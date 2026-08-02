@@ -334,6 +334,15 @@ std::vector<float> LagunaMoeResidentFp4(vt::Queue& q, const LagunaMoeWeights& mo
 //    layout for a simple first landing). Gated OFF by default (VT_LAGUNA_MARLIN_MOE=1
 //    opt-in) until the DGX near-tie + ncu gate lands — so the current default GEMV
 //    path is unchanged. CUDA-only (VT_MARLIN_NVFP4). ──────────────────────────────
+// The Marlin-repacked resident MoE state + its repack/build helpers are GENUINELY
+// device-coupled: the types and repack entry points they name exist only in the CUDA leg
+// (src/vt/cuda), so a CPU build cannot compile the block at all. REPAIR OWED: hoist this
+// behind the OpProvider seam (a `kLagunaMoeMarlin` op resolved at runtime) the way
+// laguna_device.cpp already resolves the kLaguna glue table, so the shared model TU stops
+// carrying a build-time device branch. Deferred: it restructures the resident MoE path and
+// needs the GB10 Laguna re-gate. Same class as the 26 pre-existing VT_MARLIN_NVFP4 sites
+// in qwen3_5.cpp that make up the DSR baseline.
+// DSR-ALLOW(S1): Marlin resident MoE state/helpers, CUDA-leg types; repair owed above.
 #ifdef VT_MARLIN_NVFP4
 namespace {
 // Resident Marlin-repacked routed experts. Mirror MoeMarlinResident (qwen3_5.cpp), incl.
@@ -1005,6 +1014,9 @@ std::vector<float> LagunaFfnBlock(vt::Queue& q, const LagunaLayerWeights& lw,
       // wins EAGER on Laguna's fast-kernel profile (ds4's slow-glue precedent may not
       // transfer). VT_LAGUNA_RESIDENT_MOE=0 forces the per-expert path for an A/B.
       const char* dis = std::getenv("VT_LAGUNA_RESIDENT_MOE");
+      // Dispatch branch onto the Marlin resident MoE above; carries an `else` fallback to
+      // the per-expert path, so only the BRANCH is build-gated. Same repair owed.
+      // DSR-ALLOW(S1): Marlin resident MoE dispatch branch (has an else fallback).
 #ifdef VT_MARLIN_NVFP4
       if (LagunaMarlinMoeEnabled()) {
         // N5 campaign-B: route the routed experts through vLLM's 18.8 Marlin W4A16
@@ -1128,6 +1140,11 @@ std::vector<float> LagunaFinalLogits(vt::Queue& q, const LagunaWeights& weights,
 // External linkage (declared in laguna.h); the anon-namespace helpers it calls stay
 // visible here via the anonymous namespace's implicit using-directive.
 void LagunaBuildMarlinResidents(vt::Queue& q, const LagunaWeights& w) {
+  // Body of the Marlin resident BUILD entry point — device-coupled for the same reason as
+  // the struct above (CUDA-leg repack types). Note it ALREADY asks the runtime device
+  // question on the next line (`q.device.type == kCPU`); the build-time gate exists only
+  // because the enclosed types will not compile without CUDA. Same repair owed.
+  // DSR-ALLOW(S1): Marlin resident build entry point, CUDA-leg repack types.
 #ifdef VT_MARLIN_NVFP4
   if (q.device.type == vt::DeviceType::kCPU || !LagunaMarlinMoeEnabled()) return;
   vt::Backend& bk = vt::GetBackend(q.device.type);
@@ -1520,6 +1537,29 @@ inline bool LagunaGlueFusedEnabled() {
   return on;
 }
 
+// ── On-device greedy sample + embed on the resident decode graph (VT_LAGUNA_ONDEV_SAMPLE).
+// Removes the per-step host round-trip: the driver used to Synchronize the graph, download
+// the whole [vocab] logits, argmax them on the HOST, then gather the next token's embedding
+// on the HOST before the next replay — a measured ~527 us GPU-IDLE gap PER STEP (host
+// argmax over the 100352-vocab + embed + the full drain, between two graph replays). With
+// this on, the graph argmaxes its logits ON-DEVICE (vt::GreedyArgmax, lowest-index tie =
+// the host ArgmaxLastRow winner) and gathers the next step's embedding ON-DEVICE
+// (embed_gather), so replay N+1 launches without host work on step N's logits. WHERE argmax
+// runs changes, NOT the math ⇒ BYTE-IDENTICAL token stream (=0 vs =1). DEFAULT ON
+// (parity-enablers-ship-as-defaults): the DGX GB10 gate proved it byte-exact (160-id stream
+// identical, ~/laguna-xs-nvfp4) AND faster — paired drop_caches decode wall +0.28% median
+// (removes the ~150 us/step host argmax between graph replays) at GPU-busy parity (2-length
+// nsys 27.44→27.42 ms/step); it also aligns Laguna's decode with vLLM's on-device sampling
+// (the born-on-runner pattern the decode-framework-routing audit flagged). `=0` opts back
+// out (same-binary A/B). inline so a CPU build (VT_MARLIN_NVFP4 off) does not -Wunused.
+inline bool LagunaOndevSampleEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_ONDEV_SAMPLE");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
 bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
                                 int64_t T) {
 #ifndef VT_MARLIN_NVFP4
@@ -1720,6 +1760,10 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
       GemmBf16Into(fdn.data(), lw.mlp.down_proj, dact.data(), H, dense_I);
       AddInto(hidden.data(), fdn.data());
     } else {
+      // Reads the fused router|shared_gate|shared_up weight that laguna_weights.cpp only
+      // STACKS under the same build gate, so this branch must match it. Retires together
+      // with that one when the concat moves to a runtime device question.
+      // DSR-ALLOW(S1): pairs with the laguna_weights.cpp fused-projection gate.
 #ifdef VT_MARLIN_NVFP4
       // LEVER 2 — fused router|shared_gate|shared_up projection (ONE GEMV): all
       // three read the SAME post-attn `hn`. Slice: [0,E)=router logits ->
@@ -1764,6 +1808,11 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
   return LagunaFinalLogits(q, weights, hidden, 1, logits_indices);
 }
 
+// The decode CUDA-GRAPH capture class is irreducibly device-coupled at build time —
+// graph capture/replay is a CUDA driver concept with no portable vt op today. REPAIR
+// OWED: a portable `vt` capture/replay seam (the same one deepseek_v4.cpp's V4Graph would
+// move behind), after which both graphs leave the shared layer together.
+// DSR-ALLOW(S1): decode CUDA-graph capture class; no portable vt capture seam yet.
 #ifdef VT_MARLIN_NVFP4
 namespace {
 // ─── Brick A2: the DECODE CUDA GRAPH (mirror of deepseek_v4.cpp V4Graph) ──────────
@@ -1836,6 +1885,14 @@ struct LagunaGraph {
   std::vector<float> hidden, hn, attn, o, dg, du, dact, fdn, so, doutb, topw, logits, rsg;
   std::vector<uint16_t> abf;
   std::vector<int32_t> eids32;
+  // VT_LAGUNA_ONDEV_SAMPLE: single-element device buffer holding the greedy token id.
+  // Step seeds it (host) with THIS step's input token; RunChain's embed_gather reads it
+  // at replay start and its trailing GreedyArgmax overwrites it with the next token — read
+  // back after the drain. i64 to match vt::GreedyArgmax's output dtype. `ondev` caches the
+  // env flag; `last_sampled` is the token the caller consumes (-1 when off).
+  const bool ondev = LagunaOndevSampleEnabled();
+  std::vector<int64_t> argmax_id;
+  int32_t last_sampled = -1;
   void* graph = nullptr;
   int gstate = 0;  // 0 cold (eager warm-run), 1 warm (capture+replay), 2 captured (replay)
 
@@ -1938,6 +1995,7 @@ struct LagunaGraph {
     logits.assign(static_cast<size_t>(Vsz), 0.0F);
     abf.assign(static_cast<size_t>(maxK), 0);
     eids32.assign(static_cast<size_t>(topk), 0);
+    argmax_id.assign(1, 0);  // VT_LAGUNA_ONDEV_SAMPLE token buffer (device-accessible)
   }
   ~LagunaGraph() {
     if (graph != nullptr && qp != nullptr) vt::GetBackend(qp->device).DestroyGraph(graph);
@@ -1981,6 +2039,14 @@ struct LagunaGraph {
       vt::Add(q, at, at, DevT(b, H));
     };
     const bool glue_fused = LagunaGlueFusedEnabled();
+    // VT_LAGUNA_ONDEV_SAMPLE: gather THIS step's input embedding ON-DEVICE from argmax_id
+    // (seeded by Step, or the previous replay's argmax) into the persistent hidden buffer —
+    // the in-graph replacement for the host embed loop in Step. Byte-identical widen (the
+    // kernel does bits<<16 for bf16, plain copy for f32). hidden is fully overwritten (all H
+    // elements), matching the host gather that reset it each step.
+    if (ondev)
+      LAG->embed_gather(q, hidden.data(), reinterpret_cast<const void*>(w->embed.bytes.data()),
+                        w->embed.dtype == vt::DType::kBF16, argmax_id.data(), H);
     // L4: fold a residual-Add + STANDARD RMSNorm pair into ONE vt::FusedChain
     // (kFusedAddRmsNormStd): res += x; out = rms_norm(res)*w. BYTE-EXACT to
     // AddInto(res,x) + rms_norm_seq(out,res,w): the f32 residual add is the same
@@ -2102,6 +2168,17 @@ struct LagunaGraph {
                         reinterpret_cast<const void*>(w->lm_head.bytes.data()), hn.data(), Vsz, H);
     else
       GemmBf16(logits.data(), w->lm_head, hn.data(), Vsz, H);
+    // VT_LAGUNA_ONDEV_SAMPLE: greedy argmax the logits ON-DEVICE into argmax_id (the next
+    // step's input token). vt::GreedyArgmax uses a two-pass reduction with a LOWEST-index
+    // tie-break — the exact winner ArgmaxLastRow(host) produces — so the token stream is
+    // unchanged. Its partials scratch is grown ONCE by the gstate-0 eager warm-run (same
+    // launcher sequence), so no cudaMalloc runs inside the gstate-1 capture. Fixed pointers
+    // ⇒ capture-safe; runs AFTER the lm_head write (same-stream RAW on logits).
+    if (ondev) {
+      vt::Tensor lt = vt::Tensor::Contiguous(logits.data(), vt::DType::kF32, dev, {1, Vsz});
+      vt::Tensor it = vt::Tensor::Contiguous(argmax_id.data(), vt::DType::kI64, dev, {1});
+      vt::GreedyArgmax(q, it, lt);
+    }
   }
 
   // One decode token: refresh the persistent inputs OUTSIDE capture (embed + the two
@@ -2110,8 +2187,14 @@ struct LagunaGraph {
   std::vector<float> Step(int32_t token, int32_t pos) {
     vt::Queue& q = *qp;
     VT_CHECK(kv_rows + 1 <= max_cap, "laguna decode graph: KV capacity exceeded");
-    // (1) embed → persistent hidden (host gather into the unified buffer).
-    {
+    // (1) embed → persistent hidden. VT_LAGUNA_ONDEV_SAMPLE: the gather is ON-DEVICE inside
+    // RunChain (embed_gather reads argmax_id); here we only SEED argmax_id with this step's
+    // input token (an 8-byte host write, replacing the H-element host embed loop below).
+    // token == the previous step's on-device argmax result, so the seed is value-identical
+    // to letting the graph feed itself — but keeps the driver in control of the token.
+    if (ondev) {
+      argmax_id[0] = static_cast<int64_t>(token);
+    } else {
       const OwnedTensor& et = w->embed;
       const uint8_t* raw = et.bytes.data();
       const bool is_bf16 = et.dtype == vt::DType::kBF16;
@@ -2150,6 +2233,14 @@ struct LagunaGraph {
     // Copy loop (2×nlayers launches/step) is gone — only the row count advances here.
     kv_rows++;
     b.Synchronize(q);  // the ONE step-boundary drain: logits ready, appends complete
+    // VT_LAGUNA_ONDEV_SAMPLE: the graph already argmaxed logits into argmax_id — read the
+    // winning token (8 bytes) instead of the caller downloading the full [vocab] logits for
+    // a host argmax. Return an empty vector (the driver consumes last_sampled). Off: the
+    // full logits go back for the host argmax (unchanged path).
+    if (ondev) {
+      last_sampled = static_cast<int32_t>(argmax_id[0]);
+      return {};
+    }
     return logits;
   }
 };
@@ -2189,6 +2280,7 @@ std::vector<float> LagunaForwardGgufCached(const LagunaWeights& weights, vt::Que
   // N5 device-resident T=1 decode fast path (VT_LAGUNA_RESIDENT_DECODE, default OFF).
   if (LagunaCanRunResidentDecode(p, q, weights, T) && logits_indices.size() == 1 &&
       logits_indices[0] == 0) {
+    // DSR-ALLOW(S1): decode CUDA-graph dispatch; retires with the capture class above.
 #ifdef VT_MARLIN_NVFP4
     // Brick A2 (VT_LAGUNA_DECODE_GRAPH=1): after prefill (cache.len>0), drive the
     // resident step through a captured CUDA graph — one cudaGraphLaunch/step. The
@@ -2204,6 +2296,9 @@ std::vector<float> LagunaForwardGgufCached(const LagunaWeights& weights, vt::Que
       }
       auto* g = static_cast<LagunaGraph*>(cache.decode_graph.get());
       std::vector<float> lg = g->Step(token_ids[0], positions[0]);
+      // VT_LAGUNA_ONDEV_SAMPLE: surface the graph's on-device argmax id to the driver so it
+      // skips the host argmax over the empty logits (-1 when off ⇒ caller host-argmaxes lg).
+      cache.last_sampled = g->last_sampled;
       cache.len += T;
       return lg;
     }

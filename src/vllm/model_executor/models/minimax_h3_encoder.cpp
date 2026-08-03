@@ -243,4 +243,180 @@ std::vector<float> MiniMaxH3EncoderTextForward(const MiniMaxH3EncoderConfig& con
   return h;
 }
 
+// ---------------------------------------------------------------------------
+// Vision tower block (encoder.py:417-481) — the repeated unit of the ViT.
+//
+// Differs from the TEXT tower in several ways that all matter numerically:
+//   * LayerNorm (with bias), not RMSNorm, at eps 1e-6;
+//   * the qkv output is reshaped [seq, 3, heads, head_dim] and PERMUTED, so the
+//     layout is [q_all | k_all | v_all] per token — not the per-head interleave
+//     the video VAE's ViT uses;
+//   * rotary is applied in FP32 with cos/sin supplied per token;
+//   * attention is NON-CAUSAL and segmented by `cu_seqlens` (one segment per
+//     image/frame), so it never crosses a packed-image boundary;
+//   * the MLP uses the TANH-approximate GELU (`gelu_pytorch_tanh`), not exact erf.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// nn.LayerNorm over the last dim.
+void LayerNormRows(const float* in, const float* weight, const float* bias, float* out,
+                   int64_t rows, int64_t width, double eps) {
+  for (int64_t r = 0; r < rows; ++r) {
+    const float* src = in + r * width;
+    double mean = 0.0;
+    for (int64_t i = 0; i < width; ++i) mean += src[i];
+    mean /= static_cast<double>(width);
+    double var = 0.0;
+    for (int64_t i = 0; i < width; ++i) var += (src[i] - mean) * (src[i] - mean);
+    var /= static_cast<double>(width);
+    const double inv = 1.0 / std::sqrt(var + eps);
+    float* dst = out + r * width;
+    for (int64_t i = 0; i < width; ++i) {
+      double value = (src[i] - mean) * inv * weight[i];
+      if (bias != nullptr) value += bias[i];
+      dst[i] = static_cast<float>(value);
+    }
+  }
+}
+
+// nn.GELU(approximate="tanh").
+float GeluTanh(float x) {
+  const double xd = x;
+  const double inner = 0.7978845608028654 * (xd + 0.044715 * xd * xd * xd);
+  return static_cast<float>(0.5 * xd * (1.0 + std::tanh(inner)));
+}
+
+// y = x @ W^T + b.
+std::vector<float> LinearBias(const std::vector<float>& x, int64_t rows, int64_t in_features,
+                              const std::vector<float>& weight, const std::vector<float>* bias,
+                              int64_t out_features) {
+  std::vector<float> out(static_cast<size_t>(rows * out_features));
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t o = 0; o < out_features; ++o) {
+      double acc = bias != nullptr ? (*bias)[static_cast<size_t>(o)] : 0.0;
+      const float* w = weight.data() + o * in_features;
+      for (int64_t i = 0; i < in_features; ++i) {
+        acc += static_cast<double>(x[static_cast<size_t>(r * in_features + i)]) *
+               static_cast<double>(w[i]);
+      }
+      out[static_cast<size_t>(r * out_features + o)] = static_cast<float>(acc);
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+std::vector<float> MiniMaxH3VisionBlockForward(const MiniMaxH3VisionBlockConfig& config,
+                                               const MiniMaxH3AudioVaeWeights& weights,
+                                               const std::string& prefix,
+                                               const std::vector<float>& hidden, int64_t seq,
+                                               const float* cos, const float* sin,
+                                               const int32_t* cu_seqlens, int64_t num_segments) {
+  const int64_t dim = config.hidden_size;
+  const int64_t heads = config.num_heads;
+  const int64_t head_dim = dim / heads;
+  VT_CHECK(dim > 0 && heads > 0 && dim % heads == 0,
+           "minimax_h3 vision: hidden_size must divide by num_heads");
+  VT_CHECK(static_cast<int64_t>(hidden.size()) == seq * dim,
+           "minimax_h3 vision: hidden size does not match [seq, dim]");
+
+  std::vector<float> h = hidden;
+  std::vector<float> normed(h.size());
+
+  // --- attention ---
+  LayerNormRows(h.data(), weights.Get(prefix + ".norm1.weight").data(),
+                weights.Get(prefix + ".norm1.bias").data(), normed.data(), seq, dim, config.eps);
+  const std::vector<float> qkv =
+      LinearBias(normed, seq, dim, weights.Get(prefix + ".attn.qkv.weight"),
+                 &weights.Get(prefix + ".attn.qkv.bias"), 3 * dim);
+
+  // reshape(seq, 3, heads, head_dim).permute(1,0,2,3) => q/k/v each [seq, heads, head_dim].
+  std::vector<float> q(static_cast<size_t>(seq * dim));
+  std::vector<float> k(static_cast<size_t>(seq * dim));
+  std::vector<float> v(static_cast<size_t>(seq * dim));
+  for (int64_t s = 0; s < seq; ++s) {
+    const float* row = qkv.data() + s * 3 * dim;
+    std::copy(row, row + dim, q.begin() + s * dim);
+    std::copy(row + dim, row + 2 * dim, k.begin() + s * dim);
+    std::copy(row + 2 * dim, row + 3 * dim, v.begin() + s * dim);
+  }
+
+  // Rotary in FP32, cos/sin shared across heads (encoder.py:404-415).
+  const int64_t half = head_dim / 2;
+  for (int64_t s = 0; s < seq; ++s) {
+    const float* c = cos + s * head_dim;
+    const float* sn = sin + s * head_dim;
+    for (int64_t head = 0; head < heads; ++head) {
+      for (std::vector<float>* target : {&q, &k}) {
+        float* row = target->data() + (s * heads + head) * head_dim;
+        for (int64_t i = 0; i < half; ++i) {
+          const double lo = row[i], hi = row[i + half];
+          row[i] = static_cast<float>(lo * c[i] - hi * sn[i]);
+          row[i + half] = static_cast<float>(hi * c[i + half] + lo * sn[i + half]);
+        }
+      }
+    }
+  }
+
+  // Non-causal attention, segmented by cu_seqlens.
+  std::vector<float> attn(static_cast<size_t>(seq * dim), 0.0f);
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  std::vector<double> probs;
+  for (int64_t seg = 0; seg < num_segments; ++seg) {
+    const int64_t begin = cu_seqlens[seg];
+    const int64_t end = cu_seqlens[seg + 1];
+    const int64_t len = end - begin;
+    if (len <= 0) continue;
+    probs.resize(static_cast<size_t>(len));
+    for (int64_t head = 0; head < heads; ++head) {
+      for (int64_t i = begin; i < end; ++i) {
+        double max_score = -1e30;
+        for (int64_t j = begin; j < end; ++j) {
+          double dot = 0.0;
+          for (int64_t d = 0; d < head_dim; ++d) {
+            dot += static_cast<double>(q[static_cast<size_t>((i * heads + head) * head_dim + d)]) *
+                   static_cast<double>(k[static_cast<size_t>((j * heads + head) * head_dim + d)]);
+          }
+          probs[static_cast<size_t>(j - begin)] = dot * scale;
+          max_score = std::max(max_score, probs[static_cast<size_t>(j - begin)]);
+        }
+        double denom = 0.0;
+        for (int64_t j = 0; j < len; ++j) {
+          probs[static_cast<size_t>(j)] = std::exp(probs[static_cast<size_t>(j)] - max_score);
+          denom += probs[static_cast<size_t>(j)];
+        }
+        for (int64_t d = 0; d < head_dim; ++d) {
+          double acc = 0.0;
+          for (int64_t j = 0; j < len; ++j) {
+            acc += probs[static_cast<size_t>(j)] *
+                   static_cast<double>(
+                       v[static_cast<size_t>(((begin + j) * heads + head) * head_dim + d)]);
+          }
+          attn[static_cast<size_t>((i * heads + head) * head_dim + d)] =
+              static_cast<float>(acc / denom);
+        }
+      }
+    }
+  }
+  const std::vector<float> projected =
+      LinearBias(attn, seq, dim, weights.Get(prefix + ".attn.proj.weight"),
+                 &weights.Get(prefix + ".attn.proj.bias"), dim);
+  for (size_t i = 0; i < h.size(); ++i) h[i] += projected[i];
+
+  // --- MLP with tanh-approximate GELU ---
+  LayerNormRows(h.data(), weights.Get(prefix + ".norm2.weight").data(),
+                weights.Get(prefix + ".norm2.bias").data(), normed.data(), seq, dim, config.eps);
+  std::vector<float> mid =
+      LinearBias(normed, seq, dim, weights.Get(prefix + ".mlp.linear_fc1.weight"),
+                 &weights.Get(prefix + ".mlp.linear_fc1.bias"), config.intermediate_size);
+  for (float& value : mid) value = GeluTanh(value);
+  const std::vector<float> down =
+      LinearBias(mid, seq, config.intermediate_size, weights.Get(prefix + ".mlp.linear_fc2.weight"),
+                 &weights.Get(prefix + ".mlp.linear_fc2.bias"), dim);
+  for (size_t i = 0; i < h.size(); ++i) h[i] += down[i];
+  return h;
+}
+
 }  // namespace vllm

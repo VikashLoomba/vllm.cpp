@@ -463,6 +463,24 @@ std::vector<float> MiniMaxH3EncoderTextForward(const MiniMaxH3EncoderConfig& con
                                                const uint8_t* visual_pos_mask,
                                                const std::vector<std::vector<float>>& deepstack);
 
+// One vision-tower block (encoder.py:417-481) — the repeated unit of the ViT.
+// Unlike the text tower it uses LayerNorm (with bias), a [q_all|k_all|v_all] qkv
+// layout, fp32 rotary, NON-CAUSAL attention segmented by `cu_seqlens`, and the
+// TANH-approximate GELU.
+struct MiniMaxH3VisionBlockConfig {
+  int64_t hidden_size = 1152;
+  int64_t num_heads = 16;
+  int64_t intermediate_size = 4304;
+  double eps = 1e-6;
+};
+
+std::vector<float> MiniMaxH3VisionBlockForward(const MiniMaxH3VisionBlockConfig& config,
+                                               const MiniMaxH3AudioVaeWeights& weights,
+                                               const std::string& prefix,
+                                               const std::vector<float>& hidden, int64_t seq,
+                                               const float* cos, const float* sin,
+                                               const int32_t* cu_seqlens, int64_t num_segments);
+
 // The checkpoint stores qkv GROUPED per query group as [q_per_group, k, v]; the
 // fused qkv projection wants [q_all, k_all, v_all] (minimax_h3_transformer.py:
 // 139-168). H3 is MHA, so heads_per_group == 1.

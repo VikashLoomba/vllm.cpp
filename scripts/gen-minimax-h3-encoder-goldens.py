@@ -95,6 +95,14 @@ MROPE_SECTION = [2, 1, 1]
 SEQ = 5
 DEEPSTACK_LAYERS = 2
 
+# Reduced vision tower block. Two packed images so the varlen (cu_seqlens)
+# segmentation is actually exercised rather than degenerating to one segment.
+VIS_DIM = 16
+VIS_HEADS = 2
+VIS_INTERMEDIATE = 32
+VIS_SEQ = 6
+VIS_CU_SEQLENS = [0, 4, 6]
+
 
 def emit_f32(out, name: str, values) -> None:
     flat = np.asarray(values, dtype=np.float32).reshape(-1).tolist()
@@ -172,6 +180,38 @@ def main() -> int:
     with_deepstack = model(inputs_embeds, positions, visual_pos_masks=visual_mask,
                            deepstack_visual_embeds=deepstack)
 
+    # --- vision tower BLOCK (the repeated unit of the ViT) ---
+    vision_config = SimpleNamespace(
+        hidden_size=VIS_DIM, num_heads=VIS_HEADS, intermediate_size=VIS_INTERMEDIATE,
+    )
+    vblock = enc.MiniMaxH3Qwen3VLVisionBlock(vision_config).eval()
+    vstate = vblock.state_dict()
+    for name, tensor in vstate.items():
+        scale, offset = (0.1, 0.0)
+        if name.endswith("norm1.weight") or name.endswith("norm2.weight"):
+            scale, offset = 0.1, 1.0
+        elif name.endswith(".bias"):
+            scale = 0.05
+        vstate[name] = torch.from_numpy(
+            (h3_rand("encoder.vision." + name, tensor.numel()) * scale + offset).astype(np.float32)
+        ).reshape(tensor.shape)
+    vblock.load_state_dict(vstate, strict=True)
+
+    vhidden = torch.from_numpy(
+        h3_rand("encoder.vision.input", VIS_SEQ * VIS_DIM).astype(np.float32)
+    ).reshape(VIS_SEQ, VIS_DIM)
+    # cos/sin are [seq, head_dim]; the tower builds them from a 2D rotary table,
+    # but the BLOCK just consumes them, so they are supplied directly here.
+    head_dim = VIS_DIM // VIS_HEADS
+    vcos = torch.from_numpy(
+        h3_rand("encoder.vision.cos", VIS_SEQ * head_dim).astype(np.float32)
+    ).reshape(VIS_SEQ, head_dim).cos()
+    vsin = torch.from_numpy(
+        h3_rand("encoder.vision.sin", VIS_SEQ * head_dim).astype(np.float32)
+    ).reshape(VIS_SEQ, head_dim).sin()
+    vcu = torch.tensor(VIS_CU_SEQLENS, dtype=torch.int32)
+    vout = vblock(vhidden, cu_seqlens=vcu, position_embeddings=(vcos, vsin))
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as out:
         out.write(
@@ -196,6 +236,15 @@ def main() -> int:
         emit_i64(out, "kH3EncVisualMask", visual_mask.to(torch.int64))
         emit_f32(out, "kH3EncGolden", plain.reshape(-1))
         emit_f32(out, "kH3EncDeepstackGolden", with_deepstack.reshape(-1))
+
+        out.write(f"inline constexpr int64_t kH3EncVisDim = {VIS_DIM};\n")
+        out.write(f"inline constexpr int64_t kH3EncVisHeads = {VIS_HEADS};\n")
+        out.write(f"inline constexpr int64_t kH3EncVisIntermediate = {VIS_INTERMEDIATE};\n")
+        out.write(f"inline constexpr int64_t kH3EncVisSeq = {VIS_SEQ};\n\n")
+        emit_i64(out, "kH3EncVisCuSeqlens", VIS_CU_SEQLENS)
+        emit_f32(out, "kH3EncVisCos", vcos.reshape(-1))
+        emit_f32(out, "kH3EncVisSin", vsin.reshape(-1))
+        emit_f32(out, "kH3EncVisBlockGolden", vout.reshape(-1))
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

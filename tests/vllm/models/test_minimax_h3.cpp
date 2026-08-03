@@ -1750,6 +1750,76 @@ TEST_CASE("minimax_h3: an NVFP4 checkpoint loads into a runnable DiT") {
   std::remove(path.c_str());
 }
 
+TEST_CASE("minimax_h3: the encoder VISION block matches upstream") {
+  // The repeated unit of the H3-Encoder's Qwen3-VL vision tower. It differs from
+  // the text tower in ways that all matter numerically: LayerNorm (with bias) not
+  // RMSNorm, a [q_all|k_all|v_all] qkv layout, fp32 rotary, NON-CAUSAL attention
+  // segmented by cu_seqlens, and the TANH-approximate GELU.
+  vllm::MiniMaxH3VisionBlockConfig config;
+  config.hidden_size = vllm_test::kH3EncVisDim;
+  config.num_heads = vllm_test::kH3EncVisHeads;
+  config.intermediate_size = vllm_test::kH3EncVisIntermediate;
+  config.eps = 1e-6;
+
+  const int64_t dim = config.hidden_size;
+  const int64_t seq = vllm_test::kH3EncVisSeq;
+
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& suffix, int64_t count, double scale, double offset) {
+    weights.tensors["vb." + suffix] = MakeParam("encoder.vision." + suffix, count, scale, offset);
+  };
+  put("norm1.weight", dim, 0.1, 1.0);
+  put("norm1.bias", dim, 0.05, 0.0);
+  put("norm2.weight", dim, 0.1, 1.0);
+  put("norm2.bias", dim, 0.05, 0.0);
+  put("attn.qkv.weight", 3 * dim * dim, 0.1, 0.0);
+  put("attn.qkv.bias", 3 * dim, 0.05, 0.0);
+  put("attn.proj.weight", dim * dim, 0.1, 0.0);
+  put("attn.proj.bias", dim, 0.05, 0.0);
+  put("mlp.linear_fc1.weight", config.intermediate_size * dim, 0.1, 0.0);
+  put("mlp.linear_fc1.bias", config.intermediate_size, 0.05, 0.0);
+  put("mlp.linear_fc2.weight", dim * config.intermediate_size, 0.1, 0.0);
+  put("mlp.linear_fc2.bias", dim, 0.05, 0.0);
+
+  const std::vector<float> hidden = MakeParam("encoder.vision.input", seq * dim, 1.0);
+  const std::vector<float> cos(vllm_test::kH3EncVisCos,
+                               vllm_test::kH3EncVisCos + std::size(vllm_test::kH3EncVisCos));
+  const std::vector<float> sin(vllm_test::kH3EncVisSin,
+                               vllm_test::kH3EncVisSin + std::size(vllm_test::kH3EncVisSin));
+  std::vector<int32_t> cu;
+  for (size_t i = 0; i < std::size(vllm_test::kH3EncVisCuSeqlens); ++i) {
+    cu.push_back(static_cast<int32_t>(vllm_test::kH3EncVisCuSeqlens[i]));
+  }
+  // Two packed segments, so the varlen boundary is genuinely exercised.
+  REQUIRE(cu.size() == 3);
+
+  const std::vector<float> got = vllm::MiniMaxH3VisionBlockForward(
+      config, weights, "vb", hidden, seq, cos.data(), sin.data(), cu.data(),
+      static_cast<int64_t>(cu.size()) - 1);
+
+  REQUIRE(got.size() == std::size(vllm_test::kH3EncVisBlockGolden));
+  const double err = MaxAbsDiff(got, vllm_test::kH3EncVisBlockGolden, got.size());
+  INFO("vision block max|diff| = " << err);
+  CHECK(err <= 1e-5);
+
+  // Attention must NOT cross the packed-image boundary: perturbing a token in the
+  // SECOND segment must leave the FIRST segment's outputs untouched.
+  std::vector<float> perturbed = hidden;
+  perturbed[static_cast<size_t>(cu[1] * dim)] += 1.0f;
+  const std::vector<float> other = vllm::MiniMaxH3VisionBlockForward(
+      config, weights, "vb", perturbed, seq, cos.data(), sin.data(), cu.data(),
+      static_cast<int64_t>(cu.size()) - 1);
+  for (int64_t i = 0; i < cu[1] * dim; ++i) {
+    CHECK(other[static_cast<size_t>(i)] == got[static_cast<size_t>(i)]);
+  }
+  // ...and must actually change the segment it belongs to.
+  bool changed = false;
+  for (int64_t i = cu[1] * dim; i < seq * dim; ++i) {
+    if (other[static_cast<size_t>(i)] != got[static_cast<size_t>(i)]) changed = true;
+  }
+  CHECK(changed);
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

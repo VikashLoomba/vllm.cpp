@@ -34873,3 +34873,26 @@ actually begins, since the reference forward is CPU and deliberately unoptimized
 **Environment:** dgx.casa unreachable, no local GPU. No run on a real checkpoint and
 no speed number is possible from this machine.
 
+## 2026-08-03 - MiniMax-H3 W3 vision block: both encoder towers' cores are ported
+
+The encoder's vision-tower block now matches upstream at **6.0e-8**, so both towers'
+repeated units are done (text tower was 1.2e-7).
+
+**The two ViTs in this model disagree on qkv layout, and that is the trap.** The
+VIDEO VAE decoder's ViT is PER-HEAD INTERLEAVED ([head][q,k,v]); this VISION tower
+is [q_all|k_all|v_all]. Same tensor size, no error either way - just a wrong result.
+Having ported both, it is worth stating plainly: never assume a qkv layout carries
+across ViTs inside one checkpoint; read the reshape/permute in the source each time.
+
+Other deltas from the text tower, all exercised: LayerNorm WITH BIAS rather than
+RMSNorm, fp32 rotary, and the TANH-approximate GELU rather than exact erf.
+
+The attention is `cu_seqlens`-segmented, and the test proves the isolation rather
+than assuming it: perturbing a token in the second packed image leaves every output
+of the first BIT-IDENTICAL, while the second's outputs do change. A segmentation bug
+would otherwise pass a tolerance check.
+
+**Remaining for the encoder:** the vision surround (Conv3d patch embed, learned
+pos-embed interpolation, the 2D rotary table, patch + DeepStack mergers) and the MM
+processor.
+

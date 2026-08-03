@@ -52,6 +52,9 @@
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
+#include <fstream>
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
@@ -98,6 +101,12 @@ struct Args {
   int max_model_len = 0;  // 0 => config.max_position_embeddings
   int max_num_seqs = 8;
   int max_num_batched_tokens = 0;  // 0 => per-architecture default.
+  // --- MiniMax-H3 video generation (opt-in; absent => /v1/videos is unregistered
+  // and the server behaves exactly as before). ---
+  std::string video_dit, video_vae, video_vae_config, audio_vae, audio_vae_config;
+  std::string video_prompt_embeds, video_workdir = "/tmp/vllm_h3_videos";
+  std::string video_ffmpeg = "ffmpeg", video_device = "cuda";
+  bool video_keep_quant = false;
   int cuda_profile_graph_replays = 0;  // trace-only diagnostic build seam.
   int cuda_profile_graph_batch = 0;  // 0 => accepted c16 trace contract.
   std::string benchmark_shutdown_fifo;  // paired trace-only control path.
@@ -209,6 +218,26 @@ Args ParseArgs(int argc, char** argv) {
       a.enable_force_include_usage = true;
     } else if (flag == "--enable-tokenizer-info-endpoint") {
       a.enable_tokenizer_info_endpoint = true;
+    } else if (flag == "--video-dit") {
+      a.video_dit = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-vae") {
+      a.video_vae = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-vae-config") {
+      a.video_vae_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--audio-vae") {
+      a.audio_vae = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--audio-vae-config") {
+      a.audio_vae_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-prompt-embeds") {
+      a.video_prompt_embeds = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-workdir") {
+      a.video_workdir = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-ffmpeg") {
+      a.video_ffmpeg = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-device") {
+      a.video_device = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-keep-quant") {
+      a.video_keep_quant = true;
     } else if (flag == "--enable-server-dev-mode") {
       a.enable_server_dev_mode = true;
     } else if (flag == "--enable-prefix-caching" ||
@@ -547,6 +576,165 @@ int main(int argc, char** argv) {
     // mirroring vLLM 0.26's per-endpoint default gating. /metrics and
     // /reset_prefix_cache stay unwired (no live backing on the AsyncLLM path) —
     // see ConfigureUtilityEndpoints + specs/{utility,admin}-endpoints.md. ────────
+    // ── MiniMax-H3 video generation. OPT-IN: with no --video-dit the routes are
+    // never registered and the server is byte-identical to before. The runner is a
+    // CALLBACK because src/vllm/ must not spawn processes — the ffmpeg invocation
+    // is allowed here, in examples/, by the developer's ratified decision. ───────
+    struct VideoState {
+      vllm::MiniMaxH3GgufDit dit;
+      vllm::MiniMaxH3VideoVaeDecoderConfig video_cfg;
+      vllm::MiniMaxH3AudioVaeConfig audio_cfg;
+      vllm::MiniMaxH3LatentStats video_stats, audio_stats;
+      vllm::MiniMaxH3AudioVaeWeights video_weights, audio_weights;
+      std::vector<float> prompt_embeds;
+      std::string workdir, ffmpeg;
+      vt::Device device;
+      std::atomic<int64_t> counter{0};
+    };
+    std::shared_ptr<VideoState> video;
+    if (!args.video_dit.empty()) {
+      video = std::make_shared<VideoState>();
+      std::cerr << "server: loading MiniMax-H3 video checkpoints...\n";
+      if (args.video_dit.size() > 5 &&
+          args.video_dit.compare(args.video_dit.size() - 5, 5, ".gguf") == 0) {
+        const vllm::GgufFile f = vllm::GgufFile::Open(args.video_dit);
+        video->dit = vllm::LoadMiniMaxH3DitFromGguf(f, args.video_keep_quant);
+      } else {
+        const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(args.video_dit);
+        video->dit = vllm::LoadMiniMaxH3DitFromNvfp4(f);
+      }
+      if (!args.video_vae_config.empty()) {
+        std::ifstream in(args.video_vae_config);
+        nlohmann::json j;
+        in >> j;
+        video->video_cfg = vllm::ParseMiniMaxH3VideoVaeDecoderConfig(j, &video->video_stats);
+      }
+      if (!args.audio_vae_config.empty()) {
+        std::ifstream in(args.audio_vae_config);
+        nlohmann::json j;
+        in >> j;
+        video->audio_cfg = vllm::ParseMiniMaxH3AudioVaeConfig(j, &video->audio_stats);
+      }
+      {
+        const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(args.video_vae);
+        video->video_weights = vllm::LoadMiniMaxH3VideoVaeDecoderWeights(f);
+      }
+      {
+        const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(args.audio_vae);
+        video->audio_weights = vllm::LoadMiniMaxH3AudioVaeWeights(f);
+      }
+      if (!args.video_prompt_embeds.empty()) {
+        std::ifstream in(args.video_prompt_embeds, std::ios::binary | std::ios::ate);
+        const std::streamsize n = in.tellg();
+        in.seekg(0);
+        video->prompt_embeds.resize(static_cast<size_t>(n) / sizeof(float));
+        in.read(reinterpret_cast<char*>(video->prompt_embeds.data()), n);
+      }
+      video->workdir = args.video_workdir;
+      video->ffmpeg = args.video_ffmpeg;
+      if (args.video_device == "cuda") {
+        video->device = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+      }
+      std::cerr << "server: /v1/videos on (dit layers=" << video->dit.params.num_layers
+                << ", device=" << args.video_device
+                << (args.video_keep_quant ? ", keep-quant" : "") << ")\n";
+      // HONEST LIMIT, stated at startup rather than buried: turning a PROMPT into
+      // conditioning needs the H3-Encoder (a 32B tower + tokenizer), which is not
+      // wired here. Until it is, every request is conditioned on the SAME supplied
+      // embeddings, so the prompt text does NOT steer the output.
+      if (video->prompt_embeds.empty()) {
+        std::cerr << "server: WARNING /v1/videos has no --video-prompt-embeds; "
+                     "requests will be REJECTED until the encoder is wired\n";
+      } else {
+        std::cerr << "server: WARNING /v1/videos ignores the request PROMPT — text "
+                     "conditioning needs the H3-Encoder, which is not wired yet\n";
+      }
+
+      server.set_video_runner([video](const vllm::openai::VideoRequest& req) -> std::string {
+        if (video->prompt_embeds.empty()) {
+          throw std::runtime_error(
+              "video generation needs prompt embeddings: the H3-Encoder is not wired, "
+              "so start the server with --video-prompt-embeds");
+        }
+        const vllm::MiniMaxH3DitParams& p = video->dit.params;
+        vllm::MiniMaxH3T2vaRequest r;
+        const vllm::MiniMaxH3ShapePlan plan = vllm::MiniMaxH3ResolveShape(
+            req.task.empty() ? "t2va" : req.task, req.duration_seconds, req.num_frames,
+            req.height, req.width, 0, 0);
+        r.latent_t = plan.latent_t;
+        r.latent_h = plan.height / vllm::kMiniMaxH3VaeRatio;
+        r.latent_w = plan.width / vllm::kMiniMaxH3VaeRatio;
+        r.audio_t = plan.audio_t;
+        r.audio_channel = vllm::kMiniMaxH3AudioChannels;
+        r.num_steps = req.num_inference_steps;
+        r.video_shift = req.flow_shift;
+        r.audio_shift = req.audio_flow_shift;
+        r.video_latents_mean = video->video_stats.mean;
+        r.video_latents_std = video->video_stats.std_dev;
+        r.audio_latents_mean = video->audio_stats.mean;
+        r.audio_latents_std = video->audio_stats.std_dev;
+        r.text_len = static_cast<int64_t>(video->prompt_embeds.size()) / p.text_dim;
+
+        const int64_t frame_rows =
+            (r.latent_h / p.patch_size_h) * (r.latent_w / p.patch_size_w);
+        std::vector<float> nv(static_cast<size_t>(r.latent_t * frame_rows *
+                                                  p.video_row_width()));
+        std::vector<float> na(static_cast<size_t>(r.audio_t * r.audio_channel *
+                                                  p.audio_latents_dim));
+        uint64_t x = req.has_seed ? static_cast<uint64_t>(req.seed) : 0x5EED1234ULL;
+        auto fill = [&x](std::vector<float>& o) {
+          for (float& value : o) {
+            x += 0x9E3779B97F4A7C15ULL;
+            uint64_t z = x;
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+            z ^= z >> 31;
+            value = static_cast<float>((z >> 11) * 0x1.0p-53 * 2.0 - 1.0);
+          }
+        };
+        fill(nv);
+        fill(na);
+
+        const vllm::MiniMaxH3T2vaResult out = vllm::MiniMaxH3GenerateT2va(
+            video->device, r, p, video->dit.weights, video->video_cfg, video->video_weights,
+            video->audio_cfg, video->audio_weights, video->prompt_embeds, nv, na,
+            vt::DType::kBF16);
+
+        const int64_t id = video->counter.fetch_add(1);
+        const std::string dir = video->workdir + "/job" + std::to_string(id);
+        if (std::system(("mkdir -p '" + dir + "'").c_str()) != 0) {
+          throw std::runtime_error("cannot create " + dir);
+        }
+        for (int64_t f = 0; f < out.frame_shape.t; ++f) {
+          char name[512];
+          std::snprintf(name, sizeof(name), "%s/frame_%06lld.ppm", dir.c_str(),
+                        static_cast<long long>(f));
+          std::ofstream fo(name, std::ios::binary);
+          const std::string bytes =
+              vllm::MiniMaxH3WritePpmFrame(out.frames, out.frame_shape, f);
+          fo.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        }
+        const std::string wav = dir + "/audio.wav";
+        {
+          std::ofstream fo(wav, std::ios::binary);
+          const std::string bytes = vllm::MiniMaxH3WriteWav(
+              out.waveform, out.audio_channels, out.audio_samples_per_channel,
+              out.sample_rate);
+          fo.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        }
+        vllm::MiniMaxH3MuxRequest mux;
+        mux.frame_pattern = dir + "/frame_%06d.ppm";
+        mux.audio_path = wav;
+        mux.output_path = dir + "/video.mp4";
+        std::vector<std::string> argv_mux = vllm::MiniMaxH3BuildMp4MuxArgs(mux);
+        if (!argv_mux.empty()) argv_mux[0] = video->ffmpeg;
+        std::string cmd;
+        for (const std::string& a : argv_mux) cmd += "'" + a + "' ";
+        if (std::system(cmd.c_str()) != 0) throw std::runtime_error("ffmpeg failed");
+        return mux.output_path;
+      });
+    }
+
     oai::UtilityEndpointOptions endpoint_opts;
     endpoint_opts.enable_tokenizer_info_endpoint =
         args.enable_tokenizer_info_endpoint;

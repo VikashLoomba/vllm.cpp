@@ -35736,3 +35736,25 @@ still be UNREACHED by the code path that matters. post_quant_conv was implemente
 uncalled; the keep-quant test ran on the CPU backend; the device forward was gated in
 a unit test while the loop used the CPU one. Ask what CALLS the thing, not just
 whether the thing is correct.
+
+## 2026-08-03 - MiniMax-H3: /v1/videos wired into examples/server
+
+`--video-dit` (+ --video-vae/--audio-vae and their configs) makes examples/server
+load the H3 checkpoints at startup and register a real VideoRunner: generate ->
+PPM frames + WAV -> ffmpeg -> MP4, returning the path. Omit it and the routes are
+never registered, so the server is byte-identical to before (36/36 api-server cases
+unchanged).
+
+The runner is a CALLBACK living in examples/ because that is where process spawning
+is allowed; the library still builds only artifacts and argv.
+
+HONEST GAP, and it is stated at STARTUP rather than buried in a doc: turning a
+PROMPT into conditioning needs the H3-Encoder (32B tower + tokenizer), which is not
+wired. Until it is, every request is conditioned on the SAME `--video-prompt-embeds`
+file, so the prompt text does NOT steer the output - and with no such file the
+runner REJECTS requests with that explanation rather than silently generating
+something unconditioned. Wiring the encoder is the next step for a truthful API.
+
+Shape/seed/steps DO come from the request (MiniMaxH3ResolveShape over task,
+duration, frames, height, width; seed drives the noise stream), so everything except
+text conditioning is live.

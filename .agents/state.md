@@ -35574,3 +35574,24 @@ Gate: 44/44 (13310 assertions).
 
 REMAINING for path 2: the two encoder towers (likely large reuse of the Qwen3-VL
 loader), and wiring post_quant_conv into the pipeline's decode path.
+
+## 2026-08-03 - MiniMax-H3: post_quant_conv WIRED (the branch no test entered)
+
+Implementing post_quant_conv was only half the fix. MiniMaxH3GenerateT2va still did
+not call it, so the function was correct and unused - the same shape of gap as
+before, one layer up.
+
+Wired into the decode step, guarded on the weights actually carrying the tensor
+(reduced-dimension weight sets need not ship every wrapper tensor, and the
+structural t2va test does not).
+
+The guard created a NEW hazard: a conditional branch that no test enters. So the
+t2va test now runs the whole path TWICE - once without post_quant_conv, once with -
+and requires the frames to MOVE (delta 0.056). It also requires the WAVEFORM to stay
+BIT-IDENTICAL, since a video-side wrapper tensor has no business touching audio.
+
+The fixture uses identity-plus-one-off-diagonal rather than a random matrix: an
+identity would pass a "did it run" check while proving nothing, and the off-diagonal
+term is what makes it a genuine channel MIX.
+
+Gate: 44/44 (13321 assertions).

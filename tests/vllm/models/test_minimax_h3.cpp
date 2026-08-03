@@ -1537,6 +1537,36 @@ TEST_CASE("minimax_h3: the WHOLE t2va path composes end to end") {
     moved = std::max(moved, static_cast<double>(std::abs(noise_video[i])));
   }
   CHECK(moved > 0.0);
+
+  // post_quant_conv: the real checkpoint ships it, and the pipeline must APPLY it
+  // to the latent before decoding. The weight set above deliberately omits it (a
+  // reduced-dimension set need not carry every wrapper tensor), so re-run WITH one
+  // and require the frames to CHANGE. Without this the wiring is a branch no test
+  // enters, which is how the step went missing in the first place.
+  vllm::MiniMaxH3AudioVaeWeights video_weights_pqc = video_weights;
+  const int64_t lc = p.latents_dim;
+  std::vector<float> pqc(static_cast<size_t>(lc * lc), 0.0f);
+  for (int64_t i = 0; i < lc; ++i) pqc[static_cast<size_t>(i * lc + i)] = 1.0f;  // identity...
+  pqc[1] = 0.25f;  // ...plus one off-diagonal term, so it genuinely MIXES channels
+  video_weights_pqc.tensors["post_quant_conv.weight"] = pqc;
+  video_weights_pqc.tensors["post_quant_conv.bias"] = std::vector<float>(lc, 0.0f);
+
+  const vllm::MiniMaxH3T2vaResult out_pqc = vllm::MiniMaxH3GenerateT2va(
+      Cpu(), request, p, dit->views, video_config, video_weights_pqc, audio_config, audio_weights,
+      prompt_embeds, noise_video, noise_audio, vt::DType::kF32);
+  REQUIRE(out_pqc.frames.size() == out.frames.size());
+  double frame_delta = 0.0;
+  for (size_t i = 0; i < out.frames.size(); ++i) {
+    frame_delta = std::max(frame_delta,
+                           std::abs(static_cast<double>(out_pqc.frames[i] - out.frames[i])));
+  }
+  INFO("post_quant_conv frame delta = " << frame_delta);
+  CHECK(frame_delta > 1e-6);
+  // The AUDIO path must be untouched by a VIDEO-side wrapper tensor.
+  REQUIRE(out_pqc.waveform.size() == out.waveform.size());
+  for (size_t i = 0; i < out.waveform.size(); ++i) {
+    CHECK(out_pqc.waveform[i] == out.waveform[i]);
+  }
 }
 
 TEST_CASE("minimax_h3: a ComfyUI-format GGUF loads into a runnable DiT") {

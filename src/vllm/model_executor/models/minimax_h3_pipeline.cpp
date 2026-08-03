@@ -104,6 +104,15 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
 
   // --- 6. decode ---
   MiniMaxH3T2vaResult result;
+  // post_quant_conv (the AutoencoderKL WRAPPER's Conv3d 1x1x1 channel mix) runs on
+  // the latent BEFORE the decoder. It sits OUTSIDE ViT3DDecoder, which is why the
+  // decoder's own 8.9e-8 gate never covered it. Applied only when the weights
+  // carry it, so a synthetic/reduced-dimension weight set without it still runs --
+  // the structural t2va test does not ship one.
+  if (video_weights.Has("post_quant_conv.weight")) {
+    video_latent = MiniMaxH3VideoVaePostQuantConv(video_weights, video_latent,
+                                                  dit_params.latents_dim, video_per_channel);
+  }
   result.frames = MiniMaxH3VideoVaeDecode(video_config, video_weights, video_latent,
                                           request.latent_t, request.latent_h, request.latent_w,
                                           &result.frame_shape);

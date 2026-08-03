@@ -31,6 +31,7 @@
 #include "minimax_h3_gguf_manifest.inc"
 #include "minimax_h3_audio_vae_goldens.inc"
 #include "minimax_h3_audio_vae_manifest.inc"
+#include "minimax_h3_vae_configs.inc"
 #include "minimax_h3_nvfp4_manifest.inc"
 #include "minimax_h3_video_vae_manifest.inc"
 #include "minimax_h3_video_vae_goldens.inc"
@@ -3530,4 +3531,58 @@ TEST_CASE("minimax_h3: the encoder loader FUSES q/k/v and gate/up across shards"
       vllm::LoadMiniMaxH3EncoderWeights(files, /*max_layers=*/1);
   CHECK(trunc.Has("layers.0.self_attn.qkv_proj.weight"));
   CHECK_FALSE(trunc.Has("layers.1.self_attn.qkv_proj.weight"));
+}
+
+TEST_CASE("minimax_h3: the SHIPPED VAE config.json files parse into the decoders' configs") {
+  // Assembly needs the real configs, not hand-built ones — including the per-channel
+  // latents_mean/std the pipeline denormalizes with. Both files are embedded
+  // verbatim, so this gates the parsers against what the checkpoint ACTUALLY says.
+  const nlohmann::json audio_json = nlohmann::json::parse(vllm_test::kH3AudioVaeConfigJson);
+  vllm::MiniMaxH3LatentStats audio_stats;
+  const vllm::MiniMaxH3AudioVaeConfig audio =
+      vllm::ParseMiniMaxH3AudioVaeConfig(audio_json, &audio_stats);
+
+  // The subtlety: `latent_dim` (2048) is the MEL count BigVGAN consumes, while
+  // `latent_channels` (32) is the VAE latent width that dec_in_proj maps FROM.
+  // Reading the wrong one gives a decoder that is wrong by a factor of 64.
+  CHECK(audio.num_mels == 2048);
+  CHECK(audio.upsample_initial_channel == 1024);
+  CHECK(audio.upsample_rates == std::vector<int64_t>{5, 5, 2, 2, 2, 2, 2});
+  CHECK(audio.upsample_kernel_sizes == std::vector<int64_t>{9, 9, 4, 4, 4, 4, 4});
+  CHECK(audio.resblock_kernel_sizes == std::vector<int64_t>{3, 7, 11});
+  CHECK(audio.resblock_dilation_sizes.size() == 3);
+  // 7 upsample stages take 1024 channels down to 8, which is what conv_post reads
+  // (its real weight_v is [1, 8, 7]) — the config and the manifest agree.
+  int64_t ch = audio.upsample_initial_channel;
+  for (size_t i = 0; i < audio.upsample_rates.size(); ++i) ch /= 2;
+  CHECK(ch == 8);
+  CHECK(audio_stats.mean.size() == 32);  // per VAE latent channel
+  CHECK(audio_stats.std_dev.size() == 32);
+
+  const nlohmann::json video_json = nlohmann::json::parse(vllm_test::kH3VideoVaeConfigJson);
+  vllm::MiniMaxH3LatentStats video_stats;
+  const vllm::MiniMaxH3VideoVaeDecoderConfig video =
+      vllm::ParseMiniMaxH3VideoVaeDecoderConfig(video_json, &video_stats);
+  CHECK(video.num_layers == 36);
+  CHECK(video.in_channels == 24);
+  CHECK(video.out_channels == 3);
+  CHECK(video.num_register_tokens == 4);
+  CHECK(video.block.heads == 32);
+  CHECK(video.block.dim_head == 64);
+  CHECK(video.block.dim == 2048);
+  CHECK(video.block.ff_inner == 2048 * 4);
+  CHECK(video.rope_theta == doctest::Approx(100.0));
+  // rope_apply_dim = int(dim_head * rope_dim_ratio) = int(64 * 0.75).
+  CHECK(video.rope_apply_dim == 48);
+  CHECK(video_stats.mean.size() == 24);  // per video latent channel
+  CHECK(video_stats.std_dev.size() == 24);
+
+  // The parsed geometry must agree with the REAL manifest, not just with itself:
+  // x_embedder maps latent channels -> model dim.
+  for (int64_t i = 0; i < vllm_test::kH3VideoVaeTensorCount; ++i) {
+    if (std::string("decoder.x_embedder.weight") == vllm_test::kH3VideoVaeTensors[i].name) {
+      CHECK(vllm_test::kH3VideoVaeTensors[i].shape[0] == video.block.dim);
+      CHECK(vllm_test::kH3VideoVaeTensors[i].shape[1] == video.in_channels);
+    }
+  }
 }

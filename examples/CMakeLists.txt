@@ -62,3 +62,10 @@ endif()
 add_executable(minimax-h3-mux minimax_h3_mux/main.cpp)
 target_link_libraries(minimax-h3-mux PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(minimax-h3-mux)
+
+# minimax-h3-gen: the ASSEMBLY driver — opens the real checkpoints, runs the whole
+# t2va path and writes an MP4. Lives here because it invokes ffmpeg (the ratified
+# boundary) and because it is a driver, not library surface.
+add_executable(minimax-h3-gen minimax_h3_gen/main.cpp)
+target_link_libraries(minimax-h3-gen PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(minimax-h3-gen)

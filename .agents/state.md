@@ -35674,3 +35674,41 @@ PATH 2 LOADERS ARE DONE: audio VAE, video VAE, encoder. What remains before a re
 generated video is ASSEMBLY - a driver that opens the four checkpoints, runs the
 pipeline and writes the mp4 - plus the MM processor's image preprocessing on real
 inputs.
+
+## 2026-08-03 - MiniMax-H3: ASSEMBLY - the four checkpoints compose
+
+`examples/minimax-h3-gen` opens the DiT (GGUF, dequant or keep-quant), both VAE
+safetensors and both shipped config.json files, plans the request shape, generates,
+writes PPM frames + WAV, and muxes to MP4. It lives in examples/ because that is
+where the ffmpeg invocation is allowed.
+
+Verified over REAL file formats (not mocks) on both GGUF paths: geometry recovered
+from the GGUF (layers/hidden/heads), both VAEs loaded through the loaders written
+this session, text_len derived from the prompt-embeddings file, and the shape plan
+correct - 768x1344 canvas / VAE ratio 16 = 48x84 latent, latent_t 62, 50 steps.
+
+NEW CONFIG PARSERS, gated against the REAL config.json files embedded verbatim
+(they are ~2 KB each, so embedding beats a hand-copied summary that could drift):
+  * `latent_dim` (2048) is BigVGAN's MEL count; `latent_channels` (32) is the VAE
+    latent width dec_in_proj maps FROM. Reading the wrong one is wrong by 64x, and
+    both keys sit in the same file.
+  * rope_apply_dim = int(dim_head * rope_dim_ratio) = int(64 * 0.75) = 48.
+  * Both configs carry per-channel latents_mean/latents_std (32 audio, 24 video),
+    which the pipeline denormalizes with - previously the caller had to supply them.
+The parsed geometry is cross-checked against the MANIFEST, not just itself:
+x_embedder's [2048, 24] must equal (block.dim, in_channels).
+
+DELIBERATE SCOPE: prompt EMBEDDINGS are an input file, not computed in the driver.
+The encoder tower needs a tokenizer plus a 32B forward, which is its own driver, and
+separating them keeps "do the checkpoints compose?" answerable independently.
+
+Noise is drawn from a local splitmix64 stream, seeded for reproducibility, and the
+code says explicitly that this does NOT reproduce torch's RNG - matching it decides
+WHICH sample you get, not whether the pipeline is right, and pretending otherwise
+would invite comparing our sample to upstream's as if they should match.
+
+HONEST LIMIT: no full generation on a REAL checkpoint has run. Everything is gated
+on synthetic files and real manifests/configs. That download is the next step, and
+it is the only thing between here and a video that can actually be watched.
+
+Gate: 47/47 (13763 assertions).

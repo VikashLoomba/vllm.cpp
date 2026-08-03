@@ -504,6 +504,22 @@ struct MiniMaxH3VideoVaeDecoderConfig {
   double rope_theta = 100.0;
 };
 
+// The per-channel latent statistics both VAEs ship in their config.json. The
+// pipeline DENORMALIZES with these before decoding; getting them from the config
+// (rather than a caller's hardcoded table) is what makes a real run reproducible.
+struct MiniMaxH3LatentStats {
+  std::vector<float> mean, std_dev;
+};
+
+// Parse `audio_vae/config.json` (AutoencoderKLMiniMaxH3Audio) and `vae/config.json`
+// (AutoencoderKLMiniMaxH3) into the configs the decoders take, plus their latent
+// statistics. Absent keys keep the SHIPPED defaults, matching
+// ParseMiniMaxH3DitParams' contract.
+MiniMaxH3AudioVaeConfig ParseMiniMaxH3AudioVaeConfig(const nlohmann::json& config,
+                                                     MiniMaxH3LatentStats* stats = nullptr);
+MiniMaxH3VideoVaeDecoderConfig ParseMiniMaxH3VideoVaeDecoderConfig(
+    const nlohmann::json& config, MiniMaxH3LatentStats* stats = nullptr);
+
 struct MiniMaxH3VideoFrameShape {
   int64_t channels = 0, t = 0, h = 0, w = 0;
 };

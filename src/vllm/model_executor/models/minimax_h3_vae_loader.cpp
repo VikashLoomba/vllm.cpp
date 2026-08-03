@@ -291,4 +291,102 @@ MiniMaxH3AudioVaeWeights LoadMiniMaxH3EncoderWeights(const std::vector<Safetenso
   return out;
 }
 
+
+// --- config.json parsing ----------------------------------------------------
+namespace {
+
+void ReadStats(const nlohmann::json& config, MiniMaxH3LatentStats* stats) {
+  if (stats == nullptr) return;
+  auto read = [&](const char* key, std::vector<float>& into) {
+    if (!config.contains(key) || !config.at(key).is_array()) return;
+    for (const auto& v : config.at(key)) into.push_back(v.get<float>());
+  };
+  read("latents_mean", stats->mean);
+  read("latents_std", stats->std_dev);
+  VT_CHECK(stats->mean.size() == stats->std_dev.size(),
+           "minimax_h3 config: latents_mean and latents_std must have equal length");
+}
+
+std::vector<int64_t> ReadIntArray(const nlohmann::json& config, const char* key,
+                                  const std::vector<int64_t>& fallback) {
+  if (!config.contains(key) || !config.at(key).is_array()) return fallback;
+  std::vector<int64_t> out;
+  for (const auto& v : config.at(key)) out.push_back(v.get<int64_t>());
+  return out;
+}
+
+}  // namespace
+
+MiniMaxH3AudioVaeConfig ParseMiniMaxH3AudioVaeConfig(const nlohmann::json& config,
+                                                     MiniMaxH3LatentStats* stats) {
+  MiniMaxH3AudioVaeConfig out;
+  // `latent_dim` is the mel count BigVGAN consumes (2048), NOT `latent_channels`
+  // (32) — that one is the VAE's own latent width, which dec_in_proj maps FROM.
+  if (config.contains("latent_dim")) out.num_mels = config.at("latent_dim").get<int64_t>();
+  if (config.contains("decoder_dim")) {
+    out.upsample_initial_channel = config.at("decoder_dim").get<int64_t>();
+  }
+  out.upsample_rates = ReadIntArray(config, "decoder_rates", out.upsample_rates);
+  out.upsample_kernel_sizes =
+      ReadIntArray(config, "decoder_kernel_sizes", out.upsample_kernel_sizes);
+  out.resblock_kernel_sizes =
+      ReadIntArray(config, "resblock_kernel_sizes", out.resblock_kernel_sizes);
+  if (config.contains("resblock_dilation_sizes") &&
+      config.at("resblock_dilation_sizes").is_array()) {
+    out.resblock_dilation_sizes.clear();
+    for (const auto& row : config.at("resblock_dilation_sizes")) {
+      std::vector<int64_t> dil;
+      for (const auto& v : row) dil.push_back(v.get<int64_t>());
+      out.resblock_dilation_sizes.push_back(std::move(dil));
+    }
+  }
+  VT_CHECK(out.upsample_rates.size() == out.upsample_kernel_sizes.size(),
+           "minimax_h3 audio vae config: decoder_rates and decoder_kernel_sizes differ in length");
+  VT_CHECK(out.resblock_kernel_sizes.size() == out.resblock_dilation_sizes.size(),
+           "minimax_h3 audio vae config: resblock kernels and dilations differ in length");
+  ReadStats(config, stats);
+  return out;
+}
+
+MiniMaxH3VideoVaeDecoderConfig ParseMiniMaxH3VideoVaeDecoderConfig(const nlohmann::json& config,
+                                                                   MiniMaxH3LatentStats* stats) {
+  MiniMaxH3VideoVaeDecoderConfig out;
+  if (config.contains("decoder_num_layers")) {
+    out.num_layers = config.at("decoder_num_layers").get<int64_t>();
+  }
+  if (config.contains("latent_channels")) {
+    out.in_channels = config.at("latent_channels").get<int64_t>();
+  }
+  if (config.contains("out_channels")) out.out_channels = config.at("out_channels").get<int64_t>();
+  if (config.contains("decoder_num_register_tokens")) {
+    out.num_register_tokens = config.at("decoder_num_register_tokens").get<int64_t>();
+  }
+  if (config.contains("decoder_rope_theta")) {
+    out.rope_theta = config.at("decoder_rope_theta").get<double>();
+  }
+  const int64_t heads = config.contains("decoder_num_attention_heads")
+                            ? config.at("decoder_num_attention_heads").get<int64_t>()
+                            : out.block.heads;
+  const int64_t dim_head = config.contains("decoder_attention_head_dim")
+                               ? config.at("decoder_attention_head_dim").get<int64_t>()
+                               : out.block.dim_head;
+  out.block.heads = heads;
+  out.block.dim_head = dim_head;
+  out.block.dim = heads * dim_head;
+  const int64_t ffn_mult = config.contains("decoder_ffn_mult")
+                               ? config.at("decoder_ffn_mult").get<int64_t>()
+                               : 4;
+  out.block.ff_inner = out.block.dim * ffn_mult;
+  if (config.contains("decoder_norm_eps")) {
+    out.block.eps = config.at("decoder_norm_eps").get<double>();
+  }
+  // rope_apply_dim = int(dim_head * rope_dim_ratio), the checkpoint's own formula.
+  const double ratio = config.contains("decoder_rope_dim_ratio")
+                           ? config.at("decoder_rope_dim_ratio").get<double>()
+                           : 0.75;
+  out.rope_apply_dim = static_cast<int64_t>(static_cast<double>(dim_head) * ratio);
+  ReadStats(config, stats);
+  return out;
+}
+
 }  // namespace vllm

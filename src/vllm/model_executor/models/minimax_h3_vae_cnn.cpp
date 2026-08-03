@@ -37,6 +37,9 @@ int64_t ReflectIndex(int64_t index, int64_t size) {
 
 }  // namespace
 
+// The same reflect rule the conv uses, needed by Downsample3D's asymmetric pad.
+int64_t ReflectIndexPublic(int64_t index, int64_t size) { return ReflectIndex(index, size); }
+
 // A causal 3D convolution with `reflect` spatial padding (conv.py:12-88).
 // Input/output are [C, T, H, W]; weight is [out, in, kt, kh, kw].
 std::vector<float> MiniMaxH3CausalConv3d(const std::vector<float>& in, const MiniMaxH3Conv3dSpec& spec,
@@ -75,9 +78,9 @@ std::vector<float> MiniMaxH3CausalConv3d(const std::vector<float>& in, const Min
     }
   }
 
-  const int64_t out_t = padded_t - kt + 1;
-  const int64_t out_h = padded_h - kh + 1;
-  const int64_t out_w = padded_w - kw + 1;
+  const int64_t out_t = (padded_t - kt) / spec.stride_t + 1;
+  const int64_t out_h = (padded_h - kh) / spec.stride_h + 1;
+  const int64_t out_w = (padded_w - kw) / spec.stride_w + 1;
   VT_CHECK(out_t > 0 && out_h > 0 && out_w > 0, "minimax_h3 conv3d: empty output");
   std::vector<float> out(static_cast<size_t>(co * out_t * out_h * out_w));
   for (int64_t oc = 0; oc < co; ++oc) {
@@ -90,7 +93,9 @@ std::vector<float> MiniMaxH3CausalConv3d(const std::vector<float>& in, const Min
               for (int64_t b = 0; b < kh; ++b) {
                 for (int64_t c2 = 0; c2 < kw; ++c2) {
                   const double v = padded[static_cast<size_t>(
-                      ((ic * padded_t + ot + a) * padded_h + oh + b) * padded_w + ow + c2)];
+                      ((ic * padded_t + ot * spec.stride_t + a) * padded_h + oh * spec.stride_h + b) *
+                          padded_w +
+                      ow * spec.stride_w + c2)];
                   const double k = weight[static_cast<size_t>(
                       (((oc * ci + ic) * kt + a) * kh + b) * kw + c2)];
                   acc += v * k;
@@ -190,6 +195,57 @@ std::vector<float> MiniMaxH3ResnetBlock3dForward(const MiniMaxH3ResnetBlock3dCon
   VT_CHECK(residual.size() == hbuf.size(), "minimax_h3 resnet3d: residual and main-branch shapes must match");
   for (size_t i = 0; i < hbuf.size(); ++i) hbuf[i] += residual[i];
   return hbuf;
+}
+
+// Downsample3D (vae_cnn.py:34-81). When the spatial stride is 2 the input is
+// first padded by ONE on the RIGHT of W and the BOTTOM of H (an ASYMMETRIC pad,
+// `F.pad(x, (0,1,0,1,0,0))`), and only then convolved with padding (1, 0, 0).
+// Padding symmetrically instead shifts the whole sampling lattice by half a pixel.
+std::vector<float> MiniMaxH3Downsample3d(const std::vector<float>& x,
+                                         const MiniMaxH3Downsample3dConfig& config,
+                                         const std::vector<float>& weight,
+                                         const std::vector<float>& bias) {
+  VT_CHECK(config.time_stride == 1 || config.time_stride == 2,
+           "minimax_h3 downsample3d: time_stride must be 1 or 2");
+  VT_CHECK(config.space_stride >= 1 && config.space_stride <= 3,
+           "minimax_h3 downsample3d: space_stride must be 1, 2 or 3");
+
+  std::vector<float> input = x;
+  int64_t h = config.h, w = config.w;
+  if (config.space_stride == 2) {
+    const int64_t nh = h + 1, nw = w + 1;
+    std::vector<float> padded(static_cast<size_t>(config.in_channels * config.t * nh * nw), 0.0f);
+    for (int64_t c = 0; c < config.in_channels; ++c) {
+      for (int64_t ti = 0; ti < config.t; ++ti) {
+        for (int64_t hi = 0; hi < nh; ++hi) {
+          for (int64_t wi = 0; wi < nw; ++wi) {
+            // `reflect` on the added right/bottom edge, matching pad_mode.
+            const int64_t sh = hi < h ? hi : ReflectIndexPublic(hi, h);
+            const int64_t sw = wi < w ? wi : ReflectIndexPublic(wi, w);
+            padded[static_cast<size_t>(((c * config.t + ti) * nh + hi) * nw + wi)] =
+                x[static_cast<size_t>(((c * config.t + ti) * h + sh) * w + sw)];
+          }
+        }
+      }
+    }
+    input.swap(padded);
+    h = nh;
+    w = nw;
+  }
+
+  MiniMaxH3Conv3dSpec spec;
+  spec.in_channels = config.in_channels;
+  spec.out_channels = config.out_channels;
+  spec.t = config.t;
+  spec.h = h;
+  spec.w = w;
+  spec.kernel_t = spec.kernel_h = spec.kernel_w = 3;
+  spec.pad_t = 1;
+  spec.pad_h = spec.pad_w = 0;  // padding=(1, 0, 0)
+  spec.stride_t = config.time_stride;
+  spec.stride_h = spec.stride_w = config.space_stride;
+  spec.causal = true;
+  return MiniMaxH3CausalConv3d(input, spec, weight, &bias);
 }
 
 }  // namespace vllm

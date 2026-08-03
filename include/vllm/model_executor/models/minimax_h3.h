@@ -493,8 +493,23 @@ struct MiniMaxH3Conv3dSpec {
   int64_t t = 0, h = 0, w = 0;
   int64_t kernel_t = 3, kernel_h = 3, kernel_w = 3;
   int64_t pad_t = 1, pad_h = 1, pad_w = 1;
+  int64_t stride_t = 1, stride_h = 1, stride_w = 1;
   bool causal = true;  // all temporal padding on the LEFT
 };
+
+struct MiniMaxH3Downsample3dConfig {
+  int64_t in_channels = 0, out_channels = 0;
+  int64_t t = 0, h = 0, w = 0;
+  int64_t time_stride = 1;
+  int64_t space_stride = 2;
+};
+
+// Downsample3D: an ASYMMETRIC one-pixel pad on the right/bottom when the spatial
+// stride is 2, then a strided causal conv with padding (1, 0, 0).
+std::vector<float> MiniMaxH3Downsample3d(const std::vector<float>& x,
+                                         const MiniMaxH3Downsample3dConfig& config,
+                                         const std::vector<float>& weight,
+                                         const std::vector<float>& bias);
 
 // Causal Conv3d with `reflect` spatial padding; [C,T,H,W] in and out.
 std::vector<float> MiniMaxH3CausalConv3d(const std::vector<float>& in,

@@ -273,6 +273,35 @@ def emit_resnet3d(out, src) -> None:
     emit_f32(out, "kH3Res3dGolden", y.reshape(-1))
 
 
+def emit_downsample3d(out, src) -> None:
+    """Section: Downsample3D — the encoder's strided, asymmetrically-padded conv."""
+    cnn = load_bundle(src, "vae_cnn")
+    in_ch, out_ch = 32, 32
+    t, hh, ww = 3, 4, 4
+    block = cnn.Downsample3D(in_ch, out_ch, time_stride=2, space_stride=2,
+                             padding_mode="reflect", causal=True).eval()
+    state = block.state_dict()
+    for name, tensor in state.items():
+        scale = 0.05 if name.endswith(".bias") else 0.1
+        state[name] = torch.from_numpy(
+            (h3_rand("down3d." + name, tensor.numel()) * scale).astype(np.float32)
+        ).reshape(tensor.shape)
+    block.load_state_dict(state, strict=True)
+    x = torch.from_numpy(
+        h3_rand("down3d.input", in_ch * t * hh * ww).astype(np.float32)
+    ).reshape(1, in_ch, t, hh, ww)
+    y = block(x)
+    out.write(f"inline constexpr int64_t kH3Down3dInCh = {in_ch};\n")
+    out.write(f"inline constexpr int64_t kH3Down3dOutCh = {out_ch};\n")
+    out.write(f"inline constexpr int64_t kH3Down3dT = {t};\n")
+    out.write(f"inline constexpr int64_t kH3Down3dH = {hh};\n")
+    out.write(f"inline constexpr int64_t kH3Down3dW = {ww};\n")
+    out.write(f"inline constexpr int64_t kH3Down3dOutT = {int(y.shape[2])};\n")
+    out.write(f"inline constexpr int64_t kH3Down3dOutH = {int(y.shape[3])};\n")
+    out.write(f"inline constexpr int64_t kH3Down3dOutW = {int(y.shape[4])};\n\n")
+    emit_f32(out, "kH3Down3dGolden", y.reshape(-1))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--h3-vae-source", required=True, type=Path,
@@ -380,6 +409,7 @@ def main() -> int:
         emit_f32(out, "kH3VideoVaeDecoderGolden", frames.reshape(-1))
         emit_tiling(out)
         emit_resnet3d(out, src)
+        emit_downsample3d(out, src)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out} (ff inner {int(inner)})", file=sys.stderr)
     return 0

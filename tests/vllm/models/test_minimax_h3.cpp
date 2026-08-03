@@ -2208,6 +2208,41 @@ TEST_CASE("minimax_h3: the VAE encoder ResnetBlock3D matches upstream") {
   CHECK(ca[2] != cb[2]);   // frame 2 does
 }
 
+TEST_CASE("minimax_h3: the VAE encoder Downsample3D matches upstream") {
+  // The strided conv between encoder levels. Its subtlety is the ASYMMETRIC
+  // pre-pad: one pixel on the RIGHT of W and the BOTTOM of H before a stride-2
+  // conv with padding (1, 0, 0). Padding symmetrically instead shifts the whole
+  // sampling lattice by half a pixel -- no error, just a subtly wrong latent.
+  vllm::MiniMaxH3Downsample3dConfig config;
+  config.in_channels = vllm_test::kH3Down3dInCh;
+  config.out_channels = vllm_test::kH3Down3dOutCh;
+  config.t = vllm_test::kH3Down3dT;
+  config.h = vllm_test::kH3Down3dH;
+  config.w = vllm_test::kH3Down3dW;
+  config.time_stride = 2;
+  config.space_stride = 2;
+
+  const std::vector<float> weight =
+      MakeParam("down3d.conv.weight", config.out_channels * config.in_channels * 27, 0.1);
+  const std::vector<float> bias = MakeParam("down3d.conv.bias", config.out_channels, 0.05);
+  const std::vector<float> x = MakeParam(
+      "down3d.input", config.in_channels * config.t * config.h * config.w, 1.0);
+
+  const std::vector<float> got = vllm::MiniMaxH3Downsample3d(x, config, weight, bias);
+
+  const int64_t expected = config.out_channels * vllm_test::kH3Down3dOutT *
+                           vllm_test::kH3Down3dOutH * vllm_test::kH3Down3dOutW;
+  CHECK(static_cast<int64_t>(got.size()) == expected);
+  REQUIRE(got.size() == std::size(vllm_test::kH3Down3dGolden));
+  const double err = MaxAbsDiff(got, vllm_test::kH3Down3dGolden, got.size());
+  INFO("downsample3d max|diff| = " << err);
+  CHECK(err <= 1e-4);
+
+  // Strides genuinely halve each axis (T 3->2 under the causal pad, H/W 4->2).
+  CHECK(vllm_test::kH3Down3dOutH == config.h / 2);
+  CHECK(vllm_test::kH3Down3dOutW == config.w / 2);
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

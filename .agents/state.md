@@ -35049,3 +35049,20 @@ layer that holds it, not at the layer where a legitimate mixing step breaks it.
 processor, ffmpeg media I/O + MP4 muxing (ONE dependency decision), and the
 device-resident FP4 forward plus any speed number (needs a GPU).
 
+## 2026-08-03 - MiniMax-H3: video-VAE Downsample3D
+
+The strided inter-level convolution is ported and exact, and the shared causal
+Conv3d now carries stride. Only the EncoderFCN3D level-loop assembly remains on the
+VAE encoder (and the encoder is conditioning-only - a t2va path does not use it).
+
+**The subtlety:** when the spatial stride is 2 the input is padded by ONE pixel on
+the RIGHT of W and the BOTTOM of H before a stride-2 conv with padding (1, 0, 0).
+That asymmetric pre-pad is what keeps the sampling lattice aligned; padding
+symmetrically instead shifts everything by half a pixel - a silent wrong latent, not
+an error anywhere.
+
+**Housekeeping:** a clean-rebuild hit ENOSPC partway through - about fifteen
+throwaway build trees at ~4.7 GB each had accumulated over this session. Removed
+them (71 GB free again) and re-verified from scratch. Worth doing at the END of any
+long session that rebuilds repeatedly.
+

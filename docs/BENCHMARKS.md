@@ -1,5 +1,41 @@
 # Benchmarks
 
+## MiniMax-H3 (omni-modal video+audio DiT) — PENDING (hardware-blocked), correctness gated (2026-08-03, `CLAIM-MINIMAX-H3-W0-W2`)
+
+**Throughput disposition: PENDING — and not reproducible on this project's hardware.**
+MiniMax-H3 is a 33.1B CFG-distilled joint video+audio diffusion transformer. Its
+checkpoint is ~354 GB (DiT 66.3 GB + Qwen3-VL-derived encoder 51.5 GB + video VAE
+~10 GB + audio VAE ~0.6 GB) and upstream validates on **4x NVIDIA B300 at ~133 GB
+peak per rank**. This project's target is ONE GB10 with 119 GiB **unified** memory,
+where CPU offload cannot help because the pool IS host RAM. No end-to-end latency,
+throughput, or frame result is claimed, and none can be produced here.
+
+**Reference figures (upstream, NOT ours, recorded for the eventual comparison):**
+FL2VA 8.7 s clip at 1248x768 in ~87 s E2E on 4x B300 with USP-4 + regional
+torch.compile; the DiT is ~88% of request latency; 50 inference steps at 24 FPS.
+
+**Correctness that IS gated (no GPU needed).** Upstream's H3 modules are pure Python,
+so they are executed at reduced dimensions as the oracle
+(`scripts/gen-minimax-h3-goldens.py`; both sides rebuild weights and inputs from an
+identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
+
+| Component | Result |
+|---|---|
+| fl2va packed layout + fp64 position grid | exact / **bit-exact** |
+| ref2va block layout (image + video_audio refs) | exact, incl. fp64 grid |
+| patchify / unpatchify / audio pack / unpack | exact + round-trip identity |
+| euler-ancestral eta0 scheduler + `rf_v_to_x0` | exact (<= 1e-6) |
+| **DiT forward (reduced dims, f32)** | **max abs diff 1.6e-7 video / 1.5e-7 audio** |
+
+**Reproduce:** `cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF`
+then `cmake --build build-cpu --target test_minimax_h3 -j16 && ./build-cpu/tests/test_minimax_h3`
+(10/10 cases, 2539 assertions). Regenerate goldens with
+`python3 scripts/gen-minimax-h3-goldens.py --vllm-omni <vllm-omni checkout> --out tests/vllm/models/minimax_h3_goldens.inc`.
+
+**Next gate:** W2b device-resident forward (where any speed work begins). See
+[.agents/specs/minimax-h3.md](../.agents/specs/minimax-h3.md).
+
+
 ## Laguna-S-2.1-NVFP4 decode — router top-k KERNEL-EFFICIENCY (`VT_LAGUNA_TOPK_SHFL`), BYTE-EXACT, SigmoidTopK 1.67×, −0.57% decode-step GPU (2026-08-03, `CLAIM-LAGUNA-TOPK-SHFL`)
 
 With the residual-norm byte-exact floor reached (`CLAIM-LAGUNA-FAST-NORM` below), a fresh `nsys cuda_gpu_kern_sum --cuda-graph-trace=node` 2-length diff (20-vs-70) ranked the remaining small kernels; excluding the at-parity projection GEMVs (`gemvx`, ~69% of decode step — the IDENTICAL cuBLAS kernels vLLM uses) and the Marlin MoE (we win) / attention-compute kernels, the router `SigmoidTopKKernel` was the single largest still-optimizable small kernel (415 µs/step, 1.6%). Same box/model/ids/env as below (`~/laguna-xs-nvfp4`, ids `2,785,9626,377,15360,395`, `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1`), origin/main `e61b4de3`.

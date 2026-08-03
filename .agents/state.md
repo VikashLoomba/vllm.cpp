@@ -34536,3 +34536,51 @@ unchanged. A RED-first source regression test pins that ownership boundary.
 This is build portability only and changes no runtime, model lifecycle,
 correctness result, or benchmark disposition. Darwin consumer CI remains the
 binding AppleClang verification.
+
+## 2026-08-03 - MiniMax-H3 W0-W2: first DIFFUSION architecture lands (`CLAIM-MINIMAX-H3-W0-W2`)
+
+**What it is.** `MiniMaxAI/MiniMax-H3` is not a text LLM. It is a 33.1B CFG-distilled
+joint video+audio DIFFUSION transformer served by vLLM-Omni over `/v1/videos`: one
+request runs a 50-step flow-matching denoise loop, forwarding the DiT ONCE PER STEP
+over the whole packed sequence, then decodes latents to 24 FPS frames + 32 kHz stereo
+through two VAEs. No KV cache, no sampler, no logits - the SACRED token-exact
+methodology does not apply, and the model is deliberately NOT registered in the
+causal-LM registry (so the born-on-the-runner seam does not apply either).
+
+**Hardware verdict (settled, not revisitable by software).** ~354 GB checkpoint;
+upstream validates on 4x NVIDIA B300 at ~133 GB peak per rank. One GB10 has 119 GiB
+UNIFIED memory, so CPU offload cannot help (the pool IS host RAM). End-to-end H3 is
+IMPOSSIBLE on this project's hardware. Recorded as such; no e2e claim exists.
+
+**What that leaves, and why it is strong.** vLLM-Omni's H3 implementation is pure
+Python that runs on CPU. So the gate is upstream ITSELF, executed at reduced
+dimensions: `scripts/gen-minimax-h3-goldens.py` imports `packed_sequence.py`,
+`packed_tokens.py` and the scheduler BY FILE PATH (bypassing the package `__init__`,
+which needs neither vllm nor aenum) and restates the DiT at TP=1, then freezes the
+outputs. Both sides rebuild weights and inputs from an identical FNV-1a + splitmix64
+stream, so not one weight byte is checked in. Result: 10/10 cases, 2539 assertions,
+**DiT forward max abs diff 1.6e-7** - f32 round-off, i.e. the algorithm is right.
+
+**Two things worth remembering.**
+1. The FP64 position grid is gated BIT-EXACT because it feeds RoPE. Reproducing it
+   required matching upstream's arithmetic ORDER, not its formulas: numpy's
+   `linspace(endpoint=False)` evaluates `i*step + start`, and upstream keeps a
+   numpy-PAIRWISE span sum and a Python-SEQUENTIAL span sum deliberately separate
+   because they diverge in the last ulp from n=16 (`packed_sequence.py:101-113`).
+2. The two VAEs are **checkpoint REMOTE CODE** loaded via
+   `get_class_from_dynamic_module` under `trust_remote_code` (`vae.py:41-53`).
+   vLLM-Omni only ADAPTS them. A no-Python engine must REIMPLEMENT them in C++ from
+   the checkpoint's own source - that is W4/W5 and it is not a small brick.
+
+**Reuse that paid off.** The packed varlen non-causal attention is exactly the
+contract of our shared `vt::DFlashBlockAttention(causal=false)`, and the H3-Encoder is
+a Qwen3-VL we already ship (layer-50 truncation + DeepStack + all-ones mask). No new
+kernel was added in this change.
+
+**Next.** W2b device-resident/bf16 forward + fusion folds (also where any speed work
+belongs - upstream reports the DiT at 88% of request latency), W3 encoder on the
+existing Qwen3-VL tower, W4/W5 the two VAEs, W6 pipeline/tasks, W7 `/v1/videos` + MP4
+muxing (needs a NEW dependency decision - the tree has no muxer or A/V encoder), W8
+USP multi-GPU. OPEN: there is no vllm-omni parity PIN; the upstream-sync protocol
+covers only the vLLM repo. Spec: `.agents/specs/minimax-h3.md`.
+

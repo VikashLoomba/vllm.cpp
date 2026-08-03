@@ -1,0 +1,333 @@
+// MiniMax-H3 (`MiniMaxAI/MiniMax-H3`) — the omni-modal video+audio DIFFUSION
+// transformer, ported from vLLM-Omni (vllm-project/vllm-omni). This is the
+// project's FIRST diffusion architecture: H3 is not an autoregressive decoder, so
+// it has no KV cache, no sampler, and no logits. One request runs a fixed 50-step
+// flow-matching denoise loop in which the DiT is forwarded ONCE per step over the
+// WHOLE packed sequence, and the resulting latents are decoded to frames + a
+// stereo waveform by two VAEs.
+//
+// ─── HONESTY (up front) ──────────────────────────────────────────────────────
+// The real checkpoint is ~354 GB (33.1B DiT + a Qwen3-VL-32B-derived encoder + a
+// video VAE + an audio VAE) and its validated serving config is 4x NVIDIA B300 at
+// ~133 GB peak per rank. That does not fit this project's hardware (one GB10, 119
+// GiB UNIFIED), so there is NO end-to-end token/frame gate for H3 on this box and
+// none is claimed. What IS gated here is exact: the layout math, the scheduler,
+// and the DiT forward are compared against the UPSTREAM vLLM-Omni modules
+// executed at reduced dimensions (scripts/gen-minimax-h3-goldens.py). Structure
+// and math are proven; end-to-end generation is hardware-blocked. Full lifecycle,
+// component inventory, and the remaining bricks: .agents/specs/minimax-h3.md.
+//
+// ─── WHAT THIS IS A PORT OF (file:line on BOTH sides) ────────────────────────
+// Upstream root: vllm-project/vllm-omni, vllm_omni/diffusion/models/minimax_h3/
+//   OURS                                  <-  UPSTREAM
+//   MiniMaxH3DitParams                    <-  minimax_h3_transformer.py:47-78
+//                                             (MiniMaxH3DiTArchConfig.from_mapping)
+//   MiniMaxH3PatchifyVideoLatent          <-  packed_tokens.py:23-41
+//   MiniMaxH3UnpatchifyVideoTokens        <-  packed_tokens.py:44-70
+//   MiniMaxH3PackAudioLatent              <-  packed_tokens.py:73-85
+//   MiniMaxH3UnpackAudioTokens            <-  packed_tokens.py:88-106
+//   BuildMiniMaxH3PackedSequence          <-  packed_sequence.py:116-239
+//   BuildMiniMaxH3PackedSequenceRef2va    <-  packed_sequence.py:290-557
+//   MiniMaxH3RfVToX0                      <-  scheduling_...euler_ancestral.py:49-69
+//   MiniMaxH3EulerEta0Step                <-  scheduling_...euler_ancestral.py:72-102
+//   MiniMaxH3DitForward                   <-  minimax_h3_transformer.py:986-1102
+//   EnumerateMiniMaxH3DitTensors          <-  minimax_h3_transformer.py:906-922
+//   MiniMaxH3ReorderGroupedQkv            <-  minimax_h3_transformer.py:139-168
+//   MiniMaxH3DenoiseLoop                  <-  denoise_loop.py:129-239
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "vt/device.h"
+#include "vt/tensor.h"
+
+namespace vllm {
+
+// ---------------------------------------------------------------------------
+// Architecture
+// ---------------------------------------------------------------------------
+
+// MiniMaxH3DiTArchConfig (minimax_h3_transformer.py:47-78). Defaults are the
+// SHIPPED MiniMax-H3 geometry; `ParseMiniMaxH3DitParams` overrides any key the
+// checkpoint's transformer config actually carries, exactly like `from_mapping`.
+struct MiniMaxH3DitParams {
+  int64_t num_layers = 50;
+  int64_t token_refiner_num_layers = 2;
+  int64_t hidden_size = 5376;
+  int64_t num_attention_heads = 56;  // MHA: num_kv_heads == num_attention_heads
+  int64_t attention_head_dim = 128;
+  int64_t ffn_hidden_size = 14336;
+  int64_t latents_dim = 24;        // video VAE latent channels
+  int64_t audio_latents_dim = 32;  // audio VAE latent channels
+  int64_t patch_size_t = 1;
+  int64_t patch_size_h = 2;
+  int64_t patch_size_w = 2;
+  int64_t text_dim = 5120;  // H3-Encoder hidden width (Qwen3-VL layer 50)
+  int64_t timestep_input_dim = 256;
+  int64_t time_embed_hidden_size = 5376;
+  int64_t time_embed_dim = 2688;
+  int64_t adaln_out_features = 18 * 5376;      // 6 vectors x 3 modalities x H
+  int64_t final_adaln_out_features = 2 * 5376;  // 2 vectors x 1 modality x H
+  int64_t rope_inv_freq_len = 16;
+  double norm_eps = 1e-5;
+  double qk_norm_eps = 1e-5;
+  double final_norm_eps = 1e-5;
+
+  // Derived. video_row_width is the packed video token width
+  // (latents_dim * patch volume; 24*1*2*2 = 96 at shipped scale).
+  int64_t video_row_width() const {
+    return latents_dim * patch_size_t * patch_size_h * patch_size_w;
+  }
+  // 3D RoPE rotates 6*rope_inv_freq_len of attention_head_dim dims
+  // (minimax_h3_transformer.py:207-230; 96 of 128 at shipped scale).
+  int64_t rope_rot_dim() const { return 6 * rope_inv_freq_len; }
+};
+
+// AdaLN modality count: token tags are -1 padding and 0/1/2 for video/text/audio
+// (minimax_h3_transformer.py:103-106).
+inline constexpr int64_t kMiniMaxH3AdalnModalityNum = 3;
+
+// Packed-sequence token tags (packed_sequence.py:218-221).
+inline constexpr int64_t kMiniMaxH3TagPadding = -1;
+inline constexpr int64_t kMiniMaxH3TagVideo = 0;
+inline constexpr int64_t kMiniMaxH3TagText = 1;
+inline constexpr int64_t kMiniMaxH3TagAudio = 2;
+
+// Packed-sequence placeholder input ids (packed_sequence.py:27-35).
+inline constexpr int64_t kMiniMaxH3TextId = -5;
+inline constexpr int64_t kMiniMaxH3ImgVidCondId = -11;
+inline constexpr int64_t kMiniMaxH3AudioRefCondId = -17;
+inline constexpr int64_t kMiniMaxH3AudioFirstId = -15;
+inline constexpr int64_t kMiniMaxH3AudioId = -14;
+inline constexpr int64_t kMiniMaxH3VideoFirstId = -3;
+inline constexpr int64_t kMiniMaxH3VideoId = -2;
+inline constexpr int64_t kMiniMaxH3VideoLastId = -4;
+inline constexpr int64_t kMiniMaxH3PadId = -1;
+
+// Condition anchor timesteps (denoise_loop.py:22-24).
+inline constexpr double kMiniMaxH3ImgVidCondTimestep = 0.999;
+inline constexpr double kMiniMaxH3AudioRefCondTimestep = 1.0;
+
+// Parse the checkpoint transformer config. Mirrors `from_mapping`: unknown keys
+// are ignored, present keys override, and `patch_size` must carry three values.
+MiniMaxH3DitParams ParseMiniMaxH3DitParams(const nlohmann::json& config);
+
+// ---------------------------------------------------------------------------
+// Latent <-> packed-token conversion (packed_tokens.py). Host-side layout math on
+// f32 rows; these move bytes, they do not compute, so they stay off the device.
+// ---------------------------------------------------------------------------
+
+// [B,C,T,H,W] -> [B*t*h*w, C*pt*ph*pw] (packed_tokens.py:23-41).
+std::vector<float> MiniMaxH3PatchifyVideoLatent(const std::vector<float>& latent, int64_t batch,
+                                                int64_t channels, int64_t full_t, int64_t full_h,
+                                                int64_t full_w, int64_t patch_t, int64_t patch_h,
+                                                int64_t patch_w);
+
+// Inverse of the above (packed_tokens.py:44-70). `rows` is [N, C*pt*ph*pw].
+std::vector<float> MiniMaxH3UnpatchifyVideoTokens(const std::vector<float>& rows, int64_t t,
+                                                  int64_t h, int64_t w, int64_t channels,
+                                                  int64_t patch_t, int64_t patch_h, int64_t patch_w);
+
+// [audio_channel, latent_dim, T] -> [audio_channel*T, latent_dim]
+// (packed_tokens.py:73-85).
+std::vector<float> MiniMaxH3PackAudioLatent(const std::vector<float>& latent, int64_t audio_channel,
+                                            int64_t latent_dim, int64_t steps);
+
+// Inverse (packed_tokens.py:88-106). `rows` is [audio_t, latent_dim].
+std::vector<float> MiniMaxH3UnpackAudioTokens(const std::vector<float>& rows, int64_t audio_t,
+                                              int64_t audio_channel, int64_t latent_dim);
+
+// ---------------------------------------------------------------------------
+// Packed sequence (packed_sequence.py)
+// ---------------------------------------------------------------------------
+
+// The structural fields of one CFG branch's packed sequence. Layout:
+//   [text L | imgvid_cond C | audio A | video_target V | pad P]
+// The used length is padded up to a multiple of 64 and the padding becomes a
+// SECOND attention document, so attention never crosses into it.
+struct MiniMaxH3PackedSequence {
+  int64_t seq_len = 0;
+  std::vector<int64_t> input_ids;    // [seq_len] placeholder ids
+  std::vector<uint8_t> image_mask;   // [seq_len]
+  std::vector<uint8_t> audio_mask;   // [seq_len]
+  std::vector<int64_t> img_pos;      // cond rows then target rows
+  std::vector<int64_t> audio_pos;    // reference rows then target rows
+  std::vector<int64_t> text_pos;     // [0, text_len)
+  std::vector<uint8_t> update_mask;  // per img_pos row: is it a denoise target?
+  std::vector<uint8_t> audio_update_mask;  // per audio_pos row (ref2va only)
+  // [seq_len, 3] (t, h, w) grid in FP64. Kept as double on purpose: the grid is
+  // built by fp64 accumulations whose last ulp feeds RoPE, and upstream keeps two
+  // deliberately DIFFERENT summation orders for it (see packed_sequence.py:101-113).
+  std::vector<double> img_position_ids;
+  std::vector<int64_t> token_tags;   // [seq_len]
+  std::vector<int32_t> cu_seqlens;   // {0, used, seq_len}
+  std::vector<int32_t> document_id;  // [seq_len]; 1 on the padding document
+};
+
+// fl2va / t2va layout (packed_sequence.py:116-239). `keyframe_frame_indices` must
+// be one of {}, {0}, {-1}, {0,-1} and requires `frame_count` when non-empty.
+MiniMaxH3PackedSequence BuildMiniMaxH3PackedSequence(int64_t text_len, int64_t latent_t,
+                                                     int64_t latent_h, int64_t latent_w,
+                                                     int64_t audio_t, int64_t audio_channel,
+                                                     bool include_keyframe_cond,
+                                                     const std::vector<int64_t>& keyframe_frame_indices,
+                                                     int64_t frame_count);
+
+// One ref2va reference block (packed_sequence.py:290-313).
+struct MiniMaxH3RefBlock {
+  enum class Kind { kImage, kAudio, kVideoAudio };
+  Kind kind = Kind::kImage;
+  int64_t ref_audio_t = 0;
+  int64_t latent_t = 0;
+  int64_t latent_h = 0;
+  int64_t latent_w = 0;
+};
+
+// General ref2va-family layout (packed_sequence.py:290-557).
+MiniMaxH3PackedSequence BuildMiniMaxH3PackedSequenceRef2va(
+    int64_t text_len, int64_t latent_t, int64_t latent_h, int64_t latent_w, int64_t audio_t,
+    const std::vector<MiniMaxH3RefBlock>& ref_blocks, int64_t audio_channel);
+
+// ---------------------------------------------------------------------------
+// Flow-matching scheduler (scheduling_minimax_h3_euler_ancestral.py)
+// ---------------------------------------------------------------------------
+
+// x0 = xt + (1 - t) * v (scheduling:49-69). Rectified-flow velocity -> clean sample.
+std::vector<float> MiniMaxH3RfVToX0(const std::vector<float>& xt, const std::vector<float>& v,
+                                    double timestep);
+
+// Ancestral Euler with eta = 0 (scheduling:72-102):
+//   out = r * state + (1 - r) * denoised,  r = sigma_next / sigma_curr.
+// sigma_curr == 0 is the terminal step and returns `state` unchanged.
+std::vector<float> MiniMaxH3EulerEta0Step(const std::vector<float>& state,
+                                          const std::vector<float>& denoised, double sigma_curr,
+                                          double sigma_next);
+
+// ---------------------------------------------------------------------------
+// DiT weights + forward
+// ---------------------------------------------------------------------------
+
+// Checkpoint tensor names in load order, with their expected shapes. The H3 DiT
+// loads by EXACT checkpoint name (minimax_h3_transformer.py:906-922), so this
+// enumeration IS the weight contract and is gated structurally without the
+// checkpoint.
+struct MiniMaxH3TensorSpec {
+  std::string name;
+  std::vector<int64_t> shape;
+  // The 12 latent/timestep/output params and the RoPE buffer stay FP32 after load
+  // (minimax_h3_transformer.py:85-101, 898-904); everything else is BF16.
+  bool fp32 = false;
+};
+
+std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3DitTensors(const MiniMaxH3DitParams& params);
+
+// The checkpoint stores qkv GROUPED per query group as [q_per_group, k, v]; the
+// fused qkv projection wants [q_all, k_all, v_all] (minimax_h3_transformer.py:
+// 139-168). H3 is MHA, so heads_per_group == 1.
+std::vector<float> MiniMaxH3ReorderGroupedQkv(const std::vector<float>& weight,
+                                              int64_t num_query_groups, int64_t heads_per_group,
+                                              int64_t head_dim, int64_t in_features);
+
+// Non-owning views of every DiT parameter, in the shape the forward consumes.
+struct MiniMaxH3DitBlockWeights {
+  vt::Tensor norm1;      // [H]
+  vt::Tensor norm2;      // [H]
+  vt::Tensor qkv_proj;   // [3*heads*Dh, H]
+  vt::Tensor q_norm;     // [Dh]
+  vt::Tensor k_norm;     // [Dh]
+  vt::Tensor out_proj;   // [H, heads*Dh]
+  vt::Tensor fc1;        // [2*ffn, H] as [gate; up]
+  vt::Tensor fc2;        // [H, ffn]
+  vt::Tensor adaln_w;    // [expand*modality*H, time_embed_dim] (blocks only)
+  vt::Tensor adaln_b;    // [expand*modality*H]
+};
+
+struct MiniMaxH3DitWeights {
+  vt::Tensor video_patch_proj_w, video_patch_proj_b;
+  vt::Tensor audio_patch_proj_w, audio_patch_proj_b;
+  vt::Tensor condition_proj_w, condition_proj_b;
+  vt::Tensor time_proj_in_w, time_proj_in_b;
+  vt::Tensor time_proj_out_w, time_proj_out_b;
+  vt::Tensor rope_inv_freq;  // [rope_inv_freq_len], fp32
+  std::vector<MiniMaxH3DitBlockWeights> refiner;  // no adaln, no rope
+  vt::Tensor refiner_final_norm;
+  std::vector<MiniMaxH3DitBlockWeights> blocks;
+  vt::Tensor final_norm;
+  vt::Tensor final_adaln_w, final_adaln_b;
+  vt::Tensor video_out_w, video_out_b;
+  vt::Tensor audio_out_w, audio_out_b;
+};
+
+// The per-step inputs of one denoise step (minimax_h3_transformer.py:986-1102).
+// Row-major host buffers; the forward stages them onto `device` itself.
+struct MiniMaxH3DitInputs {
+  int64_t seq_len = 0;
+  const float* x = nullptr;            // [seq_len, video_row_width]
+  const float* audio_x = nullptr;      // [seq_len, audio_latents_dim]
+  const double* img_position_ids = nullptr;  // [seq_len, 3]
+  const float* unique_timesteps = nullptr;   // [M]
+  int64_t num_unique_timesteps = 0;
+  const int64_t* inverse_indices = nullptr;  // [seq_len] -> [0, M)
+  const int64_t* token_tags = nullptr;       // [seq_len]
+  const float* prompt_embeds = nullptr;      // [text_len, text_dim]
+  const int64_t* img_pos = nullptr;
+  int64_t num_img_pos = 0;
+  const int64_t* audio_pos = nullptr;
+  int64_t num_audio_pos = 0;
+  const int64_t* text_pos = nullptr;
+  int64_t num_text_pos = 0;
+  const int64_t* infer_out_pos = nullptr;  // rows the video head reports
+  int64_t num_infer_out_pos = 0;
+  const uint8_t* update_mask = nullptr;        // [num_infer_out_pos]
+  const uint8_t* audio_update_mask = nullptr;  // optional, [num_audio_pos]
+  const int32_t* cu_seqlens = nullptr;         // {0, used, seq_len}
+  int64_t num_cu_seqlens = 0;
+  const int32_t* refiner_cu_seqlens = nullptr;
+  int64_t num_refiner_cu_seqlens = 0;
+  bool skip_mask_out_condition = false;
+};
+
+struct MiniMaxH3DitOutputs {
+  std::vector<float> video_logits;  // [num_infer_out_pos, video_row_width]
+  std::vector<float> audio_logits;  // [num_audio_pos, audio_latents_dim]
+};
+
+// One DiT forward = one denoise step's velocity prediction. `compute_dtype` picks
+// the block-stream dtype: kBF16 is the production path (upstream's cast points are
+// preserved), kF32 is the parity path the golden suite gates.
+MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitParams& params,
+                                        const MiniMaxH3DitWeights& weights,
+                                        const MiniMaxH3DitInputs& inputs,
+                                        vt::DType compute_dtype);
+
+// ---------------------------------------------------------------------------
+// Denoise loop (denoise_loop.py:129-239)
+// ---------------------------------------------------------------------------
+
+// Static per-branch state: the packed layout plus the fixed forward inputs.
+struct MiniMaxH3DenoiseBranch {
+  MiniMaxH3PackedSequence packed;
+  std::vector<float> text_embeddings;  // [text_len, text_dim]
+  std::vector<int64_t> token_tags;     // seq_len, with fl2va vision overrides applied
+};
+
+// Runs the CFG-distilled loop: one positive forward per step, video and audio
+// target rows chained through the Euler-eta0 update while pinned condition rows
+// are reset to their anchors every step. Returns the final (video, audio) rows.
+struct MiniMaxH3DenoiseResult {
+  std::vector<float> video_rows;  // [num_img_pos, video_row_width]
+  std::vector<float> audio_rows;  // [num_audio_pos, audio_latents_dim]
+};
+
+MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
+    vt::Device device, const MiniMaxH3DitParams& params, const MiniMaxH3DitWeights& weights,
+    const MiniMaxH3DenoiseBranch& branch, const std::vector<float>& initial_video_rows,
+    const std::vector<float>& initial_audio_rows, const std::vector<float>& keyframe_cond_rows,
+    const std::vector<float>& audio_ref_rows, const std::vector<double>& sigmas_video,
+    const std::vector<double>& sigmas_audio, vt::DType compute_dtype);
+
+}  // namespace vllm

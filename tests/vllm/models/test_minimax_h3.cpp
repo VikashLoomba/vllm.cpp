@@ -541,6 +541,51 @@ static void CheckDeviceForward(vt::Queue& q, const char* label) {
   }
 }
 
+// The bf16 sibling of CheckDeviceForward: gates the PRODUCTION dtype policy on the
+// device path. Same code, different rounding points -- the device forward rounds in
+// place at exactly the reference's dt.Apply sites, so what is being compared is the
+// CAST POINTS, not a different algorithm.
+static void CheckDeviceForwardBf16(vt::Queue& q, const char* label) {
+  const std::unique_ptr<GoldenWeights> weights = BuildGoldenWeights();
+  const MiniMaxH3DitParams& p = weights->params;
+  const std::unique_ptr<DitForwardCase> c = BuildDitForwardCase(p);
+
+  const MiniMaxH3DitDeviceWeights staged = StageMiniMaxH3DitWeights(q, p, weights->views);
+  const MiniMaxH3DitOutputs got =
+      MiniMaxH3DitForwardDevice(q, p, staged.weights, c->in, vt::DType::kBF16);
+
+  const double video_err =
+      MaxAbsDiff(got.video_logits, vllm_test::kH3DitVideoLogitsBf16Golden, got.video_logits.size());
+  const double audio_err =
+      MaxAbsDiff(got.audio_logits, vllm_test::kH3DitAudioLogitsBf16Golden, got.audio_logits.size());
+  INFO(label << ": bf16 video max|diff| = " << video_err << ", audio max|diff| = " << audio_err);
+  CHECK(video_err <= 5e-3);
+  CHECK(audio_err <= 5e-3);
+
+  // And the bf16 stream must actually DIFFER from the f32 stream -- otherwise the
+  // dtype policy is not being applied and this test proves nothing.
+  const double vs_f32 =
+      MaxAbsDiff(got.video_logits, vllm_test::kH3DitVideoLogitsGolden, got.video_logits.size());
+  CHECK(vs_f32 > 1e-5);
+}
+
+TEST_CASE("minimax_h3: the DEVICE-resident bf16 stream matches upstream (CPU backend)") {
+  vt::Queue q{Cpu(), nullptr};
+  CheckDeviceForwardBf16(q, "cpu-device-forward-bf16");
+}
+
+TEST_CASE("minimax_h3: the DEVICE-resident bf16 stream matches upstream on CUDA") {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  vt::Queue q = cuda->CreateQueue();
+  CheckDeviceForwardBf16(q, "cuda-device-forward-bf16");
+}
+
 TEST_CASE("minimax_h3: the DEVICE-resident DiT forward matches upstream (CPU backend)") {
   vt::Queue q{Cpu(), nullptr};
   CheckDeviceForward(q, "cpu-device-forward");

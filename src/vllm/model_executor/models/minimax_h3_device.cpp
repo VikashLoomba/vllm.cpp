@@ -52,6 +52,32 @@ using dense_attn::MakeTensor;
 using vt::DType;
 using vt::Tensor;
 
+// The device twin of the reference's StreamDtype. bf16 rounds IN PLACE at the
+// SAME points the reference calls dt.Apply; f32 is a no-op, so the f32 path stays
+// byte-identical to what it was before bf16 support existed.
+//
+// WHY ROUND RATHER THAN STORE bf16. Upstream's production stream is bf16 with
+// fp32 islands, and the reference reproduces that by rounding f32 buffers rather
+// than switching storage -- which is what makes the CAST POINTS comparable. This
+// port keeps that choice for the same reason. Storing activations as bf16 would
+// ALSO halve activation bandwidth, but it is a genuinely separate step: it needs
+// bf16 variants of the AdaLN glue kernels AND bf16 WEIGHTS (upstream has them;
+// our loaders currently dequantize to f32), and the real speed path for H3 is the
+// FP4 one regardless. So this milestone buys dtype-policy PARITY, not bandwidth.
+struct DeviceStreamDtype {
+  const minimax_h3::MiniMaxH3DeviceKernels* glue = nullptr;
+  vt::Queue* q = nullptr;
+  bool bf16 = false;
+  void Apply(vt::Tensor& t) const {
+    if (!bf16) return;
+    glue->round_bf16(*q, t.Ptr<float>(), t.Numel());
+  }
+  void Apply(float* p, int64_t n) const {
+    if (!bf16) return;
+    glue->round_bf16(*q, p, n);
+  }
+};
+
 const minimax_h3::MiniMaxH3DeviceKernels* Glue(const Dev& d) {
   VT_CHECK(minimax_h3::MiniMaxH3DeviceKernelsAvailable(d.q.device.type),
            "minimax_h3: no device glue table registered for this backend");
@@ -115,13 +141,14 @@ struct AttnWeightsDev {
 void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev& w,
                   const Tensor& in, int64_t rows, const Tensor* rope_cache,
                   const Tensor* rope_positions, const int32_t* cu_seqlens, int num_reqs,
-                  Tensor& out) {
+                  const DeviceStreamDtype& dt, Tensor& out) {
   const int64_t heads = params.num_attention_heads;
   const int64_t head_dim = params.attention_head_dim;
   const int64_t inner = heads * head_dim;
 
   DBuf qkv(d, DType::kF32, {rows, 3 * inner});
   LinearDev(d, in, rows, params.hidden_size, *w.qkv, nullptr, qkv.t());
+  dt.Apply(qkv.t());
 
   DBuf qb(d, DType::kF32, {rows, inner});
   DBuf kb(d, DType::kF32, {rows, inner});
@@ -135,6 +162,8 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
   norm_args.eps = static_cast<float>(params.qk_norm_eps);
   vt::RmsNorm(d.q, qn, qn, *w.q_norm, norm_args);
   vt::RmsNorm(d.q, kn, kn, *w.k_norm, norm_args);
+  dt.Apply(qn);
+  dt.Apply(kn);
 
   if (rope_cache != nullptr) {
     Tensor q3 = dense_attn::Reshape(qb.t(), {rows, heads, head_dim});
@@ -143,6 +172,8 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
     rope.rotary_dim = static_cast<int>(params.rope_rot_dim());
     rope.is_neox_style = true;
     vt::RopeFromCache(d.q, q3, &k3, *rope_positions, *rope_cache, rope);
+    dt.Apply(q3);
+    dt.Apply(k3);
   }
 
   Tensor tq = dense_attn::Reshape(qb.t(), {rows, heads, head_dim});
@@ -156,21 +187,26 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
   args.cu_seqlens = cu_seqlens;
   args.num_reqs = num_reqs;
   vt::DFlashBlockAttention(d.q, attn.t(), tq, tk, tv, args);
+  dt.Apply(attn.t());
 
   Tensor flat = dense_attn::Reshape(attn.t(), {rows, inner});
   LinearDev(d, flat, rows, inner, *w.out_proj, nullptr, out);
+  dt.Apply(out.Ptr<float>(), rows * params.hidden_size);
 }
 
 // MiniMaxH3MLP.forward (minimax_h3_transformer.py:512-517): silu(gate) * up.
 // fc1 emits [gate; up] per row, which is exactly vt::SiluAndMul's input layout.
 void MlpDev(Dev d, const MiniMaxH3DitParams& params, const Tensor& fc1, const Tensor& fc2,
-            const Tensor& in, int64_t rows, Tensor& out) {
+            const Tensor& in, int64_t rows, const DeviceStreamDtype& dt, Tensor& out) {
   const int64_t ffn = params.ffn_hidden_size;
   DBuf hidden(d, DType::kF32, {rows, 2 * ffn});
   LinearDev(d, in, rows, params.hidden_size, fc1, nullptr, hidden.t());
+  dt.Apply(hidden.t());
   DBuf act(d, DType::kF32, {rows, ffn});
   vt::SiluAndMul(d.q, act.t(), hidden.t());
+  dt.Apply(act.t());
   LinearDev(d, act.t(), rows, ffn, fc2, nullptr, out);
+  dt.Apply(out.Ptr<float>(), rows * params.hidden_size);
 }
 
 // MiniMaxH3AdalnProj.forward (minimax_h3_transformer.py:555-561):
@@ -256,9 +292,9 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
                                               const MiniMaxH3DitWeights& weights,
                                               const MiniMaxH3DitInputs& inputs,
                                               DType compute_dtype) {
-  VT_CHECK(compute_dtype == DType::kF32,
-           "minimax_h3: the device forward is f32 for now; the bf16 stream policy "
-           "is a follow-up to brick H3-2b (.agents/specs/minimax-h3.md)");
+  VT_CHECK(compute_dtype == DType::kF32 || compute_dtype == DType::kBF16,
+           "minimax_h3: the device forward computes in f32 (parity) or bf16 (the "
+           "production stream policy)");
   VT_CHECK(static_cast<int64_t>(weights.blocks.size()) == params.num_layers,
            "minimax_h3: block weight count does not match num_layers");
   VT_CHECK(static_cast<int64_t>(weights.refiner.size()) == params.token_refiner_num_layers,
@@ -268,6 +304,11 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
   const auto* glue = Glue(d);
+  // kBF16 reproduces upstream's PRODUCTION dtype policy: the block stream is bf16
+  // while the patch projections, the time embedder and both output heads stay fp32
+  // islands (minimax_h3_transformer.py:85-101). Both dtypes run the SAME code; only
+  // the rounding points differ -- exactly as in the CPU reference.
+  const DeviceStreamDtype dt{glue, &queue, compute_dtype == DType::kBF16};
 
   const int64_t seq_len = inputs.seq_len;
   const int64_t hidden = params.hidden_size;
@@ -328,10 +369,13 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   LinearDev(d, audio_rows.t(), inputs.num_audio_pos, audio_width, weights.audio_patch_proj_w,
             &weights.audio_patch_proj_b, audio_embed.t());
 
+  // text rows enter as the stream dtype before the BF16 condition projection.
   DBuf text_rows(d, DType::kF32, {inputs.num_text_pos, params.text_dim}, inputs.prompt_embeds);
+  dt.Apply(text_rows.t());
   DBuf text_embed(d, DType::kF32, {inputs.num_text_pos, hidden});
   LinearDev(d, text_rows.t(), inputs.num_text_pos, params.text_dim, weights.condition_proj_w,
             &weights.condition_proj_b, text_embed.t());
+  dt.Apply(text_embed.t());
 
   // Token refiner: a plain pre-norm stack, no AdaLN and no RoPE (:564-623), on the
   // REPLICATED text rows, so it uses the refiner's own cu_seqlens.
@@ -343,18 +387,23 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
     args.eps = static_cast<float>(params.norm_eps);
     for (const MiniMaxH3DitBlockWeights& block : weights.refiner) {
       vt::RmsNorm(d.q, normed.t(), text_embed.t(), block.norm1, args);
+      dt.Apply(normed.t());
       AttentionDev(d, params, AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm,
                                              &block.out_proj},
                    normed.t(), rows, nullptr, nullptr, inputs.refiner_cu_seqlens,
-                   static_cast<int>(inputs.num_refiner_cu_seqlens - 1), tmp.t());
+                   static_cast<int>(inputs.num_refiner_cu_seqlens - 1), dt, tmp.t());
       vt::Add(d.q, text_embed.t(), text_embed.t(), tmp.t());
+      dt.Apply(text_embed.t());
       vt::RmsNorm(d.q, normed.t(), text_embed.t(), block.norm2, args);
-      MlpDev(d, params, block.fc1, block.fc2, normed.t(), rows, tmp.t());
+      dt.Apply(normed.t());
+      MlpDev(d, params, block.fc1, block.fc2, normed.t(), rows, dt, tmp.t());
       vt::Add(d.q, text_embed.t(), text_embed.t(), tmp.t());
+      dt.Apply(text_embed.t());
     }
     vt::RmsNormArgs final_args;
     final_args.eps = static_cast<float>(params.final_norm_eps);
     vt::RmsNorm(d.q, normed.t(), text_embed.t(), weights.refiner_final_norm, final_args);
+    dt.Apply(normed.t());
     backend.Copy(d.q, text_embed.ptr(), normed.ptr(), normed.bytes());
   }
 
@@ -377,11 +426,17 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
     mark(img_pos);
     mark(audio_pos);
   }
+  // The patch projections are fp32 ISLANDS; their outputs enter the bf16 stream
+  // only at this indexed scatter (minimax_h3_transformer.py:978-981).
+  dt.Apply(text_embed.t());
+  dt.Apply(video_embed.t());
+  dt.Apply(audio_embed.t());
   DBuf stream(d, DType::kF32, {seq_len, hidden});
   stream.Zero(d);
   vt::IndexCopy(d.q, stream.t(), text_embed.t(), d_text_pos.t());
   vt::IndexCopy(d.q, stream.t(), video_embed.t(), d_img_pos.t());
   vt::IndexCopy(d.q, stream.t(), audio_embed.t(), d_audio_pos.t());
+  dt.Apply(stream.t());
 
   // --- time embedding (minimax_h3_transformer.py:272-285) ---
   DBuf t_emb(d, DType::kF32, {m, params.time_embed_dim});
@@ -414,6 +469,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   DBuf t_emb_act(d, DType::kF32, {m, params.time_embed_dim});
   backend.Copy(d.q, t_emb_act.ptr(), t_emb.ptr(), t_emb.bytes());
   glue->silu(d.q, t_emb_act.t().Ptr<float>(), m * params.time_embed_dim);
+  // silu(t_emb) is fp32, then cast to the BF16 AdaLN linear's dtype before the GEMM.
+  dt.Apply(t_emb_act.t());
 
   // --- the DiT block stack (minimax_h3_transformer.py:645-688) ---
   const int num_reqs = static_cast<int>(inputs.num_cu_seqlens - 1);
@@ -437,6 +494,7 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   for (const MiniMaxH3DitBlockWeights& block : weights.blocks) {
     AdalnProjectDev(d, t_emb_act.t(), m, params.time_embed_dim, block.adaln_w, block.adaln_b,
                     projected.t());
+    dt.Apply(projected.t());
     const Tensor shift_msa = chunk_view(projected, adaln_rows, 6, 0);
     const Tensor scale_msa = chunk_view(projected, adaln_rows, 6, 1);
     const Tensor gate_msa = chunk_view(projected, adaln_rows, 6, 2);
@@ -445,40 +503,50 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
     const Tensor gate_mlp = chunk_view(projected, adaln_rows, 6, 5);
 
     vt::RmsNorm(d.q, normed.t(), stream.t(), block.norm1, block_args);
+    dt.Apply(normed.t());
     glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), shift_msa.Ptr<float>(),
                                scale_msa.Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len,
                                hidden, 6 * hidden);
+    dt.Apply(normed.t());  // _modulate_scale_shift casts its result to the stream dtype
     AttentionDev(d, params,
                  AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm, &block.out_proj},
                  normed.t(), seq_len, &d_rope_cache.t(), &d_rope_pos.t(), inputs.cu_seqlens,
-                 num_reqs, tmp.t());
+                 num_reqs, dt, tmp.t());
     glue->modulate_gate(d.q, stream.t().Ptr<float>(), gate_msa.Ptr<float>(),
                         tmp.t().Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len, hidden,
                         6 * hidden);
+    dt.Apply(stream.t());
 
     vt::RmsNorm(d.q, normed.t(), stream.t(), block.norm2, block_args);
+    dt.Apply(normed.t());
     glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), shift_mlp.Ptr<float>(),
                                scale_mlp.Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len,
                                hidden, 6 * hidden);
-    MlpDev(d, params, block.fc1, block.fc2, normed.t(), seq_len, tmp.t());
+    dt.Apply(normed.t());
+    MlpDev(d, params, block.fc1, block.fc2, normed.t(), seq_len, dt, tmp.t());
     glue->modulate_gate(d.q, stream.t().Ptr<float>(), gate_mlp.Ptr<float>(),
                         tmp.t().Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len, hidden,
                         6 * hidden);
+    dt.Apply(stream.t());
   }
 
   // --- final layer (minimax_h3_transformer.py:724-743) ---
   DBuf final_projected(d, DType::kF32, {m, 2 * hidden});
   AdalnProjectDev(d, t_emb_act.t(), m, params.time_embed_dim, weights.final_adaln_w,
                   weights.final_adaln_b, final_projected.t());
+  dt.Apply(final_projected.t());
   const Tensor final_shift = chunk_view(final_projected, m, 2, 0);
   const Tensor final_scale = chunk_view(final_projected, m, 2, 1);
   vt::RmsNormArgs final_args;
   final_args.eps = static_cast<float>(params.final_norm_eps);
   vt::RmsNorm(d.q, normed.t(), stream.t(), weights.final_norm, final_args);
+  dt.Apply(normed.t());
   // The final layer is single-modality, so it indexes by inverse_indices directly.
   glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), final_shift.Ptr<float>(),
                              final_scale.Ptr<float>(), d_inverse.t().Ptr<int32_t>(), seq_len,
                              hidden, 2 * hidden);
+  // Cast UP before both output heads: they are fp32 islands.
+  dt.Apply(normed.t());
 
   DBuf video_all(d, DType::kF32, {seq_len, video_width});
   LinearDev(d, normed.t(), seq_len, hidden, weights.video_out_w, &weights.video_out_b,

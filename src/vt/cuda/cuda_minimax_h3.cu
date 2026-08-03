@@ -86,6 +86,31 @@ __global__ void SiluKernel(float* x, int64_t n) {
   }
 }
 
+// Round through bfloat16, round-to-nearest-even. A 1:1 port of minimax_h3.cpp's
+// RoundBf16 (inf/nan passthrough included), done with integer ops rather than
+// __float2bfloat16 so the rounding is EXACTLY the reference's and not the
+// hardware convert's -- the bf16 gate compares cast points, so a different
+// rounding rule here would be indistinguishable from a misplaced cast.
+__global__ void RoundBf16Kernel(float* x, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < n; t += step) {
+    unsigned int bits = __float_as_uint(x[t]);
+    if ((bits & 0x7F800000u) == 0x7F800000u) {
+      bits &= 0xFFFF0000u;
+    } else {
+      const unsigned int lsb = (bits >> 16) & 1u;
+      bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+    }
+    x[t] = __uint_as_float(bits);
+  }
+}
+
+void RoundBf16Cuda(Queue& q, float* x, int64_t n) {
+  if (n == 0) return;
+  RoundBf16Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(x, n);
+  Check(cudaGetLastError(), "round_bf16 launch");
+}
+
 void ModulateScaleShiftCuda(Queue& q, float* x, const float* shift, const float* scale,
                             const int32_t* idx, int64_t rows, int64_t width,
                             int64_t src_stride) {
@@ -115,6 +140,7 @@ const MiniMaxH3DeviceKernels kKernels{
     &ModulateScaleShiftCuda,
     &ModulateGateCuda,
     &SiluCuda,
+    &RoundBf16Cuda,
 };
 
 struct Registrar {

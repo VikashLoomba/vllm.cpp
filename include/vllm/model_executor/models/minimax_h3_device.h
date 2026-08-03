@@ -64,6 +64,14 @@ struct MiniMaxH3DeviceKernels {
   // set has SiluAndMul / MoeSiluMul (both GATED forms) but no ungated SiLU, which
   // the time embedder (:272-285) and the AdaLN projection (:555-561) both need.
   void (*silu)(vt::Queue&, float* x, int64_t n);
+  // Round f32 through bfloat16 IN PLACE (round-to-nearest-even, matching torch's
+  // `.to(bf16)`). This is how the PRODUCTION dtype policy is reproduced: upstream's
+  // stream is bf16 with fp32 islands (both patch projections, the time embedder and
+  // both output heads -- minimax_h3_transformer.py:85-101), and rounding in place
+  // rather than switching STORAGE keeps the device forward comparing the same CAST
+  // POINTS as the reference and as upstream. Storage stays f32 on purpose; see
+  // minimax_h3_device.cpp for why true bf16 storage is a separate step.
+  void (*round_bf16)(vt::Queue&, float* x, int64_t n);
 };
 
 // Resolver. Throws when nothing is registered for (kMiniMaxH3, device) — which

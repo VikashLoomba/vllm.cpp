@@ -35320,3 +35320,48 @@ device path is arguably the closer mirror; it is held to the same goldens instea
 Thor CANNOT settle H3's speed question: sm_110 resolves every fp4/cutlass/marlin/fa2
 feature DISABLED, so the NVFP4 path still needs sm_121a (dgx). What Thor gave is the
 correctness foundation the FP4 layer drops onto -- device-resident tensors first.
+
+## 2026-08-03 - MiniMax-H3: bf16 production stream on the device forward + the FP4-on-sm_110 question settled
+
+Two things.
+
+(1) The device forward now runs upstream's PRODUCTION dtype policy, not just f32:
+a bf16 block stream with fp32 islands (both patch projections, the time embedder,
+both output heads), plus the explicit bf16 casts inside the two AdaLN modulates.
+Implemented the way the CPU reference does it - ROUND IN PLACE on f32 buffers at
+the cast points rather than switching storage - because what the bf16 golden gates
+is WHERE the casts happen. One new glue kernel (round_bf16), an integer
+round-to-nearest-even transcription of the reference's RoundBf16 including inf/nan
+passthrough; deliberately NOT __float2bfloat16, whose different rounding rule would
+be indistinguishable from a misplaced cast.
+
+Gate: 38/38 CPU, and on Thor's GPU video 2.41e-3 / audio 2.05e-3 vs the bf16
+goldens - essentially the CPU reference's own 2.4e-3 / 2.1e-3, which is the real
+evidence the cast points agree. The test also asserts the bf16 result DIFFERS from
+f32 by >1e-5; without that, a no-op dtype policy would pass silently.
+
+CORRECTION to what I claimed last commit: adopting bf16 did NOT clear the
+merged-GEMM allowlist entry. The shared seam allocates kBF16 DBufs; this forward
+keeps f32 STORAGE. The allowlist reason was rewritten rather than left stale.
+
+(2) FP4 ON sm_110 IS SETTLED - PROBED, not inferred from CMake messages. There are
+TWO DISJOINT Blackwell FP4 families:
+
+  mma.sync kind::mxf4nvf4 (warp)  : sm_120a/121a YES | sm_100a NO | sm_110a NO
+  tcgen05.alloc      (datacenter) : sm_120a/121a NO  | sm_100a YES | sm_110a YES
+
+So our warp-level FP4 GEMM can NEVER widen to sm_110 - that is an ISA boundary,
+not a porting gap. Thor's FP4 would have to come via tcgen05, and cannot today:
+our datacenter body is CUTLASS ArchTag=Sm100 guarded by __CUDA_ARCH__ == 1000, so
+retargeting it to sm_110 compiles to a DEAD STUB (silently - the dangerous failure
+mode), and CUTLASS ships ZERO sm110 kernels even at v4.6.1 (verified by shallow
+clone: no *sm110* files, no arch::Sm110 tag) - only capability macros in config.h.
+With no upstream body to port, an sm_110 FP4 GEMM would be from-scratch tcgen05
+work, which ground-every-impl-in-upstream forbids as a casual move.
+
+CONSEQUENCE: Thor is a CORRECTNESS venue. Every NVFP4 speed question - H3 and
+Laguna alike - still needs sm_121a on dgx. The FEATURE-TABLE's optimistic
+"sm_103a/sm_110 are separate later bricks" note is now qualified in the spec.
+
+FA2 is a separate hole on that box: the fa2 cell is 8.0,8.6,8.7,8.9,12.0a,12.1a -
+no sm_100, no sm_110 - which is exactly why the MLA/DeepSeek-V2 tests fail there.

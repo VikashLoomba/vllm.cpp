@@ -15,6 +15,7 @@
 // gate the KERNELS, not the port's structure.
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 #include "vllm/model_executor/models/minimax_h3_device.h"
 #include "vt/ops.h"  // OpId, RegisterOp, DeviceType
@@ -55,10 +56,28 @@ void MiniMaxH3Silu(Queue&, float* x, int64_t n) {
   for (int64_t i = 0; i < n; ++i) x[i] = x[i] / (1.0f + std::exp(-x[i]));
 }
 
+// Round through bfloat16, round-to-nearest-even. A 1:1 transcription of
+// minimax_h3.cpp's RoundBf16, including the inf/nan passthrough -- the two must
+// agree bit-for-bit or the bf16 gate compares different cast points.
+void MiniMaxH3RoundBf16(Queue&, float* x, int64_t n) {
+  for (int64_t i = 0; i < n; ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, &x[i], sizeof(bits));
+    if ((bits & 0x7F800000u) == 0x7F800000u) {  // inf/nan pass through
+      bits &= 0xFFFF0000u;
+    } else {
+      const uint32_t lsb = (bits >> 16) & 1u;
+      bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+    }
+    std::memcpy(&x[i], &bits, sizeof(bits));
+  }
+}
+
 const vllm::minimax_h3::MiniMaxH3DeviceKernels kKernels{
     &MiniMaxH3ModulateScaleShift,
     &MiniMaxH3ModulateGate,
     &MiniMaxH3Silu,
+    &MiniMaxH3RoundBf16,
 };
 
 struct Registrar {

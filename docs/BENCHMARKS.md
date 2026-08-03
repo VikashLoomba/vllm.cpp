@@ -2,7 +2,7 @@
 
 ## MiniMax-H3 (omni-modal video+audio DiT) — PENDING; hardware verdict CORRECTED (2026-08-03, `CLAIM-MINIMAX-H3-W0-W2`, `CLAIM-MINIMAX-H3-W6A-W9`)
 
-**Serving (W7) is DONE on CPU and the DEVICE-RESIDENT forward (W2b, f32) is LANDED and GPU-VERIFIED as of 2026-08-03**; still no SPEED number — the FP4 path — and therefore any comparison against vLLM-Omni — needs sm_121a, because sm_110 (the Thor box these numbers come from) resolves every fp4/cutlass/marlin/fa2 feature DISABLED. Every figure below is a CORRECTNESS gate, not a throughput one.
+**Serving (W7) is DONE on CPU and the DEVICE-RESIDENT forward (W2b, f32) is LANDED and GPU-VERIFIED as of 2026-08-03**; still no SPEED number — the FP4 path — and therefore any comparison against vLLM-Omni — needs sm_121a. PROBED, not inferred: the warp-level `mma.sync kind::mxf4nvf4` our FP4 GEMM uses is CONSUMER-Blackwell only (ptxas accepts it on sm_120a/121a, rejects it on BOTH sm_110a and sm_100a); sm_110 does support the datacenter `tcgen05` family, but our sm_100 body is CUTLASS `ArchTag=Sm100` guarded by `__CUDA_ARCH__ == 1000` (retargeting it compiles to a dead stub) and CUTLASS ships **zero** sm110 kernels even at v4.6.1 — only capability macros. So Thor is a correctness venue only. Every figure below is a CORRECTNESS gate, not a throughput one.
 
 **Throughput disposition: PENDING — no number is owed yet, and the earlier
 "not reproducible on this project's hardware" verdict is WITHDRAWN.**
@@ -65,6 +65,7 @@ identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 | **Full CPU suite with the serving surface landed** | **333/333 pass**, clean build, zero warnings |
 | **DEVICE-RESIDENT DiT forward** (brick H3-2b, CPU backend) | pass — same upstream goldens, same 2e-5 tolerance as the CPU reference |
 | **DEVICE-RESIDENT DiT forward on a REAL GPU** (Thor, sm_110, in-container) | **video max abs diff 1.49e-7 / audio 8.94e-8** — ~134x inside tolerance and on par with the CPU reference's own 1.6e-7. 36/36 cases; the CUDA case is proven to have RUN (220 assertions execute rather than skip), and the CUDA build is 1043/1043 clean, zero warnings |
+| **DEVICE-RESIDENT bf16 PRODUCTION stream** (CPU backend + Thor GPU) | **video 2.41e-3 / audio 2.05e-3** vs the bf16 goldens (tolerance 5e-3) — essentially the CPU reference's own 2.4e-3 / 2.1e-3, i.e. the CAST POINTS agree. Also asserts the bf16 result differs from f32 by >1e-5, so a no-op dtype policy cannot pass |
 | **WHOLE t2va path composes** | frames + stereo waveform, correct shapes, finite, in [-1, 1] |
 | **GGUF load -> runnable DiT** | geometry from shapes; a real forward runs off the loaded weights |
 | **NVFP4 load -> runnable DiT** | compressed-tensors triple dequantized; a real forward runs |

@@ -47,9 +47,16 @@ void Check(cudaError_t e, const char* what) {
   }
 }
 
-// The scalar half of RoundBf16, shared by the standalone pass and the folded
-// stores so all three round at exactly the same rule.
-__device__ __forceinline__ float RoundBf16Scalar(float v) {
+// bf16 is the high 16 bits of the f32 pattern; round-to-nearest-even on store,
+// matching torch's `.to(bfloat16)` and minimax_h3.cpp's RoundBf16. Done with
+// integer ops rather than __nv_bfloat16 converts so the rule is EXACTLY the
+// reference's -- the bf16 gate compares cast points, so a different rounding rule
+// would be indistinguishable from a misplaced cast.
+__device__ __forceinline__ float LoadBf16(const void* p, int64_t i) {
+  return __uint_as_float(static_cast<unsigned int>(static_cast<const unsigned short*>(p)[i]) << 16);
+}
+
+__device__ __forceinline__ void StoreBf16(void* p, int64_t i, float v) {
   unsigned int bits = __float_as_uint(v);
   if ((bits & 0x7F800000u) == 0x7F800000u) {
     bits &= 0xFFFF0000u;
@@ -57,85 +64,80 @@ __device__ __forceinline__ float RoundBf16Scalar(float v) {
     const unsigned int lsb = (bits >> 16) & 1u;
     bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
   }
-  return __uint_as_float(bits);
+  static_cast<unsigned short*>(p)[i] = static_cast<unsigned short>(bits >> 16);
+}
+
+__device__ __forceinline__ float LoadAny(const void* p, int64_t i, bool bf16) {
+  return bf16 ? LoadBf16(p, i) : static_cast<const float*>(p)[i];
+}
+
+__device__ __forceinline__ void StoreAny(void* p, int64_t i, float v, bool bf16) {
+  if (bf16) {
+    StoreBf16(p, i, v);
+  } else {
+    static_cast<float*>(p)[i] = v;
+  }
 }
 
 // _modulate_scale_shift (minimax_h3_transformer.py:183-192):
 //   x[r, i] = x[r, i] * (1 + scale[idx[r], i]) + shift[idx[r], i]
-__global__ void ModulateScaleShiftKernel(float* x, const float* shift, const float* scale,
+__global__ void ModulateScaleShiftKernel(void* x, const void* shift, const void* scale,
                                          const int32_t* idx, int64_t rows, int64_t width,
-                                         int64_t src_stride, bool round_out) {
+                                         int64_t src_stride, bool bf16) {
   const int64_t n = rows * width;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < n; t += step) {
     const int64_t r = t / width, i = t % width;
     const int64_t row = idx[r];
-    const float v = x[t] * (1.0f + scale[row * src_stride + i]) + shift[row * src_stride + i];
-    x[t] = round_out ? RoundBf16Scalar(v) : v;
+    const float v = LoadAny(x, t, bf16) * (1.0f + LoadAny(scale, row * src_stride + i, bf16)) +
+                    LoadAny(shift, row * src_stride + i, bf16);
+    StoreAny(x, t, v, bf16);
   }
 }
 
 // _modulate_gate (minimax_h3_transformer.py:195-204):
 //   residual[r, i] += gate[idx[r], i] * other[r, i]
-__global__ void ModulateGateKernel(float* residual, const float* gate, const float* other,
+__global__ void ModulateGateKernel(void* residual, const void* gate, const void* other,
                                    const int32_t* idx, int64_t rows, int64_t width,
-                                   int64_t src_stride, bool round_out) {
+                                   int64_t src_stride, bool bf16) {
   const int64_t n = rows * width;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < n; t += step) {
     const int64_t r = t / width, i = t % width;
     const int64_t row = idx[r];
-    const float v = residual[t] + gate[row * src_stride + i] * other[t];
-    residual[t] = round_out ? RoundBf16Scalar(v) : v;
+    const float v = LoadAny(residual, t, bf16) +
+                    LoadAny(gate, row * src_stride + i, bf16) * LoadAny(other, t, bf16);
+    StoreAny(residual, t, v, bf16);
   }
 }
 
 // x / (1 + exp(-x)) -- the SAME form as the host Silu, not the algebraically
-// equivalent x * sigmoid(x), which would not reproduce its bits.
+// equivalent x * sigmoid(x), which would not reproduce its bits. expf, NOT the
+// __expf fast intrinsic, for the same reason.
 __global__ void SiluKernel(float* x, int64_t n) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < n; t += step) {
-    // expf, NOT the __expf fast intrinsic: __expf trades accuracy for speed and
-    // would silently break the bit-identity this file claims.
     x[t] = x[t] / (1.0f + expf(-x[t]));
   }
 }
 
-// Round through bfloat16, round-to-nearest-even. A 1:1 port of minimax_h3.cpp's
-// RoundBf16 (inf/nan passthrough included), done with integer ops rather than
-// __float2bfloat16 so the rounding is EXACTLY the reference's and not the
-// hardware convert's -- the bf16 gate compares cast points, so a different
-// rounding rule here would be indistinguishable from a misplaced cast.
-__global__ void RoundBf16Kernel(float* x, int64_t n) {
-  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < n; t += step) {
-    x[t] = RoundBf16Scalar(x[t]);
-  }
-}
-
-void RoundBf16Cuda(Queue& q, float* x, int64_t n) {
-  if (n == 0) return;
-  RoundBf16Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(x, n);
-  Check(cudaGetLastError(), "round_bf16 launch");
-}
-
-void ModulateScaleShiftCuda(Queue& q, float* x, const float* shift, const float* scale,
-                            const int32_t* idx, int64_t rows, int64_t width,
-                            int64_t src_stride, bool round_out) {
+void ModulateScaleShiftCuda(Queue& q, void* x, const void* shift, const void* scale,
+                            const int32_t* idx, int64_t rows, int64_t width, int64_t src_stride,
+                            vt::DType dtype) {
   const int64_t n = rows * width;
   if (n == 0) return;
-  ModulateScaleShiftKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(x, shift, scale, idx, rows,
-                                                                   width, src_stride, round_out);
+  ModulateScaleShiftKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+      x, shift, scale, idx, rows, width, src_stride, dtype == vt::DType::kBF16);
   Check(cudaGetLastError(), "modulate_scale_shift launch");
 }
 
-void ModulateGateCuda(Queue& q, float* residual, const float* gate, const float* other,
+void ModulateGateCuda(Queue& q, void* residual, const void* gate, const void* other,
                       const int32_t* idx, int64_t rows, int64_t width, int64_t src_stride,
-                      bool round_out) {
+                      vt::DType dtype) {
   const int64_t n = rows * width;
   if (n == 0) return;
-  ModulateGateKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(residual, gate, other, idx, rows,
-                                                             width, src_stride, round_out);
+  ModulateGateKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+      residual, gate, other, idx, rows, width, src_stride, dtype == vt::DType::kBF16);
   Check(cudaGetLastError(), "modulate_gate launch");
 }
 
@@ -149,7 +151,6 @@ const MiniMaxH3DeviceKernels kKernels{
     &ModulateScaleShiftCuda,
     &ModulateGateCuda,
     &SiluCuda,
-    &RoundBf16Cuda,
 };
 
 struct Registrar {

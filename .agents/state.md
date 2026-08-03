@@ -35399,3 +35399,46 @@ and it is the same change that would clear the merged-GEMM allowlist entry.
 NO SPEED NUMBER is claimed. The only GPU available (Thor sm_110) cannot run the
 production FP4 config and the gate runs at reduced dimensions, so launch count is the
 honest unit of improvement, not wall clock.
+
+## 2026-08-03 - MiniMax-H3: TRUE bf16 storage - faster AND ~4x more accurate
+
+Replaced the round-in-place bf16 stream with REAL bf16 storage: activations are
+bf16 buffers, and the bf16-STORED modules are staged as bf16 WEIGHTS while
+upstream's fp32 ISLANDS (both patch projections, both time-embedder projections,
+both output heads, rope.inv_freq) stay f32.
+
+THE FINDING THAT DROVE IT. CUDA's MatmulBT requires a.dtype == b.dtype (mixed
+bf16-activation x f32-weight throws), so bf16 activations FORCE bf16 weights. That
+looked like a numerics risk until I checked the generator: the bf16 golden was
+produced with `bf16_model.to_bf16_weights()` - upstream rounds those weights too.
+Our round-in-place stream had been multiplying f32 weights by bf16 activations, an
+approximation that merely fit inside the 5e-3 tolerance. Matching the golden's
+actual model dropped the error ~4x: video 2.41e-3 -> 6.16e-4, audio 2.05e-3 ->
+5.21e-4. So the FAST path is also the FAITHFUL one; those pulled the same way.
+
+Generalizes: when a dtype-policy port "passes but only just", check whether the
+ORACLE quantized something you left in full precision. The tolerance can hide a
+model mismatch that looks like rounding noise.
+
+It also PAID OFF the fold I declined last milestone. The refiner's {Add; RmsNorm}
+is now folded onto vt::kFusedAddRmsNormStd: the objection was that the recipe casts
+nothing between its two steps, but with a bf16 RESIDUAL operand the add is rounded
+on store before the f32 variance (vt::RmsNorm's documented bf16-residual behaviour,
+matching csrc fused_add_rms_norm). Byte-identical - the numbers did not move.
+
+One op forced a choice: vt::RopeFromCache requires q/k/cache to share a dtype, so a
+bf16 stream needs a bf16 cos/sin cache. The ANGLES are still computed in f32 on the
+host; only the cached cos/sin round. This follows the project's other bf16 models
+(qwen3_vl builds the cache f32 then CastBf16's it), and the error above is measured
+WITH it.
+
+MERGED-GEMM ALLOWLIST, corrected AGAIN: bf16 storage removed the DTYPE half of that
+blocker (the seam wants kBF16 DBufs; we now have them). What remains is WEIGHT
+RESIDENCY - layers::UnquantizedMlpGateUpMethod takes an OwnedTensor (host bytes
+staged on demand via ResidentWeight) while H3 stages device tensors UP FRONT. That
+is an ownership-model difference, so adopting the seam means moving H3's loaders
+onto OwnedTensor residency: an architectural change to the quantized loaders, not a
+fold. Reason rewritten rather than left stale (third revision of this entry - each
+time the previous one turned out to name the wrong blocker).
+
+Gate: 38/38 CPU (9481 assertions). Thor GPU verification follows.

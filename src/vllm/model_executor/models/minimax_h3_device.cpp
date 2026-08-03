@@ -42,6 +42,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/recipes.h"
 
 namespace vllm {
 namespace {
@@ -52,31 +53,31 @@ using dense_attn::MakeTensor;
 using vt::DType;
 using vt::Tensor;
 
-// The device twin of the reference's StreamDtype. bf16 rounds IN PLACE at the
-// SAME points the reference calls dt.Apply; f32 is a no-op, so the f32 path stays
-// byte-identical to what it was before bf16 support existed.
+// The device twin of the reference's StreamDtype -- but where the reference rounds
+// f32 buffers in place, this path gives the stream REAL bf16 STORAGE. The rounding
+// then happens where upstream's happens (on every store), the activations are half
+// the bytes, and the tuned shared ops (RmsNorm / MatmulBT / SiluAndMul / attention)
+// run their native bf16 paths instead of an f32 path plus a rounding pass.
 //
-// WHY ROUND RATHER THAN STORE bf16. Upstream's production stream is bf16 with
-// fp32 islands, and the reference reproduces that by rounding f32 buffers rather
-// than switching storage -- which is what makes the CAST POINTS comparable. This
-// port keeps that choice for the same reason. Storing activations as bf16 would
-// ALSO halve activation bandwidth, but it is a genuinely separate step: it needs
-// bf16 variants of the AdaLN glue kernels AND bf16 WEIGHTS (upstream has them;
-// our loaders currently dequantize to f32), and the real speed path for H3 is the
-// FP4 one regardless. So this milestone buys dtype-policy PARITY, not bandwidth.
+// `S()` is the stream dtype; the fp32 ISLANDS (both patch projections, the time
+// embedder, both output heads) allocate kF32 explicitly and are converted at the
+// boundary with vt::CastBf16 / vt::CastF32.
 struct DeviceStreamDtype {
-  const minimax_h3::MiniMaxH3DeviceKernels* glue = nullptr;
-  vt::Queue* q = nullptr;
   bool bf16 = false;
-  void Apply(vt::Tensor& t) const {
-    if (!bf16) return;
-    glue->round_bf16(*q, t.Ptr<float>(), t.Numel());
-  }
-  void Apply(float* p, int64_t n) const {
-    if (!bf16) return;
-    glue->round_bf16(*q, p, n);
-  }
+  DType S() const { return bf16 ? DType::kBF16 : DType::kF32; }
 };
+
+// Convert between the f32 ISLANDS and the stream dtype. A same-dtype call is a
+// straight copy, so the f32 path costs one memcpy and stays byte-identical.
+void CastTo(Dev d, Tensor& out, const Tensor& in) {
+  if (out.dtype == in.dtype) {
+    vt::GetBackend(d.q.device.type).Copy(d.q, out.data, in.data, in.Bytes());
+  } else if (out.dtype == DType::kBF16) {
+    vt::CastBf16(d.q, out, in);
+  } else {
+    vt::CastF32(d.q, out, in);
+  }
+}
 
 const minimax_h3::MiniMaxH3DeviceKernels* Glue(const Dev& d) {
   VT_CHECK(minimax_h3::MiniMaxH3DeviceKernelsAvailable(d.q.device.type),
@@ -146,13 +147,12 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
   const int64_t head_dim = params.attention_head_dim;
   const int64_t inner = heads * head_dim;
 
-  DBuf qkv(d, DType::kF32, {rows, 3 * inner});
+  DBuf qkv(d, dt.S(), {rows, 3 * inner});
   LinearDev(d, in, rows, params.hidden_size, *w.qkv, nullptr, qkv.t());
-  dt.Apply(qkv.t());
 
-  DBuf qb(d, DType::kF32, {rows, inner});
-  DBuf kb(d, DType::kF32, {rows, inner});
-  DBuf vb(d, DType::kF32, {rows, inner});
+  DBuf qb(d, dt.S(), {rows, inner});
+  DBuf kb(d, dt.S(), {rows, inner});
+  DBuf vb(d, dt.S(), {rows, inner});
   vt::QkvSplit(d.q, qb.t(), kb.t(), vb.t(), qkv.t());
 
   // Per-head RMSNorm over head_dim: [rows, heads, head_dim] -> [rows*heads, head_dim].
@@ -162,8 +162,6 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
   norm_args.eps = static_cast<float>(params.qk_norm_eps);
   vt::RmsNorm(d.q, qn, qn, *w.q_norm, norm_args);
   vt::RmsNorm(d.q, kn, kn, *w.k_norm, norm_args);
-  dt.Apply(qn);
-  dt.Apply(kn);
 
   if (rope_cache != nullptr) {
     Tensor q3 = dense_attn::Reshape(qb.t(), {rows, heads, head_dim});
@@ -172,14 +170,12 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
     rope.rotary_dim = static_cast<int>(params.rope_rot_dim());
     rope.is_neox_style = true;
     vt::RopeFromCache(d.q, q3, &k3, *rope_positions, *rope_cache, rope);
-    dt.Apply(q3);
-    dt.Apply(k3);
   }
 
   Tensor tq = dense_attn::Reshape(qb.t(), {rows, heads, head_dim});
   Tensor tk = dense_attn::Reshape(kb.t(), {rows, heads, head_dim});
   Tensor tv = dense_attn::Reshape(vb.t(), {rows, heads, head_dim});
-  DBuf attn(d, DType::kF32, {rows, heads, head_dim});
+  DBuf attn(d, dt.S(), {rows, heads, head_dim});
   vt::DFlashBlockAttentionArgs args;
   args.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
   args.causal = false;  // bidirectional within each packed document
@@ -187,11 +183,9 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
   args.cu_seqlens = cu_seqlens;
   args.num_reqs = num_reqs;
   vt::DFlashBlockAttention(d.q, attn.t(), tq, tk, tv, args);
-  dt.Apply(attn.t());
 
   Tensor flat = dense_attn::Reshape(attn.t(), {rows, inner});
   LinearDev(d, flat, rows, inner, *w.out_proj, nullptr, out);
-  dt.Apply(out.Ptr<float>(), rows * params.hidden_size);
 }
 
 // MiniMaxH3MLP.forward (minimax_h3_transformer.py:512-517): silu(gate) * up.
@@ -199,14 +193,11 @@ void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev&
 void MlpDev(Dev d, const MiniMaxH3DitParams& params, const Tensor& fc1, const Tensor& fc2,
             const Tensor& in, int64_t rows, const DeviceStreamDtype& dt, Tensor& out) {
   const int64_t ffn = params.ffn_hidden_size;
-  DBuf hidden(d, DType::kF32, {rows, 2 * ffn});
+  DBuf hidden(d, dt.S(), {rows, 2 * ffn});
   LinearDev(d, in, rows, params.hidden_size, fc1, nullptr, hidden.t());
-  dt.Apply(hidden.t());
-  DBuf act(d, DType::kF32, {rows, ffn});
+  DBuf act(d, dt.S(), {rows, ffn});
   vt::SiluAndMul(d.q, act.t(), hidden.t());
-  dt.Apply(act.t());
   LinearDev(d, act.t(), rows, ffn, fc2, nullptr, out);
-  dt.Apply(out.Ptr<float>(), rows * params.hidden_size);
 }
 
 // MiniMaxH3AdalnProj.forward (minimax_h3_transformer.py:555-561):
@@ -222,66 +213,99 @@ void AdalnProjectDev(Dev d, const Tensor& activated, int64_t m, int64_t time_emb
 
 MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitParams& params,
-                                                   const MiniMaxH3DitWeights& host) {
+                                                   const MiniMaxH3DitWeights& host,
+                                                   DType compute_dtype) {
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   MiniMaxH3DitDeviceWeights staged;
-  staged.weights = host;  // shapes/dtypes carry over; every view is rebound below
+  staged.weights = host;  // shapes carry over; every view is rebound below
+  const bool bf16 = compute_dtype == DType::kBF16;
 
-  auto upload = [&](const Tensor& src, Tensor& dst) {
+  // `as_bf16` marks a weight that upstream STORES in bf16. The fp32 islands pass
+  // false and stay f32 even in the bf16 stream -- that split IS the dtype policy
+  // (MINIMAX_H3_FP32_PARAM_NAMES, minimax_h3_transformer.py:85-101), and getting it
+  // backwards would round tensors upstream deliberately keeps at full precision.
+  auto upload = [&](const Tensor& src, Tensor& dst, bool as_bf16) {
     if (src.data == nullptr) {
       dst = src;
       return;
     }
-    VT_CHECK(src.dtype == DType::kF32, "minimax_h3 stage: weights must be f32");
-    const size_t bytes = src.Bytes();
+    VT_CHECK(src.dtype == DType::kF32, "minimax_h3 stage: host weights must be f32");
+    const std::vector<int64_t> shape(src.shape, src.shape + src.rank);
+    const int64_t n = src.Numel();
+    const DType want = (bf16 && as_bf16) ? DType::kBF16 : DType::kF32;
+    const size_t bytes = static_cast<size_t>(n) * vt::SizeOf(want);
     void* p = backend.Alloc(bytes);
     std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
-    backend.Copy(queue, p, src.data, bytes);
-    std::vector<int64_t> shape(src.shape, src.shape + src.rank);
-    dst = dense_attn::MakeTensor(p, src.dtype, queue.device, shape);
+    if (want == DType::kF32) {
+      backend.Copy(queue, p, src.data, bytes);
+    } else {
+      // Round on the HOST, then upload: the same round-to-nearest-even the stream
+      // uses, so a bf16 weight and a bf16 activation agree bit-for-bit on the rule.
+      std::vector<uint16_t> packed(static_cast<size_t>(n));
+      const float* in = src.Ptr<float>();
+      for (int64_t i = 0; i < n; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits, &in[i], sizeof(bits));
+        if ((bits & 0x7F800000u) == 0x7F800000u) {
+          bits &= 0xFFFF0000u;
+        } else {
+          const uint32_t lsb = (bits >> 16) & 1u;
+          bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+        }
+        packed[static_cast<size_t>(i)] = static_cast<uint16_t>(bits >> 16);
+      }
+      backend.Copy(queue, p, packed.data(), bytes);
+      backend.Synchronize(queue);  // `packed` dies at the end of this scope
+    }
+    dst = dense_attn::MakeTensor(p, want, queue.device, shape);
     staged.storage.push_back(std::move(owner));
   };
 
   auto upload_block = [&](const MiniMaxH3DitBlockWeights& src, MiniMaxH3DitBlockWeights& dst) {
-    upload(src.norm1, dst.norm1);
-    upload(src.norm2, dst.norm2);
-    upload(src.qkv_proj, dst.qkv_proj);
-    upload(src.q_norm, dst.q_norm);
-    upload(src.k_norm, dst.k_norm);
-    upload(src.out_proj, dst.out_proj);
-    upload(src.fc1, dst.fc1);
-    upload(src.fc2, dst.fc2);
-    upload(src.adaln_w, dst.adaln_w);
-    upload(src.adaln_b, dst.adaln_b);
+    // Every tensor in a refiner/DiT block is bf16-stored upstream.
+    upload(src.norm1, dst.norm1, true);
+    upload(src.norm2, dst.norm2, true);
+    upload(src.qkv_proj, dst.qkv_proj, true);
+    upload(src.q_norm, dst.q_norm, true);
+    upload(src.k_norm, dst.k_norm, true);
+    upload(src.out_proj, dst.out_proj, true);
+    upload(src.fc1, dst.fc1, true);
+    upload(src.fc2, dst.fc2, true);
+    upload(src.adaln_w, dst.adaln_w, true);
+    upload(src.adaln_b, dst.adaln_b, true);
   };
 
-  upload(host.video_patch_proj_w, staged.weights.video_patch_proj_w);
-  upload(host.video_patch_proj_b, staged.weights.video_patch_proj_b);
-  upload(host.audio_patch_proj_w, staged.weights.audio_patch_proj_w);
-  upload(host.audio_patch_proj_b, staged.weights.audio_patch_proj_b);
-  upload(host.condition_proj_w, staged.weights.condition_proj_w);
-  upload(host.condition_proj_b, staged.weights.condition_proj_b);
-  upload(host.time_proj_in_w, staged.weights.time_proj_in_w);
-  upload(host.time_proj_in_b, staged.weights.time_proj_in_b);
-  upload(host.time_proj_out_w, staged.weights.time_proj_out_w);
-  upload(host.time_proj_out_b, staged.weights.time_proj_out_b);
+  // --- fp32 ISLANDS (never rounded, even in the bf16 stream) ---
+  upload(host.video_patch_proj_w, staged.weights.video_patch_proj_w, false);
+  upload(host.video_patch_proj_b, staged.weights.video_patch_proj_b, false);
+  upload(host.audio_patch_proj_w, staged.weights.audio_patch_proj_w, false);
+  upload(host.audio_patch_proj_b, staged.weights.audio_patch_proj_b, false);
+  upload(host.time_proj_in_w, staged.weights.time_proj_in_w, false);
+  upload(host.time_proj_in_b, staged.weights.time_proj_in_b, false);
+  upload(host.time_proj_out_w, staged.weights.time_proj_out_w, false);
+  upload(host.time_proj_out_b, staged.weights.time_proj_out_b, false);
+  upload(host.video_out_w, staged.weights.video_out_w, false);
+  upload(host.video_out_b, staged.weights.video_out_b, false);
+  upload(host.audio_out_w, staged.weights.audio_out_w, false);
+  upload(host.audio_out_b, staged.weights.audio_out_b, false);
   // rope.inv_freq is consumed on the HOST (it builds the cos/sin cache), so it is
-  // deliberately left as the caller's host view rather than uploaded.
+  // deliberately left as the caller's host view rather than uploaded. It is also an
+  // fp32 buffer upstream, so no rounding question arises.
   staged.weights.rope_inv_freq = host.rope_inv_freq;
+
+  // --- bf16-STORED modules ---
+  upload(host.condition_proj_w, staged.weights.condition_proj_w, true);
+  upload(host.condition_proj_b, staged.weights.condition_proj_b, true);
   for (size_t i = 0; i < host.refiner.size(); ++i) {
     upload_block(host.refiner[i], staged.weights.refiner[i]);
   }
-  upload(host.refiner_final_norm, staged.weights.refiner_final_norm);
+  upload(host.refiner_final_norm, staged.weights.refiner_final_norm, true);
   for (size_t i = 0; i < host.blocks.size(); ++i) {
     upload_block(host.blocks[i], staged.weights.blocks[i]);
   }
-  upload(host.final_norm, staged.weights.final_norm);
-  upload(host.final_adaln_w, staged.weights.final_adaln_w);
-  upload(host.final_adaln_b, staged.weights.final_adaln_b);
-  upload(host.video_out_w, staged.weights.video_out_w);
-  upload(host.video_out_b, staged.weights.video_out_b);
-  upload(host.audio_out_w, staged.weights.audio_out_w);
-  upload(host.audio_out_b, staged.weights.audio_out_b);
+  upload(host.final_norm, staged.weights.final_norm, true);
+  upload(host.final_adaln_w, staged.weights.final_adaln_w, true);
+  upload(host.final_adaln_b, staged.weights.final_adaln_b, true);
   (void)params;
   backend.Synchronize(queue);
   return staged;
@@ -308,7 +332,7 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   // while the patch projections, the time embedder and both output heads stay fp32
   // islands (minimax_h3_transformer.py:85-101). Both dtypes run the SAME code; only
   // the rounding points differ -- exactly as in the CPU reference.
-  const DeviceStreamDtype dt{glue, &queue, compute_dtype == DType::kBF16};
+  const DeviceStreamDtype dt{compute_dtype == DType::kBF16};
 
   const int64_t seq_len = inputs.seq_len;
   const int64_t hidden = params.hidden_size;
@@ -349,7 +373,13 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
       BuildRopeCosSin(inputs.img_position_ids, seq_len, weights.rope_inv_freq.Ptr<float>(),
                       params.rope_inv_freq_len);
   const int64_t rot_dim = params.rope_rot_dim();
-  DBuf d_rope_cache(d, DType::kF32, {seq_len, rot_dim}, rope_cache_host.data());
+  // vt::RopeFromCache requires q/k/cache to share a dtype, so a bf16 stream gets a
+  // bf16 cache -- the same shape the project's other bf16 models use (qwen3_vl
+  // builds its cache in f32 then CastBf16's it). The ANGLES are still computed in
+  // f32 on the host; only the cached cos/sin are rounded.
+  DBuf d_rope_cache_f32(d, DType::kF32, {seq_len, rot_dim}, rope_cache_host.data());
+  DBuf d_rope_cache(d, dt.S(), {seq_len, rot_dim});
+  CastTo(d, d_rope_cache.t(), d_rope_cache_f32.t());
   std::vector<int32_t> arange(static_cast<size_t>(seq_len));
   for (int64_t i = 0; i < seq_len; ++i) arange[static_cast<size_t>(i)] = static_cast<int32_t>(i);
   DBuf d_rope_pos(d, DType::kI32, {seq_len}, arange.data());
@@ -370,48 +400,43 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
             &weights.audio_patch_proj_b, audio_embed.t());
 
   // text rows enter as the stream dtype before the BF16 condition projection.
-  DBuf text_rows(d, DType::kF32, {inputs.num_text_pos, params.text_dim}, inputs.prompt_embeds);
-  dt.Apply(text_rows.t());
-  DBuf text_embed(d, DType::kF32, {inputs.num_text_pos, hidden});
+  // text rows enter as the stream dtype before the BF16 condition projection.
+  DBuf text_rows_f32(d, DType::kF32, {inputs.num_text_pos, params.text_dim}, inputs.prompt_embeds);
+  DBuf text_rows(d, dt.S(), {inputs.num_text_pos, params.text_dim});
+  CastTo(d, text_rows.t(), text_rows_f32.t());
+  DBuf text_embed(d, dt.S(), {inputs.num_text_pos, hidden});
   LinearDev(d, text_rows.t(), inputs.num_text_pos, params.text_dim, weights.condition_proj_w,
             &weights.condition_proj_b, text_embed.t());
-  dt.Apply(text_embed.t());
 
   // Token refiner: a plain pre-norm stack, no AdaLN and no RoPE (:564-623), on the
   // REPLICATED text rows, so it uses the refiner's own cu_seqlens.
   {
     const int64_t rows = inputs.num_text_pos;
-    DBuf normed(d, DType::kF32, {rows, hidden});
-    DBuf tmp(d, DType::kF32, {rows, hidden});
+    DBuf normed(d, dt.S(), {rows, hidden});
+    DBuf tmp(d, dt.S(), {rows, hidden});
     vt::RmsNormArgs args;
     args.eps = static_cast<float>(params.norm_eps);
     for (const MiniMaxH3DitBlockWeights& block : weights.refiner) {
       vt::RmsNorm(d.q, normed.t(), text_embed.t(), block.norm1, args);
-      dt.Apply(normed.t());
       AttentionDev(d, params, AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm,
                                              &block.out_proj},
                    normed.t(), rows, nullptr, nullptr, inputs.refiner_cu_seqlens,
                    static_cast<int>(inputs.num_refiner_cu_seqlens - 1), dt, tmp.t());
-      // NOT folded onto vt::kFusedAddRmsNormStd, deliberately. That recipe computes
-      // `residual = x + residual` then `rms_norm(residual)` with NO cast between the
-      // two steps, which is right for f32 but would DROP the bf16 rounding that sits
-      // between them here -- and where the casts happen is exactly what the bf16
-      // golden gates. Folding it only in the f32 branch would add a dtype-conditional
-      // path that helps only the NON-production dtype, on the refiner's small
-      // num_text rows. The fold becomes both correct and free once activations are
-      // true bf16 STORAGE, since then the recipe's own operand stores do the rounding.
-      vt::Add(d.q, text_embed.t(), text_embed.t(), tmp.t());
-      dt.Apply(text_embed.t());
-      vt::RmsNorm(d.q, normed.t(), text_embed.t(), block.norm2, args);
-      dt.Apply(normed.t());
+      // FOLD onto the catalog recipe. This was DECLINED one milestone ago because
+      // the recipe casts nothing between its `residual = x + residual` and its
+      // `rms_norm(residual)`, which would have dropped a bf16 rounding. TRUE bf16
+      // STORAGE removes that objection: the residual operand IS bf16, so the add is
+      // rounded on store before the f32 variance (vt::RmsNorm's documented
+      // bf16-residual behaviour, matching csrc fused_add_rms_norm). Same cast point,
+      // one launch instead of two.
+      vt::FusedChain(d.q, normed.t(), tmp.t(), block.norm2, &text_embed.t(),
+                     vt::kFusedAddRmsNormStd, args.eps);
       MlpDev(d, params, block.fc1, block.fc2, normed.t(), rows, dt, tmp.t());
       vt::Add(d.q, text_embed.t(), text_embed.t(), tmp.t());
-      dt.Apply(text_embed.t());
     }
     vt::RmsNormArgs final_args;
     final_args.eps = static_cast<float>(params.final_norm_eps);
     vt::RmsNorm(d.q, normed.t(), text_embed.t(), weights.refiner_final_norm, final_args);
-    dt.Apply(normed.t());
     backend.Copy(d.q, text_embed.ptr(), normed.ptr(), normed.bytes());
   }
 
@@ -435,16 +460,17 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
     mark(audio_pos);
   }
   // The patch projections are fp32 ISLANDS; their outputs enter the bf16 stream
-  // only at this indexed scatter (minimax_h3_transformer.py:978-981).
-  dt.Apply(text_embed.t());
-  dt.Apply(video_embed.t());
-  dt.Apply(audio_embed.t());
-  DBuf stream(d, DType::kF32, {seq_len, hidden});
+  // only at this indexed scatter (minimax_h3_transformer.py:978-981), which is
+  // exactly where the cast belongs.
+  DBuf video_s(d, dt.S(), {inputs.num_img_pos, hidden});
+  DBuf audio_s(d, dt.S(), {inputs.num_audio_pos, hidden});
+  CastTo(d, video_s.t(), video_embed.t());
+  CastTo(d, audio_s.t(), audio_embed.t());
+  DBuf stream(d, dt.S(), {seq_len, hidden});
   stream.Zero(d);
   vt::IndexCopy(d.q, stream.t(), text_embed.t(), d_text_pos.t());
-  vt::IndexCopy(d.q, stream.t(), video_embed.t(), d_img_pos.t());
-  vt::IndexCopy(d.q, stream.t(), audio_embed.t(), d_audio_pos.t());
-  dt.Apply(stream.t());
+  vt::IndexCopy(d.q, stream.t(), video_s.t(), d_img_pos.t());
+  vt::IndexCopy(d.q, stream.t(), audio_s.t(), d_audio_pos.t());
 
   // --- time embedding (minimax_h3_transformer.py:272-285) ---
   DBuf t_emb(d, DType::kF32, {m, params.time_embed_dim});
@@ -477,15 +503,16 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   DBuf t_emb_act(d, DType::kF32, {m, params.time_embed_dim});
   backend.Copy(d.q, t_emb_act.ptr(), t_emb.ptr(), t_emb.bytes());
   glue->silu(d.q, t_emb_act.t().Ptr<float>(), m * params.time_embed_dim);
-  // silu(t_emb) is fp32, then cast to the BF16 AdaLN linear's dtype before the GEMM.
-  dt.Apply(t_emb_act.t());
+  // silu(t_emb) is fp32; cast to the BF16 AdaLN linear's dtype before the GEMM.
+  DBuf t_emb_s(d, dt.S(), {m, params.time_embed_dim});
+  CastTo(d, t_emb_s.t(), t_emb_act.t());
 
   // --- the DiT block stack (minimax_h3_transformer.py:645-688) ---
   const int num_reqs = static_cast<int>(inputs.num_cu_seqlens - 1);
   const int64_t adaln_rows = m * kMiniMaxH3AdalnModalityNum;
-  DBuf normed(d, DType::kF32, {seq_len, hidden});
-  DBuf tmp(d, DType::kF32, {seq_len, hidden});
-  DBuf projected(d, DType::kF32, {adaln_rows, 6 * hidden});
+  DBuf normed(d, dt.S(), {seq_len, hidden});
+  DBuf tmp(d, dt.S(), {seq_len, hidden});
+  DBuf projected(d, dt.S(), {adaln_rows, 6 * hidden});
   vt::RmsNormArgs block_args;
   block_args.eps = static_cast<float>(params.norm_eps);
 
@@ -493,16 +520,16 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   // projection; as a TENSOR that is a row-strided [rows, hidden] view, so the
   // chunks need no copy — MatmulBT wrote them where the modulates want them.
   auto chunk_view = [&](DBuf& buf, int64_t rows, int64_t expand, int64_t c) {
-    Tensor t = MakeTensor(static_cast<float*>(buf.ptr()) + c * hidden, DType::kF32, d.q.device,
-                          {rows, hidden});
+    std::byte* base = static_cast<std::byte*>(buf.ptr()) +
+                      static_cast<size_t>(c * hidden) * vt::SizeOf(dt.S());
+    Tensor t = MakeTensor(base, dt.S(), d.q.device, {rows, hidden});
     t.stride[0] = expand * hidden;  // row stride skips the sibling chunks
     return t;
   };
 
   for (const MiniMaxH3DitBlockWeights& block : weights.blocks) {
-    AdalnProjectDev(d, t_emb_act.t(), m, params.time_embed_dim, block.adaln_w, block.adaln_b,
+    AdalnProjectDev(d, t_emb_s.t(), m, params.time_embed_dim, block.adaln_w, block.adaln_b,
                     projected.t());
-    dt.Apply(projected.t());
     const Tensor shift_msa = chunk_view(projected, adaln_rows, 6, 0);
     const Tensor scale_msa = chunk_view(projected, adaln_rows, 6, 1);
     const Tensor gate_msa = chunk_view(projected, adaln_rows, 6, 2);
@@ -511,53 +538,46 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
     const Tensor gate_mlp = chunk_view(projected, adaln_rows, 6, 5);
 
     vt::RmsNorm(d.q, normed.t(), stream.t(), block.norm1, block_args);
-    dt.Apply(normed.t());
-    // FOLD: _modulate_scale_shift's cast to the stream dtype is done IN the kernel
-    // (round_out), not by a following round_bf16 pass -- one launch instead of two,
-    // and bit-identical because the kernel owns the arithmetic and rounds the same store.
-    glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), shift_msa.Ptr<float>(),
-                               scale_msa.Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len,
-                               hidden, 6 * hidden, dt.bf16);
+    glue->modulate_scale_shift(d.q, normed.t().data, shift_msa.data, scale_msa.data,
+                               d_combined.t().Ptr<int32_t>(), seq_len, hidden, 6 * hidden,
+                               dt.S());
     AttentionDev(d, params,
                  AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm, &block.out_proj},
                  normed.t(), seq_len, &d_rope_cache.t(), &d_rope_pos.t(), inputs.cu_seqlens,
                  num_reqs, dt, tmp.t());
-    glue->modulate_gate(d.q, stream.t().Ptr<float>(), gate_msa.Ptr<float>(),
-                        tmp.t().Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len, hidden,
-                        6 * hidden, dt.bf16);
+    glue->modulate_gate(d.q, stream.t().data, gate_msa.data, tmp.t().data,
+                        d_combined.t().Ptr<int32_t>(), seq_len, hidden, 6 * hidden, dt.S());
 
     vt::RmsNorm(d.q, normed.t(), stream.t(), block.norm2, block_args);
-    dt.Apply(normed.t());
-    glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), shift_mlp.Ptr<float>(),
-                               scale_mlp.Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len,
-                               hidden, 6 * hidden, dt.bf16);
+    glue->modulate_scale_shift(d.q, normed.t().data, shift_mlp.data, scale_mlp.data,
+                               d_combined.t().Ptr<int32_t>(), seq_len, hidden, 6 * hidden,
+                               dt.S());
     MlpDev(d, params, block.fc1, block.fc2, normed.t(), seq_len, dt, tmp.t());
-    glue->modulate_gate(d.q, stream.t().Ptr<float>(), gate_mlp.Ptr<float>(),
-                        tmp.t().Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len, hidden,
-                        6 * hidden, dt.bf16);
+    glue->modulate_gate(d.q, stream.t().data, gate_mlp.data, tmp.t().data,
+                        d_combined.t().Ptr<int32_t>(), seq_len, hidden, 6 * hidden, dt.S());
   }
 
   // --- final layer (minimax_h3_transformer.py:724-743) ---
-  DBuf final_projected(d, DType::kF32, {m, 2 * hidden});
-  AdalnProjectDev(d, t_emb_act.t(), m, params.time_embed_dim, weights.final_adaln_w,
+  DBuf final_projected(d, dt.S(), {m, 2 * hidden});
+  AdalnProjectDev(d, t_emb_s.t(), m, params.time_embed_dim, weights.final_adaln_w,
                   weights.final_adaln_b, final_projected.t());
-  dt.Apply(final_projected.t());
   const Tensor final_shift = chunk_view(final_projected, m, 2, 0);
   const Tensor final_scale = chunk_view(final_projected, m, 2, 1);
   vt::RmsNormArgs final_args;
   final_args.eps = static_cast<float>(params.final_norm_eps);
   vt::RmsNorm(d.q, normed.t(), stream.t(), weights.final_norm, final_args);
-  dt.Apply(normed.t());
   // The final layer is single-modality, so it indexes by inverse_indices directly.
-  glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), final_shift.Ptr<float>(),
-                             final_scale.Ptr<float>(), d_inverse.t().Ptr<int32_t>(), seq_len,
-                             hidden, 2 * hidden, dt.bf16);
+  glue->modulate_scale_shift(d.q, normed.t().data, final_shift.data, final_scale.data,
+                             d_inverse.t().Ptr<int32_t>(), seq_len, hidden, 2 * hidden, dt.S());
+  // Cast UP before both output heads: they are fp32 ISLANDS.
+  DBuf head_in(d, DType::kF32, {seq_len, hidden});
+  CastTo(d, head_in.t(), normed.t());
 
   DBuf video_all(d, DType::kF32, {seq_len, video_width});
-  LinearDev(d, normed.t(), seq_len, hidden, weights.video_out_w, &weights.video_out_b,
+  LinearDev(d, head_in.t(), seq_len, hidden, weights.video_out_w, &weights.video_out_b,
             video_all.t());
   DBuf audio_all(d, DType::kF32, {seq_len, audio_width});
-  LinearDev(d, normed.t(), seq_len, hidden, weights.audio_out_w, &weights.audio_out_b,
+  LinearDev(d, head_in.t(), seq_len, hidden, weights.audio_out_w, &weights.audio_out_b,
             audio_all.t());
 
   // Select the inference-output rows ON DEVICE, so only the selected rows cross

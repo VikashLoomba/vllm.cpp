@@ -38,6 +38,7 @@
 #include <cstdint>
 
 #include "vt/device.h"
+#include "vt/dtype.h"
 #include "vt/tensor.h"
 
 namespace vllm::minimax_h3 {
@@ -47,38 +48,30 @@ struct MiniMaxH3DeviceKernels {
   //   x[r, i] = x[r, i] * (1 + scale[idx[r], i]) + shift[idx[r], i]
   // `idx` is the per-row AdaLN row selector (combined_indices for a block,
   // inverse_indices for the final layer), i32 [rows] on the device.
+  //
   // `src_stride` is the ROW stride of shift/scale, which are strided CHUNK VIEWS
   // into the flat AdaLN projection [rows, expand*width] -- chunk c of row r lives
   // at r*src_stride + c*width, so the rows are width-wide but src_stride apart.
   // Passing it explicitly is deliberate: treating the views as contiguous reads
   // the wrong memory and yields a plausible-but-wrong result.
-  // `round_out` folds the stream-dtype bf16 rounding INTO this kernel, replacing a
-  // separate round_bf16 pass. Safe by construction, unlike fusing across a tuned
-  // shared op: this kernel already owns the arithmetic, so rounding its store is
-  // the SAME cast point the unfused {modulate; round_bf16} pair produced -- one
-  // launch instead of two, bit-for-bit identical.
-  void (*modulate_scale_shift)(vt::Queue&, float* x, const float* shift, const float* scale,
+  //
+  // `dtype` is the STREAM dtype (kF32 or kBF16) of x/shift/scale. Arithmetic is
+  // always f32; a bf16 stream rounds on STORE, which is what makes the cast point
+  // identical to upstream's -- there is no separate rounding pass.
+  void (*modulate_scale_shift)(vt::Queue&, void* x, const void* shift, const void* scale,
                                const int32_t* idx, int64_t rows, int64_t width,
-                               int64_t src_stride, bool round_out);
+                               int64_t src_stride, vt::DType dtype);
   // _modulate_gate (minimax_h3_transformer.py:195-204), accumulating in place:
   //   residual[r, i] += gate[idx[r], i] * other[r, i]
-  // `src_stride` is the ROW stride of `gate` (see modulate_scale_shift).
-  // `round_out` folds the bf16 rounding in, as for modulate_scale_shift above.
-  void (*modulate_gate)(vt::Queue&, float* residual, const float* gate, const float* other,
+  // `src_stride` and `dtype` as for modulate_scale_shift.
+  void (*modulate_gate)(vt::Queue&, void* residual, const void* gate, const void* other,
                         const int32_t* idx, int64_t rows, int64_t width, int64_t src_stride,
-                        bool round_out);
+                        vt::DType dtype);
   // Plain elementwise SiLU in place: x[i] = x[i] * sigmoid(x[i]). The shared op
   // set has SiluAndMul / MoeSiluMul (both GATED forms) but no ungated SiLU, which
   // the time embedder (:272-285) and the AdaLN projection (:555-561) both need.
+  // f32 only: both call sites are fp32 ISLANDS.
   void (*silu)(vt::Queue&, float* x, int64_t n);
-  // Round f32 through bfloat16 IN PLACE (round-to-nearest-even, matching torch's
-  // `.to(bf16)`). This is how the PRODUCTION dtype policy is reproduced: upstream's
-  // stream is bf16 with fp32 islands (both patch projections, the time embedder and
-  // both output heads -- minimax_h3_transformer.py:85-101), and rounding in place
-  // rather than switching STORAGE keeps the device forward comparing the same CAST
-  // POINTS as the reference and as upstream. Storage stays f32 on purpose; see
-  // minimax_h3_device.cpp for why true bf16 storage is a separate step.
-  void (*round_bf16)(vt::Queue&, float* x, int64_t n);
 };
 
 // Resolver. Throws when nothing is registered for (kMiniMaxH3, device) — which

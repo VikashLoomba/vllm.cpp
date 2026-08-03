@@ -6,9 +6,11 @@
 //
 // Each kernel is a 1:1 transcription of the host reference it stands in for
 // (minimax_h3.cpp: ModulateScaleShift / ModulateGate / Silu), in the same
-// arithmetic order — so on CPU the device forward is BYTE-IDENTICAL to
-// MiniMaxH3DitForward's own helpers, not merely close. The CUDA sibling lives in
-// src/vt/cuda/cuda_minimax_h3.cu.
+// arithmetic order. The CUDA sibling lives in src/vt/cuda/cuda_minimax_h3.cu.
+//
+// DTYPE: arithmetic is ALWAYS f32; only the load/store width varies. A bf16 stream
+// therefore rounds on STORE, which is exactly upstream's cast point -- no separate
+// rounding pass, and no way for the fused store to drift from it.
 //
 // Registering this on kCPU (Laguna's equivalent table is CUDA-only) is what lets
 // the whole device-forward code path be covered by CPU CI, so a GPU is needed to
@@ -23,50 +25,65 @@
 namespace vt::cpu {
 namespace {
 
-// The scalar half of RoundBf16, shared by the standalone pass and the folded
-// stores below so all three round at exactly the same rule.
-inline float RoundBf16Scalar(float v) {
-  uint32_t bits;
-  std::memcpy(&bits, &v, sizeof(bits));
-  if ((bits & 0x7F800000u) == 0x7F800000u) {
-    bits &= 0xFFFF0000u;
-  } else {
-    const uint32_t lsb = (bits >> 16) & 1u;
-    bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
-  }
+// bf16 is stored as the high 16 bits of the f32 pattern; round-to-nearest-even on
+// store, matching torch's `.to(bfloat16)` and minimax_h3.cpp's RoundBf16.
+inline float LoadBf16(const void* p, int64_t i) {
+  const uint32_t bits = static_cast<uint32_t>(static_cast<const uint16_t*>(p)[i]) << 16;
   float out;
   std::memcpy(&out, &bits, sizeof(out));
   return out;
 }
 
+inline void StoreBf16(void* p, int64_t i, float v) {
+  uint32_t bits;
+  std::memcpy(&bits, &v, sizeof(bits));
+  if ((bits & 0x7F800000u) == 0x7F800000u) {  // inf/nan pass through
+    bits &= 0xFFFF0000u;
+  } else {
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+  }
+  static_cast<uint16_t*>(p)[i] = static_cast<uint16_t>(bits >> 16);
+}
+
+inline float Load(const void* p, int64_t i, bool bf16) {
+  return bf16 ? LoadBf16(p, i) : static_cast<const float*>(p)[i];
+}
+
+inline void Store(void* p, int64_t i, float v, bool bf16) {
+  if (bf16) {
+    StoreBf16(p, i, v);
+  } else {
+    static_cast<float*>(p)[i] = v;
+  }
+}
+
 // _modulate_scale_shift (minimax_h3_transformer.py:183-192).
-void MiniMaxH3ModulateScaleShift(Queue&, float* x, const float* shift, const float* scale,
+void MiniMaxH3ModulateScaleShift(Queue&, void* x, const void* shift, const void* scale,
                                  const int32_t* idx, int64_t rows, int64_t width,
-                                 int64_t src_stride, bool round_out) {
+                                 int64_t src_stride, DType dtype) {
+  const bool bf16 = dtype == DType::kBF16;
   for (int64_t r = 0; r < rows; ++r) {
     const int64_t row = idx[r];
-    float* dst = x + r * width;
-    const float* s = scale + row * src_stride;
-    const float* h = shift + row * src_stride;
     for (int64_t i = 0; i < width; ++i) {
-      const float v = dst[i] * (1.0f + s[i]) + h[i];
-      dst[i] = round_out ? RoundBf16Scalar(v) : v;
+      const float v = Load(x, r * width + i, bf16) * (1.0f + Load(scale, row * src_stride + i, bf16)) +
+                      Load(shift, row * src_stride + i, bf16);
+      Store(x, r * width + i, v, bf16);
     }
   }
 }
 
 // _modulate_gate (minimax_h3_transformer.py:195-204).
-void MiniMaxH3ModulateGate(Queue&, float* residual, const float* gate, const float* other,
-                           const int32_t* idx, int64_t rows, int64_t width,
-                           int64_t src_stride, bool round_out) {
+void MiniMaxH3ModulateGate(Queue&, void* residual, const void* gate, const void* other,
+                           const int32_t* idx, int64_t rows, int64_t width, int64_t src_stride,
+                           DType dtype) {
+  const bool bf16 = dtype == DType::kBF16;
   for (int64_t r = 0; r < rows; ++r) {
     const int64_t row = idx[r];
-    float* dst = residual + r * width;
-    const float* g = gate + row * src_stride;
-    const float* o = other + r * width;
     for (int64_t i = 0; i < width; ++i) {
-      const float v = dst[i] + g[i] * o[i];
-      dst[i] = round_out ? RoundBf16Scalar(v) : v;
+      const float v = Load(residual, r * width + i, bf16) +
+                      Load(gate, row * src_stride + i, bf16) * Load(other, r * width + i, bf16);
+      Store(residual, r * width + i, v, bf16);
     }
   }
 }
@@ -78,20 +95,10 @@ void MiniMaxH3Silu(Queue&, float* x, int64_t n) {
   for (int64_t i = 0; i < n; ++i) x[i] = x[i] / (1.0f + std::exp(-x[i]));
 }
 
-// Round through bfloat16, round-to-nearest-even. A 1:1 transcription of
-// minimax_h3.cpp's RoundBf16, including the inf/nan passthrough -- the two must
-// agree bit-for-bit or the bf16 gate compares different cast points.
-void MiniMaxH3RoundBf16(Queue&, float* x, int64_t n) {
-  for (int64_t i = 0; i < n; ++i) {
-    x[i] = RoundBf16Scalar(x[i]);
-  }
-}
-
 const vllm::minimax_h3::MiniMaxH3DeviceKernels kKernels{
     &MiniMaxH3ModulateScaleShift,
     &MiniMaxH3ModulateGate,
     &MiniMaxH3Silu,
-    &MiniMaxH3RoundBf16,
 };
 
 struct Registrar {

@@ -799,9 +799,20 @@ struct MiniMaxH3DitDeviceWeights {
 
 // Stage a host-resident weight set onto `queue`'s device. Every tensor must be
 // f32 and host-resident; the returned views live on the device.
+// `compute_dtype` picks the WEIGHT storage policy, mirroring upstream's own split
+// (MINIMAX_H3_FP32_PARAM_NAMES / _BUFFER_NAMES, minimax_h3_transformer.py:85-101):
+//   kF32  -> every weight staged as f32.
+//   kBF16 -> the bf16-STORED modules staged as bf16 (condition_proj, every refiner
+//            and block norm/attn/mlp/adaln, refiner_final_norm, final_norm,
+//            final_adaln), while the fp32 ISLANDS stay f32 (both patch projections,
+//            both time-embedder projections, both output heads, rope.inv_freq).
+// This is exactly what the bf16 GOLDEN was generated with (the generator's
+// to_bf16_weights), so the bf16 device path now matches upstream's weight dtypes
+// as well as its activation cast points.
 MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitParams& params,
-                                                   const MiniMaxH3DitWeights& host);
+                                                   const MiniMaxH3DitWeights& host,
+                                                   vt::DType compute_dtype = vt::DType::kF32);
 
 // The DEVICE-RESIDENT DiT forward: same graph as MiniMaxH3DitForward, but every
 // activation stays in device memory for the whole block stack -- only the inputs

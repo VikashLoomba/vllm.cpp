@@ -550,7 +550,12 @@ static void CheckDeviceForwardBf16(vt::Queue& q, const char* label) {
   const MiniMaxH3DitParams& p = weights->params;
   const std::unique_ptr<DitForwardCase> c = BuildDitForwardCase(p);
 
-  const MiniMaxH3DitDeviceWeights staged = StageMiniMaxH3DitWeights(q, p, weights->views);
+  // Stage with the bf16 policy too: upstream STORES those modules in bf16 (the
+  // generator's to_bf16_weights), so the weights must be rounded the same way the
+  // golden's were -- staging f32 weights under a bf16 stream would compare a
+  // different model, not a different dtype policy.
+  const MiniMaxH3DitDeviceWeights staged =
+      StageMiniMaxH3DitWeights(q, p, weights->views, vt::DType::kBF16);
   const MiniMaxH3DitOutputs got =
       MiniMaxH3DitForwardDevice(q, p, staged.weights, c->in, vt::DType::kBF16);
 

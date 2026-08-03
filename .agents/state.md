@@ -35712,3 +35712,27 @@ on synthetic files and real manifests/configs. That download is the next step, a
 it is the only thing between here and a video that can actually be watched.
 
 Gate: 47/47 (13763 assertions).
+
+## 2026-08-03 - MiniMax-H3: the denoise loop finally runs DEVICE-RESIDENT
+
+Found while preparing the real-checkpoint run: MiniMaxH3DenoiseLoop called
+MiniMaxH3DitForward - the CPU REFERENCE - not MiniMaxH3DitForwardDevice. So every
+device-forward milestone this session was reachable only through the DiT unit test,
+never through the loop that actually drives generation.
+
+That made a real run infeasible rather than merely slow: 50 layers x hidden 5376 x
+~250k latent positions x 50 steps is not a CPU workload.
+
+Now: on a non-CPU device the loop stages the DiT weights ONCE (a 50-step loop that
+re-uploaded ~16 GB per iteration would be dominated by transfer - which is exactly
+what StageMiniMaxH3DitWeights was built for) and runs every step device-resident.
+
+Gated by re-running the WHOLE t2va path on CUDA and comparing frames AND waveform
+against the CPU pipeline at 2e-3 - the same tolerance class the DiT forward is held
+to, carried through both VAE decoders.
+
+GENERALIZES, and it is the third instance this session: a component can be gated and
+still be UNREACHED by the code path that matters. post_quant_conv was implemented but
+uncalled; the keep-quant test ran on the CPU backend; the device forward was gated in
+a unit test while the loop used the CPU one. Ask what CALLS the thing, not just
+whether the thing is correct.

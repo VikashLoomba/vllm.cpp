@@ -28,6 +28,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vt/dtype.h"
+#include "vt/backend.h"
 #include "vt/ops.h"
 
 namespace vllm {
@@ -704,6 +705,19 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
            "minimax_h3 denoise: video/audio sigma schedules must have equal length");
   VT_CHECK(sigmas_video.size() >= 2, "minimax_h3 denoise: sigma schedules need at least 2 entries");
 
+  // DEVICE PATH. On a non-CPU device the per-step forward runs device-resident, and
+  // the weights are staged ONCE here rather than per step — a 50-step loop that
+  // re-uploaded ~16 GB every iteration would be dominated by the transfer. This is
+  // exactly what StageMiniMaxH3DitWeights exists for.
+  const bool on_device = device.type != vt::DeviceType::kCPU;
+  vt::Queue device_queue{device, nullptr};
+  MiniMaxH3DitDeviceWeights staged;
+  if (on_device) {
+    vt::Backend& backend = vt::GetBackend(device.type);
+    device_queue = backend.CreateQueue();
+    staged = StageMiniMaxH3DitWeights(device_queue, params, weights, compute_dtype);
+  }
+
   const MiniMaxH3PackedSequence& packed = branch.packed;
   const int64_t seq_len = packed.seq_len;
   const int64_t video_width = params.video_row_width();
@@ -822,7 +836,9 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
 
     const MiniMaxH3DitOutputs velocity =
-        MiniMaxH3DitForward(device, params, weights, in, compute_dtype);
+        on_device ? MiniMaxH3DitForwardDevice(device_queue, params, staged.weights, in,
+                                              compute_dtype)
+                  : MiniMaxH3DitForward(device, params, weights, in, compute_dtype);
 
     // Chain only the TARGET rows; pinned rows are reset to their anchors after
     // every step (denoise_loop.py:210-235).

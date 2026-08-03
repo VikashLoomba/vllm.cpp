@@ -1539,6 +1539,43 @@ TEST_CASE("minimax_h3: the WHOLE t2va path composes end to end") {
   }
   CHECK(moved > 0.0);
 
+  // DEVICE PATH through the WHOLE pipeline. The denoise loop stages the DiT weights
+  // once and runs every step device-resident; this asserts the resulting video and
+  // audio match the CPU pipeline. Without it the device wiring is reachable only
+  // through the DiT-forward unit test, not through the loop that actually drives it.
+  {
+    vt::Backend* cuda = nullptr;
+    try {
+      cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+    } catch (...) {
+      cuda = nullptr;
+    }
+    if (cuda == nullptr) {
+      MESSAGE("SKIP: no CUDA backend registered (device t2va)");
+    } else {
+      const vt::Queue dq = cuda->CreateQueue();
+      const vllm::MiniMaxH3T2vaResult dev = vllm::MiniMaxH3GenerateT2va(
+          dq.device, request, p, dit->views, video_config, video_weights, audio_config,
+          audio_weights, prompt_embeds, noise_video, noise_audio, vt::DType::kF32);
+      REQUIRE(dev.frames.size() == out.frames.size());
+      REQUIRE(dev.waveform.size() == out.waveform.size());
+      double fmax = 0.0, amax = 0.0;
+      for (size_t i = 0; i < out.frames.size(); ++i) {
+        fmax = std::max(fmax, std::abs(static_cast<double>(dev.frames[i] - out.frames[i])));
+      }
+      for (size_t i = 0; i < out.waveform.size(); ++i) {
+        amax = std::max(amax, std::abs(static_cast<double>(dev.waveform[i] - out.waveform[i])));
+      }
+      INFO("device-vs-cpu t2va: frames " << fmax << ", waveform " << amax);
+      // Not bit-identical by construction (the device path reuses the tuned shared
+      // ops, whose reductions differ), so this is the same tolerance class the DiT
+      // forward is held to, carried through the VAEs.
+      CHECK(fmax <= 2e-3);
+      CHECK(amax <= 2e-3);
+      for (float v : dev.frames) REQUIRE(std::isfinite(v));
+    }
+  }
+
   // post_quant_conv: the real checkpoint ships it, and the pipeline must APPLY it
   // to the latent before decoding. The weight set above deliberately omits it (a
   // reduced-dimension set need not carry every wrapper tensor), so re-run WITH one

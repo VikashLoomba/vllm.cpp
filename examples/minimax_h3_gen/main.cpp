@@ -43,6 +43,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vt/backend.h"
 
 namespace {
 
@@ -107,6 +108,7 @@ int main(int argc, char** argv) {
   std::string dit_path, video_vae_path, video_cfg_path, audio_vae_path, audio_cfg_path;
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
   bool keep_quant = false, dry_run = false;
+  std::string device_name = "cpu";
   int64_t steps = 0, frames = 0, height = 0, width = 0;
 
   try {
@@ -123,6 +125,7 @@ int main(int argc, char** argv) {
       else if (f == "--ffmpeg") ffmpeg = Need(argc, argv, ++i, f);
       else if (f == "--keep-quant") keep_quant = true;
       else if (f == "--dry-run") dry_run = true;
+      else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--frames") frames = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--height") height = std::stoll(Need(argc, argv, ++i, f));
@@ -134,7 +137,8 @@ int main(int argc, char** argv) {
       std::cerr << "usage: minimax-h3-gen --dit <f> --video-vae <f> --audio-vae <f> "
                    "--prompt-embeds <f32.bin> --out <out.mp4> [--video-vae-config <j>] "
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
-                   "[--height N] [--width N] [--workdir DIR] [--ffmpeg PATH] [--dry-run]\n";
+                   "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
+                   "[--dry-run]\n";
       return 2;
     }
 
@@ -235,8 +239,17 @@ int main(int argc, char** argv) {
     fill(noise_audio, 0x5EED5678ULL);
 
     std::cerr << "generating (" << request.num_steps << " steps)...\n";
+    // On a device, the denoise loop stages the DiT weights ONCE and runs every step
+    // device-resident. On CPU it uses the portable reference forward, which is a
+    // correctness path, not a throughput one.
+    vt::Device device{};
+    if (device_name == "cuda") {
+      device = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+    } else if (device_name != "cpu") {
+      throw std::runtime_error("--device must be cpu or cuda");
+    }
     const vllm::MiniMaxH3T2vaResult result = vllm::MiniMaxH3GenerateT2va(
-        vt::Device{}, request, dit.params, dit.weights, video_cfg, video_weights, audio_cfg,
+        device, request, dit.params, dit.weights, video_cfg, video_weights, audio_cfg,
         audio_weights, prompt_embeds, noise_video, noise_audio, vt::DType::kBF16);
 
     // --- 5. artifacts (the LIBRARY builds these; nothing spawns) ---

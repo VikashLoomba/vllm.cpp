@@ -847,6 +847,12 @@ struct MiniMaxH3T2vaResult {
 // Run the whole t2va path. NOISE IS AN INPUT: upstream seeds a torch CPU
 // generator, and reproducing torch's RNG bit-exactly decides WHICH sample you get
 // rather than whether the pipeline is right, so the caller supplies it.
+// Serialize a decoded waveform as RIFF/WAVE 16-bit PCM. The VAE's output is
+// CHANNEL-MAJOR; this interleaves it. Dependency-free, and required under either
+// outcome of the open MP4/muxer dependency decision.
+std::string MiniMaxH3WriteWav(const std::vector<float>& waveform, int64_t channels,
+                              int64_t samples_per_channel, int64_t sample_rate);
+
 MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
                                           const MiniMaxH3DitParams& dit_params,
                                           const MiniMaxH3DitWeights& dit_weights,

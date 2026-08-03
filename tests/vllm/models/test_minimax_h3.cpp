@@ -2401,6 +2401,72 @@ TEST_CASE("minimax_h3: the MM processor is Qwen3-VL reuse, with H3's own config"
   std::remove(cfg_path.c_str());
 }
 
+TEST_CASE("minimax_h3: the decoded waveform serializes to a valid WAV") {
+  // Dependency-free audio output. The container question for /v1/videos (MP4, and
+  // how to get a muxer) is still open; WAV needs none of it and is required under
+  // either outcome.
+  const int64_t channels = 2, samples = 5, rate = vllm::kMiniMaxH3AudioSampleRate;
+  // CHANNEL-MAJOR, as the VAE emits: all of channel 0, then all of channel 1.
+  const std::vector<float> waveform = {0.0f,  0.5f,  -0.5f, 1.0f,  -1.0f,
+                                       0.25f, -0.25f, 0.75f, -0.75f, 0.125f};
+  const std::string wav = vllm::MiniMaxH3WriteWav(waveform, channels, samples, rate);
+
+  REQUIRE(wav.size() == 44u + static_cast<size_t>(channels * samples * 2));
+  CHECK(wav.compare(0, 4, "RIFF") == 0);
+  CHECK(wav.compare(8, 4, "WAVE") == 0);
+  CHECK(wav.compare(12, 4, "fmt ") == 0);
+  CHECK(wav.compare(36, 4, "data") == 0);
+
+  auto u16 = [&](size_t off) {
+    return static_cast<uint16_t>(static_cast<uint8_t>(wav[off]) |
+                                 (static_cast<uint8_t>(wav[off + 1]) << 8));
+  };
+  auto u32 = [&](size_t off) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) v |= static_cast<uint32_t>(static_cast<uint8_t>(wav[off + i])) << (8 * i);
+    return v;
+  };
+  CHECK(u32(4) == 36u + static_cast<uint32_t>(channels * samples * 2));
+  CHECK(u32(16) == 16u);                       // PCM fmt chunk
+  CHECK(u16(20) == 1u);                        // format = PCM
+  CHECK(u16(22) == channels);
+  CHECK(u32(24) == static_cast<uint32_t>(rate));
+  CHECK(u32(28) == static_cast<uint32_t>(rate * channels * 2));  // byte rate
+  CHECK(u16(32) == channels * 2);              // block align
+  CHECK(u16(34) == 16u);                       // bits per sample
+  CHECK(u32(40) == static_cast<uint32_t>(channels * samples * 2));
+
+  // INTERLEAVE: sample s of channel c must sit at frame s, slot c -- getting this
+  // backwards yields audio that plays but with the channels time-smeared.
+  auto sample_at = [&](int64_t frame, int64_t ch) {
+    const size_t off = 44 + static_cast<size_t>((frame * channels + ch) * 2);
+    return static_cast<int16_t>(u16(off));
+  };
+  for (int64_t s2 = 0; s2 < samples; ++s2) {
+    for (int64_t c = 0; c < channels; ++c) {
+      const float want = waveform[static_cast<size_t>(c * samples + s2)];
+      const int16_t got = sample_at(s2, c);
+      CHECK(got == static_cast<int16_t>(std::lround(want * 32767.0f)));
+    }
+  }
+  // Full-scale maps to the extremes without wrapping.
+  CHECK(sample_at(3, 0) == 32767);
+  CHECK(sample_at(4, 0) == -32767);
+
+  // Out-of-range input is clamped, not wrapped.
+  const std::vector<float> hot = {2.0f, -2.0f};
+  const std::string clamped = vllm::MiniMaxH3WriteWav(hot, 1, 2, rate);
+  auto hot_at = [&](size_t i) {
+    const size_t off = 44 + i * 2;
+    return static_cast<int16_t>(static_cast<uint8_t>(clamped[off]) |
+                                (static_cast<uint8_t>(clamped[off + 1]) << 8));
+  };
+  CHECK(hot_at(0) == 32767);
+  CHECK(hot_at(1) == -32767);
+
+  CHECK_THROWS(vllm::MiniMaxH3WriteWav(waveform, 3, samples, rate));  // size mismatch
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

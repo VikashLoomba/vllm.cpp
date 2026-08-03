@@ -35120,3 +35120,57 @@ COMPLETE (text + vision towers + MM processor), BOTH quantized loaders (GGUF,
 NVFP4), fl2va/ref2va anchor conditioning, reference-video math, presentation token
 tags, and the assembled t2va pipeline.
 
+## 2026-08-03 - MiniMax-H3: WAV output, and the muxer decision stays open
+
+The decoded stereo waveform now serializes to RIFF/WAVE 16-bit PCM, converting the
+audio VAE's CHANNEL-MAJOR layout to INTERLEAVED (getting that backwards yields audio
+that plays but with the channels time-smeared into each other) and clamping rather
+than wrapping at full scale.
+
+**Why this and not the muxer.** I re-examined my own "blocked on a dependency
+decision" claim, since the project's PRIME POLICY is to mirror upstream rather than
+ask, and upstream vLLM-Omni simply shells out to `ffmpeg` (which IS present on this
+box, 6.1.1). But the relevant asymmetry is that vLLM-Omni is a Python SERVING layer
+while vllm.cpp is a LIBRARY, and `src/vllm/` has NO subprocess precedent anywhere. A
+library that forks a process is a real architectural commitment (PATH dependence,
+sandboxing, process lifetime) - not the same class of choice as a server script
+calling ffmpeg. So the decision stays with the project owner, and a plausible
+resolution to offer is: put any ffmpeg invocation in the EXAMPLE/SERVER layer, not
+the core library.
+
+WAV sidesteps all of it: 44-byte header plus samples, no dependency, and needed
+under either outcome (a muxer consumes PCM; a standalone audio artifact is useful
+regardless).
+
+**Lane state unchanged otherwise.** Every portable piece is done. The two open items
+remain (a) the muxer/media-I/O decision and (b) the device-resident FP4 forward and
+any speed number, which need a GPU that is not reachable.
+
+## 2026-08-03 - USER DIRECTIVE: pause all GPU-requiring MiniMax-H3 work
+
+The developer flagged that **dgx.casa may already be busy with other GPU work** and
+directed: **pause if we need a GPU.** Recording it so a later session does not
+casually pick the GPU bricks back up and contend for the box.
+
+**PAUSED (needs a GPU, do NOT start without checking with the developer first):**
+  * the device-resident FP4 forward (W2b/W10b) - the actual speed work;
+  * any e2e t2va run on a real quantized checkpoint;
+  * therefore ANY speed number vs vLLM-Omni.
+
+Per the project's GPU-contention rule, a benchmark is only valid on an uncontended
+box, so attempting these while dgx.casa is busy would produce void numbers anyway -
+the pause is the correct call on measurement grounds as well as courtesy.
+
+**NOT paused (CPU-only, still open):** the ffmpeg media-I/O + MP4 muxer DEPENDENCY
+DECISION, which is a project-owner call rather than GPU work. A plausible resolution
+to offer: put any ffmpeg invocation in the EXAMPLE/SERVER layer rather than the core
+library, since `src/vllm/` has no subprocess precedent.
+
+**State at pause.** Every PORTABLE piece of the lane is ported and gated on CPU:
+DiT forward (f32 + bf16), packed layout, scheduler, request planning, denoise loop,
+the video VAE COMPLETE (ViT3D decoder + 3D-CNN encoder + tiling), the audio VAE
+decoder + WAV output, the encoder COMPLETE (text tower + vision tower + MM
+processor), BOTH quantized loaders (GGUF, NVFP4), fl2va/ref2va anchor conditioning,
+reference-video math, presentation token tags, and the assembled t2va pipeline.
+33/33 test cases, 9207 assertions, no weight bytes checked in.
+

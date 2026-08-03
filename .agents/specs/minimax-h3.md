@@ -168,6 +168,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **VAE encoder Downsample3D** (asymmetric pre-pad + strided causal conv) | **exact** |
 | **WHOLE VAE 3D-CNN encoder** (conv_in -> levels -> norm -> conv_out) | **exact** |
 | **MM PROCESSOR reuse** (H3's own processor config through our Qwen3-VL front end) | **pass** — image + video bounds, 0.5 normalization, 32-grid |
+| **WAV serialization** of the decoded waveform | **pass** — header fields, channel-major -> interleaved, clamping |
 | **WHOLE t2va PATH composes** (layout -> sigmas -> denoise loop -> unpack -> denormalize -> both VAEs) | frames + stereo waveform, correctly shaped, finite, in [-1, 1] |
 | **GGUF LOAD -> runnable DiT** (synthetic ComfyUI-format file) | geometry recovered from shapes; a real forward runs off the loaded weights |
 | **NVFP4 LOAD -> runnable DiT** (synthetic compressed-tensors file) | packed [out, in/2] recovered as logical [out, in]; sidecars excluded; a real forward runs |

@@ -100,7 +100,7 @@ final output heads. Everything else is BF16.
 | Denoise loop | `denoise_loop.py` (249 L) | — | **W2 LANDED** (driver ported, not e2e-gated) |
 | H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 PENDING** — Qwen3-VL text layer-50 + vision tower + DeepStack |
 | Video VAE | `vae.py` adapter + checkpoint REMOTE CODE | ~10 GB | **W4 PENDING** — see 5.1 |
-| Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE | ~0.6 GB | **W5 PENDING** |
+| Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 PENDING** |
 | Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **W6 PENDING** |
 | Serving | vllm-omni `/v1/videos`, `/v1/videos/sync` | — | **W7 PENDING** |
@@ -152,6 +152,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | bf16 PRODUCTION stream vs upstream's dtype policy | max abs diff 2.4e-3 (bf16 scale) |
 | request planning (frames, latent shapes, sigma schedules, canvas, task dispatch) | **exact** |
 | **REAL GGUF manifest** (535 tensors of `MiniMax-H3-FL2VA-Q3_K_M.gguf`) | **exact** — every name and logical shape matches our contract, geometry derived from shapes alone equals the shipped H3 config |
+| **AUDIO VAE decoder** vs the checkpoint's OWN remote code | **max abs diff 4.2e-9** (kaiser-sinc filter 3.0e-8) |
 | config-parse invariants + weight contract + grouped-qkv reorder | pass |
 
 The fp64 position grid is gated bit-exact deliberately: it feeds RoPE, and a
@@ -182,6 +183,14 @@ i.e. the actual VAE implementations ship INSIDE the HF checkpoint and run under
 that: W4/W5 must **reimplement both VAEs in C++ from the checkpoint's Python
 source**, which must be fetched separately (the VAE modules and their `config.json`
 are small; the 354 GB of weights are not needed to READ the architecture).
+
+**Status 2026-08-03: the remote code is IN HAND** (fetched from the checkpoint's
+`FL2VA/{audio,video}_vae/`, ~130 KB of Python, NOT vendored here — it ships under
+the MiniMax H3 Community License). The **audio VAE is DONE** (W5): a DAC-lineage
+BigVGAN vocoder, reimplemented and gated against the checkpoint's own modules at
+4.2e-9 by `scripts/gen-minimax-h3-audio-vae-goldens.py`. The **video VAE (W4)
+remains the largest brick**: `klvae.py` alone is ~48 KB, plus a CNN/ViT hybrid,
+tiling, and a parallel path.
 
 Contracts already pinned down from the adapter:
 * Video VAE weights stay **FP32**; keyframe encode is seeded
@@ -236,8 +245,8 @@ contract pending W6), `test_minimax_h3_e2e.py` (BLOCKED — needs the checkpoint
 | **W2** | DiT forward + denoise driver, parity-gated on CPU at reduced dims | — (DONE) |
 | **W2b** | Device-resident forward: bf16 stream, `vt::FusedChain` glue, fused AdaLN modulate op, merged gate/up seam, CUDA gate | — |
 | **W3** | H3-Encoder on the existing Qwen3-VL tower (layer-50 truncation, DeepStack, all-ones mask) | vllm-omni pin |
-| **W4** | Video VAE reimplementation from checkpoint remote code | fetch VAE source |
-| **W5** | Audio VAE reimplementation (+ determinism context semantics) | fetch VAE source |
+| **W4** | Video VAE reimplementation from checkpoint remote code (`FL2VA/video_vae/*.py`, ~48 KB `klvae.py` + CNN/ViT/tiling) — the largest remaining brick | — (source in hand) |
+| **W5** | Audio VAE reimplementation | **DONE** — DAC-lineage BigVGAN decoder (weight-norm materialization, anti-aliased SnakeBeta with kaiser-sinc up/down resampling, replicate padding, final clamp). Encode-side determinism context is still open |
 | **W6** | Pipeline: t2va/fl2va/ref2va task assembly, condition noise, reference video, presentation, sigma schedules | W3-W5 |
 | **W7** | Serving: `/v1/videos` + `/v1/videos/sync`, job store, MP4 mux (dependency decision in 5.2) | W6 |
 | **W8** | Speed: USP sequence parallelism, block caching, DiT TP | W2b + multi-GPU HW |

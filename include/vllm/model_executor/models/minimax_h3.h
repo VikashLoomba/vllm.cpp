@@ -40,6 +40,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -303,6 +304,58 @@ MiniMaxH3DitParams ParseMiniMaxH3DitParamsFromGgufManifest(
 class GgufFile;
 // Names + logical shapes + fp32-island flags read out of a GGUF.
 std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3GgufTensors(const GgufFile& file);
+
+// ---------------------------------------------------------------------------
+// Audio VAE decoder (minimax_h3_audio_vae.cpp)
+//
+// H3's two VAEs are checkpoint REMOTE CODE loaded under `trust_remote_code`
+// (vae.py:41-53); vLLM-Omni only ADAPTS them, so a no-Python engine must
+// REIMPLEMENT them. This is the audio side: a DAC-lineage BigVGAN vocoder at
+// 32 kHz / 2 channels, gated against the checkpoint's own modules by
+// scripts/gen-minimax-h3-audio-vae-goldens.py.
+// ---------------------------------------------------------------------------
+
+inline constexpr int64_t kMiniMaxH3AudioSampleRate = 32000;
+inline constexpr int64_t kMiniMaxH3AudioChannels = 2;
+
+struct MiniMaxH3AudioVaeConfig {
+  int64_t num_mels = 2048;                 // == DacAudioVAE latent_dim
+  int64_t upsample_initial_channel = 1024;  // decoder_dim
+  std::vector<int64_t> upsample_rates = {5, 5, 2, 2, 2, 2, 2};
+  std::vector<int64_t> upsample_kernel_sizes = {9, 9, 4, 4, 4, 4, 4};
+  std::vector<int64_t> resblock_kernel_sizes = {3, 7, 11};
+  std::vector<std::vector<int64_t>> resblock_dilation_sizes = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
+  bool use_tanh_at_final = false;  // H3 CLAMPS instead
+  bool use_bias_at_final = false;
+  bool snake_logscale = true;
+};
+
+// Parameters keyed by their torch state_dict name, so the checkpoint's own
+// naming IS the contract (`conv_pre.parametrizations.weight.original0`, ...).
+struct MiniMaxH3AudioVaeWeights {
+  std::map<std::string, std::vector<float>> tensors;
+
+  const std::vector<float>& Get(const std::string& name) const;
+  bool Has(const std::string& name) const { return tensors.count(name) != 0; }
+};
+
+// kaiser_sinc_filter1d (dac_alias_free_filter.py:26-60) — built at load time, never
+// read from the checkpoint.
+std::vector<float> MiniMaxH3KaiserSincFilter1d(double cutoff, double half_width,
+                                               int64_t kernel_size);
+
+// torch weight_norm: w = g * v / ||v||, norm over every dim except dim 0. Every
+// conv in this decoder is weight-normalized, so the checkpoint stores (g, v).
+std::vector<float> MiniMaxH3MaterializeWeightNorm(const std::vector<float>& g,
+                                                  const std::vector<float>& v,
+                                                  int64_t out_channels);
+
+// Decode one channel of audio latents [num_mels, frames] to a waveform in
+// [-1, 1]. Returns the samples and writes their count to `out_samples`.
+std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config,
+                                           const MiniMaxH3AudioVaeWeights& weights,
+                                           const std::vector<float>& latent, int64_t frames,
+                                           int64_t* out_samples);
 
 // The checkpoint stores qkv GROUPED per query group as [q_per_group, k, v]; the
 // fused qkv projection wants [q_all, k_all, v_all] (minimax_h3_transformer.py:

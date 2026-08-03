@@ -26,6 +26,7 @@
 
 #include "minimax_h3_goldens.inc"
 #include "minimax_h3_gguf_manifest.inc"
+#include "minimax_h3_audio_vae_goldens.inc"
 
 #include "vt/device.h"
 #include "vt/tensor.h"
@@ -696,6 +697,112 @@ TEST_CASE("minimax_h3: the denoise loop advances targets and pins condition rows
     if (result.audio_rows[i] != initial_audio[i]) audio_moved = true;
   }
   CHECK(audio_moved);
+}
+
+TEST_CASE("minimax_h3: the audio VAE decoder matches the checkpoint's own remote code") {
+  // H3's VAEs are checkpoint REMOTE CODE (loaded via trust_remote_code), so a
+  // no-Python engine must REIMPLEMENT them. This gates our reimplementation
+  // against the checkpoint's OWN modules, executed at reduced dimensions by
+  // scripts/gen-minimax-h3-audio-vae-goldens.py. The remote code is not vendored
+  // here; the generator takes a path to a local copy.
+  vllm::MiniMaxH3AudioVaeConfig config;
+  config.num_mels = vllm_test::kH3AudioVaeNumMels;
+  config.upsample_initial_channel = vllm_test::kH3AudioVaeInitialChannel;
+  config.upsample_rates = {2, 2};
+  config.upsample_kernel_sizes = {4, 4};
+  config.resblock_kernel_sizes = {3, 7, 11};
+  config.resblock_dilation_sizes = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
+  config.use_tanh_at_final = false;
+  config.use_bias_at_final = false;
+  config.snake_logscale = true;
+
+  // The kaiser-sinc filter is COMPUTED, not loaded. Prove it first: if the filter
+  // is wrong, every anti-aliased activation is wrong and the decoder mismatch
+  // would be impossible to localize.
+  const std::vector<float> filter = vllm::MiniMaxH3KaiserSincFilter1d(0.5 / 2, 0.6 / 2, 12);
+  REQUIRE(filter.size() == std::size(vllm_test::kH3AudioVaeUpFilterGolden));
+  double filter_err = 0.0;
+  double filter_sum = 0.0;
+  for (size_t i = 0; i < filter.size(); ++i) {
+    filter_err = std::max(filter_err, std::abs(static_cast<double>(filter[i]) -
+                                               vllm_test::kH3AudioVaeUpFilterGolden[i]));
+    filter_sum += filter[i];
+  }
+  INFO("kaiser-sinc filter max|diff| = " << filter_err);
+  CHECK(filter_err <= 1e-6);
+  CHECK(filter_sum == doctest::Approx(1.0).epsilon(1e-6));  // normalized to sum 1
+
+  // Rebuild every parameter from the shared stream, using the checkpoint's own
+  // state_dict names and the generator's per-role scales.
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& name, int64_t count, double scale, double offset) {
+    weights.tensors[name] = MakeParam(name, count, scale, offset);
+  };
+  auto put_conv = [&](const std::string& prefix, int64_t out_channels, int64_t in_channels,
+                      int64_t kernel, bool bias) {
+    put(prefix + ".parametrizations.weight.original0", out_channels, 0.03, 0.15);
+    put(prefix + ".parametrizations.weight.original1", out_channels * in_channels * kernel, 0.08, 0.0);
+    if (bias) put(prefix + ".bias", out_channels, 0.05, 0.0);
+  };
+  auto put_act = [&](const std::string& prefix, int64_t channels) {
+    put(prefix + ".act.alpha", channels, 0.2, 0.0);
+    put(prefix + ".act.beta", channels, 0.2, 0.0);
+  };
+
+  const int64_t initial = config.upsample_initial_channel;
+  put_conv("conv_pre", initial, config.num_mels, 7, /*bias=*/true);
+  int64_t channels = initial;
+  for (size_t i = 0; i < config.upsample_rates.size(); ++i) {
+    const int64_t out_channels = initial / (int64_t{1} << (i + 1));
+    // ConvTranspose1d weight is [in, out, k]; weight-norm dim 0 is IN.
+    const std::string prefix = "ups." + std::to_string(i) + ".0";
+    put(prefix + ".parametrizations.weight.original0", channels, 0.03, 0.15);
+    put(prefix + ".parametrizations.weight.original1",
+        channels * out_channels * config.upsample_kernel_sizes[i], 0.08, 0.0);
+    put(prefix + ".bias", out_channels, 0.05, 0.0);
+    channels = out_channels;
+    for (size_t j = 0; j < config.resblock_kernel_sizes.size(); ++j) {
+      const std::string block =
+          "resblocks." + std::to_string(i * config.resblock_kernel_sizes.size() + j);
+      const int64_t kernel = config.resblock_kernel_sizes[j];
+      for (size_t d = 0; d < config.resblock_dilation_sizes[j].size(); ++d) {
+        put_conv(block + ".convs1." + std::to_string(d), channels, channels, kernel, true);
+        put_conv(block + ".convs2." + std::to_string(d), channels, channels, kernel, true);
+        put_act(block + ".activations." + std::to_string(2 * d), channels);
+        put_act(block + ".activations." + std::to_string(2 * d + 1), channels);
+      }
+    }
+  }
+  put_act("activation_post", channels);
+  put_conv("conv_post", 1, channels, 7, /*bias=*/false);
+
+  const std::vector<float> latent =
+      MakeParam("audiovae.input", config.num_mels * vllm_test::kH3AudioVaeFrames, 1.0);
+  int64_t out_samples = 0;
+  const std::vector<float> waveform = vllm::MiniMaxH3AudioVaeDecode(
+      config, weights, latent, vllm_test::kH3AudioVaeFrames, &out_samples);
+
+  CHECK(out_samples == vllm_test::kH3AudioVaeOutSamples);
+  REQUIRE(waveform.size() == std::size(vllm_test::kH3AudioVaeWaveformGolden));
+  const double err =
+      MaxAbsDiff(waveform, vllm_test::kH3AudioVaeWaveformGolden, waveform.size());
+  INFO("audio VAE waveform max|diff| = " << err);
+  CHECK(err <= 1e-5);
+  // The golden is deliberately unsaturated: a clamped golden would hide errors.
+  for (float value : waveform) {
+    CHECK(value > -1.0f);
+    CHECK(value < 1.0f);
+  }
+
+  // Weight-norm materialization: ||w_c|| must equal g_c exactly.
+  const std::vector<float> g = {2.0f, 0.5f};
+  const std::vector<float> v = {3.0f, 4.0f, 0.0f, 1.0f};  // rows [3,4] and [0,1]
+  const std::vector<float> w = vllm::MiniMaxH3MaterializeWeightNorm(g, v, 2);
+  REQUIRE(w.size() == 4);
+  CHECK(w[0] == doctest::Approx(2.0f * 3.0f / 5.0f));
+  CHECK(w[1] == doctest::Approx(2.0f * 4.0f / 5.0f));
+  CHECK(w[2] == doctest::Approx(0.0f));
+  CHECK(w[3] == doctest::Approx(0.5f));
 }
 
 TEST_CASE("minimax_h3: a REAL ComfyUI GGUF resolves onto our weight contract") {

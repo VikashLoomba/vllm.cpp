@@ -39,10 +39,11 @@ identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 | request planning (frames, latents, sigmas, canvas, task dispatch) | exact |
 | denoise-loop invariants | pass |
 | **REAL GGUF manifest** (535 tensors, `MiniMax-H3-FL2VA-Q3_K_M.gguf`) | exact name + shape match; geometry derived from shapes alone equals the shipped config |
+| **AUDIO VAE decoder** vs the checkpoint's own remote code | **max abs diff 4.2e-9** (kaiser-sinc filter 3.0e-8) |
 
 **Reproduce:** `cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF`
 then `cmake --build build-cpu --target test_minimax_h3 -j16 && ./build-cpu/tests/test_minimax_h3`
-(13/13 cases, 3907 assertions). Regenerate goldens with
+(14/14 cases, 3983 assertions). Regenerate goldens with
 `python3 scripts/gen-minimax-h3-goldens.py --vllm-omni <checkout> --out tests/vllm/models/minimax_h3_goldens.inc`;
 regenerate the GGUF manifest by range-fetching the first 4 MiB of the .gguf and running
 `scripts/gen-minimax-h3-gguf-manifest.py`.

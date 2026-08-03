@@ -34630,3 +34630,39 @@ into a fixture. Real-checkpoint grounding for the cost of one curl.
 Qwen3-VL tower -> the two VAEs -> pipeline), then the NVFP4 arm (W10) for speed -
 sm_121 has native FP4 tensor cores and our NVFP4 stack is the most tuned one we own.
 
+## 2026-08-03 - MiniMax-H3 W5: the audio VAE is reimplemented (`CLAIM-MINIMAX-H3-W5`)
+
+**The blocker I flagged is half-resolved.** H3's two VAEs ship as checkpoint REMOTE
+CODE and vLLM-Omni only adapts them, so a no-Python engine has to reimplement them.
+That was the biggest unknown in the lane. The remote code is now IN HAND (~130 KB
+of Python fetched from `FL2VA/{audio,video}_vae/`; NOT vendored - it ships under the
+MiniMax H3 Community License), and the AUDIO side is done.
+
+**What it is.** A DAC-lineage BigVGAN vocoder: `dec_in_proj` (32 -> 2048, k=1) then
+conv_pre -> 7 upsample stages (ConvTranspose1d, rates 5,5,2,2,2,2,2 / kernels
+9,9,4,4,4,4,4), each followed by 3 AMPBlock1 residual stacks (kernels 3,7,11,
+dilations 1,3,5) whose outputs are AVERAGED -> anti-aliased SnakeBeta -> conv_post
+-> clamp[-1,1]. 32 kHz stereo.
+
+**Two things that would have been easy to get wrong, both now gated:**
+1. Every conv is WEIGHT-NORMALIZED, so the checkpoint stores (g, v) pairs as
+   `parametrizations.weight.original0/original1` and the loader must materialize
+   `g * v / norm(v)` with the norm over every dim except dim 0. Note ConvTranspose1d
+   weight is [in, out, k], so its weight-norm dim 0 is the INPUT channel.
+2. The anti-aliased activation is up 2x -> SnakeBeta -> down 2x through a
+   KAISER-SINC filter that is COMPUTED at load time, never loaded. It needs a
+   Bessel I0, torch's periodic=false kaiser window, and REPLICATE padding. The
+   filter is gated separately (3.0e-8) so a filter bug cannot masquerade as a
+   decoder bug.
+
+**Result: waveform max abs diff 4.2e-9** vs the checkpoint's own modules - f32
+round-off. One methodology note: the first golden had 18 of 32 samples pinned at the
+final clamp, which would have HIDDEN errors, so the generator's weight scale was
+tuned down until the output was fully unsaturated, and the test now asserts
+non-saturation explicitly.
+
+**Next.** The VIDEO VAE (W4) is the largest remaining brick - `klvae.py` alone is
+~48 KB, plus a CNN/ViT hybrid, tiling, and a parallel path. Then the encoder (W3,
+mostly reuse of our Qwen3-VL tower) and the pipeline (W6), after which an
+end-to-end run on a quantized checkpoint is reachable.
+

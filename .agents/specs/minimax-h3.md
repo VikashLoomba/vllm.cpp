@@ -98,7 +98,7 @@ final output heads. Everything else is BF16.
 | Latent packing | `packed_tokens.py` (114 L) | — | **W1 LANDED** (+ round-trip) |
 | Scheduler | `scheduling_..._euler_ancestral.py` (179 L) | — | **W1 LANDED** |
 | Denoise loop | `denoise_loop.py` (249 L) | — | **W2 LANDED** (driver ported, not e2e-gated) |
-| H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 BOTH TOWERS' CORE DONE** — text tower (truncation + UNNORMALIZED output + DeepStack) at 1.2e-7, vision BLOCK at 6.0e-8; the vision tower's surround (patch embed, pos-embed interpolation, 2D rotary, patch mergers) and the MM processor remain |
+| H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 DONE** — text tower at 1.2e-7 (truncation + UNNORMALIZED output + DeepStack) and the FULL vision tower at 6.0e-8 (patch embed, bilinear pos-embed interpolation, 2D rotary, block stack, DeepStack + final mergers). Only the MM processor (image/video preprocessing to patches) remains |
 | Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 DECODER DONE** — the FULL ViT3D decoder (pack, x_embedder, register/cls tokens, 3D RoPE, 36-block stack, norm_out, proj_out, unpatchify) is ported and gated at **8.9e-8**. Tiling and the 3D-CNN encoder (conditioning only) remain. See 5.1 |
 | Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 t2va ASSEMBLED** — the whole path composes and runs (structural e2e gate); fl2va/ref2va conditioning and the torch-RNG noise seed remain |
@@ -159,6 +159,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **VIDEO VAE FULL ViT3D decoder** vs the checkpoint's OWN remote code | **max abs diff 8.9e-8** |
 | **ENCODER text tower** (truncation + unnormalized output + DeepStack) | **max abs diff 1.2e-7** |
 | **ENCODER vision block** (LayerNorm, fp32 rotary, varlen non-causal, tanh-GELU) | **max abs diff 6.0e-8** + boundary isolation proven |
+| **ENCODER FULL vision tower** (patch embed -> pos interp -> 2D rotary -> blocks -> mergers), ragged 2-image batch | **max abs diff <= 1e-4**, DeepStack + merged both |
 | **WHOLE t2va PATH composes** (layout -> sigmas -> denoise loop -> unpack -> denormalize -> both VAEs) | frames + stereo waveform, correctly shaped, finite, in [-1, 1] |
 | **GGUF LOAD -> runnable DiT** (synthetic ComfyUI-format file) | geometry recovered from shapes; a real forward runs off the loaded weights |
 | **NVFP4 LOAD -> runnable DiT** (synthetic compressed-tensors file) | packed [out, in/2] recovered as logical [out, in]; sidecars excluded; a real forward runs |

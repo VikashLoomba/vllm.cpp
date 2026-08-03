@@ -481,6 +481,42 @@ std::vector<float> MiniMaxH3VisionBlockForward(const MiniMaxH3VisionBlockConfig&
                                                const float* cos, const float* sin,
                                                const int32_t* cu_seqlens, int64_t num_segments);
 
+// The whole vision tower (encoder.py:483-600).
+struct MiniMaxH3VisionTowerConfig {
+  MiniMaxH3VisionBlockConfig block;
+  int64_t depth = 27;
+  int64_t patch_size = 16;
+  int64_t temporal_patch_size = 2;
+  int64_t in_channels = 3;
+  int64_t spatial_merge_size = 2;
+  int64_t out_hidden_size = 5120;
+  int64_t num_position_embeddings = 2304;  // must be a perfect square
+  double rope_theta = 10000.0;
+  std::vector<int64_t> deepstack_visual_indexes;
+};
+
+struct MiniMaxH3VisionTowerResult {
+  std::vector<float> merged;                    // [tokens/merge^2, out_hidden_size]
+  std::vector<std::vector<float>> deepstack;    // one per deepstack index
+};
+
+// Bilinear resample of the learned position grid, then spatial-merge permute.
+std::vector<float> MiniMaxH3VisionPosEmbedInterpolate(const std::vector<float>& pos_embed_table,
+                                                      int64_t num_grid_per_side, int64_t dim,
+                                                      const std::vector<int64_t>& grid_thw,
+                                                      int64_t merge_size);
+
+// 2D rotary frequencies in spatial-merge order.
+std::vector<float> MiniMaxH3VisionRotary(const std::vector<int64_t>& grid_thw, int64_t merge_size,
+                                         int64_t rotary_dim, double theta);
+
+// `patches` is [tokens, in_channels * temporal_patch * patch * patch]; `grid_thw`
+// is a flat list of (t, h, w) triples, one per image/video.
+MiniMaxH3VisionTowerResult MiniMaxH3VisionTowerForward(const MiniMaxH3VisionTowerConfig& config,
+                                                       const MiniMaxH3AudioVaeWeights& weights,
+                                                       const std::vector<float>& patches,
+                                                       const std::vector<int64_t>& grid_thw);
+
 // The checkpoint stores qkv GROUPED per query group as [q_per_group, k, v]; the
 // fused qkv projection wants [q_all, k_all, v_all] (minimax_h3_transformer.py:
 // 139-168). H3 is MHA, so heads_per_group == 1.

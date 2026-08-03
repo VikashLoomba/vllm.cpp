@@ -1820,6 +1820,102 @@ TEST_CASE("minimax_h3: the encoder VISION block matches upstream") {
   CHECK(changed);
 }
 
+TEST_CASE("minimax_h3: the FULL encoder vision tower matches upstream") {
+  // Completes the encoder: patch embed -> bilinear-interpolated position embedding
+  // -> 2D rotary -> block stack -> DeepStack mergers + final patch merger.
+  vllm::MiniMaxH3VisionTowerConfig config;
+  config.block.hidden_size = vllm_test::kH3EncVisDim;
+  config.block.num_heads = vllm_test::kH3EncVisHeads;
+  config.block.intermediate_size = vllm_test::kH3EncVisIntermediate;
+  config.block.eps = 1e-6;
+  config.depth = vllm_test::kH3EncTowerDepth;
+  config.patch_size = vllm_test::kH3EncTowerPatch;
+  config.temporal_patch_size = vllm_test::kH3EncTowerTemporalPatch;
+  config.in_channels = vllm_test::kH3EncTowerInCh;
+  config.spatial_merge_size = vllm_test::kH3EncTowerMerge;
+  config.out_hidden_size = vllm_test::kH3EncTowerOutHidden;
+  config.num_position_embeddings = vllm_test::kH3EncTowerNumPos;
+  config.rope_theta = 10000.0;
+  for (size_t i = 0; i < std::size(vllm_test::kH3EncTowerDeepstackIdx); ++i) {
+    config.deepstack_visual_indexes.push_back(vllm_test::kH3EncTowerDeepstackIdx[i]);
+  }
+
+  const int64_t dim = config.block.hidden_size;
+  const int64_t merged_width = dim * config.spatial_merge_size * config.spatial_merge_size;
+  std::vector<int64_t> grid;
+  for (size_t i = 0; i < std::size(vllm_test::kH3EncTowerGridThw); ++i) {
+    grid.push_back(vllm_test::kH3EncTowerGridThw[i]);
+  }
+
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& n, int64_t count, double scale, double offset) {
+    weights.tensors[n] = MakeParam("encoder.tower." + n, count, scale, offset);
+  };
+  const int64_t patch_elems = config.in_channels * config.temporal_patch_size *
+                              config.patch_size * config.patch_size;
+  put("patch_embed.proj.weight", dim * patch_elems, 0.1, 0.0);
+  put("patch_embed.proj.bias", dim, 0.05, 0.0);
+  put("pos_embed.weight", config.num_position_embeddings * dim, 0.1, 0.0);
+  for (int64_t l = 0; l < config.depth; ++l) {
+    const std::string b = "blocks." + std::to_string(l) + ".";
+    put(b + "norm1.weight", dim, 0.1, 1.0);
+    put(b + "norm1.bias", dim, 0.05, 0.0);
+    put(b + "norm2.weight", dim, 0.1, 1.0);
+    put(b + "norm2.bias", dim, 0.05, 0.0);
+    put(b + "attn.qkv.weight", 3 * dim * dim, 0.1, 0.0);
+    put(b + "attn.qkv.bias", 3 * dim, 0.05, 0.0);
+    put(b + "attn.proj.weight", dim * dim, 0.1, 0.0);
+    put(b + "attn.proj.bias", dim, 0.05, 0.0);
+    put(b + "mlp.linear_fc1.weight", config.block.intermediate_size * dim, 0.1, 0.0);
+    put(b + "mlp.linear_fc1.bias", config.block.intermediate_size, 0.05, 0.0);
+    put(b + "mlp.linear_fc2.weight", dim * config.block.intermediate_size, 0.1, 0.0);
+    put(b + "mlp.linear_fc2.bias", dim, 0.05, 0.0);
+  }
+  // The final merger norms the PRE-shuffle width; the DeepStack mergers norm the
+  // POST-shuffle width. Getting these the wrong way round changes the result.
+  put("merger.norm.weight", dim, 0.1, 1.0);
+  put("merger.norm.bias", dim, 0.05, 0.0);
+  put("merger.linear_fc1.weight", merged_width * merged_width, 0.1, 0.0);
+  put("merger.linear_fc1.bias", merged_width, 0.05, 0.0);
+  put("merger.linear_fc2.weight", config.out_hidden_size * merged_width, 0.1, 0.0);
+  put("merger.linear_fc2.bias", config.out_hidden_size, 0.05, 0.0);
+  for (size_t d = 0; d < config.deepstack_visual_indexes.size(); ++d) {
+    const std::string m = "deepstack_merger_list." + std::to_string(d) + ".";
+    put(m + "norm.weight", merged_width, 0.1, 1.0);
+    put(m + "norm.bias", merged_width, 0.05, 0.0);
+    put(m + "linear_fc1.weight", merged_width * merged_width, 0.1, 0.0);
+    put(m + "linear_fc1.bias", merged_width, 0.05, 0.0);
+    put(m + "linear_fc2.weight", config.out_hidden_size * merged_width, 0.1, 0.0);
+    put(m + "linear_fc2.bias", config.out_hidden_size, 0.05, 0.0);
+  }
+
+  const std::vector<float> pixels =
+      MakeParam("encoder.tower.pixels", vllm_test::kH3EncTowerPatches * patch_elems, 1.0);
+  const vllm::MiniMaxH3VisionTowerResult got =
+      vllm::MiniMaxH3VisionTowerForward(config, weights, pixels, grid);
+
+  CHECK(static_cast<int64_t>(got.merged.size()) ==
+        vllm_test::kH3EncTowerMergedRows * config.out_hidden_size);
+  REQUIRE(got.merged.size() == std::size(vllm_test::kH3EncTowerMergedGolden));
+  const double err = MaxAbsDiff(got.merged, vllm_test::kH3EncTowerMergedGolden, got.merged.size());
+  INFO("vision tower merged max|diff| = " << err);
+  CHECK(err <= 1e-4);
+
+  CHECK(static_cast<int64_t>(got.deepstack.size()) == vllm_test::kH3EncTowerDeepstackCount);
+  std::vector<float> flat;
+  for (const std::vector<float>& d : got.deepstack) flat.insert(flat.end(), d.begin(), d.end());
+  REQUIRE(flat.size() == std::size(vllm_test::kH3EncTowerDeepstackGolden));
+  const double deep_err =
+      MaxAbsDiff(flat, vllm_test::kH3EncTowerDeepstackGolden, flat.size());
+  INFO("vision tower deepstack max|diff| = " << deep_err);
+  CHECK(deep_err <= 1e-4);
+
+  // Two images of DIFFERENT sizes were packed, so the position-embedding
+  // interpolation and the per-frame cu_seqlens both had to handle a ragged batch.
+  CHECK(grid.size() == 6);
+  CHECK(grid[1] != grid[4]);
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

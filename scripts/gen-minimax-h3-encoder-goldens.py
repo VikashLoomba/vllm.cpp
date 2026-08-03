@@ -103,6 +103,19 @@ VIS_INTERMEDIATE = 32
 VIS_SEQ = 6
 VIS_CU_SEQLENS = [0, 4, 6]
 
+# Reduced FULL vision tower. num_position_embeddings must be a perfect square
+# (the learned grid is num_grid_per_side^2), and grid h/w must divide by
+# spatial_merge_size.
+VIS_DEPTH = 2
+VIS_PATCH = 2
+VIS_TEMPORAL_PATCH = 2
+VIS_IN_CH = 3
+VIS_MERGE = 2
+VIS_OUT_HIDDEN = 16
+VIS_NUM_POS = 16          # 4x4 learned grid
+VIS_GRID_THW = [[1, 4, 4], [1, 2, 2]]   # two images, second smaller
+VIS_DEEPSTACK_IDX = [0]
+
 
 def emit_f32(out, name: str, values) -> None:
     flat = np.asarray(values, dtype=np.float32).reshape(-1).tolist()
@@ -212,6 +225,34 @@ def main() -> int:
     vcu = torch.tensor(VIS_CU_SEQLENS, dtype=torch.int32)
     vout = vblock(vhidden, cu_seqlens=vcu, position_embeddings=(vcos, vsin))
 
+    # --- the WHOLE vision tower ---
+    tower_config = SimpleNamespace(
+        hidden_size=VIS_DIM, num_heads=VIS_HEADS, intermediate_size=VIS_INTERMEDIATE,
+        depth=VIS_DEPTH, patch_size=VIS_PATCH, temporal_patch_size=VIS_TEMPORAL_PATCH,
+        in_channels=VIS_IN_CH, spatial_merge_size=VIS_MERGE, out_hidden_size=VIS_OUT_HIDDEN,
+        num_position_embeddings=VIS_NUM_POS, deepstack_visual_indexes=VIS_DEEPSTACK_IDX,
+    )
+    tower = enc.MiniMaxH3Qwen3VLVisionModel(tower_config).eval()
+    tstate = tower.state_dict()
+    for name, tensor in tstate.items():
+        scale, offset = (0.1, 0.0)
+        if name.endswith("norm1.weight") or name.endswith("norm2.weight") or ".norm.weight" in name:
+            scale, offset = 0.1, 1.0
+        elif name.endswith(".bias"):
+            scale = 0.05
+        tstate[name] = torch.from_numpy(
+            (h3_rand("encoder.tower." + name, tensor.numel()) * scale + offset).astype(np.float32)
+        ).reshape(tensor.shape)
+    tower.load_state_dict(tstate, strict=True)
+
+    grid = torch.tensor(VIS_GRID_THW, dtype=torch.long)
+    patch_elems = VIS_IN_CH * VIS_TEMPORAL_PATCH * VIS_PATCH * VIS_PATCH
+    total_patches = sum(t * h * w for t, h, w in VIS_GRID_THW)
+    pixels = torch.from_numpy(
+        h3_rand("encoder.tower.pixels", total_patches * patch_elems).astype(np.float32)
+    ).reshape(total_patches, patch_elems)
+    merged, deepstack_feats = tower(pixels, grid)
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as out:
         out.write(
@@ -245,6 +286,21 @@ def main() -> int:
         emit_f32(out, "kH3EncVisCos", vcos.reshape(-1))
         emit_f32(out, "kH3EncVisSin", vsin.reshape(-1))
         emit_f32(out, "kH3EncVisBlockGolden", vout.reshape(-1))
+
+        out.write(f"inline constexpr int64_t kH3EncTowerDepth = {VIS_DEPTH};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerPatch = {VIS_PATCH};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerTemporalPatch = {VIS_TEMPORAL_PATCH};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerInCh = {VIS_IN_CH};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerMerge = {VIS_MERGE};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerOutHidden = {VIS_OUT_HIDDEN};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerNumPos = {VIS_NUM_POS};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerPatches = {int(total_patches)};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerMergedRows = {int(merged.shape[0])};\n")
+        out.write(f"inline constexpr int64_t kH3EncTowerDeepstackCount = {len(deepstack_feats)};\n\n")
+        emit_i64(out, "kH3EncTowerGridThw", [v for row in VIS_GRID_THW for v in row])
+        emit_i64(out, "kH3EncTowerDeepstackIdx", VIS_DEEPSTACK_IDX)
+        emit_f32(out, "kH3EncTowerMergedGolden", merged.reshape(-1))
+        emit_f32(out, "kH3EncTowerDeepstackGolden", torch.cat([d.reshape(-1) for d in deepstack_feats]))
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

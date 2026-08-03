@@ -419,4 +419,225 @@ std::vector<float> MiniMaxH3VisionBlockForward(const MiniMaxH3VisionBlockConfig&
   return h;
 }
 
+// ---------------------------------------------------------------------------
+// Vision tower surround (encoder.py:483-600) — patch embed, interpolated
+// position embedding, 2D rotary, the block stack, and the patch mergers.
+// ---------------------------------------------------------------------------
+
+// The learned position grid is BILINEARLY resampled to each image's patch grid,
+// then permuted into spatial-merge order (encoder.py:544-585). `num_grid_per_side`
+// is sqrt(num_position_embeddings).
+std::vector<float> MiniMaxH3VisionPosEmbedInterpolate(const std::vector<float>& pos_embed_table,
+                                                      int64_t num_grid_per_side, int64_t dim,
+                                                      const std::vector<int64_t>& grid_thw,
+                                                      int64_t merge_size) {
+  std::vector<float> out;
+  for (size_t g = 0; g + 2 < grid_thw.size() + 1 && g * 3 + 2 < grid_thw.size(); ++g) {
+    const int64_t t = grid_thw[g * 3 + 0];
+    const int64_t h = grid_thw[g * 3 + 1];
+    const int64_t w = grid_thw[g * 3 + 2];
+
+    // torch.linspace(0, n-1, k): with k == 1 torch returns just the START.
+    auto linspace = [&](int64_t count) {
+      std::vector<double> v(static_cast<size_t>(count));
+      if (count == 1) {
+        v[0] = 0.0;
+        return v;
+      }
+      const double step = static_cast<double>(num_grid_per_side - 1) / static_cast<double>(count - 1);
+      for (int64_t i = 0; i < count; ++i) v[static_cast<size_t>(i)] = static_cast<double>(i) * step;
+      return v;
+    };
+    const std::vector<double> h_idxs = linspace(h);
+    const std::vector<double> w_idxs = linspace(w);
+
+    // Bilinear over the four surrounding grid points; `.int()` TRUNCATES.
+    std::vector<float> plane(static_cast<size_t>(h * w * dim), 0.0f);
+    for (int64_t i = 0; i < h; ++i) {
+      const int64_t hf = static_cast<int64_t>(h_idxs[static_cast<size_t>(i)]);
+      const int64_t hc = std::min<int64_t>(hf + 1, num_grid_per_side - 1);
+      const double dh = h_idxs[static_cast<size_t>(i)] - static_cast<double>(hf);
+      for (int64_t j = 0; j < w; ++j) {
+        const int64_t wf = static_cast<int64_t>(w_idxs[static_cast<size_t>(j)]);
+        const int64_t wc = std::min<int64_t>(wf + 1, num_grid_per_side - 1);
+        const double dw = w_idxs[static_cast<size_t>(j)] - static_cast<double>(wf);
+        const int64_t idx[4] = {hf * num_grid_per_side + wf, hf * num_grid_per_side + wc,
+                                hc * num_grid_per_side + wf, hc * num_grid_per_side + wc};
+        const double wt[4] = {(1.0 - dh) * (1.0 - dw), (1.0 - dh) * dw, dh * (1.0 - dw), dh * dw};
+        float* dst = plane.data() + (i * w + j) * dim;
+        for (int64_t c = 0; c < dim; ++c) {
+          double acc = 0.0;
+          for (int k = 0; k < 4; ++k) {
+            acc += static_cast<double>(
+                       pos_embed_table[static_cast<size_t>(idx[k] * dim + c)]) * wt[k];
+          }
+          dst[c] = static_cast<float>(acc);
+        }
+      }
+    }
+
+    // repeat over t, then view(t, h/m, m, w/m, m, -1).permute(0,1,3,2,4,5).flatten
+    const int64_t mh = h / merge_size, mw = w / merge_size;
+    for (int64_t frame = 0; frame < t; ++frame) {
+      for (int64_t bh = 0; bh < mh; ++bh) {
+        for (int64_t bw = 0; bw < mw; ++bw) {
+          for (int64_t ih = 0; ih < merge_size; ++ih) {
+            for (int64_t iw = 0; iw < merge_size; ++iw) {
+              const int64_t row = (bh * merge_size + ih) * w + (bw * merge_size + iw);
+              const float* src = plane.data() + row * dim;
+              out.insert(out.end(), src, src + dim);
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// 2D rotary position ids in spatial-merge order (encoder.py:510-537), then
+// freq_table[pos_ids].flatten(1) -> [tokens, 2 * (head_dim/2 / 2)].
+std::vector<float> MiniMaxH3VisionRotary(const std::vector<int64_t>& grid_thw, int64_t merge_size,
+                                         int64_t rotary_dim, double theta) {
+  int64_t max_hw = 0;
+  for (size_t g = 0; g * 3 + 2 < grid_thw.size(); ++g) {
+    max_hw = std::max({max_hw, grid_thw[g * 3 + 1], grid_thw[g * 3 + 2]});
+  }
+  const int64_t freqs = rotary_dim / 2;
+  std::vector<double> inv(static_cast<size_t>(freqs));
+  for (int64_t i = 0; i < freqs; ++i) {
+    inv[static_cast<size_t>(i)] =
+        1.0 / std::pow(theta, static_cast<double>(2 * i) / static_cast<double>(rotary_dim));
+  }
+  // freq_table[p][f] = p * inv[f]
+  auto table = [&](int64_t pos, int64_t f) { return static_cast<double>(pos) * inv[static_cast<size_t>(f)]; };
+
+  std::vector<float> out;
+  for (size_t g = 0; g * 3 + 2 < grid_thw.size(); ++g) {
+    const int64_t t = grid_thw[g * 3 + 0];
+    const int64_t h = grid_thw[g * 3 + 1];
+    const int64_t w = grid_thw[g * 3 + 2];
+    const int64_t mh = h / merge_size, mw = w / merge_size;
+    std::vector<float> one;
+    for (int64_t bh = 0; bh < mh; ++bh) {
+      for (int64_t bw = 0; bw < mw; ++bw) {
+        for (int64_t ih = 0; ih < merge_size; ++ih) {
+          for (int64_t iw = 0; iw < merge_size; ++iw) {
+            const int64_t row = bh * merge_size + ih;
+            const int64_t col = bw * merge_size + iw;
+            for (int64_t f = 0; f < freqs; ++f) one.push_back(static_cast<float>(table(row, f)));
+            for (int64_t f = 0; f < freqs; ++f) one.push_back(static_cast<float>(table(col, f)));
+          }
+        }
+      }
+    }
+    for (int64_t frame = 0; frame < t; ++frame) out.insert(out.end(), one.begin(), one.end());
+  }
+  (void)max_hw;  // the table is evaluated lazily; max_hw only bounds it upstream
+  return out;
+}
+
+namespace {
+
+// PatchMerger (encoder.py:372-386): LayerNorm -> fc1 -> exact-erf GELU -> fc2.
+// `use_postshuffle_norm` decides whether the norm sees the pre- or post-shuffle
+// width, which is why the DeepStack mergers and the final merger differ.
+std::vector<float> PatchMerger(const MiniMaxH3AudioVaeWeights& weights, const std::string& prefix,
+                               const std::vector<float>& x, int64_t rows, int64_t dim,
+                               int64_t merged_width, int64_t out_hidden, bool postshuffle,
+                               double eps) {
+  const int64_t groups = rows / (merged_width / dim);
+  std::vector<float> normed(x.size());
+  if (postshuffle) {
+    LayerNormRows(x.data(), weights.Get(prefix + ".norm.weight").data(),
+                  weights.Get(prefix + ".norm.bias").data(), normed.data(), groups, merged_width,
+                  eps);
+  } else {
+    LayerNormRows(x.data(), weights.Get(prefix + ".norm.weight").data(),
+                  weights.Get(prefix + ".norm.bias").data(), normed.data(), rows, dim, eps);
+  }
+  std::vector<float> mid =
+      LinearBias(normed, groups, merged_width, weights.Get(prefix + ".linear_fc1.weight"),
+                 &weights.Get(prefix + ".linear_fc1.bias"), merged_width);
+  for (float& value : mid) {
+    // nn.GELU() default = EXACT erf, unlike the vision MLP's tanh approximation.
+    value = static_cast<float>(0.5 * value * (1.0 + std::erf(value / std::sqrt(2.0))));
+  }
+  return LinearBias(mid, groups, merged_width, weights.Get(prefix + ".linear_fc2.weight"),
+                    &weights.Get(prefix + ".linear_fc2.bias"), out_hidden);
+}
+
+}  // namespace
+
+MiniMaxH3VisionTowerResult MiniMaxH3VisionTowerForward(
+    const MiniMaxH3VisionTowerConfig& config, const MiniMaxH3AudioVaeWeights& weights,
+    const std::vector<float>& patches, const std::vector<int64_t>& grid_thw) {
+  const int64_t dim = config.block.hidden_size;
+  const int64_t merge = config.spatial_merge_size;
+  const int64_t patch_elems =
+      config.in_channels * config.temporal_patch_size * config.patch_size * config.patch_size;
+  int64_t tokens = 0;
+  for (size_t g = 0; g * 3 + 2 < grid_thw.size(); ++g) {
+    tokens += grid_thw[g * 3] * grid_thw[g * 3 + 1] * grid_thw[g * 3 + 2];
+  }
+  VT_CHECK(static_cast<int64_t>(patches.size()) == tokens * patch_elems,
+           "minimax_h3 vision: patch input does not match the grid");
+
+  // patch_embed: a Conv3d whose kernel EQUALS its stride is a linear map over the
+  // flattened patch (encoder.py:337-353).
+  std::vector<float> h = LinearBias(patches, tokens, patch_elems,
+                                    weights.Get("patch_embed.proj.weight"),
+                                    &weights.Get("patch_embed.proj.bias"), dim);
+
+  const int64_t num_grid_per_side =
+      static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(config.num_position_embeddings))));
+  VT_CHECK(num_grid_per_side * num_grid_per_side == config.num_position_embeddings,
+           "minimax_h3 vision: num_position_embeddings must be a perfect square");
+  const std::vector<float> pos = MiniMaxH3VisionPosEmbedInterpolate(
+      weights.Get("pos_embed.weight"), num_grid_per_side, dim, grid_thw, merge);
+  VT_CHECK(pos.size() == h.size(), "minimax_h3 vision: position embedding size mismatch");
+  for (size_t i = 0; i < h.size(); ++i) h[i] += pos[i];
+
+  const int64_t head_dim = dim / config.block.num_heads;
+  const std::vector<float> freqs =
+      MiniMaxH3VisionRotary(grid_thw, merge, head_dim / 2, config.rope_theta);
+  // emb = cat(freqs, freqs); cos/sin over [tokens, head_dim].
+  const int64_t rot = head_dim / 2;
+  std::vector<float> cos(static_cast<size_t>(tokens * head_dim));
+  std::vector<float> sin(static_cast<size_t>(tokens * head_dim));
+  for (int64_t s = 0; s < tokens; ++s) {
+    for (int64_t i = 0; i < rot; ++i) {
+      const double angle = freqs[static_cast<size_t>(s * rot + i)];
+      cos[static_cast<size_t>(s * head_dim + i)] = static_cast<float>(std::cos(angle));
+      cos[static_cast<size_t>(s * head_dim + rot + i)] = static_cast<float>(std::cos(angle));
+      sin[static_cast<size_t>(s * head_dim + i)] = static_cast<float>(std::sin(angle));
+      sin[static_cast<size_t>(s * head_dim + rot + i)] = static_cast<float>(std::sin(angle));
+    }
+  }
+
+  // cu_seqlens: one segment per FRAME (h*w repeated t times), cumulative.
+  std::vector<int32_t> cu = {0};
+  for (size_t g = 0; g * 3 + 2 < grid_thw.size(); ++g) {
+    const int64_t frame_tokens = grid_thw[g * 3 + 1] * grid_thw[g * 3 + 2];
+    for (int64_t f = 0; f < grid_thw[g * 3]; ++f) cu.push_back(cu.back() + static_cast<int32_t>(frame_tokens));
+  }
+
+  MiniMaxH3VisionTowerResult result;
+  const int64_t merged_width = dim * merge * merge;
+  for (int64_t layer = 0; layer < config.depth; ++layer) {
+    h = MiniMaxH3VisionBlockForward(config.block, weights,
+                                    "blocks." + std::to_string(layer), h, tokens, cos.data(),
+                                    sin.data(), cu.data(), static_cast<int64_t>(cu.size()) - 1);
+    for (size_t d = 0; d < config.deepstack_visual_indexes.size(); ++d) {
+      if (config.deepstack_visual_indexes[d] != layer) continue;
+      result.deepstack.push_back(PatchMerger(
+          weights, "deepstack_merger_list." + std::to_string(d), h, tokens, dim, merged_width,
+          config.out_hidden_size, /*postshuffle=*/true, config.block.eps));
+    }
+  }
+  result.merged = PatchMerger(weights, "merger", h, tokens, dim, merged_width,
+                              config.out_hidden_size, /*postshuffle=*/false, config.block.eps);
+  return result;
+}
+
 }  // namespace vllm

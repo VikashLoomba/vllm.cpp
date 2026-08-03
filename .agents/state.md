@@ -34896,3 +34896,32 @@ would otherwise pass a tolerance check.
 pos-embed interpolation, the 2D rotary table, patch + DeepStack mergers) and the MM
 processor.
 
+## 2026-08-03 - MiniMax-H3 W3 COMPLETE: the encoder is ported
+
+The full vision tower lands, so both encoder towers are done end to end. Gated over
+a RAGGED two-image batch (different h/w), which is what actually exercises the
+position-embedding interpolation and the per-frame cu_seqlens: merged output and
+DeepStack features are both within 1e-4 of upstream.
+
+Details that were load-bearing and are now pinned:
+  * the patch embed's Conv3d has kernel == stride, so it is a plain linear over
+    the flattened patch - no sliding window;
+  * `torch.linspace(0, n-1, 1)` returns the START, not the end (the single-row
+    grid case);
+  * `.int()` TRUNCATES when picking the bilinear corners, it does not round;
+  * the two merger flavours differ - the FINAL merger norms the PRE-shuffle width
+    while the DEEPSTACK mergers norm the POST-shuffle width, and both use
+    exact-erf GELU rather than the block MLP's tanh approximation. Three different
+    GELU/norm conventions inside one encoder.
+
+**Encoder status: complete apart from the MM processor** (image/video preprocessing
+into patches), which is input plumbing rather than model math.
+
+**Lane status.** Ported and gated: DiT forward (f32 + bf16), packed layout,
+scheduler, request planning, denoise loop, both VAE decoders, BOTH encoder towers,
+the assembled t2va pipeline, and BOTH quantized loaders.
+
+**Remaining:** MM processor, fl2va/ref2va conditioning, video tiling, /v1/videos +
+MP4 muxing (blocked on a dependency decision), and the DEVICE-resident forward -
+which is where speed work begins and which needs a GPU to be worth doing.
+

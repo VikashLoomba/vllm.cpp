@@ -34,6 +34,7 @@
 #include "minimax_h3_encoder_goldens.inc"
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "../gguf_builder.h"
 
 #include "vt/device.h"
@@ -1557,6 +1558,193 @@ TEST_CASE("minimax_h3: a ComfyUI-format GGUF loads into a runnable DiT") {
       MiniMaxH3DitForward(Cpu(), loaded.params, loaded.weights, in, vt::DType::kF32);
   CHECK(static_cast<int64_t>(got.video_logits.size()) == num_img * video_width);
   CHECK(static_cast<int64_t>(got.audio_logits.size()) == num_audio * want.audio_latents_dim);
+  for (float v : got.video_logits) REQUIRE(std::isfinite(v));
+  for (float v : got.audio_logits) REQUIRE(std::isfinite(v));
+  std::remove(path.c_str());
+}
+
+TEST_CASE("minimax_h3: an NVFP4 checkpoint loads into a runnable DiT") {
+  // Closes the NVFP4 arm's loader: the manifest test proved the real checkpoint's
+  // layout IS ours; this proves a file in that layout dequantizes into weights the
+  // forward runs. Synthetic so no download is needed, but the triple is built
+  // exactly as the real file stores it.
+  MiniMaxH3DitParams want;
+  want.num_layers = 1;
+  want.token_refiner_num_layers = 1;
+  want.hidden_size = 64;
+  want.num_attention_heads = 4;
+  want.attention_head_dim = 16;
+  want.ffn_hidden_size = 128;
+  want.latents_dim = 8;
+  want.audio_latents_dim = 6;
+  want.text_dim = 32;   // must be a multiple of 16 (the NVFP4 group)
+  want.timestep_input_dim = 16;
+  want.time_embed_hidden_size = 64;
+  want.time_embed_dim = 32;
+  want.adaln_out_features = 18 * want.hidden_size;
+  want.final_adaln_out_features = 2 * want.hidden_size;
+  want.rope_inv_freq_len = 2;
+
+  struct Entry {
+    std::string name;
+    std::string dtype;
+    std::vector<int64_t> shape;
+    std::string bytes;
+  };
+  std::vector<Entry> entries;
+
+  auto add_plain = [&](const std::string& name, const std::vector<int64_t>& shape) {
+    int64_t numel = 1;
+    for (int64_t d : shape) numel *= d;
+    const std::vector<float> values = MakeParam("nvfp4." + name, numel, 0.1);
+    entries.push_back({name, "F32", shape,
+                       std::string(reinterpret_cast<const char*>(values.data()),
+                                   values.size() * sizeof(float))});
+  };
+  // A quantized projection: packed U8 [out, in/2] + E4M3 [out, in/16] + F32 scalar.
+  auto add_quant = [&](const std::string& name, int64_t out_dim, int64_t in_dim) {
+    REQUIRE(in_dim % 16 == 0);
+    std::string packed(static_cast<size_t>(out_dim * (in_dim / 2)), '\0');
+    for (size_t i = 0; i < packed.size(); ++i) {
+      packed[i] = static_cast<char>((i * 37 + 11) & 0xFF);  // deterministic nibbles
+    }
+    std::string scales(static_cast<size_t>(out_dim * (in_dim / 16)), '\0');
+    for (size_t i = 0; i < scales.size(); ++i) {
+      scales[i] = static_cast<char>(0x38);  // e4m3 ~ 1.0
+    }
+    const float global = 0.5f;
+    entries.push_back({name, "U8", {out_dim, in_dim / 2}, packed});
+    entries.push_back({name + "_scale", "F8_E4M3", {out_dim, in_dim / 16}, scales});
+    entries.push_back({name + "_scale_2", "F32", {},
+                       std::string(reinterpret_cast<const char*>(&global), sizeof(float))});
+  };
+
+  const int64_t inner = want.num_attention_heads * want.attention_head_dim;
+  const int64_t video_width = want.video_row_width();
+  // Islands stay unquantized, exactly as the real checkpoint has them.
+  add_plain("video_patch_proj.weight", {want.hidden_size, video_width});
+  add_plain("video_patch_proj.bias", {want.hidden_size});
+  add_plain("audio_patch_proj.weight", {want.hidden_size, want.audio_latents_dim});
+  add_plain("audio_patch_proj.bias", {want.hidden_size});
+  add_plain("condition_proj.bias", {want.hidden_size});
+  add_plain("time_embedder.proj_in.weight", {want.time_embed_hidden_size, want.timestep_input_dim});
+  add_plain("time_embedder.proj_in.bias", {want.time_embed_hidden_size});
+  add_plain("time_embedder.proj_out.weight", {want.time_embed_dim, want.time_embed_hidden_size});
+  add_plain("time_embedder.proj_out.bias", {want.time_embed_dim});
+  add_plain("rope.inv_freq", {want.rope_inv_freq_len});
+  // condition_proj is quantized in the real file.
+  add_quant("condition_proj.weight", want.hidden_size, want.text_dim);
+  auto add_block = [&](const std::string& prefix, bool with_adaln) {
+    add_plain(prefix + ".norm1.weight", {want.hidden_size});
+    add_plain(prefix + ".norm2.weight", {want.hidden_size});
+    add_plain(prefix + ".attn.q_norm.weight", {want.attention_head_dim});
+    add_plain(prefix + ".attn.k_norm.weight", {want.attention_head_dim});
+    add_quant(prefix + ".attn.qkv_proj.weight", 3 * inner, want.hidden_size);
+    add_quant(prefix + ".attn.out_proj.weight", want.hidden_size, inner);
+    add_quant(prefix + ".mlp.fc1.weight", 2 * want.ffn_hidden_size, want.hidden_size);
+    add_quant(prefix + ".mlp.fc2.weight", want.hidden_size, want.ffn_hidden_size);
+    if (with_adaln) {
+      add_quant(prefix + ".adaln_proj.linear.weight", want.adaln_out_features, want.time_embed_dim);
+      add_plain(prefix + ".adaln_proj.linear.bias", {want.adaln_out_features});
+    }
+  };
+  add_block("token_refiner.blocks.0", false);
+  add_plain("token_refiner.final_norm.weight", {want.hidden_size});
+  add_block("blocks.0", true);
+  add_plain("final_layer.norm.weight", {want.hidden_size});
+  add_quant("final_layer.adaln_proj.linear.weight", want.final_adaln_out_features, want.time_embed_dim);
+  add_plain("final_layer.adaln_proj.linear.bias", {want.final_adaln_out_features});
+  add_plain("final_layer.video_out.weight", {video_width, want.hidden_size});
+  add_plain("final_layer.video_out.bias", {video_width});
+  add_plain("final_layer.audio_out.weight", {want.audio_latents_dim, want.hidden_size});
+  add_plain("final_layer.audio_out.bias", {want.audio_latents_dim});
+
+  // Serialize a safetensors file: 8-byte header length, JSON header, then data.
+  std::string header = "{";
+  size_t offset = 0;
+  bool first = true;
+  for (const Entry& e : entries) {
+    if (!first) header += ",";
+    first = false;
+    header += "\"" + e.name + "\":{\"dtype\":\"" + e.dtype + "\",\"shape\":[";
+    for (size_t i = 0; i < e.shape.size(); ++i) {
+      if (i) header += ",";
+      header += std::to_string(e.shape[i]);
+    }
+    header += "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + e.bytes.size()) + "]}";
+    offset += e.bytes.size();
+  }
+  header += "}";
+  const std::string path = "/tmp/minimax_h3_nvfp4_test.safetensors";
+  {
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    const uint64_t n = header.size();
+    std::fwrite(&n, sizeof(n), 1, fh);
+    std::fwrite(header.data(), 1, header.size(), fh);
+    for (const Entry& e : entries) std::fwrite(e.bytes.data(), 1, e.bytes.size(), fh);
+    std::fclose(fh);
+  }
+
+  const vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(path);
+  const vllm::MiniMaxH3GgufDit loaded = vllm::LoadMiniMaxH3DitFromNvfp4(st);
+
+  // Geometry recovered from the DEQUANTIZED shapes: a packed [out, in/2] weight
+  // must come back as the logical [out, in].
+  CHECK(loaded.params.hidden_size == want.hidden_size);
+  CHECK(loaded.params.num_attention_heads == want.num_attention_heads);
+  CHECK(loaded.params.attention_head_dim == want.attention_head_dim);
+  CHECK(loaded.params.ffn_hidden_size == want.ffn_hidden_size);
+  CHECK(loaded.params.text_dim == want.text_dim);
+  CHECK(loaded.weights.blocks[0].qkv_proj.shape[0] == 3 * inner);
+  CHECK(loaded.weights.blocks[0].qkv_proj.shape[1] == want.hidden_size);
+  CHECK(loaded.shapes.at("blocks.0.mlp.fc1.weight")[1] == want.hidden_size);
+  // The quant sidecars must NOT appear as model tensors.
+  CHECK(loaded.storage.count("blocks.0.attn.qkv_proj.weight_scale") == 0);
+  CHECK(loaded.storage.count("blocks.0.attn.qkv_proj.weight_scale_2") == 0);
+
+  // And it must RUN.
+  const MiniMaxH3PackedSequence packed = BuildMiniMaxH3PackedSequence(
+      4, 2, 4, 4, 2, 2, /*include_keyframe_cond=*/false, {}, 0);
+  const int64_t seq = packed.seq_len;
+  const int64_t num_img = static_cast<int64_t>(packed.img_pos.size());
+  const int64_t num_audio = static_cast<int64_t>(packed.audio_pos.size());
+  const int64_t num_text = static_cast<int64_t>(packed.text_pos.size());
+  const std::vector<float> x(static_cast<size_t>(seq * video_width), 0.25f);
+  const std::vector<float> audio_x(static_cast<size_t>(seq * want.audio_latents_dim), 0.1f);
+  const std::vector<float> prompt(static_cast<size_t>(num_text * want.text_dim), 0.2f);
+  const std::vector<float> unique_ts = {0.4f};
+  const std::vector<int64_t> inverse(static_cast<size_t>(seq), 0);
+  const std::vector<int32_t> refiner_cu = {0, static_cast<int32_t>(num_text),
+                                           static_cast<int32_t>(num_text)};
+  MiniMaxH3DitInputs in;
+  in.seq_len = seq;
+  in.x = x.data();
+  in.audio_x = audio_x.data();
+  in.img_position_ids = packed.img_position_ids.data();
+  in.unique_timesteps = unique_ts.data();
+  in.num_unique_timesteps = 1;
+  in.inverse_indices = inverse.data();
+  in.token_tags = packed.token_tags.data();
+  in.prompt_embeds = prompt.data();
+  in.img_pos = packed.img_pos.data();
+  in.num_img_pos = num_img;
+  in.audio_pos = packed.audio_pos.data();
+  in.num_audio_pos = num_audio;
+  in.text_pos = packed.text_pos.data();
+  in.num_text_pos = num_text;
+  in.infer_out_pos = packed.img_pos.data();
+  in.num_infer_out_pos = num_img;
+  in.update_mask = packed.update_mask.data();
+  in.cu_seqlens = packed.cu_seqlens.data();
+  in.num_cu_seqlens = static_cast<int64_t>(packed.cu_seqlens.size());
+  in.refiner_cu_seqlens = refiner_cu.data();
+  in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
+
+  const MiniMaxH3DitOutputs got =
+      MiniMaxH3DitForward(Cpu(), loaded.params, loaded.weights, in, vt::DType::kF32);
+  CHECK(static_cast<int64_t>(got.video_logits.size()) == num_img * video_width);
   for (float v : got.video_logits) REQUIRE(std::isfinite(v));
   for (float v : got.audio_logits) REQUIRE(std::isfinite(v));
   std::remove(path.c_str());

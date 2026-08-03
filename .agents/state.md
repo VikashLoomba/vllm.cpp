@@ -34841,3 +34841,35 @@ qwen3_vl_vision.cpp) + MM processor, fl2va/ref2va conditioning, NVFP4 loader wir
 (W10 - the layout is already proven identical to ours), and a machine with a GPU.
 W2b (device-resident forward) and W10 are where speed work then begins.
 
+## 2026-08-03 - MiniMax-H3 W10 loader: both quantized arms now load
+
+`LoadMiniMaxH3DitFromNvfp4` completes the loader half of the NVFP4 arm. The
+compressed-tensors triple (U8-packed [out, in/2] + E4M3 group-16 weight_scale + F32
+scalar weight_scale_2) goes through the project's EXISTING `DequantNvfp4ToBf16` -
+no new quant code, because the manifest gate had already proven the checkpoint's
+layout IS ours. Quant sidecars are excluded from the model tensor set, and the
+geometry is recovered from the dequantized shapes.
+
+The view binding is now SHARED between the GGUF and NVFP4 arms
+(`BindMiniMaxH3DitViews`) since both land on the same weight contract.
+
+**A mistake worth recording.** Extracting that shared binder, I applied a blind
+`out.` -> `out->` rewrite, which corrupted six tensor NAME STRINGS -
+"time_embedder.proj_out.bias" became "...proj_out->bias". Two lessons: (1) never
+mechanically rewrite across code and string literals in one pass; (2) the loader's
+throw-BY-NAME-on-missing-tensor design caught it instantly, where a null-view
+default would have silently bound zeros and produced a plausible-but-wrong forward.
+That design choice paid for itself the first time it was exercised.
+
+**Where the lane stands.** Ported and gated: DiT forward (f32 + bf16), packed
+layout, scheduler, request planning, denoise loop, BOTH VAE decoders, the encoder
+text tower, the assembled t2va pipeline, and BOTH quantized loaders.
+
+**Remaining:** the encoder's VISION tower (reuse of qwen3_vl_vision.cpp) + MM
+processor, fl2va/ref2va conditioning, video tiling, /v1/videos + MP4 muxing (needs a
+dependency decision), and the DEVICE-resident forward - which is where speed work
+actually begins, since the reference forward is CPU and deliberately unoptimized.
+
+**Environment:** dgx.casa unreachable, no local GPU. No run on a real checkpoint and
+no speed number is possible from this machine.
+

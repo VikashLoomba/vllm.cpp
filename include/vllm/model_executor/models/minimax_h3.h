@@ -515,6 +515,17 @@ struct MiniMaxH3GgufDit {
 // forward's views. Missing tensors throw by name rather than reading as zeros.
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file);
 
+// Bind the forward's views onto a MiniMaxH3GgufDit's owned buffers. Shared by the
+// GGUF and NVFP4 arms: both land on the SAME weight contract.
+void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out);
+
+class SafetensorsFile;
+// Materialize the DiT from an NVFP4 safetensors checkpoint. Quantized projections
+// carry the compressed-tensors triple (U8 packed FP4 + E4M3 group-16
+// `weight_scale` + F32 scalar `weight_scale_2`) and are dequantized through the
+// project's existing NVFP4 path; the fp32/bf16 islands are read as-is.
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file);
+
 // The per-step inputs of one denoise step (minimax_h3_transformer.py:986-1102).
 // Row-major host buffers; the forward stages them onto `device` itself.
 struct MiniMaxH3DitInputs {

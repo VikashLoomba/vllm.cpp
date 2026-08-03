@@ -183,6 +183,76 @@ std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3GgufTensors(const GgufFile& f
 // F16 islands) are handled by the same code path every other GGUF model uses.
 // Shapes are resolved by the rules gated in the manifest test: reversed `ne`,
 // unless `comfy.gguf.orig_shape.<name>` says otherwise.
+// Bind the forward's non-owning views onto the owned buffers. Shared by the GGUF
+// and NVFP4 arms — both land on the SAME weight contract, so both bind identically.
+void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out) {
+  // Bind the views. Any missing name throws by NAME rather than yielding a null
+  // tensor the forward would read as zeros.
+  const MiniMaxH3DitParams& p = out->params;
+  auto view = [out](const std::string& name) -> vt::Tensor {
+    const auto it = out->storage.find(name);
+    VT_CHECK(it != out->storage.end(), "minimax_h3 gguf: checkpoint is missing a required tensor");
+    const std::vector<int64_t>& shape = out->shapes.at(name);
+    vt::Tensor t;
+    t.data = it->second.data();
+    t.dtype = vt::DType::kF32;
+    t.device = vt::Device{};
+    t.rank = static_cast<int>(shape.size());
+    int64_t stride = 1;
+    for (int i = t.rank - 1; i >= 0; --i) {
+      t.shape[i] = shape[static_cast<size_t>(i)];
+      t.stride[i] = stride;
+      stride *= shape[static_cast<size_t>(i)];
+    }
+    return t;
+  };
+
+  out->weights.video_patch_proj_w = view("video_patch_proj.weight");
+  out->weights.video_patch_proj_b = view("video_patch_proj.bias");
+  out->weights.audio_patch_proj_w = view("audio_patch_proj.weight");
+  out->weights.audio_patch_proj_b = view("audio_patch_proj.bias");
+  out->weights.condition_proj_w = view("condition_proj.weight");
+  out->weights.condition_proj_b = view("condition_proj.bias");
+  out->weights.time_proj_in_w = view("time_embedder.proj_in.weight");
+  out->weights.time_proj_in_b = view("time_embedder.proj_in.bias");
+  out->weights.time_proj_out_w = view("time_embedder.proj_out.weight");
+  out->weights.time_proj_out_b = view("time_embedder.proj_out.bias");
+  out->weights.rope_inv_freq = view("rope.inv_freq");
+
+  auto bind_block = [&](const std::string& prefix, bool with_adaln) {
+    MiniMaxH3DitBlockWeights block;
+    block.norm1 = view(prefix + ".norm1.weight");
+    block.norm2 = view(prefix + ".norm2.weight");
+    block.qkv_proj = view(prefix + ".attn.qkv_proj.weight");
+    block.q_norm = view(prefix + ".attn.q_norm.weight");
+    block.k_norm = view(prefix + ".attn.k_norm.weight");
+    block.out_proj = view(prefix + ".attn.out_proj.weight");
+    block.fc1 = view(prefix + ".mlp.fc1.weight");
+    block.fc2 = view(prefix + ".mlp.fc2.weight");
+    if (with_adaln) {
+      block.adaln_w = view(prefix + ".adaln_proj.linear.weight");
+      block.adaln_b = view(prefix + ".adaln_proj.linear.bias");
+      out->weights.blocks.push_back(block);
+    } else {
+      out->weights.refiner.push_back(block);
+    }
+  };
+  for (int64_t i = 0; i < p.token_refiner_num_layers; ++i) {
+    bind_block("token_refiner.blocks." + std::to_string(i), /*with_adaln=*/false);
+  }
+  out->weights.refiner_final_norm = view("token_refiner.final_norm.weight");
+  for (int64_t i = 0; i < p.num_layers; ++i) {
+    bind_block("blocks." + std::to_string(i), /*with_adaln=*/true);
+  }
+  out->weights.final_norm = view("final_layer.norm.weight");
+  out->weights.final_adaln_w = view("final_layer.adaln_proj.linear.weight");
+  out->weights.final_adaln_b = view("final_layer.adaln_proj.linear.bias");
+  out->weights.video_out_w = view("final_layer.video_out.weight");
+  out->weights.video_out_b = view("final_layer.video_out.bias");
+  out->weights.audio_out_w = view("final_layer.audio_out.weight");
+  out->weights.audio_out_b = view("final_layer.audio_out.bias");
+}
+
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file) {
   MiniMaxH3GgufDit out;
   const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3GgufTensors(file);
@@ -200,71 +270,7 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file) {
     out.shapes[spec.name] = spec.shape;
   }
 
-  // Bind the views. Any missing name throws by NAME rather than yielding a null
-  // tensor the forward would read as zeros.
-  const MiniMaxH3DitParams& p = out.params;
-  auto view = [&out](const std::string& name) -> vt::Tensor {
-    const auto it = out.storage.find(name);
-    VT_CHECK(it != out.storage.end(), "minimax_h3 gguf: checkpoint is missing a required tensor");
-    const std::vector<int64_t>& shape = out.shapes.at(name);
-    vt::Tensor t;
-    t.data = it->second.data();
-    t.dtype = vt::DType::kF32;
-    t.device = vt::Device{};
-    t.rank = static_cast<int>(shape.size());
-    int64_t stride = 1;
-    for (int i = t.rank - 1; i >= 0; --i) {
-      t.shape[i] = shape[static_cast<size_t>(i)];
-      t.stride[i] = stride;
-      stride *= shape[static_cast<size_t>(i)];
-    }
-    return t;
-  };
-
-  out.weights.video_patch_proj_w = view("video_patch_proj.weight");
-  out.weights.video_patch_proj_b = view("video_patch_proj.bias");
-  out.weights.audio_patch_proj_w = view("audio_patch_proj.weight");
-  out.weights.audio_patch_proj_b = view("audio_patch_proj.bias");
-  out.weights.condition_proj_w = view("condition_proj.weight");
-  out.weights.condition_proj_b = view("condition_proj.bias");
-  out.weights.time_proj_in_w = view("time_embedder.proj_in.weight");
-  out.weights.time_proj_in_b = view("time_embedder.proj_in.bias");
-  out.weights.time_proj_out_w = view("time_embedder.proj_out.weight");
-  out.weights.time_proj_out_b = view("time_embedder.proj_out.bias");
-  out.weights.rope_inv_freq = view("rope.inv_freq");
-
-  auto bind_block = [&](const std::string& prefix, bool with_adaln) {
-    MiniMaxH3DitBlockWeights block;
-    block.norm1 = view(prefix + ".norm1.weight");
-    block.norm2 = view(prefix + ".norm2.weight");
-    block.qkv_proj = view(prefix + ".attn.qkv_proj.weight");
-    block.q_norm = view(prefix + ".attn.q_norm.weight");
-    block.k_norm = view(prefix + ".attn.k_norm.weight");
-    block.out_proj = view(prefix + ".attn.out_proj.weight");
-    block.fc1 = view(prefix + ".mlp.fc1.weight");
-    block.fc2 = view(prefix + ".mlp.fc2.weight");
-    if (with_adaln) {
-      block.adaln_w = view(prefix + ".adaln_proj.linear.weight");
-      block.adaln_b = view(prefix + ".adaln_proj.linear.bias");
-      out.weights.blocks.push_back(block);
-    } else {
-      out.weights.refiner.push_back(block);
-    }
-  };
-  for (int64_t i = 0; i < p.token_refiner_num_layers; ++i) {
-    bind_block("token_refiner.blocks." + std::to_string(i), /*with_adaln=*/false);
-  }
-  out.weights.refiner_final_norm = view("token_refiner.final_norm.weight");
-  for (int64_t i = 0; i < p.num_layers; ++i) {
-    bind_block("blocks." + std::to_string(i), /*with_adaln=*/true);
-  }
-  out.weights.final_norm = view("final_layer.norm.weight");
-  out.weights.final_adaln_w = view("final_layer.adaln_proj.linear.weight");
-  out.weights.final_adaln_b = view("final_layer.adaln_proj.linear.bias");
-  out.weights.video_out_w = view("final_layer.video_out.weight");
-  out.weights.video_out_b = view("final_layer.video_out.bias");
-  out.weights.audio_out_w = view("final_layer.audio_out.weight");
-  out.weights.audio_out_b = view("final_layer.audio_out.bias");
+  BindMiniMaxH3DitViews(&out);
   return out;
 }
 

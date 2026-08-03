@@ -99,13 +99,13 @@ final output heads. Everything else is BF16.
 | Scheduler | `scheduling_..._euler_ancestral.py` (179 L) | — | **W1 LANDED** |
 | Denoise loop | `denoise_loop.py` (249 L) | — | **W2 LANDED** (driver ported, not e2e-gated) |
 | H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 PENDING** — Qwen3-VL text layer-50 + vision tower + DeepStack |
-| Video VAE | `vae.py` adapter + checkpoint REMOTE CODE | ~10 GB | **W4 PENDING** — see 5.1 |
+| Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 PENDING** — decoder is a 36-block ViT (real manifest gated); encoder is the 3D CNN. See 5.1 |
 | Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 PENDING** |
 | Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **W6 PENDING** |
 | Serving | vllm-omni `/v1/videos`, `/v1/videos/sync` | — | **W7 PENDING** |
 | GGUF arm (ComfyUI format) | `realrebelai/MiniMax-H3_GGUFs` | 15.6 GB (DiT Q3_K_M) | **W9 LANDED (shape/geometry)** — name map is the IDENTITY, gated on the real 535-tensor manifest |
-| NVFP4 arm | `lilcheaty/MiniMax-H3-NVFP4` | fits | **W10 PENDING** — the likely SPEED path on sm_121 |
+| NVFP4 arm | `lilcheaty/MiniMax-H3-NVFP4` | fits | **W10 GROUNDED** — the real 1051-tensor manifest is textbook compressed-tensors NVFP4 (U8 packed + E4M3 group-16 `weight_scale` + F32 `weight_scale_2`), i.e. EXACTLY our existing layout; 258 quantized projections, islands unquantized |
 
 Tasks: `t2va` (text), `fl2va` (first/last-frame), `ref2va` (reference). Duration
 4-15 s snapped to `17n+5` frames at 24 FPS; 50 inference steps; flow shift 12
@@ -153,6 +153,8 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | request planning (frames, latent shapes, sigma schedules, canvas, task dispatch) | **exact** |
 | **REAL GGUF manifest** (535 tensors of `MiniMax-H3-FL2VA-Q3_K_M.gguf`) | **exact** — every name and logical shape matches our contract, geometry derived from shapes alone equals the shipped H3 config |
 | **AUDIO VAE decoder** vs the checkpoint's OWN remote code | **max abs diff 4.2e-9** (kaiser-sinc filter 3.0e-8) |
+| **REAL NVFP4 manifest** (1051 tensors) | **exact** — compressed-tensors triple, group 16, islands unquantized, names identical to our contract |
+| **REAL video-VAE manifest** (560 tensors) | **exact** — decoder confirmed a 36-block ViT, encoder the 3D CNN |
 | config-parse invariants + weight contract + grouped-qkv reorder | pass |
 
 The fp64 position grid is gated bit-exact deliberately: it feeds RoPE, and a
@@ -188,9 +190,15 @@ are small; the 354 GB of weights are not needed to READ the architecture).
 `FL2VA/{audio,video}_vae/`, ~130 KB of Python, NOT vendored here — it ships under
 the MiniMax H3 Community License). The **audio VAE is DONE** (W5): a DAC-lineage
 BigVGAN vocoder, reimplemented and gated against the checkpoint's own modules at
-4.2e-9 by `scripts/gen-minimax-h3-audio-vae-goldens.py`. The **video VAE (W4)
-remains the largest brick**: `klvae.py` alone is ~48 KB, plus a CNN/ViT hybrid,
-tiling, and a parallel path.
+4.2e-9 by `scripts/gen-minimax-h3-audio-vae-goldens.py`. The **video VAE (W4)** is the largest remaining brick, but the real
+checkpoint manifest (560 tensors, `FL2VA/video_vae/source/model.safetensors`,
+captured by range request) makes it materially smaller than `klvae.py`'s 48 KB
+suggested: the **ENCODER** is the 3D CNN (116 tensors, rank-5 Conv3d down blocks)
+while the **DECODER** — the half generation actually needs — is a plain **36-block
+TRANSFORMER** (440 tensors: `attn.to_qkv`/`attn.to_out`, `ff.w1`/`ff.w2`, two
+norms and two learned residual scales per block, plus `x_embedder`, `mask_token`,
+`register_tokens`, `norm_out`, `proj_out`). We have every primitive for that. The
+whole checkpoint is fp32.
 
 Contracts already pinned down from the adapter:
 * Video VAE weights stay **FP32**; keyframe encode is seeded
@@ -251,7 +259,7 @@ contract pending W6), `test_minimax_h3_e2e.py` (BLOCKED — needs the checkpoint
 | **W7** | Serving: `/v1/videos` + `/v1/videos/sync`, job store, MP4 mux (dependency decision in 5.2) | W6 |
 | **W8** | Speed: USP sequence parallelism, block caching, DiT TP | W2b + multi-GPU HW |
 | **W9** | **GGUF arm** — ComfyUI-format load (identity name map, ne reversal, `comfy.gguf.orig_shape` reshape rule, K-quant dequant). Shape/geometry resolution LANDED and gated on the real manifest; the dequant-into-weights path needs the file | — |
-| **W10** | **NVFP4 arm** — `lilcheaty/MiniMax-H3-NVFP4` onto our existing NVFP4 stack (cutlass FP4 GEMM on sm_121). The most promising SPEED path, and the one that makes an e2e run on one GB10 realistic | W9 |
+| **W10** | **NVFP4 arm** — `lilcheaty/MiniMax-H3-NVFP4` onto our existing NVFP4 stack (cutlass FP4 GEMM on sm_121). Layout GATED as identical to ours, so this is a loader-wiring brick, not a new quant scheme. The most promising SPEED path, and the one that makes an e2e run on one GB10 realistic | W9 |
 
 **Open items.** (0) Download a quantized checkpoint and close the e2e loop — this
 is now the top item, and it supersedes the old "hardware-blocked" framing.

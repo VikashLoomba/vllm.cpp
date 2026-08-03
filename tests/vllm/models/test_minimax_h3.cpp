@@ -27,6 +27,8 @@
 #include "minimax_h3_goldens.inc"
 #include "minimax_h3_gguf_manifest.inc"
 #include "minimax_h3_audio_vae_goldens.inc"
+#include "minimax_h3_nvfp4_manifest.inc"
+#include "minimax_h3_video_vae_manifest.inc"
 
 #include "vt/device.h"
 #include "vt/tensor.h"
@@ -897,6 +899,140 @@ TEST_CASE("minimax_h3: a REAL ComfyUI GGUF resolves onto our weight contract") {
     INFO("fp32 island " << name);
     REQUIRE(it != types.end());
     CHECK(it->second != 11u);  // not Q3_K
+  }
+}
+
+TEST_CASE("minimax_h3: the REAL NVFP4 checkpoint lands on our existing NVFP4 layout") {
+  // The NVFP4 arm is the SPEED path: sm_121 has native FP4 tensor cores and this
+  // project already ships a tuned NVFP4 stack (cutlass FP4 GEMM, the Laguna arm).
+  // This gates the real `minimax_h3_ref2va_nvfp4_full.safetensors` manifest, read
+  // from the file's own header by range request — no payload downloaded.
+  REQUIRE(vllm_test::kH3Nvfp4TensorCount ==
+          static_cast<int64_t>(std::size(vllm_test::kH3Nvfp4Tensors)));
+
+  std::map<std::string, const vllm_test::H3Nvfp4Tensor*> by_name;
+  for (const vllm_test::H3Nvfp4Tensor& t : vllm_test::kH3Nvfp4Tensors) by_name[t.name] = &t;
+
+  // The compressed-tensors NVFP4 triple, exactly as our loader already expects:
+  //   weight         U8       packed FP4, 2 values per byte
+  //   weight_scale   F8_E4M3  one per group of 16 along K
+  //   weight_scale_2 F32      one global scale (scalar)
+  int64_t packed = 0, block_scales = 0, global_scales = 0;
+  for (const vllm_test::H3Nvfp4Tensor& t : vllm_test::kH3Nvfp4Tensors) {
+    const std::string name = t.name;
+    if (name.size() > 14 && name.compare(name.size() - 14, 14, "weight_scale_2") == 0) {
+      CHECK(std::string(t.dtype) == "F32");
+      CHECK(t.rank == 0);  // scalar
+      ++global_scales;
+    } else if (name.size() > 12 && name.compare(name.size() - 12, 12, "weight_scale") == 0) {
+      CHECK(std::string(t.dtype) == "F8_E4M3");
+      ++block_scales;
+    } else if (std::string(t.dtype) == "U8") {
+      ++packed;
+    }
+  }
+  // Every quantized projection carries all three, so the counts must agree.
+  CHECK(packed == block_scales);
+  CHECK(packed == global_scales);
+  CHECK(packed == 258);
+
+  // Spot-check the geometry on the fused qkv of block 0. Logical [21504, 5376]:
+  // 21504 = 3 * 56 * 128 output rows, 5376 = hidden.
+  const auto qkv = by_name.find("blocks.0.attn.qkv_proj.weight");
+  REQUIRE(qkv != by_name.end());
+  CHECK(std::string(qkv->second->dtype) == "U8");
+  CHECK(qkv->second->rank == 2);
+  CHECK(qkv->second->shape[0] == 21504);
+  CHECK(qkv->second->shape[1] == 2688);  // 5376 FP4 values packed 2-per-byte
+
+  const auto qkv_scale = by_name.find("blocks.0.attn.qkv_proj.weight_scale");
+  REQUIRE(qkv_scale != by_name.end());
+  CHECK(qkv_scale->second->shape[0] == 21504);
+  CHECK(qkv_scale->second->shape[1] == 336);  // 5376 / 16 -> NVFP4 group size 16
+  CHECK(qkv->second->shape[1] * 2 == qkv_scale->second->shape[1] * 16);
+
+  // The fp32/bf16 ISLANDS must stay unquantized here too: quantizing a patch
+  // projection, the time embedder, or an output head would break the dtype policy
+  // the DiT forward depends on.
+  for (const char* name : {"video_patch_proj.weight", "audio_patch_proj.weight",
+                           "time_embedder.proj_in.weight", "time_embedder.proj_out.weight",
+                           "final_layer.video_out.weight", "final_layer.audio_out.weight",
+                           "rope.inv_freq", "blocks.0.norm1.weight",
+                           "blocks.0.attn.q_norm.weight", "condition_proj.weight"}) {
+    const auto it = by_name.find(name);
+    INFO("unquantized island " << name);
+    REQUIRE(it != by_name.end());
+    CHECK(std::string(it->second->dtype) != "U8");
+  }
+
+  // The name map is again the IDENTITY: every non-quantization tensor in the real
+  // checkpoint is a name our contract already knows.
+  MiniMaxH3DitParams p;  // shipped geometry
+  const std::vector<vllm::MiniMaxH3TensorSpec> contract = EnumerateMiniMaxH3DitTensors(p);
+  std::map<std::string, std::vector<int64_t>> expected;
+  for (const vllm::MiniMaxH3TensorSpec& spec : contract) expected[spec.name] = spec.shape;
+  int64_t matched = 0;
+  for (const vllm_test::H3Nvfp4Tensor& t : vllm_test::kH3Nvfp4Tensors) {
+    const std::string name = t.name;
+    if (name.find("weight_scale") != std::string::npos) continue;  // quant sidecars
+    INFO("checkpoint tensor " << name);
+    CHECK(expected.count(name) == 1);
+    ++matched;
+  }
+  CHECK(matched == static_cast<int64_t>(contract.size()));
+}
+
+TEST_CASE("minimax_h3: the video VAE decoder is a ViT, and its manifest says so") {
+  // W4 scoping, grounded in the real checkpoint rather than in a guess: the video
+  // VAE's ENCODER is the 3D CNN (down blocks with Conv3d), but its DECODER — the
+  // half we actually need for generation — is a plain transformer stack. That
+  // makes W4 materially smaller than "port a 48 KB klvae.py" suggested.
+  REQUIRE(vllm_test::kH3VideoVaeTensorCount ==
+          static_cast<int64_t>(std::size(vllm_test::kH3VideoVaeTensors)));
+
+  int64_t decoder = 0, encoder = 0, quant_conv = 0, max_block = -1;
+  bool saw_conv3d = false;
+  for (const vllm_test::H3VideoVaeTensor& t : vllm_test::kH3VideoVaeTensors) {
+    const std::string name = t.name;
+    CHECK(std::string(t.dtype) == "F32");  // the source checkpoint is fp32 throughout
+    if (name.rfind("decoder.", 0) == 0) ++decoder;
+    if (name.rfind("encoder.", 0) == 0) {
+      ++encoder;
+      if (t.rank == 5) saw_conv3d = true;  // [out, in, kt, kh, kw]
+    }
+    if (name.rfind("quant_conv", 0) == 0 || name.rfind("post_quant_conv", 0) == 0) ++quant_conv;
+    const std::string prefix = "decoder.transformer_blocks.";
+    if (name.rfind(prefix, 0) == 0) {
+      const size_t start = prefix.size();
+      size_t end = start;
+      while (end < name.size() && name[end] >= '0' && name[end] <= '9') ++end;
+      if (end > start) max_block = std::max<int64_t>(max_block, std::stoll(name.substr(start, end - start)));
+    }
+  }
+  CHECK(decoder == 440);
+  CHECK(encoder == 116);
+  CHECK(quant_conv == 4);
+  CHECK(saw_conv3d);          // the ENCODER is the 3D CNN
+  CHECK(max_block == 35);     // the DECODER is a 36-block transformer
+
+  // Each decoder block carries exactly the transformer parts we already have
+  // primitives for: fused qkv attention, a 2-matrix feed-forward, two norms, and
+  // two learned residual scales.
+  std::map<std::string, bool> present;
+  for (const vllm_test::H3VideoVaeTensor& t : vllm_test::kH3VideoVaeTensors) present[t.name] = true;
+  for (const char* suffix : {"attn.to_qkv.weight", "attn.to_qkv.bias", "attn.to_out.weight",
+                             "attn.to_out.bias", "ff.w1.weight", "ff.w2.weight",
+                             "norm1.weight", "norm2.weight", "scale1", "scale2"}) {
+    const std::string name = "decoder.transformer_blocks.0." + std::string(suffix);
+    INFO("decoder block part " << name);
+    CHECK(present.count(name) == 1);
+  }
+  // Plus the ViT surround: patch embed, learned mask/register tokens, output head.
+  for (const char* name : {"decoder.x_embedder.weight", "decoder.mask_token",
+                           "decoder.register_tokens", "decoder.norm_out.weight",
+                           "decoder.proj_out.weight", "post_quant_conv.weight"}) {
+    INFO("decoder surround " << name);
+    CHECK(present.count(name) == 1);
   }
 }
 

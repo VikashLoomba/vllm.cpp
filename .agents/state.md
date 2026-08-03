@@ -34666,3 +34666,40 @@ non-saturation explicitly.
 mostly reuse of our Qwen3-VL tower) and the pipeline (W6), after which an
 end-to-end run on a quantized checkpoint is reachable.
 
+## 2026-08-03 - MiniMax-H3: NVFP4 arm grounded, video VAE scoped (`CLAIM-MINIMAX-H3-W10-SCOPE`)
+
+Two de-risking results, both obtained from REAL checkpoints without downloading a
+byte of payload. Generalized the GGUF header trick: a **safetensors header is also
+front-loaded** (8-byte length + JSON) and only tens of KB even for a 10 GB file, so
+one range request captures the entire manifest
+(`scripts/gen-minimax-h3-safetensors-manifest.py`).
+
+**1. The NVFP4 checkpoint is our layout, exactly.** `lilcheaty/MiniMax-H3-NVFP4`
+(1051 tensors) is the textbook compressed-tensors triple:
+  weight          U8       FP4 packed 2-per-byte  ([21504, 2688] for logical [21504, 5376])
+  weight_scale    F8_E4M3  one per group of **16** along K  ([21504, 336])
+  weight_scale_2  F32      one global scalar
+258 quantized projections, each with all three; the fp32/bf16 islands (patch
+projections, time embedder, output heads, norms, rope) are left unquantized; and the
+names are IDENTICAL to the contract we derived from source. **So W10 is loader
+WIRING onto the NVFP4 stack we already tuned for Laguna, not a new quant scheme.**
+That matters because W10 is the speed path: sm_121 has native FP4 tensor cores.
+
+**2. The video VAE decoder is a ViT, not a CNN.** I had scoped W4 as "port a 48 KB
+klvae.py" and treated it as the scary brick. The real 560-tensor manifest says
+otherwise: the ENCODER is the 3D CNN (116 tensors, rank-5 Conv3d down blocks), but
+the DECODER — the only half generation needs — is a **36-block transformer** (440
+tensors: attn.to_qkv/to_out, ff.w1/w2, two norms and two learned residual scales per
+block, plus x_embedder, mask_token, register_tokens, norm_out, proj_out). fp32
+throughout. We have every primitive for that.
+
+**Method note (now used three times, worth keeping):** read the checkpoint's HEADER,
+not the checkpoint. GGUF and safetensors both front-load a self-delimiting manifest;
+a 4-16 MiB range request grounds a loader contract against a real multi-GB file. It
+has now caught/confirmed the identity name map twice and correctly re-scoped a brick
+I had over-estimated.
+
+**Next.** W4 video-VAE decoder (a ViT port), W3 encoder (Qwen3-VL reuse), W6
+pipeline; then W10 loader wiring, after which an e2e run on a quantized checkpoint —
+and only then a speed number — is reachable.
+

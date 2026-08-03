@@ -2117,6 +2117,97 @@ TEST_CASE("minimax_h3: presentation token tags match upstream") {
   CHECK(video_runs == vision_spans);
 }
 
+TEST_CASE("minimax_h3: the VAE encoder ResnetBlock3D matches upstream") {
+  // The repeated unit of the video VAE's 3D-CNN ENCODER (used for image/video
+  // CONDITIONING, not for output frames). Two details are load-bearing and both
+  // are exercised: the convolution is CAUSAL in time (all padding on the LEFT, so
+  // a frame never sees the future), and GroupNorm's statistics span TIME as well
+  // as space.
+  vllm::MiniMaxH3ResnetBlock3dConfig config;
+  config.in_channels = vllm_test::kH3Res3dInCh;
+  config.out_channels = vllm_test::kH3Res3dOutCh;
+  config.t = vllm_test::kH3Res3dT;
+  config.h = vllm_test::kH3Res3dH;
+  config.w = vllm_test::kH3Res3dW;
+  config.num_groups = vllm_test::kH3Res3dGroups;
+  config.eps = 1e-6;
+
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& n, int64_t count, double scale, double offset) {
+    weights.tensors["rb." + n] = MakeParam("resnet3d." + n, count, scale, offset);
+  };
+  put("norm1.weight", config.in_channels, 0.1, 1.0);
+  put("norm1.bias", config.in_channels, 0.05, 0.0);
+  put("norm2.weight", config.out_channels, 0.1, 1.0);
+  put("norm2.bias", config.out_channels, 0.05, 0.0);
+  put("conv1.weight", config.out_channels * config.in_channels * 27, 0.1, 0.0);
+  put("conv1.bias", config.out_channels, 0.05, 0.0);
+  put("conv2.weight", config.out_channels * config.out_channels * 27, 0.1, 0.0);
+  put("conv2.bias", config.out_channels, 0.05, 0.0);
+  put("nin_shortcut.weight", config.out_channels * config.in_channels, 0.1, 0.0);
+  put("nin_shortcut.bias", config.out_channels, 0.05, 0.0);
+
+  const int64_t spatial = config.t * config.h * config.w;
+  const std::vector<float> x =
+      MakeParam("resnet3d.input", config.in_channels * spatial, 1.0);
+  const std::vector<float> got =
+      vllm::MiniMaxH3ResnetBlock3dForward(config, weights, "rb", x);
+
+  REQUIRE(got.size() == std::size(vllm_test::kH3Res3dGolden));
+  const double err = MaxAbsDiff(got, vllm_test::kH3Res3dGolden, got.size());
+  INFO("resnet3d max|diff| = " << err);
+  CHECK(err <= 1e-4);
+
+  // CAUSALITY, proven rather than assumed: perturbing the LAST frame must leave
+  // the FIRST frame's output bit-identical, while the last frame's own output
+  // changes. A non-causal (symmetric) temporal pad would break the first check.
+  std::vector<float> perturbed = x;
+  for (int64_t c = 0; c < config.in_channels; ++c) {
+    perturbed[static_cast<size_t>(c * spatial + (config.t - 1) * config.h * config.w)] += 5.0f;
+  }
+  const std::vector<float> other =
+      vllm::MiniMaxH3ResnetBlock3dForward(config, weights, "rb", perturbed);
+  // GroupNorm's statistics span time, so a change anywhere perturbs every frame
+  // a little -- an exact-equality check on the whole BLOCK would be wrong. Here
+  // the weaker (but still meaningful) claim is asserted: the perturbed frame moves
+  // strictly more than the first. Strict causality is then proven on the bare
+  // CONVOLUTION below, where no norm mixes the frames.
+  double first_delta = 0.0, last_delta = 0.0;
+  const int64_t frame = config.h * config.w;
+  for (int64_t c = 0; c < config.out_channels; ++c) {
+    for (int64_t i = 0; i < frame; ++i) {
+      first_delta = std::max(first_delta,
+                             std::abs(static_cast<double>(other[static_cast<size_t>(c * spatial + i)]) -
+                                      got[static_cast<size_t>(c * spatial + i)]));
+      const size_t last = static_cast<size_t>(c * spatial + (config.t - 1) * frame + i);
+      last_delta = std::max(last_delta,
+                            std::abs(static_cast<double>(other[last]) - got[last]));
+    }
+  }
+  CHECK(last_delta > first_delta);
+
+  // The causal convolution alone: with norms bypassed, a future-frame change must
+  // NOT reach an earlier frame at all.
+  vllm::MiniMaxH3Conv3dSpec spec;
+  spec.in_channels = spec.out_channels = 1;
+  spec.t = 3;
+  spec.h = spec.w = 1;
+  spec.kernel_t = 3;
+  spec.kernel_h = spec.kernel_w = 1;
+  spec.pad_t = 1;
+  spec.pad_h = spec.pad_w = 0;
+  spec.causal = true;
+  const std::vector<float> kernel = {1.0f, 2.0f, 4.0f};
+  const std::vector<float> a = {1.0f, 0.0f, 0.0f};
+  const std::vector<float> b = {1.0f, 0.0f, 9.0f};  // only the LAST frame differs
+  const std::vector<float> ca = vllm::MiniMaxH3CausalConv3d(a, spec, kernel, nullptr);
+  const std::vector<float> cb = vllm::MiniMaxH3CausalConv3d(b, spec, kernel, nullptr);
+  REQUIRE(ca.size() == cb.size());
+  CHECK(ca[0] == cb[0]);   // frame 0 cannot see frame 2
+  CHECK(ca[1] == cb[1]);   // frame 1 cannot see frame 2
+  CHECK(ca[2] != cb[2]);   // frame 2 does
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

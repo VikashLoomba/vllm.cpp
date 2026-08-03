@@ -470,6 +470,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_nvfp4.cpp
   src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
+  src/vllm/model_executor/models/minimax_h3_vae_cnn.cpp
   src/vllm/model_executor/models/minimax_h3_encoder.cpp
   src/vllm/model_executor/models/minimax_h3_pipeline.cpp
   src/vllm/model_executor/models/kimi_kda.cpp

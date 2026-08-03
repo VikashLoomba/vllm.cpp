@@ -35024,3 +35024,28 @@ portable, conditioning-side); ffmpeg media I/O + MP4 muxing (ONE dependency
 decision, needs the project owner); and the device-resident FP4 forward plus any
 speed number (needs a GPU - dgx.casa unreachable, none local).
 
+## 2026-08-03 - MiniMax-H3: video-VAE 3D-CNN encoder primitives
+
+Causal Conv3d, GroupNorm3D and ResnetBlock3D are ported and exact. These serve the
+video VAE's ENCODER, which is used for image/video CONDITIONING (fl2va keyframes,
+ref2va references) - a t2va generation path does not need it.
+
+Two details pinned by the gate:
+  * the convolution is CAUSAL in time: `padding[0] * 2` frames on the LEFT, none
+    on the right, with CONSTANT (zero) temporal padding and `reflect` SPATIAL
+    padding. A symmetric temporal pad would let a frame see the future.
+  * GroupNorm's statistics span TIME as well as space (32 groups, eps 1e-6), so a
+    per-frame normalization would silently differ.
+
+**Causality is PROVEN, not assumed.** On the bare convolution, changing the last
+frame leaves earlier frames BIT-IDENTICAL while the last frame's own output moves.
+At block level GroupNorm mixes across time, so exact equality would be the wrong
+assertion there; the weaker claim (the perturbed frame moves strictly more than the
+first) is asserted instead, with the strict proof done where it is actually valid.
+Worth remembering as a test-design pattern: assert the strong invariant at the
+layer that holds it, not at the layer where a legitimate mixing step breaks it.
+
+**Remaining:** the encoder's Downsample3D + EncoderFCN3D assembly, the MM
+processor, ffmpeg media I/O + MP4 muxing (ONE dependency decision), and the
+device-resident FP4 forward plus any speed number (needs a GPU).
+

@@ -484,6 +484,42 @@ void MiniMaxH3VideoVaeRope(int64_t latent_t, int64_t latent_h, int64_t latent_w,
                            int64_t num_suffix, int64_t rope_apply_dim, double rope_theta,
                            std::vector<float>* cos_out, std::vector<float>* sin_out);
 
+// --- video-VAE 3D-CNN ENCODER primitives (conv.py, norm.py, vae_cnn.py) ---
+// The decoder is a ViT; the ENCODER is this 3D CNN, needed for image/video
+// CONDITIONING (fl2va keyframes, ref2va references), not for output frames.
+
+struct MiniMaxH3Conv3dSpec {
+  int64_t in_channels = 0, out_channels = 0;
+  int64_t t = 0, h = 0, w = 0;
+  int64_t kernel_t = 3, kernel_h = 3, kernel_w = 3;
+  int64_t pad_t = 1, pad_h = 1, pad_w = 1;
+  bool causal = true;  // all temporal padding on the LEFT
+};
+
+// Causal Conv3d with `reflect` spatial padding; [C,T,H,W] in and out.
+std::vector<float> MiniMaxH3CausalConv3d(const std::vector<float>& in,
+                                         const MiniMaxH3Conv3dSpec& spec,
+                                         const std::vector<float>& weight,
+                                         const std::vector<float>* bias);
+
+// GroupNorm whose statistics span the group's channels AND all of time/space.
+void MiniMaxH3GroupNorm3d(std::vector<float>& x, int64_t channels, int64_t spatial,
+                          int64_t num_groups, const std::vector<float>& weight,
+                          const std::vector<float>& bias, double eps);
+
+struct MiniMaxH3ResnetBlock3dConfig {
+  int64_t in_channels = 0, out_channels = 0;
+  int64_t t = 0, h = 0, w = 0;
+  int64_t num_groups = 32;
+  double eps = 1e-6;
+};
+
+// norm -> SiLU -> conv -> norm -> SiLU -> conv (+ 1x1x1 shortcut when C changes).
+std::vector<float> MiniMaxH3ResnetBlock3dForward(const MiniMaxH3ResnetBlock3dConfig& config,
+                                                 const MiniMaxH3AudioVaeWeights& weights,
+                                                 const std::string& prefix,
+                                                 const std::vector<float>& x);
+
 // --- spatial tiling (klvae.py:192-250) ---
 // Shipped config: tile_size 256, tile_overlap_min 64, vae_ratio 16.
 inline constexpr int64_t kMiniMaxH3VaeTileSize = 256;

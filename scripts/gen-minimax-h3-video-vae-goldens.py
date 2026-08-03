@@ -234,6 +234,45 @@ def emit_i64(out, name, values):
     out.write("};\n\n")
 
 
+def emit_resnet3d(out, src) -> None:
+    """Section: the VAE encoder's ResnetBlock3D (the repeated unit of the 3D CNN).
+
+    GroupNorm(32, eps 1e-6) -> SiLU -> causal Conv3d(3x3x3) -> GroupNorm -> SiLU ->
+    Conv3d -> plus a 1x1x1 `nin_shortcut` when the channel count changes. The
+    convolution is CAUSAL in time (all temporal padding on the LEFT) and uses the
+    checkpoint's `reflect` spatial padding.
+    """
+    cnn = load_bundle(src, "vae_cnn")
+    # GroupNorm uses 32 groups, so channel counts must be multiples of 32.
+    in_ch, out_ch = 32, 64
+    block = cnn.ResnetBlock3D(in_ch, out_ch, padding_mode="reflect", causal=True).eval()
+    state = block.state_dict()
+    for name, tensor in state.items():
+        scale, offset = (0.1, 0.0)
+        if ".weight" in name and tensor.dim() == 1:
+            scale, offset = 0.1, 1.0     # group-norm gain
+        elif name.endswith(".bias"):
+            scale = 0.05
+        state[name] = torch.from_numpy(
+            (h3_rand("resnet3d." + name, tensor.numel()) * scale + offset).astype(np.float32)
+        ).reshape(tensor.shape)
+    block.load_state_dict(state, strict=True)
+
+    t, hh, ww = 3, 4, 4  # T>1 so the CAUSAL temporal padding path is taken
+    x = torch.from_numpy(
+        h3_rand("resnet3d.input", in_ch * t * hh * ww).astype(np.float32)
+    ).reshape(1, in_ch, t, hh, ww)
+    y = block(x)
+
+    out.write(f"inline constexpr int64_t kH3Res3dInCh = {in_ch};\n")
+    out.write(f"inline constexpr int64_t kH3Res3dOutCh = {out_ch};\n")
+    out.write(f"inline constexpr int64_t kH3Res3dT = {t};\n")
+    out.write(f"inline constexpr int64_t kH3Res3dH = {hh};\n")
+    out.write(f"inline constexpr int64_t kH3Res3dW = {ww};\n")
+    out.write(f"inline constexpr int64_t kH3Res3dGroups = 32;\n\n")
+    emit_f32(out, "kH3Res3dGolden", y.reshape(-1))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--h3-vae-source", required=True, type=Path,
@@ -340,6 +379,7 @@ def main() -> int:
         out.write(f"inline constexpr int64_t kH3VideoVaeDecFrameW = {int(frames.shape[4])};\n\n")
         emit_f32(out, "kH3VideoVaeDecoderGolden", frames.reshape(-1))
         emit_tiling(out)
+        emit_resnet3d(out, src)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out} (ff inner {int(inner)})", file=sys.stderr)
     return 0

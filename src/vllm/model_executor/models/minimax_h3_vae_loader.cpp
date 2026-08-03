@@ -127,4 +127,51 @@ MiniMaxH3AudioVaeWeights LoadMiniMaxH3AudioVaeWeights(const SafetensorsFile& fil
   return out;
 }
 
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3VideoVaeDecoderWeights(const SafetensorsFile& file) {
+  MiniMaxH3AudioVaeWeights out;
+  for (const std::string& name : file.Names()) {
+    // The 3D-CNN ENCODER shares this file (conditioning only), and `quant_conv`
+    // is its output stage. Generation decodes, so neither is loaded.
+    if (name.rfind("encoder.", 0) == 0) continue;
+    if (name.rfind("quant_conv.", 0) == 0) continue;
+
+    std::string key = name;
+    if (key.rfind("decoder.", 0) == 0) key = key.substr(std::strlen("decoder."));
+    VT_CHECK(out.tensors.count(key) == 0,
+             "minimax_h3 video vae: two checkpoint tensors map to the same name");
+    out.tensors[key] = MiniMaxH3ReadSafetensorF32(file.Get(name));
+  }
+  VT_CHECK(!out.tensors.empty(), "minimax_h3 video vae: checkpoint contained no decoder tensors");
+  return out;
+}
+
+std::vector<float> MiniMaxH3VideoVaePostQuantConv(const MiniMaxH3AudioVaeWeights& weights,
+                                                  const std::vector<float>& latent,
+                                                  int64_t channels, int64_t elems_per_channel) {
+  const std::vector<float>& w = weights.Get("post_quant_conv.weight");
+  const std::vector<float>& b = weights.Get("post_quant_conv.bias");
+  VT_CHECK(static_cast<int64_t>(w.size()) == channels * channels,
+           "minimax_h3 post_quant_conv: weight must be [C, C, 1, 1, 1]");
+  VT_CHECK(static_cast<int64_t>(b.size()) == channels,
+           "minimax_h3 post_quant_conv: bias must have one value per channel");
+  VT_CHECK(static_cast<int64_t>(latent.size()) == channels * elems_per_channel,
+           "minimax_h3 post_quant_conv: latent size does not match [C, ...]");
+
+  // A 1x1x1 Conv3d over a CHANNEL-MAJOR latent: out[o, p] = sum_i w[o, i] * in[i, p]
+  // + b[o]. The accumulation is f32 in input-channel order, matching torch's
+  // contraction over a length-C reduction.
+  std::vector<float> out(latent.size());
+  for (int64_t o = 0; o < channels; ++o) {
+    const float bias = b[static_cast<size_t>(o)];
+    float* dst = out.data() + o * elems_per_channel;
+    for (int64_t p = 0; p < elems_per_channel; ++p) dst[p] = bias;
+    for (int64_t i = 0; i < channels; ++i) {
+      const float coeff = w[static_cast<size_t>(o * channels + i)];
+      const float* src = latent.data() + i * elems_per_channel;
+      for (int64_t p = 0; p < elems_per_channel; ++p) dst[p] += coeff * src[p];
+    }
+  }
+  return out;
+}
+
 }  // namespace vllm

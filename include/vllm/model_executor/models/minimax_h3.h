@@ -584,6 +584,32 @@ std::vector<float> MiniMaxH3EncoderFcn3dForward(const MiniMaxH3EncoderFcn3dConfi
                                                 const std::vector<float>& x,
                                                 MiniMaxH3VideoFrameShape* out_shape);
 
+// Materialize the VIDEO VAE decoder's weights from the shipped checkpoint
+// (FL2VA/video_vae/model.safetensors, the gated 560-tensor manifest).
+//
+// Simpler than the audio VAE: no weight-norm spelling change. The only mapping is
+// the `decoder.` prefix, which the ViT3D decoder's own names do not carry. The
+// `encoder.*` half (the 3D CNN, conditioning-only) is ignored, and `quant_conv.*`
+// belongs to the ENCODER side.
+//
+// `post_quant_conv.*` IS kept, under its own name, because it is a real step this
+// port had not needed before: see MiniMaxH3VideoVaePostQuantConv.
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3VideoVaeDecoderWeights(const SafetensorsFile& file);
+
+// The AutoencoderKL wrapper's `post_quant_conv` — a Conv3d(latent_ch -> latent_ch,
+// kernel 1x1x1), i.e. a per-position channel MIX plus bias, applied to the latent
+// BEFORE the decoder proper.
+//
+// It sits OUTSIDE ViT3DDecoder, which is why the decoder gate (8.9e-8 vs the
+// checkpoint's own ViT3DDecoder, whose first op is x_embedder) never covered it and
+// nothing in this port applied it. Loading the tensor without applying it would
+// have been the worst outcome: a decode that runs, looks reasonable, and is wrong.
+//
+// `latent` is [channels, t, h, w] contiguous; the result has the same shape.
+std::vector<float> MiniMaxH3VideoVaePostQuantConv(const MiniMaxH3AudioVaeWeights& weights,
+                                                  const std::vector<float>& latent,
+                                                  int64_t channels, int64_t elems_per_channel);
+
 // --- spatial tiling (klvae.py:192-250) ---
 // Shipped config: tile_size 256, tile_overlap_min 64, vae_ratio 16.
 inline constexpr int64_t kMiniMaxH3VaeTileSize = 256;

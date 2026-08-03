@@ -35540,3 +35540,37 @@ written in the SHIPPED spellings produces a finite in-range waveform.
 
 REMAINING for path 2: the video VAE decoder loader (560-tensor manifest already
 gated), and the two encoder towers (likely large reuse of our Qwen3-VL loader).
+
+## 2026-08-03 - MiniMax-H3: video-VAE loader, and the step nobody was applying
+
+The mapping itself was easy - strip the `decoder.` prefix, ignore the encoder half
+and `quant_conv` (an encoder-side stage). No weight-norm spelling change here,
+unlike the audio VAE. Asserted INJECTIVE over the real 560-tensor manifest.
+
+THE REAL FIND: `post_quant_conv`. The checkpoint ships it ([24, 24, 1, 1, 1] + bias),
+it is a Conv3d with a 1x1x1 kernel - i.e. a per-position CHANNEL MIX of the 24
+latent channels - and it runs on the latent BEFORE the decoder. Nothing in this port
+applied it. Grep for it across every H3 TU returned NOTHING.
+
+Why it was missed is instructive rather than embarrassing: the video decoder was
+gated at 8.9e-8 against the checkpoint's OWN ViT3DDecoder, whose first op is
+x_embedder. post_quant_conv belongs to the outer AutoencoderKL WRAPPER, so the gate
+was correct for what it covered and simply could not see a step upstream of its own
+entry point. The manifest shapes are what made it visible: post_quant_conv's output
+channel count (24) is exactly x_embedder's input, so it sits between the latent and
+the decoder.
+
+That is the worst class of gap - loading the tensor and not applying it yields a
+decode that RUNS, looks plausible, and is wrong. So it is implemented (a straight
+f32 contraction over input channels) and gated against a hand-computed result, plus
+an assertion that it is NOT a passthrough.
+
+GENERALIZES: a component gated against an oracle SUBMODULE cannot see steps in the
+wrapper around it. When loading a real checkpoint, tensors that map to nothing in
+the port are the signal - do not skip them silently just because the forward never
+asked for them.
+
+Gate: 44/44 (13310 assertions).
+
+REMAINING for path 2: the two encoder towers (likely large reuse of the Qwen3-VL
+loader), and wiring post_quant_conv into the pipeline's decode path.

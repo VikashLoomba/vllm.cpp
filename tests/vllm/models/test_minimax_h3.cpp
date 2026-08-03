@@ -3198,3 +3198,96 @@ TEST_CASE("minimax_h3: the audio-VAE loader materializes weights the decoder RUN
     CHECK(v <= 1.0f);
   }
 }
+
+TEST_CASE("minimax_h3: the REAL video-VAE checkpoint maps onto the ViT3D decoder's names") {
+  // Same shape of gate as the audio VAE, over the real 560-tensor manifest. The
+  // mapping is simpler here (no weight-norm spelling change; only the `decoder.`
+  // prefix), which is itself worth pinning: if a future checkpoint revision moved
+  // to the parametrization spelling, this test fails rather than the decode.
+  auto mapped = [](const std::string& name) -> std::string {
+    if (name.rfind("encoder.", 0) == 0) return "";
+    if (name.rfind("quant_conv.", 0) == 0) return "";  // encoder-side stage
+    std::string key = name;
+    if (key.rfind("decoder.", 0) == 0) key = key.substr(8);
+    return key;
+  };
+
+  std::set<std::string> names;
+  int64_t skipped = 0;
+  for (int64_t i = 0; i < vllm_test::kH3VideoVaeTensorCount; ++i) {
+    const std::string key = mapped(vllm_test::kH3VideoVaeTensors[i].name);
+    if (key.empty()) {
+      ++skipped;
+      continue;
+    }
+    CHECK(names.insert(key).second);  // INJECTIVE
+  }
+  CHECK(skipped > 0);  // the encoder half really is present in the file
+
+  // Every name the ViT3D decoder reads must exist post-mapping.
+  CHECK(names.count("x_embedder.weight") == 1);
+  CHECK(names.count("x_embedder.bias") == 1);
+  CHECK(names.count("register_tokens") == 1);
+  CHECK(names.count("norm_out.weight") == 1);
+  CHECK(names.count("proj_out.weight") == 1);
+  CHECK(names.count("transformer_blocks.0.attn.to_qkv.weight") == 1);
+  CHECK(names.count("transformer_blocks.0.attn.to_out.bias") == 1);
+  CHECK(names.count("transformer_blocks.0.ff.w1.weight") == 1);
+  CHECK(names.count("transformer_blocks.0.ff.w2.bias") == 1);
+  CHECK(names.count("transformer_blocks.0.norm1.weight") == 1);
+  CHECK(names.count("transformer_blocks.0.scale1") == 1);
+  CHECK(names.count("transformer_blocks.35.scale2") == 1);  // 36 blocks, 0..35
+  CHECK(names.count("transformer_blocks.36.scale2") == 0);
+  // post_quant_conv is kept (it is a REAL step, see below), quant_conv is not.
+  CHECK(names.count("post_quant_conv.weight") == 1);
+  CHECK(names.count("quant_conv.weight") == 0);
+  for (const std::string& n : names) CHECK(n.rfind("decoder.", 0) != 0);
+}
+
+TEST_CASE("minimax_h3: post_quant_conv is a real step, and it is a 1x1x1 channel mix") {
+  // This tensor sits OUTSIDE ViT3DDecoder, so the decoder gate (8.9e-8 against the
+  // checkpoint's own decoder, whose first op is x_embedder) never covered it and
+  // nothing in this port applied it. Loading it without applying it would be the
+  // worst outcome: a decode that runs, looks plausible, and is wrong.
+  //
+  // The real shape says exactly what it is.
+  auto shape_of = [](const std::string& want) {
+    for (int64_t i = 0; i < vllm_test::kH3VideoVaeTensorCount; ++i) {
+      if (want == vllm_test::kH3VideoVaeTensors[i].name) return vllm_test::kH3VideoVaeTensors[i];
+    }
+    FAIL("manifest is missing ", want);
+    return vllm_test::kH3VideoVaeTensors[0];
+  };
+  const auto pqc = shape_of("post_quant_conv.weight");
+  CHECK(pqc.rank == 5);
+  CHECK(pqc.shape[0] == 24);  // latent channels out
+  CHECK(pqc.shape[1] == 24);  // latent channels in
+  CHECK(pqc.shape[2] == 1);   // 1x1x1 -> a per-position CHANNEL MIX
+  CHECK(pqc.shape[3] == 1);
+  CHECK(pqc.shape[4] == 1);
+  // ...and it feeds x_embedder, which takes those same 24 channels.
+  const auto xe = shape_of("decoder.x_embedder.weight");
+  CHECK(xe.shape[1] == pqc.shape[0]);
+
+  // The implementation, checked against a hand-computed contraction.
+  const int64_t C = 3, P = 4;
+  vllm::MiniMaxH3AudioVaeWeights w;
+  w.tensors["post_quant_conv.weight"] = {1, 2, 3, 4, 5, 6, 7, 8, 9};  // [C, C]
+  w.tensors["post_quant_conv.bias"] = {0.5f, -0.5f, 1.0f};
+  std::vector<float> latent(static_cast<size_t>(C * P));
+  for (int64_t i = 0; i < C * P; ++i) latent[static_cast<size_t>(i)] = float(i + 1);
+  const std::vector<float> got = vllm::MiniMaxH3VideoVaePostQuantConv(w, latent, C, P);
+  REQUIRE(got.size() == latent.size());
+  for (int64_t o = 0; o < C; ++o) {
+    for (int64_t p = 0; p < P; ++p) {
+      double want = w.tensors["post_quant_conv.bias"][static_cast<size_t>(o)];
+      for (int64_t i = 0; i < C; ++i) {
+        want += w.tensors["post_quant_conv.weight"][static_cast<size_t>(o * C + i)] *
+                latent[static_cast<size_t>(i * P + p)];
+      }
+      CHECK(got[static_cast<size_t>(o * P + p)] == doctest::Approx(want).epsilon(1e-6));
+    }
+  }
+  // A channel MIX, not a passthrough: dropping it would change the decoder's input.
+  CHECK(got[0] != doctest::Approx(latent[0]));
+}

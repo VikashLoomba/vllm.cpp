@@ -687,4 +687,37 @@ inline constexpr float kH3Down3dGolden[] = {
     0.240882233f, 0.655156732f, 1.73944545f, 1.30386937f,
 };
 
+inline constexpr int64_t kH3EncFcnCh = 32;
+inline constexpr int64_t kH3EncFcnLevels = 2;
+inline constexpr int64_t kH3EncFcnResBlocks = 1;
+inline constexpr int64_t kH3EncFcnInCh = 3;
+inline constexpr int64_t kH3EncFcnZCh = 4;
+inline constexpr int64_t kH3EncFcnT = 3;
+inline constexpr int64_t kH3EncFcnH = 4;
+inline constexpr int64_t kH3EncFcnW = 4;
+inline constexpr int64_t kH3EncFcnOutT = 2;
+inline constexpr int64_t kH3EncFcnOutH = 2;
+inline constexpr int64_t kH3EncFcnOutW = 2;
+
+inline constexpr int64_t kH3EncFcnChMult[] = {
+    1, 2,
+};
+
+inline constexpr int64_t kH3EncFcnSpaceDown[] = {
+    2, 1,
+};
+
+inline constexpr int64_t kH3EncFcnTimeDown[] = {
+    2, 1,
+};
+
+inline constexpr float kH3EncFcnGolden[] = {
+    -0.647403002f, -1.08679593f, -1.2458874f, -1.09321702f, 0.658367097f, -0.010494682f,
+    1.4137609f, 0.526135743f, -0.074380286f, 0.370558113f, -0.594323337f, -0.00315129361f,
+    -0.177218556f, -1.05845392f, 0.194596648f, 0.377935022f, -0.626861393f, -0.220532134f,
+    -0.0755905882f, -0.147749916f, -1.02707064f, -0.566771746f, 0.0391352698f, 1.44189084f,
+    -0.189376622f, 0.130435646f, -0.0821180269f, -0.175276399f, 0.353344172f, -0.58102107f,
+    -2.27422833f, -1.54143059f,
+};
+
 }  // namespace vllm_test

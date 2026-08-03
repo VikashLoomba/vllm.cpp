@@ -35066,3 +35066,24 @@ throwaway build trees at ~4.7 GB each had accumulated over this session. Removed
 them (71 GB free again) and re-verified from scratch. Worth doing at the END of any
 long session that rebuilds repeatedly.
 
+## 2026-08-03 - MiniMax-H3: the video VAE is COMPLETE (encoder + decoder)
+
+The 3D-CNN encoder level loop lands, so both halves of the video VAE are ported and
+gated. The channel plan is the fiddly part and is now pinned:
+`block_mid[i] = ch*ch_mult[i]`, `block_in[0] = block_mid[0]`,
+`block_in[i>0] = block_mid[i-1]`; a level gets a Downsample3D when
+`space_down[i]*time_down[i] > 1`, otherwise a 1x1x1 conv ONLY if its channel count
+changes, and nothing at all when it does not.
+
+**The failure was mine, in the TEST, not the port.** The first run mismatched at
+2.25 with correct shapes. Cause: the generator's scale rule tested `".norm" in name`,
+which silently misses `norm_out.weight` (no leading dot), so generator and test
+seeded that group-norm gain differently. Rule corrected to `"norm" in name`; the
+port needed no change. Same lesson as the reference-video invariant earlier -- when
+a gate fails, establish WHICH side is wrong before touching the implementation. Two
+for two this session, the fixture was at fault.
+
+**Remaining in the lane:** the MM processor (portable); ffmpeg media I/O + MP4
+muxing (ONE dependency decision, needs the project owner); and the device-resident
+FP4 forward plus any speed number (needs a GPU - dgx.casa unreachable, none local).
+

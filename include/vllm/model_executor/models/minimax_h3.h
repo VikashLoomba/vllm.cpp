@@ -535,6 +535,26 @@ std::vector<float> MiniMaxH3ResnetBlock3dForward(const MiniMaxH3ResnetBlock3dCon
                                                  const std::string& prefix,
                                                  const std::vector<float>& x);
 
+struct MiniMaxH3EncoderFcn3dConfig {
+  int64_t ch = 128;
+  std::vector<int64_t> ch_mult = {1, 2, 2, 4, 4, 8};
+  std::vector<int64_t> space_down = {2, 2, 2, 2, 1, 1};
+  std::vector<int64_t> time_down = {1, 2, 2, 1, 1, 1};
+  int64_t num_res_blocks = 2;
+  int64_t in_channels = 3;
+  int64_t z_channels = 24;
+  int64_t t = 0, h = 0, w = 0;
+  int64_t num_groups = 32;
+  double eps = 1e-6;
+};
+
+// The whole 3D-CNN encoder level loop. Conditioning-only: a t2va generation path
+// never calls it.
+std::vector<float> MiniMaxH3EncoderFcn3dForward(const MiniMaxH3EncoderFcn3dConfig& config,
+                                                const MiniMaxH3AudioVaeWeights& weights,
+                                                const std::vector<float>& x,
+                                                MiniMaxH3VideoFrameShape* out_shape);
+
 // --- spatial tiling (klvae.py:192-250) ---
 // Shipped config: tile_size 256, tile_overlap_min 64, vae_ratio 16.
 inline constexpr int64_t kMiniMaxH3VaeTileSize = 256;

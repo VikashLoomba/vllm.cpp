@@ -2243,6 +2243,87 @@ TEST_CASE("minimax_h3: the VAE encoder Downsample3D matches upstream") {
   CHECK(vllm_test::kH3Down3dOutW == config.w / 2);
 }
 
+TEST_CASE("minimax_h3: the whole VAE 3D-CNN encoder matches upstream") {
+  // Completes the video VAE: conv_in -> per level [ResnetBlock3D x N, then a
+  // Downsample3D or a 1x1x1 channel match] -> GroupNorm -> SiLU -> conv_out.
+  // Conditioning-only -- a t2va generation path never calls this.
+  vllm::MiniMaxH3EncoderFcn3dConfig config;
+  config.ch = vllm_test::kH3EncFcnCh;
+  config.ch_mult.assign(vllm_test::kH3EncFcnChMult,
+                        vllm_test::kH3EncFcnChMult + vllm_test::kH3EncFcnLevels);
+  config.space_down.assign(vllm_test::kH3EncFcnSpaceDown,
+                           vllm_test::kH3EncFcnSpaceDown + vllm_test::kH3EncFcnLevels);
+  config.time_down.assign(vllm_test::kH3EncFcnTimeDown,
+                          vllm_test::kH3EncFcnTimeDown + vllm_test::kH3EncFcnLevels);
+  config.num_res_blocks = vllm_test::kH3EncFcnResBlocks;
+  config.in_channels = vllm_test::kH3EncFcnInCh;
+  config.z_channels = vllm_test::kH3EncFcnZCh;
+  config.t = vllm_test::kH3EncFcnT;
+  config.h = vllm_test::kH3EncFcnH;
+  config.w = vllm_test::kH3EncFcnW;
+  config.num_groups = 32;
+  config.eps = 1e-6;
+
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& n, int64_t count, double scale, double offset) {
+    weights.tensors[n] = MakeParam("encfcn." + n, count, scale, offset);
+  };
+
+  const int64_t levels = vllm_test::kH3EncFcnLevels;
+  std::vector<int64_t> block_mid(static_cast<size_t>(levels));
+  for (int64_t i = 0; i < levels; ++i) block_mid[i] = config.ch * config.ch_mult[i];
+  std::vector<int64_t> block_in(static_cast<size_t>(levels));
+  block_in[0] = block_mid[0];
+  for (int64_t i = 1; i < levels; ++i) block_in[i] = block_mid[i - 1];
+
+  put("conv_in.weight", block_in[0] * config.in_channels * 27, 0.1, 0.0);
+  put("conv_in.bias", block_in[0], 0.05, 0.0);
+  for (int64_t l = 0; l < levels; ++l) {
+    for (int64_t b = 0; b < config.num_res_blocks; ++b) {
+      const std::string prefix = "down." + std::to_string(l) + ".block." + std::to_string(b);
+      const int64_t ci = (b == 0) ? block_in[l] : block_mid[l];
+      const int64_t co = block_mid[l];
+      put(prefix + ".norm1.weight", ci, 0.1, 1.0);
+      put(prefix + ".norm1.bias", ci, 0.05, 0.0);
+      put(prefix + ".norm2.weight", co, 0.1, 1.0);
+      put(prefix + ".norm2.bias", co, 0.05, 0.0);
+      put(prefix + ".conv1.weight", co * ci * 27, 0.1, 0.0);
+      put(prefix + ".conv1.bias", co, 0.05, 0.0);
+      put(prefix + ".conv2.weight", co * co * 27, 0.1, 0.0);
+      put(prefix + ".conv2.bias", co, 0.05, 0.0);
+      if (ci != co) {
+        put(prefix + ".nin_shortcut.weight", co * ci, 0.1, 0.0);
+        put(prefix + ".nin_shortcut.bias", co, 0.05, 0.0);
+      }
+    }
+    const std::string ds = "down." + std::to_string(l) + ".downsample";
+    if (config.space_down[l] * config.time_down[l] > 1) {
+      put(ds + ".conv.weight", block_mid[l] * block_mid[l] * 27, 0.1, 0.0);
+      put(ds + ".conv.bias", block_mid[l], 0.05, 0.0);
+    }
+  }
+  const int64_t last = block_mid[levels - 1];
+  put("norm_out.weight", last, 0.1, 1.0);
+  put("norm_out.bias", last, 0.05, 0.0);
+  put("conv_out.weight", config.z_channels * last * 27, 0.1, 0.0);
+  put("conv_out.bias", config.z_channels, 0.05, 0.0);
+
+  const std::vector<float> x = MakeParam(
+      "encfcn.input", config.in_channels * config.t * config.h * config.w, 1.0);
+  vllm::MiniMaxH3VideoFrameShape shape;
+  const std::vector<float> got =
+      vllm::MiniMaxH3EncoderFcn3dForward(config, weights, x, &shape);
+
+  CHECK(shape.channels == config.z_channels);
+  CHECK(shape.t == vllm_test::kH3EncFcnOutT);
+  CHECK(shape.h == vllm_test::kH3EncFcnOutH);
+  CHECK(shape.w == vllm_test::kH3EncFcnOutW);
+  REQUIRE(got.size() == std::size(vllm_test::kH3EncFcnGolden));
+  const double err = MaxAbsDiff(got, vllm_test::kH3EncFcnGolden, got.size());
+  INFO("encoder fcn3d max|diff| = " << err);
+  CHECK(err <= 1e-4);
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

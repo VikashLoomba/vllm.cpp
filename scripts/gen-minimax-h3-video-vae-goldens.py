@@ -302,6 +302,64 @@ def emit_downsample3d(out, src) -> None:
     emit_f32(out, "kH3Down3dGolden", y.reshape(-1))
 
 
+def emit_encoder_fcn3d(out, src) -> None:
+    """Section: the whole EncoderFCN3D level loop.
+
+    conv_in -> per level [num_res_blocks x ResnetBlock3D, then an optional
+    Downsample3D or a 1x1x1 channel-matching conv] -> GroupNorm -> SiLU -> conv_out.
+    The real config is ch 128, ch_mult [1,2,2,4,4,8], space_down [2,2,2,2,1,1],
+    time_down [1,2,2,1,1,1], num_res_blocks 2, embed_dim 24; only the sizes shrink.
+    """
+    cnn = load_bundle(src, "vae_cnn")
+    ch = 32
+    ch_mult = [1, 2]
+    space_down = [2, 1]
+    time_down = [2, 1]
+    num_res_blocks = 1
+    in_channels, z_channels = 3, 4
+    t, hh, ww = 3, 4, 4
+
+    enc = cnn.EncoderFCN3D(
+        ch=ch, ch_mult=ch_mult, space_down=space_down, time_down=time_down,
+        num_res_blocks=num_res_blocks, in_channels=in_channels, z_channels=z_channels,
+        double_z=False, padding_mode="reflect", causal=True,
+    ).eval()
+    state = enc.state_dict()
+    for name, tensor in state.items():
+        scale, offset = (0.1, 0.0)
+        # NOTE "norm" without a leading dot: `norm_out.weight` is a group-norm gain
+        # too, and an earlier `".norm" in name` test silently missed it.
+        if "norm" in name and name.endswith(".weight") and tensor.dim() == 1:
+            scale, offset = 0.1, 1.0
+        elif name.endswith(".bias"):
+            scale = 0.05
+        state[name] = torch.from_numpy(
+            (h3_rand("encfcn." + name, tensor.numel()) * scale + offset).astype(np.float32)
+        ).reshape(tensor.shape)
+    enc.load_state_dict(state, strict=True)
+
+    x = torch.from_numpy(
+        h3_rand("encfcn.input", in_channels * t * hh * ww).astype(np.float32)
+    ).reshape(1, in_channels, t, hh, ww)
+    y = enc(x)
+
+    out.write(f"inline constexpr int64_t kH3EncFcnCh = {ch};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnLevels = {len(ch_mult)};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnResBlocks = {num_res_blocks};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnInCh = {in_channels};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnZCh = {z_channels};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnT = {t};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnH = {hh};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnW = {ww};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnOutT = {int(y.shape[2])};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnOutH = {int(y.shape[3])};\n")
+    out.write(f"inline constexpr int64_t kH3EncFcnOutW = {int(y.shape[4])};\n\n")
+    emit_i64(out, "kH3EncFcnChMult", ch_mult)
+    emit_i64(out, "kH3EncFcnSpaceDown", space_down)
+    emit_i64(out, "kH3EncFcnTimeDown", time_down)
+    emit_f32(out, "kH3EncFcnGolden", y.reshape(-1))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--h3-vae-source", required=True, type=Path,
@@ -410,6 +468,7 @@ def main() -> int:
         emit_tiling(out)
         emit_resnet3d(out, src)
         emit_downsample3d(out, src)
+        emit_encoder_fcn3d(out, src)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out} (ff inner {int(inner)})", file=sys.stderr)
     return 0

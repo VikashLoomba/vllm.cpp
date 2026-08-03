@@ -248,4 +248,104 @@ std::vector<float> MiniMaxH3Downsample3d(const std::vector<float>& x,
   return MiniMaxH3CausalConv3d(input, spec, weight, &bias);
 }
 
+// EncoderFCN3D (vae_cnn.py:177-297): conv_in -> per level [N x ResnetBlock3D,
+// then an optional Downsample3D or a 1x1x1 channel-matching conv] -> GroupNorm ->
+// SiLU -> conv_out. Channel plan per level i:
+//   block_mid[i] = ch * ch_mult[i];  block_in[0] = block_mid[0];
+//   block_in[i>0] = block_mid[i-1];  block_out[i] = block_mid[i].
+// A level gets a Downsample3D when space_down[i]*time_down[i] > 1; otherwise it
+// gets a 1x1x1 conv ONLY if its output channel count differs, and nothing at all
+// when it does not.
+std::vector<float> MiniMaxH3EncoderFcn3dForward(const MiniMaxH3EncoderFcn3dConfig& config,
+                                                const MiniMaxH3AudioVaeWeights& weights,
+                                                const std::vector<float>& x,
+                                                MiniMaxH3VideoFrameShape* out_shape) {
+  const int64_t levels = static_cast<int64_t>(config.ch_mult.size());
+  VT_CHECK(levels > 0, "minimax_h3 encoder3d: ch_mult must not be empty");
+  VT_CHECK(static_cast<int64_t>(config.space_down.size()) == levels &&
+               static_cast<int64_t>(config.time_down.size()) == levels,
+           "minimax_h3 encoder3d: space_down/time_down must match ch_mult");
+
+  std::vector<int64_t> block_mid(static_cast<size_t>(levels));
+  for (int64_t i = 0; i < levels; ++i) block_mid[static_cast<size_t>(i)] = config.ch * config.ch_mult[static_cast<size_t>(i)];
+  std::vector<int64_t> block_in(static_cast<size_t>(levels));
+  block_in[0] = block_mid[0];
+  for (int64_t i = 1; i < levels; ++i) block_in[static_cast<size_t>(i)] = block_mid[static_cast<size_t>(i - 1)];
+
+  int64_t t = config.t, h = config.h, w = config.w;
+  auto conv_spec = [&](int64_t in_ch, int64_t out_ch, int64_t kernel, int64_t pad) {
+    MiniMaxH3Conv3dSpec spec;
+    spec.in_channels = in_ch;
+    spec.out_channels = out_ch;
+    spec.t = t;
+    spec.h = h;
+    spec.w = w;
+    spec.kernel_t = spec.kernel_h = spec.kernel_w = kernel;
+    spec.pad_t = spec.pad_h = spec.pad_w = pad;
+    spec.causal = true;
+    return spec;
+  };
+
+  std::vector<float> hbuf =
+      MiniMaxH3CausalConv3d(x, conv_spec(config.in_channels, block_in[0], 3, 1),
+                            weights.Get("conv_in.weight"), &weights.Get("conv_in.bias"));
+  int64_t channels = block_in[0];
+
+  for (int64_t level = 0; level < levels; ++level) {
+    for (int64_t b = 0; b < config.num_res_blocks; ++b) {
+      MiniMaxH3ResnetBlock3dConfig block;
+      block.in_channels = (b == 0) ? block_in[static_cast<size_t>(level)]
+                                   : block_mid[static_cast<size_t>(level)];
+      block.out_channels = block_mid[static_cast<size_t>(level)];
+      block.t = t;
+      block.h = h;
+      block.w = w;
+      block.num_groups = config.num_groups;
+      block.eps = config.eps;
+      hbuf = MiniMaxH3ResnetBlock3dForward(
+          block, weights,
+          "down." + std::to_string(level) + ".block." + std::to_string(b), hbuf);
+      channels = block.out_channels;
+    }
+
+    const int64_t sd = config.space_down[static_cast<size_t>(level)];
+    const int64_t td = config.time_down[static_cast<size_t>(level)];
+    const std::string prefix = "down." + std::to_string(level) + ".downsample";
+    if (sd * td > 1) {
+      MiniMaxH3Downsample3dConfig down;
+      down.in_channels = channels;
+      down.out_channels = block_mid[static_cast<size_t>(level)];
+      down.t = t;
+      down.h = h;
+      down.w = w;
+      down.time_stride = td;
+      down.space_stride = sd;
+      hbuf = MiniMaxH3Downsample3d(hbuf, down, weights.Get(prefix + ".conv.weight"),
+                                   weights.Get(prefix + ".conv.bias"));
+      // The causal temporal pad means T shrinks by the stride like H and W do.
+      t = (t + 2 - 3) / td + 1;
+      h = (h + 1 - 3) / sd + 1;
+      w = (w + 1 - 3) / sd + 1;
+      channels = down.out_channels;
+    } else if (block_mid[static_cast<size_t>(level)] != channels) {
+      hbuf = MiniMaxH3CausalConv3d(hbuf, conv_spec(channels, block_mid[static_cast<size_t>(level)], 1, 0),
+                                   weights.Get(prefix + ".weight"), &weights.Get(prefix + ".bias"));
+      channels = block_mid[static_cast<size_t>(level)];
+    }
+  }
+
+  MiniMaxH3GroupNorm3d(hbuf, channels, t * h * w, config.num_groups,
+                       weights.Get("norm_out.weight"), weights.Get("norm_out.bias"), config.eps);
+  for (float& v : hbuf) v = v / (1.0f + std::exp(-v));
+  hbuf = MiniMaxH3CausalConv3d(hbuf, conv_spec(channels, config.z_channels, 3, 1),
+                               weights.Get("conv_out.weight"), &weights.Get("conv_out.bias"));
+  if (out_shape != nullptr) {
+    out_shape->channels = config.z_channels;
+    out_shape->t = t;
+    out_shape->h = h;
+    out_shape->w = w;
+  }
+  return hbuf;
+}
+
 }  // namespace vllm

@@ -3401,3 +3401,133 @@ TEST_CASE("minimax_h3: post_quant_conv is a real step, and it is a 1x1x1 channel
   // A channel MIX, not a passthrough: dropping it would change the decoder's input.
   CHECK(got[0] != doctest::Approx(latent[0]));
 }
+
+TEST_CASE("minimax_h3: the encoder loader FUSES q/k/v and gate/up across shards") {
+  // The one loader that transforms rather than renames. HF ships q/k/v and gate/up
+  // SEPARATE (confirmed from the real FL2VA/text_encoder index: 1058 tensors, 64
+  // layers of model.language_model.layers.N.self_attn.{q,k,v}_proj); the port, like
+  // vLLM, consumes them FUSED. Row-concatenation ORDER is load-bearing: the forward
+  // slices qkv_proj at [0,q) / [q,q+kv) / [q+kv,...), so any other order silently
+  // feeds keys into the query path — which would still run, and still be wrong.
+  struct Entry {
+    std::string name;
+    std::vector<int64_t> shape;
+    std::vector<float> values;
+  };
+  const int64_t H = 8, QD = 16, KVD = 4, FF = 12;
+  auto make = [&](const std::string& name, const std::vector<int64_t>& shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    return Entry{name, shape, MakeParam("enc." + name, n, 0.2)};
+  };
+
+  // Two shards, with one layer's tensors SPLIT across them — the case a
+  // single-shard test would miss entirely.
+  std::vector<std::vector<Entry>> shards(2);
+  const std::string lm = "model.language_model.layers.0.";
+  shards[0].push_back(make(lm + "input_layernorm.weight", {H}));
+  shards[0].push_back(make(lm + "post_attention_layernorm.weight", {H}));
+  shards[0].push_back(make(lm + "self_attn.q_proj.weight", {QD, H}));
+  shards[0].push_back(make(lm + "self_attn.q_norm.weight", {4}));
+  shards[0].push_back(make(lm + "self_attn.k_norm.weight", {4}));
+  shards[1].push_back(make(lm + "self_attn.k_proj.weight", {KVD, H}));
+  shards[1].push_back(make(lm + "self_attn.v_proj.weight", {KVD, H}));
+  shards[1].push_back(make(lm + "self_attn.o_proj.weight", {H, QD}));
+  shards[1].push_back(make(lm + "mlp.gate_proj.weight", {FF, H}));
+  shards[1].push_back(make(lm + "mlp.up_proj.weight", {FF, H}));
+  shards[1].push_back(make(lm + "mlp.down_proj.weight", {H, FF}));
+  // A second layer, so truncation has something to cut.
+  const std::string lm1 = "model.language_model.layers.1.";
+  shards[1].push_back(make(lm1 + "input_layernorm.weight", {H}));
+  shards[1].push_back(make(lm1 + "post_attention_layernorm.weight", {H}));
+  shards[1].push_back(make(lm1 + "self_attn.q_proj.weight", {QD, H}));
+  shards[1].push_back(make(lm1 + "self_attn.k_proj.weight", {KVD, H}));
+  shards[1].push_back(make(lm1 + "self_attn.v_proj.weight", {KVD, H}));
+  shards[1].push_back(make(lm1 + "self_attn.q_norm.weight", {4}));
+  shards[1].push_back(make(lm1 + "self_attn.k_norm.weight", {4}));
+  shards[1].push_back(make(lm1 + "self_attn.o_proj.weight", {H, QD}));
+  shards[1].push_back(make(lm1 + "mlp.gate_proj.weight", {FF, H}));
+  shards[1].push_back(make(lm1 + "mlp.up_proj.weight", {FF, H}));
+  shards[1].push_back(make(lm1 + "mlp.down_proj.weight", {H, FF}));
+  // Vision tower: already fused upstream, so it must pass through untouched.
+  shards[0].push_back(make("model.visual.blocks.0.attn.qkv.weight", {3 * H, H}));
+  shards[0].push_back(make("model.visual.patch_embed.proj.bias", {H}));
+  shards[0].push_back(make("model.visual.merger.norm.weight", {H}));
+  // Must NOT be loaded: H3 reads the UNNORMALIZED output, and lm_head is unused.
+  shards[1].push_back(make("model.language_model.norm.weight", {H}));
+  shards[1].push_back(make("lm_head.weight", {4, H}));
+
+  std::vector<std::string> paths;
+  for (size_t s = 0; s < shards.size(); ++s) {
+    std::string header = "{";
+    size_t offset = 0;
+    bool first = true;
+    for (const Entry& e : shards[s]) {
+      if (!first) header += ",";
+      first = false;
+      header += "\"" + e.name + "\":{\"dtype\":\"F32\",\"shape\":[";
+      for (size_t i = 0; i < e.shape.size(); ++i) {
+        if (i) header += ",";
+        header += std::to_string(e.shape[i]);
+      }
+      const size_t nbytes = e.values.size() * sizeof(float);
+      header += "],\"data_offsets\":[" + std::to_string(offset) + "," +
+                std::to_string(offset + nbytes) + "]}";
+      offset += nbytes;
+    }
+    header += "}";
+    const std::string path = "/tmp/minimax_h3_enc_shard" + std::to_string(s) + ".safetensors";
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    const uint64_t n = header.size();
+    std::fwrite(&n, sizeof(n), 1, fh);
+    std::fwrite(header.data(), 1, header.size(), fh);
+    for (const Entry& e : shards[s]) {
+      std::fwrite(e.values.data(), 1, e.values.size() * sizeof(float), fh);
+    }
+    std::fclose(fh);
+    paths.push_back(path);
+  }
+
+  std::vector<vllm::SafetensorsFile> files;
+  for (const std::string& p : paths) files.push_back(vllm::SafetensorsFile::Open(p));
+  const vllm::MiniMaxH3AudioVaeWeights w = vllm::LoadMiniMaxH3EncoderWeights(files);
+
+  // The fusion is byte-exact and IN ORDER: [q_all | k_all | v_all].
+  const std::vector<float>& qkv = w.Get("layers.0.self_attn.qkv_proj.weight");
+  const std::vector<float> q = MakeParam("enc." + lm + "self_attn.q_proj.weight", QD * H, 0.2);
+  const std::vector<float> k = MakeParam("enc." + lm + "self_attn.k_proj.weight", KVD * H, 0.2);
+  const std::vector<float> v = MakeParam("enc." + lm + "self_attn.v_proj.weight", KVD * H, 0.2);
+  REQUIRE(qkv.size() == q.size() + k.size() + v.size());
+  for (size_t i = 0; i < q.size(); ++i) CHECK(qkv[i] == q[i]);
+  for (size_t i = 0; i < k.size(); ++i) CHECK(qkv[q.size() + i] == k[i]);
+  for (size_t i = 0; i < v.size(); ++i) CHECK(qkv[q.size() + k.size() + i] == v[i]);
+
+  const std::vector<float>& gu = w.Get("layers.0.mlp.gate_up_proj.weight");
+  const std::vector<float> gate = MakeParam("enc." + lm + "mlp.gate_proj.weight", FF * H, 0.2);
+  const std::vector<float> up = MakeParam("enc." + lm + "mlp.up_proj.weight", FF * H, 0.2);
+  REQUIRE(gu.size() == gate.size() + up.size());
+  for (size_t i = 0; i < gate.size(); ++i) CHECK(gu[i] == gate[i]);
+  for (size_t i = 0; i < up.size(); ++i) CHECK(gu[gate.size() + i] == up[i]);
+
+  // The separate names must be GONE — leaving them would let a forward silently
+  // read an unfused tensor.
+  CHECK_FALSE(w.Has("layers.0.self_attn.q_proj.weight"));
+  CHECK_FALSE(w.Has("layers.0.mlp.gate_proj.weight"));
+
+  // Vision tower passes through, de-prefixed and unfused.
+  CHECK(w.Has("blocks.0.attn.qkv.weight"));
+  CHECK(w.Has("patch_embed.proj.bias"));
+  CHECK(w.Has("merger.norm.weight"));
+
+  // H3 deltas: NO final norm, no lm_head.
+  CHECK_FALSE(w.Has("norm.weight"));
+  CHECK_FALSE(w.Has("lm_head.weight"));
+
+  // Truncation: H3 keeps min(num_hidden_layers, 50); the file ships more.
+  CHECK(w.Has("layers.1.self_attn.qkv_proj.weight"));
+  const vllm::MiniMaxH3AudioVaeWeights trunc =
+      vllm::LoadMiniMaxH3EncoderWeights(files, /*max_layers=*/1);
+  CHECK(trunc.Has("layers.0.self_attn.qkv_proj.weight"));
+  CHECK_FALSE(trunc.Has("layers.1.self_attn.qkv_proj.weight"));
+}

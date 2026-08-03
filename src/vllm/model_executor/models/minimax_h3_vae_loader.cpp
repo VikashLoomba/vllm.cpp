@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -203,6 +205,88 @@ std::vector<float> MiniMaxH3VideoVaePostQuantConv(const MiniMaxH3AudioVaeWeights
       const float* src = latent.data() + i * elems_per_channel;
       for (int64_t p = 0; p < elems_per_channel; ++p) dst[p] += coeff * src[p];
     }
+  }
+  return out;
+}
+
+
+// --- H3-Encoder (FL2VA/text_encoder) ---------------------------------------
+// The one loader that TRANSFORMS rather than renames: HF ships q/k/v and gate/up
+// SEPARATE, the port (like vLLM) consumes them FUSED. Row-concatenation order is
+// load-bearing — the forward slices qkv_proj at [0, q_width), [q_width,
+// q_width+kv_width), [q_width+kv_width, ...), so any other order silently feeds
+// keys into the query path.
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3EncoderWeights(const std::vector<SafetensorsFile>& shards,
+                                                     int64_t max_layers) {
+  // One index over every shard, so a tensor is found wherever it lives.
+  std::map<std::string, std::pair<size_t, const StTensor*>> index;
+  for (size_t s = 0; s < shards.size(); ++s) {
+    for (const std::string& name : shards[s].Names()) {
+      VT_CHECK(index.count(name) == 0, "minimax_h3 encoder: tensor appears in two shards");
+      index.emplace(name, std::make_pair(s, &shards[s].Get(name)));
+    }
+  }
+  VT_CHECK(!index.empty(), "minimax_h3 encoder: no shards contained any tensor");
+
+  MiniMaxH3AudioVaeWeights out;
+  auto read = [&](const std::string& name) -> std::vector<float> {
+    const auto it = index.find(name);
+    VT_CHECK(it != index.end(), "minimax_h3 encoder: checkpoint is missing a required tensor");
+    return MiniMaxH3ReadSafetensorF32(*it->second.second);
+  };
+  auto has = [&](const std::string& name) { return index.count(name) != 0; };
+
+  const std::string lm = "model.language_model.";
+  const std::string vis = "model.visual.";
+
+  // --- text tower: strip the prefix, FUSE q/k/v and gate/up ---
+  for (int64_t layer = 0;; ++layer) {
+    const std::string src = lm + "layers." + std::to_string(layer) + ".";
+    if (!has(src + "input_layernorm.weight")) break;
+    if (max_layers > 0 && layer >= max_layers) break;
+    const std::string dst = "layers." + std::to_string(layer) + ".";
+
+    out.tensors[dst + "input_layernorm.weight"] = read(src + "input_layernorm.weight");
+    out.tensors[dst + "post_attention_layernorm.weight"] =
+        read(src + "post_attention_layernorm.weight");
+    out.tensors[dst + "self_attn.q_norm.weight"] = read(src + "self_attn.q_norm.weight");
+    out.tensors[dst + "self_attn.k_norm.weight"] = read(src + "self_attn.k_norm.weight");
+    out.tensors[dst + "self_attn.o_proj.weight"] = read(src + "self_attn.o_proj.weight");
+    out.tensors[dst + "mlp.down_proj.weight"] = read(src + "mlp.down_proj.weight");
+
+    // [q_all | k_all | v_all], the order the forward slices.
+    std::vector<float> q = read(src + "self_attn.q_proj.weight");
+    const std::vector<float> k = read(src + "self_attn.k_proj.weight");
+    const std::vector<float> v = read(src + "self_attn.v_proj.weight");
+    q.reserve(q.size() + k.size() + v.size());
+    q.insert(q.end(), k.begin(), k.end());
+    q.insert(q.end(), v.begin(), v.end());
+    out.tensors[dst + "self_attn.qkv_proj.weight"] = std::move(q);
+
+    // [gate | up], matching MergedColumnParallelLinear.
+    std::vector<float> gate = read(src + "mlp.gate_proj.weight");
+    const std::vector<float> up = read(src + "mlp.up_proj.weight");
+    gate.reserve(gate.size() + up.size());
+    gate.insert(gate.end(), up.begin(), up.end());
+    out.tensors[dst + "mlp.gate_up_proj.weight"] = std::move(gate);
+  }
+  VT_CHECK(out.tensors.count("layers.0.self_attn.qkv_proj.weight") != 0,
+           "minimax_h3 encoder: no text-tower layers were loaded");
+
+  if (has(lm + "embed_tokens.weight")) {
+    // Kept: the text forward takes inputs_embeds, so a caller needs this to embed.
+    out.tensors["embed_tokens.weight"] = read(lm + "embed_tokens.weight");
+  }
+  // `model.language_model.norm.weight` is deliberately NOT loaded — H3 reads the
+  // UNNORMALIZED truncated output, and carrying the tensor would imply otherwise.
+
+  // --- vision tower: prefix strip only; HF already ships qkv fused ---
+  for (const auto& kv : index) {
+    const std::string& name = kv.first;
+    if (name.rfind(vis, 0) != 0) continue;
+    const std::string dst = name.substr(vis.size());
+    VT_CHECK(out.tensors.count(dst) == 0, "minimax_h3 encoder: vision name collides");
+    out.tensors[dst] = MiniMaxH3ReadSafetensorF32(*kv.second.second);
   }
   return out;
 }

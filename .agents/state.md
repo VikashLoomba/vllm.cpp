@@ -35637,3 +35637,40 @@ layer truncation). It is INT8 (I8 + weight_scale), so bf16 Qwen3-VL shards remai
 cleaner correctness source; this one is the convenience/size option.
 
 Gate: 45/45 (13342 assertions).
+
+## 2026-08-03 - MiniMax-H3: encoder loader — path 2's loaders are COMPLETE
+
+The last and least trivial of the four. The VAE loaders renamed tensors; this one
+TRANSFORMS them.
+
+The real manifest came free: FL2VA/text_encoder ships model.safetensors.index.json,
+so the complete 1058-tensor name list needed no range request at all. Worth
+remembering - an index JSON is cheaper and more complete than a header prefix.
+
+WHAT IT SHOWED: HF ships `model.language_model.layers.N.self_attn.{q,k,v}_proj` and
+`mlp.{gate,up}_proj` SEPARATE (64 layers). The port, like vLLM, consumes them FUSED
+as `self_attn.qkv_proj` / `mlp.gate_up_proj`. So the loader row-concatenates
+[q_all|k_all|v_all] and [gate|up].
+
+ORDER IS LOAD-BEARING and that is why it is gated element-by-element rather than by
+size: the forward slices qkv_proj at [0,q) / [q,q+kv) / [q+kv,..), so a wrong
+concatenation order still RUNS and silently feeds keys into the query path. The test
+splits ONE layer's tensors across TWO shards, which a single-shard test would never
+exercise.
+
+The VISION tower needs no fusion - HF already ships `attn.qkv` fused and
+`mlp.linear_fc{1,2}` already match our names. Only the `model.visual.` prefix goes.
+
+H3 DELTAS honoured explicitly, and asserted NEGATIVELY:
+  * `model.language_model.norm.weight` is NOT loaded - H3 reads the UNNORMALIZED
+    layer-49 output, and carrying the tensor would imply it is applied.
+  * `lm_head.weight` is NOT loaded - the encoder produces hidden states.
+  * `max_layers` truncates the text tower (H3 keeps min(num_hidden_layers, 50); the
+    file ships 64), which also avoids materializing 14 unused layers of a 32B model.
+
+Gate: 46/46 (13740 assertions).
+
+PATH 2 LOADERS ARE DONE: audio VAE, video VAE, encoder. What remains before a real
+generated video is ASSEMBLY - a driver that opens the four checkpoints, runs the
+pipeline and writes the mp4 - plus the MM processor's image preprocessing on real
+inputs.

@@ -683,6 +683,28 @@ std::vector<float> MiniMaxH3EncoderTextForward(const MiniMaxH3EncoderConfig& con
                                                const uint8_t* visual_pos_mask,
                                                const std::vector<std::vector<float>>& deepstack);
 
+// Materialize the H3-Encoder (FL2VA/text_encoder, 14 shards / 1058 tensors) into
+// the name map both encoder forwards read.
+//
+// Unlike the VAE loaders this one TRANSFORMS tensors, it does not merely rename
+// them. Two fusions, because the port consumes what vLLM consumes rather than what
+// HF ships:
+//   * self_attn.{q,k,v}_proj  ->  self_attn.qkv_proj   (row concat, [q|k|v] order)
+//   * mlp.{gate,up}_proj      ->  mlp.gate_up_proj     (row concat, [gate|up])
+// The VISION tower needs no fusion: HF already ships `attn.qkv` fused, and
+// `mlp.linear_fc{1,2}` already match.
+//
+// Prefixes: `model.language_model.` -> `layers.N....`, `model.visual.` -> stripped.
+//
+// `max_layers` truncates the text tower, which is H3's own behaviour
+// (min(num_hidden_layers, 50) — the file ships 64). 0 keeps every layer.
+//
+// DELIBERATELY NOT LOADED: `model.language_model.norm.weight`. H3 reads the
+// UNNORMALIZED layer-49 output — no final RMSNorm — and loading that tensor would
+// imply it is applied. `lm_head.weight` is a logits head the encoder never uses.
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3EncoderWeights(const std::vector<SafetensorsFile>& shards,
+                                                     int64_t max_layers = 0);
+
 // One vision-tower block (encoder.py:417-481) — the repeated unit of the ViT.
 // Unlike the text tower it uses LayerNorm (with bias), a [q_all|k_all|v_all] qkv
 // layout, fp32 rotary, NON-CAUSAL attention segmented by `cu_seqlens`, and the

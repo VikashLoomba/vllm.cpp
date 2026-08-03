@@ -475,6 +475,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_pipeline.cpp
   src/vllm/model_executor/models/minimax_h3_wav.cpp
   src/vllm/model_executor/models/minimax_h3_mux.cpp
+  src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
   src/vllm/model_executor/models/glm4_weights.cpp

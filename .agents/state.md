@@ -35215,3 +35215,25 @@ So the boundary is now a PROJECT DECISION, not an implementation convenience:
 **Do NOT add process spawning to src/vllm/.** The library retains zero subprocess
 usage, which was the property that motivated the split.
 
+## 2026-08-03 - MiniMax-H3: /v1/videos request contract + job store
+
+The serving surface's LOGIC is implemented and tested; what is left there is
+mechanical glue (registering the two routes on ApiServer and injecting the runner).
+
+Request parsing applies H3's documented defaults (50 steps, flow shift 12 video / 3
+audio), accepts BOTH vLLM-Omni's `extra_params` nesting and a flat top-level
+spelling so a plain client need not nest, and REJECTS malformed input with a
+specific reason rather than silently defaulting - a bad request should be a 400 with
+a cause, never a surprising generation.
+
+The job store enforces queued -> running -> succeeded|failed. Deliberate choices:
+illegal transitions THROW rather than corrupting a finished record; an unknown id is
+REPORTED so the route can 404 instead of returning an empty 200; a succeeded job must
+carry an output path; a failed job never has an empty reason. Concurrent creation
+across 8 threads is asserted to keep ids unique and lose nothing, since the HTTP
+worker pool touches it from several threads.
+
+The library still spawns NOTHING: generation+mux enter as a caller-supplied
+`VideoRunner`, and the ffmpeg invocation lives in examples/ per the developer's
+ratified decision.
+

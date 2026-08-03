@@ -57,6 +57,7 @@ identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 | **MM processor reuse** (H3's processor config on our Qwen3-VL front end) | pass |
 | **WAV serialization** (interleave + 16-bit PCM + clamping) | pass |
 | **Video output: PPM frames + MP4 mux argv** | pass; argv RUN through real ffmpeg -> valid h264 + AAC MP4 |
+| **`/v1/videos` request contract + job store** | pass (4 cases / 63 assertions, incl. concurrency) |
 | **WHOLE t2va path composes** | frames + stereo waveform, correct shapes, finite, in [-1, 1] |
 | **GGUF load -> runnable DiT** | geometry from shapes; a real forward runs off the loaded weights |
 | **NVFP4 load -> runnable DiT** | compressed-tensors triple dequantized; a real forward runs |

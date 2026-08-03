@@ -392,6 +392,14 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
                                              &block.out_proj},
                    normed.t(), rows, nullptr, nullptr, inputs.refiner_cu_seqlens,
                    static_cast<int>(inputs.num_refiner_cu_seqlens - 1), dt, tmp.t());
+      // NOT folded onto vt::kFusedAddRmsNormStd, deliberately. That recipe computes
+      // `residual = x + residual` then `rms_norm(residual)` with NO cast between the
+      // two steps, which is right for f32 but would DROP the bf16 rounding that sits
+      // between them here -- and where the casts happen is exactly what the bf16
+      // golden gates. Folding it only in the f32 branch would add a dtype-conditional
+      // path that helps only the NON-production dtype, on the refiner's small
+      // num_text rows. The fold becomes both correct and free once activations are
+      // true bf16 STORAGE, since then the recipe's own operand stores do the rounding.
       vt::Add(d.q, text_embed.t(), text_embed.t(), tmp.t());
       dt.Apply(text_embed.t());
       vt::RmsNorm(d.q, normed.t(), text_embed.t(), block.norm2, args);
@@ -504,30 +512,29 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
 
     vt::RmsNorm(d.q, normed.t(), stream.t(), block.norm1, block_args);
     dt.Apply(normed.t());
+    // FOLD: _modulate_scale_shift's cast to the stream dtype is done IN the kernel
+    // (round_out), not by a following round_bf16 pass -- one launch instead of two,
+    // and bit-identical because the kernel owns the arithmetic and rounds the same store.
     glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), shift_msa.Ptr<float>(),
                                scale_msa.Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len,
-                               hidden, 6 * hidden);
-    dt.Apply(normed.t());  // _modulate_scale_shift casts its result to the stream dtype
+                               hidden, 6 * hidden, dt.bf16);
     AttentionDev(d, params,
                  AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm, &block.out_proj},
                  normed.t(), seq_len, &d_rope_cache.t(), &d_rope_pos.t(), inputs.cu_seqlens,
                  num_reqs, dt, tmp.t());
     glue->modulate_gate(d.q, stream.t().Ptr<float>(), gate_msa.Ptr<float>(),
                         tmp.t().Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len, hidden,
-                        6 * hidden);
-    dt.Apply(stream.t());
+                        6 * hidden, dt.bf16);
 
     vt::RmsNorm(d.q, normed.t(), stream.t(), block.norm2, block_args);
     dt.Apply(normed.t());
     glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), shift_mlp.Ptr<float>(),
                                scale_mlp.Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len,
-                               hidden, 6 * hidden);
-    dt.Apply(normed.t());
+                               hidden, 6 * hidden, dt.bf16);
     MlpDev(d, params, block.fc1, block.fc2, normed.t(), seq_len, dt, tmp.t());
     glue->modulate_gate(d.q, stream.t().Ptr<float>(), gate_mlp.Ptr<float>(),
                         tmp.t().Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len, hidden,
-                        6 * hidden);
-    dt.Apply(stream.t());
+                        6 * hidden, dt.bf16);
   }
 
   // --- final layer (minimax_h3_transformer.py:724-743) ---
@@ -544,9 +551,7 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
   // The final layer is single-modality, so it indexes by inverse_indices directly.
   glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), final_shift.Ptr<float>(),
                              final_scale.Ptr<float>(), d_inverse.t().Ptr<int32_t>(), seq_len,
-                             hidden, 2 * hidden);
-  // Cast UP before both output heads: they are fp32 islands.
-  dt.Apply(normed.t());
+                             hidden, 2 * hidden, dt.bf16);
 
   DBuf video_all(d, DType::kF32, {seq_len, video_width});
   LinearDev(d, normed.t(), seq_len, hidden, weights.video_out_w, &weights.video_out_b,

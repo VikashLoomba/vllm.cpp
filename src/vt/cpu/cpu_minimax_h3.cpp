@@ -23,29 +23,51 @@
 namespace vt::cpu {
 namespace {
 
+// The scalar half of RoundBf16, shared by the standalone pass and the folded
+// stores below so all three round at exactly the same rule.
+inline float RoundBf16Scalar(float v) {
+  uint32_t bits;
+  std::memcpy(&bits, &v, sizeof(bits));
+  if ((bits & 0x7F800000u) == 0x7F800000u) {
+    bits &= 0xFFFF0000u;
+  } else {
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+  }
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
 // _modulate_scale_shift (minimax_h3_transformer.py:183-192).
 void MiniMaxH3ModulateScaleShift(Queue&, float* x, const float* shift, const float* scale,
                                  const int32_t* idx, int64_t rows, int64_t width,
-                                 int64_t src_stride) {
+                                 int64_t src_stride, bool round_out) {
   for (int64_t r = 0; r < rows; ++r) {
     const int64_t row = idx[r];
     float* dst = x + r * width;
     const float* s = scale + row * src_stride;
     const float* h = shift + row * src_stride;
-    for (int64_t i = 0; i < width; ++i) dst[i] = dst[i] * (1.0f + s[i]) + h[i];
+    for (int64_t i = 0; i < width; ++i) {
+      const float v = dst[i] * (1.0f + s[i]) + h[i];
+      dst[i] = round_out ? RoundBf16Scalar(v) : v;
+    }
   }
 }
 
 // _modulate_gate (minimax_h3_transformer.py:195-204).
 void MiniMaxH3ModulateGate(Queue&, float* residual, const float* gate, const float* other,
                            const int32_t* idx, int64_t rows, int64_t width,
-                           int64_t src_stride) {
+                           int64_t src_stride, bool round_out) {
   for (int64_t r = 0; r < rows; ++r) {
     const int64_t row = idx[r];
     float* dst = residual + r * width;
     const float* g = gate + row * src_stride;
     const float* o = other + r * width;
-    for (int64_t i = 0; i < width; ++i) dst[i] += g[i] * o[i];
+    for (int64_t i = 0; i < width; ++i) {
+      const float v = dst[i] + g[i] * o[i];
+      dst[i] = round_out ? RoundBf16Scalar(v) : v;
+    }
   }
 }
 
@@ -61,15 +83,7 @@ void MiniMaxH3Silu(Queue&, float* x, int64_t n) {
 // agree bit-for-bit or the bf16 gate compares different cast points.
 void MiniMaxH3RoundBf16(Queue&, float* x, int64_t n) {
   for (int64_t i = 0; i < n; ++i) {
-    uint32_t bits;
-    std::memcpy(&bits, &x[i], sizeof(bits));
-    if ((bits & 0x7F800000u) == 0x7F800000u) {  // inf/nan pass through
-      bits &= 0xFFFF0000u;
-    } else {
-      const uint32_t lsb = (bits >> 16) & 1u;
-      bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
-    }
-    std::memcpy(&x[i], &bits, sizeof(bits));
+    x[i] = RoundBf16Scalar(x[i]);
   }
 }
 

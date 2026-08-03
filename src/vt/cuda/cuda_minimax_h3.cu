@@ -47,17 +47,31 @@ void Check(cudaError_t e, const char* what) {
   }
 }
 
+// The scalar half of RoundBf16, shared by the standalone pass and the folded
+// stores so all three round at exactly the same rule.
+__device__ __forceinline__ float RoundBf16Scalar(float v) {
+  unsigned int bits = __float_as_uint(v);
+  if ((bits & 0x7F800000u) == 0x7F800000u) {
+    bits &= 0xFFFF0000u;
+  } else {
+    const unsigned int lsb = (bits >> 16) & 1u;
+    bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+  }
+  return __uint_as_float(bits);
+}
+
 // _modulate_scale_shift (minimax_h3_transformer.py:183-192):
 //   x[r, i] = x[r, i] * (1 + scale[idx[r], i]) + shift[idx[r], i]
 __global__ void ModulateScaleShiftKernel(float* x, const float* shift, const float* scale,
                                          const int32_t* idx, int64_t rows, int64_t width,
-                                         int64_t src_stride) {
+                                         int64_t src_stride, bool round_out) {
   const int64_t n = rows * width;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < n; t += step) {
     const int64_t r = t / width, i = t % width;
     const int64_t row = idx[r];
-    x[t] = x[t] * (1.0f + scale[row * src_stride + i]) + shift[row * src_stride + i];
+    const float v = x[t] * (1.0f + scale[row * src_stride + i]) + shift[row * src_stride + i];
+    x[t] = round_out ? RoundBf16Scalar(v) : v;
   }
 }
 
@@ -65,13 +79,14 @@ __global__ void ModulateScaleShiftKernel(float* x, const float* shift, const flo
 //   residual[r, i] += gate[idx[r], i] * other[r, i]
 __global__ void ModulateGateKernel(float* residual, const float* gate, const float* other,
                                    const int32_t* idx, int64_t rows, int64_t width,
-                                   int64_t src_stride) {
+                                   int64_t src_stride, bool round_out) {
   const int64_t n = rows * width;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < n; t += step) {
     const int64_t r = t / width, i = t % width;
     const int64_t row = idx[r];
-    residual[t] += gate[row * src_stride + i] * other[t];
+    const float v = residual[t] + gate[row * src_stride + i] * other[t];
+    residual[t] = round_out ? RoundBf16Scalar(v) : v;
   }
 }
 
@@ -94,14 +109,7 @@ __global__ void SiluKernel(float* x, int64_t n) {
 __global__ void RoundBf16Kernel(float* x, int64_t n) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < n; t += step) {
-    unsigned int bits = __float_as_uint(x[t]);
-    if ((bits & 0x7F800000u) == 0x7F800000u) {
-      bits &= 0xFFFF0000u;
-    } else {
-      const unsigned int lsb = (bits >> 16) & 1u;
-      bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
-    }
-    x[t] = __uint_as_float(bits);
+    x[t] = RoundBf16Scalar(x[t]);
   }
 }
 
@@ -113,20 +121,21 @@ void RoundBf16Cuda(Queue& q, float* x, int64_t n) {
 
 void ModulateScaleShiftCuda(Queue& q, float* x, const float* shift, const float* scale,
                             const int32_t* idx, int64_t rows, int64_t width,
-                            int64_t src_stride) {
+                            int64_t src_stride, bool round_out) {
   const int64_t n = rows * width;
   if (n == 0) return;
   ModulateScaleShiftKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(x, shift, scale, idx, rows,
-                                                                   width, src_stride);
+                                                                   width, src_stride, round_out);
   Check(cudaGetLastError(), "modulate_scale_shift launch");
 }
 
 void ModulateGateCuda(Queue& q, float* residual, const float* gate, const float* other,
-                      const int32_t* idx, int64_t rows, int64_t width, int64_t src_stride) {
+                      const int32_t* idx, int64_t rows, int64_t width, int64_t src_stride,
+                      bool round_out) {
   const int64_t n = rows * width;
   if (n == 0) return;
   ModulateGateKernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(residual, gate, other, idx, rows,
-                                                             width, src_stride);
+                                                             width, src_stride, round_out);
   Check(cudaGetLastError(), "modulate_gate launch");
 }
 

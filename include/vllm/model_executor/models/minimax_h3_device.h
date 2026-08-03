@@ -52,14 +52,21 @@ struct MiniMaxH3DeviceKernels {
   // at r*src_stride + c*width, so the rows are width-wide but src_stride apart.
   // Passing it explicitly is deliberate: treating the views as contiguous reads
   // the wrong memory and yields a plausible-but-wrong result.
+  // `round_out` folds the stream-dtype bf16 rounding INTO this kernel, replacing a
+  // separate round_bf16 pass. Safe by construction, unlike fusing across a tuned
+  // shared op: this kernel already owns the arithmetic, so rounding its store is
+  // the SAME cast point the unfused {modulate; round_bf16} pair produced -- one
+  // launch instead of two, bit-for-bit identical.
   void (*modulate_scale_shift)(vt::Queue&, float* x, const float* shift, const float* scale,
                                const int32_t* idx, int64_t rows, int64_t width,
-                               int64_t src_stride);
+                               int64_t src_stride, bool round_out);
   // _modulate_gate (minimax_h3_transformer.py:195-204), accumulating in place:
   //   residual[r, i] += gate[idx[r], i] * other[r, i]
   // `src_stride` is the ROW stride of `gate` (see modulate_scale_shift).
+  // `round_out` folds the bf16 rounding in, as for modulate_scale_shift above.
   void (*modulate_gate)(vt::Queue&, float* residual, const float* gate, const float* other,
-                        const int32_t* idx, int64_t rows, int64_t width, int64_t src_stride);
+                        const int32_t* idx, int64_t rows, int64_t width, int64_t src_stride,
+                        bool round_out);
   // Plain elementwise SiLU in place: x[i] = x[i] * sigmoid(x[i]). The shared op
   // set has SiluAndMul / MoeSiluMul (both GATED forms) but no ungated SiLU, which
   // the time embedder (:272-285) and the AdaLN projection (:555-561) both need.

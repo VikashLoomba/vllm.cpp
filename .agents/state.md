@@ -35365,3 +35365,37 @@ Laguna alike - still needs sm_121a on dgx. The FEATURE-TABLE's optimistic
 
 FA2 is a separate hole on that box: the fa2 cell is 8.0,8.6,8.7,8.9,12.0a,12.1a -
 no sm_100, no sm_110 - which is exactly why the MLA/DeepSeek-V2 tests fail there.
+
+## 2026-08-03 - MiniMax-H3: AdaLN modulate + bf16-cast fold (and what was deliberately NOT fused)
+
+Folded the stream-dtype bf16 cast INTO the two AdaLN modulate kernels (`round_out`),
+removing 5 launches per bf16 forward (4 per block + 1 in the final layer). Verified
+BYTE-IDENTICAL on Thor's GPU: same digits as before the fold (2.4063e-3 / 2.05244e-3
+bf16, 1.49012e-7 / 8.9407e-8 f32) and the same 9481-assertion count.
+
+This is the one fold here that is safe BY CONSTRUCTION rather than by argument: these
+kernels already own the arithmetic, so rounding their store is the same cast point
+the unfused {modulate; round_bf16} pair produced. No reduction is involved.
+
+TWO FOLDS DELIBERATELY DECLINED, both for the same underlying reason - fusing across
+a boundary would MOVE a bf16 cast point, and where the casts happen is exactly what
+the bf16 golden gates:
+
+1. The refiner's {vt::Add; vt::RmsNorm} onto the catalog recipe kFusedAddRmsNormStd.
+   That recipe does `residual = x + residual` then `rms_norm(residual)` with NO cast
+   between, which is right for f32 but drops the rounding that belongs between them.
+   Folding only in the f32 branch would add a dtype-conditional path benefiting only
+   the NON-production dtype, over the refiner's small num_text rows. Recorded at the
+   call site so it reads as a decision, not an oversight.
+2. The block stack's {modulate_gate; RmsNorm}. That "add" is a GATED INDEXED add with
+   no catalog recipe, and fusing it into the tuned shared vt::RmsNorm would mean
+   reimplementing that reduction - trading a gated numeric for a launch, the wrong
+   trade while the real lever (FP4) is untouched.
+
+BOTH become correct AND free once activations are true bf16 STORAGE, because then the
+recipes' own operand stores do the rounding. That makes bf16 storage the next lever,
+and it is the same change that would clear the merged-GEMM allowlist entry.
+
+NO SPEED NUMBER is claimed. The only GPU available (Thor sm_110) cannot run the
+production FP4 config and the gate runs at reduced dimensions, so launch count is the
+honest unit of improvement, not wall clock.

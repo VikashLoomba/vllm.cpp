@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -35,6 +36,7 @@
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/multimodal/qwen3vl_processor.h"
 #include "../gguf_builder.h"
 
 #include "vt/device.h"
@@ -2322,6 +2324,81 @@ TEST_CASE("minimax_h3: the whole VAE 3D-CNN encoder matches upstream") {
   const double err = MaxAbsDiff(got, vllm_test::kH3EncFcnGolden, got.size());
   INFO("encoder fcn3d max|diff| = " << err);
   CHECK(err <= 1e-4);
+}
+
+TEST_CASE("minimax_h3: the MM processor is Qwen3-VL reuse, with H3's own config") {
+  // H3's FL2VA/processor is a stock Qwen3VLProcessor, so the MM front end is REUSE
+  // of this project's existing Qwen3-VL processor rather than a new port. What
+  // needed proving is that H3's ACTUAL config parses and drives it correctly --
+  // including the video bounds, which differ from the image ones.
+  const std::string preproc = R"({
+    "size": {"longest_edge": 16777216, "shortest_edge": 65536},
+    "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+    "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
+    "processor_class": "Qwen3VLProcessor",
+    "image_processor_type": "Qwen2VLImageProcessorFast"
+  })";
+  const std::string cfg = R"({
+    "image_token_id": 151655, "vision_start_token_id": 151652,
+    "vision_end_token_id": 151653
+  })";
+  const std::string preproc_path = "/tmp/minimax_h3_preproc.json";
+  const std::string cfg_path = "/tmp/minimax_h3_cfg.json";
+  for (const auto& entry : {std::make_pair(preproc_path, preproc), std::make_pair(cfg_path, cfg)}) {
+    FILE* fh = std::fopen(entry.first.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    std::fwrite(entry.second.data(), 1, entry.second.size(), fh);
+    std::fclose(fh);
+  }
+
+  const vllm::multimodal::Qwen3VLProcessorConfig config =
+      vllm::multimodal::LoadQwen3VLProcessorConfig(preproc_path, cfg_path, "MiniMaxAI/MiniMax-H3");
+  CHECK(config.patch_size == 16);
+  CHECK(config.temporal_patch_size == 2);
+  CHECK(config.merge_size == 2);
+  // H3 normalizes to [-1, 1] with mean/std 0.5 -- NOT the usual CLIP statistics.
+  CHECK(config.image_mean == doctest::Approx(0.5));
+  CHECK(config.image_std == doctest::Approx(0.5));
+  CHECK(config.min_pixels == 65536);
+  CHECK(config.max_pixels == 16777216);
+
+  // The vision tower consumes patches on a `patch_size * merge_size` grid.
+  const int64_t factor = config.patch_size * config.merge_size;
+  CHECK(factor == 32);
+
+  // A 768x1344 canvas (H3's default) already sits on the 32 grid and inside the
+  // budget, so smart_resize must be the IDENTITY -- resizing it would silently
+  // change the conditioning image.
+  const std::array<int64_t, 2> keep =
+      vllm::multimodal::SmartResize(768, 1344, factor, config.min_pixels, config.max_pixels);
+  CHECK(keep[0] == 768);
+  CHECK(keep[1] == 1344);
+
+  // Off-grid inputs snap to the grid and stay inside the pixel budget.
+  for (const auto& wh : {std::make_pair<int64_t, int64_t>(1000, 700),
+                         std::make_pair<int64_t, int64_t>(33, 4000),
+                         std::make_pair<int64_t, int64_t>(4000, 33)}) {
+    const std::array<int64_t, 2> got =
+        vllm::multimodal::SmartResize(wh.first, wh.second, factor, config.min_pixels, config.max_pixels);
+    INFO("smart_resize " << wh.first << "x" << wh.second);
+    CHECK(got[0] % factor == 0);
+    CHECK(got[1] % factor == 0);
+    CHECK(got[0] > 0);
+    CHECK(got[1] > 0);
+  }
+
+  // H3's VIDEO bounds differ from its image bounds (shortest 4096, longest
+  // 25165824) and the video budget includes the TEMPORAL extent.
+  const int64_t video_min = 4096, video_max = 25165824;
+  const std::array<int64_t, 2> video = vllm::multimodal::VideoSmartResize(
+      /*num_frames=*/8, 768, 1344, config.temporal_patch_size, factor, video_min, video_max);
+  CHECK(video[0] % factor == 0);
+  CHECK(video[1] % factor == 0);
+  CHECK(video_min < config.min_pixels);   // video floor is LOWER than the image one
+  CHECK(video_max > config.max_pixels);   // and its ceiling HIGHER
+
+  std::remove(preproc_path.c_str());
+  std::remove(cfg_path.c_str());
 }
 
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {

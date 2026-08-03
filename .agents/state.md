@@ -35087,3 +35087,36 @@ for two this session, the fixture was at fault.
 muxing (ONE dependency decision, needs the project owner); and the device-resident
 FP4 forward plus any speed number (needs a GPU - dgx.casa unreachable, none local).
 
+## 2026-08-03 - MiniMax-H3: MM processor is reuse; ALL PORTABLE WORK IS DONE
+
+H3's FL2VA/processor is a stock Qwen3VLProcessor, so the multimodal front end is
+REUSE of the Qwen3-VL processor this project already ships. What needed proving -
+and is now gated - is that H3's ACTUAL config parses and drives it: patch 16 /
+temporal 2 / merge 2, and notably **image_mean/std 0.5 rather than the usual CLIP
+statistics**, so H3 normalizes to [-1, 1]. The 768x1344 default canvas is proven an
+IDENTITY under smart_resize (resizing it would silently change the conditioning
+image), and H3's VIDEO bounds are asserted looser than its image bounds both ways.
+
+**This closes the last portable item.** Everything outstanding is blocked on
+something that is NOT more porting:
+  1. ffmpeg media I/O + MP4 muxing - ONE dependency decision, belongs to the project
+     owner; it unblocks reference-video INPUT decode and generated-video OUTPUT
+     encode together.
+  2. the device-resident FP4 forward, and therefore ANY speed number - needs a GPU.
+     dgx.casa is unreachable and this workstation has none. The reference forward is
+     deliberately CPU and unoptimized, so the speed work IS that brick.
+
+While updating STATUS I found a sentence that had drifted into self-contradiction
+across successive edits ("the video VAE is COMPLETE ... the 3D-CNN VAE encoder ...
+remain"). Restated it. Worth watching for on any long-running lane: repeated
+in-place edits to a summary line accumulate damage that no checker catches, because
+it is prose rather than structure.
+
+**Final lane state.** Gated against upstream, the checkpoint's own remote code, or
+real checkpoint headers, with no weight bytes checked in: DiT forward (f32 + bf16),
+packed layout, scheduler, request planning, denoise loop, the video VAE COMPLETE
+(ViT3D decoder + 3D-CNN encoder + tiling), the audio VAE decoder, the encoder
+COMPLETE (text + vision towers + MM processor), BOTH quantized loaders (GGUF,
+NVFP4), fl2va/ref2va anchor conditioning, reference-video math, presentation token
+tags, and the assembled t2va pipeline.
+

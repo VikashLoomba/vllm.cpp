@@ -98,7 +98,7 @@ final output heads. Everything else is BF16.
 | Latent packing | `packed_tokens.py` (114 L) | — | **W1 LANDED** (+ round-trip) |
 | Scheduler | `scheduling_..._euler_ancestral.py` (179 L) | — | **W1 LANDED** |
 | Denoise loop | `denoise_loop.py` (249 L) | — | **W2 LANDED** (driver ported, not e2e-gated) |
-| H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 DONE** — text tower at 1.2e-7 (truncation + UNNORMALIZED output + DeepStack) and the FULL vision tower at 6.0e-8 (patch embed, bilinear pos-embed interpolation, 2D rotary, block stack, DeepStack + final mergers). Only the MM processor (image/video preprocessing to patches) remains |
+| H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 COMPLETE** — text tower at 1.2e-7 (truncation + UNNORMALIZED output + DeepStack), the FULL vision tower at 6.0e-8, and the MM processor as REUSE of our existing Qwen3-VL front end, gated on H3's own processor config |
 | Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 DECODER DONE** — the FULL ViT3D decoder (pack, x_embedder, register/cls tokens, 3D RoPE, 36-block stack, norm_out, proj_out, unpatchify) is ported and gated at **8.9e-8**. Tiling and the 3D-CNN encoder (conditioning only) remain. See 5.1 |
 | Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 t2va ASSEMBLED** — the whole path composes and runs (structural e2e gate); fl2va/ref2va conditioning and the torch-RNG noise seed remain |
@@ -167,6 +167,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **VAE encoder ResnetBlock3D** (causal Conv3d + GroupNorm3D) | **exact**; causality PROVEN on the bare convolution |
 | **VAE encoder Downsample3D** (asymmetric pre-pad + strided causal conv) | **exact** |
 | **WHOLE VAE 3D-CNN encoder** (conv_in -> levels -> norm -> conv_out) | **exact** |
+| **MM PROCESSOR reuse** (H3's own processor config through our Qwen3-VL front end) | **pass** — image + video bounds, 0.5 normalization, 32-grid |
 | **WHOLE t2va PATH composes** (layout -> sigmas -> denoise loop -> unpack -> denormalize -> both VAEs) | frames + stereo waveform, correctly shaped, finite, in [-1, 1] |
 | **GGUF LOAD -> runnable DiT** (synthetic ComfyUI-format file) | geometry recovered from shapes; a real forward runs off the loaded weights |
 | **NVFP4 LOAD -> runnable DiT** (synthetic compressed-tensors file) | packed [out, in/2] recovered as logical [out, in]; sidecars excluded; a real forward runs |

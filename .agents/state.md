@@ -35237,3 +35237,44 @@ The library still spawns NOTHING: generation+mux enter as a caller-supplied
 `VideoRunner`, and the ffmpeg invocation lives in examples/ per the developer's
 ratified decision.
 
+
+## 2026-08-03 - MiniMax-H3: /v1/videos routes registered — W7 serving DONE on CPU
+
+The last glue is in: `POST /v1/videos`, `POST /v1/videos/sync` and
+`GET /v1/videos/{id}` now exist on ApiServer, closing W7 for everything that does
+not need a GPU.
+
+Registration follows the server's EXISTING additive/opt-in pattern (the one
+/metrics and /tokenize already use): the routes are registered only when
+`set_video_runner` has been called, so a server built without video support is
+byte-identical to before - no new constructor parameter, no existing caller
+touched.
+
+Two decisions worth recording:
+
+Async means a REAL background worker, not a detached one. `POST /v1/videos`
+returns the job id immediately because a 50-step denoise would otherwise hold an
+HTTP worker for minutes (which is exactly why upstream splits async from /sync).
+The worker is a JOINABLE thread drained in `~ApiServer`; a detached thread would
+outlive `this` and write into a destroyed job store. `~ApiServer` was `= default`
+and now has that body - it is out-of-line already, so no caller changed.
+
+A throwing runner fails the JOB, not the process. The worker catches everything
+(an escaping exception would be std::terminate) and always leaves the job in a
+terminal state, or a poller would wait on "running" forever. The sync twin maps
+the same throw to a 500 carrying the reason.
+
+Gate: 4 new dispatch cases in test_openai_api_server (36 cases / 438 assertions,
+all green) covering no-runner 500, unknown-id 404, sync success returning the
+runner's path, a throwing runner failing the job on BOTH endpoints, and a
+malformed body rejected 400 WITHOUT reaching the runner. Clean full CPU build,
+zero warnings.
+
+One near-miss worth keeping: the new tests first passed the harness temporaries
+(`ServerHarness h(MakeConfig(), ...)`), but the harness stores REFERENCES - every
+existing case binds locals first. Caught by reading the neighbours rather than by
+a crash, which is the kind of bug that would have surfaced later as flaky.
+
+Still PAUSED per the developer's standing directive: the device-resident FP4
+forward, any e2e run on a real quantized checkpoint, and therefore any speed
+number vs vLLM-Omni all need the GPU.

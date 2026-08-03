@@ -2,6 +2,8 @@
 
 ## MiniMax-H3 (omni-modal video+audio DiT) — PENDING; hardware verdict CORRECTED (2026-08-03, `CLAIM-MINIMAX-H3-W0-W2`, `CLAIM-MINIMAX-H3-W6A-W9`)
 
+**Serving (W7) is DONE on CPU as of 2026-08-03**; no SPEED number exists yet — the device-resident FP4 forward, and therefore any comparison against vLLM-Omni, still needs a GPU. Every figure below is a CORRECTNESS gate, not a throughput one.
+
 **Throughput disposition: PENDING — no number is owed yet, and the earlier
 "not reproducible on this project's hardware" verdict is WITHDRAWN.**
 That verdict reasoned from the BF16 release alone (~354 GB, validated on 4x NVIDIA
@@ -58,6 +60,9 @@ identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 | **WAV serialization** (interleave + 16-bit PCM + clamping) | pass |
 | **Video output: PPM frames + MP4 mux argv** | pass; argv RUN through real ffmpeg -> valid h264 + AAC MP4 |
 | **`/v1/videos` request contract + job store** | pass (4 cases / 63 assertions, incl. concurrency) |
+| **`/v1/videos` ROUTE DISPATCH on ApiServer** | pass (4 cases): no-runner 500, unknown-id 404, sync success returns the runner's path, a throwing runner fails the JOB on both endpoints (process survives), malformed body 400 without reaching the runner |
+| **MP4 mux END TO END through the example binary** | pass; 12 PPM frames + WAV -> ffprobe reports h264 / yuv420p + stereo AAC 32 kHz (previously only the argv was validated) |
+| **Full CPU suite with the serving surface landed** | **333/333 pass**, clean build, zero warnings |
 | **WHOLE t2va path composes** | frames + stereo waveform, correct shapes, finite, in [-1, 1] |
 | **GGUF load -> runnable DiT** | geometry from shapes; a real forward runs off the loaded weights |
 | **NVFP4 load -> runnable DiT** | compressed-tensors triple dequantized; a real forward runs |

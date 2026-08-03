@@ -34952,3 +34952,26 @@ and aenum) while letting relative imports resolve.
 video tiling, /v1/videos + MP4 muxing (blocked on a dependency decision), and the
 device-resident forward.
 
+## 2026-08-03 - MiniMax-H3: reference-video geometry + frame schedule
+
+The pure-math half of `reference_video.py` is ported and exact: the canvas pipeline
+(aspect clamp -> 768 short edge -> max-pixel rescale -> nearest multiple of 32) and
+the frame schedule (24 FPS resampled to the 2 FPS Qwen rate, duplicates dropped,
+timestamps averaged per temporal patch with the tail padded by repeating the last).
+
+**A test-authoring lesson.** I added an extra invariant of my own -- "the snapped
+canvas respects the max-pixel budget" -- and it FAILED on 3840x1080 (1920x544 =
+1,044,480 > 1,032,192). The port was right; MY invariant was wrong. Upstream applies
+the budget BEFORE snapping to 32 and never re-checks. I corrected the test rather
+than the port. Worth remembering: when a self-invented invariant fails, check
+whether the REFERENCE actually holds it before touching the implementation.
+
+**DEPENDENCY BOUNDARY, now explicit.** The rest of reference_video.py -- probe,
+transcode, frame extraction, audio decode -- shells out to ffmpeg/soundfile. That is
+the SAME blocker as /v1/videos MP4 muxing: **one dependency decision unlocks
+reference-video INPUT decode and generated-video OUTPUT encode together.** This is
+the single item in the lane that needs a project decision rather than more porting.
+
+**Remaining:** MM processor, presentation.py (ref2va prompt assembly), video tiling,
+the ffmpeg-dependent media I/O above, and the device-resident forward.
+

@@ -234,6 +234,28 @@ std::pair<int64_t, int64_t> MiniMaxH3ReferenceImageShape(int64_t width, int64_t 
 // consecutive values are collapsed and a terminal 0 is appended when needed.
 std::vector<double> MiniMaxH3TimeShiftSigmas(int64_t num_steps, double shift_scale);
 
+// --- reference-video input geometry (reference_video.py) ---
+// Only the PURE-MATH half is ported; probe/transcode/decode shell out to ffmpeg
+// and share the MP4-muxing dependency decision (spec section 5.2).
+inline constexpr int64_t kMiniMaxH3RefVideoShortEdge = 768;
+inline constexpr int64_t kMiniMaxH3RefVideoMaxPixels = 768 * 1344;
+inline constexpr int64_t kMiniMaxH3RefVideoCanvasMultiple = 32;
+inline constexpr int64_t kMiniMaxH3QwenVideoSampleFps = 2;
+inline constexpr int64_t kMiniMaxH3QwenTemporalPatch = 2;
+
+// Reference-video canvas: aspect clamp -> 768 short edge -> max-pixel rescale ->
+// nearest multiple of 32. Returns {width, height}.
+std::pair<int64_t, int64_t> MiniMaxH3ReferenceVideoShape(int64_t width, int64_t height);
+
+struct MiniMaxH3ReferenceVideoSchedule {
+  std::vector<int64_t> indices;          // source frame indices to extract
+  std::vector<double> block_timestamps;  // one per temporal patch
+};
+
+// 24 FPS resampled to the 2 FPS Qwen video rate (duplicate indices dropped), then
+// timestamps averaged per temporal patch with the tail padded by REPEATING the last.
+MiniMaxH3ReferenceVideoSchedule MiniMaxH3ReferenceVideoFrameSchedule(int64_t frame_count);
+
 // The resolved generation plan for one request.
 struct MiniMaxH3ShapePlan {
   int64_t height = 0;

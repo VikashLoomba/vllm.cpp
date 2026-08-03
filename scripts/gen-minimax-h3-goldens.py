@@ -885,6 +885,85 @@ def emit_condition_noise(out, condition_noise, packed_tokens) -> None:
     emit_f32(out, "kH3CondAudioGolden", got_audio)
 
 
+def emit_reference_video(out) -> None:
+    """Section 8: the PURE-MATH half of reference_video.py.
+
+    That module is mostly ffmpeg/soundfile plumbing (probe, transcode, decode),
+    which is blocked on the same external-dependency decision as MP4 muxing. Two
+    pieces are pure arithmetic and are ported and gated here: the reference-video
+    CANVAS geometry (aspect clamp -> 768 short edge -> max-pixel rescale -> nearest
+    multiple of 32) and the FRAME SCHEDULE (24 FPS resampled to the 2 FPS Qwen
+    video sampling rate, then block timestamps averaged over the temporal patch).
+    Restated here from reference_video.py:24-27, 84-103, 201-260 -- importing the
+    module would require ffmpeg on the path.
+    """
+    out.write("// --- section 8: reference-video geometry + frame schedule ---\n")
+
+    fps, sample_fps, temporal_patch = 24.0, 2.0, 2
+    base_short_edge, max_pixels, canvas_multiple = 768, 768 * 1344, 32
+
+    def nearest_multiple(value, multiple):
+        return max(multiple, int(round(float(value) / multiple)) * multiple)
+
+    def reference_video_shape(width, height):
+        ratio = float(width) / float(height)
+        assert 0.25 <= ratio <= 4.0
+        if ratio >= 1.0:
+            tw, th = base_short_edge * ratio, float(base_short_edge)
+        else:
+            tw, th = float(base_short_edge), base_short_edge / ratio
+        area = tw * th
+        if area > max_pixels:
+            scale = math.sqrt(max_pixels / area)
+            tw *= scale
+            th *= scale
+        return nearest_multiple(tw, canvas_multiple), nearest_multiple(th, canvas_multiple)
+
+    shape_cases = [(1920, 1080), (1080, 1920), (1000, 1000), (3840, 1080), (800, 600)]
+    shape_out = []
+    for w, h in shape_cases:
+        sw, sh = reference_video_shape(w, h)
+        shape_out.extend([sw, sh])
+
+    def frame_schedule(frame_count):
+        ratio = fps / sample_fps
+        indices, cursor = [], 0.0
+        while True:
+            frame_index = int(round(cursor))
+            if frame_index >= frame_count:
+                break
+            if not indices or frame_index > indices[-1]:
+                indices.append(frame_index)
+            cursor += ratio
+        timestamps = [i / sample_fps for i in range(len(indices))]
+        timestamps += [timestamps[-1]] * ((-len(timestamps)) % temporal_patch)
+        blocks = [
+            (timestamps[i] + timestamps[i + temporal_patch - 1]) / 2
+            for i in range(0, len(timestamps), temporal_patch)
+        ]
+        return indices, blocks
+
+    frame_cases = [13, 25, 100, 209]
+    idx_flat, idx_lens, blk_flat, blk_lens = [], [], [], []
+    for count in frame_cases:
+        indices, blocks = frame_schedule(count)
+        idx_lens.append(len(indices))
+        blk_lens.append(len(blocks))
+        idx_flat.extend(indices)
+        blk_flat.extend(blocks)
+
+    emit_scalar(out, "kH3RefVidShapeCases", len(shape_cases))
+    emit_scalar(out, "kH3RefVidFrameCases", len(frame_cases))
+    out.write("\n")
+    emit_i64(out, "kH3RefVidShapeInputs", [v for c in shape_cases for v in c])
+    emit_i64(out, "kH3RefVidShapeGolden", shape_out)
+    emit_i64(out, "kH3RefVidFrameCounts", frame_cases)
+    emit_i64(out, "kH3RefVidIndexLens", idx_lens)
+    emit_i64(out, "kH3RefVidIndicesGolden", idx_flat)
+    emit_i64(out, "kH3RefVidBlockLens", blk_lens)
+    emit_f64(out, "kH3RefVidBlockTimestamps", blk_flat)
+
+
 def emit_planner(out, time_request) -> None:
     """Section 6: request planning (time_request.py executed VERBATIM).
 
@@ -1018,6 +1097,7 @@ def main() -> int:
         emit_dit(out, packed)
         emit_planner(out, time_request)
         emit_condition_noise(out, condition_noise, packed_tokens)
+        emit_reference_video(out)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

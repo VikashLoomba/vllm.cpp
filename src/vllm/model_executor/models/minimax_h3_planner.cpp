@@ -199,4 +199,84 @@ MiniMaxH3ShapePlan MiniMaxH3ResolveShape(const std::string& task, double duratio
   return plan;
 }
 
+// ---------------------------------------------------------------------------
+// Reference-video input geometry + frame schedule (reference_video.py)
+//
+// Only the PURE-MATH half of that module is ported here. The rest of it — probe,
+// transcode, frame extraction, audio decode — shells out to ffmpeg/soundfile and
+// is blocked on the SAME external-dependency decision as `/v1/videos` MP4 muxing:
+// one decision unlocks both reference-video INPUT decode and generated-video
+// OUTPUT encode. Recorded in .agents/specs/minimax-h3.md section 5.2.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// _nearest_multiple (reference_video.py:24-26): round-half-to-even (Python's
+// round()), floored at one multiple.
+int64_t NearestMultiple(double value, int64_t multiple) {
+  const int64_t snapped =
+      static_cast<int64_t>(RoundHalfToEven(value / static_cast<double>(multiple))) * multiple;
+  return std::max(multiple, snapped);
+}
+
+}  // namespace
+
+// _reference_video_shape (reference_video.py:84-103). Returns {width, height}.
+std::pair<int64_t, int64_t> MiniMaxH3ReferenceVideoShape(int64_t width, int64_t height) {
+  VT_CHECK(width > 0 && height > 0, "minimax_h3 reference video: dims must be positive");
+  const double ratio = static_cast<double>(width) / static_cast<double>(height);
+  VT_CHECK(ratio >= 0.25 && ratio <= 4.0,
+           "minimax_h3 reference video: aspect ratio must be in [1:4, 4:1]");
+  double target_w, target_h;
+  if (ratio >= 1.0) {
+    target_w = static_cast<double>(kMiniMaxH3RefVideoShortEdge) * ratio;
+    target_h = static_cast<double>(kMiniMaxH3RefVideoShortEdge);
+  } else {
+    target_w = static_cast<double>(kMiniMaxH3RefVideoShortEdge);
+    target_h = static_cast<double>(kMiniMaxH3RefVideoShortEdge) / ratio;
+  }
+  const double area = target_w * target_h;
+  if (area > static_cast<double>(kMiniMaxH3RefVideoMaxPixels)) {
+    const double scale = std::sqrt(static_cast<double>(kMiniMaxH3RefVideoMaxPixels) / area);
+    target_w *= scale;
+    target_h *= scale;
+  }
+  return {NearestMultiple(target_w, kMiniMaxH3RefVideoCanvasMultiple),
+          NearestMultiple(target_h, kMiniMaxH3RefVideoCanvasMultiple)};
+}
+
+// The frame schedule (reference_video.py:208-220, 253-260): resample 24 FPS down
+// to the 2 FPS Qwen video sampling rate, dropping duplicate indices, then average
+// timestamps over each temporal patch (padding the tail by REPEATING the last).
+MiniMaxH3ReferenceVideoSchedule MiniMaxH3ReferenceVideoFrameSchedule(int64_t frame_count) {
+  VT_CHECK(frame_count > 0, "minimax_h3 reference video: frame_count must be positive");
+  MiniMaxH3ReferenceVideoSchedule out;
+  const double ratio =
+      static_cast<double>(kMiniMaxH3Fps) / static_cast<double>(kMiniMaxH3QwenVideoSampleFps);
+  double cursor = 0.0;
+  while (true) {
+    const int64_t frame_index = static_cast<int64_t>(RoundHalfToEven(cursor));
+    if (frame_index >= frame_count) break;
+    if (out.indices.empty() || frame_index > out.indices.back()) out.indices.push_back(frame_index);
+    cursor += ratio;
+  }
+  VT_CHECK(!out.indices.empty(), "minimax_h3 reference video: no frames sampled");
+
+  std::vector<double> timestamps;
+  timestamps.reserve(out.indices.size() + kMiniMaxH3QwenTemporalPatch);
+  for (size_t i = 0; i < out.indices.size(); ++i) {
+    timestamps.push_back(static_cast<double>(i) /
+                         static_cast<double>(kMiniMaxH3QwenVideoSampleFps));
+  }
+  const int64_t pad = (kMiniMaxH3QwenTemporalPatch -
+                       static_cast<int64_t>(timestamps.size()) % kMiniMaxH3QwenTemporalPatch) %
+                      kMiniMaxH3QwenTemporalPatch;
+  for (int64_t i = 0; i < pad; ++i) timestamps.push_back(timestamps.back());
+  for (size_t i = 0; i < timestamps.size(); i += static_cast<size_t>(kMiniMaxH3QwenTemporalPatch)) {
+    out.block_timestamps.push_back(
+        (timestamps[i] + timestamps[i + static_cast<size_t>(kMiniMaxH3QwenTemporalPatch) - 1]) / 2.0);
+  }
+  return out;
+}
+
 }  // namespace vllm

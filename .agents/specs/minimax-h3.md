@@ -102,7 +102,7 @@ final output heads. Everything else is BF16.
 | Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 DECODER DONE** — the FULL ViT3D decoder (pack, x_embedder, register/cls tokens, 3D RoPE, 36-block stack, norm_out, proj_out, unpatchify) is ported and gated at **8.9e-8**. Tiling and the 3D-CNN encoder (conditioning only) remain. See 5.1 |
 | Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 t2va ASSEMBLED** — the whole path composes and runs (structural e2e gate); fl2va/ref2va conditioning and the torch-RNG noise seed remain |
-| Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **PARTIAL** — condition-noise augmentation DONE (row accounting + mix gated); `reference_video.py` / `presentation.py` remain |
+| Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **PARTIAL** — condition-noise augmentation DONE and reference-video GEOMETRY + FRAME SCHEDULE DONE; the rest of `reference_video.py` is ffmpeg plumbing (see 5.2) and `presentation.py` remains |
 | Serving | vllm-omni `/v1/videos`, `/v1/videos/sync` | — | **W7 PENDING** |
 | GGUF arm (ComfyUI format) | `realrebelai/MiniMax-H3_GGUFs` | 15.6 GB (DiT Q3_K_M) | **W9 DONE** — identity name map (gated on the real 535-tensor manifest) PLUS `LoadMiniMaxH3DitFromGguf`: dequantize through the shared GGUF path, recover the geometry from shapes, bind the forward's views |
 | NVFP4 arm | `lilcheaty/MiniMax-H3-NVFP4` | fits | **W10 LOADER DONE** — `LoadMiniMaxH3DitFromNvfp4` dequantizes the compressed-tensors triple through the project's existing NVFP4 path into a runnable DiT. Previously GROUNDED: — the real 1051-tensor manifest is textbook compressed-tensors NVFP4 (U8 packed + E4M3 group-16 `weight_scale` + F32 `weight_scale_2`), i.e. EXACTLY our existing layout; 258 quantized projections, islands unquantized |
@@ -161,6 +161,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **ENCODER vision block** (LayerNorm, fp32 rotary, varlen non-causal, tanh-GELU) | **max abs diff 6.0e-8** + boundary isolation proven |
 | **ENCODER FULL vision tower** (patch embed -> pos interp -> 2D rotary -> blocks -> mergers), ragged 2-image batch | **max abs diff <= 1e-4**, DeepStack + merged both |
 | **CONDITION-NOISE augmentation** (fl2va/ref2va anchors, visual + audio) | **exact** (<= 1e-6), noise supplied so the gate isolates row accounting from torch RNG |
+| **REFERENCE-VIDEO geometry + frame schedule** | **exact** (canvas, sampled indices, block timestamps) |
 | **WHOLE t2va PATH composes** (layout -> sigmas -> denoise loop -> unpack -> denormalize -> both VAEs) | frames + stereo waveform, correctly shaped, finite, in [-1, 1] |
 | **GGUF LOAD -> runnable DiT** (synthetic ComfyUI-format file) | geometry recovered from shapes; a real forward runs off the loaded weights |
 | **NVFP4 LOAD -> runnable DiT** (synthetic compressed-tensors file) | packed [out, in/2] recovered as logical [out, in]; sidecars excluded; a real forward runs |

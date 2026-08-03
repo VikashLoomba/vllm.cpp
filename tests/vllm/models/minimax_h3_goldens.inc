@@ -1444,4 +1444,40 @@ inline constexpr float kH3CondAudioGolden[] = {
     0.256057024f, -0.757549047f,
 };
 
+// --- section 8: reference-video geometry + frame schedule ---
+inline constexpr int64_t kH3RefVidShapeCases = 5;
+inline constexpr int64_t kH3RefVidFrameCases = 4;
+
+inline constexpr int64_t kH3RefVidShapeInputs[] = {
+    1920, 1080, 1080, 1920, 1000, 1000, 3840, 1080, 800, 600,
+};
+
+inline constexpr int64_t kH3RefVidShapeGolden[] = {
+    1344, 768, 768, 1344, 768, 768, 1920, 544, 1024, 768,
+};
+
+inline constexpr int64_t kH3RefVidFrameCounts[] = {
+    13, 25, 100, 209,
+};
+
+inline constexpr int64_t kH3RefVidIndexLens[] = {
+    2, 3, 9, 18,
+};
+
+inline constexpr int64_t kH3RefVidIndicesGolden[] = {
+    0, 12, 0, 12, 24, 0, 12, 24, 36, 48, 60, 72,
+    84, 96, 0, 12, 24, 36, 48, 60, 72, 84, 96, 108,
+    120, 132, 144, 156, 168, 180, 192, 204,
+};
+
+inline constexpr int64_t kH3RefVidBlockLens[] = {
+    1, 2, 5, 9,
+};
+
+inline constexpr double kH3RefVidBlockTimestamps[] = {
+    0.25, 0.25, 1.0, 0.25, 1.25, 2.25,
+    3.25, 4.0, 0.25, 1.25, 2.25, 3.25,
+    4.25, 5.25, 6.25, 7.25, 8.25,
+};
+
 }  // namespace vllm_test

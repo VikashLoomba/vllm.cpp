@@ -1961,6 +1961,55 @@ TEST_CASE("minimax_h3: condition-noise augmentation matches upstream") {
   CHECK_THROWS(vllm::MiniMaxH3AudioCondNoiseAug(clean_audio, {}, 0.999, audio_noise));
 }
 
+TEST_CASE("minimax_h3: reference-video geometry and frame schedule match upstream") {
+  // The PURE-MATH half of reference_video.py. The rest of that module (probe,
+  // transcode, frame extraction, audio decode) shells out to ffmpeg and is blocked
+  // on the same dependency decision as MP4 muxing -- one decision unlocks both
+  // reference-video INPUT decode and generated-video OUTPUT encode.
+  for (int64_t c = 0; c < vllm_test::kH3RefVidShapeCases; ++c) {
+    const std::pair<int64_t, int64_t> got = vllm::MiniMaxH3ReferenceVideoShape(
+        vllm_test::kH3RefVidShapeInputs[c * 2], vllm_test::kH3RefVidShapeInputs[c * 2 + 1]);
+    INFO("shape case " << c);
+    CHECK(got.first == vllm_test::kH3RefVidShapeGolden[c * 2]);
+    CHECK(got.second == vllm_test::kH3RefVidShapeGolden[c * 2 + 1]);
+    // Every canvas must land on the 32 grid.
+    CHECK(got.first % 32 == 0);
+    CHECK(got.second % 32 == 0);
+    // The pixel budget is applied BEFORE the snap to 32, so the snapped canvas
+    // may exceed it slightly -- upstream does not re-check after rounding. Assert
+    // the real invariant (within one grid step on each axis) rather than a
+    // stricter one the reference does not hold to.
+    const int64_t slack = (got.first + 32) * (got.second + 32);
+    CHECK(got.first * got.second <= slack);
+    CHECK(got.first * got.second <=
+          vllm::kMiniMaxH3RefVideoMaxPixels + 32 * (got.first + got.second) + 32 * 32);
+  }
+  // Out-of-range aspect ratios are rejected, not clamped.
+  CHECK_THROWS(vllm::MiniMaxH3ReferenceVideoShape(5000, 100));
+
+  int64_t idx_offset = 0, blk_offset = 0;
+  for (int64_t c = 0; c < vllm_test::kH3RefVidFrameCases; ++c) {
+    const vllm::MiniMaxH3ReferenceVideoSchedule got =
+        vllm::MiniMaxH3ReferenceVideoFrameSchedule(vllm_test::kH3RefVidFrameCounts[c]);
+    INFO("frame case " << c << " count=" << vllm_test::kH3RefVidFrameCounts[c]);
+    REQUIRE(static_cast<int64_t>(got.indices.size()) == vllm_test::kH3RefVidIndexLens[c]);
+    for (size_t i = 0; i < got.indices.size(); ++i) {
+      CHECK(got.indices[i] == vllm_test::kH3RefVidIndicesGolden[idx_offset + i]);
+    }
+    REQUIRE(static_cast<int64_t>(got.block_timestamps.size()) == vllm_test::kH3RefVidBlockLens[c]);
+    for (size_t i = 0; i < got.block_timestamps.size(); ++i) {
+      CHECK(got.block_timestamps[i] ==
+            doctest::Approx(vllm_test::kH3RefVidBlockTimestamps[blk_offset + i]).epsilon(1e-9));
+    }
+    // Indices must be strictly increasing and inside the clip.
+    for (size_t i = 1; i < got.indices.size(); ++i) CHECK(got.indices[i] > got.indices[i - 1]);
+    CHECK(got.indices.back() < vllm_test::kH3RefVidFrameCounts[c]);
+    idx_offset += static_cast<int64_t>(got.indices.size());
+    blk_offset += static_cast<int64_t>(got.block_timestamps.size());
+  }
+  CHECK_THROWS(vllm::MiniMaxH3ReferenceVideoFrameSchedule(0));
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

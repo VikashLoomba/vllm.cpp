@@ -2467,6 +2467,84 @@ TEST_CASE("minimax_h3: the decoded waveform serializes to a valid WAV") {
   CHECK_THROWS(vllm::MiniMaxH3WriteWav(waveform, 3, samples, rate));  // size mismatch
 }
 
+TEST_CASE("minimax_h3: video output -- PPM frames and the MP4 mux command") {
+  // The library produces the ARTIFACTS and BUILDS the argv; the example/server
+  // layer spawns ffmpeg. Both halves here are pure data transforms, so both are
+  // testable without a subprocess.
+  vllm::MiniMaxH3VideoFrameShape shape;
+  shape.channels = 3;
+  shape.t = 2;
+  shape.h = 2;
+  shape.w = 3;
+  const int64_t plane = shape.h * shape.w;
+  std::vector<float> frames(static_cast<size_t>(3 * shape.t * plane), 0.0f);
+  // Frame 1, pixel (0,0): pure red at full scale; (0,1): black; (1,2): white.
+  auto set = [&](int64_t f, int64_t y, int64_t x, float r, float g, float b) {
+    frames[static_cast<size_t>((0 * shape.t + f) * plane + y * shape.w + x)] = r;
+    frames[static_cast<size_t>((1 * shape.t + f) * plane + y * shape.w + x)] = g;
+    frames[static_cast<size_t>((2 * shape.t + f) * plane + y * shape.w + x)] = b;
+  };
+  set(1, 0, 0, 1.0f, -1.0f, -1.0f);
+  set(1, 0, 1, -1.0f, -1.0f, -1.0f);
+  set(1, 1, 2, 1.0f, 1.0f, 1.0f);
+
+  const std::string ppm = vllm::MiniMaxH3WritePpmFrame(frames, shape, 1);
+  const std::string header = "P6\n3 2\n255\n";
+  CHECK(ppm.compare(0, header.size(), header) == 0);
+  REQUIRE(ppm.size() == header.size() + static_cast<size_t>(plane * 3));
+  auto px = [&](int64_t y, int64_t x, int64_t c) {
+    return static_cast<uint8_t>(ppm[header.size() + static_cast<size_t>((y * shape.w + x) * 3 + c)]);
+  };
+  // [-1, 1] maps to [0, 255]; PPM is row-major INTERLEAVED RGB, unlike the
+  // planar [C, T, H, W] the VAE emits.
+  CHECK(px(0, 0, 0) == 255);
+  CHECK(px(0, 0, 1) == 0);
+  CHECK(px(0, 0, 2) == 0);
+  CHECK(px(0, 1, 0) == 0);
+  CHECK(px(1, 2, 0) == 255);
+  CHECK(px(1, 2, 2) == 255);
+  // Mid-grey (0.0) lands mid-range, and a different frame is genuinely different.
+  CHECK(px(1, 0, 0) == 128);
+  CHECK(vllm::MiniMaxH3WritePpmFrame(frames, shape, 0) != ppm);
+  CHECK_THROWS(vllm::MiniMaxH3WritePpmFrame(frames, shape, 2));
+
+  // The mux command.
+  vllm::MiniMaxH3MuxRequest request;
+  request.frame_pattern = "/tmp/h3/frame_%06d.ppm";
+  request.audio_path = "/tmp/h3/audio.wav";
+  request.output_path = "/tmp/h3/out.mp4";
+  request.fps = vllm::kMiniMaxH3Fps;
+  request.crf = 18;
+  const std::vector<std::string> argv = vllm::MiniMaxH3BuildMp4MuxArgs(request);
+
+  auto has = [&](const std::string& token) {
+    return std::find(argv.begin(), argv.end(), token) != argv.end();
+  };
+  CHECK(argv.front() == "ffmpeg");
+  CHECK(argv.back() == request.output_path);
+  CHECK(has("-framerate"));
+  CHECK(has("24"));                 // H3's fixed output frame rate
+  CHECK(has(request.frame_pattern));
+  CHECK(has(request.audio_path));
+  CHECK(has("libx264"));
+  CHECK(has("yuv420p"));            // so every player accepts it
+  CHECK(has("aac"));
+  CHECK(has("-shortest"));          // no trailing silence or orphan video
+  CHECK(has("+faststart"));         // moov atom first => streamable
+
+  // A silent clip must not request an audio codec or -shortest.
+  vllm::MiniMaxH3MuxRequest silent = request;
+  silent.audio_path.clear();
+  const std::vector<std::string> silent_argv = vllm::MiniMaxH3BuildMp4MuxArgs(silent);
+  CHECK(std::find(silent_argv.begin(), silent_argv.end(), "aac") == silent_argv.end());
+  CHECK(std::find(silent_argv.begin(), silent_argv.end(), "-shortest") == silent_argv.end());
+  CHECK(silent_argv.back() == request.output_path);
+
+  vllm::MiniMaxH3MuxRequest bad = request;
+  bad.output_path.clear();
+  CHECK_THROWS(vllm::MiniMaxH3BuildMp4MuxArgs(bad));
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

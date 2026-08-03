@@ -847,6 +847,26 @@ struct MiniMaxH3T2vaResult {
 // Run the whole t2va path. NOISE IS AN INPUT: upstream seeds a torch CPU
 // generator, and reproducing torch's RNG bit-exactly decides WHICH sample you get
 // rather than whether the pipeline is right, so the caller supplies it.
+// --- video output (minimax_h3_mux.cpp) ---
+// `/v1/videos` returns MP4. Upstream shells out to ffmpeg; this LIBRARY does not
+// spawn processes (no precedent in src/vllm/), so it produces the ARTIFACTS and
+// BUILDS the argv, and the example/server layer performs the invocation.
+
+// One frame as binary PPM (P6, 8-bit RGB); ffmpeg reads it natively.
+std::string MiniMaxH3WritePpmFrame(const std::vector<float>& frames,
+                                   const MiniMaxH3VideoFrameShape& shape, int64_t frame_index);
+
+struct MiniMaxH3MuxRequest {
+  std::string frame_pattern;  // printf-style, e.g. ".../frame_%06d.ppm"
+  std::string audio_path;     // WAV path; empty for a silent clip
+  std::string output_path;    // .mp4
+  int64_t fps = kMiniMaxH3Fps;
+  int64_t crf = 18;
+};
+
+// The argv the server layer runs. Pure string assembly — never spawns anything.
+std::vector<std::string> MiniMaxH3BuildMp4MuxArgs(const MiniMaxH3MuxRequest& request);
+
 // Serialize a decoded waveform as RIFF/WAVE 16-bit PCM. The VAE's output is
 // CHANNEL-MAJOR; this interleaves it. Dependency-free, and required under either
 // outcome of the open MP4/muxer dependency decision.

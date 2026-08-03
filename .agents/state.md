@@ -35174,3 +35174,44 @@ processor), BOTH quantized loaders (GGUF, NVFP4), fl2va/ref2va anchor conditioni
 reference-video math, presentation token tags, and the assembled t2va pipeline.
 33/33 test cases, 9207 assertions, no weight bytes checked in.
 
+## 2026-08-03 - MiniMax-H3: video output path done (and validated against real ffmpeg)
+
+The output path is complete: PPM frame serialization + WAV audio + the MP4 mux argv.
+
+**Resolved the dependency question without over-committing.** I had escalated "how
+does this project get a muxer" as a project-owner decision. The resolution actually
+follows from the tree's own shape: the LIBRARY builds the artifacts and the command
+but never spawns a process (`src/vllm/` has no subprocess precedent, and a forking
+library is a different commitment from a Python serving layer that shells out); the
+example/SERVER layer performs the invocation. That mirrors upstream's behaviour while
+keeping the library dependency-free, and it makes both halves unit-testable.
+
+**Validated end to end against real ffmpeg 6.1.1**: the exact argv the library builds
+was run over PPM+WAV written in this project's own formats and produced a VALID MP4 —
+ffprobe confirms h264/yuv420p video plus AAC stereo at 32 kHz. So the command is not
+merely plausible; it works.
+
+Details pinned by the gates: PPM converts PLANAR [C,T,H,W] to row-major INTERLEAVED
+RGB ([-1,1] -> [0,255], clamped); the argv carries yuv420p so every player accepts
+it, `-shortest` so no trailing silence or orphan video leaks in, and `+faststart` so
+the moov atom leads and the file streams; a SILENT clip omits the audio codec and
+`-shortest` entirely.
+
+**What is left in the lane** is now only: the server wiring itself (`/v1/videos`,
+`/v1/videos/sync`, job store) and the GPU-blocked work that remains PAUSED per the
+developer's directive (device-resident FP4 forward, e2e run, any speed number).
+
+## 2026-08-03 - DEVELOPER RATIFICATION: ffmpeg invocation lives in examples ONLY
+
+Recording the decision so it is not re-litigated. Asked whether the muxer should be
+a library dependency, the developer answered: **"re: ffmpeg invocation, correct -
+let's keep in the examples only."**
+
+So the boundary is now a PROJECT DECISION, not an implementation convenience:
+  * `src/vllm/` (the library) builds the ARTIFACTS (PPM frames, WAV audio) and
+    BUILDS the ffmpeg argv - all pure data transforms, unit-tested;
+  * `examples/` (CLI + server) performs the actual INVOCATION.
+
+**Do NOT add process spawning to src/vllm/.** The library retains zero subprocess
+usage, which was the property that motivated the split.
+

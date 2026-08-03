@@ -357,6 +357,32 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
                                            const std::vector<float>& latent, int64_t frames,
                                            int64_t* out_samples);
 
+// ---------------------------------------------------------------------------
+// Video VAE decoder (minimax_h3_video_vae.cpp)
+//
+// The real 560-tensor manifest splits the video VAE cleanly: the ENCODER is the
+// 3D CNN, but the DECODER — the half generation needs — is a 36-block TRANSFORMER.
+// This is that block, the repeated unit.
+// ---------------------------------------------------------------------------
+
+struct MiniMaxH3VideoVaeBlockConfig {
+  int64_t dim = 0;       // embed_dim
+  int64_t heads = 0;
+  int64_t dim_head = 0;
+  int64_t ff_inner = 0;  // w1 emits 2 * ff_inner ([gate | up])
+  double eps = 1e-5;
+};
+
+// One decoder TransformerBlock (base_module.py:200-281), fp32:
+//   h += scale1 * Attention(RMSNorm(h));  h += scale2 * GatedSiLU_FF(RMSNorm(h))
+// `scale1`/`scale2` are learned PER-CHANNEL vectors. NOTE the qkv layout is
+// PER-HEAD INTERLEAVED ([head][q|k|v]), unlike the DiT's [q_all|k_all|v_all].
+// Parameters are looked up by their torch state_dict names under `prefix`.
+std::vector<float> MiniMaxH3VideoVaeBlockForward(const MiniMaxH3VideoVaeBlockConfig& config,
+                                                 const MiniMaxH3AudioVaeWeights& weights,
+                                                 const std::string& prefix,
+                                                 const std::vector<float>& hidden, int64_t seq);
+
 // The checkpoint stores qkv GROUPED per query group as [q_per_group, k, v]; the
 // fused qkv projection wants [q_all, k_all, v_all] (minimax_h3_transformer.py:
 // 139-168). H3 is MHA, so heads_per_group == 1.

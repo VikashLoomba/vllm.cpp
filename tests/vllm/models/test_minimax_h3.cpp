@@ -29,6 +29,7 @@
 #include "minimax_h3_audio_vae_goldens.inc"
 #include "minimax_h3_nvfp4_manifest.inc"
 #include "minimax_h3_video_vae_manifest.inc"
+#include "minimax_h3_video_vae_goldens.inc"
 
 #include "vt/device.h"
 #include "vt/tensor.h"
@@ -980,6 +981,49 @@ TEST_CASE("minimax_h3: the REAL NVFP4 checkpoint lands on our existing NVFP4 lay
     ++matched;
   }
   CHECK(matched == static_cast<int64_t>(contract.size()));
+}
+
+TEST_CASE("minimax_h3: the video VAE decoder block matches the checkpoint's own remote code") {
+  // The shipped decoder is 36 of these blocks, so this is the repeated unit of the
+  // half of the video VAE that generation actually needs. Gated against the
+  // checkpoint's OWN base_module.TransformerBlock, executed at reduced dimensions
+  // by scripts/gen-minimax-h3-video-vae-goldens.py.
+  vllm::MiniMaxH3VideoVaeBlockConfig config;
+  config.dim = vllm_test::kH3VideoVaeBlockDim;
+  config.heads = vllm_test::kH3VideoVaeBlockHeads;
+  config.dim_head = vllm_test::kH3VideoVaeBlockDimHead;
+  config.ff_inner = vllm_test::kH3VideoVaeBlockFfInner;
+  config.eps = 1e-5;
+
+  const int64_t seq = vllm_test::kH3VideoVaeBlockSeq;
+  const int64_t dim = config.dim;
+  const int64_t inner = config.heads * config.dim_head;
+
+  vllm::MiniMaxH3AudioVaeWeights weights;  // the same name-keyed parameter bag
+  auto put = [&](const std::string& suffix, int64_t count, double scale, double offset) {
+    weights.tensors["block." + suffix] = MakeParam("videovae." + suffix, count, scale, offset);
+  };
+  put("norm1.weight", dim, 0.1, 1.0);
+  put("norm2.weight", dim, 0.1, 1.0);
+  put("scale1", dim, 0.3, 0.0);
+  put("scale2", dim, 0.3, 0.0);
+  put("attn.to_qkv.weight", 3 * inner * dim, 0.1, 0.0);
+  put("attn.to_qkv.bias", 3 * inner, 0.05, 0.0);
+  put("attn.to_out.weight", dim * inner, 0.1, 0.0);
+  put("attn.to_out.bias", dim, 0.05, 0.0);
+  put("ff.w1.weight", 2 * config.ff_inner * dim, 0.1, 0.0);
+  put("ff.w1.bias", 2 * config.ff_inner, 0.05, 0.0);
+  put("ff.w2.weight", dim * config.ff_inner, 0.1, 0.0);
+  put("ff.w2.bias", dim, 0.05, 0.0);
+
+  const std::vector<float> hidden = MakeParam("videovae.input", seq * dim, 1.0);
+  const std::vector<float> got =
+      vllm::MiniMaxH3VideoVaeBlockForward(config, weights, "block", hidden, seq);
+
+  REQUIRE(got.size() == std::size(vllm_test::kH3VideoVaeBlockGolden));
+  const double err = MaxAbsDiff(got, vllm_test::kH3VideoVaeBlockGolden, got.size());
+  INFO("video VAE decoder block max|diff| = " << err);
+  CHECK(err <= 1e-5);
 }
 
 TEST_CASE("minimax_h3: the video VAE decoder is a ViT, and its manifest says so") {

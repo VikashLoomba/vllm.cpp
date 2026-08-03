@@ -34703,3 +34703,27 @@ I had over-estimated.
 pipeline; then W10 loader wiring, after which an e2e run on a quantized checkpoint —
 and only then a speed number — is reachable.
 
+## 2026-08-03 - MiniMax-H3 W4 (partial): the video-VAE decoder block is ported
+
+The repeated unit of the 36-block ViT decoder now matches the checkpoint's own
+remote code at **6.0e-8**. Structure per block (all fp32):
+  h += scale1 * Attention(RMSNorm(h))
+  h += scale2 * GatedSiLU_FeedForward(RMSNorm(h))
+with `scale1`/`scale2` LEARNED PER-CHANNEL vectors (not scalars), and per-head RMS
+q/k normalization with NO affine weight.
+
+**The trap this caught, and it would have been nasty:** this ViT's `to_qkv` output
+is PER-HEAD INTERLEAVED. Upstream does `qkv.view(B, S, -1, 3*dim_head)` then
+`chunk(3, dim=-1)`, so the layout is [head0_q | head0_k | head0_v | head1_q | ...]
+— NOT the [q_all | k_all | v_all] the H3 DiT's fused qkv uses. The two are the same
+SIZE, so reading it the DiT way produces no error, no shape mismatch, and a
+plausible-but-wrong image. Only a numeric gate against the real module catches it.
+
+**Tooling note:** the bundle imports a few diffusers symbols (a logger, two mixin
+bases, two no-op decorators). The generator STUBS them rather than pulling the whole
+diffusers dependency in just to run an oracle - cheaper and more reproducible.
+
+**Remains for W4:** the stack surround - `x_embedder`, `mask_token`/`register_tokens`,
+3D RoPE, `norm_out`/`proj_out`, unpatchify, and tiling - plus the 3D-CNN encoder
+(only needed for image/video CONDITIONING, not for generation output).
+

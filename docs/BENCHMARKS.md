@@ -42,10 +42,11 @@ identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 | **AUDIO VAE decoder** vs the checkpoint's own remote code | **max abs diff 4.2e-9** (kaiser-sinc filter 3.0e-8) |
 | **REAL NVFP4 manifest** (1051 tensors) | exact: compressed-tensors triple, group 16, islands unquantized |
 | **REAL video-VAE manifest** (560 tensors) | exact: decoder is a 36-block ViT, encoder the 3D CNN |
+| **VIDEO VAE decoder TransformerBlock** vs the checkpoint's own remote code | **max abs diff 6.0e-8** |
 
 **Reproduce:** `cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF`
 then `cmake --build build-cpu --target test_minimax_h3 -j16 && ./build-cpu/tests/test_minimax_h3`
-(16/16 cases, 5908 assertions). Regenerate goldens with
+(17/17 cases, 5911 assertions). Regenerate goldens with
 `python3 scripts/gen-minimax-h3-goldens.py --vllm-omni <checkout> --out tests/vllm/models/minimax_h3_goldens.inc`;
 regenerate the GGUF manifest by range-fetching the first 4 MiB of the .gguf and running
 `scripts/gen-minimax-h3-gguf-manifest.py`.

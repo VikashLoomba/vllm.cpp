@@ -1480,4 +1480,23 @@ inline constexpr double kH3RefVidBlockTimestamps[] = {
     4.25, 5.25, 6.25, 7.25, 8.25,
 };
 
+// --- section 9: presentation token tags ---
+inline constexpr int64_t kH3PresSpanCount = 5;
+inline constexpr int64_t kH3PresTagCount = 43;
+
+inline constexpr int64_t kH3PresSpanKinds[] = {
+    1, 0, 1, 0, 1,
+};
+
+inline constexpr int64_t kH3PresSpanLens[] = {
+    13, 5, 13, 7, 5,
+};
+
+inline constexpr int64_t kH3PresTagsGolden[] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+    0, 0, 1, 1, 1, 1, 1,
+};
+
 }  // namespace vllm_test

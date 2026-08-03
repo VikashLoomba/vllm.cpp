@@ -286,6 +286,28 @@ std::vector<float> MiniMaxH3RfVToX0(const std::vector<float>& xt, const std::vec
                                     double timestep);
 
 // ---------------------------------------------------------------------------
+// Presentation token tags (presentation.py) — the fl2va vision-span override
+//
+// The denoise loop requires `token_tags` to already carry the presentation's
+// vision spans. A vision block is `<|vision_start|> + pad*count + <|vision_end|>`
+// and the WHOLE block — markers included — is tagged VIDEO; tagging only the pads
+// shifts every AdaLN modulation index after it. Tokenization stays with the caller.
+// ---------------------------------------------------------------------------
+
+struct MiniMaxH3PresentationSpan {
+  enum class Kind { kText, kVision };
+  Kind kind = Kind::kText;
+  int64_t length = 0;  // token count of this span
+};
+
+// Token length of a vision block carrying `pad_count` image/video pads.
+int64_t MiniMaxH3VisionBlockTokenLength(int64_t pad_count);
+
+// AdaLN token tags aligned with a presentation's span layout.
+std::vector<int64_t> MiniMaxH3BuildPresentationTokenTags(
+    const std::vector<MiniMaxH3PresentationSpan>& spans);
+
+// ---------------------------------------------------------------------------
 // Condition-noise augmentation (condition_noise.py) — fl2va / ref2va
 // ---------------------------------------------------------------------------
 

@@ -714,4 +714,38 @@ std::vector<float> MiniMaxH3AudioCondNoiseAug(const std::vector<float>& clean_ro
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Presentation token tags (presentation.py:42-62, 92-129)
+//
+// The prompt presentation interleaves TEXT spans with VISION blocks, and the AdaLN
+// token tags must line up with it. This is the fl2va "vision-span override" the
+// denoise loop requires callers to have applied to `token_tags` before the forward.
+//
+// THE DETAIL THAT MATTERS: a vision block is
+// `<|vision_start|> + pad*count + <|vision_end|>`, and the WHOLE block — markers
+// included — is tagged VIDEO. Tagging only the pads leaves the two markers as TEXT
+// and shifts every AdaLN modulation index after them.
+//
+// Tokenization stays with the caller (it owns the tokenizer); this takes SPAN
+// LENGTHS, which is the part that has to agree with the packed layout.
+// ---------------------------------------------------------------------------
+
+int64_t MiniMaxH3VisionBlockTokenLength(int64_t pad_count) {
+  VT_CHECK(pad_count > 0, "minimax_h3 presentation: vision pad count must be positive");
+  return pad_count + 2;  // the <|vision_start|> / <|vision_end|> markers
+}
+
+std::vector<int64_t> MiniMaxH3BuildPresentationTokenTags(
+    const std::vector<MiniMaxH3PresentationSpan>& spans) {
+  VT_CHECK(!spans.empty(), "minimax_h3 presentation: spans must not be empty");
+  std::vector<int64_t> tags;
+  for (const MiniMaxH3PresentationSpan& span : spans) {
+    VT_CHECK(span.length > 0, "minimax_h3 presentation: span length must be positive");
+    const int64_t tag =
+        span.kind == MiniMaxH3PresentationSpan::Kind::kVision ? kMiniMaxH3TagVideo : kMiniMaxH3TagText;
+    tags.insert(tags.end(), static_cast<size_t>(span.length), tag);
+  }
+  return tags;
+}
+
 }  // namespace vllm

@@ -2063,6 +2063,60 @@ TEST_CASE("minimax_h3: video VAE tiling plan and seam blend match upstream") {
         doctest::Approx(b[static_cast<size_t>(vllm_test::kH3TileBlendExtent)]));
 }
 
+TEST_CASE("minimax_h3: presentation token tags match upstream") {
+  // The fl2va "vision-span override" the denoise loop requires callers to have
+  // applied. The load-bearing detail: a vision block is
+  // <|vision_start|> + pad*count + <|vision_end|>, and the WHOLE block -- markers
+  // included -- is tagged VIDEO. Tagging only the pads leaves two markers as TEXT
+  // and shifts every AdaLN modulation index after them.
+  std::vector<vllm::MiniMaxH3PresentationSpan> spans;
+  for (int64_t i = 0; i < vllm_test::kH3PresSpanCount; ++i) {
+    vllm::MiniMaxH3PresentationSpan span;
+    span.kind = vllm_test::kH3PresSpanKinds[i] == 0
+                    ? vllm::MiniMaxH3PresentationSpan::Kind::kVision
+                    : vllm::MiniMaxH3PresentationSpan::Kind::kText;
+    span.length = vllm_test::kH3PresSpanLens[i];
+    spans.push_back(span);
+  }
+
+  const std::vector<int64_t> tags = vllm::MiniMaxH3BuildPresentationTokenTags(spans);
+  REQUIRE(static_cast<int64_t>(tags.size()) == vllm_test::kH3PresTagCount);
+  REQUIRE(tags.size() == std::size(vllm_test::kH3PresTagsGolden));
+  for (size_t i = 0; i < tags.size(); ++i) CHECK(tags[i] == vllm_test::kH3PresTagsGolden[i]);
+
+  // The tags must only ever be TEXT or VIDEO -- never the audio or padding tags.
+  for (int64_t tag : tags) {
+    CHECK((tag == vllm::kMiniMaxH3TagText || tag == vllm::kMiniMaxH3TagVideo));
+  }
+
+  // A vision block is pad_count + 2 tokens (the two markers).
+  CHECK(vllm::MiniMaxH3VisionBlockTokenLength(3) == 5);
+  CHECK(vllm::MiniMaxH3VisionBlockTokenLength(1) == 3);
+  CHECK_THROWS(vllm::MiniMaxH3VisionBlockTokenLength(0));
+  CHECK_THROWS(vllm::MiniMaxH3BuildPresentationTokenTags({}));
+
+  // Every VIDEO run must be a whole vision block, i.e. its length must equal one
+  // of the emitted vision spans -- proving the markers were tagged with the pads.
+  std::vector<int64_t> video_runs;
+  for (size_t i = 0; i < tags.size();) {
+    if (tags[i] != vllm::kMiniMaxH3TagVideo) {
+      ++i;
+      continue;
+    }
+    size_t j = i;
+    while (j < tags.size() && tags[j] == vllm::kMiniMaxH3TagVideo) ++j;
+    video_runs.push_back(static_cast<int64_t>(j - i));
+    i = j;
+  }
+  std::vector<int64_t> vision_spans;
+  for (const vllm::MiniMaxH3PresentationSpan& span : spans) {
+    if (span.kind == vllm::MiniMaxH3PresentationSpan::Kind::kVision) {
+      vision_spans.push_back(span.length);
+    }
+  }
+  CHECK(video_runs == vision_spans);
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

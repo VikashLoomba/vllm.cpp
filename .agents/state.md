@@ -35002,3 +35002,25 @@ pipeline, and BOTH quantized loaders.
   * device-resident FP4 forward and any speed number - needs a GPU (dgx.casa is
     unreachable; this workstation has none).
 
+## 2026-08-03 - MiniMax-H3: presentation token tags (fl2va vision-span override)
+
+This closes a gap I had explicitly flagged when porting the denoise loop: its
+contract says "token_tags must already carry any fl2va vision-span overrides", and
+nothing in the port produced them. Now it does.
+
+**The load-bearing detail:** a vision block is
+`<|vision_start|> + pad*count + <|vision_end|>`, and the WHOLE block - markers
+included - is tagged VIDEO(0). Tagging only the pads leaves two markers as TEXT(1)
+and shifts every AdaLN modulation index after them. No error, no shape change, just
+wrong modulation for the rest of the sequence. The test proves each VIDEO run in the
+output equals a whole emitted vision span, so an off-by-two cannot pass.
+
+Tokenization deliberately stays with the CALLER (it owns the tokenizer); this owns
+the span -> tag mapping, which is the part that has to agree with the packed layout.
+The gate drives upstream with a stub tokenizer, since only span LENGTHS affect tags.
+
+**Remaining in the lane:** the MM processor and the VAE's 3D-CNN encoder (both
+portable, conditioning-side); ffmpeg media I/O + MP4 muxing (ONE dependency
+decision, needs the project owner); and the device-resident FP4 forward plus any
+speed number (needs a GPU - dgx.casa unreachable, none local).
+

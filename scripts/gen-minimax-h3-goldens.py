@@ -964,6 +964,52 @@ def emit_reference_video(out) -> None:
     emit_f64(out, "kH3RefVidBlockTimestamps", blk_flat)
 
 
+def emit_presentation(out, presentation) -> None:
+    """Section 9: presentation TOKEN TAGS (presentation.py, VERBATIM).
+
+    The prompt presentation interleaves text spans with vision blocks, and the
+    AdaLN token tags must line up with it: TEXT(1) for text, VIDEO(0) for the whole
+    vision block INCLUDING its <|vision_start|>/<|vision_end|> markers. That is the
+    fl2va "vision-span override" the denoise loop requires callers to have applied.
+
+    A stub tokenizer is used because only the LENGTHS matter for tags -- it returns
+    one id per character, which makes each span length exact and predictable.
+    """
+    out.write("// --- section 9: presentation token tags ---\n")
+
+    class _StubTokenizer:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+        def convert_tokens_to_ids(self, token):
+            return 900000 + len(token)
+
+    tokenizer = _StubTokenizer()
+    prompt = "a cat"
+    image_token_counts = [3, 5]
+    tags = presentation.minimax_h3_multi_image_presentation_token_tags(
+        tokenizer, prompt=prompt, image_token_counts=image_token_counts
+    )
+    ids = presentation.minimax_h3_multi_image_presentation_ids(
+        tokenizer, prompt=prompt, image_token_counts=image_token_counts
+    )
+    assert len(ids) == len(tags)
+
+    # The span layout the C++ side reconstructs: label text, vision block, ... prompt.
+    spans = []
+    for index, count in enumerate(image_token_counts, start=1):
+        spans.append((1, len(f"<Picture {index}>: ")))   # TEXT
+        spans.append((0, int(count) + 2))                 # VISION (+start/+end)
+    spans.append((1, len(prompt)))                        # TEXT
+
+    emit_scalar(out, "kH3PresSpanCount", len(spans))
+    emit_scalar(out, "kH3PresTagCount", int(tags.numel()))
+    out.write("\n")
+    emit_i64(out, "kH3PresSpanKinds", [k for k, _ in spans])
+    emit_i64(out, "kH3PresSpanLens", [n for _, n in spans])
+    emit_i64(out, "kH3PresTagsGolden", tags)
+
+
 def emit_planner(out, time_request) -> None:
     """Section 6: request planning (time_request.py executed VERBATIM).
 
@@ -1080,6 +1126,7 @@ def main() -> int:
     packed_sequence = load_upstream(root, "packed_sequence")
     time_request = load_upstream(root, "time_request")
     condition_noise = load_upstream(root, "condition_noise")
+    presentation = load_upstream(root, "presentation")
     packed_tokens = load_upstream(root, "packed_tokens")
     scheduling = load_upstream(root, "scheduling_minimax_h3_euler_ancestral")
 
@@ -1098,6 +1145,7 @@ def main() -> int:
         emit_planner(out, time_request)
         emit_condition_noise(out, condition_noise, packed_tokens)
         emit_reference_video(out)
+        emit_presentation(out, presentation)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

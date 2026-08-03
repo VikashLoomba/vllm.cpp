@@ -35504,3 +35504,39 @@ rather than repeating the CPU path. A matching number would have been ambiguous.
 Generalizes: when a gate's whole point is a DEVICE code path, running it on the CPU
 backend can pass while proving nothing. Look for a discriminator that could only
 differ if the intended kernel ran.
+
+## 2026-08-03 - MiniMax-H3 path 2 begins: audio-VAE checkpoint loader
+
+The VAE/encoder FORWARDS were all gated against the checkpoint's own remote code,
+which proved the MATH. What that could never prove is that the SHIPPED file's
+tensors BIND onto the structs those forwards read. For the audio VAE they do not,
+and reading the real header found two mismatches - both silent-failure shaped:
+
+1. WEIGHT-NORM SPELLING. The checkpoint ships torch's LEGACY weight_norm pair
+   `weight_g` / `weight_v`. The decoder reads `parametrizations.weight.original0` /
+   `original1`, because the generator ran the checkpoint's remote code under a
+   MODERN torch, where weight_norm is a parametrization. Same tensors, different
+   era of torch.
+2. PREFIX. Every BigVGAN tensor is under `decoder.`, but `dec_in_proj.*` - the
+   Conv1d that runs BEFORE BigVGAN - is at the top level.
+
+Neither would have been visible from the forward's own gate. Both came out of an
+HTTP range request over the file's first 2 MiB (1087 tensors, no payload), the same
+technique used for the GGUF/NVFP4/video-VAE manifests.
+
+A THIRD thing surfaced while writing the fixture, and this one was MY bug: I wrote
+the `ups.N.0` weight as [out, in, k]. It is a ConvTranspose1d, so the real shape is
+[in, out, k] with the weight-norm magnitude sized by INPUT channels
+(decoder.ups.0.0.weight_v is [1024, 512, 9], bias [512]). The decoder's own
+precondition caught it - the port was right and the test fixture was wrong. Worth
+remembering: when a fixture fails a precondition, suspect the fixture first if the
+implementation was gated against the oracle.
+
+Gate: 42/42 (12389 assertions). The name mapping is asserted INJECTIVE over the real
+manifest, the shipped geometry (dec_in_proj 32->2048 k=1, conv_pre 2048->1024 k=7,
+conv_post 8->1 k=7) is recovered from manifest SHAPES alone and matches the config
+the decoder was gated with, and an end-to-end load-and-decode over a synthetic file
+written in the SHIPPED spellings produces a finite in-range waveform.
+
+REMAINING for path 2: the video VAE decoder loader (560-tensor manifest already
+gated), and the two encoder towers (likely large reuse of our Qwen3-VL loader).

@@ -40,60 +40,6 @@ float Bf16ToF32(uint16_t bits) {
   return out;
 }
 
-float F16ToF32(uint16_t bits) {
-  const uint32_t sign = (bits >> 15) & 0x1u;
-  const uint32_t exponent = (bits >> 10) & 0x1Fu;
-  const uint32_t mantissa = bits & 0x3FFu;
-  uint32_t out_bits;
-  if (exponent == 0) {
-    if (mantissa == 0) {
-      out_bits = sign << 31;
-    } else {  // subnormal: renormalize
-      uint32_t e = exponent, m = mantissa;
-      int shift = 0;
-      while ((m & 0x400u) == 0) {
-        m <<= 1;
-        ++shift;
-      }
-      m &= 0x3FFu;
-      e = 127 - 15 - shift + 1;
-      out_bits = (sign << 31) | (e << 23) | (m << 13);
-    }
-  } else if (exponent == 0x1F) {
-    out_bits = (sign << 31) | (0xFFu << 23) | (mantissa << 13);
-  } else {
-    out_bits = (sign << 31) | ((exponent - 15 + 127) << 23) | (mantissa << 13);
-  }
-  float out;
-  std::memcpy(&out, &out_bits, sizeof(out));
-  return out;
-}
-
-// Read an UNQUANTIZED island tensor into f32, whatever its storage dtype.
-std::vector<float> ReadPlain(const StTensor& t) {
-  int64_t numel = 1;
-  for (int64_t d : t.shape) numel *= d;
-  std::vector<float> out(static_cast<size_t>(numel));
-  if (t.dtype == "F32") {
-    VT_CHECK(t.nbytes == static_cast<size_t>(numel) * 4,
-             "minimax_h3 nvfp4: F32 tensor span does not match its shape");
-    std::memcpy(out.data(), t.data, t.nbytes);
-  } else if (t.dtype == "BF16") {
-    VT_CHECK(t.nbytes == static_cast<size_t>(numel) * 2,
-             "minimax_h3 nvfp4: BF16 tensor span does not match its shape");
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(t.data);
-    for (int64_t i = 0; i < numel; ++i) out[static_cast<size_t>(i)] = Bf16ToF32(src[i]);
-  } else if (t.dtype == "F16") {
-    VT_CHECK(t.nbytes == static_cast<size_t>(numel) * 2,
-             "minimax_h3 nvfp4: F16 tensor span does not match its shape");
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(t.data);
-    for (int64_t i = 0; i < numel; ++i) out[static_cast<size_t>(i)] = F16ToF32(src[i]);
-  } else {
-    VT_CHECK(false, "minimax_h3 nvfp4: unsupported island dtype (expected F32/BF16/F16)");
-  }
-  return out;
-}
-
 }  // namespace
 
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file) {
@@ -109,7 +55,7 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file) {
     }
     const StTensor& t = file.Get(name);
     if (t.dtype != "U8") {
-      out.storage[name] = ReadPlain(t);
+      out.storage[name] = MiniMaxH3ReadSafetensorF32(t);
       out.shapes[name] = t.shape;
       continue;
     }

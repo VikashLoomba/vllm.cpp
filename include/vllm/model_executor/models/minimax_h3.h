@@ -421,6 +421,34 @@ std::vector<float> MiniMaxH3MaterializeWeightNorm(const std::vector<float>& g,
                                                   const std::vector<float>& v,
                                                   int64_t out_channels);
 
+struct StTensor;
+class SafetensorsFile;
+
+// Read an unquantized safetensors tensor into f32, whatever its storage dtype
+// (F32 / BF16 / F16). Shared by every MiniMax-H3 checkpoint loader.
+std::vector<float> MiniMaxH3ReadSafetensorF32(const StTensor& tensor);
+
+// Materialize the audio VAE decoder's weights from the SHIPPED checkpoint
+// (FL2VA/audio_vae/model.safetensors).
+//
+// The file does NOT use the names the decoder reads, and the two mismatches are
+// exactly the kind that fail silently, so both are gated against the REAL
+// 1087-tensor manifest:
+//
+//  1. WEIGHT-NORM SPELLING. The checkpoint stores torch's LEGACY weight_norm pair
+//     `weight_g` / `weight_v`. The decoder (and the generator that produced its
+//     goldens, running a modern torch) reads the PARAMETRIZATION spelling
+//     `parametrizations.weight.original0` / `original1`. Same tensors, different
+//     era of torch; the loader renames them.
+//  2. PREFIX. Every BigVGAN tensor is under `decoder.`, but `dec_in_proj.*` — the
+//     Conv1d that runs BEFORE BigVGAN — is at the top level.
+//
+// The anti-aliasing `.filter` tensors are SKIPPED: those kaiser-sinc filters are
+// COMPUTED at load (MiniMaxH3KaiserSincFilter1d), never read from the checkpoint.
+// The file also carries the audio ENCODER (`encoder.*`), which generation does not
+// need; it is ignored rather than loaded.
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3AudioVaeWeights(const SafetensorsFile& file);
+
 // Decode one channel of audio latents to a waveform in [-1, 1]. When the weights
 // carry `dec_in_proj` (the checkpoint's Conv1d k=1 from vae_latent_channels to
 // num_mels, applied before BigVGAN — dac_audio_vae.py:218-231) the input is

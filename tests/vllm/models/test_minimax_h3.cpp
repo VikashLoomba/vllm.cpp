@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,7 @@
 #include "minimax_h3_goldens.inc"
 #include "minimax_h3_gguf_manifest.inc"
 #include "minimax_h3_audio_vae_goldens.inc"
+#include "minimax_h3_audio_vae_manifest.inc"
 #include "minimax_h3_nvfp4_manifest.inc"
 #include "minimax_h3_video_vae_manifest.inc"
 #include "minimax_h3_video_vae_goldens.inc"
@@ -2962,4 +2964,237 @@ TEST_CASE("minimax_h3: the KEEP-QUANT GGUF arm matches the dequantized load on C
   }
   vt::Queue q = cuda->CreateQueue();
   CheckKeepQuantForward(q, "cuda");
+}
+
+// ---------------------------------------------------------------------------
+// PATH 2: checkpoint loaders. The VAE/encoder FORWARDS were gated against the
+// checkpoint's own remote code, which proved the MATH. These gate the BINDING:
+// that the SHIPPED file's tensors actually land on the structs those forwards
+// read. For the audio VAE they do not do so directly, and this is where that is
+// caught.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("minimax_h3: the REAL audio-VAE checkpoint maps onto the decoder's names") {
+  // Drive the loader's mapping rules over the REAL 1087-tensor manifest (names +
+  // shapes, captured from the file's own header by range request; no payload).
+  // The two mismatches this pins down are silent-failure shaped:
+  //   * the file ships LEGACY weight_g/weight_v, the decoder reads
+  //     parametrizations.weight.original0/1;
+  //   * BigVGAN is under `decoder.`, but dec_in_proj.* is top level.
+  auto mapped = [](const std::string& name) -> std::string {
+    if (name.rfind("encoder.", 0) == 0) return "";  // audio ENCODER: not decoded
+    std::string key = name;
+    if (key.rfind("decoder.", 0) == 0) key = key.substr(8);
+    if (key.size() >= 7 && key.compare(key.size() - 7, 7, ".filter") == 0) return "";
+    const std::string g = ".weight_g", v = ".weight_v";
+    if (key.size() > g.size() && key.compare(key.size() - g.size(), g.size(), g) == 0) {
+      return key.substr(0, key.size() - g.size()) + ".parametrizations.weight.original0";
+    }
+    if (key.size() > v.size() && key.compare(key.size() - v.size(), v.size(), v) == 0) {
+      return key.substr(0, key.size() - v.size()) + ".parametrizations.weight.original1";
+    }
+    return key;
+  };
+
+  std::set<std::string> decoder_names;
+  int64_t skipped_filters = 0, skipped_encoder = 0, weight_norm_pairs = 0;
+  for (int64_t i = 0; i < vllm_test::kH3AudioVaeTensorCount; ++i) {
+    const std::string name = vllm_test::kH3AudioVaeTensors[i].name;
+    if (name.rfind("encoder.", 0) == 0) {
+      ++skipped_encoder;
+      continue;
+    }
+    const std::string key = mapped(name);
+    if (key.empty()) {
+      ++skipped_filters;
+      continue;
+    }
+    CHECK(decoder_names.insert(key).second);  // the mapping must be INJECTIVE
+    if (key.find(".parametrizations.weight.original") != std::string::npos) ++weight_norm_pairs;
+  }
+
+  // The file really does carry an encoder and really does use the legacy spelling
+  // — if either stopped being true these counts would move, and the loader's
+  // renaming would silently become dead code.
+  CHECK(skipped_encoder > 0);
+  CHECK(skipped_filters > 0);
+  CHECK(weight_norm_pairs > 0);
+
+  // The decoder's own entry points must be present under the MAPPED names.
+  CHECK(decoder_names.count("dec_in_proj.weight") == 1);
+  CHECK(decoder_names.count("dec_in_proj.bias") == 1);
+  CHECK(decoder_names.count("conv_pre.parametrizations.weight.original0") == 1);
+  CHECK(decoder_names.count("conv_pre.parametrizations.weight.original1") == 1);
+  CHECK(decoder_names.count("conv_pre.bias") == 1);
+  CHECK(decoder_names.count("conv_post.parametrizations.weight.original0") == 1);
+  CHECK(decoder_names.count("conv_post.parametrizations.weight.original1") == 1);
+  CHECK(decoder_names.count("activation_post.act.alpha") == 1);
+  CHECK(decoder_names.count("activation_post.act.beta") == 1);
+  CHECK(decoder_names.count("ups.0.0.parametrizations.weight.original0") == 1);
+  CHECK(decoder_names.count("resblocks.0.convs1.0.parametrizations.weight.original0") == 1);
+  CHECK(decoder_names.count("resblocks.0.convs2.0.parametrizations.weight.original1") == 1);
+  CHECK(decoder_names.count("resblocks.0.activations.0.act.alpha") == 1);
+  // Nothing may keep the legacy spelling after mapping.
+  for (const std::string& n : decoder_names) {
+    CHECK(n.find(".weight_g") == std::string::npos);
+    CHECK(n.find(".weight_v") == std::string::npos);
+    CHECK(n.rfind("decoder.", 0) != 0);
+  }
+
+  // The SHIPPED geometry, recovered from the manifest's shapes alone, must equal
+  // the config the decoder was gated with.
+  auto shape_of = [](const std::string& want) {
+    for (int64_t i = 0; i < vllm_test::kH3AudioVaeTensorCount; ++i) {
+      if (want == vllm_test::kH3AudioVaeTensors[i].name) return vllm_test::kH3AudioVaeTensors[i];
+    }
+    FAIL("manifest is missing ", want);
+    return vllm_test::kH3AudioVaeTensors[0];
+  };
+  // dec_in_proj: Conv1d(vae_latent_channels -> num_mels, k=1).
+  const auto dip = shape_of("dec_in_proj.weight");
+  CHECK(dip.rank == 3);
+  CHECK(dip.shape[0] == 2048);  // num_mels
+  CHECK(dip.shape[1] == 32);    // vae latent channels
+  CHECK(dip.shape[2] == 1);     // k = 1
+  // conv_pre: num_mels -> upsample_initial_channel, k=7.
+  const auto pre = shape_of("decoder.conv_pre.weight_v");
+  CHECK(pre.shape[0] == 1024);  // upsample_initial_channel
+  CHECK(pre.shape[1] == 2048);  // num_mels
+  CHECK(pre.shape[2] == 7);
+  // conv_post: 7 upsamples halve 1024 down to 8, then -> 1 channel, k=7.
+  const auto post = shape_of("decoder.conv_post.weight_v");
+  CHECK(post.shape[0] == 1);
+  CHECK(post.shape[1] == 8);
+  CHECK(post.shape[2] == 7);
+}
+
+TEST_CASE("minimax_h3: the audio-VAE loader materializes weights the decoder RUNS") {
+  // The manifest test above gates the NAME mapping against the real checkpoint.
+  // This gates the loader end to end: a real safetensors file, written with the
+  // SHIPPED spellings (decoder. prefix, legacy weight_g/weight_v, kaiser-sinc
+  // filters present), must produce weights the decoder actually decodes with.
+  struct Entry {
+    std::string name, dtype;
+    std::vector<int64_t> shape;
+    std::string bytes;
+  };
+  std::vector<Entry> entries;
+  auto add = [&](const std::string& name, const std::vector<int64_t>& shape) {
+    int64_t numel = 1;
+    for (int64_t d : shape) numel *= d;
+    const std::vector<float> values = MakeParam("stvae." + name, numel, 0.05);
+    entries.push_back({name, "F32", shape,
+                       std::string(reinterpret_cast<const char*>(values.data()),
+                                   values.size() * sizeof(float))});
+  };
+  // A conv, in the checkpoint's LEGACY weight-norm spelling.
+  auto add_conv = [&](const std::string& prefix, int64_t out_ch, int64_t in_ch, int64_t k,
+                      bool bias) {
+    add(prefix + ".weight_g", {out_ch, 1, 1});
+    add(prefix + ".weight_v", {out_ch, in_ch, k});
+    if (bias) add(prefix + ".bias", {out_ch});
+  };
+
+  const int64_t mels = vllm_test::kH3AudioVaeNumMels;
+  const int64_t init_ch = vllm_test::kH3AudioVaeInitialChannel;
+  add_conv("decoder.conv_pre", init_ch, mels, 7, true);
+  // Two upsample stages (rates 2,2 / kernels 4,4), matching the golden config.
+  // ConvTranspose1d stores its weight TRANSPOSED — [in, out, k], with the
+  // weight-norm magnitude sized by INPUT channels — which the real checkpoint
+  // confirms (decoder.ups.0.0.weight_v is [1024, 512, 9], bias [512]).
+  auto add_deconv = [&](const std::string& prefix, int64_t in_ch, int64_t out_ch, int64_t k) {
+    add(prefix + ".weight_g", {in_ch, 1, 1});
+    add(prefix + ".weight_v", {in_ch, out_ch, k});
+    add(prefix + ".bias", {out_ch});
+  };
+  add_deconv("decoder.ups.0.0", init_ch, init_ch / 2, 4);
+  add_deconv("decoder.ups.1.0", init_ch / 2, init_ch / 4, 4);
+  // 3 resblock kernels x 3 dilations, per upsample stage.
+  const std::vector<int64_t> ks = {3, 7, 11};
+  for (int64_t u = 0; u < 2; ++u) {
+    const int64_t ch = u == 0 ? init_ch / 2 : init_ch / 4;
+    for (size_t kidx = 0; kidx < ks.size(); ++kidx) {
+      const std::string rb = "decoder.resblocks." + std::to_string(u * 3 + kidx);
+      for (int64_t c = 0; c < 3; ++c) {
+        add_conv(rb + ".convs1." + std::to_string(c), ch, ch, ks[kidx], true);
+        add_conv(rb + ".convs2." + std::to_string(c), ch, ch, ks[kidx], true);
+      }
+      for (int64_t a = 0; a < 6; ++a) {
+        const std::string act = rb + ".activations." + std::to_string(a);
+        add(act + ".act.alpha", {ch});
+        add(act + ".act.beta", {ch});
+        // Present in the file, and the loader must SKIP them (computed at load).
+        add(act + ".upsample.filter", {1, 1, 12});
+        add(act + ".downsample.lowpass.filter", {1, 1, 12});
+      }
+    }
+  }
+  add("decoder.activation_post.act.alpha", {init_ch / 4});
+  add("decoder.activation_post.act.beta", {init_ch / 4});
+  add("decoder.activation_post.upsample.filter", {1, 1, 12});
+  add_conv("decoder.conv_post", 1, init_ch / 4, 7, false);
+  // The audio ENCODER shares the file and must be ignored.
+  add("encoder.block.0.alpha", {8});
+
+  std::string header = "{";
+  size_t offset = 0;
+  bool first = true;
+  for (const Entry& e : entries) {
+    if (!first) header += ",";
+    first = false;
+    header += "\"" + e.name + "\":{\"dtype\":\"" + e.dtype + "\",\"shape\":[";
+    for (size_t i = 0; i < e.shape.size(); ++i) {
+      if (i) header += ",";
+      header += std::to_string(e.shape[i]);
+    }
+    header += "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + e.bytes.size()) + "]}";
+    offset += e.bytes.size();
+  }
+  header += "}";
+  const std::string path = "/tmp/minimax_h3_audio_vae_loader.safetensors";
+  {
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    const uint64_t n = header.size();
+    std::fwrite(&n, sizeof(n), 1, fh);
+    std::fwrite(header.data(), 1, header.size(), fh);
+    for (const Entry& e : entries) std::fwrite(e.bytes.data(), 1, e.bytes.size(), fh);
+    std::fclose(fh);
+  }
+
+  const vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(path);
+  const vllm::MiniMaxH3AudioVaeWeights w = vllm::LoadMiniMaxH3AudioVaeWeights(st);
+
+  // Renamed, de-prefixed, filters and encoder dropped.
+  CHECK(w.Has("conv_pre.parametrizations.weight.original0"));
+  CHECK(w.Has("conv_pre.parametrizations.weight.original1"));
+  CHECK(w.Has("conv_pre.bias"));
+  CHECK(w.Has("resblocks.0.activations.0.act.alpha"));
+  CHECK_FALSE(w.Has("decoder.conv_pre.weight_g"));   // legacy spelling gone
+  CHECK_FALSE(w.Has("conv_pre.weight_g"));
+  CHECK_FALSE(w.Has("resblocks.0.activations.0.upsample.filter"));  // computed
+  CHECK_FALSE(w.Has("encoder.block.0.alpha"));                      // not decoded
+
+  // And it DECODES: the loaded weights drive the real decoder to a finite,
+  // in-range waveform. This is the step a name-only check cannot reach.
+  vllm::MiniMaxH3AudioVaeConfig cfg;
+  cfg.num_mels = mels;
+  cfg.upsample_initial_channel = init_ch;
+  cfg.upsample_rates = {2, 2};
+  cfg.upsample_kernel_sizes = {4, 4};
+  cfg.resblock_kernel_sizes = ks;
+  cfg.resblock_dilation_sizes = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
+  const int64_t frames = vllm_test::kH3AudioVaeFrames;
+  const std::vector<float> latent = MakeParam("stvae.input", mels * frames, 1.0);
+  int64_t out_samples = 0;
+  const std::vector<float> wave =
+      vllm::MiniMaxH3AudioVaeDecode(cfg, w, latent, frames, &out_samples);
+  CHECK(out_samples == frames * 4);  // two stride-2 upsamples
+  REQUIRE(wave.size() == static_cast<size_t>(out_samples));
+  for (float v : wave) {
+    CHECK(std::isfinite(v));
+    CHECK(v >= -1.0f);
+    CHECK(v <= 1.0f);
+  }
 }

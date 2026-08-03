@@ -378,10 +378,46 @@ struct MiniMaxH3VideoVaeBlockConfig {
 // `scale1`/`scale2` are learned PER-CHANNEL vectors. NOTE the qkv layout is
 // PER-HEAD INTERLEAVED ([head][q|k|v]), unlike the DiT's [q_all|k_all|v_all].
 // Parameters are looked up by their torch state_dict names under `prefix`.
+// `rope_cos`/`rope_sin` are per-TOKEN [seq, rot_dim] (shared across heads) and may
+// be null for the no-RoPE path.
 std::vector<float> MiniMaxH3VideoVaeBlockForward(const MiniMaxH3VideoVaeBlockConfig& config,
                                                  const MiniMaxH3AudioVaeWeights& weights,
                                                  const std::string& prefix,
-                                                 const std::vector<float>& hidden, int64_t seq);
+                                                 const std::vector<float>& hidden, int64_t seq,
+                                                 const float* rope_cos = nullptr,
+                                                 const float* rope_sin = nullptr,
+                                                 int64_t rot_dim = 0);
+
+// The whole ViT3D decoder (vae_vit.py:216-365). Real hyperparameters from the
+// checkpoint's `vit_decoder_kwargs`: 36 layers, 32 heads x 64, RMS norms, qk RMS
+// norm WITHOUT affine, gated SiLU, rope_theta 100.0, rope_dim_ratio 0.75.
+struct MiniMaxH3VideoVaeDecoderConfig {
+  MiniMaxH3VideoVaeBlockConfig block;
+  int64_t num_layers = 36;
+  int64_t in_channels = 24;   // video latent channels
+  int64_t out_channels = 3;   // RGB
+  int64_t patch_size = 16;
+  int64_t patch_size_t = 4;
+  int64_t num_register_tokens = 4;
+  int64_t rope_apply_dim = 48;  // int(dim_head * rope_dim_ratio)
+  double rope_theta = 100.0;
+};
+
+struct MiniMaxH3VideoFrameShape {
+  int64_t channels = 0, t = 0, h = 0, w = 0;
+};
+
+// 3D RoPE tables for one latent grid (RotaryEmbeddingND + create_token_ids).
+void MiniMaxH3VideoVaeRope(int64_t latent_t, int64_t latent_h, int64_t latent_w,
+                           int64_t num_suffix, int64_t rope_apply_dim, double rope_theta,
+                           std::vector<float>* cos_out, std::vector<float>* sin_out);
+
+// Decode a video latent [in_channels, T, H, W] to frames [out_channels, T*pt, H*ps, W*ps].
+std::vector<float> MiniMaxH3VideoVaeDecode(const MiniMaxH3VideoVaeDecoderConfig& config,
+                                           const MiniMaxH3AudioVaeWeights& weights,
+                                           const std::vector<float>& latent, int64_t latent_t,
+                                           int64_t latent_h, int64_t latent_w,
+                                           MiniMaxH3VideoFrameShape* out_shape);
 
 // The checkpoint stores qkv GROUPED per query group as [q_per_group, k, v]; the
 // fused qkv projection wants [q_all, k_all, v_all] (minimax_h3_transformer.py:

@@ -34727,3 +34727,29 @@ diffusers dependency in just to run an oracle - cheaper and more reproducible.
 3D RoPE, `norm_out`/`proj_out`, unpatchify, and tiling - plus the 3D-CNN encoder
 (only needed for image/video CONDITIONING, not for generation output).
 
+## 2026-08-03 - MiniMax-H3 W4: the video-VAE ViT3D decoder is complete
+
+Both VAE DECODERS are now done. The video VAE's full ViT3D decoder reproduces the
+checkpoint's own `ViT3DDecoder` at **8.9e-8** (the block alone was 6.0e-8), at its
+REAL hyperparameters read from `source/config.json::vit_decoder_kwargs`: 36 layers,
+32 heads x 64, rms_norm affine, qk rms_norm WITHOUT affine, gated SiLU,
+rope_theta 100.0, rope_dim_ratio 0.75.
+
+The surround, all now ported: `_pack_tensors_3d` (channels-last flatten),
+`x_embedder`, a suffix of register tokens plus a ZERO cls token, 3D RoPE, the block
+stack, a LayerNorm `norm_out` (note: LAYER norm, while the blocks use RMS),
+`proj_out`, and `_unpack_tensors_3d` back to [C, T*pt, H*ps, W*ps].
+
+**3D RoPE detail worth keeping:** RotaryEmbeddingND builds angles from
+LENGTH-NORMALIZED token ids ((i+0.5)/n mapped to [-1,1)), multiplies by an angle
+scale of 2*pi (use_angle=True), and concatenates the three per-axis frequency blocks
+then TILES the result twice to fill rot_dim. The suffix tokens carry id 0, so their
+cos/sin are 1/0 - i.e. identity - which falls out of initializing the tables that way.
+
+**What remains on the VAE side:** video tiling (vae_tile_size 256, overlap 64) and
+the 3D-CNN ENCODER. The encoder matters only for image/video CONDITIONING
+(fl2va/ref2va), NOT for producing output frames, so a t2va path does not need it.
+
+**Next:** W3 (the H3-Encoder on our Qwen3-VL tower) and W6 (pipeline) are what stand
+between here and an end-to-end t2va run on a quantized checkpoint.
+

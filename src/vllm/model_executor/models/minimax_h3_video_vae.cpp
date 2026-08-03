@@ -23,6 +23,7 @@
 #include "vllm/model_executor/models/minimax_h3.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <string>
@@ -76,7 +77,9 @@ std::vector<float> LinearRows(const std::vector<float>& x, int64_t rows, int64_t
 std::vector<float> MiniMaxH3VideoVaeBlockForward(const MiniMaxH3VideoVaeBlockConfig& config,
                                                  const MiniMaxH3AudioVaeWeights& weights,
                                                  const std::string& prefix,
-                                                 const std::vector<float>& hidden, int64_t seq) {
+                                                 const std::vector<float>& hidden, int64_t seq,
+                                                 const float* rope_cos, const float* rope_sin,
+                                                 int64_t rot_dim) {
   const int64_t dim = config.dim;
   const int64_t heads = config.heads;
   const int64_t dim_head = config.dim_head;
@@ -114,6 +117,26 @@ std::vector<float> MiniMaxH3VideoVaeBlockForward(const MiniMaxH3VideoVaeBlockCon
     // qk RMSNorm has NO affine weight in this checkpoint.
     RmsNormLastDim(q, seq * heads, dim_head, nullptr, config.eps);
     RmsNormLastDim(k, seq * heads, dim_head, nullptr, config.eps);
+
+    // 3D RoPE. cos/sin are per TOKEN (shared across heads) and cover only the
+    // first rot_dim head dims; the rest pass through (func.py:82-102).
+    if (rope_cos != nullptr && rot_dim > 0) {
+      const int64_t half = rot_dim / 2;
+      for (int64_t s = 0; s < seq; ++s) {
+        const float* cos = rope_cos + s * rot_dim;
+        const float* sin = rope_sin + s * rot_dim;
+        for (int64_t head = 0; head < heads; ++head) {
+          for (std::vector<float>* target : {&q, &k}) {
+            float* v = target->data() + (s * heads + head) * dim_head;
+            for (int64_t i = 0; i < half; ++i) {
+              const float lo = v[i], hi = v[i + half];
+              v[i] = lo * cos[i] - hi * sin[i];
+              v[i + half] = hi * cos[i + half] + lo * sin[i + half];
+            }
+          }
+        }
+      }
+    }
 
     // Full (non-causal) attention per head.
     const double scale = 1.0 / std::sqrt(static_cast<double>(dim_head));
@@ -190,6 +213,167 @@ std::vector<float> MiniMaxH3VideoVaeBlockForward(const MiniMaxH3VideoVaeBlockCon
     }
   }
   return h;
+}
+
+// ---------------------------------------------------------------------------
+// The whole ViT3D decoder (vae_vit.py:216-365)
+// ---------------------------------------------------------------------------
+
+// RotaryEmbeddingND (base_module.py:157-196) + create_token_ids
+// (func.py:12-47, "length_normalized"): coordinates are (i + 0.5)/n scaled to
+// [-1, 1), the angle scale is 2*pi (use_angle=True), and the per-axis frequency
+// blocks are concatenated then TILED twice to fill rot_dim.
+void MiniMaxH3VideoVaeRope(int64_t latent_t, int64_t latent_h, int64_t latent_w,
+                           int64_t num_suffix, int64_t rope_apply_dim, double rope_theta,
+                           std::vector<float>* cos_out, std::vector<float>* sin_out) {
+  constexpr int64_t kNDim = 3;
+  VT_CHECK(rope_apply_dim % (2 * kNDim) == 0,
+           "minimax_h3 video vae: rope dim must be divisible by 2 * n_dim");
+  const int64_t freqs = rope_apply_dim / (2 * kNDim);  // arange(0, 1, 2*n/dim) length
+  const int64_t rot_dim = 2 * kNDim * freqs;           // == rope_apply_dim
+  const int64_t patches = latent_t * latent_h * latent_w;
+  const int64_t seq = patches + num_suffix;
+
+  std::vector<double> inv_freq(static_cast<size_t>(freqs));
+  for (int64_t i = 0; i < freqs; ++i) {
+    const double step = static_cast<double>(2 * kNDim) / static_cast<double>(rope_apply_dim);
+    inv_freq[static_cast<size_t>(i)] = 1.0 / std::pow(rope_theta, static_cast<double>(i) * step);
+  }
+  auto coord = [](int64_t index, int64_t size) {
+    return 2.0 * ((static_cast<double>(index) + 0.5) / static_cast<double>(size)) - 1.0;
+  };
+
+  cos_out->assign(static_cast<size_t>(seq * rot_dim), 1.0f);
+  sin_out->assign(static_cast<size_t>(seq * rot_dim), 0.0f);
+  const int64_t half = kNDim * freqs;
+  for (int64_t p = 0; p < patches; ++p) {
+    const int64_t w = p % latent_w;
+    const int64_t h = (p / latent_w) % latent_h;
+    const int64_t t = p / (latent_w * latent_h);
+    const std::array<double, 3> ids = {coord(t, latent_t), coord(h, latent_h), coord(w, latent_w)};
+    for (int64_t axis = 0; axis < kNDim; ++axis) {
+      for (int64_t i = 0; i < freqs; ++i) {
+        const double angle = 2.0 * M_PI * ids[static_cast<size_t>(axis)] *
+                             inv_freq[static_cast<size_t>(i)];
+        const int64_t slot = axis * freqs + i;
+        // .tile(2): the [3 * freqs] block is repeated to fill rot_dim.
+        (*cos_out)[static_cast<size_t>(p * rot_dim + slot)] = static_cast<float>(std::cos(angle));
+        (*sin_out)[static_cast<size_t>(p * rot_dim + slot)] = static_cast<float>(std::sin(angle));
+        (*cos_out)[static_cast<size_t>(p * rot_dim + half + slot)] =
+            static_cast<float>(std::cos(angle));
+        (*sin_out)[static_cast<size_t>(p * rot_dim + half + slot)] =
+            static_cast<float>(std::sin(angle));
+      }
+    }
+  }
+  // The suffix tokens (register tokens + cls) carry id 0 => cos 1, sin 0, which
+  // the assign() above already established.
+}
+
+std::vector<float> MiniMaxH3VideoVaeDecode(const MiniMaxH3VideoVaeDecoderConfig& config,
+                                           const MiniMaxH3AudioVaeWeights& weights,
+                                           const std::vector<float>& latent, int64_t latent_t,
+                                           int64_t latent_h, int64_t latent_w,
+                                           MiniMaxH3VideoFrameShape* out_shape) {
+  const int64_t dim = config.block.dim;
+  const int64_t patches = latent_t * latent_h * latent_w;
+  const int64_t num_suffix = 1 + config.num_register_tokens;  // register tokens + cls
+  const int64_t seq = patches + num_suffix;
+  VT_CHECK(static_cast<int64_t>(latent.size()) == config.in_channels * patches,
+           "minimax_h3 video vae: latent size does not match [C, T, H, W]");
+
+  // _pack_tensors_3d(x, 1, 1): [C,T,H,W] -> [T*H*W, C] (channels last).
+  std::vector<float> tokens(static_cast<size_t>(patches * config.in_channels));
+  for (int64_t p = 0; p < patches; ++p) {
+    for (int64_t c = 0; c < config.in_channels; ++c) {
+      tokens[static_cast<size_t>(p * config.in_channels + c)] =
+          latent[static_cast<size_t>(c * patches + p)];
+    }
+  }
+
+  // x_embedder, then [patches | register_tokens | zero cls].
+  std::vector<float> hidden(static_cast<size_t>(seq * dim), 0.0f);
+  {
+    const std::vector<float> embedded =
+        LinearRows(tokens, patches, config.in_channels, weights.Get("x_embedder.weight"),
+                   &weights.Get("x_embedder.bias"), dim);
+    std::copy(embedded.begin(), embedded.end(), hidden.begin());
+    const std::vector<float>& registers = weights.Get("register_tokens");
+    VT_CHECK(static_cast<int64_t>(registers.size()) == config.num_register_tokens * dim,
+             "minimax_h3 video vae: register_tokens size mismatch");
+    std::copy(registers.begin(), registers.end(), hidden.begin() + patches * dim);
+    // the cls token is an explicit ZERO row (vae_vit.py:311-313)
+  }
+
+  std::vector<float> cos, sin;
+  MiniMaxH3VideoVaeRope(latent_t, latent_h, latent_w, num_suffix, config.rope_apply_dim,
+                        config.rope_theta, &cos, &sin);
+
+  for (int64_t layer = 0; layer < config.num_layers; ++layer) {
+    hidden = MiniMaxH3VideoVaeBlockForward(
+        config.block, weights, "transformer_blocks." + std::to_string(layer), hidden, seq,
+        cos.data(), sin.data(), config.rope_apply_dim);
+  }
+
+  // norm_out is a LAYER norm here (not RMS): subtract the mean too.
+  for (int64_t s = 0; s < seq; ++s) {
+    float* row = hidden.data() + s * dim;
+    double mean = 0.0;
+    for (int64_t i = 0; i < dim; ++i) mean += row[i];
+    mean /= static_cast<double>(dim);
+    double var = 0.0;
+    for (int64_t i = 0; i < dim; ++i) var += (row[i] - mean) * (row[i] - mean);
+    var /= static_cast<double>(dim);
+    const double inv = 1.0 / std::sqrt(var + config.block.eps);
+    const std::vector<float>& w = weights.Get("norm_out.weight");
+    const bool has_bias = weights.Has("norm_out.bias");
+    for (int64_t i = 0; i < dim; ++i) {
+      double value = (row[i] - mean) * inv * w[static_cast<size_t>(i)];
+      if (has_bias) value += weights.Get("norm_out.bias")[static_cast<size_t>(i)];
+      row[i] = static_cast<float>(value);
+    }
+  }
+
+  // proj_out, then drop the suffix rows.
+  const int64_t patch_dim =
+      config.out_channels * config.patch_size_t * config.patch_size * config.patch_size;
+  const std::vector<float> projected =
+      LinearRows(hidden, seq, dim, weights.Get("proj_out.weight"), &weights.Get("proj_out.bias"),
+                 patch_dim);
+
+  // _unpack_tensors_3d: [patches, C*pt*ps*ps] -> [C, T*pt, H*ps, W*ps].
+  const int64_t pt = config.patch_size_t, ps = config.patch_size;
+  const int64_t video_t = latent_t * pt, video_h = latent_h * ps, video_w = latent_w * ps;
+  std::vector<float> frames(
+      static_cast<size_t>(config.out_channels * video_t * video_h * video_w));
+  for (int64_t ti = 0; ti < latent_t; ++ti) {
+    for (int64_t hi = 0; hi < latent_h; ++hi) {
+      for (int64_t wi = 0; wi < latent_w; ++wi) {
+        const int64_t row = (ti * latent_h + hi) * latent_w + wi;
+        int64_t k = 0;
+        for (int64_t c = 0; c < config.out_channels; ++c) {
+          for (int64_t r = 0; r < pt; ++r) {
+            for (int64_t p = 0; p < ps; ++p) {
+              for (int64_t q = 0; q < ps; ++q) {
+                const int64_t dst =
+                    ((c * video_t + ti * pt + r) * video_h + hi * ps + p) * video_w + wi * ps + q;
+                frames[static_cast<size_t>(dst)] =
+                    projected[static_cast<size_t>(row * patch_dim + k)];
+                ++k;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (out_shape != nullptr) {
+    out_shape->channels = config.out_channels;
+    out_shape->t = video_t;
+    out_shape->h = video_h;
+    out_shape->w = video_w;
+  }
+  return frames;
 }
 
 }  // namespace vllm

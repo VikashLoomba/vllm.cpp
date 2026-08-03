@@ -99,7 +99,7 @@ final output heads. Everything else is BF16.
 | Scheduler | `scheduling_..._euler_ancestral.py` (179 L) | — | **W1 LANDED** |
 | Denoise loop | `denoise_loop.py` (249 L) | — | **W2 LANDED** (driver ported, not e2e-gated) |
 | H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 PENDING** — Qwen3-VL text layer-50 + vision tower + DeepStack |
-| Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 PARTIAL** — the decoder's repeated TransformerBlock is ported and gated at 6.0e-8; the 36-block stack surround (x_embedder / mask+register tokens / 3D RoPE / proj_out / unpatchify / tiling) and the encoder remain. See 5.1 |
+| Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 DECODER DONE** — the FULL ViT3D decoder (pack, x_embedder, register/cls tokens, 3D RoPE, 36-block stack, norm_out, proj_out, unpatchify) is ported and gated at **8.9e-8**. Tiling and the 3D-CNN encoder (conditioning only) remain. See 5.1 |
 | Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 PENDING** |
 | Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **W6 PENDING** |
@@ -156,6 +156,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **REAL NVFP4 manifest** (1051 tensors) | **exact** — compressed-tensors triple, group 16, islands unquantized, names identical to our contract |
 | **REAL video-VAE manifest** (560 tensors) | **exact** — decoder confirmed a 36-block ViT, encoder the 3D CNN |
 | **VIDEO VAE decoder TransformerBlock** vs the checkpoint's OWN remote code | **max abs diff 6.0e-8** |
+| **VIDEO VAE FULL ViT3D decoder** vs the checkpoint's OWN remote code | **max abs diff 8.9e-8** |
 | config-parse invariants + weight contract + grouped-qkv reorder | pass |
 
 The fp64 position grid is gated bit-exact deliberately: it feeds RoPE, and a
@@ -187,7 +188,13 @@ that: W4/W5 must **reimplement both VAEs in C++ from the checkpoint's Python
 source**, which must be fetched separately (the VAE modules and their `config.json`
 are small; the 354 GB of weights are not needed to READ the architecture).
 
-**Status 2026-08-03: the remote code is IN HAND** (fetched from the checkpoint's
+**Status 2026-08-03: both VAE DECODERS are DONE.** The audio VAE (DAC/BigVGAN,
+4.2e-9) and the video VAE's full ViT3D decoder (8.9e-8) both reproduce the
+checkpoint's own modules. What remains on the VAE side is video tiling and the
+3D-CNN ENCODER — and the encoder is only needed for image/video CONDITIONING
+(fl2va/ref2va), not for producing output frames.
+
+**Original note: the remote code is IN HAND** (fetched from the checkpoint's
 `FL2VA/{audio,video}_vae/`, ~130 KB of Python, NOT vendored here — it ships under
 the MiniMax H3 Community License). The **audio VAE is DONE** (W5): a DAC-lineage
 BigVGAN vocoder, reimplemented and gated against the checkpoint's own modules at
@@ -254,7 +261,7 @@ contract pending W6), `test_minimax_h3_e2e.py` (BLOCKED — needs the checkpoint
 | **W2** | DiT forward + denoise driver, parity-gated on CPU at reduced dims | — (DONE) |
 | **W2b** | Device-resident forward: bf16 stream, `vt::FusedChain` glue, fused AdaLN modulate op, merged gate/up seam, CUDA gate | — |
 | **W3** | H3-Encoder on the existing Qwen3-VL tower (layer-50 truncation, DeepStack, all-ones mask) | vllm-omni pin |
-| **W4** | Video VAE decoder. **Block DONE** (6.0e-8 vs the checkpoint's own `TransformerBlock`, including the per-head-interleaved qkv trap). REMAINS: the 36-block stack surround — `x_embedder`, `mask_token`/`register_tokens`, 3D RoPE, `norm_out`/`proj_out`, unpatchify, and tiling — plus the 3D-CNN encoder | — |
+| **W4** | Video VAE. **DECODER DONE** — the full ViT3D decoder gated at 8.9e-8 (block 6.0e-8), real hyperparameters 36 layers / 32 heads x 64 / rope_theta 100 / rope_dim_ratio 0.75 from the checkpoint's `vit_decoder_kwargs`. REMAINS: tiling (`vae_tile_size` 256 / overlap 64) and the 3D-CNN ENCODER, which is only needed for image/video CONDITIONING, not for generation output | — |
 | **W5** | Audio VAE reimplementation | **DONE** — DAC-lineage BigVGAN decoder (weight-norm materialization, anti-aliased SnakeBeta with kaiser-sinc up/down resampling, replicate padding, final clamp). Encode-side determinism context is still open |
 | **W6** | Pipeline: t2va/fl2va/ref2va task assembly, condition noise, reference video, presentation, sigma schedules | W3-W5 |
 | **W7** | Serving: `/v1/videos` + `/v1/videos/sync`, job store, MP4 mux (dependency decision in 5.2) | W6 |

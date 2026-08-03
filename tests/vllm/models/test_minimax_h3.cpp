@@ -1026,6 +1026,76 @@ TEST_CASE("minimax_h3: the video VAE decoder block matches the checkpoint's own 
   CHECK(err <= 1e-5);
 }
 
+TEST_CASE("minimax_h3: the FULL video-VAE ViT3D decoder matches the checkpoint's remote code") {
+  // The whole generation-critical half of the video VAE: pack -> x_embedder ->
+  // register/cls tokens -> 3D RoPE -> block stack -> norm_out -> proj_out ->
+  // unpatchify. Gated against the checkpoint's OWN ViT3DDecoder.
+  vllm::MiniMaxH3VideoVaeDecoderConfig config;
+  config.block.dim = vllm_test::kH3VideoVaeBlockDim;
+  config.block.heads = vllm_test::kH3VideoVaeBlockHeads;
+  config.block.dim_head = vllm_test::kH3VideoVaeBlockDimHead;
+  config.block.ff_inner = vllm_test::kH3VideoVaeBlockFfInner;
+  config.block.eps = 1e-5;
+  config.num_layers = vllm_test::kH3VideoVaeDecLayers;
+  config.in_channels = vllm_test::kH3VideoVaeDecInCh;
+  config.out_channels = vllm_test::kH3VideoVaeDecOutCh;
+  config.patch_size = vllm_test::kH3VideoVaeDecPatch;
+  config.patch_size_t = vllm_test::kH3VideoVaeDecPatchT;
+  config.num_register_tokens = vllm_test::kH3VideoVaeDecRegisterTokens;
+  // rope_apply_dim = int(dim_head * rope_dim_ratio 0.75); must divide by 2*n_dim.
+  config.rope_apply_dim = static_cast<int64_t>(config.block.dim_head * 0.75);
+  config.rope_theta = 100.0;
+
+  const int64_t dim = config.block.dim;
+  const int64_t inner = config.block.heads * config.block.dim_head;
+  const int64_t lt = vllm_test::kH3VideoVaeDecT, lh = vllm_test::kH3VideoVaeDecH,
+                lw = vllm_test::kH3VideoVaeDecW;
+
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& name, int64_t count, double scale, double offset) {
+    weights.tensors[name] = MakeParam("videovae.dec." + name, count, scale, offset);
+  };
+  put("x_embedder.weight", dim * config.in_channels, 0.1, 0.0);
+  put("x_embedder.bias", dim, 0.05, 0.0);
+  put("register_tokens", config.num_register_tokens * dim, 0.1, 0.0);
+  put("norm_out.weight", dim, 0.1, 1.0);
+  put("norm_out.bias", dim, 0.05, 0.0);
+  const int64_t patch_dim =
+      config.out_channels * config.patch_size_t * config.patch_size * config.patch_size;
+  put("proj_out.weight", patch_dim * dim, 0.1, 0.0);
+  put("proj_out.bias", patch_dim, 0.05, 0.0);
+  for (int64_t l = 0; l < config.num_layers; ++l) {
+    const std::string b = "transformer_blocks." + std::to_string(l) + ".";
+    put(b + "norm1.weight", dim, 0.1, 1.0);
+    put(b + "norm2.weight", dim, 0.1, 1.0);
+    put(b + "scale1", dim, 0.3, 0.0);
+    put(b + "scale2", dim, 0.3, 0.0);
+    put(b + "attn.to_qkv.weight", 3 * inner * dim, 0.1, 0.0);
+    put(b + "attn.to_qkv.bias", 3 * inner, 0.05, 0.0);
+    put(b + "attn.to_out.weight", dim * inner, 0.1, 0.0);
+    put(b + "attn.to_out.bias", dim, 0.05, 0.0);
+    put(b + "ff.w1.weight", 2 * config.block.ff_inner * dim, 0.1, 0.0);
+    put(b + "ff.w1.bias", 2 * config.block.ff_inner, 0.05, 0.0);
+    put(b + "ff.w2.weight", dim * config.block.ff_inner, 0.1, 0.0);
+    put(b + "ff.w2.bias", dim, 0.05, 0.0);
+  }
+
+  const std::vector<float> latent =
+      MakeParam("videovae.dec.input", config.in_channels * lt * lh * lw, 1.0);
+  vllm::MiniMaxH3VideoFrameShape shape;
+  const std::vector<float> frames =
+      vllm::MiniMaxH3VideoVaeDecode(config, weights, latent, lt, lh, lw, &shape);
+
+  CHECK(shape.channels == config.out_channels);
+  CHECK(shape.t == vllm_test::kH3VideoVaeDecFrameT);
+  CHECK(shape.h == vllm_test::kH3VideoVaeDecFrameH);
+  CHECK(shape.w == vllm_test::kH3VideoVaeDecFrameW);
+  REQUIRE(frames.size() == std::size(vllm_test::kH3VideoVaeDecoderGolden));
+  const double err = MaxAbsDiff(frames, vllm_test::kH3VideoVaeDecoderGolden, frames.size());
+  INFO("video VAE ViT3D decoder max|diff| = " << err);
+  CHECK(err <= 1e-4);
+}
+
 TEST_CASE("minimax_h3: the video VAE decoder is a ViT, and its manifest says so") {
   // W4 scoping, grounded in the real checkpoint rather than in a guess: the video
   // VAE's ENCODER is the 3D CNN (down blocks with Conv3d), but its DECODER — the

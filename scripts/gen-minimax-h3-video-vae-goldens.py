@@ -82,7 +82,31 @@ def install_diffusers_stub() -> None:
     class ConfigMixin:
         config_name = "config.json"
 
-    _mod("diffusers.configuration_utils", ConfigMixin=ConfigMixin, register_to_config=lambda fn: fn)
+    def register_to_config(init):
+        """Faithful-enough stand-in: capture the ctor kwargs onto `self.config`.
+
+        The bundle reads `self.config.patch_size` / `patch_size_t` in the decoder
+        forward, so a no-op decorator is NOT sufficient.
+        """
+        import functools
+        import inspect
+
+        signature = inspect.signature(init)
+
+        @functools.wraps(init)
+        def wrapper(self, *args, **kwargs):
+            bound = signature.bind_partial(self, *args, **kwargs)
+            bound.apply_defaults()
+            captured = {k: v for k, v in bound.arguments.items() if k != "self"}
+            captured.pop("kwargs", None)
+            object.__setattr__(self, "_h3_config", types.SimpleNamespace(**captured))
+            return init(self, *args, **kwargs)
+
+        return wrapper
+
+    ConfigMixin.config = property(lambda self: self._h3_config)
+    _mod("diffusers.configuration_utils", ConfigMixin=ConfigMixin,
+         register_to_config=register_to_config)
 
     class ModelMixin(nn.Module):
         pass
@@ -112,6 +136,16 @@ HEADS = 2
 DIM_HEAD = 8
 DIM = HEADS * DIM_HEAD
 SEQ = 6
+
+# Reduced ViT3DDecoder. rope_apply_dim = int(dim_head * 0.75) must stay divisible
+# by 2 * n_dim = 6 (RotaryEmbeddingND's constraint): 8 * 0.75 = 6. OK.
+DEC_LAYERS = 2
+DEC_IN_CH = 4
+DEC_OUT_CH = 3
+DEC_PATCH = 2
+DEC_PATCH_T = 1
+DEC_REGISTER_TOKENS = 4
+DEC_T, DEC_H, DEC_W = 2, 2, 3
 
 
 def emit_f32(out, name: str, values) -> None:
@@ -167,6 +201,40 @@ def main() -> int:
     y = block(x)
     inner = block.ff.w1.weight.shape[0] // 2
 
+    # --- the WHOLE ViT3DDecoder (surround + block stack), reduced ---
+    # Real hyperparameters (FL2VA/video_vae/source/config.json :: vit_decoder_kwargs):
+    # heads 32, dim_head 64, num_layers 36, rms_norm affine, qk rms_norm WITHOUT
+    # affine, gated SiLU, rope_theta 100.0, rope_dim_ratio 0.75. Only the sizes shrink.
+    vv = load_bundle(src, "vae_vit")
+    dec = vv.ViT3DDecoder(
+        patch_size=DEC_PATCH, patch_size_t=DEC_PATCH_T, t_causal=False,
+        in_channels=DEC_IN_CH, out_channels=DEC_OUT_CH, num_layers=DEC_LAYERS,
+        heads=HEADS, dim_head=DIM_HEAD, norm_type="rms_norm", norm_affine=True,
+        qk_norm_type="rms_norm", qk_norm_affine=False, ffn_activation_fn="silu",
+        ffn_use_gated=True, rope_theta=100.0, rope_dim_ratio=0.75, bias=True, eps=1e-5,
+        num_register_tokens=DEC_REGISTER_TOKENS,
+    ).eval()
+    dstate = dec.state_dict()
+    for name, tensor in dstate.items():
+        scale, offset = (0.1, 0.0)
+        if name.endswith("norm1.weight") or name.endswith("norm2.weight") or name.endswith("norm_out.weight"):
+            scale, offset = 0.1, 1.0
+        elif name.endswith("scale1") or name.endswith("scale2"):
+            scale, offset = 0.3, 0.0
+        elif name.endswith(".bias"):
+            scale = 0.05
+        elif name in ("mask_token",):
+            scale = 0.0  # unused at inference (mask_prob 0)
+        dstate[name] = torch.from_numpy(
+            (h3_rand("videovae.dec." + name, tensor.numel()) * scale + offset).astype(np.float32)
+        ).reshape(tensor.shape)
+    dec.load_state_dict(dstate, strict=True)
+
+    latent = torch.from_numpy(
+        h3_rand("videovae.dec.input", DEC_IN_CH * DEC_T * DEC_H * DEC_W).astype(np.float32)
+    ).reshape(1, DEC_IN_CH, DEC_T, DEC_H, DEC_W)
+    frames = dec(latent)
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as out:
         out.write(
@@ -185,6 +253,20 @@ def main() -> int:
         out.write(f"inline constexpr int64_t kH3VideoVaeBlockSeq = {SEQ};\n")
         out.write(f"inline constexpr int64_t kH3VideoVaeBlockFfInner = {int(inner)};\n\n")
         emit_f32(out, "kH3VideoVaeBlockGolden", y.reshape(-1))
+
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecLayers = {DEC_LAYERS};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecInCh = {DEC_IN_CH};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecOutCh = {DEC_OUT_CH};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecPatch = {DEC_PATCH};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecPatchT = {DEC_PATCH_T};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecRegisterTokens = {DEC_REGISTER_TOKENS};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecT = {DEC_T};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecH = {DEC_H};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecW = {DEC_W};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecFrameT = {int(frames.shape[2])};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecFrameH = {int(frames.shape[3])};\n")
+        out.write(f"inline constexpr int64_t kH3VideoVaeDecFrameW = {int(frames.shape[4])};\n\n")
+        emit_f32(out, "kH3VideoVaeDecoderGolden", frames.reshape(-1))
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out} (ff inner {int(inner)})", file=sys.stderr)
     return 0

@@ -19,6 +19,9 @@
 #include "vllm/model_executor/models/minimax_h3.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -710,12 +713,24 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
   // re-uploaded ~16 GB every iteration would be dominated by the transfer. This is
   // exactly what StageMiniMaxH3DitWeights exists for.
   const bool on_device = device.type != vt::DeviceType::kCPU;
+  // VT_H3_PROGRESS=1 traces the phases to stderr. A 50-step loop over a real
+  // checkpoint spends minutes in ONE of {weight staging, per-step forward}, and
+  // guessing which is exactly the trap this avoids.
+  const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
+  auto now = [] { return std::chrono::steady_clock::now(); };
   vt::Queue device_queue{device, nullptr};
   MiniMaxH3DitDeviceWeights staged;
   if (on_device) {
     vt::Backend& backend = vt::GetBackend(device.type);
     device_queue = backend.CreateQueue();
+    const auto t0 = now();
     staged = StageMiniMaxH3DitWeights(device_queue, params, weights, compute_dtype);
+    if (trace) {
+      std::fprintf(stderr, "[h3] staged weights to device in %.1f s\n",
+                   std::chrono::duration<double>(now() - t0).count());
+    }
+  } else if (trace) {
+    std::fprintf(stderr, "[h3] CPU reference forward (device.type == kCPU)\n");
   }
 
   const MiniMaxH3PackedSequence& packed = branch.packed;
@@ -835,10 +850,18 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     in.refiner_cu_seqlens = refiner_cu.data();
     in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
 
+    const auto step_t0 = now();
     const MiniMaxH3DitOutputs velocity =
         on_device ? MiniMaxH3DitForwardDevice(device_queue, params, staged.weights, in,
                                               compute_dtype)
                   : MiniMaxH3DitForward(device, params, weights, in, compute_dtype);
+    if (trace) {
+      std::fprintf(stderr, "[h3] step %d/%d forward %.2f s (seq_len=%lld)\n",
+                   static_cast<int>(step + 1), static_cast<int>(sigmas_video.size() - 1),
+                   std::chrono::duration<double>(now() - step_t0).count(),
+                   static_cast<long long>(seq_len));
+      std::fflush(stderr);
+    }
 
     // Chain only the TARGET rows; pinned rows are reset to their anchors after
     // every step (denoise_loop.py:210-235).

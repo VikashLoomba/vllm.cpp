@@ -724,7 +724,13 @@ struct MiniMaxH3DitWeights {
 // `storage` must outlive `weights` (the views are non-owning).
 struct MiniMaxH3GgufDit {
   MiniMaxH3DitParams params;
-  std::map<std::string, std::vector<float>> storage;
+  std::map<std::string, std::vector<float>> storage;  // dequantized tensors (f32)
+  // KEEP-QUANT residency: the tensor's ggml bytes VERBATIM, plus the vt block
+  // dtype they encode. A name appears in exactly one of `storage` /
+  // `quant_storage`; the view binder checks both, so a keep-quant load and a
+  // dequantizing load produce the same weight-view struct.
+  std::map<std::string, std::vector<uint8_t>> quant_storage;
+  std::map<std::string, vt::DType> quant_dtype;
   std::map<std::string, std::vector<int64_t>> shapes;
   MiniMaxH3DitWeights weights;
 };
@@ -733,7 +739,18 @@ struct MiniMaxH3GgufDit {
 // manifest, dequantize every tensor to f32 through the shared GGUF dequant path
 // (so the Q2_K/Q3_K/Q4_K families the H3 GGUFs use are covered), and bind the
 // forward's views. Missing tensors throw by name rather than reading as zeros.
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file);
+// `keep_quant` leaves every ELIGIBLE 2-D projection in its ggml block encoding
+// instead of dequantizing it to f32. Eligibility is the shared rule
+// (KeepQuantDType + K a whole number of blocks); norms, biases and anything
+// unported still dequantize, so the forward sees a uniform weight struct either
+// way. vt::MatmulBT dispatches a block-typed weight to kMatmulBTQuant on its own
+// (ops.cpp:146), so NO call site in the forward changes -- which is exactly why
+// this is a loader+staging change rather than a forward rewrite.
+//
+// This is the arm that makes a quantized H3 run cheap on hardware WITHOUT fp4
+// tensor cores: the block-quant GEMM carries no arch gate (cuda_quant_dot.cu has
+// no #if at all), unlike every cutlass/marlin/fp4 path.
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant = false);
 
 // Bind the forward's views onto a MiniMaxH3GgufDit's owned buffers. Shared by the
 // GGUF and NVFP4 arms: both land on the SAME weight contract.

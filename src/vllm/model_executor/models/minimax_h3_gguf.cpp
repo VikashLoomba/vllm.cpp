@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vt/dtype.h"
 
@@ -190,12 +191,21 @@ void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out) {
   // tensor the forward would read as zeros.
   const MiniMaxH3DitParams& p = out->params;
   auto view = [out](const std::string& name) -> vt::Tensor {
+    const auto quant = out->quant_storage.find(name);
     const auto it = out->storage.find(name);
-    VT_CHECK(it != out->storage.end(), "minimax_h3 gguf: checkpoint is missing a required tensor");
+    VT_CHECK(quant != out->quant_storage.end() || it != out->storage.end(),
+             "minimax_h3 gguf: checkpoint is missing a required tensor");
     const std::vector<int64_t>& shape = out->shapes.at(name);
     vt::Tensor t;
-    t.data = it->second.data();
-    t.dtype = vt::DType::kF32;
+    // A keep-quant tensor keeps its ggml bytes and its BLOCK dtype; the logical
+    // [N,K] shape is unchanged, which is what lets the forward stay identical.
+    if (quant != out->quant_storage.end()) {
+      t.data = quant->second.data();
+      t.dtype = out->quant_dtype.at(name);
+    } else {
+      t.data = it->second.data();
+      t.dtype = vt::DType::kF32;
+    }
     t.device = vt::Device{};
     t.rank = static_cast<int>(shape.size());
     int64_t stride = 1;
@@ -253,21 +263,38 @@ void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out) {
   out->weights.audio_out_b = view("final_layer.audio_out.bias");
 }
 
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file) {
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant) {
   MiniMaxH3GgufDit out;
   const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3GgufTensors(file);
   out.params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
 
-  // Dequantize once per tensor, keyed by checkpoint name.
   for (const MiniMaxH3TensorSpec& spec : manifest) {
     const GgufTensorInfo& info = file.Get(spec.name);
     int64_t numel = 1;
     for (int64_t d : spec.shape) numel *= d;
     VT_CHECK(numel > 0, "minimax_h3 gguf: tensor has an empty logical shape");
+    out.shapes[spec.name] = spec.shape;
+
+    // KEEP-QUANT eligibility, the SHARED rule: a supported block encoding, rank 2
+    // (a projection, not a norm or bias), and K a whole number of blocks. Anything
+    // else dequantizes, so the decision is total and the forward is unaffected.
+    vt::DType block = vt::DType::kF32;
+    const bool eligible = keep_quant && spec.shape.size() == 2 &&
+                          KeepQuantDType(info.ggml_type, &block) &&
+                          spec.shape[1] % vt::BlockElems(block) == 0;
+    if (eligible) {
+      const size_t bytes =
+          static_cast<size_t>(spec.shape[0]) * vt::RowSizeBytes(block, spec.shape[1]);
+      const uint8_t* src = static_cast<const uint8_t*>(info.data);
+      out.quant_storage[spec.name].assign(src, src + bytes);
+      out.quant_dtype[spec.name] = block;
+      continue;
+    }
+
+    // Dequantize once per tensor, keyed by checkpoint name.
     out.storage[spec.name] = DequantGgufRowToF32(info.ggml_type, info.data, numel);
     VT_CHECK(static_cast<int64_t>(out.storage[spec.name].size()) == numel,
              "minimax_h3 gguf: dequant produced the wrong element count");
-    out.shapes[spec.name] = spec.shape;
   }
 
   BindMiniMaxH3DitViews(&out);

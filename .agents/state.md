@@ -35442,3 +35442,48 @@ fold. Reason rewritten rather than left stale (third revision of this entry - ea
 time the previous one turned out to name the wrong blocker).
 
 Gate: 38/38 CPU (9481 assertions). Thor GPU verification follows.
+
+## 2026-08-03 - MiniMax-H3: KEEP-QUANT GGUF arm (and why it matters for the Thor box)
+
+The developer asked the right question: if FP4 tensor cores are unavailable on
+sm_110, what about a DIFFERENT quant? GGUF block-quant turns out to sidestep the
+whole problem.
+
+THE FINDING: src/vt/cuda/cuda_quant_dot.cu contains ZERO #if/#ifdef - the ggml
+block-quant GEMM has no arch gate whatsoever, unlike every cutlass/marlin/fp4 path.
+Thor's DISABLED feature list is only fp4-mma / cutlass-nvfp4 / cutlass-fp8 /
+scaledmm-c3x / marlin-nvfp4 / fa2; nothing quant-related. Verified on the sm_110 GPU:
+test_cuda_quant_dot 9/9 (110,432 assertions) and test_gguf_keep_quant 37/37 pass.
+So the GGUF arm runs NATIVELY on Thor, and that box becomes a usable speed venue for
+it - see [[thor-sm110-first-runtime-verification]].
+
+But our H3 GGUF loader was throwing the compression away: it dequantized every
+tensor to f32 (DequantGgufRowToF32) and staging hard-asserted f32. Correct, and
+zero benefit.
+
+LANDED: LoadMiniMaxH3DitFromGguf(file, keep_quant=true) leaves ELIGIBLE 2-D
+projections in their block encoding (the shared rule: KeepQuantDType + K a whole
+number of blocks); norms, biases and anything unported still dequantize, so the
+weight struct is uniform either way. Staging uploads those bytes VERBATIM.
+
+The forward did not change AT ALL, and that is the nice part: vt::MatmulBT already
+dispatches a block-typed weight to kMatmulBTQuant (ops.cpp:146), so keep-quant is a
+loader + staging change, not a forward rewrite.
+
+THE TRAP, avoided by construction: a keep-quant slice feeding a DEVICE GEMM must
+point at DEVICE memory. A raw host-byte view reads as ALL ZEROS on the GPU and a
+CPU-only gate cannot catch it, because there the host pointer is perfectly valid.
+Our staging already allocates + copies to device, so this is satisfied - and the
+test asserts the output magnitude is non-zero specifically to catch that mode.
+
+Gate: 39/39 (9512 assertions). Resident bytes 3.77x smaller (215,424 vs 811,008 on
+the synthetic checkpoint), and the keep-quant forward agrees with the DEQUANTIZED
+forward at video 4.39e-5 / audio 7.50e-5 - consistent with kMatmulBTQuant's
+documented contract that only the K-reduction ORDER differs. The test also asserts
+the load really kept tensors quantized and really left the 1-D tensors alone, so a
+silently-dequantizing loader cannot pass it.
+
+CAVEAT on what a GGUF speed number means: vLLM/vllm-omni does not serve GGUF, so it
+is NOT quant-matched to upstream - it is comparable to llama.cpp (the project's
+labeled secondary bar) or to our own NVFP4 arm. The headline vs-vllm-omni number
+still needs NVFP4 on sm_121a. See [[vllm-is-the-bar-not-llamacpp]].

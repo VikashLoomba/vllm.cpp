@@ -40,6 +40,7 @@
 #include "../gguf_builder.h"
 
 #include "vt/backend.h"
+#include "vt/quant.h"
 #include "vt/device.h"
 #include "vt/tensor.h"
 
@@ -2775,4 +2776,170 @@ TEST_CASE("minimax_h3: grouped-qkv checkpoint reorder is a pure permutation") {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// KEEP-QUANT GGUF arm. This is the path that makes a quantized H3 run cheap on
+// hardware WITHOUT fp4 tensor cores: the ggml block-quant GEMM carries no arch
+// gate at all (src/vt/cuda/cuda_quant_dot.cu has no #if), unlike every
+// cutlass/marlin/fp4 path. So it runs at native speed on archs where NVFP4 can
+// only be emulated.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("minimax_h3: a GGUF loads KEEP-QUANT and the forward matches the dequantized load") {
+  MiniMaxH3DitParams want;
+  want.num_layers = 2;
+  want.token_refiner_num_layers = 1;
+  want.hidden_size = 64;
+  want.num_attention_heads = 4;
+  want.attention_head_dim = 16;
+  want.ffn_hidden_size = 128;
+  want.latents_dim = 8;
+  want.audio_latents_dim = 6;
+  want.text_dim = 32;  // whole Q8_0 blocks, so condition_proj is keep-quant ELIGIBLE
+  want.timestep_input_dim = 16;
+  want.time_embed_hidden_size = 64;
+  want.time_embed_dim = 32;
+  want.adaln_out_features = 18 * want.hidden_size;
+  want.final_adaln_out_features = 2 * want.hidden_size;
+  want.rope_inv_freq_len = 2;
+
+  gguf_test::GgufModelBuilder builder;
+  builder.AddKv(gguf_test::StrKv("general.architecture", "wan"));
+
+  // F32 for anything that is NOT an eligible 2-D projection (norms, biases,
+  // rope.inv_freq): the loader must dequantize those either way.
+  auto add_f32 = [&](const std::string& name, const std::vector<int64_t>& logical) {
+    int64_t numel = 1;
+    for (int64_t d : logical) numel *= d;
+    const std::vector<float> values = MakeParam("kq." + name, numel, 0.1);
+    std::string bytes(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(float));
+    std::vector<uint64_t> ne;
+    for (auto it = logical.rbegin(); it != logical.rend(); ++it) {
+      ne.push_back(static_cast<uint64_t>(*it));
+    }
+    builder.AddTensor(name, ne, /*ggml_type=*/0 /*F32*/, bytes);
+  };
+
+  // Real Q8_0 blocks, produced by the SAME quantizer a converter would use, so
+  // this runs over bytes a real checkpoint could contain.
+  auto add_q8 = [&](const std::string& name, int64_t out_dim, int64_t in_dim) {
+    const std::vector<float> values = MakeParam("kq." + name, out_dim * in_dim, 0.1);
+    const size_t row_bytes = vt::RowSizeBytes(vt::DType::kQ8_0, in_dim);
+    std::string bytes(static_cast<size_t>(out_dim) * row_bytes, '\0');
+    vt::cpu::FromFloatFn q = vt::cpu::BlockFromFloat(vt::DType::kQ8_0);
+    REQUIRE(q != nullptr);
+    for (int64_t r = 0; r < out_dim; ++r) {
+      q(values.data() + r * in_dim, bytes.data() + static_cast<size_t>(r) * row_bytes, in_dim);
+    }
+    builder.AddTensor(name, {static_cast<uint64_t>(in_dim), static_cast<uint64_t>(out_dim)},
+                      /*ggml_type=*/8 /*Q8_0*/, bytes);
+  };
+
+  const int64_t inner = want.num_attention_heads * want.attention_head_dim;
+  const int64_t video_width = want.video_row_width();
+
+  // fp32 islands stay f32 in the file; the DiT's own projections go Q8_0.
+  add_f32("video_patch_proj.weight", {want.hidden_size, video_width});
+  add_f32("video_patch_proj.bias", {want.hidden_size});
+  add_f32("audio_patch_proj.weight", {want.hidden_size, want.audio_latents_dim});
+  add_f32("audio_patch_proj.bias", {want.hidden_size});
+  add_q8("condition_proj.weight", want.hidden_size, want.text_dim);
+  add_f32("condition_proj.bias", {want.hidden_size});
+  add_f32("time_embedder.proj_in.weight", {want.time_embed_hidden_size, want.timestep_input_dim});
+  add_f32("time_embedder.proj_in.bias", {want.time_embed_hidden_size});
+  add_f32("time_embedder.proj_out.weight", {want.time_embed_dim, want.time_embed_hidden_size});
+  add_f32("time_embedder.proj_out.bias", {want.time_embed_dim});
+  add_f32("rope.inv_freq", {want.rope_inv_freq_len});
+
+  auto add_block = [&](const std::string& prefix, bool adaln) {
+    add_f32(prefix + ".norm1.weight", {want.hidden_size});
+    add_f32(prefix + ".norm2.weight", {want.hidden_size});
+    add_q8(prefix + ".attn.qkv_proj.weight", 3 * inner, want.hidden_size);
+    add_f32(prefix + ".attn.q_norm.weight", {want.attention_head_dim});
+    add_f32(prefix + ".attn.k_norm.weight", {want.attention_head_dim});
+    add_q8(prefix + ".attn.out_proj.weight", want.hidden_size, inner);
+    add_q8(prefix + ".mlp.fc1.weight", 2 * want.ffn_hidden_size, want.hidden_size);
+    add_q8(prefix + ".mlp.fc2.weight", want.hidden_size, want.ffn_hidden_size);
+    if (adaln) {
+      add_q8(prefix + ".adaln_proj.linear.weight", want.adaln_out_features, want.time_embed_dim);
+      add_f32(prefix + ".adaln_proj.linear.bias", {want.adaln_out_features});
+    }
+  };
+  for (int64_t i = 0; i < want.token_refiner_num_layers; ++i) {
+    add_block("token_refiner.blocks." + std::to_string(i), false);
+  }
+  add_f32("token_refiner.final_norm.weight", {want.hidden_size});
+  for (int64_t i = 0; i < want.num_layers; ++i) {
+    add_block("blocks." + std::to_string(i), true);
+  }
+  add_f32("final_layer.norm.weight", {want.hidden_size});
+  add_q8("final_layer.adaln_proj.linear.weight", want.final_adaln_out_features,
+         want.time_embed_dim);
+  add_f32("final_layer.adaln_proj.linear.bias", {want.final_adaln_out_features});
+  add_f32("final_layer.video_out.weight", {video_width, want.hidden_size});
+  add_f32("final_layer.video_out.bias", {video_width});
+  add_f32("final_layer.audio_out.weight", {want.audio_latents_dim, want.hidden_size});
+  add_f32("final_layer.audio_out.bias", {want.audio_latents_dim});
+
+  const std::string path = "/tmp/minimax_h3_keepquant_test.gguf";
+  {
+    const std::string bytes = builder.Build();
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    CHECK(std::fwrite(bytes.data(), 1, bytes.size(), fh) == bytes.size());
+    std::fclose(fh);
+  }
+
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(path);
+  const vllm::MiniMaxH3GgufDit dequantized =
+      vllm::LoadMiniMaxH3DitFromGguf(gguf, /*keep_quant=*/false);
+  const vllm::MiniMaxH3GgufDit kept = vllm::LoadMiniMaxH3DitFromGguf(gguf, /*keep_quant=*/true);
+
+  // The keep-quant load must ACTUALLY have kept things quantized -- otherwise the
+  // output comparison below would pass trivially by comparing two identical paths.
+  CHECK(dequantized.quant_storage.empty());
+  CHECK_FALSE(kept.quant_storage.empty());
+  CHECK(kept.quant_dtype.at("blocks.0.attn.qkv_proj.weight") == vt::DType::kQ8_0);
+  CHECK(kept.weights.blocks[0].qkv_proj.dtype == vt::DType::kQ8_0);
+  // ...and must have left the ineligible tensors alone (1-D norms/biases).
+  CHECK(kept.quant_storage.count("blocks.0.norm1.weight") == 0);
+  CHECK(kept.weights.blocks[0].norm1.dtype == vt::DType::kF32);
+  // Keep-quant is the whole point: the resident bytes must be SMALLER.
+  size_t kept_bytes = 0;
+  for (const auto& kv : kept.quant_storage) kept_bytes += kv.second.size();
+  size_t dequant_bytes = 0;
+  for (const auto& kv : dequantized.storage) {
+    if (kept.quant_storage.count(kv.first) != 0) dequant_bytes += kv.second.size() * sizeof(float);
+  }
+  INFO("kept " << kept_bytes << " B vs dequantized " << dequant_bytes << " B");
+  CHECK(kept_bytes < dequant_bytes);
+
+  // Both must produce the same answer. vt::MatmulBT routes the block weight to
+  // kMatmulBTQuant, whose per-element product is bit-for-bit the dequantized
+  // value; only the K-reduction ORDER differs, so this is a matmul tolerance.
+  const std::unique_ptr<DitForwardCase> c = BuildDitForwardCase(kept.params);
+  vt::Queue q{Cpu(), nullptr};
+  const MiniMaxH3DitDeviceWeights staged_deq =
+      StageMiniMaxH3DitWeights(q, dequantized.params, dequantized.weights, vt::DType::kF32);
+  const MiniMaxH3DitDeviceWeights staged_kq =
+      StageMiniMaxH3DitWeights(q, kept.params, kept.weights, vt::DType::kF32);
+  const MiniMaxH3DitOutputs out_deq =
+      MiniMaxH3DitForwardDevice(q, dequantized.params, staged_deq.weights, c->in, vt::DType::kF32);
+  const MiniMaxH3DitOutputs out_kq =
+      MiniMaxH3DitForwardDevice(q, kept.params, staged_kq.weights, c->in, vt::DType::kF32);
+
+  REQUIRE(out_kq.video_logits.size() == out_deq.video_logits.size());
+  const double video_err =
+      MaxAbsDiff(out_kq.video_logits, out_deq.video_logits.data(), out_kq.video_logits.size());
+  const double audio_err =
+      MaxAbsDiff(out_kq.audio_logits, out_deq.audio_logits.data(), out_kq.audio_logits.size());
+  INFO("keep-quant vs dequantized: video " << video_err << ", audio " << audio_err);
+  CHECK(video_err <= 2e-3);
+  CHECK(audio_err <= 2e-3);
+  // And the forward must have produced something, not all zeros -- the failure
+  // mode a keep-quant slice hits when its bytes never reach the device.
+  double magnitude = 0.0;
+  for (float v : out_kq.video_logits) magnitude = std::max(magnitude, std::abs((double)v));
+  CHECK(magnitude > 1e-6);
 }

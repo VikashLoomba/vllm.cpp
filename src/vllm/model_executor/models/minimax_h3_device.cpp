@@ -229,9 +229,31 @@ MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
       dst = src;
       return;
     }
-    VT_CHECK(src.dtype == DType::kF32, "minimax_h3 stage: host weights must be f32");
     const std::vector<int64_t> shape(src.shape, src.shape + src.rank);
     const int64_t n = src.Numel();
+
+    // KEEP-QUANT: a block-encoded weight is uploaded VERBATIM and keeps its block
+    // dtype -- never dequantized, and never rounded to the stream dtype (its
+    // scales already carry the precision). vt::MatmulBT routes it to
+    // kMatmulBTQuant on its own, so the forward is unchanged.
+    //
+    // The upload is the load-bearing part: a keep-quant slice feeding a DEVICE
+    // GEMM must point at DEVICE memory. Handing the GEMM a raw host-byte view
+    // reads as ALL ZEROS on the GPU, and a CPU-only gate cannot catch it because
+    // there the host pointer is valid.
+    if (vt::IsBlockQuant(src.dtype)) {
+      VT_CHECK(src.rank == 2, "minimax_h3 stage: keep-quant weights must be rank 2");
+      const size_t bytes =
+          static_cast<size_t>(shape[0]) * vt::RowSizeBytes(src.dtype, shape[1]);
+      void* p = backend.Alloc(bytes);
+      std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
+      backend.Copy(queue, p, src.data, bytes);
+      dst = dense_attn::MakeTensor(p, src.dtype, queue.device, shape);
+      staged.storage.push_back(std::move(owner));
+      return;
+    }
+
+    VT_CHECK(src.dtype == DType::kF32, "minimax_h3 stage: host weights must be f32 or block-quant");
     const DType want = (bf16 && as_bf16) ? DType::kBF16 : DType::kF32;
     const size_t bytes = static_cast<size_t>(n) * vt::SizeOf(want);
     void* p = backend.Alloc(bytes);

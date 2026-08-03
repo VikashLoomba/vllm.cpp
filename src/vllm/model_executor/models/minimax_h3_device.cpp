@@ -1,0 +1,521 @@
+// MiniMax-H3 DiT — the DEVICE-RESIDENT forward (brick H3-2b).
+//
+// `MiniMaxH3DitForward` (minimax_h3.cpp) is the portable reference: it computes
+// into host `std::vector<float>` buffers and only reaches for `vt::` at the two
+// big ops. This file runs the SAME graph with every activation in device memory,
+// so the block stack — and, above it, the 50-step denoise loop — never round-trips
+// through the host.
+//
+// ─── WHAT IS PORTED, AND FROM WHERE ──────────────────────────────────────────
+// Structure is 1:1 with the reference; each step below names the reference helper
+// it replaces and the upstream line it came from. The port REUSES tuned shared
+// ops wherever one exists, which is why only three H3-specific kernels were added
+// (minimax_h3_device.h):
+//
+//   Linear                  -> vt::MatmulBT + vt::Add (rank-1 row-broadcast bias)
+//   RmsNormRows             -> vt::RmsNorm
+//   qkv split               -> vt::QkvSplit
+//   ApplyRope (3-axis)      -> vt::RopeFromCache over a prebuilt per-row cache
+//   MLP silu(gate)*up       -> vt::SiluAndMul
+//   residual add            -> vt::Add
+//   row gather / scatter    -> vt::IndexSelect / vt::IndexCopy
+//   packed varlen attention -> vt::DFlashBlockAttention(causal=false)
+//   ModulateScaleShift/Gate -> kMiniMaxH3 glue table
+//   Silu (ungated)          -> kMiniMaxH3 glue table
+//
+// ─── NUMERICS: CLOSE, NOT BIT-IDENTICAL ──────────────────────────────────────
+// This path is NOT bit-identical to the CPU reference and does not claim to be.
+// The divergence is in the SHARED ops, not the H3 kernels: vt::RmsNorm reduces in
+// f32 where RmsNormRows accumulates in double, and MatmulBT/attention use their
+// own accumulation orders. f32 is what upstream torch RMSNorm does, so the device
+// path is arguably the closer mirror. It is gated against the SAME upstream
+// goldens at the SAME tolerance as the CPU forward.
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <vector>
+
+#include "vllm/model_executor/models/dense_device_glue.h"
+#include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/model_executor/models/minimax_h3_device.h"
+#include "vt/backend.h"
+#include "vt/dtype.h"
+#include "vt/ops.h"
+
+namespace vllm {
+namespace {
+
+using dense_attn::DBuf;
+using dense_attn::Dev;
+using dense_attn::MakeTensor;
+using vt::DType;
+using vt::Tensor;
+
+const minimax_h3::MiniMaxH3DeviceKernels* Glue(const Dev& d) {
+  VT_CHECK(minimax_h3::MiniMaxH3DeviceKernelsAvailable(d.q.device.type),
+           "minimax_h3: no device glue table registered for this backend");
+  return minimax_h3::MiniMaxH3Device(d.q.device.type);
+}
+
+// vt::MatmulBT + optional rank-1 bias, the device twin of the reference `Linear`.
+// Weight is [out_features, in_features] — every {Column,Row,QKV,MergedColumn}
+// ParallelLinear at TP=1.
+void LinearDev(Dev d, const Tensor& in, int64_t rows, int64_t in_features, const Tensor& weight,
+               const Tensor* bias, Tensor& out) {
+  VT_CHECK(weight.rank == 2 && weight.shape[1] == in_features,
+           "minimax_h3 device linear: weight shape does not match input width");
+  Tensor a = dense_attn::Reshape(in, {rows, in_features});
+  Tensor o = dense_attn::Reshape(out, {rows, weight.shape[0]});
+  vt::MatmulBT(d.q, o, a, weight);
+  if (bias != nullptr && bias->data != nullptr) {
+    vt::Add(d.q, o, o, *bias);  // rank-1 row-broadcast == a nn.Linear bias term
+  }
+}
+
+// MiniMaxH3Rope.forward + _apply_rope (minimax_h3_transformer.py:222-244) as a
+// cos/sin CACHE.
+//
+// H3's rope is plain NeoX rotate_half over the leading rot_dim head dims; only the
+// ANGLES are unusual (three axes t/h/w off the fp64 position grid rather than one
+// scalar position). vt::RopeFromCache consumes exactly a [S, rot_dim] cache laid
+// out as [cos(half) | sin(half)] and indexes it by position, so building that
+// cache here reproduces ApplyRope with NO bespoke rope kernel.
+//
+// The reference duplicates the half-angle block (`memcpy(dst + half, dst, ...)`)
+// so its cos_lo/cos_hi are equal; that duplication is exactly what makes the
+// rotation NeoX-shaped, and it is why one [S, rot_dim] cache suffices.
+std::vector<float> BuildRopeCosSin(const double* position_ids, int64_t seq_len,
+                                   const float* inv_freq, int64_t inv_freq_len) {
+  const int64_t half = 3 * inv_freq_len;  // rot_dim / 2
+  const int64_t rot_dim = 2 * half;
+  std::vector<float> cache(static_cast<size_t>(seq_len * rot_dim));
+  for (int64_t s = 0; s < seq_len; ++s) {
+    float* dst = cache.data() + s * rot_dim;
+    for (int64_t axis = 0; axis < 3; ++axis) {
+      const float pos = static_cast<float>(position_ids[s * 3 + axis]);
+      for (int64_t i = 0; i < inv_freq_len; ++i) {
+        const float angle = pos * inv_freq[i];
+        dst[axis * inv_freq_len + i] = std::cos(angle);
+        dst[half + axis * inv_freq_len + i] = std::sin(angle);
+      }
+    }
+  }
+  return cache;
+}
+
+struct AttnWeightsDev {
+  const Tensor* qkv;
+  const Tensor* q_norm;
+  const Tensor* k_norm;
+  const Tensor* out_proj;
+};
+
+// MiniMaxH3Attention.forward (minimax_h3_transformer.py:421-467).
+void AttentionDev(Dev d, const MiniMaxH3DitParams& params, const AttnWeightsDev& w,
+                  const Tensor& in, int64_t rows, const Tensor* rope_cache,
+                  const Tensor* rope_positions, const int32_t* cu_seqlens, int num_reqs,
+                  Tensor& out) {
+  const int64_t heads = params.num_attention_heads;
+  const int64_t head_dim = params.attention_head_dim;
+  const int64_t inner = heads * head_dim;
+
+  DBuf qkv(d, DType::kF32, {rows, 3 * inner});
+  LinearDev(d, in, rows, params.hidden_size, *w.qkv, nullptr, qkv.t());
+
+  DBuf qb(d, DType::kF32, {rows, inner});
+  DBuf kb(d, DType::kF32, {rows, inner});
+  DBuf vb(d, DType::kF32, {rows, inner});
+  vt::QkvSplit(d.q, qb.t(), kb.t(), vb.t(), qkv.t());
+
+  // Per-head RMSNorm over head_dim: [rows, heads, head_dim] -> [rows*heads, head_dim].
+  Tensor qn = dense_attn::Reshape(qb.t(), {rows * heads, head_dim});
+  Tensor kn = dense_attn::Reshape(kb.t(), {rows * heads, head_dim});
+  vt::RmsNormArgs norm_args;
+  norm_args.eps = static_cast<float>(params.qk_norm_eps);
+  vt::RmsNorm(d.q, qn, qn, *w.q_norm, norm_args);
+  vt::RmsNorm(d.q, kn, kn, *w.k_norm, norm_args);
+
+  if (rope_cache != nullptr) {
+    Tensor q3 = dense_attn::Reshape(qb.t(), {rows, heads, head_dim});
+    Tensor k3 = dense_attn::Reshape(kb.t(), {rows, heads, head_dim});
+    vt::RopeArgs rope;
+    rope.rotary_dim = static_cast<int>(params.rope_rot_dim());
+    rope.is_neox_style = true;
+    vt::RopeFromCache(d.q, q3, &k3, *rope_positions, *rope_cache, rope);
+  }
+
+  Tensor tq = dense_attn::Reshape(qb.t(), {rows, heads, head_dim});
+  Tensor tk = dense_attn::Reshape(kb.t(), {rows, heads, head_dim});
+  Tensor tv = dense_attn::Reshape(vb.t(), {rows, heads, head_dim});
+  DBuf attn(d, DType::kF32, {rows, heads, head_dim});
+  vt::DFlashBlockAttentionArgs args;
+  args.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
+  args.causal = false;  // bidirectional within each packed document
+  args.sliding_window = 0;
+  args.cu_seqlens = cu_seqlens;
+  args.num_reqs = num_reqs;
+  vt::DFlashBlockAttention(d.q, attn.t(), tq, tk, tv, args);
+
+  Tensor flat = dense_attn::Reshape(attn.t(), {rows, inner});
+  LinearDev(d, flat, rows, inner, *w.out_proj, nullptr, out);
+}
+
+// MiniMaxH3MLP.forward (minimax_h3_transformer.py:512-517): silu(gate) * up.
+// fc1 emits [gate; up] per row, which is exactly vt::SiluAndMul's input layout.
+void MlpDev(Dev d, const MiniMaxH3DitParams& params, const Tensor& fc1, const Tensor& fc2,
+            const Tensor& in, int64_t rows, Tensor& out) {
+  const int64_t ffn = params.ffn_hidden_size;
+  DBuf hidden(d, DType::kF32, {rows, 2 * ffn});
+  LinearDev(d, in, rows, params.hidden_size, fc1, nullptr, hidden.t());
+  DBuf act(d, DType::kF32, {rows, ffn});
+  vt::SiluAndMul(d.q, act.t(), hidden.t());
+  LinearDev(d, act.t(), rows, ffn, fc2, nullptr, out);
+}
+
+// MiniMaxH3AdalnProj.forward (minimax_h3_transformer.py:555-561):
+// silu(t_emb) -> linear. `activated` is the ALREADY-silu'd t_emb, hoisted out of
+// the block loop by the caller: t_emb does not change across blocks, so the
+// reference's per-block silu is redundant work the device path simply does once.
+void AdalnProjectDev(Dev d, const Tensor& activated, int64_t m, int64_t time_embed_dim,
+                     const Tensor& weight, const Tensor& bias, Tensor& out) {
+  LinearDev(d, activated, m, time_embed_dim, weight, &bias, out);
+}
+
+}  // namespace
+
+MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
+                                                   const MiniMaxH3DitParams& params,
+                                                   const MiniMaxH3DitWeights& host) {
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  MiniMaxH3DitDeviceWeights staged;
+  staged.weights = host;  // shapes/dtypes carry over; every view is rebound below
+
+  auto upload = [&](const Tensor& src, Tensor& dst) {
+    if (src.data == nullptr) {
+      dst = src;
+      return;
+    }
+    VT_CHECK(src.dtype == DType::kF32, "minimax_h3 stage: weights must be f32");
+    const size_t bytes = src.Bytes();
+    void* p = backend.Alloc(bytes);
+    std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
+    backend.Copy(queue, p, src.data, bytes);
+    std::vector<int64_t> shape(src.shape, src.shape + src.rank);
+    dst = dense_attn::MakeTensor(p, src.dtype, queue.device, shape);
+    staged.storage.push_back(std::move(owner));
+  };
+
+  auto upload_block = [&](const MiniMaxH3DitBlockWeights& src, MiniMaxH3DitBlockWeights& dst) {
+    upload(src.norm1, dst.norm1);
+    upload(src.norm2, dst.norm2);
+    upload(src.qkv_proj, dst.qkv_proj);
+    upload(src.q_norm, dst.q_norm);
+    upload(src.k_norm, dst.k_norm);
+    upload(src.out_proj, dst.out_proj);
+    upload(src.fc1, dst.fc1);
+    upload(src.fc2, dst.fc2);
+    upload(src.adaln_w, dst.adaln_w);
+    upload(src.adaln_b, dst.adaln_b);
+  };
+
+  upload(host.video_patch_proj_w, staged.weights.video_patch_proj_w);
+  upload(host.video_patch_proj_b, staged.weights.video_patch_proj_b);
+  upload(host.audio_patch_proj_w, staged.weights.audio_patch_proj_w);
+  upload(host.audio_patch_proj_b, staged.weights.audio_patch_proj_b);
+  upload(host.condition_proj_w, staged.weights.condition_proj_w);
+  upload(host.condition_proj_b, staged.weights.condition_proj_b);
+  upload(host.time_proj_in_w, staged.weights.time_proj_in_w);
+  upload(host.time_proj_in_b, staged.weights.time_proj_in_b);
+  upload(host.time_proj_out_w, staged.weights.time_proj_out_w);
+  upload(host.time_proj_out_b, staged.weights.time_proj_out_b);
+  // rope.inv_freq is consumed on the HOST (it builds the cos/sin cache), so it is
+  // deliberately left as the caller's host view rather than uploaded.
+  staged.weights.rope_inv_freq = host.rope_inv_freq;
+  for (size_t i = 0; i < host.refiner.size(); ++i) {
+    upload_block(host.refiner[i], staged.weights.refiner[i]);
+  }
+  upload(host.refiner_final_norm, staged.weights.refiner_final_norm);
+  for (size_t i = 0; i < host.blocks.size(); ++i) {
+    upload_block(host.blocks[i], staged.weights.blocks[i]);
+  }
+  upload(host.final_norm, staged.weights.final_norm);
+  upload(host.final_adaln_w, staged.weights.final_adaln_w);
+  upload(host.final_adaln_b, staged.weights.final_adaln_b);
+  upload(host.video_out_w, staged.weights.video_out_w);
+  upload(host.video_out_b, staged.weights.video_out_b);
+  upload(host.audio_out_w, staged.weights.audio_out_w);
+  upload(host.audio_out_b, staged.weights.audio_out_b);
+  (void)params;
+  backend.Synchronize(queue);
+  return staged;
+}
+
+MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
+                                              const MiniMaxH3DitParams& params,
+                                              const MiniMaxH3DitWeights& weights,
+                                              const MiniMaxH3DitInputs& inputs,
+                                              DType compute_dtype) {
+  VT_CHECK(compute_dtype == DType::kF32,
+           "minimax_h3: the device forward is f32 for now; the bf16 stream policy "
+           "is a follow-up to brick H3-2b (.agents/specs/minimax-h3.md)");
+  VT_CHECK(static_cast<int64_t>(weights.blocks.size()) == params.num_layers,
+           "minimax_h3: block weight count does not match num_layers");
+  VT_CHECK(static_cast<int64_t>(weights.refiner.size()) == params.token_refiner_num_layers,
+           "minimax_h3: refiner weight count does not match token_refiner_num_layers");
+  VT_CHECK(inputs.num_cu_seqlens >= 2, "minimax_h3: packed_seq_params.cu_seqlens is required");
+
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  Dev d{backend, queue};
+  const auto* glue = Glue(d);
+
+  const int64_t seq_len = inputs.seq_len;
+  const int64_t hidden = params.hidden_size;
+  const int64_t video_width = params.video_row_width();
+  const int64_t audio_width = params.audio_latents_dim;
+  const int64_t m = inputs.num_unique_timesteps;
+
+  // --- indices, uploaded once (i32: what IndexSelect/IndexCopy and the glue take) ---
+  auto to_i32 = [](const int64_t* src, int64_t n) {
+    std::vector<int32_t> out(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = static_cast<int32_t>(src[i]);
+    return out;
+  };
+  const std::vector<int32_t> img_pos = to_i32(inputs.img_pos, inputs.num_img_pos);
+  const std::vector<int32_t> audio_pos = to_i32(inputs.audio_pos, inputs.num_audio_pos);
+  const std::vector<int32_t> text_pos = to_i32(inputs.text_pos, inputs.num_text_pos);
+  const std::vector<int32_t> infer_out_pos = to_i32(inputs.infer_out_pos, inputs.num_infer_out_pos);
+
+  // combined_indices = inverse_indices * modality_num + token_tags.clamp(min=0)
+  // (minimax_h3_transformer.py:1057).
+  std::vector<int32_t> combined(static_cast<size_t>(seq_len));
+  std::vector<int32_t> inverse(static_cast<size_t>(seq_len));
+  for (int64_t i = 0; i < seq_len; ++i) {
+    const int64_t tag = inputs.token_tags[i] < 0 ? 0 : inputs.token_tags[i];
+    combined[static_cast<size_t>(i)] =
+        static_cast<int32_t>(inputs.inverse_indices[i] * kMiniMaxH3AdalnModalityNum + tag);
+    inverse[static_cast<size_t>(i)] = static_cast<int32_t>(inputs.inverse_indices[i]);
+  }
+  DBuf d_img_pos(d, DType::kI32, {inputs.num_img_pos}, img_pos.data());
+  DBuf d_audio_pos(d, DType::kI32, {inputs.num_audio_pos}, audio_pos.data());
+  DBuf d_text_pos(d, DType::kI32, {inputs.num_text_pos}, text_pos.data());
+  DBuf d_infer_pos(d, DType::kI32, {inputs.num_infer_out_pos}, infer_out_pos.data());
+  DBuf d_combined(d, DType::kI32, {seq_len}, combined.data());
+  DBuf d_inverse(d, DType::kI32, {seq_len}, inverse.data());
+
+  // --- RoPE cache over the full packed sequence (:1040-1041) ---
+  const std::vector<float> rope_cache_host =
+      BuildRopeCosSin(inputs.img_position_ids, seq_len, weights.rope_inv_freq.Ptr<float>(),
+                      params.rope_inv_freq_len);
+  const int64_t rot_dim = params.rope_rot_dim();
+  DBuf d_rope_cache(d, DType::kF32, {seq_len, rot_dim}, rope_cache_host.data());
+  std::vector<int32_t> arange(static_cast<size_t>(seq_len));
+  for (int64_t i = 0; i < seq_len; ++i) arange[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  DBuf d_rope_pos(d, DType::kI32, {seq_len}, arange.data());
+
+  // --- _embed (minimax_h3_transformer.py:944-984) ---
+  DBuf d_x(d, DType::kF32, {seq_len, video_width}, inputs.x);
+  DBuf video_rows(d, DType::kF32, {inputs.num_img_pos, video_width});
+  vt::IndexSelect(d.q, video_rows.t(), d_x.t(), d_img_pos.t());
+  DBuf video_embed(d, DType::kF32, {inputs.num_img_pos, hidden});
+  LinearDev(d, video_rows.t(), inputs.num_img_pos, video_width, weights.video_patch_proj_w,
+            &weights.video_patch_proj_b, video_embed.t());
+
+  DBuf d_audio_x(d, DType::kF32, {seq_len, audio_width}, inputs.audio_x);
+  DBuf audio_rows(d, DType::kF32, {inputs.num_audio_pos, audio_width});
+  vt::IndexSelect(d.q, audio_rows.t(), d_audio_x.t(), d_audio_pos.t());
+  DBuf audio_embed(d, DType::kF32, {inputs.num_audio_pos, hidden});
+  LinearDev(d, audio_rows.t(), inputs.num_audio_pos, audio_width, weights.audio_patch_proj_w,
+            &weights.audio_patch_proj_b, audio_embed.t());
+
+  DBuf text_rows(d, DType::kF32, {inputs.num_text_pos, params.text_dim}, inputs.prompt_embeds);
+  DBuf text_embed(d, DType::kF32, {inputs.num_text_pos, hidden});
+  LinearDev(d, text_rows.t(), inputs.num_text_pos, params.text_dim, weights.condition_proj_w,
+            &weights.condition_proj_b, text_embed.t());
+
+  // Token refiner: a plain pre-norm stack, no AdaLN and no RoPE (:564-623), on the
+  // REPLICATED text rows, so it uses the refiner's own cu_seqlens.
+  {
+    const int64_t rows = inputs.num_text_pos;
+    DBuf normed(d, DType::kF32, {rows, hidden});
+    DBuf tmp(d, DType::kF32, {rows, hidden});
+    vt::RmsNormArgs args;
+    args.eps = static_cast<float>(params.norm_eps);
+    for (const MiniMaxH3DitBlockWeights& block : weights.refiner) {
+      vt::RmsNorm(d.q, normed.t(), text_embed.t(), block.norm1, args);
+      AttentionDev(d, params, AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm,
+                                             &block.out_proj},
+                   normed.t(), rows, nullptr, nullptr, inputs.refiner_cu_seqlens,
+                   static_cast<int>(inputs.num_refiner_cu_seqlens - 1), tmp.t());
+      vt::Add(d.q, text_embed.t(), text_embed.t(), tmp.t());
+      vt::RmsNorm(d.q, normed.t(), text_embed.t(), block.norm2, args);
+      MlpDev(d, params, block.fc1, block.fc2, normed.t(), rows, tmp.t());
+      vt::Add(d.q, text_embed.t(), text_embed.t(), tmp.t());
+    }
+    vt::RmsNormArgs final_args;
+    final_args.eps = static_cast<float>(params.final_norm_eps);
+    vt::RmsNorm(d.q, normed.t(), text_embed.t(), weights.refiner_final_norm, final_args);
+    backend.Copy(d.q, text_embed.ptr(), normed.ptr(), normed.bytes());
+  }
+
+  // index_add_ scatter of the three modality embeddings into the packed stream.
+  // The three position sets are DISJOINT by construction (each packed row carries
+  // exactly one modality), so torch's index_add_ into a zeroed stream is an
+  // index_COPY here — asserted rather than assumed, since a silent overlap would
+  // turn a lost add into a wrong answer.
+  {
+    std::vector<uint8_t> seen(static_cast<size_t>(seq_len), 0);
+    auto mark = [&](const std::vector<int32_t>& pos) {
+      for (int32_t p : pos) {
+        VT_CHECK(p >= 0 && p < seq_len, "minimax_h3: scatter position out of range");
+        VT_CHECK(seen[static_cast<size_t>(p)] == 0,
+                 "minimax_h3: modality scatter positions overlap; index_copy would drop an add");
+        seen[static_cast<size_t>(p)] = 1;
+      }
+    };
+    mark(text_pos);
+    mark(img_pos);
+    mark(audio_pos);
+  }
+  DBuf stream(d, DType::kF32, {seq_len, hidden});
+  stream.Zero(d);
+  vt::IndexCopy(d.q, stream.t(), text_embed.t(), d_text_pos.t());
+  vt::IndexCopy(d.q, stream.t(), video_embed.t(), d_img_pos.t());
+  vt::IndexCopy(d.q, stream.t(), audio_embed.t(), d_audio_pos.t());
+
+  // --- time embedding (minimax_h3_transformer.py:272-285) ---
+  DBuf t_emb(d, DType::kF32, {m, params.time_embed_dim});
+  {
+    const int64_t half = params.timestep_input_dim / 2;
+    std::vector<float> t_freq(static_cast<size_t>(m * params.timestep_input_dim));
+    for (int64_t r = 0; r < m; ++r) {
+      for (int64_t i = 0; i < half; ++i) {
+        const double freq =
+            std::exp(-std::log(10000.0) * static_cast<double>(i) / static_cast<double>(half));
+        const double arg = static_cast<double>(inputs.unique_timesteps[r]) * freq;
+        // Cosine values are concatenated BEFORE sine values.
+        t_freq[static_cast<size_t>(r * params.timestep_input_dim + i)] =
+            static_cast<float>(std::cos(arg));
+        t_freq[static_cast<size_t>(r * params.timestep_input_dim + half + i)] =
+            static_cast<float>(std::sin(arg));
+      }
+    }
+    DBuf d_t_freq(d, DType::kF32, {m, params.timestep_input_dim}, t_freq.data());
+    DBuf mid(d, DType::kF32, {m, params.time_embed_hidden_size});
+    LinearDev(d, d_t_freq.t(), m, params.timestep_input_dim, weights.time_proj_in_w,
+              &weights.time_proj_in_b, mid.t());
+    glue->silu(d.q, mid.t().Ptr<float>(), m * params.time_embed_hidden_size);
+    LinearDev(d, mid.t(), m, params.time_embed_hidden_size, weights.time_proj_out_w,
+              &weights.time_proj_out_b, t_emb.t());
+  }
+
+  // silu(t_emb), hoisted: t_emb is loop-invariant, so the reference's per-block
+  // silu inside AdalnProject is redundant work here.
+  DBuf t_emb_act(d, DType::kF32, {m, params.time_embed_dim});
+  backend.Copy(d.q, t_emb_act.ptr(), t_emb.ptr(), t_emb.bytes());
+  glue->silu(d.q, t_emb_act.t().Ptr<float>(), m * params.time_embed_dim);
+
+  // --- the DiT block stack (minimax_h3_transformer.py:645-688) ---
+  const int num_reqs = static_cast<int>(inputs.num_cu_seqlens - 1);
+  const int64_t adaln_rows = m * kMiniMaxH3AdalnModalityNum;
+  DBuf normed(d, DType::kF32, {seq_len, hidden});
+  DBuf tmp(d, DType::kF32, {seq_len, hidden});
+  DBuf projected(d, DType::kF32, {adaln_rows, 6 * hidden});
+  vt::RmsNormArgs block_args;
+  block_args.eps = static_cast<float>(params.norm_eps);
+
+  // Chunk c of AdaLN row r lives at (r * expand + c) * hidden within the flat
+  // projection; as a TENSOR that is a row-strided [rows, hidden] view, so the
+  // chunks need no copy — MatmulBT wrote them where the modulates want them.
+  auto chunk_view = [&](DBuf& buf, int64_t rows, int64_t expand, int64_t c) {
+    Tensor t = MakeTensor(static_cast<float*>(buf.ptr()) + c * hidden, DType::kF32, d.q.device,
+                          {rows, hidden});
+    t.stride[0] = expand * hidden;  // row stride skips the sibling chunks
+    return t;
+  };
+
+  for (const MiniMaxH3DitBlockWeights& block : weights.blocks) {
+    AdalnProjectDev(d, t_emb_act.t(), m, params.time_embed_dim, block.adaln_w, block.adaln_b,
+                    projected.t());
+    const Tensor shift_msa = chunk_view(projected, adaln_rows, 6, 0);
+    const Tensor scale_msa = chunk_view(projected, adaln_rows, 6, 1);
+    const Tensor gate_msa = chunk_view(projected, adaln_rows, 6, 2);
+    const Tensor shift_mlp = chunk_view(projected, adaln_rows, 6, 3);
+    const Tensor scale_mlp = chunk_view(projected, adaln_rows, 6, 4);
+    const Tensor gate_mlp = chunk_view(projected, adaln_rows, 6, 5);
+
+    vt::RmsNorm(d.q, normed.t(), stream.t(), block.norm1, block_args);
+    glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), shift_msa.Ptr<float>(),
+                               scale_msa.Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len,
+                               hidden, 6 * hidden);
+    AttentionDev(d, params,
+                 AttnWeightsDev{&block.qkv_proj, &block.q_norm, &block.k_norm, &block.out_proj},
+                 normed.t(), seq_len, &d_rope_cache.t(), &d_rope_pos.t(), inputs.cu_seqlens,
+                 num_reqs, tmp.t());
+    glue->modulate_gate(d.q, stream.t().Ptr<float>(), gate_msa.Ptr<float>(),
+                        tmp.t().Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len, hidden,
+                        6 * hidden);
+
+    vt::RmsNorm(d.q, normed.t(), stream.t(), block.norm2, block_args);
+    glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), shift_mlp.Ptr<float>(),
+                               scale_mlp.Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len,
+                               hidden, 6 * hidden);
+    MlpDev(d, params, block.fc1, block.fc2, normed.t(), seq_len, tmp.t());
+    glue->modulate_gate(d.q, stream.t().Ptr<float>(), gate_mlp.Ptr<float>(),
+                        tmp.t().Ptr<float>(), d_combined.t().Ptr<int32_t>(), seq_len, hidden,
+                        6 * hidden);
+  }
+
+  // --- final layer (minimax_h3_transformer.py:724-743) ---
+  DBuf final_projected(d, DType::kF32, {m, 2 * hidden});
+  AdalnProjectDev(d, t_emb_act.t(), m, params.time_embed_dim, weights.final_adaln_w,
+                  weights.final_adaln_b, final_projected.t());
+  const Tensor final_shift = chunk_view(final_projected, m, 2, 0);
+  const Tensor final_scale = chunk_view(final_projected, m, 2, 1);
+  vt::RmsNormArgs final_args;
+  final_args.eps = static_cast<float>(params.final_norm_eps);
+  vt::RmsNorm(d.q, normed.t(), stream.t(), weights.final_norm, final_args);
+  // The final layer is single-modality, so it indexes by inverse_indices directly.
+  glue->modulate_scale_shift(d.q, normed.t().Ptr<float>(), final_shift.Ptr<float>(),
+                             final_scale.Ptr<float>(), d_inverse.t().Ptr<int32_t>(), seq_len,
+                             hidden, 2 * hidden);
+
+  DBuf video_all(d, DType::kF32, {seq_len, video_width});
+  LinearDev(d, normed.t(), seq_len, hidden, weights.video_out_w, &weights.video_out_b,
+            video_all.t());
+  DBuf audio_all(d, DType::kF32, {seq_len, audio_width});
+  LinearDev(d, normed.t(), seq_len, hidden, weights.audio_out_w, &weights.audio_out_b,
+            audio_all.t());
+
+  // Select the inference-output rows ON DEVICE, so only the selected rows cross
+  // the bus (:1087-1101).
+  MiniMaxH3DitOutputs out;
+  DBuf video_sel(d, DType::kF32, {inputs.num_infer_out_pos, video_width});
+  vt::IndexSelect(d.q, video_sel.t(), video_all.t(), d_infer_pos.t());
+  out.video_logits.resize(static_cast<size_t>(inputs.num_infer_out_pos * video_width));
+  video_sel.Download(d, out.video_logits.data());
+
+  DBuf audio_sel(d, DType::kF32, {inputs.num_audio_pos, audio_width});
+  vt::IndexSelect(d.q, audio_sel.t(), audio_all.t(), d_audio_pos.t());
+  out.audio_logits.resize(static_cast<size_t>(inputs.num_audio_pos * audio_width));
+  audio_sel.Download(d, out.audio_logits.data());
+
+  // Zeroing the pinned condition rows stays on the host: the rows are already
+  // here, and a kernel for it would buy nothing.
+  if (!inputs.skip_mask_out_condition) {
+    VT_CHECK(inputs.update_mask != nullptr, "minimax_h3: update_mask is required");
+    for (int64_t r = 0; r < inputs.num_infer_out_pos; ++r) {
+      if (inputs.update_mask[r]) continue;
+      std::fill_n(out.video_logits.data() + r * video_width, video_width, 0.0f);
+    }
+    if (inputs.audio_update_mask != nullptr) {
+      for (int64_t r = 0; r < inputs.num_audio_pos; ++r) {
+        if (inputs.audio_update_mask[r]) continue;
+        std::fill_n(out.audio_logits.data() + r * audio_width, audio_width, 0.0f);
+      }
+    }
+  }
+  return out;
+}
+
+}  // namespace vllm

@@ -39,13 +39,17 @@
 #include "vllm/multimodal/qwen3vl_processor.h"
 #include "../gguf_builder.h"
 
+#include "vt/backend.h"
 #include "vt/device.h"
 #include "vt/tensor.h"
 
 using vllm::BuildMiniMaxH3PackedSequence;
 using vllm::BuildMiniMaxH3PackedSequenceRef2va;
 using vllm::EnumerateMiniMaxH3DitTensors;
+using vllm::MiniMaxH3DitDeviceWeights;
 using vllm::MiniMaxH3DitForward;
+using vllm::MiniMaxH3DitForwardDevice;
+using vllm::StageMiniMaxH3DitWeights;
 using vllm::MiniMaxH3DitInputs;
 using vllm::MiniMaxH3DitOutputs;
 using vllm::MiniMaxH3DitParams;
@@ -267,6 +271,86 @@ std::unique_ptr<GoldenWeights> BuildGoldenWeights() {
   return w;
 }
 
+// The fl2va DiT forward case: the packed sequence, the scattered video/audio rows
+// and the prompt embeddings the generator used. Owns every buffer the returned
+// MiniMaxH3DitInputs points at, so both the CPU forward and the DEVICE forward can
+// be driven from exactly the same bytes.
+struct DitForwardCase {
+  MiniMaxH3PackedSequence packed;
+  std::vector<float> x, audio_x, prompt_embeds;
+  std::vector<float> unique_timesteps;
+  std::vector<int64_t> inverse;
+  std::vector<int32_t> refiner_cu;
+  int64_t seq_len = 0, num_img = 0, num_audio = 0, num_text = 0, video_width = 0;
+  MiniMaxH3DitInputs in;
+};
+
+std::unique_ptr<DitForwardCase> BuildDitForwardCase(const MiniMaxH3DitParams& p) {
+  auto c = std::make_unique<DitForwardCase>();
+  c->packed = BuildMiniMaxH3PackedSequence(
+      vllm_test::kH3Fl2va_text_len, vllm_test::kH3Fl2va_latent_t, vllm_test::kH3Fl2va_latent_h,
+      vllm_test::kH3Fl2va_latent_w, vllm_test::kH3Fl2va_audio_t, vllm_test::kH3Fl2va_audio_channel,
+      /*include_keyframe_cond=*/true, {0}, vllm_test::kH3Fl2va_frame_count);
+
+  c->seq_len = c->packed.seq_len;
+  c->video_width = p.video_row_width();
+  c->num_img = static_cast<int64_t>(c->packed.img_pos.size());
+  c->num_audio = static_cast<int64_t>(c->packed.audio_pos.size());
+  c->num_text = static_cast<int64_t>(c->packed.text_pos.size());
+
+  // Scatter the same rows the generator scattered.
+  c->x.assign(static_cast<size_t>(c->seq_len * c->video_width), 0.0f);
+  const std::vector<float> video_rows =
+      MakeParam("dit.video_rows", c->num_img * c->video_width, 1.0);
+  for (int64_t r = 0; r < c->num_img; ++r) {
+    std::memcpy(c->x.data() + c->packed.img_pos[static_cast<size_t>(r)] * c->video_width,
+                video_rows.data() + r * c->video_width,
+                static_cast<size_t>(c->video_width) * sizeof(float));
+  }
+  c->audio_x.assign(static_cast<size_t>(c->seq_len * p.audio_latents_dim), 0.0f);
+  const std::vector<float> audio_rows =
+      MakeParam("dit.audio_rows", c->num_audio * p.audio_latents_dim, 1.0);
+  for (int64_t r = 0; r < c->num_audio; ++r) {
+    std::memcpy(
+        c->audio_x.data() + c->packed.audio_pos[static_cast<size_t>(r)] * p.audio_latents_dim,
+        audio_rows.data() + r * p.audio_latents_dim,
+        static_cast<size_t>(p.audio_latents_dim) * sizeof(float));
+  }
+  c->prompt_embeds = MakeParam("dit.prompt_embeds", c->num_text * p.text_dim, 1.0);
+
+  c->unique_timesteps.assign(
+      vllm_test::kH3DitUniqueTimesteps,
+      vllm_test::kH3DitUniqueTimesteps + vllm_test::kH3Dit_unique_timesteps);
+  c->inverse.assign(vllm_test::kH3DitInverseIndices,
+                    vllm_test::kH3DitInverseIndices + c->seq_len);
+  c->refiner_cu = {0, static_cast<int32_t>(c->num_text), static_cast<int32_t>(c->num_text)};
+
+  MiniMaxH3DitInputs& in = c->in;
+  in.seq_len = c->seq_len;
+  in.x = c->x.data();
+  in.audio_x = c->audio_x.data();
+  in.img_position_ids = c->packed.img_position_ids.data();
+  in.unique_timesteps = c->unique_timesteps.data();
+  in.num_unique_timesteps = static_cast<int64_t>(c->unique_timesteps.size());
+  in.inverse_indices = c->inverse.data();
+  in.token_tags = c->packed.token_tags.data();
+  in.prompt_embeds = c->prompt_embeds.data();
+  in.img_pos = c->packed.img_pos.data();
+  in.num_img_pos = c->num_img;
+  in.audio_pos = c->packed.audio_pos.data();
+  in.num_audio_pos = c->num_audio;
+  in.text_pos = c->packed.text_pos.data();
+  in.num_text_pos = c->num_text;
+  in.infer_out_pos = c->packed.img_pos.data();
+  in.num_infer_out_pos = c->num_img;
+  in.update_mask = c->packed.update_mask.data();
+  in.cu_seqlens = c->packed.cu_seqlens.data();
+  in.num_cu_seqlens = static_cast<int64_t>(c->packed.cu_seqlens.size());
+  in.refiner_cu_seqlens = c->refiner_cu.data();
+  in.num_refiner_cu_seqlens = static_cast<int64_t>(c->refiner_cu.size());
+  return c;
+}
+
 }  // namespace
 
 TEST_CASE("minimax_h3: the deterministic weight stream matches the generator") {
@@ -391,73 +475,11 @@ TEST_CASE("minimax_h3: flow-matching scheduler matches upstream") {
 TEST_CASE("minimax_h3: DiT forward matches upstream at reduced dimensions") {
   const std::unique_ptr<GoldenWeights> weights = BuildGoldenWeights();
   const MiniMaxH3DitParams& p = weights->params;
-
-  const MiniMaxH3PackedSequence packed = BuildMiniMaxH3PackedSequence(
-      vllm_test::kH3Fl2va_text_len, vllm_test::kH3Fl2va_latent_t, vllm_test::kH3Fl2va_latent_h,
-      vllm_test::kH3Fl2va_latent_w, vllm_test::kH3Fl2va_audio_t, vllm_test::kH3Fl2va_audio_channel,
-      /*include_keyframe_cond=*/true, {0}, vllm_test::kH3Fl2va_frame_count);
-
-  const int64_t seq_len = packed.seq_len;
-  const int64_t video_width = p.video_row_width();
-  REQUIRE(video_width == vllm_test::kH3Dit_video_row_width);
-  const int64_t num_img = static_cast<int64_t>(packed.img_pos.size());
-  const int64_t num_audio = static_cast<int64_t>(packed.audio_pos.size());
-  const int64_t num_text = static_cast<int64_t>(packed.text_pos.size());
-
-  // Scatter the same rows the generator scattered.
-  std::vector<float> x(static_cast<size_t>(seq_len * video_width), 0.0f);
-  const std::vector<float> video_rows =
-      MakeParam("dit.video_rows", num_img * video_width, 1.0);
-  for (int64_t r = 0; r < num_img; ++r) {
-    std::memcpy(x.data() + packed.img_pos[static_cast<size_t>(r)] * video_width,
-                video_rows.data() + r * video_width,
-                static_cast<size_t>(video_width) * sizeof(float));
-  }
-  std::vector<float> audio_x(static_cast<size_t>(seq_len * p.audio_latents_dim), 0.0f);
-  const std::vector<float> audio_rows =
-      MakeParam("dit.audio_rows", num_audio * p.audio_latents_dim, 1.0);
-  for (int64_t r = 0; r < num_audio; ++r) {
-    std::memcpy(audio_x.data() + packed.audio_pos[static_cast<size_t>(r)] * p.audio_latents_dim,
-                audio_rows.data() + r * p.audio_latents_dim,
-                static_cast<size_t>(p.audio_latents_dim) * sizeof(float));
-  }
-  const std::vector<float> prompt_embeds =
-      MakeParam("dit.prompt_embeds", num_text * p.text_dim, 1.0);
-
-  const std::vector<float> unique_timesteps(
-      vllm_test::kH3DitUniqueTimesteps,
-      vllm_test::kH3DitUniqueTimesteps + vllm_test::kH3Dit_unique_timesteps);
-  const std::vector<int64_t> inverse(vllm_test::kH3DitInverseIndices,
-                                     vllm_test::kH3DitInverseIndices + seq_len);
-  const std::vector<int32_t> refiner_cu = {0, static_cast<int32_t>(num_text),
-                                           static_cast<int32_t>(num_text)};
-
-  MiniMaxH3DitInputs in;
-  in.seq_len = seq_len;
-  in.x = x.data();
-  in.audio_x = audio_x.data();
-  in.img_position_ids = packed.img_position_ids.data();
-  in.unique_timesteps = unique_timesteps.data();
-  in.num_unique_timesteps = static_cast<int64_t>(unique_timesteps.size());
-  in.inverse_indices = inverse.data();
-  in.token_tags = packed.token_tags.data();
-  in.prompt_embeds = prompt_embeds.data();
-  in.img_pos = packed.img_pos.data();
-  in.num_img_pos = num_img;
-  in.audio_pos = packed.audio_pos.data();
-  in.num_audio_pos = num_audio;
-  in.text_pos = packed.text_pos.data();
-  in.num_text_pos = num_text;
-  in.infer_out_pos = packed.img_pos.data();
-  in.num_infer_out_pos = num_img;
-  in.update_mask = packed.update_mask.data();
-  in.cu_seqlens = packed.cu_seqlens.data();
-  in.num_cu_seqlens = static_cast<int64_t>(packed.cu_seqlens.size());
-  in.refiner_cu_seqlens = refiner_cu.data();
-  in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
+  const std::unique_ptr<DitForwardCase> c = BuildDitForwardCase(p);
+  REQUIRE(c->video_width == vllm_test::kH3Dit_video_row_width);
 
   const MiniMaxH3DitOutputs got =
-      MiniMaxH3DitForward(Cpu(), p, weights->views, in, vt::DType::kF32);
+      MiniMaxH3DitForward(Cpu(), p, weights->views, c->in, vt::DType::kF32);
 
   // f32 throughout on both sides, so the only slack is summation order inside the
   // GEMM and the softmax; 2e-5 absolute is far below any structural error.
@@ -470,12 +492,70 @@ TEST_CASE("minimax_h3: DiT forward matches upstream at reduced dimensions") {
   CHECK(audio_err <= 2e-5);
 
   // The pinned keyframe rows must be zeroed by the update mask.
-  for (int64_t r = 0; r < num_img; ++r) {
-    if (packed.update_mask[static_cast<size_t>(r)]) continue;
-    for (int64_t i = 0; i < video_width; ++i) {
-      CHECK(got.video_logits[static_cast<size_t>(r * video_width + i)] == 0.0f);
+  for (int64_t r = 0; r < c->num_img; ++r) {
+    if (c->packed.update_mask[static_cast<size_t>(r)]) continue;
+    for (int64_t i = 0; i < c->video_width; ++i) {
+      CHECK(got.video_logits[static_cast<size_t>(r * c->video_width + i)] == 0.0f);
     }
   }
+}
+
+// Brick H3-2b. The DEVICE-RESIDENT forward runs the same graph with every
+// activation in device memory. It is NOT bit-identical to the CPU reference and
+// does not claim to be -- it reuses the tuned SHARED vt:: ops (vt::RmsNorm reduces
+// in f32 where RmsNormRows accumulates in double), so it is held to the SAME
+// upstream goldens at the SAME tolerance instead.
+//
+// Runs on the CPU backend here, which is the point: the device forward's STRUCTURE
+// (staging, index plumbing, the strided AdaLN chunk views, on-device row selection)
+// is gated without a GPU. The CUDA case below covers the kernels themselves.
+static void CheckDeviceForward(vt::Queue& q, const char* label) {
+  const std::unique_ptr<GoldenWeights> weights = BuildGoldenWeights();
+  const MiniMaxH3DitParams& p = weights->params;
+  const std::unique_ptr<DitForwardCase> c = BuildDitForwardCase(p);
+
+  const MiniMaxH3DitDeviceWeights staged =
+      StageMiniMaxH3DitWeights(q, p, weights->views);
+  const MiniMaxH3DitOutputs got =
+      MiniMaxH3DitForwardDevice(q, p, staged.weights, c->in, vt::DType::kF32);
+
+  REQUIRE(got.video_logits.size() ==
+          static_cast<size_t>(c->num_img * c->video_width));
+  REQUIRE(got.audio_logits.size() ==
+          static_cast<size_t>(c->num_audio * p.audio_latents_dim));
+
+  const double video_err =
+      MaxAbsDiff(got.video_logits, vllm_test::kH3DitVideoLogitsGolden, got.video_logits.size());
+  const double audio_err =
+      MaxAbsDiff(got.audio_logits, vllm_test::kH3DitAudioLogitsGolden, got.audio_logits.size());
+  INFO(label << ": video max|diff| = " << video_err << ", audio max|diff| = " << audio_err);
+  CHECK(video_err <= 2e-5);
+  CHECK(audio_err <= 2e-5);
+
+  // The pinned keyframe rows must still be zeroed.
+  for (int64_t r = 0; r < c->num_img; ++r) {
+    if (c->packed.update_mask[static_cast<size_t>(r)]) continue;
+    for (int64_t i = 0; i < c->video_width; ++i) {
+      CHECK(got.video_logits[static_cast<size_t>(r * c->video_width + i)] == 0.0f);
+    }
+  }
+}
+
+TEST_CASE("minimax_h3: the DEVICE-resident DiT forward matches upstream (CPU backend)") {
+  vt::Queue q{Cpu(), nullptr};
+  CheckDeviceForward(q, "cpu-device-forward");
+}
+
+TEST_CASE("minimax_h3: the DEVICE-resident DiT forward matches upstream on CUDA") {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  vt::Queue q = cuda->CreateQueue();
+  CheckDeviceForward(q, "cuda-device-forward");
 }
 
 TEST_CASE("minimax_h3: the bf16 production stream matches upstream's dtype policy") {

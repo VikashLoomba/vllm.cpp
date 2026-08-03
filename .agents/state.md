@@ -35278,3 +35278,45 @@ a crash, which is the kind of bug that would have surfaced later as flaky.
 Still PAUSED per the developer's standing directive: the device-resident FP4
 forward, any e2e run on a real quantized checkpoint, and therefore any speed
 number vs vLLM-Omni all need the GPU.
+
+## 2026-08-03 - MiniMax-H3 W2b: device-resident DiT forward, verified on a real GPU
+
+The developer opened a second GPU box (Thor, sm_110, aarch64, container-only) and
+asked for H3-2b there. It landed: MiniMaxH3DitForwardDevice runs the whole DiT
+graph with every activation in device memory, so the block stack -- and above it
+the 50-step denoise loop -- never round-trips through the host.
+
+THREE kernels, not thirty. The instinct was to port ~49 host glue loops; almost all
+of them already had a tuned shared op. The one that looked like it needed a bespoke
+kernel was the RoPE, and it did not: H3's _apply_rope is plain NeoX rotate_half over
+the leading rot_dim, and only the ANGLES are unusual (three axes off the fp64
+position grid rather than one scalar). vt::RopeFromCache takes a per-row cos/sin
+cache, so building that cache from the position grid reproduces it exactly. That
+left the two indexed AdaLN modulates and an ungated SiLU (the shared set has
+SiluAndMul/MoeSiluMul, both GATED). Those three live in a kMiniMaxH3 glue table
+mirroring the kLaguna precedent -- but registered on BOTH kCPU and kCUDA, where
+Laguna's is CUDA-only, so the whole device path is gated in CPU CI and a GPU is
+needed only for the kernels.
+
+THE BUG WORTH REMEMBERING. The AdaLN chunk views are ROW-STRIDED: chunk c of row r
+lives at r*(6*hidden) + c*hidden, so rows are hidden-wide but 6*hidden apart. The
+first kernels indexed them as contiguous. The result was not garbage -- it was
+1.7e-2 off, which is exactly the magnitude f32-vs-double reduction drift would
+produce, so the failure ARGUED FOR ITSELF as acceptable numerical slack. It was a
+real defect reading the wrong memory. The stride is now an explicit kernel
+parameter rather than an assumption. Generalizes: when a device port lands "close
+but not close enough", suspect a LAYOUT assumption before blaming reduction order,
+and make strides parameters instead of conventions.
+
+Gate: CPU backend 36/36; on Thor's GPU 36/36 with video max|diff| 1.49e-7 and audio
+8.94e-8 vs the upstream goldens (tolerance 2e-5) -- on par with the CPU reference's
+own 1.6e-7. Proven to have RUN, not skipped: the CUDA case executes 220 assertions
+(9673 total on GPU vs 9453 on CPU). CUDA build 1043/1043 clean, zero warnings.
+
+NOT bit-identical to the CPU reference, deliberately: vt::RmsNorm reduces in f32
+where the reference accumulates in double. f32 is what upstream torch does, so the
+device path is arguably the closer mirror; it is held to the same goldens instead.
+
+Thor CANNOT settle H3's speed question: sm_110 resolves every fp4/cutlass/marlin/fa2
+feature DISABLED, so the NVFP4 path still needs sm_121a (dgx). What Thor gave is the
+correctness foundation the FP4 layer drops onto -- device-resident tensors first.

@@ -2,7 +2,7 @@
 
 ## MiniMax-H3 (omni-modal video+audio DiT) — PENDING; hardware verdict CORRECTED (2026-08-03, `CLAIM-MINIMAX-H3-W0-W2`, `CLAIM-MINIMAX-H3-W6A-W9`)
 
-**Serving (W7) is DONE on CPU as of 2026-08-03**; no SPEED number exists yet — the device-resident FP4 forward, and therefore any comparison against vLLM-Omni, still needs a GPU. Every figure below is a CORRECTNESS gate, not a throughput one.
+**Serving (W7) is DONE on CPU and the DEVICE-RESIDENT forward (W2b, f32) is LANDED and GPU-VERIFIED as of 2026-08-03**; still no SPEED number — the FP4 path — and therefore any comparison against vLLM-Omni — needs sm_121a, because sm_110 (the Thor box these numbers come from) resolves every fp4/cutlass/marlin/fa2 feature DISABLED. Every figure below is a CORRECTNESS gate, not a throughput one.
 
 **Throughput disposition: PENDING — no number is owed yet, and the earlier
 "not reproducible on this project's hardware" verdict is WITHDRAWN.**
@@ -63,6 +63,8 @@ identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 | **`/v1/videos` ROUTE DISPATCH on ApiServer** | pass (4 cases): no-runner 500, unknown-id 404, sync success returns the runner's path, a throwing runner fails the JOB on both endpoints (process survives), malformed body 400 without reaching the runner |
 | **MP4 mux END TO END through the example binary** | pass; 12 PPM frames + WAV -> ffprobe reports h264 / yuv420p + stereo AAC 32 kHz (previously only the argv was validated) |
 | **Full CPU suite with the serving surface landed** | **333/333 pass**, clean build, zero warnings |
+| **DEVICE-RESIDENT DiT forward** (brick H3-2b, CPU backend) | pass — same upstream goldens, same 2e-5 tolerance as the CPU reference |
+| **DEVICE-RESIDENT DiT forward on a REAL GPU** (Thor, sm_110, in-container) | **video max abs diff 1.49e-7 / audio 8.94e-8** — ~134x inside tolerance and on par with the CPU reference's own 1.6e-7. 36/36 cases; the CUDA case is proven to have RUN (220 assertions execute rather than skip), and the CUDA build is 1043/1043 clean, zero warnings |
 | **WHOLE t2va path composes** | frames + stereo waveform, correct shapes, finite, in [-1, 1] |
 | **GGUF load -> runnable DiT** | geometry from shapes; a real forward runs off the loaded weights |
 | **NVFP4 load -> runnable DiT** | compressed-tensors triple dequantized; a real forward runs |

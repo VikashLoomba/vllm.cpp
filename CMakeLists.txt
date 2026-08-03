@@ -475,6 +475,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_pipeline.cpp
   src/vllm/model_executor/models/minimax_h3_wav.cpp
   src/vllm/model_executor/models/minimax_h3_mux.cpp
+  src/vllm/model_executor/models/minimax_h3_device_resolve.cpp
+  src/vllm/model_executor/models/minimax_h3_device.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
@@ -729,6 +731,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
+  src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_matmul_elem.cpp
   src/vt/cpu/cpu_quant_dequant.cpp
   src/vt/cpu/cpu_quant_act.cpp
@@ -901,7 +904,8 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
-    src/vt/cuda/cuda_laguna.cu)
+    src/vt/cuda/cuda_laguna.cu
+    src/vt/cuda/cuda_minimax_h3.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

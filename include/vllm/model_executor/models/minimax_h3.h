@@ -41,6 +41,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -786,6 +787,40 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
                                         const MiniMaxH3DitWeights& weights,
                                         const MiniMaxH3DitInputs& inputs,
                                         vt::DType compute_dtype);
+
+// --- device-resident forward (brick H3-2b, minimax_h3_device.cpp) -----------
+// Owned device copies of every DiT weight, plus the views the device forward
+// takes. Upload once, reuse across denoise steps -- the whole point of the
+// device path is that the 50-step loop never re-stages weights.
+struct MiniMaxH3DitDeviceWeights {
+  std::vector<std::shared_ptr<void>> storage;  // owns the device allocations
+  MiniMaxH3DitWeights weights;                 // views into `storage`
+};
+
+// Stage a host-resident weight set onto `queue`'s device. Every tensor must be
+// f32 and host-resident; the returned views live on the device.
+MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
+                                                   const MiniMaxH3DitParams& params,
+                                                   const MiniMaxH3DitWeights& host);
+
+// The DEVICE-RESIDENT DiT forward: same graph as MiniMaxH3DitForward, but every
+// activation stays in device memory for the whole block stack -- only the inputs
+// go up and the selected output rows come back.
+//
+// NOT bit-identical to the CPU reference, and deliberately so: it reuses the
+// tuned SHARED vt:: ops (notably vt::RmsNorm, whose reduction is f32 where the
+// reference accumulates in double -- f32 is what upstream torch does). It is
+// gated against the SAME upstream goldens, at the same tolerance.
+//
+// `weights` must be device-resident on `queue`'s device (see
+// StageMiniMaxH3DitWeights). compute_dtype must be kF32 for now; the bf16 stream
+// policy is a follow-up (see .agents/specs/minimax-h3.md).
+MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
+                                              const MiniMaxH3DitParams& params,
+                                              const MiniMaxH3DitWeights& weights,
+                                              const MiniMaxH3DitInputs& inputs,
+                                              vt::DType compute_dtype);
+
 
 // ---------------------------------------------------------------------------
 // Denoise loop (denoise_loop.py:129-239)

@@ -212,6 +212,11 @@ class RefLinear:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
+    def as_bf16(self) -> None:
+        self.weight = bf16(self.weight)
+        if self.bias is not None:
+            self.bias = bf16(self.bias)
+
 
 class RefAttention:
     """MiniMaxH3Attention (minimax_h3_transformer.py:320-467).
@@ -282,11 +287,29 @@ class RefAdalnProj:
         return tuple(x.chunk(self.expand_ratio, dim=-1))
 
 
-class RefDiT:
-    """MiniMaxH3DiTModel (minimax_h3_transformer.py:765-1102) at TP=1, fp32."""
+def bf16(x: torch.Tensor) -> torch.Tensor:
+    """Round through bfloat16 and come back to f32.
 
-    def __init__(self, arch: dict):
+    The production H3 stream is bf16 with specific fp32 islands
+    (minimax_h3_transformer.py:85-101 for the params, and the explicit
+    `dtype=_BF16_DTYPE` casts in `_modulate_*`). Rounding in place rather than
+    switching tensor dtypes keeps the reference and the C++ port comparing the
+    SAME cast points instead of two different accumulation strategies.
+    """
+    return x.to(torch.bfloat16).to(torch.float32)
+
+
+class RefDiT:
+    """MiniMaxH3DiTModel (minimax_h3_transformer.py:765-1102) at TP=1.
+
+    `bf16_stream=True` reproduces the production dtype policy: every activation
+    that upstream materializes in bf16 is rounded to bf16, while the fp32 islands
+    (patch projections, time embedder, both output heads) stay fp32.
+    """
+
+    def __init__(self, arch: dict, bf16_stream: bool = False):
         self.arch = arch
+        self.bf16_stream = bf16_stream
         h = arch["hidden_size"]
         pt, ph, pw = arch["patch_size"]
         self.video_patch_dim = arch["latents_dim"] * pt * ph * pw
@@ -335,6 +358,39 @@ class RefDiT:
         self.video_out = RefLinear("final_layer.video_out", self.video_patch_dim, h, bias=True)
         self.audio_out = RefLinear("final_layer.audio_out", arch["audio_latents_dim"], h, bias=True)
 
+    def to_bf16_weights(self) -> None:
+        """Round every BF16-STORED parameter; the fp32 islands stay fp32.
+
+        The fp32 islands are exactly MINIMAX_H3_FP32_PARAM_NAMES +
+        MINIMAX_H3_FP32_BUFFER_NAMES (minimax_h3_transformer.py:85-101): both
+        patch projections, both time-embedder projections, both output heads, and
+        rope.inv_freq.
+        """
+        self.condition_proj.as_bf16()
+        for group in (self.refiner, self.blocks):
+            for block in group:
+                block["norm1"] = bf16(block["norm1"])
+                block["norm2"] = bf16(block["norm2"])
+                block["attn"].qkv_proj.as_bf16()
+                block["attn"].out_proj.as_bf16()
+                block["attn"].q_norm = bf16(block["attn"].q_norm)
+                block["attn"].k_norm = bf16(block["attn"].k_norm)
+                block["mlp"].fc1.as_bf16()
+                block["mlp"].fc2.as_bf16()
+                if "adaln" in block:
+                    block["adaln"].linear.as_bf16()
+        self.refiner_final_norm = bf16(self.refiner_final_norm)
+        self.final_norm = bf16(self.final_norm)
+        self.final_adaln.linear.as_bf16()
+
+    def q(self, x: torch.Tensor) -> torch.Tensor:
+        """Round to the block-stream dtype (identity in the fp32 gate)."""
+        return bf16(x) if self.bf16_stream else x
+
+    def qw(self, w: torch.Tensor) -> torch.Tensor:
+        """Round a BF16-stored weight; the fp32 islands never go through this."""
+        return bf16(w) if self.bf16_stream else w
+
     def time_embed(self, t: torch.Tensor) -> torch.Tensor:
         """MiniMaxH3TimeEmbedder.forward (minimax_h3_transformer.py:272-285).
 
@@ -367,46 +423,54 @@ class RefDiT:
         seq_len = int(x.shape[1])
         freqs = rope_freqs(self.inv_freq, img_position_ids)
 
-        # _embed (minimax_h3_transformer.py:944-984)
+        # _embed (minimax_h3_transformer.py:944-984). The two patch projections
+        # are fp32 islands; their outputs are cast to the bf16 sequence dtype only
+        # during the indexed scatter.
         video_embed = self.video_patch_proj(x.view(-1, x.shape[-1]).index_select(0, img_pos))
         audio_embed = self.audio_patch_proj(audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos))
-        text_embed = self.condition_proj(prompt_embeds)
+        text_embed = self.q(self.condition_proj(self.q(prompt_embeds)))
         for block in self.refiner:
-            text_embed = text_embed + block["attn"](
-                rms_norm(text_embed, block["norm1"], self.arch["norm_eps"]), None, refiner_cu_seqlens
-            )
-            text_embed = text_embed + block["mlp"](
-                rms_norm(text_embed, block["norm2"], self.arch["norm_eps"])
-            )
-        text_embed = rms_norm(text_embed, self.refiner_final_norm, self.arch["final_norm_eps"])
+            text_embed = self.q(text_embed + block["attn"](
+                self.q(rms_norm(text_embed, block["norm1"], self.arch["norm_eps"])),
+                None,
+                refiner_cu_seqlens,
+            ))
+            text_embed = self.q(text_embed + block["mlp"](
+                self.q(rms_norm(text_embed, block["norm2"], self.arch["norm_eps"]))
+            ))
+        text_embed = self.q(rms_norm(text_embed, self.refiner_final_norm, self.arch["final_norm_eps"]))
 
         embeddings = torch.zeros((seq_len, self.arch["hidden_size"]), dtype=torch.float32)
-        embeddings.index_add_(0, text_pos, text_embed[: text_pos.shape[0]])
-        embeddings.index_add_(0, img_pos, video_embed[: img_pos.shape[0]])
-        embeddings.index_add_(0, audio_pos, audio_embed[: audio_pos.shape[0]])
+        embeddings.index_add_(0, text_pos, self.q(text_embed)[: text_pos.shape[0]])
+        embeddings.index_add_(0, img_pos, self.q(video_embed)[: img_pos.shape[0]])
+        embeddings.index_add_(0, audio_pos, self.q(audio_embed)[: audio_pos.shape[0]])
 
         t_emb = self.time_embed(unique_timesteps)
         combined = inverse_indices * MODALITY_NUM + token_tags.clamp(min=0)
 
         hidden = embeddings
         for block in self.blocks:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block["adaln"](t_emb)
+            # AdaLN parameters are produced by a BF16 linear over the fp32 t_emb.
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
+                self.q(v) for v in block["adaln"](t_emb)
+            ]
             residual = hidden
-            h = rms_norm(hidden, block["norm1"], self.arch["norm_eps"])
-            h = modulate_scale_shift(h, shift_msa, scale_msa, combined)
-            h = block["attn"](h, freqs, cu_seqlens)
-            hidden = modulate_gate(residual, gate_msa, h, combined)
+            h = self.q(rms_norm(hidden, block["norm1"], self.arch["norm_eps"]))
+            h = self.q(modulate_scale_shift(h, shift_msa, scale_msa, combined))
+            h = self.q(block["attn"](h, freqs, cu_seqlens))
+            hidden = self.q(modulate_gate(residual, gate_msa, h, combined))
 
             residual = hidden
-            h = rms_norm(hidden, block["norm2"], self.arch["norm_eps"])
-            h = modulate_scale_shift(h, shift_mlp, scale_mlp, combined)
-            h = block["mlp"](h)
-            hidden = modulate_gate(residual, gate_mlp, h, combined)
+            h = self.q(rms_norm(hidden, block["norm2"], self.arch["norm_eps"]))
+            h = self.q(modulate_scale_shift(h, shift_mlp, scale_mlp, combined))
+            h = self.q(block["mlp"](h))
+            hidden = self.q(modulate_gate(residual, gate_mlp, h, combined))
 
         # MiniMaxH3FinalLayer.forward (minimax_h3_transformer.py:724-743)
-        shift, scale = self.final_adaln(t_emb)
-        h = rms_norm(hidden, self.final_norm, self.arch["final_norm_eps"])
-        h = modulate_scale_shift(h, shift, scale, inverse_indices)
+        shift, scale = [self.q(v) for v in self.final_adaln(t_emb)]
+        h = self.q(rms_norm(hidden, self.final_norm, self.arch["final_norm_eps"]))
+        h = self.q(modulate_scale_shift(h, shift, scale, inverse_indices))
+        # Both output heads are fp32 islands; the stream is cast up before them.
         video = self.video_out(h)
         audio = self.audio_out(h)
 
@@ -707,9 +771,137 @@ def emit_dit(out, packed) -> None:
     emit_i64(out, "kH3DitInverseIndices", inverse_indices)
     emit_f32(out, "kH3DitVideoLogitsGolden", video_logits)
     emit_f32(out, "kH3DitAudioLogitsGolden", audio_logits)
+
+    # The PRODUCTION dtype policy: bf16 activation stream with fp32 islands.
+    bf16_model = RefDiT(arch, bf16_stream=True)
+    bf16_model.to_bf16_weights()
+    bf16_video, bf16_audio = bf16_model(
+        x=x,
+        audio_x=audio_x,
+        img_position_ids=img_position_ids,
+        unique_timesteps=unique_timesteps,
+        inverse_indices=inverse_indices,
+        update_mask=update_mask,
+        token_tags=token_tags,
+        prompt_embeds=prompt_embeds,
+        img_pos=img_pos,
+        audio_pos=audio_pos,
+        text_pos=text_pos,
+        infer_out_pos=img_pos,
+        cu_seqlens=cu_seqlens,
+        refiner_cu_seqlens=refiner_cu,
+    )
+    emit_f32(out, "kH3DitVideoLogitsBf16Golden", bf16_video)
+    emit_f32(out, "kH3DitAudioLogitsBf16Golden", bf16_audio)
     # A handful of H3Rand probes so the C++ side can prove its PRNG matches before
     # it ever blames the model math for a mismatch.
     emit_f64(out, "kH3RandProbe", h3_rand("h3.probe", 8))
+
+
+def emit_planner(out, time_request) -> None:
+    """Section 6: request planning (time_request.py executed VERBATIM).
+
+    `_align_multiple` / `_reference_image_shape` / `_resolve_shape` live in
+    pipeline_minimax_h3.py, which imports the whole vLLM-Omni diffusion stack, so
+    those three are restated here (they are five lines each) exactly as
+    pipeline_minimax_h3.py:121-122, 207-222 and 393-434 define them.
+    """
+    out.write("// --- section 6: request planning (time_request.py + shape resolution) ---\n")
+
+    frame_inputs = [1, 4, 5, 6, 17, 22, 23, 39, 40, 100, 124, 209, 210, 512]
+    aligned = [time_request.minimax_h3_align_frame_count(v) for v in frame_inputs]
+    latent_t = [time_request._video_latent_t(v) for v in aligned]
+    back = [time_request._frame_count_from_video_latent_t(v) for v in latent_t]
+    audio_t = [time_request._audio_latent_t(v / 24.0) for v in aligned]
+    emit_scalar(out, "kH3PlanFrameCases", len(frame_inputs))
+    out.write("\n")
+    emit_i64(out, "kH3PlanFrameInputs", frame_inputs)
+    emit_i64(out, "kH3PlanFrameAligned", aligned)
+    emit_i64(out, "kH3PlanVideoLatentT", latent_t)
+    emit_i64(out, "kH3PlanFrameFromLatentT", back)
+    emit_i64(out, "kH3PlanAudioLatentT", audio_t)
+
+    # Sigma schedules at the shipped video/audio flow shifts plus a short case.
+    schedules = [(50, 12.0), (50, 3.0), (8, 6.0), (1, 6.0)]
+    flat, lengths = [], []
+    for steps, shift in schedules:
+        sigmas = time_request.minimax_h3_time_shift_sigmas(num_steps=steps, shift_scale=shift)
+        lengths.append(len(sigmas))
+        flat.extend(sigmas)
+    emit_scalar(out, "kH3PlanSigmaCases", len(schedules))
+    out.write("\n")
+    emit_i64(out, "kH3PlanSigmaSteps", [s for s, _ in schedules])
+    emit_f64(out, "kH3PlanSigmaShifts", [sh for _, sh in schedules])
+    emit_i64(out, "kH3PlanSigmaLengths", lengths)
+    emit_f32(out, "kH3PlanSigmasGolden", np.asarray(flat, dtype=np.float32))
+
+    def align_multiple(value, multiple=32):
+        # pipeline_minimax_h3.py:121-122
+        return max(multiple, int(round(float(value) / multiple)) * multiple)
+
+    def reference_image_shape(width, height):
+        # pipeline_minimax_h3.py:207-222
+        if width > 4 * height or height > 4 * width:
+            raise ValueError("aspect")
+        scale = 2048 / min(width, height)
+        return align_multiple(width * scale, 32), align_multiple(height * scale, 32)
+
+    ref_cases = [(1920, 1080), (1080, 1920), (1000, 1000), (800, 600), (2400, 1000)]
+    ref_out = []
+    for w, h in ref_cases:
+        rw, rh = reference_image_shape(w, h)
+        ref_out.extend([rw, rh])
+    emit_scalar(out, "kH3PlanRefImageCases", len(ref_cases))
+    out.write("\n")
+    emit_i64(out, "kH3PlanRefImageInputs", [v for case in ref_cases for v in case])
+    emit_i64(out, "kH3PlanRefImageGolden", ref_out)
+
+    def resolve_shape(task, duration, num_frames, height, width, img_w, img_h):
+        # pipeline_minimax_h3.py:393-434
+        fps = 24
+        if duration is not None:
+            requested = int(round(float(duration) * fps))
+        elif int(num_frames or 1) > 1:
+            requested = int(num_frames)
+        else:
+            requested = 124 if task == "ref2va" else 209
+        frames = time_request.minimax_h3_align_frame_count(requested)
+        if height is None or width is None:
+            if task == "fl2va" and img_w is not None:
+                ratio = img_w / img_h
+                if ratio >= 1:
+                    height, width = 768, align_multiple(768 * ratio)
+                else:
+                    width, height = 768, align_multiple(768 / ratio)
+            else:
+                height, width = 768, 1344
+        height = int(height) // 32 * 32
+        width = int(width) // 32 * 32
+        return (height, width, frames, time_request._video_latent_t(frames),
+                time_request._audio_latent_t(frames / fps))
+
+    shape_cases = [
+        ("t2va", None, 0, None, None, None, None),
+        ("ref2va", None, 0, None, None, None, None),
+        ("t2va", 6.0, 0, None, None, None, None),
+        ("t2va", None, 100, None, None, None, None),
+        ("fl2va", None, 0, None, None, 1920, 1080),
+        ("fl2va", None, 0, None, None, 1080, 1920),
+        ("t2va", 15.0, 0, 1000, 1700, None, None),
+    ]
+    flat_shape = []
+    for task, dur, nf, h, w, iw, ih in shape_cases:
+        flat_shape.extend(resolve_shape(task, dur, nf, h, w, iw, ih))
+    emit_scalar(out, "kH3PlanShapeCases", len(shape_cases))
+    out.write("\n")
+    emit_f64(out, "kH3PlanShapeDurations", [(-1.0 if d is None else d) for _, d, _, _, _, _, _ in shape_cases])
+    emit_i64(out, "kH3PlanShapeNumFrames", [nf for _, _, nf, _, _, _, _ in shape_cases])
+    emit_i64(out, "kH3PlanShapeHeights", [(0 if h is None else h) for _, _, _, h, _, _, _ in shape_cases])
+    emit_i64(out, "kH3PlanShapeWidths", [(0 if w is None else w) for _, _, _, _, w, _, _ in shape_cases])
+    emit_i64(out, "kH3PlanShapeImageW", [(0 if iw is None else iw) for _, _, _, _, _, iw, _ in shape_cases])
+    emit_i64(out, "kH3PlanShapeImageH", [(0 if ih is None else ih) for _, _, _, _, _, _, ih in shape_cases])
+    emit_i64(out, "kH3PlanShapeGolden", flat_shape)
+    out.write("// Task order for kH3PlanShape*: " + ", ".join(c[0] for c in shape_cases) + "\n\n")
 
 
 def main() -> int:
@@ -720,6 +912,7 @@ def main() -> int:
 
     root = args.vllm_omni.expanduser()
     packed_sequence = load_upstream(root, "packed_sequence")
+    time_request = load_upstream(root, "time_request")
     packed_tokens = load_upstream(root, "packed_tokens")
     scheduling = load_upstream(root, "scheduling_minimax_h3_euler_ancestral")
 
@@ -735,6 +928,7 @@ def main() -> int:
         emit_packing(out, packed_tokens)
         emit_scheduler(out, scheduling)
         emit_dit(out, packed)
+        emit_planner(out, time_request)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

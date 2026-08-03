@@ -55,6 +55,37 @@ void RmsNormRows(const float* in, const float* weight, float* out, int64_t rows,
 
 float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 
+// Round through bfloat16 (round-to-nearest-even, matching torch's .to(bf16)).
+// The production H3 stream is bf16 with fp32 islands; rounding IN PLACE rather
+// than switching storage keeps this forward comparing the same CAST POINTS as
+// upstream instead of a different accumulation strategy.
+float RoundBf16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  if ((bits & 0x7F800000u) == 0x7F800000u) {  // inf/nan pass through
+    bits &= 0xFFFF0000u;
+  } else {
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+  }
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
+// The block-stream dtype policy for one forward.
+struct StreamDtype {
+  bool bf16 = false;
+  float operator()(float value) const { return bf16 ? RoundBf16(value) : value; }
+  void Apply(float* data, int64_t count) const {
+    if (!bf16) return;
+    for (int64_t i = 0; i < count; ++i) data[i] = RoundBf16(data[i]);
+  }
+  void Apply(std::vector<float>& buffer) const {
+    Apply(buffer.data(), static_cast<int64_t>(buffer.size()));
+  }
+};
+
 // vt::MatmulBT + optional bias. Weight is [out_features, in_features], matching
 // every {Column,Row,QKV,MergedColumn}ParallelLinear at TP=1.
 void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
@@ -146,12 +177,15 @@ void ModulateGate(float* residual, int64_t rows, int64_t width, const float* gat
 // Returns the flat [M*modality_num, expand*H] buffer; chunk c of row m starts at
 // (m * expand + c) * H within the caller's indexing scheme below.
 std::vector<float> AdalnProject(vt::Queue& q, const float* t_emb, int64_t m, int64_t time_embed_dim,
-                                const Tensor& weight, const Tensor& bias) {
+                                const Tensor& weight, const Tensor& bias, const StreamDtype& dt) {
   std::vector<float> activated(static_cast<size_t>(m * time_embed_dim));
   for (int64_t i = 0; i < m * time_embed_dim; ++i) activated[static_cast<size_t>(i)] = Silu(t_emb[i]);
   const int64_t out_features = weight.shape[0];
+  // silu(t_emb) is fp32, then cast to the BF16 linear's dtype before the GEMM.
+  dt.Apply(activated);
   std::vector<float> out(static_cast<size_t>(m * out_features));
   Linear(q, activated.data(), m, time_embed_dim, weight, &bias, out.data());
+  dt.Apply(out);
   return out;
 }
 
@@ -181,7 +215,7 @@ struct AttentionBlockWeights {
 void AttentionForward(vt::Queue& q, const MiniMaxH3DitParams& params,
                       const AttentionBlockWeights& w, const float* in, int64_t rows,
                       const float* rope_freqs, const int32_t* cu_seqlens, int num_reqs,
-                      float* out) {
+                      const StreamDtype& dt, float* out) {
   const int64_t heads = params.num_attention_heads;
   const int64_t head_dim = params.attention_head_dim;
   const int64_t inner = heads * head_dim;
@@ -189,6 +223,7 @@ void AttentionForward(vt::Queue& q, const MiniMaxH3DitParams& params,
 
   std::vector<float> qkv(static_cast<size_t>(rows * 3 * inner));
   Linear(q, in, rows, hidden, *w.qkv, nullptr, qkv.data());
+  dt.Apply(qkv);
 
   std::vector<float> qbuf(static_cast<size_t>(rows * inner));
   std::vector<float> kbuf(static_cast<size_t>(rows * inner));
@@ -207,9 +242,13 @@ void AttentionForward(vt::Queue& q, const MiniMaxH3DitParams& params,
   RmsNormRows(kbuf.data(), w.k_norm->Ptr<float>(), kn.data(), rows * heads, head_dim,
               params.qk_norm_eps);
 
+  dt.Apply(qn);
+  dt.Apply(kn);
   if (rope_freqs != nullptr) {
     ApplyRope(qn.data(), rows, heads, head_dim, rope_freqs, params.rope_rot_dim());
     ApplyRope(kn.data(), rows, heads, head_dim, rope_freqs, params.rope_rot_dim());
+    dt.Apply(qn);
+    dt.Apply(kn);
   }
 
   // The SHARED packed bidirectional attention op. `cu_seqlens` carries the packed
@@ -227,23 +266,29 @@ void AttentionForward(vt::Queue& q, const MiniMaxH3DitParams& params,
   args.cu_seqlens = cu_seqlens;
   args.num_reqs = num_reqs;
   vt::DFlashBlockAttention(q, ta, tq, tk, tv, args);
+  dt.Apply(attn);
 
   Linear(q, attn.data(), rows, inner, *w.out_proj, nullptr, out);
+  dt.Apply(out, rows * hidden);
 }
 
 // MiniMaxH3MLP.forward (minimax_h3_transformer.py:512-517): silu(gate) * up.
 void MlpForward(vt::Queue& q, const MiniMaxH3DitParams& params, const Tensor& fc1,
-                const Tensor& fc2, const float* in, int64_t rows, float* out) {
+                const Tensor& fc2, const float* in, int64_t rows, const StreamDtype& dt,
+                float* out) {
   const int64_t ffn = params.ffn_hidden_size;
   std::vector<float> hidden(static_cast<size_t>(rows * 2 * ffn));
   Linear(q, in, rows, params.hidden_size, fc1, nullptr, hidden.data());
+  dt.Apply(hidden);
   std::vector<float> act(static_cast<size_t>(rows * ffn));
   for (int64_t r = 0; r < rows; ++r) {
     const float* src = hidden.data() + r * 2 * ffn;
     float* dst = act.data() + r * ffn;
     for (int64_t i = 0; i < ffn; ++i) dst[i] = Silu(src[i]) * src[ffn + i];
   }
+  dt.Apply(act);
   Linear(q, act.data(), rows, ffn, fc2, nullptr, out);
+  dt.Apply(out, rows * params.hidden_size);
 }
 
 AttentionBlockWeights AttnOf(const MiniMaxH3DitBlockWeights& b) {
@@ -413,9 +458,14 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   VT_CHECK(device.type == vt::DeviceType::kCPU,
            "minimax_h3: the reference DiT forward is CPU-only; the device-resident "
            "forward is brick H3-2b (.agents/specs/minimax-h3.md)");
-  VT_CHECK(compute_dtype == DType::kF32,
-           "minimax_h3: the reference DiT forward computes in f32; the bf16 production "
-           "stream lands with the device forward (brick H3-2b)");
+  VT_CHECK(compute_dtype == DType::kF32 || compute_dtype == DType::kBF16,
+           "minimax_h3: the reference DiT forward computes in f32 (parity) or bf16 "
+           "(the production stream policy)");
+  // kBF16 reproduces upstream's PRODUCTION dtype policy: the block stream is bf16
+  // while the patch projections, the time embedder, and both output heads stay
+  // fp32 islands (minimax_h3_transformer.py:85-101). Both dtypes run the SAME
+  // code; only the rounding points differ.
+  const StreamDtype dt{compute_dtype == DType::kBF16};
   VT_CHECK(static_cast<int64_t>(weights.blocks.size()) == params.num_layers,
            "minimax_h3: block weight count does not match num_layers");
   VT_CHECK(static_cast<int64_t>(weights.refiner.size()) == params.token_refiner_num_layers,
@@ -456,8 +506,15 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
          &weights.audio_patch_proj_b, audio_embed.data());
 
   std::vector<float> text_embed(static_cast<size_t>(inputs.num_text_pos * hidden));
-  Linear(q, inputs.prompt_embeds, inputs.num_text_pos, params.text_dim, weights.condition_proj_w,
-         &weights.condition_proj_b, text_embed.data());
+  {
+    // text rows enter as the stream dtype before the BF16 condition projection.
+    std::vector<float> text_rows(inputs.prompt_embeds,
+                                 inputs.prompt_embeds + inputs.num_text_pos * params.text_dim);
+    dt.Apply(text_rows);
+    Linear(q, text_rows.data(), inputs.num_text_pos, params.text_dim, weights.condition_proj_w,
+           &weights.condition_proj_b, text_embed.data());
+    dt.Apply(text_embed);
+  }
 
   // Token refiner: a plain pre-norm stack, no AdaLN and no RoPE
   // (minimax_h3_transformer.py:564-623). It runs on the REPLICATED text rows, so
@@ -468,18 +525,21 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
     for (const MiniMaxH3DitBlockWeights& block : weights.refiner) {
       RmsNormRows(text_embed.data(), block.norm1.Ptr<float>(), normed.data(), rows, hidden,
                   params.norm_eps);
+      dt.Apply(normed.data(), rows * hidden);
       AttentionForward(q, params, AttnOf(block), normed.data(), rows, nullptr,
                        inputs.refiner_cu_seqlens,
-                       static_cast<int>(inputs.num_refiner_cu_seqlens - 1), tmp.data());
-      for (size_t i = 0; i < text_embed.size(); ++i) text_embed[i] += tmp[i];
+                       static_cast<int>(inputs.num_refiner_cu_seqlens - 1), dt, tmp.data());
+      for (size_t i = 0; i < text_embed.size(); ++i) text_embed[i] = dt(text_embed[i] + tmp[i]);
       RmsNormRows(text_embed.data(), block.norm2.Ptr<float>(), normed.data(), rows, hidden,
                   params.norm_eps);
-      MlpForward(q, params, block.fc1, block.fc2, normed.data(), rows, tmp.data());
-      for (size_t i = 0; i < text_embed.size(); ++i) text_embed[i] += tmp[i];
+      dt.Apply(normed.data(), rows * hidden);
+      MlpForward(q, params, block.fc1, block.fc2, normed.data(), rows, dt, tmp.data());
+      for (size_t i = 0; i < text_embed.size(); ++i) text_embed[i] = dt(text_embed[i] + tmp[i]);
     }
     std::vector<float> final_normed(text_embed.size());
     RmsNormRows(text_embed.data(), weights.refiner_final_norm.Ptr<float>(), final_normed.data(),
                 rows, hidden, params.final_norm_eps);
+    dt.Apply(final_normed);
     text_embed.swap(final_normed);
   }
 
@@ -492,9 +552,15 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
       for (int64_t i = 0; i < hidden; ++i) dst[i] += s[i];
     }
   };
+  // The patch projections are fp32 islands; their outputs enter the bf16 stream
+  // only at this indexed scatter (minimax_h3_transformer.py:978-981).
+  dt.Apply(text_embed);
+  dt.Apply(video_embed);
+  dt.Apply(audio_embed);
   scatter(inputs.text_pos, inputs.num_text_pos, text_embed);
   scatter(inputs.img_pos, inputs.num_img_pos, video_embed);
   scatter(inputs.audio_pos, inputs.num_audio_pos, audio_embed);
+  dt.Apply(stream);
 
   // --- time embedding (minimax_h3_transformer.py:272-285) ---
   std::vector<float> t_emb(static_cast<size_t>(m * params.time_embed_dim));
@@ -534,7 +600,7 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   std::vector<float> normed(stream.size()), tmp(stream.size());
   for (const MiniMaxH3DitBlockWeights& block : weights.blocks) {
     const std::vector<float> projected =
-        AdalnProject(q, t_emb.data(), m, params.time_embed_dim, block.adaln_w, block.adaln_b);
+        AdalnProject(q, t_emb.data(), m, params.time_embed_dim, block.adaln_w, block.adaln_b, dt);
     const std::vector<float> shift_msa =
         AdalnChunk(projected, m, kMiniMaxH3AdalnModalityNum, hidden, 6, 0);
     const std::vector<float> scale_msa =
@@ -550,32 +616,41 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
 
     RmsNormRows(stream.data(), block.norm1.Ptr<float>(), normed.data(), seq_len, hidden,
                 params.norm_eps);
+    dt.Apply(normed);
     ModulateScaleShift(normed.data(), seq_len, hidden, shift_msa.data(), scale_msa.data(),
                        combined.data());
+    dt.Apply(normed);  // _modulate_scale_shift casts its result to the stream dtype
     AttentionForward(q, params, AttnOf(block), normed.data(), seq_len, freqs.data(),
-                     inputs.cu_seqlens, num_reqs, tmp.data());
+                     inputs.cu_seqlens, num_reqs, dt, tmp.data());
     ModulateGate(stream.data(), seq_len, hidden, gate_msa.data(), tmp.data(), combined.data());
+    dt.Apply(stream);
 
     RmsNormRows(stream.data(), block.norm2.Ptr<float>(), normed.data(), seq_len, hidden,
                 params.norm_eps);
+    dt.Apply(normed);
     ModulateScaleShift(normed.data(), seq_len, hidden, shift_mlp.data(), scale_mlp.data(),
                        combined.data());
-    MlpForward(q, params, block.fc1, block.fc2, normed.data(), seq_len, tmp.data());
+    dt.Apply(normed);
+    MlpForward(q, params, block.fc1, block.fc2, normed.data(), seq_len, dt, tmp.data());
     ModulateGate(stream.data(), seq_len, hidden, gate_mlp.data(), tmp.data(), combined.data());
+    dt.Apply(stream);
   }
 
   // --- final layer (minimax_h3_transformer.py:724-743) ---
   const std::vector<float> final_projected =
       AdalnProject(q, t_emb.data(), m, params.time_embed_dim, weights.final_adaln_w,
-                   weights.final_adaln_b);
+                   weights.final_adaln_b, dt);
   const std::vector<float> final_shift = AdalnChunk(final_projected, m, 1, hidden, 2, 0);
   const std::vector<float> final_scale = AdalnChunk(final_projected, m, 1, hidden, 2, 1);
   RmsNormRows(stream.data(), weights.final_norm.Ptr<float>(), normed.data(), seq_len, hidden,
               params.final_norm_eps);
+  dt.Apply(normed);
   // The final layer is single-modality, so it indexes by inverse_indices directly.
   std::vector<int64_t> inverse(inputs.inverse_indices, inputs.inverse_indices + seq_len);
   ModulateScaleShift(normed.data(), seq_len, hidden, final_shift.data(), final_scale.data(),
                      inverse.data());
+  // Cast UP before both output heads: they are fp32 islands.
+  dt.Apply(normed);
 
   std::vector<float> video_all(static_cast<size_t>(seq_len * video_width));
   Linear(q, normed.data(), seq_len, hidden, weights.video_out_w, &weights.video_out_b,

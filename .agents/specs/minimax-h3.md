@@ -2,11 +2,15 @@
 
 **Rows:** `MODEL-DIFFUSION-minimax-h3-mini-max-h3-dit` (model-matrix),
 `ROAD-V1-H3` (roadmap portfolio).
-**Claim:** `CLAIM-MINIMAX-H3-W0-W2`.
+**Claim:** `CLAIM-MINIMAX-H3-W0-W2`, `CLAIM-MINIMAX-H3-W6A-W9`.
 **Upstream:** vLLM-Omni (`vllm-project/vllm-omni`), `vllm_omni/diffusion/models/minimax_h3/`.
 **Checkpoint:** `MiniMaxAI/MiniMax-H3` (gated), ~354 GB, BF16 safetensors.
-**Status:** W0 spike + W1/W2 landed (layout + scheduler + DiT forward, parity-gated
-against upstream at reduced dimensions). End-to-end generation is HARDWARE-BLOCKED.
+**Quantized checkpoints:** `realrebelai/MiniMax-H3_GGUFs` (ComfyUI GGUF),
+`lilcheaty/MiniMax-H3-NVFP4` — these FIT one GB10; see section 0.
+**Status:** W0 spike + W1/W2 (layout, scheduler, DiT forward incl. the bf16
+production stream), W6a (request planning) and W9 shape/geometry (GGUF arm) landed,
+all parity-gated. End-to-end is NOT hardware-blocked on the quantized arms; it is
+gated on the remaining bricks (encoder, VAEs, pipeline).
 
 ---
 
@@ -20,22 +24,32 @@ plus a 32 kHz stereo waveform by two VAEs. There is no KV cache, no sampler, no
 logits, and no token-exact gate — the SACRED near-tie methodology this project
 uses for decoders does not apply to it.
 
-**Hardware.** The upstream recipe validates on **4x NVIDIA B300** at ~133 GB peak
-per rank (~103 GB with text-encoder TP). Component sizes: 52-block DiT 66.3 GB,
-Qwen3-VL-derived encoder 51.5 GB, video VAE ~10 GB, audio VAE ~0.6 GB. This
-project's release target is ONE GB10 with **119 GiB UNIFIED** memory (host RAM and
-GPU pool are the same physical memory, see
-[gb10-unified-memory](../environment.md)), and the checkpoint alone is ~354 GB of
-storage. **H3 cannot run end to end on this project's hardware**, with or without
-CPU offload, and no amount of software work changes that. Upstream's own
-single-GPU arm needs `--enable-cpu-offload` on top of a discrete 80 GB+ card with
-separate host RAM.
+**Hardware — CORRECTED 2026-08-03 (user-directed).** The BF16 release validates on
+**4x NVIDIA B300** at ~133 GB peak per rank (~103 GB with text-encoder TP), and at
+~354 GB of storage it does not fit one GB10 (119 GiB UNIFIED). An earlier revision
+of this spec concluded from that alone that H3 e2e was "impossible on this
+project's hardware". **That was wrong**: it reasoned from the BF16 release only.
+QUANTIZED H3 checkpoints exist and they DO fit:
 
-**Therefore:** this lane is DERIVE-AND-SHIP, like `kimi-k3.md`, but with a
-materially stronger gate available — because upstream's implementation is pure
-Python that runs on CPU, we can execute it at REDUCED DIMENSIONS and compare
-number for number. Nothing here claims a generated video, a frame-level result, or
-any speed figure.
+| Arm | Components | Size |
+|---|---|---|
+| GGUF (ComfyUI format) | DiT `MiniMax-H3-FL2VA-Q3_K_M.gguf` 15.6 GB + Qwen3-VL encoder `qwen3vl-32B-...-Q4_K_M.gguf` 14.6 GB + the two VAEs (fp16 video ~10 GB, fp32 audio ~0.6 GB) | **~41 GB** |
+| NVFP4 (safetensors) | `minimax_h3_ref2va_nvfp4_{full,mixed}.safetensors` + `text_encoders/qwen3vl_32b_..._nvfp4_awq.safetensors` + `vae/minimax_h3_{video_vae_fp16,audio_vae_fp32}.safetensors` | fits, repo 77.2 GB across 3 DiT variants |
+
+Sources: `realrebelai/MiniMax-H3_GGUFs` and `lilcheaty/MiniMax-H3-NVFP4`. Both land
+well inside the 119 GiB pool, so **end-to-end H3 IS reachable here, and therefore
+so is a speed comparison.** NVFP4 is the more interesting arm for this project:
+GB10/sm_121 has native FP4 tensor cores and our NVFP4 stack (cutlass FP4 GEMM,
+Marlin W4A16 grouped MoE, the Laguna arm's tuning) is the most optimized path we
+own. What remains blocked is a like-for-like comparison against vLLM-Omni's own
+published numbers, which were measured on 4x B300 — a different machine class.
+
+**Therefore:** the CORRECTNESS gate is upstream itself executed at REDUCED
+DIMENSIONS on CPU (section 4) — that is available today and is exact. The
+END-TO-END gate is now a matter of finishing the remaining bricks (encoder, VAEs,
+pipeline) and downloading a quantized checkpoint, NOT a hardware wall. Nothing in
+THIS change claims a generated video or a speed figure; what changed is that both
+are now on the critical path rather than out of reach.
 
 ## 1. Architecture
 
@@ -90,6 +104,8 @@ final output heads. Everything else is BF16.
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 PENDING** |
 | Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **W6 PENDING** |
 | Serving | vllm-omni `/v1/videos`, `/v1/videos/sync` | — | **W7 PENDING** |
+| GGUF arm (ComfyUI format) | `realrebelai/MiniMax-H3_GGUFs` | 15.6 GB (DiT Q3_K_M) | **W9 LANDED (shape/geometry)** — name map is the IDENTITY, gated on the real 535-tensor manifest |
+| NVFP4 arm | `lilcheaty/MiniMax-H3-NVFP4` | fits | **W10 PENDING** — the likely SPEED path on sm_121 |
 
 Tasks: `t2va` (text), `fl2va` (first/last-frame), `ref2va` (reference). Duration
 4-15 s snapped to `17n+5` frames at 24 FPS; 50 inference steps; flow shift 12
@@ -133,6 +149,9 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | euler-ancestral eta0 scheduler + `rf_v_to_x0` | **exact** (<= 1e-6) |
 | **DiT forward, reduced dims, f32** | **max abs diff 1.6e-7 (video), 1.5e-7 (audio)** |
 | denoise-loop INVARIANTS (pinned rows reset every step, targets advance, finite) | pass |
+| bf16 PRODUCTION stream vs upstream's dtype policy | max abs diff 2.4e-3 (bf16 scale) |
+| request planning (frames, latent shapes, sigma schedules, canvas, task dispatch) | **exact** |
+| **REAL GGUF manifest** (535 tensors of `MiniMax-H3-FL2VA-Q3_K_M.gguf`) | **exact** — every name and logical shape matches our contract, geometry derived from shapes alone equals the shipped H3 config |
 | config-parse invariants + weight contract + grouped-qkv reorder | pass |
 
 The fp64 position grid is gated bit-exact deliberately: it feeds RoPE, and a
@@ -222,8 +241,12 @@ contract pending W6), `test_minimax_h3_e2e.py` (BLOCKED — needs the checkpoint
 | **W6** | Pipeline: t2va/fl2va/ref2va task assembly, condition noise, reference video, presentation, sigma schedules | W3-W5 |
 | **W7** | Serving: `/v1/videos` + `/v1/videos/sync`, job store, MP4 mux (dependency decision in 5.2) | W6 |
 | **W8** | Speed: USP sequence parallelism, block caching, DiT TP | W2b + multi-GPU HW |
+| **W9** | **GGUF arm** — ComfyUI-format load (identity name map, ne reversal, `comfy.gguf.orig_shape` reshape rule, K-quant dequant). Shape/geometry resolution LANDED and gated on the real manifest; the dequant-into-weights path needs the file | — |
+| **W10** | **NVFP4 arm** — `lilcheaty/MiniMax-H3-NVFP4` onto our existing NVFP4 stack (cutlass FP4 GEMM on sm_121). The most promising SPEED path, and the one that makes an e2e run on one GB10 realistic | W9 |
 
-**Open items.** (a) A vllm-omni parity pin — the upstream-sync protocol currently
+**Open items.** (0) Download a quantized checkpoint and close the e2e loop — this
+is now the top item, and it supersedes the old "hardware-blocked" framing.
+(a) A vllm-omni parity pin — the upstream-sync protocol currently
 covers only the vLLM repo; H3 lives outside it. (b) The MP4 dependency decision.
 (c) Hardware: nothing past W2b/W3 can be END-TO-END gated on this project's boxes,
 so W4-W8 should be reviewed as structural ports with unit gates, and the honest

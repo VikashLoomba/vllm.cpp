@@ -34,10 +34,14 @@
 //   EnumerateMiniMaxH3DitTensors          <-  minimax_h3_transformer.py:906-922
 //   MiniMaxH3ReorderGroupedQkv            <-  minimax_h3_transformer.py:139-168
 //   MiniMaxH3DenoiseLoop                  <-  denoise_loop.py:129-239
+//   MiniMaxH3TimeShiftSigmas / shape plan <-  time_request.py:5-61,
+//                                            pipeline_minimax_h3.py:121-122,
+//                                            207-222, 374-434
 #pragma once
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -193,6 +197,64 @@ MiniMaxH3PackedSequence BuildMiniMaxH3PackedSequenceRef2va(
     const std::vector<MiniMaxH3RefBlock>& ref_blocks, int64_t audio_channel);
 
 // ---------------------------------------------------------------------------
+// Request planning (time_request.py + pipeline_minimax_h3.py shape resolution)
+// ---------------------------------------------------------------------------
+
+// Output frame rate is FIXED (pipeline_minimax_h3.py:83).
+inline constexpr int64_t kMiniMaxH3Fps = 24;
+// Reference-image rescale target (pipeline_minimax_h3.py:87-88).
+inline constexpr int64_t kMiniMaxH3ReferenceImageShortEdge = 2048;
+inline constexpr int64_t kMiniMaxH3ReferenceImageMultiple = 32;
+// Default frame counts when the request names neither duration nor num_frames
+// (pipeline_minimax_h3.py:405).
+inline constexpr int64_t kMiniMaxH3DefaultFramesT2va = 209;
+inline constexpr int64_t kMiniMaxH3DefaultFramesRef2va = 124;
+// Default sigma shift scales (pipeline_minimax_h3.py:283-285).
+inline constexpr double kMiniMaxH3DefaultVideoShift = 12.0;
+inline constexpr double kMiniMaxH3DefaultAudioShift = 3.0;
+inline constexpr int64_t kMiniMaxH3DefaultSteps = 50;
+
+// Snap up to the 17n+5 frame boundary (time_request.py:5-12).
+int64_t MiniMaxH3AlignFrameCount(int64_t frame_count);
+// frame_count -> video latent T (time_request.py:15-18).
+int64_t MiniMaxH3VideoLatentT(int64_t frame_count);
+// Inverse; T must be 1 or match 5n+2 (time_request.py:21-26).
+int64_t MiniMaxH3FrameCountFromVideoLatentT(int64_t out_t);
+// Audio latents run at 40 Hz (time_request.py:29-31).
+int64_t MiniMaxH3AudioLatentT(double duration_seconds);
+// `max(multiple, round(value/multiple)*multiple)` (pipeline_minimax_h3.py:121-122).
+int64_t MiniMaxH3AlignMultiple(double value, int64_t multiple);
+// Reference image rescale to a 2048 short edge on a 32 grid
+// (pipeline_minimax_h3.py:207-222). Returns {width, height}.
+std::pair<int64_t, int64_t> MiniMaxH3ReferenceImageShape(int64_t width, int64_t height);
+
+// The rectified-flow time-shifted sigma schedule (time_request.py:34-61):
+// base = linspace(1, 0, num_steps); sigma = s*base / (1 + (s-1)*base); duplicate
+// consecutive values are collapsed and a terminal 0 is appended when needed.
+std::vector<double> MiniMaxH3TimeShiftSigmas(int64_t num_steps, double shift_scale);
+
+// The resolved generation plan for one request.
+struct MiniMaxH3ShapePlan {
+  int64_t height = 0;
+  int64_t width = 0;
+  int64_t num_frames = 0;
+  int64_t latent_t = 0;
+  int64_t audio_t = 0;
+};
+
+// `_resolve_shape` (pipeline_minimax_h3.py:393-434). Pass `duration_seconds <= 0`
+// and `requested_frames <= 1` to take the per-task default; pass
+// `height`/`width` <= 0 to take the aspect-derived default (which needs the
+// keyframe aspect for fl2va, hence `image_width`/`image_height`).
+MiniMaxH3ShapePlan MiniMaxH3ResolveShape(const std::string& task, double duration_seconds,
+                                         int64_t requested_frames, int64_t height, int64_t width,
+                                         int64_t image_width, int64_t image_height);
+
+// `_resolve_task` (pipeline_minimax_h3.py:374-391). `requested` may be empty.
+std::string MiniMaxH3ResolveTask(const std::string& requested, const std::string& partition,
+                                 bool has_image, const std::vector<std::string>& supported_tasks);
+
+// ---------------------------------------------------------------------------
 // Flow-matching scheduler (scheduling_minimax_h3_euler_ancestral.py)
 // ---------------------------------------------------------------------------
 
@@ -224,6 +286,23 @@ struct MiniMaxH3TensorSpec {
 };
 
 std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3DitTensors(const MiniMaxH3DitParams& params);
+
+// --- GGUF arm (minimax_h3_gguf.cpp) ---
+// The ComfyUI-format H3 GGUFs keep the checkpoint's own parameter names, so the
+// name map is the IDENTITY against the contract above; only the SHAPES need
+// resolving. GGUF `ne` is reversed relative to torch, EXCEPT where ComfyUI had to
+// reshape a tensor for quant-block alignment, in which case the true torch shape
+// is recorded in `comfy.gguf.orig_shape.<name>` and is used verbatim.
+std::vector<int64_t> MiniMaxH3GgufLogicalShape(const std::vector<int64_t>& gguf_dims,
+                                               const std::vector<int64_t>& orig_shape);
+
+// A ComfyUI GGUF carries no transformer config, so the SHAPES are the config.
+MiniMaxH3DitParams ParseMiniMaxH3DitParamsFromGgufManifest(
+    const std::vector<MiniMaxH3TensorSpec>& manifest);
+
+class GgufFile;
+// Names + logical shapes + fp32-island flags read out of a GGUF.
+std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3GgufTensors(const GgufFile& file);
 
 // The checkpoint stores qkv GROUPED per query group as [q_per_group, k, v]; the
 // fused qkv projection wants [q_all, k_all, v_all] (minimax_h3_transformer.py:

@@ -34584,3 +34584,49 @@ muxing (needs a NEW dependency decision - the tree has no muxer or A/V encoder),
 USP multi-GPU. OPEN: there is no vllm-omni parity PIN; the upstream-sync protocol
 covers only the vLLM repo. Spec: `.agents/specs/minimax-h3.md`.
 
+## 2026-08-03 - MiniMax-H3 W6A/W9 + I had the hardware verdict WRONG (`CLAIM-MINIMAX-H3-W6A-W9`)
+
+**The correction first.** The previous entry concluded H3 end-to-end was
+"IMPOSSIBLE on this project's hardware". That was wrong, and the error was
+reasoning from ONE artifact: the BF16 release (~354 GB, 4x B300). The user pointed
+at quantized checkpoints and they change the verdict outright:
+
+  * `realrebelai/MiniMax-H3_GGUFs` - DiT `MiniMax-H3-FL2VA-Q3_K_M.gguf` 15.6 GB,
+    Qwen3-VL encoder `qwen3vl-32B-...-Q4_K_M.gguf` 14.6 GB, VAEs ~11 GB from the
+    Comfy-Org base repo => a **~41 GB working set** in a 119 GiB pool.
+  * `lilcheaty/MiniMax-H3-NVFP4` - NVFP4 DiT variants + an AWQ Qwen3-VL encoder +
+    BOTH VAEs, also a fit.
+
+So e2e AND a speed comparison are REACHABLE; they are gated on the remaining
+bricks, not on hardware. **Lesson worth keeping: a size-based "does not fit"
+verdict is only as good as the artifact list it was computed over - enumerate the
+QUANTIZED community releases before declaring a model out of reach.**
+
+**What landed.**
+1. The DiT forward now runs the **bf16 production dtype policy** as well as f32:
+   upstream's cast points with the fp32 islands (both patch projections, the time
+   embedder, both output heads) preserved. Gated against a bf16 upstream golden at
+   max abs diff 2.4e-3 - bf16 scale, same cast points, different GEMM accumulation.
+2. **Request planning** (`minimax_h3_planner.cpp`): 17n+5 frame snapping, video and
+   audio latent shapes, the rectified-flow time-shift sigma schedule, canvas
+   resolution, reference-image rescale, and t2va/fl2va/ref2va dispatch. All EXACT.
+   Watch out for Python's banker's rounding - `round()` is half-to-even and both
+   `_align_multiple` and `_audio_latent_t` depend on it.
+3. The **ComfyUI-GGUF arm**. The best news in this change: **the name map is the
+   IDENTITY.** Every one of the 535 tensors in the real Q3_K_M DiT matches the
+   contract `EnumerateMiniMaxH3DitTensors` derived from upstream SOURCE - the
+   weight contract is now validated against a real checkpoint. Two shape rules:
+   GGUF `ne` is reversed vs torch, and `comfy.gguf.orig_shape.<name>` overrides it
+   where ComfyUI reshaped for quant-block alignment (the 50 AdaLN projections:
+   logical [96768, 2688], and 2688 is not a multiple of the 256-element Q3_K block).
+   Geometry is derived from SHAPES ALONE, because a ComfyUI GGUF ships no config.
+
+**Method note worth reusing:** the GGUF gate needed no download. The header is at
+the front of the file and self-delimiting, so a 4 MiB HTTP range request yields the
+whole 535-tensor manifest, which `scripts/gen-minimax-h3-gguf-manifest.py` freezes
+into a fixture. Real-checkpoint grounding for the cost of one curl.
+
+**Next.** Download a quantized checkpoint and close the e2e loop (encoder on our
+Qwen3-VL tower -> the two VAEs -> pipeline), then the NVFP4 arm (W10) for speed -
+sm_121 has native FP4 tensor cores and our NVFP4 stack is the most tuned one we own.
+

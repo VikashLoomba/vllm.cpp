@@ -18,11 +18,14 @@
 
 #include <cmath>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "minimax_h3_goldens.inc"
+#include "minimax_h3_gguf_manifest.inc"
 
 #include "vt/device.h"
 #include "vt/tensor.h"
@@ -463,6 +466,164 @@ TEST_CASE("minimax_h3: DiT forward matches upstream at reduced dimensions") {
   }
 }
 
+TEST_CASE("minimax_h3: the bf16 production stream matches upstream's dtype policy") {
+  // The f32 case above gates the ALGORITHM. This one gates the PRODUCTION dtype
+  // policy: upstream's stream is bf16 with fp32 islands (both patch projections,
+  // the time embedder, both output heads — minimax_h3_transformer.py:85-101), and
+  // the explicit `dtype=_BF16_DTYPE` casts inside `_modulate_scale_shift` /
+  // `_modulate_gate`. Same code path, different rounding points.
+  const std::unique_ptr<GoldenWeights> weights = BuildGoldenWeights();
+  const MiniMaxH3DitParams& p = weights->params;
+
+  const MiniMaxH3PackedSequence packed = BuildMiniMaxH3PackedSequence(
+      vllm_test::kH3Fl2va_text_len, vllm_test::kH3Fl2va_latent_t, vllm_test::kH3Fl2va_latent_h,
+      vllm_test::kH3Fl2va_latent_w, vllm_test::kH3Fl2va_audio_t, vllm_test::kH3Fl2va_audio_channel,
+      /*include_keyframe_cond=*/true, {0}, vllm_test::kH3Fl2va_frame_count);
+
+  const int64_t seq_len = packed.seq_len;
+  const int64_t video_width = p.video_row_width();
+  const int64_t num_img = static_cast<int64_t>(packed.img_pos.size());
+  const int64_t num_audio = static_cast<int64_t>(packed.audio_pos.size());
+  const int64_t num_text = static_cast<int64_t>(packed.text_pos.size());
+
+  std::vector<float> x(static_cast<size_t>(seq_len * video_width), 0.0f);
+  const std::vector<float> video_rows = MakeParam("dit.video_rows", num_img * video_width, 1.0);
+  for (int64_t r = 0; r < num_img; ++r) {
+    std::memcpy(x.data() + packed.img_pos[static_cast<size_t>(r)] * video_width,
+                video_rows.data() + r * video_width,
+                static_cast<size_t>(video_width) * sizeof(float));
+  }
+  std::vector<float> audio_x(static_cast<size_t>(seq_len * p.audio_latents_dim), 0.0f);
+  const std::vector<float> audio_rows =
+      MakeParam("dit.audio_rows", num_audio * p.audio_latents_dim, 1.0);
+  for (int64_t r = 0; r < num_audio; ++r) {
+    std::memcpy(audio_x.data() + packed.audio_pos[static_cast<size_t>(r)] * p.audio_latents_dim,
+                audio_rows.data() + r * p.audio_latents_dim,
+                static_cast<size_t>(p.audio_latents_dim) * sizeof(float));
+  }
+  const std::vector<float> prompt_embeds =
+      MakeParam("dit.prompt_embeds", num_text * p.text_dim, 1.0);
+  const std::vector<float> unique_timesteps(
+      vllm_test::kH3DitUniqueTimesteps,
+      vllm_test::kH3DitUniqueTimesteps + vllm_test::kH3Dit_unique_timesteps);
+  const std::vector<int64_t> inverse(vllm_test::kH3DitInverseIndices,
+                                     vllm_test::kH3DitInverseIndices + seq_len);
+  const std::vector<int32_t> refiner_cu = {0, static_cast<int32_t>(num_text),
+                                           static_cast<int32_t>(num_text)};
+
+  MiniMaxH3DitInputs in;
+  in.seq_len = seq_len;
+  in.x = x.data();
+  in.audio_x = audio_x.data();
+  in.img_position_ids = packed.img_position_ids.data();
+  in.unique_timesteps = unique_timesteps.data();
+  in.num_unique_timesteps = static_cast<int64_t>(unique_timesteps.size());
+  in.inverse_indices = inverse.data();
+  in.token_tags = packed.token_tags.data();
+  in.prompt_embeds = prompt_embeds.data();
+  in.img_pos = packed.img_pos.data();
+  in.num_img_pos = num_img;
+  in.audio_pos = packed.audio_pos.data();
+  in.num_audio_pos = num_audio;
+  in.text_pos = packed.text_pos.data();
+  in.num_text_pos = num_text;
+  in.infer_out_pos = packed.img_pos.data();
+  in.num_infer_out_pos = num_img;
+  in.update_mask = packed.update_mask.data();
+  in.cu_seqlens = packed.cu_seqlens.data();
+  in.num_cu_seqlens = static_cast<int64_t>(packed.cu_seqlens.size());
+  in.refiner_cu_seqlens = refiner_cu.data();
+  in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
+
+  const MiniMaxH3DitOutputs got =
+      MiniMaxH3DitForward(Cpu(), p, weights->views, in, vt::DType::kBF16);
+
+  // Tolerance is bf16-scale on purpose: both sides round at the same points, but
+  // the GEMM accumulation order still differs (ours is the vt CPU kernel, the
+  // reference is torch). The gate is that the CAST POINTS agree — a misplaced or
+  // missing cast moves the result far more than accumulation order does.
+  const double video_err =
+      MaxAbsDiff(got.video_logits, vllm_test::kH3DitVideoLogitsBf16Golden, got.video_logits.size());
+  const double audio_err =
+      MaxAbsDiff(got.audio_logits, vllm_test::kH3DitAudioLogitsBf16Golden, got.audio_logits.size());
+  INFO("bf16 video max|diff| = " << video_err << ", audio max|diff| = " << audio_err);
+  CHECK(video_err <= 5e-3);
+  CHECK(audio_err <= 5e-3);
+
+  // And the bf16 stream must differ from the f32 stream — otherwise the dtype
+  // policy is not actually being applied and this test proves nothing.
+  const double vs_f32 =
+      MaxAbsDiff(got.video_logits, vllm_test::kH3DitVideoLogitsGolden, got.video_logits.size());
+  CHECK(vs_f32 > 1e-5);
+}
+
+TEST_CASE("minimax_h3: request planning matches upstream") {
+  // time_request.py executed verbatim by the generator; the three shape helpers
+  // are restated there from pipeline_minimax_h3.py:121-122, 207-222, 393-434.
+  for (int64_t i = 0; i < vllm_test::kH3PlanFrameCases; ++i) {
+    const int64_t input = vllm_test::kH3PlanFrameInputs[i];
+    const int64_t aligned = vllm::MiniMaxH3AlignFrameCount(input);
+    CHECK(aligned == vllm_test::kH3PlanFrameAligned[i]);
+    const int64_t latent_t = vllm::MiniMaxH3VideoLatentT(aligned);
+    CHECK(latent_t == vllm_test::kH3PlanVideoLatentT[i]);
+    CHECK(vllm::MiniMaxH3FrameCountFromVideoLatentT(latent_t) ==
+          vllm_test::kH3PlanFrameFromLatentT[i]);
+    CHECK(vllm::MiniMaxH3AudioLatentT(static_cast<double>(aligned) / 24.0) ==
+          vllm_test::kH3PlanAudioLatentT[i]);
+  }
+  // A latent T that is neither 1 nor 5n+2 is rejected, not silently rounded.
+  CHECK_THROWS(vllm::MiniMaxH3FrameCountFromVideoLatentT(4));
+
+  int64_t offset = 0;
+  for (int64_t c = 0; c < vllm_test::kH3PlanSigmaCases; ++c) {
+    const std::vector<double> sigmas = vllm::MiniMaxH3TimeShiftSigmas(
+        vllm_test::kH3PlanSigmaSteps[c], vllm_test::kH3PlanSigmaShifts[c]);
+    REQUIRE(static_cast<int64_t>(sigmas.size()) == vllm_test::kH3PlanSigmaLengths[c]);
+    for (size_t i = 0; i < sigmas.size(); ++i) {
+      CHECK(static_cast<float>(sigmas[i]) ==
+            doctest::Approx(vllm_test::kH3PlanSigmasGolden[offset + i]).epsilon(1e-6));
+    }
+    // Multi-step schedules must terminate at sigma 0 so the last Euler step is
+    // the identity (scheduling:89-92).
+    if (vllm_test::kH3PlanSigmaSteps[c] > 1) CHECK(sigmas.back() == 0.0);
+    offset += static_cast<int64_t>(sigmas.size());
+  }
+  CHECK_THROWS(vllm::MiniMaxH3TimeShiftSigmas(50, 0.0));
+  CHECK_THROWS(vllm::MiniMaxH3TimeShiftSigmas(0, 6.0));
+
+  for (int64_t c = 0; c < vllm_test::kH3PlanRefImageCases; ++c) {
+    const std::pair<int64_t, int64_t> shape = vllm::MiniMaxH3ReferenceImageShape(
+        vllm_test::kH3PlanRefImageInputs[c * 2], vllm_test::kH3PlanRefImageInputs[c * 2 + 1]);
+    CHECK(shape.first == vllm_test::kH3PlanRefImageGolden[c * 2]);
+    CHECK(shape.second == vllm_test::kH3PlanRefImageGolden[c * 2 + 1]);
+  }
+  CHECK_THROWS(vllm::MiniMaxH3ReferenceImageShape(5000, 100));  // aspect out of [1:4, 4:1]
+
+  const char* tasks[] = {"t2va", "ref2va", "t2va", "t2va", "fl2va", "fl2va", "t2va"};
+  for (int64_t c = 0; c < vllm_test::kH3PlanShapeCases; ++c) {
+    const vllm::MiniMaxH3ShapePlan plan = vllm::MiniMaxH3ResolveShape(
+        tasks[c], vllm_test::kH3PlanShapeDurations[c], vllm_test::kH3PlanShapeNumFrames[c],
+        vllm_test::kH3PlanShapeHeights[c], vllm_test::kH3PlanShapeWidths[c],
+        vllm_test::kH3PlanShapeImageW[c], vllm_test::kH3PlanShapeImageH[c]);
+    INFO("shape case " << c << " task=" << tasks[c]);
+    CHECK(plan.height == vllm_test::kH3PlanShapeGolden[c * 5 + 0]);
+    CHECK(plan.width == vllm_test::kH3PlanShapeGolden[c * 5 + 1]);
+    CHECK(plan.num_frames == vllm_test::kH3PlanShapeGolden[c * 5 + 2]);
+    CHECK(plan.latent_t == vllm_test::kH3PlanShapeGolden[c * 5 + 3]);
+    CHECK(plan.audio_t == vllm_test::kH3PlanShapeGolden[c * 5 + 4]);
+  }
+
+  // Task dispatch (pipeline_minimax_h3.py:374-391).
+  const std::vector<std::string> fl2va_partition = {"t2va", "fl2va"};
+  const std::vector<std::string> ref2va_partition = {"ref2va"};
+  CHECK(vllm::MiniMaxH3ResolveTask("", "FL2VA", /*has_image=*/false, fl2va_partition) == "t2va");
+  CHECK(vllm::MiniMaxH3ResolveTask("", "FL2VA", /*has_image=*/true, fl2va_partition) == "fl2va");
+  CHECK(vllm::MiniMaxH3ResolveTask("", "ref2va", /*has_image=*/false, ref2va_partition) == "ref2va");
+  CHECK(vllm::MiniMaxH3ResolveTask("T2VA", "FL2VA", false, fl2va_partition) == "t2va");
+  // A partition must refuse a task it does not carry, rather than guessing.
+  CHECK_THROWS(vllm::MiniMaxH3ResolveTask("ref2va", "FL2VA", false, fl2va_partition));
+}
+
 TEST_CASE("minimax_h3: the denoise loop advances targets and pins condition rows") {
   // The loop itself has no upstream golden (upstream's own loop test needs the
   // checkpoint), so this gates its INVARIANTS, which are what the CFG-distilled
@@ -535,6 +696,101 @@ TEST_CASE("minimax_h3: the denoise loop advances targets and pins condition rows
     if (result.audio_rows[i] != initial_audio[i]) audio_moved = true;
   }
   CHECK(audio_moved);
+}
+
+TEST_CASE("minimax_h3: a REAL ComfyUI GGUF resolves onto our weight contract") {
+  // The whole point of the GGUF arm: the quantized checkpoints are the ones that
+  // FIT this hardware. This gates the loader against the actual 535-tensor
+  // manifest of `MiniMax-H3-FL2VA-Q3_K_M.gguf` (names/dims/types read from the
+  // file's own header by scripts/gen-minimax-h3-gguf-manifest.py) — no weight
+  // bytes, no download.
+  CHECK(std::string(vllm_test::kH3GgufArchitecture) == "wan");  // ComfyUI's arch id
+  CHECK(vllm_test::kH3GgufVersion == 3);
+  REQUIRE(vllm_test::kH3GgufTensorCount == static_cast<int64_t>(std::size(vllm_test::kH3GgufTensors)));
+
+  // Resolve every real tensor to its logical (torch) shape.
+  std::vector<vllm::MiniMaxH3TensorSpec> manifest;
+  manifest.reserve(static_cast<size_t>(vllm_test::kH3GgufTensorCount));
+  for (const vllm_test::H3GgufTensor& t : vllm_test::kH3GgufTensors) {
+    const std::vector<int64_t> dims(t.dims, t.dims + t.n_dims);
+    const std::vector<int64_t> orig(t.orig_shape, t.orig_shape + t.orig_n_dims);
+    vllm::MiniMaxH3TensorSpec spec;
+    spec.name = t.name;
+    spec.shape = vllm::MiniMaxH3GgufLogicalShape(dims, orig);
+    spec.fp32 = t.ggml_type == 0;
+    manifest.push_back(std::move(spec));
+  }
+
+  // The geometry derived from SHAPES ALONE must be the shipped H3 geometry —
+  // a ComfyUI GGUF ships no transformer config, so this is the load path.
+  const MiniMaxH3DitParams p = vllm::ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+  CHECK(p.num_layers == 50);
+  CHECK(p.token_refiner_num_layers == 2);
+  CHECK(p.hidden_size == 5376);
+  CHECK(p.num_attention_heads == 56);
+  CHECK(p.attention_head_dim == 128);
+  CHECK(p.ffn_hidden_size == 14336);
+  CHECK(p.latents_dim == 24);
+  CHECK(p.audio_latents_dim == 32);
+  CHECK(p.text_dim == 5120);
+  CHECK(p.timestep_input_dim == 256);
+  CHECK(p.time_embed_dim == 2688);
+  CHECK(p.rope_inv_freq_len == 16);
+  CHECK(p.video_row_width() == 96);
+
+  // And the manifest must cover our contract EXACTLY: the ComfyUI GGUF keeps the
+  // checkpoint's own names, so this is an identity map, not a rename table.
+  const std::vector<vllm::MiniMaxH3TensorSpec> expected = EnumerateMiniMaxH3DitTensors(p);
+  CHECK(manifest.size() == expected.size());
+  std::map<std::string, std::vector<int64_t>> got;
+  for (const vllm::MiniMaxH3TensorSpec& spec : manifest) got[spec.name] = spec.shape;
+  for (const vllm::MiniMaxH3TensorSpec& want : expected) {
+    INFO("contract tensor " << want.name);
+    const auto it = got.find(want.name);
+    REQUIRE(it != got.end());
+    CHECK(it->second == want.shape);
+  }
+
+  // The AdaLN projections are the reshaped case: ne is block-aligned nonsense
+  // ([256, 1016064]) and the true shape comes from comfy.gguf.orig_shape.
+  bool saw_reshaped = false;
+  for (const vllm_test::H3GgufTensor& t : vllm_test::kH3GgufTensors) {
+    if (std::string(t.name) != "blocks.0.adaln_proj.linear.weight") continue;
+    saw_reshaped = true;
+    CHECK(t.orig_n_dims == 2);
+    CHECK(t.orig_shape[0] == 96768);  // 18 * 5376
+    CHECK(t.orig_shape[1] == 2688);   // time_embed_dim
+    CHECK(t.dims[0] == 256);          // one Q3_K block along the fastest axis
+    // 2688 is NOT a multiple of the 256-element Q3_K block, which is exactly why
+    // ComfyUI reshaped it and recorded orig_shape.
+    CHECK(2688 % 256 != 0);
+  }
+  CHECK(saw_reshaped);
+
+  // The reversal rule on a NON-reshaped quantized tensor.
+  const std::vector<int64_t> qkv =
+      vllm::MiniMaxH3GgufLogicalShape({5376, 21504}, {});
+  REQUIRE(qkv.size() == 2);
+  CHECK(qkv[0] == 21504);  // 3 * 56 * 128
+  CHECK(qkv[1] == 5376);
+  // 1-D tensors stay 1-D.
+  const std::vector<int64_t> norm = vllm::MiniMaxH3GgufLogicalShape({5376}, {});
+  REQUIRE(norm.size() == 1);
+  CHECK(norm[0] == 5376);
+
+  // The fp32 islands must still be unquantized in the GGUF: quantizing a patch
+  // projection or an output head would silently break the dtype policy.
+  std::map<std::string, uint32_t> types;
+  for (const vllm_test::H3GgufTensor& t : vllm_test::kH3GgufTensors) types[t.name] = t.ggml_type;
+  for (const char* name : {"blocks.0.norm1.weight", "blocks.0.attn.q_norm.weight",
+                           "final_layer.norm.weight", "rope.inv_freq",
+                           "time_embedder.proj_in.weight", "final_layer.video_out.weight",
+                           "final_layer.audio_out.weight", "audio_patch_proj.bias"}) {
+    const auto it = types.find(name);
+    INFO("fp32 island " << name);
+    REQUIRE(it != types.end());
+    CHECK(it->second != 11u);  // not Q3_K
+  }
 }
 
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {

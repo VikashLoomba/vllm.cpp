@@ -1,21 +1,30 @@
 # Benchmarks
 
-## MiniMax-H3 (omni-modal video+audio DiT) — PENDING (hardware-blocked), correctness gated (2026-08-03, `CLAIM-MINIMAX-H3-W0-W2`)
+## MiniMax-H3 (omni-modal video+audio DiT) — PENDING; hardware verdict CORRECTED (2026-08-03, `CLAIM-MINIMAX-H3-W0-W2`, `CLAIM-MINIMAX-H3-W6A-W9`)
 
-**Throughput disposition: PENDING — and not reproducible on this project's hardware.**
-MiniMax-H3 is a 33.1B CFG-distilled joint video+audio diffusion transformer. Its
-checkpoint is ~354 GB (DiT 66.3 GB + Qwen3-VL-derived encoder 51.5 GB + video VAE
-~10 GB + audio VAE ~0.6 GB) and upstream validates on **4x NVIDIA B300 at ~133 GB
-peak per rank**. This project's target is ONE GB10 with 119 GiB **unified** memory,
-where CPU offload cannot help because the pool IS host RAM. No end-to-end latency,
-throughput, or frame result is claimed, and none can be produced here.
+**Throughput disposition: PENDING — no number is owed yet, and the earlier
+"not reproducible on this project's hardware" verdict is WITHDRAWN.**
+That verdict reasoned from the BF16 release alone (~354 GB, validated on 4x NVIDIA
+B300 at ~133 GB peak per rank, against one GB10 with 119 GiB unified). Quantized
+MiniMax-H3 checkpoints exist and DO fit:
 
-**Reference figures (upstream, NOT ours, recorded for the eventual comparison):**
-FL2VA 8.7 s clip at 1248x768 in ~87 s E2E on 4x B300 with USP-4 + regional
-torch.compile; the DiT is ~88% of request latency; 50 inference steps at 24 FPS.
+| Arm | Working set | Fits 119 GiB? |
+|---|---|---|
+| ComfyUI GGUF (`realrebelai/MiniMax-H3_GGUFs`) | DiT Q3_K_M 15.6 GB + Qwen3-VL encoder Q4_K_M 14.6 GB + VAEs ~11 GB = **~41 GB** | yes |
+| NVFP4 (`lilcheaty/MiniMax-H3-NVFP4`) | NVFP4 DiT + AWQ encoder + both VAEs | yes |
 
-**Correctness that IS gated (no GPU needed).** Upstream's H3 modules are pure Python,
-so they are executed at reduced dimensions as the oracle
+So an end-to-end run and a speed comparison ARE reachable here; they are gated on
+the remaining bricks (encoder, VAEs, pipeline), not on hardware. NVFP4 is the
+likely speed path: sm_121 has native FP4 tensor cores and our NVFP4 stack is the
+most optimized one we own. A like-for-like comparison against vLLM-Omni's own
+published figures remains machine-class-limited (they are 4x B300 numbers).
+
+**Reference figures (upstream, NOT ours):** FL2VA 8.7 s clip at 1248x768 in ~87 s
+E2E on 4x B300 with USP-4 + regional torch.compile; the DiT is ~88% of request
+latency; 50 inference steps at 24 FPS.
+
+**Correctness that IS gated (no GPU, no checkpoint).** Upstream's H3 modules are
+pure Python, so they are executed at reduced dimensions as the oracle
 (`scripts/gen-minimax-h3-goldens.py`; both sides rebuild weights and inputs from an
 identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 
@@ -24,15 +33,21 @@ identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 | fl2va packed layout + fp64 position grid | exact / **bit-exact** |
 | ref2va block layout (image + video_audio refs) | exact, incl. fp64 grid |
 | patchify / unpatchify / audio pack / unpack | exact + round-trip identity |
-| euler-ancestral eta0 scheduler + `rf_v_to_x0` | exact (<= 1e-6) |
+| euler-ancestral eta0 scheduler + `rf_v_to_x0` | exact |
 | **DiT forward (reduced dims, f32)** | **max abs diff 1.6e-7 video / 1.5e-7 audio** |
+| **DiT forward (bf16 production stream)** | **max abs diff 2.4e-3 video / 2.1e-3 audio** |
+| request planning (frames, latents, sigmas, canvas, task dispatch) | exact |
+| denoise-loop invariants | pass |
+| **REAL GGUF manifest** (535 tensors, `MiniMax-H3-FL2VA-Q3_K_M.gguf`) | exact name + shape match; geometry derived from shapes alone equals the shipped config |
 
 **Reproduce:** `cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF`
 then `cmake --build build-cpu --target test_minimax_h3 -j16 && ./build-cpu/tests/test_minimax_h3`
-(10/10 cases, 2539 assertions). Regenerate goldens with
-`python3 scripts/gen-minimax-h3-goldens.py --vllm-omni <vllm-omni checkout> --out tests/vllm/models/minimax_h3_goldens.inc`.
+(13/13 cases, 3907 assertions). Regenerate goldens with
+`python3 scripts/gen-minimax-h3-goldens.py --vllm-omni <checkout> --out tests/vllm/models/minimax_h3_goldens.inc`;
+regenerate the GGUF manifest by range-fetching the first 4 MiB of the .gguf and running
+`scripts/gen-minimax-h3-gguf-manifest.py`.
 
-**Next gate:** W2b device-resident forward (where any speed work begins). See
+**Next gate:** download a quantized checkpoint and close the e2e loop (encoder -> VAEs -> pipeline), then W2b/W10 for speed. See
 [.agents/specs/minimax-h3.md](../.agents/specs/minimax-h3.md).
 
 

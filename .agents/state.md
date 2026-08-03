@@ -34817,3 +34817,27 @@ quantized loader wiring (GGUF dequant / NVFP4), and a GPU with the checkpoint on
 The device-resident forward (W2b) and NVFP4 wiring (W10) are where speed work then
 begins.
 
+## 2026-08-03 - MiniMax-H3 W9: the GGUF arm is complete (load -> runnable DiT)
+
+`LoadMiniMaxH3DitFromGguf` closes the GGUF arm. It resolves the manifest (identity
+name map, `ne` reversal, the `comfy.gguf.orig_shape` reshape rule), derives the
+geometry from SHAPES alone - a ComfyUI GGUF ships no transformer config - and
+dequantizes every tensor through the SHARED `DequantGgufRowToF32`, so the
+Q2_K/Q3_K/Q4_K families the H3 GGUFs use are covered by the same code path every
+other GGUF model in this tree uses. No new quant code.
+
+Gated by a synthetic-file **load-and-run** test rather than a shape check: the
+geometry comes back exactly, a loaded weight carries the LOGICAL (torch) shape
+rather than the reversed ne, and a REAL DiT forward executes off the loaded weights
+with finite, correctly-sized outputs. Missing tensors throw BY NAME instead of
+yielding a null view the forward would silently read as zeros.
+
+**Environment note:** dgx.casa is currently UNREACHABLE ("no route to host"), and
+this workstation has no GPU at all. So no run on a real checkpoint - and therefore
+no speed number - is possible from here regardless of how much of the port is done.
+
+**What remains before a real generation:** the encoder's VISION tower (reuse of
+qwen3_vl_vision.cpp) + MM processor, fl2va/ref2va conditioning, NVFP4 loader wiring
+(W10 - the layout is already proven identical to ours), and a machine with a GPU.
+W2b (device-resident forward) and W10 are where speed work then begins.
+

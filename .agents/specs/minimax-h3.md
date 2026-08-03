@@ -104,7 +104,7 @@ final output heads. Everything else is BF16.
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 t2va ASSEMBLED** — the whole path composes and runs (structural e2e gate); fl2va/ref2va conditioning and the torch-RNG noise seed remain |
 | Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **W6 PENDING** |
 | Serving | vllm-omni `/v1/videos`, `/v1/videos/sync` | — | **W7 PENDING** |
-| GGUF arm (ComfyUI format) | `realrebelai/MiniMax-H3_GGUFs` | 15.6 GB (DiT Q3_K_M) | **W9 LANDED (shape/geometry)** — name map is the IDENTITY, gated on the real 535-tensor manifest |
+| GGUF arm (ComfyUI format) | `realrebelai/MiniMax-H3_GGUFs` | 15.6 GB (DiT Q3_K_M) | **W9 DONE** — identity name map (gated on the real 535-tensor manifest) PLUS `LoadMiniMaxH3DitFromGguf`: dequantize through the shared GGUF path, recover the geometry from shapes, bind the forward's views |
 | NVFP4 arm | `lilcheaty/MiniMax-H3-NVFP4` | fits | **W10 GROUNDED** — the real 1051-tensor manifest is textbook compressed-tensors NVFP4 (U8 packed + E4M3 group-16 `weight_scale` + F32 `weight_scale_2`), i.e. EXACTLY our existing layout; 258 quantized projections, islands unquantized |
 
 Tasks: `t2va` (text), `fl2va` (first/last-frame), `ref2va` (reference). Duration
@@ -159,6 +159,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **VIDEO VAE FULL ViT3D decoder** vs the checkpoint's OWN remote code | **max abs diff 8.9e-8** |
 | **ENCODER text tower** (truncation + unnormalized output + DeepStack) | **max abs diff 1.2e-7** |
 | **WHOLE t2va PATH composes** (layout -> sigmas -> denoise loop -> unpack -> denormalize -> both VAEs) | frames + stereo waveform, correctly shaped, finite, in [-1, 1] |
+| **GGUF LOAD -> runnable DiT** (synthetic ComfyUI-format file) | geometry recovered from shapes; a real forward runs off the loaded weights |
 | config-parse invariants + weight contract + grouped-qkv reorder | pass |
 
 The fp64 position grid is gated bit-exact deliberately: it feeds RoPE, and a
@@ -268,7 +269,7 @@ contract pending W6), `test_minimax_h3_e2e.py` (BLOCKED — needs the checkpoint
 | **W6** | Pipeline. **t2va ASSEMBLED** — `MiniMaxH3GenerateT2va` wires layout -> sigma schedules -> denoise loop -> unpatchify/audio-unpack -> denormalize -> both VAE decoders, gated by a structural end-to-end test. REMAINS: fl2va/ref2va conditioning (condition noise, reference video, presentation) and bit-exact torch-RNG noise seeding | — |
 | **W7** | Serving: `/v1/videos` + `/v1/videos/sync`, job store, MP4 mux (dependency decision in 5.2) | W6 |
 | **W8** | Speed: USP sequence parallelism, block caching, DiT TP | W2b + multi-GPU HW |
-| **W9** | **GGUF arm** — ComfyUI-format load (identity name map, ne reversal, `comfy.gguf.orig_shape` reshape rule, K-quant dequant). Shape/geometry resolution LANDED and gated on the real manifest; the dequant-into-weights path needs the file | — |
+| **W9** | **GGUF arm — DONE.** Identity name map, `ne` reversal, the `comfy.gguf.orig_shape` reshape rule, and `LoadMiniMaxH3DitFromGguf` (shared K-quant dequant -> owned f32 -> bound views), gated by the real 535-tensor manifest plus a synthetic-file load-and-run test | — |
 | **W10** | **NVFP4 arm** — `lilcheaty/MiniMax-H3-NVFP4` onto our existing NVFP4 stack (cutlass FP4 GEMM on sm_121). Layout GATED as identical to ours, so this is a loader-wiring brick, not a new quant scheme. The most promising SPEED path, and the one that makes an e2e run on one GB10 realistic | W9 |
 
 **Open items.** (0) Run the assembled t2va path on a REAL quantized checkpoint — the

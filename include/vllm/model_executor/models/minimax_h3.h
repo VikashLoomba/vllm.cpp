@@ -500,6 +500,21 @@ struct MiniMaxH3DitWeights {
   vt::Tensor audio_out_w, audio_out_b;
 };
 
+// A GGUF-loaded DiT: owned dequantized buffers plus the views the forward takes.
+// `storage` must outlive `weights` (the views are non-owning).
+struct MiniMaxH3GgufDit {
+  MiniMaxH3DitParams params;
+  std::map<std::string, std::vector<float>> storage;
+  std::map<std::string, std::vector<int64_t>> shapes;
+  MiniMaxH3DitWeights weights;
+};
+
+// Materialize the DiT from a ComfyUI-format GGUF: derive the geometry from the
+// manifest, dequantize every tensor to f32 through the shared GGUF dequant path
+// (so the Q2_K/Q3_K/Q4_K families the H3 GGUFs use are covered), and bind the
+// forward's views. Missing tensors throw by name rather than reading as zeros.
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file);
+
 // The per-step inputs of one denoise step (minimax_h3_transformer.py:986-1102).
 // Row-major host buffers; the forward stages them onto `device` itself.
 struct MiniMaxH3DitInputs {

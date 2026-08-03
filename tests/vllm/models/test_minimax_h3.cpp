@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -31,6 +32,9 @@
 #include "minimax_h3_video_vae_manifest.inc"
 #include "minimax_h3_video_vae_goldens.inc"
 #include "minimax_h3_encoder_goldens.inc"
+
+#include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "../gguf_builder.h"
 
 #include "vt/device.h"
 #include "vt/tensor.h"
@@ -1397,6 +1401,165 @@ TEST_CASE("minimax_h3: the WHOLE t2va path composes end to end") {
     moved = std::max(moved, static_cast<double>(std::abs(noise_video[i])));
   }
   CHECK(moved > 0.0);
+}
+
+TEST_CASE("minimax_h3: a ComfyUI-format GGUF loads into a runnable DiT") {
+  // Closes the GGUF arm: the manifest test proved names and shapes resolve; this
+  // proves a real GGUF file DEQUANTIZES into weights the forward actually runs.
+  // A synthetic checkpoint is used so the test needs no download; the shapes and
+  // the `comfy.gguf.orig_shape` reshape rule mirror the real file exactly.
+  MiniMaxH3DitParams want;  // the geometry the loader must RECOVER from shapes
+  want.num_layers = 2;
+  want.token_refiner_num_layers = 1;
+  want.hidden_size = 64;
+  want.num_attention_heads = 4;
+  want.attention_head_dim = 16;
+  want.ffn_hidden_size = 128;
+  want.latents_dim = 8;
+  want.audio_latents_dim = 6;
+  want.text_dim = 24;
+  want.timestep_input_dim = 16;
+  want.time_embed_hidden_size = 64;
+  want.time_embed_dim = 32;
+  want.adaln_out_features = 18 * want.hidden_size;
+  want.final_adaln_out_features = 2 * want.hidden_size;
+  want.rope_inv_freq_len = 2;
+
+  gguf_test::GgufModelBuilder builder;
+  builder.AddKv(gguf_test::StrKv("general.architecture", "wan"));
+
+  // GGUF stores `ne` REVERSED vs torch, so a logical [out, in] weight is written
+  // [in, out]. F32 everywhere keeps the test about the LOADER, not about quant
+  // error (the K-quant families go through the same shared dequant entry point).
+  auto add = [&](const std::string& name, const std::vector<int64_t>& logical) {
+    int64_t numel = 1;
+    for (int64_t d : logical) numel *= d;
+    const std::vector<float> values = MakeParam("gguf." + name, numel, 0.1);
+    std::string bytes(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(float));
+    std::vector<uint64_t> ne;
+    for (auto it = logical.rbegin(); it != logical.rend(); ++it) {
+      ne.push_back(static_cast<uint64_t>(*it));
+    }
+    builder.AddTensor(name, ne, /*ggml_type=*/0 /*F32*/, bytes);
+  };
+
+  const int64_t inner = want.num_attention_heads * want.attention_head_dim;
+  const int64_t video_width = want.video_row_width();
+  add("video_patch_proj.weight", {want.hidden_size, video_width});
+  add("video_patch_proj.bias", {want.hidden_size});
+  add("audio_patch_proj.weight", {want.hidden_size, want.audio_latents_dim});
+  add("audio_patch_proj.bias", {want.hidden_size});
+  add("condition_proj.weight", {want.hidden_size, want.text_dim});
+  add("condition_proj.bias", {want.hidden_size});
+  add("time_embedder.proj_in.weight", {want.time_embed_hidden_size, want.timestep_input_dim});
+  add("time_embedder.proj_in.bias", {want.time_embed_hidden_size});
+  add("time_embedder.proj_out.weight", {want.time_embed_dim, want.time_embed_hidden_size});
+  add("time_embedder.proj_out.bias", {want.time_embed_dim});
+  add("rope.inv_freq", {want.rope_inv_freq_len});
+  auto add_block = [&](const std::string& prefix, bool with_adaln) {
+    add(prefix + ".norm1.weight", {want.hidden_size});
+    add(prefix + ".norm2.weight", {want.hidden_size});
+    add(prefix + ".attn.qkv_proj.weight", {3 * inner, want.hidden_size});
+    add(prefix + ".attn.q_norm.weight", {want.attention_head_dim});
+    add(prefix + ".attn.k_norm.weight", {want.attention_head_dim});
+    add(prefix + ".attn.out_proj.weight", {want.hidden_size, inner});
+    add(prefix + ".mlp.fc1.weight", {2 * want.ffn_hidden_size, want.hidden_size});
+    add(prefix + ".mlp.fc2.weight", {want.hidden_size, want.ffn_hidden_size});
+    if (with_adaln) {
+      add(prefix + ".adaln_proj.linear.weight", {want.adaln_out_features, want.time_embed_dim});
+      add(prefix + ".adaln_proj.linear.bias", {want.adaln_out_features});
+    }
+  };
+  for (int64_t i = 0; i < want.token_refiner_num_layers; ++i) {
+    add_block("token_refiner.blocks." + std::to_string(i), false);
+  }
+  add("token_refiner.final_norm.weight", {want.hidden_size});
+  for (int64_t i = 0; i < want.num_layers; ++i) {
+    add_block("blocks." + std::to_string(i), true);
+  }
+  add("final_layer.norm.weight", {want.hidden_size});
+  add("final_layer.adaln_proj.linear.weight", {want.final_adaln_out_features, want.time_embed_dim});
+  add("final_layer.adaln_proj.linear.bias", {want.final_adaln_out_features});
+  add("final_layer.video_out.weight", {video_width, want.hidden_size});
+  add("final_layer.video_out.bias", {video_width});
+  add("final_layer.audio_out.weight", {want.audio_latents_dim, want.hidden_size});
+  add("final_layer.audio_out.bias", {want.audio_latents_dim});
+
+  const std::string path = "/tmp/minimax_h3_loader_test.gguf";
+  {
+    const std::string bytes = builder.Build();
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    CHECK(std::fwrite(bytes.data(), 1, bytes.size(), fh) == bytes.size());
+    std::fclose(fh);
+  }
+
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(path);
+  const vllm::MiniMaxH3GgufDit loaded = vllm::LoadMiniMaxH3DitFromGguf(gguf);
+
+  // The geometry must be RECOVERED from tensor shapes alone.
+  CHECK(loaded.params.num_layers == want.num_layers);
+  CHECK(loaded.params.token_refiner_num_layers == want.token_refiner_num_layers);
+  CHECK(loaded.params.hidden_size == want.hidden_size);
+  CHECK(loaded.params.num_attention_heads == want.num_attention_heads);
+  CHECK(loaded.params.attention_head_dim == want.attention_head_dim);
+  CHECK(loaded.params.ffn_hidden_size == want.ffn_hidden_size);
+  CHECK(loaded.params.latents_dim == want.latents_dim);
+  CHECK(loaded.params.audio_latents_dim == want.audio_latents_dim);
+  CHECK(loaded.params.text_dim == want.text_dim);
+  CHECK(loaded.params.rope_inv_freq_len == want.rope_inv_freq_len);
+  CHECK(static_cast<int64_t>(loaded.weights.blocks.size()) == want.num_layers);
+  CHECK(static_cast<int64_t>(loaded.weights.refiner.size()) == want.token_refiner_num_layers);
+
+  // A loaded weight must carry the LOGICAL (torch) shape, not the reversed ne.
+  CHECK(loaded.weights.blocks[0].qkv_proj.shape[0] == 3 * inner);
+  CHECK(loaded.weights.blocks[0].qkv_proj.shape[1] == want.hidden_size);
+
+  // And the whole thing must actually RUN: a real forward off GGUF-loaded weights.
+  const MiniMaxH3PackedSequence packed = BuildMiniMaxH3PackedSequence(
+      4, 2, 4, 4, 2, 2, /*include_keyframe_cond=*/false, {}, 0);
+  const int64_t seq = packed.seq_len;
+  const int64_t num_img = static_cast<int64_t>(packed.img_pos.size());
+  const int64_t num_audio = static_cast<int64_t>(packed.audio_pos.size());
+  const int64_t num_text = static_cast<int64_t>(packed.text_pos.size());
+  const std::vector<float> x(static_cast<size_t>(seq * video_width), 0.25f);
+  const std::vector<float> audio_x(static_cast<size_t>(seq * want.audio_latents_dim), 0.1f);
+  const std::vector<float> prompt(static_cast<size_t>(num_text * want.text_dim), 0.2f);
+  const std::vector<float> unique_ts = {0.4f};
+  const std::vector<int64_t> inverse(static_cast<size_t>(seq), 0);
+  const std::vector<int32_t> refiner_cu = {0, static_cast<int32_t>(num_text),
+                                           static_cast<int32_t>(num_text)};
+  MiniMaxH3DitInputs in;
+  in.seq_len = seq;
+  in.x = x.data();
+  in.audio_x = audio_x.data();
+  in.img_position_ids = packed.img_position_ids.data();
+  in.unique_timesteps = unique_ts.data();
+  in.num_unique_timesteps = 1;
+  in.inverse_indices = inverse.data();
+  in.token_tags = packed.token_tags.data();
+  in.prompt_embeds = prompt.data();
+  in.img_pos = packed.img_pos.data();
+  in.num_img_pos = num_img;
+  in.audio_pos = packed.audio_pos.data();
+  in.num_audio_pos = num_audio;
+  in.text_pos = packed.text_pos.data();
+  in.num_text_pos = num_text;
+  in.infer_out_pos = packed.img_pos.data();
+  in.num_infer_out_pos = num_img;
+  in.update_mask = packed.update_mask.data();
+  in.cu_seqlens = packed.cu_seqlens.data();
+  in.num_cu_seqlens = static_cast<int64_t>(packed.cu_seqlens.size());
+  in.refiner_cu_seqlens = refiner_cu.data();
+  in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
+
+  const MiniMaxH3DitOutputs got =
+      MiniMaxH3DitForward(Cpu(), loaded.params, loaded.weights, in, vt::DType::kF32);
+  CHECK(static_cast<int64_t>(got.video_logits.size()) == num_img * video_width);
+  CHECK(static_cast<int64_t>(got.audio_logits.size()) == num_audio * want.audio_latents_dim);
+  for (float v : got.video_logits) REQUIRE(std::isfinite(v));
+  for (float v : got.audio_logits) REQUIRE(std::isfinite(v));
+  std::remove(path.c_str());
 }
 
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {

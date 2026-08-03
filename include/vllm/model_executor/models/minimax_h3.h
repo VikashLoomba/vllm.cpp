@@ -419,6 +419,48 @@ std::vector<float> MiniMaxH3VideoVaeDecode(const MiniMaxH3VideoVaeDecoderConfig&
                                            int64_t latent_h, int64_t latent_w,
                                            MiniMaxH3VideoFrameShape* out_shape);
 
+// ---------------------------------------------------------------------------
+// H3-Encoder text tower (minimax_h3_encoder.cpp)
+//
+// A Qwen3-VL text model with three H3-specific deltas: only the first
+// `selected_layer` (50) decoder layers run, the output is UNNORMALIZED (no final
+// RMSNorm), and DeepStack visual features are added at the visual token positions
+// after each of the first `deepstack.size()` layers.
+// ---------------------------------------------------------------------------
+
+inline constexpr int64_t kMiniMaxH3EncoderSelectedLayer = 50;
+inline constexpr int64_t kMiniMaxH3EncoderHiddenDim = 5120;
+
+struct MiniMaxH3EncoderConfig {
+  int64_t hidden_size = kMiniMaxH3EncoderHiddenDim;
+  int64_t num_hidden_layers = 64;
+  int64_t selected_layer = kMiniMaxH3EncoderSelectedLayer;
+  int64_t num_attention_heads = 40;
+  int64_t num_key_value_heads = 8;
+  int64_t head_dim = 128;
+  int64_t intermediate_size = 17408;
+  double rms_norm_eps = 1e-6;
+  double rope_theta = 5000000.0;
+  std::vector<int64_t> mrope_section = {24, 20, 20};
+};
+
+// num_layers = min(config.num_hidden_layers, selected_layer).
+int64_t MiniMaxH3EncoderNumLayers(int64_t config_num_hidden_layers, int64_t selected_layer);
+
+// Interleaved M-RoPE cos/sin ([seq, head_dim]) from [3, seq] (t, h, w) positions.
+void MiniMaxH3EncoderMrope(const int64_t* positions, int64_t seq, int64_t head_dim,
+                           double rope_theta, const std::vector<int64_t>& mrope_section,
+                           std::vector<float>* cos_out, std::vector<float>* sin_out);
+
+// The truncated, UNNORMALIZED text tower. `deepstack[i]` is [num_visual, hidden]
+// and may be empty; `visual_pos_mask` is [seq] and is required when it is not.
+std::vector<float> MiniMaxH3EncoderTextForward(const MiniMaxH3EncoderConfig& config,
+                                               const MiniMaxH3AudioVaeWeights& weights,
+                                               const std::vector<float>& inputs_embeds,
+                                               const int64_t* positions, int64_t seq,
+                                               const uint8_t* visual_pos_mask,
+                                               const std::vector<std::vector<float>>& deepstack);
+
 // The checkpoint stores qkv GROUPED per query group as [q_per_group, k, v]; the
 // fused qkv projection wants [q_all, k_all, v_all] (minimax_h3_transformer.py:
 // 139-168). H3 is MHA, so heads_per_group == 1.

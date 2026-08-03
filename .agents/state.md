@@ -34753,3 +34753,34 @@ the 3D-CNN ENCODER. The encoder matters only for image/video CONDITIONING
 **Next:** W3 (the H3-Encoder on our Qwen3-VL tower) and W6 (pipeline) are what stand
 between here and an end-to-end t2va run on a quantized checkpoint.
 
+## 2026-08-03 - MiniMax-H3 W3 (partial): the encoder TEXT tower is ported
+
+The H3-Encoder's text tower - which produces the [seq, 5120] prompt_embeds the DiT
+consumes - now matches upstream at **1.2e-7**, on both the plain and the DeepStack
+paths.
+
+Its ARCHITECTURE is a Qwen3-VL, which this project already ports, so the value here
+is pinning the three H3-specific deltas:
+  1. LAYER TRUNCATION: num_layers = min(config.num_hidden_layers, 50). The gate's
+     config deliberately declares MORE layers than are selected so this is actually
+     exercised, and a second assertion checks truncation never EXTENDS a shallower
+     model.
+  2. UNNORMALIZED OUTPUT - the load-bearing one. H3 consumes the hidden state
+     straight out of layer 49 with NO final RMSNorm, unlike a stock Qwen3-VL text
+     model. Applying one produces no error and no shape change; it just silently
+     shifts every conditioning vector.
+  3. DEEPSTACK: visual features added at the visual token positions after each of
+     the first len(deepstack_visual_embeds) layers. The test asserts DeepStack
+     actually CHANGES the result, so a no-op injection cannot pass.
+
+**Oracle note:** encoder.py imports exactly one vllm symbol (`vllm.logger`), so a
+one-line stub lets it run without vllm or any of its dependencies. Same pattern as
+the diffusers stub for the video VAE.
+
+**Remains for W3:** the VISION tower (a reuse of our `qwen3_vl_vision.cpp` rather
+than a new port) and the MM processor.
+
+**State of the lane:** DiT, scheduler, layout, request planning, both VAE decoders,
+and now the encoder text tower are all ported and gated. W6 (pipeline assembly) is
+the main thing standing between here and an end-to-end t2va run.
+

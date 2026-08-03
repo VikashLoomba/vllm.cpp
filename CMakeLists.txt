@@ -469,6 +469,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_gguf.cpp
   src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
   src/vllm/model_executor/models/glm4_weights.cpp

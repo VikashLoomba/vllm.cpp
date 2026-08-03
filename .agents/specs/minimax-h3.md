@@ -98,7 +98,7 @@ final output heads. Everything else is BF16.
 | Latent packing | `packed_tokens.py` (114 L) | — | **W1 LANDED** (+ round-trip) |
 | Scheduler | `scheduling_..._euler_ancestral.py` (179 L) | — | **W1 LANDED** |
 | Denoise loop | `denoise_loop.py` (249 L) | — | **W2 LANDED** (driver ported, not e2e-gated) |
-| H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 PENDING** — Qwen3-VL text layer-50 + vision tower + DeepStack |
+| H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 TEXT TOWER DONE** — truncation + UNNORMALIZED output + DeepStack gated at 1.2e-7; the VISION tower (reuse of our qwen3_vl_vision) and the MM processor remain |
 | Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 DECODER DONE** — the FULL ViT3D decoder (pack, x_embedder, register/cls tokens, 3D RoPE, 36-block stack, norm_out, proj_out, unpatchify) is ported and gated at **8.9e-8**. Tiling and the 3D-CNN encoder (conditioning only) remain. See 5.1 |
 | Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
 | Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 PENDING** |
@@ -157,6 +157,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **REAL video-VAE manifest** (560 tensors) | **exact** — decoder confirmed a 36-block ViT, encoder the 3D CNN |
 | **VIDEO VAE decoder TransformerBlock** vs the checkpoint's OWN remote code | **max abs diff 6.0e-8** |
 | **VIDEO VAE FULL ViT3D decoder** vs the checkpoint's OWN remote code | **max abs diff 8.9e-8** |
+| **ENCODER text tower** (truncation + unnormalized output + DeepStack) | **max abs diff 1.2e-7** |
 | config-parse invariants + weight contract + grouped-qkv reorder | pass |
 
 The fp64 position grid is gated bit-exact deliberately: it feeds RoPE, and a
@@ -260,7 +261,7 @@ contract pending W6), `test_minimax_h3_e2e.py` (BLOCKED — needs the checkpoint
 | **W1** | Packed layout + latent packing + scheduler, parity-gated | — (DONE) |
 | **W2** | DiT forward + denoise driver, parity-gated on CPU at reduced dims | — (DONE) |
 | **W2b** | Device-resident forward: bf16 stream, `vt::FusedChain` glue, fused AdaLN modulate op, merged gate/up seam, CUDA gate | — |
-| **W3** | H3-Encoder on the existing Qwen3-VL tower (layer-50 truncation, DeepStack, all-ones mask) | vllm-omni pin |
+| **W3** | H3-Encoder. **TEXT TOWER DONE** (1.2e-7): the three H3 deltas — layer truncation `min(num_hidden_layers, 50)`, the UNNORMALIZED layer-49 output (no final RMSNorm), and DeepStack injection into the first N layers — plus interleaved M-RoPE, fused QKV, per-head q/k RMSNorm, causal GQA and the gated-SiLU MLP. REMAINS: the VISION tower (reuse `qwen3_vl_vision.cpp`) and the MM processor | — |
 | **W4** | Video VAE. **DECODER DONE** — the full ViT3D decoder gated at 8.9e-8 (block 6.0e-8), real hyperparameters 36 layers / 32 heads x 64 / rope_theta 100 / rope_dim_ratio 0.75 from the checkpoint's `vit_decoder_kwargs`. REMAINS: tiling (`vae_tile_size` 256 / overlap 64) and the 3D-CNN ENCODER, which is only needed for image/video CONDITIONING, not for generation output | — |
 | **W5** | Audio VAE reimplementation | **DONE** — DAC-lineage BigVGAN decoder (weight-norm materialization, anti-aliased SnakeBeta with kaiser-sinc up/down resampling, replicate padding, final clamp). Encode-side determinism context is still open |
 | **W6** | Pipeline: t2va/fl2va/ref2va task assembly, condition noise, reference video, presentation, sigma schedules | W3-W5 |

@@ -30,6 +30,7 @@
 #include "minimax_h3_nvfp4_manifest.inc"
 #include "minimax_h3_video_vae_manifest.inc"
 #include "minimax_h3_video_vae_goldens.inc"
+#include "minimax_h3_encoder_goldens.inc"
 
 #include "vt/device.h"
 #include "vt/tensor.h"
@@ -1148,6 +1149,98 @@ TEST_CASE("minimax_h3: the video VAE decoder is a ViT, and its manifest says so"
     INFO("decoder surround " << name);
     CHECK(present.count(name) == 1);
   }
+}
+
+TEST_CASE("minimax_h3: the encoder text tower matches upstream, with all three H3 deltas") {
+  // The H3-Encoder produces the [seq, 5120] prompt_embeds the DiT consumes. Its
+  // ARCHITECTURE is a Qwen3-VL (which this project already ports); what is
+  // H3-specific are three deltas, and all three are exercised here:
+  //   layer truncation, the UNNORMALIZED output, and DeepStack injection.
+  vllm::MiniMaxH3EncoderConfig config;
+  config.hidden_size = vllm_test::kH3EncHidden;
+  config.num_hidden_layers = vllm_test::kH3EncConfigLayers;
+  config.selected_layer = vllm_test::kH3EncSelectedLayer;
+  config.num_attention_heads = vllm_test::kH3EncHeads;
+  config.num_key_value_heads = vllm_test::kH3EncKvHeads;
+  config.head_dim = vllm_test::kH3EncHeadDim;
+  config.intermediate_size = vllm_test::kH3EncIntermediate;
+  config.rms_norm_eps = 1e-6;
+  config.rope_theta = 10000.0;
+  config.mrope_section.assign(vllm_test::kH3EncMropeSection,
+                              vllm_test::kH3EncMropeSection + 3);
+
+  // DELTA 1: the config claims more layers than are kept.
+  CHECK(vllm::MiniMaxH3EncoderNumLayers(config.num_hidden_layers, config.selected_layer) ==
+        vllm_test::kH3EncSelectedLayer);
+  CHECK(vllm_test::kH3EncConfigLayers > vllm_test::kH3EncSelectedLayer);
+  // The shipped rule is 50-of-N.
+  CHECK(vllm::kMiniMaxH3EncoderSelectedLayer == 50);
+  CHECK(vllm::kMiniMaxH3EncoderHiddenDim == 5120);
+  // Truncation must never EXTEND a shallower model.
+  CHECK(vllm::MiniMaxH3EncoderNumLayers(8, 50) == 8);
+
+  const int64_t seq = vllm_test::kH3EncSeq;
+  const int64_t hidden = config.hidden_size;
+  const int64_t q_width = config.num_attention_heads * config.head_dim;
+  const int64_t kv_width = config.num_key_value_heads * config.head_dim;
+
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& name, int64_t count, double scale, double offset) {
+    weights.tensors[name] = MakeParam("encoder." + name, count, scale, offset);
+  };
+  put("embed_tokens.weight", vllm_test::kH3EncVocab * hidden, 0.1, 0.0);
+  for (int64_t l = 0; l < vllm_test::kH3EncSelectedLayer; ++l) {
+    const std::string p = "layers." + std::to_string(l) + ".";
+    put(p + "self_attn.qkv_proj.weight", (q_width + 2 * kv_width) * hidden, 0.1, 0.0);
+    put(p + "self_attn.o_proj.weight", hidden * q_width, 0.1, 0.0);
+    put(p + "self_attn.q_norm.weight", config.head_dim, 0.1, 1.0);
+    put(p + "self_attn.k_norm.weight", config.head_dim, 0.1, 1.0);
+    put(p + "mlp.gate_up_proj.weight", 2 * config.intermediate_size * hidden, 0.1, 0.0);
+    put(p + "mlp.down_proj.weight", hidden * config.intermediate_size, 0.1, 0.0);
+    put(p + "input_layernorm.weight", hidden, 0.1, 1.0);
+    put(p + "post_attention_layernorm.weight", hidden, 0.1, 1.0);
+  }
+
+  const std::vector<float> inputs_embeds =
+      MakeParam("encoder.inputs_embeds", seq * hidden, 1.0);
+  std::vector<int64_t> positions(static_cast<size_t>(3 * seq));
+  for (int64_t axis = 0; axis < 3; ++axis) {
+    for (int64_t s = 0; s < seq; ++s) positions[static_cast<size_t>(axis * seq + s)] = s;
+  }
+
+  // DELTAS 2 + 3: the plain path returns the UNNORMALIZED state; the DeepStack
+  // path additionally injects visual features into the first N layers.
+  const std::vector<float> plain = vllm::MiniMaxH3EncoderTextForward(
+      config, weights, inputs_embeds, positions.data(), seq, nullptr, {});
+  REQUIRE(plain.size() == std::size(vllm_test::kH3EncGolden));
+  const double plain_err = MaxAbsDiff(plain, vllm_test::kH3EncGolden, plain.size());
+  INFO("encoder (plain) max|diff| = " << plain_err);
+  CHECK(plain_err <= 1e-4);
+
+  std::vector<uint8_t> visual_mask(static_cast<size_t>(seq));
+  for (int64_t s = 0; s < seq; ++s) {
+    visual_mask[static_cast<size_t>(s)] =
+        static_cast<uint8_t>(vllm_test::kH3EncVisualMask[s]);
+  }
+  std::vector<std::vector<float>> deepstack;
+  for (int64_t i = 0; i < vllm_test::kH3EncDeepstackLayers; ++i) {
+    deepstack.push_back(MakeParam("encoder.deepstack." + std::to_string(i),
+                                  vllm_test::kH3EncNumVisual * hidden, 0.1, 0.0));
+  }
+  const std::vector<float> injected = vllm::MiniMaxH3EncoderTextForward(
+      config, weights, inputs_embeds, positions.data(), seq, visual_mask.data(), deepstack);
+  REQUIRE(injected.size() == std::size(vllm_test::kH3EncDeepstackGolden));
+  const double deep_err =
+      MaxAbsDiff(injected, vllm_test::kH3EncDeepstackGolden, injected.size());
+  INFO("encoder (deepstack) max|diff| = " << deep_err);
+  CHECK(deep_err <= 1e-4);
+
+  // DeepStack must actually change the result, or the test proves nothing.
+  double delta = 0.0;
+  for (size_t i = 0; i < plain.size(); ++i) {
+    delta = std::max(delta, std::abs(static_cast<double>(plain[i]) - injected[i]));
+  }
+  CHECK(delta > 1e-5);
 }
 
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {

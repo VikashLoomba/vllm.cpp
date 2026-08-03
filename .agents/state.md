@@ -35595,3 +35595,45 @@ identity would pass a "did it run" check while proving nothing, and the off-diag
 term is what makes it a genuine channel MIX.
 
 Gate: 44/44 (13321 assertions).
+
+## 2026-08-03 - MiniMax-H3: a THIRD weight-norm spelling, from the community quant repo
+
+The developer linked Abiray/Minimax-H3-nvfp4-INT4-INT8-Convrot. Inspecting its
+headers (range requests, no payload) split it cleanly into useful and not:
+
+USEFUL - `vae/minimax_h3_video_vae_fp16.safetensors` (562 tensors) and
+`vae/minimax_h3_audio_vae_fp32.safetensors` (917). Standalone, and they carry
+`latents_mean`/`latents_std` [32], the denorm statistics the pipeline needs. Our
+video loader already handles that file as-is (same decoder./encoder./post_quant_conv
+layout, and F16 is covered by the shared reader).
+
+BUT the audio one exposed a THIRD weight-norm spelling: `decoder.conv_pre.weight
+[1024, 2048, 7]` - no weight_g/weight_v, no parametrizations. The norm was FOLDED at
+conversion time. Our loader mapped (1)->(2) only, so this file would have thrown by
+name at decode.
+
+Now handled, and reconstructed EXACTLY rather than approximately: given materialized
+w, set v = w and g = per-dim-0-slice ||w||; the decoder's own g * v / ||v|| then
+returns w. Round-trip error 1.49e-08 (f32 precision). `dec_in_proj` is excluded - it
+is a PLAIN Conv1d, not weight-normalized, so synthesizing a pair for it would be
+wrong; the test asserts it survives verbatim.
+
+NOT USEFUL FOR PARITY - the INT4/INT8 "convrot" DiTs. Two disqualifiers, both from
+the manifest:
+  * The filenames say `pruned`, and pruning changes the MODEL. Gating a pruned
+    checkpoint against upstream goldens measures a different network.
+  * They are RESTRUCTURED: `adaln_t_table [1025, 8]` is a precomputed time-embedding
+    table we have no contract for, and `blocks.0.adaln_proj.linear.weight` is
+    [96768, 8] - input dim 8, not time_embed_dim. Plus a `comfy_quant` suffix on 200
+    tensors (ComfyUI's own quant metadata, not compressed-tensors).
+They may still be interesting as a SPEED experiment, but they cannot answer a
+correctness question, and a throughput number off a pruned+restructured model is not
+comparable to anything upstream.
+
+The packaged text encoder (`text_encoders/qwen3vl_32b_minimax_h3_int8_convrot`,
+1602 tensors) is more promising for path 2: ONE file carrying both towers in standard
+HF names (`model.*` 1251 + `visual.*` 351, 50 layers - matching H3's documented
+layer truncation). It is INT8 (I8 + weight_scale), so bf16 Qwen3-VL shards remain the
+cleaner correctness source; this one is the convenience/size option.
+
+Gate: 45/45 (13342 assertions).

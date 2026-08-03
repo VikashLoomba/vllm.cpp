@@ -21,6 +21,7 @@
 // therefore asserted against the real manifest in the test, not just exercised.
 #include "vllm/model_executor/models/minimax_h3.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -97,31 +98,63 @@ std::vector<float> MiniMaxH3ReadSafetensorF32(const StTensor& tensor) {
 MiniMaxH3AudioVaeWeights LoadMiniMaxH3AudioVaeWeights(const SafetensorsFile& file) {
   MiniMaxH3AudioVaeWeights out;
   for (const std::string& name : file.Names()) {
-    // The audio ENCODER shares this file. Generation only decodes, so its tensors
-    // are ignored rather than loaded — silently carrying ~half the file would cost
-    // memory for weights nothing reads.
+    // The audio ENCODER shares this file, as do the VAE's mean/logvar heads and
+    // pre_block in repackaged copies. Generation only decodes, so none are loaded.
     if (name.rfind("encoder.", 0) == 0) continue;
+    if (name.rfind("mean_proj.", 0) == 0 || name.rfind("logs_proj.", 0) == 0) continue;
+    if (name.rfind("pre_block.", 0) == 0) continue;
 
     std::string key = name;
     if (key.rfind("decoder.", 0) == 0) key = key.substr(std::strlen("decoder."));
 
     // The kaiser-sinc anti-aliasing filters are COMPUTED at load
-    // (MiniMaxH3KaiserSincFilter1d), never read. Loading them would be harmless
-    // but misleading: it would suggest the decoder consumes them.
+    // (MiniMaxH3KaiserSincFilter1d), never read.
     if (key.size() >= 7 && key.compare(key.size() - 7, 7, ".filter") == 0) continue;
 
-    // LEGACY weight_norm -> the parametrization spelling the decoder reads.
-    const std::string g = ".weight_g";
-    const std::string v = ".weight_v";
+    const StTensor& tensor = file.Get(name);
+
+    // --- the three weight-norm spellings this decoder must accept ---
+    // (1) LEGACY  `weight_g` / `weight_v`  — the OFFICIAL MiniMax-H3 checkpoint.
+    // (2) MODERN  `parametrizations.weight.original0/1` — what the decoder reads,
+    //     and what the generator produced (it ran the remote code under a torch
+    //     where weight_norm is a parametrization).
+    // (3) MATERIALIZED plain `weight` — repackaged community bundles, which folded
+    //     the norm at conversion time.
+    const std::string g = ".weight_g", v = ".weight_v";
     if (key.size() > g.size() && key.compare(key.size() - g.size(), g.size(), g) == 0) {
       key = key.substr(0, key.size() - g.size()) + ".parametrizations.weight.original0";
     } else if (key.size() > v.size() && key.compare(key.size() - v.size(), v.size(), v) == 0) {
       key = key.substr(0, key.size() - v.size()) + ".parametrizations.weight.original1";
+    } else if (key.size() > 7 && key.compare(key.size() - 7, 7, ".weight") == 0 &&
+               key != "dec_in_proj.weight" && tensor.shape.size() == 3) {
+      // (3) Reconstruct an EXACT pair rather than an approximate one: with v = w and
+      // g = per-dim-0-slice ||w||, the decoder's own g * v / ||v|| returns w.
+      // dec_in_proj is a PLAIN Conv1d (not weight-normalized), so it is excluded.
+      const std::string base = key.substr(0, key.size() - 7);
+      std::vector<float> w = MiniMaxH3ReadSafetensorF32(tensor);
+      const int64_t rows = tensor.shape[0];
+      VT_CHECK(rows > 0 && static_cast<int64_t>(w.size()) % rows == 0,
+               "minimax_h3 audio vae: materialized conv weight has an implausible shape");
+      const int64_t per_row = static_cast<int64_t>(w.size()) / rows;
+      std::vector<float> mag(static_cast<size_t>(rows));
+      for (int64_t r = 0; r < rows; ++r) {
+        double sum = 0.0;
+        for (int64_t i = 0; i < per_row; ++i) {
+          const double e = w[static_cast<size_t>(r * per_row + i)];
+          sum += e * e;
+        }
+        mag[static_cast<size_t>(r)] = static_cast<float>(std::sqrt(sum));
+      }
+      VT_CHECK(out.tensors.count(base + ".parametrizations.weight.original1") == 0,
+               "minimax_h3 audio vae: two checkpoint tensors map to the same name");
+      out.tensors[base + ".parametrizations.weight.original1"] = std::move(w);
+      out.tensors[base + ".parametrizations.weight.original0"] = std::move(mag);
+      continue;
     }
 
     VT_CHECK(out.tensors.count(key) == 0,
              "minimax_h3 audio vae: two checkpoint tensors map to the same name");
-    out.tensors[key] = MiniMaxH3ReadSafetensorF32(file.Get(name));
+    out.tensors[key] = MiniMaxH3ReadSafetensorF32(tensor);
   }
   VT_CHECK(!out.tensors.empty(), "minimax_h3 audio vae: checkpoint contained no decoder tensors");
   return out;

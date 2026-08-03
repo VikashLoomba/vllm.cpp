@@ -3229,6 +3229,86 @@ TEST_CASE("minimax_h3: the audio-VAE loader materializes weights the decoder RUN
   }
 }
 
+TEST_CASE("minimax_h3: the audio-VAE loader accepts a MATERIALIZED weight-norm too") {
+  // A third spelling exists in the wild: repackaged community VAE bundles fold the
+  // weight-norm at conversion time and ship a plain `<conv>.weight`, with no (g, v)
+  // pair at all. The decoder only knows the pair, so the loader reconstructs one --
+  // and the reconstruction must be EXACT, not approximate.
+  struct Entry {
+    std::string name, dtype;
+    std::vector<int64_t> shape;
+    std::string bytes;
+  };
+  std::vector<Entry> entries;
+  auto add = [&](const std::string& name, const std::vector<int64_t>& shape,
+                 const std::vector<float>& values) {
+    entries.push_back({name, "F32", shape,
+                       std::string(reinterpret_cast<const char*>(values.data()),
+                                   values.size() * sizeof(float))});
+  };
+  // One materialized conv weight, plus a plain dec_in_proj (NOT weight-normalized,
+  // so it must be left exactly alone).
+  const std::vector<float> w = MakeParam("matnorm.w", 4 * 3 * 5, 0.3);
+  add("decoder.conv_pre.weight", {4, 3, 5}, w);
+  add("decoder.conv_pre.bias", {4}, MakeParam("matnorm.b", 4, 0.1));
+  const std::vector<float> dip = MakeParam("matnorm.dip", 6 * 2 * 1, 0.2);
+  add("dec_in_proj.weight", {6, 2, 1}, dip);
+
+  std::string header = "{";
+  size_t offset = 0;
+  bool first = true;
+  for (const Entry& e : entries) {
+    if (!first) header += ",";
+    first = false;
+    header += "\"" + e.name + "\":{\"dtype\":\"" + e.dtype + "\",\"shape\":[";
+    for (size_t i = 0; i < e.shape.size(); ++i) {
+      if (i) header += ",";
+      header += std::to_string(e.shape[i]);
+    }
+    header += "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + e.bytes.size()) + "]}";
+    offset += e.bytes.size();
+  }
+  header += "}";
+  const std::string path = "/tmp/minimax_h3_audio_vae_materialized.safetensors";
+  {
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    const uint64_t n = header.size();
+    std::fwrite(&n, sizeof(n), 1, fh);
+    std::fwrite(header.data(), 1, header.size(), fh);
+    for (const Entry& e : entries) std::fwrite(e.bytes.data(), 1, e.bytes.size(), fh);
+    std::fclose(fh);
+  }
+
+  const vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(path);
+  const vllm::MiniMaxH3AudioVaeWeights got = vllm::LoadMiniMaxH3AudioVaeWeights(st);
+
+  // The pair exists, and the plain name is gone.
+  REQUIRE(got.Has("conv_pre.parametrizations.weight.original0"));
+  REQUIRE(got.Has("conv_pre.parametrizations.weight.original1"));
+  CHECK_FALSE(got.Has("conv_pre.weight"));
+  // dec_in_proj is NOT weight-normalized: it must survive verbatim.
+  REQUIRE(got.Has("dec_in_proj.weight"));
+  CHECK_FALSE(got.Has("dec_in_proj.parametrizations.weight.original0"));
+  const std::vector<float>& dip_got = got.Get("dec_in_proj.weight");
+  REQUIRE(dip_got.size() == dip.size());
+  for (size_t i = 0; i < dip.size(); ++i) CHECK(dip_got[i] == dip[i]);
+
+  // THE POINT: running the decoder's own materialization on the reconstructed pair
+  // must return the checkpoint's weight. Anything else is a silently wrong conv.
+  const std::vector<float> back = vllm::MiniMaxH3MaterializeWeightNorm(
+      got.Get("conv_pre.parametrizations.weight.original0"),
+      got.Get("conv_pre.parametrizations.weight.original1"), 4);
+  REQUIRE(back.size() == w.size());
+  double err = 0.0;
+  for (size_t i = 0; i < w.size(); ++i) {
+    err = std::max(err, std::abs(static_cast<double>(back[i] - w[i])));
+  }
+  INFO("materialized round-trip err = " << err);
+  CHECK(err <= 1e-6);
+}
+
 TEST_CASE("minimax_h3: the REAL video-VAE checkpoint maps onto the ViT3D decoder's names") {
   // Same shape of gate as the audio VAE, over the real 560-tensor manifest. The
   // mapping is simpler here (no weight-norm spelling change; only the `decoder.`

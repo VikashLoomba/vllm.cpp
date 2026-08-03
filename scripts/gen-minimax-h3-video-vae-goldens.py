@@ -162,6 +162,78 @@ def emit_f32(out, name: str, values) -> None:
     out.write("};\n\n")
 
 
+def emit_tiling(out) -> None:
+    """Section: the video VAE's spatial TILING plan and overlap blend.
+
+    Restated from the checkpoint's klvae.py:192-250 (`split_tiles`, `blend`) --
+    importing klvae directly would drag in the whole VAE bundle. The shipped
+    config is tile_size 256 / tile_overlap_min 64 / vae_ratio 16 (= prod of
+    space_down [2,2,2,2,1,1], the "f16" in f16t4).
+    """
+    import math as _math
+
+    vae_ratio = 16
+
+    def split_tiles(input_len, tile_size, tile_overlap_min):
+        if tile_size >= input_len:
+            return [0], [input_len], []
+        n = _math.ceil(input_len / tile_size)
+        while True:
+            overlaps = [tile_overlap_min] * (n - 1)
+            remaining = tile_size * n - sum(overlaps) - input_len
+            if remaining < 0:
+                n += 1
+            else:
+                break
+        remaining_units = remaining // vae_ratio
+        for i in range(remaining_units):
+            overlaps[i % (n - 1)] += vae_ratio
+        starts = [0]
+        for i in range(n - 1):
+            starts.append(starts[-1] + tile_size - overlaps[i])
+        return starts, [tile_size] * n, overlaps
+
+    cases = [(1024, 256, 64), (768, 256, 64), (256, 256, 64), (100, 256, 64),
+             (1344, 256, 64), (513, 128, 32)]
+    starts_flat, lens_flat, ovl_flat, counts = [], [], [], []
+    for input_len, tile, overlap in cases:
+        st, ln, ov = split_tiles(input_len, tile, overlap)
+        counts.append(len(st))
+        starts_flat.extend(st)
+        lens_flat.extend(ln)
+        ovl_flat.extend(ov + [0] * (len(st) - 1 - len(ov)))
+
+    # blend: linear cross-fade over `blend_extent` along one axis.
+    extent = 4
+    a = h3_rand("tiling.a", 12)
+    b = h3_rand("tiling.b", 12)
+    blended = []
+    for i in range(extent):
+        wa = 1.0 - i / extent
+        wb = i / extent
+        blended.append(a[len(a) - extent + i] * wa + b[i] * wb)
+    blended.extend(b[extent:])
+
+    out.write(f"inline constexpr int64_t kH3TileVaeRatio = {vae_ratio};\n")
+    out.write(f"inline constexpr int64_t kH3TileCases = {len(cases)};\n")
+    out.write(f"inline constexpr int64_t kH3TileBlendExtent = {extent};\n")
+    out.write(f"inline constexpr int64_t kH3TileBlendLen = {len(a)};\n\n")
+    emit_i64(out, "kH3TileInputs", [v for c in cases for v in c])
+    emit_i64(out, "kH3TileCounts", counts)
+    emit_i64(out, "kH3TileStarts", starts_flat)
+    emit_i64(out, "kH3TileLens", lens_flat)
+    emit_i64(out, "kH3TileOverlaps", ovl_flat)
+    emit_f32(out, "kH3TileBlendGolden", np.asarray(blended, dtype=np.float32))
+
+
+def emit_i64(out, name, values):
+    flat = [int(v) for v in np.asarray(values).reshape(-1).tolist()]
+    out.write(f"inline constexpr int64_t {name}[] = {{\n")
+    for i in range(0, len(flat), 12):
+        out.write("    " + ", ".join(str(v) for v in flat[i : i + 12]) + ",\n")
+    out.write("};\n\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--h3-vae-source", required=True, type=Path,
@@ -267,6 +339,7 @@ def main() -> int:
         out.write(f"inline constexpr int64_t kH3VideoVaeDecFrameH = {int(frames.shape[3])};\n")
         out.write(f"inline constexpr int64_t kH3VideoVaeDecFrameW = {int(frames.shape[4])};\n\n")
         emit_f32(out, "kH3VideoVaeDecoderGolden", frames.reshape(-1))
+        emit_tiling(out)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out} (ff inner {int(inner)})", file=sys.stderr)
     return 0

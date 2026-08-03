@@ -34975,3 +34975,30 @@ the single item in the lane that needs a project decision rather than more porti
 **Remaining:** MM processor, presentation.py (ref2va prompt assembly), video tiling,
 the ffmpeg-dependent media I/O above, and the device-resident forward.
 
+## 2026-08-03 - MiniMax-H3: video-VAE spatial tiling
+
+The tile plan and seam blend are ported and exact, so the video VAE side is
+complete for GENERATION (only the 3D-CNN encoder remains, and that is needed for
+image/video CONDITIONING, not for producing output frames).
+
+The plan is not a simple stride, which is the whole reason it needed a gate: it
+takes the SMALLEST tile count whose MINIMUM overlaps still cover the axis, then
+distributes the leftover slack in whole vae_ratio units ROUND-ROBIN across the
+seams. Get that distribution wrong and every tile after the first shifts - which
+surfaces as seam artifacts in the output, not as an error anywhere.
+
+Shipped config: tile 256, overlap_min 64, vae_ratio 16 (= prod(space_down)
+[2,2,2,2,1,1] - the "f16" in f16t4; vae_ratio_t = 4 is the "t4").
+
+**Lane status.** Ported and gated: DiT (f32 + bf16), packed layout, scheduler,
+request planning, denoise loop, BOTH VAE decoders + tiling, BOTH encoder towers,
+condition-noise anchors, reference-video geometry/schedule, the assembled t2va
+pipeline, and BOTH quantized loaders.
+
+**Remaining, and each is now blocked on something specific rather than on effort:**
+  * MM processor + presentation.py - portable, still to do;
+  * the VAE's 3D-CNN encoder - portable, conditioning-only;
+  * media I/O (ffmpeg) and MP4 muxing - ONE dependency decision, needs the project owner;
+  * device-resident FP4 forward and any speed number - needs a GPU (dgx.casa is
+    unreachable; this workstation has none).
+

@@ -49,13 +49,14 @@ identical FNV-1a + splitmix64 stream, so no weight byte is checked in):
 | **ENCODER FULL vision tower** (ragged 2-image batch, DeepStack + merged) | **max abs diff <= 1e-4** |
 | **CONDITION-NOISE augmentation** (visual + audio anchors) | exact (<= 1e-6) |
 | **REFERENCE-VIDEO geometry + frame schedule** | exact |
+| **VIDEO VAE tiling plan + seam blend** | exact |
 | **WHOLE t2va path composes** | frames + stereo waveform, correct shapes, finite, in [-1, 1] |
 | **GGUF load -> runnable DiT** | geometry from shapes; a real forward runs off the loaded weights |
 | **NVFP4 load -> runnable DiT** | compressed-tensors triple dequantized; a real forward runs |
 
 **Reproduce:** `cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF`
 then `cmake --build build-cpu --target test_minimax_h3 -j16 && ./build-cpu/tests/test_minimax_h3`
-(26/26 cases, 8908 assertions). Regenerate goldens with
+(27/27 cases, 9036 assertions). Regenerate goldens with
 `python3 scripts/gen-minimax-h3-goldens.py --vllm-omni <checkout> --out tests/vllm/models/minimax_h3_goldens.inc`;
 regenerate the GGUF manifest by range-fetching the first 4 MiB of the .gguf and running
 `scripts/gen-minimax-h3-gguf-manifest.py`.

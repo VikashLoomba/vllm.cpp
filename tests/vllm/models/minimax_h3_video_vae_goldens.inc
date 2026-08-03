@@ -76,4 +76,38 @@ inline constexpr float kH3VideoVaeDecoderGolden[] = {
     0.177932456f, 0.133054718f, 0.0200626496f, 0.0145068653f, -0.0634974092f, 0.433572888f,
 };
 
+inline constexpr int64_t kH3TileVaeRatio = 16;
+inline constexpr int64_t kH3TileCases = 6;
+inline constexpr int64_t kH3TileBlendExtent = 4;
+inline constexpr int64_t kH3TileBlendLen = 12;
+
+inline constexpr int64_t kH3TileInputs[] = {
+    1024, 256, 64, 768, 256, 64, 256, 256, 64, 100, 256, 64,
+    1344, 256, 64, 513, 128, 32,
+};
+
+inline constexpr int64_t kH3TileCounts[] = {
+    5, 4, 1, 1, 7, 6,
+};
+
+inline constexpr int64_t kH3TileStarts[] = {
+    0, 192, 384, 576, 768, 0, 160, 336, 512, 0, 0, 0,
+    176, 352, 528, 704, 896, 1088, 0, 80, 160, 240, 320, 400,
+};
+
+inline constexpr int64_t kH3TileLens[] = {
+    256, 256, 256, 256, 256, 256, 256, 256, 256, 256, 100, 256,
+    256, 256, 256, 256, 256, 256, 128, 128, 128, 128, 128, 128,
+};
+
+inline constexpr int64_t kH3TileOverlaps[] = {
+    64, 64, 64, 64, 96, 80, 80, 80, 80, 80, 80, 64,
+    64, 48, 48, 48, 48, 48,
+};
+
+inline constexpr float kH3TileBlendGolden[] = {
+    0.369998753f, -0.411502272f, 0.55181247f, 0.0489070341f, 0.059626583f, 0.199151933f,
+    -0.232086182f, -0.2580899f, -0.38048327f, 0.52126509f, 0.0402474627f, -0.326698303f,
+};
+
 }  // namespace vllm_test

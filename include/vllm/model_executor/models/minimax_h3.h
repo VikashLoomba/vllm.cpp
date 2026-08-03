@@ -462,6 +462,30 @@ void MiniMaxH3VideoVaeRope(int64_t latent_t, int64_t latent_h, int64_t latent_w,
                            int64_t num_suffix, int64_t rope_apply_dim, double rope_theta,
                            std::vector<float>* cos_out, std::vector<float>* sin_out);
 
+// --- spatial tiling (klvae.py:192-250) ---
+// Shipped config: tile_size 256, tile_overlap_min 64, vae_ratio 16.
+inline constexpr int64_t kMiniMaxH3VaeTileSize = 256;
+inline constexpr int64_t kMiniMaxH3VaeTileOverlapMin = 64;
+inline constexpr int64_t kMiniMaxH3VaeRatio = 16;   // prod(space_down)
+inline constexpr int64_t kMiniMaxH3VaeRatioT = 4;   // prod(time_down)
+
+struct MiniMaxH3TilePlan {
+  std::vector<int64_t> starts;
+  std::vector<int64_t> lengths;
+  std::vector<int64_t> overlaps;  // one per seam; empty for a single tile
+};
+
+// The tile plan along one axis: smallest tile count whose minimum overlaps still
+// cover the input, with the leftover slack distributed in whole `vae_ratio` units
+// ROUND-ROBIN across the seams.
+MiniMaxH3TilePlan MiniMaxH3SplitTiles(int64_t input_len, int64_t tile_size,
+                                      int64_t tile_overlap_min, int64_t vae_ratio);
+
+// Linear cross-fade of the last `blend_extent` elements of `a` into the first
+// `blend_extent` of `b`, followed by the remainder of `b`.
+std::vector<float> MiniMaxH3BlendTiles(const std::vector<float>& a, const std::vector<float>& b,
+                                       int64_t blend_extent);
+
 // Decode a video latent [in_channels, T, H, W] to frames [out_channels, T*pt, H*ps, W*ps].
 std::vector<float> MiniMaxH3VideoVaeDecode(const MiniMaxH3VideoVaeDecoderConfig& config,
                                            const MiniMaxH3AudioVaeWeights& weights,

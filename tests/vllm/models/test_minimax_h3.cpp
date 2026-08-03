@@ -2010,6 +2010,59 @@ TEST_CASE("minimax_h3: reference-video geometry and frame schedule match upstrea
   CHECK_THROWS(vllm::MiniMaxH3ReferenceVideoFrameSchedule(0));
 }
 
+TEST_CASE("minimax_h3: video VAE tiling plan and seam blend match upstream") {
+  // The tile plan is not a simple stride: it picks the smallest tile count whose
+  // MINIMUM overlaps still cover the input, then distributes the leftover slack in
+  // whole vae_ratio units ROUND-ROBIN across the seams. Getting that wrong shifts
+  // every tile after the first and shows up as seam artifacts, not as an error.
+  int64_t s_off = 0, l_off = 0, o_off = 0;
+  for (int64_t c = 0; c < vllm_test::kH3TileCases; ++c) {
+    const int64_t input_len = vllm_test::kH3TileInputs[c * 3 + 0];
+    const int64_t tile_size = vllm_test::kH3TileInputs[c * 3 + 1];
+    const int64_t overlap_min = vllm_test::kH3TileInputs[c * 3 + 2];
+    const vllm::MiniMaxH3TilePlan got =
+        vllm::MiniMaxH3SplitTiles(input_len, tile_size, overlap_min, vllm_test::kH3TileVaeRatio);
+    INFO("tile case " << c << " len=" << input_len << " tile=" << tile_size);
+    REQUIRE(static_cast<int64_t>(got.starts.size()) == vllm_test::kH3TileCounts[c]);
+    for (size_t i = 0; i < got.starts.size(); ++i) {
+      CHECK(got.starts[i] == vllm_test::kH3TileStarts[s_off + i]);
+      CHECK(got.lengths[i] == vllm_test::kH3TileLens[l_off + i]);
+    }
+    for (size_t i = 0; i < got.overlaps.size(); ++i) {
+      CHECK(got.overlaps[i] == vllm_test::kH3TileOverlaps[o_off + i]);
+    }
+    // Structural invariants the plan must satisfy for tiling to be lossless:
+    // tiles cover the whole axis, and every seam overlaps by at least the minimum.
+    CHECK(got.starts.front() == 0);
+    CHECK(got.starts.back() + got.lengths.back() >= input_len);
+    for (size_t i = 0; i < got.overlaps.size(); ++i) {
+      CHECK(got.overlaps[i] >= overlap_min);
+      CHECK(got.overlaps[i] % vllm_test::kH3TileVaeRatio == overlap_min % vllm_test::kH3TileVaeRatio);
+    }
+    s_off += static_cast<int64_t>(got.starts.size());
+    l_off += static_cast<int64_t>(got.lengths.size());
+    o_off += static_cast<int64_t>(got.starts.size()) - 1;
+  }
+
+  // A tile larger than the input is a single untiled pass with no seams.
+  const vllm::MiniMaxH3TilePlan single = vllm::MiniMaxH3SplitTiles(100, 256, 64, 16);
+  CHECK(single.starts.size() == 1);
+  CHECK(single.lengths[0] == 100);
+  CHECK(single.overlaps.empty());
+
+  // The seam cross-fade.
+  const std::vector<float> a = MakeParam("tiling.a", vllm_test::kH3TileBlendLen, 1.0);
+  const std::vector<float> b = MakeParam("tiling.b", vllm_test::kH3TileBlendLen, 1.0);
+  const std::vector<float> blended =
+      vllm::MiniMaxH3BlendTiles(a, b, vllm_test::kH3TileBlendExtent);
+  REQUIRE(blended.size() == std::size(vllm_test::kH3TileBlendGolden));
+  CHECK(MaxAbsDiff(blended, vllm_test::kH3TileBlendGolden, blended.size()) <= 1e-6);
+  // The fade starts fully on `a` and ends fully on `b`.
+  CHECK(blended.front() == doctest::Approx(a[a.size() - vllm_test::kH3TileBlendExtent]));
+  CHECK(blended[static_cast<size_t>(vllm_test::kH3TileBlendExtent)] ==
+        doctest::Approx(b[static_cast<size_t>(vllm_test::kH3TileBlendExtent)]));
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

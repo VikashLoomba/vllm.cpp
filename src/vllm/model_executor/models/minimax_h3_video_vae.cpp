@@ -376,4 +376,75 @@ std::vector<float> MiniMaxH3VideoVaeDecode(const MiniMaxH3VideoVaeDecoderConfig&
   return frames;
 }
 
+// ---------------------------------------------------------------------------
+// Spatial tiling (klvae.py:192-250)
+//
+// The video VAE decodes large canvases in overlapping tiles and cross-fades the
+// seams. The shipped config is tile_size 256 / tile_overlap_min 64 / vae_ratio 16
+// (the product of `space_down` [2,2,2,2,1,1] — the "f16" in f16t4).
+//
+// The tile plan is not a simple stride: it picks the SMALLEST tile count whose
+// minimum overlaps still cover the input, then distributes the leftover slack in
+// whole `vae_ratio` units ROUND-ROBIN across the seams. Getting that distribution
+// wrong shifts every tile after the first and shows up as seam artifacts, not as
+// an error.
+// ---------------------------------------------------------------------------
+
+MiniMaxH3TilePlan MiniMaxH3SplitTiles(int64_t input_len, int64_t tile_size,
+                                      int64_t tile_overlap_min, int64_t vae_ratio) {
+  VT_CHECK(input_len > 0, "minimax_h3 tiling: input_len must be positive");
+  VT_CHECK(tile_size > 0 && vae_ratio > 0, "minimax_h3 tiling: tile_size/vae_ratio must be positive");
+  VT_CHECK(tile_overlap_min >= 0, "minimax_h3 tiling: tile_overlap_min must be >= 0");
+
+  MiniMaxH3TilePlan plan;
+  if (tile_size >= input_len) {
+    // A single tile covers the whole axis; there are no seams to blend.
+    plan.starts = {0};
+    plan.lengths = {input_len};
+    return plan;
+  }
+
+  int64_t n = (input_len + tile_size - 1) / tile_size;  // ceil
+  int64_t remaining = 0;
+  while (true) {
+    remaining = tile_size * n - tile_overlap_min * (n - 1) - input_len;
+    if (remaining >= 0) break;
+    ++n;
+  }
+  plan.overlaps.assign(static_cast<size_t>(n - 1), tile_overlap_min);
+  const int64_t remaining_units = remaining / vae_ratio;
+  for (int64_t i = 0; i < remaining_units; ++i) {
+    plan.overlaps[static_cast<size_t>(i % (n - 1))] += vae_ratio;
+  }
+
+  plan.starts.push_back(0);
+  for (int64_t i = 0; i < n - 1; ++i) {
+    plan.starts.push_back(plan.starts.back() + tile_size - plan.overlaps[static_cast<size_t>(i)]);
+  }
+  plan.lengths.assign(static_cast<size_t>(n), tile_size);
+  return plan;
+}
+
+// blend (klvae.py:220-250): a linear cross-fade over `blend_extent` elements
+// along one axis, followed by the remainder of `b`. `stride` is the distance
+// between consecutive elements along that axis.
+std::vector<float> MiniMaxH3BlendTiles(const std::vector<float>& a, const std::vector<float>& b,
+                                       int64_t blend_extent) {
+  const int64_t a_len = static_cast<int64_t>(a.size());
+  const int64_t b_len = static_cast<int64_t>(b.size());
+  blend_extent = std::min({a_len, b_len, blend_extent});
+  VT_CHECK(blend_extent > 0, "minimax_h3 tiling: blend_extent must be positive");
+
+  std::vector<float> out;
+  out.reserve(static_cast<size_t>(b_len));
+  for (int64_t i = 0; i < blend_extent; ++i) {
+    const double wb = static_cast<double>(i) / static_cast<double>(blend_extent);
+    const double wa = 1.0 - wb;
+    out.push_back(static_cast<float>(a[static_cast<size_t>(a_len - blend_extent + i)] * wa +
+                                     b[static_cast<size_t>(i)] * wb));
+  }
+  for (int64_t i = blend_extent; i < b_len; ++i) out.push_back(b[static_cast<size_t>(i)]);
+  return out;
+}
+
 }  // namespace vllm

@@ -350,8 +350,10 @@ std::vector<float> MiniMaxH3MaterializeWeightNorm(const std::vector<float>& g,
                                                   const std::vector<float>& v,
                                                   int64_t out_channels);
 
-// Decode one channel of audio latents [num_mels, frames] to a waveform in
-// [-1, 1]. Returns the samples and writes their count to `out_samples`.
+// Decode one channel of audio latents to a waveform in [-1, 1]. When the weights
+// carry `dec_in_proj` (the checkpoint's Conv1d k=1 from vae_latent_channels to
+// num_mels, applied before BigVGAN — dac_audio_vae.py:218-231) the input is
+// [vae_latent_channels, frames]; otherwise it is already [num_mels, frames].
 std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config,
                                            const MiniMaxH3AudioVaeWeights& weights,
                                            const std::vector<float>& latent, int64_t frames,
@@ -565,5 +567,51 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     const std::vector<float>& initial_audio_rows, const std::vector<float>& keyframe_cond_rows,
     const std::vector<float>& audio_ref_rows, const std::vector<double>& sigmas_video,
     const std::vector<double>& sigmas_audio, vt::DType compute_dtype);
+
+
+// ---------------------------------------------------------------------------
+// t2va pipeline assembly (minimax_h3_pipeline.cpp)
+//
+// The wiring from prompt embeddings to frames + waveform. Every stage it calls is
+// separately ported and gated; this composes them.
+// ---------------------------------------------------------------------------
+
+struct MiniMaxH3T2vaRequest {
+  int64_t text_len = 0;
+  int64_t latent_t = 0, latent_h = 0, latent_w = 0;
+  int64_t audio_t = 0;
+  int64_t audio_channel = kMiniMaxH3AudioChannels;
+  int64_t num_steps = kMiniMaxH3DefaultSteps;
+  double video_shift = kMiniMaxH3DefaultVideoShift;
+  double audio_shift = kMiniMaxH3DefaultAudioShift;
+  // Per-channel latent statistics from each VAE's config.json; empty skips the
+  // denormalization (useful in unit tests).
+  std::vector<float> video_latents_mean, video_latents_std;
+  std::vector<float> audio_latents_mean, audio_latents_std;
+};
+
+struct MiniMaxH3T2vaResult {
+  std::vector<float> frames;  // [C, T, H, W]
+  MiniMaxH3VideoFrameShape frame_shape;
+  std::vector<float> waveform;  // channel-major, audio_samples_per_channel each
+  int64_t audio_channels = 0;
+  int64_t audio_samples_per_channel = 0;
+  int64_t sample_rate = 0;
+};
+
+// Run the whole t2va path. NOISE IS AN INPUT: upstream seeds a torch CPU
+// generator, and reproducing torch's RNG bit-exactly decides WHICH sample you get
+// rather than whether the pipeline is right, so the caller supplies it.
+MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
+                                          const MiniMaxH3DitParams& dit_params,
+                                          const MiniMaxH3DitWeights& dit_weights,
+                                          const MiniMaxH3VideoVaeDecoderConfig& video_config,
+                                          const MiniMaxH3AudioVaeWeights& video_weights,
+                                          const MiniMaxH3AudioVaeConfig& audio_config,
+                                          const MiniMaxH3AudioVaeWeights& audio_weights,
+                                          const std::vector<float>& prompt_embeds,
+                                          const std::vector<float>& initial_video_rows,
+                                          const std::vector<float>& initial_audio_rows,
+                                          vt::DType compute_dtype);
 
 }  // namespace vllm

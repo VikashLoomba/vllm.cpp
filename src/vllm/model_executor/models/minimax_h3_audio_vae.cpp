@@ -344,9 +344,6 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
            "minimax_h3 audio vae: upsample rates/kernels length mismatch");
   VT_CHECK(static_cast<int64_t>(config.resblock_dilation_sizes.size()) == num_kernels,
            "minimax_h3 audio vae: resblock kernels/dilations length mismatch");
-  VT_CHECK(static_cast<int64_t>(latent.size()) == config.num_mels * frames,
-           "minimax_h3 audio vae: latent size does not match [num_mels, frames]");
-
   AliasFreeActivation act;
   act.Build();
 
@@ -356,20 +353,42 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
                                           out_channels);
   };
 
+  // --- dec_in_proj: Conv1d(vae_latent_channels -> num_mels, k=1) ---
+  // DacAudioVAE.decode applies this BEFORE BigVGAN (dac_audio_vae.py:218-231). It
+  // is absent when the caller already supplies a num_mels-wide tensor, which is
+  // what the standalone BigVGAN gate does.
+  std::vector<float> mels;
+  const float* mel_source = latent.data();
+  if (weights.Has("dec_in_proj.weight")) {
+    const std::vector<float>& w = weights.Get("dec_in_proj.weight");
+    VT_CHECK(static_cast<int64_t>(w.size()) % config.num_mels == 0,
+             "minimax_h3 audio vae: dec_in_proj weight does not divide by num_mels");
+    const int64_t in_channels = static_cast<int64_t>(w.size()) / config.num_mels;
+    VT_CHECK(static_cast<int64_t>(latent.size()) == in_channels * frames,
+             "minimax_h3 audio vae: latent does not match dec_in_proj input channels");
+    int64_t projected_len = 0;
+    const std::vector<float>* bias =
+        weights.Has("dec_in_proj.bias") ? &weights.Get("dec_in_proj.bias") : nullptr;
+    mels = Conv1d(latent, in_channels, frames, w, bias, config.num_mels, 1, 1, 1, 1, &projected_len);
+    VT_CHECK(projected_len == frames, "minimax_h3 audio vae: dec_in_proj changed the length");
+    mel_source = mels.data();
+  } else {
+    VT_CHECK(static_cast<int64_t>(latent.size()) == config.num_mels * frames,
+             "minimax_h3 audio vae: latent size does not match [num_mels, frames]");
+  }
+
   // --- conv_pre: Conv1d(num_mels -> upsample_initial_channel, k=7, padding=3) ---
   int64_t channels = config.upsample_initial_channel;
   int64_t length = 0;
   std::vector<float> x;
   {
-    int64_t padded_len = 0;
     std::vector<float> padded(static_cast<size_t>(config.num_mels * (frames + 6)), 0.0f);
     for (int64_t c = 0; c < config.num_mels; ++c) {
       for (int64_t t = 0; t < frames; ++t) {
-        padded[static_cast<size_t>(c * (frames + 6) + 3 + t)] =
-            latent[static_cast<size_t>(c * frames + t)];
+        padded[static_cast<size_t>(c * (frames + 6) + 3 + t)] = mel_source[c * frames + t];
       }
     }
-    padded_len = frames + 6;  // zero padding 3 on each side
+    const int64_t padded_len = frames + 6;  // zero padding 3 on each side
     const std::vector<float> w = conv_weight("conv_pre", channels);
     const std::vector<float>& b = weights.Get("conv_pre.bias");
     x = Conv1d(padded, config.num_mels, padded_len, w, &b, channels, 7, 1, 1, 1, &length);

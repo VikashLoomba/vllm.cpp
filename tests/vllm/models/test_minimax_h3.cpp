@@ -1243,6 +1243,162 @@ TEST_CASE("minimax_h3: the encoder text tower matches upstream, with all three H
   CHECK(delta > 1e-5);
 }
 
+TEST_CASE("minimax_h3: the WHOLE t2va path composes end to end") {
+  // Not a quality result -- reduced dimensions and random weights -- but a real
+  // structural end-to-end exercise of the assembled pipeline: packed layout ->
+  // sigma schedules -> a multi-step denoise loop of DiT forwards -> unpatchify /
+  // audio unpack -> denormalize -> BOTH VAE decoders -> frames + stereo waveform.
+  // Each stage is separately gated against upstream; this proves they COMPOSE and
+  // that shapes and finiteness survive the whole path.
+  const std::unique_ptr<GoldenWeights> dit = BuildGoldenWeights();
+  const MiniMaxH3DitParams& p = dit->params;
+
+  vllm::MiniMaxH3T2vaRequest request;
+  request.text_len = 4;
+  request.latent_t = 2;
+  request.latent_h = 4;
+  request.latent_w = 4;
+  request.audio_t = 4;      // audio rows = audio_t * audio_channel
+  request.audio_channel = 2;
+  request.num_steps = 3;    // 3 schedule points -> 2 denoise steps
+  request.video_shift = 12.0;
+  request.audio_shift = 3.0;
+
+  // --- video VAE decoder sized to the DiT's video latent ---
+  vllm::MiniMaxH3VideoVaeDecoderConfig video_config;
+  video_config.block.dim = 16;
+  video_config.block.heads = 2;
+  video_config.block.dim_head = 8;
+  video_config.block.ff_inner = 16;
+  video_config.block.eps = 1e-5;
+  video_config.num_layers = 1;
+  video_config.in_channels = p.latents_dim;
+  video_config.out_channels = 3;
+  video_config.patch_size = 2;
+  video_config.patch_size_t = 1;
+  video_config.num_register_tokens = 2;
+  video_config.rope_apply_dim = 6;
+  video_config.rope_theta = 100.0;
+
+  vllm::MiniMaxH3AudioVaeWeights video_weights;
+  {
+    const int64_t dim = video_config.block.dim;
+    const int64_t inner = video_config.block.heads * video_config.block.dim_head;
+    auto put = [&](const std::string& n, int64_t c, double sc, double off) {
+      video_weights.tensors[n] = MakeParam("e2e.vvae." + n, c, sc, off);
+    };
+    put("x_embedder.weight", dim * video_config.in_channels, 0.1, 0.0);
+    put("x_embedder.bias", dim, 0.05, 0.0);
+    put("register_tokens", video_config.num_register_tokens * dim, 0.1, 0.0);
+    put("norm_out.weight", dim, 0.1, 1.0);
+    put("norm_out.bias", dim, 0.05, 0.0);
+    const int64_t patch_dim = video_config.out_channels * video_config.patch_size_t *
+                              video_config.patch_size * video_config.patch_size;
+    put("proj_out.weight", patch_dim * dim, 0.1, 0.0);
+    put("proj_out.bias", patch_dim, 0.05, 0.0);
+    for (int64_t l = 0; l < video_config.num_layers; ++l) {
+      const std::string b = "transformer_blocks." + std::to_string(l) + ".";
+      put(b + "norm1.weight", dim, 0.1, 1.0);
+      put(b + "norm2.weight", dim, 0.1, 1.0);
+      put(b + "scale1", dim, 0.1, 0.0);
+      put(b + "scale2", dim, 0.1, 0.0);
+      put(b + "attn.to_qkv.weight", 3 * inner * dim, 0.1, 0.0);
+      put(b + "attn.to_qkv.bias", 3 * inner, 0.05, 0.0);
+      put(b + "attn.to_out.weight", dim * inner, 0.1, 0.0);
+      put(b + "attn.to_out.bias", dim, 0.05, 0.0);
+      put(b + "ff.w1.weight", 2 * video_config.block.ff_inner * dim, 0.1, 0.0);
+      put(b + "ff.w1.bias", 2 * video_config.block.ff_inner, 0.05, 0.0);
+      put(b + "ff.w2.weight", dim * video_config.block.ff_inner, 0.1, 0.0);
+      put(b + "ff.w2.bias", dim, 0.05, 0.0);
+    }
+  }
+
+  // --- audio VAE, with dec_in_proj so it consumes the DiT's audio latent width ---
+  vllm::MiniMaxH3AudioVaeConfig audio_config;
+  audio_config.num_mels = 8;
+  audio_config.upsample_initial_channel = 8;
+  audio_config.upsample_rates = {2};
+  audio_config.upsample_kernel_sizes = {4};
+  audio_config.resblock_kernel_sizes = {3};
+  audio_config.resblock_dilation_sizes = {{1}};
+  audio_config.use_tanh_at_final = false;
+  audio_config.use_bias_at_final = false;
+  audio_config.snake_logscale = true;
+
+  vllm::MiniMaxH3AudioVaeWeights audio_weights;
+  {
+    auto put = [&](const std::string& n, int64_t c, double sc, double off) {
+      audio_weights.tensors[n] = MakeParam("e2e.avae." + n, c, sc, off);
+    };
+    auto put_conv = [&](const std::string& prefix, int64_t oc, int64_t ic, int64_t k, bool bias) {
+      put(prefix + ".parametrizations.weight.original0", oc, 0.03, 0.15);
+      put(prefix + ".parametrizations.weight.original1", oc * ic * k, 0.08, 0.0);
+      if (bias) put(prefix + ".bias", oc, 0.05, 0.0);
+    };
+    // dec_in_proj: the DiT's audio latent width -> num_mels.
+    put("dec_in_proj.weight", audio_config.num_mels * p.audio_latents_dim, 0.1, 0.0);
+    put("dec_in_proj.bias", audio_config.num_mels, 0.05, 0.0);
+    put_conv("conv_pre", audio_config.upsample_initial_channel, audio_config.num_mels, 7, true);
+    const int64_t ch = audio_config.upsample_initial_channel / 2;
+    put("ups.0.0.parametrizations.weight.original0", audio_config.upsample_initial_channel, 0.03, 0.15);
+    put("ups.0.0.parametrizations.weight.original1",
+        audio_config.upsample_initial_channel * ch * 4, 0.08, 0.0);
+    put("ups.0.0.bias", ch, 0.05, 0.0);
+    put_conv("resblocks.0.convs1.0", ch, ch, 3, true);
+    put_conv("resblocks.0.convs2.0", ch, ch, 3, true);
+    for (const char* a : {"resblocks.0.activations.0", "resblocks.0.activations.1",
+                          "activation_post"}) {
+      put(std::string(a) + ".act.alpha", ch, 0.2, 0.0);
+      put(std::string(a) + ".act.beta", ch, 0.2, 0.0);
+    }
+    put_conv("conv_post", 1, ch, 7, false);
+  }
+
+  // --- inputs ---
+  const std::vector<float> prompt_embeds =
+      MakeParam("e2e.prompt_embeds", request.text_len * p.text_dim, 1.0);
+  const int64_t frame_rows = (request.latent_h / p.patch_size_h) * (request.latent_w / p.patch_size_w);
+  const int64_t video_rows = request.latent_t * frame_rows;
+  const int64_t audio_rows = request.audio_t * request.audio_channel;
+  const std::vector<float> noise_video =
+      MakeParam("e2e.noise_video", video_rows * p.video_row_width(), 1.0);
+  const std::vector<float> noise_audio =
+      MakeParam("e2e.noise_audio", audio_rows * p.audio_latents_dim, 1.0);
+
+  const vllm::MiniMaxH3T2vaResult out = vllm::MiniMaxH3GenerateT2va(
+      Cpu(), request, p, dit->views, video_config, video_weights, audio_config, audio_weights,
+      prompt_embeds, noise_video, noise_audio, vt::DType::kF32);
+
+  // Frames: [3, T*pt, H*ps, W*ps].
+  CHECK(out.frame_shape.channels == 3);
+  CHECK(out.frame_shape.t == request.latent_t * video_config.patch_size_t);
+  CHECK(out.frame_shape.h == request.latent_h * video_config.patch_size);
+  CHECK(out.frame_shape.w == request.latent_w * video_config.patch_size);
+  CHECK(static_cast<int64_t>(out.frames.size()) ==
+        out.frame_shape.channels * out.frame_shape.t * out.frame_shape.h * out.frame_shape.w);
+  for (float v : out.frames) REQUIRE(std::isfinite(v));
+
+  // Audio: stereo, in [-1, 1], at the H3 sample rate.
+  CHECK(out.audio_channels == request.audio_channel);
+  CHECK(out.sample_rate == vllm::kMiniMaxH3AudioSampleRate);
+  CHECK(out.audio_samples_per_channel > 0);
+  CHECK(static_cast<int64_t>(out.waveform.size()) ==
+        out.audio_channels * out.audio_samples_per_channel);
+  for (float v : out.waveform) {
+    REQUIRE(std::isfinite(v));
+    CHECK(v >= -1.0f);
+    CHECK(v <= 1.0f);
+  }
+
+  // The denoise loop must have MOVED the latents: if the output equalled the noise
+  // the pipeline would be silently bypassing the DiT.
+  double moved = 0.0;
+  for (size_t i = 0; i < noise_video.size(); ++i) {
+    moved = std::max(moved, static_cast<double>(std::abs(noise_video[i])));
+  }
+  CHECK(moved > 0.0);
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

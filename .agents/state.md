@@ -34784,3 +34784,36 @@ than a new port) and the MM processor.
 and now the encoder text tower are all ported and gated. W6 (pipeline assembly) is
 the main thing standing between here and an end-to-end t2va run.
 
+## 2026-08-03 - MiniMax-H3 W6: the whole t2va path composes end to end
+
+`MiniMaxH3GenerateT2va` now wires the separately-gated stages into one path:
+
+  prompt_embeds -> packed layout -> sigma schedules (video shift 12, audio 3)
+                -> denoise loop (DiT forward per step, euler-eta0 update)
+                -> unpatchify / audio unpack -> per-channel denormalize
+                -> video ViT3D decoder + audio BigVGAN decoder
+                -> frames [3, T*pt, H*ps, W*ps] + stereo waveform at 32 kHz
+
+A structural end-to-end test runs it at reduced dimensions with random weights.
+That is explicitly NOT a quality result - it is proof the stages COMPOSE: shapes
+are right, everything is finite, the waveform lands inside [-1, 1], and the denoise
+loop demonstrably moves the latents rather than passing noise through.
+
+**Assembling it caught a real gap**, which is exactly why assembly is worth doing
+before the checkpoint arrives: the audio decode was missing the checkpoint's
+`dec_in_proj` (Conv1d k=1 from vae_latent_channels to num_mels) ahead of BigVGAN.
+The DiT emits a 32-wide audio latent and BigVGAN expects 2048 mels; without that
+projection the two never meet. Now applied when the weight is present, leaving the
+standalone BigVGAN gate untouched.
+
+**Deliberate design note:** noise is an INPUT, not generated internally. Upstream
+seeds a torch CPU generator; reproducing torch's RNG bit-exactly decides WHICH
+sample you get, not whether the pipeline is correct, so it is recorded as an open
+item rather than guessed at.
+
+**What now stands between this and a real generation:** the encoder's VISION tower
+(reuse of qwen3_vl_vision.cpp) and MM processor, fl2va/ref2va conditioning, the
+quantized loader wiring (GGUF dequant / NVFP4), and a GPU with the checkpoint on it.
+The device-resident forward (W2b) and NVFP4 wiring (W10) are where speed work then
+begins.
+

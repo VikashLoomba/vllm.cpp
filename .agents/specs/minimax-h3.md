@@ -101,7 +101,7 @@ final output heads. Everything else is BF16.
 | H3-Encoder | `encoder.py` (1214 L) | 51.5 GB | **W3 TEXT TOWER DONE** — truncation + UNNORMALIZED output + DeepStack gated at 1.2e-7; the VISION tower (reuse of our qwen3_vl_vision) and the MM processor remain |
 | Video VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/video_vae/*.py`) | ~10 GB | **W4 DECODER DONE** — the FULL ViT3D decoder (pack, x_embedder, register/cls tokens, 3D RoPE, 36-block stack, norm_out, proj_out, unpatchify) is ported and gated at **8.9e-8**. Tiling and the 3D-CNN encoder (conditioning only) remain. See 5.1 |
 | Audio VAE | `vae.py` adapter + checkpoint REMOTE CODE (`FL2VA/audio_vae/*.py`) | ~0.6 GB | **W5 LANDED** — DAC/BigVGAN decoder REIMPLEMENTED, gated vs the checkpoint's own modules at 4.2e-9 |
-| Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 PENDING** |
+| Pipeline / tasks | `pipeline_minimax_h3.py` (1196 L) | — | **W6 t2va ASSEMBLED** — the whole path composes and runs (structural e2e gate); fl2va/ref2va conditioning and the torch-RNG noise seed remain |
 | Conditioning | `condition_noise.py`, `reference_video.py`, `presentation.py`, `time_request.py` | — | **W6 PENDING** |
 | Serving | vllm-omni `/v1/videos`, `/v1/videos/sync` | — | **W7 PENDING** |
 | GGUF arm (ComfyUI format) | `realrebelai/MiniMax-H3_GGUFs` | 15.6 GB (DiT Q3_K_M) | **W9 LANDED (shape/geometry)** — name map is the IDENTITY, gated on the real 535-tensor manifest |
@@ -158,6 +158,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **VIDEO VAE decoder TransformerBlock** vs the checkpoint's OWN remote code | **max abs diff 6.0e-8** |
 | **VIDEO VAE FULL ViT3D decoder** vs the checkpoint's OWN remote code | **max abs diff 8.9e-8** |
 | **ENCODER text tower** (truncation + unnormalized output + DeepStack) | **max abs diff 1.2e-7** |
+| **WHOLE t2va PATH composes** (layout -> sigmas -> denoise loop -> unpack -> denormalize -> both VAEs) | frames + stereo waveform, correctly shaped, finite, in [-1, 1] |
 | config-parse invariants + weight contract + grouped-qkv reorder | pass |
 
 The fp64 position grid is gated bit-exact deliberately: it feeds RoPE, and a
@@ -264,14 +265,18 @@ contract pending W6), `test_minimax_h3_e2e.py` (BLOCKED — needs the checkpoint
 | **W3** | H3-Encoder. **TEXT TOWER DONE** (1.2e-7): the three H3 deltas — layer truncation `min(num_hidden_layers, 50)`, the UNNORMALIZED layer-49 output (no final RMSNorm), and DeepStack injection into the first N layers — plus interleaved M-RoPE, fused QKV, per-head q/k RMSNorm, causal GQA and the gated-SiLU MLP. REMAINS: the VISION tower (reuse `qwen3_vl_vision.cpp`) and the MM processor | — |
 | **W4** | Video VAE. **DECODER DONE** — the full ViT3D decoder gated at 8.9e-8 (block 6.0e-8), real hyperparameters 36 layers / 32 heads x 64 / rope_theta 100 / rope_dim_ratio 0.75 from the checkpoint's `vit_decoder_kwargs`. REMAINS: tiling (`vae_tile_size` 256 / overlap 64) and the 3D-CNN ENCODER, which is only needed for image/video CONDITIONING, not for generation output | — |
 | **W5** | Audio VAE reimplementation | **DONE** — DAC-lineage BigVGAN decoder (weight-norm materialization, anti-aliased SnakeBeta with kaiser-sinc up/down resampling, replicate padding, final clamp). Encode-side determinism context is still open |
-| **W6** | Pipeline: t2va/fl2va/ref2va task assembly, condition noise, reference video, presentation, sigma schedules | W3-W5 |
+| **W6** | Pipeline. **t2va ASSEMBLED** — `MiniMaxH3GenerateT2va` wires layout -> sigma schedules -> denoise loop -> unpatchify/audio-unpack -> denormalize -> both VAE decoders, gated by a structural end-to-end test. REMAINS: fl2va/ref2va conditioning (condition noise, reference video, presentation) and bit-exact torch-RNG noise seeding | — |
 | **W7** | Serving: `/v1/videos` + `/v1/videos/sync`, job store, MP4 mux (dependency decision in 5.2) | W6 |
 | **W8** | Speed: USP sequence parallelism, block caching, DiT TP | W2b + multi-GPU HW |
 | **W9** | **GGUF arm** — ComfyUI-format load (identity name map, ne reversal, `comfy.gguf.orig_shape` reshape rule, K-quant dequant). Shape/geometry resolution LANDED and gated on the real manifest; the dequant-into-weights path needs the file | — |
 | **W10** | **NVFP4 arm** — `lilcheaty/MiniMax-H3-NVFP4` onto our existing NVFP4 stack (cutlass FP4 GEMM on sm_121). Layout GATED as identical to ours, so this is a loader-wiring brick, not a new quant scheme. The most promising SPEED path, and the one that makes an e2e run on one GB10 realistic | W9 |
 
-**Open items.** (0) Download a quantized checkpoint and close the e2e loop — this
-is now the top item, and it supersedes the old "hardware-blocked" framing.
+**Open items.** (0) Run the assembled t2va path on a REAL quantized checkpoint — the
+pipeline now composes end to end at reduced dimensions, so what remains is loader
+wiring (W9 dequant / W10 NVFP4), the encoder's vision tower, and a GPU. This
+supersedes the old "hardware-blocked" framing. (0b) Noise seeding is currently an
+INPUT: upstream seeds a torch CPU generator, and matching it bit-exactly decides
+WHICH sample you get, not whether the pipeline is correct.
 (a) A vllm-omni parity pin — the upstream-sync protocol currently
 covers only the vLLM repo; H3 lives outside it. (b) The MP4 dependency decision.
 (c) Hardware: nothing past W2b/W3 can be END-TO-END gated on this project's boxes,

@@ -1916,6 +1916,51 @@ TEST_CASE("minimax_h3: the FULL encoder vision tower matches upstream") {
   CHECK(grid[1] != grid[4]);
 }
 
+TEST_CASE("minimax_h3: condition-noise augmentation matches upstream") {
+  // fl2va/ref2va pin their keyframe and reference-audio rows to a NOISED anchor.
+  // The mix is trivial; the ROW ACCOUNTING is what this gates -- and the golden
+  // feeds our side the SAME noise upstream drew, so the comparison isolates the
+  // accounting from torch's RNG (which the pipeline also takes as an input).
+  std::vector<int64_t> shapes;
+  for (size_t i = 0; i < std::size(vllm_test::kH3CondShapes); ++i) {
+    shapes.push_back(vllm_test::kH3CondShapes[i]);
+  }
+  const std::vector<float> clean =
+      MakeParam("cond.clean_video", vllm_test::kH3CondRows * 96, 1.0);
+  const std::vector<float> noise(vllm_test::kH3CondNoiseRows,
+                                 vllm_test::kH3CondNoiseRows + std::size(vllm_test::kH3CondNoiseRows));
+  const std::vector<float> got = vllm::MiniMaxH3ImgvidCondNoiseAug(
+      clean, shapes, vllm_test::kH3CondTargetLatentT, vllm_test::kH3CondImgvidFrames,
+      vllm_test::kH3CondNoiseAug[0], noise);
+  REQUIRE(got.size() == std::size(vllm_test::kH3CondGolden));
+  CHECK(MaxAbsDiff(got, vllm_test::kH3CondGolden, got.size()) <= 1e-6);
+
+  std::vector<int64_t> audio_t;
+  for (size_t i = 0; i < std::size(vllm_test::kH3CondAudioT); ++i) {
+    audio_t.push_back(vllm_test::kH3CondAudioT[i]);
+  }
+  const std::vector<float> clean_audio =
+      MakeParam("cond.clean_audio", vllm_test::kH3CondAudioRows * 32, 1.0);
+  const std::vector<float> audio_noise(
+      vllm_test::kH3CondAudioNoiseRows,
+      vllm_test::kH3CondAudioNoiseRows + std::size(vllm_test::kH3CondAudioNoiseRows));
+  const std::vector<float> got_audio = vllm::MiniMaxH3AudioCondNoiseAug(
+      clean_audio, audio_t, vllm_test::kH3CondNoiseAug[0], audio_noise);
+  REQUIRE(got_audio.size() == std::size(vllm_test::kH3CondAudioGolden));
+  CHECK(MaxAbsDiff(got_audio, vllm_test::kH3CondAudioGolden, got_audio.size()) <= 1e-6);
+
+  // noise_aug == 1.0 is the documented identity (the anchor IS the clean latent).
+  const std::vector<float> identity =
+      vllm::MiniMaxH3ImgvidCondNoiseAug(clean, shapes, vllm_test::kH3CondTargetLatentT,
+                                        vllm_test::kH3CondImgvidFrames, 1.0, noise);
+  for (size_t i = 0; i < identity.size(); ++i) CHECK(identity[i] == clean[i]);
+
+  // Shape/row-count disagreements must throw, not silently mis-slice.
+  CHECK_THROWS(vllm::MiniMaxH3ImgvidCondNoiseAug(clean, {1, 3, 6}, 3, 1, 0.999, noise));
+  CHECK_THROWS(vllm::MiniMaxH3ImgvidCondNoiseAug(clean, shapes, 3, 1, 1.5, noise));
+  CHECK_THROWS(vllm::MiniMaxH3AudioCondNoiseAug(clean_audio, {}, 0.999, audio_noise));
+}
+
 TEST_CASE("minimax_h3: config parse enforces the upstream invariants") {
   nlohmann::json config = {
       {"num_layers", 50},        {"token_refiner_num_layers", 2}, {"hidden_size", 5376},

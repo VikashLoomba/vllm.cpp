@@ -630,4 +630,88 @@ std::vector<float> MiniMaxH3EulerEta0Step(const std::vector<float>& state,
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Condition-noise augmentation (condition_noise.py)
+//
+// fl2va/ref2va pin their keyframe (and reference-audio) rows to a NOISED anchor
+// rather than the clean latent: `out = t*clean + (1-t)*noise` with t the request's
+// `noise_aug`. The mix is trivial; what is easy to get wrong is the ROW ACCOUNTING
+// around it, which is what these functions own and what the gate pins:
+//   * each visual condition draws noise of length
+//     `target_latent_t + imgvid_cond_num_frames`, then slices the PREFIX matching
+//     its own latent_t (so a shorter condition does NOT get a shorter draw);
+//   * every condition restarts the SAME seed, so concatenating and drawing once
+//     would be numerically different for multi-reference requests;
+//   * rows advance by that condition's own patchified row count.
+//
+// NOISE IS AN INPUT here, exactly as in the t2va pipeline: upstream draws it from
+// a seeded torch CPU generator, and reproducing torch's RNG bit-exactly decides
+// WHICH sample you get rather than whether the accounting is right.
+// ---------------------------------------------------------------------------
+
+std::vector<float> MiniMaxH3ImgvidCondNoiseAug(const std::vector<float>& clean_rows,
+                                               const std::vector<int64_t>& condition_shapes,
+                                               int64_t target_latent_t,
+                                               int64_t imgvid_cond_num_frames, double noise_aug,
+                                               const std::vector<float>& noise_rows) {
+  VT_CHECK(noise_aug >= 0.0 && noise_aug <= 1.0,
+           "minimax_h3 cond noise: noise_aug must be in [0, 1]");
+  if (noise_aug == 1.0) return clean_rows;  // fully clean: the anchor IS the latent
+  VT_CHECK(!condition_shapes.empty() && condition_shapes.size() % 3 == 0,
+           "minimax_h3 cond noise: condition_shapes must be (t, h, w) triples");
+  VT_CHECK(target_latent_t > 0 && imgvid_cond_num_frames > 0,
+           "minimax_h3 cond noise: target_latent_t and imgvid_cond_num_frames must be positive");
+
+  int64_t expected_rows = 0;
+  const int64_t num_conditions = static_cast<int64_t>(condition_shapes.size()) / 3;
+  for (int64_t c = 0; c < num_conditions; ++c) {
+    const int64_t t = condition_shapes[static_cast<size_t>(c * 3 + 0)];
+    const int64_t h = condition_shapes[static_cast<size_t>(c * 3 + 1)];
+    const int64_t w = condition_shapes[static_cast<size_t>(c * 3 + 2)];
+    VT_CHECK(t > 0 && h > 0 && w > 0, "minimax_h3 cond noise: condition shape must be positive");
+    VT_CHECK(h % 2 == 0 && w % 2 == 0,
+             "minimax_h3 cond noise: condition spatial dims must be divisible by 2");
+    VT_CHECK(t <= target_latent_t + imgvid_cond_num_frames,
+             "minimax_h3 cond noise: condition latent_t exceeds the noise draw length");
+    expected_rows += t * (h / 2) * (w / 2);
+  }
+  VT_CHECK(static_cast<int64_t>(clean_rows.size()) == expected_rows * kMiniMaxH3VideoRowWidth,
+           "minimax_h3 cond noise: clean rows do not match the shape-derived row count");
+  VT_CHECK(noise_rows.size() == clean_rows.size(),
+           "minimax_h3 cond noise: noise rows must match the clean rows");
+
+  const float t_mix = static_cast<float>(noise_aug);
+  std::vector<float> out(clean_rows.size());
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = t_mix * clean_rows[i] + (1.0f - t_mix) * noise_rows[i];
+  }
+  return out;
+}
+
+std::vector<float> MiniMaxH3AudioCondNoiseAug(const std::vector<float>& clean_rows,
+                                              const std::vector<int64_t>& condition_audio_t,
+                                              double noise_aug,
+                                              const std::vector<float>& noise_rows) {
+  VT_CHECK(noise_aug >= 0.0 && noise_aug <= 1.0,
+           "minimax_h3 cond noise: noise_aug must be in [0, 1]");
+  if (noise_aug == 1.0) return clean_rows;
+  VT_CHECK(!condition_audio_t.empty(), "minimax_h3 cond noise: condition_audio_t must not be empty");
+  int64_t expected_rows = 0;
+  for (int64_t audio_t : condition_audio_t) {
+    VT_CHECK(audio_t > 0, "minimax_h3 cond noise: condition audio length must be positive");
+    expected_rows += kMiniMaxH3AudioCondChannels * audio_t;
+  }
+  VT_CHECK(static_cast<int64_t>(clean_rows.size()) == expected_rows * kMiniMaxH3AudioRowWidth,
+           "minimax_h3 cond noise: clean audio rows do not match the derived row count");
+  VT_CHECK(noise_rows.size() == clean_rows.size(),
+           "minimax_h3 cond noise: noise rows must match the clean rows");
+
+  const float t_mix = static_cast<float>(noise_aug);
+  std::vector<float> out(clean_rows.size());
+  for (size_t i = 0; i < out.size(); ++i) {
+    out[i] = t_mix * clean_rows[i] + (1.0f - t_mix) * noise_rows[i];
+  }
+  return out;
+}
+
 }  // namespace vllm

@@ -263,6 +263,32 @@ std::string MiniMaxH3ResolveTask(const std::string& requested, const std::string
 std::vector<float> MiniMaxH3RfVToX0(const std::vector<float>& xt, const std::vector<float>& v,
                                     double timestep);
 
+// ---------------------------------------------------------------------------
+// Condition-noise augmentation (condition_noise.py) — fl2va / ref2va
+// ---------------------------------------------------------------------------
+
+// Packed row widths (denoise_loop.py:26-28).
+inline constexpr int64_t kMiniMaxH3VideoRowWidth = 96;
+inline constexpr int64_t kMiniMaxH3AudioRowWidth = 32;
+// Channel-major packed audio condition rows are always stereo.
+inline constexpr int64_t kMiniMaxH3AudioCondChannels = 2;
+
+// out = noise_aug*clean + (1 - noise_aug)*noise, over packed condition rows.
+// `condition_shapes` is a flat list of (latent_t, latent_h, latent_w) triples in
+// packed visual-condition order. NOISE IS AN INPUT (see the .cpp for why).
+std::vector<float> MiniMaxH3ImgvidCondNoiseAug(const std::vector<float>& clean_rows,
+                                               const std::vector<int64_t>& condition_shapes,
+                                               int64_t target_latent_t,
+                                               int64_t imgvid_cond_num_frames, double noise_aug,
+                                               const std::vector<float>& noise_rows);
+
+// The audio-side equivalent; `condition_audio_t` is the latent T of each
+// audio-bearing condition in request order.
+std::vector<float> MiniMaxH3AudioCondNoiseAug(const std::vector<float>& clean_rows,
+                                              const std::vector<int64_t>& condition_audio_t,
+                                              double noise_aug,
+                                              const std::vector<float>& noise_rows);
+
 // Ancestral Euler with eta = 0 (scheduling:72-102):
 //   out = r * state + (1 - r) * denoised,  r = sigma_next / sigma_curr.
 // sigma_curr == 0 is the terminal step and returns `state` unchanged.

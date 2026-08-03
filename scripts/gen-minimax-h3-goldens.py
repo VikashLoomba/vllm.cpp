@@ -39,6 +39,7 @@ import importlib.util
 import math
 import os
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -486,12 +487,28 @@ class RefDiT:
 
 
 def load_upstream(root: Path, module: str):
-    path = root / "vllm_omni" / "diffusion" / "models" / "minimax_h3" / f"{module}.py"
+    """Import one upstream module by path, under a synthetic package.
+
+    A synthetic package is needed because some of these modules use RELATIVE
+    imports (condition_noise imports .packed_tokens); registering the directory
+    as a package's __path__ lets those resolve while still bypassing the real
+    vllm_omni __init__, which would drag in vllm and aenum.
+    """
+    directory = root / "vllm_omni" / "diffusion" / "models" / "minimax_h3"
+    path = directory / f"{module}.py"
     if not path.is_file():
         raise SystemExit(f"upstream module not found: {path}")
-    spec = importlib.util.spec_from_file_location(f"_h3_{module}", path)
+    package = "_h3_upstream"
+    if package not in sys.modules:
+        pkg = types.ModuleType(package)
+        pkg.__path__ = [str(directory)]
+        sys.modules[package] = pkg
+    name = f"{package}.{module}"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
+    sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -798,6 +815,76 @@ def emit_dit(out, packed) -> None:
     emit_f64(out, "kH3RandProbe", h3_rand("h3.probe", 8))
 
 
+def emit_condition_noise(out, condition_noise, packed_tokens) -> None:
+    """Section 7: condition-noise augmentation (condition_noise.py, VERBATIM).
+
+    The MIX is `t*clean + (1-t)*noise`; what is easy to get wrong is the ROW
+    ACCOUNTING around it -- each visual condition draws noise of length
+    `target_latent_t + imgvid_cond_num_frames`, slices the PREFIX matching its own
+    latent_t, patchifies, and advances a row cursor. The NOISE ITSELF is emitted
+    here and fed to the C++ side, so this gates the accounting and the mix while
+    torch's RNG stays a separately-tracked open item (the pipeline takes noise as
+    an input for the same reason).
+    """
+    out.write("// --- section 7: condition-noise augmentation ---\n")
+    target_latent_t = 3
+    imgvid_cond_num_frames = 1
+    shapes = [(1, 4, 6), (2, 4, 6)]
+    noise_aug = 0.999
+    seed = 1234
+
+    rows_per = [t * (h // 2) * (w // 2) for t, h, w in shapes]
+    total_rows = sum(rows_per)
+    clean = torch.from_numpy(
+        h3_rand("cond.clean_video", total_rows * 96).astype(np.float32)
+    ).reshape(total_rows, 96)
+
+    # Reproduce the per-condition draw so the SAME noise can be handed to C++.
+    noise_rows_all = []
+    for latent_t, latent_h, latent_w in shapes:
+        full_t = target_latent_t + imgvid_cond_num_frames
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn(1, 24, full_t, latent_h, latent_w, generator=generator,
+                            dtype=torch.float32, device="cpu")[:, :, :latent_t]
+        noise_rows_all.append(packed_tokens.minimax_h3_patchify_video_latent(noise, patch_size=[1, 2, 2]))
+    noise_cat = torch.cat(noise_rows_all, dim=0)
+
+    got = condition_noise.minimax_h3_imgvid_cond_noise_aug_rows(
+        clean, condition_shapes=shapes, target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=imgvid_cond_num_frames, seed=seed, noise_aug=noise_aug,
+    )
+
+    audio_t_list = [2, 3]
+    audio_rows_total = 2 * sum(audio_t_list)
+    clean_audio = torch.from_numpy(
+        h3_rand("cond.clean_audio", audio_rows_total * 32).astype(np.float32)
+    ).reshape(audio_rows_total, 32)
+    audio_noise_parts = []
+    for audio_t in audio_t_list:
+        generator = torch.Generator(device="cpu").manual_seed(seed + 1)
+        audio_noise_parts.append(torch.randn((2 * audio_t, 32), generator=generator,
+                                             dtype=torch.float32, device="cpu"))
+    audio_noise = torch.cat(audio_noise_parts, dim=0)
+    got_audio = condition_noise.minimax_h3_audio_cond_noise_aug_rows(
+        clean_audio, condition_audio_t=audio_t_list, seed=seed, noise_aug=noise_aug,
+    )
+
+    emit_scalar(out, "kH3CondTargetLatentT", target_latent_t)
+    emit_scalar(out, "kH3CondImgvidFrames", imgvid_cond_num_frames)
+    emit_scalar(out, "kH3CondShapeCount", len(shapes))
+    emit_scalar(out, "kH3CondRows", total_rows)
+    emit_scalar(out, "kH3CondAudioCount", len(audio_t_list))
+    emit_scalar(out, "kH3CondAudioRows", audio_rows_total)
+    out.write("\n")
+    emit_f64(out, "kH3CondNoiseAug", [noise_aug])
+    emit_i64(out, "kH3CondShapes", [v for sh in shapes for v in sh])
+    emit_i64(out, "kH3CondAudioT", audio_t_list)
+    emit_f32(out, "kH3CondNoiseRows", noise_cat)
+    emit_f32(out, "kH3CondGolden", got)
+    emit_f32(out, "kH3CondAudioNoiseRows", audio_noise)
+    emit_f32(out, "kH3CondAudioGolden", got_audio)
+
+
 def emit_planner(out, time_request) -> None:
     """Section 6: request planning (time_request.py executed VERBATIM).
 
@@ -913,6 +1000,7 @@ def main() -> int:
     root = args.vllm_omni.expanduser()
     packed_sequence = load_upstream(root, "packed_sequence")
     time_request = load_upstream(root, "time_request")
+    condition_noise = load_upstream(root, "condition_noise")
     packed_tokens = load_upstream(root, "packed_tokens")
     scheduling = load_upstream(root, "scheduling_minimax_h3_euler_ancestral")
 
@@ -929,6 +1017,7 @@ def main() -> int:
         emit_scheduler(out, scheduling)
         emit_dit(out, packed)
         emit_planner(out, time_request)
+        emit_condition_noise(out, condition_noise, packed_tokens)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

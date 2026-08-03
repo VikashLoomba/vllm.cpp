@@ -34925,3 +34925,30 @@ the assembled t2va pipeline, and BOTH quantized loaders.
 MP4 muxing (blocked on a dependency decision), and the DEVICE-resident forward -
 which is where speed work begins and which needs a GPU to be worth doing.
 
+## 2026-08-03 - MiniMax-H3: condition-noise augmentation (fl2va/ref2va anchors)
+
+fl2va and ref2va pin their keyframe and reference-audio rows to a NOISED anchor
+rather than the clean latent. The mix itself is one line; the reason this needed a
+gate is the ROW ACCOUNTING around it, all three parts of which are easy to get
+subtly wrong and none of which would raise an error:
+
+  * each visual condition draws noise of length
+    `target_latent_t + imgvid_cond_num_frames` and slices the PREFIX matching its
+    own latent_t - a shorter condition does NOT get a shorter draw;
+  * every condition RESTARTS the same seed, so concatenating all conditions and
+    drawing once would be numerically different for multi-reference requests;
+  * rows advance by that condition's own patchified row count.
+
+Gated exact (<= 1e-6) with the noise SUPPLIED, so the comparison isolates the
+accounting from torch's RNG. That keeps the RNG a single tracked open item rather
+than smearing it across every conditioning path.
+
+Tooling note: `condition_noise.py` uses a RELATIVE import, so the golden generator's
+by-path loader now registers a synthetic package whose __path__ is the upstream
+directory - still bypassing the real vllm_omni __init__ (which would drag in vllm
+and aenum) while letting relative imports resolve.
+
+**Remaining in the lane:** MM processor, reference_video/presentation conditioning,
+video tiling, /v1/videos + MP4 muxing (blocked on a dependency decision), and the
+device-resident forward.
+

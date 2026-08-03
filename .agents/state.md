@@ -35487,3 +35487,20 @@ CAVEAT on what a GGUF speed number means: vLLM/vllm-omni does not serve GGUF, so
 is NOT quant-matched to upstream - it is comparable to llama.cpp (the project's
 labeled secondary bar) or to our own NVFP4 arm. The headline vs-vllm-omni number
 still needs NVFP4 on sm_121a. See [[vllm-is-the-bar-not-llamacpp]].
+
+## 2026-08-03 - MiniMax-H3: keep-quant gated on the GPU (the CPU-only gate was the hole)
+
+The keep-quant test ran on the CPU backend, which left the arm's whole premise
+UNGATED: kMatmulBTQuant's CUDA kernel was never touched with H3's shapes. Worse, the
+CPU backend is structurally incapable of catching the failure mode that matters --
+a keep-quant slice whose bytes never reach the device reads as perfectly valid host
+memory on CPU and as ALL ZEROS on the GPU.
+
+Split into CPU + CUDA cases over a shared helper. On Thor: 2/2, 62 assertions, and
+the two runs report DIFFERENT digits -- 4.39323e-05 (CPU) vs 4.39249e-05 (CUDA).
+That difference is the evidence: it proves the CUDA case dispatched its own kernel
+rather than repeating the CPU path. A matching number would have been ambiguous.
+
+Generalizes: when a gate's whole point is a DEVICE code path, running it on the CPU
+backend can pass while proving nothing. Look for a discriminator that could only
+differ if the intended kernel ran.

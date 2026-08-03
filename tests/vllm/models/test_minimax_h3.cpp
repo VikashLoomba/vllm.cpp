@@ -2786,7 +2786,7 @@ TEST_CASE("minimax_h3: grouped-qkv checkpoint reorder is a pure permutation") {
 // only be emulated.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("minimax_h3: a GGUF loads KEEP-QUANT and the forward matches the dequantized load") {
+static void CheckKeepQuantForward(vt::Queue& q, const char* label) {
   MiniMaxH3DitParams want;
   want.num_layers = 2;
   want.token_refiner_num_layers = 1;
@@ -2919,7 +2919,6 @@ TEST_CASE("minimax_h3: a GGUF loads KEEP-QUANT and the forward matches the dequa
   // kMatmulBTQuant, whose per-element product is bit-for-bit the dequantized
   // value; only the K-reduction ORDER differs, so this is a matmul tolerance.
   const std::unique_ptr<DitForwardCase> c = BuildDitForwardCase(kept.params);
-  vt::Queue q{Cpu(), nullptr};
   const MiniMaxH3DitDeviceWeights staged_deq =
       StageMiniMaxH3DitWeights(q, dequantized.params, dequantized.weights, vt::DType::kF32);
   const MiniMaxH3DitDeviceWeights staged_kq =
@@ -2934,7 +2933,7 @@ TEST_CASE("minimax_h3: a GGUF loads KEEP-QUANT and the forward matches the dequa
       MaxAbsDiff(out_kq.video_logits, out_deq.video_logits.data(), out_kq.video_logits.size());
   const double audio_err =
       MaxAbsDiff(out_kq.audio_logits, out_deq.audio_logits.data(), out_kq.audio_logits.size());
-  INFO("keep-quant vs dequantized: video " << video_err << ", audio " << audio_err);
+  INFO(label << " keep-quant vs dequantized: video " << video_err << ", audio " << audio_err);
   CHECK(video_err <= 2e-3);
   CHECK(audio_err <= 2e-3);
   // And the forward must have produced something, not all zeros -- the failure
@@ -2942,4 +2941,25 @@ TEST_CASE("minimax_h3: a GGUF loads KEEP-QUANT and the forward matches the dequa
   double magnitude = 0.0;
   for (float v : out_kq.video_logits) magnitude = std::max(magnitude, std::abs((double)v));
   CHECK(magnitude > 1e-6);
+}
+
+TEST_CASE("minimax_h3: the KEEP-QUANT GGUF arm matches the dequantized load (CPU backend)") {
+  vt::Queue q{Cpu(), nullptr};
+  CheckKeepQuantForward(q, "cpu");
+}
+
+// The one that actually matters for the GGUF arm's premise: this exercises
+// kMatmulBTQuant's CUDA kernel over H3's own shapes. It is also the only place the
+// ALL-ZEROS failure mode is reachable -- a keep-quant slice whose bytes never reach
+// the device reads as valid host memory on CPU and as zeros on the GPU.
+TEST_CASE("minimax_h3: the KEEP-QUANT GGUF arm matches the dequantized load on CUDA") {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  vt::Queue q = cuda->CreateQueue();
+  CheckKeepQuantForward(q, "cuda");
 }

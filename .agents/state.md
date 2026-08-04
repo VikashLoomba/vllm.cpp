@@ -35951,3 +35951,25 @@ That required recording each kept tensor's ggml TYPE ID alongside its vt::DType 
 single-row dequant entry point is keyed by the ggml id, not by the vt dtype.
 
 Gate: 50/50 (15254 assertions).
+
+## 2026-08-04 - MiniMax-H3: ★★ PROMPT-CONDITIONED video, end to end on real weights
+
+  --prompt "a cat playing a piano"
+    -> tokenizer (tokenizer.json)                  5 tokens
+    -> block-quant embedding gather                [5, 5120]
+    -> 32B keep-quant encoder ON DEVICE            conditioning [5, 5120]
+    -> DiT (keep-quant, device denoise loop)       21.6 s/step, seq_len 64
+    -> ViT3D + BigVGAN decode -> PPM/WAV -> ffmpeg
+    -> cond.mp4  (h264/yuv420p 128x128 + AAC stereo 32 kHz), EXIT=0
+
+No --video-prompt-embeds anywhere in the path. BOTH towers resident at once: DiT
+15.6 GB + encoder 13.2 GiB, which is only possible because both are keep-quant.
+
+ONE WRONG ASSUMPTION, corrected by the real file in a single run: I had the driver
+call Tokenizer::FromGguf because "the GGUF carries its own vocab". The ComfyUI-style
+encoder export is WEIGHTS ONLY - no tokenizer.ggml.* metadata, unlike a llama.cpp
+export - so it threw. `--tokenizer` now takes the checkpoint's own tokenizer.json,
+falling back to FromGguf for exports that do embed one.
+
+Encoder staging is 162.3 s (vs 32.8 s for the DiT), which is the next obvious cost to
+look at if prompts are encoded per request rather than once.

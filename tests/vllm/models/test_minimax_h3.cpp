@@ -1320,6 +1320,152 @@ static void CheckVideoVaeDecodeDevice(vt::Queue& queue, const char* label) {
   CHECK(err <= 1e-4);
 }
 
+// Tiling is what the untiled decode got WRONG at real resolutions, and the reason
+// no earlier gate caught it: every reduced-dimension case here is smaller than one
+// tile, where tiled and untiled are the same computation. So this gates BOTH ends.
+//
+// The decisive evidence is empirical (512x512 -- 3 tiles per axis upstream --
+// decoded untiled came out covered in a grid of small squares, while 256x256, the
+// one size where tile_size >= input, came out clean). What is gated HERE is the
+// mechanism: that a single tile is still bit-identical, and that with several tiles
+// each tile's interior equals a direct decode of that tile's own latent slice --
+// which is what pins down the slicing, the placement and the seam arithmetic.
+TEST_CASE("minimax_h3: the TILED video-VAE decode slices and places tiles correctly") {
+  vt::Queue queue = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+
+  vllm::MiniMaxH3VideoVaeDecoderConfig config;
+  config.block.dim = vllm_test::kH3VideoVaeBlockDim;
+  config.block.heads = vllm_test::kH3VideoVaeBlockHeads;
+  config.block.dim_head = vllm_test::kH3VideoVaeBlockDimHead;
+  config.block.ff_inner = vllm_test::kH3VideoVaeBlockFfInner;
+  config.block.eps = 1e-5;
+  config.num_layers = vllm_test::kH3VideoVaeDecLayers;
+  config.in_channels = vllm_test::kH3VideoVaeDecInCh;
+  config.out_channels = vllm_test::kH3VideoVaeDecOutCh;
+  config.patch_size = vllm_test::kH3VideoVaeDecPatch;
+  config.patch_size_t = vllm_test::kH3VideoVaeDecPatchT;
+  config.num_register_tokens = vllm_test::kH3VideoVaeDecRegisterTokens;
+  config.rope_apply_dim = static_cast<int64_t>(config.block.dim_head * 0.75);
+  config.rope_theta = 100.0;
+
+  const int64_t dim = config.block.dim;
+  const int64_t inner = config.block.heads * config.block.dim_head;
+  vllm::MiniMaxH3AudioVaeWeights weights;
+  auto put = [&](const std::string& name, int64_t count, double scale, double offset) {
+    weights.tensors[name] = MakeParam("videovae.dec." + name, count, scale, offset);
+  };
+  put("x_embedder.weight", dim * config.in_channels, 0.1, 0.0);
+  put("x_embedder.bias", dim, 0.05, 0.0);
+  put("register_tokens", config.num_register_tokens * dim, 0.1, 0.0);
+  put("norm_out.weight", dim, 0.1, 1.0);
+  put("norm_out.bias", dim, 0.05, 0.0);
+  const int64_t patch_dim =
+      config.out_channels * config.patch_size_t * config.patch_size * config.patch_size;
+  put("proj_out.weight", patch_dim * dim, 0.1, 0.0);
+  put("proj_out.bias", patch_dim, 0.05, 0.0);
+  for (int64_t l = 0; l < config.num_layers; ++l) {
+    const std::string b = "transformer_blocks." + std::to_string(l) + ".";
+    put(b + "norm1.weight", dim, 0.1, 1.0);
+    put(b + "norm2.weight", dim, 0.1, 1.0);
+    put(b + "scale1", dim, 0.3, 0.0);
+    put(b + "scale2", dim, 0.3, 0.0);
+    put(b + "attn.to_qkv.weight", 3 * inner * dim, 0.1, 0.0);
+    put(b + "attn.to_qkv.bias", 3 * inner, 0.05, 0.0);
+    put(b + "attn.to_out.weight", dim * inner, 0.1, 0.0);
+    put(b + "attn.to_out.bias", dim, 0.05, 0.0);
+    put(b + "ff.w1.weight", 2 * config.block.ff_inner * dim, 0.1, 0.0);
+    put(b + "ff.w1.bias", 2 * config.block.ff_inner, 0.05, 0.0);
+    put(b + "ff.w2.weight", dim * config.block.ff_inner, 0.1, 0.0);
+    put(b + "ff.w2.bias", dim, 0.05, 0.0);
+  }
+  const vllm::MiniMaxH3VideoVaeDeviceWeights staged =
+      vllm::StageMiniMaxH3VideoVaeWeights(queue, config, weights);
+
+  const int64_t ratio = vllm::kMiniMaxH3VaeRatio;
+  const int64_t ps = config.patch_size;
+  const int64_t lt = vllm_test::kH3VideoVaeDecT;
+
+  SUBCASE("a canvas within one tile is the untiled decode, bit for bit") {
+    const int64_t lh = 2, lw = 3;  // 32x48 canvas px -- far below tile_size 256
+    REQUIRE(vllm::MiniMaxH3SplitTiles(lh * ratio, vllm::kMiniMaxH3VaeTileSize,
+                                      vllm::kMiniMaxH3VaeTileOverlapMin, ratio)
+                .starts.size() == 1u);
+    const std::vector<float> latent =
+        MakeParam("videovae.tile.small", config.in_channels * lt * lh * lw, 1.0);
+    vllm::MiniMaxH3VideoFrameShape sa{}, sb{};
+    const std::vector<float> untiled =
+        vllm::MiniMaxH3VideoVaeDecodeDevice(queue.device, config, staged, latent, lt, lh, lw, &sa);
+    const std::vector<float> tiled = vllm::MiniMaxH3VideoVaeDecodeTiledDevice(
+        queue.device, config, staged, latent, lt, lh, lw, &sb);
+    REQUIRE(tiled.size() == untiled.size());
+    CHECK(sa.h == sb.h);
+    CHECK(sa.w == sb.w);
+    CHECK(MaxAbsDiff(tiled, untiled.data(), tiled.size()) == 0.0);
+  }
+
+  SUBCASE("a multi-tile canvas places each tile where the plan says") {
+    // 20 latent units = 320 canvas px > tile_size 256, so the plan is 2 tiles per
+    // axis (starts 0 and 64 px == latent 0 and 4, overlap 192 px == 12 latent).
+    const int64_t lh = 20, lw = 20;
+    const vllm::MiniMaxH3TilePlan plan = vllm::MiniMaxH3SplitTiles(
+        lh * ratio, vllm::kMiniMaxH3VaeTileSize, vllm::kMiniMaxH3VaeTileOverlapMin, ratio);
+    REQUIRE(plan.starts.size() == 2u);
+    const int64_t tile_lat = plan.lengths[0] / ratio;
+    const int64_t ov_lat = plan.overlaps[0] / ratio;
+
+    const std::vector<float> latent =
+        MakeParam("videovae.tile.big", config.in_channels * lt * lh * lw, 1.0);
+    vllm::MiniMaxH3VideoFrameShape shape{};
+    const std::vector<float> tiled = vllm::MiniMaxH3VideoVaeDecodeTiledDevice(
+        queue.device, config, staged, latent, lt, lh, lw, &shape);
+
+    CHECK(shape.channels == config.out_channels);
+    CHECK(shape.t == lt * config.patch_size_t);
+    CHECK(shape.h == lh * ps);
+    CHECK(shape.w == lw * ps);
+    REQUIRE(tiled.size() == static_cast<size_t>(shape.channels * shape.t * shape.h * shape.w));
+    for (const float v : tiled) REQUIRE(std::isfinite(v));
+
+    // Decode tile (0,0) on its own and require the assembled canvas to reproduce it
+    // EXACTLY outside the blend region. This is what a wrong slice or a wrong
+    // placement breaks -- and both still produce plausible finite frames.
+    std::vector<float> sub(static_cast<size_t>(config.in_channels * lt * tile_lat * tile_lat));
+    for (int64_t c = 0; c < config.in_channels; ++c) {
+      for (int64_t tt = 0; tt < lt; ++tt) {
+        for (int64_t y = 0; y < tile_lat; ++y) {
+          for (int64_t x = 0; x < tile_lat; ++x) {
+            sub[static_cast<size_t>(((c * lt + tt) * tile_lat + y) * tile_lat + x)] =
+                latent[static_cast<size_t>(((c * lt + tt) * lh + y) * lw + x)];
+          }
+        }
+      }
+    }
+    vllm::MiniMaxH3VideoFrameShape ts{};
+    const std::vector<float> tile0 = vllm::MiniMaxH3VideoVaeDecodeTiledDevice(
+        queue.device, config, staged, sub, lt, tile_lat, tile_lat, &ts);
+    REQUIRE(ts.h == tile_lat * ps);
+
+    // The un-blended interior: rows/cols before the first seam starts.
+    const int64_t keep = (tile_lat - ov_lat) * ps;
+    REQUIRE(keep > 0);
+    double worst = 0.0;
+    for (int64_t c = 0; c < shape.channels; ++c) {
+      for (int64_t tt = 0; tt < shape.t; ++tt) {
+        for (int64_t y = 0; y < keep; ++y) {
+          for (int64_t x = 0; x < keep; ++x) {
+            const double a = tiled[static_cast<size_t>(((c * shape.t + tt) * shape.h + y) *
+                                                           shape.w + x)];
+            const double b = tile0[static_cast<size_t>(((c * ts.t + tt) * ts.h + y) * ts.w + x)];
+            worst = std::max(worst, std::abs(a - b));
+          }
+        }
+      }
+    }
+    INFO("tile (0,0) interior vs a standalone decode, max|diff| = " << worst);
+    CHECK(worst == 0.0);
+  }
+}
+
 TEST_CASE("minimax_h3: the DEVICE video-VAE decoder matches the checkpoint's remote code") {
   vt::Queue q = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
   CheckVideoVaeDecodeDevice(q, "cpu");

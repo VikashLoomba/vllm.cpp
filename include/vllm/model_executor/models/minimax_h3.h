@@ -700,6 +700,21 @@ std::vector<float> MiniMaxH3VideoVaeDecodeDevice(vt::Device device,
                                                  int64_t latent_h, int64_t latent_w,
                                                  MiniMaxH3VideoFrameShape* out_shape);
 
+// The same decode UNDER UPSTREAM'S TILE PLAN, which is what a real canvas needs.
+//
+// Tiling is not an optional memory strategy here: the ViT3D's RoPE coordinates are
+// LENGTH-NORMALIZED over the grid it is handed, so the grid extent is part of the
+// input. Upstream always decodes 256-pixel tiles (16 latent units). Decoding a
+// larger canvas in one pass gives every token a position the model never saw, and
+// shows up as a grid of small squares over otherwise correct frames.
+//
+// Falls through to the untiled decode, bit for bit, when the plan is a single tile
+// (canvas <= tile_size), which is why the reduced-dimension gates never saw this.
+std::vector<float> MiniMaxH3VideoVaeDecodeTiledDevice(
+    vt::Device device, const MiniMaxH3VideoVaeDecoderConfig& config,
+    const MiniMaxH3VideoVaeDeviceWeights& staged, const std::vector<float>& latent,
+    int64_t latent_t, int64_t latent_h, int64_t latent_w, MiniMaxH3VideoFrameShape* out_shape);
+
 // ---------------------------------------------------------------------------
 // H3-Encoder text tower (minimax_h3_encoder.cpp)
 //

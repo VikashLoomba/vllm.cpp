@@ -388,4 +388,162 @@ std::vector<float> MiniMaxH3VideoVaeDecodeDevice(vt::Device device,
   return frames;
 }
 
+
+// ---------------------------------------------------------------------------
+// SPATIAL TILING (klvae.py:192-250)
+//
+// This is NOT a memory strategy, which is how it first reads. The ViT3D decoder's
+// RoPE coordinates are LENGTH-NORMALIZED -- `2*((i + 0.5)/n) - 1` over whatever
+// grid it is handed (MiniMaxH3VideoVaeRope) -- so the grid EXTENT is part of the
+// input, not an implementation detail. Upstream always decodes in 256-pixel tiles
+// (16 latent units); handing the decoder a 32x32 latent instead of the 16x16 it
+// was trained on gives every token a position the model has never seen.
+//
+// Observed, not theorized: at 512x512 (which upstream plans as 3 tiles per axis)
+// an untiled decode produced globally-correct frames covered in a grid of small
+// squares, while 256x256 -- the one size where tile_size >= input, so tiled and
+// untiled are the SAME computation -- came out clean.
+//
+// Every plan value is a whole number of `vae_ratio` units (tile_size 256 = 16*16,
+// and the slack is distributed in whole vae_ratio steps), so the pixel plan slices
+// the latent exactly.
+namespace {
+
+// Cross-fade `b` onto `a` along the LAST axis of a [C, T, H, W] buffer, reusing the
+// gated 1-D MiniMaxH3BlendTiles per scanline. Result width is wa - extent + wb.
+std::vector<float> BlendAlongW(const std::vector<float>& a, const std::vector<float>& b, int64_t c,
+                               int64_t t, int64_t h, int64_t wa, int64_t wb, int64_t extent) {
+  const int64_t wout = wa - extent + wb;
+  std::vector<float> out(static_cast<size_t>(c * t * h * wout));
+  std::vector<float> la(static_cast<size_t>(wa)), lb(static_cast<size_t>(wb));
+  for (int64_t i = 0; i < c * t * h; ++i) {
+    for (int64_t x = 0; x < wa; ++x) la[static_cast<size_t>(x)] = a[static_cast<size_t>(i * wa + x)];
+    for (int64_t x = 0; x < wb; ++x) lb[static_cast<size_t>(x)] = b[static_cast<size_t>(i * wb + x)];
+    const std::vector<float> merged = MiniMaxH3BlendTiles(la, lb, extent);
+    // `merged` covers the region starting at (wa - extent); everything before it is
+    // `a` untouched.
+    for (int64_t x = 0; x < wa - extent; ++x) {
+      out[static_cast<size_t>(i * wout + x)] = la[static_cast<size_t>(x)];
+    }
+    for (size_t x = 0; x < merged.size(); ++x) {
+      out[static_cast<size_t>(i * wout + wa - extent) + x] = merged[x];
+    }
+  }
+  return out;
+}
+
+// The same cross-fade along H. Lines are strided by W, so they are gathered.
+std::vector<float> BlendAlongH(const std::vector<float>& a, const std::vector<float>& b, int64_t c,
+                               int64_t t, int64_t ha, int64_t hb, int64_t w, int64_t extent) {
+  const int64_t hout = ha - extent + hb;
+  std::vector<float> out(static_cast<size_t>(c * t * hout * w));
+  std::vector<float> la(static_cast<size_t>(ha)), lb(static_cast<size_t>(hb));
+  for (int64_t plane = 0; plane < c * t; ++plane) {
+    for (int64_t x = 0; x < w; ++x) {
+      for (int64_t y = 0; y < ha; ++y) {
+        la[static_cast<size_t>(y)] = a[static_cast<size_t>((plane * ha + y) * w + x)];
+      }
+      for (int64_t y = 0; y < hb; ++y) {
+        lb[static_cast<size_t>(y)] = b[static_cast<size_t>((plane * hb + y) * w + x)];
+      }
+      const std::vector<float> merged = MiniMaxH3BlendTiles(la, lb, extent);
+      for (int64_t y = 0; y < ha - extent; ++y) {
+        out[static_cast<size_t>((plane * hout + y) * w + x)] = la[static_cast<size_t>(y)];
+      }
+      for (size_t y = 0; y < merged.size(); ++y) {
+        out[static_cast<size_t>((plane * hout + (ha - extent) + static_cast<int64_t>(y)) * w + x)] =
+            merged[y];
+      }
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+std::vector<float> MiniMaxH3VideoVaeDecodeTiledDevice(
+    vt::Device device, const MiniMaxH3VideoVaeDecoderConfig& config,
+    const MiniMaxH3VideoVaeDeviceWeights& staged, const std::vector<float>& latent,
+    int64_t latent_t, int64_t latent_h, int64_t latent_w, MiniMaxH3VideoFrameShape* out_shape) {
+  const int64_t ratio = kMiniMaxH3VaeRatio;
+  const MiniMaxH3TilePlan plan_h = MiniMaxH3SplitTiles(
+      latent_h * ratio, kMiniMaxH3VaeTileSize, kMiniMaxH3VaeTileOverlapMin, ratio);
+  const MiniMaxH3TilePlan plan_w = MiniMaxH3SplitTiles(
+      latent_w * ratio, kMiniMaxH3VaeTileSize, kMiniMaxH3VaeTileOverlapMin, ratio);
+
+  // A single tile is the untiled decode, bit for bit -- no slicing, no blending.
+  if (plan_h.starts.size() == 1 && plan_w.starts.size() == 1) {
+    return MiniMaxH3VideoVaeDecodeDevice(device, config, staged, latent, latent_t, latent_h,
+                                         latent_w, out_shape);
+  }
+
+  const int64_t channels = config.in_channels;
+  const int64_t ps = config.patch_size, pt = config.patch_size_t;
+  const int64_t frames_t = latent_t * pt;
+
+  std::vector<float> assembled;  // [out_channels, frames_t, H, W] as it grows
+  int64_t assembled_h = 0, assembled_w = 0;
+
+  for (size_t i = 0; i < plan_h.starts.size(); ++i) {
+    const int64_t h0 = plan_h.starts[i] / ratio, hl = plan_h.lengths[i] / ratio;
+    std::vector<float> row;
+    int64_t row_w = 0;
+    for (size_t j = 0; j < plan_w.starts.size(); ++j) {
+      const int64_t w0 = plan_w.starts[j] / ratio, wl = plan_w.lengths[j] / ratio;
+      VT_CHECK(h0 + hl <= latent_h && w0 + wl <= latent_w,
+               "minimax_h3 video vae tiling: tile exceeds the latent grid");
+
+      std::vector<float> sub(static_cast<size_t>(channels * latent_t * hl * wl));
+      for (int64_t c = 0; c < channels; ++c) {
+        for (int64_t tt = 0; tt < latent_t; ++tt) {
+          for (int64_t y = 0; y < hl; ++y) {
+            for (int64_t x = 0; x < wl; ++x) {
+              sub[static_cast<size_t>(((c * latent_t + tt) * hl + y) * wl + x)] =
+                  latent[static_cast<size_t>(((c * latent_t + tt) * latent_h + h0 + y) * latent_w +
+                                             w0 + x)];
+            }
+          }
+        }
+      }
+      MiniMaxH3VideoFrameShape tile_shape;
+      const std::vector<float> tile = MiniMaxH3VideoVaeDecodeDevice(
+          device, config, staged, sub, latent_t, hl, wl, &tile_shape);
+      const int64_t tw = wl * ps;
+      if (j == 0) {
+        row = tile;
+        row_w = tw;
+      } else {
+        // The plan is in CANVAS pixels (vae_ratio per latent unit); the blend
+        // happens in the DECODER'S output pixels (patch_size per latent unit).
+        // They are both 16 on the real checkpoint, so converting through latent
+        // units matters only for reduced-dimension configs -- which is exactly
+        // where the gates run.
+        const int64_t ov = (plan_w.overlaps[j - 1] / ratio) * ps;
+        row = BlendAlongW(row, tile, config.out_channels, frames_t, hl * ps, row_w, tw, ov);
+        row_w = row_w - ov + tw;
+      }
+    }
+    const int64_t th = hl * ps;
+    if (i == 0) {
+      assembled = std::move(row);
+      assembled_h = th;
+      assembled_w = row_w;
+    } else {
+      VT_CHECK(row_w == assembled_w, "minimax_h3 video vae tiling: tile rows disagree on width");
+      const int64_t ov = (plan_h.overlaps[i - 1] / ratio) * ps;
+      assembled = BlendAlongH(assembled, row, config.out_channels, frames_t, assembled_h, th,
+                              assembled_w, ov);
+      assembled_h = assembled_h - ov + th;
+    }
+  }
+
+  if (out_shape != nullptr) {
+    out_shape->channels = config.out_channels;
+    out_shape->t = frames_t;
+    out_shape->h = assembled_h;
+    out_shape->w = assembled_w;
+  }
+  return assembled;
+}
+
 }  // namespace vllm

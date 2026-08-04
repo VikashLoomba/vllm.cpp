@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
   bool keep_quant = false, dry_run = false, dequant_bf16 = false, denoise_only = false;
   std::string device_name = "cpu";
-  std::string encoder_path, prompt, tokenizer_path;
+  std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
 
@@ -136,6 +136,7 @@ int main(int argc, char** argv) {
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
       else if (f == "--tokenizer") tokenizer_path = Need(argc, argv, ++i, f);
+      else if (f == "--save-embeds") save_embeds_path = Need(argc, argv, ++i, f);
       else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--frames") frames = std::stoll(Need(argc, argv, ++i, f));
@@ -239,6 +240,18 @@ int main(int argc, char** argv) {
         encoded_prompt =
             vllm::MiniMaxH3EncoderTextForwardDevice(eq, ec, staged, embeds, pos.data(), seq);
         std::cerr << "  conditioning = [" << seq << ", " << ec.hidden_size << "]\n";
+        // Persisting the conditioning makes a checkpoint A/B CONTROLLED: two DiTs
+        // can then be compared on byte-identical text conditioning instead of two
+        // separate encoder runs. It also lets the second run skip the 13 GB tower
+        // entirely, which is the difference between fitting and not on a
+        // unified-memory box.
+        if (!save_embeds_path.empty()) {
+          std::ofstream out(save_embeds_path, std::ios::binary);
+          if (!out) throw std::runtime_error("cannot write " + save_embeds_path);
+          out.write(reinterpret_cast<const char*>(encoded_prompt.data()),
+                    static_cast<std::streamsize>(encoded_prompt.size() * sizeof(float)));
+          std::cerr << "  saved conditioning -> " << save_embeds_path << "\n";
+        }
       }
     }
 

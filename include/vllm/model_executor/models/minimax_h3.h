@@ -699,6 +699,36 @@ std::vector<float> MiniMaxH3EncoderTextForward(const MiniMaxH3EncoderConfig& con
                                                const uint8_t* visual_pos_mask,
                                                const std::vector<std::vector<float>>& deepstack);
 
+// The H3-Encoder in KEEP-QUANT form, materialized from a ComfyUI-format GGUF
+// (qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf, 902 tensors, all Q4_K).
+//
+// This exists because the encoder is 32B: the safetensors loader materializes f32,
+// which is ~128 GB and does not fit the box we test on. Keeping the projections in
+// their ggml blocks holds the tower at ~14.6 GB, and — as with the DiT — the ggml
+// block-quant GEMM carries NO arch gate, so it runs natively where FP4 cannot.
+//
+// The two fusions the forward needs (q/k/v -> qkv_proj, gate/up -> gate_up_proj)
+// are done on the QUANTIZED BYTES. That is sound precisely because ggml rows are
+// independent: a row is a whole number of blocks (every K here is a multiple of
+// 256), so concatenating whole rows of q, k and v yields a valid block-quant tensor
+// whose rows are [q_all | k_all | v_all]. No dequantize/requantize round trip.
+struct MiniMaxH3EncoderQuantWeights {
+  MiniMaxH3EncoderConfig config;
+  std::map<std::string, std::vector<uint8_t>> quant_storage;  // ggml block bytes
+  std::map<std::string, std::vector<float>> storage;          // f32 norms/biases
+  std::map<std::string, vt::Tensor> views;                    // what the forward binds
+
+  const vt::Tensor& Get(const std::string& name) const;
+  bool Has(const std::string& name) const { return views.count(name) != 0; }
+};
+
+// `max_layers` truncates the text tower to H3's own min(num_hidden_layers, 50);
+// 0 keeps every layer. The GGUF prefixes differ from the safetensors ones
+// (`model.layers.N.` here vs `model.language_model.layers.N.` there, and `visual.`
+// vs `model.visual.`), which is itself gated.
+MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
+                                                          int64_t max_layers = 0);
+
 // Materialize the H3-Encoder (FL2VA/text_encoder, 14 shards / 1058 tensors) into
 // the name map both encoder forwards read.
 //

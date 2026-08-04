@@ -3623,3 +3623,125 @@ TEST_CASE("minimax_h3: the SHIPPED VAE config.json files parse into the decoders
     }
   }
 }
+
+TEST_CASE("minimax_h3: the encoder GGUF loads KEEP-QUANT and fuses on QUANTIZED bytes") {
+  // The encoder is 32B, so f32 materialization (~128 GB) does not fit the box we
+  // test on; keeping the ggml blocks holds it at ~14.6 GB. The interesting claim is
+  // that the q/k/v and gate/up fusions can be done on the QUANTIZED bytes: ggml rows
+  // are independent block sequences, so concatenating whole rows yields a valid
+  // block-quant tensor — no dequantize/requantize round trip, and no precision lost
+  // to one. This asserts that byte-for-byte.
+  const int64_t H = 256;    // hidden (a whole number of Q8_0 blocks)
+  const int64_t QD = 128, KVD = 64, FF = 512;
+
+  gguf_test::GgufModelBuilder builder;
+  builder.AddKv(gguf_test::StrKv("general.architecture", "qwen3vl"));
+  std::map<std::string, std::string> raw;  // logical name -> the exact bytes written
+  auto add_q8 = [&](const std::string& name, int64_t out_dim, int64_t in_dim) {
+    const std::vector<float> values = MakeParam("encq." + name, out_dim * in_dim, 0.1);
+    const size_t row_bytes = vt::RowSizeBytes(vt::DType::kQ8_0, in_dim);
+    std::string bytes(static_cast<size_t>(out_dim) * row_bytes, '\0');
+    vt::cpu::FromFloatFn q = vt::cpu::BlockFromFloat(vt::DType::kQ8_0);
+    REQUIRE(q != nullptr);
+    for (int64_t r = 0; r < out_dim; ++r) {
+      q(values.data() + r * in_dim, bytes.data() + static_cast<size_t>(r) * row_bytes, in_dim);
+    }
+    raw[name] = bytes;
+    builder.AddTensor(name, {static_cast<uint64_t>(in_dim), static_cast<uint64_t>(out_dim)},
+                      /*ggml_type=*/8 /*Q8_0*/, bytes);
+  };
+  auto add_f32 = [&](const std::string& name, const std::vector<int64_t>& logical) {
+    int64_t n = 1;
+    for (int64_t d : logical) n *= d;
+    const std::vector<float> v = MakeParam("encq." + name, n, 0.1);
+    std::string bytes(reinterpret_cast<const char*>(v.data()), v.size() * sizeof(float));
+    std::vector<uint64_t> ne;
+    for (auto it = logical.rbegin(); it != logical.rend(); ++it) ne.push_back(uint64_t(*it));
+    builder.AddTensor(name, ne, /*ggml_type=*/0, bytes);
+  };
+
+  for (int layer = 0; layer < 2; ++layer) {
+    const std::string p = "model.layers." + std::to_string(layer) + ".";
+    add_f32(p + "input_layernorm.weight", {H});
+    add_f32(p + "post_attention_layernorm.weight", {H});
+    add_f32(p + "self_attn.q_norm.weight", {64});
+    add_f32(p + "self_attn.k_norm.weight", {64});
+    add_q8(p + "self_attn.q_proj.weight", QD, H);
+    add_q8(p + "self_attn.k_proj.weight", KVD, H);
+    add_q8(p + "self_attn.v_proj.weight", KVD, H);
+    add_q8(p + "self_attn.o_proj.weight", H, QD);
+    add_q8(p + "mlp.gate_proj.weight", FF, H);
+    add_q8(p + "mlp.up_proj.weight", FF, H);
+    add_q8(p + "mlp.down_proj.weight", H, FF);
+  }
+  add_q8("model.embed_tokens.weight", 512, H);
+  add_f32("model.norm.weight", {H});  // must NOT be bound (H3 reads unnormalized)
+
+  const std::string path = "/tmp/minimax_h3_enc_q.gguf";
+  {
+    const std::string bytes = builder.Build();
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    CHECK(std::fwrite(bytes.data(), 1, bytes.size(), fh) == bytes.size());
+    std::fclose(fh);
+  }
+
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(path);
+  const vllm::MiniMaxH3EncoderQuantWeights w = vllm::LoadMiniMaxH3EncoderFromGguf(gguf);
+
+  // Projections stayed QUANTIZED.
+  CHECK(w.Get("layers.0.self_attn.qkv_proj.weight").dtype == vt::DType::kQ8_0);
+  CHECK(w.Get("layers.0.mlp.gate_up_proj.weight").dtype == vt::DType::kQ8_0);
+  CHECK(w.Get("layers.0.self_attn.o_proj.weight").dtype == vt::DType::kQ8_0);
+  CHECK(w.Get("embed_tokens.weight").dtype == vt::DType::kQ8_0);
+  // Norms are f32.
+  CHECK(w.Get("layers.0.input_layernorm.weight").dtype == vt::DType::kF32);
+
+  // THE CLAIM: the fused tensor's bytes are exactly q ++ k ++ v.
+  const std::string& q = raw["model.layers.0.self_attn.q_proj.weight"];
+  const std::string& k = raw["model.layers.0.self_attn.k_proj.weight"];
+  const std::string& v = raw["model.layers.0.self_attn.v_proj.weight"];
+  const vt::Tensor& fused = w.Get("layers.0.self_attn.qkv_proj.weight");
+  CHECK(fused.shape[0] == QD + 2 * KVD);
+  CHECK(fused.shape[1] == H);
+  const uint8_t* fb = static_cast<const uint8_t*>(fused.data);
+  const std::string want = q + k + v;
+  REQUIRE(vt::RowSizeBytes(vt::DType::kQ8_0, H) * (QD + 2 * KVD) == want.size());
+  bool same = true;
+  for (size_t i = 0; i < want.size(); ++i) {
+    if (fb[i] != static_cast<uint8_t>(want[i])) { same = false; break; }
+  }
+  CHECK(same);  // byte-for-byte, in [q|k|v] order
+
+  const std::string& gate = raw["model.layers.0.mlp.gate_proj.weight"];
+  const std::string& up = raw["model.layers.0.mlp.up_proj.weight"];
+  const vt::Tensor& gu = w.Get("layers.0.mlp.gate_up_proj.weight");
+  CHECK(gu.shape[0] == 2 * FF);
+  const uint8_t* gb = static_cast<const uint8_t*>(gu.data);
+  const std::string want2 = gate + up;
+  bool same2 = true;
+  for (size_t i = 0; i < want2.size(); ++i) {
+    if (gb[i] != static_cast<uint8_t>(want2[i])) { same2 = false; break; }
+  }
+  CHECK(same2);
+
+  // The separate names are gone, and H3's deltas hold.
+  CHECK_FALSE(w.Has("layers.0.self_attn.q_proj.weight"));
+  CHECK_FALSE(w.Has("norm.weight"));       // UNNORMALIZED output
+  CHECK_FALSE(w.Has("model.norm.weight"));
+
+  // Geometry recovered from the fused shapes alone.
+  CHECK(w.config.hidden_size == H);
+  CHECK(w.config.head_dim == 64);
+  CHECK(w.config.num_attention_heads == QD / 64);
+  CHECK(w.config.num_key_value_heads == KVD / 64);
+  CHECK(w.config.intermediate_size == FF);
+  CHECK(w.config.num_hidden_layers == 2);
+
+  // Truncation, which is how H3 keeps min(num_hidden_layers, 50).
+  const vllm::MiniMaxH3EncoderQuantWeights t1 =
+      vllm::LoadMiniMaxH3EncoderFromGguf(gguf, /*max_layers=*/1);
+  CHECK(t1.Has("layers.0.self_attn.qkv_proj.weight"));
+  CHECK_FALSE(t1.Has("layers.1.self_attn.qkv_proj.weight"));
+  CHECK(t1.config.num_hidden_layers == 1);
+}

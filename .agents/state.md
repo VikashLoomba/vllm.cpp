@@ -35840,3 +35840,32 @@ is not wired. That is the next piece for a truthful API.
 
 Housekeeping: pruned 8 stale per-SHA build trees on Thor (80G -> 52G used), per
 [[grid-per-sha-trees-fill-disk]].
+
+## 2026-08-04 - MiniMax-H3: encoder KEEP-QUANT GGUF loader (toward real text conditioning)
+
+Wiring the encoder is what turns the generated video from unconditioned noise into
+something a prompt steers. Step one is loading it at all: the tower is 32B, and the
+safetensors loader materializes f32 (~128 GB), which does not fit the 122 GB box.
+
+LoadMiniMaxH3EncoderFromGguf keeps the projections in their ggml blocks - the real
+file is qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf, 902 tensors, all Q4_K - holding the tower
+at ~14.6 GB. As with the DiT, the block-quant GEMM has no arch gate, so it runs
+natively on hardware that cannot do FP4.
+
+THE INTERESTING PART: the two fusions the forward needs (q/k/v -> qkv_proj, gate/up
+-> gate_up_proj) are performed on the QUANTIZED BYTES. That is sound because ggml
+rows are INDEPENDENT block sequences and every K here is a multiple of the
+256-element block, so concatenating whole rows yields a valid block-quant tensor with
+rows [q_all|k_all|v_all]. No dequantize/requantize round trip, and no precision lost
+to one. Gated BYTE-FOR-BYTE against `q ++ k ++ v` and `gate ++ up`.
+
+Also gated: geometry recovered from the fused shapes alone (hidden/head_dim/heads/
+kv_heads/intermediate/layers), truncation to min(num_hidden_layers, 50), and the H3
+delta that `norm.weight` is NOT bound because H3 reads the UNNORMALIZED output.
+
+GGUF prefixes differ from safetensors and that is now pinned: `model.layers.N.` here
+vs `model.language_model.layers.N.` there, `visual.` vs `model.visual.`.
+
+REMAINS for conditioning: a DEVICE encoder forward that consumes these quantized
+weights (the existing MiniMaxH3EncoderTextForward is a host f32 reference), plus
+tokenization and the embedding gather.

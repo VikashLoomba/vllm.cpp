@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
   bool keep_quant = false, dry_run = false;
   std::string device_name = "cpu";
-  std::string encoder_path, prompt;
+  std::string encoder_path, prompt, tokenizer_path;
   int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
 
@@ -131,6 +131,7 @@ int main(int argc, char** argv) {
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
+      else if (f == "--tokenizer") tokenizer_path = Need(argc, argv, ++i, f);
       else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--frames") frames = std::stoll(Need(argc, argv, ++i, f));
@@ -180,9 +181,13 @@ int main(int argc, char** argv) {
                 << " GiB\n";
 
       if (!prompt.empty()) {
-        // The GGUF carries its own vocab, so the prompt needs no side-car
-        // tokenizer file.
-        const vllm::tok::Tokenizer tokenizer = vllm::tok::Tokenizer::FromGguf(ef);
+        // The ComfyUI-style encoder GGUF is WEIGHTS ONLY — it carries no
+        // `tokenizer.ggml.*` metadata, unlike a llama.cpp export — so the vocab
+        // comes from the checkpoint's own tokenizer.json. `--tokenizer` is
+        // therefore required with `--prompt` unless the GGUF happens to embed one.
+        const vllm::tok::Tokenizer tokenizer =
+            tokenizer_path.empty() ? vllm::tok::Tokenizer::FromGguf(ef)
+                                   : vllm::tok::Tokenizer::FromHfJson(tokenizer_path);
         const std::vector<int32_t> ids = tokenizer.Encode(prompt);
         VT_CHECK(!ids.empty(), "minimax-h3-gen: the prompt tokenized to nothing");
         std::cerr << "  prompt tokens = " << ids.size() << "\n";

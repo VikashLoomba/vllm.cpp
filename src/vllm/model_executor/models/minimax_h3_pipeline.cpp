@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -128,9 +129,21 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
     video_latent = MiniMaxH3VideoVaePostQuantConv(video_weights, video_latent,
                                                   dit_params.latents_dim, video_per_channel);
   }
-  result.frames = MiniMaxH3VideoVaeDecode(video_config, video_weights, video_latent,
-                                          request.latent_t, request.latent_h, request.latent_w,
-                                          &result.frame_shape);
+  // On a device, run the ViT3D decoder device-resident. The portable decoder is a
+  // scalar reference; at real resolutions it is the stage that does not finish. It
+  // stays the CPU path, and stays the thing the device path is gated against.
+  if (device.type != vt::DeviceType::kCPU) {
+    vt::Queue vq = vt::GetBackend(device.type).CreateQueue();
+    const MiniMaxH3VideoVaeDeviceWeights staged_vae =
+        StageMiniMaxH3VideoVaeWeights(vq, video_config, video_weights);
+    result.frames = MiniMaxH3VideoVaeDecodeDevice(device, video_config, staged_vae, video_latent,
+                                                  request.latent_t, request.latent_h,
+                                                  request.latent_w, &result.frame_shape);
+  } else {
+    result.frames = MiniMaxH3VideoVaeDecode(video_config, video_weights, video_latent,
+                                            request.latent_t, request.latent_h, request.latent_w,
+                                            &result.frame_shape);
+  }
 
   // The audio VAE decodes ONE channel at a time; the packed rows are channel-major.
   result.audio_channels = request.audio_channel;

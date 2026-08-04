@@ -30,6 +30,8 @@
 // own accumulation orders. f32 is what upstream torch RMSNorm does, so the device
 // path is arguably the closer mirror. It is gated against the SAME upstream
 // goldens at the SAME tolerance as the CPU forward.
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -760,9 +762,15 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
   // Opt the mapping into page release: without this the DropSpanResidency calls
   // below are no-ops and the read-once file pages accumulate against the same
   // unified pool the weights live in.
-  file.ReleaseExpandedPages(true);
+  // NOTE: page release is OFF by default here. It was enabled once and the load was
+  // SIGKILLed early at only ~21 GB peak — not a memory problem — so it is gated
+  // behind VT_H3_DROP_PAGES until that is understood rather than left on by faith.
+  const bool drop_pages = std::getenv("VT_H3_DROP_PAGES") != nullptr;
+  if (drop_pages) file.ReleaseExpandedPages(true);
+  const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
   MiniMaxH3DitDeviceWeights staged;
   std::map<std::string, Tensor> views;
+  int64_t done = 0;
   for (const MiniMaxH3TensorSpec& spec : manifest) {
     const GgufTensorInfo& info = file.Get(spec.name);
     int64_t numel = 1;
@@ -785,7 +793,12 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
     }
     // Drop the file pages we will never read again — on a unified-memory box the
     // page cache competes with the model for the same pool.
-    file.DropSpanResidency(static_cast<const uint8_t*>(info.data), info.nbytes);
+    if (drop_pages) file.DropSpanResidency(static_cast<const uint8_t*>(info.data), info.nbytes);
+    if (trace && (++done % 50 == 0 || done == static_cast<int64_t>(manifest.size()))) {
+      std::fprintf(stderr, "[h3] streamed %lld/%zu tensors (last: %s)\n",
+                   static_cast<long long>(done), manifest.size(), spec.name.c_str());
+      std::fflush(stderr);
+    }
   }
 
   // Bind the forward's views over the DEVICE tensors, by the same names the

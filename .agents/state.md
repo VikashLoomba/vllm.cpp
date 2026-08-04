@@ -35791,3 +35791,26 @@ One stderr phase trace settled in a single run what speculation had not. On this
 instrument - do not read the utilization counter.
 
 Also: --steps 1 is INVALID (N steps needs N+1 sigmas); the minimum is 2.
+
+## 2026-08-04 - MiniMax-H3: ★ END-TO-END VIDEO ON REAL WEIGHTS (Thor)
+
+A playable MP4 out of the real 15.58 GB MiniMax-H3-FL2VA-Q3_K_M checkpoint on Thor's
+GPU. ffprobe: h264 / yuv420p 128x128 + AAC stereo 32 kHz. EXIT=0 in 6m22s.
+
+The whole chain is now proven on real weights, not fixtures:
+  GGUF keep-quant load -> device-resident denoise loop -> post_quant_conv ->
+  ViT3D video decode + BigVGAN audio decode -> PPM frames + WAV -> ffmpeg mux
+
+Measured at latent 2x8x8 / 2 steps: staging 22.3 s (once), DiT forward 21.1 s/step at
+seq_len 64. The earlier 256x256 attempt gave 200 s/step at seq_len 576 and TIMED OUT
+in the CPU-only VAE decode, which is why this run used smaller dims - the milestone is
+that the chain COMPLETES on real weights, not that these dims are useful output.
+
+WHAT THIS DOES NOT SHOW: the video is not prompt-conditioned. The H3-Encoder is not
+wired, so conditioning is a fixed embeddings file and the prompt text steers nothing.
+That is the next piece for a truthful API.
+
+TWO PERFORMANCE GAPS, both now measured rather than suspected:
+  1. DiT forward 200 s/step at seq_len 576 - the 50-step default is ~2.8 h of DiT.
+  2. The VIDEO VAE DECODE IS CPU-ONLY (36-layer dim-2048 ViT3D on the host) and is
+     the wall at realistic resolutions. A missing device path, not tuning.

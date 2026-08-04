@@ -3940,3 +3940,83 @@ TEST_CASE("minimax_h3: the DEVICE keep-quant encoder matches the host f32 refere
   CHECK(mag > 1e-3);  // the tower produced something, not zeros
   for (float v : got) REQUIRE(std::isfinite(v));
 }
+
+TEST_CASE("minimax_h3: the embedding gather decodes ONLY the rows it needs, exactly") {
+  // The table is [151936, 5120] — ~1.5 GB even quantized — and a prompt touches a
+  // few dozen rows, so the gather decodes rows individually. That is only valid
+  // because ggml rows are independent block sequences; this asserts a row-wise
+  // gather is BIT-IDENTICAL to slicing a full-table dequant.
+  const int64_t VOCAB = 64, HID = 128;
+  const std::vector<float> values = MakeParam("emb.table", VOCAB * HID, 0.5);
+  const size_t row_bytes = vt::RowSizeBytes(vt::DType::kQ8_0, HID);
+  std::string bytes(static_cast<size_t>(VOCAB) * row_bytes, '\0');
+  vt::cpu::FromFloatFn q = vt::cpu::BlockFromFloat(vt::DType::kQ8_0);
+  REQUIRE(q != nullptr);
+  for (int64_t r = 0; r < VOCAB; ++r) {
+    q(values.data() + r * HID, bytes.data() + static_cast<size_t>(r) * row_bytes, HID);
+  }
+
+  gguf_test::GgufModelBuilder b;
+  b.AddKv(gguf_test::StrKv("general.architecture", "qwen3vl"));
+  b.AddTensor("model.embed_tokens.weight", {static_cast<uint64_t>(HID), static_cast<uint64_t>(VOCAB)},
+              8, bytes);
+  // One layer, so the loader has a tower to recover geometry from.
+  auto f32t = [&](const std::string& n, const std::vector<int64_t>& shape) {
+    int64_t nn = 1;
+    for (int64_t d : shape) nn *= d;
+    const std::vector<float> v = MakeParam("emb." + n, nn, 0.1);
+    std::string bb(reinterpret_cast<const char*>(v.data()), v.size() * sizeof(float));
+    std::vector<uint64_t> ne;
+    for (auto it = shape.rbegin(); it != shape.rend(); ++it) ne.push_back(uint64_t(*it));
+    b.AddTensor(n, ne, 0, bb);
+  };
+  auto q8t = [&](const std::string& n, int64_t o, int64_t i) {
+    const std::vector<float> v = MakeParam("emb." + n, o * i, 0.1);
+    const size_t rb = vt::RowSizeBytes(vt::DType::kQ8_0, i);
+    std::string bb(static_cast<size_t>(o) * rb, '\0');
+    for (int64_t r = 0; r < o; ++r) q(v.data() + r * i, bb.data() + static_cast<size_t>(r) * rb, i);
+    b.AddTensor(n, {static_cast<uint64_t>(i), static_cast<uint64_t>(o)}, 8, bb);
+  };
+  const std::string pl = "model.layers.0.";
+  f32t(pl + "input_layernorm.weight", {HID});
+  f32t(pl + "post_attention_layernorm.weight", {HID});
+  f32t(pl + "self_attn.q_norm.weight", {32});
+  f32t(pl + "self_attn.k_norm.weight", {32});
+  q8t(pl + "self_attn.q_proj.weight", 128, HID);
+  q8t(pl + "self_attn.k_proj.weight", 64, HID);
+  q8t(pl + "self_attn.v_proj.weight", 64, HID);
+  q8t(pl + "self_attn.o_proj.weight", HID, 128);
+  q8t(pl + "mlp.gate_proj.weight", 256, HID);
+  q8t(pl + "mlp.up_proj.weight", 256, HID);
+  q8t(pl + "mlp.down_proj.weight", HID, 256);
+
+  const std::string path = "/tmp/minimax_h3_emb.gguf";
+  {
+    const std::string blob = b.Build();
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    CHECK(std::fwrite(blob.data(), 1, blob.size(), fh) == blob.size());
+    std::fclose(fh);
+  }
+  const vllm::GgufFile g = vllm::GgufFile::Open(path);
+  const vllm::MiniMaxH3EncoderQuantWeights w = vllm::LoadMiniMaxH3EncoderFromGguf(g);
+  REQUIRE(w.Has("embed_tokens.weight"));
+  CHECK(w.Get("embed_tokens.weight").dtype == vt::DType::kQ8_0);  // stayed quantized
+
+  // The oracle: dequantize the WHOLE table once, then slice.
+  const std::vector<float> full = vllm::DequantGgufRowToF32(
+      8, reinterpret_cast<const uint8_t*>(bytes.data()), VOCAB * HID);
+
+  const std::vector<int32_t> ids = {0, 7, 63, 7, 1};  // includes a repeat and both ends
+  const std::vector<float> got = vllm::MiniMaxH3EncoderEmbedTokens(w, ids);
+  REQUIRE(got.size() == ids.size() * static_cast<size_t>(HID));
+  for (size_t i = 0; i < ids.size(); ++i) {
+    for (int64_t c = 0; c < HID; ++c) {
+      // BIT-identical, not approximate: same bytes through the same decoder.
+      CHECK(got[i * HID + c] == full[static_cast<size_t>(ids[i]) * HID + c]);
+    }
+  }
+  // An out-of-range id must THROW rather than read past the table.
+  CHECK_THROWS(vllm::MiniMaxH3EncoderEmbedTokens(w, {VOCAB}));
+  CHECK_THROWS(vllm::MiniMaxH3EncoderEmbedTokens(w, {-1}));
+}

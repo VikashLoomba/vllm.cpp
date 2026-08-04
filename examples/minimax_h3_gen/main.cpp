@@ -43,6 +43,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/tokenizer/tokenizer.h"
 #include "vt/backend.h"
 
 namespace {
@@ -109,7 +110,7 @@ int main(int argc, char** argv) {
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
   bool keep_quant = false, dry_run = false;
   std::string device_name = "cpu";
-  std::string encoder_path;
+  std::string encoder_path, prompt;
   int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
 
@@ -129,6 +130,7 @@ int main(int argc, char** argv) {
       else if (f == "--dry-run") dry_run = true;
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
+      else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
       else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--frames") frames = std::stoll(Need(argc, argv, ++i, f));
@@ -137,7 +139,7 @@ int main(int argc, char** argv) {
       else throw std::runtime_error("unknown argument: " + f);
     }
     if (dit_path.empty() || video_vae_path.empty() || audio_vae_path.empty() ||
-        embeds_path.empty() || out_path.empty()) {
+        out_path.empty() || (embeds_path.empty() && (encoder_path.empty() || prompt.empty()))) {
       std::cerr << "usage: minimax-h3-gen --dit <f> --video-vae <f> --audio-vae <f> "
                    "--prompt-embeds <f32.bin> --out <out.mp4> [--video-vae-config <j>] "
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
@@ -162,12 +164,13 @@ int main(int argc, char** argv) {
     // --- 1b. optional encoder probe. Loading the 32B tower keep-quant is the
     // precondition for real text conditioning; this reports the geometry it
     // recovered so the loader can be validated against the REAL file. ---
+    std::vector<float> encoded_prompt;
     if (!encoder_path.empty()) {
       std::cerr << "loading encoder " << encoder_path << " (keep-quant)\n";
       const vllm::GgufFile ef = vllm::GgufFile::Open(encoder_path);
       const vllm::MiniMaxH3EncoderQuantWeights enc =
           vllm::LoadMiniMaxH3EncoderFromGguf(ef, encoder_max_layers);
-      const vllm::MiniMaxH3EncoderConfig& ec = enc.config;
+      vllm::MiniMaxH3EncoderConfig ec = enc.config;
       std::cerr << "  encoder layers=" << ec.num_hidden_layers << " hidden=" << ec.hidden_size
                 << " heads=" << ec.num_attention_heads << " kv_heads=" << ec.num_key_value_heads
                 << " head_dim=" << ec.head_dim << " ffn=" << ec.intermediate_size << "\n";
@@ -175,6 +178,35 @@ int main(int argc, char** argv) {
       for (const auto& kv : enc.quant_storage) quant_bytes += kv.second.size();
       std::cerr << "  encoder resident (keep-quant) = " << (quant_bytes / (1024.0 * 1024.0 * 1024.0))
                 << " GiB\n";
+
+      if (!prompt.empty()) {
+        // The GGUF carries its own vocab, so the prompt needs no side-car
+        // tokenizer file.
+        const vllm::tok::Tokenizer tokenizer = vllm::tok::Tokenizer::FromGguf(ef);
+        const std::vector<int32_t> ids = tokenizer.Encode(prompt);
+        VT_CHECK(!ids.empty(), "minimax-h3-gen: the prompt tokenized to nothing");
+        std::cerr << "  prompt tokens = " << ids.size() << "\n";
+        const std::vector<float> embeds = vllm::MiniMaxH3EncoderEmbedTokens(enc, ids);
+        // Text-only: all three M-RoPE axes are the token index.
+        const int64_t seq = static_cast<int64_t>(ids.size());
+        std::vector<int64_t> pos(static_cast<size_t>(3 * seq));
+        for (int64_t a = 0; a < 3; ++a) {
+          for (int64_t s = 0; s < seq; ++s) pos[static_cast<size_t>(a * seq + s)] = s;
+        }
+        vt::Device enc_dev{};
+        if (device_name == "cuda") {
+          enc_dev = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+        }
+        vt::Queue eq{enc_dev, nullptr};
+        vt::Backend& eb = vt::GetBackend(enc_dev.type);
+        if (enc_dev.type != vt::DeviceType::kCPU) eq = eb.CreateQueue();
+        const vllm::MiniMaxH3EncoderDeviceWeights staged =
+            vllm::StageMiniMaxH3EncoderWeights(eq, enc);
+        std::cerr << "  encoding prompt...\n";
+        encoded_prompt =
+            vllm::MiniMaxH3EncoderTextForwardDevice(eq, ec, staged, embeds, pos.data(), seq);
+        std::cerr << "  conditioning = [" << seq << ", " << ec.hidden_size << "]\n";
+      }
     }
 
     // --- 2. VAEs + their configs (the configs carry the latent statistics) ---
@@ -216,7 +248,9 @@ int main(int argc, char** argv) {
     request.audio_latents_mean = audio_stats.mean;
     request.audio_latents_std = audio_stats.std_dev;
 
-    const std::vector<float> prompt_embeds = ReadF32(embeds_path);
+    // Real conditioning when a prompt was encoded; otherwise the supplied file.
+    const std::vector<float> prompt_embeds =
+        !encoded_prompt.empty() ? encoded_prompt : ReadF32(embeds_path);
     if (dit.params.text_dim <= 0 || prompt_embeds.size() % static_cast<size_t>(dit.params.text_dim) != 0) {
       throw std::runtime_error("--prompt-embeds size is not a multiple of text_dim");
     }

@@ -717,6 +717,10 @@ struct MiniMaxH3EncoderQuantWeights {
   std::map<std::string, std::vector<uint8_t>> quant_storage;  // ggml block bytes
   std::map<std::string, std::vector<float>> storage;          // f32 norms/biases
   std::map<std::string, vt::Tensor> views;                    // what the forward binds
+  // The ggml type id each kept tensor was stored as. Needed because dequantizing a
+  // SINGLE embedding row goes through the ggml entry point, which is keyed by that
+  // id rather than by vt::DType.
+  std::map<std::string, uint32_t> ggml_type;
 
   const vt::Tensor& Get(const std::string& name) const;
   bool Has(const std::string& name) const { return views.count(name) != 0; }
@@ -726,6 +730,18 @@ struct MiniMaxH3EncoderQuantWeights {
 // 0 keeps every layer. The GGUF prefixes differ from the safetensors ones
 // (`model.layers.N.` here vs `model.language_model.layers.N.` there, and `visual.`
 // vs `model.visual.`), which is itself gated.
+// Gather embedding rows for `ids` from the (block-quant) `embed_tokens` table.
+//
+// The table is the single largest tensor in the encoder — [151936, 5120], ~1.5 GB
+// even quantized — and a prompt touches a few dozen rows. So this dequantizes ONLY
+// the requested rows rather than the table: ggml rows are independent block
+// sequences, so a row can be decoded from its own bytes alone.
+//
+// Returns [ids.size(), hidden_size] f32, which is what the encoder forward takes as
+// `inputs_embeds`.
+std::vector<float> MiniMaxH3EncoderEmbedTokens(const MiniMaxH3EncoderQuantWeights& weights,
+                                               const std::vector<int32_t>& ids);
+
 // The keep-quant encoder staged onto a device: the block bytes uploaded verbatim,
 // the f32 norms uploaded as-is. Staged ONCE — a prompt is encoded per request but
 // the tower does not change.

@@ -67,6 +67,7 @@ MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
     const size_t bytes = static_cast<size_t>(rows) * RowBytes(block, k);
     const uint8_t* src_bytes = static_cast<const uint8_t*>(info.data);
     out.quant_storage[dst].assign(src_bytes, src_bytes + bytes);
+    out.ggml_type[dst] = info.ggml_type;
     out.views[dst] = vt::Tensor::Contiguous(out.quant_storage[dst].data(), block, vt::Device{},
                                             {rows, k});
   };
@@ -128,6 +129,7 @@ MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
       const uint8_t* p = static_cast<const uint8_t*>(info.data);
       dstbuf.insert(dstbuf.end(), p, p + static_cast<size_t>(info.shape[0]) * row_bytes);
     }
+    out.ggml_type[dst] = file.Get(srcs.front()).ggml_type;
     out.views[dst] =
         vt::Tensor::Contiguous(dstbuf.data(), block, vt::Device{}, {total_rows, k});
     return true;
@@ -199,6 +201,45 @@ MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
     ++layers;
   }
   out.config.num_hidden_layers = layers;
+  return out;
+}
+
+
+std::vector<float> MiniMaxH3EncoderEmbedTokens(const MiniMaxH3EncoderQuantWeights& weights,
+                                               const std::vector<int32_t>& ids) {
+  const vt::Tensor& table = weights.Get("embed_tokens.weight");
+  const int64_t vocab = table.shape[0], hidden = table.shape[1];
+  std::vector<float> out(static_cast<size_t>(ids.size()) * static_cast<size_t>(hidden));
+
+  if (!vt::IsBlockQuant(table.dtype)) {
+    const float* src = table.Ptr<float>();
+    for (size_t i = 0; i < ids.size(); ++i) {
+      const int64_t id = ids[i];
+      VT_CHECK(id >= 0 && id < vocab, "minimax_h3 encoder: token id out of vocabulary range");
+      std::memcpy(out.data() + i * hidden, src + id * hidden,
+                  static_cast<size_t>(hidden) * sizeof(float));
+    }
+    return out;
+  }
+
+  // Block-quant: decode ONE ROW at a time from its own bytes. The table is ~1.5 GB
+  // and a prompt touches a few dozen rows, so decoding the whole thing to gather a
+  // handful would be the expensive way to get the same answer.
+  const auto type_it = weights.ggml_type.find("embed_tokens.weight");
+  VT_CHECK(type_it != weights.ggml_type.end(),
+           "minimax_h3 encoder: embed_tokens has no recorded ggml type");
+  const size_t row_bytes = vt::RowSizeBytes(table.dtype, hidden);
+  const uint8_t* base = static_cast<const uint8_t*>(table.data);
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const int64_t id = ids[i];
+    VT_CHECK(id >= 0 && id < vocab, "minimax_h3 encoder: token id out of vocabulary range");
+    const std::vector<float> row =
+        DequantGgufRowToF32(type_it->second, base + static_cast<size_t>(id) * row_bytes, hidden);
+    VT_CHECK(static_cast<int64_t>(row.size()) == hidden,
+             "minimax_h3 encoder: embedding row dequantized to the wrong width");
+    std::memcpy(out.data() + i * hidden, row.data(),
+                static_cast<size_t>(hidden) * sizeof(float));
+  }
   return out;
 }
 

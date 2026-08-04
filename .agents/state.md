@@ -35929,3 +35929,25 @@ Gate: 49/49 (14606 assertions).
 REMAINS for a prompt-steered video: tokenization + the embedding gather (the table is
 block-quant, so a gather dequantizes only the selected rows), then wiring prompt ->
 embeddings into the driver and the server.
+
+## 2026-08-04 - MiniMax-H3: tokenizer + embedding gather -> REAL text conditioning
+
+The last two pieces. `minimax-h3-gen --encoder <gguf> --prompt "..."` now goes
+prompt -> ids -> embeddings -> encoder -> conditioning, with no --video-prompt-embeds
+file anywhere in the path.
+
+TOKENIZER: the encoder GGUF carries its own vocab, so tok::Tokenizer::FromGguf(ef)
+needs no side-car tokenizer.json. One fewer file to keep in sync with the weights.
+
+EMBEDDING GATHER: the table is [151936, 5120] - ~1.5 GB even quantized - and a prompt
+touches a few dozen rows, so MiniMaxH3EncoderEmbedTokens decodes ONLY the requested
+rows. That is valid for the same reason the byte-level fusion was: ggml rows are
+INDEPENDENT block sequences, so a row decodes from its own bytes alone. Gated
+BIT-IDENTICAL against slicing a full-table dequant, with a repeated id and both vocab
+ends in the id list, and out-of-range ids required to THROW rather than read past the
+table.
+
+That required recording each kept tensor's ggml TYPE ID alongside its vt::DType - the
+single-row dequant entry point is keyed by the ggml id, not by the vt dtype.
+
+Gate: 50/50 (15254 assertions).

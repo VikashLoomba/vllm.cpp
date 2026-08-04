@@ -935,7 +935,6 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant 
 // ineligible (K=2688 is not a whole number of 256-element Q3_K blocks) and they
 // dequantize to ~52 GB of f32. Straight to bf16 the whole DiT is ~33 GB.
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file);
-
 // Bind the forward's views onto a MiniMaxH3GgufDit's owned buffers. Shared by the
 // GGUF and NVFP4 arms: both land on the SAME weight contract.
 void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out);
@@ -1010,6 +1009,19 @@ struct MiniMaxH3DitDeviceWeights {
 // This is exactly what the bf16 GOLDEN was generated with (the generator's
 // to_bf16_weights), so the bf16 device path now matches upstream's weight dtypes
 // as well as its activation cast points.
+// Stream the DiT from a GGUF STRAIGHT ONTO THE DEVICE as bf16, one tensor at a time.
+//
+// This exists because peak memory, not total, is what kills a run on a UNIFIED-memory
+// box: loading to host bf16 (~33 GB) and then staging to device (~33 GB more) holds
+// BOTH at once, and 66 GB of a 122 GiB pool alongside the VAEs and page cache wedged
+// the machine hard enough to stop answering ping. Dequantizing and uploading tensor
+// by tensor — freeing each host buffer before the next — keeps the peak at the device
+// copy plus ONE tensor.
+//
+// `params` is recovered from the manifest exactly as the loaders do.
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const GgufFile& file,
+                                                         MiniMaxH3DitParams* out_params);
+
 MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitParams& params,
                                                    const MiniMaxH3DitWeights& host,

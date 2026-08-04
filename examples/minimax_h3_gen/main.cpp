@@ -154,13 +154,28 @@ int main(int argc, char** argv) {
     // --- 1. DiT ---
     std::cerr << "loading DiT " << dit_path << (keep_quant ? " (keep-quant)" : "") << "\n";
     vllm::MiniMaxH3GgufDit dit;
+    vllm::MiniMaxH3DitDeviceWeights streamed;
+    bool have_streamed = false;
     if (EndsWith(dit_path, ".gguf")) {
       const vllm::GgufFile f = vllm::GgufFile::Open(dit_path);
       // --dequant-bf16 loads STRAIGHT to bf16 (~33 GB). Keeping blocks would leave
       // the AdaLN projections ineligible (K=2688 is not a whole number of 256-element
       // Q3_K blocks) and dequantize them to ~52 GB of f32 — which is what does not fit.
-      dit = dequant_bf16 ? vllm::LoadMiniMaxH3DitFromGgufBf16(f)
-                         : vllm::LoadMiniMaxH3DitFromGguf(f, keep_quant);
+      if (dequant_bf16 && device_name == "cuda") {
+        // STREAM straight onto the device: dequantize + upload one tensor at a time
+        // so the host copy never accumulates. Peak is what kills a unified-memory
+        // box, and load-then-stage holds ~33 GB twice.
+        vt::Queue sq = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue();
+        const auto t0 = std::chrono::steady_clock::now();
+        streamed = vllm::StreamMiniMaxH3DitToDeviceBf16(sq, f, &dit.params);
+        have_streamed = true;
+        std::cerr << "  streamed DiT -> device (bf16) in "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                  << " s\n";
+      } else {
+        dit = dequant_bf16 ? vllm::LoadMiniMaxH3DitFromGgufBf16(f)
+                           : vllm::LoadMiniMaxH3DitFromGguf(f, keep_quant);
+      }
     } else {
       const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(dit_path);
       dit = vllm::LoadMiniMaxH3DitFromNvfp4(f);
@@ -321,7 +336,9 @@ int main(int argc, char** argv) {
     // render a multi-day job.
     vllm::MiniMaxH3DitDeviceWeights staged;
     const vllm::MiniMaxH3DitDeviceWeights* prestaged = nullptr;
-    if (device.type != vt::DeviceType::kCPU) {
+    if (have_streamed) {
+      prestaged = &streamed;
+    } else if (device.type != vt::DeviceType::kCPU) {
       vt::Queue sq = vt::GetBackend(device.type).CreateQueue();
       const auto t0 = std::chrono::steady_clock::now();
       staged = vllm::StageMiniMaxH3DitWeights(sq, dit.params, dit.weights, vt::DType::kBF16);

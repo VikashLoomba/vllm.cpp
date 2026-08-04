@@ -33,11 +33,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/model_executor/models/minimax_h3_device.h"
 #include "vt/backend.h"
@@ -745,6 +747,97 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
     }
   }
   return out;
+}
+
+
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const GgufFile& file,
+                                                         MiniMaxH3DitParams* out_params) {
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3GgufTensors(file);
+  const MiniMaxH3DitParams params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+  if (out_params != nullptr) *out_params = params;
+
+  // Opt the mapping into page release: without this the DropSpanResidency calls
+  // below are no-ops and the read-once file pages accumulate against the same
+  // unified pool the weights live in.
+  file.ReleaseExpandedPages(true);
+  MiniMaxH3DitDeviceWeights staged;
+  std::map<std::string, Tensor> views;
+  for (const MiniMaxH3TensorSpec& spec : manifest) {
+    const GgufTensorInfo& info = file.Get(spec.name);
+    int64_t numel = 1;
+    for (int64_t d : spec.shape) numel *= d;
+    VT_CHECK(numel > 0, "minimax_h3 stream: tensor has an empty logical shape");
+    // Dequantize ONE tensor, upload it, and let the host buffer die before the next.
+    // That is the whole point: peak stays at the device copy plus one tensor.
+    {
+      const std::vector<uint16_t> bf16 =
+          DequantGgufRowToBf16(info.ggml_type, static_cast<const uint8_t*>(info.data), numel);
+      VT_CHECK(static_cast<int64_t>(bf16.size()) == numel,
+               "minimax_h3 stream: dequant produced the wrong element count");
+      const size_t bytes = bf16.size() * sizeof(uint16_t);
+      void* p = backend.Alloc(bytes);
+      std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
+      backend.Copy(queue, p, bf16.data(), bytes);
+      backend.Synchronize(queue);  // the host buffer is about to go out of scope
+      views[spec.name] = dense_attn::MakeTensor(p, DType::kBF16, queue.device, spec.shape);
+      staged.storage.push_back(std::move(owner));
+    }
+    // Drop the file pages we will never read again — on a unified-memory box the
+    // page cache competes with the model for the same pool.
+    file.DropSpanResidency(static_cast<const uint8_t*>(info.data), info.nbytes);
+  }
+
+  // Bind the forward's views over the DEVICE tensors, by the same names the
+  // checkpoint uses, so a missing tensor still throws BY NAME.
+  auto view = [&](const std::string& name) -> Tensor {
+    const auto it = views.find(name);
+    VT_CHECK(it != views.end(), "minimax_h3 stream: checkpoint is missing a required tensor");
+    return it->second;
+  };
+  MiniMaxH3DitWeights& w = staged.weights;
+  w.video_patch_proj_w = view("video_patch_proj.weight");
+  w.video_patch_proj_b = view("video_patch_proj.bias");
+  w.audio_patch_proj_w = view("audio_patch_proj.weight");
+  w.audio_patch_proj_b = view("audio_patch_proj.bias");
+  w.condition_proj_w = view("condition_proj.weight");
+  w.condition_proj_b = view("condition_proj.bias");
+  w.time_proj_in_w = view("time_embedder.proj_in.weight");
+  w.time_proj_in_b = view("time_embedder.proj_in.bias");
+  w.time_proj_out_w = view("time_embedder.proj_out.weight");
+  w.time_proj_out_b = view("time_embedder.proj_out.bias");
+  w.rope_inv_freq = view("rope.inv_freq");
+  auto block = [&](const std::string& prefix, bool adaln) {
+    MiniMaxH3DitBlockWeights b;
+    b.norm1 = view(prefix + ".norm1.weight");
+    b.norm2 = view(prefix + ".norm2.weight");
+    b.qkv_proj = view(prefix + ".attn.qkv_proj.weight");
+    b.q_norm = view(prefix + ".attn.q_norm.weight");
+    b.k_norm = view(prefix + ".attn.k_norm.weight");
+    b.out_proj = view(prefix + ".attn.out_proj.weight");
+    b.fc1 = view(prefix + ".mlp.fc1.weight");
+    b.fc2 = view(prefix + ".mlp.fc2.weight");
+    if (adaln) {
+      b.adaln_w = view(prefix + ".adaln_proj.linear.weight");
+      b.adaln_b = view(prefix + ".adaln_proj.linear.bias");
+    }
+    return b;
+  };
+  for (int64_t i = 0; i < params.token_refiner_num_layers; ++i) {
+    w.refiner.push_back(block("token_refiner.blocks." + std::to_string(i), false));
+  }
+  w.refiner_final_norm = view("token_refiner.final_norm.weight");
+  for (int64_t i = 0; i < params.num_layers; ++i) {
+    w.blocks.push_back(block("blocks." + std::to_string(i), true));
+  }
+  w.final_norm = view("final_layer.norm.weight");
+  w.final_adaln_w = view("final_layer.adaln_proj.linear.weight");
+  w.final_adaln_b = view("final_layer.adaln_proj.linear.bias");
+  w.video_out_w = view("final_layer.video_out.weight");
+  w.video_out_b = view("final_layer.video_out.bias");
+  w.audio_out_w = view("final_layer.audio_out.weight");
+  w.audio_out_b = view("final_layer.audio_out.bias");
+  return staged;
 }
 
 }  // namespace vllm

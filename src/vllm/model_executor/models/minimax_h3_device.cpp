@@ -770,6 +770,16 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
   const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
   MiniMaxH3DitDeviceWeights staged;
   std::map<std::string, Tensor> views;
+  // Upstream's fp32 ISLANDS (MINIMAX_H3_FP32_PARAM_NAMES / _BUFFER_NAMES): both patch
+  // projections, both time-embedder projections and both output heads stay f32 even
+  // in a bf16 stream. Their ACTIVATIONS are f32 too, and vt::MatmulBT rejects a
+  // mixed (f32 act, bf16 weight) pair — so getting this split wrong is not a
+  // precision nuance, it fails loudly at the first island GEMM.
+  auto is_fp32_island = [](const std::string& n) {
+    return n.rfind("video_patch_proj.", 0) == 0 || n.rfind("audio_patch_proj.", 0) == 0 ||
+           n.rfind("time_embedder.", 0) == 0 || n.rfind("final_layer.video_out.", 0) == 0 ||
+           n.rfind("final_layer.audio_out.", 0) == 0 || n == "rope.inv_freq";
+  };
   int64_t done = 0;
   for (const MiniMaxH3TensorSpec& spec : manifest) {
     const GgufTensorInfo& info = file.Get(spec.name);
@@ -779,16 +789,30 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
     // Dequantize ONE tensor, upload it, and let the host buffer die before the next.
     // That is the whole point: peak stays at the device copy plus one tensor.
     {
-      const std::vector<uint16_t> bf16 =
-          DequantGgufRowToBf16(info.ggml_type, static_cast<const uint8_t*>(info.data), numel);
-      VT_CHECK(static_cast<int64_t>(bf16.size()) == numel,
-               "minimax_h3 stream: dequant produced the wrong element count");
-      const size_t bytes = bf16.size() * sizeof(uint16_t);
+      const bool island = is_fp32_island(spec.name);
+      const DType want = island ? DType::kF32 : DType::kBF16;
+      std::vector<float> f32;
+      std::vector<uint16_t> bf16;
+      const void* src = nullptr;
+      size_t bytes = 0;
+      if (island) {
+        f32 = DequantGgufRowToF32(info.ggml_type, static_cast<const uint8_t*>(info.data), numel);
+        VT_CHECK(static_cast<int64_t>(f32.size()) == numel,
+                 "minimax_h3 stream: island dequant produced the wrong element count");
+        src = f32.data();
+        bytes = f32.size() * sizeof(float);
+      } else {
+        bf16 = DequantGgufRowToBf16(info.ggml_type, static_cast<const uint8_t*>(info.data), numel);
+        VT_CHECK(static_cast<int64_t>(bf16.size()) == numel,
+                 "minimax_h3 stream: dequant produced the wrong element count");
+        src = bf16.data();
+        bytes = bf16.size() * sizeof(uint16_t);
+      }
       void* p = backend.Alloc(bytes);
       std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
-      backend.Copy(queue, p, bf16.data(), bytes);
+      backend.Copy(queue, p, src, bytes);
       backend.Synchronize(queue);  // the host buffer is about to go out of scope
-      views[spec.name] = dense_attn::MakeTensor(p, DType::kBF16, queue.device, spec.shape);
+      views[spec.name] = dense_attn::MakeTensor(p, want, queue.device, spec.shape);
       staged.storage.push_back(std::move(owner));
     }
     // Drop the file pages we will never read again — on a unified-memory box the

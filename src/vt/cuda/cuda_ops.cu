@@ -1476,6 +1476,37 @@ void LaunchAttention(cudaStream_t s, Tensor& out, const Tensor& query, const Ten
   const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
   const int64_t hk = key.shape[1];
   if (t == 0 || hq == 0 || d == 0) return;
+  // Warp-per-query fast path when head_dim is a whole number of warp widths (128 and
+  // 64 cover every head this port uses). Same math, vastly fewer barriers.
+  if (d % 32 == 0 && d / 32 <= 4) {
+    constexpr int kWarpsPerBlock = 4;
+    const dim3 wgrid(static_cast<unsigned>((t + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                     static_cast<unsigned>(hq));
+    const unsigned wblock = kWarpsPerBlock * 32;
+#define VT_DFLASH_WARP(PER_LANE)                                                            \
+  do {                                                                                      \
+    if (out.dtype == DType::kF32) {                                                          \
+      DFlashBlockAttentionWarpKernel<Tin, float, PER_LANE><<<wgrid, wblock, 0, s>>>(          \
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,        \
+          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);           \
+    } else {                                                                                 \
+      DFlashBlockAttentionWarpKernel<Tin, __nv_bfloat16, PER_LANE><<<wgrid, wblock, 0, s>>>(  \
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, \
+          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);           \
+    }                                                                                        \
+  } while (0)
+    switch (d / 32) {
+      case 1: VT_DFLASH_WARP(1); break;
+      case 2: VT_DFLASH_WARP(2); break;
+      case 3: VT_DFLASH_WARP(3); break;
+      default: VT_DFLASH_WARP(4); break;
+    }
+#undef VT_DFLASH_WARP
+    Check(cudaGetLastError(), "dflash-block-attn warp launch");
+    Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
+    return;
+  }
+
   const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
   const size_t shmem = (static_cast<size_t>(d) + kBlock) * sizeof(float);
   switch (out.dtype) {
@@ -1581,6 +1612,90 @@ __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Ti
 
   const float inv = 1.0f / s_l;
   for (int64_t e = threadIdx.x; e < d; e += blockDim.x) Store(out, qoff + e, acc[e] * inv);
+}
+
+// WARP-PER-QUERY fast path for the common head_dim (a multiple of the warp width).
+//
+// The general kernel above spends one block per query row and walks keys ONE AT A
+// TIME, doing a shared-memory tree reduction plus ~11 __syncthreads() PER KEY. At
+// seq 3264 that is ~36k barriers per query row, and Q is re-read from global for
+// every key — measured ~36 GFLOP/s, which made attention dominate everything at
+// realistic sequence lengths.
+//
+// Here ONE WARP owns a query row: Q and the output accumulator live in REGISTERS
+// (d/32 each per lane), the dot product is a warp shuffle reduction, and the online
+// softmax runs inside the warp. No __syncthreads at all, and Q is read once.
+//
+// The arithmetic is deliberately IDENTICAL to the general kernel — same sequential
+// key order, same online-softmax recurrence (m/corr/p/l), same f32 accumulation — so
+// this is a scheduling change, not a numerics change.
+template <typename Tin, typename Tout, int kPerLane>
+__global__ void DFlashBlockAttentionWarpKernel(Tout* out, const Tin* query, const Tin* key,
+                                              const Tin* value, const int32_t* cu, int num_reqs,
+                                              int64_t hq, int64_t hk, int64_t d, float scale,
+                                              bool causal, int64_t window) {
+  const int lane = threadIdx.x & 31;
+  const int64_t warp_id =
+      (static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5)) + (threadIdx.x >> 5);
+  const int64_t total = gridDim.y;  // unused; kept for symmetry with the grid below
+  (void)total;
+  const int64_t i = warp_id;        // GLOBAL query row
+  const int64_t h = blockIdx.y;     // q-head
+  const int64_t rows = cu[num_reqs];
+  if (i >= rows) return;
+  const int64_t g = h / (hq / hk);
+
+  int64_t qs = 0, qe = 0;
+  for (int r = 0; r < num_reqs; ++r) {
+    if (i >= cu[r] && i < cu[r + 1]) {
+      qs = cu[r];
+      qe = cu[r + 1];
+      break;
+    }
+  }
+  const int64_t ii = i - qs;
+  const int64_t jhi = causal ? ii : (qe - qs - 1);
+  int64_t jlo = 0;
+  if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+  const int64_t qoff = (i * hq + h) * d;
+
+  // Q and the accumulator in registers: lane L holds elements L, L+32, L+64, ...
+  float qreg[kPerLane], acc[kPerLane];
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) {
+    qreg[c] = Load(query, qoff + static_cast<int64_t>(c) * 32 + lane);
+    acc[c] = 0.0f;
+  }
+  float m = -CUDART_INF_F, l = 0.0f;
+
+  for (int64_t jj = jlo; jj <= jhi; ++jj) {
+    const int64_t koff = ((qs + jj) * hk + g) * d;
+    float part = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      part += qreg[c] * Load(key, koff + static_cast<int64_t>(c) * 32 + lane);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xFFFFFFFFu, part, off);
+    float s = __shfl_sync(0xFFFFFFFFu, part, 0) * scale;
+
+    const float m_new = fmaxf(m, s);
+    const float corr = expf(m - m_new);
+    const float pw = expf(s - m_new);
+    const int64_t voff = ((qs + jj) * hk + g) * d;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      acc[c] = acc[c] * corr + pw * Load(value, voff + static_cast<int64_t>(c) * 32 + lane);
+    }
+    l = l * corr + pw;
+    m = m_new;
+  }
+
+  const float inv = 1.0f / l;
+#pragma unroll
+  for (int c = 0; c < kPerLane; ++c) {
+    Store(out, qoff + static_cast<int64_t>(c) * 32 + lane, acc[c] * inv);
+  }
 }
 
 template <typename Tin>

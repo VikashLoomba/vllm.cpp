@@ -111,6 +111,7 @@ int main(int argc, char** argv) {
   std::string dit_path, video_vae_path, video_cfg_path, audio_vae_path, audio_cfg_path;
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
   bool keep_quant = false, dry_run = false, dequant_bf16 = false, denoise_only = false;
+  bool dump_params = false;
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   int64_t encoder_max_layers = 0;
@@ -132,6 +133,7 @@ int main(int argc, char** argv) {
       else if (f == "--dequant-bf16") dequant_bf16 = true;
       else if (f == "--dry-run") dry_run = true;
       else if (f == "--denoise-only") denoise_only = true;
+      else if (f == "--dump-params") dump_params = true;
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
@@ -157,6 +159,56 @@ int main(int argc, char** argv) {
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
                    "[--dry-run] [--denoise-only]\n";
       return 2;
+    }
+
+    // --dump-params reads the MANIFEST ONLY -- names and shapes, no payload -- and
+    // prints the geometry those shapes imply. That makes it safe on a checkpoint
+    // whose weights do not fit (the NVFP4 reference loader is ~132 GB of host f32),
+    // and it is the right tool for asking "do two checkpoints agree on geometry?"
+    // without running either.
+    if (dump_params) {
+      vllm::MiniMaxH3DitParams pr;
+      if (EndsWith(dit_path, ".gguf")) {
+        const vllm::GgufFile gf = vllm::GgufFile::Open(dit_path);
+        pr = vllm::ParseMiniMaxH3DitParamsFromGgufManifest(vllm::EnumerateMiniMaxH3GgufTensors(gf));
+      } else {
+        const vllm::SafetensorsFile sf = vllm::SafetensorsFile::Open(dit_path);
+        std::vector<vllm::MiniMaxH3TensorSpec> manifest;
+        for (const std::string& name : sf.Names()) {
+          if ((name.size() > 12 && name.compare(name.size() - 12, 12, "weight_scale") == 0) ||
+              (name.size() > 14 && name.compare(name.size() - 14, 14, "weight_scale_2") == 0)) {
+            continue;
+          }
+          const vllm::StTensor& st = sf.Get(name);
+          vllm::MiniMaxH3TensorSpec spec;
+          spec.name = name;
+          spec.shape = st.shape;
+          if (st.dtype == "U8") spec.shape = {st.shape[0], st.shape[1] * 2};
+          manifest.push_back(std::move(spec));
+        }
+        pr = vllm::ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+      }
+      std::cout << "num_layers=" << pr.num_layers
+                << "\ntoken_refiner_num_layers=" << pr.token_refiner_num_layers
+                << "\nhidden_size=" << pr.hidden_size
+                << "\nnum_attention_heads=" << pr.num_attention_heads
+                << "\nattention_head_dim=" << pr.attention_head_dim
+                << "\nffn_hidden_size=" << pr.ffn_hidden_size
+                << "\nlatents_dim=" << pr.latents_dim
+                << "\naudio_latents_dim=" << pr.audio_latents_dim
+                << "\npatch_size_t=" << pr.patch_size_t
+                << "\npatch_size_h=" << pr.patch_size_h
+                << "\npatch_size_w=" << pr.patch_size_w
+                << "\ntext_dim=" << pr.text_dim
+                << "\ntimestep_input_dim=" << pr.timestep_input_dim
+                << "\ntime_embed_hidden_size=" << pr.time_embed_hidden_size
+                << "\ntime_embed_dim=" << pr.time_embed_dim
+                << "\nadaln_out_features=" << pr.adaln_out_features
+                << "\nfinal_adaln_out_features=" << pr.final_adaln_out_features
+                << "\nrope_inv_freq_len=" << pr.rope_inv_freq_len
+                << "\nvideo_row_width=" << pr.video_row_width()
+                << "\nrope_rot_dim=" << pr.rope_rot_dim() << "\n";
+      return 0;
     }
 
     // --- 1. DiT ---

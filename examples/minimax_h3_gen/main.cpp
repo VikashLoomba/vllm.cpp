@@ -156,7 +156,11 @@ int main(int argc, char** argv) {
     vllm::MiniMaxH3GgufDit dit;
     if (EndsWith(dit_path, ".gguf")) {
       const vllm::GgufFile f = vllm::GgufFile::Open(dit_path);
-      dit = vllm::LoadMiniMaxH3DitFromGguf(f, keep_quant);
+      // --dequant-bf16 loads STRAIGHT to bf16 (~33 GB). Keeping blocks would leave
+      // the AdaLN projections ineligible (K=2688 is not a whole number of 256-element
+      // Q3_K blocks) and dequantize them to ~52 GB of f32 — which is what does not fit.
+      dit = dequant_bf16 ? vllm::LoadMiniMaxH3DitFromGgufBf16(f)
+                         : vllm::LoadMiniMaxH3DitFromGguf(f, keep_quant);
     } else {
       const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(dit_path);
       dit = vllm::LoadMiniMaxH3DitFromNvfp4(f);
@@ -320,9 +324,7 @@ int main(int argc, char** argv) {
     if (device.type != vt::DeviceType::kCPU) {
       vt::Queue sq = vt::GetBackend(device.type).CreateQueue();
       const auto t0 = std::chrono::steady_clock::now();
-      staged = dequant_bf16
-                   ? vllm::StageMiniMaxH3DitWeightsDequantBf16(sq, dit.params, dit)
-                   : vllm::StageMiniMaxH3DitWeights(sq, dit.params, dit.weights, vt::DType::kBF16);
+      staged = vllm::StageMiniMaxH3DitWeights(sq, dit.params, dit.weights, vt::DType::kBF16);
       std::cerr << "  staged DiT (" << (dequant_bf16 ? "dequant-bf16" : "keep-quant") << ") in "
                 << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
                 << " s\n";

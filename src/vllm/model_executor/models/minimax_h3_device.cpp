@@ -254,7 +254,17 @@ MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
       return;
     }
 
-    VT_CHECK(src.dtype == DType::kF32, "minimax_h3 stage: host weights must be f32 or block-quant");
+    // Already bf16 (the throughput loader): upload verbatim, no conversion.
+    if (src.dtype == DType::kBF16) {
+      const size_t bytes = static_cast<size_t>(n) * vt::SizeOf(DType::kBF16);
+      void* p = backend.Alloc(bytes);
+      std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
+      backend.Copy(queue, p, src.data, bytes);
+      dst = dense_attn::MakeTensor(p, DType::kBF16, queue.device, shape);
+      staged.storage.push_back(std::move(owner));
+      return;
+    }
+    VT_CHECK(src.dtype == DType::kF32, "minimax_h3 stage: host weights must be f32, bf16 or block-quant");
     const DType want = (bf16 && as_bf16) ? DType::kBF16 : DType::kF32;
     const size_t bytes = static_cast<size_t>(n) * vt::SizeOf(want);
     void* p = backend.Alloc(bytes);

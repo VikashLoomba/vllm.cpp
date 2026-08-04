@@ -900,6 +900,9 @@ struct MiniMaxH3GgufDit {
   std::map<std::string, std::vector<uint8_t>> quant_storage;
   std::map<std::string, vt::DType> quant_dtype;
   std::map<std::string, uint32_t> quant_ggml_type;  // for a later dequant
+  // bf16 bit patterns, when the DiT is loaded for a bf16 GEMM (see the loader's
+  // `bf16` flag). Mutually exclusive with `storage` per tensor.
+  std::map<std::string, std::vector<uint16_t>> bf16_storage;
   std::map<std::string, std::vector<int64_t>> shapes;
   MiniMaxH3DitWeights weights;
 };
@@ -920,6 +923,18 @@ struct MiniMaxH3GgufDit {
 // tensor cores: the block-quant GEMM carries no arch gate (cuda_quant_dot.cu has
 // no #if at all), unlike every cutlass/marlin/fp4 path.
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant = false);
+
+// Load the DiT dequantized straight to BF16 — never materializing f32.
+//
+// This is the THROUGHPUT configuration, and it is what ComfyUI-GGUF effectively does
+// (it dequantizes to bf16 and calls F.linear rather than computing in-quant). Our
+// in-quant GEMM measured ~103 GFLOP/s because it re-streams the whole weight set per
+// SEQUENCE ROW; a bf16 weight goes through the tuned cuBLASLt MatmulBT instead.
+//
+// It is also the only way this fits: keeping blocks leaves the AdaLN projections
+// ineligible (K=2688 is not a whole number of 256-element Q3_K blocks) and they
+// dequantize to ~52 GB of f32. Straight to bf16 the whole DiT is ~33 GB.
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file);
 
 // Bind the forward's views onto a MiniMaxH3GgufDit's owned buffers. Shared by the
 // GGUF and NVFP4 arms: both land on the SAME weight contract.

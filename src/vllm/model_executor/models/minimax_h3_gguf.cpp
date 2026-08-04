@@ -192,8 +192,10 @@ void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out) {
   const MiniMaxH3DitParams& p = out->params;
   auto view = [out](const std::string& name) -> vt::Tensor {
     const auto quant = out->quant_storage.find(name);
+    const auto bf16 = out->bf16_storage.find(name);
     const auto it = out->storage.find(name);
-    VT_CHECK(quant != out->quant_storage.end() || it != out->storage.end(),
+    VT_CHECK(quant != out->quant_storage.end() || bf16 != out->bf16_storage.end() ||
+                 it != out->storage.end(),
              "minimax_h3 gguf: checkpoint is missing a required tensor");
     const std::vector<int64_t>& shape = out->shapes.at(name);
     vt::Tensor t;
@@ -202,6 +204,9 @@ void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out) {
     if (quant != out->quant_storage.end()) {
       t.data = quant->second.data();
       t.dtype = out->quant_dtype.at(name);
+    } else if (bf16 != out->bf16_storage.end()) {
+      t.data = bf16->second.data();
+      t.dtype = vt::DType::kBF16;
     } else {
       t.data = it->second.data();
       t.dtype = vt::DType::kF32;
@@ -298,6 +303,27 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant)
              "minimax_h3 gguf: dequant produced the wrong element count");
   }
 
+  BindMiniMaxH3DitViews(&out);
+  return out;
+}
+
+
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file) {
+  MiniMaxH3GgufDit out;
+  const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3GgufTensors(file);
+  out.params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+  for (const MiniMaxH3TensorSpec& spec : manifest) {
+    const GgufTensorInfo& info = file.Get(spec.name);
+    int64_t numel = 1;
+    for (int64_t d : spec.shape) numel *= d;
+    VT_CHECK(numel > 0, "minimax_h3 gguf bf16: tensor has an empty logical shape");
+    // Straight to bf16: going via f32 would double the peak for no benefit, and the
+    // f32 intermediate is exactly what does not fit.
+    out.bf16_storage[spec.name] = DequantGgufRowToBf16(info.ggml_type, info.data, numel);
+    VT_CHECK(static_cast<int64_t>(out.bf16_storage[spec.name].size()) == numel,
+             "minimax_h3 gguf bf16: dequant produced the wrong element count");
+    out.shapes[spec.name] = spec.shape;
+  }
   BindMiniMaxH3DitViews(&out);
   return out;
 }

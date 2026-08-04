@@ -85,6 +85,7 @@ Read-only observability; none change output.
 | `VT_OP_PROVIDER_DISABLE` | (none) | Comma-separated provider names to disable, forcing fallback (diagnostic) |
 | `VT_GDN_VALIDATE` | off | Run the GDN validation/cross-check path (slower; for kernel debugging) |
 | `VT_FP4_AUTOTUNE_VERBOSE` | off | Log the NVFP4 GEMM autotuner's tactic selection |
+| `VT_H3_PROGRESS` | unset | Trace the MiniMax-H3 denoise loop's phases to stderr: which forward path was taken (device vs the CPU reference), how long the ONE-TIME device weight staging took, and per-step forward seconds with the sequence length. A real-checkpoint run spends its minutes in exactly one of those phases, and this says which without guessing — it was added after GPU-utilization counters proved unreliable on Tegra-class boards |
 | `VT_POOL_BYPASS` | off | `=1` makes every device-scratch pool allocation an exact-size driver `Alloc` and every release a real `Free`, so `compute-sanitizer` can see tensor boundaries and use-after-free that the caching, size-class-rounding pool hides. DEBUGGING ONLY: it reinstates the per-op `cudaMalloc`/`cudaFree` device-sync storm the pool exists to remove, so it is never a timing configuration |
 
 ## Kernel-internal knobs (deferred)

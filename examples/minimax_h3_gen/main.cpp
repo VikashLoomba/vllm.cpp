@@ -109,6 +109,8 @@ int main(int argc, char** argv) {
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
   bool keep_quant = false, dry_run = false;
   std::string device_name = "cpu";
+  std::string encoder_path;
+  int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
 
   try {
@@ -126,6 +128,8 @@ int main(int argc, char** argv) {
       else if (f == "--keep-quant") keep_quant = true;
       else if (f == "--dry-run") dry_run = true;
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
+      else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
+      else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--frames") frames = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--height") height = std::stoll(Need(argc, argv, ++i, f));
@@ -154,6 +158,24 @@ int main(int argc, char** argv) {
     }
     std::cerr << "  layers=" << dit.params.num_layers << " hidden=" << dit.params.hidden_size
               << " heads=" << dit.params.num_attention_heads << "\n";
+
+    // --- 1b. optional encoder probe. Loading the 32B tower keep-quant is the
+    // precondition for real text conditioning; this reports the geometry it
+    // recovered so the loader can be validated against the REAL file. ---
+    if (!encoder_path.empty()) {
+      std::cerr << "loading encoder " << encoder_path << " (keep-quant)\n";
+      const vllm::GgufFile ef = vllm::GgufFile::Open(encoder_path);
+      const vllm::MiniMaxH3EncoderQuantWeights enc =
+          vllm::LoadMiniMaxH3EncoderFromGguf(ef, encoder_max_layers);
+      const vllm::MiniMaxH3EncoderConfig& ec = enc.config;
+      std::cerr << "  encoder layers=" << ec.num_hidden_layers << " hidden=" << ec.hidden_size
+                << " heads=" << ec.num_attention_heads << " kv_heads=" << ec.num_key_value_heads
+                << " head_dim=" << ec.head_dim << " ffn=" << ec.intermediate_size << "\n";
+      size_t quant_bytes = 0;
+      for (const auto& kv : enc.quant_storage) quant_bytes += kv.second.size();
+      std::cerr << "  encoder resident (keep-quant) = " << (quant_bytes / (1024.0 * 1024.0 * 1024.0))
+                << " GiB\n";
+    }
 
     // --- 2. VAEs + their configs (the configs carry the latent statistics) ---
     vllm::MiniMaxH3VideoVaeDecoderConfig video_cfg;

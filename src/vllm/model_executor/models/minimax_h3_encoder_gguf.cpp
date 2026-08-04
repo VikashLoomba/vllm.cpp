@@ -93,7 +93,14 @@ MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
 
   // Fuse a group of same-K quantized projections by concatenating whole ROWS of
   // ggml bytes. Sound because rows are independent block sequences.
-  auto fuse = [&](const std::vector<std::string>& srcs, const std::string& dst) {
+  //
+  // Returns FALSE when the group mixes ggml encodings, in which case nothing is
+  // written and the caller keeps the members separate. That is not hypothetical:
+  // the shipped Q4_K_M encoder stores v_proj as Q6_K while q_proj/k_proj are Q4_K
+  // (the usual K_M recipe of keeping V at higher precision), so the attention group
+  // CANNOT be byte-concatenated. Dequantizing to force a fusion would throw away
+  // exactly the precision the recipe was chosen to keep.
+  auto fuse = [&](const std::vector<std::string>& srcs, const std::string& dst) -> bool {
     vt::DType block = vt::DType::kF32;
     int64_t total_rows = 0, k = -1;
     for (const std::string& s : srcs) {
@@ -107,7 +114,7 @@ MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
         block = b;
       }
       VT_CHECK(info.shape[1] == k, "minimax_h3 encoder gguf: fused group disagrees on K");
-      VT_CHECK(b == block, "minimax_h3 encoder gguf: fused group mixes quant encodings");
+      if (b != block) return false;  // mixed encodings: keep the members separate
       total_rows += info.shape[0];
     }
     VT_CHECK(k % vt::BlockElems(block) == 0,
@@ -123,6 +130,16 @@ MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
     }
     out.views[dst] =
         vt::Tensor::Contiguous(dstbuf.data(), block, vt::Device{}, {total_rows, k});
+    return true;
+  };
+
+  // Fuse if the group is uniform; otherwise bind each member under its own name.
+  // The forward takes whichever is present, so a mixed-precision checkpoint costs
+  // extra GEMM launches rather than precision.
+  auto fuse_or_keep = [&](const std::vector<std::string>& srcs,
+                          const std::vector<std::string>& dsts, const std::string& fused) {
+    if (fuse(srcs, fused)) return;
+    for (size_t i = 0; i < srcs.size(); ++i) keep(srcs[i], dsts[i]);
   };
 
   for (int64_t layer = 0;; ++layer) {
@@ -137,13 +154,17 @@ MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
     plain(src + "self_attn.k_norm.weight", dst + "self_attn.k_norm.weight");
     keep(src + "self_attn.o_proj.weight", dst + "self_attn.o_proj.weight");
     keep(src + "mlp.down_proj.weight", dst + "mlp.down_proj.weight");
-    fuse({src + "self_attn.q_proj.weight", src + "self_attn.k_proj.weight",
-          src + "self_attn.v_proj.weight"},
-         dst + "self_attn.qkv_proj.weight");
-    fuse({src + "mlp.gate_proj.weight", src + "mlp.up_proj.weight"},
-         dst + "mlp.gate_up_proj.weight");
+    fuse_or_keep({src + "self_attn.q_proj.weight", src + "self_attn.k_proj.weight",
+                  src + "self_attn.v_proj.weight"},
+                 {dst + "self_attn.q_proj.weight", dst + "self_attn.k_proj.weight",
+                  dst + "self_attn.v_proj.weight"},
+                 dst + "self_attn.qkv_proj.weight");
+    fuse_or_keep({src + "mlp.gate_proj.weight", src + "mlp.up_proj.weight"},
+                 {dst + "mlp.gate_proj.weight", dst + "mlp.up_proj.weight"},
+                 dst + "mlp.gate_up_proj.weight");
   }
-  VT_CHECK(out.views.count("layers.0.self_attn.qkv_proj.weight") != 0,
+  VT_CHECK(out.views.count("layers.0.self_attn.qkv_proj.weight") != 0 ||
+               out.views.count("layers.0.self_attn.q_proj.weight") != 0,
            "minimax_h3 encoder gguf: no text-tower layers were loaded");
 
   // The embedding table stays QUANTIZED too — at [151936, 5120] it is the single
@@ -155,16 +176,24 @@ MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
 
   // Recover the geometry from the fused shapes. qkv rows are q + 2*kv, and the
   // per-head dim comes from q_norm, which is [head_dim].
-  const vt::Tensor& qkv = out.Get("layers.0.self_attn.qkv_proj.weight");
   const vt::Tensor& qn = out.Get("layers.0.self_attn.q_norm.weight");
-  const vt::Tensor& gate_up = out.Get("layers.0.mlp.gate_up_proj.weight");
-  out.config.hidden_size = qkv.shape[1];
   out.config.head_dim = qn.shape[0];
   const int64_t o_rows = out.Get("layers.0.self_attn.o_proj.weight").shape[1];
   out.config.num_attention_heads = o_rows / out.config.head_dim;
-  out.config.num_key_value_heads =
-      (qkv.shape[0] - o_rows) / (2 * out.config.head_dim);
-  out.config.intermediate_size = gate_up.shape[0] / 2;
+  if (out.views.count("layers.0.self_attn.qkv_proj.weight") != 0) {
+    const vt::Tensor& qkv = out.Get("layers.0.self_attn.qkv_proj.weight");
+    out.config.hidden_size = qkv.shape[1];
+    out.config.num_key_value_heads = (qkv.shape[0] - o_rows) / (2 * out.config.head_dim);
+  } else {
+    const vt::Tensor& q = out.Get("layers.0.self_attn.q_proj.weight");
+    out.config.hidden_size = q.shape[1];
+    out.config.num_key_value_heads =
+        out.Get("layers.0.self_attn.k_proj.weight").shape[0] / out.config.head_dim;
+  }
+  out.config.intermediate_size =
+      out.views.count("layers.0.mlp.gate_up_proj.weight") != 0
+          ? out.Get("layers.0.mlp.gate_up_proj.weight").shape[0] / 2
+          : out.Get("layers.0.mlp.gate_proj.weight").shape[0];
   int64_t layers = 0;
   while (out.views.count("layers." + std::to_string(layers) + ".input_layernorm.weight") != 0) {
     ++layers;

@@ -3738,6 +3738,83 @@ TEST_CASE("minimax_h3: the encoder GGUF loads KEEP-QUANT and fuses on QUANTIZED 
   CHECK(w.config.intermediate_size == FF);
   CHECK(w.config.num_hidden_layers == 2);
 
+  // MIXED ENCODINGS. The SHIPPED Q4_K_M encoder stores v_proj as Q6_K while
+  // q_proj/k_proj are Q4_K (the usual K_M recipe of keeping V at higher precision),
+  // so that group CANNOT be byte-concatenated. The loader must keep the members
+  // SEPARATE rather than dequantize to force a fusion — which would throw away
+  // exactly the precision the recipe exists to keep.
+  {
+    gguf_test::GgufModelBuilder mixed;
+    mixed.AddKv(gguf_test::StrKv("general.architecture", "qwen3vl"));
+    // Only Q8_0 has a CPU quantizer, so the second encoding is written as
+    // correctly-SIZED arbitrary bytes. That is enough and it is honest: this test
+    // exercises the loader's ROUTING decision (mixed encodings => keep separate),
+    // and the loader copies bytes without interpreting them. Nothing here
+    // dequantizes, so no real Q4_0 payload is needed.
+    auto add_typed = [&](const std::string& name, int64_t out_dim, int64_t in_dim,
+                         vt::DType dt, uint32_t ggml_type) {
+      const size_t row_bytes = vt::RowSizeBytes(dt, in_dim);
+      std::string bytes(static_cast<size_t>(out_dim) * row_bytes, '\0');
+      vt::cpu::FromFloatFn q = vt::cpu::BlockFromFloat(dt);
+      if (q != nullptr) {
+        const std::vector<float> values = MakeParam("encm." + name, out_dim * in_dim, 0.1);
+        for (int64_t r = 0; r < out_dim; ++r) {
+          q(values.data() + r * in_dim, bytes.data() + static_cast<size_t>(r) * row_bytes, in_dim);
+        }
+      } else {
+        for (size_t i = 0; i < bytes.size(); ++i) {
+          bytes[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+        }
+      }
+      mixed.AddTensor(name, {static_cast<uint64_t>(in_dim), static_cast<uint64_t>(out_dim)},
+                      ggml_type, bytes);
+    };
+    auto add_f32m = [&](const std::string& name, const std::vector<int64_t>& logical) {
+      int64_t n = 1;
+      for (int64_t d : logical) n *= d;
+      const std::vector<float> v = MakeParam("encm." + name, n, 0.1);
+      std::string bytes(reinterpret_cast<const char*>(v.data()), v.size() * sizeof(float));
+      std::vector<uint64_t> ne;
+      for (auto it = logical.rbegin(); it != logical.rend(); ++it) ne.push_back(uint64_t(*it));
+      mixed.AddTensor(name, ne, 0, bytes);
+    };
+    const std::string pm = "model.layers.0.";
+    add_f32m(pm + "input_layernorm.weight", {H});
+    add_f32m(pm + "post_attention_layernorm.weight", {H});
+    add_f32m(pm + "self_attn.q_norm.weight", {64});
+    add_f32m(pm + "self_attn.k_norm.weight", {64});
+    add_typed(pm + "self_attn.q_proj.weight", QD, H, vt::DType::kQ8_0, 8);
+    add_typed(pm + "self_attn.k_proj.weight", KVD, H, vt::DType::kQ8_0, 8);
+    add_typed(pm + "self_attn.v_proj.weight", KVD, H, vt::DType::kQ4_0, 2);  // the odd one
+    add_typed(pm + "self_attn.o_proj.weight", H, QD, vt::DType::kQ8_0, 8);
+    add_typed(pm + "mlp.gate_proj.weight", FF, H, vt::DType::kQ8_0, 8);
+    add_typed(pm + "mlp.up_proj.weight", FF, H, vt::DType::kQ8_0, 8);
+    add_typed(pm + "mlp.down_proj.weight", H, FF, vt::DType::kQ8_0, 8);
+
+    const std::string mpath = "/tmp/minimax_h3_enc_mixed.gguf";
+    const std::string mbytes = mixed.Build();
+    FILE* mf = std::fopen(mpath.c_str(), "wb");
+    REQUIRE(mf != nullptr);
+    CHECK(std::fwrite(mbytes.data(), 1, mbytes.size(), mf) == mbytes.size());
+    std::fclose(mf);
+
+    const vllm::GgufFile mg = vllm::GgufFile::Open(mpath);
+    const vllm::MiniMaxH3EncoderQuantWeights mw = vllm::LoadMiniMaxH3EncoderFromGguf(mg);
+    // qkv could NOT fuse: the members stay separate, each in its OWN encoding.
+    CHECK_FALSE(mw.Has("layers.0.self_attn.qkv_proj.weight"));
+    REQUIRE(mw.Has("layers.0.self_attn.q_proj.weight"));
+    REQUIRE(mw.Has("layers.0.self_attn.v_proj.weight"));
+    CHECK(mw.Get("layers.0.self_attn.q_proj.weight").dtype == vt::DType::kQ8_0);
+    CHECK(mw.Get("layers.0.self_attn.v_proj.weight").dtype == vt::DType::kQ4_0);
+    // gate/up ARE uniform, so they still fuse.
+    CHECK(mw.Has("layers.0.mlp.gate_up_proj.weight"));
+    // Geometry must still come out right from the UNFUSED shapes.
+    CHECK(mw.config.hidden_size == H);
+    CHECK(mw.config.num_attention_heads == QD / 64);
+    CHECK(mw.config.num_key_value_heads == KVD / 64);
+    CHECK(mw.config.intermediate_size == FF);
+  }
+
   // Truncation, which is how H3 keeps min(num_hidden_layers, 50).
   const vllm::MiniMaxH3EncoderQuantWeights t1 =
       vllm::LoadMiniMaxH3EncoderFromGguf(gguf, /*max_layers=*/1);

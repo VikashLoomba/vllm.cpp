@@ -657,6 +657,49 @@ std::vector<float> MiniMaxH3VideoVaeDecode(const MiniMaxH3VideoVaeDecoderConfig&
                                            int64_t latent_h, int64_t latent_w,
                                            MiniMaxH3VideoFrameShape* out_shape);
 
+// --- the DEVICE-RESIDENT video VAE decoder (minimax_h3_video_vae_device.cpp) ---
+//
+// Same graph as MiniMaxH3VideoVaeDecode, routed to the tuned shared ops with every
+// activation on the device. The portable one is a scalar reference; on a 36-layer
+// ViT3D it is what made a 256x256 decode time out.
+//
+// Staging performs two EXACT weight rearrangements (a per-head-interleaved to_qkv
+// row permutation, and a fold of each branch's learned per-channel scale into the
+// preceding projection) so the whole decoder needs NO new kernels. Held to the
+// decoder's tolerance gate rather than bit-equality with the reference: the shared
+// ops accumulate in f32 where the reference accumulates in double, and the scale
+// fold reassociates that branch's rounding.
+struct MiniMaxH3VideoVaeDeviceBlock {
+  vt::Tensor norm1, norm2;
+  vt::Tensor qkv_weight, qkv_bias;  // rows reordered to [q_all | k_all | v_all]
+  vt::Tensor out_weight, out_bias;  // scale1 folded in
+  vt::Tensor w1_weight, w1_bias;
+  vt::Tensor w2_weight, w2_bias;  // scale2 folded in
+};
+
+struct MiniMaxH3VideoVaeDeviceWeights {
+  std::vector<std::shared_ptr<void>> storage;  // owns the device allocations
+  std::vector<MiniMaxH3VideoVaeDeviceBlock> blocks;  // views into `storage`
+  vt::Tensor x_embedder_weight, x_embedder_bias;
+  vt::Tensor register_tokens;
+  vt::Tensor norm_out_weight, norm_out_bias;
+  bool has_norm_out_bias = false;
+  vt::Tensor proj_out_weight, proj_out_bias;
+  vt::Tensor qk_norm_ones;  // the qk RMSNorm is elementwise_affine=False
+};
+
+// Stage the decoder onto `queue`'s device. Every weight must be host-resident f32.
+MiniMaxH3VideoVaeDeviceWeights StageMiniMaxH3VideoVaeWeights(
+    vt::Queue& queue, const MiniMaxH3VideoVaeDecoderConfig& config,
+    const MiniMaxH3AudioVaeWeights& weights);
+
+std::vector<float> MiniMaxH3VideoVaeDecodeDevice(vt::Device device,
+                                                 const MiniMaxH3VideoVaeDecoderConfig& config,
+                                                 const MiniMaxH3VideoVaeDeviceWeights& staged,
+                                                 const std::vector<float>& latent, int64_t latent_t,
+                                                 int64_t latent_h, int64_t latent_w,
+                                                 MiniMaxH3VideoFrameShape* out_shape);
+
 // ---------------------------------------------------------------------------
 // H3-Encoder text tower (minimax_h3_encoder.cpp)
 //

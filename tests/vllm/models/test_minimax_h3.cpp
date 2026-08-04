@@ -2152,6 +2152,48 @@ TEST_CASE("minimax_h3: an NVFP4 checkpoint loads into a runnable DiT") {
   CHECK(loaded.storage.count("blocks.0.attn.qkv_proj.weight_scale") == 0);
   CHECK(loaded.storage.count("blocks.0.attn.qkv_proj.weight_scale_2") == 0);
 
+  // The STREAMING stager must recover the same model as the reference loader.
+  // It exists because the reference one materializes every weight as host f32 --
+  // ~132 GB for the real checkpoint, an OOM kill during load on a 122 GiB unified
+  // box -- so the streamed path is what a real run actually uses, and "it loads
+  // without OOM" is not the same claim as "it loads the right numbers".
+  {
+    vt::Queue q = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+    vllm::MiniMaxH3DitParams streamed_params;
+    const vllm::MiniMaxH3DitDeviceWeights streamed =
+        vllm::StreamMiniMaxH3Nvfp4ToDeviceBf16(q, st, &streamed_params);
+    CHECK(streamed_params.hidden_size == want.hidden_size);
+    CHECK(streamed_params.num_layers == loaded.params.num_layers);
+    REQUIRE(streamed.weights.blocks.size() == loaded.weights.blocks.size());
+
+    // A packed weight comes back at the same logical shape, and its VALUES match
+    // the reference to bf16 rounding -- the streamed path stores bf16 where the
+    // reference keeps f32, so the tolerance is the cast, not the algorithm.
+    const vt::Tensor& sq_ = streamed.weights.blocks[0].qkv_proj;
+    REQUIRE(sq_.rank == 2);
+    CHECK(sq_.shape[0] == 3 * inner);
+    CHECK(sq_.shape[1] == want.hidden_size);
+    CHECK(sq_.dtype == vt::DType::kBF16);
+    const std::vector<float>& ref = loaded.storage.at("blocks.0.attn.qkv_proj.weight");
+    const int64_t n = sq_.shape[0] * sq_.shape[1];
+    REQUIRE(static_cast<int64_t>(ref.size()) == n);
+    const uint16_t* got = static_cast<const uint16_t*>(sq_.data);
+    double worst = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+      const uint32_t widened = static_cast<uint32_t>(got[i]) << 16;
+      float v;
+      std::memcpy(&v, &widened, sizeof(v));
+      worst = std::max(worst, std::abs(static_cast<double>(v) - ref[static_cast<size_t>(i)]));
+    }
+    INFO("streamed NVFP4 vs reference loader, max|diff| = " << worst);
+    CHECK(worst <= 1e-2);  // bf16 has ~8 mantissa bits; values here are O(1)
+
+    // rope.inv_freq must stay HOST-resident: the forward reads it before any
+    // kernel runs, so a device pointer here segfaults rather than misbehaving.
+    CHECK(!streamed.rope_inv_freq_host.empty());
+    CHECK(streamed.weights.rope_inv_freq.data == streamed.rope_inv_freq_host.data());
+  }
+
   // And it must RUN.
   const MiniMaxH3PackedSequence packed = BuildMiniMaxH3PackedSequence(
       4, 2, 4, 4, 2, 2, /*include_keyframe_cond=*/false, {}, 0);

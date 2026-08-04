@@ -42,6 +42,8 @@
 #include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/model_executor/models/minimax_h3_device.h"
 #include "vt/backend.h"
@@ -752,6 +754,67 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
 }
 
 
+namespace {
+
+// Bind the forward's views over the DEVICE tensors, by the same names the
+// checkpoint uses, so a missing tensor still throws BY NAME.
+//
+// Shared by BOTH streaming stagers (GGUF and NVFP4). One copy deliberately: a
+// name-by-name binding this long would drift the moment a tensor is added to one
+// path only. `rope.inv_freq` is NOT bound here -- it is the one entry that must
+// stay HOST-resident, and each loader reads it from its own container.
+void BindStreamedDitViews(const std::map<std::string, Tensor>& views,
+                          const MiniMaxH3DitParams& params, MiniMaxH3DitWeights* out) {
+  auto view = [&](const std::string& name) -> Tensor {
+    const auto it = views.find(name);
+    VT_CHECK(it != views.end(), "minimax_h3 stream: checkpoint is missing a required tensor");
+    return it->second;
+  };
+  MiniMaxH3DitWeights& w = *out;
+  w.video_patch_proj_w = view("video_patch_proj.weight");
+  w.video_patch_proj_b = view("video_patch_proj.bias");
+  w.audio_patch_proj_w = view("audio_patch_proj.weight");
+  w.audio_patch_proj_b = view("audio_patch_proj.bias");
+  w.condition_proj_w = view("condition_proj.weight");
+  w.condition_proj_b = view("condition_proj.bias");
+  w.time_proj_in_w = view("time_embedder.proj_in.weight");
+  w.time_proj_in_b = view("time_embedder.proj_in.bias");
+  w.time_proj_out_w = view("time_embedder.proj_out.weight");
+  w.time_proj_out_b = view("time_embedder.proj_out.bias");
+  auto block = [&](const std::string& prefix, bool adaln) {
+    MiniMaxH3DitBlockWeights b;
+    b.norm1 = view(prefix + ".norm1.weight");
+    b.norm2 = view(prefix + ".norm2.weight");
+    b.qkv_proj = view(prefix + ".attn.qkv_proj.weight");
+    b.q_norm = view(prefix + ".attn.q_norm.weight");
+    b.k_norm = view(prefix + ".attn.k_norm.weight");
+    b.out_proj = view(prefix + ".attn.out_proj.weight");
+    b.fc1 = view(prefix + ".mlp.fc1.weight");
+    b.fc2 = view(prefix + ".mlp.fc2.weight");
+    if (adaln) {
+      b.adaln_w = view(prefix + ".adaln_proj.linear.weight");
+      b.adaln_b = view(prefix + ".adaln_proj.linear.bias");
+    }
+    return b;
+  };
+  for (int64_t i = 0; i < params.token_refiner_num_layers; ++i) {
+    w.refiner.push_back(block("token_refiner.blocks." + std::to_string(i), false));
+  }
+  w.refiner_final_norm = view("token_refiner.final_norm.weight");
+  for (int64_t i = 0; i < params.num_layers; ++i) {
+    w.blocks.push_back(block("blocks." + std::to_string(i), true));
+  }
+  w.final_norm = view("final_layer.norm.weight");
+  w.final_adaln_w = view("final_layer.adaln_proj.linear.weight");
+  w.final_adaln_b = view("final_layer.adaln_proj.linear.bias");
+  w.video_out_w = view("final_layer.video_out.weight");
+  w.video_out_b = view("final_layer.video_out.bias");
+  w.audio_out_w = view("final_layer.audio_out.weight");
+  w.audio_out_b = view("final_layer.audio_out.bias");
+}
+
+}  // namespace
+
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const GgufFile& file,
                                                          MiniMaxH3DitParams* out_params) {
   vt::Backend& backend = vt::GetBackend(queue.device.type);
@@ -825,24 +888,7 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
     }
   }
 
-  // Bind the forward's views over the DEVICE tensors, by the same names the
-  // checkpoint uses, so a missing tensor still throws BY NAME.
-  auto view = [&](const std::string& name) -> Tensor {
-    const auto it = views.find(name);
-    VT_CHECK(it != views.end(), "minimax_h3 stream: checkpoint is missing a required tensor");
-    return it->second;
-  };
   MiniMaxH3DitWeights& w = staged.weights;
-  w.video_patch_proj_w = view("video_patch_proj.weight");
-  w.video_patch_proj_b = view("video_patch_proj.bias");
-  w.audio_patch_proj_w = view("audio_patch_proj.weight");
-  w.audio_patch_proj_b = view("audio_patch_proj.bias");
-  w.condition_proj_w = view("condition_proj.weight");
-  w.condition_proj_b = view("condition_proj.bias");
-  w.time_proj_in_w = view("time_embedder.proj_in.weight");
-  w.time_proj_in_b = view("time_embedder.proj_in.bias");
-  w.time_proj_out_w = view("time_embedder.proj_out.weight");
-  w.time_proj_out_b = view("time_embedder.proj_out.bias");
   // rope.inv_freq is read on the HOST (BuildRopeCosSin runs before any kernel), so
   // it is dequantized to host f32 and kept alive by the staged struct. Binding the
   // device tensor here segfaults on the first forward.
@@ -855,36 +901,145 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
     w.rope_inv_freq = vt::Tensor::Contiguous(staged.rope_inv_freq_host.data(), DType::kF32,
                                              vt::Device{}, {n});
   }
-  auto block = [&](const std::string& prefix, bool adaln) {
-    MiniMaxH3DitBlockWeights b;
-    b.norm1 = view(prefix + ".norm1.weight");
-    b.norm2 = view(prefix + ".norm2.weight");
-    b.qkv_proj = view(prefix + ".attn.qkv_proj.weight");
-    b.q_norm = view(prefix + ".attn.q_norm.weight");
-    b.k_norm = view(prefix + ".attn.k_norm.weight");
-    b.out_proj = view(prefix + ".attn.out_proj.weight");
-    b.fc1 = view(prefix + ".mlp.fc1.weight");
-    b.fc2 = view(prefix + ".mlp.fc2.weight");
-    if (adaln) {
-      b.adaln_w = view(prefix + ".adaln_proj.linear.weight");
-      b.adaln_b = view(prefix + ".adaln_proj.linear.bias");
-    }
-    return b;
+  BindStreamedDitViews(views, params, &staged.weights);
+  return staged;
+}
+
+
+// Stream an NVFP4 (compressed-tensors) DiT STRAIGHT ONTO THE DEVICE as bf16.
+//
+// The non-streaming LoadMiniMaxH3DitFromNvfp4 materializes every weight as host
+// f32, which for this checkpoint is ~132 GB and is an OOM kill on a 122 GiB
+// unified box (observed: anon-rss 125 GB, killed during load). It stays as the
+// portable/reference loader; this is the one a real run uses, and it mirrors
+// StreamMiniMaxH3DitToDeviceBf16 exactly: dequantize ONE tensor, upload it, let
+// the host buffer die before the next, so peak is the device copy plus one tensor.
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
+                                                           const SafetensorsFile& file,
+                                                           MiniMaxH3DitParams* out_params) {
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
+
+  auto is_sidecar = [](const std::string& n) {
+    return (n.size() > 12 && n.compare(n.size() - 12, 12, "weight_scale") == 0) ||
+           (n.size() > 14 && n.compare(n.size() - 14, 14, "weight_scale_2") == 0);
   };
-  for (int64_t i = 0; i < params.token_refiner_num_layers; ++i) {
-    w.refiner.push_back(block("token_refiner.blocks." + std::to_string(i), false));
+  // Same fp32 ISLANDS as the GGUF stream: vt::MatmulBT rejects a mixed
+  // (f32 activation, bf16 weight) pair, so this split is load-bearing, not a
+  // precision nicety.
+  auto is_fp32_island = [](const std::string& n) {
+    return n.rfind("video_patch_proj.", 0) == 0 || n.rfind("audio_patch_proj.", 0) == 0 ||
+           n.rfind("time_embedder.", 0) == 0 || n.rfind("final_layer.video_out.", 0) == 0 ||
+           n.rfind("final_layer.audio_out.", 0) == 0 || n == "rope.inv_freq";
+  };
+
+  // Pass 1: LOGICAL shapes only (no payload), so geometry is known before any
+  // allocation. A packed [out, in/2] U8 weight is logically [out, in].
+  std::vector<MiniMaxH3TensorSpec> manifest;
+  for (const std::string& name : file.Names()) {
+    if (is_sidecar(name)) continue;
+    const StTensor& t = file.Get(name);
+    MiniMaxH3TensorSpec spec;
+    spec.name = name;
+    spec.shape = t.shape;
+    if (t.dtype == "U8") {
+      VT_CHECK(t.shape.size() == 2, "minimax_h3 nvfp4 stream: a packed weight must be rank 2");
+      spec.shape = {t.shape[0], t.shape[1] * 2};
+    }
+    manifest.push_back(std::move(spec));
   }
-  w.refiner_final_norm = view("token_refiner.final_norm.weight");
-  for (int64_t i = 0; i < params.num_layers; ++i) {
-    w.blocks.push_back(block("blocks." + std::to_string(i), true));
+  const MiniMaxH3DitParams params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+  if (out_params != nullptr) *out_params = params;
+
+  MiniMaxH3DitDeviceWeights staged;
+  std::map<std::string, Tensor> views;
+  size_t done = 0;
+  for (const MiniMaxH3TensorSpec& spec : manifest) {
+    const StTensor& t = file.Get(spec.name);
+    const bool island = is_fp32_island(spec.name);
+
+    // rope.inv_freq is consumed on the HOST (BuildRopeCosSin runs before any
+    // kernel); binding a device pointer here segfaults on the first forward.
+    if (spec.name == "rope.inv_freq") {
+      staged.rope_inv_freq_host = MiniMaxH3ReadSafetensorF32(t);
+      staged.weights.rope_inv_freq = vt::Tensor::Contiguous(
+          staged.rope_inv_freq_host.data(), DType::kF32, vt::Device{},
+          {static_cast<int64_t>(staged.rope_inv_freq_host.size())});
+      continue;
+    }
+
+    std::vector<uint16_t> bf16;
+    std::vector<float> f32;
+    const void* src = nullptr;
+    size_t bytes = 0;
+    DType want = island ? DType::kF32 : DType::kBF16;
+
+    if (t.dtype == "U8") {
+      const int64_t out_dim = spec.shape[0], in_dim = spec.shape[1];
+      const StTensor& scale = file.Get(spec.name + "_scale");
+      const StTensor& global = file.Get(spec.name + "_scale_2");
+      VT_CHECK(scale.dtype == "F8_E4M3", "minimax_h3 nvfp4 stream: weight_scale must be F8_E4M3");
+      VT_CHECK(global.dtype == "F32", "minimax_h3 nvfp4 stream: weight_scale_2 must be F32");
+      VT_CHECK(scale.shape.size() == 2 && scale.shape[0] == out_dim &&
+                   scale.shape[1] * 16 == in_dim,
+               "minimax_h3 nvfp4 stream: weight_scale must be [out, in/16] (group size 16)");
+      VT_CHECK(global.nbytes >= sizeof(float), "minimax_h3 nvfp4 stream: weight_scale_2 too small");
+      float global_scale = 0.0f;
+      std::memcpy(&global_scale, global.data, sizeof(float));
+      bf16.resize(static_cast<size_t>(out_dim * in_dim));
+      DequantNvfp4ToBf16(static_cast<const uint8_t*>(t.data),
+                         static_cast<const uint8_t*>(scale.data), global_scale, out_dim, in_dim,
+                         bf16.data());
+      if (island) {
+        f32.resize(bf16.size());
+        for (size_t i = 0; i < bf16.size(); ++i) {
+          const uint32_t widened = static_cast<uint32_t>(bf16[i]) << 16;
+          std::memcpy(&f32[i], &widened, sizeof(float));
+        }
+        bf16.clear();
+        bf16.shrink_to_fit();
+        src = f32.data();
+        bytes = f32.size() * sizeof(float);
+      } else {
+        src = bf16.data();
+        bytes = bf16.size() * sizeof(uint16_t);
+      }
+    } else {
+      f32 = MiniMaxH3ReadSafetensorF32(t);
+      if (island) {
+        src = f32.data();
+        bytes = f32.size() * sizeof(float);
+      } else {
+        bf16.resize(f32.size());
+        for (size_t i = 0; i < f32.size(); ++i) {
+          uint32_t bits;
+          std::memcpy(&bits, &f32[i], sizeof(bits));
+          // round-to-nearest-even, the same rounding vt uses on a bf16 store
+          const uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
+          bf16[i] = static_cast<uint16_t>(rounded >> 16);
+        }
+        f32.clear();
+        f32.shrink_to_fit();
+        src = bf16.data();
+        bytes = bf16.size() * sizeof(uint16_t);
+      }
+    }
+
+    void* pdev = backend.Alloc(bytes);
+    std::shared_ptr<void> owner(pdev, [&backend](void* q) { backend.Free(q); });
+    backend.Copy(queue, pdev, src, bytes);
+    backend.Synchronize(queue);  // the host buffer dies at the end of this iteration
+    views[spec.name] = dense_attn::MakeTensor(pdev, want, queue.device, spec.shape);
+    staged.storage.push_back(std::move(owner));
+
+    if (trace && (++done % 50 == 0 || done == manifest.size())) {
+      std::fprintf(stderr, "[h3] nvfp4-streamed %zu/%zu tensors (last: %s)\n", done,
+                   manifest.size(), spec.name.c_str());
+      std::fflush(stderr);
+    }
   }
-  w.final_norm = view("final_layer.norm.weight");
-  w.final_adaln_w = view("final_layer.adaln_proj.linear.weight");
-  w.final_adaln_b = view("final_layer.adaln_proj.linear.bias");
-  w.video_out_w = view("final_layer.video_out.weight");
-  w.video_out_b = view("final_layer.video_out.bias");
-  w.audio_out_w = view("final_layer.audio_out.weight");
-  w.audio_out_b = view("final_layer.audio_out.bias");
+
+  BindStreamedDitViews(views, params, &staged.weights);
   return staged;
 }
 

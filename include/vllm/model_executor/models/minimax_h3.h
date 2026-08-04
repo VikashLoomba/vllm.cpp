@@ -1084,6 +1084,14 @@ struct MiniMaxH3DitDeviceWeights {
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const GgufFile& file,
                                                          MiniMaxH3DitParams* out_params);
 
+// The NVFP4 twin of the above. The non-streaming LoadMiniMaxH3DitFromNvfp4
+// materializes every weight as host f32 (~132 GB for this checkpoint) and is an
+// OOM kill on a 122 GiB unified box; it stays as the reference loader, and this
+// is what a real run uses.
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
+                                                           const SafetensorsFile& file,
+                                                           MiniMaxH3DitParams* out_params = nullptr);
+
 MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitParams& params,
                                                    const MiniMaxH3DitWeights& host,

@@ -186,7 +186,21 @@ int main(int argc, char** argv) {
       }
     } else {
       const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(dit_path);
-      dit = vllm::LoadMiniMaxH3DitFromNvfp4(f);
+      if (device_name == "cuda") {
+        // Stream NVFP4 straight to the device. The host-f32 reference loader is
+        // ~132 GB for this checkpoint and gets OOM-killed during load on a
+        // unified-memory box; streaming keeps peak at the device copy plus one
+        // tensor.
+        vt::Queue sq = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue();
+        const auto t0 = std::chrono::steady_clock::now();
+        streamed = vllm::StreamMiniMaxH3Nvfp4ToDeviceBf16(sq, f, &dit.params);
+        have_streamed = true;
+        std::cerr << "  streamed NVFP4 DiT -> device (bf16) in "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                  << " s\n";
+      } else {
+        dit = vllm::LoadMiniMaxH3DitFromNvfp4(f);
+      }
     }
     std::cerr << "  layers=" << dit.params.num_layers << " hidden=" << dit.params.hidden_size
               << " heads=" << dit.params.num_attention_heads << "\n";

@@ -149,15 +149,20 @@ int main(int argc, char** argv) {
     // --denoise-only stops after the DiT step loop, so it needs neither VAE nor an
     // output path -- and, just as importantly, does not spend their memory. On a
     // unified-memory box that headroom is the difference between a run and a reboot.
-    const bool need_vaes = !denoise_only;
+    // --dump-params reads the manifest and exits, so it needs NOTHING but --dit:
+    // no VAEs, no conditioning, no output path. Requiring them would make the one
+    // tool that works on a checkpoint too large to load unusable on exactly that
+    // checkpoint.
+    const bool need_vaes = !denoise_only && !dump_params;
+    const bool need_cond = !dump_params;
     if (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
         (need_vaes && out_path.empty()) ||
-        (embeds_path.empty() && (encoder_path.empty() || prompt.empty()))) {
+        (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty()))) {
       std::cerr << "usage: minimax-h3-gen --dit <f> --video-vae <f> --audio-vae <f> "
                    "--prompt-embeds <f32.bin> --out <out.mp4> [--video-vae-config <j>] "
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
-                   "[--dry-run] [--denoise-only]\n";
+                   "[--dry-run] [--denoise-only] [--dump-params]\n";
       return 2;
     }
 

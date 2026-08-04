@@ -994,6 +994,10 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
 // device path is that the 50-step loop never re-stages weights.
 struct MiniMaxH3DitDeviceWeights {
   std::vector<std::shared_ptr<void>> storage;  // owns the device allocations
+  // rope.inv_freq is consumed on the HOST (it builds the cos/sin cache before any
+  // kernel runs), so it must stay host-resident f32 no matter how the rest is
+  // staged. Binding it to device memory segfaults the moment the forward reads it.
+  std::vector<float> rope_inv_freq_host;
   MiniMaxH3DitWeights weights;                 // views into `storage`
 };
 

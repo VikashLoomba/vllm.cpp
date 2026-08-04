@@ -819,7 +819,18 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
   w.time_proj_in_b = view("time_embedder.proj_in.bias");
   w.time_proj_out_w = view("time_embedder.proj_out.weight");
   w.time_proj_out_b = view("time_embedder.proj_out.bias");
-  w.rope_inv_freq = view("rope.inv_freq");
+  // rope.inv_freq is read on the HOST (BuildRopeCosSin runs before any kernel), so
+  // it is dequantized to host f32 and kept alive by the staged struct. Binding the
+  // device tensor here segfaults on the first forward.
+  {
+    const GgufTensorInfo& info = file.Get("rope.inv_freq");
+    int64_t n = 1;
+    for (int64_t d : info.shape) n *= d;
+    staged.rope_inv_freq_host =
+        DequantGgufRowToF32(info.ggml_type, static_cast<const uint8_t*>(info.data), n);
+    w.rope_inv_freq = vt::Tensor::Contiguous(staged.rope_inv_freq_host.data(), DType::kF32,
+                                             vt::Device{}, {n});
+  }
   auto block = [&](const std::string& prefix, bool adaln) {
     MiniMaxH3DitBlockWeights b;
     b.norm1 = view(prefix + ".norm1.weight");

@@ -37,6 +37,7 @@
 #include "minimax_h3_video_vae_goldens.inc"
 #include "minimax_h3_encoder_goldens.inc"
 
+#include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/multimodal/qwen3vl_processor.h"
@@ -3821,4 +3822,121 @@ TEST_CASE("minimax_h3: the encoder GGUF loads KEEP-QUANT and fuses on QUANTIZED 
   CHECK(t1.Has("layers.0.self_attn.qkv_proj.weight"));
   CHECK_FALSE(t1.Has("layers.1.self_attn.qkv_proj.weight"));
   CHECK(t1.config.num_hidden_layers == 1);
+}
+
+TEST_CASE("minimax_h3: the DEVICE keep-quant encoder matches the host f32 reference") {
+  // The conditioning path end to end: a GGUF is loaded KEEP-QUANT, staged to a
+  // device, and its tower run through vt ops — against the gated host f32 reference
+  // over the SAME weights. The tolerance is Q8_0's, not f32's: the two paths differ
+  // by the quantization of the projections, which is the whole point of the arm.
+  const int64_t H = 128, HEADS = 4, KV = 2, HD = 32, FF = 256, SEQ = 6, LAYERS = 2;
+  REQUIRE(HEADS * HD == 128);
+
+  gguf_test::GgufModelBuilder builder;
+  builder.AddKv(gguf_test::StrKv("general.architecture", "qwen3vl"));
+  std::map<std::string, std::vector<float>> f32;  // the SAME values the host gets
+  auto add_q8 = [&](const std::string& gguf_name, const std::string& host_name, int64_t out_dim,
+                    int64_t in_dim) {
+    std::vector<float> values = MakeParam("encd." + gguf_name, out_dim * in_dim, 0.08);
+    const size_t row_bytes = vt::RowSizeBytes(vt::DType::kQ8_0, in_dim);
+    std::string bytes(static_cast<size_t>(out_dim) * row_bytes, '\0');
+    vt::cpu::FromFloatFn q = vt::cpu::BlockFromFloat(vt::DType::kQ8_0);
+    REQUIRE(q != nullptr);
+    for (int64_t r = 0; r < out_dim; ++r) {
+      q(values.data() + r * in_dim, bytes.data() + static_cast<size_t>(r) * row_bytes, in_dim);
+    }
+    // The host reference must see the DEQUANTIZED values, so the only difference
+    // between the two paths is where the quantization error enters — not the model.
+    f32[host_name] = vllm::DequantGgufRowToF32(8, reinterpret_cast<const uint8_t*>(bytes.data()),
+                                               out_dim * in_dim);
+    builder.AddTensor(gguf_name, {static_cast<uint64_t>(in_dim), static_cast<uint64_t>(out_dim)},
+                      8, bytes);
+  };
+  auto add_f32 = [&](const std::string& gguf_name, const std::string& host_name,
+                     const std::vector<int64_t>& logical) {
+    int64_t n = 1;
+    for (int64_t d : logical) n *= d;
+    std::vector<float> v = MakeParam("encd." + gguf_name, n, 0.1);
+    f32[host_name] = v;
+    std::string bytes(reinterpret_cast<const char*>(v.data()), v.size() * sizeof(float));
+    std::vector<uint64_t> ne;
+    for (auto it = logical.rbegin(); it != logical.rend(); ++it) ne.push_back(uint64_t(*it));
+    builder.AddTensor(gguf_name, ne, 0, bytes);
+  };
+
+  for (int64_t l = 0; l < LAYERS; ++l) {
+    const std::string g = "model.layers." + std::to_string(l) + ".";
+    const std::string hn = "layers." + std::to_string(l) + ".";
+    add_f32(g + "input_layernorm.weight", hn + "input_layernorm.weight", {H});
+    add_f32(g + "post_attention_layernorm.weight", hn + "post_attention_layernorm.weight", {H});
+    add_f32(g + "self_attn.q_norm.weight", hn + "self_attn.q_norm.weight", {HD});
+    add_f32(g + "self_attn.k_norm.weight", hn + "self_attn.k_norm.weight", {HD});
+    add_q8(g + "self_attn.q_proj.weight", "", HEADS * HD, H);
+    add_q8(g + "self_attn.k_proj.weight", "", KV * HD, H);
+    add_q8(g + "self_attn.v_proj.weight", "", KV * HD, H);
+    add_q8(g + "self_attn.o_proj.weight", hn + "self_attn.o_proj.weight", H, HEADS * HD);
+    add_q8(g + "mlp.gate_proj.weight", "", FF, H);
+    add_q8(g + "mlp.up_proj.weight", "", FF, H);
+    add_q8(g + "mlp.down_proj.weight", hn + "mlp.down_proj.weight", H, FF);
+  }
+
+  const std::string path = "/tmp/minimax_h3_enc_dev.gguf";
+  {
+    const std::string bytes = builder.Build();
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    CHECK(std::fwrite(bytes.data(), 1, bytes.size(), fh) == bytes.size());
+    std::fclose(fh);
+  }
+  const vllm::GgufFile gguf = vllm::GgufFile::Open(path);
+  const vllm::MiniMaxH3EncoderQuantWeights kq = vllm::LoadMiniMaxH3EncoderFromGguf(gguf);
+  REQUIRE(kq.config.hidden_size == H);
+  REQUIRE(kq.config.num_attention_heads == HEADS);
+  REQUIRE(kq.config.num_key_value_heads == KV);
+
+  // Build the HOST reference's weights from the loader's own (fused) tensors, so
+  // both paths see identical numbers — the fused qkv/gate_up are what the host
+  // forward reads.
+  vllm::MiniMaxH3AudioVaeWeights host;
+  for (const auto& kv : kq.views) {
+    const vt::Tensor& tt = kv.second;
+    if (vt::IsBlockQuant(tt.dtype)) {
+      host.tensors[kv.first] = vllm::DequantGgufRowToF32(
+          8, static_cast<const uint8_t*>(tt.data), tt.shape[0] * tt.shape[1]);
+    } else {
+      host.tensors[kv.first] =
+          std::vector<float>(tt.Ptr<float>(), tt.Ptr<float>() + tt.Numel());
+    }
+  }
+
+  vllm::MiniMaxH3EncoderConfig cfg = kq.config;
+  cfg.selected_layer = LAYERS;
+  cfg.mrope_section = {4, 3, 3};
+  cfg.rope_theta = 10000.0;
+
+  const std::vector<float> embeds = MakeParam("encd.embeds", SEQ * H, 1.0);
+  std::vector<int64_t> pos(static_cast<size_t>(3 * SEQ));
+  for (int64_t a = 0; a < 3; ++a) {
+    for (int64_t s = 0; s < SEQ; ++s) pos[static_cast<size_t>(a * SEQ + s)] = s;
+  }
+
+  const std::vector<float> want = vllm::MiniMaxH3EncoderTextForward(
+      cfg, host, embeds, pos.data(), SEQ, /*visual_pos_mask=*/nullptr, {});
+
+  vt::Queue q{Cpu(), nullptr};
+  const vllm::MiniMaxH3EncoderDeviceWeights staged =
+      vllm::StageMiniMaxH3EncoderWeights(q, kq);
+  const std::vector<float> got = vllm::MiniMaxH3EncoderTextForwardDevice(
+      q, cfg, staged, embeds, pos.data(), SEQ);
+
+  REQUIRE(got.size() == want.size());
+  double err = 0.0, mag = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    err = std::max(err, std::abs(static_cast<double>(got[i] - want[i])));
+    mag = std::max(mag, std::abs(static_cast<double>(want[i])));
+  }
+  INFO("device keep-quant encoder vs host reference: max|diff| = " << err << " (scale " << mag << ")");
+  CHECK(err <= 2e-3);
+  CHECK(mag > 1e-3);  // the tower produced something, not zeros
+  for (float v : got) REQUIRE(std::isfinite(v));
 }

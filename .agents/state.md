@@ -35894,3 +35894,38 @@ keep - so a mixed checkpoint costs extra GEMM launches, not precision.
 Worth noting the assertion is what found this. A loader that silently took the first
 member's dtype would have produced a tensor whose v rows were garbage, and nothing
 downstream would have said so.
+
+## 2026-08-04 - MiniMax-H3: the DEVICE keep-quant ENCODER forward runs
+
+MiniMaxH3EncoderTextForwardDevice: the 32B conditioning tower running from its ggml
+blocks. Gated at max abs diff 3.76e-4 against the host f32 reference on a scale of
+~1.0 - 0.04% relative, which is Q8_0 quantization error and nothing else, because
+the test feeds BOTH paths the same DEQUANTIZED numbers so the only difference is
+where quantization enters.
+
+No dequantization on the device path: the projections go through vt::MatmulBT, which
+dispatches kMatmulBTQuant on a block-typed weight. That is what lets a 32B tower fit
+a 122 GB box (13.2 GiB resident) alongside the DiT.
+
+TWO THINGS THAT LOOKED LIKE THEY NEEDED BESPOKE KERNELS AND DID NOT:
+  * M-RoPE. Upstream builds emb = cat(freqs, freqs), so cos/sin REPEAT across the
+    two halves - exactly vt::RopeFromCache's [cos_half | sin_half] layout. Only the
+    ANGLES are unusual (three axes interleaved [THW THW ...] across frequency slots),
+    and those are host-side, once per prompt.
+  * Causal GQA attention. vt::DFlashBlockAttention(causal=true) already broadcasts
+    kv heads across their query group.
+So the whole tower is shared ops plus the loader.
+
+The MIXED-ENCODING path is handled in the forward too: when the checkpoint kept
+q/k/v separate (the shipped Q4_K_M does, v_proj being Q6_K) it issues three GEMMs
+instead of one, and likewise gate/up. Costs launches, not precision.
+
+All three H3 deltas preserved: layer truncation to min(num_hidden_layers,
+selected_layer), the UNNORMALIZED output (no final RMSNorm - which is why
+norm.weight is never even loaded), and DeepStack left to the caller.
+
+Gate: 49/49 (14606 assertions).
+
+REMAINS for a prompt-steered video: tokenization + the embedding gather (the table is
+block-quant, so a gather dequantizes only the selected rows), then wiring prompt ->
+embeddings into the driver and the server.

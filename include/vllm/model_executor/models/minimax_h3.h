@@ -726,6 +726,36 @@ struct MiniMaxH3EncoderQuantWeights {
 // 0 keeps every layer. The GGUF prefixes differ from the safetensors ones
 // (`model.layers.N.` here vs `model.language_model.layers.N.` there, and `visual.`
 // vs `model.visual.`), which is itself gated.
+// The keep-quant encoder staged onto a device: the block bytes uploaded verbatim,
+// the f32 norms uploaded as-is. Staged ONCE — a prompt is encoded per request but
+// the tower does not change.
+struct MiniMaxH3EncoderDeviceWeights {
+  std::vector<std::shared_ptr<void>> storage;
+  std::map<std::string, vt::Tensor> views;
+
+  const vt::Tensor& Get(const std::string& name) const;
+  bool Has(const std::string& name) const { return views.count(name) != 0; }
+};
+
+MiniMaxH3EncoderDeviceWeights StageMiniMaxH3EncoderWeights(
+    vt::Queue& queue, const MiniMaxH3EncoderQuantWeights& host);
+
+// The DEVICE-resident encoder text tower — H3's conditioning path.
+//
+// Same graph as MiniMaxH3EncoderTextForward, with the three H3 deltas intact:
+// layer truncation to min(num_hidden_layers, selected_layer), the UNNORMALIZED
+// output (no final RMSNorm), and DeepStack injection left to the caller.
+//
+// Reuses the shared ops throughout — the projections go through vt::MatmulBT,
+// which dispatches kMatmulBTQuant on the block weights, so a 32B tower runs from
+// its ggml blocks with no dequantization. `positions` is [3, seq] (the M-RoPE
+// temporal/height/width axes); for a pure text prompt all three are the token
+// index. Returns [seq, hidden] f32.
+std::vector<float> MiniMaxH3EncoderTextForwardDevice(
+    vt::Queue& queue, const MiniMaxH3EncoderConfig& config,
+    const MiniMaxH3EncoderDeviceWeights& weights, const std::vector<float>& inputs_embeds,
+    const int64_t* positions, int64_t seq);
+
 MiniMaxH3EncoderQuantWeights LoadMiniMaxH3EncoderFromGguf(const GgufFile& file,
                                                           int64_t max_layers = 0);
 

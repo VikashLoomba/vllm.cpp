@@ -1476,37 +1476,6 @@ void LaunchAttention(cudaStream_t s, Tensor& out, const Tensor& query, const Ten
   const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
   const int64_t hk = key.shape[1];
   if (t == 0 || hq == 0 || d == 0) return;
-  // Warp-per-query fast path when head_dim is a whole number of warp widths (128 and
-  // 64 cover every head this port uses). Same math, vastly fewer barriers.
-  if (d % 32 == 0 && d / 32 <= 4) {
-    constexpr int kWarpsPerBlock = 4;
-    const dim3 wgrid(static_cast<unsigned>((t + kWarpsPerBlock - 1) / kWarpsPerBlock),
-                     static_cast<unsigned>(hq));
-    const unsigned wblock = kWarpsPerBlock * 32;
-#define VT_DFLASH_WARP(PER_LANE)                                                            \
-  do {                                                                                      \
-    if (out.dtype == DType::kF32) {                                                          \
-      DFlashBlockAttentionWarpKernel<Tin, float, PER_LANE><<<wgrid, wblock, 0, s>>>(          \
-          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,        \
-          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);           \
-    } else {                                                                                 \
-      DFlashBlockAttentionWarpKernel<Tin, __nv_bfloat16, PER_LANE><<<wgrid, wblock, 0, s>>>(  \
-          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, \
-          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);           \
-    }                                                                                        \
-  } while (0)
-    switch (d / 32) {
-      case 1: VT_DFLASH_WARP(1); break;
-      case 2: VT_DFLASH_WARP(2); break;
-      case 3: VT_DFLASH_WARP(3); break;
-      default: VT_DFLASH_WARP(4); break;
-    }
-#undef VT_DFLASH_WARP
-    Check(cudaGetLastError(), "dflash-block-attn warp launch");
-    Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
-    return;
-  }
-
   const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
   const size_t shmem = (static_cast<size_t>(d) + kBlock) * sizeof(float);
   switch (out.dtype) {
@@ -1712,6 +1681,37 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   Check(cudaMemcpyAsync(d_cu, args.cu_seqlens, cub, cudaMemcpyHostToDevice, s),
         "dflash-block-attn cu upload");
   const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
+  // Warp-per-query fast path when head_dim is a whole number of warp widths (64 and
+  // 128 cover every head this port uses). Same math, far fewer barriers.
+  if (d % 32 == 0 && d / 32 <= 4) {
+    constexpr int kWarpsPerBlock = 4;
+    const dim3 wgrid(static_cast<unsigned>((t + kWarpsPerBlock - 1) / kWarpsPerBlock),
+                     static_cast<unsigned>(hq));
+    const unsigned wblock = kWarpsPerBlock * 32;
+#define VT_DFLASH_WARP(PER_LANE)                                                              \
+  do {                                                                                        \
+    if (out.dtype == DType::kF32) {                                                           \
+      DFlashBlockAttentionWarpKernel<Tin, float, PER_LANE><<<wgrid, wblock, 0, s>>>(          \
+          out.Ptr<float>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,         \
+          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);            \
+    } else {                                                                                  \
+      DFlashBlockAttentionWarpKernel<Tin, __nv_bfloat16, PER_LANE><<<wgrid, wblock, 0, s>>>(  \
+          out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(), key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu, \
+          args.num_reqs, hq, hk, d, args.scale, args.causal, args.sliding_window);            \
+    }                                                                                         \
+  } while (0)
+    switch (d / 32) {
+      case 1: VT_DFLASH_WARP(1); break;
+      case 2: VT_DFLASH_WARP(2); break;
+      case 3: VT_DFLASH_WARP(3); break;
+      default: VT_DFLASH_WARP(4); break;
+    }
+#undef VT_DFLASH_WARP
+    Check(cudaGetLastError(), "dflash-block-attn warp launch");
+    Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
+    return;
+  }
+
   const size_t shmem = (static_cast<size_t>(d) + kBlock) * sizeof(float);
   switch (out.dtype) {
     case DType::kF32:

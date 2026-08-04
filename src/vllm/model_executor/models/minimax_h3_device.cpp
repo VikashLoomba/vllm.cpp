@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
+#include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/model_executor/models/minimax_h3_device.h"
 #include "vt/backend.h"
@@ -328,6 +329,109 @@ MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
   upload(host.final_norm, staged.weights.final_norm, true);
   upload(host.final_adaln_w, staged.weights.final_adaln_w, true);
   upload(host.final_adaln_b, staged.weights.final_adaln_b, true);
+  (void)params;
+  backend.Synchronize(queue);
+  return staged;
+}
+
+MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeightsDequantBf16(
+    vt::Queue& queue, const MiniMaxH3DitParams& params, const MiniMaxH3GgufDit& gguf) {
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  MiniMaxH3DitDeviceWeights staged;
+  staged.weights = gguf.weights;
+
+  // Reverse of the loader's own name->view binding: find which checkpoint name a
+  // given view came from, so its ggml type id can be recovered.
+  auto ggml_type_of = [&](const Tensor& t) -> const uint32_t* {
+    for (const auto& kv : gguf.quant_storage) {
+      if (kv.second.data() == static_cast<const uint8_t*>(t.data)) {
+        const auto it = gguf.quant_ggml_type.find(kv.first);
+        return it == gguf.quant_ggml_type.end() ? nullptr : &it->second;
+      }
+    }
+    return nullptr;
+  };
+
+  auto upload = [&](const Tensor& src, Tensor& dst) {
+    if (src.data == nullptr) {
+      dst = src;
+      return;
+    }
+    const std::vector<int64_t> shape(src.shape, src.shape + src.rank);
+    std::vector<uint16_t> bf16;
+    if (vt::IsBlockQuant(src.dtype)) {
+      const uint32_t* type = ggml_type_of(src);
+      VT_CHECK(type != nullptr,
+               "minimax_h3 stage-dequant: a block-quant weight has no recorded ggml type");
+      // Straight to bf16: dequantizing to f32 first would double the peak and buy
+      // nothing, since bf16 is what the GEMM will consume.
+      bf16 = DequantGgufRowToBf16(*type, static_cast<const uint8_t*>(src.data),
+                                  src.shape[0] * src.shape[1]);
+    } else {
+      VT_CHECK(src.dtype == DType::kF32, "minimax_h3 stage-dequant: expected f32 or block-quant");
+      const int64_t n = src.Numel();
+      bf16.resize(static_cast<size_t>(n));
+      const float* in = src.Ptr<float>();
+      for (int64_t i = 0; i < n; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits, &in[i], sizeof(bits));
+        if ((bits & 0x7F800000u) == 0x7F800000u) {
+          bits &= 0xFFFF0000u;
+        } else {
+          const uint32_t lsb = (bits >> 16) & 1u;
+          bits = (bits + 0x7FFFu + lsb) & 0xFFFF0000u;
+        }
+        bf16[static_cast<size_t>(i)] = static_cast<uint16_t>(bits >> 16);
+      }
+    }
+    const size_t bytes = bf16.size() * sizeof(uint16_t);
+    void* p = backend.Alloc(bytes);
+    std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
+    backend.Copy(queue, p, bf16.data(), bytes);
+    backend.Synchronize(queue);  // `bf16` dies at the end of this scope
+    dst = dense_attn::MakeTensor(p, DType::kBF16, queue.device, shape);
+    staged.storage.push_back(std::move(owner));
+  };
+
+  auto upload_block = [&](const MiniMaxH3DitBlockWeights& src, MiniMaxH3DitBlockWeights& dst) {
+    upload(src.norm1, dst.norm1);
+    upload(src.norm2, dst.norm2);
+    upload(src.qkv_proj, dst.qkv_proj);
+    upload(src.q_norm, dst.q_norm);
+    upload(src.k_norm, dst.k_norm);
+    upload(src.out_proj, dst.out_proj);
+    upload(src.fc1, dst.fc1);
+    upload(src.fc2, dst.fc2);
+    upload(src.adaln_w, dst.adaln_w);
+    upload(src.adaln_b, dst.adaln_b);
+  };
+
+  const MiniMaxH3DitWeights& host = gguf.weights;
+  upload(host.video_patch_proj_w, staged.weights.video_patch_proj_w);
+  upload(host.video_patch_proj_b, staged.weights.video_patch_proj_b);
+  upload(host.audio_patch_proj_w, staged.weights.audio_patch_proj_w);
+  upload(host.audio_patch_proj_b, staged.weights.audio_patch_proj_b);
+  upload(host.condition_proj_w, staged.weights.condition_proj_w);
+  upload(host.condition_proj_b, staged.weights.condition_proj_b);
+  upload(host.time_proj_in_w, staged.weights.time_proj_in_w);
+  upload(host.time_proj_in_b, staged.weights.time_proj_in_b);
+  upload(host.time_proj_out_w, staged.weights.time_proj_out_w);
+  upload(host.time_proj_out_b, staged.weights.time_proj_out_b);
+  staged.weights.rope_inv_freq = host.rope_inv_freq;  // consumed on the host
+  for (size_t i = 0; i < host.refiner.size(); ++i) {
+    upload_block(host.refiner[i], staged.weights.refiner[i]);
+  }
+  upload(host.refiner_final_norm, staged.weights.refiner_final_norm);
+  for (size_t i = 0; i < host.blocks.size(); ++i) {
+    upload_block(host.blocks[i], staged.weights.blocks[i]);
+  }
+  upload(host.final_norm, staged.weights.final_norm);
+  upload(host.final_adaln_w, staged.weights.final_adaln_w);
+  upload(host.final_adaln_b, staged.weights.final_adaln_b);
+  upload(host.video_out_w, staged.weights.video_out_w);
+  upload(host.video_out_b, staged.weights.video_out_b);
+  upload(host.audio_out_w, staged.weights.audio_out_w);
+  upload(host.audio_out_b, staged.weights.audio_out_b);
   (void)params;
   backend.Synchronize(queue);
   return staged;

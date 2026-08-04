@@ -27,6 +27,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -108,7 +109,7 @@ std::string Need(int argc, char** argv, int i, const std::string& flag) {
 int main(int argc, char** argv) {
   std::string dit_path, video_vae_path, video_cfg_path, audio_vae_path, audio_cfg_path;
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
-  bool keep_quant = false, dry_run = false;
+  bool keep_quant = false, dry_run = false, dequant_bf16 = false;
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path;
   int64_t encoder_max_layers = 0;
@@ -127,6 +128,7 @@ int main(int argc, char** argv) {
       else if (f == "--workdir") workdir = Need(argc, argv, ++i, f);
       else if (f == "--ffmpeg") ffmpeg = Need(argc, argv, ++i, f);
       else if (f == "--keep-quant") keep_quant = true;
+      else if (f == "--dequant-bf16") dequant_bf16 = true;
       else if (f == "--dry-run") dry_run = true;
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
@@ -309,9 +311,26 @@ int main(int argc, char** argv) {
     } else if (device_name != "cpu") {
       throw std::runtime_error("--device must be cpu or cuda");
     }
+    // Stage ONCE here rather than inside the denoise loop. --dequant-bf16 trades
+    // memory (DiT ~33 GB bf16 vs 15.6 GB kept-quant) for GEMM throughput: the
+    // keep-quant path measured ~103 GFLOP/s, which is what makes a full-quality
+    // render a multi-day job.
+    vllm::MiniMaxH3DitDeviceWeights staged;
+    const vllm::MiniMaxH3DitDeviceWeights* prestaged = nullptr;
+    if (device.type != vt::DeviceType::kCPU) {
+      vt::Queue sq = vt::GetBackend(device.type).CreateQueue();
+      const auto t0 = std::chrono::steady_clock::now();
+      staged = dequant_bf16
+                   ? vllm::StageMiniMaxH3DitWeightsDequantBf16(sq, dit.params, dit)
+                   : vllm::StageMiniMaxH3DitWeights(sq, dit.params, dit.weights, vt::DType::kBF16);
+      std::cerr << "  staged DiT (" << (dequant_bf16 ? "dequant-bf16" : "keep-quant") << ") in "
+                << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                << " s\n";
+      prestaged = &staged;
+    }
     const vllm::MiniMaxH3T2vaResult result = vllm::MiniMaxH3GenerateT2va(
         device, request, dit.params, dit.weights, video_cfg, video_weights, audio_cfg,
-        audio_weights, prompt_embeds, noise_video, noise_audio, vt::DType::kBF16);
+        audio_weights, prompt_embeds, noise_video, noise_audio, vt::DType::kBF16, prestaged);
 
     // --- 5. artifacts (the LIBRARY builds these; nothing spawns) ---
     std::string mkdir_cmd = "mkdir -p '" + workdir + "'";

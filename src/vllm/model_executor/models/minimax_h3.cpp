@@ -703,7 +703,8 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     const MiniMaxH3DenoiseBranch& branch, const std::vector<float>& initial_video_rows,
     const std::vector<float>& initial_audio_rows, const std::vector<float>& keyframe_cond_rows,
     const std::vector<float>& audio_ref_rows, const std::vector<double>& sigmas_video,
-    const std::vector<double>& sigmas_audio, DType compute_dtype) {
+    const std::vector<double>& sigmas_audio, DType compute_dtype,
+    const MiniMaxH3DitDeviceWeights* prestaged) {
   VT_CHECK(sigmas_video.size() == sigmas_audio.size(),
            "minimax_h3 denoise: video/audio sigma schedules must have equal length");
   VT_CHECK(sigmas_video.size() >= 2, "minimax_h3 denoise: sigma schedules need at least 2 entries");
@@ -724,7 +725,9 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     vt::Backend& backend = vt::GetBackend(device.type);
     device_queue = backend.CreateQueue();
     const auto t0 = now();
-    staged = StageMiniMaxH3DitWeights(device_queue, params, weights, compute_dtype);
+    if (prestaged == nullptr) {
+      staged = StageMiniMaxH3DitWeights(device_queue, params, weights, compute_dtype);
+    }
     if (trace) {
       std::fprintf(stderr, "[h3] staged weights to device in %.1f s\n",
                    std::chrono::duration<double>(now() - t0).count());
@@ -852,8 +855,10 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
 
     const auto step_t0 = now();
     const MiniMaxH3DitOutputs velocity =
-        on_device ? MiniMaxH3DitForwardDevice(device_queue, params, staged.weights, in,
-                                              compute_dtype)
+        on_device ? MiniMaxH3DitForwardDevice(
+                        device_queue, params,
+                        prestaged != nullptr ? prestaged->weights : staged.weights, in,
+                        compute_dtype)
                   : MiniMaxH3DitForward(device, params, weights, in, compute_dtype);
     if (trace) {
       std::fprintf(stderr, "[h3] step %d/%d forward %.2f s (seq_len=%lld)\n",

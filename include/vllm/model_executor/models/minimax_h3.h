@@ -899,6 +899,7 @@ struct MiniMaxH3GgufDit {
   // dequantizing load produce the same weight-view struct.
   std::map<std::string, std::vector<uint8_t>> quant_storage;
   std::map<std::string, vt::DType> quant_dtype;
+  std::map<std::string, uint32_t> quant_ggml_type;  // for a later dequant
   std::map<std::string, std::vector<int64_t>> shapes;
   MiniMaxH3DitWeights weights;
 };
@@ -999,6 +1000,20 @@ MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitWeights& host,
                                                    vt::DType compute_dtype = vt::DType::kF32);
 
+// The same staging, but DEQUANTIZING block-quant weights to bf16 on the way up
+// instead of keeping their blocks.
+//
+// This is a THROUGHPUT trade, and the measurement behind it is stark: the keep-quant
+// GEMM achieves ~103 GFLOP/s on the DiT, which makes a full-quality render a
+// ~12-day job. Dequantized to bf16 the projections go through the tuned cuBLASLt
+// MatmulBT instead. It costs memory — the DiT is ~33 GB in bf16 against 15.6 GB
+// kept-quant — which is affordable where 145 GB of f32 was not.
+//
+// `gguf` supplies the ggml type ids the block bytes were stored as; a weight with no
+// entry is uploaded unchanged.
+MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeightsDequantBf16(
+    vt::Queue& queue, const MiniMaxH3DitParams& params, const MiniMaxH3GgufDit& gguf);
+
 // The DEVICE-RESIDENT DiT forward: same graph as MiniMaxH3DitForward, but every
 // activation stays in device memory for the whole block stack -- only the inputs
 // go up and the selected output rows come back.
@@ -1042,7 +1057,8 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     const MiniMaxH3DenoiseBranch& branch, const std::vector<float>& initial_video_rows,
     const std::vector<float>& initial_audio_rows, const std::vector<float>& keyframe_cond_rows,
     const std::vector<float>& audio_ref_rows, const std::vector<double>& sigmas_video,
-    const std::vector<double>& sigmas_audio, vt::DType compute_dtype);
+    const std::vector<double>& sigmas_audio, vt::DType compute_dtype,
+    const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
 
 
 // ---------------------------------------------------------------------------
@@ -1114,6 +1130,11 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                                           const std::vector<float>& prompt_embeds,
                                           const std::vector<float>& initial_video_rows,
                                           const std::vector<float>& initial_audio_rows,
-                                          vt::DType compute_dtype);
+                                          vt::DType compute_dtype,
+                                          // Weights already staged on `device`. Staging the DiT
+                                          // costs tens of seconds, so a driver or server stages
+                                          // ONCE and passes it here rather than per generation.
+                                          // Null stages internally, as before.
+                                          const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
 
 }  // namespace vllm

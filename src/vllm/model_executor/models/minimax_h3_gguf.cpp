@@ -288,6 +288,7 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant)
       const uint8_t* src = static_cast<const uint8_t*>(info.data);
       out.quant_storage[spec.name].assign(src, src + bytes);
       out.quant_dtype[spec.name] = block;
+      out.quant_ggml_type[spec.name] = info.ggml_type;
       continue;
     }
 

@@ -35814,3 +35814,29 @@ TWO PERFORMANCE GAPS, both now measured rather than suspected:
   1. DiT forward 200 s/step at seq_len 576 - the 50-step default is ~2.8 h of DiT.
   2. The VIDEO VAE DECODE IS CPU-ONLY (36-layer dim-2048 ViT3D on the host) and is
      the wall at realistic resolutions. A missing device path, not tuning.
+
+## 2026-08-04 - MiniMax-H3: ★ /v1/videos SERVED end-to-end from examples/server
+
+The second half of the goal. `examples/server` started on Thor with BOTH the
+Qwen3-0.6B LLM and the H3 checkpoints logs:
+
+  server: /v1/videos on (dit layers=50, device=cuda, keep-quant)
+  server: WARNING /v1/videos ignores the request PROMPT - text conditioning needs
+          the H3-Encoder, which is not wired yet
+
+Then over HTTP:
+  POST /v1/videos  -> {"id":"vid_1","status":"queued"}
+  GET  /v1/videos/vid_1 (poll) -> {"status":"succeeded","output_path":"..."}
+  ffprobe(output_path) -> h264 / yuv420p 128x128 + AAC stereo 32 kHz
+  GET  /v1/videos/video-0 (a wrong id) -> 404 NotFoundError
+
+So the async route, the job store's queued->running->succeeded lifecycle, the
+runner callback, the ffmpeg mux and the 404 path are all exercised against the REAL
+checkpoint, not fixtures. Server-side trace: staging 58.0 s, DiT forward 22.4 s/step.
+
+STILL TRUE, and stated at startup rather than buried: the PROMPT does not steer the
+output. Conditioning is the fixed --video-prompt-embeds file because the H3-Encoder
+is not wired. That is the next piece for a truthful API.
+
+Housekeeping: pruned 8 stale per-SHA build trees on Thor (80G -> 52G used), per
+[[grid-per-sha-trees-fill-disk]].

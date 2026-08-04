@@ -105,6 +105,8 @@ struct Args {
   // and the server behaves exactly as before). ---
   std::string video_dit, video_vae, video_vae_config, audio_vae, audio_vae_config;
   std::string video_prompt_embeds, video_workdir = "/tmp/vllm_h3_videos";
+  std::string video_encoder, video_tokenizer;
+  int video_encoder_max_layers = 50;
   std::string video_ffmpeg = "ffmpeg", video_device = "cuda";
   bool video_keep_quant = false;
   int cuda_profile_graph_replays = 0;  // trace-only diagnostic build seam.
@@ -228,6 +230,12 @@ Args ParseArgs(int argc, char** argv) {
       a.audio_vae = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--audio-vae-config") {
       a.audio_vae_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-encoder") {
+      a.video_encoder = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-tokenizer") {
+      a.video_tokenizer = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-encoder-max-layers") {
+      a.video_encoder_max_layers = std::atoi(NextArg(argc, argv, i, argv[0]).c_str());
     } else if (flag == "--video-prompt-embeds") {
       a.video_prompt_embeds = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-workdir") {
@@ -586,7 +594,15 @@ int main(int argc, char** argv) {
       vllm::MiniMaxH3AudioVaeConfig audio_cfg;
       vllm::MiniMaxH3LatentStats video_stats, audio_stats;
       vllm::MiniMaxH3AudioVaeWeights video_weights, audio_weights;
-      std::vector<float> prompt_embeds;
+      std::vector<float> prompt_embeds;   // fallback when no encoder is configured
+      // Encoder staged ONCE: staging the 32B tower costs ~162 s, so per-request
+      // staging would dominate every generation.
+      bool has_encoder = false;
+      vllm::MiniMaxH3EncoderConfig enc_config;
+      vllm::MiniMaxH3EncoderQuantWeights enc_host;
+      vllm::MiniMaxH3EncoderDeviceWeights enc_staged;
+      std::unique_ptr<vllm::tok::Tokenizer> tokenizer;
+      vt::Queue enc_queue{};
       std::string workdir, ffmpeg;
       vt::Device device;
       std::atomic<int64_t> counter{0};
@@ -630,6 +646,27 @@ int main(int argc, char** argv) {
         video->prompt_embeds.resize(static_cast<size_t>(n) / sizeof(float));
         in.read(reinterpret_cast<char*>(video->prompt_embeds.data()), n);
       }
+      if (!args.video_encoder.empty()) {
+        std::cerr << "server: loading MiniMax-H3 encoder (keep-quant)...\n";
+        const vllm::GgufFile ef = vllm::GgufFile::Open(args.video_encoder);
+        video->enc_host = vllm::LoadMiniMaxH3EncoderFromGguf(ef, args.video_encoder_max_layers);
+        video->enc_config = video->enc_host.config;
+        // The ComfyUI-style encoder export is WEIGHTS ONLY, so the vocab comes from
+        // the checkpoint tokenizer.json unless the GGUF happens to embed one.
+        video->tokenizer = std::make_unique<vllm::tok::Tokenizer>(
+            args.video_tokenizer.empty()
+                ? vllm::tok::Tokenizer::FromGguf(ef)
+                : vllm::tok::Tokenizer::FromHfJson(args.video_tokenizer));
+        video->enc_queue = vt::Queue{video->device, nullptr};
+        if (video->device.type != vt::DeviceType::kCPU) {
+          video->enc_queue = vt::GetBackend(video->device.type).CreateQueue();
+        }
+        std::cerr << "server: staging encoder to device (once)...\n";
+        video->enc_staged = vllm::StageMiniMaxH3EncoderWeights(video->enc_queue, video->enc_host);
+        video->has_encoder = true;
+        std::cerr << "server: encoder ready (layers=" << video->enc_config.num_hidden_layers
+                  << ", hidden=" << video->enc_config.hidden_size << ")\n";
+      }
       video->workdir = args.video_workdir;
       video->ffmpeg = args.video_ffmpeg;
       if (args.video_device == "cuda") {
@@ -642,19 +679,40 @@ int main(int argc, char** argv) {
       // conditioning needs the H3-Encoder (a 32B tower + tokenizer), which is not
       // wired here. Until it is, every request is conditioned on the SAME supplied
       // embeddings, so the prompt text does NOT steer the output.
-      if (video->prompt_embeds.empty()) {
-        std::cerr << "server: WARNING /v1/videos has no --video-prompt-embeds; "
-                     "requests will be REJECTED until the encoder is wired\n";
+      if (video->has_encoder) {
+        std::cerr << "server: /v1/videos conditions on the request PROMPT\n";
+      } else if (video->prompt_embeds.empty()) {
+        std::cerr << "server: WARNING /v1/videos has neither --video-encoder nor "
+                     "--video-prompt-embeds; requests will be REJECTED\n";
       } else {
-        std::cerr << "server: WARNING /v1/videos ignores the request PROMPT — text "
-                     "conditioning needs the H3-Encoder, which is not wired yet\n";
+        std::cerr << "server: WARNING /v1/videos ignores the request PROMPT — pass "
+                     "--video-encoder to condition on it\n";
       }
 
       server.set_video_runner([video](const vllm::openai::VideoRequest& req) -> std::string {
-        if (video->prompt_embeds.empty()) {
+        // REAL text conditioning when an encoder is configured: tokenize the
+        // request prompt, gather its rows from the block-quant table, and run the
+        // already-staged tower.
+        std::vector<float> conditioning;
+        if (video->has_encoder) {
+          const std::vector<int32_t> ids = video->tokenizer->Encode(req.prompt);
+          if (ids.empty()) throw std::runtime_error("the prompt tokenized to nothing");
+          const std::vector<float> embeds =
+              vllm::MiniMaxH3EncoderEmbedTokens(video->enc_host, ids);
+          const int64_t eseq = static_cast<int64_t>(ids.size());
+          std::vector<int64_t> epos(static_cast<size_t>(3 * eseq));
+          for (int64_t a = 0; a < 3; ++a) {
+            for (int64_t s = 0; s < eseq; ++s) epos[static_cast<size_t>(a * eseq + s)] = s;
+          }
+          vllm::MiniMaxH3EncoderConfig ec = video->enc_config;
+          conditioning = vllm::MiniMaxH3EncoderTextForwardDevice(
+              video->enc_queue, ec, video->enc_staged, embeds, epos.data(), eseq);
+        } else if (!video->prompt_embeds.empty()) {
+          conditioning = video->prompt_embeds;
+        } else {
           throw std::runtime_error(
-              "video generation needs prompt embeddings: the H3-Encoder is not wired, "
-              "so start the server with --video-prompt-embeds");
+              "video generation needs conditioning: start the server with "
+              "--video-encoder (to condition on the prompt) or --video-prompt-embeds");
         }
         const vllm::MiniMaxH3DitParams& p = video->dit.params;
         vllm::MiniMaxH3T2vaRequest r;
@@ -673,7 +731,7 @@ int main(int argc, char** argv) {
         r.video_latents_std = video->video_stats.std_dev;
         r.audio_latents_mean = video->audio_stats.mean;
         r.audio_latents_std = video->audio_stats.std_dev;
-        r.text_len = static_cast<int64_t>(video->prompt_embeds.size()) / p.text_dim;
+        r.text_len = static_cast<int64_t>(conditioning.size()) / p.text_dim;
 
         const int64_t frame_rows =
             (r.latent_h / p.patch_size_h) * (r.latent_w / p.patch_size_w);
@@ -697,7 +755,7 @@ int main(int argc, char** argv) {
 
         const vllm::MiniMaxH3T2vaResult out = vllm::MiniMaxH3GenerateT2va(
             video->device, r, p, video->dit.weights, video->video_cfg, video->video_weights,
-            video->audio_cfg, video->audio_weights, video->prompt_embeds, nv, na,
+            video->audio_cfg, video->audio_weights, conditioning, nv, na,
             vt::DType::kBF16);
 
         const int64_t id = video->counter.fetch_add(1);

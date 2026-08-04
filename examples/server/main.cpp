@@ -720,6 +720,7 @@ int main(int argc, char** argv) {
             req.task.empty() ? "t2va" : req.task, req.duration_seconds, req.num_frames,
             req.height, req.width, 0, 0);
         r.latent_t = plan.latent_t;
+        r.num_frames = plan.num_frames;
         r.latent_h = plan.height / vllm::kMiniMaxH3VaeRatio;
         r.latent_w = plan.width / vllm::kMiniMaxH3VaeRatio;
         r.audio_t = plan.audio_t;

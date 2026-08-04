@@ -377,6 +377,14 @@ MiniMaxH3VideoVaeDecoderConfig ParseMiniMaxH3VideoVaeDecoderConfig(const nlohman
                                ? config.at("decoder_ffn_mult").get<int64_t>()
                                : 4;
   out.block.ff_inner = out.block.dim * ffn_mult;
+  if (config.contains("clip_length")) out.clip_length = config.at("clip_length").get<int64_t>();
+  if (config.contains("token_drop")) out.token_drop = config.at("token_drop").get<int64_t>();
+  if (config.contains("temporal_downsample_factors")) {
+    // vae_ratio_t = prod(time_down) (klvae.py:1148).
+    int64_t prod = 1;
+    for (const auto& v : config.at("temporal_downsample_factors")) prod *= v.get<int64_t>();
+    if (prod > 0) out.vae_ratio_t = prod;
+  }
   if (config.contains("decoder_norm_eps")) {
     out.block.eps = config.at("decoder_norm_eps").get<double>();
   }

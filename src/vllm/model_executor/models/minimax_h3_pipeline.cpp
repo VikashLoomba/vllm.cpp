@@ -136,10 +136,12 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
     vt::Queue vq = vt::GetBackend(device.type).CreateQueue();
     const MiniMaxH3VideoVaeDeviceWeights staged_vae =
         StageMiniMaxH3VideoVaeWeights(vq, video_config, video_weights);
-    result.frames = MiniMaxH3VideoVaeDecodeTiledDevice(device, video_config, staged_vae,
-                                                       video_latent, request.latent_t,
-                                                       request.latent_h, request.latent_w,
-                                                       &result.frame_shape);
+    // Upstream's video path is decode_base -> decode_temporal: chunked in TIME,
+    // and NOT spatially tiled (decoder_tiling defaults false and the shipped
+    // config does not set it).
+    result.frames = MiniMaxH3VideoVaeDecodeTemporalDevice(
+        device, video_config, staged_vae, video_latent, request.latent_t, request.latent_h,
+        request.latent_w, request.num_frames, &result.frame_shape);
   } else {
     result.frames = MiniMaxH3VideoVaeDecode(video_config, video_weights, video_latent,
                                             request.latent_t, request.latent_h, request.latent_w,

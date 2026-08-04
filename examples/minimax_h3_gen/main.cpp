@@ -360,6 +360,7 @@ int main(int argc, char** argv) {
         "t2va", /*duration_seconds=*/0.0, frames, height, width,
         /*image_width=*/0, /*image_height=*/0);
     request.latent_t = plan.latent_t;
+    request.num_frames = plan.num_frames;
     request.latent_h = plan.height / vllm::kMiniMaxH3VaeRatio;
     request.latent_w = plan.width / vllm::kMiniMaxH3VaeRatio;
     request.audio_t = plan.audio_t;

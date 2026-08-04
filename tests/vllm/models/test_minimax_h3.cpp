@@ -1330,6 +1330,35 @@ static void CheckVideoVaeDecodeDevice(vt::Queue& queue, const char* label) {
 // mechanism: that a single tile is still bit-identical, and that with several tiles
 // each tile's interior equals a direct decode of that tile's own latent slice --
 // which is what pins down the slicing, the placement and the seam arithmetic.
+// The TEMPORAL chunk arithmetic, against upstream's decode_temporal (klvae.py).
+// Pure integer geometry, so it pins the plan down without decoding anything --
+// and the plan is the part that was WRONG (we decoded the whole latent in one
+// pass where upstream never hands the ViT more than 7 temporal tokens).
+TEST_CASE("minimax_h3: the video-VAE temporal chunk plan matches upstream") {
+  vllm::MiniMaxH3VideoVaeDecoderConfig c;  // shipped defaults: 17 / 3 / 4
+  CHECK(c.clip_length == 17);
+  CHECK(c.token_drop == 3);
+  CHECK(c.vae_ratio_t == 4);
+  // tokens_chunk_size = ceil(17/4); frame_pre_padding = (-17) % 4;
+  // token_overlap = (-3) % 5; frame_overlap = max(2*4 - 3, 0).
+  CHECK(c.tokens_chunk_size() == 5);
+  CHECK(c.frame_pre_padding() == 3);
+  CHECK(c.token_overlap() == 2);
+  CHECK(c.frame_overlap() == 5);
+
+  // The modulo must be the PYTHON one: (-clip_length) % ratio is 3 in Python and
+  // -1 in C, and a negative pre-padding would slice from the wrong end.
+  CHECK(c.frame_pre_padding() >= 0);
+  CHECK(c.token_overlap() >= 0);
+
+  // For latent_t 12: pseudo = 12 + 3 = 15, a whole number of 5-token chunks, so
+  // num_chunks = 15/5 - 1 = 2, each covering tokens [0,7) and [5,12).
+  const int64_t latent_t = 12;
+  const int64_t pseudo = latent_t + c.token_drop;
+  CHECK(pseudo % c.tokens_chunk_size() == 0);
+  CHECK(pseudo / c.tokens_chunk_size() - 1 == 2);
+}
+
 TEST_CASE("minimax_h3: the TILED video-VAE decode slices and places tiles correctly") {
   vt::Queue queue = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
 

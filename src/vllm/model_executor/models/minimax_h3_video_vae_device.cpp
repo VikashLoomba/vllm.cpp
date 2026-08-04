@@ -546,4 +546,193 @@ std::vector<float> MiniMaxH3VideoVaeDecodeTiledDevice(
   return assembled;
 }
 
+
+// ---------------------------------------------------------------------------
+// TEMPORAL CHUNKING (klvae.py decode_temporal, :678-786)
+//
+// This is the real shape of upstream's video decode, and the one thing our port
+// was missing: `decode_base` routes video through `decode_temporal`, NOT through
+// a single pass. The ViT sees `tokens_chunk_size + token_overlap` temporal tokens
+// at a time -- 7 for the shipped config -- never the whole latent.
+//
+// It matters for the same reason the spatial extent does: the decoder's RoPE is
+// LENGTH-NORMALIZED over the grid it is handed (MiniMaxH3VideoVaeRope takes
+// latent_t/h/w), so the temporal EXTENT is part of the input. Handing it 12
+// tokens when it was trained on 7 gives every token a position the model never
+// saw. Every reduced-dimension gate in this tree runs at latent_t = 2 -- below one
+// chunk, where chunked and unchunked decode are the SAME computation -- which is
+// exactly why the suite could not see this.
+//
+// Shipped config (clip_length 17, token_drop 3, vae_ratio_t 4) gives
+// tokens_chunk_size 5, token_overlap 2, frame_pre_padding 3, frame_overlap 5.
+// isolated_first_frame / isolated_last_frame default FALSE and the shipped config
+// sets neither, so the head/tail isolation branches are not taken; they are
+// deliberately NOT implemented rather than implemented untested.
+std::vector<float> MiniMaxH3VideoVaeDecodeTemporalDevice(
+    vt::Device device, const MiniMaxH3VideoVaeDecoderConfig& config,
+    const MiniMaxH3VideoVaeDeviceWeights& staged, const std::vector<float>& latent,
+    int64_t latent_t, int64_t latent_h, int64_t latent_w, int64_t target_frames,
+    MiniMaxH3VideoFrameShape* out_shape) {
+  const int64_t chan = config.in_channels;
+  const int64_t ratio_t = config.vae_ratio_t;
+  const int64_t chunk_tokens = config.tokens_chunk_size();
+  const int64_t overlap_tokens = config.token_overlap();
+  const int64_t pre_pad = config.frame_pre_padding();
+  const int64_t frame_ov = config.frame_overlap();
+  VT_CHECK(chunk_tokens > 0 && ratio_t > 0, "minimax_h3 temporal decode: bad chunk geometry");
+
+  // pseudo_total_tokens = T - isolated + token_drop, padded up to a whole number
+  // of chunks by REPEATING the last latent frame (klvae.py:688-696).
+  int64_t pseudo_total = latent_t + config.token_drop;
+  const int64_t remainder = pseudo_total % chunk_tokens;
+  const int64_t pad_tokens = remainder == 0 ? 0 : chunk_tokens - remainder;
+  pseudo_total += pad_tokens;
+  const int64_t num_chunks = pseudo_total / chunk_tokens - (config.token_drop > 0 ? 1 : 0);
+  VT_CHECK(num_chunks >= 1, "minimax_h3 temporal decode: no chunks to decode");
+
+  std::vector<float> z = latent;
+  int64_t z_t = latent_t;
+  if (pad_tokens > 0) {
+    // repeat the LAST temporal token pad_tokens times
+    std::vector<float> padded(static_cast<size_t>(chan * (z_t + pad_tokens) * latent_h * latent_w));
+    const int64_t plane = latent_h * latent_w;
+    for (int64_t c = 0; c < chan; ++c) {
+      for (int64_t tt = 0; tt < z_t + pad_tokens; ++tt) {
+        const int64_t src_t = std::min(tt, z_t - 1);
+        for (int64_t i = 0; i < plane; ++i) {
+          padded[static_cast<size_t>((c * (z_t + pad_tokens) + tt) * plane + i)] =
+              z[static_cast<size_t>((c * z_t + src_t) * plane + i)];
+        }
+      }
+    }
+    z = std::move(padded);
+    z_t += pad_tokens;
+  }
+
+  const int64_t ps = config.patch_size;
+  const int64_t out_h = latent_h * ps, out_w = latent_w * ps;
+  const int64_t chunk_dec = chunk_tokens * ratio_t;
+  const int64_t plane = out_h * out_w;
+  const int64_t chans = config.out_channels;
+
+  // Decode each chunk, then walk upstream's j-loop: slice `chunk_dec` frames at a
+  // time, drop `frame_pre_padding` leading frames, cross-fade the carried overlap.
+  std::vector<std::vector<float>> pieces;  // each [C, f, H, W]
+  std::vector<int64_t> piece_frames;
+  std::vector<float> carry;  // dec_overlap
+  int64_t carry_frames = 0;
+
+  for (int64_t i = 0; i < num_chunks; ++i) {
+    const int64_t t0 = i * chunk_tokens;
+    const int64_t t1 = std::min(t0 + chunk_tokens + overlap_tokens, z_t);
+    const int64_t nt = t1 - t0;
+    VT_CHECK(nt > 0, "minimax_h3 temporal decode: empty chunk");
+
+    std::vector<float> sub(static_cast<size_t>(chan * nt * latent_h * latent_w));
+    const int64_t lplane = latent_h * latent_w;
+    for (int64_t c = 0; c < chan; ++c) {
+      for (int64_t k = 0; k < nt; ++k) {
+        for (int64_t e = 0; e < lplane; ++e) {
+          sub[static_cast<size_t>((c * nt + k) * lplane + e)] =
+              z[static_cast<size_t>((c * z_t + t0 + k) * lplane + e)];
+        }
+      }
+    }
+    MiniMaxH3VideoFrameShape cs{};
+    const std::vector<float> dec =
+        MiniMaxH3VideoVaeDecodeDevice(device, config, staged, sub, nt, latent_h, latent_w, &cs);
+    const int64_t dec_frames = cs.t;
+
+    for (int64_t j = 0; j < (config.token_drop > 0 ? 2 : 1); ++j) {
+      const int64_t f0 = j * chunk_dec;
+      if (f0 >= dec_frames) break;
+      const int64_t f1 = std::min(f0 + chunk_dec, dec_frames);
+      const int64_t keep0 = f0 + pre_pad;
+      if (keep0 >= f1) continue;
+      const int64_t nf = f1 - keep0;
+
+      std::vector<float> piece(static_cast<size_t>(chans * nf * plane));
+      for (int64_t c = 0; c < chans; ++c) {
+        for (int64_t f = 0; f < nf; ++f) {
+          for (int64_t e = 0; e < plane; ++e) {
+            piece[static_cast<size_t>((c * nf + f) * plane + e)] =
+                dec[static_cast<size_t>((c * dec_frames + keep0 + f) * plane + e)];
+          }
+        }
+      }
+
+      if (j == 0) {
+        if (carry_frames > 0) {
+          // blend(dec_overlap, piece, frame_overlap) along the FRAME axis
+          const int64_t ext = std::min({carry_frames, nf, frame_ov});
+          for (int64_t c = 0; c < chans; ++c) {
+            for (int64_t e = 0; e < plane; ++e) {
+              for (int64_t f = 0; f < ext; ++f) {
+                const double wb = static_cast<double>(f) / static_cast<double>(ext);
+                const float a_v = carry[static_cast<size_t>(
+                    (c * carry_frames + carry_frames - ext + f) * plane + e)];
+                float& b_v = piece[static_cast<size_t>((c * nf + f) * plane + e)];
+                b_v = static_cast<float>(a_v * (1.0 - wb) + b_v * wb);
+              }
+            }
+          }
+          carry.clear();
+          carry_frames = 0;
+        }
+        pieces.push_back(std::move(piece));
+        piece_frames.push_back(nf);
+      } else {
+        carry = std::move(piece);
+        carry_frames = nf;
+      }
+    }
+  }
+  if (carry_frames > 0) {
+    pieces.push_back(std::move(carry));
+    piece_frames.push_back(carry_frames);
+  }
+
+  int64_t total = 0;
+  for (const int64_t f : piece_frames) total += f;
+  std::vector<float> out(static_cast<size_t>(chans * total * plane));
+  int64_t at = 0;
+  for (size_t k = 0; k < pieces.size(); ++k) {
+    const int64_t nf = piece_frames[k];
+    for (int64_t c = 0; c < chans; ++c) {
+      for (int64_t f = 0; f < nf; ++f) {
+        for (int64_t e = 0; e < plane; ++e) {
+          out[static_cast<size_t>((c * total + at + f) * plane + e)] =
+              pieces[k][static_cast<size_t>((c * nf + f) * plane + e)];
+        }
+      }
+    }
+    at += nf;
+  }
+
+  // trim_output (klvae.py:452-459): non-causal decoders CENTER-crop to the frame
+  // count the request asked for.
+  if (target_frames > 0 && target_frames < total) {
+    const int64_t start = (total - target_frames) / 2;
+    std::vector<float> trimmed(static_cast<size_t>(chans * target_frames * plane));
+    for (int64_t c = 0; c < chans; ++c) {
+      for (int64_t f = 0; f < target_frames; ++f) {
+        for (int64_t e = 0; e < plane; ++e) {
+          trimmed[static_cast<size_t>((c * target_frames + f) * plane + e)] =
+              out[static_cast<size_t>((c * total + start + f) * plane + e)];
+        }
+      }
+    }
+    out = std::move(trimmed);
+    total = target_frames;
+  }
+
+  if (out_shape != nullptr) {
+    out_shape->channels = chans;
+    out_shape->t = total;
+    out_shape->h = out_h;
+    out_shape->w = out_w;
+  }
+  return out;
+}
+
 }  // namespace vllm

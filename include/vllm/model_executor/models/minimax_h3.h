@@ -39,6 +39,7 @@
 //                                            207-222, 374-434
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -502,6 +503,29 @@ struct MiniMaxH3VideoVaeDecoderConfig {
   int64_t num_register_tokens = 4;
   int64_t rope_apply_dim = 48;  // int(dim_head * rope_dim_ratio)
   double rope_theta = 100.0;
+
+  // TEMPORAL CHUNKING (klvae.py decode_temporal). The video decode is NOT one
+  // pass over the whole latent: upstream feeds the ViT `tokens_chunk_size +
+  // token_overlap` temporal tokens at a time. Since the decoder's RoPE is
+  // LENGTH-NORMALIZED over the grid it is handed, the temporal extent is part of
+  // the input -- a 12-token pass gives every token a position the model never saw.
+  int64_t clip_length = 17;   // config `clip_length`
+  int64_t token_drop = 3;     // config `token_drop`
+  int64_t vae_ratio_t = 4;    // prod(temporal_downsample_factors)
+
+  int64_t tokens_chunk_size() const {
+    return (clip_length + vae_ratio_t - 1) / vae_ratio_t;  // ceil
+  }
+  int64_t frame_pre_padding() const {
+    return ((-clip_length) % vae_ratio_t + vae_ratio_t) % vae_ratio_t;
+  }
+  int64_t token_overlap() const {
+    const int64_t c = tokens_chunk_size();
+    return c == 0 ? 0 : ((-token_drop) % c + c) % c;
+  }
+  int64_t frame_overlap() const {
+    return std::max<int64_t>(token_overlap() * vae_ratio_t - frame_pre_padding(), 0);
+  }
 };
 
 // The per-channel latent statistics both VAEs ship in their config.json. The
@@ -710,6 +734,22 @@ std::vector<float> MiniMaxH3VideoVaeDecodeDevice(vt::Device device,
 //
 // Falls through to the untiled decode, bit for bit, when the plan is a single tile
 // (canvas <= tile_size), which is why the reduced-dimension gates never saw this.
+// The video decode as upstream actually performs it: TEMPORAL CHUNKS.
+//
+// `decode_base` routes video through `decode_temporal`, never a single pass. The
+// ViT sees `tokens_chunk_size + token_overlap` temporal tokens at a time (7 for
+// the shipped config), and since its RoPE is LENGTH-NORMALIZED over the grid it is
+// handed, that extent is part of the input -- a whole-latent pass gives every
+// token a temporal position the model never saw.
+//
+// `target_frames` is the request's frame count; upstream center-crops to it
+// (trim_output). Pass 0 to keep every decoded frame.
+std::vector<float> MiniMaxH3VideoVaeDecodeTemporalDevice(
+    vt::Device device, const MiniMaxH3VideoVaeDecoderConfig& config,
+    const MiniMaxH3VideoVaeDeviceWeights& staged, const std::vector<float>& latent,
+    int64_t latent_t, int64_t latent_h, int64_t latent_w, int64_t target_frames,
+    MiniMaxH3VideoFrameShape* out_shape);
+
 std::vector<float> MiniMaxH3VideoVaeDecodeTiledDevice(
     vt::Device device, const MiniMaxH3VideoVaeDecoderConfig& config,
     const MiniMaxH3VideoVaeDeviceWeights& staged, const std::vector<float>& latent,
@@ -1170,6 +1210,9 @@ struct MiniMaxH3T2vaRequest {
   int64_t latent_t = 0, latent_h = 0, latent_w = 0;
   int64_t audio_t = 0;
   int64_t audio_channel = kMiniMaxH3AudioChannels;
+  // The frame count the request asked for. The temporal decode produces whole
+  // chunks and upstream center-crops to this (trim_output); 0 keeps every frame.
+  int64_t num_frames = 0;
   int64_t num_steps = kMiniMaxH3DefaultSteps;
   double video_shift = kMiniMaxH3DefaultVideoShift;
   double audio_shift = kMiniMaxH3DefaultAudioShift;

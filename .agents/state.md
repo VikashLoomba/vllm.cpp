@@ -35758,3 +35758,36 @@ something unconditioned. Wiring the encoder is the next step for a truthful API.
 Shape/seed/steps DO come from the request (MiniMaxH3ResolveShape over task,
 duration, frames, height, width; seed drives the noise stream), so everything except
 text conditioning is live.
+
+## 2026-08-04 - MiniMax-H3: FIRST real-checkpoint run on Thor - measured, not guessed
+
+Downloaded the real stack to Thor (DiT MiniMax-H3-FL2VA-Q3_K_M 15.58 GB, video VAE
+5.21 GB fp16, audio VAE 605 MB fp32, both configs) and ran it.
+
+WHAT WORKS: the DiT LOADS - geometry recovered from GGUF SHAPES alone as layers=50,
+hidden=5376, heads=56, i.e. the shipped H3 - both VAEs load through the loaders
+written this session, both configs parse, and the DiT forward RUNS on the GPU.
+
+★ KEEP-QUANT IS REQUIRED, NOT AN OPTIMIZATION. The dequant path is OOM-KILLED:
+Q3_K -> f32 is ~145 GB against 122 GB of unified memory. With --keep-quant the DiT
+stays at 15.6 GB and loads. The arm built earlier today is what makes a real run
+possible at all - a nice case of an "optimization" turning out to be the enabling
+condition.
+
+MEASURED (the VT_H3_PROGRESS trace added for exactly this):
+  weight staging to device   32.8 s, ONCE
+  DiT forward                199.96 s per step at seq_len 576
+So the 50-step default is ~2.8 h of DiT alone. Slow, but running.
+
+BLOCKER: the run TIMED OUT (EXIT=124) in the VIDEO VAE DECODE. That decoder is still
+CPU-ONLY - MiniMaxH3VideoVaeDecode has no device path - and it is a 36-layer,
+dim-2048 ViT3D on the host. So even with the DiT on GPU the decode is a serial CPU
+wall. This is a MISSING DEVICE PATH, not a tuning problem.
+
+METHOD NOTE worth keeping: nvidia-smi's GPU utilization is NOT reliable on this
+Tegra-class board (it also reports Memory-Usage "Not Supported"). I spent ~20 minutes
+treating "GPU 0%, CPU 75%" as evidence the device path was not taken; it WAS taken.
+One stderr phase trace settled in a single run what speculation had not. On this box,
+instrument - do not read the utilization counter.
+
+Also: --steps 1 is INVALID (N steps needs N+1 sigmas); the minimum is 2.

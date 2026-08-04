@@ -1168,4 +1168,20 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                                           // Null stages internally, as before.
                                           const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
 
+// The DENOISE half of `MiniMaxH3GenerateT2va` on its own: packed layout, the two
+// sigma schedules, and the step loop, stopping before the VAEs.
+//
+// `MiniMaxH3GenerateT2va` is implemented in terms of this, so there is one copy of
+// the layout and schedule logic rather than two. Exposed separately because the DiT
+// and the VAE decoders have very different cost profiles, and a caller measuring or
+// debugging the step loop should not have to load, or find memory for, either VAE.
+MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
+                                            const MiniMaxH3DitParams& dit_params,
+                                            const MiniMaxH3DitWeights& dit_weights,
+                                            const std::vector<float>& prompt_embeds,
+                                            const std::vector<float>& initial_video_rows,
+                                            const std::vector<float>& initial_audio_rows,
+                                            vt::DType compute_dtype,
+                                            const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
+
 }  // namespace vllm

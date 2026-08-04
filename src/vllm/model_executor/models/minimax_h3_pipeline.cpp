@@ -34,18 +34,14 @@
 
 namespace vllm {
 
-MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
-                                          const MiniMaxH3DitParams& dit_params,
-                                          const MiniMaxH3DitWeights& dit_weights,
-                                          const MiniMaxH3VideoVaeDecoderConfig& video_config,
-                                          const MiniMaxH3AudioVaeWeights& video_weights,
-                                          const MiniMaxH3AudioVaeConfig& audio_config,
-                                          const MiniMaxH3AudioVaeWeights& audio_weights,
-                                          const std::vector<float>& prompt_embeds,
-                                          const std::vector<float>& initial_video_rows,
-                                          const std::vector<float>& initial_audio_rows,
-                                          vt::DType compute_dtype,
-                                          const MiniMaxH3DitDeviceWeights* prestaged) {
+MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
+                                            const MiniMaxH3DitParams& dit_params,
+                                            const MiniMaxH3DitWeights& dit_weights,
+                                            const std::vector<float>& prompt_embeds,
+                                            const std::vector<float>& initial_video_rows,
+                                            const std::vector<float>& initial_audio_rows,
+                                            vt::DType compute_dtype,
+                                            const MiniMaxH3DitDeviceWeights* prestaged) {
   VT_CHECK(request.text_len > 0, "minimax_h3 t2va: text_len must be positive");
   VT_CHECK(request.num_steps >= 1, "minimax_h3 t2va: num_steps must be >= 1");
   VT_CHECK(static_cast<int64_t>(prompt_embeds.size()) == request.text_len * dit_params.text_dim,
@@ -68,10 +64,27 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
            "minimax_h3 t2va: the two sigma schedules must have equal length");
 
   // --- 3. the denoise loop (one DiT forward per step) ---
-  const MiniMaxH3DenoiseResult denoised = MiniMaxH3DenoiseLoop(
-      device, dit_params, dit_weights, branch, initial_video_rows, initial_audio_rows,
-      /*keyframe_cond_rows=*/{}, /*audio_ref_rows=*/{}, sigmas_video, sigmas_audio, compute_dtype,
-      prestaged);
+  return MiniMaxH3DenoiseLoop(device, dit_params, dit_weights, branch, initial_video_rows,
+                              initial_audio_rows, /*keyframe_cond_rows=*/{},
+                              /*audio_ref_rows=*/{}, sigmas_video, sigmas_audio, compute_dtype,
+                              prestaged);
+}
+
+MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
+                                          const MiniMaxH3DitParams& dit_params,
+                                          const MiniMaxH3DitWeights& dit_weights,
+                                          const MiniMaxH3VideoVaeDecoderConfig& video_config,
+                                          const MiniMaxH3AudioVaeWeights& video_weights,
+                                          const MiniMaxH3AudioVaeConfig& audio_config,
+                                          const MiniMaxH3AudioVaeWeights& audio_weights,
+                                          const std::vector<float>& prompt_embeds,
+                                          const std::vector<float>& initial_video_rows,
+                                          const std::vector<float>& initial_audio_rows,
+                                          vt::DType compute_dtype,
+                                          const MiniMaxH3DitDeviceWeights* prestaged) {
+  const MiniMaxH3DenoiseResult denoised =
+      MiniMaxH3DenoiseT2va(device, request, dit_params, dit_weights, prompt_embeds,
+                           initial_video_rows, initial_audio_rows, compute_dtype, prestaged);
 
   // --- 4. rows -> latents ---
   const int64_t ph = request.latent_h / dit_params.patch_size_h;

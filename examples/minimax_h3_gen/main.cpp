@@ -34,6 +34,7 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -109,7 +110,7 @@ std::string Need(int argc, char** argv, int i, const std::string& flag) {
 int main(int argc, char** argv) {
   std::string dit_path, video_vae_path, video_cfg_path, audio_vae_path, audio_cfg_path;
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
-  bool keep_quant = false, dry_run = false, dequant_bf16 = false;
+  bool keep_quant = false, dry_run = false, dequant_bf16 = false, denoise_only = false;
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path;
   int64_t encoder_max_layers = 0;
@@ -130,6 +131,7 @@ int main(int argc, char** argv) {
       else if (f == "--keep-quant") keep_quant = true;
       else if (f == "--dequant-bf16") dequant_bf16 = true;
       else if (f == "--dry-run") dry_run = true;
+      else if (f == "--denoise-only") denoise_only = true;
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
@@ -141,13 +143,18 @@ int main(int argc, char** argv) {
       else if (f == "--width") width = std::stoll(Need(argc, argv, ++i, f));
       else throw std::runtime_error("unknown argument: " + f);
     }
-    if (dit_path.empty() || video_vae_path.empty() || audio_vae_path.empty() ||
-        out_path.empty() || (embeds_path.empty() && (encoder_path.empty() || prompt.empty()))) {
+    // --denoise-only stops after the DiT step loop, so it needs neither VAE nor an
+    // output path -- and, just as importantly, does not spend their memory. On a
+    // unified-memory box that headroom is the difference between a run and a reboot.
+    const bool need_vaes = !denoise_only;
+    if (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
+        (need_vaes && out_path.empty()) ||
+        (embeds_path.empty() && (encoder_path.empty() || prompt.empty()))) {
       std::cerr << "usage: minimax-h3-gen --dit <f> --video-vae <f> --audio-vae <f> "
                    "--prompt-embeds <f32.bin> --out <out.mp4> [--video-vae-config <j>] "
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
-                   "[--dry-run]\n";
+                   "[--dry-run] [--denoise-only]\n";
       return 2;
     }
 
@@ -246,14 +253,18 @@ int main(int argc, char** argv) {
     if (!audio_cfg_path.empty()) {
       audio_cfg = vllm::ParseMiniMaxH3AudioVaeConfig(ReadJson(audio_cfg_path), &audio_stats);
     }
-    std::cerr << "loading video VAE " << video_vae_path << "\n";
-    const vllm::SafetensorsFile video_file = vllm::SafetensorsFile::Open(video_vae_path);
-    const vllm::MiniMaxH3AudioVaeWeights video_weights =
-        vllm::LoadMiniMaxH3VideoVaeDecoderWeights(video_file);
-    std::cerr << "loading audio VAE " << audio_vae_path << "\n";
-    const vllm::SafetensorsFile audio_file = vllm::SafetensorsFile::Open(audio_vae_path);
-    const vllm::MiniMaxH3AudioVaeWeights audio_weights =
-        vllm::LoadMiniMaxH3AudioVaeWeights(audio_file);
+    // The files stay in scope alongside the weights: the loaders read through the
+    // mapping, so releasing it early would leave the weights pointing at nothing.
+    std::optional<vllm::SafetensorsFile> video_file, audio_file;
+    vllm::MiniMaxH3AudioVaeWeights video_weights, audio_weights;
+    if (need_vaes) {
+      std::cerr << "loading video VAE " << video_vae_path << "\n";
+      video_file = vllm::SafetensorsFile::Open(video_vae_path);
+      video_weights = vllm::LoadMiniMaxH3VideoVaeDecoderWeights(*video_file);
+      std::cerr << "loading audio VAE " << audio_vae_path << "\n";
+      audio_file = vllm::SafetensorsFile::Open(audio_vae_path);
+      audio_weights = vllm::LoadMiniMaxH3AudioVaeWeights(*audio_file);
+    }
 
     // --- 3. request shape ---
     vllm::MiniMaxH3T2vaRequest request;
@@ -347,6 +358,29 @@ int main(int argc, char** argv) {
                 << " s\n";
       prestaged = &staged;
     }
+    if (denoise_only) {
+      // Time the DiT step loop by itself. Reported as an AVERAGE over the requested
+      // steps rather than a single step: the first step pays one-off costs (RoPE
+      // caches, allocator warm-up) that do not recur, so a one-step run overstates
+      // the steady-state cost.
+      const auto t0 = std::chrono::steady_clock::now();
+      const vllm::MiniMaxH3DenoiseResult denoised = vllm::MiniMaxH3DenoiseT2va(
+          device, request, dit.params, dit.weights, prompt_embeds, noise_video, noise_audio,
+          vt::DType::kBF16, prestaged);
+      const double elapsed =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      const int64_t seq = static_cast<int64_t>(request.text_len) + video_rows + audio_rows;
+      std::cout << "denoise-only: seq=" << seq << " steps=" << request.num_steps << " total="
+                << elapsed << " s  per_step=" << (elapsed / double(request.num_steps)) << " s\n";
+      // Touch the result so the loop cannot be optimized away, and so an all-NaN
+      // forward shows up here instead of passing as a fast run.
+      double checksum = 0.0;
+      for (const float v : denoised.video_rows) checksum += v;
+      std::cout << "  video_rows=" << denoised.video_rows.size() << " checksum=" << checksum
+                << "\n";
+      return 0;
+    }
+
     const vllm::MiniMaxH3T2vaResult result = vllm::MiniMaxH3GenerateT2va(
         device, request, dit.params, dit.weights, video_cfg, video_weights, audio_cfg,
         audio_weights, prompt_embeds, noise_video, noise_audio, vt::DType::kBF16, prestaged);

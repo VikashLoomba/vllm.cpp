@@ -35869,3 +35869,28 @@ vs `model.language_model.layers.N.` there, `visual.` vs `model.visual.`.
 REMAINS for conditioning: a DEVICE encoder forward that consumes these quantized
 weights (the existing MiniMaxH3EncoderTextForward is a host f32 reference), plus
 tokenization and the embedding gather.
+
+## 2026-08-04 - MiniMax-H3: the REAL 32B encoder loads keep-quant on Thor
+
+`--encoder /ckpt/enc_q4km.gguf --encoder-max-layers 50` on the real 14.58 GB file:
+
+  encoder layers=50 hidden=5120 heads=64 kv_heads=8 head_dim=128 ffn=25600
+  encoder resident (keep-quant) = 13.2421 GiB
+
+Geometry recovered from SHAPES alone, and it is Qwen3-32B exactly (64 heads x 128,
+8:1 GQA, ffn 25600). Layers are 50 because H3 truncates - the file ships 64. It loads
+ALONGSIDE the keep-quant DiT, so the full stack fits the box.
+
+THE REAL FILE CORRECTED A DESIGN ASSUMPTION. My loader asserted a fused group shares
+one ggml encoding; the shipped Q4_K_M encoder stores v_proj as Q6_K while q/k are
+Q4_K - the usual K_M recipe of keeping V at higher precision. So the attention group
+CANNOT be byte-concatenated.
+
+Fusion is now conditional: uniform groups fuse (gate/up still do), mixed groups keep
+their members separate in their own encodings. Dequantizing to force the fusion was
+the alternative and would have discarded exactly the precision the recipe exists to
+keep - so a mixed checkpoint costs extra GEMM launches, not precision.
+
+Worth noting the assertion is what found this. A loader that silently took the first
+member's dtype would have produced a tensor whose v rows were garbage, and nothing
+downstream would have said so.

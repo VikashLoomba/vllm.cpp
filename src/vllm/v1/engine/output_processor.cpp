@@ -514,14 +514,20 @@ OutputProcessorOutput OutputProcessor::process_outputs(
       // the SAME workload. Reads only; byte-identical generation when unset.
       static const bool kDumpTtftSplit = std::getenv("VT_TTFT_DUMP") != nullptr;
       if (kDumpTtftSplit) {
+        // intake = QUEUED - arrival: the async engine-core intake wait, from
+        // OutputProcessor registration (arrival_time, MonotonicSeconds set in
+        // add_request AFTER tokenize) to the scheduler's QUEUED event (same
+        // steady clock). This isolates the engine-side ingress cost (input-queue
+        // drain / step cadence) from tokenize (before arrival) and egress.
+        const double intake = req_state.queued_ts - req_state.arrival_time;
         const double queued = req_state.scheduled_ts - req_state.queued_ts;
         const double prefill = req_state.first_token_ts - req_state.scheduled_ts;
         const double decode = req_state.last_token_ts - req_state.first_token_ts;
         const double e2e = engine_core_timestamp - req_state.arrival_time;
         std::fprintf(stderr,
-                     "TTFTSPLIT rid=%s queued=%.6f prefill=%.6f decode=%.6f "
-                     "e2e=%.6f gen=%lld\n",
-                     req_id.c_str(), queued, prefill, decode, e2e,
+                     "TTFTSPLIT rid=%s intake=%.6f queued=%.6f prefill=%.6f "
+                     "decode=%.6f e2e=%.6f gen=%lld\n",
+                     req_id.c_str(), intake, queued, prefill, decode, e2e,
                      static_cast<long long>(req_state.num_generation_tokens));
       }
 

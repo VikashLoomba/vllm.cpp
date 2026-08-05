@@ -36,7 +36,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Model | Quant | vLLM pin | Axes passing | Disposition |
 |---|---|---|---:|---|
 | Qwen3.6-27B | NVFP4 | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality |
-| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | fresh 3-rep grid 2026-08-05 @`1ea26427`: tput 0.93-1.03x (c4 wins), TTFT 0.93-0.98x; c1 closed 0.82→0.98; c16 0.93x. c16 drain-sync lever A/B'd (below): blocking-event LOST -1.9%, drain kept; cost = serialization |
+| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.24.0 | 5/8 | Throughput 0.98x, TTFT and memory win |
 
@@ -83,7 +83,21 @@ read-after-writes the previous step's device scatter of `last_sampled_tokens`, a
 true data dependency on the integrated host-array combine path that cannot be
 overlapped without moving sampled tokens GPU-resident (vLLM's `prev_sampled_
 token_ids` device gather). The full drain is byte-exact and UAF-safe and is
-**kept**; the device-resident lever is the open follow-up.
+**kept**.
+
+**Device-resident sampled tokens on integrated (`VT_ASYNC_DEVICE_MIRROR`) A/B'd
+2026-08-06, also NEUTRAL** (same-binary): c16 OFF median 2305.8 vs ON 2303.3
+(0.999x), c32 2928.9 vs 2919.1 (0.997x), bands overlap. It is a drain MOVE (relocate
+the drain past the host prep, not remove it), so it overlaps only the small host
+prep; the drain still serializes GPU input staging, so c16 does not recover. Real
+c16 recovery needs the drain REMOVAL plus double-buffered `exec_state_`/block-table.
+Gated OFF. Detail in the benchmark record.
+
+**Correctness finding from the token-exactness probe:** the baseline async batch-1
+greedy decode DEGENERATES into token-0 garbage, nondeterministically, reproducing
+byte-identically on the unchanged production server (`1ea26427`); the mirror fixes
+it (deterministic, coherent). Never caught because SACRED exercises the SYNC engine,
+not the async served path. An async-serving token-exact gate is owed.
 
 ### DeepSeek-V2-Lite (MLA)
 
@@ -272,7 +286,7 @@ built on it rather than keeping the flattering one.
 | Track | Status | Next gate |
 |---|---|---|
 | 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
-| 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x, drain-sync lever measured NEGATIVE 2026-08-05 (blocking-event −1.9%) | GPU-resident sampled tokens (vLLM `prev_sampled_token_ids`) so host `condense` stops data-depending on the device scatter |
+| 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. Both c16 levers A/B'd NEGATIVE: drain blocking-event 2026-08-05 (−1.9%), device-resident sampled tokens `VT_ASYNC_DEVICE_MIRROR` 2026-08-06 (0.999x NEUTRAL); gated OFF | c16 recovery needs drain-removal + double-buffered `exec_state_`/block-table (mirror alone overlaps only host prep). Separately: async batch-1 greedy DEGENERATES (prod bug the mirror fixes); async-serving token gate owed |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |

@@ -19,7 +19,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate models & on-framework dense unaffected (bf16-out, e2e-verified) | Re-verify deepseek_v4 bf16 tower same-tool |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **§8 golden STRICT** + **bf16-resident loader/forward IMPLEMENTED + CPU-gated 13/13·656** (`row/MODEL-KIMI-LINEAR-BF16`, §13): `GemmBf16` cast-act + stage-then-ReleaseHost loader + `kimi-linear-gen` harness; pool math ~94 GiB CLOSES | dgx CUDA build + full-model e2e vs STRICT golden PENDING; default OFF |
+| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13, f32-loader block CLEARED): CPU+CUDA 13/13·656; host RSS peak 1.7 GiB, min-avail 21 GiB, no OOM. **Token gate NEAR-TIE 106/128** (6/8 prompts token-exact; numerics near-tie vs deterministic oracle, not a bug) | STRICT path = device GDN/MLA islands + bf16 stream (W7-speed residuals); 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 

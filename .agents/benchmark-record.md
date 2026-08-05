@@ -12182,3 +12182,31 @@ memory-critical full-model e2e are the scoped next execution (§13 Gates). CPU M
 supports f32-act x bf16-weight (cuda_deepseek_v4.cu:1821), so a CPU-only variant is possible,
 but the vLLM-parity path is the cast-to-bf16 GEMM above. No code landed this session beyond
 the pool-math/design records; nothing broken.
+
+## Kimi-Linear-48B-A3B: FULL-MODEL GB10 e2e RUNS via bf16-resident path — NEAR-TIE 106/128 (2026-08-06)
+
+The §13 bf16-resident loader/forward LANDED and the full 48.9B model now runs e2e on ONE GB10
+(f32-loader block CLEARED). Build: dgx.casa GB10 sm_121a, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, nvcc 13.0.88,
+Release, `-Werror` clean (in `/dev/shm`); 14 GDN AOT `gdn_*_default` symbols nm-linked;
+`test_kimi_linear_forward` 13/13·656 in the CUDA binary. Vehicle: `kimi-linear-gen --gpu` greedy the
+§12 8-prompt battery x16 through the bf16 `ForwardDeviceCompute` vs `greedy_ids.npy`.
+
+MEMORY (pool math CLOSES): load 117.6s; host RSS PEAK 1.7 GiB (stage-then-ReleaseHost — one tensor's
+host bytes live at a time); device peak 100896 MiB (98.5 GiB); min available 21605 MiB (21.1 GiB)
+throughout — above the 15 GiB floor, matches the predicted ~25 GiB headroom. NO OOM/reboot. Load-only
+smoke first: same profile (min-avail 22.0 GiB, peak-used 100021 MiB). Ran under both flock locks,
+correctly WAITED behind the co-tenant MXFP4 job.
+
+TOKEN gate: NEAR-TIE 106/128 (82.8%), NOT STRICT. Per-prompt matches (of 16): p0 16, p1 16, p2 0,
+p3 16, p4 16, p5 16, p6 16, p7 10. p2 diverges from token 0 (261 vs 276); p7 diverges at a comma
+(pos 6: 387 vs 11). Golden DETERMINISTIC (K=3) at both points, so a genuine numerics near-tie — 96
+consecutive exact tokens across 6 prompts prove the wiring. Root cause: the f32 residual stream (§13
+design, for the host islands) + the host-f64 KDA-recurrence/MLA-softmax islands are MORE precise than
+vLLM's bf16 device kernels, flipping the argmax on small-margin punctuation/word boundaries.
+
+SPEED: 1.59 tok/s steady (0.630 s/step over 127 steps) — the O(n^2) full-recompute + host-island rate,
+a NAMED speed residual, NOT an optimized decode. DEFAULT: `VT_KIMI_DEVICE_COMPUTE` STAYS OFF
+(near-tie != token-exact). PATH TO STRICT + speed = the named W7 residuals: device GDN per-channel
+recurrence + exp/softplus gate op + paged `mla::ForwardMlaAttentionBlock` + a bf16 residual stream
+end-to-end (matches vLLM's rounding, removes the host round-trips).

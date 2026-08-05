@@ -377,6 +377,17 @@ W4A16 for a second reference point (W4A4 vs W4A16 on one box).
   and the fp4 dequant (`dequant_skip_flop=false` bias path) is a faithful lift, so
   the residual is inside the group_blocks=2 Marlin GEMM interaction — a path our
   prior NVFP4-only usage (group_blocks=1) never exercised.
+- **W3 e2e — COMPUTE PATH GREEN (async-off token-exact 3/4); async-default degeneration
+  ROOT-CAUSED as a PRE-EXISTING non-MXFP4 bug.** With `VT_ASYNC_SCHED=0` our engine's
+  native Marlin mxf4 e2e is TOKEN-EXACT vs the golden on 3 of 4 prompts (p1/p2/p4);
+  the 4th (open-ended story) diverges after the identical first token — bf16 /
+  implementation non-determinism (near-tie/distributional regime). The DEFAULT
+  (async on) degenerated, but NOT from MXFP4: the async executor overlaps the prior
+  step's output-copy with the forward, and classic dense `Qwen3ForCausalLM` lacks the
+  async device-mirror fix (the #31 class wired only for the gate models) — a
+  quant-independent, pre-existing classic-dense-Qwen3 async bug (SEPARATE row).
+  Evidence: `docs/bench-evidence/mxfp4-qwen/W3-e2e-result.md`. So the MXFP4
+  keep-quant COMPUTE is correct (3/4 e2e token-exact + all unit gates below).
 - **W3 unit gate — GREEN (`test_ops_moe_grouped.cpp`, commit `8469e333`).** The MXFP4
   Marlin GEMM (`MoeGroupedGemmNvfp4Marlin`, mxfp4 args) vs the INDEPENDENT CPU dequant
   reference (`DequantMxfp4ToF32` + f32 matmul) at K=256,N=128: **max_rel 3.8e-3** at

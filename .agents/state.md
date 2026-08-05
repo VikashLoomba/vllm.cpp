@@ -36323,3 +36323,31 @@ by the Kimi bf16 agent — locks HELD, WAITED, did not intrude); RED at a model 
 large-shape kernel fix; GREEN => per-layer activation dump. Then re-gate e2e + W4 bench.
 Box left as found (Kimi holds the locks; my tmux sessions killed; build tree persists at
 dgx:~/work/mxfp4-w2).
+
+## QUANT-CT-MXFP4 e2e RESOLVED: compute CORRECT (async-off 3/4 token-exact); async-default degeneration is a PRE-EXISTING classic-dense-Qwen3 bug
+
+<!-- state: 2026-08-07T03:00 -->
+
+Closed the e2e residual. Root-caused via the box-free continuation: the DEFAULT
+(async scheduling ON) degeneration is NOT the MXFP4 compute — with VT_ASYNC_SCHED=0
+the SAME binary is TOKEN-EXACT vs the golden on 3/4 prompts (p1 capitals, p2 arithmetic,
+p4 fibonacci all EXACT; p3 open-ended story diverges after the identical first token
+" there" = bf16/impl non-determinism, near-tie regime). The async executor overlaps
+the prior step's output-copy (async_copy_queue_) with the current forward; classic dense
+Qwen3ForCausalLM (qwen3.cpp) lacks the async device-mirror fix (the #31 "async batch-1
+token-0 degeneration" class wired only for the gate models qwen3_5) -> quant-independent,
+pre-existing classic-dense-Qwen3 async bug (SEPARATE row; would hit bf16/NVFP4 too).
+
+MXFP4 compute PROVEN correct across the full stack: op-level Marlin GEMM vs independent
+CPU dequant (0.36% M=1/M=8, all real shapes, e28130ee); scale permute byte-exact vs vLLM
+at all model shapes; model-facing MakeLinearMethod->Apply->BuildMarlinDenseResident gate
+(bad=0 K=4096+K=12288, 02410453); and e2e async-off 3/4 token-exact. Also surfaced +
+recorded: MarlinDenseResidentFor is keyed by weight POINTER (fine in the model; a reused
+stack slot aliases in tests). Reverted an exploratory per-stream DenseMarlinWorkspace
+change (not the async cause; async overlaps output-copy, not 2 forwards).
+
+REMAINING: (1) classic-dense-Qwen3 async device-mirror fix (separate row, non-MXFP4) for
+a default-config e2e; (2) W4 bench (online_gate.py c1..c8x3) on the async-off compute
+path, oracle arm VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel; (3) formal
+distributional gate for p3. Evidence: docs/bench-evidence/mxfp4-qwen/W3-e2e-result.md.
+Box: locks released, tmux killed, build tree persists at dgx:~/work/mxfp4-w2.

@@ -11699,3 +11699,43 @@ Follow-ups: async-serving token-exact gate; precise batch-1 host-combine↔decod
 root-cause; then a correctness-based default decision; c16 speed still needs
 drain-removal + double-buffer. Evidence
 `dgx:~/work/mirror-ab/{mab-measure.log,mab-tokdiag.log,mab-prodcheck.log,evidence/raw/35/ours/c16-r{1,2,3}-abmirr{off,on}.json,greedy/*}`.
+
+## ROW-SERVE-ASYNC-LLM: async batch-1 token-0 degeneration ROOT-CAUSED + FIXED (mirror default ON); async-serving token-exact gate landed; c16 re-checked neutral
+
+`benchmark_binding=false` (correctness fix + no-regression re-check, not a new
+binding grid). Closes the 2026-08-06 correctness finding.
+
+ROOT CAUSE. Async serving (AsyncLLM depth-2, `step_with_batch_queue`) batch-1 greedy
+decode on 35B NVFP4 nondeterministically degenerated into repeated token-0 garbage.
+`sample_tokens_async` (`runner.cpp:2148-2154`) deletes the synchronous
+`token_ids_cpu` write-back, so the next `prepare_inputs` reads a stale/zero decode-row
+placeholder and relies on the device combine. On `VT_ASYNC_DEVICE_MIRROR=0` the
+combine patches `step.input_token_ids` on the main queue (`runner.cpp:982-986`) while
+the Qwen3.5 decode graph reads it on the CPU (`qwen3_5.cpp` BuildPaddedDecode ->
+CopyInPlace -> EmbedInto host upload) with no sync — an unsynchronized
+device-write/host-read race; CPU wins -> embeds token 0. The SYNC engine
+(`LLMEngine::step` -> `EngineCore::step`, depth-1) writes `token_ids_cpu`
+synchronously so the combine is redundant and the race harmless — which is why the
+SACRED SYNC gate never caught it.
+
+FIX. Flip `VT_ASYNC_DEVICE_MIRROR` default ON (device-resident sampled tokens; the
+embed reads the combine's device output on-queue via `ApplyDeviceTokenIdsOverride`).
+Chosen over a per-step post-combine `Synchronize` (which reintroduces the async
+path's host sync — a c16 regression — and is a GB10-only hack, not parity). Upstream
+parity: states.py:64 + gpu_model_runner.py `_prepare_input_ids`. `=0` is the rollback.
+
+GATE (the missing one). `tests/parity/test_qwen36_async_serving.cpp` drives
+`async_engine()` (AsyncLLM depth-2), batch-1 (5 reps) + 4-way concurrency, token-exact
+vs the SACRED oracle continuation. RED on `=0` (ctest exit=8, nondet token-0
+garbage), GREEN on the default (100% pass, 39.3s). dgx-only; CPU skips.
+
+GATES. SACRED `test_qwen36_paged_engine` default (mirror ON) exit=0 (SYNC token-exact).
+UAF served ignore_eos mt 4-128 (default server): all http 200 + ALIVE.
+compute-sanitizer memcheck async gate (default): MEMCHECK_EXIT=0 (ERROR SUMMARY: 0 errors; the async gate passed 39/39 assertions under the sanitizer).
+
+c16 3-rep, FINAL default (no env -> mirror ON), single load, dual-lock:
+2312.9/2303.9/2294.4 total tok/s, **median 2303.9** vs the ~2305 drained baseline —
+NO regression (rollback `=0` arm median 2290.0). c32 default 2942.7.
+Evidence `dgx:~/work/mirror-ab/{asyncgate2-{RED,GREEN}.log,
+asyncgate-SACRED-default.log,mab-defmeasure.log,mab-asyncmemcheck.log,
+evidence/raw/35/ours/c16-r{1,2,3}-{defaulton,rollback0}.json}`.

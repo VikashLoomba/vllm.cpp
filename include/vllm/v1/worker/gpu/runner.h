@@ -475,12 +475,13 @@ class GPUModelRunner final : public ModelRunnerBase {
   };
   std::unique_ptr<AsyncDeviceInputs> async_device_inputs_;
   // Allocate on first use, or return nullptr when the mirror is not engaged
-  // (non-CUDA backend, async not engaged, or VT_ASYNC_DEVICE_MIRROR unset). Caller
+  // (non-CUDA backend, async not engaged, or VT_ASYNC_DEVICE_MIRROR=0). Caller
   // treats nullptr as "take the pre-W4 host-array path".
   AsyncDeviceInputs* get_or_create_async_device_inputs();
   // True when this runner mirrors the async inputs onto the device: CUDA, async
-  // engaged, VT_ASYNC_DEVICE_MIRROR set, on a real GPU (integrated OR discrete;
-  // not the CPU backend). Memoized. Default OFF pending the integrated A/B.
+  // engaged, VT_ASYNC_DEVICE_MIRROR not "0", on a real GPU (integrated OR discrete;
+  // not the CPU backend). Memoized. Default ON since the 2026-08-06 correctness
+  // flip (ROW-SERVE-ASYNC-LLM P0); VT_ASYNC_DEVICE_MIRROR=0 is the rollback.
   bool async_device_mirror() const;
   mutable int async_device_mirror_cached_ = -1;  // -1 unknown, 0 no, 1 yes
   // Push the recorded InputBatch structural edits (seed/move/swap) to the device

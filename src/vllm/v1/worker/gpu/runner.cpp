@@ -917,12 +917,12 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // persistent batch is already condensed dense (batch row == req_state slot).
   // Runs on the HOST side of input prep, BEFORE the forward and OUTSIDE any
   // CUDA-graph capture (input prep always precedes the decode graph replay), so
-  // it is capture-safe. Default OFF: production keeps the byte-identical sync
-  // host path (both give the same id, since sample_tokens writes the same token
-  // to token_ids_cpu and last_sampled_tokens).
-  // Non-null only on the W4 discrete-CUDA path below: the device input-id buffer
-  // the combine patched, handed to the forward so it embeds the spliced ids
-  // instead of the (deliberately stale) host vector.
+  // it is capture-safe. The mirror is DEFAULT ON (ROW-SERVE-ASYNC-LLM P0 fix);
+  // VT_ASYNC_DEVICE_MIRROR=0 rolls back to the host-array combine, whose host
+  // decode-graph read races this combine's device write (the bug the flip fixes).
+  // Non-null on the W4 mirror path below (the default; integrated OR discrete):
+  // the device input-id buffer the combine patched, handed to the forward so it
+  // embeds the spliced ids instead of the (deliberately stale) host vector.
   const int32_t* device_input_ids = nullptr;
   if (async_input_combine_ && num_reqs > 0) {
 #ifdef VLLM_CPP_CUDA
@@ -1957,28 +1957,45 @@ AsyncOutputPool& GPUModelRunner::get_or_create_async_output_pool() {
   return *async_output_pool_;
 }
 
-// ─── ENG-ASYNC-SCHED W4: discrete-CUDA device-resident async inputs ──────────
+// ─── ENG-ASYNC-SCHED W4: CUDA device-resident async inputs ───────────────────
 
-// W4 opt-in, DEFAULT OFF — deliberately, and following the precedent W3 set for
-// exactly this situation: the W3 device combine/scatter kernels also landed
-// default OFF and were flipped on only after a measured A/B on the hardware they
-// targeted. W4's target is the depth-2 overlap of the ASYNC serving loop
-// (AsyncLLM -> step_with_batch_queue -> sample_tokens_async). The synchronous
-// LLMEngine::step() loop that vllm-bench and every synchronous embedding drive
-// has no overlap to unlock, so on that path W4 is correct but cannot pay: it
-// adds four small uploads and two kernels per step and removes nothing. Until a
-// SERVING A/B shows the win it was built for, production keeps the byte-identical
-// host path and this is the switch that turns the mechanism on.
+// W4, DEFAULT ON since the 2026-08-06 CORRECTNESS flip (ROW-SERVE-ASYNC-LLM P0).
+// It landed default OFF (W3's A/B precedent: prove the speed win before flipping),
+// and the c16 A/B came back NEUTRAL (0.999x — the drain MOVE overlaps only host
+// prep). But the token-exactness probe that A/B ran uncovered a latent, SHIPPING
+// correctness bug the OFF path CANNOT avoid: on the async serving loop
+// (AsyncLLM -> step_with_batch_queue -> sample_tokens_async) the sampled token is
+// not written to token_ids_cpu synchronously (see sample_tokens_async), so the
+// next step's prepare_inputs reads a stale/zero decode-row placeholder and RELIES
+// on the device combine. On the OFF integrated path the combine patches
+// step.input_token_ids on the MAIN QUEUE while the Qwen3.5 decode graph reads that
+// same host vector on the CPU (BuildPaddedDecode -> CopyInPlace -> EmbedInto's
+// host->device upload) with NO intervening sync — an unsynchronized
+// device-write/host-read race that nondeterministically embeds the zero
+// placeholder and degenerates batch-1 greedy decode into repeated token-0 garbage.
+// Making step.input_token_ids device-resident (this mirror) routes the combine's
+// output into the embed via ApplyDeviceTokenIdsOverride, main-queue-ordered after
+// the combine, so the embed never does the racing host read. The only OFF-path
+// alternative is a per-step Synchronize after the combine — which reintroduces the
+// host sync the async path exists to remove (a c16 REGRESSION) and is a GB10-only
+// band-aid, not parity. This is exactly what upstream does on every platform
+// (states.py:64 keeps prev_sampled_token_ids a GPU tensor; gpu_model_runner.py's
+// _prepare_input_ids gathers on the GPU), so flipping the default ON is MIRROR-vLLM
+// parity, speed-neutral, and gated: VT_ASYNC_DEVICE_MIRROR=0 is the rollback to the
+// (racy) host-array path for an A/B. The async-serving token-exact gate
+// (test_qwen36_async_serving.cpp) is RED on =0 and GREEN on the default.
 //
-// VT_ASYNC_DEVICE_MIRROR=1 engages it. Distinct from VT_ASYNC_RUNNER, which would
-// also turn off async scheduling itself; keeping them separate is what makes an
-// honest A/B of W4 alone possible — same binary, same scheduler, one mechanism.
+// Distinct from VT_ASYNC_RUNNER, which would also turn off async scheduling
+// itself; keeping them separate is what makes an honest A/B of W4 alone possible —
+// same binary, same scheduler, one mechanism.
 #ifdef VLLM_CPP_CUDA
 // Guarded with its only use below: on a CPU build the mirror cannot exist, and
-// an unused static function is a -Werror=unused-function break there.
+// an unused static function is a -Werror=unused-function break there. DEFAULT ON:
+// on unless VT_ASYNC_DEVICE_MIRROR is explicitly "0" (the rollback), mirroring the
+// AsyncRunnerFlagIsOn convention.
 static bool AsyncDeviceMirrorEnvDefault() {
   const char* value = std::getenv("VT_ASYNC_DEVICE_MIRROR");
-  return value != nullptr && value[0] == '1';
+  return value == nullptr || value[0] != '0';
 }
 #endif
 
@@ -1994,8 +2011,9 @@ bool GPUModelRunner::async_device_mirror() const {
   //    making last_sampled_tokens device-resident removes the host condense<->
   //    scatter read-after-write that pins the async drain to the TOP of
   //    execute_model, letting the bulk host prep overlap the GPU tail (a drain
-  //    MOVE). This is the lever VT_ASYNC_DEVICE_MIRROR turns on for GB10; DEFAULT
-  //    OFF until an A/B proves the win byte-exact.
+  //    MOVE) AND — the reason it is now DEFAULT ON — removes the unsynchronized
+  //    combine-write/host-read race the OFF path has with the decode-graph embed
+  //    (ROW-SERVE-ASYNC-LLM P0). VT_ASYNC_DEVICE_MIRROR=0 rolls back to it.
   //  - The CPU backend (UnifiedMemory AND not an integrated GPU) keeps the in-place
   //    host path — mirroring there would only add copies with no GPU tail to hide.
   // is_integrated_gpu() is already read at the combine/scatter sites in this file,

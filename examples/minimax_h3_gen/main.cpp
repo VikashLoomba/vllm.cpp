@@ -77,6 +77,41 @@ nlohmann::json ReadJson(const std::string& path) {
   return j;
 }
 
+// A binary PPM (P6) reader, so a reference frame can be handed in with no image
+// dependency -- the same format this example already WRITES for its own output,
+// so a frame from one run can condition the next. Returns [3, H, W] in [-1, 1],
+// which is the range the VAE encoder expects.
+std::vector<float> ReadPpmAsChw(const std::string& path, int64_t* out_h, int64_t* out_w) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open " + path);
+  std::string magic;
+  in >> magic;
+  if (magic != "P6") throw std::runtime_error(path + ": not a binary PPM (P6)");
+  auto next_int = [&]() {
+    int v = 0;
+    while (in >> std::ws, in.peek() == '#') { std::string skip; std::getline(in, skip); }
+    in >> v;
+    return v;
+  };
+  const int w = next_int(), h = next_int(), maxv = next_int();
+  if (w <= 0 || h <= 0 || maxv <= 0) throw std::runtime_error(path + ": bad PPM header");
+  in.get();  // the single whitespace byte before the payload
+  std::vector<unsigned char> rgb(static_cast<size_t>(w) * h * 3);
+  in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(rgb.size()));
+  if (!in) throw std::runtime_error(path + ": truncated PPM payload");
+  std::vector<float> chw(rgb.size());
+  const int64_t plane = static_cast<int64_t>(w) * h;
+  for (int64_t i = 0; i < plane; ++i) {
+    for (int64_t c = 0; c < 3; ++c) {
+      chw[static_cast<size_t>(c * plane + i)] =
+          static_cast<float>(rgb[static_cast<size_t>(i * 3 + c)]) / (maxv * 0.5f) - 1.0f;
+    }
+  }
+  if (out_h != nullptr) *out_h = h;
+  if (out_w != nullptr) *out_w = w;
+  return chw;
+}
+
 std::vector<float> ReadF32(const std::string& path) {
   std::ifstream in(path, std::ios::binary | std::ios::ate);
   if (!in) throw std::runtime_error("cannot open " + path);
@@ -114,6 +149,8 @@ int main(int argc, char** argv) {
   bool dump_params = false;
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
+  std::string first_frame_path, last_frame_path;
+  double imgvid_noise_aug = 1.0;
   int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
 
@@ -139,6 +176,9 @@ int main(int argc, char** argv) {
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
       else if (f == "--tokenizer") tokenizer_path = Need(argc, argv, ++i, f);
       else if (f == "--save-embeds") save_embeds_path = Need(argc, argv, ++i, f);
+      else if (f == "--first-frame") first_frame_path = Need(argc, argv, ++i, f);
+      else if (f == "--last-frame") last_frame_path = Need(argc, argv, ++i, f);
+      else if (f == "--noise-aug") imgvid_noise_aug = std::stod(Need(argc, argv, ++i, f));
       else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--frames") frames = std::stoll(Need(argc, argv, ++i, f));
@@ -162,7 +202,8 @@ int main(int argc, char** argv) {
                    "--prompt-embeds <f32.bin> --out <out.mp4> [--video-vae-config <j>] "
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
-                   "[--dry-run] [--denoise-only] [--dump-params]\n";
+                   "[--dry-run] [--denoise-only] [--dump-params] "
+                   "[--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A]\n";
       return 2;
     }
 
@@ -369,6 +410,41 @@ int main(int argc, char** argv) {
     request.video_latents_std = video_stats.std_dev;
     request.audio_latents_mean = audio_stats.mean;
     request.audio_latents_std = audio_stats.std_dev;
+
+    // --- fl2va KEYFRAMES: encode the supplied frame(s) into pinned conditioning.
+    // Upstream allows exactly {0}, {-1} or {0, -1}: first, last, or both.
+    if (!first_frame_path.empty() || !last_frame_path.empty()) {
+      VT_CHECK(!video_vae_path.empty(),
+               "minimax-h3-gen: --first-frame/--last-frame need --video-vae (the ENCODER half)");
+      const vllm::SafetensorsFile vf = vllm::SafetensorsFile::Open(video_vae_path);
+      const vllm::MiniMaxH3AudioVaeWeights enc_w = vllm::LoadMiniMaxH3VideoVaeEncoderWeights(vf);
+      vllm::MiniMaxH3EncoderFcn3dConfig enc_cfg;
+      enc_cfg.z_channels = 2 * dit.params.latents_dim;  // moments: mean | logvar
+
+      std::vector<std::vector<float>> imgs;
+      std::vector<int64_t> idx;
+      int64_t ih = 0, iw = 0;
+      if (!first_frame_path.empty()) {
+        std::cerr << "loading first frame " << first_frame_path << "\n";
+        imgs.push_back(ReadPpmAsChw(first_frame_path, &ih, &iw));
+        idx.push_back(0);
+      }
+      if (!last_frame_path.empty()) {
+        int64_t h2 = 0, w2 = 0;
+        std::cerr << "loading last frame " << last_frame_path << "\n";
+        imgs.push_back(ReadPpmAsChw(last_frame_path, &h2, &w2));
+        if (ih == 0) { ih = h2; iw = w2; }
+        VT_CHECK(h2 == ih && w2 == iw,
+                 "minimax-h3-gen: the first and last frames must have the same size");
+        idx.push_back(-1);
+      }
+      request.keyframe_frame_indices = idx;
+      request.imgvid_noise_aug = imgvid_noise_aug;
+      request.keyframe_cond_rows = vllm::MiniMaxH3EncodeKeyframeCondRows(
+          enc_cfg, enc_w, dit.params, imgs, ih, iw, request.latent_t, imgvid_noise_aug, {});
+      std::cerr << "  keyframe conditioning: " << imgs.size() << " frame(s) at " << iw << "x" << ih
+                << " -> " << request.keyframe_cond_rows.size() << " floats\n";
+    }
 
     // Real conditioning when a prompt was encoded; otherwise the supplied file.
     const std::vector<float> prompt_embeds =

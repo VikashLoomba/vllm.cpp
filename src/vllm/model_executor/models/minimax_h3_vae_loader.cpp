@@ -180,6 +180,83 @@ MiniMaxH3AudioVaeWeights LoadMiniMaxH3VideoVaeDecoderWeights(const SafetensorsFi
   return out;
 }
 
+// The ENCODER half of the same file — the piece the decoder loader deliberately
+// skips. Needed for CONDITIONING (fl2va keyframes, ref2va references): turning a
+// supplied image or clip into the latent the DiT is conditioned on.
+//
+// Mirrors the decoder loader's one mapping rule in reverse: strip `encoder.`,
+// because MiniMaxH3EncoderFcn3dForward reads bare names (`conv_in.weight`,
+// `down.N.block.M...`). `quant_conv` IS kept — it is the encoder's output stage,
+// projecting conv_out's 48 channels to the 48 that split into mean|logvar.
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3VideoVaeEncoderWeights(const SafetensorsFile& file) {
+  MiniMaxH3AudioVaeWeights out;
+  for (const std::string& name : file.Names()) {
+    const bool is_encoder = name.rfind("encoder.", 0) == 0;
+    const bool is_quant = name.rfind("quant_conv.", 0) == 0;
+    if (!is_encoder && !is_quant) continue;  // the ViT decoder half
+    std::string key = name;
+    if (is_encoder) key = key.substr(std::strlen("encoder."));
+    VT_CHECK(out.tensors.count(key) == 0,
+             "minimax_h3 video vae encoder: two checkpoint tensors map to the same name");
+    out.tensors[key] = MiniMaxH3ReadSafetensorF32(file.Get(name));
+  }
+  VT_CHECK(!out.tensors.empty(),
+           "minimax_h3 video vae: checkpoint contained no encoder tensors");
+  return out;
+}
+
+// Encode frames [in_channels, T, H, W] in [-1, 1] to the conditioning latent.
+//
+// The 3D CNN emits 2*z_channels (mean | logvar); `quant_conv` mixes those 48
+// channels, and conditioning takes the DISTRIBUTION MEAN rather than a sample --
+// a sample would make the same reference image produce a different conditioning
+// on every run, which is not what a reference is for.
+std::vector<float> MiniMaxH3VideoVaeEncodeToLatent(const MiniMaxH3EncoderFcn3dConfig& config,
+                                                   const MiniMaxH3AudioVaeWeights& weights,
+                                                   const std::vector<float>& frames,
+                                                   MiniMaxH3VideoFrameShape* out_shape) {
+  MiniMaxH3VideoFrameShape shape{};
+  std::vector<float> moments = MiniMaxH3EncoderFcn3dForward(config, weights, frames, &shape);
+  // `z_channels` is the MOMENTS width, not the latent width: the encoder's final
+  // conv emits it directly, and the real checkpoint has conv_out -> 48 with a
+  // 24-channel latent. So the latent is half of it (mean | logvar).
+  const int64_t two_z = config.z_channels;
+  VT_CHECK(two_z % 2 == 0,
+           "minimax_h3 vae encode: z_channels must be even (it carries mean|logvar)");
+  const int64_t latent_ch = two_z / 2;
+  const int64_t per_channel = shape.t * shape.h * shape.w;
+  VT_CHECK(static_cast<int64_t>(moments.size()) == two_z * per_channel,
+           "minimax_h3 vae encode: encoder output is not [2 * z_channels, T, H, W]");
+
+  // quant_conv: a 1x1x1 Conv3d over the 2*z channels, same shape as the decoder's
+  // post_quant_conv but on the encoder side.
+  if (weights.Has("quant_conv.weight")) {
+    const std::vector<float>& w = weights.Get("quant_conv.weight");
+    const std::vector<float>& b = weights.Get("quant_conv.bias");
+    VT_CHECK(static_cast<int64_t>(w.size()) == two_z * two_z &&
+                 static_cast<int64_t>(b.size()) == two_z,
+             "minimax_h3 vae encode: quant_conv must be [2Z, 2Z, 1, 1, 1] with a 2Z bias");
+    std::vector<float> mixed(moments.size());
+    for (int64_t o = 0; o < two_z; ++o) {
+      for (int64_t p = 0; p < per_channel; ++p) {
+        double acc = b[static_cast<size_t>(o)];
+        for (int64_t i = 0; i < two_z; ++i) {
+          acc += static_cast<double>(w[static_cast<size_t>(o * two_z + i)]) *
+                 moments[static_cast<size_t>(i * per_channel + p)];
+        }
+        mixed[static_cast<size_t>(o * per_channel + p)] = static_cast<float>(acc);
+      }
+    }
+    moments = std::move(mixed);
+  }
+
+  // DiagonalGaussianDistribution.mean == the first half of the moments.
+  std::vector<float> latent(static_cast<size_t>(latent_ch * per_channel));
+  std::copy(moments.begin(), moments.begin() + latent.size(), latent.begin());
+  if (out_shape != nullptr) *out_shape = shape;
+  return latent;
+}
+
 std::vector<float> MiniMaxH3VideoVaePostQuantConv(const MiniMaxH3AudioVaeWeights& weights,
                                                   const std::vector<float>& latent,
                                                   int64_t channels, int64_t elems_per_channel) {

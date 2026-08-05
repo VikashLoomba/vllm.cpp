@@ -35,6 +35,50 @@
 
 namespace vllm {
 
+// Turn supplied KEYFRAME IMAGES into the packed conditioning rows the denoise loop
+// pins. This is the one step that stands between "the fl2va primitives are ported"
+// and "a caller can pass a first frame".
+//
+// Each image is [3, H, W] in [-1, 1] and is encoded as a ONE-FRAME clip: the 3D CNN
+// is causal in time, so a single frame is a valid input and yields latent_t 1.
+// Rows are then patchified with the DiT's own patch sizes, which is what makes them
+// interchangeable with the video rows the loop carries.
+//
+// `noise_aug` blends toward the supplied noise (1.0 pins the frame exactly). Noise
+// is an INPUT for the same reason it is in the t2va path: reproducing upstream's RNG
+// decides WHICH sample you get, not whether the pipeline is right.
+std::vector<float> MiniMaxH3EncodeKeyframeCondRows(
+    const MiniMaxH3EncoderFcn3dConfig& encoder_config, const MiniMaxH3AudioVaeWeights& encoder_weights,
+    const MiniMaxH3DitParams& dit_params, const std::vector<std::vector<float>>& images,
+    int64_t image_h, int64_t image_w, int64_t target_latent_t, double noise_aug,
+    const std::vector<float>& noise_rows) {
+  VT_CHECK(!images.empty(), "minimax_h3 keyframe: no images supplied");
+  std::vector<float> rows;
+  std::vector<int64_t> condition_shapes;
+  for (const std::vector<float>& img : images) {
+    VT_CHECK(static_cast<int64_t>(img.size()) == encoder_config.in_channels * image_h * image_w,
+             "minimax_h3 keyframe: image is not [in_channels, H, W]");
+    MiniMaxH3EncoderFcn3dConfig cfg = encoder_config;
+    cfg.t = 1;  // a single frame is a valid causal clip
+    cfg.h = image_h;
+    cfg.w = image_w;
+    MiniMaxH3VideoFrameShape ls{};
+    const std::vector<float> latent =
+        MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, img, &ls);
+    // [C, t, h, w] -> packed rows with the DiT's patch volume.
+    std::vector<float> patched = MiniMaxH3PatchifyVideoLatent(
+        latent, /*batch=*/1, dit_params.latents_dim, ls.t, ls.h, ls.w, dit_params.patch_size_t,
+        dit_params.patch_size_h, dit_params.patch_size_w);
+    rows.insert(rows.end(), patched.begin(), patched.end());
+    condition_shapes.push_back(ls.t);
+    condition_shapes.push_back(ls.h);
+    condition_shapes.push_back(ls.w);
+  }
+  if (noise_aug >= 1.0 || noise_rows.empty()) return rows;
+  return MiniMaxH3ImgvidCondNoiseAug(rows, condition_shapes, target_latent_t,
+                                     static_cast<int64_t>(images.size()), noise_aug, noise_rows);
+}
+
 MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
                                             const MiniMaxH3DitParams& dit_params,
                                             const MiniMaxH3DitWeights& dit_weights,
@@ -48,11 +92,15 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
   VT_CHECK(static_cast<int64_t>(prompt_embeds.size()) == request.text_len * dit_params.text_dim,
            "minimax_h3 t2va: prompt_embeds must be [text_len, text_dim]");
 
-  // --- 1. packed layout (t2va: no keyframe conditioning) ---
+  // --- 1. packed layout. fl2va is the SAME layout with keyframe conditioning
+  // switched on, so t2va is just the empty-keyframe case rather than a separate
+  // path -- upstream models it the same way (packed_sequence.py:116-239).
+  const bool has_keyframes = !request.keyframe_frame_indices.empty();
   MiniMaxH3DenoiseBranch branch;
   branch.packed = BuildMiniMaxH3PackedSequence(
       request.text_len, request.latent_t, request.latent_h, request.latent_w, request.audio_t,
-      request.audio_channel, /*include_keyframe_cond=*/false, {}, /*frame_count=*/0);
+      request.audio_channel, has_keyframes, request.keyframe_frame_indices,
+      has_keyframes ? request.num_frames : 0);
   branch.text_embeddings = prompt_embeds;
   branch.token_tags = branch.packed.token_tags;
 
@@ -65,8 +113,35 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
            "minimax_h3 t2va: the two sigma schedules must have equal length");
 
   // --- 3. the denoise loop (one DiT forward per step) ---
-  return MiniMaxH3DenoiseLoop(device, dit_params, dit_weights, branch, initial_video_rows,
-                              initial_audio_rows, /*keyframe_cond_rows=*/{},
+  // Keyframe conditioning ADDS condition rows to the packed layout, and the loop
+  // wants initial rows for every img position. Callers supply noise for the TARGET
+  // rows -- that is what they can know -- so the condition slots are filled in
+  // here. Their contents do not matter: the loop pins them to the keyframe anchors
+  // before the first step.
+  const int64_t video_width = dit_params.video_row_width();
+  const int64_t num_img = static_cast<int64_t>(branch.packed.img_pos.size());
+  std::vector<float> video_rows = initial_video_rows;
+  if (static_cast<int64_t>(video_rows.size()) != num_img * video_width) {
+    VT_CHECK(has_keyframes,
+             "minimax_h3 t2va: initial video rows do not match the packed layout");
+    std::vector<float> full(static_cast<size_t>(num_img * video_width), 0.0f);
+    int64_t src = 0;
+    for (int64_t r = 0; r < num_img; ++r) {
+      if (!branch.packed.update_mask[static_cast<size_t>(r)]) continue;  // pinned anchor
+      VT_CHECK((src + 1) * video_width <= static_cast<int64_t>(initial_video_rows.size()),
+               "minimax_h3 t2va: too few initial video rows for the denoise targets");
+      std::copy(initial_video_rows.begin() + src * video_width,
+                initial_video_rows.begin() + (src + 1) * video_width,
+                full.begin() + r * video_width);
+      ++src;
+    }
+    video_rows = std::move(full);
+  }
+
+  // The keyframe rows are PINNED: the loop resets them to these anchors every
+  // step, so the supplied frame stays put instead of being denoised away.
+  return MiniMaxH3DenoiseLoop(device, dit_params, dit_weights, branch, video_rows,
+                              initial_audio_rows, request.keyframe_cond_rows,
                               /*audio_ref_rows=*/{}, sigmas_video, sigmas_audio, compute_dtype,
                               prestaged);
 }

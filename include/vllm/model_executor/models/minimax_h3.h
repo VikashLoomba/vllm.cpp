@@ -643,6 +643,19 @@ std::vector<float> MiniMaxH3EncoderFcn3dForward(const MiniMaxH3EncoderFcn3dConfi
 // port had not needed before: see MiniMaxH3VideoVaePostQuantConv.
 MiniMaxH3AudioVaeWeights LoadMiniMaxH3VideoVaeDecoderWeights(const SafetensorsFile& file);
 
+// The ENCODER half of the same file, for CONDITIONING (fl2va keyframes, ref2va
+// references). Strips `encoder.` and KEEPS `quant_conv.*`, which is the encoder's
+// output stage rather than the decoder's.
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3VideoVaeEncoderWeights(const SafetensorsFile& file);
+
+// Encode frames [in_channels, T, H, W] in [-1, 1] to the conditioning latent
+// [z_channels, T', H', W']. Takes the distribution MEAN, not a sample: a sample
+// would make one reference image condition differently on every run.
+std::vector<float> MiniMaxH3VideoVaeEncodeToLatent(const MiniMaxH3EncoderFcn3dConfig& config,
+                                                   const MiniMaxH3AudioVaeWeights& weights,
+                                                   const std::vector<float>& frames,
+                                                   MiniMaxH3VideoFrameShape* out_shape);
+
 // The AutoencoderKL wrapper's `post_quant_conv` — a Conv3d(latent_ch -> latent_ch,
 // kernel 1x1x1), i.e. a per-position channel MIX plus bias, applied to the latent
 // BEFORE the decoder proper.
@@ -1221,6 +1234,17 @@ struct MiniMaxH3T2vaRequest {
   // chunks and upstream center-crops to this (trim_output); 0 keeps every frame.
   int64_t num_frames = 0;
   int64_t num_steps = kMiniMaxH3DefaultSteps;
+
+  // --- fl2va KEYFRAME CONDITIONING (empty => plain t2va) ---
+  // Which generated frames the supplied keyframes pin. Upstream allows exactly
+  // {}, {0}, {-1} or {0, -1}: first frame, last frame, or both.
+  std::vector<int64_t> keyframe_frame_indices;
+  // The conditioning rows, already VAE-encoded and patchified into the packed
+  // layout -- see MiniMaxH3EncodeKeyframeCondRows.
+  std::vector<float> keyframe_cond_rows;
+  // Condition-noise augmentation: out = aug*clean + (1-aug)*noise. 1.0 pins the
+  // keyframe exactly; upstream lowers it to let the model deviate.
+  double imgvid_noise_aug = 1.0;
   double video_shift = kMiniMaxH3DefaultVideoShift;
   double audio_shift = kMiniMaxH3DefaultAudioShift;
   // Per-channel latent statistics from each VAE's config.json; empty skips the
@@ -1291,6 +1315,16 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
 // the layout and schedule logic rather than two. Exposed separately because the DiT
 // and the VAE decoders have very different cost profiles, and a caller measuring or
 // debugging the step loop should not have to load, or find memory for, either VAE.
+// Encode supplied KEYFRAME IMAGES (each [in_channels, H, W] in [-1, 1]) into the
+// packed conditioning rows the denoise loop pins. Each image is encoded as a
+// one-frame causal clip, then patchified with the DiT's patch volume so the rows
+// are interchangeable with the video rows the loop carries.
+std::vector<float> MiniMaxH3EncodeKeyframeCondRows(
+    const MiniMaxH3EncoderFcn3dConfig& encoder_config,
+    const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
+    const std::vector<std::vector<float>>& images, int64_t image_h, int64_t image_w,
+    int64_t target_latent_t, double noise_aug, const std::vector<float>& noise_rows);
+
 MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
                                             const MiniMaxH3DitParams& dit_params,
                                             const MiniMaxH3DitWeights& dit_weights,

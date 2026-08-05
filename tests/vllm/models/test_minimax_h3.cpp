@@ -1658,6 +1658,130 @@ TEST_CASE("minimax_h3: the encoder text tower matches upstream, with all three H
   CHECK(delta > 1e-5);
 }
 
+// fl2va CONDITIONING, end to end through the pipeline. Everything below was
+// already ported and gated in PIECES -- the packed keyframe layout, the VAE 3D-CNN
+// encoder, condition-noise augmentation, the denoise loop's pinned condition rows.
+// What did not exist was any path from "caller has an image" to "the DiT is
+// conditioned on it", so the whole feature was unreachable.
+//
+// The load-bearing assertion is that conditioning CHANGES THE RESULT. A wiring
+// that accepted the rows and ignored them would produce perfectly finite,
+// correctly shaped output and pass every structural check.
+TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
+  const std::unique_ptr<GoldenWeights> dit = BuildGoldenWeights();
+  const MiniMaxH3DitParams& p = dit->params;
+
+  // A reduced 3D-CNN encoder: one level, tiny channels. Real geometry is irrelevant
+  // here -- what matters is that a real encode feeds real rows into the loop.
+  vllm::MiniMaxH3EncoderFcn3dConfig ecfg;
+  ecfg.ch = 8;
+  ecfg.ch_mult = {1};
+  ecfg.space_down = {1};
+  ecfg.time_down = {1};
+  ecfg.num_res_blocks = 1;
+  ecfg.in_channels = 3;
+  ecfg.z_channels = 2 * p.latents_dim;  // moments width: mean | logvar
+  ecfg.num_groups = 4;
+
+  const int64_t IH = 8, IW = 8;
+  vllm::MiniMaxH3AudioVaeWeights ew;
+  auto put = [&](const std::string& n, int64_t c, double s, double o) {
+    ew.tensors[n] = MakeParam("fl2va.enc." + n, c, s, o);
+  };
+  put("conv_in.weight", ecfg.ch * ecfg.in_channels * 27, 0.05, 0.0);
+  put("conv_in.bias", ecfg.ch, 0.01, 0.0);
+  for (int64_t b = 0; b < ecfg.num_res_blocks; ++b) {
+    const std::string pre = "down.0.block." + std::to_string(b) + ".";
+    put(pre + "norm1.weight", ecfg.ch, 0.1, 1.0);
+    put(pre + "norm1.bias", ecfg.ch, 0.05, 0.0);
+    put(pre + "conv1.weight", ecfg.ch * ecfg.ch * 27, 0.05, 0.0);
+    put(pre + "conv1.bias", ecfg.ch, 0.01, 0.0);
+    put(pre + "norm2.weight", ecfg.ch, 0.1, 1.0);
+    put(pre + "norm2.bias", ecfg.ch, 0.05, 0.0);
+    put(pre + "conv2.weight", ecfg.ch * ecfg.ch * 27, 0.05, 0.0);
+    put(pre + "conv2.bias", ecfg.ch, 0.01, 0.0);
+  }
+  put("norm_out.weight", ecfg.ch, 0.1, 1.0);
+  put("norm_out.bias", ecfg.ch, 0.05, 0.0);
+  put("conv_out.weight", ecfg.z_channels * ecfg.ch * 27, 0.05, 0.0);
+  put("conv_out.bias", ecfg.z_channels, 0.01, 0.0);
+  put("quant_conv.weight", ecfg.z_channels * ecfg.z_channels, 0.05, 0.0);
+  put("quant_conv.bias", ecfg.z_channels, 0.01, 0.0);
+
+  const std::vector<float> image = MakeParam("fl2va.image", ecfg.in_channels * IH * IW, 1.0);
+
+  SUBCASE("the encoder yields a deterministic latent (the MEAN, not a sample)") {
+    vllm::MiniMaxH3VideoFrameShape ls{}, ls2{};
+    vllm::MiniMaxH3EncoderFcn3dConfig c = ecfg;
+    c.t = 1; c.h = IH; c.w = IW;
+    const std::vector<float> a1 = vllm::MiniMaxH3VideoVaeEncodeToLatent(c, ew, image, &ls);
+    const std::vector<float> a2 = vllm::MiniMaxH3VideoVaeEncodeToLatent(c, ew, image, &ls2);
+    REQUIRE(!a1.empty());
+    CHECK(ls.t == ls2.t);
+    // z_channels out, not 2*z: the logvar half must be dropped.
+    CHECK(static_cast<int64_t>(a1.size()) == (ecfg.z_channels / 2) * ls.t * ls.h * ls.w);
+    CHECK(MaxAbsDiff(a1, a2.data(), a1.size()) == 0.0);
+    for (const float v : a1) REQUIRE(std::isfinite(v));
+  }
+
+  SUBCASE("keyframe rows reach the denoise loop and CHANGE the result") {
+    vllm::MiniMaxH3T2vaRequest req;
+    req.text_len = 4;
+    req.latent_t = 2;
+    req.latent_h = 4;
+    req.latent_w = 4;
+    req.audio_t = 4;
+    req.audio_channel = 2;
+    req.num_frames = 5;
+    req.num_steps = 3;
+
+    const int64_t frame_rows = (req.latent_h / p.patch_size_h) * (req.latent_w / p.patch_size_w);
+    const std::vector<float> prompt =
+        MakeParam("fl2va.prompt", req.text_len * p.text_dim, 0.2);
+    const std::vector<float> nv =
+        MakeParam("fl2va.nv", req.latent_t * frame_rows * p.video_row_width(), 0.3);
+    const std::vector<float> na =
+        MakeParam("fl2va.na", req.audio_t * req.audio_channel * p.audio_latents_dim, 0.3);
+
+    const vllm::MiniMaxH3DenoiseResult plain = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, req, p, dit->views, prompt, nv, na, vt::DType::kF32);
+
+    vllm::MiniMaxH3T2vaRequest cond = req;
+    cond.keyframe_frame_indices = {0};
+    cond.keyframe_cond_rows = vllm::MiniMaxH3EncodeKeyframeCondRows(
+        ecfg, ew, p, {image}, IH, IW, req.latent_t, /*noise_aug=*/1.0, {});
+    REQUIRE(!cond.keyframe_cond_rows.empty());
+
+    // The layout itself must differ: a keyframe adds condition rows.
+    const vllm::MiniMaxH3PackedSequence pk_plain = vllm::BuildMiniMaxH3PackedSequence(
+        req.text_len, req.latent_t, req.latent_h, req.latent_w, req.audio_t, req.audio_channel,
+        false, {}, 0);
+    const vllm::MiniMaxH3PackedSequence pk_cond = vllm::BuildMiniMaxH3PackedSequence(
+        req.text_len, req.latent_t, req.latent_h, req.latent_w, req.audio_t, req.audio_channel,
+        true, {0}, req.num_frames);
+    CHECK(pk_cond.img_pos.size() > pk_plain.img_pos.size());
+
+    const vllm::MiniMaxH3DenoiseResult conditioned = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, cond, p, dit->views, prompt, nv, na, vt::DType::kF32);
+
+    for (const float v : conditioned.video_rows) REQUIRE(std::isfinite(v));
+    REQUIRE(!conditioned.video_rows.empty());
+
+    // THE assertion: identical prompt, identical noise, identical schedule -- the
+    // only difference is the keyframe, so the video MUST move. Ignoring the rows
+    // would still produce finite, correctly shaped output.
+    const size_t n = std::min(plain.video_rows.size(), conditioned.video_rows.size());
+    REQUIRE(n > 0);
+    double delta = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      delta = std::max(delta, std::abs(static_cast<double>(plain.video_rows[i]) -
+                                       conditioned.video_rows[i]));
+    }
+    INFO("keyframe conditioning moved the video rows by " << delta);
+    CHECK(delta > 1e-5);
+  }
+}
+
 TEST_CASE("minimax_h3: the WHOLE t2va path composes end to end") {
   // Not a quality result -- reduced dimensions and random weights -- but a real
   // structural end-to-end exercise of the assembled pipeline: packed layout ->

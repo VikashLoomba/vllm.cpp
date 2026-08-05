@@ -291,6 +291,69 @@ TEST_CASE("dflash-block-attn CUDA matches CPU across the 5 semantic corners") {
 // Gated against the CPU reference over identical inputs. The tiled kernel keeps
 // the same key order and the same online-softmax recurrence as the untiled one, so
 // the bar is tight rather than merely "close".
+// H3's REAL packed shape: cu_seqlens {0, used, seq_len} -- content plus a padding
+// tail, i.e. TWO documents, not one. The first version of the tiled kernel was
+// guarded to num_reqs == 1 and therefore never ran on the very workload it was
+// written for, while the suite stayed green. This covers both branches: blocks
+// wholly inside one request take the shared-tile path, and the block straddling
+// the boundary takes the per-warp fallback.
+TEST_CASE("dflash-block-attn LONG multi-request matches the reference (H3 packed shape)") {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  const int64_t T = 3000, H = 2, D = 64;
+  const int32_t used = 2317;  // deliberately NOT a multiple of the 8-warp block
+  std::vector<float> q(static_cast<size_t>(T * H * D));
+  std::vector<float> k(q.size()), v(q.size());
+  uint64_t x = 0xD1B54A32D192ED03ULL;
+  auto rnd = [&]() {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return static_cast<float>((x >> 40) / 16777216.0 - 0.5);
+  };
+  for (size_t i = 0; i < q.size(); ++i) { q[i] = rnd(); k[i] = rnd(); v[i] = rnd(); }
+  const int32_t cu[3] = {0, used, static_cast<int32_t>(T)};
+
+  std::vector<float> want(q.size(), 0.0f);
+  {
+    Queue cq = Q();
+    Tensor qt = F32(q, {T, H, D}), kt = F32(k, {T, H, D}), vt_ = F32(v, {T, H, D});
+    Tensor ot = F32(want, {T, H, D});
+    vt::DFlashBlockAttention(cq, ot, qt, kt, vt_, Args(cu, 2, /*causal=*/false, 0));
+  }
+
+  Queue gq = cuda->CreateQueue();
+  auto up = [&](const std::vector<float>& hv) {
+    void* p = cuda->Alloc(hv.size() * sizeof(float));
+    cuda->Copy(gq, p, hv.data(), hv.size() * sizeof(float));
+    return p;
+  };
+  void* dq = up(q); void* dk = up(k); void* dv = up(v);
+  void* dout = cuda->Alloc(q.size() * sizeof(float));
+  Device gd = gq.device;
+  Tensor gqt = Contig(dq, DType::kF32, gd, {T, H, D});
+  Tensor gkt = Contig(dk, DType::kF32, gd, {T, H, D});
+  Tensor gvt = Contig(dv, DType::kF32, gd, {T, H, D});
+  Tensor got = Contig(dout, DType::kF32, gd, {T, H, D});
+  vt::DFlashBlockAttention(gq, got, gqt, gkt, gvt, Args(cu, 2, /*causal=*/false, 0));
+  cuda->Synchronize(gq);
+  std::vector<float> got_host(q.size(), 0.0f);
+  cuda->Copy(gq, got_host.data(), dout, got_host.size() * sizeof(float));
+  cuda->Synchronize(gq);
+
+  double worst = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(std::isfinite(got_host[i]));
+    worst = std::max(worst, std::abs(static_cast<double>(got_host[i]) - want[i]));
+  }
+  INFO("tiled CUDA multi-request vs CPU reference, max|diff| = " << worst);
+  CHECK(worst <= 2e-5);
+  cuda->Free(dq); cuda->Free(dk); cuda->Free(dv); cuda->Free(dout);
+}
+
 TEST_CASE("dflash-block-attn LONG non-causal matches the reference (tiled CUDA path)") {
   vt::Backend* cuda = nullptr;
   try {

@@ -1620,7 +1620,8 @@ __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Ti
 // path, where each query has its own [jlo, jhi].
 template <typename Tin, typename Tout, int kPerLane, int kWarps, int kTile>
 __global__ void DFlashBlockAttentionWarpTiledKernel(Tout* out, const Tin* query, const Tin* key,
-                                                   const Tin* value, int64_t rows, int64_t hq,
+                                                   const Tin* value, const int32_t* cu,
+                                                   int num_reqs, int64_t rows, int64_t hq,
                                                    int64_t hk, int64_t d, float scale) {
   extern __shared__ float smem[];
   float* ks = smem;                       // [kTile][d]
@@ -1633,6 +1634,24 @@ __global__ void DFlashBlockAttentionWarpTiledKernel(Tout* out, const Tin* query,
   const int64_t g = h / (hq / hk);
   const bool active = i < rows;
 
+  // A shared tile is only correct if every warp in this block reads the SAME key
+  // range. Requests are contiguous, so a block straddles at most one boundary:
+  // find the range of the block's first and last query and require them to agree.
+  // H3's packed layout is {0, used, seq_len} -- content plus a padding tail -- so
+  // this covers nearly every block and keeps the rest correct.
+  const int64_t blk_first = static_cast<int64_t>(blockIdx.x) * kWarps;
+  const int64_t blk_last = min(blk_first + kWarps - 1, rows - 1);
+  int64_t rs = 0, re = rows;
+  bool uniform = false;
+  for (int r = 0; r < num_reqs; ++r) {
+    if (blk_first >= cu[r] && blk_first < cu[r + 1]) {
+      rs = cu[r];
+      re = cu[r + 1];
+      uniform = (blk_last < re);
+      break;
+    }
+  }
+
   const int64_t qoff = (i * hq + h) * d;
   float qreg[kPerLane], acc[kPerLane];
 #pragma unroll
@@ -1642,9 +1661,46 @@ __global__ void DFlashBlockAttentionWarpTiledKernel(Tout* out, const Tin* query,
   }
   float m = -CUDART_INF_F, l = 0.0f;
 
+  if (!uniform) {
+    // Straddling block: no shared range, so each warp reads its own keys from
+    // global. Same recurrence, just without the tile.
+    if (active) {
+      int64_t qs = 0, qe = rows;
+      for (int r = 0; r < num_reqs; ++r) {
+        if (i >= cu[r] && i < cu[r + 1]) { qs = cu[r]; qe = cu[r + 1]; break; }
+      }
+      for (int64_t j = qs; j < qe; ++j) {
+        const int64_t koff = (j * hk + g) * d;
+        float part = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kPerLane; ++c) {
+          part += qreg[c] * Load(key, koff + static_cast<int64_t>(c) * 32 + lane);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xFFFFFFFFu, part, off);
+        const float sc = __shfl_sync(0xFFFFFFFFu, part, 0) * scale;
+        const float m_new = fmaxf(m, sc);
+        const float corr = expf(m - m_new);
+        const float pw = expf(sc - m_new);
+#pragma unroll
+        for (int c = 0; c < kPerLane; ++c) {
+          acc[c] = acc[c] * corr + pw * Load(value, koff + static_cast<int64_t>(c) * 32 + lane);
+        }
+        l = l * corr + pw;
+        m = m_new;
+      }
+      const float inv0 = 1.0f / l;
+#pragma unroll
+      for (int c = 0; c < kPerLane; ++c) {
+        Store(out, qoff + static_cast<int64_t>(c) * 32 + lane, acc[c] * inv0);
+      }
+    }
+    return;
+  }
+
   const int64_t threads = kWarps * 32;
-  for (int64_t base = 0; base < rows; base += kTile) {
-    const int64_t n = min(static_cast<int64_t>(kTile), rows - base);
+  for (int64_t base = rs; base < re; base += kTile) {
+    const int64_t n = min(static_cast<int64_t>(kTile), re - base);
     // Cooperative stage: every thread in the block helps fill the tile.
     for (int64_t e = threadIdx.x; e < n * d; e += threads) {
       const int64_t r = e / d, c = e - r * d;
@@ -1779,8 +1835,7 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   // Restricted to the case where every warp in a block provably shares one key
   // range; the threshold keeps short sequences on the simpler path, where the
   // staging overhead would not pay for itself.
-  if (d % 32 == 0 && d / 32 <= 4 && !args.causal && args.sliding_window == 0 &&
-      args.num_reqs == 1 && t >= 2048) {
+  if (d % 32 == 0 && d / 32 <= 4 && !args.causal && args.sliding_window == 0 && t >= 2048) {
     constexpr int kWarps = 8;
     constexpr int kTile = 32;
     const size_t shmem_t = static_cast<size_t>(2 * kTile) * static_cast<size_t>(d) * sizeof(float);
@@ -1790,13 +1845,13 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
     if (out.dtype == DType::kF32) {                                                              \
       DFlashBlockAttentionWarpTiledKernel<Tin, float, PER_LANE, kWarps, kTile>                    \
           <<<tgrid, kWarps * 32, shmem_t, s>>>(out.Ptr<float>(), query.Ptr<Tin>(),               \
-                                               key.Ptr<Tin>(), value.Ptr<Tin>(), t, hq, hk, d,   \
-                                               args.scale);                                      \
+                                               key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,          \
+                                               args.num_reqs, t, hq, hk, d, args.scale);                                      \
     } else {                                                                                     \
       DFlashBlockAttentionWarpTiledKernel<Tin, __nv_bfloat16, PER_LANE, kWarps, kTile>            \
           <<<tgrid, kWarps * 32, shmem_t, s>>>(out.Ptr<__nv_bfloat16>(), query.Ptr<Tin>(),       \
-                                               key.Ptr<Tin>(), value.Ptr<Tin>(), t, hq, hk, d,   \
-                                               args.scale);                                      \
+                                               key.Ptr<Tin>(), value.Ptr<Tin>(), d_cu,          \
+                                               args.num_reqs, t, hq, hk, d, args.scale);                                      \
     }                                                                                            \
   } while (0)
     switch (d / 32) {

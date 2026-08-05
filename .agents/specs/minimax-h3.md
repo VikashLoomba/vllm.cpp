@@ -153,6 +153,7 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | request planning (frames, latent shapes, sigma schedules, canvas, task dispatch) | **exact** |
 | **REAL GGUF manifest** (535 tensors of `MiniMax-H3-FL2VA-Q3_K_M.gguf`) | **exact** — every name and logical shape matches our contract, geometry derived from shapes alone equals the shipped H3 config |
 | **AUDIO VAE decoder** vs the checkpoint's OWN remote code | **max abs diff 4.2e-9** (kaiser-sinc filter 3.0e-8) |
+| **AUDIO VAE ENCODER** vs the checkpoint's OWN remote code, STAGE BY STAGE | **conv stack 2.98e-8, `pre_block` AttnProjection 1.64e-7, whole encode-to-latent 1.86e-8** — `DacAudioVAE` exposes only `decode`, so the encode is composed the way vLLM-Omni composes it (vae.py:317-325): preprocess right-pad -> `Encoder` -> `pre_block` -> `mean_proj`. Generator: `scripts/gen-minimax-h3-audio-vae-encoder-goldens.py`. `mean_proj` and never `logs_proj` — a sampled reference would condition differently every run |
 | **REAL NVFP4 manifest** (1051 tensors) | **exact** — compressed-tensors triple, group 16, islands unquantized, names identical to our contract |
 | **REAL video-VAE manifest** (560 tensors) | **exact** — decoder confirmed a 36-block ViT, encoder the 3D CNN |
 | **VIDEO VAE decoder TransformerBlock** vs the checkpoint's OWN remote code | **max abs diff 6.0e-8** |
@@ -176,6 +177,8 @@ Landed results (`build-cpu`, Release, 10/10 test cases, 2539 assertions):
 | **DEVICE-RESIDENT DiT forward on a REAL GPU** (Thor, sm_110) | **pass — video 1.49e-7 / audio 8.94e-8** vs upstream; 36/36 cases, and the CUDA case is proven to have RUN (220 assertions execute, not skip) |
 | **AUDIO-VAE CHECKPOINT LOADER** (real 1087-tensor manifest) | **pass** — and it caught TWO silent-failure mismatches: the shipped file uses torch's LEGACY `weight_g`/`weight_v`, not the `parametrizations.weight.original0/1` the decoder reads, and BigVGAN sits under `decoder.` while `dec_in_proj.*` is top level. Mapping asserted INJECTIVE over the real manifest (2770 assertions) + an end-to-end load-and-DECODE over a synthetic file written in the shipped spellings |
 | **Audio-VAE loader accepts ALL THREE weight-norm spellings** | **pass** — (1) LEGACY `weight_g`/`weight_v` (official checkpoint), (2) MODERN `parametrizations.weight.originalN` (what the decoder reads), (3) MATERIALIZED plain `weight` (repackaged community bundles). The third is reconstructed exactly, round-trip **1.49e-08** |
+| **AUDIO-VAE ENCODER LOADER** (same real 1087-tensor manifest) | **pass** — takes the half the decoder loader skips: strip `encoder.`, keep top-level `pre_block.*`/`mean_proj.*`, drop `logs_proj.*`, and accept all three weight-norm spellings (the materialized one reconstructed to <=1e-6 round-trip). The manifest also confirms the SHIPPED encoder geometry from shapes alone: `encoder_rates` [2,4,4,5,5], `latent_dim` 2048, `attn_proj_dim` 32, qkv 3x the INPUT width (the narrowing AttnProjection branch). A plain Linear's `.weight` must NOT be mistaken for a materialized weight-norm, which is asserted |
+| **ref2va AUDIO + VIDEO+AUDIO references WIRED** | **pass** — the last two unwired conditioning modes. Gated on conditioning CHANGING the result: an audio reference moves the AUDIO rows by **0.51**, a video+audio reference by **0.71** against the SILENT same-clip control, a DIFFERENT waveform still by **7.1e-4**, and a DIFFERENT clip with the same audio moves the VIDEO rows by **3.7e-2**. An audio-bearing block with no encoded rows behind it THROWS. Driver `--ref-audio f.wav` on a library `MiniMaxH3ReadWav`, gated against the writer it inverts and REFUSING a non-32 kHz file |
 | **VIDEO-VAE CHECKPOINT LOADER** (real 560-tensor manifest) | **pass** — mapping is just the `decoder.` prefix (no weight-norm spelling change), asserted INJECTIVE. ★ Surfaced a MISSING STEP: `post_quant_conv` (Conv3d 24->24, kernel 1x1x1) sits OUTSIDE `ViT3DDecoder`, so the 8.9e-8 decoder gate never covered it and NOTHING in this port applied it — a decode that runs, looks plausible and is wrong. Now implemented, gated against a hand-computed contraction, AND wired into `MiniMaxH3GenerateT2va` — the pipeline test re-runs t2va with it present and requires the frames to move (0.056) while the waveform stays bit-identical |
 | **ENCODER CHECKPOINT LOADER** (FL2VA/text_encoder, 14 shards / 1058 tensors) | **pass** — the only loader that TRANSFORMS rather than renames: HF ships `self_attn.{q,k,v}_proj` and `mlp.{gate,up}_proj` SEPARATE, the port (like vLLM) consumes them FUSED, so they are row-concatenated as `[q\|k\|v]` and `[gate\|up]`. Gated byte-exact ACROSS SHARDS (one layer deliberately split between two files), plus layer truncation, plus the H3 deltas: `norm.weight` and `lm_head` are NOT loaded, because H3 reads the UNNORMALIZED truncated output. The VISION tower needs no fusion — HF already ships `attn.qkv` fused |
 | **ASSEMBLY driver** (`examples/minimax-h3-gen`) | **pass (LOAD + PLAN)** — composes the DiT + both VAEs + both shipped configs, over real file formats, on both the dequant and keep-quant GGUF paths. Shape planning verified: 768x1344 / 16 = 48x84 latent. ★ A full generation on a REAL checkpoint is still UNRUN (needs the multi-GB download) |
@@ -197,6 +200,8 @@ keeps separate on purpose (`packed_sequence.py:101-113`).
 number, the encoder/VAE numerics (no checkpoint), and the multi-GPU USP path. All
 are recorded PENDING in `docs/BENCHMARKS.md`, not as passes.
 
+**Reference audio, still ungated:** no real-checkpoint render with `--ref-audio` has been run. The encoder numerics, the loader mapping and the wiring are all gated; what is not is a full generation conditioned on a real waveform, which needs the multi-GB download and a GPU.
+
 **Oracle note.** The parity pin (`555967922`, vLLM 0.26.0.dev0) does NOT contain
 MiniMax-H3 — H3 was released after it, and it lives in the separate `vllm-omni`
 repository, which the pin protocol does not currently cover. Advancing the pin
@@ -215,11 +220,12 @@ that: W4/W5 must **reimplement both VAEs in C++ from the checkpoint's Python
 source**, which must be fetched separately (the VAE modules and their `config.json`
 are small; the 354 GB of weights are not needed to READ the architecture).
 
-**Status 2026-08-03: both VAE DECODERS are DONE.** The audio VAE (DAC/BigVGAN,
-4.2e-9) and the video VAE's full ViT3D decoder (8.9e-8) both reproduce the
-checkpoint's own modules. What remains on the VAE side is video tiling and the
-3D-CNN ENCODER — and the encoder is only needed for image/video CONDITIONING
-(fl2va/ref2va), not for producing output frames.
+**Status 2026-08-05: BOTH VAEs are DONE IN BOTH DIRECTIONS.** Decoders: audio
+(DAC/BigVGAN, 4.2e-9) and the video ViT3D (8.9e-8). Encoders: the video 3D CNN
+(image/video conditioning) and now the AUDIO encoder — the DAC analysis stack
+plus `pre_block` and `mean_proj`, gated stage by stage at 2.98e-8 / 1.64e-7 /
+1.86e-8. That was the last thing standing between ref2va and its audio-bearing
+reference blocks, which are now wired and gated on moving the result.
 
 **Original note: the remote code is IN HAND** (fetched from the checkpoint's
 `FL2VA/{audio,video}_vae/`, ~130 KB of Python, NOT vendored here — it ships under

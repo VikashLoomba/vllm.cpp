@@ -162,6 +162,82 @@ MiniMaxH3AudioVaeWeights LoadMiniMaxH3AudioVaeWeights(const SafetensorsFile& fil
   return out;
 }
 
+// The ENCODER half of the SAME audio-VAE file — the half the decoder loader above
+// skips outright. ref2va needs it: an audio reference is a waveform, and the rows
+// the DiT is conditioned on come out of this stack.
+//
+// It carries the decoder loader's rules over unchanged, because the file is the
+// same file:
+//   * PREFIX. The DAC encoder is under `encoder.`, stripped so the forward reads
+//     bare `block.N...`. `pre_block.*` and `mean_proj.*` sit at the TOP level and
+//     are kept verbatim — the same split `dec_in_proj` has on the decoder side.
+//   * WEIGHT-NORM SPELLING. All three: legacy `weight_g`/`weight_v` (what the
+//     official checkpoint ships), the modern `parametrizations.weight.originalN`
+//     (what the forward reads, and what a modern-torch generator produces), and a
+//     plain MATERIALIZED `weight` (repackaged bundles).
+//
+// `logs_proj.*` is deliberately NOT loaded. Conditioning takes the distribution
+// MEAN; carrying the log-variance head would imply something is sampled, and a
+// sampled reference would condition differently on every run. `decoder.*` and
+// `dec_in_proj.*` are the synthesis half and are skipped.
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3AudioVaeEncoderWeights(const SafetensorsFile& file) {
+  MiniMaxH3AudioVaeWeights out;
+  for (const std::string& name : file.Names()) {
+    const bool is_encoder = name.rfind("encoder.", 0) == 0;
+    const bool is_pre_block = name.rfind("pre_block.", 0) == 0;
+    const bool is_mean = name.rfind("mean_proj.", 0) == 0;
+    if (!is_encoder && !is_pre_block && !is_mean) continue;
+
+    std::string key = name;
+    if (is_encoder) key = key.substr(std::strlen("encoder."));
+
+    const StTensor& tensor = file.Get(name);
+
+    // `mean_proj` and every `pre_block` Linear are PLAIN modules, so their bare
+    // `.weight` must NOT be reinterpreted as a materialized weight-norm pair. Only
+    // the encoder's own convs are weight-normalized.
+    const std::string g = ".weight_g", v = ".weight_v";
+    if (key.size() > g.size() && key.compare(key.size() - g.size(), g.size(), g) == 0) {
+      key = key.substr(0, key.size() - g.size()) + ".parametrizations.weight.original0";
+    } else if (key.size() > v.size() && key.compare(key.size() - v.size(), v.size(), v) == 0) {
+      key = key.substr(0, key.size() - v.size()) + ".parametrizations.weight.original1";
+    } else if (is_encoder && key.size() > 7 && key.compare(key.size() - 7, 7, ".weight") == 0 &&
+               tensor.shape.size() == 3) {
+      // Reconstruct an EXACT (g, v) pair: with v = w and g = per-output-channel
+      // ||w||, the forward's own g * v / ||v|| returns w.
+      const std::string base = key.substr(0, key.size() - 7);
+      std::vector<float> w = MiniMaxH3ReadSafetensorF32(tensor);
+      const int64_t rows = tensor.shape[0];
+      VT_CHECK(rows > 0 && static_cast<int64_t>(w.size()) % rows == 0,
+               "minimax_h3 audio encoder: materialized conv weight has an implausible shape");
+      const int64_t per_row = static_cast<int64_t>(w.size()) / rows;
+      std::vector<float> mag(static_cast<size_t>(rows));
+      for (int64_t r = 0; r < rows; ++r) {
+        double sum = 0.0;
+        for (int64_t i = 0; i < per_row; ++i) {
+          const double e = w[static_cast<size_t>(r * per_row + i)];
+          sum += e * e;
+        }
+        mag[static_cast<size_t>(r)] = static_cast<float>(std::sqrt(sum));
+      }
+      VT_CHECK(out.tensors.count(base + ".parametrizations.weight.original1") == 0,
+               "minimax_h3 audio encoder: two checkpoint tensors map to the same name");
+      out.tensors[base + ".parametrizations.weight.original1"] = std::move(w);
+      out.tensors[base + ".parametrizations.weight.original0"] = std::move(mag);
+      continue;
+    }
+
+    VT_CHECK(out.tensors.count(key) == 0,
+             "minimax_h3 audio encoder: two checkpoint tensors map to the same name");
+    out.tensors[key] = MiniMaxH3ReadSafetensorF32(tensor);
+  }
+  VT_CHECK(out.tensors.count("block.0.parametrizations.weight.original1") != 0,
+           "minimax_h3 audio encoder: checkpoint contained no encoder tensors");
+  VT_CHECK(out.tensors.count("mean_proj.weight") != 0,
+           "minimax_h3 audio encoder: checkpoint is missing mean_proj (the latent MEAN head)");
+  return out;
+}
+
 MiniMaxH3AudioVaeWeights LoadMiniMaxH3VideoVaeDecoderWeights(const SafetensorsFile& file) {
   MiniMaxH3AudioVaeWeights out;
   for (const std::string& name : file.Names()) {

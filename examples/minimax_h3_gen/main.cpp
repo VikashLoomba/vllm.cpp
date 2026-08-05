@@ -112,6 +112,20 @@ std::vector<float> ReadPpmAsChw(const std::string& path, int64_t* out_h, int64_t
   return chw;
 }
 
+// The WAV reader lives in the LIBRARY (MiniMaxH3ReadWav), next to the writer and
+// unit-gated with it; this only opens the file. Returns CHANNEL-MAJOR samples in
+// [-1, 1], mono repeated up to kMiniMaxH3AudioChannels, and REFUSES a sample rate
+// the audio VAE was not trained at rather than silently mis-encoding it.
+std::vector<float> ReadWavRef(const std::string& path, int64_t* out_channels,
+                              int64_t* out_samples_per_channel) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open " + path);
+  const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (out_channels != nullptr) *out_channels = vllm::kMiniMaxH3AudioChannels;
+  return vllm::MiniMaxH3ReadWav(bytes, vllm::kMiniMaxH3AudioChannels,
+                                vllm::kMiniMaxH3AudioSampleRate, out_samples_per_channel);
+}
+
 std::vector<float> ReadF32(const std::string& path) {
   std::ifstream in(path, std::ios::binary | std::ios::ate);
   if (!in) throw std::runtime_error("cannot open " + path);
@@ -151,7 +165,7 @@ int main(int argc, char** argv) {
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   std::string first_frame_path, last_frame_path;
   std::vector<std::string> ref_image_paths;
-  std::string ref_video_prefix;
+  std::string ref_video_prefix, ref_audio_path;
   double imgvid_noise_aug = 1.0;
   int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
@@ -182,6 +196,7 @@ int main(int argc, char** argv) {
       else if (f == "--last-frame") last_frame_path = Need(argc, argv, ++i, f);
       else if (f == "--ref-image") ref_image_paths.push_back(Need(argc, argv, ++i, f));
       else if (f == "--ref-video") ref_video_prefix = Need(argc, argv, ++i, f);
+      else if (f == "--ref-audio") ref_audio_path = Need(argc, argv, ++i, f);
       else if (f == "--noise-aug") imgvid_noise_aug = std::stod(Need(argc, argv, ++i, f));
       else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
@@ -208,7 +223,7 @@ int main(int argc, char** argv) {
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
                    "[--dry-run] [--denoise-only] [--dump-params] "
                    "[--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A] "
-                   "[--ref-image f.ppm ...] [--ref-video DIR]\n";
+                   "[--ref-image f.ppm ...] [--ref-video DIR] [--ref-audio f.wav]\n";
       return 2;
     }
 
@@ -493,6 +508,48 @@ int main(int argc, char** argv) {
       request.ref_blocks = blocks;
       std::cerr << "  ref2va: " << blocks.size() << " reference image(s) at " << iw << "x" << ih
                 << "\n";
+    }
+
+    // --- ref2va REFERENCE AUDIO: a waveform prepended to the sequence, through
+    // the audio VAE's ENCODER half. It ATTACHES to a video reference when there is
+    // one (one kVideoAudio block carrying both, which is the layout
+    // packed_sequence.py builds), and otherwise stands alone as a kAudio block.
+    if (!ref_audio_path.empty()) {
+      VT_CHECK(first_frame_path.empty() && last_frame_path.empty(),
+               "minimax-h3-gen: --ref-audio (ref2va) and --first/--last-frame (fl2va) are "
+               "exclusive");
+      VT_CHECK(!audio_vae_path.empty(),
+               "minimax-h3-gen: --ref-audio needs --audio-vae (the ENCODER half)");
+      VT_CHECK(!audio_cfg_path.empty(),
+               "minimax-h3-gen: --ref-audio needs --audio-vae-config (it carries the latent "
+               "statistics the reference rows are normalized by)");
+      std::cerr << "loading reference audio " << ref_audio_path << "\n";
+      int64_t wav_channels = 0, wav_samples = 0;
+      const std::vector<float> wave = ReadWavRef(ref_audio_path, &wav_channels, &wav_samples);
+
+      // The audio VAE file is opened again for its ENCODER half; the decoder
+      // loader deliberately skips it, so the two halves are separate weight sets.
+      const vllm::SafetensorsFile af = vllm::SafetensorsFile::Open(audio_vae_path);
+      const vllm::MiniMaxH3AudioVaeWeights aenc = vllm::LoadMiniMaxH3AudioVaeEncoderWeights(af);
+      vllm::MiniMaxH3AudioVaeEncoderConfig aenc_cfg;  // the shipped geometry
+      aenc_cfg.vae_latent_channels = dit.params.audio_latents_dim;
+
+      vllm::MiniMaxH3RefBlock ab{};
+      const std::vector<float> arows = vllm::MiniMaxH3EncodeReferenceAudio(
+          aenc_cfg, aenc, wave, wav_channels, wav_samples, audio_stats.mean, audio_stats.std_dev,
+          /*noise_aug=*/1.0, {}, &ab);
+      request.audio_ref_rows = arows;
+      if (request.ref_blocks.size() == 1 &&
+          request.ref_blocks[0].kind == vllm::MiniMaxH3RefBlock::Kind::kVideoAudio) {
+        // A video reference that now has SOUND: same block, non-zero ref_audio_t.
+        request.ref_blocks[0].ref_audio_t = ab.ref_audio_t;
+        std::cerr << "  ref2va: reference video now carries audio, " << ab.ref_audio_t
+                  << " latent frames\n";
+      } else {
+        request.ref_blocks.push_back(ab);
+        std::cerr << "  ref2va: reference AUDIO " << wav_samples << " samples/channel -> "
+                  << ab.ref_audio_t << " latent frames\n";
+      }
     }
 
     // --- fl2va KEYFRAMES: encode the supplied frame(s) into pinned conditioning.

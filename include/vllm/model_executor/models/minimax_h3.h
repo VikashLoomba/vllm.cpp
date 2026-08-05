@@ -460,6 +460,94 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
                                            int64_t* out_samples);
 
 // ---------------------------------------------------------------------------
+// Audio VAE ENCODER (minimax_h3_audio_vae.cpp)
+//
+// The ANALYSIS half of the same DAC-lineage VAE, and the piece a REFERENCE AUDIO
+// needs: ref2va conditions on rows produced from a supplied waveform, so without
+// it a `kAudio` block (or a `kVideoAudio` block with `ref_audio_t > 0`) can only
+// be refused.
+//
+// The encode path is not a method on the shipped module — `DacAudioVAE` exposes
+// only `decode` (dac_audio_vae.py:211-225). vLLM-Omni composes it by hand
+// (vae.py:317-325), and this mirrors that composition exactly:
+//
+//   preprocess  right-pad to a multiple of hop_length   (dac_audio_vae.py:201-209)
+//     -> Encoder     strided conv stack                 (dac_audio_vae.py:90-117)
+//     -> pre_block   AttnProjection, when attn_proj     (dac_attn_proj.py:69-88)
+//     -> mean_proj   Conv1d(attn_proj_dim -> latent, 1) (dac_audio_vae.py:157)
+//
+// `mean_proj` and never `logs_proj`: conditioning takes the distribution MEAN, so
+// the same reference always produces the same rows — the same rule the video side
+// follows in MiniMaxH3VideoVaeEncodeToLatent.
+// ---------------------------------------------------------------------------
+
+struct MiniMaxH3AudioVaeEncoderConfig {
+  // The SHIPPED geometry (FL2VA/audio_vae/metadata.json + config.yaml), confirmed
+  // by the real 1087-tensor manifest.
+  int64_t encoder_dim = 64;                            // d_model of the first conv
+  std::vector<int64_t> encoder_rates = {2, 4, 4, 5, 5};  // hop_length = 800
+  int64_t latent_dim = 2048;                           // d_latent, the last conv's width
+  int64_t vae_latent_channels = 32;                    // mean_proj's output width
+  bool attn_proj = true;
+  int64_t attn_proj_heads = 8;
+  double layer_norm_eps = 1e-5;  // torch nn.LayerNorm default
+
+  // np.prod(encoder_rates) (dac_audio_vae.py:148).
+  int64_t hop_length() const;
+  // dac_audio_vae.py:151-155 — vae_latent_channels when it divides latent_dim,
+  // else the next power of two.
+  int64_t attn_proj_dim() const;
+};
+
+// Encoder.forward (dac_audio_vae.py:116-117) over a MONO waveform, INCLUDING the
+// `preprocess` right-pad. Returns [latent_dim, frames]; `frames` is
+// padded_samples / hop_length.
+std::vector<float> MiniMaxH3AudioVaeEncoderForward(const MiniMaxH3AudioVaeEncoderConfig& config,
+                                                   const MiniMaxH3AudioVaeWeights& weights,
+                                                   const std::vector<float>& samples,
+                                                   int64_t sample_count, int64_t* out_frames);
+
+// AttnProjection.forward (dac_attn_proj.py:85-88) over [tokens, latent_dim] rows,
+// returning [tokens, attn_proj_dim]. The narrowing branch it takes is the one the
+// checkpoint ships (in_dim > out_dim): causal attention, MEAN over heads, then an
+// adaptive average pool down to out_dim.
+std::vector<float> MiniMaxH3AudioVaeAttnProjection(const MiniMaxH3AudioVaeEncoderConfig& config,
+                                                   const MiniMaxH3AudioVaeWeights& weights,
+                                                   const std::vector<float>& tokens,
+                                                   int64_t token_count);
+
+// The whole encode of ONE channel: preprocess -> Encoder -> pre_block -> mean_proj.
+// Returns the latent MEAN as [vae_latent_channels, frames].
+std::vector<float> MiniMaxH3AudioVaeEncodeToLatent(const MiniMaxH3AudioVaeEncoderConfig& config,
+                                                   const MiniMaxH3AudioVaeWeights& weights,
+                                                   const std::vector<float>& samples,
+                                                   int64_t sample_count, int64_t* out_frames);
+
+// vae.py:293-340 end to end: a multi-channel waveform (channel-major, mono is
+// REPEATED up to `kMiniMaxH3AudioChannels`) becomes NORMALIZED packed condition
+// rows [channels * frames, vae_latent_channels], channel-major — the layout
+// BuildMiniMaxH3PackedSequenceRef2va gives an audio-bearing block. `out_audio_t`
+// receives `frames`, which is the block's `ref_audio_t`.
+//
+// `latents_mean` / `latents_std` come from audio_vae/config.json; passing both
+// empty skips the normalization (useful in unit tests).
+std::vector<float> MiniMaxH3AudioVaeEncodeToRows(const MiniMaxH3AudioVaeEncoderConfig& config,
+                                                 const MiniMaxH3AudioVaeWeights& weights,
+                                                 const std::vector<float>& waveform,
+                                                 int64_t channels, int64_t samples_per_channel,
+                                                 const std::vector<float>& latents_mean,
+                                                 const std::vector<float>& latents_std,
+                                                 int64_t* out_audio_t);
+
+// The ENCODER half of FL2VA/audio_vae/model.safetensors — the half
+// LoadMiniMaxH3AudioVaeWeights deliberately skips. `encoder.` is stripped (so the
+// forward reads bare `block.N...`), while `pre_block.*` and `mean_proj.*` are kept
+// verbatim because they sit at the top level of the file. `logs_proj.*` is NOT
+// loaded: conditioning uses the mean, never a sample. The same three weight-norm
+// spellings the decoder loader accepts are accepted here.
+MiniMaxH3AudioVaeWeights LoadMiniMaxH3AudioVaeEncoderWeights(const SafetensorsFile& file);
+
+// ---------------------------------------------------------------------------
 // Video VAE decoder (minimax_h3_video_vae.cpp)
 //
 // The real 560-tensor manifest splits the video VAE cleanly: the ENCODER is the
@@ -1252,6 +1340,12 @@ struct MiniMaxH3T2vaRequest {
   // layout is built by BuildMiniMaxH3PackedSequenceRef2va and the visual rows come
   // from the same pinned-condition mechanism keyframes use.
   std::vector<MiniMaxH3RefBlock> ref_blocks;
+  // The AUDIO conditioning rows for the audio-bearing reference blocks, in block
+  // order and channel-major within a block -- see MiniMaxH3EncodeReferenceAudio.
+  // Exactly `sum(ref_audio_t) * audio_channel` rows of `audio_latents_dim`; a
+  // block that claims audio rows without supplying them is refused, because the
+  // layout would grow around rows nothing ever wrote.
+  std::vector<float> audio_ref_rows;
   double video_shift = kMiniMaxH3DefaultVideoShift;
   double audio_shift = kMiniMaxH3DefaultAudioShift;
   // Per-channel latent statistics from each VAE's config.json; empty skips the
@@ -1297,6 +1391,14 @@ std::vector<std::string> MiniMaxH3BuildMp4MuxArgs(const MiniMaxH3MuxRequest& req
 // outcome of the open MP4/muxer dependency decision.
 std::string MiniMaxH3WriteWav(const std::vector<float>& waveform, int64_t channels,
                               int64_t samples_per_channel, int64_t sample_rate);
+
+// The inverse, for REFERENCE AUDIO: parse 16-bit PCM RIFF/WAVE into the same
+// CHANNEL-MAJOR float layout, mono REPEATED up to `want_channels` and anything
+// wider truncated (vae.py:305-313). `want_sample_rate` > 0 REFUSES a mismatch
+// rather than resampling — encoding at the wrong rate would shift every latent
+// frame, and this library has no audio dependency to resample with.
+std::vector<float> MiniMaxH3ReadWav(const std::string& bytes, int64_t want_channels,
+                                    int64_t want_sample_rate, int64_t* out_samples_per_channel);
 
 MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
                                           const MiniMaxH3DitParams& dit_params,
@@ -1350,6 +1452,22 @@ std::vector<float> MiniMaxH3EncodeReferenceImages(
     const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
     const std::vector<std::vector<float>>& images, int64_t image_h, int64_t image_w,
     std::vector<MiniMaxH3RefBlock>* out_blocks);
+
+// Encode a REFERENCE WAVEFORM (channel-major, already at
+// kMiniMaxH3AudioSampleRate) into the packed audio conditioning rows, and report
+// the kAudio block it occupies. The audio counterpart of
+// MiniMaxH3EncodeReferenceImages, and what makes an audio-bearing ref2va request
+// expressible: the rows belong in MiniMaxH3T2vaRequest::audio_ref_rows.
+//
+// For a VIDEO+AUDIO reference, encode the clip with MiniMaxH3EncodeReferenceVideo
+// and copy the `ref_audio_t` this reports onto that block: one kVideoAudio block
+// then carries both, which is the layout packed_sequence.py builds.
+std::vector<float> MiniMaxH3EncodeReferenceAudio(
+    const MiniMaxH3AudioVaeEncoderConfig& encoder_config,
+    const MiniMaxH3AudioVaeWeights& encoder_weights, const std::vector<float>& waveform,
+    int64_t channels, int64_t samples_per_channel, const std::vector<float>& latents_mean,
+    const std::vector<float>& latents_std, double noise_aug,
+    const std::vector<float>& noise_rows, MiniMaxH3RefBlock* out_block);
 
 std::vector<float> MiniMaxH3EncodeKeyframeCondRows(
     const MiniMaxH3EncoderFcn3dConfig& encoder_config,

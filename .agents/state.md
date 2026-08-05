@@ -35973,3 +35973,60 @@ falling back to FromGguf for exports that do embed one.
 
 Encoder staging is 162.3 s (vs 32.8 s for the DiT), which is the next obvious cost to
 look at if prompts are encoded per request rather than once.
+
+## 2026-08-05 - MiniMax-H3: audio-VAE ENCODER ported; ref2va AUDIO and VIDEO+AUDIO wired
+
+The last two unwired conditioning modes were blocked on one missing half. Only the
+audio VAE's DECODER was ported (DAC/BigVGAN, 4.2e-9), so `MiniMaxH3DenoiseT2va`
+THREW on any reference block carrying audio: a `kAudio` block, or a `kVideoAudio`
+block with `ref_audio_t > 0`.
+
+WHAT THE ENCODE PATH ACTUALLY IS. There is no `encode` on the shipped module -
+`DacAudioVAE` exposes only `decode` (dac_audio_vae.py:211-225). vLLM-Omni composes
+the encode by hand (vae.py:317-325), and that composition is the contract:
+preprocess right-pad to a whole hop -> `Encoder` -> `pre_block` -> `mean_proj`.
+Ported with upstream citations: Snake1d (:25-40 - one parameter, NEVER log-scaled,
+and it both scales the sine and forms the reciprocal, so it is not the decoder's
+SnakeBeta), ResidualUnit (:50-66), EncoderBlock (:69-87), Encoder (:90-117), and
+the AttnProjection block (dac_attn_proj.py:8-88) whose qkv bias is ASSEMBLED as
+[q_bias | zero_k_bias | v_bias] so keys carry no bias at all. Only the NARROWING
+branch (in_dim > out_dim) is implemented - the one the checkpoint ships; the
+widening branch refuses loudly rather than running untested.
+
+GATED STAGE BY STAGE against the checkpoint's own modules, via a new generator on
+the same FNV-1a + splitmix64 pattern: conv stack 2.98e-8, AttnProjection 1.64e-7,
+whole encode-to-latent 1.86e-8. Three stages rather than one end-to-end number,
+because a single figure says something is wrong without saying which of three
+quite different subsystems it is. The reduced input is 25 samples against a hop of
+4, deliberately NOT a multiple, so a port that skipped `preprocess` returns 6
+frames instead of 7 and fails.
+
+`mean_proj` and never `logs_proj`, same rule the video side follows: a sampled
+reference would condition differently on every run. `logs_proj` is not even loaded.
+
+LOADER on the same real 1087-tensor manifest the decoder loader is gated on, which
+also CONFIRMED the shipped geometry from shapes alone - encoder_rates [2,4,4,5,5],
+latent_dim 2048, attn_proj_dim 32, qkv 3x the INPUT width. One trap worth naming:
+`pre_block`'s Linears and `mean_proj` are PLAIN modules, so their bare `.weight`
+must not be swept up by the materialized-weight-norm rule that exists for the
+encoder's convs. Asserted.
+
+WIRING gated on the property that matters. What is refused now is an audio-bearing
+block with NO encoded rows behind it - the layout would grow around packed rows
+nothing ever wrote. Under identical prompt, noise and schedule: an audio reference
+moves the audio rows by 0.51, a video+audio reference by 0.71 against the SILENT
+same-clip control, a DIFFERENT waveform still by 7.1e-4, and a DIFFERENT clip with
+the same audio moves the video rows by 3.7e-2. The last two are the ones a wiring
+that reserved the rows and then pinned a constant would fail; everything
+structural would still pass.
+
+The WAV reader went into the LIBRARY next to the writer it inverts rather than
+into the example, so it is unit-gated: chunk-list walk (not a fixed 44-byte
+header), mono repeated to stereo, and a non-32 kHz file REFUSED rather than
+mis-encoded - there is no audio dependency here to resample with.
+
+NEXT: no real-checkpoint render conditioned on a real waveform has been run. That
+needs the multi-GB download and a GPU, and it is the one thing here that is not
+gated.
+
+Suite: 60/60 cases, 29427 assertions, clean CPU build.

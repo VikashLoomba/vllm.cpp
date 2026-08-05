@@ -30,6 +30,7 @@
 #include "minimax_h3_goldens.inc"
 #include "minimax_h3_gguf_manifest.inc"
 #include "minimax_h3_audio_vae_goldens.inc"
+#include "minimax_h3_audio_vae_encoder_goldens.inc"
 #include "minimax_h3_audio_vae_manifest.inc"
 #include "minimax_h3_vae_configs.inc"
 #include "minimax_h3_nvfp4_manifest.inc"
@@ -951,6 +952,316 @@ TEST_CASE("minimax_h3: the audio VAE decoder matches the checkpoint's own remote
   CHECK(w[3] == doctest::Approx(0.5f));
 }
 
+namespace {
+
+// The reduced audio-VAE ENCODER configuration the generator ran upstream at.
+vllm::MiniMaxH3AudioVaeEncoderConfig ReducedAudioEncoderConfig() {
+  vllm::MiniMaxH3AudioVaeEncoderConfig cfg;
+  cfg.encoder_dim = vllm_test::kH3AudioEncDim;
+  cfg.encoder_rates.assign(std::begin(vllm_test::kH3AudioEncRates),
+                           std::end(vllm_test::kH3AudioEncRates));
+  cfg.latent_dim = vllm_test::kH3AudioEncLatentDim;
+  cfg.vae_latent_channels = vllm_test::kH3AudioEncVaeChannels;
+  cfg.attn_proj = true;
+  cfg.attn_proj_heads = vllm_test::kH3AudioEncHeads;
+  return cfg;
+}
+
+// Rebuild every encoder parameter from the shared stream, keyed by the CHECKPOINT's
+// own state_dict name, applying exactly the per-role scales
+// gen-minimax-h3-audio-vae-encoder-goldens.py :: fill_from_stream applies. The rule
+// is expressed once, here, for the same reason it is expressed once there: a scale
+// that drifts on one side turns the golden into noise.
+void PutEncoderParam(vllm::MiniMaxH3AudioVaeWeights& w, const std::string& full, int64_t count,
+                     const std::string& stream_prefix, bool one_d_norm = false) {
+  auto ends = [&](const std::string& suffix) {
+    return full.size() >= suffix.size() &&
+           full.compare(full.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
+  // The loader strips `encoder.`; the STREAM is keyed by the unstripped name.
+  std::string key = full;
+  if (key.rfind("encoder.", 0) == 0) key = key.substr(std::strlen("encoder."));
+
+  if (ends("zero_k_bias")) {  // a registered buffer that stays zero
+    w.tensors[key] = std::vector<float>(static_cast<size_t>(count), 0.0f);
+    return;
+  }
+  double scale = 0.1, offset = 0.0;
+  if (ends("original0")) {
+    scale = 0.03;
+    offset = 0.15;
+  } else if (ends("original1")) {
+    scale = 0.08;
+  } else if (ends(".alpha")) {
+    scale = 0.2;
+    offset = 1.0;  // Snake1d divides by (alpha + 1e-9); upstream inits it to ones
+  } else if (ends("bias")) {
+    scale = 0.05;
+  } else if (one_d_norm && full.find("norm") != std::string::npos && ends(".weight")) {
+    scale = 0.1;
+    offset = 1.0;
+  }
+  w.tensors[key] = MakeParam(stream_prefix + full, count, scale, offset);
+}
+
+// Every tensor the reduced encoder + pre_block + mean_proj needs, named exactly as
+// the checkpoint names them.
+vllm::MiniMaxH3AudioVaeWeights BuildAudioEncoderWeights(
+    const vllm::MiniMaxH3AudioVaeEncoderConfig& cfg, const std::string& stream_prefix) {
+  vllm::MiniMaxH3AudioVaeWeights w;
+  auto conv = [&](const std::string& prefix, int64_t out_ch, int64_t in_ch, int64_t k) {
+    PutEncoderParam(w, prefix + ".parametrizations.weight.original0", out_ch, stream_prefix);
+    PutEncoderParam(w, prefix + ".parametrizations.weight.original1", out_ch * in_ch * k,
+                    stream_prefix);
+    PutEncoderParam(w, prefix + ".bias", out_ch, stream_prefix);
+  };
+
+  // block.0: WNConv1d(1, encoder_dim, k=7).
+  conv("encoder.block.0", cfg.encoder_dim, 1, 7);
+  int64_t channels = cfg.encoder_dim;
+  for (size_t i = 0; i < cfg.encoder_rates.size(); ++i) {
+    channels *= 2;
+    const int64_t half = channels / 2;
+    const std::string blk = "encoder.block." + std::to_string(i + 1);
+    for (int64_t u = 0; u < 3; ++u) {  // three dilated ResidualUnits at dim/2
+      const std::string ru = blk + ".block." + std::to_string(u);
+      PutEncoderParam(w, ru + ".block.0.alpha", half, stream_prefix);
+      conv(ru + ".block.1", half, half, 7);
+      PutEncoderParam(w, ru + ".block.2.alpha", half, stream_prefix);
+      conv(ru + ".block.3", half, half, 1);
+    }
+    PutEncoderParam(w, blk + ".block.3.alpha", half, stream_prefix);
+    conv(blk + ".block.4", channels, half, 2 * cfg.encoder_rates[i]);
+  }
+  const size_t rates = cfg.encoder_rates.size();
+  PutEncoderParam(w, "encoder.block." + std::to_string(rates + 1) + ".alpha", channels,
+                  stream_prefix);
+  conv("encoder.block." + std::to_string(rates + 2), cfg.latent_dim, channels, 3);
+
+  // pre_block: AttnProjection(latent_dim -> attn_proj_dim).
+  const int64_t in_dim = cfg.latent_dim, out_dim = cfg.attn_proj_dim();
+  auto norm = [&](const std::string& prefix, int64_t width) {
+    PutEncoderParam(w, prefix + ".weight", width, stream_prefix, /*one_d_norm=*/true);
+    PutEncoderParam(w, prefix + ".bias", width, stream_prefix);
+  };
+  norm("pre_block.norm1", in_dim);
+  norm("pre_block.norm3", in_dim);
+  norm("pre_block.norm2", out_dim);
+  PutEncoderParam(w, "pre_block.attn.q_bias", in_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.attn.v_bias", in_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.attn.zero_k_bias", in_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.attn.qkv.weight", 3 * in_dim * in_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.attn.proj.weight", out_dim * out_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.attn.proj.bias", out_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.proj.weight", out_dim * in_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.proj.bias", out_dim, stream_prefix);
+  norm("pre_block.mlp.norm", out_dim);
+  const int64_t hidden = 2 * out_dim;  // AttnProjection's mlp_ratio is 2
+  PutEncoderParam(w, "pre_block.mlp.w0.weight", hidden * out_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.mlp.w0.bias", hidden, stream_prefix);
+  PutEncoderParam(w, "pre_block.mlp.w1.weight", hidden * out_dim, stream_prefix);
+  PutEncoderParam(w, "pre_block.mlp.w1.bias", hidden, stream_prefix);
+  PutEncoderParam(w, "pre_block.mlp.w2.weight", out_dim * hidden, stream_prefix);
+  PutEncoderParam(w, "pre_block.mlp.w2.bias", out_dim, stream_prefix);
+
+  // mean_proj: a PLAIN Conv1d(attn_proj_dim -> vae_latent_channels, k=1).
+  PutEncoderParam(w, "mean_proj.weight", cfg.vae_latent_channels * out_dim, stream_prefix);
+  PutEncoderParam(w, "mean_proj.bias", cfg.vae_latent_channels, stream_prefix);
+  return w;
+}
+
+}  // namespace
+
+TEST_CASE("minimax_h3: the audio VAE ENCODER matches the checkpoint's own remote code") {
+  // The ANALYSIS half, gated the same way the decoder is: against the CHECKPOINT'S
+  // OWN modules (FL2VA/audio_vae/dac_audio_vae.py + dac_attn_proj.py) executed at
+  // reduced dimensions by scripts/gen-minimax-h3-audio-vae-encoder-goldens.py, in
+  // the exact sequence vLLM-Omni's reference-audio path runs (vae.py:317-325).
+  //
+  // Three STAGES are checked, not just the end: Encoder, then pre_block, then
+  // mean_proj. A single end-to-end number would tell us something is wrong without
+  // telling us which of three quite different subsystems it is.
+  const vllm::MiniMaxH3AudioVaeEncoderConfig cfg = ReducedAudioEncoderConfig();
+  const vllm::MiniMaxH3AudioVaeWeights w = BuildAudioEncoderWeights(cfg, "");
+
+  CHECK(cfg.hop_length() == 4);           // prod(encoder_rates)
+  CHECK(cfg.attn_proj_dim() == vllm_test::kH3AudioEncVaeChannels);
+
+  // The input the oracle ran, drawn from the same stream. If this drifts, nothing
+  // downstream means anything.
+  const std::vector<float> input =
+      MakeParam("audiovae.encoder.input", vllm_test::kH3AudioEncSamples, 1.0);
+  REQUIRE(input.size() == std::size(vllm_test::kH3AudioEncInputGolden));
+  CHECK(MaxAbsDiff(input, vllm_test::kH3AudioEncInputGolden, input.size()) == 0.0);
+
+  // --- stage 1: preprocess + Encoder. The sample count (25) is deliberately NOT a
+  // multiple of hop_length (4): a port that skipped `preprocess` would return 6
+  // frames instead of 7 and fail here.
+  int64_t frames = 0;
+  const std::vector<float> enc = vllm::MiniMaxH3AudioVaeEncoderForward(
+      cfg, w, input, vllm_test::kH3AudioEncSamples, &frames);
+  CHECK(frames == vllm_test::kH3AudioEncFrames);
+  CHECK(frames * cfg.hop_length() > vllm_test::kH3AudioEncSamples);  // the pad really happened
+  REQUIRE(enc.size() == std::size(vllm_test::kH3AudioEncBlockGolden));
+  const double enc_err = MaxAbsDiff(enc, vllm_test::kH3AudioEncBlockGolden, enc.size());
+  INFO("audio VAE encoder (conv stack) max|diff| = " << enc_err);
+  CHECK(enc_err <= 1e-5);
+
+  // --- stage 2: pre_block (AttnProjection). Our forward takes [frames, latent_dim]
+  // rows; the golden is the upstream [1, attn_proj_dim, frames] tensor, so the
+  // comparison transposes.
+  const int64_t in_dim = cfg.latent_dim, out_dim = cfg.attn_proj_dim();
+  std::vector<float> tokens(static_cast<size_t>(frames * in_dim));
+  for (int64_t c = 0; c < in_dim; ++c) {
+    for (int64_t t = 0; t < frames; ++t) {
+      tokens[static_cast<size_t>(t * in_dim + c)] = enc[static_cast<size_t>(c * frames + t)];
+    }
+  }
+  const std::vector<float> proj = vllm::MiniMaxH3AudioVaeAttnProjection(cfg, w, tokens, frames);
+  REQUIRE(proj.size() == std::size(vllm_test::kH3AudioEncAttnProjGolden));
+  double proj_err = 0.0;
+  for (int64_t c = 0; c < out_dim; ++c) {
+    for (int64_t t = 0; t < frames; ++t) {
+      proj_err = std::max(proj_err,
+                          std::abs(static_cast<double>(proj[static_cast<size_t>(t * out_dim + c)]) -
+                                   vllm_test::kH3AudioEncAttnProjGolden[c * frames + t]));
+    }
+  }
+  INFO("audio VAE encoder (AttnProjection) max|diff| = " << proj_err);
+  CHECK(proj_err <= 1e-5);
+
+  // --- stage 3: the whole encode, ending at mean_proj (the distribution MEAN).
+  int64_t latent_frames = 0;
+  const std::vector<float> latent = vllm::MiniMaxH3AudioVaeEncodeToLatent(
+      cfg, w, input, vllm_test::kH3AudioEncSamples, &latent_frames);
+  CHECK(latent_frames == frames);
+  REQUIRE(latent.size() == std::size(vllm_test::kH3AudioEncMeanGolden));
+  const double mean_err = MaxAbsDiff(latent, vllm_test::kH3AudioEncMeanGolden, latent.size());
+  INFO("audio VAE encode-to-latent max|diff| = " << mean_err);
+  CHECK(mean_err <= 1e-5);
+
+  // The MEAN, not a sample: the same reference must encode identically every time,
+  // or a reference would condition differently on every run.
+  int64_t again_frames = 0;
+  const std::vector<float> again = vllm::MiniMaxH3AudioVaeEncodeToLatent(
+      cfg, w, input, vllm_test::kH3AudioEncSamples, &again_frames);
+  CHECK(MaxAbsDiff(again, latent.data(), again.size()) == 0.0);
+  // `logs_proj` must play no part -- the loader never even loads it.
+  CHECK_FALSE(w.Has("logs_proj.weight"));
+}
+
+TEST_CASE("minimax_h3: audio-VAE encode produces the packed rows a reference block claims") {
+  // The row layout is the contract between the encoder and the packed sequence: a
+  // block claiming `ref_audio_t * audio_channel` rows must get exactly those rows,
+  // CHANNEL-MAJOR, in the DiT's normalized latent space (vae.py:327-341).
+  const vllm::MiniMaxH3AudioVaeEncoderConfig cfg = ReducedAudioEncoderConfig();
+  const vllm::MiniMaxH3AudioVaeWeights w = BuildAudioEncoderWeights(cfg, "");
+  const int64_t width = cfg.vae_latent_channels;
+  const int64_t samples = vllm_test::kH3AudioEncSamples;
+
+  // Two channels: the SAME waveform in both, so the two halves must be identical.
+  std::vector<float> stereo;
+  const std::vector<float> mono = MakeParam("audiovae.encoder.input", samples, 1.0);
+  stereo.insert(stereo.end(), mono.begin(), mono.end());
+  stereo.insert(stereo.end(), mono.begin(), mono.end());
+
+  int64_t audio_t = 0;
+  const std::vector<float> rows =
+      vllm::MiniMaxH3AudioVaeEncodeToRows(cfg, w, stereo, 2, samples, {}, {}, &audio_t);
+  CHECK(audio_t == vllm_test::kH3AudioEncFrames);
+  REQUIRE(rows.size() == static_cast<size_t>(2 * audio_t * width));
+  // Channel-major: rows [0, audio_t) are channel 0, [audio_t, 2*audio_t) channel 1.
+  double channel_diff = 0.0;
+  for (int64_t i = 0; i < audio_t * width; ++i) {
+    channel_diff = std::max(channel_diff, std::abs(static_cast<double>(rows[i]) -
+                                                   rows[audio_t * width + i]));
+  }
+  CHECK(channel_diff == 0.0);
+  // And row r of channel 0 is the mean_proj latent's frame r, transposed.
+  int64_t lf = 0;
+  const std::vector<float> latent = vllm::MiniMaxH3AudioVaeEncodeToLatent(cfg, w, mono, samples, &lf);
+  for (int64_t t = 0; t < audio_t; ++t) {
+    for (int64_t d = 0; d < width; ++d) {
+      CHECK(rows[static_cast<size_t>(t * width + d)] ==
+            doctest::Approx(latent[static_cast<size_t>(d * audio_t + t)]));
+    }
+  }
+
+  // With statistics the rows move into the DiT's normalized space: (x - mean) / std.
+  std::vector<float> mean(static_cast<size_t>(width)), stdev(static_cast<size_t>(width));
+  for (int64_t d = 0; d < width; ++d) {
+    mean[static_cast<size_t>(d)] = 0.25f * static_cast<float>(d + 1);
+    stdev[static_cast<size_t>(d)] = 1.5f + 0.5f * static_cast<float>(d);
+  }
+  int64_t nt = 0;
+  const std::vector<float> normalized =
+      vllm::MiniMaxH3AudioVaeEncodeToRows(cfg, w, stereo, 2, samples, mean, stdev, &nt);
+  CHECK(nt == audio_t);
+  for (int64_t t = 0; t < audio_t; ++t) {
+    for (int64_t d = 0; d < width; ++d) {
+      const double raw = rows[static_cast<size_t>(t * width + d)];
+      CHECK(normalized[static_cast<size_t>(t * width + d)] ==
+            doctest::Approx((raw - mean[static_cast<size_t>(d)]) / stdev[static_cast<size_t>(d)])
+                .epsilon(1e-5));
+    }
+  }
+}
+
+TEST_CASE("minimax_h3: reference-audio rows take the SHIPPED 32-wide path, noise aug included") {
+  // The golden config narrows 16 -> 4 through the adaptive average pool. The
+  // SHIPPED one does not pool at all in the same way, and its row width is the 32
+  // that MiniMaxH3AudioCondNoiseAug hard-codes (as upstream does), so both the
+  // no-pool branch and the noise-aug delegation are only reachable at 32.
+  vllm::MiniMaxH3AudioVaeEncoderConfig cfg;
+  cfg.encoder_dim = 2;
+  cfg.encoder_rates = {2, 2};
+  cfg.latent_dim = 64;
+  cfg.vae_latent_channels = vllm::kMiniMaxH3AudioRowWidth;  // 32
+  cfg.attn_proj = true;
+  cfg.attn_proj_heads = 2;
+  // 64 % 32 == 0, so attn_proj_dim is vae_latent_channels itself, and
+  // head_dim = 64 / 2 = 32 == out_dim: the adaptive pool is a NO-OP here.
+  CHECK(cfg.attn_proj_dim() == vllm::kMiniMaxH3AudioRowWidth);
+  const vllm::MiniMaxH3AudioVaeWeights w = BuildAudioEncoderWeights(cfg, "wide.");
+
+  const int64_t channels = vllm::kMiniMaxH3AudioChannels;
+  const int64_t samples = 20;  // hop 4 -> 5 latent frames
+  const std::vector<float> wave = MakeParam("wide.wave", channels * samples, 0.8);
+
+  vllm::MiniMaxH3RefBlock block{};
+  const std::vector<float> clean = vllm::MiniMaxH3EncodeReferenceAudio(
+      cfg, w, wave, channels, samples, {}, {}, /*noise_aug=*/1.0, {}, &block);
+  CHECK(block.kind == vllm::MiniMaxH3RefBlock::Kind::kAudio);
+  CHECK(block.ref_audio_t == samples / cfg.hop_length());
+  REQUIRE(clean.size() ==
+          static_cast<size_t>(channels * block.ref_audio_t * vllm::kMiniMaxH3AudioRowWidth));
+  for (float v : clean) CHECK(std::isfinite(v));
+
+  // noise_aug < 1 must DELEGATE to the already-gated mix rather than reimplement
+  // it: out = aug*clean + (1-aug)*noise, over the same rows.
+  const std::vector<float> noise = MakeParam("wide.noise", clean.size(), 0.5);
+  const double aug = 0.35;
+  const std::vector<float> mixed = vllm::MiniMaxH3EncodeReferenceAudio(
+      cfg, w, wave, channels, samples, {}, {}, aug, noise, &block);
+  REQUIRE(mixed.size() == clean.size());
+  double mix_err = 0.0;
+  for (size_t i = 0; i < mixed.size(); ++i) {
+    const double want = aug * clean[i] + (1.0 - aug) * noise[i];
+    mix_err = std::max(mix_err, std::abs(static_cast<double>(mixed[i]) - want));
+  }
+  INFO("reference-audio noise-aug mix max|diff| = " << mix_err);
+  CHECK(mix_err <= 1e-6);
+  // And it really MOVED: a delegation that silently returned `clean` would pass
+  // every shape check above.
+  CHECK(MaxAbsDiff(mixed, clean.data(), clean.size()) > 1e-3);
+
+  // A mono waveform handed in as stereo is refused: the packed layout is
+  // channel-major over kMiniMaxH3AudioChannels, so a one-channel encode would
+  // silently claim half the rows a block declares.
+  CHECK_THROWS(vllm::MiniMaxH3EncodeReferenceAudio(cfg, w, wave, 1, samples, {}, {}, 1.0, {},
+                                                   nullptr));
+}
+
 TEST_CASE("minimax_h3: a REAL ComfyUI GGUF resolves onto our weight contract") {
   // The whole point of the GGUF arm: the quantized checkpoints are the ones that
   // FIT this hardware. This gates the loader against the actual 535-tensor
@@ -1769,13 +2080,19 @@ TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
     INFO("ref2va image reference moved the video rows by " << delta);
     CHECK(delta > 1e-5);
 
-    // An AUDIO reference must be REFUSED, not silently conditioned on nothing:
-    // the audio VAE's encoder is not ported, so there is no way to honour it.
+    // An audio-bearing block that supplies NO rows must still be refused: the
+    // layout would grow around packed rows nothing ever wrote, and the loop would
+    // pin whatever happened to be in the buffer.
     vllm::MiniMaxH3T2vaRequest bad = req;
     vllm::MiniMaxH3RefBlock ab;
     ab.kind = vllm::MiniMaxH3RefBlock::Kind::kAudio;
     ab.ref_audio_t = 2;
     bad.ref_blocks = {ab};
+    CHECK_THROWS(vllm::MiniMaxH3DenoiseT2va(vt::Device{}, bad, p, dit->views, prompt, nv, na,
+                                            vt::DType::kF32));
+    // ... and so must one that supplies the WRONG number of rows.
+    bad.audio_ref_rows = MakeParam("ref2va.short", (ab.ref_audio_t * req.audio_channel - 1) *
+                                                       p.audio_latents_dim, 0.3);
     CHECK_THROWS(vllm::MiniMaxH3DenoiseT2va(vt::Device{}, bad, p, dit->views, prompt, nv, na,
                                             vt::DType::kF32));
 
@@ -1844,8 +2161,8 @@ TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
     INFO("ref2va video reference moved the video rows by " << delta);
     CHECK(delta > 1e-5);
 
-    // A video reference WITH audio must be refused, for the same reason a bare
-    // audio reference is.
+    // A video reference WITH audio but WITHOUT the encoded audio rows must be
+    // refused: its audio slots would otherwise be pinned to nothing.
     vllm::MiniMaxH3T2vaRequest bad = req;
     vllm::MiniMaxH3RefBlock loud = vb;
     loud.ref_audio_t = 2;
@@ -1910,6 +2227,207 @@ TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
     }
     INFO("keyframe conditioning moved the video rows by " << delta);
     CHECK(delta > 1e-5);
+  }
+
+  // --- the AUDIO half of ref2va. A reduced audio VAE encoder whose latent width
+  // is the DiT's own audio row width, so the rows it emits ARE packed rows.
+  vllm::MiniMaxH3AudioVaeEncoderConfig acfg;
+  acfg.encoder_dim = 4;
+  acfg.encoder_rates = {2, 2};
+  acfg.latent_dim = 16;
+  acfg.vae_latent_channels = p.audio_latents_dim;
+  acfg.attn_proj = true;
+  acfg.attn_proj_heads = 2;
+  const vllm::MiniMaxH3AudioVaeWeights aw = BuildAudioEncoderWeights(acfg, "ref2va.aud.");
+  const int64_t kRefSamples = 24;  // 24 / hop 4 -> 6 latent frames
+
+  SUBCASE("ref2va AUDIO references are wired, and CHANGE the result") {
+    vllm::MiniMaxH3T2vaRequest req;
+    req.text_len = 4;
+    req.latent_t = 2;
+    req.latent_h = 4;
+    req.latent_w = 4;
+    req.audio_t = 4;
+    req.audio_channel = 2;
+    req.num_steps = 3;
+
+    // A stereo reference waveform, encoded by the audio VAE's ENCODER half.
+    const std::vector<float> stereo =
+        MakeParam("ref2va.wave", req.audio_channel * kRefSamples, 0.9);
+    vllm::MiniMaxH3RefBlock ab{};
+    const std::vector<float> arows = vllm::MiniMaxH3EncodeReferenceAudio(
+        acfg, aw, stereo, req.audio_channel, kRefSamples, {}, {}, /*noise_aug=*/1.0, {}, &ab);
+    CHECK(ab.kind == vllm::MiniMaxH3RefBlock::Kind::kAudio);
+    CHECK(ab.ref_audio_t == kRefSamples / acfg.hop_length());
+    REQUIRE(arows.size() ==
+            static_cast<size_t>(ab.ref_audio_t * req.audio_channel * p.audio_latents_dim));
+    for (const float v : arows) REQUIRE(std::isfinite(v));
+
+    // The layout must GROW by exactly the rows the block claims -- an audio
+    // reference occupies packed audio positions, it does not overwrite targets.
+    const vllm::MiniMaxH3PackedSequence pk_plain = vllm::BuildMiniMaxH3PackedSequence(
+        req.text_len, req.latent_t, req.latent_h, req.latent_w, req.audio_t, req.audio_channel,
+        false, {}, 0);
+    const vllm::MiniMaxH3PackedSequence pk_ref = vllm::BuildMiniMaxH3PackedSequenceRef2va(
+        req.text_len, req.latent_t, req.latent_h, req.latent_w, req.audio_t, {ab},
+        req.audio_channel);
+    CHECK(static_cast<int64_t>(pk_ref.audio_pos.size()) ==
+          static_cast<int64_t>(pk_plain.audio_pos.size()) + ab.ref_audio_t * req.audio_channel);
+
+    const int64_t frame_rows = (req.latent_h / p.patch_size_h) * (req.latent_w / p.patch_size_w);
+    const std::vector<float> prompt = MakeParam("ref2aud.prompt", req.text_len * p.text_dim, 0.2);
+    const std::vector<float> nv =
+        MakeParam("ref2aud.nv", req.latent_t * frame_rows * p.video_row_width(), 0.3);
+    const std::vector<float> na =
+        MakeParam("ref2aud.na", req.audio_t * req.audio_channel * p.audio_latents_dim, 0.3);
+
+    const vllm::MiniMaxH3DenoiseResult plain = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, req, p, dit->views, prompt, nv, na, vt::DType::kF32);
+
+    vllm::MiniMaxH3T2vaRequest ra = req;
+    ra.ref_blocks = {ab};
+    ra.audio_ref_rows = arows;
+    const vllm::MiniMaxH3DenoiseResult withaudio = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, ra, p, dit->views, prompt, nv, na, vt::DType::kF32);
+    for (const float v : withaudio.audio_rows) REQUIRE(std::isfinite(v));
+    for (const float v : withaudio.video_rows) REQUIRE(std::isfinite(v));
+
+    // THE assertion, the audio-side twin of the keyframe one: identical prompt,
+    // identical noise, identical schedule -- the only difference is the reference
+    // audio, so BOTH streams must move. Wiring that accepts the rows and ignores
+    // them would still produce finite, correctly shaped output.
+    const size_t na_n = std::min(plain.audio_rows.size(), withaudio.audio_rows.size());
+    REQUIRE(na_n > 0);
+    double audio_delta = 0.0;
+    for (size_t i = 0; i < na_n; ++i) {
+      audio_delta = std::max(audio_delta, std::abs(static_cast<double>(plain.audio_rows[i]) -
+                                                   withaudio.audio_rows[i]));
+    }
+    INFO("ref2va audio reference moved the audio rows by " << audio_delta);
+    CHECK(audio_delta > 1e-5);
+
+    const size_t nv_n = std::min(plain.video_rows.size(), withaudio.video_rows.size());
+    REQUIRE(nv_n > 0);
+    double video_delta = 0.0;
+    for (size_t i = 0; i < nv_n; ++i) {
+      video_delta = std::max(video_delta, std::abs(static_cast<double>(plain.video_rows[i]) -
+                                                   withaudio.video_rows[i]));
+    }
+    INFO("ref2va audio reference moved the VIDEO rows by " << video_delta);
+    CHECK(video_delta > 1e-5);
+
+    // And the reference itself is LOAD-BEARING, not merely present: a DIFFERENT
+    // waveform must give a different result. Wiring that reserved the rows and
+    // then pinned a constant would pass every check above and fail this one.
+    const std::vector<float> other =
+        MakeParam("ref2va.wave.other", req.audio_channel * kRefSamples, 0.9);
+    vllm::MiniMaxH3RefBlock ob{};
+    vllm::MiniMaxH3T2vaRequest rb = ra;
+    rb.audio_ref_rows = vllm::MiniMaxH3EncodeReferenceAudio(
+        acfg, aw, other, req.audio_channel, kRefSamples, {}, {}, /*noise_aug=*/1.0, {}, &ob);
+    CHECK(ob.ref_audio_t == ab.ref_audio_t);
+    const vllm::MiniMaxH3DenoiseResult otheraudio = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, rb, p, dit->views, prompt, nv, na, vt::DType::kF32);
+    double which_delta = 0.0;
+    for (size_t i = 0; i < na_n; ++i) {
+      which_delta = std::max(which_delta, std::abs(static_cast<double>(withaudio.audio_rows[i]) -
+                                                  otheraudio.audio_rows[i]));
+    }
+    INFO("a DIFFERENT reference waveform moved the audio rows by " << which_delta);
+    CHECK(which_delta > 1e-5);
+  }
+
+  SUBCASE("ref2va VIDEO+AUDIO references carry both, and both are load-bearing") {
+    const int64_t FT = 3;
+    const std::vector<float> clip =
+        MakeParam("ref2va.avclip", ecfg.in_channels * FT * IH * IW, 1.0);
+    vllm::MiniMaxH3RefBlock vb{};
+    const std::vector<float> vrows =
+        vllm::MiniMaxH3EncodeReferenceVideo(ecfg, ew, p, clip, FT, IH, IW, &vb);
+    REQUIRE(!vrows.empty());
+    CHECK(vb.ref_audio_t == 0);  // silent until an encoded waveform says otherwise
+
+    vllm::MiniMaxH3T2vaRequest req;
+    req.text_len = 4;
+    req.latent_t = 2;
+    req.latent_h = 4;
+    req.latent_w = 4;
+    req.audio_t = 4;
+    req.audio_channel = 2;
+    req.num_steps = 3;
+
+    const std::vector<float> stereo =
+        MakeParam("ref2va.avwave", req.audio_channel * kRefSamples, 0.9);
+    vllm::MiniMaxH3RefBlock ab{};
+    const std::vector<float> arows = vllm::MiniMaxH3EncodeReferenceAudio(
+        acfg, aw, stereo, req.audio_channel, kRefSamples, {}, {}, /*noise_aug=*/1.0, {}, &ab);
+    // ONE block carrying both: the clip's geometry plus the waveform's extent.
+    vllm::MiniMaxH3RefBlock av = vb;
+    av.ref_audio_t = ab.ref_audio_t;
+    CHECK(av.kind == vllm::MiniMaxH3RefBlock::Kind::kVideoAudio);
+    CHECK(av.ref_audio_t > 0);
+
+    const int64_t frame_rows = (req.latent_h / p.patch_size_h) * (req.latent_w / p.patch_size_w);
+    const std::vector<float> prompt = MakeParam("ref2av.prompt", req.text_len * p.text_dim, 0.2);
+    const std::vector<float> nv =
+        MakeParam("ref2av.nv", req.latent_t * frame_rows * p.video_row_width(), 0.3);
+    const std::vector<float> na =
+        MakeParam("ref2av.na", req.audio_t * req.audio_channel * p.audio_latents_dim, 0.3);
+
+    // The SILENT same-clip reference is the control: the only difference is sound.
+    vllm::MiniMaxH3T2vaRequest silent = req;
+    silent.ref_blocks = {vb};
+    silent.keyframe_cond_rows = vrows;
+    const vllm::MiniMaxH3DenoiseResult quiet = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, silent, p, dit->views, prompt, nv, na, vt::DType::kF32);
+
+    vllm::MiniMaxH3T2vaRequest loud = req;
+    loud.ref_blocks = {av};
+    loud.keyframe_cond_rows = vrows;
+    loud.audio_ref_rows = arows;
+    const vllm::MiniMaxH3DenoiseResult sounded = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, loud, p, dit->views, prompt, nv, na, vt::DType::kF32);
+    for (const float v : sounded.audio_rows) REQUIRE(std::isfinite(v));
+    for (const float v : sounded.video_rows) REQUIRE(std::isfinite(v));
+
+    const size_t na_n = std::min(quiet.audio_rows.size(), sounded.audio_rows.size());
+    REQUIRE(na_n > 0);
+    double audio_delta = 0.0;
+    for (size_t i = 0; i < na_n; ++i) {
+      audio_delta = std::max(audio_delta, std::abs(static_cast<double>(quiet.audio_rows[i]) -
+                                                  sounded.audio_rows[i]));
+    }
+    INFO("ref2va video+audio moved the audio rows by " << audio_delta);
+    CHECK(audio_delta > 1e-5);
+
+    const size_t nv_n = std::min(quiet.video_rows.size(), sounded.video_rows.size());
+    REQUIRE(nv_n > 0);
+    double video_delta = 0.0;
+    for (size_t i = 0; i < nv_n; ++i) {
+      video_delta = std::max(video_delta, std::abs(static_cast<double>(quiet.video_rows[i]) -
+                                                  sounded.video_rows[i]));
+    }
+    INFO("ref2va video+audio moved the VIDEO rows by " << video_delta);
+    CHECK(video_delta > 1e-5);
+
+    // The VISUAL half must still be load-bearing once audio joins it: encode a
+    // different clip and the result must move again.
+    const std::vector<float> clip2 =
+        MakeParam("ref2va.avclip2", ecfg.in_channels * FT * IH * IW, 1.0);
+    vllm::MiniMaxH3RefBlock vb2{};
+    vllm::MiniMaxH3T2vaRequest loud2 = loud;
+    loud2.keyframe_cond_rows =
+        vllm::MiniMaxH3EncodeReferenceVideo(ecfg, ew, p, clip2, FT, IH, IW, &vb2);
+    const vllm::MiniMaxH3DenoiseResult sounded2 = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, loud2, p, dit->views, prompt, nv, na, vt::DType::kF32);
+    double visual_delta = 0.0;
+    for (size_t i = 0; i < nv_n; ++i) {
+      visual_delta = std::max(visual_delta, std::abs(static_cast<double>(sounded.video_rows[i]) -
+                                                    sounded2.video_rows[i]));
+    }
+    INFO("a DIFFERENT reference clip (with the same audio) moved the video rows by "
+         << visual_delta);
+    CHECK(visual_delta > 1e-5);
   }
 }
 
@@ -3239,6 +3757,73 @@ TEST_CASE("minimax_h3: the decoded waveform serializes to a valid WAV") {
   CHECK_THROWS(vllm::MiniMaxH3WriteWav(waveform, 3, samples, rate));  // size mismatch
 }
 
+TEST_CASE("minimax_h3: a reference WAV reads back channel-major, and refuses what it cannot fix") {
+  // The reader exists for REFERENCE AUDIO: ref2va conditions on a supplied
+  // waveform. It is gated against the writer it inverts, because a de-interleave
+  // that is backwards produces audio that still plays -- just with the channels
+  // time-smeared into each other, which no shape check catches.
+  const int64_t rate = vllm::kMiniMaxH3AudioSampleRate;
+  const int64_t samples = 9;
+  std::vector<float> stereo(static_cast<size_t>(2 * samples));
+  for (int64_t t = 0; t < samples; ++t) {
+    stereo[static_cast<size_t>(t)] = 0.1f * static_cast<float>(t);              // channel 0
+    stereo[static_cast<size_t>(samples + t)] = -0.05f * static_cast<float>(t);  // channel 1
+  }
+  const std::string wav = vllm::MiniMaxH3WriteWav(stereo, 2, samples, rate);
+
+  int64_t got = 0;
+  const std::vector<float> back = vllm::MiniMaxH3ReadWav(wav, 2, rate, &got);
+  CHECK(got == samples);
+  REQUIRE(back.size() == stereo.size());
+  // 16-bit PCM: one quantization step is 1/32768, so the round trip is exact to
+  // within half a step.
+  const double err = MaxAbsDiff(back, stereo.data(), stereo.size());
+  INFO("WAV round-trip max|diff| = " << err);
+  CHECK(err <= 1.0 / 32768.0);
+  // Channel-major really is channel-major: channel 1 must be the DESCENDING ramp.
+  CHECK(back[static_cast<size_t>(samples + 1)] < 0.0f);
+  CHECK(back[1] > 0.0f);
+
+  // A MONO file is REPEATED up to the model's channel count (vae.py:305-313), so
+  // a mono reference conditions both channels rather than silencing one.
+  const std::vector<float> mono(stereo.begin(), stereo.begin() + samples);
+  const std::string mono_wav = vllm::MiniMaxH3WriteWav(mono, 1, samples, rate);
+  int64_t mono_got = 0;
+  const std::vector<float> widened =
+      vllm::MiniMaxH3ReadWav(mono_wav, vllm::kMiniMaxH3AudioChannels, rate, &mono_got);
+  CHECK(mono_got == samples);
+  REQUIRE(widened.size() == static_cast<size_t>(vllm::kMiniMaxH3AudioChannels * samples));
+  for (int64_t t = 0; t < samples; ++t) {
+    CHECK(widened[static_cast<size_t>(t)] == widened[static_cast<size_t>(samples + t)]);
+  }
+
+  // A rate the VAE was not trained at is REFUSED, not resampled: encoding a
+  // 44.1 kHz file as 32 kHz would shift every latent frame, and there is no audio
+  // dependency here to resample with.
+  const std::string wrong_rate = vllm::MiniMaxH3WriteWav(stereo, 2, samples, 44100);
+  CHECK_THROWS(vllm::MiniMaxH3ReadWav(wrong_rate, 2, rate, nullptr));
+  CHECK_NOTHROW(vllm::MiniMaxH3ReadWav(wrong_rate, 2, /*want_sample_rate=*/0, nullptr));
+
+  // And malformed input is refused rather than read as audio.
+  CHECK_THROWS(vllm::MiniMaxH3ReadWav("not a wav at all", 2, rate, nullptr));
+  std::string truncated = wav.substr(0, 40);
+  CHECK_THROWS(vllm::MiniMaxH3ReadWav(truncated, 2, rate, nullptr));
+  // A chunk BEFORE `data` must be walked over, not assumed away: a fixed 44-byte
+  // header would read the LIST payload as samples.
+  std::string with_list = wav.substr(0, 36);
+  const std::string list_body = "INFOxxxx";
+  with_list += "LIST";
+  for (int i = 0; i < 4; ++i) {
+    with_list.push_back(static_cast<char>((list_body.size() >> (8 * i)) & 0xFF));
+  }
+  with_list += list_body;
+  with_list += wav.substr(36);
+  int64_t list_got = 0;
+  const std::vector<float> after_list = vllm::MiniMaxH3ReadWav(with_list, 2, rate, &list_got);
+  CHECK(list_got == samples);
+  CHECK(MaxAbsDiff(after_list, back.data(), back.size()) == 0.0);
+}
+
 TEST_CASE("minimax_h3: video output -- PPM frames and the MP4 mux command") {
   // The library produces the ARTIFACTS and BUILDS the argv; the example/server
   // layer spawns ffmpeg. Both halves here are pure data transforms, so both are
@@ -3836,6 +4421,319 @@ TEST_CASE("minimax_h3: the audio-VAE loader materializes weights the decoder RUN
     CHECK(v >= -1.0f);
     CHECK(v <= 1.0f);
   }
+}
+
+TEST_CASE("minimax_h3: the REAL audio-VAE checkpoint maps onto the ENCODER's names") {
+  // The mirror of the decoder's manifest test, for the half that had no loader.
+  // Same file, same 1087 tensors, opposite selection: `encoder.*` (de-prefixed),
+  // plus the TOP-LEVEL `pre_block.*` and `mean_proj.*`. `logs_proj.*` must be left
+  // behind -- loading it would imply conditioning samples the distribution.
+  auto mapped = [](const std::string& name) -> std::string {
+    const bool is_encoder = name.rfind("encoder.", 0) == 0;
+    if (!is_encoder && name.rfind("pre_block.", 0) != 0 && name.rfind("mean_proj.", 0) != 0) {
+      return "";
+    }
+    std::string key = is_encoder ? name.substr(std::strlen("encoder.")) : name;
+    const std::string g = ".weight_g", v = ".weight_v";
+    if (key.size() > g.size() && key.compare(key.size() - g.size(), g.size(), g) == 0) {
+      return key.substr(0, key.size() - g.size()) + ".parametrizations.weight.original0";
+    }
+    if (key.size() > v.size() && key.compare(key.size() - v.size(), v.size(), v) == 0) {
+      return key.substr(0, key.size() - v.size()) + ".parametrizations.weight.original1";
+    }
+    return key;
+  };
+
+  std::set<std::string> encoder_names;
+  int64_t weight_norm_pairs = 0, skipped_decoder = 0, skipped_logs = 0;
+  for (int64_t i = 0; i < vllm_test::kH3AudioVaeTensorCount; ++i) {
+    const std::string name = vllm_test::kH3AudioVaeTensors[i].name;
+    if (name.rfind("logs_proj.", 0) == 0) {
+      ++skipped_logs;
+      continue;
+    }
+    const std::string key = mapped(name);
+    if (key.empty()) {
+      ++skipped_decoder;
+      continue;
+    }
+    CHECK(encoder_names.insert(key).second);  // the mapping must be INJECTIVE
+    if (key.find(".parametrizations.weight.original") != std::string::npos) ++weight_norm_pairs;
+  }
+  CHECK(skipped_decoder > 0);  // the decoder really does share the file
+  CHECK(skipped_logs == 2);    // logs_proj.weight + logs_proj.bias, both left behind
+  CHECK(weight_norm_pairs > 0);
+
+  // The encoder's own entry points, under the MAPPED names the forward reads.
+  CHECK(encoder_names.count("block.0.parametrizations.weight.original0") == 1);
+  CHECK(encoder_names.count("block.0.parametrizations.weight.original1") == 1);
+  CHECK(encoder_names.count("block.0.bias") == 1);
+  CHECK(encoder_names.count("block.1.block.0.block.0.alpha") == 1);      // ResidualUnit Snake1d
+  CHECK(encoder_names.count("block.1.block.0.block.1.parametrizations.weight.original1") == 1);
+  CHECK(encoder_names.count("block.1.block.4.parametrizations.weight.original1") == 1);  // stride
+  CHECK(encoder_names.count("mean_proj.weight") == 1);
+  CHECK(encoder_names.count("pre_block.attn.qkv.weight") == 1);
+  CHECK(encoder_names.count("pre_block.attn.zero_k_bias") == 1);
+  CHECK(encoder_names.count("pre_block.mlp.w2.weight") == 1);
+  for (const std::string& n : encoder_names) {
+    CHECK(n.find(".weight_g") == std::string::npos);
+    CHECK(n.find(".weight_v") == std::string::npos);
+    CHECK(n.rfind("encoder.", 0) != 0);
+    CHECK(n.rfind("logs_proj", 0) != 0);
+  }
+
+  // The SHIPPED geometry, recovered from the manifest's shapes alone, must equal
+  // the config MiniMaxH3AudioVaeEncoderConfig defaults to. This is the check that
+  // catches a rates list or a latent width that drifted from the checkpoint.
+  auto shape_of = [](const std::string& want) {
+    for (int64_t i = 0; i < vllm_test::kH3AudioVaeTensorCount; ++i) {
+      if (want == vllm_test::kH3AudioVaeTensors[i].name) return vllm_test::kH3AudioVaeTensors[i];
+    }
+    FAIL("manifest is missing ", want);
+    return vllm_test::kH3AudioVaeTensors[0];
+  };
+  const vllm::MiniMaxH3AudioVaeEncoderConfig cfg;  // the SHIPPED defaults
+  // block.0: WNConv1d(1, encoder_dim, k=7).
+  const auto first = shape_of("encoder.block.0.weight_v");
+  CHECK(first.shape[0] == cfg.encoder_dim);
+  CHECK(first.shape[1] == 1);  // a MONO waveform in
+  CHECK(first.shape[2] == 7);
+  // Each EncoderBlock's strided conv doubles the channels; its kernel is 2*stride,
+  // which is how the manifest pins down `encoder_rates` without a config file.
+  int64_t channels = cfg.encoder_dim;
+  for (size_t i = 0; i < cfg.encoder_rates.size(); ++i) {
+    const auto down =
+        shape_of("encoder.block." + std::to_string(i + 1) + ".block.4.weight_v");
+    CHECK(down.shape[0] == channels * 2);
+    CHECK(down.shape[1] == channels);
+    CHECK(down.shape[2] == 2 * cfg.encoder_rates[i]);
+    channels *= 2;
+  }
+  CHECK(channels == cfg.latent_dim);  // 64 * 2^5 == 2048
+  // The final conv lands on d_latent with k=3, and the manifest's index proves the
+  // block count: 1 conv + 5 EncoderBlocks + 1 Snake1d + 1 conv.
+  const auto tail = shape_of("encoder.block." + std::to_string(cfg.encoder_rates.size() + 2) +
+                             ".weight_v");
+  CHECK(tail.shape[0] == cfg.latent_dim);
+  CHECK(tail.shape[1] == channels);
+  CHECK(tail.shape[2] == 3);
+  // pre_block: AttnProjection(latent_dim -> attn_proj_dim), qkv 3x the INPUT width
+  // (the narrowing branch, dac_attn_proj.py:31-37).
+  const auto qkv = shape_of("pre_block.attn.qkv.weight");
+  CHECK(qkv.shape[0] == 3 * cfg.latent_dim);
+  CHECK(qkv.shape[1] == cfg.latent_dim);
+  const auto pproj = shape_of("pre_block.proj.weight");
+  CHECK(pproj.shape[0] == cfg.attn_proj_dim());
+  CHECK(pproj.shape[1] == cfg.latent_dim);
+  // mean_proj: Conv1d(attn_proj_dim -> vae_latent_channels, k=1).
+  const auto mp = shape_of("mean_proj.weight");
+  CHECK(mp.shape[0] == cfg.vae_latent_channels);
+  CHECK(mp.shape[1] == cfg.attn_proj_dim());
+  CHECK(mp.shape[2] == 1);
+}
+
+TEST_CASE("minimax_h3: the audio-VAE ENCODER loader materializes weights that RUN") {
+  // End to end for the encoder half: a real safetensors file written with the
+  // SHIPPED spellings (encoder. prefix, legacy weight_g/weight_v, a decoder and a
+  // logs_proj sharing the file) must load into weights the encoder actually
+  // encodes with. Names alone cannot reach that.
+  const vllm::MiniMaxH3AudioVaeEncoderConfig cfg = ReducedAudioEncoderConfig();
+  struct Entry {
+    std::string name;
+    std::vector<int64_t> shape;
+    std::string bytes;
+  };
+  std::vector<Entry> entries;
+  auto add = [&](const std::string& name, const std::vector<int64_t>& shape, double scale,
+                 double offset) {
+    int64_t numel = 1;
+    for (int64_t d : shape) numel *= d;
+    const std::vector<float> values = MakeParam("stenc." + name, numel, scale, offset);
+    entries.push_back({name, shape,
+                       std::string(reinterpret_cast<const char*>(values.data()),
+                                   values.size() * sizeof(float))});
+  };
+  // A weight-normalized conv, in the checkpoint's LEGACY spelling.
+  auto add_conv = [&](const std::string& prefix, int64_t out_ch, int64_t in_ch, int64_t k) {
+    add(prefix + ".weight_g", {out_ch, 1, 1}, 0.03, 0.15);
+    add(prefix + ".weight_v", {out_ch, in_ch, k}, 0.08, 0.0);
+    add(prefix + ".bias", {out_ch}, 0.05, 0.0);
+  };
+  auto add_alpha = [&](const std::string& name, int64_t ch) {
+    add(name, {1, ch, 1}, 0.2, 1.0);
+  };
+
+  add_conv("encoder.block.0", cfg.encoder_dim, 1, 7);
+  int64_t channels = cfg.encoder_dim;
+  for (size_t i = 0; i < cfg.encoder_rates.size(); ++i) {
+    channels *= 2;
+    const int64_t half = channels / 2;
+    const std::string blk = "encoder.block." + std::to_string(i + 1);
+    for (int64_t u = 0; u < 3; ++u) {
+      const std::string ru = blk + ".block." + std::to_string(u);
+      add_alpha(ru + ".block.0.alpha", half);
+      add_conv(ru + ".block.1", half, half, 7);
+      add_alpha(ru + ".block.2.alpha", half);
+      add_conv(ru + ".block.3", half, half, 1);
+    }
+    add_alpha(blk + ".block.3.alpha", half);
+    add_conv(blk + ".block.4", channels, half, 2 * cfg.encoder_rates[i]);
+  }
+  const size_t rates = cfg.encoder_rates.size();
+  add_alpha("encoder.block." + std::to_string(rates + 1) + ".alpha", channels);
+  add_conv("encoder.block." + std::to_string(rates + 2), cfg.latent_dim, channels, 3);
+
+  const int64_t in_dim = cfg.latent_dim, out_dim = cfg.attn_proj_dim();
+  add("pre_block.norm1.weight", {in_dim}, 0.1, 1.0);
+  add("pre_block.norm1.bias", {in_dim}, 0.05, 0.0);
+  add("pre_block.norm3.weight", {in_dim}, 0.1, 1.0);
+  add("pre_block.norm3.bias", {in_dim}, 0.05, 0.0);
+  add("pre_block.norm2.weight", {out_dim}, 0.1, 1.0);
+  add("pre_block.norm2.bias", {out_dim}, 0.05, 0.0);
+  add("pre_block.attn.q_bias", {in_dim}, 0.05, 0.0);
+  add("pre_block.attn.v_bias", {in_dim}, 0.05, 0.0);
+  add("pre_block.attn.zero_k_bias", {in_dim}, 0.0, 0.0);
+  add("pre_block.attn.qkv.weight", {3 * in_dim, in_dim}, 0.1, 0.0);
+  add("pre_block.attn.proj.weight", {out_dim, out_dim}, 0.1, 0.0);
+  add("pre_block.attn.proj.bias", {out_dim}, 0.05, 0.0);
+  add("pre_block.proj.weight", {out_dim, in_dim}, 0.1, 0.0);
+  add("pre_block.proj.bias", {out_dim}, 0.05, 0.0);
+  add("pre_block.mlp.norm.weight", {out_dim}, 0.1, 1.0);
+  add("pre_block.mlp.norm.bias", {out_dim}, 0.05, 0.0);
+  const int64_t hidden = 2 * out_dim;
+  add("pre_block.mlp.w0.weight", {hidden, out_dim}, 0.1, 0.0);
+  add("pre_block.mlp.w0.bias", {hidden}, 0.05, 0.0);
+  add("pre_block.mlp.w1.weight", {hidden, out_dim}, 0.1, 0.0);
+  add("pre_block.mlp.w1.bias", {hidden}, 0.05, 0.0);
+  add("pre_block.mlp.w2.weight", {out_dim, hidden}, 0.1, 0.0);
+  add("pre_block.mlp.w2.bias", {out_dim}, 0.05, 0.0);
+  add("mean_proj.weight", {cfg.vae_latent_channels, out_dim, 1}, 0.1, 0.0);
+  add("mean_proj.bias", {cfg.vae_latent_channels}, 0.05, 0.0);
+  // The DECODER and the log-variance head share the file. Both must be left behind.
+  add("decoder.conv_pre.weight_g", {8, 1, 1}, 0.1, 0.0);
+  add("decoder.conv_pre.weight_v", {8, 4, 7}, 0.1, 0.0);
+  add("dec_in_proj.weight", {4, 4, 1}, 0.1, 0.0);
+  add("logs_proj.weight", {cfg.vae_latent_channels, out_dim, 1}, 0.1, 0.0);
+  add("logs_proj.bias", {cfg.vae_latent_channels}, 0.05, 0.0);
+
+  std::string header = "{";
+  size_t offset = 0;
+  bool first = true;
+  for (const Entry& e : entries) {
+    if (!first) header += ",";
+    first = false;
+    header += "\"" + e.name + "\":{\"dtype\":\"F32\",\"shape\":[";
+    for (size_t i = 0; i < e.shape.size(); ++i) {
+      if (i) header += ",";
+      header += std::to_string(e.shape[i]);
+    }
+    header += "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + e.bytes.size()) + "]}";
+    offset += e.bytes.size();
+  }
+  header += "}";
+  const std::string path = "/tmp/minimax_h3_audio_vae_encoder_loader.safetensors";
+  {
+    FILE* fh = std::fopen(path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    const uint64_t n = header.size();
+    std::fwrite(&n, sizeof(n), 1, fh);
+    std::fwrite(header.data(), 1, header.size(), fh);
+    for (const Entry& e : entries) std::fwrite(e.bytes.data(), 1, e.bytes.size(), fh);
+    std::fclose(fh);
+  }
+
+  const vllm::SafetensorsFile st = vllm::SafetensorsFile::Open(path);
+  const vllm::MiniMaxH3AudioVaeWeights w = vllm::LoadMiniMaxH3AudioVaeEncoderWeights(st);
+
+  // Renamed, de-prefixed, and the decoder half dropped.
+  CHECK(w.Has("block.0.parametrizations.weight.original0"));
+  CHECK(w.Has("block.0.parametrizations.weight.original1"));
+  CHECK(w.Has("block.1.block.0.block.0.alpha"));
+  CHECK(w.Has("pre_block.attn.qkv.weight"));   // top level: NOT de-prefixed
+  CHECK(w.Has("mean_proj.weight"));
+  CHECK_FALSE(w.Has("encoder.block.0.weight_g"));  // legacy spelling gone
+  CHECK_FALSE(w.Has("block.0.weight_g"));
+  CHECK_FALSE(w.Has("conv_pre.parametrizations.weight.original0"));  // decoder half
+  CHECK_FALSE(w.Has("dec_in_proj.weight"));
+  // The log-variance head is refused on purpose: a reference must be the MEAN.
+  CHECK_FALSE(w.Has("logs_proj.weight"));
+  CHECK_FALSE(w.Has("logs_proj.bias"));
+  // A PLAIN Linear's `.weight` must NOT be mistaken for a materialized weight-norm.
+  CHECK_FALSE(w.Has("pre_block.attn.qkv.parametrizations.weight.original0"));
+  CHECK_FALSE(w.Has("mean_proj.parametrizations.weight.original0"));
+
+  // And it ENCODES: the loaded weights drive the real encoder to finite rows of
+  // the shape a reference block claims.
+  int64_t audio_t = 0;
+  const int64_t samples = vllm_test::kH3AudioEncSamples;
+  std::vector<float> stereo = MakeParam("stenc.wave", samples, 1.0);
+  const std::vector<float> copy = stereo;
+  stereo.insert(stereo.end(), copy.begin(), copy.end());
+  const std::vector<float> rows =
+      vllm::MiniMaxH3AudioVaeEncodeToRows(cfg, w, stereo, 2, samples, {}, {}, &audio_t);
+  CHECK(audio_t == vllm_test::kH3AudioEncFrames);
+  REQUIRE(rows.size() == static_cast<size_t>(2 * audio_t * cfg.vae_latent_channels));
+  for (float v : rows) CHECK(std::isfinite(v));
+
+  // A MATERIALIZED weight-norm (the third spelling) must load too: rewriting one
+  // conv as a plain `.weight` has to reconstruct an exact (g, v) pair, so the rows
+  // come out byte-identical.
+  std::vector<Entry> folded;
+  for (const Entry& e : entries) {
+    if (e.name == "encoder.block.0.weight_g") continue;
+    if (e.name == "encoder.block.0.weight_v") {
+      // w = g * v / ||v||, folded at "conversion time".
+      std::vector<float> v(e.bytes.size() / sizeof(float));
+      std::memcpy(v.data(), e.bytes.data(), e.bytes.size());
+      const std::vector<float> g = MakeParam("stenc.encoder.block.0.weight_g", cfg.encoder_dim,
+                                             0.03, 0.15);
+      const std::vector<float> materialized =
+          vllm::MiniMaxH3MaterializeWeightNorm(g, v, cfg.encoder_dim);
+      folded.push_back({"encoder.block.0.weight", e.shape,
+                        std::string(reinterpret_cast<const char*>(materialized.data()),
+                                    materialized.size() * sizeof(float))});
+      continue;
+    }
+    folded.push_back(e);
+  }
+  header = "{";
+  offset = 0;
+  first = true;
+  for (const Entry& e : folded) {
+    if (!first) header += ",";
+    first = false;
+    header += "\"" + e.name + "\":{\"dtype\":\"F32\",\"shape\":[";
+    for (size_t i = 0; i < e.shape.size(); ++i) {
+      if (i) header += ",";
+      header += std::to_string(e.shape[i]);
+    }
+    header += "],\"data_offsets\":[" + std::to_string(offset) + "," +
+              std::to_string(offset + e.bytes.size()) + "]}";
+    offset += e.bytes.size();
+  }
+  header += "}";
+  const std::string folded_path = "/tmp/minimax_h3_audio_vae_encoder_folded.safetensors";
+  {
+    FILE* fh = std::fopen(folded_path.c_str(), "wb");
+    REQUIRE(fh != nullptr);
+    const uint64_t n = header.size();
+    std::fwrite(&n, sizeof(n), 1, fh);
+    std::fwrite(header.data(), 1, header.size(), fh);
+    for (const Entry& e : folded) std::fwrite(e.bytes.data(), 1, e.bytes.size(), fh);
+    std::fclose(fh);
+  }
+  const vllm::SafetensorsFile fst = vllm::SafetensorsFile::Open(folded_path);
+  const vllm::MiniMaxH3AudioVaeWeights fw = vllm::LoadMiniMaxH3AudioVaeEncoderWeights(fst);
+  CHECK(fw.Has("block.0.parametrizations.weight.original0"));
+  int64_t ft = 0;
+  const std::vector<float> frows =
+      vllm::MiniMaxH3AudioVaeEncodeToRows(cfg, fw, stereo, 2, samples, {}, {}, &ft);
+  CHECK(ft == audio_t);
+  REQUIRE(frows.size() == rows.size());
+  const double fold_err = MaxAbsDiff(frows, rows.data(), rows.size());
+  INFO("materialized-weight-norm encode max|diff| = " << fold_err);
+  CHECK(fold_err <= 1e-6);
 }
 
 TEST_CASE("minimax_h3: the audio-VAE loader accepts a MATERIALIZED weight-norm too") {

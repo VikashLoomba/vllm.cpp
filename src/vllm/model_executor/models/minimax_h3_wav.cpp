@@ -78,4 +78,73 @@ std::string MiniMaxH3WriteWav(const std::vector<float>& waveform, int64_t channe
   return out;
 }
 
+// The INVERSE, needed once REFERENCE AUDIO became expressible: a ref2va request
+// conditions on a supplied waveform, and the waveform arrives as a file.
+//
+// Deliberately NOT a resampler. The checkpoint's audio VAE is 32 kHz; encoding a
+// 44.1 kHz file as if it were 32 kHz would silently shift every latent frame, so a
+// rate mismatch is REFUSED and the caller resamples. Upstream can be lax here only
+// because it has torchaudio (vae.py:298-306); this library has no audio dependency
+// and will not pretend to.
+std::vector<float> MiniMaxH3ReadWav(const std::string& bytes, int64_t want_channels,
+                                    int64_t want_sample_rate, int64_t* out_samples_per_channel) {
+  VT_CHECK(want_channels > 0, "minimax_h3 wav: want_channels must be positive");
+  VT_CHECK(bytes.size() >= 44, "minimax_h3 wav: too short to be a RIFF/WAVE file");
+  VT_CHECK(bytes.compare(0, 4, "RIFF") == 0 && bytes.compare(8, 4, "WAVE") == 0,
+           "minimax_h3 wav: not a RIFF/WAVE file");
+
+  auto u16 = [&](size_t at) -> uint32_t {
+    return static_cast<uint32_t>(static_cast<unsigned char>(bytes[at])) |
+           (static_cast<uint32_t>(static_cast<unsigned char>(bytes[at + 1])) << 8);
+  };
+  auto u32 = [&](size_t at) -> uint32_t { return u16(at) | (u16(at + 2) << 16); };
+
+  int64_t channels = 0, sample_rate = 0, bits = 0;
+  bool have_fmt = false;
+  size_t data_at = 0, data_len = 0;
+  // Walk the CHUNK LIST rather than assuming a 44-byte header: real files carry
+  // LIST/fact chunks before `data`, and a fixed offset would read metadata as audio.
+  for (size_t at = 12; at + 8 <= bytes.size();) {
+    const size_t len = u32(at + 4);
+    const size_t body = at + 8;
+    if (bytes.compare(at, 4, "fmt ") == 0 && len >= 16 && body + 16 <= bytes.size()) {
+      VT_CHECK(u16(body) == 1u, "minimax_h3 wav: only uncompressed PCM is supported");
+      channels = u16(body + 2);
+      sample_rate = u32(body + 4);
+      bits = u16(body + 14);
+      have_fmt = true;
+    } else if (bytes.compare(at, 4, "data") == 0) {
+      data_at = body;
+      data_len = std::min(len, bytes.size() - body);
+      break;
+    }
+    at = body + len + (len & 1u);  // chunks are word-aligned
+  }
+  VT_CHECK(have_fmt, "minimax_h3 wav: no fmt chunk");
+  VT_CHECK(data_at != 0, "minimax_h3 wav: no data chunk");
+  VT_CHECK(bits == 16, "minimax_h3 wav: only 16-bit PCM is supported");
+  VT_CHECK(channels > 0, "minimax_h3 wav: the fmt chunk declares no channels");
+  VT_CHECK(want_sample_rate <= 0 || sample_rate == want_sample_rate,
+           "minimax_h3 wav: sample rate does not match the model's (resample the file first; "
+           "this reader deliberately does not)");
+
+  const int64_t frames = static_cast<int64_t>(data_len) / (2 * channels);
+  VT_CHECK(frames > 0, "minimax_h3 wav: the data chunk holds no samples");
+
+  // Interleaved -> CHANNEL-MAJOR, the layout every other H3 audio surface uses.
+  // A MONO source is REPEATED across the model's channels and anything wider is
+  // truncated, mirroring vae.py:305-313.
+  std::vector<float> out(static_cast<size_t>(want_channels * frames), 0.0f);
+  for (int64_t t = 0; t < frames; ++t) {
+    for (int64_t c = 0; c < want_channels; ++c) {
+      const int64_t src = channels == 1 ? 0 : std::min<int64_t>(c, channels - 1);
+      const int16_t pcm = static_cast<int16_t>(static_cast<uint16_t>(
+          u16(data_at + static_cast<size_t>((t * channels + src) * 2))));
+      out[static_cast<size_t>(c * frames + t)] = static_cast<float>(pcm) / 32768.0f;
+    }
+  }
+  if (out_samples_per_channel != nullptr) *out_samples_per_channel = frames;
+  return out;
+}
+
 }  // namespace vllm

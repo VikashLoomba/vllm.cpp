@@ -85,6 +85,44 @@ std::vector<float> MiniMaxH3EncodeReferenceVideo(
   return rows;
 }
 
+// Turn a supplied REFERENCE WAVEFORM into the packed audio conditioning rows, the
+// audio counterpart of MiniMaxH3EncodeReferenceImages. This is what makes a
+// `kAudio` block (and a `kVideoAudio` block with sound) expressible at all.
+//
+// `waveform` is CHANNEL-MAJOR and already at kMiniMaxH3AudioSampleRate; a mono
+// source is REPEATED up to kMiniMaxH3AudioChannels, exactly as upstream does
+// before it encodes (vae.py:305-313). Rows come back normalized by the audio VAE's
+// own latent statistics, because that is the space the DiT's rows live in.
+//
+// `noise_aug` blends toward the supplied noise the way the visual side does
+// (1.0 pins the reference exactly); noise is an INPUT for the same reason it is
+// everywhere else in this pipeline.
+std::vector<float> MiniMaxH3EncodeReferenceAudio(
+    const MiniMaxH3AudioVaeEncoderConfig& encoder_config,
+    const MiniMaxH3AudioVaeWeights& encoder_weights, const std::vector<float>& waveform,
+    int64_t channels, int64_t samples_per_channel, const std::vector<float>& latents_mean,
+    const std::vector<float>& latents_std, double noise_aug,
+    const std::vector<float>& noise_rows, MiniMaxH3RefBlock* out_block) {
+  VT_CHECK(channels == kMiniMaxH3AudioChannels,
+           "minimax_h3 ref2va: reference audio must be stereo (mono is repeated by the caller)");
+  int64_t audio_t = 0;
+  std::vector<float> rows = MiniMaxH3AudioVaeEncodeToRows(
+      encoder_config, encoder_weights, waveform, channels, samples_per_channel, latents_mean,
+      latents_std, &audio_t);
+  VT_CHECK(audio_t > 0, "minimax_h3 ref2va: the reference waveform encoded to zero latent frames");
+
+  if (out_block != nullptr) {
+    // A bare audio reference is a kAudio block: no visual extent, `ref_audio_t`
+    // latent frames per channel.
+    MiniMaxH3RefBlock b;
+    b.kind = MiniMaxH3RefBlock::Kind::kAudio;
+    b.ref_audio_t = audio_t;
+    *out_block = b;
+  }
+  if (noise_aug >= 1.0 || noise_rows.empty()) return rows;
+  return MiniMaxH3AudioCondNoiseAug(rows, {audio_t}, noise_aug, noise_rows);
+}
+
 std::vector<float> MiniMaxH3EncodeReferenceImages(
     const MiniMaxH3EncoderFcn3dConfig& encoder_config,
     const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
@@ -173,21 +211,22 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
   VT_CHECK(!(has_keyframes && has_refs),
            "minimax_h3: keyframe (fl2va) and reference (ref2va) conditioning are exclusive");
   MiniMaxH3DenoiseBranch branch;
+  int64_t ref_audio_rows = 0;
   if (has_refs) {
-    // AUDIO-bearing reference blocks need the audio VAE's ENCODER, which this port
-    // does not have -- only its decoder is implemented. Refusing loudly beats
-    // silently conditioning on nothing.
+    // AUDIO-bearing reference blocks claim packed audio rows, and every claimed row
+    // must be BACKED by an encoded reference -- otherwise the layout would grow and
+    // the loop would pin whatever happened to be in the buffer. The rows come from
+    // MiniMaxH3EncodeReferenceAudio (the audio VAE's encoder half).
     for (const MiniMaxH3RefBlock& b : request.ref_blocks) {
-      VT_CHECK(b.kind != MiniMaxH3RefBlock::Kind::kAudio,
-               "minimax_h3 ref2va: audio reference blocks need the audio-VAE encoder, which is "
-               "not ported");
-      // A video reference is a kVideoAudio block; with ref_audio_t == 0 it
-      // contributes ZERO audio rows, i.e. a SILENT video reference, which is
-      // exactly the part we can honour without the audio encoder.
-      VT_CHECK(b.kind != MiniMaxH3RefBlock::Kind::kVideoAudio || b.ref_audio_t == 0,
-               "minimax_h3 ref2va: a video reference WITH audio needs the audio-VAE encoder, "
-               "which is not ported (use ref_audio_t = 0 for a silent video reference)");
+      if (b.kind == MiniMaxH3RefBlock::Kind::kImage) continue;
+      VT_CHECK(b.ref_audio_t >= 0, "minimax_h3 ref2va: ref_audio_t cannot be negative");
+      ref_audio_rows += b.ref_audio_t * request.audio_channel;
     }
+    VT_CHECK(static_cast<int64_t>(request.audio_ref_rows.size()) ==
+                 ref_audio_rows * dit_params.audio_latents_dim,
+             "minimax_h3 ref2va: audio_ref_rows must supply exactly the rows the reference blocks "
+             "claim (ref_audio_t * audio_channel per block) -- see "
+             "MiniMaxH3EncodeReferenceAudio");
     branch.packed = BuildMiniMaxH3PackedSequenceRef2va(
         request.text_len, request.latent_t, request.latent_h, request.latent_w, request.audio_t,
         request.ref_blocks, request.audio_channel);
@@ -234,12 +273,39 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
     video_rows = std::move(full);
   }
 
-  // The keyframe rows are PINNED: the loop resets them to these anchors every
-  // step, so the supplied frame stays put instead of being denoised away.
-  return MiniMaxH3DenoiseLoop(device, dit_params, dit_weights, branch, video_rows,
-                              initial_audio_rows, request.keyframe_cond_rows,
-                              /*audio_ref_rows=*/{}, sigmas_video, sigmas_audio, compute_dtype,
-                              prestaged);
+  // The audio side has the SAME shape of problem once a reference carries sound:
+  // reference audio adds PINNED rows to the layout, and callers supply noise only
+  // for the denoise TARGETS (pipeline_minimax_h3.py:937-955). Scatter theirs into
+  // the updating slots and leave the pinned ones to the anchors below.
+  const int64_t audio_width = dit_params.audio_latents_dim;
+  const int64_t num_audio = static_cast<int64_t>(branch.packed.audio_pos.size());
+  std::vector<float> audio_rows = initial_audio_rows;
+  if (static_cast<int64_t>(audio_rows.size()) != num_audio * audio_width) {
+    VT_CHECK(ref_audio_rows > 0,
+             "minimax_h3 t2va: initial audio rows do not match the packed layout");
+    std::vector<float> full(static_cast<size_t>(num_audio * audio_width), 0.0f);
+    int64_t src = 0;
+    for (int64_t r = 0; r < num_audio; ++r) {
+      if (!branch.packed.audio_update_mask.empty() &&
+          !branch.packed.audio_update_mask[static_cast<size_t>(r)]) {
+        continue;  // a pinned reference row
+      }
+      VT_CHECK((src + 1) * audio_width <= static_cast<int64_t>(initial_audio_rows.size()),
+               "minimax_h3 t2va: too few initial audio rows for the denoise targets");
+      std::copy(initial_audio_rows.begin() + src * audio_width,
+                initial_audio_rows.begin() + (src + 1) * audio_width,
+                full.begin() + r * audio_width);
+      ++src;
+    }
+    audio_rows = std::move(full);
+  }
+
+  // Both the keyframe rows and the reference-audio rows are PINNED: the loop
+  // resets them to these anchors every step, so the supplied conditioning stays
+  // put instead of being denoised away.
+  return MiniMaxH3DenoiseLoop(device, dit_params, dit_weights, branch, video_rows, audio_rows,
+                              request.keyframe_cond_rows, request.audio_ref_rows, sigmas_video,
+                              sigmas_audio, compute_dtype, prestaged);
 }
 
 MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,

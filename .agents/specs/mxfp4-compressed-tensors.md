@@ -358,17 +358,34 @@ W4A16 for a second reference point (W4A4 vs W4A16 on one box).
 
 ### Empirical status (2026-08-05)
 
-- **W0 DONE** — checkpoint downloaded (6.18 GB, disk floor respected) and the oracle
-  RAN a greedy golden (PYEXIT=0, coherent+correct). Golden +
-  evidence in `docs/bench-evidence/mxfp4-qwen/`.
+- **W0 DONE** — checkpoint downloaded (6.18 GB) and the oracle RAN a greedy golden
+  (PYEXIT=0, coherent+correct). Golden + evidence in `docs/bench-evidence/mxfp4-qwen/`.
 - **W1 DONE** — runtime-traced: FlashInfer W4A4 selected-but-crashes on sm_121;
   Marlin W4A16 is the working GB10 path (see the W1 EMPIRICAL RESULT block).
-- **W2 / W3 / W4 REMAINING** — the native Marlin-W4A16-mxf4 keep-quant compute in
-  our engine + gates + bench. Build-environment note: at result time the DGX had NO
-  clean `vllm.cpp` checkout and ~31 GiB free (a full CUDA build ~21 GiB is tight and
-  slow; other agents' `~/work/*/build` trees must not be reused). W2 needs a
-  git-archive of this branch to a fresh DGX dir + CUDA build. Marlin-W4A16-mxf4
-  extends `src/vt/cuda/marlin/*` (group-32 E8M0 format plumbing) — NOT a new kernel.
-- Nsys same-tool kernel-name confirm of the Marlin path: nice-to-have, QUEUED.
-- W4 bench recipe MUST export `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
-  (else the oracle arm crashes on GB10).
+- **W2 IMPLEMENTED + BUILDS + RUNS; e2e correctness RED (commit `7068dca6`)** — the
+  native Marlin-W4A16-mxf4 keep-quant path landed (kernel-gen MXFP4 config +
+  regenerated group_blocks=2 instances/selector; `MarlinProcessExpertScalesMxfp4`;
+  `MoeMarlinArgs.{group_size,mxfp4}` + launcher branch; `Nvfp4Weight.{group_size,
+  is_mxfp4}` + `dense_nvfp4_gemm.h` branch + `MatmulMxfp4W4A16D`;
+  `dense_weight_loaders.h` MXFP4 loaders; `qwen3_weights.cpp` detect+load). Clean
+  `-Werror` CUDA build on GB10; loads Yi30/Qwen3-8B-MXFP4; dispatches the native
+  group_blocks=2 Marlin kernel; runs. **NOT token-exact vs the golden** — a
+  DETERMINISTIC, UNIFORM (prefill+decode, NOT graph-related: identical with
+  `VLLM_CPP_CUDAGRAPH=0`) numerics error: robust tokens survive (" Paris", "there"
+  match) but the rest degenerates. LOCALIZATION: the MXFP4 scale permute is PROVEN
+  byte-exact vs vLLM's `mxfp4_marlin_process_scales` (128x256 CPU check, 1024/1024),
+  and the fp4 dequant (`dequant_skip_flop=false` bias path) is a faithful lift, so
+  the residual is inside the group_blocks=2 Marlin GEMM interaction — a path our
+  prior NVFP4-only usage (group_blocks=1) never exercised.
+- **W3 — the next debugging step + gate:** a DEVICE unit test of `MatmulMxfp4W4A16D`
+  vs the independent CPU dequant reference (`DequantMxfp4ToF32` + f32 matmul) at
+  **M=1 AND M=8** (RED-first). It isolates the GEMM error from the model and is the
+  W3 unit gate the plan calls for; run it before the e2e re-gate.
+- **W4 NOT REACHED** — bench (`online_gate.py` c1..c8x3, oracle arm MUST set
+  `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`) is owed once W3 is green.
+- Build recipe (reproducible): git-archive branch to `~/work/mxfp4-w2`, `cmake -B
+  build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_CUDA=ON
+  -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_MARLIN=ON -DVLLM_CPP_TRITON=OFF
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, then `ninja -C build vllm-cli` (build
+  SPECIFIC targets — bare `ninja` builds 100+ tests that whole-archive libvllm.a =
+  28 GiB, blows the disk floor).

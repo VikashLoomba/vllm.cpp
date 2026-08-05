@@ -836,32 +836,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // queue and never see it, which is exactly why the CPU gates stayed green while
   // the served 35B aborted. Drain the outstanding work before touching anything.
   if (async_forward_in_flight_) {
-    vt::Backend& backend = vt::GetBackend(queue_.device.type);
-    if (intake_drain_hook_) {
-      // VT_INTAKE_DRAIN experiment (SERVE-INTAKE-CADENCE): the prior forward /
-      // sample / scatter are still in flight and this host thread would otherwise
-      // busy-wait them out with nothing to do. Record a completion event on the
-      // main queue (it fires once all that prior work retires — the SAME barrier
-      // Synchronize enforces) and poll it, invoking the drain hook between polls
-      // so requests that arrived during this step get admitted to the scheduler's
-      // waiting queue DURING the GPU wait rather than only at the next busy-loop
-      // drain. Byte-exact: schedule() for THIS step already ran, so the admitted
-      // requests are picked up by the NEXT schedule() exactly as they would be
-      // after a plain Synchronize + top-of-loop drain; arrival_time (the scheduler
-      // ordering key) is stamped at request creation, not admission, so batch
-      // composition and tokens are identical. Same completion barrier => the same
-      // UAF protection. QueryEvent is a non-blocking spin (like the baseline
-      // stream sync's driver poll), so no per-step sleep/wake is added.
-      if (intake_poll_event_.handle == nullptr) {
-        intake_poll_event_ = backend.CreateEvent();
-      }
-      backend.RecordEvent(intake_poll_event_, queue_);
-      while (!backend.QueryEvent(intake_poll_event_)) {
-        intake_drain_hook_();
-      }
-    } else {
-      backend.Synchronize(queue_);
-    }
+    vt::GetBackend(queue_.device.type).Synchronize(queue_);
     async_forward_in_flight_ = false;
   }
 
@@ -1881,10 +1856,6 @@ GPUModelRunner::~GPUModelRunner() {
   // no explicit teardown; our vt::Queue owns a CUDA stream that must be freed).
   if (async_copy_queue_.id != 0) {
     vt::DestroyQueue(async_copy_queue_);
-  }
-  // Release the VT_INTAKE_DRAIN poll event if it was lazily created.
-  if (intake_poll_event_.handle != nullptr) {
-    vt::GetBackend(queue_.device.type).DestroyEvent(intake_poll_event_);
   }
   // W4 device mirror. Freed here rather than leaked like the scratch pool: these
   // are per-runner, and a serving process can construct more than one runner.

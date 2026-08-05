@@ -85,6 +85,16 @@ overlapped without moving sampled tokens GPU-resident (vLLM's `prev_sampled_
 token_ids` device gather). The full drain is byte-exact and UAF-safe and is
 **kept**; the device-resident lever is the open follow-up.
 
+**INTAKE drain-during-forward lever, MEASURED NEUTRAL 2026-08-06**
+(`VT_INTAKE_DRAIN`, env-toggle A/B, 3+3 reps c16/c32, single load/arm): admitting
+queued requests during the in-flight-forward wait collapses the TTFTSPLIT intake
+(c32 600 to 54 ms, -91%) but shifts it into queued (+522); arrival-to-scheduled is
+invariant, so throughput (1.001x), TPOT and median TTFT are NEUTRAL. The recorded
+"INTAKE +103 ms" is an attribution boundary, not a reducible term (a burst cannot
+be prefilled until the in-flight prefill frees the GPU, regardless of admission
+timing). Lever reverted; the byte-exact `VT_LOOP_TRACE` probe is kept. Real lever
+= prefill speed (task #61).
+
 ### DeepSeek-V2-Lite (MLA)
 
 Medians of 3 reps, 1,024 in / 128 out. The vLLM arm runs `--moe-backend triton`,

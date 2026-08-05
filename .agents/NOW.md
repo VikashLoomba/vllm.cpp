@@ -20,7 +20,7 @@ Working head: `origin/main`.
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
 | Protocol substrate repair | BENCHMARKS.md converted to scoreboard (landed); STATUS.md budget + record-era roll still open | Items below |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W7 device COMPUTE landed, CPU-gated** (`CLAIM-KIMI-LINEAR-W7`, `ACTIVE`): DBuf-resident `ForwardDeviceCompute` (2 host islands: KDA recurrence, NoPE-MLA softmax); `test_kimi_linear_forward` **12/12·614**; opt-in `VT_KIMI_DEVICE_COMPUTE=1` | GPU-verify: CUDA build, token-exact vs oracle, e2e §8 |
-| 35B fresh grid | **BOUND** @`1ea26427`. TTFT growing-deficit **ATTRIBUTED** (`row/BENCH-35B-TTFT`, not pushed): serving **INTAKE** (async engine-core admission) +34..103ms growing 20x c2→c32, plus ~flat prefill glue +82..92ms (task #61); scheduler queue+kernels at parity, both async. state+benchmark-record | Levers: mirror vLLM input-drain cadence; prefill fusion; async /metrics logger |
+| 35B fresh grid | **BOUND** @`1ea26427`. INTAKE lever **RESOLVED NEGATIVE** (`row/SERVE-INTAKE-CADENCE`): the +34..103ms INTAKE is an ATTRIBUTION BOUNDARY (VT_INTAKE_DRAIN A/B collapses intake -91% but shifts to queued; arrival→sched GPU-bound, TTFT/tput NEUTRAL). Probe KEPT, lever REVERTED | Real lever: prefill glue (task #61); async device-resident executor |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

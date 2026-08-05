@@ -175,7 +175,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | device COMPUTE GPU-verified; §8 golden CAPTURED (STRICT); full e2e f32-loader-blocked | 27-layer hybrid via shared `vt::` ops, 12/12·614 GREEN on GB10; §8 oracle golden captured (8/8 STRICT, committed); full-model our e2e needs bf16 loader (f32 materialize ~183 GiB > 119 pool) |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | §8 golden CAPTURED (STRICT); bf16-resident brick pool-math+design DONE (§13); impl pending | 12/12·614 GREEN on GB10; §8 golden captured (8/8 STRICT, committed). Full-model e2e needs bf16-resident loader/forward: DESIGNED §13, pool math ~94 GiB / ~25 GiB headroom CLOSES; impl pending |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |

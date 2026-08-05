@@ -616,6 +616,71 @@ GDN Triton-AOT decode + grouped-MoE device slabs, (c) speed. Box left clean.
 
 ---
 
+## 13. bf16-RESIDENT loader/forward — POOL MATH + design (2026-08-06, branch `row/MODEL-KIMI-LINEAR-BF16`)
+
+The final phase-3 brick: replace the f32 `MaterializeHost` (183 GiB) with a bf16-resident
+loader/forward so the full-model e2e fits the 119 GiB unified pool and can gate against the
+committed STRICT golden (§12).
+
+### POOL MATH (done BEFORE building, per the design constraint)
+- Weights bf16: exact 98,245,528,576 B = **91.5 GiB** (§12 index).
+- Device-resident staging: cudaMalloc'd `OwnedTensor::d_dev` (native GPU memory, no ATS
+  penalty — the [[gb10-weight-residency-ats-penalty]] lever), **91.5 GiB** in the unified
+  pool. Per-tensor stage-then-`ReleaseHost` keeps only ONE tensor's host bytes live at a
+  time (biggest = embed/lm_head [163840,2304] bf16 = 0.72 GiB), so the LOAD peak is
+  ~91.5 GiB device + <1 GiB host + the mmap read window (`ReleaseSourcePages` per tensor).
+- Activations f32 (the residual stream stays f32 — norms/convs/L2Norm/RmsNormGated/
+  host-islands unchanged): the golden decodes T ≤ prompt(≤20)+16 ≈ 36 tokens; the largest
+  buffers are the last-row logits [1,V=163840] f32 = 0.64 MB, KDA [T,4096], router [T,256],
+  expert_out [T,8,2304] — all < ~0.3 GiB total at T≈36. The per-GEMM bf16 activation cast
+  scratch [T,K] is tiny.
+- Norm/scale vectors kept host f32 (ReadF32-on-demand from bf16, the [[gate-comparing...]]
+  bf16→ReadF32 trap): input/post/final norms + kv_a_layernorm + o_norm + a_log + dt_bias +
+  gate + e_score_correction_bias, ~27 layers × few KB = < 0.1 GiB.
+- CUDA context (reserved FIRST, before load, per the GB10 recipe `examples/laguna_gen/
+  main.cpp:185-194`): ~1-2 GiB.
+- **STEADY total ≈ 91.5 + ~0.3 + ~0.1 + ~2 ≈ 94 GiB → ~25 GiB headroom. CLOSES.** The
+  e2e harness recomputes context (no paged KV) so there is no KV cache to budget; a future
+  engine path adds only the small MLA latent-576 (7 layers) + GDN state groups.
+
+### DESIGN (grounded in the recorded winning patterns)
+1. **bf16-resident storage** — a new `KimiLinearResidentWeights` of `OwnedTensor`s
+   (`qwen3_5_weights.h:40`, reusing its `d_dev` cache), one per checkpoint tensor, mirroring
+   `laguna_weights.cpp` / `gemma_weights.cpp`. Loader path uses `dense_loaders::LoadBf16Direct`
+   (`dense_weight_loaders.h:63`) per tensor + `ReleaseSourcePages` (`safetensors_reader.cpp:317`),
+   NEVER `MaterializeHost`. The f32 `KimiLinearHostWeights` + `MaterializeHost` STAY for the
+   SMALL-config unit gate (tiny shapes) — the full-model path must never materialize f32.
+2. **Resident GEMM** — a `KimiResidentBf16W(q,w,dev)` helper mirroring `laguna.cpp:125-139`
+   (cudaMalloc+one-H2D to `d_dev`, byte-exact; CPU aliases host bytes) + a `GemmBf16(d,out_f32,
+   act_f32,w,{N,K})` mirroring `laguna.cpp:1939-1946`: `vt::CastBf16(act_f32→bf16 scratch)` then
+   `vt::MatmulBT(out_f32, act_bf16, w_bf16-resident)` — the (bf16,bf16)->f32 combo the CUDA
+   MatmulBT SUPPORTS (`cuda_matmul.cu:3`; the elementwise f32-act×bf16-weight it LACKS,
+   `cuda_deepseek_v4.cu:1821`). This makes the GEMM numerics vLLM-bf16 (best token-exact
+   chance vs the bf16 oracle golden), keeps the residual stream f32.
+3. **Device forward** — bf16 variants of `DeviceForwardBody`/`KdaLayerDevice`/`MlaLayerDevice`/
+   `MoeBlockDevice`/`DenseMlpDevice` (`kimi_linear_device.cpp`) that take the `OwnedTensor`
+   weights and call `GemmBf16` in place of `WF32`+`MatmulBT` at each of the ~20 GEMM sites; the
+   two host-fallback islands (KDA recurrence, NoPE-MLA softmax) are UNCHANGED (f32 activations,
+   small). Norms via `ReadF32`/`ResidentWeightF32` (`dense_attn_block.h:202`).
+4. **Runner** — `ForwardDevice` drops the `host.materialized` precondition when the resident
+   weights are present; the registry `LoadKimiLinearForCausalLM` uses the bf16 loader for the
+   full model. GB10 load recipe (context-first + shard-release) in a Kimi gen driver / the e2e
+   harness, mirroring `examples/laguna_gen/main.cpp:185-237`.
+5. **e2e vehicle** — a greedy-decode harness (mirroring the CPU `KimiLinearGreedyDecode`) that
+   loads the bf16-resident checkpoint, decodes the §12 8-prompt battery × 16 tokens through the
+   bf16 `ForwardDeviceCompute`, and compares token-exact to `tests/parity/goldens/
+   kimi_linear_greedy/greedy_ids.npy`. NOTE: the `VT_KIMI_DEVICE_COMPUTE=0` arm (the pure f32
+   host `Forward`) CANNOT run the full model (183 GiB f32) — only the `=1` bf16 device path
+   fits, so the full-model gate is the `=1` arm; the `=0` arm stays the tiny-config reference.
+
+### Gates
+CPU: `test_kimi_linear_forward` stays 12/12·614 (f32 tiny path untouched) + a tiny-config bf16
+device gate (bf16 forward == f32 reference within a bf16 tolerance). dgx CUDA build (usual
+flags, nm GDN). Full-model e2e vs the STRICT golden (`=1` arm), free -g ≥ 90 before load,
+memory-monitored; if the pool math does not close in practice, STOP and record.
+
+---
+
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)
 
 ## Scope

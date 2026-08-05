@@ -19,6 +19,45 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## QUANT-CT-MXFP4 W4 throughput bench — harness PLUMBED, grid GATING on dgx (2026-08-07, `row/QUANT-CT-MXFP4-BENCH`) — NO numbers yet
+
+The MXFP4 W4A16 keep-quant compute is correctness-DONE on main (#38 + the
+`ROW-SERVE-ASYNC-DENSE-MIRROR` #44 async fix: default-config e2e 3/4 token-exact +
+p2 near-tie ratified). The one owed piece is the binding ours-vs-oracle throughput
+grid on the SAME checkpoint (`Yi30/Qwen3-8B-MXFP4`, a dense `Qwen3ForCausalLM`).
+The online-serving harness only carried the "27"/"35" NVFP4 gate-model keys; this
+row adds the `q3mxfp4` key so the grid can run. NO throughput number is produced
+or owed by THIS entry; it records the plumbing and the exact one-command recipe so
+the grid re-runs deterministically once the dgx build+legs execute.
+
+**Landed (additive; 27/35 byte-unchanged, harness CPU contract tests 45/45 GREEN):**
+- `tools/bench/online_gate.py`: `MODEL_REVISIONS`/`MODEL_REPOSITORIES`
+  (`Yi30/Qwen3-8B-MXFP4` @ `b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47`),
+  `MAX_NUM_BATCHED_TOKENS`=2048, `MAX_MODEL_LEN`=40960, and a `POINTS_BY_MODEL`
+  reduced sweep (c1/c2/c4/c8, a strict prefix of `POINTS`) surfaced through a new
+  `points_for(model_key)` helper that both the harness and `online_gate_summary`
+  consult (so a c1-c8 key never trips a "missing result group" for c16/c32).
+- `tools/bench/mxfp4_smoke_gate.py`: the q3mxfp4 model-gate = the #44 e2e smoke
+  battery (vllm-cli greedy, temp 0, seed 0, vs `golden_marlin_w4a16.json`);
+  requires the 3 deterministic prompts token-exact + the story prompt coherent.
+- `scripts/dgx-online-serving.sh`: q3mxfp4 branches — model validation, dense 2048
+  batched-tokens, gate builds `vllm-cli`+`server` and runs the smoke gate instead
+  of a paged-engine ctest, oracle arm `env VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
+  (Marlin W4A16; sm_121 cute-dsl mxf4 crash worked around) with no mamba flag, and
+  the low-concurrency `1 2 4 8` leg loop.
+- `scripts/mxfp4-online-serving-grid.sh`: the one-command orchestrator (source-corpus
+  gen + dry-run manifest + locked `--execute` grid + `--model q3mxfp4` summary).
+
+**Repro (one command, on dgx, both flock locks free, free -g ≥ 90, ninja+nvcc on PATH):**
+`scripts/mxfp4-online-serving-grid.sh --snapshot ~/.cache/huggingface/hub/models--Yi30--Qwen3-8B-MXFP4/snapshots/b3e7ab32f7225ca779b3dbf6ef4ecefeb6de9b47 --build-dir <PROD_BUILD> --configure-log <CONFIGURE_LOG>`
+(build recipe = git-archive → /dev/shm, `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`,
+Release, nvcc 13.0; build the `server` + `vllm-cli` targets only, never bare
+`ninja`, to respect the disk floor). Verdict rule: at/above vLLM on total+output
+tok/s AND at/below on TTFT+TPOT across c1/c2/c4/c8 → MXFP4 row DONE; below on any
+cell → record the failing cells + a same-tool nsys attribution pass (decode-window
+separated) before any lever campaign.
+
 ## DeepSeek-V4-Flash UD-IQ2_M — IQ2_S + MXFP4 CPU keep-quant bring-up (2026-08-03, `CLAIM-DSV4-UDIQ2M-QUANT`) — no throughput owed (off-GPU correctness bring-up)
 
 Off-GPU task (GB10 down, no nvcc on the dev box), so NO throughput is measured or owed. Adds the two per-tensor "dynamic" encodings the `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_M` checkpoint's last 4 routed-expert slabs use — **IQ2_S** (ggml type 22; 2.5625 bpw codebook, Q8_K activation) and **MXFP4** (type 39; OCP micro-scaling fp4, 32-elem blocks, Q8_0 activation) — as first-class vt block dtypes (`kIQ2_S`/`kMXFP4`): block traits + dequant + a keep-quant `vec_dot`, ported 1:1 from llama.cpp `ggml-quants.c` @ 237ad9b96 (`iq2s_grid` 1024-entry codebook copied verbatim + direct sign bytes; `kvalues_mxfp4` + `e8m0_to_fp32_half`). The memory point: these load COMPRESSED (keep-quant) instead of the ~17 GiB bf16 expansion that OOM-reboots the 119 GiB pool.

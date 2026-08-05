@@ -769,8 +769,15 @@ TEST_CASE("CUDA marlin MXFP4 W4A16 (group_blocks=2, E8M0) matches CPU dequant re
   }
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
 
-  // K%128==0 (Marlin tile) and %32 (mxfp4 group); N%64==0.
-  const int64_t K = 256, N = 128;
+  // K%128==0 (Marlin tile) and %32 (mxfp4 group); N%64==0. Cover the small case
+  // AND the real Qwen3-8B projection shapes (o/qkv K=4096; down K=12288; gate/up
+  // N=12288) so the group_blocks=2 kernel is exercised at model scale, not just a
+  // tiny tile — a large-shape-only bug would pass the tiny case and corrupt e2e.
+  for (auto KN : std::vector<std::pair<int64_t, int64_t>>{
+           {256, 128}, {4096, 4096}, {4096, 12288}, {12288, 4096}}) {
+  const int64_t K = KN.first, N = KN.second;
+  CAPTURE(K);
+  CAPTURE(N);
   Mxfp4Weight w = MakeMxfp4Weight(N, K, 4321);
 
   // CPU reference weight [N,K] f32 via the independent dequant helper.
@@ -859,10 +866,15 @@ TEST_CASE("CUDA marlin MXFP4 W4A16 (group_blocks=2, E8M0) matches CPU dequant re
       if (a > max_abs) max_abs = a;
       if (r > max_rel) max_rel = r;
     }
-    MESSAGE("MXFP4 M=" << M << " max_abs=" << max_abs << " max_rel=" << max_rel);
-    // Measured max_rel ~= 3.8e-3 at M=1 and M=8 (pure bf16 rounding vs the f32
-    // reference; NOT a systematic error). Gate at 2e-2 leaves bf16 headroom.
+    MESSAGE("MXFP4 K=" << K << " N=" << N << " M=" << M
+                       << " max_abs=" << max_abs << " max_rel=" << max_rel);
+    // Measured max_rel ~= 3.8e-3 at M=1,M=8 (K=256,N=128; pure bf16 rounding, NOT
+    // a systematic error). Gate at 2e-2 leaves bf16 headroom. The added Qwen3-8B
+    // shapes ({4096,4096},{4096,12288},{12288,4096}) are RUN-PENDING (box contended
+    // when authored) — a FAIL there localizes a large-N/K group_blocks=2 kernel bug
+    // as the e2e residual's cause; a PASS shifts the residual to model integration.
     CheckClose(got, ref, 2e-2f, 2e-2f);
+  }
   }
 }
 

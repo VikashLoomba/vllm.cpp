@@ -8,6 +8,7 @@
 // that causal != non-causal so a wrong mask is CAUGHT.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -279,4 +280,74 @@ TEST_CASE("dflash-block-attn CUDA matches CPU across the 5 semantic corners") {
   RunCudaParity(17, 8, 2, 32, 0.3f, /*causal=*/true, /*window=*/4, {0, 17}, 4444);
   // (5) GQA extreme (8 q-heads share 1 kv-head) + ragged multi-block causal.
   RunCudaParity(20, 8, 1, 16, 0.35f, /*causal=*/true, /*window=*/2048, {0, 6, 20}, 5555);
+}
+
+// The LONG non-causal single-document case, which is the only shape that reaches
+// the shared-memory tiled CUDA kernel (guarded to !causal, num_reqs == 1, no
+// window, seq >= 2048). Every other case in this file is far shorter, so without
+// this the tiled path ships UNEXERCISED while the suite reports green -- the exact
+// failure mode where a gate proves something other than what it appears to.
+//
+// Gated against the CPU reference over identical inputs. The tiled kernel keeps
+// the same key order and the same online-softmax recurrence as the untiled one, so
+// the bar is tight rather than merely "close".
+TEST_CASE("dflash-block-attn LONG non-causal matches the reference (tiled CUDA path)") {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+
+  const int64_t T = 2560, H = 2, D = 64;  // T >= 2048 crosses the tiled threshold
+  std::vector<float> q(static_cast<size_t>(T * H * D));
+  std::vector<float> k(q.size()), v(q.size());
+  uint64_t x = 0x9E3779B97F4A7C15ULL;
+  auto rnd = [&]() {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return static_cast<float>((x >> 40) / 16777216.0 - 0.5);
+  };
+  for (size_t i = 0; i < q.size(); ++i) { q[i] = rnd(); k[i] = rnd(); v[i] = rnd(); }
+
+  const int32_t cu[2] = {0, static_cast<int32_t>(T)};
+  std::vector<float> want(q.size(), 0.0f);
+  {
+    Queue cq = Q();
+    Tensor qt = F32(q, {T, H, D}), kt = F32(k, {T, H, D}), vt_ = F32(v, {T, H, D});
+    Tensor ot = F32(want, {T, H, D});
+    vt::DFlashBlockAttention(cq, ot, qt, kt, vt_, Args(cu, 1, /*causal=*/false, 0));
+  }
+
+  Queue gq = cuda->CreateQueue();
+  auto up = [&](const std::vector<float>& hostv) {
+    void* p = cuda->Alloc(hostv.size() * sizeof(float));
+    cuda->Copy(gq, p, hostv.data(), hostv.size() * sizeof(float));
+    return p;
+  };
+  void* dq = up(q);
+  void* dk = up(k);
+  void* dv = up(v);
+  void* dout = cuda->Alloc(q.size() * sizeof(float));
+  Device gdev = gq.device;
+  Tensor gqt = Contig(dq, DType::kF32, gdev, {T, H, D});
+  Tensor gkt = Contig(dk, DType::kF32, gdev, {T, H, D});
+  Tensor gvt = Contig(dv, DType::kF32, gdev, {T, H, D});
+  Tensor got = Contig(dout, DType::kF32, gdev, {T, H, D});
+  vt::DFlashBlockAttention(gq, got, gqt, gkt, gvt, Args(cu, 1, /*causal=*/false, 0));
+  cuda->Synchronize(gq);
+
+  std::vector<float> got_host(q.size(), 0.0f);
+  cuda->Copy(gq, got_host.data(), dout, got_host.size() * sizeof(float));
+  cuda->Synchronize(gq);
+
+  double worst = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(std::isfinite(got_host[i]));
+    worst = std::max(worst, std::abs(static_cast<double>(got_host[i]) - want[i]));
+  }
+  INFO("tiled CUDA vs CPU reference over " << T << " keys, max|diff| = " << worst);
+  CHECK(worst <= 2e-5);
+
+  cuda->Free(dq); cuda->Free(dk); cuda->Free(dv); cuda->Free(dout);
 }

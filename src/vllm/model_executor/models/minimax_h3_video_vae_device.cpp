@@ -588,7 +588,21 @@ std::vector<float> MiniMaxH3VideoVaeDecodeTemporalDevice(
   const int64_t pad_tokens = remainder == 0 ? 0 : chunk_tokens - remainder;
   pseudo_total += pad_tokens;
   const int64_t num_chunks = pseudo_total / chunk_tokens - (config.token_drop > 0 ? 1 : 0);
-  VT_CHECK(num_chunks >= 1, "minimax_h3 temporal decode: no chunks to decode");
+  // A latent shorter than one chunk yields num_chunks == 0 (latent_t 2 gives
+  // pseudo 5, i.e. exactly one chunk, minus the token_drop chunk). There is no
+  // chunking to do, so decode it directly rather than aborting -- this is the
+  // regime the reduced-dimension gates run in.
+  if (num_chunks < 1) {
+    MiniMaxH3VideoFrameShape s{};
+    std::vector<float> whole =
+        config.decoder_tiling
+            ? MiniMaxH3VideoVaeDecodeTiledDevice(device, config, staged, latent, latent_t, latent_h,
+                                                 latent_w, &s)
+            : MiniMaxH3VideoVaeDecodeDevice(device, config, staged, latent, latent_t, latent_h,
+                                            latent_w, &s);
+    if (out_shape != nullptr) *out_shape = s;
+    return whole;
+  }
 
   std::vector<float> z = latent;
   int64_t z_t = latent_t;

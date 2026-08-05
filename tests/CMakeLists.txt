@@ -17,7 +17,11 @@ set_tests_properties(test_serve_low_tools PROPERTIES
 
 function(vllm_cpp_add_test name)
   add_executable(${name} ${ARGN})
-  target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
+  if(TARGET vllm::sanitize_test_shared)
+    target_link_libraries(${name} PRIVATE vllm::sanitize_test_shared vllm_test_main)
+  else()
+    target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
+  endif()
   vllm_cpp_set_warnings(${name})
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
@@ -223,6 +227,11 @@ vllm_cpp_add_test(test_single_type_kv_cache_manager vllm/v1/test_single_type_kv_
 vllm_cpp_add_test(test_kv_cache_coordinator vllm/v1/test_kv_cache_coordinator.cpp)
 vllm_cpp_add_test(test_kv_cache_manager vllm/v1/test_kv_cache_manager.cpp)
 vllm_cpp_add_test(test_none_hash_determinism vllm/v1/test_none_hash_determinism.cpp)
+# This suite explicitly exercises configured and unconfigured hash seeding in
+# child processes. Insulate its unconfigured control arm from a developer shell
+# that happens to export Python's seed (the Nix dev shell exports 0).
+set_tests_properties(test_none_hash_determinism PROPERTIES
+  ENVIRONMENT_MODIFICATION "PYTHONHASHSEED=unset:")
 vllm_cpp_add_test(test_prefix_cache_stats vllm/v1/test_prefix_cache_stats.cpp)
 vllm_cpp_add_test(test_prometheus_metrics vllm/v1/test_prometheus_metrics.cpp)
 vllm_cpp_add_test(test_kv_offload_cpu vllm/v1/test_kv_offload_cpu.cpp)
@@ -919,6 +928,16 @@ vllm_cpp_add_test(test_qwen36_paged_engine parity/test_qwen36_paged_engine.cpp)
 target_compile_definitions(test_qwen36_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen36_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# ROW-SERVE-ASYNC-LLM — the ASYNC-serving 35B greedy token-exact gate (the
+# depth-2 AsyncLLM counterpart of the SYNC SACRED gate above). Reproduces the
+# async batch-1 token-0 degeneration P0 on the mirror-OFF default and proves the
+# device-resident mirror fixes it (checkpoint-gated, dgx-only; skips on CPU/CI).
+vllm_cpp_add_test(test_qwen36_async_serving parity/test_qwen36_async_serving.cpp)
+target_compile_definitions(test_qwen36_async_serving PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen36_async_serving PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # ADDITIVE-MODEL W4 — the SACRED token-exact gate: Qwen3-0.6B (dense) greedy

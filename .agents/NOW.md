@@ -20,7 +20,8 @@ Working head: `origin/main`.
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
 | Protocol substrate repair | BENCHMARKS.md converted to scoreboard (landed); STATUS.md budget + record-era roll still open | Items below |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W7 device COMPUTE landed, CPU-gated** (`CLAIM-KIMI-LINEAR-W7`, `ACTIVE`): DBuf-resident `ForwardDeviceCompute` (2 host islands: KDA recurrence, NoPE-MLA softmax); `test_kimi_linear_forward` **12/12·614**; opt-in `VT_KIMI_DEVICE_COMPUTE=1` | GPU-verify: CUDA build, token-exact vs oracle, e2e §8 |
-| 35B fresh grid | **BOUND** @`1ea26427`. INTAKE lever **RESOLVED NEGATIVE** (`row/SERVE-INTAKE-CADENCE`): the +34..103ms INTAKE is an ATTRIBUTION BOUNDARY (VT_INTAKE_DRAIN A/B collapses intake -91% but shifts to queued; arrival→sched GPU-bound, TTFT/tput NEUTRAL). Probe KEPT, lever REVERTED | Real lever: prefill glue (task #61); async device-resident executor |
+| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE lever **RESOLVED NEGATIVE**: attribution boundary (drain A/B collapses intake -91% but shifts to queued; arrival→sched GPU-bound, NEUTRAL). Probe kept, lever reverted | Real levers: prefill glue (task #61) + async device-resident executor (also the c16 fix) |
+| Async-serving decode bug **FIXED** (`ROW-SERVE-ASYNC-LLM`) | Async batch-1 greedy = nondet token-0 garbage: unsynced combine device-write vs decode-graph host read (SACRED is SYNC → missed it). FIX: `VT_ASYNC_DEVICE_MIRROR` **default ON**. Gate `test_qwen36_async_serving` RED(=0)→GREEN(default); SACRED/UAF clean; c16 neutral | MERGED (#31) |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -33,27 +34,26 @@ both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
 [benchmark-protocol.md](benchmark-protocol.md). Parity pin: vLLM `555967922`
 (0.26.0.dev0).
 
-Method rules hardened this cycle (AGENTS.md): the STRUCTURAL lens (same kernel,
-different throughput ⇒ audit the context; scan the REFERENCE's own rationale —
-vLLM or ds4/SGLang/llama.cpp — as a default lane; the scan GENERATES hypotheses,
-per-shape MEASUREMENT arbitrates; distrust aggregate bytes/time and CROSS-TOOL
-comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
+Method rules hardened (AGENTS.md): the STRUCTURAL lens (same kernel, different
+throughput ⇒ audit the context; scan the REFERENCE's own rationale; per-shape
+MEASUREMENT arbitrates; distrust aggregate bytes/time and CROSS-TOOL comparisons).
 
 ## Next actions
 
-1. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
+1. **★ Async-serving token-exact gate** — the missing gate that let the batch-1
+   greedy degeneration ship; then root-cause it + decide the mirror default.
+2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
 5. **Protocol substrate — partly done.** Claim triage DONE; `docs/STATUS.md`
-   under shrink-only ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING:
-   (a) anchor backfill, 98 rows `SPIKE`/`ACTIVE` (no zero-cost parking state; 6
-   model rows need a DECISION, arch unregistered); (b) record-era rollover
-   BLOCKED — `check-agent-record.py` binds `DONE` to `parity-ledger.md` LINE
-   anchors (43 refs); re-anchor by ledger ROW ID first (`state.md`/
-   `benchmark-record.md` have no line anchors, can roll now).
+   under a shrink-only ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING:
+   anchor backfill (98 rows `SPIKE`/`ACTIVE`, need code/test anchors; 6 model rows
+   need a DECISION, architecture unregistered); record-era rollover BLOCKED on
+   `check-agent-record.py` binding `DONE` rows to `parity-ledger.md` LINE anchors
+   (re-anchor by ROW ID first; `state.md`/`benchmark-record.md` can roll now).
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED

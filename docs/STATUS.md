@@ -52,7 +52,7 @@ token-for-token correctness against the pinned oracle.
 | Capability | State | Notes |
 |---|---|---|
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete, at/above vLLM speed | Token-exact greedy on GB10; beats vLLM 0.25.0 total throughput at every concurrency (1.007-1.045x), effective parity 115/124 axes |
-| Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; fresh 3-rep grid 2026-08-05: 0.93-1.03x | Token-exact greedy (gate=0); tput c4 1.025x, c16 0.932x, TTFT 0.93-0.98x. 2 loop levers A/B NEGATIVE: drain-sync -1.9%; INTAKE drain NEUTRAL (re-splits intake->queued, arrival->sched GPU-bound). Fix: prefill speed |
+| Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; 3-rep grid 0.93-1.03x. Async batch-1 token-0 degeneration FIXED: `VT_ASYNC_DEVICE_MIRROR` default ON | Token-exact SYNC + ASYNC (`test_qwen36_async_serving` RED→GREEN); c4 1.025x, c16 0.932x; loop levers NEGATIVE/NEUTRAL (drain-sync, intake-drain re-splits only); fixes = prefill speed + drain-removal/double-buffer |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual. **D1 (2026-07-31, `CLAIM-D1-BF16-MERGED-QKV`): the bf16 merged-QKV path (`Qwen3QkvMergeEnabled`/`VT_QWEN3_QKV_MERGE`) is now default-ON** — one `vt::MatmulBT` over the merged `[qdim+2kdim,H]` owner + a contiguous `vt::QkvSplit` (OLMo-2 exemplar), replacing three per-shard GEMMs. Bit-exact GEMM math (A/B unit `test_ops_qkv_merge` byte-identical, RED-first); the wider-N cuBLASLt K-reduction flips the 0.6B genuine bf16 near-tie so the SACRED 0.6B golden was regenerated (all tokens within the near-tie band, max 0.125 nats), while Qwen3-4B is byte-neutral (0 diffs, stays STRICT). Re-gated 0.6B 16/16 + 4B 16/16; consistency/launch-count fold (measured NEUTRAL on 4B decode), no new throughput owed |
 | Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical, and token-identical to the previous series; direct loading cuts peak/stable host PSS by 73.4%/91.1% and mean TTFT by 12.7%. Against an oracle built at the actual parity pin: 0.9970x total throughput, TTFT passes (0.773x), TPOT 12.4% high; re-validated unchanged (0.9972x / 1.1247x) after rebasing onto 139 upstream commits. The failing axis is the discrete-GPU async-overlap gap, scoped as ENG-ASYNC-SCHED W4 |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM. **D1 (2026-07-31): inherits the default-ON bf16 merged-QKV via the shared dense `AttnBlock` — byte-neutral (0 token diffs, golden UNCHANGED); re-gated 6/6** |
@@ -62,7 +62,7 @@ token-for-token correctness against the pinned oracle.
 | DeepSeek-V2 MLA | Correctness-complete, speed-pending | Token-exact 8/8 (DeepSeek-V2-Lite); 0.86-0.95x output rate, TTFT faster at c4/c8. A2+A5 MLA norm-rope fold default-ON (`VT_MLA_FUSED_NORM_ROPE`, bit-exact rollback, SACRED 8/8 unchanged; forensics in benchmark-record) — kimi_k3/kimi-linear inherit it |
 | GLM-4 dense (sandwich norms, partial rope) | Correctness-complete, speed-pending | Token-exact 16/16 (GLM-4-9B-0414); first GLM-family model; partial interleaved RoPE + Gemma2 sandwich norms + biased qkv |
 | GLM-4.7-Flash (MLA + GLM MoE) | Correctness-complete, speed-pending | Token-exact 8/8 (GLM-4.7-Flash, 31.2B); reuses the DeepSeek-V2 MLA stack; first e2e coverage of the q_lora query branch + noaux_tc sigmoid router with routed-scaling |
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | W7 device COMPUTE, CPU-gated | `ForwardDeviceCompute` runs the hybrid over DBufs via `vt::` ops; 2 host islands (KDA recurrence, NoPE-MLA softmax); gated 12/12·614; opt-in `VT_KIMI_DEVICE_COMPUTE=1` |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | W7 device COMPUTE, CPU-gated | `ForwardDeviceCompute` runs the hybrid over DBufs via `vt::` ops; 2 host islands (KDA recurrence, NoPE-MLA softmax); gated 12/12·614; opt-in `VT_KIMI_DEVICE_COMPUTE=1`; loader-surface test repaired |
 | Gemma-3 dense (GeGLU, dual rope, sandwich norms) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-3-1b-it); first Gemma-family model; GeGLU (gelu_pytorch_tanh) + dual per-layer RoPE theta + Gemma-RMSNorm sandwich norms + sqrt(hidden) embed-scale + query_pre_attn_scalar scaling |
 | Gemma-2 dense (attn + final logit soft-cap) | Correctness-complete, speed-pending | Near-tie-band 48/48 (gemma-2-2b-it): 44/48 strict on vLLM's greedy + 4/48 at 0.0-nat ties in vLLM's own logits; proves the attention + final logit soft-cap primitives (attn_logit_softcapping 50 + final 30); the inverse of Gemma-3 (both soft-caps, no QK-norm) |
 | Gemma-1 dense (the original Gemma) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-2b); two fused norms/layer, head_dim scale, GeGLU + sqrt(hidden) embed-scale, tied lm_head; no soft-cap/QK-norm/sliding. **D1 (2026-07-31): the whole Gemma family (1/2/3/4) folded to the default-ON bf16 merged-QKV descriptor (`MergedQkvEnabled`); re-gated Gemma-2 SACRED 48/48 (global+sliding) + Gemma-4 STRICT 32/32 — its existing gate held** |
@@ -1246,12 +1246,12 @@ protocol is ACCEPTED; W0-W5 LANDED, enforcement opt-in
 ([spec](../.agents/specs/operator-helper-protocol.md)). No engine code, no
 kernel, no numbers changed.
 
-Measured against an oracle built from source at the ACTUAL parity pin, the gap
-is 0.9970x total throughput, not the 0.9819x published against the older
-pip-installed 0.24.0 release: that release is 1.25% faster than the pin, so
-the old denominator was understating us. TPOT (+12.4%) is the one real gap.
-Re-validated 2026-07-29 after rebasing onto 139 upstream commits: 0.9972x /
-TPOT 1.1247x, every axis inside noise and token-identical to the prior series.
+Qwen3.5-4B direct-load remains speed-pending against the oracle built at the
+actual parity pin. The 2026-08-03 revalidation across another 217 upstream
+commits plus the GCC 15 repair measured 0.9980x total throughput and 1.1243x
+TPOT, with output bit-identical to the prior series (128/128 per arm). The
+0.0008x ratio movement was denominator noise. The older 0.9819x result used the
+1.25%-faster pip 0.24.0 release and is not the binding comparison.
 
 One open lead is on record from the same profiling pass: cuBLASLt resolves
 Ampere-class GEMM kernels on this Blackwell device. It is unmeasured and may be
@@ -1265,33 +1265,27 @@ Benchmark provenance is gated as well as measured: both the comparison and the
 same-binary A/B harness refuse to start a leg on a GPU that is not idle, after
 a cooldown rather than before it.
 
-Alongside the default build, `-DVLLM_CPP_SANITIZE=address,undefined` and
-`-DVLLM_CPP_SANITIZE=thread` build the CPU tier under the dynamic detectors, and
-CI runs both as separate jobs. Verified end to end: the ASan+UBSan lane builds
-and passes `test_input_batch`, `test_combine_tokens` and `test_arena` with leak
-detection on. The lanes keep the warnings but drop `-Werror`, because sanitizer
-instrumentation makes GCC's range and initialization analyses fire inside
-libstdc++ on correct code; the plain build is the one that enforces `-Werror`. The lane refuses to configure with the CUDA
-backend on, because a host sanitizer runtime does not instrument nvcc device
-translation units and reports false positives against the CUDA driver; the CUDA
-tier's equivalent is `compute-sanitizer`, and `VT_POOL_BYPASS=1` makes the device
-scratch pool hand out exact-size, really-freed allocations so that tool can see
-tensor boundaries and use-after-free the caching pool otherwise hides.
+The ASan+UBSan and TSan CPU lanes both pass **333/333** on GCC 15.2 after
+merging upstream `main`; ASan leak detection stays enabled. PR #28's hosted
+failure was filesystem exhaustion, not
+a sanitizer finding: sharing one internal instrumented image and using `-g1`
+cut the ASan+UBSan tree from 93 GiB to 5.7 GiB; TSan occupies 1.9 GiB.
+`VT_POOL_BYPASS=1` makes intentional scratch retention visible as real frees,
+and the complete survey fixed one genuine minja context/callable ownership
+cycle. Host sanitizers remain CPU-only; CUDA uses `compute-sanitizer`.
 
-CI concurrency is split by GATE SCOPE, not applied workflow-wide. The two
-DIFF-scoped gates, `documentation-checkpoint` and `commit-protocol-tag`,
-evaluate `github.event.before..github.sha`, so each owns a commit range that no
-later run re-covers (the next run's `before` is this run's `sha`). They
-deliberately carry no concurrency group and are never cancelled. The six
-TREE-scoped jobs (`agent-record`, `cuda-arch-features`, `device-leakage`,
-`build-test-cpu`, and both `sanitize-cpu` lanes) validate HEAD, so only the
-newest push to a ref is meaningful; each carries a per-job group keyed on
-`github.ref` with `cancel-in-progress`. Net effect: a superseded push to `main`
-keeps its 2 per-commit gates and drops the other 6 jobs. The `sanitize-cpu`
-group includes `matrix.lane`, without which the two mutually exclusive
-sanitizer legs of the SAME run would share a group and cancel each other. At
-the workflow level the group is keyed on the SHA for a push, so two pushes to
-`main` never share a group; only pull-request pushes are deduplicated there.
+The plain GCC 15.2 `-Werror` build exposed two optimizer false positives. The
+project-owned `std::vector<bool>` assignment now avoids the packed word-copy
+path without suppression; the vendored minja diagnostic is demoted only for
+`chat_template.cpp` under GNU. Every other diagnostic and unit remains fatal.
+Sanitizer lanes alone omit `-Werror` because instrumentation triggers additional
+libstdc++ range-analysis false positives.
+
+CI concurrency follows gate scope. The diff-scoped documentation and commit
+protocol jobs never cancel because no later run rechecks their commit range.
+Tree-scoped jobs cancel superseded PR runs per ref; sanitizer groups also key on
+the matrix lane so ASan+UBSan and TSan cannot cancel each other. Push workflows
+key on SHA, while pull-request workflows deduplicate the same updated ref.
 
 Known failing on discrete sm_120 (RTX 5070 Ti), pre-existing and not introduced
 by the lanes: `test_cuda_ops` "CUDA matmul (cuBLASLt) matches CPU on odd sizes"

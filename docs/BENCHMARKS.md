@@ -90,10 +90,10 @@ token_ids` device gather). The full drain is byte-exact and UAF-safe and is
 (0.999x), c32 2928.9 vs 2919.1 (0.997x), bands overlap. It is a drain MOVE (relocate
 the drain past the host prep, not remove it), so it overlaps only the small host
 prep; the drain still serializes GPU input staging, so c16 does not recover. The
-drain REMOVAL is `row/SERVE-ASYNC-EXECUTOR` (`VT_ASYNC_EXECUTOR`, landed default-OFF):
-a 2-slot decode-graph ring + reuse event, proven token-exact (async GREEN 5/5 c32,
-SACRED 3/3); hazard-C is real-by-construction but empirically unreproducible on GB10
-so it stays OFF (record has detail + the Option A follow-up).
+drain REMOVAL, `VT_ASYNC_EXECUTOR` Option A (`row/SERVE-ASYNC-OPTION-A`, default-OFF,
+input H2D staged out of capture, the faithful vLLM structure), is GREEN + RED-reproducing
+but binding-A/B speed-NEUTRAL (c8/c16/c32 +0.0-0.1%), so the c16 gap is NOT the async
+input path. Detail in `.agents/benchmark-record.md`.
 
 **But the mirror FIXES a shipping correctness bug, so it is now DEFAULT ON
 (ROW-SERVE-ASYNC-LLM, 2026-08-06).** Baseline async (AsyncLLM depth-2) batch-1 greedy
@@ -297,7 +297,7 @@ built on it rather than keeping the flattering one.
 | Track | Status | Next gate |
 |---|---|---|
 | 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
-| 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` now **default ON for correctness** (fixes async batch-1 token-0 degeneration, ROW-SERVE-ASYNC-LLM; c16 2303.9 neutral) | c16 recovery still needs drain-removal + double-buffer. Async-serving token-exact gate `test_qwen36_async_serving` LANDED: RED(=0) to GREEN(default) |
+| 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
@@ -305,7 +305,7 @@ built on it rather than keeping the flattering one.
 | DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
-| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | W7 device COMPUTE GPU-verified (f32) on GB10; e2e §8 disk-blocked | `test_kimi_linear_forward` 12/12·614 GREEN on GB10 sm_121a CUDA build, both arms (device `VT_KIMI_DEVICE_COMPUTE=1` + host-ref), device f32==W2 ref; e2e §8 golden blocked: 91.5 GiB weights vs 34G free disk |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | Full-model GB10 e2e RUNS (bf16-resident §13), NEAR-TIE 106/128, pool math CLOSES; default OFF | Full model RUNS on GB10 (bf16-resident, RSS peak 1.7 GiB, min-avail 21 GiB, no OOM). Token NEAR-TIE 106/128 (6/8 prompts exact, numerics vs deterministic oracle). 1.59 tok/s. Detail: spec §13 |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |

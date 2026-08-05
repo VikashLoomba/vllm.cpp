@@ -36175,7 +36175,6 @@ tmux killed, `/dev/shm` freed, both locks released, `local-ai-worker` left stopp
 found. Evidence: local logs `scratchpad/kimi_build_dgx.log` + `kimi_test_dgx.log`;
 records in spec section 11, model-matrix `MODEL-TEXT-kimi-linear-*`, benchmark record.
 
-
 ## QUANT-CT-MXFP4 Qwen vehicle: W0 checkpoint + W1 kernel target PINNED; empirical GPU/disk-gated
 
 <!-- state: 2026-08-06T21:00 -->
@@ -36227,6 +36226,67 @@ risk the 15G floor. WAITED (locks not broken, disk not breached). Resume: downlo
 when disk >= ~15G free + lock free, then greedy golden, then build+gate+bench.
 Evidence: spec `.agents/specs/mxfp4-compressed-tensors.md` (W0-W5 section).
 
+## SERVE-ASYNC-OPTION-A: decode-graph input H2D staged OUT of capture (faithful vLLM) — LANDS gated OFF; RED finally CONSTRUCTED; throughput WASH refutes "c16 = the baked H2D"
+<!-- state: 2026-08-06T21:00 -->
+
+The Option A follow-up to #36 (SERVE-ASYNC-EXECUTOR). #36 (Option B) kept the per-step
+input H2D BAKED INSIDE the captured decode replay and worked around the host-input
+reuse with a 2-slot ring, but its RED was UNREPRODUCIBLE and it was speed-neutral.
+Option A ports vLLM's actual structure (`gpu_model_runner.py` `_prepare_input_ids` +
+`synchronize_input_prep`, `states.py:64`): each `SizeSlot` gets PERSISTENT device
+input buffers the captured graph reads (`s.dev`, a `StepDevInputs`) and PINNED host
+staging (`s.pin`); per step the H2D is enqueued on the main queue BEFORE `ReplayGraph`
+(OUT of capture) and an input-staged event is recorded right after the tiny staging
+copy, so the next same-slot Refresh waits only that copy, never the GPU tail. The
+2-slot ring is RETAINED (the depth-2 loop enqueues sample(i) right after forward(i),
+so persistent logits must double-buffer). `EmbedInto` unchanged (device-resident ids
+override already avoids the host token round-trip). Both drivers (35B MoE + 27B dense;
+dense re-derives the fused-preamble cos|sin from the re-staged persistent positions
+via `FillAttnCosSin`, alloc pre-capture). Default OFF byte-identical (baked H2D, single
+slot, drain intact). `qwen3_5.cpp:3348 FillAttnCosSin`, `:7495-7620` Option A helpers
+(`PinnedStepInputs`/`StageStepInputs`/`MaybePoisonStagedInputs`/`PersistentDecodeInput
+Pool`), `ForwardLayers`/`DenseForwardLayers` `persistent_sdi` param, both `Step` warm/
+replay branches; runner drain-skip is #36's (unchanged).
+
+CAPTURE-MALLOC BUG (found + fixed, the exact #36 trap class). First GPU run: every ON
+step aborted with `cudaMalloc when stream is capturing`. Root cause: `BuildStepDevInputs`
+in the warm branch popped-and-RETAINED small input-buffer blocks from the shared main
+`Pool()`, leaving a size-class the captured forward's own scratch then needs empty ->
+a pool MISS = cudaMalloc mid-capture. FIX: route the persistent `s.dev`+cos|sin through
+a DEDICATED `PersistentDecodeInputPool()` under an `ActivePoolScope`, leaving the main
+scratch pool exactly as the eager pre-warm left it. After the fix, capture is clean.
+
+RED CONSTRUCTED (the thing #36 could NOT do; brief STOP-rule met). `VT_ASYNC_EXECUTOR_
+POISON` now overwrites the PINNED H2D source immediately after `StageStepInputs`
+enqueues the async copy: the true-async DMA reads the garbage -> a DETERMINISTIC token
+divergence (coherent-but-wrong "capital of Germany is Berlin", 16/16 tokens, no crash),
+FAILURE every rep. This proves (a) the H2D is genuinely async and (b) the input-staged
+event is load-bearing (a Refresh running ahead does exactly this). It needs PINNED
+memory: pageable std::vector H2D on GB10 is host-synchronous, which is precisely why
+#36's poison never raced.
+
+GREEN (dgx, both locks, single load/arm, drop_caches): `test_qwen36_async_serving`
+ON @conc-32 5/5 PASS + control PASS; SACRED `test_qwen36_paged_engine` ON x3 PASS
+(97.9/101.2/91.0s, sync token-exact under Option A); compute-sanitizer memcheck x2 =
+0 errors; `VT_ASYNC_EXECUTOR_NO_DBUF` (baked single-slot) PASS; served ignore_eos UAF
+bracket mt 4-128 all http=200 ALIVE. Drain-skip engagement confirmed in the SERVER
+(`VT_ASYNC_EXECUTOR_TRACE` fired).
+
+BINDING A/B (THE gate, `tools/bench/online_gate.py`, ONE binary env-toggled OFF vs ON,
+c8/c16/c32 x3, never reload). Throughput WASH: c8 1778.9->1781.4 (+0.14%), c16
+2294.4->2294.8 (+0.02%), c32 2914.5->2916.3 (+0.06%) tok/s. Mean TTFT WASH: c8
+1130->1115, c16 1910->1925, c32 2820->2822 ms. All inside rep noise. vs vLLM targets
+(2497/3013/1922 tok/s; 1834/2703/1085 ms) still 0.92/0.97/0.93x tput.
+
+DEFAULT: OFF (parity-enablers: flip ON only on a clean win). Mechanism kept gated —
+strictly better than #36's Option B (faithful structure + a working RED). ATTRIBUTION
+(definitive negative): Option A removes EXACTLY the depth-2 drain + the in-capture baked
+H2D and throughput/TTFT are unchanged -> the c16/c32/c8 deficit to vLLM is NOT the
+decode-graph input-H2D structure. That closes the "c16 = the moved drain" hypothesis;
+the residual is prefill glue (task #61) + steady host-orchestration/GPU compute, not the
+async input path. Evidence `dgx:~/work/mirror-ab/option-a/`, branch `row/SERVE-ASYNC-
+OPTION-A`.
+
 ## QUANT-CT-MXFP4 Qwen W0+W1 EMPIRICAL: oracle golden RUNS (Marlin W4A16); FlashInfer W4A4 CRASHES on sm_121
 
 <!-- state: 2026-08-06T21:30 -->
@@ -36264,6 +36324,45 @@ checkout and ~31 GiB free (full CUDA build ~21 GiB, tight/slow; other agents'
 `~/work/*/build` must not be reused) -> W2 needs a git-archive + fresh CUDA build.
 Spec updated (`.agents/specs/mxfp4-compressed-tensors.md`, W1 EMPIRICAL RESULT block).
 
+## MODEL-TEXT-kimi-linear: §8 SACRED oracle golden CAPTURED (STRICT, 8/8 deterministic); full our-engine e2e f32-loader-blocked (~183 GiB > 119 pool)
+<!-- state: 2026-08-06T23:00 -->
+
+Disk unblocked upstream (129 GiB free); the §11 GPU-verify merged as #37. Resumed
+Steps 3-6 on a fresh branch `row/MODEL-KIMI-LINEAR-E2E` off `origin/main` `c1a7b452`.
+
+STEP 3 (download) DONE. `moonshotai/Kimi-Linear-48B-A3B-Instruct` into the HF cache in a
+named tmux + done-marker, NO GPU (alongside the Option-A campaign); 20 shards, exact
+98,245,528,576 B = 91.5 GiB bf16 / ~49.1B; `config.json` matches the spec. df landed
+37 GiB free (> 15 GiB floor).
+
+STEP 4 (§8 golden) DONE, STRICT. Oracle (0.25.0-stage) ALONE under BOTH flock locks
+(waited out Option-A), drop_caches, 116 GiB free. Recipe = deepseek-v2 analog:
+moe_backend=triton (MANDATORY — FlashInfer CUTLASS MoE OOM-reboots the box),
+enforce_eager, max_num_batched_tokens=512, max_num_seqs=1, per-prompt batch=1, K=3,
+T=16. MEMORY CRUX: vLLM footprint ~= util*119, so 91.5 GiB weights need util ~0.82 (the
+briefed <=0.60 CANNOT hold weights: 0.60*119=71<91.5). util=0.82 => ~97.6 GiB
+footprint, min available 15 GiB throughout, NO reboot (real-time monitor). Verdict: ALL
+8 prompts DETERMINISTIC over K=3 -> STRICT token-exact gate (as spec §4 predicted for a
+48.9B MoE); coherent completions. Golden committed
+`tests/parity/goldens/kimi_linear_greedy/` + recipe `scripts/kimi-linear-oracle-capture.py`.
+Reduced-layer smoke (hf_overrides num_hidden_layers=4) is INCOMPATIBLE with the Kimi
+hybrid schedule in vLLM 0.25.0 (loader KeyError layers.4.block_sparse_moe) -> skipped.
+
+STEP 5 (our-engine full e2e) BLOCKED on OUR f32 loader — NOT disk, NOT oracle.
+`kimi_linear_weights.cpp::MaterializeHost` decodes every weight to `std::vector<float>`
+f32 (all 27 layers + 256 experts) => ~49.1B*4 B ~183 GiB, over the 119 GiB pool; a
+full-model our-engine load would OOM-reboot, so NOT attempted (premise grounded in the
+loader source). This is the §10/§11 bf16-residency residual; the device compute is
+already GPU-verified (test_kimi_linear_forward 12/12·614). The STRICT golden is now the
+committed target for the moment the bf16 loader/forward lands.
+
+STEP 6. Row STAYS `ACTIVE` (e2e token gate did not run); `VT_KIMI_DEVICE_COMPUTE`
+default STAYS OFF. No tok/s (no safe full-model our-engine load). Residuals: (a)
+bf16-resident loader/forward (unblocks full e2e vs the golden), (b) paged het-KV + GDN
+Triton-AOT decode + grouped-MoE device slabs, (c) speed. Box left clean; the 91.5 GiB
+checkpoint retained in the HF cache. Evidence: `dgx:~/kimi-e2e/{oracle_full.log,mem_full.log}`,
+local golden `tests/parity/goldens/kimi_linear_greedy/`.
+
 ## QUANT-CT-MXFP4 W2 native Marlin mxf4 keep-quant LANDS (builds+runs on GB10); e2e RED, bug localized to group_blocks=2 GEMM
 
 <!-- state: 2026-08-06T23:30 -->
@@ -36297,6 +36396,39 @@ dequant reference at M=1 AND M=8 (RED-first) to pinpoint; then re-gate e2e, then
 Box left clean (locks released, tmux killed, GPU idle, disk 27G). Build tree persists at
 dgx:~/work/mxfp4-w2 for the continuation.
 
+## MODEL-TEXT-kimi-linear: bf16-resident loader/forward POOL MATH + grounded design (§13); implementation scoped, PENDING
+<!-- state: 2026-08-07T00:30 -->
+
+Disk unblocked and the §12 golden merged as #40 (main `32148dd9`). Resumed the final
+phase-3 brick on `row/MODEL-KIMI-LINEAR-BF16`: the bf16-resident loader/forward that
+replaces the f32 `MaterializeHost` (183 GiB) so the full-model e2e fits the 119 GiB pool.
+
+POOL MATH (done BEFORE building, per the design constraint — spec §13): bf16 weights
+91.5 GiB device-resident (`OwnedTensor::d_dev`, cudaMalloc+H2D, no ATS penalty), per-tensor
+stage-then-`ReleaseHost` keeps the load peak ~91.5 GiB device + <1 GiB host + the mmap read
+window; f32 residual-stream activations < ~0.3 GiB at T~36; host f32 norm/scale vectors
+< 0.1 GiB; CUDA context ~2 GiB reserved FIRST. STEADY ~94 GiB -> ~25 GiB headroom. CLOSES.
+
+DESIGN (grounded file:line in the winning patterns): bf16 storage via
+`dense_loaders::LoadBf16Direct`->`OwnedTensor` (mirror laguna/gemma weights), f32
+`MaterializeHost` KEPT for the small-config unit gate; resident GEMM = `KimiResidentBf16W`
+(mirror laguna.cpp:125-139) + `GemmBf16` = `vt::CastBf16(f32-act->bf16)` then `vt::MatmulBT`
+(bf16,bf16)->f32 (the combo CUDA MatmulBT SUPPORTS, cuda_matmul.cu:3; the elementwise
+f32-act x bf16-weight it LACKS, cuda_deepseek_v4.cu:1821) so GEMM numerics are vLLM-bf16;
+residual stream + the two host islands stay f32; norms via ReadF32; runner drops the
+host.materialized precondition on the resident path; GB10 load recipe context-first +
+shard-release (examples/laguna_gen/main.cpp:185-237); e2e = a greedy-decode harness over the
+bf16 ForwardDeviceCompute vs the committed golden (the VT_KIMI_DEVICE_COMPUTE=1 arm only —
+the =0 f32 host Forward cannot fit the full model).
+
+HONEST OUTCOME: this session completed the pool-math + grounded-design phase and landed it in
+the records (spec §13, this entry, benchmark record, matrix, NOW, STATUS/BENCHMARKS/FEATURES).
+The ~500-line implementation (bf16 loader + device-forward rewrite + tiny-config bf16 gate +
+CUDA build + the memory-critical full-model e2e vs the golden) is the scoped NEXT execution;
+no code landed beyond records, nothing broken. Row STAYS `ACTIVE`. Next: implement §13 on
+this branch, keep `test_kimi_linear_forward` 12/12·614 green, then the full-model e2e
+(free -g >= 90, monitor, STOP if the pool math does not close in practice).
+
 ## QUANT-CT-MXFP4 W3 unit gate GREEN: MXFP4 GEMM PROVEN correct; e2e residual is NOT the compute
 
 <!-- state: 2026-08-07T01:00 -->
@@ -36323,6 +36455,41 @@ by the Kimi bf16 agent — locks HELD, WAITED, did not intrude); RED at a model 
 large-shape kernel fix; GREEN => per-layer activation dump. Then re-gate e2e + W4 bench.
 Box left as found (Kimi holds the locks; my tmux sessions killed; build tree persists at
 dgx:~/work/mxfp4-w2).
+
+## MODEL-TEXT-kimi-linear: bf16-resident loader/forward IMPLEMENTED + CPU-gated (§13); dgx CUDA build + full-model e2e PENDING
+<!-- state: 2026-08-07T01:30 -->
+
+Executed §13 on `row/MODEL-KIMI-LINEAR-BF16` (base `e28ace81`). LANDED (file:line):
+`LoadKimiLinearResidentBf16Weights` + `StageKimiResidentBf16` + `BuildKimiResidentFromHost`
+(`kimi_linear_weights.cpp`) — large matmul weights via `dense_loaders::LoadBf16Direct` ->
+`OwnedTensor`, per-tensor stage-to-`d_dev` (cudaMalloc + one H2D) then `ReleaseHost` so the LOAD
+peak holds ONE tensor's host bytes; tiny norm/scale/conv/bias vectors decoded to host f32
+(`ReadFloatVec`, dtype-agnostic). Real checkpoint verified on dgx: 20 shards, 91.5 GiB bf16,
+tie_word_embeddings=false, ONLY `dt_bias`/`A_log` are F32 (the rest BF16 incl. conv1d + router
+gate + e_score_bias). `KimiLinearResidentWeights` struct + `resident` member on
+`KimiLinearWeights` (`kimi_linear.h`). bf16 device forward `DeviceForwardBodyBf16` +
+`Kda|Mla|MoeBlock|DenseMlp|SwiGluDeviceBf16` with the Laguna cast-GEMM `GemmBf16`
+(`vt::CastBf16` f32-act->bf16 then `vt::MatmulBT` (bf16,bf16)->f32 vs `ResidentBf16W`) at each of
+the ~20 GEMM sites; f32 residual stream; the two host-fallback islands (`KdaRecurrenceIsland`,
+`MlaSoftmaxIsland`) EXTRACTED and SHARED with the f32 path (byte-identical, so the f32 12/12
+stays exact). Router gate made bf16-resident (matches vLLM's bf16 router — a f32 gate could flip
+near-tie top-8 selections; the primary token-divergence risk). `ForwardDevice` drops the
+`host.materialized` precondition on the resident path; `ForwardDeviceCompute` dispatches
+bf16-vs-f32 on `resident.resident`. e2e harness `examples/kimi_linear_gen/main.cpp`
+(context-first + shard-release, greedy the 8-prompt golden battery x16 vs `greedy_ids.npy`).
+
+CPU GATE GREEN: `test_kimi_linear_forward` **13/13·656** = the original 12/12·614 (f32 path
+UNTOUCHED, incl. the extracted islands) + NEW case (k) bf16-resident `ForwardDeviceCompute` ==
+the independent f32 host reference within a bf16 envelope (rtol 6e-2 + atol scaled to |logit|).
+All 3 changed TUs + the harness compile `-Werror` clean; full CPU lib + test + harness build+link
+green (worktree `build-cpu`, on `mudler-ubuntu-box`).
+
+PENDING (this row, on dgx.casa GB10 — checkpoint CACHED 92G, 89 GiB free RAM, no GPU process):
+(1) CUDA build `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`
+(nm GDN check), (2) `test_kimi_linear_forward` on CUDA, (3) full-model e2e via `kimi-linear-gen`
+vs the STRICT golden (free -g >= 90 before load, memory-monitored; STOP + record if the pool math
+diverges toward the limit). Row STAYS `ACTIVE`; `VT_KIMI_DEVICE_COMPUTE` default STAYS OFF until
+the e2e token gate is green.
 
 ## QUANT-CT-MXFP4 e2e RESOLVED: compute CORRECT (async-off 3/4 token-exact); async-default degeneration is a PRE-EXISTING classic-dense-Qwen3 bug
 
@@ -36351,3 +36518,44 @@ a default-config e2e; (2) W4 bench (online_gate.py c1..c8x3) on the async-off co
 path, oracle arm VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel; (3) formal
 distributional gate for p3. Evidence: docs/bench-evidence/mxfp4-qwen/W3-e2e-result.md.
 Box: locks released, tmux killed, build tree persists at dgx:~/work/mxfp4-w2.
+
+## MODEL-TEXT-kimi-linear: FULL-MODEL GB10 e2e RUNS via bf16-resident path — NEAR-TIE 106/128 (6/8 prompts token-exact); pool math CLOSES
+<!-- state: 2026-08-07T03:00 -->
+
+The §13 bf16-resident loader/forward CLEARS the f32-loader block: the full 48.9B Kimi-Linear-48B-A3B
+now runs e2e on ONE GB10 (the primary mission goal). dgx CUDA build (`-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`,
+nvcc 13.0.88, Release, `-Werror` clean, built in `/dev/shm` on dgx.casa): CUTLASS NVFP4 GEMM + FA2
+[121a] + Triton-AOT GDN (14 cubins, all `gdn_*_default` symbols nm-linked). `test_kimi_linear_forward`
+**13/13·656** in the CUDA-built binary. `kimi-linear-gen --gpu` loads the checkpoint (context-first +
+shard-release) and greedy-decodes the §12 8-prompt battery x16 through the bf16 `ForwardDeviceCompute`,
+token-compared to `greedy_ids.npy`.
+
+MEMORY (pool math CLOSES in practice, matches §13): load 117.6s; host RSS PEAK **1.7 GiB**
+(stage-then-ReleaseHost keeps ONE tensor's host bytes live); device peak **98.5 GiB** (100896 MiB);
+min available **21.6 GiB** throughout — above the 15 GiB floor, matches the predicted ~25 GiB headroom.
+NO OOM, NO reboot. A load-only smoke first proved the ~20k per-tensor cudaMalloc staging closes safely.
+Ran UNDER both flock locks (correctly WAITED behind the co-tenant MXFP4 agent's job — never broke the
+lock); box left clean (locks free, no leftover procs).
+
+TOKEN gate: **NEAR-TIE 106/128 (82.8%), NOT STRICT.** Prompts 0,1,3,4,5,6 = 16/16 token-exact; p2
+diverges from token 0 (261 vs golden 276); p7 matches 6 then diverges at a comma boundary (pos 6:
+387 vs golden 11) and cascades. The golden is DETERMINISTIC (K=3 identical) at both divergence points,
+so this is a genuine numerics NEAR-TIE, not a wiring bug — 96 consecutive token-exact tokens across 6
+prompts prove the loader / resident-GEMM / MoE-routing / residual-stream WIRING is correct.
+
+DIVERGENCE ROOT CAUSE (honest): the correctness-vehicle forward is NOT bit-identical to vLLM's bf16
+stream. (1) The residual stream stays f32 (the §13 design — the two host-fallback islands consume it);
+vLLM ROUNDS the residual to bf16 after every add and before every RMSNorm, so its norm variance is over
+bf16 values, ours over f32 (higher precision). (2) The KDA recurrence + NoPE-MLA softmax islands run in
+f64 on host; vLLM runs GDN Triton-AOT + FA2 MLA in bf16/f32 on device. So our per-op numerics are MORE
+accurate than vLLM, which lands a DIFFERENT top-1 where vLLM's deterministic bf16 top-1 has a small
+margin (punctuation/word boundaries; longer prompts accumulate more delta — p2 is the longest at 14
+prompt tokens and flips immediately). PATH TO STRICT (the named W7-speed residuals): the device GDN
+per-channel-decay recurrence + exp/softplus gate op + the paged `mla::ForwardMlaAttentionBlock`, then a
+bf16 residual stream end-to-end (matching vLLM's rounding) — closes the numerics gap AND removes the
+host round-trips (the 1.59 tok/s is the O(n^2) full-recompute + host-island rate, not an optimized
+decode). `VT_KIMI_DEVICE_COMPUTE` STAYS OFF (parity-enablers: a near-tie is not token-exact). Row STAYS
+`ACTIVE`. Residuals now precisely: (a) STRICT token-exactness (device islands + bf16 stream), (b) the
+paged het-KV incremental decode, (c) speed.
+

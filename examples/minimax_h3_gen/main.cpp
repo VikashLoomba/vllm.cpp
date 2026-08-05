@@ -151,6 +151,7 @@ int main(int argc, char** argv) {
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   std::string first_frame_path, last_frame_path;
   std::vector<std::string> ref_image_paths;
+  std::string ref_video_prefix;
   double imgvid_noise_aug = 1.0;
   int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
@@ -180,6 +181,7 @@ int main(int argc, char** argv) {
       else if (f == "--first-frame") first_frame_path = Need(argc, argv, ++i, f);
       else if (f == "--last-frame") last_frame_path = Need(argc, argv, ++i, f);
       else if (f == "--ref-image") ref_image_paths.push_back(Need(argc, argv, ++i, f));
+      else if (f == "--ref-video") ref_video_prefix = Need(argc, argv, ++i, f);
       else if (f == "--noise-aug") imgvid_noise_aug = std::stod(Need(argc, argv, ++i, f));
       else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
@@ -206,7 +208,7 @@ int main(int argc, char** argv) {
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
                    "[--dry-run] [--denoise-only] [--dump-params] "
                    "[--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A] "
-                   "[--ref-image f.ppm ...]\n";
+                   "[--ref-image f.ppm ...] [--ref-video DIR]\n";
       return 2;
     }
 
@@ -413,6 +415,56 @@ int main(int argc, char** argv) {
     request.video_latents_std = video_stats.std_dev;
     request.audio_latents_mean = audio_stats.mean;
     request.audio_latents_std = audio_stats.std_dev;
+
+    // --- ref2va VIDEO reference: a CLIP prepended to the sequence. Reads
+    // DIR/frame_%06d.ppm, which is exactly what this example WRITES, so a previous
+    // run's workdir can be handed straight back in as a reference.
+    if (!ref_video_prefix.empty()) {
+      VT_CHECK(ref_image_paths.empty() && first_frame_path.empty() && last_frame_path.empty(),
+               "minimax-h3-gen: --ref-video is exclusive with --ref-image and --first/--last-frame");
+      VT_CHECK(!video_vae_path.empty(), "minimax-h3-gen: --ref-video needs --video-vae");
+      const vllm::SafetensorsFile vf = vllm::SafetensorsFile::Open(video_vae_path);
+      const vllm::MiniMaxH3AudioVaeWeights enc_w = vllm::LoadMiniMaxH3VideoVaeEncoderWeights(vf);
+      vllm::MiniMaxH3EncoderFcn3dConfig enc_cfg;
+      enc_cfg.z_channels = 2 * dit.params.latents_dim;
+
+      std::vector<float> clip;
+      int64_t ft = 0, fh = 0, fw = 0;
+      for (int64_t k = 0;; ++k) {
+        char nm[512];
+        std::snprintf(nm, sizeof(nm), "%s/frame_%06lld.ppm", ref_video_prefix.c_str(),
+                      static_cast<long long>(k));
+        std::ifstream probe(nm, std::ios::binary);
+        if (!probe) break;
+        probe.close();
+        int64_t h2 = 0, w2 = 0;
+        const std::vector<float> f = ReadPpmAsChw(nm, &h2, &w2);
+        if (ft == 0) { fh = h2; fw = w2; }
+        VT_CHECK(h2 == fh && w2 == fw,
+                 "minimax-h3-gen: every --ref-video frame must have the same size");
+        // [C,H,W] per frame -> [C,T,H,W]: append per channel, so build channel-major.
+        clip.insert(clip.end(), f.begin(), f.end());
+        ++ft;
+      }
+      VT_CHECK(ft > 0, "minimax-h3-gen: --ref-video found no frame_%06d.ppm files");
+      // Re-lay the per-frame [C,H,W] stack into [C,T,H,W].
+      std::vector<float> chw(clip.size());
+      const int64_t plane = fh * fw;
+      for (int64_t c = 0; c < 3; ++c) {
+        for (int64_t k = 0; k < ft; ++k) {
+          for (int64_t e = 0; e < plane; ++e) {
+            chw[static_cast<size_t>((c * ft + k) * plane + e)] =
+                clip[static_cast<size_t>(k * 3 * plane + c * plane + e)];
+          }
+        }
+      }
+      vllm::MiniMaxH3RefBlock vb{};
+      request.keyframe_cond_rows = vllm::MiniMaxH3EncodeReferenceVideo(
+          enc_cfg, enc_w, dit.params, chw, ft, fh, fw, &vb);
+      request.ref_blocks = {vb};
+      std::cerr << "  ref2va: reference VIDEO " << ft << " frames at " << fw << "x" << fh
+                << " (silent)\n";
+    }
 
     // --- ref2va REFERENCES: whole reference images prepended to the sequence,
     // as opposed to fl2va which pins frames OF THE OUTPUT. Mutually exclusive.

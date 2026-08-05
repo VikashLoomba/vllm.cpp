@@ -1332,6 +1332,19 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
 //
 // Returns the packed condition rows; `out_blocks` receives one kImage block per
 // image, in the same order.
+// Encode a REFERENCE VIDEO (a clip, [in_channels, T, H, W] in [-1, 1]) for ref2va.
+//
+// Needs no new porting beyond the image path: the 3D CNN is CAUSAL in time, so a
+// clip is the same call with t > 1. Emits a kVideoAudio block -- the only kind that
+// carries a temporal extent, since kImage counts exactly one frame however large
+// its latent_t -- with `ref_audio_t = 0`, i.e. a SILENT video reference, which is
+// the part that can be honoured without the (unported) audio-VAE encoder.
+std::vector<float> MiniMaxH3EncodeReferenceVideo(
+    const MiniMaxH3EncoderFcn3dConfig& encoder_config,
+    const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
+    const std::vector<float>& frames, int64_t frame_count, int64_t frame_h, int64_t frame_w,
+    MiniMaxH3RefBlock* out_block);
+
 std::vector<float> MiniMaxH3EncodeReferenceImages(
     const MiniMaxH3EncoderFcn3dConfig& encoder_config,
     const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,

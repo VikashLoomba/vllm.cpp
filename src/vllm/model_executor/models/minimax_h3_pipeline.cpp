@@ -47,6 +47,44 @@ namespace vllm {
 // `noise_aug` blends toward the supplied noise (1.0 pins the frame exactly). Noise
 // is an INPUT for the same reason it is in the t2va path: reproducing upstream's RNG
 // decides WHICH sample you get, not whether the pipeline is right.
+std::vector<float> MiniMaxH3EncodeReferenceVideo(
+    const MiniMaxH3EncoderFcn3dConfig& encoder_config,
+    const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
+    const std::vector<float>& frames, int64_t frame_count, int64_t frame_h, int64_t frame_w,
+    MiniMaxH3RefBlock* out_block) {
+  VT_CHECK(frame_count > 0, "minimax_h3 ref2va: a video reference needs at least one frame");
+  VT_CHECK(static_cast<int64_t>(frames.size()) ==
+               encoder_config.in_channels * frame_count * frame_h * frame_w,
+           "minimax_h3 ref2va: reference video is not [in_channels, T, H, W]");
+
+  // The 3D CNN is CAUSAL in time, so a clip encodes in one call -- this is the same
+  // encoder the single-image path uses, just with t > 1, which is why a video
+  // reference needed no new porting once the image path existed.
+  MiniMaxH3EncoderFcn3dConfig cfg = encoder_config;
+  cfg.t = frame_count;
+  cfg.h = frame_h;
+  cfg.w = frame_w;
+  MiniMaxH3VideoFrameShape ls{};
+  const std::vector<float> latent =
+      MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, frames, &ls);
+  std::vector<float> rows = MiniMaxH3PatchifyVideoLatent(
+      latent, /*batch=*/1, dit_params.latents_dim, ls.t, ls.h, ls.w, dit_params.patch_size_t,
+      dit_params.patch_size_h, dit_params.patch_size_w);
+
+  if (out_block != nullptr) {
+    // kVideoAudio is the only kind that carries a temporal extent -- kImage counts
+    // exactly one frame regardless of latent_t. ref_audio_t stays 0: silent.
+    MiniMaxH3RefBlock b;
+    b.kind = MiniMaxH3RefBlock::Kind::kVideoAudio;
+    b.ref_audio_t = 0;
+    b.latent_t = ls.t / dit_params.patch_size_t;
+    b.latent_h = ls.h / dit_params.patch_size_h;
+    b.latent_w = ls.w / dit_params.patch_size_w;
+    *out_block = b;
+  }
+  return rows;
+}
+
 std::vector<float> MiniMaxH3EncodeReferenceImages(
     const MiniMaxH3EncoderFcn3dConfig& encoder_config,
     const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
@@ -140,9 +178,15 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
     // does not have -- only its decoder is implemented. Refusing loudly beats
     // silently conditioning on nothing.
     for (const MiniMaxH3RefBlock& b : request.ref_blocks) {
-      VT_CHECK(b.kind == MiniMaxH3RefBlock::Kind::kImage,
-               "minimax_h3 ref2va: only IMAGE reference blocks are supported (audio references "
-               "need the audio-VAE encoder, which is not ported)");
+      VT_CHECK(b.kind != MiniMaxH3RefBlock::Kind::kAudio,
+               "minimax_h3 ref2va: audio reference blocks need the audio-VAE encoder, which is "
+               "not ported");
+      // A video reference is a kVideoAudio block; with ref_audio_t == 0 it
+      // contributes ZERO audio rows, i.e. a SILENT video reference, which is
+      // exactly the part we can honour without the audio encoder.
+      VT_CHECK(b.kind != MiniMaxH3RefBlock::Kind::kVideoAudio || b.ref_audio_t == 0,
+               "minimax_h3 ref2va: a video reference WITH audio needs the audio-VAE encoder, "
+               "which is not ported (use ref_audio_t = 0 for a silent video reference)");
     }
     branch.packed = BuildMiniMaxH3PackedSequenceRef2va(
         request.text_len, request.latent_t, request.latent_h, request.latent_w, request.audio_t,

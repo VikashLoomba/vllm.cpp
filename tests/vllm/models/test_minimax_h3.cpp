@@ -1787,6 +1787,74 @@ TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
                                             vt::DType::kF32));
   }
 
+  SUBCASE("ref2va VIDEO references carry a temporal extent, and stay silent") {
+    const int64_t FT = 3;  // a 3-frame reference clip
+    const std::vector<float> clip =
+        MakeParam("ref2va.clip", ecfg.in_channels * FT * IH * IW, 1.0);
+    vllm::MiniMaxH3RefBlock vb{};
+    const std::vector<float> vrows = vllm::MiniMaxH3EncodeReferenceVideo(
+        ecfg, ew, p, clip, FT, IH, IW, &vb);
+    REQUIRE(!vrows.empty());
+    CHECK(vb.kind == vllm::MiniMaxH3RefBlock::Kind::kVideoAudio);
+    // ref_audio_t 0 is what keeps it honest: no audio rows are claimed, because
+    // the audio-VAE encoder that would produce them is not ported.
+    CHECK(vb.ref_audio_t == 0);
+    CHECK(vb.latent_t >= 1);
+
+    // A video reference must occupy MORE rows than a single image one: kImage
+    // counts exactly one frame however large its latent_t, so a clip that came
+    // back as kImage would silently lose its temporal extent.
+    std::vector<vllm::MiniMaxH3RefBlock> iblocks;
+    const std::vector<float> irows =
+        vllm::MiniMaxH3EncodeReferenceImages(ecfg, ew, p, {image}, IH, IW, &iblocks);
+    REQUIRE(iblocks.size() == 1);
+    CHECK(vrows.size() > irows.size());
+
+    vllm::MiniMaxH3T2vaRequest req;
+    req.text_len = 4;
+    req.latent_t = 2;
+    req.latent_h = 4;
+    req.latent_w = 4;
+    req.audio_t = 4;
+    req.audio_channel = 2;
+    req.num_steps = 3;
+    const int64_t frame_rows = (req.latent_h / p.patch_size_h) * (req.latent_w / p.patch_size_w);
+    const std::vector<float> prompt = MakeParam("refvid.prompt", req.text_len * p.text_dim, 0.2);
+    const std::vector<float> nv =
+        MakeParam("refvid.nv", req.latent_t * frame_rows * p.video_row_width(), 0.3);
+    const std::vector<float> na =
+        MakeParam("refvid.na", req.audio_t * req.audio_channel * p.audio_latents_dim, 0.3);
+
+    const vllm::MiniMaxH3DenoiseResult plain = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, req, p, dit->views, prompt, nv, na, vt::DType::kF32);
+
+    vllm::MiniMaxH3T2vaRequest rv = req;
+    rv.ref_blocks = {vb};
+    rv.keyframe_cond_rows = vrows;
+    const vllm::MiniMaxH3DenoiseResult withvid = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, rv, p, dit->views, prompt, nv, na, vt::DType::kF32);
+    for (const float v : withvid.video_rows) REQUIRE(std::isfinite(v));
+    const size_t n = std::min(plain.video_rows.size(), withvid.video_rows.size());
+    REQUIRE(n > 0);
+    double delta = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      delta = std::max(delta,
+                       std::abs(static_cast<double>(plain.video_rows[i]) - withvid.video_rows[i]));
+    }
+    INFO("ref2va video reference moved the video rows by " << delta);
+    CHECK(delta > 1e-5);
+
+    // A video reference WITH audio must be refused, for the same reason a bare
+    // audio reference is.
+    vllm::MiniMaxH3T2vaRequest bad = req;
+    vllm::MiniMaxH3RefBlock loud = vb;
+    loud.ref_audio_t = 2;
+    bad.ref_blocks = {loud};
+    bad.keyframe_cond_rows = vrows;
+    CHECK_THROWS(vllm::MiniMaxH3DenoiseT2va(vt::Device{}, bad, p, dit->views, prompt, nv, na,
+                                            vt::DType::kF32));
+  }
+
   SUBCASE("keyframe rows reach the denoise loop and CHANGE the result") {
     vllm::MiniMaxH3T2vaRequest req;
     req.text_len = 4;

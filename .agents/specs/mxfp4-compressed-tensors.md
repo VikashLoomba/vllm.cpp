@@ -313,6 +313,27 @@ Route through the SAME families vLLM uses, mirroring the landed NVFP4 lane:
    software-emulation arm the GB10 fp4xf4 GEMM validates against, exactly as
    `EmulationNvFp4LinearKernel` is for NVFP4.
 
+### W2 code surface (our side, for the continuation) — Marlin W4A16 mxf4
+
+The dense `Qwen3ForCausalLM` (the Yi30 vehicle's arch) IS already in our engine, so
+W2 is a quant-lane extension, not a new model:
+- **Model + loader:** `src/vllm/model_executor/models/qwen3_weights.cpp`
+  `LoadQwen3ForCausalLMWeights` (dense Qwen3 text gate) + `qwen3_dense.cpp`.
+- **Scheme detection:** `src/vllm/entrypoints/model_loader.cpp` (compressed-tensors /
+  `uses_nvfp4_w4a4()` seam, `:750`) — add the `format=="mxfp4-pack-quantized"` probe
+  alongside the nvfp4-pack detection.
+- **Weight struct:** mirror `Nvfp4Weight` (`dense_nvfp4_gemm.h`) as an `Mxfp4Weight`
+  (packed `[N,K/2]` U8 + E8M0 `weight_scale` `[N,K/32]` U8, NO global). ResidentWeight
+  staging (keep-quant-device-slice rule).
+- **GEMM:** mirror `MatmulNvfp4W4A16D` (`dense_nvfp4_gemm.h:426`) +
+  `MarlinW4A16Enabled` (`:83`) as `MatmulMxfp4W4A16D`, extending the Marlin FP4 repack
+  (`src/vt/cuda/cuda_marlin_repack.cu`, `marlin_repack.h`) to consume E8M0 group-32
+  scales with no global (vLLM `apply_fp4_marlin_linear(weight_global_scale=None)`).
+- **Selection method:** `schemes/mxfp4.h` mirroring `schemes/nvfp4.h`
+  (`MakeLinearMethod`), chosen once from the checkpoint.
+- **Build:** git-archive this branch to a fresh DGX dir + CUDA build (~1-2 GiB tree,
+  fits the 31 GiB free; NOT ~21 GiB — that was a vLLM-oracle-source-tree figure).
+
 ### W3 — correctness gates
 
 - **Unit (CPU, buildable off-GPU):** extend `tests/vllm/test_mxfp4_dequant.cpp` (or a

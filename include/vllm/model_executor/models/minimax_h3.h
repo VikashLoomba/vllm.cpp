@@ -509,6 +509,13 @@ struct MiniMaxH3VideoVaeDecoderConfig {
   // token_overlap` temporal tokens at a time. Since the decoder's RoPE is
   // LENGTH-NORMALIZED over the grid it is handed, the temporal extent is part of
   // the input -- a 12-token pass gives every token a position the model never saw.
+  // Spatial tiling is a RUNTIME choice, not a checkpoint property: the wrapper
+  // reads `vae_decoder_tiling` from caller-supplied config, and neither the VAE
+  // config.json nor the source config.json carries a tiling key. Upstream's chunk
+  // loop calls `_adaptive_decode`, so tiling composes WITH temporal chunking
+  // rather than replacing it. Default ON because it is a no-op below one tile
+  // (the tiled path falls through bit-identically) and measurably better above.
+  bool decoder_tiling = true;
   int64_t clip_length = 17;   // config `clip_length`
   int64_t token_drop = 3;     // config `token_drop`
   int64_t vae_ratio_t = 4;    // prod(temporal_downsample_factors)

@@ -638,9 +638,18 @@ std::vector<float> MiniMaxH3VideoVaeDecodeTemporalDevice(
         }
       }
     }
+    // Upstream's chunk loop calls `self._adaptive_decode(clip_z)` -- so when
+    // decoder tiling is on, each TEMPORAL chunk is ALSO spatially tiled. The two
+    // compose; they are not alternatives. Tiled decode falls through to the
+    // untiled one bit-for-bit when the canvas fits in a single tile, so this is a
+    // no-op below 256 px and matches upstream's tiled mode above it.
     MiniMaxH3VideoFrameShape cs{};
     const std::vector<float> dec =
-        MiniMaxH3VideoVaeDecodeDevice(device, config, staged, sub, nt, latent_h, latent_w, &cs);
+        config.decoder_tiling
+            ? MiniMaxH3VideoVaeDecodeTiledDevice(device, config, staged, sub, nt, latent_h,
+                                                 latent_w, &cs)
+            : MiniMaxH3VideoVaeDecodeDevice(device, config, staged, sub, nt, latent_h, latent_w,
+                                            &cs);
     const int64_t dec_frames = cs.t;
 
     for (int64_t j = 0; j < (config.token_drop > 0 ? 2 : 1); ++j) {

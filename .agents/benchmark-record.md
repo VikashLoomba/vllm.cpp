@@ -12210,3 +12210,32 @@ a NAMED speed residual, NOT an optimized decode. DEFAULT: `VT_KIMI_DEVICE_COMPUT
 (near-tie != token-exact). PATH TO STRICT + speed = the named W7 residuals: device GDN per-channel
 recurrence + exp/softplus gate op + paged `mla::ForwardMlaAttentionBlock` + a bf16 residual stream
 end-to-end (matches vLLM's rounding, removes the host round-trips).
+
+## 2026-08-07T05:00 — ROW-SERVE-ASYNC-DENSE-MIRROR: classic-dense async P0 fix (code+CPU gates) + W4 MXFP4 bench PLAN
+
+CORRECTNESS (not a speed lever): the #31 async device token-ids mirror, ported to the
+classic dense family. Classic dense `Qwen3ForCausalLM` (qwen3.cpp `EmbedInto`) raced
+the async combine's device input-ids write against a stale host upload → nondeterministic
+token-0 degeneration on the depth-2 AsyncLLM serving path (surfaced by the MXFP4
+campaign; quant-independent). Fix: EmbedInto consumes `ApplyDeviceTokenIdsOverride`
+(main-queue-ordered `d.b.Copy` over the DBuf prefix) published by
+`ForwardQwen3ForCausalLM`'s `DeviceTokenIdsScope` — verbatim the 27B-dense template.
+Byte-identical when the mirror is off. Gate `test_qwen3_dense_async_serving` (Qwen3-0.6B/4B,
+async==in-process-SYNC anchor; RED on VT_ASYNC_DEVICE_MIRROR=0, GREEN default). CPU
+-Werror clean; regression suites GREEN (input_batch 183 / combine_tokens 14 / runner 323 /
+engine_core_proc 576 / async_llm 309); test_llm_engine = documented flaky (unrelated TU).
+
+OWED ON DGX (this row):
+- Async gate RED→GREEN (same binary, VT_ASYNC_DEVICE_MIRROR env-toggled) + SACRED
+  test_qwen3_paged_engine (0.6B/4B) unchanged + ignore_eos bracket + compute-sanitizer
+  memcheck on the new gate.
+- THE MXFP4 W4 BENCH (now unblocked): `tools/bench/online_gate.py` c1..c8 x3 reps, single
+  load per arm, OURS (fixed default config) vs ORACLE on Yi30/Qwen3-8B-MXFP4. Oracle arm
+  MUST set `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` (its default MXFP4 dispatch
+  crashes on sm_121). Match-or-beat is the bar; honest either way. Update the BENCHMARKS
+  MXFP4 Qwen3-8B row + quantization-matrix with the numbers.
+- p3 (open-ended story) near-tie distributional verdict against the oracle K-run set while
+  the oracle is loaded (converts the QUANT-CT-MXFP4 "3/4 token-exact, p3 diverges after
+  identical first token" into a ratified near-tie).
+Box safety: both locks (flock $HOME/gpu.lock AND /tmp/gpu), free -g >= 90, no oracle
+alongside our server, local-ai-worker stopped, tmux + done-markers, git archive not rsync.

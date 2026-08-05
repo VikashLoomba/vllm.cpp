@@ -1598,6 +1598,115 @@ __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Ti
 // The arithmetic is deliberately IDENTICAL to the general kernel — same sequential
 // key order, same online-softmax recurrence (m/corr/p/l), same f32 accumulation — so
 // this is a scheduling change, not a numerics change.
+// Q-BLOCKED warp attention: one warp carries kQ queries at once.
+//
+// The one-query-per-warp kernel re-reads every K and V row for EVERY query, so
+// global traffic is O(seq^2 * d) per head. At MiniMax-H3's default canvas that is
+// ~341 TB per step (seq 15424, 56 heads, 50 layers) against Thor's 273 GB/s, and
+// attention is ~85% of a 557 s step.
+//
+// Holding kQ queries per warp loads each K/V row ONCE and reuses it kQ times,
+// cutting that traffic by kQ.
+//
+// Deliberately uses NO SHARED MEMORY. A previous attempt staged K/V tiles in
+// shared and measured 23% SLOWER: 32 KB per block against Thor's 48 KB/block limit
+// allowed ~one block per SM and occupancy collapsed. Registers cost nothing here --
+// kQ * kPerLane accumulators plus the same for Q, which fits comfortably.
+//
+// Per-query key ranges are computed up front, so causal, sliding-window and
+// multi-request layouts all work: the mask is warp-UNIFORM for each query (j, qs,
+// qe and ii are all warp-wide), so the skip costs no divergence.
+//
+// Arithmetic is unchanged -- same sequential key order, same online-softmax
+// recurrence, same f32 accumulation -- so this is a scheduling change.
+template <typename Tin, typename Tout, int kPerLane, int kQ>
+__global__ void DFlashAttnQBlockKernel(Tout* out, const Tin* query, const Tin* key,
+                                       const Tin* value, const int32_t* cu, int num_reqs,
+                                       int64_t rows, int64_t hq, int64_t hk, int64_t d,
+                                       float scale, bool causal, int64_t window) {
+  const int lane = threadIdx.x & 31;
+  const int64_t wid =
+      (static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5)) + (threadIdx.x >> 5);
+  const int64_t i0 = wid * kQ;
+  if (i0 >= rows) return;
+  const int64_t h = blockIdx.y;
+  const int64_t g = h / (hq / hk);
+
+  float qreg[kQ][kPerLane], acc[kQ][kPerLane], m[kQ], l[kQ];
+  int64_t jlo[kQ], jhi[kQ];
+  bool act[kQ];
+  int64_t lo = rows, hi = 0;
+
+#pragma unroll
+  for (int u = 0; u < kQ; ++u) {
+    const int64_t i = i0 + u;
+    act[u] = (i < rows);
+    m[u] = -CUDART_INF_F;
+    l[u] = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) acc[u][c] = 0.0f;
+    jlo[u] = 0;
+    jhi[u] = -1;
+    if (!act[u]) continue;
+    int64_t qs = 0, qe = rows;
+    for (int r = 0; r < num_reqs; ++r) {
+      if (i >= cu[r] && i < cu[r + 1]) { qs = cu[r]; qe = cu[r + 1]; break; }
+    }
+    const int64_t ii = i - qs;
+    const int64_t rel_hi = causal ? ii : (qe - qs - 1);
+    int64_t rel_lo = 0;
+    if (causal && window > 0) rel_lo = (ii - (window - 1) > 0) ? ii - (window - 1) : 0;
+    jlo[u] = qs + rel_lo;
+    jhi[u] = qs + rel_hi;
+    lo = min(lo, jlo[u]);
+    hi = max(hi, jhi[u]);
+    const int64_t qoff = (i * hq + h) * d;
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      qreg[u][c] = Load(query, qoff + static_cast<int64_t>(c) * 32 + lane);
+    }
+  }
+  if (hi < lo) return;
+
+  for (int64_t j = lo; j <= hi; ++j) {
+    const int64_t koff = (j * hk + g) * d;
+    float kreg[kPerLane], vreg[kPerLane];
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      kreg[c] = Load(key, koff + static_cast<int64_t>(c) * 32 + lane);
+      vreg[c] = Load(value, koff + static_cast<int64_t>(c) * 32 + lane);
+    }
+#pragma unroll
+    for (int u = 0; u < kQ; ++u) {
+      if (!act[u] || j < jlo[u] || j > jhi[u]) continue;  // warp-uniform
+      float part = 0.0f;
+#pragma unroll
+      for (int c = 0; c < kPerLane; ++c) part += qreg[u][c] * kreg[c];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xFFFFFFFFu, part, off);
+      const float s = __shfl_sync(0xFFFFFFFFu, part, 0) * scale;
+      const float m_new = fmaxf(m[u], s);
+      const float corr = expf(m[u] - m_new);
+      const float pw = expf(s - m_new);
+#pragma unroll
+      for (int c = 0; c < kPerLane; ++c) acc[u][c] = acc[u][c] * corr + pw * vreg[c];
+      l[u] = l[u] * corr + pw;
+      m[u] = m_new;
+    }
+  }
+
+#pragma unroll
+  for (int u = 0; u < kQ; ++u) {
+    if (!act[u] || l[u] == 0.0f) continue;
+    const int64_t qoff = ((i0 + u) * hq + h) * d;
+    const float inv = 1.0f / l[u];
+#pragma unroll
+    for (int c = 0; c < kPerLane; ++c) {
+      Store(out, qoff + static_cast<int64_t>(c) * 32 + lane, acc[u][c] * inv);
+    }
+  }
+}
+
 template <typename Tin, typename Tout, int kPerLane>
 __global__ void DFlashBlockAttentionWarpKernel(Tout* out, const Tin* query, const Tin* key,
                                               const Tin* value, const int32_t* cu, int num_reqs,

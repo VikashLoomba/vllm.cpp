@@ -414,3 +414,116 @@ TEST_CASE("dflash-block-attn LONG non-causal matches the reference (tiled CUDA p
 
   cuda->Free(dq); cuda->Free(dk); cuda->Free(dv); cuda->Free(dout);
 }
+
+namespace {
+
+// LONG CUDA-vs-CPU parity over an arbitrary mask.
+//
+// Both LONG cases above are NON-CAUSAL SINGLE-DOCUMENT, which is the easiest mask
+// there is: every query sees exactly the same key range, so any kernel that gets
+// the range right ONCE is right for all of them. Nothing in this file previously
+// combined a long sequence with a mask that VARIES per query -- causal (jhi moves),
+// sliding-window (jlo moves too) or ragged multi-request (queries in one warp
+// belong to different documents). Those are where per-query bookkeeping and warp
+// scheduling can disagree, and where a long-sequence kernel is most likely to be
+// wrong in a way the short cases cannot see.
+//
+// These were added while evaluating the Q-blocked kernel (DFlashAttnQBlockKernel,
+// which walks the UNION of a warp's key ranges and skips per query -- exactly the
+// logic a non-causal single document cannot exercise). That kernel measured
+// NEGATIVE and is not dispatched, but the gaps these cases close are properties of
+// the OP, not of that experiment, so they stay.
+//
+// cu_seqlens must span [0,T] (vt::DFlashBlockAttention's precondition), so the
+// documents always tile the whole tensor; raggedness comes from the boundaries
+// sitting off any warp multiple.
+void RunLongParity(const char* what, int64_t T, int64_t H, int64_t D, float scale, bool causal,
+                   int64_t window, const std::vector<int32_t>& cu, uint64_t seed) {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  const int num_reqs = static_cast<int>(cu.size()) - 1;
+  std::vector<float> q(static_cast<size_t>(T * H * D));
+  std::vector<float> k(q.size()), v(q.size());
+  uint64_t x = seed;
+  auto rnd = [&]() {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return static_cast<float>((x >> 40) / 16777216.0 - 0.5);
+  };
+  for (size_t i = 0; i < q.size(); ++i) { q[i] = rnd(); k[i] = rnd(); v[i] = rnd(); }
+
+  auto mk = [&]() {
+    DFlashBlockAttentionArgs a = Args(cu.data(), num_reqs, causal, window);
+    a.scale = scale;
+    return a;
+  };
+
+  std::vector<float> want(q.size(), 0.0f);
+  {
+    Queue cq = Q();
+    Tensor qt = F32(q, {T, H, D}), kt = F32(k, {T, H, D}), vt_ = F32(v, {T, H, D});
+    Tensor ot = F32(want, {T, H, D});
+    vt::DFlashBlockAttention(cq, ot, qt, kt, vt_, mk());
+  }
+
+  Queue gq = cuda->CreateQueue();
+  auto up = [&](const std::vector<float>& hv) {
+    void* p = cuda->Alloc(hv.size() * sizeof(float));
+    cuda->Copy(gq, p, hv.data(), hv.size() * sizeof(float));
+    return p;
+  };
+  void* dq = up(q); void* dk = up(k); void* dv = up(v);
+  void* dout = cuda->Alloc(q.size() * sizeof(float));
+  Device gd = gq.device;
+  Tensor gqt = Contig(dq, DType::kF32, gd, {T, H, D});
+  Tensor gkt = Contig(dk, DType::kF32, gd, {T, H, D});
+  Tensor gvt = Contig(dv, DType::kF32, gd, {T, H, D});
+  Tensor got = Contig(dout, DType::kF32, gd, {T, H, D});
+  vt::DFlashBlockAttention(gq, got, gqt, gkt, gvt, mk());
+  cuda->Synchronize(gq);
+  std::vector<float> got_host(q.size(), 0.0f);
+  cuda->Copy(gq, got_host.data(), dout, got_host.size() * sizeof(float));
+  cuda->Synchronize(gq);
+
+  double worst = 0.0;
+  size_t worst_at = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(std::isfinite(got_host[i]));
+    const double dif = std::abs(static_cast<double>(got_host[i]) - want[i]);
+    if (dif > worst) { worst = dif; worst_at = i; }
+  }
+  INFO(what << ": long CUDA vs CPU, T=" << T << " D=" << D << " causal=" << causal
+            << " window=" << window << " max|diff|=" << worst << " at " << worst_at);
+  CHECK(worst <= 2e-5);
+  cuda->Free(dq); cuda->Free(dk); cuda->Free(dv); cuda->Free(dout);
+}
+
+}  // namespace
+
+TEST_CASE("dflash-block-attn LONG CAUSAL matches the reference") {
+  // Plain causal over one long document: adjacent queries have DIFFERENT jhi, the
+  // simplest mask that varies per query, at a length nothing else here reaches.
+  RunLongParity("long causal", /*T=*/2560, /*H=*/2, /*D=*/64, 0.125f, /*causal=*/true,
+                /*window=*/0, /*cu=*/{0, 2560}, 0x243F6A8885A308D3ULL);
+}
+
+TEST_CASE("dflash-block-attn LONG causal SLIDING WINDOW matches the reference") {
+  // window=48 moves jlo as well as jhi, so the visible range slides rather than
+  // grows. D=128 also exercises the kPerLane=4 instantiation.
+  RunLongParity("long SWA", /*T=*/2048, /*H=*/2, /*D=*/128, 0.088388f, /*causal=*/true,
+                /*window=*/48, /*cu=*/{0, 2048}, 0x13198A2E03707344ULL);
+}
+
+TEST_CASE("dflash-block-attn LONG ragged multi-request CAUSAL matches the reference") {
+  // Three documents whose boundaries (501, 1503) land off every warp multiple, so
+  // warps straddle document boundaries under both masks.
+  RunLongParity("long ragged causal", /*T=*/2185, /*H=*/2, /*D=*/64, 0.125f, /*causal=*/true,
+                /*window=*/0, /*cu=*/{0, 501, 1503, 2185}, 0xA4093822299F31D0ULL);
+  RunLongParity("long ragged non-causal", /*T=*/2185, /*H=*/2, /*D=*/64, 0.125f,
+                /*causal=*/false, /*window=*/0, /*cu=*/{0, 501, 1503, 2185},
+                0x082EFA98EC4E6C89ULL);
+}

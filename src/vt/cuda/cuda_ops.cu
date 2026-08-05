@@ -1600,13 +1600,35 @@ __global__ void DFlashBlockAttentionKernel(Tout* out, const Tin* query, const Ti
 // this is a scheduling change, not a numerics change.
 // Q-BLOCKED warp attention: one warp carries kQ queries at once.
 //
-// The one-query-per-warp kernel re-reads every K and V row for EVERY query, so
-// global traffic is O(seq^2 * d) per head. At MiniMax-H3's default canvas that is
-// ~341 TB per step (seq 15424, 56 heads, 50 layers) against Thor's 273 GB/s, and
-// attention is ~85% of a 557 s step.
+// *** MEASURED NEGATIVE ON sm_110 AND DELIBERATELY NOT DISPATCHED. Do not wire
+// *** this up again on this hardware without re-reading the numbers below.
 //
-// Holding kQ queries per warp loads each K/V row ONCE and reuses it kQ times,
-// cutting that traffic by kQ.
+// The idea: the one-query-per-warp kernel re-reads every K and V row for EVERY
+// query, so global traffic is O(seq^2 * d) per head -- ~341 TB per step at H3's
+// default canvas (seq 15424, 56 heads, 50 layers, d 64) against Thor's 273 GB/s.
+// Holding kQ queries per warp loads each K/V row ONCE and reuses it kQ times.
+//
+// It was dispatched, gated (all five DFlash/attention suites green at kQ 4 and 8,
+// with a RED proof that the kernel really produced the output) and MEASURED on the
+// real H3 denoise loop, 2 paired reps per arm, order reversed between reps:
+//
+//   864x480/124f, seq 15424:  per-query 557.80 s   kQ=4 553.14 s (-0.84%)   kQ=8 765.57 s (+37%)
+//   512x512/33f,  seq  3264:  per-query  28.04 s   kQ=4  28.98 s (+3.3%)    kQ=8  36.33 s (+30%)
+//
+// So the premise is WRONG here, and the reason is the same one that killed the
+// shared-memory tiling attempt: the K/V re-reads were never coming from HBM. One
+// head's K+V at seq 15424 is 15424*64*2*2 B = 3.9 MB against Thor's 32 MB L2, and
+// every warp on a given blockIdx.y streams the SAME rows, so the traffic this
+// kernel removes was already L2-resident and nearly free. What it does NOT remove
+// is the per-key warp-shuffle reduction -- it still performs kQ of them per K row
+// loaded, i.e. exactly as many in total as before. It only adds cost: registers go
+// 64 -> 108 (kQ 4 -> 8) at kPerLane 2, which cuts occupancy, and the kQ online-
+// softmax updates per key form a serial expf dependency chain, which is why kQ=8
+// is far worse than kQ=4 rather than twice as good.
+//
+// Kept as source (it compiles to nothing while uninstantiated) because the
+// conclusion is HARDWARE-SPECIFIC: on a part with a small L2 relative to one head's
+// K/V the arithmetic could flip. Full disposition in docs/BENCHMARKS.md.
 //
 // Deliberately uses NO SHARED MEMORY. A previous attempt staged K/V tiles in
 // shared and measured 23% SLOWER: 32 KB per block against Thor's 48 KB/block limit

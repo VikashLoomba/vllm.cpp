@@ -47,6 +47,41 @@ namespace vllm {
 // `noise_aug` blends toward the supplied noise (1.0 pins the frame exactly). Noise
 // is an INPUT for the same reason it is in the t2va path: reproducing upstream's RNG
 // decides WHICH sample you get, not whether the pipeline is right.
+std::vector<float> MiniMaxH3EncodeReferenceImages(
+    const MiniMaxH3EncoderFcn3dConfig& encoder_config,
+    const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
+    const std::vector<std::vector<float>>& images, int64_t image_h, int64_t image_w,
+    std::vector<MiniMaxH3RefBlock>* out_blocks) {
+  VT_CHECK(!images.empty(), "minimax_h3 ref2va: no reference images supplied");
+  std::vector<float> rows;
+  if (out_blocks != nullptr) out_blocks->clear();
+  for (const std::vector<float>& img : images) {
+    VT_CHECK(static_cast<int64_t>(img.size()) == encoder_config.in_channels * image_h * image_w,
+             "minimax_h3 ref2va: reference image is not [in_channels, H, W]");
+    MiniMaxH3EncoderFcn3dConfig cfg = encoder_config;
+    cfg.t = 1;
+    cfg.h = image_h;
+    cfg.w = image_w;
+    MiniMaxH3VideoFrameShape ls{};
+    const std::vector<float> latent =
+        MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, img, &ls);
+    const std::vector<float> patched = MiniMaxH3PatchifyVideoLatent(
+        latent, /*batch=*/1, dit_params.latents_dim, ls.t, ls.h, ls.w, dit_params.patch_size_t,
+        dit_params.patch_size_h, dit_params.patch_size_w);
+    rows.insert(rows.end(), patched.begin(), patched.end());
+    if (out_blocks != nullptr) {
+      // The block declares the PATCHED grid, which is what occupies packed rows.
+      MiniMaxH3RefBlock b;
+      b.kind = MiniMaxH3RefBlock::Kind::kImage;
+      b.latent_t = ls.t / dit_params.patch_size_t;
+      b.latent_h = ls.h / dit_params.patch_size_h;
+      b.latent_w = ls.w / dit_params.patch_size_w;
+      out_blocks->push_back(b);
+    }
+  }
+  return rows;
+}
+
 std::vector<float> MiniMaxH3EncodeKeyframeCondRows(
     const MiniMaxH3EncoderFcn3dConfig& encoder_config, const MiniMaxH3AudioVaeWeights& encoder_weights,
     const MiniMaxH3DitParams& dit_params, const std::vector<std::vector<float>>& images,
@@ -96,11 +131,28 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
   // switched on, so t2va is just the empty-keyframe case rather than a separate
   // path -- upstream models it the same way (packed_sequence.py:116-239).
   const bool has_keyframes = !request.keyframe_frame_indices.empty();
+  const bool has_refs = !request.ref_blocks.empty();
+  VT_CHECK(!(has_keyframes && has_refs),
+           "minimax_h3: keyframe (fl2va) and reference (ref2va) conditioning are exclusive");
   MiniMaxH3DenoiseBranch branch;
-  branch.packed = BuildMiniMaxH3PackedSequence(
-      request.text_len, request.latent_t, request.latent_h, request.latent_w, request.audio_t,
-      request.audio_channel, has_keyframes, request.keyframe_frame_indices,
-      has_keyframes ? request.num_frames : 0);
+  if (has_refs) {
+    // AUDIO-bearing reference blocks need the audio VAE's ENCODER, which this port
+    // does not have -- only its decoder is implemented. Refusing loudly beats
+    // silently conditioning on nothing.
+    for (const MiniMaxH3RefBlock& b : request.ref_blocks) {
+      VT_CHECK(b.kind == MiniMaxH3RefBlock::Kind::kImage,
+               "minimax_h3 ref2va: only IMAGE reference blocks are supported (audio references "
+               "need the audio-VAE encoder, which is not ported)");
+    }
+    branch.packed = BuildMiniMaxH3PackedSequenceRef2va(
+        request.text_len, request.latent_t, request.latent_h, request.latent_w, request.audio_t,
+        request.ref_blocks, request.audio_channel);
+  } else {
+    branch.packed = BuildMiniMaxH3PackedSequence(
+        request.text_len, request.latent_t, request.latent_h, request.latent_w, request.audio_t,
+        request.audio_channel, has_keyframes, request.keyframe_frame_indices,
+        has_keyframes ? request.num_frames : 0);
+  }
   branch.text_embeddings = prompt_embeds;
   branch.token_tags = branch.packed.token_tags;
 
@@ -122,7 +174,7 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
   const int64_t num_img = static_cast<int64_t>(branch.packed.img_pos.size());
   std::vector<float> video_rows = initial_video_rows;
   if (static_cast<int64_t>(video_rows.size()) != num_img * video_width) {
-    VT_CHECK(has_keyframes,
+    VT_CHECK(has_keyframes || has_refs,
              "minimax_h3 t2va: initial video rows do not match the packed layout");
     std::vector<float> full(static_cast<size_t>(num_img * video_width), 0.0f);
     int64_t src = 0;

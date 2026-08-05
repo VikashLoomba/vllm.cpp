@@ -1245,6 +1245,13 @@ struct MiniMaxH3T2vaRequest {
   // Condition-noise augmentation: out = aug*clean + (1-aug)*noise. 1.0 pins the
   // keyframe exactly; upstream lowers it to let the model deviate.
   double imgvid_noise_aug = 1.0;
+
+  // --- ref2va REFERENCE BLOCKS (empty => no references) ---
+  // Mutually exclusive with keyframe_frame_indices: fl2va pins frames of the
+  // OUTPUT, ref2va prepends whole reference blocks. When non-empty the packed
+  // layout is built by BuildMiniMaxH3PackedSequenceRef2va and the visual rows come
+  // from the same pinned-condition mechanism keyframes use.
+  std::vector<MiniMaxH3RefBlock> ref_blocks;
   double video_shift = kMiniMaxH3DefaultVideoShift;
   double audio_shift = kMiniMaxH3DefaultAudioShift;
   // Per-channel latent statistics from each VAE's config.json; empty skips the
@@ -1319,6 +1326,18 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
 // packed conditioning rows the denoise loop pins. Each image is encoded as a
 // one-frame causal clip, then patchified with the DiT's patch volume so the rows
 // are interchangeable with the video rows the loop carries.
+// Encode REFERENCE IMAGES for ref2va: the same VAE encode + patchify as keyframes,
+// but it also reports the per-image latent geometry, because a ref2va block must
+// declare the shape it occupies in the packed layout.
+//
+// Returns the packed condition rows; `out_blocks` receives one kImage block per
+// image, in the same order.
+std::vector<float> MiniMaxH3EncodeReferenceImages(
+    const MiniMaxH3EncoderFcn3dConfig& encoder_config,
+    const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
+    const std::vector<std::vector<float>>& images, int64_t image_h, int64_t image_w,
+    std::vector<MiniMaxH3RefBlock>* out_blocks);
+
 std::vector<float> MiniMaxH3EncodeKeyframeCondRows(
     const MiniMaxH3EncoderFcn3dConfig& encoder_config,
     const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,

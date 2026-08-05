@@ -150,6 +150,7 @@ int main(int argc, char** argv) {
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   std::string first_frame_path, last_frame_path;
+  std::vector<std::string> ref_image_paths;
   double imgvid_noise_aug = 1.0;
   int64_t encoder_max_layers = 0;
   int64_t steps = 0, frames = 0, height = 0, width = 0;
@@ -178,6 +179,7 @@ int main(int argc, char** argv) {
       else if (f == "--save-embeds") save_embeds_path = Need(argc, argv, ++i, f);
       else if (f == "--first-frame") first_frame_path = Need(argc, argv, ++i, f);
       else if (f == "--last-frame") last_frame_path = Need(argc, argv, ++i, f);
+      else if (f == "--ref-image") ref_image_paths.push_back(Need(argc, argv, ++i, f));
       else if (f == "--noise-aug") imgvid_noise_aug = std::stod(Need(argc, argv, ++i, f));
       else if (f == "--encoder-max-layers") encoder_max_layers = std::stoll(Need(argc, argv, ++i, f));
       else if (f == "--steps") steps = std::stoll(Need(argc, argv, ++i, f));
@@ -203,7 +205,8 @@ int main(int argc, char** argv) {
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
                    "[--dry-run] [--denoise-only] [--dump-params] "
-                   "[--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A]\n";
+                   "[--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A] "
+                   "[--ref-image f.ppm ...]\n";
       return 2;
     }
 
@@ -410,6 +413,35 @@ int main(int argc, char** argv) {
     request.video_latents_std = video_stats.std_dev;
     request.audio_latents_mean = audio_stats.mean;
     request.audio_latents_std = audio_stats.std_dev;
+
+    // --- ref2va REFERENCES: whole reference images prepended to the sequence,
+    // as opposed to fl2va which pins frames OF THE OUTPUT. Mutually exclusive.
+    if (!ref_image_paths.empty()) {
+      VT_CHECK(first_frame_path.empty() && last_frame_path.empty(),
+               "minimax-h3-gen: --ref-image (ref2va) and --first/--last-frame (fl2va) are exclusive");
+      VT_CHECK(!video_vae_path.empty(), "minimax-h3-gen: --ref-image needs --video-vae");
+      const vllm::SafetensorsFile vf = vllm::SafetensorsFile::Open(video_vae_path);
+      const vllm::MiniMaxH3AudioVaeWeights enc_w = vllm::LoadMiniMaxH3VideoVaeEncoderWeights(vf);
+      vllm::MiniMaxH3EncoderFcn3dConfig enc_cfg;
+      enc_cfg.z_channels = 2 * dit.params.latents_dim;
+
+      std::vector<std::vector<float>> imgs;
+      int64_t ih = 0, iw = 0;
+      for (const std::string& rp : ref_image_paths) {
+        int64_t h2 = 0, w2 = 0;
+        std::cerr << "loading reference image " << rp << "\n";
+        imgs.push_back(ReadPpmAsChw(rp, &h2, &w2));
+        if (ih == 0) { ih = h2; iw = w2; }
+        VT_CHECK(h2 == ih && w2 == iw,
+                 "minimax-h3-gen: every --ref-image must have the same size");
+      }
+      std::vector<vllm::MiniMaxH3RefBlock> blocks;
+      request.keyframe_cond_rows = vllm::MiniMaxH3EncodeReferenceImages(
+          enc_cfg, enc_w, dit.params, imgs, ih, iw, &blocks);
+      request.ref_blocks = blocks;
+      std::cerr << "  ref2va: " << blocks.size() << " reference image(s) at " << iw << "x" << ih
+                << "\n";
+    }
 
     // --- fl2va KEYFRAMES: encode the supplied frame(s) into pinned conditioning.
     // Upstream allows exactly {0}, {-1} or {0, -1}: first, last, or both.

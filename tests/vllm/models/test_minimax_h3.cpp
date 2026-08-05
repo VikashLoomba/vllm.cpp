@@ -1724,6 +1724,69 @@ TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
     for (const float v : a1) REQUIRE(std::isfinite(v));
   }
 
+  SUBCASE("ref2va IMAGE references are wired, and audio references are REFUSED") {
+    vllm::MiniMaxH3T2vaRequest req;
+    req.text_len = 4;
+    req.latent_t = 2;
+    req.latent_h = 4;
+    req.latent_w = 4;
+    req.audio_t = 4;
+    req.audio_channel = 2;
+    req.num_steps = 3;
+
+    std::vector<vllm::MiniMaxH3RefBlock> blocks;
+    const std::vector<float> ref_rows = vllm::MiniMaxH3EncodeReferenceImages(
+        ecfg, ew, p, {image}, IH, IW, &blocks);
+    REQUIRE(blocks.size() == 1);
+    CHECK(blocks[0].kind == vllm::MiniMaxH3RefBlock::Kind::kImage);
+    CHECK(blocks[0].latent_t >= 1);
+    REQUIRE(!ref_rows.empty());
+
+    const int64_t frame_rows = (req.latent_h / p.patch_size_h) * (req.latent_w / p.patch_size_w);
+    const std::vector<float> prompt = MakeParam("ref2va.prompt", req.text_len * p.text_dim, 0.2);
+    const std::vector<float> nv =
+        MakeParam("ref2va.nv", req.latent_t * frame_rows * p.video_row_width(), 0.3);
+    const std::vector<float> na =
+        MakeParam("ref2va.na", req.audio_t * req.audio_channel * p.audio_latents_dim, 0.3);
+
+    const vllm::MiniMaxH3DenoiseResult plain = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, req, p, dit->views, prompt, nv, na, vt::DType::kF32);
+
+    vllm::MiniMaxH3T2vaRequest r2 = req;
+    r2.ref_blocks = blocks;
+    r2.keyframe_cond_rows = ref_rows;  // the same pinned-condition mechanism
+    const vllm::MiniMaxH3DenoiseResult withref = vllm::MiniMaxH3DenoiseT2va(
+        vt::Device{}, r2, p, dit->views, prompt, nv, na, vt::DType::kF32);
+    for (const float v : withref.video_rows) REQUIRE(std::isfinite(v));
+
+    const size_t n = std::min(plain.video_rows.size(), withref.video_rows.size());
+    REQUIRE(n > 0);
+    double delta = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      delta = std::max(delta,
+                       std::abs(static_cast<double>(plain.video_rows[i]) - withref.video_rows[i]));
+    }
+    INFO("ref2va image reference moved the video rows by " << delta);
+    CHECK(delta > 1e-5);
+
+    // An AUDIO reference must be REFUSED, not silently conditioned on nothing:
+    // the audio VAE's encoder is not ported, so there is no way to honour it.
+    vllm::MiniMaxH3T2vaRequest bad = req;
+    vllm::MiniMaxH3RefBlock ab;
+    ab.kind = vllm::MiniMaxH3RefBlock::Kind::kAudio;
+    ab.ref_audio_t = 2;
+    bad.ref_blocks = {ab};
+    CHECK_THROWS(vllm::MiniMaxH3DenoiseT2va(vt::Device{}, bad, p, dit->views, prompt, nv, na,
+                                            vt::DType::kF32));
+
+    // fl2va and ref2va are mutually exclusive and must say so.
+    vllm::MiniMaxH3T2vaRequest both = req;
+    both.ref_blocks = blocks;
+    both.keyframe_frame_indices = {0};
+    CHECK_THROWS(vllm::MiniMaxH3DenoiseT2va(vt::Device{}, both, p, dit->views, prompt, nv, na,
+                                            vt::DType::kF32));
+  }
+
   SUBCASE("keyframe rows reach the denoise loop and CHANGE the result") {
     vllm::MiniMaxH3T2vaRequest req;
     req.text_len = 4;

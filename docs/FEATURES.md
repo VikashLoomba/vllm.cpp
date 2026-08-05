@@ -175,7 +175,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | §8 golden CAPTURED (STRICT); bf16-resident brick pool-math+design DONE (§13); impl pending | 12/12·614 GREEN on GB10; §8 golden captured (8/8 STRICT, committed). Full-model e2e needs bf16-resident loader/forward: DESIGNED §13, pool math ~94 GiB / ~25 GiB headroom CLOSES; impl pending |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | §8 golden STRICT; bf16-resident loader/forward IMPLEMENTED + CPU-gated (§13); GB10 e2e pending | 13/13·656 GREEN (f32 12/12·614 unchanged + bf16-vs-f32 tiny gate); §8 golden 8/8 STRICT. bf16-resident loader/forward LANDED §13 (`GemmBf16` cast-act); dgx CUDA build + full-model e2e pending |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |

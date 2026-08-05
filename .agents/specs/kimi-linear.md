@@ -679,6 +679,35 @@ device gate (bf16 forward == f32 reference within a bf16 tolerance). dgx CUDA bu
 flags, nm GDN). Full-model e2e vs the STRICT golden (`=1` arm), free -g ≥ 90 before load,
 memory-monitored; if the pool math does not close in practice, STOP and record.
 
+### IMPLEMENTATION LANDED — loader/forward + CPU bf16 gate (2026-08-06, `row/MODEL-KIMI-LINEAR-BF16`)
+The §13 design is now implemented (`file:line`):
+- **bf16 loader** `LoadKimiLinearResidentBf16Weights` + `StageKimiResidentBf16` + `BuildKimiResidentFromHost`
+  (`kimi_linear_weights.cpp`): every large matmul weight (embed/lm_head/all *_proj/all MLP
+  gate/up/down/router gate) via `dense_loaders::LoadBf16Direct` -> `OwnedTensor`, then (on a CUDA
+  queue) staged to `d_dev` (cudaMalloc + one H2D) and `ReleaseHost`'d immediately after its copy so
+  the LOAD peak holds only one tensor's host bytes; the tiny norm/scale/conv/bias vectors decoded
+  to host f32 (`ReadFloatVec`, dtype-agnostic — checkpoint has only `dt_bias`/`A_log` in F32, the
+  rest BF16). NEVER `MaterializeHost` (183 GiB f32). Real checkpoint = 20 shards, 91.5 GiB bf16,
+  tie_word_embeddings=false, 20 KDA + 7 NoPE-MLA layers, 256 experts.
+- **Resident weights** `KimiLinearResidentWeights` (`kimi_linear.h`) mirroring `laguna_weights.cpp`
+  over `OwnedTensor::d_dev`; the router gate is bf16-resident too (matches vLLM's bf16 router — a
+  f32 gate could flip near-tie top-8 expert selections; the primary token-divergence risk).
+- **Device forward** bf16 variants `DeviceForwardBodyBf16` / `Kda|Mla|MoeBlock|DenseMlp|SwiGlu
+  DeviceBf16` (`kimi_linear_device.cpp`): the Laguna cast-GEMM `GemmBf16` (CastBf16 act -> bf16 scratch,
+  MatmulBT (bf16,bf16)->f32 vs `ResidentBf16W` — vLLM's projection numerics) at each of the ~20 GEMM
+  sites; f32 residual stream; the two host-fallback islands (`KdaRecurrenceIsland`, `MlaSoftmaxIsland`)
+  EXTRACTED and shared with the f32 path (byte-identical), small vectors via `WF32`.
+- **Runner** `ForwardDevice` drops the `host.materialized` precondition on the resident path and
+  routes to `ForwardDeviceCompute`, which dispatches bf16 (`weights.resident.resident`) vs f32.
+- **e2e harness** `examples/kimi_linear_gen/main.cpp`: context-first GB10 load recipe + shard-release,
+  greedy-decode the 8-prompt golden battery x 16 tokens through the bf16 `ForwardDeviceCompute`,
+  token-compare to `greedy_ids.npy`.
+
+**CPU gate GREEN:** `test_kimi_linear_forward` **13/13·656** — the original 12/12·614 (f32 tiny path
+UNTOUCHED, incl. the extracted islands) + NEW case (k) `BuildKimiResidentFromHost` bf16-resident
+`ForwardDeviceCompute` == the independent f32 host reference within a bf16 envelope (rtol 6e-2 + atol
+scaled to |logit|). PENDING: the dgx CUDA build + the full-model GB10 e2e vs the STRICT golden.
+
 ---
 
 ## Structured contract (machine-readable — mirrors deepseek-v4-flash.md)

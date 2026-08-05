@@ -36308,3 +36308,37 @@ no code landed beyond records, nothing broken. Row STAYS `ACTIVE`. Next: impleme
 this branch, keep `test_kimi_linear_forward` 12/12·614 green, then the full-model e2e
 (free -g >= 90, monitor, STOP if the pool math does not close in practice).
 
+## MODEL-TEXT-kimi-linear: bf16-resident loader/forward IMPLEMENTED + CPU-gated (§13); dgx CUDA build + full-model e2e PENDING
+<!-- state: 2026-08-07T01:30 -->
+
+Executed §13 on `row/MODEL-KIMI-LINEAR-BF16` (base `e28ace81`). LANDED (file:line):
+`LoadKimiLinearResidentBf16Weights` + `StageKimiResidentBf16` + `BuildKimiResidentFromHost`
+(`kimi_linear_weights.cpp`) — large matmul weights via `dense_loaders::LoadBf16Direct` ->
+`OwnedTensor`, per-tensor stage-to-`d_dev` (cudaMalloc + one H2D) then `ReleaseHost` so the LOAD
+peak holds ONE tensor's host bytes; tiny norm/scale/conv/bias vectors decoded to host f32
+(`ReadFloatVec`, dtype-agnostic). Real checkpoint verified on dgx: 20 shards, 91.5 GiB bf16,
+tie_word_embeddings=false, ONLY `dt_bias`/`A_log` are F32 (the rest BF16 incl. conv1d + router
+gate + e_score_bias). `KimiLinearResidentWeights` struct + `resident` member on
+`KimiLinearWeights` (`kimi_linear.h`). bf16 device forward `DeviceForwardBodyBf16` +
+`Kda|Mla|MoeBlock|DenseMlp|SwiGluDeviceBf16` with the Laguna cast-GEMM `GemmBf16`
+(`vt::CastBf16` f32-act->bf16 then `vt::MatmulBT` (bf16,bf16)->f32 vs `ResidentBf16W`) at each of
+the ~20 GEMM sites; f32 residual stream; the two host-fallback islands (`KdaRecurrenceIsland`,
+`MlaSoftmaxIsland`) EXTRACTED and SHARED with the f32 path (byte-identical, so the f32 12/12
+stays exact). Router gate made bf16-resident (matches vLLM's bf16 router — a f32 gate could flip
+near-tie top-8 selections; the primary token-divergence risk). `ForwardDevice` drops the
+`host.materialized` precondition on the resident path; `ForwardDeviceCompute` dispatches
+bf16-vs-f32 on `resident.resident`. e2e harness `examples/kimi_linear_gen/main.cpp`
+(context-first + shard-release, greedy the 8-prompt golden battery x16 vs `greedy_ids.npy`).
+
+CPU GATE GREEN: `test_kimi_linear_forward` **13/13·656** = the original 12/12·614 (f32 path
+UNTOUCHED, incl. the extracted islands) + NEW case (k) bf16-resident `ForwardDeviceCompute` ==
+the independent f32 host reference within a bf16 envelope (rtol 6e-2 + atol scaled to |logit|).
+All 3 changed TUs + the harness compile `-Werror` clean; full CPU lib + test + harness build+link
+green (worktree `build-cpu`, on `mudler-ubuntu-box`).
+
+PENDING (this row, on dgx.casa GB10 — checkpoint CACHED 92G, 89 GiB free RAM, no GPU process):
+(1) CUDA build `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`
+(nm GDN check), (2) `test_kimi_linear_forward` on CUDA, (3) full-model e2e via `kimi-linear-gen`
+vs the STRICT golden (free -g >= 90 before load, memory-monitored; STOP + record if the pool math
+diverges toward the limit). Row STAYS `ACTIVE`; `VT_KIMI_DEVICE_COMPUTE` default STAYS OFF until
+the e2e token gate is green.

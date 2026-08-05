@@ -305,7 +305,7 @@ built on it rather than keeping the flattering one.
 | DFlash speculative decode | Below vLLM throughput | bf16 acceptance floor ~0.85x |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
-| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | §8 golden CAPTURED (STRICT, 8/8); bf16-resident brick pool-math+design DONE (§13); impl pending | §8 golden captured GB10 (8/8 DETERMINISTIC K=3, STRICT), committed. bf16-resident loader/forward DESIGNED §13: bf16 OwnedTensor d_dev (91.5 GiB) + cast-act GEMM; pool math ~94 GiB CLOSES; impl pending |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | §8 golden STRICT 8/8; bf16-resident loader/forward IMPLEMENTED + CPU-gated (§13); GB10 e2e pending | §8 golden 8/8 STRICT committed. bf16-resident loader/forward LANDED §13 (`GemmBf16` cast-act, `d_dev` 91.5 GiB); CPU 13/13·656; dgx CUDA build + full-model e2e vs STRICT golden pending (detail: spec §13) |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |

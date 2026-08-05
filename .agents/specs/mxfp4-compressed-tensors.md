@@ -6,7 +6,16 @@ brick landed; the GPU W4A4 fp4 GEMM is a named later brick).
 
 **Base:** current `main` HEAD `42c56b51` (isolated worktree, CPU-only, foreground,
 NOT pushed). **Pinned oracle:** `${VLLM_SOURCE}` = `/home/mudler/_git/vllm` @
-`5559679229bc961848b121ccdeaa8fa5d79bec98` (vLLM 0.26.0.dev0).
+`5559679229bc961848b121ccdeaa8fa5d79bec98` (vLLM 0.26.0.dev0). **Runnable oracle
+on-box** = `~/venvs/vllm-oracle -> vllm-oracle-v0.25.0-stage` (vLLM **0.25.0**,
+compressed_tensors 0.17.0). The 0.25.0 tree is the one W0-W5 gate against; its
+mxfp4 dispatch is byte-for-byte the same shape as the 0.26 pin (verified below).
+
+> **W0-W5 UPDATE (2026-08-05, USER-priority "full MXFP4 at vLLM parity,
+> benchmarked on a Qwen model", branch `row/QUANT-CT-MXFP4`).** DeepSeek/Kimi are
+> NOT the vehicle (won't fit / not the target); **Qwen dense is**. This block
+> re-scopes W2-W5 around a real on-box Qwen MXFP4 checkpoint and pins the parity
+> target from the RUNNING oracle. See "## W0-W5 (Qwen vehicle) — 2026-08-05".
 
 **Why now:** shared unblocker. Both **DeepSeek-V4-Flash** (W6 MegaMoE MXFP4
 experts) and **Kimi-K3** (its real 2.8T checkpoint is `mxfp4-pack-quantized`)
@@ -163,4 +172,147 @@ the NVFP4 `weight_scale_2` bf16 round.
 - **No on-box e2e yet** — the two owning checkpoints are huge (Kimi-K3 2.8T does not
   fit one GB10; DeepSeek-V4-Flash NVFP4/fp8 need multi-Spark). The dequant brick is
   gateable at unit scale today; the e2e stays derive-and-ship until a fitting MXFP4
-  vehicle runs (RECORDED, mirrors both model specs).
+  vehicle runs (RECORDED, mirrors both model specs). **SUPERSEDED for the e2e vehicle
+  by the Qwen dense path below (2026-08-05): a small dense Qwen3-8B MXFP4 checkpoint
+  fits GB10 and the oracle registers its arch, so the e2e gate is now reachable
+  independently of DeepSeek/Kimi.**
+
+---
+
+## W0-W5 (Qwen vehicle) — 2026-08-05
+
+USER re-scope: **full MXFP4 support at vLLM parity, benchmarked on a Qwen model.**
+Qwen dense is the vehicle (DeepSeek/Kimi explicitly out — fit/target). This section
+pins the parity target from the RUNNING 0.25.0 oracle and lays the W2-W5 contract.
+Empirical (RUN/BUILD/BENCH) steps are GPU-gated and may lag the spec (box shared;
+locks + disk contended); the design + oracle-support proofs below are not.
+
+### W0 — checkpoint gateability
+
+**Vehicle: `Yi30/Qwen3-8B-MXFP4`** (HF). The clean dense W0 vehicle.
+- `config.json`: `architectures=["Qwen3ForCausalLM"]` (dense — the best-supported
+  Qwen family, NOT the new hybrid `Qwen3_5ForConditionalGeneration`),
+  `quant_method="compressed-tensors"`, `format="mxfp4-pack-quantized"`,
+  `group_size=32`, `ignore=["lm_head"]`. **`input_activations` is SET**
+  (`dynamic=true`, `num_bits=4`, `type=float`, `group_size=32`) → this is a **true
+  W4A4** checkpoint (weights AND activations MXFP4), which selects the W4A4 GEMM on
+  GB10 (see W1). Weights: 4-bit float, group 32, symmetric.
+- Size: 2 shards, **6.18 GB** safetensors total; complete tokenizer +
+  `generation_config` + chat template. Fits GB10 trivially (~6 GiB weights).
+- **Oracle-support PROVED at the import/registry layer (0.25.0, on dgx):**
+  `ModelRegistry.get_supported_archs()` contains `Qwen3ForCausalLM`; and
+  `from ...schemes.compressed_tensors_w4a4_mxfp4 import CompressedTensorsW4A4Mxfp4`
+  imports clean. **Oracle-RUN proof (greedy golden) is GPU-gated — QUEUED.**
+- Alternatives surveyed: `Yi30/Qwen3-8B-MXFP4-LLMC` (same, produced by
+  llm-compressor — the mechanical-repro arm), `Yi30/Qwen3-8B-MXFP4-FP8KV[-FP8Attn]`
+  (adds fp8 KV/attn — extra axes, avoid for the clean gate);
+  `olka-fi/Qwen3.5-27B-MXFP4` (genuine `mxfp4-pack-quantized` but **weight-only**,
+  `input_activations=null`, arch `Qwen3_5ForConditionalGeneration` — the new hybrid;
+  a valid W4A16 secondary vehicle but a harder arch); `OsaurusAI/Qwen3.6-27B-MXFP4`
+  = MLX mode (`{group_size,bits,mode:mxfp4}`), NOT compressed-tensors — rejected.
+- **`llm-compressor` is NOT installed** in the oracle venv (self-quantize is a
+  fallback only if no checkpoint runs; not needed — a runnable checkpoint exists).
+
+### W1 — the kernel the oracle ACTUALLY runs (parity target)
+
+Traced in the **0.25.0 site-packages** (the runnable oracle), `file:line`:
+- `compressed_tensors/schemes/compressed_tensors_w4a4_mxfp4.py`
+  `CompressedTensorsW4A4Mxfp4.__init__` → `self.kernel =
+  init_mxfp4_linear_kernel()` (`model_executor/kernels/linear/__init__.py:804`).
+- `_POSSIBLE_MXFP4_KERNELS[CUDA] = [FlashInferMxFp4LinearKernel,
+  MarlinMxFp4LinearKernel, HummingMxFp4LinearKernel]` (`__init__.py:462-466`).
+  `init_mxfp4_linear_kernel` returns the **first** whose `is_supported()` is True.
+- `FlashInferMxFp4LinearKernel.is_supported` (`mxfp4/flashinfer.py:22-28`):
+  `current_platform.has_device_capability(100) and has_flashinfer_cutedsl()`.
+  **On GB10 both are True** (device cap `(12,1)`; `has_flashinfer_cutedsl()`
+  returns **True** on-box — verified via import). So **the FlashInfer W4A4 kernel
+  is selected FIRST; Marlin is never reached.**
+- **Parity target = true W4A4 fp4xfp4 GEMM via FlashInfer CUTLASS cute-dsl**
+  (`mxfp4/flashinfer.py:apply_weights`): `flashinfer_mxfp4_quantize(x)` quantizes
+  the activation to mxf4, then `flashinfer_scaled_fp4_mm(x_fp4, weight, x_scale,
+  weight_scale, backend="cute-dsl", block_size=32, use_nvfp4=False)`. Weight scale
+  is swizzled + N padded to mult-of-128 in `process_weights_after_loading`
+  (`swizzle_mxfp4_scales`).
+- **This overrides the row's earlier "Marlin W4A16 fallback" hypothesis for THIS
+  box.** Marlin `MxFp4` (`mxfp4/marlin.py`, `weight_global_scale=None`) is the
+  **non-Blackwell / cute-dsl-absent** fallback only. Per mirror policy the W4A4
+  path is our target on GB10; the W4A16 Marlin path stays the documented fallback
+  for sm_80..sm_89 and cute-dsl-absent boxes.
+- **Runtime confirmation (QUEUED, GPU-gated):** the oracle logs
+  `"Using FlashInferMxFp4LinearKernel for MXFP4 GEMM"` (`__init__.py` `logger.info_once`)
+  — grep it in the W0 run; and same-tool nsys to name the cute-dsl GEMM kernel.
+- Env overrides that would change the pick (record for the A/B): `--linear-backend`
+  != auto (filters the kernel list) and `VLLM_DISABLED_KERNELS` (can disable
+  FlashInfer to force Marlin — the exact lever to A/B the two arms on one box).
+
+### W2 — native keep-quant compute route (design)
+
+Target = W4A4 mxf4xf4 (GB10) with the Marlin W4A16 mxf4 fallback documented.
+Route through the SAME families vLLM uses, mirroring the landed NVFP4 lane:
+
+1. **Reuse the NVFP4 cutlass fp4 tensor-core GEMM** (`src/vt/cuda/
+   cuda_matmul_nvfp4_cutlass.cu` + `nvfp4_cutlass_tactics*`). mxf4 differs from
+   nvf4 only in the block-scale FORMAT: group **32** (not 16), **E8M0** scale bytes
+   (not fp8-e4m3), and **no global scale**. CUTLASS block-scaled fp4 supports both
+   (`ScaleVectorSize`/`SFVecSize` 16 vs 32, UE8M0 vs UE4M3 SF dtype) — this is
+   exactly flashinfer's `use_nvfp4=False, block_size=32`. mxf4 warp
+   `mma.sync ...mxf4nvf4` is consumer-Blackwell (sm_121) available (see
+   `no-fa2`/Thor state notes: mxf4 tensor cores are consumer-Blackwell-only, which
+   GB10 IS). New: a `vt::MatmulMxfp4Fp4` op (or an `mxf4` mode flag on the nvfp4
+   op) + a mxf4 activation-quant emitter (per-token per-32-group amax → E8M0 scale
+   → E2M1 pack), mirroring vLLM `flashinfer_mxfp4_quantize`.
+2. **Scheme-selection method mirroring `schemes/nvfp4.h`**: add `schemes/mxfp4.h`
+   with `Mxfp4W4A4LinearMethod` (+ a `Mxfp4W4A16` arm for the Marlin/weight-only
+   fallback) and a `MakeLinearMethod` factory chosen ONCE from the checkpoint (the
+   loader probes `weight_packed` + the `mxfp4-pack-quantized` format string), NOT a
+   per-call tensor-name probe. Honors the three MUST-route seams
+   (LinearMethod/QuantizationConfig policy split, `vt::` op registry gate, shared
+   decode runner). Weight staging: MXFP4 packed bytes are a DEVICE-GEMM operand →
+   route through `ResidentWeight` (the keep-quant-device-slice rule: a raw host-byte
+   view is all-zeros on GB10).
+3. **Loader probe**: recognize `format=="mxfp4-pack-quantized"` and the
+   `input_activations` presence to distinguish W4A4 (both) vs weight-only W4A16, and
+   populate an `Mxfp4Weight` (packed `[N,K/2]` U8 + E8M0 `weight_scale` `[N,K/32]`
+   U8, no global). Reuse the `Nvfp4Weight`/`OwnedTensor` residency plumbing.
+4. **CPU reference (the gate truth, extends W1 dequant):** add
+   `compressed_tensors/mxfp4_emulation.{h,cpp}` mirroring `nvfp4_emulation.*` but
+   SIMPLER (no global scales): `RefScaledMxfp4Quant` (activation → mxf4: per-token
+   per-32-group amax, E8M0 block scale `2^(floor(log2(amax/6))+127)` clamped, E2M1
+   cast+pack), and `RunMxfp4Emulation` (dequant weight via existing
+   `DequantMxfp4ToF32` + activation round-trip + f32 matmul). This is the
+   software-emulation arm the GB10 fp4xf4 GEMM validates against, exactly as
+   `EmulationNvFp4LinearKernel` is for NVFP4.
+
+### W3 — correctness gates
+
+- **Unit (CPU, buildable off-GPU):** extend `tests/vllm/test_mxfp4_dequant.cpp` (or a
+  sibling `test_mxfp4_emulation.cpp`) with the activation-quant + emulated-W4A4
+  round-trip vs a double-precision reference; the E8M0-vs-fp8, group-32-vs-16, and
+  no-global RED traps carried over. Mirror NVFP4's emulation gate.
+- **GPU unit (RED-first):** the `vt::MatmulMxfp4Fp4` GEMM vs the CPU emulation
+  reference (near-exact), INCLUDING the **M=1 decode mis-route RED trap** (the
+  recorded nvfp4 M=1 class — a new fp4 GEMM path can silently mis-route at batch 1).
+- **e2e SACRED greedy golden** vs the oracle on `Yi30/Qwen3-8B-MXFP4`. vLLM's own
+  greedy on a dense small model may be bf16-non-deterministic → use the ratified
+  DISTRIBUTIONAL gate (ours in vLLM's K-run set) if strict token-exact does not
+  hold; verify a bigger dense model strict where feasible.
+
+### W4 — benchmark (Qwen, the binding bar)
+
+`tools/bench/online_gate.py` ours-vs-oracle on `Yi30/Qwen3-8B-MXFP4`, SAME
+checkpoint both arms, c1..c8 (>=), 3 reps, single load per arm, idle box, GPU lock
+held. Match-or-beat is the bar; record honestly. Note the A/B lever:
+`VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` forces the oracle onto Marlin
+W4A16 for a second reference point (W4A4 vs W4A16 on one box).
+
+### Empirical status (2026-08-05) — GPU/disk-gated, QUEUED
+
+W0-run, W1-runtime-confirm, W2-build, W3-gates, W4-bench all need the GB10
+exclusively. At spec time the box was contended: `gpu.lock`+`/tmp/gpu` HELD
+(Option-A `test_qwen36_async_serving`), and a Kimi-Linear-48B `hf download` (91.5G)
+was actively shrinking free disk (98G -> 86G), so a 6.2G checkpoint pull would risk
+the 15G headroom floor. Per box-safety these WAIT (never break locks, never breach
+disk). Resume order: (1) `hf download Yi30/Qwen3-8B-MXFP4` when disk >= ~15G free;
+(2) greedy golden + grep the FlashInfer log line (W0+W1 empirical); (3) build the
+W2 route + gates; (4) bench. Design + oracle-support proofs above are NOT gated and
+stand now.

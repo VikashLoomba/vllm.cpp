@@ -377,12 +377,28 @@ W4A16 for a second reference point (W4A4 vs W4A16 on one box).
   and the fp4 dequant (`dequant_skip_flop=false` bias path) is a faithful lift, so
   the residual is inside the group_blocks=2 Marlin GEMM interaction — a path our
   prior NVFP4-only usage (group_blocks=1) never exercised.
-- **W3 — the next debugging step + gate:** a DEVICE unit test of `MatmulMxfp4W4A16D`
-  vs the independent CPU dequant reference (`DequantMxfp4ToF32` + f32 matmul) at
-  **M=1 AND M=8** (RED-first). It isolates the GEMM error from the model and is the
-  W3 unit gate the plan calls for; run it before the e2e re-gate.
+- **W3 unit gate — GREEN (`test_ops_moe_grouped.cpp`, commit `8469e333`).** The MXFP4
+  Marlin GEMM (`MoeGroupedGemmNvfp4Marlin`, mxfp4 args) vs the INDEPENDENT CPU dequant
+  reference (`DequantMxfp4ToF32` + f32 matmul) at K=256,N=128: **max_rel 3.8e-3** at
+  M=1 AND M=8 — pure bf16 rounding, NOT a systematic error. **PROVES the MXFP4
+  keep-quant compute (repack, E8M0 scale processing, group_blocks=2 dispatch,
+  launcher) is correct.** So the e2e degeneration (`7068dca6`) is **NOT the GEMM**.
+- **e2e residual localization (as of `e28130ee`) — every MXFP4 component verified
+  correct; the bug is NOT in the compute or the loader byte interpretation:**
+  - scale permute byte-exact vs vLLM at ALL model shapes (N=6144/12288, K=12288);
+  - GEMM unit gate 0.38% at M=1/M=8 (N=128);
+  - loader dequant of the REAL layer-0 q_proj = sane+correct weights (min -0.5, max
+    0.5, mean|.| 0.02; scales 2^-8..2^-7), shapes match, U8-scale discriminator works;
+  - model dispatch (`IsNvfp4()` = `!qkv_proj_fp4.Empty()`) routes MXFP4 correctly;
+  - dense `Qwen3ForCausalLM` + NVFP4-W4A16 are known token-exact e2e (model-matrix).
+  Remaining suspects, in order: (1) **the group_blocks=2 kernel at LARGE N/K** — the
+  unit gate only ran N=128; the extended shapes ({4096,4096},{4096,12288},{12288,4096})
+  are committed RUN-PENDING (`e28130ee`); (2) a model-integration subtlety (per-layer
+  activation diff vs the oracle to find the first divergent op). NEXT: run the extended
+  unit gate; if RED at a model shape → large-shape kernel fix; if GREEN → per-layer
+  activation dump vs oracle.
 - **W4 NOT REACHED** — bench (`online_gate.py` c1..c8x3, oracle arm MUST set
-  `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`) is owed once W3 is green.
+  `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`) is owed once the e2e is green.
 - Build recipe (reproducible): git-archive branch to `~/work/mxfp4-w2`, `cmake -B
   build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_CUDA=ON
   -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DVLLM_CPP_MARLIN=ON -DVLLM_CPP_TRITON=OFF

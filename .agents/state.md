@@ -36296,3 +36296,30 @@ exercised. W3 e2e RED (honest). NEXT: device unit gate MatmulMxfp4W4A16D vs the 
 dequant reference at M=1 AND M=8 (RED-first) to pinpoint; then re-gate e2e, then W4 bench.
 Box left clean (locks released, tmux killed, GPU idle, disk 27G). Build tree persists at
 dgx:~/work/mxfp4-w2 for the continuation.
+
+## QUANT-CT-MXFP4 W3 unit gate GREEN: MXFP4 GEMM PROVEN correct; e2e residual is NOT the compute
+
+<!-- state: 2026-08-07T01:00 -->
+
+Built + ran the owed W3 device unit gate (`test_ops_moe_grouped.cpp`, commit `8469e333`):
+MXFP4 Marlin GEMM vs the INDEPENDENT CPU dequant reference (`DequantMxfp4ToF32` + f32
+matmul), single-expert dense routing, M=1 AND M=8. GREEN — max_rel 3.8e-3 (pure bf16
+rounding). This PROVES the MXFP4 keep-quant compute (repack, E8M0 scale processing,
+group_blocks=2 kernel dispatch, launcher) is correct, so the e2e degeneration
+(`7068dca6`) is NOT the GEMM.
+
+Exhaustive component verification (all GREEN, none is the bug): scale permute byte-exact
+vs vLLM's mxfp4_marlin_process_scales at ALL model shapes (N=6144/12288, K=12288, CPU
+check); GEMM unit gate 0.38% M=1/M=8; loader dequant of the REAL layer-0 q_proj gives
+sane+correct weights (min -0.5/max 0.5/mean 0.02, scales 2^-8..2^-7) with matching
+shapes + working U8-scale discriminator; model dispatch (`IsNvfp4()`=`!fp4.Empty()`)
+routes MXFP4 correctly; graph-off == graph-on (not graph-safety); dense Qwen3 +
+NVFP4-W4A16 are known token-exact e2e. So the e2e residual is NOT the compute NOR the
+loader byte interpretation. PRIME SUSPECT: the group_blocks=2 kernel at LARGE N/K (unit
+gate only ran N=128) — extended shape cases ({4096,4096},{4096,12288},{12288,4096})
+committed RUN-PENDING (`e28130ee`); else a model-integration subtlety needing a
+per-layer activation diff vs the oracle. NEXT: run the extended unit gate (box was taken
+by the Kimi bf16 agent — locks HELD, WAITED, did not intrude); RED at a model shape =>
+large-shape kernel fix; GREEN => per-layer activation dump. Then re-gate e2e + W4 bench.
+Box left as found (Kimi holds the locks; my tmux sessions killed; build tree persists at
+dgx:~/work/mxfp4-w2).

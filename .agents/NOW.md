@@ -19,9 +19,8 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate models & on-framework dense unaffected (bf16-out, e2e-verified) | Re-verify deepseek_v4 bf16 tower same-tool |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **§8 golden CAPTURED, STRICT** (`row/MODEL-KIMI-LINEAR-E2E`): 8/8 deterministic K=3, committed; device compute GPU-verified 12/12·614 (§12) | full our-engine e2e **f32-loader-blocked** (~183 GiB > 119 pool), needs bf16 residency; default OFF |
-| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE lever **RESOLVED NEGATIVE** (attribution boundary, drain A/B, sum invariant); probe kept, lever reverted | Real levers: prefill glue (task #61) + Option A (H2D out of capture) |
-| Async decode: mirror fix MERGED (#31); slot double-buffer (`VT_ASYNC_EXECUTOR`) landed gated **OFF** | Ring+reuse-event replaces the depth-2 drain; proven correct (async gate 5/5 @c32, SACRED 3/3, capture-malloc fixed); RED unreproducible, speed neutral in a host-bound regime | Option A follow-up; binding-harness A/B owed |
+| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **§8 golden CAPTURED, STRICT** (#37 GPU-verify + `row/MODEL-KIMI-LINEAR-E2E`): 8/8 deterministic K=3, committed; device compute 12/12·614 both arms | full our-engine e2e **f32-loader-blocked** (~183 GiB > 119 pool): bf16-resident loader is THE brick; default OFF |
+| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`

@@ -177,6 +177,10 @@ class EngineCoreProc : public EngineCore {
                  StructuredOutputManager* structured_output_manager = nullptr,
                  int max_concurrent_batches = 1, int shutdown_timeout_s = 0);
 
+  // Clears the runner's intake-drain hook (VT_INTAKE_DRAIN experiment) so it can
+  // never outlive this object's queues. No-op unless the ctor gate installed it.
+  ~EngineCoreProc();
+
   // The IO queue split (core.py:915-916). Public exactly like the upstream
   // attributes: the in-proc client shares them directly (no socket relay).
   BlockingQueue<EngineCoreInputItem> input_queue;
@@ -201,6 +205,16 @@ class EngineCoreProc : public EngineCore {
   // Runs on the dedicated engine thread; returns (instead of raising
   // SystemExit) when shutdown completes.
   void run_busy_loop();
+
+  // drain_input_queue_opportunistic (VT_INTAKE_DRAIN experiment): admit every
+  // request currently on the input queue (the same non-blocking drain-all the
+  // tail of _process_input_queue runs), callable mid-step by the runner's
+  // intake-drain hook while it waits out the prior async forward. Runs on the
+  // engine thread (the runner's execute_model is called from process_engine_step
+  // on this very thread), so it shares no state concurrently; the admitted
+  // requests enter the waiting queue for the NEXT schedule() — byte-identical to
+  // admitting them at the next top-of-loop drain (see runner.cpp for the proof).
+  void drain_input_queue_opportunistic();
 
   // _send_engine_dead (core.py:1470-1480): put the ENGINE_CORE_DEAD sentinel
   // on the output queue so a blocked get_output() learns the engine died.

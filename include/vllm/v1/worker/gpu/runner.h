@@ -79,6 +79,7 @@
 #include "vllm/v1/worker/gpu/input_batch.h"
 #include "vllm/v1/worker/gpu/model_runner_base.h"
 #include "vllm/v1/worker/gpu/prepare_inputs.h"
+#include "vt/backend.h"  // vt::Event (VT_INTAKE_DRAIN poll event)
 #include "vt/device.h"
 #include "vt/tensor.h"
 
@@ -429,6 +430,13 @@ class GPUModelRunner final : public ModelRunnerBase {
   // sample so the sync path allocates no extra stream; destroyed in the dtor.
   // id == 0 marks "not created". The copy runs OUTSIDE any CUDA-graph capture.
   vt::Queue async_copy_queue_{};
+  // Persistent completion event for the VT_INTAKE_DRAIN experiment
+  // (SERVE-INTAKE-CADENCE): when intake_drain_hook_ is set, execute_model records
+  // this on the main queue and polls QueryEvent (instead of a blocking
+  // Synchronize) so it can invoke the drain hook during the GPU wait. handle ==
+  // nullptr marks "not created"; created lazily on first use, destroyed in the
+  // dtor. Only touched on the hook path (default production path never records).
+  vt::Event intake_poll_event_{};
   // Lazily create + return the async-output copy queue on the runner's device.
   vt::Queue& get_or_create_async_copy_queue();
   // Persistent pool of the per-step overlap resources (device sampled-id buffer +

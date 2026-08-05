@@ -33,8 +33,10 @@
 //     init / profiling / LoRA / pooling RPC methods on WorkerBase.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 
 #include "vllm/v1/core/sched/output.h"           // SchedulerOutput
 #include "vllm/v1/engine/types.h"                 // ModelRunnerOutput
@@ -100,6 +102,21 @@ class ModelRunnerBase {
   virtual std::optional<DraftTokenIds> take_draft_token_ids() {
     return std::nullopt;
   }
+
+  // Optional idle-drain hook (VT_INTAKE_DRAIN experiment; SERVE-INTAKE-CADENCE).
+  // When set, a runner busy-waiting for the prior async forward invokes it while
+  // it polls for completion, so requests that arrived DURING the in-flight step
+  // are admitted to the scheduler's waiting queue during the GPU wait instead of
+  // only at the next busy-loop drain. Default null => the runner blocks with a
+  // plain Synchronize (byte-identical production path). Set by EngineCoreProc's
+  // ctor only when the env gate is on; cleared in EngineCoreProc's dtor. This is
+  // a diagnostic lever the SERVE-INTAKE-CADENCE A/B toggles, not a shipped path.
+  void set_intake_drain_hook(std::function<void()> hook) {
+    intake_drain_hook_ = std::move(hook);
+  }
+
+ protected:
+  std::function<void()> intake_drain_hook_;
 };
 
 }  // namespace vllm::v1

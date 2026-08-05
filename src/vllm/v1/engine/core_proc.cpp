@@ -36,6 +36,38 @@ EngineCoreProc::EngineCoreProc(Scheduler& scheduler, Executor& executor,
   // step_with_batch_queue.
   step_fn_ = (batch_queue_size_ > 1) ? &EngineCore::step_with_batch_queue
                                      : &EngineCore::step;
+
+  // VT_INTAKE_DRAIN experiment (SERVE-INTAKE-CADENCE): install a hook that lets
+  // the runner admit newly-arrived requests DURING the in-flight-forward wait
+  // (the recorded 35B INTAKE deficit is requests arriving in a burst during a
+  // long prefill step and waiting the whole step for the once-per-iteration
+  // drain). Only meaningful on the async batch-queue path (> 1), where the runner
+  // busy-waits the prior forward. Default OFF => byte-identical production path
+  // (the runner keeps its plain Synchronize). Env read once.
+  static const bool kIntakeDrain = std::getenv("VT_INTAKE_DRAIN") != nullptr;
+  if (kIntakeDrain && batch_queue_size_ > 1) {
+    executor_.set_intake_drain_hook([this] { drain_input_queue_opportunistic(); });
+  }
+}
+
+EngineCoreProc::~EngineCoreProc() {
+  // Detach the intake-drain hook before our queues die: the runner (reached via
+  // executor_) outlives this object, and a stale hook capturing `this` must never
+  // be invoked. No-op when the ctor gate never installed one.
+  executor_.set_intake_drain_hook(nullptr);
+}
+
+void EngineCoreProc::drain_input_queue_opportunistic() {
+  // VT_INTAKE_DRAIN: the non-blocking drain-all tail of process_input_queue,
+  // callable mid-step. handle_client_request admits ADDs to the waiting queue
+  // (and processes aborts) exactly as the top-of-loop drain does while a forward
+  // is in flight. Same thread as the busy loop, so no concurrent scheduler
+  // access. loop_trace_ accounting (if VT_LOOP_TRACE is also on) is handled
+  // inside handle_client_request, keeping the residence attribution consistent.
+  EngineCoreInputItem item;
+  while (input_queue.try_get(item)) {
+    handle_client_request(item);
+  }
 }
 
 bool EngineCoreProc::has_work() const {

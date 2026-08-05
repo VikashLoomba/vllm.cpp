@@ -28,8 +28,10 @@
 // to the runner; Task 3 consumes it).
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 
 #include "vllm/v1/core/sched/output.h"             // SchedulerOutput
 #include "vllm/v1/engine/types.h"                  // ModelRunnerOutput
@@ -71,6 +73,16 @@ class Executor {
   // runner_supports_async: pass-through to the runner's compat advertisement,
   // consumed by the engine wiring's SchedulerConfig::ResolveAsyncScheduling.
   bool runner_supports_async() const { return runner_.runner_supports_async(); }
+
+  // set_intake_drain_hook: pass-through to the runner's optional idle-drain hook
+  // (VT_INTAKE_DRAIN experiment; SERVE-INTAKE-CADENCE). No mirror in upstream's
+  // async Executor — there the engine thread is already free during the forward
+  // (execute_model returns a Future); this hook approximates that opportunistic
+  // input draining on our synchronous-runner path. Off unless the ctor gate sets
+  // it; the default path never calls the runner with a hook.
+  void set_intake_drain_hook(std::function<void()> hook) {
+    runner_.set_intake_drain_hook(std::move(hook));
+  }
 
   // take_draft_token_ids: pass-through to the runner's out-of-band drafter output
   // (abstract.py take_draft_token_ids -> collective_rpc). nullopt on the default

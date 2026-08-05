@@ -280,6 +280,15 @@ TEST_CASE("dflash-block-attn CUDA matches CPU across the 5 semantic corners") {
   RunCudaParity(17, 8, 2, 32, 0.3f, /*causal=*/true, /*window=*/4, {0, 17}, 4444);
   // (5) GQA extreme (8 q-heads share 1 kv-head) + ragged multi-block causal.
   RunCudaParity(20, 8, 1, 16, 0.35f, /*causal=*/true, /*window=*/2048, {0, 6, 20}, 5555);
+  // (6) head_dim 96 -- MiniMax-H3's PRODUCTION shape (hidden 5376 / 56 heads), and
+  // the only head_dim that is a whole number of warp widths but NOT a power of two.
+  // Nothing in this file covered it before, so the CUDA fast path's head_dim/32 == 3
+  // instantiation shipped UNEXERCISED while the suite reported green -- and it is
+  // precisely the instantiation whose per-lane element partition differs from the
+  // 64/128 ones (strided rather than contiguous-vector, to keep loads coalesced).
+  RunCudaParity(17, 8, 2, 96, std::pow(96.0f, -0.5f), /*causal=*/false, 0, {0, 17}, 6666);
+  RunCudaParity(20, 8, 2, 96, std::pow(96.0f, -0.5f), /*causal=*/true, /*window=*/6,
+                {0, 6, 20}, 7777);
 }
 
 // The LONG non-causal single-document case, which is the only shape that reaches
@@ -516,6 +525,17 @@ TEST_CASE("dflash-block-attn LONG causal SLIDING WINDOW matches the reference") 
   // grows. D=128 also exercises the kPerLane=4 instantiation.
   RunLongParity("long SWA", /*T=*/2048, /*H=*/2, /*D=*/128, 0.088388f, /*causal=*/true,
                 /*window=*/48, /*cu=*/{0, 2048}, 0x13198A2E03707344ULL);
+}
+
+TEST_CASE("dflash-block-attn LONG head_dim 96 matches the reference (H3 production shape)") {
+  // The real canvas runs head_dim 96 over thousands of keys. The short case above
+  // proves the mask bookkeeping; this one proves the long-sequence CHUNKING at the
+  // head_dim the model actually uses, in both masks.
+  RunLongParity("long d96 non-causal", /*T=*/2560, /*H=*/2, /*D=*/96, 0.102062f,
+                /*causal=*/false, /*window=*/0, /*cu=*/{0, 2560}, 0xBE5466CF34E90C6CULL);
+  RunLongParity("long d96 ragged causal", /*T=*/2185, /*H=*/2, /*D=*/96, 0.102062f,
+                /*causal=*/true, /*window=*/0, /*cu=*/{0, 501, 1503, 2185},
+                0xC0AC29B7C97C50DDULL);
 }
 
 TEST_CASE("dflash-block-attn LONG ragged multi-request CAUSAL matches the reference") {

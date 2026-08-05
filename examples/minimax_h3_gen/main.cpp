@@ -672,8 +672,17 @@ int main(int argc, char** argv) {
       const double elapsed =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       const int64_t seq = static_cast<int64_t>(request.text_len) + video_rows + audio_rows;
-      std::cout << "denoise-only: seq=" << seq << " steps=" << request.num_steps << " total="
-                << elapsed << " s  per_step=" << (elapsed / double(request.num_steps)) << " s\n";
+      // A flow-matching schedule of N sigmas runs N-1 DiT FORWARDS (each step maps
+      // sigma[i] -> sigma[i+1]), which is exactly what the `[h3] step i/N-1` trace
+      // prints. Dividing the elapsed time by `num_steps` therefore UNDER-reports the
+      // per-forward cost by N/(N-1) -- 1.5x at the 3-step setting used for kernel
+      // A/Bs, which is large enough to make two measurements look like a regression.
+      // Report the per-FORWARD cost, which is what the trace and any kernel
+      // comparison are denominated in.
+      const int64_t forwards = request.num_steps > 1 ? request.num_steps - 1 : 1;
+      std::cout << "denoise-only: seq=" << seq << " steps=" << request.num_steps
+                << " forwards=" << forwards << " total=" << elapsed
+                << " s  per_forward=" << (elapsed / double(forwards)) << " s\n";
       // Touch the result so the loop cannot be optimized away, and so an all-NaN
       // forward shows up here instead of passing as a fast run.
       double checksum = 0.0;

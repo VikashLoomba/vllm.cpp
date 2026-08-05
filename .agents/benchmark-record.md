@@ -12239,3 +12239,29 @@ OWED ON DGX (this row):
   identical first token" into a ratified near-tie).
 Box safety: both locks (flock $HOME/gpu.lock AND /tmp/gpu), free -g >= 90, no oracle
 alongside our server, local-ai-worker stopped, tmux + done-markers, git archive not rsync.
+
+## 2026-08-07T07:00 — ROW-SERVE-ASYNC-DENSE-MIRROR dgx GB10 verification (f9c969ae)
+
+CUDA build (/dev/shm, 121a, cutlass 4.5.0, nvcc 13.0, Release). Both flock locks per run,
+tmux + done-markers, free-g 98-100 GiB. CORRECTNESS (this row is a correctness fix, not a
+speed lever):
+- ASYNC GATE (same binary, env-toggled): 0.6B + 4B GREEN (default) 41/41 async==sync;
+  0.6B + 4B RED (VT_ASYNC_DEVICE_MIRROR=0) FAIL 3 CHECKs — concurrency requests degenerate
+  into "...the Germany is!!!!!!" token-0 garbage. P0 reproduced + fixed on real HW.
+- SACRED test_qwen3_paged_engine 0.6B+4B 184/184, 16/16 prompts each, 0 forward-divergent
+  (byte-neutral sync path).
+- compute-sanitizer memcheck on 0.6B async GREEN: 0 errors.
+- MXFP4 Yi30/Qwen3-8B-MXFP4 DEFAULT-config (async ON + fix) vllm-cli greedy 48 tok: p0/p1/p3
+  TOKEN-EXACT vs golden, p2 story coherent near-tie; VT_ASYNC_DEVICE_MIRROR=0 same binary
+  DEGENERATES (" Paris. What I I I What... !!!!!!") = the W3 async-default degeneration, CLOSED.
+- p3/p2 NEAR-TIE RATIFIED: oracle (VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel, ninja+nvcc
+  on PATH) re-reproduces the golden; story greedy K=8 singleton; teacher-forcing the oracle on
+  OUR sequence => our token is the oracle argmax at EVERY position (max gap 0.0000 nats). The
+  free-run " wise old man" vs our " young girl" is the oracle's own prefill-vs-decode tie.
+
+W4 THROUGHPUT BENCH NOT DONE (harness gap, honest): online_gate.py MODEL_REVISIONS carries
+only "27"/"35"; no Yi30/8B key. Retargeting = MODEL_REVISIONS/REPOSITORIES entry + corpus
+(make_serve_low_corpus) + record-oracle (needs an 8B paged_engine test binary) + num-blocks/
+max-num-seqs sizing. The fix unblocks the DEFAULT-config bench (no more VT_ASYNC_SCHED=0
+workaround); oracle proven to run the model today. Evidence: dgx:/dev/shm/serve-async-dense/
+{gates_06b.log,gates2.log,mxfp4_e2e.log,oracle_neartie2.log,oracle_tf.log}.

@@ -36629,3 +36629,52 @@ bench — tools/bench/online_gate.py c1..c8 x3, single load/arm, ours vs oracle 
 Yi30/Qwen3-8B-MXFP4, oracle arm VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel;
 (3) the p3 near-tie distributional verdict (oracle K-run set) while the oracle is
 loaded. Branch `row/SERVE-ASYNC-DENSE-MIRROR`.
+
+## ROW-SERVE-ASYNC-DENSE-MIRROR: dgx GB10 verification — async gate RED→GREEN (0.6B+4B) + SACRED no-regression + memcheck + MXFP4 default-config e2e + p3 near-tie RATIFIED
+<!-- state: 2026-08-07T07:00 -->
+
+Ran the full dgx GB10 campaign for `f9c969ae` (git-archive → /dev/shm build, CUDA
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`, Release, nvcc 13.0; both flock locks
+held per run, tmux + done-markers, free-g 98-100 GiB throughout, local-ai-worker
+parked). All correctness proofs GREEN.
+
+ASYNC GATE RED→GREEN (same binary, `VT_ASYNC_DEVICE_MIRROR` env-toggled):
+- 0.6B GREEN (default) 41/41 — every async batch-1 rep + concurrent request reproduces
+  the SYNC anchor (" capital of Italy is Rome. ... Beijing. The capital of Japan").
+- 0.6B RED (`=0`) FAILURE, 3 CHECKs — concurrency requests degenerate into
+  " capital of Italy the Germany is!!!!!!!!!!" (token-0 garbage). P0 reproduced.
+- 4B GREEN 41/41; 4B RED FAILURE 3 CHECKs. Both models.
+
+SACRED NO-REGRESSION: `test_qwen3_paged_engine` 0.6B+4B 184/184, 16/16 prompts each
+(11/16 strict + 5/16 near-tie, max gap 0.125/0.25 nats, 0 forward-divergent) — my
+change is byte-neutral on the sync path (the mirror override is null there), confirmed.
+
+MEMCHECK: compute-sanitizer memcheck on the 0.6B async gate GREEN arm = ERROR SUMMARY
+0 errors, 41/41 assertions under the sanitizer.
+
+MXFP4 Yi30/Qwen3-8B-MXFP4 (a classic dense `Qwen3ForCausalLM`) DEFAULT-config e2e
+(vllm-cli, async ON + fix, greedy 48 tok): p0 " Paris. What is the capital of Italy?...",
+p1 " 4. Q: What is 3+3? A: 6...", p3 fibonacci = TOKEN-EXACT vs golden; p2 story
+coherent " there lived a young girl named Lily..." (near-tie). Same binary with
+`VT_ASYNC_DEVICE_MIRROR=0` DEGENERATES (" Paris. What I I I What What ... !!!!!!") —
+exactly the QUANT-CT-MXFP4 W3 async-default degeneration, now CLOSED by the fix.
+
+p3/p2 NEAR-TIE RATIFIED (oracle, `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
++ ninja/nvcc on PATH — the DGX non-interactive quirk): oracle re-reproduces the 4-prompt
+golden today (Marlin W4A16); its story greedy is deterministic (K=8 singleton
+" there was a wise old man"). Teacher-forcing the oracle on OUR story sequence: our
+token is the oracle's OWN argmax at EVERY continuation position (max gap 0.0000 nats,
+no divergence in the 0.5-nat band) — the free-run divergence is the oracle contradicting
+itself at a genuine bf16 tie (prefill-vs-decode), the documented near-tie regime. VERDICT
+NEAR-TIE-RATIFIED.
+
+RESIDUAL (owed): the W4 THROUGHPUT bench (online_gate.py c1..c8x3 ours vs oracle) is
+NOT done — `online_gate.py` MODEL_REVISIONS only carries the "27"/"35" NVFP4 gate-model
+keys; the fingerprinted harness (`dgx-online-serving.sh`, per-model corpora +
+`record-oracle` via a paged_engine test binary) has no Yi30/8B entry. Retargeting needs
+a MODEL_REVISIONS/REPOSITORIES entry + corpus generation + oracle recording + sizing.
+The fix UNBLOCKS the default-config number (the async-default degeneration no longer
+forces `VT_ASYNC_SCHED=0`); the oracle is proven to run the model today. Plus the
+sibling scope one-liner (InternLM2/Mistral/Llama). dgx build tree persists at
+`dgx:/dev/shm/serve-async-dense`.

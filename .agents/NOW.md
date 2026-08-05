@@ -20,7 +20,7 @@ Working head: `origin/main`.
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
 | Protocol substrate repair | BENCHMARKS.md converted to scoreboard (landed); STATUS.md budget + record-era roll still open | Items below |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W7 device COMPUTE landed, CPU-gated** (`CLAIM-KIMI-LINEAR-W7`, `ACTIVE`): DBuf-resident `ForwardDeviceCompute` (2 host islands: KDA recurrence, NoPE-MLA softmax); `test_kimi_linear_forward` **12/12·614**; opt-in `VT_KIMI_DEVICE_COMPUTE=1` | GPU-verify: CUDA build, token-exact vs oracle, e2e §8 |
-| 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, TTFT 0.93-0.98x, c1 closed, c16 0.93x. c16 drain-sync lever **A/B'd NEGATIVE 2026-08-06** (blocking-event −1.9%; drain KEPT). Cost = depth-2 serialization, not the drain (see state) | Real lever = GPU-resident sampled tokens (W4 `VT_ASYNC_DEVICE_MIRROR` on integrated); then TTFT |
+| 35B fresh grid | **BOUND** @`1ea26427`. TTFT growing-deficit **ATTRIBUTED** (`row/BENCH-35B-TTFT`, not pushed): serving **INTAKE** (async engine-core admission) +34..103ms growing 20x c2→c32, plus ~flat prefill glue +82..92ms (task #61); scheduler queue+kernels at parity, both async. state+benchmark-record | Levers: mirror vLLM input-drain cadence; prefill fusion; async /metrics logger |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -47,18 +47,13 @@ comparisons — the Laguna "ceiling" was a cross-tool artifact, twice).
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
-5. **Protocol substrate — partly done.** Claim triage DONE (54 rows out of
-   `ACTIVE`, 29 claims retired); `docs/STATUS.md` now under a shrink-only
-   ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING: (a) anchor
-   backfill, 98 rows still `SPIKE`/`ACTIVE` (backend 36, engine 26, kernel 16,
-   model 16, quant 4) because every honest destination needs code/test anchors
-   they lack — root cause is that the lifecycle has no zero-cost parking state
-   for a landed-but-unowned row; 6 model rows need a DECISION, not an anchor
-   (architecture unregistered). (b) The record-era rollover is BLOCKED:
-   `check-agent-record.py` binds `DONE` rows to exact LINE anchors in
-   `parity-ledger.md` (43 references), so freezing it invalidates the evidence
-   graph — re-anchor by ledger ROW ID first. `state.md` and
-   `benchmark-record.md` have no line anchors and can roll now.
+5. **Protocol substrate — partly done.** Claim triage DONE; `docs/STATUS.md`
+   under shrink-only ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING:
+   (a) anchor backfill, 98 rows `SPIKE`/`ACTIVE` (no zero-cost parking state; 6
+   model rows need a DECISION, arch unregistered); (b) record-era rollover
+   BLOCKED — `check-agent-record.py` binds `DONE` to `parity-ledger.md` LINE
+   anchors (43 refs); re-anchor by ledger ROW ID first (`state.md`/
+   `benchmark-record.md` have no line anchors, can roll now).
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED

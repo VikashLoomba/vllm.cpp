@@ -35791,7 +35791,6 @@ including CI, and that is a separate switch with a separate blast radius.
 
 No source, kernel, model, gate, benchmark or capability mark changed.
 
-
 ## 35B c16 drain-sync lever A/B: blocking-event drain NEGATIVE (−1.9%), full drain KEPT; real fix = GPU-resident sampled tokens
 <!-- state: 2026-08-06T01:00 -->
 
@@ -36000,7 +35999,6 @@ interaction; (3) then decide the mirror default on correctness; (4) c16 speed st
 needs drain-removal + double-buffer. Evidence
 `dgx:~/work/mirror-ab/{mab-measure.log,mab-tokdiag.log,mab-prodcheck.log,evidence/raw/35/ours/c16-r{1,2,3}-abmirr{off,on}.json,greedy/*}`.
 
-
 ## ROW-SERVE-ASYNC-LLM P0 RESOLVED: root-caused the async batch-1 token-0 degeneration, added the missing async-serving token-exact gate (RED-first), flipped the device mirror default ON
 <!-- state: 2026-08-06T14:00 -->
 
@@ -36066,6 +36064,21 @@ asyncgate-SACRED-default.log,mab-defmeasure.log,mab-asyncmemcheck.log,
 evidence/raw/35/ours/c16-r{1,2,3}-{defaulton,rollback0}.json}`. Commit on
 `row/SERVE-ASYNC-LLM`.
 
+## Qwen3.5-4B upstream revalidation is a local null; binding ratio 0.9971x
+<!-- state: 2026-08-06T14:00 -->
+
+Measurement date 2026-08-05. Branch `fix/minja-gcc15-werror-20260803` merged
+the four new `upstream/main` commits through `59674cf1d` as `312af21a9`, then
+rebuilt and completed an uncontended 18-leg Qwen3.5-4B comparison against the
+pinned vLLM oracle. Ours is 6611.207 tok/s, 0.999971x its previous run; vLLM is
+6630.481 tok/s, 1.000890x its previous run. The strict binding ratio is 0.9971x
+and remains speed-pending. TTFT 0.7719x and host PSS 0.3127x pass; TPOT/ITL
+1.1244x and VRAM 1.0014x remain open. Direct ON/OFF output is 128/128 identical
+in all reps and unchanged from history. Fresh node-level nsys traces contain
+graph child kernels on both arms. Evidence:
+`docs/bench-evidence/qwen35-4b-upstream-20260805.md`; raw root
+`/tmp/qwen35-upstream-312af21a9`.
+
 ## SERVE-ASYNC-EXECUTOR: decode-graph slot double-buffer (Option B) landed gated default-OFF; ring PROVEN correct; hazard-C real-by-construction but empirical RED unreproducible on GB10
 <!-- state: 2026-08-06T18:30 -->
 
@@ -36121,3 +36134,4 @@ device-staged H2D, vLLM states.py:64) is the faithful follow-up; the eager
 `exec_state_` 2-deep ring was not needed (drain-on-eager retained). Evidence
 `dgx:~/work/mirror-ab/serve-async-executor/{gate2*.log,speed3*,diag*}`, commit
 `fa971248` on `row/SERVE-ASYNC-EXECUTOR`.
+

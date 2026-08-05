@@ -1978,6 +1978,54 @@ TEST_CASE("minimax_h3: the encoder text tower matches upstream, with all three H
 // The load-bearing assertion is that conditioning CHANGES THE RESULT. A wiring
 // that accepted the rows and ignored them would produce perfectly finite,
 // correctly shaped output and pass every structural check.
+// The video VAE works in IMAGENET-NORMALIZED pixel space, and the conversions sit
+// OUTSIDE ViT3DDecoder -- so the decoder's own 1.19e-07 gate never covered them,
+// exactly like post_quant_conv before it. Omitting the output step feeds
+// ImageNet-normalized values to a writer that expects [-1, 1]: it casts colour (the
+// per-channel means differ) and compresses the dynamic range ~4.4x (std ~0.22),
+// which is what "dark and washed out" looks like.
+TEST_CASE("minimax_h3: ImageNet pixel de/normalization matches upstream's wrapper") {
+  const int64_t n = 5;
+  // Round trip: normalize then de-normalize must return the original, for values
+  // that stay inside the [0,1] clamp.
+  std::vector<float> pixels;
+  for (int64_t c = 0; c < 3; ++c) {
+    for (int64_t i = 0; i < n; ++i) pixels.push_back(-0.6f + 0.3f * static_cast<float>(i));
+  }
+  std::vector<float> round = pixels;
+  vllm::MiniMaxH3VideoNormalizePixels(round, 3, n);
+  vllm::MiniMaxH3VideoDenormalizePixels(round, 3, n);
+  CHECK(MaxAbsDiff(round, pixels.data(), pixels.size()) <= 1e-5);
+
+  // Exact values against upstream's formula (vae.py:659,693), per channel -- a
+  // shared mean/std would round-trip fine yet still cast colour.
+  const float mean[3] = {0.485f, 0.456f, 0.406f};
+  const float sd[3] = {0.229f, 0.224f, 0.225f};
+  std::vector<float> one(3, 0.0f);  // one value per channel, ImageNet-normalized 0
+  vllm::MiniMaxH3VideoDenormalizePixels(one, 3, 1);
+  for (int64_t c = 0; c < 3; ++c) {
+    CHECK(one[static_cast<size_t>(c)] == doctest::Approx(mean[c] * 2.0f - 1.0f).epsilon(1e-5));
+  }
+
+  // The clamp happens BEFORE the [-1,1] map (vae.py:693 order): a far
+  // out-of-gamut value must saturate at exactly +/-1, not overshoot.
+  std::vector<float> hot = {50.0f, -50.0f, 50.0f};
+  vllm::MiniMaxH3VideoDenormalizePixels(hot, 3, 1);
+  CHECK(hot[0] == doctest::Approx(1.0f));
+  CHECK(hot[1] == doctest::Approx(-1.0f));
+  CHECK(hot[2] == doctest::Approx(1.0f));
+
+  // And the per-channel std is really applied: an ImageNet-normalized 1.0 must
+  // land at a DIFFERENT pixel per channel.
+  std::vector<float> unit = {1.0f, 1.0f, 1.0f};
+  vllm::MiniMaxH3VideoDenormalizePixels(unit, 3, 1);
+  for (int64_t c = 0; c < 3; ++c) {
+    CHECK(unit[static_cast<size_t>(c)] ==
+          doctest::Approx((mean[c] + sd[c]) * 2.0f - 1.0f).epsilon(1e-5));
+  }
+  CHECK(unit[0] != doctest::Approx(unit[1]));
+}
+
 TEST_CASE("minimax_h3: fl2va keyframe conditioning is wired and load-bearing") {
   const std::unique_ptr<GoldenWeights> dit = BuildGoldenWeights();
   const MiniMaxH3DitParams& p = dit->params;

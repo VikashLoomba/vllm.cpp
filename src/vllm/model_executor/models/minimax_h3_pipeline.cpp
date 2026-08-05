@@ -47,6 +47,37 @@ namespace vllm {
 // `noise_aug` blends toward the supplied noise (1.0 pins the frame exactly). Noise
 // is an INPUT for the same reason it is in the t2va path: reproducing upstream's RNG
 // decides WHICH sample you get, not whether the pipeline is right.
+void MiniMaxH3VideoDenormalizePixels(std::vector<float>& frames, int64_t channels,
+                                     int64_t per_channel) {
+  VT_CHECK(channels == 3, "minimax_h3: ImageNet de-normalization expects 3 channels");
+  VT_CHECK(static_cast<int64_t>(frames.size()) == channels * per_channel,
+           "minimax_h3: frame buffer does not match [C, ...]");
+  for (int64_t c = 0; c < channels; ++c) {
+    const float mean = kMiniMaxH3ImagenetMean[c], std_dev = kMiniMaxH3ImagenetStd[c];
+    for (int64_t i = 0; i < per_channel; ++i) {
+      float& v = frames[static_cast<size_t>(c * per_channel + i)];
+      // clamp in [0,1] BEFORE the [-1,1] map, matching vae.py:693's order --
+      // clamping afterwards would let out-of-gamut values survive rescaled.
+      const float pixel = std::min(1.0F, std::max(0.0F, v * std_dev + mean));
+      v = pixel * 2.0F - 1.0F;
+    }
+  }
+}
+
+void MiniMaxH3VideoNormalizePixels(std::vector<float>& frames, int64_t channels,
+                                   int64_t per_channel) {
+  VT_CHECK(channels == 3, "minimax_h3: ImageNet normalization expects 3 channels");
+  VT_CHECK(static_cast<int64_t>(frames.size()) == channels * per_channel,
+           "minimax_h3: frame buffer does not match [C, ...]");
+  for (int64_t c = 0; c < channels; ++c) {
+    const float mean = kMiniMaxH3ImagenetMean[c], std_dev = kMiniMaxH3ImagenetStd[c];
+    for (int64_t i = 0; i < per_channel; ++i) {
+      float& v = frames[static_cast<size_t>(c * per_channel + i)];
+      v = ((v + 1.0F) * 0.5F - mean) / std_dev;  // vae.py:659
+    }
+  }
+}
+
 std::vector<float> MiniMaxH3EncodeReferenceVideo(
     const MiniMaxH3EncoderFcn3dConfig& encoder_config,
     const MiniMaxH3AudioVaeWeights& encoder_weights, const MiniMaxH3DitParams& dit_params,
@@ -60,13 +91,16 @@ std::vector<float> MiniMaxH3EncodeReferenceVideo(
   // The 3D CNN is CAUSAL in time, so a clip encodes in one call -- this is the same
   // encoder the single-image path uses, just with t > 1, which is why a video
   // reference needed no new porting once the image path existed.
+  // Same ImageNet normalization the image path needs (vae.py:659).
+  std::vector<float> norm = frames;
+  MiniMaxH3VideoNormalizePixels(norm, encoder_config.in_channels, frame_count * frame_h * frame_w);
   MiniMaxH3EncoderFcn3dConfig cfg = encoder_config;
   cfg.t = frame_count;
   cfg.h = frame_h;
   cfg.w = frame_w;
   MiniMaxH3VideoFrameShape ls{};
   const std::vector<float> latent =
-      MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, frames, &ls);
+      MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, norm, &ls);
   std::vector<float> rows = MiniMaxH3PatchifyVideoLatent(
       latent, /*batch=*/1, dit_params.latents_dim, ls.t, ls.h, ls.w, dit_params.patch_size_t,
       dit_params.patch_size_h, dit_params.patch_size_w);
@@ -134,13 +168,16 @@ std::vector<float> MiniMaxH3EncodeReferenceImages(
   for (const std::vector<float>& img : images) {
     VT_CHECK(static_cast<int64_t>(img.size()) == encoder_config.in_channels * image_h * image_w,
              "minimax_h3 ref2va: reference image is not [in_channels, H, W]");
+    // The encoder consumes IMAGENET-NORMALIZED pixels (vae.py:659), not [-1, 1].
+    std::vector<float> norm = img;
+    MiniMaxH3VideoNormalizePixels(norm, encoder_config.in_channels, image_h * image_w);
     MiniMaxH3EncoderFcn3dConfig cfg = encoder_config;
     cfg.t = 1;
     cfg.h = image_h;
     cfg.w = image_w;
     MiniMaxH3VideoFrameShape ls{};
     const std::vector<float> latent =
-        MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, img, &ls);
+        MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, norm, &ls);
     const std::vector<float> patched = MiniMaxH3PatchifyVideoLatent(
         latent, /*batch=*/1, dit_params.latents_dim, ls.t, ls.h, ls.w, dit_params.patch_size_t,
         dit_params.patch_size_h, dit_params.patch_size_w);
@@ -169,13 +206,16 @@ std::vector<float> MiniMaxH3EncodeKeyframeCondRows(
   for (const std::vector<float>& img : images) {
     VT_CHECK(static_cast<int64_t>(img.size()) == encoder_config.in_channels * image_h * image_w,
              "minimax_h3 keyframe: image is not [in_channels, H, W]");
+    // The encoder consumes IMAGENET-NORMALIZED pixels (vae.py:659), not [-1, 1].
+    std::vector<float> norm = img;
+    MiniMaxH3VideoNormalizePixels(norm, encoder_config.in_channels, image_h * image_w);
     MiniMaxH3EncoderFcn3dConfig cfg = encoder_config;
     cfg.t = 1;  // a single frame is a valid causal clip
     cfg.h = image_h;
     cfg.w = image_w;
     MiniMaxH3VideoFrameShape ls{};
     const std::vector<float> latent =
-        MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, img, &ls);
+        MiniMaxH3VideoVaeEncodeToLatent(cfg, encoder_weights, norm, &ls);
     // [C, t, h, w] -> packed rows with the DiT's patch volume.
     std::vector<float> patched = MiniMaxH3PatchifyVideoLatent(
         latent, /*batch=*/1, dit_params.latents_dim, ls.t, ls.h, ls.w, dit_params.patch_size_t,
@@ -384,6 +424,12 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                                             request.latent_t, request.latent_h, request.latent_w,
                                             &result.frame_shape);
   }
+  // The ViT decoder emits IMAGENET-NORMALIZED values; the wrapper de-normalizes
+  // them (vae.py:693). Outside the decoder, so its own gate never covered it --
+  // the same shape of omission as post_quant_conv.
+  MiniMaxH3VideoDenormalizePixels(
+      result.frames, result.frame_shape.channels,
+      result.frame_shape.t * result.frame_shape.h * result.frame_shape.w);
 
   // The audio VAE decodes ONE channel at a time; the packed rows are channel-major.
   result.audio_channels = request.audio_channel;

@@ -782,6 +782,30 @@ MiniMaxH3TilePlan MiniMaxH3SplitTiles(int64_t input_len, int64_t tile_size,
 std::vector<float> MiniMaxH3BlendTiles(const std::vector<float>& a, const std::vector<float>& b,
                                        int64_t blend_extent);
 
+// The video VAE works in IMAGENET-NORMALIZED pixel space, NOT in [-1, 1].
+//
+// Upstream's wrapper de-normalizes on the way out (`dec*std + mean`, clamp to
+// [0,1], then map to [-1,1] -- comfy/ldm/minimax/vae.py:693) and normalizes on the
+// way in (`(x+1)/2 - mean) / std` -- vae.py:659). Both sit OUTSIDE ViT3DDecoder,
+// which is why the decoder's own 1.19e-07 gate never covered them, exactly like
+// post_quant_conv before them.
+//
+// Skipping the output step feeds ImageNet-normalized values to a writer expecting
+// [-1, 1]: the per-channel means differ (0.485/0.456/0.406) so it casts colour, and
+// the std of ~0.22 means the true dynamic range is compressed ~4.4x, which reads as
+// dark and low-contrast.
+inline constexpr float kMiniMaxH3ImagenetMean[3] = {0.485F, 0.456F, 0.406F};
+inline constexpr float kMiniMaxH3ImagenetStd[3] = {0.229F, 0.224F, 0.225F};
+
+// Decoder output (ImageNet-normalized, [C,T,H,W]) -> [-1, 1] pixels, in place.
+void MiniMaxH3VideoDenormalizePixels(std::vector<float>& frames, int64_t channels,
+                                     int64_t per_channel);
+
+// Pixels in [-1, 1] ([C,T,H,W]) -> the ImageNet-normalized space the VAE ENCODER
+// expects, in place. The inverse of the above, for reference/keyframe conditioning.
+void MiniMaxH3VideoNormalizePixels(std::vector<float>& frames, int64_t channels,
+                                   int64_t per_channel);
+
 // Decode a video latent [in_channels, T, H, W] to frames [out_channels, T*pt, H*ps, W*ps].
 std::vector<float> MiniMaxH3VideoVaeDecode(const MiniMaxH3VideoVaeDecoderConfig& config,
                                            const MiniMaxH3AudioVaeWeights& weights,

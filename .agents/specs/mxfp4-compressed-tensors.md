@@ -245,7 +245,37 @@ Traced in the **0.25.0 site-packages** (the runnable oracle), `file:line`:
   != auto (filters the kernel list) and `VLLM_DISABLED_KERNELS` (can disable
   FlashInfer to force Marlin — the exact lever to A/B the two arms on one box).
 
+### W1 EMPIRICAL RESULT (2026-08-05, RUNTIME — supersedes the source-only pick above)
+
+Ran the oracle on `Yi30/Qwen3-8B-MXFP4` on GB10 (evidence:
+`docs/bench-evidence/mxfp4-qwen/`). The source trace said FlashInfer; the RUNTIME
+says FlashInfer is **selected but CRASHES on sm_121**:
+- `init_mxfp4_linear_kernel` logs `Using FlashInferMxFp4LinearKernel for MXFP4 GEMM`
+  (is_supported passes: cap 121 >= 100, cute-dsl present), THEN engine start dies with
+  `flashinfer.utils.BackendSupportedError: mm_fp4 does not support backend 'cute-dsl'
+  with capability 121`. FlashInfer's cute-dsl mxf4 backend covers sm_100 (datacenter
+  Blackwell) but NOT sm_121 (GB10). **The default oracle config is non-functional
+  for this checkpoint on GB10.**
+- The WORKING path = `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` -> the next
+  supported kernel = `MarlinMxFp4LinearKernel` (W4A16 weight-only fp4 Marlin,
+  `apply_fp4_marlin_linear(weight_global_scale=None)`). Greedy golden PYEXIT=0,
+  coherent+correct (Paris/Rome/Berlin, 2+2=4, fibonacci) — W0 satisfied.
+- **CORRECTION: the GB10 parity target is Marlin W4A16 mxf4, NOT FlashInfer W4A4.**
+  This REVALIDATES the row's original Laguna-B2 Marlin W4A16 hypothesis. The
+  source-only W1 conclusion above was wrong for sm_121 because it did not model
+  flashinfer's RUNTIME backend gate. `is_supported` != actually-runs. Trace the
+  execution, not just the dispatch source.
+
 ### W2 — native keep-quant compute route (design)
+
+> **REVISED per the W1 empirical result:** the GB10 target is **Marlin W4A16
+> mxf4** (weight-only fp4, bf16 activation), NOT the cute-dsl W4A4 GEMM. Route
+> through our EXISTING Marlin FP4 infra (`src/vt/cuda/marlin/...`,
+> `cuda_marlin_repack.cu`, the NVFP4/AWQ/GPTQ Marlin path) exactly as the Laguna
+> B2 route did for NVFP4: extend the FP4 Marlin format plumbing for group-32 E8M0
+> (no global scale). The cutlass-W4A4 extension below stays a FUTURE arm, only
+> reachable once a flashinfer sm_121 mxf4 backend exists or we write the cutlass
+> mxf4 mma directly; it is not today's GB10 bar.
 
 Target = W4A4 mxf4xf4 (GB10) with the Marlin W4A16 mxf4 fallback documented.
 Route through the SAME families vLLM uses, mirroring the landed NVFP4 lane:
@@ -305,14 +335,19 @@ held. Match-or-beat is the bar; record honestly. Note the A/B lever:
 `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel` forces the oracle onto Marlin
 W4A16 for a second reference point (W4A4 vs W4A16 on one box).
 
-### Empirical status (2026-08-05) — GPU/disk-gated, QUEUED
+### Empirical status (2026-08-05)
 
-W0-run, W1-runtime-confirm, W2-build, W3-gates, W4-bench all need the GB10
-exclusively. At spec time the box was contended: `gpu.lock`+`/tmp/gpu` HELD
-(Option-A `test_qwen36_async_serving`), and a Kimi-Linear-48B `hf download` (91.5G)
-was actively shrinking free disk (98G -> 86G), so a 6.2G checkpoint pull would risk
-the 15G headroom floor. Per box-safety these WAIT (never break locks, never breach
-disk). Resume order: (1) `hf download Yi30/Qwen3-8B-MXFP4` when disk >= ~15G free;
-(2) greedy golden + grep the FlashInfer log line (W0+W1 empirical); (3) build the
-W2 route + gates; (4) bench. Design + oracle-support proofs above are NOT gated and
-stand now.
+- **W0 DONE** — checkpoint downloaded (6.18 GB, disk floor respected) and the oracle
+  RAN a greedy golden (PYEXIT=0, coherent+correct). Golden +
+  evidence in `docs/bench-evidence/mxfp4-qwen/`.
+- **W1 DONE** — runtime-traced: FlashInfer W4A4 selected-but-crashes on sm_121;
+  Marlin W4A16 is the working GB10 path (see the W1 EMPIRICAL RESULT block).
+- **W2 / W3 / W4 REMAINING** — the native Marlin-W4A16-mxf4 keep-quant compute in
+  our engine + gates + bench. Build-environment note: at result time the DGX had NO
+  clean `vllm.cpp` checkout and ~31 GiB free (a full CUDA build ~21 GiB is tight and
+  slow; other agents' `~/work/*/build` trees must not be reused). W2 needs a
+  git-archive of this branch to a fresh DGX dir + CUDA build. Marlin-W4A16-mxf4
+  extends `src/vt/cuda/marlin/*` (group-32 E8M0 format plumbing) — NOT a new kernel.
+- Nsys same-tool kernel-name confirm of the Marlin path: nice-to-have, QUEUED.
+- W4 bench recipe MUST export `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`
+  (else the oracle arm crashes on GB10).

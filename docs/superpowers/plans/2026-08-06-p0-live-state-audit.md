@@ -62,7 +62,7 @@ Copied from `AGENTS.md`, `.agents/coordination.md` and `.agents/specs/issue-nati
 
 **Interfaces:**
 - Consumes: `scripts/check-agent-record.py` — `ClaimRow` (frozen dataclass with fields `path: Path`, `line_no: int`, `item_id: str`, `state: str`, `header: tuple[str, ...]`, `cells: tuple[str, ...]`, `raw: str`, and method `field(name: str) -> str`); `parse_claim_rows(path: Path, errors: list[str]) -> list[ClaimRow]`; `MATRIX_PATHS: list[Path]`.
-- Produces: `LIVE_STATES: frozenset[str]`; `AUDIT_MATRIX_PATHS: list[Path]` (= `record.MATRIX_PATHS` plus `.agents/feature-matrix.md` and `.agents/sglang-matrix.md`); `live_rows() -> list[ClaimRow]`; `row_branches() -> dict[str, list[str]]`; `main_commits(item_id: str) -> list[str]`; `unmerged(branch: str) -> list[str]`.
+- Produces: `LIVE_STATES: frozenset[str]`; `AUDIT_MATRIX_PATHS: list[Path]` (= `record.MATRIX_PATHS` plus `.agents/feature-matrix.md` and `.agents/sglang-matrix.md`); `live_rows(errors: list[str] | None = None) -> list[record.ClaimRow]`; `row_branches() -> dict[str, list[str]]`; `main_commits(item_id: str) -> list[str]` (**anchored** on ID boundaries); `unmerged(branch: str) -> list[str]`; `require_origin_main() -> None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -80,6 +80,7 @@ abandoned row live because a branch name happens to exist.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -114,6 +115,21 @@ class LiveRowLoadingTests(unittest.TestCase):
         self.assertIn("sglang-matrix.md", names)
         self.assertEqual(len(names), 7)
 
+    def test_newly_covered_feature_matrix_actually_yields_live_rows(self):
+        # Asserting the path is in a list proves nothing: every other assertion
+        # here still passes if feature-matrix.md contributes zero rows. This is
+        # what the seventh-matrix commit actually bought.
+        rows = audit.live_rows()
+        self.assertTrue([r for r in rows if r.path.name == "feature-matrix.md"])
+
+    def test_shipped_record_parses_without_errors(self):
+        # parse_claim_rows DROPS a row it cannot parse. If a malformed row ever
+        # lands, the census silently shrinks -- so the sink must be surfaced,
+        # and it must be empty today.
+        errors: list[str] = []
+        audit.live_rows(errors)
+        self.assertEqual(errors, [])
+
     def test_shipped_matrices_yield_only_live_rows(self):
         rows = audit.live_rows()
         self.assertTrue(rows, "the shipped matrices must contain live rows")
@@ -147,7 +163,7 @@ Create `scripts/audit-live-rows.py`:
 #!/usr/bin/env python3
 """Audit the live-state matrix rows against Git reality. (P0)
 
-49 rows claim ACTIVE at once, which cannot be true: a stale ACTIVE cell inside
+54 rows claim ACTIVE at once, which cannot be true: a stale ACTIVE cell inside
 a several-hundred-row table is invisible rot. This tool makes it visible.
 
 It PROPOSES and REPORTS. It never rewrites a matrix -- corrections are applied
@@ -203,12 +219,19 @@ AUDIT_MATRIX_PATHS = [
 ]
 
 
-def live_rows() -> list:
-    """Every row in the shipped matrices whose state is in LIVE_STATES."""
+def live_rows(errors: list[str] | None = None) -> list[record.ClaimRow]:
+    """Every row in the audited matrices whose state is in LIVE_STATES.
+
+    Parse errors are appended to `errors` when a list is supplied. They must
+    not be swallowed: parse_claim_rows DROPS a row it cannot parse, so a
+    malformed row would vanish from a census whose whole point is
+    completeness -- and it bites hardest on feature-matrix.md and
+    sglang-matrix.md, which no CI gate parses today.
+    """
+    sink = errors if errors is not None else []
     rows = []
     for path in AUDIT_MATRIX_PATHS:
-        errors: list[str] = []
-        for row in record.parse_claim_rows(path, errors):
+        for row in record.parse_claim_rows(path, sink):
             if row.state in LIVE_STATES:
                 rows.append(row)
     return rows
@@ -237,13 +260,43 @@ def row_branches() -> dict[str, list[str]]:
     return mapping
 
 
+def id_grep_pattern(item_id: str) -> str:
+    """POSIX-ERE pattern matching this row ID as a whole token, never a prefix."""
+    return r"(^|[^A-Za-z0-9_-])" + re.escape(item_id) + r"([^A-Za-z0-9_-]|$)"
+
+
 def main_commits(item_id: str) -> list[str]:
-    """Commits on origin/main whose message mentions the row ID literally."""
+    """Commits on origin/main whose message mentions this row ID as a whole token.
+
+    The match is ANCHORED on ID boundaries, never a substring: 55 pairs of live
+    row IDs are prefixes of longer ones (MODEL-MM of seven MODEL-MM-* rows,
+    LOAD-SAFETENSORS of LOAD-SAFETENSORS-DIRECT-DENSE, ...). A substring match
+    would credit the short row with the long row's commits, and the classifier
+    calls any commit LANDED -- so an abandoned row would silently report as
+    finished, the exact false negative this tool exists to prevent.
+    """
     out = git(
-        "log", "--oneline", "--fixed-strings", f"--grep={item_id}", "-n", "20",
+        "log", "--oneline", "-E", f"--grep={id_grep_pattern(item_id)}", "-n", "20",
         "origin/main",
     )
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def require_origin_main() -> None:
+    """Abort unless origin/main resolves.
+
+    git() maps any failure to "", which downstream is indistinguishable from
+    "no evidence". An unfetched or missing origin/main would therefore make
+    EVERY row look abandoned and the audit would propose downgrading all 54
+    ACTIVE rows at once. Absence of work and absence of information must never
+    look the same.
+    """
+    if not git("rev-parse", "--verify", "--quiet", "origin/main").strip():
+        raise SystemExit(
+            "origin/main does not resolve -- run `git fetch origin main` first. "
+            "Without it every row reports no Git evidence and this audit would "
+            "propose downgrading every ACTIVE row."
+        )
 
 
 def unmerged(branch: str) -> list[str]:
@@ -257,7 +310,7 @@ Make it executable: `chmod +x scripts/audit-live-rows.py`
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 4 tests.
+Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Verify the loader sees the real census**
 
@@ -396,7 +449,7 @@ def classify_active(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 10 tests.
+Expected: PASS, 12 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -432,6 +485,22 @@ The row contract already requires a `PARTIAL` row to make its missing modes expl
 Append to `tests/scripts/test_audit_live_rows.py`, above the `if __name__` block:
 
 ```python
+class IdMatchingTests(unittest.TestCase):
+    def test_pattern_matches_the_id_as_a_whole_token(self):
+        pattern = re.compile(audit.id_grep_pattern("MODEL-MM"))
+        self.assertTrue(pattern.search("feat(mm): MODEL-MM decode path"))
+        self.assertTrue(pattern.search("MODEL-MM"))
+
+    def test_pattern_does_not_match_a_longer_id_that_starts_with_it(self):
+        # 55 live ID pairs collide this way. A substring match would credit
+        # MODEL-MM with MODEL-MM-gemma4's commits, and the classifier calls any
+        # commit LANDED -- an abandoned row would report as finished.
+        pattern = re.compile(audit.id_grep_pattern("MODEL-MM"))
+        self.assertFalse(pattern.search("feat(mm): MODEL-MM-gemma4-mm landed"))
+        pattern = re.compile(audit.id_grep_pattern("LOAD-SAFETENSORS"))
+        self.assertFalse(pattern.search("LOAD-SAFETENSORS-DIRECT-DENSE done"))
+
+
 class PartialGapTests(unittest.TestCase):
     def test_explicit_gap_language_is_recognised(self):
         for text in [
@@ -508,7 +577,7 @@ def names_missing_modes(row_text: str) -> bool:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 15 tests.
+Expected: PASS, 19 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -536,7 +605,7 @@ EOF
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–3.
-- Produces: `audit() -> list[dict]` (one record per live row, keys `id`, `state`, `path`, `line`, `verdict`, `reason`, `flag`); `render_markdown(records: list[dict]) -> str`; `main(argv: list[str] | None = None) -> int`.
+- Produces: `audit() -> list[dict]` (one record per live row, keys `id`, `state`, `path`, `line`, `verdict`, `reason`, `flag`, `duplicate`); `duplicate_live_ids(rows: list) -> dict[str, list[str]]`; `render_markdown(records: list[dict]) -> str`; `main(argv: list[str] | None = None) -> int`. `audit()` calls `require_origin_main()` first and aborts on any parse error.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -608,11 +677,35 @@ import argparse
 import json
 
 
+def duplicate_live_ids(rows: list) -> dict[str, list[str]]:
+    """Row IDs that appear live in more than one matrix.
+
+    BACKEND-CUDA-SM121 and BACKEND-CPU are PARTIAL in BOTH backend-matrix.md
+    and feature-matrix.md, so 188 live rows carry only 186 unique IDs.
+    check-agent-record.py's duplicate check only walks MATRIX_PATHS, so it has
+    never seen these. Left unresolved, the backfill would mint two issues for
+    one item and this audit would report each twice with identical evidence.
+    """
+    seen: dict[str, list[str]] = {}
+    for row in rows:
+        seen.setdefault(row.item_id, []).append(f"{row.path.name}:{row.line_no}")
+    return {k: v for k, v in seen.items() if len(v) > 1}
+
+
 def audit() -> list[dict]:
     """One record per live row, with verdict (ACTIVE) and flag (PARTIAL)."""
+    require_origin_main()
+    parse_errors: list[str] = []
+    rows = live_rows(parse_errors)
+    if parse_errors:
+        raise SystemExit(
+            "the matrices do not parse cleanly, so the census is incomplete:\n"
+            + "\n".join(parse_errors)
+        )
+    duplicates = duplicate_live_ids(rows)
     branches_by_id = row_branches()
     records: list[dict] = []
-    for row in live_rows():
+    for row in rows:
         verdict = ""
         reason = ""
         flag = ""
@@ -626,6 +719,7 @@ def audit() -> list[dict]:
             flag = "does not name its missing modes"
         records.append(
             {
+                "duplicate": ", ".join(duplicates.get(row.item_id, [])),
                 "id": row.item_id,
                 "state": row.state,
                 "path": str(row.path.relative_to(ROOT)),
@@ -691,9 +785,11 @@ def main(argv: list[str] | None = None) -> int:
         print(render_markdown(records))
         stale = [i for i in records if i["verdict"] == "ABANDONED"]
         vague = [i for i in records if i["flag"]]
+        dupes = sorted({i["id"] for i in records if i["duplicate"]})
         print(
             f"\n{len(records)} live rows; {len(stale)} abandoned ACTIVE; "
-            f"{len(vague)} PARTIAL rows to review."
+            f"{len(vague)} PARTIAL rows to review; "
+            f"{len(dupes)} IDs live in two matrices: {', '.join(dupes) or 'none'}."
         )
     return exit_code(records, args.check)
 
@@ -707,7 +803,7 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 21 tests.
+Expected: PASS, 25 tests.
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 
@@ -788,6 +884,7 @@ Create `.agents/specs/live-state-audit-2026-08-06.md` with these sections:
 - **Method** — `scripts/audit-live-rows.py`, the classification rules verbatim, and the hand-verified sample from Step 3 with its result.
 - **Findings** — the full report table from `/tmp/audit.md`, plus the verdict distribution from Step 2.
 - **Proposed corrections** — one line per row needing a change, with its target state and the contract obligation that target carries. Apply the legality rule from Global Constraints: an abandoned `ACTIVE` row goes to `READY` if it has a real spec link, otherwise to `INVENTORIED`.
+- **Duplicate live IDs** — `BACKEND-CUDA-SM121` and `BACKEND-CPU` are `PARTIAL` in both `backend-matrix.md` and `feature-matrix.md`. Decide which matrix OWNS each row and what the other becomes (a non-claimable reference, a differently-keyed row, or deleted), and say why. This must be settled here: the backfill would otherwise mint two issues for one item.
 - **Rows left alone** — every `IN-FLIGHT` row, named, so the next reader can see the audit considered and kept them.
 - **Risks/decisions** — every verdict the tool could not decide, and the human call made.
 
@@ -952,7 +1049,7 @@ In `.github/workflows/ci.yml`, extend the record job (lines 42–46):
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 24 tests.
+Expected: PASS, 28 tests.
 
 - [ ] **Step 6: Verify the whole gate is green**
 

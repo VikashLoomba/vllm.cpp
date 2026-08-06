@@ -3286,8 +3286,14 @@ TEST_CASE("minimax_h3: the NVFP4 fp4 forward runs Marlin W4A16 on CUDA (speed)")
           << " fallback_gemms=" << stats.fallback_gemms
           << " fused_gate_up=" << stats.fused_gate_up);
   // The POSITIVE proof the Marlin W4A16 path RAN on the GPU for all 11 quantized
-  // projections. On CPU these would be fallback_gemms; here they are marlin_gemms.
-  CHECK(stats.marlin_gemms == 11);
+  // projections, and NOT the CPU/redundant-dequant fallback. On CPU these would be
+  // fallback_gemms. On CUDA the production default (VT_MARLIN_DENSE on, sm_121a)
+  // routes each projection through vLLM's OWN dense Marlin GEMM -> `dense_gemms`;
+  // VT_MARLIN_DENSE=0 opts into the single-expert MoE-grouped Marlin -> `marlin_gemms`.
+  // Either Marlin sub-route is the "this-path-ran" signal; fallback_gemms MUST be 0.
+  const uint64_t marlin_family = stats.marlin_gemms + stats.dense_gemms;
+  CHECK(marlin_family == 11);
+  CHECK(stats.fallback_gemms == 0);
   std::vector<double> tf;
   for (int r = 0; r < reps; ++r) {
     const auto t0 = now();

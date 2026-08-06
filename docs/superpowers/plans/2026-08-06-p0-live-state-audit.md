@@ -1051,7 +1051,23 @@ EOF
 - Consumes: the **Proposed corrections** section of `.agents/specs/live-state-audit-2026-08-06.md`.
 - Produces: matrices whose live states are true, so P2 can mint issues from a corrected record.
 
-**One commit per matrix.** A 49-row single commit is unreviewable, and a bad transition in one matrix should be revertible without losing the others.
+**One commit per matrix.** A single sweeping commit is unreviewable, and a bad
+transition in one matrix should be revertible without losing the others. The 10
+rows sit in 5 matrices: engine 3, model 3, kernel 2, quantization 1, backend 1.
+
+**SCOPE, user-directed 2026-08-06 — the 10 abandoned `ACTIVE` rows and nothing
+else.** Explicitly OUT of scope, left as-is and already documented in the
+artifact:
+
+- the **44 `LANDED`** rows — every verdict rests on a commit merely mentioning
+  the ID, 8 of them on commits that changed no code, so none is touched;
+- the **~30 vague `PARTIAL`** rows — the repair is editorial and needs per-row
+  knowledge of what actually works, which the tool cannot supply;
+- the **2 duplicate IDs** (`BACKEND-CPU`, `BACKEND-CUDA-SM121`) — the ownership
+  decision is recorded in the artifact and deliberately not applied here.
+
+Touching any of those is scope creep. The artifact keeps them visible for a
+later, separately-decided change.
 
 - [ ] **Step 0: Re-fetch and re-run the audit**
 
@@ -1062,7 +1078,7 @@ are stale — re-verify the affected rows rather than applying a stale list.
 
 - [ ] **Step 1: Correct the first matrix**
 
-Work one matrix at a time, starting with the one holding the most corrections. For each row in the artifact's corrections list, edit **only** the `State` and `Owner` cells. Do not touch `Our code`, `Tests/evidence`, `Upstream` or `Spike/spec` — those are durable anchors and are not what this audit is about.
+Work one matrix at a time, starting with the one holding the most corrections. For each of the 10 rows in the artifact's corrections list, edit **only** the `State` and `Owner` cells. Do not touch `Our code`, `Tests/evidence`, `Upstream` or `Spike/spec` — those are durable anchors and are not what this audit is about.
 
 Apply the legality rule: `READY` if the row has a real spec link, otherwise `INVENTORIED`. Clear the `Owner` cell to `-` for any row leaving `ACTIVE`.
 

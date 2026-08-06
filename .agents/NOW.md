@@ -23,7 +23,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
-| QUANT-CT-MXFP4-BENCH | **PLUMBED** (`row/QUANT-CT-MXFP4-BENCH`): `q3mxfp4` key + smoke gate + oracle disabled-kernel; CPU tests 45/45 | Grid GATING dgx: `mxfp4-online-serving-grid.sh` c1-c8x3 |
+| QUANT-CT-MXFP4-BENCH | **Grid RAN** (`33e93608`): BELOW-FLOOR — 0.99x@c1 / ~0.91x@c2-c8, TPOT +10-12%@c2-c8, GPU mem 2.6x LESS | Lever: batched Marlin decode GEMM (M=2..8); nsys c8 both engines |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

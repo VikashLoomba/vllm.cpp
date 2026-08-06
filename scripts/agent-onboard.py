@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Report what a session has not resolved yet. (A)
+"""Report what a session has not resolved yet, and record what it answered. (A)
 
-This script REPORTS. It never asks, it never decides and it never writes,
-because no harness-neutral mechanism exists for a shell script to run an
-interactive prompt, and a hook injects text rather than conversing. The split
-is fixed:
+This script REPORTS, and writes exactly one thing: a .env value it was handed.
+It never asks and it never decides, because no harness-neutral mechanism exists
+for a shell script to run an interactive prompt, and a hook injects text rather
+than conversing. The split is fixed:
 
-    this script   -> detect and report
+    this script   -> detect and report; record an answer it is given
     the agent     -> ask, using the interview in .agents/workflow.md
     agent-role.py -> make the answer a fact
 
-    scripts/agent-onboard.py --probe            # human-readable state
-    scripts/agent-onboard.py --probe --json     # machine-readable
+    scripts/agent-onboard.py --probe             # human-readable state
+    scripts/agent-onboard.py --probe --json      # machine-readable
+    scripts/agent-onboard.py --env-set KEY=VALUE # record one answered value
 
-Writing (`--env-set`, which records answered .env values) arrives in step 4;
-this step reports only.
+`--env-set` never invents anything. Only keys .env.example declares may be
+written, and an unanswered key stays EMPTY -- empty means the gates that need
+it stay PENDING, which is an honest state and not a failure. Never infer a
+value from a username, a filesystem path, a machine identity or another
+developer's setup.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -168,11 +173,107 @@ def render_probe(state: dict) -> str:
     return "\n".join(lines)
 
 
+def _render(value: str) -> str:
+    """Render a value so the file's TWO readers agree on it.
+
+    .env.example documents the loader as `set -a; . ./.env; set +a`, so the file
+    is shell as well as data. An unquoted `/pa th` makes that loader run `th`
+    ("command not found") and leave the variable EMPTY, while the probe's own
+    parser reads the same line as a set value -- the probe reports PRESENT and
+    the gate stays PENDING, which is the exact confusion this command exists to
+    prevent. shlex.quote only adds quotes when they are needed, so ordinary
+    paths are written unchanged.
+
+    Empty is the one value left bare: shlex.quote("") is `''`, and the probe
+    counts that two-character string as SET. Unanswered must keep reading as
+    unanswered.
+    """
+    return shlex.quote(value) if value else ""
+
+
+def cmd_env_set(pair: str) -> int:
+    """Write one .env value. Refuses any key .env.example does not declare."""
+    if "=" not in pair:
+        print("ERROR: expected KEY=VALUE", file=sys.stderr)
+        return 2
+    key, value = pair.split("=", 1)
+    key = key.strip()
+    if key not in ENV_KEYS:
+        # A typo would sit in .env doing nothing while the gate that wanted the
+        # real key stays mysteriously PENDING.
+        print(
+            f"ERROR: {key} is not declared in .env.example. Never invent a key; "
+            f"legal keys are: {', '.join(ENV_KEYS)}",
+            file=sys.stderr,
+        )
+        return 2
+    # The value is the one field nothing else validates. A line separator inside
+    # it forges a whole extra .env line that no key check ever saw -- the same
+    # silent clobber as an unrecognised key, through the back door.
+    #
+    # Ask the QUESTION rather than enumerate characters: "\n" and "\r" are 2 of
+    # the 10 separators str.splitlines() breaks on, and it is splitlines() that
+    # both env_state_from_text and the rewrite below use, so a "\v" or a U+2028
+    # smuggled a forged pair past the key check and the probe then reported the
+    # forged key as SET. An empty value splits to [] and is legal, so it is the
+    # one case this cannot phrase as a round trip.
+    if value and value.splitlines() != [value]:
+        print(
+            f"ERROR: the value for {key} contains a line separator, which would "
+            "forge a second .env line. Pass a single-line value.",
+            file=sys.stderr,
+        )
+        return 2
+    if not ENV_FILE.exists():
+        # Seed from the tracked example so every OTHER declared key survives,
+        # commented and empty, instead of a one-line .env that hides the rest.
+        ENV_FILE.write_text(ENV_EXAMPLE.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        # env_state treats an existing-but-unreadable .env as its own third
+        # case rather than as absent. Writing must agree: a bare traceback
+        # tells the caller nothing, and "create one" is the wrong instruction
+        # for a file that is already there.
+        print(f"ERROR: .env exists but cannot be read ({error})", file=sys.stderr)
+        return 2
+    # Rewrite EVERY match, not just the first. A hand-maintained .env routinely
+    # carries an override appended at the bottom, and both readers here and
+    # `set -a; . ./.env` take the LAST assignment, so breaking on the first left
+    # the file changed, the exit code 0, the message reassuring -- and the
+    # effective value exactly what it was. Collapse to one line, keeping the
+    # first line's position so the example's grouping and comments still read.
+    matches = [
+        index
+        for index, line in enumerate(lines)
+        if not line.startswith("#") and line.split("=", 1)[0].strip() == key
+    ]
+    if matches:
+        lines[matches[0]] = f"{key}={_render(value)}"
+        for index in reversed(matches[1:]):
+            del lines[index]
+    else:
+        lines.append(f"{key}={_render(value)}")
+    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # An empty value is a legitimate answer -- it means UNAVAILABLE, and the
+    # gates that need it stay PENDING. Say so rather than let it read as a win.
+    print(f"set {key} in .env" + ("" if value else " (empty: gates stay PENDING)"))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report unresolved session state.")
     parser.add_argument("--probe", action="store_true", help="report session state")
     parser.add_argument("--json", action="store_true", help="machine-readable probe")
+    parser.add_argument("--env-set", metavar="KEY=VALUE", help="write one .env value")
     args = parser.parse_args(argv)
+
+    # `is not None`, not truthiness: `--env-set ''` is a malformed write, and
+    # falling through to the probe would print a state report and exit 0 having
+    # recorded nothing -- a silent no-op is the failure mode this command is
+    # built to avoid. cmd_env_set refuses it out loud instead.
+    if args.env_set is not None:
+        return cmd_env_set(args.env_set)
 
     state = probe()
     print(json.dumps(state, indent=2, sort_keys=True) if args.json else render_probe(state))

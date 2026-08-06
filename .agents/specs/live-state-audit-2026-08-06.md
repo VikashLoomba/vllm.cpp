@@ -9,8 +9,12 @@ reasoning can be read independently of the churn it justifies.
 - **Rows.** The 188 rows in a live state (`SPIKE`, `READY`, `ACTIVE`, `GATING`,
   `PARTIAL`, `BLOCKED`) across all seven `.agents/*-matrix.md` files. The five in
   `check-agent-record.py`'s `MATRIX_PATHS`, plus `feature-matrix.md` and
-  `sglang-matrix.md`, which no CI gate parses as claim rows and which together
-  hold 11 live rows.
+  `sglang-matrix.md`, which no CI gate parses as claim rows. All 11 of the live
+  rows those two add are in `feature-matrix.md`; `sglang-matrix.md` holds **0**,
+  because its lifecycle column is `Class` (FUSED / SGLANG-DISTINCT /
+  OUT-OF-SCOPE), not `State`, so no table in it parses as a claim table. It stays
+  in `AUDIT_MATRIX_PATHS` anyway — free today, automatic coverage the day it
+  grows a `State` column.
 - **Trees.** Rows are read from the working tree on `spec/issue-native-tracking`
   @ `4aaa9a8c`. Git evidence is read from `origin/main` @ `cf32c619` (fetched
   2026-08-06). The only matrix delta between the two is `engine-matrix.md`
@@ -131,6 +135,38 @@ mention is not a completion proof, and a records-only commit is not even a work
 proof. Establishing completion requires a human reading the row's own code/test
 anchors against the gate output — outside this audit's reach.
 
+#### ➁a The gate's evidence rule self-blinds on the rows this audit vacated
+
+**Recorded as a known hazard, not fixed here.** The rule in `main_commits()` is a
+commit-MESSAGE mention with no code-touch discriminator: any commit on
+`origin/main` whose subject or body names the row ID as a whole token makes the
+row `LANDED`, whatever that commit changed. Record commits in this repository
+routinely name row IDs, so the gate's discriminating power decays with every
+records-only commit that lands.
+
+That is not hypothetical for this branch. **9 of the 10 IDs vacated in ➂ are
+named in this branch's OWN commit messages** — every one except
+`MODEL-MM-gemma4-mm-gemma4-for-conditional-generation` (`BACKEND-DISTRIBUTED-TP`
+and `ENG-MM-AUDIO-ENCODER` twice each; `ENG-MM-INPUT-PIPELINE`,
+`ENG-MM-VIDEO-FORWARD`, `KERNEL-GDN-AOT-BF16`, `KERNEL-GDN-SCRATCH`,
+`MODEL-TEXT-glm4-glm4-for-causal-lm`,
+`MODEL-MM-voxtral-voxtral-for-conditional-generation` and `QUANT-GGUF-IQ3_XXS`
+once each). Once those messages reach `origin/main` — and a squash merge
+concatenates them, so squashing does not shed them — `main_commits()` is
+non-empty for those nine FOREVER. **`--check` can therefore never flag those rows
+abandoned again**, including if somebody re-flips one to `ACTIVE` with no work
+behind it. The gate keeps its full force on every row it has not yet fired on;
+it has spent itself precisely on the ten it just repaired.
+
+The fix is already computed above: filter `main_commits()` by whether the commit
+touched a code path (`src/`, `include/`, `tests/`, `cmake/`, `scripts/`) — the
+same discriminator that splits the 44 `LANDED` verdicts 36/8 in this section.
+**It is deliberately NOT applied in this change**, because applying it today
+flips the 8 records-only-backed `LANDED` rows listed above to `ABANDONED` and
+turns the standing gate RED for everyone. Vacating eight more rows is a
+correction with its own evidence and its own decision; it does not get to ride in
+on a tool tweak. Follow-up carried in `.agents/state.md`.
+
 ### ➂ The 10 abandoned `ACTIVE` rows
 
 No `row/<ID>` branch and no commit on `origin/main` naming the ID:
@@ -227,9 +263,20 @@ than printing a bare boolean. The remaining 13 bare-`no`/`gap` first-matches
 (`KV-BLOCK-POOL`, `TOOLS-CALLING-CORE`, `MODEL-TEXT-minicpm...`,
 `MODEL-TEXT-minicpm3...`, `MODEL-TEXT-mistral...`, `MODEL-TEXT-olmo2...`,
 `MODEL-TEXT-phi...`, `MODEL-TEXT-phi3...`, `MODEL-MM-qwen3-vl...`,
-`QUANT-GGUF-NVFP4`, `BACKEND-CUDA-COMP-FA`, `BACKEND-CPU`, `MODEL-MM`) also carry
-a stronger marker (`absent`, `pending`, `missing`, `only`, `without`) elsewhere in
-the row, so their explicit reading does not depend on the weak hit.
+`QUANT-GGUF-NVFP4`, `BACKEND-CUDA-COMP-FA`, `BACKEND-CPU` (backend-matrix.md:226),
+`MODEL-MM`) also carry a stronger marker (`absent`, `pending`, `missing`, `only`,
+`without`) elsewhere in the row, so their explicit reading does not depend on the
+weak hit.
+
+`BACKEND-CPU` reads as explicit here AND appears in the vague-20 table above,
+which is not a contradiction: it is one of the two IDs live in two matrices at
+once (see *Duplicate live IDs*), and its two instances read differently. The
+`backend-matrix.md` instance (`:226`) is the explicit one; the
+`feature-matrix.md` roll-up (`:277`) is the vague one the table flags. The other
+duplicate, `BACKEND-CUDA-SM121`, splits the same way — explicit via `only` at
+backend-matrix.md:178, vague at feature-matrix.md:275 — it just never reaches
+this list, because `only` is a strong marker. Every entry in both lists is about
+ONE instance; where an ID is duplicated the location disambiguates it.
 
 ### ➄ Full report
 

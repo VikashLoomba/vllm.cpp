@@ -52,11 +52,12 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
 5. **Protocol substrate — partly done.** Claim triage + live-state audit DONE
-   (10 unevidenced `ACTIVE` rows → `READY`, 11 dead claims retired, 9 amended);
-   `docs/STATUS.md` ratcheted; roadmap compacted; `AGENTS.md` tiered. REMAINING:
-   anchor backfill (rows `SPIKE`/`ACTIVE` needing code/test anchors; 6 model rows
-   need a DECISION); record-era rollover BLOCKED on `DONE` rows bound to
-   `parity-ledger.md` LINE anchors (re-anchor by ROW ID first).
+   (10 unevidenced rows → `READY`, 11 claims retired, 9 amended); `STATUS.md`
+   ratcheted; roadmap compacted; `AGENTS.md` tiered. REMAINING: anchor backfill
+   (6 model rows need a DECISION); record-era rollover BLOCKED on `DONE` rows
+   bound to `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
+   ★ The gate SELF-BLINDS on those same 10 (audit §➁a); its fix owes an 8-row
+   adjudication. workflow.md now states the `ACTIVE` precondition.
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED

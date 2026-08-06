@@ -46,10 +46,15 @@ record = _load("agent_record", "scripts/check-agent-record.py")
 LIVE_STATES = frozenset({"SPIKE", "READY", "ACTIVE", "GATING", "PARTIAL", "BLOCKED"})
 
 # check-agent-record.py's MATRIX_PATHS omits feature-matrix.md and
-# sglang-matrix.md, which together hold 11 live rows. The audit covers all
-# seven matrices so no live row escapes it, but deliberately does NOT widen
-# MATRIX_PATHS itself: that governs a repo-wide CI gate whose row contract
-# these two files have never been held to.
+# sglang-matrix.md. All 11 of the live rows they add come from
+# feature-matrix.md; sglang-matrix.md contributes ZERO, because its lifecycle
+# column is `Class` (FUSED / SGLANG-DISTINCT / OUT-OF-SCOPE), not `State`, so
+# no table in it parses as a claim table today. Keeping it here is still
+# right: it costs nothing now and the coverage becomes automatic the day it
+# grows a `State` column. The audit covers all seven matrices so no live row
+# escapes it, but deliberately does NOT widen MATRIX_PATHS itself: that
+# governs a repo-wide CI gate whose row contract these two files have never
+# been held to.
 AUDIT_MATRIX_PATHS = [
     *record.MATRIX_PATHS,
     record.AGENTS / "feature-matrix.md",

@@ -143,5 +143,31 @@ def unmerged(branch: str) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+VERDICTS = frozenset({"IN-FLIGHT", "LANDED", "ABANDONED"})
+
+
+def classify_active(
+    branches: list[str],
+    unmerged_by_branch: dict[str, list[str]],
+    commits: list[str],
+) -> tuple[str, str]:
+    """Classify one ACTIVE row from already-gathered evidence.
+
+    IN-FLIGHT wins over LANDED whenever both are present: a row can have landed
+    groundwork and still have open follow-up work, and calling that finished
+    would silently steal a live claim.
+    """
+    live_branches = [b for b in branches if unmerged_by_branch.get(b)]
+    if live_branches:
+        joined = ", ".join(sorted(live_branches))
+        return "IN-FLIGHT", f"unmerged commits on {joined}"
+    if branches:
+        joined = ", ".join(sorted(branches))
+        return "LANDED", f"branch {joined} exists and is fully merged into main"
+    if commits:
+        return "LANDED", f"on main: {commits[0]}"
+    return "ABANDONED", "no branch, no commit on main mentioning the row ID"
+
+
 if __name__ == "__main__":
     raise SystemExit("CLI arrives in P0 step 4; import this module for now")

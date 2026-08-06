@@ -118,5 +118,61 @@ class CommandLineGuardTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+class ClassifierTests(unittest.TestCase):
+    def test_unmerged_branch_commits_mean_in_flight(self):
+        verdict, reason = audit.classify_active(
+            branches=["row/ENG-FOO"],
+            unmerged_by_branch={"row/ENG-FOO": ["abc1234 wip"]},
+            commits=[],
+        )
+        self.assertEqual(verdict, "IN-FLIGHT")
+        self.assertIn("row/ENG-FOO", reason)
+
+    def test_fully_merged_branch_means_landed(self):
+        verdict, reason = audit.classify_active(
+            branches=["row/ENG-FOO"],
+            unmerged_by_branch={"row/ENG-FOO": []},
+            commits=[],
+        )
+        self.assertEqual(verdict, "LANDED")
+        self.assertIn("merged", reason.lower())
+
+    def test_main_commits_without_branch_mean_landed(self):
+        verdict, reason = audit.classify_active(
+            branches=[],
+            unmerged_by_branch={},
+            commits=["def5678 feat(eng): ENG-FOO"],
+        )
+        self.assertEqual(verdict, "LANDED")
+        self.assertIn("def5678", reason)
+
+    def test_no_evidence_at_all_means_abandoned(self):
+        verdict, reason = audit.classify_active(
+            branches=[], unmerged_by_branch={}, commits=[]
+        )
+        self.assertEqual(verdict, "ABANDONED")
+        self.assertIn("no branch", reason.lower())
+
+    def test_in_flight_wins_over_landed_when_both_present(self):
+        # A row can have landed groundwork AND active follow-up work.
+        # Claiming it is finished would silently steal an open claim.
+        verdict, _ = audit.classify_active(
+            branches=["row/ENG-FOO"],
+            unmerged_by_branch={"row/ENG-FOO": ["abc1234 wip"]},
+            commits=["def5678 feat(eng): ENG-FOO groundwork"],
+        )
+        self.assertEqual(verdict, "IN-FLIGHT")
+
+    def test_every_verdict_is_declared(self):
+        for branches, by_branch, commits in [
+            (["row/X"], {"row/X": ["a b"]}, []),
+            (["row/X"], {"row/X": []}, []),
+            ([], {}, ["a b"]),
+            ([], {}, []),
+        ]:
+            verdict, _ = audit.classify_active(branches, by_branch, commits)
+            self.assertIn(verdict, audit.VERDICTS)
+
+
 if __name__ == "__main__":
     unittest.main()

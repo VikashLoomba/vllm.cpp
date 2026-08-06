@@ -888,6 +888,28 @@ def interview_errors(text: str) -> list[str]:
 
 Call `interview_errors` from `main()` against `.agents/workflow.md` and add its output to the error list.
 
+**Two residual false claims must die in this task** (found by Task 3's re-review, both outside the lines Task 3 corrected, both passing every existing gate):
+
+- `.agents/NOW.md` still says "role discipline ENFORCING, `--require-role` still opt-in" — directly contradicted by Task 3's deliverable.
+- `.agents/specs/operator-helper-protocol.md:203`'s W0 table row still says "session-scoped role marker" — the exact claim corrected 130 lines earlier in the same file.
+
+**And add the behavioural pin the text anchors cannot give.** Every assertion in `PreflightWiringTests` greps text, so an *override* still slips through even though a *rewrite* of the default is caught: keeping `REQUIRE_ROLE=1` and adding `REQUIRE_ROLE=0 ` (one trailing space) on the next line leaves the suite green while the gate stops failing. Add a test that RUNS the script:
+
+```python
+    def test_preflight_actually_fails_on_an_undeclared_role(self):
+        # Every other assertion here greps text, so an override on a later line
+        # slips through. Only executing the script closes the class.
+        env = dict(os.environ, VLLM_CPP_AGENT_SESSION="probe-no-such-session")
+        result = subprocess.run(
+            ["bash", str(ROOT / "scripts/agent-preflight.sh"), "--quiet"],
+            cwd=ROOT, capture_output=True, text=True, check=False, env=env,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("role-undeclared", result.stdout + result.stderr)
+```
+
+This test must run in a state with no resolvable role. If the worktree carries a marker, the test is meaningless — assert the precondition or skip loudly, never silently pass.
+
 Update `AGENTS.md`'s T0 role bullet to say the role is asked as the first question of the session, that `read-only` is available, and that preflight demands it by default. Update `.agents/specs/operator-helper-protocol.md` § "Determining the role" to record `read-only` and the mode declaration.
 
 - [ ] **Step 4: Run test to verify it passes**

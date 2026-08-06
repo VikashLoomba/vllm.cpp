@@ -665,7 +665,129 @@ def gap_pattern(markers: tuple[str, ...]) -> re.Pattern[str]:
     return re.compile(r"\b(?:" + alternation + r")\b", re.IGNORECASE)
 
 
-GAP_RE = gap_pattern(GAP_MARKERS)```
+GAP_RE = gap_pattern(GAP_MARKERS)
+
+# check mode fails on abandoned ACTIVE rows and nothing else. The PARTIAL flag
+# is a keyword heuristic for human review; gating on it would be the fragile
+# checker the protocol warns against.
+CHECK_FAILS_ON = frozenset({"ACTIVE"})
+
+
+def names_missing_modes(row_text: str) -> bool:
+    """True when a PARTIAL row states what is NOT supported."""
+    return GAP_RE.search(row_text) is not None
+
+
+def matched_marker(row_text: str) -> str:
+    """The gap marker that fired, or "" -- so a human can discount a bad hit.
+
+    The heuristic under-flags: 11 of the 48 rows it reads as explicit qualify
+    only via bare `no` or `gap`, on prose asserting GOODNESS rather than
+    absence ("no longer double-resides", "max gap 0.0 nats", "CLOSED the CPU
+    RSS gap"). Naming the marker lets a reviewer dismiss those at a glance
+    instead of trusting the verdict.
+    """
+    match = GAP_RE.search(row_text)
+    return match.group(0) if match else ""
+```
+
+`re` is already imported at the top of the module from Task 1; if it is not, add it there rather than mid-file.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `python3 tests/scripts/test_audit_live_rows.py -v`
+Expected: PASS, 26 tests.
+
+- [ ] **Step 5: Run preflight and commit**
+
+```bash
+bash scripts/agent-preflight.sh > /tmp/preflight.log 2>&1; echo "EXIT=$?"
+git add scripts/audit-live-rows.py tests/scripts/test_audit_live_rows.py
+git commit -F - <<'EOF'
+tools(audit): advisory PARTIAL missing-modes flag (P0 step 3)
+
+Report-only by construction: CHECK_FAILS_ON is ACTIVE alone, so the keyword
+heuristic can never fail a build.
+
+FOLLOWING_AGENTS_PROTOCOL
+Assisted-by: Claude Code:claude-opus-5 [ClaudeCode]
+EOF
+```
+
+---
+
+### Task 4: Report rendering and CLI
+
+**Files:**
+- Modify: `scripts/audit-live-rows.py`
+- Test: `tests/scripts/test_audit_live_rows.py`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1–3.
+- Produces: `audit() -> list[dict]` (one record per live row, keys `id`, `state`, `path`, `line`, `verdict`, `reason`, `flag`, `duplicate`); `duplicate_live_ids(rows: list) -> dict[str, list[str]]`; `render_markdown(records: list[dict]) -> str`; `main(argv: list[str] | None = None) -> int`. `audit()` calls `require_origin_main()` first and aborts on any parse error.
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/scripts/test_audit_live_rows.py`, above the `if __name__` block:
+
+```python
+class ReportTests(unittest.TestCase):
+    RECORDS = [
+        {
+            "id": "ENG-FOO",
+            "state": "ACTIVE",
+            "path": ".agents/engine-matrix.md",
+            "line": 42,
+            "verdict": "ABANDONED",
+            "reason": "no branch, no commit on main mentioning the row ID",
+            "flag": "",
+        },
+        {
+            "id": "MODEL-BAR",
+            "state": "PARTIAL",
+            "path": ".agents/model-matrix.md",
+            "line": 7,
+            "verdict": "",
+            "reason": "",
+            "flag": "does not name its missing modes",
+        },
+    ]
+
+    def test_markdown_lists_every_record(self):
+        out = audit.render_markdown(self.RECORDS)
+        self.assertIn("ENG-FOO", out)
+        self.assertIn("MODEL-BAR", out)
+        self.assertIn("ABANDONED", out)
+        self.assertIn("does not name its missing modes", out)
+
+    def test_markdown_cells_do_not_break_the_table(self):
+        records = [dict(self.RECORDS[0], reason="a | b")]
+        out = audit.render_markdown(records)
+        body = [ln for ln in out.splitlines() if "ENG-FOO" in ln]
+        self.assertEqual(len(body), 1)
+        self.assertNotIn("a | b", body[0])
+
+    def test_check_mode_fails_when_an_active_row_is_abandoned(self):
+        self.assertEqual(audit.exit_code(self.RECORDS, check=True), 1)
+
+    def test_check_mode_passes_when_no_active_row_is_abandoned(self):
+        clean = [dict(self.RECORDS[0], verdict="IN-FLIGHT")] + self.RECORDS[1:]
+        self.assertEqual(audit.exit_code(clean, check=True), 0)
+
+    def test_only_the_vague_flag_counts_as_needing_review(self):
+        # Every PARTIAL row carries a flag: the marker that fired, or the vague
+        # string. Counting non-empty flags would report all 68 as vague.
+        explicit = dict(self.RECORDS[1], flag="explicit via 'missing'")
+        self.assertNotEqual(explicit["flag"], audit.VAGUE_FLAG)
+        self.assertEqual(self.RECORDS[1]["flag"], audit.VAGUE_FLAG)
+
+    def test_report_mode_always_exits_zero(self):
+        self.assertEqual(audit.exit_code(self.RECORDS, check=False), 0)
+
+    def test_vague_partial_alone_never_fails_check_mode(self):
+        only_flag = [self.RECORDS[1]]
+        self.assertEqual(audit.exit_code(only_flag, check=True), 0)
+```
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -679,6 +801,12 @@ Append to `scripts/audit-live-rows.py`:
 ```python
 import argparse
 import json
+
+
+# Every PARTIAL row carries a flag string now -- either the marker that fired
+# or this. So "needs review" is THIS string, never merely a non-empty flag;
+# counting non-empty flags would report all 68 PARTIAL rows as vague.
+VAGUE_FLAG = "does not name its missing modes"
 
 
 def duplicate_live_ids(rows: list) -> dict[str, list[str]]:
@@ -721,11 +849,7 @@ def audit() -> list[dict]:
             )
         if row.state == "PARTIAL":
             marker = matched_marker(row.raw)
-            flag = (
-                f"explicit via {marker!r}"
-                if marker
-                else "does not name its missing modes"
-            )
+            flag = f"explicit via {marker!r}" if marker else VAGUE_FLAG
         records.append(
             {
                 "duplicate": ", ".join(duplicates.get(row.item_id, [])),
@@ -793,7 +917,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(render_markdown(records))
         stale = [i for i in records if i["verdict"] == "ABANDONED"]
-        vague = [i for i in records if i["flag"]]
+        vague = [i for i in records if i["flag"] == VAGUE_FLAG]
         dupes = sorted({i["id"] for i in records if i["duplicate"]})
         print(
             f"\n{len(records)} live rows; {len(stale)} abandoned ACTIVE; "
@@ -812,7 +936,7 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 31 tests (32 added minus the transitional CLI-guard test you delete here).
+Expected: PASS, 33 tests (34 added minus the transitional CLI-guard test you delete here).
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 
@@ -1058,7 +1182,7 @@ In `.github/workflows/ci.yml`, extend the record job (lines 42–46):
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 34 tests.
+Expected: PASS, 36 tests.
 
 - [ ] **Step 6: Verify the whole gate is green**
 

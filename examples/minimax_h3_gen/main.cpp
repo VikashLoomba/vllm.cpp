@@ -164,6 +164,7 @@ int main(int argc, char** argv) {
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   std::string first_frame_path, last_frame_path;
+  std::string decode_latent_path;  // diagnostic: decode a dumped VAE-input latent
   std::vector<std::string> ref_image_paths;
   std::string ref_video_prefix, ref_audio_path;
   double imgvid_noise_aug = 1.0;
@@ -188,6 +189,7 @@ int main(int argc, char** argv) {
       else if (f == "--dry-run") dry_run = true;
       else if (f == "--denoise-only") denoise_only = true;
       else if (f == "--dump-params") dump_params = true;
+      else if (f == "--decode-latent") decode_latent_path = Need(argc, argv, ++i, f);
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
@@ -213,11 +215,14 @@ int main(int argc, char** argv) {
     // no VAEs, no conditioning, no output path. Requiring them would make the one
     // tool that works on a checkpoint too large to load unusable on exactly that
     // checkpoint.
-    const bool need_vaes = !denoise_only && !dump_params;
-    const bool need_cond = !dump_params;
-    if (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
-        (need_vaes && out_path.empty()) ||
-        (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty()))) {
+    const bool need_vaes = !denoise_only && !dump_params && decode_latent_path.empty();
+    const bool need_cond = !dump_params && decode_latent_path.empty();
+    // --decode-latent needs NO DiT and NO conditioning (its own block validates its
+    // inputs); the shared check below would otherwise reject the missing --dit.
+    if (decode_latent_path.empty() &&
+        (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
+         (need_vaes && out_path.empty()) ||
+         (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty())))) {
       std::cerr << "usage: minimax-h3-gen --dit <f> --video-vae <f> --audio-vae <f> "
                    "--prompt-embeds <f32.bin> --out <out.mp4> [--video-vae-config <j>] "
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
@@ -275,6 +280,61 @@ int main(int argc, char** argv) {
                 << "\nrope_inv_freq_len=" << pr.rope_inv_freq_len
                 << "\nvideo_row_width=" << pr.video_row_width()
                 << "\nrope_rot_dim=" << pr.rope_rot_dim() << "\n";
+      return 0;
+    }
+
+    // --decode-latent DIAGNOSTIC: decode a dumped VAE-input latent
+    // (VT_H3_DUMP_DIR/vae_input_video_latent.f32) directly, with NO DiT and NO
+    // conditioning, on either device. Lets the device ViT3D decoder be compared
+    // against the scalar CPU reference (gated vs upstream at 8.9e-8) on the SAME
+    // real latent -- the VAE-branch oracle test for the render-coherence bisection.
+    if (!decode_latent_path.empty()) {
+      if (video_cfg_path.empty() || video_vae_path.empty() || out_path.empty()) {
+        throw std::runtime_error(
+            "--decode-latent needs --video-vae, --video-vae-config, --out and --width/--height/--frames");
+      }
+      vllm::MiniMaxH3LatentStats vstats;
+      vllm::MiniMaxH3VideoVaeDecoderConfig vcfg =
+          vllm::ParseMiniMaxH3VideoVaeDecoderConfig(ReadJson(video_cfg_path), &vstats);
+      vllm::SafetensorsFile vfile = vllm::SafetensorsFile::Open(video_vae_path);
+      vllm::MiniMaxH3AudioVaeWeights vweights = vllm::LoadMiniMaxH3VideoVaeDecoderWeights(vfile);
+      const vllm::MiniMaxH3ShapePlan plan = vllm::MiniMaxH3ResolveShape(
+          "t2va", 0.0, frames, height, width, 0, 0);
+      const int64_t lt = plan.latent_t, lh = plan.height / vllm::kMiniMaxH3VaeRatio,
+                    lw = plan.width / vllm::kMiniMaxH3VaeRatio, ch = vcfg.in_channels;
+      const int64_t need = ch * lt * lh * lw;
+      std::ifstream lf(decode_latent_path, std::ios::binary);
+      if (!lf) throw std::runtime_error("cannot open --decode-latent file");
+      std::vector<float> latent(static_cast<size_t>(need));
+      lf.read(reinterpret_cast<char*>(latent.data()), need * static_cast<int64_t>(sizeof(float)));
+      if (!lf) throw std::runtime_error("--decode-latent file too small for [C,T,H,W]");
+      std::cerr << "decode-latent: [" << ch << "," << lt << "," << lh << "," << lw << "] on "
+                << device_name << "\n";
+      vllm::MiniMaxH3T2vaResult result;
+      if (device_name == "cuda") {
+        vt::Device dev = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+        vt::Queue vq = vt::GetBackend(dev.type).CreateQueue();
+        const vllm::MiniMaxH3VideoVaeDeviceWeights staged =
+            vllm::StageMiniMaxH3VideoVaeWeights(vq, vcfg, vweights);
+        result.frames = vllm::MiniMaxH3VideoVaeDecodeTemporalDevice(
+            dev, vcfg, staged, latent, lt, lh, lw, plan.num_frames, &result.frame_shape);
+      } else {
+        result.frames = vllm::MiniMaxH3VideoVaeDecode(vcfg, vweights, latent, lt, lh, lw,
+                                                      &result.frame_shape);
+      }
+      vllm::MiniMaxH3VideoDenormalizePixels(
+          result.frames, result.frame_shape.channels,
+          result.frame_shape.t * result.frame_shape.h * result.frame_shape.w);
+      std::string mkc = "mkdir -p '" + workdir + "'";
+      if (std::system(mkc.c_str()) != 0) throw std::runtime_error("cannot create " + workdir);
+      for (int64_t fr = 0; fr < result.frame_shape.t; ++fr) {
+        char nm[512];
+        std::snprintf(nm, sizeof(nm), "%s/frame_%06lld.ppm", workdir.c_str(),
+                      static_cast<long long>(fr));
+        WriteFile(nm, vllm::MiniMaxH3WritePpmFrame(result.frames, result.frame_shape, fr));
+      }
+      std::cerr << "decode-latent: wrote " << result.frame_shape.t << " frames to " << workdir
+                << "\n";
       return 0;
     }
 

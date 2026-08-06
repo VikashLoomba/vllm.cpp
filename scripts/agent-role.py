@@ -7,18 +7,34 @@ role has already been taken. So the role is DECLARED, immediately MATERIALIZED
 into a fact, and only then re-derived. See
 .agents/specs/operator-helper-protocol.md.
 
-Two identities make that work, both verified real rather than assumed:
+A role keys on the **worktree**, never on the session (user-directed correction,
+2026-08-06):
 
-* **session** - `VLLM_CPP_AGENT_SESSION` when set, else the parent process id,
-  which is the agent CLI process and is stable across tool calls within a
-  session (measured) while differing between concurrently running sessions.
-* **worktree** - `git rev-parse --git-dir`, which is per-worktree
+* **worktree** - `git rev-parse --absolute-git-dir`, which is per-worktree
   (`.git/worktrees/<name>`), so a materialized helper is distinguishable from
-  the primary checkout without any bookkeeping.
+  the primary checkout without any bookkeeping. The marker lives inside it, so
+  one worktree is one role and that role survives a new shell, a new process
+  and a lost environment.
+* **session** - `VLLM_CPP_AGENT_SESSION` when set, else the parent process id.
+  Recorded as PROVENANCE only, and nothing gates on it. An earlier version of
+  this file called it "stable across tool calls within a session (measured)".
+  That was DISPROVEN: at least one real harness gives every tool call a fresh
+  shell and does not persist environment variables, so a role claimed in one
+  call resolved as UNDECLARED in the next and `agent-preflight.sh` exited 1 --
+  making a default-on role gate unpassable rather than strict, which is how a
+  gate teaches people to disable it.
+
+The accepted cost is explicit: two sessions sharing one checkout share a role.
+Helpers take their own worktree by construction, so the shared case is the
+operator's primary checkout, where one role is the correct answer anyway. See
+.agents/specs/session-onboarding.md, "Correction: a role keys on the WORKTREE,
+not the session".
 
 The operator lock lives in the git COMMON dir, not the working tree: it is
 shared by every worktree of the repo (the correct scope for "one operator per
-repo") and can never be committed by accident.
+repo") and can never be committed by accident. Its ownership keys on the
+worktree too, so the operator survives the same call boundary while a second
+worktree is still refused.
 
     scripts/agent-role.py show                  # resolve; exit 3 if undeclared
     scripts/agent-role.py claim operator
@@ -67,20 +83,46 @@ def git(*args: str) -> str:
 
 
 def session_id() -> str:
-    """Stable within one agent session, distinct between concurrent ones."""
+    """Provenance only: who declared this. NOT stable across tool calls."""
     explicit = os.environ.get("VLLM_CPP_AGENT_SESSION")
     return explicit if explicit else f"ppid:{os.getppid()}"
 
 
+def worktree_id() -> str:
+    """The identity a role keys on. One worktree is one role."""
+    return git("rev-parse", "--absolute-git-dir")
+
+
 def marker_path() -> Path:
     """Per-worktree, so a materialized helper carries its own role."""
-    return Path(git("rev-parse", "--absolute-git-dir")) / "vllm-cpp-agent-role"
+    return Path(worktree_id()) / "vllm-cpp-agent-role"
 
 
 def lock_path() -> Path:
     """Shared by every worktree of this repo, and never inside the work tree."""
     common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
     return Path(common) / "vllm-cpp-operator.lock"
+
+
+def lock_is_ours(lock: dict | None) -> bool:
+    """Does the operator lock belong to THIS worktree?
+
+    Ownership follows the same identity as the role. A lock written before the
+    2026-08-06 correction carries no worktree, so it falls back to its recorded
+    session: that keeps such a lock releasable and re-claimable by the session
+    that took it instead of wedging the repo until the TTL expires.
+
+    That fallback is WIDER than the worktree rule -- another worktree running
+    under the same session id also reads it as ours -- so `claim` rewrites the
+    record instead of passing, stamping the worktree on and healing the
+    ambiguity the first time it is used. Delete this branch once no
+    pre-correction lock can exist.
+    """
+    if not lock:
+        return False
+    if lock.get("worktree"):
+        return lock["worktree"] == worktree_id()
+    return lock.get("session") == session_id()
 
 
 def read_json(path: Path) -> dict | None:
@@ -103,36 +145,40 @@ def current_branch() -> str:
 
 
 def resolve() -> dict:
-    """Return the resolved role for THIS session, or {'role': None, ...}."""
+    """Return the resolved role for THIS WORKTREE, or {'role': None, ...}."""
     me = session_id()
     marker = read_json(marker_path())
     lock = read_json(lock_path())
 
-    # A marker written by a DIFFERENT session sharing this checkout is not ours.
+    # The marker is keyed on the WORKTREE, which is where it lives, and NOT on
+    # the session: a session id is not stable across tool calls, so requiring it
+    # made a declared role invisible one call later. `session` is carried
+    # through as `declared_by` provenance and gates nothing.
+    #
     # DECLARABLE, not ROLES: read-only is declarable but holds no lock, so it
     # must resolve here while still never counting as "may write".
-    if marker and marker.get("session") == me and marker.get("role") in DECLARABLE:
+    if marker and marker.get("role") in DECLARABLE:
         declared = marker["role"]
-        if declared == "operator":
-            if not lock or lock.get("session") != me:
-                return {
-                    "role": None,
-                    "session": me,
-                    "mode": "interactive",
-                    "reason": "operator marker without a held lock; re-claim",
-                    "branch": current_branch(),
-                }
+        if declared == "operator" and not lock_is_ours(lock):
+            return {
+                "role": None,
+                "session": me,
+                "mode": "interactive",
+                "reason": "operator marker without a held lock; re-claim",
+                "branch": current_branch(),
+            }
         return {
             "role": declared,
             "row": marker.get("row"),
             "session": me,
+            "declared_by": marker.get("session"),
             "branch": current_branch(),
             "mode": mode_from_marker(marker),
             "reason": "declared",
         }
 
-    # Not declared by us. Report what else is going on so the caller can decide.
-    held_by_other = bool(lock and lock.get("session") != me and not lock_is_stale(lock))
+    # Not declared here. Report what else is going on so the caller can decide.
+    held_by_other = bool(lock and not lock_is_ours(lock) and not lock_is_stale(lock))
     return {
         "role": None,
         "session": me,
@@ -166,7 +212,8 @@ def cmd_claim(args: argparse.Namespace) -> int:
 
     if role == "operator":
         path = lock_path()
-        record = {"session": me, "claimed_at": time.time(), "heartbeat": time.time(),
+        record = {"session": me, "worktree": worktree_id(),
+                  "claimed_at": time.time(), "heartbeat": time.time(),
                   "host": os.uname().nodename, "pid": os.getpid()}
         try:
             # Create-exclusive: a second self-declared operator FAILS here rather
@@ -176,8 +223,15 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 json.dump(record, handle)
         except FileExistsError:
             existing = read_json(path) or {}
-            if existing.get("session") == me:
-                pass  # already ours, idempotent
+            if lock_is_ours(existing):
+                # Already this worktree's. REWRITE rather than pass: it renews
+                # the heartbeat (ownership keyed on the worktree means a live
+                # operator re-claims more often than it beats, and a lock that
+                # ages out while its owner is alive gets broken by someone
+                # else), and it stamps `worktree` onto a pre-correction lock,
+                # which is what stops the legacy session fallback below from
+                # leaving two worktrees resolving as operator at once.
+                path.write_text(json.dumps(record), encoding="utf-8")
             elif lock_is_stale(existing):
                 age = int(time.time() - float(existing.get("heartbeat", 0)))
                 print(
@@ -227,9 +281,8 @@ def cmd_heartbeat(_: argparse.Namespace) -> int:
 
 
 def cmd_release(_: argparse.Namespace) -> int:
-    me = session_id()
     lock = read_json(lock_path())
-    if lock and lock.get("session") == me:
+    if lock_is_ours(lock):
         lock_path().unlink(missing_ok=True)
         print("released the operator lock")
     marker_path().unlink(missing_ok=True)

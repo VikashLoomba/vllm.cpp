@@ -9,6 +9,7 @@ a complete one, and an undeclared role must never render as a declared one.
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 import tempfile
@@ -167,6 +168,54 @@ class QueueTests(unittest.TestCase):
         self.assertIn("record is broken", error)
         self.assertIn("UNAVAILABLE", onboard.render_probe(
             dict(ProbeRenderTests.UNDECLARED, queue=[], queue_error=error)))
+
+
+class PreflightWiringTests(unittest.TestCase):
+    TEXT = (ROOT / "scripts/agent-preflight.sh").read_text(encoding="utf-8")
+
+    def test_require_role_defaults_on(self):
+        # Anchored to the DEFAULT assignment itself -- the line with no
+        # indentation and nothing else on it. A bare assertIn("REQUIRE_ROLE=1")
+        # is satisfied by the --require-role arm of the arg loop all by itself,
+        # so the default could be flipped back and the whole deliverable of this
+        # change would go unprotected. Any line-anchored assignment of zero is
+        # refused, quoted or not, because that is what a silent revert looks
+        # like however it is spelled.
+        self.assertRegex(self.TEXT, r"(?m)^REQUIRE_ROLE=1$")
+        self.assertNotRegex(self.TEXT, r"""(?m)^REQUIRE_ROLE=['"]?0['"]?$""")
+
+    def test_opt_out_flag_exists(self):
+        self.assertIn("--no-require-role", self.TEXT)
+
+    def test_failure_text_carries_the_interview(self):
+        # An error code alone gets routed around. The gate must say what to ask.
+        self.assertIn("claim read-only", self.TEXT)
+        self.assertIn("claim helper --row", self.TEXT)
+
+    def test_staged_refuses_read_only(self):
+        self.assertIn("read-only", self.TEXT)
+        self.assertIn("STAGED", self.TEXT)
+
+    def test_the_gate_records_a_failure_and_not_only_a_print(self):
+        # Every other assertion in this class inspects the text that EXPLAINS
+        # the gate, so deleting the one line that enforces it -- the failed+=()
+        # inside the REQUIRE_ROLE branch -- leaves them all green while
+        # preflight exits 0 on an undeclared role. Pin the enforcing line, and
+        # pin that it is inside the branch: outside it, --no-require-role would
+        # stop working instead.
+        branch = re.search(
+            r'if \[ "\$REQUIRE_ROLE" -eq 1 \]; then(.*?)\n  fi', self.TEXT, re.S)
+        self.assertIsNotNone(branch, "the REQUIRE_ROLE branch is gone")
+        self.assertIn('failed+=("role-undeclared")', branch.group(1))
+
+    def test_onboard_suite_is_registered(self):
+        self.assertIn("test_agent_onboard", self.TEXT)
+
+    def test_read_only_alone_does_not_satisfy_a_write_gate(self):
+        # agent-role.py show exits 0 for read-only, so --require-role is
+        # satisfied by a declared ABSENCE of claim. That is correct for a plain
+        # run and wrong for --staged; the refusal must be explicit.
+        self.assertIn("read-only-cannot-stage", self.TEXT)
 
 
 if __name__ == "__main__":

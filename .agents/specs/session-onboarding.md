@@ -130,6 +130,52 @@ stay `PENDING`. That is an honest state, not a failure.
 Never substitute another developer's paths, and never infer a value from a
 username, a filesystem path or a machine identity.
 
+## Correction: a role keys on the WORKTREE, not the session
+
+User-directed 2026-08-06, after Task 3 of the implementation hit it.
+
+`scripts/agent-role.py`'s docstring asserts the session id is "the parent
+process id, which is the agent CLI process and is **stable across tool calls
+within a session (measured)**". **That is false in at least one real harness**,
+and it was measured to be false three ways:
+
+- two consecutive `agent-role.py show` calls report different ids
+  (`ppid:2530150`, then `ppid:2530375`);
+- `claim read-only` in one call, then `show` in the next, reports `UNDECLARED`;
+- `agent-preflight.sh` in the next call exits 1.
+
+Every tool call gets a fresh shell, and the harness does not persist environment
+variables, so `VLLM_CPP_AGENT_SESSION` cannot be exported once and reused.
+Because `resolve()` requires `marker["session"] == me`, a role claimed in one
+call is invisible in the next.
+
+The consequence is worse than inconvenient: `--require-role` default-on becomes
+**unpassable rather than strict**, which points every agent straight at
+`--no-require-role` — precisely the erosion the `read-only` answer exists to
+prevent. A gate that cannot be satisfied is not a stricter gate; it is a gate
+people learn to disable.
+
+**The fix is to key the role on the worktree.** The marker already lives in the
+worktree's own git dir, so one worktree is one role, and the spec's own
+reasoning supports it: *"a materialized helper is distinguishable from the
+primary checkout without any bookkeeping"*. The circularity the original
+protocol worried about — that derivation cannot decide a role before one has
+been taken — is resolved by the DECLARE step writing the marker; after that,
+deriving from the worktree is sound.
+
+Two properties are preserved unchanged:
+
+- **One operator per repo.** The operator lock stays in the git COMMON dir, so
+  it is shared by every worktree and a second operator still fails.
+- **Helpers stay isolated.** A helper already materializes its own worktree.
+
+The cost is explicit: **two agent sessions sharing one checkout now share a
+role.** That is the case the session id was invented for, and it is the right
+trade — helpers get their own worktree by construction, so the shared case is
+almost always the operator's primary checkout, where one role is the correct
+answer anyway. `scripts/agent-role.py`'s docstring must lose the false
+"measured" claim in the same change.
+
 ## Enforcement
 
 **`scripts/agent-onboard.py --probe`** (new, harness-neutral, read-only) reports

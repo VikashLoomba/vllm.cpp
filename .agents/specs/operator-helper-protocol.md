@@ -68,10 +68,13 @@ does not exist in the environment yet. It is also cheap, once per session.
 After this step the session IS distinguishable from the outside, which is what
 the first draft wrongly assumed at the start.
 
-**3. Persist and re-derive — never ask twice.** The role is recorded in a
-session-scoped marker (keyed by session id, outside the repo). Re-derivation, not
-memory, is what survives context compaction: a session that has forgotten its
-role reads the marker and the lock rather than guessing or asking again.
+**3. Persist and re-derive — never ask twice.** The role is recorded in a marker
+inside the worktree's own git dir, keyed by the WORKTREE and not by the session
+id (corrected 2026-08-06: a session id is not stable across tool calls in every
+harness, so keying on it made a declared role invisible one call later — see
+`.agents/specs/session-onboarding.md`). Re-derivation, not memory, is what
+survives context compaction: a session that has forgotten its role reads the
+marker and the lock rather than guessing or asking again.
 
 **4. Resolution rides on the mandatory preflight.** `scripts/agent-preflight.sh`
 resolves and PRINTS the role every run, and refuses to pass if a session has not
@@ -213,9 +216,10 @@ PR, whoever produced it.
 `ROLE_DISCIPLINE_SINCE` names that cutover. Turning it on retroactively would redden
 history created under the current, explicitly sanctioned direct-push policy. Set
 that constant to the cutover commit when the protocol is adopted, and every
-commit after it is enforced. Likewise `agent-preflight.sh` PRINTS the role every
-run but only fails on `--require-role`, so an undeclared session is visible
-before it is fatal.
+commit after it is enforced. `agent-preflight.sh` PRINTS the role every run, and
+that was its only effect until 2026-08-06, when an undeclared role became a
+FAILING gate by default; `--no-require-role` is the explicit opt-out, and a
+`read-only` declaration passes a plain run while failing `--staged`.
 
 ## Risks/decisions
 

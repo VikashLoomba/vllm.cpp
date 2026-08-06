@@ -55,7 +55,7 @@ Copied from `AGENTS.md` and `.agents/specs/session-onboarding.md`. Every task's 
 
 **Interfaces:**
 - Consumes: `scripts/agent-role.py` — `resolve() -> dict` (keys `role`, `row`, `session`, `branch`, `reason`), loaded via `importlib.util` because the filename is hyphenated.
-- Produces: `ENV_KEYS: tuple[str, ...]`; `env_state() -> tuple[str, list[str]]` returning `(status, missing_keys)` where status is `"present" | "missing" | "incomplete"`; `ready_rows() -> list[str]`; `probe() -> dict` with keys `role`, `row`, `mode`, `env`, `env_missing`, `queue`; `render_probe(state: dict) -> str`; `main(argv=None) -> int`.
+- Produces: `ENV_KEYS: tuple[str, ...]`; `env_state() -> tuple[str, list[str]]` returning `(status, missing_keys)` where status is `"present" | "missing" | "incomplete" | "unreadable"`; `ready_rows() -> list[str]`; `probe() -> dict` with keys `role`, `row`, `mode`, `env`, `env_missing`, `queue`; `render_probe(state: dict) -> str`; `main(argv=None) -> int`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -137,9 +137,21 @@ class ProbeRenderTests(unittest.TestCase):
         self.assertNotIn("operator", out.split("queue")[0])
 
     def test_declared_role_renders_with_its_row(self):
-        out = onboard.render_probe(dict(self.UNDECLARED, role="helper", row="ENG-FOO"))
+        # The row id must NOT be one the fixture queue already contains, or the
+        # queue line satisfies the assertion and deleting row rendering stays
+        # green. Assert the `row=` prefix, not the bare id.
+        out = onboard.render_probe(dict(self.UNDECLARED, role="helper", row="KERNEL-BAR"))
         self.assertIn("helper", out)
-        self.assertIn("ENG-FOO", out)
+        self.assertIn("row=KERNEL-BAR", out)
+
+    def test_undeclared_render_carries_the_interview_hint(self):
+        # The hint is the whole point of the probe: without it an agent sees a
+        # state line and no instruction. Deleting the block must go red.
+        out = onboard.render_probe(self.UNDECLARED)
+        self.assertIn("claim", out)
+        self.assertIn("read-only", out)
+        self.assertNotIn("claim", onboard.render_probe(
+            dict(self.UNDECLARED, role="helper", row="KERNEL-BAR")))
 
     def test_probe_never_exits_nonzero(self):
         # The probe reports; it does not gate. Preflight gates.
@@ -258,7 +270,17 @@ def probe() -> dict:
     return {
         "role": state.get("role"),
         "row": state.get("row"),
-        "mode": state.get("mode") or "interactive",
+        # resolve() distinguishes "never declared" from "the operator lock is
+        # held by another live session" and from "operator marker without a
+        # held lock; re-claim". Dropping those makes this front door LESS
+        # honest than the tool it wraps, and sends a session toward `claim
+        # operator` when that will fail.
+        "blocked_by_other_operator": bool(state.get("operator_held_by_other")),
+        "reason": state.get("reason"),
+        # Absent until step 2 teaches resolve() about mode. Rendered as a
+        # default rather than a declaration, because headless is never
+        # inferred and neither is interactive.
+        "mode": state.get("mode"),
         "env": status,
         "env_missing": missing,
         "queue": ready_rows(),
@@ -268,14 +290,20 @@ def probe() -> dict:
 def render_probe(state: dict) -> str:
     role = state["role"] or "UNDECLARED"
     row = f" row={state['row']}" if state.get("row") else ""
+    mode = state.get("mode") or "interactive (default, not declared)"
     lines = [
-        f"role: {role}{row}   mode: {state['mode']}",
+        f"role: {role}{row}   mode: {mode}",
         f".env: {state['env']}"
         + (f" (unset: {', '.join(state['env_missing'])})" if state["env_missing"] else ""),
         f"queue: {len(state['queue'])} READY rows"
         + (f" — {', '.join(state['queue'][:5])}" if state["queue"] else ""),
     ]
     if state["role"] is None:
+        if state.get("blocked_by_other_operator"):
+            lines.append(
+                "NOTE: the operator lock is held by another live session, so "
+                "`claim operator` will fail. Take helper or read-only."
+            )
         lines.append(
             "This session has not declared a role. Ask what the work is, then claim: "
             "a long campaign -> operator; one scoped change -> helper --row <ROW-ID>; "
@@ -304,7 +332,7 @@ Make it executable: `chmod +x scripts/agent-onboard.py`
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_agent_onboard.py -v`
-Expected: PASS, 7 tests.
+Expected: PASS, 11 tests.
 
 - [ ] **Step 5: Smoke-test against the real repo**
 

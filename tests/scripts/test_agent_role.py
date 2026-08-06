@@ -35,6 +35,7 @@ def _load(name: str, relative: str):
 
 
 discipline = _load("role_discipline", "scripts/check-role-discipline.py")
+role = _load("agent_role", "scripts/agent-role.py")
 ROLE_SCRIPT = ROOT / "scripts/agent-role.py"
 
 
@@ -46,8 +47,8 @@ def run_role(repo: Path, session: str, *args: str):
     )
 
 
-class RoleLifecycle(unittest.TestCase):
-    """Exercised against a throwaway repo, never the real one."""
+class _TempRepo:
+    """A throwaway git repo per test. The real checkout is never touched."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -60,6 +61,10 @@ class RoleLifecycle(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+
+class RoleLifecycle(_TempRepo, unittest.TestCase):
+    """Exercised against a throwaway repo, never the real one."""
 
     def test_undeclared_session_exits_3(self) -> None:
         self.assertEqual(run_role(self.repo, "a", "show").returncode, 3)
@@ -187,7 +192,85 @@ class RoleDiscipline(unittest.TestCase):
         self.assertTrue(discipline.enforced("HEAD"))
 
     def test_live_repository_is_reportable(self) -> None:
-        self.assertEqual(discipline.main(), 0)
+        # main() parses sys.argv, which under `unittest -v` still carries the
+        # runner's own flags and made argparse SystemExit(2) here. The argv is
+        # isolated; the assertion is unchanged.
+        saved = sys.argv
+        sys.argv = [saved[0]]
+        try:
+            self.assertEqual(discipline.main(), 0)
+        finally:
+            sys.argv = saved
+
+
+class ReadOnlyAndModeTests(unittest.TestCase):
+    def test_claimable_roles_stay_exactly_two(self):
+        # read-only must never become a third claimable role: it takes no lock
+        # and no worktree, and every write path keys on CLAIMABLE_ROLES.
+        self.assertEqual(role.CLAIMABLE_ROLES, ("operator", "helper"))
+        self.assertIn("read-only", role.DECLARABLE)
+        self.assertNotIn("read-only", role.CLAIMABLE_ROLES)
+
+    def test_read_only_is_declarable(self):
+        self.assertIn("read-only", role.DECLARABLE)
+
+    def test_mode_defaults_to_interactive(self):
+        # Headless is DECLARED, never inferred. Absent an explicit flag the
+        # session is interactive.
+        self.assertEqual(role.mode_from_marker({}), "interactive")
+        self.assertEqual(role.mode_from_marker({"mode": "headless"}), "headless")
+        self.assertEqual(role.mode_from_marker({"mode": "nonsense"}), "interactive")
+
+
+class ReadOnlyAndModeResolved(_TempRepo, unittest.TestCase):
+    """Drives resolve() itself, not only the pure helpers above.
+
+    mode_from_marker() can be perfectly correct while resolve() never calls it:
+    the key would simply be absent from the resolved state and a test that only
+    exercised the helper would stay green. So these claim through the real CLI
+    and read the mode back out of resolve()'s OWN return value.
+    """
+
+    def _resolve_as(self, session: str) -> dict:
+        cwd = os.getcwd()
+        saved = os.environ.get("VLLM_CPP_AGENT_SESSION")
+        os.chdir(self.repo)
+        os.environ["VLLM_CPP_AGENT_SESSION"] = session
+        try:
+            return role.resolve()
+        finally:
+            os.chdir(cwd)
+            if saved is None:
+                del os.environ["VLLM_CPP_AGENT_SESSION"]
+            else:
+                os.environ["VLLM_CPP_AGENT_SESSION"] = saved
+
+    def test_resolve_carries_a_declared_headless_mode(self) -> None:
+        claimed = run_role(self.repo, "a", "claim", "read-only", "--headless")
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        state = self._resolve_as("a")
+        self.assertEqual(state["role"], "read-only")
+        self.assertEqual(state["mode"], "headless")
+
+    def test_resolve_reports_interactive_unless_headless_was_declared(self) -> None:
+        run_role(self.repo, "a", "claim", "helper", "--row", "ENG-FOO")
+        self.assertEqual(self._resolve_as("a")["mode"], "interactive")
+        # An UNDECLARED session is interactive too: silence is never headless.
+        undeclared = self._resolve_as("b")
+        self.assertIsNone(undeclared["role"])
+        self.assertEqual(undeclared["mode"], "interactive")
+
+    def test_read_only_takes_no_operator_lock(self) -> None:
+        # The whole reason read-only exists: a session that only reads must not
+        # hold the repo-wide operator lock, or it blocks a real operator.
+        self.assertEqual(run_role(self.repo, "a", "claim", "read-only").returncode, 0)
+        common = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=self.repo, text=True).strip()
+        self.assertFalse((Path(common) / "vllm-cpp-operator.lock").exists())
+        self.assertIn("role=read-only", run_role(self.repo, "a", "show").stdout)
+        # ... and another session is still free to become the operator.
+        self.assertEqual(run_role(self.repo, "b", "claim", "operator").returncode, 0)
 
 
 if __name__ == "__main__":

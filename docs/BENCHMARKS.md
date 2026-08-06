@@ -283,7 +283,7 @@ The PR #28 sanitizer repair is also NOT APPLICABLE to performance: both full
 333-test CPU detector lanes pass after merging upstream `main`, while the
 ASan+UBSan build footprint falls from 93 GiB to 5.7 GiB and TSan occupies
 1.9 GiB. Reproduce with the sanitizer
-CTest commands recorded in `.agents/state.md`. The 2026-08-06 live-state audit, its standing preflight+CI gate (`scripts/audit-live-rows.py --check`), that gate's review follow-up and the accepted session-onboarding design (`.agents/specs/session-onboarding.md`) are likewise NOT APPLICABLE: bookkeeping, a record checker over matrices and Git refs, a role interview, probe 1/5, prose. No engine code, no kernel, no number on this page.
+CTest commands recorded in `.agents/state.md`. The 2026-08-06 live-state audit, its standing preflight+CI gate (`scripts/audit-live-rows.py --check`), that gate's review follow-up and the accepted session-onboarding design (`.agents/specs/session-onboarding.md`) are likewise NOT APPLICABLE: bookkeeping, a record checker over matrices and Git refs, a role interview, probe 2/5, prose. No engine code, no kernel, no number on this page.
 
 **Vocabulary.** *Token-exact* means our output ids equal the reference's, byte
 for byte. *Near-tie* means the reference's own greedy decode is not deterministic

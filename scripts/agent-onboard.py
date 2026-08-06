@@ -127,9 +127,9 @@ def probe() -> dict:
         # operator` when that will fail.
         "blocked_by_other_operator": bool(state.get("operator_held_by_other")),
         "reason": state.get("reason"),
-        # Absent until step 2 teaches resolve() about mode. Rendered as a
-        # default rather than a declaration, because headless is never
-        # inferred and neither is interactive.
+        # resolve() now carries this (step 2). Still read with .get and still
+        # rendered as a DEFAULT when absent: headless is never inferred, so a
+        # state that carries no mode must not read as a declaration either.
         "mode": state.get("mode"),
         "env": status,
         "env_missing": missing,

@@ -23,6 +23,8 @@ repo") and can never be committed by accident.
     scripts/agent-role.py show                  # resolve; exit 3 if undeclared
     scripts/agent-role.py claim operator
     scripts/agent-role.py claim helper --row ENG-FOO
+    scripts/agent-role.py claim read-only          # declares no claim at all
+    scripts/agent-role.py claim helper --row ENG-FOO --headless
     scripts/agent-role.py heartbeat
     scripts/agent-role.py release
 """
@@ -38,7 +40,20 @@ import time
 from pathlib import Path
 
 
-ROLES = ("operator", "helper")
+# read-only is a declared ABSENCE of claim, not a third role: it takes no lock
+# and creates no worktree. Every "may this session write?" test keys on
+# CLAIMABLE_ROLES. Without it, a session that only reads must either take the
+# repo-wide operator lock or create a throwaway worktree, and faced with that
+# people reach for --no-require-role until the gate means nothing.
+CLAIMABLE_ROLES = ("operator", "helper")
+DECLARABLE = (*CLAIMABLE_ROLES, "read-only")
+ROLES = CLAIMABLE_ROLES  # retained: existing call sites mean "may write"
+
+
+def mode_from_marker(marker: dict) -> str:
+    """Interactive unless headless was DECLARED. Never inferred."""
+    return "headless" if marker.get("mode") == "headless" else "interactive"
+
 
 # A lock older than this with no heartbeat is stale: a crashed operator must not
 # block everyone forever. Breaking one is always logged, never silent.
@@ -94,21 +109,25 @@ def resolve() -> dict:
     lock = read_json(lock_path())
 
     # A marker written by a DIFFERENT session sharing this checkout is not ours.
-    if marker and marker.get("session") == me and marker.get("role") in ROLES:
-        role = marker["role"]
-        if role == "operator":
+    # DECLARABLE, not ROLES: read-only is declarable but holds no lock, so it
+    # must resolve here while still never counting as "may write".
+    if marker and marker.get("session") == me and marker.get("role") in DECLARABLE:
+        declared = marker["role"]
+        if declared == "operator":
             if not lock or lock.get("session") != me:
                 return {
                     "role": None,
                     "session": me,
+                    "mode": "interactive",
                     "reason": "operator marker without a held lock; re-claim",
                     "branch": current_branch(),
                 }
         return {
-            "role": role,
+            "role": declared,
             "row": marker.get("row"),
             "session": me,
             "branch": current_branch(),
+            "mode": mode_from_marker(marker),
             "reason": "declared",
         }
 
@@ -118,6 +137,7 @@ def resolve() -> dict:
         "role": None,
         "session": me,
         "branch": current_branch(),
+        "mode": "interactive",
         "operator_held_by_other": held_by_other,
         "reason": "undeclared",
     }
@@ -178,7 +198,15 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 return 1
 
     marker_path().write_text(
-        json.dumps({"role": role, "row": args.row, "session": me, "at": time.time()}),
+        json.dumps({
+            "role": role,
+            "row": args.row,
+            "session": me,
+            # Declared with the role, so it is a fact rather than a guess: no
+            # later code has to infer headless from the hour or from silence.
+            "mode": "headless" if args.headless else "interactive",
+            "at": time.time(),
+        }),
         encoding="utf-8",
     )
     print(f"claimed role={role}" + (f" row={args.row}" if args.row else ""))
@@ -218,8 +246,13 @@ def main() -> int:
     show.set_defaults(func=cmd_show)
 
     claim = sub.add_parser("claim", help="declare and materialize a role")
-    claim.add_argument("role", choices=ROLES)
+    claim.add_argument("role", choices=DECLARABLE)
     claim.add_argument("--row", help="the row ID a helper claims")
+    claim.add_argument(
+        "--headless",
+        action="store_true",
+        help="unattended run: decide and record rather than ask (never inferred)",
+    )
     claim.set_defaults(func=cmd_claim)
 
     sub.add_parser("heartbeat", help="keep the operator lock alive").set_defaults(

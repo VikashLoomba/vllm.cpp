@@ -459,6 +459,22 @@ class ClassifierTests(unittest.TestCase):
         self.assertIn("row/B-LIVE", reason)
         self.assertNotIn("row/A-MERGED", reason)
 
+    def test_reason_is_order_independent(self):
+        # The mixed case above has exactly ONE live branch, so sorted() is a
+        # no-op there and deleting it survives. Two branches on the same side
+        # of the filter are what pin determinism, on both reason paths: a
+        # report that reshuffles its own evidence between runs cannot be
+        # diffed by the human who has to act on it.
+        for label, by_branch in [
+            ("in-flight", {"row/B": ["abc1234 wip"], "row/A": ["def5678 wip"]}),
+            ("landed", {"row/B": [], "row/A": []}),
+        ]:
+            with self.subTest(label):
+                forward = audit.classify_active(["row/A", "row/B"], by_branch, [])
+                reverse = audit.classify_active(["row/B", "row/A"], by_branch, [])
+                self.assertEqual(forward, reverse)
+                self.assertIn("row/A, row/B", forward[1])
+
     def test_missing_branch_key_is_a_loud_caller_bug(self):
         # Silently treating an ungathered branch as merged would report a live
         # claim as finished -- the exact false negative this tool prevents.
@@ -522,7 +538,7 @@ def classify_active(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 17 tests.
+Expected: PASS, 18 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -634,7 +650,7 @@ def names_missing_modes(row_text: str) -> bool:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 22 tests.
+Expected: PASS, 23 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -860,7 +876,7 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 27 tests (28 added minus the transitional CLI-guard test you delete here).
+Expected: PASS, 28 tests (29 added minus the transitional CLI-guard test you delete here).
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 
@@ -1106,7 +1122,7 @@ In `.github/workflows/ci.yml`, extend the record job (lines 42–46):
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 30 tests.
+Expected: PASS, 31 tests.
 
 - [ ] **Step 6: Verify the whole gate is green**
 

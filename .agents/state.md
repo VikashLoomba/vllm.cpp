@@ -39537,3 +39537,24 @@ are committed on the row for the next session. fp4 speed path stays CLOSED.
 Box left clean (GPU idle, both locks free, worker down, ~39 G ckpt cached at
 `dgx:~/h3fp4/ckpt`, diagnostic latents at `dgx:~/h3fp4/diag`). Evidence:
 `dgx:~/h3fp4/{diag,rt_out,out_small,out_cond}`; PR #70.
+## 2026-08-06T20:45 - H3 DiT geometry-ladder gate CLAIMED (row/H3-DIT-SCALE-GATE, helper, DRAFT PR) - pin the #70 spatial-mixing divergence at real token geometry
+<!-- state: 2026-08-06T20:45 -->
+
+`row/H3-DIT-SCALE-GATE` (helper, isolated worktree off `origin/main` f7a1e322,
+DRAFT PR). CPU-ONLY (no dgx). Follow-up to #70, which root-caused the H3 render
+grid to the DiT emitting a spatially-WHITE latent at real token geometry (VAE,
+denoise loop, fp4/bf16 residency, attention kernels all ruled out). The
+reduced-dim DiT parity gate only ever ran 2x3 spatial tokens (1.6e-7 vs
+upstream); the divergence appears between 2x3 and the real 8x8 grid.
+
+PLAN: extend `scripts/gen-minimax-h3-goldens.py` `emit_dit` into a GEOMETRY
+LADDER (2x3 -> 4x4 -> 6x6 -> 8x8 + rectangle + multi-frame temporal + video+audio
+packed mix) at reduced hidden dims, running the same RefDiT oracle + upstream
+`minimax_h3_packed_sequence`; gate BOTH the host forward (`MiniMaxH3DitForward`)
+AND the device-resident forward (`MiniMaxH3DitForwardDevice`, CPU backend, the
+one the real pipeline uses) against it at every rung. Find the FIRST rung where
+ours diverges; bisect per-op; fix (mirror upstream); keep 63/63 green; add the
+ladder as a permanent below-one-tile gate. If the ladder does NOT reproduce even
+at 8x8+temporal+mix, record that verdict with data and redirect to the
+device-vs-host diff at ladder geometry. Harness verified: gen script reproduces
+the checked-in goldens byte-identically against the local `~/_git/vllm-omni`.

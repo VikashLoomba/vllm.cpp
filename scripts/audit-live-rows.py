@@ -238,5 +238,129 @@ def matched_marker(row_text: str) -> str:
     return match.group(0) if match else ""
 
 
+# Every PARTIAL row carries a flag string now -- either the marker that fired
+# or this. So "needs review" is THIS string, never merely a non-empty flag;
+# counting non-empty flags would report all 68 PARTIAL rows as vague.
+VAGUE_FLAG = "does not name its missing modes"
+
+
+def duplicate_live_ids(rows: list) -> dict[str, list[str]]:
+    """Row IDs that appear live in more than one matrix.
+
+    BACKEND-CUDA-SM121 and BACKEND-CPU are PARTIAL in BOTH backend-matrix.md
+    and feature-matrix.md, so 188 live rows carry only 186 unique IDs.
+    check-agent-record.py's duplicate check only walks MATRIX_PATHS, so it has
+    never seen these. Left unresolved, the backfill would mint two issues for
+    one item and this audit would report each twice with identical evidence.
+    """
+    seen: dict[str, list[str]] = {}
+    for row in rows:
+        seen.setdefault(row.item_id, []).append(f"{row.path.name}:{row.line_no}")
+    return {k: v for k, v in seen.items() if len(v) > 1}
+
+
+def audit() -> list[dict]:
+    """One record per live row, with verdict (ACTIVE) and flag (PARTIAL)."""
+    require_origin_main()
+    parse_errors: list[str] = []
+    rows = live_rows(parse_errors)
+    if parse_errors:
+        raise SystemExit(
+            "the matrices do not parse cleanly, so the census is incomplete:\n"
+            + "\n".join(parse_errors)
+        )
+    duplicates = duplicate_live_ids(rows)
+    branches_by_id = row_branches()
+    records: list[dict] = []
+    for row in rows:
+        verdict = ""
+        reason = ""
+        flag = ""
+        if row.state == "ACTIVE":
+            branches = branches_by_id.get(row.item_id, [])
+            unmerged_by_branch = {b: unmerged(b) for b in branches}
+            verdict, reason = classify_active(
+                branches, unmerged_by_branch, main_commits(row.item_id)
+            )
+        if row.state == "PARTIAL":
+            marker = matched_marker(row.raw)
+            flag = f"explicit via {marker!r}" if marker else VAGUE_FLAG
+        records.append(
+            {
+                "duplicate": ", ".join(duplicates.get(row.item_id, [])),
+                "id": row.item_id,
+                "state": row.state,
+                "path": str(row.path.relative_to(ROOT)),
+                "line": row.line_no,
+                "verdict": verdict,
+                "reason": reason,
+                "flag": flag,
+            }
+        )
+    return records
+
+
+def _cell(value: object) -> str:
+    """Table cells never contain a raw pipe -- it would split the row."""
+    return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def render_markdown(records: list[dict]) -> str:
+    lines = [
+        "| Row | State | Location | Verdict | Evidence | Flag |",
+        "|---|---|---|---|---|---|",
+    ]
+    for item in records:
+        lines.append(
+            "| `{id}` | `{state}` | {path}:{line} | {verdict} | {reason} | {flag} |".format(
+                id=_cell(item["id"]),
+                state=_cell(item["state"]),
+                path=_cell(item["path"]),
+                line=_cell(item["line"]),
+                verdict=_cell(item["verdict"]) or "-",
+                reason=_cell(item["reason"]) or "-",
+                flag=_cell(item["flag"]) or "-",
+            )
+        )
+    return "\n".join(lines)
+
+
+def exit_code(records: list[dict], check: bool) -> int:
+    if not check:
+        return 0
+    abandoned = [
+        item
+        for item in records
+        if item["state"] in CHECK_FAILS_ON and item["verdict"] == "ABANDONED"
+    ]
+    return 1 if abandoned else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="exit 1 if any ACTIVE row is abandoned",
+    )
+    args = parser.parse_args(argv)
+
+    records = audit()
+    if args.json:
+        print(json.dumps(records, indent=2, sort_keys=True))
+    else:
+        print(render_markdown(records))
+        stale = [i for i in records if i["verdict"] == "ABANDONED"]
+        vague = [i for i in records if i["flag"] == VAGUE_FLAG]
+        dupes = sorted({i["id"] for i in records if i["duplicate"]})
+        print(
+            f"\n{len(records)} live rows; {len(stale)} abandoned ACTIVE; "
+            f"{len(vague)} PARTIAL rows to review; "
+            f"{len(dupes)} IDs live in two matrices: {', '.join(dupes) or 'none'}."
+        )
+    return exit_code(records, args.check)
+
+
 if __name__ == "__main__":
-    raise SystemExit("CLI arrives in P0 step 4; import this module for now")
+    raise SystemExit(main())

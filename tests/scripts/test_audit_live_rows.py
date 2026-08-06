@@ -8,12 +8,15 @@ abandoned row live because a branch name happens to exist.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import re
-import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -101,21 +104,6 @@ class IdGrepPatternTests(unittest.TestCase):
             "record(mm): MODEL-MM_SUFFIX bookkeeping",
         ):
             self.assertIsNone(pattern.search(message), message)
-
-
-class CommandLineGuardTests(unittest.TestCase):
-    def test_check_flag_does_not_silently_exit_zero(self):
-        # The file is executable and its docstring advertises --check, but the
-        # real CLI arrives in P0 step 4. Until then --check must NOT exit 0:
-        # a gate that reports success because it ignored its own flag is the
-        # worst possible answer.
-        result = subprocess.run(
-            [sys.executable, str(ROOT / "scripts/audit-live-rows.py"), "--check"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertNotEqual(result.returncode, 0)
 
 
 class ClassifierTests(unittest.TestCase):
@@ -294,6 +282,180 @@ class PartialGapTests(unittest.TestCase):
         # argument instead of closing over GAP_MARKERS.
         self.assertEqual(
             audit.GAP_RE.pattern, audit.gap_pattern(audit.GAP_MARKERS).pattern
+        )
+
+
+class ReportTests(unittest.TestCase):
+    RECORDS = [
+        {
+            "id": "ENG-FOO",
+            "state": "ACTIVE",
+            "path": ".agents/engine-matrix.md",
+            "line": 42,
+            "verdict": "ABANDONED",
+            "reason": "no branch, no commit on main mentioning the row ID",
+            "flag": "",
+        },
+        {
+            "id": "MODEL-BAR",
+            "state": "PARTIAL",
+            "path": ".agents/model-matrix.md",
+            "line": 7,
+            "verdict": "",
+            "reason": "",
+            "flag": "does not name its missing modes",
+        },
+    ]
+
+    def test_markdown_lists_every_record(self):
+        out = audit.render_markdown(self.RECORDS)
+        self.assertIn("ENG-FOO", out)
+        self.assertIn("MODEL-BAR", out)
+        self.assertIn("ABANDONED", out)
+        self.assertIn("does not name its missing modes", out)
+
+    def test_markdown_cells_do_not_break_the_table(self):
+        records = [dict(self.RECORDS[0], reason="a | b")]
+        out = audit.render_markdown(records)
+        body = [ln for ln in out.splitlines() if "ENG-FOO" in ln]
+        self.assertEqual(len(body), 1)
+        self.assertNotIn("a | b", body[0])
+
+    def test_check_mode_fails_when_an_active_row_is_abandoned(self):
+        self.assertEqual(audit.exit_code(self.RECORDS, check=True), 1)
+
+    def test_check_mode_passes_when_no_active_row_is_abandoned(self):
+        clean = [dict(self.RECORDS[0], verdict="IN-FLIGHT")] + self.RECORDS[1:]
+        self.assertEqual(audit.exit_code(clean, check=True), 0)
+
+    def test_only_the_vague_flag_counts_as_needing_review(self):
+        # Every PARTIAL row carries a flag: the marker that fired, or the vague
+        # string. Counting non-empty flags would report all 68 as vague.
+        explicit = dict(self.RECORDS[1], flag="explicit via 'missing'")
+        self.assertNotEqual(explicit["flag"], audit.VAGUE_FLAG)
+        self.assertEqual(self.RECORDS[1]["flag"], audit.VAGUE_FLAG)
+
+    def test_report_mode_always_exits_zero(self):
+        self.assertEqual(audit.exit_code(self.RECORDS, check=False), 0)
+
+    def test_vague_partial_alone_never_fails_check_mode(self):
+        only_flag = [self.RECORDS[1]]
+        self.assertEqual(audit.exit_code(only_flag, check=True), 0)
+
+
+class SummaryTests(unittest.TestCase):
+    """The counting the summary line actually does, not just the constant.
+
+    test_only_the_vague_flag_counts_as_needing_review above compares two
+    literals and never calls the code: rewriting the summary to count every
+    non-empty flag leaves it green while the report claims all 68 PARTIAL rows
+    need review instead of the ~20 that do. This drives the real counter.
+    """
+
+    VAGUE = {
+        "id": "MODEL-VAGUE",
+        "state": "PARTIAL",
+        "path": ".agents/model-matrix.md",
+        "line": 7,
+        "verdict": "",
+        "reason": "",
+        "flag": "does not name its missing modes",
+        "duplicate": "",
+    }
+    EXPLICIT = dict(VAGUE, id="MODEL-EXPLICIT", flag="explicit via 'missing'")
+
+    def run_main(self, records: list[dict], argv: list[str]) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with mock.patch.object(audit, "audit", lambda: records):
+            with contextlib.redirect_stdout(buffer):
+                code = audit.main(argv)
+        return code, buffer.getvalue()
+
+    def test_summary_counts_only_the_vague_partial_rows(self):
+        code, out = self.run_main([self.VAGUE, self.EXPLICIT], [])
+        self.assertEqual(code, 0)
+        self.assertIn("2 live rows; 0 abandoned ACTIVE", out)
+        self.assertIn("1 PARTIAL rows to review", out)
+
+    def test_summary_names_the_ids_living_in_two_matrices(self):
+        both = dict(self.VAGUE, id="BACKEND-CPU", duplicate="backend-matrix.md:12")
+        _, out = self.run_main([both, self.EXPLICIT], [])
+        self.assertIn("1 IDs live in two matrices: BACKEND-CPU", out)
+
+    def test_json_mode_emits_every_record_and_no_report_table(self):
+        code, out = self.run_main([self.VAGUE, self.EXPLICIT], ["--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), [self.VAGUE, self.EXPLICIT])
+        self.assertNotIn("PARTIAL rows to review", out)
+
+
+class AuditGuardTests(unittest.TestCase):
+    """audit() must abort rather than emit a quietly wrong census."""
+
+    def test_origin_main_is_verified_before_any_row_is_read(self):
+        # git() maps every failure to "", so an unfetched origin/main makes
+        # each row look ABANDONED and the audit would propose downgrading all
+        # 54 ACTIVE rows at once. The guard has to fire first, not eventually.
+        calls: list[str] = []
+
+        def guard() -> None:
+            calls.append("guard")
+            raise SystemExit("origin/main does not resolve")
+
+        def rows(errors=None):
+            calls.append("rows")
+            return []
+
+        with mock.patch.object(audit, "require_origin_main", guard), mock.patch.object(
+            audit, "live_rows", rows
+        ):
+            with self.assertRaises(SystemExit):
+                audit.audit()
+        self.assertEqual(calls, ["guard"])
+
+    def test_a_row_that_fails_to_parse_aborts_the_audit(self):
+        # parse_claim_rows DROPS a row it cannot parse. A census whose whole
+        # point is completeness must not quietly return one row short.
+        def broken(errors=None):
+            if errors is not None:
+                errors.append(".agents/engine-matrix.md:9: ENG-X has 4 cells")
+            return []
+
+        with mock.patch.object(
+            audit, "require_origin_main", lambda: None
+        ), mock.patch.object(audit, "live_rows", broken):
+            with self.assertRaises(SystemExit) as caught:
+                audit.audit()
+        self.assertIn("ENG-X", str(caught.exception))
+
+
+class DuplicateLiveIdTests(unittest.TestCase):
+    @staticmethod
+    def _row(item_id: str, matrix: str, line_no: int):
+        return audit.record.ClaimRow(
+            path=audit.record.AGENTS / matrix,
+            line_no=line_no,
+            item_id=item_id,
+            state="PARTIAL",
+            header=(),
+            cells=(),
+            raw="",
+        )
+
+    def test_only_ids_live_in_more_than_one_matrix_are_reported(self):
+        # A row ID living in two matrices would mint two issues for one item
+        # and report the same item twice with identical evidence. Every other
+        # ID must stay out of the result, or the report calls all 186 duplicates.
+        dupes = audit.duplicate_live_ids(
+            [
+                self._row("BACKEND-CPU", "backend-matrix.md", 12),
+                self._row("BACKEND-CPU", "feature-matrix.md", 40),
+                self._row("ENG-SOLO", "engine-matrix.md", 5),
+            ]
+        )
+        self.assertEqual(list(dupes), ["BACKEND-CPU"])
+        self.assertEqual(
+            dupes["BACKEND-CPU"], ["backend-matrix.md:12", "feature-matrix.md:40"]
         )
 
 

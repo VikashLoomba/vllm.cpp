@@ -661,6 +661,24 @@ python3 scripts/check-doc-checkpoint.py --commit "$(git rev-parse HEAD)"; echo "
 
 ### Task 4: The ratchet
 
+> **Superseded on 2026-08-06 by the whole-branch review, in two places. This
+> plan text is left as written; where it disagrees with the list below, the list
+> governs.**
+>
+> 1. **"Shrink-only" is wrong** — here, in Task 2's `AUDITED_MATRIX_PATHS`
+>    comment, in "Done when", and wherever else this plan says it. What shipped
+>    is an **exact pin**: `RUNNABLE_BASELINE` must EQUAL the audited `runnable`
+>    set, so growth is red too and any movement re-pins the set in the same
+>    change. See `.agents/specs/gate-command-audit-2026-08-06.md` § The ratchet
+>    baseline.
+> 2. **`test_all_seven_matrices_are_audited` is wrong**, and its
+>    `assertIn("sglang-matrix.md", names)` was plan-mandated. `sglang-matrix.md`
+>    carries a classification column, not a lifecycle state, and contributed 0
+>    rows of 87 — listed and empty, which is this repo's recorded defect class.
+>    It is **dropped** from the audited set with the reasoning recorded; six
+>    matrices are audited, and the test now pins the justification (zero rows AND
+>    zero parse errors) instead of the membership. See that artifact's risk 6.
+
 **Files:**
 - Modify: `scripts/check-gate-commands.py`
 - Modify: `scripts/agent-preflight.sh` (`CHECKERS=(` line 57, `SUITES=(` line 73)

@@ -41,9 +41,12 @@ a decision with reasoning attached rather than a number someone pasted.
 ## Scope
 
 - **Subject:** every row at `READY`, `ACTIVE`, `GATING`, `DONE` or `BLOCKED` in
-  the seven area matrices, as of `0a23f966` on `spec/orchestration-harness`
-  (`.agents/{engine,model,kernel,backend,quantization,feature,sglang}-matrix.md`).
-  97 rows.
+  the **six lifecycle matrices**, as of `0a23f966` on `spec/orchestration-harness`
+  (`.agents/{engine,model,kernel,backend,quantization,feature}-matrix.md`).
+  97 rows. `sglang-matrix.md` was listed as a seventh when this audit ran and
+  contributed **0 rows**; step 5 dropped it from `AUDITED_MATRIX_PATHS` with the
+  reasoning recorded — see risk 6, which is now **resolved**, not deferred.
+  Nothing in the counts below changes: 0 rows in, 0 rows out.
 - **Instrument:** `scripts/check-gate-commands.py` (landed step 2, `0a23f966`).
 - **What the classifier decides:** whether the row's spec has a `Gates` heading,
   and whether the body under it contains at least one backticked or fenced span
@@ -137,15 +140,16 @@ carries a `pip install`.
 | `kernel-matrix.md` | 10 | 1 | 5 | 4 | 0 |
 | `quantization-matrix.md` | 8 | 2 | 0 | 6 | 0 |
 | `feature-matrix.md` | 4 | 0 | 2 | 1 | 1 |
-| `sglang-matrix.md` | 0 | 0 | 0 | 0 | 0 |
+| `sglang-matrix.md` — now **excluded**, risk 6 | 0 | 0 | 0 | 0 | 0 |
 | **total** | **97** | **25** | **51** | **20** | **1** |
 
 `quantization-matrix.md` is the outlier: 6 of its 8 gated rows have **no `Gates`
 heading at all** and none are `gates-no-command`. Its specs record results in
 prose sections under other names.
 
-`sglang-matrix.md` contributes **zero rows, and not because its rows are all
-below `READY`** — see risk 6. It is audited in name only.
+`sglang-matrix.md` contributed **zero rows, and not because its rows are all
+below `READY`** — see risk 6. It was audited in name only, and is no longer
+listed as audited at all.
 
 ### `gates-no-command` — 51 rows
 
@@ -265,7 +269,7 @@ count, or the section boundary means nothing).
 | `MODEL-TEXT-deepseek-v2-glm-moe-dsa-…` | BLOCKED | model:202 | `scripts/check-agent-record.py` |
 | `QUANT-GGUF-COMPUTE` | READY | quant:33 | `VLLM_CPP_CPU_THREADS=N ctest --test-dir build -L cpu` |
 | `QUANT-NVFP4-CT-W4A16` | ACTIVE | quant:122 | `scripts/qwen3-32b-nvfp4a16-oracle-capture.py --runs 5` |
-| `KERNEL-GEMM-CPU-ELEM` | ACTIVE | kernel:126 | `ctest -j2` |
+| `KERNEL-GEMM-CPU-ELEM` | ACTIVE | kernel:126 | `ctest -j2` **(weak — see risk 3; lifted from prose about a FLAKE)** |
 | `BACKEND-CUDA-ARCH-ADDITIVITY` | ACTIVE | backend:187 | `scripts/check-agent-record.py` (incl. `cuobjdump -lelf libvllm.a`) |
 | `BACKEND-METAL-MLX` | ACTIVE | backend:232 | `python3 -m venv ~/mlx-venv && … pip install … mlx-lm` **(env setup — risk 3)** |
 | `BACKEND-VULKAN` | ACTIVE | backend:233 | `python3 -m venv ~/mlx-venv && … pip install … mlx-lm` **(env setup — risk 3)** |
@@ -326,30 +330,50 @@ report those 16 as a debt someone forgot to pay.
 
 ## The ratchet baseline
 
-**25.**
+**The 25 named rows below — as a SET, pinned exactly.**
 
-That is the count of `runnable` rows at `0a23f966`, and it is the number step 4
-pins. The rule step 4 enforces is **shrink-only**: the count of `runnable` rows
-may rise and may never fall. A row that loses its gate command turns the gate
-red; a row that gains one raises the floor.
+> **Superseding note (step 5).** An earlier draft of this section said the
+> baseline was "**25**", "a **floor on a count**", and that the rule was
+> **shrink-only**. Both descriptions are wrong about what shipped, and the next
+> subsection (§ The baseline's principal false-red mode) already argued why a
+> count cannot work. What `check-gate-commands.py` pins is the SET of row IDs,
+> and it is pinned by **exact equality**, not as a floor. This section is the
+> corrected text; the count-and-floor wording survives nowhere.
 
-The baseline is a **floor on a count**, not an assertion that these 25 rows are
-correctly gated. Four of them are not (risk 3). It is pinned anyway, because a
-ratchet that waits for a clean baseline never starts, and because the alternative
-— relaxing the rule until everything passes — is the failure mode this whole
-subsystem exists to prevent. A relaxed gate is worse than no gate.
+Twenty-five rows scored `runnable` at `0a23f966`. Step 4 pins **their IDs**, in
+`RUNNABLE_BASELINE`, and the contract is an **exact pin**:
 
-Raising the baseline is ordinary work: transcribe a row's existing evidence into
-an invocation, and the count goes up. That is § Work breakdown item 5, and it is
-now measured rather than estimated.
+- `--check` refuses a row that **lost** its command, and distinguishes that from
+  a row that legitimately **left** the gated population (next subsection);
+- `tests/scripts/test_check_gate_commands.py` additionally asserts the shipped
+  `runnable` set **equals** `RUNNABLE_BASELINE`, which is what makes "just lower
+  the number" impossible to do quietly — and which means **growth is red too**.
+
+So adding a real gate command to a row's spec — textbook improvement — leaves
+`--check` at 0 while the suite, preflight and CI go red until the set is
+re-pinned. **That is the intended cost, and it is stronger than shrink-only.**
+Any movement, up or down, re-pins `RUNNABLE_BASELINE` in the SAME change, naming
+the rows that moved and why. Growth is welcome, ordinary work; **silent** growth
+is what the pin forbids.
+
+The pin is not an assertion that these 25 rows are correctly gated. **Five of
+them are not** (risk 3). They are pinned anyway, because a ratchet that waits for
+a clean baseline never starts, and because the alternative — relaxing the rule
+until everything passes — is the failure mode this whole subsystem exists to
+prevent. A relaxed gate is worse than no gate.
+
+Raising the set is ordinary work: transcribe a row's existing evidence into an
+invocation, add the row ID here and to `RUNNABLE_BASELINE` in the same change.
+That is § Work breakdown item 5, and it is now measured rather than estimated.
 
 ### The baseline's principal false-red mode: the population moves
 
-**25 is a count over a population that is not fixed, and step 4 must handle
-that explicitly.** Step 2 already observed the record move — three rows shifted
-during its own work — which is exactly why the *total* (97) was deliberately not
-pinned. But the `runnable` count inherits the same exposure, and a naive
-shrink-only rule reads a legitimate record edit as a regression.
+**Twenty-five is a headcount over a population that is not fixed, which is the
+first reason step 4 pins IDs rather than a number.** Step 2 already observed
+the record move — three rows shifted during its own work — which is exactly why
+the *total* (97) was deliberately not pinned. The `runnable` population inherits
+the same exposure, and a rule written over a bare number reads a legitimate
+record edit as a regression.
 
 A `runnable` row can leave the population without anything being broken:
 
@@ -357,12 +381,14 @@ A `runnable` row can leave the population without anything being broken:
 - it is **merged** with another row;
 - it **transitions out of `GATED_STATES`** — e.g. `READY` → `INVENTORIED` on a
   descope, or any move to a state below `READY`;
-- its **matrix** leaves `AUDITED_MATRIX_PATHS` (see risk 6, which recommends
-  exactly this for `sglang-matrix.md`).
+- its **matrix** leaves `AUDITED_MATRIX_PATHS` (risk 6, done in step 5 for
+  `sglang-matrix.md` — which cost nothing here only because that matrix
+  contributed no `runnable` rows to begin with).
 
-Each drops the count below 25 and turns a shrink-only gate red on a correct
-edit. Risk 4 covers gaming the count *upward*; this is the opposite failure and
-is the more likely one, because record edits are routine and gaming is not.
+Each drops the headcount below 25 and would turn a number-based gate red on a
+correct edit. Risk 4 covers gaming the count *upward*; this is the opposite
+failure and is the more likely one, because record edits are routine and gaming
+is not.
 
 **The distinguishing rule step 4 should implement:**
 
@@ -378,7 +404,8 @@ is lowering the baseline because the number "went down" without saying which row
 moved — that is the relaxation this subsystem exists to prevent.
 
 **Consequence for the checker's output:** step 4 cannot enforce this on a bare
-count. It needs the **set** of `runnable` row IDs, not just `len()`, so a drop
+count — this is what supersedes the count-and-floor wording flagged above. It
+needs the **set** of `runnable` row IDs, not just `len()`, so a drop
 can be attributed to a named row and classified as "lost its command" versus
 "left the population". Pinning an integer alone makes the two indistinguishable
 — the repo's recorded defect class, one more time.
@@ -496,10 +523,14 @@ The baseline pinned above is 25 because that is what the shipped classifier
 computes, and a baseline must be reproducible by running the tool. Recorded here
 so that when `classify_row` is fixed to scan all specs, the jump from 25 to 31 —
 and the § Findings `no-gates-section` total dropping 20 → 14 — is **understood as
-the fix landing** and not mistaken for rows being gated or degated. Under a
-shrink-only ratchet this fix is safe: it can only raise the count.
+the fix landing** and not mistaken for rows being gated or degated. Note this
+fix is **not** free under the shipped pin, and an earlier draft here said it was:
+the baseline is an EXACT pin, so taking `runnable` from 25 to 31 turns the suite
+red until the six new IDs are added to `RUNNABLE_BASELINE` in the same change.
+That is the pin working — the six rows are named right here, so the re-pin is a
+transcription with its reasoning already written.
 
-### 3. Four of the 25 `runnable` credits are not gates
+### 3. Five of the 25 `runnable` credits are not gates
 
 They satisfy the stated rule. The ratchet should not lock them in silently.
 
@@ -517,6 +548,13 @@ They satisfy the stated rule. The ratchet should not lock them in silently.
   review named.
 - **`SERVE-STREAM-USAGE`** — credited solely to `git diff --check`. This *can*
   fail (whitespace errors), so it is not vacuous, but it is not this row's gate.
+- **`KERNEL-GEMM-CPU-ELEM`** — credited solely to a bare `` `ctest -j2` ``
+  extracted from prose reporting a **flake**: the spec says a test "flaked once
+  under `ctest -j2` on the co-tenanted dev box". That is an incident report, not
+  an invocation this row is gated by — no `-R`, no test-dir, no assertion of a
+  result. The classifier reads shape, and the shape of a flake note is the shape
+  of a command. Found in step 5's whole-branch review; it is the fifth weak
+  credit and was missed by the count of four above.
 
 A related weakness, not counted above: three GLM rows
 (`MODEL-TEXT-glm4-*`, `MODEL-TEXT-deepseek-v2-glm-moe-dsa-*`) are credited
@@ -574,20 +612,34 @@ identical. A file listed as audited, returning no errors, contributing nothing.
 Anyone reading `AUDITED_MATRIX_PATHS` would reasonably conclude SGLang rows were
 examined and found clean.
 
-**Call: record, do not fix here.** Whether `SGLANG-*` rows *should* carry gate
+**Resolved in step 5: dropped, with the reasoning recorded.** `sglang-matrix.md`
+is no longer in `AUDITED_MATRIX_PATHS`; `scripts/check-gate-commands.py` carries
+the reason at the constant, and `test_sglang_is_excluded_and_the_exclusion_is_justified`
+pins the justification rather than the bare absence — it asserts that
+`parse_claim_rows` really does find zero rows and zero errors there, so the
+matrix goes back into the audited set the moment it gains lifecycle rows. The
+`runnable` set is unchanged at 25, because 0 rows left. The original call
+follows, unchanged.
+
+**Original call (step 3): record, do not fix here.** Whether `SGLANG-*` rows *should* carry gate
 commands is a real question — they are classification rows about a competitor's
 surface, and most are `FUSED`, i.e. claims about our existing implementation
 whose gates live on the rows they map to. But that argument must be made
 explicitly, not arrived at by a silent zero. Step 4 should either drop
 `sglang-matrix.md` from the audited set with that reasoning recorded, or teach
-the parser its schema. **It must not leave it listed and empty.**
+the parser its schema. **It must not leave it listed and empty.** — Step 4 did
+neither and step 5 took the first branch, above: dropping is the cheaper option
+and is defensible, because a classification column (`FUSED` / `INVENTORIED` /
+`NOT-APPLICABLE`) is not a lifecycle state and `FUSED` rows' gates live on the
+rows they map to, which are audited in their own right.
 
 ---
 
 ## Provenance
 
 - Classifier: `scripts/check-gate-commands.py` @ `0a23f966`.
-- Rows: the seven area matrices @ `0a23f966`.
+- Rows: the six lifecycle matrices @ `0a23f966` (`sglang-matrix.md` was listed
+  as a seventh and contributed 0 rows; dropped in step 5, risk 6).
 - Reproduce: `python3 scripts/check-gate-commands.py` (summary) or
   `--json` (per-row).
 - Related: [orchestration-harness.md](orchestration-harness.md) § Gate-command

@@ -77,6 +77,35 @@ def _prompt_tree(files: dict[str, str]):
             consistency.ROOT = saved
 
 
+@contextlib.contextmanager
+def _repo_copy(workflow_text: str, *, prompts: bool = True):
+    """Run consistency.main() against a copy of the repo's own documents.
+
+    Only `.agents/workflow.md` is substituted, so a red from this helper is
+    attributable to the manual under test rather than to a hand-built fixture
+    that never resembled the repository.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "scripts").mkdir()
+        (root / ".agents").mkdir()
+        shutil.copy(
+            ROOT / "scripts/check-doc-checkpoint.py",
+            root / "scripts/check-doc-checkpoint.py",
+        )
+        shutil.copy(ROOT / "AGENTS.md", root / "AGENTS.md")
+        if prompts:
+            shutil.copytree(ROOT / ".agents/prompts", root / ".agents/prompts")
+        (root / ".agents/workflow.md").write_text(workflow_text, encoding="utf-8")
+        saved, consistency.ROOT = consistency.ROOT, root
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                yield lambda: (consistency.main(), out.getvalue(), err.getvalue())
+        finally:
+            consistency.ROOT = saved
+
+
 def document(*paths: str) -> str:
     rows = "\n".join(f"| `{path}` | every checkpoint |" for path in paths)
     return "\n".join(
@@ -204,26 +233,8 @@ class InterviewWiring(unittest.TestCase):
 
     @contextlib.contextmanager
     def _tree(self, workflow_text: str, *, prompts: bool = True):
-        """Run consistency.main() against a copy of the repo's own documents."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "scripts").mkdir()
-            (root / ".agents").mkdir()
-            shutil.copy(
-                ROOT / "scripts/check-doc-checkpoint.py",
-                root / "scripts/check-doc-checkpoint.py",
-            )
-            shutil.copy(ROOT / "AGENTS.md", root / "AGENTS.md")
-            if prompts:
-                shutil.copytree(ROOT / ".agents/prompts", root / ".agents/prompts")
-            (root / ".agents/workflow.md").write_text(workflow_text, encoding="utf-8")
-            saved, consistency.ROOT = consistency.ROOT, root
-            out, err = io.StringIO(), io.StringIO()
-            try:
-                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    yield lambda: (consistency.main(), out.getvalue(), err.getvalue())
-            finally:
-                consistency.ROOT = saved
+        with _repo_copy(workflow_text, prompts=prompts) as run:
+            yield run
 
     def test_faithful_copy_passes(self):
         """Positive control: the temp tree itself is not what fails below."""
@@ -395,6 +406,168 @@ class PromptArtifactTests(unittest.TestCase):
                     with _prompt_tree({relative: damaged}):
                         errors = consistency.prompt_errors({relative: needles})
                     self.assertTrue(any("omits" in e for e in errors), errors)
+
+
+class OrchestrationLoopTests(unittest.TestCase):
+    """The operator's loop must live in the manual agents actually read.
+
+    A loop that exists only in an operator's head, or only in a sub-agent
+    prompt the operator never opens, is not a protocol: nothing tells the next
+    session that a reviewer must MUTATE, that the gate is run by the controller
+    rather than reported by the author, or that findings are never fixed in the
+    controller's own context.
+    """
+
+    def _manual(self) -> str:
+        return (ROOT / consistency.LOOP_DOCUMENT).read_text(encoding="utf-8")
+
+    def test_workflow_carries_the_loop_exactly_once(self):
+        # Uniqueness, not mere presence. A duplicated block would make every
+        # deletion mutation below silently invalid, because removing one copy
+        # leaves the other behind and the gate stays green for the wrong reason.
+        text = self._manual()
+        self.assertEqual(text.count(consistency.LOOP_MARKER), 1)
+        self.assertEqual(text.count(consistency.LOOP_END), 1)
+        self.assertLess(
+            text.index(consistency.LOOP_MARKER), text.index(consistency.LOOP_END)
+        )
+
+    def test_the_loop_states_the_rules_that_carry_it(self):
+        block = consistency.loop_block(self._manual())
+        self.assertIsNotNone(block, "the manual has no orchestration-loop block")
+        lowered = block.lower()
+        # A bare "reviewer" needle would be UNFALSIFIABLE here: the block links
+        # `prompts/reviewer.md`, so the word is present no matter what the loop
+        # says. The reviewer's INDEPENDENCE is the assertion worth making, and
+        # it is the one rule below that LOOP_REQUIRED does not also pin.
+        for needle in (
+            "never the agent that wrote the code",
+            "mutate, not read",
+            "run the row's gate yourself",
+            "never fix findings yourself",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, lowered)
+
+    def test_the_loop_links_both_tracked_prompts(self):
+        block = consistency.loop_block(self._manual())
+        for name in ("implementer.md", "reviewer.md"):
+            with self.subTest(prompt=name):
+                self.assertIn(f"prompts/{name}", block)
+                # The link is relative to `.agents/`, so a link that reads
+                # perfectly can still resolve to nothing.
+                self.assertTrue(
+                    (ROOT / ".agents/prompts" / name).is_file(),
+                    f"the loop links prompts/{name}, which does not exist",
+                )
+
+    def test_the_real_manual_satisfies_the_gate(self):
+        # Positive control: every red below is the mutation, not the baseline.
+        self.assertEqual(consistency.loop_errors(self._manual()), [])
+
+    def test_checker_rejects_a_workflow_without_the_loop(self):
+        errors = consistency.loop_errors("# workflow\n\nno loop here\n")
+        self.assertTrue(errors)
+        self.assertTrue(any("orchestration-loop" in e for e in errors), errors)
+
+    def test_an_unterminated_block_is_rejected(self):
+        # An opening marker with no `:end` is not a block. Without this the
+        # scoping below could be satisfied by "everything after the marker".
+        errors = consistency.loop_errors(
+            f"# workflow\n{consistency.LOOP_MARKER}\n"
+            + "\n".join(consistency.LOOP_REQUIRED)
+            + "\n"
+        )
+        self.assertTrue(errors)
+
+    def test_each_required_phrase_is_pinned_individually(self):
+        # LOOP_REQUIRED is a hand-written tuple, so a manual that survives
+        # losing one of its phrases means that phrase was never enforced.
+        text = self._manual()
+        for needle in consistency.LOOP_REQUIRED:
+            with self.subTest(needle=needle):
+                damaged = re.sub(re.escape(needle), "", text, flags=re.I)
+                self.assertNotEqual(
+                    damaged, text, f"{needle!r} does not appear in the manual"
+                )
+                self.assertTrue(consistency.loop_errors(damaged), needle)
+
+    def test_the_needles_must_be_INSIDE_the_block(self):
+        # Executable justification for scoping loop_errors to the block rather
+        # than searching the whole file. `.agents/workflow.md` is a long manual
+        # that already talks about gates, prompts and closing loops; a
+        # whole-file search would keep a loop gutted down to its two markers
+        # green on unrelated prose that happens to carry the phrases. That is
+        # the "an unrelated line satisfied the assertion" failure this project
+        # has now paid for repeatedly.
+        gutted = "\n".join(
+            [consistency.LOOP_MARKER, consistency.LOOP_END, *consistency.LOOP_REQUIRED]
+        )
+        self.assertTrue(consistency.loop_errors(gutted))
+
+    def test_the_checker_enforces_the_phrases_this_suite_demands(self):
+        # Every assertion above reads the MANUAL, so emptying or narrowing
+        # LOOP_REQUIRED would leave them all green while the gate quietly
+        # stopped looking. Equality, deliberately, not containment: a narrowing
+        # (say, back to a bare "mutate") is exactly the failure to catch, and
+        # containment cannot see it.
+        self.assertEqual(
+            set(consistency.LOOP_REQUIRED),
+            {
+                "prompts/implementer.md",
+                "prompts/reviewer.md",
+                "mutate, not read",
+                "run the row's gate yourself",
+                "never fix findings yourself",
+            },
+            "LOOP_REQUIRED no longer enforces exactly the phrases this suite "
+            "demands; narrowing one is how the gate stops catching what it was "
+            "built for",
+        )
+
+
+class OrchestrationLoopWiring(unittest.TestCase):
+    """main() must CALL loop_errors, not merely define it.
+
+    Every assertion in OrchestrationLoopTests exercises the function directly,
+    so a main() that never wires it in leaves them all green while the gate
+    enforces nothing -- the same drift this file exists to catch, one function
+    later. InterviewWiring.test_faithful_copy_passes is the positive control
+    for the temp tree these two tests run in.
+    """
+
+    STRIP = re.compile(
+        r"<!-- orchestration-loop:begin -->.*?<!-- orchestration-loop:end -->\n?", re.S
+    )
+
+    def test_main_fails_when_the_loop_is_deleted(self):
+        text = (ROOT / consistency.LOOP_DOCUMENT).read_text(encoding="utf-8")
+        stripped = self.STRIP.sub("", text)
+        self.assertNotEqual(stripped, text, "the strip pattern matched nothing")
+        self.assertNotIn(consistency.LOOP_MARKER, stripped)
+        # The interview must SURVIVE the strip: otherwise a red here would be
+        # interview_errors firing and would prove nothing about the loop.
+        self.assertEqual(consistency.interview_errors(stripped), [])
+        with _repo_copy(stripped) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1)
+        self.assertIn("missing the orchestration-loop block", err)
+
+    def test_main_fails_when_the_loop_loses_one_phrase(self):
+        # The marker check and the needle loop are two different wirings. A
+        # main() that only saw the marker would pass the test above and let a
+        # block drift into saying nothing binding.
+        text = (ROOT / consistency.LOOP_DOCUMENT).read_text(encoding="utf-8")
+        needle = "run the row's gate yourself"
+        self.assertEqual(
+            text.lower().count(needle), 1, f"{needle!r} is not a unique anchor"
+        )
+        damaged = re.sub(re.escape(needle), "", text, flags=re.I)
+        self.assertIn(consistency.LOOP_MARKER, damaged)
+        with _repo_copy(damaged) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1)
+        self.assertIn("loop omits", err)
 
 
 if __name__ == "__main__":

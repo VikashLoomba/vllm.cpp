@@ -10,7 +10,8 @@ You implement one task. A different agent will review it by mutating your code.
 3. **Mutate every test you wrote**: delete the line it names, confirm red,
    restore. Report the results. If a briefed test does not pin what it claims,
    fix it and say so; four implementers before you did exactly that and were
-   right every time.
+   right every time. Read that four as a **dated floor** (2026-08-06), not a
+   running total: it can only grow, and growing never weakens the rule.
 4. Run the project gate (`scripts/agent-preflight.sh`, redirected to a file,
    never piped) and confirm `EXIT=0`. When a gate is ALREADY red before you
    touch anything, capture that failing set as a baseline FIRST: you are green

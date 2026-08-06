@@ -8,7 +8,9 @@ prose that looks like one.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import re
 import sys
 import unittest
@@ -126,16 +128,32 @@ class ShippedRecordTests(unittest.TestCase):
                 on_record.add(row.state)
         self.assertTrue(on_record - gates.GATED_STATES, "filter excludes nothing")
 
-    def test_all_seven_matrices_are_audited(self):
+    def test_the_six_lifecycle_matrices_are_audited(self):
         names = {p.name for p in gates.AUDITED_MATRIX_PATHS}
         self.assertIn("feature-matrix.md", names)
-        self.assertIn("sglang-matrix.md", names)
-        self.assertEqual(len(names), 7)
+        self.assertEqual(len(names), 6)
         # The LIST length too, not just the set of names. If check-agent-record's
-        # MATRIX_PATHS ever gains one of the two appended here, audit() parses
-        # that file twice and double-counts every row in it -- the denominator
-        # moving silently again, which a set comparison reads as still 7.
-        self.assertEqual(len(gates.AUDITED_MATRIX_PATHS), 7)
+        # MATRIX_PATHS ever gains the one appended here, audit() parses that file
+        # twice and double-counts every row in it -- the denominator moving
+        # silently again, which a set comparison reads as still 6.
+        self.assertEqual(len(gates.AUDITED_MATRIX_PATHS), 6)
+
+    def test_sglang_is_excluded_and_the_exclusion_is_justified(self):
+        # It was listed and contributed 0 rows: "audited in name only", an
+        # absence that reads as a pass (audit artifact risk 6). Dropping it is
+        # only honest if it genuinely has no gated rows, so pin THAT rather than
+        # the bare absence. sglang-matrix.md carries a CLASSIFICATION column
+        # (FUSED / INVENTORIED / NOT-APPLICABLE), not a lifecycle state, so the
+        # row parser recognises nothing in it -- and reports no error either.
+        # If it ever gains real lifecycle rows this goes red, and the matrix must
+        # come back into the audited set rather than stay silently skipped.
+        names = {p.name for p in gates.AUDITED_MATRIX_PATHS}
+        self.assertNotIn("sglang-matrix.md", names)
+        sglang = gates.record.AGENTS / "sglang-matrix.md"
+        self.assertTrue(sglang.is_file())
+        errors: list[str] = []
+        self.assertEqual(gates.record.parse_claim_rows(sglang, errors), [])
+        self.assertEqual(errors, [])
 
     def test_every_record_carries_a_known_verdict(self):
         known = {"runnable", "gates-no-command", "no-gates-section", "no-spec"}
@@ -143,6 +161,57 @@ class ShippedRecordTests(unittest.TestCase):
         self.assertTrue(records)
         for item in records:
             self.assertIn(item["verdict"], known)
+
+    def test_a_matrix_that_does_not_parse_is_a_hard_failure(self):
+        # audit() used to build a fresh `errors` list per matrix, hand it to
+        # parse_claim_rows and never read it. Stripping rows from a matrix then
+        # surfaced as "these baseline rows left the gated population ... re-pin
+        # RUNNABLE_BASELINE" -- a parse FAILURE wearing the face of a legitimate
+        # record edit, recommending the one action the audit forbids doing
+        # blindly. Every mode must go red, --json included.
+        original = gates.record.parse_claim_rows
+
+        def broken(path, errors):
+            rows = original(path, errors)
+            errors.append(f"{path.name}:1: SOME-ROW has 4 cells; header has 6")
+            return rows
+
+        gates.record.parse_claim_rows = broken
+        try:
+            with self.assertRaises(gates.RecordParseError):
+                gates.audit()
+            noise = io.StringIO()
+            with contextlib.redirect_stderr(noise), contextlib.redirect_stdout(noise):
+                statuses = [
+                    gates.main(argv)
+                    for argv in ([], ["--json"], ["--check"], ["--json", "--check"])
+                ]
+            self.assertEqual(statuses, [1, 1, 1, 1])
+        finally:
+            gates.record.parse_claim_rows = original
+
+    def test_a_parse_failure_never_reads_as_a_legitimate_record_edit(self):
+        # The message is the finding: a broken matrix must not be reported in
+        # the words that describe a row correctly leaving the population, and
+        # must not steer the reader toward re-pinning the baseline.
+        original = gates.record.parse_claim_rows
+
+        def broken(path, errors):
+            errors.append(f"{path.name}:1: SOME-ROW must have exactly one canonical state")
+            return []
+
+        gates.record.parse_claim_rows = broken
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                self.assertEqual(gates.main(["--check"]), 1)
+        finally:
+            gates.record.parse_claim_rows = original
+        message = buffer.getvalue()
+        self.assertIn("did not PARSE", message)
+        self.assertIn("must have exactly one canonical state", message)
+        self.assertNotIn("left the gated population", message)
+        self.assertNotIn("re-pin RUNNABLE_BASELINE in the", message)
 
     def test_report_mode_exits_zero_even_with_debt(self):
         # 67 of 97 rows cannot state a command today. Report mode must still
@@ -167,6 +236,12 @@ def _bash_array(text: str, name: str) -> list[str]:
 
 class RatchetTests(unittest.TestCase):
     def test_the_baseline_matches_the_shipped_record(self):
+        # EXACT equality, in both directions, and that is the whole contract:
+        # this is an exact pin, not a shrink-only floor. Lowering the baseline
+        # to make a red gate green goes red here, which is the point -- and so
+        # does GROWTH. Add a real gate command to a row's spec and `--check`
+        # stays 0 while this assertion, preflight and CI go red until the set
+        # below is re-pinned. Growth is welcome; silent growth is not.
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 

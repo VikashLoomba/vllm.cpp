@@ -13,8 +13,13 @@ gate.
 
 The ratchet is the second half, wired only AFTER the debt was recorded
 (.agents/specs/gate-command-audit-2026-08-06.md), so it ships green and never had
-to be relaxed to pass. It pins the SET of rows carrying a runnable command, which
-may grow and may never silently shrink.
+to be relaxed to pass. It pins the SET of rows carrying a runnable command, and
+it is an EXACT PIN, not a shrink-only floor: `--check` below refuses a row that
+LOST its command, and tests/scripts/test_check_gate_commands.py additionally
+asserts RUNNABLE_BASELINE equals the shipped set, so growth is red too. That is
+deliberate -- an exact pin is what makes "just lower the number" impossible --
+and it means ANY movement, up or down, re-pins RUNNABLE_BASELINE in the SAME
+change, naming the rows and the reason. Growth is welcome; silent growth is not.
 
     scripts/check-gate-commands.py            # report
     scripts/check-gate-commands.py --json     # machine-readable
@@ -50,13 +55,22 @@ record = _load("agent_record", "scripts/check-agent-record.py")
 # this exists to catch, and DONE rows are the ones people stop looking at.
 GATED_STATES = frozenset({"READY", "ACTIVE", "GATING", "DONE", "BLOCKED"})
 
-# check-agent-record.py's MATRIX_PATHS covers 5 of the 7 matrices. Audit all
-# seven, without widening that constant -- it governs a repo-wide CI gate whose
-# row contract these two files have never been held to.
+# check-agent-record.py's MATRIX_PATHS covers 5 of the 7 matrices. feature-matrix
+# is added here without widening that constant -- it governs a repo-wide CI gate
+# whose row contract these two files have never been held to.
+#
+# sglang-matrix.md is DELIBERATELY ABSENT, and the reason is recorded rather than
+# implied (.agents/specs/gate-command-audit-2026-08-06.md risk 6). Step 2 listed
+# it; it contributed 0 rows of its 87 table rows, with 0 parse errors, because it
+# carries a CLASSIFICATION column (FUSED / INVENTORIED / NOT-APPLICABLE) in place
+# of a lifecycle state, so parse_claim_rows recognises nothing in it. Listed and
+# empty is this repo's recorded defect class -- a reader of this constant would
+# conclude SGLang rows were examined and found clean. It has no gated rows to
+# audit, so it is not audited; the test pins that justification, and goes red if
+# the matrix ever gains lifecycle rows.
 AUDITED_MATRIX_PATHS = [
     *record.MATRIX_PATHS,
     record.AGENTS / "feature-matrix.md",
-    record.AGENTS / "sglang-matrix.md",
 ]
 
 _GATES_HEADING = re.compile(r"(?im)^#{1,6}\s*gates\b.*$")
@@ -150,10 +164,27 @@ def classify_row(row) -> tuple[str, str]:
     return "runnable", commands[0]
 
 
+class RecordParseError(RuntimeError):
+    """A matrix did not parse, so the audit below it is INCOMPLETE.
+
+    This existed as a silent `errors` list nobody read, and the consequence was
+    exactly this repo's recorded defect class: strip rows from a matrix and the
+    ratchet reported `these baseline rows left the gated population ... re-pin
+    RUNNABLE_BASELINE` -- a parse FAILURE wearing the face of a legitimate
+    record edit, recommending the one action the audit says must never be taken
+    blindly. A parse failure and a record edit must never look the same.
+    """
+
+    def __init__(self, errors: list[str]) -> None:
+        super().__init__("; ".join(errors))
+        self.errors = list(errors)
+
+
 def audit() -> list[dict]:
+    """Classify every gated row. Raises RecordParseError if a matrix is broken."""
     records = []
+    errors: list[str] = []
     for path in AUDITED_MATRIX_PATHS:
-        errors: list[str] = []
         for row in record.parse_claim_rows(path, errors):
             if row.state not in GATED_STATES:
                 continue
@@ -168,26 +199,38 @@ def audit() -> list[dict]:
                     "detail": detail,
                 }
             )
+    if errors:
+        raise RecordParseError(errors)
     return records
 
 
-# Shrink-only, like STATUS_RATCHET in check-public-doc-tables.py -- but a SET of
-# row IDs, not a count. A count cannot tell "this row lost its gate command" from
+# An EXACT PIN over a SET of row IDs -- not a count, and NOT shrink-only.
+#
+# Not a count, because a count cannot tell "this row lost its gate command" from
 # "this row left the population", and the population moves: 3 rows moved
 # mid-branch while the classifier above was being written, which is why the total
 # (97) was deliberately never pinned. Pinning a count would go red on a legitimate
 # record edit, and the natural "fix" is to lower the number, which is the gate
 # erasing its own finding.
 #
-# This is a FLOOR, not a certificate: four of these credits are weak (two MLX
-# `pip install` lines, `git diff --check`, and TOOLS-STREAMING-PARSER resting
-# solely on `git diff --stat`, which exits 0 unconditionally in a repo). They are
-# pinned anyway -- see .agents/specs/gate-command-audit-2026-08-06.md risk 3. A
-# ratchet that waits for a clean baseline never starts.
+# Not shrink-only, because the pin is enforced from BOTH sides: `ratchet_errors`
+# below catches a row that lost its command, and
+# tests/scripts/test_check_gate_commands.py asserts this frozenset EQUALS the
+# shipped runnable set, which is what makes lowering the baseline impossible to
+# do quietly. The same equality means GROWTH is red too: add a real gate command
+# to a row's spec and `--check` stays 0 while the suite, preflight and CI go red
+# until this set is re-pinned. That is the intended cost. Growth is ordinary,
+# welcome work -- transcribe a row's existing evidence into an invocation -- but
+# ANY movement, up or down, re-pins RUNNABLE_BASELINE in the SAME change, naming
+# the rows that moved and why.
 #
-# Raising it is ordinary work: transcribe a row's existing evidence into an
-# invocation and the set grows. Lowering it requires naming the row and the
-# reason, in the same change.
+# This is a pin, not a certificate: five of these credits are weak (two MLX
+# `pip install` lines, `git diff --check`, TOOLS-STREAMING-PARSER resting solely
+# on `git diff --stat`, which exits 0 unconditionally in a repo, and
+# KERNEL-GEMM-CPU-ELEM credited a bare `ctest -j2` lifted from prose describing a
+# FLAKE). They are pinned anyway -- see
+# .agents/specs/gate-command-audit-2026-08-06.md risk 3. A ratchet that waits for
+# a clean baseline never starts.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
     "ATTN-ROPE-FAMILY",
@@ -228,6 +271,10 @@ def ratchet_errors(records: list[dict]) -> list[str]:
     single "the count fell" message would make a broken row and a retired row
     look the same, which is this repo's recorded defect class and the reason
     the baseline is a set.
+
+    This half of the pin sees only DROPS. Growth is caught by the equality
+    assertion in tests/scripts/test_check_gate_commands.py, so a row that gains
+    a command still re-pins RUNNABLE_BASELINE -- see the note above the set.
     """
     runnable = {item["id"] for item in records if item["verdict"] == "runnable"}
     present = {item["id"] for item in records}
@@ -255,7 +302,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true", help="fail on a ratchet regression")
     args = parser.parse_args(argv)
 
-    records = audit()
+    # A matrix that did not parse fails EVERY mode, including --json. Reporting
+    # a partial audit as if it were the record is how a parse failure ends up
+    # wearing the face of a legitimate record edit.
+    try:
+        records = audit()
+    except RecordParseError as exc:
+        for line in exc.errors:
+            print(f"ERROR: {line}", file=sys.stderr)
+        print(
+            "ERROR: a matrix did not PARSE, so this audit is incomplete and its "
+            "row set means nothing. Repair the matrix. Do NOT re-pin "
+            "RUNNABLE_BASELINE off a failed parse.",
+            file=sys.stderr,
+        )
+        return 1
     # BEFORE --json, which returns 0 whatever the record says. If --json won,
     # `--check --json` would be a gate that cannot fail -- the shape this whole
     # file exists to detect, wearing this file's own face.

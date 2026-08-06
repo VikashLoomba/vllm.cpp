@@ -29,6 +29,15 @@ that has not declared a role, so an agent who is never told the question, or
 never told that `read-only` is one of the answers, meets a red gate with no
 instructions -- and a gate people cannot satisfy is a gate people route around.
 
+The same gate also asserts that `.agents/workflow.md` carries the ORCHESTRATION
+LOOP, between `<!-- orchestration-loop:begin -->` and its `:end`. The prompts
+below are what a sub-agent is handed; the loop is what the OPERATOR does with
+them, and until it was written here it lived nowhere an agent reads -- neither
+`AGENTS.md` nor this manual said that a reviewer must mutate rather than read,
+that the controller runs the row's gate itself instead of taking the
+implementer's word, or that findings are never fixed in the controller's own
+session.
+
 The same gate finally asserts that the sub-agent prompts under `.agents/prompts`
 exist and still carry their binding instructions. Every Important finding across
 two branches of this project came from an INDEPENDENT reviewer sub-agent, none
@@ -63,6 +72,29 @@ END = "<!-- doc-obligation-contract:end -->"
 INTERVIEW_DOCUMENT = ".agents/workflow.md"
 INTERVIEW_MARKER = "<!-- role-interview:begin -->"
 INTERVIEW_REQUIRED = ("claim operator", "claim helper --row", "claim read-only", "--headless")
+
+# The same manual must carry the operator's LOOP. The prompts in PROMPT_REQUIRED
+# below are handed to sub-agents; nothing told the operator how to run one, and
+# the three rules that carry the whole return are exactly the ones an operator
+# improvises away: dispatch a FRESH reviewer whose instruction is to MUTATE,
+# run the row's gate YOURSELF rather than believing the author's report, and
+# never repair a finding in the coordinating session.
+#
+# The needles are matched INSIDE the block, not across the whole document.
+# workflow.md is a long manual that already discusses gates, prompts and
+# "closing the loop", so a whole-file search would keep a loop gutted down to
+# its two markers green on unrelated prose -- the same "an unrelated line
+# satisfied the assertion" failure the reviewer prompt is written to catch.
+LOOP_DOCUMENT = ".agents/workflow.md"
+LOOP_MARKER = "<!-- orchestration-loop:begin -->"
+LOOP_END = "<!-- orchestration-loop:end -->"
+LOOP_REQUIRED = (
+    "prompts/implementer.md",
+    "prompts/reviewer.md",
+    "mutate, not read",
+    "run the row's gate yourself",
+    "never fix findings yourself",
+)
 
 # The reviewer prompt's value is the MUTATION instruction; a reviewer told only
 # to "review" reads the diff, and reading found none of the eleven tests that
@@ -181,6 +213,40 @@ def interview_errors(text: str) -> list[str]:
     ]
 
 
+def loop_block(text: str) -> str | None:
+    """Return the orchestration-loop block's body, or None if there isn't one.
+
+    An opening marker with no `:end` is NOT a block. Treating it as "everything
+    after the marker" would silently widen the scope back to the whole
+    document, which is the incidental-match hole this scoping exists to close.
+    """
+    start = text.find(LOOP_MARKER)
+    if start == -1:
+        return None
+    end = text.find(LOOP_END, start)
+    if end == -1:
+        return None
+    return text[start + len(LOOP_MARKER) : end]
+
+
+def loop_errors(text: str) -> list[str]:
+    """The operator's loop must live where agents read it, not in a prompt."""
+    block = loop_block(text)
+    if block is None:
+        return [
+            f"{LOOP_DOCUMENT} is missing the orchestration-loop block "
+            f"({LOOP_MARKER} ... {LOOP_END}); the sub-agent prompts say what a "
+            "reviewer or implementer does, and nothing else says what the "
+            "OPERATOR does with them"
+        ]
+    lowered = block.lower()
+    return [
+        f"{LOOP_DOCUMENT} loop omits {needle!r}"
+        for needle in LOOP_REQUIRED
+        if needle.lower() not in lowered
+    ]
+
+
 def prompt_errors(required: dict[str, tuple[str, ...]] | None = None) -> list[str]:
     """Each tracked prompt exists and carries its binding instruction."""
     # `required or PROMPT_REQUIRED` would silently promote an explicitly EMPTY
@@ -216,6 +282,15 @@ def main() -> int:
             interview_errors(interview.read_text(encoding="utf-8"))
         )
 
+    # INTERVIEW_DOCUMENT and LOOP_DOCUMENT are the same manual today, but the
+    # two obligations are independent and either may move, so each resolves its
+    # own path rather than sharing one read.
+    loop_doc = ROOT / LOOP_DOCUMENT
+    if not loop_doc.exists():
+        failures.append(f"{LOOP_DOCUMENT} does not exist")
+    else:
+        failures.extend(loop_errors(loop_doc.read_text(encoding="utf-8")))
+
     failures.extend(prompt_errors())
 
     for name in CONTRACT_DOCUMENTS:
@@ -246,7 +321,10 @@ def main() -> int:
             "in the contract block of every document listed in "
             "CONTRACT_DOCUMENTS. The role interview is the block between "
             f"{INTERVIEW_MARKER} and its :end in {INTERVIEW_DOCUMENT}; it must "
-            "name every answer agent-role.py accepts. The sub-agent prompts in "
+            "name every answer agent-role.py accepts. The operator's loop is "
+            f"the block between {LOOP_MARKER} and its :end in {LOOP_DOCUMENT}; "
+            f"it must carry {', '.join(repr(n) for n in LOOP_REQUIRED)} inside "
+            "the block. The sub-agent prompts in "
             f"{', '.join(PROMPT_REQUIRED)} must carry their binding "
             "instructions verbatim; a prompt that lives only in an operator's "
             "head is not a protocol.",
@@ -258,8 +336,9 @@ def main() -> int:
         "OK: the doc-obligation contract in "
         f"{' and '.join(CONTRACT_DOCUMENTS)} matches "
         f"scripts/check-doc-checkpoint.py, {INTERVIEW_DOCUMENT} carries the "
-        f"role interview, and {len(PROMPT_REQUIRED)} sub-agent prompts carry "
-        "their binding instructions."
+        f"role interview and the orchestration loop, and "
+        f"{len(PROMPT_REQUIRED)} sub-agent prompts carry their binding "
+        "instructions."
     )
     return 0
 

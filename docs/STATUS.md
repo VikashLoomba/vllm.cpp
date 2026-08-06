@@ -2222,4 +2222,4 @@ GCC-only `-Wstringop-overflow` suppression is now guarded out of Clang builds,
 where the unknown warning name was itself fatal under `-Werror`. The Go
 `go-m1cpu` folding diagnostics in that run were nonfatal and outside this repo.
 
-**Session onboarding: design accepted** (`.agents/specs/session-onboarding.md`).
+**Session onboarding: design accepted, step 1/5** (`.agents/specs/session-onboarding.md`).

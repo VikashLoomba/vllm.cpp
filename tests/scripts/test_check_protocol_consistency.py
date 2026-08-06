@@ -14,6 +14,7 @@ import importlib.util
 import io
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -36,6 +37,44 @@ def _load(name: str, relative: str):
 consistency = _load("protocol_consistency", "scripts/check-protocol-consistency.py")
 
 EXPECTED = ("docs/STATUS.md", "docs/BENCHMARKS.md", "docs/FEATURES.md")
+
+
+def _tracked_paths(prefix: str) -> set[str] | None:
+    """Paths git knows under `prefix`, or None when this is not a checkout.
+
+    A prompt that exists only in a working tree is precisely the thing this
+    task exists to stop: an instruction nobody else can read. `git ls-files`
+    sees staged files too, so it is honest before the commit as well as after.
+    Exported trees (git archive) have no `.git`, so absence of git is a skip
+    rather than a failure.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "--", prefix],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return {line for line in completed.stdout.splitlines() if line}
+
+
+@contextlib.contextmanager
+def _prompt_tree(files: dict[str, str]):
+    """Point consistency.ROOT at a temp tree holding exactly `files`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for relative, text in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        saved, consistency.ROOT = consistency.ROOT, root
+        try:
+            yield root
+        finally:
+            consistency.ROOT = saved
 
 
 def document(*paths: str) -> str:
@@ -164,7 +203,7 @@ class InterviewWiring(unittest.TestCase):
     )
 
     @contextlib.contextmanager
-    def _tree(self, workflow_text: str):
+    def _tree(self, workflow_text: str, *, prompts: bool = True):
         """Run consistency.main() against a copy of the repo's own documents."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -175,6 +214,8 @@ class InterviewWiring(unittest.TestCase):
                 root / "scripts/check-doc-checkpoint.py",
             )
             shutil.copy(ROOT / "AGENTS.md", root / "AGENTS.md")
+            if prompts:
+                shutil.copytree(ROOT / ".agents/prompts", root / ".agents/prompts")
             (root / ".agents/workflow.md").write_text(workflow_text, encoding="utf-8")
             saved, consistency.ROOT = consistency.ROOT, root
             out, err = io.StringIO(), io.StringIO()
@@ -201,6 +242,159 @@ class InterviewWiring(unittest.TestCase):
             code, _, err = run()
         self.assertEqual(code, 1)
         self.assertIn("role-interview", err)
+
+    def test_main_fails_when_the_prompts_are_missing(self):
+        """main() must CALL prompt_errors, not merely define it.
+
+        Every prompt assertion above calls the function directly, so a main()
+        that never wires it in leaves them all green while the gate enforces
+        nothing -- the same drift, one function later.
+        """
+        text = (ROOT / ".agents/workflow.md").read_text(encoding="utf-8")
+        with self._tree(text, prompts=False) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1, err)
+        self.assertIn(".agents/prompts/reviewer.md", err)
+
+
+class PromptArtifactTests(unittest.TestCase):
+    def test_both_prompts_exist_and_are_tracked(self):
+        tracked = _tracked_paths(".agents/prompts")
+        for name in ("reviewer.md", "implementer.md"):
+            path = ROOT / ".agents/prompts" / name
+            self.assertTrue(path.is_file(), f"{name} must exist")
+            # A silent downgrade to existence-only is the failure/absence
+            # confusion again, so say so in the run output rather than passing
+            # quietly with half the assertion skipped.
+            with self.subTest(tracked=name):
+                if tracked is None:
+                    self.skipTest("git unavailable: tracking not verifiable here")
+                self.assertIn(
+                    f".agents/prompts/{name}",
+                    tracked,
+                    f"{name} exists but is untracked; an operator-local prompt "
+                    "is not a protocol",
+                )
+
+    def test_the_reviewer_prompt_carries_the_mutation_instruction(self):
+        # The instruction IS the deliverable. A reviewer told only to "review"
+        # reads the diff, and reading found none of the eleven tests that
+        # passed with their subject deleted.
+        text = (ROOT / ".agents/prompts/reviewer.md").read_text(encoding="utf-8")
+        for needle in ("mutate", "delete or invert", "stays green"):
+            self.assertIn(needle, text.lower(), needle)
+
+    def test_the_reviewer_prompt_refuses_to_defer_to_the_plan(self):
+        text = (ROOT / ".agents/prompts/reviewer.md").read_text(encoding="utf-8")
+        self.assertIn("plan-mandated", text.lower())
+
+    def test_checker_rejects_a_prompt_missing_its_instruction(self):
+        # A missing FILE and a present file missing its INSTRUCTION are two
+        # different failures. Asserting only the first would leave the needle
+        # loop -- the part that carries the value -- entirely unpinned.
+        errors = consistency.prompt_errors({"nonexistent-prompt.md": ("mutate",)})
+        self.assertTrue(errors)
+        self.assertTrue(any("missing" in e for e in errors), errors)
+
+        present = ".agents/prompts/reviewer.md"
+        self.assertEqual(consistency.prompt_errors({present: ("mutate",)}), [])
+        omitted = consistency.prompt_errors(
+            {present: ("no reviewer prompt would ever contain this phrase",)}
+        )
+        self.assertTrue(any("omits" in e for e in omitted), omitted)
+
+    def test_an_explicitly_empty_spec_checks_nothing(self):
+        # An empty spec must mean "nothing required", not silently fall back to
+        # the live PROMPT_REQUIRED: an absence and a value that look the same is
+        # the defect class the implementer prompt names.
+        with _prompt_tree({}):
+            self.assertEqual(consistency.prompt_errors({}), [])
+            self.assertTrue(consistency.prompt_errors())
+
+    def test_the_checker_enforces_the_phrases_these_tests_demand(self):
+        # Every assertion above reads the prompt FILES, so emptying, narrowing
+        # or widening a PROMPT_REQUIRED tuple would leave them all green while
+        # the gate quietly stopped enforcing what this suite believes it does.
+        #
+        # The comparison is EQUALITY, deliberately, not "demanded is a substring
+        # of enforced". That substring idiom is borrowed from
+        # test_every_declarable_role_is_named_in_the_interview, where it is safe
+        # because the demanded side is DERIVED from role.DECLARABLE. Here both
+        # sides are hand-written literals, and a substring test cannot see the
+        # one narrowing that matters: reverting the reviewer needle from
+        # "mutate, don't read" to a bare "mutate" satisfies it while re-opening
+        # the incidental-match hole check-protocol-consistency.py spends five
+        # lines arguing is dangerous. Equality means changing what the gate
+        # enforces is a deliberate two-file act.
+        demanded = {
+            ".agents/prompts/reviewer.md": (
+                "mutate, don't read",
+                "delete or invert",
+                "stays green",
+                "every mutation you make re-runs the suite",
+                "plan-mandated",
+            ),
+            ".agents/prompts/implementer.md": (
+                "failing test first",
+                "mutate every test",
+                "capture that failing set as a baseline",
+                "escalate rather than guess",
+            ),
+        }
+        self.assertEqual(
+            set(demanded),
+            set(consistency.PROMPT_REQUIRED),
+            "PROMPT_REQUIRED covers a different set of prompts than this suite",
+        )
+        for relative, needles in demanded.items():
+            with self.subTest(prompt=relative):
+                self.assertEqual(
+                    set(consistency.PROMPT_REQUIRED[relative]),
+                    set(needles),
+                    f"PROMPT_REQUIRED[{relative!r}] no longer enforces exactly "
+                    "the phrases this suite demands; narrowing one is how the "
+                    "gate stops catching what it was built for",
+                )
+
+    def test_a_bare_mutate_needle_would_not_pin_the_binding_instruction(self):
+        # The executable justification for the full "mutate, don't read" needle.
+        # Deleting the ENTIRE binding-instruction section still leaves the word
+        # "mutate" in the file ("Never mutate the reviewed worktree" under What
+        # you may not do), so a bare needle stays green through the exact
+        # deletion it exists to catch. If this test ever goes red because the
+        # incidental match is gone, the needle may safely be simplified.
+        relative = ".agents/prompts/reviewer.md"
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        without_section = re.sub(
+            r"## The binding instruction.*?(?=\n## )", "", text, flags=re.S
+        )
+        self.assertNotEqual(without_section, text, "the strip pattern matched nothing")
+        with _prompt_tree({relative: without_section}):
+            self.assertEqual(
+                consistency.prompt_errors({relative: ("mutate",)}),
+                [],
+                "a bare 'mutate' no longer matches incidentally",
+            )
+            self.assertTrue(
+                consistency.prompt_errors({relative: ("mutate, don't read",)}),
+                "the shipped needle failed to catch the section deletion",
+            )
+
+    def test_each_required_phrase_is_pinned_individually(self):
+        # PROMPT_REQUIRED is a hand-written tuple, so a prompt that survives
+        # losing one of its phrases means that phrase was never enforced. Strip
+        # each one in turn from a copy of the real file and demand a red.
+        for relative, needles in consistency.PROMPT_REQUIRED.items():
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            for needle in needles:
+                with self.subTest(prompt=relative, needle=needle):
+                    damaged = re.sub(re.escape(needle), "", text, flags=re.I)
+                    self.assertNotEqual(
+                        damaged, text, f"{needle!r} does not appear in {relative}"
+                    )
+                    with _prompt_tree({relative: damaged}):
+                        errors = consistency.prompt_errors({relative: needles})
+                    self.assertTrue(any("omits" in e for e in errors), errors)
 
 
 if __name__ == "__main__":

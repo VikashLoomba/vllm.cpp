@@ -15,7 +15,7 @@ Copied from `AGENTS.md` and `.agents/specs/session-onboarding.md`. Every task's 
 - **Every commit carries `FOLLOWING_AGENTS_PROTOCOL`** plus `Assisted-by: Claude Code:claude-opus-5 [ClaudeCode]`. **Never** `Signed-off-by` or `Co-Authored-By` from an AI.
 - **Run `bash scripts/agent-preflight.sh` before committing; it must exit 0.** Never pipe it — redirect to a file and check `$?`.
 - **Every commit touching `scripts/`, `tests/` or `.agents/specs/` also updates `docs/STATUS.md` and `docs/BENCHMARKS.md` in the SAME commit.** Verify the committed form explicitly with `python3 scripts/check-doc-checkpoint.py --commit <sha>` — preflight only runs that checker `--staged`, which passes vacuously after committing. `docs/STATUS.md` sits under a shrink-only char ratchet in `scripts/check-public-doc-tables.py`; if you add text there, stay under the cap or offset it and **lower** the ratchet. Never raise it. `docs/BENCHMARKS.md` is at its 35-prose-paragraph budget and a 700-char-per-paragraph limit — extend the existing "NOT APPLICABLE" paragraph rather than adding a new one.
-- **Use a ROLLING doc surface, do not append per task.** Task 1 already added the entry on both pages and left `docs/STATUS.md` at 284,071 of a 284,081 cap and the BENCHMARKS paragraph at 676 of 700. There is no room for five separate additions. Every later task **edits the line Task 1 wrote** — rolling it forward ("step 1/5" → "2/5" → … → "all 5") so each is true at its own commit and the page does not grow. Never compact unrelated evidence to buy room: on the previous branch that produced a cross-arm supersession claim that contradicted a paragraph two lines below it.
+- **Use a ROLLING doc surface, do not append per task.** Task 1 already added the entry on both pages and left `docs/STATUS.md` at 284,071 of a 284,081 cap and the BENCHMARKS paragraph at 676 of 700. There is no room for five separate additions. Every later task **edits the line Task 1 wrote** — rolling it forward **digit-only**: "step 1/5" → "2/5" → … → "step 5/5". `docs/STATUS.md` now sits at **exactly** its 284,081 cap with zero headroom and the BENCHMARKS paragraph at 699 of 700, so a digit roll is free and **anything longer is red** — never end the sequence with "all 5", which is two characters more and fails. If your entry needs more room, shorten *your own* sentence; never someone else's. Never compact unrelated evidence to buy room: on the previous branch that produced a cross-arm supersession claim that contradicted a paragraph two lines below it.
 - **Python standard library only.** `from __future__ import annotations`, type hints, house style.
 - **Never weaken a checker to make something pass. Repair the record.**
 - **`read-only` is a declared ABSENCE of claim, not a third role.** The claimable roles stay exactly `("operator", "helper")`.
@@ -340,7 +340,7 @@ Run: `python3 scripts/agent-onboard.py --probe`
 Expected: three lines plus the interview hint, since this session has no role marker and no `.env`.
 
 Run: `python3 scripts/agent-onboard.py --probe --json | python3 -c "import json,sys; d=json.load(sys.stdin); print(sorted(d))"`
-Expected: `['env', 'env_missing', 'mode', 'queue', 'role', 'row']`
+Expected 9 keys: `['blocked_by_other_operator', 'env', 'env_missing', 'mode', 'queue', 'queue_error', 'reason', 'role', 'row']`
 
 - [ ] **Step 6: Update the owed doc surfaces, run preflight, commit**
 

@@ -232,6 +232,19 @@ class WorktreeKeyedRole(_TempRepo, unittest.TestCase):
             cwd=repo, text=True).strip()
         return Path(common) / "vllm-cpp-operator.lock"
 
+    def _resolve_in(self, where: Path) -> dict:
+        """resolve()'s OWN return value, read in `where`.
+
+        The CLI prints a rendering; several keys of the resolved state never
+        reach stdout, so a dict-level assertion is the only way to pin them.
+        """
+        saved = os.getcwd()
+        os.chdir(where)
+        try:
+            return role.resolve()
+        finally:
+            os.chdir(saved)
+
     def test_reclaiming_your_own_lock_refreshes_the_heartbeat(self) -> None:
         # The idempotent branch REWRITES the record instead of passing. With
         # ownership keyed on the worktree a live operator is likelier to
@@ -271,6 +284,76 @@ class WorktreeKeyedRole(_TempRepo, unittest.TestCase):
         self.assertEqual(
             len(operators), 1,
             f"exactly one operator expected, got {[r.stdout for r in resolved]}")
+
+    def test_an_operator_marker_beaten_to_the_lock_reports_the_lockout(self) -> None:
+        # Keying lock OWNERSHIP on the worktree made this branch reachable from
+        # a LIVE RIVAL, not only from a self-lost lock: another worktree can now
+        # hold the lock while this one still carries an operator marker. Without
+        # operator_held_by_other the state is indistinguishable from "never
+        # declared" -- same JSON, same cmd_show output, same probe NOTE (none) --
+        # and every one of those tells the session to `claim operator`, which
+        # exits 1. Deleting the key from this branch must go red.
+        self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
+        self._lock(self.repo).unlink()
+        rival = self.worktree("live-rival")
+        self.assertEqual(run_role(rival, "b", "claim", "operator").returncode, 0)
+
+        state = self._resolve_in(self.repo)
+        self.assertIsNone(state["role"])
+        self.assertEqual(
+            state["reason"], "operator marker without a held lock; re-claim")
+        # .get, so DROPPING the key fails on the value rather than erroring
+        # on the lookup: a missing signal is the same defect as a false one.
+        self.assertIs(state.get("operator_held_by_other"), True)
+        # the CLI surface, which is what an agent actually reads
+        shown = run_role(self.repo, "a", "show")
+        self.assertEqual(shown.returncode, 3)
+        self.assertIn("held by another live session", shown.stdout)
+
+    def test_a_self_lost_lock_is_not_reported_as_a_rival(self) -> None:
+        # The other side of the same key: with the lock simply GONE there is no
+        # rival, so a blanket True would be a different lie. Hardcoding the key
+        # either way now fails one of these two tests.
+        run_role(self.repo, "a", "claim", "operator")
+        self._lock(self.repo).unlink()
+        state = self._resolve_in(self.repo)
+        self.assertIsNone(state["role"])
+        self.assertIs(state.get("operator_held_by_other"), False)
+        self.assertNotIn("another live session", run_role(self.repo, "a", "show").stdout)
+
+    def test_downgrading_out_of_operator_releases_the_lock(self) -> None:
+        # `claim read-only` ("just looking") is the exact next command an
+        # operator types, and leaving the lock behind is worse than holding no
+        # role: heartbeat answers "not the operator; nothing to heartbeat", so
+        # nothing renews it, and a second worktree is refused for the full 2h
+        # TTL by a session that holds no role at all.
+        self.assertEqual(run_role(self.repo, "a", "claim", "operator").returncode, 0)
+        self.assertTrue(self._lock(self.repo).exists())
+        downgrade = run_role(self.repo, "a", "claim", "read-only")
+        self.assertEqual(downgrade.returncode, 0, downgrade.stderr)
+        self.assertFalse(self._lock(self.repo).exists())
+        self.assertIn("role=read-only", run_role(self.repo, "a", "show").stdout)
+        # the lock is genuinely free, not merely absent from this worktree
+        successor = run_role(self.worktree("successor"), "b", "claim", "operator")
+        self.assertEqual(successor.returncode, 0, successor.stderr)
+
+    def test_downgrading_to_helper_releases_the_lock_too(self) -> None:
+        # Same rule, the other non-operator answer: the release keys on "the
+        # claimed role is not operator", not on read-only specifically.
+        run_role(self.repo, "a", "claim", "operator")
+        self.assertEqual(
+            run_role(self.repo, "a", "claim", "helper", "--row", "ENG-FOO").returncode, 0)
+        self.assertFalse(self._lock(self.repo).exists())
+
+    def test_a_downgrade_never_frees_ANOTHER_worktrees_lock(self) -> None:
+        # The release must use the same ownership test `release` does. A
+        # read-only claim in one worktree stealing the operator lock from
+        # another would be the mutual-exclusion guarantee inverted.
+        run_role(self.repo, "a", "claim", "operator")
+        elsewhere = self.worktree("bystander")
+        self.assertEqual(run_role(elsewhere, "b", "claim", "read-only").returncode, 0)
+        self.assertTrue(self._lock(self.repo).exists())
+        self.assertIn("role=operator", run_role(self.repo, "a", "show").stdout)
 
     def test_release_from_a_new_session_frees_the_lock(self) -> None:
         # Release has to cross the call boundary as well, or a lock taken in one
@@ -365,7 +448,10 @@ class RoleDiscipline(unittest.TestCase):
 class ReadOnlyAndModeTests(unittest.TestCase):
     def test_claimable_roles_stay_exactly_two(self):
         # read-only must never become a third claimable role: it takes no lock
-        # and no worktree, and every write path keys on CLAIMABLE_ROLES.
+        # and no worktree. CLAIMABLE_ROLES is the vocabulary a "may this session
+        # write?" test is meant to key on; it has no consumer outside
+        # agent-role.py and this suite today, so this pin protects the
+        # constant's meaning rather than a live refusal.
         self.assertEqual(role.CLAIMABLE_ROLES, ("operator", "helper"))
         self.assertIn("read-only", role.DECLARABLE)
         self.assertNotIn("read-only", role.CLAIMABLE_ROLES)
@@ -374,8 +460,9 @@ class ReadOnlyAndModeTests(unittest.TestCase):
         self.assertIn("read-only", role.DECLARABLE)
 
     def test_the_roles_alias_is_not_widened(self):
-        # ROLES is the alias existing write-gating call sites import; it must
-        # stay the CLAIMABLE pair. Mutating it to DECLARABLE leaves every other
+        # ROLES is the alias a write-gating call site would import; no such
+        # call site exists yet, so keeping it the CLAIMABLE pair is what stops
+        # the first one from being born wrong. Mutating it to DECLARABLE leaves every other
         # assertion in this suite green, so the constraint that keeps read-only
         # out of "may this session write?" would be enforced by comment only.
         self.assertEqual(role.ROLES, role.CLAIMABLE_ROLES)

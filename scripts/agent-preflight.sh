@@ -10,10 +10,21 @@
 #   scripts/agent-preflight.sh --staged     # also check the staged change
 #   scripts/agent-preflight.sh --quiet      # gates only, no digest
 #   scripts/agent-preflight.sh --no-require-role  # tolerate an undeclared role
+#   scripts/agent-preflight.sh --role-only  # ONLY the role gate; NOT a preflight
 #
 # A session declares a role, and an UNDECLARED one is a failing gate by default:
 # the obligation used to live in prose and in an opt-in flag, and neither fired.
 # read-only passes a plain run and fails --staged, because staging is writing.
+#
+# --role-only exists so the mutation suite can EXECUTE that gate instead of
+# grepping it: text assertions catch a REWRITE of the default and miss an
+# OVERRIDE on a later line. A nested FULL run is impossible -- this script runs
+# the very suite that would call it, so it would recurse without bound -- hence
+# a mode that runs the role block and stops. It is not an opt-out: it checks the
+# ROLE strictly, which --no-require-role does not, and it never prints the "All
+# gates green." banner, because it skips every record gate and mutation suite
+# --no-require-role runs and so has not earned it. Neither mode is a superset of
+# the other; --role-only is narrower and stricter, and says so on stdout.
 #
 # It never writes anything, so it is always safe to run.
 
@@ -24,6 +35,7 @@ cd "$ROOT"
 
 STAGED=0
 QUIET=0
+ROLE_ONLY=0
 # ON by default: an undeclared session is a FAILING gate. The mutation suite
 # anchors on THIS line (`^REQUIRE_ROLE=1$`) and refuses any line-anchored
 # assignment of zero, quoted or not, so a silent revert of the default goes red
@@ -36,7 +48,8 @@ for arg in "$@"; do
     --quiet) QUIET=1 ;;
     --require-role) REQUIRE_ROLE=1 ;;
     --no-require-role) REQUIRE_ROLE=0 ;;
-    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --role-only) ROLE_ONLY=1 ;;
+    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -109,6 +122,15 @@ fi
 if [ "$STAGED" -eq 1 ] && printf '%s' "$role_line" | grep -q 'role=read-only'; then
   printf '  \033[31mFAIL\033[0m read-only sessions do not write. Claim operator or helper first.\n'
   failed+=("read-only-cannot-stage")
+fi
+
+if [ "$ROLE_ONLY" -eq 1 ]; then
+  echo "ROLE CHECK ONLY -- this is NOT a full preflight; no record gate ran."
+  if [ "${#failed[@]}" -ne 0 ]; then
+    echo "${#failed[@]} gate(s) failed: ${failed[*]}"
+    exit 1
+  fi
+  exit 0
 fi
 
 echo "Record gates:"

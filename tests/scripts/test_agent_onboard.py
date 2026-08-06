@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import os
 import re
 import shutil
 import subprocess
@@ -136,6 +137,118 @@ class ProbeRenderTests(unittest.TestCase):
             self.assertEqual(onboard.main(["--probe"]), 0)
 
 
+ROLE_SCRIPT = ROOT / "scripts/agent-role.py"
+
+
+class ProbeFieldsComeFromResolve(unittest.TestCase):
+    """probe()'s RETURNED DICT, against a role claimed through the real CLI.
+
+    Every other probe test in this file feeds render_probe an already-populated
+    fixture, so nothing asserted that probe() actually reads its fields out of
+    agent-role.py. Five hardcodes therefore left the whole suite green:
+    `blocked_by_other_operator: False`, `reason: None`, `mode: "headless"`,
+    `role: "operator"` and `env: "present"`. `--probe` is the front door
+    .agents/workflow.md sends every session to, and a probe that answers
+    `role: operator` to a session that never declared one is worse than no
+    probe: it points at a `claim operator` that will exit 1.
+
+    So these claim in a THROWAWAY repo and read the values back out of probe().
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "root", "--allow-empty"], cwd=self.repo,
+            check=True,
+            env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                     GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+
+    def claim(self, where: Path, session: str, *args: str):
+        result = subprocess.run(
+            [sys.executable, str(ROLE_SCRIPT), "claim", *args], cwd=where,
+            env=dict(os.environ, VLLM_CPP_AGENT_SESSION=session),
+            capture_output=True, text=True)
+        return result
+
+    def worktree(self, name: str) -> Path:
+        path = self.repo / f".{name}"
+        subprocess.run(["git", "worktree", "add", "-q", str(path), "-b", name],
+                       cwd=self.repo, check=True, capture_output=True)
+        return path
+
+    def probe_in(self, where: Path) -> dict:
+        saved = os.getcwd()
+        os.chdir(where)
+        try:
+            return onboard.probe()
+        finally:
+            os.chdir(saved)
+
+    def test_probe_reports_the_role_and_row_that_were_claimed(self) -> None:
+        # Kills `role: "operator"`, `row: None`, `mode: "headless"` and
+        # `reason: None` in one assertion block: a helper claim with no
+        # --headless flag disagrees with every one of them.
+        claimed = self.claim(self.repo, "a", "helper", "--row", "PROBE-WIRING")
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        state = self.probe_in(self.repo)
+        self.assertEqual(state["role"], "helper")
+        self.assertEqual(state["row"], "PROBE-WIRING")
+        self.assertEqual(state["mode"], "interactive")
+        self.assertEqual(state["reason"], "declared")
+        self.assertIs(state["blocked_by_other_operator"], False)
+
+    def test_probe_reports_a_mode_that_was_declared(self) -> None:
+        # The other half of the mode pin: a hardcoded "interactive" survives the
+        # test above and dies here. Headless is DECLARED, never inferred, so
+        # both directions have to come out of the marker.
+        self.assertEqual(
+            self.claim(self.repo, "a", "read-only", "--headless").returncode, 0)
+        state = self.probe_in(self.repo)
+        self.assertEqual(state["role"], "read-only")
+        self.assertEqual(state["mode"], "headless")
+
+    def test_probe_reports_a_lockout_by_a_live_rival(self) -> None:
+        # Kills `blocked_by_other_operator: False` and `reason: None`, and pins
+        # the resolve() branch that reaches this state: an operator marker whose
+        # lock is now held by ANOTHER LIVE WORKTREE. Since ownership keys on the
+        # worktree, that is not a hypothetical -- it is what a rival claim
+        # leaves behind, and rendering it as "never declared" sends the session
+        # straight at a `claim operator` that exits 1.
+        self.assertEqual(self.claim(self.repo, "a", "operator").returncode, 0)
+        common = subprocess.check_output(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=self.repo, text=True).strip()
+        (Path(common) / "vllm-cpp-operator.lock").unlink()
+        rival = self.worktree("rival")
+        self.assertEqual(self.claim(rival, "b", "operator").returncode, 0)
+
+        state = self.probe_in(self.repo)
+        self.assertIsNone(state["role"])
+        self.assertIs(state["blocked_by_other_operator"], True)
+        self.assertEqual(
+            state["reason"], "operator marker without a held lock; re-claim")
+        # and the human surface must say so, not print the generic hint alone
+        rendered = onboard.render_probe(state)
+        self.assertIn("held by another live session", rendered)
+
+    def test_probe_reports_the_env_state_it_was_given(self) -> None:
+        # Kills `env: "present"`. It cannot be pinned against the real tree --
+        # a developer with a complete .env would make the hardcode true -- so
+        # env_state is substituted with a value no hardcode can be, and probe()
+        # must carry BOTH of its outputs through.
+        saved = onboard.env_state
+        onboard.env_state = lambda *a, **k: ("stubbed-status", ["STUB_KEY"])
+        try:
+            state = self.probe_in(self.repo)
+        finally:
+            onboard.env_state = saved
+        self.assertEqual(state["env"], "stubbed-status")
+        self.assertEqual(state["env_missing"], ["STUB_KEY"])
+
+
 class QueueTests(unittest.TestCase):
     def test_queue_is_the_checkers_own_computation_and_failure_is_visible(self):
         # Beyond the brief, two properties of the same function.
@@ -222,6 +335,67 @@ class PreflightWiringTests(unittest.TestCase):
         # satisfied by a declared ABSENCE of claim. That is correct for a plain
         # run and wrong for --staged; the refusal must be explicit.
         self.assertIn("read-only-cannot-stage", self.TEXT)
+
+    def test_preflight_actually_fails_on_an_undeclared_role(self):
+        # Every other assertion in this class greps text, so a REWRITE of the
+        # default is caught while an OVERRIDE is not: keep `REQUIRE_ROLE=1` and
+        # add `REQUIRE_ROLE=0 ` (one trailing space, so the ^...$ anchor misses)
+        # on a later line and the whole class stays green while the gate stops
+        # failing. Only executing the script closes that hole.
+        #
+        # Two mechanics this test cannot do the obvious way:
+        #
+        # * VLLM_CPP_AGENT_SESSION cannot make a role unresolvable. A role keys
+        #   on the WORKTREE (agent-role.py marker_path/lock_path, corrected
+        #   2026-08-06), so this tree's own marker answers whatever the session
+        #   id says. GIT_DIR is the one knob that moves the marker and the lock
+        #   together, so the run is pointed at an empty git dir instead.
+        # * The run is --role-only, not a full preflight: agent-preflight.sh
+        #   runs THIS suite, and a nested full run would recurse without bound.
+        #   --role-only executes the same role block and the same REQUIRE_ROLE
+        #   branch, which is the code under test.
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty-git-dir"
+            subprocess.run(
+                ["git", "init", "--quiet", "--bare", str(empty)], check=True)
+            env = dict(os.environ, GIT_DIR=str(empty))
+            env.pop("GIT_WORK_TREE", None)
+
+            # PRECONDITION, asserted and never skipped: if a role still
+            # resolves here the run below proves nothing and must go red.
+            probe = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/agent-role.py"), "show"],
+                cwd=ROOT, capture_output=True, text=True, check=False, env=env,
+            )
+            self.assertEqual(
+                probe.returncode, 3,
+                "precondition failed: a role still resolves under the empty "
+                f"GIT_DIR, so this test asserts nothing. show said: "
+                f"{probe.stdout.strip()!r}")
+            self.assertIn("UNDECLARED", probe.stdout)
+
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/agent-preflight.sh"), "--role-only"],
+                cwd=ROOT, capture_output=True, text=True, check=False, env=env,
+            )
+        self.assertNotEqual(
+            result.returncode, 0,
+            "preflight exited 0 with no resolvable role; the REQUIRE_ROLE "
+            "default is off however it is spelled")
+        self.assertIn("role-undeclared", result.stdout + result.stderr)
+
+    def test_role_only_is_not_mistakable_for_a_full_preflight(self):
+        # --role-only exists so a test can execute the gate without recursing.
+        # It must never read as a green preflight, or it becomes the opt-out
+        # --no-require-role was demoted from.
+        self.assertIn("--role-only", self.TEXT)
+        run = subprocess.run(
+            ["bash", str(ROOT / "scripts/agent-preflight.sh"), "--role-only"],
+            cwd=ROOT, capture_output=True, text=True, check=False,
+        )
+        output = run.stdout + run.stderr
+        self.assertIn("NOT a full preflight", output)
+        self.assertNotIn("All gates green", output)
 
 
 class EnvSetTests(unittest.TestCase):

@@ -57,13 +57,19 @@ from pathlib import Path
 
 
 # read-only is a declared ABSENCE of claim, not a third role: it takes no lock
-# and creates no worktree. Every "may this session write?" test keys on
-# CLAIMABLE_ROLES. Without it, a session that only reads must either take the
-# repo-wide operator lock or create a throwaway worktree, and faced with that
-# people reach for --no-require-role until the gate means nothing.
+# and creates no worktree. Without it, a session that only reads must either
+# take the repo-wide operator lock or create a throwaway worktree, and faced
+# with that people reach for --no-require-role until the gate means nothing.
+#
+# CLAIMABLE_ROLES is the vocabulary a "may this session write?" test SHOULD key
+# on, and it is kept at exactly two so that such a test stays correct when one
+# is written. Today it has no consumer outside this file and its suite: the one
+# write refusal that exists is `agent-preflight.sh --staged`, which matches on
+# the rendered `role=read-only` line. Nothing else refuses a read-only session
+# (see AGENTS.md and .agents/specs/session-onboarding.md, which say so).
 CLAIMABLE_ROLES = ("operator", "helper")
 DECLARABLE = (*CLAIMABLE_ROLES, "read-only")
-ROLES = CLAIMABLE_ROLES  # retained: existing call sites mean "may write"
+ROLES = CLAIMABLE_ROLES  # alias kept as the "may write" name for future callers
 
 
 def mode_from_marker(marker: dict) -> str:
@@ -165,6 +171,14 @@ def resolve() -> dict:
                 "session": me,
                 "mode": "interactive",
                 "reason": "operator marker without a held lock; re-claim",
+                # Carried on THIS path too, and for the same reason the
+                # undeclared path below carries it: a worktree keyed lock made
+                # this branch reachable from a LIVE RIVAL, not only from a
+                # self-lost lock. Without the key, "locked out by another
+                # operator" renders identically to "never declared", and every
+                # reader -- render_probe's NOTE, cmd_show's note, the probe's
+                # JSON -- tells the session to `claim operator`, which exits 1.
+                "operator_held_by_other": bool(lock and not lock_is_stale(lock)),
                 "branch": current_branch(),
             }
         return {
@@ -250,6 +264,17 @@ def cmd_claim(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+    else:
+        # Downgrading OUT of the operator role must not orphan the lock.
+        # `claim read-only` ("just looking") is the exact command an operator
+        # types next, and leaving the lock behind is worse than leaving no role
+        # at all: heartbeat answers "not the operator; nothing to heartbeat", so
+        # nothing renews it, while a second worktree's `claim operator` is
+        # refused for the full TTL by a session that holds no role. Releasing
+        # here is the same ownership test `release` uses.
+        if lock_is_ours(read_json(lock_path())):
+            lock_path().unlink(missing_ok=True)
+            print(f"released the operator lock (this worktree is now {role})")
 
     marker_path().write_text(
         json.dumps({

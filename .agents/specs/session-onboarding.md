@@ -1,8 +1,9 @@
 # Session onboarding — ask, don't assume
 
-User-directed 2026-08-06. Status: **accepted design, not yet implemented.**
-This document is the contract; the checker and prose changes named in
-§ Enforcement are the work it implies.
+User-directed 2026-08-06. Status: **IMPLEMENTED 2026-08-06**, except the one
+piece § Enforcement marks DEFERRED (refusal on write paths other than
+`preflight --staged`). This document is the contract; § Work breakdown records
+what landed and what did not.
 
 Subsystem **A** of two. Subsystem B — the orchestration harness an operator
 follows to run a row through subagents with an independent review — is a
@@ -31,8 +32,9 @@ Every piece of this already exists as prose or tooling. None of it fires.
 - `scripts/agent-role.py` already does the hard part — `claim`, materialize
   (operator lock in the git COMMON dir, helper = worktree), `heartbeat`,
   `release`. It exits 3 when undeclared.
-- `scripts/agent-preflight.sh` already has `--require-role`, and it is
-  **opt-in**. `.agents/NOW.md` records it as "still opt-in".
+- `scripts/agent-preflight.sh` already has `--require-role`, and it was
+  **opt-in** when this was written; `.agents/NOW.md` recorded it as "still
+  opt-in". Both were changed by the work below: it is now the default.
 - `AGENTS.md` already says that when `.env` is missing it "is asked, never
   inferred".
 - There is **no `.claude/settings.json` and no hook of any kind**. Nothing runs
@@ -95,9 +97,15 @@ block a real one; forcing `helper` would create a throwaway worktree. Faced with
 either, a developer reaches for `--no-require-role`, and the gate erodes to
 nothing. A cheap honest answer keeps the gate credible.
 
-A `read-only` session **passes preflight and is refused by every write path**:
-commit, push, and any matrix or record edit. Escalating is one command — it is a
-declaration, not a sentence.
+A `read-only` session **passes a plain preflight and is refused by
+`scripts/agent-preflight.sh --staged`** — and by nothing else. That refusal is
+what SHIPPED; the wider claim this paragraph carried until 2026-08-06 ("refused
+by every write path: commit, push, and any matrix or record edit") was never
+true of the delivered code. `git commit`, `git push`, the `gate && git push`
+chain AGENTS.md mandates (which runs preflight WITHOUT `--staged`) and every
+record or matrix edit proceed unimpeded, so past staging `read-only` is the
+honour system. Repo-wide write refusal is DEFERRED, not built — see the work
+breakdown, item 3. Escalating is one command — a declaration, not a sentence.
 
 ### Mode: interactive by default, headless when asked
 
@@ -195,8 +203,14 @@ follow and one they route around.
 **`scripts/agent-role.py`** gains `claim read-only` and a `--headless` flag on
 `claim`, so mode and role are one materialized fact.
 
-**Write paths refuse a `read-only` session.** Preflight `--staged` fails, and the
-role check runs before any record edit.
+**Preflight `--staged` refuses a `read-only` session.** DELIVERED: staging is
+writing, so `--staged` fails on a `read-only` marker. DEFERRED and NOT built:
+"the role check runs before any record edit". Nothing outside preflight consults
+the role, so `git commit`, `git push` and every record/matrix edit proceed for a
+`read-only` session. Closing that needs a repo-wide write hook (a `pre-commit`
+hook is harness-neutral but opt-in per clone; a role check inside every record
+checker is neutral but touches ~15 scripts) and is out of this spec's delivered
+scope. It is tracked in the SDD ledger rather than assumed done.
 
 **Prose and gate move together.** `AGENTS.md` T0's role bullet, the
 `.agents/workflow.md` session protocol (which carries the canonical interview),
@@ -217,7 +231,7 @@ Each item is independently landable.
 |---|---|
 | 1 | `scripts/agent-onboard.py --probe` + mutation tests; reports state, writes nothing |
 | 2 | `agent-role.py claim read-only` and `--headless`; the mode becomes a materialized fact |
-| 3 | `--require-role` default-on, `--no-require-role` escape, actionable failure text; write paths refuse `read-only` |
+| 3 | `--require-role` default-on, `--no-require-role` escape, actionable failure text; preflight `--staged` refuses `read-only` (LANDED). Refusal on every OTHER write path — commit, push, record/matrix edit — is DEFERRED, not built |
 | 4 | `--env-set KEY=VALUE`, creating `.env` from `.env.example` on first use |
 | 5 | Prose: `AGENTS.md` T0, `workflow.md` interview table, `operator-helper-protocol.md` — in the same change as the `check-protocol-consistency.py` extension |
 

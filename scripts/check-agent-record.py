@@ -137,7 +137,12 @@ MATRICES = {
     # measured 3.5x) and +`KERNEL-GEMM-CPU-TILED` (the tinyBLAS-style tiled
     # sgemm; controls proved our NEON kernel is at ggml-stock parity and the
     # whole 16-bit deficit is llamafile, ~1.9x Arm / ~2.4x x86).
-    "KERNEL": (AGENTS / "kernel-matrix.md", 47),
+    # 50 since 2026-08-06: +`KERNEL-CPU-CONV2D-SUBSAMPLE`, +`KERNEL-DEPTHWISE-CONV1D`
+    # and +`KERNEL-ATTN-RELPOS` — the three conformer/FastConformer audio-encoder
+    # primitives the tree had no device op for at all (Conv2d existed only as a host
+    # std::vector loop; the only depthwise conv1d was the CAUSAL Mamba/GDN one; every
+    # attention path was RoPE + paged/flash KV). Spike specs/parakeet-conformer-encoder.md.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 50),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

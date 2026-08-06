@@ -14,18 +14,19 @@ checkpoint on `upstream/main` at `59674cf1d`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (byte-exact, default; `VT_LAGUNA_RESIDENT_BF16W`) | vLLM K-run when convenient |
-| DeepSeek-V4-Flash decode | **Closed: beats ds4 1.144x** (`VT_V4_RESIDENT_W`, byte-exact); phase-2 residency NEG, default-OFF | — |
-| f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
+| Laguna NVFP4 decode speed | **Closed: PARITY+ 1.03x** (byte-exact, default) | vLLM K-run when convenient |
+| DeepSeek-V4-Flash decode | **Closed: beats ds4 1.144x** (byte-exact); phase-2 residency NEG, default-OFF | — |
+| f32-out GEMV audit | Only laguna + ds4 bf16 tower; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + AGENTS.md checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **RENDER BUG CLOSED** (`H3-RENDER-CLOSE` PR #77): #70/#74 white = t2va on the REF2VA ckpt; the FL2VA GGUF t2va renders COHERENT (adj-cos 0.95) | Follow-up: partition guard + vision tower |
-| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **e2e RUNS** (bf16-resident §13): 13/13·656. Token gate **NEAR-TIE 106/128** | device GDN/MLA islands; 1.59 tok/s; default OFF |
-| 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
+| MiniMax-H3 lane | **RENDER BUG CLOSED** (PR #77): #70/#74 white = t2va on the REF2VA ckpt; FL2VA t2va renders COHERENT | Follow-up: partition guard + vision tower |
+| Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **e2e RUNS** 13/13·656; token gate **NEAR-TIE 106/128** | device GDN/MLA islands; 1.59 tok/s; default OFF |
+| 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x. INTAKE + Option A NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. #75: occupancy IDENTICAL 8.33%; matched vLLM reg+instr, STILL +10us = ptxas gap | c8: flash ptxas ~40%; try ptxas-lineage vendor |
-| ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
+| MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. #75: occupancy IDENTICAL, matched reg+instr, STILL +10us = ptxas gap | c8: try ptxas-lineage vendor |
+| ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
+| Parakeet encoder kernels (`CLAIM-PARAKEET-KERNELS-P1P3`) | **P1-P3 LANDED, CPU**: Conv2d, non-causal depthwise Conv1d, relpos attention; byte-identity gated. No GPU run | P4: encoder+CTC+mel, then CUDA |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -43,10 +44,10 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 
 ## Next actions
 
-1. **Spike the Parakeet encoder row.** Upstream vLLM has `parakeet.py` +
-   `conformer_encoder.py` as the audio encoder of `nano_nemotron_vl.py`, which we
-   already carry `MODEL-MM-nano-nemotron-vl-*` rows for, so it is owed mirror work.
-   The transducer decode half (RNN-T/TDT/CTC) is NOT in vLLM: separate scope call.
+1. **Parakeet encoder: spike ACCEPTED, kernels P1-P3 DONE on CPU.** The three
+   blocking primitives are now `vt::` ops through `op_provider`. NEXT is P4 (the
+   `ParakeetEncoder` + `ParakeetForCTC` port, mel extractor) and then the CUDA
+   providers. The transducer half (RNN-T/TDT) is NOT in vLLM: separate scope call.
 2. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
    speed-pending; bind the default-ON async-serving path against the same oracle
    before attributing the remaining TPOT gap.

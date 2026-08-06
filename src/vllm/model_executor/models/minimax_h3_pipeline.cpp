@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -406,6 +408,22 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
     video_latent = MiniMaxH3VideoVaePostQuantConv(video_weights, video_latent,
                                                   dit_params.latents_dim, video_per_channel);
   }
+  // DIAGNOSTIC (env-gated, byte-identical when unset): dump the exact latent that
+  // enters the video VAE (post unpatchify + denormalize + post_quant_conv) as raw
+  // f32, so the VAE decode can be replayed on a KNOWN latent and runs byte-compared
+  // (H3 render-coherence bisection at the VAE boundary).
+  if (const char* dump_dir = std::getenv("VT_H3_DUMP_DIR")) {
+    std::string path = std::string(dump_dir) + "/vae_input_video_latent.f32";
+    if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+      std::fwrite(video_latent.data(), sizeof(float), video_latent.size(), f);
+      std::fclose(f);
+      std::fprintf(stderr, "[h3-dump] wrote %s (%zu floats, channels=%lld per_channel=%lld)\n",
+                   path.c_str(), video_latent.size(),
+                   static_cast<long long>(dit_params.latents_dim),
+                   static_cast<long long>(video_per_channel));
+    }
+  }
+
   // On a device, run the ViT3D decoder device-resident. The portable decoder is a
   // scalar reference; at real resolutions it is the stage that does not finish. It
   // stays the CPU path, and stays the thing the device path is gated against.

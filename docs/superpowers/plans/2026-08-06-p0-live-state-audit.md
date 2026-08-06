@@ -594,12 +594,25 @@ class PartialGapTests(unittest.TestCase):
         # "commonly" contains "only" and "node" contains "no". A substring
         # match would mark these rows explicit and hide them from review.
         self.assertFalse(audit.names_missing_modes("Commonly used decode node"))
+        # Both halves need their marker pinned as live, or the assertFalse
+        # above passes for the wrong reason: dropping "no" from GAP_MARKERS
+        # entirely also stops "node" matching, and nothing would notice.
         self.assertTrue(audit.names_missing_modes("Decode only"))
+        self.assertTrue(audit.names_missing_modes("No fp8 path"))
 
     def test_flag_is_advisory_and_never_gates(self):
         # check mode fails only on abandoned ACTIVE rows, never on a vague
         # PARTIAL row -- the detector is a keyword heuristic.
         self.assertNotIn("PARTIAL", audit.CHECK_FAILS_ON)
+
+    def test_check_fails_on_active_and_nothing_else(self):
+        # assertNotIn above passes for frozenset() -- a check mode that fails
+        # on NOTHING -- and even for the bare string "ACTIVE", since "PARTIAL"
+        # is not a substring of it. Neither is what "report-only" means: the
+        # flag must be excluded from a set that still gates something. Pin the
+        # membership exactly, and pin that the gated state is a real live one.
+        self.assertEqual(audit.CHECK_FAILS_ON, frozenset({"ACTIVE"}))
+        self.assertTrue(audit.CHECK_FAILS_ON <= audit.LIVE_STATES)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -650,7 +663,7 @@ def names_missing_modes(row_text: str) -> bool:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 23 tests.
+Expected: PASS, 24 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -876,7 +889,7 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 28 tests (29 added minus the transitional CLI-guard test you delete here).
+Expected: PASS, 29 tests (30 added minus the transitional CLI-guard test you delete here).
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 
@@ -1122,7 +1135,7 @@ In `.github/workflows/ci.yml`, extend the record job (lines 42–46):
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 31 tests.
+Expected: PASS, 32 tests.
 
 - [ ] **Step 6: Verify the whole gate is green**
 

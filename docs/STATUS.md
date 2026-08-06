@@ -84,7 +84,7 @@ token-for-token correctness against the pinned oracle.
 | Safetensors loading | Supported | Both gate models plus every registered dense/MoE family |
 | GGUF loading (F32/F16/BF16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ2_XXS/IQ3_XXS/IQ2_S/MXFP4/NVFP4) | Supported; compute-in-quant (keep-quant) on CPU AND now CUDA for the six K-block encodings PLUS Q2_K/IQ2_XXS/IQ3_XXS (DeepSeek-V4 W8, 2026-07-29 - the FIRST CUDA keep-quant GGUF k-quant GEMM `KERNEL-QUANT-CIQ-GEMM-CUDA`, MMVQ-style dequant-in-kernel, GB10-gated 92401/92401 vs the CPU oracle, so a CUDA runner keeps blocks compressed and dots them on the GPU instead of the ARM cores); **NVFP4 now COMPUTES IN FP4 on CUDA for the dense-MLP and full-attention projections (2026-07-29, `CLAIM-GGUF-NVFP4-COMPUTE`), no longer materialize-only** | Weights in six block encodings stay compressed from file to matmul on CPU (no BF16 expansion). NVFP4 (ggml type 40) DEQUANTIZES, including the per-tensor (per-expert) `<stem>.scale` sidecar the container keeps outside the blocks; gated BIT-EXACT against the compressed-tensors NVFP4 path on real Qwen3.6-27B bytes from both containers. **It no longer expands to bf16 on CUDA:** an NVFP4 matmul/expert weight is REPACKED at load into the same (`weight_packed [N,K/2]`, `weight_scale [N,K/16]`) operand pair the compressed-tensors path produces - a pure byte permutation, gated BYTE-IDENTICAL against that container - and the existing `vt::MatmulNvfp4*` kernels run on it, so no new kernel exists and no numerics are re-derived. Covers the dense MLP + full-attention q/k/v/o and the MoE shared/routed experts; the GDN `in_proj_*` family and `ssm_out` still expand (the V-head reorder rewrites their layout) and a CPU build still expands everything - the documented `part` subset. **MEASURED on GB10 (2026-07-29), same-binary A/B, one `flock`, idle box, 2 reps per arm:** peak RSS **50.8 -> 25.7 GiB**, load-and-generate **1:58 -> 0:41**, and the 256 projections that move cost 35 840 MiB expanded against 10 080 MiB fp4-resident (3.56x). **The divergence against the safetensors sibling CLOSES:** the fp4 arm is token-IDENTICAL over 24 greedy tokens where the bf16 arm of the same binary diverges at index 4, which retires the reading that that divergence was permanent. It is REPORTED, not gated: the two containers are not the same model - the GGUF NVFP4-quantizes 192 GDN `in_proj` tensors the safetensors keeps BF16 (mean relative weight error ~0.18) and their activation global scales differ - so identity is not guaranteed and a cross-container throughput arm is not valid. SACRED gates unmoved: `test_qwen27_paged_engine` 235/235, `test_qwen36_paged_engine` 315/315. **The MoE (35B) stacked-expert arm is now HARDWARE-GATED too (2026-07-29)**, superseding the gap recorded here: the real 35B A3B NVFP4 GGUF loads and generates through the fp4 path, its 120 routed-expert stacks x 256 experts repack to the modelopt safetensors' own operands with ZERO differing bytes over 840 sampled (tensor, expert) slabs, and all 840 per-expert `<stem>.scale[e]` are bit-identical to that expert's `weight_scale_2` - the per-expert scale INDEXING, mutation-proved against both a `scales[0]`-for-every-expert and an expert-0-slab-for-every-expert mutant. Same-binary A/B: peak RSS 68.5 -> 22.7 GiB (3.01x), load-and-generate 1:51.9 -> 0:28.8, tokens IDENTICAL (correct here, since the 35B routed experts run the W4A16 grouped GEMM in both arms). Recorded as OPEN, not smoothed over: this case's 24-token greedy stream is NOT run-to-run stable (one of three `use_a16` runs and one of four safetensors-reference runs differed), so the binding results are the weight-level byte identity and the residency audit, not a token-exactness claim; `test_qwen36_paged_engine` is token-exact at ITS engine params, so the instability belongs to this case's configuration and attributing it is owed work. That run also found and FIXED a latent defect the MoE arm made reachable: the two fp4 fused MoE blocks issued the router GEMM assuming the safetensors `[K,N]` gate layout and threw `matmul: inner dims mismatch` on the GGUF's `[N,K]` one; `MoeRouterLogits` now branches on `nk` (inert for the safetensors path, SACRED gates unmoved). **Q2_K (id 10) + IQ2_XXS (id 16) DEQUANTIZE (2026-07-29, `CLAIM-DSV4-GGUF-LOADER`):** the ~2-bit types the single-Spark `DeepSeek-V4-Flash-GGUF UD-IQ2_XXS`/`UD-Q2_K_XL` vehicles use, ported 1:1 from llama.cpp `ggml-quants.c` (`iq2xxs_grid` codebook + signs; Q2_K nibble sub-scale/min), unit-gated on hand-derived bytes (`test_gguf_dequant` 15/15). Dequant-only (no vec_dot -> expand-bf16). A V4-GGUF model still cannot RUN: the V4-GGUF name map (tensor-manifest-blocked) + the V4 forward (W3-W8) remain. **Multi-shard split GGUF READING landed (2026-08-03, `CLAIM-GGUF-SPLIT-SHARDS`):** `GgufFile::Open` now transparently stitches llama.cpp `gguf-split` shards (`...-00001-of-00003.gguf`) — every shard mmap'd, tensor tables merged, KV metadata taken from shard `00001`, and the sibling shard mappings kept alive by the primary so keep-quant mmap-borrows stay valid across shards (`OwnsSpan` is shard-aware); `VT_GGUF_NO_SPLIT=1` opts out; unit-gated (`test_gguf` split-merge / no-split / count-mismatch cases, 33/33 local). This unblocks the real 3-shard `unsloth/DeepSeek-V4-Flash-0731 UD-IQ2_M` (~91 GiB), whose layout is the NATIVE `deepseek4` arch — per-block `ffn_gate_tid2eid` hash tables (hash layers 0/1/2) + `hc_*` MHC + DSA compressor/indexer are all PRESENT (name-map 1328/1328), `vocab_size` derives from `token_embd` — NOT a standard llama.cpp conversion, so no loader-layout change is owed. It now loads THROUGH 1324/1328 tensors; the sole remaining gap is 4 routed-expert slabs quantized with IQ2_S (id 22, ×2) + MXFP4 (id 39, ×2) — encodings we have GGUF block traits for but no keep-quant vec_dot, so they hit the expand→dequant path which lacks them. Dequant-expanding those 4 big expert tensors to bf16 would add ~17 GiB (~106 GiB total → GB10 OOM-reboot risk), so the memory-safe fix is an IQ2_S+MXFP4 keep-quant kernel (CPU dequant dispatch + the `iq2s_grid` codebook + a CUDA `DotSuperblock<WType::kIQ2_S/kMXFP4>`), spec'd as the next brick **IQ2_S (id 22) + MXFP4 (id 39) DEQUANTIZE + KEEP-QUANT on CPU (2026-08-03, `CLAIM-DSV4-UDIQ2M-QUANT`, off-GPU):** the extra per-tensor "dynamic" encodings the `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_M` checkpoint mixes into its last routed-expert slabs (IQ2_S `ffn_gate/up` dotting Q8_K, MXFP4 `ffn_down` dotting Q8_0) — ported 1:1 from llama.cpp `ggml-quants.c` @ 237ad9b96 (`iq2s_grid` 1024-entry codebook + DIRECT sign bytes; MXFP4 `kvalues_mxfp4` + `e8m0_to_fp32_half` micro-scaling, distinct from the compressed-tensors `E8M0ToF32` NVFP4 path). CPU dequant + keep-quant `vec_dot`, unit-gated on hand-derived golden bytes (`test_gguf_dequant` 17/17), an INDEPENDENT f64 dequant-then-dot + GEMM NMSE (`test_ops_quant_dot` 19/19), and keep-quant routing (`test_gguf_keep_quant` 37/37) — all CPU-green, so UD-IQ2_M's four previously-`unsupported ggml type 22/39` slabs now load COMPRESSED (no ~17 GiB bf16 expansion that OOM-reboots the box). CUDA: the IQ2_S device `DotSuperblock<WType::kIQ2_S>` is wired into the Q8_K grouped-MoE GEMM and now **CUDA-BUILT + LINKED on GB10 (sm_121a, CUDA 13.0, `-Werror`, 2026-08-03 integration)** — it compiles clean and the merged binary links; MXFP4's device dot (`DotMXFP4`) is written but NOT wired (Q8_0-activation needs a separate 32-block GEMM) so it is marked `[[maybe_unused]]` to keep the ready math without tripping nvcc #177-D, and on GPU MXFP4 CPU-fallbacks like Q4_0/Q8_0. The V4-GGUF forward + a real UD-IQ2_M GPU load/coherence run are owed |
 | AWQ / GPTQ quantization | W0 spike + W1 CPU INT4 dequant primitive; not yet loadable end to end | INT4 unpack+dequant-to-bf16 for BOTH community formats, mirroring vLLM 1:1 (AWQ reverse-order `awq_triton.py`; GPTQ `qdq_4.cuh` with zero_offset v1/v2 + act-order g_idx). Unit-gated RED-first (hand-computed known bytes + double-precision roundtrip). NOT wired to a loader, no GPU Marlin compute, no model run yet: config recognizer (W2), Marlin GPU GEMM riding the vendored NVFP4 Marlin (W4), CPU e2e (W3), GPTQ 8/2/3-bit (W5) and MoE (W6) are named next bricks. See [.agents/specs/awq-gptq-quant.md](../.agents/specs/awq-gptq-quant.md) |
-| MXFP4 (compressed-tensors `mxfp4-pack-quantized`) | Compute PROVEN (#38); binding c1 0.99 / c2-c8 0.92-0.94 (#49 GQA-swap default-ON), mem 2.6x LESS, BELOW-FLOOR; dense-marlin port NO-GO (#50, cross-tool bias); Marlin-config + glue-fusion levers REFUTED by measurement. **Closer slivers LANDED byte-exact default-ON (`QUANT-CT-MXFP4-CLOSERS`, d3b412f5): dense M≤8 8-row Marlin tile + per-call ws re-zero dropped (block8≡block16 bitdiff=0 MXFP4+NVFP4, memcheck clean, #44 3/3). Binding x3: c1 1.005 PASSES, c2-c8 0.92-0.95 BELOW (best c8 0.953, +1.1pp vs #49), mem 2.18x WIN, gate NO; host slice NOT engine-loop (VT_LOOP_TRACE).** Detail in state.md | Shared with DeepSeek-V4-Flash + Kimi-K3 MXFP4-expert paths. CPU E8M0 dequant (`2^(byte-127)`, group 32, no global scale) unit-gated 5/5·1142 vs `dq_mxfp4_torch`. GPU W4A4 fp4 GEMM + MoE-expert e2e remain later bricks |
+| MXFP4 (compressed-tensors `mxfp4-pack-quantized`) | Compute PROVEN (#38); GQA-swap ON (#49); dense-marlin NO-GO (#50); config+glue levers REFUTED. **Byte-exact closer slivers default-ON (`QUANT-CT-MXFP4-CLOSERS`, d3b412f5; #44 3/3). Binding x3: c1 1.005 PASSES, c2-c8 0.92-0.95 BELOW (best c8 0.953), mem 2.18x WIN, gate NO. c8 SAME-TOOL diff (`QUANT-CT-MXFP4-C8-DIFF`) SETTLES the residual: marlin grouped-5-GEMM (gate_up UNFUSED, 180 vs 144) DOMINANT (+0.9/+1.4ms step); eager launch-gap +0.88ms graph-closeable (`VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH` opt-in) nets +1.3% only; #50 grouped==dense = isolated-shape artifact.** Detail in state.md | Shared with DeepSeek-V4-Flash + Kimi-K3 MXFP4-expert paths. CPU E8M0 dequant (`2^(byte-127)`, group 32, no global scale) unit-gated 5/5·1142 vs `dq_mxfp4_torch`. GPU W4A4 fp4 GEMM + MoE-expert e2e remain later bricks |
 | CPU backend vs llama.cpp | At or ahead on every axis (GGUF) | Prefill 1.18x ahead, decode at parity, peak memory 1.01x, byte-identical greedy tokens. Single-stream only; no concurrent-serving comparison has been measured |
 | Paged KV cache + prefix caching | Supported | Block-paged full attention, hybrid full-attention + GDN state groups, automatic prefix caching (APC) on by default for dense models (cache-ON gated end to end: token-identical output, cache hits, faster TTFT) |
 | fp8 KV cache (`cache_dtype=fp8`) | In progress (W1 CPU brick), not yet usable end-to-end | HIGH-priority memory/throughput lever (halves the KV footprint). W0 spike + W1 CPU brick landed (`KV-FP8` ACTIVE): fp8-e4m3 K/V STORE (`Quantize(hp/scale)`) + the paged-attention READ dequant (`Dequant(fp8)*scale`) + the `cache_dtype` config parse, all CPU-gated RED-first (`test_ops_fp8_kv_cache` 8/8·511; a wrong store direction fails 3/480). Storage is 1-byte fp8 (`DType::kI8`) + a `Fp8KVCacheDataType` interpretation enum, per-tensor k/v scales (mirroring vLLM `BaseKVCacheMethod`). The CUDA store + fp8 paged-attention read (the GPU memory-halving path, DGX-blocked), the runner/spec integration (half-sized KV blocks + checkpoint-scale threading + `--kv-cache-dtype`/`--calculate-kv-scales`), fp8_e5m2 and per-head scales are named W2-W5 in [.agents/specs/fp8-kv-cache.md](../.agents/specs/fp8-kv-cache.md). No model can run with an fp8 KV cache yet |
@@ -1419,16 +1419,19 @@ MXFP4, CUTLASS MLA) remain scoped.
 
 A separate **beyond-vLLM breadth lane** targets the older NVIDIA arches vLLM
 DROPS but llama.cpp still runs (Pascal/Volta/Turing). Its first brick landed
-2026-07-28: **Turing `sm_75` is BUILD-VERIFIED.** The bf16-WMMA prefill kernels
-(bf16 tensor-core fragments are Ampere+ only) are now guarded
-`#if __CUDA_ARCH__ >= 800`, so a single-arch `75` build compiles `-Werror` 0
-warnings on nvcc 13.0 and `cuobjdump` shows real `sm_75` cubins — the TU falls
-back to the existing scalar CUDA-core attention path (the llama.cpp fp16 fast
-body is a later brick). On `sm_80`+ the guard is a no-op (preprocessor identity),
-so the GB10 gate build is byte-identical. This is
+2026-07-28: **the Turing `sm_75` attention TU is BUILD-VERIFIED.** The bf16-WMMA
+prefill kernels (bf16 tensor-core fragments are Ampere+ only) are now guarded
+`#if __CUDA_ARCH__ >= 800`, so `cuda_paged_attn.cu` compiles `-Werror` 0
+warnings at single-arch `75` on nvcc 13.0 and `cuobjdump` shows a real `sm_75`
+cubin — the TU falls back to the existing scalar CUDA-core attention path (the
+llama.cpp fp16 fast body is a later brick). On `sm_80`+ the guard is a no-op
+(preprocessor identity), so the GB10 gate build is byte-identical. This is
 **DERIVED+BUILD-VERIFIED (testing-welcome), NOT runtime** — no Turing board ran
 it; there is no vLLM oracle on Turing (vLLM dropped it), so correctness is
-referenced against llama.cpp-on-card plus a portable cross-check. Volta/Pascal
+referenced against llama.cpp-on-card plus a portable cross-check. **A 2026-08-06
+audit of all 20 unconditionally-built CUDA TUs at `sm_75` measures 18 PASS / 2
+FAIL** (`cuda_gdn.cu`, `cuda_matmul_nvfp4.cu`), so no `sm_75` library build
+exists yet — see the backend detail section below. Volta/Pascal
 need a CUDA `<13` toolkit (nvcc 13 rejects `sm_70`/`sm_60`/`sm_61`). See
 [.agents/backend-matrix.md](../.agents/backend-matrix.md) `BACKEND-CUDA-SM075`.
 
@@ -1523,17 +1526,46 @@ competitor floor. Our portable attention uses bf16 tensor-core WMMA, which does
 not exist before Ampere, so these arches need the bf16-WMMA path compile-guarded
 (and, for a fast path, a new fp16/non-tensor-core kernel body ported 1:1 from
 llama.cpp's `fattn-tile`/`fattn-vec`). The lane is derive-and-ship, and its first
-brick has LANDED: **Turing (`sm_75`, e.g. the cloud-common T4) is BUILD-VERIFIED**
-(2026-07-28, `CLAIM-CUDA-TURING-SM75`). The bf16-WMMA prefill kernels are now
-guarded `#if __CUDA_ARCH__ >= 800`, so a single-arch `75` build compiles `-Werror`
-0-warn on our current CUDA 13 toolkit and `cuobjdump` shows real `sm_75` cubins —
-the TU falls back to the existing scalar CUDA-core attention path (the fp16 fast
-body is a separate later brick). On `sm_80`+ the guard is a no-op (byte-identical
-GB10 build). It ships labeled "derived, build-verified, not hardware-tested here,
-community testing welcome" — no Turing board ran it; a green compile + SASS is not
-execution evidence. **Volta (`sm_70`, V100) and Pascal (`sm_60`/`sm_61`, P100/P40)
+brick has LANDED: the **Turing (`sm_75`, e.g. the cloud-common T4) attention TU is
+BUILD-VERIFIED** (2026-07-28, `CLAIM-CUDA-TURING-SM75`). The bf16-WMMA prefill
+kernels are now guarded `#if __CUDA_ARCH__ >= 800`, so `cuda_paged_attn.cu`
+compiles `-Werror` 0-warn at single-arch `75` on our current CUDA 13 toolkit and
+`cuobjdump` shows a real `sm_75` cubin — the TU falls back to the existing scalar
+CUDA-core attention path (the fp16 fast body is a separate later brick). On
+`sm_80`+ the guard is a no-op (byte-identical GB10 build). It ships labeled
+"derived, build-verified, not hardware-tested here, community testing welcome" —
+no Turing board ran it; a green compile + SASS is not execution evidence.
+
+**Scope correction (2026-08-06): that was ONE translation unit, not a library
+build**, and this page previously read as the latter. A full compile audit of all
+20 unconditionally-built CUDA TUs at `sm_75` (base `249697b7`, nvcc 13.0.88) now
+measures **18 PASS (0 errors, 0 warnings) and 2 FAIL**: `cuda_gdn.cu` (110 error
+lines — bf16 WMMA fragments plus `wmma::precision::tf32`, which is also Ampere+
+and fails at the type-alias definition rather than at a use site) and
+`cuda_matmul_nvfp4.cu` (10 errors — bf16 fragments; the TU is compiled
+unconditionally even though its own `fp4-mma` feature cell resolves DISABLED).
+The audit also confirms all eight fast-path feature cells resolve DISABLED at
+`75`, so the remaining surface is those two files.
+
+**Both are now guarded, and the audit is green: `sm_75` compiles 20/20 TUs, 0
+errors and 0 warnings** (2026-08-06). The bf16 and TF32 WMMA bodies in both files
+are wrapped `#if __CUDA_ARCH__ >= 800` with a `__trap()` fallback, together with
+the helper structs and device functions that only those bodies use. **The GB10
+gate build is unaffected, by measurement:** at `sm_121a` both TUs compile
+`-Werror=all-warnings` 0-warn, `cuda_gdn.cu` SASS is bit-identical across 824,704
+lines, and `cuda_matmul_nvfp4.cu` shows zero instruction-level differences (the
+only 148 differing lines are `Function :` headers carrying the anonymous-namespace
+hash, which shifts on any edit to a file). **No `sm_75` library link exists yet**
+— a per-TU compile sweep is not a link, and no Turing, Volta or Pascal board has
+run any of this. Separately, the audit
+established that bf16 needs no fp16 model path on these arches: there are zero
+bf16 *arithmetic* intrinsics in the CUDA tree (the pattern is convert-on-load,
+compute in fp32), so models stay bf16 and only WMMA fragment instantiation is
+Ampere-gated. **Volta (`sm_70`, V100) and Pascal (`sm_60`/`sm_61`, P100/P40)
 are not-yet-buildable** because CUDA 13 dropped their code generation and no
-CUDA 12.x toolkit is provisioned here. There is no vLLM oracle on these cards
+CUDA 12.x toolkit is provisioned here; both failing TUs fail for capability
+reasons that hold on Volta by construction, so the fix list transfers but the
+SASS proof does not. There is no vLLM oracle on these cards
 (vLLM will not run there), so a real correctness test uses llama.cpp on the same
 card plus a newer-card/CPU cross-check; nothing is runtime-verified yet.
 

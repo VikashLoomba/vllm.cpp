@@ -1053,6 +1053,13 @@ EOF
 
 **One commit per matrix.** A 49-row single commit is unreviewable, and a bad transition in one matrix should be revertible without losing the others.
 
+- [ ] **Step 0: Re-fetch and re-run the audit**
+
+The artifact pins `origin/main` at `cf32c619` and the remote has since advanced.
+Run `git fetch -q origin` and re-run `python3 scripts/audit-live-rows.py --json`
+before editing anything. If the verdict set has changed, the artifact's proposals
+are stale — re-verify the affected rows rather than applying a stale list.
+
 - [ ] **Step 1: Correct the first matrix**
 
 Work one matrix at a time, starting with the one holding the most corrections. For each row in the artifact's corrections list, edit **only** the `State` and `Owner` cells. Do not touch `Our code`, `Tests/evidence`, `Upstream` or `Spike/spec` — those are durable anchors and are not what this audit is about.
@@ -1098,6 +1105,11 @@ Every abandoned row sits in an active claim in `.agents/coordination.md`, and
 **11 claims must be RETIRED, not emptied** — moved to the completed block with
 their outcome — and it has to happen in the same commit as the matrix edit, or
 `scripts/check-agent-record.py` goes red between the two.
+
+**Retirement has an exact mechanic.** `parse_active_claims` keys on
+`line.startswith("| \`CLAIM-")`, so a claim moved to a table row in another
+section is *still parsed as active* and still red. The repo's existing archival
+convention (`.agents/coordination.md:1643+`) uses **prose bullets** — follow it.
 
 Run `python3 scripts/check-agent-record.py; echo "EXIT=$?"` and confirm `EXIT=0`
 before committing. If it complains about a claim/owner mismatch, the claim

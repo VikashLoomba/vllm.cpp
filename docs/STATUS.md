@@ -1555,9 +1555,21 @@ gate build is unaffected, by measurement:** at `sm_121a` both TUs compile
 `-Werror=all-warnings` 0-warn, `cuda_gdn.cu` SASS is bit-identical across 824,704
 lines, and `cuda_matmul_nvfp4.cu` shows zero instruction-level differences (the
 only 148 differing lines are `Function :` headers carrying the anonymous-namespace
-hash, which shifts on any edit to a file). **No `sm_75` library link exists yet**
-— a per-TU compile sweep is not a link, and no Turing, Volta or Pascal board has
-run any of this. Separately, the audit
+hash, which shifts on any edit to a file).
+
+**The prefill selector is arch-gated as well**, which the guards alone did not
+cover: the predicate choosing the bf16-WMMA prefill kernels was entirely
+host-side (shape, dtype, env) and never consulted the device, so a pre-Ampere
+board would have selected a kernel whose body is a `__trap()`. It now also
+requires `sm_major >= 8`, and `<sm_80` falls through to the portable CUDA-core
+register-tiled flash, which needs no tensor cores. On `sm_80`+ the term is always
+true, so gate-model selection is unchanged. The equivalent arch-blind selection
+still exists for the GDN and bf16-MoE WMMA kernels, which have no portable
+fallback in their launchers; closing those is a design call, not a mechanical
+edit, and is tracked in the spec.
+
+**No `sm_75` library link exists yet** — a per-TU compile sweep is not a link,
+and no Turing, Volta or Pascal board has run any of this. Separately, the audit
 established that bf16 needs no fp16 model path on these arches: there are zero
 bf16 *arithmetic* intrinsics in the CUDA tree (the pattern is convert-on-load,
 compute in fp32), so models stay bf16 and only WMMA fragment instantiation is

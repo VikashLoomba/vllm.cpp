@@ -900,6 +900,20 @@ vllm_cpp_add_test(test_ops_mla_absorb vt/test_ops_mla_absorb.cpp)
 vllm_cpp_add_test(test_mla_attention_block
   vllm/model_executor/layers/attention/test_mla_attention_block.cpp)
 vllm_cpp_add_test(test_ops_moe_router_grouped vt/test_ops_moe_router_grouped.cpp)
+# Conformer / FastConformer audio-encoder kernels (spike
+# .agents/specs/parakeet-conformer-encoder.md rows P1/P2/P3). Each gate is
+# BYTE-IDENTITY against an INDEPENDENT in-test scalar reference (never against
+# the kernel), across dtype x shape x thread count, matching the
+# test_ops_matmul_elem.cpp discipline. The relpos-attention reference performs
+# the upstream `_rel_shift` LITERALLY, so byte-identity is what proves the
+# kernel's closed-form index. They reach src/ for the threadpool test hook
+# (Threadpool::SwapForTesting) used by the determinism cases. CPU-only.
+vllm_cpp_add_test(test_ops_conv2d vt/test_ops_conv2d.cpp)
+target_include_directories(test_ops_conv2d PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_conv1d_depthwise vt/test_ops_conv1d_depthwise.cpp)
+target_include_directories(test_ops_conv1d_depthwise PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_attn_relpos vt/test_ops_attn_relpos.cpp)
+target_include_directories(test_ops_attn_relpos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
 vllm_cpp_add_test(test_ops_penalties vt/test_ops_penalties.cpp)

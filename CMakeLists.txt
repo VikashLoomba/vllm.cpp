@@ -852,6 +852,12 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_quant_traits.cpp
   src/vt/cpu/cpu_quant_gemm.cpp
   src/vt/cpu/cpu_layernorm.cpp
+  # Conformer / FastConformer audio-encoder kernels (spike
+  # .agents/specs/parakeet-conformer-encoder.md rows P1/P2/P3). Self-registering
+  # translation units, reached through vllm's INTERFACE --whole-archive option.
+  src/vt/cpu/cpu_conv2d.cpp
+  src/vt/cpu/cpu_conv1d_depthwise.cpp
+  src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
   src/vt/cpu/cpu_mla_prefill.cpp

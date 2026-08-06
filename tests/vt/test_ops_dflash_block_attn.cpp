@@ -547,3 +547,221 @@ TEST_CASE("dflash-block-attn LONG ragged multi-request CAUSAL matches the refere
                 /*causal=*/false, /*window=*/0, /*cu=*/{0, 501, 1503, 2185},
                 0x082EFA98EC4E6C89ULL);
 }
+
+// ---------------------------------------------------------------------------
+// bf16 CUDA parity — the TENSOR-CORE (mma.sync) path.
+//
+// Every CUDA case above uploads f32, so all of them land on the CUDA-core kernels
+// and NOT ONE of them would touch the bf16 tensor-core kernel. That is exactly the
+// failure mode this file has been bitten by before (a long-sequence kernel guarded
+// to num_reqs == 1 shipped never-executed while the suite stayed green), so the
+// bf16 path gets its own coverage of the same semantic corners.
+//
+// THE BAR. Q, K and V are bf16 on both sides here — the reference runs on the very
+// same rounded values — so the inputs contribute NOTHING. What differs is that the
+// tensor-core kernel rounds the softmax probabilities P to bf16 before the P·V
+// GEMM (as FlashAttention does), which is a bounded ~2^-9 relative perturbation of
+// a convex combination of the V rows. With |v| < 0.5 here that is ~1e-3 absolute,
+// so 5e-3 is the honest bf16 bound — the same one test_minimax_h3 uses for its
+// bf16 stream — and NOT a loosened f32 bound: the f32 cases above still gate at
+// 2e-5 and they still run the CUDA-core kernel.
+//
+// A tolerance alone cannot prove the kernel is right, because a wrong mask also
+// produces "small" numbers when the rows are similar. So each case ALSO checks the
+// RMS error against a much tighter statistical bound (random sign errors cancel;
+// a structurally wrong kernel does not), and the mask cases are separated from
+// their opposite mask by a margin far larger than 5e-3.
+namespace {
+
+std::vector<uint16_t> ToBf16(const std::vector<float>& f) {
+  std::vector<uint16_t> b(f.size());
+  for (size_t i = 0; i < f.size(); ++i) b[i] = vt::F32ToBF16(f[i]);
+  return b;
+}
+std::vector<float> FromBf16(const std::vector<uint16_t>& b) {
+  std::vector<float> f(b.size());
+  for (size_t i = 0; i < b.size(); ++i) f[i] = vt::BF16ToF32(b[i]);
+  return f;
+}
+
+// Runs one config with bf16 Q/K/V on CUDA against the f32 CPU reference over the
+// SAME (bf16-rounded) values. `bf16_out` also rounds the result, which is the
+// production stream's shape.
+void RunBf16Parity(const char* what, int64_t T, int64_t Hq, int64_t Hk, int64_t D, float scale,
+                   bool causal, int64_t window, const std::vector<int32_t>& cu, uint64_t seed,
+                   bool bf16_out, double tol, double rms_tol) {
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  const int num_reqs = static_cast<int>(cu.size()) - 1;
+  std::vector<float> q(static_cast<size_t>(T * Hq * D));
+  std::vector<float> k(static_cast<size_t>(T * Hk * D)), v(k.size());
+  uint64_t x = seed;
+  auto rnd = [&]() {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return static_cast<float>((x >> 40) / 16777216.0 - 0.5);
+  };
+  for (size_t i = 0; i < q.size(); ++i) q[i] = rnd();
+  for (size_t i = 0; i < k.size(); ++i) { k[i] = rnd(); v[i] = rnd(); }
+
+  // Round ONCE; both sides then see identical numbers.
+  const std::vector<uint16_t> qb = ToBf16(q), kb = ToBf16(k), vb = ToBf16(v);
+  std::vector<float> qr = FromBf16(qb), kr = FromBf16(kb), vr = FromBf16(vb);
+
+  auto mk = [&]() {
+    DFlashBlockAttentionArgs a = Args(cu.data(), num_reqs, causal, window);
+    a.scale = scale;
+    return a;
+  };
+
+  std::vector<float> want(q.size(), 0.0f);
+  {
+    Queue cq = Q();
+    Tensor qt = F32(qr, {T, Hq, D}), kt = F32(kr, {T, Hk, D}), vt_ = F32(vr, {T, Hk, D});
+    Tensor ot = F32(want, {T, Hq, D});
+    vt::DFlashBlockAttention(cq, ot, qt, kt, vt_, mk());
+  }
+
+  Queue gq = cuda->CreateQueue();
+  auto up16 = [&](const std::vector<uint16_t>& hv) {
+    void* p = cuda->Alloc(hv.size() * sizeof(uint16_t));
+    cuda->Copy(gq, p, hv.data(), hv.size() * sizeof(uint16_t));
+    return p;
+  };
+  void* dq = up16(qb); void* dk = up16(kb); void* dv = up16(vb);
+  const size_t obytes = q.size() * (bf16_out ? sizeof(uint16_t) : sizeof(float));
+  void* dout = cuda->Alloc(obytes);
+  Device gd = gq.device;
+  Tensor gqt = Contig(dq, DType::kBF16, gd, {T, Hq, D});
+  Tensor gkt = Contig(dk, DType::kBF16, gd, {T, Hk, D});
+  Tensor gvt = Contig(dv, DType::kBF16, gd, {T, Hk, D});
+  Tensor got = Contig(dout, bf16_out ? DType::kBF16 : DType::kF32, gd, {T, Hq, D});
+  vt::DFlashBlockAttention(gq, got, gqt, gkt, gvt, mk());
+  cuda->Synchronize(gq);
+
+  std::vector<float> host(q.size(), 0.0f);
+  if (bf16_out) {
+    std::vector<uint16_t> h16(q.size(), 0);
+    cuda->Copy(gq, h16.data(), dout, obytes);
+    cuda->Synchronize(gq);
+    host = FromBf16(h16);
+  } else {
+    cuda->Copy(gq, host.data(), dout, obytes);
+    cuda->Synchronize(gq);
+  }
+
+  double worst = 0.0, sq = 0.0;
+  size_t worst_at = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(std::isfinite(host[i]));
+    const double dif = std::abs(static_cast<double>(host[i]) - want[i]);
+    sq += dif * dif;
+    if (dif > worst) { worst = dif; worst_at = i; }
+  }
+  const double rms = std::sqrt(sq / static_cast<double>(want.size()));
+  INFO(what << ": bf16 CUDA vs bf16-rounded CPU reference, T=" << T << " D=" << D
+            << " causal=" << causal << " window=" << window << " bf16_out=" << bf16_out
+            << " max|diff|=" << worst << " at " << worst_at << " rms=" << rms);
+  CHECK(worst <= tol);
+  CHECK(rms <= rms_tol);
+  cuda->Free(dq); cuda->Free(dk); cuda->Free(dv); cuda->Free(dout);
+}
+
+}  // namespace
+
+TEST_CASE("dflash-block-attn bf16 TENSOR-CORE path matches the reference (semantic corners)") {
+  // The same five corners the f32 CUDA case pins, plus head_dim 16 (the smallest
+  // shape the MMA serves, and the one test_minimax_h3's golden DiT uses) and 96.
+  RunBf16Parity("nc d128 gqa", 17, 32, 8, 128, std::pow(128.0f, -0.5f), false, 0, {0, 17},
+                0x243F6A8885A308D3ULL, false, 5e-3, 1e-3);
+  RunBf16Parity("causal d128", 17, 32, 8, 128, std::pow(128.0f, -0.5f), true, 2048, {0, 17},
+                0x13198A2E03707344ULL, false, 5e-3, 1e-3);
+  RunBf16Parity("blocks d64", 51, 16, 4, 64, 0.25f, false, 0, {0, 17, 34, 51},
+                0xA4093822299F31D0ULL, false, 5e-3, 1e-3);
+  RunBf16Parity("swa d32", 17, 8, 2, 32, 0.3f, true, 4, {0, 17}, 0x082EFA98EC4E6C89ULL, false,
+                5e-3, 1e-3);
+  RunBf16Parity("gqa-extreme ragged d16", 20, 8, 1, 16, 0.35f, true, 2048, {0, 6, 20},
+                0xBE5466CF34E90C6CULL, false, 5e-3, 1e-3);
+  RunBf16Parity("nc d96", 17, 8, 2, 96, std::pow(96.0f, -0.5f), false, 0, {0, 17},
+                0xC0AC29B7C97C50DDULL, false, 5e-3, 1e-3);
+  // bf16 OUTPUT too — the production stream's dtype, which adds one more rounding.
+  RunBf16Parity("nc d128 bf16-out", 17, 32, 8, 128, std::pow(128.0f, -0.5f), false, 0, {0, 17},
+                0x9E3779B97F4A7C15ULL, true, 8e-3, 2e-3);
+}
+
+TEST_CASE("dflash-block-attn bf16 TENSOR-CORE path is right at LENGTH (H3 packed shape)") {
+  // H3's real layout: cu_seqlens {0, used, seq_len} — TWO documents, the boundary
+  // deliberately off every tile multiple, at head_dim 128 (the production shape,
+  // 7168 attention inner / 56 heads) and at 96. Long sequences are where the
+  // online-softmax rescaling across many tiles can drift and where blocks straddle
+  // a document boundary.
+  RunBf16Parity("long two-doc d128", 3000, 2, 2, 128, std::pow(128.0f, -0.5f), false, 0,
+                {0, 2317, 3000}, 0xD1B54A32D192ED03ULL, false, 5e-3, 1e-3);
+  RunBf16Parity("long nc d96", 2560, 2, 2, 96, 0.102062f, false, 0, {0, 2560},
+                0x452821E638D01377ULL, false, 5e-3, 1e-3);
+  RunBf16Parity("long causal d64", 2560, 2, 2, 64, 0.125f, true, 0, {0, 2560},
+                0x3F84D5B5B5470917ULL, false, 5e-3, 1e-3);
+  RunBf16Parity("long SWA d128", 2048, 2, 2, 128, 0.088388f, true, 48, {0, 2048},
+                0x9216D5D98979FB1BULL, false, 5e-3, 1e-3);
+  RunBf16Parity("long ragged causal d64", 2185, 2, 2, 64, 0.125f, true, 0, {0, 501, 1503, 2185},
+                0xBA7C9045F12C7F99ULL, false, 5e-3, 1e-3);
+  RunBf16Parity("long ragged nc d96", 2185, 2, 2, 96, 0.102062f, false, 0, {0, 501, 1503, 2185},
+                0x24A19947B3916CF7ULL, false, 5e-3, 1e-3);
+}
+
+TEST_CASE("dflash-block-attn bf16 RED: the MASK is load-bearing on the tensor-core path") {
+  // A tolerance gate alone cannot tell "right kernel" from "wrong mask" — so pin
+  // the SEPARATION: running the same inputs causal must move the answer by orders
+  // of magnitude more than the 5e-3 bf16 bound the cases above allow.
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  const int64_t T = 64, H = 2, D = 64;
+  std::vector<float> q(static_cast<size_t>(T * H * D)), k(q.size()), v(q.size());
+  uint64_t x = 0x2FFD72DBD01ADFB7ULL;
+  auto rnd = [&]() {
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    return static_cast<float>((x >> 40) / 16777216.0 - 0.5);
+  };
+  for (size_t i = 0; i < q.size(); ++i) { q[i] = rnd(); k[i] = rnd(); v[i] = rnd() * 8.0f; }
+  const std::vector<uint16_t> qb = ToBf16(q), kb = ToBf16(k), vb = ToBf16(v);
+
+  Queue gq = cuda->CreateQueue();
+  auto up16 = [&](const std::vector<uint16_t>& hv) {
+    void* p = cuda->Alloc(hv.size() * sizeof(uint16_t));
+    cuda->Copy(gq, p, hv.data(), hv.size() * sizeof(uint16_t));
+    return p;
+  };
+  void* dq = up16(qb); void* dk = up16(kb); void* dv = up16(vb);
+  void* o_nc = cuda->Alloc(q.size() * sizeof(float));
+  void* o_c = cuda->Alloc(q.size() * sizeof(float));
+  Device gd = gq.device;
+  Tensor gqt = Contig(dq, DType::kBF16, gd, {T, H, D});
+  Tensor gkt = Contig(dk, DType::kBF16, gd, {T, H, D});
+  Tensor gvt = Contig(dv, DType::kBF16, gd, {T, H, D});
+  Tensor tnc = Contig(o_nc, DType::kF32, gd, {T, H, D});
+  Tensor tc = Contig(o_c, DType::kF32, gd, {T, H, D});
+  const int32_t cu[2] = {0, static_cast<int32_t>(T)};
+  vt::DFlashBlockAttention(gq, tnc, gqt, gkt, gvt, Args(cu, 1, /*causal=*/false, 0));
+  vt::DFlashBlockAttention(gq, tc, gqt, gkt, gvt, Args(cu, 1, /*causal=*/true, 0));
+  cuda->Synchronize(gq);
+  std::vector<float> hnc(q.size()), hc(q.size());
+  cuda->Copy(gq, hnc.data(), o_nc, hnc.size() * sizeof(float));
+  cuda->Copy(gq, hc.data(), o_c, hc.size() * sizeof(float));
+  cuda->Synchronize(gq);
+
+  double sep = 0.0;
+  for (size_t i = 0; i < hnc.size(); ++i)
+    sep = std::max(sep, std::abs(static_cast<double>(hnc[i]) - hc[i]));
+  INFO("causal vs non-causal separation on the bf16 tensor-core path = " << sep);
+  CHECK(sep > 0.5);  // ~100x the bf16 tolerance the parity cases allow
+  cuda->Free(dq); cuda->Free(dk); cuda->Free(dv); cuda->Free(o_nc); cuda->Free(o_c);
+}

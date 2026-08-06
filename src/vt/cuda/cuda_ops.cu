@@ -2270,6 +2270,354 @@ __global__ void DFlashAttnChunkKernel(Tout* out, const Tin* query, const Tin* ke
   StoreLane<kPerLane>(out, qoff, lane, res);
 }
 
+// ---------------------------------------------------------------------------
+// TENSOR-CORE (bf16 mma.sync) FlashAttention — the D16 default for bf16 streams.
+//
+// Every kernel above computes attention on the CUDA CORES: at head_dim 128 the
+// chunked reduce-scatter form measured 1.13 TFLOP/s against a ~7.7 TFLOP/s f32
+// CUDA-core ceiling and 30.0 TFLOP/s of cuBLASLt GEMM on the SAME chip. That gap
+// is not a scheduling problem any more — it is the wrong MATH UNIT. This kernel
+// moves both GEMMs of attention onto the bf16 tensor cores with
+// `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, which is Ampere-and-later
+// (it assembles, launches and accumulates on sm_110; the FP4 `kind::mxf4nvf4`
+// restriction recorded for this box applies to the block-scaled FP4 MMA ONLY).
+//
+// SHAPE. One WARP owns 16 query rows and the FULL head_dim of output; a block is
+// kMmaWarps warps, so 64 query rows share one staged K/V tile of kMmaKeys keys.
+//
+//   S[16q x 32k] = Q[16q x d] · Kᵀ[d x 32k]   — d/16 k-steps x 4 n-tiles
+//   O[16q x d]  += P[16q x 32k] · V[32k x d]  — 2 k-steps x d/8 n-tiles
+//
+// SHARED MEMORY IS A FIRST-CLASS CONSTRAINT here, because the previous
+// shared-memory attempt in this file died of occupancy (32 KB/block, 23% SLOWER).
+// So ONLY K and V are staged: 2 * 32 * (d+8) * 2 B = 17.4 KB/block at d=128,
+// 4.6 KB at d=64. S, P and the whole O accumulator stay in REGISTERS. That is
+// possible because the m16n8k16 C fragment maps EXACTLY onto the next MMA's A
+// fragment: the accumulator lane layout (rows groupID / groupID+8, cols
+// threadInGroup*2 + {0,1}) is the same partition the A operand wants, so P needs
+// zero shuffles and zero shared round-trip — the reason FlashAttention-2 uses raw
+// mma.sync rather than the nvcuda::wmma API (whose fragments are opaque and must
+// go through memory; see PagedFlashWmmaKernel in cuda_paged_attn.cu, which pays
+// exactly that cost).
+//
+// FRAGMENT LAYOUT (PTX ISA "Matrix Fragments for mma.m16n8k16"), gid = lane>>2,
+// tig = lane&3:
+//   A (16x16 row): reg0={row gid, col tig*2, +1}   reg1={row gid+8, same cols}
+//                  reg2={row gid, col tig*2+8, +9} reg3={row gid+8, same cols}
+//   B (16x8 col):  reg0={col gid, row tig*2, +1}   reg1={col gid, row tig*2+8, +9}
+//   C (16x8 f32):  c0,c1={row gid,   col tig*2, +1}
+//                  c2,c3={row gid+8, col tig*2, +1}
+// So every lane owns exactly TWO query rows for its whole lifetime, and the online
+// softmax state (m, l) is two registers reduced across the 4 lanes of a QUAD
+// (__shfl_xor 1 and 2) — no block barrier, no shared scratch.
+//
+// SHARED BANKS. K/V rows are padded to d+8 elements. d is a multiple of 16, so the
+// row stride in 4-byte banks is (d+8)/2 = an ODD multiple of 4, and the 8 distinct
+// rows a warp touches land on banks 4*gid (mod 32) — all distinct — while tig adds
+// 0..3. The K fragment load is therefore CONFLICT-FREE. The V fragment reads a
+// COLUMN (b0/b1 are consecutive KEYS, not consecutive elements), so it costs four
+// 16-bit shared loads with a 2-way conflict; that is the one structural tax of
+// keeping V row-major, and it is paid against 2x the MMA work it feeds.
+//
+// MASKS. Identical bookkeeping to the chunked kernel, evaluated per (row, key)
+// on the f32 S fragment: non-causal, causal, sliding-window and multi-request
+// (cu_seqlens) all work, including a warp whose 16 rows straddle a document
+// boundary. The block walks the UNION of its 64 rows' key ranges so the staged
+// tile is block-uniform (every barrier is reached by every warp), and rows mask
+// out what they cannot see. Query rows past cu[num_reqs] clamp their row index
+// and skip the store.
+//
+// NUMERICS. Q, K and V are already bf16 in the production stream, so QKᵀ loses
+// NOTHING (bf16 in, f32 accumulate — the CUDA-core path converts the same bf16 to
+// f32 and accumulates in f32). The PV GEMM must round P to bf16, exactly as
+// FlashAttention does; that is a real ~2^-9 relative error on the probabilities
+// and it is why this path is gated at a bf16 tolerance rather than the f32 path's
+// 2e-5. f32 inputs therefore stay on DFlashAttnChunkKernel, whose f32 tolerance
+// this could not hold.
+__device__ __forceinline__ void MmaBf16M16N8K16(float* c, const unsigned* a, const unsigned* b) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+  (void)c;
+  (void)a;
+  (void)b;
+#endif
+}
+
+constexpr int kMmaWarps = 4;   // warps per block (4 * 16 = 64 query rows per block)
+constexpr int kMmaQ = 16;      // query rows per warp = the MMA's M
+constexpr int kMmaKeys = 32;   // keys per staged K/V tile = 4 n-tiles of the QKᵀ MMA
+constexpr int kMmaPad = 8;     // shared row padding, in elements (see SHARED BANKS)
+
+// kDT = head_dim / 16 (the QKᵀ k-step count). head_dim = 16 * kDT is a compile-time
+// constant so every fragment index below is a compile-time index into a register
+// array — a dynamic index would spill the accumulator to local memory.
+template <typename Tout, int kDT>
+__global__ __launch_bounds__(kMmaWarps * 32) void DFlashAttnMmaKernel(
+    Tout* out, const __nv_bfloat16* query, const __nv_bfloat16* key,
+    const __nv_bfloat16* value, const int32_t* cu, int num_reqs, int64_t hq, int64_t hk,
+    float scale, bool causal, int64_t window) {
+#if __CUDA_ARCH__ >= 800
+  constexpr int kD = kDT * 16;        // head_dim
+  constexpr int kNT = kD / 8;         // P·V n-tiles (8 output columns each)
+  constexpr int kStride = kD + kMmaPad;
+
+  extern __shared__ uint4 dfa_mma_smem[];  // uint4 => guaranteed 16-byte aligned
+  __nv_bfloat16* ksh = reinterpret_cast<__nv_bfloat16*>(dfa_mma_smem);
+  __nv_bfloat16* vsh = ksh + kMmaKeys * kStride;
+  const unsigned short* vsh_u = reinterpret_cast<const unsigned short*>(vsh);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int gid = lane >> 2;  // 0..7 : which of the 8 row-pairs this lane owns
+  const int tig = lane & 3;   // 0..3 : which column pair
+
+  const int64_t rows = cu[num_reqs];
+  const int64_t h = blockIdx.y;
+  const int64_t g = h / (hq / hk);
+  const int64_t qblk = static_cast<int64_t>(blockIdx.x) * (kMmaWarps * kMmaQ);
+  if (qblk >= rows) return;  // block-uniform
+
+  // --- block-wide key range: the UNION over this block's 64 query rows ------
+  const int64_t qend = (qblk + kMmaWarps * kMmaQ < rows) ? (qblk + kMmaWarps * kMmaQ) : rows;
+  int64_t klo = rows, khi = -1;
+  for (int r = 0; r < num_reqs; ++r) {
+    const int64_t rs = cu[r], re = cu[r + 1];
+    const int64_t lo = rs > qblk ? rs : qblk;
+    const int64_t hi = (re < qend ? re : qend) - 1;
+    if (lo > hi) continue;
+    const int64_t jhi = causal ? hi : (re - 1);
+    int64_t jlo = rs;
+    if (causal && window > 0) {
+      const int64_t ii = lo - rs;
+      jlo = rs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+    }
+    if (jlo < klo) klo = jlo;
+    if (jhi > khi) khi = jhi;
+  }
+  if (khi < klo) return;  // block-uniform
+
+  // --- this lane's TWO query rows and their per-row mask bounds -------------
+  const int64_t qbase = qblk + static_cast<int64_t>(warp) * kMmaQ;
+  int64_t qrow[2], rlo[2], rhi[2];
+  bool live[2];
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int64_t i = qbase + gid + 8 * u;
+    live[u] = i < rows;
+    const int64_t ic = live[u] ? i : (rows - 1);  // clamp: reads stay in bounds
+    qrow[u] = ic;
+    int64_t qs = 0, qe = 0;
+    for (int r = 0; r < num_reqs; ++r) {
+      if (ic >= cu[r] && ic < cu[r + 1]) {
+        qs = cu[r];
+        qe = cu[r + 1];
+        break;
+      }
+    }
+    const int64_t ii = ic - qs;
+    rhi[u] = qs + (causal ? ii : (qe - qs - 1));
+    rlo[u] = qs;
+    if (causal && window > 0) rlo[u] = qs + (ii - (window - 1) > 0 ? ii - (window - 1) : 0);
+  }
+
+  // --- Q A-fragments, read ONCE straight from global into registers ---------
+  unsigned qfrag[kDT][4];
+#pragma unroll
+  for (int kd = 0; kd < kDT; ++kd) {
+    const int64_t c0 = static_cast<int64_t>(kd) * 16 + tig * 2;
+    const int64_t o0 = (qrow[0] * hq + h) * kD;
+    const int64_t o1 = (qrow[1] * hq + h) * kD;
+    qfrag[kd][0] = *reinterpret_cast<const unsigned*>(query + o0 + c0);
+    qfrag[kd][1] = *reinterpret_cast<const unsigned*>(query + o1 + c0);
+    qfrag[kd][2] = *reinterpret_cast<const unsigned*>(query + o0 + c0 + 8);
+    qfrag[kd][3] = *reinterpret_cast<const unsigned*>(query + o1 + c0 + 8);
+  }
+
+  float acc[kNT][4];
+#pragma unroll
+  for (int nt = 0; nt < kNT; ++nt) {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) acc[nt][c] = 0.0f;
+  }
+  float mrow[2] = {-CUDART_INF_F, -CUDART_INF_F};
+  float lrow[2] = {0.0f, 0.0f};
+
+  for (int64_t base = klo; base <= khi; base += kMmaKeys) {
+    // (1) stage the K and V tiles: 8 bf16 (16 B) per thread per step, coalesced.
+    __syncthreads();
+    for (int idx = tid * 8; idx < kMmaKeys * kD; idx += static_cast<int>(blockDim.x) * 8) {
+      const int kk = idx / kD, col = idx % kD;
+      const int64_t j = base + kk;
+      const int64_t jc = j < rows ? j : (rows - 1);  // clamp; masked keys score -inf
+      const int64_t off = (jc * hk + g) * kD + col;
+      const int sh = kk * kStride + col;
+      *reinterpret_cast<uint4*>(ksh + sh) = *reinterpret_cast<const uint4*>(key + off);
+      *reinterpret_cast<uint4*>(vsh + sh) = *reinterpret_cast<const uint4*>(value + off);
+    }
+    __syncthreads();
+
+    // (2) S = Q·Kᵀ on the tensor cores. 4 independent n-tiles => 4-way ILP over
+    //     the kDT-long serial accumulate chain.
+    float s[4][4];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) s[nt][c] = 0.0f;
+#pragma unroll
+      for (int kd = 0; kd < kDT; ++kd) {
+        const int krow = nt * 8 + gid;
+        unsigned b[2];
+        b[0] = *reinterpret_cast<const unsigned*>(ksh + krow * kStride + kd * 16 + tig * 2);
+        b[1] = *reinterpret_cast<const unsigned*>(ksh + krow * kStride + kd * 16 + tig * 2 + 8);
+        MmaBf16M16N8K16(s[nt], qfrag[kd], b);
+      }
+    }
+
+    // (3) scale + MASK, then the per-row max over this lane's 8 columns.
+    float rmax[2] = {-CUDART_INF_F, -CUDART_INF_F};
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const int u = c >> 1;
+        const int64_t j = base + nt * 8 + tig * 2 + (c & 1);
+        float v = s[nt][c] * scale;
+        if (j < rlo[u] || j > rhi[u]) v = -CUDART_INF_F;
+        s[nt][c] = v;
+        rmax[u] = fmaxf(rmax[u], v);
+      }
+    }
+    // The 8 columns of a row live in the 4 lanes of a QUAD: reduce with xor 1,2.
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      rmax[u] = fmaxf(rmax[u], __shfl_xor_sync(0xFFFFFFFFu, rmax[u], 1));
+      rmax[u] = fmaxf(rmax[u], __shfl_xor_sync(0xFFFFFFFFu, rmax[u], 2));
+    }
+
+    // (4) online softmax. A row can see NOTHING in this tile (the block walks the
+    //     union of 64 rows' ranges), so guard the -inf minus -inf that would NaN.
+    float corr[2];
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      const bool any = rmax[u] > -CUDART_INF_F;
+      const float mn = any ? fmaxf(mrow[u], rmax[u]) : mrow[u];
+      corr[u] = any ? __expf(mrow[u] - mn) : 1.0f;  // 0 on the first live tile
+      mrow[u] = mn;
+    }
+    float rsum[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const int u = c >> 1;
+        const float p = s[nt][c] > -CUDART_INF_F ? __expf(s[nt][c] - mrow[u]) : 0.0f;
+        s[nt][c] = p;
+        rsum[u] += p;
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < 2; ++u) {
+      rsum[u] += __shfl_xor_sync(0xFFFFFFFFu, rsum[u], 1);
+      rsum[u] += __shfl_xor_sync(0xFFFFFFFFu, rsum[u], 2);
+      lrow[u] = lrow[u] * corr[u] + rsum[u];
+    }
+#pragma unroll
+    for (int nt = 0; nt < kNT; ++nt) {
+      acc[nt][0] *= corr[0];
+      acc[nt][1] *= corr[0];
+      acc[nt][2] *= corr[1];
+      acc[nt][3] *= corr[1];
+    }
+
+    // (5) P -> bf16 A-fragments. The C layout of step (2) IS the A layout, so this
+    //     is a pure pack: n-tiles {2kk, 2kk+1} become the 16-key k-step kk.
+    unsigned pf[2][4];
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk) {
+      const __nv_bfloat162 r0 = __floats2bfloat162_rn(s[2 * kk][0], s[2 * kk][1]);
+      const __nv_bfloat162 r1 = __floats2bfloat162_rn(s[2 * kk][2], s[2 * kk][3]);
+      const __nv_bfloat162 r2 = __floats2bfloat162_rn(s[2 * kk + 1][0], s[2 * kk + 1][1]);
+      const __nv_bfloat162 r3 = __floats2bfloat162_rn(s[2 * kk + 1][2], s[2 * kk + 1][3]);
+      pf[kk][0] = *reinterpret_cast<const unsigned*>(&r0);
+      pf[kk][1] = *reinterpret_cast<const unsigned*>(&r1);
+      pf[kk][2] = *reinterpret_cast<const unsigned*>(&r2);
+      pf[kk][3] = *reinterpret_cast<const unsigned*>(&r3);
+    }
+
+    // (6) O += P·V on the tensor cores. B wants consecutive KEYS in one register,
+    //     which V's row-major tile does not give: four 16-bit shared reads.
+#pragma unroll
+    for (int nt = 0; nt < kNT; ++nt) {
+      const int dcol = nt * 8 + gid;
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) {
+        const int r0 = kk * 16 + tig * 2;
+        unsigned b[2];
+        b[0] = static_cast<unsigned>(vsh_u[r0 * kStride + dcol]) |
+               (static_cast<unsigned>(vsh_u[(r0 + 1) * kStride + dcol]) << 16);
+        b[1] = static_cast<unsigned>(vsh_u[(r0 + 8) * kStride + dcol]) |
+               (static_cast<unsigned>(vsh_u[(r0 + 9) * kStride + dcol]) << 16);
+        MmaBf16M16N8K16(acc[nt], pf[kk], b);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    if (!live[u]) continue;
+    const float inv = lrow[u] > 0.0f ? 1.0f / lrow[u] : 0.0f;
+    const int64_t ooff = (qrow[u] * hq + h) * kD;
+#pragma unroll
+    for (int nt = 0; nt < kNT; ++nt) {
+      const int64_t col = nt * 8 + tig * 2;
+      Store(out, ooff + col, acc[nt][2 * u] * inv);
+      Store(out, ooff + col + 1, acc[nt][2 * u + 1] * inv);
+    }
+  }
+#else
+  (void)out; (void)query; (void)key; (void)value; (void)cu; (void)num_reqs; (void)hq;
+  (void)hk; (void)scale; (void)causal; (void)window;
+  __trap();  // never launched below sm_80 (host gate: DFlashMmaSupported)
+#endif
+}
+
+// The bf16 tensor-core path needs BOTH a compile-time and a runtime guarantee:
+// mma.sync's bf16 form is Ampere-and-later, so it must be in the compiled arch set
+// AND on the device we are actually running. VT_DFLASH_ATTN_MMA=0 disables it for
+// the same-binary A/B this project's benchmark protocol requires.
+#if defined(__CUDA_ARCH_LIST__)
+constexpr int kBuiltArchList[] = {__CUDA_ARCH_LIST__};
+constexpr bool BuiltArchesAllHaveBf16Mma() {
+  for (int a : kBuiltArchList) {
+    if (a < 800) return false;
+  }
+  return true;
+}
+#else
+constexpr bool BuiltArchesAllHaveBf16Mma() { return false; }
+#endif
+
+inline bool DFlashMmaSupported() {
+  static const bool on = [] {
+    if (!BuiltArchesAllHaveBf16Mma()) return false;
+    const char* e = std::getenv("VT_DFLASH_ATTN_MMA");
+    if (e != nullptr && e[0] == '0') return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess)
+      return false;
+    return major >= 8;
+  }();
+  return on;
+}
+
 template <typename Tin>
 void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query,
                                 const Tensor& key, const Tensor& value,
@@ -2284,6 +2632,48 @@ void LaunchDFlashBlockAttention(cudaStream_t s, Tensor& out, const Tensor& query
   Check(cudaMemcpyAsync(d_cu, args.cu_seqlens, cub, cudaMemcpyHostToDevice, s),
         "dflash-block-attn cu upload");
   const dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hq));
+  // TENSOR-CORE fast path: bf16 in, head_dim a multiple of the MMA's k (16), up to
+  // 128 (the largest head this port uses). f32 streams stay on the CUDA-core kernel
+  // below -- rounding them to bf16 to reach the tensor cores would trade the f32
+  // path's 2e-5 tolerance for a bf16 one, which is not a trade this op may make.
+  if (std::is_same<Tin, __nv_bfloat16>::value && d % 16 == 0 && d >= 16 && d <= 128 &&
+      DFlashMmaSupported()) {
+    const dim3 mgrid(static_cast<unsigned>((t + kMmaWarps * kMmaQ - 1) / (kMmaWarps * kMmaQ)),
+                     static_cast<unsigned>(hq));
+    const unsigned mblock = kMmaWarps * 32;
+    const size_t mshmem =
+        2u * kMmaKeys * static_cast<size_t>(d + kMmaPad) * sizeof(__nv_bfloat16);
+#define VT_DFLASH_MMA(DT)                                                                     \
+  do {                                                                                        \
+    if (out.dtype == DType::kF32) {                                                           \
+      DFlashAttnMmaKernel<float, DT><<<mgrid, mblock, mshmem, s>>>(                           \
+          out.Ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(query.data),               \
+          reinterpret_cast<const __nv_bfloat16*>(key.data),                                   \
+          reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, args.num_reqs, hq, hk,    \
+          args.scale, args.causal, args.sliding_window);                                      \
+    } else {                                                                                  \
+      DFlashAttnMmaKernel<__nv_bfloat16, DT><<<mgrid, mblock, mshmem, s>>>(                   \
+          out.Ptr<__nv_bfloat16>(), reinterpret_cast<const __nv_bfloat16*>(query.data),       \
+          reinterpret_cast<const __nv_bfloat16*>(key.data),                                   \
+          reinterpret_cast<const __nv_bfloat16*>(value.data), d_cu, args.num_reqs, hq, hk,    \
+          args.scale, args.causal, args.sliding_window);                                      \
+    }                                                                                         \
+  } while (0)
+    switch (d / 16) {
+      case 1: VT_DFLASH_MMA(1); break;
+      case 2: VT_DFLASH_MMA(2); break;
+      case 3: VT_DFLASH_MMA(3); break;
+      case 4: VT_DFLASH_MMA(4); break;
+      case 5: VT_DFLASH_MMA(5); break;
+      case 6: VT_DFLASH_MMA(6); break;
+      case 7: VT_DFLASH_MMA(7); break;
+      default: VT_DFLASH_MMA(8); break;
+    }
+#undef VT_DFLASH_MMA
+    Check(cudaGetLastError(), "dflash-block-attn mma launch");
+    Check(cudaFreeAsync(d_cu, s), "dflash-block-attn cu free");
+    return;
+  }
   // Warp-per-query fast path when head_dim is a whole number of warp widths (64 and
   // 128 cover every head this port uses). Three forms live here so the verdict can
   // be reproduced on ONE binary (same-binary A/B is this project's benchmark rule):

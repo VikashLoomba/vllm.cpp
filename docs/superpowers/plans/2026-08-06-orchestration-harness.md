@@ -669,9 +669,13 @@ python3 scripts/check-doc-checkpoint.py --commit "$(git rev-parse HEAD)"; echo "
 
 **Interfaces:**
 - Consumes: `audit()` from Task 2.
-- Produces: `RUNNABLE_RATCHET: int`; `ratchet_errors(records: list[dict]) -> list[str]`; `--check` on `main()`.
+- Produces: `RUNNABLE_BASELINE: frozenset[str]` — the SET of row IDs carrying a runnable gate command, **not a count**; `ratchet_errors(records: list[dict]) -> list[str]`; `--check` on `main()`.
 
-**Why a ratchet and not a demand:** 67 rows cannot satisfy a demand today, and this repo already uses shrink-only ratchets for exactly this shape (`STATUS_RATCHET`, the device-leakage ratchet). The rule is: **the number of rows carrying a runnable gate command may never fall.** It ships green today and gets stricter every time someone fixes a row.
+**Why a ratchet and not a demand:** 72 of 97 rows cannot satisfy a demand today, and this repo already uses shrink-only ratchets for exactly this shape (`STATUS_RATCHET`, the device-leakage ratchet). It ships green today and gets stricter every time someone fixes a row.
+
+**Pin the SET of row IDs, never a count** (specified by step 3's artifact, § the ratchet baseline). A bare integer cannot distinguish *a row lost its gate command* from *a row legitimately left the population* — and the population already moved 3 rows mid-branch, which is why 97 was deliberately never pinned. A count would go red on a legitimate record edit, and the author would "fix" it by lowering the number, which is the gate erasing its own finding.
+
+**The rule, verbatim from the artifact:** a drop is a regression **only if** the row still exists and is still in `GATED_STATES`. If the row was deleted, merged, or transitioned out, the baseline is re-pinned **in the same change**, naming the row and the reason. `ratchet_errors` must therefore report *which* IDs left and why it could or could not tell.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -679,23 +683,36 @@ Append to `tests/scripts/test_check_gate_commands.py`, above `if __name__`:
 
 ```python
 class RatchetTests(unittest.TestCase):
-    def test_the_ratchet_matches_the_shipped_record(self):
-        records = gates.audit()
-        runnable = sum(1 for r in records if r["verdict"] == "runnable")
-        self.assertEqual(runnable, gates.RUNNABLE_RATCHET)
+    def test_the_baseline_matches_the_shipped_record(self):
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
-    def test_a_regression_is_refused(self):
-        fewer = [{"verdict": "gates-no-command", "id": "X", "state": "READY",
-                  "path": "p", "line": 1, "detail": "d"}]
-        self.assertTrue(gates.ratchet_errors(fewer))
+    def test_a_row_that_loses_its_command_is_refused(self):
+        # Still present, still gated, no longer runnable -- a real regression.
+        victim = sorted(gates.RUNNABLE_BASELINE)[0]
+        records = [{"verdict": "gates-no-command", "id": victim, "state": "READY",
+                    "path": "p", "line": 1, "detail": "d"}]
+        errors = gates.ratchet_errors(records)
+        self.assertTrue(errors)
+        self.assertIn(victim, errors[0])
+        self.assertIn("Repair the row", errors[0])
+
+    def test_a_row_that_left_the_population_reports_differently(self):
+        # Deleted or transitioned out: legitimate, but must re-pin. The two
+        # cases MUST be distinguishable -- that is why the baseline is a set.
+        errors = gates.ratchet_errors([])
+        self.assertTrue(errors)
+        self.assertTrue(any("left the gated population" in e for e in errors))
+        self.assertFalse(any("Repair the row" in e for e in errors))
 
     def test_an_improvement_is_allowed(self):
-        more = [
-            {"verdict": "runnable", "id": f"X{i}", "state": "READY",
-             "path": "p", "line": i, "detail": "d"}
-            for i in range(gates.RUNNABLE_RATCHET + 5)
-        ]
-        self.assertEqual(gates.ratchet_errors(more), [])
+        records = [
+            {"verdict": "runnable", "id": rid, "state": "READY",
+             "path": "p", "line": 1, "detail": "d"}
+            for rid in sorted(gates.RUNNABLE_BASELINE)
+        ] + [{"verdict": "runnable", "id": "NEW-ROW", "state": "READY",
+              "path": "p", "line": 2, "detail": "d"}]
+        self.assertEqual(gates.ratchet_errors(records), [])
 
     def test_check_mode_passes_on_the_shipped_record(self):
         # The gate ships GREEN. It was wired after the debt was recorded, so it
@@ -721,21 +738,42 @@ Expected: FAIL with `AttributeError: … has no attribute 'RUNNABLE_RATCHET'`.
 Append to `scripts/check-gate-commands.py`, above `main()`:
 
 ```python
-# Shrink-only, exactly like STATUS_RATCHET in check-public-doc-tables.py: the
-# number of gated rows carrying a command that can FAIL may never fall. Set
-# from the step-3 audit. Raise it when rows are fixed; never lower it.
-RUNNABLE_RATCHET = <the count you measured in step 3>
+# Shrink-only, like STATUS_RATCHET in check-public-doc-tables.py -- but a SET of
+# row IDs, not a count. A count cannot tell "this row lost its gate command"
+# from "this row left the population", and the population moves: 3 rows moved
+# mid-branch while step 2 was being written. Pinning a count would go red on a
+# legitimate record edit, and the natural "fix" is to lower the number, which is
+# the gate erasing its own finding.
+RUNNABLE_BASELINE = frozenset({
+    # the exact row IDs step 3 recorded as `runnable`
+})
 
 
 def ratchet_errors(records: list[dict]) -> list[str]:
-    runnable = sum(1 for item in records if item["verdict"] == "runnable")
-    if runnable >= RUNNABLE_RATCHET:
-        return []
-    return [
-        f"rows with a runnable gate command fell to {runnable}, below the "
-        f"ratchet of {RUNNABLE_RATCHET}. A row lost its gate command; repair "
-        f"the row, never the ratchet."
-    ]
+    """A row may not silently lose its gate command.
+
+    Leaving the gated population is legitimate; losing the command is not. So
+    only IDs still PRESENT and still gated can be a regression -- anything else
+    is a record edit that must re-pin the baseline in the same change.
+    """
+    runnable = {item["id"] for item in records if item["verdict"] == "runnable"}
+    present = {item["id"] for item in records}
+    lost = sorted((RUNNABLE_BASELINE - runnable) & present)
+    departed = sorted(RUNNABLE_BASELINE - runnable - present)
+    errors = []
+    if lost:
+        errors.append(
+            "these rows still exist and are still gated but no longer name a "
+            f"command that can fail: {', '.join(lost)}. Repair the row, never "
+            "the baseline."
+        )
+    if departed:
+        errors.append(
+            f"these baseline rows left the gated population: {', '.join(departed)}. "
+            "If that is a legitimate record edit, re-pin RUNNABLE_BASELINE in the "
+            "SAME change, naming each row and the reason."
+        )
+    return errors
 ```
 
 In `main()`, add the flag and return its errors:
@@ -773,7 +811,7 @@ bash scripts/agent-preflight.sh > /tmp/pf.log 2>&1; echo "EXIT=$?"  # 0
 
 - [ ] **Step 6: Mutate**
 
-Confirm each goes red, then restore: lower `RUNNABLE_RATCHET` by 1 and delete a real gate command from a spec (the regression the gate exists to catch); delete the `check-gate-commands` line from `CHECKERS`; delete the CI line. Report all three. **If `--check` is red for any reason other than your own mutation, the record regressed — repair the row, never the ratchet.**
+Confirm each goes red, then restore: delete a real gate command from a spec whose row is in the baseline (the regression the gate exists to catch); replace the `& present` intersection with nothing, so a departed row is misreported as a loss; delete the `check-gate-commands` line from `CHECKERS`; delete the CI line. Report all four. **If `--check` is red for any reason other than your own mutation, the record regressed — repair the row, never the baseline.**
 
 - [ ] **Step 7: Roll the docs to `step 4/5`, preflight, commit**
 

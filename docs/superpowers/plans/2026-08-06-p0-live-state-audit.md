@@ -416,7 +416,9 @@ class ClassifierTests(unittest.TestCase):
             commits=[],
         )
         self.assertEqual(verdict, "LANDED")
-        self.assertIn("merged", reason.lower())
+        # "unmerged" contains "merged", so a substring check on the bare word
+        # would pass for the IN-FLIGHT reason too.
+        self.assertIn("fully merged", reason)
 
     def test_main_commits_without_branch_mean_landed(self):
         verdict, reason = audit.classify_active(
@@ -443,6 +445,27 @@ class ClassifierTests(unittest.TestCase):
             commits=["def5678 feat(eng): ENG-FOO groundwork"],
         )
         self.assertEqual(verdict, "IN-FLIGHT")
+
+    def test_reason_names_only_the_branches_with_unmerged_commits(self):
+        # With more than one branch, the reason must name the live one and not
+        # the merged one, and must be order-independent so a re-run does not
+        # produce a spuriously different report.
+        verdict, reason = audit.classify_active(
+            branches=["row/B-LIVE", "row/A-MERGED"],
+            unmerged_by_branch={"row/B-LIVE": ["abc1234 wip"], "row/A-MERGED": []},
+            commits=[],
+        )
+        self.assertEqual(verdict, "IN-FLIGHT")
+        self.assertIn("row/B-LIVE", reason)
+        self.assertNotIn("row/A-MERGED", reason)
+
+    def test_missing_branch_key_is_a_loud_caller_bug(self):
+        # Silently treating an ungathered branch as merged would report a live
+        # claim as finished -- the exact false negative this tool prevents.
+        with self.assertRaises(KeyError):
+            audit.classify_active(
+                branches=["row/NEVER-GATHERED"], unmerged_by_branch={}, commits=[]
+            )
 
     def test_every_verdict_is_declared(self):
         for branches, by_branch, commits in [
@@ -479,7 +502,12 @@ def classify_active(
     groundwork and still have open follow-up work, and calling that finished
     would silently steal a live claim.
     """
-    live_branches = [b for b in branches if unmerged_by_branch.get(b)]
+    # Indexed, never .get(): `branches` is the authority for which keys must
+    # exist, so a missing key is a CALLER bug, not data. .get() would return
+    # None -> falsy -> the row reports LANDED, a live claim reported as
+    # finished. Absence of work and absence of information must never look the
+    # same; a KeyError at the audit's own boundary is the loud alternative.
+    live_branches = [b for b in branches if unmerged_by_branch[b]]
     if live_branches:
         joined = ", ".join(sorted(live_branches))
         return "IN-FLIGHT", f"unmerged commits on {joined}"
@@ -494,7 +522,7 @@ def classify_active(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 15 tests.
+Expected: PASS, 17 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -606,7 +634,7 @@ def names_missing_modes(row_text: str) -> bool:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 20 tests.
+Expected: PASS, 22 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -832,7 +860,7 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 25 tests (26 added minus the transitional CLI-guard test you delete here).
+Expected: PASS, 27 tests (28 added minus the transitional CLI-guard test you delete here).
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 
@@ -1078,7 +1106,7 @@ In `.github/workflows/ci.yml`, extend the record job (lines 42–46):
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 28 tests.
+Expected: PASS, 30 tests.
 
 - [ ] **Step 6: Verify the whole gate is green**
 
@@ -1105,12 +1133,38 @@ EOF
 
 ---
 
+## Branch-level obligation: the doc checkpoint
+
+`scripts/check-doc-checkpoint.py` requires that any commit touching `scripts/`,
+`tests/` or `.agents/specs/` **also updates `docs/STATUS.md` and
+`docs/BENCHMARKS.md` in the same commit**. CI enforces it **per commit** over the
+PR range (`.github/workflows/ci.yml:126`), but `agent-preflight.sh` only runs it
+`--staged` (line 109) — which passes vacuously once the work is already
+committed. That asymmetry is why per-task commits accumulate violations while
+every preflight reports green.
+
+**Do not add a trailing docs commit — it cannot fix earlier commits.** This
+branch lands as a **squash** (the house practice: `gh pr merge` would attribute
+the squash to `localai-bot`, so squashes are landed locally via `commit-tree` and
+a direct push). The single squashed commit carries the `docs/STATUS.md` and
+`docs/BENCHMARKS.md` updates, and satisfies the gate for the whole change.
+
+Verify before pushing, over the exact range that will be pushed:
+
+```bash
+python3 scripts/check-doc-checkpoint.py --base <merge-base> --head HEAD
+```
+
+This is a real obligation, not a formality to route around: never weaken the
+checker to pass it.
+
 ## Done when
 
 - `python3 scripts/audit-live-rows.py --check` exits 0 on a record where every `ACTIVE` row has real Git evidence behind it.
 - `.agents/specs/live-state-audit-2026-08-06.md` justifies every correction, names every row left alone, and records the hand-verified classifier sample.
 - `bash scripts/agent-preflight.sh` exits 0, with the new suite and gate registered.
 - CI runs the gate and its mutation suite.
+- The squashed commit updates `docs/STATUS.md` and `docs/BENCHMARKS.md`, and `check-doc-checkpoint.py` passes over the pushed range.
 - P2's backfill can mint ~188 issues from a record that is true.
 
 ## Out of scope

@@ -21,9 +21,11 @@ ordering) and how to do it.
 
 ## Our baseline — why this exists
 
-The record is 30 files and ~52k lines under `.agents/`, plus 393 ID'd rows across
-seven area matrices, of which 367 carry a recognised lifecycle state. Two
-properties of it are in tension:
+The record is 30 files and ~52k lines under `.agents/`, plus **714 ID'd rows**
+across seven area matrices, all of which carry a recognised lifecycle state (the
+count comes from `parse_claim_rows` in `check-agent-record.py`, with zero parse
+errors; an earlier ad-hoc regex estimate of 393/367 was wrong and is
+superseded). Two properties of it are in tension:
 
 - **Evidence** is append-only, git-provenanced, greppable and shipped with the
   code. This works. `benchmark-record.md` exists precisely so a lever is not
@@ -47,7 +49,7 @@ properties of it are in tension:
 Every one of those is the same bug: **one fact stored in two writable places,
 reconciled by a three-way merge.**
 
-A second, quieter symptom: **49 rows are simultaneously marked `ACTIVE`.** That
+A second, quieter symptom: **54 rows are simultaneously marked `ACTIVE`.** That
 cannot be true. A stale `ACTIVE` cell inside a several-hundred-row table is
 invisible rot; an issue with no assignee and no linked PR is visibly stale.
 
@@ -59,20 +61,25 @@ mapping already exists by accident.
 
 | Bucket | Count | Gets an issue? |
 |---|---|---|
-| `ACTIVE` 49, `SPIKE` 24, `GATING` 11, `BLOCKED` 6, `READY` 6 | **96** | yes — live work |
-| `PARTIAL` | **64** | yes — a known open gap is roadmap content |
-| `ANCHOR-BACKFILL` | 52 | not at backfill; on transition |
-| `INVENTORIED` 125, `DONE` 22, `OUT-OF-SCOPE` 8 | 155 | no — inventory and history |
+| `ACTIVE` 54, `SPIKE` 43, `GATING` 10, `BLOCKED` 7, `READY` 6 | **120** | yes — live work |
+| `PARTIAL` | **68** | yes — a known open gap is roadmap content |
+| `ANCHOR-BACKFILL` | 57 | not at backfill; on transition |
+| `INVENTORIED` 449, `DONE` 20 | 469 | no — inventory and history |
 
-**~160 issues at backfill** (user-directed 2026-08-06: include `PARTIAL`). A
+**~188 issues at backfill** (user-directed 2026-08-06: include `PARTIAL`). A
 `PARTIAL` row is a capability with working modes and explicitly missing ones —
 on a public roadmap that is exactly the content outsiders need, and leaving the
-64 of them invisible would undersell what is genuinely open. `ANCHOR-BACKFILL`
+68 of them invisible would undersell what is genuinely open. `ANCHOR-BACKFILL`
 is evidence debt rather than a capability gap, so it stays file-side until
 someone picks it up.
 
-A wholesale conversion would create 393 issues of mostly dead inventory. The
+A wholesale conversion would create 714 issues, 449 of them dead inventory. The
 tracker is the **live window**; the matrices remain the **permanent inventory**.
+
+**Coverage caveat carried into P0.** `check-agent-record.py`'s `MATRIX_PATHS`
+covers only 5 of the 7 matrices; `feature-matrix.md` and `sglang-matrix.md` hold
+11 live rows it never sees. The audit and the backfill must cover all seven, or
+those rows become unaudited public issues.
 
 ## Design
 
@@ -227,18 +234,18 @@ P2 backfill is verified.**
 
 | Phase | Work |
 |---|---|
-| P0 | **The live-state audit** — reconcile the 49 `ACTIVE` rows against branches, PRs and commits → in-flight / landed / abandoned; confirm each of the 64 `PARTIAL` rows names its missing modes; correct the matrices. Pure file-side, no issue machinery |
+| P0 | **The live-state audit** — reconcile the 54 `ACTIVE` rows against branches and commits → in-flight / landed / abandoned; confirm each of the 68 `PARTIAL` rows names its missing modes; correct the matrices, across all 7 matrices. Pure file-side, no issue machinery |
 | P1 | Label and milestone schema, `.github/ISSUE_TEMPLATE/row.yml`, `scripts/sync-rows.py`, `scripts/check-issue-record.py` (skip-when-offline, required-in-CI) |
-| P2 | Idempotent backfill of the ~160 live rows into issues; dry-run first |
+| P2 | Idempotent backfill of the ~188 live rows into issues; dry-run first |
 | P3 | Strip `State`/`Owner` from the seven matrices, add `Issue`; update `check-agent-record.py` **and its mutation suite** |
 | P4 | `agent-role.py claim` assigns instead of writing a row; `coordination.md` claim table retired to `completed/`; `NOW.md` generated; rewire `claim-view.py`, `ready-for-helper.py`, `check-now-current.py` |
 | P5 | Prose: `AGENTS.md` T0, `.agents/workflow.md`, `.agents/directives.md` |
 
 **P0 lands first and stands alone** (user-directed 2026-08-06). It is an audit,
-not bookkeeping: it is the first time the 49 `ACTIVE` claims are tested against
+not bookkeeping: it is the first time the 54 `ACTIVE` claims are tested against
 reality. Its value does not depend on the migration — a truthful matrix is worth
 having even if every later phase stalls — and running it first means the backfill
-mints ~160 issues from a corrected record rather than publishing the rot. Because
+mints ~188 issues from a corrected record rather than publishing the rot. Because
 `PARTIAL` rows now become public issues, P0 also checks that each states its
 missing modes, which the row contract already requires; a vague `PARTIAL` row
 would otherwise become a vague public issue.

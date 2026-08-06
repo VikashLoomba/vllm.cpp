@@ -14159,3 +14159,53 @@ noise fix from #70 stands but was already known not to be the render fix.
    full canvas, and the real per-token timestep layout. A real-weights activation diff of
    the DiT INPUTS (encoder output, position grid, condition-noise) at real geometry is
    the untested surface #70 did not isolate.
+
+## MiniMax-H3 render bug CLOSED — the render ran t2va on the ref2va PARTITION checkpoint; t2va on the FL2VA partition renders a COHERENT scene (2026-08-06, `row/H3-RENDER-CLOSE` PR #77, `ROAD-V1-H3`, dgx GB10 sm_121a)
+
+**Verdict.** The #70/#74 white latent was NOT a code bug. Every prior render ran
+**task=t2va on `minimax_h3_ref2va_nvfp4_full`, which is the REF2VA partition.**
+Upstream ships two independently-served partitions and requires the task to match:
+*"Set MODEL to FL2VA for T2VA"*, ref2va runs against the Ref2VA partition, and
+*"task ... must match the served partition"* (`recipes/MiniMaxAI/MiniMax-H3.md:50,222,289`;
+`pipeline._resolve_task` RAISES otherwise, `pipeline_minimax_h3.py:387-390`). A
+ref2va-trained DiT fed a t2va sequence (no reference block) is out of distribution →
+the spatially-white latent, invariant to the text prompt and step count — exactly #70.
+
+**How it was cornered (all NEW, all measured on dgx at real 512x512/22f scale):**
+| Suspect | Test | Result |
+|---|---|---|
+| S1 (a)(b) DiT INPUT wiring at real scale | `VT_H3_DUMP_INPUTS` dumped every step-0 DiT input; diffed vs upstream `pipeline_minimax_h3.py` at t2va 512x512/22f (text_len=8, latent 7x32x32, seq_len 1920) | **EXACT** — packed layout, fp64 grid, token_tags, inverse/combined AdaLN indices, sigmas all byte-equal; tokenization byte-equal to `tokenizer(prompt,add_special_tokens=False)` |
+| encoder conditioning | shape/stat check | correct [8,5120], carries the expected Qwen massive-activation (row0 ch731=15915, others rms~4) — not all-pad, not garbage |
+| NVFP4 dequant | independent torch dequant of `blocks.0.attn.qkv_proj` + Laguna/Qwen3 already prove `DequantNvfp4ToBf16` byte-exact | sane trained weight (rms 0.089, absmax=ws2·6·maxscale=3.61) |
+| CUDA kernels at real seq | NEW gate `test_minimax_h3 :: CUDA device forward tracks the host at the REAL render seq (1920)` (RealRatioParams head_dim=128, seq 1920) | **CUDA device == CPU host** (28/28) — no scale-dependent kernel bug (#74 only ran device-vs-host on the CPU backend) |
+| forward math | RefDiT restatement vs true upstream source, read side by side (block, attention, AdaLN view(m*3,6H), 3D-RoPE, modulate) | identical |
+
+So inputs + forward + kernels + dequant are all correct → the only thing left was
+the checkpoint↔task pairing.
+
+**Proof.** Downloaded the FL2VA-partition DiT `MiniMax-H3-FL2VA-Q3_K_M.gguf` (15.58 GB,
+`realrebelai/MiniMax-H3_GGUFs`, same 50L/5376/head128 geometry) and rendered the SAME
+t2va prompt *"an orange cat sitting on a wooden table"* at 512x512/22f, 20 steps,
+`--dequant-bf16`:
+- VAE-input latent **adj-cell cosine = 0.9467** (vs 0.06 white on the ref2va checkpoint; a real encoded latent is 0.789), latent rms 0.10.
+- frame **seam16/interior = 1.00** (no 16px patch grid), and the decoded frames SHOW a
+  photorealistic orange cat sitting on a wooden table, prompt-matched, temporally
+  evolving across the 22 frames. Valid `h264 512x512 + AAC 32kHz stereo` mp4.
+- healthy denoise signature: velocity STABLE ~1.37 rms, final latent rms **1.00** (the
+  broken ref2va-t2va run blew up to 2.64).
+
+**Secondary bug FOUND+FIXED (this PR).** Running the CORRECT task (ref2va) surfaced a
+real, never-exercised bug in `MiniMaxH3GenerateT2va`: `BuildMiniMaxH3PackedSequenceRef2va`
+PREPENDS pinned reference rows, the DiT zeroes them in its output, and the pipeline handed
+the full (reference+target) buffer to unpatchify → `rows not divisible by t*h*w`. Fixed by
+slicing to the TRAILING target rows (no-op for t2va/fl2va). (ref2va with a SYNTHETIC image+
+tone reference + text-only encoder still gridded — expected: a meaningless reference plus
+the still-unported encoder vision tower is weak conditioning; the clean confirmation is the
+FL2VA t2va render above, which needs neither.)
+
+**Residuals.** (1) The driver takes NO partition/supported_tasks guard (the community GGUF/
+NVFP4 files strip the release config), so picking the right checkpoint per task is on the
+caller — mirror-upstream guard is a follow-up. (2) The encoder vision tower (W3 remnant) is
+still unported, so real image/video-conditioned ref2va/fl2va renders are not yet clean. (3)
+50-step render at the reference canvas (768x1344) is the artifact leg. fp4 speed path
+unchanged.

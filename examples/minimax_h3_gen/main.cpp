@@ -29,6 +29,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -749,15 +750,30 @@ int main(int argc, char** argv) {
     // NOT reproduce torch's RNG: matching it bit-for-bit decides WHICH sample you
     // get, not whether the pipeline is correct, and pretending otherwise would
     // invite comparing our sample against upstream's as if they should match.
-    auto fill = [](std::vector<float>& out, uint64_t seed) {
+    // A flow-matching model is trained with GAUSSIAN N(0,1) noise at sigma=1
+    // (torch.randn); feeding uniform[-1,1] (std 0.577) is out-of-distribution.
+    // VT_H3_GAUSSIAN_NOISE=1 draws Box-Muller Gaussians from the same stream for the
+    // render-coherence A/B; default stays the historical uniform draw.
+    const bool gaussian = std::getenv("VT_H3_GAUSSIAN_NOISE") != nullptr;
+    auto fill = [gaussian](std::vector<float>& out, uint64_t seed) {
       uint64_t x = seed;
-      for (float& v : out) {
+      auto u01 = [&x]() {
         x += 0x9E3779B97F4A7C15ULL;
         uint64_t z = x;
         z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         z ^= z >> 31;
-        v = static_cast<float>((z >> 11) * 0x1.0p-53 * 2.0 - 1.0);
+        return (z >> 11) * 0x1.0p-53;  // [0,1)
+      };
+      for (size_t i = 0; i < out.size(); ++i) {
+        if (gaussian) {
+          double u1 = u01(), u2 = u01();
+          if (u1 < 1e-12) u1 = 1e-12;
+          out[i] = static_cast<float>(std::sqrt(-2.0 * std::log(u1)) *
+                                      std::cos(2.0 * 3.14159265358979323846 * u2));
+        } else {
+          out[i] = static_cast<float>(u01() * 2.0 - 1.0);  // uniform [-1,1]
+        }
       }
     };
     std::vector<float> noise_video(

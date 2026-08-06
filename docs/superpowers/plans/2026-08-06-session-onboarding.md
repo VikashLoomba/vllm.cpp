@@ -391,6 +391,12 @@ class ReadOnlyAndModeTests(unittest.TestCase):
     def test_read_only_is_declarable(self):
         self.assertIn("read-only", role.DECLARABLE)
 
+    def test_the_roles_alias_is_not_widened(self):
+        # ROLES means "may write". Widening it to DECLARABLE would silently let
+        # read-only through every existing write-gating call site, and today
+        # that mutation leaves the whole suite green.
+        self.assertEqual(role.ROLES, role.CLAIMABLE_ROLES)
+
     def test_mode_defaults_to_interactive(self):
         # Headless is DECLARED, never inferred. Absent an explicit flag the
         # session is interactive.
@@ -550,6 +556,12 @@ class PreflightWiringTests(unittest.TestCase):
 
     def test_onboard_suite_is_registered(self):
         self.assertIn("test_agent_onboard", self.TEXT)
+
+    def test_read_only_alone_does_not_satisfy_a_write_gate(self):
+        # agent-role.py show exits 0 for read-only, so --require-role is
+        # satisfied by a declared ABSENCE of claim. That is correct for a plain
+        # run and wrong for --staged; the refusal must be explicit.
+        self.assertIn("read-only-cannot-stage", self.TEXT)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**

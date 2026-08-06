@@ -12576,3 +12576,42 @@ unconditional (no `VT_*` gate). Blast radius (header consumers Qwen3-8B-MXFP4, Q
 Laguna) closed by proving BOTH quant schemes byte-exact. Binding c1-c8 x3 (clean-checkout grid) + the
 substantive ~0.7ms/step host/sched slice (the #47 residual) remain the parity verdict's open terms.
 Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
+
+## QUANT-CT-MXFP4-CLOSERS BINDING: clean-checkout grid at d3b412f5 — slivers improve EVERY throughput axis vs #49 (c1 crosses to parity+); MXFP4 goal still <1.0x on c2-c8 (2026-08-09, GB10, vLLM oracle 0.25.0, evidence `dgx:~/work/vllm.cpp-online-gate/evidence/d3b412f5c191aace1f2960fa7940d8eef925762a`)
+Full c1/c2/c4/c8 x3 binding on the CLEAN-checkout build at the committed sha d3b412f5 (not an
+overlay), oracle `VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`, single-load/arm,
+drop_caches+mincore, RelWithDebInfo+oracle-cutlass. #44 model gate re-passed inside the grid
+(mxfp4_smoke_battery). 24/24 legs `failed:0`; reps tight (ours c8 [1481.7,1475.1,1486.7] tok/s,
+CoV ~0.4%; vllm c8 CoV ~0.06%). The grid EXIT=1 is the gate-FAIL signal (`gate_pass:false`) + the
+single-model "cross-model summary waits for the other model", NOT a crash — all q3mxfp4 artifacts
+are complete. (q3mxfp4's sweep IS c1-c8, matching #48/#49; c16/c32 are other-model points.)
+
+| axis (ours/vLLM normalized ratio) | c1 | c2 | c4 | c8 | vs #49 (tput) |
+|---|---|---|---|---|---|
+| total_token_throughput | **1.005** | 0.925 | 0.939 | **0.953** | +0.015/+0.003/+0.009/+0.011 |
+| median_tpot_ms         | 1.002 | 0.922 | 0.915 | 0.939 | — |
+| mean_ttft_ms           | 1.034 | 0.962 | 1.004 | 0.999 | — |
+| median_itl_ms          | 1.004 | 0.919 | 0.920 | 0.929 | — |
+
+Peak host-mem footprint (peak_mem_available_drop): ours **35.2 GiB** vs vLLM **76.7 GiB** = **2.18x
+LESS** (WIN). VERDICT: **c1 PASSES every axis (tput 1.005, tpot 1.002, ttft 1.034, itl 1.004)**;
+c2-c8 BELOW on tput/tpot/itl (best c8 0.953 tput), TTFT at parity c4/c8 (1.004/0.999). gate_pass
+FALSE => MXFP4 parity goal **NOT DONE** (below-floor on c2-c8). The slivers moved EVERY throughput
+axis up vs #49 (c1 +1.5pp crosses to parity+, c4 +0.9pp, c8 +1.1pp, c2 +0.3pp), exactly the
+byte-exact block=8 recovery (~0.8pp @c8, #50) plus the memset-drop; nothing regressed.
+
+RESIDUAL MAP (per-shape, c8 ~4.75% tput gap): (1) block=16 padding — **CLOSED this run** (sliver a).
+(2) grouped-Marlin decode **+7-9% per-call** (GPU): `MoeGroupedGemmNvfp4Marlin` E=1 indirect
+`sorted_token_ids` gather + fp32 `C_tmp` vs vLLM dense `marlin_gemm` direct-A (#46/#50; a delicate
+grouped->dense-direct-A port, per-shape parity at M<=8 so not a config lever). (3) the host slice.
+
+HOST-SLICE ATTRIBUTION (step 2, VT_LOOP_TRACE on our server under decode load, this session): in
+every 1 s window the engine-core loop shows **interval_ms ≈ step_ms** (mean 25.5 vs 25.5, delta
+<=0.02 ms; `admits=0` pure-decode windows show interval-step ≈ 0). So the born-on-runner
+engine-core decode loop (scheduler + drain + admit) carries **negligible** per-iteration host
+overhead — the #47 ~0.7ms/step "host/sched" residual is NOT in the engine loop; it lives in the
+shared-architecture async frontend (HTTP / output-processing / detokenize, which vLLM runs too) or
+within the cross-tool attribution boundary (~0.7ms is ~24% of the c2 gap, near measurement error).
+Not a born-on-runner lever. (Caveat: the curl load under-saturated vs steady c8, so step_ms 25.5
+is not the c8 TPOT 37.6; the interval≈step finding is batch-independent and robust.)
+Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).

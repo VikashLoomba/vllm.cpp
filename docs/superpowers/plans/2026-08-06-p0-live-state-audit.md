@@ -1260,11 +1260,31 @@ PR range (`.github/workflows/ci.yml:126`), but `agent-preflight.sh` only runs it
 committed. That asymmetry is why per-task commits accumulate violations while
 every preflight reports green.
 
-**Do not add a trailing docs commit — it cannot fix earlier commits.** This
-branch lands as a **squash** (the house practice: `gh pr merge` would attribute
-the squash to `localai-bot`, so squashes are landed locally via `commit-tree` and
-a direct push). The single squashed commit carries the `docs/STATUS.md` and
-`docs/BENCHMARKS.md` updates, and satisfies the gate for the whole change.
+**Squashing alone does NOT clear it.** That was an early assumption and it is
+disproven: feeding the union of every path this branch changes through
+`checkpoint_errors()` still fails, because `docs/BENCHMARKS.md` and
+`docs/FEATURES.md` are never touched anywhere on the branch. A squash fixes the
+*per-commit* spread; it cannot conjure a file the branch never edits.
+
+**The fix is a record repair, not a merge trick.** The owed surfaces must
+actually be written. Both accept an explicit "nothing moved" entry — that is the
+point of the obligation, which covers pending, failed and void checkpoints, not
+only externally visible closure:
+
+- `docs/BENCHMARKS.md` — a line recording that this checkpoint moved lifecycle
+  bookkeeping and produced **no benchmark movement**.
+- `docs/FEATURES.md` — a line recording that **no capability changed**.
+
+That second one matters for honesty, not just for the gate. Moving a row to
+`READY` is a statement about *evidence of in-flight work*, never about capability;
+`scripts/check-model-checklist.py` forces `✅`→`🚧` at `READY`, which makes the
+internal checklist claim less support than reality. Do **not** demote the public
+`docs/FEATURES.md` marks to match — that would assert a regression that did not
+happen. Explain the divergence instead.
+
+This branch still lands as a **squash** (the house practice: `gh pr merge` would
+attribute the squash to `localai-bot`, so squashes are landed locally via
+`commit-tree` and a direct push), but only once the owed surfaces exist.
 
 Verify before pushing, over the exact range that will be pushed:
 

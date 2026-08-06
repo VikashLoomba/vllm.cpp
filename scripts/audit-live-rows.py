@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Audit the live-state matrix rows against Git reality. (P0)
 
-49 rows claim ACTIVE at once, which cannot be true: a stale ACTIVE cell inside
+54 rows claim ACTIVE at once, which cannot be true: a stale ACTIVE cell inside
 a several-hundred-row table is invisible rot. This tool makes it visible.
 
 It PROPOSES and REPORTS. It never rewrites a matrix -- corrections are applied
@@ -57,12 +57,19 @@ AUDIT_MATRIX_PATHS = [
 ]
 
 
-def live_rows() -> list:
-    """Every row in the shipped matrices whose state is in LIVE_STATES."""
+def live_rows(errors: list[str] | None = None) -> list[record.ClaimRow]:
+    """Every row in the audited matrices whose state is in LIVE_STATES.
+
+    Parse errors are appended to `errors` when a list is supplied. They must
+    not be swallowed: parse_claim_rows DROPS a row it cannot parse, so a
+    malformed row would vanish from a census whose whole point is
+    completeness -- and it bites hardest on feature-matrix.md and
+    sglang-matrix.md, which no CI gate parses today.
+    """
+    sink = errors if errors is not None else []
     rows = []
     for path in AUDIT_MATRIX_PATHS:
-        errors: list[str] = []
-        for row in record.parse_claim_rows(path, errors):
+        for row in record.parse_claim_rows(path, sink):
             if row.state in LIVE_STATES:
                 rows.append(row)
     return rows
@@ -91,16 +98,50 @@ def row_branches() -> dict[str, list[str]]:
     return mapping
 
 
+def id_grep_pattern(item_id: str) -> str:
+    """POSIX-ERE pattern matching this row ID as a whole token, never a prefix."""
+    return r"(^|[^A-Za-z0-9_-])" + re.escape(item_id) + r"([^A-Za-z0-9_-]|$)"
+
+
 def main_commits(item_id: str) -> list[str]:
-    """Commits on origin/main whose message mentions the row ID literally."""
+    """Commits on origin/main whose message mentions this row ID as a whole token.
+
+    The match is ANCHORED on ID boundaries, never a substring: 55 pairs of live
+    row IDs are prefixes of longer ones (MODEL-MM of seven MODEL-MM-* rows,
+    LOAD-SAFETENSORS of LOAD-SAFETENSORS-DIRECT-DENSE, ...). A substring match
+    would credit the short row with the long row's commits, and the classifier
+    calls any commit LANDED -- so an abandoned row would silently report as
+    finished, the exact false negative this tool exists to prevent.
+    """
     out = git(
-        "log", "--oneline", "--fixed-strings", f"--grep={item_id}", "-n", "20",
+        "log", "--oneline", "-E", f"--grep={id_grep_pattern(item_id)}", "-n", "20",
         "origin/main",
     )
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def require_origin_main() -> None:
+    """Abort unless origin/main resolves.
+
+    git() maps any failure to "", which downstream is indistinguishable from
+    "no evidence". An unfetched or missing origin/main would therefore make
+    EVERY row look abandoned and the audit would propose downgrading all 54
+    ACTIVE rows at once. Absence of work and absence of information must never
+    look the same.
+    """
+    if not git("rev-parse", "--verify", "--quiet", "origin/main").strip():
+        raise SystemExit(
+            "origin/main does not resolve -- run `git fetch origin main` first. "
+            "Without it every row reports no Git evidence and this audit would "
+            "propose downgrading every ACTIVE row."
+        )
 
 
 def unmerged(branch: str) -> list[str]:
     """Commits on branch that are not yet on origin/main."""
     out = git("log", "--oneline", f"origin/main..{branch}")
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+if __name__ == "__main__":
+    raise SystemExit("CLI arrives in P0 step 4; import this module for now")

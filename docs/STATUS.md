@@ -31,7 +31,7 @@ citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
 
 ## Capability status
 
-Orchestration prompts (2026-08-06): tracked reviewer + implementer, step 1/5.
+Orchestration prompts (2026-08-06): tracked reviewer + implementer, step 2/5.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by

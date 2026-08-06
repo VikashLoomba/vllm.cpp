@@ -157,7 +157,12 @@ def classify_active(
     groundwork and still have open follow-up work, and calling that finished
     would silently steal a live claim.
     """
-    live_branches = [b for b in branches if unmerged_by_branch.get(b)]
+    # Indexed, never .get(): `branches` is the authority for which keys must
+    # exist, so a missing key is a CALLER bug, not data. .get() would return
+    # None -> falsy -> the row reports LANDED, a live claim reported as
+    # finished. Absence of work and absence of information must never look the
+    # same; a KeyError at the audit's own boundary is the loud alternative.
+    live_branches = [b for b in branches if unmerged_by_branch[b]]
     if live_branches:
         joined = ", ".join(sorted(live_branches))
         return "IN-FLIGHT", f"unmerged commits on {joined}"

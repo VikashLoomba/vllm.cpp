@@ -135,7 +135,9 @@ class ClassifierTests(unittest.TestCase):
             commits=[],
         )
         self.assertEqual(verdict, "LANDED")
-        self.assertIn("merged", reason.lower())
+        # "unmerged" contains "merged", so a substring check on the bare word
+        # would pass for the IN-FLIGHT reason too.
+        self.assertIn("fully merged", reason)
 
     def test_main_commits_without_branch_mean_landed(self):
         verdict, reason = audit.classify_active(
@@ -162,6 +164,43 @@ class ClassifierTests(unittest.TestCase):
             commits=["def5678 feat(eng): ENG-FOO groundwork"],
         )
         self.assertEqual(verdict, "IN-FLIGHT")
+
+    def test_reason_names_only_the_branches_with_unmerged_commits(self):
+        # With more than one branch, the reason must name the live one and not
+        # the merged one, and must be order-independent so a re-run does not
+        # produce a spuriously different report.
+        verdict, reason = audit.classify_active(
+            branches=["row/B-LIVE", "row/A-MERGED"],
+            unmerged_by_branch={"row/B-LIVE": ["abc1234 wip"], "row/A-MERGED": []},
+            commits=[],
+        )
+        self.assertEqual(verdict, "IN-FLIGHT")
+        self.assertIn("row/B-LIVE", reason)
+        self.assertNotIn("row/A-MERGED", reason)
+
+    def test_reason_is_order_independent(self):
+        # The mixed case above has exactly ONE live branch, so sorted() is a
+        # no-op there and deleting it survives. Two branches on the same side
+        # of the filter are what pin determinism, on both reason paths: a
+        # report that reshuffles its own evidence between runs cannot be
+        # diffed by the human who has to act on it.
+        for label, by_branch in [
+            ("in-flight", {"row/B": ["abc1234 wip"], "row/A": ["def5678 wip"]}),
+            ("landed", {"row/B": [], "row/A": []}),
+        ]:
+            with self.subTest(label):
+                forward = audit.classify_active(["row/A", "row/B"], by_branch, [])
+                reverse = audit.classify_active(["row/B", "row/A"], by_branch, [])
+                self.assertEqual(forward, reverse)
+                self.assertIn("row/A, row/B", forward[1])
+
+    def test_missing_branch_key_is_a_loud_caller_bug(self):
+        # Silently treating an ungathered branch as merged would report a live
+        # claim as finished -- the exact false negative this tool prevents.
+        with self.assertRaises(KeyError):
+            audit.classify_active(
+                branches=["row/NEVER-GATHERED"], unmerged_by_branch={}, commits=[]
+            )
 
     def test_every_verdict_is_declared(self):
         for branches, by_branch, commits in [

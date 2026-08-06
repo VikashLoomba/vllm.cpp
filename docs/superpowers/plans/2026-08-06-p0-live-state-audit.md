@@ -936,7 +936,7 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 33 tests (34 added minus the transitional CLI-guard test you delete here).
+Expected: PASS, 38 tests (39 added minus the transitional CLI-guard test you delete here).
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 
@@ -1182,7 +1182,7 @@ In `.github/workflows/ci.yml`, extend the record job (lines 42–46):
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 36 tests.
+Expected: PASS, 41 tests.
 
 - [ ] **Step 6: Verify the whole gate is green**
 

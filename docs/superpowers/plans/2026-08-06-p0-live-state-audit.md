@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -146,9 +147,53 @@ class LiveRowLoadingTests(unittest.TestCase):
         self.assertGreater(len(rows), 100, "the live set is ~188 rows")
 
 
+class IdGrepPatternTests(unittest.TestCase):
+    """The ID match must be a whole-token match, never a prefix match."""
+
+    def test_pattern_matches_the_id_as_a_whole_token(self):
+        pattern = re.compile(audit.id_grep_pattern("MODEL-MM"))
+        for message in (
+            "MODEL-MM",
+            "feat(mm): MODEL-MM decoder lands",
+            "closes MODEL-MM.",
+            "(MODEL-MM) golden captured",
+        ):
+            self.assertTrue(pattern.search(message), message)
+
+    def test_pattern_rejects_a_longer_id_that_merely_starts_with_it(self):
+        # 55 pairs of live row IDs are prefixes of longer ones. A substring
+        # match would credit MODEL-MM with MODEL-MM-voxtral's commits, and the
+        # classifier calls any commit LANDED -- so an abandoned row would
+        # report as finished, the exact false negative this tool prevents.
+        pattern = re.compile(audit.id_grep_pattern("MODEL-MM"))
+        for message in (
+            "feat(mm): MODEL-MM-voxtral audio tower lands",
+            "MODEL-MM-QWEN3VL golden captured",
+            "record(mm): MODEL-MM_SUFFIX bookkeeping",
+        ):
+            self.assertIsNone(pattern.search(message), message)
+
+
+class CommandLineGuardTests(unittest.TestCase):
+    def test_check_flag_does_not_silently_exit_zero(self):
+        # The file is executable and its docstring advertises --check, but the
+        # real CLI arrives in P0 step 4. Until then --check must NOT exit 0:
+        # a gate that reports success because it ignored its own flag is the
+        # worst possible answer.
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/audit-live-rows.py"), "--check"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 ```
+
+**`CommandLineGuardTests` is transitional.** Task 4 lands the real CLI and replaces it with the `exit_code` tests — delete it there, do not leave both.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -310,7 +355,7 @@ Make it executable: `chmod +x scripts/audit-live-rows.py`
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 6 tests.
+Expected: PASS, 9 tests.
 
 - [ ] **Step 5: Verify the loader sees the real census**
 
@@ -449,7 +494,7 @@ def classify_active(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 12 tests.
+Expected: PASS, 15 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -485,22 +530,6 @@ The row contract already requires a `PARTIAL` row to make its missing modes expl
 Append to `tests/scripts/test_audit_live_rows.py`, above the `if __name__` block:
 
 ```python
-class IdMatchingTests(unittest.TestCase):
-    def test_pattern_matches_the_id_as_a_whole_token(self):
-        pattern = re.compile(audit.id_grep_pattern("MODEL-MM"))
-        self.assertTrue(pattern.search("feat(mm): MODEL-MM decode path"))
-        self.assertTrue(pattern.search("MODEL-MM"))
-
-    def test_pattern_does_not_match_a_longer_id_that_starts_with_it(self):
-        # 55 live ID pairs collide this way. A substring match would credit
-        # MODEL-MM with MODEL-MM-gemma4's commits, and the classifier calls any
-        # commit LANDED -- an abandoned row would report as finished.
-        pattern = re.compile(audit.id_grep_pattern("MODEL-MM"))
-        self.assertFalse(pattern.search("feat(mm): MODEL-MM-gemma4-mm landed"))
-        pattern = re.compile(audit.id_grep_pattern("LOAD-SAFETENSORS"))
-        self.assertFalse(pattern.search("LOAD-SAFETENSORS-DIRECT-DENSE done"))
-
-
 class PartialGapTests(unittest.TestCase):
     def test_explicit_gap_language_is_recognised(self):
         for text in [
@@ -577,7 +606,7 @@ def names_missing_modes(row_text: str) -> bool:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 19 tests.
+Expected: PASS, 20 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -803,7 +832,7 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 25 tests.
+Expected: PASS, 25 tests (26 added minus the transitional CLI-guard test you delete here).
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 

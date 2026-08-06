@@ -38,8 +38,7 @@ both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
 (0.26.0.dev0).
 
 Method rules hardened (AGENTS.md): the STRUCTURAL lens (same kernel, different
-throughput ⇒ audit the context; scan the REFERENCE's own rationale; per-shape
-MEASUREMENT arbitrates; distrust aggregate bytes/time and CROSS-TOOL comparisons).
+throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 
 ## Next actions
 
@@ -52,19 +51,19 @@ MEASUREMENT arbitrates; distrust aggregate bytes/time and CROSS-TOOL comparisons
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
-5. **Protocol substrate — partly done.** Claim triage DONE; `docs/STATUS.md`
-   under a shrink-only ratchet; roadmap compacted; `AGENTS.md` tiered. REMAINING:
-   anchor backfill (98 rows `SPIKE`/`ACTIVE`, need code/test anchors; 6 model rows
-   need a DECISION, architecture unregistered); record-era rollover BLOCKED on
-   `check-agent-record.py` binding `DONE` rows to `parity-ledger.md` LINE anchors
-   (re-anchor by ROW ID first; `state.md`/`benchmark-record.md` can roll now).
+5. **Protocol substrate — partly done.** Claim triage + live-state audit DONE
+   (10 unevidenced `ACTIVE` rows → `READY`, 11 dead claims retired, 9 amended);
+   `docs/STATUS.md` ratcheted; roadmap compacted; `AGENTS.md` tiered. REMAINING:
+   anchor backfill (rows `SPIKE`/`ACTIVE` needing code/test anchors; 6 model rows
+   need a DECISION); record-era rollover BLOCKED on `DONE` rows bound to
+   `parity-ledger.md` LINE anchors (re-anchor by ROW ID first).
 
 **Operator/helper protocol**
 ([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
 into a lock or worktree+PR; operator merges PRs first and does features only via
 sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
 START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
-`--require-role` still opt-in. Queue: 4 rows. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
+`--require-role` still opt-in. Queue: 10 rows — 6 are audit-vacated, with LANDED gate anchors; READ before picking. Backfill: 79 rows, 30 anchored; blocker is claim FAMILIES.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
 OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated

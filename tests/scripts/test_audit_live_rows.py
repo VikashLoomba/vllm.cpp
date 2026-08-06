@@ -37,6 +37,12 @@ class LiveRowLoadingTests(unittest.TestCase):
             frozenset({"SPIKE", "READY", "ACTIVE", "GATING", "PARTIAL", "BLOCKED"}),
         )
 
+    def test_all_seven_matrices_are_audited(self):
+        names = {path.name for path in audit.AUDIT_MATRIX_PATHS}
+        self.assertIn("feature-matrix.md", names)
+        self.assertIn("sglang-matrix.md", names)
+        self.assertEqual(len(names), 7)
+
     def test_shipped_matrices_yield_only_live_rows(self):
         rows = audit.live_rows()
         self.assertTrue(rows, "the shipped matrices must contain live rows")
@@ -50,7 +56,7 @@ class LiveRowLoadingTests(unittest.TestCase):
         rows = audit.live_rows()
         present = {row.state for row in rows}
         self.assertEqual(present, set(audit.LIVE_STATES))
-        self.assertGreater(len(rows), 100, "the live set is ~160 rows")
+        self.assertGreater(len(rows), 100, "the live set is ~188 rows")
 
 
 if __name__ == "__main__":

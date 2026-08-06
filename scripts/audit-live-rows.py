@@ -45,11 +45,22 @@ record = _load("agent_record", "scripts/check-agent-record.py")
 
 LIVE_STATES = frozenset({"SPIKE", "READY", "ACTIVE", "GATING", "PARTIAL", "BLOCKED"})
 
+# check-agent-record.py's MATRIX_PATHS omits feature-matrix.md and
+# sglang-matrix.md, which together hold 11 live rows. The audit covers all
+# seven matrices so no live row escapes it, but deliberately does NOT widen
+# MATRIX_PATHS itself: that governs a repo-wide CI gate whose row contract
+# these two files have never been held to.
+AUDIT_MATRIX_PATHS = [
+    *record.MATRIX_PATHS,
+    record.AGENTS / "feature-matrix.md",
+    record.AGENTS / "sglang-matrix.md",
+]
+
 
 def live_rows() -> list:
     """Every row in the shipped matrices whose state is in LIVE_STATES."""
     rows = []
-    for path in record.MATRIX_PATHS:
+    for path in AUDIT_MATRIX_PATHS:
         errors: list[str] = []
         for row in record.parse_claim_rows(path, errors):
             if row.state in LIVE_STATES:

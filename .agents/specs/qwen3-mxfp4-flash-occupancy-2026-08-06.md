@@ -1,6 +1,6 @@
 # QUANT-CT-MXFP4-FLASH-OCCUPANCY — the owed ours-vs-vLLM flash decode ncu diff + the occupancy/L2/codegen lever
 
-<!-- spec-status: SPIKE -->
+<!-- spec-status: CLOSED -->
 Row: `QUANT-CT-MXFP4-FLASH-OCCUPANCY` (helper, `row/QUANT-CT-MXFP4-FLASH-OCCUPANCY`).
 Base: `origin/main` `f7a1e322`. Vehicle: `Yi30/Qwen3-8B-MXFP4` (dense
 `Qwen3ForCausalLM`, W4A16 Marlin keep-quant); oracle arm
@@ -57,3 +57,21 @@ Byte-exact razor: #44 MXFP4-8B smoke 3/3 token-exact + coherent. If reduction
 order shifts: SACRED 0.6B/4B distributional + 32B strict, async, memcheck, eager
 + graphed. Box safety: BOTH flock locks, free -g ≥ 90, worker STOPPED, tmux +
 done-markers, sequential arms, single-load steady-state.
+
+## CLOSED — verdict (2026-08-06)
+
+W1 DONE (matched-c8 ncu, both engines, grid 1x3x64): **vLLM runs at the SAME
+8.33% occupancy** (both smem-limited to 1 CTA/SM by the byte-identical 81.92 KB
+smem), L2 ~1% both, identical stall structure. The ONLY measured diff was +13%
+executed instructions — the CODEGEN hypothesis. W2 tested every mirror-first
+lever and REFUTED all of them: arch-mirror (compute_80 PTX driver-JIT) is
+neutral; and building vLLM's EXACT recipe (compute_80 + `-use_fast_math`)
+reproduces vLLM's SASS profile EXACTLY (241 reg, 17,008 instr vs vLLM 241/17,020)
+and is STILL ~167 us, ~10 us slower than vLLM's ~157 us. So matching vLLM's arch,
+fast-math, register AND instruction count does NOT close the gap: the kernel is
+not instruction-bound, and the residual is vLLM's wheel-`ptxas` SASS-scheduling
+quality, un-reachable from our nvcc 13.0. W3 VERDICT: MXFP4 stays BELOW-FLOOR
+(binding unchanged 1.020/0.962/0.966/0.969), NO lever exists on our stack, NO
+default flip owed. No functional code shipped; a CMakeLists NOTE + benchmark
+record (#75) capture the closed levers so they are not re-tried. NO byte-exact
+razor / SACRED battery owed (nothing shipped to gate).

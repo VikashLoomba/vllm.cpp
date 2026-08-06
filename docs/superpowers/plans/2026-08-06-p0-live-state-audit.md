@@ -565,7 +565,7 @@ EOF
 - Test: `tests/scripts/test_audit_live_rows.py`
 
 **Interfaces:**
-- Produces: `GAP_MARKERS: tuple[str, ...]`; `names_missing_modes(row_text: str) -> bool`.
+- Produces: `GAP_MARKERS: tuple[str, ...]`; `gap_pattern(markers: tuple[str, ...]) -> re.Pattern[str]`; `GAP_RE`; `CHECK_FAILS_ON: frozenset[str]`; `names_missing_modes(row_text: str) -> bool`; `matched_marker(row_text: str) -> str`.
 
 The row contract already requires a `PARTIAL` row to make its missing modes explicit. Because `PARTIAL` rows become **public** issues in P2, a vague one becomes a vague public issue. This is a **report-only flag for human review** and must never become a hard failure — the detector is a keyword heuristic and gating on it would be exactly the fragile-checker trap the protocol warns about.
 
@@ -642,132 +642,30 @@ GAP_MARKERS = (
 # Whole words, never substrings: "only" must not match "commonly" and "no"
 # must not match "node". A substring match would silently mark a vague row as
 # explicit, which is the exact failure this flag exists to catch.
-# Markers are ESCAPED before interpolation: the list above invites human
-# tuning, and an unescaped marker containing "(" would raise re.error at
-# IMPORT time and take the whole module down, while "wip?" would silently
-# compile to something that matches "wi ". re.escape("not yet") is
-# "not\\ yet", so widening the escaped space to \s+ still works.
-GAP_RE = re.compile(
-    r"\b(?:"
-    + "|".join(re.escape(marker).replace("\\ ", r"\s+") for marker in GAP_MARKERS)
-    + r")\b",
-    re.IGNORECASE,
-)
+def gap_pattern(markers: tuple[str, ...]) -> re.Pattern[str]:
+    """Compile markers into a whole-word, case-insensitive alternation.
 
-# check mode fails on abandoned ACTIVE rows and nothing else. The PARTIAL flag
-# is a keyword heuristic for human review; gating on it would be the fragile
-# checker the protocol warns against.
-CHECK_FAILS_ON = frozenset({"ACTIVE"})
+    Whole words, never substrings: "only" must not match "commonly" and "no"
+    must not match "node". A substring match would silently mark a vague row as
+    explicit, which is the exact failure this flag exists to catch.
 
+    Markers are ESCAPED before interpolation. GAP_MARKERS invites human tuning,
+    and a raw marker fails two ways: "fp4(" raises re.error at IMPORT time and
+    takes this whole module down with it, while "not.yet" compiles silently
+    into a wildcard that also matches "notXyet". re.escape("not yet") is
+    "not\\ yet", so widening that escaped space to \\s+ still works.
 
-def names_missing_modes(row_text: str) -> bool:
-    """True when a PARTIAL row states what is NOT supported."""
-    return GAP_RE.search(row_text) is not None
-
-
-def matched_marker(row_text: str) -> str:
-    """The gap marker that fired, or "" -- so a human can discount a bad hit.
-
-    The heuristic under-flags: 11 of the 48 rows it reads as explicit qualify
-    only via bare `no` or `gap`, on prose asserting GOODNESS rather than
-    absence ("no longer double-resides", "max gap 0.0 nats", "CLOSED the CPU
-    RSS gap"). Naming the marker lets a reviewer dismiss those at a glance
-    instead of trusting the verdict.
+    Taking the markers as an argument is what makes the escaping testable: no
+    shipped marker needs escaping today, so an inline expression could drop
+    re.escape with nothing to notice.
     """
-    match = GAP_RE.search(row_text)
-    return match.group(0) if match else ""
-```
+    alternation = "|".join(
+        re.escape(marker).replace("\\ ", r"\s+") for marker in markers
+    )
+    return re.compile(r"\b(?:" + alternation + r")\b", re.IGNORECASE)
 
-`re` is already imported at the top of the module from Task 1; if it is not, add it there rather than mid-file.
 
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 26 tests.
-
-- [ ] **Step 5: Run preflight and commit**
-
-```bash
-bash scripts/agent-preflight.sh > /tmp/preflight.log 2>&1; echo "EXIT=$?"
-git add scripts/audit-live-rows.py tests/scripts/test_audit_live_rows.py
-git commit -F - <<'EOF'
-tools(audit): advisory PARTIAL missing-modes flag (P0 step 3)
-
-Report-only by construction: CHECK_FAILS_ON is ACTIVE alone, so the keyword
-heuristic can never fail a build.
-
-FOLLOWING_AGENTS_PROTOCOL
-Assisted-by: Claude Code:claude-opus-5 [ClaudeCode]
-EOF
-```
-
----
-
-### Task 4: Report rendering and CLI
-
-**Files:**
-- Modify: `scripts/audit-live-rows.py`
-- Test: `tests/scripts/test_audit_live_rows.py`
-
-**Interfaces:**
-- Consumes: everything from Tasks 1–3.
-- Produces: `audit() -> list[dict]` (one record per live row, keys `id`, `state`, `path`, `line`, `verdict`, `reason`, `flag`, `duplicate`); `duplicate_live_ids(rows: list) -> dict[str, list[str]]`; `render_markdown(records: list[dict]) -> str`; `main(argv: list[str] | None = None) -> int`. `audit()` calls `require_origin_main()` first and aborts on any parse error.
-
-- [ ] **Step 1: Write the failing test**
-
-Append to `tests/scripts/test_audit_live_rows.py`, above the `if __name__` block:
-
-```python
-class ReportTests(unittest.TestCase):
-    RECORDS = [
-        {
-            "id": "ENG-FOO",
-            "state": "ACTIVE",
-            "path": ".agents/engine-matrix.md",
-            "line": 42,
-            "verdict": "ABANDONED",
-            "reason": "no branch, no commit on main mentioning the row ID",
-            "flag": "",
-        },
-        {
-            "id": "MODEL-BAR",
-            "state": "PARTIAL",
-            "path": ".agents/model-matrix.md",
-            "line": 7,
-            "verdict": "",
-            "reason": "",
-            "flag": "does not name its missing modes",
-        },
-    ]
-
-    def test_markdown_lists_every_record(self):
-        out = audit.render_markdown(self.RECORDS)
-        self.assertIn("ENG-FOO", out)
-        self.assertIn("MODEL-BAR", out)
-        self.assertIn("ABANDONED", out)
-        self.assertIn("does not name its missing modes", out)
-
-    def test_markdown_cells_do_not_break_the_table(self):
-        records = [dict(self.RECORDS[0], reason="a | b")]
-        out = audit.render_markdown(records)
-        body = [ln for ln in out.splitlines() if "ENG-FOO" in ln]
-        self.assertEqual(len(body), 1)
-        self.assertNotIn("a | b", body[0])
-
-    def test_check_mode_fails_when_an_active_row_is_abandoned(self):
-        self.assertEqual(audit.exit_code(self.RECORDS, check=True), 1)
-
-    def test_check_mode_passes_when_no_active_row_is_abandoned(self):
-        clean = [dict(self.RECORDS[0], verdict="IN-FLIGHT")] + self.RECORDS[1:]
-        self.assertEqual(audit.exit_code(clean, check=True), 0)
-
-    def test_report_mode_always_exits_zero(self):
-        self.assertEqual(audit.exit_code(self.RECORDS, check=False), 0)
-
-    def test_vague_partial_alone_never_fails_check_mode(self):
-        only_flag = [self.RECORDS[1]]
-        self.assertEqual(audit.exit_code(only_flag, check=True), 0)
-```
+GAP_RE = gap_pattern(GAP_MARKERS)```
 
 - [ ] **Step 2: Run test to verify it fails**
 

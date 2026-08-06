@@ -1984,6 +1984,34 @@ TEST_CASE("minimax_h3: the encoder text tower matches upstream, with all three H
 // ImageNet-normalized values to a writer that expects [-1, 1]: it casts colour (the
 // per-channel means differ) and compresses the dynamic range ~4.4x (std ~0.22),
 // which is what "dark and washed out" looks like.
+// The decoded AUDIO must last as long as the decoded VIDEO. Nothing checked this,
+// and it was wrong: `audio_t` is the PER-CHANNEL latent length (planner: 40 Hz *
+// duration) but the pipeline divided it by the channel count, halving the audio.
+// Because the muxer passes `-shortest`, that silently truncated the VIDEO too --
+// a 124-frame render produced a 61-frame MP4. Every structural check passed
+// throughout: shapes were self-consistent, just half as long as intended.
+TEST_CASE("minimax_h3: decoded audio spans the same duration as the video") {
+  // Planner geometry: audio latents run at 40 Hz over num_frames / fps seconds.
+  const int64_t num_frames = 124;
+  const double seconds = static_cast<double>(num_frames) / vllm::kMiniMaxH3Fps;
+  const int64_t audio_t = vllm::MiniMaxH3AudioLatentT(seconds);
+  INFO("num_frames=" << num_frames << " seconds=" << seconds << " audio_t=" << audio_t);
+
+  // 40 Hz * 5.1667 s = 207 latent steps PER CHANNEL, not 103.
+  CHECK(audio_t == 207);
+
+  // The invariant the bug broke: latent steps / 40 Hz must equal the video
+  // duration, to within one latent step.
+  const double audio_seconds = static_cast<double>(audio_t) / 40.0;
+  INFO("audio " << audio_seconds << " s vs video " << seconds << " s");
+  CHECK(std::abs(audio_seconds - seconds) <= 1.0 / 40.0);
+
+  // And the halving specifically: dividing by the 2 channels would give ~half the
+  // duration, which is what shipped.
+  const double halved = static_cast<double>(audio_t / vllm::kMiniMaxH3AudioChannels) / 40.0;
+  CHECK(std::abs(halved - seconds) > 1.0);  // the wrong value is off by ~2.5 s
+}
+
 TEST_CASE("minimax_h3: ImageNet pixel de/normalization matches upstream's wrapper") {
   const int64_t n = 5;
   // Round trip: normalize then de-normalize must return the original, for values

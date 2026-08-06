@@ -253,6 +253,23 @@ Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
 | Qwen3-VL (image + video) | Qwen3-VL-4B-Instruct | - | Strict token-exact 32/32 (image) | Speed-pending |
 | Qwen3.6-27B vision (image + video) | Qwen3.6-27B | - | Strict token-exact 32/32 | Speed-pending |
 | Voxtral (audio) | Voxtral-Mini-3B-2507 | - | Near-tie-robust (decoder 48/48 exact) | Speed-pending |
+| **MiniMax-H3 (video + audio GENERATION)** | MiniMaxAI/MiniMax-H3 | Q4_K_M / NVFP4 | Renders 864x480 / 124f with audio | **34.6 s/step on one Jetson Thor** |
+
+**Video + audio GENERATION is supported**, not just video *input*. MiniMax-H3, a 33 B
+joint video+audio diffusion transformer, renders end to end: prompt -> Qwen3-VL-32B encoder
+-> DiT denoise -> ViT3D video VAE + DAC/BigVGAN audio VAE -> MP4 with a stereo track. It is
+the project's first DIFFUSION architecture (no KV cache, no sampler, no logits), and upstream
+is `vllm-project/vllm-omni`, beyond the vLLM parity pin.
+
+Conditioning modes, each gated on the conditioning actually CHANGING the output rather than
+merely being accepted: text-to-video+audio, first/last keyframe (`--first-frame`/`--last-frame`),
+image references (`--ref-image`), silent video references (`--ref-video`), and audio
+references. Served over HTTP via `POST /v1/videos`.
+
+Use **Q4_K_M**, not Q3_K_M: H3's split-half RoPE produces channel-wise magnitude outliers that
+3-bit quantisation cannot hold, and the difference is a murky silhouette versus a photoreal
+close-up. On one Jetson Thor (sm_110, no FlashAttention-2) a 50-step 864x480/124-frame render
+takes about 28 minutes, after a **16.6x** attention rewrite ending in bf16 tensor cores.
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and

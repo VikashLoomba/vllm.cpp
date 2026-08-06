@@ -90,6 +90,15 @@ are our reading of their documented behavior, not measurements.
 architectures. The full per-model state, including which are oracle-blocked, is
 in [STATUS.md](STATUS.md) and `.agents/model-matrix.md`.
 
+The marks above are the accurate ones. The 2026-08-06 live-state audit moved
+3 model rows
+off a stale `ACTIVE` claim to `READY`. For the MODEL rows `check-model-checklist.py`
+then demotes the INTERNAL mark in `.agents/model-matrix.md` from `✅` to `🚧`,
+because `✅` is illegal at `READY`. That is a lifecycle-contract artifact:
+`READY` is a statement about evidence of in-flight work, never about
+capability. No capability changed, no gate was lost, and these public marks
+are deliberately NOT demoted to match.
+
 ## Multimodal
 
 | Input | vllm.cpp | vLLM | SGLang | llama.cpp |

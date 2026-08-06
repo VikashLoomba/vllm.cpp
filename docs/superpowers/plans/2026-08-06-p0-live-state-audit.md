@@ -642,8 +642,15 @@ GAP_MARKERS = (
 # Whole words, never substrings: "only" must not match "commonly" and "no"
 # must not match "node". A substring match would silently mark a vague row as
 # explicit, which is the exact failure this flag exists to catch.
+# Markers are ESCAPED before interpolation: the list above invites human
+# tuning, and an unescaped marker containing "(" would raise re.error at
+# IMPORT time and take the whole module down, while "wip?" would silently
+# compile to something that matches "wi ". re.escape("not yet") is
+# "not\\ yet", so widening the escaped space to \s+ still works.
 GAP_RE = re.compile(
-    r"\b(?:" + "|".join(marker.replace(" ", r"\s+") for marker in GAP_MARKERS) + r")\b",
+    r"\b(?:"
+    + "|".join(re.escape(marker).replace("\\ ", r"\s+") for marker in GAP_MARKERS)
+    + r")\b",
     re.IGNORECASE,
 )
 
@@ -656,6 +663,19 @@ CHECK_FAILS_ON = frozenset({"ACTIVE"})
 def names_missing_modes(row_text: str) -> bool:
     """True when a PARTIAL row states what is NOT supported."""
     return GAP_RE.search(row_text) is not None
+
+
+def matched_marker(row_text: str) -> str:
+    """The gap marker that fired, or "" -- so a human can discount a bad hit.
+
+    The heuristic under-flags: 11 of the 48 rows it reads as explicit qualify
+    only via bare `no` or `gap`, on prose asserting GOODNESS rather than
+    absence ("no longer double-resides", "max gap 0.0 nats", "CLOSED the CPU
+    RSS gap"). Naming the marker lets a reviewer dismiss those at a glance
+    instead of trusting the verdict.
+    """
+    match = GAP_RE.search(row_text)
+    return match.group(0) if match else ""
 ```
 
 `re` is already imported at the top of the module from Task 1; if it is not, add it there rather than mid-file.
@@ -663,7 +683,7 @@ def names_missing_modes(row_text: str) -> bool:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 24 tests.
+Expected: PASS, 26 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -801,8 +821,13 @@ def audit() -> list[dict]:
             verdict, reason = classify_active(
                 branches, unmerged_by_branch, main_commits(row.item_id)
             )
-        if row.state == "PARTIAL" and not names_missing_modes(row.raw):
-            flag = "does not name its missing modes"
+        if row.state == "PARTIAL":
+            marker = matched_marker(row.raw)
+            flag = (
+                f"explicit via {marker!r}"
+                if marker
+                else "does not name its missing modes"
+            )
         records.append(
             {
                 "duplicate": ", ".join(duplicates.get(row.item_id, [])),
@@ -889,7 +914,7 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 29 tests (30 added minus the transitional CLI-guard test you delete here).
+Expected: PASS, 31 tests (32 added minus the transitional CLI-guard test you delete here).
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 
@@ -1135,7 +1160,7 @@ In `.github/workflows/ci.yml`, extend the record job (lines 42–46):
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 32 tests.
+Expected: PASS, 34 tests.
 
 - [ ] **Step 6: Verify the whole gate is green**
 

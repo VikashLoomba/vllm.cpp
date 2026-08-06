@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Reconcile the 160 live-state matrix rows against Git reality — above all the 49 rows simultaneously claiming `ACTIVE`, which cannot all be true — so the record is truthful before any issue backfill mints ~160 public issues from it.
+**Goal:** Reconcile the 188 live-state matrix rows against Git reality — above all the 54 rows simultaneously claiming `ACTIVE`, which cannot all be true — so the record is truthful before any issue backfill mints ~160 public issues from it.
 
 **Architecture:** A new reporting tool, `scripts/audit-live-rows.py`, reuses the row parser already inside `scripts/check-agent-record.py` (never reimplements it) and cross-references each live row against local/remote `row/<ID>` branches and `main` commits mentioning the ID. Classification is a **pure function** over already-gathered evidence, so it is unit-testable without Git. The tool **proposes and reports; it never rewrites a matrix.** A human/agent applies corrections per matrix in reviewable commits. Only after the record is corrected does the tool become a CI gate, so the rot cannot return.
 
@@ -28,7 +28,15 @@ Copied from `AGENTS.md`, `.agents/coordination.md` and `.agents/specs/issue-nati
   - Therefore an abandoned `ACTIVE` row moves to **`READY` if it has a real spec, otherwise `INVENTORIED`** — it may not simply be blanked.
 - The live set is exactly: `SPIKE`, `READY`, `ACTIVE`, `GATING`, `PARTIAL`, `BLOCKED`.
 
-**Baseline census on `origin/main` @ `027af9b0` (verified 2026-08-06):** 367 rows carry a state — `INVENTORIED` 125, `PARTIAL` 64, `ANCHOR-BACKFILL` 52, `ACTIVE` 49, `SPIKE` 24, `DONE` 22, `GATING` 11, `OUT-OF-SCOPE` 8, `BLOCKED` 6, `READY` 6. **Live total = 160.**
+**Baseline census on `origin/main` @ `027af9b0`**, measured with `parse_claim_rows` itself (an earlier ad-hoc regex estimate of 160 was wrong and is superseded):
+
+| Source | Rows | Live rows | ACTIVE | PARTIAL | SPIKE | GATING | BLOCKED | READY |
+|---|---|---|---|---|---|---|---|---|
+| The 5 files in `MATRIX_PATHS` | 695 | 177 | 51 | 60 | 43 | 10 | 7 | 6 |
+| `feature-matrix.md` + `sglang-matrix.md` | 19 | 11 | 3 | 8 | 0 | 0 | 0 | 0 |
+| **Total across all 7 matrices** | **714** | **188** | **54** | **68** | **43** | **10** | **7** | **6** |
+
+**`check-agent-record.py`'s `MATRIX_PATHS` covers only 5 of the 7 matrices.** The audit must cover all 7: `feature-matrix.md` and `sglang-matrix.md` hold 11 live rows that would otherwise become unaudited public issues in P2. The audit therefore defines its own `AUDIT_MATRIX_PATHS`. It does **not** widen `MATRIX_PATHS` itself — that would change what the repo-wide CI gate validates and could turn CI red on rows never held to the row contract. The DRY constraint is about the *parser*, which is still imported and never reimplemented.
 
 ---
 
@@ -54,7 +62,7 @@ Copied from `AGENTS.md`, `.agents/coordination.md` and `.agents/specs/issue-nati
 
 **Interfaces:**
 - Consumes: `scripts/check-agent-record.py` — `ClaimRow` (frozen dataclass with fields `path: Path`, `line_no: int`, `item_id: str`, `state: str`, `header: tuple[str, ...]`, `cells: tuple[str, ...]`, `raw: str`, and method `field(name: str) -> str`); `parse_claim_rows(path: Path, errors: list[str]) -> list[ClaimRow]`; `MATRIX_PATHS: list[Path]`.
-- Produces: `LIVE_STATES: frozenset[str]`; `live_rows() -> list[ClaimRow]`; `row_branches() -> dict[str, list[str]]`; `main_commits(item_id: str) -> list[str]`; `unmerged(branch: str) -> list[str]`.
+- Produces: `LIVE_STATES: frozenset[str]`; `AUDIT_MATRIX_PATHS: list[Path]` (= `record.MATRIX_PATHS` plus `.agents/feature-matrix.md` and `.agents/sglang-matrix.md`); `live_rows() -> list[ClaimRow]`; `row_branches() -> dict[str, list[str]]`; `main_commits(item_id: str) -> list[str]`; `unmerged(branch: str) -> list[str]`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -100,6 +108,12 @@ class LiveRowLoadingTests(unittest.TestCase):
             frozenset({"SPIKE", "READY", "ACTIVE", "GATING", "PARTIAL", "BLOCKED"}),
         )
 
+    def test_all_seven_matrices_are_audited(self):
+        names = {path.name for path in audit.AUDIT_MATRIX_PATHS}
+        self.assertIn("feature-matrix.md", names)
+        self.assertIn("sglang-matrix.md", names)
+        self.assertEqual(len(names), 7)
+
     def test_shipped_matrices_yield_only_live_rows(self):
         rows = audit.live_rows()
         self.assertTrue(rows, "the shipped matrices must contain live rows")
@@ -113,7 +127,7 @@ class LiveRowLoadingTests(unittest.TestCase):
         rows = audit.live_rows()
         present = {row.state for row in rows}
         self.assertEqual(present, set(audit.LIVE_STATES))
-        self.assertGreater(len(rows), 100, "the live set is ~160 rows")
+        self.assertGreater(len(rows), 100, "the live set is ~188 rows")
 
 
 if __name__ == "__main__":
@@ -177,11 +191,22 @@ record = _load("agent_record", "scripts/check-agent-record.py")
 
 LIVE_STATES = frozenset({"SPIKE", "READY", "ACTIVE", "GATING", "PARTIAL", "BLOCKED"})
 
+# check-agent-record.py's MATRIX_PATHS omits feature-matrix.md and
+# sglang-matrix.md, which together hold 11 live rows. The audit covers all
+# seven matrices so no live row escapes it, but deliberately does NOT widen
+# MATRIX_PATHS itself: that governs a repo-wide CI gate whose row contract
+# these two files have never been held to.
+AUDIT_MATRIX_PATHS = [
+    *record.MATRIX_PATHS,
+    record.AGENTS / "feature-matrix.md",
+    record.AGENTS / "sglang-matrix.md",
+]
+
 
 def live_rows() -> list:
     """Every row in the shipped matrices whose state is in LIVE_STATES."""
     rows = []
-    for path in record.MATRIX_PATHS:
+    for path in AUDIT_MATRIX_PATHS:
         errors: list[str] = []
         for row in record.parse_claim_rows(path, errors):
             if row.state in LIVE_STATES:
@@ -232,14 +257,14 @@ Make it executable: `chmod +x scripts/audit-live-rows.py`
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 3 tests.
+Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Verify the loader sees the real census**
 
 Run: `python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('a','scripts/audit-live-rows.py'); m=importlib.util.module_from_spec(s); sys.modules['a']=m; s.loader.exec_module(m); rows=m.live_rows(); import collections; print(len(rows), collections.Counter(r.state for r in rows))"`
-Expected: `160` total, with `ACTIVE` = 49, `PARTIAL` = 64, `SPIKE` = 24, `GATING` = 11, `BLOCKED` = 6, `READY` = 6.
+Expected: `188` total, with `ACTIVE` = 54, `PARTIAL` = 68, `SPIKE` = 43, `GATING` = 10, `BLOCKED` = 7, `READY` = 6.
 
-If the numbers differ, do **not** adjust the test to match — `main` has moved. Re-read the current census, record the new baseline in the commit message, and continue.
+If the numbers differ, do **not** adjust the test to match — `main` has moved. Re-read the current census, record the new baseline in the report, and continue.
 
 - [ ] **Step 6: Run preflight and commit**
 
@@ -371,7 +396,7 @@ def classify_active(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 9 tests.
+Expected: PASS, 10 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -483,7 +508,7 @@ def names_missing_modes(row_text: str) -> bool:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 14 tests.
+Expected: PASS, 15 tests.
 
 - [ ] **Step 5: Run preflight and commit**
 
@@ -682,15 +707,15 @@ Move the `import argparse` and `import json` lines up into the module's import b
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 20 tests.
+Expected: PASS, 21 tests.
 
 - [ ] **Step 5: Smoke-test the CLI against the real repository**
 
 Run: `git fetch -q origin && python3 scripts/audit-live-rows.py | tail -5`
-Expected: a summary line reading `160 live rows; N abandoned ACTIVE; M PARTIAL rows to review.`
+Expected: a summary line reading `188 live rows; N abandoned ACTIVE; M PARTIAL rows to review.`
 
 Run: `python3 scripts/audit-live-rows.py --json | python3 -c "import json,sys; print(len(json.load(sys.stdin)))"`
-Expected: `160`.
+Expected: `188`.
 
 **Note:** `--check` is expected to exit 1 right now. That is the finding, not a bug. Do not wire it into preflight or CI until Task 7.
 
@@ -759,7 +784,7 @@ Confirm the tool's verdict matches what you see. A classifier that is wrong on a
 
 Create `.agents/specs/live-state-audit-2026-08-06.md` with these sections:
 
-- **Scope** — the 160 live rows on `origin/main` @ `<SHA>`; what the audit does and does not decide.
+- **Scope** — the 188 live rows on `origin/main` @ `<SHA>`; what the audit does and does not decide.
 - **Method** — `scripts/audit-live-rows.py`, the classification rules verbatim, and the hand-verified sample from Step 3 with its result.
 - **Findings** — the full report table from `/tmp/audit.md`, plus the verdict distribution from Step 2.
 - **Proposed corrections** — one line per row needing a change, with its target state and the contract obligation that target carries. Apply the legality rule from Global Constraints: an abandoned `ACTIVE` row goes to `READY` if it has a real spec link, otherwise to `INVENTORIED`.
@@ -927,7 +952,7 @@ In `.github/workflows/ci.yml`, extend the record job (lines 42–46):
 - [ ] **Step 5: Run test to verify it passes**
 
 Run: `python3 tests/scripts/test_audit_live_rows.py -v`
-Expected: PASS, 23 tests.
+Expected: PASS, 24 tests.
 
 - [ ] **Step 6: Verify the whole gate is green**
 
@@ -960,7 +985,7 @@ EOF
 - `.agents/specs/live-state-audit-2026-08-06.md` justifies every correction, names every row left alone, and records the hand-verified classifier sample.
 - `bash scripts/agent-preflight.sh` exits 0, with the new suite and gate registered.
 - CI runs the gate and its mutation suite.
-- P2's backfill can mint ~160 issues from a record that is true.
+- P2's backfill can mint ~188 issues from a record that is true.
 
 ## Out of scope
 

@@ -1018,7 +1018,8 @@ Create `.agents/specs/live-state-audit-2026-08-06.md` with these sections:
 - **Findings** — the full report table from `/tmp/audit.md`, plus the verdict distribution from Step 2.
 - **Proposed corrections** — one line per row needing a change, with its target state and the contract obligation that target carries. Apply the legality rule from Global Constraints: an abandoned `ACTIVE` row goes to `READY` if it has a real spec link, otherwise to `INVENTORIED`.
 - **Duplicate live IDs** — `BACKEND-CUDA-SM121` and `BACKEND-CPU` are `PARTIAL` in both `backend-matrix.md` and `feature-matrix.md`. Decide which matrix OWNS each row and what the other becomes (a non-claimable reference, a differently-keyed row, or deleted), and say why. This must be settled here: the backfill would otherwise mint two issues for one item.
-- **Rows left alone** — every `IN-FLIGHT` row, named, so the next reader can see the audit considered and kept them.
+- **Rows left alone** — every row the audit did not propose changing, named, so the next reader can see it was considered and kept. There are **no `IN-FLIGHT` rows**: not one of the 54 `ACTIVE` claims has an unmerged `row/<ID>` branch.
+- **The `LANDED` caveat** — all 44 `LANDED` verdicts rest on a commit *mentioning* the row ID, and **8 of them on records-only commits that changed no code**. `LANDED` means "has evidence worth reading", never "finished". No row may be proposed `DONE` on a commit mention alone.
 - **Risks/decisions** — every verdict the tool could not decide, and the human call made.
 
 - [ ] **Step 5: Run preflight and commit**
@@ -1090,7 +1091,19 @@ Assisted-by: Claude Code:claude-opus-5 [ClaudeCode]
 EOF
 ```
 
-- [ ] **Step 5: Repeat Steps 1–4 for each remaining matrix with corrections**
+- [ ] **Step 4b: Retire the coordination claims in the SAME commit**
+
+Every abandoned row sits in an active claim in `.agents/coordination.md`, and
+`check_row_contracts` cross-checks a row's `Owner` against that claim table.
+**11 claims must be RETIRED, not emptied** — moved to the completed block with
+their outcome — and it has to happen in the same commit as the matrix edit, or
+`scripts/check-agent-record.py` goes red between the two.
+
+Run `python3 scripts/check-agent-record.py; echo "EXIT=$?"` and confirm `EXIT=0`
+before committing. If it complains about a claim/owner mismatch, the claim
+retirement is missing or partial — repair the record, never the checker.
+
+- [ ] **Step 5: Repeat Steps 1–4b for each remaining matrix with corrections**
 
 - [ ] **Step 6: Update the roadmap, state log and public status**
 

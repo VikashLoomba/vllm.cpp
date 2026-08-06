@@ -12554,3 +12554,25 @@ launch/GEMM, micro. (c) the **~0.7ms/step host/sched slice** — the real remain
 not a kernel port. No single lever reaches ≥1.0x; the MXFP4 parity goal stays BELOW-FLOOR (best c8
 0.942). Evidence: `dgx:~/mxfp4-nsys/{mxfp4_marlin_ubench.py,ubench.log,ubench_3x.log}`. Box left
 clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).
+
+## QUANT-CT-MXFP4-CLOSERS: slivers (a)+(b) land BYTE-EXACT + default-ON; correctness gates GREEN, binding re-bench PENDING (2026-08-09, `row/QUANT-CT-MXFP4-CLOSERS`, GB10 sm_121a CUDA 13.0, `~/mxfp4-bench` overlay `1f446fd7`+swap-ON+3 files md5-matched)
+The two #50-arbitrated slivers, both in the SHARED header
+`include/vllm/model_executor/models/dense_nvfp4_gemm.h` (the qwen3_5.cpp twin serving the 27B/35B
+gate models is deliberately untouched): **(a)** `DenseAlignFor` forces `block=8` at M≤8 (:286),
+routing the M=8 dense E1 GEMM to vLLM's 8-row `m_block_size_8` tile instead of the padded 16-row
+tile (recovers the #50-measured ~0.33ms/step / ~0.8pp at c8); **(b)** `DenseMarlinWorkspace` zeroes
+the shared reduction workspace ONCE at alloc and the two per-call `Memset(ws)` are DROPPED — the
+fp32-reduce marlin barrier self-resets its locks (invariant cited: `use_atomic_add=false`
+cuda_moe_marlin.cu:141 ⇒ only the fp32 barrier path is reachable, whose last release zeroes the lock
+marlin_template.h:2170→:204; slice_count==1 never touches locks :2162; the atomic-add non-clearing
+path :614 is dead). GATES (both flock locks, ninja EXIT 0 no -Werror): OP RED-first
+`test_ops_moe_grouped` closers — block8-vs-block16 A/B at M=8 **BYTE-EXACT** (`bitdiff=0/32768
+max_abs=0`) on MXFP4 K=4096/N4096 + K=12288/N4096 AND NVFP4 K=4096/N4096; ws all-zero after a GEMM +
+reuse bit-identical; 15/15·2 cases. LAUNCH-CONFIG `test_qwen3_forward` `DenseAlignFor(d,8).block==8`
+(pre-fix ==16) 7/7. MEMCHECK 0 real errors (leaks = pre-existing static-cache harness artifacts; the
+unchanged prior test leaks MORE). #44 smoke (Yi30/Qwen3-8B-MXFP4, default async graphed, vllm-cli
+greedy vs golden) **3/3 deterministic TOKEN-EXACT** + near-tie coherent. Byte-exact ⇒ DEFAULT-ON
+unconditional (no `VT_*` gate). Blast radius (header consumers Qwen3-8B-MXFP4, Qwen3-32B-NVFP4A16,
+Laguna) closed by proving BOTH quant schemes byte-exact. Binding c1-c8 x3 (clean-checkout grid) + the
+substantive ~0.7ms/step host/sched slice (the #47 residual) remain the parity verdict's open terms.
+Box left clean (both locks free, GPU idle, worker down, disk 21G, tmux gone).

@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-08 -->
+<!-- now-updated: 2026-08-09 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -22,9 +22,9 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13): CPU+CUDA 13/13·656, no OOM. **Token gate NEAR-TIE 106/128** (6/8 token-exact) | device GDN/MLA islands + bf16 stream; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| MXFP4 parity (Qwen3-8B) | c1 0.990/TTFT parity/mem 2.6x WIN; c2-c8 0.92-0.94 post-GQA-swap (#49). Dense-marlin port arbitrated **NO-GO** (#50: 4-run ubench, +7-9% was cross-tool bias; only real sliver = c8 block-16 padding ~0.33ms) | Closers: c8 block=8 tweak (~5 lines) + ws-memset drop + the ~0.7ms/step host/sched slice |
+| MXFP4 parity (Qwen3-8B) | c1 0.990/mem 2.6x WIN; c2-c8 0.92-0.94 (#49). **Closers LANDED byte-exact default-ON (`QUANT-CT-MXFP4-CLOSERS`): dense M≤8 8-row Marlin tile + per-call ws re-zero dropped; block8≡block16 bitdiff=0, memcheck clean, #44 smoke 3/3** | Binding grid + host nsys pending |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
-| MXFP4 parity goal | swap-ON binding **still <1.0x** (best c8 0.942); residual grouped-Marlin +7-9% + ~0.7ms host/sched | NEXT: grouped→dense-direct-A marlin decode |
+| MXFP4 parity goal | swap-ON binding <1.0x (best c8 0.942); closers byte-exact default-ON; residual = ~0.7ms host/sched (substantive) + grouped-Marlin +7-9% | NEXT: binding x3 verdict + host nsys |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

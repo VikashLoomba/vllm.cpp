@@ -459,5 +459,28 @@ class DuplicateLiveIdTests(unittest.TestCase):
         )
 
 
+class GateWiringTests(unittest.TestCase):
+    def test_preflight_runs_the_audit_suite(self):
+        # The INVOCATION, not the substring. `audit-live-rows.py` also appears
+        # in the explanatory comment above the gate, so asserting the bare name
+        # stays green with the `run` line DELETED -- a test that passes with its
+        # subject removed, guarding the one thing this task exists to install.
+        text = (ROOT / "scripts/agent-preflight.sh").read_text(encoding="utf-8")
+        self.assertIn("test_audit_live_rows", text)
+        self.assertIn(
+            'run "audit-live-rows" python3 scripts/audit-live-rows.py --check', text
+        )
+
+    def test_ci_runs_the_gate_and_its_suite(self):
+        text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("scripts/audit-live-rows.py --check", text)
+        self.assertIn("tests/scripts/test_audit_live_rows.py", text)
+
+    def test_shipped_record_has_no_abandoned_active_row(self):
+        records = audit.audit()
+        stale = [r["id"] for r in records if r["verdict"] == "ABANDONED"]
+        self.assertEqual(stale, [], f"stale ACTIVE rows remain: {stale}")
+
+
 if __name__ == "__main__":
     unittest.main()

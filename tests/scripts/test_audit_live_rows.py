@@ -213,5 +213,46 @@ class ClassifierTests(unittest.TestCase):
             self.assertIn(verdict, audit.VERDICTS)
 
 
+class PartialGapTests(unittest.TestCase):
+    def test_explicit_gap_language_is_recognised(self):
+        for text in [
+            "Works for bf16; fp8 is missing",
+            "Prefill only, decode not yet ported",
+            "Dense path supported, MoE unsupported",
+            "Image works; audio pending",
+        ]:
+            self.assertTrue(audit.names_missing_modes(text), text)
+
+    def test_row_without_gap_language_is_flagged(self):
+        self.assertFalse(audit.names_missing_modes("Ported and gated on GB10"))
+
+    def test_detection_is_case_insensitive(self):
+        self.assertTrue(audit.names_missing_modes("FP8 IS MISSING"))
+
+    def test_markers_match_whole_words_not_substrings(self):
+        # "commonly" contains "only" and "node" contains "no". A substring
+        # match would mark these rows explicit and hide them from review.
+        self.assertFalse(audit.names_missing_modes("Commonly used decode node"))
+        # Both halves need their marker pinned as live, or the assertFalse
+        # above passes for the wrong reason: dropping "no" from GAP_MARKERS
+        # entirely also stops "node" matching, and nothing would notice.
+        self.assertTrue(audit.names_missing_modes("Decode only"))
+        self.assertTrue(audit.names_missing_modes("No fp8 path"))
+
+    def test_flag_is_advisory_and_never_gates(self):
+        # check mode fails only on abandoned ACTIVE rows, never on a vague
+        # PARTIAL row -- the detector is a keyword heuristic.
+        self.assertNotIn("PARTIAL", audit.CHECK_FAILS_ON)
+
+    def test_check_fails_on_active_and_nothing_else(self):
+        # assertNotIn above passes for frozenset() -- a check mode that fails
+        # on NOTHING -- and even for the bare string "ACTIVE", since "PARTIAL"
+        # is not a substring of it. Neither is what "report-only" means: the
+        # flag must be excluded from a set that still gates something. Pin the
+        # membership exactly, and pin that the gated state is a real live one.
+        self.assertEqual(audit.CHECK_FAILS_ON, frozenset({"ACTIVE"}))
+        self.assertTrue(audit.CHECK_FAILS_ON <= audit.LIVE_STATES)
+
+
 if __name__ == "__main__":
     unittest.main()

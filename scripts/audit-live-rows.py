@@ -174,5 +174,38 @@ def classify_active(
     return "ABANDONED", "no branch, no commit on main mentioning the row ID"
 
 
+GAP_MARKERS = (
+    "missing",
+    "not yet",
+    "unsupported",
+    "pending",
+    "only",
+    "absent",
+    "gap",
+    "no",
+    "without",
+    "blocked",
+    "todo",
+)
+
+# Whole words, never substrings: "only" must not match "commonly" and "no"
+# must not match "node". A substring match would silently mark a vague row as
+# explicit, which is the exact failure this flag exists to catch.
+GAP_RE = re.compile(
+    r"\b(?:" + "|".join(marker.replace(" ", r"\s+") for marker in GAP_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
+
+# check mode fails on abandoned ACTIVE rows and nothing else. The PARTIAL flag
+# is a keyword heuristic for human review; gating on it would be the fragile
+# checker the protocol warns against.
+CHECK_FAILS_ON = frozenset({"ACTIVE"})
+
+
+def names_missing_modes(row_text: str) -> bool:
+    """True when a PARTIAL row states what is NOT supported."""
+    return GAP_RE.search(row_text) is not None
+
+
 if __name__ == "__main__":
     raise SystemExit("CLI arrives in P0 step 4; import this module for now")

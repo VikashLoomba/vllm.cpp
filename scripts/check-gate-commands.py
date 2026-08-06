@@ -11,8 +11,14 @@ rows cannot state a runnable command today, so a gate demanding one would be red
 on arrival and would have to be relaxed to pass. A relaxed gate is worse than no
 gate.
 
+The ratchet is the second half, wired only AFTER the debt was recorded
+(.agents/specs/gate-command-audit-2026-08-06.md), so it ships green and never had
+to be relaxed to pass. It pins the SET of rows carrying a runnable command, which
+may grow and may never silently shrink.
+
     scripts/check-gate-commands.py            # report
     scripts/check-gate-commands.py --json     # machine-readable
+    scripts/check-gate-commands.py --check    # gate: no row may lose its command
 """
 
 from __future__ import annotations
@@ -165,12 +171,99 @@ def audit() -> list[dict]:
     return records
 
 
+# Shrink-only, like STATUS_RATCHET in check-public-doc-tables.py -- but a SET of
+# row IDs, not a count. A count cannot tell "this row lost its gate command" from
+# "this row left the population", and the population moves: 3 rows moved
+# mid-branch while the classifier above was being written, which is why the total
+# (97) was deliberately never pinned. Pinning a count would go red on a legitimate
+# record edit, and the natural "fix" is to lower the number, which is the gate
+# erasing its own finding.
+#
+# This is a FLOOR, not a certificate: four of these credits are weak (two MLX
+# `pip install` lines, `git diff --check`, and TOOLS-STREAMING-PARSER resting
+# solely on `git diff --stat`, which exits 0 unconditionally in a repo). They are
+# pinned anyway -- see .agents/specs/gate-command-audit-2026-08-06.md risk 3. A
+# ratchet that waits for a clean baseline never starts.
+#
+# Raising it is ordinary work: transcribe a row's existing evidence into an
+# invocation and the set grows. Lowering it requires naming the row and the
+# reason, in the same change.
+RUNNABLE_BASELINE = frozenset({
+    "ATTN-CHUNKED-LOCAL",
+    "ATTN-ROPE-FAMILY",
+    "BACKEND-CUDA-ARCH-ADDITIVITY",
+    "BACKEND-METAL-MLX",
+    "BACKEND-VULKAN",
+    "ENG-ASYNC-SCHED",
+    "ENG-CORE-BUSY-LOOP",
+    "ENG-EXPERT-STREAM",
+    "ENG-PRIORITY-SCHED",
+    "KERNEL-GEMM-CPU-ELEM",
+    "KV-CHUNKED-LOCAL-SPEC",
+    "KV-SLIDING-LOCAL-SPECS",
+    "KV-SLIDING-WINDOW-SPEC",
+    "LOAD-SAFETENSORS-DIRECT-DENSE",
+    "MODEL-FACTORY-registry",
+    "MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm",
+    "MODEL-TEXT-gemma4-gemma4-for-causal-lm",
+    "MODEL-TEXT-glm4-glm4-for-causal-lm",
+    "MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm",
+    "QUANT-GGUF-COMPUTE",
+    "QUANT-NVFP4-CT-W4A16",
+    "SERVE-ASYNC-LLM",
+    "SERVE-HTTP-TRANSPORT",
+    "SERVE-STREAM-USAGE",
+    "TOOLS-STREAMING-PARSER",
+})
+
+
+def ratchet_errors(records: list[dict]) -> list[str]:
+    """A row may not silently lose its gate command.
+
+    Leaving the gated population is legitimate; losing the command is not. So
+    only IDs still PRESENT and still gated can be a regression -- anything else
+    is a record edit that must re-pin the baseline in the same change.
+
+    The two are reported as SEPARATE, differently worded errors on purpose: a
+    single "the count fell" message would make a broken row and a retired row
+    look the same, which is this repo's recorded defect class and the reason
+    the baseline is a set.
+    """
+    runnable = {item["id"] for item in records if item["verdict"] == "runnable"}
+    present = {item["id"] for item in records}
+    lost = sorted((RUNNABLE_BASELINE - runnable) & present)
+    departed = sorted(RUNNABLE_BASELINE - runnable - present)
+    errors = []
+    if lost:
+        errors.append(
+            "these rows still exist and are still gated but no longer name a "
+            f"command that can fail: {', '.join(lost)}. Repair the row, never "
+            "the baseline."
+        )
+    if departed:
+        errors.append(
+            f"these baseline rows left the gated population: {', '.join(departed)}. "
+            "If that is a legitimate record edit, re-pin RUNNABLE_BASELINE in the "
+            "SAME change, naming each row and the reason."
+        )
+    return errors
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Classify gated rows' gate commands.")
     parser.add_argument("--json", action="store_true", help="machine-readable")
+    parser.add_argument("--check", action="store_true", help="fail on a ratchet regression")
     args = parser.parse_args(argv)
 
     records = audit()
+    # BEFORE --json, which returns 0 whatever the record says. If --json won,
+    # `--check --json` would be a gate that cannot fail -- the shape this whole
+    # file exists to detect, wearing this file's own face.
+    if args.check:
+        errors = ratchet_errors(records)
+        for line in errors:
+            print(f"ERROR: {line}", file=sys.stderr)
+        return 1 if errors else 0
     if args.json:
         print(json.dumps(records, indent=2, sort_keys=True))
         return 0

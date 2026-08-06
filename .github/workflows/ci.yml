@@ -88,6 +88,14 @@ jobs:
         run: |
           python3 scripts/check-now-current.py
           python3 tests/scripts/test_check_now_current.py
+      - name: A gated row may never lose a gate command that can FAIL
+        # Shrink-only over the SET of rows whose spec names a runnable command,
+        # not a count: a count cannot tell a row that LOST its command from one
+        # that legitimately left the gated population, and the fix for the
+        # second reads as lowering the number for the first.
+        run: |
+          python3 scripts/check-gate-commands.py --check
+          python3 tests/scripts/test_check_gate_commands.py
       - name: Agent role machinery and role discipline
         run: |
           python3 scripts/check-role-discipline.py

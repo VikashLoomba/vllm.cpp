@@ -252,7 +252,7 @@ Record dates are CI-guarded: state anchors dated in the future are rejected
 (`check-state-order`), so scoreboard stamps trace to real landing dates. The
 review protocol behind these numbers is guarded the same way: the reviewer and
 implementer sub-agent prompts are tracked artifacts checked by
-`check-protocol-consistency` (orchestration harness step 3/5).
+`check-protocol-consistency` (orchestration harness step 4/5).
 
 **Hardware.** NVIDIA GB10 / DGX Spark (sm_121a) for CUDA, `dgx.casa` aarch64 for
 CPU, Apple M4 for Metal. GB10's 119 GiB pool is unified, so host and device

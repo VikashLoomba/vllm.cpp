@@ -253,6 +253,49 @@ class PartialGapTests(unittest.TestCase):
         self.assertEqual(audit.CHECK_FAILS_ON, frozenset({"ACTIVE"}))
         self.assertTrue(audit.CHECK_FAILS_ON <= audit.LIVE_STATES)
 
+    def test_matched_marker_names_the_marker_that_fired(self):
+        # The heuristic under-flags: 11 of the 48 shipped rows it reads as
+        # explicit qualify only via bare "no" or "gap", on prose asserting
+        # GOODNESS rather than absence. Naming the hit is what lets a reviewer
+        # discount those at a glance instead of trusting the verdict.
+        self.assertEqual(
+            audit.matched_marker("Works for bf16; fp8 is missing"), "missing"
+        )
+        self.assertEqual(
+            audit.matched_marker("the mirror build no longer double-resides"), "no"
+        )
+        self.assertEqual(audit.matched_marker("max gap 0.0 nats, 0 divergent"), "gap")
+        # The text AS WRITTEN, not the canonical marker, so the reviewer reads
+        # the row's own words back.
+        self.assertEqual(audit.matched_marker("FP8 IS MISSING"), "MISSING")
+        # No hit is "", never None: a vague row must not be reported through
+        # the same falsy channel as a row whose marker failed to render.
+        self.assertEqual(audit.matched_marker("Ported and gated on GB10"), "")
+
+    def test_a_marker_needing_escaping_is_treated_literally(self):
+        # GAP_MARKERS invites human tuning, and an unescaped marker fails two
+        # ways. "not.yet" compiles to a wildcard that also matches "notXyet",
+        # silently widening the flag...
+        literal = audit.gap_pattern(("not.yet",))
+        self.assertTrue(literal.search("decode not.yet ported"))
+        self.assertIsNone(literal.search("decode notXyet ported"))
+        # ...and "fp4(" raises re.error at IMPORT time, taking the whole
+        # module -- loader, classifier and all -- down with it.
+        audit.gap_pattern(("fp4(",))
+        # Escaping must not cost the multi-word widening: re.escape("not yet")
+        # is "not\\ yet", and that escaped space is what gets widened.
+        self.assertTrue(audit.gap_pattern(("not yet",)).search("decode not  yet"))
+        # The shipped regex must be the one this builder returns. Mutation
+        # testing shows what this does NOT buy: rebuilding GAP_RE inline
+        # WITHOUT re.escape survives, because no shipped marker needs escaping
+        # today, so both spellings compile to the identical pattern. It pins
+        # the marker set and the structure, not the escaping -- and that
+        # unobservability is exactly why gap_pattern takes its markers as an
+        # argument instead of closing over GAP_MARKERS.
+        self.assertEqual(
+            audit.GAP_RE.pattern, audit.gap_pattern(audit.GAP_MARKERS).pattern
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

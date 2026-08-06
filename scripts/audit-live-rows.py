@@ -188,13 +188,30 @@ GAP_MARKERS = (
     "todo",
 )
 
-# Whole words, never substrings: "only" must not match "commonly" and "no"
-# must not match "node". A substring match would silently mark a vague row as
-# explicit, which is the exact failure this flag exists to catch.
-GAP_RE = re.compile(
-    r"\b(?:" + "|".join(marker.replace(" ", r"\s+") for marker in GAP_MARKERS) + r")\b",
-    re.IGNORECASE,
-)
+def gap_pattern(markers: tuple[str, ...]) -> re.Pattern[str]:
+    """Compile markers into a whole-word, case-insensitive alternation.
+
+    Whole words, never substrings: "only" must not match "commonly" and "no"
+    must not match "node". A substring match would silently mark a vague row as
+    explicit, which is the exact failure this flag exists to catch.
+
+    Markers are ESCAPED before interpolation. GAP_MARKERS invites human tuning,
+    and a raw marker fails two ways: "fp4(" raises re.error at IMPORT time and
+    takes this whole module down with it, while "not.yet" compiles silently
+    into a wildcard that also matches "notXyet". re.escape("not yet") is
+    "not\\ yet", so widening that escaped space to \\s+ still works.
+
+    Taking the markers as an argument is what makes the escaping testable: no
+    shipped marker needs escaping today, so an inline expression could drop
+    re.escape with nothing to notice.
+    """
+    alternation = "|".join(
+        re.escape(marker).replace("\\ ", r"\s+") for marker in markers
+    )
+    return re.compile(r"\b(?:" + alternation + r")\b", re.IGNORECASE)
+
+
+GAP_RE = gap_pattern(GAP_MARKERS)
 
 # check mode fails on abandoned ACTIVE rows and nothing else. The PARTIAL flag
 # is a keyword heuristic for human review; gating on it would be the fragile
@@ -205,6 +222,20 @@ CHECK_FAILS_ON = frozenset({"ACTIVE"})
 def names_missing_modes(row_text: str) -> bool:
     """True when a PARTIAL row states what is NOT supported."""
     return GAP_RE.search(row_text) is not None
+
+
+def matched_marker(row_text: str) -> str:
+    """The gap marker that fired, or "" -- so a human can discount a bad hit.
+
+    The heuristic under-flags: 11 of the 48 shipped rows it reads as explicit
+    qualify only via bare `no` or `gap`, on prose asserting GOODNESS rather
+    than absence ("no longer double-resides", "max gap 0.0 nats", "CLOSED the
+    CPU RSS gap"). Naming the marker lets a reviewer dismiss those at a glance
+    instead of trusting the verdict. Over-flagging costs a glance;
+    under-flagging ships a vague public issue.
+    """
+    match = GAP_RE.search(row_text)
+    return match.group(0) if match else ""
 
 
 if __name__ == "__main__":

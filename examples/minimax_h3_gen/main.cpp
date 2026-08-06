@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -165,6 +166,7 @@ int main(int argc, char** argv) {
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   std::string first_frame_path, last_frame_path;
   std::string decode_latent_path;  // diagnostic: decode a dumped VAE-input latent
+  std::string roundtrip_path;      // diagnostic: encode->decode a real image
   std::vector<std::string> ref_image_paths;
   std::string ref_video_prefix, ref_audio_path;
   double imgvid_noise_aug = 1.0;
@@ -190,6 +192,7 @@ int main(int argc, char** argv) {
       else if (f == "--denoise-only") denoise_only = true;
       else if (f == "--dump-params") dump_params = true;
       else if (f == "--decode-latent") decode_latent_path = Need(argc, argv, ++i, f);
+      else if (f == "--roundtrip") roundtrip_path = Need(argc, argv, ++i, f);
       else if (f == "--device") device_name = Need(argc, argv, ++i, f);
       else if (f == "--encoder") encoder_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt") prompt = Need(argc, argv, ++i, f);
@@ -215,11 +218,12 @@ int main(int argc, char** argv) {
     // no VAEs, no conditioning, no output path. Requiring them would make the one
     // tool that works on a checkpoint too large to load unusable on exactly that
     // checkpoint.
-    const bool need_vaes = !denoise_only && !dump_params && decode_latent_path.empty();
-    const bool need_cond = !dump_params && decode_latent_path.empty();
-    // --decode-latent needs NO DiT and NO conditioning (its own block validates its
-    // inputs); the shared check below would otherwise reject the missing --dit.
-    if (decode_latent_path.empty() &&
+    const bool diag_vae_only = !decode_latent_path.empty() || !roundtrip_path.empty();
+    const bool need_vaes = !denoise_only && !dump_params && !diag_vae_only;
+    const bool need_cond = !dump_params && !diag_vae_only;
+    // --decode-latent / --roundtrip need NO DiT and NO conditioning (their own blocks
+    // validate their inputs); the shared check below would otherwise reject --dit.
+    if (!diag_vae_only &&
         (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
          (need_vaes && out_path.empty()) ||
          (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty())))) {
@@ -335,6 +339,69 @@ int main(int argc, char** argv) {
       }
       std::cerr << "decode-latent: wrote " << result.frame_shape.t << " frames to " << workdir
                 << "\n";
+      return 0;
+    }
+
+    // --roundtrip DIAGNOSTIC: encode a real image through the video VAE encoder,
+    // apply post_quant_conv, and decode -- a DiT-independent gold-standard test of
+    // the decoder. A coherent round-trip proves the decoder works and localizes the
+    // render bug to the DiT-produced latent; a grid proves the decoder itself.
+    if (!roundtrip_path.empty()) {
+      if (video_cfg_path.empty() || video_vae_path.empty()) {
+        throw std::runtime_error("--roundtrip needs --video-vae and --video-vae-config");
+      }
+      vllm::MiniMaxH3LatentStats vstats;
+      vllm::MiniMaxH3VideoVaeDecoderConfig vcfg =
+          vllm::ParseMiniMaxH3VideoVaeDecoderConfig(ReadJson(video_cfg_path), &vstats);
+      vllm::SafetensorsFile vfile = vllm::SafetensorsFile::Open(video_vae_path);
+      vllm::MiniMaxH3AudioVaeWeights dec_w = vllm::LoadMiniMaxH3VideoVaeDecoderWeights(vfile);
+      vllm::MiniMaxH3AudioVaeWeights enc_w = vllm::LoadMiniMaxH3VideoVaeEncoderWeights(vfile);
+      int64_t ih = 0, iw = 0;
+      std::vector<float> chw = ReadPpmAsChw(roundtrip_path, &ih, &iw);  // [3,H,W] in [0,1]
+      vllm::MiniMaxH3VideoNormalizePixels(chw, 3, ih * iw);             // -> imagenet space
+      vllm::MiniMaxH3EncoderFcn3dConfig enc_cfg;
+      enc_cfg.z_channels = 2 * vcfg.in_channels;  // moments (mean|logvar)
+      enc_cfg.t = 1; enc_cfg.h = ih; enc_cfg.w = iw;
+      vllm::MiniMaxH3VideoFrameShape ls{};
+      std::vector<float> z = vllm::MiniMaxH3VideoVaeEncodeToLatent(enc_cfg, enc_w, chw, &ls);
+      std::cerr << "roundtrip: encoded [" << vcfg.in_channels << "," << ls.t << "," << ls.h << ","
+                << ls.w << "]\n";
+      const int64_t per = ls.t * ls.h * ls.w;
+      // per-channel stats of the ENCODED latent (the in-distribution reference)
+      { double s2 = 0; for (float v : z) s2 += double(v) * v;
+        std::cerr << "roundtrip: encoded-latent rms=" << std::sqrt(s2 / z.size()) << "\n"; }
+      if (const char* dd = std::getenv("VT_H3_DUMP_DIR")) {
+        std::string p = std::string(dd) + "/encoder_latent.f32";
+        if (std::FILE* fp = std::fopen(p.c_str(), "wb")) {
+          std::fwrite(z.data(), sizeof(float), z.size(), fp); std::fclose(fp);
+          std::cerr << "roundtrip: dumped encoder latent [" << vcfg.in_channels << "," << ls.t
+                    << "," << ls.h << "," << ls.w << "] to " << p << "\n";
+        }
+      }
+      if (dec_w.Has("post_quant_conv.weight")) {
+        z = vllm::MiniMaxH3VideoVaePostQuantConv(dec_w, z, vcfg.in_channels, per);
+      }
+      vllm::MiniMaxH3T2vaResult result;
+      if (device_name == "cuda") {
+        vt::Device dev = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+        vt::Queue vq = vt::GetBackend(dev.type).CreateQueue();
+        const vllm::MiniMaxH3VideoVaeDeviceWeights staged =
+            vllm::StageMiniMaxH3VideoVaeWeights(vq, vcfg, dec_w);
+        result.frames = vllm::MiniMaxH3VideoVaeDecodeTemporalDevice(
+            dev, vcfg, staged, z, ls.t, ls.h, ls.w, 1, &result.frame_shape);
+      } else {
+        result.frames = vllm::MiniMaxH3VideoVaeDecode(vcfg, dec_w, z, ls.t, ls.h, ls.w,
+                                                      &result.frame_shape);
+      }
+      vllm::MiniMaxH3VideoDenormalizePixels(
+          result.frames, result.frame_shape.channels,
+          result.frame_shape.t * result.frame_shape.h * result.frame_shape.w);
+      std::string mkc = "mkdir -p '" + workdir + "'";
+      if (std::system(mkc.c_str()) != 0) throw std::runtime_error("cannot create " + workdir);
+      WriteFile(workdir + "/roundtrip.ppm",
+                vllm::MiniMaxH3WritePpmFrame(result.frames, result.frame_shape, 0));
+      std::cerr << "roundtrip: wrote " << workdir << "/roundtrip.ppm ("
+                << result.frame_shape.w << "x" << result.frame_shape.h << ")\n";
       return 0;
     }
 

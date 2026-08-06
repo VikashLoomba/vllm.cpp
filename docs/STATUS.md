@@ -2221,3 +2221,5 @@ The next consumer run exposed a separate Voxtral portability error: its
 GCC-only `-Wstringop-overflow` suppression is now guarded out of Clang builds,
 where the unknown warning name was itself fatal under `-Werror`. The Go
 `go-m1cpu` folding diagnostics in that run were nonfatal and outside this repo.
+
+**Session onboarding: design accepted** (`.agents/specs/session-onboarding.md`).

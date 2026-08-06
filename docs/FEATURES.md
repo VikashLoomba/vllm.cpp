@@ -91,7 +91,7 @@ architectures. The full per-model state, including which are oracle-blocked, is
 in [STATUS.md](STATUS.md) and `.agents/model-matrix.md`.
 
 The marks above are the accurate ones. The 2026-08-06 live-state audit moved
-3 model rows, plus 1 quantization row that carries no checklist mark
+3 model rows, plus 1 quantization and 1 backend row that carry no checklist mark
 off a stale `ACTIVE` claim to `READY`. For the MODEL rows `check-model-checklist.py`
 then demotes the INTERNAL mark in `.agents/model-matrix.md` from `✅` to `🚧`,
 because `✅` is illegal at `READY`. That is a lifecycle-contract artifact:

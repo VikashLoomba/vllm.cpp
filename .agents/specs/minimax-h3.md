@@ -400,7 +400,7 @@ vLLM-Omni H3 modules at `vllm_omni/diffusion/models/minimax_h3/`; serving in
 | WebSocket `/v1/video/chat/stream`, `/v1/realtime/video` | `api_server.py:1593,1610` | — | **MISSING** (streaming/realtime) |
 | Request schema (prompt, size/w/h, num_frames, fps, seed, steps, refs) | `protocol/videos.py:97-249` | request contract (W7) | **PARTIAL** (core fields; frame-interp/lora/generate_sound absent) |
 | H3 knobs via `extra_params.{task,duration,flow_shift,audio_flow_shift}` | `pipeline:1034,403,1157-1158` | planner reads task/duration/shift | **DONE** |
-| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; vision tower LOADS real `visual.*` + runs; merged→prompt_embeds scatter + DeepStack→device text tower WIRED 1:1 + gated (§8.9); fl2va COHERENT via BOTH the VAE-keyframe AND the encoder vision path; ref2va still grids (residual RE-ATTRIBUTED to the ref2va reference-row assembly, NOT the conditioning) | **PARTIAL** (vision→conditioning scatter DONE §8.9; residual = ref2va reference-row assembly) |
+| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; vision tower LOADS real `visual.*` + runs; merged→prompt_embeds scatter + DeepStack→device text tower WIRED 1:1 + gated (§8.9); fl2va COHERENT via BOTH the VAE-keyframe AND the encoder vision path; ref2va reference-row assembly FIXED + gated (§8.10, the block-dim double-division) — but ref2va still grids, now RE-ATTRIBUTED to the ref2va NVFP4 CHECKPOINT/loader (t2va-zero-assembly grids too), NOT the assembly | **PARTIAL** (vision→conditioning scatter + ref2va assembly DONE; residual = the NVFP4 DiT loader for the ref2va checkpoint, §8.10) |
 | Output: joint video+audio, 24 fps, 32 kHz stereo | `pipeline:106-111,1187` | frames + WAV + MP4 mux (W7) | **DONE** |
 | Scheduler: euler-ancestral rectified flow (single) | `scheduling_...euler_ancestral.py`; `time_request.py:34-61` | `MiniMaxH3EulerEta0Step` / `MiniMaxH3TimeShiftSigmas` | **DONE** |
 | CFG: distilled, no CFG (guidance params accepted+ignored; `cfg_parallel_size==1`) | `pipeline:250,275-276` | no CFG branch | **DONE** (matches) |
@@ -774,3 +774,73 @@ the un-pinned target rows on them), NOT the prompt_embeds and NOT the DiT forwar
 dump the ref2va target-row VAE-input latent adjacency-cosine (like #77 did for the coherent fl2va,
 0.95) to confirm the target rows are white, and A/B the reference-row condition-noise vs a clean
 anchor.
+
+## 8.10 REF2VA ASSEMBLY — a real assembly bug FIXED + gated, and the grid RE-ATTRIBUTED to the CHECKPOINT (2026-08-07, `row/H3-REF2VA-ASSEMBLY` PR #93)
+
+Took §8.9's residual (the ref2va reference-row assembly) at face value, diffed the whole assembly
+against upstream on CPU, found + fixed a real bug, extended the permanent gate, then re-rendered on
+real weights — and the render **DISPROVED §8.9's attribution**: the grid is NOT the assembly.
+
+**The real assembly bug FOUND + FIXED (suspect #1, `MiniMaxH3EncodeReferenceImages`).**
+`MiniMaxH3EncodeReferenceImages` (`minimax_h3_pipeline.cpp:162`) and `MiniMaxH3EncodeReferenceVideo`
+(`:83`) populated the `MiniMaxH3RefBlock` with **PATCHED** dims (`ls.h / patch_size_h`), but
+`BuildMiniMaxH3PackedSequenceRef2va` (`minimax_h3_packing.cpp:453`) divides `block.latent_h / kPatchH`
+**again** — it mirrors upstream `minimax_h3_packed_sequence_ref2va_blocks` (`packed_sequence.py:328-330`),
+which takes the **UNPATCHED** latent and divides by `_PATCH_H` once (upstream feeds it the raw latent:
+`pipeline_minimax_h3.py:1141-1145` sets `visual_shape = (1, height//16, width//16)`, and the target
+`latent_h = height//16` is fed to the same builder). The double-division under-allocated the reference
+span by `patch_h*patch_w` (=4): the layout claimed **1/4** the reference rows the VAE encode produced,
+and the denoise loop's `keyframe_cond_rows.size() >= …` check is a `>=`, so the oversized encoded
+reference was **silently truncated to its first quarter** — no throw, a coherence-mangling layout bug.
+Fix: emit the RAW `ls.{t,h,w}` in both encode functions (byte-for-byte upstream's `visual_shape`). The
+other three suspects were CLEARED by the same read: the per-token timesteps mirror `denoise_loop.py:109-118`
+exactly (pinned refs at `max(t_v,0.999)` / `max(t_a,1.0)` — `minimax_h3.cpp:843-854`); the packed layout,
+position grid and token tags are byte-exact vs upstream (gated below); the #77 output bookkeeping is
+correct (upstream `video_rows[update_mask]` == our trailing-target slice, refs front-loaded).
+
+**Permanent gates (the recurring blind-spot class closed).**
+1. `scripts/gen-minimax-h3-goldens.py` grew **section 5c**: a REF2VA-shaped DiT-forward rung built from
+   the upstream `minimax_h3_packed_sequence_ref2va_blocks` (an image reference + a video+audio reference
+   prepended to the target) at 8×8 spatial geometry, forwarded through `RefDiT` with the ref2va per-token
+   timestep partition (target `t_v`/`t_a`, pinned visual refs at 0.999, pinned audio refs at 1.0) and its
+   audio update mask. The C++ case `test_minimax_h3.cpp :: "DiT-forward REF2VA rung matches upstream
+   (reference rows, mixing)"` rebuilds it with `BuildMiniMaxH3PackedSequenceRef2va` and gates the layout,
+   host+device video/audio logits (≤2e-5), the reference-row output masking, and the target-row
+   spatial-mixing probe (mix_fraction 1.0). No prior DiT-forward gate ever forwarded a ref2va layout —
+   the §8.9 blind spot. Needed a 1-line RefDiT extension (honor `audio_update_mask`, mirroring
+   `minimax_h3_transformer.py:1099-1101`; our port already did). Goldens regen is purely additive (635
+   inserts, 0 deletes — no drift).
+2. A RED-first **encoded-vs-layout row-count invariant** in the ref2va image + video subcases: after
+   `MiniMaxH3EncodeReferenceImages`, `ref_visual_rows * video_row_width == ref_rows.size()`. With the bug
+   reintroduced it fails `128 == 512` (16 encoded rows vs 4 allocated — the exact 4× patch double-count);
+   restored → green. Nothing else in the suite couples encoded rows to layout rows (the section-2 layout
+   gate hand-builds unpatched blocks; the denoise round-trip only checks finiteness/motion). Suite
+   **69/69, 52377 assertions** (CPU), the fix RED→GREEN proven.
+
+**GB10 render A/B + isolation (2026-08-07, dgx sm_121a, 256×256/22f/12steps, fixed binary).**
+- **ref2va, fp4-resident** (`--ref-image` + `--cond-image` + `--partition ref2va`): still a multicolour
+  patch grid. `~/h3fp4/out_vs_ref2va.mp4`.
+- **ref2va, bf16** (same, NVFP4→bf16 dequant, no `--fp4-resident`): **also grids** → fp4 is NOT the cause.
+  `~/h3fp4/out_bf16_ref2va.mp4`.
+- **t2va with ZERO reference assembly** (ref2va NVFP4, bf16, `--partition fl2va` to bypass the guard, no
+  refs, no cond-image, plain text prompt): **still grids** → the reference-row assembly is NOT the cause;
+  the grid appears with the entire assembly removed. `~/h3fp4/out_t2va_nvfp4.mp4`.
+- **fl2va control** (FL2VA GGUF `--dequant-bf16` + keyframe + `--cond-image`): **COHERENT** — frame 0 a
+  photorealistic orange cat matching the keyframe, frame 21 the cat on a windowsill in warm sunlight
+  (evolved toward the prompt). No regression from the fix. `~/h3fp4/out_vs_fl2va.mp4`.
+
+**RE-ATTRIBUTION (corrects §8.9 and §8.6).** The grid is **NOT the ref2va reference-row assembly** and
+**NOT fp4**. It correlates 1:1 with the **ref2va NVFP4 checkpoint** (`minimax_h3_ref2va_nvfp4_full`):
+EVERY render that loads it grids (t2va #74, ref2va-fp4, ref2va-bf16, t2va-zero-assembly), while EVERY
+render that loads the FL2VA GGUF is coherent (t2va #77, fl2va #90, fl2va here). §8.9's A/B varied only the
+prompt and §8.6's only the task — neither ever varied the checkpoint or the quant, so both misattributed
+a checkpoint/loader defect (to "assembly" and to "wrong partition"). The DiT MATH, the ref2va assembly
+math, and the vision scatter are now all gate-proven correct vs upstream; the real residual is the
+**NVFP4 DiT LOADER for this checkpoint** (`StreamMiniMaxH3Nvfp4ToDeviceBf16/Fp4`, `minimax_h3_nvfp4*`) —
+suspect the fp32-island preservation (patch/time/output layers, `minimax_h3_transformer.py:898-904`),
+the `weight_scale_2` double-dequant, or the tensor-name mapping for this specific 1051-tensor file. The
+synthetic-NVFP4 gates (§8.4/§8.6) proved the dequant MATH byte-exact but never loaded THIS file end to
+end against a coherent oracle. Next: a REF2VA GGUF (bf16, known-good loader) as the checkpoint oracle —
+if ref2va-on-REF2VA-GGUF is coherent, the NVFP4 loader for this file is the bug; else the checkpoint
+itself. The REF2VA GGUF download is dgx-disk-blocked (23 GiB free, 100% full; large dirs belong to other
+campaigns — not prunable).

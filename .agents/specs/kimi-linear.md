@@ -978,9 +978,10 @@ The §15/§16 STRICT residual (c) — "vLLM processes the PROMPT with the CHUNKE
 kernel, we still run the RECURRENT form; a different reduction order coin-flips the p7
 near-tie" — is here scoped, grounded, and DE-RISKED to the point of mechanical execution.
 This section is the **AOT regen recipe + pinned-config record** the mission asks for.
-The authored Triton harness bodies are STAGED in
-[`.agents/specs/kda-chunk-aot/`](kda-chunk-aot/) (CI-safe: the drift check globs
-`triton_kernels/*.py` non-recursively, so a staged sibling directory does not gate).
+The authored Triton harness bodies were STAGED in `.agents/specs/kda-chunk-aot/`
+during this Phase-1 spike (CI-safe: the drift check globs `triton_kernels/*.py`
+non-recursively, so the staged sibling directory did not gate); **Phase-2 (§18, #111)
+MOVED them into `triton_kernels/`** (the staged copy is retired — see §18 "AOT regen").
 **Phase-2** moves them into `triton_kernels/`, adds the declarations below to
 `cmake/TritonAOTKernels.cmake`, regenerates the sm_121a cubins
 (`scripts/regen-triton-aot.sh`), wires the `vt::KdaChunkPrefill` op, and runs the gates.
@@ -1214,6 +1215,66 @@ lever, coupled. The `chunk_kda` kernels + the op are the reusable, GB10-validate
 remaining brick is the persistent-state decode wiring + the paged NoPE-MLA (§16 residual d). The
 chunk-every-step measurement PROVES the recompute vehicle cannot host the chunk lever — it must be
 paged-incremental.
+
+---
+
+## 19. PAGED-INCREMENTAL DECODE IMPLEMENTED + CPU byte-exact state-carry gated; GB10 Gate A/B + speed re-measure OWED (2026-08-07, `row/KIMI-PAGED-INCREMENTAL`)
+
+<!-- state: 2026-08-07 -->
+
+The §18 named real lever (e) — paged-incremental decode — is now IMPLEMENTED as the additive
+device path `KimiLinearModel::ForwardPrefillIncremental` + `ForwardDecodeStepIncremental`
+(`kimi_linear_device.cpp`) over a persistent `KimiDecodeCache` (`kimi_linear.h`). It replaces the
+O(n²) recompute vehicle (`ForwardDeviceCompute` re-runs [0..prompt+t] every step — the 4.24 tok/s
+rate) with vLLM's decode regime: PREFILL the prompt ONCE, then advance ONE token per step from the
+CARRIED state.
+
+### The state-carry wiring (file:line, `src/vllm/model_executor/models/kimi_linear_device.cpp`)
+- **`KimiDecodeCache`** (`include/vllm/model_executor/models/kimi_linear.h`): host-resident f32
+  per-layer state (GB10 unified pool: the up/download is a cheap memcpy). Per KDA layer:
+  `conv_q/k/v` short-conv taps [proj*(K-1)] + `recurrent` [nh*hd*hd]. Per NoPE-MLA layer: growing
+  `kv` [T*kvw] + `kpe` [T*qr] latent-KV. Sizes at 48.9B: KDA state 40 MiB + conv 8 MiB + MLA-KV
+  ~2 MiB at T≈36 — inside the §13 budget.
+- **KDA state carry** — `KdaRecurrenceIslandInc`: `vt::KdaGatedDeltaRule`'s `state [1,nh,hd,hd]`
+  is READ-IN (carried, `cs.Copy` from `rec_state`) / final-WRITTEN (`dstate.Download` → `rec_state`).
+  Prefill uses the CHUNK path (`vt::KdaChunkPrefill`, `VT_KIMI_DEVICE_KDA_CHUNK=1`, ht=state) or the
+  recurrence (byte-exact vs `ForwardDeviceCompute`'s device-KDA path); decode always the recurrence
+  (T==1). This IS vLLM's prefill=chunk / decode=recurrent split (`kimi_gdn_linear_attn.py:233-268`).
+- **KDA conv carry** — `ConvSiluInc`: `vt::CausalConv1dFwd` reads the carried taps
+  (`has_initial_state=1`, decode) / captures the final K-1 taps (`cs.Download` → `state`) — the
+  mamba conv-decode carry.
+- **NoPE-MLA KV carry** — `MlaLayerDeviceBf16Inc` appends each token's projected `kv[kvw]`/`kpe[qr]`
+  to the growing cache; `MlaSoftmaxIslandInc` runs the SAME f64 causal-softmax over the cache with
+  query at global position `base_pos+t` attending `[0 .. base_pos+t]` (query_len=T, key_len grows).
+- **Body** `DeviceForwardBodyBf16Incremental`: byte-for-byte the `DeviceForwardBodyBf16` residual
+  stream, KDA/MLA layers swapped for their `…Inc` state-carrying forms. `base_pos=0` prefill /
+  `cache.seq_len` decode.
+
+### Why byte-exact vs recompute (the Gate A claim)
+The KDA recurrence is a pure ORDERED fold; splitting it at the prompt boundary and carrying the state
+is exact (step P from a fresh [0..P] run == step 1 from the carried S_P). The short conv carries its
+K-1 tap window (mamba decode, exact). Each cached MLA token's KV is a per-ROW projection independent
+of the batch dimension, and the causal softmax reduces over `s` ascending in the SAME order — so the
+incremental decode-step is byte-identical to a fresh full-recompute at the same numeric config. The
+harness `--incremental` at `VT_KIMI_DEVICE_KDA=1` therefore must reproduce ForwardDeviceCompute's
+tokens (Gate A); Gate B is the same at `VT_KIMI_DEVICE_KDA_CHUNK=1` (vLLM's prompt order — the p7
+suspect finally in the right vehicle).
+
+### Gates
+- **CPU byte-exact state-carry gate GREEN** (the Laguna W6 pattern): `test_kimi_linear_forward`
+  **15/15·875** (was 14/14·825) — NEW case (l) `paged-incremental: decode == full-recompute`: the
+  prefill-once + carried decode-step logits are byte-identical (Close 1e-5) to a fresh full-sequence
+  prefill of the growing sequence at each step, with identical greedy tokens (50 assertions). Both
+  paths run the same `vt::KdaGatedDeltaRule` / `vt::CausalConv1dFwd` / f64 softmax, so the gate is a
+  pure WIRING proof (any divergence = a state-carry/cache-append bug). Clean CPU build, no regressions.
+- **GB10 Gate A / Gate B / memory audit / speed re-measure — OWED** (this session): `kimi-linear-gen
+  --incremental` (recurrence vs chunk-prefill) vs `ForwardDeviceCompute` at `DEVICE_KDA=1` (token
+  identity), vs the §12 STRICT golden (128-gate), + the §17.5.3 speed ladder (ours-incremental steady
+  tok/s + TTFT vs vLLM ~21). Default flip only on STRICT + ≥ vLLM speed (parity-enablers).
+
+### Default
+`--incremental` is opt-in (harness flag); `VT_KIMI_DEVICE_KDA`/`_CHUNK` STAY OFF (122/128 ≠ STRICT).
+Row STAYS `ACTIVE` until GB10 Gate B (STRICT) + the speed win land.
 
 ---
 

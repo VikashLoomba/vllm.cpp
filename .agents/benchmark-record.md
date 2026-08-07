@@ -19,6 +19,22 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## KIMI-PAGED-INCREMENTAL — paged-incremental decode LANDS the 5× speed win (4.23→18.9 tok/s, 0.20×→0.90× vLLM); Gate A token-identical to recompute; STRICT NOT reached (p7 intrinsic near-tie, 122/128); decode is 90% cuBLAS-GEMV-parity (2026-08-07, `row/KIMI-PAGED-INCREMENTAL`, base `origin/main` `68b394bc`, commit `f9ba4a9c`, GB10 sm_121a, PR #113)
+
+Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 18-21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy` (md5 `bfa5bdbf…`). vLLM ~21 stands from #111 (re-run only ours). The §18 lever (e) built: prefill-once (KDA recurrent+conv state carried, NoPE-MLA latent-KV cached) + recurrent decode-step; mirrors vLLM `kimi_gdn_linear_attn._forward` (prefill=`chunk_kda_with_fused_gate` / decode=`fused_recurrent_kda`) at `vllm-src` `a4e3cb4`.
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1`) | /128 | tok/s (steady) | first-step | note |
+|---|---|---|---|---|---|
+| recompute (O(n²)) | (recompute vehicle) | **122** | 4.23 | 0.498s | reproduces #111/§15/§16 EXACTLY (p0-p6 16/16, p7 10/16) |
+| incremental + recurrence-prefill | `--incremental` | 120 | 16.63 | 0.640s | p0-p6 16/16; p7 flips 10→8/16 (GPU near-tie) |
+| **incremental + chunk-prefill** | `--incremental DEVICE_KDA_CHUNK=1` | **122** | **18.87 / 19.03** | 0.54-0.62s | **token-IDENTICAL to recompute (p7 `got` byte-exact)** |
+
+- **SPEED (headline).** Paged-incremental (chunk-prefill) = **18.9-19.0 tok/s steady** (2 runs) vs the O(n²) recompute **4.23** = **4.5×**; **0.90× of vLLM ~21** (the #111 16-tok AGGREGATE floor) — the MEASURED 5× decode gap (0.20×, #111) is CLOSED to ~1.1×. It runs the projections/MoE for 1 token/step (decode) instead of [0..prompt+t].
+- **Gate A (token identity) — PASS for chunk-prefill.** `incremental+chunk-prefill` byte-token-identical to `recompute` across ALL 128 tokens (p7 `got` string `276,6315,7275,382,2512,2470,387,658,18705,58084,824,2234,397,73874,2366,16626` exact-equal). Recurrence-prefill matches on p0-p6 (112 tokens) and flips ONLY the p7 near-tie (10→8/16) — GPU projection-GEMM M-dimension tiling (M=P prefill / M=1 decode → different cuBLAS kernel) perturbing the single documented near-tie, the §14/§16 coin-flip class; NOT a wiring bug (CPU gate byte-exact, `test_kimi_linear_forward` 15/15·875).
+- **Gate B (STRICT) — NOT reached, 122/128.** Chunk-prefill (vLLM's PROMPT order) in the RIGHT vehicle reproduces recompute's 122/128 EXACTLY — does NOT close p7. HONESTLY REFUTES the #111 "p7 suspect in the right vehicle → STRICT" hypothesis: p7 is INTRINSIC (§13/§14 — f32-accurate forward vs the golden's deterministic bf16 top-1 at a comma; golden pos-6 `11`, ours `387`), not a chunked-vs-recurrent artifact.
+- **DECODE DECOMPOSITION (nsys `cuda_gpu_kern_sum`, OUR decode, 99 steps, same-tool).** ~90% = `internal::gemvx::kernel<bf16,float,float>` 71.2% (57,144 inst) + cutlass bf16 WMMA GEMM 14.2%+1.1% + more gemvx — the SAME cuBLAS batch-1 GEMV symbol vLLM calls (cuBLAS-parity, [[laguna-gap-is-gpu-compute-not-host]]). CastBf16 3.0%, KdaScanKernel 2.3% (1,980 inst = decode=recurrent ✓), MoE glue (router+silu+combine) 2.3%, convs 0.7%; chunk kernels 20 inst = PREFILL only (prefill=chunk / decode=recurrent IN VIVO). **Killing O(n²) ALONE reaches parity-class; no single lever is load-bearing beyond it** — the residual is ~15% host-orchestration idle + 3% CastBf16 (a bf16 residual stream, the one lever that is ALSO the p7-STRICT lever), NOT a missing grouped-MoE kernel. **vLLM-live-nsys at util 0.82 NOT run** — a MEASURED box-safety violation (vLLM reserves 95-98 GiB + nsys ~2 GiB → min-avail below the 15 GiB LIFE-CRITICAL floor; #111's un-traced 0.82 already at 15 GiB).
+- **Default.** `--incremental` opt-in; `VT_KIMI_DEVICE_KDA`/`_CHUNK` STAY OFF (122/128 ≠ STRICT, K=3-deterministic golden). The paged-incremental path is the validated 4.5× speed lever, opt-in until STRICT lands.
+
 ## KIMI-CHUNK-KDA-P2 — chunk_kda prefill op lands + GB10-validated (unit 4.68e-5), but chunk-EVERY-STEP in the O(n²) recompute island REGRESSES 122→102/128 (worse than the recurrence's 122); vLLM ~5× faster on decode; the real lever is paged-incremental decode (2026-08-07, `row/KIMI-CHUNK-KDA-P2`, base `origin/main` `5548a731`, GB10 sm_121a, PR #111)
 
 Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy`; the vLLM arm SEQUENTIAL after ours at the §12 recipe (util 0.82, triton MoE, eager, seqs=1; min-avail 15 GiB, no reboot):
@@ -14862,3 +14878,162 @@ host conversion peak **0.0195 MiB** (one norm — the projections never touch a 
 buffer), total host+device peak **51.95 GiB** on the 122 GiB UNIFIED pool. The
 streamer's counters confirm the path ran: `layers=50 tensors=400 direct=350
 converted=200 fused=100`.
+## 2026-08-06 — CPU grouped keep-quant GEMM was f32-ONLY: the `b4f5610a` CPU P0, root-caused and fixed
+
+`CLAIM-QUANT-GGUF-CIQ-GROUPED-DTYPE`, row `QUANT-GGUF-CIQ-GEMM`, base `main`
+`1e4d159b`, worktree `/home/mudler/_git/vllmcpp-ciq-grouped`, branch
+`row/QUANT-GGUF-CIQ-GEMM-grouped-act-dtype`.
+
+**NO PERFORMANCE NUMBER IS CLAIMED OR OWED HERE.** This is a correctness repair
+on the CPU reference tier: it restores output that was garbage, and it does not
+change the arithmetic of any path that was already correct (f32 activations are
+byte-untouched — asserted, not assumed). Per developer instruction the work was
+**CPU-ONLY**: no GPU regression suite, no SACRED set, no CUDA test and no CUDA
+benchmark was run, so nothing on the GPU axis is measured or re-confirmed here.
+
+### The symptom and the bisect (both pre-established, re-verified here)
+
+On a **CPU-only Release** build, `tests/parity/test_qwen36_gguf_engine.cpp` with
+`Qwen3.6-35B-A3B-APEX-Compact.gguf` produced 16/16 tokens that were ALL token id
+0 (`"!!!!!!!!!!!!!!!!"`) against the golden `{11751, 11, 9338, 13, …}`. Prompt
+tokenization was correct and the engine reported `finished`, so the loader and
+the scheduler were never implicated; the doctest SIGSEGV at `:145` is a
+second-order effect on the following prompt. First bad commit by bisect:
+**`b4f5610a`** "perf(qwen3_5): A3 W3b — keep-quant grouped MoE", range
+`88dcba77` (good) .. `4a62c43f` (bad), 712 commits, both endpoints gate-confirmed.
+`VT_ASYNC_SCHED=0` reproduces the byte-identical all-zero stream, so async
+scheduling was already ruled out.
+
+### Root cause — `src/vt/cpu/cpu_quant_gemm.cpp:228-235` (pre-fix line numbers)
+
+`MatmulBTQuantGroupedKernel`, the kCPU provider of `OpId::kMatmulBTQuantGrouped`,
+built its per-pair row views like this:
+
+```
+Tensor a_row = Tensor::Contiguous(
+    static_cast<float*>(act.data) + (bcast ? 0 : p) * act.stride[0],
+    DType::kF32, act.device, {1, K});          // <-- f32 ASSUMED, twice
+Tensor o_row = Tensor::Contiguous(
+    static_cast<float*>(out.data) + p * N, out.dtype, out.device, {1, N});
+```
+
+Two independent f32 assumptions, in one expression each:
+
+1. **Addressing.** `act.stride[0]` is in ELEMENTS, so `float* + p*stride` walks
+   `4` bytes per element. For a bf16/f16 activation the row pitch is `2` bytes,
+   so every row `p>0` was read from `2*p*K` bytes past where it lives — off the
+   end of the buffer at the last pairs. Same bug on the output base pointer for a
+   bf16 output.
+2. **Decoding.** The row was *declared* `DType::kF32`, so `LoadActF32`
+   (`cpu_quant_gemm.cpp:41`) read 4 bytes per element out of a 2-byte-per-element
+   buffer — two adjacent bf16 lanes reinterpreted as one f32. Even row `p==0`,
+   whose address is correct, decodes to garbage.
+
+**Why it survived review and CI.** The op's own contract is wider than the
+provider: `vt::MatmulBTQuantGrouped` validates `IsFloat(act.dtype) &&
+IsOutFloat(out.dtype)` (`src/vt/ops.cpp:220-221`), i.e. it ACCEPTS f32/f16/bf16
+in and f32/bf16 out, and the CUDA provider honours all three
+(`cuda_quant_dot.cu:1868-1871`, the `ActDT` switch). But every caller and every
+test that existed passed **f32**: `deepseek_v4.cpp:560` `GemmGroupedExpertsKq`,
+`laguna.cpp:985` `LqGemmGrouped`, `merged_gemm.cpp:45-47`, and all four grouped
+cases in `tests/vllm/models/test_deepseek_v4_gguf_load.cpp:571-715`. `b4f5610a`'s
+`KqGrouped` (`qwen3_5.cpp:4370`, `DBuf da(d, DType::kBF16, …)`) was the FIRST
+non-f32 caller in the tree. It was gated on CUDA, where the provider is correct,
+so the commit's "GATED BYTE-EXACT … grouped(=1) vs per-expert(=0) BYTE-IDENTICAL"
+claim was true *and* CUDA-only, and no CPU gate covered the new dtype at all.
+
+**A second, latent defect in the same function.** The hand-built weight slice
+started from `Tensor w{}` and never copied `weight.repacked` /
+`weight.q8_0_aligned`. That is exactly the CIQ-G7 failure mode recorded on
+2026-07-23 (`state.md`: "`ResidentWeight`/`MakeTensor` built the CPU forward's
+weight `vt::Tensor` WITHOUT propagating `OwnedTensor.repacked`, so the kernel
+read repacked bytes as plain q8_0 → all-zero tokens"), and it is why
+`Tensor::Slice` was made to throw on a repacked weight — a defence this call site
+sidesteps by constructing the slice by hand. It is latent rather than active for
+APEX-Compact (no q8_0 experts) but live for any repacked-q8_0 tower on an i8mm
+host, so it is fixed in the same change.
+
+### The fix
+
+`src/vt/cpu/cpu_quant_gemm.cpp:220-268`. Both row bases are advanced as
+`uint8_t*` by `SizeOf(act.dtype)` / `SizeOf(out.dtype)`, the activation row view
+carries `act.dtype` instead of a hardcoded `kF32`, and `repacked` /
+`q8_0_aligned` are propagated onto the per-expert slice. No change to the f32
+path's arithmetic: `SizeOf(kF32)==4` reproduces the old pointer walk exactly, and
+`kMoeGateUpSwiGLUGrouped` (which composes this kernel) inherits the fix.
+
+### RED → GREEN, unit tier (x86-64, CPU-only Release, no model, no GPU)
+
+Two NEW cases in `tests/vt/test_ops_quant_dot.cpp`, over all 12 weight encodings
+in `kWeightCases`: grouped-over-the-stacked-tower must be BIT-IDENTICAL to
+`vt::MatmulBTQuant` on the per-expert row-slice, (a) for every activation dtype
+the op accepts, (b) for a bf16 output.
+
+| Arm | `test_ops_quant_dot -tc="grouped keep-quant*"` |
+|---|---|
+| pre-fix | 2 cases FAILED, 33/88 assertions failed — f16 and bf16 fail on all 12 encodings; **f32 passes on all 12** |
+| post-fix | 2 cases passed, **88/88** assertions |
+
+The f32/non-f32 split is the diagnosis stated as a measurement: nothing but the
+activation dtype changes between a passing and a failing arm.
+
+Whole-file and neighbours, post-fix, same build:
+`test_ops_quant_dot` **21/21 cases, 150224/150224**; `test_deepseek_v4_gguf_load`
+(the f32 grouped + `MergedGemm` descriptor cases) **15/15, 931/931**;
+`test_ops_quant_repack` **5/5, 110/110**. So the f32 callers are byte-untouched.
+
+### e2e, CPU-only Release on dgx.casa (aarch64 GB10), one `flock /tmp/gpu` hold
+
+`cmake -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF` in
+`/home/mudler/_git/vllmcpp-ciqgrouped`, then `tests/test_qwen36_gguf_engine -s`
+over both APEX files. GPU-host discipline: the build and both 17 GB/25 GB model
+runs ran SERIALLY inside a single flock hold, never concurrently — the box
+hard-reset earlier the same day under stacked heavy jobs.
+
+Same source tree, same `b/` build dir; arms A and B are the SAME binary and
+differ only by the env guard, and arm C differs from them by exactly ONE
+recompiled TU (`cpu_quant_gemm.cpp` swapped to its pre-fix content, 1 TU +
+relink) so nothing else in the binary moved.
+
+| Arm | `cpu_quant_gemm.cpp` | `VT_QWEN35_GROUPED_MOE` | Result |
+|---|---|---|---|
+| A | FIXED | unset (default = grouped ON) | **2/2 cases, 28/28 assertions, SUCCESS** on APEX-Compact AND APEX-Balanced |
+| B | FIXED | `0` (per-expert loop) | **2/2 cases, 28/28 assertions, SUCCESS**, byte-identical continuations to A |
+| C | PRE-FIX | unset (default = grouped ON) | **FAILURE**: `got == {0 × 16}` vs golden `{11751, 11, 9338, 13, …}`, then SIGSEGV |
+
+Arm A/B continuations, both files, both prompts, identical:
+`eiffel` → `" Paris, France. It is one of the most famous landmarks in the world and"`;
+`count` → `" 9, 10, 11, 12, "`. So the grouped path is not merely non-crashing —
+it is byte-equal to the per-expert reference in the same binary, which is the
+byte-exactness claim `b4f5610a` made on CUDA now also held on CPU.
+
+Arm C is the reported P0 reproduced exactly, including its second-order effect:
+`continuation="!!!!!!!!!!!!!!!!"`, `prompt_token_ids` CORRECT (so not a
+tokenizer fault), `out.finished` true, `got.size()==16`, and then `FATAL ERROR:
+test case CRASHED: SIGSEGV` at `test_qwen36_gguf_engine.cpp:145` on the
+following test case. `Asynchronous scheduling is enabled
+(max_concurrent_batches=2)` in every arm, so async scheduling is neither the
+cause nor part of the fix.
+
+Arm C is also the proof that the CPU grouped path is genuinely LIVE and
+load-bearing on this workload: if `test_qwen36_gguf_engine` did not route
+through `kMatmulBTQuantGrouped` on CPU, swapping that one kernel back could not
+have turned a 28/28 pass into token-0 garbage.
+
+Build (arm A): 343 CXX TUs, `-Werror` clean, 1:05 wall at `-j10`, 845 MB peak
+RSS, no compiler cache. Timings, for the record only: arm A 48 s for both files
+(cold-ish page cache), arm B 19 s (warm).
+
+### What this does NOT establish
+
+- **No GPU regression was run** (SACRED set, CUDA tests, CUDA benchmarks) — the
+  developer prohibited it for this session. The CUDA provider is untouched by
+  this change and the only edited TU is a CPU-only one, but that is an argument,
+  not a measurement.
+- No throughput/latency/memory number on any axis, CPU or GPU.
+- The **APEX-Balanced 2nd-case all-zeros** noted in `b4f5610a`'s message is a
+  SEPARATE, pre-A3 issue (tasks #50/#65) on the CUDA path; nothing here addresses
+  or re-measures it.
+- The class of defect — an op whose validation accepts N dtypes while one
+  provider implements 1 — is fixed at this call site only. A tree-wide sweep of
+  "provider narrower than its op contract" is NOT done and is worth a row.

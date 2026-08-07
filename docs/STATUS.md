@@ -36,7 +36,8 @@ Startup-latency axis (2026-08-07): `MEASURED / provisional`. Cold launch to firs
 6 legs contended, uncontended repeat died with a host reboot.
 [Detail](../.agents/specs/startup-latency-axis.md).
 
-Orchestration prompts (2026-08-06): tracked pair; 25 gate rows exact-pinned, step 5/5.
+Protocol (2026-08-07): PR disposition — verified-good PRs MERGE in-session, superseded
+CLOSE with a reason; prompt pair tracked, 25 gate rows exact-pinned.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
@@ -74,7 +75,7 @@ token-for-token correctness against the pinned oracle.
 | DeepSeek-V2 MLA | Correctness-complete, speed-pending | Token-exact 8/8 (DeepSeek-V2-Lite); 0.86-0.95x output rate, TTFT faster at c4/c8. A2+A5 MLA norm-rope fold default-ON (`VT_MLA_FUSED_NORM_ROPE`, bit-exact rollback, SACRED 8/8 unchanged; forensics in benchmark-record) — kimi_k3/kimi-linear inherit it |
 | GLM-4 dense (sandwich norms, partial rope) | Correctness-complete, speed-pending | Token-exact 16/16 (GLM-4-9B-0414); first GLM-family model; partial interleaved RoPE + Gemma2 sandwich norms + biased qkv |
 | GLM-4.7-Flash (MLA + GLM MoE) | Correctness-complete, speed-pending | Token-exact 8/8 (GLM-4.7-Flash, 31.2B); reuses the DeepSeek-V2 MLA stack; first e2e coverage of the q_lora query branch + noaux_tc sigmoid router with routed-scaling |
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | KDA op `vt::KdaGatedDeltaRule` GB10 **122/128, 4.24 tok/s** best, NOT STRICT, OFF. chunk_kda prefill LANDED (§18, #111): op unit-correct (4.68e-5) but chunk-every-step REGRESSES 122→102 in the O(n²) vehicle | `test_ops_kda_chunk_prefill` 2/2·4; real lever = paged-incremental decode (chunk-prefill ONCE + recurrent-decode over persistent state) |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **Paged-incremental decode MEASURED GB10 (§19): 18.9 tok/s, 4.5× over recompute, 0.90× vLLM ~21** (gap 0.20×→0.90×); Gate A == recompute (122/128), NOT STRICT (p7 near-tie), OFF | `test_kimi_linear_forward` **15/15·875** (CPU byte-exact); GB10 incr-chunk 122/128 == recompute, 18.87/19.03 tok/s; STRICT owed (p7) |
 | Gemma-3 dense (GeGLU, dual rope, sandwich norms) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-3-1b-it); first Gemma-family model; GeGLU (gelu_pytorch_tanh) + dual per-layer RoPE theta + Gemma-RMSNorm sandwich norms + sqrt(hidden) embed-scale + query_pre_attn_scalar scaling |
 | Gemma-2 dense (attn + final logit soft-cap) | Correctness-complete, speed-pending | Near-tie-band 48/48 (gemma-2-2b-it): 44/48 strict on vLLM's greedy + 4/48 at 0.0-nat ties in vLLM's own logits; proves the attention + final logit soft-cap primitives (attn_logit_softcapping 50 + final 30); the inverse of Gemma-3 (both soft-caps, no QK-norm) |
 | Gemma-1 dense (the original Gemma) | Correctness-complete, speed-pending | STRICT token-exact 48/48 greedy (gemma-2b); two fused norms/layer, head_dim scale, GeGLU + sqrt(hidden) embed-scale, tied lm_head; no soft-cap/QK-norm/sliding. **D1 (2026-07-31): the whole Gemma family (1/2/3/4) folded to the default-ON bf16 merged-QKV descriptor (`MergedQkvEnabled`); re-gated Gemma-2 SACRED 48/48 (global+sliding) + Gemma-4 STRICT 32/32 — its existing gate held** |
@@ -396,6 +397,13 @@ AVX-512 (16 outputs in one ZMM, mr 6) elementwise tiers replace SSE2 when the ru
 them, each in its own ISA-flagged TU. Byte-identical to the portable tier on every tier and dtype:
 widening adds OUTPUT lanes, each output's K reduction stays sequential, and products are
 mul-then-add, never FMA. Speed is indicative only, the x86 box is VOID for timing.
+
+CPU elementwise GEMM, transpose-free `[K,N]` path (2026-08-07): M-blocked `[K,N]` micro-kernels on every
+tier, the `mr` dispatch degated from `[N,K]` only (it forced mr=1 on `[K,N]`, so a 131-row activation
+re-read the whole weight 131 times), and an opt-in load-time `[N,K]` to `[K,N]` repack
+(`VT_CPU_ELEM_KN_REPACK`, CPU-only, default off) so `vt::MatmulBT` can reach that family at all.
+Byte-identical: both orientations accumulate each output over K in strict increasing order, so the
+repack is a layout choice and never a numerical one.
 
 Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Kernels, encoder, CTC greedy, log-mel; ids exact vs HF `ParakeetForCTC` oracle; transcribes ctc-0.6b/1.1b, rnnt-0.6b, tdt-0.6b-v3. No CUDA/aarch64, no speed number.
 
@@ -940,39 +948,11 @@ run; gguf_load 12/12). The CUDA graph stays OPT-IN default OFF (graph 7.92 ≈ e
 
 (2026-08-01 nsys state and Q8_0-GEMV-lever framing superseded by the 2026-08-04 binding parity line; detail in the benchmark record.)
 Row `ACTIVE`; see docs/BENCHMARKS.md.
-**Last-mile campaign — Bricks 0 and 1 (2026-07-30): the keep-quant GEMM roofline profile, then the
-`__dp4a` vectorized-dequant matvec (Q2_K grouped 2.35x, IQ2_XXS flat and grid-serialization-bound).
-Bit-identical; decode 8.01 -> 8.51 tok/s.** Per-brick forensics, profiler tables and the refuted
-framings live in [.agents/benchmark-record.md](../.agents/benchmark-record.md).
-**Last-mile campaign — Brick 1b: IQ2_XXS grid-lookup fix (`__constant__` → GLOBAL) — the flat kernel unblocked,
-+12.5% (2026-07-30, base `f6c34252`, branch `deepseek-v4-last-mile`, commit `e4d8845b`, NOT pushed).** Brick 1's
-finding: IQ2_XXS grouped stayed at ~19% of peak because `d_iq2xxs_grid[256]` is `__constant__` and the 32 warp
-lanes read DIFFERENT indices → divergent constant reads serialize ~32×/warp. FIX: moved `d_iq2xxs_grid` +
-`d_ksigns_iq2xs` to `__device__` GLOBAL (L2-cached, cross-lane parallel; llama.cpp's mmvq does the same).
-BIT-IDENTICAL (same literals): `test_cuda_quant_dot` **2/2·105601 nmse≤1e-6 ZERO drift**; `test_cuda_deepseek_v4`
-18/18; `test_deepseek_v4_gguf_load` 12/12; real model resident-default TOKEN-IDENTICAL "…Paris.". **RESULT:
-IQ2_XXS grouped 2.45× (median 265→108 µs; 19% → 46% of peak — now memory-bound-ish like Q2_K 56% / Q8_0 63%;
-22.8% → 10.0% of step). Decode 8.51 → 9.58 tok/s (+12.5%, 5 stable warm) vs ds4 16.5 (~58% of ds4;
-campaign-cumulative host 6.44 → 9.58 = +49%).** The grouped-MoE dequant lever (Bricks 1+1b) is DONE. NEXT:
-Brick 2 (activation-quant fusion, ~14% launch-bound) → Brick 3 (Q8_0 coalescing, 43% at 63% of peak). STOPPED
-for review. Row `ACTIVE`; see docs/BENCHMARKS.md.
-**Last-mile campaign — Brick 2: routed gate/up activation preq-reuse (broadcast) — bit-exact +4.6% (2026-07-30,
-base `67bb8d1c` after rebase, branch `deepseek-v4-last-mile`, commit `99d2b282`→amended, NOT pushed).** The
-resident-decode routed experts fed `xrep` — topk-identical copies of the shared hidden x — into the gate + up
-grouped GEMMs, re-quantizing an IDENTICAL row per expert (6× redundant) + a per-layer topk `AsyncCopyF`. FIX
-(ds4's preq pattern): the grouped providers (Q8_K + Q8_0) detect a 1-row activation (`act.shape[0]==1 && P>1`) →
-quantize ONE row, kernels read block-set 0 for all p (`bcast`); the resident forward (eager + graph) passes x
-with `act_rows=1`, dropping xrep. BIT-IDENTICAL (identical input → identical block-quant → identical dot):
-`test_cuda_quant_dot` **2/2·105601 nmse≤1e-6**; `test_cuda_deepseek_v4` 18/18·34176; `test_deepseek_v4_gguf_load`
-**13/13·631** (+1 broadcast==replicated BYTE-IDENTICAL + RED-first case); real 80.7 GB model resident-default
-TOKEN-IDENTICAL "…Paris." (ids byte-equal to host `=0`). **RESULT (nsys re-profile, 50 tok): `QuantizeQ8K`
-9.8%→7.3%, `QuantizeQ8_0` 4.5%→4.7% (bucket ~14.3%→~12.0%). Decode 9.58 → 10.02 tok/s (+4.6%, 6 stable warm runs
-9.99–10.04; nvidia-smi 92% util)** (host `=0` 8.47→8.50, MoE host path unchanged) vs ds4 16.5 (~61% of ds4;
-campaign-cumulative host 6.44 → 10.02 = +56%). HONEST: the quant bucket is LAUNCH-bound (fixed per-launch
-overhead dominates → cutting per-launch rows 6→1 barely moves the %); the +4.6% comes mostly from eliminating
-the 6×/layer xrep host-copies. Remaining quant lever = LAUNCH-COUNT reduction (fuse quant into GEMM / dedup
-gate+up). NEXT: Brick 3 (Q8_0 coalescing — now **45%** of step at 63% of peak, the dominant lever). STOPPED for
-review. Rollback `VT_V4_RESIDENT_DECODE=0`. Row `ACTIVE`; see docs/BENCHMARKS.md.
+**Last-mile campaign — Bricks 0 to 2 (2026-07-30): the keep-quant GEMM roofline profile, the `__dp4a`
+vectorized-dequant matvec, the IQ2_XXS grid-lookup fix (`__constant__` to GLOBAL) and routed gate/up
+activation preq-reuse. Every step bit-identical; decode 8.01 -> 10.02 tok/s.** Per-brick forensics,
+profiler tables and the refuted framings live in
+[.agents/benchmark-record.md](../.agents/benchmark-record.md).
 **Last-mile campaign — Brick 3: Q8_0 GEMM vectorized dp4a dot — BIT-EXACT but NEAR-FLAT +0.5% (the Q8_0 matvec is
 at the 34-byte-block MEMORY WALL) (2026-07-30, base `dd6cc93c`, branch `deepseek-v4-last-mile`, commit
 `91e51aea`→amended, NOT pushed).** `QuantDotGemmQ8_0Kernel` (+grouped, ~45% of step at 63% of BW peak) read the 32
@@ -2193,17 +2173,9 @@ _(Laguna NVFP4-Marlin decode-isolated (2026-08-01, `CLAIM-LAGUNA-DECODE-SYNC`, B
 
 _(Laguna decode KV+attention → shared-framework port, bf16-KV slice (2026-08-02, `CLAIM-LAGUNA-KV-ATTN-BF16`, BENCHMARKS): scoped the tractable slice (private f32 KV → **bf16**, vLLM's own paged-KV dtype, halving the memory-bound decode-attn DRAM bytes, inside Laguna's own `DecodeAttnGqa*` kernels — SACRED 27B/35B byte-untouched; full `AttnBlock` port OWED — the shared FA2 pure-decode throws on `window_size` and has no gate epilogue, so it needs per-layer sliding-window + a softplus-head-gate hook grown additively). Built clean on GB10 (7 TUs, 0 warn) + DGX-gated on `laguna-xs-nvfp4` (decode-graph path). **RESULT: WASH + near-tie prefix BREAK — reverted, NOT landed.** Speed: bf16 3.93s vs base 3.84s decode/127 (within noise) — did NOT move the residual (at XS ~130-tok context the KV read is a small share; `lm_head_gemv`+Marlin MoE dominate, confirming the residual is GEMV/MoE not attention). Correctness: bf16 flips the argmax at decode step 2 (268→22345) so it no longer shares vLLM's first-20 prefix — the device regime is not bit-identical to vLLM, so a near-tie flips even moving TOWARD vLLM's dtype. Default stays f32 KV (base golden prefix + ~33 tok/s, re-verified after restore). See `.agents/specs/laguna-kv-attn-port-2026-08-02.md`.)_
 
-**qwen3_5 A3 keep-quant grouped-MoE fold — W1 spike + scaffolding (2026-07-31).** Spike spec `.agents/specs/qwen35-a3-grouped-moe-2026-07-31.md` + additive `MoeBlockWeights.expert_*_kq` stacked fields; applies the landed Laguna W9 grouped pattern to qwen3_5 GGUF, memory-neutral. W2/W3a/W3b all LANDED below.
+**qwen3_5 A3 keep-quant grouped-MoE — LANDED, COMPLETE (2026-07-31).** W2/W3a: keep-quant experts load as one stacked [E*out,in] tower + byte-exact `ExpertMlpKq` slice forward via a ResidentWeight slice (CUDA `needs_weight_staging`=TRUE). W3b: that loop collapses to 3 grouped `vt::MatmulBTQuantGrouped` launches, `VT_QWEN35_GROUPED_MOE` default-ON, sharing Laguna W9's descriptor — DGX APEX-Compact grouped(=1) vs per-expert(=0) byte-identical and strict-passing the golden; APEX-Balanced 2nd-case all-zeros is PRE-EXISTING (tasks #50/#65). **That gate was CUDA-only — see the CPU P0 below.** W1, the down-GEMM bf16-out hazard and two non-landing attempts are superseded; see the record + `.agents/specs/qwen35-a3-grouped-moe-2026-07-31.md`.
 
-**qwen3_5 A3 W3 byte-exactness hazard recorded (2026-07-31).** The grouped down GEMM needs bf16-output byte-exactness with ExpertMlp MatmulBf16 on the STRICT-gated 35B; shared MatmulBTQuantGrouped is f32-out only. Provable-by-construction but A/B-confirm-before-strict; may need a bf16-output grouped-down variant. See spec §W3 hazard.
-
-**qwen3_5 A3 W2/W3a attempts #1-#2 (2026-07-31): both caught by gates, neither landed.** #1: emptying the keep-quant expert_gate vector broke 3 consumers, which must route through the stacked tower together. #2: DGX-gated, device staging ROOT-CAUSED (keep-quant slice must go via ResidentWeight), 1/2 cases golden, CPU 37/37. Nothing broken pushed. See spec §W2/W3a attempt, §attempt #2.
-
-**qwen3_5 A3 W2+W3a LANDED (2026-07-31).** Keep-quant experts load as one stacked [E*out,in] tower + byte-exact ExpertMlpKq slice forward (via ResidentWeight-resident slice — CUDA needs_weight_staging=TRUE). ATTRIBUTED byte-identical to pre-A3: APEX-Compact keep-quant golden-correct + CPU 37/37; the APEX-Balanced 2nd-case all-zeros is PRE-EXISTING (reproduced on pre-A3, tasks #50/#65). Unblocks W3b grouping. See spec.
-
-**qwen3_5 A3 W3b LANDED (2026-07-31) — A3 COMPLETE.** Per-expert keep-quant MoE loop → 3 grouped vt::MatmulBTQuantGrouped launches (VT_QWEN35_GROUPED_MOE default-ON). BYTE-EXACT: DGX APEX-Compact grouped(=1) vs per-expert(=0) continuations byte-identical + strict-passes golden. Shared descriptor with Laguna W9. See spec §W3b.
-
-**Fold-plan A3 tier CLOSED (2026-07-31).** Both keep-quant models (Laguna W9 + qwen3_5 GGUF W2/W3a/W3b) route their routed-expert MoE through the shared vt::MatmulBTQuantGrouped descriptor, byte-exact gated. See .agents/specs/arch-fusion-fold-plan-2026-07-30.md A3.
+**CPU grouped keep-quant GEMM was f32-ONLY — P0 FIXED (`QUANT-GGUF-CIQ-GEMM`, 2026-08-06).** `KqGrouped` (W3b) first passed `vt::MatmulBTQuantGrouped` a **bf16** activation; the CPU provider addressed both row views as `float*` with a hardcoded `kF32` activation row, so bf16/f16 rows were mis-strode and mis-decoded: CPU GGUF 35B decode was all-token-0 from `b4f5610a` on, while CUDA stayed byte-exact (it honours `act.dtype`) Fixed at `src/vt/cpu/cpu_quant_gemm.cpp:220-268`: rows addressed by `SizeOf(act.dtype)`/`SizeOf(out.dtype)`; `repacked`/`q8_0_aligned` now propagate onto the slice (CIQ-G7 mode). Gated per dtype in `tests/vt/test_ops_quant_dot.cpp`.
 
 **Records-only repairs; no capability change.** 2026-07-31: six `DONE` rows re-pointed at closure commits. 2026-08-06 audit: all 10 stale `ACTIVE` rows → `READY`; 11 claims retired, 9 amended. That reconciliation is now a STANDING GATE, wired only after the record was repaired so it never had to be relaxed to pass: `scripts/audit-live-rows.py --check` fails on any `ACTIVE` row with no branch and no commit behind it, and runs in `agent-preflight.sh` and CI with its mutation suite. A red gate means the record drifted, never that the gate is too strict.
 

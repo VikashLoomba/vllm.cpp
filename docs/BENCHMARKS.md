@@ -4,6 +4,7 @@
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
+| **Record repair 2026-08-07** | `main` was red on `check-agent-record` + `check-env-doc`, blocking every PR. Dangling `kda-chunk-aot/` link and two undocumented env vars. No behaviour change |
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
@@ -256,7 +257,8 @@ implementer sub-agent prompts are tracked artifacts checked by
 `check-protocol-consistency` (orchestration harness step 5/5), and
 `check-gate-commands` pins the 25 record rows that name a gate command able to
 FAIL. That pin is exact, not shrink-only: gaining a gate command reddens it too,
-so the set is never re-pinned silently in either direction.
+so the set is never re-pinned silently in either direction. Since 2026-08-07,
+a PR verified green merges in that same session (disposition rule).
 
 **Hardware.** NVIDIA GB10 / DGX Spark (sm_121a) for CUDA, `dgx.casa` aarch64 for
 CPU, Apple M4 for Metal. GB10's 119 GiB pool is unified, so host and device
@@ -297,12 +299,15 @@ built on it rather than keeping the flattering one.
 
 **CPU elementwise GEMM, wide x86 tiers (2026-08-07).** INDICATIVE ONLY, not binding: the x86 dev box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. The AVX-512 tier measures 1.56x to 2.83x over SSE2 on the elementwise micro-kernels, byte-identically. A binding number needs a qualified x86 host, which the project does not have.
 
+**CPU elementwise GEMM, transpose-free `[K,N]` path (2026-08-07).** On dgx aarch64 the `[K,N]` path beats `[N,K]` by 1.16x to 1.30x, byte-identically. The x86 arm is INDICATIVE ONLY, not binding: that box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. `VT_CPU_MATMUL_STEAL` ships default OFF and is NOT measured; it must justify itself by measurement and may measure neutral.
+
 ## Open gaps
 
 | Track | Status | Next gate |
 |---|---|---|
 | 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
+| CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
@@ -311,7 +316,7 @@ built on it rather than keeping the flattering one.
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
 | `/v1/videos` OpenAI (Sora) shape | **No number owed**: a CPU serving-surface change (request aliases, the MP4 content route, and reference conditioning wiring), unit-gated only, no kernel or generation path touched | Video generation speed stays the MiniMax-H3 FP4 row below |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
-| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | KDA op `vt::KdaGatedDeltaRule` GB10 **122/128 + 4.24 tok/s** best, NOT STRICT, OFF; chunk_kda prefill LANDED (§18, #111): unit-correct (4.68e-5) but chunk-every-step REGRESSES 122→102 + 4.08 tok/s | chunk-every-step ≠ vLLM prefill=chunk/decode=recurrent → coin-flips (p3 16→3); vLLM ~21 tok/s (~5×). Real lever = paged-incremental decode (§18) |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | **Paged-incremental decode (§19) MEASURED GB10: 18.9 tok/s** (4.5× over recompute 4.23), Gate A token-identical to recompute (122/128), NOT STRICT (p7 near-tie), OFF | vLLM ~21 tok/s (16-tok aggregate floor); ours-incremental steady **0.90× vLLM**, the MEASURED 5× decode gap (0.20×, #111) closed to ~1.1×; residual = per-step projection GEMVs + host orchestration |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | MiniMax-H3 FP4 speed (W-FP4a) | **Measured GB10 (`row/H3-FP4-GPU-E2E`).** Marlin W4A16 byte-exact vs bf16; fp4 a memory win, 0.8x bf16/forward. Real-ckpt fp4-resident e2e RUNS (mp4/wav) | fp4 speed CLOSED. bf16-vs-quant A/B: ENCODER half MEASURED (§8.15), DiT half NOT (no bf16 render exists). Detail: benchmark-record + spec §8 |
 | MiniMax-H3 render coherence (`row/H3-RENDER-CLOSE` #77) | **CLOSED: a COHERENT scene on GB10.** #70/#74 white was wrong-PARTITION usage (t2va on the ref2va ckpt); t2va on the FL2VA GGUF renders a prompt-matched orange cat (adj-cos 0.95 vs 0.06, no patch-grid) | Verified first: t2va inputs byte-exact vs upstream; CUDA device==host at seq 1920. Follow-up `H3-TASK-PARTITION-GUARD`: the task/partition mismatch now RAISES 1:1 with `_resolve_task` (spec §8.6-8.7) |

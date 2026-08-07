@@ -23,8 +23,10 @@
 // the checkpoint ships a `tokenizer.json` the decoded TEXT is printed too; see
 // the decoder note on `DecodeIds` for exactly which upstream rule that mirrors
 // and why it does not reuse vllm::Tokenizer.
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -237,8 +239,23 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "weights: %zu encoder layers, vocab %lld\n", w.encoder.layers.size(),
                static_cast<long long>(cfg.vocab_size));
 
-  const vllm::multimodal::ParakeetCTCOutput out = vllm::multimodal::ParakeetForCTCForward(
-      feats.input_features, feats.num_frames, feats.valid_frames, w, cfg, cpu);
+  // Optional third argument: repeat the FORWARD only, so the checkpoint load and
+  // the mel front end stay OUT of the timed region. Without it the wall clock is
+  // dominated by reading a multi-GiB safetensors, and a 3 s clip can time SLOWER
+  // than a 10 s one: a loader measurement wearing a model's clothes.
+  const int reps = (argc > 3) ? std::atoi(argv[3]) : 1;
+  vllm::multimodal::ParakeetCTCOutput out;
+  double best_ms = 0.0;
+  for (int r = 0; r < reps; ++r) {
+    const auto t0 = std::chrono::steady_clock::now();
+    out = vllm::multimodal::ParakeetForCTCForward(
+        feats.input_features, feats.num_frames, feats.valid_frames, w, cfg, cpu);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (r == 0 || ms < best_ms) best_ms = ms;
+    std::fprintf(stderr, "forward rep %d: %.1f ms\n", r, ms);
+  }
+  std::fprintf(stderr, "forward best: %.1f ms\n", best_ms);
   std::fprintf(stderr, "encoder: %lld output frames (%lld valid)\n",
                static_cast<long long>(out.num_output_frames),
                static_cast<long long>(out.valid_output_frames));

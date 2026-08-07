@@ -260,12 +260,15 @@ int main(int argc, char** argv) {
     // no VAEs, no conditioning, no output path. Requiring them would make the one
     // tool that works on a checkpoint too large to load unusable on exactly that
     // checkpoint.
+    // --prompt-image runs the vision tower ONLY (from --encoder); it needs no DiT/VAE/out.
+    const bool vision_probe = !prompt_image_path.empty();
     const bool diag_vae_only = !decode_latent_path.empty() || !roundtrip_path.empty();
     const bool need_vaes = !denoise_only && !dump_params && !diag_vae_only;
     const bool need_cond = !dump_params && !diag_vae_only;
-    // --decode-latent / --roundtrip need NO DiT and NO conditioning (their own blocks
-    // validate their inputs); the shared check below would otherwise reject --dit.
-    if (!diag_vae_only &&
+    // --decode-latent / --roundtrip / --prompt-image need NO DiT and NO conditioning
+    // (their own blocks validate their inputs); the shared check below would otherwise
+    // reject --dit.
+    if (!diag_vae_only && !vision_probe &&
         (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
          (need_vaes && out_path.empty()) ||
          (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty())))) {

@@ -1076,6 +1076,16 @@ MiniMaxH3EncoderDeviceWeights StageMiniMaxH3EncoderWeights(
 // MERGED-feature masked_scatter into `inputs_embeds` is the CALLER's job (upstream
 // `_encode` does it on inputs_embeds before the tower runs); this forward consumes
 // the already-scattered stream, exactly like the host reference.
+//
+// A BF16 projection is WIDENED to f32 on the device immediately before its GEMM,
+// into a scratch buffer reused across layers. That is not a precision choice —
+// bf16 -> f32 is EXACT — it is what makes the unquantized (bf16 safetensors) arm
+// runnable at all: the activations here are f32 and `vt::MatmulBT` rejects a mixed
+// (f32 activation, bf16 weight) pair, while staging the tower as f32 would double
+// a 48.8 GiB residency to 97.5 GiB on a 122 GiB UNIFIED pool. Widening per layer
+// costs ONE layer's worth of scratch (~2 GiB) and leaves the GEMM inputs
+// bit-identical to what an f32-staged tower would have fed it — so the Q4_K_M and
+// bf16 arms differ in their WEIGHT BYTES and nothing else.
 std::vector<float> MiniMaxH3EncoderTextForwardDevice(
     vt::Queue& queue, const MiniMaxH3EncoderConfig& config,
     const MiniMaxH3EncoderDeviceWeights& weights, const std::vector<float>& inputs_embeds,
@@ -1113,6 +1123,85 @@ multimodal::Qwen3VLVisionConfig MiniMaxH3EncoderVisionConfig();
 // is needed. `cfg.depth` / `cfg.deepstack_visual_indexes.size()` drive the loop.
 multimodal::Qwen3VLVisionWeights LoadQwen3VLVisionFromGguf(
     const GgufFile& file, const multimodal::Qwen3VLVisionConfig& cfg);
+
+// ---------------------------------------------------------------------------
+// H3-Encoder from the ORIGINAL bf16 release — 14 safetensors shards, 63 GB
+// (minimax_h3_encoder_sharded.cpp)
+//
+// WHY: every H3 render so far conditioned on a Q4_K_M encoder, and nobody had
+// measured what that quantization does to the conditioning tensor. Answering it
+// needs the SAME prompt encoded by the unquantized tower, which ships as 14
+// shards — and `--encoder` only ever accepted a GGUF.
+//
+// This is a LOADER, not a second forward: it fills the same `views` map
+// `MiniMaxH3EncoderDeviceWeights` already binds, over bf16 data instead of ggml
+// blocks, and `MiniMaxH3EncoderTextForwardDevice` runs unchanged.
+//
+// The name map is the one already gated for `LoadMiniMaxH3EncoderWeights`:
+// `model.language_model.layers.N.` -> `layers.N.`, with q/k/v and gate/up FUSED
+// by row concatenation ([q|k|v], [gate|up]) because the forward slices them that
+// way. `model.language_model.norm.weight` and `lm_head.weight` are deliberately
+// NOT bound — H3 reads the UNNORMALIZED truncated output.
+// ---------------------------------------------------------------------------
+class MiniMaxH3ShardedCheckpoint;
+
+// The encoder geometry implied by the shard index's SHAPES alone — no payload is
+// read, so this is safe on a checkpoint far larger than RAM and is the answer to
+// "do the GGUF and bf16 arms agree on geometry?" without loading either.
+// `max_layers` truncates the text tower exactly as the GGUF loader's does.
+MiniMaxH3EncoderConfig MiniMaxH3EncoderConfigFromShards(const MiniMaxH3ShardedCheckpoint& ckpt,
+                                                        int64_t max_layers = 0);
+
+// Gather `ids`' embedding rows STRAIGHT out of the mmap'd shard holding
+// `model.language_model.embed_tokens.weight`. The table is [151936, 5120] — 1.6 GB
+// even in bf16 — and a prompt touches a few dozen rows, so nothing is materialized:
+// this is the safetensors twin of MiniMaxH3EncoderEmbedTokens' per-row dequantize.
+// Returns [ids.size(), hidden] f32.
+std::vector<float> MiniMaxH3EncoderEmbedTokensFromShards(const MiniMaxH3ShardedCheckpoint& ckpt,
+                                                         const std::vector<int32_t>& ids);
+
+// "This loader actually RAN" counters. A green suite over a path that silently
+// fell back to the GGUF loader is a failure mode this codebase has hit before, so
+// the streamer is OBSERVABLE and the gate asserts on it. Mirrors
+// MiniMaxH3ShardStreamStats.
+struct MiniMaxH3EncoderShardStreamStats {
+  uint64_t shards_opened = 0;      // shards the checkpoint resolved to
+  uint64_t layers_streamed = 0;    // text-tower layers bound
+  uint64_t tensors_streamed = 0;   // device views produced
+  uint64_t direct_uploads = 0;     // uploaded straight from the mmap, NO host copy
+  uint64_t converted_uploads = 0;  // needed one host dtype conversion first
+  uint64_t fused_groups = 0;       // qkv / gate_up concatenations done ON DEVICE
+  uint64_t bytes_uploaded = 0;     // total device bytes staged
+  uint64_t host_peak_bytes = 0;    // largest host conversion buffer alive at once
+};
+
+inline MiniMaxH3EncoderShardStreamStats& MutableMiniMaxH3EncoderShardStreamStats() {
+  static MiniMaxH3EncoderShardStreamStats s;
+  return s;
+}
+inline MiniMaxH3EncoderShardStreamStats GetMiniMaxH3EncoderShardStreamStats() {
+  return MutableMiniMaxH3EncoderShardStreamStats();
+}
+inline void ResetMiniMaxH3EncoderShardStreamStats() {
+  MutableMiniMaxH3EncoderShardStreamStats() = MiniMaxH3EncoderShardStreamStats{};
+}
+
+// ★ Stream the bf16 tower STRAIGHT ONTO THE DEVICE, one tensor at a time.
+//
+// It MUST stream. The box has 122 GiB of UNIFIED memory (host and device share
+// ONE pool) and a previous non-streaming H3 loader was OOM-KILLED at anon-rss
+// 125 GB. Here the projections stay BF16 on the device (~48.8 GiB for the 50
+// layers H3 actually runs, against 97.5 GiB as f32) and are uploaded DIRECTLY out
+// of the read-only mmap — a bf16 shard tensor bound for a bf16 device slot needs
+// no host buffer at all. Only the norms are widened, and those are [5120] each.
+// Each source range goes to MaybeReleaseSourcePages the moment its copy returns.
+//
+// The FUSIONS are done on the DEVICE: one allocation per fused group, with q, k
+// and v uploaded into its row offsets. That keeps the "no host copy" property
+// through the one transform this loader performs.
+MiniMaxH3EncoderDeviceWeights StreamMiniMaxH3EncoderShardsToDevice(
+    vt::Queue& queue, const MiniMaxH3ShardedCheckpoint& ckpt, int64_t max_layers = 0,
+    MiniMaxH3EncoderConfig* out_config = nullptr);
 
 // Materialize the H3-Encoder (FL2VA/text_encoder, 14 shards / 1058 tensors) into
 // the name map both encoder forwards read.
@@ -1499,11 +1588,57 @@ std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3ShardedTensors(
 
 // The REFERENCE (non-streaming) multi-shard loader: materialize every tensor as
 // host f32 and bind the forward's views, exactly as LoadMiniMaxH3DitFromNvfp4
-// does for the single-file NVFP4 arm. It is the CPU path for small checkpoints
-// and the comparison baseline a device streamer is gated against; on the REAL
-// 66.3 GB release it would need ~132 GB of host f32 and must NOT be used — that
-// release needs a streaming device loader, which this row does not yet ship.
+// does for the single-file NVFP4 arm. It is the comparison baseline the streamer
+// is gated against and the CPU path for small checkpoints; on the REAL 66.3 GB
+// release it would need ~132 GB of host f32 and must not be used — that is what
+// StreamMiniMaxH3ShardedToDeviceBf16 exists for.
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromShards(const MiniMaxH3ShardedCheckpoint& ckpt);
+
+// ★ Stream the ORIGINAL bf16 DiT from its shards STRAIGHT ONTO THE DEVICE, one
+// tensor at a time — the multi-shard twin of StreamMiniMaxH3Nvfp4ToDeviceBf16.
+//
+// It MUST stream. 66.3 GB cannot be materialized on the host and then staged: the
+// box has 122 GiB of UNIFIED memory (host and device share ONE pool), and the
+// non-streaming NVFP4 loader was already OOM-KILLED at anon-rss 125 GB doing
+// exactly that. Peak host anonymous memory here is ONE tensor's conversion buffer
+// (freed before the next), and for the real release it is very nearly ZERO: a
+// BF16-on-disk tensor bound for a bf16 device slot is uploaded DIRECTLY out of
+// the read-only mmap with no host buffer at all, and each source range is
+// released (MaybeReleaseSourcePages) the moment its copy returns, so the page
+// cache does not accumulate against the same pool the weights live in either.
+//
+// The fp32 ISLANDS (see MiniMaxH3IsFp32IslandTensor) stay f32; everything else is
+// staged bf16. `rope.inv_freq` stays HOST-resident on the returned struct.
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
+    vt::Queue& queue, const MiniMaxH3ShardedCheckpoint& ckpt,
+    MiniMaxH3DitParams* out_params = nullptr);
+
+// --- "this loader actually RAN" counters -----------------------------------
+// A green suite over a path that silently fell back to another loader is a
+// failure mode this codebase has hit before (a kernel guarded to `num_reqs == 1`
+// shipped never-executing while the suite stayed green), so the streamer is made
+// OBSERVABLE and the gate asserts on it. Mirrors dense_nvfp4_gemm.h's
+// Nvfp4W4A16Stats.
+struct MiniMaxH3ShardStreamStats {
+  uint64_t shards_opened = 0;       // shards the checkpoint resolved to
+  uint64_t tensors_streamed = 0;    // tensors uploaded to the device
+  uint64_t direct_uploads = 0;      // uploaded straight from the mmap, NO host copy
+  uint64_t converted_uploads = 0;   // needed one host dtype conversion first
+  uint64_t host_resident = 0;       // kept on the HOST on purpose (rope.inv_freq)
+  uint64_t bytes_uploaded = 0;      // total device bytes staged
+  uint64_t host_peak_bytes = 0;     // largest host conversion buffer alive at once
+};
+
+inline MiniMaxH3ShardStreamStats& MutableMiniMaxH3ShardStreamStats() {
+  static MiniMaxH3ShardStreamStats s;
+  return s;
+}
+inline MiniMaxH3ShardStreamStats GetMiniMaxH3ShardStreamStats() {
+  return MutableMiniMaxH3ShardStreamStats();
+}
+inline void ResetMiniMaxH3ShardStreamStats() {
+  MutableMiniMaxH3ShardStreamStats() = MiniMaxH3ShardStreamStats{};
+}
 
 MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitParams& params,

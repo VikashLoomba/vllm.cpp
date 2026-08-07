@@ -344,7 +344,7 @@ STATUS_RATCHET = {
     # in an abridged form; the fuller originals already live in
     # .agents/benchmark-record.md, so the duplicates collapsed to their binding
     # result plus a pointer. Nothing was lost, only de-duplicated. Net -1755.
-    "chars": 281700,
+    "chars": 281699,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

@@ -576,6 +576,11 @@ add_library(vllm STATIC
   # vLLM does not register one either (parakeet.py is a component of
   # nano_nemotron_vl.py, and it delegates the encoder itself to transformers).
   src/vllm/model_executor/models/parakeet_encoder.cpp
+  # The RNN-T / TDT transducer heads over that encoder (row P5). Upstream after
+  # all: transformers `main` implements ParakeetRNNTDecoder / ParakeetForRNNT /
+  # ParakeetForTDT, which the P4 spike wrongly recorded as absent because it
+  # measured the LOCALLY INSTALLED 5.3.0. Corrected in the spike.
+  src/vllm/model_executor/models/parakeet_transducer.cpp
   src/vllm/model_executor/models/parakeet_weights.cpp
   src/vllm/multimodal/parakeet_audio_processor.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp

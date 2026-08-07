@@ -39949,3 +39949,113 @@ branch point by running the checkers' pure functions over the base files):
 `check-public-doc-tables` (docs/BENCHMARKS.md:316 is a 371-char cell owned by
 another row, and docs/STATUS.md was already 645 chars over its ratchet). This
 change NET-SHRINKS docs/STATUS.md and .agents/NOW.md rather than growing either.
+
+## 2026-08-07: Parakeet P6: the RNN-T and TDT transducer heads land on CPU, and the "no upstream" record is CORRECTED
+<!-- state: 2026-08-07T18:00 -->
+
+Row `MODEL-AUDIO-PARAKEET-TRANSDUCER` (NEW), claim
+`CLAIM-PARAKEET-MODEL-P4`, worktree `/home/mudler/_git/vllm.cpp-parakeet`,
+branch `row/MODEL-AUDIO-PARAKEET-ENCODER`, work item P6 of the spike
+[parakeet-conformer-encoder](specs/parakeet-conformer-encoder.md). CPU only,
+additive.
+
+**The correction first, because it is the reason this row exists.** P4 recorded,
+in the spike, in `include/vllm/model_executor/models/parakeet_encoder.h`, in
+`model-matrix.md` and in the parity ledger, that the RNN-T / TDT transducer had
+"NO upstream in either vLLM or HF transformers" and was therefore a PRODUCT call
+rather than mirror work. The grep behind that was run against the transformers
+INSTALLED on the box, 5.3.0, which ships only `ParakeetForCTC`. It is false of
+upstream: transformers `main` implements the whole stack -
+`ParakeetRNNTDecoder:831`, `ParakeetRNNTJointNetwork:879`, `ParakeetForRNNT:922`,
+`ParakeetTDTJointNetwork:1035`, `ParakeetForTDT:1052` in `modeling_parakeet.py`,
+plus `ParakeetRNNTDecoderCache:23`, `ParakeetRNNTGenerationMixin:125` and
+`ParakeetTDTGenerationMixin:271` in `generation_parakeet.py` and
+`ParakeetRNNTConfig:136` / `ParakeetTDTConfig:188` in
+`configuration_parakeet.py`. The transducer was never a product call; it was
+mirror work behind a stale version check. **Method rule this earns: a grep
+against the installed package is not evidence about upstream. State the version
+you measured, and check `main` before recording anything as unmirrored.**
+
+**What landed.** `include/vllm/model_executor/models/parakeet_transducer.h` +
+`src/vllm/model_executor/models/parakeet_transducer.cpp`: the LSTM prediction
+network (embedding -> stacked `nn.LSTM` cell with BOTH torch bias vectors ->
+decoder projector) carrying `ParakeetRNNTDecoderCache`'s blank fast path, where a
+blank input returns the cached output and advances neither the hidden nor the
+cell state; the joint `head(relu(encoder_projected + decoder))`, widened by
+`len(durations)` for TDT; and the greedy transducer loop with the RNN-T
+`max_symbols_per_step` forced advance, the TDT duration-driven frame skip and its
+blank-with-zero-duration guard, the clamped encoder gather, and the
+`max_symbols_per_step * frames` output bound. The transducer half of
+`src/vllm/model_executor/models/parakeet_weights.cpp` loads
+`encoder_projector.*`, `decoder.embedding.*`, `decoder.lstm.{weight,bias}_{ih,hh}_l*`,
+`decoder.decoder_projector.*` and `joint.head.*`, reusing the P4 encoder key map
+through a new shared `LoadEncoder` helper.
+
+**Gates, all CPU x86-64 `-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`.**
+`tests/vllm/models/test_parakeet_transducer.cpp`, 3 cases / 777 assertions:
+the LSTM cell against an INDEPENDENT in-test scalar reference (gates sliced out
+first, then the recurrence: a different loop structure and accumulation order
+from the port's fused row walk) over 5 shapes x bias/no-bias x 6 sequential
+steps; decoder and joint tensors rel-L2 <= 1.2e-7 against a dumped HF oracle over
+a fixed token walk chosen to drive the blank fast path; and **the emitted
+sequence and the per-step durations EXACT** for both `ParakeetForRNNT` and
+`ParakeetForTDT`, from the oracle's own projected encoder output AND end to end
+from mel features. The fixture asserts its own branch coverage: blank
+emissions, non-blank emissions, tokens held at one frame, RNN-T forced advances -
+so a regeneration that degenerated to a single branch fails instead of gating
+nothing quietly. The TDT case additionally exercises the `max_length` bound
+(48 steps at `max_symbols_per_step` 3 x 16 encoder frames).
+
+**TRACED, not read (T0).** `ParakeetRNNTDecoderCache` is not a `past_key_values`
+cache, so the base `prepare_inputs_for_generation` slicing rules do not visibly
+apply and the per-step decoder input shape cannot be read off the source with
+confidence. A forward hook over a full `generate()` run records that EVERY
+decoder call took `input_ids` of shape `[1, 1]`. That trace is in the fixture
+manifest and the gate asserts it, because the whole greedy loop rests on it.
+
+**PRETRAINED, and this is the binding claim.** `nvidia/parakeet-rnnt-0.6b` and
+`nvidia/parakeet-tdt-0.6b-v3` were downloaded and run. Our emitted token ids are
+EXACT against a real HF `generate()` run on the LibriSpeech clip
+`1089-134686-0000.wav`, both through the reference's own `input_features` and end
+to end through our own WAV reader and log-mel front end. Transcripts:
+CTC/RNN-T (vocab 1025) "he hoped there would be stew for dinner turnips and
+carrots and bruised potatoes and fat mutton pieces to be ladled out in thick
+peppered flour fattened sauce"; TDT-v3 (vocab 8193, punctuation and casing)
+"He hoped there would be stew for dinner, turnips and carrots and bruised
+potatoes, and fat mutton pieces to be ladled out in thick, peppered, flour
+fattened sauce." `nvidia/parakeet-ctc-1.1b` was also verified on the EXISTING P4
+loader with no code change (identical architecture at 42 encoder layers instead
+of 24), producing the same transcript as ctc-0.6b; it was deleted immediately
+after, since the box is shared and was at 98% disk.
+
+**`examples/parakeet_transcribe`** now dispatches on `model_type` in config.json
+(`parakeet_ctc` / `parakeet_rnnt` / `parakeet_tdt`), drives the extractor from the
+checkpoint's own `num_mel_bins` (80 on CTC/RNN-T, 128 on tdt-0.6b-v3) and prints
+DECODED TEXT as well as ids, implementing the `Metaspace` decoder rule directly
+rather than weakening `Tokenizer::FromHfJson`'s deliberate `split: true` refusal,
+which is an encode-side guard this example never needs.
+
+**Checkpoint reach, recorded in the spike.** The HF-safetensors models are in
+(ctc-0.6b, ctc-1.1b, rnnt-0.6b, rnnt-1.1b by construction, tdt-0.6b-v3). The
+`.nemo`-only ones are out until converted: `parakeet-tdt-0.6b-v2` and
+`parakeet-tdt-1.1b` are plain TDT and upstream's own
+`src/transformers/models/parakeet/convert_nemo_to_hf.py` covers them, but the
+`tdt_ctc` hybrids lose their aux CTC head (no hybrid HF class; the converter's
+CTC regex does not match `ctc_decoder.decoder_layers.0.*`) and
+`parakeet_realtime_eou_120m-v1` would convert to a SILENTLY WRONG model, because
+`convert_encoder_config` ignores `att_context_size`, `att_context_style`,
+`causal_downsampling`, `conv_context_size` and `conv_norm_type` and
+`ParakeetEncoderConfig` has no field for any of them. We are NOT writing a
+`.nemo` reader: the pickle/zip part is small, but it would also owe an OmegaConf
+YAML parser and a reimplementation of NeMo's `setup_streaming_params()`
+derivation.
+
+**NOT verified.** No GPU path (the three P1-P3 ops still have no CUDA provider
+and no GPU suite was run), no aarch64, and no speed or memory number measured,
+claimed or owed. No mutation run for the transducer sources this session.
+
+**Doc budgets.** `docs/STATUS.md` had ZERO headroom against its 284067-char
+ratchet, so the Parakeet line was TIGHTENED while gaining the RNN-T/TDT coverage
+and two more verified checkpoints; the page NET-SHRINKS to 284063 and the ratchet
+was LOWERED to match. `check-agent-record.py`'s MODEL row count goes 360 -> 361
+because a genuinely new row exists.

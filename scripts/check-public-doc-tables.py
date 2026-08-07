@@ -321,7 +321,12 @@ def features_errors(text: str) -> list[str]:
 # Lowering these numbers as the page is compacted is the gate closing.
 STATUS = ROOT / "docs/STATUS.md"
 STATUS_RATCHET = {
-    "chars": 284067,
+    # 284063 since 2026-08-07: the Parakeet ASR line now covers the RNN-T and TDT
+    # heads and four verified transcripts in FEWER characters than the CTC-only
+    # line it replaces. Lowered to the measured size, per the rule above: this
+    # page may only shrink, so a change that adds coverage pays for it by
+    # tightening the prose rather than by raising the cap.
+    "chars": 284063,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

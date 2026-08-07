@@ -41,7 +41,7 @@ leg whose page cache was not dropped. **No ours-vs-vLLM startup number exists ye
 
 Orchestration prompts (2026-08-06): tracked pair; 25 gate rows exact-pinned, step 5/5.
 
-Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Kernels, encoder, CTC greedy, log-mel; gated vs a HF `ParakeetForCTC` oracle, ids exact; real transcript on `nvidia/parakeet-ctc-0.6b`. No CUDA, no aarch64, no speed number.
+Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Encoder, CTC, RNN-T/TDT, log-mel; ids exact vs HF oracles; transcripts: ctc-0.6b/1.1b, rnnt-0.6b, tdt-0.6b-v3. `.nemo` needs upstream's converter. No CUDA/aarch64/speed.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by

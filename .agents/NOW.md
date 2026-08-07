@@ -26,7 +26,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
-| Parakeet ASR P1-P4 (`CLAIM-PARAKEET-MODEL-P4`) | **LANDED, CPU**: 3 ops + encoder/CTC/mel vs a HF `ParakeetForCTC` oracle, ids exact, 20/20 mutants. No GPU, no ckpt | CUDA providers; real transcript |
+| Parakeet ASR P1-P6 (`CLAIM-PARAKEET-MODEL-P4`) | **LANDED, CPU**: encoder/CTC/mel + **RNN-T/TDT**, ids exact vs HF oracles; 4 ckpts transcribed | CUDA providers |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -44,10 +44,11 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 
 ## Next actions
 
-1. **Parakeet ASR: P1-P4 DONE on CPU.** Three `vt::` ops plus the encoder, CTC
-   greedy, log-mel front end and an HF-safetensors loader. NEXT: CUDA providers,
-   then a pretrained transcript (none downloaded, none claimed; the arm is wired
-   behind `VLLM_PARAKEET_CKPT`). RNN-T/TDT is in neither vLLM nor HF: scope call.
+1. **Parakeet ASR: P1-P6 DONE on CPU**, whole HF-format family (ops, encoder,
+   CTC, log-mel, loader, RNN-T + TDT). Ids token-exact vs HF `generate()`;
+   transcripts on all four HF-format ckpts. The old "no RNN-T/TDT
+   upstream" note was WRONG: it measured transformers 5.3.0, not `main`. NEXT:
+   CUDA providers; `.nemo`-only models need upstream's converter.
 2. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
    speed-pending; bind the default-ON async-serving path against the same oracle
    before attributing the remaining TPOT gap.

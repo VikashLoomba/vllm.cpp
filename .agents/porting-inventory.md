@@ -959,9 +959,24 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     precision; (b) vLLM's 30-second clip splitting (`parakeet.py:253-284`) belongs
     to the Nemotron-VL token budget, not to the ASR model, so the extractor
     processes one clip and a caller that wants the splitting slices first; (c) the
-    RNN-T / TDT transducer is deliberately NOT ported — it has no upstream in
-    either vLLM or HF and is a product call the spike left open, so this row is
-    CTC only.
+    RNN-T / TDT transducer is a SEPARATE row,
+    `MODEL-AUDIO-PARAKEET-TRANSDUCER`, landed 2026-08-07 as spike work item P6.
+
+    **CORRECTION, 2026-08-07.** Sub-deviation (c) used to read "the RNN-T / TDT
+    transducer is deliberately NOT ported: it has no upstream in either vLLM or
+    HF and is a product call the spike left open, so this row is CTC only". That
+    was measured against the transformers INSTALLED on the box, 5.3.0, which
+    ships only `ParakeetForCTC`. Upstream `main` implements the entire transducer
+    stack (`modeling_parakeet.py` `ParakeetRNNTDecoder:831`,
+    `ParakeetRNNTJointNetwork:879`, `ParakeetForRNNT:922`,
+    `ParakeetTDTJointNetwork:1035`, `ParakeetForTDT:1052`, plus the greedy loops
+    at `generation_parakeet.py:125` / `:271`), so it was never a product call and
+    never a deviation: it is mirror work, and it is now ported. The provenance
+    deviation is if anything STRONGER for the transducer than for the encoder:
+    vLLM wraps only the encoder and has no transducer call site at all, so HF is
+    the sole possible source. **Method rule this earns: a grep against the
+    installed package is not evidence about upstream. Record the version you
+    measured, and check `main` before writing "no upstream" into the record.**
 
 ## 10. E2E test suites (T0 deliverable)
 

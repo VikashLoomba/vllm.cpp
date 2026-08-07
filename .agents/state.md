@@ -41093,3 +41093,266 @@ is required") is now IMPLEMENTED as the additive device op `vt::KdaGatedDeltaRul
   (needs a decode/paged-attn op, query_len≠key_len, which `vt::Attention` cannot express; kills O(n²)).
   Each a substantial multi-kernel brick. Row STAYS ACTIVE. Box left clean (build tree/markers removed,
   memory restored to 112 GiB avail, worker restarted --restart=always, golden preserved, no reboot).
+
+## 2026-08-07T13:00 — Kimi-Linear chunk_kda PREFILL AOT port — Phase-1 SPIKE (kernel set + pins + recipe; no gate) (`row/KIMI-CHUNK-KDA-AOT`)
+<!-- state: 2026-08-07T13:00 -->
+The §16 STRICT residual (c) — vLLM runs the PROMPT through the CHUNKED `chunk_kda` kernel while we
+still run the recurrent form (a different reduction order that coin-flips the p7 near-tie) — is now
+SCOPED, GROUNDED and de-risked to mechanical execution. Spec §17 is the AOT regen recipe +
+pinned-config record.
+- **Exact forward-only kernel set** (`chunk_kda_with_fused_gate`→`_fwd`, FLA `kda.py` @ 555967922):
+  5 NEW Triton kernels — `kda_gate_cumsum_fwd_kernel` `:1182`, the two `chunk_kda_scaled_dot_kkt`
+  sub-kernels `:521`/`:627`, `recompute_w_u_fwd_kernel` `:817` (KDA per-K-channel, ≠ GDN `wy_fast.py`),
+  `chunk_gla_fwd_kernel_o` `:1019`; + 1 NEW PIN of an existing .py (`chunk_delta_h.py` with
+  `USE_GK=1,USE_EXP2=1,USE_G=0,Hg=32` — GDN's `gdn_deltah` pin is NOT reusable); + 1 pure REUSE
+  (`solve_tril`→`gdn_tril_h32`, byte-identical sig). Decode STAYS #104 recurrent (vLLM's own split).
+- **Delivered**: 5 harness bodies authored (verbatim FLA ports, AOT-adapted) STAGED in
+  `.agents/specs/kda-chunk-aot/` (CI-safe — drift globs `triton_kernels/*.py` non-recursively); the
+  full `_vllm_triton_aot_declare` recipe (§17.3); the `vt::KdaChunkPrefill` op design (buffer layout,
+  6-launch order, dispatch guard, prefill/decode split, mirrors `cuda_gdn.cu` GdnPrefill); the
+  RED-first gate plan (unit vs #104 recurrent + #173 host refs + FLA-python golden; then 48.9B STRICT).
+- **NOT YET (Phase-2, coupled)**: the harness signatures depend on the op's confirmed buffer dtypes,
+  so regen is premature until the op exists. Phase-2 = move harness → `triton_kernels/`, add the §17.3
+  declarations, regen sm_121a cubins, wire `vt::KdaChunkPrefill`, run RED-first unit + FLA golden +
+  full 48.9B GB10 STRICT gate (`DEVICE_KDA=1` + chunk-prefill) + tok/s/TTFT ladder. Row STAYS ACTIVE.
+- **USER 2026-08-07: the Kimi bar is MEET vLLM SPEED; the §14/§16 "HW-forced-indirect" framing is
+  SUPERSEDED.** vLLM DOES run this on one GB10 (§12 golden used util 0.82, single-seq, eager). The
+  Phase-2 speed ladder MUST add a vLLM arm at that EXACT recipe on the same prompts (SEQUENTIAL after
+  ours, worker parked, drop_caches, PRE-WARM FlashInfer autotune at tiny util first — cold autotune at
+  high util is an OOM-reboot trigger; ONE attempt, record honestly if it OOMs). Recorded in §17.5.
+- No GPU work this session (pure authoring); box untouched, `local-ai-worker` left as-is. No STRICT
+  claimed. Branch `row/KIMI-CHUNK-KDA-AOT` off `origin/main` @ `ea89926f`; DRAFT PR opened.
+## 2026-08-07T13:10 - H3: the ORIGINAL bf16 DiT now STREAMS to the device - one tensor at a time, zero host buffer for the bulk (row/H3-BF16-SHARDED-STREAM, CPU-only)
+<!-- state: 2026-08-07T13:10 -->
+
+`row/H3-BF16-SHARDED-STREAM` (helper; CPU-only, no GPU job, no download), STACKED on
+`row/H3-BF16-SHARDED-DIT`, which landed the multi-shard checkpoint and its host-f32
+reference loader. Split from that row so each PR stays inside the 900-line review cap;
+the seam is checkpoint-vs-device, not an arbitrary cut.
+
+**Why a streamer and not the reference loader.** The reference loader materializes the
+whole DiT as host f32 - ~132 GB on the real release. The box has 122 GiB of UNIFIED
+memory, so host and device draw on ONE pool and "load to host, then stage" holds the
+model TWICE against that budget; the non-streaming NVFP4 loader was already OOM-KILLED
+at anon-rss 125 GB on HALF this size. So the real 66.3 GB release is not loadable at
+all without a streaming path.
+
+**What landed.**
+- `StreamMiniMaxH3ShardedToDeviceBf16(queue, ckpt, out_params)` in
+  `minimax_h3_device.cpp`, beside its GGUF and NVFP4 twins so it reuses
+  `BindStreamedDitViews`. Manifest first (names+shapes, no payload), so the geometry is
+  known and a wrong name map is caught before a byte is allocated; then ONE tensor at a
+  time. A BF16-on-disk tensor bound for a bf16 device slot - essentially the whole
+  66.3 GB - is uploaded DIRECTLY out of the read-only mmap with NO host buffer at all;
+  same for F32 -> f32 island. Only a dtype MISMATCH (BF16 island widened, F32 body
+  rounded, an F16 shard) costs a host buffer, and it is freed before the next tensor.
+  Each source range goes to `MaybeReleaseSourcePages` the moment its copy returns, so
+  the page cache does not accumulate against the pool the weights live in.
+  `rope.inv_freq` stays HOST-resident (`BuildRopeCosSin` runs before any kernel; a
+  device pointer there segfaults on the first forward).
+- `MiniMaxH3ShardStreamStats` (mirroring `Nvfp4W4A16Stats`) makes the path OBSERVABLE:
+  shards opened, tensors streamed, direct vs converted uploads, host-resident count,
+  bytes uploaded, and the largest host conversion buffer alive at once.
+- `examples/minimax_h3_gen`: `--dit <dir> --device cuda` now streams and prints the
+  stats line; `--device cpu` keeps the host reference loader.
+
+**Gates (CPU, `test_minimax_h3` 73/73 cases / 55203 assertions; clean Release build of
+`libvllm.a`, `test_minimax_h3`, `minimax-h3-gen`).** Over a 3-shard synthetic set whose
+dtypes exercise all four (on-disk x device) combinations: every one of the 46 weight
+views is BIT-EXACT (`memcmp == 0`) against `StageMiniMaxH3DitWeights(kBF16)` over the
+same checkpoint, dtypes included (12 fp32 islands), and the two device forwards return
+IDENTICAL logits (video and audio max|diff| both exactly 0.0). The counters are asserted
+on, not just printed - observed `shards=3 tensors=46 direct=37 converted=9 bytes=444504
+host_peak=8192`: BOTH upload paths were taken, every bound view is owned by this
+loader's staging, and `host_peak_bytes` (8192 = one tensor's buffer) is under 1/4 of the
+bytes uploaded, so the peak cannot scale with the model. `rope.inv_freq` asserted
+HOST-resident.
+
+**Honest residuals.** The real 66.3 GB load and its measured peak RSS are UNVERIFIED
+here, as is CUDA `cudaMemcpy` straight from a file-backed mmap (valid pageable-source
+usage, and every copy is followed by a synchronize, but unexercised on device): this row
+ran CPU-only, with no GPU job and no download. NO bf16-vs-quantized RENDER or SPEED
+number is claimed - the quality A/B is now runnable, and has not been run.
+
+Next: the operator runs the real 13-shard bf16 DiT on GB10 and answers the quantization
+quality question.
+Next: the operator runs the real 13-shard bf16 DiT and answers the quantization
+quality question; nothing here claims it.
+
+## 2026-08-07T13:30 - H3: the bf16 TEXT ENCODER (14 shards, 63 GB) LOADS + `--encoder-only`, so the Q4_K_M conditioning question is measurable (row/H3-ENC-BF16-COND-DIFF)
+
+<!-- state: 2026-08-07T13:30 -->
+
+`row/H3-ENC-BF16-COND-DIFF` (helper, branched from `origin/main` `ad231615`, with
+§8.13's `MiniMaxH3ShardedCheckpoint` (landed separately as `row/H3-BF16-SHARDED-DIT` + `row/H3-BF16-SHARDED-STREAM`)
+`1a46ff17` rather than mirrored - the shard index resolver is exactly the piece this
+row needs and duplicating 222 lines of it would drift).
+
+**Why.** §8.13/§8.14 made the full-precision *DiT* loadable, but every H3 render so far -
+including the ones that look competent-but-generic - conditioned on a **Q4_K_M**
+encoder (`enc_q4km.gguf`, 14.6 GB, Qwen3-VL-32B), and the encoder's contribution had
+NEVER been measured. Weak conditioning and quantization-damaged conditioning look
+identical from outside a render: the wuxia prompt asked for shot/reverse-shot
+coverage of a sect exchanging intelligence and produced a good generic portrait.
+This family is quantization-sensitive (ComfyUI PR 15298: the partial split-half RoPE
+produces channel-wise magnitude outliers that corrupt even INT8). The blocker was
+mechanical - `--encoder` took only a GGUF, the unquantized tower ships as 14
+safetensors shards.
+
+**What landed** (full detail: [specs/minimax-h3.md](specs/minimax-h3.md) §8.15).
+`MiniMaxH3EncoderConfigFromShards` (geometry from the index's SHAPES alone, SAME
+recovery rules and SAME non-shape defaults as the GGUF loader, so an A/B cannot be
+comparing two RoPEs), `StreamMiniMaxH3EncoderShardsToDevice` (fills the same
+`MiniMaxH3EncoderDeviceWeights::views` map over bf16; projections uploaded DIRECTLY
+out of the mmap, the `[q|k|v]` and `[gate|up]` fusions done ON DEVICE into offsets of
+one allocation, so even the transform costs no host copy),
+`MiniMaxH3EncoderEmbedTokensFromShards` (per-row gather out of the `[151936, 5120]`
+table), and `--encoder <dir>` + **`--encoder-only`** in `minimax-h3-gen`.
+
+**The memory decision, stated plainly.** The 50 layers H3 actually runs are
+**48.8 GiB in bf16 and 97.5 GiB in f32**, on a 122 GiB UNIFIED pool that has
+OOM-rebooted this box. So the weights stay bf16 and
+`MiniMaxH3EncoderTextForwardDevice` WIDENS each one to f32 immediately before its
+GEMM into a scratch reused across layers (~2 GiB peak): `vt::MatmulBT` requires one
+dtype for both operands and these activations are f32. bf16 -> f32 is EXACT, so this
+is residency, not numerics - and it is GATED as such. `--encoder-only` matters for
+the same reason: the DiT was loaded FIRST in the normal path, so conditioning alone
+used to cost ~96 GiB peak instead of ~49 GiB.
+
+**Gates (CPU, re-run POST-REBASE: `test_minimax_h3` 75/75 cases / 55609 assertions).**
+(1) resolve+fuse+stream over a synthetic 4-shard encoder at the REAL name spellings -
+every fused view `memcmp`-exact against `q ++ k ++ v` and `gate ++ up` for every
+layer, unfused projections byte-exact, separate names GONE, `norm.weight`/`lm_head`/
+vision tower NOT bound, truncation, exact embedding gather + out-of-range throws.
+(2) ★ the loader RAN and is NOT the GGUF path - `MiniMaxH3EncoderShardStreamStats`
+asserted on shards/layers/views/fused-groups/direct-vs-converted uploads, with
+`host_peak_bytes` equal to ONE norm so peak cannot scale with the model, and the
+views are `kBF16`, a dtype the GGUF loader can never produce. (3) ★ widening is
+EXACT - the same checkpoint written BF16 and F32 (bf16-rounded values) streams to
+`kBF16` and `kF32` views respectively and the two full forwards are BIT-IDENTICAL
+(`memcmp == 0`), so the measurement below cannot be confounded by the widening.
+
+**Rebase note.** This row was written off `ad231615` and REBASED onto the landed
+`row/H3-BF16-SHARDED-STREAM` before landing; the gate numbers here are the POST-REBASE
+re-run. Two claims from the pre-rebase write-up no longer apply and are withdrawn: the
+`docs/STATUS.md` ratchet red (284114 vs 284073) was repaired on main in the meantime,
+and the earlier 70/70 count is superseded by the 75/75 recorded above. `origin/main` had ALSO grown
+a vision-conditioning path in the encoder block (`--cond-image`, DeepStack taps) that
+this row's text-only `EncodeH3Prompt` refactor would have silently dropped; the refactor
+is now scoped to `--encoder-only` and main's inline block is kept for the run path, so
+both capabilities survive.
+
+Next: the measurement itself - encode the wuxia prompt with both encoders on the
+Thor GPU and diff the `[tokens, 5120]` conditioning (max|diff|, RMS, relative RMS,
+per-token cosine). Numbers land in the same row.
+
+## 2026-08-07T13:40 - H3 THE NUMBER: Q4_K_M encoder moves the conditioning as much as a ONE-WORD prompt edit, but DIFFUSELY (row/H3-ENC-BF16-COND-DIFF, Thor)
+
+<!-- state: 2026-08-07T13:40 -->
+
+The measurement the loader existed for. Full tables:
+[benchmark-record.md](benchmark-record.md) and
+[specs/minimax-h3.md](specs/minimax-h3.md) §8.15. Build `d1085374` (built and measured as `d1085374`, amended for the row-branch trailer; IDENTICAL tree `dd9283cf`, so the measurement binary IS this commit), Thor sm_110,
+CUDA 13.0.1 container, GPU idle (the LocalAI render had finished; it was never
+touched).
+
+**Controlled the way it has to be.** Same prompt (`wuxia.txt`, 233 tokens), same
+tokenizer, same 50-layer truncation, same `MiniMaxH3EncoderTextForwardDevice`, same
+f32 activations - only the weight bytes differ. Both arms self-report IDENTICAL
+geometry (50 / 5120 / 64 / 8 / 128 / 25600), which is what proves they are the same
+model rather than two checkpoints that merely share a name.
+
+**A CALIBRATION arm, because a cosine means nothing without a yardstick.** The bf16
+encoder also encoded a ONE-WORD edit of the same prompt (`at night` -> `at dawn`,
+also 233 tokens).
+
+| | rel RMS | rel RMS excl. sink | cos mean | cos median | cos min | angle median | angle max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Q4_K_M vs bf16** | **0.03403** | **0.06849** | **0.99745** | 0.99810 | 0.90916 | 3.535° | 24.61° |
+| bf16 one-word edit | 0.01897 | 0.06666 | 0.99769 | 0.99963 | 0.84736 | 1.565° | 32.07° |
+
+max|diff| 154.0 / RMS 0.5045 (quant) vs 31.1 / 0.2812 (edit).
+
+**The read.** (1) NOT a scale change - the Q4 conditioning is uniformly ~1% smaller
+(norm ratio 0.99010) but the best global rescale removes almost none of it
+(0.03403 -> 0.03280), so it is DIRECTIONAL. (2) Its total energy is ON PAR with a
+one-word prompt edit (6.85% vs 6.67% excluding the sink token). (3) The SHAPE is
+opposite: the edit is SPARSE (172/233 tokens above cosine 0.999, median rotation
+0.16°, concentrated on ~6 tokens), quantization is DIFFUSE (232/233 below 0.999,
+median 3.5°, every token). (4) `max|diff|` 154 is the ATTENTION SINK, not
+corruption: token 0 has norm 15,522 vs a 366 mean (42x) and carries 68% of the total
+squared error while its DIRECTION is intact (cosine 0.99962) - ComfyUI PR 15298's
+channel-wise magnitude outliers, concretely.
+
+**Verdict.** Q4_K_M does real, measurable, directional damage, comparable in
+magnitude to editing the prompt, but diffusely - a uniform few-degree rotation of
+every token, which is the signature that blunts fine-grained compositional
+instruction toward a prompt's average semantics. That matches the
+"competent but generic" symptom, so the bf16 encoder is worth a render A/B.
+
+**Explicitly NOT established: that the RENDER changes.** Nothing here measures the
+DiT's sensitivity to a 3.5°-median rotation. The owed follow-up is a
+byte-identical-everything-else render A/B - same DiT, seed and steps, with
+`--prompt-embeds cond_q4km.bin` vs `cond_bf16.bin` (both saved on the box), which is
+exactly what the save/replay seam makes controllable.
+
+**REPRODUCED.** Both arms were re-run from scratch (fresh process, fresh
+checkpoint load) and each produced a BYTE-IDENTICAL file - `cond_q4km.bin` md5
+`a331232096ef1da2628f885950b2fc55`, `cond_bf16.bin` md5
+`9c096b63b9bd07f604daebb2fc090f46` on both runs. Every number above is
+deterministic, not a sample; there is no noise band to argue about.
+
+**Cost, recorded for the next run.** Q4_K_M 40 s / 18.0 GiB peak; bf16 40 s (35 s
+streaming) / 45.41 GiB uploaded / host conversion peak 0.0195 MiB (ONE norm - the
+projections never touch a host buffer) / 51.95 GiB total peak of the 122 GiB unified
+pool. Real-checkpoint streamer counters: `layers=50 tensors=400 direct=350
+converted=200 fused=100`.
+
+Also fixed this session: the streamer uploaded norms from a conversion buffer scoped
+INSIDE its branch, i.e. freed before the Synchronize that guarantees the async
+`cudaMemcpyAsync` landed. Norms are ~20 KB so CUDA would usually stage them and get
+away with it, which is exactly why it could not ship (`d1085374`).
+
+Next: the render A/B, and the same treatment for the bf16 DiT (§8.13's loader is
+already in this branch).
+
+## 2026-08-07 — chunk_kda PREFILL Phase-2: op validated (unit 4.68e-5), chunk-every-step REGRESSES 122→102, real lever pinned (`row/KIMI-CHUNK-KDA-P2`, #111)
+<!-- state: 2026-08-07T13:40 -->
+<!-- anchor: CLAIM-KIMI-CHUNK-KDA-P2 date=2026-08-07 -->
+
+- **Regen (all 6 arches).** The 5 `chunk_kda` harness kernels moved into `triton_kernels/`; 6 §17.3
+  AOT declarations added (`cmake/TritonAOTKernels.cmake` contract + `CMakeLists.txt` `add_triton_kernel`,
+  byte-identical manifest lines). Regenerated sm_121a + all 5 sibling arches (sm_80/86/89/90a/100a) on
+  the GB10 via `scripts/regen-triton-aot.sh -DVLLM_CPP_TRITON_VENDORED_ARCH=<arch>` (Triton 3.6.0 cross-
+  compiles each `cuda:CC:32`). Triton 3.6 rejected the plain-float module globals the Phase-1 harness
+  baked → fixed to `tl.constexpr(...)` (the regen caught it). Reproducibility VERIFIED per arch: only
+  new `kda_*`+MANIFEST change, every GDN cubin byte-identical. `check-triton-aot-drift.sh` GREEN ×6.
+- **Op + wiring.** `vt::KdaChunkPrefill` (OpId `kKdaChunkPrefill`): the 6-launch `_chunk_kda_fwd_with_
+  cumulative_g` order (gate_cumsum → kkt inter+intra → `gdn_tril_h32` REUSE → wu → delta_h → gla_o) in
+  `cuda_gdn.cu`, bf16 casts, chunk_indices/offsets, per-step scratch; takes RAW g1+a_log+dt_bias (gate
+  fused on-device). CPU ref (gate→recurrence), dual-registered. Island `VT_KIMI_DEVICE_KDA_CHUNK`
+  (prefill T>1 → chunk; decode T==1 → recurrence). `cuda_gdn.cu.o` -Werror clean; full CUDA build
+  444/444, disk-safe (18G). CPU build + runner-routing/fusion/model-checklist/protocol GREEN.
+- **Unit gate (RED-first, GB10).** `test_ops_kda_chunk_prefill` 2/2·4: CPU chunk==recurrence bit-exact;
+  CUDA 6-cubin chunk vs recurrence mean_abs **4.68e-5** (correct), wrong-gate (a_log+1.0) **3.38e-3=72×**
+  (teeth). GDN untouched (`test_ops_gdn` 66/66·4242), `test_ops_kda_recurrence` 4/4·8.
+- **Full 48.9B GB10 gate** (single-load/config, flock, drop_caches, min-avail 21 GiB, no reboot, §12
+  golden): control device-KDA **122/128, 4.24 tok/s** EXACT (§15/§16); **+chunk-prefill REGRESSES to
+  102/128, 4.08 tok/s** (p3 16→3, p6 16→11, p7 10→8). Root cause: the island's O(n²) recompute applies
+  chunk EVERY decode step over [0,prompt+t] — NOT vLLM's prefill=chunk/decode=recurrent split — so it
+  coin-flips near-ties the recurrence-every-step (control) doesn't. The recurrence matches vLLM's DECODE
+  (both recurrent for t>0); the chunk only matches vLLM's PREFILL (t=0). §14 razor at the kernel level.
+- **vLLM speed ladder** (§12 recipe, util 0.82, triton MoE, eager, single-seq; a first attempt died on a
+  driver PATH bug — FlashInfer sampling JIT couldn't spawn `ninja`, NOT an OOM, box freed cleanly; fixed
+  + re-ran): vLLM at util 0.82 loaded min-avail **15 GiB, no reboot**; **~21 tok/s median** 16-token
+  aggregate (25.3 cold-discarding p0=0.55; TTFT not isolable — 0.25.0 `RequestOutput.metrics` absent, so
+  the number is prefill-amortized aggregate = a FLOOR on the gap). Ours per lever: recurrence 4.24 tok/s
+  / chunk 4.08 tok/s; first-step 0.547s / 0.522s. **ours/vLLM ≈ 0.20 — vLLM ~5× faster on decode**, the
+  measured O(n²)-recompute vs paged-incremental distance (= the coupled STRICT+speed lever).
+- **Verdict.** NO arm STRICT (chunk 102 < control 122). Per parity-enablers `VT_KIMI_DEVICE_KDA_CHUNK`
+  + `VT_KIMI_DEVICE_KDA` STAY OFF. device-KDA (122, 4.24 tok/s) best. Row STAYS ACTIVE. The op + regen
+  are the validated prefill half of the REAL lever (e) paged-incremental decode: chunk-prefill the
+  prompt ONCE + recurrent-decode over a PERSISTENT KDA state (query_len≠key_len) — kills the O(n²)
+  recompute (the 4.24 tok/s IS the recompute rate), the STRICT lever AND the big speed lever, coupled.
+  chunk-every-step PROVES the recompute vehicle cannot host the chunk lever. Branch `row/KIMI-CHUNK-KDA-P2`
+  off `origin/main` @ `5548a731`; DRAFT PR #111. `local-ai-worker` parked during GPU work, RESTORED at end.

@@ -17,8 +17,8 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **fl2va COHERENT; ref2va grid DIAGNOSED (#95): NO loader bug; bf16 13-shard DiT INDEXES** | residual = community-NVFP4 quant fidelity §8.12; no bf16 render yet |
-| Kimi-Linear-48B (KDA/NoPE-MLA/MoE) | device-KDA **122/128 + 4.24 tok/s** best (§15); device NoPE-MLA `VT_KIMI_DEVICE_MLA` **MEASURED-NEGATIVE 122→109** (§16, #107 — f32-softmax≠FA2, coin-flips). Both OFF ≠STRICT | STRICT owes ACTUAL kernels: chunk_kda + paged FA2 MLA + incremental |
+| MiniMax-H3 lane | **bf16 shards STREAM both towers (DiT + encoder); Q4_K_M enc cond cos 0.9975, 3.5° med, DIFFUSE** | render A/B on saved embeds |
+| Kimi-Linear-48B | device-KDA **122/128, 4.24 tok/s**; chunk op unit-correct (#111) but chunk-every-step REGRESSES 122→102; **vs vLLM MEASURED 0.20x (~21 tok/s)** | paged-incremental: chunk-prefill ONCE + persistent-state decode (STRICT+speed) |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |

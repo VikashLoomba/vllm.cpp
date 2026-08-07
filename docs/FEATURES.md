@@ -119,7 +119,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `Glm4ForCausalLM` | GLM-4-9B-0414 | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `Glm4MoeLiteForCausalLM` | zai-org/GLM-4.7-Flash (31.2B, MLA MoE) | near-tie 8/8 vs vLLM 0.25.0 | pending |
 | `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on |
-| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | e2e runs bf16-resident; KDA device op `vt::KdaGatedDeltaRule` GB10: 106→122/128 + 1.35→4.24 tok/s, not STRICT; `VT_KIMI_DEVICE_MLA` MEASURED-NEGATIVE 122→109 (§16) | default off; STRICT residual = chunk_kda prefill + paged FA2 MLA + incremental (§16) |
+| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | KDA device op `vt::KdaGatedDeltaRule` GB10 122/128 + 4.24 tok/s, not STRICT; chunk_kda prefill LANDED (§18): op unit-correct (4.68e-5) but chunk-every-step REGRESSES 122→102 in the O(n²) vehicle | default off; real lever = paged-incremental decode (chunk-prefill once + recurrent-decode over persistent state) |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
@@ -133,7 +133,7 @@ they sit outside the gated list above.
 |---|---|---|---|
 | Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17x, pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
-| MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 72/72; t2va+fl2va COHERENT; ref2va NVFP4 grid = the community checkpoint's own quant fidelity, NO loader bug (§8.12); loads GGUF + NVFP4, INDEXES the bf16 13-shard release | FP4/Marlin landed; ref2va NVFP4 render blocked on checkpoint quant (needs official modelopt NVFP4), speed pending; no bf16 render yet |
+| MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 75/75; t2va+fl2va COHERENT; ref2va NVFP4 grid = that checkpoint's own quant fidelity (§8.12); GGUF + NVFP4 + bf16 shards (DiT and encoder) all stream; Q4_K_M-vs-bf16 conditioning MEASURED, cos 0.99745 mean | FP4/Marlin landed; ref2va NVFP4 render blocked on checkpoint quant (needs official modelopt NVFP4), speed pending; no bf16 render yet |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
@@ -161,7 +161,7 @@ model architecture is wired.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10; ref2va NVFP4 grid = the community checkpoint's own quant fidelity, NO loader bug (§8.12); DiT loads GGUF or NVFP4, and indexes the bf16 13-shard release | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10; ref2va NVFP4 grid = the community ckpt's own quant fidelity, NO loader bug (§8.12); DiT loads GGUF/NVFP4/bf16-13-shard, encoder loads GGUF or bf16-14-shard | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them
@@ -252,7 +252,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | e2e RUNS (bf16-resident §13); KDA device op `vt::KdaGatedDeltaRule` GB10: 106→122/128 + 4.24 tok/s (3.1×), NOT STRICT, default OFF; `VT_KIMI_DEVICE_MLA` MEASURED-NEGATIVE 122→109 (§16) | p7 near-tie; STRICT residual = chunk_kda prefill + paged FA2 MLA + incremental decode (§16) |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | KDA device op `vt::KdaGatedDeltaRule` GB10 122/128 + 4.24 tok/s (3.1×), NOT STRICT, default OFF; chunk_kda prefill LANDED+MEASURED (§18): unit-correct (4.68e-5) but chunk-every-step REGRESSES 122→102 | real lever = paged-incremental decode (kills O(n²); the STRICT+speed lever) |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |

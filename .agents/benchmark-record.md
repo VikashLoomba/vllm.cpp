@@ -19,6 +19,18 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## KIMI-CHUNK-KDA-P2 — chunk_kda prefill op lands + GB10-validated (unit 4.68e-5), but chunk-EVERY-STEP in the O(n²) recompute island REGRESSES 122→102/128 (worse than the recurrence's 122); vLLM ~5× faster on decode; the real lever is paged-incremental decode (2026-08-07, `row/KIMI-CHUNK-KDA-P2`, base `origin/main` `5548a731`, GB10 sm_121a, PR #111)
+
+Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy`; the vLLM arm SEQUENTIAL after ours at the §12 recipe (util 0.82, triton MoE, eager, seqs=1; min-avail 15 GiB, no reboot):
+
+| config | env | /128 | tok/s | first-step |
+|---|---|---|---|---|
+| control (recurrence, §15) | `DEVICE_COMPUTE=1 DEVICE_KDA=1` | 122 | 4.24 (steady) | 0.547s |
+| + chunk-prefill | `… DEVICE_KDA_CHUNK=1` | **102** | 4.08 (steady) | 0.522s |
+| vLLM (paged incremental) | util 0.82, triton MoE | (golden) | **~21 median** (16-tok aggregate; 25.3 cold-discarded) | TTFT n/a in 0.25.0 |
+
+**ours/vLLM ≈ 0.20 (vLLM ~5× faster on decode)** — a MEASURED distance (supersedes §14's "HW-forced-indirect"; vLLM 0.25.0 `RequestOutput.metrics` per-token times were absent so the vLLM figure is prefill-amortized 16-token aggregate = a FLOOR on the gap). Unit (RED-first, GB10): `test_ops_kda_chunk_prefill` 2/2·4 — chunk-vs-recurrence mean_abs **4.68e-5**, wrong-gate (a_log+1.0) **3.38e-3 = 72×**. GDN untouched (`test_ops_gdn` 66/66·4242, `test_ops_kda_recurrence` 4/4·8). Regen reproducible ×6 arches (only `kda_*`+MANIFEST changed; GDN cubins byte-identical; drift GREEN). **Why the regression:** the op is unit-correct, but the island's O(n²) recompute applies chunk EVERY decode step over the growing sequence — NOT vLLM's prefill=chunk/decode=recurrent split — so it coin-flips more near-ties than the recurrence (the recurrence matches vLLM's DECODE, both recurrent for t>0; the chunk only matches vLLM's PREFILL, t=0). `VT_KIMI_DEVICE_KDA_CHUNK` STAYS OFF; device-KDA (122, OFF) best. The op + regen are the validated prefill half of the REAL lever (e) paged-incremental decode (chunk-prefill ONCE + recurrent-decode over PERSISTENT state; kills the O(n²) — the coupled STRICT+speed lever). The chunk-every-step measurement PROVES the recompute vehicle cannot host the chunk lever.
+
 ## QUANT-CT-MXFP4-FLASH-PTXAS — the ptxas-lineage hypothesis is REFUTED three ways: vLLM's fa2 wheel ships NO sm_12x cubin (only CUDA-13.0 PTX-ISA-9.0 compute_80 PTX, driver-JIT'd on GB10), an "old CUDA 12.x ptxas" cannot even target sm_121a, and a same-params cuModule A/B shows our-PTX and vLLM's-OWN-PTX schedule the c8 decode kernel identically (~144 us) across driver-JIT / ptxas 13.0 / ptxas 13.2 — the +10 us/call engine gap is ENGINE CONTEXT, not flash codegen (2026-08-06, `row/QUANT-CT-MXFP4-FLASH-PTXAS`, base `362a3c99`, GB10 sm_121a, PR #82)
 
 #75 attributed the residual +10 us/call c8 flash gap (ours ~167 vs vLLM ~157) to "vLLM's wheel `ptxas` SASS-scheduling quality (older CUDA 12.x lineage)" and OWED obtaining that ptxas and A/B'ing it. This row did. **The lineage hypothesis dies at the premise, then again at the measurement.**
@@ -14673,3 +14685,95 @@ Full 48.9B GB10 gate vs the §12 STRICT `greedy_ids.npy` (single-load per config
 WHY NEGATIVE (the §14 razor, re-proven). device-KDA WORKS (106→122) because the recurrence is the SAME algorithm as vLLM's decode kernel, only f32-on-bf16 — it MATCHES. But vLLM's MLA prefill uses FA2 (a specific flash tiling/reduction ORDER); `vt::Attention`'s plain f32 online-softmax is the right MATH but a DIFFERENT reduction order, so — exactly like §14's host-precision plateau — it COIN-FLIPS near-ties: it BREAKS p3 16/16→3/16 (got `220,41938,382,1810,…163586,163586` — the same `163586×` degenerate repeat §14's bf16 knobs caused) while p7 stays diverged at 10/16. And it is SLOWER (4.24→3.89): the per-`(t,h)` key/value build copies + the 192-dim pad-V waste add overhead to the O(n²) recompute path. An approximation of vLLM's kernel is not enough — only the ACTUAL kernel matches.
 
 VERDICT: `VT_KIMI_DEVICE_MLA` STAYS OFF, kept as a documented-MEASURED-NEGATIVE A/B knob (parity-lever precedent: §14's `ISLAND_F32ACC`). device-KDA (122/128, 4.24 tok/s) remains the best config, itself default OFF (122 ≠ STRICT). The one-brick STRICT-close did NOT land. STRICT residual, SHARPENED: needs vLLM's ACTUAL kernels, not a device approximation — (c) the **chunk_kda** prefill family (`chunk_kda_scaled_dot_kkt`+`recompute_w_u`+`chunk_gla_fwd_o_gk`+`fused_kda_gate_chunk_cumsum`, FLA `ops/kda.py`) via a Triton-AOT regen for sm_121a (`scripts/regen-triton-aot.sh` + new `triton_kernels/*.py`), the named prime suspect; (d) the paged FA2 `mla::ForwardMlaAttentionBlock` (NOT the `vt::Attention` approximation tried here); (e) paged-incremental decode (needs a decode/paged-attn op with `query_len≠key_len`, which `vt::Attention` cannot express; kills the O(n²)). Each is a substantial multi-kernel brick, recorded as the named follow-on. Row STAYS ACTIVE. HONEST bar stays HW-forced-indirect (vLLM cannot serve this bf16 on one GB10 with KV headroom — §14).
+
+## 2026-08-07 — Kimi-Linear-48B: chunk_kda PREFILL AOT port SPIKED (kernel set + pinned-config record + regen recipe; NO gate yet) (`row/KIMI-CHUNK-KDA-AOT`)
+
+The §16 STRICT residual (c) — "vLLM processes the PROMPT with the CHUNKED `chunk_kda` kernel; the recurrent form we run is a different reduction order that coin-flips the p7 near-tie" — was SCOPED and de-risked to mechanical execution. This is a PLANNING/authoring spike; it MEASURES nothing on GPU and claims NO STRICT verdict.
+
+EXACT forward-only kernel set (`chunk_kda_with_fused_gate` → `_fwd` → `_chunk_kda_fwd_with_cumulative_g`, FLA `kda.py` @ 555967922), launch order: (1) `kda_gate_cumsum_fwd_kernel` `:1182` NEW; (2) `chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter` `:521` NEW; (3) `…intra_sub_intra` `:627` NEW; (4) `solve_tril` REUSE `gdn_tril_h32` (byte-identical sig at H=32,BT=64,A f32→bf16); (5) `recompute_w_u_fwd_kernel` `:817` NEW (KDA per-K-channel `exp2(gk)` + STORE_KG; ≠ GDN `wy_fast.py`); (6) `chunk_gated_delta_rule_fwd_h` REUSE `chunk_delta_h.py` with a NEW pin `USE_GK=1,USE_EXP2=1,USE_G=0,Hg=32` (the GDN `gdn_deltah` is `USE_G=1,USE_GK=0,USE_EXP2=0` — NOT reusable as-is); (7) `chunk_gla_fwd_kernel_o` `:1019` NEW. → 5 new Triton kernels + 1 new pin of an existing .py + 1 pure reuse. Decode STAYS the #104 recurrent `vt::KdaGatedDeltaRule` (mirrors vLLM's prefill=chunk / decode=recurrent split). Backward NOT owed.
+
+Pinned-config record (Kimi KDA: H=32, Hg=32, K=V=128, BT=FLA_CHUNK_SIZE=64, BC=16, NC=4): the full `_vllm_triton_aot_declare` recipe (bases, kernels, BK/BV/BD, warps/stages, grids, signatures) is in spec §17.3. num_warps/num_stages are correctness-invariant (pinned mirroring GDN); shape pins from FLA driver-fixed values + heuristic lists; dtypes MIRROR FLA (bf16 activations/intermediates, fp32 for gk-cumulative/A/Aqk/state). Scalar constants baked as literals (Triton AOT mis-packs fp32 scalars, per `chunk_o.py` note 3): `scale=K**-0.5`, softplus `beta=1.0`/`threshold=20.0`/`cumsum_scale=RCP_LN2`, `DOT_PRECISION="ieee"`.
+
+DELIVERED: 5 harness bodies authored (verbatim FLA ports, AOT-adapted) STAGED in `.agents/specs/kda-chunk-aot/` (CI-safe: drift check globs `triton_kernels/*.py` non-recursively); the `vt::KdaChunkPrefill` op design (buffer layout + 6-launch order + dispatch guard + prefill/decode split, mirrors `cuda_gdn.cu` GdnPrefill); the RED-first gate plan (unit vs #104 recurrent + #173 host refs + an FLA-python golden at Kimi shapes; then the full 48.9B GB10 gate vs the §12 STRICT golden with `DEVICE_KDA=1` + chunk-prefill).
+
+NOT YET (Phase-2, coupled — the harness signatures depend on the op's confirmed buffer dtypes so regen is premature until the op exists): move harness to `triton_kernels/`, add the §17.3 declarations, regen sm_121a cubins (`scripts/regen-triton-aot.sh`), wire `vt::KdaChunkPrefill`, run the RED-first unit + FLA golden + 48.9B STRICT gate + tok/s/TTFT ladder. Row STAYS ACTIVE. No default flips (nothing measured).
+
+**USER 2026-08-07 (mid-flight): the Kimi-Linear success bar is MEET vLLM SPEED — the §14/§16/#107 "HW-forced-indirect" framing is SUPERSEDED.** vLLM demonstrably RUNS Kimi-Linear-48B on ONE GB10: the §12 STRICT golden capture used it at `gpu_memory_utilization=0.82`, single-seq, eager. So the Phase-2 speed ladder MUST include a vLLM arm at that EXACT recipe (single-seq, eager, util 0.82, the §12 launch config) measuring steady decode tok/s + prefill TTFT on the SAME prompts as our arm — SEQUENTIAL after our runs, `local-ai-worker` PARKED, `drop_caches` before wall-clock, and PRE-WARM FlashInfer's autotune in a throwaway start at TINY util FIRST (cold autotune at util 0.82 with 91.5 GiB weights = the tightest vLLM config ever run on this box = a recorded OOM-reboot trigger; memory monitor mandatory, ONE attempt, if it OOMs record honestly and do NOT retry higher). The tok/s ladder then reads ours-vs-vLLM matched-config: the lane's distance-to-bar becomes a MEASURED number. Recorded in spec §17.5; below vLLM on any axis is an open gap, not done.
+## MiniMax-H3 — what quantizing the TEXT ENCODER to Q4_K_M does to the conditioning (2026-08-06, `row/H3-ENC-BF16-COND-DIFF`, Thor sm_110)
+
+**The question.** Every H3 render so far conditioned on a Q4_K_M Qwen3-VL-32B text
+encoder (`enc_q4km.gguf`, 14.6 GB), and the encoder's contribution had never been
+measured. It mattered because weak conditioning and quantization-damaged
+conditioning are indistinguishable from outside a render: the wuxia prompt asked
+for measured shot/reverse-shot coverage of a martial-arts sect exchanging
+intelligence and produced a good but generic portrait.
+
+**Method.** The SAME prompt (`wuxia.txt`, 233 tokens), the SAME tokenizer, the SAME
+50-layer truncation, the SAME `MiniMaxH3EncoderTextForwardDevice`, the SAME f32
+activations — only the weight bytes differ (Q4_K_M ggml blocks vs the original
+bf16 14-shard release). Both arms self-report identical geometry
+(`layers=50 hidden=5120 heads=64 kv_heads=8 head_dim=128 ffn=25600`), which is what
+establishes they are the same model. Conditioning is `[233, 5120]` f32, written by
+`minimax-h3-gen --encoder-only --save-embeds`. Build `d3861693d51a`, CUDA 13.0.1
+container, Thor sm_110, GPU idle (the LocalAI render had finished).
+
+**A CALIBRATION arm, because a cosine is meaningless without a scale.** The bf16
+encoder also encoded a one-word edit of the same prompt (`bamboo forest at night`
+-> `at dawn`, also 233 tokens). That is a real semantic change to the scene, and it
+is the yardstick the quantization number is read against.
+
+| | max\|diff\| | RMS | rel RMS | rel RMS excl. sink tok | cos min | cos mean | cos median | angle mean | angle max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Q4_K_M vs bf16** (quantization) | 154.0 | 0.5045 | **0.03403** | **0.06849** | 0.90916 | **0.99745** | 0.99810 | 3.793° | 24.61° |
+| bf16 `night`->`dawn` (one-word edit) | 31.1 | 0.2812 | 0.01897 | 0.06666 | 0.84736 | 0.99769 | 0.99963 | 2.228° | 32.07° |
+
+**Reading it.**
+
+1. **It is NOT a scale change.** The Q4 conditioning is uniformly ~1% smaller
+   (per-token norm ratio mean 0.99010), but the best single global rescale removes
+   almost none of the difference (0.03403 -> 0.03280). The change is DIRECTIONAL,
+   which is the kind that matters for conditioning.
+2. **Its total energy is on par with a one-word prompt edit.** Excluding token 0,
+   the perturbations are 6.85% (quantization) vs 6.67% (the edit) of the
+   conditioning norm. Quantizing the encoder moves the conditioning about as much
+   as rewriting a word of the prompt.
+3. **But the SHAPE is opposite, and this is the interesting part.** The word edit
+   is SPARSE: 172 of 233 tokens stay above cosine 0.999 (median rotation 0.16°) and
+   the change concentrates on ~6 tokens, the biggest at 32°. Quantization is
+   DIFFUSE: 232 of 233 tokens fall below cosine 0.999, EVERY token rotates by a few
+   degrees (median 3.5°), and one token (69) rotates 24.6°. That is a smear applied
+   everywhere, not a different prompt.
+4. **`max|diff|` = 154 is the attention sink, not corruption.** Token 0 has norm
+   15,522 against a 366 mean (42x) and carries 68% of the total squared error, yet
+   its DIRECTION is nearly untouched (cosine 0.99962). This is the channel-wise
+   magnitude-outlier behaviour ComfyUI PR 15298 attributes to H3's partial
+   split-half RoPE, showing up concretely: the outlier dominates every norm-weighted
+   aggregate, which is why the sink-excluded column is the honest one.
+
+**Verdict.** Q4_K_M is doing real, measurable damage to the conditioning — not a
+rounding artifact, and comparable in magnitude to editing the prompt — but it
+damages it DIFFUSELY. A uniform few-degree rotation of every token is the signature
+that blunts fine-grained compositional instruction (coverage, blocking, staging)
+toward a prompt's average semantics, which is exactly the "competent but generic"
+symptom. So the bf16 encoder is worth a render A/B.
+
+**What this does NOT establish.** It does not prove the render changes. The DiT
+consumes conditioning through a token refiner and cross-attention, and nothing here
+measures that path's sensitivity to a 3.5°-median rotation. The owed next
+measurement is a byte-identical-everything-else render A/B: same DiT, same seed,
+same steps, `--prompt-embeds cond_q4km.bin` vs `cond_bf16.bin` (which is exactly
+what `--save-embeds` / `--prompt-embeds` make controllable).
+
+**REPRODUCED.** Both arms were re-run from scratch (fresh process, fresh
+load of the checkpoint) and each produced a BYTE-IDENTICAL conditioning file:
+`cond_q4km.bin` md5 `a331232096ef1da2628f885950b2fc55` and `cond_bf16.bin` md5
+`9c096b63b9bd07f604daebb2fc090f46` on both runs. So every number above is
+deterministic, not a sample — there is no noise band to argue about, and a
+future change to either path shows up as an md5 change.
+
+**Cost, for the next person.** Q4_K_M arm: 40 s wall, host+device peak **18.0 GiB**.
+bf16 arm: 40 s wall (35 s of it streaming), **45.41 GiB uploaded** to the device,
+host conversion peak **0.0195 MiB** (one norm — the projections never touch a host
+buffer), total host+device peak **51.95 GiB** on the 122 GiB UNIFIED pool. The
+streamer's counters confirm the path ran: `layers=50 tensors=400 direct=350
+converted=200 fused=100`.

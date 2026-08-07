@@ -41,7 +41,7 @@ leg whose page cache was not dropped. **No ours-vs-vLLM startup number exists ye
 
 Orchestration prompts (2026-08-06): tracked pair; 25 gate rows exact-pinned, step 5/5.
 
-Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Kernels, encoder, CTC greedy, log-mel front end; gated vs a HF `ParakeetForCTC` oracle, ids exact. No CUDA, no pretrained transcript, no transducer. [Spike](../.agents/specs/parakeet-conformer-encoder.md).
+Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Kernels, encoder, CTC greedy, log-mel; gated vs a HF `ParakeetForCTC` oracle, ids exact; real transcript on `nvidia/parakeet-ctc-0.6b`. No CUDA, no aarch64, no speed number.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
@@ -169,9 +169,9 @@ loop (R2) + device draft (R4). fp16 dequant cache refuted net-slower on GB10; MH
 a measured tie; routed-MoE we already win. See
 `.agents/specs/deepseek-beat-ds4-sweep-2026-07-30.md`.
 
-**DeepSeek-V4-Flash decode levers (2026-08-03, byte-exact, default-ON): SUPERSEDED by the 1.14x BINDING below** (13.5 -> 14.96 tok/s; forensics in `.agents/benchmark-record.md`).
+**DeepSeek-V4-Flash decode levers (2026-08-03): superseded by the 1.14x binding below**, see the record.
 
-**BINDING 2026-08-05: `VT_V4_RESIDENT_W` (default-ON) BEATS ds4 — 18.69 vs 16.33 tok/s (1.144x), byte-exact:** the dense Q8_0 MLA/shared/lm_head proj tower was read from GGUF-mmap over ATS; staging it `cudaMalloc`-device once (Q8_0 per-launch ~20% each, ids-IDENTICAL) lifts decode 16.23→18.69 (median-of-3, drop_caches, PEAK flat 86.68 GiB, net move). Mirrors Laguna `VT_LAGUNA_RESIDENT_BF16W`; our GEMV was ATS-bound, not at ds4 parity. **Phase-2 routed-expert residency (`VT_V4_RESIDENT_EXPERTS`) MEASURED NEGATIVE, HELD default-OFF (2026-08-05):** the ~70 GiB IQ2/Q2_K expert slabs staged device-resident (madvise move-semantics) are byte-exact but **−3.4% steady** (18.76 vs 19.43 tok/s, same-binary median-of-3) + a one-time capture cost — the grouped-MoE kernels are dequant/latency-bound (~19-24% of DRAM peak), so residency (a bandwidth lever) cannot help, and device pinning cuts pool headroom (103→30 GiB avail). Prior (superseded, see record): PARITY 16.28 vs 16.33 (0.997x); `VT_V4_MHC_SINK4` +4.6% byte-exact; HC-expand + f16-DSA held default-OFF.
+**BINDING 2026-08-05: `VT_V4_RESIDENT_W` (default-ON) BEATS ds4, 18.69 vs 16.33 tok/s (1.144x), byte-exact:** staging the dense Q8_0 MLA/shared/lm_head tower device-resident (it was read from GGUF-mmap over ATS) lifts decode 16.23 to 18.69, median-of-3, PEAK flat 86.68 GiB. Mirrors Laguna `VT_LAGUNA_RESIDENT_BF16W`; our GEMV was ATS-bound. **Phase-2 routed-expert residency (`VT_V4_RESIDENT_EXPERTS`) MEASURED NEGATIVE, default-OFF:** byte-exact but -3.4% steady, because the grouped-MoE kernels are dequant/latency-bound, so a bandwidth lever cannot help. Superseded readings and the full forensics are in `.agents/benchmark-record.md`.
 
 **Integration re-verify (2026-08-03, GB10 sm_121a, clean CUDA+Triton Release build off `6576814b`).** Both decode glue-fold levers (`CLAIM-DSV4-ROPE-FLOAT` + `CLAIM-DSV4-MHC-LEAN`) cherry-picked clean and re-gated on a fresh GB10 build: build **EXIT 0**; **SACRED `test_qwen36_paged_engine` 315/315, 0 failed (UNMOVED)**; `test_cuda_deepseek_v4` **20/20·67073**; **byte-exact re-confirmed on the resident-decode path** — `deepseek-v4-gen --gpu --kv-cache` on ds4flash IQ2XXS gives decode ids token-IDENTICAL for `VT_V4_ROPE_FLOAT=1`/`=0` AND `VT_V4_MHC_LEAN=1024`/`=0` (the `--kv-cache` T==1 steps engage `ForwardResidentDecodeGguf`, so the gated device `NormRopeRows`/`MhcPre` kernels are genuinely exercised — decode ~0.06 s/step confirms the GPU path). The 27B paged-engine gate SKIPs (checkpoint absent on box).
 
@@ -931,7 +931,7 @@ run; gguf_load 12/12). The CUDA graph stays OPT-IN default OFF (graph 7.92 ≈ e
 `=0` (host) **7.24**, both "…Paris." token-identical. Shipped DeepSeek-V4 decode = device-resident ~7.96 tok/s
 (~48% of ds4, GEMM-bound); last mile = fp8 KV + tuned MMQ (named residual). **★ MMQ LEVER 1 LANDED (2026-08-01, byte-exact): the ds4-gap decode kernel was MISATTRIBUTED — the prior campaign optimized the Q8_0 dense GEMV (already `__dp4a`-efficient), but the DOMINANT-FLOP routed-expert k-quant MoE GEMM (`DotQ4K`/`DotQ5K`/`DotQ3K`/`DotQ6K` in `cuda_quant_dot.cu`) was a VERBATIM SCALAR CPU port (256-B/lane `aux8` local-mem spill + scalar MAC, NO `__dp4a`) while `DotQ2K`/`DotIQ2XXS` were vectorized. Resolves the "94% util but slow" paradox (SMs busy on an inefficient kernel). `__dp4a`-vectorized `DotQ4K`+`DotQ5K` (the DeepSeek routed-expert quants; ref llama.cpp `vec_dot_q4_K_q8_1_impl_vmmq`): `test_cuda_quant_dot` BIT-FOR-BIT green (9 cases / 110432 assertions CUDA==CPU). ★ HONEST SCOPE CORRECTION: this is a GENERAL k-quant kernel win (helps Q4_K/Q5_K keep-quant models incl. the `DeepSeek-V4-Flash-MTP-Q4K` variant), but the ds4-BENCHMARK checkpoint is `IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8` — its routed experts are IQ2_XXS (gate/up) + Q2_K (down), both ALREADY `__dp4a`-vectorized (`DotIQ2XXS`/`DotQ2K`), with attn/shared/out Q8_0. So `DotQ4K`/`DotQ5K` are NOT on THIS checkpoint's decode hot path → NO ds4-gap speedup here (the lever-scan's Lever-1 premise was seeded by a wrong ground-context "routed experts Q4_K/Q5_K"; the actual checkpoint differs). The change is kept as a correct byte-exact general improvement, not a DeepSeek-benchmark closer.
 
-(2026-08-01 nsys/Q8_0-GEMV framing superseded by the 2026-08-04 binding parity line; detail in the record.)
+(2026-08-01 framing superseded by the 2026-08-04 binding line)
 Row `ACTIVE`; see docs/BENCHMARKS.md.
 **Last-mile campaign — Brick 0 (PROFILE-ONLY): the keep-quant GEMM roofline (2026-07-30, base `aed4a498`,
 branch `deepseek-v4-last-mile`, commit `42a99471`, NOT pushed).** Profile-only (holding for the coordinator's
@@ -2203,7 +2203,7 @@ The gate models' W4A4 decode is at the achievable roofline. See `.agents/specs/n
 
 **Laguna W9 grouped-expert MoE LANDED + GATED (2026-07-31).** The 30 un-grouped per-expert GEMV launches/step fold onto the shared `vt::MatmulBTQuantGrouped` (3×top_k → 3 launches/token, no loader change). Same-binary A/B on real UD-Q4_K_XL (GB10, `--gpu`): grouped==per-expert BYTE-IDENTICAL (md5 `754728c6`, == W6 golden) + decode **0.18 → 0.13 s/tok (1.38×)**. Cumulative with W8: **0.66 → 0.13 s/tok (5.1×, 1.5 → 7.7 tok/s)**. See spec §W9.
 
-_(Laguna W8-W11 decode campaign: 0.66 → 0.13 s/tok. W10/W11 readings ALL superseded by the 2026-08-04 binding result above; see `.agents/state.md` §W10/§W11.)_
+_(Laguna W8-W11: 0.66 to 0.13 s/tok; W10/W11 superseded by the 2026-08-04 binding result.)_
 
 _(Laguna NVFP4-Marlin decode-isolated (2026-08-01, `CLAIM-LAGUNA-DECODE-SYNC`, BENCHMARKS): the ~10 tok/s Marlin-default path's 1.9× gap to vLLM 18.8 is HOST-SYNC — 60-tok−20-tok nsys÷40 = **~432 `cudaStreamSynchronize` + ~188 `cudaMemcpyAsync` per decode token, ZERO malloc/free** (the 72k allocs are all the one-time load-repack; DBuf pool recycles). Byte-exact lever = device-resident decode (kills the memcpy) + decode CUDA-graph (collapses 432 syncs→1), vLLM's mechanism, gated on golden ids UNCHANGED. Executable plan: `.agents/specs/laguna-device-resident-decode.md`; same "Brick D" as DeepSeek task #228. Unlike the GGUF W11 path (GPU-compute-bound), the NVFP4-Marlin path IS host-sync-bound — the Marlin MoE kernel is vLLM's own, so compute is at parity.)_
 

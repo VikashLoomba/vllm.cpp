@@ -76,3 +76,12 @@ vllm_cpp_set_warnings(minimax-h3-mux)
 add_executable(minimax-h3-gen minimax_h3_gen/main.cpp)
 target_link_libraries(minimax-h3-gen PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(minimax-h3-gen)
+
+# parakeet-transcribe: the ASR driver — real WAV, real pretrained
+# ParakeetForCTC weights, log-mel -> encoder -> CTC -> collapsed token ids.
+# Lives here for the same reason the h3 drivers do: it is a driver over real
+# checkpoints, not library surface. The unit gates prove the math against a
+# random-weight HF oracle; this proves the model actually transcribes.
+add_executable(parakeet-transcribe parakeet_transcribe/main.cpp)
+target_link_libraries(parakeet-transcribe PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(parakeet-transcribe)

@@ -14239,3 +14239,34 @@ GREEN. Suite **67/67** (66 prior + this), 46549 assertions; `test_video_api` 4/4
 wiring). Wired at both loading entry points: `MiniMaxH3GenerateT2va` guards every full
 render; the pure pipeline-math tests build `declared=false` requests so the guard is inert
 there. No numbers changed — this is a correctness/refusal gate, not a perf lever.
+
+## MiniMax-H3 ENCODER VISION TOWER — record reconciled + real-weights loader; the encoder GGUF DOES carry the vision tensors (2026-08-07, `row/H3-CONDITIONED-E2E`, `ROAD-V1-H3`, dgx GB10 sm_121a)
+
+**Record reconciliation.** #26/W3 recorded the vision tower "COMPLETE … only the MM
+processor remains"; #77 recorded it "still unported". Reading the code, both are true of
+different halves: the tower MATH exists as a CPU scalar reference
+(`minimax_h3_encoder.cpp` `MiniMaxH3VisionTowerForward:572` + surround) gated ONLY at
+reduced dims with SYNTHETIC weights (`test_minimax_h3.cpp:4041`), but it was NEVER wired to
+real weights — `LoadMiniMaxH3EncoderFromGguf` (`minimax_h3_encoder_gguf.cpp:47`) loads the
+TEXT tower only and skips every `visual.*` tensor; the device forward is text-only; the
+driver/server call only the text path. So: math CPU-gated synthetic, zero real-weights
+wiring.
+
+**Encoder-arm decision (measured, no download).** The on-box encoder
+`~/h3fp4/ckpt/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` (14 GiB) carries the FULL vision tower —
+`visual.blocks.{0..26}` (Q4_K/Q5_K), `patch_embed.proj` (F16 `[16,16,6,1152]`), `pos_embed`
+(F16 `[2304,1152]`=48²), `merger.*`, and 3 `deepstack_merger_list.*`. Geometry: hidden 1152
+/ 16 heads / depth 27 / intermediate 4304 / out 5120 / patch 16 / temporal 2 / merge 2 /
+pos 2304 (== the Qwen3.6-27B vision config, state.md :23310). ComfyUI quant reshapes
+non-256-aligned rows (in=1152) to ne0=256; dequant of the flat buffer preserves the
+row-major `[out,in]` order the tower reads. `deepstack_visual_indexes` is NOT in the
+weights-only GGUF and must be supplied from the H3 vision_config (residual for a bit-correct
+DeepStack inject).
+
+**Landing this row:** GGUF `visual.*`→`Qwen3VLVisionWeights` loader (`LoadQwen3VLVisionFromGguf`,
+mirrors safetensors `LoadQwen3VLVisionWeights` `qwen3_vl.cpp:417`) + a CPU/real-weights
+vision-tower forward gate + driver `--prompt-image` probe. HONEST residual (recorded, not
+claimed done): the vision-ENRICHED DiT render (DeepStack scatter into the DEVICE text tower
+actually changing the frames) needs the exact deepstack indexes + a device-text
+DeepStack/merge extension + an on-box GPU render; fl2va/ref2va frame-sanity verdicts recorded
+here as they are produced.

@@ -624,3 +624,70 @@ asserts the two real manifests reduce to the identical 535-name set (proving the
 no-discriminator premise in the harness). Neutralizing the guard body (reviewer mutation)
 turned the case RED at 10 assertions, restoring it turned it GREEN — the test has teeth.
 Suite: 67/67 (66 prior + this), 46549 assertions. `test_video_api` 4/4 (server wiring).
+
+## 8.8 ENCODER VISION TOWER — record reconciliation + real-weights wiring (2026-08-06, `row/H3-CONDITIONED-E2E`)
+
+**The contradictory record, reconciled (file:line).** Two prior lanes disagreed. The
+#26/W3 lane recorded the vision tower as **"W3 COMPLETE … the FULL vision tower at
+6.0e-8 … only the MM processor remains"** (this spec lines 101, 162-163); the #77
+residual recorded **"the encoder vision tower (W3) is still unported"** (lines 565-566).
+Reading the actual code resolves it — **both describe different halves and both are
+literally true of what they describe**:
+
+- The vision-tower **MATH exists** as a CPU scalar f32 reference in
+  `minimax_h3_encoder.cpp`: `MiniMaxH3VisionBlockForward` (:311), the surround
+  `MiniMaxH3VisionPosEmbedInterpolate` (:430) / `MiniMaxH3VisionRotary` (:500) /
+  `PatchMerger` (:545) / `MiniMaxH3VisionTowerForward` (:572). It is gated ONLY in
+  `tests/vllm/models/test_minimax_h3.cpp` (:3942, :4041) at **reduced dims with SYNTHETIC
+  weights** (`MakeParam`), block 6.0e-8 / tower ≤1e-4 vs a self-restated oracle.
+- It is **NEVER wired to real weights.** `LoadMiniMaxH3EncoderFromGguf`
+  (`minimax_h3_encoder_gguf.cpp:47`) loads the **TEXT tower only** — it iterates
+  `model.layers.N.*` + `model.embed_tokens.weight` and **skips every `visual.*` tensor**
+  (the comment at :51-52 even names `visual.*` as present-but-unloaded). The device
+  encoder `MiniMaxH3EncoderTextForwardDevice` (`minimax_h3_encoder_device.cpp:103`) runs
+  text only and takes **no deepstack / no visual-mask** argument (the HOST reference
+  `MiniMaxH3EncoderTextForward` does, :113-118). The driver
+  (`examples/minimax_h3_gen/main.cpp:476-547`) and server
+  (`examples/server/main.cpp:659-716`) call only the text path.
+- **So the reconciled truth:** the tower math is CPU-gated at reduced dims with synthetic
+  weights; there is **zero real-weights wiring** — no GGUF `visual.*` loader, no image→patch
+  MM processor on the H3 path, no device vision forward, no merge/DeepStack injection into
+  the encoded prompt. The #26 "only the MM processor remains" understated the gap (loader,
+  real-weights forward, and the merge/inject were ALSO absent); the #77 "still unported" was
+  right in the sense that matters (nothing real ran through it).
+
+**The encoder ARM already carries the vision weights (no download).** The on-box encoder
+`~/h3fp4/ckpt/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` (14 GiB, the ComfyUI-format text-tower
+GGUF that already serves text conditioning) **DOES carry the full vision tower**: measured
+`visual.blocks.{0..26}` (27, Q4_K/Q5_K), `visual.patch_embed.proj` (F16 `[16,16,6,1152]` =
+Conv3d as a linear over `patch_elems`=1536), `visual.pos_embed.weight` (F16 `[2304,1152]` =
+48² grid), `visual.merger.*`, and **`visual.deepstack_merger_list.{0,1,2}`** (3 DeepStack
+mergers). Names map 1:1 to `MiniMaxH3VisionTowerForward` / the reuse target
+`multimodal::Qwen3VLVisionWeights`. So the encoder-arm decision is settled: **reuse the
+in-place encoder GGUF; no new download** (disk floor 15 GiB / ~23 GiB free honoured).
+
+**Vision geometry (from the checkpoint + state.md :23310-23318, the Qwen3.6-27B vision
+config which shares this tower):** hidden **1152**, **16 heads** (head_dim 72), depth **27**,
+intermediate **4304**, out_hidden **5120** (== encoder text dim), patch **16**, temporal **2**,
+merge **2**, num_position_embeddings **2304**, gelu-tanh blocks / exact-erf merger. H3 differs
+from the 27B only by having **3 real DeepStack mergers** (the 27B's are empty). The one
+config value NOT recoverable from the ComfyUI GGUF (weights-only, no arch metadata) is
+`deepstack_visual_indexes` — the WHICH-layers taps — needed for a bit-correct DeepStack
+inject; it is inferred + flagged as the residual for a fully-correct conditioned render.
+
+**The reuse path (mission: "stock Qwen3VLProcessor + our existing front end").** The image
+MM processor already exists and is gated: `multimodal::Qwen3VLImageProcessor::ProcessImage`
+(`qwen3vl_processor.h`, patch 16 / temporal 2 / merge 2 / 0.5 normalize → pixel_values +
+grid_thw), `ExpandImagePlaceholders`, and the device tower
+`multimodal::Qwen3VLVisionForward` (`qwen3_vl_vision.cpp`) with `PrepareVisionDeviceWeights`.
+The only genuinely-new code is the **GGUF `visual.*` → `Qwen3VLVisionWeights` loader**
+(`LoadQwen3VLVisionFromGguf`), mirroring the safetensors `LoadQwen3VLVisionWeights`
+(`qwen3_vl.cpp:417`) but dequantizing the Q4_K/Q5_K blocks (ComfyUI reshapes non-256-aligned
+rows to ne0=256; dequant preserves the flat row-major order the tower reads as `[out,in]`)
+and converting the F16 patch/pos tensors.
+
+**This row's status (honest):** loader + real-image processor reuse + the real-weights
+vision-tower forward gate LAND here (see §8.4-style status in STATUS/BENCHMARKS). The full
+vision-ENRICHED DiT render (DeepStack scatter into the DEVICE text tower changing the frames)
+depends additionally on the exact `deepstack_visual_indexes` and a device-text DeepStack/merge
+extension; its e2e render verdict is recorded honestly in the benchmark record.

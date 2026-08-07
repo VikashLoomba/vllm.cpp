@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-06 -->
+<!-- now-updated: 2026-08-07 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -26,7 +26,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Op-dispatch profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
-| Parakeet encoder kernels (`CLAIM-PARAKEET-KERNELS-P1P3`) | **P1-P3 LANDED, CPU**: Conv2d, non-causal depthwise Conv1d, relpos attention; byte-identity gated. No GPU run | P4: encoder+CTC+mel, then CUDA |
+| Parakeet ASR P1-P4 (`CLAIM-PARAKEET-MODEL-P4`) | **LANDED, CPU**: 3 ops + encoder/CTC/mel vs a HF `ParakeetForCTC` oracle, ids exact, 20/20 mutants. No GPU, no ckpt | CUDA providers; real transcript |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -44,10 +44,10 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 
 ## Next actions
 
-1. **Parakeet encoder: spike ACCEPTED, kernels P1-P3 DONE on CPU.** The three
-   blocking primitives are now `vt::` ops through `op_provider`. NEXT is P4 (the
-   `ParakeetEncoder` + `ParakeetForCTC` port, mel extractor) and then the CUDA
-   providers. The transducer half (RNN-T/TDT) is NOT in vLLM: separate scope call.
+1. **Parakeet ASR: P1-P4 DONE on CPU.** Three `vt::` ops plus the encoder, CTC
+   greedy, log-mel front end and an HF-safetensors loader. NEXT: CUDA providers,
+   then a pretrained transcript (none downloaded, none claimed; the arm is wired
+   behind `VLLM_PARAKEET_CKPT`). RNN-T/TDT is in neither vLLM nor HF: scope call.
 2. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
    speed-pending; bind the default-ON async-serving path against the same oracle
    before attributing the remaining TPOT gap.

@@ -131,6 +131,7 @@ they sit outside the gated list above.
 |---|---|---|---|
 | Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17x, pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
+| Parakeet/FastConformer ASR (encoder + CTC head) | none pretrained: gated on a seeded HF `ParakeetForCTC` oracle; no checkpoint downloaded, so no transcript is claimed | 15/54082 CPU: stages rel-L2 <= 3.5e-7 vs the HF oracle, greedy + collapsed token ids exact, 20/20 mutants killed | none measured, claimed or owed |
 | MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable path 66/66 (DiT geometry ladder + CUDA-vs-host at the REAL render seq 1920); t2va renders a COHERENT prompt-matched scene on GB10 (render bug CLOSED: #70/#74 was wrong-partition usage, not a code bug) | FP4/Marlin routing landed, GB10 speed pending |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |

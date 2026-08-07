@@ -41,7 +41,7 @@ leg whose page cache was not dropped. **No ours-vs-vLLM startup number exists ye
 
 Orchestration prompts (2026-08-06): tracked pair; 25 gate rows exact-pinned, step 5/5.
 
-Parakeet/FastConformer encoder kernels (2026-08-06): *correctness-complete, CPU only*. `vt::Conv2d`, `vt::DepthwiseConv1d` (non-causal) and `vt::AttentionRelPos`, each byte-identity gated. No CUDA, no encoder model/CTC/mel yet. [Spike](../.agents/specs/parakeet-conformer-encoder.md).
+Parakeet/FastConformer ASR (2026-08-07): *correctness-complete, CPU only*. Kernels, encoder, CTC greedy, log-mel front end; gated vs a HF `ParakeetForCTC` oracle, ids exact. No CUDA, no pretrained transcript, no transducer. [Spike](../.agents/specs/parakeet-conformer-encoder.md).
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by

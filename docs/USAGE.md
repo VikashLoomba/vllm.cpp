@@ -120,6 +120,45 @@ API surface, auth, and metrics.
 
 ## MiniMax-H3: video + audio generation
 
+### Writing the prompt (read this first)
+
+Two things decide whether you get what you asked for, and neither is obvious.
+
+**To get SPEECH, ask for it and supply the line.** The model generates video and
+audio jointly, so a prompt describing a silent performance produces room tone and
+ambience, which is correct but not what most people expect. Say that the character
+talks, describe the voice, and put the words in the prompt:
+
+```
+It is TALKING to the camera: its mouth moves clearly in sync with its speech,
+in a dry, deadpan tone.
+
+It says, clearly and audibly: "Michael scheduled another all-hands.
+It is about the printer. Again."
+
+Audio: a single clear voice, close-miked, with quiet room tone underneath.
+```
+
+That prompt produced audio an ASR pass transcribed back word for word. A prompt
+that only described expressions and sighs produced ambience at about 13 dB lower
+level and no speech at all.
+
+**Refer to references BY TAG in the prompt text.** A reference is bound by naming
+it, not merely by being passed on the command line. Use `<Picture i>`, `<Video k>`
+and `<Audio j>`, numbered from 1 per type, matching the order you pass them:
+
+```
+<Picture 1> is a cyan llama mascot wearing white sunglasses.
+
+A talking-head interview. The subject is the llama from <Picture 1>, sitting in a
+grey office chair ...
+```
+
+Other prompt notes: frame count runs on the 17n+5 grid at 24 fps, and the trained
+range is roughly 124 to 362 frames (about 5 to 15 seconds). Text rendered *inside*
+the video (signage, wordmarks) is the model's weakest area and will often come out
+malformed; composite real logos in afterwards.
+
 `/v1/videos` generates video with sound through the MiniMax-H3 diffusion model.
 It speaks **OpenAI's Sora video shape**, so an OpenAI client works against it
 unmodified, and it keeps the richer native knobs alongside.

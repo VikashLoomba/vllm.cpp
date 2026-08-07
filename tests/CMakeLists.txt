@@ -339,6 +339,32 @@ target_compile_definitions(test_qwen3vl_video_e2e PRIVATE
 vllm_cpp_add_test(test_audio_processor vllm/multimodal/test_audio_processor.cpp)
 target_compile_definitions(test_audio_processor PRIVATE
   MM_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/whisper_audio")
+# P4 (MODEL-AUDIO-PARAKEET-ENCODER) — the Parakeet log-mel FRONT END. Gates the
+# mel filter bank against a dump of transformers `audio_utils.mel_filter_bank`
+# (the exact function vLLM's ParakeetExtractor calls) AND against librosa's
+# float32 bank (what HF's own ParakeetFeatureExtractor uses), then the full
+# `input_features` against a dump of ParakeetFeatureExtractor.__call__ on a fixed
+# waveform. Fixture COMMITTED (228 KiB), so it runs in CI with no download
+# (scripts/mm/p4_parakeet_extractor_ref.py). CPU-only.
+vllm_cpp_add_test(test_parakeet_audio_processor
+  vllm/multimodal/test_parakeet_audio_processor.cpp)
+target_compile_definitions(test_parakeet_audio_processor PRIVATE
+  MM_PARAKEET_AUDIO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/multimodal/fixtures/parakeet_audio")
+# P4 — the ParakeetEncoder/ParakeetForCTC MODULE gate: the forward vs an
+# INDEPENDENT in-test scalar reference written from the transformers definition
+# (and performing `_rel_shift` LITERALLY, so agreement is evidence for
+# vt::AttentionRelPos's closed form). No fixture, no checkpoint, CPU-only.
+vllm_cpp_add_test(test_parakeet_encoder vllm/models/test_parakeet_encoder.cpp)
+# P4 — the e2e gate: the whole encoder + CTC head + greedy collapse vs a dumped
+# HuggingFace `ParakeetForCTC` ORACLE (transformers 5.3.0 — the module vLLM
+# itself runs). Stage-by-stage rel-L2 plus EXACT greedy and collapsed token ids.
+# The oracle is a small SEEDED, RANDOMLY-INITIALISED model, not a pretrained
+# checkpoint, so the gate is on logits and ids and never on a transcript; the
+# pretrained-checkpoint arm is the separate VLLM_PARAKEET_CKPT case, skipped
+# when unset. Fixture COMMITTED (464 KiB, scripts/mm/p4_parakeet_oracle_dump.py).
+vllm_cpp_add_test(test_parakeet_ctc_engine vllm/models/test_parakeet_ctc_engine.cpp)
+target_compile_definitions(test_parakeet_ctc_engine PRIVATE
+  PARAKEET_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet")
 # M3d — NEAR-TIE-ROBUST e2e VIDEO->text token gate on the Qwen3.6-27B GDN-hybrid
 # gate model: the full pipeline (video processor -> tower per-frame windowed attn,
 # 27B vision config -> merge -> forked GDN-hybrid video MRoPE greedy decode) vs the

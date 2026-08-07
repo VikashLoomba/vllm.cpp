@@ -1563,6 +1563,9 @@ runtime-verified yet.
   lanes. Guard `scripts/check-surface-coverage.py` (two axes, preflight + CI):
   every `examples/*` unit is a client of `include/vllm.h` or tracked to a fold
   row; every `FEATURES.md` C-ABI capability names an entry point or is tracked.
+  Fold ROW 8: `vllm_model_params.device` (ABI v14, 0=auto/1=cpu/2=cuda);
+  explicit cpu forces CPU, an absent named device fails loud (never
+  substituted); `--device` on server+cli. CUDA-build A/B = named residual.
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /
   GDN and attention-free default off, mirroring vLLM), and it now has an
   end-to-end cache-ON gate on `Qwen/Qwen3-4B` (a shared common prefix reused
@@ -1594,10 +1597,6 @@ runtime-verified yet.
   remaining work is the async production-serving path wiring, the chat/completion
   response-body timing surface, and the config-gated metric families (speculative
   decoding, KV connector, multimodal cache, LoRA).
-  matching vLLM's own mapping. A behavioural CPU gate drives the reference engine
-  for several steps and checks the values track the run. The remaining work is
-  the async production-serving path wiring and the config-gated metric families
-  (speculative decoding, KV connector, multimodal cache, LoRA).
 - **SGLang RadixAttention behavior parity** — scoped 2026-07-27, W1+W2 flags now
   IMPLEMENTED (CPU-gated). SGLang's radix-tree prefix cache is functionally
   equivalent to our block-hash APC (both do automatic longest-prefix KV sharing

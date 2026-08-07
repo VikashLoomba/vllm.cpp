@@ -28,7 +28,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
 | `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
-| Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 2 LANDED (#123)**: H3 video on the surface (`vllm_video_*` v12, `/v1/videos` via the seam, both examples thin clients, ratchet 11→9); ROW 1 (#121) before it | GB10 re-verify residual; next fold row |
+| Surface coverage (`ARCH-ONE-SURFACE`) | **ROW 8 IN REVIEW (`row/DEVICE-KNOB`)**: ABI v14 `device` knob (0=auto/1=cpu/2=cuda), absent-cuda fails loud, `--device` on server+cli, #123's 3 minors folded | Merge after review; rebased (#122); CUDA A/B residual |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.

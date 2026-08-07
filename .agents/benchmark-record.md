@@ -14270,3 +14270,43 @@ claimed done): the vision-ENRICHED DiT render (DeepStack scatter into the DEVICE
 actually changing the frames) needs the exact deepstack indexes + a device-text
 DeepStack/merge extension + an on-box GPU render; fl2va/ref2va frame-sanity verdicts recorded
 here as they are produced.
+
+### GB10 VERIFICATION (2026-08-07, dgx sm_121a, flock, worker parked)
+
+**Real-weights vision-tower probe RAN (deliverable 1).** `minimax-h3-gen --device cuda
+--encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --prompt-image <512x512 cat frame>`: the loader
+read the real `visual.*` tower (depth 27 / hidden 1152 / 16 heads / out 5120 / 3 DeepStack
+mergers); the stock Qwen3VLImageProcessor produced grid_thw [1,32,32] = 1024 tokens → 256
+merged; `Qwen3VLVisionForward` on the GGUF-loaded weights returned [256, 20480] = merged +
+3 deepstack concatenated, ALL FINITE and non-degenerate: merged rms 1.45 / maxabs 29.1 (the
+expected Qwen MASSIVE-ACTIVATION signature), deepstack rms 0.54/1.04/0.51. The vision tower now
+runs on real weights.
+
+**fl2va e2e — COHERENT (deliverable 2, frame-sanity PASS).** FL2VA-partition GGUF
+(`MiniMax-H3-FL2VA-Q3_K_M.gguf`, `--dequant-bf16`, ~66 GB device, free 117→23 G, no OOM) +
+`--first-frame` (real coherent orange-cat frame, VAE-keyframe conditioning) + `--partition
+fl2va`, 512x512/22f/12steps. Valid h264 512x512 + AAC mp4, 22 frames. VISUAL sanity (frames
+0/6/12/21 inspected): every frame is a coherent photorealistic ORANGE CAT sitting on a WOODEN
+TABLE, matching the conditioning first-frame's pose/table/gray-background, consistent across
+the whole clip — no patch-grid, no white latent. The render visibly CONTINUES/MATCHES the
+conditioning image. (This uses the VAE-KEYFRAME path, not the vision tower.)
+
+**ref2va e2e — STILL GRIDS (deliverable 2, frame-sanity FAIL, recorded honestly).** Ref2VA
+NVFP4 (`minimax_h3_ref2va_nvfp4_full`, `--fp4-resident`, ~16 GB, free 117→63 G) + `--ref-image`
+(one 256x256 real cat image, VAE-reference conditioning) + `--partition ref2va` + text
+prompt_embeds, 256x256/22f/12steps. Valid mp4, 22 frames, but EVERY frame (0/10/21) is a
+multicolour PATCH GRID — the #70/#74 degenerate render — NOT a coherent scene. First attempt
+(5x512 `--ref-video`) was ABANDONED: the reference-video VAE encode is a single-thread CPU
+3D-CNN scalar path (GPU 0%, 98% CPU) and did not finish in ~15 min — a known perf limit, not a
+bug. **HONEST verdict vs the mission's expectation:** landing the vision-tower LOADER does NOT
+fix the ref2va grid, because the tower is wired as a loader+probe and is NOT yet scattered into
+the DiT render-conditioning path — this render did not use it. fl2va (same partition family,
+same session, VAE-keyframe path) is COHERENT, so the DiT/VAE/partition are sound; the ref2va
+grid is specific to the ref2va conditioning assembly (VAE-reference rows + un-enriched text
+prompt). Testing whether the vision-enriched prompt fixes ref2va needs the render-conditioning
+scatter (merge merged-features into prompt_embeds + DeepStack inject into the DEVICE text
+tower) — the tracked residual. Suite note: the full `test_minimax_h3` run SIGSEGVs at an
+UNRELATED CUDA case (line 3503, "an NVFP4 checkpoint loads into a runnable DiT") that PASSES in
+isolation (585 assertions) and runs BEFORE the new case — a pre-existing cross-test CUDA
+resource-accumulation flake, not this change; the new loader gate passes standalone (59
+assertions).

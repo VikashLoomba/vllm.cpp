@@ -400,7 +400,7 @@ vLLM-Omni H3 modules at `vllm_omni/diffusion/models/minimax_h3/`; serving in
 | WebSocket `/v1/video/chat/stream`, `/v1/realtime/video` | `api_server.py:1593,1610` | — | **MISSING** (streaming/realtime) |
 | Request schema (prompt, size/w/h, num_frames, fps, seed, steps, refs) | `protocol/videos.py:97-249` | request contract (W7) | **PARTIAL** (core fields; frame-interp/lora/generate_sound absent) |
 | H3 knobs via `extra_params.{task,duration,flow_shift,audio_flow_shift}` | `pipeline:1034,403,1157-1158` | planner reads task/duration/shift | **DONE** |
-| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; fl2va/ref2va image/video/audio WIRED (W6/ref2va) | **PARTIAL** (encoder vision tower still open) |
+| Modalities in: text/image/video/audio | `pipeline:1036-1104` | t2va (text) done; fl2va COHERENT on real weights (VAE-keyframe); vision tower now LOADS real `visual.*` + runs (probe); ref2va still grids | **PARTIAL** (vision-tower→DiT-conditioning scatter is the residual; §8.8) |
 | Output: joint video+audio, 24 fps, 32 kHz stereo | `pipeline:106-111,1187` | frames + WAV + MP4 mux (W7) | **DONE** |
 | Scheduler: euler-ancestral rectified flow (single) | `scheduling_...euler_ancestral.py`; `time_request.py:34-61` | `MiniMaxH3EulerEta0Step` / `MiniMaxH3TimeShiftSigmas` | **DONE** |
 | CFG: distilled, no CFG (guidance params accepted+ignored; `cfg_parallel_size==1`) | `pipeline:250,275-276` | no CFG branch | **DONE** (matches) |
@@ -691,3 +691,21 @@ vision-tower forward gate LAND here (see §8.4-style status in STATUS/BENCHMARKS
 vision-ENRICHED DiT render (DeepStack scatter into the DEVICE text tower changing the frames)
 depends additionally on the exact `deepstack_visual_indexes` and a device-text DeepStack/merge
 extension; its e2e render verdict is recorded honestly in the benchmark record.
+
+**GB10 VERIFIED (2026-08-07, dgx sm_121a).**
+- **Vision-tower probe RAN on real weights:** `--prompt-image` loaded the real `visual.*`
+  tower (27 blocks / 3 DeepStack mergers), processed a 512×512 image → grid [1,32,32], and
+  `Qwen3VLVisionForward` returned [256, 20480] all FINITE + non-degenerate (merged rms 1.45 /
+  maxabs 29.1 — the expected Qwen massive-activation). Deliverable-1 core DONE.
+- **fl2va e2e COHERENT:** FL2VA GGUF (`--dequant-bf16`) + a real first-frame (VAE-keyframe) +
+  `--partition fl2va`, 512×512/22f/12steps → all 22 frames a coherent photorealistic orange
+  cat on a wooden table matching the conditioning frame (no grid). Frame-sanity PASS.
+- **ref2va STILL GRIDS (honest):** Ref2VA NVFP4 (`--fp4-resident`) + a real `--ref-image` +
+  `--partition ref2va` → every frame a multicolour patch grid. Landing the tower LOADER does
+  NOT fix it: the tower is a loader+probe, NOT yet scattered into the DiT render-conditioning,
+  so this render never used it. fl2va (same session, VAE-keyframe) is coherent ⇒ DiT/VAE/
+  partition are sound; the ref2va grid is specific to the ref2va conditioning assembly. The
+  render-conditioning scatter (merge features into prompt_embeds + DeepStack inject into the
+  DEVICE text tower) is the tracked residual that would let the vision-enriched-prompt
+  hypothesis be tested. The `--ref-video` VAE encode is a slow single-thread CPU 3D-CNN path
+  (separate perf limit).

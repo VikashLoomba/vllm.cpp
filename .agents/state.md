@@ -39918,3 +39918,38 @@ into the DEVICE text tower changing the frames) needs the exact deepstack indexe
 device-text DeepStack/merge extension + an on-box GPU render; recorded in the benchmark record.
 Records: spec §8.8, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Pre-existing
 preflight red (check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.
+## 2026-08-07T03:20 - MiniMax-H3 vision tower GB10-VERIFIED on real weights; fl2va COHERENT, ref2va STILL GRIDS (row/H3-CONDITIONED-E2E, helper, PR #86)
+<!-- state: 2026-08-07T03:20 -->
+
+Landed on dgx (git-archive of HEAD over `~/h3fp4/src`, golden md5 unchanged, incremental CUDA
+build, flock, worker parked). New loader `LoadQwen3VLVisionFromGguf` + CPU gate + driver
+`--prompt-image` probe.
+
+**Deliverable 1 (vision tower → real weights) DONE + VERIFIED.** CPU gate `test_minimax_h3 ::
+"the encoder GGUF visual.* loader dequantizes the vision tower"` passes standalone (59
+assertions). Real-weights probe on dgx: `--prompt-image` loaded the real `visual.*` tower (27
+blocks / hidden 1152 / 16 heads / out 5120 / 3 DeepStack mergers), stock Qwen3VLImageProcessor
+→ grid [1,32,32]=1024 tokens→256 merged, `Qwen3VLVisionForward` → [256,20480] ALL FINITE +
+non-degenerate (merged rms 1.45 / maxabs 29.1 = Qwen massive-activation; 3 deepstack finite).
+
+**Deliverable 2 renders (frame-sanity, visually inspected).**
+- **fl2va COHERENT (PASS):** FL2VA GGUF `--dequant-bf16` (~66 GB, free 117→23 G, no OOM) +
+  real `--first-frame` (VAE-keyframe) + `--partition fl2va`, 512×512/22f/12steps. All 22 frames
+  a coherent photorealistic orange cat on a wooden table matching the conditioning frame — no
+  grid. (VAE-keyframe path, not the vision tower.)
+- **ref2va STILL GRIDS (FAIL, honest vs the mission's expectation):** Ref2VA NVFP4
+  `--fp4-resident` (~16 GB, free→63 G) + real `--ref-image` + `--partition ref2va`,
+  256×256/22f → every frame a multicolour patch grid. Landing the tower LOADER does NOT fix it:
+  it is a loader+probe, NOT yet scattered into the DiT render-conditioning, so this render never
+  used it. fl2va (same session) is coherent ⇒ DiT/VAE/partition sound; the ref2va grid is
+  specific to the ref2va conditioning assembly. The `--ref-video` VAE encode is a slow
+  single-thread CPU 3D-CNN path (abandoned the 5×512 attempt at 98% CPU / 0% GPU).
+
+**RESIDUAL (the true deliverable-2 fix):** scatter the vision-tower merged features into
+prompt_embeds + DeepStack inject into the DEVICE text tower (`MiniMaxH3EncoderTextForwardDevice`
+has no deepstack arg yet) + confirm the exact `deepstack_visual_indexes` (inferred {8,16,24}) —
+then re-test whether the vision-enriched prompt fixes ref2va. Suite note: full `test_minimax_h3`
+SIGSEGVs at an UNRELATED CUDA case (line 3503) that PASSES in isolation (585) and runs before
+the new case — pre-existing cross-test CUDA resource-accumulation flake, not this change.
+Box left clean (no procs, GPU idle, locks released, worker parked, my artifacts pruned, ckpts
+kept). Records: spec §8.8 + §8.2, STATUS/BENCHMARKS/FEATURES, benchmark-record, NOW.

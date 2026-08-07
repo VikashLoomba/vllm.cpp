@@ -120,6 +120,34 @@ API surface, auth, and metrics.
 
 ## MiniMax-H3: video + audio generation
 
+### The exact weights (so a render is reproducible)
+
+Five files. The DiT and encoder are community GGUF quantisations; the two VAEs and
+the tokenizer come from the official checkpoint.
+
+| file | size | source |
+|---|---|---|
+| `MiniMax-H3-FL2VA-Q4_K_M.gguf` | 19.9 GB | [realrebelai/MiniMax-H3_GGUFs](https://huggingface.co/realrebelai/MiniMax-H3_GGUFs) |
+| `qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf` | 14.6 GB | [realrebelai/MiniMax-H3_GGUFs](https://huggingface.co/realrebelai/MiniMax-H3_GGUFs) |
+| `vae/diffusion_pytorch_model.safetensors` | 5.2 GB | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/video_vae/` |
+| `audio_vae/model.safetensors` | 0.6 GB | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/audio_vae/` |
+| `tokenizer.json` | 7 MB | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) `FL2VA/tokenizer/` |
+
+Take each VAE's `config.json` from the same directory as its weights: they carry the
+per-channel `latents_mean` / `latents_std` and the temporal `clip_length` /
+`token_drop`, and the decode is wrong without them.
+
+**Use Q4_K_M, not Q3_K_M.** H3's split-half RoPE produces channel-wise magnitude
+outliers that 3-bit cannot hold. In a controlled A/B (same prompt, seed, code and
+VAEs, only the DiT quantisation changed) Q3_K_M gave a murky silhouette under a
+visible lattice and Q4_K_M gave a photoreal close-up. The full bf16 release is
+66.3 GB across 13 shards if you want to go further.
+
+Higher-precision arms that exist but are not the default: NVFP4
+([lilcheaty/MiniMax-H3-NVFP4](https://huggingface.co/lilcheaty/MiniMax-H3-NVFP4),
+note the pruned variants restructure AdaLN into a timestep lookup table and are
+NOT drop-in), and the original bf16 weights under `FL2VA/transformer/`.
+
 ### Writing the prompt (read this first)
 
 Two things decide whether you get what you asked for, and neither is obvious.

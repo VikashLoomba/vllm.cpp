@@ -34,10 +34,18 @@
 // vLLM-native conformer `vllm/model_executor/models/conformer_encoder.py`
 // (`ConformerEncoder:289`) is the P5 reuse target, not this row's source.
 //
-// **SCOPE — CTC only.** `ParakeetForCTC` (:675) is upstream-defined, so the CTC
-// head and its greedy collapse are mirror work. The RNN-T / TDT transducer has
-// NO upstream in either vLLM or HF and is deliberately NOT implemented (spike
-// § Scope, "Out, and why"); it stays a product call.
+// **SCOPE: the CTC head.** `ParakeetForCTC` (:675) is upstream-defined, so the
+// CTC head and its greedy collapse are mirror work.
+//
+// **CORRECTED 2026-08-07.** This block used to end "The RNN-T / TDT transducer
+// has NO upstream in either vLLM or HF and is deliberately NOT implemented; it
+// stays a product call." That was measured against the transformers installed on
+// the spike box, 5.3.0, which ships only `ParakeetForCTC`. It is FALSE of
+// upstream `main`, which implements `ParakeetRNNTDecoder:831`,
+// `ParakeetRNNTJointNetwork:879`, `ParakeetForRNNT:922`,
+// `ParakeetTDTJointNetwork:1035` and `ParakeetForTDT:1052`, plus the greedy
+// loops in `generation_parakeet.py`. The transducer is therefore MIRROR work and
+// it lives in parakeet_transducer.h, which composes over this encoder.
 //
 // **TRACED, not read (T0).** `ParakeetEncoderAttention` selects its attention
 // path at runtime (:306-308). On the pinned oracle dump the path that ACTUALLY

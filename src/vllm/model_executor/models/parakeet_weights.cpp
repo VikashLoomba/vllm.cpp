@@ -44,8 +44,17 @@
 
 #include <nlohmann/json.hpp>
 
+// The TRANSDUCER half (`ParakeetForRNNT` :927-935, `ParakeetForTDT` :1055-1057
+// in transformers `main`) is loaded by `LoadParakeetTransducer` at the bottom of
+// this file, which reuses the encoder key map above verbatim and adds:
+//   encoder_projector.{weight,bias}                                    (:930)
+//   decoder.embedding.weight                                           (:837)
+//   decoder.lstm.{weight_ih_l,weight_hh_l,bias_ih_l,bias_hh_l}{0..N-1} (:838-843)
+//   decoder.decoder_projector.{weight,bias}                            (:844)
+//   joint.head.{weight,bias}                                    (:885 / :1044)
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/parakeet_encoder.h"
+#include "vllm/model_executor/models/parakeet_transducer.h"
 #include "vt/dtype.h"
 
 namespace vllm::multimodal {
@@ -311,6 +320,20 @@ ParakeetEncoderLayerWeights LoadLayer(const Resolver& r, const std::string& pref
   return w;
 }
 
+// The encoder half, shared by `ParakeetForCTC` and the two transducer heads:
+// all three nest it under `encoder.` (:680, :929), and a standalone
+// `ParakeetEncoder` checkpoint has no prefix.
+ParakeetEncoderWeights LoadEncoder(const Resolver& r, const ParakeetEncoderConfig& cfg) {
+  const std::string prefix = r.Has("encoder.subsampling.layers.0.weight") ? "encoder." : "";
+  ParakeetEncoderWeights w;
+  w.subsampling = LoadSubsampling(r, prefix, cfg);
+  w.layers.reserve(static_cast<size_t>(cfg.num_hidden_layers));
+  for (int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
+    w.layers.push_back(LoadLayer(r, prefix, i, cfg));
+  }
+  return w;
+}
+
 }  // namespace
 
 ParakeetEncoderConfig LoadParakeetConfig(const std::string& dir) {
@@ -323,20 +346,136 @@ ParakeetForCTCWeights LoadParakeetForCTC(const std::string& dir,
   if (out_cfg != nullptr) *out_cfg = cfg;
 
   Resolver r(dir);
-  // `ParakeetForCTC` nests the encoder under `encoder.` (:680); a standalone
-  // `ParakeetEncoder` checkpoint has no prefix.
-  const std::string prefix = r.Has("encoder.subsampling.layers.0.weight") ? "encoder." : "";
-
   ParakeetForCTCWeights w;
-  w.encoder.subsampling = LoadSubsampling(r, prefix, cfg);
-  w.encoder.layers.reserve(static_cast<size_t>(cfg.num_hidden_layers));
-  for (int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
-    w.encoder.layers.push_back(LoadLayer(r, prefix, i, cfg));
-  }
+  w.encoder = LoadEncoder(r, cfg);
   w.ctc_head_w = r.Get("ctc_head.weight");
   RequireSize("ctc_head.weight", w.ctc_head_w, cfg.vocab_size * cfg.hidden_size);
   w.ctc_head_b = r.Get("ctc_head.bias");
   RequireSize("ctc_head.bias", w.ctc_head_b, cfg.vocab_size);
+  return w;
+}
+
+std::string LoadParakeetModelType(const std::string& dir) {
+  const nlohmann::json doc = nlohmann::json::parse(ReadFile(dir + "/config.json"));
+  // configuration_parakeet.py:116 / :164 / :224.
+  return JsonStr(doc, "model_type", "");
+}
+
+ParakeetTransducerConfig LoadParakeetTransducerConfig(const std::string& dir) {
+  const nlohmann::json doc = nlohmann::json::parse(ReadFile(dir + "/config.json"));
+  ParakeetTransducerConfig cfg;
+  // ParakeetRNNTConfig fields (configuration_parakeet.py:167-175).
+  cfg.vocab_size = JsonInt(doc, "vocab_size", cfg.vocab_size);
+  cfg.decoder_hidden_size = JsonInt(doc, "decoder_hidden_size", cfg.decoder_hidden_size);
+  cfg.num_decoder_layers = JsonInt(doc, "num_decoder_layers", cfg.num_decoder_layers);
+  cfg.hidden_act = JsonStr(doc, "hidden_act", cfg.hidden_act);
+  cfg.max_symbols_per_step =
+      JsonInt(doc, "max_symbols_per_step", cfg.max_symbols_per_step);
+  cfg.blank_token_id =
+      static_cast<int32_t>(JsonInt(doc, "blank_token_id", cfg.blank_token_id));
+  cfg.pad_token_id = static_cast<int32_t>(JsonInt(doc, "pad_token_id", cfg.pad_token_id));
+
+  // ParakeetTDTConfig.durations (:225). Absent => RNN-T.
+  const auto dur = doc.find("durations");
+  if (dur != doc.end() && dur->is_array()) {
+    cfg.durations = dur->get<std::vector<int64_t>>();
+    // `_update_model_kwargs_for_generation` (generation_parakeet.py:288, :293)
+    // advances the encoder pointer by the duration head's ARGMAX INDEX rather
+    // than by `durations[index]`. The two coincide exactly when `durations` is
+    // the identity list, which it is on every published checkpoint
+    // ([0, 1, 2, 3, 4]). We advance by `durations[index]`, which is NeMo's
+    // semantics; refuse anything else rather than silently disagreeing with the
+    // upstream we gate against.
+    for (size_t i = 0; i < cfg.durations.size(); ++i) {
+      if (cfg.durations[i] != static_cast<int64_t>(i)) {
+        throw std::runtime_error(
+            "parakeet: non-identity `durations` is not supported: upstream's greedy "
+            "TDT loop advances by the duration head's argmax INDEX, which only agrees "
+            "with the configured duration VALUES for the identity list every published "
+            "checkpoint ships");
+      }
+    }
+  }
+
+  // generation_config.json, when the checkpoint ships one.
+  std::ifstream probe(dir + "/generation_config.json", std::ios::binary);
+  if (probe.good()) {
+    probe.close();
+    const nlohmann::json gen =
+        nlohmann::json::parse(ReadFile(dir + "/generation_config.json"));
+    cfg.decoder_start_token_id =
+        static_cast<int32_t>(JsonInt(gen, "decoder_start_token_id", -1));
+    const auto eos = gen.find("eos_token_id");
+    if (eos != gen.end() && eos->is_number()) {
+      cfg.eos_token_ids.push_back(eos->get<int32_t>());
+    } else if (eos != gen.end() && eos->is_array()) {
+      cfg.eos_token_ids = eos->get<std::vector<int32_t>>();
+    }
+  }
+  return cfg;
+}
+
+ParakeetForTransducerWeights LoadParakeetTransducer(const std::string& dir,
+                                                    ParakeetEncoderConfig* out_enc,
+                                                    ParakeetTransducerConfig* out_cfg) {
+  const ParakeetEncoderConfig enc = LoadParakeetConfig(dir);
+  const ParakeetTransducerConfig cfg = LoadParakeetTransducerConfig(dir);
+  if (out_enc != nullptr) *out_enc = enc;
+  if (out_cfg != nullptr) *out_cfg = cfg;
+
+  const int64_t D = cfg.decoder_hidden_size;
+  Resolver r(dir);
+
+  ParakeetForTransducerWeights w;
+  w.encoder = LoadEncoder(r, enc);
+
+  // :930 nn.Linear(encoder hidden_size -> decoder_hidden_size).
+  w.encoder_projector_w = r.Get("encoder_projector.weight");
+  RequireSize("encoder_projector.weight", w.encoder_projector_w, D * enc.hidden_size);
+  w.encoder_projector_b = r.GetOptional("encoder_projector.bias");
+
+  // :837 nn.Embedding(vocab_size, decoder_hidden_size).
+  w.decoder.embedding = r.Get("decoder.embedding.weight");
+  RequireSize("decoder.embedding.weight", w.decoder.embedding, cfg.vocab_size * D);
+
+  // :838-843 nn.LSTM(D, D, num_layers=N, batch_first=True). Every layer's input
+  // width is D, since hidden_size == input_size here.
+  w.decoder.lstm.reserve(static_cast<size_t>(cfg.num_decoder_layers));
+  for (int64_t l = 0; l < cfg.num_decoder_layers; ++l) {
+    const std::string s = std::to_string(l);
+    ParakeetLstmLayerWeights lw;
+    lw.weight_ih = r.Get("decoder.lstm.weight_ih_l" + s);
+    RequireSize("decoder.lstm.weight_ih_l" + s, lw.weight_ih, 4 * D * D);
+    lw.weight_hh = r.Get("decoder.lstm.weight_hh_l" + s);
+    RequireSize("decoder.lstm.weight_hh_l" + s, lw.weight_hh, 4 * D * D);
+    // torch's `bias=True` default gives BOTH; a bias-free LSTM gives neither.
+    lw.bias_ih = r.GetOptional("decoder.lstm.bias_ih_l" + s);
+    lw.bias_hh = r.GetOptional("decoder.lstm.bias_hh_l" + s);
+    if (lw.bias_ih.empty() != lw.bias_hh.empty()) {
+      throw std::runtime_error("parakeet: decoder.lstm layer " + s +
+                               " has only one of bias_ih/bias_hh");
+    }
+    if (!lw.bias_ih.empty()) {
+      RequireSize("decoder.lstm.bias_ih_l" + s, lw.bias_ih, 4 * D);
+      RequireSize("decoder.lstm.bias_hh_l" + s, lw.bias_hh, 4 * D);
+    }
+    w.decoder.lstm.push_back(std::move(lw));
+  }
+
+  // :844 nn.Linear(D, D).
+  w.decoder.projector_w = r.Get("decoder.decoder_projector.weight");
+  RequireSize("decoder.decoder_projector.weight", w.decoder.projector_w, D * D);
+  w.decoder.projector_b = r.GetOptional("decoder.decoder_projector.bias");
+
+  // :885 nn.Linear(D, vocab_size), widened to vocab_size + len(durations) by
+  // `ParakeetTDTJointNetwork` (:1044). The checkpoint's own width is what tells
+  // RNN-T and TDT apart if config.json ever disagreed, so check it.
+  w.joint_head_w = r.Get("joint.head.weight");
+  RequireSize("joint.head.weight", w.joint_head_w, cfg.joint_output_size() * D);
+  w.joint_head_b = r.GetOptional("joint.head.bias");
+  if (!w.joint_head_b.empty()) {
+    RequireSize("joint.head.bias", w.joint_head_b, cfg.joint_output_size());
+  }
   return w;
 }
 

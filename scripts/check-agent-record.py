@@ -24,7 +24,15 @@ MATRICES = {
     # `nano_nemotron_vl.py` and delegates the encoder itself to transformers, so
     # there is no `registry.py` entry to inventory. A genuinely new row, never a
     # count relaxed to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 360),
+    # 361 since 2026-08-07: +`MODEL-AUDIO-PARAKEET-TRANSDUCER` (the Parakeet RNN-T
+    # and TDT heads over that same encoder: `ParakeetForRNNT` / `ParakeetForTDT`,
+    # spike work item P6). A SEPARATE row rather than an advance of the encoder
+    # row, because it is a different upstream model class with its own state dict,
+    # its own decode and its own checkpoints. Like the encoder row it is not one
+    # of the 328 registry architectures: vLLM has no transducer call site at all
+    #: so there is nothing in `registry.py` to inventory. Bumped because a new
+    # row EXISTS, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 361),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

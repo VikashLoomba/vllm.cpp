@@ -365,6 +365,20 @@ vllm_cpp_add_test(test_parakeet_encoder vllm/models/test_parakeet_encoder.cpp)
 vllm_cpp_add_test(test_parakeet_ctc_engine vllm/models/test_parakeet_ctc_engine.cpp)
 target_compile_definitions(test_parakeet_ctc_engine PRIVATE
   PARAKEET_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet")
+# P5: the RNN-T / TDT TRANSDUCER gate: the LSTM prediction network, the joint
+# (with the TDT duration head) and the greedy transducer loop vs a dumped
+# HuggingFace `ParakeetForRNNT` / `ParakeetForTDT` ORACLE from transformers
+# `main`: which DOES implement them, contrary to what the P4 spike recorded off
+# the locally installed 5.3.0. Decoder and joint tensors by rel-L2; the emitted
+# sequence and the per-step durations EXACT. Also gates the LSTM cell against an
+# independent in-test scalar reference. The oracle is a small SEEDED,
+# RANDOMLY-INITIALISED model, so nothing is claimed about a transcript; the
+# pretrained arm (VLLM_PARAKEET_TRANSDUCER_CKPT + _REF) gates ids against a real
+# `generate()` run and is skipped when unset. Fixture COMMITTED (1.1 MiB,
+# scripts/mm/p5_parakeet_transducer_oracle_dump.py). CPU-only.
+vllm_cpp_add_test(test_parakeet_transducer vllm/models/test_parakeet_transducer.cpp)
+target_compile_definitions(test_parakeet_transducer PRIVATE
+  PARAKEET_TRANSDUCER_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_transducer")
 # M3d — NEAR-TIE-ROBUST e2e VIDEO->text token gate on the Qwen3.6-27B GDN-hybrid
 # gate model: the full pipeline (video processor -> tower per-frame windowed attn,
 # 27B vision config -> merge -> forked GDN-hybrid video MRoPE greedy decode) vs the

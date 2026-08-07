@@ -281,6 +281,8 @@ M4. We never publish a partial, contended, or stale-denominator number as
 binding, and when a denominator turns out to be wrong we correct every ratio
 built on it rather than keeping the flattering one.
 
+
+**CPU elementwise GEMM, x86 wide tiers + transpose-free `[K,N]` path (2026-08-06).** INDICATIVE ONLY, not binding: the x86 dev box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. AVX-512 measures 1.56x to 2.83x over SSE2; on dgx aarch64 the `[K,N]` path beats `[N,K]` by 1.16x to 1.30x, byte-identically. A binding number needs a qualified x86 host, which the project does not have.
 ## Open gaps
 
 | Track | Status | Next gate |

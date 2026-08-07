@@ -191,6 +191,9 @@ abstraction, and `world_size == 1` stays byte-identical.
 | Multi-node | ☐ spike written | ✅ | ✅ |
 | PD disaggregation | ☐ | ✅ | ✅ |
 
+
+CPU elementwise GEMM runs AVX2/AVX-512 tiers on x86 (SSE2 before) and can take a transpose-free `[K,N]` weight path via an opt-in load-time repack (`VT_CPU_ELEM_KN_REPACK`, CPU only, default off). Byte-identical to the portable tier.
+
 ## Not supported yet
 
 | Gap | State | Detail |

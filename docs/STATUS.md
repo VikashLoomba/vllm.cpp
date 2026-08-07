@@ -380,6 +380,8 @@ The correctness form and the full D0-D14 measured chronology live in
 [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) and
 [.agents/specs/dflash-spec-decode.md](../.agents/specs/dflash-spec-decode.md).
 
+CPU elementwise GEMM, wide x86 + transpose-free path (2026-08-06): AVX2 and AVX-512 tiers (SSE2 before), M-blocked `[K,N]` kernels, and an opt-in load-time `[N,K]->[K,N]` repack (`VT_CPU_ELEM_KN_REPACK`, CPU-only). Byte-identical to the portable tier on every tier and dtype; no FMA, no split K reduction. Speed indicative only, the x86 box is VOID for timing.
+
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed — see the capability table; not yet usable

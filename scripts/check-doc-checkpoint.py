@@ -359,13 +359,34 @@ GOVERNANCE_FILES = frozenset(
         "scripts/check-protocol-consistency.py",
         "scripts/check-role-discipline.py",
         "scripts/claim-view.py",
+        "scripts/ready-for-helper.py",
         "tests/scripts/test_agent_role.py",
         "tests/scripts/test_claim_view.py",
+        "tests/scripts/test_ready_for_helper.py",
         "tests/scripts/test_policy_contract.py",
         "tests/scripts/test_check_prompt_contract.py",
         "tests/scripts/test_doc_checkpoint.py",
         "tests/scripts/test_check_protocol_consistency.py",
         "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md",
+        ".agents/completed/pre-cutover-claim-protocol.md",
+    }
+)
+
+# coordination.md normally moves live feature state and therefore owes NOW plus
+# the checkpoint projections.  This one closed migration removes only its
+# obsolete generated-claim snapshot.  Scope the exception to the complete,
+# exact cutover transaction so a later coordination edit -- alone or alongside
+# feature work -- cannot inherit a blanket governance bypass.
+CLAIM_CUTOVER_FILES = frozenset(
+    {
+        "scripts/claim-view.py",
+        "scripts/ready-for-helper.py",
+        "tests/scripts/test_claim_view.py",
+        "tests/scripts/test_ready_for_helper.py",
+        ".agents/coordination.md",
+        ".agents/completed/pre-cutover-claim-protocol.md",
+        "scripts/check-doc-checkpoint.py",
+        "tests/scripts/test_doc_checkpoint.py",
     }
 )
 FEATURE_CHECKPOINT_FILES = frozenset(
@@ -446,8 +467,14 @@ def classify_changed_paths(paths: list[str]) -> set[str]:
 
     classes: set[str] = set()
     path_set = set(paths)
+    exact_claim_cutover = (
+        path_set == CLAIM_CUTOVER_FILES
+    )
     for path in sorted(path_set):
         if path in PUBLIC_SURFACES:
+            continue
+        if exact_claim_cutover and path == ".agents/coordination.md":
+            classes.add("governance")
             continue
         if path in GOVERNANCE_FILES:
             classes.add("governance")

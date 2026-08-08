@@ -156,6 +156,56 @@ class SemanticClassificationTests(unittest.TestCase):
         self.assertEqual(doc_checkpoint.classify_changed_paths(paths), {"governance"})
         self.assertEqual(doc_checkpoint.checkpoint_errors(set(paths)), [])
 
+    def test_live_claim_checker_files_are_exact_governance(self) -> None:
+        for path in (
+            "scripts/claim-view.py",
+            "scripts/ready-for-helper.py",
+            "tests/scripts/test_claim_view.py",
+            "tests/scripts/test_ready_for_helper.py",
+            ".agents/completed/pre-cutover-claim-protocol.md",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    doc_checkpoint.classify_changed_paths([path]), {"governance"}
+                )
+
+    def test_exact_claim_cutover_migration_has_no_public_feature_obligation(self) -> None:
+        paths = {
+            "scripts/claim-view.py",
+            "scripts/ready-for-helper.py",
+            "tests/scripts/test_claim_view.py",
+            "tests/scripts/test_ready_for_helper.py",
+            ".agents/coordination.md",
+            ".agents/completed/pre-cutover-claim-protocol.md",
+            "scripts/check-doc-checkpoint.py",
+            "tests/scripts/test_doc_checkpoint.py",
+        }
+        self.assertEqual(doc_checkpoint.classify_changed_paths(sorted(paths)), {"governance"})
+        self.assertEqual(doc_checkpoint.checkpoint_errors(paths), [])
+
+    def test_coordination_bypass_is_not_broadened_beyond_exact_cutover(self) -> None:
+        self.assertEqual(
+            doc_checkpoint.classify_changed_paths([".agents/coordination.md"]),
+            {"feature_checkpoint", "live_state"},
+        )
+        classes = doc_checkpoint.classify_changed_paths(
+            [
+                ".agents/coordination.md",
+                ".agents/completed/pre-cutover-claim-protocol.md",
+                "src/vt/backend.cpp",
+            ]
+        )
+        self.assertIn("feature_checkpoint", classes)
+        self.assertIn("live_state", classes)
+        pair_only = doc_checkpoint.classify_changed_paths(
+            [
+                ".agents/coordination.md",
+                ".agents/completed/pre-cutover-claim-protocol.md",
+            ]
+        )
+        self.assertIn("feature_checkpoint", pair_only)
+        self.assertIn("live_state", pair_only)
+
     def test_governance_design_is_not_misclassified_as_feature_work(self) -> None:
         path = "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md"
         self.assertEqual(doc_checkpoint.classify_changed_paths([path]), {"governance"})

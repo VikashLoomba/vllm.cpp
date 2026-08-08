@@ -19,6 +19,66 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## KIMI-BF16-STREAM — bf16 residual stream end-to-end REFUTED (122→4/128, KDA repeat-loop destabilization, no speed win); STRICT is NOT reachable by residual-precision (§14-§20 all closed); 122/128 @ 18.9 tok/s (0.90× vLLM) is the coherent best; SERVER runner fold scoped (runner aborts on Kimi's KV today) (2026-08-07, `row/KIMI-BF16-STREAM-CLOSE`, base `origin/main` `2f029a10`, GB10 sm_121a, PR #118)
+
+The #113 follow-on tested the §19-named residual #1 — the bf16 residual stream END-TO-END, framed as
+"the ONE lever both verdicts point at" (STRICT via vLLM bf16 rounding on p7 + speed via killing the 3%
+CastBf16). Implemented STRUCTURALLY (bf16 `DBuf`s for hidden/residual/normed-hidden/block-outputs via
+`vt::FusedChain(kFusedAddRmsNormStd)`, mirroring `deepseek_v2.cpp:479-615`; supersedes the partial §14
+RoundDevBf16 knob), gated behind `VT_KIMI_BF16_STREAM` (default OFF). Clean-from-`origin/main` `2f029a10`
+CUDA build (`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_CUTLASS_DIR=…cutlass-4.5.0`, nvcc 13.0.88, Release), built in `/dev/shm`. CPU gate
+`test_kimi_linear_forward` 15/15·875 with the knob OFF (byte-identical); knob ON keeps the greedy-TOKEN
+state-carry check (incremental==recompute) but trips case-(l)'s 1e-5 logit tol (too tight for bf16).
+
+**GB10 full 48.9B 128-gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored,
+min-avail 18G, NO reboot; §12 golden md5 `bfa5bdbf…`; CONTROL reproduces §19's 122 EXACTLY, 3×):**
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1 DEVICE_KDA_CHUNK=1`, `--incremental`) | /128 | tok/s (steady) |
+|---|---|---|---|
+| CONTROL (f32 stream) | — | **122** | 18.9-19.0 |
+| **+bf16 stream** | `VT_KIMI_BF16_STREAM=1` | **4** | 19.8 |
+| bf16 stream, recompute+f64-island (diagnostic) | `VT_KIMI_BF16_STREAM=1` (no device-KDA, non-incremental) | **5** | 1.47 |
+
+- **REFUTED on BOTH axes.** bf16 residual REGRESSES 122→4/128: the KDA recurrence DESTABILIZES into
+  degenerate REPEAT LOOPS (p1 `15383,387,15383,387…`, p2 `220,16,25,…`, p4 `220,2466,25,…`) — the
+  §14/§15 "bf16 destabilizes KDA" pathology, confirmed STRUCTURALLY. **No speed win** (18.9→19.8, within
+  noise; the removed CastBf16 is a memory-bound decode's ~3% that overlaps the GEMVs, offset by the added
+  `ToStream` + bf16-norm-weight casts).
+- **Diagnostic (5/128 vs §14's f32-variance BF16_RESIDUAL=106):** the STRUCTURAL stream computes the
+  RMSNorm variance over the bf16-ROUNDED residual (vLLM's ACTUAL `fused_add_rms_norm` order,
+  `cpu_ops.cpp:326-332`) — MORE vLLM-faithful yet EVEN LESS stable than §14's f32-variance approximation.
+  Both bf16 variants sit far below the f32 control's 122 ⇒ the direction is dead in ALL variance
+  treatments.
+- **STRICT verdict, definitive:** with §14 (host-precision plateau 120), §15 (device-KDA 122), §16
+  (device-MLA 109), §18 (chunk-every-step 102), and now bf16-stream (4-5) — **p7 is an INTRINSIC near-tie;
+  122/128 @ 18.9 tok/s (0.90× vLLM) is Kimi-Linear's coherent best; STRICT is NOT reachable by residual-
+  precision or device-island approximation.** The only remaining STRICT/speed path is vLLM's ACTUAL fused
+  kernels via the full runner fold.
+- **SERVER runner fold (ARCH-ONE-SURFACE req 4): scoped, enabling-blocked.** The runner ABORTS on Kimi's
+  KV today — `VT_CHECK(mamba_spec->shapes == …)` at `runner.cpp:489-493` fails because Kimi lacks the
+  qwen3_5 `linear_*` config fields + `layer_types` (its KDA split lives in `linear_attn_config`). The fold
+  = synthesize layer_types + source GDN geometry from `linear_attn_config` + a Kimi KDA-paged block
+  (`KdaChunkPrefill`/`KdaGatedDeltaRule` over `gdn_state`) + a NoPE-MLA-paged block (`ForwardMlaAttentionBlock`
+  identity-RoPE) + bind in `ForwardDevice`; a multi-brick runner-touching integration (gate-model regression
+  risk), NOT landed this campaign. `VT_KIMI_BF16_STREAM` kept default-OFF as a documented-measured-negative.
+
+## KIMI-PAGED-INCREMENTAL — paged-incremental decode LANDS the 5× speed win (4.23→18.9 tok/s, 0.20×→0.90× vLLM); Gate A token-identical to recompute; STRICT NOT reached (p7 intrinsic near-tie, 122/128); decode is 90% cuBLAS-GEMV-parity (2026-08-07, `row/KIMI-PAGED-INCREMENTAL`, base `origin/main` `68b394bc`, commit `f9ba4a9c`, GB10 sm_121a, PR #113)
+
+Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 18-21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy` (md5 `bfa5bdbf…`). vLLM ~21 stands from #111 (re-run only ours). The §18 lever (e) built: prefill-once (KDA recurrent+conv state carried, NoPE-MLA latent-KV cached) + recurrent decode-step; mirrors vLLM `kimi_gdn_linear_attn._forward` (prefill=`chunk_kda_with_fused_gate` / decode=`fused_recurrent_kda`) at `vllm-src` `a4e3cb4`.
+
+| config | env (all `DEVICE_COMPUTE=1 DEVICE_KDA=1`) | /128 | tok/s (steady) | first-step | note |
+|---|---|---|---|---|---|
+| recompute (O(n²)) | (recompute vehicle) | **122** | 4.23 | 0.498s | reproduces #111/§15/§16 EXACTLY (p0-p6 16/16, p7 10/16) |
+| incremental + recurrence-prefill | `--incremental` | 120 | 16.63 | 0.640s | p0-p6 16/16; p7 flips 10→8/16 (GPU near-tie) |
+| **incremental + chunk-prefill** | `--incremental DEVICE_KDA_CHUNK=1` | **122** | **18.87 / 19.03** | 0.54-0.62s | **token-IDENTICAL to recompute (p7 `got` byte-exact)** |
+
+- **SPEED (headline).** Paged-incremental (chunk-prefill) = **18.9-19.0 tok/s steady** (2 runs) vs the O(n²) recompute **4.23** = **4.5×**; **0.90× of vLLM ~21** (the #111 16-tok AGGREGATE floor) — the MEASURED 5× decode gap (0.20×, #111) is CLOSED to ~1.1×. It runs the projections/MoE for 1 token/step (decode) instead of [0..prompt+t].
+- **Gate A (token identity) — PASS for chunk-prefill.** `incremental+chunk-prefill` byte-token-identical to `recompute` across ALL 128 tokens (p7 `got` string `276,6315,7275,382,2512,2470,387,658,18705,58084,824,2234,397,73874,2366,16626` exact-equal). Recurrence-prefill matches on p0-p6 (112 tokens) and flips ONLY the p7 near-tie (10→8/16) — GPU projection-GEMM M-dimension tiling (M=P prefill / M=1 decode → different cuBLAS kernel) perturbing the single documented near-tie, the §14/§16 coin-flip class; NOT a wiring bug (CPU gate byte-exact, `test_kimi_linear_forward` 15/15·875).
+- **Gate B (STRICT) — NOT reached, 122/128.** Chunk-prefill (vLLM's PROMPT order) in the RIGHT vehicle reproduces recompute's 122/128 EXACTLY — does NOT close p7. HONESTLY REFUTES the #111 "p7 suspect in the right vehicle → STRICT" hypothesis: p7 is INTRINSIC (§13/§14 — f32-accurate forward vs the golden's deterministic bf16 top-1 at a comma; golden pos-6 `11`, ours `387`), not a chunked-vs-recurrent artifact.
+- **DECODE DECOMPOSITION (nsys `cuda_gpu_kern_sum`, OUR decode, 99 steps, same-tool).** ~90% = `internal::gemvx::kernel<bf16,float,float>` 71.2% (57,144 inst) + cutlass bf16 WMMA GEMM 14.2%+1.1% + more gemvx — the SAME cuBLAS batch-1 GEMV symbol vLLM calls (cuBLAS-parity, [[laguna-gap-is-gpu-compute-not-host]]). CastBf16 3.0%, KdaScanKernel 2.3% (1,980 inst = decode=recurrent ✓), MoE glue (router+silu+combine) 2.3%, convs 0.7%; chunk kernels 20 inst = PREFILL only (prefill=chunk / decode=recurrent IN VIVO). **Killing O(n²) ALONE reaches parity-class; no single lever is load-bearing beyond it** — the residual is ~15% host-orchestration idle + 3% CastBf16 (a bf16 residual stream, the one lever that is ALSO the p7-STRICT lever), NOT a missing grouped-MoE kernel. **vLLM-live-nsys at util 0.82 NOT run** — a MEASURED box-safety violation (vLLM reserves 95-98 GiB + nsys ~2 GiB → min-avail below the 15 GiB LIFE-CRITICAL floor; #111's un-traced 0.82 already at 15 GiB).
+- **Default.** `--incremental` opt-in; `VT_KIMI_DEVICE_KDA`/`_CHUNK` STAY OFF (122/128 ≠ STRICT, K=3-deterministic golden). The paged-incremental path is the validated 4.5× speed lever, opt-in until STRICT lands.
+
 ## KIMI-CHUNK-KDA-P2 — chunk_kda prefill op lands + GB10-validated (unit 4.68e-5), but chunk-EVERY-STEP in the O(n²) recompute island REGRESSES 122→102/128 (worse than the recurrence's 122); vLLM ~5× faster on decode; the real lever is paged-incremental decode (2026-08-07, `row/KIMI-CHUNK-KDA-P2`, base `origin/main` `5548a731`, GB10 sm_121a, PR #111)
 
 Full 48.9B GB10 gate (single-load/config, `flock $HOME/gpu.lock`, `drop_caches`, memory-monitored, min-avail 21 GiB, NO reboot) vs the §12 STRICT `greedy_ids.npy`; the vLLM arm SEQUENTIAL after ours at the §12 recipe (util 0.82, triton MoE, eager, seqs=1; min-avail 15 GiB, no reboot):
@@ -14685,6 +14745,91 @@ Full 48.9B GB10 gate vs the §12 STRICT `greedy_ids.npy` (single-load per config
 WHY NEGATIVE (the §14 razor, re-proven). device-KDA WORKS (106→122) because the recurrence is the SAME algorithm as vLLM's decode kernel, only f32-on-bf16 — it MATCHES. But vLLM's MLA prefill uses FA2 (a specific flash tiling/reduction ORDER); `vt::Attention`'s plain f32 online-softmax is the right MATH but a DIFFERENT reduction order, so — exactly like §14's host-precision plateau — it COIN-FLIPS near-ties: it BREAKS p3 16/16→3/16 (got `220,41938,382,1810,…163586,163586` — the same `163586×` degenerate repeat §14's bf16 knobs caused) while p7 stays diverged at 10/16. And it is SLOWER (4.24→3.89): the per-`(t,h)` key/value build copies + the 192-dim pad-V waste add overhead to the O(n²) recompute path. An approximation of vLLM's kernel is not enough — only the ACTUAL kernel matches.
 
 VERDICT: `VT_KIMI_DEVICE_MLA` STAYS OFF, kept as a documented-MEASURED-NEGATIVE A/B knob (parity-lever precedent: §14's `ISLAND_F32ACC`). device-KDA (122/128, 4.24 tok/s) remains the best config, itself default OFF (122 ≠ STRICT). The one-brick STRICT-close did NOT land. STRICT residual, SHARPENED: needs vLLM's ACTUAL kernels, not a device approximation — (c) the **chunk_kda** prefill family (`chunk_kda_scaled_dot_kkt`+`recompute_w_u`+`chunk_gla_fwd_o_gk`+`fused_kda_gate_chunk_cumsum`, FLA `ops/kda.py`) via a Triton-AOT regen for sm_121a (`scripts/regen-triton-aot.sh` + new `triton_kernels/*.py`), the named prime suspect; (d) the paged FA2 `mla::ForwardMlaAttentionBlock` (NOT the `vt::Attention` approximation tried here); (e) paged-incremental decode (needs a decode/paged-attn op with `query_len≠key_len`, which `vt::Attention` cannot express; kills the O(n²)). Each is a substantial multi-kernel brick, recorded as the named follow-on. Row STAYS ACTIVE. HONEST bar stays HW-forced-indirect (vLLM cannot serve this bf16 on one GB10 with KV headroom — §14).
+## Parakeet ASR port: first timing attempt, recorded VOID (2026-08-07)
+
+Recorded so the next person does not repeat it and does not mistake these
+numbers for a result.
+
+`examples/parakeet-transcribe`, `nvidia/parakeet-ctc-0.6b`, x86 dev box, 20
+cores, CPU f32:
+
+| clip | audio | wall |
+|---|---:|---|
+| 1089-134686-0000 | 10.44 s | 8.38 / 12.59 / 9.15 s |
+| 1089-134686-0001 | 3.27 s | 17.39 / 9.51 s |
+
+**VOID on three independent counts**, any one of which is disqualifying:
+
+1. The timed region includes loading a **2.4 GiB f32 safetensors** on every run,
+   which dominates it. The 3.27 s clip taking LONGER than the 10.44 s one is the
+   tell: this measures the loader, not the model.
+2. Run-to-run spread is ~2x (9.51 vs 17.39 s on the same clip), so there is no
+   stable median to quote. The box was at 98% disk with other sessions active.
+3. The x86 dev box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`
+   regardless of the above.
+
+**What a real number needs**, in order: hoist the checkpoint load out of the
+timed region (load once, transcribe N clips); run on the gate host `dgx.casa`
+idle under one flock with 3+ reps; and put **parakeet.cpp on the SAME
+checkpoint** beside it as the floor, which today means converting
+`parakeet-ctc-0.6b` to GGUF since the local parakeet.cpp build only has
+`tdt_ctc-110m` (a 5.5x smaller model at f16, so the existing 0.17 s figure for
+it is NOT a comparable baseline and must not be quoted as one).
+
+Also worth stating plainly: **no optimisation pass has been attempted on this
+port.** It is f32, portable/AVX2 CPU tiers, no quantisation, no CUDA provider
+for its three new ops. The correctness work is done; the speed work has not
+started, and the first honest number will likely be poor.
+
+## Parakeet port vs parakeet.cpp, SAME checkpoint, load excluded (2026-08-07)
+
+Supersedes the VOID attempt above. Same box, same clip, and for the first time
+the SAME weights on both sides: `nvidia/parakeet-ctc-0.6b`, taken as HF
+safetensors by vllm.cpp and as `mudler/parakeet-cpp-gguf:ctc-0.6b-f16.gguf` by
+parakeet.cpp. LibriSpeech `1089-134686-0000.wav`, 10.44 s, x86 20 cores.
+
+### Correctness: the two engines agree EXACTLY
+
+parakeet.cpp `--json` emits token ids
+`67 17 163 33 131 209 50 70 969 69 26 10 896 808 346 1003 25 ...`
+and vllm.cpp's `parakeet-transcribe` emits the identical sequence, 63 ids, same
+order. Two independent implementations, one of them gated at WER 0 against NeMo,
+produce byte-identical token output on real audio. That is a stronger
+correctness signal than either engine's own oracle gate.
+
+### Speed: we are at least 12x slower, and that is the honest headline
+
+| engine | dtype | measurement |
+|---|---|---|
+| vllm.cpp | f32 | **6217 ms** forward-only, best of 5, load and mel EXCLUDED |
+| parakeet.cpp | f16 | **9.09 s** total for the 10.44 s clip, **9.24 s** total for a 3.27 s clip |
+
+parakeet.cpp's wall time is insensitive to clip length (9.09 vs 9.24 s for 3.2x
+the audio), so it is load-dominated and its INFERENCE is bounded by the
+difference: well under 0.5 s, and by the trend nearer 0.15 s. Against our
+6217 ms that is a floor of **>12x slower**, and plausibly ~40x.
+
+Method caveats, stated rather than buried: the x86 box is VOID for binding
+timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`, so treat the RATIO (same box, same
+clip, both engines) as the result and neither absolute as bindable. Our number
+excludes load while parakeet.cpp's includes it, which flatters US, and the gap
+is still >12x. Our f32 against their f16 also flatters them on memory
+bandwidth, so a like-for-like dtype comparison is still owed.
+
+### Why, and what would close it
+
+Nothing here is surprising and none of it is a defect:
+- we run **f32**; they run f16, and their GGUF path also has q8_0/q4_k
+- our three new ops (`kConv2d`, `kDepthwiseConv1d`, `kAttentionRelPos`) have a
+  portable CPU tier ONLY: no CUDA provider, and no arch-specific tier
+- ggml carries llamafile's tiled sgemm, measured earlier in this record as worth
+  ~1.9x on Arm 16-bit and ~2.4x on x86, which we deliberately do not match
+  because it splits the K reduction and uses FMA
+- no optimisation pass of any kind has been attempted on this port
+
+**The correctness work is done; the speed work has not started.** This entry
+exists so nobody mistakes the port for competitive, and so the first optimisation
+claim has a real baseline to beat.
 
 ## 2026-08-07 — Kimi-Linear-48B: chunk_kda PREFILL AOT port SPIKED (kernel set + pinned-config record + regen recipe; NO gate yet) (`row/KIMI-CHUNK-KDA-AOT`)
 
@@ -14936,3 +15081,904 @@ RSS, no compiler cache. Timings, for the record only: arm A 48 s for both files
 - The class of defect — an op whose validation accepts N dtypes while one
   provider implements 1 — is fixed at this call site only. A tree-wide sweep of
   "provider narrower than its op contract" is NOT done and is worth a row.
+VERDICT: device-KDA (122/128, 4.24 tok/s) is the NEW BEST on BOTH axes but STILL a DIVERGENCE (STRICT required, K=3-deterministic golden) → `VT_KIMI_DEVICE_KDA` STAYS OFF (parity-enablers). The residual is now a SINGLE near-tie (p7 pos-6). NAMED next brick to STRICT (+ more speed): the KDA chunked-prefill kernel family (vLLM processes the PROMPT with `chunk_kda`, we still run the recurrent form — regen a Triton-AOT cubin for sm_121a via `scripts/regen-triton-aot.sh`, or a native `chunk_kda` port) + paged `mla::ForwardMlaAttentionBlock` for the 7 NoPE-MLA layers + paged-incremental decode (persistent KDA state + MLA-KV, kills the remaining O(n²)). Row STAYS ACTIVE.
+
+### VK-E unblocked: identical weights in both containers (2026-08-07)
+
+The blocker recorded above — "no model on dgx loads in both engines" — is RESOLVED
+without needing `VK-D`. The stock `Qwen/Qwen3-0.6B` HF snapshot (cached on dgx)
+was converted to GGUF with **llama.cpp's own** `convert_hf_to_gguf.py`, so
+llama.cpp runs the GGUF and vllm.cpp runs the safetensors it was made from —
+**byte-identical weights by construction**, which removes the weight-identity
+doubt that makes a same-named-model comparison unfalsifiable.
+
+Toolchain note worth keeping: the converter needs `transformers` + `gguf` +
+`torch` and NO single interpreter on dgx had all three (the oracle venv has
+transformers but not gguf; system python has gguf+torch but not transformers).
+Resolved with **zero installs and zero disk** by borrowing transformers via
+`PYTHONPATH=~/venvs/vllm-oracle/lib/python3.12/site-packages` into the system
+python. The oracle venv was deliberately NOT pip-installed into — it is the parity
+oracle and was expensive to repair.
+
+**llama.cpp Vulkan, full strength (`NV_coopmat2`), stock Qwen3-0.6B F16
+(1.40 GiB, 751.63 M params):**
+
+| test | t/s |
+|---|---:|
+| pp128 | **11,514.16 ± 388.21** |
+| tg32 | **160.91 ± 1.54** |
+
+Consistent with the finetune-GGUF run (11,730 / 161.4), which sanity-checks the
+measurement rather than the model.
+
+**vllm.cpp on Vulkan: the engine SELECTS Vulkan** (`[vt reference-tier] op=...
+device=3` — device 3 is `kVULKAN`) **and is orders of magnitude slower.** A
+4-prompt / 128-in / 32-out run did not finish inside 900 s, against llama.cpp's
+seconds. That is the expected shape and not a defect: **71 of 87 ops run on the
+portable CPU reference tier**, so this measures our HOST FALLBACK wearing a Vulkan
+label, not our Vulkan kernels. The reference tier announces itself per op, which
+is exactly why the slowness is attributable rather than mysterious.
+
+**Therefore no ratio is quoted.** A ratio here would be read as "our Vulkan vs
+llama.cpp's Vulkan" when it is really "our CPU tier vs llama.cpp's Vulkan". The
+comparison becomes meaningful when native coverage closes — the progress metric is
+`vt::GetReferenceTierHits()` reaching 0, and the ops that matter for this model are
+the RoPE table build, the sampler tail, and the remaining norm/glue set.
+
+#### CORRECTION (2026-08-07, same session): the vllm.cpp Vulkan arm is GPU-BOUND, not CPU-bound
+
+The entry above attributes vllm.cpp's slowness to "our HOST FALLBACK wearing a
+Vulkan label" — 71 of 87 ops on the portable CPU reference tier. **That
+attribution was asserted, not measured, and the measurement contradicts it.**
+
+Taken while the run was in flight (`vllm-bench`, Qwen3-0.6B, 1 prompt / 32 in /
+8 out, 26 min elapsed):
+
+| signal | value |
+|---|---|
+| process CPU | **1.6 %** |
+| GPU utilisation | **96 %** |
+| GPU compute apps | `495202 ./build-vk/examples/vllm-bench, 2066 MiB` — the ONLY one |
+
+A run pinned on the CPU reference tier would show the opposite: CPU saturated, GPU
+idle. This one is GPU-resident and GPU-busy, so the dominant cost is on the DEVICE.
+
+A second assumption also fails: the weights are **BF16** (all 311 tensors), so the
+coopmat tactic's dtype precondition is satisfiable here — this is not a case of
+"f16 model, coopmat ineligible".
+
+**The true attribution is UNMEASURED and is deliberately not replaced with another
+guess.** The candidates, in the order worth testing:
+1. **Per-op synchronous dispatch.** `VulkanContext::Dispatch` records, submits and
+   fence-waits for EVERY op (the W0 skeleton's documented design, "correct, not
+   fast"). `VK-A2` — async submission plus command-buffer reuse — was scoped as
+   "the single biggest speed lever" and never built. Thousands of round trips per
+   token would look exactly like this.
+2. **The naive GEMM where coopmat does not apply.** The tactic needs K % 16 == 0
+   and both operands bf16; activations may be f32 at some call sites, silently
+   falling back to the untiled scalar kernel measured at 52 GFLOP/s on Thor.
+3. **Paged attention**, which walks keys sequentially with a workgroup reduction
+   per key.
+
+`GetReferenceTierHits()` and the per-op provider counters distinguish (1)–(3)
+directly, and a `VT_VULKAN_COOPMAT=0` A/B isolates (2). None of that was run here.
+
+**Lesson, recorded because it recurs:** "we know why it is slow" is a claim like
+any other. The op-coverage number (16/87) made the CPU-tier story feel obvious
+enough to write down without checking `top`, and it was wrong.
+
+#### ATTRIBUTION MEASURED: per-op synchronous dispatch, not compute and not the CPU tier
+
+The previous note left the cause "UNMEASURED". It is now measured, and it is
+candidate (1).
+
+**Method.** `gdb -p` stack samples of the main thread plus `/proc/<pid>/status`
+context-switch deltas, taken on the live run (Qwen3-0.6B, 1 prompt / 32 in /
+8 out, ~34 min elapsed at sampling).
+
+| evidence | value |
+|---|---|
+| stack samples in `poll()` inside `VulkanContext::Dispatch` | **6 of 6** |
+| call path | `LLMEngine::step` → `GPUModelRunner::execute_model` → `Qwen3DenseModel::ForwardDevice` → `ForwardLayers` → `MatmulGeneric<true>` → `Go<…>` → `Dispatch` → NVIDIA driver `poll()` |
+| voluntary context switches | 202,770 → 203,730 in 10 s = **~96 blocking waits/s** |
+| process CPU | 1.6 % |
+
+**Arithmetic that makes it unambiguous.** Qwen3-0.6B is ~0.6 B params, so ~1.2
+GFLOP per token position; 40 positions plus lm_head is roughly **48-60 GFLOP**. Our
+NAIVE scalar Vulkan GEMM was measured at **52 GFLOP/s** on Thor. Even entirely on
+the slow kernel the compute is **~1-2 SECONDS**. Wall clock was ~34 minutes, so
+**>99 % of the time is dispatch round-trip latency, not arithmetic.**
+
+**Mechanism.** `VulkanContext::Dispatch` records a command buffer, submits it and
+FENCE-WAITS, for EVERY op — the W0 skeleton's documented "correct, not fast"
+design. At ~96 waits/s the model's per-token dispatch count turns into minutes.
+The GPU's reported 96 % "utilisation" is the driver context being resident while
+we poll, NOT compute saturation; on Tegra/GB10 that counter cannot distinguish the
+two, which is precisely why it misled the first attribution.
+
+**This retires the "71 of 87 ops on the CPU tier" explanation for THIS workload.**
+Op coverage is a real limitation, but it is not what makes the e2e run slow here.
+
+**Consequence for the roadmap.** `VK-A2` (async submission + command-buffer reuse,
+`SupportsGraphCapture()` via a pre-recorded `VkCommandBuffer`) was scoped in the
+campaign spec as "the single biggest speed lever" and deferred. It is now the
+MEASURED bottleneck, and it outranks further native-kernel work for anything
+end-to-end: more native ops would each still pay a ~10 ms round trip.
+
+#### SECOND, SEPARATE ANOMALY: the dispatch COUNT looks far too high
+
+The minimal workload — **1 prompt, 32 in, 8 out** — also failed to complete, hitting
+its 2400 s timeout with no result line. Per-dispatch latency alone does not
+explain that, and the gap is worth stating as its own open question rather than
+folding into the first finding.
+
+**Order-of-magnitude.** At the measured ~96 blocking waits/s, 40 minutes is
+**~230,000 waits**. A 28-layer Qwen3-0.6B forward should need roughly 11 dispatches
+per layer (qkv matmul, qkv split, rope, KV write, paged attn, o_proj, 2 norms,
+gate/up matmul, silu, down matmul) ≈ **~310 per forward**. Even counting 32 prefill
+positions plus 8 decode steps generously, the expected total is a few thousand —
+**not ~230,000**. That is roughly an order of magnitude and a half unaccounted for.
+
+**Two candidate explanations, NOT yet distinguished:**
+1. **Waits ≠ dispatches.** The driver's fence wait is a `poll()` loop that may wake
+   several times per fence, inflating the context-switch count relative to the
+   real dispatch count. If so the dispatch count is fine and only the latency
+   finding stands.
+2. **We really do dispatch far more than expected** — e.g. a per-token or per-head
+   dispatch where a per-tensor one was intended, or the `kFusedChain` interpreter
+   issuing one dispatch per recipe step.
+
+**Distinguishing them is cheap and is the next thing to do:** add a dispatch
+counter to `VulkanContext` (or read the existing per-op provider selection counts
+with `VT_OP_PROVIDER_STATS=1`) and print it per forward. Until then, the
+per-dispatch latency finding is MEASURED and this one is an OPEN QUESTION — not a
+second confirmed defect.
+
+**Recorded so it is not lost:** the e2e comparison against llama.cpp therefore has
+NO vllm.cpp number at all, not even a slow one. The workload never produced a
+completion at any size attempted (4 prompts/128/32 at 900 s; 1 prompt/32/8 at
+2400 s).
+
+#### RESOLVED: it was a GPU HANG, not slowness. VK-E now has BOTH arms.
+
+Everything above about "orders of magnitude slower", "per-op synchronous dispatch
+is the measured bottleneck" and "the dispatch count looks 10x high" was diagnosing
+a **hang**. All three readings are superseded.
+
+**How it was found.** Dispatch instrumentation showed ~300 submits in 1.2 s then
+total silence, with NO slow-dispatch line — and that absence was the clue, because
+the timing print runs only after the fence wait RETURNS. Tracing each submit
+BEFORE the wait named the culprit immediately:
+`#368 vt_matmul_coopmat groups=9496` — the lm_head GEMM at **M=1**.
+
+**The defect (mine, merged earlier this session).** `coopMatLoad` reads a FULL
+16x16 tile with no masking. At M=1 it read 15 rows, ~30 KB, past the end of the
+activation buffer; the GPU faulted and `vkWaitForFences(UINT64_MAX)` never
+returned. The shader's own comment claimed ragged M/N were safe "because the store
+is bounds-checked" — the store guard cannot help when the fault is on the LOAD.
+
+**Why the correctness gate missed it.** That gate used M=20, N=12 *specifically*
+to exercise ragged shapes and passed: the out-of-bounds read stayed inside the
+allocation, and its garbage rows were discarded by the bounds-checked store.
+Raggedness alone was not sufficient — the read has to LEAVE the allocation to
+fault, which needs a large N against a small operand, i.e. lm_head at decode.
+
+**Fix:** the tactic requires `m % 16 == 0 && n % 16 == 0` alongside `k % 16 == 0`;
+decode falls back to the scalar kernel, where coopmat would have wasted 15/16 of
+every tile anyway. A masked/padded load is the better long-term answer, not
+attempted here. New gate asserts the DECLINE at M=1, N=17 — expressible only as a
+tactic assertion, since the bad path hangs rather than returning a wrong number.
+
+**vllm.cpp Vulkan, GB10, Qwen3-0.6B bf16 safetensors (fix applied):**
+
+| workload | E2E | prefill tok/s | decode tok/s (per stream) |
+|---|---:|---:|---:|
+| 32 in / 8 out | **1,125.9 ms** | 28.42 | **8.59** |
+| 128 in / 32 out | **5,571.1 ms** | 22.98 | **5.85** |
+
+**The comparison, finally on both sides** (same weights; llama.cpp on the GGUF
+converted from this snapshot by its own script):
+
+| engine | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| llama.cpp Vulkan (`NV_coopmat2`) | **11,514** (pp128) | **160.9** (tg32) |
+| vllm.cpp Vulkan | 22.98 | 5.85 |
+
+That is roughly **500x on prefill** and **27x on decode** in llama.cpp's favour, and
+those ratios are honest but not yet diagnostic: 71 of 87 ops still run on the
+portable CPU tier, dispatch is still one submit + fence-wait per op (`VK-A2`
+unbuilt), and the scalar GEMM now serves every decode GEMM because coopmat
+declines at M=1. Each of those is a named, separately measurable lever.
+
+**Method lesson, the durable part:** a run that "never finishes" is not a slow run
+until proven so. Three separate attributions were published from indirect signals
+(op-coverage counts, CPU%, GPU-utilisation%) before anyone instrumented the thing
+that was actually blocking. The dispatch tracer cost minutes and answered it
+outright.
+
+### VK-A2/VK-F: the three named levers, MEASURED — two are dead, one is 55% (2026-08-07, GB10)
+
+The `VK-E` record above named three levers off the back of a 500x/27x gap and
+called them "separately measurable". Measuring them first killed two.
+
+**Instrumented, not inferred.** `VT_VULKAN_DISPATCH_STATS` grew a per-shader TIME
+profile alongside the count histogram, and a new `vulkan-dispatch-floor` benchmark
+sweeps one op across a 65,536x range of element counts.
+
+**Lever 1, "71 of 87 ops on the portable CPU tier" — IRRELEVANT in steady state.**
+The e2e run fires exactly ONE reference-tier op, `kRopeCosSinCache` (op=65), which
+builds the rotary table ONCE at setup. Every op in the per-token loop is already
+native: the histogram is `vt_rms_norm` 904, `vt_matmul` 792, `vt_paged_attn` /
+`vt_qkv_split` / `vt_reshape_and_cache` / `vt_rope_from_cache` / `vt_silu_and_mul`
+224 each, `vt_matmul_coopmat` 112, and 8 apiece of cast/embedding/argmax. The
+count is a REGISTRY-COVERAGE fact and was quoted as a hot-path one.
+
+**Lever 2, per-op synchronous dispatch (`VK-A2`) — CEILING 1.15x, REJECTED as the
+primary lever.** The floor benchmark is the decisive part: `kAdd` costs **0.046
+ms/dispatch and is DEAD FLAT from 256 to 262,144 elements** — a 1,024x change in
+work with no change in time — then finally rises past ~1M. So 0.046 ms is pure
+per-dispatch overhead. Against the model's measured 0.357 ms average, overhead is
+**13%**; the other 87% is real kernel execution. Perfect batching of all 2,952
+dispatches saves 136 ms of 1,054 = **1.15x**, against a 19-27x gap. This is the
+lever I had already published as "the measured bottleneck" and would have built
+first.
+
+**Lever 3, kernel quality — CONFIRMED, and it is where everything is.**
+
+| shader | count | % of GPU time | ms/call |
+|---|---:|---:|---:|
+| `vt_matmul` (scalar) | 792 | **49.3%** | 0.4971 |
+| `vt_rms_norm` | 904 | 18.3% | 0.1619 |
+| `vt_greedy_argmax` | 8 | **10.0%** | **10.0316** |
+| `vt_paged_attn` | 224 | 6.6% | 0.2368 |
+| `vt_matmul_coopmat` | 112 | 6.2% | 0.4455 |
+
+**FIRST FIX: greedy argmax, 10.03 -> 0.53 ms/call (18.9x), share 10.0% -> 0.6%.**
+The shader put ONE INVOCATION on each row and scanned the vocabulary serially; at
+decode there is one row, so `groups=1` walked 151,936 entries on a single lane
+while the device idled. Now one WORKGROUP per row with a tree reduction.
+
+**The gate caught a bug in the first version of that reduction, and it is the
+interesting part.** "Keep the left operand unless the right is strictly greater"
+looks like it reproduces the CPU's first-wins tie-break. It does not: a halving
+tree does NOT combine lanes in index order — lane 0 absorbs lane 16, and
+everything lane 16 already swallowed, long before it meets lane 1. With equal
+maxima at 8 and 900 the kernel returned **900** where the CPU returns 8. A
+different token, from a kernel whose maximum VALUE was perfectly correct. Ties are
+now broken on the INDEX explicitly, which makes the merge associative and
+commutative and therefore correct for any tree shape.
+
+Second subtlety, same fix: `x > best` is false for every NaN, so the CPU can never
+ADOPT one — a NaN only becomes the running best by being the value the scan
+STARTED from, element 0. Seeding every lane from its own first element would
+invent poisoning the CPU does not have, masking a real maximum inside that chunk.
+Only lane 0 seeds from element 0; the rest start at -inf.
+
+**MEASUREMENT DISCIPLINE: absolute totals on this box are unusable.** Five
+identical repeats spread **322.5 to 684.3 ms, a 2.1x swing**, and a cold run read
+799-879 ms — consistent with the recorded GB10 reload-swing effect. Per-shader
+SHARE is stable across the same five runs (`vt_matmul` 54.8% +/- 2.7, argmax 0.58%
++/- 0.08), so shares are what is quoted here and totals are not.
+
+**NEXT: `vt_matmul` at ~55% of GPU time.** It is one invocation per OUTPUT ELEMENT
+with a sequential K loop, so at decode (M=1, MatmulBT) consecutive lanes read
+addresses K*4 bytes apart — every load its own cache line. A GEMV shape with lanes
+splitting K coalesces those reads; that is the next change, and it moves the K
+reduction off the CPU's accumulation order into the NMSE tier, so it needs the
+token-exactness gate rather than an NMSE bound.
+
+### VK-F: the GEMV tactic — the 55% lever, cut to ~35% (2026-08-07, GB10)
+
+The profile above put `vt_matmul` at ~55% of GPU time. It is a COALESCING problem,
+not an arithmetic one, and the fix is a different assignment of work to lanes.
+
+**The defect.** `vt_matmul` gives each OUTPUT ELEMENT one invocation and loops K
+there. For `MatmulBT` — b is `[N,K]`, the torch Linear layout every model uses —
+lane `j` reads `b[j*k + q]`, so at a fixed `q` adjacent lanes are `k*2` bytes
+apart: 2 KB for a 1024-wide K. Every lane pulls its own 128-byte cache line to
+consume 2 bytes of it, so a 128-lane workgroup fetches ~16 KB to use 256 — a
+**64x waste of bandwidth** on a kernel that is entirely bandwidth-bound.
+
+**The tactic.** `vt_matmul_vec` gives each output element a WORKGROUP whose lanes
+stride K, so lane `t` reads `b[j*k + t]` and adjacent lanes read adjacent
+addresses — 2 fully-used cache lines instead of 128 barely-used ones. Structure
+from llama.cpp `mul_mat_vec.comp`; per-element semantics still our own
+`cpu_ops.cpp` `MatmulChunked`.
+
+**Scoped, not universal.** `MatmulBT` only: in the other orientation `vt_matmul`
+reads `b[q*n + j]`, which is ALREADY coalesced across lanes, and the vec shape
+would make it strided and strictly worse. Plus `m == 1` (one workgroup per output
+element is only the right trade when there are few) and `k >= 128`. The gate
+asserts the DECLINE in both directions, not just the win.
+
+**RESULT — interleaved paired A/B, `VT_VULKAN_GEMV` the only variable, same
+binary.** The first attempt ran the arms in BLOCKS and had to be thrown away: the
+OFF arm degraded monotonically (20.70 -> 13.55 -> 6.70 tok/s) because it ran last,
+so drift aligned with the arm. Re-run interleaved, 8 pairs:
+
+| metric | GEMV on | GEMV off | result |
+|---|---:|---:|---|
+| GEMM ms/call (median) | 0.2359 | 0.4256 | **1.80x**, ON faster in **7 of 8 pairs** |
+| GEMM share of GPU time | ~35% | ~53% | the lever is spent down, not gone |
+| decode tok/s (median) | 16.22 | 11.70 | 1.39x, ON faster in 5 of 8 — WEAK, quoted as such |
+
+The kernel claim is the strong one (7/8, direct metric). The e2e decode claim is
+5/8 and sits inside this box's known 2.1x run-to-run swing, so it is recorded as
+suggestive rather than established.
+
+**CORRECTNESS: the accumulation order changed, and that needed the strict gate.**
+The K reduction is now a tree, so unlike the scalar kernel this tactic does NOT
+share the CPU's accumulation order — it joins coopmat in the NMSE tier. A decode
+GEMM feeds the sampler, where a changed low bit is a changed TOKEN, so an NMSE
+bound would not have been enough. **opt-125m STRICT: 6/6 prompts token-exact
+(96/96 tokens) vs the vLLM 0.25.0 oracle, all 9 ops on device type 3, 0 declines.**
+
+**Gates.** llvmpipe `test_vulkan_backend` **15/15 (858 assertions)**, GB10
+**15/15 (856)**. The new tactic has NO hardware precondition — it is a lane
+assignment, not an instruction — so unlike coopmat, CI can gate the SELECTION for
+real rather than only gating that it is refused.
+
+**Still open.** GEMM remains ~35% of GPU time, so the lever is not exhausted:
+wider per-lane loads and subgroup reductions in place of shared memory are the
+obvious next steps. `vt_rms_norm` is now the second cost at ~18%.
+
+### VK-F follow-up: the SUBGROUP reduction is a WASH — built, measured, NOT shipped (2026-08-07, GB10)
+
+The remaining GEMM headroom was chased in the obvious direction and the obvious
+direction was wrong. Recorded because the negative result redirects the next lever.
+
+**What was built.** `vt_matmul_vec` gives each output element a 128-lane workgroup
+and reduces through shared memory: a 7-step halving tree with a barrier at every
+step. For lm_head at K=1024 that is 8 loads per lane against 7 barriers, so the
+reduction looked like the larger half. `vt_matmul_vec_sg` gave each output element
+one SUBGROUP instead, reducing with a single `subgroupAdd` — no barriers, no
+shared memory, 4x more terms per lane. This is llama.cpp's own `mul_mat_vec`
+structure. It needed a probe (`VK_SUBGROUP_FEATURE_ARITHMETIC_BIT` in compute,
+optional in Vulkan 1.1 and a PIPELINE-CREATION failure where absent), a second
+committed module (the extension is compile-time, so it cannot be a specialization
+constant), and a `VT_VULKAN_GEMV_SG` bisect lever.
+
+It WORKED: llvmpipe supports subgroup arithmetic, so CI exercised the subgroup
+path rather than the fallback; `test_vulkan_backend` 15/15 on both devices;
+opt-125m STRICT 6/6 token-exact.
+
+**And it bought nothing.**
+
+| comparison | GEMM ms/call | decode tok/s |
+|---|---|---|
+| sg vs SCALAR, 8 interleaved pairs | 2.51x, 7/8 | 2.06x, 6/8 |
+| sg vs WORKGROUP form, 8 interleaved pairs, ONE binary | **4/8 pairs, median 1.05x** | **4/8 pairs** |
+
+**An exact coin flip.** A cross-session read had suggested ~1.2x (sg 2.66x over
+scalar in one session versus vec 1.80x in another) and that advantage did NOT
+survive a paired test — it was session drift, which is precisely what this box's
+2.1x run-to-run swing produces and why the `VT_VULKAN_GEMV_SG` lever had to exist
+before the claim could be made at all.
+
+**REVERTED.** A second SPIR-V module, an optional-feature probe, a
+device-dependent code path and a fourth env lever, for a measured wash. The
+workgroup form is simpler, has no optional-feature dependency and runs everywhere.
+
+**WHAT THE NEGATIVE RESULT BUYS.** Replacing a 7-barrier shared-memory tree with
+one instruction changed nothing measurable, so **the reduction was never the
+cost** — which was the premise of the whole attempt. The GEMV is a memory-path
+problem, and it is not yet at the roof either: 1.50 GB of bf16 weights per decode
+token against GB10's ~273 GB/s is a 5.49 ms floor, i.e. ~182 tok/s, versus 19.8
+measured — still **~9x off**. So the next lever is the memory path (wider per-lane
+loads, weight layout), NOT the reduction and NOT dispatch batching (`VK-A2`,
+already capped at 1.15x).
+
+## Surface-coverage audit + ONE SURFACE guard (2026-08-07, `ARCH-ONE-SURFACE`, `row/SURFACE-COVERAGE-AUDIT`)
+
+A CPU-only records/tooling change, no measurement.
+
+- **No number owed on any axis.** No kernel, generation, scheduling, or engine
+  code path was touched — the change adds a checker
+  (`scripts/check-surface-coverage.py`, two axes), its two allowlists, a mutation
+  suite (46 cases, incl. subprocess enforcement seams), preflight + CI wiring, the audit spec, and public-doc edits.
+  No throughput/latency/memory number was measured, claimed, or owed.
+- **What was verified (CPU, no build):** `check-surface-coverage.py` rc=0 (13
+  example units; 12 internal-reachers tracked, `examples/cli` the clean baseline;
+  C-ABI table 7 reachable / 4 embedder-unreachable, all tracked; public set
+  derived from CMake; shrink-only ratchet at 12);
+  `test_check_surface_coverage.py` 46/46; `check-public-doc-tables.py` rc=0 (STATUS
+  inside its char ratchet); `check-now-current.py`, `check-agent-record.py`,
+  `check-state-order.py`, `check-supported-models.py` all rc=0.
+- **The guard caught one on landing:** the rebase onto the Parakeet `#89` main
+  surfaced `examples/parakeet_transcribe` (CLI-only ASR reaching internal headers,
+  Parakeet off-registry) — added to the transition tracker, not silently ignored.
+- The seven surface gaps (H3 video-gen, Laguna/DeepSeek-V4 fast decode,
+  transcription, Kimi-Linear incremental, embeddings/pooling, mm-input) each carry
+  a ranked fold in `.agents/specs/surface-coverage-2026-08-07.md`; their speed
+  gates are owed by the folds themselves, not by this change.
+### VK-F: Tier-1 fusion NEGATIVE, and the dispatch floor is now 49% (2026-08-07, GB10)
+
+**Two findings that reorder the whole lever list.**
+
+**1. `VT_FUSED_TIER=1` on Vulkan is a NEGATIVE — because it fuses NOTHING.**
+
+The portable fusion framework already exists (`include/vt/recipes.h`,
+`.agents/specs/portable-fusion-framework.md`), Vulkan already registers the
+Tier-1 interpreter (`kFusedChain` -> `vt_fused_chain`), and Qwen3 already calls
+`vt::FusedChain(..., kFusedAddRmsNormStd, ...)` with `VT_FUSED_CHAIN_ADOPT` ON.
+Only `VT_FUSED_TIER` defaulted to 0, so every call was realized as the Tier-0
+composite. That looked like a free lever: flip the flag.
+
+It engages, and it is correct — 456 `vt_fused_chain` dispatches versus 0, gate
+15/15, and opt-125m STRICT 6/6 token-exact under tier 1. **And the dispatch count
+is IDENTICAL in both arms: 2,952.**
+
+    tier 0:  vt_rms_norm 904
+    tier 1:  vt_rms_norm 448  +  vt_fused_chain 456  =  904
+
+`kFusedAddRmsNormStd` is (residual add + RMS norm), and `vt_rms_norm` ALREADY
+does both in a single dispatch through its `has_res` path. There was nothing to
+fuse. Tier 1 swapped a specialized kernel for a generic recipe interpreter and
+lost accordingly: **314.7 ms vs 275.8 ms total GPU, tier 1 faster in only 2 of 8
+interleaved pairs.** `VT_FUSED_TIER` stays 0.
+
+**The durable lesson: fusion that does not REMOVE a dispatch is not fusion.** The
+recipe adoption was real and the framework worked exactly as designed; the recipe
+in play simply described something one kernel already did.
+
+**2. The dispatch floor has grown from 13% to 49% of GPU time.**
+
+This is the growth predicted when `VK-A2` was first measured and set aside. Total
+GPU time fell from ~1,054 ms to 275.8 ms as argmax and the GEMV landed, while the
+per-dispatch floor (0.046 ms x 2,952 = 135.8 ms) did not move at all.
+
+The small ops are now almost pure launch overhead:
+
+| shader | calls | ms/call | vs the 0.046 ms floor |
+|---|---:|---:|---:|
+| `vt_rms_norm` | 904 | 0.0806 | 1.75x |
+| `vt_reshape_and_cache` | 224 | 0.0500 | 1.09x |
+| `vt_silu_and_mul` | 224 | 0.0462 | **1.00x** |
+| `vt_rope_from_cache` | 224 | 0.0433 | **0.94x** |
+| `vt_qkv_split` | 224 | 0.0422 | **0.92x** |
+
+Those 1,800 dispatches cost 113.6 ms of which **73% is launch overhead**. Several
+sit AT or BELOW the measured floor, which is the signature of a kernel that does
+no meaningful work relative to being launched at all.
+
+**So making these kernels faster is pointless; only removing dispatches helps.**
+`VK-A2` (command-buffer batching) is no longer a 1.15x afterthought — it is the
+top lever, and its ceiling is higher than the fence cost alone because batching
+also recovers the pipelining lost when the GPU idles between every submit.
+
+**Fusion is still worth having, but for the DISPATCH COUNT, not the kernel time.**
+The collapsible chain is `qkv_split -> rope_from_cache -> reshape_and_cache`:
+224x3 = 672 dispatches that could be 224, removing 448 launches. `kAttnQkNormRope`
+exists as a recipe but is composite-only — the Tier-1 vocabulary is
+`{kAdd,kMul,kSilu,kSigmoid,kRmsNorm}`, so extending it is shared-framework work
+that every backend inherits, not a Vulkan shader.
+
+**Also corrected here: the "~500x behind on prefill" figure was a metric
+artifact.** `bench_core.h` computed `input_throughput = total_input / WHOLE run
+duration`, so a 1-prompt 32-in/8-out run reported 32/E2EL and charged the entire
+decode to prefill. It was being compared against llama-bench `pp128`, which is
+prefill-ONLY. A true `prefill_throughput = total_input / sum(TTFT)` is now
+reported alongside it; `sum_prefill` was already being accumulated and discarded
+with `(void)sum_prefill`.
+
+### VK-A2: command-buffer batching — decode 2.62x, 8/8 pairs (2026-08-07, GB10)
+
+The lever this campaign twice mis-ranked. It was first published as "the measured
+bottleneck" (wrong), then measured at a 1.15x ceiling and set aside (right at the
+time), then predicted to grow — and it did, to 49% of GPU time once argmax and the
+GEMV landed.
+
+**THE BLOCKER, now solved.** `VulkanContext::Pipeline` held ONE `VkDescriptorSet`,
+updated per dispatch. That is sound only because each dispatch waited on a fence
+before the next touched the set. **A descriptor set is read at EXECUTION time, not
+record time**, so batching two dispatches of the same pipeline would have the
+second `vkUpdateDescriptorSets` overwrite the first's operands before the GPU ran
+either — silent garbage, not an error. Each pipeline now owns a ring of 16 sets,
+and a pipeline that exhausts its ring forces a flush.
+
+Between recorded dispatches there is a `VkMemoryBarrier`
+(COMPUTE->COMPUTE, SHADER_WRITE->SHADER_READ|WRITE): decode ops are sequentially
+dependent, so without it the batch would run them concurrently.
+
+**RESULT, 8 interleaved pairs, `VT_VULKAN_BATCH` the only variable:**
+
+| metric | batched | per-op | result |
+|---|---:|---:|---|
+| decode tok/s (median) | **64.5** | 24.8 | **2.62x, 8 of 8 pairs** |
+| per-pair ratios | 1.79 / 1.87 / 1.96 / 2.26 / 2.98 / 3.02 / 3.52 / 3.55 | | every pair a win |
+| prefill tok/s (median) | ~142 | ~135 | ~1.05x, as expected |
+
+Batches run **40-46 dispatches per submit**. Prefill barely moves, which is the
+right shape: it has fewer, larger kernels, so it was never floor-bound.
+
+**Decode is now 35% of the 182 tok/s bandwidth roof, up from 11%, and the gap to
+llama.cpp's 160.9 tok/s is 2.5x, down from ~19x on this workload.**
+
+**Correctness: opt-125m STRICT 6/6 token-exact (96/96), 0 declines, with batches
+of 40-46 actually recorded** — verified after catching that the first "pass" was a
+STALE BINARY (only `test_vulkan_backend` had been rebuilt), which reported zero
+flushes and a green gate. A gate that passes on a binary without the change is
+worth nothing.
+
+**The new gate asserts the MECHANISM**, because results cannot show it: batching
+runs the same kernels in the same order, so a batch silently degrading to one
+dispatch per submit computes identical numbers. It asserts `pending_batch() > 1`
+with the lever on and `== 0` with it off, so neither arm is vacuous.
+
+**DEFAULT OFF, and this is the one measured win in this campaign that does not
+immediately become the default.** Batching is sound only if every host read of
+device memory flushes first. `Backend::Copy`/`Memset`/`Synchronize` now do. The
+PORTABLE REFERENCE TIER does not and cannot yet: it runs CPU kernels directly
+against the shared mapped allocation, and `Resolve` caches the provider function,
+so there is no per-call seam to flush at. An op with no native Vulkan kernel would
+read STALE BYTES with no error. For the models that run on Vulkan today the
+reference tier fires once, at setup (`kRopeCosSinCache`), which is why the STRICT
+gate passes — but "empirically safe for two models" is not the bar for a default.
+
+**Closing that hazard is the gate on the default flip, and is the next task.**
+
+### VK-A2 DEFAULT-ON: the reference-tier hazard is closed by an existing seam (2026-08-07)
+
+The 2.62x batching win shipped OFF because the PORTABLE REFERENCE TIER runs CPU
+kernels directly over device memory with no per-call flush point — `Resolve`
+caches the provider function, so there appeared to be no seam.
+
+**There already was one.** `Backend::FlushPending` (`include/vt/backend.h:44-49`)
+exists for exactly this, is documented for exactly this, is already called by
+`op_provider.cpp` whenever a reference-tier kernel is selected, and Metal already
+implements it (M3c-1). Vulkan simply had not. The fix is one override.
+
+That is the second time in this campaign the framework already had the answer —
+the first was the fusion recipes. Looking for the seam before building one is
+cheaper than either.
+
+**`VT_VULKAN_BATCH` now defaults ON.** All three host-read paths drain first:
+`Copy`/`Memset` (host memcpy over the mapped allocation), `Synchronize`, and
+`FlushPending` for the reference tier.
+
+**A GATE THAT THE STRICT RUN COULD NOT PROVIDE.** opt-125m STRICT passes 6/6
+token-exact with batching on — and it would pass whether or not the hook existed,
+because OPT touches the reference tier only once, at setup, before any batch is
+open. So the hazard has its own gate: open a batch, resolve `kRopeNeox` (genuinely
+unimplemented natively on Vulkan), and assert `pending_batch() == 0` afterwards.
+
+**Verified by DISABLING the hook**: the gate goes red (`pending_batch() == 0` fails
+at 4 pending) and green again when restored. A gate never observed failing is a
+gate that has not been shown to test anything.
+
+**One bug caught in my own gate along the way.** The VK-A2 mechanism test
+re-derived the lever's default from the environment variable, so flipping the
+default to ON made it assert the wrong branch. It failed loudly, which was luck —
+a subtler duplication would have gone vacuously green. The context now exposes
+`batching_enabled()` and the test ASKS rather than restating. A predicate
+duplicated between an implementation and its gate will eventually disagree with
+itself.
+
+llvmpipe `test_vulkan_backend` **17/17 (873 assertions)** with the lever on AND
+off; opt-125m STRICT 6/6 (96/96), 0 declines, batching default.
+
+### The last two levers: one SUBSUMED, one UNESTABLISHED (2026-08-07, GB10)
+
+Both closed by measurement rather than built. Also fixes an observability
+regression `VK-A2` introduced.
+
+**Lever 4, Tier-1 fusion vocabulary — SUBSUMED BY `VK-A2`, not built.** The plan
+was to collapse `qkv_split -> rope_from_cache -> reshape_and_cache`, 672 dispatches
+into 224. Subtracting the per-dispatch floor from the batch-OFF profile shows what
+those ops actually COST once launch overhead is removed:
+
+| shader | measured | floor | REAL kernel work |
+|---|---:|---:|---:|
+| `vt_reshape_and_cache` | 11.2 ms | 10.3 | **0.9** |
+| `vt_silu_and_mul` | 10.3 | 10.3 | **0.0** |
+| `vt_rope_from_cache` | 9.7 | 10.3 | **0.0** |
+| `vt_qkv_split` | 9.5 | 10.3 | **0.0** |
+
+Their entire cost WAS the launch count, and batching already removed it. Fusing
+them now saves approximately nothing. GEMM is **64%** of real kernel work;
+`vt_rms_norm` is 22.5% and is genuine work rather than launch, so folding it would
+mean fusing INTO the GEMM — a much larger change than a vocabulary extension.
+
+**Lever 3, GEMV unroll — UNESTABLISHED at n=8, reverted.** Four independent
+accumulators keep four reads per lane in flight instead of one (memory-level
+parallelism, not instruction count). Correct: 17/17 and opt-125m STRICT 6/6.
+
+A first cross-session read said **0.99x**. Because a cross-session read is exactly
+what produced a false 1.2x for the subgroup tactic earlier today, the unroll factor
+was made a SPECIALIZATION CONSTANT so both arms run in one binary, and A/B'd
+interleaved:
+
+    unroll-4 faster in 5 of 8 pairs; ratios 0.92 0.95 1.00 1.03 1.08 1.10 1.11 1.18
+    arm medians 60.3 vs 60.4 tok/s
+
+A slight positive lean, well inside noise at this sample size, and 5/8 is not a
+majority. **Reverted**: a spec constant, an env lever, a tail loop and four
+accumulators is real complexity, and it has not been shown to buy anything. A
+larger sample could settle it; the honest state is "not established", which is not
+the same as the subgroup reduction's clean 4/8 wash.
+
+**OBSERVABILITY REGRESSION FROM `VK-A2`, fixed.** Per-shader TIME came from the
+per-dispatch fence wait. Batching submits many dispatches under ONE fence, so
+there is nothing to attribute and the profile printed **0.0 ms for every shader** —
+which reads as "these kernels are free" rather than "this was not measured". The
+dump now says so explicitly and prints counts only, pointing at
+`VT_VULKAN_BATCH=0` for per-kernel milliseconds. Restoring per-kernel time UNDER
+batching needs GPU timestamp queries (`vkCmdWriteTimestamp`), which is the proper
+Vulkan answer and is not built.
+
+**Blinding your own instrument is a cost of the optimisation, and it should be
+recorded as one.** Every lever this session was found with that profile.
+
+### GPU timestamp profiling restored — and the workload is now HOST-BOUND (2026-08-07, GB10)
+
+`VK-A2` blinded the per-shader time profile (one fence per batch, nothing to
+attribute). GPU timestamp queries restore it, and they are strictly BETTER
+evidence than what they replace: `vkCmdWriteTimestamp` brackets each dispatch on
+the DEVICE timeline, so this measures GPU execution rather than a host-side fence
+wait that also contained launch latency.
+
+Probed, not assumed: `timestampComputeAndGraphics` and a non-zero
+`timestampPeriod`, else profiling stays off and says so. The pool and the
+timestamp commands exist only under `VT_VULKAN_DISPATCH_STATS`, so production
+pays nothing.
+
+**MEASURED GPU TIME, batching on, Qwen3-0.6B decode:**
+
+| shader | count | GPU ms | % | ms/call |
+|---|---:|---:|---:|---:|
+| `vt_matmul_vec` | 792 | 42.2 | **51.8%** | 0.0533 |
+| `vt_paged_attn` | 224 | 13.0 | 15.9% | 0.0579 |
+| `vt_matmul_coopmat` | 112 | 11.9 | 14.6% | 0.1061 |
+| `vt_rms_norm` | 904 | 9.2 | 11.3% | 0.0102 |
+| `vt_rope_from_cache` | 224 | 1.5 | 1.8% | 0.0066 |
+| `vt_reshape_and_cache` | 224 | 1.0 | 1.3% | 0.0047 |
+| `vt_silu_and_mul` | 224 | 0.9 | 1.1% | 0.0039 |
+| `vt_qkv_split` | 224 | 0.8 | 1.0% | 0.0038 |
+| **TOTAL** | 2952 | **81.4** | | |
+
+**★ THE HEADLINE: GPU busy is 81.4 ms of a 314.5 ms run — 26%. SEVENTY-FOUR
+PERCENT OF THE RUN IS HOST-SIDE.** Before `VK-A2` the same workload was ~276 ms of
+GPU time in ~1,092 ms. Batching removed 195 ms of GPU time and, in doing so,
+moved the bottleneck OFF the GPU entirely.
+
+**Every remaining GPU-side lever is now bounded by 26%.** Even an infinitely fast
+GEMM buys at most 51.8% of 26% = 13% of the run. The next lever is host
+orchestration — the same conclusion the CUDA campaign reached
+(`profile-full-step-not-just-kernels`), arrived at here from the opposite
+direction.
+
+**It also settles the fusion question DIRECTLY** rather than by subtraction:
+`qkv_split` 0.0038, `silu_and_mul` 0.0039, `reshape_and_cache` 0.0047 and
+`rope_from_cache` 0.0066 ms/call are **8-14% of the old 0.046 ms launch floor**.
+These ops do essentially no work. Abandoning the fusion lever was right, and this
+is the measurement that proves it instead of inferring it.
+
+### Host-side orchestration: the descriptor ring was capping batches — 1.51x (2026-08-07, GB10)
+
+`VK-A2` moved the bottleneck off the GPU (busy 26%). This is the first host-side
+lever, and it was found by profiling rather than guessing.
+
+**FIRST, A MISATTRIBUTION AVOIDED.** `perf record` put **62.87% of on-CPU time in
+`vt::cpu::Threadpool::ThreadReady`** — which looks damning on a Vulkan run. It is
+llama.cpp's `ggml_graph_compute_poll_for_work` ported 1:1: a `1024*128*poll`
+busy-wait, `poll=50`, across `hardware_concurrency` (20) threads. So it is IDLE
+SPIN, and `perf` samples on-CPU time, which a spinning thread dominates while
+contributing nothing.
+
+Tested rather than assumed, with `VLLM_CPP_CPU_THREADS=1` (19 fewer spinners), 8
+interleaved pairs: **4/8, 1.018x — a wash.** A profile percentage is not an
+attribution. It did, however, drown everything else, so the real profile needed
+the spin suppressed.
+
+**THE REAL HOST PROFILE**, `VLLM_CPP_CPU_THREADS=1`, by shared object:
+
+| | share |
+|---|---:|
+| `[kernel.kallsyms]` | **40.5%** |
+| `[nvidia]` | **21.9%** |
+| `libc` | 15.2% |
+| **our own code** | **13.7%** |
+| `libnvidia-eglcore`, `libstdc++`, rest | 7.0% |
+
+**62% of host time is kernel plus driver; only 14% is ours.** So the host cost is
+submissions and syscalls, not our C++ logic.
+
+**THE CAUSE: `kDescriptorRing = 16` was the batch-length limiter, not `kMaxBatch`.**
+Observed flushes were 40-46 dispatches against a cap of 128. `vt_rms_norm` runs
+**112 times per forward pass** (4 per layer x 28 layers), so it exhausted a 16-deep
+ring **seven times per pass** and forced a submit each time. Every forced flush is
+a `vkQueueSubmit` plus a blocking `vkWaitForFences`.
+
+Ring 16 -> 128 (and `kMaxBatch` 128 -> 512). Batches now reach **368 dispatches —
+an entire forward pass in ONE submit.**
+
+**RESULT, 8 interleaved pairs, `VT_VULKAN_RING` the only variable, one binary:**
+
+| | ring 128 | ring 16 |
+|---|---:|---:|
+| decode tok/s (median) | **87.3** | 57.7 |
+| per-pair ratios | 1.44 1.47 1.49 1.50 1.52 1.58 1.62 1.63 | |
+| result | **1.51x, 8 of 8 pairs** | |
+
+The ring depth was made a RUNTIME value first, so both arms run in one binary —
+a cross-build comparison is what produced a false 1.2x for the subgroup tactic
+earlier today.
+
+**Decode is now 87.3 tok/s: 48% of the 182 tok/s bandwidth roof, and 1.84x off
+llama.cpp's 160.9 — from ~19x at the start of the session, 10.2x overall.**
+
+opt-125m STRICT 6/6 token-exact; `test_vulkan_backend` 17/17.
+
+### Re-profile after the ring change: GPU-bound again, and a "void" result reversed (2026-08-07)
+
+**THE REGIME INVERTED TWICE IN ONE SESSION.** `VK-A2` batching cut GPU time and
+left the run HOST-bound at 26% GPU-busy. The descriptor-ring fix then cut the
+submits, and the bottleneck moved straight back:
+
+| | GPU busy (decode phase) |
+|---|---:|
+| before `VK-A2` | ~25% of a 1,092 ms run |
+| after `VK-A2` | **26%** -- host-bound |
+| after ring 16 -> 128 | **84%** -- GPU-bound again |
+
+**GPU timestamp profile at the new default** (32-token decode, 11,808 dispatches,
+288.7 ms GPU):
+
+| shader | count | GPU ms | % | ms/call |
+|---|---:|---:|---:|---:|
+| `vt_matmul_vec` | 3504 | 157.9 | **54.7%** | 0.0451 |
+| `vt_paged_attn` | 896 | 66.4 | **23.0%** | 0.0741 |
+| `vt_rms_norm` | 3616 | 32.4 | 11.2% | 0.0090 |
+| `vt_matmul_coopmat` | 112 | 13.5 | 4.7% | 0.1203 |
+| the four small ops | 3584 | 15.0 | 4.4% | 0.0035-0.0059 |
+
+Host side, spin suppressed: kernel 45.6%, libc 17.7%, nvidia 17.7%, **our own code
+10.9%**.
+
+**★ A "NOT ESTABLISHED" RESULT REVERSED BY THE REGIME CHANGE, NOT BY NEW CODE.**
+The GEMV four-way unroll was measured earlier at **5/8 pairs, arm medians 60.3 vs
+60.4 tok/s**, and reverted as unproven. That verdict was taken while the GPU was
+26% busy — where a 10% GEMV win moves e2e by only 1.4%, far inside this box's
+noise. **5/8 was the expected result whether or not the change helped.**
+
+Re-tested unchanged in the new regime, where the same win is worth ~4.6% e2e:
+
+    unroll 4 vs 1, 8 interleaved pairs, one binary
+    7 of 8 pairs, median 1.055x, arm medians 91.7 vs 87.5 tok/s
+    ratios 0.983 1.048 1.049 1.050 1.059 1.063 1.077 1.096
+
+**Same code, same statistic, different regime: 5/8 -> 7/8.** Restored and shipped.
+
+**The durable lesson, and it is a correction to how this campaign has been
+measuring: A NEGATIVE RESULT IS REGIME-DEPENDENT.** "Not established" means "not
+resolvable against the noise floor *as the system stands now*", not "does not
+help". Every lever discarded while some other component dominates deserves a
+re-test once that component is fixed — and the discard should say which regime it
+was measured in. Re-check the subgroup-reduction wash (4/8, measured at 26% GPU
+busy) on the same grounds.
+
+Decode is now **91.7 tok/s: 50% of the 182 tok/s roof, 1.75x off llama.cpp's
+160.9**, from 8.59 at the start of the session.
+
+
+## 2026-08-07 — ROW 7 Kimi-Linear runner fold: GB10 campaign (`row/KIMI-RUNNER-FOLD` #122)
+
+Build: /dev/shm/kimifold, CUDA 121a, CUTLASS 4.5.0, FA2, Triton AOT sm_121a. Golden md5
+`bfa5bdbf` (§12). flock $HOME/gpu.lock + /tmp/gpu, drop_caches per leg, worker parked,
+min-avail >= 21G, no reboot. Engine legs: `kimi-linear-gen` thin ABI client
+(`vllm_engine_load` + `vllm_complete_tokens`, max_model_len 4096) over
+`~/kimi-linear-engine-dir` (snapshot symlinks + TikTokenConverter tokenizer.json).
+
+| leg | config | /128 | steady tok/s | note |
+|---|---|---|---|---|
+| SACRED 35B | `test_qwen36_paged_engine` post-fold | 2/2·315 | — | PASS |
+| SACRED 27B | `test_qwen27_paged_engine` post-fold | 1/1·235 | — | PASS |
+| CLI reference | `test_kimi_linear_fold_gate`, §19 config | **122** | 18.93 (120 steps) | reproduces §19; p7 10/16 got == §19 |
+| engine round 1 | FA2 unset (exact arm), pre-mirror-fix | 9 | 13.07 (16-step diff) | STALE HOST IDS (async device mirror) — root-caused, fixed |
+| engine exact arm | post-fix, `VT_KIMI_PAGED_MLA_FA2=0` | 111 | 11.46 (16-step diff) | §19 M-tiling near-tie class: p7→16/16, p4 15/16, p2 token-1 cascade 0/16 |
+| **engine FA2 arm** | post-fix (now DEFAULT) | **122** | 9.81 (16-step diff) | **p0-p6 16/16 + p7 got byte-equal CLI ⇒ engine==CLI 128/128** |
+| engine FA2, N=64 | async sched | 122-profile (p0/p1 16/16) | **16.87** | two-length diff N=64 vs N=1 — the honest steady rate |
+| engine FA2, N=64 | `VT_ASYNC_SCHED=0` | 122-profile | 16.11 | async is NOT the gap |
+| default-bind | flipped-default binary, no env | **122** | 9.44 (16-step diff) | binds the shipped default |
+
+Server smoke (`examples/server`, /v1/completions, converted tokenizer): STREAMED 48 tokens
+in 2.52 s = 19.0 tok/s WALL (incl. prefill + first-request warmup — a lower bound on steady
+decode); non-streamed haiku coherent; /v1/models lists the model.
+
+Verdicts: Gate A engine==CLI 128/128 BYTE-IDENTICAL; golden >= 122 bound MET (122, same
+profile). Speed: the SERVER 19.0 tok/s wall is the production-surface anchor (~0.90× the
+#111 vLLM ~21 floor; CLI 18.93 reproduced) — NOT >= vLLM. MEASUREMENT CAVEAT: the example's
+two-length diffs (N=64 16.9; N=16 9.8-11.5) run the LONG leg first and cold, so one-time
+CUDA warmup pollutes the subtraction — the diffs UNDERSTATE steady decode; anchor on the
+server wall (or run the short leg first / a warmup pass). Residual = per-step KDA host
+islands (beta/g1 downloads + host decay gate per layer), grouped MoE via the shared seam,
+decode graph. Exact-island arm kept as diagnostic (VT_KIMI_PAGED_MLA_FA2=0), its 111/128
+recorded as the §19 M-tiling near-tie regime, not a bug.
+
+vLLM same-session re-measure: ATTEMPTED and ABORTED BY BOX REBOOT. The leg (oracle venv,
+util 0.82 — the #111-precedented config, no tracing, worker parked, 95G+ free at launch)
+loaded all 20 shards and reached torch.compile/graph capture, then the box HARD-REBOOTED
+at 00:25:32 (journal boot logs; min-avail had sat at the 15-17G floor during load). This
+REPRODUCES the §19 finding that vLLM@0.82 + any additional pressure sits below the
+life-critical floor on the 119G unified pool — per the safety mandate ("do not retry
+higher", and now: do not retry AT 0.82 with compile/capture on), the leg is NOT retried.
+The DENOMINATOR for this campaign therefore remains the #111 recorded floor (~21 tok/s,
+16-token aggregate, same prompts/workload). Box recovered clean: single reboot, GPU
+visible, local-ai-worker auto-restored by --restart=always; /dev/shm build tree gone
+(campaign complete; all gate logs under $HOME).
+
+### 27B Vulkan re-run with the six GDN kernels: coverage MEASURED, speed NOT (2026-08-08, GB10)
+
+The GDN merge claimed the six new kernels would stop the reference-tier fallbacks.
+That was an inference from registration. This run makes it a measurement.
+
+**REFERENCE-TIER OPS: 11 -> 5.** Exactly the six that got kernels are gone —
+`kCausalConv1dUpdate`, `kRmsNormGated`, `kSigmoidGateBf16`, `kGdnPostConv`,
+`kGdnStateGather`, `kGdnStateScatter`.
+
+Still on the host, and each for a stated reason:
+
+| op | why |
+|---|---|
+| `kGdnPrefill`, `kGdnDecode` | chunked gated-delta recurrences, deliberately out of scope |
+| `kCausalConv1dFwd` | started and abandoned; its state write-back reads the OLD row while other tokens of the sequence still need it |
+| `kRopeCosSinCache` | **BY DESIGN** — double-precision table, mirrors vLLM's own split |
+| `kAttnQkNormRopeGate` | not attempted |
+
+**SPEED DID NOT MOVE, AND IS NOT CALLABLE.** decode 2.65 -> 2.40 tok/s, prefill
+2.22 -> 1.82, E2E 616.7 -> 709.1 s. That reads as a 9-18% regression and **it is
+n=1 per arm on a box that swung 2.1x run-to-run on the 0.6B**. Inside the noise
+band in both directions; calling it a regression would be the same error as
+calling it a win.
+
+**And no speed change was EXPECTED.** `kGdnPrefill`/`kGdnDecode` — the heavy
+recurrence cores — are still on the host. The six that landed are GLUE. Moving
+glue off the CPU while the dominant work stays there is a coverage and correctness
+result, not a throughput one.
+
+This is the regime effect recorded earlier today, applied prospectively for once:
+with the recurrence cores dominating, a glue-op improvement cannot clear the noise
+floor, so this measurement **cannot** resolve whether the six kernels are faster
+than their CPU counterparts. Re-measure them AFTER `kGdnPrefill`/`kGdnDecode`
+land, and treat today's numbers as unresolved rather than negative.
+
+**What the GDN merge IS justified on:** coverage (11 -> 5 fallbacks, measured),
+correctness (`test_vulkan_backend` 22/22 with 977 assertions on GB10 hardware, not
+just llvmpipe; opt-125m STRICT 6/6 with 0 declines), and the backend-wide
+sub-word buffer bug it exposed — `AllocBuffer` sized buffers at exactly the
+requested bytes while every operand is read through a `uint32_t[]` view, so a
+3-byte flag array gave a ZERO-element view and read false silently under
+robustBufferAccess.
+
+It is **not** justified on speed, and nothing measured here says otherwise.
+
+**Next lever for 27B Vulkan speed is `kGdnPrefill`/`kGdnDecode`** — that is where
+the prefill time sits, and a materially larger piece of work than the six glue ops.
+### paged_attn barrier batching: REFUTED, reverted (2026-08-07, GB10)
+
+With the run GPU-bound again, `vt_paged_attn` is the second cost at 23.0%. It runs
+ONE WORKGROUP per (query token, query head) with lanes splitting the head
+dimension, and calls `vt_tg_sum` **once per key** — 2 + log2(128) = 9 barriers to
+combine ONE multiply per lane, since `d = 128` equals the workgroup width. At 0.0741
+ms/call over ~48 keys that is 1.54 us per key, which looked barrier-bound.
+
+Batched four keys per reduction round: four independent sums pushed through ONE
+barrier sequence, with the online softmax still consuming them STRICTLY IN KEY
+ORDER so `m`/`l`/`acc` evolve identically. **Bit-identical, not NMSE-tier** — and
+opt-125m STRICT 6/6 with 1152 `kPagedAttention` selections confirmed it.
+
+**4x fewer barriers bought 1.6%: 0.0741 -> 0.0729 ms/call, share 23.0% -> 22.8%.**
+
+**The barriers were not the cost.** Per key the kernel gathers 128 K elements AND
+128 V elements through the block table — roughly 512 B of scattered reads against
+one multiply per lane. `vt_paged_attn` is **memory-bound on the KV gather**, not
+barrier-bound.
+
+Reverted: 2 KiB of shared memory and a restructured loop for nothing measurable.
+The next attempt on this kernel should target the GATHER — KV layout, vectorised
+loads, or caching the K/V slice across the query heads that share a KV head —
+**not** the reduction.
+
+Recorded because the hypothesis was specific and the refutation is reusable: this
+is the second kernel this session where a barrier-count argument looked compelling
+and measured flat (the subgroup GEMV was the first).

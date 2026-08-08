@@ -55,6 +55,17 @@ struct ModelInfo {
   bool is_hybrid = false;
   bool has_inner_state = false;
   bool supports_multimodal = false;
+  // Mirror of the SupportsTranscription protocol
+  // (vllm/model_executor/models/interfaces.py:1110-1118):
+  // `supports_transcription` marks an ASR-capable arch;
+  // `supports_transcription_only` marks one with NO text-generation path
+  // (interfaces.py:1118 `supports_transcription_only: ClassVar[bool]`), which
+  // the entrypoints use to refuse-by-task: LoadedEngine::FromModelDir rejects
+  // such an arch with a message pointing at the transcription entry points
+  // (vllm_transcribe / /v1/audio/transcriptions), mirroring how vLLM excludes
+  // "generate" from supported_tasks for them.
+  bool supports_transcription = false;
+  bool supports_transcription_only = false;
   std::string_view score_type = "bi-encoder";
 };
 
@@ -102,6 +113,15 @@ class LoadedModel {
   // Runtime capability rather than architecture metadata: GGUF/synthetic
   // instances of a W4A4-capable family may contain only BF16 weights.
   virtual bool uses_nvfp4_w4a4() const { return false; }
+
+  // ARCH-ONE-SURFACE ROW 6: the model-owned Pooler of a POOLING model — the
+  // mirror of upstream `VllmModelForPooling.pooler` (as_embedding_model wires
+  // `self.pooler = DispatchPooler.for_embedding(...)`, adapters.py:248-257).
+  // Non-null iff the registration's info.is_pooling_model; the GPU runner
+  // builds its PoolingRunner over exactly this pooler (the mirror of
+  // gpu/model_runner.py:368-369 `PoolingRunner(self.model)`). Default null:
+  // every text-generation model is byte-identical.
+  virtual const class Pooler* pooler() const { return nullptr; }
 
   // ── SPEC-MTP I5d-pre: typed access to the MTP draft, without breaking the
   //    type-erasure of this base. Only the concrete Qwen3.5 dense/MoE
@@ -253,6 +273,11 @@ struct ModelFactory {
   // Preserves the already-gated per-arch scheduler default. This is execution
   // policy, not an upstream _ModelInfo capability.
   bool is_dense_model = false;
+  // ROW 7 (kimi-linear.md §20.3): the loader wants a `ModelSource::load_queue`
+  // selected BEFORE the weights load — the GB10 recipe (CUDA context first, then
+  // per-tensor stage-and-release; Kimi-Linear's 91.5 GiB bf16-resident loader).
+  // Default false: every existing arch's engine load path is byte-identical.
+  bool stage_on_load = false;
 };
 
 struct ModelRegistration {

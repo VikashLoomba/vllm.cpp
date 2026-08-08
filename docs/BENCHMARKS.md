@@ -4,12 +4,16 @@
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
+| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`: primary host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states; 30 tests GREEN. No archive, staged smoke, runtime, correctness, or performance evidence | n/a |
+| **Developer agent entry point (implemented)** | `DOCS-AGENT-PROTOCOL-ENTRYPOINT`: public contribution guide + synchronized, mutation-gated pre-claim intake rule | Rebased documentation/protocol only; benchmark void | n/a |
+| **ARCH audit: ABI is text-only** | 4 capabilities (H3 video, Laguna, Kimi-Linear, DeepSeek-V4) reachable only from `examples/`, none registry-backed. No gate asks whether a CONSUMER can reach a capability. Documentation only |
+| **`ROAD-V1-MEM` M1+M2 (2026-08-08)** | KV auto-sizing CPU brick: `--kv-cache-memory` sizes the pool from a byte budget via the group-aware `KVBytesPerBlock` divisor (ABI v16, CPU-gated). M3 profile run dgx-gated |
 | **Record repair 2026-08-07** | `main` was red on `check-agent-record` + `check-env-doc`, blocking every PR. Dangling `kda-chunk-aot/` link and two undocumented env vars. No behaviour change |
 | **vLLM** | Qwen3.6-27B NVFP4, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
-| **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
-| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | prefill **1.18x ahead**, decode tie, memory parity | byte-identical |
+| **vLLM** | Laguna-S-2.1 NVFP4 (118B/8B MoE), GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
+| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: vllm.cpp is **0.461x prefill / 0.653x decode+E2E**, but uses **24.2% less RSS** | byte-identical on both Arm lanes |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 
@@ -113,9 +117,12 @@ caveat that vLLM pre-reserves a fixed fraction up front while we allocate the KV
 blocks the workload needs. Real difference in operating footprint, not evidence
 of a lower per-token KV cost.
 
-### Laguna-XS-2.1 (NVFP4)
+### Laguna-S-2.1 (NVFP4)
 
-Both arms NVFP4, single request, batch 1, GB10.
+`poolside/Laguna-S-2.1-NVFP4`, 118B total / ~8B active MoE, 48 layers,
+256 experts, ~67 GiB. Both arms NVFP4, single request, batch 1, GB10. The local
+checkpoint directory is named `laguna-xs-nvfp4`, which is where the "Laguna-XS"
+label in earlier revisions of this page came from; the measured model is S-2.1.
 
 | Arm | Decode tok/s | Ratio |
 |---|---:|---:|
@@ -156,6 +163,15 @@ Qwen3.6-27B NVFP4, GB10, whole serving window.
 host mirror is freed once the device Marlin resident is built.
 
 ## llama.cpp, CPU
+
+| RPi5/A76 arm (R4-R6, `GATING`) | Result |
+|---|---|
+| Scope | 4-core A76, DotProd, no i8mm; 20-core binding arm does NOT transfer. buildx/QEMU-built, Pi-executed unthrottled; hashes pinned in the [campaign spec](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md) |
+| Assembly vs compiler SDOT (one GCC 13.3 binary) | AAPCS64 leaf wall +3.66% M1/T1, +5.08% M128/T1, +3.69% M128/T4, with 9.74-10.24% fewer instructions; M1/T4 is the -2.43% residual ([assembly evidence](bench-evidence/rpi5-a76-q8-dot-20260806.md)) |
+| 64-token Qwen model gate | Byte-identical across x86, portable, SDOT and assembly arms; asm vs SDOT median TTFT -1.55%, TPOT neutral, E2E -0.13%; vs portable TTFT -33.40%, E2E -2.67%. Cortex-A76+DotProd selects assembly by default |
+| Same-file llama.cpp floor (pp17/tg64) | **NOT MET on speed**: prefill 12.81 vs 27.77 tok/s (0.461x), decode 2.55 vs 3.91 (0.653x), E2E 26,018.39 vs 16,998.49 ms ([competitor evidence](bench-evidence/rpi5-a76-llamacpp-20260806.md)) |
+| Peak RSS | **2.841 vs 3.747 GiB, 24.2% less**; 3 clean unthrottled reps; same-text 64-token greedy output byte-identical after trailing-newline normalization |
+| `PENDING` | Pi concurrency; BF16 GEMM / speed closure (the 2.17x prefill, 1.53x decode gap profiling is W6) |
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
 llama.cpp `237ad9b96` built fresh on the same host.
@@ -299,22 +315,26 @@ built on it rather than keeping the flattering one.
 
 **CPU elementwise GEMM, wide x86 tiers (2026-08-07).** INDICATIVE ONLY, not binding: the x86 dev box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. The AVX-512 tier measures 1.56x to 2.83x over SSE2 on the elementwise micro-kernels, byte-identically. A binding number needs a qualified x86 host, which the project does not have.
 
+**CPU elementwise GEMM, transpose-free `[K,N]` path (2026-08-07).** On dgx aarch64 the `[K,N]` path beats `[N,K]` by 1.16x to 1.30x, byte-identically. The x86 arm is INDICATIVE ONLY, not binding: that box is VOID for timing per `CLAIM-KERNEL-CPU-ELEM-GEMM-1`. `VT_CPU_MATMUL_STEAL` ships default OFF and is NOT measured; it must justify itself by measurement and may measure neutral.
+
 ## Open gaps
 
 | Track | Status | Next gate |
 |---|---|---|
+| Surface coverage (`ARCH-ONE-SURFACE`) | **CORRECTNESS COMPLETE:** #139 restores DSR 32 (`kcuda=0`) via registry/name resolution; ABI-v14 selection unchanged; no speed claim | Selector 2/2·11 plus execution-bound CMake/File-API/CTest + CI/preflight + manifest-integrity guard 52/52; CPU platform/loader/C-ABI tests green; CUDA A/B remains residual |
 | 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
-| Laguna-XS NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
+| Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |
 | DeepSeek-V4-Flash vs vLLM | Infeasible on one Spark | 2x GB10 with TP2 over the NCCL seam |
+| Tensor parallelism (task #287 spike, 2026-08-08) | **No number owed** (`benchmark_binding=false`): records-only scope at pin `555967922` ([spec](../.agents/specs/tensor-parallelism-spike.md)). CPU-completable bricks TP-W1..W4+W7 gate on token-exactness, not speed | Perf gate is TP-W6: at or above vLLM TP=2 on every axis, same 2-GPU box (PENDING-HW) |
 | DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
 | Multimodal image, audio, video | Correctness gated, speed unmeasured | Per-modality speed grids |
-| `/v1/videos` OpenAI (Sora) shape | **No number owed**: a CPU serving-surface change (request aliases, the MP4 content route, and reference conditioning wiring), unit-gated only, no kernel or generation path touched | Video generation speed stays the MiniMax-H3 FP4 row below |
+| `/v1/videos` OpenAI + ONE-SURFACE ROW 2 | **No number owed:** ABI-v12 device selection is backend-dispatch plumbing; generation math and speed paths are unchanged | DSR 34→32; baseline/allowlist unchanged; 25/25 checker mutations; CPU fold 6/137, including one-queue/device-provenance mutations |
 | Qwen3-dense decode CUDA-graph | Token-exact pass, ~4.3% e2e directional | Steady-state per-step tok/s |
-| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | KDA op `vt::KdaGatedDeltaRule` GB10 **122/128 + 4.24 tok/s** best, NOT STRICT, OFF; chunk_kda prefill LANDED (§18, #111): unit-correct (4.68e-5) but chunk-every-step REGRESSES 122→102 + 4.08 tok/s | chunk-every-step ≠ vLLM prefill=chunk/decode=recurrent → coin-flips (p3 16→3); vLLM ~21 tok/s (~5×). Real lever = paged-incremental decode (§18) |
+| Kimi-Linear-48B-A3B (KDA+MLA+MoE) | **RUNNER FOLD LANDS (ROW 7, §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (near-tie profile); FA2 MLA default-ON; SACRED green.** Server 19.0 tok/s wall; CLI 18.93 reproduced | vLLM ~21 (#111 floor; in-session re-measure ABORTED by GB10 reboot at util 0.82, §21): **~0.90×**, >= vLLM NOT met; residual = KDA host islands + grouped MoE + decode graph |
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | MiniMax-H3 FP4 speed (W-FP4a) | **Measured GB10 (`row/H3-FP4-GPU-E2E`).** Marlin W4A16 byte-exact vs bf16; fp4 a memory win, 0.8x bf16/forward. Real-ckpt fp4-resident e2e RUNS (mp4/wav) | fp4 speed CLOSED. bf16-vs-quant A/B: ENCODER half MEASURED (§8.15), DiT half NOT (no bf16 render exists). Detail: benchmark-record + spec §8 |
 | MiniMax-H3 render coherence (`row/H3-RENDER-CLOSE` #77) | **CLOSED: a COHERENT scene on GB10.** #70/#74 white was wrong-PARTITION usage (t2va on the ref2va ckpt); t2va on the FL2VA GGUF renders a prompt-matched orange cat (adj-cos 0.95 vs 0.06, no patch-grid) | Verified first: t2va inputs byte-exact vs upstream; CUDA device==host at seq 1920. Follow-up `H3-TASK-PARTITION-GUARD`: the task/partition mismatch now RAISES 1:1 with `_resolve_task` (spec §8.6-8.7) |
@@ -325,13 +345,15 @@ built on it rather than keeping the flattering one.
 | MiniMax-H3 image conditioning (`row/H3-CONDITIONED-E2E`, `row/H3-VISION-SCATTER`, `row/H3-REF2VA-ASSEMBLY`, `row/H3-NVFP4-LOADER-DIFF`, `row/H3-NVFP4-STREAM-DIFF`) | **fl2va COHERENT; ref2va NVFP4 nibble loader bug FIXED (byte-verified); grid residual DIAGNOSED §8.12** | Activation diff + fingerprints (PR #95): NO load-path defect; all weights/islands/RoPE quant-noise-close to the coherent GGUF; grid = community-NVFP4 quant fidelity, not a loader fix. See benchmark-record |
 | MiniMax-H3 encoder quantization (`H3-ENC-BF16-COND-DIFF`) | **Measured Thor (`d1085374`).** Q4_K_M vs bf16 encoder, same 233-token prompt, same forward: rel RMS **0.0340** (0.0685 excl. sink), per-token cosine mean **0.99745** / min 0.909, median rotation **3.5°** | NOT a scale change (best rescale 0.0340->0.0328). Same energy as a ONE-WORD prompt edit but DIFFUSE: 232/233 tokens rotate vs 172/233 untouched. Render A/B owed. Detail: benchmark-record |
 | MXFP4 Qwen3-8B (W4A16 Marlin) | **`KERNEL-MARLIN-DENSE-EXEC` x3 (dense-ON default): c1 1.020, c2/c4/c8 0.962/0.966/0.969, GPU mem 2.63x less** (beats #51 1.005/0.925/0.939/0.953 EVERY axis); #44 3/3, 32B-NVFP4A16 6/6; -Werror test-guard fixes x2 | **VT_MARLIN_DENSE default-ON** (+951us). `FLASH-PTXAS` #82: cuModule A/B ties our+vLLM PTX across ptxas 13.0/13.2/driver-JIT (~144us); +10us is engine CONTEXT not codegen, no ptxas lever/flip (retires #75) |
-| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **llama.cpp denominator MEASURED** on GB10 at full strength (`NV_coopmat2`): qwen3-0.6B F16 pp128 **11,730 t/s**, tg32 **161.4 t/s**. Our arm NOT RUN. [Detail](../.agents/benchmark-record.md) | BLOCKED: no model on dgx loads in BOTH engines (our GGUF path rejects arch `qwen3`; llama.cpp cannot load our Laguna file). Needs a shared arch or `VK-D` |
+| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **Both arms measured, same weights.** 0.6B @128-in/32-out: llama.cpp Vulkan **11,956** pp / **174.8** tg; ours **575** pp / **66.6** tg | Decode **8.59 -> 91.7 t/s** (**10.7x**), 6/6 exact; **2.62x** off llama.cpp at matched shape. CUDA arm unblocked. 27B: fallbacks **11->5**. paged_attn batching REFUTED ([plan](../.agents/specs/bench-27b-five-way.md)) |
 | Memory footprint vs declared workload (`ROAD-V1-MEM`, #83) | **Never measured, and not measurable today**: there is no auto-sizing to compare against, because the KV pool is a hand-typed `--num-blocks`, so "what the run actually needed" has no number | Once M1's `MemoryBudget` lands: predicted-vs-actual bytes per allocation class, then peak footprint ours-auto vs vLLM at its 0.9 default on the same model and config |
 | Startup latency (cold to first `/health`) | **36.51 s vs vLLM 0.25.0's 221.51 s = 6.07x** (medians of 3, 27B-NVFP4, GB10). PROVISIONAL: 3 of 6 legs contended, repeat killed by a host reboot. [Detail](../.agents/benchmark-record.md) | Uncontended 3-rep re-run on a quiet box |
 | Speculation depth (`ROAD-V1-D3-SPEC-K`, #81) | **Never measured, MTP is k=1** (our port covers vLLM's k=1 branch only), so no acceptance-vs-depth curve exists | k=2..4 three-way greedy gate, then the c1/c>1 A/B + the per-workload (prose vs code) acceptance-vs-depth curve any dynamic or adaptive depth policy needs |
-| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **NOT APPLICABLE: nothing measured, claimed or owed.** 16 NATIVE kernels; 71 on the host tier. opt-125m runs e2e token-exact on llvmpipe; no speed measured. [Detail](../.agents/specs/vulkan-full-support.md) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
-| ROCm (`BACKEND-GATE-ROCM-VLLM` / `-SGLANG`) | **NOT APPLICABLE: no number measured, claimed or owed.** The W0 skeleton registers 1 of 106 ops and its HIP sources have never been compiled by anyone; no AMD hardware here | A contributor's first `-DVLLM_CPP_HIP=ON` build ([#41](https://github.com/mudler/vllm.cpp/issues/41)). Only once a model runs does a same-box vLLM-ROCm oracle become the gate; the floor is vLLM, quant-matched |
+| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | **NOT APPLICABLE: nothing measured, claimed or owed.** 24 NATIVE (+8 GDN, BOTH recurrences; oracle-gated, no speed); 63 host-tier. opt-125m e2e token-exact on llvmpipe. [Detail](../.agents/specs/vulkan-full-support.md) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
+| ROCm (`BACKEND-GATE-ROCM-VLLM` / `-SGLANG`) | **NOT APPLICABLE: no number measured, claimed or owed.** W0 ctest-green on 4 gfx archs (#41); gfx1201 hipBLAS + Gemma-4 MoE (#140, contributor) ran M0/M1 on 2× R9700, our side CPU-link-verified only. No AMD HW here | The approach-(b) fix (PENDING community) unblocks the first APU model run (M2); the gate becomes a same-box vLLM-ROCm oracle once a model runs ([#41](https://github.com/mudler/vllm.cpp/issues/41)); floor: vLLM |
 | SGLang floor arms | Never ran | Both arms of the SGLang comparison |
+| Embeddings on the ONE surface (ROW 6, `LlamaModel` + `vllm_embed` + `/v1/embeddings`) | **NO number measured, claimed or owed.** Correctness-gated only, CPU: the 2026-08-08 fold (engine path == direct registry path, f64 LAST+normalize reference on the committed fixture) is plumbing, no speed claim | A REAL embedding checkpoint (e5-mistral class) + a same-box `vllm.LLM(task="embed")` oracle; only then does an embed-throughput bar exist |
+| Parakeet/FastConformer ASR (P1-P4 + ONE-SURFACE fold ROW 1) | **NO number measured, claimed or owed.** Correctness-gated only, CPU f32; the 2026-08-07 surface fold (`vllm_transcribe`, `/v1/audio/transcriptions`) is transcript-byte-identical plumbing, no speed claim. | Floor is `parakeet.cpp`, same clip and box; needs a CUDA provider and a pretrained checkpoint |
 | cuBLAS invocation-parity guard | CI guard landed (CPU); `kGemvHeuristicAlgos` refactor build-verify owed | `nvcc` rebuild + SACRED gate on dgx |
 | Ampere consumer (`sm_86`, RTX 3090 class) | **No number owed; no such board here.** 2026-08-06 build-verify: 7/7 FA2 TUs 0-warn, real `sm_86` SASS. [Detail](../.agents/benchmark-record.md) | External RTX 3090 report. Floor is llama.cpp on that card (GGUF, not our Blackwell-only NVFP4 grid) |
 | Pre-Ampere breadth (Turing `sm_75` / Volta `sm_70` / Pascal) | **No number owed; nothing runs on these arches.** 2026-08-06 `sm_75`: 20/20 TUs PASS (0 err/warn), WMMA bodies + all 3 selectors arch-gated; GB10 SASS byte-identical. [Detail](../.agents/benchmark-record.md) | Full-library LINK at `sm_75` + `cuobjdump` SASS, then a build-supported row. The fp16 `fattn` port is speed-only now; its floor when a card exists is llama.cpp on that card |
@@ -342,7 +364,7 @@ built on it rather than keeping the flattering one.
 |---|---|
 | vLLM online grid | `.agents/specs/competitive-benchmarks.md`, evidence under `dgx:~/work/vllm.cpp-online-gate/evidence/` |
 | CPU vs llama.cpp | Same GGUF both arms, 3 reps under one `flock $HOME/gpu.lock`; `VT_GGUF_KEEP_F16=0` reproduces the pre-L7 baseline |
-| Laguna NVFP4 decode | `flock $HOME/gpu.lock ./build-cuda/examples/laguna-gen --model ~/laguna-xs-nvfp4 --gpu`; `drop_caches` first, create the CUDA context before loading weights |
+| Laguna NVFP4 decode | `flock $HOME/gpu.lock ./build-cuda/examples/laguna-gen --model ~/laguna-xs-nvfp4 --gpu` (that directory holds the S-2.1 checkpoint); `drop_caches` first, create the CUDA context before loading weights |
 | DeepSeek-V4-Flash decode | `deepseek-v4-gen --gpu --kv-cache` on `ds4flash.gguf`, captured under tmux |
 | Metal vs MLX-LM | Paired A/B harness, interleaved runs, cold legs discarded |
 | Vulkan vs llama.cpp Vulkan | Not yet runnable (no model runs on Vulkan). Planned harness in `.agents/specs/vulkan-full-support.md` §5.2 |

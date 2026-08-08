@@ -17,7 +17,22 @@ MATRICES = {
     # 358 since 2026-08-05: +31 architectures vLLM's registry defines that we had
     # NEVER inventoried (found by scripts/upstream-inventory.py). All INVENTORIED;
     # inventorying is not committing.
-    "MODEL": (AGENTS / "model-matrix.md", 359),
+    # 360 since 2026-08-07: +`MODEL-AUDIO-PARAKEET-ENCODER`, the first row of the
+    # new `MODEL-AUDIO` section (Parakeet / FastConformer encoder + CTC head,
+    # spike parakeet-conformer-encoder.md work item P4). It is NOT one of the 328
+    # registry architectures: vLLM ships it as the audio COMPONENT of
+    # `nano_nemotron_vl.py` and delegates the encoder itself to transformers, so
+    # there is no `registry.py` entry to inventory. A genuinely new row, never a
+    # count relaxed to make a transition pass.
+    # 361 since 2026-08-07: +`MODEL-AUDIO-PARAKEET-TRANSDUCER` (the Parakeet RNN-T
+    # and TDT heads over that same encoder: `ParakeetForRNNT` / `ParakeetForTDT`,
+    # spike work item P6). A SEPARATE row rather than an advance of the encoder
+    # row, because it is a different upstream model class with its own state dict,
+    # its own decode and its own checkpoints. Like the encoder row it is not one
+    # of the 328 registry architectures: vLLM has no transducer call site at all
+    #: so there is nothing in `registry.py` to inventory. Bumped because a new
+    # row EXISTS, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 361),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -130,6 +145,11 @@ MATRICES = {
     # the DGX GB10: 2/2 cases · 92401 assertions vs the CPU oracle + f64 dequant,
     # memcheck 0, RED-first proven. `ACTIVE`, `CLAIM-CUDA-KEEPQUANT-GEMM`, spec
     # specs/deepseek-v4-flash.md §W8.)
+    # 46 since 2026-08-06: +`KERNEL-CPU-A76-Q8-DOT`, a separately gateable
+    # Cortex-A76 Q8_0 x Q8_0 DotProd/assembly family. The physical-Pi trace
+    # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
+    # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
+    # the broad CPU-backend row.
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
     # 47 since 2026-08-06: +`KERNEL-GEMM-CPU-ELEM-X86WIDE` (the AVX2/AVX-512
@@ -137,7 +157,17 @@ MATRICES = {
     # measured 3.5x) and +`KERNEL-GEMM-CPU-TILED` (the tinyBLAS-style tiled
     # sgemm; controls proved our NEON kernel is at ggml-stock parity and the
     # whole 16-bit deficit is llamafile, ~1.9x Arm / ~2.4x x86).
-    "KERNEL": (AGENTS / "kernel-matrix.md", 47),
+    # 50 since 2026-08-06: +`KERNEL-CPU-CONV2D-SUBSAMPLE`, +`KERNEL-DEPTHWISE-CONV1D`
+    # and +`KERNEL-ATTN-RELPOS` — the three conformer/FastConformer audio-encoder
+    # primitives the tree had no device op for at all (Conv2d existed only as a host
+    # std::vector loop; the only depthwise conv1d was the CAUSAL Mamba/GDN one; every
+    # attention path was RoPE + paged/flash KV). Spike specs/parakeet-conformer-encoder.md.
+    # 51 since 2026-08-06 (PR #79): +`KERNEL-CPU-A76-Q8-DOT`, a separately gateable
+    # Cortex-A76 Q8_0 x Q8_0 DotProd/assembly family. The physical-Pi trace
+    # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
+    # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
+    # the broad CPU-backend row.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 51),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
@@ -272,7 +302,13 @@ ENGINE_PREFIXES = (
 # over HTTP at all. CPU-landed + gated, `CLAIM-SERVE-VIDEOS-REFS`, spec
 # `specs/minimax-h3.md` §10.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 142
+# 143 since 2026-08-07: +`ENG-RELEASE-BINARIES` (downloadable, backend-specific
+# server bundles and their static/runtime dependency contract) — a real
+# distribution capability requested in issue #117, not a restatement of the
+# server implementation. Inventoried while its release-matrix spike is written;
+# no packaging support is claimed by the count bump.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 143
 
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [

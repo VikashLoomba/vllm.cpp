@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import tempfile
 import subprocess
@@ -104,6 +105,50 @@ class BudgetEnforcement(unittest.TestCase):
                 )
                 self.assertTrue(errors)
 
+    def test_only_one_exact_pr_waiver_covers_an_over_budget_class(self) -> None:
+        change = self.change(
+            "AGENTS.md", checker.PATH_CLASS_BUDGETS["procedure"] + 1
+        )
+        waiver = checker.Waiver(
+            waiver_id="WAIVER-PR-SIZE-001",
+            rule_id="POL-PR-SIZE",
+            scope="pr:128",
+            owner="maintainer",
+            reason="bounded migration",
+            evidence="PR-128",
+            expires=dt.date(2026, 8, 15),
+        )
+        self.assertEqual(
+            checker.change_errors(
+                [change], waivers=(waiver,), waiver_scope="pr:128"
+            ),
+            [],
+        )
+        for rule_id, scope in (
+            ("POL-PATH-CLASSIFICATION", "pr:128"),
+            ("POL-PR-SIZE", "pr:129"),
+            ("POL-PR-SIZE", ""),
+        ):
+            with self.subTest(rule_id=rule_id, scope=scope):
+                wrong = checker.Waiver(
+                    **{**waiver.__dict__, "rule_id": rule_id, "scope": scope}
+                )
+                self.assertTrue(
+                    checker.change_errors(
+                        [change], waivers=(wrong,), waiver_scope="pr:128"
+                    )
+                )
+
+        duplicate = checker.Waiver(
+            **{**waiver.__dict__, "waiver_id": "WAIVER-PR-SIZE-002"}
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate applicable waivers"):
+            checker.change_errors(
+                [change],
+                waivers=(waiver, duplicate),
+                waiver_scope="pr:128",
+            )
+
     def test_binary_changes_fail_closed_instead_of_becoming_free(self) -> None:
         errors = checker.change_errors([checker.ChangedPath("docs/image.png", None, None)])
         self.assertTrue(any("binary" in error for error in errors), errors)
@@ -131,6 +176,19 @@ class BudgetEnforcement(unittest.TestCase):
             ),
             [],
         )
+
+    def test_every_created_checker_has_closed_bootstrap_evidence(self) -> None:
+        expected = {
+            "scripts/check-commit-trailers.py",
+            "scripts/check-policy.py",
+            "scripts/check-pr-size.py",
+            "scripts/check-prompt-contract.py",
+        }
+        self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
+        for path, mutation in checker.CREATION_MUTATIONS.items():
+            with self.subTest(path=path):
+                compile(mutation, path, "exec")
+                self.assertTrue(checker.recognized_evidence(path).endswith(".py"))
 
     def test_unchanged_or_mode_only_test_is_not_semantic_mutation_evidence(self) -> None:
         errors = checker.change_errors(

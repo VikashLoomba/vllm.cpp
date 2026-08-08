@@ -30,6 +30,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace vt::vulkan {
 
@@ -85,6 +87,57 @@ class VulkanContext {
   // that checks numbers alone passes identically when the fallback served the
   // call -- the same trap the op-provider decline counters exist for.
   bool PipelineExistsFor(const std::string& name) const;
+
+  // DISPATCH ACCOUNTING (VK-E deep dive). Total submits, and a per-shader
+  // histogram. This exists because a wall-clock number could not distinguish two
+  // very different stories: a reasonable dispatch count each paying a large
+  // fence-wait, versus dispatching far more times than the model should need.
+  // Context-switch counts could not separate them either -- the driver's fence
+  // wait is a poll() loop that may wake more than once per fence -- so the count
+  // has to come from OUR side of the boundary.
+  //
+  // Always-on and lock-free-ish (guarded by the same mutex the dispatch already
+  // takes), because the cost is one increment against a submit that already costs
+  // milliseconds. `VT_VULKAN_DISPATCH_STATS=1` prints the histogram at exit.
+  uint64_t dispatch_count() const;
+  // name -> count, sorted by count descending. For the diagnostic dump.
+  std::vector<std::pair<std::string, uint64_t>> DispatchHistogram() const;
+
+  // name -> total fence-wait milliseconds, sorted descending. COUNTS NAME THE
+  // SHAPE OF A RUN; ONLY TIME NAMES THE LEVER. A measured 0.046 ms per-dispatch
+  // floor against a 0.357 ms observed average proved that 87% of this backend's
+  // dispatch cost is real kernel execution, not submission overhead -- so the
+  // question stopped being "how many dispatches" and became "which kernel", and
+  // a histogram of counts cannot answer that. The two differ wildly: the most
+  // FREQUENT shader is routinely not the most EXPENSIVE one.
+  //
+  // Submission is synchronous, so the fence wait brackets that dispatch and
+  // nothing else, and these sum to the run's GPU time rather than overlapping.
+  std::vector<std::pair<std::string, double>> DispatchTimeMs() const;
+
+  // COMMAND-BUFFER BATCHING (VK-A2). Records dispatches into ONE command buffer
+  // and submits once, instead of submit+fence-wait per op.
+  //
+  // WHY: a measured per-dispatch floor of 0.046 ms times 2,952 dispatches is
+  // 135.8 ms of a 275.8 ms decode run -- 49% of GPU time, up from 13% before the
+  // argmax and GEMV kernels landed. Three shaders now cost AT OR BELOW that
+  // floor, meaning they do no meaningful work relative to being launched.
+  //
+  // FLUSH is mandatory before ANY host read of device memory. This backend's
+  // Copy/Memset are plain memcpy over the persistently mapped, host-coherent
+  // allocation, so a pending batch means the host reads STALE bytes -- silently,
+  // with no error. Backend::Copy, Memset and Synchronize all flush.
+  void FlushBatch();
+  // Whether dispatch batching is active. Exposed so a test never has to restate
+  // the default: the VK-A2 gate originally re-derived it from the environment
+  // variable and silently asserted the wrong branch the moment the default
+  // flipped from off to on. A predicate duplicated between an implementation and
+  // its gate is a predicate that will disagree with itself.
+  bool batching_enabled() const;
+  // Dispatches currently recorded and not yet submitted. For the gate: batching
+  // is invisible in results by construction (same kernels, same order), so a test
+  // has to assert the MECHANISM rather than the numbers.
+  uint32_t pending_batch() const;
 
   // Number of distinct pipelines currently cached. Exposed for the unit gate: it
   // is how a test proves a new specialization produced a NEW pipeline rather than
@@ -159,6 +212,24 @@ class VulkanContext {
   void* scratch_buffer_ = nullptr;   // VkBuffer
   void* scratch_memory_ = nullptr;   // VkDeviceMemory
   void* scratch_mapped_ = nullptr;   // host pointer
+  void FlushBatchLocked();           // caller holds mutex_
+  // GPU TIMESTAMP PROFILING. Batching submits many dispatches under ONE fence,
+  // so the per-dispatch fence wait that used to attribute time to a shader no
+  // longer exists. Timestamps written into the command buffer are the only way to
+  // recover per-kernel GPU time once submissions are batched -- and they measure
+  // the GPU directly rather than a host-side wait, so they are strictly better
+  // evidence than what they replace.
+  //
+  // Allocated and written ONLY when VT_VULKAN_DISPATCH_STATS is set, so a
+  // production dispatch pays nothing.
+  void* query_pool_ = nullptr;       // VkQueryPool
+  double timestamp_period_ns_ = 0.0; // 0 => device cannot timestamp; profiling off
+  void* batch_names_ = nullptr;      // std::vector<std::string>*, one per recorded dispatch
+  bool batch_open_ = false;          // a command buffer is recording
+  uint32_t batch_count_ = 0;         // dispatches recorded into it
+  void* dispatch_hist_ = nullptr;    // std::map<std::string, uint64_t>*
+  void* dispatch_ms_ = nullptr;      // std::map<std::string, double>*
+  uint64_t dispatch_total_ = 0;
   void* pipelines_ = nullptr;        // std::map<std::string, Pipeline>*
   void* mutex_ = nullptr;            // std::mutex*
   uint32_t queue_family_ = 0;

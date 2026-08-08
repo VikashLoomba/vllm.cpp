@@ -478,6 +478,10 @@ Hooks remain convenience backstops.  They are never described as proof because
 
 ## Migration and cutover
 
+PR #128 consumes `WAIVER-PR-SIZE-001` only for the one-time consolidation and
+evidence-preserving archive migration. It expires after the migration window;
+subsequent policy changes remain within the ordinary per-class budgets.
+
 1. Inventory every active normative statement and map it to a `POL-*` rule,
    procedure, archived rationale, or deletion as duplicate.
 2. Land `policy.csv`, schemas, render/check tooling, and mutation tests without

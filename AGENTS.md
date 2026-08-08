@@ -37,6 +37,7 @@ byte-for-byte. Do not edit it independently.
 - `POL-REVIEW-FRESH` — Use a fresh reviewer that performs static review and targeted scratch mutation.
 - `POL-REVIEW-NO-REPAIR` — Return findings to a fresh implementer and do not repair them in the coordinating session.
 - `POL-OPERATOR-VERIFY` — Run the claimed gate instead of trusting an implementer report.
+- `POL-ONE-SURFACE` — Expose every shipped capability through include/vllm.h and keep examples as thin clients of the same library surface.
 - `POL-EVIDENCE-PRESERVE` — Move evidence without deleting it.
 - `POL-PR-DISPOSITION` — Merge a verified PR in-session or close an obsolete PR with the reason recorded.
 <!-- policy-t0:end -->

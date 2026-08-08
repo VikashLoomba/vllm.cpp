@@ -28,6 +28,9 @@
 //      which is integer arithmetic and therefore unaffected either way.
 #include "vulkan_context.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -41,6 +44,43 @@
 
 namespace vt::vulkan {
 namespace {
+
+// Dispatch accounting, enabled by VT_VULKAN_DISPATCH_STATS (VK-E deep dive).
+const bool kDispatchStats = [] {
+  const char* v = std::getenv("VT_VULKAN_DISPATCH_STATS");
+  return v != nullptr && std::strcmp(v, "0") != 0;
+}();
+// COMMAND-BUFFER BATCHING (VK-A2), VT_VULKAN_BATCH.
+//
+// DEFAULT ON. `=0` forces the per-dispatch submit-and-wait path, as a bisect
+// lever and for the same-binary A/B that measured this (decode 2.62x, 8 of 8
+// interleaved pairs on GB10).
+//
+// Batching is sound only if EVERY host read of device memory drains the batch
+// first, and there are exactly three such paths. Backend::Copy and Memset are
+// host memcpy over the persistently mapped allocation, and Synchronize is the
+// caller's explicit "make results readable" point -- all three flush. The third
+// is not a method on this backend at all: the PORTABLE REFERENCE TIER runs CPU
+// kernels DIRECTLY over device memory for any op with no native Vulkan kernel,
+// which is sound only because this backend is unified-memory.
+//
+// That last one is covered by `Backend::FlushPending` (backend.h:44-49), which
+// op_provider.cpp calls before dispatching a reference-tier kernel and which the
+// Vulkan backend implements. Without it a host kernel would read bytes a pending
+// dispatch had not written -- silently, with no error, which is the failure mode
+// this campaign has already paid for twice.
+const bool kBatchDispatch = [] {
+  const char* v = std::getenv("VT_VULKAN_BATCH");
+  return v == nullptr || std::strcmp(v, "0") != 0;
+}();
+
+// Cap on dispatches per submit. Bounded so a batch cannot pin an unbounded number
+// of descriptor sets, and so the fence granularity stays coarse enough to be
+// worth batching but fine enough to bound latency.
+constexpr uint32_t kMaxBatch = 512;
+
+const std::chrono::steady_clock::time_point g_dispatch_t0 =
+    std::chrono::steady_clock::now();
 
 // The void* handle smuggling in vulkan_context.h is only sound while every
 // Vulkan handle fits in a pointer. Dispatchable handles are pointers by
@@ -245,12 +285,48 @@ Probe ProbeDevice(VkInstance instance) {
 
 // ---------------------------------------------------------------------------
 
+// How many descriptor sets each pipeline owns (VK-A2).
+//
+// A DESCRIPTOR SET IS READ AT EXECUTION TIME, NOT RECORD TIME. With one set per
+// pipeline -- the pre-VK-A2 shape -- recording two dispatches of the same
+// pipeline into one command buffer would have the second vkUpdateDescriptorSets
+// overwrite the first's operands before the GPU ran either. That was sound only
+// because every dispatch waited on a fence before the next one touched the set.
+// Batching therefore needs a set PER RECORDED DISPATCH, which is the substantive
+// part of this row; deferring the submit alone would silently compute garbage.
+//
+// The ring is bounded, so a pipeline used more than kDescriptorRing times in one
+// batch forces a flush. That is a throughput ceiling, never a correctness
+// question: the flush happens before the set is reused.
+// MEASURED: 16 was the batch-length limiter, not kMaxBatch. vt_rms_norm runs 112
+// times per forward pass (4 per layer x 28 layers), so it exhausted a 16-deep ring
+// seven times per pass and forced a flush each time -- observed batches capped at
+// 40-46 dispatches against a kMaxBatch of 128. Every forced flush is a
+// vkQueueSubmit plus a blocking vkWaitForFences, and a host profile with the idle
+// CPU-threadpool spin suppressed puts 62% of on-CPU time in the kernel and the
+// NVIDIA driver against only 14% in our own code. So the submits ARE the host
+// cost, and the ring depth is what sets how many there are.
+constexpr uint32_t kDescriptorRing = 128;
+
+// EFFECTIVE ring depth, clamped to the allocated one. Exists so the ring can be
+// A/B'd in ONE binary: it was 16, which capped batches at 40-46 dispatches, and a
+// cross-BUILD comparison of two depths is the shape that produced a false 1.2x
+// reading for the subgroup tactic earlier in this campaign.
+const uint32_t kRingDepth = [] {
+  const char* v = std::getenv("VT_VULKAN_RING");
+  if (v == nullptr) return kDescriptorRing;
+  const int n = std::atoi(v);
+  if (n < 1) return 1u;
+  return n > static_cast<int>(kDescriptorRing) ? kDescriptorRing : static_cast<uint32_t>(n);
+}();
+
 struct VulkanContext::Pipeline {
   VkShaderModule module = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
   VkPipelineLayout layout = VK_NULL_HANDLE;
   VkPipeline pipeline = VK_NULL_HANDLE;
-  VkDescriptorSet set = VK_NULL_HANDLE;
+  VkDescriptorSet sets[kDescriptorRing] = {};
+  uint32_t used_this_batch = 0;  // reset by FlushBatchLocked
   uint32_t buffer_count = 0;
   uint32_t push_size = 0;
 };
@@ -315,6 +391,14 @@ VulkanContext::VulkanContext() {
   denorm_preserve_f32_ = fc.shaderDenormPreserveFloat32 == VK_TRUE;
   sz_inf_nan_preserve_f32_ = fc.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
   max_workgroup_count_x_ = props2.properties.limits.maxComputeWorkGroupCount[0];
+  // GPU TIMESTAMP SUPPORT, probed rather than assumed. `timestampPeriod` is
+  // nanoseconds per tick; a device reporting 0 cannot timestamp at all, and
+  // `timestampComputeAndGraphics == VK_FALSE` means the compute queue family may
+  // not support it even when the device nominally does. Either way profiling
+  // silently stays off rather than producing nonsense numbers.
+  if (props2.properties.limits.timestampComputeAndGraphics == VK_TRUE) {
+    timestamp_period_ns_ = static_cast<double>(props2.properties.limits.timestampPeriod);
+  }
   VT_CHECK(props2.properties.limits.maxComputeWorkGroupInvocations >= kWorkgroupSize,
            "vulkan: device reports maxComputeWorkGroupInvocations below the Vulkan "
            "guaranteed minimum of 128, which the committed SPIR-V is compiled for");
@@ -436,10 +520,12 @@ VulkanContext::VulkanContext() {
       static_cast<uint32_t>(kSpirvModuleCount) * kSpecializationHeadroom;
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_size.descriptorCount = kernels * kMaxBindings;
+  pool_size.descriptorCount = kernels * kDescriptorRing * kMaxBindings;
   VkDescriptorPoolCreateInfo dpci{};
   dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  dpci.maxSets = kernels;
+  // kDescriptorRing sets per pipeline now, not one -- see the ring's comment for
+  // why batching cannot share a set across recorded dispatches.
+  dpci.maxSets = kernels * kDescriptorRing;
   dpci.poolSizeCount = 1;
   dpci.pPoolSizes = &pool_size;
   VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
@@ -456,6 +542,86 @@ VulkanContext::VulkanContext() {
   scratch_mapped_ = AllocBuffer(kScratchBytes, &scratch_buffer_, &scratch_memory_);
 
   pipelines_ = new std::map<std::string, Pipeline>();
+  dispatch_hist_ = new std::map<std::string, uint64_t>();
+  dispatch_ms_ = new std::map<std::string, double>();
+  batch_names_ = new std::vector<std::string>();
+  // TWO timestamps per dispatch (before and after), for a whole batch. Created
+  // only under the stats flag: a query pool is cheap, but writing timestamps adds
+  // commands to every dispatch and production must not pay for a diagnostic.
+  if (kDispatchStats && timestamp_period_ns_ > 0.0) {
+    VkQueryPoolCreateInfo qpci{};
+    qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = kMaxBatch * 2;
+    VkQueryPool qp = VK_NULL_HANDLE;
+    if (Api().vkCreateQueryPool(Unpack<VkDevice>(device_), &qpci, nullptr, &qp) == VK_SUCCESS) {
+      query_pool_ = Pack(qp);
+    }
+  }
+
+  // VT_VULKAN_DISPATCH_STATS=1 dumps the per-shader histogram at exit. Registered
+  // with atexit rather than printed from a destructor because this context is a
+  // never-destroyed process singleton, and because a run that is KILLED by a
+  // timeout -- which is exactly how the VK-E runs ended -- still unwinds atexit
+  // handlers on SIGTERM only if the handler is installed. A run that never
+  // reaches a clean exit still leaves the counters readable via the accessors.
+  if (const char* v = std::getenv("VT_VULKAN_DISPATCH_STATS");
+      v != nullptr && std::strcmp(v, "0") != 0) {
+    std::atexit([] {
+      if (!Available()) return;
+      const VulkanContext& ctx = Get();
+      std::fprintf(stderr, "[vt vulkan] TOTAL DISPATCHES: %llu\n",
+                   static_cast<unsigned long long>(ctx.dispatch_count()));
+      std::map<std::string, uint64_t> counts;
+      for (const auto& kv : ctx.DispatchHistogram()) counts[kv.first] = kv.second;
+      const auto times = ctx.DispatchTimeMs();
+      double total_ms = 0.0;
+      for (const auto& kv : times) total_ms += kv.second;
+      // Sorted by TIME, not count. The ordering is the point: reading a
+      // count-sorted list is how a cheap shader that runs often gets mistaken
+      // for the bottleneck.
+      // PER-SHADER TIME IS UNAVAILABLE UNDER BATCHING, and printing 0.0 for
+      // every row would read as "these kernels are free" rather than "this was
+      // not measured". The wait that attributed time to a shader was the
+      // per-dispatch fence; batching submits many dispatches under ONE fence, so
+      // there is nothing to attribute. Counts stay exact either way.
+      //
+      // Getting per-kernel time back under batching needs GPU timestamp queries
+      // (vkCmdWriteTimestamp around each dispatch), which is the proper Vulkan
+      // answer and is not built. Until then, profile with VT_VULKAN_BATCH=0:
+      // relative KERNEL cost is still meaningful there, it just also carries the
+      // per-dispatch floor that batching removes.
+      if (!ctx.batching_enabled() || total_ms > 0.0) {
+        std::fprintf(stderr, "[vt vulkan] %-24s %8s %10s %7s %10s\n", "shader",
+                     "count", "total ms", "%", "ms/call");
+      } else {
+        // Reached only when batching is on AND the device could not timestamp
+        // (timestampComputeAndGraphics false, or the pool failed to create).
+        std::fprintf(stderr,
+                     "[vt vulkan] per-shader TIME unavailable: batching is on and this "
+                     "device reports no compute timestamps.\n"
+                     "[vt vulkan] Re-run with VT_VULKAN_BATCH=0 for per-kernel ms. "
+                     "Counts below are exact.\n");
+        std::fprintf(stderr, "[vt vulkan] %-24s %8s\n", "shader", "count");
+        for (const auto& kv : counts) {
+          std::fprintf(stderr, "[vt vulkan] %-24s %8llu\n", kv.first.c_str(),
+                       static_cast<unsigned long long>(kv.second));
+        }
+        std::fprintf(stderr, "[vt vulkan] %-24s %8llu\n", "TOTAL",
+                     static_cast<unsigned long long>(ctx.dispatch_count()));
+        return;
+      }
+      for (const auto& kv : times) {
+        const uint64_t n = counts[kv.first];
+        std::fprintf(stderr, "[vt vulkan] %-24s %8llu %10.1f %6.1f%% %10.4f\n",
+                     kv.first.c_str(), static_cast<unsigned long long>(n), kv.second,
+                     total_ms > 0 ? 100.0 * kv.second / total_ms : 0.0,
+                     n > 0 ? kv.second / double(n) : 0.0);
+      }
+      std::fprintf(stderr, "[vt vulkan] %-24s %8llu %10.1f\n", "TOTAL",
+                   static_cast<unsigned long long>(ctx.dispatch_count()), total_ms);
+    });
+  }
   mutex_ = new std::mutex();
 }
 
@@ -470,10 +636,35 @@ VulkanContext& VulkanContext::Get() {
 void* VulkanContext::AllocBuffer(size_t bytes, void** out_buffer, void** out_memory) {
   const VulkanApi& vk = Api();
   auto device = Unpack<VkDevice>(device_);
-  // A zero-length VkBuffer is invalid; round up so a 0-byte request still yields
-  // a distinct freeable pointer (the CPU backend's contract, which vt::StepArena
-  // relies on). Same treatment as the Metal skeleton.
-  const VkDeviceSize len = bytes == 0 ? 1 : static_cast<VkDeviceSize>(bytes);
+  // ROUNDED UP TO A WHOLE 32-BIT WORD, and that is a CORRECTNESS requirement of
+  // this backend's storage model, not tidiness.
+  //
+  // Every operand is bound as a `uint32_t[]` view (and, for float operands, also
+  // as a `uint16_t[]` one) over the WHOLE buffer — vt_common.glsl § STORAGE
+  // MODEL. An array of `uint` over a buffer of N bytes has floor(N/4) elements,
+  // so a buffer whose length is not a multiple of 4 has a TRUNCATED 32-bit view
+  // and its last partial word is unreachable. Under robustBufferAccess that read
+  // returns zero; without it, it is undefined. Either way it is silent.
+  //
+  // MEASURED (BACKEND-VULKAN-GDN): a 3-byte i8 `has_initial_state[3]` — the GDN
+  // per-request "does this row have a prior state" flag, which the gather shader
+  // reads byte-wise through the 32-bit view precisely so it need not require
+  // VK_KHR_8bit_storage — produced a 0-element view, every flag read back as
+  // false, and the gather ZEROED rows it should have copied. The gate caught it
+  // as a memcmp mismatch against the CPU oracle.
+  //
+  // Nothing before that read a non-multiple-of-4 buffer through the 32-bit view
+  // (f32/i32/i64 lengths are multiples of 4 by construction, and 16-bit dtypes go
+  // through the 16-bit view), which is why the skeleton lived with it. The fix
+  // belongs HERE rather than in one shader: any future byte- or word-granular
+  // read of a small operand would hit the same edge.
+  //
+  // A zero-length VkBuffer is also invalid, and the rounding covers that too: a
+  // 0-byte request still yields a distinct freeable pointer, which is the CPU
+  // backend's contract and what vt::StepArena relies on. Only the BUFFER LENGTH
+  // grows; the mapped pointer and every byte the caller wrote are untouched, so
+  // Copy/Memset stay bit-exact.
+  const VkDeviceSize len = bytes == 0 ? 4 : static_cast<VkDeviceSize>((bytes + 3) & ~size_t{3});
 
   VkBufferCreateInfo bci{};
   bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -644,12 +835,14 @@ VulkanContext::Pipeline& VulkanContext::GetPipeline(const std::string& name,
   VkDescriptorSetAllocateInfo dsai{};
   dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   dsai.descriptorPool = Unpack<VkDescriptorPool>(descriptor_pool_);
-  dsai.descriptorSetCount = 1;
-  dsai.pSetLayouts = &p.set_layout;
+  dsai.descriptorSetCount = kDescriptorRing;
+  VkDescriptorSetLayout layouts[kDescriptorRing];
+  for (uint32_t i = 0; i < kDescriptorRing; ++i) layouts[i] = p.set_layout;
+  dsai.pSetLayouts = layouts;
   // Named, because the plausible cause is pool exhaustion from specialization
   // (one set per PIPELINE, and a module can have many), which is otherwise a bare
   // VkResult a long way from its reason.
-  Check(vk.vkAllocateDescriptorSets(device, &dsai, &p.set),
+  Check(vk.vkAllocateDescriptorSets(device, &dsai, p.sets),
         ("vkAllocateDescriptorSets for pipeline '" + key +
          "' (descriptor pool may be exhausted by specialized pipelines)").c_str());
 
@@ -669,9 +862,97 @@ bool VulkanContext::PipelineExistsFor(const std::string& name) const {
   return false;
 }
 
+uint64_t VulkanContext::dispatch_count() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return dispatch_total_;
+}
+
+std::vector<std::pair<std::string, double>> VulkanContext::DispatchTimeMs() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  const auto& ms = *static_cast<std::map<std::string, double>*>(dispatch_ms_);
+  std::vector<std::pair<std::string, double>> out(ms.begin(), ms.end());
+  std::sort(out.begin(), out.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  return out;
+}
+
+std::vector<std::pair<std::string, uint64_t>> VulkanContext::DispatchHistogram() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  const auto& hist = *static_cast<std::map<std::string, uint64_t>*>(dispatch_hist_);
+  std::vector<std::pair<std::string, uint64_t>> out(hist.begin(), hist.end());
+  std::sort(out.begin(), out.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+  return out;
+}
+
 size_t VulkanContext::PipelineCacheSize() const {
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
   return static_cast<std::map<std::string, Pipeline>*>(pipelines_)->size();
+}
+
+bool VulkanContext::batching_enabled() const { return kBatchDispatch; }
+
+uint32_t VulkanContext::pending_batch() const {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  return batch_count_;
+}
+
+void VulkanContext::FlushBatch() {
+  std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
+  FlushBatchLocked();
+}
+
+// Ends the open command buffer, submits it, and WAITS. The wait is what makes
+// every descriptor set in the batch free to reuse and every write visible to the
+// host, so it is not an optimisation to drop: without it the reset below would
+// race the GPU.
+void VulkanContext::FlushBatchLocked() {
+  if (!batch_open_) return;
+  const VulkanApi& vk = Api();
+  auto device = Unpack<VkDevice>(device_);
+  auto cmd = Unpack<VkCommandBuffer>(command_buffer_);
+  Check(vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+
+  VkSubmitInfo si{};
+  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  auto fence = Unpack<VkFence>(fence_);
+  Check(vk.vkResetFences(device, 1, &fence), "vkResetFences");
+  Check(vk.vkQueueSubmit(Unpack<VkQueue>(queue_), 1, &si, fence), "vkQueueSubmit");
+  if (kDispatchStats) {
+    std::fprintf(stderr, "[vt vulkan] FLUSH %u dispatches in one submit\n", batch_count_);
+    std::fflush(stderr);
+  }
+  Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+
+  // Read the timestamps back, now that the batch has certainly completed. This is
+  // what restores the per-shader TIME profile that batching removed -- and it
+  // measures GPU execution directly instead of a host-side fence wait.
+  auto* names = static_cast<std::vector<std::string>*>(batch_names_);
+  if (query_pool_ != nullptr && !names->empty()) {
+    const uint32_t n = static_cast<uint32_t>(names->size());
+    std::vector<uint64_t> ticks(n * 2, 0);
+    if (vk.vkGetQueryPoolResults(device, Unpack<VkQueryPool>(query_pool_), 0, n * 2,
+                                 ticks.size() * sizeof(uint64_t), ticks.data(),
+                                 sizeof(uint64_t),
+                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+        VK_SUCCESS) {
+      auto& acc = *static_cast<std::map<std::string, double>*>(dispatch_ms_);
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t t0 = ticks[i * 2], t1 = ticks[i * 2 + 1];
+        if (t1 > t0) acc[(*names)[i]] += double(t1 - t0) * timestamp_period_ns_ / 1.0e6;
+      }
+    }
+    names->clear();
+  }
+
+  // Every pipeline's ring is free again only AFTER the wait above.
+  for (auto& kv : *static_cast<std::map<std::string, Pipeline>*>(pipelines_)) {
+    kv.second.used_this_batch = 0;
+  }
+  batch_open_ = false;
+  batch_count_ = 0;
 }
 
 void VulkanContext::Dispatch(const std::string& name, const void* const* buffers,
@@ -692,7 +973,33 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   // one command buffer per op (src/vt/metal/metal_ops.mm § DISPATCH MODEL).
   std::lock_guard<std::mutex> guard(*static_cast<std::mutex*>(mutex_));
 
+  // Counted under the mutex the dispatch already holds -- see the header for why
+  // this is measured on OUR side rather than inferred from context switches.
+  ++dispatch_total_;
+  ++(*static_cast<std::map<std::string, uint64_t>*>(dispatch_hist_))[name];
+  // PERIODIC dump, not just atexit: `timeout` sends SIGTERM, whose default action
+  // terminates WITHOUT running atexit handlers, and every VK-E run so far ended
+  // exactly that way. A diagnostic that only reports on a clean exit would have
+  // reported nothing on precisely the runs worth diagnosing.
+  if (kDispatchStats && dispatch_total_ % 100 == 0) {
+    const auto now = std::chrono::steady_clock::now();
+    const double secs =
+        std::chrono::duration<double>(now - g_dispatch_t0).count();
+    std::fprintf(stderr, "[vt vulkan] dispatches=%llu  elapsed=%.1fs  rate=%.0f/s\n",
+                 static_cast<unsigned long long>(dispatch_total_), secs,
+                 secs > 0 ? dispatch_total_ / secs : 0.0);
+  }
+
   Pipeline& p = GetPipeline(name, buffer_count, push_size, spec_values, spec_count);
+
+  // A pipeline that has consumed its whole descriptor ring must flush before it
+  // can reuse set 0, because the GPU has not necessarily read the earlier ones
+  // yet. Flushing also resets every pipeline's counter.
+  if (kBatchDispatch && (p.used_this_batch >= kRingDepth || batch_count_ >= kMaxBatch)) {
+    FlushBatchLocked();
+  }
+
+  VkDescriptorSet set = kBatchDispatch ? p.sets[p.used_this_batch] : p.sets[0];
 
   std::vector<VkDescriptorBufferInfo> infos(buffer_count);
   std::vector<VkWriteDescriptorSet> writes(buffer_count);
@@ -701,7 +1008,7 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
     infos[i].offset = 0;  // always WHOLE; the element offset rides push constants
     infos[i].range = VK_WHOLE_SIZE;
     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[i].dstSet = p.set;
+    writes[i].dstSet = set;
     writes[i].dstBinding = i;
     writes[i].descriptorCount = 1;
     writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -710,18 +1017,65 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   vk.vkUpdateDescriptorSets(device, buffer_count, writes.data(), 0, nullptr);
 
   auto cmd = Unpack<VkCommandBuffer>(command_buffer_);
-  Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
-        "vkResetCommandPool");
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+
+  if (!kBatchDispatch) {
+    Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
+          "vkResetCommandPool");
+    Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+  } else if (!batch_open_) {
+    Check(vk.vkResetCommandPool(device, Unpack<VkCommandPool>(command_pool_), 0),
+          "vkResetCommandPool");
+    Check(vk.vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+    // The pool must be reset on the DEVICE timeline, inside the command buffer,
+    // before any query in it is written.
+    if (query_pool_ != nullptr) {
+      vk.vkCmdResetQueryPool(cmd, Unpack<VkQueryPool>(query_pool_), 0, kMaxBatch * 2);
+      static_cast<std::vector<std::string>*>(batch_names_)->clear();
+    }
+    batch_open_ = true;
+  } else {
+    // BETWEEN recorded dispatches: the ops in a decode step are sequentially
+    // dependent (norm feeds projection feeds attention), so every dispatch must
+    // see the previous one's writes. Without this the batch would run them
+    // concurrently and compute garbage. This is the cost batching pays back --
+    // a barrier is far cheaper than a fence round-trip to the host.
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0,
+                            nullptr);
+  }
+
   vk.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-  vk.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &p.set, 0,
+  vk.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0,
                              nullptr);
   vk.vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size,
                         push_constants);
+  const bool timed = kBatchDispatch && query_pool_ != nullptr && batch_count_ < kMaxBatch;
+  if (timed) {
+    // TOP_OF_PIPE before / BOTTOM_OF_PIPE after brackets this dispatch's execution
+    // on the GPU. Because a barrier separates consecutive dispatches, the interval
+    // is this kernel's own time rather than an overlap with its neighbours.
+    vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           Unpack<VkQueryPool>(query_pool_), batch_count_ * 2);
+  }
   vk.vkCmdDispatch(cmd, group_count_x, 1, 1);
+  if (timed) {
+    vk.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           Unpack<VkQueryPool>(query_pool_), batch_count_ * 2 + 1);
+    static_cast<std::vector<std::string>*>(batch_names_)->push_back(name);
+  }
+
+  if (kBatchDispatch) {
+    ++p.used_this_batch;
+    ++batch_count_;
+    return;  // submitted by FlushBatch, at the next host read or Synchronize
+  }
   Check(vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
   VkSubmitInfo si{};
@@ -736,7 +1090,33 @@ void VulkanContext::Dispatch(const std::string& name, const void* const* buffers
   // needs no invalidate, and vkQueueSubmit itself makes prior host writes
   // visible to the device (the host-write ordering guarantee), so there is no
   // flush on the way in either.
+  // PER-DISPATCH TIMING. The periodic counter showed fewer than 2000 dispatches
+  // in 150 s, which rules out "many cheap submits" and points at a few very
+  // expensive ones -- so the useful diagnostic is WHICH shader is slow, not how
+  // many ran. Anything over the threshold names itself.
+  // Printed BEFORE the wait, and flushed. The timing print below runs only if the
+  // wait RETURNS -- so if a fence never completes, the post-wait line never
+  // appears and the hang is invisible. The last line printed here names the
+  // dispatch that hung.
+  if (kDispatchStats) {
+    std::fprintf(stderr, "[vt vulkan] submit #%llu %-22s groups=%u\n",
+                 static_cast<unsigned long long>(dispatch_total_), name.c_str(),
+                 group_count_x);
+    std::fflush(stderr);
+  }
+  const auto wait_t0 = std::chrono::steady_clock::now();
   Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  if (kDispatchStats) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - wait_t0).count();
+    // Attributed to the shader that just ran. Accumulated OUTSIDE the dispatch
+    // mutex would race; this whole function already holds it.
+    (*static_cast<std::map<std::string, double>*>(dispatch_ms_))[name] += ms;
+    if (ms > 200.0) {
+      std::fprintf(stderr, "[vt vulkan] SLOW dispatch %-22s %8.1f ms  groups=%u\n",
+                   name.c_str(), ms, group_count_x);
+    }
+  }
 }
 
 }  // namespace vt::vulkan

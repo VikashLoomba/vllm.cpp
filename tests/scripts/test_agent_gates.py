@@ -163,6 +163,26 @@ class IntegrationContractTests(unittest.TestCase):
         ):
             self.assertEqual(integration.main(), 1)
 
+    def test_trailer_range_starts_at_integration_base_not_cutover(self) -> None:
+        completed = subprocess.CompletedProcess([], 0)
+        with (
+            mock.patch.object(integration, "run_ready", return_value=True),
+            mock.patch.object(integration.ready, "local_expected", return_value=EXPECTED),
+            mock.patch.object(integration.ready, "load_payload", return_value=payload()),
+            mock.patch.object(integration, "base_freshness_errors", return_value=[]),
+            mock.patch.object(integration, "cutover_oid", return_value="d" * 40),
+            mock.patch.object(integration.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(
+                sys,
+                "argv",
+                ["agent-integration.py", "--base", "origin/main", "--pr-json", "pr.json"],
+            ),
+        ):
+            self.assertEqual(integration.main(), 0)
+        command = run.call_args.args[0]
+        self.assertIn("origin/main..HEAD", command)
+        self.assertNotIn(("d" * 40) + "..HEAD", command)
+
     def test_cutover_and_base_must_be_reachable_and_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

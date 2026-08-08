@@ -19,6 +19,8 @@ Each controlled paragraph names exactly the rule it implements.
 
 [POL-BOOT-TASK] After NOW, read only the claimed spec, owning matrix/roadmap row, coordination entry, linked evidence, and the procedures selected by applicable policy rows.
 
+[POL-INTAKE-REVALIDATE] Before claiming or implementing, search current code and tests plus open issues, pull requests, NOW, coordination, and owning rows. Record exact anchors in the spike. If the gap already landed, is claimed, or no longer matches its record, stop implementation and reconcile the task first.
+
 [POL-CONFIG-SHARED] Resolve `.env` and `.agents/developer-preferences.md` through the shared checkout configuration described by their tracked examples; do not manufacture per-worktree alternatives.
 
 [POL-CONFIG-JIT] Request only a missing environment or permission value needed by the current gate. An empty value remains unavailable and its dependent gate remains `PENDING`.
@@ -74,6 +76,8 @@ Each controlled paragraph names exactly the rule it implements.
 [POL-PATH-CLASSIFICATION] Classify policy, checker, documentation, script, test, CI, generated, binary, and product paths explicitly when computing scope. Never hide mutable files behind a blanket directory exclusion.
 
 [POL-PR-SIZE] Keep every explicit path class within its reviewed budget. Split unrelated work or cite one valid exact waiver before marking a PR ready.
+
+[POL-ONE-SURFACE] A capability reaches `DONE` only when `include/vllm.h` exposes it through the stable C ABI, implementation state flows through the shared library entry point, and CLI/server examples are thin clients of that same surface. Run `scripts/check-surface-coverage.py` and its mutation suite; a feature reachable only through example internals remains open.
 <!-- policy-procedure:end -->
 
 Implementation starts from the committed spike. Write or port the smallest

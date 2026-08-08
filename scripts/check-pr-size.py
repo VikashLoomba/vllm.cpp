@@ -15,9 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 try:
-    from scripts.policy_contract import PolicyRule, load_policy
+    from scripts.policy_contract import PolicyRule, Waiver, load_policy, load_waivers
 except ModuleNotFoundError:
-    from policy_contract import PolicyRule, load_policy
+    from policy_contract import PolicyRule, Waiver, load_policy, load_waivers
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -161,7 +161,15 @@ CREATED_CHECKER_RULES = {
         "POL-AI-ATTRIBUTION",
         "POL-WAIVER-EXACT",
     ),
+    "scripts/check-pr-size.py": (
+        "POL-PATH-CLASSIFICATION",
+        "POL-PR-SIZE",
+    ),
 }
+DISABLED_CREATION_CHECKER = (
+    b"#!/usr/bin/env python3\n"
+    b'\"\"\"Deliberately disabled creation-contract mutation.\"\"\"\n'
+)
 CREATION_MUTATIONS = {
     "scripts/check-commit-trailers.py": (
         b"#!/usr/bin/env python3\n"
@@ -172,6 +180,9 @@ CREATION_MUTATIONS = {
         b"def exact_waiver(*args, **kwargs): return None\n"
         b"def validate_waiver_targets(*args, **kwargs): return None\n"
     ),
+    "scripts/check-policy.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
 }
 EVIDENCE_TIMEOUT_SECONDS = 120
 TEST_COUNT = re.compile(r"Ran ([0-9]+) tests? in ")
@@ -299,6 +310,8 @@ def change_errors(
     changes: list[ChangedPath],
     *,
     evidence_results: dict[str, EvidenceResult] | None = None,
+    waivers: tuple[Waiver, ...] = (),
+    waiver_scope: str = "",
 ) -> list[str]:
     errors: list[str] = []
     totals = {path_class: 0 for path_class in PATH_CLASSES}
@@ -345,6 +358,17 @@ def change_errors(
     for path_class in sorted(PATH_CLASSES):
         budget = PATH_CLASS_BUDGETS[path_class]
         if totals[path_class] > budget:
+            applicable = [
+                waiver
+                for waiver in waivers
+                if waiver.rule_id == "POL-PR-SIZE" and waiver.scope == waiver_scope
+            ]
+            if len(applicable) > 1:
+                raise ValueError(
+                    f"duplicate applicable waivers for POL-PR-SIZE {waiver_scope}"
+                )
+            if applicable:
+                continue
             errors.append(
                 f"{path_class} changes total {totals[path_class]} lines, over the {budget}-line budget"
             )
@@ -564,15 +588,28 @@ def main() -> int:
     parser.add_argument("--base", required=True)
     parser.add_argument("--head", required=True)
     parser.add_argument("--branch", default="", help="accepted for CI compatibility")
+    parser.add_argument("--pr-number", default="")
     args = parser.parse_args()
     del args.branch
     try:
+        if args.pr_number and (
+            not args.pr_number.isascii()
+            or not args.pr_number.isdecimal()
+            or int(args.pr_number) <= 0
+        ):
+            raise ValueError("--pr-number must be a positive decimal integer")
         base_oid = resolve_commit(ROOT, args.base)
         head_oid = resolve_commit(ROOT, args.head)
         changes = changed_paths(base_oid, head_oid)
         rules = load_policy(ROOT)
+        waivers = tuple(load_waivers(ROOT, rules))
         evidence = executable_evidence(ROOT, base_oid, head_oid, changes, rules)
-        errors = change_errors(changes, evidence_results=evidence)
+        errors = change_errors(
+            changes,
+            evidence_results=evidence,
+            waivers=waivers,
+            waiver_scope=f"pr:{args.pr_number}" if args.pr_number else "",
+        )
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"ERROR: PR size check could not classify the change: {exc}", file=sys.stderr)
         return 1

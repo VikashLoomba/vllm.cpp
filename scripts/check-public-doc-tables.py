@@ -344,7 +344,52 @@ STATUS_RATCHET = {
     # in an abridged form; the fuller originals already live in
     # .agents/benchmark-record.md, so the duplicates collapsed to their binding
     # result plus a pointer. Nothing was lost, only de-duplicated. Net -1755.
-    "chars": 281700,
+    #
+    # 279200 since 2026-08-07 (measured 279167): the transpose-free [K,N] row
+    # owes this page a status line, paid for the same way and out of the same
+    # duplication. Bricks 1b and 2 folded into the same one-line binding result
+    # as Bricks 0 and 1; the fuller originals stay in
+    # .agents/benchmark-record.md. Net -2501.
+    #
+    # 283446 since 2026-08-07 (measured 283446): the Vulkan row swapped a
+    # SUPERSEDED number for two shipped ones. "71 on CPU tier" was a
+    # registry-coverage count being read as a hot-path one - a profile showed
+    # exactly ONE reference-tier op fires per run (kRopeCosSinCache, at setup) -
+    # so it went out and "argmax 18.9x" came in. The per-shader time profile that
+    # replaces it, and the 55%-of-GPU-time GEMM finding it points at, are detail
+    # and live in .agents/benchmark-record.md rather than on this page. Net -9.
+
+    #
+    #
+    # 283442 since 2026-08-07 (measured 283442): the Vulkan row now carries the GEMV
+    # tactic (1.8x) and drops the coopmat microbenchmark, which is a COMPONENT
+    # number and lives in .agents/benchmark-record.md. The llama.cpp gap stayed
+    # on the page deliberately - it was the first thing that fit when trimming,
+    # and dropping the unflattering number to satisfy a size limit is how a
+    # status page starts reading better than the code. Net -4.
+
+    #
+
+    #
+    # 283442 since 2026-08-07 (measured 283442): the Vulkan row records the VOID
+    # subgroup-reduction outcome, paid for by dropping the native-kernel COUNT,
+    # which is derivable from the linked campaign doc while a void result is not
+    # derivable from anywhere. Net -0.
+    #
+    # 279150 since 2026-08-08 (measured 279111 after the #122 rebase): the ONE-SURFACE ROW 8 device
+    # knob owes this page a status line, paid for by removing a STALE MERGE
+    # DUPLICATE in the metrics paragraph (the same "matching vLLM's own
+    # mapping ... behavioural CPU gate ... remaining work" narrative appeared
+    # twice back to back; the longer, newer version stays). Nothing was lost,
+    # only de-duplicated. Net -92.
+    #
+    # 279130 since 2026-08-08 (measured 279120 after the #145/#151 rebases): the ROCm
+    # entry in "Not supported yet" swapped "HIP never compiled" (falsified by
+    # the four #41 community build reports) for the current binding state — W0
+    # community-green, approach-(b) F6 fix in blind-unverified, M2 on
+    # verification — paid for inside the same parenthetical; the board/arch
+    # detail lives in docs/ROCM.md and .agents/backend-matrix.md. Net -12.
+    "chars": 279130,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

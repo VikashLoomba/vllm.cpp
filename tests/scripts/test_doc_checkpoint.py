@@ -257,6 +257,30 @@ class SemanticClassificationTests(unittest.TestCase):
             doc_checkpoint.classify_changed_paths(sorted(with_product)),
         )
 
+    def test_exact_pr_size_bootstrap_is_governance_only(self) -> None:
+        paths = set(doc_checkpoint.PR_SIZE_BOOTSTRAP_FILES)
+        self.assertEqual(doc_checkpoint.classify_changed_paths(sorted(paths)), {"governance"})
+        self.assertEqual(doc_checkpoint.checkpoint_errors(paths), [])
+
+    def test_pr_size_bootstrap_exemption_is_exact(self) -> None:
+        paths = set(doc_checkpoint.PR_SIZE_BOOTSTRAP_FILES)
+        for removed in sorted(paths):
+            with self.subTest(removed=removed):
+                self.assertIn(
+                    "feature_checkpoint",
+                    doc_checkpoint.classify_changed_paths(sorted(paths - {removed})),
+                )
+        with_product = paths | {"src/vt/backend.cpp"}
+        self.assertIn(
+            "feature_checkpoint",
+            doc_checkpoint.classify_changed_paths(sorted(with_product)),
+        )
+        with_governance = paths | {"scripts/check-protocol-consistency.py"}
+        self.assertIn(
+            "feature_checkpoint",
+            doc_checkpoint.classify_changed_paths(sorted(with_governance)),
+        )
+
     def test_governance_design_is_not_misclassified_as_feature_work(self) -> None:
         path = "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md"
         self.assertEqual(doc_checkpoint.classify_changed_paths([path]), {"governance"})

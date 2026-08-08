@@ -91,6 +91,12 @@ namespace vt::vulkan {
   X(vkCmdBindDescriptorSets)           \
   X(vkCmdPushConstants)                \
   X(vkCmdDispatch)                     \
+  X(vkCmdPipelineBarrier)              \
+  X(vkCreateQueryPool)                 \
+  X(vkDestroyQueryPool)                \
+  X(vkCmdResetQueryPool)               \
+  X(vkCmdWriteTimestamp)               \
+  X(vkGetQueryPoolResults)             \
   X(vkQueueSubmit)                     \
   X(vkQueueWaitIdle)                   \
   X(vkCreateFence)                     \

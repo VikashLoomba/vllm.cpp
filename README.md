@@ -285,10 +285,8 @@ and Voxtral (audio).
 **Video + audio GENERATION is supported**, not just video *input*. MiniMax-H3 renders end to
 end: prompt -> Qwen3-VL-32B encoder -> DiT denoise -> ViT3D video VAE + DAC/BigVGAN audio VAE
 -> MP4 with a stereo track. The project's first DIFFUSION architecture (no KV cache, no
-sampler, no logits); upstream is `vllm-project/vllm-omni`, beyond the parity pin. Five
-conditioning modes, each gated on the conditioning CHANGING the output rather than merely
-being accepted, and `POST /v1/videos`. Use **Q4_K_M**: 3 bits cannot hold the channel-wise
-outliers H3's split-half RoPE produces. Detail: [docs/STATUS.md](docs/STATUS.md).
+sampler, no logits); upstream is `vllm-project/vllm-omni`. Five conditioning modes and
+`POST /v1/videos`. Use **Q4_K_M**. Detail: [docs/STATUS.md](docs/STATUS.md).
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
@@ -357,8 +355,9 @@ build/examples/minimax-h3-gen --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 
   --frames 124 --height 480 --width 864 --steps 50 --device cuda --out out.mp4
 ```
 
-Conditioning flags, the PPM convention that chains clips, and serving:
-[docs/USAGE.md](docs/USAGE.md).
+Weights: [realrebelai/MiniMax-H3_GGUFs](https://huggingface.co/realrebelai/MiniMax-H3_GGUFs)
+(DiT + encoder) and [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) (VAEs,
+tokenizer). For SPEECH put the spoken line in the prompt. Recipe: [docs/USAGE.md](docs/USAGE.md).
 
 ## OpenAI-compatible server
 
@@ -431,21 +430,22 @@ the number stays in the README and the label says *speed-pending*.
 
 | Doc | What is in it |
 |---|---|
-| [docs/USAGE.md](docs/USAGE.md) | CLI, OpenAI server (endpoints + flags), C ABI, C++ API |
-| [docs/BUILD.md](docs/BUILD.md) | Build recipes per backend, every CMake option, hardware and quantization state |
-| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | The measured evidence: per-axis grids, memory, reproduction recipes |
-| [docs/FEATURES.md](docs/FEATURES.md) | Feature-by-feature comparison against vLLM, SGLang and llama.cpp |
-| [docs/STATUS.md](docs/STATUS.md) | Per-capability lifecycle ledger, active gaps, next gate |
-| [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | The SGLang-inspired knobs, and when to turn them on |
+| [Contribute](CONTRIBUTING.md) | Agent contribution guide |
+| [docs/USAGE.md](docs/USAGE.md) | CLI, server endpoints/flags, C ABI and C++ API |
+| [docs/BUILD.md](docs/BUILD.md) | Backend recipes, CMake options, hardware and quantization |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured grids, memory and repro recipes |
+| [docs/FEATURES.md](docs/FEATURES.md) | Feature comparison: vLLM, SGLang and llama.cpp |
+| [docs/STATUS.md](docs/STATUS.md) | Capability lifecycle, gaps and next gate |
+| [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | SGLang knobs and when to use them |
 | [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) | MTP, DFlash, ngram |
-| [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) | KV offload to CPU/disk, LMCache client, KV events |
+| [docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md) | CPU/disk KV offload, LMCache and events |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Runtime environment variables |
 
-The canonical project record lives under [`.agents/`](.agents/), indexed by [AGENTS.md](AGENTS.md):
-the append-only [`.agents/state.md`](.agents/state.md), the
-[parity ledger](.agents/parity-ledger.md), and the [model matrix](.agents/model-matrix.md). The
-portfolio-completion plan is
-[`.agents/specs/roadmap-v1-completion.md`](.agents/specs/roadmap-v1-completion.md).
+The canonical project record is indexed by [AGENTS.md](AGENTS.md) and lives
+under [`.agents/`](.agents/). See [current state](.agents/state.md),
+[parity evidence](.agents/parity-ledger.md), the
+[model inventory](.agents/model-matrix.md), and the
+[portfolio roadmap](.agents/specs/roadmap-v1-completion.md).
 
 ## Credits, and what we borrow
 

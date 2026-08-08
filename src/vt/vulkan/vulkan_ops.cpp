@@ -12,11 +12,18 @@
 // It matches the Metal skeleton's set exactly, so the two backends are directly
 // comparable through tests/vt/test_backend_cross_device.cpp.
 //
-// WHAT IS STILL STUBBED: everything else. `kMatmul`/`kMatmulBT`,
-// `kPagedAttention`, `kReshapeAndCache`, the whole quant tier and the sampler
-// ops are NOT registered, so `vt::GetOp` throws its normal "no kernel for op N
-// on device type 3" for them (src/vt/ops.cpp:104-111 — a partial backend is a
-// supported, tested state). NO MODEL RUNS ON THIS BACKEND.
+// SINCE THEN this TU has grown the dense path (both GEMM orientations plus the
+// decode GEMV and coopmat tactics), the attention block (paged attention, the KV
+// write, the QKV split, the rotary apply), the two ends of the model (embedding
+// and greedy argmax), and — this row, BACKEND-VULKAN-GDN — six of the GDN /
+// conv1d glue ops that Qwen3.6-27B needs.
+//
+// WHAT IS STILL NOT REGISTERED: the quant tier, MoE, the sampler beyond greedy
+// argmax, the GDN recurrences themselves, and the ops listed in the
+// BACKEND-VULKAN-GDN block comment further down. None of them THROW any more:
+// since the portable reference tier landed, a missed GetOp on this
+// unified-memory device installs the CPU kernel as a priority -1000 provider, so
+// an unregistered op is CORRECT AND SLOW rather than fatal.
 //
 // BINDING MODEL: every tensor operand occupies TWO consecutive descriptor
 // bindings onto the SAME VkBuffer — a uint32_t view and a uint16_t view — and
@@ -79,6 +86,20 @@ class Binder {
     buffers_.push_back(r.buffer);
     VT_CHECK(r.offset % 4 == 0,
              std::string("vulkan: ") + what + " has a byte offset that is not 4-byte aligned");
+    return r.offset;
+  }
+
+  // A tensor bound through the uint32_t view ONLY, for BYTE-granular reads: an
+  // i8 operand (GDN's has_initial_state) may legitimately start at any byte, so
+  // AddU32Only's 4-byte assertion would reject a valid tensor. The shader
+  // recovers the byte with a shift, which is exact because every buffer is bound
+  // WHOLE at offset 0 and the returned offset is therefore a plain byte address
+  // into it (vt_common.glsl § STORAGE MODEL). Deliberately NOT VK_KHR_8bit_storage:
+  // this backend does not probe for it, and requiring it would narrow the set of
+  // devices the backend registers on for the sake of one boolean array.
+  uint32_t AddByteView(const Tensor& t, const char* what) {
+    Resolved r = Resolve(t.data, what);
+    buffers_.push_back(r.buffer);
     return r.offset;
   }
 
@@ -154,6 +175,47 @@ struct FcParams {
   uint32_t t, h, nsteps, x_dt, w_dt, res_dt, out_dt, x_off, w_off, res_off, out_off;
   float eps;
 };
+// --- The GDN / conv1d family (BACKEND-VULKAN-GDN). Same rule as above: field
+// order and types must match the GLSL push-constant blocks EXACTLY.
+struct SigmoidGateParams {
+  uint32_t n, a_off, g_off, o_off;
+};
+struct RmsNormGatedParams {
+  uint32_t rows, d, x_dt, z_dt, w_dt, out_dt, sigmoid_gate, gate_group, gate_outer;
+  uint32_t x_off, z_off, w_off, out_off;
+  float eps;
+};
+struct GdnStateGatherParams {
+  uint32_t rows, work_row, work_inner, cache_inner, cache_row, n_cache_rows;
+  uint32_t work_dt, cache_dt, his_mode;
+  uint32_t work_off, cache_off, idx_off, his_off;
+};
+struct GdnStateScatterParams {
+  uint32_t rows, work_row, work_inner, cache_inner, cache_row, n_cache_rows;
+  uint32_t work_dt, cache_dt;
+  uint32_t cache_off, work_off, idx_off;
+};
+struct ConvUpdateParams {
+  uint32_t batch, c_dim, k, width, state_len, x_rs, n_state_rows;
+  uint32_t has_bias, has_idx, silu;
+  uint32_t out_dt, x_dt, w_dt, bias_dt;
+  uint32_t out_off, x_off, w_off, bias_off, st_off, idx_off;
+};
+struct GdnPostConvParams {
+  uint32_t t, hk, dk, hv, dv, key_dim, value_dim, conv_dim, a_rs, b_rs;
+  uint32_t conv_off, q_off, k_off, v_off, a_off, b_off;
+  uint32_t g_off, beta_off, alog_off, dtb_off;
+  float eps;
+};
+// ONE block for BOTH recurrences: vt_gdn_prefill and vt_gdn_decode share their
+// step body through an include, so they must also share their push layout. The
+// prefill shader ignores has_idx / n_state_rows (they are the decode state-row
+// indirection) rather than each op carrying a block that drifts from the other.
+struct GdnRecurrenceParams {
+  uint32_t hk, dk, hv, dv, nv, ratio, has_idx, n_state_rows;
+  uint32_t q_off, k_off, v_off, out_off, g_off, beta_off, state_off, meta_off;
+  float scale;
+};
 
 // Vulkan only GUARANTEES 128 bytes of push-constant space (maxPushConstantsSize);
 // staying inside it is what keeps this backend portable without a probe.
@@ -161,6 +223,19 @@ static_assert(sizeof(RmsParams) <= 128, "push constants must fit the guaranteed 
 static_assert(sizeof(LayerNormParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(FcParams) <= 128, "push constants must fit the guaranteed 128 bytes");
 static_assert(sizeof(PagedAttnParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(ConvUpdateParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
+// The widest block in the backend at 84 bytes: the fused post-conv carries ten
+// operand offsets. If it ever needs an eleventh, the step list has to move to the
+// scratch buffer the way vt_fused_chain's does.
+static_assert(sizeof(GdnPostConvParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(RmsNormGatedParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(GdnStateGatherParams) <= 128,
+              "push constants must fit the guaranteed 128 bytes");
+static_assert(sizeof(GdnRecurrenceParams) <= 128,
               "push constants must fit the guaranteed 128 bytes");
 
 template <typename P>
@@ -389,7 +464,7 @@ void FusedChainKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight
 // MEASURED: GB10 satisfies all four; llvmpipe -- the only Vulkan device CI can
 // reach -- fails the first, so CI exercises the scalar tactic and this selection
 // returning false is the property CI can actually gate.
-bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k) {
+bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k, int64_t m, int64_t n) {
   // VT_VULKAN_COOPMAT=0 forces the scalar tactic. This exists for ONE reason: a
   // same-binary A/B. Comparing the two tactics across two builds would confound
   // the kernel with everything else that differs between them, and the project's
@@ -404,7 +479,60 @@ bool CoopMatMatmulUsable(const Tensor& a, const Tensor& b, int64_t k) {
 
   const VulkanContext& ctx = VulkanContext::Get();
   return ctx.coopmat_bf16_f32() && ctx.subgroup_size() == 32 &&
-         a.dtype == DType::kBF16 && b.dtype == DType::kBF16 && k % 16 == 0;
+         a.dtype == DType::kBF16 && b.dtype == DType::kBF16 && k % 16 == 0 &&
+         // M AND N MUST ALSO BE WHOLE TILES. `coopMatLoad` reads a FULL 16x16
+         // tile with no masking, so a partial tile reads past the end of the
+         // operand -- and the store being bounds-checked does not save it,
+         // because the fault happens on the LOAD. MEASURED: lm_head at M=1
+         // (single decode token) read 15 rows (~30 KB) past a small activation
+         // buffer, faulted the GPU, and the fence NEVER SIGNALLED -- an infinite
+         // vkWaitForFences, which presents as a hang, not as an error.
+         //
+         // The original correctness gate used M=20, N=12 precisely to exercise
+         // ragged shapes and PASSED, because there the out-of-bounds read stayed
+         // inside the allocation and its garbage rows were discarded by the
+         // bounds-checked store. Raggedness alone was not enough; the read has to
+         // leave the allocation to fault.
+         m % 16 == 0 && n % 16 == 0;
+}
+
+// GEMV TACTIC SELECTION (VK-F). Same shape of contract as the coopmat predicate
+// above -- every requirement is a hard one, and failing any of them runs the
+// always-correct scalar kernel instead.
+//
+// The problem this solves is COALESCING, measured: vt_matmul was ~55% of all GPU
+// time in an e2e decode run. It puts one invocation on each output element and
+// loops K there, so for MatmulBT lane j reads b[j*k + q] and adjacent lanes land
+// k*2 bytes apart -- each pulling its own cache line to use 2 bytes of it. The
+// GEMV shader instead gives each output element a workgroup whose lanes stride K,
+// so adjacent lanes read adjacent addresses.
+//
+//   * MatmulBT ONLY. In the other orientation vt_matmul reads b[q*n + j], which
+//     is ALREADY coalesced across lanes; the GEMV shape would make that strided
+//     and strictly worse. This is not a universally better kernel and the
+//     predicate does not pretend otherwise.
+//   * m == 1, the decode shape. One workgroup per output element is the right
+//     trade only when there are few of them: at prefill m*n workgroups would each
+//     do k/128 multiplies, and prefill is the coopmat tactic's job anyway.
+//   * k >= the workgroup width, so the strided loop actually has work for every
+//     lane. Below that most lanes contribute a zero partial and the reduction
+//     costs more than the loop saves.
+//
+// ACCUMULATION ORDER: the K reduction becomes a tree, so this tactic does NOT
+// share the CPU's accumulation order -- it sits in the NMSE tier alongside
+// coopmat. That is why it is gated on a token-exactness run and not on an NMSE
+// bound alone.
+bool GemvMatmulUsable(bool bt, int64_t k, int64_t m) {
+  // VT_VULKAN_GEMV=0 forces the scalar tactic, for the same single reason the
+  // coopmat lever exists: a same-binary A/B, so the arms differ in exactly one
+  // thing. Default ON.
+  static const bool kDisabled = [] {
+    const char* v = std::getenv("VT_VULKAN_GEMV");
+    return v != nullptr && std::strcmp(v, "0") == 0;
+  }();
+  if (kDisabled) return false;
+  if (!bt || m != 1) return false;
+  return k >= static_cast<int64_t>(kWorkgroupSize);
 }
 
 template <bool kBT>
@@ -417,7 +545,7 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   const uint32_t b_off = bind.Add(b, "matmul: b");
   const uint32_t out_off = bind.Add(out, "matmul: out");
 
-  if (CoopMatMatmulUsable(a, b, k)) {
+  if (CoopMatMatmulUsable(a, b, k, m, n)) {
     // One workgroup (= one subgroup) per 16x16 OUTPUT TILE. Deliberately not
     // FlatGroupCount, which divides an element count by the workgroup size: here
     // the whole subgroup cooperates on one tile.
@@ -427,6 +555,24 @@ void MatmulGeneric(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
     MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n),
                    static_cast<uint32_t>(k), a_off, b_off, out_off};
     Go("vt_matmul_coopmat", bind, p, tiles, spec, 2);
+    return;
+  }
+
+  if (GemvMatmulUsable(kBT, k, m)) {
+    // ONE WORKGROUP PER OUTPUT ELEMENT -- not FlatGroupCount, which would divide
+    // the element count by the workgroup size and put the whole K reduction back
+    // on a single lane. The workgroup cooperates on one element.
+    const uint32_t groups = static_cast<uint32_t>(m * n);
+    // VT_VULKAN_GEMV_UNROLL=1 forces the un-unrolled body, for the same-binary A/B.
+    static const uint32_t kUnroll = [] {
+      const char* v = std::getenv("VT_VULKAN_GEMV_UNROLL");
+      return (v != nullptr && std::strcmp(v, "1") == 0) ? 1u : 4u;
+    }();
+    const uint32_t spec[4] = {DtypeCode(a.dtype), DtypeCode(b.dtype),
+                              DtypeCode(out.dtype), kUnroll};
+    MatmulParams p{static_cast<uint32_t>(m), static_cast<uint32_t>(n),
+                   static_cast<uint32_t>(k), a_off, b_off, out_off};
+    Go("vt_matmul_vec", bind, p, groups, spec, 4);
     return;
   }
 
@@ -473,7 +619,12 @@ void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
   const uint32_t logits_off = bind.AddU32Only(logits, "argmax: logits");
   const uint32_t out_off = bind.AddU32Only(token_ids, "argmax: token_ids");
   ArgmaxParams p{static_cast<uint32_t>(n), static_cast<uint32_t>(v), logits_off, out_off};
-  Go("vt_greedy_argmax", bind, p, FlatGroupCount(n));
+  // ONE WORKGROUP PER ROW, matching vt_rms_norm's convention -- the shader
+  // tree-reduces the vocabulary across the workgroup's lanes. NOT
+  // FlatGroupCount(n), which would allot one INVOCATION per row and leave the
+  // vocabulary scan serial; at decode n is 1, so that dispatched a single lane
+  // and measured 10.03 ms per call.
+  Go("vt_greedy_argmax", bind, p, static_cast<uint32_t>(n));
 }
 
 // cpu_paged_attn.cpp:52-171 PagedAttentionKernel. ONE WORKGROUP per (query
@@ -692,6 +843,386 @@ void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
   Go("vt_qkv_split", bind, p, FlatGroupCount(t * (q_dim + k_dim + v_dim)), spec, 2);
 }
 
+// ===========================================================================
+// The GDN / conv1d family (BACKEND-VULKAN-GDN). Qwen3.6-27B is a GDN hybrid, so
+// before this row every one of these ops fell to the PORTABLE CPU REFERENCE TIER
+// on Vulkan — correct, and running on the host against shared memory.
+//
+// The two RECURRENCES themselves (kGdnPrefill / kGdnDecode) landed in the
+// follow-up row BACKEND-VULKAN-GDN-CORE and are at the bottom of this section.
+//
+// WHAT IS DELIBERATELY NOT HERE, so a later row does not have to re-derive it:
+//   * kRopeCosSinCache — the rotary TABLE BUILD, which constructs its angles in
+//     `double` (cpu_ops.cpp RopeCosSinCacheKernel). GLSL has no f64 here and
+//     emulating it would be a numerics divergence in the one place vLLM itself
+//     keeps the work off the device (its RotaryEmbedding builds the cache once in
+//     __init__). Leaving it on the host MIRRORS upstream; "implementing" it would
+//     be a regression, and the assertion in tests/vt/test_vulkan_backend.cpp says
+//     so out loud.
+//   * kCausalConv1dFwd — the PREFILL conv. It is the same arithmetic as the
+//     update below but its state write-back reads the OLD state row while other
+//     tokens of the same sequence are still reading it, so it needs either a
+//     per-(sequence, channel) serial invocation over the whole token range or a
+//     buffered old row; that is a different dispatch shape, not a wider push
+//     block, and it is left for a follow-up rather than guessed at here.
+// ===========================================================================
+
+// cpu_ops.cpp:2272-2279 SigmoidGateBf16Kernel. Flat, one invocation per element.
+void SigmoidGateBf16Kernel(Queue&, Tensor& out, const Tensor& attn, const Tensor& gate) {
+  const int64_t n = out.Numel();
+  if (n == 0) return;
+  Binder bind;
+  const uint32_t a_off = bind.Add(attn, "sigmoid_gate_bf16: attn");
+  const uint32_t g_off = bind.Add(gate, "sigmoid_gate_bf16: gate");
+  const uint32_t o_off = bind.Add(out, "sigmoid_gate_bf16: out");
+  // Only the attention operand varies; `gate` is f32 and `out` is bf16 by the op
+  // contract (src/vt/ops.cpp:3327-3334) and are compile-time constants in the
+  // shader, so a violation fails the host VT_CHECK rather than silently working.
+  const uint32_t spec[1] = {DtypeCode(attn.dtype)};
+  SigmoidGateParams p{static_cast<uint32_t>(n), a_off, g_off, o_off};
+  Go("vt_sigmoid_gate_bf16", bind, p, FlatGroupCount(n), spec, 1);
+}
+
+// cpu_ops.cpp:1210-1235 RmsNormGatedKernel. ONE WORKGROUP PER ROW (the workgroup
+// tree-reduces the mean square), not FlatGroupCount — same convention as
+// vt_rms_norm.
+void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate,
+                        const Tensor& w, const RmsNormGatedArgs& args) {
+  const int64_t d = x.shape[x.rank - 1];
+  const int64_t rows = d == 0 ? 0 : x.Numel() / d;
+  if (rows == 0 || d == 0) return;
+  // The rank-3 gate is a padded-row [T,Hv,D] view of the merged qkvz z slice;
+  // rank-2 degenerates to group 1 with outer stride d (cpu_ops.cpp:1218-1219).
+  const int64_t gate_group = gate.rank == 3 ? gate.shape[1] : 1;
+  const int64_t gate_outer = gate.stride[0];
+  Binder bind;
+  const uint32_t x_off = bind.Add(x, "rmsnorm_gated: x");
+  const uint32_t z_off = bind.Add(gate, "rmsnorm_gated: gate");
+  const uint32_t w_off = bind.Add(w, "rmsnorm_gated: weight");
+  const uint32_t out_off = bind.Add(out, "rmsnorm_gated: out");
+  RmsNormGatedParams p{static_cast<uint32_t>(rows),
+                       static_cast<uint32_t>(d),
+                       DtypeCode(x.dtype),
+                       DtypeCode(gate.dtype),
+                       DtypeCode(w.dtype),
+                       DtypeCode(out.dtype),
+                       args.sigmoid_gate ? 1u : 0u,
+                       static_cast<uint32_t>(gate_group),
+                       static_cast<uint32_t>(gate_outer),
+                       x_off,
+                       z_off,
+                       w_off,
+                       out_off,
+                       args.eps};
+  Go("vt_rms_norm_gated", bind, p, static_cast<uint32_t>(rows));
+}
+
+// Shared geometry of the two state-cache ops (cpu_ops.cpp:1676-1682 and
+// :1723-1727 compute it identically). `mid` is the channels/heads per row and
+// `cache_row` the row's PHYSICAL width, which exceeds work_row when the conv
+// state has been widened for spec-decode rollback.
+struct GdnStateGeom {
+  int64_t rows, work_row, work_inner, cache_inner, cache_row;
+};
+GdnStateGeom GdnStateGeometry(const Tensor& working, const Tensor& cache,
+                              const Tensor& state_idx) {
+  GdnStateGeom g{};
+  g.rows = state_idx.shape[0];
+  if (g.rows == 0) return g;
+  g.work_inner = working.shape[working.rank - 1];
+  g.cache_inner = cache.shape[cache.rank - 1];
+  g.work_row = working.Numel() / g.rows;
+  const int64_t mid = g.work_inner == 0 ? 0 : g.work_row / g.work_inner;
+  g.cache_row = mid * g.cache_inner;
+  return g;
+}
+
+// cpu_ops.cpp:1666-1707 GdnStateGatherKernel.
+void GdnStateGatherKernel(Queue&, Tensor& working, const Tensor& cache,
+                          const Tensor& state_idx, const Tensor* has_initial_state) {
+  const GdnStateGeom g = GdnStateGeometry(working, cache, state_idx);
+  if (g.rows == 0 || g.work_row == 0) return;
+  Binder bind;
+  const uint32_t work_off = bind.Add(working, "gdn_state_gather: working");
+  const uint32_t cache_off = bind.Add(cache, "gdn_state_gather: cache");
+  const uint32_t idx_off = bind.AddU32Only(state_idx, "gdn_state_gather: state_idx");
+  // Binding 5 is always written: a descriptor a shader statically uses must be
+  // valid even on the path that never reads it. With his_mode == 0 it aliases
+  // state_idx and is dead — the same arrangement vt_rms_norm uses for its
+  // optional residual.
+  const uint32_t his_off =
+      has_initial_state != nullptr
+          ? bind.AddByteView(*has_initial_state, "gdn_state_gather: has_initial_state")
+          : bind.AddByteView(state_idx, "gdn_state_gather: state_idx");
+  uint32_t his_mode = 0;
+  if (has_initial_state != nullptr) {
+    his_mode = has_initial_state->dtype == DType::kI8 ? 1u : 2u;
+  }
+  GdnStateGatherParams p{static_cast<uint32_t>(g.rows),
+                         static_cast<uint32_t>(g.work_row),
+                         static_cast<uint32_t>(g.work_inner),
+                         static_cast<uint32_t>(g.cache_inner),
+                         static_cast<uint32_t>(g.cache_row),
+                         static_cast<uint32_t>(cache.shape[0]),
+                         DtypeCode(working.dtype),
+                         DtypeCode(cache.dtype),
+                         his_mode,
+                         work_off,
+                         cache_off,
+                         idx_off,
+                         his_off};
+  Go("vt_gdn_state_gather", bind, p, FlatGroupCount(g.rows * g.work_row));
+}
+
+// cpu_ops.cpp:1709-1745 GdnStateScatterKernel.
+void GdnStateScatterKernel(Queue&, Tensor& cache, const Tensor& working,
+                           const Tensor& state_idx) {
+  const GdnStateGeom g = GdnStateGeometry(working, cache, state_idx);
+  if (g.rows == 0 || g.work_row == 0) return;
+  Binder bind;
+  const uint32_t cache_off = bind.Add(cache, "gdn_state_scatter: cache");
+  const uint32_t work_off = bind.Add(working, "gdn_state_scatter: working");
+  const uint32_t idx_off = bind.AddU32Only(state_idx, "gdn_state_scatter: state_idx");
+  GdnStateScatterParams p{static_cast<uint32_t>(g.rows),
+                          static_cast<uint32_t>(g.work_row),
+                          static_cast<uint32_t>(g.work_inner),
+                          static_cast<uint32_t>(g.cache_inner),
+                          static_cast<uint32_t>(g.cache_row),
+                          static_cast<uint32_t>(cache.shape[0]),
+                          DtypeCode(working.dtype),
+                          DtypeCode(cache.dtype),
+                          cache_off,
+                          work_off,
+                          idx_off};
+  Go("vt_gdn_state_scatter", bind, p, FlatGroupCount(g.rows * g.work_row));
+}
+
+// cpu_ops.cpp:1081-1127 CausalConv1dUpdateKernel. One invocation per
+// (token, channel) — the CPU kernel's own row-chunking unit, and what makes the
+// read-old-then-roll safe with no barrier.
+void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
+                              const Tensor* bias, Tensor& conv_state,
+                              const Tensor* conv_state_indices,
+                              const CausalConv1dArgs& args) {
+  const int64_t batch = x.shape[0], c_dim = x.shape[1], k = w.shape[1];
+  if (batch == 0 || c_dim == 0) return;
+  // bf16 conv_state is a CUDA-only extension of the contract
+  // (src/vt/ops.cpp CheckConvCommon), so on this backend the state is f32 and the
+  // shader reads it through the 32-bit view directly.
+  VT_CHECK(conv_state.dtype == DType::kF32,
+           "vulkan causal_conv1d_update: conv_state must be f32");
+  Binder bind;
+  const uint32_t out_off = bind.Add(out, "causal_conv1d_update: out");
+  const uint32_t x_off = bind.Add(x, "causal_conv1d_update: x");
+  const uint32_t w_off = bind.Add(w, "causal_conv1d_update: weight");
+  // Bindings 6/7 alias the weight when there is no bias; see the note above.
+  const uint32_t bias_off = bias != nullptr ? bind.Add(*bias, "causal_conv1d_update: bias")
+                                            : bind.Add(w, "causal_conv1d_update: weight");
+  const uint32_t st_off = bind.AddU32Only(conv_state, "causal_conv1d_update: conv_state");
+  const uint32_t idx_off =
+      conv_state_indices != nullptr
+          ? bind.AddU32Only(*conv_state_indices, "causal_conv1d_update: conv_state_indices")
+          : bind.AddU32Only(conv_state, "causal_conv1d_update: conv_state");
+  ConvUpdateParams p{static_cast<uint32_t>(batch),
+                     static_cast<uint32_t>(c_dim),
+                     static_cast<uint32_t>(k),
+                     static_cast<uint32_t>(k - 1),
+                     static_cast<uint32_t>(conv_state.shape[2]),
+                     static_cast<uint32_t>(x.stride[0]),
+                     static_cast<uint32_t>(conv_state.shape[0]),
+                     bias != nullptr ? 1u : 0u,
+                     conv_state_indices != nullptr ? 1u : 0u,
+                     args.silu_activation ? 1u : 0u,
+                     DtypeCode(out.dtype),
+                     DtypeCode(x.dtype),
+                     DtypeCode(w.dtype),
+                     bias != nullptr ? DtypeCode(bias->dtype) : DtypeCode(w.dtype),
+                     out_off,
+                     x_off,
+                     w_off,
+                     bias_off,
+                     st_off,
+                     idx_off};
+  Go("vt_causal_conv1d_update", bind, p, FlatGroupCount(batch * c_dim));
+}
+
+// cpu_ops.cpp:2337-2417 GdnPostConvKernel. ONE WORKGROUP PER (token, head slot)
+// over Hk + Hv slots — upstream's own (L, H+HV) grid — not FlatGroupCount: the
+// q/k slots tree-reduce an L2 norm across the workgroup's lanes.
+void GdnPostConvKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& g_out,
+                       Tensor& beta_out, const Tensor& conv, const Tensor& araw,
+                       const Tensor& braw, const Tensor& a_log, const Tensor& dt_bias,
+                       const L2NormArgs& args) {
+  const int64_t t = conv.shape[0];
+  const int64_t hk = q_out.shape[1], dk = q_out.shape[2];
+  const int64_t hv = v_out.shape[1], dv = v_out.shape[2];
+  if (t == 0 || hk + hv == 0) return;
+  const int64_t key_dim = hk * dk, value_dim = hv * dv;
+  Binder bind;
+  const uint32_t conv_off = bind.Add(conv, "gdn_post_conv: conv");
+  const uint32_t q_off = bind.Add(q_out, "gdn_post_conv: q_out");
+  const uint32_t k_off = bind.Add(k_out, "gdn_post_conv: k_out");
+  const uint32_t v_off = bind.Add(v_out, "gdn_post_conv: v_out");
+  const uint32_t a_off = bind.Add(araw, "gdn_post_conv: araw");
+  const uint32_t b_off = bind.Add(braw, "gdn_post_conv: braw");
+  // f32 BY CONTRACT (src/vt/ops.cpp:3459-3463), so one binding each rather than a
+  // dtype-erased pair whose 16-bit half could never be taken.
+  const uint32_t g_off = bind.AddU32Only(g_out, "gdn_post_conv: g_out");
+  const uint32_t beta_off = bind.AddU32Only(beta_out, "gdn_post_conv: beta_out");
+  const uint32_t alog_off = bind.AddU32Only(a_log, "gdn_post_conv: a_log");
+  const uint32_t dtb_off = bind.AddU32Only(dt_bias, "gdn_post_conv: dt_bias");
+  // Ascending constantID order: conv dtype, the shared q/k/v dtype, the shared
+  // araw/braw dtype.
+  const uint32_t spec[3] = {DtypeCode(conv.dtype), DtypeCode(q_out.dtype),
+                            DtypeCode(araw.dtype)};
+  GdnPostConvParams p{static_cast<uint32_t>(t),
+                      static_cast<uint32_t>(hk),
+                      static_cast<uint32_t>(dk),
+                      static_cast<uint32_t>(hv),
+                      static_cast<uint32_t>(dv),
+                      static_cast<uint32_t>(key_dim),
+                      static_cast<uint32_t>(value_dim),
+                      static_cast<uint32_t>(2 * key_dim + value_dim),
+                      static_cast<uint32_t>(araw.stride[0]),
+                      static_cast<uint32_t>(braw.stride[0]),
+                      conv_off,
+                      q_off,
+                      k_off,
+                      v_off,
+                      a_off,
+                      b_off,
+                      g_off,
+                      beta_off,
+                      alog_off,
+                      dtb_off,
+                      args.eps};
+  Go("vt_gdn_post_conv", bind, p, static_cast<uint32_t>(t * (hk + hv)), spec, 3);
+}
+
+// ---------------------------------------------------------------------------
+// The two GATED-DELTA RECURRENCES (BACKEND-VULKAN-GDN-CORE). These are not glue:
+// they ARE Qwen3.6's linear-attention core, and with the glue above already
+// native they were the whole of what the model still ran on the host — a 512
+// token prompt spent ~280 s in kGdnPrefill on the reference tier.
+//
+// The shaders (src/vt/vulkan/shaders/vt_gdn_prefill.comp, vt_gdn_decode.comp and
+// the shared vt_gdn_recurrence.glsl) carry the port provenance and the tile
+// geometry. What the HOST has to get right is only the grid and the decline.
+// ---------------------------------------------------------------------------
+
+// Must equal VT_GDN_BV / VT_GDN_MAX_DK in vt_gdn_recurrence.glsl. Duplicated
+// rather than shared because the shader constants are in GLSL and the SPIR-V is
+// committed, so nothing can compute one from the other — the gate in
+// tests/vt/test_vulkan_backend.cpp exercises a Dv that is NOT a multiple of the
+// tile so a drift shows up as wrong numbers there rather than in a model run.
+constexpr int64_t kGdnTileRows = 16;
+constexpr int64_t kGdnMaxDk = 128;
+
+// Shared grid + binding setup for the two recurrences. Returns false when this
+// backend cannot serve the shape and the caller must decline to the next
+// provider.
+bool GdnRecurrenceCommon(const Tensor& out, const Tensor& q_in, const Tensor& k,
+                         const Tensor& v, const Tensor& g, const Tensor& beta,
+                         const Tensor& state, Binder& bind, GdnRecurrenceParams& p,
+                         uint32_t spec[2], float scale) {
+  const int64_t hv = state.shape[1], dv = state.shape[2], dk = state.shape[3];
+  const int64_t hk = q_in.shape[1];
+  // PER-CALL REFUSAL rather than a throw, the same seam vt_paged_attn uses for an
+  // fp8 KV cache: declining forwards to the portable reference tier, which is
+  // correct for every shape, instead of REMOVING a capability the backend already
+  // had. Two reasons to decline.
+  //   * Dk beyond the shared tile's compile-time extent. The tile has to be sized
+  //     at compile time against Vulkan's GUARANTEED 16 KB of shared memory, and
+  //     the real gate dim is 128.
+  //   * q/k/v disagreeing on dtype. One specialization constant covers the three
+  //     (they come out of one GdnPostConv dispatch and always agree), and CUDA
+  //     asserts the same thing (cuda_gdn.cu:2577).
+  if (dk > kGdnMaxDk || dk <= 0) return false;
+  if (k.dtype != q_in.dtype || v.dtype != q_in.dtype) return false;
+  const uint32_t q_off = bind.Add(q_in, "gdn recurrence: q");
+  const uint32_t k_off = bind.Add(k, "gdn recurrence: k");
+  const uint32_t v_off = bind.Add(v, "gdn recurrence: v");
+  const uint32_t out_off = bind.Add(out, "gdn recurrence: out");
+  // g, beta and the state are f32 by the op contract on this device
+  // (src/vt/ops.cpp:1629-1643 — a compressed state is CUDA-only), so one binding
+  // each rather than a dtype-erased pair whose 16-bit half could never be taken.
+  const uint32_t g_off = bind.AddU32Only(g, "gdn recurrence: g");
+  const uint32_t beta_off = bind.AddU32Only(beta, "gdn recurrence: beta");
+  const uint32_t state_off = bind.AddU32Only(state, "gdn recurrence: state");
+  spec[0] = DtypeCode(q_in.dtype);
+  spec[1] = DtypeCode(out.dtype);
+  p.hk = static_cast<uint32_t>(hk);
+  p.dk = static_cast<uint32_t>(dk);
+  p.hv = static_cast<uint32_t>(hv);
+  p.dv = static_cast<uint32_t>(dv);
+  p.nv = static_cast<uint32_t>((dv + kGdnTileRows - 1) / kGdnTileRows);
+  p.ratio = static_cast<uint32_t>(hv / hk);
+  p.has_idx = 0;
+  p.n_state_rows = static_cast<uint32_t>(state.shape[0]);
+  p.q_off = q_off;
+  p.k_off = k_off;
+  p.v_off = v_off;
+  p.out_off = out_off;
+  p.g_off = g_off;
+  p.beta_off = beta_off;
+  p.state_off = state_off;
+  p.meta_off = 0;
+  p.scale = scale;
+  return true;
+}
+
+// cpu_ops.cpp:1331-1366 GdnPrefillKernel. ONE WORKGROUP PER
+// (sequence, value-head, value-tile) — the CPU kernel's own (SEQUENCE,
+// VALUE-HEAD) chunking plus the value-row tile our CUDA kernel already uses as
+// its grid.x (cuda_gdn.cu:2421). NOT FlatGroupCount: the whole workgroup
+// cooperates on one tile, and the sequence stays sequential inside it.
+void GdnPrefillKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                      const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                      const Tensor& query_start_loc, const GdnArgs& args) {
+  const int64_t n = state.shape[0], hv = state.shape[1], dv = state.shape[2];
+  if (n == 0 || hv == 0 || dv == 0) return;
+  Binder bind;
+  GdnRecurrenceParams p{};
+  uint32_t spec[2] = {0, 0};
+  if (!GdnRecurrenceCommon(out, q_in, k, v, g, beta, state, bind, p, spec, args.scale)) {
+    auto next = reinterpret_cast<GdnPrefillFn>(
+        GetOpFallback(OpId::kGdnPrefill, DeviceType::kVULKAN, kNativeProviderName));
+    next(q, out, q_in, k, v, g, beta, state, query_start_loc, args);
+    return;
+  }
+  p.meta_off = bind.AddU32Only(query_start_loc, "gdn_prefill: query_start_loc");
+  Go("vt_gdn_prefill", bind, p, static_cast<uint32_t>(n * hv * p.nv), spec, 2);
+}
+
+// cpu_ops.cpp:1368-1396 GdnDecodeKernel, one step per batch token. Same grid with
+// the sequence axis replaced by the batch — cuda_gdn.cu:2513's
+// (NV, n*Hv) flattened.
+void GdnDecodeKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                     const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
+                     const Tensor* state_idx, const GdnArgs& args) {
+  const int64_t batch = q_in.shape[0], hv = state.shape[1], dv = state.shape[2];
+  if (batch == 0 || hv == 0 || dv == 0) return;
+  Binder bind;
+  GdnRecurrenceParams p{};
+  uint32_t spec[2] = {0, 0};
+  if (!GdnRecurrenceCommon(out, q_in, k, v, g, beta, state, bind, p, spec, args.scale)) {
+    auto next = reinterpret_cast<GdnDecodeFn>(
+        GetOpFallback(OpId::kGdnDecode, DeviceType::kVULKAN, kNativeProviderName));
+    next(q, out, q_in, k, v, g, beta, state, state_idx, args);
+    return;
+  }
+  // Binding 11 is always written: a descriptor a shader statically uses must be
+  // valid even on the path that never reads it. With has_idx == 0 it aliases the
+  // state buffer and is dead.
+  if (state_idx != nullptr) {
+    p.has_idx = 1;
+    p.meta_off = bind.AddU32Only(*state_idx, "gdn_decode: state_idx");
+  } else {
+    p.meta_off = bind.AddU32Only(state, "gdn_decode: state");
+  }
+  Go("vt_gdn_decode", bind, p, static_cast<uint32_t>(batch * hv * p.nv), spec, 2);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Vulkan-enabled build on a host with
@@ -732,6 +1263,28 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kFusedChain, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernel)));
+    // BACKEND-VULKAN-GDN: the GDN glue family. kCausalConv1dFwd (the prefill
+    // conv) and kRopeCosSinCache (the double-precision rotary table, deliberately
+    // host-side) stay on the portable reference tier; see the block comment above
+    // these kernels.
+    RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16Kernel)));
+    RegisterOp(OpId::kRmsNormGated, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<RmsNormGatedFn>(&RmsNormGatedKernel)));
+    RegisterOp(OpId::kGdnStateGather, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GdnStateGatherFn>(&GdnStateGatherKernel)));
+    RegisterOp(OpId::kGdnStateScatter, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GdnStateScatterFn>(&GdnStateScatterKernel)));
+    RegisterOp(
+        OpId::kCausalConv1dUpdate, DeviceType::kVULKAN,
+        reinterpret_cast<void*>(static_cast<CausalConv1dUpdateFn>(&CausalConv1dUpdateKernel)));
+    RegisterOp(OpId::kGdnPostConv, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GdnPostConvFn>(&GdnPostConvKernel)));
+    // BACKEND-VULKAN-GDN-CORE: the two recurrences.
+    RegisterOp(OpId::kGdnPrefill, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
+    RegisterOp(OpId::kGdnDecode, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernel)));
   }
 } registrar;
 

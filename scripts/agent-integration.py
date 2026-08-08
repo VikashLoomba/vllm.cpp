@@ -105,7 +105,7 @@ def main() -> int:
         return 1
     trailers = subprocess.run(
         [sys.executable, str(ROOT / "scripts/check-commit-trailers.py"),
-         "--range", f"{cutover}..HEAD", "--cutover", cutover],
+         "--range", f"{args.base}..HEAD", "--cutover", cutover],
         cwd=ROOT,
     )
     if trailers.returncode:

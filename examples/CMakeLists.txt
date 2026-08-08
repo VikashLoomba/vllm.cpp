@@ -22,11 +22,12 @@ add_executable(laguna-gen laguna_gen/main.cpp)
 target_link_libraries(laguna-gen PRIVATE vllm::vllm)
 vllm_cpp_set_warnings(laguna-gen)
 
-# kimi-linear-gen: the single-GB10 Kimi-Linear-48B-A3B full-model e2e harness (§13
-# bf16-resident loader/forward — greedy decode the 8-prompt golden battery through
-# the bf16 ForwardDeviceCompute and token-compare to the STRICT oracle golden).
+# kimi-linear-gen: the Kimi-Linear-48B-A3B golden token battery, a THIN CLIENT
+# of the public C ABI (ONE SURFACE / ROW 7 §20.3 B4): vllm_engine_load + the
+# v13 vllm_complete_tokens over the pre-tokenized golden prompts. Links the
+# packaged shared library like vllm-cli — no internal headers.
 add_executable(kimi-linear-gen kimi_linear_gen/main.cpp)
-target_link_libraries(kimi-linear-gen PRIVATE vllm::vllm)
+target_link_libraries(kimi-linear-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(kimi-linear-gen)
 
 # vllm-bench (M2.1): the throughput/latency benchmark harness — the gate-#1
@@ -51,6 +52,18 @@ target_link_libraries(quant-gemm-bench PRIVATE vllm::vllm)
 target_include_directories(quant-gemm-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_set_warnings(quant-gemm-bench)
 
+add_executable(vllm-cpu-kernel-bench cpu_kernel_bench/main.cpp)
+target_link_libraries(vllm-cpu-kernel-bench PRIVATE vllm::vllm)
+target_include_directories(vllm-cpu-kernel-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_set_warnings(vllm-cpu-kernel-bench)
+if(VLLM_CPP_BUILD_TESTS)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME test_cpu_kernel_bench_cli
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/scripts/test_cpu_kernel_bench.py
+      $<TARGET_FILE:vllm-cpu-kernel-bench>)
+endif()
+
 # The OpenAI HTTP server example is gated on the vendored cpp-httplib transport.
 if(VLLM_CPP_SERVER)
   add_executable(server server/main.cpp)
@@ -64,17 +77,22 @@ if(VLLM_CPP_SERVER)
 endif()
 
 # minimax-h3-mux: muxes MiniMax-H3 PPM frames + WAV into an MP4 by invoking
-# ffmpeg. This is the RATIFIED home of that process spawn (developer decision
-# 2026-08-03): the library builds the artifacts and the argv, examples/ runs it.
+# ffmpeg — a THIN client of the public C ABI (include/vllm.h + vllm::shared
+# ONLY, like vllm-cli), per the ONE SURFACE directive. This is the RATIFIED
+# home of that process spawn (developer decision 2026-08-03): the library
+# composes the argv (vllm_video_mux_argv), examples/ runs it.
 add_executable(minimax-h3-mux minimax_h3_mux/main.cpp)
-target_link_libraries(minimax-h3-mux PRIVATE vllm::vllm)
+target_link_libraries(minimax-h3-mux PRIVATE vllm::shared)
 vllm_cpp_set_warnings(minimax-h3-mux)
 
-# minimax-h3-gen: the ASSEMBLY driver — opens the real checkpoints, runs the whole
-# t2va path and writes an MP4. Lives here because it invokes ffmpeg (the ratified
-# boundary) and because it is a driver, not library surface.
+# minimax-h3-gen: MiniMax-H3 video generation end to end — a THIN client of
+# the public C ABI (ARCH-ONE-SURFACE ROW 2). The assembly pipeline it used to
+# own privately lives in the library behind vllm_video_engine_load +
+# vllm_video_generate; the fold gate holds its frames + WAV byte-identical to
+# the pre-fold binary. Lives here because it invokes ffmpeg (the ratified
+# boundary).
 add_executable(minimax-h3-gen minimax_h3_gen/main.cpp)
-target_link_libraries(minimax-h3-gen PRIVATE vllm::vllm)
+target_link_libraries(minimax-h3-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(minimax-h3-gen)
 
 # vulkan-gemm-ab: the VK-C tactic A/B — cooperative matrix vs the portable scalar
@@ -87,4 +105,23 @@ if(VLLM_CPP_VULKAN)
   target_link_libraries(vulkan-gemm-ab PRIVATE vllm::vllm)
   target_include_directories(vulkan-gemm-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
   vllm_cpp_set_warnings(vulkan-gemm-ab)
+
+  # vulkan-dispatch-floor: the VK-A2 sizing measurement. Sweeps ONE op across a
+  # 65,536x range of element counts to separate per-dispatch overhead from real
+  # kernel cost -- two causes that produce an identical wall clock but imply
+  # opposite fixes. Same Vulkan-only condition, same reason.
+  add_executable(vulkan-dispatch-floor
+                 ${CMAKE_SOURCE_DIR}/benchmarks/vulkan_dispatch_floor.cpp)
+  target_link_libraries(vulkan-dispatch-floor PRIVATE vllm::vllm)
+  target_include_directories(vulkan-dispatch-floor PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  vllm_cpp_set_warnings(vulkan-dispatch-floor)
 endif()
+
+# parakeet-transcribe: the ASR example — a THIN client of the public C ABI
+# (include/vllm.h + vllm::shared ONLY, like vllm-cli), per the ONE SURFACE
+# directive. The pipeline it used to own privately lives in the library behind
+# vllm_engine_load + vllm_transcribe (ARCH-ONE-SURFACE ROW 1); the fold gate
+# holds its transcript byte-identical to the pre-fold binary.
+add_executable(parakeet-transcribe parakeet_transcribe/main.cpp)
+target_link_libraries(parakeet-transcribe PRIVATE vllm::shared)
+vllm_cpp_set_warnings(parakeet-transcribe)

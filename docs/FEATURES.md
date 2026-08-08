@@ -94,7 +94,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 <!-- supported-arch-table:begin -->
 | Architecture | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|
-| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (NVFP4, GDN hybrid) | strict 235/235 text, image+video 32/32 vs vLLM 0.25.0 | gate model: at or above vLLM |
+| `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (NVFP4, GDN hybrid) | strict 235/235 text, image+video 32/32 vs vLLM 0.25.0 | gate model: at or above vLLM. CUDA/CPU only; the off-CUDA host-pointer bug (#125) is fixed but unrun |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | strict 315/315 text vs vLLM 0.25.0 | gate model: 0.93x to 1.03x grid |
 | `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |
 | `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B | strict 6/6 vs vLLM 0.25.0 | 11/16 grid cells at or above graphed vLLM |
@@ -109,18 +109,21 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `Gemma2ForCausalLM` | google/gemma-2-2b-it | near-tie 48/48 vs vLLM 0.25.0 | pending |
 | `Gemma3ForCausalLM` | google/gemma-3-1b-it | strict 48/48 vs vLLM 0.25.0 | pending |
 | `Gemma4ForConditionalGeneration` | Gemma-4 multimodal (unsloth/gemma-4-E4B-it) | text strict, image mm near-tie; audio pending | pending |
+| `Gemma4UnifiedForConditionalGeneration` | Gemma-4 "unified" HF export (google/gemma-4-12B-it), no-PLE dense layout | shares the Gemma-4 text+mm forward; loads on the same factory (contributor #140); no separate oracle gate for this arch name yet | pending |
 | `GraniteForCausalLM` | ibm-granite/granite-3.3-2b-instruct | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `StableLmForCausalLM` | stabilityai/stablelm-2-1_6b | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `MiniCPMForCausalLM` | openbmb/MiniCPM-2B-sft-bf16 | strict 16/16 vs vLLM 0.25.0 | pending |
 | `MiniCPM3ForCausalLM` | openbmb/MiniCPM3-4B (MLA) | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `Olmo2ForCausalLM`, `Olmo3ForCausalLM` | allenai/OLMo-2-0425-1B; OLMo-3 (Olmo2 factory alias) | OLMo-2 strict 16/16; OLMo-3 oracle-blocked (vLLM 0.25.0 cannot build it) | pending |
 | `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite (MLA) | strict 8/8 vs vLLM 0.25.0 | speed short, attributed |
-| `DeepseekV4ForCausalLM` | DeepSeek-V4-Flash GGUF (ds4 q2-imatrix, UD-IQ2) | coherent near-tie vs ds4 oracle (vLLM cannot fit one GB10) | decode beats ds4 1.144x, default on |
+| `DeepseekV4ForCausalLM` | DeepSeek-V4-Flash GGUF (ds4 q2-imatrix, UD-IQ2) | coherent near-tie vs ds4 oracle (vLLM cannot fit one GB10) | decode beats ds4 1.144x, default on, via the `deepseek-v4-gen` CLI; the registered engine forward is a W3 stub (`ARCH-ONE-SURFACE` fold) |
 | `Glm4ForCausalLM` | GLM-4-9B-0414 | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `Glm4MoeLiteForCausalLM` | zai-org/GLM-4.7-Flash (31.2B, MLA MoE) | near-tie 8/8 vs vLLM 0.25.0 | pending |
-| `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on |
-| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | KDA device op `vt::KdaGatedDeltaRule` GB10 122/128 + 4.24 tok/s, not STRICT; chunk_kda prefill LANDED (§18): op unit-correct (4.68e-5) but chunk-every-step REGRESSES 122→102 in the O(n²) vehicle | default off; real lever = paged-incremental decode (chunk-prefill once + recurrent-decode over persistent state) |
+| `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on, via the `laguna-gen` CLI; the registered engine forward VT_CHECKs non-bf16 (`ARCH-ONE-SURFACE` fold) |
+| `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | **Folded onto the shared paged runner (ROW 7 §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (the intrinsic near-tie profile); FA2 paged MLA default-ON; SACRED post-fold green** | Served via `vllm_engine_load` + `vllm_complete_tokens` (ABI v13); server 19.0 tok/s wall vs vLLM ~21 (~0.90×), speed residual open |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
+| `LlamaModel` | committed tiny synthetic embedding fixture (engine path == direct pooler path, identical vectors; f64 LAST+normalize reference); real checkpoint (e5-mistral class) is a NAMED residual | pooling/embed only, text paths refuse by task; `vllm_embed` + `/v1/embeddings` | n/a (CPU correctness-grade embeddings) |
+| `ParakeetForCTC`, `ParakeetForRNNT`, `ParakeetForTDT` | nvidia/parakeet-ctc-0.6b/-1.1b, -rnnt-0.6b, -tdt-0.6b-v3 (transcribed, ids exact vs HF `generate()`, P4/P6 2026-08-07; not retained) + committed synthetic fold fixture | ASR transcription-only (`SupportsTranscription` mirror; text paths refuse by task); fold gate byte-identical to the pre-refactor pipeline | n/a (CPU correctness-grade ASR via `vllm_transcribe` + `/v1/audio/transcriptions`) |
 | `CohereForCausalLM` | Command-R / Cohere (and Cohere2) | scaffold: W0 tiny-random oracle run-verified; real-checkpoint gate blocked | no run |
 <!-- supported-arch-table:end -->
 
@@ -148,11 +151,12 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
 
-25 of the 30 registered architectures carry a passing correctness gate today;
-the rest are honestly marked scaffold or blocked above. vLLM registers 130+ text
-architectures, so this is a curated, gated subset, not a breadth claim. Embedding
-and reranking models are not yet registered: the engine-side pooler landed, no
-model architecture is wired.
+25 of the 30 registered text-generation architectures carry a passing
+correctness gate today; the rest are honestly marked scaffold or blocked above.
+vLLM registers 130+ text architectures, so this is a curated, gated subset, not
+a breadth claim. The first EMBEDDING architecture is registered and live
+(`LlamaModel`, task=embed, LAST pooling, the as_embedding_model mirror, gated
+on the committed fixture); reranking/classify models are not yet registered.
 
 ## Multimodal
 
@@ -161,7 +165,7 @@ model architecture is wired.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10; ref2va NVFP4 grid = the community ckpt's own quant fidelity, NO loader bug (§8.12); DiT loads GGUF/NVFP4/bf16-13-shard, encoder loads GGUF or bf16-14-shard | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT; ref2va ckpt-limited (§8.12); GGUF/NVFP4/bf16 loaders; ABI v12 `vllm_video_*` uses generic `DeviceType` dispatch (DSR 32) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them
@@ -178,7 +182,7 @@ the registered engine forward.
 | EAGLE / EAGLE3 | ☐ | ✅ | ✅ |
 | DFlash block diffusion | ✅ 2.9x over spec-off, at/above vLLM DFlash-on | ✅ | ☐ |
 | n-gram / prompt lookup | ✅ 27B 5/5 strict vs vLLM | ✅ | ✅ |
-| Other methods (ngram-gpu, suffix, dspark, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried | ✅ | ◐ |
+| Other methods (ngram-gpu, suffix, dspark, custom-class, dynamic-k, mlp-speculator) | ☐ inventoried; dspark re-grounded at the pin 2026-08-08 (V2-only DFlash-derived block drafter; Qwen3 + Gemma4 targets are ours) | ✅ | ◐ |
 
 ## Structured output and tool calling
 
@@ -198,10 +202,10 @@ the registered engine forward.
 | Backend | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | CUDA | ✅ sm_80 to sm_121a | ✅ | ✅ | ✅ |
-| CPU (x86 AVX-512, Arm i8mm) | ✅ | ◐ | ☐ | ✅ |
+| CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ☐ (W0 skeleton, HIP never compiled) | ✅ | ✅ | ✅ |
+| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
@@ -211,8 +215,10 @@ kernels for it.
 Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact, 6/6
 prompts / 96/96 tokens vs the vLLM 0.25.0 oracle, all nine of that model's ops
 dispatched natively with **zero provider declines**, on llvmpipe (no Vulkan GPU is
-reachable here). Still partial: **16 native kernels**, the other 71 ops fall back
-to the portable CPU tier, and quant/MoE/MLA/linear-attention have none at all (MLA
+reachable here). Still partial: **22 native kernels**, the other 65 ops fall back
+to the portable CPU tier. Six of the 22 are the **GDN / conv1d glue** a GDN hybrid
+(Qwen3.6) hits every step, gated against the CPU oracle; the GDN recurrences
+themselves are still on the host tier, and quant/MoE/MLA have none at all (MLA
 is refused at the platform seam, not mis-routed). **No speed number is owed.**
 Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 
@@ -226,9 +232,28 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Prometheus metrics | ✅ | ✅ | ✅ | ◐ |
 | Plugin / out-of-tree model registration | ✅ in-tree factory `DONE` + plugin seam | ✅ | ◐ | ☐ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |
-| Embedding / pooling endpoints | ◐ engine only | ✅ | ✅ | ✅ |
+| Embedding / pooling endpoints | ◐ `/v1/embeddings` live (task=embed; score/rerank/classify pending) | ✅ | ✅ | ✅ |
 | OpenAI video generation `/v1/videos` (Sora shape) | ✅ `model`/`size`/`seconds` aliases + `GET /{id}/content`; `input_reference` and the `metadata` video/audio references condition the render | ◐ (vllm-omni, its own request shape) | ☐ | ☐ |
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
+
+#### C-ABI capability coverage <!-- abi-capability-table:begin -->
+- Which capabilities an embedder drives through the flat C ABI (`include/vllm.h`, the only installed header), gated by `scripts/check-surface-coverage.py`: a `reachable` row names an entry point that exists; an `embedder-unreachable` row is tracked in `scripts/abi-capability-allowlist.txt` against its fold row (`ARCH-ONE-SURFACE`). The ABI is text-generation-complete; the one `embedder-unreachable` row (multimodal input) is the open capability gap.
+
+| Capability | C-ABI surface | Embedder-reachable |
+|---|---|---|
+| Text completion (blocking + streaming) | `vllm_complete`, `vllm_complete_stream` | reachable |
+| Pre-tokenized completion (token-id prompts, ABI v13) | `vllm_complete_tokens` | reachable |
+| OpenAI chat (tools, streaming) | `vllm_chat`, `vllm_chat_stream` | reachable |
+| Async request submission | `vllm_request_submit` | reachable |
+| Structured output / grammars | `structured_json`, `structured_grammar` | reachable |
+| Tool + reasoning parser selection | `tool_parser`, `reasoning_parser` | reachable |
+| Speculative decoding config | `speculative_config` | reachable |
+| Custom logits processor | `vllm_logits_processor` | reachable |
+| Embeddings / pooling (task=embed) | `vllm_embed`, `vllm_embedding_result_free` (ABI v15; pooling checkpoints load via `vllm_engine_load`) | reachable |
+| Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
+| Video+audio generation (MiniMax-H3) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv` | reachable |
+| Explicit device selection (auto/cpu/cuda) | `device` field on `vllm_model_params` (ABI v14; 0=auto keeps the probe, explicit absent device fails loud) | reachable |
+| Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 
 ## Parallelism and scale-out
 
@@ -237,7 +262,7 @@ abstraction, and `world_size == 1` stays byte-identical.
 
 | Mode | vllm.cpp | vLLM | SGLang |
 |---|---|---|---|
-| Tensor parallel (TP) | ◐ CPU-gated, no 2-GPU run | ✅ | ✅ |
+| Tensor parallel (TP) | ◐ CPU-gated, no 2-GPU run; end-to-end scope spiked at the pin 2026-08-08 (TP-W1..W4+W7 CPU-completable) | ✅ | ✅ |
 | Collective / process-group abstraction | ✅ CPU + NCCL transport | ✅ | ✅ |
 | Pipeline parallel (PP) | ☐ spike written | ✅ | ✅ |
 | Expert parallel (EP) + EPLB | ☐ spike written | ✅ | ✅ |
@@ -246,21 +271,21 @@ abstraction, and `world_size == 1` stays byte-identical.
 | Multi-node | ☐ spike written | ✅ | ✅ |
 | PD disaggregation | ☐ | ✅ | ✅ |
 
-CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the CPU supports them (SSE2 before), selected by a runtime probe and byte-identical to the portable tier.
+CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the CPU supports them (SSE2 before), selected by a runtime probe, and can take a transpose-free `[K,N]` weight path via an opt-in load-time repack (`VT_CPU_ELEM_KN_REPACK`, CPU only, default off). Byte-identical to the portable tier either way.
 
 ## Not supported yet
 
 | Gap | State | Detail |
 |---|---|---|
-| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | KDA device op `vt::KdaGatedDeltaRule` GB10 122/128 + 4.24 tok/s (3.1×), NOT STRICT, default OFF; chunk_kda prefill LANDED+MEASURED (§18): unit-correct (4.68e-5) but chunk-every-step REGRESSES 122→102 | real lever = paged-incremental decode (kills O(n²); the STRICT+speed lever) |
+| Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE hybrid) | **Runner fold LANDS (ROW 7 §21, #122): the ENGINE/SERVER surface serves Kimi at the 122/128 golden profile (engine==CLI 128/128); STRICT stays closed (intrinsic p7 near-tie)** | server 19.0 tok/s wall / CLI 18.9 vs vLLM ~21 (~0.90×), speed residual named (§21) |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
-| Embedding / reranking models | Engine side only | Pooler and runner path landed, no model architecture registered |
-| ROCm | W0 skeleton, unbuilt | Backend + platform + 1 op (RmsNorm); the HIP sources have never been compiled by anyone (no AMD board here). Open: [ROCM.md](ROCM.md), [#41](https://github.com/mudler/vllm.cpp/issues/41) |
+| Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
+| ROCm | W0 verified by community, model e2e pending | Backend + platform + 1 op, ctest-green on gfx1151/1103/1100/1201 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix in (managed allocs, unverified); M2 unblocks with it. [ROCM.md](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
-| Memory budgeting (`ROAD-V1-MEM`, #83) | Scoped, spike owed | No profiling; KV pool is a hand-typed `--num-blocks`. Target: auto-size to the declared workload, optional total-footprint cap, refuse before allocating |
+| Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
 
 ## How to read this page
 
@@ -281,4 +306,4 @@ nobody is flying them; the 2026-08-05 device inventory put 11 llama.cpp ggml
 backends in scope as inventoried rows. Neither changed a capability, so **no
 mark on this page moved**. An inventoried backend is not a supported one, and the same
 holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle state and its support mark
-are independent: see [STATUS.md](STATUS.md).
+are independent: see [STATUS.md](STATUS.md). Parakeet ASR (encoder + CTC/RNN-T/TDT) runs natively on CPU, 4 checkpoints token-exact vs HF.

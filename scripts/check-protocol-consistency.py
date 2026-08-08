@@ -98,6 +98,7 @@ CUTOVER_WIRING = {
     "scripts/agent-integration.py": (
         "reviewDecision",
         "if not run_ready(args.pr_json):",
+        'f"{args.base}..HEAD"',
         "errors = ready.ready_errors(payload, expected)",
         "check-commit-trailers.py",
         ".agents/policy-cutover",

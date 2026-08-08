@@ -44,6 +44,10 @@ jobs:
           python3 scripts/check-agent-record.py
           python3 tests/scripts/test_agent_record.py
           python3 tests/scripts/test_doc_checkpoint.py
+      - name: Accepted binary-release design and record anchors stay in sync
+        run: |
+          python3 scripts/check-release-binary-contract.py
+          python3 tests/scripts/test_check_release_binary_contract.py
       - name: README stays a human-readable user-facing document
         run: |
           python3 scripts/check-readme-structure.py
@@ -72,6 +76,14 @@ jobs:
         run: |
           python3 scripts/check-runner-routing-consistency.py
           python3 tests/scripts/test_check_runner_routing_consistency.py
+      - name: Examples are thin clients of the public ABI, capabilities reach it
+        run: |
+          python3 scripts/check-surface-coverage.py
+          python3 tests/scripts/test_check_surface_coverage.py
+      - name: Critical regression tests remain executable and CTest-registered
+        run: |
+          python3 scripts/check-test-registration.py
+          python3 tests/scripts/test_check_test_registration.py
       - name: cuBLASLt GEMM invocation stays dtype-faithful (template parity)
         run: |
           python3 scripts/check-gemv-invocation-consistency.py
@@ -89,8 +101,10 @@ jobs:
           python3 tests/scripts/test_check_protocol_consistency.py
           python3 tests/scripts/test_agent_gates.py
           cutover="$(tr -d '\n' < .agents/policy-cutover)"
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then base="${{ github.event.before }}"; fi
           python3 scripts/check-commit-trailers.py \
-            --range "$cutover..HEAD" --cutover "$cutover"
+            --range "$base..HEAD" --cutover "$cutover"
       - name: The state-log tail is anchored and chronological
         run: |
           python3 scripts/check-state-order.py
@@ -237,7 +251,8 @@ jobs:
           python3 scripts/check-pr-size.py \
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}" \
-            --branch "${{ github.event.pull_request.head.ref }}"
+            --branch "${{ github.event.pull_request.head.ref }}" \
+            --pr-number "${{ github.event.pull_request.number }}"
   cuda-arch-features:
     # Configure-tier assertions on the CUDA per-arch FEATURE TABLE. Needs neither
     # a CUDA toolkit nor a GPU: it drives cmake/CudaArchFeatures.cmake directly,

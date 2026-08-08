@@ -792,7 +792,24 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
 // the const_cast is safe. `shape` defaults to the owned shape.
 Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
-  if (!vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging()) {
+  // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY (issue
+  // #125). This read `!needs_weight_staging()`, which is true ONLY on CUDA
+  // (platforms/cuda.cpp; the base default is false and neither Vulkan, Metal nor
+  // XPU overrides it) -- so every DEVICE backend except CUDA aliased the host
+  // weight bytes into a tensor tagged with a device and handed a HOST pointer to
+  // a DEVICE kernel. On Vulkan that surfaces as "embedding: table points outside
+  // every Vulkan allocation" on the first native kernel of the forward.
+  //
+  // The correct predicate is `is_cpu()`: alias when the "device" IS the host,
+  // upload otherwise. It leaves CPU and CUDA on exactly the branches they already
+  // took (CPU: is_cpu true / staging false -> alias; CUDA: is_cpu false / staging
+  // true -> upload), so this cannot change either.
+  //
+  // include/vllm/model_executor/models/dense_attn_block.h carries the SAME helper
+  // already fixed this way, and 25 model files inherit it. This file is not one of
+  // them -- it kept a private copy, so the fix never reached it. That is the
+  // off-framework-model hazard the decode-framework-routing audit names.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
     Tensor t = MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype,
                           d.q.device, shape);
     // CIQ G7: carry the i8mm-repack marker from the OwnedTensor to the vt::Tensor
@@ -802,8 +819,23 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     // garbage. Only ever true on the CPU keep-quant path (a staged device never
     // repacks), so it is inert everywhere else.
     t.repacked = w.repacked;
+    // Same reasoning for the elementwise [N,K] -> [K,N] repack: without this the
+    // kernel would read transposed bytes as a plain [N,K] weight. Set only on
+    // this CPU-resident construction, which is exactly where MatmulBTKernel
+    // consumes it; a staged device weight is never elem-repacked.
+    t.elem_kn_repacked = w.elem_kn_repacked;
     return t;
   }
+  // AUDIT GUARD (KERNEL-GEMM-CPU-TILED lever 2). Only the CPU MatmulBTKernel
+  // honours elem_kn_repacked, and the staging path below uploads bytes verbatim
+  // and returns a tensor WITHOUT the marker, so a repacked weight reaching a
+  // staged device would be read as plain [N,K] and produce garbage silently.
+  // VT_CPU_ELEM_KN_REPACK is CPU-only and the loader policy cannot see the
+  // device, so this is where the invariant is enforced: fail loudly at load
+  // rather than corrupt tokens at inference.
+  VT_CHECK(!w.elem_kn_repacked,
+           "qwen3_5: an elem_kn_repacked ([K,N]) weight reached device staging; "
+           "VT_CPU_ELEM_KN_REPACK is a CPU-only load transform");
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);
@@ -822,7 +854,11 @@ Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
                          const std::vector<int64_t>& shape) {
   if (!w.d_dev_f32) {
     std::vector<float> f = WeightF32(w);
-    if (!vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging()) {
+    // Same defect and same fix as ResidentWeight above (issue #125): this handed
+    // out `std::vector<float>::data()`, a plain heap pointer, to any non-CUDA
+    // device backend. It would have thrown immediately after the embed one was
+    // fixed, on the q/k-norm and GDN f32 weights.
+    if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
       auto* buf = new std::vector<float>(std::move(f));
       w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
     } else {

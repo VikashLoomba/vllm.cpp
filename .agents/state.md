@@ -36718,8 +36718,8 @@ any of them is worth building is a roadmap decision the rows now make visible.
 No source, kernel, model, gate, benchmark or capability mark changed.
 
 ## Kimi-Linear-48B-A3B W0 dedicated spike — SPIKE→READY, the one e2e-gateable Kimi text model
-
 <!-- state: 2026-08-05T09:00 -->
+
 
 Wrote the full W0 spike contract for `KimiLinearForCausalLM` (Kimi-Linear-48B-A3B-Instruct),
 `specs/kimi-linear.md`, `CLAIM-KIMI-LINEAR-W0`. CPU-only, records-only: NO build, NO GPU, NO
@@ -37693,8 +37693,8 @@ found. Evidence: local logs `scratchpad/kimi_build_dgx.log` + `kimi_test_dgx.log
 records in spec section 11, model-matrix `MODEL-TEXT-kimi-linear-*`, benchmark record.
 
 ## QUANT-CT-MXFP4 Qwen vehicle: W0 checkpoint + W1 kernel target PINNED; empirical GPU/disk-gated
-
 <!-- state: 2026-08-06T13:15 -->
+
 
 USER re-scope (full MXFP4 at vLLM parity, benchmarked on a Qwen model; DeepSeek/Kimi
 NOT the vehicle). Spike checkpoint on `row/QUANT-CT-MXFP4` (branch off `main`
@@ -37805,8 +37805,8 @@ async input path. Evidence `dgx:~/work/mirror-ab/option-a/`, branch `row/SERVE-A
 OPTION-A`.
 
 ## QUANT-CT-MXFP4 Qwen W0+W1 EMPIRICAL: oracle golden RUNS (Marlin W4A16); FlashInfer W4A4 CRASHES on sm_121
-
 <!-- state: 2026-08-06T13:17 -->
+
 
 Box freed (coordinator); resumed the QUEUED empirical steps under both flock locks,
 mem gate (94-95 GiB free >= 90), tmux + done-markers, oracle alone, single load,
@@ -37881,8 +37881,8 @@ checkpoint retained in the HF cache. Evidence: `dgx:~/kimi-e2e/{oracle_full.log,
 local golden `tests/parity/goldens/kimi_linear_greedy/`.
 
 ## QUANT-CT-MXFP4 W2 native Marlin mxf4 keep-quant LANDS (builds+runs on GB10); e2e RED, bug localized to group_blocks=2 GEMM
-
 <!-- state: 2026-08-06T13:19 -->
+
 
 Coordinator freed the box for W2-W4. Implemented the native MXFP4 (mxfp4-pack-quantized)
 Marlin W4A16 keep-quant path for dense Qwen3, routed through the EXISTING Marlin FP4
@@ -38047,8 +38047,8 @@ this branch, keep `test_kimi_linear_forward` 12/12·614 green, then the full-mod
 (free -g >= 90, monitor, STOP if the pool math does not close in practice).
 
 ## QUANT-CT-MXFP4 W3 unit gate GREEN: MXFP4 GEMM PROVEN correct; e2e residual is NOT the compute
-
 <!-- state: 2026-08-06T13:23 -->
+
 
 Built + ran the owed W3 device unit gate (`test_ops_moe_grouped.cpp`, commit `8469e333`):
 MXFP4 Marlin GEMM vs the INDEPENDENT CPU dequant reference (`DequantMxfp4ToF32` + f32
@@ -38109,8 +38109,8 @@ diverges toward the limit). Row STAYS `ACTIVE`; `VT_KIMI_DEVICE_COMPUTE` default
 the e2e token gate is green.
 
 ## QUANT-CT-MXFP4 e2e RESOLVED: compute CORRECT (async-off 3/4 token-exact); async-default degeneration is a PRE-EXISTING classic-dense-Qwen3 bug
-
 <!-- state: 2026-08-06T13:25 -->
+
 
 Closed the e2e residual. Root-caused via the box-free continuation: the DEFAULT
 (async scheduling ON) degeneration is NOT the MXFP4 compute — with VT_ASYNC_SCHED=0
@@ -39216,7 +39216,6 @@ numerics-delicate) — a kernel rewrite, not a routing/config lever. Full forens
 benchmark record (QUANT-CT-MXFP4-FINAL-STACK). Branch pushed to
 `row/QUANT-CT-MXFP4-FINAL-STACK`; not merged to main.
 
-
 ## 2026-08-06T13:45 - RECORDS REPAIR: future-dated stamps corrected to the evidenced date
 <!-- state: 2026-08-06T13:45 -->
 
@@ -39232,7 +39231,6 @@ were mapped the same way (body cross-references of duplicated stamps map to
 the first occurrence). The DATES are now evidence-true; the intra-day minutes
 on corrected entries are synthetic ordering values, not measured times. No
 cited SHA changed.
-
 
 ## 2026-08-06T14:19 - MiniMax-H3 W-FP4a: fp4-resident Marlin-W4A16 routing (CPU-landed)
 <!-- state: 2026-08-06T14:19 -->
@@ -39275,6 +39273,35 @@ DISK-BLOCKED: NVFP4 working set (DiT + Qwen3-VL-32B NVFP4 encoder + 2 VAEs) is
 render. Comparability: vLLM-Omni CANNOT serve a quantized H3 on one GPU
 (BF16-only in practice; source-audited `a4ea67a2`) -> HW/loader-forced-indirect,
 DeepSeek-GGUF precedent. Draft PR is the claim.
+
+## 2026-08-06T15:05 - BACKEND-CPU Raspberry Pi 5 Cortex-A76 campaign spiked
+<!-- state: 2026-08-06T15:05 -->
+
+Draft PR #65 (`row/BACKEND-CPU`) records the target before implementation:
+Qwen3.5-2B UD-Q8_K_XL, SHA-256
+`a53988df91157d78acaf3c95e22db179d13f6236061bdb86576494dc99b1bc3b`, on
+the four-core Raspberry Pi 5 Cortex-A76. Read-only hardware inspection proved
+ASIMD/FP16/RDM/DotProd and no i8mm, 64 KiB L1D/L1I + 512 KiB L2 per core,
+shared 2 MiB L3, and a real `armv8_cortex_a76` Linux PMU exposing cycles,
+instructions, frontend/backend stalls, branch, TLB and L1/L2/L3/LL-cache
+events. The existing Arm MMLA/repack fast path is therefore inert on this
+target; an SDOT route is a candidate, not yet a result.
+
+The committed leaf spec `.agents/specs/rpi5-cortex-a76-cpu-optimization.md`
+pins the sequence: generalized PMU-backed kernel harness; x86 vLLM/current-CPU
+goldens; portable Pi 16-token bring-up; trace-derived reached-loop inventory;
+C++/NEON/SDOT experiments; assembly only after a measured compiler gap; and
+recursive kernel→op→block→model/serving A/B after every accepted lever. A
+causal PMU improvement may remain in the experimental stack before wall clock
+moves, but no optimized provider becomes default without enclosing-scope
+evidence and no area closes until every lever family has a disposition with
+less than 1% predicted end-to-end residual. Same-file llama.cpp at project pin
+`237ad9b96` is the Pi speed/memory floor; vLLM will not run on the Pi.
+
+No Pi model run, correctness result, throughput number or assembly kernel is
+claimed at this checkpoint. `docs/BENCHMARKS.md` records `PENDING`; the prior
+20-core Arm/i8mm binding result remains intact and explicitly does not transfer.
+Next: R1 harness, then exact-hash model transfer and portable bring-up.
 
 ## 2026-08-06T15:40 - QUANT-CT-MXFP4-FUSED-GLUE W0: the funded glue-fusion-into-Marlin kernel is SOURCE-REFUTED; residual is flash-dominant, not glue
 <!-- state: 2026-08-06T15:40 -->
@@ -39357,6 +39384,7 @@ encoder of `nano_nemotron_vl.py`, which vllm.cpp already carries rows for, so it
 is mirror-vLLM work that is owed anyway). The transducer decode half of
 parakeet.cpp (RNN-T/TDT/CTC search, joint network) is NOT in vLLM and is a
 separate scope call.
+
 ## 2026-08-06T16:05 - MiniMax-H3 W-FP4a GB10 leg: Marlin W4A16 GB10-verified byte-exact; fp4 = memory win; real-checkpoint e2e RUNS but frame is a non-scene patch-grid
 <!-- state: 2026-08-06T16:05 -->
 
@@ -39405,9 +39433,36 @@ green + valid mp4, yet a non-scene). fp4 speed path is CLOSED. Box left clean (G
 idle, locks free, worker down, disk ≥15 G; checkpoint cached for reruns). Benchmark
 record + spec §8 + STATUS/BENCHMARKS/FEATURES + model-matrix/roadmap updated.
 
-## 2026-08-06T16:44 - DOCS-SUPPORTED-MODELS-MATRIX: public per-architecture supported list is now CI-bound to the C++ registry
+## 2026-08-06T16:39 - BACKEND-CPU R1 PMU harness CPU-gated
+<!-- state: 2026-08-06T16:39 -->
 
+`examples/cpu_kernel_bench/main.cpp` adds the review-capped
+`vllm-cpu-kernel-bench` vt-op substrate without changing a production kernel.
+The initial fixture covers `MatmulBTQuant` Q8_0/Q4_K/Q6_K with M/N/K/thread,
+provider, warmup/iteration, hot/L2/L3/stream pressure and text/JSON controls.
+Inputs are deterministic and every timing/counter pass must preserve the same
+FNV checksum. Hot cases calibrate calls per sample until clock-read overhead is
+below 0.1%; cold profiles expose an invalid timing instead of hiding overhead.
+
+Linux counters use `perf_event_open` directly. Generic passes and four
+Cortex-A76 raw groups repeat cycles/instructions alongside stalls, branch,
+L1/L2/LL-cache and TLB events; counts are scaled by enabled/running time and
+each pass reports `ok`, `partial`, `multiplexed`, `unscheduled` or
+`unsupported`. The JSON also records IPC, logical bytes/bandwidth, compiler
+features, CPU/affinity/migration, frequency, governor, temperature and
+Raspberry Pi `get_throttled` output when `vcgencmd` exists.
+
+GCC 15.2 CPU build passed `-Wall -Wextra -Werror`; clang-format is clean;
+CTest `test_cpu_kernel_bench_cli` passed its deterministic JSON-schema,
+invalid-input and structured-counter cases. Direct x86 executions passed at
+1 and 4 threads, including a model-shaped Q8_0 decode fixture, and generic PMU
+groups returned real counts. Those x86 timings are tool validation only and
+are not binding performance evidence. Pi PMU execution, Qwen correctness and
+llama.cpp comparison remain `PENDING`; next is R1-on-Pi, then R2 bring-up.
+
+## 2026-08-06T16:44 - DOCS-SUPPORTED-MODELS-MATRIX: public per-architecture supported list is now CI-bound to the C++ registry
 <!-- state: 2026-08-06T16:44 -->
+
 
 Row `row/DOCS-SUPPORTED-MODELS-MATRIX` (helper worktree, DRAFT PR). USER-directed:
 the public surface must show every supported architecture AND the concrete
@@ -39449,8 +39504,8 @@ HW-infeasible ~1.56 TB). Both marked scaffold in FEATURES.
 the public list bound to the registry going forward.
 
 ## QUANT-CT-MXFP4-FLASH-AUDIT — `-use_fast_math` on the FA2 TUs REJECTED (measured flash regression); the flash decode gap vs vLLM is occupancy/L2-bound, not the SASS instruction count
-
 <!-- state: 2026-08-06T17:38 -->
+
 
 Helper row `QUANT-CT-MXFP4-FLASH-AUDIT` (worktree `row/QUANT-CT-MXFP4-FLASH-AUDIT`,
 draft PR #69, base `origin/main` `4ce9fb74`). Runs the #67-OWED flash audit to a MEASURED
@@ -39482,6 +39537,186 @@ functional code ships. The +450 us/step flash residual is occupancy/L2, NOT the 
 count; NEXT lever = lift flash occupancy above 8.3% (register pressure / `__launch_bounds__`)
 or cut the barrier/smem stalls. No default flip (no throughput win). Full tables in
 `.agents/benchmark-record.md` (QUANT-CT-MXFP4-FLASH-AUDIT) + the spec. Box left clean.
+
+## 2026-08-06T17:45 - BACKEND-CPU R2-R3 portable Pi baseline green
+<!-- state: 2026-08-06T17:45 -->
+
+The CPU-only ARM64 build now runs entirely through local Docker buildx/QEMU;
+the Pi remains execution-only. Ubuntu 24.04/GCC 13.3 built and linked
+`vllm-bench` plus `vllm-cpu-kernel-bench`, and QEMU executed the quantized
+matmul smoke. Exported binaries and the pinned 2.83 GB Q8_K_XL model were
+SHA-256-gated before deployment into `~/vllm-cpp-assembly`.
+
+R2 correctness is GREEN. The Pi generated the exact x86 current-engine golden
+over 16/16 tokens; the token file SHA-256 is
+`684f55a32355c0ccb6ce9c987273981f077b9591a46db07aea68561eb6432966`.
+Portable Q8 operation checksums were exact at one and four threads: decode
+M=1/N=3072/K=2048 `0xd6aec014c0050fda`, prefill M=128
+`0xa89baff1f3a4e360`.
+
+R3's idle, unthrottled 2.4 GHz baseline measured the M=1 fixture at 1,554,115
+ns median / 8.10 GFLOP/s on one core and 742,585 ns / 16.94 GFLOP/s on four;
+the M=128 fixture measured 197,061,735 ns and 49,890,756 ns (3.95x). The
+16-token model arm measured 2.14 output tok/s, TTFT 1,961.99 ms and TPOT/ITL
+366.91 ms. A separate 64-token `perf record -e cycles:u -c 1000000` captured
+241K samples with zero loss: `Bt16Neon` 57.76%, portable
+`VecDotQ8_0Q8_0` 20.10%, thread-ready 6.45%, `F16ToF32` 4.87%.
+
+The real model therefore reaches a material scalar Q8 dot hot spot. Existing
+Arm acceleration requires i8mm, which the A76 lacks; DotProd is available.
+R4/R5 will compare an exact-order C++ SDOT intrinsic against a scheduled
+AAPCS64 implementation in one QEMU-built binary, using the portable checksums,
+PMU fixture and full-model run as recursive gates. No speedup or llama.cpp
+parity is claimed at this checkpoint.
+
+## 2026-08-06T17:50 - KERNEL-CPU-A76-Q8-DOT spiked
+<!-- state: 2026-08-06T17:50 -->
+
+R3's zero-loss physical-Pi trace selects the portable Q8_0 x Q8_0 dot as the
+first assembly candidate: it consumes 20.10% of Qwen3.5-2B user cycles on a
+Cortex-A76 with DotProd but no i8mm. New row `KERNEL-CPU-A76-Q8-DOT` and spike
+`.agents/specs/cpu-a76-q8-dot.md` bind the comparison to three same-binary arms:
+portable scalar, exact-order compiler SDOT, and scheduled AAPCS64 assembly.
+
+The assembly arm is not accepted merely for using SDOT or beating scalar. It
+must beat the C++ intrinsic in physical-Pi cycles and wall time with identical
+operation checksums and model tokens, a proven ABI/disassembly contract, and no
+enclosing Qwen regression. QEMU remains build/smoke-only and source will not be
+compiled on the Pi. No optimized implementation or speed claim exists at this
+spike checkpoint.
+
+## 2026-08-06T17:50 - KERNEL-CPU-A76-Q8-DOT spiked
+<!-- state: 2026-08-06T17:50 -->
+
+R3's zero-loss physical-Pi trace selects the portable Q8_0 x Q8_0 dot as the
+first assembly candidate: it consumes 20.10% of Qwen3.5-2B user cycles on a
+Cortex-A76 with DotProd but no i8mm. New row `KERNEL-CPU-A76-Q8-DOT` and spike
+`.agents/specs/cpu-a76-q8-dot.md` bind the comparison to three same-binary arms:
+portable scalar, exact-order compiler SDOT, and scheduled AAPCS64 assembly.
+
+The assembly arm is not accepted merely for using SDOT or beating scalar. It
+must beat the C++ intrinsic in physical-Pi cycles and wall time with identical
+operation checksums and model tokens, a proven ABI/disassembly contract, and no
+enclosing Qwen regression. QEMU remains build/smoke-only and source will not be
+compiled on the Pi. No optimized implementation or speed claim exists at this
+spike checkpoint.
+
+## 2026-08-06T19:45 - KERNEL-CPU-A76-Q8-DOT R4-R5 assembly win
+<!-- state: 2026-08-06T19:45 -->
+
+`CLAIM-KERNEL-CPU-A76-Q8-DOT` closes W1-W5 and moves the kernel row from
+`SPIKE` to `GATING`. ARM64 was never compiled on the Pi: local buildx/QEMU
+with Ubuntu 24.04/GCC 13.3 built the assembly TU, ran `test_ops_quant_dot`
+20/20 (150,258 assertions) and executed an explicit assembly smoke before
+export. Final binary SHA-256 values are `vllm-bench`
+`9eb57cf3760eaade9dcef03dda1648556577c44199369ad38bf42083efbc70a9`
+and `vllm-cpu-kernel-bench`
+`a94dad30411651901e4f6ed8aaf14efb735e09f0412bb8f8788873fdfd7a6818`.
+
+The implementation keeps the portable Q8_0 dot as the universal fallback,
+adds a GCC/ACLE exact-order SDOT control, and adds an AAPCS64 two-block leaf.
+Linux HWCAP gates DotProd; MIDR implementer `0x41`, part `0xd0b` gates the
+automatic assembly selection. Only `cpu_quant_dot_sdot.cpp` receives
+`-march=armv8.2-a+dotprod+fp16`. Explicit benchmark overrides remain available
+through `VT_CPU_Q8_DOT=portable|sdot|a76-asm`; `auto` selects assembly only on
+Cortex-A76+DotProd and otherwise stays portable.
+
+Final disassembly proves the compiler gap. GCC's 216-byte `VecDotQ8Sdot` has a
+48-byte stack frame and a one-block loop whose two adjacent SDOTs feed one
+dependent accumulator. The 276-byte assembly valid path is a leaf with no
+stack traffic, overlaps two independent `v4`/`v20` block chains, post-indexes
+the 68-byte Q8 pair, uses only caller-saved registers and retains original
+per-block f32 accumulation order. Invalid K/`nrc` tail-branches to the C++
+contract checker.
+
+Physical-Pi evidence is one same-binary interleaved series per shape, seven
+outer repetitions per arm, ondemand up to 2.4 GHz and `throttled=0x0`.
+Assembly versus compiler SDOT medians: M=1/T1 614,414.75 vs 637,738.5 ns
+(**+3.66%**), cycles 1,469,048 vs 1,517,121 and instructions 3,664,537.5 vs
+4,076,185.5; M=128/T1 75,537,409 vs 79,579,829 ns (**+5.08%**); M=128/T4
+19,887,768 vs 20,649,426 ns (**+3.69%**). Retired instructions fall
+9.74-10.24%. The named negative is M=1/T4, 480,210 vs 468,798.25 ns
+(**-2.43%**) and 4.32% more cycles despite 8.77% fewer instructions,
+selecting the threadpool partition as W6
+rather than hiding it.
+
+All portable/compiler/assembly fixture arms are checksum-identical. The three
+64-token Qwen repetitions for each arm are also byte-identical to the x86
+golden SHA-256
+`0ec98eabb23e4148d540fcf79a2fe61678fb90fe462cdf28134af7a42fe6a826`.
+Median assembly versus compiler SDOT: TTFT 1,307.27 vs 1,327.91 ms
+(**1.55% lower**), TPOT 367.67 vs 367.85 ms (0.05% lower, neutral), E2E
+24,470.20 vs 24,502.52 ms (**0.13% lower**). Against portable, assembly
+lowers TTFT 33.40%, E2E 2.67% and raises output throughput 2.75%. A final
+`auto` 16-token run selected assembly, matched the original x86 golden and
+reported TTFT 1,305.62 ms / TPOT 362.63 ms / E2E 6,745.08 ms without
+throttling.
+
+Binding commands, all raw-file SHA-256 values, the four shape tables and
+disassembly excerpts are indexed at
+`docs/bench-evidence/rpi5-a76-q8-dot-20260806.md`. W6 remains open for the
+M=1/T4 scheduler interaction, the still-dominant BF16 GEMM, peak memory,
+concurrency and the same-file Pi llama.cpp floor. No Pi competitor-parity
+claim is made.
+
+## 2026-08-06T19:45 - KERNEL-CPU-A76-Q8-DOT R4-R5 assembly win
+<!-- state: 2026-08-06T19:45 -->
+
+`CLAIM-KERNEL-CPU-A76-Q8-DOT` closes W1-W5 and moves the kernel row from
+`SPIKE` to `GATING`. ARM64 was never compiled on the Pi: local buildx/QEMU
+with Ubuntu 24.04/GCC 13.3 built the assembly TU, ran `test_ops_quant_dot`
+20/20 (150,258 assertions) and executed an explicit assembly smoke before
+export. Final binary SHA-256 values are `vllm-bench`
+`9eb57cf3760eaade9dcef03dda1648556577c44199369ad38bf42083efbc70a9`
+and `vllm-cpu-kernel-bench`
+`a94dad30411651901e4f6ed8aaf14efb735e09f0412bb8f8788873fdfd7a6818`.
+
+The implementation keeps the portable Q8_0 dot as the universal fallback,
+adds a GCC/ACLE exact-order SDOT control, and adds an AAPCS64 two-block leaf.
+Linux HWCAP gates DotProd; MIDR implementer `0x41`, part `0xd0b` gates the
+automatic assembly selection. Only `cpu_quant_dot_sdot.cpp` receives
+`-march=armv8.2-a+dotprod+fp16`. Explicit benchmark overrides remain available
+through `VT_CPU_Q8_DOT=portable|sdot|a76-asm`; `auto` selects assembly only on
+Cortex-A76+DotProd and otherwise stays portable.
+
+Final disassembly proves the compiler gap. GCC's 216-byte `VecDotQ8Sdot` has a
+48-byte stack frame and a one-block loop whose two adjacent SDOTs feed one
+dependent accumulator. The 276-byte assembly valid path is a leaf with no
+stack traffic, overlaps two independent `v4`/`v20` block chains, post-indexes
+the 68-byte Q8 pair, uses only caller-saved registers and retains original
+per-block f32 accumulation order. Invalid K/`nrc` tail-branches to the C++
+contract checker.
+
+Physical-Pi evidence is one same-binary interleaved series per shape, seven
+outer repetitions per arm, ondemand up to 2.4 GHz and `throttled=0x0`.
+Assembly versus compiler SDOT medians: M=1/T1 614,414.75 vs 637,738.5 ns
+(**+3.66%**), cycles 1,469,048 vs 1,517,121 and instructions 3,664,537.5 vs
+4,076,185.5; M=128/T1 75,537,409 vs 79,579,829 ns (**+5.08%**); M=128/T4
+19,887,768 vs 20,649,426 ns (**+3.69%**). Retired instructions fall
+9.74-10.24%. The named negative is M=1/T4, 480,210 vs 468,798.25 ns
+(**-2.43%**) and 4.32% more cycles despite 8.77% fewer instructions,
+selecting the threadpool partition as W6
+rather than hiding it.
+
+All portable/compiler/assembly fixture arms are checksum-identical. The three
+64-token Qwen repetitions for each arm are also byte-identical to the x86
+golden SHA-256
+`0ec98eabb23e4148d540fcf79a2fe61678fb90fe462cdf28134af7a42fe6a826`.
+Median assembly versus compiler SDOT: TTFT 1,307.27 vs 1,327.91 ms
+(**1.55% lower**), TPOT 367.67 vs 367.85 ms (0.05% lower, neutral), E2E
+24,470.20 vs 24,502.52 ms (**0.13% lower**). Against portable, assembly
+lowers TTFT 33.40%, E2E 2.67% and raises output throughput 2.75%. A final
+`auto` 16-token run selected assembly, matched the original x86 golden and
+reported TTFT 1,305.62 ms / TPOT 362.63 ms / E2E 6,745.08 ms without
+throttling.
+
+Binding commands, all raw-file SHA-256 values, the four shape tables and
+disassembly excerpts are indexed at
+`docs/bench-evidence/rpi5-a76-q8-dot-20260806.md`. W6 remains open for the
+M=1/T4 scheduler interaction, the still-dominant BF16 GEMM, peak memory,
+concurrency and the same-file Pi llama.cpp floor. No Pi competitor-parity
+claim is made.
+
 ## 2026-08-06T20:30 - H3 render-coherence ROOT-CAUSED by latent bisection: VAE is FINE (round-trip coherent), the DiT emits a spatially-WHITE latent at real geometry
 <!-- state: 2026-08-06T20:30 -->
 
@@ -39537,6 +39772,7 @@ are committed on the row for the next session. fp4 speed path stays CLOSED.
 Box left clean (GPU idle, both locks free, worker down, ~39 G ckpt cached at
 `dgx:~/h3fp4/ckpt`, diagnostic latents at `dgx:~/h3fp4/diag`). Evidence:
 `dgx:~/h3fp4/{diag,rt_out,out_small,out_cond}`; PR #70.
+
 ## 2026-08-06T20:45 - H3 DiT geometry-ladder gate CLAIMED (row/H3-DIT-SCALE-GATE, helper, DRAFT PR) - pin the #70 spatial-mixing divergence at real token geometry
 <!-- state: 2026-08-06T20:45 -->
 
@@ -39558,6 +39794,7 @@ ladder as a permanent below-one-tile gate. If the ladder does NOT reproduce even
 at 8x8+temporal+mix, record that verdict with data and redirect to the
 device-vs-host diff at ladder geometry. Harness verified: gen script reproduces
 the checked-in goldens byte-identically against the local `~/_git/vllm-omni`.
+
 ## 2026-08-06T20:55 - H3 DiT geometry-ladder BUILT + run: #70 spatial-mixing-math hypothesis REFUTED; the white latent is trained-weights/real-scale, not a reduced-dim DiT bug
 <!-- state: 2026-08-06T20:55 -->
 
@@ -39602,9 +39839,67 @@ real-weights activation diff of the DiT inputs at real geometry is the untested
 surface #70 did not isolate. Pre-existing preflight red
 (check-fusion-consistency minimax_h3_video_vae_device) is NOT this row's.
 
-## 2026-08-06T21:45 - QUANT-CT-MXFP4-FLASH-OCCUPANCY: the owed matched-c8 flash ncu diff - occupancy is IDENTICAL (8.33%), the gap is an irreducible-for-us ptxas SASS-scheduling quality difference (matched vLLM's exact reg+instr, still +10us), NO lever on our stack
+## 2026-08-06 — RPi5 same-file llama.cpp floor measured
+<!-- state: 2026-08-06T21:30 -->
 
+The four-core Cortex-A76 lane now has its independent same-file competitor
+result. Official llama.cpp tag b9892 (`ee445f93d`) was built locally for
+AArch64 under QEMU with GCC 13.3, DotProd+FP16, OpenMP and no accelerator
+backend, then copied to the execution-only Pi. The historical project object
+`237ad9b96` is unavailable from both recorded remotes; b9892's Q8/Arm/repack
+and Qwen3.5 line anchors match the project record exactly, and the binding
+evidence records this reconstruction plus the actual binary SHA.
+
+The vllm.cpp nominal input length 16 tokenized to 17 tokens. Three clean
+vllm.cpp reps and llama.cpp pp17/tg64/pp17+tg64 (three timed samples after
+warmups) were all unthrottled. Medians/means: vllm.cpp prefill 12.81 tok/s,
+decode 2.55 tok/s, output-equivalent E2E 2.46 tok/s, E2E 26,018.39 ms;
+llama.cpp 27.77 / 3.91 / 3.77 tok/s, E2E 16,998.49 ms. Ratios are 0.461x
+prefill and 0.653x decode/E2E, so the Pi speed floor is NOT MET. vllm.cpp wins
+peak RSS, 2.841 vs 3.747 GiB (24.2% less). A separate same-text 64-token greedy
+CLI check is byte-identical after trailing-newline normalization, SHA-256
+`a5a630d7e9774c2300f5dda67a085d43ab1cf9125480c37208ae1c24a2eb25e0`.
+
+An initial `/proc` sampler that forked two `awk` processes every 50 ms is
+explicitly VOID because it inflated load and slowed both arms. Accepted
+throughput ran with no sampler; RSS ran separately with a once-per-second
+shell-builtin `VmHWM` reader. Full commands, samples, pins and raw hashes are
+in `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md`. R6 now owns a measured
+2.17x prefill / 1.53x decode speed gap, with fresh cross-engine profiling and
+the already-dominant BF16 GEMM first; M1/T4 and concurrency remain open.
+
+## 2026-08-06 — RPi5 same-file llama.cpp floor measured
+<!-- state: 2026-08-06T21:30 -->
+
+The four-core Cortex-A76 lane now has its independent same-file competitor
+result. Official llama.cpp tag b9892 (`ee445f93d`) was built locally for
+AArch64 under QEMU with GCC 13.3, DotProd+FP16, OpenMP and no accelerator
+backend, then copied to the execution-only Pi. The historical project object
+`237ad9b96` is unavailable from both recorded remotes; b9892's Q8/Arm/repack
+and Qwen3.5 line anchors match the project record exactly, and the binding
+evidence records this reconstruction plus the actual binary SHA.
+
+The vllm.cpp nominal input length 16 tokenized to 17 tokens. Three clean
+vllm.cpp reps and llama.cpp pp17/tg64/pp17+tg64 (three timed samples after
+warmups) were all unthrottled. Medians/means: vllm.cpp prefill 12.81 tok/s,
+decode 2.55 tok/s, output-equivalent E2E 2.46 tok/s, E2E 26,018.39 ms;
+llama.cpp 27.77 / 3.91 / 3.77 tok/s, E2E 16,998.49 ms. Ratios are 0.461x
+prefill and 0.653x decode/E2E, so the Pi speed floor is NOT MET. vllm.cpp wins
+peak RSS, 2.841 vs 3.747 GiB (24.2% less). A separate same-text 64-token greedy
+CLI check is byte-identical after trailing-newline normalization, SHA-256
+`a5a630d7e9774c2300f5dda67a085d43ab1cf9125480c37208ae1c24a2eb25e0`.
+
+An initial `/proc` sampler that forked two `awk` processes every 50 ms is
+explicitly VOID because it inflated load and slowed both arms. Accepted
+throughput ran with no sampler; RSS ran separately with a once-per-second
+shell-builtin `VmHWM` reader. Full commands, samples, pins and raw hashes are
+in `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md`. R6 now owns a measured
+2.17x prefill / 1.53x decode speed gap, with fresh cross-engine profiling and
+the already-dominant BF16 GEMM first; M1/T4 and concurrency remain open.
+
+## 2026-08-06T21:45 - QUANT-CT-MXFP4-FLASH-OCCUPANCY: the owed matched-c8 flash ncu diff - occupancy is IDENTICAL (8.33%), the gap is an irreducible-for-us ptxas SASS-scheduling quality difference (matched vLLM's exact reg+instr, still +10us), NO lever on our stack
 <!-- state: 2026-08-06T21:45 -->
+
 
 Ran the #69-owed ours-vs-vLLM flash decode ncu diff to a MEASURED verdict on an
 idle box (PR #75, `row/QUANT-CT-MXFP4-FLASH-OCCUPANCY`, base `f7a1e322`).
@@ -39708,9 +40003,10 @@ Box left clean (GPU idle, both locks free, worker down). Evidence:
 
   Next: `VK-A1` (shader-variant pipeline + the feature-matrix drift repair),
   which blocks every shader written after it.
-## 2026-08-06T23:10 - BACKEND-ROCM W0: the AMD skeleton lands UNBUILT and says so - plus the one non-additive platform site the enum change uncovered
 
+## 2026-08-06T23:10 - BACKEND-ROCM W0: the AMD skeleton lands UNBUILT and says so - plus the one non-additive platform site the enum change uncovered
 <!-- state: 2026-08-06T23:10 -->
+
 
 Three contributors offered AMD hardware on [#41](https://github.com/mudler/vllm.cpp/issues/41)
 (gfx1151 Strix Halo, gfx1103 Radeon 780M, 4x gfx1100 7900 XTX). What they lacked
@@ -39838,7 +40134,6 @@ and the encoder vision tower (W3) for clean image/video-conditioned ref2va/fl2va
 a synthetic reference + text-only encoder still grids). dgx assets: `~/h3fp4/ckpt/MiniMax-H3-
 FL2VA-Q3_K_M.gguf`, `~/h3fp4/fl2va_t2va_20/`. Box left clean.
 
-
 ## 2026-08-06 — startup latency becomes a MEASURABLE axis (harness only; no number)
 <!-- state: 2026-08-06T23:55 -->
 
@@ -39880,6 +40175,82 @@ Open: **the number.** dgx.casa root was at 100% (20 GiB free) with no existing
 CUDA `server` build, so the ours arm could not be built. User authorized
 reclaiming the untagged 7.37 GB docker image + 4.4 GB builder cache (NOT the
 stopped `local-ai-worker` container). Run owed: 27B, 3 interleaved repetitions.
+
+## 2026-08-06 — Parakeet/FastConformer encoder kernels P1-P3 land on CPU: Conv2d, non-causal depthwise Conv1d, relative-position attention
+<!-- state: 2026-08-06T23:58 -->
+
+Row `MODEL-AUDIO-PARAKEET-ENCODER`, helper worktree
+`/home/mudler/_git/vllm.cpp-parakeet`, branch
+`row/MODEL-AUDIO-PARAKEET-ENCODER`. Executes work items P1/P2/P3 of the accepted
+spike [parakeet-conformer-encoder](specs/parakeet-conformer-encoder.md). The
+three primitives the spike named as the encoder's blockers are now ordinary
+`vt::` ops on the portable CPU tier, registered through the existing
+`op_provider` seam. No new seam, no existing kernel modified.
+
+- `vt::Conv2d` (`kConv2d`, [cpu_conv2d.cpp](../src/vt/cpu/cpu_conv2d.cpp)) —
+  torch `nn.Conv2d` with groups/stride/padding/dilation, serving all three
+  `ParakeetEncoderSubsamplingConv2D` stages (dense, depthwise, pointwise;
+  transformers 5.3.0 `modeling_parakeet.py:357`, :369-371 / :377-386 / :388).
+  Supersedes the host `std::vector<float>` loop `gemma4_audio.cpp:92`, which
+  stays as an independent reference.
+- `vt::DepthwiseConv1d` (`kDepthwiseConv1d`,
+  [cpu_conv1d_depthwise.cpp](../src/vt/cpu/cpu_conv1d_depthwise.cpp)) — the
+  centre-padded, stateless, activation-free conformer conv
+  (`modeling_parakeet.py:116`, ctor :138-146). A SIBLING of
+  `vt::CausalConv1dFwd`, which is untouched, per the spike's port map.
+- `vt::AttentionRelPos` (`kAttentionRelPos`,
+  [cpu_attn_relpos.cpp](../src/vt/cpu/cpu_attn_relpos.cpp)) — Transformer-XL
+  encoder self-attention, no KV cache, no paging, non-causal
+  (`modeling_parakeet.py:259`, forward :302-347, `_rel_shift` :349-355).
+
+**The `_rel_shift` result is a closed form, and that is the interesting part.**
+Both upstreams materialise a `[T, 2T-1]` matrix, left-pad a column, reinterpret
+as `[2T, T]`, drop a row, reinterpret back and truncate. That whole sequence is
+exactly `shifted(i,j) = raw(i, T-1-i+j)`, because `1 <= T-i+p <= 2T-1` for every
+`i,p in [0,T)`, so the flat index `i*(2T-1)+p+T` always lands in row `i`. The
+kernel indexes `rel_key` by that expression and never allocates the scratch
+matrix. The unit test's reference performs the literal pad/reshape/slice, so
+byte-identity between them is what PROVES the derivation — checked by execution,
+not by reading.
+
+**Gate: byte-identity vs an INDEPENDENT in-test scalar reference**, the
+`test_ops_matmul_elem.cpp` bar, not NMSE. Every output element keeps one f32
+accumulator in a fixed order and the parallel dispatch partitions output rows
+only, so thread-count independence is by construction. CPU x86-64,
+`-DVLLM_CPP_CUDA=OFF`: `test_ops_conv2d` 4 cases / 1631 assertions,
+`test_ops_conv1d_depthwise` 5 / 1184, `test_ops_attn_relpos` 7 / 368; all green.
+Coverage is dtype (f32/f16/bf16, including mixed operands) x shape (ragged
+extents, grouped/dilated/non-square, `L < K`, `T == 1`) x thread count (1/2/4/8).
+
+**Mutation-verified, not just green.** 11 single-line kernel mutations were
+compiled and run: 10 killed (group mapping, stride/dilation axis swap, weight
+base, bias placement, the `_rel_shift` index, the GQA kv-head map, the bias
+row offset, the scale placement, the softmax denominator, the all-masked
+guard). One survived and is a genuine no-op: adding `1e-9f` to a softmax
+denominator of order `T` is below the f32 ulp there; the same mutation at
+`1e-3f` is killed.
+
+Two recorded deviations, both stated in `include/vt/ops.h`: the attention adds
+`bias_u`/`bias_v` in f32 inside the kernel where upstream materialises them in
+the activation dtype (pass `nullptr` + a pre-biased query to reproduce upstream
+rounding exactly), and an all-masked query row yields zeros rather than
+upstream's NaN. The vLLM-native conformer's one arithmetic divergence — scaling
+the summed score rather than the two terms — is an arg (`scale_after_sum`), not
+a choice, so both upstreams have a byte-exact path.
+
+NOT done, deliberately, and owned by P4: the encoder model, the CTC head and
+the mel extractor. NOT done: CUDA providers for the three ops (CPU is the
+deliverable for this row; the ops decline to nothing on kCUDA today). NOT run:
+any GPU regression suite, per the row's CPU-only instruction and the dgx.casa
+hard-reset earlier the same day.
+
+Inherited red gates, untouched and NOT caused here: `check-fusion-consistency`
+(`minimax_h3_video_vae_device` gate-up fold), `check-public-doc-tables`
+(docs/BENCHMARKS.md:316 is a 371-char cell, and docs/STATUS.md was already 645
+chars over its ratchet at this branch point). The missing `<!-- state: -->`
+anchor on the startup-latency entry WAS repaired here, because an append cannot
+be order-checked without it.
+
 ## MiniMax-H3 task/partition GUARD landed — mirror `_resolve_task`'s raise (`row/H3-TASK-PARTITION-GUARD` PR #84, helper, DRAFT PR, CPU-only)
 <!-- state: 2026-08-06T23:59 -->
 
@@ -39917,6 +40288,7 @@ assertions; restored → GREEN. Suite 67/67 (66 prior +1), 46549 assertions; `te
 4/4 (server wiring). No numbers changed (refusal gate, not a perf lever). Records: spec §8.7,
 STATUS/BENCHMARKS H3 rows, benchmark-record, NOW. Pre-existing preflight red
 (check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.
+
 ## 2026-08-07T00:45 - QUANT-CT-MXFP4-FLASH-PTXAS: the ptxas-lineage arbiter = NO; #75's "wheel ptxas SASS-quality" attribution RETIRED - vLLM's flash SASS is driver-JIT'd from CUDA-13.0 PTX, codegen ties across all ptxas AND vs vLLM's own PTX, the +10us gap is ENGINE CONTEXT (row/QUANT-CT-MXFP4-FLASH-PTXAS, helper, PR #82)
 <!-- state: 2026-08-07T00:45 -->
 
@@ -40229,6 +40601,7 @@ this <1 GiB microbench) - run-1 data is on disk and decisive.
 
   Still on the reference tier: quant, MoE, GDN/MLA, the rotary TABLE build and
   every sampler beyond greedy argmax.
+
 ## 2026-08-07T01:45 - MiniMax-H3 encoder VISION TOWER — record reconciled + real-weights loader wired (row/H3-CONDITIONED-E2E, helper, DRAFT PR)
 <!-- state: 2026-08-07T01:45 -->
 
@@ -40278,6 +40651,7 @@ into the DEVICE text tower changing the frames) needs the exact deepstack indexe
 device-text DeepStack/merge extension + an on-box GPU render; recorded in the benchmark record.
 Records: spec §8.8, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Pre-existing
 preflight red (check-fusion-consistency `minimax_h3_video_vae_device`) is not this row.
+
 ## 2026-08-07T03:20 - MiniMax-H3 vision tower GB10-VERIFIED on real weights; fl2va COHERENT, ref2va STILL GRIDS (row/H3-CONDITIONED-E2E, helper, PR #86)
 <!-- state: 2026-08-07T03:20 -->
 
@@ -40401,8 +40775,8 @@ Box left clean (renders exited, GPU idle, gpu.lock released, worker stays parked
 ckpts kept). Records: spec §8.9 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW.
 
 ## 2026-08-07T04:15 - `/v1/videos` speaks OpenAI's Sora WIRE SHAPE, plus the MP4 content route
-
 <!-- state: 2026-08-07T04:15 -->
+
 
 Row `SERVE-VIDEOS-OAI`, claim `CLAIM-SERVE-VIDEOS-OAI`, branch
 `row/SERVE-VIDEOS-OAI`. Developer-directed: an unmodified OpenAI client must work
@@ -40503,8 +40877,8 @@ weakening, and gated as such: a new test asserts that a merge naming no row
 anywhere (and a plain local `Merge branch 'wip'`) STILL fails. Suite 40/40.
 
 ## 2026-08-07T04:40 - reference CONDITIONING over `/v1/videos`: `input_reference` -> fl2va, `metadata` -> ref2va
-
 <!-- state: 2026-08-07T04:40 -->
+
 
 Row `SERVE-VIDEOS-REFS`, claim `CLAIM-SERVE-VIDEOS-REFS`, branch
 `row/SERVE-VIDEOS-REFS`, STACKED on `SERVE-VIDEOS-OAI`. That row made an OpenAI
@@ -40577,6 +40951,7 @@ the pipeline is the failure that looks like it worked), and an illegal pair is a
 video reference is a frame DIRECTORY; OpenAI's real `input_reference` upload is
 multipart, ours is the JSON spelling; the real-weights leg rides the H3 GB10/disk
 window.
+
 ## 2026-08-07T05:30 - MiniMax-H3 ref2va assembly bug FIXED + gated; render grid RE-ATTRIBUTED to the ref2va NVFP4 CHECKPOINT (NOT the assembly) (row/H3-REF2VA-ASSEMBLY, helper, PR #93)
 <!-- state: 2026-08-07T05:30 -->
 
@@ -40625,8 +41000,8 @@ regardless; box left clean (renders exited, gpu.lock released, worker stays park
 spec §8.10 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW.
 
 ## 2026-08-07T05:35 - MiniMax-H3: half of every video was being discarded (audio duration), plus the user-facing docs the lane never had
-
 <!-- state: 2026-08-07T05:35 -->
+
 
 Branch `fix/h3-audio-duration-and-readme` (PR #68). Found by RENDERING, not by
 the suite.
@@ -40716,7 +41091,6 @@ nibble, fp4, or free-gen. fp4-resident Marlin arm grids differently again (3rd, 
 wiring-gated). NEXT: layer-by-layer activation diff of the NVFP4-bf16 stream vs the GGUF-bf16 stream
 (identical weights; differ only in dequant source + island read bf16-disk vs f16-disk). Records: spec
 §8.11 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW. Box left clean.
-
 
 ## 2026-08-07 — startup latency MEASURED (provisional): 36.51 s vs vLLM 221.51 s = 6.07x
 <!-- state: 2026-08-07T05:35 -->
@@ -40965,6 +41339,96 @@ question is UNBLOCKED, not answered.
 
 Next: `row/H3-BF16-SHARDED-STREAM` (device streamer), then the operator runs the real
 13-shard bf16 DiT.
+
+## 2026-08-07 — Parakeet/FastConformer P4 lands on CPU: the encoder, the CTC head, greedy collapse, the log-mel front end and an HF-safetensors loader
+<!-- state: 2026-08-07T10:00 -->
+
+
+Row `MODEL-AUDIO-PARAKEET-ENCODER` (NEW), claim `CLAIM-PARAKEET-MODEL-P4`,
+helper worktree `/home/mudler/_git/vllm.cpp-parakeet`, branch
+`row/MODEL-AUDIO-PARAKEET-ENCODER`, base `1ace9e27`. Work item P4 of the
+accepted spike
+[parakeet-conformer-encoder](specs/parakeet-conformer-encoder.md), CPU tier
+only, CTC only.
+
+**What landed.** `ParakeetEncoderForward` and `ParakeetForCTCForward`
+(`include/vllm/model_executor/models/parakeet_encoder.h`,
+`src/vllm/model_executor/models/parakeet_encoder.cpp`), the HF-format
+safetensors loader (`parakeet_weights.cpp`), and the log-mel front end
+(`include/vllm/multimodal/parakeet_audio_processor.h`,
+`src/vllm/multimodal/parakeet_audio_processor.cpp`). The forward composes the
+three P1-P3 kernels — `vt::Conv2d` for the subsampling stack, `vt::DepthwiseConv1d`
+for the conformer convolution module, `vt::AttentionRelPos` for the
+Transformer-XL self-attention — with `vt::MatmulBT`/`vt::Add`/`vt::LayerNorm`/
+`vt::Relu` for everything else, and explicit host loops (each individually
+cited) for the leftovers vt has no standalone op for: SiLU, GLU, the eval-time
+BatchNorm1d affine, the conformer 0.5 residual scaling and the two transposes.
+f32 end to end, which is the dtype the HF reference runs at.
+
+**The mirror source is HF, and that is the deviation.** vLLM does NOT implement
+this encoder: `vllm/model_executor/models/parakeet.py:14,61` imports and
+instantiates `transformers.ParakeetEncoder` as the audio component of
+`nano_nemotron_vl.py`. Every ported file therefore cites transformers 5.3.0
+`modeling_parakeet.py`, recorded as `.agents/porting-inventory.md` §9 item 12.
+The vLLM-native halves are mirrored where they exist — the front end follows
+`ParakeetExtractor:138` and `ExtractorConfig:41`.
+
+**Traced, not read.** `ParakeetEncoderAttention` picks its path at runtime
+(`:306-308`). A torch run of the oracle shows the path that ACTUALLY executes is
+`sdpa`, which returns exactly ZERO for a fully-masked query row where `eager`
+returns NaN. That is the behaviour `vt::AttentionRelPos` already documents, so
+the forward reproduces the traced observable rather than the source's apparent
+one; the fixture manifest records the implementation and the test asserts it.
+
+**Gates, all CPU x86-64, `-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`.**
+`test_parakeet_encoder` 7 cases / 543 assertions against an INDEPENDENT in-test
+double-precision reference written from the upstream definition, which performs
+`_rel_shift` LITERALLY (pad a column, reinterpret as [2T,T], drop the first row,
+reinterpret) rather than the closed form the kernel uses — encoder rel-L2 1.9e-7
+to 2.4e-7 across four frame/valid-length shapes, CTC logits 2.0e-7, greedy and
+collapsed token ids EXACT. `test_parakeet_ctc_engine` 2 / 12485 against a dumped
+HuggingFace `ParakeetForCTC` oracle, stage by stage over the FULL padded extent
+(subsampling, layer0 ff1/attn/conv, block0, block1, last_hidden_state, logits,
+every one rel-L2 <= 3.5e-7), with greedy and collapsed ids EXACT on a
+full-length AND a padded batch item. `test_parakeet_audio_processor` 6 / 41054:
+the mel bank is BIT-IDENTICAL (rel-L2 0) to a dump of transformers
+`mel_filter_bank`, within 1.9e-9 of librosa's float32 bank, and the full log-mel
+is rel-L2 4.9e-6 vs `ParakeetFeatureExtractor`.
+
+**Mutation-verified.** 20 single-line mutations were compiled and run across the
+two source files — dropped conv padding mask, dropped fully-masked attention
+rows, swapped `bias_u`/`bias_v`, dropped input scale, sin/cos collapse in the
+position table, dropped pointwise subsampling mask, 0.5 -> 1.0 macaron residual,
+collapse-order inversion, dropped BatchNorm affine and mean, GLU without the
+sigmoid, subsampling flatten order, argmax tie direction, dropped preemphasis,
+periodic Hann, biased variance, uncentred window, dropped slaney norm, changed
+log guard. **20 killed, 0 survivors.** The argmax tie mutant needed a targeted
+case (a zeroed CTC head makes every logit equal, so the tie direction becomes
+observable); random logits never tie.
+
+**NOT verified, stated plainly.** No pretrained `nvidia/parakeet-*` checkpoint
+was downloaded: AGENTS.md's safe defaults forbid pulling large assets without
+the developer saying so, `.env`/`developer-preferences.md` are both absent here,
+and the smallest HF-format CTC checkpoint (`nvidia/parakeet-ctc-0.6b`) is a
+2.4 GB `model.safetensors` on a box at 92% disk shared with other sessions. So
+the oracle is a seeded, RANDOMLY-INITIALISED `ParakeetForCTC` and **no
+transcript is claimed anywhere**; the pretrained arm exists, is one env var away
+(`VLLM_PARAKEET_CKPT`), and SKIPS rather than silently passing. Also NOT run:
+any GPU regression suite or CUDA test (the three ops still have no CUDA
+provider, and dgx.casa was down), aarch64, and any speed or memory measurement —
+no number is measured, claimed or owed for this row.
+
+**Out of scope by spike decision:** RNN-T / TDT transducer decode. It has no
+upstream in either vLLM or HF, so it stays a product call and `parakeet.cpp`
+keeps it.
+
+Inherited red gates, untouched and NOT caused here (both verified present at the
+branch point by running the checkers' pure functions over the base files):
+`check-fusion-consistency` (`minimax_h3_video_vae_device`) and
+`check-public-doc-tables` (docs/BENCHMARKS.md:316 is a 371-char cell owned by
+another row, and docs/STATUS.md was already 645 chars over its ratchet). This
+change NET-SHRINKS docs/STATUS.md and .agents/NOW.md rather than growing either.
+
 ## 2026-08-07T12:30 — Kimi-Linear: per-channel-decay KDA device kernel `vt::KdaGatedDeltaRule` LANDED (the §14 STRICT+speed residual, one object)
 <!-- state: 2026-08-07T12:30 -->
 KIMI-KDA-DEVICE-KERNEL (`row/KIMI-KDA-DEVICE-KERNEL`, helper) — the §14 named residual ("`vt::GdnDecode`/
@@ -41060,6 +41524,7 @@ is required") is now IMPLEMENTED as the additive device op `vt::KdaGatedDeltaRul
   dgx gained `glslc`, `glslang-tools`, `libvulkan-dev`, `spirv-headers` (apt) and
   a source-built shaderc at `/tmp/shaderc`; llama.cpp at the pin is unpacked at
   `~/lcpp-vk` with `build-vk/bin/llama-bench` ready.
+
 ## 2026-08-07T12:35 — Kimi-Linear: device NoPE-MLA attention lever `VT_KIMI_DEVICE_MLA` MEASURED-NEGATIVE (122→109/128, slower); STRICT owes the ACTUAL FA2/chunk_kda kernels (row/KIMI-STRICT-CLOSE, #107)
 <!-- state: 2026-08-07T12:35 -->
 - The §15 residual (d) — the 7 NoPE-MLA layers still run a host f64 softmax island; closing p7 needs
@@ -41122,6 +41587,7 @@ pinned-config record.
   high util is an OOM-reboot trigger; ONE attempt, record honestly if it OOMs). Recorded in §17.5.
 - No GPU work this session (pure authoring); box untouched, `local-ai-worker` left as-is. No STRICT
   claimed. Branch `row/KIMI-CHUNK-KDA-AOT` off `origin/main` @ `ea89926f`; DRAFT PR opened.
+
 ## 2026-08-07T13:10 - H3: the ORIGINAL bf16 DiT now STREAMS to the device - one tensor at a time, zero host buffer for the bulk (row/H3-BF16-SHARDED-STREAM, CPU-only)
 <!-- state: 2026-08-07T13:10 -->
 
@@ -41180,8 +41646,8 @@ Next: the operator runs the real 13-shard bf16 DiT and answers the quantization
 quality question; nothing here claims it.
 
 ## 2026-08-07T13:30 - H3: the bf16 TEXT ENCODER (14 shards, 63 GB) LOADS + `--encoder-only`, so the Q4_K_M conditioning question is measurable (row/H3-ENC-BF16-COND-DIFF)
-
 <!-- state: 2026-08-07T13:30 -->
+
 
 `row/H3-ENC-BF16-COND-DIFF` (helper, branched from `origin/main` `ad231615`, with
 §8.13's `MiniMaxH3ShardedCheckpoint` (landed separately as `row/H3-BF16-SHARDED-DIT` + `row/H3-BF16-SHARDED-STREAM`)
@@ -41247,8 +41713,8 @@ Thor GPU and diff the `[tokens, 5120]` conditioning (max|diff|, RMS, relative RM
 per-token cosine). Numbers land in the same row.
 
 ## 2026-08-07T13:40 - H3 THE NUMBER: Q4_K_M encoder moves the conditioning as much as a ONE-WORD prompt edit, but DIFFUSELY (row/H3-ENC-BF16-COND-DIFF, Thor)
-
 <!-- state: 2026-08-07T13:40 -->
+
 
 The measurement the loader existed for. Full tables:
 [benchmark-record.md](benchmark-record.md) and
@@ -41433,3 +41899,1371 @@ Also repaired: the `2026-08-06 startup latency` state entry was missing its
 reports `minimax_h3_video_vae_device` gemm-merge drift. That is the H3 row's
 fold-or-allowlist decision and it was already failing on unmodified `main` at
 `1e4d159b`; it is not weakened, worked around, or allowlisted here.
+
+## Kimi-Linear paged-incremental decode LANDS the 5× speed win (4.23→18.9 tok/s, 0.90× vLLM); Gate A token-identical; STRICT not reached (p7 intrinsic near-tie); decode 90% cuBLAS-GEMV-parity (2026-08-07, `row/KIMI-PAGED-INCREMENTAL`, PR #113)
+<!-- state: 2026-08-07T17:00 -->
+The §18 named lever (e) is BUILT + MEASURED. `KimiDecodeCache` + `ForwardPrefillIncremental` /
+`ForwardDecodeStepIncremental` (`kimi_linear.h`, `kimi_linear_device.cpp`): prefill-once (KDA recurrent+
+conv state carried via `vt::KdaGatedDeltaRule` state in/out + `vt::CausalConv1dFwd` tap carry; NoPE-MLA
+latent-KV cached) then recurrent decode-step. MIRRORS vLLM `kimi_gdn_linear_attn._forward` (prefill=
+`chunk_kda_with_fused_gate` output_final_state / decode=`fused_recurrent_kda` initial_state) @ `vllm-src`
+`a4e3cb4`; divergences deliberate (host state vs paged slot cache; materialized-MHA MLA vs paged-FA2 —
+both named residuals). Harness `--incremental`; commit `f9ba4a9c` off `origin/main` `68b394bc`.
+
+- **CPU byte-exact state-carry gate GREEN** (Laguna W6 pattern): `test_kimi_linear_forward` **15/15·875**
+  (NEW case l: carried decode == fresh full-recompute byte-identical + greedy-identical, 50 assertions).
+  CUDA binary: 15/15·875 + `test_ops_kda_recurrence` 4/4·8 + `test_ops_kda_chunk_prefill` 2/2·4.
+- **GB10 MEASURED** (single-load/config, flock, drop_caches, min-avail 18-21 GiB, NO reboot; §12 golden
+  md5 `bfa5bdbf…`): recompute 122/128 @ 4.23 tok/s (reproduces #111); incremental+recurrence 120/128 @
+  16.63; **incremental+chunk-prefill 122/128 @ 18.87/19.03 tok/s (2 runs)**.
+- **SPEED = the win:** 18.9 tok/s = **4.5× over recompute, 0.90× of vLLM ~21** (5× gap 0.20×→0.90×).
+- **Gate A PASS (chunk config):** token-identical to recompute across all 128 (p7 `got` byte-exact). The
+  recurrence config flips ONLY p7 (10→8/16) — GPU projection-GEMM tiling near-tie, not a bug (CPU byte-exact).
+- **Gate B STRICT NOT reached (122/128):** chunk-prefill (vLLM prompt order) reproduces recompute EXACTLY,
+  does NOT close p7 — HONESTLY REFUTES the #111 "right vehicle closes p7" hypothesis; p7 is intrinsic
+  (§13/§14: f32-accurate vs the golden's bf16 top-1 at a comma).
+- **Decode decomposition (nsys, ours, 99 steps):** ~90% = the SAME cuBLAS `internal::gemvx::kernel`
+  vLLM uses (batch-1 GEMV parity); CastBf16 3%, KdaScanKernel 2.3% (decode=recurrent ✓), MoE glue 2.3%,
+  convs 0.7%; chunk kernels 20 inst = prefill-only (prefill=chunk/decode=recurrent IN VIVO). **Killing
+  O(n²) ALONE reaches parity-class; no lever load-bearing beyond it** — residual = ~15% host-orchestration
+  idle + 3% CastBf16 (a bf16 residual stream = ALSO the p7-STRICT lever). **vLLM-live-nsys @0.82 NOT run:
+  box-safety violation** (95-98 GiB reservation + nsys → below the 15 GiB LIFE-CRITICAL floor).
+- **Default:** `--incremental` opt-in; `VT_KIMI_DEVICE_KDA`/`_CHUNK` STAY OFF (≠ STRICT). Row STAYS
+  ACTIVE. Next: bf16 residual stream (closes 3% CastBf16 + island round-trips AND the p7 near-tie) +
+  paged-FA2 MLA decode. `local-ai-worker` parked during GPU, RESTORED at end. PR #113.
+
+## 2026-08-07: Parakeet P6: the RNN-T and TDT transducer heads land on CPU, and the "no upstream" record is CORRECTED
+<!-- state: 2026-08-07T18:00 -->
+
+Row `MODEL-AUDIO-PARAKEET-TRANSDUCER` (NEW), claim
+`CLAIM-PARAKEET-MODEL-P4`, worktree `/home/mudler/_git/vllm.cpp-parakeet`,
+branch `row/MODEL-AUDIO-PARAKEET-ENCODER`, work item P6 of the spike
+[parakeet-conformer-encoder](specs/parakeet-conformer-encoder.md). CPU only,
+additive.
+
+**The correction first, because it is the reason this row exists.** P4 recorded,
+in the spike, in `include/vllm/model_executor/models/parakeet_encoder.h`, in
+`model-matrix.md` and in the parity ledger, that the RNN-T / TDT transducer had
+"NO upstream in either vLLM or HF transformers" and was therefore a PRODUCT call
+rather than mirror work. The grep behind that was run against the transformers
+INSTALLED on the box, 5.3.0, which ships only `ParakeetForCTC`. It is false of
+upstream: transformers `main` implements the whole stack -
+`ParakeetRNNTDecoder:831`, `ParakeetRNNTJointNetwork:879`, `ParakeetForRNNT:922`,
+`ParakeetTDTJointNetwork:1035`, `ParakeetForTDT:1052` in `modeling_parakeet.py`,
+plus `ParakeetRNNTDecoderCache:23`, `ParakeetRNNTGenerationMixin:125` and
+`ParakeetTDTGenerationMixin:271` in `generation_parakeet.py` and
+`ParakeetRNNTConfig:136` / `ParakeetTDTConfig:188` in
+`configuration_parakeet.py`. The transducer was never a product call; it was
+mirror work behind a stale version check. **Method rule this earns: a grep
+against the installed package is not evidence about upstream. State the version
+you measured, and check `main` before recording anything as unmirrored.**
+
+**What landed.** `include/vllm/model_executor/models/parakeet_transducer.h` +
+`src/vllm/model_executor/models/parakeet_transducer.cpp`: the LSTM prediction
+network (embedding -> stacked `nn.LSTM` cell with BOTH torch bias vectors ->
+decoder projector) carrying `ParakeetRNNTDecoderCache`'s blank fast path, where a
+blank input returns the cached output and advances neither the hidden nor the
+cell state; the joint `head(relu(encoder_projected + decoder))`, widened by
+`len(durations)` for TDT; and the greedy transducer loop with the RNN-T
+`max_symbols_per_step` forced advance, the TDT duration-driven frame skip and its
+blank-with-zero-duration guard, the clamped encoder gather, and the
+`max_symbols_per_step * frames` output bound. The transducer half of
+`src/vllm/model_executor/models/parakeet_weights.cpp` loads
+`encoder_projector.*`, `decoder.embedding.*`, `decoder.lstm.{weight,bias}_{ih,hh}_l*`,
+`decoder.decoder_projector.*` and `joint.head.*`, reusing the P4 encoder key map
+through a new shared `LoadEncoder` helper.
+
+**Gates, all CPU x86-64 `-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`.**
+`tests/vllm/models/test_parakeet_transducer.cpp`, 3 cases / 777 assertions:
+the LSTM cell against an INDEPENDENT in-test scalar reference (gates sliced out
+first, then the recurrence: a different loop structure and accumulation order
+from the port's fused row walk) over 5 shapes x bias/no-bias x 6 sequential
+steps; decoder and joint tensors rel-L2 <= 1.2e-7 against a dumped HF oracle over
+a fixed token walk chosen to drive the blank fast path; and **the emitted
+sequence and the per-step durations EXACT** for both `ParakeetForRNNT` and
+`ParakeetForTDT`, from the oracle's own projected encoder output AND end to end
+from mel features. The fixture asserts its own branch coverage: blank
+emissions, non-blank emissions, tokens held at one frame, RNN-T forced advances -
+so a regeneration that degenerated to a single branch fails instead of gating
+nothing quietly. The TDT case additionally exercises the `max_length` bound
+(48 steps at `max_symbols_per_step` 3 x 16 encoder frames).
+
+**TRACED, not read (T0).** `ParakeetRNNTDecoderCache` is not a `past_key_values`
+cache, so the base `prepare_inputs_for_generation` slicing rules do not visibly
+apply and the per-step decoder input shape cannot be read off the source with
+confidence. A forward hook over a full `generate()` run records that EVERY
+decoder call took `input_ids` of shape `[1, 1]`. That trace is in the fixture
+manifest and the gate asserts it, because the whole greedy loop rests on it.
+
+**PRETRAINED, and this is the binding claim.** `nvidia/parakeet-rnnt-0.6b` and
+`nvidia/parakeet-tdt-0.6b-v3` were downloaded and run. Our emitted token ids are
+EXACT against a real HF `generate()` run on the LibriSpeech clip
+`1089-134686-0000.wav`, both through the reference's own `input_features` and end
+to end through our own WAV reader and log-mel front end. Transcripts:
+CTC/RNN-T (vocab 1025) "he hoped there would be stew for dinner turnips and
+carrots and bruised potatoes and fat mutton pieces to be ladled out in thick
+peppered flour fattened sauce"; TDT-v3 (vocab 8193, punctuation and casing)
+"He hoped there would be stew for dinner, turnips and carrots and bruised
+potatoes, and fat mutton pieces to be ladled out in thick, peppered, flour
+fattened sauce." `nvidia/parakeet-ctc-1.1b` was also verified on the EXISTING P4
+loader with no code change (identical architecture at 42 encoder layers instead
+of 24), producing the same transcript as ctc-0.6b; it was deleted immediately
+after, since the box is shared and was at 98% disk.
+
+**`examples/parakeet_transcribe`** now dispatches on `model_type` in config.json
+(`parakeet_ctc` / `parakeet_rnnt` / `parakeet_tdt`), drives the extractor from the
+checkpoint's own `num_mel_bins` (80 on CTC/RNN-T, 128 on tdt-0.6b-v3) and prints
+DECODED TEXT as well as ids, implementing the `Metaspace` decoder rule directly
+rather than weakening `Tokenizer::FromHfJson`'s deliberate `split: true` refusal,
+which is an encode-side guard this example never needs.
+
+**Checkpoint reach, recorded in the spike.** The HF-safetensors models are in
+(ctc-0.6b, ctc-1.1b, rnnt-0.6b, rnnt-1.1b by construction, tdt-0.6b-v3). The
+`.nemo`-only ones are out until converted: `parakeet-tdt-0.6b-v2` and
+`parakeet-tdt-1.1b` are plain TDT and upstream's own
+`src/transformers/models/parakeet/convert_nemo_to_hf.py` covers them, but the
+`tdt_ctc` hybrids lose their aux CTC head (no hybrid HF class; the converter's
+CTC regex does not match `ctc_decoder.decoder_layers.0.*`) and
+`parakeet_realtime_eou_120m-v1` would convert to a SILENTLY WRONG model, because
+`convert_encoder_config` ignores `att_context_size`, `att_context_style`,
+`causal_downsampling`, `conv_context_size` and `conv_norm_type` and
+`ParakeetEncoderConfig` has no field for any of them. We are NOT writing a
+`.nemo` reader: the pickle/zip part is small, but it would also owe an OmegaConf
+YAML parser and a reimplementation of NeMo's `setup_streaming_params()`
+derivation.
+
+**NOT verified.** No GPU path (the three P1-P3 ops still have no CUDA provider
+and no GPU suite was run), no aarch64, and no speed or memory number measured,
+claimed or owed. No mutation run for the transducer sources this session.
+
+**Doc budgets.** `docs/STATUS.md` had ZERO headroom against its 284067-char
+ratchet, so the Parakeet line was TIGHTENED while gaining the RNN-T/TDT coverage
+and two more verified checkpoints; the page NET-SHRINKS to 284063 and the ratchet
+was LOWERED to match. `check-agent-record.py`'s MODEL row count goes 360 -> 361
+because a genuinely new row exists.
+- **2026-08-07 (later)** — **`VK-E` UNBLOCKED and the denominator is now a FAIR one;
+  ours deliberately quoted as NO RATIO (`CLAIM-VULKAN-FULL-1`).**
+
+  The blocker recorded earlier ("no model on dgx loads in both engines") is
+  resolved WITHOUT needing `VK-D`: the stock `Qwen/Qwen3-0.6B` snapshot was
+  converted to GGUF with **llama.cpp's own** `convert_hf_to_gguf.py`, so llama.cpp
+  runs the GGUF and vllm.cpp runs the safetensors it came from — **byte-identical
+  weights by construction**, which is what makes the pairing falsifiable instead
+  of merely same-named.
+
+  **llama.cpp Vulkan, `NV_coopmat2`, Qwen3-0.6B F16 (1.40 GiB, 751.63 M):
+  pp128 11,514.16 ± 388.21 t/s, tg32 160.91 ± 1.54 t/s.** Consistent with the
+  finetune-GGUF run (11,730 / 161.4), which sanity-checks the measurement.
+
+  **vllm.cpp SELECTS Vulkan** (`[vt reference-tier] op=… device=3`, device 3 =
+  `kVULKAN`) **and is orders of magnitude slower** — a 4-prompt/128-in/32-out run
+  did not finish in 900 s against llama.cpp's seconds. Expected, not a defect:
+  **71 of 87 ops run on the portable CPU reference tier**, so this measures our
+  HOST FALLBACK wearing a Vulkan label. The tier announces itself per op, which is
+  why the slowness is attributable rather than mysterious.
+
+  **★ NO RATIO IS QUOTED, deliberately.** A number here would be read as "our
+  Vulkan vs their Vulkan" when it is "our CPU tier vs their Vulkan". It becomes
+  meaningful when native coverage closes; the progress metric is
+  `vt::GetReferenceTierHits()` reaching 0, and for THIS model the remaining ops are
+  the RoPE table build, the sampler tail, and the residual norm/glue set.
+
+  Toolchain note: the converter needs `transformers`+`gguf`+`torch` and no single
+  interpreter on dgx had all three (oracle venv has transformers, not gguf; system
+  python has gguf+torch, not transformers). Solved with **zero installs and zero
+  disk** via `PYTHONPATH=~/venvs/vllm-oracle/lib/python3.12/site-packages` into the
+  system python. The oracle venv was deliberately NOT pip-installed into — it is
+  the parity oracle and was expensive to repair.
+
+- **2026-08-07 (correction)** — **`VK-E`: the vllm.cpp Vulkan arm is GPU-BOUND, not
+  CPU-bound. My previous entry's attribution was WRONG.**
+
+  Measured mid-run (`vllm-bench`, Qwen3-0.6B, 1 prompt / 32 in / 8 out, 26 min
+  elapsed): **process CPU 1.6 %, GPU utilisation 96 %**, and `nvidia-smi
+  --query-compute-apps` shows our PID as the ONLY GPU compute app at 2,066 MiB. A
+  run pinned on the portable CPU reference tier would show the opposite — CPU
+  saturated, GPU idle.
+
+  A second assumption also failed: the weights are **BF16** (all 311 tensors), so
+  the coopmat dtype precondition is satisfiable; this is not "f16 model, coopmat
+  ineligible".
+
+  **The real cause is UNMEASURED and deliberately not replaced with another
+  guess.** Candidates in test order: (1) **per-op synchronous dispatch** —
+  `Dispatch` records, submits and fence-waits for EVERY op, the W0 skeleton's
+  documented "correct, not fast" design, and `VK-A2` (async submission +
+  command-buffer reuse) was scoped as "the single biggest speed lever" and NEVER
+  BUILT; (2) the naive scalar GEMM at call sites where coopmat's K%16 or dtype
+  precondition fails; (3) paged attention's sequential key walk.
+  `GetReferenceTierHits()` plus the provider counters separate (1)-(3), and
+  `VT_VULKAN_COOPMAT=0` isolates (2).
+
+  **Lesson: "we know why it is slow" is a claim like any other.** The 16/87
+  op-coverage figure made the CPU-tier story feel obvious enough to write into the
+  record without checking `top`, and it was wrong. The op count says what COULD be
+  slow, not what IS.
+
+- **2026-08-07 (attribution MEASURED)** — **The Vulkan e2e bottleneck is PER-OP
+  SYNCHRONOUS DISPATCH. Both of my earlier explanations were wrong.**
+
+  Prompted by the right question — "26 minutes for 1 prompt is a lot, are we sure
+  it's all right?" — because that number is not merely slow, it is
+  ~1000x more than any kernel inefficiency can explain.
+
+  **Arithmetic first.** Qwen3-0.6B is ~0.6 B params → ~1.2 GFLOP per token
+  position; 40 positions plus lm_head ≈ **48-60 GFLOP**. Our NAIVE scalar Vulkan
+  GEMM measures **52 GFLOP/s**. So even entirely on the slow kernel the compute is
+  **1-2 SECONDS** against ~34 minutes of wall clock. The kernels cannot be the
+  story.
+
+  **Measured.** `gdb -p` stack samples: **6 of 6** in `poll()` inside the NVIDIA
+  driver, called from `VulkanContext::Dispatch`, under
+  `ForwardLayers → MatmulGeneric<true>`. `/proc/<pid>/status`: 202,770 → 203,730
+  voluntary context switches in 10 s = **~96 blocking waits/second**. Process CPU
+  1.6 %. So the run is neither hung nor computing — it is WAITING, ~99 % of the
+  time.
+
+  **`Dispatch` records, submits and FENCE-WAITS for every single op** — the W0
+  skeleton's documented "correct, not fast" design. The GPU's 96 % "utilisation"
+  is the driver context being resident while we poll, not compute saturation;
+  on Tegra/GB10 that counter cannot separate the two, which is exactly how it
+  misled me into the GPU-bound reading after the CPU-tier reading.
+
+  **Two wrong claims retired, in order:** (1) "it is the CPU reference tier,
+  71/87 ops" — refuted by CPU 1.6 %; (2) "it is GPU-bound" — technically true of
+  the utilisation counter, false as an attribution, since the GPU is idle-waiting
+  inside our own fence. Op coverage is a real limitation but is NOT what makes
+  this workload slow.
+
+  **Roadmap consequence.** `VK-A2` (async submission + command-buffer reuse,
+  `SupportsGraphCapture()` via pre-recorded `VkCommandBuffer`) was scoped in the
+  campaign spec as "the single biggest speed lever", deferred, and is now the
+  MEASURED bottleneck. It outranks further native-kernel work for anything
+  end-to-end: every additional native op would still pay a ~10 ms round trip.
+
+- **2026-08-07 (VK-E close-out)** — **The minimal workload ALSO never completed, so
+  there is NO vllm.cpp Vulkan e2e number at all — and a SECOND anomaly is open.**
+
+  1 prompt / 32 in / 8 out hit its 2400 s timeout with no result line, after the
+  earlier 4-prompt run hit 900 s. So VK-E has llama.cpp's denominator and **nothing
+  on our side, not even a slow figure**.
+
+  **The dispatch COUNT does not add up, separately from the latency.** At the
+  measured ~96 waits/s, 40 minutes is **~230,000 waits**. A 28-layer Qwen3-0.6B
+  forward should need ~11 dispatches per layer ≈ **~310 per forward**; even
+  counting 32 prefill positions and 8 decode steps generously that is a few
+  thousand, not 230,000 — roughly an order of magnitude and a half unexplained.
+
+  **Two candidates, NOT distinguished:** (a) waits ≠ dispatches, because the
+  driver's fence wait is a `poll()` loop that may wake several times per fence, in
+  which case only the latency finding stands; (b) we genuinely dispatch far more
+  than expected — a per-token or per-head dispatch where per-tensor was intended,
+  or `kFusedChain` issuing one dispatch per recipe step.
+
+  **Cheap next step:** a dispatch counter on `VulkanContext`, or
+  `VT_OP_PROVIDER_STATS=1` per-op selection counts, printed per forward. Until
+  then this is an OPEN QUESTION, not a confirmed second defect — recorded that way
+  deliberately, since I already published two wrong attributions in this session by
+  reasoning ahead of measurement.
+
+  dgx left clean: no process, GPU lock released.
+
+- **2026-08-07 (RESOLVED)** — **★ It was a GPU HANG, not slowness. A coopmat
+  out-of-bounds LOAD faulted the GPU; the fence never signalled. Fixed, and VK-E
+  now has BOTH arms (`CLAIM-VULKAN-FULL-1`).**
+
+  **Three published attributions in this session were all wrong**, each inferred
+  from an indirect signal instead of instrumenting the thing that was blocking:
+  (1) "the CPU reference tier, 71/87 ops" — from an op count; refuted by CPU 1.6 %.
+  (2) "GPU-bound" — from GPU-utilisation %, which on Tegra cannot separate compute
+  from a resident context polling a fence. (3) "per-op synchronous dispatch is the
+  measured bottleneck, ~96 waits/s" — the waits were real but they were the
+  driver's `poll()` loop spinning on ONE fence that never completed.
+
+  **The find.** Dispatch instrumentation showed ~300 submits in 1.2 s then
+  silence, with NO slow-dispatch line — and that ABSENCE was the clue, because the
+  timing print only runs after the wait returns. Tracing each submit BEFORE the
+  wait named it at once: `#368 vt_matmul_coopmat groups=9496`, the lm_head GEMM at
+  **M=1**.
+
+  **The defect, mine, merged earlier today.** `coopMatLoad` reads a FULL 16x16
+  tile with no masking; at M=1 it read 15 rows (~30 KB) past the activation
+  buffer, faulting the GPU so `vkWaitForFences(UINT64_MAX)` never returned. The
+  shader's comment claimed ragged M/N were safe "because the store is
+  bounds-checked" — the store guard cannot help when the fault is on the LOAD.
+
+  **Why my own gate missed it.** It used M=20, N=12 *specifically* to exercise
+  ragged shapes and passed: the OOB read stayed INSIDE the allocation and its
+  garbage rows were discarded by the bounds-checked store. Raggedness was not
+  enough — the read must LEAVE the allocation to fault, which needs a large N
+  against a small operand, i.e. lm_head at decode.
+
+  **Fix:** tactic requires `m % 16 == 0 && n % 16 == 0` too; decode falls back to
+  scalar (where coopmat would waste 15/16 of a tile anyway). New gate asserts the
+  DECLINE at M=1, N=17 — expressible only as a tactic assertion, since the bad
+  path hangs rather than returning a wrong number. GB10: 13/13, 509 assertions.
+
+  **Result: 40+ minutes of not-finishing became 1,125 ms.**
+
+  | engine (same weights) | prefill tok/s | decode tok/s |
+  |---|---:|---:|
+  | llama.cpp Vulkan `NV_coopmat2` | **11,514** | **160.9** |
+  | vllm.cpp Vulkan | 22.98 | 5.85 |
+
+  ~500x prefill / ~27x decode behind — honest, and not yet diagnostic: 71/87 ops
+  still on the CPU tier, dispatch is still one submit+fence per op (`VK-A2`
+  unbuilt), and the scalar GEMM now serves every decode GEMM since coopmat
+  declines at M=1. Each is a named, separately measurable lever.
+
+  **Durable lesson: a run that never finishes is not a slow run until proven so.**
+
+- **2026-08-07 (levers)** — **★ Measured the three `VK-E` levers before building
+  them; TWO WERE DEAD, and a fourth idea died on the bench
+  (`CLAIM-VULKAN-FULL-1`).**
+
+  **The pattern that keeps paying: measure the lever before building it.**
+
+  | lever | verdict |
+  |---|---|
+  | 71/87 ops on the CPU tier | IRRELEVANT — exactly ONE fires per run, at setup |
+  | per-op sync dispatch (`VK-A2`) | CEILING **1.15x** — measured, not estimated |
+  | kernel quality | CONFIRMED, and it is where everything is |
+  | subgroup reduction (my own idea) | **WASH** — 4/8 pairs. Built, then reverted |
+
+  `VK-A2` was the one I had already PUBLISHED as "the measured bottleneck". A
+  dispatch-floor sweep killed it: cost is dead flat at **0.046 ms from 256 to
+  262,144 elements**, a 1,024x change in work, so that value is pure per-dispatch
+  overhead — 13% of the model's 0.357 ms average. Perfect batching saves 136 ms of
+  1,054 against a 19-27x gap. One benchmark to learn; a day to have built.
+
+  **SHIPPED:** argmax **18.9x** (a 151,936-entry vocabulary was being scanned on
+  ONE lane), and the GEMV tactic **1.8x** on the GEMM, 7/8 pairs — the old kernel
+  left adjacent lanes 2 KB apart, each pulling its own cache line for 2 bytes of
+  it. opt-125m stayed 6/6 token-exact, which mattered because the GEMV changes the
+  accumulation order and a decode GEMM feeds the sampler.
+
+  **NOT SHIPPED:** the subgroup form of that reduction. It worked, gated green on
+  both devices, and was an exact coin flip against the workgroup form in a direct
+  paired A/B — the ~1.2x that a cross-session read had suggested was session
+  drift. A second module, a probe, a device-dependent path and a fourth lever, for
+  nothing.
+
+  **Two durable lessons.** (1) A `>=` where a `>` belongs: my first argmax tree
+  returned token 900 where the CPU returns 8, with a perfectly correct maximum
+  VALUE — a halving tree does not combine lanes in index order, so "keep the left
+  operand" is not first-wins. Only the gate caught it. (2) **Absolute timings on
+  this box are unusable** (five identical repeats: 322.5-684.3 ms, 2.1x). Every
+  claim here is a per-pair majority from INTERLEAVED arms; the first GEMV A/B ran
+  the arms in blocks, the OFF arm degraded monotonically because it ran last, and
+  it was thrown away.
+
+  Next lever is the MEMORY PATH: the reduction is not the cost, and decode is
+  still ~9x off the bandwidth roof (1.50 GB/token vs ~273 GB/s = 182 tok/s
+  ceiling, 19.8 measured).
+
+## 2026-08-07 — Developer agent protocol entry point design accepted
+<!-- state: 2026-08-07T19:00 -->
+
+User-directed row `DOCS-AGENT-PROTOCOL-ENTRYPOINT`. The accepted design adds a
+friendly root-level contribution page that explains the project's 1:1 C++ vLLM
+target, the additional SGLang and multimodal surface, and the one instruction a
+developer gives an agent: read `AGENTS.md` completely and run preflight.
+
+The scope grew from public prose to one binding intake obligation. Before a row
+is claimed or implementation starts, the agent must search open issues and PRs,
+read the live records and helper queue, inspect the current code and tests, and
+confirm that the recorded gap still exists. The PR records the issue search and
+exact code/test anchors. `check-protocol-consistency.py` will keep the obligation
+verbatim in `AGENTS.md` and `.agents/workflow.md`; GitHub availability will not
+become a local role-claim dependency.
+
+This is a design checkpoint only. No engine code, capability state, benchmark
+number, or public feature surface changed. Implementation follows in the same
+row after the draft PR is opened.
+
+## 2026-08-07 — Developer agent protocol entry point implemented
+<!-- state: 2026-08-07T20:00 -->
+
+Row `DOCS-AGENT-PROTOCOL-ENTRYPOINT` now has its public entry point. Root
+`CONTRIBUTING.md` welcomes developers, explains the 1:1 C++ vLLM target and the
+SGLang and multimodal additions, gives the first instruction for an agent, and
+walks from open issues and PRs through live records to a code-grounded claim.
+It also states that reference and hardware setup happens just in time. Missing
+required inputs leave the applicable gate `PENDING`; the gate is not waived.
+
+The same marker-delimited intake obligation now appears verbatim in `AGENTS.md`
+and `.agents/workflow.md`. Every agent checks issues, claims, current code,
+tests, and evidence before claiming or implementing, records exact anchors, and
+reconciles work that already landed or is owned. The protocol checker and its
+mutation suite reject either missing copy, a removed instruction, or drift
+between copies. README discoverability and its mutation gate, plus matching PR
+template evidence fields, complete the entry path. This documentation-only
+checkpoint is benchmark-void and changes no engine behavior or capability
+state.
+
+## Kimi-Linear: bf16 residual stream REFUTED; STRICT is intrinsically unreachable; SERVER fold scoped (spec §20, PR #118)
+<!-- state: 2026-08-07T20:30 -->
+
+`row/KIMI-BF16-STREAM-CLOSE` (helper worktree, DRAFT PR #118), the #113 follow-on. Base `origin/main`
+`2f029a10`. Tested the §19-named residual #1 (bf16 residual stream END-TO-END) as the STRICT+speed lever.
+
+- **bf16 residual stream (residual #1) — MEASURED-NEGATIVE / REFUTED.** STRUCTURAL bf16 stream
+  (`hidden`/`res`/`dhn`/block-outputs bf16, `vt::FusedChain(kFusedAddRmsNormStd)`, mirroring
+  `deepseek_v2.cpp:479-615`; supersedes the partial §14 RoundDevBf16), gated `VT_KIMI_BF16_STREAM`
+  default OFF. Clean GB10 CUDA build (/dev/shm, nvcc 13.0.88), CPU gate 15/15·875 knob-OFF. **GB10 full
+  48.9B 128-gate (flock, drop_caches, min-avail 18G, no reboot; golden `bfa5bdbf…`):** CONTROL (f32)
+  **122/128 @ 18.9 tok/s** (reproduces §19 3×); **+bf16 stream 4/128 @ 19.8** — KDA recurrence
+  DESTABILIZES into degenerate repeat loops (`15383,387,15383,387…`), the §14/§15 pathology confirmed
+  structurally; NO speed win. Diagnostic (bf16 recompute+f64-island) **5/128** vs §14's f32-variance
+  BF16_RESIDUAL=106 — the structural stream computes the RMSNorm variance over the bf16-rounded residual
+  (vLLM-faithful, `cpu_ops.cpp:326-332`), even less stable. Both bf16 variants ≪ the f32 control's 122.
+  REFUTES the §19 "bf16 stream closes p7 + wins speed" hypothesis. Knob kept default-OFF, documented-
+  measured-negative (§14/§16 precedent).
+- **STRICT (128/128) — DEFINITIVELY NOT reachable** by residual-precision or device-island levers
+  (§14 plateau 120, §15 device-KDA 122, §16 device-MLA 109, §18 chunk-every-step 102, §20 bf16 4-5).
+  **p7 is an INTRINSIC near-tie; 122/128 @ 18.9 tok/s (0.90× vLLM) is Kimi's coherent best.** The STRICT
+  thread is CLOSED as a near-tie; only vLLM's ACTUAL fused kernels (the paged fold) could move it.
+- **SERVER runner fold (ARCH-ONE-SURFACE req 4) — SCOPED, enabling-blocked.** The runner ABORTS on
+  Kimi's KV today: `VT_CHECK(mamba_spec->shapes==…)` at `runner.cpp:489-493` fails (Kimi lacks the
+  qwen3_5 `linear_*` fields + `layer_types`; its split is in `linear_attn_config`). Fold = synthesize
+  layer_types + source GDN geometry from `linear_attn_config` + a Kimi KDA-paged block
+  (`KdaChunkPrefill`/`KdaGatedDeltaRule` over `gdn_state`, NOT per-head `GdnBlockPaged`) + a NoPE-MLA-paged
+  block (`ForwardMlaAttentionBlock` identity-RoPE) + bind in `ForwardDevice`. Multi-brick, runner-touching
+  (gate-model regression risk) — NOT landed this campaign; named born-on-runner residual, spec §20.3.
+- Row STAYS `ACTIVE` on the SERVER fold + the last 0.10× speed. Worker was PARKED during GPU work;
+  RESTORE at campaign end.
+
+## Surface-coverage audit + the ONE SURFACE recurrence guard land (2026-08-07, `ARCH-ONE-SURFACE`, `row/SURFACE-COVERAGE-AUDIT`, PR #120)
+<!-- state: 2026-08-07T20:35 -->
+
+**What.** The user-directed CLI-fragmentation audit: capabilities keep landing in
+a per-model CLI instead of the shared runner / engine / OpenAI server / C-ABI.
+Code-grounded sweep of all 30 registered archs + the off-registry lanes across
+four surfaces (`.agents/specs/surface-coverage-2026-08-07.md`). **21 of 30 text
+archs are fully on-framework.** Seven gap lanes: (1) MiniMax-H3 video+audio gen
+off-registry, served over `/v1/videos` ONLY via an example-injected `VideoRunner`
+(`api_server.h:167`); (2) Laguna and (3) DeepSeek-V4 registered but engine
+forwards are stubs (`laguna.cpp:156`; `deepseek_v4_registry.cpp:22`) — real decode
+in `laguna-gen`/`deepseek-v4-gen`; (4) transcription (Parakeet/Voxtral/Whisper
+off-registry, `parakeet-transcribe` CLI-only); (5) Kimi-Linear incremental; (6)
+embeddings/pooling (pooler landed, never invoked live); (7) multimodal input over
+HTTP/ABI. Also: `vllm_engine_load` is never CI-gated on a real model load.
+
+**Guard (the deliverable = ONE SURFACE order-of-work item 3).**
+`scripts/check-surface-coverage.py`, two axes, mutation-tested (helper +
+subprocess seams), wired into `scripts/agent-preflight.sh` + CI. Axis 1: every
+`examples/*` unit is a thin client of the public `include/vllm.h` (DERIVED from
+the CMake install rules) or tracked in `scripts/example-abi-allowlist.txt` with a
+fold row — NO permanent exemptions, shrink-only ratchet (`MAX_INTERNAL_REACHING=12`),
+catches BOTH `#include` (`["<]` forms) AND `-I ${CMAKE_SOURCE_DIR}/src` grants.
+Only `examples/cli` is clean; 12 units tracked (incl. the new `parakeet-transcribe`,
+caught on rebase). Axis 2: every `docs/FEATURES.md` `abi-capability-table` row
+names a C-ABI symbol present in `vllm.h` (comments stripped; 7 reachable) or is a
+tracked `embedder-unreachable` row (4). `check-supported-models.py` is NOT a
+substitute (tolerates non-registered lanes).
+
+**Corrections.** FEATURES: Laguna/DeepSeek-V4 speed cells name the `-gen` CLI +
+stub forward. `.agents/specs/one-surface-abi.md`: its ":20-21" "none registered"
+claim was FALSE for 3 of 4 (Laguna/Kimi/DeepSeek-V4 ARE registered, only H3 is
+not) — corrected WITHOUT closing rows; stale sizes fixed; gate marked LANDED.
+
+**Residuals.** REBASED onto `b8493d57` (Kimi #118); `ARCH-ONE-SURFACE` /
+`.agents/specs/one-surface-abi.md` exists, references resolve. Fold lanes are its
+leaves (Kimi runner fold #279, Parakeet ASR #280). Reviewer findings 1-8 applied
+(quoted+angle includes, comment-stripped ABI tokenize, subprocess enforcement
+tests, ratchet equality pin, reachable-row-removal design note, meta-gap note). No
+CUDA build; no perf number owed; STATUS inside its char ratchet.
+
+## 2026-08-07 — ARCH-ONE-SURFACE ROW 1: Parakeet ASR folded onto the ONE surface (PR #121)
+<!-- state: 2026-08-07T23:30 -->
+
+**Landed** (`row/PARAKEET-ONE-SURFACE`, helper claim = PR #121, base `f98e1e48`):
+the first remediation slice of the ONE SURFACE program — audio transcription is
+now reachable by every consumer, gated BYTE-IDENTICAL to the pre-fold example.
+
+**Correctness anchor first.** Real `nvidia/parakeet-*` checkpoints were deleted
+post-#89, so a deterministic tiny CTC+RNNT fixture pair + clip was committed
+(`tests/vllm/models/fixtures/parakeet_e2e`, generator
+`scripts/mm/parakeet_e2e_fixture_gen.py`) and the transcript goldens were
+captured from the PRE-refactor binary at `main@f98e1e48` BEFORE any change
+(ctc: ids `3 4 3` / "atheat"; rnnt: 20 ids / "sss on on onssssss ...").
+`tests/vllm/models/test_parakeet_transcription_fold.cpp` holds seam ==
+replicated old pipeline == committed goldens, per head.
+
+**The fold, in the binding order.**
+- W1a tokenizer: `Tokenizer::FromHfJson` accepts Metaspace `split:true`
+  (MergedWithNext pre-split; merges cannot cross ▁) and a bare `Metaspace`
+  DECODER node selects HF's decode_chain rule (first token drops ▁) —
+  the guard at `tokenizer.cpp:554` implemented instead of refusing;
+  Mistral/Gemma Sequence chain regression-pinned
+  (`tests/vllm/test_tokenizer_metaspace_split.cpp`, metaspace.rs ports).
+- W1b/c library: `vllm::multimodal::ParakeetTranscriber`
+  (`parakeet_transcription.{h,cpp}`) absorbs WAV ingest
+  (`DecodeWavPcm16Mono`), model_type head dispatch and tokenizer decode; the
+  example's private `ReadWav16BitMono`/`LoadVocab`/`DecodeIds` are DELETED.
+- W2 registry: `ParakeetForCTC/ForRNNT/ForTDT` registered
+  (`parakeet_registry.cpp`), `ModelInfo` grows the SupportsTranscription
+  mirror (interfaces.py:1110-1118); BEYOND-PIN breadth recorded (pinned vLLM:
+  Parakeet = NemotronH audio component only, registry.py:511-513).
+  Refuse-by-task: every factory hook + `LoadedEngine::FromModelDir` (via new
+  non-throwing `PeekHfArchitectures`) refuse actionably; registry pins moved
+  30 -> 33.
+- W3 C ABI: `vllm_transcribe` + params/result structs, ABI v10 -> 11;
+  `vllm_engine_load` task-dispatches a transcription-only dir to the seam;
+  text entrypoints and `vllm_transcribe` refuse each other's handles cleanly.
+  FIRST real-checkpoint load gated through the public ABI (`test_capi` v11
+  cases close the audit's severity note). FEATURES abi-capability row flips
+  to reachable; `abi-capability-allowlist.txt` shrinks by the transcription
+  row.
+- W4 server: task-conditional `/v1/audio/transcriptions` (multipart `file`,
+  response_format json/text) through the SAME seam; serving-less `ApiServer`
+  ctor = vLLM's supported_tasks-conditional registration (generate routes 404
+  on an ASR server); `examples/server` dispatches by resolved arch; verified
+  LIVE with curl. Residuals: run_batch transcription line;
+  verbose_json/srt/vtt.
+- W5 example: `examples/parakeet_transcribe` = thin `vllm.h` client
+  (`vllm::shared`), stdout DIFF-IDENTICAL to the pre-fold binary on both
+  fixtures; `example-abi-allowlist.txt` loses its row;
+  `MAX_INTERNAL_REACHING` 12 -> 11 with the test pin + spec claims moved.
+
+**Gates.** Full CPU build clean (`-Werror`, 0 warnings); ctest 349/349 (345
+parallel + 4 serial; the only 2 reds were the registry count pins, moved as
+their comments instruct); surface guard + 46-case mutation suite green with
+the SHRINK enforced; every new test mutation-verified red/green (tokenizer
+decode rule + split gate, CTC collapse, transcription-only flag, ABI dispatch
++ input validation, server response_format + route gate).
+
+**Residuals (honest).** (1) run_batch `/v1/audio/transcriptions` stays a named
+residual (batch line shape carries no audio). (2) verbose_json/srt/vtt
+response formats -> 400 naming the residual. (3) A REAL pretrained checkpoint
+was not re-downloaded (safe defaults); the fold gate rests on the committed
+synthetic pair + the P4/P6 pretrained evidence. (4) A real Parakeet
+tokenizer.json may carry normalizer fields `FromHfJson` refuses loudly —
+untestable CPU-side without the checkpoint, fails loud not wrong. (5) Whisper/
+Voxtral remain off-registry (fold #9/#10 of the audit).
+- **2026-08-07 (levers, cont.)** — **★ Tier-1 fusion is a NEGATIVE, the dispatch
+  floor has grown 13% -> 49%, and `VK-A2`'s real blocker is named
+  (`CLAIM-VULKAN-FULL-1`).**
+
+  **Fusion that does not REMOVE a dispatch is not fusion.** `VT_FUSED_TIER=1`
+  engages on Vulkan (456 `vt_fused_chain` dispatches vs 0) and stays token-exact,
+  but the dispatch count is IDENTICAL at 2,952: `kFusedAddRmsNormStd` is
+  add+RMS-norm and `vt_rms_norm` already did both in one dispatch via `has_res`.
+  It swapped a specialized kernel for a generic interpreter and lost — 314.7 vs
+  275.8 ms, 2/8 pairs. `VT_FUSED_TIER` stays 0. The framework worked exactly as
+  designed; the recipe simply described something one kernel already did.
+
+  **The floor grew exactly as predicted.** GPU time fell ~1,054 -> 275.8 ms as
+  argmax and the GEMV landed; the 0.046 ms x 2,952 = 135.8 ms floor did not move,
+  so it went from 13% to **49%**. `vt_silu_and_mul`, `vt_rope_from_cache` and
+  `vt_qkv_split` now sit AT or BELOW the floor — a kernel doing no meaningful work
+  relative to being launched. 73% of those 1,800 small dispatches' cost is launch
+  overhead. **Making them faster is pointless; only removing dispatches helps.**
+
+  **`VK-A2`'s blocker, now named.** `VulkanContext::Pipeline` holds ONE
+  `VkDescriptorSet`, and every `Dispatch` calls `vkUpdateDescriptorSets` on it and
+  then submits and waits. Batching N dispatches into one command buffer would let
+  a later dispatch to the same pipeline OVERWRITE the descriptor set before the
+  GPU executes the earlier one — the set is read at EXECUTION time, not record
+  time. So batching requires a per-dispatch descriptor set (a ring or per-batch
+  pool with recycling), not just deferring the submit. That is the substantive
+  change, and it is why this row has stayed unbuilt.
+
+  Also corrected: the "~500x behind on prefill" figure was a METRIC ARTIFACT —
+  `input_throughput` divided by the WHOLE run, so a 1-prompt run reported
+  32/E2EL and charged the whole decode to prefill, then was compared against
+  llama-bench `pp128` which is prefill-ONLY. A true `prefill_throughput` now
+  ships alongside it.
+
+  Pre-existing red, NOT from this work: `test_bench` fails on any Vulkan-ON build
+  (synthetic engine's host-allocated embedding table is not a Vulkan allocation).
+  Verified identical on unmodified HEAD before attributing.
+
+- **2026-08-07 (VK-A2 default-on)** — **★ Vulkan decode 8.59 -> 59.3 tok/s on
+  PRODUCTION DEFAULTS, 6.9x in one session (`CLAIM-VULKAN-FULL-1`).**
+
+  | | session start | now (no env set) |
+  |---|---:|---:|
+  | decode tok/s | 8.59 | **59.3** |
+  | % of the 182 tok/s bandwidth roof | 5% | **33%** |
+  | gap to llama.cpp 160.9 | ~19x | **2.7x** |
+
+  **`VK-A2` was the lever, at 2.62x (8/8 interleaved pairs), and its blocker was
+  never "defer the submit".** `Pipeline` held ONE `VkDescriptorSet`, and a
+  descriptor set is read at EXECUTION time — batching two dispatches of one
+  pipeline would let the second overwrite the first's operands before either ran.
+  Each pipeline now owns a ring of 16, plus a memory barrier between dispatches.
+
+  **The default flip was unblocked by a seam that already existed.**
+  `Backend::FlushPending` is documented for exactly the reference-tier host-read
+  hazard and already called by `op_provider.cpp`; Metal implemented it, Vulkan had
+  not. **Second time this campaign the framework already had the answer** — the
+  first was the fusion recipes. Look for the seam before building one.
+
+  **Ratio of shipped to discarded work: 3 of 6 levers were NEGATIVE and reverted
+  or left off** — subgroup reduction (4/8 wash), Tier-1 fusion (fuses 0
+  dispatches), and `VK-A2` itself when first measured (1.15x ceiling, correct at
+  the time; it only became the top lever once the others shrank everything else).
+
+  **Two gate lessons.** (1) A gate the STRICT run cannot provide: opt-125m passes
+  with or without the FlushPending hook, because OPT hits the reference tier once
+  at setup. The hazard needed its own gate, and it was **verified by disabling the
+  hook** — red at 4 pending, green restored. (2) My VK-A2 mechanism test
+  re-derived the lever's default from the environment and asserted the wrong
+  branch the moment the default flipped; the context now exposes
+  `batching_enabled()` and the test ASKS. A predicate duplicated between an
+  implementation and its gate will disagree with itself.
+
+  Also fixed: the "~500x behind on prefill" figure was a METRIC ARTIFACT
+  (`input_throughput` divided by the whole run). Real prefill is now measured:
+  **137.7 tok/s**.
+
+  Next levers, unstarted: wider per-lane GEMV loads, and Tier-1 vocabulary for the
+  `qkv_split -> rope -> reshape_and_cache` chain (672 dispatches -> 224).
+
+- **2026-08-07 (issue #125, AMD)** — **★ An external Vulkan-on-AMD report found a
+  bug that is NOT AMD-specific: `qwen3_5.cpp` hands a HOST pointer to a DEVICE
+  kernel on every non-CUDA backend.**
+
+  Reporter `fprimex` on AMD Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151, Slackware,
+  RADV implied). Two failures, neither about AMD:
+
+  **(1) FP8 Qwen3.6-27B is unsupported on EVERY device.** The dense loader calls
+  `LoadMergedBf16RawNK` unconditionally for `linear_attn.in_proj_*`; only the
+  MoE/35B leg has `LoadFp8Raw`. Device-independent — it fails identically on GB10.
+
+  **(2) `vulkan: embedding: table points outside every Vulkan allocation`.**
+  VERIFIED IN SOURCE: `qwen3_5.cpp:795` gates weight upload on
+  `needs_weight_staging()`, which is `true` **only on CUDA**
+  (`cuda.cpp:67`; base default `false` at `interface.h:218`, and `VulkanPlatform`
+  does not override). So on Vulkan it aliases the mmap'd HOST bytes into a Tensor
+  tagged `kVULKAN`, and the first native kernel — embedding — throws.
+
+  **The shared framework helper was ALREADY FIXED for exactly this**, and says so:
+  `dense_attn_block.h:186-189` reads *"HOST-POINTER ALIASING IS A CPU PROPERTY,
+  NOT A 'NOT-CUDA' PROPERTY"* and uses `is_cpu()`. **25 model files include it.
+  `qwen3_5.cpp` does not** — it carries a duplicate with a different, still
+  CUDA-only, predicate. This is the off-framework-model hazard
+  [[decode-framework-routing-audit]] names, caught in the wild by a user.
+
+  **So Qwen3.6-27B/35B cannot run on Vulkan OR Metal on ANY box, including ours.**
+  It went unnoticed because the only model ever run e2e on Vulkan is opt-125m,
+  which routes through the FIXED helper. Nothing about AMD, RADV or wave64 is
+  implicated — and no Vulkan capability probe ever ran, because it died before the
+  first dispatch.
+
+  Second instance, same file: `ResidentWeightF32` (`:836`) hands out
+  `std::vector<float>::data()` under the same predicate — it will throw next.
+
+  **The discriminating test to ask for: run opt-125m on gfx1151.** It is the one
+  model proven token-exact on Vulkan and it takes the fixed path. If it works,
+  there is no AMD-specific defect in evidence at all.
+
+  Their build predates command-buffer batching (their `vulkan_backend.cpp:144` is
+  our `:164` today), so none of today's work is implicated either.
+
+## 2026-08-07 — Downloadable static-core server release matrix spiked (PR #129)
+<!-- state: 2026-08-07T23:45 -->
+
+`ENG-RELEASE-BINARIES` moves `INVENTORIED` -> `SPIKE`; no implementation or
+artifact is claimed. The accepted contract is
+`.agents/specs/release-binary-matrix.md`: backend/host-specific
+`vllm-server` archives, stable only after matching-hardware archive runtime and
+correctness gates, and preview for derived/build-only tuples.
+
+The initial matrix covers CPU x86_64+arm64, macOS arm64 Metal and opt-in MLX,
+Vulkan preview, an experimental literal-static x86_64-musl CPU feasibility
+lane, and ten separate CUDA SM artifacts (`80,86,87,89,90a,100a,103a,110,120a,121a`)
+with explicit host ABIs. Triton AOT is ON only for the six complete vendored
+trees (`80,86,89,90a,100a,121a`) and OFF for `87,103a,110,120a`; fat+AOT is
+forbidden. ROCm stays blocked because the HIP skeleton has never compiled on
+AMD hardware.
+
+The package contract adds a future server install/component target, extracted
+archive smoke, dependency and RPATH audits, independent evidence booleans,
+SHA256, SPDX SBOM, provenance, version and license records, and a tag/dry-run
+least-privilege workflow. The normal promise is static project core with honest
+external ffmpeg/platform/driver boundaries, not a magically static GPU stack.
+First implementation after fresh review is W1: install and package the existing
+static-core server; manifest, validator, CI, platform, and CUDA bricks follow as
+separate claims.
+
+## 2026-08-07 — Release matrix revised: fat CUDA and adaptive CPU are the primary downloads
+<!-- state: 2026-08-07T23:55 -->
+
+User review changed the KISS artifact unit without changing lifecycle:
+`ENG-RELEASE-BINARIES` remains `SPIKE`, and no archive or implementation is
+claimed. This explicitly supersedes the prior checkpoint's single-SM-primary
+and fat+AOT-prohibited design. Primary downloads are now one binary per
+OS+host ABI: adaptive CPU and fat CUDA. One ELF cannot cross x86_64/aarch64 or
+libc/OS ABIs.
+
+CUDA primary artifacts cover all ten supported SMs
+(`80,86,87,89,90a,100a,103a,110,120a,121a`) in each Linux x86_64/aarch64 host
+binary. This makes two known gaps prerequisites: per-source gencode must make
+cross-family fat builds compile, and Triton AOT must embed and runtime-select all
+six available exact-SM trees (`80,86,89,90a,100a,121a`) while the other four
+use portable CUDA fallbacks. Per-SM archives remain optional diagnostics, not
+primary downloads. Stable/preview evidence stays per SM and is never inferred.
+
+CPU primary artifacts use a conservative baseline with runtime ISA dispatch,
+never global `-march=native`: x86_64 portable/SSE2 plus only real F16C/AVX2/
+AVX-512 and later gated tiers; aarch64 portable/NEON plus independently probed
+DotProd/i8mm and future real-kernel tiers. Exact CPU+OS-state probes, compiled
+tier manifests, forced-tier mutation tests, and execution on feature-poor and
+feature-rich hosts/emulation are release gates. W1 is now the CUDA per-source
+gencode prerequisite; multi-SM AOT and CPU ISA audits precede bundle work.
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 2: MiniMax-H3 video+audio generation folded onto the ONE surface (PR #123)
+<!-- state: 2026-08-08T04:30 -->
+
+**What landed (`row/H3-VIDEO-ABI`, task #283; fold order: grow ABI -> rewrite
+examples -> delete parallel impl).**
+- FOLD GATE FIRST: `tests/vllm/models/minimax_h3_video_fold_fixture.h` writes a
+  deterministic tiny checkpoint set (857KB F32 ComfyUI-GGUF DiT at the :3786
+  reduced geometry + on-disk reduced ViT3D/BigVGAN VAEs + prompt embeds); the
+  PRE-fold `minimax-h3-gen` binary at the branch base (fc636c76) rendered it
+  (--partition fl2va --steps 3 --frames 5 --height/width 32, CPU, keep-quant)
+  and its 8 frames + WAV + both `minimax-h3-mux --print-only` argv lines are
+  COMMITTED goldens (`fixtures/minimax_h3_video_fold/`). Determinism proven
+  (two runs, diff clean).
+- W1 seam: `vllm::multimodal::MiniMaxH3VideoEngine` (`minimax_h3_video.{h,cpp}`)
+  absorbs the example's 1293-line assembly driver AND the server's 354-line
+  /v1/videos twin: 4 DiT loader arms (GGUF keep-quant / dequant-bf16
+  host+streamed / bf16-shard stream / NVFP4 bf16+fp4-resident stream), VAE
+  decoder + lazy encoder halves, the H3-Encoder tower staged once (GGUF or
+  bf16 shards), the #77 partition guard, fl2va/ref2va conditioning, the
+  byte-exact splitmix64 Box-Muller noise streams (VT_H3_GAUSSIAN_NOISE
+  honored; seeded requests derive audio via splitmix64), artifact writing +
+  mux argv. Library SPAWNS NOTHING (mkdir -p became std::filesystem; ffmpeg
+  stays caller-side). `MiniMaxH3VideoGenParamsFromRequest` = the ONE
+  /v1/videos mapping.
+- W2 ABI: `vllm_video_engine(_load/_free)`, `vllm_video_model_params(_default)`,
+  `vllm_video_params(_default)`, `vllm_video_generate`, `vllm_video_result(_free)`
+  + `vllm_video_mux_argv((_params_default)/_free)`; VLLM_ABI_VERSION 11 -> 12,
+  test_capi floor >= 12. As-shipped deltas vs the ratified proposal argued in
+  the spec (+prompt_embeds_path/+partition/+fp4_resident/+output_dir/+mux
+  composer; -task/-duration; ONE ref_image). Refuse-both-directions pinned:
+  video-load on a text dir names vllm_engine_load; vllm_engine_load on the H3
+  dir fails byte-for-byte as captured at v11.
+- W3 server: the VideoState block is DELETED; /v1/videos = seam Load + a
+  runner lambda (FromRequest -> Generate -> fork/execvp(mux_argv)). Direct
+  MiniMaxH3 refs 54 -> 7 (all seam type names). DISCLOSED numeric deltas on
+  the server arm (no goldens existed; the drift WAS the defect): legacy
+  single-stream uniform noise -> the ratified shared recipe; host-f32 GGUF
+  default -> keep-quant; new `--video-dequant-bf16`.
+- W4 examples: `minimax_h3_gen` (1293 -> 216 lines) + `minimax_h3_mux` are
+  `vllm.h`+`vllm::shared` thin clients; BOTH byte-identical to the pre-fold
+  binaries on the fixture (frames+WAV cmp clean; mux argv diff clean).
+  Ratchet: both allowlist rows removed, `MAX_INTERNAL_REACHING` 11 -> 9 +
+  equality pin + spec claims moved; abi-capability video row closed; FEATURES
+  video row -> reachable naming the four symbols.
+
+**Gates.** 3-arm fold gate `test_minimax_h3_video_fold` 4/131 GREEN (seam ==
+replicated pre-fold pipeline == committed goldens, byte-identical; guard
+refusals; FromRequest field-complete). test_capi 40/373 incl. the v12 golden
+e2e THROUGH the C marshalling; vllm_capi_c_check strict-C11 green.
+test_minimax_h3 75/75 unchanged. test_openai_api_server 45/566 incl. the
+socket-level "routes do not exist without a runner" 404 pin; test_video_api
+14/14. check-surface-coverage green with the SHRINK enforced + its 46-test
+mutation suite green.
+
+**Residuals (honest).** (1) GB10 real-video re-verification through the v12
+ABI + folded server (real checkpoints; box on the Kimi campaign — CPU fold
+gates are the landed evidence). (2) The pre-fold example's diagnostic modes
+(--denoise-only/--dump-params/--encoder-only/--save-embeds/--decode-latent/
+--roundtrip/--prompt-image/--cond-image/--dry-run, multi --ref-image) were
+deleted with the private pipeline; capabilities remain library/test-reachable;
+the GB10 speed recipe must move to the seam. (3) Server-arm numeric deltas
+disclosed above. (4) The CPU host-f32 GGUF arm is off the ABI (keep-quant is
+the gated arm). (5) /v1/videos job/status/content stay VideoJobStore-served
+(unchanged); no async-job C-ABI shape yet.
+
+## 2026-08-08 — ROW 7: Kimi-Linear FOLDED onto the shared paged runner (engine==CLI 128/128; golden 122/128 profile; speed residual named)
+<!-- state: 2026-08-08T05:00 -->
+`row/KIMI-RUNNER-FOLD` (#122), ARCH-ONE-SURFACE ROW 7 / kimi-linear.md §20.3→§21, task #281.
+The full digits and file:line map live in spec §21; the binding facts:
+
+- **B1**: `LoadHfConfig` synthesizes `layer_types` + GDN geometry from `linear_attn_config`
+  (additive; `runner.cpp` untouched) — the §20.3 runner ABORT is gone.
+- **B2/B3**: `KimiLinearModel::ForwardPaged` — KDA over the paged `gdn_state` group
+  (`KdaChunkPrefill` prefill / `KdaGatedDeltaRule` decode, conv in vLLM's chunk(3) layout);
+  NoPE-MLA latent through `ConcatAndCacheMla` with **`mla::ForwardMlaAttentionBlock` DEFAULT-ON**
+  (GB10-ruled: that arm reproduces the golden's 122/128 near-tie profile EXACTLY; the diagnostic
+  f64-island arm measured 111/128 = the §19 GPU M-tiling near-tie class, not a paging bug).
+- **B4**: engine loads the bf16-resident tower (`stage_on_load`, §13 recipe);
+  `vllm_complete_tokens` (ABI v13 after the #123 video-v12 rebase); `kimi_linear_gen` = thin `vllm.h` client; allowlist kimi row removed (merged ratchet 8 with #123's two minimax removals);
+  CLI reference leg preserved as env-gated `test_kimi_linear_fold_gate`.
+- **Gate A**: engine==CLI **128/128 BYTE-IDENTICAL** (p7 got-strings equal); vs golden **122/128**
+  (>=122 bound MET). SACRED re-run post-fold: 35B 315/315, 27B 235/235. CPU: paged suite 8/8·206
+  (logits byte-equal, mutation-verified ×4), ctest 351/351.
+- **The async-mirror catch**: round-1 engine leg diverged 9/128 — ForwardPaged embedded the host
+  ids the DEFAULT-ON async device mirror leaves stale; fixed by honoring `device_token_ids`
+  (RED-first CPU pin). ★ AUDIT RESIDUAL: models outside qwen3_5/kimi still ignore this field —
+  any of them served on GB10 through the async engine would hit the same divergence.
+- **SPEED (honest)**: server stream **19.0 tok/s wall** (48 tok incl. prefill+warmup — the
+  production-surface anchor) vs CLI 18.93 (reproduced) vs vLLM ~21 → ~0.90×, >= vLLM NOT met.
+  The example's two-length diffs (16.9 N=64; 9.8-11.5 N=16) ran the long leg first and cold, so
+  warmup pollutes the subtraction — measurement caveat recorded. Residual levers: device KDA decay
+  gate + beta (per-step host islands), grouped MoE via the shared seam, decode graph.
+- **Tokenizer**: Kimi ships tiktoken-only; converted to tokenizer.json via transformers
+  TikTokenConverter (round-trip verified) → `~/kimi-linear-engine-dir` for the engine/server legs;
+  a shippable-converter residual is noted.
+- **vLLM same-session re-measure: ABORTED BY BOX REBOOT** (util 0.82 + torch.compile/graph
+  capture pushed the unified pool below the floor at 00:25 — reproduces the §19 measured
+  box-safety violation; NOT retried per the safety mandate). Denominator stays the #111
+  recorded ~21 floor. Box recovered clean; worker auto-restored (--restart=always).
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 2 device dispatch repaired (PR #135; replaces #134)
+<!-- state: 2026-08-08T05:00 -->
+
+The H3 ABI-v12 fold introduced two literal `GetBackend(kCUDA)` calls in
+`src/vllm/multimodal/minimax_h3_video.cpp`, raising the shared-layer DSR from
+its immutable 32 floor to 34 and blocking unrelated main-based work. RED was
+captured with `check-device-leakage.py --report` (`kcuda=2`, exit 1).
+
+The repair keeps the public contract 0=CPU / 1=CUDA, validates that selector in
+`MiniMaxH3VideoDeviceType`, converts once to `vt::DeviceType`, and creates one
+queue through `GetBackend(device_type)`; the queue's device becomes the engine
+device. The fold test pins 0, 1 and both rejected values. GREEN locally:
+DSR=32 at the unchanged baseline, no allowlist added, and the checker mutation
+suite is 25/25. No GPU/download/benchmark/release-row work occurred.
+
+Honest pending gate: the from-scratch CPU build was stopped at the operator's
+request when the shared filesystem reached 100%; compile/fold/C-ABI/H3 tests
+are NOT locally claimed and must run in GitHub CI before merge.
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 8: explicit device selection through the ONE surface (`row/DEVICE-KNOB`, task #284)
+<!-- state: 2026-08-08T12:00 -->
+
+**What.** The smallest fold row: an embedder can now ASK for a device instead
+of inheriting the accelerator-first probe. Mirrors vLLM's `DeviceConfig.device`
+names (`${VLLM_SOURCE}/vllm/config/device.py:13` `Device = Literal["auto",
+"cuda", "cpu", ...]`; explicit assignment is VERBATIM, never substituted,
+device.py:61-66; upstream's `--device` CLI flag itself was removed in v0.10,
+`bc8a8ce5e`, so the ABI field mirrors the surviving config surface).
+
+- W1 ABI: `vllm_model_params.device` appended (int32, 0=auto/1=cpu/2=cuda —
+  0 MUST be auto for the zero-value contract; cpu-before-cuda follows the v12
+  `vllm_video_model_params.device` precedent shifted by the auto slot).
+  `VLLM_ABI_VERSION` -> 14 per the operator's version-collision correction
+  (#122 Kimi `vllm_complete_tokens` reconciles to v13 at its landing; this
+  branch pre-rebase shows v12 -> v14 with the gap named in the changelog).
+  Floor pin advanced to `>= 14` (the #121 == lesson). New
+  `include/vllm/config/device.h` + `src/vllm/config/device.cpp`
+  (`vllm::Device`, `DeviceFromString`, `DeviceName`), ported from
+  vllm/config/device.py @ 555967922.
+- W2 plumb: `EngineParams::device` -> `SelectQueue(architecture, device)`.
+  Explicit arms route through `LoadedEngine::ResolveExplicitDeviceType(device,
+  cuda_platform_registered)` — pure, so the CPU tier gates the full matrix
+  including "explicit cpu beats a REGISTERED accelerator". Explicit cpu never
+  consults the probe; explicit cuda requires the registered kCUDA platform
+  (cuda.cpp Registrar == usable GPU) and THROWS the pinned message otherwise;
+  queue-creation failure on the explicit arm PROPAGATES (no try/catch), unlike
+  the auto arm's byte-identical catch-and-fall-back. `FromModelDir` resolves
+  an explicit device BEFORE any path/config I/O (mirror of DeviceConfig
+  resolving at config time, arg_utils.py:1878), so the device error is never
+  masked by a path error — which is also what makes the capi plumb pinnable
+  with no loadable checkpoint. capi validates 0/1/2 (else
+  VLLM_ERR_INVALID_ARGUMENT) and refuses explicit cuda on the CPU-hosted
+  transcription stack instead of silently downgrading.
+- W3 thin clients: `--device auto|cpu|cuda` on `vllm-cli` (ABI field only,
+  local name->int map) and `examples/server` (`vllm::DeviceFromString` ->
+  `EngineParams.device`; `--video-device` untouched — separate engine,
+  separate checkpoint, may legitimately differ).
+- W5 (the #123 review's 3 MINORS, closed): c_header_compile.c now actually
+  references the v11 transcription + v12 video entry points + the v14 field
+  (its "references every ABI entry point" claim went stale at v10); the v12
+  changelog block moved to chronological position (after v11); the H3 fold
+  fixture's flag list gained `--keep-quant` (matches test:85 + the capture).
+
+**Gates.** Full CPU build -Werror clean (fresh tree). test_capi 44 cases
+(4 new v14 + floor >= 14) green; test_loaded_engine_dense +3 device cases
+green; test_dlopen green; test_openai_api_server + the new explicit-cpu
+serving smoke green; test_minimax_h3_video_fold green (vllm.h touched);
+test_model_loader_gguf + test_platform green. check-surface-coverage green
+(capability row added, ratchet UNTOUCHED — 8 after the #122 rebase below;
+9 at first write). STATUS ratchet: paid for the
+new line by removing a stale back-to-back merge DUPLICATE of the metrics
+narrative (nothing lost), ratchet 279200 -> 279150 (measured 279108).
+
+**Mutation kills (each RED then reverted).** M1 default device=2 ->
+zero-contract 3 fails; M2 capi 0->kCUDA -> zero-contract bogus-path arm RED
+(the auto arm must report the PATH, not a device); M3 range validation
+dropped -> range test 6 fails; M4 capi drops the device=2 mapping -> plumb
+pin RED; M5 FromModelDir early resolve removed -> capi plumb pin + the
+device-before-path test both RED; M6 ctor passes kAuto -> EngineParams-seam
+ctor-throw arm RED; M7 SelectQueue explicit arm catch-and-fallback -> same
+test RED; M8 policy hands explicit-cpu to a registered accelerator -> matrix
+RED; M9 DeviceFromString "cuda"->kCPU -> parse test RED; M10 ABI macro left
+at 12 -> floor pin RED. Not uniquely killable (disclosed): the api_server
+smoke (same seams as M6-M8), c_header_compile (a compile-time reference),
+the two doc-only minors.
+
+**Residuals (honest).** (1) CUDA-build A/B — auto->CUDA vs explicit-cpu->CPU
+vs explicit-cuda->CUDA on a GPU box — not run (no dgx in scope); the CPU tier
+pins that half via the pure matrix. (2) The 0-as-explicit-cpu vs 0-as-auto
+distinction is behaviorally invisible on a CPU-only tier at the queue level;
+pinned structurally (matrix + the bogus-path capi arm) and named for the
+CUDA-build pass. (3) EXECUTED post-#122 (9f772cad): rebased onto main — v14 sits
+on v13 (changelog now v10..v14 chronological, the minor-#2 v12 move kept),
+c_header_compile composes main's `vllm_complete_tokens` reference with the
+v14 field, floor pin stays >= 14, allowlist ratchet inherited at 8, keyed
+records main-wholesale + these rows re-applied. (4) Explicit
+names for xpu/vulkan/metal/rocm are additive later; auto reaches them today.
+(5) The transcription stack refuses explicit cuda (CPU pipeline) — revisit
+when an accelerated transcription path exists.
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 8 device leakage repaired through the platform registry (PR #139)
+<!-- state: 2026-08-08T13:00 -->
+
+Current main `b44ad337` inherited PR #136 with seven CUDA enum literals in the
+shared device config/loader: DSR was 39 vs the immutable baseline 32
+(`kcuda=7`). RED-first focused tests required a platform-neutral ABI enum tag,
+a canonical-name registry lookup and an optional resolved `DeviceType`; the
+old API failed to compile on each missing seam.
+
+The ABI and public behavior are unchanged: values remain 0=auto, 1=cpu,
+2=cuda; parsing and `DeviceName()` still expose `"cuda"`; absent CUDA still
+fails loudly before model-path I/O; explicit CPU still bypasses accelerator
+selection. Internally slot 2 is `Device::kNamedPlatform`; shared loading calls
+`FindPlatformByName(DeviceName(device))` and propagates the registered
+platform's type. A mutation-sensitive test supplies `kXPU` and requires
+`kXPU` back, so replacing the propagation with a hidden CUDA constant is RED.
+The platform test walks every registered canonical name and pins missing-name
+failure.
+
+GREEN in `/dev/shm/vllm-device-leakage-build`, CPU Release, CUDA OFF,
+`-Werror`: `test_platform` 11/11 cases · 85 assertions;
+`test_loaded_engine_dense` 9/9 · 65; `test_capi` 45/45 · 428. The leakage
+checker reports DSR 32 (`kcuda=0`, `is_cuda=0`, `cuda_inc=0`, `vt_ifdef=32`)
+with baseline/allowlist unchanged, and its mutation suite is 25/25. H3 source
+is untouched. No CUDA runtime, model download, service action, benchmark or
+release artifact occurred; the existing CUDA-build A/B remains pending.
+
+## 2026-08-08 — PR #139 device-selector test registration made non-vacuous
+<!-- state: 2026-08-08T14:00 -->
+
+Review found that deleting `test_device_selection` from `tests/CMakeLists.txt`
+left preflight green: the standalone integration test existed but no tree gate
+required CI to build or execute it. `scripts/check-test-registration.py` now
+requires the exact target/source invocation and verifies that the shared
+`vllm_cpp_add_test` helper both creates the executable and registers it with
+CTest. The checker and its 15-test mutation suite run in preflight and the
+explicit agent-record CI lane. Deleting the target invocation, substituting its
+source, deleting either helper registration, duplicating the target, or dropping
+the guard's preflight/CI wiring is RED. The loader header now states explicitly
+that internal `Device::kNamedPlatform` is the stable public/wire value and name
+`2="cuda"`; behavior and ABI are unchanged. No GPU, model, benchmark or speed
+claim is involved; CUDA A/B remains pending.
+
+## 2026-08-08 — PR #139 registration guard follows configured semantics
+<!-- state: 2026-08-08T15:00 -->
+
+Mutation re-review proved the text scanner vacuous under five semantic deaths:
+the target in a CMake bracket comment, false conditional, or quoted string; the
+helper registration in a false conditional; and both CI commands behind `if
+false`. The checker now configures a disposable CPU-only project, reads CMake's
+File-API codemodel for the exact executable/source pair, and reads CTest JSON for
+the registered test. The CI half parses the dedicated YAML literal block into
+exact direct argv, rejecting control flow and inert quoted text. The expanded
+23-test suite makes all five survivors RED, pins every mutation case's outcome
+assertion, and preserves the original 15 cases. A fresh CPU Release `-Werror`
+configure exposes `test_device_selection` through both build-target help and
+CTest JSON, builds it, and runs the focused selector/platform/loader/C-ABI set
+4/4 green. No behavior, ABI, performance, model, GPU, or CUDA A/B claim changed.
+
+## 2026-08-08 — PR #139 registration guard proves execution, not presence
+<!-- state: 2026-08-08T16:00 -->
+
+Final mutation review found five more critical survivors in the guard itself.
+CTest accepted a required test by name while its helper executed `cmake -E
+true`; GitHub Actions commands counted inside a step/job disabled by `if`;
+preflight names counted in an inert array instead of the executed
+`CHECKERS`/`SUITES`; deleting both mutation assertion-helper assertions left the
+suite green; and deleting M19 plus shrinking the in-file numeric range made a
+smaller suite self-approve.
+
+The repair binds every claim to execution. After CMake File-API identifies the
+single executable artifact, the disposable configure materializes that path and
+CTest JSON must resolve to it as the exact sole argv. The Actions parser accepts
+only a canonical literal run block owned by an unconditional job and step.
+Preflight parses the named arrays and requires the actual checker/suite loops to
+consume them. Wrapper bodies are inspected for their direct production call and
+`assertTrue`, and the 27 numbered mutations are pinned in an external manifest;
+the 34-test suite also mutates both integrity mechanisms directly.
+
+All five real review mutations are RED in a scratch exact-head tree (each rc=1),
+as are wrong-binary, extra-argv, job-level condition and loop-rebinding nearby
+weakenings. Baseline checker + suite are GREEN. This is CPU-only test/governance
+hardening: selector behavior, ABI, DSR 32, performance, model state, CUDA A/B and
+release state are unchanged.
+
+## 2026-08-08 — PR #139 registration guard executes every claimed layer
+<!-- state: 2026-08-08T17:00 -->
+
+The preceding checkpoint was later mutation-reviewed as insufficient: it still
+accepted a disabled CTest, non-gating quoted/spaced Actions fields, preflight
+loop headers whose bodies never executed, and tandem suite/manifest shrinkage.
+Its 34-test conclusion is superseded by this checkpoint, without rewriting that
+historical entry. The comprehensive repair replaces source-shape inference at
+each boundary.
+CMake File-API now selects Release from a multi-config codemodel and the CTest
+query uses the same explicit configuration; the exact executable command must
+be present and the test must not be `DISABLED`. The Actions subset parser
+normalizes quoted/spaced keys and accepts the dedicated exact-argv block only
+when its job/step has no `if`, `continue-on-error`, or custom `shell`. Preflight
+is executed in a disposable tree with instrumented `python3`/`git` shims; the
+checker and suite argv must each be observed exactly once, making a `true` body,
+immediate `continue`, false outer branch, or unset array red.
+
+Mutation-suite integrity is now owned by the production checker, a third layer:
+it pins the canonical manifest path plus SHA-256 and the suite's named integrity
+method/wrapper contracts. Tandem suite+manifest deletion/rename of M18, redirect
+to a byte-identical alternate manifest, and integrity-test deletion all fail.
+This proves resistance to those two-layer tandem shrinks, not to an arbitrary
+simultaneous rewrite of all three checker layers. RED-first was 50 discovered
+tests with 11 failures + 9 missing-contract errors; GREEN is 50/50 plus the
+shipped-tree checker. CPU-only governance hardening; selector behavior, ABI, DSR
+32, performance, model state, CUDA A/B and release state remain unchanged.
+
+## 2026-08-08 — PR #139 canonical manifest-path guard made independently observable
+<!-- state: 2026-08-08T18:00 -->
+
+Final mutation review deleted only the production check that rejects a
+non-canonical mutation-manifest path and the 50-test suite remained green. M40
+was not discriminating: it rewrote the suite wrapper source, while its broad
+`canonical manifest` assertion could be satisfied by the independent wrapper
+shape error.
+
+M42 now calls `mutation_suite_integrity_errors` with the unchanged canonical
+suite source and a byte-for-byte copy of the manifest at an alternate path, and
+requires the sole exact error `mutation suite must use the canonical manifest
+path`. The external inventory includes M42 and its production-owned SHA-256 was
+updated, so dropping the test or its manifest entry is independently red. The
+exact delete-only production mutation now fails only M42 (1/51), while the
+baseline checker and suite are green at 51/51. CPU-only governance hardening;
+selector behavior, ABI, DSR 32, performance, model state, CUDA A/B and release
+state remain unchanged.
+
+## 2026-08-08 — PR #139 M42 outcome assertion is production-pinned
+<!-- state: 2026-08-08T19:00 -->
+
+Scoped re-review deleted M42's sole path-outcome `assertEqual`, but the suite
+stayed green because its unrelated byte-identity `assertTrue` satisfied the
+generic mutation-case shape check. The production checker now parses M42 and
+requires `assertEqual(errors, ["mutation suite must use the canonical manifest
+path"])` exactly. M43 deletes that assertion and replaces its diagnostic in
+turn; both mutations produce the dedicated M42 contract error. The external
+inventory and production-owned digest now pin M43 as well.
+
+The direct destructive proofs are red: deleting M42's outcome assertion fails
+the shipped-tree check and M43, while deleting the production path guard still
+fails M42 itself. Baseline checker plus suite are green at 52/52. This remains
+CPU-only governance hardening; selector behavior, ABI, DSR 32, performance,
+model state, CUDA A/B and release state are unchanged.
+
+## 2026-08-08 — PR #129 release contract binds backend policy and guard execution
+<!-- state: 2026-08-08T20:00 -->
+
+Final mutation review found that the accepted release checker did not bind five
+backend channel decisions or its own CI/preflight execution, and that its
+`docs/STATUS.md` edit replaced unrelated OpenAI/Sora endpoint prose. The repair
+adds exact machine and human guards for Metal, MLX, Vulkan, experimental
+CPU-only musl, blocked ROCm, and the external host GPU-driver boundary.
+
+The release checker now accepts only direct argv in an unconditional Actions
+job/step and executes preflight under Python/Git shims to prove the checker and
+suite each run once through the named loops. Nineteen new semantic/wiring
+mutations are red, and their inventories, consumer bodies and 30 named tests are
+production-pinned. The full release suite is 30/30 and the shared executable
+registration guard remains 52/52. The OpenAI row is byte-identical to main after
+removing only `; #129: SPIKE∅`; the compact clause consumes the existing
+279150-character ratchet exactly. `ENG-RELEASE-BINARIES` remains `SPIKE`: there
+is no archive, runtime, correctness or performance evidence.
+
+
+
+## 2026-08-08 — Tensor-parallelism end-to-end spike lands at the current pin (task #287)
+<!-- state: 2026-08-08T21:00 -->
+
+`CLAIM-TP-SPIKE-287` (`row/SPIKE-TENSOR-PARALLELISM`, draft PR #143,
+records-only). The dedicated TP scope spike is committed:
+`.agents/specs/tensor-parallelism-spike.md`, building on the #50-era TP spec,
+the scale-out W1/W2 lanes and the #164 mode enumeration instead of re-deriving
+them.
+
+What it established: (1) S1 — a 14-row at-pin (`555967922`, SHA-verified)
+inventory of everything TP touches, each with our seam and a
+REUSE/PARTIAL/NEW verdict; roughly 40% of the end-to-end surface is already
+landed or directly reusable. (2) The landed-vs-claimed audit of scale-out
+W1/W2: the `vt::Communicator` stack, OpId routing, per-device registry, NCCL
+TU and the four forward all-reduce seams are REAL; but the tp handle
+dead-ends at the layer boundary (`qwen3.cpp:92-136` defaults), NO production
+loader passes `tp` into `LoadMergedBf16RawNK`, and the only tp>1 driver is
+the toy MLP test. (3) S2 — thread-per-rank orchestration (recorded deviation;
+multiproc returns at multi-node), additive TP>1 branch through
+`ModelRegistry::Forward` with TP=1 byte-identical, `tensor_parallel_size` on
+`vllm_model_params` at the next ABI bump (base is v14), and the
+per-weight-class sharded-load map (merged-column done; row/vocab/NVFP4/GGUF
+mapped). (4) S3 — the TP2-on-CPU token-exact gate design over the W1
+in-process transport (synthetic-dense CI tier + real-0.6B env-gated tier),
+plus the honesty finding: upstream's own TP=2 test asserts greedy equality
+vs HF, not vs TP1 (`test_basic_correctness.py:204`), and at the pin
+`use_all_gather()` defaults True so every TP rank all-gathers full logits and
+samples identically. (5) S4 — TP-W0..W7 ranked bricks; TP-W1..W4 and TP-W7
+are CPU-completable now, TP-W5/W6 are PENDING-HW (no ≥2-GPU box).
+
+RIDER (USER 2026-08-08): DSpark speculator re-grounded at the pin —
+`specs/dspark-speculator-note.md`; `SPEC-DSPARK` + the feature-matrix row
+refreshed (V2-runner-only DFlash-derived block drafter; both target families
+are our registered archs; slots beside the landed MTP/DFlash lanes). Full
+scoping stays a future spike.
+
+Rows moved: none in lifecycle (`BACKEND-DISTRIBUTED-TP`/`PAR-TP` stay
+`READY`, now pointing at the new spec; `SPEC-DSPARK` stays `INVENTORIED`).
+Next: dispatch TP-W1 (GroupCoordinator-analog) — CPU-completable, no HW wait.
+
+## 2026-08-08T21:00 - richiejp stack LANDS: #65 + #79 merged with fix map (prep/land-65, prep/land-79)
+<!-- state: 2026-08-08T21:00 -->
+
+The external RPi5/Cortex-A76 stack lands as two prepared branches off
+`b38f78a7`: `prep/land-65` (PR #65, PMU kernel-bench harness + lane records)
+and `prep/land-79` (PR #79, the Q8_0 SDOT/AAPCS64 tier), keyed records merged
+by the resolution law (main wholesale + in-lane rows; state pure-append in
+anchor order). The mutation review's fix map applied: F65-1 (ONE-SURFACE
+allowlist entry for `examples/cpu_kernel_bench`, ratchet 8->9 with a dated
+operator exception), F79-5 (KERNEL count 50->51 on top of main, their dated
+comment transplanted), F79-6 (the two RPi5 BENCHMARKS.md paragraphs are keyed
+table rows pointing at `docs/bench-evidence/rpi5-*.md`; the STATUS.md CPU cell
+condensed inside the char/cell ratchets), and F79-1: the new
+`test_ops_quant_dot` A76 byte-equality case referenced
+`QuantTraits(kQ8_0).vec_dot` — the SELECTED kernel, i.e. the assembly tier on
+a real A76 — so its CHECKs were a self-comparison. A true-portable seam
+`vt::cpu::QuantQ8PortableVecDot()` (quants.c:400 order) is exported next to
+the existing sdot/asm getters, the reference arm retargeted, and a new
+seam-pinning case compares the portable kernel byte-equal against an
+independent in-test transcription of the exact order on EVERY platform
+(contraction-robust: mul and fma candidates). Mutation kill verified on x86:
+reversing the portable block accumulation order REDs exactly that case
+(2 assertions, blocks=3/64), green on revert; 23/23 cases, 150231 assertions.
+
+RESIDUALS, recorded not fixed (per the review map, operator-held): F79-3 and
+F79-4 remain open on the landed tree; the review's merge-and-fix map is the
+binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
+as the lane's own next steps.
+
+
+## 2026-08-08 — ROCm approach-(b): unified memory true by construction on integrated APUs
+<!-- state: 2026-08-08T21:30 -->
+
+Implements the maintainer-ratified approach (b) from issue #41 F6 (decision
+comment 2026-08-08, quoted verbatim in `specs/rocm-unified-memory-b.md`): on a
+ROCm device probing `Integrated=1 && ManagedMemory=1 &&
+ConcurrentManagedAccess=1`, `RocmBackend::Alloc` allocates through
+`hipMallocManaged(hipMemAttachGlobal)` and `UnifiedMemory()` returns true
+exactly then — the host-dereference contract the CPU reference tier needs
+becomes API-guaranteed on XNACK-less RDNA3 APUs (gfx1151/gfx1103), where the
+W0 CUDA-shaped probe read `PageableMemoryAccess=0` and blocked M2. The W0
+conjunction stays as ground 1; `Free` stays `hipFree` (API-documented for both
+alloc paths); inherited `AllocPinned` rides the same branch via its
+delegate-to-`Alloc` base; discrete devices are byte-identical (branch provably
+dead at `Integrated=0`, gated by a new runtime test through the new HIP-free
+probes `ManagedAllocActive`/`IntegratedDevice`). F6's decisive experiment
+(kernel write → host read, no copy) is now a standing test. Also absorbed:
+issue #41 F1/F3 — when `ROCM_PATH` exists, the configure derives
+`CMAKE_HIP_COMPILER_ROCM_ROOT`, seeds `--rocm-path` into `CMAKE_HIP_FLAGS`,
+and exports `ROCM_PATH`, each only when unset, making Arch/TheRock layouts
+configure flag-free (F2 was downstream of the unidentified compiler). NO
+upstream analog to mirror (vLLM allocates via torch; `rocm.py:75-77,909-910`
+only names the APUs): recorded as ADDITIVE deviation, porting-inventory §9.14.
+
+Blind-written under this lane's policy — no AMD hardware or hipcc here; the
+CPU gates (preflight, `vllm_rocm_platform_syntax_check` -Werror
+object-compile of the platform + test TUs) are the only ones run. Community
+owes: the (b) delta's first compile, the two new ctest cases, a flag-free
+Arch/TheRock configure log, and the unblocked M2 on gfx1151/gfx1103 —
+itemized in the spec's verification table and on the #41 handoff comment
+(PR #144, `row/ROCM-UNIFIED-MEMORY-B`).
+
+## 2026-08-08 — ARCH-ONE-SURFACE ROW 6: embeddings/pooling LIVE on the ONE surface (`row/EMBEDDINGS-ONE-SURFACE`, task #285, PR #137)
+<!-- state: 2026-08-08T22:00 -->
+
+**What landed.** The pooling lane's engine-side pooler (`ENG-POOLER-SEQ` ops +
+`ENG-POOLING-RUNNER` `PoolingRunner`) is now INVOKED LIVE through one path:
+`vllm_engine_load` on a pooling checkpoint -> `LLMEngine::embed` ->
+scheduler -> `GPUModelRunner::pool_tokens` -> pooled vector, driven identically
+by `vllm_embed` (ABI v15) and the live task-conditional `/v1/embeddings`.
+
+**W1 registry+runner.** NEW arch `LlamaModel`
+(`llama_embedding_registry.cpp:132`, `is_pooling_model=true`,
+`is_text_generation_model=false`) — the exact upstream mirror of
+`_EMBEDDING_MODELS` `"LlamaModel": ("llama", "LlamaForCausalLM")`
+(registry.py:230) + `as_embedding_model` (adapters.py:230): the SHARED dense
+backbone run to the post-final-norm hidden with NO lm_head
+(`Qwen3DenseModel::ForwardHidden`, an additive tail arm of the shared
+ForwardLayers; text callers byte-identical), loader accepts BOTH name layouts
+(adapters.py:178-181 candidate_prefixes) and never loads lm_head
+(`LoadLlamaModelEmbeddingWeights`). The runner builds a `PoolingRunner` iff the
+registration declares pooling (model_runner.py:368-369 mirror) and
+`sample_tokens` routes to `pool_tokens()` (model_runner.py:1586-1607): pooled
+rows instead of sampled tokens, validity == the existing discard predicate
+(pooling_runner.py:40-41), scheduler pooling stop at the marked DEFERRED site
+(scheduler.py:1718-1721), `pooling_output` out through
+EngineCoreOutput/RequestOutput, async scheduling OFF for pooling models
+(config/vllm.py:1068-1073 — the landed `ResolveAsyncScheduling` arm now WIRED).
+Every hook is task-gated on `is_pooling_model`/`pooling_params` (default
+nullopt/false = byte-identical text path; engine suites re-run green:
+scheduler 423, llm_engine 204, engine_core 44, output_processor 77,
+qwen3_forward 1557, async_llm 342, llama_forward 509 asserts).
+
+**W2 ABI.** `vllm_embed` + `vllm_embedding_result_free`, VLLM_ABI_VERSION
+14 -> 15, floor pin advanced to `>= 15`; strict-C references in
+c_header_compile.c; dlopen symbol resolution; refuse-by-task BOTH directions
+(text entry points on a pooling engine name `vllm_embed`; `vllm_embed` on a
+text engine names `vllm_complete`); FIXED en route: v13's
+`vllm_complete_tokens` shipped without the v11 task guard (null-deref on a
+transcription handle) — guard added.
+
+**W3 server.** `handle_embeddings` (OpenAI shape per embed/protocol.py:34,
+173-185; `dimensions`/base64/token-arrays = named-residual 400s) registered
+ONLY when an embedder is attached; server main dispatches pooling archs to a
+serving-less embedding server. Socket-level 404 pins BOTH directions.
+
+**W4 guard/records.** `scripts/abi-capability-allowlist.txt` embeddings row
+REMOVED (1 row left: mm-input); FEATURES abi-capability row -> reachable +
+`LlamaModel` arch row; `check-supported-models.py` ARCH_TOKEN_RE widened to
+bare `*Model`; the runner-routing checker gains the explicit POOLING
+classification (a pooling registration is a hidden-state producer BY DESIGN,
+never the silently-exempt NONE bucket — pinned in its mutation suite);
+gate-commands runnable-baseline re-pinned (+2 rows); STATUS/BENCHMARKS keyed
+rows; engine/model matrices + coordination claim
+`CLAIM-EMBEDDINGS-ONE-SURFACE`; ROW 6 closed in one-surface-abi.md +
+surface-coverage-2026-08-07.md.
+
+**The fold's correctness anchor.** The pooling lane's cosine gate was
+STRUCTURAL (synthetic hidden buffer, registry BYPASSED; the brief's "recorded
+oracle fixtures" premise was inaccurate — the qwen36_embed goldens are
+token-embedding LOOKUP goldens, unrelated). ROW 6 re-anchors it THROUGH the
+registry/runner path: `test_llama_embedding_fold` 4/4-231 on the COMMITTED
+deterministic fixture (`scripts/mm/llama_embed_fixture_gen.py`,
+`tests/vllm/models/fixtures/llama_embed_e2e`, 151 KB) — (a) direct
+`ModelRegistry::Forward`+`PoolingRunner` == f64 LAST+normalize reference,
+(b) FULL-ENGINE path == direct path, IDENTICAL vectors, (c) chunked-prefill
+(max_num_batched_tokens=2) == unchunked (the is_valid arm), plus
+`test_capi` 48/48-462 (v15 section incl. the REAL fixture-checkpoint load
+through the public ABI), test_dlopen 30/30, server suite 50/50,
+registry 24/24-820.
+
+**Mutation kills (each RED then reverted, 9).** M1 ABI macro left at 14 ->
+floor pin RED; M2 embed-on-text refusal dropped -> capi both-directions RED
+(3 asserts); M3 generation-on-pooling refusal dropped -> the refusal case
+HANGS (SIGTERM, doctest FAILURE); M4 `if (embedder_)` -> `if (true)` ->
+text-server 404 pin RED; M5 generate route unconditional -> embedding-server
+404 pin RED; M6 engine-step pooling invocation deleted -> fold gate RED
+(2 cases); M7 scheduler pooling stop deleted -> fold gate RED; M9 registry
+`is_pooling_model=false` -> registry pin + fold RED (819/820 + 6 asserts);
+M11 async-off wire dropped -> fold engine arm RED (hang/SIGTERM +
+CHECK_FALSE(async) pin).
+
+**Residuals (honest).** (1) REAL embedding checkpoint (e5-mistral class)
+through the fold + the `vllm.LLM(task="embed").encode` oracle cosine — the
+committed synthetic-fixture arm is the gate (the #121 precedent); NO
+cosine-vs-oracle number fabricated. (2) The other 7 `_EMBEDDING_MODELS`
+memberships (incl. `MistralModel`) unregistered. (3) `/pooling`, `/score`,
+`/rerank`, `/classify` (need a classify arch). (4) Matryoshka `dimensions`,
+`encoding_format: base64`, token-array inputs = 400s naming the residual.
+(5) `vllm_embed` batches sequentially through the synchronous engine
+(recorded deviation; AsyncLLM stays generation-only).
+
+## 2026-08-08 — PR #140 ROCm gfx1201 + Gemma-4-26B-A4B MoE landed with contributor authorship preserved + operator hardening
+<!-- state: 2026-08-08T22:30 -->
+
+**USER 2026-08-08: external contributions must PRESERVE the contributor's git
+authorship, not re-author as mudler with a Contributed-by line.** Landed PR #140
+(Don Mirror / @bakon11) via a real `--no-ff` merge — his 6 commits are preserved
+authored by him (`commit-protocol-tag` CI-skips merged-in commits) — and the
+operator hardening was folded into the mudler-authored MERGE commit (git-blame
+shows Don for his lines, mudler for the fixes). Policy recorded in memory
+`commit-trailer-protocol`; #65/#79 (richiejp) landed author=mudler pre-policy and
+are NOT rewritten (pushed history).
+
+**Operator hardening (the merge-review's checklist, CPU-verified):**
+- **F1 non-HIP LINK unbroken**: `UploadGemma4ExpertsResident{,ForWeights}` were
+  defined only in `rocm_gemma4_experts.hip`; added loud-no-op `#ifndef
+  VLLM_CPP_HIP` stubs in `gemma4_moe.cpp` so plain-CPU builds link (call site is
+  `VT_GEMMA4_RESIDENT_EXPERTS=1`-gated, never reached off-ROCm). test_hf_config +
+  all targets link clean.
+- **F2 runner gate rescoped**: `QueueSupportsAsyncInputCombine` returned false for
+  ALL non-CUDA queues, silently flipping the CPU backend's async default (5 red
+  `test_loaded_engine_dense` cases). Now `kCPU→true` (host/device alias valid),
+  `kCUDA→true`, discrete non-CUDA GPU→false; comment rewritten to the verified
+  root cause (host-deref of device `dev_ids` in the non-CUDA `sample_tokens_async`
+  leg = the R9700 "!" tokens, NOT an embed race). test_loaded_engine_dense 9/9·65.
+  Integrated-GPU refinement (UnifiedMemory() seam) is a TODO citing the ROCm-(b)
+  lane.
+- **F3 registry**: upstream registers `Gemma4UnifiedForConditionalGeneration` at
+  the pin (registry.py:405), so KEPT; test_model_registry pins 34→35, arch added
+  to kSortedArchs/kExampleConfig/both oracle strings, and to the multimodal
+  taxonomy branch (it shares the Gemma-4 mm-capable forward via kGemma4Factory).
+  test_model_registry 24/24·837. FEATURES supported-arch row added (mm-for-this-
+  arch UNVERIFIED — a dedicated text-only ModelInfo is the alternative if the
+  unified export proves text-only: residual).
+- **F4 records/env**: `.hip` added to check-env-doc SCAN_SUFFIXES; the 5 new vars
+  (VT_GEMMA4_RESIDENT_{EXPERTS,GPUS,MAX_LAYERS}, VT_ROCM_ATTN_CPU_REF,
+  VT_DEBUG_SAMPLED) documented; STATUS/BENCHMARKS/FEATURES rows.
+- **F6**: VT_DEBUG_SAMPLED hoisted to a read-once static (was per-token getenv).
+
+**Residuals (ROCm lane, recorded not fixed):** F7 provenance headers +
+porting-inventory §9 rows for the from-scratch HIP kernels; F8 HIP-side fixes
+(LayerNorm grid-stride >65535 rows, hipSetDevice before hipblasCreate on the
+2-GPU target, dev_id on the Gemma4Fp8ExpertMats lazy cache, hipBLASLt-linked-
+but-unused); the paged-attn serial-key decode shape; all HIP-runtime evidence is
+PENDING-community (no AMD HW here — CPU build+link+tests are the operator gate).
+
+## 2026-08-08 — ROAD-V1-MEM M0 spike LANDED: KV-cache auto-sizing design (specs/kv-sizing.md), row READY
+<!-- state: 2026-08-08T23:00 -->
+
+Autonomous roadmap pickup after MXFP4 confirmed TERMINAL (STATUS.md:101 /
+BENCHMARKS.md:346: c1 1.020x parity, c2-c8 0.962-0.969 engine-context-bound,
+FLASH-PTXAS #82 proved codegen at parity — e2e Qwen3-8B-MXFP4 3/4 token-exact,
+p2 near-tie 0.0000). Scanned roadmap_v1; picked `ROAD-V1-MEM` (#83, user-directed
+2026-08-06) — the M0 spike was OWED and we are measurably BEHIND vLLM (KV pool is
+a raw hand-typed `--num-blocks`).
+
+`.agents/specs/kv-sizing.md` written, grounded at the pin: vLLM's 3 knobs
+(`config/cache.py`: gpu_memory_utilization 0.92 default / kv_cache_memory_bytes
+absolute override / num_gpu_blocks_override) + the profile-run formula
+(`gpu_worker.py:497-599`: `available_kv = free*util − non_kv − cudagraph`,
+`num_blocks = available_kv / bytes_per_block`). Our design: additive knobs on
+EngineParams + the C ABI (appended field, zero=auto), group-aware
+`bytes_per_block` over the runner's existing per-layer KV geometry (dense / MLA /
+het-KV), a device profile run, pre-flight error (not OOM), token-exact-vs-explicit
+gate, default flips to auto. GB10 caveat carried: the unified pool means util
+reserves HOST RAM (gb10-unified-memory-oom-reboots-box), so the profile run reads
+the unified free-memory and the default 0.92 is not unconditionally safe there.
+
+Row moved INVENTORIED→READY (roadmap_v1 + feature-matrix §2). M1-M4 are the impl
+rows this unblocks; M1/M2/M4-CPU are CPU-completable, M3 (profile run) is
+dgx-gated. Records-only spike (no code).
+
+
+## 2026-08-08 — ROAD-V1-MEM M1+M2 LANDED: absolute --kv-cache-memory knob + group-aware bytes-per-block (CPU brick)
+<!-- state: 2026-08-08T23:30 -->
+
+The absolute `--kv-cache-memory` KV-pool knob is live: `ResolveNumBlocks`
+(`model_loader.cpp`) applies the vLLM precedence `num_blocks (override) >
+kv_cache_memory_bytes > 256`, dividing the byte budget by `KVBytesPerBlock`
+(`kv_cache_interface.cpp`, M2) — a group-aware sum over attention specs that
+mirrors the runner's own per-layer `num_blocks * page_size_bytes()` allocation,
+excluding GDN/Mamba state (per-sequence-slot, not per-block). `EngineParams`
+gained `gpu_memory_utilization` (0.92) + `kv_cache_memory_bytes` and `num_blocks`
+became the override (default 0 = auto → 256 fallback, byte-identical default
+path). Mirrored on the C ABI at v16 (`vllm_model_params.gpu_memory_utilization` /
+`.kv_cache_memory_bytes`, appended, zero-value preserves behaviour);
+`--gpu-memory-utilization` / `--kv-cache-memory` on `examples/server` +
+`examples/cli`. Gates: `test_kv_cache_interface` KVBytesPerBlock 5/5 (dense /
+MLA no-factor-2 / hybrid-excludes-mamba / het-KV per-layer / divisor),
+`test_capi` 49/49 incl. v16 round-trip, `test_model_loader_gguf` 3/3, CPU build
+clean -Werror. M3 (the `gpu_memory_utilization` device profile run) stays
+dgx-gated; until it lands the util branch falls back to 256. Row `M1+M2 DONE`.

@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-07 -->
+<!-- now-updated: 2026-08-08 -->
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
@@ -18,15 +18,19 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | **bf16 shards STREAM both towers (DiT + encoder); Q4_K_M enc cond cos 0.9975, 3.5° med, DIFFUSE** | render A/B on saved embeds |
-| Kimi-Linear-48B | device-KDA **122/128, 4.24 tok/s**; chunk op unit-correct (#111) but chunk-every-step REGRESSES 122→102; **vs vLLM MEASURED 0.20x (~21 tok/s)** | paged-incremental: chunk-prefill ONCE + persistent-state decode (STRICT+speed) |
+| Kimi-Linear-48B | **ROW 7 fold LANDS (#122 §21): engine==CLI 128/128; golden 122/128; SACRED green; v13 tokens ABI** | ACTIVE: 19.0 tok/s vs vLLM ~21 (~0.90×) |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
+| RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec, RSS -24% | W6: BF16 GEMM |
 | MXFP4 parity | c1 1.020, c2-c8 0.962-0.969. **#82 CLOSED: ptxas-lineage REFUTED (A/B ties our+vLLM PTX all ptxas/JIT; +10us=engine context, not codegen)** | TERMINAL: at parity |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): async mirror on classic dense Qwen3; SACRED 184/184 | Residual: sibling scope one-liner |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
-| Supported-models list (`row/DOCS-SUPPORTED-MODELS-MATRIX`) | **DRAFT PR**: FEATURES per-arch table CI-bound to registry (30 archs) | Reviewer merge |
+| Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
-| `BACKEND-ROCM` W0 | Skeleton in; **HIP never compiled** (no AMD HW) | #41 contributors build it; a compile error IS the deliverable |
+| `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed (contributor, authorship-preserved); W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
+| TP spike #287 (PR #143) | **LANDED** ([spec](specs/tensor-parallelism-spike.md)); DSpark rider grounded | dispatch TP-W1 (CPU-able) |
+| Release | SPIKE; 30/30 | #129 |
+| Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139 IN; **ROW 6 IN REVIEW (#137): embeddings LIVE — `LlamaModel` arch, PoolingRunner in the step, `vllm_embed` v15, `/v1/embeddings`, fold gate 4/4-231, 9 kills** | Merge #137; real-ckpt oracle cosine residual |
 
 In-flight (default-OFF, not pushed): `laguna-fp4proj-prod`, laguna
 bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -39,15 +43,12 @@ both gate models, reproduced 2–3x on an idle box. See the
 [verification procedure](verification.md). Parity pin: vLLM `555967922`
 (0.26.0.dev0).
 
-Method rules hardened (AGENTS.md): the STRUCTURAL lens (same kernel, different
-throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
 
 ## Next actions
 
-1. **Spike the Parakeet encoder row.** Upstream vLLM has `parakeet.py` +
-   `conformer_encoder.py` as the audio encoder of `nano_nemotron_vl.py`, which we
-   already carry `MODEL-MM-nano-nemotron-vl-*` rows for, so it is owed mirror work.
-   The transducer decode half (RNN-T/TDT/CTC) is NOT in vLLM: separate scope call.
+0. **`ROAD-V1-MEM`** KV auto-sizing spike LANDED (`specs/kv-sizing.md`, `READY`).
+1. **Spike the Parakeet encoder row** (vLLM carries it inside
+   `nano_nemotron_vl.py`; the transducer half is NOT in vLLM: separate call).
 2. **Qwen3.5-4B serving follow-up:** bind the default-ON async-serving path
    against the same oracle before attributing the remaining TPOT gap.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
@@ -56,11 +57,10 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
    f32-out caller) once the Laguna fix proves the mechanism.
 4. **Restore `local-ai-worker`** on dgx when the GPU campaign ends
    (`docker update --restart=always` + `docker start`).
-5. **Protocol substrate — partly done.** Triage/audit, `STATUS.md` ratchet and
-   the `AGENTS.md` tiering are DONE. REMAINING: anchor backfill (6 model rows
-   need a DECISION); record-era rollover BLOCKED on `DONE` rows bound to
-   `parity-ledger.md` LINE anchors (re-anchor by ROW ID). ★ The gate SELF-BLINDS
-   on the 10 audited rows (audit §➁a); its fix owes an 8-row adjudication.
+5. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
+   `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
+   DECISION); record-era rollover BLOCKED on `DONE` rows bound to
+   `parity-ledger.md` LINE anchors (re-anchor by ROW ID).
 
 **Operator/helper protocol**
 ([spec](workflow.md)): roles DECLARED then MATERIALIZED
@@ -70,8 +70,8 @@ START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,
 `--require-role` is the DEFAULT. Queue: 10 rows; backfill 79 rows, 30 anchored.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md),
 drift-gated, arch parity BOTH ways): SM060/061/070 below vLLM's floor =
-OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs now have rows**; llama.cpp's 11 extra devices are IN SCOPE, spike-gated
-(`ROAD-V1-D6`).
+OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL unported work; **all 362 archs have
+rows**; llama.cpp's 11 extra devices IN SCOPE, spike-gated (`ROAD-V1-D6`).
 
 ## Protocol invariants that bite most often
 

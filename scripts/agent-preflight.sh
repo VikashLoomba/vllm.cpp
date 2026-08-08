@@ -58,6 +58,7 @@ CHECKERS=(
   check-policy
   check-prompt-contract
   check-agent-record
+  check-release-binary-contract
   check-role-discipline
   claim-view
   check-readme-structure
@@ -67,6 +68,8 @@ CHECKERS=(
   check-env-doc
   check-fusion-consistency
   check-runner-routing-consistency
+  check-surface-coverage
+  check-test-registration
   check-protocol-consistency
   check-state-order
   check-now-current
@@ -77,6 +80,7 @@ SUITES=(
   test_check_prompt_contract
   test_agent_gates
   test_agent_record
+  test_check_release_binary_contract
   test_agent_role
   test_agent_onboard
   test_claim_view
@@ -89,6 +93,8 @@ SUITES=(
   test_check_env_doc
   test_check_fusion_consistency
   test_check_runner_routing_consistency
+  test_check_surface_coverage
+  test_check_test_registration
   test_check_protocol_consistency
   test_check_state_order
   test_check_now_current
@@ -196,9 +202,14 @@ fi
 # It reads only committed Git objects and the tracked policy registries.
 if [ -f .agents/policy-cutover ]; then
   cutover="$(tr -d '\n' < .agents/policy-cutover)"
+  trailer_base="$cutover"
+  if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
+     git merge-base --is-ancestor origin/main HEAD; then
+    trailer_base=origin/main
+  fi
   echo "Post-cutover commit range:"
   run "commit-trailers cutover" python3 scripts/check-commit-trailers.py \
-    --range "$cutover..HEAD" --cutover "$cutover"
+    --range "$trailer_base..HEAD" --cutover "$cutover"
 fi
 
 if [ "$STAGED" -eq 1 ]; then

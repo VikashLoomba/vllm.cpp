@@ -464,6 +464,22 @@ POLICY_CUTOVER_FILES = frozenset(
         "tests/scripts/test_doc_checkpoint.py",
     }
 )
+# The cutover PR must prove its own finite review budget against a base where
+# the size checker did not exist. This exact transaction supplies closed
+# creation mutations and one expiring PR-scoped migration waiver. CI normally
+# signals feature work, so any missing or additional path restores the usual
+# product-document obligations.
+PR_SIZE_BOOTSTRAP_FILES = frozenset(
+    {
+        ".agents/waivers.csv",
+        ".github/workflows/ci.yml",
+        "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md",
+        "scripts/check-doc-checkpoint.py",
+        "scripts/check-pr-size.py",
+        "tests/scripts/test_check_pr_size.py",
+        "tests/scripts/test_doc_checkpoint.py",
+    }
+)
 FEATURE_CHECKPOINT_FILES = frozenset(
     {
         "CMakeLists.txt",
@@ -546,6 +562,15 @@ def classify_changed_paths(paths: list[str]) -> set[str]:
         return {"governance"}
     if path_set == POLICY_CUTOVER_FILES:
         return {"governance"}
+    if path_set == PR_SIZE_BOOTSTRAP_FILES:
+        return {"governance"}
+    pr_size_bootstrap_members = path_set & PR_SIZE_BOOTSTRAP_FILES
+    incomplete_pr_size_bootstrap = (
+        ".agents/waivers.csv" in pr_size_bootstrap_members
+        and len(pr_size_bootstrap_members) > 1
+    )
+    if incomplete_pr_size_bootstrap:
+        classes.add("feature_checkpoint")
     exact_claim_cutover = (
         path_set == CLAIM_CUTOVER_FILES
     )

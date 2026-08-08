@@ -251,6 +251,52 @@ endif()
 if(VLLM_CPP_HIP STREQUAL "AUTO")
   set(VLLM_CPP_HIP OFF)
 elseif(VLLM_CPP_HIP)
+  # F1/F3 ABSORPTION (issue #41, jimmykarily's gfx1151 findings; layout also
+  # confirmed by arch-btw on gfx1103/TheRock). Arch and TheRock dist layouts
+  # install the compiler at ${ROCM_PATH}/lib/llvm/bin instead of
+  # ${ROCM_PATH}/llvm/bin, so clang's walk-up-from-InstalledDir autodetection
+  # derives the ROCm root as ${ROCM_PATH}/lib and finds neither the HIP headers
+  # (F1) nor the hip-lang CMake package (F3: CMakeDetermineHIPCompiler
+  # hard-fails). The unidentified-compiler fallout also broke the LINKER:
+  # prefix expansion on the --whole-archive link options further down (F2) —
+  # one root cause, three unrelated-looking failures. The report's finding:
+  # ROCM_PATH was advertised by our own FATAL_ERROR below but only ever used
+  # for find_library, so on those layouts the documented flag did not do what
+  # its error message promised.
+  #
+  # Fix: derive the three hints the report set by hand from ROCM_PATH — and
+  # ONLY where unset, so an explicit -DCMAKE_HIP_FLAGS /
+  # -DCMAKE_HIP_COMPILER_ROCM_ROOT / exported HIPFLAGS/ROCM_PATH environment
+  # always wins, and a machine whose ROCM_PATH does not exist on disk (hipcc
+  # found elsewhere on PATH) configures byte-identically to before. On the
+  # standard /opt/rocm layout the values filled are exactly what clang/CMake
+  # autodetect anyway. Upstream vLLM honours ROCM_PATH the same way
+  # (vllm/CMakeLists.txt:54-60 @ pin 555967922). All three must be set BEFORE
+  # check_language/enable_language: the report measured that the ROOT hint
+  # alone regresses the compiler identification, because the identification
+  # try-compile then has no --rocm-path.
+  if(EXISTS "${ROCM_PATH}")
+    # CMake's own ROCm-root probe (F3), consulted by CMakeDetermineHIPCompiler.
+    if(NOT DEFINED CMAKE_HIP_COMPILER_ROCM_ROOT)
+      set(CMAKE_HIP_COMPILER_ROCM_ROOT "${ROCM_PATH}")
+    endif()
+    # clang's own ROCm-root flag (F1). Rides CMAKE_HIP_FLAGS so the
+    # compiler-identification try-compile sees it too; pre-seeded as the cache
+    # entry enable_language(HIP) would otherwise create empty. Skipped when the
+    # user passed -DCMAKE_HIP_FLAGS or exported HIPFLAGS, which must keep
+    # winning.
+    if(NOT DEFINED CACHE{CMAKE_HIP_FLAGS} AND NOT DEFINED ENV{HIPFLAGS})
+      set(CMAKE_HIP_FLAGS "--rocm-path=${ROCM_PATH}" CACHE STRING
+        "Flags used by the HIP compiler during all build types.")
+    endif()
+    # hipcc/hipconfig read ROCM_PATH from the environment (the mechanism the
+    # report validated: `ROCM_PATH=/opt/rocm hipcc` compiles where bare hipcc
+    # cannot), and the environment also reaches check_language's sub-configure
+    # below, which forwards no cache variables.
+    if(NOT DEFINED ENV{ROCM_PATH})
+      set(ENV{ROCM_PATH} "${ROCM_PATH}")
+    endif()
+  endif()
   # CMake's own HIP language support (>= 3.21; we require 3.24) understands .hip
   # sources, which is why upstream calls enable_language(HIP) explicitly rather
   # than leaning on torch's setup (vllm/CMakeLists.txt:196-202).
@@ -513,6 +559,7 @@ add_library(vllm STATIC
   src/vllm/sampling_params.cpp
   src/vllm/lora/punica_cpu.cpp
   src/vllm/config/scheduler.cpp
+  src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
@@ -598,11 +645,13 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/opt_weights.cpp
   src/vllm/model_executor/models/opt.cpp
   src/vllm/model_executor/models/llama_registry.cpp
+  src/vllm/model_executor/models/llama_embedding_registry.cpp
   src/vllm/model_executor/models/llama_weights.cpp
   src/vllm/model_executor/models/mistral_registry.cpp
   src/vllm/model_executor/models/mistral_weights.cpp
   src/vllm/model_executor/models/gemma4_registry.cpp
   src/vllm/model_executor/models/gemma4_weights.cpp
+  src/vllm/model_executor/models/gemma4_moe.cpp
   src/vllm/model_executor/models/gemma4.cpp
   src/vllm/model_executor/models/gemma4_mm.cpp
   src/vllm/model_executor/models/gemma3_registry.cpp
@@ -653,6 +702,32 @@ add_library(vllm STATIC
   src/vllm/multimodal/hasher.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
+  # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
+  # (spike .agents/specs/parakeet-conformer-encoder.md row P4). A standalone
+  # forward composed from the P1-P3 vt:: kernels, NOT a registry architecture —
+  # vLLM does not register one either (parakeet.py is a component of
+  # nano_nemotron_vl.py, and it delegates the encoder itself to transformers).
+  src/vllm/model_executor/models/parakeet_encoder.cpp
+  # The RNN-T / TDT transducer heads over that encoder (row P5). Upstream after
+  # all: transformers `main` implements ParakeetRNNTDecoder / ParakeetForRNNT /
+  # ParakeetForTDT, which the P4 spike wrongly recorded as absent because it
+  # measured the LOCALLY INSTALLED 5.3.0. Corrected in the spike.
+  src/vllm/model_executor/models/parakeet_transducer.cpp
+  src/vllm/model_executor/models/parakeet_weights.cpp
+  src/vllm/multimodal/parakeet_audio_processor.cpp
+  # The ONE transcription seam every consumer drives (C ABI vllm_transcribe,
+  # the server's /v1/audio/transcriptions, the parakeet-transcribe example) —
+  # ARCH-ONE-SURFACE ROW 1: absorbs the pipeline examples/parakeet_transcribe
+  # used to own privately. The refuse-by-task registry TU registers the three
+  # Parakeet head archs so config.json RESOLVES (SupportsTranscription mirror).
+  src/vllm/multimodal/parakeet_transcription.cpp
+  src/vllm/model_executor/models/parakeet_registry.cpp
+  # The ONE video-generation seam every consumer drives (C ABI vllm_video_*,
+  # the server's /v1/videos, the minimax-h3-gen example) — ARCH-ONE-SURFACE
+  # ROW 2: absorbs the assembly pipeline examples/minimax_h3_gen and the
+  # server's private /v1/videos twin. Builds artifacts + the ffmpeg argv and
+  # SPAWNS NOTHING (the ratified process boundary).
+  src/vllm/multimodal/minimax_h3_video.cpp
   src/vllm/v1/core/encoder_cache_manager.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
@@ -847,12 +922,19 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_quant_dequant.cpp
   src/vt/cpu/cpu_quant_act.cpp
   src/vt/cpu/cpu_quant_dot.cpp
+  src/vt/cpu/cpu_quant_dot_sdot.cpp
   src/vt/cpu/cpu_quant_dot_arm.cpp
   src/vt/cpu/cpu_quant_repack.cpp
   src/vt/cpu/cpu_quant_repack_arm.cpp
   src/vt/cpu/cpu_quant_traits.cpp
   src/vt/cpu/cpu_quant_gemm.cpp
   src/vt/cpu/cpu_layernorm.cpp
+  # Conformer / FastConformer audio-encoder kernels (spike
+  # .agents/specs/parakeet-conformer-encoder.md rows P1/P2/P3). Self-registering
+  # translation units, reached through vllm's INTERFACE --whole-archive option.
+  src/vt/cpu/cpu_conv2d.cpp
+  src/vt/cpu/cpu_conv1d_depthwise.cpp
+  src/vt/cpu/cpu_attn_relpos.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
   src/vt/cpu/cpu_mla_prefill.cpp
@@ -890,6 +972,17 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-mavx512f;-mavx512bw;-mavx512vl;-mf16c>")
 endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  # KERNEL-CPU-A76-Q8-DOT is Linux-only because its dispatch uses HWCAP/MIDR
+  # and the hand-written file carries ELF assembler directives. Other arm64
+  # platforms compile the generic stub and retain their existing portable tier.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    enable_language(ASM)
+    target_sources(vllm PRIVATE src/vt/cpu/cpu_quant_dot_a76.S)
+    set_source_files_properties(
+      src/vt/cpu/cpu_quant_dot_sdot.cpp PROPERTIES
+      COMPILE_DEFINITIONS VT_CPU_A76_Q8_DOT=1
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+fp16>")
+  endif()
   # G6 mmla tier AND G7 repack tier (cpu_quant_repack_arm.cpp) both need i8mm.
   # The global -ffp-contract=off (top of this file) still applies on top of this
   # per-file -march, which is what keeps the repack gemm/gemv's non-fused
@@ -1047,11 +1140,21 @@ if(VLLM_CPP_HIP)
     src/vllm/platforms/rocm.cpp
     src/vt/rocm/rocm_backend.hip
     src/vt/rocm/rocm_rmsnorm.hip
+    src/vt/rocm/rocm_embedding.hip
+    src/vt/rocm/rocm_dense_basic.hip
+    src/vt/rocm/rocm_matmul_hipblaslt.hip
+    src/vt/rocm/rocm_paged_attn.hip
+    src/vt/rocm/rocm_gemma4_experts.hip
     src/vt/rocm/rocm_ops.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
       src/vt/rocm/rocm_backend.hip
       src/vt/rocm/rocm_rmsnorm.hip
+      src/vt/rocm/rocm_embedding.hip
+      src/vt/rocm/rocm_dense_basic.hip
+      src/vt/rocm/rocm_matmul_hipblaslt.hip
+      src/vt/rocm/rocm_paged_attn.hip
+      src/vt/rocm/rocm_gemma4_experts.hip
       src/vt/rocm/rocm_ops.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()
@@ -1063,6 +1166,27 @@ if(VLLM_CPP_HIP)
     target_link_libraries(vllm PUBLIC ${VLLM_CPP_AMDHIP64_LIB})
   else()
     target_link_libraries(vllm PUBLIC amdhip64)
+  endif()
+  # hipBLAS + hipBLASLt — dense GEMM (ROCm math libraries).
+  find_path(VLLM_CPP_HIPBLAS_INCLUDE hipblas/hipblas.h
+    PATHS ${ROCM_PATH}/include /opt/rocm/include)
+  find_library(VLLM_CPP_HIPBLAS_LIB NAMES hipblas
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64 /opt/rocm/lib /opt/rocm/lib64)
+  find_path(VLLM_CPP_HIPBLASLT_INCLUDE hipblaslt/hipblaslt.h
+    PATHS ${ROCM_PATH}/include /opt/rocm/include)
+  find_library(VLLM_CPP_HIPBLASLT_LIB NAMES hipblaslt
+    PATHS ${ROCM_PATH}/lib ${ROCM_PATH}/lib64 /opt/rocm/lib /opt/rocm/lib64)
+  if(VLLM_CPP_HIPBLAS_INCLUDE AND VLLM_CPP_HIPBLAS_LIB)
+    target_include_directories(vllm PUBLIC ${VLLM_CPP_HIPBLAS_INCLUDE})
+    target_link_libraries(vllm PUBLIC ${VLLM_CPP_HIPBLAS_LIB})
+    message(STATUS "ROCm hipBLAS: ${VLLM_CPP_HIPBLAS_LIB}")
+  else()
+    message(FATAL_ERROR "VLLM_CPP_HIP=ON requires hipBLAS (libhipblas + hipblas/hipblas.h).")
+  endif()
+  if(VLLM_CPP_HIPBLASLT_INCLUDE AND VLLM_CPP_HIPBLASLT_LIB)
+    target_include_directories(vllm PUBLIC ${VLLM_CPP_HIPBLASLT_INCLUDE})
+    target_link_libraries(vllm PUBLIC ${VLLM_CPP_HIPBLASLT_LIB})
+    message(STATUS "ROCm hipBLASLt: ${VLLM_CPP_HIPBLASLT_LIB}")
   endif()
 else()
   # BIT-ROT GUARD (BACKEND-ROCM W0). The ROCm platform leg is deliberately plain

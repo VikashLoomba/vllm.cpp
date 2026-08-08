@@ -73,6 +73,22 @@ FromFloatFn BlockFromFloat(DType dtype);
 // cpu_quant_dot.cpp.
 VecDotFn BlockVecDot(DType dtype);
 
+// Q8_0 x Q8_0 DotProd variants for KERNEL-CPU-A76-Q8-DOT. The explicit
+// getters are test/benchmark seams; SelectQuantQ8VecDot applies
+// VT_CPU_Q8_DOT=auto|portable|sdot|a76-asm while retaining `portable` as the
+// universal fallback. The assembly getter is ISA-safe on any DotProd core;
+// QuantQ8A76AsmActive additionally reports whether the running CPU is A76.
+// QuantQ8PortableVecDot is the TRUE portable reference (quants.c:400 order),
+// never the runtime-selected kernel: on an A76 the QuantTraits vec_dot IS the
+// assembly tier, so a byte-equality test that used it as its reference would
+// compare the selected kernel against itself.
+VecDotFn QuantQ8PortableVecDot();
+VecDotFn QuantQ8SdotVecDot();
+VecDotFn QuantQ8A76AsmVecDot();
+VecDotFn SelectQuantQ8VecDot(VecDotFn portable);
+bool QuantQ8SdotActive();
+bool QuantQ8A76AsmActive();
+
 // The Arm i8mm (mmla) `nrc == 2` `vec_dot` for a block WEIGHT dtype — QUANT-
 // GGUF-CIQ-GEMM work row G6 (cpu_quant_dot_arm.cpp). Non-null ONLY when the
 // process runs on i8mm-capable aarch64 (compile-time `__ARM_FEATURE_MATMUL_INT8`
@@ -139,6 +155,23 @@ bool QuantRepackActive();
 // K % 32 subsumes the K % 8 one). A weight that fails it stays plain and takes
 // the normal path — correct, just unrepacked.
 bool QuantRepackEligible(DType weight_dtype, int64_t n, int64_t k);
+
+// --- ELEMENTWISE repack-at-load (KERNEL-GEMM-CPU-TILED lever 2) -------------
+// The non-quant sibling of the block repack above, declared here for the same
+// reason: the loader needs it and `src/vt/cpu/cpu_matmul_elem.h` is private.
+//
+// Transposes an ELEMENTWISE (f32/f16/bf16) [N,K] matmul weight into [K,N] so
+// `vt::MatmulBT` reaches the transpose-free `nk`/`nkm` micro-kernels, measured
+// 1.16x to 1.30x on dgx and BYTE-IDENTICAL (both orientations accumulate each
+// output over K in strict increasing order). Pure permutation: same bytes, same
+// count, so no product and no sum can change.
+//
+// The caller must set `Tensor.elem_kn_repacked` on the resulting weight. Only
+// the CPU `MatmulBTKernel` honours that flag, so a repacked buffer handed to
+// any other consumer would be read as [N,K] and be garbage; the loader keeps
+// this opt-in (VT_CPU_ELEM_KN_REPACK=1) for exactly that reason.
+bool ElemRepackEligible(DType weight_dtype, int64_t n, int64_t k);
+void ElemRepackWeight(DType weight_dtype, uint8_t* bytes, int64_t n, int64_t k);
 
 // Repack a [N,K] q8_0 weight buffer IN PLACE into the block_q8_0x4 interleave.
 // `blocks` holds N*(K/32) plain BlockQ8_0 on entry and N/4 groups of (K/32)

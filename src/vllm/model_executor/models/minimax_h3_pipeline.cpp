@@ -479,9 +479,12 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
     vt::Queue vq = vt::GetBackend(device.type).CreateQueue();
     const MiniMaxH3VideoVaeDeviceWeights staged_vae =
         StageMiniMaxH3VideoVaeWeights(vq, video_config, video_weights);
-    // Upstream's video path is decode_base -> decode_temporal: chunked in TIME,
-    // and NOT spatially tiled (decoder_tiling defaults false and the shipped
-    // config does not set it).
+    // Upstream's video path is decode_base -> decode_temporal: chunked in TIME.
+    // decode_temporal then composes SPATIAL tiling per chunk whenever
+    // `decoder_tiling` is set, which it is by DEFAULT (minimax_h3.h: `bool
+    // decoder_tiling = true`) -- required, not optional, because the ViT3D's RoPE
+    // is length-normalized over the grid it is handed. A real canvas therefore
+    // decodes as 256-px tiles inside each temporal chunk.
     result.frames = MiniMaxH3VideoVaeDecodeTemporalDevice(
         device, video_config, staged_vae, video_latent, request.latent_t, request.latent_h,
         request.latent_w, request.num_frames, &result.frame_shape);

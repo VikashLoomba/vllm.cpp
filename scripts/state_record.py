@@ -97,7 +97,7 @@ def parse_manifest(root: Path) -> tuple[list[Shard], list[str]]:
         if path.stat().st_size > MANIFEST_MAX_BYTES:
             return [], [f"{path}: manifest exceeds the 64 KiB limit"]
         with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.reader(handle)
+            reader = csv.reader(handle, strict=True)
             header = tuple(next(reader, ()))
             if header != MANIFEST_HEADER:
                 return [], [f"{path}: expected manifest header {MANIFEST_HEADER!r}"]
@@ -180,8 +180,11 @@ def _validate_evidence(root: Path, event: Event, *, legacy: bool) -> list[str]:
     except UnicodeError as exc:
         return [*errors, f"{path}: evidence is not UTF-8: {exc}"]
     marker = f"<!-- state-event: {event.event_id} -->"
-    if marker not in text.splitlines():
-        errors.append(f"{path}: event marker must match {event.event_id}")
+    marker_lines = [line for line in text.splitlines() if "<!-- state-event:" in line]
+    if marker_lines != [marker]:
+        errors.append(
+            f"{path}: event must contain exactly one event marker matching {event.event_id}"
+        )
     if legacy:
         try:
             read_legacy_payload(path)
@@ -293,7 +296,7 @@ def parse_events(root: Path, shards: list[Shard]) -> tuple[list[Event], list[str
                 errors.append(f"{path}: index shard exceeds the 256 KiB limit")
                 continue
             with path.open(newline="", encoding="utf-8") as handle:
-                reader = csv.reader(handle)
+                reader = csv.reader(handle, strict=True)
                 header = tuple(next(reader, ()))
                 if header != EVENT_HEADER:
                     errors.append(f"{path}: expected event header {EVENT_HEADER!r}")

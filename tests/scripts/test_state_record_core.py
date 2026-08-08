@@ -58,6 +58,37 @@ class ManifestParsingTests(unittest.TestCase):
             self.assertEqual(len(shards), 1)
             self.assertEqual(shards[0].shard_id, "2026-08-001")
 
+    def test_manifest_rejects_unterminated_quoted_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".agents").mkdir()
+            (root / ".agents/state.csv").write_text(
+                "schema_version,shard_id,index_path,event_prefix\n"
+                "1,2026-08-001,.agents/state-index/2026-08-001.csv,"
+                '".agents/state-events/2026-08/',
+                encoding="utf-8",
+            )
+
+            shards, errors = state_record.parse_manifest(root)
+
+            self.assertEqual(shards, [])
+            self.assertTrue(any("parse manifest" in error for error in errors), errors)
+
+    def test_manifest_rejects_invalid_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".agents").mkdir()
+            (root / ".agents/state.csv").write_bytes(
+                b"schema_version,shard_id,index_path,event_prefix\n"
+                b"1,2026-08-001,.agents/state-index/2026-08-001.csv,"
+                b".agents/state-events/2026-08/\n\xff"
+            )
+
+            shards, errors = state_record.parse_manifest(root)
+
+            self.assertEqual(shards, [])
+            self.assertTrue(any("utf-8" in error.lower() for error in errors), errors)
+
     def test_manifest_rejects_invalid_scalar_and_path_contracts(self) -> None:
         cases = {
             "schema": (
@@ -205,6 +236,38 @@ class EventParsingTests(unittest.TestCase):
             self.assertEqual(events, [])
             self.assertTrue(any("event header" in error for error in errors), errors)
 
+    def test_event_index_rejects_unterminated_quoted_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_root(directory)
+            fields = self.valid_fields()
+            self.write_event_file(root, fields)
+            (root / self.shard.index_path).write_text(
+                self.header + ",".join(fields[:-1]) + ',"unterminated',
+                encoding="utf-8",
+            )
+
+            events, errors = self.parse_events(root)
+
+            self.assertEqual(events, [])
+            self.assertTrue(any("parse event index" in error for error in errors), errors)
+
+    def test_event_index_rejects_invalid_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_root(directory)
+            fields = self.valid_fields()
+            self.write_event_file(root, fields)
+            row = ",".join(fields).encode("utf-8").replace(
+                fields[11].encode("utf-8"), b"invalid-\xff-summary"
+            )
+            (root / self.shard.index_path).write_bytes(
+                self.header.encode("utf-8") + row + b"\n"
+            )
+
+            events, errors = self.parse_events(root)
+
+            self.assertEqual(events, [])
+            self.assertTrue(any("utf-8" in error.lower() for error in errors), errors)
+
     def test_event_index_rejects_files_over_256_kib(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.make_root(directory)
@@ -306,6 +369,57 @@ class EventParsingTests(unittest.TestCase):
 
                 self.assertEqual(events, [])
                 self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_event_rejects_duplicate_matching_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_root(directory)
+            fields = self.valid_fields()
+            marker = f"<!-- state-event: {fields[0]} -->"
+            self.write_event(
+                root,
+                fields,
+                "# Duplicate markers\n"
+                f"{marker}\n{marker}\n\n"
+                "## Context\nX\n\n## Outcome\nX\n\n## Evidence\nX\n\n"
+                "## Next action\nX\n",
+            )
+
+            events, errors = self.parse_events(root)
+
+            self.assertEqual(events, [])
+            self.assertTrue(any("event marker" in error for error in errors), errors)
+
+    def test_event_rejects_conflicting_second_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_root(directory)
+            fields = self.valid_fields()
+            self.write_event(
+                root,
+                fields,
+                "# Conflicting markers\n"
+                f"<!-- state-event: {fields[0]} -->\n"
+                "<!-- state-event: STATE-20260808T143000-999 -->\n\n"
+                "## Context\nX\n\n## Outcome\nX\n\n## Evidence\nX\n\n"
+                "## Next action\nX\n",
+            )
+
+            events, errors = self.parse_events(root)
+
+            self.assertEqual(events, [])
+            self.assertTrue(any("event marker" in error for error in errors), errors)
+
+    def test_event_evidence_rejects_invalid_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_root(directory)
+            fields = self.valid_fields()
+            self.write_event(root, fields)
+            evidence = root / fields[9]
+            evidence.write_bytes(evidence.read_bytes().replace(b"Input", b"invalid-\xff"))
+
+            events, errors = self.parse_events(root)
+
+            self.assertEqual(events, [])
+            self.assertTrue(any("UTF-8" in error for error in errors), errors)
 
     def test_event_rejects_oversized_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

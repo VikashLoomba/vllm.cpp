@@ -483,6 +483,8 @@ evidence-preserving archive migration. It expires after the migration window;
 subsequent policy changes remain within the ordinary per-class budgets.
 Pull-request CI supplies its exact event head to role discipline so a detached
 clean checkout cannot misreport unmerged row commits as already landed on main.
+Trailer validation also walks the exact event base-to-head range; it never
+mistakes GitHub's synthetic checkout merge for contributor history.
 
 1. Inventory every active normative statement and map it to a `POL-*` rule,
    procedure, archived rationale, or deletion as duplicate.

@@ -89,7 +89,14 @@ jobs:
           python3 scripts/check-gemv-invocation-consistency.py
           python3 tests/scripts/test_check_gemv_invocation_consistency.py
       - name: Protocol prose matches the checkers that enforce it
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
         run: |
+          set -eu
           python3 scripts/check-policy.py
           python3 scripts/check-prompt-contract.py
           python3 scripts/check-protocol-consistency.py
@@ -101,10 +108,15 @@ jobs:
           python3 tests/scripts/test_check_protocol_consistency.py
           python3 tests/scripts/test_agent_gates.py
           cutover="$(tr -d '\n' < .agents/policy-cutover)"
-          base="${{ github.event.pull_request.base.sha }}"
-          if [ -z "$base" ]; then base="${{ github.event.before }}"; fi
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+          else
+            base="$PUSH_BASE"
+            head="$PUSH_HEAD"
+          fi
           python3 scripts/check-commit-trailers.py \
-            --range "$base..HEAD" --cutover "$cutover"
+            --range "$base..$head" --cutover "$cutover"
       - name: The state-log tail is anchored and chronological
         run: |
           python3 scripts/check-state-order.py

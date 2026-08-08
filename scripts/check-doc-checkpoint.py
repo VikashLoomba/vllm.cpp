@@ -496,6 +496,18 @@ PENDING_PR_RANGE_FILES = frozenset(
         "tests/scripts/test_doc_checkpoint.py",
     }
 )
+# Actions checks out a synthetic PR merge, which is not contributor history and
+# cannot carry contributor trailers. This closed follow-up makes the in-job
+# trailer gate walk the exact event base..head range instead of base..HEAD.
+SYNTHETIC_MERGE_RANGE_FILES = frozenset(
+    {
+        ".github/workflows/ci.yml",
+        "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md",
+        "scripts/check-doc-checkpoint.py",
+        "tests/scripts/test_agent_gates.py",
+        "tests/scripts/test_doc_checkpoint.py",
+    }
+)
 FEATURE_CHECKPOINT_FILES = frozenset(
     {
         "CMakeLists.txt",
@@ -582,6 +594,8 @@ def classify_changed_paths(paths: list[str]) -> set[str]:
         return {"governance"}
     if path_set == PENDING_PR_RANGE_FILES:
         return {"governance"}
+    if path_set == SYNTHETIC_MERGE_RANGE_FILES:
+        return {"governance"}
     pr_size_bootstrap_members = path_set & PR_SIZE_BOOTSTRAP_FILES
     incomplete_pr_size_bootstrap = (
         ".agents/waivers.csv" in pr_size_bootstrap_members
@@ -596,6 +610,14 @@ def classify_changed_paths(paths: list[str]) -> set[str]:
         and len(pending_pr_range_members) > 1
     )
     if incomplete_pending_pr_range:
+        classes.add("feature_checkpoint")
+    synthetic_merge_range_members = path_set & SYNTHETIC_MERGE_RANGE_FILES
+    incomplete_synthetic_merge_range = (
+        "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md"
+        in synthetic_merge_range_members
+        and len(synthetic_merge_range_members) > 1
+    )
+    if incomplete_synthetic_merge_range:
         classes.add("feature_checkpoint")
     exact_claim_cutover = (
         path_set == CLAIM_CUTOVER_FILES

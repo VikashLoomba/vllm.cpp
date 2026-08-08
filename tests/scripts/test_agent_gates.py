@@ -66,6 +66,13 @@ class AgentGateBootstrapTests(unittest.TestCase):
         self.assertTrue((ROOT / "scripts/agent-ready.py").is_file())
         self.assertTrue((ROOT / "scripts/agent-integration.py").is_file())
 
+    def test_ci_trailer_gate_uses_event_head_not_synthetic_checkout_head(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn('head="$PR_HEAD"', workflow)
+        self.assertIn('head="$PUSH_HEAD"', workflow)
+        self.assertIn('--range "$base..$head"', workflow)
+        self.assertNotIn('--range "$base..HEAD"', workflow)
+
 
 class ReadyContractTests(unittest.TestCase):
     def test_exact_live_pr_and_green_ci_pass(self) -> None:

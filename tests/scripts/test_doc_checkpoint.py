@@ -131,8 +131,11 @@ class SemanticClassificationTests(unittest.TestCase):
         for path in (
             "scripts/check-policy.py",
             "scripts/check-doc-checkpoint.py",
+            "scripts/check-prompt-contract.py",
             "scripts/check-protocol-consistency.py",
+            ".agents/prompts/operator.md",
             "tests/scripts/test_doc_checkpoint.py",
+            "tests/scripts/test_check_prompt_contract.py",
             "tests/scripts/test_check_protocol_consistency.py",
         ):
             with self.subTest(path=path):
@@ -146,7 +149,9 @@ class SemanticClassificationTests(unittest.TestCase):
             ".agents/waivers.csv",
             "scripts/policy_contract.py",
             "scripts/check-policy.py",
+            "scripts/check-prompt-contract.py",
             "tests/scripts/test_policy_contract.py",
+            "tests/scripts/test_check_prompt_contract.py",
         ]
         self.assertEqual(doc_checkpoint.classify_changed_paths(paths), {"governance"})
         self.assertEqual(doc_checkpoint.checkpoint_errors(set(paths)), [])

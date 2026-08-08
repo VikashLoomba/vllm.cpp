@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -91,7 +92,13 @@ def _prompt_tree(files: dict[str, str]):
 
 
 @contextlib.contextmanager
-def _repo_copy(workflow_text: str, *, prompts: bool = True):
+def _repo_copy(
+    workflow_text: str,
+    *,
+    prompts: bool = True,
+    prompt_damage: tuple[str, str, str] | None = None,
+    extra_prompt: tuple[str, str] | None = None,
+):
     """Run consistency.main() against a copy of the repo's own documents.
 
     Only `.agents/workflow.md` is substituted, so a red from this helper is
@@ -105,6 +112,10 @@ def _repo_copy(workflow_text: str, *, prompts: bool = True):
         shutil.copy(
             ROOT / "scripts/check-doc-checkpoint.py",
             root / "scripts/check-doc-checkpoint.py",
+        )
+        shutil.copy(
+            ROOT / "scripts/check-prompt-contract.py",
+            root / "scripts/check-prompt-contract.py",
         )
         shutil.copy(ROOT / ".agents/policy.csv", root / ".agents/policy.csv")
         shutil.copy(ROOT / ".agents/waivers.csv", root / ".agents/waivers.csv")
@@ -122,6 +133,19 @@ def _repo_copy(workflow_text: str, *, prompts: bool = True):
                         target.write_text("# fixture\n", encoding="utf-8")
         if prompts:
             shutil.copytree(ROOT / ".agents/prompts", root / ".agents/prompts")
+            if prompt_damage is not None:
+                role, old, new = prompt_damage
+                path = root / ".agents/prompts" / f"{role}.md"
+                text = path.read_text(encoding="utf-8")
+                damaged = text.replace(old, new, 1)
+                if damaged == text:
+                    raise AssertionError(f"prompt mutation did not match: {old!r}")
+                path.write_text(damaged, encoding="utf-8")
+            if extra_prompt is not None:
+                name, content = extra_prompt
+                (root / ".agents/prompts" / name).write_text(
+                    content, encoding="utf-8"
+                )
         (root / ".agents/workflow.md").write_text(workflow_text, encoding="utf-8")
         saved, consistency.ROOT = consistency.ROOT, root
         out, err = io.StringIO(), io.StringIO()
@@ -441,8 +465,16 @@ class InterviewWiring(unittest.TestCase):
     )
 
     @contextlib.contextmanager
-    def _tree(self, workflow_text: str, *, prompts: bool = True):
-        with _repo_copy(workflow_text, prompts=prompts) as run:
+    def _tree(
+        self,
+        workflow_text: str,
+        *,
+        prompts: bool = True,
+        prompt_damage: tuple[str, str, str] | None = None,
+    ):
+        with _repo_copy(
+            workflow_text, prompts=prompts, prompt_damage=prompt_damage
+        ) as run:
             yield run
 
     def test_faithful_copy_passes(self):
@@ -464,23 +496,41 @@ class InterviewWiring(unittest.TestCase):
         self.assertIn("role-interview", err)
 
     def test_main_fails_when_the_prompts_are_missing(self):
-        """main() must CALL prompt_errors, not merely define it.
-
-        Every prompt assertion above calls the function directly, so a main()
-        that never wires it in leaves them all green while the gate enforces
-        nothing -- the same drift, one function later.
-        """
+        """The protocol gate must call the semantic prompt validator."""
         text = (ROOT / ".agents/workflow.md").read_text(encoding="utf-8")
         with self._tree(text, prompts=False) as run:
             code, _, err = run()
         self.assertEqual(code, 1, err)
         self.assertIn(".agents/prompts/reviewer.md", err)
 
+    def test_main_rejects_semantic_damage_that_keeps_legacy_phrases(self):
+        """A complete legacy phrase registry must not mask a contradiction."""
+        text = (ROOT / ".agents/workflow.md").read_text(encoding="utf-8")
+        damage = (
+            "reviewer",
+            "## Method",
+            "Scratch mutation replaces static review.\n\n## Method",
+        )
+        with self._tree(text, prompt_damage=damage) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1, err)
+        self.assertIn("unparsed", err)
+
 
 class PromptArtifactTests(unittest.TestCase):
-    def test_both_prompts_exist_and_are_tracked(self):
+    def test_unknown_runtime_prompt_artifact_is_rejected(self):
+        text = (ROOT / ".agents/workflow.md").read_text(encoding="utf-8")
+        with _repo_copy(
+            text,
+            extra_prompt=("critic.md", "# malformed runtime prompt\n"),
+        ) as run:
+            code, _, err = run()
+        self.assertEqual(code, 1, err)
+        self.assertIn("critic.md", err)
+
+    def test_all_runtime_prompts_exist_and_are_tracked(self):
         tracked = _tracked_paths(".agents/prompts")
-        for name in ("reviewer.md", "implementer.md"):
+        for name in ("implementer.md", "reviewer.md", "operator.md"):
             path = ROOT / ".agents/prompts" / name
             self.assertTrue(path.is_file(), f"{name} must exist")
             # A silent downgrade to existence-only is the failure/absence
@@ -496,125 +546,68 @@ class PromptArtifactTests(unittest.TestCase):
                     "is not a protocol",
                 )
 
-    def test_the_reviewer_prompt_carries_the_mutation_instruction(self):
-        # The instruction IS the deliverable. A reviewer told only to "review"
-        # reads the diff, and reading found none of the eleven tests that
-        # passed with their subject deleted.
-        text = (ROOT / ".agents/prompts/reviewer.md").read_text(encoding="utf-8")
-        for needle in ("mutate", "delete or invert", "stays green"):
-            self.assertIn(needle, text.lower(), needle)
+    def test_protocol_checker_uses_the_semantic_prompt_contract(self):
+        self.assertEqual(consistency.prompt_contract_errors(), [])
 
-    def test_the_reviewer_prompt_refuses_to_defer_to_the_plan(self):
-        text = (ROOT / ".agents/prompts/reviewer.md").read_text(encoding="utf-8")
-        self.assertIn("plan-mandated", text.lower())
 
-    def test_checker_rejects_a_prompt_missing_its_instruction(self):
-        # A missing FILE and a present file missing its INSTRUCTION are two
-        # different failures. Asserting only the first would leave the needle
-        # loop -- the part that carries the value -- entirely unpinned.
-        errors = consistency.prompt_errors({"nonexistent-prompt.md": ("mutate",)})
-        self.assertTrue(errors)
-        self.assertTrue(any("missing" in e for e in errors), errors)
-
-        present = ".agents/prompts/reviewer.md"
-        self.assertEqual(consistency.prompt_errors({present: ("mutate",)}), [])
-        omitted = consistency.prompt_errors(
-            {present: ("no reviewer prompt would ever contain this phrase",)}
+class SemanticPromptBridgeBoundaryTests(unittest.TestCase):
+    def _source(self) -> str:
+        return (ROOT / "scripts/check-protocol-consistency.py").read_text(
+            encoding="utf-8"
         )
-        self.assertTrue(any("omits" in e for e in omitted), omitted)
 
-    def test_an_explicitly_empty_spec_checks_nothing(self):
-        # An empty spec must mean "nothing required", not silently fall back to
-        # the live PROMPT_REQUIRED: an absence and a value that look the same is
-        # the defect class the implementer prompt names.
-        with _prompt_tree({}):
-            self.assertEqual(consistency.prompt_errors({}), [])
-            self.assertTrue(consistency.prompt_errors())
+    def assert_source_boundary(self, source: str) -> None:
+        # These are direct assertions over the complete production source. They
+        # deliberately do not consult a production token set: emptying or
+        # renaming an in-checker registry cannot weaken this boundary.
+        self.assertNotIn(".agents/prompts/", source)
+        self.assertNotIn("PROMPT_REQUIRED", source)
+        self.assertNotIn("PHRASE_PINS", source)
 
-    def test_the_checker_enforces_the_phrases_these_tests_demand(self):
-        # Every assertion above reads the prompt FILES, so emptying, narrowing
-        # or widening a PROMPT_REQUIRED tuple would leave them all green while
-        # the gate quietly stopped enforcing what this suite believes it does.
-        #
-        # The comparison is EQUALITY, deliberately, not "demanded is a substring
-        # of enforced". That substring idiom is borrowed from
-        # test_every_declarable_role_is_named_in_the_interview, where it is safe
-        # because the demanded side is DERIVED from role.DECLARABLE. Here both
-        # sides are hand-written literals, and a substring test cannot see the
-        # one narrowing that matters: reverting the reviewer needle from
-        # "mutate, don't read" to a bare "mutate" satisfies it while re-opening
-        # the incidental-match hole check-protocol-consistency.py spends five
-        # lines arguing is dangerous. Equality means changing what the gate
-        # enforces is a deliberate two-file act.
-        demanded = {
-            ".agents/prompts/reviewer.md": (
-                "mutate, don't read",
-                "delete or invert",
-                "stays green",
-                "every mutation you make re-runs the suite",
-                "plan-mandated",
+    def test_protocol_checker_source_is_only_a_prompt_contract_bridge(self):
+        self.assert_source_boundary(self._source())
+
+    def test_source_boundary_rejects_direct_and_indirect_registries_anywhere(self):
+        mutations = (
+            "\nPROMPT_REQUIRED = {}\n",
+            '\nruntime_prompt = ".agents/prompts/reviewer.md"\nlegacy_rows = {runtime_prompt: ()}\n',
+            '\nlegacy_rows = ((".agents/prompts/reviewer.md", ("mutate",)),)\n',
+            '\nlegacy_rows = [[".agents/prompts/reviewer.md", ["mutate"]]]\n',
+            '\ndef retired_validator():\n    return {".agents/prompts/reviewer.md": ("mutate",)}\n',
+            "\nPHRASE_PINS = ()\n",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(AssertionError):
+                    self.assert_source_boundary(self._source() + mutation)
+
+    def test_unrelated_module_constants_remain_allowed(self):
+        extended = self._source() + """
+
+PROMPT_BUDGET = 4096
+REQUIRED_PUBLIC_SURFACES = {"docs/STATUS.md": "feature checkpoint"}
+"""
+        self.assert_source_boundary(extended)
+
+    def test_bridge_imports_and_calls_the_authoritative_repository_validator(self):
+        checker = mock.Mock()
+        checker.repository_errors.return_value = ["semantic sentinel"]
+        with (
+            mock.patch.object(consistency, "_load", return_value=checker) as load,
+            mock.patch.object(
+                consistency,
+                "load_policy",
+                return_value={"POL-PROMPT-BOUNDARIES": object()},
             ),
-            ".agents/prompts/implementer.md": (
-                "failing test first",
-                "mutate every test",
-                "capture that failing set as a baseline",
-                "escalate rather than guess",
-            ),
-        }
-        self.assertEqual(
-            set(demanded),
-            set(consistency.PROMPT_REQUIRED),
-            "PROMPT_REQUIRED covers a different set of prompts than this suite",
+        ):
+            errors = consistency.prompt_contract_errors()
+        load.assert_called_once_with(
+            "prompt_contract_for_consistency", "scripts/check-prompt-contract.py"
         )
-        for relative, needles in demanded.items():
-            with self.subTest(prompt=relative):
-                self.assertEqual(
-                    set(consistency.PROMPT_REQUIRED[relative]),
-                    set(needles),
-                    f"PROMPT_REQUIRED[{relative!r}] no longer enforces exactly "
-                    "the phrases this suite demands; narrowing one is how the "
-                    "gate stops catching what it was built for",
-                )
-
-    def test_a_bare_mutate_needle_would_not_pin_the_binding_instruction(self):
-        # The executable justification for the full "mutate, don't read" needle.
-        # Deleting the ENTIRE binding-instruction section still leaves the word
-        # "mutate" in the file ("Never mutate the reviewed worktree" under What
-        # you may not do), so a bare needle stays green through the exact
-        # deletion it exists to catch. If this test ever goes red because the
-        # incidental match is gone, the needle may safely be simplified.
-        relative = ".agents/prompts/reviewer.md"
-        text = (ROOT / relative).read_text(encoding="utf-8")
-        without_section = re.sub(
-            r"## The binding instruction.*?(?=\n## )", "", text, flags=re.S
+        checker.repository_errors.assert_called_once_with(
+            consistency.ROOT, {"POL-PROMPT-BOUNDARIES"}
         )
-        self.assertNotEqual(without_section, text, "the strip pattern matched nothing")
-        with _prompt_tree({relative: without_section}):
-            self.assertEqual(
-                consistency.prompt_errors({relative: ("mutate",)}),
-                [],
-                "a bare 'mutate' no longer matches incidentally",
-            )
-            self.assertTrue(
-                consistency.prompt_errors({relative: ("mutate, don't read",)}),
-                "the shipped needle failed to catch the section deletion",
-            )
-
-    def test_each_required_phrase_is_pinned_individually(self):
-        # PROMPT_REQUIRED is a hand-written tuple, so a prompt that survives
-        # losing one of its phrases means that phrase was never enforced. Strip
-        # each one in turn from a copy of the real file and demand a red.
-        for relative, needles in consistency.PROMPT_REQUIRED.items():
-            text = (ROOT / relative).read_text(encoding="utf-8")
-            for needle in needles:
-                with self.subTest(prompt=relative, needle=needle):
-                    damaged = re.sub(re.escape(needle), "", text, flags=re.I)
-                    self.assertNotEqual(
-                        damaged, text, f"{needle!r} does not appear in {relative}"
-                    )
-                    with _prompt_tree({relative: damaged}):
-                        errors = consistency.prompt_errors({relative: needles})
-                    self.assertTrue(any("omits" in e for e in errors), errors)
+        self.assertEqual(errors, ["semantic sentinel"])
 
 
 class OrchestrationLoopTests(unittest.TestCase):

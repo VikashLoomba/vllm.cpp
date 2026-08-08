@@ -344,6 +344,7 @@ def public_rule_bindings(root: Path = ROOT) -> dict[str, PublicRuleBinding]:
 GOVERNANCE_FILES = frozenset(
     {
         ".agents/prompts/implementer.md",
+        ".agents/prompts/operator.md",
         ".agents/prompts/reviewer.md",
         ".agents/governance-tasks.csv",
         ".agents/policy.csv",
@@ -353,6 +354,7 @@ GOVERNANCE_FILES = frozenset(
         "scripts/check-gate-commands.py",
         "scripts/policy_contract.py",
         "scripts/check-policy.py",
+        "scripts/check-prompt-contract.py",
         "scripts/check-pr-size.py",
         "scripts/check-protocol-consistency.py",
         "scripts/check-role-discipline.py",
@@ -360,6 +362,7 @@ GOVERNANCE_FILES = frozenset(
         "tests/scripts/test_agent_role.py",
         "tests/scripts/test_claim_view.py",
         "tests/scripts/test_policy_contract.py",
+        "tests/scripts/test_check_prompt_contract.py",
         "tests/scripts/test_doc_checkpoint.py",
         "tests/scripts/test_check_protocol_consistency.py",
         "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md",

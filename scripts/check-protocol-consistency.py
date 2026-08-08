@@ -21,13 +21,9 @@ that the controller runs the row's gate itself instead of taking the
 implementer's word, or that findings are never fixed in the controller's own
 session.
 
-The same gate finally asserts that the sub-agent prompts under `.agents/prompts`
-exist and still carry their binding instructions. Every Important finding across
-two branches of this project came from an INDEPENDENT reviewer sub-agent, none
-from an implementer's self-review, and the reviewers found them by MUTATING code
-rather than reading diffs: eleven tests passed with the thing they named
-deleted, and not one was visible by reading. That instruction is the deliverable,
-so it is tracked and pinned phrase by phrase, not merely present as a file.
+The same gate finally runs the closed runtime-prompt grammar. Phrase presence
+cannot establish a method contract: contradictory prose may retain every
+required phrase. The semantic validator therefore parses every nonempty line.
 """
 
 from __future__ import annotations
@@ -53,8 +49,8 @@ INTERVIEW_DOCUMENT = ".agents/workflow.md"
 INTERVIEW_MARKER = "<!-- role-interview:begin -->"
 INTERVIEW_REQUIRED = ("claim operator", "claim helper --row", "claim read-only", "--headless")
 
-# The same manual must carry the operator's LOOP. The prompts in PROMPT_REQUIRED
-# below are handed to sub-agents; nothing told the operator how to run one, and
+# The same manual must carry the operator's LOOP. The prompts handed to
+# sub-agents cannot by themselves tell the operator how to run one, and
 # the three rules that carry the whole return are exactly the ones an operator
 # improvises away: dispatch a FRESH reviewer whose instruction is to MUTATE,
 # run the row's gate YOURSELF rather than believing the author's report, and
@@ -75,38 +71,6 @@ LOOP_REQUIRED = (
     "run the row's gate yourself",
     "never fix findings yourself",
 )
-
-# The reviewer prompt's value is the MUTATION instruction; a reviewer told only
-# to "review" reads the diff, and reading found none of the eleven tests that
-# passed with their subject deleted. Pin the instruction, not the file.
-#
-# The reviewer needle is the full "mutate, don't read", not a bare "mutate":
-# the prompt also says "never mutate the reviewed worktree" further down, so the
-# short form would stay satisfied by an unrelated sentence after the binding
-# instruction was deleted. That is the same "an unrelated line satisfied the
-# assertion" failure the prompt itself is written to catch.
-#
-# Two needles pin REPAIRS to earlier drafts of these prompts, because a prompt
-# that once contradicted itself can drift back: the reviewer prompt used to
-# forbid re-running the full suite (which reads as a budget on the mutations it
-# demands two sections earlier), and the implementer prompt used to demand a
-# green gate with no answer for reds that were already there before the work
-# started, whose only exits were stalling or an allowlist.
-PROMPT_REQUIRED = {
-    ".agents/prompts/reviewer.md": (
-        "mutate, don't read",
-        "delete or invert",
-        "stays green",
-        "every mutation you make re-runs the suite",
-        "plan-mandated",
-    ),
-    ".agents/prompts/implementer.md": (
-        "failing test first",
-        "mutate every test",
-        "capture that failing set as a baseline",
-        "escalate rather than guess",
-    ),
-}
 
 def _load(name: str, relative: str):
     path = ROOT / relative
@@ -203,26 +167,13 @@ def loop_errors(text: str) -> list[str]:
     ]
 
 
-def prompt_errors(required: dict[str, tuple[str, ...]] | None = None) -> list[str]:
-    """Each tracked prompt exists and carries its binding instruction."""
-    # `required or PROMPT_REQUIRED` would silently promote an explicitly EMPTY
-    # spec into the full live check, which is this repo's recurring defect
-    # class: an absence and a value that look the same. Only a missing argument
-    # means "use the default".
-    errors: list[str] = []
-    spec = PROMPT_REQUIRED if required is None else required
-    for relative, needles in spec.items():
-        path = ROOT / relative
-        if not path.is_file():
-            errors.append(f"{relative} is missing; the prompt is the protocol")
-            continue
-        text = path.read_text(encoding="utf-8").lower()
-        errors.extend(
-            f"{relative} omits {needle!r}"
-            for needle in needles
-            if needle.lower() not in text
-        )
-    return errors
+def prompt_contract_errors() -> list[str]:
+    """Validate every runtime prompt through the closed semantic grammar."""
+
+    checker = _load(
+        "prompt_contract_for_consistency", "scripts/check-prompt-contract.py"
+    )
+    return checker.repository_errors(ROOT, set(load_policy(ROOT)))
 
 
 def main() -> int:
@@ -246,7 +197,7 @@ def main() -> int:
     else:
         failures.extend(loop_errors(loop_doc.read_text(encoding="utf-8")))
 
-    failures.extend(prompt_errors())
+    failures.extend(prompt_contract_errors())
 
     if failures:
         for failure in failures:
@@ -258,10 +209,8 @@ def main() -> int:
             "name every answer agent-role.py accepts. The operator's loop is "
             f"the block between {LOOP_MARKER} and its :end in {LOOP_DOCUMENT}; "
             f"it must carry {', '.join(repr(n) for n in LOOP_REQUIRED)} inside "
-            "the block. The sub-agent prompts in "
-            f"{', '.join(PROMPT_REQUIRED)} must carry their binding "
-            "instructions verbatim; a prompt that lives only in an operator's "
-            "head is not a protocol.",
+            "the block. Every runtime prompt must satisfy the closed grammar "
+            "in scripts/check-prompt-contract.py; unknown prose is a failure.",
             file=sys.stderr,
         )
         return 1
@@ -269,9 +218,8 @@ def main() -> int:
     print(
         "OK: public-document policy matches scripts/check-doc-checkpoint.py, "
         f"{INTERVIEW_DOCUMENT} carries the "
-        f"role interview and the orchestration loop, and "
-        f"{len(PROMPT_REQUIRED)} sub-agent prompts carry their binding "
-        "instructions."
+        f"role interview and the orchestration loop, and all runtime prompts "
+        "satisfy the closed semantic contract."
     )
     return 0
 

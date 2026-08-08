@@ -496,9 +496,9 @@ PENDING_PR_RANGE_FILES = frozenset(
         "tests/scripts/test_doc_checkpoint.py",
     }
 )
-# Actions checks out a synthetic PR merge, which is not contributor history and
-# cannot carry contributor trailers. This closed follow-up makes the in-job
-# trailer gate walk the exact event base..head range instead of base..HEAD.
+# Actions checks out a synthetic PR merge, which is not contributor history.
+# These closed follow-ups make both in-job role checks and trailer validation
+# walk the exact event base..head range instead of detached HEAD.
 SYNTHETIC_MERGE_RANGE_FILES = frozenset(
     {
         ".github/workflows/ci.yml",

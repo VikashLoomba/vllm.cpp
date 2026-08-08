@@ -138,8 +138,25 @@ jobs:
           python3 scripts/check-gate-commands.py --check
           python3 tests/scripts/test_check_gate_commands.py
       - name: Agent role machinery and role discipline
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
         run: |
-          python3 scripts/check-role-discipline.py
+          set -eu
+          pending_args=()
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+            pending_args=(--pending-pr-head "$PR_HEAD")
+          else
+            base="$PUSH_BASE"
+            head="$PUSH_HEAD"
+          fi
+          python3 scripts/check-role-discipline.py \
+            --base "$base" --head "$head" "${pending_args[@]}"
           python3 tests/scripts/test_agent_role.py
           python3 tests/scripts/test_agent_onboard.py
       - name: Claim view, helper queue and PR reviewability

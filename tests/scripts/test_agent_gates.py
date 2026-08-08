@@ -73,6 +73,18 @@ class AgentGateBootstrapTests(unittest.TestCase):
         self.assertIn('--range "$base..$head"', workflow)
         self.assertNotIn('--range "$base..HEAD"', workflow)
 
+    def test_ci_role_suite_uses_exact_event_range_not_detached_head(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        role_step = workflow.split(
+            "- name: Agent role machinery and role discipline", 1
+        )[1].split("- name: Claim view, helper queue and PR reviewability", 1)[0]
+        self.assertIn('base="$PR_BASE"', role_step)
+        self.assertIn('head="$PR_HEAD"', role_step)
+        self.assertIn('base="$PUSH_BASE"', role_step)
+        self.assertIn('head="$PUSH_HEAD"', role_step)
+        self.assertIn('pending_args=(--pending-pr-head "$PR_HEAD")', role_step)
+        self.assertIn('--base "$base" --head "$head"', role_step)
+
 
 class ReadyContractTests(unittest.TestCase):
     def test_exact_live_pr_and_green_ci_pass(self) -> None:

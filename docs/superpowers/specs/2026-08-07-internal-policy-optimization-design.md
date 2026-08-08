@@ -481,6 +481,8 @@ Hooks remain convenience backstops.  They are never described as proof because
 PR #128 consumes `WAIVER-PR-SIZE-001` only for the one-time consolidation and
 evidence-preserving archive migration. It expires after the migration window;
 subsequent policy changes remain within the ordinary per-class budgets.
+Pull-request CI supplies its exact event head to role discipline so a detached
+clean checkout cannot misreport unmerged row commits as already landed on main.
 
 1. Inventory every active normative statement and map it to a `POL-*` rule,
    procedure, archived rationale, or deletion as duplicate.

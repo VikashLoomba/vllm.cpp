@@ -338,6 +338,20 @@ class BudgetEnforcement(unittest.TestCase):
                     )
                 )
 
+    def test_pending_pr_range_requires_the_exact_event_head(self) -> None:
+        role = checker.load_role_discipline()
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip()
+        base = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^"], cwd=ROOT, text=True
+        ).strip()
+        self.assertIn(head, role.pending_pr_commits(base, head, head))
+        for pending in ("", head[:-1], head.upper(), "0" * 40):
+            with self.subTest(pending=pending):
+                with self.assertRaises(ValueError):
+                    role.pending_pr_commits(base, head, pending)
+
 
 if __name__ == "__main__":
     unittest.main()

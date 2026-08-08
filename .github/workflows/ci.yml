@@ -189,7 +189,12 @@ jobs:
           fi
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
-          python3 scripts/check-role-discipline.py --base "$base" --head "$head"
+          pending_args=()
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            pending_args=(--pending-pr-head "$PR_HEAD")
+          fi
+          python3 scripts/check-role-discipline.py \
+            --base "$base" --head "$head" "${pending_args[@]}"
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.

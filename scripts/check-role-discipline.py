@@ -223,14 +223,34 @@ def commits_in_range(base: str, head: str) -> list[str]:
     return [c for c in git("rev-list", "--reverse", f"{base}..{head}").splitlines() if c]
 
 
+def pending_pr_commits(base: str, head: str, pending_pr_head: str) -> frozenset[str]:
+    """Return the exact unmerged PR range named by a trusted PR event."""
+
+    if re.fullmatch(r"[0-9a-f]{40}", pending_pr_head) is None:
+        raise ValueError("--pending-pr-head must be one lowercase 40-byte commit SHA")
+    try:
+        resolved_head = git("rev-parse", "--verify", f"{head}^{{commit}}")
+    except subprocess.CalledProcessError as exc:
+        raise ValueError("--head must resolve to one commit") from exc
+    if resolved_head != pending_pr_head:
+        raise ValueError("--pending-pr-head must exactly match --head")
+    return frozenset(commits_in_range(base, resolved_head))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--commit", help="check one commit")
     parser.add_argument("--base", help="check every commit after this revision")
     parser.add_argument("--head", help="range endpoint (requires --base)")
+    parser.add_argument(
+        "--pending-pr-head",
+        help="exact PR-event head SHA; marks only base..head as not yet landed",
+    )
     args = parser.parse_args()
     if (args.base is None) != (args.head is None):
         parser.error("--base and --head must be supplied together")
+    if args.pending_pr_head is not None and args.base is None:
+        parser.error("--pending-pr-head requires --base and --head")
 
     if args.base is not None:
         commits = commits_in_range(args.base, args.head)
@@ -239,6 +259,16 @@ def main() -> int:
     else:
         commits = ["HEAD"]
 
+    try:
+        pending = (
+            pending_pr_commits(args.base, args.head, args.pending_pr_head)
+            if args.pending_pr_head is not None
+            else frozenset()
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     failures, reported = [], []
     for commit in commits:
         for problem in inspect(commit):
@@ -246,7 +276,8 @@ def main() -> int:
             # integration rather than a false claim that unmerged work already
             # violated the arrival rule. Main history and recognized synthetic
             # PR merges remain strict.
-            (failures if enforced(commit) and has_reached_main(commit) else reported).append(problem)
+            landed = commit not in pending and enforced(commit) and has_reached_main(commit)
+            (failures if landed else reported).append(problem)
 
     for problem in reported:
         print(f"REPORT: {problem}", file=sys.stderr)

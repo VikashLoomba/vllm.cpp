@@ -129,6 +129,7 @@ class SemanticClassificationTests(unittest.TestCase):
 
     def test_exact_governance_checker_files_are_exempt(self) -> None:
         for path in (
+            "scripts/check-commit-trailers.py",
             "scripts/check-policy.py",
             "scripts/check-doc-checkpoint.py",
             "scripts/check-prompt-contract.py",
@@ -137,11 +138,25 @@ class SemanticClassificationTests(unittest.TestCase):
             "tests/scripts/test_doc_checkpoint.py",
             "tests/scripts/test_check_prompt_contract.py",
             "tests/scripts/test_check_protocol_consistency.py",
+            "tests/scripts/test_check_commit_trailers.py",
+            "tests/scripts/test_policy_waivers.py",
+            "tests/scripts/test_check_pr_size.py",
         ):
             with self.subTest(path=path):
                 self.assertEqual(
                     doc_checkpoint.classify_changed_paths([path]), {"governance"}
                 )
+
+    def test_similar_governance_names_remain_feature_checkpoints(self) -> None:
+        for path in (
+            "scripts/check-commit-trailers-extra.py",
+            "tests/scripts/test_policy_waivers_extra.py",
+            "tests/scripts/test_check_pr_size.md",
+        ):
+            with self.subTest(path=path):
+                classes = doc_checkpoint.classify_changed_paths([path])
+                self.assertIn("feature_checkpoint", classes)
+                self.assertNotIn("governance", classes)
 
     def test_governance_only_task_one_files_are_not_a_checkpoint(self) -> None:
         paths = [

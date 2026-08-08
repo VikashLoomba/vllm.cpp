@@ -416,8 +416,7 @@ recurrences; 27B prefill 21.5x on GB10; qwen3_5 #125 VERIFIED; CUDA build repair
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
 on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in —
 **blind-written, unverified** — M2 unblocks on verification; gfx1201 hipBLAS +
-Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700; #158 Task 1 expert-GeGLU
-shared-method fold is CPU byte-exact, runner repair pending;
+Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700; #158 CPU-green;
 [guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
 with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's
@@ -433,7 +432,7 @@ tp=1). The **real TP-2 GPU run + NCCL build-verify remain HW-blocked** (no
 parallelism mode is enumerated and ranked in
 [parallelism-modes](../.agents/specs/parallelism-modes.md), noting vLLM's
 "sequence parallel" is a TP compilation pass, not an axis).
-**Shared layer names no device**: async readback is a `Backend` capability.
+**Shared layer names no device**: async combine is capability-gated.
 
 **Tensor parallelism is scoped end-to-end at the pin** (#287,
 [tensor-parallelism-spike](../.agents/specs/tensor-parallelism-spike.md)):

@@ -86,19 +86,20 @@ static bool AsyncRunnerEnvDefault() {
 }
 
 // Async input-combine reads the sampled token id back on the host between
-// steps. Whether that read is VALID is a backend CAPABILITY, not a device name:
-// ask the backend (vt::Backend::SupportsAsyncSampledTokenReadback, backend.h),
-// which answers true for CPU (host and device memory are one allocation) and
-// CUDA (the sampled id is device-mirrored, async_device_mirror()), and false for
-// a DISCRETE non-CUDA GPU (e.g. ROCm gfx1201) whose sample_tokens_async leg
-// host-dereferences a device Alloc — the root cause of the "!" tokens on the lab
-// R9700 (2026-08-07). An absent backend (device not built into this binary)
-// yields nullptr and therefore false, which also subsumes the old
-// #ifdef VLLM_CPP_CUDA guard. Keeping the question on the backend is what stops
-// this device-agnostic shared layer from naming a device (check-device-leakage).
+// steps. Whether that read is VALID is a backend capability, not a device name:
+// unified memory is directly host-readable; otherwise the backend must advertise
+// a sampled-token mirror (CUDA's async_device_mirror()). A discrete non-CUDA GPU
+// without a mirror remains synchronous. An absent backend yields false, which
+// also subsumes the old #ifdef VLLM_CPP_CUDA guard. Keeping both questions on the
+// backend stops this shared layer from naming a device (check-device-leakage).
+bool BackendSupportsAsyncInputCombine(const vt::Backend& backend) {
+  return backend.UnifiedMemory() ||
+         backend.SupportsAsyncSampledTokenReadback();
+}
+
 static bool QueueSupportsAsyncInputCombine(const vt::Queue& queue) {
   const vt::Backend* backend = vt::TryGetBackend(queue.device.type);
-  return backend != nullptr && backend->SupportsAsyncSampledTokenReadback();
+  return backend != nullptr && BackendSupportsAsyncInputCombine(*backend);
 }
 
 // GDN step-geometry diagnostic (default OFF). When VT_GDN_DIAG_STEP_LOG=1, each

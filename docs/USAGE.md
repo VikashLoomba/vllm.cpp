@@ -31,6 +31,10 @@ Gemma-4 MoE expert residency (host-backed or already device-resident) is chosen
 automatically from the loaded weights; the shared GeGLU method adds no CLI or
 server flag.
 
+Async input combine is also selected automatically from backend capabilities:
+it is enabled for genuinely unified memory or a backend-provided sampled-token
+mirror, and stays synchronous on a discrete backend without that mirror.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--model <dir>` | (required) | Model directory (config.json + tokenizer.json + safetensors) |

@@ -187,6 +187,49 @@ constexpr int kBlockSize = 8;
 constexpr int kMaxModelLen = 32;
 constexpr int kNumBlocks = 8;
 
+class AsyncInputCombineBackend final : public vt::Backend {
+ public:
+  AsyncInputCombineBackend(bool unified_memory, bool sampled_token_mirror)
+      : unified_memory_(unified_memory),
+        sampled_token_mirror_(sampled_token_mirror) {}
+
+  void* Alloc(size_t) override { return nullptr; }
+  void Free(void*) override {}
+  void Memset(vt::Queue&, void*, int, size_t) override {}
+  void Copy(vt::Queue&, void*, const void*, size_t) override {}
+  vt::Queue CreateQueue() override { return {}; }
+  bool UnifiedMemory() const override { return unified_memory_; }
+  bool SupportsAsyncSampledTokenReadback() const override {
+    return sampled_token_mirror_;
+  }
+
+ private:
+  bool unified_memory_;
+  bool sampled_token_mirror_;
+};
+
+TEST_CASE("async input combine follows backend readability capabilities") {
+  struct Case {
+    const char* name;
+    bool unified_memory;
+    bool sampled_token_mirror;
+    bool want;
+  };
+  const Case cases[] = {
+      {"unified memory without a mirror", true, false, true},
+      {"discrete memory with a mirror", false, true, true},
+      {"discrete memory without a mirror", false, false, false},
+      {"unified memory with a mirror", true, true, true},
+  };
+
+  for (const Case& tc : cases) {
+    CAPTURE(std::string(tc.name));
+    const AsyncInputCombineBackend backend(tc.unified_memory,
+                                           tc.sampled_token_mirror);
+    CHECK(vllm::v1::BackendSupportsAsyncInputCombine(backend) == tc.want);
+  }
+}
+
 // A fake KVCacheConfig with the gate group structure: one full-attn group + one
 // mamba (GDN) group, sharing kNumBlocks blocks.
 KVCacheConfig MakeKvConfig(const HfConfig& c,

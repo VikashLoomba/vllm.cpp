@@ -108,7 +108,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `GemmaForCausalLM` | google/gemma-1.1-2b-it, unsloth/gemma-2b | near-tie 48/48 vs vLLM 0.25.0 | pending |
 | `Gemma2ForCausalLM` | google/gemma-2-2b-it | near-tie 48/48 vs vLLM 0.25.0 | pending |
 | `Gemma3ForCausalLM` | google/gemma-3-1b-it | strict 48/48 vs vLLM 0.25.0 | pending |
-| `Gemma4ForConditionalGeneration` | Gemma-4 multimodal (unsloth/gemma-4-E4B-it) | text strict, image mm near-tie; #158 Task 1 expert GeGLU host/resident fold CPU byte-exact; audio pending | pending |
+| `Gemma4ForConditionalGeneration` | Gemma-4 multimodal (unsloth/gemma-4-E4B-it) | text strict, image mm near-tie; #158 expert GeGLU host/resident fold CPU byte-exact and runner async eligibility capability-gated; audio pending | pending |
 | `Gemma4UnifiedForConditionalGeneration` | Gemma-4 "unified" HF export (google/gemma-4-12B-it), no-PLE dense layout | shares the Gemma-4 text+mm forward; loads on the same factory (contributor #140); no separate oracle gate for this arch name yet | pending |
 | `GraniteForCausalLM` | ibm-granite/granite-3.3-2b-instruct | near-tie 16/16 vs vLLM 0.25.0 | pending |
 | `StableLmForCausalLM` | stabilityai/stablelm-2-1_6b | near-tie 16/16 vs vLLM 0.25.0 | pending |
@@ -205,7 +205,7 @@ the registered engine forward.
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
+| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; APU unified-memory fix landed, unverified; async combine requires unified memory or a mirror) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
@@ -282,7 +282,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Architecturally blocked | Vision tower lives outside the registered engine forward |
 | Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
-| ROCm | W0 verified by community, model e2e pending | Backend + platform + 1 op, ctest-green on gfx1151/1103/1100/1201 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix in (managed allocs, unverified); M2 unblocks with it. [ROCM.md](ROCM.md) |
+| ROCm | W0 verified by community, model e2e pending | Ctest-green on gfx1151/1103/1100/1201 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocations are unverified; async combine accepts unified memory, not discrete/no-mirror. [ROCM.md](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |

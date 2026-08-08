@@ -83,11 +83,20 @@
 #include "vt/device.h"
 #include "vt/tensor.h"
 
+namespace vt {
+class Backend;
+}
+
 namespace vllm::v1::kv_offload {
 class KVConnector;  // KV-EXTERNAL-CACHE: worker-side store/load seam (fwd-decl).
 }  // namespace vllm::v1::kv_offload
 
 namespace vllm::v1 {
+
+// Backend policy predicate used by the queue-level async-input gate. Kept
+// separate from device registration so its complete capability truth table can
+// be exercised without pretending a host allocation belongs to a discrete GPU.
+bool BackendSupportsAsyncInputCombine(const vt::Backend& backend);
 
 // Decode-first reorder (utils.py::reorder_batch_to_split_decodes_and_prefills @
 // e24d1b24, T0 subset). Reorders `input_batch`'s active [0, num_reqs) requests so

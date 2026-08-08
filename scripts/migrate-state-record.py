@@ -147,11 +147,6 @@ def _assign_segments(
 ) -> tuple[Segment, ...]:
     legacy_ordinal = 0
     timestamp_sequences: Counter[str] = Counter()
-    fallback_period = next(
-        (occurred_at[:7] for _, _, occurred_at, _ in ranges if occurred_at),
-        "0000-00",
-    )
-
     segments: list[Segment] = []
     for start, end, occurred_at, compact in ranges:
         if compact is None:
@@ -160,7 +155,7 @@ def _assign_segments(
         else:
             timestamp_sequences[compact] += 1
             event_id = f"STATE-{compact}-{timestamp_sequences[compact]:03d}"
-        period = occurred_at[:7] if occurred_at else fallback_period
+        period = occurred_at[:7] if compact is not None else "0000-00"
         evidence_path = f".agents/state-events/{period}/{event_id}.md"
         segments.append(Segment(event_id, start, end, occurred_at, evidence_path))
     return tuple(segments)
@@ -207,7 +202,9 @@ def _build_indexes(segments: tuple[Segment, ...]) -> tuple[dict[str, bytes], byt
     for period, period_rows in sorted(rows_by_period.items()):
         groups: list[list[list[str]]] = []
         current: list[list[str]] = []
-        for row in sorted(period_rows, key=lambda item: item[0]):
+        for row in sorted(
+            period_rows, key=lambda item: state_record.event_order_key(item[0])
+        ):
             candidate = [*current, row]
             candidate_bytes = _csv_bytes(state_record.EVENT_HEADER, candidate)
             if current and (

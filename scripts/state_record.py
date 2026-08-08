@@ -65,6 +65,11 @@ LEGACY_LINK_RE = re.compile(
 )
 
 
+def event_order_key(event_id: str) -> tuple[int, str]:
+    """Order unsortable legacy imports before timestamped event IDs."""
+    return (0 if LEGACY_EVENT_ID_RE.fullmatch(event_id) else 1, event_id)
+
+
 @dataclass(frozen=True)
 class Shard:
     schema_version: str
@@ -326,7 +331,7 @@ def parse_events(root: Path, shards: list[Shard]) -> tuple[list[Event], list[str
         if len(shard_events) > SHARD_MAX_EVENTS:
             errors.append(f"{path}: index shard exceeds the 512-event limit")
         event_ids = [event.event_id for event in shard_events]
-        if event_ids != sorted(set(event_ids)):
+        if event_ids != sorted(set(event_ids), key=event_order_key):
             errors.append(f"{path}: event IDs must be unique and in increasing order")
         events.extend(shard_events)
     if errors:
@@ -401,7 +406,7 @@ def _spec_errors(root: Path, event: Event) -> list[str]:
 def _relation_errors(root: Path, events: list[Event]) -> list[str]:
     errors: list[str] = []
     event_ids = [event.event_id for event in events]
-    if event_ids != sorted(event_ids):
+    if event_ids != sorted(event_ids, key=event_order_key):
         errors.append("event IDs must be globally ordered across index shards")
     if len(event_ids) != len(set(event_ids)):
         errors.append("event IDs must be globally unique across index shards")

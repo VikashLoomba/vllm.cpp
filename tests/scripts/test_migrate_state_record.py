@@ -87,6 +87,26 @@ class MigrationRepo:
 
 
 class MigrationApplyTests(unittest.TestCase):
+    def test_apply_and_verify_prelude_with_multi_month_history(self) -> None:
+        """Catches legacy IDs sorting after timestamp IDs across dated shards."""
+        source = (
+            b"Unanchored prelude.\n"
+            b"## July event\n"
+            b"<!-- state: 2026-07-31T23:59:00Z -->\n"
+            b"July payload.\n"
+            b"## August event\n"
+            b"<!-- state: 2026-08-01T00:01:00Z -->\n"
+            b"August payload.\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = MigrationRepo(directory, source)
+
+            applied = repo.run("--apply")
+            verified = repo.run("--verify")
+
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+
     def test_apply_partitions_indexes_and_evidence_by_event_month(self) -> None:
         """Catches collapsing a multi-month history into the final month."""
         source = (

@@ -216,11 +216,25 @@ def has_reached_main(commit: str) -> bool:
 
 
 def commits_in_range(base: str, head: str) -> list[str]:
+    """Mainline arrival events in base..head, oldest first.
+
+    A reviewed merge is the arrival event for every commit on its merged side.
+    Inspecting those internal commits separately discards the enclosing PR
+    evidence and falsely rejects an ordinary multi-commit row PR. First-parent
+    traversal retains direct pushes and unrecognized merges as distinct events,
+    so neither can be laundered by a later reviewed merge.
+    """
     try:
         git("cat-file", "-e", f"{base}^{{commit}}")
     except subprocess.CalledProcessError:
         return [head]
-    return [c for c in git("rev-list", "--reverse", f"{base}..{head}").splitlines() if c]
+    return [
+        c
+        for c in git(
+            "rev-list", "--first-parent", "--reverse", f"{base}..{head}"
+        ).splitlines()
+        if c
+    ]
 
 
 def pending_pr_commits(base: str, head: str, pending_pr_head: str) -> frozenset[str]:

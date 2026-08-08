@@ -103,7 +103,7 @@ gates.
 [POL-PR-DISPOSITION] After independent verification and clean review, merge the PR in that session when authorized. Close obsolete or superseded PRs with a recorded reason; otherwise record the exact external blocker. Only an explicitly declared headless run may record `READY-TO-MERGE at <sha>` for later disposition.
 <!-- orchestration-loop:end -->
 
-[POL-PR-REQUIRED] Deliver feature, policy, checker, documentation, or record changes through a PR unless one exact unexpired emergency waiver authorizes the named change.
+[POL-PR-REQUIRED] Use a reviewed `row/*` PR absent exact waiver. Landed ranges inspect first-parent events: row merges cover internals; direct and unrecognized arrivals fail.
 <!-- policy-procedure:end -->
 
 ## Commit, documents, and handoff

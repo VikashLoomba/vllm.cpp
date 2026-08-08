@@ -43403,3 +43403,34 @@ The closed operator grammar adds `OP-CONTINUE` and removes the generic
 remote-state stops. Policy, T0, workflow, prompt, prompt checker, protocol
 checker, and mutation suites move together; no product or benchmark code
 changes, so the public benchmark result remains NOT APPLICABLE.
+
+## 2026-08-09 — Current-main prerequisites repaired: hermetic role test and truthful embedding PARTIAL state
+<!-- state: 2026-08-09T00:20 -->
+
+Three independent regressions on main blocked clean contributor PRs. First,
+`test_landed_detached_commit_remains_strict_without_pending_evidence` patched
+only `has_reached_main()` while feeding `check-role-discipline.py` the ambient
+`HEAD`; an integration-only, merge, or reservation tip produces no violation
+from `inspect()`, so the classification path was never exercised and the suite
+failed 0-vs-1 depending on checkout state. The test now supplies one hermetic
+synthetic violation and retains `has_reached_main=true`. Production checker
+bytes and strict landed-commit behavior are unchanged.
+
+Second, `MODEL-EMBED-llama-llama-for-causal-lm` claimed `ACTIVE` after only the
+`LlamaModel` membership of eight landed at `57ed063e`. Clean CI therefore
+reported an abandoned ACTIVE row: the integration branch and commit use the
+umbrella `EMBEDDINGS-ONE-SURFACE` name, while the audit correctly searches for
+the exact row ID. The record now says `PARTIAL`, with the seven sibling
+memberships and real-checkpoint vLLM cosine gate still open; model rollups,
+roadmap, completed coordination claim, STATUS, FEATURES and BENCHMARKS move
+together. No product code, checker code, benchmark number, or performance claim
+changed. RED evidence, design, gates, and mutation targets are committed in
+`specs/current-main-prerequisite-repairs-2026-08-08.md`.
+
+Third, landed range validation walked every commit in a merged PR and judged
+each without its enclosing merge's review evidence. It now walks first-parent
+arrival events: a recognized row-PR merge covers its internal commits, while a
+direct first-parent commit and an unrecognized merge remain strict failures.
+The production change is synchronized under `POL-PR-REQUIRED` and
+`POL-CHECKER-CHANGE`, with temp-Git tests for recognized multi-commit,
+synthetic, direct-before-reviewed, and unrecognized merge ranges.

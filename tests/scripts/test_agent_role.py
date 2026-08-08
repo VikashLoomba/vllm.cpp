@@ -489,10 +489,124 @@ class RoleDiscipline(unittest.TestCase):
         saved = sys.argv
         sys.argv = [saved[0], "--commit", "HEAD"]
         try:
-            with mock.patch.object(discipline, "has_reached_main", return_value=True):
+            # Exercise classification, not whichever commit happens to be HEAD
+            # in the checkout running this suite.  A merge, reservation, or
+            # integration-only tip has no governed-path violation, so without
+            # this hermetic input main() never reaches has_reached_main().
+            with mock.patch.object(
+                discipline, "inspect", return_value=["synthetic violation"]
+            ), mock.patch.object(discipline, "has_reached_main", return_value=True):
                 self.assertEqual(discipline.main(), 1)
         finally:
             sys.argv = saved
+
+
+class RoleDisciplineFirstParentRange(_TempRepo, unittest.TestCase):
+    """A push range judges mainline arrival events, not PR-internal commits."""
+
+    def _git(self, *args: str) -> str:
+        return subprocess.check_output(
+            ["git", *args], cwd=self.repo, text=True
+        ).strip()
+
+    def _commit_feature(self, subject: str) -> str:
+        path = self.repo / "src" / "vllm" / "a.cpp"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous = path.read_text(encoding="utf-8") if path.exists() else ""
+        path.write_text(previous + subject + "\n", encoding="utf-8")
+        subprocess.run(["git", "add", str(path)], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", subject],
+            cwd=self.repo,
+            check=True,
+            env=dict(
+                os.environ,
+                GIT_AUTHOR_NAME="t",
+                GIT_AUTHOR_EMAIL="t@t",
+                GIT_COMMITTER_NAME="t",
+                GIT_COMMITTER_EMAIL="t@t",
+            ),
+        )
+        return self._git("rev-parse", "HEAD")
+
+    def _merge(self, branch: str, subject: str) -> str:
+        subprocess.run(
+            ["git", "merge", "--no-ff", "-qm", subject, branch],
+            cwd=self.repo,
+            check=True,
+            env=dict(
+                os.environ,
+                GIT_AUTHOR_NAME="t",
+                GIT_AUTHOR_EMAIL="t@t",
+                GIT_COMMITTER_NAME="t",
+                GIT_COMMITTER_EMAIL="t@t",
+            ),
+        )
+        return self._git("rev-parse", "HEAD")
+
+    def _check_range(self, base: str, head: str) -> int:
+        saved = sys.argv
+        sys.argv = [saved[0], "--base", base, "--head", head]
+        try:
+            with mock.patch.object(discipline, "ROOT", self.repo), mock.patch.object(
+                discipline, "ROLE_DISCIPLINE_SINCE", base
+            ):
+                return discipline.main()
+        finally:
+            sys.argv = saved
+
+    def test_multi_commit_recognized_row_merge_passes_as_one_arrival(self) -> None:
+        base = self._git("rev-parse", "HEAD")
+        primary = self._git("branch", "--show-current")
+        subprocess.run(
+            ["git", "checkout", "-qb", "row/ENG-FOO"], cwd=self.repo, check=True
+        )
+        self._commit_feature("first feature commit")
+        self._commit_feature("second feature commit")
+        subprocess.run(["git", "checkout", "-q", primary], cwd=self.repo, check=True)
+        head = self._merge(
+            "row/ENG-FOO", "Merge pull request #12 from mudler/row/ENG-FOO"
+        )
+        self.assertEqual(self._check_range(base, head), 0)
+
+    def test_direct_first_parent_commit_before_reviewed_merge_still_fails(self) -> None:
+        base = self._git("rev-parse", "HEAD")
+        self._commit_feature("direct feature commit")
+        primary = self._git("branch", "--show-current")
+        subprocess.run(
+            ["git", "checkout", "-qb", "row/ENG-REVIEWED"],
+            cwd=self.repo,
+            check=True,
+        )
+        self._commit_feature("reviewed follow-up")
+        subprocess.run(["git", "checkout", "-q", primary], cwd=self.repo, check=True)
+        head = self._merge(
+            "row/ENG-REVIEWED",
+            "Merge pull request #13 from mudler/row/ENG-REVIEWED",
+        )
+        self.assertEqual(self._check_range(base, head), 1)
+
+    def test_synthetic_merge_uses_second_parent_row_evidence(self) -> None:
+        base = self._git("rev-parse", "HEAD")
+        primary = self._git("branch", "--show-current")
+        subprocess.run(
+            ["git", "checkout", "-qb", "row/ENG-SYNTHETIC"],
+            cwd=self.repo,
+            check=True,
+        )
+        self._commit_feature("feature body names branch row/ENG-SYNTHETIC")
+        subprocess.run(["git", "checkout", "-q", primary], cwd=self.repo, check=True)
+        head = self._merge("row/ENG-SYNTHETIC", "Merge deadbeef into cafe0000")
+        self.assertEqual(self._check_range(base, head), 0)
+
+    def test_unrecognized_merge_still_fails(self) -> None:
+        base = self._git("rev-parse", "HEAD")
+        primary = self._git("branch", "--show-current")
+        subprocess.run(["git", "checkout", "-qb", "wip"], cwd=self.repo, check=True)
+        self._commit_feature("unreviewed branch commit")
+        subprocess.run(["git", "checkout", "-q", primary], cwd=self.repo, check=True)
+        head = self._merge("wip", "Merge branch 'wip'")
+        self.assertEqual(self._check_range(base, head), 1)
 
 
 class ReadOnlyAndModeTests(unittest.TestCase):

@@ -10,6 +10,8 @@ disagrees with scripts/check-doc-checkpoint.py.
 from __future__ import annotations
 
 import contextlib
+import csv
+import dataclasses
 import importlib.util
 import io
 import re
@@ -36,7 +38,18 @@ def _load(name: str, relative: str):
 
 consistency = _load("protocol_consistency", "scripts/check-protocol-consistency.py")
 
-EXPECTED = ("docs/STATUS.md", "docs/BENCHMARKS.md", "docs/FEATURES.md")
+EXPECTED_PUBLIC_RULES = {
+    "POL-DOC-STATUS": ("docs/STATUS.md", "feature_checkpoint", "Update"),
+    "POL-DOC-BENCHMARKS": (
+        "docs/BENCHMARKS.md",
+        "feature_checkpoint",
+        "Update",
+    ),
+    "POL-DOC-FEATURES": ("docs/FEATURES.md", "feature_surface", "Update"),
+    "POL-DOC-USAGE": ("docs/USAGE.md", "user_usage", "Update"),
+    "POL-DOC-README": ("README.md", "landing_page", "Update"),
+    "POL-NOW-COUPLING": (".agents/NOW.md", "live_state", "Refresh"),
+}
 
 
 def _tracked_paths(prefix: str) -> set[str] | None:
@@ -93,7 +106,20 @@ def _repo_copy(workflow_text: str, *, prompts: bool = True):
             ROOT / "scripts/check-doc-checkpoint.py",
             root / "scripts/check-doc-checkpoint.py",
         )
-        shutil.copy(ROOT / "AGENTS.md", root / "AGENTS.md")
+        shutil.copy(ROOT / ".agents/policy.csv", root / ".agents/policy.csv")
+        shutil.copy(ROOT / ".agents/waivers.csv", root / ".agents/waivers.csv")
+        # The policy parser validates every named checker and procedure. Create
+        # the exact declared paths so this fixture isolates workflow behavior.
+        with (ROOT / ".agents/policy.csv").open(
+            newline="", encoding="utf-8"
+        ) as stream:
+            for row in csv.DictReader(stream):
+                named = [*row["enforcement"].split(";"), row["procedure"]]
+                for relative in named:
+                    target = root / relative.strip()
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if not target.exists():
+                        target.write_text("# fixture\n", encoding="utf-8")
         if prompts:
             shutil.copytree(ROOT / ".agents/prompts", root / ".agents/prompts")
         (root / ".agents/workflow.md").write_text(workflow_text, encoding="utf-8")
@@ -106,79 +132,262 @@ def _repo_copy(workflow_text: str, *, prompts: bool = True):
             consistency.ROOT = saved
 
 
-def document(*paths: str) -> str:
-    rows = "\n".join(f"| `{path}` | every checkpoint |" for path in paths)
-    return "\n".join(
-        [
-            "# Some normative document",
-            "",
-            consistency.BEGIN,
-            "| Public surface | Owed by |",
-            "|---|---|",
-            rows,
-            consistency.END,
-            "",
-            "Trailing prose.",
-        ]
-    )
+class PublicDocumentPolicyTests(unittest.TestCase):
+    def _mutated_errors(self, rule_id: str, **changes: str) -> list[str]:
+        rules = consistency.load_policy(ROOT)
+        rules[rule_id] = dataclasses.replace(rules[rule_id], **changes)
+        return consistency.public_document_rule_errors(rules)
 
+    def _extra_rule_errors(self, rule_id: str, **changes: str) -> list[str]:
+        rules = consistency.load_policy(ROOT)
+        source = rules["POL-PR-REQUIRED"]
+        fields = {
+            "rule_id": rule_id,
+            "scope": "internal review",
+            "trigger": "policy review",
+            "requirement": "Review the policy change.",
+        }
+        fields.update(changes)
+        rules[rule_id] = dataclasses.replace(source, **fields)
+        return consistency.public_document_rule_errors(rules)
 
-class ContractParsing(unittest.TestCase):
-    def test_extracts_paths_in_order(self) -> None:
-        self.assertEqual(
-            consistency.contract_paths(document(*EXPECTED)), list(EXPECTED)
-        )
+    def test_repository_policy_matches_the_checker_semantically(self) -> None:
+        self.assertEqual(consistency.public_document_rule_errors(), [])
 
-    def test_absent_block_is_none(self) -> None:
-        self.assertIsNone(consistency.contract_paths("# No contract here"))
-
-    def test_end_before_begin_is_none(self) -> None:
-        text = f"{consistency.END}\n| `docs/STATUS.md` |\n{consistency.BEGIN}"
-        self.assertIsNone(consistency.contract_paths(text))
-
-
-class Mutations(unittest.TestCase):
-    def test_baseline_passes(self) -> None:
-        self.assertEqual(
-            consistency.document_errors("doc", document(*EXPECTED), EXPECTED), []
-        )
-
-    def test_missing_block_is_rejected(self) -> None:
-        errors = consistency.document_errors("doc", "# nothing", EXPECTED)
-        self.assertTrue(any("missing the doc-obligation contract" in e for e in errors))
-
-    def test_readme_in_contract_is_rejected_by_name(self) -> None:
-        """The exact historical regression: README named as a checkpoint."""
-        text = document("README.md", "docs/BENCHMARKS.md", "docs/FEATURES.md")
-        errors = consistency.document_errors("doc", text, EXPECTED)
-        self.assertTrue(any("README.md" in e and "landing page" in e for e in errors))
-
-    def test_dropped_surface_is_rejected(self) -> None:
-        text = document("docs/STATUS.md", "docs/BENCHMARKS.md")
-        errors = consistency.document_errors("doc", text, EXPECTED)
-        self.assertTrue(any("enforces" in e for e in errors))
-
-    def test_reordered_surfaces_are_rejected(self) -> None:
-        text = document("docs/BENCHMARKS.md", "docs/STATUS.md", "docs/FEATURES.md")
-        self.assertNotEqual(
-            consistency.document_errors("doc", text, EXPECTED), []
-        )
-
-    def test_extra_surface_is_rejected(self) -> None:
-        text = document(*EXPECTED, "docs/USAGE.md")
-        self.assertNotEqual(consistency.document_errors("doc", text, EXPECTED), [])
-
-
-class LiveTree(unittest.TestCase):
-    def test_expected_surfaces_come_from_the_checker(self) -> None:
-        self.assertEqual(consistency.obligated_surfaces(), EXPECTED)
-
-    def test_repository_contract_is_consistent(self) -> None:
+    def test_main_enforces_the_public_document_mapping(self) -> None:
         self.assertEqual(consistency.main(), 0)
 
-    def test_every_contract_document_exists(self) -> None:
-        for name in consistency.CONTRACT_DOCUMENTS:
-            self.assertTrue((ROOT / name).exists(), name)
+    def test_missing_public_rule_is_rejected(self) -> None:
+        rules = consistency.load_policy(ROOT)
+        rules.pop("POL-DOC-USAGE")
+        errors = consistency.public_document_rule_errors(rules)
+        self.assertTrue(any("POL-DOC-USAGE" in error for error in errors), errors)
+
+    def test_unknown_trigger_identifier_is_rejected(self) -> None:
+        errors = self._mutated_errors("POL-DOC-STATUS", trigger="mutable_tree")
+        self.assertTrue(any("mutable_tree" in error for error in errors), errors)
+
+    def test_public_rule_must_name_the_document_checker(self) -> None:
+        errors = self._mutated_errors(
+            "POL-DOC-USAGE", enforcement="scripts/check-policy.py"
+        )
+        self.assertTrue(any("POL-DOC-USAGE" in e and "enforcement" in e for e in errors), errors)
+
+    def test_partial_enforcement_content_is_rejected(self) -> None:
+        errors = self._mutated_errors(
+            "POL-DOC-USAGE",
+            enforcement="scripts/check-doc-checkpoint.py; scripts/check-policy.py; later",
+        )
+        self.assertTrue(any("POL-DOC-USAGE" in e and "enforcement" in e for e in errors), errors)
+
+    def test_duplicate_public_surface_is_rejected(self) -> None:
+        rules = consistency.load_policy(ROOT)
+        rules["POL-DOC-USAGE"] = dataclasses.replace(
+            rules["POL-DOC-USAGE"], scope=rules["POL-DOC-STATUS"].scope
+        )
+        errors = consistency.public_document_rule_errors(rules)
+        self.assertTrue(
+            any("POL-DOC-USAGE" in e and "scope" in e for e in errors), errors
+        )
+
+    def test_each_public_rule_accepts_only_exact_positive_requirement(self) -> None:
+        for rule_id, (scope, _trigger, verb) in EXPECTED_PUBLIC_RULES.items():
+            original = consistency.load_policy(ROOT)[rule_id]
+            mutations = {
+                "wrong action": f"Observe {scope}.",
+                "wrong target": f"{verb} another-page.md.",
+                "except suffix": original.requirement.rstrip(".")
+                + " except when state is appended.",
+                "unless suffix": original.requirement.rstrip(".")
+                + " unless the change is small.",
+                "other than suffix": original.requirement.rstrip(".")
+                + " other than for releases.",
+                "without suffix": original.requirement.rstrip(".")
+                + " without benchmark changes.",
+                "generic trailing text": original.requirement + " Extra words",
+                "missing period": f"{verb} {scope}",
+            }
+            for label, requirement in mutations.items():
+                with self.subTest(rule_id=rule_id, mutation=label):
+                    errors = self._mutated_errors(rule_id, requirement=requirement)
+                    self.assertTrue(
+                        any(rule_id in error and "requirement" in error for error in errors),
+                        errors,
+                    )
+
+    def test_public_rule_rejects_unparsed_scope_content(self) -> None:
+        errors = self._mutated_errors(
+            "POL-DOC-STATUS", scope="docs/STATUS.md except docs/legacy.md"
+        )
+        self.assertTrue(any("POL-DOC-STATUS" in e and "scope" in e for e in errors), errors)
+
+    def test_public_rule_rejects_unparsed_trigger_content(self) -> None:
+        errors = self._mutated_errors(
+            "POL-DOC-STATUS", trigger="feature_checkpoint except docs-only"
+        )
+        self.assertTrue(any("POL-DOC-STATUS" in e and "trigger" in e for e in errors), errors)
+
+    def test_extra_rule_cannot_reuse_a_public_trigger(self) -> None:
+        errors = self._extra_rule_errors(
+            "POL-EXTRA-TRIGGER", trigger="feature_checkpoint"
+        )
+        self.assertTrue(
+            any("POL-EXTRA-TRIGGER" in e and "trigger" in e for e in errors), errors
+        )
+
+    def test_extra_rule_cannot_reuse_a_public_scope(self) -> None:
+        errors = self._extra_rule_errors(
+            "POL-EXTRA-SCOPE", scope="docs/STATUS.md"
+        )
+        self.assertTrue(
+            any("POL-EXTRA-SCOPE" in e and "scope" in e for e in errors), errors
+        )
+
+    def test_extra_rule_cannot_target_a_public_surface_in_its_requirement(self) -> None:
+        errors = self._extra_rule_errors(
+            "POL-EXTRA-REQUIREMENT", requirement="Update docs/STATUS.md."
+        )
+        self.assertTrue(
+            any(
+                "POL-EXTRA-REQUIREMENT" in e and "requirement" in e
+                for e in errors
+            ),
+            errors,
+        )
+
+    def test_malformed_positive_requirements_cannot_bypass_public_target_ownership(
+        self,
+    ) -> None:
+        mutations = {
+            "double terminal period": "Update docs/STATUS.md..",
+            "triple terminal period": "Update docs/STATUS.md...",
+            "segment ending period": "Update docs./STATUS.md.",
+            "empty segment": "Update docs//STATUS.md.",
+            "dot segment": "Update docs/./STATUS.md.",
+            "dot-dot segment": "Update docs/../STATUS.md.",
+            "parent traversal": "Update ../docs/STATUS.md.",
+            "absolute path": "Update /docs/STATUS.md.",
+            "backslash separator": r"Update docs\STATUS.md.",
+            "space inside token": "Update docs/STATUS file.md.",
+            "tab inside token": "Update docs/STATUS\tfile.md.",
+            "leading space": " Update docs/STATUS.md.",
+            "trailing space": "Update docs/STATUS.md. ",
+            "double space": "Update  docs/STATUS.md.",
+            "tab delimiter": "Update\tdocs/STATUS.md.",
+            "nbsp delimiter": "Update\u00a0docs/STATUS.md.",
+            "inserted token": "Update only docs/STATUS.md.",
+            "carriage return delimiter": "Update\rdocs/STATUS.md.",
+            "line feed delimiter": "Update\ndocs/STATUS.md.",
+            "second sentence": (
+                "Update docs/STATUS.md. Refresh docs/BENCHMARKS.md."
+            ),
+            "second delimiter": "Update docs/STATUS.md.;docs/BENCHMARKS.md.",
+        }
+        for label, requirement in mutations.items():
+            with self.subTest(mutation=label):
+                errors = self._extra_rule_errors(
+                    "POL-EXTRA-MALFORMED", requirement=requirement
+                )
+                self.assertTrue(
+                    any(
+                        "POL-EXTRA-MALFORMED" in error
+                        and "requirement" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_reserved_target_scan_is_independent_of_positive_grammar(self) -> None:
+        requirements = (
+            "Review docs/STATUS.md before release.",
+            " Review docs/STATUS.md.",
+            "Update  docs/STATUS.md.",
+            "Update\tdocs/STATUS.md.",
+            "Update\u00a0docs/STATUS.md.",
+            "Update only docs/STATUS.md.",
+            "Review (docs/STATUS.md).",
+            "Update\r\ndocs/STATUS.md.",
+        )
+        for requirement in requirements:
+            with self.subTest(requirement=repr(requirement)):
+                errors = self._extra_rule_errors(
+                    "POL-EXTRA-LEXICAL", requirement=requirement
+                )
+                self.assertTrue(
+                    any(
+                        "POL-EXTRA-LEXICAL" in error
+                        and "requirement target" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_reserved_target_scan_avoids_path_prefix_collisions(self) -> None:
+        # These controls independently pin both lexical boundaries. Removing
+        # the left-boundary check makes the nested/prefixed paths collide;
+        # removing the right-boundary check makes the suffixed paths collide.
+        requirements = (
+            "Review sub/docs/STATUS.md before release.",
+            "Review prefix/docs/STATUS.md before release.",
+            "Review docs/STATUS.md.extra before release.",
+            "Review .agents/NOW.md.extra before release.",
+        )
+        for requirement in requirements:
+            with self.subTest(requirement=requirement):
+                errors = self._extra_rule_errors(
+                    "POL-EXTRA-PREFIX", requirement=requirement
+                )
+                self.assertFalse(
+                    any("requirement target" in error for error in errors), errors
+                )
+
+        self._assert_reserved_target_scan_accepts_non_path_delimiters()
+
+    def _assert_reserved_target_scan_accepts_non_path_delimiters(self) -> None:
+        # Exact references remain reserved when ordinary prose punctuation is
+        # adjacent. Inverting either boundary predicate makes at least one of
+        # these positive controls disappear from the ownership scan.
+        requirements = (
+            'Review "docs/STATUS.md" before release.',
+            "Review `docs/STATUS.md` before release.",
+            "Review (docs/STATUS.md) before release.",
+            "Review docs/STATUS.md: before release.",
+            "Review docs/STATUS.md, before release.",
+            "Review docs/STATUS.md; before release.",
+            "Review docs/STATUS.md! before release.",
+            "Review docs/STATUS.md? before release.",
+        )
+        for requirement in requirements:
+            with self.subTest(requirement=requirement):
+                errors = self._extra_rule_errors(
+                    "POL-EXTRA-DELIMITED", requirement=requirement
+                )
+                self.assertTrue(
+                    any(
+                        "POL-EXTRA-DELIMITED" in error
+                        and "requirement target" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_extra_rule_cannot_duplicate_a_public_semantic_binding(self) -> None:
+        errors = self._extra_rule_errors(
+            "POL-EXTRA-BINDING",
+            scope="docs/STATUS.md",
+            trigger="feature_checkpoint",
+            requirement="Update docs/STATUS.md.",
+        )
+        self.assertTrue(
+            any("POL-EXTRA-BINDING" in e and "duplicate" in e for e in errors),
+            errors,
+        )
+
+    def test_extra_rule_cannot_claim_the_reserved_public_rule_namespace(self) -> None:
+        errors = self._extra_rule_errors("POL-DOC-EXTRA")
+        self.assertTrue(
+            any("POL-DOC-EXTRA" in e and "reserved" in e for e in errors), errors
+        )
 
 
 class InterviewBlockTests(unittest.TestCase):

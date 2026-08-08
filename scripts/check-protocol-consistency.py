@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
-"""Keep the protocol prose and the checkers that enforce it in agreement.
+"""Keep structured policy consumers and their protocol artifacts consistent.
 
-The failure this exists to prevent is real and already happened: the
-same-change public-document obligation was migrated from README.md to
-docs/STATUS.md in scripts/check-doc-checkpoint.py, AGENTS.md was updated, and
-`.agents/workflow.md` -- the operating manual an agent is told to follow every
-session -- was not. For a while the manual instructed agents to update README.md
-at every checkpoint, which is exactly the drift the migration removed. Prose and
-checker disagreed, and the prose is what agents actually read.
-
-So the obligated surfaces are declared ONCE, as a machine-readable contract
-block that both documents carry verbatim, and this gate asserts the block equals
-the constants in scripts/check-doc-checkpoint.py. Changing the checker without
-changing the prose (or the reverse) is a red build, not a silent divergence.
-
-The contract block looks like this, and is a normal Markdown table to a reader:
-
-    <!-- doc-obligation-contract:begin -->
-    | Public surface | Owed by |
-    |---|---|
-    | `docs/STATUS.md` | every feature/iteration checkpoint |
-    <!-- doc-obligation-contract:end -->
+Public-document obligations are controlled policy rows. The document checker
+fully parses their stable ID, exact scope, semantic trigger, positive action,
+and enforcement list; explanatory details remain in procedures.
 
 The same gate now also asserts that `.agents/workflow.md` carries the ROLE
 INTERVIEW, between `<!-- role-interview:begin -->` and its `:end`. That is the
@@ -56,13 +39,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-# Both documents must carry the contract, because both are read as normative:
-# AGENTS.md is the canonical index, workflow.md is the session operating manual.
-CONTRACT_DOCUMENTS = ("AGENTS.md", ".agents/workflow.md")
-
-BEGIN = "<!-- doc-obligation-contract:begin -->"
-END = "<!-- doc-obligation-contract:end -->"
+from scripts.policy_contract import PolicyRule, load_policy
 
 # The session manual must carry the role interview, because agent-preflight.sh
 # now FAILS a session that has not declared a role. A gate whose precondition is
@@ -128,21 +108,6 @@ PROMPT_REQUIRED = {
     ),
 }
 
-# A path in a table cell, e.g. `docs/STATUS.md`.
-CELL_PATH = re.compile(r"`([^`]+\.md)`")
-
-# README.md is a landing page, not a checkpoint surface. Naming it inside the
-# contract is the specific regression this gate was built after, so it earns a
-# targeted message instead of a bare set-difference.
-FORBIDDEN_IN_CONTRACT = {
-    "README.md": (
-        "README.md is a user-facing landing page, not a per-checkpoint status "
-        "surface; it changes only when a user-visible headline shifts. The "
-        "per-capability obligation belongs to docs/STATUS.md"
-    ),
-}
-
-
 def _load(name: str, relative: str):
     path = ROOT / relative
     spec = importlib.util.spec_from_file_location(name, path)
@@ -153,52 +118,43 @@ def _load(name: str, relative: str):
     return module
 
 
-def obligated_surfaces() -> tuple[str, ...]:
-    """Return the surfaces check-doc-checkpoint.py actually enforces."""
-    checkpoint = _load("doc_checkpoint", "scripts/check-doc-checkpoint.py")
-    return tuple(checkpoint.PUBLIC_CHECKPOINTS) + (checkpoint.FEATURE_CHECKPOINT,)
+def public_document_rule_errors(
+    rules: dict[str, PolicyRule] | None = None,
+) -> list[str]:
+    """Validate every public rule through the document checker's closed parser."""
 
+    checkpoint = _load(
+        "doc_checkpoint_for_consistency", "scripts/check-doc-checkpoint.py"
+    )
+    policy = load_policy(ROOT) if rules is None else rules
+    errors: list[str] = checkpoint.public_namespace_errors(policy)
+    seen_surfaces: dict[str, str] = {}
 
-def contract_paths(text: str) -> list[str] | None:
-    """Return the paths declared in the contract block, or None if absent."""
-    start = text.find(BEGIN)
-    end = text.find(END)
-    if start == -1 or end == -1 or end < start:
-        return None
-    block = text[start + len(BEGIN) : end]
-    paths: list[str] = []
-    for line in block.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("|"):
+    for rule_id in checkpoint.PUBLIC_RULE_IDS:
+        rule = policy.get(rule_id)
+        if rule is None:
+            errors.append(f"public-document checker requires missing policy rule {rule_id}")
             continue
-        found = CELL_PATH.findall(stripped)
-        if found:
-            paths.append(found[0])
-    return paths
+        try:
+            binding = checkpoint.parse_public_rule(rule)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        previous = seen_surfaces.setdefault(binding.surface, rule_id)
+        if previous != rule_id:
+            errors.append(
+                f"public surface {binding.surface!r} is duplicate in "
+                f"{previous} and {rule_id}"
+            )
 
-
-def document_errors(name: str, text: str, expected: tuple[str, ...]) -> list[str]:
-    """Return contract problems for one normative document."""
-    paths = contract_paths(text)
-    if paths is None:
-        return [
-            f"{name} is missing the doc-obligation contract block "
-            f"({BEGIN} ... {END}); it must declare the surfaces that "
-            "scripts/check-doc-checkpoint.py enforces so prose cannot drift "
-            "from the gate"
-        ]
-
-    errors: list[str] = []
-    for path in paths:
-        if path in FORBIDDEN_IN_CONTRACT:
-            errors.append(f"{name} contract names {path}: {FORBIDDEN_IN_CONTRACT[path]}")
-
-    if tuple(paths) != expected:
-        errors.append(
-            f"{name} contract declares {paths!r} but "
-            f"scripts/check-doc-checkpoint.py enforces {list(expected)!r}; "
-            "update the prose and the checker in the same change"
-        )
+    if rules is None and not errors:
+        try:
+            bindings = checkpoint.public_rule_bindings(ROOT)
+        except ValueError as exc:
+            errors.extend(str(exc).splitlines())
+        else:
+            if set(bindings) != set(checkpoint.PUBLIC_RULE_IDS):
+                errors.append("document-checker bindings omit a required public rule")
     return errors
 
 
@@ -270,9 +226,8 @@ def prompt_errors(required: dict[str, tuple[str, ...]] | None = None) -> list[st
 
 
 def main() -> int:
-    expected = obligated_surfaces()
     failures: list[str] = []
-    blocks: dict[str, list[str] | None] = {}
+    failures.extend(public_document_rule_errors())
 
     interview = ROOT / INTERVIEW_DOCUMENT
     if not interview.exists():
@@ -293,33 +248,12 @@ def main() -> int:
 
     failures.extend(prompt_errors())
 
-    for name in CONTRACT_DOCUMENTS:
-        path = ROOT / name
-        if not path.exists():
-            failures.append(f"{name} does not exist")
-            continue
-        text = path.read_text(encoding="utf-8")
-        blocks[name] = contract_paths(text)
-        failures.extend(document_errors(name, text, expected))
-
-    present = {name: paths for name, paths in blocks.items() if paths is not None}
-    if len(present) == len(CONTRACT_DOCUMENTS):
-        distinct = {tuple(paths) for paths in present.values()}
-        if len(distinct) > 1:
-            failures.append(
-                "the doc-obligation contract differs between "
-                f"{' and '.join(CONTRACT_DOCUMENTS)}; both must carry the same "
-                "block verbatim"
-            )
-
     if failures:
         for failure in failures:
             print(f"ERROR: {failure}", file=sys.stderr)
         print(
-            "The obligated public surfaces are defined by PUBLIC_CHECKPOINTS and "
-            "FEATURE_CHECKPOINT in scripts/check-doc-checkpoint.py. Mirror them "
-            "in the contract block of every document listed in "
-            "CONTRACT_DOCUMENTS. The role interview is the block between "
+            "Public-document policy rows must fully parse through "
+            "scripts/check-doc-checkpoint.py. The role interview is the block between "
             f"{INTERVIEW_MARKER} and its :end in {INTERVIEW_DOCUMENT}; it must "
             "name every answer agent-role.py accepts. The operator's loop is "
             f"the block between {LOOP_MARKER} and its :end in {LOOP_DOCUMENT}; "
@@ -333,9 +267,8 @@ def main() -> int:
         return 1
 
     print(
-        "OK: the doc-obligation contract in "
-        f"{' and '.join(CONTRACT_DOCUMENTS)} matches "
-        f"scripts/check-doc-checkpoint.py, {INTERVIEW_DOCUMENT} carries the "
+        "OK: public-document policy matches scripts/check-doc-checkpoint.py, "
+        f"{INTERVIEW_DOCUMENT} carries the "
         f"role interview and the orchestration loop, and "
         f"{len(PROMPT_REQUIRED)} sub-agent prompts carry their binding "
         "instructions."

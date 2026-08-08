@@ -235,6 +235,20 @@ def _bash_array(text: str, name: str) -> list[str]:
 
 
 class RatchetTests(unittest.TestCase):
+    def test_partial_embedding_row_left_the_active_scoped_baseline(self):
+        # The one-of-eight Llama embedding landing is PARTIAL.  Its historical
+        # commands stay in the spec, but PARTIAL is outside GATED_STATES and the
+        # exact runnable baseline must move with that lifecycle correction.
+        # Restoring the old baseline entry is the checker mutation this kills.
+        row_id = "MODEL-EMBED-llama-llama-for-causal-lm"
+        states = {
+            row.item_id: row.state
+            for path in gates.AUDITED_MATRIX_PATHS
+            for row in gates.record.parse_claim_rows(path, [])
+        }
+        self.assertEqual(states[row_id], "PARTIAL")
+        self.assertNotIn(row_id, gates.RUNNABLE_BASELINE)
+
     def test_the_baseline_matches_the_shipped_record(self):
         # EXACT equality, in both directions, and that is the whole contract:
         # this is an exact pin, not a shrink-only floor. Lowering the baseline

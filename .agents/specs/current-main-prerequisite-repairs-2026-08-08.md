@@ -14,7 +14,8 @@ clean row PRs from passing preflight:
    recognized row-PR merge supplies the review evidence for its internal
    commits without blessing direct pushes or unrecognized merges.
 
-Affected policy IDs: `POL-PR-REQUIRED`, `POL-CHECKER-CHANGE`, `POL-ROW-SYNC`, `POL-KEYED-MERGE`,
+Affected policy IDs: `POL-PR-REQUIRED`, `POL-CHECKER-CHANGE`,
+`POL-PATH-CLASSIFICATION`, `POL-PR-SIZE`, `POL-ROW-SYNC`, `POL-KEYED-MERGE`,
 `POL-DOC-STATUS`, `POL-DOC-BENCHMARKS`, `POL-DOC-FEATURES`,
 `POL-NOW-COUPLING`, `POL-PREFLIGHT`, and `POL-PR-DISPOSITION`.
 The landed-range change follows `POL-CHECKER-CHANGE`: policy and procedure move
@@ -65,6 +66,16 @@ reports or fails them even though the recognized merge is the reviewed arrival
 event. The range must walk `git rev-list --first-parent --reverse`: a reviewed
 merge then represents its full diff, while an earlier direct first-parent
 commit and an unrecognized merge remain individually visible and strict.
+
+### Tracked manifesto path
+
+Current main tracks root `MANIFESTO.md`, but the fail-closed PR path classifier
+did not assign it an explicit class; its own tracked-tree mutation test was RED.
+Classify that exact path as `public_document`. No regex, budget, exemption, or
+other path changes. This checker delta is governed by both
+`POL-PATH-CLASSIFICATION` and `POL-CHECKER-CHANGE`; the existing synchronized
+registry and workflow wording already requires explicit documentation-path
+classification, so their policy meaning stays unchanged.
 
 ## Changes
 

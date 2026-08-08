@@ -125,6 +125,7 @@ GOVERNANCE_SUPPORT_FILES = frozenset(
 PUBLIC_DOCUMENT_FILES = frozenset(
     {
         "README.md",
+        "MANIFESTO.md",
         "CONTRIBUTING.md",
         "docs/STATUS.md",
         "docs/BENCHMARKS.md",

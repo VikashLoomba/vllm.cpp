@@ -42,7 +42,10 @@ it; registry/prompt mutation gates bind it. Verified PRs merge; obsolete close.
 
 Protocol repair (2026-08-08): release AST pins pass 30 tests on Python
 3.12/3.13; Gemma-4 MoE is known drift pending the shared merged-GeGLU fold;
-embeddings #137 is landed/partial, not an active claim. No runtime change.
+embeddings #137 is landed/partial, not an active claim. First-parent arrival
+events and the PARTIAL gate-command baseline have checker-mutation evidence;
+root `MANIFESTO.md` is explicitly classified as a public document. No runtime
+change.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by

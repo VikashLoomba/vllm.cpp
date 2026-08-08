@@ -10,6 +10,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +19,38 @@ assert SPEC is not None and SPEC.loader is not None
 checker = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = checker
 SPEC.loader.exec_module(checker)
+
+ROLE_SPEC = importlib.util.spec_from_file_location(
+    "check_role_discipline", ROOT / "scripts/check-role-discipline.py"
+)
+assert ROLE_SPEC is not None and ROLE_SPEC.loader is not None
+role_checker = importlib.util.module_from_spec(ROLE_SPEC)
+sys.modules[ROLE_SPEC.name] = role_checker
+ROLE_SPEC.loader.exec_module(role_checker)
+
+
+class CheckerSemanticEvidence(unittest.TestCase):
+    def test_landed_range_uses_first_parent_arrival_events(self) -> None:
+        # PR-size recognizes this module as check-role-discipline.py's semantic
+        # mutation evidence.  The base checker enumerates both PR-internal
+        # commits; HEAD asks Git for first-parent events and sees only the merge.
+        def fake_git(*args: str) -> str:
+            if args[:2] == ("cat-file", "-e"):
+                return ""
+            if args[:3] == ("rev-list", "--first-parent", "--reverse"):
+                return "reviewed-merge"
+            if args[:2] == ("rev-list", "--reverse"):
+                return "internal-commit\nreviewed-merge"
+            self.fail(f"unexpected git invocation: {args}")
+
+        with mock.patch.object(role_checker, "git", side_effect=fake_git) as git:
+            self.assertEqual(
+                role_checker.commits_in_range("base", "head"),
+                ["reviewed-merge"],
+            )
+        git.assert_any_call(
+            "rev-list", "--first-parent", "--reverse", "base..head"
+        )
 
 
 class PathClassification(unittest.TestCase):
@@ -29,6 +62,7 @@ class PathClassification(unittest.TestCase):
             ".agents/policy.csv": "policy",
             ".agents/state.md": "append_only_record",
             "docs/STATUS.md": "public_document",
+            "MANIFESTO.md": "public_document",
             ".github/workflows/ci.yml": "ci",
         }
         for path, path_class in expected.items():

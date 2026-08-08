@@ -133,6 +133,8 @@ class StateRepo:
         (self.root / ".agents/state.md").write_text(
             "# Structured state record\n\n"
             "Current index: [.agents/state.csv](state.csv).\n\n"
+            "Index shards: [.agents/state-index/](state-index/).\n\n"
+            "Event evidence: [.agents/state-events/](state-events/).\n\n"
             "Migration coverage: "
             "[.agents/completed/state-migration-manifest.csv]"
             "(completed/state-migration-manifest.csv).\n\n"
@@ -301,6 +303,40 @@ class RelationalValidationTests(unittest.TestCase):
                 errors = state_record.validate(repo.root)
 
                 self.assertTrue(any("migration" in error or "compatibility stub" in error for error in errors), errors)
+
+    def test_compatibility_stub_requires_state_index_tree_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = StateRepo(directory)
+            stub = repo.root / ".agents/state.md"
+            stub.write_text(
+                stub.read_text(encoding="utf-8").replace(
+                    "Index shards: [.agents/state-index/](state-index/).\n\n", ""
+                ),
+                encoding="utf-8",
+            )
+
+            errors = state_record.validate(repo.root)
+
+            self.assertTrue(
+                any(".agents/state-index/" in error for error in errors), errors
+            )
+
+    def test_compatibility_stub_requires_state_events_tree_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = StateRepo(directory)
+            stub = repo.root / ".agents/state.md"
+            stub.write_text(
+                stub.read_text(encoding="utf-8").replace(
+                    "Event evidence: [.agents/state-events/](state-events/).\n\n", ""
+                ),
+                encoding="utf-8",
+            )
+
+            errors = state_record.validate(repo.root)
+
+            self.assertTrue(
+                any(".agents/state-events/" in error for error in errors), errors
+            )
 
 
 class GitImmutabilityTests(unittest.TestCase):

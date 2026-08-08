@@ -459,6 +459,8 @@ def _stub_and_migration_errors(root: Path, events: list[Event]) -> list[str]:
         return [*errors, f"compatibility stub is not UTF-8: {exc}"]
     for required in (
         ".agents/state.csv",
+        ".agents/state-index/",
+        ".agents/state-events/",
         ".agents/completed/state-migration-manifest.csv",
     ):
         if required not in stub_text:

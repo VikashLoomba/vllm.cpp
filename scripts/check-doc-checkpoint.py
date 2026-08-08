@@ -444,6 +444,26 @@ POLICY_CONSOLIDATION_FILES = frozenset(
         "tests/scripts/test_policy_contract.py",
     }
 )
+
+# Final policy cutover wires policy-only local/remote/integration enforcement.
+# CI and scripts normally signal product work, so exempt only this complete,
+# closed transaction; any missing or extra path restores ordinary classes.
+POLICY_CUTOVER_FILES = frozenset(
+    {
+        ".agents/policy-cutover",
+        ".agents/workflow.md",
+        ".github/workflows/ci.yml",
+        ".githooks/pre-push",
+        "scripts/agent-integration.py",
+        "scripts/agent-preflight.sh",
+        "scripts/agent-ready.py",
+        "scripts/check-doc-checkpoint.py",
+        "scripts/check-protocol-consistency.py",
+        "tests/scripts/test_agent_gates.py",
+        "tests/scripts/test_check_protocol_consistency.py",
+        "tests/scripts/test_doc_checkpoint.py",
+    }
+)
 FEATURE_CHECKPOINT_FILES = frozenset(
     {
         "CMakeLists.txt",
@@ -523,6 +543,8 @@ def classify_changed_paths(paths: list[str]) -> set[str]:
     classes: set[str] = set()
     path_set = set(paths)
     if path_set == POLICY_CONSOLIDATION_FILES:
+        return {"governance"}
+    if path_set == POLICY_CUTOVER_FILES:
         return {"governance"}
     exact_claim_cutover = (
         path_set == CLAIM_CUTOVER_FILES

@@ -119,6 +119,12 @@ def _repo_copy(
         )
         shutil.copy(ROOT / ".agents/policy.csv", root / ".agents/policy.csv")
         shutil.copy(ROOT / ".agents/waivers.csv", root / ".agents/waivers.csv")
+        for relative in consistency.CUTOVER_WIRING:
+            source = ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(source, target)
+        shutil.copy(ROOT / ".agents/policy-cutover", root / ".agents/policy-cutover")
         # The policy parser validates every named checker and procedure. Create
         # the exact declared paths so this fixture isolates workflow behavior.
         with (ROOT / ".agents/policy.csv").open(
@@ -770,6 +776,84 @@ class OrchestrationLoopWiring(unittest.TestCase):
             code, _, err = run()
         self.assertEqual(code, 1)
         self.assertIn("loop omits", err)
+
+
+class CutoverGateWiring(unittest.TestCase):
+    def test_repository_wiring_is_complete(self) -> None:
+        self.assertEqual(consistency.cutover_wiring_errors(ROOT), [])
+
+    def test_each_required_wire_is_mutation_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in consistency.CUTOVER_WIRING:
+                source = ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(source, target)
+            target = root / ".agents/policy-cutover"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / ".agents/policy-cutover", target)
+            for relative, needles in consistency.CUTOVER_WIRING.items():
+                for needle in needles:
+                    with self.subTest(path=relative, needle=needle):
+                        path = root / relative
+                        original = path.read_text(encoding="utf-8")
+                        damaged = original.replace(needle, "", 1)
+                        self.assertNotEqual(damaged, original)
+                        path.write_text(damaged, encoding="utf-8")
+                        self.assertTrue(consistency.cutover_wiring_errors(root))
+                        path.write_text(original, encoding="utf-8")
+
+    def test_second_integration_snapshot_validation_is_mutation_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in consistency.CUTOVER_WIRING:
+                source = ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(source, target)
+            target = root / ".agents/policy-cutover"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / ".agents/policy-cutover", target)
+            integration = root / "scripts/agent-integration.py"
+            needle = "errors = ready.ready_errors(payload, expected)"
+            original = integration.read_text(encoding="utf-8")
+            damaged = original.replace(needle, "errors = []", 1)
+            self.assertNotEqual(damaged, original)
+            integration.write_text(damaged, encoding="utf-8")
+            self.assertTrue(consistency.cutover_wiring_errors(root))
+
+    def test_local_preflight_rejects_remote_entrypoints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in consistency.CUTOVER_WIRING:
+                source = ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(source, target)
+            target = root / ".agents/policy-cutover"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / ".agents/policy-cutover", target)
+            preflight = root / "scripts/agent-preflight.sh"
+            preflight.write_text(
+                preflight.read_text(encoding="utf-8") + "\npython3 scripts/agent-ready.py\n",
+                encoding="utf-8",
+            )
+            errors = consistency.cutover_wiring_errors(root)
+            self.assertTrue(any("network-independent" in error for error in errors), errors)
+
+    def test_cutover_file_shape_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in consistency.CUTOVER_WIRING:
+                source = ROOT / relative
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(source, target)
+            target = root / ".agents/policy-cutover"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("00927ed6\nsecond\n", encoding="utf-8")
+            self.assertTrue(consistency.cutover_wiring_errors(root))
 
 
 if __name__ == "__main__":

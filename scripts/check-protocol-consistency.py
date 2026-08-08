@@ -72,6 +72,38 @@ LOOP_REQUIRED = (
     "never fix findings yourself",
 )
 
+CUTOVER_WIRING = {
+    "scripts/agent-preflight.sh": (
+        "check-policy",
+        "check-prompt-contract",
+        "test_agent_gates",
+        "check-commit-trailers.py",
+    ),
+    ".agents/workflow.md": (
+        "scripts/agent-ready.py",
+        "scripts/agent-integration.py --base origin/main",
+        "network-independent",
+    ),
+    ".github/workflows/ci.yml": (
+        "scripts/check-policy.py",
+        "tests/scripts/test_agent_gates.py",
+        ".agents/policy-cutover",
+    ),
+    ".githooks/pre-push": ("check-policy.py", "check-prompt-contract.py"),
+    "scripts/agent-ready.py": (
+        "REMOTE_UNVERIFIED",
+        "if not run_local_preflight():",
+        "query_remote(expected)",
+    ),
+    "scripts/agent-integration.py": (
+        "reviewDecision",
+        "if not run_ready(args.pr_json):",
+        "errors = ready.ready_errors(payload, expected)",
+        "check-commit-trailers.py",
+        ".agents/policy-cutover",
+    ),
+}
+
 def _load(name: str, relative: str):
     path = ROOT / relative
     spec = importlib.util.spec_from_file_location(name, path)
@@ -176,6 +208,36 @@ def prompt_contract_errors() -> list[str]:
     return checker.repository_errors(ROOT, set(load_policy(ROOT)))
 
 
+def cutover_wiring_errors(root: Path | None = None) -> list[str]:
+    """Bind the local/ready/integration separation and its backstops."""
+
+    repository = root or ROOT
+    errors: list[str] = []
+    texts: dict[str, str] = {}
+    for relative, needles in CUTOVER_WIRING.items():
+        path = repository / relative
+        if not path.is_file():
+            errors.append(f"cutover wiring is missing {relative}")
+            continue
+        content = path.read_text(encoding="utf-8")
+        texts[relative] = content
+        for needle in needles:
+            if needle not in content:
+                errors.append(f"cutover wiring {relative} omits {needle!r}")
+    preflight = texts.get("scripts/agent-preflight.sh", "")
+    for remote_entrypoint in ("agent-ready.py", "agent-integration.py", "gh pr"):
+        if remote_entrypoint in preflight:
+            errors.append(
+                f"network-independent preflight invokes remote surface {remote_entrypoint!r}"
+            )
+    cutover = repository / ".agents/policy-cutover"
+    if not cutover.is_file():
+        errors.append("cutover wiring is missing .agents/policy-cutover")
+    elif re.fullmatch(r"[0-9a-f]{40}\n", cutover.read_text(encoding="utf-8")) is None:
+        errors.append(".agents/policy-cutover must contain one lowercase 40-hex commit")
+    return errors
+
+
 def main() -> int:
     failures: list[str] = []
     failures.extend(public_document_rule_errors())
@@ -198,6 +260,7 @@ def main() -> int:
         failures.extend(loop_errors(loop_doc.read_text(encoding="utf-8")))
 
     failures.extend(prompt_contract_errors())
+    failures.extend(cutover_wiring_errors())
 
     if failures:
         for failure in failures:
@@ -218,8 +281,8 @@ def main() -> int:
     print(
         "OK: public-document policy matches scripts/check-doc-checkpoint.py, "
         f"{INTERVIEW_DOCUMENT} carries the "
-        f"role interview and the orchestration loop, and all runtime prompts "
-        "satisfy the closed semantic contract."
+        f"role interview and the orchestration loop, all runtime prompts satisfy "
+        "the closed semantic contract, and cutover wiring is complete."
     )
     return 0
 

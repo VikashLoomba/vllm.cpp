@@ -239,6 +239,24 @@ class SemanticClassificationTests(unittest.TestCase):
             doc_checkpoint.classify_changed_paths(sorted(with_product)),
         )
 
+    def test_exact_policy_cutover_is_governance_only(self) -> None:
+        paths = set(doc_checkpoint.POLICY_CUTOVER_FILES)
+        self.assertEqual(doc_checkpoint.classify_changed_paths(sorted(paths)), {"governance"})
+        self.assertEqual(doc_checkpoint.checkpoint_errors(paths), [])
+
+    def test_policy_cutover_exemption_is_exact(self) -> None:
+        paths = set(doc_checkpoint.POLICY_CUTOVER_FILES)
+        without_one = paths - {"scripts/agent-ready.py"}
+        self.assertIn(
+            "feature_checkpoint",
+            doc_checkpoint.classify_changed_paths(sorted(without_one)),
+        )
+        with_product = paths | {"src/vt/backend.cpp"}
+        self.assertIn(
+            "feature_checkpoint",
+            doc_checkpoint.classify_changed_paths(sorted(with_product)),
+        )
+
     def test_governance_design_is_not_misclassified_as_feature_work(self) -> None:
         path = "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md"
         self.assertEqual(doc_checkpoint.classify_changed_paths([path]), {"governance"})

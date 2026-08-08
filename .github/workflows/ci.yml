@@ -78,8 +78,19 @@ jobs:
           python3 tests/scripts/test_check_gemv_invocation_consistency.py
       - name: Protocol prose matches the checkers that enforce it
         run: |
+          python3 scripts/check-policy.py
+          python3 scripts/check-prompt-contract.py
           python3 scripts/check-protocol-consistency.py
+          python3 -m unittest \
+            tests.scripts.test_policy_contract \
+            tests.scripts.test_policy_waivers \
+            tests.scripts.test_check_commit_trailers
+          python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_check_protocol_consistency.py
+          python3 tests/scripts/test_agent_gates.py
+          cutover="$(tr -d '\n' < .agents/policy-cutover)"
+          python3 scripts/check-commit-trailers.py \
+            --range "$cutover..HEAD" --cutover "$cutover"
       - name: The state-log tail is anchored and chronological
         run: |
           python3 scripts/check-state-order.py

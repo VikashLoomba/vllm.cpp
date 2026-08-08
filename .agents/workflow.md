@@ -37,7 +37,7 @@ Each controlled paragraph names exactly the rule it implements.
 
 [POL-OPERATOR-BOUNDARY] The operator coordinates feature implementation through bounded implementer and reviewer tasks, owns main integration and the GPU, and avoids writing an implementation that should be independently reviewed.
 
-[POL-PREFLIGHT] Run `scripts/agent-preflight.sh` at session start and the staged form before committing. Before pushing, rerun the applicable gate and chain success directly to the exact-SHA push.
+[POL-PREFLIGHT] Run network-independent `scripts/agent-preflight.sh` at session start and its staged form before committing. Before remote handoff run `scripts/agent-ready.py`; before integration run `scripts/agent-integration.py --base origin/main`. A remote failure is never converted to local success. Before pushing, rerun the applicable local gate and chain success directly to the exact-SHA push; hooks are only bypassable convenience backstops, never proof.
 <!-- policy-procedure:end -->
 
 ## Intake, claims, and readiness

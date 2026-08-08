@@ -377,6 +377,89 @@ TEST_CASE("linear_method: fused GeGLU gate-up seam == standalone MatmulBT+GeluAn
     CHECK(got[i] == ref[i]);  // BYTE-IDENTICAL — the fold changes nothing numerically
 }
 
+TEST_CASE("linear_method: expert GeGLU host slab and resident view preserve split reference bytes") {
+  const int64_t M = 3, H = 8, I = 5;
+  OwnedTensor gate_up = MakeBf16({2 * I, H}, 23);
+  OwnedTensor down = MakeBf16({H, I}, 29);
+  OwnedTensor xw = MakeBf16({M, H}, 31);
+  const auto* gate_up_data =
+      reinterpret_cast<const uint16_t*>(gate_up.bytes.data());
+  const auto* down_data = reinterpret_cast<const uint16_t*>(down.bytes.data());
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCPU);
+  vllm::dense_attn::Dev d{b, q};
+  vllm::dense_attn::DBuf x(d, DType::kBF16, {M, H}, xw.bytes.data());
+
+  // Pre-repair reference: stage the two I-wide projections independently,
+  // concatenate their bf16 rows, apply GeGLU, then project down.
+  vllm::dense_attn::DBuf gate_w(d, DType::kBF16, {I, H}, gate_up_data);
+  vllm::dense_attn::DBuf up_w(d, DType::kBF16, {I, H}, gate_up_data + I * H);
+  vllm::dense_attn::DBuf down_w(d, DType::kBF16, {H, I}, down_data);
+  vllm::dense_attn::DBuf gate(d, DType::kBF16, {M, I});
+  vllm::dense_attn::DBuf up(d, DType::kBF16, {M, I});
+  vt::MatmulBT(d.q, gate.t(), x.t(), gate_w.t());
+  vt::MatmulBT(d.q, up.t(), x.t(), up_w.t());
+  vllm::dense_attn::DBuf packed(d, DType::kBF16, {M, 2 * I});
+  const size_t row_bytes = static_cast<size_t>(I) * sizeof(uint16_t);
+  for (int64_t m = 0; m < M; ++m) {
+    d.b.Copy(d.q,
+             static_cast<char*>(packed.ptr()) + static_cast<size_t>(m) * 2 * row_bytes,
+             static_cast<const char*>(gate.ptr()) + static_cast<size_t>(m) * row_bytes,
+             row_bytes);
+    d.b.Copy(d.q,
+             static_cast<char*>(packed.ptr()) + static_cast<size_t>(m) * 2 * row_bytes +
+                 row_bytes,
+             static_cast<const char*>(up.ptr()) + static_cast<size_t>(m) * row_bytes,
+             row_bytes);
+  }
+  vllm::dense_attn::DBuf act_ref(d, DType::kBF16, {M, I});
+  vt::GeluAndMul(d.q, act_ref.t(), packed.t());
+  vllm::dense_attn::DBuf out_ref(d, DType::kBF16, {M, H});
+  vt::MatmulBT(d.q, out_ref.t(), act_ref.t(), down_w.t());
+
+  layers::UnquantizedMlpGateUpGeluMethod host_method(gate_up_data, I, H);
+  REQUIRE(std::string(host_method.Name()) == "bf16-gate-up-gelu");
+  vllm::dense_attn::DBuf act_host = host_method.Apply(d, x.t());
+  CHECK(act_host.t().rank == 2);
+  CHECK(act_host.t().shape[0] == M);
+  CHECK(act_host.t().shape[1] == I);
+  vllm::dense_attn::DBuf down_host(d, DType::kBF16, {H, I}, down_data);
+  vllm::dense_attn::DBuf out_host(d, DType::kBF16, {M, H});
+  vt::MatmulBT(d.q, out_host.t(), act_host.t(), down_host.t());
+
+  vt::Tensor gate_up_resident = vt::Tensor::Contiguous(
+      const_cast<uint16_t*>(gate_up_data), DType::kBF16, q.device, {2 * I, H});
+  vt::Tensor down_resident = vt::Tensor::Contiguous(
+      const_cast<uint16_t*>(down_data), DType::kBF16, q.device, {H, I});
+  layers::UnquantizedMlpGateUpGeluMethod resident_method(gate_up_resident, I);
+  REQUIRE(std::string(resident_method.Name()) == "bf16-gate-up-gelu");
+  vllm::dense_attn::DBuf act_resident = resident_method.Apply(d, x.t());
+  CHECK(act_resident.t().rank == 2);
+  CHECK(act_resident.t().shape[0] == M);
+  CHECK(act_resident.t().shape[1] == I);
+  vllm::dense_attn::DBuf out_resident(d, DType::kBF16, {M, H});
+  vt::MatmulBT(d.q, out_resident.t(), act_resident.t(), down_resident);
+
+  std::vector<uint16_t> act_expected(static_cast<size_t>(M) * I);
+  std::vector<uint16_t> act_host_bytes(act_expected.size());
+  std::vector<uint16_t> act_resident_bytes(act_expected.size());
+  act_ref.Download(d, act_expected.data());
+  act_host.Download(d, act_host_bytes.data());
+  act_resident.Download(d, act_resident_bytes.data());
+  CHECK(act_host_bytes == act_expected);
+  CHECK(act_resident_bytes == act_expected);
+
+  std::vector<uint16_t> out_expected(static_cast<size_t>(M) * H);
+  std::vector<uint16_t> out_host_bytes(out_expected.size());
+  std::vector<uint16_t> out_resident_bytes(out_expected.size());
+  out_ref.Download(d, out_expected.data());
+  out_host.Download(d, out_host_bytes.data());
+  out_resident.Download(d, out_resident_bytes.data());
+  CHECK(out_host_bytes == out_expected);
+  CHECK(out_resident_bytes == out_expected);
+}
+
 TEST_CASE("linear_method: bf16 UnquantizedLinearMethod apply == reference MatmulBT") {
   const int64_t M = 2, K = 16, N = 4;
   OwnedTensor w = MakeBf16({N, K}, 7);  // raw-NK [N=out, K=in]

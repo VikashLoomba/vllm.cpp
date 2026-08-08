@@ -119,14 +119,38 @@ class UnquantizedMlpGateUpMethod : public MlpGateUpMethodBase {
 // merged-GEMM descriptor / fused-kernel scheme choice has one home across both
 // activation families; a future nvfp4 checkpoint gets a GeGLU quant arm the same
 // way the SwiGLU one gets GateUpFusedMarlinD.
+//
+// Gemma-4's experts borrow contiguous [2I,H] slabs rather than OwnedTensor
+// objects. The host form stages that slab through DBuf on the running backend;
+// the resident form binds its existing vt::Tensor view. Both then enter the
+// same ApplyWeight implementation, with no device identity in the method.
 class UnquantizedMlpGateUpGeluMethod : public MlpGateUpMethodBase {
  public:
   UnquantizedMlpGateUpGeluMethod(const OwnedTensor* gate_up, int64_t intermediate)
       : gate_up_(gate_up), I_(intermediate) {}
 
+  UnquantizedMlpGateUpGeluMethod(const uint16_t* gate_up_host, int64_t intermediate,
+                                 int64_t hidden)
+      : gate_up_host_(gate_up_host), I_(intermediate), H_(hidden) {}
+
+  UnquantizedMlpGateUpGeluMethod(const vt::Tensor& gate_up_resident,
+                                 int64_t intermediate)
+      : gate_up_resident_(gate_up_resident), I_(intermediate) {}
+
   DBuf Apply(Dev d, const vt::Tensor& x) const override {
+    if (gate_up_ != nullptr) return ApplyWeight(d, x, ResidentWeight(d, *gate_up_));
+    if (gate_up_host_ != nullptr) {
+      DBuf staged(d, vt::DType::kBF16, {2 * I_, H_}, gate_up_host_);
+      return ApplyWeight(d, x, staged.t());
+    }
+    return ApplyWeight(d, x, gate_up_resident_);
+  }
+
+  const char* Name() const override { return "bf16-gate-up-gelu"; }
+
+ private:
+  DBuf ApplyWeight(Dev d, const vt::Tensor& x, const vt::Tensor& wgu) const {
     const int64_t M = x.shape[0];
-    vt::Tensor wgu = ResidentWeight(d, *gate_up_);  // [2I, H] raw-NK
     DBuf gate_up(d, vt::DType::kBF16, {M, 2 * I_});
     vt::MatmulBT(d.q, gate_up.t(), x, wgu);
     DBuf act(d, vt::DType::kBF16, {M, I_});
@@ -134,11 +158,11 @@ class UnquantizedMlpGateUpGeluMethod : public MlpGateUpMethodBase {
     return act;
   }
 
-  const char* Name() const override { return "bf16-gate-up-gelu"; }
-
- private:
-  const OwnedTensor* gate_up_;
+  const OwnedTensor* gate_up_ = nullptr;
+  const uint16_t* gate_up_host_ = nullptr;
+  vt::Tensor gate_up_resident_;
   int64_t I_;
+  int64_t H_ = 0;
 };
 
 }  // namespace layers

@@ -27,6 +27,10 @@ build/examples/vllm-cli \
   --max-tokens 64
 ```
 
+Gemma-4 MoE expert residency (host-backed or already device-resident) is chosen
+automatically from the loaded weights; the shared GeGLU method adds no CLI or
+server flag.
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--model <dir>` | (required) | Model directory (config.json + tokenizer.json + safetensors) |

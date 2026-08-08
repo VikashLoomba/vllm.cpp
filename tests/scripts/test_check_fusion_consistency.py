@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -19,6 +20,26 @@ SPEC.loader.exec_module(mod)
 
 drift_models = mod.drift_models
 gemm_merge_drift_models = mod.gemm_merge_drift_models
+
+
+def _strip_cpp_comments(text: str) -> str:
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", text, flags=re.DOTALL)
+
+
+def _cpp_function_body(text: str, name: str) -> str:
+    match = re.search(rf"\b{name}\s*\([^;]*\)\s*\{{", text)
+    if match is None:
+        raise AssertionError(f"missing C++ function {name}")
+    start = match.end() - 1
+    depth = 0
+    for pos in range(start, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : pos]
+    raise AssertionError(f"unterminated C++ function {name}")
 
 
 class DriftModelTests(unittest.TestCase):
@@ -161,6 +182,27 @@ class GemmMergeDriftTests(unittest.TestCase):
             )
         )
         self.assertEqual(gemm_merge_drift_models(scanned, allowlisted), [])
+
+    def test_gemma4_expert_helpers_apply_the_shared_geglu_method(self) -> None:
+        source = _strip_cpp_comments(
+            (ROOT / "src/vllm/model_executor/models/gemma4_moe.cpp").read_text(
+                encoding="utf-8"
+            )
+        )
+        failures: list[str] = []
+        apply_pattern = re.compile(
+            r"layers::UnquantizedMlpGateUpGeluMethod\s*\([^;]*\)\s*\.Apply\s*\("
+        )
+        for helper in ("ExpertGeGLUHost", "ExpertGeGLUDevice"):
+            body = _cpp_function_body(source, helper)
+            direct_calls = len(re.findall(r"\bvt::GeluAndMul\s*\(", body))
+            if direct_calls:
+                failures.append(f"{helper}: {direct_calls} direct vt::GeluAndMul call(s)")
+            if len(apply_pattern.findall(body)) != 1:
+                failures.append(
+                    f"{helper}: expected exactly one shared GeGLU method application"
+                )
+        self.assertEqual(failures, [], "; ".join(failures))
 
     def test_a_new_unfolded_model_would_fail(self) -> None:
         scanned = dict(mod.scan_models_gemm(ROOT / "src/vllm/model_executor/models"))

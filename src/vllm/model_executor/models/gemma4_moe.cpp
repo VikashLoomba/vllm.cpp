@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vllm/model_executor/layers/linear.h"
 #include "vllm/model_executor/models/dense_attn_block.h"
 #include "vllm/model_executor/models/device_pool.h"
 #include "vt/backend.h"
@@ -26,51 +27,19 @@ using vt::Tensor;
 
 void ExpertGeGLUHost(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
                      const uint16_t* down_e, int64_t I, int64_t H) {
-  const int64_t T = x.shape[0];
-  DBuf gate_w(d, DType::kBF16, {I, H}, gate_up_e);
-  DBuf up_w(d, DType::kBF16, {I, H}, gate_up_e + I * H);
   DBuf down_w(d, DType::kBF16, {H, I}, down_e);
-  DBuf gate(d, DType::kBF16, {T, I});
-  DBuf up(d, DType::kBF16, {T, I});
-  vt::MatmulBT(d.q, gate.t(), x, gate_w.t());
-  vt::MatmulBT(d.q, up.t(), x, up_w.t());
-  DBuf gu(d, DType::kBF16, {T, 2 * I});
-  const size_t row = static_cast<size_t>(I) * sizeof(uint16_t);
-  for (int64_t t = 0; t < T; ++t) {
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row,
-             static_cast<const char*>(gate.ptr()) + static_cast<size_t>(t) * row, row);
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row + row,
-             static_cast<const char*>(up.ptr()) + static_cast<size_t>(t) * row, row);
-  }
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::GeluAndMul(d.q, act.t(), gu.t());
+  DBuf act = layers::UnquantizedMlpGateUpGeluMethod(gate_up_e, I, H).Apply(d, x);
   vt::MatmulBT(d.q, out.t(), act.t(), down_w.t());
 }
 
 void ExpertGeGLUDevice(Dev d, DBuf& out, const Tensor& x, const uint16_t* gate_up_e,
                        const uint16_t* down_e, int64_t I, int64_t H) {
-  const int64_t T = x.shape[0];
   const vt::Device dev = d.q.device;
-  Tensor gate_w =
-      Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e), DType::kBF16, dev, {I, H});
-  Tensor up_w = Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e + I * H), DType::kBF16,
-                                   dev, {I, H});
+  Tensor gate_up_w = Tensor::Contiguous(const_cast<uint16_t*>(gate_up_e), DType::kBF16,
+                                        dev, {2 * I, H});
   Tensor down_w =
       Tensor::Contiguous(const_cast<uint16_t*>(down_e), DType::kBF16, dev, {H, I});
-  DBuf gate(d, DType::kBF16, {T, I});
-  DBuf up(d, DType::kBF16, {T, I});
-  vt::MatmulBT(d.q, gate.t(), x, gate_w);
-  vt::MatmulBT(d.q, up.t(), x, up_w);
-  DBuf gu(d, DType::kBF16, {T, 2 * I});
-  const size_t row = static_cast<size_t>(I) * sizeof(uint16_t);
-  for (int64_t t = 0; t < T; ++t) {
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row,
-             static_cast<const char*>(gate.ptr()) + static_cast<size_t>(t) * row, row);
-    d.b.Copy(d.q, static_cast<char*>(gu.ptr()) + static_cast<size_t>(t) * 2 * row + row,
-             static_cast<const char*>(up.ptr()) + static_cast<size_t>(t) * row, row);
-  }
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::GeluAndMul(d.q, act.t(), gu.t());
+  DBuf act = layers::UnquantizedMlpGateUpGeluMethod(gate_up_w, I).Apply(d, x);
   vt::MatmulBT(d.q, out.t(), act.t(), down_w);
 }
 

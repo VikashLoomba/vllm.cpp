@@ -416,7 +416,8 @@ recurrences; 27B prefill 21.5x on GB10; qwen3_5 #125 VERIFIED; CUDA build repair
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
 on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in —
 **blind-written, unverified** — M2 unblocks on verification; gfx1201 hipBLAS +
-Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700; #158 repair SPEC, CPU-link;
+Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700; #158 Task 1 expert-GeGLU
+shared-method fold is CPU byte-exact, runner repair pending;
 [guide](ROCM.md)), and the full tool-calling template surface. **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
 with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's

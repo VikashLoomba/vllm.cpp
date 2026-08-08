@@ -44,8 +44,8 @@ no Dockerfile, workflow or registry package is claimed. Metal/MLX are NOT-CONTAI
 Protocol (2026-08-08): `agent-start.py` → claim → preflight; review FAIL →
 fresh implementer → both gates → fresh review until PASS. Budgets cannot stop
 it; registry/prompt mutation gates bind it. Dormant structured-state parser:
-15 focused tests; live record/cutover unchanged. Verified PRs merge; obsolete
-close.
+17 tests, including malformed legacy metadata/date rejection; live record and
+cutover unchanged. Verified PRs merge; obsolete close.
 
 Protocol repair (2026-08-08): release AST pins pass 30 tests on Python
 3.12/3.13; Gemma-4 MoE is known drift pending the shared merged-GeGLU fold;

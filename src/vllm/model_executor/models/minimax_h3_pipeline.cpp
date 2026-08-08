@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/device_pool.h"  // ActivePool()/DevicePool::Drain
 #include "vt/backend.h"
 #include "vt/dtype.h"
 
@@ -476,7 +477,23 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
   // scalar reference; at real resolutions it is the stage that does not finish. It
   // stays the CPU path, and stays the thing the device path is gated against.
   if (device.type != vt::DeviceType::kCPU) {
-    vt::Queue vq = vt::GetBackend(device.type).CreateQueue();
+    vt::Backend& vae_backend = vt::GetBackend(device.type);
+    // PHASE CHANGE: denoise is done, the VAE decode is next. The denoise left the
+    // scratch pool holding every activation size class it touched, and on an
+    // UNCAPPED pool (GB10/Thor: `device_pool_cap_bytes == 0`) those blocks are
+    // never returned to the driver. The decode allocates DIFFERENT classes, so it
+    // cannot reuse any of them -- they are pure headroom loss at the one moment
+    // the decode needs its own working set. At the REF canvas (1344x768/124f)
+    // that is the difference between a decode that fits and one that takes the
+    // BOX DOWN: measured 85 GiB resident at this point against a ~18 GiB decode
+    // in a 122 GiB unified pool, and the driver OOM (NV_ERR_NO_MEMORY) rebooted
+    // the machine. Draining costs one cudaFree per retained block, once.
+    const size_t drained = ActivePool()->Drain(vae_backend);
+    if (std::getenv("VT_POOL_STATS") != nullptr) {
+      std::fprintf(stderr, "[h3] drained %.2f GiB of denoise scratch before VAE decode\n",
+                   static_cast<double>(drained) / (1024.0 * 1024.0 * 1024.0));
+    }
+    vt::Queue vq = vae_backend.CreateQueue();
     const MiniMaxH3VideoVaeDeviceWeights staged_vae =
         StageMiniMaxH3VideoVaeWeights(vq, video_config, video_weights);
     // Upstream's video path is decode_base -> decode_temporal: chunked in TIME.

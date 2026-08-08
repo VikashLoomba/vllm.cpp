@@ -1169,8 +1169,22 @@ log, ~1 min after the dump, box down ~2 min later). The dequantised bf16 DiT sta
 resident through `MiniMaxH3VideoVaeDecodeTemporalDevice`. Decoding the SAME dumped latent
 standalone — VAE only, no DiT resident — completes with room to spare and produced the
 1.15 frames above. So generation is correct at the REF canvas and the DECODE is what does
-not fit alongside the model. A driver that frees the DiT before decode, or decodes in
-temporal slices, is the fix; not attempted in this row.
+not fit alongside the model.
+
+**FIXED in this row — `DevicePool::Drain` at the phase change.** The scratch pool is
+UNCAPPED on this platform (`cuda.cpp:98`, `device_pool_cap_bytes = 0`), so every block a
+`DBuf` returns across 50 denoise steps is retained forever, keyed by size class. The VAE
+decode then asks for DIFFERENT classes, cannot reuse any of them, and `cudaMalloc`s on
+top. `MiniMaxH3GenerateT2va` now drains the pool once at the denoise -> decode boundary.
+Measured on the REF canvas: **10.25 GiB released**, the render completed (124 frames +
+32 kHz audio, no reboot), and the pool still served **99.92%** of allocations from the
+free list (`hits=98475 misses=75 distinct-classes=8`) — draining at a PHASE boundary does
+not cost the within-phase reuse the pool exists for. Capping the pool platform-wide was
+REJECTED: it would charge every CUDA model the cudaMalloc/cudaFree sync storm the pool was
+built to avoid, for a problem that only appears at one phase change.
+
+`--keep-quant` was tried first as a no-code workaround and is NOT one: it OOM-killed the
+box ~8 min in, during weight staging, before a single denoise step.
 
 **Residuals.** (1) No full 124-frame MP4 with audio at the REF canvas yet — blocked on the
 OOM above. (2) The audio latent has no `VT_H3_DUMP_DIR` hook, so the audio arm is

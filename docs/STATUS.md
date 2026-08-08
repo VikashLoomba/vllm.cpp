@@ -44,7 +44,7 @@ no Dockerfile, workflow or registry package is claimed. Metal/MLX are NOT-CONTAI
 Protocol (2026-08-08): `agent-start.py` → claim → preflight; review FAIL →
 fresh implementer → both gates → fresh review until PASS. Budgets cannot stop
 it; registry/prompt mutation gates bind it. Dormant structured-state parser:
-17 tests, including malformed legacy metadata/date rejection; live record and
+17 scalar tests and 32 total with relational/Git history; live record and
 cutover unchanged. Verified PRs merge; obsolete close.
 
 Protocol repair (2026-08-08): release AST pins pass 30 tests on Python

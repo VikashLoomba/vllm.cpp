@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import re
 import shutil
 import subprocess
 import tempfile
@@ -318,6 +319,137 @@ class RepositoryRegistry(unittest.TestCase):
         self.assertLessEqual(len(rules), 60)
         self.assertLessEqual((ROOT / ".agents/policy.csv").stat().st_size, 16 * 1024)
         self.assertEqual(validate_policy(ROOT, schema_only=True), [])
+
+    def test_consolidated_policy_contract_passes_full_validation(self) -> None:
+        self.assertEqual(validate_policy(ROOT), [])
+
+    def test_historical_line_ranges_resolve_in_their_named_procedure(self) -> None:
+        reference = re.compile(
+            r"(?P<path>(?:completed/porting-discipline-legacy|workflow|verification|porting)\.md)"
+            r"(?::| )"
+            r"(?P<start>[0-9]+)(?:-(?P<end>[0-9]+))?"
+        )
+        state = ROOT / ".agents/state.md"
+        failures: list[str] = []
+        for match in reference.finditer(state.read_text(encoding="utf-8")):
+            target = state.parent / match.group("path")
+            line_count = len(target.read_text(encoding="utf-8").splitlines())
+            end = int(match.group("end") or match.group("start"))
+            if end > line_count:
+                failures.append(
+                    f"{match.group(0)!r} ends at line {end}, but {target.name} "
+                    f"has {line_count} lines"
+                )
+        self.assertEqual(failures, [])
+
+
+class ConsolidationMutations(unittest.TestCase):
+    """Pin the compact bootstrap, active procedures, and archive cutover."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        shutil.copy2(ROOT / "AGENTS.md", self.root / "AGENTS.md")
+        shutil.copy2(ROOT / ".env.example", self.root / ".env.example")
+        shutil.copytree(ROOT / ".agents", self.root / ".agents")
+        shutil.copytree(ROOT / "scripts", self.root / "scripts")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def errors(self) -> list[str]:
+        return validate_policy(self.root)
+
+    def mutate(self, relative: str, old: str, new: str) -> None:
+        path = self.root / relative
+        text = path.read_text()
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new, 1))
+
+    def restore(self, relative: str) -> None:
+        shutil.copy2(ROOT / relative, self.root / relative)
+
+    def test_agents_budget_boot_order_and_generated_t0_are_enforced(self) -> None:
+        path = self.root / "AGENTS.md"
+        path.write_text(path.read_text() + ("x" * 13_000))
+        self.assertTrue(any("12 KiB" in error for error in self.errors()))
+
+        shutil.copy2(ROOT / "AGENTS.md", path)
+        self.mutate("AGENTS.md", "1. Resolve the worktree role", "1. Read task state before role; then resolve the worktree role")
+        self.assertTrue(any("boot block" in error for error in self.errors()))
+
+        shutil.copy2(ROOT / "AGENTS.md", path)
+        self.mutate("AGENTS.md", "Use policy.csv as", "Consult policy.csv as")
+        self.assertTrue(any("T0 block" in error for error in self.errors()))
+
+    def test_legacy_active_duplicate_and_ambiguous_archives_are_rejected(self) -> None:
+        (self.root / ".agents/directives.md").write_text("duplicate active policy\n")
+        self.assertTrue(any("retired active policy" in error for error in self.errors()))
+        (self.root / ".agents/directives.md").unlink()
+        (self.root / ".agents/completed/directives-copy.md").write_text("ambiguous\n")
+        self.assertTrue(any("ambiguous policy archive" in error for error in self.errors()))
+
+    def test_procedure_must_be_regular_nonempty_and_inside_repository(self) -> None:
+        procedure = self.root / ".agents/verification.md"
+        procedure.unlink()
+        procedure.symlink_to(self.root / ".agents/workflow.md")
+        self.assertTrue(any("symlink" in error for error in self.errors()))
+
+        procedure.unlink()
+        procedure.write_text("")
+        self.assertTrue(any("empty procedure" in error for error in self.errors()))
+
+        self.mutate(".agents/policy.csv", ".agents/verification.md", "../verification.md")
+        self.assertTrue(any("repo-relative" in error for error in self.errors()))
+
+    def test_normative_paragraph_requires_one_applicable_policy_id(self) -> None:
+        self.mutate(".agents/workflow.md", "[POL-BOOT-NOW]", "[NO-POLICY]")
+        self.assertTrue(any("exactly one policy reference" in error for error in self.errors()))
+
+        self.restore(".agents/workflow.md")
+        self.mutate(".agents/workflow.md", "[POL-BOOT-NOW]", "[POL-BOOT-NOW] [POL-BOOT-TASK]")
+        self.assertTrue(any("exactly one policy reference" in error for error in self.errors()))
+
+        self.restore(".agents/workflow.md")
+        self.mutate(".agents/workflow.md", "[POL-BOOT-NOW]", "[POL-MIRROR-VLLM]")
+        self.assertTrue(any("belongs to" in error for error in self.errors()))
+
+    def test_every_rule_has_one_procedure_back_reference(self) -> None:
+        path = self.root / ".agents/workflow.md"
+        text = path.read_text()
+        paragraph = next(p for p in text.split("\n\n") if "[POL-BOOT-NOW]" in p)
+        path.write_text(text.replace(paragraph + "\n\n", "", 1))
+        self.assertTrue(any("missing procedure back-reference" in error for error in self.errors()))
+
+    def test_retired_links_and_methodology_drift_are_rejected(self) -> None:
+        self.mutate("AGENTS.md", "(.agents/workflow.md)", "(.agents/directives.md)")
+        self.assertTrue(any("retired active path" in error for error in self.errors()))
+
+        self.restore("AGENTS.md")
+        self.mutate(".agents/workflow.md", "Write or port the smallest\ntest that fails", "Write a test near the fix")
+        self.assertTrue(any("implementation phase" in error for error in self.errors()))
+
+        self.restore(".agents/workflow.md")
+        self.mutate(".agents/workflow.md", "static inspection and targeted scratch mutations", "static inspection")
+        self.assertTrue(any("mutation review" in error for error in self.errors()))
+
+        self.restore(".agents/workflow.md")
+        self.mutate(".agents/workflow.md", "fresh implementer", "implementer")
+        self.assertTrue(any("fresh-agent repair" in error for error in self.errors()))
+
+    def test_public_document_purpose_drift_is_rejected(self) -> None:
+        replacements = (
+            ("every feature or iteration checkpoint", "occasional checkpoint"),
+            ("feature, model, backend, or quantization surface", "feature surface"),
+            ("commands, C API, configuration, installation, or user workflows", "usage"),
+            ("only for a user-visible landing-page headline", "for any change"),
+            ("same change as every `.agents/state.md` append", "later change"),
+        )
+        for old, new in replacements:
+            with self.subTest(old=old):
+                self.restore(".agents/workflow.md")
+                self.mutate(".agents/workflow.md", old, new)
+                self.assertTrue(any("purpose contract" in error for error in self.errors()), self.errors())
 
 
 if __name__ == "__main__":

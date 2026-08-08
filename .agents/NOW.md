@@ -35,8 +35,8 @@ bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
 
 Unchanged: token-exact (or the ratified distributional gate) against the pinned
 vLLM oracle, AND ≥ vLLM on every throughput axis / ≤ on latency and memory, on
-both gate models, reproduced 2–3x on an idle box. See [gates.md](gates.md) and
-[benchmark-protocol.md](benchmark-protocol.md). Parity pin: vLLM `555967922`
+both gate models, reproduced 2–3x on an idle box. See the
+[verification procedure](verification.md). Parity pin: vLLM `555967922`
 (0.26.0.dev0).
 
 Method rules hardened (AGENTS.md): the STRUCTURAL lens (same kernel, different
@@ -63,7 +63,7 @@ throughput ⇒ audit the context; per-shape MEASUREMENT arbitrates).
    on the 10 audited rows (audit §➁a); its fix owes an 8-row adjudication.
 
 **Operator/helper protocol**
-([spec](specs/operator-helper-protocol.md)): roles DECLARED then MATERIALIZED
+([spec](workflow.md)): roles DECLARED then MATERIALIZED
 into a lock or worktree+PR; operator merges PRs first and does features only via
 sub-agents; helpers use worktrees on `row/<ROW-ID>` and open a DRAFT PR at the
 START, which IS the claim. **W0-W5 LANDED**; role discipline ENFORCING,

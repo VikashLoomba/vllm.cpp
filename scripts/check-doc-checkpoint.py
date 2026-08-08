@@ -393,6 +393,57 @@ CLAIM_CUTOVER_FILES = frozenset(
         "tests/scripts/test_doc_checkpoint.py",
     }
 )
+# Policy consolidation repairs links in records that ordinarily signal feature
+# work.  Exempt only the complete, closed migration transaction: removing any
+# path or adding any unrelated path restores the ordinary semantic classes.
+POLICY_CONSOLIDATION_FILES = frozenset(
+    {
+        ".agents/NOW.md",
+        ".agents/backend-matrix.md",
+        ".agents/backends.md",
+        ".agents/benchmark-record.md",
+        ".agents/completed/ai-coding-assistants-legacy.md",
+        ".agents/completed/benchmark-protocol-legacy.md",
+        ".agents/completed/mvp-gates-legacy.md",
+        ".agents/completed/operator-helper-protocol-legacy.md",
+        ".agents/completed/policy-directives-legacy.md",
+        ".agents/completed/porting-discipline-legacy.md",
+        ".agents/completed/roadmap_mvp_v0.md",
+        ".agents/completed/roadmap_v1_inventory_spikes_2026-07-10.md",
+        ".agents/completed/test-porting-legacy.md",
+        ".agents/parity-ledger.md",
+        ".agents/policy.csv",
+        ".agents/porting.md",
+        ".agents/roadmap_v1.md",
+        ".agents/specs/backend-fanout-metal-vulkan-xpu.md",
+        ".agents/specs/cuda-sglang-low-concurrency.md",
+        ".agents/specs/gemma4-multimodal.md",
+        ".agents/specs/glm-dsa-latest-deepseek.md",
+        ".agents/specs/kv-persistence-lmcache.md",
+        ".agents/specs/lmcache-cpp-client-connector.md",
+        ".agents/specs/mla-deepseek-campaign.md",
+        ".agents/specs/model-factory-registry.md",
+        ".agents/specs/multimodal-track.md",
+        ".agents/specs/prefix-prompt-caching-parity.md",
+        ".agents/specs/quantization-coverage.md",
+        ".agents/specs/session-onboarding.md",
+        ".agents/specs/sglang-parity-oracle.md",
+        ".agents/specs/sweep-gemma.md",
+        ".agents/specs/sweep-olmo2.md",
+        ".agents/specs/sweep-recent-dense-batch.md",
+        ".agents/specs/vulkan-full-support.md",
+        ".agents/state.md",
+        ".agents/verification.md",
+        ".agents/workflow.md",
+        "AGENTS.md",
+        "docs/ROCM.md",
+        "docs/STATUS.md",
+        "scripts/check-doc-checkpoint.py",
+        "scripts/policy_contract.py",
+        "tests/scripts/test_doc_checkpoint.py",
+        "tests/scripts/test_policy_contract.py",
+    }
+)
 FEATURE_CHECKPOINT_FILES = frozenset(
     {
         "CMakeLists.txt",
@@ -471,6 +522,8 @@ def classify_changed_paths(paths: list[str]) -> set[str]:
 
     classes: set[str] = set()
     path_set = set(paths)
+    if path_set == POLICY_CONSOLIDATION_FILES:
+        return {"governance"}
     exact_claim_cutover = (
         path_set == CLAIM_CUTOVER_FILES
     )

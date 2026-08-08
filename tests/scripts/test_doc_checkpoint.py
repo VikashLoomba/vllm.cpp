@@ -221,6 +221,24 @@ class SemanticClassificationTests(unittest.TestCase):
         self.assertIn("feature_checkpoint", pair_only)
         self.assertIn("live_state", pair_only)
 
+    def test_exact_policy_consolidation_is_governance_only(self) -> None:
+        paths = set(doc_checkpoint.POLICY_CONSOLIDATION_FILES)
+        self.assertEqual(doc_checkpoint.classify_changed_paths(sorted(paths)), {"governance"})
+        self.assertEqual(doc_checkpoint.checkpoint_errors(paths), [])
+
+    def test_policy_consolidation_exemption_is_exact(self) -> None:
+        paths = set(doc_checkpoint.POLICY_CONSOLIDATION_FILES)
+        without_one = paths - {".agents/backend-matrix.md"}
+        self.assertIn(
+            "feature_checkpoint",
+            doc_checkpoint.classify_changed_paths(sorted(without_one)),
+        )
+        with_product = paths | {"src/vt/backend.cpp"}
+        self.assertIn(
+            "feature_checkpoint",
+            doc_checkpoint.classify_changed_paths(sorted(with_product)),
+        )
+
     def test_governance_design_is_not_misclassified_as_feature_work(self) -> None:
         path = "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md"
         self.assertEqual(doc_checkpoint.classify_changed_paths([path]), {"governance"})

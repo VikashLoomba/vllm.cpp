@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,57 @@ SCOPE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 BROAD_SCOPE_VALUES = frozenset(
     {"all", "any", "everything", "global", "repo", "repository"}
 )
+AGENTS_MAX_BYTES = 12 * 1024
+PROCEDURE_BUDGETS = {
+    ".agents/workflow.md": 12 * 1024,
+    ".agents/verification.md": 8 * 1024,
+    ".agents/porting.md": 8 * 1024,
+}
+T0_RULE_IDS = (
+    "POL-AUTH-REGISTRY",
+    "POL-ROLE-DECLARED",
+    "POL-SPIKE-FIRST",
+    "POL-MIRROR-VLLM",
+    "POL-PORT-TESTS",
+    "POL-CORRECTNESS-GATE",
+    "POL-PREFLIGHT",
+    "POL-REVIEW-FRESH",
+    "POL-REVIEW-NO-REPAIR",
+    "POL-OPERATOR-VERIFY",
+    "POL-EVIDENCE-PRESERVE",
+    "POL-PR-DISPOSITION",
+)
+BOOT_BLOCK = """<!-- policy-boot:begin -->
+1. Resolve the worktree role with `python3 scripts/agent-role.py show`; claim the developer-selected role only when no valid role exists.
+2. Resolve `.env` and `.agents/developer-preferences.md` from the shared checkout, requesting only values required by the current task.
+3. Read `.agents/NOW.md` for the live snapshot.
+4. Read `.agents/policy.csv`, then the procedure named by each applicable rule.
+5. Read only the claimed task's spec, owning row, evidence, and coordination entry.
+<!-- policy-boot:end -->"""
+LEGACY_ACTIVE_PATHS = (
+    ".agents/directives.md",
+    ".agents/ai-coding-assistants.md",
+    ".agents/specs/operator-helper-protocol.md",
+    ".agents/gates.md",
+    ".agents/benchmark-protocol.md",
+    ".agents/discipline.md",
+    ".agents/test-porting.md",
+)
+POLICY_ARCHIVES = (
+    ".agents/completed/policy-directives-legacy.md",
+    ".agents/completed/ai-coding-assistants-legacy.md",
+    ".agents/completed/operator-helper-protocol-legacy.md",
+    ".agents/completed/mvp-gates-legacy.md",
+    ".agents/completed/benchmark-protocol-legacy.md",
+    ".agents/completed/porting-discipline-legacy.md",
+    ".agents/completed/test-porting-legacy.md",
+)
+ARCHIVE_NAME_PATTERN = re.compile(
+    r"(?:directives|ai-coding-assistants|operator-helper|gates|benchmark-protocol|discipline|test-porting)",
+    re.IGNORECASE,
+)
+POLICY_REF = re.compile(r"(?<![A-Z0-9-])POL-[A-Z0-9]+(?:-[A-Z0-9]+)*(?![A-Z0-9-])")
+MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")
 
 
 @dataclass(frozen=True)
@@ -184,8 +236,16 @@ def _parse_policy(root: Path) -> tuple[dict[str, PolicyRule], list[str]]:
             errors.append(
                 f"policy.csv:{number}: procedure {procedure!r} is not repo-relative"
             )
-        elif Path(procedure).suffix != ".md" or not (root / procedure).is_file():
+        elif Path(procedure).suffix != ".md":
             errors.append(f"policy.csv:{number}: unknown procedure path {procedure!r}")
+        else:
+            procedure_path = root / procedure
+            if procedure_path.is_symlink():
+                errors.append(f"policy.csv:{number}: procedure path {procedure!r} is a symlink")
+            elif not procedure_path.is_file():
+                errors.append(f"policy.csv:{number}: unknown procedure path {procedure!r}")
+            elif procedure_path.stat().st_size == 0:
+                errors.append(f"policy.csv:{number}: empty procedure path {procedure!r}")
 
         if rule_id not in rules:
             rules[rule_id] = PolicyRule(**row)
@@ -304,12 +364,11 @@ def _waiver_is_referenced(root: Path, waiver_id: str) -> bool:
 def validate_policy(root: Path, *, schema_only: bool = False) -> list[str]:
     """Return every policy/waiver contract defect found under *root*.
 
-    ``schema_only`` is the bootstrap mode.  Task 1 has no generated prose to
-    check yet, so both modes intentionally enforce the complete registry
-    schema and path contract; later cutover checks extend only full mode.
+    ``schema_only`` validates the registries and named files early in bootstrap.
+    Full mode additionally validates the compact bootstrap, procedure coverage,
+    archives, and policy-surface links.
     """
 
-    del schema_only
     rules, errors = _parse_policy(root)
     if errors:
         return errors
@@ -317,4 +376,188 @@ def validate_policy(root: Path, *, schema_only: bool = False) -> list[str]:
         load_waivers(root, rules)
     except (ValueError, KeyError) as exc:
         errors.extend(str(exc).splitlines())
+    if not schema_only:
+        errors.extend(_validate_consolidation(root, rules))
+    return errors
+
+
+def _marker_block(text: str, begin: str, end: str) -> str | None:
+    if text.count(begin) != 1 or text.count(end) != 1:
+        return None
+    start = text.index(begin)
+    finish = text.index(end, start) + len(end)
+    return text[start:finish]
+
+
+def _generated_t0(rules: dict[str, PolicyRule]) -> str:
+    lines = ["<!-- policy-t0:begin -->"]
+    for rule_id in T0_RULE_IDS:
+        rule = rules.get(rule_id)
+        if rule is not None:
+            lines.append(f"- `{rule_id}` — {rule.requirement}")
+    lines.append("<!-- policy-t0:end -->")
+    return "\n".join(lines)
+
+
+def _controlled_paragraphs(text: str, relative: str) -> tuple[list[str], list[str]]:
+    begin = "<!-- policy-procedure:begin -->"
+    end = "<!-- policy-procedure:end -->"
+    errors: list[str] = []
+    if text.count(begin) != text.count(end):
+        return [], [f"{relative}: unbalanced policy-procedure markers"]
+    paragraphs: list[str] = []
+    position = 0
+    while True:
+        start = text.find(begin, position)
+        if start < 0:
+            break
+        finish = text.find(end, start + len(begin))
+        if finish < 0:
+            break
+        body = text[start + len(begin):finish].strip()
+        paragraphs.extend(part.strip() for part in re.split(r"\n\s*\n", body) if part.strip())
+        position = finish + len(end)
+    return paragraphs, errors
+
+
+def _validate_consolidation(root: Path, rules: dict[str, PolicyRule]) -> list[str]:
+    errors: list[str] = []
+    agents = root / "AGENTS.md"
+    if agents.is_symlink() or not agents.is_file():
+        return ["AGENTS.md must be a non-symlink regular file"]
+    agents_text = agents.read_text(encoding="utf-8")
+    if agents.stat().st_size >= AGENTS_MAX_BYTES:
+        errors.append(
+            f"AGENTS.md exceeds the strict 12 KiB budget ({agents.stat().st_size} bytes)"
+        )
+    if _marker_block(agents_text, "<!-- policy-boot:begin -->", "<!-- policy-boot:end -->") != BOOT_BLOCK:
+        errors.append("AGENTS.md boot block is missing, duplicated, or out of order")
+    expected_t0 = _generated_t0(rules)
+    if _marker_block(agents_text, "<!-- policy-t0:begin -->", "<!-- policy-t0:end -->") != expected_t0:
+        errors.append("AGENTS.md generated T0 block does not match policy.csv")
+
+    for relative in LEGACY_ACTIVE_PATHS:
+        if os.path.lexists(root / relative):
+            errors.append(f"retired active policy path still exists: {relative}")
+
+    expected_archives = {Path(path).name for path in POLICY_ARCHIVES}
+    for relative in POLICY_ARCHIVES:
+        path = root / relative
+        if path.is_symlink():
+            errors.append(f"policy archive is a symlink: {relative}")
+        elif not path.is_file():
+            errors.append(f"missing policy archive: {relative}")
+        elif path.stat().st_size == 0:
+            errors.append(f"empty policy archive: {relative}")
+    completed = root / ".agents/completed"
+    if completed.is_dir():
+        for path in completed.iterdir():
+            if (
+                path.name not in expected_archives
+                and ARCHIVE_NAME_PATTERN.search(path.name)
+            ):
+                errors.append(f"ambiguous policy archive: .agents/completed/{path.name}")
+
+    references: dict[str, list[str]] = {rule_id: [] for rule_id in rules}
+    rule_paragraphs: dict[str, list[str]] = {rule_id: [] for rule_id in rules}
+    procedure_paths = set(rule.procedure for rule in rules.values())
+    allowed_paths = set(PROCEDURE_BUDGETS)
+    unexpected = sorted(procedure_paths - allowed_paths)
+    if unexpected:
+        errors.append("registry uses non-canonical procedure path(s): " + ", ".join(unexpected))
+    for relative in sorted(procedure_paths):
+        path = root / relative
+        if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+            continue
+        budget = PROCEDURE_BUDGETS.get(relative)
+        if budget is not None and path.stat().st_size > budget:
+            errors.append(f"{relative} exceeds its {budget}-byte procedure budget")
+        text = path.read_text(encoding="utf-8")
+        paragraphs, paragraph_errors = _controlled_paragraphs(text, relative)
+        errors.extend(paragraph_errors)
+        for number, paragraph in enumerate(paragraphs, start=1):
+            ids = POLICY_REF.findall(paragraph)
+            if len(ids) != 1:
+                errors.append(
+                    f"{relative}: controlled paragraph {number} must contain exactly one policy reference"
+                )
+                continue
+            rule_id = ids[0]
+            rule = rules.get(rule_id)
+            if rule is None:
+                errors.append(f"{relative}: unknown policy reference {rule_id}")
+            elif rule.procedure != relative:
+                errors.append(
+                    f"{relative}: {rule_id} belongs to procedure {rule.procedure}"
+                )
+            else:
+                references[rule_id].append(relative)
+                rule_paragraphs[rule_id].append(" ".join(paragraph.split()))
+
+    for rule_id, locations in references.items():
+        if not locations:
+            errors.append(f"{rule_id}: missing procedure back-reference")
+        elif len(locations) > 1:
+            errors.append(f"{rule_id}: duplicate procedure back-reference")
+
+    required_method = {
+        "implementation phase": (
+            "Implementation starts from the committed spike",
+            "Write or port the smallest test that fails",
+            "green focused tests before broader validation",
+        ),
+        "mutation review": ("static inspection and targeted scratch mutations",),
+        "fresh-agent repair": ("fresh implementer",),
+        "operator verification": ("operator independently checks",),
+        "PR disposition": ("merge the PR in that session",),
+    }
+    workflow_text = (root / ".agents/workflow.md").read_text(encoding="utf-8") if (root / ".agents/workflow.md").is_file() else ""
+    normalized_workflow = " ".join(workflow_text.split())
+    for label, fragments in required_method.items():
+        if any(fragment not in normalized_workflow for fragment in fragments):
+            errors.append(f"workflow missing {label} contract")
+
+    purpose_fragments = {
+        "POL-DOC-STATUS": "every feature or iteration checkpoint",
+        "POL-DOC-BENCHMARKS": "every feature or iteration checkpoint",
+        "POL-DOC-FEATURES": "feature, model, backend, or quantization surface",
+        "POL-DOC-USAGE": "commands, C API, configuration, installation, or user workflows",
+        "POL-DOC-README": "only for a user-visible landing-page headline",
+        "POL-NOW-COUPLING": "same change as every `.agents/state.md` append",
+    }
+    for rule_id, fragment in purpose_fragments.items():
+        if not any(fragment in paragraph for paragraph in rule_paragraphs.get(rule_id, [])):
+            errors.append(f"workflow public-document purpose contract drift: {rule_id}")
+
+    errors.extend(_validate_policy_links(root, {"AGENTS.md", *procedure_paths}))
+    return errors
+
+
+def _validate_policy_links(root: Path, relative_paths: set[str]) -> list[str]:
+    errors: list[str] = []
+    retired = set(LEGACY_ACTIVE_PATHS)
+    for relative in sorted(relative_paths):
+        source = root / relative
+        if not source.is_file() or source.is_symlink():
+            continue
+        text = source.read_text(encoding="utf-8")
+        for raw in MARKDOWN_LINK.findall(text):
+            target = raw.strip().split(maxsplit=1)[0].strip("<>")
+            if not target or target.startswith(("#", "http://", "https://", "mailto:")):
+                continue
+            target_path = target.split("#", 1)[0]
+            if not target_path:
+                continue
+            resolved = (source.parent / target_path).resolve(strict=False)
+            try:
+                normalized = resolved.relative_to(root.resolve()).as_posix()
+            except ValueError:
+                errors.append(f"{relative}: Markdown link escapes repository: {target}")
+                continue
+            if normalized in retired:
+                errors.append(f"{relative}: Markdown link uses retired active path: {normalized}")
+            elif not resolved.exists():
+                errors.append(f"{relative}: broken Markdown link: {target}")
+            elif resolved.is_symlink():
+                errors.append(f"{relative}: Markdown link targets symlink: {target}")
     return errors

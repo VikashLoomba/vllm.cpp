@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib.util
 import csv
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -211,6 +213,9 @@ class CommittedRangeIntegration(unittest.TestCase):
                 csv.writer(handle, lineterminator="\n").writerow(state_record.EVENT_HEADER)
             subprocess.run(["git", "add", "."], cwd=root, check=True)
             subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+            base = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
 
             event = FreshnessMutations().event()
             with index.open("a", newline="", encoding="utf-8") as handle:
@@ -222,13 +227,20 @@ class CommittedRangeIntegration(unittest.TestCase):
             head = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=root, text=True
             ).strip()
-            with mock.patch.object(now, "ROOT", root), mock.patch.object(now, "NOW", digest):
-                paths = now.commit_paths(head)
-                events = now.commit_events(head, paths)
-                errors = now.freshness_errors(
-                    paths, events, now_text=now.now_at(head)
-                )
-            self.assertTrue(any(event.event_id in error for error in errors), errors)
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(now, "ROOT", root),
+                mock.patch.object(now, "NOW", digest),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["check-now-current.py", "--base", base, "--head", head],
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = now.main()
+            self.assertEqual(code, 1)
+            self.assertIn(event.event_id, stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -93,8 +93,10 @@ CUTOVER_WIRING = {
     "scripts/agent-preflight.sh": (
         "check-policy",
         "check-prompt-contract",
-        "state-record range",
-        "now-current range",
+        'run "state-record range" python3 scripts/check-state-record.py',
+        '--base origin/main\n  run "now-current range"',
+        'run "now-current range" python3 scripts/check-now-current.py',
+        '--base origin/main --head HEAD\n  run "doc-checkpoint range"',
         "test_state_record_core",
         "test_check_state_record",
         "test_agent_gates",

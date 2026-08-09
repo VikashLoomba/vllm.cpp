@@ -837,7 +837,7 @@ class OrchestrationLoopWiring(unittest.TestCase):
 class CutoverGateWiring(unittest.TestCase):
     def test_structured_state_cutover_wires_are_closed(self) -> None:
         self.assertIn(
-            "state-record range",
+            '--base origin/main\n  run "now-current range"',
             consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
         )
         self.assertIn(
@@ -852,7 +852,12 @@ class CutoverGateWiring(unittest.TestCase):
             'check-state-record.py) args=(--base "$base")',
             consistency.CUTOVER_WIRING[".githooks/pre-push"],
         )
-        for needle in ("state-record range", "now-current range"):
+        for needle in (
+            'run "state-record range" python3 scripts/check-state-record.py',
+            '--base origin/main\n  run "now-current range"',
+            'run "now-current range" python3 scripts/check-now-current.py',
+            '--base origin/main --head HEAD\n  run "doc-checkpoint range"',
+        ):
             self.assertIn(
                 needle,
                 consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],

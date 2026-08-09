@@ -394,6 +394,16 @@ class SemanticClassificationTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(doc_checkpoint.classify_changed_paths([path]), {"governance"})
 
+    def test_structured_now_checker_and_mutations_are_governance(self) -> None:
+        for path in (
+            "scripts/check-now-current.py",
+            "tests/scripts/test_check_now_current.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    doc_checkpoint.classify_changed_paths([path]), {"governance"}
+                )
+
 
 class RequiredSurfaceTests(unittest.TestCase):
     def assertMissing(self, paths: set[str], surface: str) -> None:

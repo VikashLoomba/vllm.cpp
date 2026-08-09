@@ -18,6 +18,15 @@ merged `row/*` PR; everything before it is exempt, because it was created under
 the previous direct-push policy and rewriting that judgement retroactively would
 redden honest history. The cutover itself is a records-only commit, so it passes.
 
+What this changes in practice: feature paths (src/, include/, tests/, examples/,
+cmake/, CMakeLists.txt) can no longer be pushed straight to main.
+
+ARRIVAL IS JUDGED ONCE, ON THE COMMIT THAT LANDS THE CHANGE. A squash-merge
+lands one commit carrying "(#N)". A real merge commit lands the merge plus the
+branch commits it brings in; the merge is the arrival, and `merged_pr_content`
+exempts the content underneath it rather than re-judging each branch commit on a
+message that was never required to name the PR.
+
 SECOND CUTOVER: WORKTREE_DISCIPLINE_SINCE (user-directed 2026-08-09). Integration
 paths (scripts/, .agents/, docs/, .github/, AGENTS.md) USED to be pushable
 straight to main, so the operator could fix a gate or repair a record without a
@@ -217,6 +226,37 @@ def policy_commit_violations(
     ]
 
 
+def merged_pr_content(commits: list[str]) -> frozenset[str]:
+    """The commits that reached main as the reviewed CONTENT of a row/* PR merge.
+
+    A PR landed with a real merge commit ("Merge pull request #N from
+    mudler/row/X") pushes the merge AND the branch commits it brings in, so both
+    appear in one `before..after` range. The merge names the PR; the branch
+    commits under it do not, and reading each of them on its own message alone
+    called every merge-landed PR a direct push -- the gate reddened main for
+    doing exactly what the gate asks for. Squash-merges are unaffected: their one
+    commit carries "(#N)" and passes on its own message.
+
+    Only the SIDE parents count. `parents[0]` is main's existing first-parent
+    history, so merging something on top cannot launder a commit that was pushed
+    straight to main: it is excluded by `--not parents[0]`. A merge naming no row
+    and no PR exempts nothing, which is the case the gate exists for.
+    """
+    content: set[str] = set()
+    for commit in commits:
+        parents = git("rev-list", "--parents", "-n", "1", commit).split()[1:]
+        if len(parents) < 2:
+            continue
+        subject = git("log", "-1", "--format=%s", commit)
+        body = git("log", "-1", "--format=%b", commit)
+        merged = tuple(git("log", "-1", "--format=%s%n%b", p) for p in parents[1:])
+        if not arrives_via_row_pr(parents, subject, body, merged):
+            continue
+        brought_in = git("rev-list", *parents[1:], "--not", parents[0])
+        content.update(line for line in brought_in.splitlines() if line)
+    return frozenset(content)
+
+
 def commit_paths(commit: str) -> list[str]:
     parents = git("rev-list", "--parents", "-n", "1", commit).split()[1:]
     if parents:
@@ -339,8 +379,12 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    reviewed = merged_pr_content(commits)
     failures, reported = [], []
     for commit in commits:
+        # Already judged, once, on the merge commit that carries it.
+        if commit in reviewed:
+            continue
         for problem in inspect(commit, worktree_enforced(commit)):
             # A row head has not reached main yet, so it is reportable pending
             # integration rather than a false claim that unmerged work already

@@ -220,6 +220,7 @@ jobs:
             base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
+          python3 scripts/check-state-record.py --base "$base"
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
           python3 scripts/check-now-current.py --base "$base" --head "$head"
           pending_args=()

@@ -194,6 +194,10 @@ run "policy/trailer suites" python3 -m unittest \
 if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
    [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
   echo "Committed range vs origin/main:"
+  run "state-record range" python3 scripts/check-state-record.py \
+    --base origin/main
+  run "now-current range" python3 scripts/check-now-current.py \
+    --base origin/main --head HEAD
   run "doc-checkpoint range" python3 scripts/check-doc-checkpoint.py \
     --base origin/main --head HEAD
 fi

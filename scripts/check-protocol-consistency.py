@@ -93,7 +93,8 @@ CUTOVER_WIRING = {
     "scripts/agent-preflight.sh": (
         "check-policy",
         "check-prompt-contract",
-        "check-state-record",
+        "state-record range",
+        "now-current range",
         "test_state_record_core",
         "test_check_state_record",
         "test_agent_gates",
@@ -106,7 +107,8 @@ CUTOVER_WIRING = {
     ),
     ".github/workflows/ci.yml": (
         "scripts/check-policy.py",
-        "scripts/check-state-record.py",
+        'check-state-record.py --base "$base"',
+        'check-now-current.py --base "$base" --head "$head"',
         "tests/scripts/test_state_record_core.py",
         "tests/scripts/test_check_state_record.py",
         "tests/scripts/test_agent_gates.py",
@@ -115,7 +117,8 @@ CUTOVER_WIRING = {
     ".githooks/pre-push": (
         "CHECKERS=(check-policy.py",
         "check-prompt-contract.py",
-        "check-state-record.py",
+        'check-state-record.py) args=(--base "$base")',
+        'check-now-current.py) args=(--base "$base" --head "$sha")',
     ),
     "scripts/agent-ready.py": (
         "REMOTE_UNVERIFIED",

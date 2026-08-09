@@ -366,6 +366,19 @@ class GitImmutabilityTests(unittest.TestCase):
 
             self.assertTrue(any("append-only" in error for error in errors), errors)
 
+    def test_pre_cutover_base_uses_first_structured_commit_as_history_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = StateRepo(directory)
+            pre_cutover = repo.source_revision
+            repo.commit("structured cutover")
+            rows = repo.event_rows()
+            rows[0][11] = "rewritten legacy metadata"
+            repo.write_event_rows(rows)
+
+            errors = state_record.validate(repo.root, base=pre_cutover)
+
+            self.assertTrue(any("append-only" in error for error in errors), errors)
+
     def test_root_manifest_is_byte_preserving_append_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = StateRepo(directory)

@@ -837,7 +837,7 @@ class OrchestrationLoopWiring(unittest.TestCase):
 class CutoverGateWiring(unittest.TestCase):
     def test_structured_state_cutover_wires_are_closed(self) -> None:
         self.assertIn(
-            "check-state-record",
+            "state-record range",
             consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
         )
         self.assertIn(
@@ -845,11 +845,25 @@ class CutoverGateWiring(unittest.TestCase):
             consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
         )
         self.assertIn(
-            "scripts/check-state-record.py",
+            'check-state-record.py --base "$base"',
             consistency.CUTOVER_WIRING[".github/workflows/ci.yml"],
         )
         self.assertIn(
-            "check-state-record.py",
+            'check-state-record.py) args=(--base "$base")',
+            consistency.CUTOVER_WIRING[".githooks/pre-push"],
+        )
+        for needle in ("state-record range", "now-current range"):
+            self.assertIn(
+                needle,
+                consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
+            )
+        for needle in (
+            'check-state-record.py --base "$base"',
+            'check-now-current.py --base "$base" --head "$head"',
+        ):
+            self.assertIn(needle, consistency.CUTOVER_WIRING[".github/workflows/ci.yml"])
+        self.assertIn(
+            'check-now-current.py) args=(--base "$base" --head "$sha")',
             consistency.CUTOVER_WIRING[".githooks/pre-push"],
         )
         expected_retired = {

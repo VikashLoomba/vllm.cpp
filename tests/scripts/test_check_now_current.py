@@ -9,8 +9,12 @@ moved what is live without refreshing the digest.
 from __future__ import annotations
 
 import importlib.util
+import csv
+import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -190,6 +194,41 @@ class NonEventChangesAreNotAppends(unittest.TestCase):
             ),
             [],
         )
+
+
+class CommittedRangeIntegration(unittest.TestCase):
+    def test_committed_qualifying_event_without_now_refresh_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "NOW Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "now@example.invalid"], cwd=root, check=True)
+            digest = root / ".agents/NOW.md"
+            index = root / ".agents/state-index/2026-08-001.csv"
+            index.parent.mkdir(parents=True)
+            digest.write_text(VALID, encoding="utf-8")
+            with index.open("w", newline="", encoding="utf-8") as handle:
+                csv.writer(handle, lineterminator="\n").writerow(state_record.EVENT_HEADER)
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+
+            event = FreshnessMutations().event()
+            with index.open("a", newline="", encoding="utf-8") as handle:
+                csv.writer(handle, lineterminator="\n").writerow(
+                    [getattr(event, field) for field in state_record.EVENT_HEADER]
+                )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "uncoupled event"], cwd=root, check=True)
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            with mock.patch.object(now, "ROOT", root), mock.patch.object(now, "NOW", digest):
+                paths = now.commit_paths(head)
+                events = now.commit_events(head, paths)
+                errors = now.freshness_errors(
+                    paths, events, now_text=now.now_at(head)
+                )
+            self.assertTrue(any(event.event_id in error for error in errors), errors)
 
 
 if __name__ == "__main__":

@@ -369,6 +369,21 @@ def _git_revision_exists(root: Path, revision: str) -> bool:
     ).returncode == 0
 
 
+def _structured_history_floor(root: Path, base: str) -> str | None:
+    """Return the first structured-state commit after a pre-cutover base."""
+    result = subprocess.run(
+        ["git", "rev-list", "--reverse", f"{base}..HEAD", "--", ".agents/state.csv"],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return next((line for line in result.stdout.splitlines() if line), None)
+
+
 def _csv_rows(raw: bytes, header: tuple[str, ...], label: str) -> tuple[list[list[str]], list[str]]:
     try:
         text = raw.decode("utf-8")
@@ -553,7 +568,13 @@ def _git_history_errors(root: Path, base: str, shards: list[Shard]) -> list[str]
         return [f"Git base revision does not resolve: {base}"]
     base_manifest = _git_bytes(root, base, ".agents/state.csv")
     if base_manifest is None:
-        return []
+        floor = _structured_history_floor(root, base)
+        if floor is None:
+            return []
+        base = floor
+        base_manifest = _git_bytes(root, base, ".agents/state.csv")
+        if base_manifest is None:
+            return [f"structured history floor cannot be read: {base}"]
     errors: list[str] = []
     current_manifest_path = root / ".agents/state.csv"
     try:

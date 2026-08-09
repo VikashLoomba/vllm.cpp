@@ -1199,8 +1199,8 @@ InternLM2 plus a sliding window).
 ## Build and test lanes
 
 Record hygiene (2026-08-08): the monolithic log is byte-preserved behind a
-compatibility stub and manifest. New bounded indexes and immutable events are
-gated by `check-state-record`.
+compatibility stub and manifest. Bounded indexes and immutable events are
+range-gated by `check-state-record`.
 
 Public documentation restructure (2026-08-04): `docs/BENCHMARKS.md` had grown
 into an append log of 11,405 lines and 171 claim-titled sections and was no

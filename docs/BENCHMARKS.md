@@ -4,7 +4,7 @@
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|
-| **Structured state record (active)** | v1 scalar + relational + Git-history contracts | **No performance number owed:** policy cutover LANDED; 82 focused tests GREEN (42 validator/core, 18 NOW, 11 migration, 11 cutover). Deterministic byte-lossless generation and live immutable/append-only gates are active | n/a |
+| **Structured state record (active)** | v1 scalar + relational + Git-history contracts | **No performance number.** Final merge snapshot: 156 legacy imports = 3,225,646 exact bytes. 92 pass: validator/core 44 (checker 20 + core 24), NOW 18, migration 19, cutover 11. Raw-row and archive/preservation guarded. | n/a |
 | **Binary release matrix (ACTIVE; W5 implemented)** | `ENG-RELEASE-BINARIES`: versioned deterministic manifest for primary host-ABI fat-CUDA + adaptive-CPU static-core bundles, optional per-SM diagnostics and experimental literal-static musl CPU | **W5 GREEN:** 19/19 + ten review mutations killed; contract 30/30; PR-size classes/budget GREEN. Synthetic fixtures only. **PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/correctness/performance gates | n/a |
 | **Container images (inventoried)** | `ENG-RELEASE-CONTAINERS`: GHCR images from GitHub Actions; lanes `-cuda`/`-vulkan`/`-cpu`, amd64+arm64 manifests | **No number owed:** record-only. No Dockerfile, workflow, registry package or image exists; the image is the unimplemented `ENG-RELEASE-BINARIES` bundle | n/a |
 | **Developer agent entry point (implemented)** | `DOCS-AGENT-PROTOCOL-ENTRYPOINT`: public contribution guide + synchronized, mutation-gated pre-claim intake rule | Rebased documentation/protocol only; benchmark void | n/a |

@@ -12,7 +12,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
-| State record (#166) | **149 imports verified** against 3,199,258 source bytes | Rebase; rerun record gate + preflight |
+| State record (#166) | **156 legacy imports = 3,225,646 exact bytes** at final merge `dc2139b3`; 92/92 | Force-update PR #166; rerun readiness |
 | Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |

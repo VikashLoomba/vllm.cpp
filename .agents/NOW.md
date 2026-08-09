@@ -81,4 +81,7 @@ rows**; llama.cpp's 11 extra devices IN SCOPE, spike-gated (`ROAD-V1-D6`).
 - GPU: park `local-ai-worker`, flock `$HOME/gpu.lock`, single-load
   steady-state, never reload per rep, named tmux.
 - Never weaken a checker to pass; repair the record.
-- Feature code needs a `row/*` PR (enforced); integration paths push direct.
+- Every unit of work gets its own worktree on its own task branch; the shared
+  checkout stays on clean `main` and is never a work surface. Land via a
+  `row/*` PR or an authorized local merge naming the branch; remove the
+  worktree and branch afterwards.

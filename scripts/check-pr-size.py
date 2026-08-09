@@ -181,6 +181,10 @@ STATE_EVENT = re.compile(
     r"\.agents/state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md\Z"
 )
 STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
+STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
+    r"\.agents/completed/state-migration-manifest-"
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?\.csv\Z"
+)
 ASSET = re.compile(r"assets/[A-Za-z0-9_.-]+\.(?:png|svg)\Z")
 RELEASE_MANIFEST_FIXTURE = re.compile(
     r"tests/scripts/fixtures/release_manifest/v[0-9]+/[a-z0-9-]+\.json\Z"
@@ -310,6 +314,7 @@ def classify_path(path: str) -> str:
         return "procedure"
     if (
         path == STATE_MIGRATION_MANIFEST
+        or STATE_MIGRATION_MANIFEST_ARCHIVE.fullmatch(path)
         or SPEC_EVIDENCE.fullmatch(path)
         or SYNC_RECORD.fullmatch(path)
         or BENCH_EVIDENCE.fullmatch(path)

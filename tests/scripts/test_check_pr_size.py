@@ -46,6 +46,26 @@ class CheckerEvidenceMapping(unittest.TestCase):
 
 
 class PathClassification(unittest.TestCase):
+    def test_state_migration_manifest_archives_are_evidence(self) -> None:
+        for path in (
+            ".agents/completed/state-migration-manifest.csv",
+            ".agents/completed/state-migration-manifest-f921.csv",
+            ".agents/completed/state-migration-manifest-release-v1.2.csv",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "evidence")
+
+    def test_completed_csv_near_misses_fail_closed(self) -> None:
+        for path in (
+            ".agents/completed/unrelated.csv",
+            ".agents/completed/state-migration-manifests-f921.csv",
+            ".agents/completed/state-migration-manifest-.csv",
+            ".agents/completed/state-migration-manifest-f921-.csv",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
     def test_each_mutable_surface_has_an_explicit_class(self) -> None:
         expected = {
             "CLAUDE.md": "procedure",

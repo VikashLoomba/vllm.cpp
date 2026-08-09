@@ -18,6 +18,7 @@ commit the parameter does not exist and the exemption is unconditional.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -190,6 +191,27 @@ class CutoverWiring(unittest.TestCase):
         since = checker.WORKTREE_DISCIPLINE_SINCE
         if since is not None:
             self.assertRegex(since, r"\A[0-9a-f]{40}\Z")
+
+    def test_cutover_shas_resolve_to_real_commits(self) -> None:
+        """A dangling cutover SHA fails OPEN, silently disabling the rule.
+
+        `_since` swallows CalledProcessError and returns False, so a typo'd or
+        rebased-away SHA turns enforcement off with a green gate -- exactly the
+        "turn a red gate green by widening a scope" failure AGENTS.md forbids.
+        """
+        for name in ("ROLE_DISCIPLINE_SINCE", "WORKTREE_DISCIPLINE_SINCE"):
+            since = getattr(checker, name)
+            if since is None:
+                continue
+            with self.subTest(cutover=name):
+                resolved = subprocess.run(
+                    ["git", "cat-file", "-e", f"{since}^{{commit}}"],
+                    cwd=ROOT,
+                    capture_output=True,
+                )
+                self.assertEqual(
+                    resolved.returncode, 0, f"{name}={since} is not a commit in this repo"
+                )
 
     def test_unset_cutover_never_enforces(self) -> None:
         original = checker.WORKTREE_DISCIPLINE_SINCE

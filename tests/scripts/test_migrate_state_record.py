@@ -261,6 +261,54 @@ class MigrationVerifyTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("byte-exact", result.stdout)
 
+    def test_verify_accepts_newer_revision_with_identical_source_bytes(self) -> None:
+        """Current-base verification must not rewrite immutable provenance."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = MigrationRepo(directory)
+            applied = repo.run("--apply")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-qm", "new base, same source"],
+                cwd=repo.root,
+                check=True,
+            )
+            current_revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo.root, text=True
+            ).strip()
+
+            result = repo.run("--verify", current_revision)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(current_revision, result.stdout)
+            self.assertIn(repo.source_revision, result.stdout)
+
+    def test_verify_rejects_newer_revision_with_different_source_bytes(self) -> None:
+        """A matching commit shape cannot hide source content drift."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = MigrationRepo(directory)
+            applied = repo.run("--apply")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            state_path = repo.root / ".agents/state.md"
+            compatibility_stub = state_path.read_bytes()
+            state_path.write_bytes(SOURCE + b"\nnew source bytes\n")
+            subprocess.run(
+                ["git", "add", ".agents/state.md"], cwd=repo.root, check=True
+            )
+            subprocess.run(
+                ["git", "commit", "-qm", "new base, changed source"],
+                cwd=repo.root,
+                check=True,
+            )
+            current_revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo.root, text=True
+            ).strip()
+            state_path.write_bytes(compatibility_stub)
+
+            result = repo.run("--verify", current_revision)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("differs from frozen migration source", result.stderr)
+
     def test_verify_rejects_boundary_payload_header_and_missing_file_mutations(self) -> None:
         """Catches gaps/overlaps, payload edits, schema drift, and incomplete output."""
         mutations = ("gap", "overlap", "payload", "header", "missing")

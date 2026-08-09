@@ -27,6 +27,11 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIME_RE = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?Z?$"
 )
+FROZEN_SOURCE_RE = re.compile(
+    rb"(?m)^Frozen legacy source: "
+    rb"https://github\.com/mudler/vllm\.cpp/blob/([0-9a-f]{40})/"
+    rb"\.agents/state\.md\r?$"
+)
 
 
 class MigrationError(RuntimeError):
@@ -73,6 +78,36 @@ def read_source(root: Path, revision: str) -> tuple[str, bytes]:
             f"source revision {full_revision} has no readable {SOURCE_PATH}: {detail}"
         )
     return full_revision, source.stdout
+
+
+def frozen_source_revision(root: Path) -> str:
+    """Return the one reviewed provenance revision embedded in the stub."""
+
+    try:
+        stub = (root / SOURCE_PATH).read_bytes()
+    except OSError as exc:
+        raise MigrationError(f"cannot read structured state stub: {exc}") from exc
+    matches = FROZEN_SOURCE_RE.findall(stub)
+    if len(matches) != 1:
+        raise MigrationError(
+            f"{SOURCE_PATH} must name exactly one frozen legacy source revision"
+        )
+    return matches[0].decode("ascii")
+
+
+def build_verification_migration(
+    root: Path, requested_revision: str
+) -> tuple[str, Migration]:
+    """Bind current source bytes to immutable migration provenance."""
+
+    current_revision, current_source = read_source(root, requested_revision)
+    migration = build_migration(root, frozen_source_revision(root))
+    if current_source != migration.source:
+        raise MigrationError(
+            f"source revision {current_revision} differs from frozen migration source "
+            f"{migration.source_revision}"
+        )
+    return current_revision, migration
 
 
 def _canonical_anchor(raw: bytes) -> tuple[str, str | None]:
@@ -408,18 +443,22 @@ def main() -> int:
     args = parser.parse_args()
     root = args.output_root.resolve()
     try:
-        migration = build_migration(root, args.source_revision)
         if args.apply:
+            migration = build_migration(root, args.source_revision)
             apply_migration(root, migration)
             print(
                 f"generated {len(migration.segments)} state events from "
                 f"{migration.source_revision}"
             )
         else:
+            requested_revision, migration = build_verification_migration(
+                root, args.source_revision
+            )
             verify_migration(root, migration)
             print(
                 f"state migration is byte-exact for {len(migration.source)} source bytes "
-                f"at {migration.source_revision}"
+                f"at {requested_revision} using frozen provenance "
+                f"{migration.source_revision}"
             )
     except (MigrationError, OSError) as exc:
         print(f"state migration failed: {exc}", file=sys.stderr)

@@ -93,6 +93,9 @@ CUTOVER_WIRING = {
     "scripts/agent-preflight.sh": (
         "check-policy",
         "check-prompt-contract",
+        "check-state-record",
+        "test_state_record_core",
+        "test_check_state_record",
         "test_agent_gates",
         "check-commit-trailers.py",
     ),
@@ -103,12 +106,16 @@ CUTOVER_WIRING = {
     ),
     ".github/workflows/ci.yml": (
         "scripts/check-policy.py",
+        "scripts/check-state-record.py",
+        "tests/scripts/test_state_record_core.py",
+        "tests/scripts/test_check_state_record.py",
         "tests/scripts/test_agent_gates.py",
         ".agents/policy-cutover",
     ),
     ".githooks/pre-push": (
         "CHECKERS=(check-policy.py",
         "check-prompt-contract.py",
+        "check-state-record.py",
     ),
     "scripts/agent-ready.py": (
         "REMOTE_UNVERIFIED",
@@ -122,6 +129,14 @@ CUTOVER_WIRING = {
         "errors = ready.ready_errors(payload, expected)",
         "check-commit-trailers.py",
         ".agents/policy-cutover",
+    ),
+}
+
+RETIRED_STATE_WIRING = {
+    "scripts/agent-preflight.sh": ("check-state-order", "test_check_state_order"),
+    ".github/workflows/ci.yml": (
+        "scripts/check-state-order.py",
+        "tests/scripts/test_check_state_order.py",
     ),
 }
 
@@ -278,6 +293,14 @@ def cutover_wiring_errors(root: Path | None = None) -> list[str]:
         for needle in needles:
             if needle not in content:
                 errors.append(f"cutover wiring {relative} omits {needle!r}")
+    for relative, retired_needles in RETIRED_STATE_WIRING.items():
+        path = repository / relative
+        if not path.is_file():
+            continue
+        content = path.read_text(encoding="utf-8")
+        for needle in retired_needles:
+            if needle in content:
+                errors.append(f"cutover wiring {relative} retains retired {needle!r}")
     preflight = texts.get("scripts/agent-preflight.sh", "")
     for remote_entrypoint in ("agent-ready.py", "agent-integration.py", "gh pr"):
         if remote_entrypoint in preflight:

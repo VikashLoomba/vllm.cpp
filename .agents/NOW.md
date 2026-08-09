@@ -4,8 +4,8 @@
 
 Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
 the gate being chased, what to do next. Never a log — evidence lives in the
-append-only [state.md](state.md), [parity-ledger.md](parity-ledger.md) and the
-benchmark record. Budget: 100 lines.
+structured [state manifest](state.csv), [parity-ledger.md](parity-ledger.md),
+and the benchmark record. Budget: 100 lines.
 
 ## Live claims
 

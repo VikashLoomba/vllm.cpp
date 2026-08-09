@@ -71,7 +71,7 @@ CHECKERS=(
   check-surface-coverage
   check-test-registration
   check-protocol-consistency
-  check-state-order
+  check-state-record
   check-now-current
   check-gate-commands
 )
@@ -98,7 +98,8 @@ SUITES=(
   test_check_surface_coverage
   test_check_test_registration
   test_check_protocol_consistency
-  test_check_state_order
+  test_state_record_core
+  test_check_state_record
   test_check_now_current
   test_audit_live_rows
   test_check_gate_commands

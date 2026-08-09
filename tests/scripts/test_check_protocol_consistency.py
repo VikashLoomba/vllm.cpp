@@ -835,6 +835,34 @@ class OrchestrationLoopWiring(unittest.TestCase):
 
 
 class CutoverGateWiring(unittest.TestCase):
+    def test_structured_state_cutover_wires_are_closed(self) -> None:
+        self.assertIn(
+            "check-state-record",
+            consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
+        )
+        self.assertIn(
+            "test_check_state_record",
+            consistency.CUTOVER_WIRING["scripts/agent-preflight.sh"],
+        )
+        self.assertIn(
+            "scripts/check-state-record.py",
+            consistency.CUTOVER_WIRING[".github/workflows/ci.yml"],
+        )
+        self.assertIn(
+            "check-state-record.py",
+            consistency.CUTOVER_WIRING[".githooks/pre-push"],
+        )
+        expected_retired = {
+            "scripts/agent-preflight.sh": ("check-state-order", "test_check_state_order"),
+            ".github/workflows/ci.yml": (
+                "scripts/check-state-order.py",
+                "tests/scripts/test_check_state_order.py",
+            ),
+        }
+        self.assertEqual(
+            getattr(consistency, "RETIRED_STATE_WIRING", {}), expected_retired
+        )
+
     def test_repository_wiring_is_complete(self) -> None:
         self.assertEqual(consistency.cutover_wiring_errors(ROOT), [])
 

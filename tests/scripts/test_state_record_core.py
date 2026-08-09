@@ -179,7 +179,7 @@ class EventParsingTests(unittest.TestCase):
             event_id,
             "2026-08-08T14:30:00Z",
             "checkpoint",
-            "POL-STATE-ORDER;state-record-structure-1",
+            "POL-STATE-STRUCTURED;state-record-structure-1",
             "verification",
             "passed",
             "a" * 40,

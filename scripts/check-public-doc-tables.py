@@ -474,7 +474,7 @@ def status_errors(text: str) -> list[str]:
                 f"docs/STATUS.md {key.replace('_', ' ')} is {measured[key]}, over "
                 f"the {cap} ratchet: this page may only shrink. Collapse the "
                 "superseded narrative into the binding result and move the "
-                f"detail to {RECORD_LINK} or .agents/state.md, then lower the "
+                f"detail to {RECORD_LINK} or structured state evidence, then lower the "
                 "ratchet in the same change"
             )
 

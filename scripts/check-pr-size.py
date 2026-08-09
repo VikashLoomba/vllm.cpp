@@ -91,13 +91,14 @@ POLICY_FILES = frozenset(
 )
 APPEND_ONLY_FILES = frozenset(
     {
-        ".agents/state.md",
         ".agents/benchmark-record.md",
         ".agents/parity-ledger.md",
     }
 )
 PROJECT_RECORD_FILES = frozenset(
     {
+        ".agents/state.md",
+        ".agents/state.csv",
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
@@ -146,6 +147,8 @@ GOVERNANCE_SUPPORT_FILES = frozenset(
         "scripts/claim-view.py",
         "scripts/ready-for-helper.py",
         "scripts/agent-preflight.sh",
+        "scripts/state_record.py",
+        "scripts/migrate-state-record.py",
     }
 )
 PRODUCT_CHECKER_FILES = frozenset({"scripts/check-release-binary-contract.py"})
@@ -173,6 +176,11 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
 BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
+STATE_INDEX = re.compile(r"\.agents/state-index/\d{4}-\d{2}-\d{3}\.csv\Z")
+STATE_EVENT = re.compile(
+    r"\.agents/state-events/\d{4}-\d{2}/STATE-[A-Za-z0-9-]+\.md\Z"
+)
+STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
 ASSET = re.compile(r"assets/[A-Za-z0-9_.-]+\.(?:png|svg)\Z")
 RELEASE_MANIFEST_FIXTURE = re.compile(
     r"tests/scripts/fixtures/release_manifest/v[0-9]+/[a-z0-9-]+\.json\Z"
@@ -277,13 +285,20 @@ def classify_path(path: str) -> str:
         return "policy"
     if path in APPEND_ONLY_FILES:
         return "append_only_record"
+    if STATE_INDEX.fullmatch(path) or STATE_EVENT.fullmatch(path):
+        return "append_only_record"
     if path in PROJECT_RECORD_FILES:
         return "project_record"
     if path == ".agents/upstream-inventory.json":
         return "project_record"
     if path in PROCEDURE_FILES or SPEC.fullmatch(path) or COMPLETED.fullmatch(path):
         return "procedure"
-    if SPEC_EVIDENCE.fullmatch(path) or SYNC_RECORD.fullmatch(path) or BENCH_EVIDENCE.fullmatch(path):
+    if (
+        path == STATE_MIGRATION_MANIFEST
+        or SPEC_EVIDENCE.fullmatch(path)
+        or SYNC_RECORD.fullmatch(path)
+        or BENCH_EVIDENCE.fullmatch(path)
+    ):
         return "evidence"
     if path in GOVERNANCE_SUPPORT_FILES:
         return "governance_support"

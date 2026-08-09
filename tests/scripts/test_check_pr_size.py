@@ -53,7 +53,13 @@ class PathClassification(unittest.TestCase):
             "scripts/check-policy.py": "governance_checker",
             "tests/scripts/test_policy_contract.py": "governance_test",
             ".agents/policy.csv": "policy",
-            ".agents/state.md": "append_only_record",
+            ".agents/state.md": "project_record",
+            ".agents/state.csv": "project_record",
+            ".agents/state-index/2026-08-001.csv": "append_only_record",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md": "append_only_record",
+            ".agents/completed/state-migration-manifest.csv": "evidence",
+            "scripts/state_record.py": "governance_support",
+            "scripts/migrate-state-record.py": "governance_support",
             "docs/STATUS.md": "public_document",
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
@@ -365,7 +371,7 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-policy.py",
             "tests/scripts/test_policy_contract.py",
             ".agents/workflow.md",
-            ".agents/state.md",
+            ".agents/state-index/2026-08-001.csv",
             ".agents/NOW.md",
             "docs/STATUS.md",
             ".github/workflows/ci.yml",
@@ -380,7 +386,7 @@ class BudgetEnforcement(unittest.TestCase):
     def test_production_role_check_requires_pr_for_records_docs_ci_and_support(self) -> None:
         role = checker.load_role_discipline()
         for path in (
-            ".agents/state.md",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md",
             "docs/STATUS.md",
             ".github/workflows/ci.yml",
             "scripts/agent-role.py",

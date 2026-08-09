@@ -11,8 +11,8 @@ oracle), *speed-pending* (correct, throughput work in progress), *build-only*
 (compiles for a target with no runtime proof here), and *hardware-blocked*
 (cannot run on the hardware available).
 
-The forensic chronology and the raw evidence live in the append-only
-[`.agents/state.md`](../.agents/state.md), the
+The forensic chronology and raw evidence live in the structured
+[state manifest](../.agents/state.csv), its immutable events, the
 [parity ledger](../.agents/parity-ledger.md), the area matrices, and
 [docs/BENCHMARKS.md](BENCHMARKS.md). This file keeps ONE binding current-state
 line per capability, not a run-by-run log.
@@ -1198,10 +1198,9 @@ InternLM2 plus a sliding window).
 
 ## Build and test lanes
 
-Record hygiene (2026-08-06): `check-state-order` now rejects future-dated
-state anchors (one-day timezone grace) after a chained stamp bug recurred
-three times; the third recurrence was re-anchored to its git-evidenced date; #77 slip
-tree-reverted.
+Record hygiene (2026-08-08): the monolithic log is byte-preserved behind a
+compatibility stub and manifest. New bounded indexes and immutable events are
+gated by `check-state-record`.
 
 Public documentation restructure (2026-08-04): `docs/BENCHMARKS.md` had grown
 into an append log of 11,405 lines and 171 claim-titled sections and was no
@@ -1240,7 +1239,7 @@ ENFORCES** since `44e8225c`: feature code reaches `main` only via a merged
 them cancelled. The roadmap's 484-line chronology moved to
 `completed/`, `AGENTS.md` went 697 to 286 lines with its directives verbatim in
 [the archived directives](../.agents/completed/policy-directives-legacy.md), and THIS page gained a
-shrink-only ratchet. Detail is in `.agents/state.md`. An operator/helper
+shrink-only ratchet. Detail is in the structured state record. An operator/helper
 protocol is ACCEPTED; W0-W5 LANDED, enforcement opt-in
 ([archived spec](../.agents/completed/operator-helper-protocol-legacy.md)). No engine code, no
 kernel, no numbers changed.

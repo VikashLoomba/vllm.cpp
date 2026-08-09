@@ -22,6 +22,31 @@ a cumulative prefix epoch. The append-epoch verifier must continue rejecting it;
 the final cutover instead rebuilds live migration metadata from this exact merge
 snapshot while retaining the frozen origin as historical provenance.
 
+## Current-main append addendum
+
+After that reconciliation was reviewed, `main` advanced to
+`776c56f1c8b78ab69ea01e14759187b243b24d9e`. Its `.agents/state.md` is blob
+`e266a8892401bc744955ccc1cb3bc75f64e4f399`, 3,231,342 bytes, with SHA-256
+`913c76a2ab8303b1b5ad7dae3ec7876c5e29f0c319670b86eb646c4baa3119b6`.
+The complete 3,225,646-byte `dc2139b3` source is its exact prefix, so this is a
+strict append after the concurrent-merge snapshot rather than another rebuild.
+
+All 156 prior legacy wrappers and their live raw rows remain byte-for-byte
+unchanged. Their final row still ends at byte 3,225,646. The appended bytes form
+one new legacy import, `STATE-20260809T150000-001`, whose payload owns the leading
+newline and covers the half-open range `3225646..3231342`. The final live
+manifest therefore contains 157 contiguous event rows and reconstructs all
+3,231,342 bytes. The archived `f921` manifest and every original wrapper and
+raw-row preservation inventory remain unchanged.
+
+Verification independently pins the new raw-row hash, the wrapper hash, and the
+extracted payload bytes. Mutating any of those authorities, removing the leading
+newline, changing either range boundary, or altering the final provenance tuple
+must fail while every prior preservation hash remains green. The resulting live
+checkpoint reports 157 imports and 3,231,342 reconstructed bytes; the focused
+test count is updated from measured implementation results rather than predicted
+in this addendum.
+
 ## Preservation boundary
 
 All 146 event files imported from the original frozen source remain

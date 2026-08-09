@@ -337,6 +337,18 @@ class BudgetEnforcement(unittest.TestCase):
                 "scripts/check-unregistered-contract.py", rules, ROOT
             )
 
+    def test_retired_state_checker_uses_cutover_mutation_evidence(self) -> None:
+        rules = checker.load_policy(ROOT)
+        retired = "scripts/check-state-order.py"
+        self.assertEqual(
+            checker.recognized_evidence(retired),
+            "tests/scripts/test_state_record_cutover.py",
+        )
+        self.assertEqual(
+            checker.affected_policy_rules(retired, rules, ROOT),
+            ("POL-STATE-STRUCTURED",),
+        )
+
     def test_numstat_parser_rejects_malformed_negative_and_duplicate_paths(self) -> None:
         for text in (
             "1\t2\n",

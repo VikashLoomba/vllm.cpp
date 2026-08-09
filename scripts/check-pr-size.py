@@ -197,6 +197,7 @@ CHECKER_EVIDENCE_OVERRIDES = {
     # exist and NO change to this checker could ever satisfy its own evidence
     # rule. Mapped to the file CI actually runs.
     "scripts/check-device-leakage.py": "tests/scripts/test_device_leakage.py",
+    "scripts/check-state-order.py": "tests/scripts/test_state_record_cutover.py",
 }
 
 # New entrypoints cannot appear in their own historical policy enforcement
@@ -219,6 +220,12 @@ CREATED_CHECKER_RULES = {
 # still fails closed instead of inheriting a directory-wide exemption.
 TECHNICAL_CHECKER_CHANGE_RULES = {
     "scripts/check-release-binary-contract.py": ("POL-CHECKER-CHANGE",),
+}
+# A retired checker is mutation-tested by restoring its BASE bytes into the
+# HEAD worktree. The cutover suite must then turn red because the obsolete tool
+# exists again.
+RETIRED_CHECKER_RULES = {
+    "scripts/check-state-order.py": ("POL-STATE-STRUCTURED",),
 }
 DISABLED_CREATION_CHECKER = (
     b"#!/usr/bin/env python3\n"
@@ -518,6 +525,7 @@ def affected_policy_rules(
     declared = (
         CREATED_CHECKER_RULES.get(checker_path, ())
         + TECHNICAL_CHECKER_CHANGE_RULES.get(checker_path, ())
+        + RETIRED_CHECKER_RULES.get(checker_path, ())
     )
     rule_ids = tuple(sorted(set(direct) | set(declared)))
     if not rule_ids:

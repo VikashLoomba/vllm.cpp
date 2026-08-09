@@ -43,7 +43,7 @@ no Dockerfile, workflow or registry package is claimed. Metal/MLX are NOT-CONTAI
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
 append preserved prior 156 wrappers/rows. Archive/new raw-row mutation guards bind.
-Tests: 94: validator/core 44 (checker 20 + core 24), NOW 18, migration 21,
+Tests: 95: validator/core 44 (checker 20 + core 24), NOW 18, migration 22,
 cutover 11.
 
 Protocol repair (2026-08-08): release AST pins pass 30 tests on Python

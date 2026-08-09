@@ -12,6 +12,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WAIVER_ID = "WAIVER-PR-SIZE-002"
+M03_PLAN = "docs/superpowers/plans/2026-07-03-m0.3-parity-harness.md"
+M03_HISTORICAL_REFERENCE_LINES = (
+    "- Tolerances per state-log breadcrumbs: rmsnorm/silu standard paths "
+    "compute in f32 vs upstream's dtype rounding → compare with bf16-eps "
+    "tolerance (`atol=8e-3, rtol=8e-3`) on bf16 cases, tight "
+    "(`atol=1e-5, rtol=1e-5`) on f32 cases; RoPE long-position cases need "
+    "position-scaled tolerance (upstream f32 cos/sin cache drifts ~1e-2 at "
+    "pos 131k) — use `atol=2e-2` for the pos≥32k case, tight for short "
+    "positions.",
+    "drift — see .agents/state.md 2026-07-03 note).",
+)
 WAIVER_ROW = {
     "waiver_id": WAIVER_ID,
     "rule_id": "POL-PR-SIZE",
@@ -32,9 +43,11 @@ STALE_INSTRUCTIONS = (
     ),
     re.compile(r"(?i)append-only[^\n]{0,80}(?:state\.md|state (?:log|tail))"),
     re.compile(r"(?i)append-only checkpoint entry"),
+    re.compile(r"(?i)state-log breadcrumbs"),
     re.compile(r"(?i)state-log entry"),
     re.compile(r"(?i)state log(?=[\"'])"),
     re.compile(r"(?i)state\.md`?\s*\("),
+    re.compile(r"(?i)(?:\.agents/)?state\.md[^\n]{0,80}\bnote\b"),
     re.compile(r"(?i)modify:[^\n]{0,160}\.agents/state\.md"),
     re.compile(r"(?i)record (?:each|every) decision in `.agents/state\.md`"),
     re.compile(r"(?i)\|[^\n]*\.agents/state\.md[^\n]*\|\s*Record\s*\|"),
@@ -51,16 +64,7 @@ HISTORICAL_REFERENCE_LINES = {
     ".agents/specs/issue-native-tracking.md": (
         "**Rejected: full conversion.** Moving `state.md` (36,277 lines) and",
     ),
-    "docs/superpowers/plans/2026-07-03-m0.3-parity-harness.md": (
-        "- Tolerances per state-log breadcrumbs: rmsnorm/silu standard paths "
-        "compute in f32 vs upstream's dtype rounding → compare with bf16-eps "
-        "tolerance (`atol=8e-3, rtol=8e-3`) on bf16 cases, tight "
-        "(`atol=1e-5, rtol=1e-5`) on f32 cases; RoPE long-position cases need "
-        "position-scaled tolerance (upstream f32 cos/sin cache drifts ~1e-2 at "
-        "pos 131k) — use `atol=2e-2` for the pos≥32k case, tight for short "
-        "positions.",
-        "drift — see .agents/state.md 2026-07-03 note).",
-    )
+    M03_PLAN: M03_HISTORICAL_REFERENCE_LINES,
 }
 
 EXCLUDED_AGENT_RECORDS = frozenset(
@@ -167,6 +171,34 @@ class ActiveReferenceAudit(unittest.TestCase):
                 with self.subTest(mutation=mutation):
                     target.write_text(mutation, encoding="utf-8")
                     self.assertTrue(stale_reference_errors(root, [target]))
+
+    def test_each_stale_line_produces_exactly_one_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "AGENTS.md"
+            target.write_text(
+                "Modify: .agents/state.md (append-only checkpoint entry).\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                stale_reference_errors(root, [target]),
+                [
+                    "AGENTS.md:1 retains obsolete state instruction "
+                    "'append-only checkpoint entry'"
+                ],
+            )
+
+    def test_m03_historical_exemption_is_exact_and_source_is_preserved(self) -> None:
+        source = (ROOT / M03_PLAN).read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / M03_PLAN
+            target.parent.mkdir(parents=True)
+            for reference in M03_HISTORICAL_REFERENCE_LINES:
+                with self.subTest(reference=reference):
+                    self.assertEqual(source.count(reference), 1)
+                    target.write_text(f"{reference} changed\n", encoding="utf-8")
+                    self.assertEqual(len(stale_reference_errors(root, [target])), 1)
 
     def test_exact_historical_references_remain_descriptive(self) -> None:
         for relative, references in HISTORICAL_REFERENCE_LINES.items():

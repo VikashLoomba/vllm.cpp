@@ -78,6 +78,30 @@ a silent fallback cannot post a plausible number:
   reports GPU-timestamp time rather than wall clock; see
   [ENVIRONMENT.md](ENVIRONMENT.md) for what each knob does and what it measured.
 
+### How long a load takes, and how to see where it goes
+
+`VT_LOAD_STATS=1` prints one line per load phase with its wall time, plus the
+bytes the load actually MOVED: `host_copy` (materialized into a host buffer),
+`borrowed` (read in place from the file mapping) and `device_upload`. The byte
+line is printed twice, once when the weights are loaded and once at exit, because
+the device uploads are lazy and happen at first use.
+
+```
+$ VT_LOAD_STATS=1 build/examples/vllm-cli --model /path/to/Qwen3.6-27B --prompt hi --max-tokens 1
+[vt load] mmap+header       0.027 s
+[vt load] weights          12.268 s
+[vt load] bytes@load-end  host_copy=31.162 GiB borrowed=18.936 GiB device_upload=0.000 GiB
+[vt load] bytes@exit      host_copy=31.162 GiB borrowed=18.936 GiB device_upload=50.098 GiB
+```
+
+A weight the device consumes verbatim is READ FROM the checkpoint mapping rather
+than copied into a host buffer first, so it is moved once instead of twice; that
+is `borrowed` above, and on this 27B it is 37.8% of the model and worth 1.54x on
+the load phase warm, 1.61x cold. Tensors that are merged (`qkv`, `gate_up`),
+transposed (`lm_head`) or dequantized at load are not verbatim and still copy.
+`VT_LOAD_DIRECT_UPLOAD=0` turns the direct path off in the same binary; the
+loaded bytes, and therefore the tokens, are identical either way.
+
 ### Quantized checkpoints: which `lm_head` forms load
 
 Publishers do not agree on how the output head is stored, and a single repo can

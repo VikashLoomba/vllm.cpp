@@ -26,7 +26,8 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn**. **G5 not next** | Parakeet encoder; attn dtype hoist |
 | Supported-models list | **LANDED**: FEATURES arch table CI-bound (33 archs) | — |
 | `/v1/videos` OpenAI shape | **MERGED** (#71): Sora `model`/`size`/`seconds` + `GET /{id}/content` | `row/SERVE-VIDEOS-REFS` PR open: reference conditioning |
-| Vulkan 27B | decode **MET 4.36 vs 4.35** (barriers OFF). **LOADMEM: load held the model TWICE, VmRSS 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
+| Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, VmRSS 100.759 -> 53.413 GiB** | — |
+| `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** verbatim weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold**, bytes **100.2 -> 81.3 GiB** | Merged qkv/gate_up: the other 62% |
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed (contributor, authorship-preserved); W0 green 4 archs** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; W5 19/19+10/10; contract 30/30** | #141; artifacts pending |
@@ -51,8 +52,7 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other
-   f32-out caller) once the Laguna fix proves the mechanism.
-4. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
+   f32-out caller).
 5. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
    `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
    DECISION); record-era rollover BLOCKED on `DONE` rows bound to

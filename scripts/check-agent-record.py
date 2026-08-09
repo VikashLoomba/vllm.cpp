@@ -315,7 +315,13 @@ ENGINE_PREFIXES = (
 # staged bundle. User-directed, issue #170; inventoried while its spike is
 # written, and no image, workflow or registry package is claimed by the bump.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 144
+#
+# 2026-08-09: 144 -> 145 for `ENG-LOAD-DIRECT-UPLOAD` (issue #150) — the
+# load-time direct device upload: a weight the device consumes verbatim views the
+# safetensors mmap instead of being copied into an owned host buffer first, so
+# the load moves those bytes once instead of twice. A real new row with code,
+# a spec and a mechanism test, not a bump to pass a transition.
+ENGINE_ROWS = 145
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

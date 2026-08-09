@@ -435,7 +435,14 @@ STATUS_RATCHET = {
     # compaction onto current main reduced the live page below the inherited
     # cap. The cap remains byte-tight and within the <=25 convention, so that
     # reduction cannot become untracked growth headroom.
-    "chars": 243761,
+    #
+    # 243756 since 2026-08-09 (measured 243756): `ENG-LOAD-DIRECT-UPLOAD` (#150)
+    # owes STATUS a cold-start result, and the page may only shrink, so the new
+    # load number was MERGED INTO the startup-latency paragraph it belongs with
+    # -- both are "time to a usable engine", both keep their own detail link, and
+    # two paragraphs became one that is shorter than the one it replaced. Re-pinned
+    # byte-tight so the added result cannot be paid for twice.
+    "chars": 243756,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

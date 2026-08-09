@@ -2,10 +2,9 @@
 
 <!-- now-updated: 2026-08-09 -->
 
-Read this FIRST, every session. A SNAPSHOT, rewritten in place: what is live,
-the gate being chased, what to do next. Never a log — evidence lives in the
-structured [state manifest](state.csv), [parity-ledger.md](parity-ledger.md),
-and the benchmark record. Budget: 100 lines.
+Read this first. It is a state snapshot, not a log; evidence lives
+in the [state manifest](state.csv), [parity ledger](parity-ledger.md), and
+benchmark record. Budget: 100 lines / 6,000 characters.
 
 ## Live claims
 
@@ -13,6 +12,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
+| State record (#166) | **149 imports verified** against 3,199,258 source bytes | Rebase; rerun record gate + preflight |
 | Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |

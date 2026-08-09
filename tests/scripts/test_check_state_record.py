@@ -235,6 +235,23 @@ class StateRepo:
 
 
 class RelationalValidationTests(unittest.TestCase):
+    def test_reconciled_imports_coexist_with_strict_post_cutover_checkpoint(self) -> None:
+        """Catches treating independently valid structured events as migration output."""
+        events, errors = state_record.load_events(ROOT)
+
+        self.assertEqual(errors, [])
+        by_id = {event.event_id: event for event in events}
+        self.assertEqual(by_id["STATE-20260809T083000-001"].kind, "legacy_import")
+        checkpoints = [
+            event
+            for event in events
+            if event.kind == "checkpoint"
+            and "state-record-structure-1" in event.subject_ids.split(";")
+        ]
+        self.assertEqual(len(checkpoints), 1)
+        self.assertEqual(checkpoints[0].pr, "pr:166")
+        self.assertEqual(state_record.validate_repository(ROOT), [])
+
     def test_valid_structured_tree_passes(self) -> None:
         self.assertTrue(hasattr(state_record, "validate"), "validate() is missing")
         with tempfile.TemporaryDirectory() as directory:

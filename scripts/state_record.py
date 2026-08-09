@@ -78,11 +78,72 @@ class MigrationProvenance:
     sha256: str
 
 
+@dataclass(frozen=True)
+class LegacyRange:
+    event_id: str
+    occurred_at: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class MigrationEpoch:
+    commit: str
+    blob: str
+    byte_count: int
+    sha256: str
+    ranges: tuple[LegacyRange, ...]
+
+
 FROZEN_MIGRATION_PROVENANCE = MigrationProvenance(
     commit="994cd8d4122ecf44f72d51fabd61c45adaaea9d3",
     blob="93a8d0da802a7ea7cbea4bee3bedffb4d90459f7",
     byte_count=3191283,
     sha256="00c08e974724c19b5f79cce44df71c6fbfef4db32aa6acb545ef56546e3bb5e6",
+)
+
+MIGRATION_EPOCHS = (
+    MigrationEpoch(
+        commit=FROZEN_MIGRATION_PROVENANCE.commit,
+        blob=FROZEN_MIGRATION_PROVENANCE.blob,
+        byte_count=FROZEN_MIGRATION_PROVENANCE.byte_count,
+        sha256=FROZEN_MIGRATION_PROVENANCE.sha256,
+        ranges=(),
+    ),
+    MigrationEpoch(
+        commit="eee64f81812f97d87190d715c41dd004c1a89d9a",
+        blob="b8c38281f5e3ef54d0be30f8c2c234a8ba754fd5",
+        byte_count=3195928,
+        sha256="ff9a66b618777f88bcb025a9636c04e87f9457d2c96606b6bd99eac151513a0f",
+        ranges=(
+            LegacyRange(
+                "STATE-20260809T083000-001",
+                "2026-08-09T08:30:00Z",
+                3191283,
+                3193748,
+            ),
+            LegacyRange(
+                "STATE-20260809T110000-001",
+                "2026-08-09T11:00:00Z",
+                3193748,
+                3195928,
+            ),
+        ),
+    ),
+    MigrationEpoch(
+        commit="161bf64b71413db3fbdffe27e3d8765cc2138d2f",
+        blob="48588f1f9154ea0bbc334b278d9d339217fa181f",
+        byte_count=3199258,
+        sha256="53e41e89e6d5de1b57db20654296392946ff2484a607ba0cbd142cca5bcb043f",
+        ranges=(
+            LegacyRange(
+                "STATE-20260809T130000-001",
+                "2026-08-09T13:00:00Z",
+                3195928,
+                3199258,
+            ),
+        ),
+    ),
 )
 
 
@@ -360,6 +421,14 @@ def parse_events(root: Path, shards: list[Shard]) -> tuple[list[Event], list[str
     return events, []
 
 
+def load_events(root: Path) -> tuple[list[Event], list[str]]:
+    """Load the complete ordered event set from the repository indexes."""
+    shards, errors = parse_manifest(root)
+    if errors:
+        return [], errors
+    return parse_events(root, shards)
+
+
 def read_legacy_payload(path: Path) -> bytes:
     raw = path.read_bytes()
     if raw.count(LEGACY_BEGIN) != 1 or raw.count(LEGACY_END) != 1:
@@ -500,9 +569,11 @@ def _relation_errors(root: Path, events: list[Event]) -> list[str]:
 def _stub_and_migration_errors(
     root: Path,
     events: list[Event],
-    provenance: MigrationProvenance,
+    epochs: tuple[MigrationEpoch, ...],
 ) -> list[str]:
     errors: list[str] = []
+    if not epochs:
+        return ["migration epoch authority tuple is empty"]
     stub = root / ".agents/state.md"
     try:
         raw_stub = stub.read_bytes()
@@ -523,23 +594,37 @@ def _stub_and_migration_errors(
         if required not in stub_text:
             errors.append(f"compatibility stub must link {required}")
     links = LEGACY_LINK_RE.findall(stub_text)
-    if len(links) != 1:
-        errors.append("compatibility stub must contain one permanent legacy Git blob link")
-        source = None
-    else:
-        if links[0] != provenance.commit:
-            errors.append("compatibility stub disagrees with frozen migration provenance")
-        source = _git_bytes(root, provenance.commit, ".agents/state.md")
+    expected_links = [epochs[0].commit]
+    if len(epochs) > 1:
+        expected_links.append(epochs[-1].commit)
+    if links != expected_links:
+        errors.append("compatibility stub disagrees with migration epoch provenance")
+
+    sources: list[bytes | None] = []
+    for index, epoch in enumerate(epochs):
+        source = _git_bytes(root, epoch.commit, ".agents/state.md")
+        sources.append(source)
         if source is None:
-            errors.append("compatibility stub legacy Git blob link does not resolve")
-        else:
-            frozen_blob = _git_blob_oid(root, provenance.commit, ".agents/state.md")
-            if frozen_blob != provenance.blob:
-                errors.append("frozen migration provenance blob does not match Git")
-            if len(source) != provenance.byte_count:
-                errors.append("frozen migration provenance byte count does not match Git")
-            if hashlib.sha256(source).hexdigest() != provenance.sha256:
-                errors.append("frozen migration provenance SHA-256 does not match Git")
+            errors.append(f"migration epoch {index} Git source does not resolve")
+            continue
+        if _git_blob_oid(root, epoch.commit, ".agents/state.md") != epoch.blob:
+            errors.append(f"migration epoch {index} provenance blob does not match Git")
+        if len(source) != epoch.byte_count:
+            errors.append(f"migration epoch {index} provenance byte count does not match Git")
+        if hashlib.sha256(source).hexdigest() != epoch.sha256:
+            errors.append(f"migration epoch {index} provenance SHA-256 does not match Git")
+        if index and sources[index - 1] is not None:
+            ancestor = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", epochs[index - 1].commit, epoch.commit],
+                cwd=root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if ancestor.returncode != 0:
+                errors.append("migration epochs must be in ordered ancestor sequence")
+            if not source.startswith(sources[index - 1]):
+                errors.append(f"migration epoch {index} changes the cumulative source prefix")
 
     manifest = root / ".agents/completed/state-migration-manifest.csv"
     try:
@@ -551,47 +636,11 @@ def _stub_and_migration_errors(
     if csv_errors:
         return errors
 
-    source_rows = [row for row in rows if row and row[0] == "source"]
-    if len(source_rows) != 1 or not rows or rows[0][0] != "source":
-        errors.append("migration manifest must begin with exactly one source provenance row")
-    elif len(source_rows[0]) == len(MIGRATION_HEADER):
-        (
-            _, source_commit, source_blob, source_bytes_s, source_digest,
-            *source_event_fields,
-        ) = source_rows[0]
-        if any(source_event_fields):
-            errors.append("migration source provenance row cannot contain event fields")
-        expected_source_row = (
-            provenance.commit,
-            provenance.blob,
-            str(provenance.byte_count),
-            provenance.sha256,
-        )
-        if (
-            source_commit,
-            source_blob,
-            source_bytes_s,
-            source_digest,
-        ) != expected_source_row:
-            errors.append("migration manifest disagrees with frozen migration provenance")
-        try:
-            source_bytes = int(source_bytes_s)
-        except ValueError:
-            errors.append("migration source byte count must be an integer")
-            source_bytes = -1
-        if source is not None and source_bytes != len(source):
-            errors.append("migration source byte count does not match the frozen source")
-        if (
-            re.fullmatch(r"[0-9a-f]{64}", source_digest) is None
-            or source is not None
-            and source_digest != hashlib.sha256(source).hexdigest()
-        ):
-            errors.append("migration source SHA-256 does not match the frozen source")
-
     legacy_events = {event.event_id: event for event in events if event.kind == "legacy_import"}
     seen: set[str] = set()
     expected_start = 0
     reconstructed = bytearray()
+    source_index = -1
     for line_number, row in enumerate(rows, start=2):
         location = f"migration manifest:{line_number}"
         if len(row) != len(MIGRATION_HEADER):
@@ -599,6 +648,25 @@ def _stub_and_migration_errors(
             continue
         record_type, *fields = row
         if record_type == "source":
+            source_index += 1
+            if source_index >= len(epochs):
+                errors.append(f"{location}: unexpected migration source epoch")
+                continue
+            epoch = epochs[source_index]
+            expected = [
+                "source", epoch.commit, epoch.blob, str(epoch.byte_count), epoch.sha256,
+                "", "", "", "", "", "",
+            ]
+            if row != expected:
+                if source_index == 0:
+                    errors.append("migration manifest disagrees with frozen migration provenance")
+                else:
+                    errors.append(f"{location}: migration manifest disagrees with epoch {source_index}")
+            if source_index and expected_start != epochs[source_index - 1].byte_count:
+                errors.append(f"{location}: source epoch boundary disagrees with reconstructed range")
+            previous = sources[source_index - 1] if source_index else b""
+            if source_index and previous is not None and bytes(reconstructed) != previous:
+                errors.append(f"{location}: payloads do not reconstruct the preceding epoch")
             continue
         if record_type != "event":
             errors.append(f"{location}: record type must be source or event")
@@ -628,6 +696,10 @@ def _stub_and_migration_errors(
             continue
         if start != expected_start or end < start:
             errors.append(f"{location}: migration ranges must be contiguous and increasing")
+        if source_index < 0:
+            errors.append(f"{location}: migration event precedes its source epoch")
+        elif end > epochs[source_index].byte_count:
+            errors.append(f"{location}: migration range crosses its source epoch boundary")
         if end - start != count or count != len(payload):
             errors.append(f"{location}: migration payload byte count disagrees with its range")
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None or hashlib.sha256(payload).hexdigest() != digest:
@@ -636,8 +708,11 @@ def _stub_and_migration_errors(
         reconstructed.extend(payload)
     if seen != set(legacy_events):
         errors.append("migration manifest must cover every legacy_import event exactly once")
-    if source is not None and bytes(reconstructed) != source:
-        errors.append("migration manifest payloads do not reconstruct the frozen source")
+    if source_index + 1 != len(epochs):
+        errors.append("migration manifest must contain every configured source epoch exactly once")
+    final_source = sources[-1]
+    if final_source is not None and bytes(reconstructed) != final_source:
+        errors.append("migration manifest payloads do not reconstruct the final source")
     return errors
 
 
@@ -714,6 +789,7 @@ def validate(
     *,
     base: str | None = None,
     migration_provenance: MigrationProvenance = FROZEN_MIGRATION_PROVENANCE,
+    migration_epochs: tuple[MigrationEpoch, ...] | None = None,
 ) -> list[str]:
     """Return all structured-record validation failures rooted at *root*."""
     root = root.resolve()
@@ -725,7 +801,25 @@ def validate(
     if event_errors:
         return errors
     errors.extend(_relation_errors(root, events))
-    errors.extend(_stub_and_migration_errors(root, events, migration_provenance))
+    if migration_epochs is None:
+        if migration_provenance == FROZEN_MIGRATION_PROVENANCE:
+            migration_epochs = MIGRATION_EPOCHS
+        else:
+            migration_epochs = (
+                MigrationEpoch(
+                    migration_provenance.commit,
+                    migration_provenance.blob,
+                    migration_provenance.byte_count,
+                    migration_provenance.sha256,
+                    (),
+                ),
+            )
+    errors.extend(_stub_and_migration_errors(root, events, migration_epochs))
     if base is not None:
         errors.extend(_git_history_errors(root, base, shards))
     return errors
+
+
+def validate_repository(root: Path, base_ref: str | None = None) -> list[str]:
+    """Validate the repository using the configured migration epoch authority."""
+    return validate(root, base=base_ref, migration_epochs=MIGRATION_EPOCHS)

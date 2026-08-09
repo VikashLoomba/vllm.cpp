@@ -8,11 +8,14 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -300,6 +303,222 @@ class MigrationApplyTests(unittest.TestCase):
 
 
 class MigrationVerifyTests(unittest.TestCase):
+    def test_verify_allows_new_strict_shard_but_freezes_legacy_subset(self) -> None:
+        """Catches treating the migration-only manifest as the whole live record."""
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            shutil.copytree(ROOT / ".agents", scratch / ".agents")
+            spec = Path(
+                "docs/superpowers/specs/2026-08-09-state-migration-epochs-design.md"
+            )
+            (scratch / spec).parent.mkdir(parents=True)
+            shutil.copy2(ROOT / spec, scratch / spec)
+            subprocess.run(["git", "init", "-q"], cwd=scratch, check=True)
+            common_dir = subprocess.check_output(
+                ["git", "rev-parse", "--git-common-dir"], cwd=ROOT, text=True
+            ).strip()
+            common_objects = (ROOT / common_dir / "objects").resolve()
+            alternates = scratch / ".git/objects/info/alternates"
+            alternates.parent.mkdir(parents=True, exist_ok=True)
+            alternates.write_text(f"{common_objects}\n", encoding="utf-8")
+
+            event_id = "STATE-20260809T140000-001"
+            evidence_path = f".agents/state-events/2026-08/{event_id}.md"
+            manifest_path = scratch / ".agents/state.csv"
+            with manifest_path.open("a", newline="", encoding="utf-8") as handle:
+                csv.writer(handle, lineterminator="\n").writerow(
+                    [
+                        "1",
+                        "2026-08-002",
+                        ".agents/state-index/2026-08-002.csv",
+                        ".agents/state-events/2026-08/",
+                    ]
+                )
+            shard_path = scratch / ".agents/state-index/2026-08-002.csv"
+            with shard_path.open("w", newline="", encoding="utf-8") as handle:
+                csv.writer(handle, lineterminator="\n").writerows(
+                    [
+                        state_record.EVENT_HEADER,
+                        [
+                            event_id,
+                            "2026-08-09T14:00:00Z",
+                            "checkpoint",
+                            "state-record-structure-1",
+                            "verification",
+                            "passed",
+                            "9e50a2f48b0c6162c0da155a2033429826f53f3e",
+                            "pr:166",
+                            spec.as_posix(),
+                            evidence_path,
+                            "",
+                            "Independent strict checkpoint in a new shard.",
+                            "Continue with the next structured-state gate.",
+                        ],
+                    ]
+                )
+            (scratch / evidence_path).write_text(
+                "# Independent structured checkpoint\n"
+                f"<!-- state-event: {event_id} -->\n\n"
+                "## Context\nPost-cutover structured state remains independently appendable.\n\n"
+                "## Outcome\nThe strict event occupies a new index shard.\n\n"
+                "## Evidence\nThe structured checker validates the complete scratch tree.\n\n"
+                "## Next action\nContinue the state-record gate.\n",
+                encoding="utf-8",
+            )
+
+            migration = migrate_state_record.build_verification_migration(
+                scratch, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
+            )
+            self.assertEqual(state_record.validate_repository(scratch), [])
+            migrate_state_record.verify_migration(
+                scratch, migration, state_record.FROZEN_MIGRATION_PROVENANCE
+            )
+
+            legacy_path = scratch / ".agents/state-index/0000-00-001.csv"
+            frozen_rows = list(
+                csv.reader(legacy_path.read_text(encoding="utf-8").splitlines())
+            )
+            for mutation in ("mutated", "removed"):
+                with self.subTest(mutation=mutation):
+                    rows = [row[:] for row in frozen_rows]
+                    if mutation == "mutated":
+                        rows[1][1] = "2026-08-01"
+                    else:
+                        del rows[1]
+                    with legacy_path.open("w", newline="", encoding="utf-8") as handle:
+                        csv.writer(handle, lineterminator="\n").writerows(rows)
+                    with self.assertRaises(migrate_state_record.MigrationError):
+                        migrate_state_record.verify_migration(
+                            scratch,
+                            migration,
+                            state_record.FROZEN_MIGRATION_PROVENANCE,
+                        )
+            with legacy_path.open("w", newline="", encoding="utf-8") as handle:
+                csv.writer(handle, lineterminator="\n").writerows(frozen_rows)
+
+    def test_reconciliation_preserves_frozen_events_and_index_rows(self) -> None:
+        """Catches regeneration of any reviewed frozen event or index-row byte."""
+        frozen = migrate_state_record.build_migration(
+            ROOT, state_record.MIGRATION_EPOCHS[0].commit
+        )
+        reconciled = migrate_state_record.build_verification_migration(
+            ROOT, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
+        )
+        frozen_events = {
+            path: payload
+            for path, payload in frozen.artifacts.items()
+            if path.startswith(".agents/state-events/")
+        }
+
+        self.assertEqual(len(frozen_events), 146)
+        self.assertEqual(
+            {path: hashlib.sha256(payload).hexdigest() for path, payload in frozen_events.items()},
+            {
+                path: hashlib.sha256(reconciled.artifacts[path]).hexdigest()
+                for path in frozen_events
+            },
+        )
+        for path, frozen_bytes in frozen.artifacts.items():
+            if path.startswith(".agents/state-index/"):
+                self.assertTrue(reconciled.artifacts[path].startswith(frozen_bytes), path)
+
+    def test_verify_accepts_reviewed_appended_source_revision(self) -> None:
+        """Catches verification that rejects reviewed append-only source epochs."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(MIGRATOR),
+                "--source-revision",
+                "f921062ba4fbf3341b02d2ac826bb3d84cc91a64",
+                "--output-root",
+                str(ROOT),
+                "--verify",
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_epoch_authority_and_range_mutations_are_rejected(self) -> None:
+        """Catches mutable tuple fields, ancestry drift, prefix edits, and bad ranges."""
+        self.assertTrue(hasattr(state_record, "MIGRATION_EPOCHS"))
+        epochs = state_record.MIGRATION_EPOCHS
+        self.assertGreaterEqual(len(epochs), 3)
+
+        scalar_mutations = {
+            "commit": replace(epochs[1], commit=epochs[0].commit),
+            "blob": replace(epochs[1], blob="0" * 40),
+            "byte_count": replace(epochs[1], byte_count=epochs[1].byte_count + 1),
+            "sha256": replace(epochs[1], sha256="0" * 64),
+        }
+        for field, mutated_epoch in scalar_mutations.items():
+            with self.subTest(field=field), mock.patch.object(
+                state_record,
+                "MIGRATION_EPOCHS",
+                (epochs[0], mutated_epoch, *epochs[2:]),
+            ):
+                with self.assertRaises(migrate_state_record.MigrationError):
+                    migrate_state_record.build_verification_migration(
+                        ROOT, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
+                    )
+
+        with mock.patch.object(
+            state_record,
+            "MIGRATION_EPOCHS",
+            (epochs[0], epochs[2], epochs[1]),
+        ):
+            with self.assertRaisesRegex(
+                migrate_state_record.MigrationError, "ordered ancestor"
+            ):
+                migrate_state_record.build_verification_migration(
+                    ROOT, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
+                )
+
+        original_read_source = migrate_state_record.read_source
+
+        def prefix_mutating_read_source(root: Path, revision: str, source_path: str = ".agents/state.md"):
+            resolved, blob, source = original_read_source(root, revision, source_path)
+            if resolved == epochs[1].commit:
+                source = b"X" + source[1:]
+            return resolved, blob, source
+
+        mutated_second = replace(
+            epochs[1], sha256=hashlib.sha256(b"X" + subprocess.check_output(
+                ["git", "show", f"{epochs[1].commit}:.agents/state.md"], cwd=ROOT
+            )[1:]).hexdigest()
+        )
+        with mock.patch.object(
+            state_record,
+            "MIGRATION_EPOCHS",
+            (epochs[0], mutated_second, *epochs[2:]),
+        ), mock.patch.object(
+            migrate_state_record, "read_source", side_effect=prefix_mutating_read_source
+        ):
+            with self.assertRaisesRegex(migrate_state_record.MigrationError, "prefix"):
+                migrate_state_record.build_verification_migration(
+                    ROOT, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
+                )
+
+        tail_range = epochs[2].ranges[0]
+        range_mutations = {
+            "overlap": replace(tail_range, start=tail_range.start - 1),
+            "gap": replace(tail_range, start=tail_range.start + 1),
+            "epoch boundary": replace(tail_range, end=epochs[2].byte_count + 1),
+        }
+        for case, mutated_range in range_mutations.items():
+            with self.subTest(case=case), mock.patch.object(
+                state_record,
+                "MIGRATION_EPOCHS",
+                (*epochs[:2], replace(epochs[2], ranges=(mutated_range,))),
+            ):
+                with self.assertRaises(migrate_state_record.MigrationError):
+                    migrate_state_record.build_verification_migration(
+                        ROOT, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
+                    )
+
     def test_verify_accepts_exact_generated_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = MigrationRepo(directory)
@@ -380,7 +599,7 @@ class MigrationVerifyTests(unittest.TestCase):
             result = repo.run("--verify", current_revision)
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("differs from frozen migration source", result.stderr)
+            self.assertIn("differs from final migration epoch", result.stderr)
 
     def test_verify_rejects_boundary_payload_header_and_missing_file_mutations(self) -> None:
         """Catches gaps/overlaps, payload edits, schema drift, and incomplete output."""

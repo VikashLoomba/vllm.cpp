@@ -41,12 +41,16 @@ class Segment:
 
 
 @dataclass(frozen=True)
-class Migration:
+class MigrationResult:
     source_revision: str
     source_blob: str
     source: bytes
     segments: tuple[Segment, ...]
     artifacts: dict[str, bytes]
+
+
+# Kept as a source-compatible name for the reviewed frozen builder.
+Migration = MigrationResult
 
 
 def _git(root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
@@ -59,24 +63,26 @@ def _git(root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
     )
 
 
-def read_source(root: Path, revision: str) -> tuple[str, str, bytes]:
+def read_source(
+    root: Path, revision: str, source_path: str = SOURCE_PATH
+) -> tuple[str, str, bytes]:
     resolved = _git(root, "rev-parse", "--verify", f"{revision}^{{commit}}")
     if resolved.returncode != 0:
         detail = resolved.stderr.decode("utf-8", errors="replace").strip()
         raise MigrationError(f"source revision {revision!r} does not resolve: {detail}")
     full_revision = resolved.stdout.decode("ascii").strip()
-    blob = _git(root, "rev-parse", f"{full_revision}:{SOURCE_PATH}")
+    blob = _git(root, "rev-parse", f"{full_revision}:{source_path}")
     if blob.returncode != 0:
         detail = blob.stderr.decode("utf-8", errors="replace").strip()
         raise MigrationError(
-            f"source revision {full_revision} has no {SOURCE_PATH} blob: {detail}"
+            f"source revision {full_revision} has no {source_path} blob: {detail}"
         )
     source_blob = blob.stdout.decode("ascii").strip()
-    source = _git(root, "show", f"{full_revision}:{SOURCE_PATH}")
+    source = _git(root, "show", f"{full_revision}:{source_path}")
     if source.returncode != 0:
         detail = source.stderr.decode("utf-8", errors="replace").strip()
         raise MigrationError(
-            f"source revision {full_revision} has no readable {SOURCE_PATH}: {detail}"
+            f"source revision {full_revision} has no readable {source_path}: {detail}"
         )
     return full_revision, source_blob, source.stdout
 
@@ -84,26 +90,66 @@ def read_source(root: Path, revision: str) -> tuple[str, str, bytes]:
 def build_verification_migration(
     root: Path,
     requested_revision: str,
-    provenance: state_record.MigrationProvenance,
-) -> tuple[str, Migration]:
-    """Bind current source bytes to immutable migration provenance."""
+    source_path: str = SOURCE_PATH,
+    epochs: tuple[state_record.MigrationEpoch, ...] | None = None,
+) -> MigrationResult:
+    """Build and validate the frozen migration plus each ordered append epoch."""
 
-    current_revision, current_blob, current_source = read_source(root, requested_revision)
-    migration = build_migration(root, provenance.commit)
-    actual_provenance = state_record.MigrationProvenance(
-        commit=migration.source_revision,
-        blob=migration.source_blob,
-        byte_count=len(migration.source),
-        sha256=hashlib.sha256(migration.source).hexdigest(),
+    configured = epochs if epochs is not None else state_record.MIGRATION_EPOCHS
+    if not configured:
+        raise MigrationError("migration epoch authority tuple is empty")
+    snapshots: list[bytes] = []
+    for index, epoch in enumerate(configured):
+        revision, blob, source = read_source(root, epoch.commit, source_path)
+        actual = (revision, blob, len(source), hashlib.sha256(source).hexdigest())
+        expected = (epoch.commit, epoch.blob, epoch.byte_count, epoch.sha256)
+        if actual != expected:
+            raise MigrationError(
+                f"migration epoch {index} Git source disagrees with tuple authority"
+            )
+        if index:
+            ancestor = _git(root, "merge-base", "--is-ancestor", configured[index - 1].commit, epoch.commit)
+            if ancestor.returncode != 0:
+                raise MigrationError("migration epochs must be in ordered ancestor sequence")
+            if not source.startswith(snapshots[-1]):
+                raise MigrationError(
+                    f"migration epoch {index} changes the cumulative source prefix"
+                )
+        snapshots.append(source)
+
+    expected_start = configured[0].byte_count
+    for index, epoch in enumerate(configured[1:], start=1):
+        previous_size = configured[index - 1].byte_count
+        if expected_start != previous_size:
+            raise MigrationError("migration epoch boundary disagrees with prior snapshot")
+        if not epoch.ranges:
+            raise MigrationError(f"migration epoch {index} contributes no explicit ranges")
+        for legacy_range in epoch.ranges:
+            if legacy_range.start != expected_start:
+                raise MigrationError(
+                    f"migration range {legacy_range.event_id} leaves a gap or overlap at {expected_start}"
+                )
+            if legacy_range.end <= legacy_range.start or legacy_range.end > epoch.byte_count:
+                raise MigrationError(
+                    f"migration range {legacy_range.event_id} crosses its epoch boundary"
+                )
+            expected_start = legacy_range.end
+        if expected_start != epoch.byte_count:
+            raise MigrationError(
+                f"migration epoch {index} ranges stop at {expected_start}, expected {epoch.byte_count}"
+            )
+
+    current_revision, current_blob, current_source = read_source(
+        root, requested_revision, source_path
     )
-    if actual_provenance != provenance:
-        raise MigrationError("Git source disagrees with frozen migration provenance")
-    if current_blob != migration.source_blob or current_source != migration.source:
+    final = configured[-1]
+    if current_blob != final.blob or current_source != snapshots[-1]:
         raise MigrationError(
-            f"source revision {current_revision} differs from frozen migration source "
-            f"{migration.source_revision}"
+            f"source revision {current_revision} differs from final migration epoch {final.commit}"
         )
-    return current_revision, migration
+
+    migration = build_migration(root, configured[0].commit, source_path)
+    return _append_epochs(migration, configured, snapshots, source_path)
 
 
 def _canonical_anchor(raw: bytes) -> tuple[str, str | None]:
@@ -192,11 +238,16 @@ def _assign_segments(
     return tuple(segments)
 
 
-def _event_wrapper(segment: Segment, revision: str, payload: bytes) -> bytes:
+def _event_wrapper(
+    segment: Segment,
+    revision: str,
+    payload: bytes,
+    source_path: str = SOURCE_PATH,
+) -> bytes:
     prefix = (
         f"# Imported state event {segment.event_id}\n"
         f"<!-- state-event: {segment.event_id} -->\n"
-        f"<!-- legacy-source: {revision}:{SOURCE_PATH} "
+        f"<!-- legacy-source: {revision}:{source_path} "
         f"bytes {segment.start}-{segment.end} -->\n"
     ).encode("ascii")
     return prefix + state_record.LEGACY_BEGIN + payload + state_record.LEGACY_END
@@ -266,8 +317,10 @@ def _build_indexes(segments: tuple[Segment, ...]) -> tuple[dict[str, bytes], byt
     return artifacts, manifest
 
 
-def build_migration(root: Path, revision: str) -> Migration:
-    full_revision, source_blob, source = read_source(root, revision)
+def build_migration(
+    root: Path, revision: str, source_path: str = SOURCE_PATH
+) -> MigrationResult:
+    full_revision, source_blob, source = read_source(root, revision, source_path)
     segments = _assign_segments(segment_source(source))
     artifacts: dict[str, bytes] = {}
     source_digest = hashlib.sha256(source).hexdigest()
@@ -287,7 +340,7 @@ def build_migration(root: Path, revision: str) -> Migration:
     for segment in segments:
         payload = source[segment.start : segment.end]
         artifacts[segment.evidence_path] = _event_wrapper(
-            segment, full_revision, payload
+            segment, full_revision, payload, source_path
         )
         migration_rows.append(
             [
@@ -308,7 +361,7 @@ def build_migration(root: Path, revision: str) -> Migration:
     index_artifacts, root_manifest = _build_indexes(segments)
     artifacts.update(index_artifacts)
     artifacts[".agents/state.csv"] = root_manifest
-    artifacts[SOURCE_PATH] = (
+    artifacts[source_path] = (
         "# Structured state record\n\n"
         "Current index: [.agents/state.csv](state.csv).\n\n"
         "Index shards: [.agents/state-index/](state-index/).\n\n"
@@ -319,7 +372,113 @@ def build_migration(root: Path, revision: str) -> Migration:
         "Frozen legacy source: "
         f"https://github.com/mudler/vllm.cpp/blob/{full_revision}/.agents/state.md\n"
     ).encode("ascii")
-    return Migration(full_revision, source_blob, source, segments, artifacts)
+    return MigrationResult(full_revision, source_blob, source, segments, artifacts)
+
+
+def _source_row(epoch: state_record.MigrationEpoch) -> list[str]:
+    return [
+        "source",
+        epoch.commit,
+        epoch.blob,
+        str(epoch.byte_count),
+        epoch.sha256,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]
+
+
+def _append_epochs(
+    frozen: MigrationResult,
+    epochs: tuple[state_record.MigrationEpoch, ...],
+    snapshots: list[bytes],
+    source_path: str,
+) -> MigrationResult:
+    artifacts = dict(frozen.artifacts)
+    manifest_reader = csv.reader(
+        artifacts[MANIFEST_PATH].decode("utf-8").splitlines(keepends=True),
+        strict=True,
+    )
+    header = tuple(next(manifest_reader, ()))
+    if header != state_record.MIGRATION_HEADER:
+        raise MigrationError("frozen migration manifest header changed")
+    manifest_rows = [row for row in manifest_reader if row]
+    segments = list(frozen.segments)
+    delta_rows_by_index: dict[str, list[list[str]]] = {}
+
+    for epoch, snapshot in zip(epochs[1:], snapshots[1:]):
+        manifest_rows.append(_source_row(epoch))
+        for legacy_range in epoch.ranges:
+            period = legacy_range.occurred_at[:7]
+            evidence_path = (
+                f".agents/state-events/{period}/{legacy_range.event_id}.md"
+            )
+            segment = Segment(
+                legacy_range.event_id,
+                legacy_range.start,
+                legacy_range.end,
+                legacy_range.occurred_at,
+                evidence_path,
+            )
+            payload = snapshot[legacy_range.start : legacy_range.end]
+            artifacts[evidence_path] = _event_wrapper(
+                segment, epoch.commit, payload, source_path
+            )
+            manifest_rows.append(
+                [
+                    "event",
+                    "",
+                    "",
+                    "",
+                    "",
+                    segment.event_id,
+                    str(segment.start),
+                    str(segment.end),
+                    str(len(payload)),
+                    hashlib.sha256(payload).hexdigest(),
+                    segment.evidence_path,
+                ]
+            )
+            index_path = f".agents/state-index/{period}-001.csv"
+            delta_rows_by_index.setdefault(index_path, []).append(_event_row(segment))
+            segments.append(segment)
+
+    artifacts[MANIFEST_PATH] = _csv_bytes(state_record.MIGRATION_HEADER, manifest_rows)
+    for index_path, delta_rows in delta_rows_by_index.items():
+        try:
+            existing = artifacts[index_path]
+        except KeyError as exc:
+            raise MigrationError(f"reviewed delta index does not exist: {index_path}") from exc
+        reader = csv.reader(existing.decode("utf-8").splitlines(keepends=True), strict=True)
+        index_header = tuple(next(reader, ()))
+        if index_header != state_record.EVENT_HEADER:
+            raise MigrationError(f"reviewed delta index header changed: {index_path}")
+        rows = [row for row in reader if row]
+        rows.extend(delta_rows)
+        if [row[0] for row in rows] != sorted(
+            (row[0] for row in rows), key=state_record.event_order_key
+        ):
+            raise MigrationError(f"reviewed delta rows are not ordered in {index_path}")
+        artifacts[index_path] = _csv_bytes(state_record.EVENT_HEADER, rows)
+
+    final = epochs[-1]
+    if len(epochs) > 1:
+        artifacts[source_path] = artifacts[source_path] + (
+            "\nFinal imported source SHA-256: "
+            f"`{final.sha256}`.\n\n"
+            "Final imported legacy source: "
+            f"https://github.com/mudler/vllm.cpp/blob/{final.commit}/{source_path}\n"
+        ).encode("ascii")
+    return MigrationResult(
+        final.commit,
+        final.blob,
+        snapshots[-1],
+        tuple(segments),
+        artifacts,
+    )
 
 
 def _managed_paths(root: Path) -> set[str]:
@@ -349,13 +508,12 @@ def apply_migration(root: Path, migration: Migration) -> None:
             conflicts.append(f"{relative}: cannot inspect existing path: {exc}")
             continue
         source_replacement = relative == SOURCE_PATH and actual == migration.source
-        if actual != expected and not source_replacement:
+        appendable = (
+            relative in {SOURCE_PATH, MANIFEST_PATH}
+            or relative.startswith(".agents/state-index/")
+        ) and expected.startswith(actual)
+        if actual != expected and not source_replacement and not appendable:
             conflicts.append(f"{relative}: refusing to overwrite different bytes")
-    unexpected = _managed_paths(root) - set(migration.artifacts)
-    conflicts.extend(
-        f"{relative}: refusing to retain unexpected generated output"
-        for relative in sorted(unexpected)
-    )
     if conflicts:
         raise MigrationError("\n".join(conflicts))
 
@@ -383,26 +541,14 @@ def _manifest_reconstruction_errors(root: Path, migration: Migration) -> list[st
 
     errors: list[str] = []
     source_rows = [row for row in rows if row and row[0] == "source"]
-    expected_source_row = [
-        "source",
-        migration.source_revision,
-        migration.source_blob,
-        str(len(migration.source)),
-        hashlib.sha256(migration.source).hexdigest(),
-        "",
-        "",
-        "",
-        "",
-        "",
-        "",
-    ]
-    if len(source_rows) != 1 or not rows or rows[0] != expected_source_row:
-        errors.append(
-            "migration manifest must begin with exact source commit/blob/bytes/SHA-256 provenance"
-        )
+    if not source_rows or not rows or rows[0][0] != "source":
+        errors.append("migration manifest must begin with source provenance")
     expected_start = 0
     reconstructed = bytearray()
     seen: set[str] = set()
+    source_index = -1
+    source_sizes: list[int] = []
+    source_snapshots: list[bytes | None] = []
     for line_number, row in enumerate(rows, start=2):
         location = f"{MANIFEST_PATH}:{line_number}"
         if len(row) != len(state_record.MIGRATION_HEADER):
@@ -412,6 +558,33 @@ def _manifest_reconstruction_errors(root: Path, migration: Migration) -> list[st
             continue
         record_type, *fields = row
         if record_type == "source":
+            source_index += 1
+            if any(fields[4:]):
+                errors.append(f"{location}: source row cannot contain event fields")
+            try:
+                size = int(fields[2])
+            except ValueError:
+                errors.append(f"{location}: source byte count must be an integer")
+                size = -1
+            snapshot = state_record._git_bytes(root, fields[0], SOURCE_PATH)
+            source_sizes.append(size)
+            source_snapshots.append(snapshot)
+            if snapshot is None:
+                errors.append(f"{location}: source revision cannot be read")
+            else:
+                blob = state_record._git_blob_oid(root, fields[0], SOURCE_PATH)
+                if (
+                    blob != fields[1]
+                    or len(snapshot) != size
+                    or hashlib.sha256(snapshot).hexdigest() != fields[3]
+                ):
+                    errors.append(f"{location}: source tuple disagrees with Git")
+            if source_index:
+                previous = source_snapshots[source_index - 1]
+                if expected_start != source_sizes[source_index - 1]:
+                    errors.append(f"{location}: source epoch begins at the wrong boundary")
+                if previous is not None and bytes(reconstructed) != previous:
+                    errors.append(f"{location}: payloads do not reconstruct preceding epoch")
             continue
         if record_type != "event":
             errors.append(f"{location}: record type must be source or event")
@@ -433,6 +606,10 @@ def _manifest_reconstruction_errors(root: Path, migration: Migration) -> list[st
             )
         if end < start:
             errors.append(f"{location}: range ends before it starts")
+        if source_index < 0:
+            errors.append(f"{location}: event precedes source provenance")
+        elif end > source_sizes[source_index]:
+            errors.append(f"{location}: range crosses its source epoch boundary")
         try:
             payload = state_record.read_legacy_payload(root / evidence_path)
         except (OSError, ValueError) as exc:
@@ -468,10 +645,51 @@ def verify_migration(
         except OSError as exc:
             errors.append(f"{relative}: generated output is missing or unreadable: {exc}")
             continue
-        if actual != expected:
+        if relative == ".agents/state.csv":
+            header: tuple[str, ...] = ()
+            try:
+                expected_reader = csv.reader(
+                    expected.decode("utf-8").splitlines(keepends=True), strict=True
+                )
+                expected_header = tuple(next(expected_reader, ()))
+                expected_rows = [row for row in expected_reader if row]
+                migration_indexes = {row[2] for row in expected_rows}
+                actual_reader = csv.reader(
+                    actual.decode("utf-8").splitlines(keepends=True), strict=True
+                )
+                header = tuple(next(actual_reader, ()))
+                migration_rows = [
+                    row
+                    for row in actual_reader
+                    if row and len(row) > 2 and row[2] in migration_indexes
+                ]
+                actual_migration_subset = _csv_bytes(
+                    state_record.MANIFEST_HEADER, migration_rows
+                )
+            except (UnicodeError, csv.Error):
+                expected_header = state_record.MANIFEST_HEADER
+                actual_migration_subset = actual
+            differs = (
+                header != state_record.MANIFEST_HEADER
+                or expected_header != state_record.MANIFEST_HEADER
+                or actual_migration_subset != expected
+            )
+        elif relative.startswith(".agents/state-index/"):
+            header: tuple[str, ...] = ()
+            try:
+                reader = csv.reader(
+                    actual.decode("utf-8").splitlines(keepends=True), strict=True
+                )
+                header = tuple(next(reader, ()))
+                legacy_rows = [row for row in reader if row and len(row) > 2 and row[2] == "legacy_import"]
+                actual_import_subset = _csv_bytes(state_record.EVENT_HEADER, legacy_rows)
+            except (UnicodeError, csv.Error):
+                actual_import_subset = actual
+            differs = header != state_record.EVENT_HEADER or actual_import_subset != expected
+        else:
+            differs = actual != expected
+        if differs:
             errors.append(f"{relative}: generated bytes differ from deterministic output")
-    for relative in sorted(_managed_paths(root) - set(migration.artifacts)):
-        errors.append(f"{relative}: unexpected generated output")
     errors.extend(_manifest_reconstruction_errors(root, migration))
     errors.extend(state_record.validate(root, migration_provenance=provenance))
     if errors:
@@ -490,10 +708,22 @@ def main(
     mode.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
     root = args.output_root.resolve()
+    configured_epochs = None
+    if provenance != state_record.FROZEN_MIGRATION_PROVENANCE:
+        configured_epochs = (
+            state_record.MigrationEpoch(
+                provenance.commit,
+                provenance.blob,
+                provenance.byte_count,
+                provenance.sha256,
+                (),
+            ),
+        )
     try:
+        requested_revision = read_source(root, args.source_revision)[0]
         if args.apply:
-            requested_revision, migration = build_verification_migration(
-                root, args.source_revision, provenance
+            migration = build_verification_migration(
+                root, args.source_revision, epochs=configured_epochs
             )
             apply_migration(root, migration)
             print(
@@ -501,8 +731,8 @@ def main(
                 f"{requested_revision} using frozen provenance {migration.source_revision}"
             )
         else:
-            requested_revision, migration = build_verification_migration(
-                root, args.source_revision, provenance
+            migration = build_verification_migration(
+                root, args.source_revision, epochs=configured_epochs
             )
             verify_migration(root, migration, provenance)
             print(

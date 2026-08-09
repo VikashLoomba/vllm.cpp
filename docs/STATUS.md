@@ -41,10 +41,10 @@ published by GitHub Actions - lanes `-cuda`/`-vulkan`/`-cpu` plus moving `latest
 each an amd64+arm64 manifest. The image is the `ENG-RELEASE-BINARIES` staged bundle, which does not exist yet, so
 no Dockerfile, workflow or registry package is claimed. Metal/MLX are NOT-CONTAINERIZABLE. Issue #170.
 
-Protocol (2026-08-09): 156 legacy imports reconstruct the final merge snapshot
-(3,225,646 bytes); wrappers, archive and raw rows are
-mutation-gated. Tests: 92 (validator/core 44 = checker 20 + core 24; NOW 18;
-migration 19; cutover 11).
+Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
+append preserved prior 156 wrappers/rows. Archive/new raw-row mutation guards bind.
+Tests: 94: validator/core 44 (checker 20 + core 24), NOW 18, migration 21,
+cutover 11.
 
 Protocol repair (2026-08-08): release AST pins pass 30 tests on Python
 3.12/3.13; Gemma-4 MoE is known drift pending the shared merged-GeGLU fold;

@@ -51,6 +51,7 @@ def active_files(root: Path) -> list[Path]:
     candidates = [root / "AGENTS.md", root / "README.md"]
     candidates.extend((root / ".agents").glob("*.md"))
     candidates.extend((root / ".agents/specs").glob("*.md"))
+    candidates.extend((root / "docs/superpowers/plans").glob("*.md"))
     candidates.extend(
         root / relative
         for relative in (
@@ -93,6 +94,15 @@ def stale_reference_errors(root: Path, paths: list[Path] | None = None) -> list[
 
 
 class ActiveReferenceAudit(unittest.TestCase):
+    def test_execution_plans_are_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plans = root / "docs/superpowers/plans"
+            plans.mkdir(parents=True)
+            plan = plans / "active-plan.md"
+            plan.write_text("Current execution instructions.\n", encoding="utf-8")
+            self.assertIn(plan, active_files(root))
+
     def test_active_references_have_cut_over(self) -> None:
         self.assertEqual(stale_reference_errors(ROOT), [])
 

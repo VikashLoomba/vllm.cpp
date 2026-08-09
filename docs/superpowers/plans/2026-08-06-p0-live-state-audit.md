@@ -1133,18 +1133,24 @@ retirement is missing or partial — repair the record, never the checker.
 
 - [ ] **Step 5: Repeat Steps 1–4b for each remaining matrix with corrections**
 
-- [ ] **Step 6: Update the roadmap, state log and public status**
+- [ ] **Step 6: Update the roadmap, structured state record and public status**
 
 The record obligation is that the roadmap portfolio row and its owning area matrix row move in the **same change** as the state they describe. If any corrected row has a portfolio row in `.agents/roadmap_v1.md`, update it now.
 
-Append one entry to `.agents/state.md` **below** the `<!-- state-order:enforced-below -->` marker, carrying a `<!-- state: 2026-08-06 -->` anchor on the line after its heading. Refresh `.agents/NOW.md` in the same commit (the freshness coupling is CI-gated) and update `docs/STATUS.md`.
+Append one checkpoint row to the writable `.agents/state-index/` shard and add
+its matching immutable Markdown evidence under `.agents/state-events/`, using
+the schema and event contract in the structured-state design. Refresh
+`.agents/NOW.md` in the same commit (the freshness coupling is CI-gated) and
+update `docs/STATUS.md`. Leave the `.agents/state.md` compatibility stub
+unchanged.
 
 - [ ] **Step 7: Verify chronology and doc obligations, then commit**
 
 ```bash
-python3 scripts/check-state-order.py; echo "state-order EXIT=$?"
+python3 scripts/check-state-record.py; echo "state-record EXIT=$?"
 bash scripts/agent-preflight.sh > /tmp/preflight.log 2>&1; echo "EXIT=$?"
-git add .agents/roadmap_v1.md .agents/state.md .agents/NOW.md docs/STATUS.md
+git add .agents/roadmap_v1.md .agents/state-index/<writable-shard>.csv \
+  .agents/state-events/<YYYY-MM>/<event-id>.md .agents/NOW.md docs/STATUS.md
 git commit -F - <<'EOF'
 record(state): live-state audit checkpoint — the ACTIVE claim set is now true
 

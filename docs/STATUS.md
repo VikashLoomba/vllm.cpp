@@ -1314,7 +1314,7 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 ## Backend detail
 
-Gemma4 ROCm fused helpers use portable `include/vt/fused_ops.h`: ROCm fast paths under `VLLM_CPP_HIP`; non-HIP stubs cover peer/pin/resident upload; kernel-only `VT_GEMMA4_*` switches are classified and device leakage stays at baseline (#154).
+Gemma4/ROCm env split: public `VT_GEMMA4_EXPERT_VRAM_MB` caps expert LRU in positive MiB (unset/0 unlimited); `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` guard requests at 200000/4096 (0 disables); nine inherited tuning toggles are internal. No runtime/perf change.
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers

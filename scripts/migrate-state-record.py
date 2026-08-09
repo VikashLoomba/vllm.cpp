@@ -95,6 +95,19 @@ def build_verification_migration(
 ) -> MigrationResult:
     """Build and validate the frozen migration plus each ordered append epoch."""
 
+    if epochs is None:
+        requested = read_source(root, requested_revision, source_path)
+        final = state_record.FINAL_MIGRATION_PROVENANCE
+        actual = (
+            requested[0],
+            requested[1],
+            len(requested[2]),
+            hashlib.sha256(requested[2]).hexdigest(),
+        )
+        expected = (final.commit, final.blob, final.byte_count, final.sha256)
+        if actual == expected:
+            return _build_final_snapshot_migration(root, requested, source_path)
+
     configured = epochs if epochs is not None else state_record.MIGRATION_EPOCHS
     if not configured:
         raise MigrationError("migration epoch authority tuple is empty")
@@ -493,6 +506,207 @@ def _append_epochs(
     )
 
 
+def _final_segments(source: bytes) -> tuple[Segment, ...]:
+    canonical = _assign_segments(segment_source(source))
+    overrides = state_record.FINAL_BOUNDARY_OVERRIDES
+    seen: set[str] = set()
+    segments: list[Segment] = []
+    expected_start = 0
+    for segment in canonical:
+        if segment.event_id in overrides:
+            start, end = overrides[segment.event_id]
+            seen.add(segment.event_id)
+            segment = Segment(
+                segment.event_id,
+                start,
+                end,
+                segment.occurred_at,
+                segment.evidence_path,
+            )
+        if segment.start != expected_start or segment.end <= segment.start:
+            raise MigrationError(
+                f"final boundary override for {segment.event_id} breaks contiguous coverage"
+            )
+        expected_start = segment.end
+        segments.append(segment)
+    if seen != set(overrides):
+        raise MigrationError("final boundary override names do not match canonical events")
+    if expected_start != len(source):
+        raise MigrationError("final boundary overrides do not cover the final source")
+    return tuple(segments)
+
+
+def _preserved_wrapper_artifacts(
+    root: Path, source: bytes, segments: tuple[Segment, ...]
+) -> dict[str, bytes]:
+    regenerated = {*state_record.FINAL_NEW_EVENT_IDS, "STATE-20260809T130000-001"}
+    artifacts: dict[str, bytes] = {}
+    inventory: list[bytes] = []
+    for segment in segments:
+        if segment.event_id in regenerated:
+            continue
+        path = root / segment.evidence_path
+        try:
+            wrapper = path.read_bytes()
+            payload = state_record.read_legacy_payload(path)
+        except (OSError, ValueError) as exc:
+            raise MigrationError(
+                f"preserved wrapper {segment.evidence_path} cannot be read: {exc}"
+            ) from exc
+        expected_payload = source[segment.start : segment.end]
+        if payload != expected_payload:
+            raise MigrationError(
+                f"preserved wrapper {segment.event_id} payload differs from final segment"
+            )
+        artifacts[segment.evidence_path] = wrapper
+        inventory.append(
+            f"{segment.evidence_path},{hashlib.sha256(wrapper).hexdigest()}\n".encode(
+                "ascii"
+            )
+        )
+    digest = hashlib.sha256(b"".join(inventory)).hexdigest()
+    if (
+        len(inventory) != state_record.PRESERVED_WRAPPER_COUNT
+        or digest != state_record.PRESERVED_WRAPPER_INVENTORY_SHA256
+    ):
+        raise MigrationError("preserved wrapper hash inventory disagrees with authority")
+    return artifacts
+
+
+def _archived_manifest_bytes(root: Path) -> bytes:
+    archive = root / state_record.ARCHIVED_MIGRATION_MANIFEST
+    live = root / MANIFEST_PATH
+    candidate = archive if archive.exists() else live
+    try:
+        raw = candidate.read_bytes()
+    except OSError as exc:
+        raise MigrationError(f"reviewed append-epoch manifest cannot be read: {exc}") from exc
+    if (
+        len(raw) != state_record.ARCHIVED_MIGRATION_MANIFEST_BYTES
+        or hashlib.sha256(raw).hexdigest()
+        != state_record.ARCHIVED_MIGRATION_MANIFEST_SHA256
+    ):
+        raise MigrationError("reviewed append-epoch manifest bytes disagree with authority")
+    return raw
+
+
+def _merge_final_index(
+    root: Path, segments: tuple[Segment, ...]
+) -> tuple[dict[str, bytes], bytes]:
+    if set(state_record.FINAL_NEW_INDEX_ROW_SHA256) != set(
+        state_record.FINAL_NEW_EVENT_IDS
+    ):
+        raise MigrationError("final index row byte authority disagrees with event IDs")
+    root_path = root / ".agents/state.csv"
+    try:
+        root_manifest = root_path.read_bytes()
+        root_records = _raw_csv_rows(root_manifest)
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise MigrationError(f"reviewed root state manifest cannot be read: {exc}") from exc
+    if not root_records or tuple(root_records[0][0]) != state_record.MANIFEST_HEADER:
+        raise MigrationError("reviewed root state manifest header changed")
+
+    artifacts: dict[str, bytes] = {}
+    by_index: dict[str, list[Segment]] = {}
+    for segment in segments:
+        period = segment.evidence_path.split("/")[2]
+        by_index.setdefault(f".agents/state-index/{period}-001.csv", []).append(segment)
+
+    for index_path, period_segments in by_index.items():
+        path = root / index_path
+        try:
+            records = _raw_csv_rows(path.read_bytes())
+        except (OSError, UnicodeError, csv.Error) as exc:
+            raise MigrationError(f"reviewed index {index_path} cannot be read: {exc}") from exc
+        if not records or tuple(records[0][0]) != state_record.EVENT_HEADER:
+            raise MigrationError(f"reviewed index header changed: {index_path}")
+        header_raw = records[0][1]
+        raw_by_id = {row[0]: raw for row, raw in records[1:] if row}
+        for segment in period_segments:
+            if segment.event_id not in raw_by_id:
+                encoded = _csv_bytes(state_record.EVENT_HEADER, [_event_row(segment)])
+                raw_by_id[segment.event_id] = _raw_csv_rows(encoded)[1][1]
+            expected_digest = state_record.FINAL_NEW_INDEX_ROW_SHA256.get(
+                segment.event_id
+            )
+            if (
+                expected_digest is not None
+                and hashlib.sha256(raw_by_id[segment.event_id]).hexdigest()
+                != expected_digest
+            ):
+                raise MigrationError(
+                    f"final index row bytes disagree with authority: {segment.event_id}"
+                )
+        expected_ids = {segment.event_id for segment in period_segments}
+        imported_ids = {
+            row[0] for row, _ in records[1:] if row and len(row) > 2 and row[2] == "legacy_import"
+        }
+        if not imported_ids.issubset(expected_ids):
+            raise MigrationError(f"reviewed index has unknown legacy rows: {index_path}")
+        ordered = sorted(raw_by_id, key=state_record.event_order_key)
+        artifacts[index_path] = header_raw + b"".join(raw_by_id[event_id] for event_id in ordered)
+    return artifacts, root_manifest
+
+
+def _build_final_snapshot_migration(
+    root: Path,
+    source_tuple: tuple[str, str, bytes],
+    source_path: str,
+) -> MigrationResult:
+    revision, blob, source = source_tuple
+    final = state_record.FINAL_MIGRATION_PROVENANCE
+    segments = _final_segments(source)
+    if len(segments) != 156:
+        raise MigrationError(f"final source produced {len(segments)} events, expected 156")
+    present_new = tuple(
+        segment.event_id
+        for segment in segments
+        if segment.event_id in state_record.FINAL_NEW_EVENT_IDS
+    )
+    if present_new != state_record.FINAL_NEW_EVENT_IDS:
+        raise MigrationError("final source concurrent event IDs disagree with authority")
+
+    artifacts = _preserved_wrapper_artifacts(root, source, segments)
+    regenerated = {*state_record.FINAL_NEW_EVENT_IDS, "STATE-20260809T130000-001"}
+    manifest_rows = [_source_row(state_record.MigrationEpoch(
+        final.commit, final.blob, final.byte_count, final.sha256, ()
+    ))]
+    for segment in segments:
+        payload = source[segment.start : segment.end]
+        if segment.event_id in regenerated:
+            artifacts[segment.evidence_path] = _event_wrapper(
+                segment, final.commit, payload, source_path
+            )
+        manifest_rows.append([
+            "event", "", "", "", "", segment.event_id,
+            str(segment.start), str(segment.end), str(len(payload)),
+            hashlib.sha256(payload).hexdigest(), segment.evidence_path,
+        ])
+    artifacts[state_record.ARCHIVED_MIGRATION_MANIFEST] = _archived_manifest_bytes(root)
+    artifacts[MANIFEST_PATH] = _csv_bytes(state_record.MIGRATION_HEADER, manifest_rows)
+    index_artifacts, root_manifest = _merge_final_index(root, segments)
+    artifacts.update(index_artifacts)
+    artifacts[".agents/state.csv"] = root_manifest
+    artifacts[source_path] = (
+        "# Structured state record\n\n"
+        "Current index: [.agents/state.csv](state.csv).\n\n"
+        "Index shards: [.agents/state-index/](state-index/).\n\n"
+        "Event evidence: [.agents/state-events/](state-events/).\n\n"
+        "Migration coverage: [.agents/completed/state-migration-manifest.csv]"
+        "(completed/state-migration-manifest.csv).\n\n"
+        "Archived append-epoch coverage: "
+        "[.agents/completed/state-migration-manifest-f921.csv]"
+        "(completed/state-migration-manifest-f921.csv).\n\n"
+        f"Frozen source SHA-256: `{state_record.FROZEN_MIGRATION_PROVENANCE.sha256}`.\n\n"
+        "Frozen legacy source: "
+        f"https://github.com/mudler/vllm.cpp/blob/{state_record.FROZEN_MIGRATION_PROVENANCE.commit}/{source_path}\n\n"
+        f"Final imported source SHA-256: `{final.sha256}`.\n\n"
+        "Final imported legacy source: "
+        f"https://github.com/mudler/vllm.cpp/blob/{final.commit}/{source_path}\n"
+    ).encode("ascii")
+    return MigrationResult(revision, blob, source, segments, artifacts)
+
+
 def _managed_paths(root: Path) -> set[str]:
     paths: set[str] = set()
     for pattern in (
@@ -502,7 +716,12 @@ def _managed_paths(root: Path) -> set[str]:
         paths.update(
             path.relative_to(root).as_posix() for path in root.glob(pattern) if path.is_file()
         )
-    for relative in (SOURCE_PATH, ".agents/state.csv", MANIFEST_PATH):
+    for relative in (
+        SOURCE_PATH,
+        ".agents/state.csv",
+        MANIFEST_PATH,
+        state_record.ARCHIVED_MIGRATION_MANIFEST,
+    ):
         if (root / relative).is_file():
             paths.add(relative)
     return paths
@@ -510,6 +729,9 @@ def _managed_paths(root: Path) -> set[str]:
 
 def apply_migration(root: Path, migration: Migration) -> None:
     conflicts: list[str] = []
+    final_reconciliation = (
+        migration.source_revision == state_record.FINAL_MIGRATION_PROVENANCE.commit
+    )
     for relative, expected in sorted(migration.artifacts.items()):
         path = root / relative
         if not path.exists():
@@ -524,7 +746,17 @@ def apply_migration(root: Path, migration: Migration) -> None:
             relative in {SOURCE_PATH, MANIFEST_PATH}
             or relative.startswith(".agents/state-index/")
         ) and expected.startswith(actual)
-        if actual != expected and not source_replacement and not appendable:
+        final_replaceable = final_reconciliation and (
+            relative in {SOURCE_PATH, MANIFEST_PATH}
+            or relative.startswith(".agents/state-index/")
+            or relative.endswith("/STATE-20260809T130000-001.md")
+        )
+        if (
+            actual != expected
+            and not source_replacement
+            and not appendable
+            and not final_replaceable
+        ):
             conflicts.append(f"{relative}: refusing to overwrite different bytes")
     if conflicts:
         raise MigrationError("\n".join(conflicts))
@@ -693,7 +925,9 @@ def verify_migration(
                     tuple(expected_records[0][0]) if expected_records else ()
                 )
                 expected_import_rows = [
-                    raw for row, raw in expected_records[1:] if row
+                    raw
+                    for row, raw in expected_records[1:]
+                    if row and len(row) > 2 and row[2] == "legacy_import"
                 ]
                 actual_records = _raw_csv_rows(actual)
                 header = tuple(actual_records[0][0]) if actual_records else ()

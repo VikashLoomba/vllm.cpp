@@ -102,6 +102,54 @@ FROZEN_MIGRATION_PROVENANCE = MigrationProvenance(
     sha256="00c08e974724c19b5f79cce44df71c6fbfef4db32aa6acb545ef56546e3bb5e6",
 )
 
+FINAL_MIGRATION_PROVENANCE = MigrationProvenance(
+    commit="dc2139b3ff95f6de9b6a8ec8cae4bd5d40262dc7",
+    blob="e79acd955e7042f9d028e18d41569ff5b67e32c3",
+    byte_count=3225646,
+    sha256="5c389a0cd84e6834263630af9e9d5a7a64f131ef06d479670dc6e3dc942ec202",
+)
+
+ARCHIVED_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest-f921.csv"
+ARCHIVED_MIGRATION_MANIFEST_BYTES = 27431
+ARCHIVED_MIGRATION_MANIFEST_SHA256 = (
+    "2f8ea0da82038cb1b297b53b2b28f93a02d2963170b13572a6f676299b439113"
+)
+PRESERVED_WRAPPER_COUNT = 148
+PRESERVED_WRAPPER_INVENTORY_SHA256 = (
+    "87680b6a195552450a9f83f7711a2d352dc468ac6bcdf1650f90d711d5342b59"
+)
+FINAL_BOUNDARY_OVERRIDES = {
+    "STATE-20260809T001000-001": (3196620, 3197705),
+    "STATE-20260809T083000-001": (3197705, 3200170),
+    "STATE-20260809T110000-001": (3200170, 3202350),
+    "STATE-20260809T130000-001": (3202350, 3205680),
+}
+FINAL_NEW_EVENT_IDS = (
+    "STATE-20260808T210000-003",
+    "STATE-20260808T220000-002",
+    "STATE-20260808T230000-002",
+    "STATE-20260808T233000-002",
+    "STATE-20260808T234500-002",
+    "STATE-20260809T140000-001",
+    "STATE-20260809T140000-002",
+)
+FINAL_NEW_INDEX_ROW_SHA256 = {
+    "STATE-20260808T210000-003":
+        "f6ef197bae96e5ff8d1b9e9f47c1cb3729c6f8eed3da0d28a1ac5f81b2acef3d",
+    "STATE-20260808T220000-002":
+        "02e320a239a82ab00eeabbe3dc1d11d95e0467cfb93158460a1a87c02cd77b9b",
+    "STATE-20260808T230000-002":
+        "6bf899ac1a80b9027ed46a9498ef738158f1bb22776673bc3258900d340a0ce9",
+    "STATE-20260808T233000-002":
+        "60e2529de3820e8651979e12c2195c228be2b7ca5d75ca3071615a9114560b95",
+    "STATE-20260808T234500-002":
+        "72e45c389dd8aa692eebc75949ac5f02a509b19ada919fa266760f6faa1958f8",
+    "STATE-20260809T140000-001":
+        "4bbbe4a78b4b196a7553a07d9130ed059916c053892aaf81e72b8cb98def8b7a",
+    "STATE-20260809T140000-002":
+        "05a03ffbc09399563a24d833d48c0d1b9df90b1c3ccaaa12b76bd87b07cd41dc",
+}
+
 MIGRATION_EPOCHS = (
     MigrationEpoch(
         commit=FROZEN_MIGRATION_PROVENANCE.commit,
@@ -716,6 +764,212 @@ def _stub_and_migration_errors(
     return errors
 
 
+def _authority_source(
+    root: Path, provenance: MigrationProvenance, label: str
+) -> tuple[bytes | None, list[str]]:
+    errors: list[str] = []
+    source = _git_bytes(root, provenance.commit, ".agents/state.md")
+    if source is None:
+        return None, [f"{label} Git source does not resolve"]
+    if _git_blob_oid(root, provenance.commit, ".agents/state.md") != provenance.blob:
+        errors.append(f"{label} provenance blob does not match Git")
+    if len(source) != provenance.byte_count:
+        errors.append(f"{label} provenance byte count does not match Git")
+    if hashlib.sha256(source).hexdigest() != provenance.sha256:
+        errors.append(f"{label} provenance SHA-256 does not match Git")
+    return source, errors
+
+
+def _historical_epoch_errors(root: Path) -> list[str]:
+    errors: list[str] = []
+    previous: bytes | None = None
+    for index, epoch in enumerate(MIGRATION_EPOCHS):
+        provenance = MigrationProvenance(
+            epoch.commit, epoch.blob, epoch.byte_count, epoch.sha256
+        )
+        source, source_errors = _authority_source(
+            root, provenance, f"historical migration epoch {index}"
+        )
+        errors.extend(source_errors)
+        if index:
+            ancestor = subprocess.run(
+                [
+                    "git", "merge-base", "--is-ancestor",
+                    MIGRATION_EPOCHS[index - 1].commit, epoch.commit,
+                ],
+                cwd=root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if ancestor.returncode != 0:
+                errors.append("historical migration epochs must be in ordered ancestor sequence")
+            if source is not None and previous is not None and not source.startswith(previous):
+                errors.append(f"historical migration epoch {index} changes the cumulative source prefix")
+        previous = source
+    archive = root / ARCHIVED_MIGRATION_MANIFEST
+    try:
+        raw_archive = archive.read_bytes()
+    except OSError as exc:
+        errors.append(f"archived migration manifest cannot be read: {exc}")
+    else:
+        if (
+            len(raw_archive) != ARCHIVED_MIGRATION_MANIFEST_BYTES
+            or hashlib.sha256(raw_archive).hexdigest()
+            != ARCHIVED_MIGRATION_MANIFEST_SHA256
+        ):
+            errors.append("archived migration manifest bytes disagree with authority")
+    return errors
+
+
+def _final_index_row_errors(root: Path) -> list[str]:
+    if set(FINAL_NEW_INDEX_ROW_SHA256) != set(FINAL_NEW_EVENT_IDS):
+        return ["final index row byte authority disagrees with event IDs"]
+    path = root / ".agents/state-index/2026-08-001.csv"
+    try:
+        records = _raw_csv_record_bytes(path.read_bytes())
+    except OSError as exc:
+        return [f"final index row bytes cannot be read: {exc}"]
+    if records is None or not records:
+        return ["final index row bytes are not valid CSV records"]
+    digests = [hashlib.sha256(record).hexdigest() for record in records[1:]]
+    errors: list[str] = []
+    for event_id, expected_digest in FINAL_NEW_INDEX_ROW_SHA256.items():
+        if digests.count(expected_digest) != 1:
+            errors.append(
+                f"final index row bytes disagree with authority: {event_id}"
+            )
+    return errors
+
+
+def _final_stub_and_migration_errors(root: Path, events: list[Event]) -> list[str]:
+    errors: list[str] = []
+    stub = root / ".agents/state.md"
+    try:
+        raw_stub = stub.read_bytes()
+    except OSError as exc:
+        return [f"compatibility stub cannot be read: {exc}"]
+    if len(raw_stub) > STUB_MAX_BYTES:
+        errors.append("compatibility stub exceeds the 4 KiB limit")
+    try:
+        stub_text = raw_stub.decode("utf-8")
+    except UnicodeError as exc:
+        return [*errors, f"compatibility stub is not UTF-8: {exc}"]
+    for required in (
+        ".agents/state.csv",
+        ".agents/state-index/",
+        ".agents/state-events/",
+        ".agents/completed/state-migration-manifest.csv",
+        ARCHIVED_MIGRATION_MANIFEST,
+    ):
+        if required not in stub_text:
+            errors.append(f"compatibility stub must link {required}")
+    expected_links = [
+        FROZEN_MIGRATION_PROVENANCE.commit,
+        FINAL_MIGRATION_PROVENANCE.commit,
+    ]
+    if LEGACY_LINK_RE.findall(stub_text) != expected_links:
+        errors.append("compatibility stub disagrees with final migration provenance")
+
+    errors.extend(_historical_epoch_errors(root))
+    errors.extend(_final_index_row_errors(root))
+    final_source, source_errors = _authority_source(
+        root, FINAL_MIGRATION_PROVENANCE, "final migration snapshot"
+    )
+    errors.extend(source_errors)
+
+    manifest = root / ".agents/completed/state-migration-manifest.csv"
+    try:
+        raw_manifest = manifest.read_bytes()
+    except OSError as exc:
+        return [*errors, f"migration manifest cannot be read: {exc}"]
+    rows, csv_errors = _csv_rows(raw_manifest, MIGRATION_HEADER, str(manifest))
+    errors.extend(csv_errors)
+    if csv_errors:
+        return errors
+
+    expected_source_row = [
+        "source",
+        FINAL_MIGRATION_PROVENANCE.commit,
+        FINAL_MIGRATION_PROVENANCE.blob,
+        str(FINAL_MIGRATION_PROVENANCE.byte_count),
+        FINAL_MIGRATION_PROVENANCE.sha256,
+        "", "", "", "", "", "",
+    ]
+    if not rows or rows[0] != expected_source_row:
+        errors.append("migration manifest disagrees with final snapshot provenance")
+
+    legacy_events = {event.event_id: event for event in events if event.kind == "legacy_import"}
+    seen: set[str] = set()
+    expected_start = 0
+    reconstructed = bytearray()
+    wrapper_inventory: list[bytes] = []
+    regenerated = {*FINAL_NEW_EVENT_IDS, "STATE-20260809T130000-001"}
+    for line_number, row in enumerate(rows[1:], start=3):
+        location = f"migration manifest:{line_number}"
+        if len(row) != len(MIGRATION_HEADER):
+            errors.append(f"{location}: expected {len(MIGRATION_HEADER)} columns")
+            continue
+        if row[0] != "event":
+            errors.append(f"{location}: final manifest permits only one source row")
+            continue
+        if any(row[1:5]):
+            errors.append(f"{location}: migration event row cannot contain source provenance")
+        event_id, start_s, end_s, count_s, digest, evidence_path = row[5:]
+        if event_id in seen:
+            errors.append(f"{location}: duplicate migration event ID {event_id}")
+        seen.add(event_id)
+        event = legacy_events.get(event_id)
+        if event is None:
+            errors.append(f"{location}: migration row must name one legacy_import event")
+            continue
+        if evidence_path != event.evidence_path:
+            errors.append(f"{location}: migration evidence path disagrees with the index")
+        try:
+            start, end, count = int(start_s), int(end_s), int(count_s)
+        except ValueError:
+            errors.append(f"{location}: migration byte ranges must be integers")
+            continue
+        if start != expected_start or end <= start:
+            errors.append(f"{location}: migration ranges must be contiguous and increasing")
+        override = FINAL_BOUNDARY_OVERRIDES.get(event_id)
+        if override is not None and (start, end) != override:
+            errors.append(f"{location}: migration boundary override disagrees with authority")
+        try:
+            wrapper = (root / evidence_path).read_bytes()
+            payload = read_legacy_payload(root / evidence_path)
+        except (OSError, ValueError) as exc:
+            errors.append(f"{location}: migration payload cannot be read: {exc}")
+            expected_start = end
+            continue
+        if end - start != count or count != len(payload):
+            errors.append(f"{location}: migration payload byte count disagrees with its range")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or hashlib.sha256(payload).hexdigest() != digest:
+            errors.append(f"{location}: migration payload hash mismatch")
+        if final_source is not None and payload != final_source[start:end]:
+            errors.append(f"{location}: extracted payload differs from configured final segment")
+        if event_id not in regenerated:
+            wrapper_inventory.append(
+                f"{evidence_path},{hashlib.sha256(wrapper).hexdigest()}\n".encode("ascii")
+            )
+        reconstructed.extend(payload)
+        expected_start = end
+
+    if seen != set(legacy_events):
+        errors.append("migration manifest must cover every legacy_import event exactly once")
+    if not set(FINAL_NEW_EVENT_IDS).issubset(seen):
+        errors.append("migration manifest is missing configured concurrent events")
+    if (
+        len(wrapper_inventory) != PRESERVED_WRAPPER_COUNT
+        or hashlib.sha256(b"".join(wrapper_inventory)).hexdigest()
+        != PRESERVED_WRAPPER_INVENTORY_SHA256
+    ):
+        errors.append("preserved wrapper hash inventory disagrees with authority")
+    if final_source is not None and bytes(reconstructed) != final_source:
+        errors.append("migration manifest payloads do not reconstruct the final source")
+    return errors
+
+
 def _base_event_paths(root: Path, revision: str, manifest_rows: list[list[str]]) -> list[str]:
     paths: list[str] = []
     for row in manifest_rows:
@@ -731,7 +985,39 @@ def _base_event_paths(root: Path, revision: str, manifest_rows: list[list[str]])
     return paths
 
 
-def _git_history_errors(root: Path, base: str, shards: list[Shard]) -> list[str]:
+def _raw_csv_record_bytes(raw: bytes) -> list[bytes] | None:
+    lines = raw.splitlines(keepends=True)
+    try:
+        reader = csv.reader((line.decode("utf-8") for line in lines), strict=True)
+        records: list[bytes] = []
+        start = 0
+        for _ in reader:
+            end = reader.line_num
+            records.append(b"".join(lines[start:end]))
+            start = end
+        return records
+    except (UnicodeError, csv.Error):
+        return None
+
+
+def _preserves_raw_rows_in_order(base: bytes, current: bytes) -> bool:
+    base_records = _raw_csv_record_bytes(base)
+    current_records = _raw_csv_record_bytes(current)
+    if base_records is None or current_records is None or not base_records:
+        return False
+    if not current_records or current_records[0] != base_records[0]:
+        return False
+    cursor = iter(current_records[1:])
+    return all(any(candidate == expected for candidate in cursor) for expected in base_records[1:])
+
+
+def _git_history_errors(
+    root: Path,
+    base: str,
+    shards: list[Shard],
+    *,
+    allow_final_snapshot_insertions: bool = False,
+) -> list[str]:
     if not _git_revision_exists(root, base):
         return [f"Git base revision does not resolve: {base}"]
     base_manifest = _git_bytes(root, base, ".agents/state.csv")
@@ -769,7 +1055,11 @@ def _git_history_errors(root: Path, base: str, shards: list[Shard]) -> list[str]
         if base_bytes is None:
             errors.append(f"{path}: base index shard cannot be read")
         elif path == latest:
-            if not current_bytes.startswith(base_bytes):
+            raw_rows_preserved = (
+                allow_final_snapshot_insertions
+                and _preserves_raw_rows_in_order(base_bytes, current_bytes)
+            )
+            if not current_bytes.startswith(base_bytes) and not raw_rows_preserved:
                 errors.append(f"{path}: writable shard must be byte-preserving append-only")
         elif current_bytes != base_bytes:
             errors.append(f"{path}: sealed shard is immutable")
@@ -801,10 +1091,14 @@ def validate(
     if event_errors:
         return errors
     errors.extend(_relation_errors(root, events))
-    if migration_epochs is None:
-        if migration_provenance == FROZEN_MIGRATION_PROVENANCE:
-            migration_epochs = MIGRATION_EPOCHS
-        else:
+    final_snapshot = (
+        migration_epochs is None
+        and migration_provenance == FROZEN_MIGRATION_PROVENANCE
+    )
+    if final_snapshot:
+        errors.extend(_final_stub_and_migration_errors(root, events))
+    else:
+        if migration_epochs is None:
             migration_epochs = (
                 MigrationEpoch(
                     migration_provenance.commit,
@@ -814,12 +1108,19 @@ def validate(
                     (),
                 ),
             )
-    errors.extend(_stub_and_migration_errors(root, events, migration_epochs))
+        errors.extend(_stub_and_migration_errors(root, events, migration_epochs))
     if base is not None:
-        errors.extend(_git_history_errors(root, base, shards))
+        errors.extend(
+            _git_history_errors(
+                root,
+                base,
+                shards,
+                allow_final_snapshot_insertions=final_snapshot,
+            )
+        )
     return errors
 
 
 def validate_repository(root: Path, base_ref: str | None = None) -> list[str]:
-    """Validate the repository using the configured migration epoch authority."""
-    return validate(root, base=base_ref, migration_epochs=MIGRATION_EPOCHS)
+    """Validate the repository using the configured final snapshot authority."""
+    return validate(root, base=base_ref)

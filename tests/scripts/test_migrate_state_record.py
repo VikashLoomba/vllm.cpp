@@ -303,6 +303,24 @@ class MigrationApplyTests(unittest.TestCase):
 
 
 class MigrationVerifyTests(unittest.TestCase):
+    def final_scratch(self, directory: str) -> Path:
+        scratch = Path(directory)
+        shutil.copytree(ROOT / ".agents", scratch / ".agents")
+        spec = Path(
+            "docs/superpowers/specs/2026-08-09-state-migration-epochs-design.md"
+        )
+        (scratch / spec).parent.mkdir(parents=True)
+        shutil.copy2(ROOT / spec, scratch / spec)
+        subprocess.run(["git", "init", "-q"], cwd=scratch, check=True)
+        common_dir = subprocess.check_output(
+            ["git", "rev-parse", "--git-common-dir"], cwd=ROOT, text=True
+        ).strip()
+        common_objects = (ROOT / common_dir / "objects").resolve()
+        alternates = scratch / ".git/objects/info/alternates"
+        alternates.parent.mkdir(parents=True, exist_ok=True)
+        alternates.write_text(f"{common_objects}\n", encoding="utf-8")
+        return scratch
+
     def test_verify_allows_new_strict_shard_but_freezes_legacy_subset(self) -> None:
         """Catches treating the migration-only manifest as the whole live record."""
         with tempfile.TemporaryDirectory() as directory:
@@ -322,7 +340,7 @@ class MigrationVerifyTests(unittest.TestCase):
             alternates.parent.mkdir(parents=True, exist_ok=True)
             alternates.write_text(f"{common_objects}\n", encoding="utf-8")
 
-            event_id = "STATE-20260809T140000-001"
+            event_id = "STATE-20260809T150000-001"
             evidence_path = f".agents/state-events/2026-08/{event_id}.md"
             manifest_path = scratch / ".agents/state.csv"
             with manifest_path.open("a", newline="", encoding="utf-8") as handle:
@@ -341,7 +359,7 @@ class MigrationVerifyTests(unittest.TestCase):
                         state_record.EVENT_HEADER,
                         [
                             event_id,
-                            "2026-08-09T14:00:00Z",
+                            "2026-08-09T15:00:00Z",
                             "checkpoint",
                             "state-record-structure-1",
                             "verification",
@@ -367,7 +385,7 @@ class MigrationVerifyTests(unittest.TestCase):
             )
 
             migration = migrate_state_record.build_verification_migration(
-                scratch, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
+                scratch, "dc2139b3ff95f6de9b6a8ec8cae4bd5d40262dc7"
             )
             self.assertEqual(state_record.validate_repository(scratch), [])
             migrate_state_record.verify_migration(
@@ -456,25 +474,180 @@ class MigrationVerifyTests(unittest.TestCase):
             if path.startswith(".agents/state-index/"):
                 self.assertTrue(reconciled.artifacts[path].startswith(frozen_bytes), path)
 
-    def test_verify_accepts_reviewed_appended_source_revision(self) -> None:
-        """Catches verification that rejects reviewed append-only source epochs."""
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(MIGRATOR),
-                "--source-revision",
-                "f921062ba4fbf3341b02d2ac826bb3d84cc91a64",
-                "--output-root",
-                str(ROOT),
-                "--verify",
-            ],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=False,
+    def test_reviewed_append_epoch_builder_remains_available_for_archive(self) -> None:
+        """Catches dropping the reviewed append-epoch artifact after reconciliation."""
+        migration = migrate_state_record.build_verification_migration(
+            ROOT, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
         )
 
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            migration.artifacts[migrate_state_record.MANIFEST_PATH],
+            (ROOT / state_record.ARCHIVED_MIGRATION_MANIFEST).read_bytes(),
+        )
+
+    def test_reconciliation_accepts_the_pinned_concurrent_merge_snapshot(self) -> None:
+        """Catches treating the reviewed final merge snapshot as an append epoch."""
+        migration = migrate_state_record.build_verification_migration(
+            ROOT, "dc2139b3ff95f6de9b6a8ec8cae4bd5d40262dc7"
+        )
+
+        self.assertEqual(
+            migration.source_revision,
+            "dc2139b3ff95f6de9b6a8ec8cae4bd5d40262dc7",
+        )
+        self.assertEqual(migration.source_blob, "e79acd955e7042f9d028e18d41569ff5b67e32c3")
+        self.assertEqual(len(migration.source), 3_225_646)
+        self.assertEqual(
+            hashlib.sha256(migration.source).hexdigest(),
+            "5c389a0cd84e6834263630af9e9d5a7a64f131ef06d479670dc6e3dc942ec202",
+        )
+        self.assertEqual(
+            state_record.FINAL_BOUNDARY_OVERRIDES,
+            {
+                "STATE-20260809T001000-001": (3196620, 3197705),
+                "STATE-20260809T083000-001": (3197705, 3200170),
+                "STATE-20260809T110000-001": (3200170, 3202350),
+                "STATE-20260809T130000-001": (3202350, 3205680),
+            },
+        )
+        self.assertEqual(
+            state_record.FINAL_NEW_EVENT_IDS,
+            (
+                "STATE-20260808T210000-003",
+                "STATE-20260808T220000-002",
+                "STATE-20260808T230000-002",
+                "STATE-20260808T233000-002",
+                "STATE-20260808T234500-002",
+                "STATE-20260809T140000-001",
+                "STATE-20260809T140000-002",
+            ),
+        )
+        self.assertEqual(
+            state_record.FINAL_NEW_INDEX_ROW_SHA256,
+            {
+                "STATE-20260808T210000-003":
+                    "f6ef197bae96e5ff8d1b9e9f47c1cb3729c6f8eed3da0d28a1ac5f81b2acef3d",
+                "STATE-20260808T220000-002":
+                    "02e320a239a82ab00eeabbe3dc1d11d95e0467cfb93158460a1a87c02cd77b9b",
+                "STATE-20260808T230000-002":
+                    "6bf899ac1a80b9027ed46a9498ef738158f1bb22776673bc3258900d340a0ce9",
+                "STATE-20260808T233000-002":
+                    "60e2529de3820e8651979e12c2195c228be2b7ca5d75ca3071615a9114560b95",
+                "STATE-20260808T234500-002":
+                    "72e45c389dd8aa692eebc75949ac5f02a509b19ada919fa266760f6faa1958f8",
+                "STATE-20260809T140000-001":
+                    "4bbbe4a78b4b196a7553a07d9130ed059916c053892aaf81e72b8cb98def8b7a",
+                "STATE-20260809T140000-002":
+                    "05a03ffbc09399563a24d833d48c0d1b9df90b1c3ccaaa12b76bd87b07cd41dc",
+            },
+        )
+        segment_ranges = {
+            segment.event_id: (segment.start, segment.end)
+            for segment in migration.segments
+        }
+        for event_id, expected_range in state_record.FINAL_BOUNDARY_OVERRIDES.items():
+            self.assertEqual(segment_ranges[event_id], expected_range)
+        reconstructed = b"".join(
+            state_record.read_legacy_payload(ROOT / segment.evidence_path)
+            for segment in migration.segments
+        )
+        self.assertEqual(len(reconstructed), 3_225_646)
+        self.assertEqual(reconstructed, migration.source)
+
+        artifact_hashes = {
+            state_record.ARCHIVED_MIGRATION_MANIFEST:
+                "2f8ea0da82038cb1b297b53b2b28f93a02d2963170b13572a6f676299b439113",
+            migrate_state_record.MANIFEST_PATH:
+                "22b963c5147bb4b673330a266d0c3e5a04f5e555aca5c971ced9de9bd71db8aa",
+            ".agents/state-index/2026-08-001.csv":
+                "b7607aa343dc0feaa4beb45a4e61299ec8e7afe9401b1d350254a9d3d42e0445",
+            ".agents/state.csv":
+                "354e55c87e7724cf777f3ca20e51de80f78c859698458df3805a54d4e8e2e86a",
+            ".agents/state.md":
+                "6d875619350e4ebbd6da8fc1efb4c219bfc7944ae1c69fe41815691a5d6e373c",
+            ".agents/state-events/2026-08/STATE-20260809T130000-001.md":
+                "d86f92366e9fb3b91ebcc520f30b70788af0f8070d604fa9a5cbdd663e4ae007",
+        }
+        for path, expected_hash in artifact_hashes.items():
+            self.assertEqual(
+                hashlib.sha256(migration.artifacts[path]).hexdigest(),
+                expected_hash,
+                path,
+            )
+        preserved_wrapper_hashes = {
+            "STATE-20260809T001000-001":
+                "629faa117ce380284ee5272a04a874795cb00632422392997bffc978e5512692",
+            "STATE-20260809T083000-001":
+                "3a0338cad087a6abe80442677d6e19a0fe910128d87ed1c37563431d0acd3f32",
+            "STATE-20260809T110000-001":
+                "098a616110e62bb37771e39fd28d7237aac2b310d9d8681030dbeec3c8da54c6",
+        }
+        for event_id, expected_hash in preserved_wrapper_hashes.items():
+            path = f".agents/state-events/2026-08/{event_id}.md"
+            self.assertEqual(
+                hashlib.sha256(migration.artifacts[path]).hexdigest(), expected_hash
+            )
+
+    def test_final_reconciliation_rejects_new_live_row_byte_mutations_before_build(self) -> None:
+        """Catches deriving final raw-row authority from the mutable live index."""
+        index_relative = Path(".agents/state-index/2026-08-001.csv")
+        for event_id in state_record.FINAL_NEW_EVENT_IDS:
+            with self.subTest(event_id=event_id), tempfile.TemporaryDirectory() as directory:
+                scratch = self.final_scratch(directory)
+                index_path = scratch / index_relative
+                original = index_path.read_bytes()
+                needle = f"{event_id},".encode("ascii")
+                mutated = original.replace(
+                    needle,
+                    f'"{event_id}",'.encode("ascii"),
+                    1,
+                )
+                self.assertNotEqual(mutated, original)
+                self.assertEqual(
+                    list(csv.reader(mutated.decode("utf-8").splitlines())),
+                    list(csv.reader(original.decode("utf-8").splitlines())),
+                )
+                index_path.write_bytes(mutated)
+
+                validation_errors = state_record.validate_repository(scratch)
+                self.assertTrue(
+                    any("final index row bytes" in error for error in validation_errors),
+                    validation_errors,
+                )
+                with self.assertRaisesRegex(
+                    migrate_state_record.MigrationError,
+                    "final index row bytes",
+                ):
+                    migration = migrate_state_record.build_verification_migration(
+                        scratch,
+                        state_record.FINAL_MIGRATION_PROVENANCE.commit,
+                    )
+                    migrate_state_record.verify_migration(
+                        scratch,
+                        migration,
+                        state_record.FROZEN_MIGRATION_PROVENANCE,
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = self.final_scratch(directory)
+            index_path = scratch / index_relative
+            original = index_path.read_bytes()
+            mutated = original.replace(
+                b"STATE-20260808T210000-003,2026-08-08T21:00:00Z,",
+                b"STATE-20260808T210000-003,2026-08-08T21:00:01Z,",
+                1,
+            )
+            self.assertNotEqual(mutated, original)
+            index_path.write_bytes(mutated)
+
+            with self.assertRaisesRegex(
+                migrate_state_record.MigrationError,
+                "final index row bytes",
+            ):
+                migrate_state_record.build_verification_migration(
+                    scratch,
+                    state_record.FINAL_MIGRATION_PROVENANCE.commit,
+                )
 
     def test_epoch_authority_and_range_mutations_are_rejected(self) -> None:
         """Catches mutable tuple fields, ancestry drift, prefix edits, and bad ranges."""
@@ -497,6 +670,60 @@ class MigrationVerifyTests(unittest.TestCase):
                 with self.assertRaises(migrate_state_record.MigrationError):
                     migrate_state_record.build_verification_migration(
                         ROOT, "f921062ba4fbf3341b02d2ac826bb3d84cc91a64"
+                    )
+
+    def test_final_authority_and_each_boundary_override_mutation_are_rejected(self) -> None:
+        final = state_record.FINAL_MIGRATION_PROVENANCE
+        authority_mutations = (
+            replace(final, commit=state_record.FROZEN_MIGRATION_PROVENANCE.commit),
+            replace(final, blob="0" * 40),
+            replace(final, byte_count=final.byte_count + 1),
+            replace(final, sha256="0" * 64),
+        )
+        for mutated in authority_mutations:
+            with self.subTest(authority=mutated), mock.patch.object(
+                state_record, "FINAL_MIGRATION_PROVENANCE", mutated
+            ):
+                with self.assertRaises(migrate_state_record.MigrationError):
+                    migrate_state_record.build_verification_migration(
+                        ROOT, final.commit
+                    )
+
+    def test_archived_manifest_and_preserved_wrapper_mutations_are_rejected(self) -> None:
+        final = state_record.FINAL_MIGRATION_PROVENANCE
+        epochs = state_record.MIGRATION_EPOCHS
+        mutations = ("archive", "wrapper_metadata", "wrapper_payload")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                scratch = self.final_scratch(directory)
+                if mutation == "archive":
+                    path = scratch / state_record.ARCHIVED_MIGRATION_MANIFEST
+                    path.write_bytes(path.read_bytes() + b"X")
+                else:
+                    path = scratch / (
+                        ".agents/state-events/2026-08/"
+                        "STATE-20260809T083000-001.md"
+                    )
+                    raw = path.read_bytes()
+                    if mutation == "wrapper_metadata":
+                        path.write_bytes(raw.replace(b"# Imported", b"! Imported", 1))
+                    else:
+                        path.write_bytes(raw.replace(b"Vulkan", b"vulkan", 1))
+
+                with self.assertRaises(migrate_state_record.MigrationError):
+                    migrate_state_record.build_verification_migration(
+                        scratch, state_record.FINAL_MIGRATION_PROVENANCE.commit
+                    )
+
+        for event_id, boundary in state_record.FINAL_BOUNDARY_OVERRIDES.items():
+            mutated_overrides = dict(state_record.FINAL_BOUNDARY_OVERRIDES)
+            mutated_overrides[event_id] = (boundary[0], boundary[1] - 1)
+            with self.subTest(boundary=event_id), mock.patch.object(
+                state_record, "FINAL_BOUNDARY_OVERRIDES", mutated_overrides
+            ):
+                with self.assertRaises(migrate_state_record.MigrationError):
+                    migrate_state_record.build_verification_migration(
+                        ROOT, final.commit
                     )
 
         with mock.patch.object(

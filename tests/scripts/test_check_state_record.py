@@ -9,7 +9,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -390,40 +392,30 @@ class RelationalValidationTests(unittest.TestCase):
 
                 self.assertTrue(any("migration" in error or "compatibility stub" in error for error in errors), errors)
 
-    def test_coupled_stub_and_manifest_commit_mutation_is_rejected(self) -> None:
-        """Catches replacing both mutable provenance references with a newer commit."""
-        frozen = "994cd8d4122ecf44f72d51fabd61c45adaaea9d3"
-        replacement = "6db9ec5095ea9c7ce56184abb86d1130ee7c04c4"
-        with tempfile.TemporaryDirectory() as directory:
-            scratch = Path(directory) / "repo"
-            head = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-            ).strip()
-            subprocess.run(
-                ["git", "clone", "-q", "--shared", str(ROOT), str(scratch)],
-                check=True,
-            )
-            subprocess.run(
-                ["git", "checkout", "-q", "--detach", head],
-                cwd=scratch,
-                check=True,
-            )
-            for relative in (
-                ".agents/state.md",
-                ".agents/completed/state-migration-manifest.csv",
+    def test_frozen_and_final_provenance_authority_mutations_are_rejected(self) -> None:
+        """Catches coupling or replacing either independently pinned source role."""
+        mutations = (
+            (
+                "frozen",
+                "FROZEN_MIGRATION_PROVENANCE",
+                replace(
+                    state_record.FROZEN_MIGRATION_PROVENANCE,
+                    commit=state_record.FINAL_MIGRATION_PROVENANCE.commit,
+                ),
+            ),
+            (
+                "final",
+                "FINAL_MIGRATION_PROVENANCE",
+                replace(state_record.FINAL_MIGRATION_PROVENANCE, sha256="0" * 64),
+            ),
+        )
+        for label, attribute, value in mutations:
+            with self.subTest(role=label), mock.patch.object(
+                state_record, attribute, value
             ):
-                path = scratch / relative
-                path.write_text(
-                    path.read_text(encoding="utf-8").replace(frozen, replacement),
-                    encoding="utf-8",
-                )
+                errors = state_record.validate(ROOT)
 
-            errors = state_record.validate(scratch)
-
-            self.assertTrue(
-                any("frozen migration provenance" in error for error in errors),
-                errors,
-            )
+            self.assertTrue(any("migration" in error for error in errors), errors)
 
     def test_compatibility_stub_requires_state_index_tree_link(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

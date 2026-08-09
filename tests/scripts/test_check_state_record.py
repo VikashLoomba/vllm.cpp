@@ -21,6 +21,11 @@ import state_record
 EVENT_HEADER = state_record.EVENT_HEADER
 MANIFEST_HEADER = state_record.MANIFEST_HEADER
 MIGRATION_HEADER = (
+    "record_type",
+    "source_commit",
+    "source_blob",
+    "source_bytes",
+    "source_sha256",
     "event_id",
     "start_byte",
     "end_byte",
@@ -118,17 +123,42 @@ class StateRepo:
             + b"<!-- legacy-payload:end -->\n"
         )
         digest = hashlib.sha256(self.source_payload).hexdigest()
+        source_blob = subprocess.check_output(
+            ["git", "rev-parse", f"{self.source_revision}:.agents/state.md"],
+            cwd=self.root,
+            text=True,
+        ).strip()
         self.write_csv(
             ".agents/completed/state-migration-manifest.csv",
             MIGRATION_HEADER,
-            [[
-                event_id,
-                "0",
-                str(len(self.source_payload)),
-                str(len(self.source_payload)),
-                digest,
-                evidence_path,
-            ]],
+            [
+                [
+                    "source",
+                    self.source_revision,
+                    source_blob,
+                    str(len(self.source_payload)),
+                    digest,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ],
+                [
+                    "event",
+                    "",
+                    "",
+                    "",
+                    "",
+                    event_id,
+                    "0",
+                    str(len(self.source_payload)),
+                    str(len(self.source_payload)),
+                    digest,
+                    evidence_path,
+                ],
+            ],
         )
         (self.root / ".agents/state.md").write_text(
             "# Structured state record\n\n"
@@ -286,18 +316,44 @@ class RelationalValidationTests(unittest.TestCase):
             self.assertEqual(state_record.validate(repo.root), [])
 
     def test_migration_manifest_and_stub_are_validated(self) -> None:
-        mutations = ("stub", "hash", "range", "path")
+        mutations = (
+            "stub",
+            "hash",
+            "range",
+            "path",
+            "provenance_missing",
+            "provenance_commit",
+            "provenance_blob",
+            "provenance_size",
+            "provenance_hash",
+        )
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 repo = StateRepo(directory)
+                self.assertEqual(state_record.validate(repo.root), [])
                 if mutation == "stub":
                     (repo.root / ".agents/state.md").write_text("# old state\n")
                 else:
                     path = repo.root / ".agents/completed/state-migration-manifest.csv"
                     with path.open(newline="", encoding="utf-8") as handle:
                         rows = list(csv.reader(handle))
-                    column = {"range": 2, "hash": 4, "path": 5}[mutation]
-                    rows[1][column] = {"range": "999", "hash": "0" * 64, "path": ".agents/wrong.md"}[mutation]
+                    if mutation == "provenance_missing":
+                        del rows[1]
+                    elif mutation.startswith("provenance_"):
+                        column = {
+                            "provenance_commit": 1,
+                            "provenance_blob": 2,
+                            "provenance_size": 3,
+                            "provenance_hash": 4,
+                        }[mutation]
+                        rows[1][column] = "0" * (64 if column == 4 else 40)
+                    else:
+                        column = {"range": 7, "hash": 9, "path": 10}[mutation]
+                        rows[2][column] = {
+                            "range": "999",
+                            "hash": "0" * 64,
+                            "path": ".agents/wrong.md",
+                        }[mutation]
                     repo.write_csv(str(path.relative_to(repo.root)), MIGRATION_HEADER, rows[1:])
 
                 errors = state_record.validate(repo.root)

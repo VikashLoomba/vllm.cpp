@@ -41,10 +41,10 @@ published by GitHub Actions - lanes `-cuda`/`-vulkan`/`-cpu` plus moving `latest
 each an amd64+arm64 manifest. The image is the `ENG-RELEASE-BINARIES` staged bundle, which does not exist yet, so
 no Dockerfile, workflow or registry package is claimed. Metal/MLX are NOT-CONTAINERIZABLE. Issue #170.
 
-Protocol (2026-08-08): `agent-start.py` → claim → preflight; review FAIL →
-fresh implementer → both gates → fresh review until PASS. Dormant structured
-state validation is 17 scalar/32 total tests; live cutover unchanged. Verified
-PRs merge; obsolete ones close.
+Protocol (2026-08-09): structured-state cutover LANDED and active; 82 focused
+tests pass (42 validator/core, 18 NOW, 11 migration, 11 cutover). Review FAIL
+loops through fresh implementer and reviewer; verified PRs merge, obsolete PRs
+close.
 
 Protocol repair (2026-08-08): release AST pins pass 30 tests on Python
 3.12/3.13; Gemma-4 MoE is known drift pending the shared merged-GeGLU fold;

@@ -165,6 +165,11 @@ class MigrationApplyTests(unittest.TestCase):
             self.assertEqual(
                 manifest[0],
                 [
+                    "record_type",
+                    "source_commit",
+                    "source_blob",
+                    "source_bytes",
+                    "source_sha256",
                     "event_id",
                     "start_byte",
                     "end_byte",
@@ -173,20 +178,42 @@ class MigrationApplyTests(unittest.TestCase):
                     "evidence_path",
                 ],
             )
-            self.assertEqual(len(manifest), 5)
-            first_heading = SOURCE.index(b"## First event")
-            self.assertEqual(manifest[1][1:3], ["0", str(first_heading)])
-            self.assertEqual(manifest[1][0], "STATE-LEGACY-000001")
+            self.assertEqual(len(manifest), 6)
+            source_blob = subprocess.check_output(
+                ["git", "rev-parse", f"{repo.source_revision}:.agents/state.md"],
+                cwd=repo.root,
+                text=True,
+            ).strip()
             self.assertEqual(
-                [row[0] for row in manifest[2:4]],
+                manifest[1],
+                [
+                    "source",
+                    repo.source_revision,
+                    source_blob,
+                    str(len(SOURCE)),
+                    hashlib.sha256(SOURCE).hexdigest(),
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ],
+            )
+            first_heading = SOURCE.index(b"## First event")
+            self.assertEqual(manifest[2][6:8], ["0", str(first_heading)])
+            self.assertEqual(manifest[2][5], "STATE-LEGACY-000001")
+            self.assertEqual(
+                [row[5] for row in manifest[3:5]],
                 ["STATE-20260805T090000-001", "STATE-20260805T090000-002"],
             )
-            self.assertEqual(manifest[4][0], "STATE-LEGACY-000002")
+            self.assertEqual(manifest[5][5], "STATE-LEGACY-000002")
 
             reconstructed = bytearray()
             expected_start = 0
-            for row in manifest[1:]:
-                event_id, start_s, end_s, count_s, digest, evidence_path = row
+            for row in manifest[2:]:
+                self.assertEqual(row[:5], ["event", "", "", "", ""])
+                event_id, start_s, end_s, count_s, digest, evidence_path = row[5:]
                 start, end, count = int(start_s), int(end_s), int(count_s)
                 self.assertEqual(start, expected_start)
                 self.assertEqual(end - start, count)
@@ -237,7 +264,7 @@ class MigrationApplyTests(unittest.TestCase):
             repo = MigrationRepo(directory)
             applied = repo.run("--apply")
             self.assertEqual(applied.returncode, 0, applied.stderr)
-            event_path = repo.root / repo.manifest_rows()[1][5]
+            event_path = repo.root / repo.manifest_rows()[2][10]
             mutated = event_path.read_bytes().replace(b"Prelude", b"Tampered", 1)
             event_path.write_bytes(mutated)
 
@@ -263,6 +290,28 @@ class MigrationVerifyTests(unittest.TestCase):
 
     def test_verify_accepts_newer_revision_with_identical_source_bytes(self) -> None:
         """Current-base verification must not rewrite immutable provenance."""
+        frozen_commit = "994cd8d4122ecf44f72d51fabd61c45adaaea9d3"
+        frozen_blob = "93a8d0da802a7ea7cbea4bee3bedffb4d90459f7"
+        frozen_digest = "00c08e974724c19b5f79cce44df71c6fbfef4db32aa6acb545ef56546e3bb5e6"
+        current_blob = subprocess.check_output(
+            ["git", "rev-parse", "origin/main:.agents/state.md"],
+            cwd=ROOT,
+            text=True,
+        ).strip()
+        current_source = subprocess.check_output(
+            ["git", "show", "origin/main:.agents/state.md"], cwd=ROOT
+        )
+        self.assertEqual(current_blob, frozen_blob)
+        self.assertEqual(len(current_source), 3191283)
+        self.assertEqual(hashlib.sha256(current_source).hexdigest(), frozen_digest)
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "rev-parse", f"{frozen_commit}^{{commit}}"],
+                cwd=ROOT,
+                text=True,
+            ).strip(),
+            frozen_commit,
+        )
         with tempfile.TemporaryDirectory() as directory:
             repo = MigrationRepo(directory)
             applied = repo.run("--apply")
@@ -311,7 +360,18 @@ class MigrationVerifyTests(unittest.TestCase):
 
     def test_verify_rejects_boundary_payload_header_and_missing_file_mutations(self) -> None:
         """Catches gaps/overlaps, payload edits, schema drift, and incomplete output."""
-        mutations = ("gap", "overlap", "payload", "header", "missing")
+        mutations = (
+            "gap",
+            "overlap",
+            "payload",
+            "header",
+            "missing",
+            "provenance_missing",
+            "provenance_commit",
+            "provenance_blob",
+            "provenance_size",
+            "provenance_hash",
+        )
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 repo = MigrationRepo(directory)
@@ -320,18 +380,31 @@ class MigrationVerifyTests(unittest.TestCase):
                 manifest_path = repo.root / ".agents/completed/state-migration-manifest.csv"
                 rows = repo.manifest_rows()
                 if mutation in {"gap", "overlap"}:
-                    rows[2][1] = str(int(rows[2][1]) + (1 if mutation == "gap" else -1))
+                    rows[3][6] = str(int(rows[3][6]) + (1 if mutation == "gap" else -1))
                     with manifest_path.open("w", newline="", encoding="utf-8") as handle:
                         csv.writer(handle, lineterminator="\n").writerows(rows)
                 elif mutation == "payload":
-                    event_path = repo.root / rows[2][5]
+                    event_path = repo.root / rows[3][10]
                     event_path.write_bytes(event_path.read_bytes().replace(b"Alpha", b"Omega", 1))
                 elif mutation == "header":
                     rows[0][0] = "wrong_id"
                     with manifest_path.open("w", newline="", encoding="utf-8") as handle:
                         csv.writer(handle, lineterminator="\n").writerows(rows)
+                elif mutation == "missing":
+                    (repo.root / rows[3][10]).unlink()
                 else:
-                    (repo.root / rows[2][5]).unlink()
+                    if mutation == "provenance_missing":
+                        del rows[1]
+                    else:
+                        column = {
+                            "provenance_commit": 1,
+                            "provenance_blob": 2,
+                            "provenance_size": 3,
+                            "provenance_hash": 4,
+                        }[mutation]
+                        rows[1][column] = "0" * (64 if column == 4 else 40)
+                    with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+                        csv.writer(handle, lineterminator="\n").writerows(rows)
 
                 result = repo.run("--verify")
 

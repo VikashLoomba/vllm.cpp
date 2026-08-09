@@ -191,8 +191,10 @@ The migration is mechanical and lossless, not a semantic rewrite.
 5. Index historical entries as `kind=legacy_import`. Populate only fields
    explicitly present and mechanically unambiguous; leave missing structured
    fields empty.
-6. Emit `state-migration-manifest.csv` with event ID, source start byte, source
-   end byte, payload byte count, payload SHA-256, and evidence path.
+6. Emit `state-migration-manifest.csv` with one typed `source` row carrying the
+   exact source commit, Git blob object ID, byte count, and SHA-256, followed by
+   typed `event` rows carrying event ID, source byte range, payload byte count,
+   payload SHA-256, and evidence path.
 7. Verify that ranges are contiguous, non-overlapping, begin at byte zero, end
    at the source size, and that concatenating extracted payloads reproduces the
    original blob byte-for-byte and hash-for-hash.

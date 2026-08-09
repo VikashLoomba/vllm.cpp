@@ -52,6 +52,11 @@ REQUIRED_SECTIONS = ("Context", "Outcome", "Evidence", "Next action")
 LEGACY_BEGIN = b"<!-- legacy-payload:begin -->\n"
 LEGACY_END = b"<!-- legacy-payload:end -->\n"
 MIGRATION_HEADER = (
+    "record_type",
+    "source_commit",
+    "source_blob",
+    "source_bytes",
+    "source_sha256",
     "event_id",
     "start_byte",
     "end_byte",
@@ -359,6 +364,18 @@ def _git_bytes(root: Path, revision: str, path: str) -> bytes | None:
     return result.stdout if result.returncode == 0 else None
 
 
+def _git_blob_oid(root: Path, revision: str, path: str) -> str | None:
+    result = subprocess.run(
+        ["git", "rev-parse", f"{revision}:{path}"],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def _git_revision_exists(root: Path, revision: str) -> bool:
     return subprocess.run(
         ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
@@ -504,6 +521,35 @@ def _stub_and_migration_errors(root: Path, events: list[Event]) -> list[str]:
     if csv_errors:
         return errors
 
+    source_rows = [row for row in rows if row and row[0] == "source"]
+    if len(source_rows) != 1 or not rows or rows[0][0] != "source":
+        errors.append("migration manifest must begin with exactly one source provenance row")
+    elif len(source_rows[0]) == len(MIGRATION_HEADER):
+        (
+            _, source_commit, source_blob, source_bytes_s, source_digest,
+            *source_event_fields,
+        ) = source_rows[0]
+        if any(source_event_fields):
+            errors.append("migration source provenance row cannot contain event fields")
+        if not links or source_commit != links[0]:
+            errors.append("migration source commit disagrees with the compatibility stub")
+        expected_blob = _git_blob_oid(root, source_commit, ".agents/state.md")
+        if COMMIT_RE.fullmatch(source_blob) is None or source_blob != expected_blob:
+            errors.append("migration source blob does not match the frozen Git object")
+        try:
+            source_bytes = int(source_bytes_s)
+        except ValueError:
+            errors.append("migration source byte count must be an integer")
+            source_bytes = -1
+        if source is not None and source_bytes != len(source):
+            errors.append("migration source byte count does not match the frozen source")
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", source_digest) is None
+            or source is not None
+            and source_digest != hashlib.sha256(source).hexdigest()
+        ):
+            errors.append("migration source SHA-256 does not match the frozen source")
+
     legacy_events = {event.event_id: event for event in events if event.kind == "legacy_import"}
     seen: set[str] = set()
     expected_start = 0
@@ -513,7 +559,16 @@ def _stub_and_migration_errors(root: Path, events: list[Event]) -> list[str]:
         if len(row) != len(MIGRATION_HEADER):
             errors.append(f"{location}: expected {len(MIGRATION_HEADER)} columns")
             continue
-        event_id, start_s, end_s, count_s, digest, evidence_path = row
+        record_type, *fields = row
+        if record_type == "source":
+            continue
+        if record_type != "event":
+            errors.append(f"{location}: record type must be source or event")
+            continue
+        source_fields = fields[:4]
+        if any(source_fields):
+            errors.append(f"{location}: migration event row cannot contain source provenance")
+        event_id, start_s, end_s, count_s, digest, evidence_path = fields[4:]
         if event_id in seen:
             errors.append(f"{location}: duplicate migration event ID {event_id}")
         seen.add(event_id)

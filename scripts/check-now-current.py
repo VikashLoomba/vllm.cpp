@@ -12,7 +12,7 @@ Two obligations are enforced:
   * structure and budget, so it cannot decay into another status log;
   * freshness, so it cannot silently go stale. A newly indexed event refreshes
     NOW.md when its outcome changes the live project position. Migration-only,
-    correction-only, and already-terminal forensic events are exempt.
+    forensic corrections, and already-terminal forensic events are exempt.
 """
 
 from __future__ import annotations
@@ -115,13 +115,15 @@ def _normalize_next_action(value: str) -> str:
 
 def event_requires_refresh(event: Event, now_text: str) -> bool:
     """Whether a newly indexed event changes the live NOW projection."""
-    if event.kind in {"legacy_import", "correction"}:
+    if event.kind == "legacy_import":
         return False
-    if event.outcome not in TERMINAL_OUTCOMES:
-        return True
     subjects = [subject.lower() for subject in event.subject_ids.split(";") if subject]
     subject_is_live = any(subject in now_text.lower() for subject in subjects)
     has_follow_up = _normalize_next_action(event.next_action) not in TERMINAL_NEXT_ACTIONS
+    if event.kind == "correction" and event.outcome == "superseded":
+        return subject_is_live or has_follow_up
+    if event.outcome not in TERMINAL_OUTCOMES:
+        return True
     return subject_is_live or has_follow_up
 
 

@@ -50,6 +50,7 @@ class Segment:
 @dataclass(frozen=True)
 class Migration:
     source_revision: str
+    source_blob: str
     source: bytes
     segments: tuple[Segment, ...]
     artifacts: dict[str, bytes]
@@ -65,19 +66,26 @@ def _git(root: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
     )
 
 
-def read_source(root: Path, revision: str) -> tuple[str, bytes]:
+def read_source(root: Path, revision: str) -> tuple[str, str, bytes]:
     resolved = _git(root, "rev-parse", "--verify", f"{revision}^{{commit}}")
     if resolved.returncode != 0:
         detail = resolved.stderr.decode("utf-8", errors="replace").strip()
         raise MigrationError(f"source revision {revision!r} does not resolve: {detail}")
     full_revision = resolved.stdout.decode("ascii").strip()
+    blob = _git(root, "rev-parse", f"{full_revision}:{SOURCE_PATH}")
+    if blob.returncode != 0:
+        detail = blob.stderr.decode("utf-8", errors="replace").strip()
+        raise MigrationError(
+            f"source revision {full_revision} has no {SOURCE_PATH} blob: {detail}"
+        )
+    source_blob = blob.stdout.decode("ascii").strip()
     source = _git(root, "show", f"{full_revision}:{SOURCE_PATH}")
     if source.returncode != 0:
         detail = source.stderr.decode("utf-8", errors="replace").strip()
         raise MigrationError(
             f"source revision {full_revision} has no readable {SOURCE_PATH}: {detail}"
         )
-    return full_revision, source.stdout
+    return full_revision, source_blob, source.stdout
 
 
 def frozen_source_revision(root: Path) -> str:
@@ -100,9 +108,9 @@ def build_verification_migration(
 ) -> tuple[str, Migration]:
     """Bind current source bytes to immutable migration provenance."""
 
-    current_revision, current_source = read_source(root, requested_revision)
+    current_revision, current_blob, current_source = read_source(root, requested_revision)
     migration = build_migration(root, frozen_source_revision(root))
-    if current_source != migration.source:
+    if current_blob != migration.source_blob or current_source != migration.source:
         raise MigrationError(
             f"source revision {current_revision} differs from frozen migration source "
             f"{migration.source_revision}"
@@ -271,10 +279,23 @@ def _build_indexes(segments: tuple[Segment, ...]) -> tuple[dict[str, bytes], byt
 
 
 def build_migration(root: Path, revision: str) -> Migration:
-    full_revision, source = read_source(root, revision)
+    full_revision, source_blob, source = read_source(root, revision)
     segments = _assign_segments(segment_source(source))
     artifacts: dict[str, bytes] = {}
-    migration_rows: list[list[str]] = []
+    source_digest = hashlib.sha256(source).hexdigest()
+    migration_rows: list[list[str]] = [[
+        "source",
+        full_revision,
+        source_blob,
+        str(len(source)),
+        source_digest,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]]
     for segment in segments:
         payload = source[segment.start : segment.end]
         artifacts[segment.evidence_path] = _event_wrapper(
@@ -282,6 +303,11 @@ def build_migration(root: Path, revision: str) -> Migration:
         )
         migration_rows.append(
             [
+                "event",
+                "",
+                "",
+                "",
+                "",
                 segment.event_id,
                 str(segment.start),
                 str(segment.end),
@@ -294,7 +320,6 @@ def build_migration(root: Path, revision: str) -> Migration:
     index_artifacts, root_manifest = _build_indexes(segments)
     artifacts.update(index_artifacts)
     artifacts[".agents/state.csv"] = root_manifest
-    source_digest = hashlib.sha256(source).hexdigest()
     artifacts[SOURCE_PATH] = (
         "# Structured state record\n\n"
         "Current index: [.agents/state.csv](state.csv).\n\n"
@@ -306,7 +331,7 @@ def build_migration(root: Path, revision: str) -> Migration:
         "Frozen legacy source: "
         f"https://github.com/mudler/vllm.cpp/blob/{full_revision}/.agents/state.md\n"
     ).encode("ascii")
-    return Migration(full_revision, source, segments, artifacts)
+    return Migration(full_revision, source_blob, source, segments, artifacts)
 
 
 def _managed_paths(root: Path) -> set[str]:
@@ -369,15 +394,43 @@ def _manifest_reconstruction_errors(root: Path, migration: Migration) -> list[st
         ]
 
     errors: list[str] = []
+    source_rows = [row for row in rows if row and row[0] == "source"]
+    expected_source_row = [
+        "source",
+        migration.source_revision,
+        migration.source_blob,
+        str(len(migration.source)),
+        hashlib.sha256(migration.source).hexdigest(),
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+    ]
+    if len(source_rows) != 1 or not rows or rows[0] != expected_source_row:
+        errors.append(
+            "migration manifest must begin with exact source commit/blob/bytes/SHA-256 provenance"
+        )
     expected_start = 0
     reconstructed = bytearray()
     seen: set[str] = set()
     for line_number, row in enumerate(rows, start=2):
         location = f"{MANIFEST_PATH}:{line_number}"
         if len(row) != len(state_record.MIGRATION_HEADER):
-            errors.append(f"{location}: expected six columns")
+            errors.append(
+                f"{location}: expected {len(state_record.MIGRATION_HEADER)} columns"
+            )
             continue
-        event_id, start_s, end_s, count_s, digest, evidence_path = row
+        record_type, *fields = row
+        if record_type == "source":
+            continue
+        if record_type != "event":
+            errors.append(f"{location}: record type must be source or event")
+            continue
+        if any(fields[:4]):
+            errors.append(f"{location}: event row cannot contain source provenance")
+        event_id, start_s, end_s, count_s, digest, evidence_path = fields[4:]
         if event_id in seen:
             errors.append(f"{location}: duplicate event ID {event_id}")
         seen.add(event_id)

@@ -155,6 +155,28 @@ class FreshnessMutations(unittest.TestCase):
                     [],
                 )
 
+    def test_live_correction_without_digest_refresh_is_rejected(self) -> None:
+        for outcome in ("checkpoint", "failed", "blocked"):
+            with self.subTest(outcome=outcome):
+                errors = now.freshness_errors(
+                    {".agents/state-index/2026-08-001.csv"},
+                    [self.event(kind="correction", outcome=outcome)],
+                    now_text=VALID,
+                )
+                self.assertTrue(any("did not" in error for error in errors), errors)
+
+    def test_terminal_correction_refreshes_when_subject_is_live(self) -> None:
+        event = self.event(
+            kind="correction", outcome="closed", subjects="Thing", next_action="None"
+        )
+        self.assertTrue(
+            now.freshness_errors(
+                {".agents/state-index/2026-08-001.csv"},
+                [event],
+                now_text=VALID,
+            )
+        )
+
     def test_terminal_event_refreshes_when_subject_is_live(self) -> None:
         event = self.event(outcome="landed", subjects="Thing", next_action="None")
         self.assertTrue(

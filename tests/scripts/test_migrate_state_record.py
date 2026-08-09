@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import csv
+import contextlib
 import hashlib
+import importlib.util
+import io
 import subprocess
 import sys
 import tempfile
@@ -17,6 +20,15 @@ MIGRATOR = ROOT / "scripts/migrate-state-record.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import state_record
+
+
+MIGRATOR_SPEC = importlib.util.spec_from_file_location(
+    "migrate_state_record", MIGRATOR
+)
+assert MIGRATOR_SPEC is not None and MIGRATOR_SPEC.loader is not None
+migrate_state_record = importlib.util.module_from_spec(MIGRATOR_SPEC)
+sys.modules[MIGRATOR_SPEC.name] = migrate_state_record
+MIGRATOR_SPEC.loader.exec_module(migrate_state_record)
 
 
 SOURCE = (
@@ -56,21 +68,32 @@ class MigrationRepo:
         self.source_revision = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=self.root, text=True
         ).strip()
-
-    def run(self, mode: str, revision: str | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                sys.executable,
-                str(MIGRATOR),
-                "--source-revision",
-                revision or self.source_revision,
-                "--output-root",
-                str(self.root),
-                mode,
-            ],
+        source_blob = subprocess.check_output(
+            ["git", "rev-parse", f"{self.source_revision}:.agents/state.md"],
             cwd=self.root,
             text=True,
-            capture_output=True,
+        ).strip()
+        self.provenance = state_record.MigrationProvenance(
+            commit=self.source_revision,
+            blob=source_blob,
+            byte_count=len(source),
+            sha256=hashlib.sha256(source).hexdigest(),
+        )
+
+    def run(self, mode: str, revision: str | None = None) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            "--source-revision",
+            revision or self.source_revision,
+            "--output-root",
+            str(self.root),
+            mode,
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            returncode = migrate_state_record.main(arguments, self.provenance)
+        return subprocess.CompletedProcess(
+            arguments, returncode, stdout.getvalue(), stderr.getvalue()
         )
 
     def manifest_rows(self) -> list[list[str]]:
@@ -293,13 +316,14 @@ class MigrationVerifyTests(unittest.TestCase):
         frozen_commit = "994cd8d4122ecf44f72d51fabd61c45adaaea9d3"
         frozen_blob = "93a8d0da802a7ea7cbea4bee3bedffb4d90459f7"
         frozen_digest = "00c08e974724c19b5f79cce44df71c6fbfef4db32aa6acb545ef56546e3bb5e6"
+        identical_source_commit = "6db9ec5095ea9c7ce56184abb86d1130ee7c04c4"
         current_blob = subprocess.check_output(
-            ["git", "rev-parse", "origin/main:.agents/state.md"],
+            ["git", "rev-parse", f"{identical_source_commit}:.agents/state.md"],
             cwd=ROOT,
             text=True,
         ).strip()
         current_source = subprocess.check_output(
-            ["git", "show", "origin/main:.agents/state.md"], cwd=ROOT
+            ["git", "show", f"{identical_source_commit}:.agents/state.md"], cwd=ROOT
         )
         self.assertEqual(current_blob, frozen_blob)
         self.assertEqual(len(current_source), 3191283)

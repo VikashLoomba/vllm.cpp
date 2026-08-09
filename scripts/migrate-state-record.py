@@ -27,13 +27,6 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIME_RE = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?Z?$"
 )
-FROZEN_SOURCE_RE = re.compile(
-    rb"(?m)^Frozen legacy source: "
-    rb"https://github\.com/mudler/vllm\.cpp/blob/([0-9a-f]{40})/"
-    rb"\.agents/state\.md\r?$"
-)
-
-
 class MigrationError(RuntimeError):
     """A deterministic migration contract violation."""
 
@@ -88,28 +81,23 @@ def read_source(root: Path, revision: str) -> tuple[str, str, bytes]:
     return full_revision, source_blob, source.stdout
 
 
-def frozen_source_revision(root: Path) -> str:
-    """Return the one reviewed provenance revision embedded in the stub."""
-
-    try:
-        stub = (root / SOURCE_PATH).read_bytes()
-    except OSError as exc:
-        raise MigrationError(f"cannot read structured state stub: {exc}") from exc
-    matches = FROZEN_SOURCE_RE.findall(stub)
-    if len(matches) != 1:
-        raise MigrationError(
-            f"{SOURCE_PATH} must name exactly one frozen legacy source revision"
-        )
-    return matches[0].decode("ascii")
-
-
 def build_verification_migration(
-    root: Path, requested_revision: str
+    root: Path,
+    requested_revision: str,
+    provenance: state_record.MigrationProvenance,
 ) -> tuple[str, Migration]:
     """Bind current source bytes to immutable migration provenance."""
 
     current_revision, current_blob, current_source = read_source(root, requested_revision)
-    migration = build_migration(root, frozen_source_revision(root))
+    migration = build_migration(root, provenance.commit)
+    actual_provenance = state_record.MigrationProvenance(
+        commit=migration.source_revision,
+        blob=migration.source_blob,
+        byte_count=len(migration.source),
+        sha256=hashlib.sha256(migration.source).hexdigest(),
+    )
+    if actual_provenance != provenance:
+        raise MigrationError("Git source disagrees with frozen migration provenance")
     if current_blob != migration.source_blob or current_source != migration.source:
         raise MigrationError(
             f"source revision {current_revision} differs from frozen migration source "
@@ -467,7 +455,11 @@ def _manifest_reconstruction_errors(root: Path, migration: Migration) -> list[st
     return errors
 
 
-def verify_migration(root: Path, migration: Migration) -> None:
+def verify_migration(
+    root: Path,
+    migration: Migration,
+    provenance: state_record.MigrationProvenance,
+) -> None:
     errors: list[str] = []
     for relative, expected in sorted(migration.artifacts.items()):
         path = root / relative
@@ -481,33 +473,38 @@ def verify_migration(root: Path, migration: Migration) -> None:
     for relative in sorted(_managed_paths(root) - set(migration.artifacts)):
         errors.append(f"{relative}: unexpected generated output")
     errors.extend(_manifest_reconstruction_errors(root, migration))
-    errors.extend(state_record.validate(root))
+    errors.extend(state_record.validate(root, migration_provenance=provenance))
     if errors:
         raise MigrationError("\n".join(dict.fromkeys(errors)))
 
 
-def main() -> int:
+def main(
+    argv: list[str] | None = None,
+    provenance: state_record.MigrationProvenance = state_record.FROZEN_MIGRATION_PROVENANCE,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-revision", required=True, metavar="REV")
     parser.add_argument("--output-root", required=True, type=Path, metavar="PATH")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--verify", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     root = args.output_root.resolve()
     try:
         if args.apply:
-            migration = build_migration(root, args.source_revision)
+            requested_revision, migration = build_verification_migration(
+                root, args.source_revision, provenance
+            )
             apply_migration(root, migration)
             print(
                 f"generated {len(migration.segments)} state events from "
-                f"{migration.source_revision}"
+                f"{requested_revision} using frozen provenance {migration.source_revision}"
             )
         else:
             requested_revision, migration = build_verification_migration(
-                root, args.source_revision
+                root, args.source_revision, provenance
             )
-            verify_migration(root, migration)
+            verify_migration(root, migration, provenance)
             print(
                 f"state migration is byte-exact for {len(migration.source)} source bytes "
                 f"at {requested_revision} using frozen provenance "

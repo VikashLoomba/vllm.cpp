@@ -128,6 +128,12 @@ class StateRepo:
             cwd=self.root,
             text=True,
         ).strip()
+        self.migration_provenance = state_record.MigrationProvenance(
+            commit=self.source_revision,
+            blob=source_blob,
+            byte_count=len(self.source_payload),
+            sha256=digest,
+        )
         self.write_csv(
             ".agents/completed/state-migration-manifest.csv",
             MIGRATION_HEADER,
@@ -174,6 +180,13 @@ class StateRepo:
         )
         (self.root / ".agents/specs").mkdir(exist_ok=True)
         (self.root / ".agents/specs/state-test.md").write_text("# Test spec\n")
+
+    def validate(self, *, base: str | None = None) -> list[str]:
+        return state_record.validate(
+            self.root,
+            base=base,
+            migration_provenance=self.migration_provenance,
+        )
 
     def add_event(
         self,
@@ -228,14 +241,14 @@ class RelationalValidationTests(unittest.TestCase):
             repo = StateRepo(directory)
             repo.add_event()
 
-            self.assertEqual(state_record.validate(repo.root), [])
+            self.assertEqual(repo.validate(), [])
 
     def test_subjects_must_be_sorted_and_unique(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = StateRepo(directory)
             repo.add_event(subjects="z;a;a")
 
-            errors = state_record.validate(repo.root)
+            errors = repo.validate()
 
             self.assertTrue(any("subject IDs" in error and "sorted" in error for error in errors), errors)
 
@@ -256,7 +269,7 @@ class RelationalValidationTests(unittest.TestCase):
             duplicate[1] = "2026-08-08T14:30:00Z"
             repo.write_event_rows([duplicate], "2026-09-001")
 
-            errors = state_record.validate(repo.root)
+            errors = repo.validate()
 
             self.assertTrue(any("globally unique" in error for error in errors), errors)
 
@@ -267,7 +280,7 @@ class RelationalValidationTests(unittest.TestCase):
                 repo = StateRepo(directory)
                 repo.add_event(spec=spec)
 
-                errors = state_record.validate(repo.root)
+                errors = repo.validate()
 
                 self.assertTrue(any("spec" in error for error in errors), errors)
 
@@ -277,7 +290,7 @@ class RelationalValidationTests(unittest.TestCase):
             (repo.root / ".agents/specs/escape.md").symlink_to("/etc/passwd")
             repo.add_event(spec=".agents/specs/escape.md")
 
-            errors = state_record.validate(repo.root)
+            errors = repo.validate()
 
             self.assertTrue(any("outside the repository" in error for error in errors), errors)
 
@@ -287,7 +300,7 @@ class RelationalValidationTests(unittest.TestCase):
             orphan = repo.root / ".agents/state-events/2026-08/STATE-ORPHAN.md"
             orphan.write_text("orphan\n", encoding="utf-8")
 
-            errors = state_record.validate(repo.root)
+            errors = repo.validate()
 
             self.assertTrue(any("orphan evidence" in error for error in errors), errors)
 
@@ -302,7 +315,7 @@ class RelationalValidationTests(unittest.TestCase):
                 repo = StateRepo(directory)
                 repo.add_event(kind=kind, supersedes=supersedes)
 
-                errors = state_record.validate(repo.root)
+                errors = repo.validate()
 
                 self.assertTrue(any(expected in error for error in errors), errors)
 
@@ -313,7 +326,7 @@ class RelationalValidationTests(unittest.TestCase):
                 kind="correction", supersedes="STATE-20260801T000000-001"
             )
 
-            self.assertEqual(state_record.validate(repo.root), [])
+            self.assertEqual(repo.validate(), [])
 
     def test_migration_manifest_and_stub_are_validated(self) -> None:
         mutations = (
@@ -330,7 +343,7 @@ class RelationalValidationTests(unittest.TestCase):
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 repo = StateRepo(directory)
-                self.assertEqual(state_record.validate(repo.root), [])
+                self.assertEqual(repo.validate(), [])
                 if mutation == "stub":
                     (repo.root / ".agents/state.md").write_text("# old state\n")
                 else:
@@ -356,9 +369,44 @@ class RelationalValidationTests(unittest.TestCase):
                         }[mutation]
                     repo.write_csv(str(path.relative_to(repo.root)), MIGRATION_HEADER, rows[1:])
 
-                errors = state_record.validate(repo.root)
+                errors = repo.validate()
 
                 self.assertTrue(any("migration" in error or "compatibility stub" in error for error in errors), errors)
+
+    def test_coupled_stub_and_manifest_commit_mutation_is_rejected(self) -> None:
+        """Catches replacing both mutable provenance references with a newer commit."""
+        frozen = "994cd8d4122ecf44f72d51fabd61c45adaaea9d3"
+        replacement = "6db9ec5095ea9c7ce56184abb86d1130ee7c04c4"
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory) / "repo"
+            head = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+            ).strip()
+            subprocess.run(
+                ["git", "clone", "-q", "--shared", str(ROOT), str(scratch)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "-q", "--detach", head],
+                cwd=scratch,
+                check=True,
+            )
+            for relative in (
+                ".agents/state.md",
+                ".agents/completed/state-migration-manifest.csv",
+            ):
+                path = scratch / relative
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace(frozen, replacement),
+                    encoding="utf-8",
+                )
+
+            errors = state_record.validate(scratch)
+
+            self.assertTrue(
+                any("frozen migration provenance" in error for error in errors),
+                errors,
+            )
 
     def test_compatibility_stub_requires_state_index_tree_link(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -371,7 +419,7 @@ class RelationalValidationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            errors = state_record.validate(repo.root)
+            errors = repo.validate()
 
             self.assertTrue(
                 any(".agents/state-index/" in error for error in errors), errors
@@ -388,7 +436,7 @@ class RelationalValidationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            errors = state_record.validate(repo.root)
+            errors = repo.validate()
 
             self.assertTrue(
                 any(".agents/state-events/" in error for error in errors), errors
@@ -406,7 +454,7 @@ class GitImmutabilityTests(unittest.TestCase):
             path = repo.root / ".agents/state-events/2026-08/STATE-20260801T000000-001.md"
             path.write_bytes(path.read_bytes().replace(b"Historical", b"historical"))
 
-            errors = state_record.validate(repo.root, base=base)
+            errors = repo.validate(base=base)
 
             self.assertTrue(any("immutable evidence" in error for error in errors), errors)
 
@@ -418,7 +466,7 @@ class GitImmutabilityTests(unittest.TestCase):
             rows[0][11] = "rewritten legacy metadata"
             repo.write_event_rows(rows)
 
-            errors = state_record.validate(repo.root, base=base)
+            errors = repo.validate(base=base)
 
             self.assertTrue(any("append-only" in error for error in errors), errors)
 
@@ -431,7 +479,7 @@ class GitImmutabilityTests(unittest.TestCase):
             rows[0][11] = "rewritten legacy metadata"
             repo.write_event_rows(rows)
 
-            errors = state_record.validate(repo.root, base=pre_cutover)
+            errors = repo.validate(base=pre_cutover)
 
             self.assertTrue(any("append-only" in error for error in errors), errors)
 
@@ -449,7 +497,7 @@ class GitImmutabilityTests(unittest.TestCase):
             repo.write_csv(".agents/state.csv", MANIFEST_HEADER, rows)
             repo.write_event_rows([], "2026-07-001")
 
-            errors = state_record.validate(repo.root, base=base)
+            errors = repo.validate(base=base)
 
             self.assertTrue(any("state manifest" in error and "append-only" in error for error in errors), errors)
 
@@ -459,7 +507,7 @@ class GitImmutabilityTests(unittest.TestCase):
             base = self.structured_base(repo)
             repo.add_event()
 
-            self.assertEqual(state_record.validate(repo.root, base=base), [])
+            self.assertEqual(repo.validate(base=base), [])
 
     def test_new_shard_seals_previous_shard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -478,7 +526,7 @@ class GitImmutabilityTests(unittest.TestCase):
             old_rows[0][11] = "mutated while sealing"
             repo.write_event_rows(old_rows)
 
-            errors = state_record.validate(repo.root, base=base)
+            errors = repo.validate(base=base)
 
             self.assertTrue(any("sealed shard" in error for error in errors), errors)
 
@@ -487,17 +535,14 @@ class CliTests(unittest.TestCase):
     def test_cli_reports_valid_tree(self) -> None:
         checker = ROOT / "scripts/check-state-record.py"
         self.assertTrue(checker.exists(), "check-state-record.py is missing")
-        with tempfile.TemporaryDirectory() as directory:
-            repo = StateRepo(directory)
+        result = subprocess.run(
+            [sys.executable, str(checker), "--root", str(ROOT)],
+            text=True,
+            capture_output=True,
+        )
 
-            result = subprocess.run(
-                [sys.executable, str(checker), "--root", str(repo.root)],
-                text=True,
-                capture_output=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("structured state record", result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("structured state record", result.stdout)
 
 
 if __name__ == "__main__":

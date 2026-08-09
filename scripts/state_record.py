@@ -70,6 +70,22 @@ LEGACY_LINK_RE = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class MigrationProvenance:
+    commit: str
+    blob: str
+    byte_count: int
+    sha256: str
+
+
+FROZEN_MIGRATION_PROVENANCE = MigrationProvenance(
+    commit="994cd8d4122ecf44f72d51fabd61c45adaaea9d3",
+    blob="93a8d0da802a7ea7cbea4bee3bedffb4d90459f7",
+    byte_count=3191283,
+    sha256="00c08e974724c19b5f79cce44df71c6fbfef4db32aa6acb545ef56546e3bb5e6",
+)
+
+
 def event_order_key(event_id: str) -> tuple[int, str]:
     """Order unsortable legacy imports before timestamped event IDs."""
     return (0 if LEGACY_EVENT_ID_RE.fullmatch(event_id) else 1, event_id)
@@ -481,7 +497,11 @@ def _relation_errors(root: Path, events: list[Event]) -> list[str]:
     return errors
 
 
-def _stub_and_migration_errors(root: Path, events: list[Event]) -> list[str]:
+def _stub_and_migration_errors(
+    root: Path,
+    events: list[Event],
+    provenance: MigrationProvenance,
+) -> list[str]:
     errors: list[str] = []
     stub = root / ".agents/state.md"
     try:
@@ -507,9 +527,19 @@ def _stub_and_migration_errors(root: Path, events: list[Event]) -> list[str]:
         errors.append("compatibility stub must contain one permanent legacy Git blob link")
         source = None
     else:
-        source = _git_bytes(root, links[0], ".agents/state.md")
+        if links[0] != provenance.commit:
+            errors.append("compatibility stub disagrees with frozen migration provenance")
+        source = _git_bytes(root, provenance.commit, ".agents/state.md")
         if source is None:
             errors.append("compatibility stub legacy Git blob link does not resolve")
+        else:
+            frozen_blob = _git_blob_oid(root, provenance.commit, ".agents/state.md")
+            if frozen_blob != provenance.blob:
+                errors.append("frozen migration provenance blob does not match Git")
+            if len(source) != provenance.byte_count:
+                errors.append("frozen migration provenance byte count does not match Git")
+            if hashlib.sha256(source).hexdigest() != provenance.sha256:
+                errors.append("frozen migration provenance SHA-256 does not match Git")
 
     manifest = root / ".agents/completed/state-migration-manifest.csv"
     try:
@@ -531,11 +561,19 @@ def _stub_and_migration_errors(root: Path, events: list[Event]) -> list[str]:
         ) = source_rows[0]
         if any(source_event_fields):
             errors.append("migration source provenance row cannot contain event fields")
-        if not links or source_commit != links[0]:
-            errors.append("migration source commit disagrees with the compatibility stub")
-        expected_blob = _git_blob_oid(root, source_commit, ".agents/state.md")
-        if COMMIT_RE.fullmatch(source_blob) is None or source_blob != expected_blob:
-            errors.append("migration source blob does not match the frozen Git object")
+        expected_source_row = (
+            provenance.commit,
+            provenance.blob,
+            str(provenance.byte_count),
+            provenance.sha256,
+        )
+        if (
+            source_commit,
+            source_blob,
+            source_bytes_s,
+            source_digest,
+        ) != expected_source_row:
+            errors.append("migration manifest disagrees with frozen migration provenance")
         try:
             source_bytes = int(source_bytes_s)
         except ValueError:
@@ -671,7 +709,12 @@ def _git_history_errors(root: Path, base: str, shards: list[Shard]) -> list[str]
     return errors
 
 
-def validate(root: Path, *, base: str | None = None) -> list[str]:
+def validate(
+    root: Path,
+    *,
+    base: str | None = None,
+    migration_provenance: MigrationProvenance = FROZEN_MIGRATION_PROVENANCE,
+) -> list[str]:
     """Return all structured-record validation failures rooted at *root*."""
     root = root.resolve()
     shards, errors = parse_manifest(root)
@@ -682,7 +725,7 @@ def validate(root: Path, *, base: str | None = None) -> list[str]:
     if event_errors:
         return errors
     errors.extend(_relation_errors(root, events))
-    errors.extend(_stub_and_migration_errors(root, events))
+    errors.extend(_stub_and_migration_errors(root, events, migration_provenance))
     if base is not None:
         errors.extend(_git_history_errors(root, base, shards))
     return errors

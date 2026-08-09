@@ -219,6 +219,18 @@ def _csv_bytes(header: tuple[str, ...], rows: list[list[str]]) -> bytes:
     return output.getvalue().encode("utf-8")
 
 
+def _raw_csv_rows(raw: bytes) -> list[tuple[list[str], bytes]]:
+    lines = raw.splitlines(keepends=True)
+    reader = csv.reader((line.decode("utf-8") for line in lines), strict=True)
+    records: list[tuple[list[str], bytes]] = []
+    start = 0
+    for row in reader:
+        end = reader.line_num
+        records.append((row, b"".join(lines[start:end])))
+        start = end
+    return records
+
+
 def _assign_segments(
     ranges: tuple[tuple[int, int, str, str | None], ...]
 ) -> tuple[Segment, ...]:
@@ -648,44 +660,57 @@ def verify_migration(
         if relative == ".agents/state.csv":
             header: tuple[str, ...] = ()
             try:
-                expected_reader = csv.reader(
-                    expected.decode("utf-8").splitlines(keepends=True), strict=True
+                expected_records = _raw_csv_rows(expected)
+                expected_header = (
+                    tuple(expected_records[0][0]) if expected_records else ()
                 )
-                expected_header = tuple(next(expected_reader, ()))
-                expected_rows = [row for row in expected_reader if row]
-                migration_indexes = {row[2] for row in expected_rows}
-                actual_reader = csv.reader(
-                    actual.decode("utf-8").splitlines(keepends=True), strict=True
-                )
-                header = tuple(next(actual_reader, ()))
-                migration_rows = [
-                    row
-                    for row in actual_reader
+                expected_rows = [
+                    (row, raw) for row, raw in expected_records[1:] if row
+                ]
+                migration_indexes = {row[2] for row, _ in expected_rows}
+                actual_records = _raw_csv_rows(actual)
+                header = tuple(actual_records[0][0]) if actual_records else ()
+                actual_migration_rows = [
+                    raw
+                    for row, raw in actual_records[1:]
                     if row and len(row) > 2 and row[2] in migration_indexes
                 ]
-                actual_migration_subset = _csv_bytes(
-                    state_record.MANIFEST_HEADER, migration_rows
-                )
+                expected_migration_rows = [raw for _, raw in expected_rows]
             except (UnicodeError, csv.Error):
                 expected_header = state_record.MANIFEST_HEADER
-                actual_migration_subset = actual
+                actual_migration_rows = [actual]
+                expected_migration_rows = [expected]
             differs = (
                 header != state_record.MANIFEST_HEADER
                 or expected_header != state_record.MANIFEST_HEADER
-                or actual_migration_subset != expected
+                or actual_migration_rows != expected_migration_rows
             )
         elif relative.startswith(".agents/state-index/"):
             header: tuple[str, ...] = ()
             try:
-                reader = csv.reader(
-                    actual.decode("utf-8").splitlines(keepends=True), strict=True
+                expected_records = _raw_csv_rows(expected)
+                expected_header = (
+                    tuple(expected_records[0][0]) if expected_records else ()
                 )
-                header = tuple(next(reader, ()))
-                legacy_rows = [row for row in reader if row and len(row) > 2 and row[2] == "legacy_import"]
-                actual_import_subset = _csv_bytes(state_record.EVENT_HEADER, legacy_rows)
+                expected_import_rows = [
+                    raw for row, raw in expected_records[1:] if row
+                ]
+                actual_records = _raw_csv_rows(actual)
+                header = tuple(actual_records[0][0]) if actual_records else ()
+                actual_import_rows = [
+                    raw
+                    for row, raw in actual_records[1:]
+                    if row and len(row) > 2 and row[2] == "legacy_import"
+                ]
             except (UnicodeError, csv.Error):
-                actual_import_subset = actual
-            differs = header != state_record.EVENT_HEADER or actual_import_subset != expected
+                expected_header = state_record.EVENT_HEADER
+                actual_import_rows = [actual]
+                expected_import_rows = [expected]
+            differs = (
+                header != state_record.EVENT_HEADER
+                or expected_header != state_record.EVENT_HEADER
+                or actual_import_rows != expected_import_rows
+            )
         else:
             differs = actual != expected
         if differs:

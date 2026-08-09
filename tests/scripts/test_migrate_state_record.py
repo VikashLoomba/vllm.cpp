@@ -375,6 +375,40 @@ class MigrationVerifyTests(unittest.TestCase):
             )
 
             legacy_path = scratch / ".agents/state-index/0000-00-001.csv"
+            legacy_bytes = legacy_path.read_bytes()
+            quoted_legacy_bytes = legacy_bytes.replace(
+                b"STATE-LEGACY-000001,",
+                b'"STATE-LEGACY-000001",',
+                1,
+            )
+            manifest_bytes = manifest_path.read_bytes()
+            quoted_manifest_bytes = manifest_bytes.replace(
+                b"1,0000-00-001,",
+                b'"1",0000-00-001,',
+                1,
+            )
+            for path, original, differently_quoted in (
+                (legacy_path, legacy_bytes, quoted_legacy_bytes),
+                (manifest_path, manifest_bytes, quoted_manifest_bytes),
+            ):
+                with self.subTest(raw_row_path=path.relative_to(scratch)):
+                    self.assertNotEqual(differently_quoted, original)
+                    self.assertEqual(
+                        list(csv.reader(differently_quoted.decode("utf-8").splitlines())),
+                        list(csv.reader(original.decode("utf-8").splitlines())),
+                    )
+                    path.write_bytes(differently_quoted)
+                    try:
+                        self.assertEqual(state_record.validate_repository(scratch), [])
+                        with self.assertRaises(migrate_state_record.MigrationError):
+                            migrate_state_record.verify_migration(
+                                scratch,
+                                migration,
+                                state_record.FROZEN_MIGRATION_PROVENANCE,
+                            )
+                    finally:
+                        path.write_bytes(original)
+
             frozen_rows = list(
                 csv.reader(legacy_path.read_text(encoding="utf-8").splitlines())
             )

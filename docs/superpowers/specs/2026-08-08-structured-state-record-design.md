@@ -263,7 +263,7 @@ references; the compatibility stub directs those readers to the frozen blob.
 ## Delivery sequence
 
 The work is delivered in a new draft PR on `row/state-record-structure-1` with
-an exact, expiring PR-size waiver for the mechanical file fan-out.
+exact expiring waiver `WAIVER-PR-SIZE-002` for the mechanical file fan-out.
 
 1. **Design commit:** this approved specification only.
 2. **Dormant tooling commit:** migration generator, structured checker, and

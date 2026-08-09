@@ -1221,9 +1221,9 @@ No engine code, no kernel, no measured number changed; the scoreboard carries
 the corrected ds4 (~16.5) and Laguna (~43) denominators already on main.
 
 Agent-record repair, triage and compaction (2026-08-04). An audit found
-the rules sound but the substrate decayed. **Cold resume** was unsound (union-merged
-appends had interleaved `.agents/state.md`); entries below a marker now carry a
-sortable anchor. **Orientation** gained [.agents/NOW.md](../.agents/NOW.md).
+the rules sound but the substrate decayed. **Cold resume** was unsound under the
+former union-merged state log; the structured state record now uses ordered
+indexes and immutable events. **Orientation** gained [.agents/NOW.md](../.agents/NOW.md).
 **The operating manual** had drifted from the checker; both now carry one
 machine-readable contract. **Claim state** was triaged: only DeepSeek and
 Laguna are in flight; 54 rows left `ACTIVE`, 29 claims retired to

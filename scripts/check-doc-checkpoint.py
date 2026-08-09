@@ -383,6 +383,7 @@ GOVERNANCE_FILES = frozenset(
         "tests/scripts/test_check_state_record.py",
         "tests/scripts/test_state_record_core.py",
         "tests/scripts/test_migrate_state_record.py",
+        "tests/scripts/test_state_record_cutover.py",
         "docs/superpowers/specs/2026-08-07-internal-policy-optimization-design.md",
         ".agents/completed/pre-cutover-claim-protocol.md",
     }

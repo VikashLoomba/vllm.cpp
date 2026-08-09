@@ -398,6 +398,7 @@ class SemanticClassificationTests(unittest.TestCase):
         for path in (
             "scripts/check-now-current.py",
             "tests/scripts/test_check_now_current.py",
+            "tests/scripts/test_state_record_cutover.py",
         ):
             with self.subTest(path=path):
                 self.assertEqual(

@@ -48,6 +48,8 @@ class CheckerEvidenceMapping(unittest.TestCase):
 class PathClassification(unittest.TestCase):
     def test_each_mutable_surface_has_an_explicit_class(self) -> None:
         expected = {
+            "CLAUDE.md": "procedure",
+            "MANIFESTO.md": "public_document",
             "src/vt/x.cpp": "product",
             "scripts/check-release-binary-contract.py": "product",
             "scripts/check-policy.py": "governance_checker",
@@ -208,6 +210,18 @@ class BudgetEnforcement(unittest.TestCase):
                 waivers=(waiver, duplicate),
                 waiver_scope="pr:128",
             )
+
+    def test_repository_pr_166_waiver_is_exact(self) -> None:
+        rules = checker.load_policy(ROOT)
+        waivers = checker.load_waivers(ROOT, rules, today=dt.date(2026, 8, 8))
+        applicable = [
+            waiver
+            for waiver in waivers
+            if waiver.rule_id == "POL-PR-SIZE" and waiver.scope == "pr:166"
+        ]
+        self.assertEqual(len(applicable), 1)
+        self.assertEqual(applicable[0].waiver_id, "WAIVER-PR-SIZE-002")
+        self.assertEqual(applicable[0].expires, dt.date(2026, 8, 15))
 
     def test_binary_changes_fail_closed_instead_of_becoming_free(self) -> None:
         errors = checker.change_errors([checker.ChangedPath("docs/image.png", None, None)])

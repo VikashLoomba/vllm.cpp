@@ -97,16 +97,21 @@ def build_verification_migration(
 
     if epochs is None:
         requested = read_source(root, requested_revision, source_path)
-        final = state_record.FINAL_MIGRATION_PROVENANCE
         actual = (
             requested[0],
             requested[1],
             len(requested[2]),
             hashlib.sha256(requested[2]).hexdigest(),
         )
-        expected = (final.commit, final.blob, final.byte_count, final.sha256)
-        if actual == expected:
-            return _build_final_snapshot_migration(root, requested, source_path)
+        for final in (
+            state_record.FINAL_MIGRATION_PROVENANCE,
+            state_record.PREVIOUS_FINAL_MIGRATION_PROVENANCE,
+        ):
+            expected = (final.commit, final.blob, final.byte_count, final.sha256)
+            if actual == expected:
+                return _build_final_snapshot_migration(
+                    root, requested, source_path, final
+                )
 
     configured = epochs if epochs is not None else state_record.MIGRATION_EPOCHS
     if not configured:
@@ -506,9 +511,11 @@ def _append_epochs(
     )
 
 
-def _final_segments(source: bytes) -> tuple[Segment, ...]:
+def _final_segments(source: bytes, include_final_append: bool = False) -> tuple[Segment, ...]:
     canonical = _assign_segments(segment_source(source))
-    overrides = state_record.FINAL_BOUNDARY_OVERRIDES
+    overrides = dict(state_record.FINAL_BOUNDARY_OVERRIDES)
+    if include_final_append:
+        overrides.update(state_record.FINAL_APPEND_BOUNDARY_OVERRIDES)
     seen: set[str] = set()
     segments: list[Segment] = []
     expected_start = 0
@@ -537,11 +544,23 @@ def _final_segments(source: bytes) -> tuple[Segment, ...]:
 
 
 def _preserved_wrapper_artifacts(
-    root: Path, source: bytes, segments: tuple[Segment, ...]
+    root: Path,
+    source: bytes,
+    segments: tuple[Segment, ...],
+    include_final_append: bool,
 ) -> dict[str, bytes]:
-    regenerated = {*state_record.FINAL_NEW_EVENT_IDS, "STATE-20260809T130000-001"}
+    historical_regenerated = {
+        *state_record.FINAL_NEW_EVENT_IDS,
+        "STATE-20260809T130000-001",
+    }
+    regenerated = (
+        {state_record.FINAL_APPEND_EVENT_ID}
+        if include_final_append
+        else historical_regenerated
+    )
     artifacts: dict[str, bytes] = {}
     inventory: list[bytes] = []
+    historical_inventory: list[bytes] = []
     for segment in segments:
         if segment.event_id in regenerated:
             continue
@@ -559,15 +578,27 @@ def _preserved_wrapper_artifacts(
                 f"preserved wrapper {segment.event_id} payload differs from final segment"
             )
         artifacts[segment.evidence_path] = wrapper
-        inventory.append(
+        inventory_row = (
             f"{segment.evidence_path},{hashlib.sha256(wrapper).hexdigest()}\n".encode(
                 "ascii"
             )
         )
-    digest = hashlib.sha256(b"".join(inventory)).hexdigest()
+        inventory.append(inventory_row)
+        if segment.event_id not in historical_regenerated:
+            historical_inventory.append(inventory_row)
+    if include_final_append:
+        if (
+            len(inventory) != state_record.PREVIOUS_FINAL_WRAPPER_COUNT
+            or hashlib.sha256(b"".join(inventory)).hexdigest()
+            != state_record.PREVIOUS_FINAL_WRAPPER_INVENTORY_SHA256
+        ):
+            raise MigrationError(
+                "previous final wrapper hash inventory disagrees with authority"
+            )
     if (
-        len(inventory) != state_record.PRESERVED_WRAPPER_COUNT
-        or digest != state_record.PRESERVED_WRAPPER_INVENTORY_SHA256
+        len(historical_inventory) != state_record.PRESERVED_WRAPPER_COUNT
+        or hashlib.sha256(b"".join(historical_inventory)).hexdigest()
+        != state_record.PRESERVED_WRAPPER_INVENTORY_SHA256
     ):
         raise MigrationError("preserved wrapper hash inventory disagrees with authority")
     return artifacts
@@ -591,7 +622,9 @@ def _archived_manifest_bytes(root: Path) -> bytes:
 
 
 def _merge_final_index(
-    root: Path, segments: tuple[Segment, ...]
+    root: Path,
+    segments: tuple[Segment, ...],
+    include_final_append: bool,
 ) -> tuple[dict[str, bytes], bytes]:
     if set(state_record.FINAL_NEW_INDEX_ROW_SHA256) != set(
         state_record.FINAL_NEW_EVENT_IDS
@@ -607,6 +640,7 @@ def _merge_final_index(
         raise MigrationError("reviewed root state manifest header changed")
 
     artifacts: dict[str, bytes] = {}
+    reviewed_legacy_rows: dict[str, bytes] = {}
     by_index: dict[str, list[Segment]] = {}
     for segment in segments:
         period = segment.evidence_path.split("/")[2]
@@ -622,6 +656,13 @@ def _merge_final_index(
             raise MigrationError(f"reviewed index header changed: {index_path}")
         header_raw = records[0][1]
         raw_by_id = {row[0]: raw for row, raw in records[1:] if row}
+        if not include_final_append:
+            raw_by_id.pop(state_record.FINAL_APPEND_EVENT_ID, None)
+        reviewed_legacy_rows.update({
+            row[0]: raw
+            for row, raw in records[1:]
+            if row and len(row) > 2 and row[2] == "legacy_import"
+        })
         for segment in period_segments:
             if segment.event_id not in raw_by_id:
                 encoded = _csv_bytes(state_record.EVENT_HEADER, [_event_row(segment)])
@@ -629,6 +670,8 @@ def _merge_final_index(
             expected_digest = state_record.FINAL_NEW_INDEX_ROW_SHA256.get(
                 segment.event_id
             )
+            if segment.event_id == state_record.FINAL_APPEND_EVENT_ID:
+                expected_digest = state_record.FINAL_APPEND_INDEX_ROW_SHA256
             if (
                 expected_digest is not None
                 and hashlib.sha256(raw_by_id[segment.event_id]).hexdigest()
@@ -641,10 +684,37 @@ def _merge_final_index(
         imported_ids = {
             row[0] for row, _ in records[1:] if row and len(row) > 2 and row[2] == "legacy_import"
         }
+        if not include_final_append:
+            imported_ids.discard(state_record.FINAL_APPEND_EVENT_ID)
         if not imported_ids.issubset(expected_ids):
             raise MigrationError(f"reviewed index has unknown legacy rows: {index_path}")
         ordered = sorted(raw_by_id, key=state_record.event_order_key)
         artifacts[index_path] = header_raw + b"".join(raw_by_id[event_id] for event_id in ordered)
+
+    if include_final_append:
+        prior_inventory = []
+        for segment in sorted(
+            segments[:-1], key=lambda item: state_record.event_order_key(item.event_id)
+        ):
+            try:
+                raw = reviewed_legacy_rows[segment.event_id]
+            except KeyError as exc:
+                raise MigrationError(
+                    f"previous final index row is missing: {segment.event_id}"
+                ) from exc
+            prior_inventory.append(
+                f"{segment.event_id},{hashlib.sha256(raw).hexdigest()}\n".encode(
+                    "ascii"
+                )
+            )
+        if (
+            len(prior_inventory) != state_record.PREVIOUS_FINAL_INDEX_ROW_COUNT
+            or hashlib.sha256(b"".join(prior_inventory)).hexdigest()
+            != state_record.PREVIOUS_FINAL_INDEX_ROW_INVENTORY_SHA256
+        ):
+            raise MigrationError(
+                "previous final index row inventory disagrees with authority"
+            )
     return artifacts, root_manifest
 
 
@@ -652,12 +722,35 @@ def _build_final_snapshot_migration(
     root: Path,
     source_tuple: tuple[str, str, bytes],
     source_path: str,
+    final: state_record.MigrationProvenance,
 ) -> MigrationResult:
     revision, blob, source = source_tuple
-    final = state_record.FINAL_MIGRATION_PROVENANCE
-    segments = _final_segments(source)
-    if len(segments) != 156:
-        raise MigrationError(f"final source produced {len(segments)} events, expected 156")
+    include_final_append = final == state_record.FINAL_MIGRATION_PROVENANCE
+    if include_final_append:
+        previous = state_record.PREVIOUS_FINAL_MIGRATION_PROVENANCE
+        previous_tuple = read_source(root, previous.commit, source_path)
+        previous_actual = (
+            previous_tuple[0],
+            previous_tuple[1],
+            len(previous_tuple[2]),
+            hashlib.sha256(previous_tuple[2]).hexdigest(),
+        )
+        previous_expected = (
+            previous.commit,
+            previous.blob,
+            previous.byte_count,
+            previous.sha256,
+        )
+        if previous_actual != previous_expected or not source.startswith(previous_tuple[2]):
+            raise MigrationError(
+                "final migration snapshot does not preserve the previous final prefix"
+            )
+    segments = _final_segments(source, include_final_append)
+    expected_count = 157 if include_final_append else 156
+    if len(segments) != expected_count:
+        raise MigrationError(
+            f"final source produced {len(segments)} events, expected {expected_count}"
+        )
     present_new = tuple(
         segment.event_id
         for segment in segments
@@ -666,8 +759,17 @@ def _build_final_snapshot_migration(
     if present_new != state_record.FINAL_NEW_EVENT_IDS:
         raise MigrationError("final source concurrent event IDs disagree with authority")
 
-    artifacts = _preserved_wrapper_artifacts(root, source, segments)
-    regenerated = {*state_record.FINAL_NEW_EVENT_IDS, "STATE-20260809T130000-001"}
+    if include_final_append and segments[-1].event_id != state_record.FINAL_APPEND_EVENT_ID:
+        raise MigrationError("final appended event ID disagrees with authority")
+
+    artifacts = _preserved_wrapper_artifacts(
+        root, source, segments, include_final_append
+    )
+    regenerated = (
+        {state_record.FINAL_APPEND_EVENT_ID}
+        if include_final_append
+        else {*state_record.FINAL_NEW_EVENT_IDS, "STATE-20260809T130000-001"}
+    )
     manifest_rows = [_source_row(state_record.MigrationEpoch(
         final.commit, final.blob, final.byte_count, final.sha256, ()
     ))]
@@ -677,6 +779,14 @@ def _build_final_snapshot_migration(
             artifacts[segment.evidence_path] = _event_wrapper(
                 segment, final.commit, payload, source_path
             )
+            if (
+                segment.event_id == state_record.FINAL_APPEND_EVENT_ID
+                and hashlib.sha256(artifacts[segment.evidence_path]).hexdigest()
+                != state_record.FINAL_APPEND_WRAPPER_SHA256
+            ):
+                raise MigrationError(
+                    "final appended wrapper bytes disagree with authority"
+                )
         manifest_rows.append([
             "event", "", "", "", "", segment.event_id,
             str(segment.start), str(segment.end), str(len(payload)),
@@ -684,7 +794,9 @@ def _build_final_snapshot_migration(
         ])
     artifacts[state_record.ARCHIVED_MIGRATION_MANIFEST] = _archived_manifest_bytes(root)
     artifacts[MANIFEST_PATH] = _csv_bytes(state_record.MIGRATION_HEADER, manifest_rows)
-    index_artifacts, root_manifest = _merge_final_index(root, segments)
+    index_artifacts, root_manifest = _merge_final_index(
+        root, segments, include_final_append
+    )
     artifacts.update(index_artifacts)
     artifacts[".agents/state.csv"] = root_manifest
     artifacts[source_path] = (

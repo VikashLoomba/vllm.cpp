@@ -102,11 +102,18 @@ FROZEN_MIGRATION_PROVENANCE = MigrationProvenance(
     sha256="00c08e974724c19b5f79cce44df71c6fbfef4db32aa6acb545ef56546e3bb5e6",
 )
 
-FINAL_MIGRATION_PROVENANCE = MigrationProvenance(
+PREVIOUS_FINAL_MIGRATION_PROVENANCE = MigrationProvenance(
     commit="dc2139b3ff95f6de9b6a8ec8cae4bd5d40262dc7",
     blob="e79acd955e7042f9d028e18d41569ff5b67e32c3",
     byte_count=3225646,
     sha256="5c389a0cd84e6834263630af9e9d5a7a64f131ef06d479670dc6e3dc942ec202",
+)
+
+FINAL_MIGRATION_PROVENANCE = MigrationProvenance(
+    commit="776c56f1c8b78ab69ea01e14759187b243b24d9e",
+    blob="e266a8892401bc744955ccc1cb3bc75f64e4f399",
+    byte_count=3231342,
+    sha256="913c76a2ab8303b1b5ad7dae3ec7876c5e29f0c319670b86eb646c4baa3119b6",
 )
 
 ARCHIVED_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest-f921.csv"
@@ -118,12 +125,39 @@ PRESERVED_WRAPPER_COUNT = 148
 PRESERVED_WRAPPER_INVENTORY_SHA256 = (
     "87680b6a195552450a9f83f7711a2d352dc468ac6bcdf1650f90d711d5342b59"
 )
+PREVIOUS_FINAL_WRAPPER_COUNT = 156
+PREVIOUS_FINAL_WRAPPER_INVENTORY_SHA256 = (
+    "bcbd8bace3dbffaa23325b9a59f4b2f2e2754491b9abde7139a2c214f83cedab"
+)
+PREVIOUS_FINAL_INDEX_ROW_COUNT = 156
+PREVIOUS_FINAL_INDEX_ROW_INVENTORY_SHA256 = (
+    "00915524b22500a9e3ddb4a727f451c5057315b140241f80409eee1d825545ff"
+)
+FINAL_INDEX_ROW_COUNT = 157
+FINAL_INDEX_ROW_INVENTORY_SHA256 = (
+    "9aa5c11c5754e9412d0ea81a3f261a0e56388704eeef8778367f56ebaf7f3926"
+)
 FINAL_BOUNDARY_OVERRIDES = {
     "STATE-20260809T001000-001": (3196620, 3197705),
     "STATE-20260809T083000-001": (3197705, 3200170),
     "STATE-20260809T110000-001": (3200170, 3202350),
     "STATE-20260809T130000-001": (3202350, 3205680),
 }
+FINAL_APPEND_EVENT_ID = "STATE-20260809T150000-001"
+FINAL_APPEND_BOUNDARY_OVERRIDES = {
+    "STATE-20260809T140000-002": (3221201, 3225646),
+    FINAL_APPEND_EVENT_ID: (3225646, 3231342),
+}
+FINAL_APPEND_INDEX_ROW_SHA256 = (
+    "beb95851a72f6b15939312c2ef6e98a139155620f5578ffd8549c13901533e85"
+)
+FINAL_APPEND_WRAPPER_SHA256 = (
+    "d344a78d79bcac347617bde1ab0d0f3d42fe4dc9e504a8c60ccdb05936ddb383"
+)
+FINAL_WRAPPER_COUNT = 157
+FINAL_WRAPPER_INVENTORY_SHA256 = (
+    "5d0cd0c557bbbd7832a97bb399b27d15900ac6efb2342658a2090e341ad06c45"
+)
 FINAL_NEW_EVENT_IDS = (
     "STATE-20260808T210000-003",
     "STATE-20260808T220000-002",
@@ -822,23 +856,65 @@ def _historical_epoch_errors(root: Path) -> list[str]:
     return errors
 
 
-def _final_index_row_errors(root: Path) -> list[str]:
+def _final_index_row_errors(root: Path, events: list[Event]) -> list[str]:
     if set(FINAL_NEW_INDEX_ROW_SHA256) != set(FINAL_NEW_EVENT_IDS):
         return ["final index row byte authority disagrees with event IDs"]
-    path = root / ".agents/state-index/2026-08-001.csv"
-    try:
-        records = _raw_csv_record_bytes(path.read_bytes())
-    except OSError as exc:
-        return [f"final index row bytes cannot be read: {exc}"]
-    if records is None or not records:
-        return ["final index row bytes are not valid CSV records"]
-    digests = [hashlib.sha256(record).hexdigest() for record in records[1:]]
+    raw_by_id: dict[str, bytes] = {}
+    for path in sorted((root / ".agents/state-index").glob("*.csv")):
+        try:
+            raw = path.read_bytes()
+            records = _raw_csv_record_bytes(raw)
+            rows, csv_errors = _csv_rows(raw, EVENT_HEADER, str(path))
+        except OSError as exc:
+            return [f"final index row bytes cannot be read: {exc}"]
+        if records is None or not records or csv_errors:
+            return ["final index row bytes are not valid CSV records"]
+        for row, record in zip(rows, records[1:]):
+            if len(row) == len(EVENT_HEADER) and row[2] == "legacy_import":
+                raw_by_id[row[0]] = record
+
+    digests = [hashlib.sha256(record).hexdigest() for record in raw_by_id.values()]
     errors: list[str] = []
     for event_id, expected_digest in FINAL_NEW_INDEX_ROW_SHA256.items():
         if digests.count(expected_digest) != 1:
             errors.append(
                 f"final index row bytes disagree with authority: {event_id}"
             )
+    appended = raw_by_id.get(FINAL_APPEND_EVENT_ID)
+    if (
+        appended is None
+        or hashlib.sha256(appended).hexdigest() != FINAL_APPEND_INDEX_ROW_SHA256
+    ):
+        errors.append(
+            f"final index row bytes disagree with authority: {FINAL_APPEND_EVENT_ID}"
+        )
+
+    legacy_ids = [event.event_id for event in events if event.kind == "legacy_import"]
+    inventory: list[tuple[str, bytes]] = []
+    for event_id in legacy_ids:
+        raw = raw_by_id.get(event_id)
+        if raw is None:
+            continue
+        inventory.append((
+            event_id,
+            f"{event_id},{hashlib.sha256(raw).hexdigest()}\n".encode("ascii"),
+        ))
+    inventory_bytes = [row for _, row in inventory]
+    if (
+        len(inventory_bytes) != FINAL_INDEX_ROW_COUNT
+        or hashlib.sha256(b"".join(inventory_bytes)).hexdigest()
+        != FINAL_INDEX_ROW_INVENTORY_SHA256
+    ):
+        errors.append("final index row inventory disagrees with authority")
+    previous_inventory = [
+        row for event_id, row in inventory if event_id != FINAL_APPEND_EVENT_ID
+    ]
+    if (
+        len(previous_inventory) != PREVIOUS_FINAL_INDEX_ROW_COUNT
+        or hashlib.sha256(b"".join(previous_inventory)).hexdigest()
+        != PREVIOUS_FINAL_INDEX_ROW_INVENTORY_SHA256
+    ):
+        errors.append("previous final index row inventory disagrees with authority")
     return errors
 
 
@@ -872,11 +948,21 @@ def _final_stub_and_migration_errors(root: Path, events: list[Event]) -> list[st
         errors.append("compatibility stub disagrees with final migration provenance")
 
     errors.extend(_historical_epoch_errors(root))
-    errors.extend(_final_index_row_errors(root))
+    errors.extend(_final_index_row_errors(root, events))
     final_source, source_errors = _authority_source(
         root, FINAL_MIGRATION_PROVENANCE, "final migration snapshot"
     )
     errors.extend(source_errors)
+    previous_source, previous_source_errors = _authority_source(
+        root, PREVIOUS_FINAL_MIGRATION_PROVENANCE, "previous final migration snapshot"
+    )
+    errors.extend(previous_source_errors)
+    if (
+        final_source is not None
+        and previous_source is not None
+        and not final_source.startswith(previous_source)
+    ):
+        errors.append("final migration snapshot changes the previous final prefix")
 
     manifest = root / ".agents/completed/state-migration-manifest.csv"
     try:
@@ -904,7 +990,11 @@ def _final_stub_and_migration_errors(root: Path, events: list[Event]) -> list[st
     expected_start = 0
     reconstructed = bytearray()
     wrapper_inventory: list[bytes] = []
-    regenerated = {*FINAL_NEW_EVENT_IDS, "STATE-20260809T130000-001"}
+    previous_wrapper_inventory: list[bytes] = []
+    final_wrapper_inventory: list[bytes] = []
+    historical_regenerated = {*FINAL_NEW_EVENT_IDS, "STATE-20260809T130000-001"}
+    overrides = dict(FINAL_BOUNDARY_OVERRIDES)
+    overrides.update(FINAL_APPEND_BOUNDARY_OVERRIDES)
     for line_number, row in enumerate(rows[1:], start=3):
         location = f"migration manifest:{line_number}"
         if len(row) != len(MIGRATION_HEADER):
@@ -932,7 +1022,7 @@ def _final_stub_and_migration_errors(root: Path, events: list[Event]) -> list[st
             continue
         if start != expected_start or end <= start:
             errors.append(f"{location}: migration ranges must be contiguous and increasing")
-        override = FINAL_BOUNDARY_OVERRIDES.get(event_id)
+        override = overrides.get(event_id)
         if override is not None and (start, end) != override:
             errors.append(f"{location}: migration boundary override disagrees with authority")
         try:
@@ -948,10 +1038,19 @@ def _final_stub_and_migration_errors(root: Path, events: list[Event]) -> list[st
             errors.append(f"{location}: migration payload hash mismatch")
         if final_source is not None and payload != final_source[start:end]:
             errors.append(f"{location}: extracted payload differs from configured final segment")
-        if event_id not in regenerated:
-            wrapper_inventory.append(
-                f"{evidence_path},{hashlib.sha256(wrapper).hexdigest()}\n".encode("ascii")
-            )
+        wrapper_row = (
+            f"{evidence_path},{hashlib.sha256(wrapper).hexdigest()}\n".encode("ascii")
+        )
+        final_wrapper_inventory.append(wrapper_row)
+        if event_id != FINAL_APPEND_EVENT_ID:
+            previous_wrapper_inventory.append(wrapper_row)
+        if event_id not in historical_regenerated and event_id != FINAL_APPEND_EVENT_ID:
+            wrapper_inventory.append(wrapper_row)
+        if (
+            event_id == FINAL_APPEND_EVENT_ID
+            and hashlib.sha256(wrapper).hexdigest() != FINAL_APPEND_WRAPPER_SHA256
+        ):
+            errors.append("final appended wrapper bytes disagree with authority")
         reconstructed.extend(payload)
         expected_start = end
 
@@ -959,12 +1058,26 @@ def _final_stub_and_migration_errors(root: Path, events: list[Event]) -> list[st
         errors.append("migration manifest must cover every legacy_import event exactly once")
     if not set(FINAL_NEW_EVENT_IDS).issubset(seen):
         errors.append("migration manifest is missing configured concurrent events")
+    if FINAL_APPEND_EVENT_ID not in seen:
+        errors.append("migration manifest is missing the configured final append event")
     if (
         len(wrapper_inventory) != PRESERVED_WRAPPER_COUNT
         or hashlib.sha256(b"".join(wrapper_inventory)).hexdigest()
         != PRESERVED_WRAPPER_INVENTORY_SHA256
     ):
         errors.append("preserved wrapper hash inventory disagrees with authority")
+    if (
+        len(previous_wrapper_inventory) != PREVIOUS_FINAL_WRAPPER_COUNT
+        or hashlib.sha256(b"".join(previous_wrapper_inventory)).hexdigest()
+        != PREVIOUS_FINAL_WRAPPER_INVENTORY_SHA256
+    ):
+        errors.append("previous final wrapper hash inventory disagrees with authority")
+    if (
+        len(final_wrapper_inventory) != FINAL_WRAPPER_COUNT
+        or hashlib.sha256(b"".join(final_wrapper_inventory)).hexdigest()
+        != FINAL_WRAPPER_INVENTORY_SHA256
+    ):
+        errors.append("final wrapper hash inventory disagrees with authority")
     if final_source is not None and bytes(reconstructed) != final_source:
         errors.append("migration manifest payloads do not reconstruct the final source")
     return errors

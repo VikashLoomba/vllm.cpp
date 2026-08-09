@@ -14,6 +14,6 @@ Frozen source SHA-256: `00c08e974724c19b5f79cce44df71c6fbfef4db32aa6acb545ef5654
 
 Frozen legacy source: https://github.com/mudler/vllm.cpp/blob/994cd8d4122ecf44f72d51fabd61c45adaaea9d3/.agents/state.md
 
-Final imported source SHA-256: `5c389a0cd84e6834263630af9e9d5a7a64f131ef06d479670dc6e3dc942ec202`.
+Final imported source SHA-256: `913c76a2ab8303b1b5ad7dae3ec7876c5e29f0c319670b86eb646c4baa3119b6`.
 
-Final imported legacy source: https://github.com/mudler/vllm.cpp/blob/dc2139b3ff95f6de9b6a8ec8cae4bd5d40262dc7/.agents/state.md
+Final imported legacy source: https://github.com/mudler/vllm.cpp/blob/776c56f1c8b78ab69ea01e14759187b243b24d9e/.agents/state.md

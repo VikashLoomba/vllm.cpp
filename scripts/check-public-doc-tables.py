@@ -430,7 +430,12 @@ STATUS_RATCHET = {
     # allowlist, and both files state that authoritatively. Net -111, and
     # re-pinned byte-tight to match the convention this ratchet was set with
     # rather than quietly keeping the slack as headroom.
-    "chars": 244015,
+    #
+    # 243761 since 2026-08-09 (measured 243756): rebasing the structured-state
+    # compaction onto current main reduced the live page below the inherited
+    # cap. The cap remains byte-tight and within the <=25 convention, so that
+    # reduction cannot become untracked growth headroom.
+    "chars": 243761,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

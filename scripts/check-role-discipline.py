@@ -77,6 +77,18 @@ def git(*args: str) -> str:
     ).strip()
 
 
+def is_integration_path(path: str) -> bool:
+    """Return whether path is an explicit record, checker, or CI surface."""
+
+    return bool(
+        path in INTEGRATION_FILES
+        or STRUCTURED_STATE_PATH.fullmatch(path)
+        or CHECKER_PATH.fullmatch(path)
+        or CHECKER_TEST_PATH.fullmatch(path)
+        or CI_PATH.fullmatch(path)
+    )
+
+
 def is_feature_path(path: str) -> bool:
     candidate = PurePosixPath(path)
     if (
@@ -88,13 +100,7 @@ def is_feature_path(path: str) -> bool:
         or any(part in {"", ".", ".."} for part in candidate.parts)
     ):
         return True
-    if (
-        path in INTEGRATION_FILES
-        or STRUCTURED_STATE_PATH.fullmatch(path)
-        or CHECKER_PATH.fullmatch(path)
-        or CHECKER_TEST_PATH.fullmatch(path)
-        or CI_PATH.fullmatch(path)
-    ):
+    if is_integration_path(path):
         return False
     return path in FEATURE_FILES or path.startswith(FEATURE_PREFIXES)
 

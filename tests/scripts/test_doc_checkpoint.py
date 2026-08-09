@@ -405,6 +405,16 @@ class SemanticClassificationTests(unittest.TestCase):
                     doc_checkpoint.classify_changed_paths([path]), {"governance"}
                 )
 
+    def test_public_document_checker_and_mutations_are_governance(self) -> None:
+        for path in (
+            "scripts/check-public-doc-tables.py",
+            "tests/scripts/test_check_public_doc_tables.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    doc_checkpoint.classify_changed_paths([path]), {"governance"}
+                )
+
 
 class RequiredSurfaceTests(unittest.TestCase):
     def assertMissing(self, paths: set[str], surface: str) -> None:

@@ -325,6 +325,12 @@ class BudgetEnforcement(unittest.TestCase):
         )
         self.assertTrue(any("test_policy_contract.py" in error for error in errors), errors)
 
+    def test_agent_record_checker_uses_its_existing_mutation_suite(self) -> None:
+        self.assertEqual(
+            checker.recognized_evidence("scripts/check-agent-record.py"),
+            "tests/scripts/test_agent_record.py",
+        )
+
     def test_exact_technical_checker_is_bound_to_checker_change_policy(self) -> None:
         rules = checker.load_policy(ROOT)
         self.assertEqual(
@@ -438,6 +444,17 @@ class BudgetEnforcement(unittest.TestCase):
                         "abc123", ["parent"], "direct", "", [path]
                     )
                 )
+
+    def test_role_checker_classifies_structured_state_as_integration(self) -> None:
+        role = checker.load_role_discipline()
+        for path in (
+            ".agents/state.csv",
+            ".agents/state-index/2026-08-001.csv",
+            ".agents/state-events/2026-08/STATE-20260808T120000-001.md",
+            ".agents/completed/state-migration-manifest.csv",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(role.is_integration_path(path))
 
     def test_pending_pr_range_requires_the_exact_event_head(self) -> None:
         role = checker.load_role_discipline()

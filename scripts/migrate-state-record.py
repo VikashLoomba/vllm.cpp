@@ -1067,6 +1067,20 @@ def verify_migration(
         raise MigrationError("\n".join(dict.fromkeys(errors)))
 
 
+def _authority_description(
+    migration: MigrationResult, provenance: state_record.MigrationProvenance
+) -> str:
+    if (
+        provenance == state_record.FROZEN_MIGRATION_PROVENANCE
+        and migration.source_revision != provenance.commit
+    ):
+        return (
+            f"final/current snapshot authority {migration.source_revision}; "
+            f"frozen provenance {provenance.commit}"
+        )
+    return f"frozen provenance {migration.source_revision}"
+
+
 def main(
     argv: list[str] | None = None,
     provenance: state_record.MigrationProvenance = state_record.FROZEN_MIGRATION_PROVENANCE,
@@ -1097,19 +1111,20 @@ def main(
                 root, args.source_revision, epochs=configured_epochs
             )
             apply_migration(root, migration)
+            authority = _authority_description(migration, provenance)
             print(
                 f"generated {len(migration.segments)} state events from "
-                f"{requested_revision} using frozen provenance {migration.source_revision}"
+                f"{requested_revision} using {authority}"
             )
         else:
             migration = build_verification_migration(
                 root, args.source_revision, epochs=configured_epochs
             )
             verify_migration(root, migration, provenance)
+            authority = _authority_description(migration, provenance)
             print(
                 f"state migration is byte-exact for {len(migration.source)} source bytes "
-                f"at {requested_revision} using frozen provenance "
-                f"{migration.source_revision}"
+                f"at {requested_revision} using {authority}"
             )
     except (MigrationError, OSError) as exc:
         print(f"state migration failed: {exc}", file=sys.stderr)

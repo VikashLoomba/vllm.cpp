@@ -662,6 +662,31 @@ class MigrationVerifyTests(unittest.TestCase):
         )
         self.assertEqual(reconstructed, migration.source)
 
+    def test_verify_reports_final_snapshot_and_frozen_provenance_roles(self) -> None:
+        """Catches presenting the live snapshot as the frozen historical source."""
+        final_revision = "776c56f1c8b78ab69ea01e14759187b243b24d9e"
+        frozen_revision = "994cd8d4122ecf44f72d51fabd61c45adaaea9d3"
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            returncode = migrate_state_record.main(
+                [
+                    "--source-revision",
+                    final_revision,
+                    "--output-root",
+                    str(ROOT),
+                    "--verify",
+                ]
+            )
+
+        self.assertEqual(returncode, 0, stderr.getvalue())
+        self.assertIn(
+            f"final/current snapshot authority {final_revision}", stdout.getvalue()
+        )
+        self.assertIn(f"frozen provenance {frozen_revision}", stdout.getvalue())
+        self.assertNotIn(f"frozen provenance {final_revision}", stdout.getvalue())
+
     def test_post_final_append_mutations_are_rejected(self) -> None:
         """Catches raw-row, boundary, wrapper, and coupled-authority drift."""
         event_id = state_record.FINAL_APPEND_EVENT_ID
@@ -957,6 +982,10 @@ class MigrationVerifyTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("byte-exact", result.stdout)
+            self.assertIn(
+                f"using frozen provenance {repo.source_revision}", result.stdout
+            )
+            self.assertNotIn("final/current snapshot authority", result.stdout)
 
     def test_verify_accepts_newer_revision_with_identical_source_bytes(self) -> None:
         """Current-base verification must not rewrite immutable provenance."""

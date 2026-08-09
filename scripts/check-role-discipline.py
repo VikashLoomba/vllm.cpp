@@ -49,7 +49,7 @@ ROLE_DISCIPLINE_SINCE: str | None = "44e8225cf95fff12de6c5d4f3c3b4ecc9f0b1f94"
 # Set to the cutover commit SHA to govern INTEGRATION paths too, so that every
 # tracked path must arrive on a task branch. None = report only. A commit cannot
 # name its own SHA, so this names the commit that introduced the behaviour.
-WORKTREE_DISCIPLINE_SINCE: str | None = None
+WORKTREE_DISCIPLINE_SINCE: str | None = "f236ca96088cce64eadc7c794a73033e2c4ec177"
 
 # Product code. A change here must arrive through a reviewed row/* PR.
 FEATURE_PREFIXES = (

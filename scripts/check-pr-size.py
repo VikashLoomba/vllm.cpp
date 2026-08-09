@@ -244,6 +244,7 @@ CREATION_MUTATIONS = {
     "scripts/check-policy.py": DISABLED_CREATION_CHECKER,
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
+    "scripts/check-state-record.py": DISABLED_CREATION_CHECKER,
 }
 EVIDENCE_TIMEOUT_SECONDS = 120
 TEST_COUNT = re.compile(r"Ran ([0-9]+) tests? in ")

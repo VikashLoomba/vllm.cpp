@@ -257,6 +257,7 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-policy.py",
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
+            "scripts/check-state-record.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

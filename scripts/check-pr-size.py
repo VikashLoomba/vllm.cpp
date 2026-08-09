@@ -213,6 +213,13 @@ CREATED_CHECKER_RULES = {
         "POL-PR-SIZE",
     ),
 }
+# Task-specific technical contract checkers do not become repository-policy
+# authorities. Their changes are nevertheless mutation-bound by the policy that
+# governs checker changes. Keep this declaration exact so an unknown checker
+# still fails closed instead of inheriting a directory-wide exemption.
+TECHNICAL_CHECKER_CHANGE_RULES = {
+    "scripts/check-release-binary-contract.py": ("POL-CHECKER-CHANGE",),
+}
 DISABLED_CREATION_CHECKER = (
     b"#!/usr/bin/env python3\n"
     b'\"\"\"Deliberately disabled creation-contract mutation.\"\"\"\n'
@@ -508,7 +515,10 @@ def affected_policy_rules(
             if checker_path in {part.strip() for part in rule.enforcement.split(";")}
         )
     )
-    declared = CREATED_CHECKER_RULES.get(checker_path, ())
+    declared = (
+        CREATED_CHECKER_RULES.get(checker_path, ())
+        + TECHNICAL_CHECKER_CHANGE_RULES.get(checker_path, ())
+    )
     rule_ids = tuple(sorted(set(direct) | set(declared)))
     if not rule_ids:
         raise ValueError(f"{checker_path} has no affected POL rule mapping")

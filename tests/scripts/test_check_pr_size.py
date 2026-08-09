@@ -324,6 +324,19 @@ class BudgetEnforcement(unittest.TestCase):
         )
         self.assertTrue(any("test_policy_contract.py" in error for error in errors), errors)
 
+    def test_exact_technical_checker_is_bound_to_checker_change_policy(self) -> None:
+        rules = checker.load_policy(ROOT)
+        self.assertEqual(
+            checker.affected_policy_rules(
+                "scripts/check-release-binary-contract.py", rules, ROOT
+            ),
+            ("POL-CHECKER-CHANGE",),
+        )
+        with self.assertRaisesRegex(ValueError, "no affected POL rule mapping"):
+            checker.affected_policy_rules(
+                "scripts/check-unregistered-contract.py", rules, ROOT
+            )
+
     def test_numstat_parser_rejects_malformed_negative_and_duplicate_paths(self) -> None:
         for text in (
             "1\t2\n",

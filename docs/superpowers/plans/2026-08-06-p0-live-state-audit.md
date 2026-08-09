@@ -48,7 +48,7 @@ Copied from `AGENTS.md`, `.agents/coordination.md` and `.agents/specs/issue-nati
 | `tests/scripts/test_audit_live_rows.py` (create) | Unit + mutation suite for the classifier and the shipped-matrix integration |
 | `.agents/specs/live-state-audit-2026-08-06.md` (create) | The audit findings artifact — the evidence justifying every correction |
 | `.agents/*-matrix.md` (modify, Task 6) | The corrections themselves, one commit per matrix |
-| `.agents/state.md` (modify, Task 6) | Append-only checkpoint entry |
+| `.agents/state-index/<writable-shard>.csv`, `.agents/state-events/<YYYY-MM>/<event-id>.md` (create/modify, Task 6) | Ordered index row plus immutable checkpoint evidence |
 | `scripts/agent-preflight.sh:50-63` (modify, Task 7) | Register the new mutation suite and the gate |
 | `.github/workflows/ci.yml:42-46` (modify, Task 7) | Run the gate and its mutation suite in CI |
 
@@ -1045,7 +1045,8 @@ EOF
 **Files:**
 - Modify: `.agents/engine-matrix.md`, `.agents/model-matrix.md`, `.agents/kernel-matrix.md`, `.agents/quantization-matrix.md`, `.agents/backend-matrix.md`, `.agents/feature-matrix.md`, `.agents/sglang-matrix.md` (only those with corrections)
 - Modify: `.agents/roadmap_v1.md` (only if a corrected row has a portfolio row)
-- Modify: `.agents/state.md`, `.agents/NOW.md`, `docs/STATUS.md`
+- Modify: `.agents/state-index/<writable-shard>.csv`, `.agents/NOW.md`, `docs/STATUS.md`
+- Create: `.agents/state-events/<YYYY-MM>/<event-id>.md`
 
 **Interfaces:**
 - Consumes: the **Proposed corrections** section of `.agents/specs/live-state-audit-2026-08-06.md`.
@@ -1155,7 +1156,8 @@ git commit -F - <<'EOF'
 record(state): live-state audit checkpoint — the ACTIVE claim set is now true
 
 49 rows claimed ACTIVE simultaneously; the audit reconciled them against
-branches and commits. Portfolio, state log, NOW and STATUS move together.
+branches and commits. Portfolio, structured state indexes, immutable event
+evidence, NOW and STATUS move together.
 
 FOLLOWING_AGENTS_PROTOCOL
 Assisted-by: Claude Code:claude-opus-5 [ClaudeCode]

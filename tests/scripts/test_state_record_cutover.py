@@ -31,6 +31,9 @@ STALE_INSTRUCTIONS = (
         r"(?i)append(?:ing)?[^\n]{0,80}(?:\.agents/)?state\.md"
     ),
     re.compile(r"(?i)append-only[^\n]{0,80}(?:state\.md|state (?:log|tail))"),
+    re.compile(r"(?i)append-only checkpoint entry"),
+    re.compile(r"(?i)modify:[^\n]{0,80}\.agents/state\.md[^\n]{0,80}\.agents/NOW\.md"),
+    re.compile(r"(?i)portfolio,\s*state log,\s*NOW"),
 )
 
 EXCLUDED_AGENT_RECORDS = frozenset(
@@ -114,6 +117,9 @@ class ActiveReferenceAudit(unittest.TestCase):
             "Write below state-order:enforced-below.",
             "Append one .agents/state.md entry.",
             "Keep the append-only state tail current.",
+            "| `.agents/state.md` (modify) | Append-only checkpoint entry |",
+            "- Modify: `.agents/state.md`, `.agents/NOW.md`, `docs/STATUS.md`",
+            "Portfolio, state log, NOW and STATUS move together.",
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

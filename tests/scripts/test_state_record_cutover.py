@@ -32,9 +32,36 @@ STALE_INSTRUCTIONS = (
     ),
     re.compile(r"(?i)append-only[^\n]{0,80}(?:state\.md|state (?:log|tail))"),
     re.compile(r"(?i)append-only checkpoint entry"),
-    re.compile(r"(?i)modify:[^\n]{0,80}\.agents/state\.md[^\n]{0,80}\.agents/NOW\.md"),
+    re.compile(r"(?i)state-log entry"),
+    re.compile(r"(?i)state log(?=[\"'])"),
+    re.compile(r"(?i)state\.md`?\s*\("),
+    re.compile(r"(?i)modify:[^\n]{0,160}\.agents/state\.md"),
+    re.compile(r"(?i)record (?:each|every) decision in `.agents/state\.md`"),
+    re.compile(r"(?i)\|[^\n]*\.agents/state\.md[^\n]*\|\s*Record\s*\|"),
     re.compile(r"(?i)portfolio,\s*state log,\s*NOW"),
 )
+
+HISTORICAL_REFERENCE_LINES = {
+    ".agents/porting-inventory.md": (
+        "    `.agents/state.md` (2026-07-09 \"portable async-pipeline EXHAUSTED\").",
+    ),
+    ".agents/specs/developer-agent-protocol-entrypoint.md": (
+        "  `.agents/state.md` (same-change checkpoint record).",
+    ),
+    ".agents/specs/issue-native-tracking.md": (
+        "**Rejected: full conversion.** Moving `state.md` (36,277 lines) and",
+    ),
+    "docs/superpowers/plans/2026-07-03-m0.3-parity-harness.md": (
+        "- Tolerances per state-log breadcrumbs: rmsnorm/silu standard paths "
+        "compute in f32 vs upstream's dtype rounding → compare with bf16-eps "
+        "tolerance (`atol=8e-3, rtol=8e-3`) on bf16 cases, tight "
+        "(`atol=1e-5, rtol=1e-5`) on f32 cases; RoPE long-position cases need "
+        "position-scaled tolerance (upstream f32 cos/sin cache drifts ~1e-2 at "
+        "pos 131k) — use `atol=2e-2` for the pos≥32k case, tight for short "
+        "positions.",
+        "drift — see .agents/state.md 2026-07-03 note).",
+    )
+}
 
 EXCLUDED_AGENT_RECORDS = frozenset(
     {
@@ -86,13 +113,20 @@ def stale_reference_errors(root: Path, paths: list[Path] | None = None) -> list[
     errors: list[str] = []
     for path in active_files(root) if paths is None else paths:
         text = path.read_text(encoding="utf-8")
-        for pattern in STALE_INSTRUCTIONS:
-            match = pattern.search(text)
-            if match is not None:
+        relative = path.relative_to(root).as_posix()
+        descriptive_lines = set(HISTORICAL_REFERENCE_LINES.get(relative, ()))
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if line in descriptive_lines:
+                continue
+            for pattern in STALE_INSTRUCTIONS:
+                match = pattern.search(line)
+                if match is None:
+                    continue
                 errors.append(
-                    f"{path.relative_to(root)} retains obsolete state instruction "
+                    f"{relative}:{line_number} retains obsolete state instruction "
                     f"{match.group(0)!r}"
                 )
+                break
     return errors
 
 
@@ -119,6 +153,11 @@ class ActiveReferenceAudit(unittest.TestCase):
             "Keep the append-only state tail current.",
             "| `.agents/state.md` (modify) | Append-only checkpoint entry |",
             "- Modify: `.agents/state.md`, `.agents/NOW.md`, `docs/STATUS.md`",
+            "Append a state-log entry.",
+            'git commit -m "docs: update state log"',
+            "Records: roadmap; state.md (NEXT: resume work).",
+            "record each decision in `.agents/state.md`",
+            "| `.agents/backend-matrix.md`, `.agents/state.md` | Record | Modify |",
             "Portfolio, state log, NOW and STATUS move together.",
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -126,6 +165,39 @@ class ActiveReferenceAudit(unittest.TestCase):
             target = root / "AGENTS.md"
             for mutation in mutations:
                 with self.subTest(mutation=mutation):
+                    target.write_text(mutation, encoding="utf-8")
+                    self.assertTrue(stale_reference_errors(root, [target]))
+
+    def test_exact_historical_references_remain_descriptive(self) -> None:
+        for relative, references in HISTORICAL_REFERENCE_LINES.items():
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            for reference in references:
+                with self.subTest(path=relative, reference=reference):
+                    self.assertEqual(text.count(reference), 1)
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        target = root / relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(reference, encoding="utf-8")
+                        self.assertEqual(stale_reference_errors(root, [target]), [])
+
+    def test_historical_reference_exemption_does_not_hide_instructions(self) -> None:
+        mutations = (
+            (
+                "docs/superpowers/plans/2026-07-03-m0.3-parity-harness.md",
+                "- Tolerances per state-log entry: preserve the values.",
+            ),
+            (
+                ".agents/specs/developer-agent-protocol-entrypoint.md",
+                "- Modify: `.agents/state.md` (same-change checkpoint record).",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative, mutation in mutations:
+                with self.subTest(path=relative, mutation=mutation):
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(mutation, encoding="utf-8")
                     self.assertTrue(stale_reference_errors(root, [target]))
 

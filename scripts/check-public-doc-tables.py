@@ -492,13 +492,27 @@ STATUS_RATCHET = {
     # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
     # from 243556, the only direction this number may move.
     #
-    # 243525 since 2026-08-10 (measured 243525): ENG-RELEASE-CONTAINERS owes the
-    # page a lifecycle line (cpu image gated e2e, nothing published), and it was
-    # paid for inside the release paragraph rather than out of the page -- the
-    # two release paragraphs collapsed into one and the startup-latency
-    # restatement dropped, since docs/BENCHMARKS.md carries that number with
-    # more detail. Net -1. Strictly DOWN, the only direction this may move.
-    "chars": 243525,
+    # 243512 since 2026-08-10 (measured 243512, #277): the metrics paragraph and
+    # the OpenAI-server row both carried a claim that had become FALSE -- that
+    # the async serving path has no live metric backing. Wiring it (the AsyncLLM
+    # output handler now folds each step's stats into the logger) RETIRES a
+    # residual rather than adding one, so the correction is a net deletion:
+    # "metrics and cache reset lack live async backing" loses its first subject,
+    # and "the async production-serving path wiring" leaves the remaining-work
+    # list. Net -30 against whatever main's concurrent re-pins leave (243554 at
+    # each rebase); re-pinned byte-tight to the merged measurement.
+    #
+    # 243455 since 2026-08-10 (measured, #213): the 35B row folded the
+    # superseded VT_ASYNC_EXECUTOR Option A negative A/B into the ledger and
+    # collapsed the mid-band narrative to its binding result. Strictly DOWN.
+    #
+    # 243454 since 2026-08-10 (measured 243454): ENG-RELEASE-CONTAINERS owes the
+    # page a lifecycle line (cpu image gated end to end, nothing published), and
+    # it was paid for inside the release paragraph rather than out of the page --
+    # the two release paragraphs collapsed into one and the startup-latency
+    # restatement dropped, since docs/BENCHMARKS.md carries that number with more
+    # detail. Strictly DOWN, the only direction this may move.
+    "chars": 243454,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

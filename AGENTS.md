@@ -245,6 +245,15 @@ Assisted-by: AGENT:MODEL [TOOL]
 AI tools never add `Signed-off-by` or `Co-Authored-By`. The human submitter owns
 and reviews the change.
 
+That applies to the commit that LANDS, which is not the one you wrote. A GitHub
+squash composes its own message from the PR title and body, so the branch's
+trailers never reach `main` and the PR run cannot catch it — the squash does not
+exist yet while those checks run. Pass the message explicitly
+(`gh pr merge --squash --subject ... --body ...`, or a local merge commit) and
+the trailers survive. `AGENTS.md`'s own `Assisted-by` grammar is
+`AGENT:MODEL [TOOL]` with no space in the agent field: `Claude-Code:...`, not
+`Claude Code:...`.
+
 Keep each PR within its reviewed budget, classifying policy, checker, doc,
 script, test, CI, generated, and product paths explicitly. Never hide mutable
 files behind a blanket directory exemption.

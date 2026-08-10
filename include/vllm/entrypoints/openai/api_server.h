@@ -206,6 +206,13 @@ class ApiServer {
     video_runner_ = std::move(runner);
   }
 
+  // Serve a static directory at /ui (examples/server/webui holds a single-file
+  // H3 console). ADDITIVE and OPT-IN like the seams above: unset => nothing is
+  // mounted and the server is byte-identical to before. It is a pure CLIENT of
+  // the same /v1/videos endpoints curl would drive -- mounting a page grants no
+  // capability the ABI does not already expose.
+  void set_webui_dir(std::string dir) { webui_dir_ = std::move(dir); }
+
   // Attach the transcription seam backing POST /v1/audio/transcriptions.
   // ADDITIVE and OPT-IN like the video runner above: absent => route
   // unregistered => 404, byte-identical to a server without ASR. The callback
@@ -296,6 +303,7 @@ class ApiServer {
   // Opt-in C8 backings (all nullptr/empty by default → routes not registered).
   const v1::metrics::PrometheusStatLogger* metrics_ = nullptr;
   ::vllm::openai::VideoRunner video_runner_;
+  std::string webui_dir_;
   TranscribeFn transcriber_;
   EmbedFn embedder_;
   mutable ::vllm::openai::VideoJobStore video_jobs_;

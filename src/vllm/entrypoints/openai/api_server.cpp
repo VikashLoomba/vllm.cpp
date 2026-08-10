@@ -995,6 +995,17 @@ void ApiServer::register_routes() {
              [this, write](const httplib::Request&, httplib::Response& res) {
                write(handle_models(), res);
              });
+  // The optional static console. Mounted BEFORE the API routes so a stray file
+  // can never shadow one: httplib checks handlers first, and /ui is a distinct
+  // prefix regardless.
+  if (!webui_dir_.empty()) {
+    if (!server.set_mount_point("/ui", webui_dir_)) {
+      std::fprintf(stderr, "server: --webui directory not found: %s\n", webui_dir_.c_str());
+    } else {
+      std::fprintf(stderr, "server: web console at /ui (from %s)\n", webui_dir_.c_str());
+    }
+  }
+
   server.Get("/health",
              [this, write](const httplib::Request&, httplib::Response& res) {
                write(handle_health(), res);

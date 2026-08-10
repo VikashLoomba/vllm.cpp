@@ -164,6 +164,7 @@ struct Args {
   std::string video_encoder, video_tokenizer;
   int video_encoder_max_layers = 50;
   std::string video_ffmpeg = "ffmpeg", video_device = "cuda";
+  std::string webui_dir;  // --webui DIR => the static console at /ui
   std::string video_partition;  // served partition (fl2va|ref2va); see the #77 guard
   // Keep-quant is the library seam's DEFAULT arm; --video-dequant-bf16 selects
   // the bf16 dequant/stream arm (the throughput trade the gen example ships).
@@ -240,6 +241,7 @@ struct Args {
          "               [--enable-force-include-usage]\n"
          "               [--enable-tokenizer-info-endpoint]\n"
          "               [--enable-server-dev-mode]\n"
+         "               [--webui DIR]   serve a static console at /ui\n"
          "               [--verbose]\n"
          "               [--enable-thinking|--no-enable-thinking]\n"
          "               [--enable-log-requests|--disable-log-requests]\n"
@@ -329,6 +331,8 @@ Args ParseArgs(int argc, char** argv) {
       a.video_workdir = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-ffmpeg") {
       a.video_ffmpeg = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--webui") {
+      a.webui_dir = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-device") {
       a.video_device = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-partition") {
@@ -844,6 +848,12 @@ int VllmServerMain(int argc, char** argv) {
     oai::ApiServer server(completion, chat, models, vllm::Version(),
                           static_cast<size_t>(args.max_num_seqs),
                           worker_pool_mode);
+
+    // The static console (opt-in), mounted at /ui. Deliberately NOT gated on
+    // --video-dit: a user who passes --webui and gets a silent 404 because an
+    // unrelated flag was missing has no way to tell a broken build from a
+    // missing argument. The page itself reports whether the video routes exist.
+    if (!args.webui_dir.empty()) server.set_webui_dir(args.webui_dir);
 
     // ── C8 opt-in utility/admin endpoints (SERVE-UTILITY-ENDPOINTS /
     // SERVE-ADMIN). Wire the setters from the LIVE engine + tokenizer through the

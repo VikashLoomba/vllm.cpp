@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-08-10 -->
+<!-- now-updated: 2026-08-09 -->
 
 Snapshot, not log. History is git; evidence:
 [parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
@@ -31,8 +31,8 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
-| Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Hosted eight-tuple dry run; rebase/push |
-| Containers `#170` | **cpu image GATED e2e**; found+fixed #312 SIGTERM | W6: arm64 + GB10; nothing pushed |
+| Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
+| Containers `#170` | **cpu image GATED e2e**; #312 SIGTERM fixed | W6: arm64 + GB10; none pushed |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
 
 In-flight, default-OFF, not pushed: see the row's spec.

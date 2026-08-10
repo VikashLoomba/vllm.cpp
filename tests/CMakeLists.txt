@@ -1312,6 +1312,8 @@ target_include_directories(test_qwen27_spec_decode_concurrent PRIVATE
 # battery through the paged engine and checks per-(prompt,pos) set membership vs
 # the vLLM 0.25.0 oracle's K-run greedy set (STRICT where vLLM is deterministic).
 # Checkpoint-gated, dgx-only; skips on CPU/CI when the snapshot/goldens are absent.
+vllm_cpp_add_test(test_moe_two_engines vllm/models/test_moe_two_engines.cpp)
+target_include_directories(test_moe_two_engines PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3coder_paged_engine vllm/models/test_qwen3coder_paged_engine.cpp)
 target_compile_definitions(test_qwen3coder_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

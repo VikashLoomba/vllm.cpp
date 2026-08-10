@@ -1,9 +1,10 @@
 # Published container images on GHCR
 
-Status: spike spec for `ENG-RELEASE-CONTAINERS`, accepted design, no
-implementation. No image, workflow, registry package, or pull is claimed to
-exist. The row may leave `INVENTORIED` on this document; it may not enter
-`ACTIVE` until W1 lands.
+Status: accepted design and IMPLEMENTED for W1-W5 and W7. The `cpu` lane is
+built and gated end to end on a real image; `vulkan` and `cuda` are implemented
+and gated statically but have not been built on this box. **No image has been
+pushed: the GHCR package does not exist, and no lane has runtime evidence on
+matching accelerator hardware (W6).**
 
 Pins: vLLM parity source `555967922`; vllm.cpp baseline
 `24306364ab8beaed9197604a042a56aaccfde493`; issue
@@ -387,13 +388,62 @@ wrong reason is not evidence that the gate works.
 
 | Work | Deps | Deliverable | Exit gate |
 |---|---|---|---|
-| W1 | — | `docker/Dockerfile` cpu target + builder, runtime stage, entrypoint/user/volumes/labels; `release/container-matrix.json` and its checker | local `docker build --target cpu` for the host arch; staged tree matches `package-server.py`'s allowlist; container smoke green; matrix checker red-first tested |
-| W2 | W1 | cuda and vulkan targets: builder bases, `JOBS` threading, CUDA runtime-lib copy and notices, BuildKit-safe driver stub, software ICD in the vulkan builder | both targets build locally; the release scripts' own validation passes inside the build; ten-SM `cuobjdump` inventory intact in the image |
-| W3 | W1 | image layout audit and container smoke as scripts with red-first mutation tests | mutating the staged tree, the uid, a missing `ffmpeg`, or a version mismatch each fail for the named reason |
-| W4 | W1, W2, W3 | `.github/workflows/containers.yml` with the seven stages, plus `scripts/check-container-workflow.py` and its mutation suite | dry run proves no push occurs; permission-widening, PR-push, and immutable-tag-reuse mutations red |
-| W5 | W4 | multi-arch manifest assembly, digest push, provenance attestation, two-part SBOM, retention | dry run produces both architecture digests and a manifest locally; attestation verifies against the manifest digest |
-| W6 | W5 | matching-hardware runtime evidence: GB10 arm64-cuda real-model request; both-arch cpu baseline execution; Thor Tegra determination | per-tuple evidence recorded independently; no tuple inherits another's result |
-| W7 | W6 | docs and first publication: `docs/USAGE.md` run recipes, `docs/FEATURES.md` lane surface, `README.md` quick start, `docs/STATUS.md` + `.agents/NOW.md` on the lifecycle move | published tags match the matrix; every documented command runs against the published bytes |
+| W1 (DONE) | — | `docker/Dockerfile` cpu target + builder, runtime stage, entrypoint/user/volumes/labels; `release/container-matrix.json` and its checker | local `docker build --target cpu` for the host arch; staged tree matches `package-server.py`'s allowlist; container smoke green; matrix checker red-first tested |
+| W2 (DONE) | W1 | cuda and vulkan targets: builder bases, `JOBS` threading, CUDA runtime-lib copy and notices, BuildKit-safe driver stub, software ICD in the vulkan builder | both targets build locally; the release scripts' own validation passes inside the build; ten-SM `cuobjdump` inventory intact in the image |
+| W3 (DONE) | W1 | image layout audit and container smoke as scripts with red-first mutation tests | mutating the staged tree, the uid, a missing `ffmpeg`, or a version mismatch each fail for the named reason |
+| W4 (DONE) | W1, W2, W3 | `.github/workflows/containers.yml` with the seven stages, plus `scripts/check-container-workflow.py` and its mutation suite | dry run proves no push occurs; permission-widening, PR-push, and immutable-tag-reuse mutations red |
+| W5 (DONE) | W4 | multi-arch manifest assembly, digest push, provenance attestation, two-part SBOM, retention | dry run produces both architecture digests and a manifest locally; attestation verifies against the manifest digest |
+| W6 (OPEN) | W5 | matching-hardware runtime evidence: GB10 arm64-cuda real-model request; both-arch cpu baseline execution; Thor Tegra determination | per-tuple evidence recorded independently; no tuple inherits another's result |
+| W7 (DONE except publication) | W6 | docs and first publication: `docs/USAGE.md` run recipes, `docs/FEATURES.md` lane surface, `README.md` quick start, `docs/STATUS.md` + `.agents/NOW.md` on the lifecycle move | published tags match the matrix; every documented command runs against the published bytes |
+
+
+## Outcome
+
+Measured on 2026-08-10, x86_64, Docker 29.1.2, from `docker/Dockerfile --target cpu`.
+
+**The cpu lane works end to end.** A 783 MB image built from the release
+scripts; `scripts/validate-container-image.py` passes config, layout and boot:
+`/health` 200, `/version` 200, the image's own declared healthcheck passing
+inside the container, and a clean SIGTERM. The boot leg ran against
+`opt-125m-bf16-st`, so this is real runtime evidence for `linux/amd64` cpu and
+for nothing else.
+
+**The gate found a real product bug on its first run, which is the whole reason
+it boots the server rather than running `--help` (issue #312).** `vllm-server`
+installed no `SIGTERM` handler. As container PID 1 the kernel does not apply
+default signal dispositions, so the signal was ignored outright: `docker stop`
+waited its full 30 s grace and then `SIGKILL`ed, exit 137. Fixed by a self-pipe
+handler that routes both `SIGTERM` and `SIGINT` into the same `server.stop()`
+the existing `VT_BENCH_PROFILE_CONTROL` FIFO shutdown already used, installed at
+all three `listen()` sites. **RED 137 after 30 s -> GREEN exit 0 in 0.25 s.**
+Every orchestrator restart, rolling update and `compose down` was hard-killing
+the server and dropping in-flight requests; it was invisible outside a container
+because a non-PID-1 process dies on the default disposition anyway.
+
+**Two build-context bugs, both silent.** `.dockerignore`'s `**/build*/` also
+matched *files* -- Docker does not honour a trailing slash as directories-only
+the way `.gitignore` does -- so `scripts/build-*-release.sh` was excluded from
+the context and the build failed with `not found` after appearing to copy the
+tree. And the builders needed `file` and `binutils`: the release scripts end in
+`validate-release-archive.py`, which refuses to certify an archive it cannot
+inspect, so a missing inspector failed the build *after* a full compile.
+
+**What the design got right, and what it cost.** Calling the release scripts
+rather than restating cmake flags meant the ten-SM list and the CPU tier gates
+were never written twice, and the image inherited the extracted-archive audit
+for free. The price was paid in builder dependencies -- qemu-user and a
+SHA256-pinned Intel SDE for the CPU tier legs, a software Vulkan ICD because the
+accelerator script *runs* `test_vulkan_backend` -- each of which is a real
+requirement of the gate being inherited, not incidental weight. `-j 2` was
+hardcoded in both scripts and is now a `JOBS` parameter.
+
+**Not established, and not claimed.** No image is published. `cuda` and
+`vulkan` have never been built here: they are gated by the matrix checker and
+the workflow guard, which prove structure, not that they compile. The arm64 legs
+are unbuilt, so the SBSA-vs-Tegra question (Thor `sm_110`, Orin `sm_87`) is
+exactly as open as it was. The boot gate needs a model, so hosted CI runs config
+and layout only and reports the absence of runtime evidence rather than
+implying it -- W6 is where that closes.
 
 ## Stop conditions
 

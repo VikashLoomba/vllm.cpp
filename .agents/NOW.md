@@ -31,7 +31,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Hosted eight-tuple dry run; rebase/push |
-| Containers `#170` | **READY**: [spec](specs/container-images.md); 3 GHCR lanes | W1: cpu lane + matrix |
+| Containers `#170` | **cpu image GATED e2e**; found+fixed #312 SIGTERM | W6: arm64 + GB10; nothing pushed |
 | Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
 
 In-flight, default-OFF, not pushed: see the row's spec.

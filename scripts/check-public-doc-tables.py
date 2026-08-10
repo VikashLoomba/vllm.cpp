@@ -491,7 +491,14 @@ STATUS_RATCHET = {
     # ~100% GPU-busy reading) into the binding result, both of which are now
     # carried durably by docs/BENCHMARKS.md's canonical rows. Strictly DOWN
     # from 243556, the only direction this number may move.
-    "chars": 243526,
+    #
+    # 243525 since 2026-08-10 (measured 243525): ENG-RELEASE-CONTAINERS owes the
+    # page a lifecycle line (cpu image gated e2e, nothing published), and it was
+    # paid for inside the release paragraph rather than out of the page -- the
+    # two release paragraphs collapsed into one and the startup-latency
+    # restatement dropped, since docs/BENCHMARKS.md carries that number with
+    # more detail. Net -1. Strictly DOWN, the only direction this may move.
+    "chars": 243525,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

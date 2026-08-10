@@ -152,6 +152,27 @@ def validate(text: str) -> list[str]:
                 "untrusted input until it does"
             )
 
+    # The reduced pull-request matrix must never reach a push. publish takes the
+    # full release matrix, computed with --release, so a lane skipped on PRs is
+    # still built and validated before it ships.
+    plan_block = blocks["plan"]
+    # Match the publish= assignment exactly. Looking for "--build-matrix
+    # --release" anywhere in the job passes on the verify branch's own use of
+    # the flag, which is how the first version of this check failed to notice
+    # the publish matrix losing it.
+    if 'publish=$(python3 scripts/container_tags.py --build-matrix --release)' not in plan_block:
+        errors.append(
+            "the plan job must compute the publish matrix with --release: the "
+            "reduced pull-request matrix must never decide what gets published"
+        )
+    if "fromJSON(needs.plan.outputs.publish_matrix)" not in publish:
+        errors.append(
+            "the publish job must consume publish_matrix, not the reduced "
+            "verify_matrix"
+        )
+    if "fromJSON(needs.plan.outputs.verify_matrix)" not in verify_block:
+        errors.append("the verify job must consume verify_matrix")
+
     promote = blocks["promote"]
     if "container_tags.py" not in promote:
         errors.append(

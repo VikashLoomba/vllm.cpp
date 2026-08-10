@@ -445,6 +445,22 @@ exactly as open as it was. The boot gate needs a model, so hosted CI runs config
 and layout only and reports the absence of runtime evidence rather than
 implying it -- W6 is where that closes.
 
+### Pull-request scope, and why it is not a hole
+
+A release run builds every lane on both architectures. A pull request builds a
+reduced set -- `cpu` and `vulkan` on amd64 -- declared per lane in the matrix as
+`verify_on_pull_request`. The reason is cost, not confidence: a ten-SM fat CUDA
+image does not fit a hosted runner budget on every push, and a gate that
+expensive becomes one people route around.
+
+It is not a publication hole. `publish` consumes the FULL release matrix, and
+rebuilds and revalidates each lane immediately before pushing it, so the worst
+outcome a reduced pull-request matrix can produce is a failed release run --
+never a published image that was not validated. `check-container-workflow.py`
+enforces exactly that: the plan job must compute the publish matrix with
+`--release`, and `publish` must consume `publish_matrix` rather than the reduced
+one.
+
 ## Stop conditions
 
 - The image and the published archive are ever described as the same bytes.

@@ -261,6 +261,35 @@ class ReleasePipelineContract(unittest.TestCase):
         errors = self.checker.validate(WORKFLOW.read_text(encoding="utf-8"))
         self.assertEqual(errors, [])
 
+    def test_every_artifact_download_uses_flat_extraction(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("          merge-multiple: true", original)
+        mutant = original.replace(
+            "          merge-multiple: true",
+            "          merge-multiple: false",
+            1,
+        )
+        self.assertIn(
+            "every artifact download must flatten into its declared path",
+            self.checker.validate(mutant),
+        )
+
+    def test_flat_extraction_cannot_be_compensated_by_an_upload(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        mutant = original.replace(
+            "          merge-multiple: true",
+            "          merge-multiple: false",
+            1,
+        ).replace(
+            "          overwrite: false",
+            "          merge-multiple: true\n          overwrite: false",
+            1,
+        )
+        self.assertIn(
+            "every artifact download must flatten into its declared path",
+            self.checker.validate(mutant),
+        )
+
     def test_hosted_packagers_resolve_their_runtime_dependencies(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(

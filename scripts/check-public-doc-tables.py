@@ -505,13 +505,13 @@ STATUS_RATCHET = {
     # 243455 since 2026-08-10 (measured, #213): the 35B row folded the
     # superseded VT_ASYNC_EXECUTOR Option A negative A/B into the ledger and
     # collapsed the mid-band narrative to its binding result. Strictly DOWN.
+    # 243431 since 2026-08-11 (measured 243431): the #213 post-lever binding
+    # numbers replace the pre-lever narrative in the 27B cell. Strictly DOWN
+    # from 243451.
     #
-    # 243450 since 2026-08-10 (measured 243450): ENG-RELEASE-CONTAINERS owes the
-    # page a lifecycle line (cpu image gated end to end, nothing published), paid
-    # for inside the release paragraph -- the two release paragraphs collapsed
-    # into one and the startup-latency restatement dropped, since
-    # docs/BENCHMARKS.md carries that number with more detail. Strictly DOWN.
-    "chars": 243450,
+    # 243399 since 2026-08-10 (measured, #213): the gemv build-verify row folded a
+    # superseded allowlist clause into the binding result. Strictly DOWN.
+    "chars": 243399,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

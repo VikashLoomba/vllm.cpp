@@ -37,9 +37,9 @@ Cold start: `MEASURED`. Load (#150): 27B bf16 loads **1.54x warm / 1.61x cold**,
 
 Releases: W1-W11/W13 are implemented in #196; local CPU, Vulkan, archive,
 metadata and mutation gates are green, while the hosted eight-tuple dry run and
-tagged publication stay pending, so no binary is published. Container images
-(#170): the cpu lane passes its gate end to end; cuda/vulkan unbuilt here;
-nothing is published. See [RELEASES](RELEASES.md).
+tagged publication stay pending, so no binary is published. Container
+images (#170): the cpu lane passes its gate; nothing is published.
+See [RELEASES](RELEASES.md).
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
 append preserved prior 156 wrappers/rows. Archive/new raw-row mutation guards bind.

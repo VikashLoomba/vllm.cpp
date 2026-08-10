@@ -213,6 +213,28 @@ class ApiServer {
   // capability the ABI does not already expose.
   void set_webui_dir(std::string dir) { webui_dir_ = std::move(dir); }
 
+  // Video-engine LIFECYCLE, so one process can serve every H3 task. The two H3
+  // partitions are separate ~20 GB checkpoints and each refuses the other's
+  // tasks, so a server pinned to one can only ever do two of the three
+  // modalities. These let the running server drop the loaded DiT and bring up
+  // another WITHOUT a restart.
+  //
+  // `status` reports what is loaded; `swap` unloads and loads, returning an
+  // error string (empty on success). Both ADDITIVE and OPT-IN: unset => the
+  // routes are unregistered => 404, exactly as before.
+  //
+  // A swap is MINUTES (the weights are tens of GB). The handler runs it
+  // synchronously and the caller waits; that is honest, and the alternative --
+  // a background reload with the old engine still answering -- would silently
+  // serve the wrong partition for the duration.
+  using VideoEngineStatusFn = std::function<std::string()>;                 // JSON
+  using VideoEngineSwapFn = std::function<std::string(const std::string& dit,
+                                                      const std::string& partition)>;
+  void set_video_engine_control(VideoEngineStatusFn status, VideoEngineSwapFn swap) {
+    video_engine_status_ = std::move(status);
+    video_engine_swap_ = std::move(swap);
+  }
+
   // Attach the transcription seam backing POST /v1/audio/transcriptions.
   // ADDITIVE and OPT-IN like the video runner above: absent => route
   // unregistered => 404, byte-identical to a server without ASR. The callback
@@ -304,6 +326,8 @@ class ApiServer {
   const v1::metrics::PrometheusStatLogger* metrics_ = nullptr;
   ::vllm::openai::VideoRunner video_runner_;
   std::string webui_dir_;
+  VideoEngineStatusFn video_engine_status_;
+  VideoEngineSwapFn video_engine_swap_;
   TranscribeFn transcriber_;
   EmbedFn embedder_;
   mutable ::vllm::openai::VideoJobStore video_jobs_;

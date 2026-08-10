@@ -870,6 +870,20 @@ int VllmServerMain(int argc, char** argv) {
     // file keeps exactly what an example may own: flag plumbing, the job
     // directory, and the ONE process spawn (ffmpeg, ratified 2026-08-03 — the
     // library builds the argv and spawns nothing). ────────────────────────────
+    // The loaded DiT lives in a SWAPPABLE slot. H3 ships two partitions that
+    // each refuse the other's tasks, so a server pinned to one checkpoint can
+    // only ever serve two of the three modalities; POST /v1/videos/engine drops
+    // the current weights and brings up another set without a restart.
+    //
+    // A render takes a shared_ptr COPY for its whole duration, so a swap while a
+    // job is in flight cannot free the engine under it -- the old weights stay
+    // alive until that job returns, then release.
+    struct VideoEngineSlot {
+      std::mutex m;
+      std::shared_ptr<vllm::multimodal::MiniMaxH3VideoEngine> engine;
+      vllm::multimodal::MiniMaxH3VideoModelParams params;  // what produced `engine`
+    };
+    auto slot = std::make_shared<VideoEngineSlot>();
     std::shared_ptr<vllm::multimodal::MiniMaxH3VideoEngine> video_engine;
     if (!args.video_dit.empty()) {
       std::cerr << "server: loading MiniMax-H3 video checkpoints...\n";
@@ -887,6 +901,11 @@ int VllmServerMain(int argc, char** argv) {
       vmp.dequant_bf16 = args.video_dequant_bf16 ? 1 : 0;
       vmp.encoder_max_layers = args.video_encoder_max_layers;
       video_engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(vmp);
+      {
+        std::lock_guard<std::mutex> lk(slot->m);
+        slot->engine = video_engine;
+        slot->params = vmp;
+      }
       std::cerr << "server: /v1/videos on (device=" << args.video_device
                 << (args.video_dequant_bf16 ? ", dequant-bf16" : ", keep-quant") << ")\n";
       // HONEST LIMIT, stated at startup rather than buried: turning a PROMPT
@@ -905,13 +924,19 @@ int VllmServerMain(int argc, char** argv) {
       auto counter = std::make_shared<std::atomic<int64_t>>(0);
       const std::string workdir = args.video_workdir;
       const std::string ffmpeg = args.video_ffmpeg;
-      server.set_video_runner([video_engine, counter, workdir,
+      server.set_video_runner([slot, counter, workdir,
                                ffmpeg](const vllm::openai::VideoRequest& req) -> std::string {
         const int64_t id = counter->fetch_add(1);
         const std::string dir = workdir + "/job" + std::to_string(id);
         // The library-owned request mapping + generation: conditioning, task
         // resolution, the #77 partition guard, reference encoding, artifacts.
-        const vllm::multimodal::MiniMaxH3VideoResult out = video_engine->Generate(
+        std::shared_ptr<vllm::multimodal::MiniMaxH3VideoEngine> eng;
+        {
+          std::lock_guard<std::mutex> lk(slot->m);
+          eng = slot->engine;
+        }
+        if (!eng) throw std::runtime_error("no video engine is loaded");
+        const vllm::multimodal::MiniMaxH3VideoResult out = eng->Generate(
             vllm::multimodal::MiniMaxH3VideoGenParamsFromRequest(req, dir));
         // The ONE process spawn: exec the argv the library composed.
         std::vector<std::string> argv_mux = out.mux_argv;
@@ -922,6 +947,51 @@ int VllmServerMain(int argc, char** argv) {
         }
         return out.mux_output_path;
       });
+
+      // Engine lifecycle for the console: report what is loaded, and swap it.
+      server.set_video_engine_control(
+          [slot]() -> std::string {
+            std::lock_guard<std::mutex> lk(slot->m);
+            return nlohmann::json{
+                {"loaded", slot->engine != nullptr},
+                {"dit", slot->params.dit_path},
+                {"partition", slot->params.partition},
+                {"device", slot->params.device == 1 ? "cuda" : "cpu"},
+                {"dequant_bf16", slot->params.dequant_bf16 != 0}}.dump();
+          },
+          [slot](const std::string& dit, const std::string& partition) -> std::string {
+            vllm::multimodal::MiniMaxH3VideoModelParams next;
+            {
+              std::lock_guard<std::mutex> lk(slot->m);
+              next = slot->params;  // keep the VAEs, encoder, tokenizer, device
+            }
+            next.dit_path = dit;
+            next.partition = partition;
+            try {
+              // UNLOAD FIRST. These checkpoints are ~20 GB quantised and ~66 GB
+              // dequantised; holding the old one while building the new one is
+              // what makes this box OOM, and an OOM here takes the whole
+              // machine down rather than failing the request.
+              {
+                std::lock_guard<std::mutex> lk(slot->m);
+                slot->engine.reset();
+              }
+              std::shared_ptr<vllm::multimodal::MiniMaxH3VideoEngine> fresh =
+                  vllm::multimodal::MiniMaxH3VideoEngine::Load(next);
+              {
+                std::lock_guard<std::mutex> lk(slot->m);
+                slot->engine = fresh;
+                slot->params = next;
+              }
+              std::cerr << "server: video engine swapped to " << partition << " (" << dit << ")\n";
+              return std::string();
+            } catch (const std::exception& e) {
+              // The slot is now EMPTY and says so: /v1/videos will refuse with
+              // "no video engine is loaded" rather than quietly serving the
+              // partition the caller just asked to leave.
+              return std::string("load failed: ") + e.what();
+            }
+          });
     }
 
     oai::UtilityEndpointOptions endpoint_opts;

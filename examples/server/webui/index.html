@@ -113,6 +113,21 @@
   <form class="panel" id="f">
     <h1>H3 console<small id="srv">checking server…</small></h1>
 
+    <fieldset id="engwrap" hidden>
+      <legend>Loaded checkpoint</legend>
+      <p class="hint" id="engnow">—</p>
+      <div class="grid2">
+        <input id="engdit" placeholder="/path/to/DiT.gguf">
+        <select id="engpart">
+          <option value="fl2va">fl2va</option>
+          <option value="ref2va">ref2va</option>
+        </select>
+      </div>
+      <button type="button" class="go" id="engswap" style="font-size:13px;padding:9px">Swap checkpoint</button>
+      <p class="hint">Unloads the current weights first, then loads these. Minutes,
+        and the server answers nothing video-shaped until it finishes.</p>
+    </fieldset>
+
     <fieldset>
       <legend>Mode</legend>
       <div class="modes" role="group">
@@ -301,6 +316,36 @@ $("#f").onsubmit = async ev => {
     $("#go").textContent = "Render";
   } finally { go.disabled = false; }
 };
+
+async function refreshEngine(){
+  try{
+    const r = await fetch("/v1/videos/engine");
+    if(!r.ok) return;                       // route absent => server has no video support
+    const e = await r.json();
+    $("#engwrap").hidden = false;
+    $("#engnow").innerHTML = e.loaded
+      ? `<b>${e.partition}</b> · ${e.device}${e.dequant_bf16?" · bf16":""}<br>${e.dit}`
+      : "<b>nothing loaded</b> — swap one in below";
+    if(!$("#engdit").value && e.dit) $("#engdit").value = e.dit;
+    if(e.partition) $("#engpart").value = e.partition;
+  }catch(_){}
+}
+$("#engswap").onclick = async () => {
+  const b = $("#engswap"); const dit = $("#engdit").value.trim();
+  if(!dit){ alert("give the DiT path on the server"); return; }
+  if(!confirm("Unload the current checkpoint and load:\n\n"+dit+"\n\nThis takes minutes.")) return;
+  b.disabled = true; b.textContent = "Loading… (minutes)";
+  try{
+    const r = await fetch("/v1/videos/engine", {method:"POST",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({dit, partition: $("#engpart").value})});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    await refreshEngine();
+  }catch(e){ alert(e.message); }
+  finally{ b.disabled = false; b.textContent = "Swap checkpoint"; }
+};
+refreshEngine();
 
 fetch("/health").then(r => r.ok ? fetch("/version") : Promise.reject())
   .then(r => r.json())

@@ -1070,6 +1070,50 @@ void ApiServer::register_routes() {
   if (video_runner_) {
     // MiniMax-H3. Registered ONLY when a runner is attached, so a server built
     // without video support answers 404 exactly as before.
+    // Engine lifecycle, so one process can serve every H3 task rather than the
+    // two its loaded partition happens to cover.
+    if (video_engine_status_) {
+      server.Get("/v1/videos/engine",
+                 [this](const httplib::Request&, httplib::Response& res) {
+                   res.set_content(video_engine_status_(), "application/json");
+                 });
+    }
+    if (video_engine_swap_) {
+      server.Post("/v1/videos/engine",
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                    std::string dit, partition;
+                    try {
+                      const nlohmann::json b = nlohmann::json::parse(req.body);
+                      dit = b.value("dit", std::string());
+                      partition = b.value("partition", std::string());
+                    } catch (const std::exception& e) {
+                      res.status = 400;
+                      res.set_content(nlohmann::json{{"error", std::string("bad JSON: ") + e.what()}}
+                                          .dump(), "application/json");
+                      return;
+                    }
+                    if (dit.empty() || partition.empty()) {
+                      res.status = 400;
+                      res.set_content(
+                          nlohmann::json{{"error", "dit and partition are both required"}}.dump(),
+                          "application/json");
+                      return;
+                    }
+                    // Synchronous on purpose: this is TENS OF GB and minutes
+                    // long. Returning early would leave the old partition
+                    // answering requests that the caller believes are going to
+                    // the new one.
+                    const std::string err = video_engine_swap_(dit, partition);
+                    if (!err.empty()) {
+                      res.status = 500;
+                      res.set_content(nlohmann::json{{"error", err}}.dump(), "application/json");
+                      return;
+                    }
+                    res.set_content(video_engine_status_ ? video_engine_status_()
+                                                         : std::string("{\"ok\":true}"),
+                                    "application/json");
+                  });
+    }
     server.Post("/v1/videos",
                 [this, write](const httplib::Request& req,
                               httplib::Response& res) {

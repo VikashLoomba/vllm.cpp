@@ -1482,6 +1482,36 @@ error.
   frame (~1.15-1.19 clean, 2.28 the known-broken lattice) and VAE-input latent
   adjacent-cell cosine (0.06 white, 0.789 a real encode, 0.89+ coherent).
 
+### Render — MEASURED (Thor sm_110, 2026-08-10)
+
+`minimax_h3_fl2va_pruned-Q8_0.gguf` (21.4 GB) rendered end to end through the
+production path (`--dequant-bf16`, CUDA, `--partition fl2va`) at 512x512 / 124
+frames / 50 steps, on the same prompt and first frame as the lane's known-good
+Q4_K_M reference and with the same default seed.
+
+A CONTROLLED A/B: both arms ran back to back from the SAME binary, prompt, first
+frame, canvas, step count and default seed, and were measured with the same
+script. Only `--dit` changed.
+
+| measure | pruned Q8_0 (21.4 GB) | unpruned Q4_K_M (19.9 GB) | reading |
+|---|---|---|---|
+| tensors streamed | **532/532** | **535/535** | ONE binary takes both forms, and tells them apart |
+| DiT s/step | 15.88-15.96 | 15.94-15.98 | no per-step cost; the curve lerp is a host-side [m, 8] gather |
+| VAE-input latent adjacent cosine | **0.8385** | **0.8391** | 0.06 == white/broken, 0.789 == a real encode |
+| period-16 seam ratio, frame 100 | **0.9941** | **0.9839** | 2.28 is the known-broken lattice |
+| frame 0 luma mean / sd | 119.74 / 66.02 | 119.75 / 66.35 | both anchor on the same first frame |
+| frame 100 luma mean / sd | 115.13 / 57.11 | 112.96 / 56.94 | |
+| frame 0 -> 100 mean abs diff | 46.66 | 45.78 | neither is a frozen video |
+
+The frame is a coherent scene, not a silhouette or a lattice: the cyan llama, the
+office behind it, the blinds and the readable LOCALAI poster all resolve. On every
+number the pruned Q8_0 sits inside the reference's own band.
+
+**What is NOT claimed.** Nothing here says Q8_0 looks BETTER than Q4_K_M. The two
+numbers this lane measures are coherence detectors, not quality metrics, and they
+cannot separate two coherent renders. A quality claim needs a perceptual
+comparison this row did not run.
+
 ### Stop conditions
 
 A pruned checkpoint that carries `time_embedder.*` AND `adaln_t_table`, or an

@@ -29,6 +29,19 @@ def action_steps(text: str, action: str) -> list[str]:
     ]
 
 
+def step_mapping_blocks(step: str, name: str) -> list[str]:
+    lines = step.splitlines()
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        if line != f"        {name}:":
+            continue
+        end = index + 1
+        while end < len(lines) and not re.match(r"^        \S", lines[end]):
+            end += 1
+        blocks.append("\n".join(lines[index + 1 : end]))
+    return blocks
+
+
 def validate(text: str) -> list[str]:
     errors: list[str] = []
     required_global = (
@@ -144,11 +157,18 @@ def validate(text: str) -> list[str]:
         errors.append("every artifact upload must fail when its explicit file is missing")
     if downloads < 5 or text.count("artifact-ids:") != downloads:
         errors.append("every cross-job handoff must use an exact immutable artifact ID")
-    if any(
-        re.findall(r"(?m)^          merge-multiple:\s*(\S+)\s*$", step)
-        != ["true"]
-        for step in download_steps
-    ):
+    flatten_values = []
+    for step in download_steps:
+        with_blocks = step_mapping_blocks(step, "with")
+        flatten_values.append(
+            re.findall(
+                r"(?m)^          merge-multiple:\s*(true|'true'|\"true\")\s*$",
+                with_blocks[0],
+            )
+            if len(with_blocks) == 1
+            else []
+        )
+    if any(values not in (["true"], ["'true'"], ['"true"']) for values in flatten_values):
         errors.append("every artifact download must flatten into its declared path")
     if re.search(r"(?m)^\s+path:\s*[^\n]*[*?]", text):
         errors.append("release workflow artifact paths must not use wildcards")

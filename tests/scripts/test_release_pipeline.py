@@ -290,6 +290,32 @@ class ReleasePipelineContract(unittest.TestCase):
             self.checker.validate(mutant),
         )
 
+    def test_flat_extraction_cannot_be_spoofed_by_sibling_env(self) -> None:
+        original = WORKFLOW.read_text(encoding="utf-8")
+        download = (
+            "      - name: Download the exact immutable plan by ID\n"
+            "        uses: actions/download-artifact@v4\n"
+            "        with:\n"
+            "          artifact-ids: ${{ needs.plan.outputs.artifact_id }}\n"
+            "          path: plan\n"
+            "          merge-multiple: true"
+        )
+        spoofed = (
+            "      - name: Download the exact immutable plan by ID\n"
+            "        uses: actions/download-artifact@v4\n"
+            "        env:\n"
+            "          merge-multiple: true\n"
+            "        with:\n"
+            "          artifact-ids: ${{ needs.plan.outputs.artifact_id }}\n"
+            "          path: plan"
+        )
+        self.assertEqual(original.count(download), 1)
+        mutant = original.replace(download, spoofed, 1)
+        self.assertIn(
+            "every artifact download must flatten into its declared path",
+            self.checker.validate(mutant),
+        )
+
     def test_hosted_packagers_resolve_their_runtime_dependencies(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(

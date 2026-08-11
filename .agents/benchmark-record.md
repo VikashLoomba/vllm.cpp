@@ -18080,3 +18080,63 @@ for every request after the first.
 
 Evidence: `dgx:~/fx_run.log` (7/7), `dgx:~/fx2.log` (SACRED), `dgx:~/diag.log`,
 `dgx:~/diag2.log`, `dgx:~/g9.log`.
+
+## Qwen3.6-35B-A3B: first CANONICAL post-lever grid, and the ad-hoc grid it invalidates (2026-08-11, main `348c265d`, GB10)
+
+Run through `scripts/dgx-online-serving.sh --execute --model 35` on a build made
+to the H1d contract (RelWithDebInfo, oracle ninja, oracle flashinfer cutlass,
+`VLLM_CPP_BENCH_PROFILE_CONTROL=OFF`, tests ON, pinned `/usr/local/cuda-13.0/bin/nvcc`),
+against `nvidia/Qwen3.6-35B-A3B-NVFP4`@`491c2f1e`. FA2 marker verified present.
+
+| c | ours med tok/s (n=3) | vLLM med tok/s (n=2) | ratio |
+|---:|---:|---:|---:|
+| 1 | 65.262 (spread 1.005) | 67.223 (1.001) | **0.9708x** |
+| 2 | 93.012 (1.003) | 100.088 (1.006) | 0.9293x |
+| 4 | 140.174 (1.002) | 144.226 (1.066) | **0.9719x** |
+| 8 | 193.477 (1.018) | 210.679 (1.002) | 0.9183x |
+| 16 | 251.490 (1.007) | 271.479 (1.002) | 0.9264x |
+| 32 | 311.897 (1.007) | 332.606 (1.005) | 0.9377x |
+
+**NOT parity: 0.918x to 0.972x.** These are the campaign's FIRST c16/c32 numbers;
+both earlier canonical attempts died to host reboots.
+
+### This invalidates the ad-hoc 35B grid recorded on 2026-08-10
+
+That grid put our c1 at 32.9 tok/s and the ratio at 0.524, and flagged an
+"unexplained ~14% floor drop". The canonical harness measures our c1 at **65.262
+tok/s**, essentially double, and in line with the historical 70.58. The anomaly
+was an artifact of the ad-hoc harness, NOT of the engine and NOT of the #213
+levers -- which the same-binary lever A/B had already ruled out independently.
+The ad-hoc grid was correctly disclaimed rather than published; this supersedes it.
+
+### The harness rejected the ORACLE, not us
+
+Our arm completed 18/18 legs. The vLLM arm stopped at 12/18 when the stream probe
+caught it emitting **127 token chunks where 128 were requested** with
+`ignore_eos`. So the run has no driver-written summary and vLLM's medians are over
+**2 reps, not 3** -- weaker than ours, and stated rather than averaged away. A
+check strict enough to fail the reference implementation is why these numbers are
+worth more than the ad-hoc ones.
+
+### Known 35B-specific lever result
+
+The #213 merged-qkvz lever measures **-1.5% at c8 on this MoE model** (real,
+against a 0.7% band) while gaining ~10 points on the 27B dense. Scoping that
+default by model family is an open question, worth ~1.5% at c8 here.
+
+## Closed gaps moved verbatim out of docs/BENCHMARKS.md (2026-08-11)
+
+The scoreboard's `Open gaps` table is Track / Status / **Next gate**. These three
+rows had reached next gate `none` -- the gap each tracked is closed and no gate
+remains -- so they are not open gaps. They are reproduced here BYTE-FOR-BYTE, per
+this file's header contract, so the page can carry the two void-measurement rows
+that #223 and #238 owe without exceeding its 45,000-character cap. The full
+forensics for each are already in this file: `kGemvHeuristicAlgos CUDA
+build-verify CLOSED`, `DFlash speculative decode ... D14 c1 SPEED GATE MET`, and
+the Laguna-XS-2.1-NVFP4 decode sections. Nothing was edited or dropped.
+
+| Track | Status | Next gate |
+|---|---|---|
+| Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
+| DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
+| cuBLAS invocation-parity guard | **CLOSED**: CI guard landed (CPU) and the `kGemvHeuristicAlgos` refactor re-verified on CUDA @`812de8ca` (forced recompile, clean `-Werror`, 315/315 + 235/235) | none |

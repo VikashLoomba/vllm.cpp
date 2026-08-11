@@ -512,10 +512,10 @@ STATUS_RATCHET = {
     # 243399 since 2026-08-10 (measured, #213): the gemv build-verify row folded a
     # superseded allowlist clause into the binding result. Strictly DOWN.
     #
-    # 243361 since 2026-08-10 (measured 243361): ENG-RELEASE-CONTAINERS
+    # 243340 since 2026-08-10 (measured 243340): ENG-RELEASE-CONTAINERS
     # owes the page a lifecycle line, paid for inside the release
     # paragraph rather than out of the page. Strictly DOWN.
-    "chars": 243361,
+    "chars": 243340,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

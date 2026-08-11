@@ -349,6 +349,11 @@ class BudgetEnforcement(unittest.TestCase):
             # in the same PR has no BASE version to mutate, so it registers the
             # disabled form its own tests must reject.
             "scripts/check-site.py",
+            # 2026-08-10: the container-image gates (#170). Both suites load the
+            # checker as a module and call into it, so the disabled stub fails
+            # every case rather than quietly passing a reduced one.
+            "scripts/check-container-matrix.py",
+            "scripts/check-container-workflow.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

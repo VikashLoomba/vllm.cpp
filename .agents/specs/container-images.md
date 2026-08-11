@@ -437,9 +437,16 @@ accelerator script *runs* `test_vulkan_backend` -- each of which is a real
 requirement of the gate being inherited, not incidental weight. `-j 2` was
 hardcoded in both scripts and is now a `JOBS` parameter.
 
-**Not established, and not claimed.** No image is published. `cuda` and
-`vulkan` have never been built here: they are gated by the matrix checker and
-the workflow guard, which prove structure, not that they compile. The arm64 legs
+**Hosted evidence.** `containers.yml` ran end to end on PR #307: `plan` green,
+`verify (cpu, linux/amd64)` and `verify (vulkan, linux/amd64)` green -- the
+vulkan lane's first build anywhere -- with `publish`, `manifest`, `attest` and
+`promote` correctly skipped on a non-tag. CI has no model, so those runs cover
+config and layout and report the absence of runtime evidence rather than
+implying it.
+
+**Not established, and not claimed.** No image is published. The `cuda` lane has
+never been built, on this box or in CI: it is gated by the matrix checker and
+the workflow guard, which prove structure, not that it compiles. The arm64 legs
 are unbuilt, so the SBSA-vs-Tegra question (Thor `sm_110`, Orin `sm_87`) is
 exactly as open as it was. The boot gate needs a model, so hosted CI runs config
 and layout only and reports the absence of runtime evidence rather than

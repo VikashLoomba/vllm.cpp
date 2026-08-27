@@ -27,6 +27,35 @@ Out of scope for the first implementation wave, each named under `## Owed` rathe
 than dropped: MTP depth > 1, the 1M-token RoPE extension the card advertises above
 the native 262144, and any throughput claim.
 
+### Merge sequencing for the `ACTIVE` transition and its claim (operator note)
+
+W1 and W6a BOTH moved this row `READY -> ACTIVE` on their own branches, independently
+and correctly — AGENTS.md "Records" requires the matrix row to move with the lifecycle
+state, and each wave was the first product code from its own point of view. The result
+is a collision that a clean three-way merge will NOT catch, and it is recorded here
+because the second merge is where it bites:
+
+- **The counts happen to be safe.** Both branches make the IDENTICAL edit, `ACTIVE`
+  10 -> 11 and `READY` 4 -> 3, so a three-way merge with a base of 10/4 and both sides
+  at 11/3 resolves to 11/3. That is luck, not design: two branches making DIFFERENT
+  one-line edits to the same counter merge cleanly and apply BOTH, which is the failure
+  AGENTS.md names under "Never store a measurement of one file inside another file".
+  **Verify these two numbers by COUNTING ROWS at every merge, never by trusting the
+  merge.**
+- **The claim owner is NOT safe.** W1 wrote owner `CLAIM-MODEL-MM-QWEN4-EXP-W1` with
+  `.agents/claims/CLAIM-MODEL-MM-QWEN4-EXP-W1.md`; W6a wrote `CLAIM-MODEL-MM-QWEN4-EXP`
+  with its own file. Two different owners for one cell, and two claim files for one row.
+
+**Resolution: the row-level claim `CLAIM-MODEL-MM-QWEN4-EXP` wins**, because the claim
+covers the whole campaign rather than one wave, and `check-agent-record.py` binds an
+owner to a ROW. Whichever of W1/W6a merges second drops its own transition and its own
+claim file, keeping only the survivor. This is a merge-time reconciliation, not a
+defect in either branch.
+
+The same shape will recur for W2, W3 and W4: each is the first product code from its
+own vantage, none of them should re-make the transition, and each should drop the edit
+if it finds the row already `ACTIVE` on `main`.
+
 ## Why this needs a spec before code
 
 Three of this row's decisions are expensive to reverse and cheap to get wrong, and
@@ -37,9 +66,18 @@ record. They are settled here so a fresh implementer does not re-derive them.
    `Qwen/Qwen3.8-27B` as the Qwen3.6-27B shape retrained, differing in exactly one
    config key. That precedent does not extend here. `qwen4_exp` shares an ancestor
    with `qwen3_5` and diverges in four load-bearing places.
-2. **QSA's twin in vLLM is MiniMax-M3, not DeepSeek-V4.** See `## Design`. Building
-   it on the DSA/MLA path is the wrong port, and DSA is the path an agent reaches
-   for first because this tree already has it.
+2. **QSA's twin in vLLM is DeepSeek-V4's C4 indexer lane, not MiniMax-M3.** See
+   `## Design`. This REVERSES the row's first reading, which rested on treating
+   `MLAAttentionSpec` as an MLA claim; it is a per-state BUDGET shape, and M3 —
+   itself plain GQA — uses it too. Nine independent structural matches tie QSA to
+   DeepSeek-V4, `compress_ratio == 4` literally the same number. Building QSA on M3
+   is the wrong port and it fails hard rather than subtly: M3 welds
+   `SPARSE_BLOCK_SIZE = 128` to the KV page size, so ratio 4 forces a page size of 4
+   and breaks `tl.dot`, whose tile needs >= 16. What M3 does contribute is a wiring
+   precedent and not an algorithm: a plain-GQA model owning a key-only side cache
+   through `MLAAttentionSpec`. The DSA/MLA reflex remains the trap, because this tree
+   already has that path — the correction is which side of it QSA sits on
+   ([#2049](https://github.com/mudler/vllm.cpp/issues/2049)).
 3. **The oracle split is a direction, not a default.** See below.
 
 ## Oracles
@@ -755,6 +793,56 @@ checkpoint repo **and revision** plus sha256 for any quantized artifact, the dev
 and the contention state. `docs/USAGE.md` gains the checkpoint pins in the same
 change that makes any arm reachable, not later.
 
+## Mutation record — W6a (#1989)
+
+Committed because the first fresh review could not re-run W6a's claimed
+mutations: no table for the wave existed anywhere in the tree, so the reviewer
+designed and ran fourteen of their own. This section is the reproducible list.
+Every row is one textual change applied to a pristine tree, rebuilt, run,
+restored, and rebuilt again with the source `touch`ed after restore — without
+that touch ninja skips the rebuild and the mutations ACCUMULATE, which fails
+toward RED and makes a weak gate read strong.
+
+Reviewer battery (14, at `beedfdf31`; R8b and R11-R13 are what the review's
+findings F2 and F7 are made of):
+
+| # | mutation | target(s) | result |
+|---|---|---|---|
+| R1 | `kValuesIq4nl[8]` `1` -> `0` | dequant, embedding | RED, RED |
+| R2 | `DequantQ5_0` upper-half `qh` shift `j+12` -> `j+16` | dequant, embedding | RED, RED |
+| R3 | `DequantIQ4_NL` swap the two nibble halves | dequant, embedding | RED, RED |
+| R4 | reader `GgmlTypeTraits` IQ4_NL `block_bytes` 18 -> 17 | load_plan, traits | RED, RED |
+| R5 | `vt` `BlockGeometry` Q5_0 `block_bytes` 22 -> 21 | traits | RED |
+| R6 | delete the block arm of `EmbeddingKernel` | embedding, qwen36_loader | RED, RED |
+| R7 | `KeepQuantKDim(kEmbeddingTable)` back to `-1` | keep_quant, qwen36_loader, load_plan | RED x3 |
+| R8a | `DeviceQuantGatherSupported` INVERTED | keep_quant | RED |
+| R8b | `DeviceQuantGatherSupported` widened to every device but ROCm | keep_quant | SURVIVED — only the CPU branch is reachable on a CPU host, the same limitation `DeviceKeepQuantSupported` already has |
+| R9 | remove the NVFP4 `role != kEmbeddingTable` exclusion | keep_quant | RED |
+| R10 | delete the `kGgufArchArms` `qwen4exp` row | model_loader_gguf | RED |
+| R11 | neuter `vt::Embedding`'s whole-block precondition | embedding | SURVIVED at `beedfdf31` -> **RED after the F7 repair** |
+| R12 | `VecDotIQ4_NLQ8_0`: swap the two nibble halves | all 8 suites | SURVIVED x8 at `beedfdf31` -> **RED after the F2 repair** |
+| R13 | `VecDotQ5_0Q8_0`: upper-half `qh` shift `j+12` -> `j+16` | all 8 suites | SURVIVED x8 at `beedfdf31` -> **RED after the F2 repair** |
+
+Repair battery (this change; each restored byte-identically and re-verified
+green afterwards):
+
+| # | mutation | target(s) | result |
+|---|---|---|---|
+| R11 | neuter `vt::Embedding`'s whole-block precondition (`% BlockElems` -> `% 1`) | `test_ops_embedding_quant` | RED |
+| R12 | `VecDotIQ4_NLQ8_0`: swap the two nibble halves | `test_ops_quant_dot` | RED |
+| R13 | `VecDotQ5_0Q8_0`: `>> (j + 12)` -> `>> (j + 16)` | `test_ops_quant_dot` | RED |
+| R14 | `NoKeepQuant` made a no-op (the F1 defect, restored) | `test_deepseek_v4_gguf_load`, `test_laguna_gguf_load` | RED, RED |
+| R15 | delete the block arm's per-id bounds check (`id % v`) | `test_ops_embedding_quant` | RED |
+| R16 | `ResidentWeight`'s CPU alias offset by one byte | `test_gguf_qwen36_loader` | RED |
+
+Anchor repairs in W6a: **three**, not nine. Measured with the repository's own
+checker on both trees — parent `ok=876, stale=31, broken=6 -> rot 37`; head
+`ok=879, stale=28, broken=6 -> rot 34`. The three are
+`KERNEL-ATTN-DFLASH-BLOCK -> cpu_ops.cpp`, `SPEC-DFLASH-GGUF -> :773 -> :1015`
+and `SPEC-MTP-GGUF -> :971 -> :1425`. All three were stale BEFORE W6a. The
+DFlash one landed with a label that disagreed with its own href and is corrected
+here.
+
 ## Stop conditions
 
 - vLLM registers `qwen4_exp`: **stop and reconcile onto vLLM** before continuing.
@@ -807,11 +895,42 @@ change that makes any arm reachable, not later.
   the hash reads ids and not activations — is a CALLER obligation with no caller
   yet. W5 owns asserting it where the mask is built.
 - The 1M-token RoPE extension above the native 262144.
-- The non-resident n-gram table on CUDA: the dequantizing gather op and the
-  `kEmbeddingTable` keep-quant policy change (Route B), and a measurement of the
-  page-cache cost that the <= 64 KiB/token arithmetic only bounds.
-- **UNVERIFIED and owed a check against the pinned llama.cpp oracle:** llama.cpp's exact
-  substitution for a ragged-K Q4_K tensor, asserted here as Q5_0.
+- The non-resident n-gram table on CUDA. **W6a (#1989) discharged the CPU half**:
+  the dequantizing gather (`vt::Embedding` over a block table) and the
+  `kEmbeddingTable` keep-quant policy change both landed, gated bit-exactly
+  against llama.cpp `b10451` decoding real bytes of the shipped tensor. What is
+  still owed is the **CUDA arm**: `EmbeddingKernelCuda` (`src/vt/cuda/cuda_ops.cu`)
+  refuses anything but f32/bf16, so `DeviceQuantGatherSupported` returns false on
+  CUDA and the table keeps its expand-bf16 residency there. That is the honest
+  state and it is also the expensive one — a device-resident quantized table
+  gathered on device is precisely the shape llama.cpp's #27742 does NOT have (it
+  pins the table to the CPU by tensor class), so the CUDA arm is where this
+  model's high-concurrency advantage lives, not a tidying task. Still owed with
+  it: a measurement of the page-cache cost that the <= 64 KiB/token arithmetic
+  only bounds.
+- **VERIFIED 2026-08-26, no longer owed:** llama.cpp's substitution for a
+  ragged-K tensor is read at the pin, `src/llama-quant.cpp:374-405 @ b10451`
+  (`tensor_type_fallback`). `Q4_K -> Q5_0` is confirmed exactly as this spec
+  asserted, and `IQ4_XS -> IQ4_NL` beside it, which is why the shipped UD-IQ1_S
+  carries 49 IQ4_NL tensors. Both encodings landed in W6a.
+- **NEW, from reading that table:** the same function maps `Q5_K -> Q5_1` (ggml
+  type 7) and `Q2_K`/`Q3_K` -> `Q4_0`. Q5_1 and Q4_1 (3) are still absent from
+  our reader, so a `-Q5_K_M` recipe of THIS model — whose `ffn_down_shexp` row is
+  640 and therefore ragged for any K-quant — would refuse at header parse. Not
+  in W6a's scope, which the shipped file does not need; recorded rather than
+  quietly added.
+- **A keep-quant gather for `deepseek4` and `laguna`.** W6a made
+  `GgufTensorRole::kEmbeddingTable` keep-quant eligible, which is a change to a
+  SHARED policy with three consumers. Only `qwen3_5_gguf_weights.cpp` was given
+  the residency; `deepseek_v4_weights.cpp` and `laguna_weights.cpp` consume
+  `token_embd` as a flat host f32 array (and, on a tied file, hand the same f32
+  image to the final projection), so both now narrow the policy for that tensor
+  through `NoKeepQuant` and keep expanding it. That is correct and it is not
+  free: on a real deepseek4 or laguna checkpoint the vocab matrix is still
+  materialized in f32. Decoding it per gathered row instead needs those two
+  forwards to take a `vt::Tensor` rather than a `std::vector<float>`, which is
+  model work and not policy work. Owed to
+  [#1978](https://github.com/mudler/vllm.cpp/issues/1978).
 - A K-divisibility assertion in whatever writes our GGUF files.
 - A speed denominator, once one exists.
 - **W4's QSA slice lands UNREACHED**, and this entry is what AGENTS.md "Nothing
@@ -936,11 +1055,32 @@ change that makes any arm reachable, not later.
 
 ## Now
 
-`READY` in the matrix, and the state cell is deliberately not moved here — see
-`## Owed`, "the row's lifecycle record is owed the W4 transition". The spec is
-committed; W4 has landed the QSA host reference math
-([#1991](https://github.com/mudler/vllm.cpp/issues/1991)) UNREACHED, and no other
-implementation exists.
+`ACTIVE`. Four waves have landed and **nothing is reachable yet**, which is the
+whole of the current state: W2 the hashed n-gram index and the PLE dilated conv
+([#1987](https://github.com/mudler/vllm.cpp/issues/1987)), W3 the gated-residual
+hyper-connection stream ([#1988](https://github.com/mudler/vllm.cpp/issues/1988)),
+W4 Qwen Sparse Attention with its gather consumer
+([#1991](https://github.com/mudler/vllm.cpp/issues/1991)), and W6a this wave. W1
+([#1981](https://github.com/mudler/vllm.cpp/issues/1981)) is reviewed, repaired
+and gated, and lands next.
+
+W6a's own contribution: the GGUF reader opens all three shards of
+`unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S`, a `qwen4exp` file reaches its own
+config builder through the production architecture dispatch, and the n-gram
+table's residency is decided rather than assumed. No forward, no token claim and
+no speed claim.
+
+**Landed unreached, and named here because `AGENTS.md` §"Nothing lands dead"
+requires it:** `Qwen4ExpHfConfigFromGguf` IS reached — the dispatch row in
+`kGgufArchArms` is a production entry point and a `qwen4exp` file lands on it —
+but the `HfConfig` it produces names `Qwen4ExpForConditionalGeneration`, which
+`ModelRegistry` does not resolve. A user who passes the shipped GGUF today gets a
+correct config and then a registry refusal by architecture name. Every other
+landed slice is host reference math with no production call site at all. The
+wiring is owed to **W5**
+([#2031](https://github.com/mudler/vllm.cpp/issues/2031)), under
+[#1978](https://github.com/mudler/vllm.cpp/issues/1978), which is also what the
+benchmark and e2e gates wait on.
 
 Both decisions this spec was blocked on are **settled** (developer, 2026-08-26) and
 recorded in place rather than left as proposals: the transformers lane pin is

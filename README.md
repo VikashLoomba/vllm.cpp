@@ -40,6 +40,9 @@
 - **2026-08** **Hybrid CPU/GPU expert placement reaches four architecture families.** Qwen3-MoE,
   Qwen3.5/3.6, Nemotron-H, and DeepSeek-V2 can run routed experts on the CPU while the rest of the
   model stays on the selected accelerator. The end-to-end token and speed gates are still pending.
+- **2026-08** **IndexTTS 2.5 now uses its reference audio.** The clip conditions both the talker
+  and S2Mel stages. Repeated runs with one clip are bit-identical, while different clips change
+  the output. Voice-cloning parity with vLLM-Omni remains unmeasured.
 - **2026-08** **MiniMax-Music3 generates music through the public API.** Every pipeline stage is
   implemented and gated. The server exposes it through `POST /v1/audio/speech`; no reference speed
   number is available yet.

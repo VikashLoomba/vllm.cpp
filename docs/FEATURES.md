@@ -25,7 +25,7 @@ are our reading of their documented behavior, not measurements.
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 40 registered, 27 gated | 130+ | 100+ | 100+ |
+| Architectures | 43 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 | Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, C++20 `std::numbers` pi, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
@@ -102,7 +102,7 @@ are our reading of their documented behavior, not measurements.
 The supported set is exactly what the C++ registry registers: every
 architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
-cannot drift. Today that is **40 registered architectures**. Each row names the
+cannot drift. Today that is **43 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
 [Project status](../README.md#project-status), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
@@ -190,7 +190,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | LTX-2.5 Conv VAE decode DEVICE arm | LTX-2.5 video VAE | `test_ops_conv3d` 4/4 vs an independent scalar reference; `test_diffusion_device_seam` runs a non-CPU dispatch and requires byte-identical pixels | Routes through the new `vt::Conv3d` op on the queue the engine resolved at load ([#1007](https://github.com/mudler/vllm.cpp/issues/1007)). NO GPU has run the CUDA arm (#1452); other stages stay host-side (#1451) |
 | LTX-2.5 retake (`RetakePipeline`, regenerate a time window) | LTX-2.5 DiT + video VAE encoder | `test_ltx2_retake` 4/4 (69 assertions) and 4 `test_ltx2_video` cases entering through `Generate`; mask, conform and the four-way plan pinned to upstream `fd4ded7f` | `--pipeline-kind retake` on `ltx2-gen`. Source is a `frame_%06d.ppm` DIRECTORY; a container is REFUSED (no demuxer). Geometry comes from the clip. A folder has no audio, so the soundtrack is generated |
 | LTX-2.5 text-to-audio (`T2AOneStagePipeline`) | LTX-2.5 DiT + audio VAE, no video VAE | `test_ltx2_video`'s `ltx2 t2a:` cases, entering through `Generate`; 18 mutations, 17 DETECTED (four by review of a conditional-only #1039 gate) and the 18th proven an identity, not a blind spot | `--pipeline-kind t2a_one_stage`. NO picture: 0 frames, no mux argv. The only AUDIO-ONLY guided arm (CFG + STG, 3 forwards/step), so it needs a text tower. CPU only; the device forward is refused by name |
-| LTX-2.5 HQ preset (`TI2VidTwoStagesHQPipeline`, `res_2s` sampler) | LTX-2.5 DiT | 6 `test_ltx2_pipeline` cases + 2 `test_ltx2_video` cases through `Generate`, vs UPSTREAM'S OWN loop run at `fd4ded7f`: video latents BIT-EXACT on 3 of 5 fixtures, 1 ulp on 2. 20 mutations, 18 DETECTED | `--pipeline-kind res2s_two_stage` plus `--lora`, which is now REQUIRED (#1445, both stages, at ONE strength rather than upstream's 0.25/0.5 — #1144). 2.5 only. TWO denoiser calls per step plus a terminal one, and stage 1 is GUIDED at cfg 3.0 / modality 3.0, so 15 + 3 steps is 38 calls and 100 forwards. The preset IS the sampler |
+| LTX-2.5 HQ preset (`TI2VidTwoStagesHQPipeline`, `res_2s` sampler) | LTX-2.5 DiT | 6 `test_ltx2_pipeline` cases + 2 `test_ltx2_video` cases through `Generate`, vs UPSTREAM'S OWN loop run at `fd4ded7f`: video latents BIT-EXACT on 3 of 5 fixtures, 1 ulp on 2. 20 mutations, 18 DETECTED | `--pipeline-kind res2s_two_stage` plus `--lora`, which is now REQUIRED (#1445, both stages, at ONE strength rather than upstream's 0.25/0.5; #1144). 2.5 only. TWO denoiser calls per step plus a terminal one, and stage 1 is GUIDED at cfg 3.0 / modality 3.0, so 15 + 3 steps is 38 calls and 100 forwards. The preset IS the sampler |
 | LTX-2.5 T2A guidance space | LTX-2.5 DiT (T2A arm) | `test_ltx2_video` "the guider is handed x0 predictions" through `Generate`, on all 3 arms plus the guider output and the Euler input; a seam case puts the two spaces 1.5e-07 apart at rescale 0 and 0.352 at 0.7 | Combines **denoised (x0)**, mirroring `X0Model` (`model.py:590-604`). Was velocity space, which agrees only at rescale 0 ([#1039](https://github.com/mudler/vllm.cpp/issues/1039)) |
 | LTX-2.5 VIDEO guidance | LTX-2.5 DiT, joint video+audio | `test_ltx2_video`'s `ltx2 one_stage:` cases through `Generate`; all FOUR arms carry the x0 invariant and the guider output replays EXACTLY | `--pipeline-kind one_stage` runs `_guided_denoise`: 4 forwards/step, combined per modality in **x0**. Was ONE unguided forward, every `video_guidance` field dead ([#1092](https://github.com/mudler/vllm.cpp/issues/1092)) |
 | LTX-2.5 cross-attention perturbations | LTX-2.5 DiT | `test_ltx2_video` and `test_ltx2_device` each gate one direction ALONE, on a forward where the other stream is PRESENT but DISABLED. Swapping the two flags is RED on both arms | `SKIP_A2V_CROSS_ATTN` / `SKIP_V2A_CROSS_ATTN`, which `modality_scale = 3.0` selects on every video row. On the DEVICE forward too since 2026-08-19 ([#1092](https://github.com/mudler/vllm.cpp/issues/1092)) |
@@ -215,11 +215,11 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
-| `Dots3NoteMTPModel` | dots3-note nextn head (the target arch `Dots3NoteForCausalLM` IS registered — see the supported table above) | W10 owns it and it is deliberately NOT registered: a speculator that cannot propose makes the engine accept a speculative config it then dies on mid-run. The checkpoint ships exactly one nextn layer. Blocked behind the target row: no oracle runs here, ~290 GB fp8 against a 122 GiB ceiling, so NO number is claimable on any axis ([spec](../.agents/specs/dots3-note.md), #699) |
+| `Dots3NoteMTPModel` | dots3-note nextn head (the target arch `Dots3NoteForCausalLM` IS registered; see the supported table above) | W10 owns it and it is deliberately NOT registered: a speculator that cannot propose makes the engine accept a speculative config it then dies on mid-run. The checkpoint ships exactly one nextn layer. Blocked behind the target row: no oracle runs here, ~290 GB fp8 against a 122 GiB ceiling, so NO number is claimable on any axis ([spec](../.agents/specs/dots3-note.md), #699) |
 
-27 of the 37 registered text-generation architectures carry a passing
+27 of the 39 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
-(The 41 registered total also covers 3 Parakeet ASR entry points and the
+(The 43 registered total also covers 3 Parakeet ASR entry points and the
 `LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live

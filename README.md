@@ -111,8 +111,10 @@ We are ahead at all six, but only c1 at 4.5% is clearly outside our 0.5% run-to-
 treat c2 through c32 as ties. The tokens are identical either way, and the install is 66 MiB against
 9.1 GiB.
 
-Cold start to first `/health`: **36.5 s vs vLLM's 221.5 s (6.1x)**, provisional
-([detail](.agents/benchmark-record.md)).
+Cold start to first `/health`: **53 s vs vLLM's 780 s (14.7x)**, medians of three, and
+deliberately NOT like-for-like -- we answer `/health` on process liveness, so the first
+request then pays 91.6 s of real first-inference cost that vLLM front-loads
+([measurement details](docs/benchmarks/vllm-online-serving.md)).
 
 Peak host memory is a clean win at **24.88 GiB vs vLLM's 28.18 GiB**, with no Python stack behind it:
 
@@ -158,8 +160,10 @@ shape-gated to prefill (95.9% on the default build).
 ### Speculative decoding
 
 MTP is **token-identical to vLLM's MTP and about 4% faster** at c1 on Qwen3.6-27B-NVFP4, on both gate
-models end to end. Block-diffusion DFlash runs about 2x over spec-off but stays below vLLM's
-throughput. That gap is an open bf16 acceptance floor, tracked in the benchmark record.
+models end to end. Block-diffusion DFlash runs **2.9x over spec-off** and lands at vLLM's own
+DFlash (1.003x); its successor DFlash2 is the one still **behind, at 0.8017x**, on an open bf16
+acceptance floor. Every speculator's current position is in
+[the speculative-decoding measurements](docs/benchmarks/speculative-decoding.md).
 
 Full per-axis grids, memory tables, the nine residual axes, and exact reproduction recipes:
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The two figures above are rendered from these measured

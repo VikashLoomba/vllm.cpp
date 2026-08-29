@@ -25,6 +25,7 @@
 // a partial backend is a supported, tested state (src/vt/ops.cpp:104-111).
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -36,9 +37,12 @@
 
 #include "support/test_env.h"  // SetEnv/UnsetEnv — MSVC has no setenv (#603)
 #include "vt/backend.h"
+#include "../../src/vt/cpu/cpu_quant_blocks.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
+#include "vt/quant.h"
 #include "vt/recipes.h"
+#include "vt/rocm/rocm_runtime.h"
 
 namespace {
 
@@ -2322,7 +2326,421 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
 namespace vt::rocm {
 int KQuantDecodeCoopWarps(vt::DType wdt, int64_t m, int64_t nsb);
 uint64_t KQuantCoopDispatchCount();
+void Q8KQuantizeForTest(vt::Queue& q, void* scratch, const void* act, vt::DType dtype,
+                        int64_t row_stride, int64_t rows, int64_t nsb, bool candidate);
+bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_accepted,
+                                 int device_index,
+                                 std::string (*resolve)(int) noexcept);
+void Q8KResetRouteDispatchCountsForTest();
+uint64_t Q8KRouteDispatchCountForTest(bool grouped, bool candidate);
 }  // namespace vt::rocm
+
+namespace {
+
+constexpr size_t kQ8KBlockBytes = sizeof(vt::cpu::BlockQ8_K);
+static_assert(kQ8KBlockBytes == 292);
+
+std::string Q8KMatrixResolver(int device_index) noexcept {
+  switch (device_index) {
+    case 0: return "gfx1100";
+    case 1: return "gfx1200";
+    case 2: return "gfx1201";
+    case 3: return "unknown";
+    default: return {};
+  }
+}
+
+std::string Q8KAlternateResolver(int device_index) noexcept {
+  if (device_index == 0) return "gfx1200";
+  if (device_index == 1) return "gfx1100";
+  return {};
+}
+
+class ScopedQ8KEnv {
+ public:
+  explicit ScopedQ8KEnv(const char* value) {
+    if (const char* old = std::getenv("VT_ROCM_Q8K_BLOCK")) {
+      had_value_ = true;
+      old_value_ = old;
+    }
+    if (value == nullptr) vllm_test::UnsetEnv("VT_ROCM_Q8K_BLOCK");
+    else vllm_test::SetEnv("VT_ROCM_Q8K_BLOCK", value);
+  }
+
+  ~ScopedQ8KEnv() {
+    if (had_value_) vllm_test::SetEnv("VT_ROCM_Q8K_BLOCK", old_value_);
+    else vllm_test::UnsetEnv("VT_ROCM_Q8K_BLOCK");
+  }
+
+  ScopedQ8KEnv(const ScopedQ8KEnv&) = delete;
+  ScopedQ8KEnv& operator=(const ScopedQ8KEnv&) = delete;
+
+ private:
+  bool had_value_ = false;
+  std::string old_value_;
+};
+
+size_t Q8KSourceElementBytes(DType dtype) {
+  return dtype == DType::kF32 ? sizeof(float) : sizeof(uint16_t);
+}
+
+const char* Q8KDTypeName(DType dtype) {
+  if (dtype == DType::kF32) return "f32";
+  if (dtype == DType::kF16) return "f16";
+  return "bf16";
+}
+
+void StoreQ8KSource(std::vector<uint8_t>& bytes, DType dtype, size_t index, float value) {
+  const size_t offset = index * Q8KSourceElementBytes(dtype);
+  if (dtype == DType::kF32) {
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+  } else {
+    const uint16_t bits = dtype == DType::kF16 ? vt::F32ToF16(value) : vt::F32ToBF16(value);
+    std::memcpy(bytes.data() + offset, &bits, sizeof(bits));
+  }
+}
+
+float LoadQ8KSource(const std::vector<uint8_t>& bytes, DType dtype, size_t index) {
+  const size_t offset = index * Q8KSourceElementBytes(dtype);
+  if (dtype == DType::kF32) {
+    float value = 0.0f;
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    return value;
+  }
+  uint16_t bits = 0;
+  std::memcpy(&bits, bytes.data() + offset, sizeof(bits));
+  return dtype == DType::kF16 ? vt::F16ToF32(bits) : vt::BF16ToF32(bits);
+}
+
+enum class Q8KInputKind {
+  kRandom,
+  kZero,
+  kPositiveNegativeWaveTie,
+  kNegativePositiveWaveTie,
+  kPositiveNegativeReductionTie,
+  kNegativePositiveReductionTie,
+};
+
+struct Q8KInputCase {
+  Q8KInputKind kind;
+  const char* name;
+};
+
+constexpr std::array<Q8KInputCase, 6> kQ8KInputCases{{
+    {Q8KInputKind::kRandom, "random"},
+    {Q8KInputKind::kZero, "all-zero-sentinel"},
+    {Q8KInputKind::kPositiveNegativeWaveTie, "positive-negative-wave-tie"},
+    {Q8KInputKind::kNegativePositiveWaveTie, "negative-positive-wave-tie"},
+    {Q8KInputKind::kPositiveNegativeReductionTie, "positive-negative-reduction-tie"},
+    {Q8KInputKind::kNegativePositiveReductionTie, "negative-positive-reduction-tie"},
+}};
+
+void FillQ8KInput(std::vector<uint8_t>& source, DType dtype, int64_t row_stride,
+                  int64_t rows, int64_t nsb, Q8KInputKind kind) {
+  std::mt19937 rng(1876u + static_cast<uint32_t>(nsb) * 17u +
+                   static_cast<uint32_t>(kind) * 101u);
+  std::uniform_real_distribution<float> random_value(-3.0f, 3.0f);
+  const int64_t k = nsb * vt::cpu::kQK_K;
+  for (int64_t row = 0; row < rows; ++row) {
+    for (int64_t col = 0; col < k; ++col) {
+      float value = 0.0f;
+      if (kind == Q8KInputKind::kRandom) {
+        value = random_value(rng);
+      } else if (kind != Q8KInputKind::kZero) {
+        const int bounded = static_cast<int>((col * 29 + row * 11) % 101) - 50;
+        value = static_cast<float>(bounded) / 64.0f;
+      }
+      StoreQ8KSource(source, dtype, static_cast<size_t>(row * row_stride + col), value);
+    }
+    if (kind == Q8KInputKind::kRandom || kind == Q8KInputKind::kZero) continue;
+    for (int64_t sb = 0; sb < nsb; ++sb) {
+      int first = 31;
+      int second = 32;
+      float first_value = 7.0f;
+      float second_value = -7.0f;
+      if (kind == Q8KInputKind::kNegativePositiveWaveTie) {
+        first_value = -7.0f;
+        second_value = 7.0f;
+      } else if (kind == Q8KInputKind::kPositiveNegativeReductionTie) {
+        first = 127;
+        second = 128;
+      } else if (kind == Q8KInputKind::kNegativePositiveReductionTie) {
+        first = 127;
+        second = 128;
+        first_value = -7.0f;
+        second_value = 7.0f;
+      }
+      const int64_t block_start = row * row_stride + sb * vt::cpu::kQK_K;
+      StoreQ8KSource(source, dtype, static_cast<size_t>(block_start + first), first_value);
+      StoreQ8KSource(source, dtype, static_cast<size_t>(block_start + second), second_value);
+    }
+  }
+}
+
+void CheckQ8KBlockBytes(const std::vector<uint8_t>& got,
+                        const std::vector<uint8_t>& expected, const char* reference,
+                        DType dtype, const char* input_class, int64_t row, int64_t sb,
+                        int64_t nsb) {
+  const size_t block = static_cast<size_t>(row * nsb + sb);
+  const size_t offset = block * kQ8KBlockBytes;
+  size_t mismatch = kQ8KBlockBytes;
+  for (size_t byte = 0; byte < kQ8KBlockBytes; ++byte) {
+    if (got[offset + byte] != expected[offset + byte]) {
+      mismatch = byte;
+      break;
+    }
+  }
+  CAPTURE(std::string(Q8KDTypeName(dtype)));
+  CAPTURE(std::string(input_class));
+  CAPTURE(std::string(reference));
+  CAPTURE(row);
+  CAPTURE(sb);
+  CAPTURE(mismatch);
+  CHECK_MESSAGE(mismatch == kQ8KBlockBytes,
+                "ROCm Q8_K byte mismatch: dtype/class/reference/row/sb/byte are captured");
+}
+
+void CheckOnlyQ8KRouteCounter(bool grouped, bool candidate) {
+  for (bool observed_grouped : {false, true}) {
+    for (bool observed_candidate : {false, true}) {
+      const uint64_t count =
+          vt::rocm::Q8KRouteDispatchCountForTest(observed_grouped, observed_candidate);
+      CAPTURE(grouped);
+      CAPTURE(candidate);
+      CAPTURE(observed_grouped);
+      CAPTURE(observed_candidate);
+      CHECK(count == ((grouped == observed_grouped && candidate == observed_candidate) ? 1u
+                                                                                       : 0u));
+    }
+  }
+}
+
+void CheckNoQ8KRouteCounters() {
+  for (bool grouped : {false, true})
+    for (bool candidate : {false, true})
+      CHECK(vt::rocm::Q8KRouteDispatchCountForTest(grouped, candidate) == 0);
+}
+
+}  // namespace
+
+TEST_CASE("ROCm Q8_K policy is resolver-keyed and default-off") {
+  for (bool default_accepted : {false, true}) {
+    for (int device = 0; device < 5; ++device) {
+      CAPTURE(default_accepted);
+      CAPTURE(device);
+      const bool unset_expected = default_accepted && device == 0;
+      CHECK(vt::rocm::Q8KCandidateSelectedForTest(
+                nullptr, default_accepted, device, Q8KMatrixResolver) == unset_expected);
+      CHECK_FALSE(vt::rocm::Q8KCandidateSelectedForTest(
+          "0", default_accepted, device, Q8KMatrixResolver));
+      CHECK(vt::rocm::Q8KCandidateSelectedForTest(
+          "1", default_accepted, device, Q8KMatrixResolver));
+      CHECK_THROWS_WITH_AS(
+          vt::rocm::Q8KCandidateSelectedForTest(
+              "invalid", default_accepted, device, Q8KMatrixResolver),
+          doctest::Contains("VT_ROCM_Q8K_BLOCK=invalid"), std::runtime_error);
+    }
+  }
+
+  // One resolver says device 0 is gfx1100 and device 1 is gfx1200. The next
+  // resolver reverses those answers. A cache keyed only by device fails here.
+  CHECK(vt::rocm::Q8KCandidateSelectedForTest(nullptr, true, 0, Q8KMatrixResolver));
+  CHECK_FALSE(vt::rocm::Q8KCandidateSelectedForTest(nullptr, true, 1, Q8KMatrixResolver));
+  CHECK_FALSE(vt::rocm::Q8KCandidateSelectedForTest(nullptr, true, 0,
+                                                    Q8KAlternateResolver));
+  CHECK(vt::rocm::Q8KCandidateSelectedForTest(nullptr, true, 1,
+                                              Q8KAlternateResolver));
+}
+
+TEST_CASE("ROCm Q8_K cooperative quantizer matches both 292-byte oracles") {
+  const bool rocm_registered = [] {
+    for (DeviceType dtype : RegisteredDevices())
+      if (dtype == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  constexpr int64_t kRows = 3;
+  constexpr int64_t kPadding = 37;
+  constexpr std::array<int64_t, 5> kSuperblocks{{1, 2, 3, 10, 16}};
+  constexpr std::array<DType, 3> kDTypes{{DType::kF32, DType::kF16, DType::kBF16}};
+  const vt::cpu::FromFloatFn cpu_oracle = vt::cpu::BlockFromFloat(DType::kQ8_K);
+  REQUIRE(cpu_oracle != nullptr);
+  vt::rocm::Q8KResetRouteDispatchCountsForTest();
+
+  for (DType dtype : kDTypes) {
+    for (const Q8KInputCase& input_case : kQ8KInputCases) {
+      for (int64_t nsb : kSuperblocks) {
+        CAPTURE(std::string(Q8KDTypeName(dtype)));
+        CAPTURE(std::string(input_case.name));
+        CAPTURE(nsb);
+        const int64_t k = nsb * vt::cpu::kQK_K;
+        const int64_t row_stride = k + kPadding;
+        const size_t source_bytes = static_cast<size_t>(kRows * row_stride) *
+                                    Q8KSourceElementBytes(dtype);
+        const size_t scratch_bytes =
+            static_cast<size_t>(kRows * nsb) * kQ8KBlockBytes;
+        std::vector<uint8_t> source(source_bytes, 0xD3);
+        FillQ8KInput(source, dtype, row_stride, kRows, nsb, input_case.kind);
+
+        std::vector<uint8_t> cpu_bytes(scratch_bytes, 0xA5);
+        std::vector<float> cpu_row(static_cast<size_t>(k));
+        for (int64_t row = 0; row < kRows; ++row) {
+          for (int64_t col = 0; col < k; ++col) {
+            cpu_row[static_cast<size_t>(col)] = LoadQ8KSource(
+                source, dtype, static_cast<size_t>(row * row_stride + col));
+          }
+          cpu_oracle(cpu_row.data(),
+                     cpu_bytes.data() + static_cast<size_t>(row * nsb) * kQ8KBlockBytes, k);
+        }
+
+        DevBufBytes device_source(rocm, q, source_bytes);
+        DevBufBytes device_legacy(rocm, q, scratch_bytes);
+        DevBufBytes device_candidate(rocm, q, scratch_bytes);
+        std::vector<uint8_t> sentinel(scratch_bytes, 0xA5);
+        device_source.Upload(source.data());
+        device_legacy.Upload(sentinel.data());
+        device_candidate.Upload(sentinel.data());
+        vt::rocm::Q8KQuantizeForTest(q, device_legacy.ptr(), device_source.ptr(), dtype,
+                                    row_stride, kRows, nsb, false);
+        vt::rocm::Q8KQuantizeForTest(q, device_candidate.ptr(), device_source.ptr(), dtype,
+                                    row_stride, kRows, nsb, true);
+        std::vector<uint8_t> legacy(scratch_bytes);
+        std::vector<uint8_t> candidate(scratch_bytes);
+        device_legacy.Download(legacy.data());
+        device_candidate.Download(candidate.data());
+
+        for (int64_t row = 0; row < kRows; ++row) {
+          for (int64_t sb = 0; sb < nsb; ++sb) {
+            CheckQ8KBlockBytes(candidate, legacy, "legacy-gpu", dtype, input_case.name,
+                               row, sb, nsb);
+            CheckQ8KBlockBytes(candidate, cpu_bytes, "cpu-block-from-float", dtype,
+                               input_case.name, row, sb, nsb);
+          }
+        }
+      }
+    }
+  }
+  CheckNoQ8KRouteCounters();
+  rocm.DestroyQueue(q);
+}
+
+TEST_CASE("ROCm Q8_K dense and grouped production routes select one actual arm") {
+  const bool rocm_registered = [] {
+    for (DeviceType dtype : RegisteredDevices())
+      if (dtype == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuantGrouped, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (actual_arch.rfind("gfx1100", 0) != 0) return;
+  REQUIRE(actual_arch.rfind("gfx1100", 0) == 0);
+
+  constexpr int64_t kM = 2;
+  constexpr int64_t kP = 2;
+  constexpr int64_t kN = 4;
+  constexpr int64_t kE = 3;
+  constexpr int64_t kK = vt::cpu::kQK_K;
+  constexpr size_t kQ4BlockBytes = sizeof(vt::cpu::BlockQ4_K);
+  std::vector<float> dense_act = RandomVec(static_cast<size_t>(kM * kK), 18760, -0.5f, 0.5f);
+  std::vector<float> grouped_act = RandomVec(static_cast<size_t>(kP * kK), 18761, -0.5f, 0.5f);
+  std::vector<uint8_t> dense_weight(static_cast<size_t>(kN) * kQ4BlockBytes);
+  std::vector<uint8_t> grouped_weight(static_cast<size_t>(kE * kN) * kQ4BlockBytes);
+  std::mt19937 rng(18762);
+  for (uint8_t& byte : dense_weight) byte = static_cast<uint8_t>(rng() & 0xff);
+  for (uint8_t& byte : grouped_weight) byte = static_cast<uint8_t>(rng() & 0xff);
+  auto set_q4_deltas = [](std::vector<uint8_t>& bytes) {
+    for (size_t offset = 0; offset < bytes.size(); offset += kQ4BlockBytes) {
+      const uint16_t d = vt::F32ToF16(0.0125f);
+      const uint16_t dmin = vt::F32ToF16(0.0075f);
+      std::memcpy(bytes.data() + offset, &d, sizeof(d));
+      std::memcpy(bytes.data() + offset + sizeof(d), &dmin, sizeof(dmin));
+    }
+  };
+  set_q4_deltas(dense_weight);
+  set_q4_deltas(grouped_weight);
+  const std::vector<int32_t> expert_ids{2, 0};
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  const Device device{DeviceType::kROCM, 0};
+  DevBuf dense_act_device(rocm, q, dense_act.size());
+  DevBuf grouped_act_device(rocm, q, grouped_act.size());
+  DevBufBytes dense_weight_device(rocm, q, dense_weight.size());
+  DevBufBytes grouped_weight_device(rocm, q, grouped_weight.size());
+  DevBufI32 expert_ids_device(rocm, q, expert_ids.size());
+  DevBuf dense_out(rocm, q, static_cast<size_t>(kM * kN));
+  DevBuf grouped_out(rocm, q, static_cast<size_t>(kP * kN));
+  dense_act_device.Upload(dense_act);
+  grouped_act_device.Upload(grouped_act);
+  dense_weight_device.Upload(dense_weight.data());
+  grouped_weight_device.Upload(grouped_weight.data());
+  expert_ids_device.Upload(expert_ids);
+
+  Tensor dense_act_tensor = T2(dense_act_device.ptr(), device, kM, kK);
+  Tensor dense_weight_tensor = Tensor::Contiguous(
+      dense_weight_device.ptr(), DType::kQ4_K, device, {kN, kK});
+  Tensor dense_out_tensor = T2(dense_out.ptr(), device, kM, kN);
+  Tensor grouped_act_tensor = T2(grouped_act_device.ptr(), device, kP, kK);
+  Tensor grouped_weight_tensor = Tensor::Contiguous(
+      grouped_weight_device.ptr(), DType::kQ4_K, device, {kE * kN, kK});
+  Tensor expert_ids_tensor = TI32(expert_ids_device.ptr(), device, kP);
+  Tensor grouped_out_tensor = T2(grouped_out.ptr(), device, kP, kN);
+
+  auto run_dense = [&] {
+    vt::MatmulBTQuant(q, dense_out_tensor, dense_act_tensor, dense_weight_tensor);
+    rocm.Synchronize(q);
+  };
+  auto run_grouped = [&] {
+    vt::MatmulBTQuantGrouped(q, grouped_out_tensor, grouped_act_tensor,
+                            grouped_weight_tensor, expert_ids_tensor);
+    rocm.Synchronize(q);
+  };
+
+  struct ArmCase {
+    const char* value;
+    bool candidate;
+  };
+  const ArmCase arms[] = {{"0", false}, {"1", true}, {nullptr, false}};
+  for (const ArmCase& arm : arms) {
+    CAPTURE(arm.value == nullptr ? std::string("unset") : std::string(arm.value));
+    {
+      ScopedQ8KEnv env(arm.value);
+      vt::rocm::Q8KResetRouteDispatchCountsForTest();
+      run_dense();
+      CheckOnlyQ8KRouteCounter(false, arm.candidate);
+    }
+    {
+      ScopedQ8KEnv env(arm.value);
+      vt::rocm::Q8KResetRouteDispatchCountsForTest();
+      run_grouped();
+      CheckOnlyQ8KRouteCounter(true, arm.candidate);
+    }
+  }
+
+  {
+    ScopedQ8KEnv env("invalid-production");
+    vt::rocm::Q8KResetRouteDispatchCountsForTest();
+    CHECK_THROWS_WITH_AS(run_dense(),
+                         doctest::Contains("VT_ROCM_Q8K_BLOCK=invalid-production"),
+                         std::runtime_error);
+    CheckNoQ8KRouteCounters();
+  }
+  {
+    ScopedQ8KEnv env("invalid-production");
+    vt::rocm::Q8KResetRouteDispatchCountsForTest();
+    CHECK_THROWS_WITH_AS(run_grouped(),
+                         doctest::Contains("VT_ROCM_Q8K_BLOCK=invalid-production"),
+                         std::runtime_error);
+    CheckNoQ8KRouteCounters();
+  }
+  rocm.DestroyQueue(q);
+}
 
 TEST_CASE("ROCm Q6_K decode spreads one row's superblocks over several warps") {
   // Issue #1910: KQuantGemmK strides ONE warp's 32 lanes over nsb = K/256

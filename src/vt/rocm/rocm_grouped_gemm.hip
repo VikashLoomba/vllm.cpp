@@ -18,14 +18,17 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
+#include "vt/rocm/rocm_runtime.h"
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
 #include "vt/cpu/cpu_quant_blocks.h"
@@ -175,6 +178,64 @@ __global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __rest
     y.bsums[g] = static_cast<int16_t>(sum);
   }
   y.d = 1.0f / iscale;
+}
+
+// Q8_K (block-per-256-superblock): cuda_quant_dot.cu
+// QuantizeQ8KPreqKernel. One thread loads and writes one activation element.
+// The reduction retains the signed value and the lowest original index, which
+// preserves the legacy first-occurrence rule for opposite-sign absolute ties.
+__global__ void QuantizeQ8KCooperativeK(BlockQ8_K* __restrict__ scratch,
+                                        const void* __restrict__ a, ActDT adt,
+                                        int64_t a_rs, int64_t m, int64_t nsb) {
+  const int64_t sb = static_cast<int64_t>(blockIdx.x);
+  const int64_t row = static_cast<int64_t>(blockIdx.y);
+  if (sb >= nsb || row >= m) return;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t elem0 = row * a_rs + sb * kQK_K;
+  const float value = DLoadAct(a, adt, elem0 + tid);
+
+  __shared__ float reduction_abs[kQK_K];
+  __shared__ float reduction_value[kQK_K];
+  __shared__ int reduction_index[kQK_K];
+  reduction_abs[tid] = fabsf(value);
+  reduction_value[tid] = value;
+  reduction_index[tid] = tid;
+  __syncthreads();
+
+#pragma unroll
+  for (int stride = kQK_K / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      const float other_abs = reduction_abs[tid + stride];
+      const int other_index = reduction_index[tid + stride];
+      if (other_abs > reduction_abs[tid] ||
+          (other_abs == reduction_abs[tid] && other_index < reduction_index[tid])) {
+        reduction_abs[tid] = other_abs;
+        reduction_value[tid] = reduction_value[tid + stride];
+        reduction_index[tid] = other_index;
+      }
+    }
+    __syncthreads();
+  }
+
+  BlockQ8_K& output = scratch[row * nsb + sb];
+  if (reduction_abs[0] == 0.0f) {
+    if (tid == 0) output.d = 0.0f;
+    output.qs[tid] = 0;
+    if (tid < kQK_K / 16) output.bsums[tid] = 0;
+    return;
+  }
+
+  const float iscale = -127.0f / reduction_value[0];
+  const int quant = DNearestInt(iscale * value);
+  output.qs[tid] = static_cast<int8_t>(quant < 127 ? quant : 127);
+  __syncthreads();
+  if (tid < kQK_K / 16) {
+    int sum = 0;
+#pragma unroll
+    for (int ii = 0; ii < 16; ++ii) sum += output.qs[tid * 16 + ii];
+    output.bsums[tid] = static_cast<int16_t>(sum);
+  }
+  if (tid == 0) output.d = 1.0f / iscale;
 }
 
 // ---- dot superblocks (1:1 ports) ----
@@ -593,6 +654,97 @@ void* EnsureQuantScratch(size_t need, hipStream_t s) {
   return sc.buf;
 }
 
+enum class Q8KQuantArm : uint8_t { kLegacy = 0, kCandidate = 1 };
+enum class Q8KProductionRoute : uint8_t { kDense = 0, kGrouped = 1 };
+using Q8KArchResolver = std::string (*)(int) noexcept;
+
+// This constant changes only after the real-checkpoint and profiler gates
+// accept gfx1100. The first implementation remains legacy on every device.
+constexpr bool kQ8KGfx1100DefaultAccepted = false;
+
+struct Q8KArchCacheEntry {
+  int device_index;
+  Q8KArchResolver resolve;
+  std::string arch;
+};
+
+class Q8KArchCache {
+ public:
+  std::string Resolve(int device_index, Q8KArchResolver resolve) {
+    for (const Q8KArchCacheEntry& entry : entries_) {
+      if (entry.device_index == device_index && entry.resolve == resolve) return entry.arch;
+    }
+    const std::string arch = resolve == nullptr ? std::string{} : resolve(device_index);
+    entries_.push_back(Q8KArchCacheEntry{device_index, resolve, arch});
+    return arch;
+  }
+
+ private:
+  std::vector<Q8KArchCacheEntry> entries_;
+};
+
+std::string ResolveQ8KArch(int device_index, Q8KArchResolver resolve) {
+  // Match rocm_skinny_gemm_arch.h: cache each device and resolver on the
+  // calling thread. The launch hot path takes no process-wide mutex.
+  static thread_local Q8KArchCache cache;
+  return cache.Resolve(device_index, resolve);
+}
+
+bool Q8KArchIsGfx1100(const std::string& arch) {
+  constexpr char kStem[] = "gfx1100";
+  constexpr size_t kStemLength = sizeof(kStem) - 1;
+  if (arch.size() < kStemLength || arch.compare(0, kStemLength, kStem) != 0) return false;
+  if (arch.size() == kStemLength) return true;
+  const char next = arch[kStemLength];
+  return next < '0' || next > '9';
+}
+
+Q8KQuantArm SelectQ8KQuantArm(const char* env_value, bool gfx1100_default_accepted,
+                              int device_index, Q8KArchResolver resolve) {
+  if (env_value != nullptr) {
+    if (std::strcmp(env_value, "0") == 0) return Q8KQuantArm::kLegacy;
+    if (std::strcmp(env_value, "1") == 0) return Q8KQuantArm::kCandidate;
+    throw std::runtime_error(std::string("vt rocm: VT_ROCM_Q8K_BLOCK=") + env_value +
+                             " must be 0 or 1");
+  }
+  const std::string arch = ResolveQ8KArch(device_index, resolve);
+  return gfx1100_default_accepted && Q8KArchIsGfx1100(arch)
+             ? Q8KQuantArm::kCandidate
+             : Q8KQuantArm::kLegacy;
+}
+
+std::atomic<uint64_t> g_q8k_route_dispatches[2][2]{};
+
+void LaunchQ8KQuantArm(BlockQ8_K* scratch, const void* act, ActDT dtype,
+                       int64_t row_stride, int64_t rows, int64_t nsb, hipStream_t stream,
+                       Q8KQuantArm arm, const Q8KProductionRoute* route) {
+  if (route != nullptr) {
+    g_q8k_route_dispatches[static_cast<size_t>(*route)][static_cast<size_t>(arm)].fetch_add(
+        1, std::memory_order_relaxed);
+  }
+  if (arm == Q8KQuantArm::kCandidate) {
+    const dim3 grid(static_cast<unsigned>(nsb), static_cast<unsigned>(rows), 1);
+    QuantizeQ8KCooperativeK<<<grid, kQK_K, 0, stream>>>(
+        scratch, act, dtype, row_stride, rows, nsb);
+    Check(hipGetLastError(), "q8_K cooperative quant");
+    return;
+  }
+  constexpr int kThreads = 128;
+  const int64_t blocks = (rows * nsb + kThreads - 1) / kThreads;
+  QuantizeQ8KK<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+      scratch, act, dtype, row_stride, rows, nsb);
+  Check(hipGetLastError(), "q8_K legacy quant");
+}
+
+void LaunchQ8KQuantizer(BlockQ8_K* scratch, const void* act, ActDT dtype,
+                        int64_t row_stride, int64_t rows, int64_t nsb,
+                        hipStream_t stream, Q8KProductionRoute route, int device_index) {
+  const Q8KQuantArm arm = SelectQ8KQuantArm(std::getenv("VT_ROCM_Q8K_BLOCK"),
+                                            kQ8KGfx1100DefaultAccepted, device_index,
+                                            vt::rocm::DeviceArchName);
+  LaunchQ8KQuantArm(scratch, act, dtype, row_stride, rows, nsb, stream, arm, &route);
+}
+
 // How many dense K-quant dispatches took the cooperative arm. Host-side and
 // relaxed: nothing reads it on the decode path, and the ROCm decode gate reads
 // it to prove the call site below is REACHED rather than merely compiled
@@ -630,6 +782,34 @@ uint64_t KQuantCoopDispatchCount() {
   return g_kq_coop_dispatches.load(std::memory_order_relaxed);
 }
 
+void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
+                        int64_t row_stride, int64_t rows, int64_t nsb, bool candidate) {
+  EnsureQueueDevice(q);
+  if (dtype != DType::kF32 && dtype != DType::kF16 && dtype != DType::kBF16) {
+    throw std::runtime_error("vt rocm: Q8KQuantizeForTest requires f32, f16, or bf16");
+  }
+  LaunchQ8KQuantArm(static_cast<BlockQ8_K*>(scratch), act, ActDtOf(dtype), row_stride, rows,
+                    nsb, static_cast<hipStream_t>(q.handle),
+                    candidate ? Q8KQuantArm::kCandidate : Q8KQuantArm::kLegacy, nullptr);
+}
+
+bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_accepted,
+                                 int device_index,
+                                 std::string (*resolve)(int) noexcept) {
+  return SelectQ8KQuantArm(env_value, gfx1100_default_accepted, device_index, resolve) ==
+         Q8KQuantArm::kCandidate;
+}
+
+void Q8KResetRouteDispatchCountsForTest() {
+  for (auto& route : g_q8k_route_dispatches)
+    for (std::atomic<uint64_t>& count : route) count.store(0, std::memory_order_relaxed);
+}
+
+uint64_t Q8KRouteDispatchCountForTest(bool grouped, bool candidate) {
+  return g_q8k_route_dispatches[grouped ? 1 : 0][candidate ? 1 : 0].load(
+      std::memory_order_relaxed);
+}
+
 void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   EnsureQueueDevice(q);
   const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
@@ -663,9 +843,8 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
     BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
         static_cast<size_t>(m) * nsb * sizeof(BlockQ8_K), s));
-    QuantizeQ8KK<<<static_cast<unsigned>((m * nsb + 127) / 128), 128, 0, s>>>(
-        qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb);
-    Check(hipGetLastError(), "q8_K quant");
+    LaunchQ8KQuantizer(qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb, s,
+                       Q8KProductionRoute::kDense, q.device.index);
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
     const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
@@ -741,9 +920,8 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
     BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
         static_cast<size_t>(Pa) * nsb * sizeof(BlockQ8_K), s));
-    QuantizeQ8KK<<<static_cast<unsigned>((Pa * nsb + 127) / 128), 128, 0, s>>>(
-        qact, act.data, ActDtOf(act.dtype), act.stride[0], Pa, nsb);
-    Check(hipGetLastError(), "q8_K quant");
+    LaunchQ8KQuantizer(qact, act.data, ActDtOf(act.dtype), act.stride[0], Pa, nsb, s,
+                       Q8KProductionRoute::kGrouped, q.device.index);
     const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = weight.dtype == DType::kQ6_K ? 2 : weight.dtype == DType::kQ5_K ? 1 : 0;
     auto launch = [&](auto ot) {

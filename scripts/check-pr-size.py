@@ -208,7 +208,12 @@ COMPLETED_STATE_EVENT = re.compile(
 )
 SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
-BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
+# `csv` joined the list 2026-08-29 (#2316): `ncu --csv` writes one, and
+# `docs/bench-evidence/laguna-grouped-gemv-ncu-20260829.csv` (#2289) landed
+# on `main` with no class at all. `classify_path` FAILS CLOSED, so the
+# whole-tree sweep in this checker's suite went red on `main` itself. A
+# profiler export is evidence exactly as a `.log` is.
+BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log|csv)\Z")
 # A PER-RUN evidence directory: docs/bench-evidence/<run-id>/<file> (#1448).
 # AGENTS.md requires the exact build and run recipe beside a measurement, so one
 # run arrives as a dated directory of logs, dumps and the scripts that produced

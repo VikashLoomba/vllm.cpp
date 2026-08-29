@@ -180,12 +180,23 @@ suite's and never on a diff that merely looks deletion-shaped, so a live checker
 cannot borrow the exemption. The second case pins that half: without it, marking
 every checker change "deleted" would silence the whole contract.
 
-**Not taken:** `docs/bench-evidence/*.csv` has no path class, which reds
-`check-pr-size`'s whole-tree sweep on `origin/main` itself (from #2289). It is
-filed as [#2316](https://github.com/mudler/vllm.cpp/issues/2316) and NOT fixed
-here: it is a second classification-set change, it does not block this row (the
-checker is green; only the suite's tree sweep is red), and it comes with a
-question about why that sweep runs in no lane at all.
+**`docs/bench-evidence/*.csv` has no path class**
+([#2316](https://github.com/mudler/vllm.cpp/issues/2316), from #2289). Filed
+first as not-blocking, on the reasoning that the CHECKER was green and only the
+suite's whole-tree sweep was red. **That was wrong, and the correction is the
+interesting part.** Editing `check-pr-size.py` makes
+`tests/scripts/test_check_pr_size.py` its mutation evidence, and the evidence
+contract runs the WHOLE module — so one unrelated red anywhere in that suite
+fails the HEAD pair and blocks the change. A checker's suite is load-bearing for
+every future edit to that checker, which means a red in it is never merely
+someone else's problem once you touch the checker.
+
+Fixed here: `csv` joins `BENCH_EVIDENCE`, because `ncu --csv` writes one and a
+profiler export is evidence exactly as a `.log` is. Two cases, one for the
+classification and one pinning that a `csv` elsewhere under `docs/` still fails
+closed, so the widening cannot be read as "any csv anywhere". The second half of
+#2316 — that the whole-tree sweep executes in no lane at all, which is the #467
+shape — stays open and is NOT taken here.
 
 ## Tests to port
 

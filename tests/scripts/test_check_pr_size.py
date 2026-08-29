@@ -111,6 +111,29 @@ class PathClassification(unittest.TestCase):
                 # classify_path raising ValueError is the failure being pinned.
                 self.assertIsInstance(checker.classify_path(path), str)
 
+    def test_a_profiler_csv_under_bench_evidence_is_evidence(self) -> None:
+        """#2316: `ncu --csv` writes one, and #2289 landed
+        `docs/bench-evidence/laguna-grouped-gemv-ncu-20260829.csv` with no class.
+
+        `classify_path` fails closed, so the whole-tree sweep in this suite went
+        RED on `origin/main` itself. It also blocked #2290: that change edits
+        this checker, which makes THIS suite its mutation evidence, and the
+        evidence contract runs the whole module -- so one unrelated red in it
+        fails the pair. RED at base.
+        """
+        self.assertEqual(
+            checker.classify_path(
+                "docs/bench-evidence/laguna-grouped-gemv-ncu-20260829.csv"
+            ),
+            "evidence",
+        )
+
+    def test_a_csv_outside_bench_evidence_still_fails_closed(self) -> None:
+        """The extension is not a licence. Widening by suffix alone would let a
+        csv anywhere in docs/ take the evidence class without review."""
+        with self.assertRaises(ValueError):
+            checker.classify_path("docs/some-other-place/whatever.csv")
+
     def test_completed_csv_near_misses_fail_closed(self) -> None:
         for path in (
             ".agents/completed/unrelated.csv",

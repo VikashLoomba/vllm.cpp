@@ -100,7 +100,7 @@ tree already falsifies (#420, #1543, #1213, #647, #587, #1533). Details in #2298
 |---|---|---|
 | Index storage | `.agents/issue-index.md`, tracked, `merge=union` | `gh issue list`, refreshed into untracked `.agents/issue-index.generated.md` |
 | Row association | index `Row` column | a `Row:` line in the issue body |
-| Historical rows | 854 rows in the tracked file | `.agents/completed/issue-index.md`, moved not deleted |
+| Historical rows | 854 rows in the tracked file | `.agents/issue-index.md`, moved not deleted |
 | Append-only gate | `check-issue-index-append-only.py` | deleted; a generated file cannot be appended to wrongly |
 | Ownership gate | `UNOWNED_HIGH_WATER = 33`, global ratchet | diff-scoped: a change owns the issues it references |
 | Attribution | PR-body gate **and** a walk over `main` | PR-body gate only |

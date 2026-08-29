@@ -86,11 +86,13 @@ PROJECT_RECORD_FILES = frozenset(
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
-        # The intake surface moved out of roadmap_v1.md into its own append-only
-        # file (#840) and was never classified here. Classification is a hard
-        # error by design, so pr-size aborted on EVERY pull request that appends
-        # an index row, which under the same policy is nearly all of them (#856).
-        ".agents/issue-index.md",
+        # The intake surface moved out of roadmap_v1.md into its own file
+        # (#840) and was never classified here. Classification is a hard error by
+        # design, so pr-size aborted on EVERY pull request that appended an index
+        # row (#856). The file is now archived and GitHub is the index (#2290);
+        # the path stays classified because the archive is still editable-in-
+        # principle and an unclassified path is a hard error, not a skip.
+        ".agents/completed/issue-index.md",
         ".agents/porting-inventory.md",
         ".agents/engine-matrix.md",
         ".agents/feature-matrix.md",

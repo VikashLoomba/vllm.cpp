@@ -28,6 +28,11 @@ the repository default and is recorded in the local developer preferences.
 The specification commit must precede all product and test commits. A fresh
 implementer must start from this committed specification.
 
+Local correctness and performance evidence can proceed against the reviewed
+external prompt source in the real-checkpoint gate. Publication and merge of
+#1876 remain ordered after records-only pull request #2270 or an equivalent
+maintainer-landed evidence commit that tracks the same reviewed prompt artifact.
+
 ## Scope
 
 The implementation has these in-scope changes:
@@ -385,11 +390,21 @@ Use this exact model artifact:
 
 Use `tools/tg200-prompt.txt` with SHA-256
 `e2b801cc6a5739cd317c2f77adfb67040667de524ab60ca64aac39f79c846bba`.
-The blob exists on the local `remotes/pr/1936` ref but is absent at this base.
-Import only that prompt artifact before measurement and verify its hash.
+Use these prompt sources in order:
 
-Do not import product code from pull request #1936. If the prompt artifact is
-still absent, the real-checkpoint gate stays `PENDING`.
+1. After #2270 lands, use the tracked `tools/tg200-prompt.txt` and verify its
+   SHA-256.
+2. Until #2270 lands, local validation can use only
+   `/home/vikash/vllm.cpp-rocm-launch-evidence/tools/tg200-prompt.txt`. Before
+   each validation, assert that the worktree has HEAD
+   `88b1b1bc80c7c7024d64b9ab10626a93ff279a95`, tree
+   `e2fb82f523d9572a5a3e26437d912c5ea0a5f76c`, an empty
+   `git status --porcelain=v1`, the tracked path `tools/tg200-prompt.txt`, and
+   the required SHA-256.
+
+If neither verified source exists, the real-checkpoint gate stays `PENDING`.
+Never substitute prompt text copied from prose. Do not import the prompt into
+this branch. No product file from pull request #1936 is imported.
 
 The correctness run uses batch 1, greedy decode, `--max-tokens 256`,
 `--temperature 0`, and `--seed 0`. Both arms must return byte-identical
@@ -503,6 +518,8 @@ Record these items:
 - Full Release gate result.
 - All mutation failures and restoration checks.
 - Model and prompt hashes.
+- The prompt source path, its tracked commit and tree, and its clean-worktree
+  assertion when local validation uses the reviewed #2270 worktree.
 - Binary and relevant source hashes.
 - Route counters and profiler kernel names.
 - Ten measured A/B legs and their raw completion hashes.
@@ -520,7 +537,7 @@ until the real-checkpoint correctness and performance gates succeed.
 - Dense routing can work while grouped routing still launches the legacy arm.
 - A default flip can hide a dead candidate if the environment policy is wrong.
 - Profiler totals can mix prefill and decode without the 4-token subtraction.
-- The prompt artifact can be absent even when its Git blob is available.
+- The reviewed prompt source can be absent or fail a provenance assertion.
 - A `gfx1100` result does not predict `gfx1200` or `gfx1201` behavior.
 
 ## Owed
@@ -548,6 +565,9 @@ engagement.
 Stop if the candidate does not beat the ratified engine threshold. Record the
 negative result and restore the candidate product code instead of landing dead
 speculative code.
+
+Keep the real-checkpoint gate `PENDING` if neither ordered prompt source passes
+all provenance assertions. Do not reconstruct the prompt from prose.
 
 Stop with `NEEDS_CONTEXT` if an unavailable input changes the correctness or
 measurement contract. Do not replace an unavailable input with a new artifact.

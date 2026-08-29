@@ -834,6 +834,16 @@ jobs:
         with:
           fetch-depth: 0
       - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
+        # PULL-REQUEST LANE ONLY (#2157, #2322). This step used to run on the
+        # `push` lane too, walking LANDED history on `main` where the only repair
+        # is rewriting `main` -- which AGENTS.md forbids. It was also redundant:
+        # `squash_merge_commit_message = PR_BODY` makes the pull request body the
+        # landed message, and the body check below validates those exact bytes
+        # BEFORE they freeze. Its only unique coverage was a direct push to
+        # `main`, which the landing rules already prohibit. What it produced
+        # instead was forgiveness work -- 42 commits behind the enforcement floor
+        # plus one LANDED_MESSAGE_EXCEPTIONS entry, each excused by hand.
+        if: github.event_name == 'pull_request'
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -884,6 +894,16 @@ jobs:
           fi
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
       - name: Every new commit satisfies the strict trailer contract
+        # PULL-REQUEST LANE ONLY (#2157, #2322). This step used to run on the
+        # `push` lane too, walking LANDED history on `main` where the only repair
+        # is rewriting `main` -- which AGENTS.md forbids. It was also redundant:
+        # `squash_merge_commit_message = PR_BODY` makes the pull request body the
+        # landed message, and the body check below validates those exact bytes
+        # BEFORE they freeze. Its only unique coverage was a direct push to
+        # `main`, which the landing rules already prohibit. What it produced
+        # instead was forgiveness work -- 42 commits behind the enforcement floor
+        # plus one LANDED_MESSAGE_EXCEPTIONS entry, each excused by hand.
+        if: github.event_name == 'pull_request'
         # DIFF-scoped, and therefore HERE rather than in agent-record. It lived
         # in that job until #863: agent-record carries a cancellable group keyed
         # on `github.ref`, which for a push is the constant `refs/heads/main`, so

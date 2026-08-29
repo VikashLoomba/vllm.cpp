@@ -142,10 +142,35 @@ to name a `Row:` or appear under a spec's `## Owed`. `owed_issues()`
 
 **5. Attribution is enforced once.** `scripts/agent-pr-body.py` stays and is the
 authority, because it reads the exact bytes `squash_merge_commit_message =
-PR_BODY` will land. The post-hoc walk over `main` in
-`check-commit-trailers.py` goes, and #2157's contradiction goes with it — there
-is no second copy left to disagree. The checker keeps its PR-body mode and its
-mutation suite.
+PR_BODY` will land.
+
+`--range` had THREE deployments, and the first draft of this spec collapsed
+them: `agent-preflight.sh` pre-push, the CI pull-request lane, and the CI PUSH
+lane on `main`. The first two are diff-scoped to commits their author wrote and
+can still amend or force-push, and they stay. The third re-read LANDED history,
+where the only repair is rewriting `main`, which AGENTS.md forbids outright — so
+a violation there could never clear itself.
+
+It was also redundant. Anything that reaches `main` through a pull request has
+already had its landing bytes checked by the `--message-file` gate before they
+froze. The push lane's only unique coverage was a direct push to `main`, which
+§"Landing work" already prohibits.
+
+What it produced instead was forgiveness work. Two mechanisms existed solely to
+excuse landed commits: `scripts/ci-enforcement-floor.txt`, whose current value
+forgives 42 commits dated 2026-08-13 to 2026-08-24, and
+`LANDED_MESSAGE_EXCEPTIONS`, which carried one. That is 43 commits on `main`
+that violate the contract and cannot be repaired, each forgiven by a deliberate
+reviewed act. A gate whose three-week output is 43 forgiveness decisions rather
+than 43 prevented defects is measuring the wrong thing.
+
+So both trailer steps of `commit-protocol-tag` become `pull_request`-only, and
+`LANDED_MESSAGE_EXCEPTIONS` goes with the reason it existed for — a dead
+exception list invites a live one. The floor FILE stays: it still governs
+`documentation-checkpoint` and `agent-record`'s role-discipline step, which do
+walk the push lane, and its value does not move. Only its scope narrows, and its
+own comment and `ci-walk-base.py`'s docstring are corrected to stop naming the
+trailer steps.
 
 **6. Preflight runs the checkers.** `agent-preflight.sh` discovers
 `scripts/check-*.py` by glob and runs each, rather than naming five. A checker
@@ -277,7 +302,8 @@ implementation commits, which is what proves the order.
 | ID | Work | Issues |
 |---|---|---|
 | W6 | Derive the index; retire the file, the driver and the append-only gate; rewrite §Records; scope the force-push sentence | #2290 #883 #364 #1745 #1002 #1619 #1644 #2266 #1808 |
-| W7 | Attribution enforced once at the PR body; drop the walk | #2157 #858 #406 #581 #467 |
+| W7 | The trailer walk gets its caller's merge-commit rule | #2157 |
+| W9 | Attribution enforced ONCE: the push-lane walk goes, and the exception registry with it | #858 #406 #581 #1058 #1260 #1262 |
 | W8 | Preflight runs every checker; add the two exit rules to §intake | #467 #2298 |
 
 ## Risks / decisions

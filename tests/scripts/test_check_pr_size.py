@@ -86,6 +86,31 @@ class PathClassification(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(checker.classify_path(path), "evidence")
 
+    def test_both_sides_of_the_issue_index_retirement_classify(self) -> None:
+        """#2290 moved the index to `.agents/completed/`, and a diff that spans
+        the move names BOTH paths -- the archive as the destination, the old path
+        as the rename source.
+
+        Classification is a HARD ERROR, not a skip, so an unclassified side
+        aborts pr-size entirely: on the retirement change itself, and on every
+        in-flight branch whose range still straddles it.
+
+        A REGRESSION GUARD, not mutation evidence -- it passes at base and at
+        head. It is here because the retirement change first "tidied" the old
+        path out of the classification set, having assumed the archive needed
+        adding; in fact `.agents/completed/` already classifies by prefix, and
+        the entry that had to stay was the one removed. pr-size then aborted on
+        its own change, and only did so visibly because W8 had just put it in
+        preflight. Both sides are pinned so the next reader does not repeat it.
+        """
+        for path in (
+            ".agents/completed/issue-index.md",
+            ".agents/issue-index.md",
+        ):
+            with self.subTest(path=path):
+                # classify_path raising ValueError is the failure being pinned.
+                self.assertIsInstance(checker.classify_path(path), str)
+
     def test_completed_csv_near_misses_fail_closed(self) -> None:
         for path in (
             ".agents/completed/unrelated.csv",

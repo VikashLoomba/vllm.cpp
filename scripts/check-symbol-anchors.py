@@ -99,11 +99,11 @@ SCAN_SUFFIXES = {
 #
 # `.agents/completed/` is the frozen archive: AGENTS.md `## Records` says moved
 # detail keeps its provenance, and rewriting an archived citation would forge
-# what a past session wrote. The retired issue index needed a per-FILE entry here
-# while it lived at `.agents/issue-index.md`; it is archived now, so the prefix
-# covers it and the per-file exemption is empty rather than removed (#2290).
+# what a past session wrote. `.agents/issue-index.md` is append-only by rule --
+# a row there may never be edited -- so a stale anchor inside one is unrepairable
+# by construction and gating it would be a gate nobody may satisfy.
 FROZEN_PREFIXES = (".agents/completed/",)
-FROZEN_FILES: tuple[str, ...] = ()
+FROZEN_FILES = (".agents/issue-index.md",)
 
 # A path claims to be OURS when its DIRECTORY exists in this tree -- not when it
 # starts with a familiar root. `tests/` was the first cut and it was wrong: vLLM

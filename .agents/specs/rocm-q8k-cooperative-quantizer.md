@@ -7,7 +7,8 @@ Row: `BACKEND-ROCM`
 ## Now
 
 The specification is `READY`. Product implementation and tests are `PENDING`.
-The first implementation must keep the cooperative arm off by default.
+The first implementation must keep the cooperative arm off by default on every
+architecture.
 
 This commit adds only this specification and the issue ownership row. It makes
 no matrix or lifecycle change.
@@ -215,20 +216,36 @@ cooperative kernel, increments its route witness, and performs the launch.
 Both production consumers must call this launcher. The launcher must preserve
 the existing scratch allocation, stream ordering, and error check.
 
+The launcher must resolve default eligibility from the queue's actual device.
+It must key any cached architecture result by both the device and resolver.
+It must never use one process-global cached eligibility boolean. Follow the
+device-aware pattern established by issue #1183, or use an equivalent
+per-device, thread-safe cache. The launch hot path must not take a process-wide
+mutex.
+
 ### Same-binary selection
 
 `VT_ROCM_Q8K_BLOCK` accepts only `0` and `1`:
 
 - `0` selects the current serial `QuantizeQ8KK` arm.
 - `1` selects the cooperative block arm.
-- An unset value selects the recorded default.
+- An unset value selects the architecture-scoped recorded default.
 - Any other value refuses by name instead of choosing an arm silently.
 
-The first implementation default is `0`. Read the selection at launch time so
-one test process can exercise both values.
+The first implementation's unset default is the legacy arm on every
+architecture. Read the environment selection at launch time so one test
+process can exercise every value.
 
-A final default of `1` is allowed only by the acceptance rules in this spec.
-If the default becomes `1`, value `0` remains the legacy same-binary arm.
+If and only if `gfx1100` acceptance succeeds, the final unset policy is allowed
+to select the candidate on a queue whose actual device resolves to `gfx1100`.
+The unset policy must select legacy on `gfx1200`, `gfx1201`, an unknown
+architecture, or an architecture resolution failure. Pending validation on
+those architectures never authorizes a global candidate default.
+
+Explicit `0` remains the legacy same-binary arm. Explicit `1` remains a
+diagnostic opt-in on any ROCm architecture, even when architecture resolution
+fails. Outside measured `gfx1100` hardware, explicit `1` carries no
+correctness, performance, or default claim.
 
 ### Test-only seams
 
@@ -244,7 +261,9 @@ The seam must include these capabilities:
 - Launch either arm explicitly into caller-provided Q8_K scratch.
 - Reset and read dense legacy, dense candidate, grouped legacy, and grouped
   candidate counters.
-- Resolve the environment policy without changing the public ABI.
+- Resolve the environment and architecture policy without changing the public
+  ABI or querying the process environment from the pure policy function.
+- Supply a synthetic architecture resolver and device to the policy caller.
 
 The explicit-arm hook must not read `VT_ROCM_Q8K_BLOCK`. This separation lets
 the direct byte test compare both kernels regardless of the default.
@@ -304,8 +323,23 @@ The production tests must call `vt::MatmulBTQuant` and
 `vt::MatmulBTQuantGrouped`. For each environment arm, they must assert the
 matching route counter changes and the other route counter stays unchanged.
 
-Also test unset, `0`, `1`, and one invalid value. Test the explicit-arm hook
-independently from the environment policy.
+Add a HIP-free pure policy matrix for unset, `0`, `1`, and one invalid value.
+Run every value against synthetic `gfx1100`, `gfx1200`, `gfx1201`, unknown,
+and resolution-failure results. Unset must select legacy in every case for the
+first implementation. After accepted `gfx1100` default enablement, only the
+synthetic `gfx1100` case can change to candidate. Explicit `0` must select
+legacy, explicit `1` must select candidate, and invalid must refuse for every
+synthetic result.
+
+Exercise device hops and resolver changes in one process. The matrix must fail
+if one device's eligibility is reused for another device or resolver. Test the
+explicit-arm hook independently from the environment policy.
+
+Use an actual resolved `gfx1100` queue for the production-route evidence. With
+the environment unset, both production entry points must increment the arm
+required by the current recorded default. The first implementation must prove
+legacy engagement. An accepted default change must rerun this evidence and
+prove candidate engagement.
 
 The record-first specification commit has no product behavior to make red. Do
 not fabricate a red result for this commit.
@@ -494,9 +528,11 @@ Run these mutations separately:
 2. Bypass the shared launcher in the dense production consumer.
 3. Bypass the shared launcher in the grouped production consumer.
 4. Force the legacy arm when the candidate arm is selected.
-5. Corrupt one `qs` byte equality guarantee.
-6. Corrupt one `bsums` equality guarantee.
-7. Corrupt the `d` byte equality guarantee.
+5. Make the unset policy select the candidate globally after one eligible
+   device resolves.
+6. Corrupt one `qs` byte equality guarantee.
+7. Corrupt one `bsums` equality guarantee.
+8. Corrupt the `d` byte equality guarantee.
 
 Each mutation must fail the focused test for the intended reason. The reviewer
 must restore the scratch tree byte-for-byte after each mutation.
@@ -536,6 +572,9 @@ until the real-checkpoint correctness and performance gates succeed.
 - Shared memory and barriers can cost more than the serial loop on `gfx1100`.
 - Dense routing can work while grouped routing still launches the legacy arm.
 - A default flip can hide a dead candidate if the environment policy is wrong.
+- A process-global architecture result can enable an unvalidated device after
+  one `gfx1100` launch.
+- A process-wide cache mutex can serialize the quantizer launch hot path.
 - Profiler totals can mix prefill and decode without the 4-token subtraction.
 - The reviewed prompt source can be absent or fail a provenance assertion.
 - A `gfx1100` result does not predict `gfx1200` or `gfx1201` behavior.
@@ -546,6 +585,9 @@ until the real-checkpoint correctness and performance gates succeed.
 - `gfx1201` runtime validation is `PENDING` external hardware, including
   validation from @bakon11.
 - Public documentation is owed only after successful real-checkpoint gates.
+  If the `gfx1100` unset default changes, the documentation must state the
+  architecture-scoped unset policy and the diagnostic-only scope of explicit
+  `1` on other ROCm architectures.
 - A llama.cpp floor measurement is owed if a clean pinned build cannot run in
   this implementation flow.
 
@@ -561,6 +603,10 @@ equivalence does not waive this condition.
 
 Stop if the profiler does not show the candidate kernel and matching arm
 engagement.
+
+Stop if the policy matrix lets unset select the candidate on `gfx1200`,
+`gfx1201`, unknown, or resolution failure. Stop if policy eligibility uses one
+process-global cached boolean or a process-wide mutex on the launch hot path.
 
 Stop if the candidate does not beat the ratified engine threshold. Record the
 negative result and restore the candidate product code instead of landing dead
@@ -583,13 +629,17 @@ route engagement.
 Performance is accepted only when the five-pair engine rule and the profiler
 rule both pass on `gfx1100`. All completions must stay byte-identical.
 
-Keep `VT_ROCM_Q8K_BLOCK` default-off if correctness, reachability, engine speed,
-or profile engagement fails. A source-level expectation cannot override a
-failed gate.
+Keep the unset `VT_ROCM_Q8K_BLOCK` policy on the legacy arm for every
+architecture if correctness, reachability, engine speed, or profile engagement
+fails. A source-level expectation cannot override a failed gate.
 
-A final default-on decision is allowed only after the specification records
-exact-byte correctness, dense engagement, grouped engagement, the accepted
-five-pair win, and the quantizer profile reduction.
+A final unset-candidate decision is allowed only for a resolved `gfx1100`
+device. It is allowed only after the specification records exact-byte
+correctness, actual-device dense engagement, actual-device grouped engagement,
+the accepted five-pair win, and the quantizer profile reduction on `gfx1100`.
 
-If the default becomes on, `VT_ROCM_Q8K_BLOCK=0` remains the permanent legacy
-A/B arm. All performance and default claims remain scoped to `gfx1100`.
+If the `gfx1100` unset default becomes candidate, `VT_ROCM_Q8K_BLOCK=0`
+remains the permanent legacy A/B arm. Unset remains legacy on `gfx1200`,
+`gfx1201`, unknown, and resolution failure until each architecture gets its own
+ratified acceptance authority. All performance and default claims remain
+scoped to `gfx1100`.

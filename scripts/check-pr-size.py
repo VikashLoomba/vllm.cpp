@@ -553,6 +553,7 @@ def change_errors(
     changes: list[ChangedPath],
     *,
     evidence_results: dict[str, EvidenceResult] | None = None,
+    deleted: set[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     changed_paths = {change.path: change for change in changes}
@@ -572,6 +573,19 @@ def change_errors(
         # `lines is None` still matters downstream: the evidence contract below
         # tests it, so a binary cannot serve as mutation evidence.
         if path_class == "governance_checker":
+            # A checker that is GONE at head owes no mutation evidence. The
+            # contract asks the paired suite to fail against the BASE checker and
+            # pass against the HEAD one; a deletion has no head checker to run,
+            # and when the suite goes in the same change there is no module to
+            # import either, so the contract collapsed into a ModuleNotFoundError
+            # reported as "HEAD checker/test pair failed" -- an absent checker
+            # reading as a broken one. You cannot mutate a guarantee that no
+            # longer exists: the deletion IS the change, and reviewing it is the
+            # evidence. Keyed on the CHECKER's absence, never on the suite's, and
+            # never on the diff looking deletion-shaped, so a live checker cannot
+            # borrow the exemption (#2290).
+            if deleted is not None and change.path in deleted:
+                continue
             evidence = recognized_evidence(change.path)
             evidence_change = changed_paths.get(evidence)
             if evidence_change is None or evidence_change.lines is None or evidence_change.lines <= 0:
@@ -670,6 +684,26 @@ def changed_paths(base: str, head: str, *, repo: Path = ROOT) -> list[ChangedPat
         git("diff", "--no-renames", "--numstat",
             range_base(repo, base_oid, head_oid), head_oid, repo=repo)
     )
+
+
+def deleted_paths(base: str, head: str, *, repo: Path = ROOT) -> set[str]:
+    """Paths the range DELETES, from git's own rename-aware diff filter.
+
+    Read from `--diff-filter=D` rather than inferred from a numstat row that
+    happens to add nothing: a file emptied but kept is not deleted, and a rename
+    is not a deletion either. Asking git keeps the two apart.
+    """
+
+    base_oid = resolve_commit(repo, base)
+    head_oid = resolve_commit(repo, head)
+    return {
+        line
+        for line in git(
+            "diff", "--no-renames", "--diff-filter=D", "--name-only",
+            range_base(repo, base_oid, head_oid), head_oid, repo=repo,
+        ).splitlines()
+        if line
+    }
 
 
 def load_role_discipline():
@@ -864,10 +898,15 @@ def main() -> int:
         base_oid = resolve_commit(ROOT, args.base)
         head_oid = resolve_commit(ROOT, args.head)
         changes = changed_paths(base_oid, head_oid)
-        evidence = executable_evidence(ROOT, base_oid, head_oid, changes)
+        gone = deleted_paths(base_oid, head_oid)
+        evidence = executable_evidence(
+            ROOT, base_oid, head_oid,
+            [c for c in changes if c.path not in gone],
+        )
         errors = change_errors(
             changes,
             evidence_results=evidence,
+            deleted=gone,
         )
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"ERROR: PR size check could not classify the change: {exc}", file=sys.stderr)

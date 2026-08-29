@@ -287,6 +287,53 @@ class PathClassification(unittest.TestCase):
         )
 
 
+class DeletedCheckers(unittest.TestCase):
+    """A checker that is GONE at head owes no mutation evidence.
+
+    The evidence contract asks a checker change to prove a guarantee moved: the
+    paired test must fail against the BASE checker and pass against the HEAD one.
+    A DELETION has no head checker to run and, when the suite is removed in the
+    same change, no test module to import either -- so the contract collapses
+    into `ModuleNotFoundError` reported as "HEAD checker/test pair failed",
+    which reads as a broken checker rather than an absent one.
+
+    Found by #2290, which deletes `check-issue-index-append-only.py` together
+    with its suite. `pr-size` is a REQUIRED check, so a change that retires a
+    checker could not land at all. You cannot mutate a guarantee that no longer
+    exists; the deletion IS the change, and the review of it is the evidence.
+    """
+
+    def test_a_deleted_checker_does_not_demand_evidence(self) -> None:
+        changes = [checker.ChangedPath("scripts/check-gone.py", 0, 120)]
+        errors = checker.change_errors(changes, deleted={"scripts/check-gone.py"})
+        self.assertEqual(errors, [], f"a deletion was asked to prove itself: {errors}")
+
+    def test_a_surviving_checker_still_demands_evidence(self) -> None:
+        """The half that must NOT move. Without this the fix above is a mute
+        switch: marking every checker change 'deleted' would silence the whole
+        contract."""
+        changes = [checker.ChangedPath("scripts/check-gone.py", 4, 4)]
+        errors = checker.change_errors(changes, deleted=set())
+        self.assertTrue(
+            any("requires semantic mutation evidence" in e for e in errors),
+            f"a live checker change escaped the evidence contract: {errors}",
+        )
+
+    def test_a_deleted_checker_whose_suite_survives_still_demands_nothing(self) -> None:
+        """Deletion is decided by the CHECKER's absence, not the suite's.
+
+        A change may retire a checker and keep its suite for a while. The
+        evidence contract is about the checker, so the checker's absence settles
+        it either way.
+        """
+        changes = [
+            checker.ChangedPath("scripts/check-gone.py", 0, 120),
+            checker.ChangedPath("tests/scripts/test_check_gone.py", 3, 0),
+        ]
+        errors = checker.change_errors(changes, deleted={"scripts/check-gone.py"})
+        self.assertEqual(errors, [], f"{errors}")
+
+
 class RetiredSurfaces(unittest.TestCase):
     """Deleted paths keep a class on purpose; the table says so in one place.
 

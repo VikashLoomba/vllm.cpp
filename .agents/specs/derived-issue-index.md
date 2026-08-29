@@ -19,6 +19,8 @@ because that invariant admits a shape GitHub does not implement.
 
 **In scope.** `.agents/issue-index.md` and its `merge=union` attribute; the four
 consumers that read it; `scripts/check-issue-index-append-only.py`; the
+deleted-checker case in `scripts/check-pr-size.py` (added to scope 2026-08-29,
+see below); the
 `UNOWNED_HIGH_WATER` ratchet; the post-hoc commit-trailer walk over `main`;
 `scripts/agent-preflight.sh`'s checker coverage; and four `AGENTS.md` sections —
 §"Every change starts from an issue", §"Records", §"Landing work", and the
@@ -155,6 +157,35 @@ admissible shapes. §"Every change starts from an issue" points at `gh` and the
 closes its issue, and an issue the tree falsifies is closed with that evidence
 rather than re-specced. §"Landing work" line 512's unscoped *"Never force-push"*
 is scoped to `main`, matching line 194 (#1808).
+
+### Added to scope during implementation
+
+**`check-pr-size.py` cannot express a deleted checker.** Its evidence contract
+asks a checker change to prove a guarantee moved: the paired suite must fail
+against the BASE checker and pass against the HEAD one. A DELETION has no head
+checker to run, and when the suite goes in the same change there is no module to
+import, so the contract collapsed into `ModuleNotFoundError` reported as "HEAD
+checker/test pair failed" — an absent checker reading as a broken one.
+
+`pr-size` is a REQUIRED check, so this row could not land at all: retiring
+`check-issue-index-append-only.py` is exactly the shape the contract cannot
+describe. That makes it a blocker rather than an adjacent tidy, which is why it
+is taken here instead of filed. It IS checker semantics, so it gets the full
+treatment AGENTS.md §"Changing the rules or a checker" demands — this scope
+entry, three red-first cases, and green-after evidence — rather than the in-flow
+rule, which explicitly does not cover a checker-semantic change.
+
+Keyed on the CHECKER's absence via `git diff --diff-filter=D`, never on the
+suite's and never on a diff that merely looks deletion-shaped, so a live checker
+cannot borrow the exemption. The second case pins that half: without it, marking
+every checker change "deleted" would silence the whole contract.
+
+**Not taken:** `docs/bench-evidence/*.csv` has no path class, which reds
+`check-pr-size`'s whole-tree sweep on `origin/main` itself (from #2289). It is
+filed as [#2316](https://github.com/mudler/vllm.cpp/issues/2316) and NOT fixed
+here: it is a second classification-set change, it does not block this row (the
+checker is green; only the suite's tree sweep is red), and it comes with a
+question about why that sweep runs in no lane at all.
 
 ## Tests to port
 

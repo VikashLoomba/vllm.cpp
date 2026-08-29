@@ -45,6 +45,7 @@ using vt::cpu::kQK8_0;
 using vt::cpu::kQK_K;
 
 enum class ActDT : int { kF32 = 0, kF16 = 1, kBF16 = 2 };
+using Q8KKernelWitnessCount = unsigned long long;
 inline ActDT ActDtOf(DType dt) {
   return dt == DType::kF32 ? ActDT::kF32 : dt == DType::kF16 ? ActDT::kF16 : ActDT::kBF16;
 }
@@ -149,9 +150,11 @@ __global__ void QuantizeQ8_0K(BlockQ8_0* __restrict__ scratch, const void* __res
 
 // Q8_K (thread-per-256-superblock): cuda_quant_dot.cu QuantizeQ8KKernel.
 __global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __restrict__ a,
-                             ActDT adt, int64_t a_rs, int64_t m, int64_t nsb) {
+                             ActDT adt, int64_t a_rs, int64_t m, int64_t nsb,
+                             Q8KKernelWitnessCount* kernel_witness) {
   const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (t >= m * nsb) return;
+  if (t == 0 && kernel_witness != nullptr) atomicAdd(&kernel_witness[0], 1ULL);
   const int64_t i = t / nsb;
   const int64_t sb = t % nsb;
   const int64_t elem0 = i * a_rs + sb * kQK_K;
@@ -186,11 +189,14 @@ __global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __rest
 // preserves the legacy first-occurrence rule for opposite-sign absolute ties.
 __global__ void QuantizeQ8KCooperativeK(BlockQ8_K* __restrict__ scratch,
                                         const void* __restrict__ a, ActDT adt,
-                                        int64_t a_rs, int64_t m, int64_t nsb) {
+                                        int64_t a_rs, int64_t m, int64_t nsb,
+                                        Q8KKernelWitnessCount* kernel_witness) {
   const int64_t sb = static_cast<int64_t>(blockIdx.x);
   const int64_t row = static_cast<int64_t>(blockIdx.y);
   if (sb >= nsb || row >= m) return;
   const int tid = static_cast<int>(threadIdx.x);
+  if (sb == 0 && row == 0 && tid == 0 && kernel_witness != nullptr)
+    atomicAdd(&kernel_witness[1], 1ULL);
   const int64_t elem0 = row * a_rs + sb * kQK_K;
   const float value = DLoadAct(a, adt, elem0 + tid);
 
@@ -714,10 +720,12 @@ Q8KQuantArm SelectQ8KQuantArm(const char* env_value, bool gfx1100_default_accept
 }
 
 std::atomic<uint64_t> g_q8k_route_dispatches[2][2]{};
+thread_local Q8KKernelWitnessCount* g_q8k_kernel_execution_witness_for_test = nullptr;
 
 void LaunchQ8KQuantArm(BlockQ8_K* scratch, const void* act, ActDT dtype,
                        int64_t row_stride, int64_t rows, int64_t nsb, hipStream_t stream,
-                       Q8KQuantArm arm, const Q8KProductionRoute* route) {
+                       Q8KQuantArm arm, const Q8KProductionRoute* route,
+                       Q8KKernelWitnessCount* kernel_witness) {
   if (route != nullptr) {
     g_q8k_route_dispatches[static_cast<size_t>(*route)][static_cast<size_t>(arm)].fetch_add(
         1, std::memory_order_relaxed);
@@ -725,14 +733,14 @@ void LaunchQ8KQuantArm(BlockQ8_K* scratch, const void* act, ActDT dtype,
   if (arm == Q8KQuantArm::kCandidate) {
     const dim3 grid(static_cast<unsigned>(nsb), static_cast<unsigned>(rows), 1);
     QuantizeQ8KCooperativeK<<<grid, kQK_K, 0, stream>>>(
-        scratch, act, dtype, row_stride, rows, nsb);
+        scratch, act, dtype, row_stride, rows, nsb, kernel_witness);
     Check(hipGetLastError(), "q8_K cooperative quant");
     return;
   }
   constexpr int kThreads = 128;
   const int64_t blocks = (rows * nsb + kThreads - 1) / kThreads;
   QuantizeQ8KK<<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
-      scratch, act, dtype, row_stride, rows, nsb);
+      scratch, act, dtype, row_stride, rows, nsb, kernel_witness);
   Check(hipGetLastError(), "q8_K legacy quant");
 }
 
@@ -742,7 +750,11 @@ void LaunchQ8KQuantizer(BlockQ8_K* scratch, const void* act, ActDT dtype,
   const Q8KQuantArm arm = SelectQ8KQuantArm(std::getenv("VT_ROCM_Q8K_BLOCK"),
                                             kQ8KGfx1100DefaultAccepted, device_index,
                                             vt::rocm::DeviceArchName);
-  LaunchQ8KQuantArm(scratch, act, dtype, row_stride, rows, nsb, stream, arm, &route);
+  // The ordinary path passes null. Its instrumentation cost is one pointer
+  // argument and one kernel-leader null check, with no allocation, host copy,
+  // synchronization, or atomic operation.
+  LaunchQ8KQuantArm(scratch, act, dtype, row_stride, rows, nsb, stream, arm, &route,
+                    g_q8k_kernel_execution_witness_for_test);
 }
 
 // How many dense K-quant dispatches took the cooperative arm. Host-side and
@@ -790,7 +802,8 @@ void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
   }
   LaunchQ8KQuantArm(static_cast<BlockQ8_K*>(scratch), act, ActDtOf(dtype), row_stride, rows,
                     nsb, static_cast<hipStream_t>(q.handle),
-                    candidate ? Q8KQuantArm::kCandidate : Q8KQuantArm::kLegacy, nullptr);
+                    candidate ? Q8KQuantArm::kCandidate : Q8KQuantArm::kLegacy, nullptr,
+                    nullptr);
 }
 
 bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_accepted,
@@ -808,6 +821,13 @@ void Q8KResetRouteDispatchCountsForTest() {
 uint64_t Q8KRouteDispatchCountForTest(bool grouped, bool candidate) {
   return g_q8k_route_dispatches[grouped ? 1 : 0][candidate ? 1 : 0].load(
       std::memory_order_relaxed);
+}
+
+void* Q8KSetKernelExecutionWitnessForTest(void* device_counts) {
+  Q8KKernelWitnessCount* previous = g_q8k_kernel_execution_witness_for_test;
+  g_q8k_kernel_execution_witness_for_test =
+      static_cast<Q8KKernelWitnessCount*>(device_counts);
+  return previous;
 }
 
 void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {

@@ -2333,6 +2333,7 @@ bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_acc
                                  std::string (*resolve)(int) noexcept);
 void Q8KResetRouteDispatchCountsForTest();
 uint64_t Q8KRouteDispatchCountForTest(bool grouped, bool candidate);
+void* Q8KSetKernelExecutionWitnessForTest(void* device_counts);
 }  // namespace vt::rocm
 
 namespace {
@@ -2521,6 +2522,52 @@ void CheckNoQ8KRouteCounters() {
       CHECK(vt::rocm::Q8KRouteDispatchCountForTest(grouped, candidate) == 0);
 }
 
+constexpr size_t kQ8KKernelWitnessArmCount = 2;
+using Q8KKernelWitnessCounts = std::array<uint64_t, kQ8KKernelWitnessArmCount>;
+
+class ScopedQ8KKernelExecutionWitness {
+ public:
+  explicit ScopedQ8KKernelExecutionWitness(void* device_counts)
+      : previous_(vt::rocm::Q8KSetKernelExecutionWitnessForTest(device_counts)) {}
+
+  ~ScopedQ8KKernelExecutionWitness() {
+    vt::rocm::Q8KSetKernelExecutionWitnessForTest(previous_);
+  }
+
+  ScopedQ8KKernelExecutionWitness(const ScopedQ8KKernelExecutionWitness&) = delete;
+  ScopedQ8KKernelExecutionWitness& operator=(const ScopedQ8KKernelExecutionWitness&) =
+      delete;
+
+ private:
+  void* previous_ = nullptr;
+};
+
+void ResetQ8KKernelExecutionWitness(DevBufBytes& device_counts) {
+  const Q8KKernelWitnessCounts zero{};
+  device_counts.Upload(zero.data());
+}
+
+Q8KKernelWitnessCounts ReadQ8KKernelExecutionWitness(DevBufBytes& device_counts) {
+  Q8KKernelWitnessCounts counts{};
+  device_counts.Download(counts.data());
+  return counts;
+}
+
+void CheckOnlyQ8KKernelExecutionWitness(DevBufBytes& device_counts, bool candidate) {
+  const Q8KKernelWitnessCounts counts = ReadQ8KKernelExecutionWitness(device_counts);
+  for (bool observed_candidate : {false, true}) {
+    CAPTURE(candidate);
+    CAPTURE(observed_candidate);
+    CHECK(counts[observed_candidate ? 1 : 0] ==
+          (candidate == observed_candidate ? 1u : 0u));
+  }
+}
+
+void CheckNoQ8KKernelExecutionWitness(DevBufBytes& device_counts) {
+  const Q8KKernelWitnessCounts counts = ReadQ8KKernelExecutionWitness(device_counts);
+  for (uint64_t count : counts) CHECK(count == 0);
+}
+
 }  // namespace
 
 TEST_CASE("ROCm Q8_K policy is resolver-keyed and default-off") {
@@ -2676,6 +2723,7 @@ TEST_CASE("ROCm Q8_K dense and grouped production routes select one actual arm")
   DevBufI32 expert_ids_device(rocm, q, expert_ids.size());
   DevBuf dense_out(rocm, q, static_cast<size_t>(kM * kN));
   DevBuf grouped_out(rocm, q, static_cast<size_t>(kP * kN));
+  DevBufBytes kernel_witness_device(rocm, q, sizeof(Q8KKernelWitnessCounts));
   dense_act_device.Upload(dense_act);
   grouped_act_device.Upload(grouped_act);
   dense_weight_device.Upload(dense_weight.data());
@@ -2691,6 +2739,7 @@ TEST_CASE("ROCm Q8_K dense and grouped production routes select one actual arm")
       grouped_weight_device.ptr(), DType::kQ4_K, device, {kE * kN, kK});
   Tensor expert_ids_tensor = TI32(expert_ids_device.ptr(), device, kP);
   Tensor grouped_out_tensor = T2(grouped_out.ptr(), device, kP, kN);
+  ScopedQ8KKernelExecutionWitness kernel_witness(kernel_witness_device.ptr());
 
   auto run_dense = [&] {
     vt::MatmulBTQuant(q, dense_out_tensor, dense_act_tensor, dense_weight_tensor);
@@ -2712,32 +2761,40 @@ TEST_CASE("ROCm Q8_K dense and grouped production routes select one actual arm")
     {
       ScopedQ8KEnv env(arm.value);
       vt::rocm::Q8KResetRouteDispatchCountsForTest();
+      ResetQ8KKernelExecutionWitness(kernel_witness_device);
       run_dense();
       CheckOnlyQ8KRouteCounter(false, arm.candidate);
+      CheckOnlyQ8KKernelExecutionWitness(kernel_witness_device, arm.candidate);
     }
     {
       ScopedQ8KEnv env(arm.value);
       vt::rocm::Q8KResetRouteDispatchCountsForTest();
+      ResetQ8KKernelExecutionWitness(kernel_witness_device);
       run_grouped();
       CheckOnlyQ8KRouteCounter(true, arm.candidate);
+      CheckOnlyQ8KKernelExecutionWitness(kernel_witness_device, arm.candidate);
     }
   }
 
   {
     ScopedQ8KEnv env("invalid-production");
     vt::rocm::Q8KResetRouteDispatchCountsForTest();
+    ResetQ8KKernelExecutionWitness(kernel_witness_device);
     CHECK_THROWS_WITH_AS(run_dense(),
                          doctest::Contains("VT_ROCM_Q8K_BLOCK=invalid-production"),
                          std::runtime_error);
     CheckNoQ8KRouteCounters();
+    CheckNoQ8KKernelExecutionWitness(kernel_witness_device);
   }
   {
     ScopedQ8KEnv env("invalid-production");
     vt::rocm::Q8KResetRouteDispatchCountsForTest();
+    ResetQ8KKernelExecutionWitness(kernel_witness_device);
     CHECK_THROWS_WITH_AS(run_grouped(),
                          doctest::Contains("VT_ROCM_Q8K_BLOCK=invalid-production"),
                          std::runtime_error);
     CheckNoQ8KRouteCounters();
+    CheckNoQ8KKernelExecutionWitness(kernel_witness_device);
   }
   rocm.DestroyQueue(q);
 }

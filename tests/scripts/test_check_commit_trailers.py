@@ -226,6 +226,50 @@ class RangeContract(unittest.TestCase):
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True
         ).strip()
 
+    def test_a_merge_commit_is_not_authored_content_and_is_skipped(self) -> None:
+        """#2157: the same CI job walks twice and only one walk skips merges.
+
+        `ci.yml:872` skips a commit with more than one parent -- "they are not
+        authored content" -- and then hands the SAME range to this checker, which
+        did not. So `git merge origin/main` on a row branch, the routine way to
+        take main, reddened commit-protocol-tag on a message git wrote and no
+        contributor can edit without a force-push.
+
+        RED before this change: the merge commit's default message carries no
+        trailer block and the walk demanded one.
+        """
+        base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-b", "side", base],
+            check=True,
+        )
+        self.commit(STRICT_MESSAGE.replace("policy:", "policy side:"))
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-"], check=True
+        )
+        self.commit(STRICT_MESSAGE.replace("policy:", "policy main:"))
+        # `git merge --no-edit` writes "Merge branch 'side'" and nothing else.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "merge", "--no-edit", "side"],
+            check=True, capture_output=True,
+        )
+        errors = self.checker.validate_range(self.repo, base, "HEAD", cutover=None)
+        self.assertEqual(
+            errors, [], "a merge commit is git's message, not authored content"
+        )
+
+    def test_a_non_merge_commit_in_the_same_range_is_still_demanded(self) -> None:
+        """The skip must be keyed on PARENT COUNT, not on looking merge-ish.
+
+        Without this case the fix above could be widened into "stop checking",
+        which is the shape AGENTS.md forbids: never make a red gate green by
+        widening an assertion's scope.
+        """
+        base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")
+        self.commit("Merge branch 'nothing' -- but a single parent\n")
+        errors = self.checker.validate_range(self.repo, base, "HEAD", cutover=None)
+        self.assertTrue(errors, "a one-parent commit is authored content")
+
     def test_cutover_commit_itself_is_strict_and_parent_is_legacy(self) -> None:
         base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")
         before = self.commit("before\n\nFOLLOWING_AGENTS_PROTOCOL\n")

@@ -463,6 +463,17 @@ def validate_range(
     commits_text = _git(repo, "rev-list", "--reverse", f"{base_oid}..{head_oid}")
     failures: list[str] = []
     for commit in (line for line in commits_text.splitlines() if line):
+        # A merge commit is git's message, not authored content, so it is not
+        # held to a contract about what an author must write. `ci.yml` has said
+        # so since it was written -- "Skip merge commits (>1 parent) -- they are
+        # not authored content" -- and then handed the SAME range to this walk,
+        # which did not (#2157). One job, two walks, one rule between them: a
+        # plain `git merge origin/main` on a row branch, the routine way to take
+        # main, reddened commit-protocol-tag on a message no contributor can edit
+        # without force-pushing. Keyed on PARENT COUNT and never on the message,
+        # so a hand-written commit that merely says "Merge" is still authored.
+        if len(_git(repo, "rev-list", "--parents", "-n1", commit).split()) > 2:
+            continue
         if cutover_oid is None:
             strict = True
         elif _is_ancestor(repo, cutover_oid, commit):

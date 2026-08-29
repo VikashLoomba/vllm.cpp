@@ -213,6 +213,14 @@ resolution is mechanical and always the same — **drop the branch's index hunk*
 because the archive is frozen and the row's content now lives in the issue body
 that `--backfill` wrote. Nothing is lost by discarding it.
 
+There is a second, smaller cost with the same cause, and it recurs until the
+window closes. A row an in-flight branch appended carries links written relative
+to `.agents/`, and the archive now sits one directory deeper, so git merges the
+row cleanly and `check-agent-record` then reports a dangling link. It happened on
+both merges of `origin/main` taken during this row's implementation. Repoint the
+appended row's links, or drop the hunk; the same one-line loop that moved the
+original 523 links resolves them by target.
+
 What the change does remove is the *recurrence*. Two fresh branches that each
 file an issue no longer share an append target at all, which
 `tests/scripts/test_agent_issue_index.py::FilingAnIssueNoLongerCollides` pins

@@ -297,6 +297,88 @@ class BackfillIsIdempotentAndSafe(unittest.TestCase):
         self.assertEqual(code, 3)
 
 
+class FilingAnIssueNoLongerCollides(unittest.TestCase):
+    """The campaign's actual claim, executable.
+
+    The measurement that opened this row -- 16 of 21 open pull requests
+    CONFLICTING, four of them on the index alone -- is a property of a SHARED
+    APPEND TARGET, not of the index's content. These two cases pin the mechanism
+    in a scratch repository so the argument cannot rot into folklore: two branches
+    that each append to one file collide, and two that each write their own file
+    do not.
+
+    `merge.union.driver=false` throughout, because that is what GITHUB does. A
+    merge run WITH the driver reproduces the local false green this row exists to
+    remove: it resolves cleanly on a developer's machine while the forge reports
+    CONFLICTING and never schedules CI at all (#883, #2248).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = __import__("tempfile").TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        self.git("init", "-q", ".")
+        self.git("config", "user.email", "t@example.com")
+        self.git("config", "user.name", "T")
+        (self.repo / "seed").write_text("seed\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "seed")
+        self.base = self.git("rev-parse", "HEAD").strip()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def git(self, *args: str) -> str:
+        return subprocess.check_output(
+            ["git", "-C", str(self.repo), *args], text=True,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def branch_writing(self, name: str, path: str, content: str) -> str:
+        self.git("checkout", "-q", "-B", name, self.base)
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Append when the file already exists, which is what an index row was.
+        existing = target.read_text() if target.exists() else ""
+        target.write_text(existing + content)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", f"{name} files an issue")
+        return self.git("rev-parse", "HEAD").strip()
+
+    def conflicts(self, a: str, b: str) -> int:
+        out = subprocess.run(
+            ["git", "-C", str(self.repo), "-c", "merge.union.driver=false",
+             "merge-tree", "--write-tree", a, b],
+            capture_output=True, text=True,
+        ).stdout
+        return sum(1 for line in out.splitlines() if line.startswith("CONFLICT"))
+
+    def test_the_old_shape_collides(self) -> None:
+        """A shared append target. This is the control, and it must be RED-ish.
+
+        Without it, the green below proves nothing: a merge that cannot conflict
+        for an unrelated reason would pass the same assertion.
+        """
+        (self.repo / "index.md").write_text("| row 0 |\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "the shared index")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        a = self.branch_writing("a", "index.md", "| row A |\n")
+        b = self.branch_writing("b", "index.md", "| row B |\n")
+        self.assertGreater(
+            self.conflicts(a, b), 0,
+            "the control did not collide, so the case below proves nothing",
+        )
+
+    def test_the_new_shape_does_not(self) -> None:
+        """Each change carries its own file, and the index is not in the tree."""
+        a = self.branch_writing("a", "specs/a.md", "spec A\n")
+        b = self.branch_writing("b", "specs/b.md", "spec B\n")
+        self.assertEqual(
+            self.conflicts(a, b), 0,
+            "two independent filings still collide; the lock was not removed",
+        )
+
+
 class TheRetiredIndexStaysRetired(unittest.TestCase):
     """The row's whole point. If the tracked file returns, so does the lock."""
 

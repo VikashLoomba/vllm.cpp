@@ -203,7 +203,21 @@ zero check-runs, and `ls scripts/check-*.py | wc -l` against the names in
 None on product rows. It touches `.agents/issue-index.md`, which nearly every
 in-flight branch also writes, so it lands as one change and the affected branches
 rebase onto it once — the last conflict of this class rather than a new one.
-16 open PRs currently conflict on it and each will need that single rebase.
+
+**Measured, not assumed.** Re-running `git -c merge.union.driver=false
+merge-tree` for all 16 conflicting pull requests against this branch shows the
+conflict does NOT disappear for them: git follows the rename, so a branch that
+appends an index row now conflicts on `.agents/completed/issue-index.md`
+instead. That is the one-time migration cost, and it is the whole of it. The
+resolution is mechanical and always the same — **drop the branch's index hunk**,
+because the archive is frozen and the row's content now lives in the issue body
+that `--backfill` wrote. Nothing is lost by discarding it.
+
+What the change does remove is the *recurrence*. Two fresh branches that each
+file an issue no longer share an append target at all, which
+`tests/scripts/test_agent_issue_index.py::FilingAnIssueNoLongerCollides` pins
+with its own control: the old shape collides, the new shape does not, both with
+the union driver disabled because that is what GitHub does.
 
 ## Work breakdown
 

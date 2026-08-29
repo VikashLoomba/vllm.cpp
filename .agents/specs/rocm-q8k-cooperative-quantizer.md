@@ -6,12 +6,15 @@ Row: `BACKEND-ROCM`
 
 ## Now
 
-The specification is `READY`. Product implementation and tests are `PENDING`.
-The first implementation must keep the cooperative arm off by default on every
-architecture.
+The local implementation, gfx1100-only unset default, acceptance evidence, and
+fresh review are accepted. Review of immutable head
+`be70d25bbc67e3ce4d242c44d1bd4b47cdd52328` found no findings and returned
+`PASS`.
 
-This commit adds only this specification and the issue ownership row. It makes
-no matrix or lifecycle change.
+Issue #1876 and publication remain open and `PENDING` pull request #2270 or an
+equivalent maintainer-landed evidence commit. Runtime and default validation on
+gfx1200 and gfx1201 remain `PENDING` external hardware. Nothing in this outcome
+claims upstream landing. The owning `BACKEND-ROCM` row remains `ACTIVE`.
 
 ## Issue ownership
 
@@ -565,6 +568,124 @@ Record these items:
 Do not edit `docs/FEATURES.md`, `docs/BENCHMARKS.md`, or another public document
 until the real-checkpoint correctness and performance gates succeed.
 
+## Outcome
+
+The accepted implementation is head
+`be70d25bbc67e3ce4d242c44d1bd4b47cdd52328`, tree
+`6cffd44c485374fcca729615ff93373042b6553c`. Its CLI SHA-256 is
+`289a76a00fbeaa4af9ee5d8d74dad5a501b4935d59e57d350aa53be512759b0b`, and
+its `libvllm.so.0.0.3` SHA-256 is
+`13d46bf5f2a6055635e4b4fb3f2c583b5a653d8f3846f0f5d27e5c728c9fc336`.
+The review record is `/tmp/rocm-q8k-review2.out`, SHA-256
+`f26e6997e95d95c54d13fd243944baefe09e8901f050daa87d823155ad93d04f`;
+it records findings `NONE` and verdict `PASS`. The operator focused gate passed
+3/3 cases and 3561/3561 assertions. The full gate retained the same 25 failures
+as its immutable base, and deterministic preflight ended directly with `All
+gates green.`
+
+### Correctness and reachability
+
+The direct gate compared all 292 bytes of every candidate `BlockQ8_K` with
+both the legacy GPU encoder and `vt::cpu::BlockFromFloat(DType::kQ8_K)`. It
+covered f32, f16, and bf16 inputs; deterministic random values; zero output;
+opposite-sign first-absolute-maximum ties in both orders across wave and
+reduction boundaries; padded stride; three rows; and
+`nsb={1,2,3,10,16}`. Every comparison was byte-identical.
+
+The public dense and grouped operations proved exclusive host-route identity
+and arm-distinct device writes from inside the kernels. Explicit `0`, explicit
+`1`, and unset were exercised on the actual gfx1100 device; invalid values left
+both witness classes at zero. Five independent reviewer mutations made actual
+kernel identity, legacy identity, candidate identity, dense reachability, and
+grouped reachability fail. Each byte-for-byte restoration returned the focused
+gate to 3561/3561 assertions.
+
+The accepted real checkpoint is
+`Qwen3.5-4B-Q4_K_M-unsloth-e87f1764.gguf`, 2,740,937,888 bytes, from
+`unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523`, with
+SHA-256 `00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4`.
+The prompt SHA-256 is
+`e2b801cc6a5739cd317c2f77adfb67040667de524ab60ca64aac39f79c846bba`.
+Its clean tracked source was head
+`88b1b1bc80c7c7024d64b9ab10626a93ff279a95`, tree
+`e2fb82f523d9572a5a3e26437d912c5ea0a5f76c`. All ten measured A/B legs
+produced 256 tokens and one completion SHA-256,
+`769bf8eebae5390db7b6aec5b9ab8e84caa9bc4124f659d77b7240f4494ed245`.
+
+### Engine and profiler evidence
+
+The binding same-binary A/B is `/tmp/rocm-q8k-ab2-be70d25`; its summary and
+provenance SHA-256 values are
+`1a92664c1f95d6710cd83bdd65344d24057e9e5ac4792d2a05b9ecbbe98a9ef2` and
+`ec3837756fbcd22c1b76a7219e84bae8a68aabd24e524d3cc2b87946fe04cb9e`.
+The candidate won all five pairs. Legacy and candidate medians were 30.943 and
+40.316 tok/s, the median paired improvement was 31.377%, and the exact
+one-sided sign test was `p=0.03125`.
+
+The binding two-repeat `rocprofv3 --kernel-trace --stats` subtraction is
+`/tmp/rocm-q8k-prof-be70d25`; its summary and provenance SHA-256 values are
+`a938c56225460a2f0f50bb58cbffe8591af416401638e29c0d97a2c8b0488d40` and
+`692073e885ceb43f5f328802304a5ca24748e8ff084373d709005875f7e2b48c`.
+Both arms issued 129 selected quantizer calls per decode token. Median
+quantizer time fell from 7.8811 to 0.3426 ms/token, a 95.65% reduction, and
+median total kernel time fell from 25.7287 to 18.1923 ms/token. The 7.5385
+ms/token reduction exceeded the 0.0080 ms/token legacy and 0.0043 ms/token
+candidate repeat spreads. Each capture contained only the selected quantizer
+kernel name, and every 4-token output was the prefix of its matching 36-token
+output.
+
+GDB route counters were `[516,0,0,0]` for explicit `0` and `[0,516,0,0]` for
+explicit `1`, ordered as dense legacy, dense candidate, grouped legacy, grouped
+candidate. The 516 selected dense dispatches matched the profiler's selected
+quantizer calls. The focused production gate supplies the separate grouped
+device witness because the dense checkpoint does not exercise grouped routing.
+
+### Memory, hardware, and rejected evidence
+
+Peak VRAM maxima were identical at 7,523,020,800 bytes. The raw paired
+candidate-minus-legacy deltas were `-8192,+8192,-4096,-8192,-4096` bytes,
+inside the 12-16 KiB within-arm sampling spread. Overlapping host RSS samples
+also resolved no arm increase. The cooperative arm adds no allocation,
+synchronization, or copy, and its default-null witness performs no atomic.
+Memory therefore showed no increase beyond repeat resolution.
+
+The accepted hardware was ROCm device 0, an AMD Radeon RX 7900 XTX resolving
+to gfx1100 at PCI `0000:03:00.0` and `/sys/class/drm/card1/device`. Every GPU
+run held `/home/vikash/gpu.lock` with `HIP_VISIBLE_DEVICES=0`,
+`ROCR_VISIBLE_DEVICES=0`, and the fixed ROCm library path. No external KFD
+process appeared. Measured temperature was 62-64 C, sampled peak package power
+was 327 W, and no contention, clock, thermal, or power evidence invalidated a
+leg.
+
+The earlier `/tmp/rocm-q8k-ab-be70d25` campaign is rejected. It sampled DRM
+card0 while ROCm device 0 resolved to card1; its `INVALID.md` records the
+disposition, and no leg was reused. The historical T27 commit
+`05455b6a97f1fe60615af105b63b8611ac681873` is also not acceptance evidence:
+its 8-thread candidate was dense-only, had no direct scratch-byte suite, and
+remained off by default. Its 91.532 to 93.417 tok/s result, 2.06% change, and
+five byte-identical winning pairs cannot establish the current result.
+
+### Default rationale and remaining work
+
+Unset selects the cooperative arm only when the queue-device resolver returns
+gfx1100, including a valid feature-suffix spelling. Exact-byte correctness,
+both production-route witnesses, the five-pair engine win, and the profiler
+reduction ratify that value. Unset remains legacy for gfx1200, gfx1201, unknown
+architectures, and resolution failure because none has its own runtime/default
+acceptance. Explicit `VT_ROCM_Q8K_BLOCK=0` remains the permanent legacy A/B
+control. Explicit `1` remains a diagnostic candidate override regardless of
+architecture so future validation can compare the two arms without another
+binary; it makes no correctness, performance, or default claim outside
+validated gfx1100. Every other value is refused so a misspelling cannot change
+the quantizer silently.
+
+The clean pinned llama.cpp `b10451` floor remains secondary and cannot alter
+the Q8_K byte oracle or this default decision. Gfx1200 and gfx1201 runtime and
+default validation remain `PENDING` external hardware, including gfx1201
+validation from @bakon11. Issue #1876, publication, and merge remain ordered
+after pull request #2270 or equivalent maintainer-landed prompt evidence. The
+broader `BACKEND-ROCM` row therefore remains `ACTIVE`.
+
 ## Risks
 
 - A block-wide reduction can select the wrong signed maximum on an exact tie.
@@ -584,10 +705,9 @@ until the real-checkpoint correctness and performance gates succeed.
 - `gfx1200` runtime validation is `PENDING` external hardware.
 - `gfx1201` runtime validation is `PENDING` external hardware, including
   validation from @bakon11.
-- Public documentation is owed only after successful real-checkpoint gates.
-  If the `gfx1100` unset default changes, the documentation must state the
-  architecture-scoped unset policy and the diagnostic-only scope of explicit
-  `1` on other ROCm architectures.
+- The architecture-scoped public control documentation is complete locally;
+  its publication remains ordered after pull request #2270 or equivalent
+  maintainer-landed prompt evidence.
 - A llama.cpp floor measurement is owed if a clean pinned build cannot run in
   this implementation flow.
 

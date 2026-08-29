@@ -664,9 +664,9 @@ enum class Q8KQuantArm : uint8_t { kLegacy = 0, kCandidate = 1 };
 enum class Q8KProductionRoute : uint8_t { kDense = 0, kGrouped = 1 };
 using Q8KArchResolver = std::string (*)(int) noexcept;
 
-// This constant changes only after the real-checkpoint and profiler gates
-// accept gfx1100. The first implementation remains legacy on every device.
-constexpr bool kQ8KGfx1100DefaultAccepted = false;
+// The accepted real-checkpoint and profiler gates apply only to gfx1100.
+// Explicit arms and every other architecture remain governed by the selector.
+constexpr bool kQ8KGfx1100DefaultAccepted = true;
 
 struct Q8KArchCacheEntry {
   int device_index;

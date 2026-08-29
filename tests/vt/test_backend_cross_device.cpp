@@ -2570,7 +2570,7 @@ void CheckNoQ8KKernelExecutionWitness(DevBufBytes& device_counts) {
 
 }  // namespace
 
-TEST_CASE("ROCm Q8_K policy is resolver-keyed and default-off") {
+TEST_CASE("ROCm Q8_K policy is resolver-keyed and architecture-scoped") {
   for (bool default_accepted : {false, true}) {
     for (int device = 0; device < 5; ++device) {
       CAPTURE(default_accepted);
@@ -2755,7 +2755,7 @@ TEST_CASE("ROCm Q8_K dense and grouped production routes select one actual arm")
     const char* value;
     bool candidate;
   };
-  const ArmCase arms[] = {{"0", false}, {"1", true}, {nullptr, false}};
+  const ArmCase arms[] = {{"0", false}, {"1", true}, {nullptr, true}};
   for (const ArmCase& arm : arms) {
     CAPTURE(arm.value == nullptr ? std::string("unset") : std::string(arm.value));
     {

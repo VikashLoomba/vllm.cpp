@@ -480,6 +480,9 @@ skips with that refusal quoted.
 - Read the matching model or task guide before you add model-specific flags.
 - If startup fails, use the exact error text to find the refused file, option,
   operation, or checkpoint arm in the focused guides.
+- On ROCm, see [Q8_K activation quantization](ROCM.md#select-q8_k-activation-quantization)
+  to inspect or override the architecture-scoped quantizer during
+  troubleshooting.
 - On ROCm, GGUF mixture-of-experts checkpoints compute on the quantized
   expert blocks (Q8_0, Q4_K, Q5_K, Q6_K) instead of being dequantized to
   bf16 at load time.

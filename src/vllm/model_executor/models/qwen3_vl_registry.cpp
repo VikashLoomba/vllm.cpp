@@ -129,11 +129,14 @@ ForwardLogits ForwardQwen3VLForConditionalGeneration(
            "multimodal inputs (ModelForwardInput.mm). Text-only Qwen3-VL through "
            "this arch is a named MM-ENGINE-FORWARD residual.");
   const MultiModalForwardInput& mm = *input.mm;
-  VT_CHECK(mm.inputs_embeds_bf16 != nullptr && mm.positions3 != nullptr &&
-               mm.deepstack_bf16 != nullptr,
-           "Qwen3-VL mm forward: null merged-embeds / positions3 / deepstack "
-           "handle on ModelForwardInput.mm");
-  const int64_t num_tokens = static_cast<int64_t>(mm.positions3->size()) / 3;
+  // ENG-MM-INPUT-PIPELINE P1: both handles are DEVICE views now. `deepstack` is
+  // legitimately absent on a decode step and on a DeepStack-less VL checkpoint, so
+  // only the two mandatory channels are required here; the forward core checks the
+  // shapes it was given.
+  VT_CHECK(mm.inputs_embeds.data != nullptr && mm.positions3.data != nullptr,
+           "Qwen3-VL mm forward: null merged-embeds / positions3 device handle on "
+           "ModelForwardInput.mm");
+  const int64_t num_tokens = mm.positions3.Numel() / 3;
   const Qwen3VLCosSinCache& cos_sin = vl.CosSinCache(input.queue, input.config);
   // DEVICE-resident logits (sampler-on-device) on the gather path — the mm forward
   // produces exactly the single last-token [1, vocab] row, kept ON DEVICE so the
@@ -142,13 +145,13 @@ ForwardLogits ForwardQwen3VLForConditionalGeneration(
   // path (gather_logits=false) reproduces the old download-then-sample A/B.
   if (input.gather_logits) {
     return Qwen3VLForwardStepLastLogitsDevice(
-        input.queue, vl.weights().text, input.config, *mm.inputs_embeds_bf16,
-        *mm.positions3, num_tokens, *mm.deepstack_bf16, mm.deepstack_levels,
+        input.queue, vl.weights().text, input.config, mm.inputs_embeds,
+        mm.positions3, num_tokens, mm.deepstack, mm.deepstack_levels,
         cos_sin.tensor, input.attn_meta, input.attn_kv);
   }
   std::vector<float> logits = Qwen3VLForwardStepLastLogits(
-      input.queue, vl.weights().text, input.config, *mm.inputs_embeds_bf16,
-      *mm.positions3, num_tokens, *mm.deepstack_bf16, mm.deepstack_levels,
+      input.queue, vl.weights().text, input.config, mm.inputs_embeds,
+      mm.positions3, num_tokens, mm.deepstack, mm.deepstack_levels,
       cos_sin.tensor, input.attn_meta, input.attn_kv);
   return HostLogits(std::move(logits), input.config.vocab_size);
 }

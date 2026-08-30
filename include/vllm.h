@@ -328,7 +328,13 @@ extern "C" {
  * this one moved. The dependent sites moved with it: the >= floor in
  * `tests/capi/test_capi.cpp`, the table row and the version line in
  * `docs/USAGE.md`, and the surface row in `docs/FEATURES.md`. */
-#define VLLM_ABI_VERSION 23
+/* v24 — vllm_model_params.kv_cache_dtype, KV-CACHE STORAGE DTYPE (row
+ * `KV-FP8` W6, fork issue #7). Mirrors vLLM CacheConfig.cache_dtype and its
+ * `--kv-cache-dtype` flag (config/cache.py:19-36,76). NULL or "auto" (the
+ * zero value) uses the model dtype and is byte-identical to before; "fp8" or
+ * "fp8_e4m3" stores 1-byte fp8-e4m3 K/V. Appended at the END of
+ * vllm_model_params, so a zero-initialized v23 struct is byte-identical. */
+#define VLLM_ABI_VERSION 24
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -667,6 +673,13 @@ typedef struct vllm_model_params {
    * other half. Every one of those fires BEFORE the tokenizer and before any
    * language-model weight byte is read. Borrowed for the call only. */
   const char* mmproj_path;
+  /* ── KV-cache storage dtype (ABI v24) ──────────────────────────────────────
+   * Mirrors vLLM CacheConfig.cache_dtype and its `--kv-cache-dtype` flag
+   * (config/cache.py:19-36,76). NULL or "auto" (the default) uses the model
+   * dtype and is byte-identical to before this field existed; "fp8" or
+   * "fp8_e4m3" stores 1-byte fp8-e4m3 K/V, halving the bytes per KV block.
+   * Borrowed for the call only. */
+  const char* kv_cache_dtype;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────

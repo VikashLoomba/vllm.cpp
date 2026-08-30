@@ -1733,6 +1733,35 @@ config parse and upstream's disagree about the layer partition (that would be a
 
 ## Owed
 
+- **The last link of W5 -- `Forward` resolving pages from `multi_kv` -- is NOT
+  mechanical, and the reason is the topology rather than the plumbing** (#2323).
+  `DeepseekV4ForwardGgufPaged` and its paged `AttentionBlock` arm have landed and
+  are gated token-for-token against full recompute, but they assume ONE page
+  tensor per layer. A real DeepSeek-V4 config does not have that:
+
+  - `MakeDeepseekV4KVCache` publishes the compressed latent under
+    `model.layers.{l}.attn`, and **skips it entirely for `compress_ratio == 1`**
+    (`deepseek_v4_registry.cpp`: `if (ratio == 1) continue;`, mirroring
+    `attention.py:626-630` returning `None`). Those layers carry only a SWA
+    cache, so `MultiKvCacheIndex::Find` returns -1 for them by design.
+  - The 21 `compress_ratio == 4` layers additionally carry an indexer key cache
+    and compressor states, and their algorithm belongs to
+    `MODEL-DSV4-DSA-COMPOSE` ([#2286](https://github.com/mudler/vllm.cpp/issues/2286)).
+
+  So the wiring has to express THREE layer shapes against the published names,
+  not map a flat list. That is a design step, and doing it by widening the paged
+  forward's per-layer assumption until it stops throwing would produce a forward
+  that reads whichever cache it happened to find -- the silent-wrong-context
+  failure this row has refused twice already.
+
+  Also owed, and noticed while reading that code: this file and the row's records
+  describe the no-MLA-cache layers as `compress_ratio == 0` (the `{0: 5, 4: 21,
+  128: 20}` histogram), while the registry accepts **1, 4 or 128** and skips
+  `ratio == 1`. One of the two is wrong. It is flagged rather than corrected here
+  because only one side was read, and it is the same class as the unreconciled
+  "43 vs 46" layer count.
+
+
 - **W5's dispatch mechanism has landed UNREACHED, and this entry is the record
   AGENTS.md requires for that** (#2323). `ModelFactory::consumes_multi_kv` and
   `MultiKvRefusalApplies` turn `ModelRegistry::Forward`'s blanket refusal into a

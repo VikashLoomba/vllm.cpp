@@ -26,6 +26,7 @@
 #include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
 #include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
+#include "vllm/model_executor/expert_stream_seam.h"  // MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the load-time slot-capacity refusal
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -2488,6 +2489,31 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
         // the computed default, so the number here is the number that gets
         // allocated and not an estimate of it.
         lane.tensor_name_suffix = kStreamedExpertSuffix;
+        // MODEL-TEXT-GLM-MOE-DSA W3 (#2214, spec §3.3). The budget must hold
+        // ONE decode step's whole slice working set, because every `Acquire`
+        // marks its entry protected until `EndStep` clears it. Below that, the
+        // cache does not fail: `Slice` returns nullptr and the caller reads the
+        // tower IN PLACE out of the mmap, counted on stderr and reported as
+        // success. On the model this row targets that is a 187 GiB random read
+        // per token, and a benchmark measuring it would publish a page-cache
+        // number under a streaming label.
+        //
+        // HERE, not inside the store's constructor, because "at load" is the
+        // point of it: the constructor first runs on the FIRST expert slice of
+        // the first forward, after the weights are read and the device pool is
+        // built, which is exactly the 26-minute-then-die shape the refusal a few
+        // lines above exists to avoid. This block is already the one place that
+        // has both the file and the resolved budget.
+        //
+        // Reached on every streaming load, not only this row's: the geometry
+        // comes from the file, so Qwen3.5 is checked by the same call. Streaming
+        // is default OFF and this branch needs `ResolveExpertStreamRequested()`,
+        // so a run that never asked for the lane cannot reach the refusal.
+        const GgufExpertLaneGeometry lane_geom =
+            GgufStreamedExpertLaneGeometry(gguf, lane.tensor_name_suffix);
+        expert_stream::RequireSlotCapacity(
+            std::string(gguf_arch.architecture), lane_geom.streamed_tower_count,
+            lane_geom.experts_per_tok, ResolveExpertStreamSlots());
         const size_t slice =
             GgufLargestExpertSliceBytes(gguf, lane.tensor_name_suffix);
         if (slice > 0) {

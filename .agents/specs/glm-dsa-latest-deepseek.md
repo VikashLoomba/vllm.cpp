@@ -2003,7 +2003,12 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   onto CIFS. Discharged by W7 staging the shards, recording their sha256, and
   reporting which filesystem served the `pread`s.
 - **O8 — the expert-streaming mechanism has no shared seam**, so it is reachable
-  from exactly one model TU (§3.2 gap 1). Discharged by W3.
+  from exactly one model TU (§3.2 gap 1). **DISCHARGED by W3**, 2026-08-30:
+  `include/vllm/model_executor/expert_stream_seam.h` and
+  `src/vllm/model_executor/expert_stream_seam.cpp` carry `ExpertStreamLane` (was
+  `Qwen35ExpertStream`), `ExpertStreamStepGuard`, `HostSliceView` and
+  `ExpertSlice`; `qwen3_5.cpp` is the first client and keeps four alias
+  declarations. The resident-tower fallback is a PARAMETER, not a call — see O13.
 - **O9 — the resident 14.511 GiB is arithmetic from the shard headers, not a
   measurement.** It excludes KV cache, activations, scratch pools and the CUDA
   context, which is the same omission `expert-streaming.md` `## Owed` already
@@ -2021,6 +2026,37 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   describes "fixed contiguous Marlin slots" when no Marlin code is on that path.
   Not this row's record to fix, and named here because a reader who checks that
   row before this section will conclude the capability does not exist.
+- **O13 — this tree has TWO `ResidentWeight` definitions and they are not
+  interchangeable.** `qwen3_5.cpp` defines one in its unnamed namespace which
+  SHADOWS `dense_attn_block.h:181`'s, and the local one additionally refuses a
+  streamed tower, an `elem_kn_repacked` weight and a `repacked` weight at device
+  staging, and carries the `MakeHostBytesDeviceAliasable` /
+  `StageOwnedWeightsToDevice` host-alias arm. W3 found this while lifting the
+  seam: a shared `ExpertSlice` that called `ResidentWeight` itself would bind to
+  the header's definition and silently drop all of those guarantees from
+  Qwen3.5's streamed lane, with no test in the tree able to see it. W3 works
+  around it by injecting the fallback (`ResidentSliceFn`), which is correct and
+  is not a repair. Discharged by reconciling the two definitions, which is not
+  this row's work and has no owner yet.
+- **O14 — the load-time capacity refusal's production call site is not reachable
+  from any CPU gate.** `RequireSlotCapacity` is called from
+  `LoadedEngine::FromModelDir`'s streamed-lane block, which is guarded by
+  `target.needs_weight_staging() && target.host_memory_is_device_addressable()`
+  — true on `dgx:gpu0` and false on every CPU. So W3 gates the refusal, its
+  arithmetic and its GGUF-header inputs directly
+  (`tests/vllm/model_executor/test_expert_stream_capacity.cpp`, 7 cases), and
+  the call site itself is proven only by reading it. Discharged by W7, which is
+  the first wave that loads through that block under an `rc` lease; the same
+  device-only reachability problem `test_expert_stream_device_slot` solves with
+  a fake platform, which W3 did not extend because the block under test is the
+  loader's and not the seam's.
+- **O15 — nothing measures the lifted seam from a SECOND model.** W3 makes the
+  lane reachable by a second TU and Qwen3.5 remains its only client, so what is
+  gated is that the mechanism still works, not that another architecture can
+  take it. This is deliberate: W3's scope is the lift, and a second client
+  without a model to attach it to would be the shell several waves on this row
+  stopped rather than ship. Discharged by W7 routing GLM-5.3's `_exps.weight`
+  towers through the seam.
 
 ### 3.10 Now
 
@@ -2067,5 +2103,54 @@ token-exact number against it. What W3 onward can prove is that a streamed slice
 and a resident tower produce identical logits, which is the row's actual novelty
 and needs no oracle at all.
 
+**W3 LANDED 2026-08-30** ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)),
+and it is the first wave of this section with product code on `main`. The
+expert-streaming wiring is now `expert_stream_seam.{h,cpp}`: `ExpertStreamLane`
+(was `Qwen35ExpertStream`), `ExpertStreamStepGuard`, `HostSliceView` and
+`ExpertSlice`, moved rather than rewritten. `qwen3_5.cpp` shrinks by 556 lines
+and keeps four alias declarations. O8 is discharged; O13, O14 and O15 are new
+and named.
+
+Three things the lift found or decided, each of which a later reader would
+otherwise rediscover.
+
+**The resident fallback could not be a call, and that is O13.** `qwen3_5.cpp`
+defines its own `ResidentWeight` in its unnamed namespace, shadowing
+`dense_attn_block.h:181`'s, and the two differ: the local one refuses a streamed
+tower, an `elem_kn_repacked` weight and a `repacked` weight at device staging,
+and carries the host-alias arm. A shared `ExpertSlice` that called
+`ResidentWeight` itself would have bound to the header's definition and dropped
+every one of those guarantees from Qwen3.5's streamed lane, with no gate in the
+tree able to see it — the tokens would still be tokens. So `ExpertSlice` takes a
+`ResidentSliceFn` and each model passes its own. Byte-identity then holds by
+construction rather than by inspection.
+
+**Qwen3.5's byte-identity is measured, not argued.** Two separately-built
+libraries differing only in `qwen3_5.cpp` — the lifted file and `origin/main`'s,
+same build directory, same flags, both relinked and confirmed distinct by
+sha256 — run the same synthetic forward through `Qwen3_5Model::Forward` and
+produce logits digest `84ae1a52ee64d117` over 160 floats, with streaming OFF and
+with streaming ON, and with a character-identical
+`[expert-stream] steps=1 hits=0 misses=42 evictions=0 fills=42 bytes=45696
+exhausted=0 advised=42` line. The one deliberate text change is the step guard's
+refusal prefix, `qwen3_5:` to `expert stream:`, because the guard is no longer
+that model's; `test_expert_stream_steps` matches on `must not nest` and is
+unaffected.
+
+**The capacity refusal is at LOAD, and it fires on every streaming load rather
+than only this row's.** §3.3 argued for it and W3 ships it: below
+`streamed_towers * experts_per_tok` the loader refuses by name instead of
+letting `Slice` return nullptr and the caller read the tower in place out of the
+mmap. Both terms are read off the GGUF header the lane will serve
+(`GgufStreamedExpertLaneGeometry`), so the refusal and the forward cannot
+disagree about a checkpoint. This DOES change one behaviour outside this row: a
+`VT_MOE_EXPERT_STREAM=1` load of a large Qwen3.5 at the default 64 slots now
+refuses rather than silently degrading. That is the intended polarity and it is
+not a numerical change — streaming is default OFF, the six existing streaming
+binaries do not load through `FromModelDir`, and all of them stay green. An
+unknown geometry is inert rather than a refusal, so an architecture whose
+metadata the reader did not understand is never refused by a number the reader
+invented.
+
 **Next action:** W1 and W2, both CPU, both independent. W1 belongs to
-`QUANT-GGUF-IQ4_XS` and unlocks two arms at once.
+`QUANT-GGUF-IQ4_XS` and unlocks two arms at once. W4 is now unblocked on W3.

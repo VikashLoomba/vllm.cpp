@@ -2,6 +2,8 @@
 // See `glm5_next_layer.h` for the oracle, the port anchors and the manifold.
 #include "vllm/model_executor/models/glm5_next_layer.h"
 
+#include "vllm/model_executor/models/glm5_next_diag.h"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -138,12 +140,23 @@ DecoderLayerResult DecoderLayerForward(
                 static_cast<size_t>(H), collapsed.data() + t * H);
   }
 
+  if (diag::Level() > 1) {
+    const std::string tag = "L" + std::to_string(layer_idx) + " ";
+    diag::Stats((tag + "in.streams").c_str(), hidden_streams);
+    diag::Stats((tag + "mhc_pre.collapsed").c_str(), collapsed);
+  }
+
   // `self.input_layernorm(hidden_states)` (`:1296`) — applied AFTER the collapse
   // and as a separate module, which is why `glm5_next::MhcPre` deliberately does
   // not fold it (`glm5_next_mhc.h`).
   for (int64_t t = 0; t < tokens; ++t) {
     RmsNorm(collapsed.data() + t * H, w.input_layernorm.data(), H,
             p.rms_norm_eps, normed.data() + t * H);
+  }
+
+  if (diag::Level() > 1) {
+    diag::Stats(("L" + std::to_string(layer_idx) + " attn_norm.out").c_str(),
+                normed);
   }
 
   // ── the attention arm (`:1297-1315`) ──────────────────────────────────────
@@ -204,6 +217,12 @@ DecoderLayerResult DecoderLayerForward(
     }
   }
   RequireSize("attention output", attn_out.size(), tokens * H);
+  if (diag::Level() > 1) {
+    diag::Stats(("L" + std::to_string(layer_idx) + " attn.out (" +
+                 std::string(Glm5NextLayerKindName(w.attn_kind)) + ")")
+                    .c_str(),
+                attn_out);
+  }
 
   // ── the attention site's mHC post (`:1316-1318`) ──────────────────────────
   // `post.unsqueeze(-1) * hidden.unsqueeze(-2) + matmul(comb.transpose(-1,-2),
@@ -219,6 +238,11 @@ DecoderLayerResult DecoderLayerForward(
     RequireSize("mHC attention fold", mixed.size(), hc * H);
     std::copy_n(mixed.data(), static_cast<size_t>(hc * H),
                 streams.data() + t * hc * H);
+  }
+
+  if (diag::Level() > 1) {
+    diag::Stats(("L" + std::to_string(layer_idx) + " streams@attn_fold").c_str(),
+                streams);
   }
 
   // ── the feed-forward site's mHC pre (`:1320-1323`) ────────────────────────
@@ -245,6 +269,14 @@ DecoderLayerResult DecoderLayerForward(
     mlp_out = MoeForward(MoeDimsFrom(p), w.moe, normed, tokens, queue);
   }
   RequireSize("feed-forward output", mlp_out.size(), tokens * H);
+  if (diag::Level() > 1) {
+    diag::Stats(("L" + std::to_string(layer_idx) + " ffn_norm.out").c_str(),
+                normed);
+    diag::Stats(("L" + std::to_string(layer_idx) + " mlp.out (" +
+                 std::string(Glm5NextMlpKindName(w.mlp_kind)) + ")")
+                    .c_str(),
+                mlp_out);
+  }
 
   // ── the feed-forward site's mHC post (`:1325-1327`) ───────────────────────
   for (int64_t t = 0; t < tokens; ++t) {
@@ -350,6 +382,14 @@ std::vector<float> TextModelForward(const Glm5NextParams& p,
     streams = std::move(r.hidden_streams);
     topk = std::move(r.topk_indices);
     topk_width = topk.empty() ? 0 : r.topk_width;
+    // ONE LINE PER LAYER, which is what makes this a bisect rather than a
+    // verdict: the first layer whose streams stop being finite, or stop
+    // varying, is the layer that owns the defect. A single reading of the last
+    // layer says the model is broken and nothing about where.
+    if (diag::Level() > 0) {
+      diag::Stats(("layer[" + std::to_string(i) + "].streams out").c_str(),
+                  streams);
+    }
   }
 
   // `self.norm(self.hc_head(hidden_states))` (`:1493`). `HcHeadCollapseMean` is
@@ -362,6 +402,9 @@ std::vector<float> TextModelForward(const Glm5NextParams& p,
     const std::vector<float> slab(streams.begin() + t * hc * H,
                                   streams.begin() + (t + 1) * hc * H);
     const std::vector<float> collapsed = HcHeadCollapseMean(slab, hc, H);
+    if (diag::Level() > 0 && t == tokens - 1) {
+      diag::Stats("hc_head collapse (last token)", collapsed);
+    }
     RmsNorm(collapsed.data(), norm.data(), H, p.rms_norm_eps,
             out.data() + t * H);
   }

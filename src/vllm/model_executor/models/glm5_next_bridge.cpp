@@ -112,6 +112,29 @@ std::vector<float> DecodeOwnedTensorRowsToF32(const OwnedTensor& t,
                "bridged to a host f32 reference");
   }
   if (t.bytes.empty()) Fail(what, "carries no bytes");
+  // A LAYOUT THIS DECODER CANNOT READ IS REFUSED BY NAME, because it cannot be
+  // detected any other way. `OwnGgufQuantBlocks` permutes an eligible q8_0
+  // weight into the `block_q8_0x4` i8mm interleave when
+  // `GgufLoadPolicy::quant_repack` is set -- which it is on every aarch64 i8mm
+  // box this row runs on -- and it leaves the DTYPE at `kQ8_0` and the byte
+  // count UNCHANGED, since `sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0)`. So
+  // every span and block check below passes, `BlockToFloat(kQ8_0)` reads the
+  // interleave as plain blocks, and this function returns finite, plausible,
+  // WRONG floats. The same holds for the CUDA coalesced-load layout and for the
+  // elementwise `[N,K] -> [K,N]` transpose, whose own field comment says a
+  // consumer that ignores it "would read garbage". This bridge is exactly such
+  // a consumer. See `test_glm5_next_bridge.cpp` and issue #2241.
+  if (t.repacked || t.q8_0_aligned || t.elem_kn_repacked) {
+    Fail(what, std::string("was repacked at load into a layout this host f32 "
+                           "bridge cannot read (") +
+                   (t.repacked ? "repacked " : "") +
+                   (t.q8_0_aligned ? "q8_0_aligned " : "") +
+                   (t.elem_kn_repacked ? "elem_kn_repacked " : "") +
+                   "set). The bytes are a permutation, the dtype and the byte "
+                   "count are unchanged, and decoding them as plain blocks "
+                   "returns wrong values with no error. The loader must not "
+                   "request a repack for a weight this bridge decodes");
+  }
 
   std::vector<float> out(static_cast<size_t>(want_elems));
   if (vt::IsBlockQuant(t.dtype)) {
@@ -219,6 +242,29 @@ std::vector<float> DecodeOwnedTensorToF32(const OwnedTensor& t,
                "be bridged to a host f32 reference");
   }
   if (t.bytes.empty()) Fail(what, "carries no bytes");
+  // A LAYOUT THIS DECODER CANNOT READ IS REFUSED BY NAME, because it cannot be
+  // detected any other way. `OwnGgufQuantBlocks` permutes an eligible q8_0
+  // weight into the `block_q8_0x4` i8mm interleave when
+  // `GgufLoadPolicy::quant_repack` is set -- which it is on every aarch64 i8mm
+  // box this row runs on -- and it leaves the DTYPE at `kQ8_0` and the byte
+  // count UNCHANGED, since `sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0)`. So
+  // every span and block check below passes, `BlockToFloat(kQ8_0)` reads the
+  // interleave as plain blocks, and this function returns finite, plausible,
+  // WRONG floats. The same holds for the CUDA coalesced-load layout and for the
+  // elementwise `[N,K] -> [K,N]` transpose, whose own field comment says a
+  // consumer that ignores it "would read garbage". This bridge is exactly such
+  // a consumer. See `test_glm5_next_bridge.cpp` and issue #2241.
+  if (t.repacked || t.q8_0_aligned || t.elem_kn_repacked) {
+    Fail(what, std::string("was repacked at load into a layout this host f32 "
+                           "bridge cannot read (") +
+                   (t.repacked ? "repacked " : "") +
+                   (t.q8_0_aligned ? "q8_0_aligned " : "") +
+                   (t.elem_kn_repacked ? "elem_kn_repacked " : "") +
+                   "set). The bytes are a permutation, the dtype and the byte "
+                   "count are unchanged, and decoding them as plain blocks "
+                   "returns wrong values with no error. The loader must not "
+                   "request a repack for a weight this bridge decodes");
+  }
 
   std::vector<float> out(static_cast<size_t>(numel));
   const uint8_t* src = t.bytes.data();

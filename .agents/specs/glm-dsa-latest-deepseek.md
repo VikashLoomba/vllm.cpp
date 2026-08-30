@@ -1745,7 +1745,22 @@ are CPU-gateable and need no GPU. W5, W7 and W8 need a GPU.** Sizes are the
 author's estimate of reviewable diff, not a budget. W1 and W2 are independent of
 each other; everything else is ordered.
 
-#### W1 — the `IQ4_XS` encoding (CPU, medium)
+#### W1 — the `IQ4_XS` encoding (CPU, medium) — **LANDED, by another row**
+
+**DISCHARGED on `origin/main` before this row reached it, and verified at the
+three sites rather than taken on report.** `2e9f4d88d`
+([#2247](https://github.com/mudler/vllm.cpp/issues/2247),
+[#2256](https://github.com/mudler/vllm.cpp/issues/2256)) landed the keep-quant
+`vec_dot` for the sibling Flash row: `VecDotIQ4_XSQ8_K` is defined at
+`cpu_quant_dot.cpp:844` and dispatched at `:1004`, its `QuantTypeTraits` row is
+`MakeTraits(DType::kIQ4_XS, DType::kQ8_K)` at `cpu_quant_traits.cpp:121-122`,
+and `KeepQuantDType` gates on `HasQuantDotKernel` at `gguf_keep_quant.cpp:176`.
+So `HasQuantDotKernel(kIQ4_XS)` is TRUE and the type is no longer expanded to
+bf16. `QUANT-GGUF-IQ4_XS` records the same at `quantization-matrix.md:78`
+(`C = Y` since #2247). **`kIQ2_XS` landed in the same commit** (`:1003`), which
+discharges the IQ4_XS and IQ2_XS halves of O2 and O3 together.
+
+The original scope is kept below as history. Nothing in it remains to do.
 
 **Scope:** the keep-quant `VecDotIQ4_XSQ8_K` and its `QuantTypeTraits` row, so
 `vt::cpu::HasQuantDotKernel(kIQ4_XS)` becomes true and
@@ -1853,10 +1868,54 @@ arrive from the config parsed in W2, not be constructed in the test.
 
 #### W5 — the indexer KV side cache (GPU, large) — [#1925](https://github.com/mudler/vllm.cpp/issues/1925)
 
+**STRUCK FROM THIS ROW 2026-08-30, and RE-SEQUENCED as a consumption site.**
+This is not a deferral: the wave does not belong to this row at any date, and
+what remains here is the site that consumes `KV-DSV4-MULTICACHE` W5 once that
+row lands it. The conditional below is retained because reading how it resolved
+is the point.
+
 **Scope:** the indexer's own 132 B/token cache in its own kv-cache group, so a
 resumed request no longer refuses. This is `KV-DSV4-MULTICACHE`'s work and this
 row consumes it; if that row does not schedule it, this row's W5 is where it
 lands and the ownership is recorded in both places before a line is written.
+
+**The condition resolved FALSE.** `KV-DSV4-MULTICACHE` HAS scheduled W5. It
+carries a `### W5 design` section (W5-1 through W5-6) tracked by
+[#2323](https://github.com/mudler/vllm.cpp/issues/2323), and its first
+implementation commit — W5-2's "the refusal becomes a gated dispatch" — is
+already written on `row/KV-DSV4-W5-IMPL`. Three further branches are working the
+same by-name multi-KV plumbing concurrently (`ENG-MULTIKV-BYNAME`,
+`ENG-MULTIKV-FORWARD-1925`, `MODEL-MM-GLM53-FLASH-MULTIKV`). So this row
+CONSUMES that channel and takes no cache-plumbing scope of its own; the decision
+is recorded in `.agents/specs/kv-dsv4-multicache.md` beside its W5 boundary
+table, per the sentence above.
+
+**Two further reasons, either of which is independently sufficient**, recorded
+so a later reader does not reopen this on the ownership point alone:
+
+1. **The test this wave named would have deleted another row's guard.** The
+   refusal below guards `Dots3NoteForCausalLM` and belongs to
+   `MODEL-DOTS3-NOTE` ([#699](https://github.com/mudler/vllm.cpp/issues/699)) —
+   a different model. Its own comment already says the indexer cache "is
+   `KV-DSV4-MULTICACHE` (#1925), **not this row**", and `kv-dsv4-multicache.md`
+   W5-2 says **"deleting the refusal is the one thing W5 must not do"**,
+   because it would restore the silent-discard failure W3 built it to prevent.
+   The replacement is a DISPATCH on a declared capability, not an absence.
+2. **There is no GLM-5.3 forward to wire a cache into.**
+   `glm_moe_dsa.cpp` is a config parser plus `kForwardRefusal`; W1 (`IQ4_XS`)
+   and W7 (the loader and the streamed towers) are both undone, so no GLM-5.3
+   weight can be materialized. A cache routed into a refusal stub is a shell
+   under `## Nothing lands dead`, gateable only by a unit test that constructs
+   the type by hand — which proves the class works, never that anything reaches
+   it.
+
+**What is left here, and its shape.** Not a wave — a CONSUMPTION SITE that
+opens when `KV-DSV4-MULTICACHE` W5 lands, built on the form
+`MODEL-MM-GLM53-FLASH` already proved: `glm5_next_kv.{h,cpp}`,
+`ModelFactory::consumes_multi_kv_cache`, and each layer resolving its own caches
+by the names they were published under, where an unresolved name refuses rather
+than falling back. It is ordered after W7, because a consumption site needs a
+forward and a loaded weight to consume anything, and W7 supplies both.
 **Exclusions:** sparse prefill, which is W6.
 **Anchors:** `DeepseekV32IndexerCache` `deepseek_v2.py:696-701`; the
 `MLAAttentionSpec` merge rule `vllm/v1/kv_cache_interface.py:399-429` that forces
@@ -1888,6 +1947,12 @@ W3 seam; the resident class staged to device; safetensors refused by name (D1);
 `allow_mtp_tail` skipping block 78. Stage `UD-IQ1_S` (201.83 GiB, 6 shards) to
 `/mnt/nas_share` — 2.2 TiB free — and record the sha256 of each shard.
 **Exclusions:** no speed number.
+**No decoder or keep-quant question remains on this path (verified 2026-08-30):**
+all six encodings the `UD-IQ1_S` arm uses — IQ1_S, IQ3_XXS, IQ2_XXS, IQ4_XS,
+Q2_K, Q3_K — have a `vec_dot` row in `cpu_quant_dot.cpp` on `origin/main`, 6 of
+6, so the arm keeps its blocks and `gguf_device_fit.cpp`'s all-or-nothing rule
+admits it to the streaming lane. `IQ1_M` is still absent, which refuses only the
+`UD-IQ1_M` arm this wave does not stage.
 **Tests:** **G2** structurally over the real shard headers, env-gated; the model
 loads and produces a first token; the resident footprint measured against the
 14.511 GiB this section predicts, and the difference explained if it is not
@@ -1971,13 +2036,23 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   multi-device execution path this project does not have. Tracked by
   [#2214](https://github.com/mudler/vllm.cpp/issues/2214). Discharged by either
   of those two things and by nothing else.
-- **O2 — `IQ4_XS` has a decoder and no keep-quant `vec_dot`, so the target arm
+- **O2 — DISCHARGED 2026-08-30 by `2e9f4d88d`** (#2247, #2256), which landed
+  `VecDotIQ4_XSQ8_K` (`cpu_quant_dot.cpp:844`, dispatched `:1004`) and its
+  traits row (`cpu_quant_traits.cpp:121-122`). `HasQuantDotKernel(kIQ4_XS)` is
+  true, so the arm keeps its blocks and stays in the streaming lane. Verified at
+  the three sites on `origin/main`, not taken on report. Original text: `IQ4_XS`
+  has a decoder and no keep-quant `vec_dot`, so the target arm
   loads by EXPANDING four expert towers from 6.375 GiB to 24.000 GiB and, worse,
   drops out of the streaming lane entirely** (`gguf_device_fit.cpp:85-100` is
   all-or-nothing across a model's `*_exps` tensors). Discharged by W1 landing
   `VecDotIQ4_XSQ8_K`. Owned by `QUANT-GGUF-IQ4_XS`.
-- **O3 — `IQ2_XS` (id 17) is in the same state and `IQ1_M` (id 29) has no reader
-  traits at all.** `UD-Q2_K_XL` would expand 148 towers from 128.344 GiB to
+- **O3 — HALF DISCHARGED 2026-08-30. `IQ2_XS` (id 17) landed in the same
+  commit as O2** (`2e9f4d88d`, dispatched `cpu_quant_dot.cpp:1003`), so
+  `UD-Q2_K_XL` no longer expands. **`IQ1_M` (id 29) still has no reader traits
+  at all** — zero occurrences in `cpu_quant_dot.cpp` and `gguf_reader.cpp` on
+  `origin/main`, re-measured 2026-08-30 — so `UD-IQ1_M` still refuses at file
+  open and that half stands. Original text: `IQ2_XS` (id 17) is in the same
+  state and `IQ1_M` (id 29) has no reader traits at all.** `UD-Q2_K_XL` would expand 148 towers from 128.344 GiB to
   888.000 GiB; `UD-IQ1_M` refuses at file open. Discharged by a
   `VecDotIQ2_XSQ8_K` and an `IQ1_M` port, or by this row permanently recording
   those two arms as unreachable. Nothing here needs either; they are named so a
@@ -1988,27 +2063,57 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   record to repair. Named here because a reader who checks `gguf_dequant.cpp` and
   stops will conclude both types are supported.
 - **O4 — the indexer KV side cache does not exist**, so sparse decode refuses any
-  resumed request (`dots3_note_device.cpp:1147-1180`). Discharged by W5, whose
-  work is `KV-DSV4-MULTICACHE`'s
-  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)).
+  resumed request — the refusing `VT_CHECK(!elig.prunes || elig.Active(), ...)`,
+  at `dots3_note_device.cpp:1204-1227` on `origin/main` `03e0dcd19` and
+  `:1205-1228` on this row's integration branch, which is W4's own three-line
+  edit moving it. The anchor read `:1147-1180` until 2026-08-30, see O20. Discharged by `KV-DSV4-MULTICACHE`
+  W5 ([#1925](https://github.com/mudler/vllm.cpp/issues/1925),
+  [#2323](https://github.com/mudler/vllm.cpp/issues/2323)) and consumed here,
+  NOT by a wave of this row — the §3.7 W5 conditional resolved FALSE on
+  2026-08-30 and the decision is recorded in both specs. The refusal is not
+  discharged by DELETION under any owner: it guards `Dots3NoteForCausalLM`
+  (`MODEL-DOTS3-NOTE`, #699) and its replacement is a gated dispatch.
 - **O5 — MTP is skipped, not implemented.** `num_nextn_predict_layers: 1` and
   `index_share_for_mtp_iteration: true` are dropped through `allow_mtp_tail`.
   There is no MTP drafter in the tree (`src/vllm/v1/spec_decode/` holds three
   files, none of them one). Discharged by a drafter row that does not exist yet.
 - **O6 — sparse prefill does not exist** (§3.5.2 item 3). Discharged by W6.
-- **O7 — no artifact is staged and no `pread` streaming number exists on any real
-  checkpoint** (`expert-streaming.md` `## Owed`, verbatim: "The `pread` path has
-  never run on the model"). `dgx.casa`'s local disk was 184 GiB free at its last
-  measurement (§0.1 C3, 2026-07-21) against a 201.83 GiB arm, so W7 may be forced
-  onto CIFS. Discharged by W7 staging the shards, recording their sha256, and
-  reporting which filesystem served the `pread`s.
+- **O7 — PARTIALLY DISCHARGED by W7, 2026-08-30; the half that remains is the
+  measurement rather than the staging.** The `UD-IQ1_S` arm is being staged to
+  `/mnt/nas_share/rc/ckpt/GLM-5.3-UD-IQ1_S/` (which IS `/workspace` on a leased
+  worker), sha256-verified per shard by the fetch script as each one lands.
+  Recorded so far, at revision `346b3591c7f28d1a23716f97a065ecf12ec14771`:
+  shard 1 `ff3adab0853dfb00bdf3889ec3f5556196f56b65783115720d57767bbd760dd9`,
+  shard 2 `659d04cf4fc0b6026944f34c0b590a635803bff06c1775361e28490db7b168f8`.
+  Shards 3-6 were still downloading when W7 ended (43% of 201.83 GiB staged) and
+  their hashes are owed to the wave that drives the load. **NO `pread` NUMBER
+  EXISTS AND NONE IS CLAIMED** (`expert-streaming.md` `## Owed`, verbatim: "The
+  `pread` path has never run on the model"). `/mnt/nas_share` is CIFS, and §3.7
+  W7's stop condition binds: a `pread` served across CIFS is a CIFS number and
+  must be labelled one, never reported as a streaming measurement. Whether
+  `dgx.casa`'s local disk can hold 201.83 GiB was NOT re-measured — the last
+  figure is 184 GiB free from 2026-07-21 (§0.1 C3), which is stale rather than
+  current. Discharged by a wave that records the remaining four hashes, drives
+  the load, and states which filesystem served the reads.
 - **O8 — the expert-streaming mechanism has no shared seam**, so it is reachable
-  from exactly one model TU (§3.2 gap 1). Discharged by W3.
+  from exactly one model TU (§3.2 gap 1). **DISCHARGED by W3**, 2026-08-30:
+  `include/vllm/model_executor/expert_stream_seam.h` and
+  `src/vllm/model_executor/expert_stream_seam.cpp` carry `ExpertStreamLane` (was
+  `Qwen35ExpertStream`), `ExpertStreamStepGuard`, `HostSliceView` and
+  `ExpertSlice`; `qwen3_5.cpp` is the first client and keeps four alias
+  declarations. The resident-tower fallback is a PARAMETER, not a call — see O13.
 - **O9 — the resident 14.511 GiB is arithmetic from the shard headers, not a
   measurement.** It excludes KV cache, activations, scratch pools and the CUDA
   context, which is the same omission `expert-streaming.md` `## Owed` already
-  records for its own fit bound. Discharged by W7 reporting the measured resident
-  footprint beside this prediction.
+  records for its own fit bound. **STILL OWED after W7**, which loaded no real
+  weight: no `rc` lease was obtained and the artifact was 43% staged when the
+  wave ended, so the 14.511 GiB stands as arithmetic. When it is measured, note
+  what may and may not establish it: **peak RSS is NOT a residency measurement
+  while the towers are mmap-resident**, because `VmHWM` then tracks page-cache
+  pressure — the sibling Flash row read 99.47, 85.18 and 72.05 GiB for the same
+  model on different boxes. The number that answers this item is the DEVICE pool
+  the resident class occupies, not the process's high-water mark. Discharged by a
+  wave reporting that beside this prediction, and naming what established it.
 - **O10 — no speed axis has a denominator** (§3.6). vLLM cannot run the model, so
   the only comparable is llama.cpp on the same artifact, a labeled secondary
   floor. Open gap by construction, not a waiver.
@@ -2021,8 +2126,486 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   describes "fixed contiguous Marlin slots" when no Marlin code is on that path.
   Not this row's record to fix, and named here because a reader who checks that
   row before this section will conclude the capability does not exist.
+- **O13 — this tree has TWO `ResidentWeight` definitions and they are not
+  interchangeable.** `qwen3_5.cpp` defines one in its unnamed namespace which
+  SHADOWS `dense_attn_block.h:181`'s, and the local one additionally refuses a
+  streamed tower, an `elem_kn_repacked` weight and a `repacked` weight at device
+  staging, and carries the `MakeHostBytesDeviceAliasable` /
+  `StageOwnedWeightsToDevice` host-alias arm. W3 found this while lifting the
+  seam: a shared `ExpertSlice` that called `ResidentWeight` itself would bind to
+  the header's definition and silently drop all of those guarantees from
+  Qwen3.5's streamed lane, with no test in the tree able to see it. W3 works
+  around it by injecting the fallback (`ResidentSliceFn`), which is correct and
+  is not a repair. Discharged by reconciling the two definitions, which is not
+  this row's work and has no owner yet.
+- **O14 — the load-time capacity refusal's production call site is not reachable
+  from any CPU gate.** `RequireSlotCapacity` is called from
+  `LoadedEngine::FromModelDir`'s streamed-lane block, which is guarded by
+  `target.needs_weight_staging() && target.host_memory_is_device_addressable()`
+  — true on `dgx:gpu0` and false on every CPU. So W3 gates the refusal, its
+  arithmetic and its GGUF-header inputs directly
+  (`tests/vllm/model_executor/test_expert_stream_capacity.cpp`, 7 cases), and
+  the call site itself is proven only by reading it. Discharged by W7, which is
+  the first wave that loads through that block under an `rc` lease; the same
+  device-only reachability problem `test_expert_stream_device_slot` solves with
+  a fake platform, which W3 did not extend because the block under test is the
+  loader's and not the seam's. **STILL OWED after W7.** W7 loaded a model through
+  `FromModelDir`, but on a CPU and on a synthetic fixture, so the device-gated
+  block that calls `RequireSlotCapacity` was not entered: it needs
+  `needs_weight_staging() && host_memory_is_device_addressable()`, which is a
+  GB10 and not a CI runner, and it additionally needs
+  `factory->streams_routed_experts`, which W7 deliberately did NOT set (O22).
+  Discharged by the wave that drives the load on `dgx:gpu0`.
+- **O15 — nothing measures the lifted seam from a SECOND model.** W3 makes the
+  lane reachable by a second TU and Qwen3.5 remains its only client, so what is
+  gated is that the mechanism still works, not that another architecture can
+  take it. This is deliberate: W3's scope is the lift, and a second client
+  without a model to attach it to would be the shell several waves on this row
+  stopped rather than ship. **STILL OWED after W7, and this is the most important
+  thing W7 did not do.** W7 loads GLM-5.3's 228 towers and holds them in exactly
+  the shape the seam consumes — stacked keep-quant, borrowed from the mmap, flat
+  `[E*out, K]`, the form `LoadExpertsStackedKq` produces for the seam's only
+  gated client — but nothing calls `expert_stream::ExpertSlice` on them, because
+  the forward that would does not exist (O21). Qwen3.5 therefore remains the
+  seam's only client. Discharged by the wave that writes the forward and routes
+  the towers through it.
+- **O16 — W2 lands three surfaces that NOTHING reaches yet**, and it says so
+  rather than letting a reader infer reachability from a green suite. The
+  registration, its config hook, the `glm-dsa` `kGgufArchArms` row and
+  `GlmMoeDsaHfConfigFromGguf` ARE reached, from `LoadedEngine::FromModelDir`
+  through `HfConfigFromGgufDispatch` and `ModelRegistry::Resolve`, and the
+  focused suite enters through that entry point. `GlmMoeDsaModel::Forward` /
+  `ForwardDevice`, the registry's `forward` hook and `MakeGlmMoeDsaKVCache` are
+  NOT: every arm of `load_weights` refuses, so no `LoadedModel` of this type can
+  exist and neither the forward nor the KV-cache hook can be called through
+  production. Owned by this row. **HALF DISCHARGED by W7, 2026-08-30**: the GGUF
+  arm of `load_weights` loads, so a `GlmMoeDsaLoadedModel` DOES exist and
+  `MakeGlmMoeDsaKVCache` is reached through it —
+  `tests/vllm/models/test_glm_moe_dsa_gguf_load.cpp` builds one through
+  `LoadedEngine::FromModelDir`, and three mutations (the `kGgufArchArms` row, the
+  `REGISTER_VLLM_MODEL` line, the GGUF branch of `LoadGlmMoeDsaForCausalLM`) each
+  red it. The FORWARD hook is still not reached, because `GlmMoeDsaModel::Forward`
+  still refuses — that half is O21. Tracked by
+  [#2214](https://github.com/mudler/vllm.cpp/issues/2214).
+- **O17 — the one staged GGUF arm cannot be fed, because it states no indexer
+  schedule.** D3 records that the published conversion writes no
+  `glm-dsa.attention.indexer.types`, and W2 refuses such a file by name rather
+  than substituting llama.cpp's hardcoded table. So the `glm-dsa` arm is
+  implemented and the published artifact still does not load.
+  **W7 CONFIRMED THE DIAGNOSIS ON THE REAL FILE AND SHIPPED THE REPAIR,
+  2026-08-30, and the repair is to the FILE and not to the loader.** Shard 1's KV
+  block was read key by key at revision
+  `346b3591c7f28d1a23716f97a065ecf12ec14771`: **64 keys, and none of
+  `glm-dsa.attention.indexer.types`, `index_topk_freq` or
+  `index_skip_topk_offset` is among them.** The file also declares `indexer.*` on
+  all 79 blocks, so its own tensor list cannot be read as the schedule either —
+  D3's broadcast, confirmed by census.
+  `scripts/glm-dsa-write-indexer-types.py` writes the key llama.cpp's own
+  converter would have written (`b10451:conversion/glm.py:337-339`),
+  TRANSCRIBING it from the model author's `config.json` and deriving nothing. It
+  refuses a config that states no `indexer_types`, refuses a shard that carries
+  tensor payload (growing that header would move every tensor's data without
+  moving its recorded offset), refuses a file that already states its schedule,
+  and reads its own output back before reporting success. It rewrites only the
+  metadata shard, which on this artifact is shard 1: 9,428,677 bytes, zero
+  tensors, header ending exactly at end-of-file. A dry run over the real shard
+  produces a 9,428,810-byte file, 64 keys becoming 65, sha256
+  `b3e9838651a5c279533c98390ab4bc03cf1d8c176d5be0754180f07d9ed85c01`.
+  **The output is a DERIVED artifact and must never be quoted as the published
+  one.** The loader's refusal is NOT weakened, which is D3's whole point: a
+  hardcoded 78-entry constant that happens to be right is the shape that silently
+  becomes wrong on GLM-5.4. Fully discharged when a wave runs the script against
+  the complete artifact and records the derived shard's hash beside the published
+  ones.
+- **O18 — the fp32 router GEMM's dtype SELECTION has no discriminating
+  numerical gate, and this is measured rather than suspected.** W4 makes
+  `MoeBlock` size `dlog` from `DeepseekV2Params::router_dtype_is_f32`
+  (`deepseek_v2.cpp:363`), and the line is REACHED — `MoeBlock` is on
+  `DeepseekV2Model::Forward`, which `test_deepseek_v2_forward` drives on the CPU.
+  What no test can see is the dtype itself. Over the tiny fixture's 500 output
+  logits the f32 arm and the bf16 arm are BIT-IDENTICAL (`differing = 0/500`,
+  `maxabs = 0`): the router logits feed an f32 softmax and top-k, and every
+  activation downstream of the combine is stored at bf16, so the ~4e-3 relative
+  rounding the wider store removes is re-introduced two ops later. Forcing
+  `DType::kF32` unconditionally at `:363` also leaves every case in that file
+  green, which was measured as mutation M7. So what W4 gates is the PARSE
+  (against the pinned oracle's own return values on eight configs), that an f32
+  and a bf16 store of one GEMM genuinely differ (13 of 24 exact-integer
+  products), and that the f32 arm RUNS end to end through `vt::MoeRouterTopK`;
+  the selection at `:363` is proven by reading. Discharged by a fixture whose
+  routing is precision-sensitive enough to separate the two arms, or by an
+  end-to-end gate against a checkpoint that declares `moe_router_dtype:
+  "float32"` — neither of which this row needs, because GLM-5.3's own forward is
+  W7's. Named so a reader who sees a green suite does not conclude the dtype is
+  gated. This is the `## Gates` hazard AGENTS.md states — "a token gate cannot
+  detect a dtype that is too wide" — landing as a concrete instance.
+- **O19 — the `skip_topk` reuse arm of `ForwardMlaAttentionBlock` has no
+  PRODUCTION caller yet.** W4 lands the semantics, the refusals and the shared
+  buffer, and the only thing that sets `dims.skip_topk` on a real forward is a
+  GLM-5.3 decoder layer, which does not exist: `GlmMoeDsaModel::Forward` still
+  refuses by name (O16). What IS reached is the SCHEDULE — `ParseGlmMoeDsaConfig`
+  runs `GlmMoeDsaMlaSchedule` for every `GlmMoeDsaForCausalLM` config resolved
+  through `ModelRegistry::Resolve`, and deleting that call reds the focused gate.
+  The reuse arm itself is a staged slice under `## Nothing lands dead`, owned by
+  W7, tracked by [#2214](https://github.com/mudler/vllm.cpp/issues/2214), and
+  discharged when W7's forward drives the 78 layers in order over one
+  `MlaSharedSelection`.
+- **O20 — this section's `dots3_note_device.cpp:1147-1180` anchor was WRONG,
+  and it had already propagated into product code.** The refusing `VT_CHECK` is
+  at `:1204-1227` on `origin/main` `03e0dcd19` (`:1205-1228` on this row's
+  integration branch, one line down under W4's edit to the same file);
+  `:1147-1180` is the explanatory comment block above it, so the anchor pointed
+  at prose rather than at the guard it claimed to cite. **Cite it by its
+  predicate — `!elig.prunes || elig.Active()` — rather than by a number**, which
+  is the durable form: the range moved by one line inside this very branch. The
+  same wrong range is compiled into `kForwardRefusal`
+  (`glm_moe_dsa.cpp`), which means a GLM-5.3 user meeting the refuse-by-name
+  forward is handed a line range that does not contain a refusal. Corrected in
+  O4 and §3.7 here; the product-code string is W2's surface and is left to the
+  wave that next edits that file, named rather than silently repaired, because
+  editing a refusal message is a behaviour change to a registered model and not
+  this record's to make. Verified at parity pin `5559679229`.
+  **DISPOSITION, decided 2026-08-30: repaired IN FLOW by the next wave that
+  touches `glm_moe_dsa.cpp`, referencing O20 — not by a row of its own.** It is
+  a wrong `file:line` inside a user-visible refusal string, so a user who hits
+  the refusal is sent to a comment rather than to the check; worth fixing, and
+  not worth its own branch, gate run and fresh review. Discharged when
+  `kForwardRefusal` cites the predicate `!elig.prunes || elig.Active()` rather
+  than a line range — cite the predicate, not the line.
+  **DISCHARGED by W7, 2026-08-30.** `kForwardRefusal` now cites the predicate
+  `!elig.prunes || elig.Active()` — verified unique repo-wide over `src`,
+  `include` and `tests`, one hit at `dots3_note_device.cpp:1205` — and no line
+  range. `git grep 1147-1180` over `src` and `include` returns only the comment
+  in `glm_moe_dsa.cpp` that records the repair.
+  **The same string had gone stale in four further places and W7 fixed those
+  too**, because a refusal that keeps naming finished work sends its reader
+  looking for something they will not find: it named the expert-streaming seam
+  (landed, W3), the per-layer dims and `skip_topk` reuse (landed, W4), the
+  `IQ4_XS` keep-quant `vec_dot` (landed, `2e9f4d88d`) and the fp32 router GEMM
+  (landed) as missing. `test_glm_moe_dsa_config.cpp` now gates BOTH halves: the
+  two primitives that are genuinely missing, and that the four discharged ones
+  are no longer named.
+  **The other three anchors in §3.7 W5 verified CLEAN at the same pin**, and
+  are recorded so they are not re-checked: `DeepseekV32IndexerCache`
+  (`deepseek_v2.py:696-701`) is exact; the **132 B/token** figure is exact and
+  DERIVED rather than quoted — `head_dim + head_dim // quant_block_size * 4` is
+  `128 + 128//128*4 = 132` at `dtype=torch.uint8` (`:697-698`); the
+  `MLAAttentionSpec` merge rule (`kv_cache_interface.py:399-429`) is imprecise
+  rather than wrong — the class opens at `:381` and `merge` at `:419`, so the
+  cited range's first half is `real_page_size_bytes`. That property carries **no
+  factor 2**, which is the sibling Flash row's hard-won lesson: an MLA latent is
+  ONE vector per token, not a K+V pair, and reading it pair-strided yields
+  finite, correctly-shaped, WRONG numbers.
+- **O16 and O17 were authored by W2 as O13 and O14, and are renumbered here.**
+  W2 and W3 were developed on parallel branches and each appended two owed
+  items to this list, so both claimed O13 and O14. W3's three items landed on
+  this row's integration branch first and keep their numbers; W2's two move to
+  O16 and O17, and the `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm` row
+  in `.agents/model-matrix.md` cites the new numbers. Nothing else changed in
+  either item.
+
+- **O21 — THE FORWARD DOES NOT EXIST, SO NO TOKEN HAS BEEN OBSERVED, and W7 did
+  not produce one.** This is the plainest thing this record has to say. W7's
+  scope paragraph is the loader and W7 delivered the loader; W7's TEST list
+  additionally says "the model loads and produces a first token", and the second
+  half did not happen. `GlmMoeDsaModel::Forward` still refuses by name.
+  What the forward needs, read out of the tree rather than guessed: a per-layer
+  `RunLayer` that passes `GlmMoeDsaMlaSchedule`'s 78 dims instead of one scalar
+  `p.mla`, and threads an `mla::MlaSharedSelection` into
+  `ForwardMlaAttentionBlock`'s eleventh argument — which exists and defaults to
+  `nullptr`, and which **no production model passes today**; a sparse-step
+  builder that populates `meta.indexer_cu_seqlens_q`, which `BuildMlaStep` never
+  sets and only `BuildDots3NoteSparseStep` does; and a MoE block that slices the
+  stacked towers through `expert_stream::ExpertSlice` rather than DeepSeek-V2's
+  per-expert vectors. **A FIRST token is reachable and a SECOND is not**: a
+  sparse step routes every token through MQA (`mla_attention.cpp:448-453`), which
+  a fresh prompt can do and a resumed request cannot until O4 lands. Owned by
+  this row.
+- **O22 — `ModelFactory::streams_routed_experts` is deliberately NOT set on
+  `kGlmMoeDsaFactory`, and the load on `dgx:gpu0` cannot succeed until it is.**
+  The flag asserts that THIS model's forward reads experts through the slot seam,
+  and `model_registry.h:552-589` argues at length that it is a property of the
+  forward and lives beside it. W7 has no forward, so setting it would be a claim
+  about code that is not there. The cost is exact, and stating it is the point of
+  this item: without the flag `model_loader.cpp:2487-2494` never builds the lane,
+  so `CheckDeviceWeightFit` charges the device the full 187.312 GiB of towers
+  against a 119.631 GiB budget and REFUSES the load. Discharged in the same
+  change that lands the forward, and not before.
+- **O23 — `docs/USAGE.md`'s GLM-5.3 row states a load that has not been driven.**
+  O11 asked for the weights row in the change that makes the capability
+  reachable. W7 makes the LOADER reachable and adds the row, and the row says
+  exactly that: the published arm is unfeedable as shipped (O17), no load of the
+  real artifact has run, and no token exists. Discharged when the row can state a
+  driven load instead of a reachable loader.
 
 ### 3.10 Now
+
+**W7 LANDED ITS LOADER AND DID NOT PRODUCE A TOKEN, 2026-08-30**
+([#2214](https://github.com/mudler/vllm.cpp/issues/2214)). Both halves of that
+sentence are the record. `GlmMoeDsaForCausalLM` now materializes weights from a
+`glm-dsa` GGUF through `LoadedEngine::FromModelDir`, and
+`GlmMoeDsaModel::Forward` still refuses by name. W7's scope paragraph asked for
+the loader and got it; W7's test list also asked for a first token, and that is
+O21 and is owed.
+
+**The census reproduces, and it reproduces exactly.** §3.4's numbers were
+recomputed here from the six published shard headers rather than trusted: 1809
+tensors, 216,705,819,648 payload bytes = 201.823 GiB, **228 expert towers at
+187.312 GiB against 1581 resident tensors at 14.511 GiB**, and the per-type table
+to the tensor — IQ3_XXS 71, IQ1_S 106, IQ2_XXS 44, Q5_K 312, IQ4_XS 4, Q8_0 476,
+Q2_K 2, Q3_K 1, Q6_K 82, Q4_K 2, F32 709. The payload plus the six headers plus
+62 bytes of 32-byte alignment padding is 216,715,365,893, the published byte
+count exactly. The largest per-expert slice is 6,684,672 B, which §3.3 predicted.
+`test_glm_moe_dsa_gguf_census` carries all of it; two of its three cases need no
+artifact.
+
+**The accounting closes at 1782 + 27 = 1809, and that is the gate.** There is no
+token gate on this row and there cannot be one on this fleet (O1), so a tensor
+the port does not claim is weight that is silently absent from the model with
+nothing to catch it. The loader refuses rather than returning a model when the
+sum does not close, and the negative case proves it by adding a tensor.
+
+**Three things the file gets wrong are now handled by name rather than by luck.**
+The MTP block is read, counted and dropped (27 tensors, spec O5). The 285
+`indexer.*` tensors the conversion broadcast onto the 57 `shared` blocks are
+dropped by SCHEDULE, and the mutation that makes the loader believe the file
+instead — build an indexer on every layer — is killed by the gate; that failure
+would otherwise load clean and carry 57 indexers the reference does not build.
+And the file states its indexer schedule nowhere at all, which was confirmed key
+by key on shard 1: **64 metadata keys and not one of `indexer.types`,
+`index_topk_freq`, `index_skip_topk_offset`**. O17 is now diagnosed on the real
+file rather than inferred, and `scripts/glm-dsa-write-indexer-types.py` repairs
+the FILE from the model author's own `config.json` — the loader's refusal is
+untouched, because D3 is right that a hardcoded table which happens to be correct
+is the shape that silently becomes wrong on GLM-5.4.
+
+**The i8mm quant repack is declined, and the reason is correctness rather than
+speed.** It keeps the dtype and the byte count identical, so every assertion in
+this tree passes on a repacked buffer while a consumer reading it as plain blocks
+reads wrong values silently. The sibling Flash row paid for exactly that once
+(#2241) on an artifact from the same publisher, and this arm's 476 Q8_0 tensors
+are the MLA and indexer projections whose values decide the attention selection.
+W7 claims no speed number, so the lever buys nothing here and no gate on this row
+could see it go wrong.
+
+**What did NOT happen, stated before anything else claims otherwise.** No `rc`
+lease was taken: `dgx:gpu0` and `thor:gpu0` were both busy for the whole wave.
+The artifact was **43% staged** when the wave ended, so the load was never
+driven, no resident footprint was measured (O9 stands as arithmetic), no `pread`
+number exists (O7), and **no token was observed** (O21). Every gate reported here
+is a CPU gate on a synthetic model or a header read of the real one.
+
+**One decision is recorded as a refusal to claim rather than as work.**
+`kGlmMoeDsaFactory` does not set `streams_routed_experts`, because that flag
+asserts this model's forward reads experts through the slot seam and this model
+has no forward. The consequence is exact and is O22: without it
+`CheckDeviceWeightFit` charges the device all 187.312 GiB of towers against
+119.631 GiB and refuses. The flag and the forward land together or neither does.
+
+**Next action: the forward (O21).** It is the last thing between this row and a
+token, the pieces it needs are enumerated in O21, and a first token is reachable
+on a fresh prompt while a second waits on O4. Then O22's flag, then the load on
+`dgx:gpu0` under a lease, which discharges O7, O9, O14, O15 and O23 together.
+
+---
+
+**W5 IS STRUCK FROM THIS ROW AND RE-SEQUENCED, 2026-08-30**
+([#1925](https://github.com/mudler/vllm.cpp/issues/1925),
+[#2214](https://github.com/mudler/vllm.cpp/issues/2214)). W5 was dispatched as a
+wave of this row, and the first obligation in its own scope paragraph — settle
+the ownership before a line is written — resolved against it. No product code
+was written. §3.7 W5 carries the evidence and `kv-dsv4-multicache.md` carries
+the other half, as that paragraph requires.
+
+**The short version: the conditional was already false when it was written
+down.** §3.7 W5 says this wave lands here "if that row does not schedule it".
+`KV-DSV4-MULTICACHE` had scheduled it — a `### W5 design` section, W5-1 through
+W5-6, tracked by [#2323](https://github.com/mudler/vllm.cpp/issues/2323), with
+W5-2's gated dispatch already implemented. Four branches are working that
+plumbing right now. What made this worth an hour rather than a glance is that
+the roadmap sentence and the code disagreed in the ordinary direction: the
+record said "if nobody schedules it", and `git log --grep` said somebody had,
+two days earlier.
+
+**The near miss is the reusable part.** This wave's test list said *"the refusal
+at `dots3_note_device.cpp:1147-1180` is deleted"*. Three things were wrong with
+that one line and each was found by opening the file rather than trusting the
+citation:
+
+1. **It is not our refusal.** It guards `Dots3NoteForCausalLM` —
+   `MODEL-DOTS3-NOTE`, [#699](https://github.com/mudler/vllm.cpp/issues/699) —
+   and its own comment says the indexer cache "is `KV-DSV4-MULTICACHE` (#1925),
+   **not this row**".
+2. **Deleting it is forbidden by the owning row in as many words.** W5-2:
+   "deleting the refusal is the one thing W5 must not do", because it restores
+   the silent-discard failure W3 built it to prevent — a wrong-answer-not-a-crash
+   invisible to a token gate, since the tokens stay right while the decode
+   recomputes. The replacement is a DISPATCH on a declared capability.
+3. **The line range does not contain the refusal.** The `VT_CHECK` is at
+   `:1204-1227` on `origin/main` `03e0dcd19`, and at `:1205-1228` here — W4's
+   own edit to that file moved it one line, inside this branch, which is why
+   the durable citation is its predicate `!elig.prunes || elig.Active()` and
+   not a range. `:1147-1180` is the comment above it. That wrong range is
+   compiled into `kForwardRefusal` in `glm_moe_dsa.cpp`, so it is shipping to
+   users today. Recorded as O20 rather than repaired here, because editing a
+   registered model's refusal message is a behaviour change and not a record's
+   to make.
+
+**Anchors verified at parity pin `5559679229`**, so the next reader does not
+re-run them. `DeepseekV32IndexerCache` (`deepseek_v2.py:696-701`) — exact. The
+**132 B/token** figure — exact, and derived rather than quoted:
+`128 + 128//128*4 = 132` at `dtype=torch.uint8`. The `MLAAttentionSpec` merge
+rule (`kv_cache_interface.py:399-429`) — imprecise, not wrong; `merge` opens at
+`:419` and the range's first half is `real_page_size_bytes`, which carries no
+factor 2. One of four anchors wrong, one drifted, two clean.
+
+**Even with the ownership question set aside, there is nothing to build.**
+`glm_moe_dsa.cpp` is a config parser and a `kForwardRefusal` string: W2
+registered the architecture with a forward that refuses by name, and **W7** (the
+loader and the streamed towers) is undone, so no GLM-5.3 weight can be
+materialized. A cache wired into a refusal stub is a shell under `## Nothing
+lands dead` — provable only by a unit test that constructs the type by hand,
+which shows the class works and never that anything reaches it.
+
+**W1 IS ALREADY DONE, and this section said otherwise for one commit.** The
+first draft of this entry carried "W1 and W7 are both undone" from the wave
+table without checking the tree. `2e9f4d88d` (#2247, #2256) had already landed
+`VecDotIQ4_XSQ8_K` for the sibling Flash row: defined `cpu_quant_dot.cpp:844`,
+dispatched `:1004`, traits `cpu_quant_traits.cpp:121-122`, and
+`KeepQuantDType` gates on `HasQuantDotKernel` at `gguf_keep_quant.cpp:176`.
+`kIQ2_XS` landed with it at `:1003`. That is the SAME defect this entry was
+written to record — a wave's status read off a record instead of off the code —
+committed by the same session that had just documented it, one screen further
+down. It is kept rather than quietly fixed for that reason. O2 is discharged,
+O3's IQ2_XS half with it, and `IQ1_M` remains absent.
+
+**A second thing falls out of that table, and it removes a question from W7's
+path:** every encoding the `UD-IQ1_S` arm uses — IQ1_S, IQ3_XXS, IQ2_XXS,
+IQ4_XS, Q2_K and Q3_K — now has a `vec_dot` row on `origin/main`, verified 6 of
+6 on 2026-08-30. W7 therefore has no decoder or keep-quant question left to
+answer; the whole arm keeps its blocks and stays in the streaming lane.
+
+**Next action: W7**, which is now the critical path — it is what turns O19 from
+a staged slice into a reached one, and what gives this row's re-sequenced W5 a
+forward to consume caches into. Then W6 (sparse prefill). This row's W5 opens as
+a consumption site once `KV-DSV4-MULTICACHE` W5 lands, on the shape
+`MODEL-MM-GLM53-FLASH` already proved (`glm5_next_kv.{h,cpp}`,
+`ModelFactory::consumes_multi_kv_cache`).
+
+---
+
+**W4 LANDED, 2026-08-30** ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)).
+The heterogeneous indexer schedule, the `skip_topk` selection reuse and the fp32
+router gate GEMM are on this row's integration branch, on top of W2 and W3.
+`GlmMoeDsaMlaSchedule` turns the parsed `indexer_types` into 78
+`mla::MlaBlockDims`, 21 of them carrying an indexer and 57 carrying `skip_topk`;
+with the MTP block upstream forces full at `deepseek_v2.py:1110-1115` that is the
+22 of 79 §3.5.1 counted, and the test asserts the split from the checkpoint's own
+`config.json` rather than from a literal.
+
+**The reuse is the ABSENCE of a write, and reading it as a copy is how a port
+gets it wrong.** Upstream allocates ONE `topk_indices_buffer` per model
+(`deepseek_v2.py:1372-1377`) and hands the same tensor to every layer (`:1395`,
+`mla.py:120`). `mla.py:180` — `if self.indexer and self.is_sparse and not
+self.skip_topk:` — runs the indexer only on a full layer, and a shared layer's
+indexer does not exist at all (`:1134-1135`). So the bytes a shared layer attends
+through are the ones its owning full layer left there earlier in the same forward
+pass; nothing is copied, cached or carried across steps.
+`sparse_mla_attention.py:303-305` says it in upstream's own words. Mirrored as
+`mla::MlaSharedSelection`: a full layer writes INTO it, a shared layer reads it,
+and a `skip_topk` layer handed no buffer is REFUSED rather than falling through
+to the dense contiguous key loop — which would have produced a finite, plausible,
+wrong output on 57 of 79 blocks that no token gate could see.
+
+**One polarity in this seam now points both ways, deliberately.**
+`mla_attention.cpp:943-945` already said the decode metadata is copied so that "a
+sliding layer must not inherit a full layer's selection". That is still true and
+still dots3-note's. GLM's shared layer inherits BY CONFIGURATION, from a buffer
+the caller allocated for it, and never from leftover metadata. Both statements
+are in the file, next to each other.
+
+**The fp32 router turned out to be a DeepSeek-V2 parity repair as well as a GLM
+need.** `_get_moe_router_dtype` (`deepseek_v2.py:123-133`) returns f32 for
+`model_type == "glm_moe_dsa"` at `:127` AND for any config declaring
+`moe_router_dtype: "float32"` at `:131`; the tree hardcoded bf16, so a DeepSeek-V2
+or V3 checkpoint asking for an f32 router silently did not get one.
+`DeepseekV2Params::router_dtype_is_f32` is read in `ParseDeepseekV2Params` and
+consumed at `deepseek_v2.cpp:363`. The dtype answers are the pinned oracle's own
+return values, not a transcription: `_get_moe_router_dtype` was extracted from
+`5559679229` and EXECUTED on eight configs with torch 2.11.0+cu130. The order of
+its two arms is what the table gates — `:127` wins even against an explicit
+`"bfloat16"`, and a rule written the other way round passes every other row.
+
+**And the dtype selection at `:363` is not gateable, which is measured.** The f32
+and bf16 arms of the tiny DeepSeek-V2 forward are bit-identical over all 500
+logits, because every activation downstream of the router combine is stored at
+bf16. Forcing f32 unconditionally leaves that whole file green. That is O18, and
+it is AGENTS.md's "a token gate cannot detect a dtype that is too wide" arriving
+as a concrete instance rather than a warning.
+
+**What W4 does NOT reach.** The reuse arm has no production caller: only a GLM
+decoder layer sets `skip_topk` on a real forward, and `GlmMoeDsaModel::Forward`
+still refuses by name. The SCHEDULE is reached — `ParseGlmMoeDsaConfig` runs it
+for every config `ModelRegistry::Resolve` sees, and deleting that call reds the
+focused gate — but the block arm is a staged slice, owned by W7 and recorded as
+O19. W4 also closed a hole W2 left and W4 would have been first to fall into: a
+non-`default` `rope_type` is now refused, because `MlaAttentionScale` would
+otherwise have handed a YaRN checkpoint the unscaled softmax scale.
+
+Gates: 24 cases and 2594 assertions across the two new/extended suites, plus
+`test_mla_attention_block` (18 cases, 2,255,433 assertions), `test_dots3_note_attn`
+(51 / 6888), `test_glm_moe_dsa_config` (15 / 380) and `test_deepseek_v2_load`
+(4 / 14) all green and unmoved. Seven mutations: deleting the reuse read kills
+G1; making the full layer keep its selection local kills G1 and the tautology
+guard; deleting the schedule's production call site kills the reachability case;
+neutering the router-dtype parse kills two; dropping either refusal kills one
+each; and forcing f32 at the GEMM call site kills NOTHING, which is O18.
+
+**Next action:** W1, still independent and still unlocking two arms at once, then
+W5 (the indexer KV side cache, GPU) and W6 (sparse prefill, GPU). W7 is what
+turns O19 from a staged slice into a reached one.
+
+---
+
+W2 LANDED, 2026-08-30. The row moves `SPIKE` -> `ACTIVE` (`📋` -> `🚧`),
+which is what D4 said would happen when W2 landed. `ACTIVE` rather than
+`PARTIAL` because `CLAIM-MODEL-GLM-MOE-DSA` is still open over seven remaining
+waves, and `scripts/check-agent-record.py` holds an active claim's rows to
+`SPIKE` or `ACTIVE`; the row moves to `PARTIAL` when the claim closes. What is on `main`
+now: `GlmMoeDsaForCausalLM` is registered from its own translation unit, its
+config resolves from a `config.json` and from a `glm-dsa` GGUF header through
+ONE validator, `kGgufArchArms` carries a `glm-dsa` row, and the forward refuses
+by name and lists all seven missing primitives. It loads no weight and computes
+no token, and O16 names the three surfaces nothing reaches yet.
+
+**The three-way agreement of §3.5.1 is now executable, and it holds.** The
+checkpoint's own 78-entry `indexer_types` (committed verbatim as
+`tests/vllm/models/glm_moe_dsa_config_glm53.inc`, `zai-org/GLM-5.3` revision
+`935644c05e76fc198714f4cca449fd8b970ff6d7`), upstream's derived rule at
+`deepseek_v2.py:1097-1101` evaluated at `freq = 4` / `offset = 3`, and
+llama.cpp's `GLM_5_2_DEFAULT_INDEXER_TYPES` (`b10451:src/models/glm-dsa.cpp:6-27`)
+agree on all 78 entries, 21 of them `full`. The same case proves the derivation
+is not a constant: three other (freq, offset) pairs produce three other
+schedules. `mlp_layer_types` likewise reproduces exactly from
+`first_k_dense_replace = 3`, and a config whose two statements disagree is
+refused rather than resolved to either.
+
+**Everything else in this section still holds.** The port is smaller than §0.2
+implies, the blocker that remains is one quantization kernel, and the gate is
+the honest cost: vLLM at the pin implements this architecture and cannot run it
+on any device this project can reach, so no wave may promise a token-exact
+number against it.
+
+**Next action:** W1, which is independent of W2 and unlocks two arms at once.
+W3 has since landed on this row's integration branch; its own record is the
+`W3 LANDED` paragraph further down this section. W2's own residue is O16 (the
+unreached forward) and O17 (the staged artifact states no indexer schedule, so
+the arm that exists still cannot be fed).
+
+---
+
+The state this section recorded when the spike was written, kept because the
+arithmetic is what makes the row's position defensible:
 
 `SPIKE`, 2026-08-29. The row moves off `🚫 BLOCKED` because the blocker was
 computed in the wrong frame, and the correct frame is measured here: **97.49% of
@@ -2067,5 +2650,54 @@ token-exact number against it. What W3 onward can prove is that a streamed slice
 and a resident tower produce identical logits, which is the row's actual novelty
 and needs no oracle at all.
 
+**W3 LANDED 2026-08-30** ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)),
+and it is the first wave of this section with product code on `main`. The
+expert-streaming wiring is now `expert_stream_seam.{h,cpp}`: `ExpertStreamLane`
+(was `Qwen35ExpertStream`), `ExpertStreamStepGuard`, `HostSliceView` and
+`ExpertSlice`, moved rather than rewritten. `qwen3_5.cpp` shrinks by 556 lines
+and keeps four alias declarations. O8 is discharged; O13, O14 and O15 are new
+and named.
+
+Three things the lift found or decided, each of which a later reader would
+otherwise rediscover.
+
+**The resident fallback could not be a call, and that is O13.** `qwen3_5.cpp`
+defines its own `ResidentWeight` in its unnamed namespace, shadowing
+`dense_attn_block.h:181`'s, and the two differ: the local one refuses a streamed
+tower, an `elem_kn_repacked` weight and a `repacked` weight at device staging,
+and carries the host-alias arm. A shared `ExpertSlice` that called
+`ResidentWeight` itself would have bound to the header's definition and dropped
+every one of those guarantees from Qwen3.5's streamed lane, with no gate in the
+tree able to see it — the tokens would still be tokens. So `ExpertSlice` takes a
+`ResidentSliceFn` and each model passes its own. Byte-identity then holds by
+construction rather than by inspection.
+
+**Qwen3.5's byte-identity is measured, not argued.** Two separately-built
+libraries differing only in `qwen3_5.cpp` — the lifted file and `origin/main`'s,
+same build directory, same flags, both relinked and confirmed distinct by
+sha256 — run the same synthetic forward through `Qwen3_5Model::Forward` and
+produce logits digest `84ae1a52ee64d117` over 160 floats, with streaming OFF and
+with streaming ON, and with a character-identical
+`[expert-stream] steps=1 hits=0 misses=42 evictions=0 fills=42 bytes=45696
+exhausted=0 advised=42` line. The one deliberate text change is the step guard's
+refusal prefix, `qwen3_5:` to `expert stream:`, because the guard is no longer
+that model's; `test_expert_stream_steps` matches on `must not nest` and is
+unaffected.
+
+**The capacity refusal is at LOAD, and it fires on every streaming load rather
+than only this row's.** §3.3 argued for it and W3 ships it: below
+`streamed_towers * experts_per_tok` the loader refuses by name instead of
+letting `Slice` return nullptr and the caller read the tower in place out of the
+mmap. Both terms are read off the GGUF header the lane will serve
+(`GgufStreamedExpertLaneGeometry`), so the refusal and the forward cannot
+disagree about a checkpoint. This DOES change one behaviour outside this row: a
+`VT_MOE_EXPERT_STREAM=1` load of a large Qwen3.5 at the default 64 slots now
+refuses rather than silently degrading. That is the intended polarity and it is
+not a numerical change — streaming is default OFF, the six existing streaming
+binaries do not load through `FromModelDir`, and all of them stay green. An
+unknown geometry is inert rather than a refusal, so an architecture whose
+metadata the reader did not understand is never refused by a number the reader
+invented.
+
 **Next action:** W1 and W2, both CPU, both independent. W1 belongs to
-`QUANT-GGUF-IQ4_XS` and unlocks two arms at once.
+`QUANT-GGUF-IQ4_XS` and unlocks two arms at once. W4 is now unblocked on W3.

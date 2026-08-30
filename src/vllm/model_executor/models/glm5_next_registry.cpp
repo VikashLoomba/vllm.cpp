@@ -44,6 +44,7 @@
 
 #include "vllm/model_executor/models/glm5_next.h"
 #include "vllm/model_executor/models/glm5_next_forward.h"
+#include "vllm/model_executor/models/glm5_next_kv.h"
 #include "vllm/model_executor/models/glm5_next_loader.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
@@ -141,20 +142,23 @@ ForwardLogits ForwardGlm5NextForConditionalGeneration(
                                          "Glm5NextForConditionalGeneration");
   const Glm5NextWeights& w = g.weights();
 
-  // THE HOUSE PATTERN, surveyed and not guessed. `NemotronHForCausalLM`
+  // W5b-2c (#2348): THE PAGED CACHES ARE READ, and the house pattern is
+  // deliberately NOT followed here. `NemotronHForCausalLM`
   // (`nemotron_h_registry.cpp`) and `KimiLinearForCausalLM`
-  // (`kimi_linear_forward.cpp`) each carry a host arm inside their `forward`
-  // hook that consumes three of `ModelForwardInput`'s fields -- `token_ids`,
-  // `logits_indices`, `queue` -- ignores the paged caches, and re-runs the
-  // whole prefix each step. No `LoadedModel` in this tree keeps per-request KV
-  // or recurrent state on itself, and Kimi-Linear is the closest architecture
-  // there is to this one (KDA plus MLA). `glm5_next_forward.h` records what
-  // the recompute costs and which binding it leaves unreached.
+  // (`kimi_linear_forward.cpp`) each ignore the paged caches and describe
+  // themselves as re-running the whole prefix. O28 measured what the runner
+  // actually hands a forward and that description does not survive it:
+  // `ModelForwardInput::token_ids` is the step's SCHEDULED tokens, so on the
+  // second step of a decode it is ONE id and a forward that treats it as a
+  // sequence attends to an empty prefix. That is fluent wrong text, which is
+  // the one failure this row refuses to ship.
+  //
+  // `positions` is still unread, and that is upstream's arithmetic rather than
+  // an omission: `qk_rope_head_dim` is ZERO on this architecture -- upstream's
+  // own `validate_architecture` requires it -- so there is no rotary embedding
+  // to place and the causal order comes from the cache length
+  // (`glm5_next_dsa.cpp`, `q_pos = current_length - q_length + s`).
   (void)input.positions;
-  (void)input.attn_meta;
-  (void)input.gdn_meta;
-  (void)input.attn_kv;
-  (void)input.gdn_state;
 
   // ONE DIVERGENCE FROM THAT PATTERN, in the safe direction. Both precedents
   // take `token_ids` as a single sequence whatever `num_reqs` says; on a
@@ -173,10 +177,33 @@ ForwardLogits ForwardGlm5NextForConditionalGeneration(
                "could detect. Ragged batching (attn_meta.query_start_loc) is "
                "owed. See .agents/specs/glm5-next-flash.md and issue #2241.");
 
-  return HostLogits(glm5_next::Glm5NextHostForward(w, input.token_ids,
-                                                   input.logits_indices,
-                                                   input.queue),
-                    w.params.vocab_size);
+  // THE BINDING, resolved BY NAME and refusing by name. `glm5_next_kv.h`
+  // carries the whole argument: what the engine hands over, why the MLA latent
+  // is not a K+V pair, and why the recurrent group's correspondence is a count
+  // rather than a name.
+  VT_CHECK(input.multi_kv != nullptr,
+           "Glm5NextForConditionalGeneration: this step arrived with no "
+           "multi-KV channel. `MakeGlm5NextKVCache` publishes THREE groups -- "
+           "the MLA latent, the KDA recurrent state and the DSA indexer side "
+           "cache -- which is a multi-cache topology, so the runner sets "
+           "`ModelForwardInput::multi_kv` on every step of this model. A null "
+           "channel means the topology was classified as uniform, and the "
+           "positional `attn_kv` convention cannot say which of a DSA layer's "
+           "two caches an entry is. Running anyway would attend an empty "
+           "prefix on every step after the first. See "
+           ".agents/specs/glm5-next-flash.md and issue #2348.");
+  const glm5_next::KvBinding binding =
+      glm5_next::ResolveKvBinding(w.params, input);
+  std::vector<glm5_next::LayerCache> caches;
+  glm5_next::LoadCaches(w.params, binding, input, &caches);
+  std::vector<float> logits = glm5_next::Glm5NextHostForward(
+      w, input.token_ids, input.logits_indices, input.queue, &caches);
+  // The new rows go back into the ENGINE's pages, so the next step reads them
+  // through the same block table the block manager owns -- rather than onto
+  // this `LoadedModel`, which would be per-model state the engine cannot
+  // evict, preempt or share.
+  glm5_next::StoreCaches(w.params, binding, caches, input);
+  return HostLogits(std::move(logits), w.params.vocab_size);
 }
 
 // ─── The heterogeneous KV-cache spec (W5, #2223) ─────────────────────────────
@@ -400,6 +427,11 @@ const ModelFactory kGlm5NextFactory{
     .forward = &ForwardGlm5NextForConditionalGeneration,
     .make_kv_cache = &MakeGlm5NextKVCache,
     .is_dense_model = false,
+    // W5b-2c (#2348): this forward READS the cache set keyed by published layer
+    // name, so `ModelRegistry::Forward` stops refusing the step above it. The
+    // consuming code is `glm5_next_kv.cpp` and the refusals it can raise are
+    // all by name.
+    .consumes_multi_kv = true,
 };
 
 }  // namespace

@@ -477,6 +477,35 @@ that is stated rather than discovered: W5's synthetic-config gate proves routing
 and the token-exact oracle gate belongs to `MODEL-DSV4-DSA-COMPOSE` above 512
 tokens.
 
+**A SECOND row consumes this W5, and it is recorded here so the count of
+consumers is not rediscovered as a surprise.**
+`MODEL-TEXT-GLM-MOE-DSA` (`.agents/specs/glm-dsa-latest-deepseek.md` §3.7)
+also has a wave numbered W5, "the indexer KV side cache", and its own text
+makes it conditional: *"This is `KV-DSV4-MULTICACHE`'s work and this row
+consumes it; if that row does not schedule it, this row's W5 is where it lands
+and the ownership is recorded in both places before a line is written."*
+
+**That condition resolved FALSE on 2026-08-30, so W5 is STRUCK from the GLM row
+and re-sequenced there as a consumption site — struck, not deferred, because the
+wave does not belong to that row at any date.** This row scheduled W5: it has a `### W5 design` section (W5-1 through
+W5-6) tracked by [#2323](https://github.com/mudler/vllm.cpp/issues/2323), and
+its first implementation commit — W5-2's gated dispatch — is already written.
+GLM-5.3 is therefore a CONSUMER of the same by-name multi-KV channel that
+DeepSeek-V4 consumes, on the shape `MODEL-MM-GLM53-FLASH` already proved
+(`glm5_next_kv.{h,cpp}`, `ModelFactory::consumes_multi_kv_cache`), and it
+acquires no independent cache-plumbing scope.
+
+**The concrete thing that would have gone wrong** is worth keeping, because it
+is the failure this boundary exists to prevent. The GLM row's W5 lists as a
+test *"the refusal at `dots3_note_device.cpp` is deleted"* — and W5-2 above
+says, in this row's own words, that **deleting the refusal is the one thing W5
+must not do**. Two rows working the same wave from two specs would have had one
+of them delete the guard the other built. A third point: that refusal is not
+GLM's to delete under any owner, because it guards `Dots3NoteForCausalLM` and
+belongs to `MODEL-DOTS3-NOTE` ([#699](https://github.com/mudler/vllm.cpp/issues/699)),
+whose own comment already says the cache "is `KV-DSV4-MULTICACHE` (#1925), not
+this row".
+
 W1, W2, W4 and W6 are fully CPU-gateable. W3 is CPU-gateable for its own
 guarantees but its byte-neutrality obligation reaches every model, so its full
 gate includes the SACRED `test_qwen35_paged_engine` regression. W5 and W7 need
@@ -601,7 +630,7 @@ copy is exactly the work the paged cache exists to avoid. The engine would then
 report a decode rate for a path that is asymptotically no better than the
 full-recompute one it replaced. That is the same shape as
 `## Why our KV interface cannot represent it`: a wrong-answer-not-a-crash, only
-here the wrong answer is a NUMBER rather than a token. It is also why W5-7's
+here the wrong answer is a NUMBER rather than a token. It is also why W5-8's
 gate asserts the saving by COUNTING WORK rather than by timing -- a timing gate on
 a small synthetic config would not separate (a) from (b), and a token gate cannot
 separate them at all.
@@ -721,7 +750,80 @@ seam's public shape, and it must land BEFORE any DeepSeek-V4 routing: a V4 layer
 cannot reach `ForwardMlaAttentionBlock` at all while step 6 requires a weight the
 model does not have.
 
-#### W5-7. Gate
+#### W5-7. The routing target is the OP, not the block -- and that shrinks the wave again
+
+Tracing the routing to the point of writing it found that DeepSeek-V4 should not
+go through `ForwardMlaAttentionBlock` at all.
+
+**V4's attention is already in post-absorption form.** The block exists to do the
+V2-style work: project q and kv, apply RoPE, ABSORB `kv_b_proj` into the query,
+attend, then project out. V4 has no `kv_b_proj`, no `kv_lora_rank` and no
+separate `v_head_dim` -- `deepseek_v4.h:74` records the whole geometry as
+`head_dim = 512 (= 448 v/nope + 64 rope)`, and the forward attends a per-token
+`deck` of `[T, 512]` latents shared across heads (`deepseek_v4.cpp:~900-930`).
+That is MQA over a latent, which is precisely what MLA decode IS once absorbed.
+
+**And `vt::MlaDecodeAttention` is geometry-general.** Its validator
+(`ops.cpp:4039-4053`) takes `query [batch, num_q_heads, head_size]`,
+`out [batch, num_q_heads, v_head_dim]` and
+`kv_cache [num_blocks, block_size, head_size]` -- "MLA has no K/V and no head
+axis" -- with no width hardcoded anywhere. V4's `head_size = 512`,
+`v_head_dim = 448` satisfies it as written.
+
+So the routing is:
+
+1. write V4's per-token latent into a PAGED cache each step, instead of appending
+   to `DeepseekV4KvCache::deck`;
+2. call `vt::MlaDecodeAttention` with the runner's `block_table` and `seq_lens` --
+   the op already supports the attention sink (W5 step one);
+3. keep V4's own grouped-LoRA output projection, unchanged.
+
+That is materially smaller than routing through the block, and it needs no
+further seam extension.
+
+**AN HONEST CONSEQUENCE, recorded rather than buried.** The `o_proj` split landed
+in the previous commit is therefore NOT on this row's critical path: V4 bypasses
+the block, so it never reaches step 6. The split remains a correct improvement --
+it mirrors upstream, where `_o_proj` is a separate platform-specific step, and it
+unblocks any future model whose output projection is not a dense matrix -- but it
+was built for a route this row will not take. It was written before this check
+was made, which is the cost of estimating a step before tracing it to the point
+of writing it.
+
+That is the fourth time this row's cost has moved after reading the tree rather
+than a record (#2302's wrong dependency; "from scratch" versus an existing seam;
+the `o_proj` requirement; and now the block versus the op). Each move made the
+work smaller.
+
+##### W5-7a. Step one in detail: the latent write needs no new op and no copy
+
+`vt::ConcatAndCacheMla(q, kv_c, k_pe, kv_cache, slot_mapping)` already expresses
+V4's cache write exactly, and the mapping is worth writing down because it is not
+obvious from the names:
+
+| the op wants | V4 supplies |
+|---|---|
+| `kv_c [num_tokens, kv_lora_rank]` | the latent's first **448** columns (nope/v) |
+| `k_pe [num_tokens, qk_rope_head_dim]` | the latent's last **64** columns (rope) |
+| `kv_cache [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]` | `head_dim == 512` |
+| `slot_mapping [num_slots] i64` | from the runner's metadata |
+
+**And it needs no copy.** The op's own contract says indexing is driven by the
+tensor STRIDES -- "a strided cache view or a split-projection source view is
+handled without a copy" -- so V4's CONTIGUOUS `[T, 512]` deck is passed as two
+views over the same buffer: offset 0 width 448, and offset 448 width 64, both
+with row stride 512. Nothing is materialized to split nope from rope.
+
+**One constraint to respect rather than discover.** The op takes the "auto" path
+only: the cache dtype must equal `kv_c`'s, and the `fp8_ds_mla` and int4 layouts
+are REFUSED loudly rather than silently mis-written. V4's published compressed
+latent is `fp8_ds_mla` at 584 B/token (`## The geometry`), so step one lands on
+the plain arm first and the fp8 layout is a later wave -- `KV-DSV4-MULTICACHE`
+already lists it, and this is where the two meet.
+
+So step one is a call, two views and a dtype check, not a kernel.
+
+#### W5-8. Gate
 
 Red-first, on CPU at a synthetic config:
 

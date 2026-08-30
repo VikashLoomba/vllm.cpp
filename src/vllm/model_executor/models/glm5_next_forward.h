@@ -44,25 +44,26 @@
 // layer's three banks are 27.0 GiB in f32, and `kBridgeTensorF32ByteCeiling`
 // refuses the first one BY NAME at 9.0 GiB before anything is allocated.
 //
-// ─── FULL-PREFIX RECOMPUTE, AND IT IS A DECISION AND NOT AN OVERSIGHT ────────
+// ─── W5b-2c: THE PREFIX IS NO LONGER RECOMPUTED, AND IT COULD NOT HAVE BEEN ──
 //
-// This forward RE-RUNS THE WHOLE PREFIX every step and keeps no per-request
-// state. That is the house pattern and it was surveyed rather than assumed: two
-// registered models already do exactly this inside their `forward` hook —
-// `NemotronHForCausalLM` (`nemotron_h_registry.cpp`, whose host arm "consumes
-// three of `ModelForwardInput`'s fields — `token_ids`, `logits_indices`,
-// `queue`") and `KimiLinearForCausalLM` (`kimi_linear_forward.cpp`, which
-// `(void)`s `positions`, `attn_meta`, `attn_kv` and `queue`) — and no
-// `LoadedModel` in this tree keeps per-request KV or recurrent state on itself.
-// Kimi-Linear is the closest architecture there is to this one (KDA plus MLA),
-// so its shape is the precedent.
+// W5b-2b passed `caches = nullptr` and this header said the forward "re-runs
+// the whole prefix every step", following `NemotronHForCausalLM` and
+// `KimiLinearForCausalLM`. O28 then measured the engine and the sentence turned
+// out to describe something the runner never offers: `ModelForwardInput::token_ids`
+// is the step's SCHEDULED tokens, not the sequence
+// (`runner.cpp`, `forward_input{.token_ids = token_ids, ...}`), so on the second
+// step of a decode it is ONE id. A forward that treats that as a whole sequence
+// does not re-run the prefix — it attends to an empty one, and emits fluent
+// wrong text no gate on this fleet could detect. The house pattern carries the
+// same defect; this row does not inherit it.
 //
-// **The cost is named rather than hidden.** W5b-2a's `LayerCache` binding —
-// the DSA latent and the KDA recurrence carried across steps — is gated and
-// correct and this path does not call it, so it stays unreached. Carrying
-// `std::vector<LayerCache>` on `Glm5NextLoadedModel` has no precedent in this
-// tree, and inventing one on a model that cannot be run end to end on this
-// fleet is the wrong place to try it. The spec's `## Owed` records it.
+// So the caches are consumed. `glm5_next_kv.h` maps the engine's
+// layer-name-keyed `MultiKvCacheIndex` onto the three groups
+// `MakeGlm5NextKVCache` publishes and hydrates one `LayerCache` per layer; this
+// file runs the stack over the step's new tokens with that history behind them,
+// and the caller writes the new rows back into the engine's pages. W5b-2a's
+// binding — the DSA latent and the KDA recurrence carried across steps — is
+// what does the work, and it is REACHED from `ModelRegistry::Forward` now.
 //
 // ─── ONE DELIBERATE DIVERGENCE FROM THE HOUSE PATTERN, AND WHY ──────────────
 //
@@ -136,7 +137,18 @@ class Glm5NextGgufLayerSource final : public LayerWeightSource {
 
 // The host reference forward, from a loaded tower to logits.
 //
-//   token_ids      : ONE sequence's ids. The prefix is re-run in full.
+//   token_ids      : the step's tokens for ONE sequence. With `caches` null
+//                    that is the whole sequence; with `caches` non-null it is
+//                    the new window and the history is the caches'.
+//   caches         : null for a one-shot forward, or exactly
+//                    `num_hidden_layers` layer states carried across steps.
+//                    Read and written in place, so the caller can store the new
+//                    rows back into the engine's pages afterwards. It has NO
+//                    DEFAULT deliberately: a default would let the existing
+//                    `Glm5NextHostForward(w, ids, {}, q, 0)` -- a chunk-size
+//                    argument -- bind its `0` to this pointer instead, which is
+//                    a silent behaviour change and not a compile error. The
+//                    W5b-2c suite caught that on its first build.
 //   logits_indices : positions to emit, EMPTY meaning every position. The
 //                    gather happens BEFORE `lm_head` so the head never runs on
 //                    the full `T`, and every index is bounds-checked.
@@ -156,6 +168,7 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
                                        const std::vector<int32_t>& token_ids,
                                        const std::vector<int32_t>& logits_indices,
                                        vt::Queue& queue,
+                                       std::vector<LayerCache>* caches,
                                        int64_t lm_head_chunk_bytes = kLmHeadChunkBytes);
 
 }  // namespace vllm::glm5_next

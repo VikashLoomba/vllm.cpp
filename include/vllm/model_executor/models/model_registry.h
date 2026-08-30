@@ -618,6 +618,29 @@ struct ModelFactory {
   // architecture gets the whole bound and the #1123 refusal until somebody wires
   // the seam and says so here.
   bool streams_routed_experts = false;
+  // MODEL-MM-GLM53-FLASH W5b-2c (#2348): whether THIS model's forward CONSUMES
+  // `ModelForwardInput::multi_kv` -- the cache set keyed by published layer
+  // name -- rather than ignoring it.
+  //
+  // THE DEFAULT IS FALSE, AND THE REFUSAL IN `ModelRegistry::Forward` IS WHAT
+  // THE DEFAULT BUYS. KV-DSV4-MULTICACHE W3 (#2068) made the runner allocate
+  // every published cache and hand them here by name, and refused the step
+  // unconditionally because no forward knew what to do with them. Letting a
+  // model through without that knowledge discards a correctly allocated KV
+  // topology in silence and reports a decode rate for a full-recompute path --
+  // and, for a paged model, re-attends an empty prefix on every step after the
+  // first, which is fluent wrong text and not a crash.
+  //
+  // WHY THE CAPABILITY AND NOT AN ARCHITECTURE LIST, which is the same argument
+  // `streams_routed_experts` above makes: the fact is a property of the
+  // model's forward and it lives beside the forward. `glm5_next_registry.cpp`
+  // is the translation unit that reads the channel and it is the one that sets
+  // this. A new architecture inherits false and is refused until somebody
+  // writes the consuming forward and says so here.
+  //
+  // DeepSeek-V4 keeps the default: `DeepseekV4Model::Forward` still opens with
+  // `(void)attn_kv;` and row KV-DSV4-MULTICACHE W5 (#1925) owns its consuming
+  // forward.
 };
 
 struct ModelRegistration {

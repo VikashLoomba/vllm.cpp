@@ -26,6 +26,7 @@
 #include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
 #include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
+#include "vllm/model_executor/expert_stream_seam.h"  // MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the load-time slot-capacity refusal
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -33,6 +34,7 @@
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/glm5_next_weights.h"  // glm5next GGUF arm
+#include "vllm/model_executor/models/glm_moe_dsa.h"  // glm-dsa GGUF arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"  // qwen4exp GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
@@ -1016,6 +1018,15 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
 //    which asserts its own three architectures by name; a fourth family routed
 //    there would refuse as "qwen3_5 gguf: unexpected architecture", which is the
 //    #809 defect this table exists to prevent (see the default arm below).
+//  * `glm-dsa` -> GlmMoeDsaHfConfigFromGguf. GLM-5.3, and the first row here
+//    whose family vLLM DOES implement at the pin -- `registry.py:117` routes
+//    `GlmMoeDsaForCausalLM` into `deepseek_v2` -- while our own DeepSeek-V2
+//    loader refuses the checkpoint at its `index_topk` tripwire. It is a
+//    SEPARATE row rather than a `deepseek2` one for that reason: the tripwire
+//    stays a wall for DeepSeek-V2 and this family gets its own config, its own
+//    registration and its own refusals. The builder synthesizes an HF-shaped
+//    config and hands it to the same `ParseGlmMoeDsaParams` a config.json
+//    descends through.
 //  * `glm5next` -> Glm5NextHfConfigFromGguf, whose builder synthesizes an
 //    HF-shaped config and hands it to the SAME `ParseGlm5NextParams` a
 //    config.json descends through, so both sources meet one validator. This is
@@ -1035,6 +1046,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen3next", &vllm::HfConfigFromGguf},
     {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
     {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
+    {vllm::kGlmMoeDsaGgufArch, &vllm::GlmMoeDsaHfConfigFromGguf},
 };
 
 std::string SupportedGgufArchitectures() {
@@ -2488,6 +2500,31 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
         // the computed default, so the number here is the number that gets
         // allocated and not an estimate of it.
         lane.tensor_name_suffix = kStreamedExpertSuffix;
+        // MODEL-TEXT-GLM-MOE-DSA W3 (#2214, spec §3.3). The budget must hold
+        // ONE decode step's whole slice working set, because every `Acquire`
+        // marks its entry protected until `EndStep` clears it. Below that, the
+        // cache does not fail: `Slice` returns nullptr and the caller reads the
+        // tower IN PLACE out of the mmap, counted on stderr and reported as
+        // success. On the model this row targets that is a 187 GiB random read
+        // per token, and a benchmark measuring it would publish a page-cache
+        // number under a streaming label.
+        //
+        // HERE, not inside the store's constructor, because "at load" is the
+        // point of it: the constructor first runs on the FIRST expert slice of
+        // the first forward, after the weights are read and the device pool is
+        // built, which is exactly the 26-minute-then-die shape the refusal a few
+        // lines above exists to avoid. This block is already the one place that
+        // has both the file and the resolved budget.
+        //
+        // Reached on every streaming load, not only this row's: the geometry
+        // comes from the file, so Qwen3.5 is checked by the same call. Streaming
+        // is default OFF and this branch needs `ResolveExpertStreamRequested()`,
+        // so a run that never asked for the lane cannot reach the refusal.
+        const GgufExpertLaneGeometry lane_geom =
+            GgufStreamedExpertLaneGeometry(gguf, lane.tensor_name_suffix);
+        expert_stream::RequireSlotCapacity(
+            std::string(gguf_arch.architecture), lane_geom.streamed_tower_count,
+            lane_geom.experts_per_tok, ResolveExpertStreamSlots());
         const size_t slice =
             GgufLargestExpertSliceBytes(gguf, lane.tensor_name_suffix);
         if (slice > 0) {

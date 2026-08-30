@@ -383,7 +383,7 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
 //
 //   0. the QSA layers' paged K+V              `FullAttentionSpec`
 //   1. EVERY linear-attention layer's state   `MambaSpec`, N states
-//   2. the QSA layers' indexer side cache     `MLAAttentionSpec`, compress 4
+//   2. the QSA layers' indexer side cache     `MLAAttentionSpec`, ONE ROW PER TOKEN
 //
 // ONE UNIFORM RECURRENT GROUP, NOT ONE PER LAYER, AND THE COST IS DELIBERATE.
 // Only ONE linear-attention layer carries the PLE conv and the n-gram token
@@ -443,14 +443,53 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
 // what this function said.
 //
 // GROUP 2 IS AN `MLAAttentionSpec` AND THAT IS LOAD-BEARING. `MLAAttentionSpec`
-// is not an MLA claim — it is the key-only page budget, one vector per stored
-// state instead of a K+V pair — and `compress_ratio` is what makes a state
-// cover four tokens (`vllm/v1/kv_cache_interface.py:386` and the
-// `storage_block_size = block_size // compress_ratio` property at `:393-395`).
-// A `FullAttentionSpec` here would be absorbed by the runner as the single
-// `fa_draft` draft-KV slot instead (`gpu/runner.cpp`, the `draft_slot_taken`
-// arm of the leftover scan), `multi_cache_topology` would stay false, and the
-// side cache would be published and never allocated — in silence.
+// is not an MLA claim — it is the KEY-ONLY page budget, one vector per stored
+// row instead of a K+V pair. A `FullAttentionSpec` here would be absorbed by the
+// runner as the single `fa_draft` draft-KV slot instead (`gpu/runner.cpp`, the
+// `draft_slot_taken` arm of the leftover scan), `multi_cache_topology` would
+// stay false, and the side cache would be published and never allocated — in
+// silence.
+//
+// ITS `compress_ratio` IS 1 AND NOT `indexer_compress_ratio` (W5h). This
+// paragraph used to say the ratio "is what makes a state cover four tokens",
+// which is what `compress_ratio` MEANS
+// (`vllm/v1/kv_cache_interface.py:386`, `:393-395`) and is not what this cache
+// STORES. The oracle is unambiguous — transformers 5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py`, the lane pin recorded in
+// `.agents/oracles/transformers.md`:
+//
+//   :645-646  `q, raw_keys = q.reshape(*hidden_shape),
+//              token_k.reshape(*hidden_shape).squeeze(2)` — one UN-normed,
+//              UN-roped key per TOKEN
+//   :654-655  `raw_keys = past_key_values.update_indexer(raw_keys,
+//              self.layer_idx)` — and `cache_utils.py:340` calls that "update
+//              the indexer key cache by concatenation", returning
+//              `[batch_size, total_len, index_head_dim]` (`:346`); the static
+//              arm returns `[batch_size, max_cache_len, index_head_dim]`
+//              (`:672`)
+//   :678-681  the POOLED block keys are rebuilt from those raw keys on EVERY
+//              step (`raw_keys[batch_idx].index_select(0, ...)` then
+//              `.float().mean(dim=1)`). Nothing caches a pooled key.
+//
+// So `indexer_compress_ratio` belongs to the indexer's ALGORITHM — `block_topk =
+// token_budget // compress_ratio` (`:622`) and `complete_keys = (kv_len / CR) *
+// CR` in `Qwen4ExpQsaIndex` — and never to this cache's page geometry. Our own
+// consumer already said so: `Qwen4ExpQsaPagedCaches::index_key` is
+// `[max_kv, indexer_head_dim]`, written at rows `[past_len, past_len + T)`
+// (`qwen4_exp_qsa_block.cpp:426`) and read over rows `[0, complete_keys)`
+// (`:193`), which is one row per token.
+//
+// WHAT THE FOUR COST, AND WHY IT WAS WORSE THAN A SHORT CACHE. The allocation is
+// `num_blocks * page_size_bytes()` and `MLAAttentionSpec::real_page_size_bytes`
+// takes `storage_block_size()` (`src/vllm/v1/kv_cache_interface.cpp:151-152`),
+// while the `PagedKvCache` VIEW the runner hands the forward carries
+// `kv.block_size = fa_dims[i].block_size` — the spec's own `block_size`
+// (`src/vllm/v1/worker/gpu/runner.cpp:1532` filled at `:1333`). At ratio 4 the
+// view claimed 16 rows per page over an allocation of 4, so a consumer that
+// trusted the view read four times past the buffer. The two agree exactly when
+// `storage_block_size() == block_size`, which is what ratio 1 makes true. It was
+// unreachable only because `ModelRegistry::Forward` refuses a multi-cache
+// topology before any of it runs.
 v1::KVCacheConfig MakeQwen4ExpKVCache(const HfConfig& config, int block_size,
                                       int num_blocks) {
   // The row's own resolve-and-validate, not a second reading of the raw config.
@@ -505,21 +544,19 @@ v1::KVCacheConfig MakeQwen4ExpKVCache(const HfConfig& config, int block_size,
                "the QSA indexer side cache cannot be sized. See "
                ".agents/specs/qwen4-exp-flash-next.md and issue #2031.");
 
-  // `MLAAttentionSpec::storage_block_size()` is `block_size / compress_ratio`,
-  // an INTEGER division that truncates in silence
-  // (`vllm/v1/kv_cache_interface.py:393-395`). At a block size the ratio does
-  // not divide, the page is sized for `floor(block/ratio)` states while the
-  // block still covers `block` tokens, so the last partial state's key has
-  // nowhere to go — a short cache, i.e. wrong tokens rather than a crash.
-  // Upstream never meets this because its DeepSeek-V4 block sizes are powers of
-  // two above the ratio; ours arrives as a caller-supplied parameter.
-  VT_CHECK(block_size % p.qsa.compress_ratio == 0,
-           "qwen4_exp KV spec: block_size " + std::to_string(block_size) +
-               " is not a multiple of `indexer_compress_ratio` " +
-               std::to_string(p.qsa.compress_ratio) +
-               "; the indexer side cache stores one state per " +
-               std::to_string(p.qsa.compress_ratio) +
-               " tokens and storage_block_size() would truncate.");
+  // W5h: THE BLOCK-SIZE DIVISIBILITY REFUSAL IS GONE, BECAUSE THE COMPRESSION IT
+  // GUARDED WAS NEVER THIS CACHE'S. It read `block_size % indexer_compress_ratio
+  // == 0` and explained that `storage_block_size()` truncates under integer
+  // division (`vllm/v1/kv_cache_interface.py:393-395`). Every word of that was
+  // true of a COMPRESSED page and this page is not one — see the group-2
+  // construction below for the oracle that decides it — so at `compress_ratio`
+  // 1 there is no division and nothing to truncate. Deleting a guard needs an
+  // argument rather than a green run, and the argument is that its replacement
+  // is STRICTLY STRONGER: `test_qwen4_exp_kv_cache.cpp`'s W5h case asserts the
+  // side cache's row capacity EQUALS the paged K/V group's token capacity, at
+  // both a dividing and a non-dividing block size. The old refusal could only
+  // see one arithmetic accident; the capacity law sees any spec that cannot hold
+  // what the model stores.
 
   // The recurrent state set, in the order stated above.
   //
@@ -580,7 +617,10 @@ v1::KVCacheConfig MakeQwen4ExpKVCache(const HfConfig& config, int block_size,
           v1::KVQuantMode::kNone, /*page_size_padded=*/std::nullopt,
           /*indexes_kv_by_block_stride=*/false,
           /*cache_dtype_str=*/std::nullopt, /*alignment=*/std::nullopt,
-          static_cast<int>(p.qsa.compress_ratio),
+          // ONE ROW PER TOKEN — `compress_ratio` 1, NOT
+          // `indexer_compress_ratio`. See the "GROUP 2" paragraph above this
+          // function for the oracle lines that decide it.
+          /*compress_ratio=*/1,
           /*model_version=*/std::nullopt));
   return kv;
 }

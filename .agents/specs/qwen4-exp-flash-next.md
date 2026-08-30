@@ -3502,7 +3502,200 @@ now makes possible for recurrent members too, 5 of 5 on this shape where it was
 channel carries. Then the guard becomes the per-architecture capability bit
 `.agents/specs/kv-dsv4-multicache.md` describes, and this row owns its arm.
 
+## Mutation record — W5h (#2031, issue OWED)
+
+**THE INDEXER SIDE CACHE WAS FOUR TIMES TOO SMALL, AND THE VIEW OVER IT WAS
+FOUR TIMES TOO LARGE.** Found by taking the serving question seriously: the
+runner allocates every published cache on the multi-cache path, and this is the
+one the model cannot read.
+
+**WHAT W5c-1 PUBLISHED.** Group 2 as
+`MLAAttentionSpec(..., compress_ratio = indexer_compress_ratio)`, i.e. 4. That
+makes `storage_block_size()` = `block_size / 4` and `page_size_bytes()` =
+`storage_block_size() * num_kv_heads * head_size * sizeof(dtype)`
+(`src/vllm/v1/kv_cache_interface.cpp:151-152`) — 1024 B per page, 64 B per token
+per layer, one stored row per FOUR tokens.
+
+**WHAT THE ORACLE SAYS.** transformers 5.16.0
+`models/qwen4_exp/modeling_qwen4_exp.py`, the lane pin in
+`.agents/oracles/transformers.md` (sha256
+`77fec77d87f2a0eb23b95fa04276fb5779698a7c7f523cf5061e49c118bcc459`), re-derived
+by READING the file rather than relayed:
+
+| Anchor | What it says |
+|---|---|
+| `modeling_qwen4_exp.py:645-646` | `q, raw_keys = q.reshape(*hidden_shape), token_k.reshape(*hidden_shape).squeeze(2)` — ONE un-normed, un-roped key per TOKEN |
+| `:654-655` | `raw_keys = past_key_values.update_indexer(raw_keys, self.layer_idx)` |
+| `cache_utils.py:340`, `:346` | "Update the indexer key cache **by concatenation**", returning `[batch_size, total_len, index_head_dim]` |
+| `cache_utils.py:666`, `:672` | the static-cache arm: `[batch_size, max_cache_len, index_head_dim]` |
+| `modeling_qwen4_exp.py:678-681` | the POOLED block keys are rebuilt from the raw keys on EVERY step (`index_select` then `.float().mean(dim=1)`); nothing caches a pooled key |
+| `:622` | `self.block_topk = self.token_budget // self.compress_ratio` — where `compress_ratio` actually lives: the indexer's ALGORITHM |
+
+Our own consumer already agreed and nobody had compared the two:
+`Qwen4ExpQsaPagedCaches::index_key` is `[max_kv, indexer_head_dim]`, written at
+rows `[past_len, past_len + T)` (`qwen4_exp_qsa_block.cpp:426`) and read over
+rows `[0, complete_keys)` (`:193`). One row per token, both sides.
+
+**THE SECOND CONSEQUENCE IS AN OVERRUN, NOT MERELY A SHORT CACHE.** The runner
+allocates `num_blocks * page_size_bytes()` — off `storage_block_size()` — while
+the `PagedKvCache` VIEW it hands the forward carries `kv.block_size =
+fa_dims[i].block_size`, the spec's own `block_size`
+(`src/vllm/v1/worker/gpu/runner.cpp:1532`, filled at `:1333`). At ratio 4 the
+view claimed 16 rows per page over an allocation of 4. Unreachable today only
+because `ModelRegistry::Forward` refuses a multi-cache topology first, which is
+the sense in which the engine guard has been holding a real defect shut.
+
+**THE FIX.** `compress_ratio = 1` for group 2. `storage_block_size() ==
+block_size`, allocation and view agree, 256 B per token per layer.
+
+**THE RETIRED REFUSAL.** `block_size % indexer_compress_ratio == 0` guarded the
+integer truncation in `storage_block_size()`. At ratio 1 there is no division.
+It is deleted rather than weakened, and its replacement is strictly stronger: a
+CAPACITY LAW asserting the side cache's row count equals the paged K/V group's
+token count, evaluated at a dividing block size (16) AND at the one the old
+refusal rejected (18). The old refusal could see one arithmetic accident; the
+law sees any spec that cannot hold what the model stores. The retired SUBCASE
+is kept as an ACCEPTANCE (`block_size` 18 must NOT throw), so reinstating the
+ratio reds in two places rather than silently restoring a passing test.
+
+**THE LAW IS DERIVED, NOT A CONSTANT.** `token_slots` comes from group 0's own
+`block_size * num_blocks`, never from the literal 16. M3 below is the paired
+red.
+
+### Gate
+
+Base `e2d58307162b7505b5f6a3039b0e6688954dc90b` (`row/MODEL-MM-QWEN4-EXP-E2E`).
+CPU-only build, `cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+-DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF`, `-j 2`, named targets.
+
+| Suite | Before | After |
+|---|---|---|
+| `test_qwen4_exp_kv_cache` | 4 cases / 399 assertions, `SUCCESS` | 5 cases / 414 assertions, `SUCCESS` |
+| `test_qwen4_exp_layer_loop` | 2 cases / 104 assertions, `SUCCESS` | 2 cases / 104 assertions, `SUCCESS` |
+
+The transformers 5.16.0 end-to-end golden is UNMOVED: `max|diff| = 0.00982457`
+against a bound of `0.03`, on both sides of the change.
+
+**RED FIRST, and the numbers are the defect.** The new case was committed
+against the UNCHANGED product and read:
+
+```
+CHECK( indexer_rows == token_slots ) is NOT correct!
+  values: CHECK( 32 == 128 )
+  logged: the indexer side cache holds 32 rows for 128 token slots
+CHECK( idx->storage_block_size() == idx->block_size ) ... CHECK( 4 == 16 )
+CHECK( idx->compress_ratio == 1 ) ................. CHECK( 4 == 1 )
+CHECK( idx->page_size_bytes() == ... ) ............ CHECK( 1024 == 4096 )
+CHECK( idx->page_size_bytes() / idx->block_size == 256 ) ... CHECK( 64 == 256 )
+CHECK( token_slots <= indexer_rows ) ............. CHECK( 128 <= 32 )
+test case THREW exception: qwen4_exp KV spec: block_size 18 is not a multiple
+  of `indexer_compress_ratio` 4 ... at qwen4_exp_registry.cpp:516
+```
+
+### Mutations
+
+Build rc read BEFORE any test output in every case; a build failure is not a
+test result. Applied-proof is the post-mutation sha256 against the pre-mutation
+one, restore-proof is the sha256 back to
+`439d2998a704d3b745cd6768980a4159a267ded3df2a36b1ff1550abbca8b6bb`
+(`qwen4_exp_registry.cpp`) and
+`865c3b7fd11c4ae6619958226749819cc265bee551f27fd7e476364e5325c0f7`
+(`test_qwen4_exp_kv_cache.cpp`). `touch` after every restore, or ninja skips the
+rebuild.
+
+| # | Mutation | sha256 after apply | Build rc | Result |
+|---|---|---|---|---|
+| M1 | `compress_ratio` 1 -> `p.qsa.compress_ratio` (the pre-W5h value) | `693f6d8bb868c2b71749f4eddab261a0e8f84becce92c04c9ecf8e08c50c486c` | 0 | **RED** — 3 of 5 cases, 13 of 414 assertions |
+| M2 | REACHABILITY: delete the group-2 `emplace_back` from `MakeQwen4ExpKVCache` | `6d555e75006cb8f4be49fbf56012d3eb1c4cf629ed69fc731618bbdd0eaf6dfa` | 0 | **RED** — rc 139, 3 failed cases, `SIGSEGV` in the pre-existing group-2 case. NOT vacuous: the suite reaches the production `make_kv_cache` through `ModelRegistry::Resolve(config).factory`, which is the entry `LoadedEngine::MakeKVCacheMaybeSpec` calls |
+| M3 | group 0's `FullAttentionSpec` built at `block_size * 2` | `6cb6b8bb56848e94b3588860d3574cc5afce5df86e5054d3217c938cb880d3bf` | 0 | **RED** — 3 assertions, and exactly the three derived ones (`indexer_rows == token_slots`, `token_slots <= indexer_rows`, the block-18 law). The shape assertions stayed green, which is what proves the law reads group 0 and not the literal 16 |
+
+**THREE MUTATIONS THE DISPATCH ASKED FOR ARE VACUOUS ON THIS WAVE AND ARE
+REPORTED AS VACUOUS RATHER THAN RUN.** "Resolve a cache to the wrong name",
+"drop the indexer side cache from the resolution" and "lift the guard for a
+shape nothing consumes" all mutate code this wave does NOT land: no forward here
+resolves by name and the engine guard is untouched. A mutation whose target does
+not exist cannot red for the reason claimed, and running one anyway would be the
+"a mutation that never applied reads as a passing test" failure. They belong to
+W5i and W5j below.
+
 ## Owed
+
+- **W5h's ISSUE IS OWED.** GitHub writes are `403` from this host (account
+  suspended), so nothing could be filed. The change rides under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031) and no row was
+  appended to `.agents/issue-index.md`, because an index row pointing at an
+  issue that does not exist is worse than an absent one.
+
+- **`.agents/issue-index.md` ROW [#1978](https://github.com/mudler/vllm.cpp/issues/1978)
+  NOW CARRIES A FALSIFIED SENTENCE AND CANNOT BE REPAIRED.** Its survey reads
+  "one stored state per 4 tokens via `MLAAttentionSpec(tokens_per_state=
+  compress_ratio)`" among the nine DeepSeek-V4 structural matches. That is true
+  of DeepSeek-V4 and NOT of `qwen4_exp`, whose indexer caches the RAW per-token
+  key (`modeling_qwen4_exp.py:655`, `cache_utils.py:346`) — the ninth "match"
+  is the one that does not hold, and believing it is what produced the 4x-short
+  group W5h fixes. The index is APPEND-ONLY and carries `merge=union`, so the
+  row is left byte-for-byte alone and the correction lives here, which is the
+  arrangement AGENTS.md prescribes for a keyed append-only record.
+
+- **W5i — THE INDEXER SIDE CACHE IS NOW BIG ENOUGH AND STILL NOT READABLE.**
+  Sizing it correctly does not make it addressable. `Qwen4ExpQsaIndex` requires a
+  CONTIGUOUS `[max_kv, indexer_head_dim]` tensor indexed by ABSOLUTE logical
+  position (`qwen4_exp_qsa_block.cpp:166-169`, `:193`, `:426`), and the engine's
+  buffer is PAGED: physical row = `block_table[pos / block_size] * block_size +
+  pos % block_size`. The gap is a gather and a scatter and needs no new op —
+  `vt::IndexSelect` (`include/vt/ops.h:4033`) and `vt::IndexCopy` (`:4040`) are
+  exactly row gather and row scatter over dim 0 with an i32 index — but it is
+  product code with its own golden, and the golden must use a NON-IDENTITY page
+  permutation or it proves nothing (a single sequence at prefill happens to map
+  identically, which is the fixture accident this entry exists to forbid).
+  ISSUE OWED.
+
+- **W5j — THE FORWARD MUST RESOLVE ITS CACHES BY NAME, AND THE ENGINE GUARD
+  MUST BECOME A PER-ARCHITECTURE CAPABILITY.** Measured on this head, not
+  supposed:
+  - `ForwardQwen4ExpForConditionalGeneration` asserts
+    `input.attn_kv.size() == n_qsa` (`qwen4_exp_registry.cpp`, the "paged K/V
+    caches for ... qwen_sparse_attention layers" refusal). The runner allocates
+    one paged buffer per (ATTENTION GROUP x LAYER) on the multi-cache path
+    (`src/vllm/v1/worker/gpu/runner.cpp:1300-1339`, the loop over
+    `attn_group_ids_`), and this model publishes TWO attention groups, so
+    `attn_kv` arrives at `2 * n_qsa`. Lifting the engine guard without fixing
+    this yields a different refusal, not a token.
+  - The by-name channel now covers recurrent members (`ENG-MULTIKV-BYNAME`), so
+    `MultiKvCacheIndex::Resolve` can address all five of this model's published
+    cache kinds. The hook must use it, and it must build its layer names through
+    ONE builder shared with `MakeQwen4ExpKVCache` — two derivations of one name
+    set is the shape that can disagree.
+  - `ModelRegistry::Forward`'s `if (input.multi_kv != nullptr)` refusal must
+    become a bit the MODEL declares, which the guard's own comment already
+    names as the intended polarity ("the polarity `ModelFactory`'s existing
+    `stage_on_load` and offload bits already use"). It must still refuse an
+    architecture that declares nothing, and the mutation that proves it is
+    "declare the bit for a shape nothing consumes and check it STILL refuses" —
+    against the specific message, never a bare `CHECK_THROWS` an unrelated
+    exception can satisfy.
+  ISSUE OWED.
+
+- **THE PUBLISHED PLE CONV STATE IS bf16 AND `RunQwen4ExpPleBlock` REQUIRES
+  f32.** `MakeQwen4ExpKVCache` pushes the PLE conv state at
+  `conv_dtype = vt::DType::kBF16`, and the block refuses anything else:
+  `VT_CHECK(conv_state.dtype == DType::kF32 && conv_state.IsContiguous(), ...)`
+  (`qwen4_exp_ple_block.cpp:320-321`), then reads it through
+  `conv_state.Ptr<float>()` (`:354`). The n-gram history is `kI64` on both
+  sides and agrees, but it is read through a HOST pointer (`:386-389`), so the
+  runner's allocation is only usable while the device is CPU. Which side is
+  wrong is a design call this wave did not have the oracle to settle — upstream
+  stores whatever dtype the conv input carries (`update_conv_state`) — so it is
+  RECORDED rather than changed, because publishing a dtype on a guess is the
+  same class of error W5h just removed. It blocks multi-step decode either way.
+  ISSUE OWED.
+
+- **NOTHING SERVES YET, AND THE SECOND STEP IS STILL THE THING.** `past_len ==
+  0` still refuses (`qwen4_exp_registry.cpp`, the SINGLE-SHOT PREFILL refusal),
+  `GPUModelRunner` still cannot reach this model's hook because the engine
+  guard fires above it, and no `examples/server` end-to-end and no
+  `docs/USAGE.md` weights row are owed until an arm SERVES. W5h moved one of
+  the four blockers between here and there and did not move the other three.
 
 - **CLOSED BY W5g, AND ITS DIAGNOSIS WAS HALF RIGHT.** The entry below is kept
   because its measurement is what bought the fix, and because BOTH repairs it
@@ -4880,9 +5073,10 @@ channel carries. Then the guard becomes the per-architecture capability bit
   `kv_cache_backend_resident_` is false
   (`!platforms::GetPlatform(dev.type).is_cpu()`), so the runner takes host
   vectors and nothing on a device has ever held this model's KV. The 3391504 B
-  page, the 49.2 MiB uniform slack and the 64 B/token/layer side cache are
+  page, the 49.2 MiB uniform slack and the 256 B/token/layer side cache are
   arithmetic over the published shapes, gated as literals, and they are not a
-  measurement. Gateable only on `dgx:gpu0`, and `--device cuda` still refuses
+  measurement. The side-cache figure read 64 B until W5h, which is the same
+  arithmetic over a `compress_ratio` the oracle says this cache does not have. Gateable only on `dgx:gpu0`, and `--device cuda` still refuses
   ahead of any tensor I/O for the n-gram expansion
   ([#2083](https://github.com/mudler/vllm.cpp/issues/2083)).
 - **`--kv-cache-dtype fp8` now refuses the WHOLE model**, and that is a
@@ -5338,13 +5532,18 @@ a row here, and every row says whether anything in production reaches it:
 | W5e-1 | the PLE GATE as `vt::Qwen4ExpPleGate` — the op #2249 never surveyed | no | [#2336](https://github.com/mudler/vllm.cpp/issues/2336) |
 | W5e-2 | `RunQwen4ExpPleBlock`, the PLE layer as ONE composition — the LAST block seam | no | [#2336](https://github.com/mudler/vllm.cpp/issues/2336) |
 | W5f | `Qwen4ExpTextModel::Forward` — THE LAYER LOOP, and the `lm_head` tail | **yes** — `ModelRegistry::Forward` calls it on a loaded `qwen4exp` GGUF | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2336](https://github.com/mudler/vllm.cpp/issues/2336) |
+| W5g | the STATED n-gram vocabulary as the layout's authority, and a heap over-read closed on the GGUF arm | **yes** — `Qwen4ExpPleLayout`, reached from `qwen4_exp_forward.cpp` inside the loop W5f wired | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
+| W5h | the indexer side cache sized at ONE ROW PER TOKEN: `compress_ratio` 1, not 4 | **yes** — `make_kv_cache`, the same production hook W5c-1 reaches | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5h's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than
 claiming a decode. **Nothing in the table decodes a token, and W5f does not
-change that** — it changes the reason. Before it, thirteen of the twenty rows
-were unreached because nothing composed them; after it, the composition exists
-and runs from a production entry point, and what is missing is the SECOND STEP.
+change that** — it changes the reason. Before it, most of the rows above were
+unreached because nothing composed them; after it, the composition exists and
+runs from a production entry point, and what is missing is the SECOND STEP. The
+count is deliberately not written out: this section deletes prose counts of its
+own table, and W5g and W5h each added a row without touching this sentence,
+which is exactly the drift the policy exists to stop.
 **WHAT W5f's LOOP ACTUALLY REACHES IS A PREFIX OF THAT COLUMN, NOT ALL OF IT,
 and the sentence that stood here said all of it.** It read "Every `no` above is
 now reached THROUGH W5f's loop at a single-shot prefill". That is false, and the
@@ -5394,7 +5593,7 @@ gather arm is owed.
 `make_kv_cache` return three groups — the QSA layers' paged K+V, ONE uniform
 recurrent group carrying `[gdn_conv, temporal, ple_conv, ngram]` on every
 linear layer, and the QSA indexer side cache as an `MLAAttentionSpec` at
-`compress_ratio` 4 — over real per-layer names, so the runner takes its
+ONE ROW PER TOKEN since W5h — over real per-layer names, so the runner takes its
 multi-cache path and allocates every published cache. The engine half was
 `ENG-RECURRENT-MULTISTATE` (#2131); the second half that row expected to be
 needed, more than one recurrent group, is NOT on this path, because upstream

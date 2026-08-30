@@ -1017,6 +1017,51 @@ TEST_CASE("W5: a loaded attention sink reaches the MLA decode through the block 
   CHECK(worst > 1e-4);
 }
 
+TEST_CASE("W5: a loaded sink on the PREFILL path REFUSES, it does not attend without it") {
+  // The sink is implemented on the decode half only (#2323). A prefill batch
+  // carrying one must throw by name.
+  //
+  // THE POINT IS THE POLARITY. Ignoring the sink would leave every prefill row
+  // normalized over its keys alone -- a wrong answer that still emits plausible
+  // tokens, which no token gate would catch. This case pins the refusal so the
+  // half-built capability stays loud until the prefill half exists.
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = LiteDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = MlaAttentionScale(d, rp);
+  HostWeights hw = MakeWeights(d, rp, 512, 2323u);
+
+  // MULTI-token requests, and `decode_reqs = 0`, so the batch takes prefill.
+  const std::vector<Request> reqs = {{9, 3}, {16, 2}};
+  int64_t T = 0;
+  for (const Request& r : reqs) T += r.q_len;
+  auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 5150u, 0.8f));
+  auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 5151u);
+  const std::vector<float> sink(static_cast<size_t>(d.num_heads), 0.0f);
+
+  std::string msg;
+  try {
+    RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/0, 64,
+             /*raw_out=*/nullptr, /*k_rope_ln=*/nullptr, /*gate=*/nullptr,
+             /*gate_rows=*/0, &sink);
+    msg = "ACCEPTED (no throw)";
+  } catch (const std::invalid_argument& e) {
+    msg = e.what();
+  }
+  CHECK(msg.find("attention sink") != std::string::npos);
+  CHECK(msg.find("decode half only") != std::string::npos);
+
+  // AND THE SAME BATCH WITHOUT A SINK STILL RUNS. Without this, a refusal that
+  // fired on every prefill batch would pass the check above while breaking every
+  // existing model -- the opposite failure, and a worse one.
+  const auto ok =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/0, 64);
+  REQUIRE(!ok.empty());
+  for (float v : ok) REQUIRE(!std::isnan(v));
+}
+
 // (3) OURS vs OURS THROUGH TWO DIFFERENT CODE PATHS — the strongest form of the
 //     absorption proof, because nothing but the weights is shared.
 TEST_CASE("The SAME batch through the ABSORBED decode kernel and the UNABSORBED prefill path agree") {

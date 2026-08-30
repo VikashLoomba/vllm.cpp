@@ -760,6 +760,31 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   // ─── 5a. PREFILL — the materialized-MHA form (mla_attention.py:722-737) ──
   // Runs on the TAIL `q[num_mqa_tokens:]`, because decode tokens are packed
   // first.
+  // KV-DSV4-MULTICACHE W5 (#2323): the sink is implemented on the DECODE half
+  // only, so a batch that would take the prefill path with one loaded REFUSES
+  // rather than attending without it.
+  //
+  // WHY REFUSE INSTEAD OF IGNORING. A sink removes probability mass; dropping it
+  // leaves every prefill row normalized over the keys alone, which is a WRONG
+  // ANSWER that still produces plausible tokens -- the invisible class this tree
+  // rejects. Refusing makes the missing half loud at the first forward instead.
+  //
+  // WHY IT IS NOT IMPLEMENTED HERE YET, recorded so the next reader does not
+  // assume it was an oversight. The prefill softmax is TWO-PASS and its chunked
+  // arm merges a prefix and a suffix through their LSEs
+  // (`cpu_mla_prefill.cpp`). A sink added inside the kernel would therefore be
+  // counted once PER CHUNK rather than once per row -- the same double-count the
+  // decode kernel avoids by seeding stage 2 rather than stage 1. Getting that
+  // right needs its own design and its own gate, and a gate that ran only the
+  // unchunked case could not see the error.
+  if (w.attn_sink.data != nullptr && prefill_toks > 0) {
+    throw std::invalid_argument(
+        "MLA block: a per-head attention sink is loaded, but this batch takes "
+        "the PREFILL path and the sink is implemented on the decode half only "
+        "(KV-DSV4-MULTICACHE W5, #2323). Refusing rather than attending without "
+        "it, because a dropped sink is a wrong answer that still produces "
+        "plausible tokens.");
+  }
   if (prefill_toks > 0) {
     RequireWeight(w.kv_b_proj, "kv_b_proj");
     if (meta.prefill_cu_seqlens_q.data == nullptr) {

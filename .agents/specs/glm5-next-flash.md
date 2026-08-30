@@ -3622,7 +3622,7 @@ Debts this row carries, each visible rather than waived:
   `consumes_multi_kv_cache`, default false, and `ModelRegistry::Forward` refuses
   only when a keyed cache set arrives AND the registered forward does not
   declare that it consumes one — the pair of facts the message already asserted.
-  Restoring the unconditional form reds 17 of 23 cases, which is the measure of
+  Restoring the unconditional form reds 18 of 23 cases, which is the measure of
   how much this narrowing carries; DeepSeek-V4 keeps the default, is still
   refused, and #1925 still owns its consuming forward.
 
@@ -3696,7 +3696,7 @@ same defect and this row does not inherit it.
 with the one-shot forward over the same eight tokens EXACTLY on an f32 cache,
 and nine negative mutations all kill their gate — including the reachability one
 `.agents/reachability.md` asks for and a restoration of the unconditional W3
-guard, which reds 17 of 23 cases. What the fixture CANNOT see is recorded in
+guard, which reds 18 of 23 cases. What the fixture CANNOT see is recorded in
 O29: at `hidden_size` 32 a wrong prompt moves the tail logits by two ULP, so the
 bf16 case asserts a one-ULP bound and nothing about discrimination.
 

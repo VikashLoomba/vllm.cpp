@@ -390,32 +390,19 @@ __device__ inline void LoadRowEplFp8(const uint8_t* p, int64_t base, int lane,
       r[i + 4] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.y >> (i * 8)) & 0xFF)) * scale;
   } else {
     const uint4* u = reinterpret_cast<const uint4*>(p + base);
-    const uint4 w0 = u[lane];
-    const uint4 w1 = u[lane + 32];
+    const uint4 w = u[lane];
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      r[i] = F8E4M3ToF32Dev(static_cast<uint8_t>((w0.x >> (i * 8)) & 0xFF)) * scale;
+      r[i] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.x >> (i * 8)) & 0xFF)) * scale;
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      r[i + 4] = F8E4M3ToF32Dev(static_cast<uint8_t>((w0.y >> (i * 8)) & 0xFF)) * scale;
+      r[i + 4] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.y >> (i * 8)) & 0xFF)) * scale;
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      r[i + 8] = F8E4M3ToF32Dev(static_cast<uint8_t>((w0.z >> (i * 8)) & 0xFF)) * scale;
+      r[i + 8] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.z >> (i * 8)) & 0xFF)) * scale;
 #pragma unroll
     for (int i = 0; i < 4; ++i)
-      r[i + 12] = F8E4M3ToF32Dev(static_cast<uint8_t>((w0.w >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 16] = F8E4M3ToF32Dev(static_cast<uint8_t>((w1.x >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 20] = F8E4M3ToF32Dev(static_cast<uint8_t>((w1.y >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 24] = F8E4M3ToF32Dev(static_cast<uint8_t>((w1.z >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 28] = F8E4M3ToF32Dev(static_cast<uint8_t>((w1.w >> (i * 8)) & 0xFF)) * scale;
+      r[i + 12] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.w >> (i * 8)) & 0xFF)) * scale;
   }
 }
 

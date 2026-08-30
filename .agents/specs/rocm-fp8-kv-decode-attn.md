@@ -170,3 +170,45 @@ confirm the dispatch falls back to `PagedAttnOnline`.
 ## Now
 
 Spec committed, implementation pending.
+
+## Outcome
+
+Implementation landed on `row/fp8-kv-decode-attn` (fork issue #7), rebased
+onto `origin/main` at `0bb090def` (2026-08-30).
+
+**Bug fixed during validation:** the `LoadRowEplFp8<EPL=16>` path loaded two
+`uint4` values (32 bytes = 32 fp8 elements) and wrote to `r[0..31]`, but `r`
+is `float r[16]` — a stack buffer overflow. The bf16 EPL=16 path needs two
+`uint4` because each bf16 element is 2 bytes (16 × 2 = 32); fp8 elements are
+1 byte (16 × 1 = 16), so one `uint4` suffices. The bug was latent: the
+dispatch only instantiates EPL=4 (d=128) and EPL=8 (d=256); EPL=16 would need
+d=512, which the guard `(d == 128 || d == 256)` excludes. The `static_assert`
+admits EPL=16, so the trap was set for a future d=512 extension. Fixed to a
+single `uint4` load writing `r[0..15]`, matching the spec's design section.
+
+**Verification (ROCm 10.0.0 container, `rocm10-gfx1100:10.0.0`, gfx1100 =
+AMD Radeon RX 7900 XTX, HIP 7.15.26333, 2026-08-30):**
+
+| Test | Cases | Assertions | Result |
+|---|---:|---:|---|
+| `test_rocm_fp8_kv_cache` (G2–G5, device) | 7 | 28 | PASS |
+| `test_ops_fp8_kv_cache` (CPU oracle) | 8 | 511 | PASS |
+| `test_attn_backend_registry` | 20 | 125 | PASS |
+| `test_attn_validate_configuration` | 21 | 82 | PASS |
+| `test_kv_cache_fp8_wiring` | 31 | 487 | PASS |
+| `test_ops_attention` | 11 | 39 | PASS |
+| `test_rocm_backend` | 9 | 1065 | PASS |
+| `test_rocm_arch` | 9 | 59 | PASS |
+
+**Project gates:**
+
+| Gate | Result |
+|---|---|
+| `check-agent-record.py` | OK |
+| `check-commit-style.py` | OK |
+| `check-commit-trailers.py` | OK |
+| `check-env-doc.py` | OK |
+
+**Not yet measured:** the served-model token-exact gate and the performance
+A/B (the `kind_tharp` container run with `VT_ATTN_DECODE_GQA4=1` + fp8 KV).
+These require a served-model run on the GPU and are owed.

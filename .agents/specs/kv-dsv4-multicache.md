@@ -575,7 +575,50 @@ table says.
 on: it already caches, with indexer and compressor forced OFF on every layer
 (`:677-679`).
 
-#### W5-5. Gate
+#### W5-5. The bridge: the two cache representations, and the shortcut that must not be taken
+
+The wave's substance is that two representations have to meet, and naming them
+precisely is what stops the wrong one being chosen:
+
+| side | shape |
+|---|---|
+| runner (`PagedKvCache`, `qwen3_5.h:78-92`) | PAGED -- `{data, dtype, num_blocks, block_size, num_kv_heads, head_size, fp8_kind}`, addressed through a block table, `bf16` or `fp8` |
+| model (`DeepseekV4KvCache`, `deepseek_v4.h:513-528`) | CONTIGUOUS -- `deck[layer]` is a flat `[len * head_dim]` of **f32** that GROWS, plus `len` |
+
+Three ways to join them, and only one of them is real.
+
+**(a) Attend over the paged cache directly.** What upstream does, and what the
+primitives here already support: `vt::ReshapeAndCache` (`ops.h:4628`) writes a
+step's K/V into pages, `vt::PagedAttention` (`ops.h:4975`) reads `[0, ctx)` back
+out, and `dense_attn::AttnBlock` already drives exactly that pair
+(`dense_attn_block.h:662`). This is the wave.
+
+**(b) Copy paged -> contiguous each step, then run the existing forward.**
+**This is the trap, and it must be named rather than left to be discovered.** It
+is by far the easiest thing to write, it produces IDENTICAL TOKENS, and it makes
+every token gate green -- while the decode stays O(context) per token, because the
+copy is exactly the work the paged cache exists to avoid. The engine would then
+report a decode rate for a path that is asymptotically no better than the
+full-recompute one it replaced. That is the same shape as
+`## Why our KV interface cannot represent it`: a wrong-answer-not-a-crash, only
+here the wrong answer is a NUMBER rather than a token. It is also why W5-6's
+gate asserts the saving by COUNTING WORK rather than by timing -- a timing gate on
+a small synthetic config would not separate (a) from (b), and a token gate cannot
+separate them at all.
+
+**(c) Alias the paged storage from the deck.** Not available: pages are not
+contiguous, which is the entire point of paging.
+
+**A DTYPE DECISION RIDES ALONG, and it is not incidental.** The deck is `f32`
+while the pages are `bf16`/`fp8`, so (a) does not merely change WHERE the KV
+lives, it halves or quarters what it costs, and it changes the arithmetic the
+attention reads. That is the same polarity as the carried tower's f32 widening
+(#2186): a model-dtype value materialized wider, invisible to a token gate
+because the tokens still match while the path moves more bytes. W5 should
+therefore state the KV dtype it reads and gate it, rather than inherit `f32`
+from the deck by accident.
+
+#### W5-6. Gate
 
 Red-first, on CPU at a synthetic config:
 

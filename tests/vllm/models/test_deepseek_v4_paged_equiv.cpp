@@ -137,3 +137,190 @@ TEST_CASE("W5: vt::MlaDecodeAttention reproduces DeepSeek-V4's sink attention") 
     diff = std::max(diff, std::abs(static_cast<double>(want[i] - no_sink[i])));
   CHECK(diff > 1e-4 * mag);
 }
+
+TEST_CASE("W5: the paged helper reproduces V4's DENSE-CAUSAL step for T > 1") {
+  // The single-query case above proves the OP matches V4's attention. This proves
+  // the MAPPING that lets one decode op serve a whole step: `batch = T` with
+  // `seq_lens[t] = kv_base + t + 1`.
+  //
+  // WHY THAT IS THE RISKY PART. Query `t` sits at global position `kv_base + t`
+  // and may see `[0, kv_base + t]`. Off-by-one in either direction still produces
+  // finite, plausible output -- one key too many leaks the FUTURE, one too few
+  // drops the token's own key -- and neither shows up as a NaN or a crash. So the
+  // case runs several `kv_base` values, including 0, and compares against V4's own
+  // `sel`-driven arithmetic rather than a restatement of the formula.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 3, T = 5;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  std::vector<float> sink(static_cast<size_t>(nh));
+  for (int64_t h = 0; h < nh; ++h) sink[static_cast<size_t>(h)] = -0.25f + 0.15f * static_cast<float>(h);
+
+  for (const int64_t kv_base : {int64_t{0}, int64_t{7}, int64_t{31}}) {
+    const int64_t n_keys = kv_base + T;  // the cache holds every key this step sees
+    const std::vector<float> kv = Rand(static_cast<size_t>(n_keys * hd), 3u + static_cast<uint32_t>(kv_base), 0.3f);
+    const std::vector<float> qv = Rand(static_cast<size_t>(T * nh * hd), 91u, 0.25f);
+
+    // (A) V4's own step-5 arithmetic, causal `sel` and all.
+    std::vector<float> want(static_cast<size_t>(T * nh * hd), 0.0f);
+    for (int64_t t = 0; t < T; ++t) {
+      const int64_t g = kv_base + t;  // this query's GLOBAL position
+      for (int64_t h = 0; h < nh; ++h) {
+        std::vector<float> sc(static_cast<size_t>(g + 1));
+        const float* qh = &qv[static_cast<size_t>((t * nh + h) * hd)];
+        for (int64_t j = 0; j <= g; ++j) {
+          float dot = 0.0f;
+          for (int64_t d = 0; d < hd; ++d) dot += qh[d] * kv[static_cast<size_t>(j * hd + d)];
+          sc[static_cast<size_t>(j)] = dot * scale;
+        }
+        const std::vector<float> prob =
+            vllm::deepseek_v4::SoftmaxWithSink(sc, sink[static_cast<size_t>(h)]);
+        float* oh = &want[static_cast<size_t>((t * nh + h) * hd)];
+        for (int64_t j = 0; j <= g; ++j)
+          for (int64_t d = 0; d < hd; ++d)
+            oh[d] += prob[static_cast<size_t>(j)] * kv[static_cast<size_t>(j * hd + d)];
+      }
+    }
+
+    // (B) the paged helper.
+    const int64_t block_size = 16;
+    const int64_t num_blocks = (n_keys + block_size - 1) / block_size;
+    std::vector<float> cache(static_cast<size_t>(num_blocks * block_size * hd), 0.0f);
+    for (int64_t j = 0; j < n_keys; ++j)
+      for (int64_t d = 0; d < hd; ++d)
+        cache[static_cast<size_t>(j * hd + d)] = kv[static_cast<size_t>(j * hd + d)];
+    vt::Tensor t_c =
+        Contig(cache.data(), vt::DType::kF32, q.device, {num_blocks, block_size, hd});
+    const std::vector<float> got = vllm::deepseek_v4::PagedCausalMlaAttention(
+        q, qv, t_c, num_blocks, block_size, T, nh, hd, kv_base, sink, scale,
+        /*no_sink=*/false);
+
+    REQUIRE(got.size() == want.size());
+    double worst = 0.0, mag = 0.0;
+    for (size_t i = 0; i < want.size(); ++i) {
+      REQUIRE(!std::isnan(got[i]));
+      mag = std::max(mag, std::abs(static_cast<double>(want[i])));
+      worst = std::max(worst, std::abs(static_cast<double>(want[i] - got[i])));
+    }
+    CAPTURE(kv_base);
+    REQUIRE(mag > 1e-3);
+    CHECK(worst <= 1e-5 * mag);
+  }
+}
+
+TEST_CASE("W5: the paged helper's no_sink arm is EXACTLY no sink") {
+  // `kNoAttnSink` feeds -inf, which contributes `exp(-inf - m) == 0` to the
+  // denominator. This pins that it equals a plain softmax rather than merely
+  // approximating one -- and that the SINKED arm differs, so the case is not
+  // vacuous.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 2, T = 3, kv_base = 4;
+  const int64_t n_keys = kv_base + T;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const std::vector<float> kv = Rand(static_cast<size_t>(n_keys * hd), 55u, 0.3f);
+  const std::vector<float> qv = Rand(static_cast<size_t>(T * nh * hd), 56u, 0.25f);
+  const std::vector<float> sink(static_cast<size_t>(nh), 0.0f);
+  const std::vector<float> neg_inf(static_cast<size_t>(nh),
+                                   -std::numeric_limits<float>::infinity());
+
+  const int64_t block_size = 16;
+  const int64_t num_blocks = (n_keys + block_size - 1) / block_size;
+  std::vector<float> cache(static_cast<size_t>(num_blocks * block_size * hd), 0.0f);
+  for (int64_t j = 0; j < n_keys; ++j)
+    for (int64_t d = 0; d < hd; ++d)
+      cache[static_cast<size_t>(j * hd + d)] = kv[static_cast<size_t>(j * hd + d)];
+  vt::Tensor t_c = Contig(cache.data(), vt::DType::kF32, q.device, {num_blocks, block_size, hd});
+
+  const auto no_sink = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qv, t_c, num_blocks, block_size, T, nh, hd, kv_base, sink, scale, /*no_sink=*/true);
+  const auto explicit_neg = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qv, t_c, num_blocks, block_size, T, nh, hd, kv_base, neg_inf, scale,
+      /*no_sink=*/false);
+  const auto sinked = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qv, t_c, num_blocks, block_size, T, nh, hd, kv_base, sink, scale, /*no_sink=*/false);
+
+  REQUIRE(no_sink.size() == explicit_neg.size());
+  bool identical = true;
+  for (size_t i = 0; i < no_sink.size(); ++i)
+    if (no_sink[i] != explicit_neg[i]) identical = false;
+  CHECK(identical);
+
+  double diff = 0.0, mag = 0.0;
+  for (size_t i = 0; i < sinked.size(); ++i) {
+    mag = std::max(mag, std::abs(static_cast<double>(no_sink[i])));
+    diff = std::max(diff, std::abs(static_cast<double>(sinked[i] - no_sink[i])));
+  }
+  REQUIRE(mag > 1e-3);
+  CHECK(diff > 1e-4 * mag);
+}
+
+TEST_CASE("W5: the SLIDING WINDOW matches upstream's swa_only layer, and bounds the old claim") {
+  // `KV-DSV4-MULTICACHE` W5 (#2323). Upstream attends a `compress_ratio <= 1`
+  // layer over its 128-token window and NOTHING else -- `flash_mla_with_kvcache`
+  // is called with `k_cache=swa_cache` and `extra_k_cache=None` when
+  // `swa_only` (`nvidia/flashmla.py`). Our forward attends the FULL causal
+  // prefix, so the two diverge above the window.
+  //
+  // THIS CASE PINS BOTH HALVES OF THAT. The windowed helper must match a windowed
+  // host reference, AND it must DIFFER from the full-context answer -- because a
+  // window that silently did nothing would pass the first assertion alone, and
+  // that is exactly the failure this row's records already made once by carrying
+  // a 512-token bound where the real one is 128.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 2, T = 3, kv_base = 40, win = 8;
+  const int64_t n_keys = kv_base + T;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const std::vector<float> kv = Rand(static_cast<size_t>(n_keys * hd), 17u, 0.3f);
+  const std::vector<float> qv = Rand(static_cast<size_t>(T * nh * hd), 18u, 0.25f);
+  const std::vector<float> sink(static_cast<size_t>(nh), -0.2f);
+
+  const int64_t block_size = 16;
+  const int64_t num_blocks = (n_keys + block_size - 1) / block_size;
+  std::vector<float> cache(static_cast<size_t>(num_blocks * block_size * hd), 0.0f);
+  for (int64_t j = 0; j < n_keys; ++j)
+    for (int64_t d = 0; d < hd; ++d)
+      cache[static_cast<size_t>(j * hd + d)] = kv[static_cast<size_t>(j * hd + d)];
+  vt::Tensor t_c = Contig(cache.data(), vt::DType::kF32, q.device, {num_blocks, block_size, hd});
+
+  // (A) a WINDOWED host reference: query t sees `[g - win + 1, g]`, g = kv_base+t.
+  std::vector<float> want(static_cast<size_t>(T * nh * hd), 0.0f);
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t g = kv_base + t;
+    const int64_t lo = std::max<int64_t>(0, g - win + 1);
+    for (int64_t h = 0; h < nh; ++h) {
+      std::vector<float> sc;
+      const float* qh = &qv[static_cast<size_t>((t * nh + h) * hd)];
+      for (int64_t j = lo; j <= g; ++j) {
+        float dot = 0.0f;
+        for (int64_t d = 0; d < hd; ++d) dot += qh[d] * kv[static_cast<size_t>(j * hd + d)];
+        sc.push_back(dot * scale);
+      }
+      const std::vector<float> prob =
+          vllm::deepseek_v4::SoftmaxWithSink(sc, sink[static_cast<size_t>(h)]);
+      float* oh = &want[static_cast<size_t>((t * nh + h) * hd)];
+      for (int64_t j = lo; j <= g; ++j)
+        for (int64_t d = 0; d < hd; ++d)
+          oh[d] += prob[static_cast<size_t>(j - lo)] * kv[static_cast<size_t>(j * hd + d)];
+    }
+  }
+
+  const auto got = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qv, t_c, num_blocks, block_size, T, nh, hd, kv_base, sink, scale,
+      /*no_sink=*/false, /*sliding_window=*/win);
+  const auto full = vllm::deepseek_v4::PagedCausalMlaAttention(
+      q, qv, t_c, num_blocks, block_size, T, nh, hd, kv_base, sink, scale,
+      /*no_sink=*/false, /*sliding_window=*/0);
+
+  REQUIRE(got.size() == want.size());
+  double worst = 0.0, mag = 0.0, vs_full = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(!std::isnan(got[i]));
+    mag = std::max(mag, std::abs(static_cast<double>(want[i])));
+    worst = std::max(worst, std::abs(static_cast<double>(want[i] - got[i])));
+    vs_full = std::max(vs_full, std::abs(static_cast<double>(got[i] - full[i])));
+  }
+  REQUIRE(mag > 1e-3);
+  CHECK(worst <= 1e-5 * mag);
+  // THE WINDOW IS LOAD-BEARING: with kv_base=40 and win=8 the full-context answer
+  // is a different function, so a no-op window could not pass this.
+  CHECK(vs_full > 1e-3 * mag);
+}

@@ -1733,6 +1733,83 @@ config parse and upstream's disagree about the layer partition (that would be a
 
 ## Owed
 
+- **SETTLED, AND THE RECORDED EXACTNESS BOUND IS TOO GENEROUS BY 4x** (#2323).
+  The previous revision of this entry raised it as an open question; the
+  composition has now been traced end to end and the answer is confirmed.
+
+  `forward_mqa` issues ONE kernel call
+  (`nvidia/flashmla.py`, `flash_mla_with_kvcache`):
+
+  ```python
+  out, _ = flash_mla_with_kvcache(
+      k_cache=swa_cache,                                 # PRIMARY: the sliding window
+      indices=swa_indices,
+      extra_k_cache=kv_cache if not swa_only else None,  # compressed latent, SPARSE layers only
+      extra_indices_in_kvcache=topk_indices,
+      out=output.unsqueeze(1))
+  ```
+
+  with `swa_only = self.compress_ratio <= 1`. So upstream attends the SLIDING
+  WINDOW always, and the selected compressed history ONLY on sparse layers. A
+  `compress_ratio <= 1` layer therefore attends **128 tokens and nothing else**
+  (`sliding_window = 128`, `sparse_swa.py:86-101`).
+
+  Our forward attends the FULL context on every layer (`deepseek_v4.cpp`, the
+  dense-causal `sel` arm over `[0, kv_base + t]`), and the paged arm reproduces
+  it. So:
+
+  | layers | ours | upstream | diverges above |
+  |---|---|---|---|
+  | `ratio <= 1` (5 of 46) | full context | 128-token window | **128 tokens** |
+  | `ratio == 4 / 128` | full context | window + top-k compressed | already refused (#2286) |
+
+  **This row's recorded bound -- "exact only while `seq_len <= index_topk`
+  (=512)" -- is therefore wrong for the SWA-only layers, where the binding
+  constraint is 128.** Any DeepSeek-V4 token-exactness claim above 128 tokens is
+  measuring a different computation from upstream on those five layers, and that
+  includes this row's own W5 gate, which runs far below 128 and so cannot see the
+  difference either way.
+
+  What is owed is the sliding window itself on the SWA-only path, and a bound in
+  the records that says 128 rather than 512.
+
+
+- **The last link of W5 -- `Forward` resolving pages from `multi_kv` -- is NOT
+  mechanical, and the reason is the topology rather than the plumbing** (#2323).
+  `DeepseekV4ForwardGgufPaged` and its paged `AttentionBlock` arm have landed and
+  are gated token-for-token against full recompute, but they assume ONE page
+  tensor per layer. A real DeepSeek-V4 config does not have that:
+
+  - `MakeDeepseekV4KVCache` publishes the compressed latent under
+    `model.layers.{l}.attn`, and **skips it entirely for `compress_ratio == 1`**
+    (`deepseek_v4_registry.cpp`: `if (ratio == 1) continue;`, mirroring
+    `attention.py:626-630` returning `None`). Those layers carry only a SWA
+    cache, so `MultiKvCacheIndex::Find` returns -1 for them by design.
+  - The 21 `compress_ratio == 4` layers additionally carry an indexer key cache
+    and compressor states, and their algorithm belongs to
+    `MODEL-DSV4-DSA-COMPOSE` ([#2286](https://github.com/mudler/vllm.cpp/issues/2286)).
+
+  So the wiring has to express THREE layer shapes against the published names,
+  not map a flat list. That is a design step, and doing it by widening the paged
+  forward's per-layer assumption until it stops throwing would produce a forward
+  that reads whichever cache it happened to find -- the silent-wrong-context
+  failure this row has refused twice already.
+
+  **A `0` versus `1` discrepancy was flagged here and is WITHDRAWN**, because the
+  second side had not been read. The registry NORMALIZES before validating --
+  `const int64_t ratio = raw < 1 ? 1 : raw;`, commented as "`max(1,
+  config.compress_ratios[layer_id])` -- upstream's own guard ... Our parser keeps
+  the raw 0 for layers 0 and 1". So raw `0` and raw `1` both mean "no MLA latent
+  cache", the histogram's `{0: 5, ...}` is the raw value and correct, and the
+  registry's "accepts 1, 4 or 128" is the normalized one. Nothing is wrong.
+
+  Left in rather than deleted, because the flag was landed and a reader who saw
+  it deserves to see it withdrawn -- and because it is a fair example of the rule
+  this row keeps relearning: a discrepancy between two records is not a defect
+  until BOTH sides have been read in the tree. Reading one side and inferring the
+  other is how the four earlier wrong estimates on this row were made.
+
+
 - **W5's dispatch mechanism has landed UNREACHED, and this entry is the record
   AGENTS.md requires for that** (#2323). `ModelFactory::consumes_multi_kv` and
   `MultiKvRefusalApplies` turn `ModelRegistry::Forward`'s blanket refusal into a

@@ -533,6 +533,19 @@ struct DeepseekV4KvCache {
 // the cache and attends the new query over the full cached KV — token-IDENTICAL to
 // the full-recompute path (a pure equivalence: same tokens, ~ctx x fewer FLOPs).
 // `logits_indices` are LOCAL indices into the tokens passed THIS call.
+// KV-DSV4-MULTICACHE W5 (#2323): incremental decode over the RUNNER'S PAGES --
+// the paged counterpart of `DeepseekV4ForwardGgufCached`. `paged_kv` holds one
+// `[num_blocks, block_size, head_dim]` tensor per layer; `kv_base` is how many
+// keys they already hold. Dense-causal only: the indexer and compressor layers
+// refuse, and belong to `MODEL-DSV4-DSA-COMPOSE` (#2286).
+std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
+                                              vt::Queue& queue,
+                                              std::vector<vt::Tensor>& paged_kv,
+                                              int64_t kv_base,
+                                              const std::vector<int32_t>& token_ids,
+                                              const std::vector<int32_t>& positions,
+                                              const std::vector<int32_t>& logits_indices);
+
 std::vector<float> DeepseekV4ForwardGgufCached(
     const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,

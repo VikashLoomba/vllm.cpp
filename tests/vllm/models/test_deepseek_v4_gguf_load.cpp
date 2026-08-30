@@ -60,6 +60,12 @@ struct Dims {
   int64_t hc = 2, sinkhorn = 3;
   int64_t inh = 2, ihd = 32, index_topk = 3;
   int64_t n_layer = 4, n_hash = 2;
+  // KV-DSV4-MULTICACHE W5 (#2323): the SWA window, in tokens. Parameterized
+  // because a window CONFOUNDS the paging gate -- with a window the paged arm
+  // legitimately differs from the unwindowed full-recompute path, so a case that
+  // wants to isolate the paging must switch it off. 4 keeps every existing case
+  // byte-identical.
+  int64_t sliding_window = 4;
   std::vector<int32_t> compress_ratios = {0, 4, 2, 4};  // idx {1,3}, comp {1,2,3}
   // The DSA compressor's REAL output width is `coff * head_dim` (ds4: coff==2 for
   // compress_ratio==4). Default 1 collapses it onto head_dim (the historical tiny
@@ -171,7 +177,7 @@ std::string BuildGguf(const Dims& d, const std::string& drop = "",
   b.AddKv(U32Kv(p + "attention.q_lora_rank", d.qlr));
   b.AddKv(U32Kv(p + "attention.output_lora_rank", d.olr));
   b.AddKv(U32Kv(p + "attention.output_group_count", d.o_groups));
-  b.AddKv(U32Kv(p + "attention.sliding_window", 4));
+  b.AddKv(U32Kv(p + "attention.sliding_window", static_cast<uint32_t>(d.sliding_window)));
   b.AddKv(F32Kv(p + "rope.freq_base", 10000.0f));
   b.AddKv(F32Kv(p + "attention.compress_rope_freq_base", 160000.0f));
   b.AddKv(F32Kv(p + "attention.layer_norm_rms_epsilon", 1e-6f));
@@ -561,6 +567,109 @@ TEST_CASE("DeepseekV4ForwardGguf: keep-quant forward runs + near-tie vs dequant 
 // cached latent equals the recomputed one and the greedy sequences MUST match. This
 // is a pure equivalence — same tokens, ~ctx x fewer FLOPs. RED-first: a cache that
 // forgets its history (reset each step) diverges, proving the cached KV load-bearing.
+TEST_CASE("W5: PAGED incremental decode == full-recompute, token for token") {
+  // `KV-DSV4-MULTICACHE` W5 (#2323). The end-to-end gate for the paged arm: a
+  // greedy generation driven through `DeepseekV4ForwardGgufPaged`, one step at a
+  // time over the runner's page layout, must produce the SAME TOKENS as
+  // re-passing the whole growing context.
+  //
+  // THIS IS THE CLAIM THAT MATTERS. The op-level cases prove the attention math
+  // and the causal mapping in isolation; this proves the whole step -- latent
+  // write into pages, block/slot arithmetic, `kv_base` bookkeeping across steps,
+  // and the read back -- composes into the same model. A paging defect that the
+  // per-op cases cannot see (a slot written to the wrong block, a `kv_base` that
+  // drifts by one after several steps) shows up here as a DIFFERENT TOKEN.
+  // NO SLIDING WINDOW, deliberately. With one, the paged arm attends a window on
+  // the `compress_ratio <= 1` layers while the full-recompute anchor attends the
+  // whole prefix -- they diverge above the window BY DESIGN, and mixing that into
+  // this case would hide whether the PAGING is right. The window has its own gate
+  // in `test_deepseek_v4_paged_equiv`, against a windowed reference.
+  Dims d;
+  d.sliding_window = 0;
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  REQUIRE(w.has_gguf_weights);
+  REQUIRE(w.params.sliding_window == 0);
+
+  const int V = static_cast<int>(d.vocab);
+  auto argmax_last = [V](const std::vector<float>& logits) -> int {
+    const size_t rows = logits.size() / static_cast<size_t>(V);
+    const float* row = logits.data() + (rows - 1) * static_cast<size_t>(V);
+    int best = 0;
+    for (int j = 1; j < V; ++j)
+      if (row[j] > row[best]) best = j;
+    return best;
+  };
+
+  const std::vector<int32_t> prompt = {1, 5, 9};
+  const int N = 6;
+
+  // (A) full-recompute greedy — the anchor.
+  std::vector<int32_t> gen_full;
+  {
+    std::vector<int32_t> tok = prompt;
+    for (int s = 0; s < N; ++s) {
+      std::vector<int32_t> pos(tok.size());
+      for (size_t i = 0; i < tok.size(); ++i) pos[i] = static_cast<int32_t>(i);
+      const auto lg = vllm::DeepseekV4ForwardGguf(
+          w, q, tok, pos, {static_cast<int32_t>(tok.size() - 1)});
+      const int nx = argmax_last(lg);
+      gen_full.push_back(nx);
+      tok.push_back(nx);
+    }
+  }
+
+  // (B) PAGED incremental greedy.
+  std::vector<int32_t> gen_paged;
+  {
+    const int64_t nlayers = w.params.num_hidden_layers;
+    const int64_t hd = w.params.head_dim;
+    const int64_t block_size = 8;
+    // Enough pages for the prompt plus every generated token.
+    const int64_t max_tokens = static_cast<int64_t>(prompt.size()) + N + 1;
+    const int64_t num_blocks = (max_tokens + block_size - 1) / block_size;
+    std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+    std::vector<vt::Tensor> pages(static_cast<size_t>(nlayers));
+    for (int64_t l = 0; l < nlayers; ++l) {
+      storage[static_cast<size_t>(l)].assign(
+          static_cast<size_t>(num_blocks * block_size * hd), 0.0f);
+      pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+          storage[static_cast<size_t>(l)].data(), vt::DType::kF32, q.device,
+          {num_blocks, block_size, hd});
+    }
+
+    int64_t kv_base = 0;
+    std::vector<int32_t> step = prompt;   // first step is the whole prompt
+    for (int s = 0; s < N; ++s) {
+      std::vector<int32_t> pos(step.size());
+      for (size_t i = 0; i < step.size(); ++i)
+        pos[i] = static_cast<int32_t>(kv_base + static_cast<int64_t>(i));
+      const auto lg = vllm::DeepseekV4ForwardGgufPaged(
+          w, q, pages, kv_base, step, pos,
+          {static_cast<int32_t>(step.size() - 1)});
+      const int nx = argmax_last(lg);
+      gen_paged.push_back(nx);
+      kv_base += static_cast<int64_t>(step.size());
+      step = {static_cast<int32_t>(nx)};  // every later step is ONE token
+    }
+  }
+
+  // TOKEN FOR TOKEN. Not a tolerance: paging must not change a value, so it must
+  // not change a decision.
+  REQUIRE(gen_paged.size() == gen_full.size());
+  CHECK(gen_paged == gen_full);
+  // And the generation is NON-DEGENERATE -- an all-same-token run would match
+  // trivially and prove nothing about either path.
+  bool varied = false;
+  for (size_t i = 1; i < gen_full.size(); ++i)
+    if (gen_full[i] != gen_full[0]) varied = true;
+  CHECK(varied);
+}
+
 TEST_CASE("DeepseekV4ForwardGgufCached: incremental decode == full-recompute (Stage 1)") {
   Dims d;
   TempFile f(BuildGguf(d));

@@ -344,6 +344,26 @@ shows the consequence directly: `LoadF32` 23.09% plus `SizeOf` 20.49% is
 **43.6% of a connector layer spent resolving an element type and an address**,
 inside a loop whose body is one multiply and one add.
 
+**That attribution is proved, not inferred.** A `perf` profile of `--mode attn`,
+which runs `vt::AttentionCross` and the probe's hoisted reference and NO GEMM at
+all, isolates it:
+
+| symbol | self |
+|---|---:|
+| `LoadF32(Tensor const&, long)` | 36.14% |
+| `vt::SizeOf(vt::DType)` | 28.41% |
+| `AttentionCrossKernel(...)::{lambda(long, long)#1}` | 15.60% |
+| `Threadpool::Barrier()` | 8.18% |
+| `ModeAttn(long, int)` -- the hoisted reference, inlined | **4.76%** |
+| `Threadpool::PollForWork(...)` | 4.45% |
+
+**64.6% of the attention kernel's own CPU time is resolving an element type and
+an address.** The arithmetic and the softmax are the 15.60% line. And the last
+column is the same profile's own control: the hoisted reference computes the
+identical output for **4.76%** of the process's CPU against the shipped kernel's
+80.15%, so the shipped kernel burns **16.8x the CPU for the same result** --
+measured in ONE process, with no cross-run drift to argue about.
+
 **The repair is the transformation `MatmulOneChunk` already applies against
 `MatmulOneChunkRef`:** resolve the element type once, outside the loops, and walk
 typed pointers. It touches no output's accumulation order -- the same indices are

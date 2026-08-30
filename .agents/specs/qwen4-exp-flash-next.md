@@ -6288,6 +6288,26 @@ is the honest state until a line below names the device, the toolkit and the
 build rc. Everything in this subsection is a HOST measurement and is labelled as
 one. A reader who needs "does it run on a GPU" has not been told yet.
 
+**THE LEASE ATTEMPT, because "no device" should say what was tried.** A
+`dgx:gpu0` job was submitted at the start of the wave and sat at queue position
+**#1 for roughly three hours**, behind the developer's own `dflash2-staged`
+runs, which finished and re-queued more than once in that window. A `thor:gpu0`
+job was added later as the developer's named fallback, reached position #3
+behind the sibling W5n released-checkpoint run and two of the developer's
+`thor-parity` jobs, and was CANCELLED rather than left armed — a queued job
+nobody is watching fires whenever the device frees and takes a box another wave
+is waiting for. It was killed while still queued and never started, so it cost
+the fleet nothing.
+
+The dgx job did not run either. It was killed from outside this session using
+the `--as w6cuda@qwen4exp` submitter identity, and the same script was then
+re-submitted under the default identity by another session. **`rc run --as
+<name>` is worth avoiding for this reason**: it makes `rc kill` refuse the
+submitter with `not_job_owner` unless `RC_SUBMITTER` is set to match, and it puts
+a kill incantation into circulation that anyone who reads it can use. A plain
+submit leaves the job killable by the session that owns it and by nobody else's
+convenience.
+
 **What WAS measured, and why it is worth having.** The two `.cu` files were
 compiled and EXECUTED on the host under a shim that makes `__global__` a plain
 function and the launch indices a single-thread grid, so every grid-stride loop

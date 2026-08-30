@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -322,8 +323,20 @@ void RunCuda(const Case& c, std::vector<float>& out, std::vector<float>* lse,
   DeviceTensor d_sl(b, g.q, DType::kI32, {c.bs}, c.seq_lens.data());
   DeviceTensor d_lse(b, g.q, DType::kF32, {c.bs, c.heads});
 
+  // W5 (#2323): the attention sink is a DEVICE read inside stage 2, so a host
+  // pointer here would be dereferenced on the GPU. Upload it and repoint the
+  // arg. Absent, `dev_args` is `args` unchanged and this costs nothing.
+  MlaDecodeAttentionArgs dev_args = args;
+  std::unique_ptr<DeviceTensor> d_sink;
+  if (args.attn_sink != nullptr) {
+    d_sink = std::make_unique<DeviceTensor>(b, g.q, DType::kF32,
+                                            std::vector<int64_t>{c.heads},
+                                            args.attn_sink->data);
+    dev_args.attn_sink = &d_sink->tensor();
+  }
+
   vt::MlaDecodeAttention(g.q, d_out.tensor(), lse != nullptr ? &d_lse.tensor() : nullptr,
-                         d_q.tensor(), d_c.tensor(), d_bt.tensor(), d_sl.tensor(), args);
+                         d_q.tensor(), d_c.tensor(), d_bt.tensor(), d_sl.tensor(), dev_args);
   b.Synchronize(g.q);
   if (bf16) {
     std::vector<uint16_t> raw(out_n);
@@ -506,6 +519,55 @@ TEST_CASE("CUDA mla_decode matches the CPU reference at V2-Lite dims (f32, ragge
 
   CHECK(MaxAbsDiff(got, want) < 2e-4);
   CHECK(MaxAbsDiff(got_lse, want_lse) < 2e-3);
+}
+
+TEST_CASE("CUDA mla_decode: the attention SINK matches the CPU reference ACROSS SPLITS") {
+  if (!HasCuda()) return;
+  // `KV-DSV4-MULTICACHE` W5 (#2323). This case exists for one reason: the CUDA
+  // decode is a TWO-STAGE split-KV kernel, and a per-head sink must be added in
+  // STAGE 2, the final reduction. Seeded in stage 1 instead it would be counted
+  // once PER SPLIT rather than once per row.
+  //
+  // `num_kv_splits = 1` CANNOT SEE THAT ERROR -- with a single split the two
+  // placements are the same arithmetic. So this case forces MULTIPLE splits and
+  // long sequences, and a sink placed in the wrong stage diverges from the CPU
+  // reference here while every single-split case stays green.
+  Case c = MakeCase({1, 15, 255, 256, 257, 300}, kHeadsLite, 23u);
+  MlaDecodeAttentionArgs args;
+  args.scale = static_cast<float>(LiteScale());
+  args.max_seq_len = 300;
+  args.num_kv_splits = 4;  // FORCED > 1 — the whole point of this case
+
+  std::vector<float> sink(static_cast<size_t>(c.heads), 0.0f);
+  for (int h = 0; h < c.heads; ++h) {
+    // Spread across a range that keeps every head's sink competitive with its
+    // scores, so the sink actually moves the answer rather than vanishing.
+    sink[static_cast<size_t>(h)] = -0.5F + 0.25F * static_cast<float>(h % 5);
+  }
+  Tensor t_sink = Contig(sink.data(), DType::kF32, Cpu(), {c.heads});
+  args.attn_sink = &t_sink;
+
+  std::vector<float> want;
+  std::vector<float> want_lse;
+  RunCpu(c, want, &want_lse, args);
+
+  // `RunCuda` uploads the sink and repoints the arg -- a host pointer would be
+  // dereferenced on the GPU inside stage 2.
+  std::vector<float> got;
+  std::vector<float> got_lse;
+  RunCuda(c, got, &got_lse, args, /*bf16=*/false);
+
+  CHECK(MaxAbsDiff(got, want) < 2e-4);
+  CHECK(MaxAbsDiff(got_lse, want_lse) < 2e-3);
+
+  // AND THE SINK IS LOAD-BEARING on this case: without it the answer differs.
+  // A comparison that passed both with and without would prove only that the
+  // two backends agree, not that either honours the sink.
+  MlaDecodeAttentionArgs no_sink = args;
+  no_sink.attn_sink = nullptr;
+  std::vector<float> plain;
+  RunCpu(c, plain, nullptr, no_sink);
+  CHECK(MaxAbsDiff(plain, want) > 1e-3);
 }
 
 TEST_CASE("CUDA mla_decode matches the CPU reference at V2-Lite dims (bf16, ragged)") {

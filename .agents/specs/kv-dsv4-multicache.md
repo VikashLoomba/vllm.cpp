@@ -1733,6 +1733,37 @@ config parse and upstream's disagree about the layer partition (that would be a
 
 ## Owed
 
+- **AN OPEN QUESTION about the forward's exactness bound, raised with citations
+  and deliberately NOT asserted as a defect** (#2323). Two things were read
+  directly in the tree and upstream, and they sit uneasily together:
+
+  1. `attention.py:568` comments the KV-insert step as **"kv is unchanged;
+     attention reads kv solely via swa_kv_cache"**, and every attention layer --
+     all 43 -- constructs a `DeepseekV4SWACache` unconditionally
+     (`attention.py:315-321`) whose spec carries `sliding_window = 128`
+     (`sparse_swa.py:86-101`).
+  2. Our forward attends over a `deck` holding EVERY key of the sequence
+     (`deepseek_v4.cpp`, the dense-causal `sel` arm builds `[0, kv_base + t]`),
+     and the new paged arm reproduces that exactly -- which is why the
+     token-identity gate passes.
+
+  If upstream's attention really reads only a 128-token window of raw KV, then
+  our full-context attention diverges from it ABOVE 128 TOKENS, and this row's
+  recorded bound -- "exact only while `seq_len <= index_topk` (=512)" -- would be
+  too generous by a factor of four for the arms that have no compressed history
+  to fall back on.
+
+  **It is a question and not a finding**, because the composition was not traced:
+  on the sparse layers the compressed latent may supply the history beyond the
+  window, in which case the two are not comparable term by term, and the bound
+  may be right for a reason this entry has not read. Settling it needs
+  `forward_mqa` and the sparse-MLA path read end to end.
+
+  It is recorded because it is cheap to check and expensive to be wrong about: it
+  bounds the sequence length at which ANY DeepSeek-V4 token-exactness claim -- including
+  this row's own W5 gate -- stops meaning what it says.
+
+
 - **The last link of W5 -- `Forward` resolving pages from `multi_kv` -- is NOT
   mechanical, and the reason is the topology rather than the plumbing** (#2323).
   `DeepseekV4ForwardGgufPaged` and its paged `AttentionBlock` arm have landed and

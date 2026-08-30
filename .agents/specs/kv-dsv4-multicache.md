@@ -1515,6 +1515,26 @@ config parse and upstream's disagree about the layer partition (that would be a
   is the same seam. Tracked under
   [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
 
+- **The by-name channel could not address a RECURRENT cache, and now can.**
+  W3's three vectors were parallel to `attn_kv` and were filled from
+  `attn_group_ids_`, which collects only `AttentionSpec` groups, so a `MambaSpec`
+  group's layers were named nowhere: their states reached the forward through
+  `gdn_state` positionally and `Find()` answered -1 for all of them. DeepSeek-V4
+  never showed it — it publishes only MLA / SlidingWindowMLA specs, so all 167 of
+  its caches are attention ones — while both three-group hybrids (`qwen4_exp`,
+  `glm5_next`) carry a `MambaSpec`.
+  [#2343](https://github.com/mudler/vllm.cpp/issues/2343) measured it on
+  GLM-5.3-Flash as `22 KV cache(s) from 2 published group(s)` reported beside
+  `block tables gathered for 3 of 3 published group(s)`. CLOSED by row
+  `ENG-MULTIKV-BYNAME` ([`eng-multikv-byname.md`](eng-multikv-byname.md)), which
+  makes the index cover every published cache in upstream's own insertion order
+  and adds the `KvCachePayload` locator; the refusal in `ModelRegistry::Forward`
+  is UNCHANGED as a guard and now reports the paged/recurrent split, because the
+  total it printed stopped meaning "attention caches". **That row could file no
+  issue** — GitHub writes are `403` from this host — so the issue and its index
+  row are OWED and are listed under that spec's own `## Owed`. The consuming
+  forward remains W5's.
+
 ## Evidence
 
 Every structural claim in this document was read from a file at the SHA below.

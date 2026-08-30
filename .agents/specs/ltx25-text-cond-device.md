@@ -242,18 +242,186 @@ beside them, which the harness reads back and records in `PROVENANCE`.
 
 ## Now
 
-`ACTIVE`. W1 and W2 are in this change, with red-first evidence and three
-mutations, one of which changed the design rather than confirming it.
+`DONE` on what it set out to measure. W1-W4 are complete and the reading is
+taken. The repair it carries is a **measured near-negative** and the split is the
+result.
 
-W3 and W4 are DISPATCHED and not yet read: `rc` job
-`ab8a0831-4ae4-4698-8068-40ded708df5c` on `dgx:gpu0`, submitted 2026-08-30 at
-queue position 4 behind three other jobs, `--timeout 8h --max-runtime 5h`.
-Evidence will land at `/mnt/nas_share/rc/ltx25-text-cond/run/<RUN_ID>`. Until
-that job's `SUMMARY.txt` exists this row has NO speed number and no correctness
-verdict on the device, and saying so is better than leaving the section empty.
+## Outcome
 
-**The remote is blocked and that is recorded rather than worked around.** The
-`mudler-agent` GitHub account returned `Your account is suspended` (HTTP 403) on
-`git push` and on `gh api user`, roughly forty minutes after `gh issue create`
-succeeded for #2354. The branch is committed locally and unpushed, and there is
-no pull request. `REMOTE_UNVERIFIED` for every remote fact after that point.
+**The lease.** `rc` job `ab8a0831-4ae4-4698-8068-40ded708df5c` on `dgx:gpu0`,
+2026-08-30 09:51:40Z to 11:26Z, **~1h35m**, `renders_completed_per_arm=3`.
+Submitted at queue position 4 and it waited for three other jobs; no device was
+cleared and no holder was displaced. Evidence at
+`/mnt/nas_share/rc/ltx25-text-cond/run/20260830T095140Z`.
+
+**Every precondition held and each was checked rather than assumed.**
+`MemAvailable` 115.0 GiB at start against a 78.0 GiB floor. All four checkpoint
+sha256 recomputed inside the lease and all four match
+`ltx2_oracle_manifest.json`. The two source tarballs unpacked to
+`c221c43559cbc09f6176b33d00412194762e2613` (arm A) and
+`055707217c4a9820490488f596675d200996b03e` (arm B), which is the pinned pair.
+**The two libraries hash DIFFERENTLY** -- `2af944ef...` and `571871a3...` -- so
+this is two binaries and not one measured twice, which is what exit 54 exists to
+refuse. Both CUDA unit gates read **23 cases / 806 assertions / 0 failed**, the
+same counts `fa9903b86` recorded. Every render ran 8 steps and 32 DiT forwards,
+and every phase table covered its own wall to better than 0.13%.
+
+**The baseline reproduces #2296.** Arm A's wall is **516.751 s** at 1.74% spread
+against #2296's 518.398 s, and the ratio is **5.51x** against its 5.53x. The five
+nested sub-leaves cost nothing measurable, which is what `nested` predicted:
+`unaccounted_seconds` is 0.599 s, 0.12% of wall.
+
+### The split, which is this row's result
+
+| | seconds (n=3) | spread | % of wall |
+|---|---:|---:|---:|
+| `conditioning.connector` | 122.167 | 1.68% | 23.64 |
+| ~ `.compute` | **112.768** | **1.70%** | **21.82** |
+| ~ `.weights` | 8.674 | 6.78% | 1.68 |
+| `generate.guiders` | 189.496 | 1.07% | 36.67 |
+| ~ `guiders.tower` | 71.548 | 0.81% | 13.85 |
+| ~ `guiders.connector.compute` | **112.114** | **2.07%** | **21.70** |
+| ~ `guiders.connector.weights` | 5.033 | 7.02% | 0.97 |
+
+Both leaves decompose to a residue under 0.9 s, so this is a decomposition and
+not a set of intervals.
+
+**IT IS THE ARITHMETIC, NOT THE WEIGHTS.** Connector compute is **224.882 s,
+43.52% of the render**. Materializing the connector -- all four times, both
+passes -- is **13.707 s, 2.65%**. #2296's hypothesis, that the 122 s is loading
+and widening 2.016 B parameters out of the 42 GB DiT file, is **FALSE as a time
+claim**, and the way it went wrong is worth keeping: its 8.59 GiB memory step was
+real and correctly observed. A memory step says the widen HAPPENS. It says
+nothing about what the widen COSTS, and the widen costs 8.7 s because the DiT is
+page-cached by then. The second materialization is cheaper than the first --
+5.033 s against 8.674 s -- for the same reason.
+
+**The row's own prediction, committed before the number existed, holds.**
+`## Why the split has to come first` put the connector at about 4.2 TFLOP of f32
+GEMM per call, "which at 122.388 s is 34 GFLOP/s". Measured: 4.2 TFLOP over
+112.768 s = **37.2 GFLOP/s**. The estimate was recorded in advance precisely so
+this sentence could be checked rather than asserted.
+
+**The attribution rests on the quiet rows.** The two compute leaves are at 1.70%
+and 2.07% spread. The rows that move -- `load.dit` at 61.07%,
+`load.text_encoder` at 22.52%, `artifacts.frames.ppm` at 253.05% -- are
+attributed to nothing.
+
+### `generate.guiders` is no longer read by subtraction
+
+#2296 measured the positive halves at 150.731 s against a `generate.guiders` of
+190.016 s and wrote that the remaining 39.3 s was "a reading rather than a
+measurement, because `generate.guiders` is ONE leaf". It is now two:
+**`guiders.tower` is 71.548 s against `conditioning.tower`'s 28.287 s, 2.53x**,
+both at sub-1% spread. The negative prompt's larger valid-token count costs
+43.3 s more than the positive prompt's, and that is measured rather than
+inferred.
+
+### The repair: a measured near-negative, reported as one
+
+| | arm A | arm B | delta |
+|---|---:|---:|---:|
+| `~guiders.connector.weights` | 5.033 s | **0.000 s** | -5.033 |
+| `generate.guiders` | 189.496 s | 183.520 s | -5.976 |
+| `~conditioning.connector.weights` | 8.674 s | 9.923 s | +1.250 |
+| `~conditioning.connector.compute` | 112.768 s | 113.803 s | +1.035 |
+| `~guiders.connector.compute` | 112.114 s | 112.160 s | +0.046 |
+| **wall** | **516.751 s** | **510.956 s** | **-5.795 (-1.12%)** |
+
+**The structural claim is established and the wall claim is NOT.** The second
+materialization is gone -- the leaf reads exactly 0.000 s on all three renders,
+and `generate.guiders` falls by 5.976 s, which matches the 5.033 s removed. That
+is a directed, predicted, structural change and it is what T2 asserts.
+
+**But -1.12% is INSIDE the same-arm spread of either arm** (A 1.74%, B 2.12%,
+which are 9.0 s and 10.8 s). A wall delta smaller than the noise it sits in does
+not establish a speedup, and this repository has already paid for calling one
+that did: `1997-put-us-on-the-slow-topk-kernel`. So the honest statement is that
+the wall is CONSISTENT with removing 5 s and does not on its own demonstrate it.
+The two compute leaves are unchanged to within 1%, which is the correct control:
+the repair was never supposed to touch them.
+
+**The ceiling was known before the arm ran and is the point.** Once the split
+read `weights` at 2.65% of wall, the maximum this repair could return was the
+second materialization alone -- 5.033 s, 0.97%. It was still run, because a
+predicted negative that is not measured is an opinion, and because it is the
+control that proves the compute leaves do not move.
+
+### Correctness, established before the speed result was accepted
+
+- **Byte equality.** All 25 frames and the wav are byte-identical between the
+  arms: `pixel_files_differing=0`, re-checked independently at 26/26, and the
+  concatenated sha256 of each arm's frame set is `fb5bc236...` on both. The
+  repair reuses an identical weight bag, so this is the prediction the spec made
+  rather than a tolerance that was met.
+- **The #1864 absolute-quality gate PASSES on both arms**, `compare_exit_A=0`
+  and `compare_exit_B=0`, `VERDICT PASS`,
+  `READING NO_WORSE_THAN_ORACLE_ON_BLOCKINESS`. `blockiness_grid8` 1.030110
+  against the reference's per-frame maximum 1.143393 (margin +0.113283) and
+  `blockiness_grid32` 1.024809 against 1.148672 (margin +0.123862), with 0 of
+  1600 bands collapsing to the off-grid denominator on each grid.
+- **The two arms' reference JSONs differ only in the arm LABEL.** Every metric
+  value is identical, which is the cross-check that the blockiness gate and the
+  byte comparison agree instead of one covering for the other.
+- Both CUDA unit gates: 23 / 806 / 0.
+
+**And the blockiness gate remains one-sided, which is why byte equality was run
+beside it.** #1864 records our render as already less blocky, less sharp and less
+clipped than upstream's, so a change that smoothed it further would PASS that
+gate while moving every pixel. On this change the sharper instrument returned
+equality, so the question does not arise -- but it would have.
+
+### A claim this row made at n=1 and withdrew at n=2
+
+`artifacts.frames.ppm` read 16.357 s on arm A render 1 -- larger than
+`decode.video` and larger than the whole denoise loop -- and was reported as a
+finding. Render 2 read **0.944 s**. Over six renders the leaf spreads 253.05% on
+arm A and 114.04% on arm B. It is also not an engine cost: the harness renders
+into `--workdir` under `/workspace`, which is CIFS, so the leaf measures network
+write-back. **Withdrawn**, and recorded here rather than deleted, because
+promoting an n=1 number one paragraph after writing "this is n=1" is the failure
+this repository names and the correction belongs with its origin.
+
+## Owed
+
+- **THE COMPUTE LEVER IS UNOWNED, and it is 43.52% of the render.** 224.882 s of
+  host f32 GEMM at ~37 GFLOP/s, in `Ltx2ConnectorForward` through
+  `vt::MatmulBT`'s CPU arm. This row measured it and does not move it. Two
+  traceable next steps, neither a ceiling: (1) determine whether `MatmulBT`
+  reaches `MatmulOneChunk`'s specialized elementwise kernel on these shapes or
+  falls back to `MatmulOneChunkRef`, which is a `VT_CPU_ELEM_GEMM`-class question
+  answerable without a lease; (2) the two connector passes run the SAME weights
+  over different inputs and could share one batched GEMM at `batch = 2`, which
+  doubles arithmetic intensity and halves weight streaming, and is bit-identical
+  because each output's K reduction stays sequential over K. The device arm is a
+  third and much larger step: `Ltx2Attention` interleaves host `RmsNormRows` and
+  `Ltx2ApplyRotaryEmb` on raw `float*` between its GEMMs, and
+  `Ltx2ConnectorForward` reads weights as host `std::vector<float>`, so it is a
+  weight-arm port and not a queue swap. **No issue was filed for this: the
+  GitHub account was suspended mid-row (see below). Owner: this row, until an
+  issue can be opened.**
+- **`decode.audio.mel` is still unattributed** at 47.171 s, 9.13% of wall, at the
+  tightest spread in the whole table (0.16%). It is 3.1x the entire denoise loop
+  for 1.02 s of audio. This row confirmed the number and explains it no better
+  than #2296 did. Owner: this row.
+- **The AUDIO-ONLY arm still materializes twice.** `GenerateAudioOnly` is a
+  private static declared in `include/vllm/multimodal/ltx2_video.h`, so it cannot
+  take a type defined in `ltx2_video.cpp`'s anonymous namespace. It keeps
+  `RunConnectorFromFile`. Owner: this row, through #2354.
+- **The oracle side is still n = 1.** Its 93.8 s has no spread and this row did
+  not re-run it, so both ratios above (A 5.51x, B 5.45x) are stated against a
+  denominator whose own variance is unknown. Inherited from #2296 unchanged.
+- **The harness writes renders onto CIFS.** That put network write-back inside
+  `artifacts.frames.ppm` and is why the leaf is unusable. A later row should
+  render into `/root` and copy out, which is what
+  `stage-checkpoints-to-local-disk` already says for inputs. Owner: this row.
+
+## The remote
+
+**`REMOTE_UNVERIFIED` from 2026-08-30 onward.** The `mudler-agent` GitHub account
+returned `Your account is suspended` (HTTP 403) on `git push` and on
+`gh api user`, roughly forty minutes after `gh issue create` succeeded for #2354.
+The branch is committed locally and unpushed and there is no pull request. The
+PR body is written and staged at `/tmp/ltx25-text-cond-pr/body.md`. Nothing in
+this outcome depends on the remote: the measurement ran on `dgx:gpu0` through
+`rc` and its evidence is on the NAS.

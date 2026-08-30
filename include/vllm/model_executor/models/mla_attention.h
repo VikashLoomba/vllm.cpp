@@ -394,6 +394,20 @@ struct MlaBlockWeights {
   //     path — and narrowing the GEMM is what closed it. Both are measured in
   //     `tests/vllm/models/test_dots3_note_attn.cpp`, not assumed.
   vt::Tensor attn_gate_proj;
+  // KV-DSV4-MULTICACHE W5 (#2323): the PER-HEAD ATTENTION SINK, `[num_heads]`
+  // f32, or absent.
+  //
+  // One extra logit per head that joins the attention softmax's DENOMINATOR and
+  // contributes no value, so a row can attend to "nothing"
+  // (`vllm/models/deepseek_v4/attention.py:218-222`). It is a loaded WEIGHT, not
+  // cache state -- which is why it lives here beside the projections rather than
+  // in the KV topology, and why `kv-dsv4-multicache.md` puts it out of that
+  // row's scope.
+  //
+  // ABSENT for every model that does not load one, which is every current caller
+  // of this block: the sink never reaches `vt::MlaDecodeAttention` and the
+  // kernel keeps its `-inf`/0 softmax seeds, so those models are bit-identical.
+  vt::Tensor attn_sink;
 
   // ─── the DSA indexer's five tensors (W4b-3c, #699) ────────────────────────
   // EMPTY is the ABSENT state, and empty is what every DeepSeek registration

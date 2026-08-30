@@ -860,6 +860,10 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     impl.num_heads = static_cast<int>(N);
     impl.head_size = static_cast<int>(dims.head_size());
     impl.scale = dims.scale;
+    // W5 (#2323). Set unconditionally: an absent weight is a null tensor, which
+    // `forward_mqa` reads as "no sink" -- so this is inert for every model that
+    // does not load one rather than needing a branch here.
+    impl.attn_sink = w.attn_sink;
     impl.queue = &d.q;  // W4 deviation (i), wired here.
     // dots3-note's windowed decode (#699 W4b-2). Upstream expresses it as the
     // `Dots3NoteTritonMLAImpl` subclass keeping `self.sliding_window`

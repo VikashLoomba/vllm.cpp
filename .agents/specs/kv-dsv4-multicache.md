@@ -450,7 +450,7 @@ and no wave has an owner.
 | **W2** | `MakeDeepseekV4KVCache` publishes the real topology: one group per (spec class × compress ratio), real per-layer names, the 167 entries enumerated under `## The geometry, derived from source`. Nothing consumes it yet; the gate is the published spec set. | **CPU** | M |
 | **W3** | The runner carries more than one attention group and more than one cache per layer: generalize `full_attn_group_id_`/`gdn_group_id_` (`runner.h:571-572`) and the three-valued `LayerKvClass` (`runner.h:366-370`), and add the third forward channel that `## Why our KV interface cannot represent it` item (5) says is absent. **This is the wave that touches every model**, so its obligation is byte-neutrality for the uniform case, on the model of the `per_layer_attn_specs` contract (`kv_cache_interface.h:384-393`). | **CPU** | L |
 | **W4** | Non-uniform `block_size` across groups: `HybridKVCacheCoordinator`'s deferral (`kv_cache_coordinator.cpp:340-346`) and the block-table geometry (`runner.cpp:311-319`). May land inside W3 if W3's design needs it; kept separate because it is where a wrong answer is silent under `NDEBUG`. | **CPU** | M |
-| **W5** | `Forward`/`ForwardDevice` CONSUME `attn_kv`: the published caches reach the model keyed by layer name and each layer routes to its own, replacing `(void)attn_kv` and the `ModelRegistry::Forward` refusal (`model_registry.cpp:430-440`). **The cache plumbing only** -- see the scope boundary below. | CPU at synthetic config; **GPU** for the real geometry | L |
+| **W5** | `Forward`/`ForwardDevice` CONSUME `attn_kv`: the published caches reach the model keyed by layer name and each layer routes to its own, replacing `(void)attn_kv` and the `ModelRegistry::Forward` refusal (its `input.multi_kv` guard in `model_registry.cpp`; cited as `:430-440` until [#2353](https://github.com/mudler/vllm.cpp/issues/2353), which measured that those lines are `MultiKvCacheIndex::Find` and replaced the range with the symbol). **The cache plumbing only** -- see the scope boundary below. | CPU at synthetic config; **GPU** for the real geometry | L |
 | **W6** | Reachability + ABI: the capability reachable from `ModelRegistry::Forward` and exposed through `include/vllm.h`, so `examples/deepseek_v4_gen` stops including an internal header (`## Our baseline`). | **CPU** | S |
 | **W7** | The oracle gate of `## Gates`. | **GPU**, ≥2 GB10 | M |
 
@@ -1514,6 +1514,94 @@ config parse and upstream's disagree about the layer partition (that would be a
   row, falls due at **W4** with the `fa_draft`-on-`spec_on()` item above, which
   is the same seam. Tracked under
   [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
+
+- [#2353](https://github.com/mudler/vllm.cpp/issues/2353) — the guard's refusal
+  named ONE owner where THREE architectures arrive, and never named the arriving
+  one. Owned by this row, FIXED IN FLOW and closed by that change. Listed rather
+  than omitted because the index row has to name an owner.
+
+- **THE BY-NAME CHANNEL DOES NOT COVER RECURRENT MEMBERS, and that is a mirror
+  divergence rather than a gap in this row's own shape.** `MultiKvCacheIndex`
+  addresses exactly the caches in `attn_kv`, and `attn_kv` is filled from
+  `attn_group_ids_`, which collects only non-eagle groups whose spec downcasts to
+  `AttentionSpec` (`src/vllm/v1/worker/gpu/runner.cpp:697-699`). A `kMamba`
+  group's caches go to `gdn_state` through `alloc_recurrent_layer_states` and are
+  reached positionally, so their published layer names are NOT in
+  `layer_names` and `Find()` cannot resolve them. **This row's own shape does not
+  feel it**: DeepSeek-V4 publishes only `MLAAttentionSpec` and
+  `SlidingWindowMLASpec` groups (`deepseek_v4_registry.cpp:301-320`), so all 167
+  of its caches are attention and `num_groups()` equals `num_published_groups()`.
+  **Both other arriving architectures are hybrid and do feel it.** `qwen4_exp`
+  publishes 3 groups of which group 1 is a `MambaSpec`
+  (`qwen4_exp_registry.cpp:510-513`), and `glm5_next` publishes 3 of which group
+  1 is a `MambaSpec` — which is why [#2343](https://github.com/mudler/vllm.cpp/issues/2343)'s
+  `dgx:gpu0` run reported `22 KV cache(s) from 2 published group(s)` against
+  `block tables gathered for 3 of 3`: the 34 KDA recurrent states are invisible
+  to the channel while their group's block table is not. That measurement is the
+  evidence for this item and it was taken before the item was written.
+
+  **Upstream has ONE channel and no such split**, read at the pin
+  `5559679229bc961848b121ccdeaa8fa5d79bec98`: `_reshape_kv_cache_tensors` puts a
+  `MambaSpec` layer's state into the SAME `kv_caches: dict[str, torch.Tensor]` as
+  every attention layer, as a `[num_blocks, 1, 1, page_size_bytes]` int8 page view
+  (`vllm/v1/worker/gpu_model_runner.py:7429-7440`), with the reason in its own
+  comment — "Keeping one tensor per layer lets the KV connector register it
+  without special-casing Mamba" — and `:7318-7325` then asserts that the by-name
+  dict covers EVERY layer of EVERY published group. Completing the mirror is an
+  ENGINE wave, it is CPU-gateable, and it is a prerequisite for any hybrid
+  multi-cache consumer, which is two of the three architectures that reach the
+  guard. It is NOT a prerequisite for DeepSeek-V4. Owned by this row; not dated
+  to a wave here, because it serves three rows and dating it to W4 or W5 would
+  hide that.
+
+- **LIFTING THE GUARD IS A PER-ARCHITECTURE CAPABILITY AND NOT A WAVE OF THIS
+  ROW, which corrects what `#### 7. The channel is READ by production code` and
+  the `## Work breakdown` W5 row together imply.** W5 is scoped as the DeepSeek-V4
+  DSA-sparse forward, and the comment above the guard read "W5 replaces this with
+  the DSA-sparse forward that reads the caches". Both were written when DeepSeek-V4
+  was the only architecture that could publish a multi-cache topology. Surveyed at
+  `85f65b0e8`, **none of the three arriving forwards consumes the channel and each
+  fails to for a different reason**: `DeepseekV4Model::Forward` / `::ForwardDevice`
+  open `(void)attn_meta; (void)attn_kv;` (`deepseek_v4.cpp:3033-3034`, `:3105-3106`);
+  `ForwardGlm5NextForConditionalGeneration` opens `(void)input.attn_kv;
+  (void)input.gdn_state;` (`glm5_next_registry.cpp:156-157`) and re-runs the whole
+  prefix each step, which its own comment says in those words; and
+  `ForwardQwen4ExpForConditionalGeneration` (`qwen4_exp_registry.cpp:142`) refuses
+  unconditionally, because `Qwen4ExpTextModel::Forward` does not exist.
+
+  So deleting the guard does not make anything serve. It converts a refusal into
+  a silent full-prefix recompute over a correctly allocated topology, which is the
+  wrong-answer-not-a-crash shape the guard was built to remove. The end state is
+  a capability the MODEL declares — the polarity `ModelFactory`'s `stage_on_load`
+  and offload bits already use, where a model that was never wired inherits false
+  and is refused by name. **It is deliberately NOT added ahead of a consumer**: a
+  capability bit no model can set true has an arm no test can drive, and a
+  refusal nothing can drive red is a claim rather than a guarantee — the same
+  reason W3 gives for not making the speculation guard a `VT_CHECK`. It falls due
+  with the FIRST forward that consumes the channel, and each of the three rows
+  owns its own arm. Owned by this row for the engine half.
+  **W5's scope moved under this entry while it was being written, and the entry
+  survives the move.** It was drafted at `85f65b0e8`, where `## Work breakdown`
+  gave W5 the DeepSeek-V4 DSA-sparse path. `44d795d96` ([#2352](https://github.com/mudler/vllm.cpp/issues/2352))
+  landed after that base and NARROWED W5 to the plumbing -- the caches reaching
+  the model, each layer routing to its own, and this guard's refusal stopping --
+  with the DSA algorithm moved to `MODEL-DSV4-DSA-COMPOSE`. That reading makes
+  the ENGINE half of the lift W5's more explicitly than the old one did, and it
+  changes nothing here: both scopings are DeepSeek-V4's model half, so neither
+  reaches the other two architectures' forwards. THIS BRANCH IS NOT MERGED ONTO
+  THAT COMMIT. Whoever merges it re-reads this paragraph against `## Work
+  breakdown` as it then stands, because a clean merge would carry it forward
+  without checking -- which is how this row has already lost a claim once.
+
+  **`glm5_next` is the nearest of the three to a served token and `qwen4_exp` is
+  the furthest**, which is worth recording because the two are easy to rank the
+  other way round. GLM-5.3-Flash LOADS on real hardware and its forward runs and
+  is gated ([#2337](https://github.com/mudler/vllm.cpp/issues/2337),
+  [#2343](https://github.com/mudler/vllm.cpp/issues/2343)); what stands between it
+  and a token is this guard plus the decision to accept a full-recompute decode,
+  and that decision belongs to its row because it re-makes a product claim #2343
+  had just corrected to false. `qwen4_exp` needs `Qwen4ExpTextModel::Forward`
+  written, which is a model wave and not an engine one.
 
 ## Evidence
 

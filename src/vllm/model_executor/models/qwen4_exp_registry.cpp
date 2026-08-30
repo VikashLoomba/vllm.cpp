@@ -290,19 +290,52 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   dense_attn::DBuf d_bt(d, vt::DType::kI32, {1, cols}, bt.data());
   dense_attn::DBuf d_slots(d, vt::DType::kI64, {T}, slots.data());
 
+  // ─── THE QSA INDEXER SIDE CACHE, IN THE ENGINE'S OWN PAGED SHAPE (W5i) ────
+  //
+  // The block reads and writes group 2 through a block table now, so the scratch
+  // this hook allocates is shaped the way the engine allocates group 2 —
+  // `[num_pages, block_size, indexer_head_dim]`, the FUSED 3-dim MLA page — and
+  // is addressed through a table. Nothing here is a second geometry invented for
+  // the scratch: `page` is the group-0 page size the runner handed us, and
+  // `MakeQwen4ExpKVCache` publishes group 2 at that same `block_size` with
+  // `compress_ratio = 1`, which is W5h's capacity law (one indexer row per token
+  // slot) written as a shape.
+  //
+  // THE TABLE IS THE IDENTITY, AND THAT IS WHAT A PRIVATE PER-CALL BUFFER MEANS,
+  // NOT A SHORTCUT. There is no allocator behind this scratch, so there are no
+  // physical pages to permute; logical page `i` IS physical page `i`. It is NOT
+  // group 0's table: those are group 0's physical page ids in group 0's pool, and
+  // adopting them here would name pages this buffer does not have. The
+  // permutation the translation exists for is exercised by the block's own gate,
+  // which runs a non-identity `{2, 6, 1}` against a logical `{0, 1, 2}` with a
+  // partial final page (`test_qwen4_exp_qsa_block.cpp`, the W5i case).
+  //
+  // WHAT REPLACES IT. When `ModelRegistry::Forward` stops refusing `multi_kv`
+  // (#2353, W5j), these two lines become group 2's own cache and
+  // `group_block_tables[2]` — the vector W5c-2 already gathers — and NOTHING in
+  // the block changes. That substitution is the whole point of paging it here.
+  const int64_t idx_page =
+      input.attn_kv[0].block_size > 0 ? input.attn_kv[0].block_size : T;
+  const int64_t idx_pages = (T + idx_page - 1) / idx_page;
+  std::vector<int32_t> idx_bt(static_cast<size_t>(idx_pages));
+  for (int64_t k = 0; k < idx_pages; ++k) idx_bt[static_cast<size_t>(k)] = static_cast<int32_t>(k);
+  dense_attn::DBuf d_idx_bt(d, vt::DType::kI32, {1, idx_pages}, idx_bt.data());
+
   std::vector<dense_attn::DBuf> idx_bufs;
   idx_bufs.reserve(static_cast<size_t>(n_qsa));
   caches.qsa.resize(static_cast<size_t>(n_qsa));
   for (int64_t i = 0; i < n_qsa; ++i) {
     const int64_t id = p.qsa.head_dim;
     index_keys[static_cast<size_t>(i)].assign(
-        static_cast<size_t>(T * id), 0);
-    idx_bufs.emplace_back(d, vt::DType::kBF16, std::vector<int64_t>{T, id},
+        static_cast<size_t>(idx_pages * idx_page * id), 0);
+    idx_bufs.emplace_back(d, vt::DType::kBF16,
+                          std::vector<int64_t>{idx_pages, idx_page, id},
                           index_keys[static_cast<size_t>(i)].data());
     caches.qsa[static_cast<size_t>(i)].kv = input.attn_kv[static_cast<size_t>(i)];
     caches.qsa[static_cast<size_t>(i)].block_table = d_bt.t();
     caches.qsa[static_cast<size_t>(i)].slot_mapping = d_slots.t();
     caches.qsa[static_cast<size_t>(i)].index_key = idx_bufs.back().t();
+    caches.qsa[static_cast<size_t>(i)].index_block_table = d_idx_bt.t();
   }
 
   std::vector<dense_attn::DBuf> ple_conv_bufs;
@@ -458,26 +491,35 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
 // `models/qwen4_exp/modeling_qwen4_exp.py`, the lane pin recorded in
 // `.agents/oracles/transformers.md`:
 //
-//   :645-646  `q, raw_keys = q.reshape(*hidden_shape),
+//   :650      `q, raw_keys = q.reshape(*hidden_shape),
 //              token_k.reshape(*hidden_shape).squeeze(2)` — one UN-normed,
-//              UN-roped key per TOKEN
+//              UN-roped key per TOKEN. (W5i re-derived this at the pin: the
+//              anchor read `:645-646`, which is inside the `torch.split(` call
+//              that FEEDS the line, not the line quoted here.)
 //   :654-655  `raw_keys = past_key_values.update_indexer(raw_keys,
 //              self.layer_idx)` — and `cache_utils.py:340` calls that "update
 //              the indexer key cache by concatenation", returning
-//              `[batch_size, total_len, index_head_dim]` (`:346`); the static
-//              arm returns `[batch_size, max_cache_len, index_head_dim]`
-//              (`:672`)
-//   :678-681  the POOLED block keys are rebuilt from those raw keys on EVERY
-//              step (`raw_keys[batch_idx].index_select(0, ...)` then
-//              `.float().mean(dim=1)`). Nothing caches a pooled key.
+//              `[batch_size, total_len, index_head_dim]` (`:346`). Those two are
+//              the DOCSTRING; the executing line is
+//              `self.indexer_keys = torch.cat([self.indexer_keys,
+//              indexer_key_states], dim=1)` (`:350-351`). The static arm returns
+//              `[batch_size, max_cache_len, index_head_dim]` (`:672`)
+//   :679-682  the POOLED block keys are rebuilt from those raw keys on EVERY
+//              step (`raw_keys[batch_idx].index_select(0, ...)` at `:679` then
+//              `.float().mean(dim=1)` at `:681` and `k_layernorm` at `:682`).
+//              Nothing caches a pooled key. (W5i re-derived this too: the anchor
+//              read `:678-681` and `:678` is blank.)
 //
 // So `indexer_compress_ratio` belongs to the indexer's ALGORITHM — `block_topk =
 // token_budget // compress_ratio` (`:622`) and `complete_keys = (kv_len / CR) *
 // CR` in `Qwen4ExpQsaIndex` — and never to this cache's page geometry. Our own
-// consumer already said so: `Qwen4ExpQsaPagedCaches::index_key` is
-// `[max_kv, indexer_head_dim]`, written at rows `[past_len, past_len + T)`
-// (`qwen4_exp_qsa_block.cpp:426`) and read over rows `[0, complete_keys)`
-// (`:193`), which is one row per token.
+// consumer already said so, and since W5i it says it in the ENGINE's own shape:
+// `Qwen4ExpQsaPagedCaches::index_key` is the fused MLA page
+// `[num_pages, block_size, indexer_head_dim]`, ONE ROW PER TOKEN SLOT, written
+// at the physical rows of logical positions `[past_len, past_len + T)` and read
+// over the physical rows of `[0, kv_len)`. Both go through `IndexerRows` in
+// `qwen4_exp_qsa_block.cpp` — see that helper for the translation, and see
+// `Qwen4ExpQsaPagedCaches` for why group 2 carries its own block table.
 //
 // WHAT THE FOUR COST, AND WHY IT WAS WORSE THAN A SHORT CACHE. The allocation is
 // `num_blocks * page_size_bytes()` and `MLAAttentionSpec::real_page_size_bytes`

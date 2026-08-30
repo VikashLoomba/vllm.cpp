@@ -487,7 +487,9 @@ TEST_CASE(
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
                               {2, 1, T, p.num_key_value_heads, p.head_dim},
                               kv.data());
-  vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {T, p.qsa.head_dim},
+  // W5i: the indexer side cache is PAGED, `[num_pages, block_size, D]`. One page
+  // of `T` rows here, matching the single-page K/V beside it.
+  vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {1, T, p.qsa.head_dim},
                                index_key.data());
   vllm::dense_attn::DBuf bt_b(d, DType::kI32, {1, 1}, bt.data());
   vllm::dense_attn::DBuf slot_b(d, DType::kI64, {T}, slots.data());
@@ -501,6 +503,7 @@ TEST_CASE(
   caches.qsa[0].block_table = bt_b.t();
   caches.qsa[0].slot_mapping = slot_b.t();
   caches.qsa[0].index_key = idx_b.t();
+  caches.qsa[0].index_block_table = bt_b.t();
 
   const int64_t state_len = p.ple.short_conv_state_len();
   std::vector<float> ple_conv(static_cast<size_t>(kStream * state_len), 0.0F);

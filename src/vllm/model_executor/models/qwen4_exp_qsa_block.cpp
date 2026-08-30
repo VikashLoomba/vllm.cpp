@@ -60,6 +60,46 @@ Tensor Reshape(const Tensor& t, const std::vector<int64_t>& shape) {
   return RowsView(t, 0, t.rank == 0 ? 0 : t.shape[0], shape);
 }
 
+// ─── W5i: THE INDEXER SIDE CACHE'S PAGE TRANSLATION (#2249 item 3) ──────────
+// The PHYSICAL rows of logical indexer positions [begin, begin + n), resolved
+// through group 2's own block table:
+//
+//     row(pos) = table[pos / block_size] * block_size + pos % block_size
+//
+// which is the ordinary paged address and the same arithmetic the runner uses to
+// build a slot mapping. Flattened, an `MLAAttentionSpec` group's pages are a
+// contiguous `[num_pages * block_size, D]` array of such rows, so this vector is
+// exactly the `idx` operand `vt::IndexSelect` and `vt::IndexCopy` take, and the
+// gather and the scatter need NO NEW OP.
+//
+// THE TABLE IS READ ON THE HOST, and the caller is REFUSED BY NAME when it is not
+// host-resident rather than being read through a device pointer. That is
+// `CheckRopeLayoutsAgree`'s rule a few lines up, for the same reason: this block
+// has no device arm to run the translation on — the CUDA arm is the QSA ops' own
+// owed item — and a check or a translation that silently does not run on a
+// device arm is a mute switch.
+std::vector<int32_t> IndexerRows(const Tensor& table, int64_t block_size, int64_t begin,
+                                 int64_t n) {
+  VT_CHECK(table.device.type == vt::DeviceType::kCPU,
+           "qwen4_exp qsa block: the indexer block table is read on the HOST to resolve a "
+           "physical row, so it must be CPU-resident; a device-resident table needs that "
+           "translation moved onto the device, which the CUDA arm owes (see the spec's "
+           "`## Owed`)");
+  const int64_t pages = table.shape[1];
+  const auto* tb = table.Ptr<int32_t>();
+  std::vector<int32_t> rows(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    const int64_t pos = begin + i;
+    const int64_t lp = pos / block_size;
+    VT_CHECK(lp < pages,
+             "qwen4_exp qsa block: the indexer block table does not name logical page " +
+                 std::to_string(lp));
+    rows[static_cast<size_t>(i)] =
+        static_cast<int32_t>(static_cast<int64_t>(tb[lp]) * block_size + pos % block_size);
+  }
+  return rows;
+}
+
 
 // ─── THE TWO ROPE LAYOUTS, CROSS-CHECKED ────────────────────────────────────
 // The block is handed ONE set of angles TWICE: `vt::RopeFromCache` reads a
@@ -307,7 +347,6 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   const bool paged = arm.paged != nullptr;
   VT_CHECK((arm.contig != nullptr) != paged,
            "qwen4_exp qsa block: exactly one cache arm must be set");
-  const Tensor& index_key = paged ? arm.paged->index_key : arm.contig->index_key;
   const int64_t T = hidden.shape[0];
   const int64_t H = params.hidden_size;
   const int64_t Hq = params.num_attention_heads;
@@ -393,7 +432,52 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
     VT_CHECK(pc.slot_mapping.rank == 1 && pc.slot_mapping.shape[0] == T &&
                  pc.slot_mapping.dtype == DType::kI64 && pc.slot_mapping.IsContiguous(),
              "qwen4_exp qsa block: slot_mapping must be a contiguous i64 [T]");
+    // ─── GROUP 2, the indexer side cache (W5i, #2249 item 3) ────────────────
+    // The runner's fused MLA page, `[num_pages, block_size, indexer_head_dim]`.
+    // Rank 3 and not a flat `[max_kv, D]`: the page geometry has to be READABLE
+    // to translate a logical position, and a shape is the one place it cannot
+    // disagree with the buffer.
+    VT_CHECK(pc.index_key.rank == 3 && pc.index_key.shape[2] == IdxD &&
+                 pc.index_key.IsContiguous() && pc.index_key.data != nullptr,
+             "qwen4_exp qsa block: the paged indexer side cache must be a "
+             "contiguous [num_pages, block_size, indexer_head_dim] — the fused "
+             "3-dim page an MLAAttentionSpec group is allocated as");
+    VT_CHECK(pc.index_key.shape[0] > 0 && pc.index_key.shape[1] > 0,
+             "qwen4_exp qsa block: the paged indexer side cache is unallocated");
+    // GROUP 2'S OWN TABLE. Not `block_table` above: the two groups are allocated
+    // from separate physical page pools, so reading one through the other's map
+    // returns another sequence's keys with no shape error.
+    VT_CHECK(pc.index_block_table.rank == 2 && pc.index_block_table.shape[0] == 1 &&
+                 pc.index_block_table.dtype == DType::kI32 &&
+                 pc.index_block_table.IsContiguous(),
+             "qwen4_exp qsa block: index_block_table must be a contiguous i32 "
+             "[1, max_pages] — this block serves ONE sequence per call");
+    VT_CHECK(pc.index_block_table.shape[1] * pc.index_key.shape[1] >= kv_len,
+             "qwen4_exp qsa block: the indexer block table names fewer tokens "
+             "than kv_len");
+    // The physical row index travels as i32, because that is what
+    // `vt::IndexSelect` / `vt::IndexCopy` take. Refuse a cache whose last row
+    // cannot be NAMED rather than wrap into a valid-looking small index.
+    VT_CHECK(pc.index_key.shape[0] * pc.index_key.shape[1] <=
+                 static_cast<int64_t>(INT32_MAX),
+             "qwen4_exp qsa block: the paged indexer side cache has more rows "
+             "than an i32 slot index can name");
   }
+
+  // ─── THE INDEXER SIDE CACHE, AS A FLAT ARRAY OF ROWS ──────────────────────
+  // Both arms end up here: the contiguous arm's cache already IS
+  // `[max_kv, indexer_head_dim]` addressed by logical position, and the paged
+  // arm's `[num_pages, block_size, D]` pages flatten — same bytes, no copy — into
+  // `[num_pages * block_size, D]` addressed by PHYSICAL slot. `idx_page` is what
+  // separates the two: on the paged arm a logical position must go through
+  // `IndexerRows` before it names a row here, and on the contiguous arm it is the
+  // row.
+  const int64_t idx_page = paged ? arm.paged->index_key.shape[1] : 0;
+  Tensor index_rows =
+      paged ? Reshape(arm.paged->index_key,
+                      {arm.paged->index_key.shape[0] * idx_page,
+                       arm.paged->index_key.shape[2]})
+            : arm.contig->index_key;
 
   vt::RopeArgs rope;
   rope.rotary_dim = static_cast<int>(rot);
@@ -422,9 +506,25 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   // un-roped, which is what `Cache.update_indexer` stores (:653) and what
   // `vt::Qwen4ExpQsaCompress` expects — it applies the norm and the block-start
   // rope itself. Storing a normed or roped key here would double-apply both.
+  //
+  // WHERE IT LANDS, and this is the second place the cache arm forks. The
+  // CONTIGUOUS arm projects DIRECTLY INTO the rows this step owns, so nothing is
+  // copied afterwards. The PAGED arm cannot: a step's tokens can cross a page
+  // boundary, so there are no "the rows this step owns" to project into. It
+  // stages `[T, IdxD]` and scatters with `vt::IndexCopy` at the physical rows
+  // group 2's table names — the same stage-then-scatter shape the K/V takes
+  // below, for the same reason.
   {
-    Tensor slot = RowsView(index_key, past_len, T, {T, IdxD});
+    DBuf idx_stage;
+    if (paged) idx_stage = DBuf(d, index_rows.dtype, {T, IdxD});
+    Tensor slot = paged ? idx_stage.t() : RowsView(index_rows, past_len, T, {T, IdxD});
     vt::MatmulBT(d.q, slot, hidden, dense_attn::ResidentWeight(d, w.idx_k_proj, {IdxD, H}));
+    if (paged) {
+      const std::vector<int32_t> rows =
+          IndexerRows(arm.paged->index_block_table, idx_page, past_len, T);
+      DBuf ridx(d, DType::kI32, {T}, rows.data());
+      vt::IndexCopy(d.q, index_rows, idx_stage.t(), ridx.t());
+    }
   }
 
   // `q = self.q_layernorm(q)` then `apply_rotary_pos_emb(q, cos=current_cos,
@@ -457,10 +557,35 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
                                               vt::Device{vt::DeviceType::kCPU, 0}, {T});
   DBuf kv_lens(d, DType::kI32, {T}, kv_lens_host.data());
 
+  // WHAT THE INDEXER READS. `Qwen4ExpQsaIndex` takes a CONTIGUOUS `[rows, D]`
+  // addressed by logical position and its contract is unchanged by W5i, because
+  // the paged arm GATHERS one for it: `vt::IndexSelect` over the visible prefix's
+  // physical rows. That is upstream's own shape rather than a concession —
+  // `Cache.update_indexer` returns the whole concatenated
+  // `[batch, total_len, index_head_dim]` and the indexer `index_select`s out of
+  // it (`cache_utils.py:350-351`, `modeling_qwen4_exp.py:679`).
+  //
+  // IT COSTS ONE EXTRA PASS OVER THE VISIBLE PREFIX PER LAYER PER STEP, and that
+  // is recorded rather than hidden. It is not an asymptotic change:
+  // `vt::Qwen4ExpQsaCompress` already streams all `complete_keys` rows every step
+  // — it rebuilds every pooled block key and caches none, exactly as upstream
+  // does — so the gather adds a constant to a pass that was already O(kv_len).
+  // Folding the page resolution into that op instead would remove the constant;
+  // the spec's `## Owed` carries it with the issue that owes the measurement.
+  DBuf idx_gathered;
+  Tensor index_visible = index_rows;
+  if (paged) {
+    idx_gathered = DBuf(d, index_rows.dtype, {kv_len, IdxD});
+    const std::vector<int32_t> rows =
+        IndexerRows(arm.paged->index_block_table, idx_page, 0, kv_len);
+    DBuf ridx(d, DType::kI32, {kv_len}, rows.data());
+    vt::IndexSelect(d.q, idx_gathered.t(), index_rows, ridx.t());
+    index_visible = idx_gathered.t();
+  }
   Qwen4ExpQsaSelection sel = Qwen4ExpQsaIndex(
-      d, params.qsa, eps, q_index, index_key,
+      d, params.qsa, eps, q_index, index_visible,
       dense_attn::ResidentWeight(d, w.idx_k_norm, {IdxD}), cos, sin, kv_lens_cpu, kv_len,
-      /*round_intermediates_to_bf16=*/index_key.dtype == DType::kBF16);
+      /*round_intermediates_to_bf16=*/index_visible.dtype == DType::kBF16);
 
   // ─── THE ATTENTION ─────────────────────────────────────────────────────────
   // `q_proj` emits `num_attention_heads * head_dim * 2` and is chunked PER HEAD

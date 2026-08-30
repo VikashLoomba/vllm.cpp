@@ -428,7 +428,10 @@ struct MultiKvCacheIndex {
   // exactly two group ids — the target attention group and the recurrent group
   // — so a third group's table never left the runner and its cache was
   // allocated and unread. `qwen4_exp` publishes exactly such a third group: the
-  // QSA indexer side cache, an `MLAAttentionSpec` at `compress_ratio` 4.
+  // QSA indexer side cache, an `MLAAttentionSpec` at `compress_ratio` 1 —
+  // ONE ROW PER TOKEN. This line said 4 until W5h measured the group against
+  // upstream's `Cache.update_indexer`, which concatenates one raw key per
+  // token; the ratio is the SELECTION algorithm's, never the page geometry.
   //
   // UPSTREAM DOES NOT HAVE A "TWO NAMED GROUPS" SHAPE AT ALL. Its per-group
   // metadata loop runs over `enumerate(kv_cache_groups)` and hands every group

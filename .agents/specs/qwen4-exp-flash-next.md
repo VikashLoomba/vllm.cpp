@@ -3618,6 +3618,113 @@ not exist cannot red for the reason claimed, and running one anyway would be the
 "a mutation that never applied reads as a passing test" failure. They belong to
 W5i and W5j below.
 
+## Mutation record — W5i (#2031, #2249 item 3, issue OWED)
+
+**W5i makes the QSA INDEXER SIDE CACHE readable and writable through the PAGED
+allocation.** `Qwen4ExpQsaPagedCaches::index_key` becomes the runner's own fused
+MLA page `[num_pages, block_size, indexer_head_dim]` and gains
+`index_block_table`, GROUP 2'S OWN logical-to-physical page map. The store
+scatters with `vt::IndexCopy` and the read gathers with `vt::IndexSelect`, both
+at physical rows resolved by `IndexerRows`.
+
+**NO NEW OP AND NO OP EXTENSION, and the arm count is why.** W5h's `## Owed`
+claimed `vt::IndexSelect` and `vt::IndexCopy` suffice; that was re-verified
+against their contracts before any code was written and it holds —
+`IndexCopy`'s destination must be a contiguous `[N, D...]`, which is exactly
+what an `MLAAttentionSpec` group's pages are when flattened, and both ops
+already register a `kCPU` AND a `kCUDA` arm. The alternative was W5d-3's
+precedent, an ADDRESS MODE on the op: `vt::Qwen4ExpQsaCompress` is the op that
+reads this cache and it has **ONE arm** (`kCPU`, `src/vt/cpu/cpu_qwen4_exp_qsa.cpp`;
+there is no CUDA arm for any `qwen4_exp` op). That count is what decided it in
+the OPPOSITE direction from `vt::RmsNormGroup`, which became its own OpId
+because `kRmsNorm` has six arms and a silently-ignored field would return a
+wrong answer on five of them. Here a one-arm op with no gate-able second arm
+would take an address mode nothing could measure, so the composition is the
+smaller and the more honest change.
+
+### Gate
+
+Base `e12a197cd71a596b7d520264bed0804685c5c222` (`row/MODEL-MM-QWEN4-EXP-SERVE`).
+CPU-only build, `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
+-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF`, `-j 2`,
+named targets only. Every `Before` figure was MEASURED on a scratch worktree at
+that base SHA and not carried over from an earlier record.
+
+| Suite | Before | After |
+|---|---|---|
+| `test_qwen4_exp_qsa_block` | 11 cases / 4382 assertions, `SUCCESS` | 12 cases / 5937 assertions, `SUCCESS` |
+| `test_qwen4_exp_layer_loop` | 2 cases / 104 assertions, `SUCCESS` | 2 cases / 104 assertions, `SUCCESS` |
+| `test_qwen4_exp_kv_cache` | 5 cases / 414 assertions, `SUCCESS` | 5 cases / 414 assertions, `SUCCESS` |
+| `test_qwen4_exp_forward` | 1 case / 421 assertions, `SUCCESS` | 1 case / 421 assertions, `SUCCESS` |
+
+The transformers 5.16.0 end-to-end golden is UNMOVED: `max|diff| = 0.00982457`
+against a bound of `0.03`, and `ModelRegistry::Forward` still samples token 15.
+
+**RED FIRST, AND THE RED IS THE FINDING.** The case was committed against a
+STRAWMAN body that flattened the paged pages and addressed them LINEARLY — which
+is mutation M3, so the red-first evidence and M3's proof are the same
+measurement made twice. It read:
+
+```
+CHECK( wrong_written == 0 ) is NOT correct!
+  values: CHECK( 9 == 0 )
+  logged: paged-indexer block max relative difference vs the oracle 0.00558036
+          paged vs contiguous differing bf16 words 0 of 1472
+          named rows left unwritten 9; unnamed rows written 9
+CHECK( wrong_untouched == 0 ) ...................... CHECK( 9 == 0 )
+CHECK( std::isnan(... tail_row ...) ) .............. CHECK( false )
+CHECK( rel < kOutTol ) ............... CHECK( 1.3819 <  0.03 )
+CHECK( differing == 0 ) .............. CHECK( 64 == 0 )
+CHECK( std::isfinite(... row22 ...) ) CHECK( false )
+```
+
+**READ THE THIRD AND FOURTH LINES OF THAT BLOCK BEFORE WRITING ANOTHER GATE ON
+THIS AXIS.** With 9 of 23 rows in the wrong physical page, the paged-vs-
+contiguous comparison read `differing 0 of 1472` and the oracle bound read
+`0.00558036` — both GREEN. The store and the read share one translation, so a
+translation that is wrong THE SAME WAY on both sides writes and reads the same
+wrong rows and returns the right answer. A value comparison at prefill is not a
+gate on paging. What convicts is the STRUCTURAL assertion (the exact set of
+physical rows written, against the set the block table names, every other row
+still the NaN it was constructed with) and a decode step whose prefix the TEST
+places at rows it computes itself.
+
+The fixture is `{2, 6, 1}` for the indexer against `{5, 3, 7}` for the K/V —
+TWO DIFFERENT permutations, because group 0 and group 2 are separate physical
+page pools and one table could not see a body that resolved the indexer through
+the K/V map. Neither shares a fixed point with the logical `{0, 1, 2}`. 23
+tokens over pages of 8 leave the third page PARTIAL, so row 7 of it is the one
+row a full-page defect reaches for and it is asserted NaN by name.
+
+### Mutations
+
+Build rc read BEFORE any test output in every case; a build failure is not a
+test result. Every mutation below was run against the FINAL tree, after the
+record and comment repairs and after the three refusal subcases were added —
+the first battery ran against an earlier tree and is not reported, because a
+later commit silently disarms an earlier commit's mutation proof. Applied-proof
+is the post-mutation sha256; restore-proof is the sha256 back to
+`bb9baf661a248b74eb26281a3f79d1115871c6a16392e65f83e7fc2f503a844e`
+(`qwen4_exp_qsa_block.cpp`) and
+`6e3d8b64612f28d90da37ce08bf28cd145ab4f60411350d559e4c49510c21a21`
+(`qwen4_exp_registry.cpp`), verified by `diff` after each. `touch` after every
+restore, or ninja skips the rebuild.
+
+| # | Mutation | sha256 after apply | Build rc | Result |
+|---|---|---|---|---|
+| M1 | OFF-BY-ONE PAGE INDEX in `IndexerRows`: `lp = (pos + 1) / block_size` | `a491df61e800c7527847f190b4028fdae8c6e6d5c84bf1a6f726601a820eb853` | 0 | **RED** — 1 of 12 cases, 3 of 5937 assertions, all three the STRUCTURAL ones (`wrong_written 1`, `wrong_untouched 1`, the tail row). The value subcase stayed GREEN, which is the shared-translation property above measured a second time |
+| M2 | PARTIAL FINAL PAGE READ AT FULL LENGTH: the gather rounds the visible prefix up to a whole page and tells `Qwen4ExpQsaIndex` so | `da0349e30dacb1746f3ab1ee1cc64cefe9fdc3f4cab09ba156500e46822ed3a2` | 0 | **RED** — 3 of 12 cases (all three paged cases), by a THROW rather than an assertion: `qwen4_exp_qsa_compress: cos/sin must cover every key position`. Reported with the mechanism because it is not the one intended — the NaN tail row is UNREACHABLE without overstating the prefix, and overstating it is caught first by a guard that predates this wave. `assertions: 2844`, all passed, is a thrown case and not a green one |
+| M3 | DROP THE PERMUTATION: `IndexerRows` returns `pos`, ignoring the table | `60b4c20e08434bea4123179381549c8f4eae0a77d90d71dd0854e29fcdd3e03a` | 0 | **RED** — 1 case, 6 of 5937 assertions, across BOTH subcases: the three structural ones and the decode's `rel 1.3819 < 0.03`, `differing 64 of 64`, `isfinite(row22) false` |
+| M4a | REACHABILITY, fatal-body form: `IndexerRows` opens with `VT_CHECK(false, ...)` | `cd88b512622a0946f029659e5b9dbf25789bcb31195b576e067e3e4752facb26` | 0 | **RED** in `test_qwen4_exp_layer_loop`, 2 of 2 cases, including `REQUIRE_NOTHROW( fl = vllm::ModelRegistry::Forward(*model, in) ) THREW`. **NOT VACUOUS**: the paged indexer translation is reached from `ModelRegistry::Forward` on a loaded `qwen4exp` GGUF, which is a production entry point |
+| M4b | REACHABILITY, call-site-deletion form (`.agents/reachability.md` step 5): the registry hook's paged scratch goes back to the pre-W5i contiguous `[T, D]` and the `index_block_table` assignment is deleted | `cd726d05fa565d06820eb81cdc13e15348e9f4f4d1068319bd9b187f9d0f4ed8` (`qwen4_exp_registry.cpp`) | 0 | **RED** on the `ModelRegistry::Forward` case alone, with the block's own refusal: `the paged indexer side cache must be a contiguous [num_pages, block_size, indexer_head_dim]`. The oracle case stayed GREEN, which is the separation the step exists to produce — it drives `Qwen4ExpTextModelForward` with its own caches and does not go through the hook |
+
+**WHAT NO MUTATION HERE PROVES.** M4a and M4b prove the translation is reached;
+neither proves the ENGINE's group-2 buffer reaches it, because it does not — the
+`multi_kv` refusal stands and the hook substitutes a scratch. The scratch's
+block table is the IDENTITY, so the PERMUTATION is exercised only by the block's
+gate and never on the production path. That is stated in `## Owed` and it is
+W5j's to close.
+
 ## Owed
 
 - **W5h's ISSUE IS OWED.** GitHub writes are `403` from this host (account
@@ -3637,18 +3744,39 @@ W5i and W5j below.
   row is left byte-for-byte alone and the correction lives here, which is the
   arrangement AGENTS.md prescribes for a keyed append-only record.
 
-- **W5i — THE INDEXER SIDE CACHE IS NOW BIG ENOUGH AND STILL NOT READABLE.**
-  Sizing it correctly does not make it addressable. `Qwen4ExpQsaIndex` requires a
-  CONTIGUOUS `[max_kv, indexer_head_dim]` tensor indexed by ABSOLUTE logical
-  position (`qwen4_exp_qsa_block.cpp:166-169`, `:193`, `:426`), and the engine's
-  buffer is PAGED: physical row = `block_table[pos / block_size] * block_size +
-  pos % block_size`. The gap is a gather and a scatter and needs no new op —
-  `vt::IndexSelect` (`include/vt/ops.h:4033`) and `vt::IndexCopy` (`:4040`) are
-  exactly row gather and row scatter over dim 0 with an i32 index — but it is
-  product code with its own golden, and the golden must use a NON-IDENTITY page
-  permutation or it proves nothing (a single sequence at prefill happens to map
-  identically, which is the fixture accident this entry exists to forbid).
-  ISSUE OWED.
+- **CLOSED by W5i: THE INDEXER SIDE CACHE IS ADDRESSABLE THROUGH THE PAGED
+  ALLOCATION.** This entry read "now big enough and still not readable".
+  `Qwen4ExpQsaPagedCaches` now carries the side cache as the runner's own fused
+  MLA page `[num_pages, block_size, indexer_head_dim]` plus GROUP 2'S OWN block
+  table, the store scatters through `vt::IndexCopy` and the read gathers through
+  `vt::IndexSelect`, and `Qwen4ExpQsaIndex`'s contiguous `[rows, D]` contract is
+  unchanged because the gather is what hands it one. **NO NEW OP AND NO OP
+  EXTENSION**: the entry's own claim that `vt::IndexSelect` and `vt::IndexCopy`
+  suffice was re-verified against their contracts before anything was written,
+  and it holds — `IndexCopy` wants a contiguous `[N, D...]` destination, which is
+  exactly what an MLA group's pages are when flattened. The golden uses a
+  NON-IDENTITY permutation `{2, 6, 1}` against a logical `{0, 1, 2}`, DIFFERENT
+  from the K/V arm's `{5, 3, 7}` so that resolving one group through the other's
+  map is visible, with a PARTIAL final page. W5i's own issue is OWED.
+
+  **WHAT THE GOLDEN MEASURED THAT THE ENTRY DID NOT ANTICIPATE, and it changes
+  what a future wave here must assert.** The store and the read share one
+  translation, so a translation that is wrong THE SAME WAY on both sides writes
+  and reads the same wrong rows and RETURNS THE RIGHT ANSWER. Measured, not
+  feared: against a body that dropped the permutation entirely, the paged-vs-
+  contiguous comparison read `differing 0 of 1472` and the oracle bound read
+  `0.00558036`, both green, while 9 of 23 rows were in the wrong physical page.
+  A value comparison at prefill is therefore NOT a gate on this. What convicts is
+  the STRUCTURAL assertion — the exact set of physical rows written, against the
+  set the block table names, with every other row still the NaN it was
+  constructed with — and a decode step whose prefix the TEST places at the rows
+  it computes itself. Both are in `test_qwen4_exp_qsa_block.cpp`'s W5i case.
+
+  Three narrower things replace this entry, and each is named where it belongs
+  below: the ENGINE's group-2 buffer still does not reach the block (W5j);
+  the gather costs one extra pass over the visible prefix per layer per step;
+  and the page translation is a HOST read of the block table, so a device-
+  resident table is refused by name and the CUDA arm owes it a device-side home.
 
 - **W5j — THE FORWARD MUST RESOLVE ITS CACHES BY NAME, AND THE ENGINE GUARD
   MUST BECOME A PER-ARCHITECTURE CAPABILITY.** Measured on this head, not
@@ -3789,13 +3917,38 @@ W5i and W5j below.
   `query_start_loc` plumbing a ragged multi-request batch needs, which no block
   on this row carries. Until all three land there is no token number, no speed
   number, no `examples/server` end to end and no `docs/USAGE.md` weights row.
-- **THE QSA INDEXER SIDE CACHE'S PAGED STORE IS STILL OWED, and W5f inherited it
-  rather than closing it.** `Qwen4ExpQsaPagedCaches::index_key` is contiguous
-  `[max_kv, indexer_head_dim]`, W5c-2 gathers group 2's block table and nothing
-  reads it, and the registry hook allocates the side cache as per-call scratch —
-  which is CORRECT at `past_len == 0` and is exactly why the hook refuses any
-  other `past_len`. It becomes a real store the moment multi-step decode is
-  reachable.
+- **CLOSED by W5i as a STORE, and what remains is a REACH.** This entry read
+  "the QSA indexer side cache's paged store is still owed". The store and the
+  read are paged now, and the registry hook allocates the scratch IN THE ENGINE'S
+  OWN PAGED SHAPE and addresses it through a table, so the code the engine's
+  buffer will run is the code that runs today. What is NOT closed: that buffer
+  does not REACH the block. `ModelRegistry::Forward` refuses `multi_kv` by name
+  (#2353) and this row must not lift it, so `group_block_tables[2]` — the vector
+  W5c-2 already gathers — never arrives. **Owned by W5j.** The substitution is
+  two lines in `ForwardQwen4ExpForConditionalGeneration` and nothing in the
+  block; that is what paging it here bought. The scratch's table is the IDENTITY,
+  which is what a private per-call buffer means rather than a shortcut — there is
+  no allocator behind it, so there are no physical pages to permute — and the
+  permutation is exercised by the block's own gate instead.
+- **THE GATHER COSTS ONE EXTRA PASS OVER THE VISIBLE PREFIX, per QSA layer per
+  step, and it is recorded rather than hidden.** `vt::IndexSelect` materialises
+  `[kv_len, indexer_head_dim]` before `vt::Qwen4ExpQsaCompress` reads it. It is
+  NOT an asymptotic change — the compressor already streams every visible row
+  each step, rebuilding every pooled block key and caching none, exactly as
+  upstream does (`modeling_qwen4_exp.py:679-682`) — but it is a real constant on
+  a pass that is already O(kv_len). Folding the page resolution INTO that op, as
+  W5d-3 did for `vt::Qwen4ExpQsaGatherAttention`'s K/V read, removes it. That was
+  weighed and not taken: the compressor is a ONE-ARM op with no CUDA arm, so an
+  address mode there is an unmeasurable extension, and no benchmark on this row
+  can price it until a decode exists. **NOTHING HAS MEASURED THIS**, and the
+  issue that owes the measurement is OWED with W5i's.
+- **THE INDEXER PAGE TRANSLATION IS A HOST READ.** `IndexerRows` reads group 2's
+  block table on the host to resolve a physical row, and REFUSES a table that is
+  not CPU-resident by name rather than dereferencing a device pointer. That is
+  `CheckRopeLayoutsAgree`'s rule in the same file, for the same reason, and it is
+  owed the same thing: the QSA CUDA arm must give the translation a device-side
+  home or argue it away. Recorded here so the CUDA wave inherits two items and
+  not one.
 - **THE MoE ADAPTER IS REBUILT PER LAYER PER STEP, and that is a SPEED ceiling
   W5f accepted rather than a wrong answer.** `Qwen4ExpMoeBlockWeights` runs
   inside the layer loop, which is the third risk #2336 §3 named: a per-step
@@ -4329,7 +4482,13 @@ W5i and W5j below.
   coincide and block `b` is exactly tokens `[CR*b, CR*b + CR)`. The op REFUSES a
   key count that is not a whole number of complete blocks (M20 reds that refusal)
   but it cannot detect an arbitrary visibility set, and nothing yet does.
-- **The side cache's paged store.** `QsaSideCacheSpec` (W4) says what the cache
+- **The side cache's paged store — READ THE SCOPE, W5i DID NOT CLOSE THIS ONE.**
+  This entry is about `vt::Qwen4ExpQsaCompress`'s OUTPUT, the POOLED block keys,
+  and not about the raw indexer keys W5i paged. Upstream caches no pooled key at
+  all — it rebuilds them from the raw keys every step
+  (`modeling_qwen4_exp.py:679-682`) — so this array is scratch by construction
+  and a paged home for it is an optimisation, not a correctness gap.
+  `QsaSideCacheSpec` (W4) says what the cache
   costs and `QsaCompressedSlot` says which slot a token writes; this op writes a
   DENSE `[num_blocks, head_dim]` array and not a paged one. The block-table store
   belongs to the wave that gives QSA a real KV-cache group, which is blocked on
@@ -4395,8 +4554,11 @@ W5i and W5j below.
     `Qwen4ExpQsaPagedCaches` + `RunQwen4ExpQsaBlockPaged`, over a
     `kv_block_table`/`kv_block_size` ADDRESS MODE inside the same
     `vt::Qwen4ExpQsaGatherAttention` rather than a second op. The INDEXER side
-    cache is still contiguous: that is KV group 2, the `MLAAttentionSpec`, and its
-    paged store is the separate entry above and #2249 item 3 (owed as W5c-2). What
+    cache was still contiguous at W5d-3 — that is KV group 2, the
+    `MLAAttentionSpec`, and its paged store was the separate entry above and
+    #2249 item 3 — and **W5i closed it**, by composition rather than by a second
+    address mode: `vt::IndexCopy` for the store, `vt::IndexSelect` for the read,
+    no op touched. What
     W5d-3 did NOT need from #2131 is worth recording, because this bullet asserted
     the dependency for three waves: the K/V paged read needs only a block table and
     a slot mapping, both of which the runner already builds for every full-attention
@@ -4488,10 +4650,12 @@ W5i and W5j below.
   mutation `.agents/reachability.md` prescribes has no site here for the same
   reason it had none for W5b-5: there is no production call site to delete.
   Also owed from this wave:
-  - **The INDEXER side cache is still contiguous.** #2249 item 3 — KV group 2 is
-    never gathered — is owed as W5c-2 and is deliberately not smuggled into this
-    wave. `Qwen4ExpQsaPagedCaches::index_key` is `[max_kv, indexer_head_dim]`, so
-    a forward built on this arm still needs a contiguous side cache per sequence.
+  - **The INDEXER side cache was still contiguous — CLOSED by W5i.** #2249 item
+    3 — KV group 2 is never gathered — was owed as W5c-2 and deliberately not
+    smuggled into this wave. At W5d-3 `Qwen4ExpQsaPagedCaches::index_key` was
+    `[max_kv, indexer_head_dim]`, so a forward built on this arm still needed a
+    contiguous side cache per sequence. It is now the fused MLA page
+    `[num_pages, block_size, indexer_head_dim]` with group 2's own block table.
   - **ONE REQUEST PER CALL.** `kv_block_table` is `[1, max_pages]` and the block
     refuses anything else by name. A ragged multi-request batch needs the
     `query_start_loc` plumbing `vt::PagedAttention` carries and this block does
@@ -5051,10 +5215,15 @@ W5i and W5j below.
   per-group metadata loop (`vllm/v1/worker/gpu_model_runner.py:2551-2567` @ pin
   `5559679229`, `cm.block_table_tensor = _get_block_table(kv_cache_gid)`), so
   the map from a logical position to the physical page now reaches the forward.
-  The half that remains is the CONSUMER: `Qwen4ExpQsaPagedCaches::index_key` is
-  still a contiguous `[max_kv, indexer_head_dim]` tensor — W5d-3 paged the K/V
-  half of the axis and deliberately did not page the side cache — so nothing
-  turns that map into a read. Named under all four "Nothing lands dead"
+  The half that remained was the CONSUMER, and **W5i closed it**:
+  `Qwen4ExpQsaPagedCaches::index_key` was a contiguous
+  `[max_kv, indexer_head_dim]` tensor — W5d-3 paged the K/V half of the axis and
+  deliberately did not page the side cache — and it is now the engine's fused MLA
+  page, stored and read through a block table. What is STILL owed is one hop
+  further out: the map W5c-2 gathers reaches `MultiKvCacheIndex` and not the
+  block, because `ModelRegistry::Forward` refuses `multi_kv` (#2353) and the
+  registry hook substitutes a per-call scratch in the same paged shape. **W5j
+  owns that hop.** Named under all four "Nothing lands dead"
   conditions: what is unreached is the per-group block-table channel's VALUE —
   the runner's gather runs on the production `execute_model` path and the
   refusal in `ModelRegistry::Forward` reads its count, but no forward consumes
@@ -5307,9 +5476,13 @@ W5i and W5j below.
        bridge KV group 0 (the `FullAttentionSpec`) through a
        `kv_block_table`/`kv_block_size` address mode inside the same
        `vt::Qwen4ExpQsaGatherAttention`, rather than a second op. The INDEXER
-       side cache is untouched and still contiguous, which is item 3 below and
-       is owed as W5c-2 — so this item is closed and item 3 is not, and the two
-       are the SAME axis split in half. The survey text follows, because it is
+       side cache was untouched and still contiguous, which is item 3 below and
+       was owed as W5c-2 — so this item closed and item 3 did not, and the two
+       are the SAME axis split in half. **W5i closed the other half**, and by a
+       different shape: a composition of `vt::IndexCopy` and `vt::IndexSelect` in
+       the block, not a second address mode on an op. The two halves therefore
+       set no single precedent, and a reader who takes W5d-3's address mode as
+       THE pattern will over-extend an op that did not need it. The survey text follows, because it is
        the argument that produced the wave and the layer loop still has to CALL
        the paged arm, which nothing does.
        `Qwen4ExpQsaCaches` is `key`/`value` `[max_kv, num_kv_heads, head_dim]`
@@ -5534,6 +5707,7 @@ a row here, and every row says whether anything in production reaches it:
 | W5f | `Qwen4ExpTextModel::Forward` — THE LAYER LOOP, and the `lm_head` tail | **yes** — `ModelRegistry::Forward` calls it on a loaded `qwen4exp` GGUF | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2336](https://github.com/mudler/vllm.cpp/issues/2336) |
 | W5g | the STATED n-gram vocabulary as the layout's authority, and a heap over-read closed on the GGUF arm | **yes** — `Qwen4ExpPleLayout`, reached from `qwen4_exp_forward.cpp` inside the loop W5f wired | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
 | W5h | the indexer side cache sized at ONE ROW PER TOKEN: `compress_ratio` 1, not 4 | **yes** — `make_kv_cache`, the same production hook W5c-1 reaches | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5h's own issue OWED |
+| W5i | the indexer side cache PAGED: the engine's fused MLA page + group 2's own block table, gathered and scattered with `vt::IndexSelect`/`vt::IndexCopy` | **path yes, ENGINE BUFFER no** — `ModelRegistry::Forward` reaches the translation on a loaded `qwen4exp` GGUF (M4a, M4b), but over a per-call scratch in that paged shape; `multi_kv` is still refused so group 2's real buffer and its non-identity table do not arrive (W5j) | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2249](https://github.com/mudler/vllm.cpp/issues/2249), W5i's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than
@@ -5542,8 +5716,10 @@ change that** — it changes the reason. Before it, most of the rows above were
 unreached because nothing composed them; after it, the composition exists and
 runs from a production entry point, and what is missing is the SECOND STEP. The
 count is deliberately not written out: this section deletes prose counts of its
-own table, and W5g and W5h each added a row without touching this sentence,
-which is exactly the drift the policy exists to stop.
+own table, and W5g, W5h and W5i each added a row without touching this sentence,
+which is exactly the drift the policy exists to stop. The policy holds for the
+TABLE and it did not save the PROSE below: W5i found a stale enumeration further
+down that survived W5g, and repaired it in flow.
 **WHAT W5f's LOOP ACTUALLY REACHES IS A PREFIX OF THAT COLUMN, NOT ALL OF IT,
 and the sentence that stood here said all of it.** It read "Every `no` above is
 now reached THROUGH W5f's loop at a single-shot prefill". That is false, and the
@@ -5556,27 +5732,48 @@ inconsistent (`## Owed`), so the production path stops at
 puts its only PLE layer at index 1 and PLE runs FIRST in a decoder layer
 (`:1218`), so the prefix that runs is exact:
 
-- **Reached through `ModelRegistry::Forward` today:** layer 0 whole — the
-  attention hyper-connection and its rank-1 write-back (W5b-2, W5b-6),
-  `RunGdnBlockPaged` (W5b-1), the MLP hyper-connection, `RunQwen4ExpMoeBlock`
-  and its adapter (W5d-4) — plus, at layer 1, `Qwen4ExpPleLayout` itself, which
-  is W5e-2's own helper and is what refuses.
-- **Reached by NOTHING in production, at this merge commit:**
-  `RunQwen4ExpPleBlock`'s body and the PLE conv and gate ops it drives (W5b-3,
-  W5e-1, the rest of W5e-2); the whole Qwen Sparse Attention arm, because the
-  fixture's QSA layer is layer 3 and the loop never gets there (W5b-4, W5b-5,
-  W5d-3); and the terminal `use_combine=false` hyper-connection mixer at
-  `:1430`, which is after the loop.
+**THIS ENUMERATION WAS STALE AND W5i's MUTATION BATTERY IS WHAT CAUGHT IT.** It
+read that the loop stopped at layer 1's `Qwen4ExpPleLayout` refusal and that "the
+whole Qwen Sparse Attention arm" was reached by nothing, "because the fixture's
+QSA layer is layer 3 and the loop never gets there". W5g removed the refusal that
+stopped it — it made the STATED n-gram vocabulary the layout's authority — and
+nothing rewrote this list afterwards. Two measurements on `e12a197cd`'s tree say
+so directly, and both are in W5i's mutation record above:
 
-The column therefore still says `no` for those, and it says so for the ordinary
-reason rather than the decode reason. Closing the gap is a ONE-LINE fixture
-question and not new product code: it is owned by row `MODEL-MM-QWEN4-EXP` under
-[#2336](https://github.com/mudler/vllm.cpp/issues/2336), and the `## Owed` entry
-that owns it is **"THE SHARED `qwen4exp` GGUF FIXTURE IS INTERNALLY INCONSISTENT,
-AND NOTHING COULD SEE IT UNTIL A FORWARD RAN THE PLE LAYER ON IT (found by
-W5f)"**, which records both candidate repairs. Until that lands, the reach claim
-this row may make is the prefix above and no more, and rewriting any `no` to
-`yes` would be the overstatement this section exists to prevent.
+- `test_qwen4_exp_layer_loop.cpp:751` MESSAGES `qwen4_exp sampled token id: 15 of
+  16 (logit range [3290.84, 95090.7])`. `ModelRegistry::Forward` RETURNS LOGITS
+  on this fixture; it does not refuse partway.
+- W5i's M4a made `IndexerRows` — inside `RunQwen4ExpQsaBlockPaged`'s indexer —
+  fatal, and `REQUIRE_NOTHROW( fl = vllm::ModelRegistry::Forward(*model, in) )`
+  THREW. The QSA arm is therefore reached FROM A PRODUCTION ENTRY POINT.
+
+`RunQwen4ExpPleBlock`'s body follows by construction rather than by its own
+mutation: PLE runs FIRST in a decoder layer (`:1218`), the fixture puts its only
+PLE layer at index 1, and the loop demonstrably reaches layer 3's QSA, so layer
+1's PLE body ran. That inference is recorded as an inference. **No mutation on
+this row has deleted `RunQwen4ExpPleBlock`'s call site**, so the PLE conv and gate
+ops (W5b-3, W5e-1, W5e-2) are reached-by-argument and not reached-by-measurement,
+which is a weaker claim and is written as one.
+
+- **Reached through `ModelRegistry::Forward` today:** the loop end to end on the
+  fixture — layer 0 whole (the attention hyper-connection and its rank-1
+  write-back, W5b-2/W5b-6; `RunGdnBlockPaged`, W5b-1; the MLP hyper-connection;
+  `RunQwen4ExpMoeBlock` and its adapter, W5d-4), layer 1's PLE, and the Qwen
+  Sparse Attention arm (W5b-4, W5b-5, W5d-3, and W5i's paged indexer side cache),
+  through to the `lm_head` and a sampled token.
+- **Reached by NOTHING in production, at this merge commit:** the terminal
+  `use_combine=false` hyper-connection mixer at `:1430`, which is after the loop.
+  And, one level out from the code: the ENGINE's group-2 buffer, because
+  `ModelRegistry::Forward` refuses `multi_kv` and the registry hook substitutes a
+  per-call scratch — so W5i's translation runs on the production path over an
+  IDENTITY table and the permutation is exercised only by the block's own gate.
+
+**THE `Reached?` COLUMN IS THE AUTHORITY AND THIS PROSE IS NOT A SECOND COUNT.**
+Rows that still read `no` do so for the ordinary reason — nothing composes them
+— and not because the loop stops. What remains true from the sentence this
+replaces is the SCOPE of the claim: this is ONE single-shot prefill of ONE
+sequence, it is not a decode, and rewriting any `no` to `yes` on the strength of
+a prefill would be the overstatement this section exists to prevent.
 
 **Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
 `Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry
@@ -5674,9 +5871,12 @@ first rode with.
   `RunQwen4ExpQsaBlockPaged` over a `kv_block_table`/`kv_block_size` ADDRESS
   MODE inside `vt::Qwen4ExpQsaGatherAttention`, landed by W5d-3 (#2249 item 2) —
   the wave this section is being merged with, which is why this recount rides
-  here. Closed as a SEAM as well, and only for the K/V half: the INDEXER side
-  cache is still contiguous, and its paged STORE outlives the survey — see
-  below, where it is named as a gap that was never one of the five.
+  here. Closed as a SEAM as well, and at the time only for the K/V half: the
+  INDEXER side cache was still contiguous and its paged STORE outlived the
+  survey. **W5i closed that half too** — the side cache is the engine's fused MLA
+  page now, stored and read through group 2's block table — so what outlives the
+  survey is narrower again: the engine's group-2 BUFFER still does not reach the
+  block, which is W5j's and is named below.
 - **Item 3, the group-2 block table**, is
   `GPUModelRunner::gather_group_block_tables`, landed by W5c-2 (#2249 item 3) —
   the wave THIS section is being merged with, which is why this recount rides
@@ -5689,9 +5889,13 @@ first rode with.
 it is the LAYER LOOP itself, `Qwen4ExpTextModel::Forward`, owned by
 [#2031](https://github.com/mudler/vllm.cpp/issues/2031), which nothing above
 substitutes for. Two things sit beside it and neither is one of the five. The
-QSA indexer side cache's PAGED STORE is still owed — the map arrives with W5c-2
-and `Qwen4ExpQsaPagedCaches::index_key` is still contiguous, so the loop wave
-inherits that store rather than finding it done. And the `multi_kv` refusal is
+QSA indexer side cache's PAGED STORE **is no longer one of them: W5i landed it**
+— the map arrived with W5c-2, and `Qwen4ExpQsaPagedCaches::index_key` is the
+engine's own `[num_pages, block_size, indexer_head_dim]` page addressed through
+group 2's table. What sits beside the loop instead is that the engine's group-2
+buffer does not REACH the block, because `ModelRegistry::Forward` refuses
+`multi_kv`; the hook allocates a scratch in that same paged shape meanwhile. And
+the `multi_kv` refusal is
 not this row's: `ModelRegistry::Forward` refuses every multi-cache topology by
 name and this model publishes one, which #2249 records as belonging to an
 engine row. The refusal in `qwen4_exp_registry.cpp` says exactly this at this

@@ -48,6 +48,15 @@
 #include "iq2xs_iq4xs_dot_golden.h"
 #include "iq2xs_iq4xs_golden_vectors.h"
 
+// The production GGUF reader and the production residency decision, so the
+// reachability case below can start at a real file header instead of at a
+// hand-built block. `../vllm/gguf_builder.h` is the same cross-directory
+// include tests/vllm/test_gguf_dequant.cpp already makes in the other
+// direction for the golden vectors above.
+#include "../vllm/gguf_builder.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
+
 #ifdef VLLM_CPP_CUDA
 // The device-codebook seal: the CPU tables it is measured against, and the copy
 // out of device memory (only the CUDA TU that defines them can address them).
@@ -1145,6 +1154,128 @@ TEST_CASE("CUDA IQ2_XS / IQ4_XS dot the ORACLE's own numbers on REAL checkpoint 
 // keep-quant GEMM the decode path cannot use. `cudaStreamSynchronize` on a
 // capturing stream fails, which invalidates the capture -- so this case is RED
 // for exactly the dtypes that fall back and green for the ones that do not.
+// ─── from a REAL GGUF header to the device kernel, in one chain ─────────────
+//
+// Every other gate in this file hands the GEMM bytes this test made up. That
+// proves the kernel and says nothing about whether a checkpoint can reach it,
+// and the two have come apart here before: a dtype can decode, keep its blocks,
+// and still be absent from the device dispatch, which is exactly the state
+// #2260 found and fixed.
+//
+// So this one starts where a user starts. It writes a GGUF whose tensors are
+// REAL bytes of the staged `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL artifact,
+// opens it with the production reader (`GgufFile::Open` resolves a single-shard
+// path through `GgufFile::OpenOne`), asks the production residency decision what
+// to do with each tensor, and then dots the bytes the READER handed back --
+// never a local copy -- on the device. The expected value is the pinned
+// oracle's own, so a defect anywhere along that chain moves it.
+//
+// The residency half runs everywhere, including the CPU CI leg; only the GEMM
+// half needs a device.
+//
+// It is NOT a red-first discriminator and must not be read as one. Before the
+// kernels landed, `vt::MatmulBTQuant` on a CUDA queue drained the stream and ran
+// the CPU keep-quant kernel over the same unified tensors, which returns the
+// oracle's bits exactly -- so this case would have PASSED on the broken tree.
+// That is the point being made: correctness gates cannot see a host fallback,
+// which is why the capture case below exists and why this one is about the
+// CHAIN. Its red comes from the reachability mutation.
+TEST_CASE("a REAL GGUF header carries IQ2_XS / IQ4_XS to the CUDA keep-quant GEMM") {
+  gguf_test::GgufModelBuilder b;
+  // ne0 is the fastest-varying dim: 1024 elements is four whole 256-element
+  // super-blocks of either encoding, which is exactly the golden slice.
+  b.AddTensor("blk.3.ffn_gate_exps.weight", {1024}, 17,
+              std::string(reinterpret_cast<const char*>(vllm_test::kIq2xsGoldenBlocks),
+                          sizeof(vllm_test::kIq2xsGoldenBlocks)));
+  b.AddTensor("blk.11.ffn_down_exps.weight", {1024}, 23,
+              std::string(reinterpret_cast<const char*>(vllm_test::kIq4xsGoldenBlocks),
+                          sizeof(vllm_test::kIq4xsGoldenBlocks)));
+  const gguf_test::TempFile f(b.Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  struct Arm {
+    const char* tensor;
+    uint32_t ggml_type;
+    DType dtype;
+    size_t block_bytes;
+    uint32_t seed;
+    const uint32_t* per_block;
+  };
+  const Arm arms[] = {
+      {"blk.3.ffn_gate_exps.weight", 17U, DType::kIQ2_XS, 74U, 0x2247U,
+       vllm_test::kIq2xsDotPerBlockBits},
+      {"blk.11.ffn_down_exps.weight", 23U, DType::kIQ4_XS, 136U, 0x4247U,
+       vllm_test::kIq4xsDotPerBlockBits},
+  };
+
+  const bool cuda = HasCuda();
+  if (!cuda) MESSAGE("no CUDA backend on this host; only the residency half of this chain runs");
+
+  int64_t dotted = 0;
+  for (const Arm& arm : arms) {
+    const std::string tensor(arm.tensor);
+    CAPTURE(tensor);
+    const vllm::GgufTensorInfo& t = g.Get(arm.tensor);
+    REQUIRE(t.ggml_type == arm.ggml_type);
+    REQUIRE(t.nbytes == 4U * arm.block_bytes);
+
+    // The production residency decision. It must answer keep-quant, because an
+    // EXPANDED tensor never reaches a keep-quant GEMM at all -- which is the
+    // other way this chain can break, and the way #2245 found it broken.
+    // `[out=1, in=1024]` is the `kMatmulWeight` orientation `KeepQuantKDim`
+    // reads (shape[1] is K); the real artifact stores these towers stacked as
+    // `kStackedExpertWeight` `[E, out, in]`, which takes shape[2] and is
+    // already gated in tests/vllm/test_gguf_keep_quant.cpp. Both land on the
+    // same encoding rule, and this file exercises the one whose K matches the
+    // four super-blocks it then dots.
+    const vllm::GgufResidency res = vllm::RouteGgufTensor(
+        /*keep_quant=*/true, /*keep_f16=*/true, /*nvfp4_fp4=*/false,
+        /*cpu_ref=*/false, vllm::GgufTensorRole::kMatmulWeight,
+        arm.ggml_type, {1, 1024});
+    CHECK(res == vllm::GgufResidency::kKeepQuant);
+
+    if (!cuda) continue;
+    Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+    Queue gq = gpu.CreateQueue();
+    std::vector<float> act(1024);
+    MakeDotActivation(1024, arm.seed, act.data());
+
+    void* d_a = gpu.Alloc(act.size() * sizeof(float));
+    void* d_w = gpu.Alloc(t.nbytes);
+    void* d_o = gpu.Alloc(sizeof(float));
+    gpu.Copy(gq, d_a, act.data(), act.size() * sizeof(float));
+    gpu.Copy(gq, d_w, t.data, t.nbytes);   // the READER's bytes, not a copy of ours
+    gpu.Synchronize(gq);
+
+    for (int blk = 0; blk < 4; ++blk) {
+      CAPTURE(blk);
+      const float poison = kPoison;
+      gpu.Copy(gq, d_o, &poison, sizeof(float));
+      gpu.Synchronize(gq);
+      Tensor at = DevTensor(static_cast<uint8_t*>(d_a) + blk * 256 * sizeof(float),
+                            DType::kF32, {1, 256});
+      Tensor wt = DevTensor(static_cast<uint8_t*>(d_w) + blk * arm.block_bytes,
+                            arm.dtype, {1, 256});
+      Tensor ot = DevTensor(d_o, DType::kF32, {1, 1});
+      vt::MatmulBTQuant(gq, ot, at, wt);
+      float got = 0.0F;
+      gpu.Copy(gq, &got, d_o, sizeof(float));
+      gpu.Synchronize(gq);
+      REQUIRE(std::isfinite(got));
+      CHECK(got != kPoison);
+      CAPTURE(got);
+      CHECK(FloatBits(got) == arm.per_block[blk]);
+      ++dotted;
+    }
+    gpu.Free(d_a);
+    gpu.Free(d_w);
+    gpu.Free(d_o);
+    gpu.DestroyQueue(gq);
+  }
+  CAPTURE(dotted);
+  CHECK(dotted == (cuda ? 8 : 0));
+}
+
 TEST_CASE("CUDA keep-quant runs every kCases dtype INSIDE a stream capture") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend on this host; keep-quant capture gate skipped");

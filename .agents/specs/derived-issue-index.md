@@ -15,6 +15,26 @@ same move [now-derived.md](now-derived.md) made for `.agents/NOW.md`.
 write, and it is the one the invariant #364 added to `AGENTS.md` cannot protect —
 because that invariant admits a shape GitHub does not implement.
 
+## The tracker was pruned while this row was in flight
+
+**Recorded 2026-08-30.** Between this row's measurements and its landing, the
+GitHub tracker went from 707 open issues to 89. Of the 889 issues in the retired
+index, **817 no longer exist on GitHub**, including every issue this spec cites:
+#364, #467, #883, #1808, #2157, #2290, #2298 and #2316. Pull request #2322, which
+carried this work, is also gone. The branch and its commits were untouched.
+
+Nothing in this spec is withdrawn. Every measurement below was taken at
+`origin/main` `e541be98` on 2026-08-29 and is stamped to that revision, so it
+reads as a measurement at a revision rather than a claim about today. The
+argument is also strengthened rather than weakened: a TRACKED index would now be
+85% stale, and only a derived one can follow a change of that size.
+
+Two things follow for a reader. A cited number that 404s is resolvable in
+[`../completed/issue-index.md`](../completed/issue-index.md), which carries all
+889 rows with their full text and is now the only record of the deleted 817.
+And this row's landing preserves that archive: before it merged, the archive
+existed only on an unmerged branch.
+
 ## Scope
 
 **In scope.** `.agents/issue-index.md` and its `merge=union` attribute; the four

@@ -166,6 +166,30 @@ is a performance question for a later wave, not a correctness one.
 describes. It exercises the state cache, the boundary gate and the two-pass merge
 without the hardest part.
 
+#### The `c128a` selection is ARITHMETIC, not a learned top-k
+
+The last unknown in W1's shape, and it resolves in W1's favour. The compressed
+pass needs an index list, and the name upstream gives it --
+`c128a_global_decode_topk_indices` -- reads like the Lightning Indexer's output.
+It is not.
+
+`sparse_mla.py:126-129` calls the field "Pre-computed C128A metadata
+(compress_ratio == 128 only). Decode: global slot ids + valid-entry counts
+**(fused from positions)**", and `_build_c128a_metadata` asserts
+`cm.positions is not None` because positions are its only input. The selection is
+therefore arithmetic over the current position -- which compressed windows have
+CLOSED -- and carries no learned component at all.
+
+That is what makes `compress_ratio == 128` the right first shape. It needs:
+
+- the compressor cycle (landed: `CompressorStepCycle`),
+- a window pass and a compressed pass merged by LSE (proven equivalent above),
+- and an index list computable from `positions` alone.
+
+The Lightning Indexer, which DOES learn its selection, belongs only to the
+`compress_ratio == 4` layers and therefore to W3. A reader who assumed "topk
+implies indexer" would have pulled W3's hardest dependency into W1 for no reason.
+
 #### THE SINK MUST ENTER EXACTLY ONE PASS
 
 The trap, written down before anyone hits it. A sink is one extra logit in the

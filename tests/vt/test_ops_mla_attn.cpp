@@ -414,6 +414,79 @@ TEST_CASE("mla_decode CPU single block, single token") {
   }
 }
 
+TEST_CASE("mla_decode CPU: the per-head attention SINK is denominator-only") {
+  // `KV-DSV4-MULTICACHE` W5 (#2323). DeepSeek-V4 carries a per-head attention
+  // sink -- one extra logit that joins the softmax DENOMINATOR and contributes
+  // NO value, so a row can attend to "nothing"
+  // (`vllm/models/deepseek_v4/attention.py:218-222`). The shared MLA seam could
+  // not express it; `MlaDecodeAttentionArgs::attn_sink` is the extension.
+  //
+  // GATED ON THE SINGLE-KEY CASE BECAUSE IT HAS A CLOSED FORM. With one key the
+  // row is `softmax([qk, sink])`, so
+  //     out = V * exp(qk) / (exp(qk) + exp(sink)) = V * sigmoid(qk - sink)
+  // and `qk` is recoverable from the NO-SINK run's `lse`, which is
+  // `m + log(l) = qk + log(1) = qk`. The expectation is therefore built from a
+  // `sigmoid` written HERE, not from a second run of the path under test.
+  const Case c = MakeCase({1}, kHeadsLite, 31u);
+  REQUIRE(c.max_blocks == 1);
+
+  MlaDecodeAttentionArgs base;
+  base.scale = static_cast<float>(LiteScale());
+  std::vector<float> no_sink;
+  std::vector<float> lse;
+  RunCpu(c, no_sink, &lse, base);
+
+  // 1. A sink of -inf is NO sink: `exp(-inf - m)` adds nothing to the
+  //    denominator. BIT-IDENTICAL, not approximate -- drift here would mean the
+  //    seeding changed the reduction rather than only its starting point.
+  std::vector<float> neg_inf(static_cast<size_t>(c.heads),
+                             -std::numeric_limits<float>::infinity());
+  Tensor t_neg = Contig(neg_inf.data(), DType::kF32, Cpu(), {c.heads});
+  MlaDecodeAttentionArgs args_neg = base;
+  args_neg.attn_sink = &t_neg;
+  std::vector<float> got_neg;
+  RunCpu(c, got_neg, nullptr, args_neg);
+  REQUIRE(got_neg.size() == no_sink.size());
+  bool bit_identical = true;
+  for (size_t i = 0; i < got_neg.size(); ++i)
+    if (got_neg[i] != no_sink[i]) bit_identical = false;
+  CHECK(bit_identical);
+
+  // 2. A FINITE sink removes mass, by exactly `sigmoid(qk - sink)`.
+  std::vector<float> sink(static_cast<size_t>(c.heads), 0.0f);
+  for (int h = 0; h < c.heads; ++h) {
+    // Offset from this head's OWN `qk`, so every head exercises a different,
+    // non-degenerate weight instead of all landing on the same one. The offset
+    // CYCLES rather than growing: an unbounded one drives `sigmoid` to 1 for the
+    // later heads, which the interiority REQUIRE below rejected when this case
+    // was first written -- a weight of ~1 would pass against a kernel that
+    // ignored the sink.
+    sink[static_cast<size_t>(h)] =
+        lse[static_cast<size_t>(h)] - (0.4F + 0.2F * static_cast<float>(h % 4));
+  }
+  Tensor t_sink = Contig(sink.data(), DType::kF32, Cpu(), {c.heads});
+  MlaDecodeAttentionArgs args_sink = base;
+  args_sink.attn_sink = &t_sink;
+  std::vector<float> got;
+  RunCpu(c, got, nullptr, args_sink);
+
+  int checked = 0;
+  for (int h = 0; h < c.heads; ++h) {
+    const float qk = lse[static_cast<size_t>(h)];
+    const float w = 1.0F / (1.0F + std::exp(sink[static_cast<size_t>(h)] - qk));
+    // The weight must be genuinely INTERIOR: if it collapsed to 1 the case
+    // would pass against a kernel that ignored the sink entirely.
+    REQUIRE(w > 0.05F);
+    REQUIRE(w < 0.95F);
+    for (int d = 0; d < c.v_head_dim; d += 97) {
+      const size_t i = static_cast<size_t>(h) * c.v_head_dim + d;
+      CHECK(got[i] == doctest::Approx(no_sink[i] * w).epsilon(1e-5));
+      ++checked;
+    }
+  }
+  REQUIRE(checked > 0);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // CUDA (the two-stage split-KV port) vs the CPU reference.
 // ───────────────────────────────────────────────────────────────────────────

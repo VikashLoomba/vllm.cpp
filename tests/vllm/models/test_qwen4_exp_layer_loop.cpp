@@ -509,8 +509,17 @@ TEST_CASE(
   const int64_t state_len = p.ple.short_conv_state_len();
   std::vector<float> ple_conv(static_cast<size_t>(kStream * state_len), 0.0F);
   std::vector<int64_t> ple_tok(static_cast<size_t>(p.ple.ngram_size - 1), 0);
-  vllm::dense_attn::DBuf ple_conv_b(d, DType::kF32, {1, kStream, state_len},
-                                    ple_conv.data());
+  // THE RING CARRIES THE STREAM DTYPE (W5k, #2031). It was f32 against a bf16
+  // loop, which upstream cannot produce: each cache slot is allocated with the
+  // dtype of the tensor that first reaches it (`cache_utils.py:1019-1023`), and
+  // the tensor reaching this one is `hidden_states`
+  // (`modeling_qwen4_exp.py:1157-1159`). THE GOLDEN DOES NOT MOVE, and that is a
+  // property rather than luck: on a `past_len == 0` call the block zeroes the ring
+  // on entry and the conv only WRITES it at the end, so nothing reads a ring value
+  // and its dtype cannot reach a single output. It would have reached the answer at
+  // the first continuing step, which is what W5k makes possible.
+  vllm::dense_attn::DBuf ple_conv_b(d, vllm::kQwen4ExpStreamDType,
+                                    {1, kStream, state_len}, ple_conv.data());
   caches.ple.resize(1);
   caches.ple[0].conv_state = ple_conv_b.t();
   caches.ple[0].tokens = vllm::dense_attn::MakeTensor(
@@ -870,12 +879,24 @@ TEST_CASE(
   in2.gdn_state_slots = 1;
   const std::string past_len_msg = refusal_message(
       in2,
-      "ModelRegistry::Forward returned on a step at past_len 1; the "
-      "single-shot-prefill refusal is gone");
+      "ModelRegistry::Forward returned on a step at past_len 1 with NO by-name "
+      "cache index; the scratch-arm refusal is gone");
   INFO("the past_len refusal said: ", past_len_msg);
   CHECK(past_len_msg.find("Qwen4ExpForConditionalGeneration") !=
         std::string::npos);
-  CHECK(past_len_msg.find("SINGLE-SHOT") != std::string::npos);
+  // W5k: THE REFUSAL IS NOW ABOUT THIS ARM, NOT ABOUT THE MODEL. It used to say
+  // the hook served a "SINGLE-SHOT PREFILL" because the PLE states could not
+  // persist at all; they persist now, in the engine's own recurrent group, and a
+  // continuing step on the BY-NAME arm returns a token (see the by-name case).
+  // What is refused here is the POSITIONAL arm specifically: nothing published
+  // the PLE states, so the hook allocates them per call, and a per-call buffer is
+  // zeroed on entry — every step would re-seed the history with EOS and decode as
+  // though each token were the first.
+  CHECK(past_len_msg.find("NO by-name cache index") != std::string::npos);
+  // The word that named the OLD limit must be GONE, not merely joined by a new
+  // one: a message that still claims a single-shot-prefill hook would send the
+  // next reader to rebuild what this wave landed.
+  CHECK(past_len_msg.find("SINGLE-SHOT") == std::string::npos);
   // The VALUE, not only the word: the hook reports the past_len it was handed.
   CHECK(past_len_msg.find("at past_len 1") != std::string::npos);
   // It stopped at the boundary and never entered the loop, so the PLE layout
@@ -1570,4 +1591,334 @@ TEST_CASE(
     CHECK(m.find(kPle) == std::string::npos);
     CHECK(m.find(kEngine) == std::string::npos);
   }
+}
+
+// ─── A SECOND STEP: THE DECODE (W5k, #2031) ──────────────────────────────────
+//
+// Every case above serves ONE step. This one runs TWO through
+// `ModelRegistry::Forward` over caches that PERSIST between them, which is the
+// thing the row has been unable to do since W5c published the topology:
+// `past_len > 0` was refused because the recurrent group publishes the PLE conv
+// ring at the model dtype and the n-gram history on the device, while
+// `RunQwen4ExpPleBlock` required an f32 ring and a host history.
+//
+// W5k settled which side was wrong by INSTALLING the lane oracle rather than
+// reasoning from this tree's convention — transformers 5.16.0,
+// `models/qwen4_exp/modeling_qwen4_exp.py` sha256 77fec77d…c459, the pin
+// `scripts/gen-qwen4-exp-forward-goldens.py` asserts — and reading the running
+// model. It types each cache slot from the tensor that first reaches it
+// (`cache_utils.py:1019-1023`), so the ring carries the MODEL dtype (observed:
+// `conv_states[1] dtype=torch.bfloat16` on a bf16 run) and the history carries
+// `input_ids.long()` on `input_ids.device` (`:1070`, `:1089-1091`). The
+// PUBLISHER was right twice and both requirements moved to the block.
+//
+// ─── WHAT THIS GATES, AND WHY NOT BY VALUE ───────────────────────────────────
+// W5j MEASURED that this fixture cannot gate cache CONTENT: across two prompts,
+// 0 of 128 indexer words and 0 of 192 paged K/V words moved while the logits
+// moved 31.84, because layer-3 activations sit near 2^18 where one bf16 ULP is
+// ~1024 and the store saturates. A rescaled fixture is owed. So nothing here
+// asserts a cache VALUE.
+//
+// What it asserts instead is the one cross-step observable that CANNOT saturate:
+// the n-gram history is int64 TOKEN IDS. Upstream keeps the last
+// `ngram_size - 1` raw ids and rolls them every step — measured on the pinned
+// oracle over four steps of the prompt [5,9,13,3,7,2]:
+//
+//     after prefill      ngram_history = [7, 2]      (the prompt's last two)
+//     after decode 11    ngram_history = [2, 11]
+//     after decode 4     ngram_history = [11, 4]
+//     after decode 3     ngram_history = [4, 3]
+//
+// That is a FIFO whose contents are exact integers at any dtype, so the
+// assertions below read the engine's own recurrent state and compare it to ids,
+// not to a rounded activation. And the step-2 read's WRITER IS A PRIOR CALL,
+// which is the property W5j's single-step cases could not have.
+TEST_CASE("qwen4_exp: a SECOND step decodes on the engine's own persistent caches") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  constexpr int64_t kQsaLayer = 3;
+  constexpr int64_t kGdnLayers = 3;
+  constexpr int64_t kPleLayer = 1;   // ple_layer_ids = [2], one-based
+  constexpr int64_t T1 = 6;          // the prefill
+  constexpr int64_t kPage = 4;
+  constexpr int64_t kCols = 3;       // T1 + 1 token spans 2 pages; 3 is slack
+  constexpr int64_t kBlocks0 = 4;
+  constexpr int64_t kBlocks2 = 5;
+  const int64_t kIdxRows = kBlocks2 * kPage;
+
+  // The recurrent state geometry, exactly as `MakeQwen4ExpKVCache` publishes it.
+  const int64_t kConvDim = 2 * kKeyDim + kValueDim;
+  const int64_t kGdnConvLen = kConvKernel - 1;
+  const int64_t kSsmRow = kNumVHeads * kLinHeadDim * kLinHeadDim;
+  const int64_t kPleStateLen = (kConvKernel - 1) * kNgramSize;  // DILATED: 9
+  const int64_t kCtx = kNgramSize - 1;                          // 2
+
+  const std::vector<int32_t> bt0{2, 0, 3};
+  const std::vector<int32_t> bt2{1, 3, 4};
+  const std::vector<int32_t> bt_recurrent{0};
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  // ─── THE CACHES, ALLOCATED ONCE AND SHARED BY BOTH STEPS ──────────────────
+  // This is the whole point: a per-call scratch is zeroed on entry, so a second
+  // step over one would re-seed the n-gram history with EOS and re-zero the ring
+  // and the model would decode as though each token were the first.
+  std::vector<std::vector<unsigned char>> st_gdn_conv(kGdnLayers),
+      st_ssm(kGdnLayers), st_ple_conv(kGdnLayers);
+  std::vector<std::vector<int64_t>> st_ngram(kGdnLayers);
+  std::vector<vllm::dense_attn::DBuf> b_gdn_conv, b_ssm, b_ple_conv, b_ngram;
+  std::vector<vllm::GdnStateCache> gdn(kGdnLayers);
+  b_gdn_conv.reserve(kGdnLayers); b_ssm.reserve(kGdnLayers);
+  b_ple_conv.reserve(kGdnLayers); b_ngram.reserve(kGdnLayers);
+  for (int i = 0; i < kGdnLayers; ++i) {
+    st_gdn_conv[i].assign(static_cast<size_t>(kConvDim * kGdnConvLen) * sizeof(float), 0);
+    st_ssm[i].assign(static_cast<size_t>(kSsmRow) * sizeof(float), 0);
+    st_ple_conv[i].assign(
+        static_cast<size_t>(qwen4_exp_fixture::kStream * kPleStateLen) *
+            vt::SizeOf(vllm::kQwen4ExpStreamDType), 0);
+    st_ngram[i].assign(static_cast<size_t>(kCtx), 0);
+    b_gdn_conv.emplace_back(d, DType::kF32,
+                            std::vector<int64_t>{1, kConvDim, kGdnConvLen},
+                            st_gdn_conv[i].data());
+    b_ssm.emplace_back(d, DType::kF32,
+                       std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+                       st_ssm[i].data());
+    // THE RING AT THE MODEL DTYPE and the HISTORY ON THIS STEP'S DEVICE — the
+    // two the publisher declares and the two the block refused before W5k.
+    b_ple_conv.emplace_back(d, vllm::kQwen4ExpStreamDType,
+                            std::vector<int64_t>{1, qwen4_exp_fixture::kStream,
+                                                 kPleStateLen},
+                            st_ple_conv[i].data());
+    b_ngram.emplace_back(d, DType::kI64, std::vector<int64_t>{1, kCtx},
+                         st_ngram[i].data());
+    gdn[static_cast<size_t>(i)].conv_state = b_gdn_conv.back().t();
+    gdn[static_cast<size_t>(i)].ssm_state = b_ssm.back().t();
+    // THE PUBLISHED ORDER: [gdn_conv, temporal, ple_conv, ngram]. Filled by
+    // `GPUModelRunner::initialize_kv_cache` in production; filled here because
+    // this case stands in for it.
+    gdn[static_cast<size_t>(i)].states = {b_gdn_conv.back().t(), b_ssm.back().t(),
+                                          b_ple_conv.back().t(), b_ngram.back().t()};
+  }
+  REQUIRE(gdn[kPleLayer].states.size() == 4);
+
+  std::vector<uint16_t> kv(
+      static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                              {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+  constexpr uint16_t kPoison = 0x3F80;
+  std::vector<uint16_t> idx(static_cast<size_t>(kIdxRows * kIdxHeadDim), kPoison);
+  vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
+                               idx.data());
+
+  std::vector<vllm::PagedKvCache> attn_kv(2);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = kBlocks0;
+  attn_kv[0].block_size = kPage;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+  attn_kv[1].data = idx_b.t().data;
+  attn_kv[1].dtype = DType::kBF16;
+  attn_kv[1].num_blocks = kBlocks2;
+  attn_kv[1].block_size = kPage;
+  attn_kv[1].num_kv_heads = kIdxKvHeads;
+  attn_kv[1].head_size = kIdxHeadDim;
+
+  std::vector<std::string> names;
+  std::vector<int32_t> group_ids, layer_indices, payload_slots;
+  std::vector<uint8_t> payload_kinds;
+  names.push_back("model.layers." + std::to_string(kQsaLayer) + ".self_attn.attn");
+  group_ids.push_back(0);
+  layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+  payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+  payload_slots.push_back(0);
+  for (int i = 0; i < kGdnLayers; ++i) {
+    names.push_back("model.layers." + std::to_string(i) + ".linear_attn");
+    group_ids.push_back(1);
+    layer_indices.push_back(i);
+    payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kRecurrent));
+    payload_slots.push_back(i);
+  }
+  names.push_back("model.layers." + std::to_string(kQsaLayer) +
+                  ".self_attn.indexer.k_cache");
+  group_ids.push_back(2);
+  layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+  payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+  payload_slots.push_back(1);
+
+  std::vector<std::vector<int32_t>> group_tables{bt0, bt_recurrent, bt2};
+  std::vector<int32_t> group_cols{static_cast<int32_t>(kCols), 1,
+                                  static_cast<int32_t>(kCols)};
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+  mk.group_ids = &group_ids;
+  mk.layer_indices = &layer_indices;
+  mk.payload_kinds = &payload_kinds;
+  mk.payload_slots = &payload_slots;
+  mk.group_block_tables = &group_tables;
+  mk.group_block_table_cols = &group_cols;
+
+  // The physical slot a logical position lands on under group 0's table.
+  const auto slot_of = [&](int64_t t) {
+    return static_cast<int32_t>(bt0[static_cast<size_t>(t / kPage)] * kPage + t % kPage);
+  };
+
+  // ─── ONE STEP, OVER THE CACHES ABOVE ──────────────────────────────────────
+  struct Step { std::vector<float> logits; int64_t vocab = 0; int64_t token = -1; };
+  const auto run = [&](const std::vector<int32_t>& tok_ids, int64_t past_len) {
+    const auto T = static_cast<int64_t>(tok_ids.size());
+    std::vector<int32_t> pos(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      pos[static_cast<size_t>(t)] = static_cast<int32_t>(past_len + t);
+
+    vllm::v1::CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = static_cast<int>(T);
+    am.max_query_len = static_cast<int>(T);
+    am.query_start_loc.assign({0, static_cast<int32_t>(T)});
+    am.seq_lens.assign(1, static_cast<int32_t>(past_len + T));
+    am.block_table_tensor = bt0;
+    am.block_table_num_cols = static_cast<int>(kCols);
+    am.max_seq_len = static_cast<int>(past_len + T);
+    am.slot_mapping.resize(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      am.slot_mapping[static_cast<size_t>(t)] = slot_of(past_len + t);
+
+    vllm::v1::GDNAttentionMetadata gm;
+    gm.num_actual_tokens = static_cast<int>(T);
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+    if (past_len == 0) {
+      gm.num_prefills = 1;
+      gm.num_prefill_tokens = static_cast<int>(T);
+      gm.has_initial_state = std::vector<uint8_t>{0};
+      gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+      gm.prefill_state_indices = std::vector<int32_t>{0};
+      // `prefill_has_initial_state == 0` IS upstream's
+      // `has_previous_state(layer_idx, state_idx=2) == False`, which is the
+      // branch that seeds the n-gram history with `eos_token_id` rather than
+      // trusting the zero-filled cache (`modeling_qwen4_exp.py:1073-1076`).
+      // ZERO IS A VALID TOKEN ID, so that seed is not decoration.
+      gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+      const auto conv =
+          vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+      gm.batch_ptr = conv.batch_ptr;
+      gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+    } else {
+      // A PURE DECODE. Upstream populates `has_initial_state` only when there is
+      // a prefill (`gdn_attn.py:389-405`), and the single-token update kernel is
+      // selected instead of the conv program map.
+      gm.num_decodes = 1;
+      gm.num_decode_tokens = static_cast<int>(T);
+    }
+
+    const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+    vllm::ModelForwardInput in{tok_ids, pos,    am, gm, attn_kv,
+                               gdn,     config, q,  logits_indices};
+    in.num_reqs = 1;
+    in.gdn_state_slots = 1;
+    in.multi_kv = &mk;
+
+    Step out;
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+    REQUIRE(fl.on_device());
+    REQUIRE(fl.rows == 1);
+    out.vocab = fl.vocab;
+    out.logits.assign(static_cast<size_t>(fl.rows * fl.vocab), 0.0F);
+    d.b.Copy(q, out.logits.data(), fl.device_tensor.data,
+             out.logits.size() * sizeof(float));
+    d.b.Synchronize(q);
+    {
+      std::vector<int64_t> t1(1, -1);
+      vllm::dense_attn::DBuf tok_b(d, DType::kI64, {1});
+      vt::Tensor tt = tok_b.t();
+      vt::GreedyArgmax(q, tt, fl.device_tensor);
+      tok_b.Download(d, t1.data());
+      out.token = t1[0];
+    }
+    return out;
+  };
+
+  // The prompt carries an EOS in the INTERIOR, which is a segment boundary in
+  // the hashed n-gram construction, so the ids after it are not a straight ramp.
+  std::vector<int32_t> prompt{5, 9, 13, static_cast<int32_t>(kEosTokenId), 7, 2};
+  REQUIRE(static_cast<int64_t>(prompt.size()) == T1);
+  for (int32_t v : prompt) REQUIRE(v < static_cast<int32_t>(kVocab));
+
+  // ─── STEP 1: THE PREFILL ──────────────────────────────────────────────────
+  Step s1;
+  REQUIRE_NOTHROW(s1 = run(prompt, /*past_len=*/0));
+  CHECK(s1.vocab == kVocab);
+  for (float v : s1.logits) REQUIRE(std::isfinite(v));
+  CHECK(s1.token >= 0);
+  CHECK(s1.token < s1.vocab);
+  MESSAGE("qwen4_exp STEP 1 (prefill, T=" << T1 << ") sampled token " << s1.token);
+
+  // THE HISTORY THE PREFILL LEFT BEHIND is the prompt's last `ngram_size - 1`
+  // ids — upstream's `[7, 2]` for this prompt. Read out of the ENGINE's own
+  // recurrent state, and compared to the INPUT IDS rather than to a value read
+  // back from the cache before the run, so a cache that was never written fails.
+  std::vector<int64_t> hist(static_cast<size_t>(kCtx), -1);
+  b_ngram[kPleLayer].Download(d, hist.data());
+  for (int64_t i = 0; i < kCtx; ++i) {
+    INFO("history slot ", i);
+    CHECK(hist[static_cast<size_t>(i)] ==
+          static_cast<int64_t>(prompt[static_cast<size_t>(T1 - kCtx + i)]));
+  }
+
+  // NOTHING WAS WRITTEN TO THE OTHER LAYERS' PLE SLOTS. Only layer 1 carries a
+  // PLE block, and the uniform recurrent group gives all three linear layers the
+  // same state set; a hook that indexed the PLE cache by DECODER layer index
+  // instead of by rank among linear layers would write layer 2's or layer 3's.
+  for (int i = 0; i < kGdnLayers; ++i) {
+    if (i == kPleLayer) continue;
+    std::vector<int64_t> other(static_cast<size_t>(kCtx), -1);
+    b_ngram[static_cast<size_t>(i)].Download(d, other.data());
+    INFO("linear layer ", i, " must own no PLE history");
+    CHECK(other == std::vector<int64_t>(static_cast<size_t>(kCtx), 0));
+  }
+
+  // ─── STEP 2: THE DECODE — past_len > 0, ON THE SAME BUFFERS ───────────────
+  // This is the call every wave since W5c has been refused at.
+  const std::vector<int32_t> next{static_cast<int32_t>(s1.token)};
+  Step s2;
+  REQUIRE_NOTHROW(s2 = run(next, /*past_len=*/T1));
+  CHECK(s2.vocab == kVocab);
+  for (float v : s2.logits) REQUIRE(std::isfinite(v));
+  CHECK(s2.token >= 0);
+  CHECK(s2.token < s2.vocab);
+  MESSAGE("qwen4_exp STEP 2 (decode, past_len=" << T1 << ", token " << s1.token
+          << ") sampled token " << s2.token);
+
+  // THE FIFO ROLLED, AND THAT IS THE CROSS-STEP GATE. Upstream's history after a
+  // decode is `[previous_last, this_token]` — measured on the pinned oracle as
+  // `[7,2] -> [2,11]` after decoding 11. The first slot must now hold what the
+  // SECOND slot held before the step, which no single-step run can produce and
+  // which a re-seeded scratch would render as `[eos, token]` instead.
+  std::vector<int64_t> hist2(static_cast<size_t>(kCtx), -1);
+  b_ngram[kPleLayer].Download(d, hist2.data());
+  CHECK(hist2[static_cast<size_t>(kCtx - 1)] == s1.token);
+  for (int64_t i = 0; i + 1 < kCtx; ++i) {
+    INFO("rolled slot ", i);
+    CHECK(hist2[static_cast<size_t>(i)] == hist[static_cast<size_t>(i + 1)]);
+  }
+  // And it is NOT the seed a per-call scratch would have produced.
+  const std::vector<int64_t> seeded{static_cast<int64_t>(kEosTokenId), s1.token};
+  CHECK(hist2 != seeded);
+
+  // THE LOGITS MOVED. Step 2 sees a one-token query at position T1 against six
+  // cached keys; step 1 saw six queries. Identical rows would mean the second
+  // call recomputed the first.
+  REQUIRE(s1.logits.size() == s2.logits.size());
+  CHECK(std::memcmp(s1.logits.data(), s2.logits.data(),
+                    s1.logits.size() * sizeof(float)) != 0);
 }

@@ -274,7 +274,7 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
                std::to_string(p.ple.layer_ids_zero_based.size()) +
                " PLE layers");
 
-  const DType dt = DType::kBF16;
+  const DType dt = kQwen4ExpStreamDType;
 
   // ─── :1415  inputs_embeds = self.embed_tokens(input_ids) ──────────────────
   CheckOwned(w.embed_tokens, "embed_tokens", {p.vocab_size, H});

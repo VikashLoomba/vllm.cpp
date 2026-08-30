@@ -228,15 +228,27 @@ HostWeights GoldenHostWeights() {
 // One sequence's two caches, host-resident, sized for the tiny geometry and
 // ZERO-FILLED — which is what `CacheBuffer` hands a layer, and therefore the
 // state the block's own EOS seeding has to correct.
+// THE RING CARRIES THE STREAM'S DTYPE, which is what upstream stores: each cache
+// slot is allocated with the dtype of the tensor that first reaches it
+// (`cache_utils.py:1019-1023`), and the tensor reaching this one is
+// `hidden_states` (`modeling_qwen4_exp.py:1157-1159`). Running the pinned oracle
+// at `dtype=torch.bfloat16` reports `conv_states[1] dtype=torch.bfloat16`; at
+// `float32` it reports `float32`. A fixture that pinned the ring to f32 while the
+// stream ran bf16 was asserting a pair upstream cannot produce, which is exactly
+// how the f32 requirement survived four waves (W5k, #2031).
+//
+// The storage is BYTES so one buffer serves both dtypes; `View(dt)` is what says
+// how wide an element is. Zero-filled either way, and all-zero bits is +0.0 in
+// f32 and bf16 alike.
 struct Caches {
-  std::vector<float> ring;
+  std::vector<unsigned char> ring;
   std::vector<int64_t> tokens;
   Caches()
-      : ring(static_cast<size_t>(kW * kTinyShortConvStateLen), 0.0F),
+      : ring(static_cast<size_t>(kW * kTinyShortConvStateLen) * sizeof(float), 0),
         tokens(static_cast<size_t>(kCtx), 0) {}
-  Qwen4ExpPleCaches View() {
+  Qwen4ExpPleCaches View(DType dt = DType::kF32) {
     Qwen4ExpPleCaches c;
-    c.conv_state = MakeT(ring.data(), DType::kF32, {1, kW, kTinyShortConvStateLen});
+    c.conv_state = MakeT(ring.data(), dt, {1, kW, kTinyShortConvStateLen});
     c.tokens = MakeT(tokens.data(), DType::kI64, {1, kCtx});
     c.state_row = 0;
     return c;
@@ -354,16 +366,23 @@ TEST_CASE("the STREAM DTYPE is inherited: a bf16 arm moves bf16 bytes end to end
   //
   // The ONE f32 buffer in the block is the [T, hc] score, and it is f32 because
   // `vt::Qwen4ExpPleGate` refuses a bf16 score: it is the argument of a sigmoid
-  // and a transcendental's input must not be rounded. The conv ring is f32 for
-  // its own reason — `vt::Qwen4ExpPleConv` admits no other state dtype, because
-  // no kernel exists that would write one.
+  // and a transcendental's input must not be rounded.
+  //
+  // THE CONV RING IS bf16 ON THIS ARM, and until W5k this case passed an f32 ring
+  // into a bf16 stream — the very widening the case's own title says it gates.
+  // The comment that stood here said the ring was "f32 for its own reason:
+  // `vt::Qwen4ExpPleConv` admits no other state dtype, because no kernel exists
+  // that would write one". That was a fact about which KERNELS this tree had, not
+  // about what upstream stores, and the pinned oracle stores the model dtype
+  // (`cache_utils.py:1019-1023`; observed at `conv_states[1] dtype=torch.bfloat16`
+  // on a bf16 run). The op now admits it and the CPU kernel writes it.
   const Qwen4ExpParams p = GoldenParams();
   const qwen4_exp::NGramTableLayout layout = vllm::Qwen4ExpPleLayout(p, 0);
   const Qwen4ExpPleWeights w = GoldenWeights(DType::kBF16);
   const OwnedTensor table =
       OwnedFrom(DType::kBF16, {kTinyPaddedVocabSize, kHd}, kPleNgramEmbeddingWeight);
   Caches c;
-  Qwen4ExpPleCaches cv = c.View();
+  Qwen4ExpPleCaches cv = c.View(DType::kBF16);
   const std::vector<float> got =
       RunChunk(DType::kBF16, w, table, p, layout, kPleHiddenStates, kNgramTokens, nullptr,
                kNgramTotalLen, cv, /*past_len=*/0);

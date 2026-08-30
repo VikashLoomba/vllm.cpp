@@ -1948,11 +1948,35 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
                std::to_string(conv_state.shape[2]) + "]");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
            std::string(name) + ": float x/weight, f32/bf16 out");
-  // f32 state ONLY. `CausalConv1dSpecUpdate` admits bf16 on CUDA because a CUDA
-  // kernel there writes it; no CUDA arm of this op exists, so admitting a dtype
-  // nothing can produce would be a promise with no kernel behind it.
-  VT_CHECK(conv_state.dtype == DType::kF32,
-           std::string(name) + ": conv_state must be f32");
+  // THE STATE CARRIES THE MODEL DTYPE, AND THE ORACLE SETTLES IT (W5k, #2031).
+  // This check read `conv_state.dtype == kF32` and argued that "no CUDA arm of
+  // this op exists, so admitting a dtype nothing can produce would be a promise
+  // with no kernel behind it". The premise was about which KERNELS exist; the
+  // question is what UPSTREAM STORES, and those are different questions. The
+  // second one is now answered from the running oracle rather than from the
+  // shape of this tree.
+  //
+  // transformers 5.16.0 (the `qwen4_exp` lane pin, `.agents/oracles/transformers.md`)
+  // types each cache slot from the tensor that FIRST reaches it, per slot and not
+  // per layer: `cache_utils.py:1019-1023` allocates
+  // `torch.zeros(..., dtype=conv_states.dtype, device=conv_states.device)`. The
+  // tensor reaching the PLE conv slot is `hidden_states`
+  // (`modeling_qwen4_exp.py:1157-1159`, `update_conv_state(..., state_idx=1)`), so
+  // the ring carries the MODEL dtype. Observed, not inferred: the same fixture run
+  // at `dtype=torch.bfloat16` reports `conv_states[1] dtype=torch.bfloat16`, and at
+  // `float32` reports `float32`. It NEVER widens to f32.
+  //
+  // Admitting bf16 is therefore mirroring upstream, and refusing it was the
+  // "dtype that is too wide" AGENTS.md names — the defect class a token gate
+  // cannot see, because the tokens match while the path moves twice the bytes.
+  // The CPU kernel reads and writes the ring through the same `LoadF32At` /
+  // `StoreF32At` accessors it already used for `x` and `out`, so this admits no
+  // dtype that has no kernel behind it. f32 stays accepted and every existing
+  // f32 caller is byte-unchanged.
+  VT_CHECK(conv_state.dtype == DType::kF32 || conv_state.dtype == DType::kBF16,
+           std::string(name) +
+               ": conv_state must be f32 or bf16 (upstream types the slot from "
+               "the model dtype, cache_utils.py:1019-1023)");
   VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous() &&
                conv_state.IsContiguous(),
            std::string(name) + ": x/out/weight/conv_state must be contiguous");

@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -317,18 +318,63 @@ Qwen4ExpPleBlockOutput RunQwen4ExpPleBlock(Dev d, const Qwen4ExpPleWeights& w,
                std::to_string(L) +
                "] — (kernel-1)*ngram_size deep, NOT kernel-1: the conv is DILATED, so "
                "the state is nine columns at the released config and not three");
-  VT_CHECK(conv_state.dtype == DType::kF32 && conv_state.IsContiguous(),
-           "qwen4_exp ple block: conv_state must be a contiguous f32 tensor");
+  // ─── THE RING'S DTYPE IS THE STREAM'S, AND THE ORACLE SETTLES IT (W5k) ────
+  // This required f32 and the recurrent group publishes bf16, which is the pair
+  // that refused `past_len > 0` for four waves. It is not a free choice on either
+  // side: transformers 5.16.0 (`.agents/oracles/transformers.md`, the `qwen4_exp`
+  // lane pin) allocates each cache slot with the dtype of the tensor that first
+  // reaches it — `cache_utils.py:1019-1023`,
+  // `torch.zeros(..., dtype=conv_states.dtype, ...)` — and the tensor reaching
+  // THIS slot is `hidden_states` at `modeling_qwen4_exp.py:1157-1159`. So the ring
+  // carries the MODEL dtype, and running the pinned oracle at bf16 reports
+  // `conv_states[1] dtype=torch.bfloat16` where the f32 arm reports `float32`.
+  //
+  // Requiring EQUALITY with `dt` rather than merely admitting bf16 is the stronger
+  // mirror and the one upstream's own construction states: a ring at any dtype
+  // other than the stream's is a slot upstream cannot produce. It also makes the
+  // publisher's `conv_dtype` and this consumer's stream ONE fact instead of two
+  // that can drift apart in silence.
+  VT_CHECK(conv_state.dtype == dt,
+           std::string("qwen4_exp ple block: conv_state carries ") +
+               vt::Name(conv_state.dtype) +
+               " and the hyper-connection stream carries " + vt::Name(dt) +
+               "; upstream types this cache slot from the model dtype "
+               "(cache_utils.py:1019-1023 over the hidden_states at "
+               "modeling_qwen4_exp.py:1157-1159), so the ring and the stream are "
+               "ONE dtype and never two");
+  VT_CHECK(conv_state.IsContiguous(),
+           "qwen4_exp ple block: conv_state must be contiguous");
   VT_CHECK(tokens.rank == 2 && tokens.shape[1] == ctx && tokens.dtype == DType::kI64 &&
                tokens.IsContiguous(),
            "qwen4_exp ple block: the n-gram history must be a contiguous i64 [N," +
                std::to_string(ctx) +
                "] — int64 because it holds TOKEN IDS, and a float store would ROUND them");
-  VT_CHECK(tokens.device.type == vt::DeviceType::kCPU,
-           "qwen4_exp ple block: the n-gram history is read and written on the HOST, "
-           "because the splitmix64 hash that consumes it is a host int64 computation and "
-           "no vt:: op computes it; a device-resident history needs the hash on the "
-           "device, which the spec's `## Owed` records");
+  // ─── RESIDENCY IS THE ENGINE'S, AND THE HASH STAGES AROUND IT (W5k) ───────
+  // This refused anything but a HOST tensor, and the recurrent group publishes a
+  // DEVICE one — the second half of the pair that refused `past_len > 0`. The
+  // refusal stated a true fact about THIS TREE (the splitmix64 hash at
+  // `qwen4_exp::BuildNGramIds` is a host int64 computation and no `vt::` op
+  // computes it) and turned it into a requirement on the CACHE, which is the
+  // wrong object: where a hash runs does not decide where upstream stores state.
+  //
+  // Upstream stores it on the COMPUTE DEVICE. `modeling_qwen4_exp.py:1070` takes
+  // `input_ids.long()` and `:1089-1091` hands exactly that to
+  // `update_conv_state(..., state_idx=2)`, which allocates the slot with
+  // `device=conv_states.device` (`cache_utils.py:1019-1023`) — so the history
+  // lives wherever `input_ids` live, which on a CUDA run is the GPU. There is no
+  // host-residency contract to mirror, and the publisher was right.
+  //
+  // So the block ACCEPTS either residency and stages the row instead. The state
+  // is `ngram_size - 1` int64s — 16 bytes at the released config — so the
+  // round trip is two copies of one cache line per PLE layer per step, against a
+  // gather over the n-gram table that moves orders of magnitude more. A device
+  // splitmix64 would remove even that and is still worth having; it is recorded
+  // under `## Owed` as an optimization now, rather than as the blocker it was
+  // recorded as before.
+  VT_CHECK(tokens.device.type == vt::DeviceType::kCPU ||
+               tokens.device == d.q.device,
+           "qwen4_exp ple block: the n-gram history must be host-resident or live "
+           "on this step's own device; it is on neither");
   VT_CHECK(caches.state_row >= 0 && caches.state_row < conv_state.shape[0] &&
                caches.state_row < tokens.shape[0],
            "qwen4_exp ple block: state_row is outside one of the two caches");
@@ -348,11 +394,33 @@ Qwen4ExpPleBlockOutput RunQwen4ExpPleBlock(Dev d, const Qwen4ExpPleWeights& w,
   // (cache_utils.py:1053-1060 left-zero-pads), so this only matters when the
   // runner hands back a slot a previous sequence used. Together the two are
   // exactly `qwen4_exp::PleSequenceState::Reset`.
-  auto* hist = tokens.Ptr<int64_t>() + caches.state_row * ctx;
+  // THE ROW IS STAGED ON HOST whichever side it came from. When the cache is
+  // already host-resident `stage` is filled from it and written back to it, which
+  // is byte-identical to the direct pointer walk this replaces; when it is on the
+  // device the same two copies cross the bus. One code path either way, because
+  // two would be two places for the write-back to be forgotten.
+  const bool tokens_on_host = tokens.device.type == vt::DeviceType::kCPU;
+  const size_t hist_bytes = static_cast<size_t>(ctx) * sizeof(int64_t);
+  auto* tokens_row = static_cast<char*>(tokens.data) +
+                     static_cast<size_t>(caches.state_row) * hist_bytes;
+  std::vector<int64_t> stage(static_cast<size_t>(ctx), 0);
+  int64_t* hist = stage.data();
   if (past_len == 0) {
+    // ZERO IS A VALID TOKEN ID: seed with EOS, never with the zero-filled cache.
     for (int64_t i = 0; i < ctx; ++i) hist[i] = p.eos_token_id;
-    float* ring = conv_state.Ptr<float>() + caches.state_row * W * L;
-    for (int64_t i = 0; i < W * L; ++i) ring[i] = 0.0F;
+    // The ring is zeroed by BYTES, which is dtype-agnostic and residency-agnostic
+    // in one stroke: all-zero bits is +0.0 in f32, bf16 and f16 alike, and the
+    // `Ptr<float>()` walk this replaces was wrong on BOTH counts the moment the
+    // ring became a bf16 device buffer.
+    d.b.Memset(d.q,
+               static_cast<char*>(conv_state.data) +
+                   static_cast<size_t>(caches.state_row) * static_cast<size_t>(W * L) *
+                       vt::SizeOf(conv_state.dtype),
+               0, static_cast<size_t>(W * L) * vt::SizeOf(conv_state.dtype));
+  } else if (tokens_on_host) {
+    std::memcpy(hist, tokens_row, hist_bytes);
+  } else {
+    d.b.Copy(d.q, hist, tokens_row, hist_bytes);
   }
 
   // ─── THE MASK'S PAIRED HALF, ENFORCED (spec `## Owed`, since W2) ───────────
@@ -387,6 +455,14 @@ Qwen4ExpPleBlockOutput RunQwen4ExpPleBlock(Dev d, const Qwen4ExpPleWeights& w,
   std::vector<int64_t> ids(static_cast<size_t>(T * heads));
   qwen4_exp::BuildNGramIds(geom, layout, input_ids, T, &hash_state, ids.data());
   for (int64_t i = 0; i < ctx; ++i) hist[i] = hash_state.tokens[static_cast<size_t>(i)];
+  // THE WRITE-BACK IS `update_conv_state(..., state_idx=2)` (:1089-1091) and it is
+  // what makes the NEXT step's `past_len > 0` read a real history rather than the
+  // EOS seed. Unconditional, because the staging buffer is a copy on both arms.
+  if (tokens_on_host) {
+    std::memcpy(tokens_row, hist, hist_bytes);
+  } else {
+    d.b.Copy(d.q, tokens_row, hist, hist_bytes);
+  }
 
   DBuf d_ids(d, DType::kI64, {T * heads}, ids.data());
   // :1114 — `self.ngram_embedding(ngram_ids).flatten(-2)`. The gather emits

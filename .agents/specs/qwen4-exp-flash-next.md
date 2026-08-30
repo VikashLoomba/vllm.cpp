@@ -4039,8 +4039,46 @@ All six mutations were re-run after this refactor.
   same class of error W5h just removed. It blocks multi-step decode either way.
   ISSUE OWED.
 
-  **W5j RE-MEASURED THIS AND IT IS NOW THE LAST STRUCTURAL BLOCKER, WITH TWO
-  CORRECTIONS.** The anchors have moved: the host read of the n-gram history is
+  **W5k SETTLED THIS AGAINST THE ORACLE AND BOTH SIDES NOW AGREE. RESOLVED.**
+  The entry above and the W5j note below it are kept for provenance; the state
+  they describe is gone. W5j STOPPED for the right reason but looked in the wrong
+  place: it read a local `transformers` checkout at `7d06b1a5` and an installed
+  wheel at 5.3.0, when the lane pin is a RELEASE. W5k installed 5.16.0 into a
+  virtual environment, verified `modeling_qwen4_exp.py` sha256
+  `77fec77d87f2a0eb23b95fa04276fb5779698a7c7f523cf5061e49c118bcc459` against the
+  pin, and confirmed the environment by REGENERATING
+  `tests/vllm/models/qwen4_exp_forward_goldens.inc` byte-identically
+  (sha256 `d968a142…05d77`, unchanged). Then it read the running model:
+
+  - **THE CONV RING CARRIES THE MODEL DTYPE, so the PUBLISHER was right and the
+    BLOCK was wrong.** `cache_utils.py:1019-1023` allocates each slot as
+    `torch.zeros(..., dtype=conv_states.dtype, device=conv_states.device)` — PER
+    SLOT, from the tensor that first reaches it — and the tensor reaching this one
+    is `hidden_states` (`modeling_qwen4_exp.py:1157-1159`). OBSERVED, not
+    inferred: the same fixture at `dtype=torch.bfloat16` reports
+    `conv_states[1] dtype=torch.bfloat16`, and at `float32` reports `float32`. It
+    never widens. So `MakeQwen4ExpKVCache`'s bf16 was upstream's answer and the
+    f32 requirement was the "dtype too wide" AGENTS.md names. The block now
+    requires the ring to EQUAL the stream dtype, which is upstream's own
+    construction rather than a widened admission.
+  - **THE N-GRAM HISTORY IS DEVICE-RESIDENT, so the PUBLISHER was right again.**
+    `:1070` takes `input_ids.long()` and `:1089-1091` hands exactly that to
+    `update_conv_state(..., state_idx=2)`, so the slot's device is
+    `input_ids.device` — the compute device. The old refusal stated a true fact
+    about THIS TREE (the splitmix64 hash is a host int64 computation) and turned
+    it into a requirement on the CACHE, which is the wrong object. The block now
+    accepts either residency and stages the row — `ngram_size - 1` int64s, 16
+    bytes at the released config — around its host hash.
+  - **THE EOS SEED ON THE FIRST STEP IS CONFIRMED.** `:1073-1076`: when
+    `has_previous_state(layer_idx, state_idx=2)` is false, `previous_context =
+    input_ids.new_full((B, context_len), self.eos_token_id)`. This tree's
+    `past_len == 0` / `prefill_has_initial_state == 0` branch mirrors it exactly.
+
+  A **DEVICE splitmix64** is still worth having and is now an OPTIMIZATION rather
+  than a blocker: it would remove the two 16-byte copies per PLE layer per step.
+  ISSUE OWED.
+
+  **W5j's RE-MEASUREMENT, kept for provenance (superseded by W5k above).** The anchors have moved: the host read of the n-gram history is
   `:351` and not `:386-389`, and the CPU-residency refusal is its own `VT_CHECK`
   at `:327`. And the reason for `past_len != 0` is now THIS entry alone — before
   W5j the indexer side cache and these two states all had "nowhere to persist",
@@ -4056,17 +4094,31 @@ All six mutations were re-run after this refactor.
   buffer the annotated-exception direction. **Until this is settled no second
   step decodes and the server can serve exactly one forward per sequence.**
 
-- **NOTHING SERVES YET, AND THE SECOND STEP IS STILL THE THING.** `past_len ==
-  0` still refuses (`qwen4_exp_registry.cpp`, the SINGLE-SHOT PREFILL refusal),
-  and no `examples/server` end-to-end and no `docs/USAGE.md` weights row are owed
-  until an arm SERVES. **W5j moved the SECOND of the four blockers and the clause
-  naming the third is now wrong**: this entry read "`GPUModelRunner` still cannot
-  reach this model's hook because the engine guard fires above it", and since W5j
-  the guard passes this architecture and the hook resolves the whole three-group
-  topology by name. What has NOT moved is the one that decides serving: the
-  second step, blocked on the PLE conv dtype and the n-gram history's residency
-  above. A server on this head would answer one forward per sequence and then
-  refuse, which is not serving, so nothing in `docs/` changes yet.
+- **A SECOND STEP DECODES; SERVING IS STILL NOT CLAIMED.** W5k removed the
+  `past_len == 0` refusal and a decode at `past_len = 6` now returns a token
+  through `ModelRegistry::Forward` over the engine's own persistent caches
+  (`test_qwen4_exp_layer_loop.cpp`, "a SECOND step decodes on the engine's own
+  persistent caches"). The clause this replaces said the second step was "blocked
+  on the PLE conv dtype and the n-gram history's residency"; both are settled
+  above. What remains before an `examples/server` end-to-end or a
+  `docs/USAGE.md` weights row is owed:
+
+  - `num_reqs > 1` is still refused. `RunQwen4ExpQsaBlockPaged` takes a
+    `block_table` of i32 `[1, max_pages]`, so a ragged multi-request batch needs
+    `query_start_loc` plumbing no block on this row carries. ISSUE OWED.
+  - The POSITIONAL arm still serves one shot, and that is now a statement about
+    that arm rather than about the model: nothing publishes the PLE states there,
+    so the hook allocates them per call and a per-call buffer is zeroed on entry.
+    Refused on the same predicate that routes.
+  - `GPUModelRunner` has not been driven end to end; the two steps above are
+    assembled the way the runner assembles one, not BY the runner. ISSUE OWED.
+  - The FIXTURE still cannot gate cache CONTENT (W5j measured 0 of 128 indexer
+    words and 0 of 192 paged K/V words moving while logits moved 31.84; layer-3
+    activations sit near 2^18 where one bf16 ULP is ~1024). W5k gates the
+    cross-step path on the n-gram history's INTEGER token ids, which cannot
+    saturate, and asserts no cache value. A RESCALED fixture stays owed.
+
+  So no `docs/` surface changes in this wave.
 
 - **CLOSED BY W5g, AND ITS DIAGNOSIS WAS HALF RIGHT.** The entry below is kept
   because its measurement is what bought the fix, and because BOTH repairs it
@@ -5915,6 +5967,89 @@ and three things are still owed before a single cell of that table exists.
   or removing the guard and saying what replaces it. Owned by
   `MODEL-MM-QWEN4-EXP`; NO ISSUE NUMBER, GitHub writes are `403`.
 
+## Mutation record — W5k (#2031)
+
+**THE ORACLE, AND HOW IT WAS PROVED TO BE THE ORACLE.** W5j stopped rather than
+guess, and it was right to; it looked in the wrong place. The lane pin is a
+RELEASE, not a checkout: `transformers` **5.16.0**. W5k created a virtual
+environment, installed it, and checked three things before reading a line of it:
+
+| Check | Result |
+|---|---|
+| `transformers.__version__` on a live import | `5.16.0` |
+| `models/qwen4_exp/modeling_qwen4_exp.py` sha256 | `77fec77d87f2a0eb23b95fa04276fb5779698a7c7f523cf5061e49c118bcc459` — the pin |
+| `scripts/gen-qwen4-exp-forward-goldens.py` regenerates the committed golden | sha256 `d968a142…05d77` before and after; `git status` clean |
+
+The third is the one that makes it an instrument rather than a download: the
+environment reproduces this row's existing committed golden byte-for-byte.
+
+**WHAT THE RUNNING MODEL SAID.** A two-step probe over the row's own fixture
+geometry, at both `float32` and `bfloat16`:
+
+| Model dtype | `conv_states[1]` (PLE ring) | `conv_states[2]` (n-gram history) |
+|---|---|---|
+| `torch.float32` | `float32`, `(1, 16, 9)` | `int64`, `(1, 2)`, device `cpu` |
+| `torch.bfloat16` | **`bfloat16`**, `(1, 16, 9)` | `int64`, `(1, 2)`, device `cpu` |
+
+The ring FOLLOWS the model dtype and never widens. Mechanism:
+`cache_utils.py:1019-1023` allocates each slot as `torch.zeros(...,
+dtype=conv_states.dtype, device=conv_states.device)` — per SLOT, from the tensor
+that first reaches it — and the tensor reaching slot 1 is `hidden_states`
+(`modeling_qwen4_exp.py:1157-1159`). Slot 2 is fed `input_ids.long()` (`:1070`)
+at `:1089-1091`, so it is i64 on `input_ids.device`, the COMPUTE device. Both
+publisher-side declarations in `MakeQwen4ExpKVCache` were correct and both
+`RunQwen4ExpPleBlock` requirements were the wrong side.
+
+The cross-step observable, over the prompt `[5,9,13,3,7,2]`, four steps:
+
+| After | `ngram_history` |
+|---|---|
+| prefill | `[7, 2]` — the prompt's last two ids |
+| decode 11 | `[2, 11]` |
+| decode 4 | `[11, 4]` |
+| decode 3 | `[4, 3]` |
+
+A FIFO of raw token ids. INTEGERS, so unlike this fixture's bf16 activations it
+cannot saturate, which is why W5k gates the cross-step path on it and asserts no
+cache VALUE anywhere (W5j measured 0 of 128 indexer words and 0 of 192 paged K/V
+words moving while logits moved 31.84; a rescaled fixture stays owed).
+
+**THE RESULT.** `ModelRegistry::Forward` runs a prefill (T = 6, `past_len` 0,
+sampled token 15) and then a DECODE (`past_len` 6, sampled a token) over one set
+of persistent caches. Oracle golden UNMOVED at `max|diff| = 0.00982457` against
+its 0.03 bound.
+
+**THE BATTERY.** Every mutation: sha256 proved applied, build rc read BEFORE any
+test output, tree restored and the restore sha256-verified against the
+pre-mutation snapshot.
+
+| # | Mutation | Build | Result |
+|---|---|---|---|
+| M1 | delete the n-gram history WRITE-BACK inside `RunQwen4ExpPleBlock` | rc 0 | **RED** — 3 assertions. Step-1 `CHECK( 0 == 7 )` and `CHECK( 0 == 2 )` at `:1874`; step-2 rolled-FIFO `CHECK( 0 == 15 )` at `:1909`. Also the first MEASURED reach of this block's body from a production entry point |
+| M2 | seed the recurrent state WRONG on step 1 (`eos_token_id` to `0`) | rc 0 | **RED** — the oracle golden at `0.777988` against a bound of `0.03`, plus 5 assertions over 4 cases in `test_qwen4_exp_ple_block` |
+| M3 | REACHABILITY: force `published` false, deleting the production route to the engine's published states | rc 0 | **RED** — step-1 history reds AND step 2 THROWS the authoritative refusal. NOT vacuous: the route is load-bearing |
+| M4 | read the WRONG published slot for the history (`states[3]` to `states[1]`) | rc 0 | **RED** — refused by shape: "the recurrent group's fourth state ... must be [slots,2]" |
+| M5 | the op admits bf16 but the KERNEL treats the ring as f32 — "a dtype with no kernel behind it" | rc 0 | **RED** — 65 assertions, and ONLY in the new bf16 ring case; the 10 f32 cases stayed green, so the mutation isolates the bf16 path |
+
+**THE PREDICATE TRAP, CAUGHT IN FLOW.** The first draft refused a continuing step
+on `input.multi_kv != nullptr`, while the predicate that ROUTES the PLE caches is
+`g.states.size() >= 4`. Those are different: a channel can be present and still
+carry a recurrent group whose `states` list was never filled — every hand-built
+`GdnStateCache` in this tree does exactly that (`qwen3_5.h` documents it). The
+weaker refusal would have let that case run on a zeroed per-call scratch, which
+re-seeds the history every step and produces a fluent wrong answer with no error.
+The authoritative refusal was moved onto the routing predicate itself; the
+`multi_kv` check remains only as an early, strictly-weaker message. This is the
+`refusal != route predicate` failure recorded elsewhere on this row, found before
+it landed rather than after.
+
+**WHAT W5k DID NOT PROVE.** The block's new ring-dtype EQUALITY check is a guard,
+not a route: with the publisher and the stream now agreeing through one exported
+constant (`kQwen4ExpStreamDType`), deleting that check reds nothing. It is
+recorded as a guard rather than claimed as gated. `GPUModelRunner` was not driven
+end to end — the two steps are assembled the way the runner assembles one, not BY
+it. No CUDA arm was built or run; this is a CPU-only host.
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**
@@ -5961,11 +6096,19 @@ a row here, and every row says whether anything in production reaches it:
 | W5h | the indexer side cache sized at ONE ROW PER TOKEN: `compress_ratio` 1, not 4 | **yes** — `make_kv_cache`, the same production hook W5c-1 reaches | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5h's own issue OWED |
 | W5i | the indexer side cache PAGED: the engine's fused MLA page + group 2's own block table, gathered and scattered with `vt::IndexSelect`/`vt::IndexCopy` | **yes, and W5j closed the gap this row named** — `ModelRegistry::Forward` reached the translation over a per-call scratch (M4a, M4b); since W5j a by-name step reaches it over the engine's OWN group-2 buffer through group 2's OWN gathered table | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2249](https://github.com/mudler/vllm.cpp/issues/2249), W5i's own issue OWED |
 | W5j | the forward CONSUMES the by-name channel, and `ModelFactory::consumes_multi_kv` narrows the engine's `multi_kv` refusal to a model-declared capability | **yes** — `ModelRegistry::Forward` dispatches a THREE-GROUP topology to this hook, which resolves all five published caches by name and reads group 2's own block table; M4 proves the guard still refuses with the bit cleared, M6 proves the tower is entered. It is still a SINGLE-SHOT prefill: nothing decodes a second token | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2353](https://github.com/mudler/vllm.cpp/issues/2353), W5j's own issue OWED |
+| W5k | the PLE conv ring's DTYPE and the n-gram history's RESIDENCY settled against the running lane oracle, and the SECOND STEP | **yes, and it DECODES** — `ModelRegistry::Forward` runs a prefill at `past_len` 0 and then a decode at `past_len` 6 over the engine's own persistent recurrent group, sampling a token on each; M1 deletes the n-gram write-back INSIDE `RunQwen4ExpPleBlock` and the step-1 history assertion reds, which is the first measured reach of that block's body | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5k's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than
-claiming a decode. **Nothing in the table decodes a token, and W5f does not
-change that** — it changes the reason. Before it, most of the rows above were
+claiming a decode. **W5k IS THE ROW THAT DECODES, and the sentence that stood
+here is now false.** It read "Nothing in the table decodes a token, and W5f does
+not change that", which was true of every wave up to W5j and stopped being true
+the moment `past_len > 0` returned logits. A second step now runs through
+`ModelRegistry::Forward` over caches that persist between calls, and samples a
+token. What is still NOT claimed is SERVING: `num_reqs > 1` is refused, the
+positional arm is one-shot, and `GPUModelRunner` has not been driven end to end
+— all three are named in `## Owed`. W5f's own contribution is unchanged by this:
+it changed the reason the rows above were unreached. Before it, most of the rows above were
 unreached because nothing composed them; after it, the composition exists and
 runs from a production entry point, and what is missing is the SECOND STEP. The
 count is deliberately not written out: this section deletes prose counts of its
@@ -6003,9 +6146,23 @@ so directly, and both are in W5i's mutation record above:
 `RunQwen4ExpPleBlock`'s body follows by construction rather than by its own
 mutation: PLE runs FIRST in a decoder layer (`:1218`), the fixture puts its only
 PLE layer at index 1, and the loop demonstrably reaches layer 3's QSA, so layer
-1's PLE body ran. That inference is recorded as an inference. **No mutation on
-this row has deleted `RunQwen4ExpPleBlock`'s call site**, so the PLE conv and gate
-ops (W5b-3, W5e-1, W5e-2) are reached-by-argument and not reached-by-measurement,
+1's PLE body ran. That inference is recorded as an inference.
+
+**W5k REPLACED THAT INFERENCE WITH A MEASUREMENT, and the sentence below it is
+now out of date.** It read "No mutation on this row has deleted
+`RunQwen4ExpPleBlock`'s call site", so the PLE ops were reached-by-argument. W5k's
+M1 deletes the n-gram history WRITE-BACK inside `RunQwen4ExpPleBlock`'s own body
+— `update_conv_state(..., state_idx=2)`, `modeling_qwen4_exp.py:1089-1091` — and
+`test_qwen4_exp_layer_loop.cpp:1874` reds with `CHECK( 0 == 7 )` on a step driven
+through `ModelRegistry::Forward`. A body that did not run could not have failed to
+write. W5k's M2 (the EOS seed, in the same body) additionally reds the oracle
+golden at 0.777988 against a bound of 0.03. So the PLE block body is
+reached-by-measurement from a production entry point, and the paragraph that
+follows describes the state before this wave:
+
+**(superseded)** No mutation on
+this row has deleted `RunQwen4ExpPleBlock`'s call site, so the PLE conv and gate
+ops (W5b-3, W5e-1, W5e-2) were reached-by-argument and not reached-by-measurement,
 which is a weaker claim and is written as one.
 
 - **Reached through `ModelRegistry::Forward` today:** the loop end to end on the

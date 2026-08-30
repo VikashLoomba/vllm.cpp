@@ -177,17 +177,19 @@ std::string Qwen4ExpQsaIndexerName(size_t layer) {
   return Qwen4ExpLayerPrefix(layer) + "self_attn.indexer.k_cache";
 }
 
-// The single-shot prefill this hook serves is assembled below from the two
-// POSITIONAL cache channels plus the three states no channel carries.
+// The step this hook serves is assembled below from EITHER the two POSITIONAL
+// cache channels or the by-name index, plus — on the positional arm only — the
+// three states that channel cannot carry.
 //
 // WHY THE SCRATCH IS BUILT HERE AND NOT IN THE LOOP. `Qwen4ExpTextModelForward`
 // takes every cache as an operand and has no opinion about where they came
 // from, which is what lets its gate drive it at any `past_len`. The RESTRICTION
-// is the engine's: `ModelForwardInput` carries `attn_kv` and `gdn_state` and
-// nothing else, so the QSA indexer side cache and the PLE layer's conv ring and
-// n-gram history have no home across steps. Putting the scratch — and the
-// refusal that makes it sound — at this boundary keeps the limit where it is
-// true instead of baking it into the loop.
+// is the engine's, and only on the POSITIONAL arm: `ModelForwardInput` carries
+// `attn_kv` and `gdn_state` and nothing else, so there the QSA indexer side cache
+// and the PLE layer's conv ring and n-gram history have no home across steps. On
+// the BY-NAME arm all three DO have one and a second step runs. Putting the
+// scratch — and the refusal that makes it sound — at this boundary keeps the
+// limit where it is true instead of baking it into the loop.
 
 ForwardLogits ForwardQwen4ExpForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
@@ -221,29 +223,34 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   //     `MakeQwen4ExpKVCache` published — including the recurrent ones, which
   //     `ENG-MULTIKV-BYNAME` made addressable and which the paragraph this
   //     replaces said "cannot be addressed at all".
-  //   * WHAT STILL REFUSES IS THE PLE LAYER'S PAIR OF STATES, and it is a DTYPE
-  //     and a RESIDENCY, not a missing channel. `MakeQwen4ExpKVCache` publishes
-  //     the PLE conv ring as the recurrent group's third state at the group's
-  //     uniform `conv_dtype`, which is bf16, and `RunQwen4ExpPleBlock` requires
-  //     f32 (`qwen4_exp_ple_block.cpp:320`) because it walks the ring through
-  //     `Ptr<float>()`. It publishes the n-gram history as an i64 state, which
-  //     the block requires to be HOST-resident (`:327`, and `:351` reads it
-  //     through a host pointer) because the splitmix64 hash is a host int64
-  //     computation. Which side of each is wrong is a design call this row does
-  //     not have the oracle to settle — the lane pin's `modeling_qwen4_exp.py`
-  //     is not readable on this host — so it is recorded under `## Owed` in
-  //     `.agents/specs/qwen4-exp-flash-next.md` rather than guessed at.
+  //   * THE PLE LAYER'S PAIR OF STATES NO LONGER REFUSES (W5k). This bullet said
+  //     they did, "a DTYPE and a RESIDENCY, not a missing channel", and that
+  //     "which side of each is wrong is a design call this row does not have the
+  //     oracle to settle — the lane pin's `modeling_qwen4_exp.py` is not readable
+  //     on this host". The pin is a RELEASE rather than a checkout, and W5k
+  //     installed it (transformers 5.16.0, sha256 77fec77d…c459, verified by
+  //     regenerating this row's committed forward golden byte-identically) and
+  //     read the running model. Upstream types each cache slot from the tensor
+  //     that first reaches it (`cache_utils.py:1019-1023`), so the ring carries
+  //     the MODEL dtype and the history carries `input_ids.long()` on
+  //     `input_ids.device`. The PUBLISHER was right on both counts; both
+  //     requirements moved to `RunQwen4ExpPleBlock`, and both caches now persist
+  //     in the engine's own recurrent group.
   //   * `RunQwen4ExpQsaBlockPaged` takes a `block_table` of i32 `[1, max_pages]`
   //     — ONE sequence per call — so `num_reqs > 1` is out of reach for the same
   //     seam work.
+  //   * THE POSITIONAL ARM is still one shot, and that is a statement about the
+  //     ARM rather than about the model: nothing publishes the PLE states there,
+  //     so this hook allocates them per call and a per-call buffer is zeroed on
+  //     entry. Refused on the same predicate that routes — see the PLE cache
+  //     wiring below.
   //
-  // So this hook SERVES a single-shot prefill of one sequence, from EITHER cache
-  // channel, and refuses everything else BY NAME. What W5j changes is which
-  // buffers that prefill runs on: the QSA indexer side cache is now the engine's
-  // own group-2 pages read through group 2's own gathered block table, rather
-  // than a per-call scratch behind an identity table. Nothing about that is a
-  // decode: a decode needs a second step, and the second step is what the two
-  // PLE states above still cannot carry.
+  // So on the BY-NAME channel this hook serves a prefill AND a decode of one
+  // sequence, over the engine's own persistent caches, and refuses everything
+  // else BY NAME. The sentence this replaces ended "a decode needs a second step,
+  // and the second step is what the two PLE states above still cannot carry" —
+  // they carry it now, and `test_qwen4_exp_layer_loop.cpp` runs a `past_len = 6`
+  // step that samples a token.
   VT_CHECK(input.num_reqs == 1,
            "Qwen4ExpForConditionalGeneration: this forward serves ONE sequence "
            "per call and the step carries " +
@@ -260,24 +267,58 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
            "attn_meta.seq_lens must hold exactly one entry");
   const int64_t past_len =
       static_cast<int64_t>(input.attn_meta.seq_lens[0]) - T;
-  VT_CHECK(
-      past_len == 0,
-      "Qwen4ExpForConditionalGeneration: this forward serves a SINGLE-SHOT "
-      "PREFILL (past_len == 0) and this step continues a sequence at past_len " +
-          std::to_string(past_len) +
-          ". The layer loop itself has no such limit — it takes every cache as "
-          "an operand — and since W5j neither does the CHANNEL: multi_kv reaches "
-          "this hook, every published cache resolves by name, and the QSA "
-          "indexer side cache persists in the engine's own group-2 pages. What "
-          "cannot persist is the PLE layer's PAIR OF STATES, and the reason is a "
-          "dtype and a residency rather than a missing channel: the recurrent "
-          "group publishes the PLE conv ring at the group's uniform bf16 and "
-          "RunQwen4ExpPleBlock requires f32 (qwen4_exp_ple_block.cpp:320), and "
-          "it publishes the n-gram history as a DEVICE i64 state that the same "
-          "block requires to be HOST-resident (:327). Which side of each is "
-          "wrong is an oracle question this row could not settle on this host; "
-          "it is recorded under `## Owed`. Owned by MODEL-MM-QWEN4-EXP; see "
-          ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #2336.");
+  VT_CHECK(past_len >= 0,
+           "Qwen4ExpForConditionalGeneration: attn_meta.seq_lens[0] is smaller "
+           "than this step's token count, so past_len is negative");
+  // ─── WHY THE `past_len == 0` REFUSAL IS GONE (W5k, #2031) ─────────────────
+  //
+  // It said the PLE layer's pair of states "cannot persist", and named a dtype
+  // and a residency as the reason: the recurrent group publishes the conv ring at
+  // bf16 where `RunQwen4ExpPleBlock` required f32, and publishes the n-gram
+  // history as a DEVICE i64 state where the same block required HOST residency.
+  // It also said which side of each was wrong "is an oracle question this row
+  // could not settle on this host". W5k settled it by installing the lane pin —
+  // transformers 5.16.0, `modeling_qwen4_exp.py` sha256 77fec77d…c459, which
+  // regenerates the committed forward golden byte-identically — and reading the
+  // running model rather than the convention. Upstream was on the PUBLISHER's
+  // side both times (see the PLE cache wiring below for the lines), so both
+  // requirements moved to the block and both caches now persist.
+  //
+  // WHAT IS LEFT IS THE SCRATCH ARM, and it is a real limit rather than the same
+  // one renamed. With `multi_kv == nullptr` nothing publishes the PLE states, the
+  // hook allocates them per call, and a per-call buffer is zeroed on entry: every
+  // step would re-seed the n-gram history with EOS and re-zero the ring, and the
+  // model would decode as though each token were the first — a fluent wrong
+  // answer with no error anywhere. So the positional arm still serves a
+  // single-shot prefill, and it says so about ITSELF instead of about the model.
+  // WHAT IS LEFT IS THE SCRATCH ARM, and it is a real limit rather than the same
+  // one renamed. Where nothing publishes the PLE states the hook allocates them
+  // per call, and a per-call buffer is zeroed on entry: every step would re-seed
+  // the n-gram history with EOS and re-zero the ring, and the model would decode
+  // as though each token were the first — a fluent wrong answer with no error
+  // anywhere.
+  //
+  // THIS CHECK IS AN EARLY MESSAGE AND NOT THE DECIDING ONE. The predicate that
+  // ROUTES is whether the recurrent group actually carries the four published
+  // states, and it cannot be evaluated until they are resolved by name below; a
+  // refusal on a DIFFERENT predicate from the route is how a per-call scratch
+  // would serve a continuing step in silence. So the authoritative refusal lives
+  // at the wiring site on that exact predicate, and this one only catches the
+  // strictly weaker case — no channel at all — where the answer is already known
+  // and the message can be plainer.
+  VT_CHECK(past_len == 0 || input.multi_kv != nullptr,
+           "Qwen4ExpForConditionalGeneration: this step continues a sequence at "
+           "past_len " + std::to_string(past_len) +
+               " and carries NO by-name cache index, so nothing published the "
+               "PLE layer's conv ring or its n-gram history. On that arm this "
+               "hook allocates both per call and a per-call buffer is zeroed on "
+               "entry, so the history would be re-seeded with eos_token_id and "
+               "the ring re-zeroed at every step: the model would decode as "
+               "though each token were the first, and no shape or dtype error "
+               "would say so. A continuing step must carry the three-group "
+               "topology MakeQwen4ExpKVCache publishes. Owned by "
+               "MODEL-MM-QWEN4-EXP; see .agents/specs/qwen4-exp-flash-next.md "
+               "and issue #2031.");
 
   vt::Backend& backend = vt::GetBackend(input.queue.device.type);
   dense_attn::Dev d{backend, input.queue};
@@ -608,6 +649,41 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
     caches.qsa[static_cast<size_t>(i)].index_block_table = d_idx_bt.t();
   }
 
+  // ─── THE PLE LAYER'S TWO STATES (W5k, #2031) ──────────────────────────────
+  //
+  // These are the pair that refused `past_len > 0` for four waves, and the reason
+  // was never a missing channel: `MakeQwen4ExpKVCache` has published both as the
+  // recurrent group's third and fourth states since W5c, and W5j made the group
+  // resolvable by name. What refused was a DTYPE and a RESIDENCY, and W5k settled
+  // both against the running lane oracle (transformers 5.16.0, sha256
+  // 77fec77d…c459) rather than against this tree's convention:
+  //
+  //   * THE RING'S DTYPE IS THE MODEL'S. `cache_utils.py:1019-1023` allocates
+  //     each slot as `torch.zeros(..., dtype=conv_states.dtype,
+  //     device=conv_states.device)` — PER SLOT, from the tensor that first
+  //     reaches it — and the tensor reaching this one is `hidden_states`
+  //     (`modeling_qwen4_exp.py:1157-1159`). Observed: at `dtype=torch.bfloat16`
+  //     the oracle reports `conv_states[1] dtype=torch.bfloat16`. So the
+  //     PUBLISHER was right at bf16 and `RunQwen4ExpPleBlock`'s f32 requirement
+  //     was the wrong side; it now requires the ring to EQUAL the stream dtype.
+  //   * THE HISTORY IS DEVICE-RESIDENT. `:1070` takes `input_ids.long()` and
+  //     `:1089-1091` hands exactly that to `update_conv_state(..., state_idx=2)`,
+  //     so the slot's device is `input_ids.device` — the compute device. The
+  //     publisher was right here too, and the block now stages the row around its
+  //     host splitmix64 instead of refusing the buffer.
+  //
+  // SO THIS TAKES THE ENGINE'S OWN BUFFERS ON THE BY-NAME ARM, which is what
+  // makes a second step possible: a per-call scratch is zeroed on entry, so every
+  // step would re-seed the history with EOS and re-zero the ring, and the model
+  // would decode as though each token were the first. The scratch remains on the
+  // positional arm, where nothing publishes these states at all.
+  //
+  // THE STATE ORDER IS THE ONE `MakeQwen4ExpKVCache` PUBLISHES —
+  // `[gdn_conv, temporal, ple_conv, ngram]` — read from `GdnStateCache::states`,
+  // the complete ordered list `ENG-RECURRENT-MULTISTATE` (#2131) added. It is NOT
+  // read positionally out of anything else: `conv_state` and `ssm_state` are
+  // `states[0]` and `states[1]` under different names, and slots 2 and 3 have no
+  // named field to be confused with.
   std::vector<dense_attn::DBuf> ple_conv_bufs;
   ple_conv_bufs.reserve(p.ple.layer_ids_zero_based.size());
   caches.ple.resize(p.ple.layer_ids_zero_based.size());
@@ -615,19 +691,104 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
     const int64_t stream = p.stream_width();
     const int64_t state_len = p.ple.short_conv_state_len();
     const int64_t ctx = p.ple.ngram_size - 1;
-    ple_convs[i].assign(static_cast<size_t>(stream * state_len), 0.0F);
-    ple_tokens[i].assign(static_cast<size_t>(ctx), 0);
-    ple_conv_bufs.emplace_back(d, vt::DType::kF32,
-                               std::vector<int64_t>{1, stream, state_len},
-                               ple_convs[i].data());
-    caches.ple[i].conv_state = ple_conv_bufs.back().t();
-    // HOST-RESIDENT AND REFUSED OTHERWISE by the PLE block itself: the n-gram
-    // hash is a host int64 computation, so the history is a host tensor over
-    // this vector's bytes rather than a device buffer.
-    caches.ple[i].tokens = dense_attn::MakeTensor(
-        ple_tokens[i].data(), vt::DType::kI64,
-        vt::Device{vt::DeviceType::kCPU, 0}, {1, ctx});
-    caches.ple[i].state_row = 0;
+    // WHICH RECURRENT SLOT THIS PLE LAYER OWNS. The PLE layer is a
+    // linear_attention layer (upstream refuses PLE on a sparse one), so its state
+    // is the `gdn` entry at its RANK AMONG LINEAR LAYERS — never at its decoder
+    // layer index, which counts the sparse layers too.
+    const int64_t ple_layer = p.ple.layer_ids_zero_based[i];
+    int64_t rank = -1, seen = 0;
+    for (size_t l = 0; l < p.layer_types.size(); ++l) {
+      if (p.layer_types[l] != Qwen4ExpLayerKind::kLinearAttention) continue;
+      if (static_cast<int64_t>(l) == ple_layer) { rank = seen; break; }
+      ++seen;
+    }
+    VT_CHECK(rank >= 0 && rank < static_cast<int64_t>(gdn.size()),
+             "Qwen4ExpForConditionalGeneration: PLE layer " +
+                 std::to_string(ple_layer) +
+                 " is not a linear_attention layer, so it owns no recurrent "
+                 "state slot. See .agents/specs/qwen4-exp-flash-next.md.");
+    const GdnStateCache& g = gdn[static_cast<size_t>(rank)];
+
+    // The by-name arm carries the published four; a hand-built cache sets only the
+    // two named fields and leaves `states` EMPTY, which `qwen3_5.h` documents and
+    // which is the scratch arm below.
+    const bool published = g.states.size() >= 4;
+    if (published) {
+      caches.ple[i].conv_state = g.states[2];
+      caches.ple[i].tokens = g.states[3];
+      // `MambaSpec` shapes carry the slot dim prepended, so the history arrives
+      // [num_slots, ngram_size-1] and the ring [num_slots, stream, state_len] —
+      // exactly the two shapes `RunQwen4ExpPleBlock` checks.
+      VT_CHECK(caches.ple[i].tokens.rank == 2 &&
+                   caches.ple[i].tokens.shape[1] == ctx,
+               "Qwen4ExpForConditionalGeneration: the recurrent group's fourth "
+               "state is this model's n-gram history and must be [slots," +
+                   std::to_string(ctx) + "]");
+      VT_CHECK(caches.ple[i].conv_state.rank == 3 &&
+                   caches.ple[i].conv_state.shape[1] == stream &&
+                   caches.ple[i].conv_state.shape[2] == state_len,
+               "Qwen4ExpForConditionalGeneration: the recurrent group's third "
+               "state is this model's PLE conv ring and must be [slots," +
+                   std::to_string(stream) + "," + std::to_string(state_len) + "]");
+    } else {
+      // ─── THE AUTHORITATIVE CONTINUING-STEP REFUSAL, ON THE ROUTING PREDICATE ──
+      // `published` is what decides which buffers this step runs on, so it is what
+      // must decide whether the step may continue a sequence. The early check at
+      // the top of this hook tests `multi_kv != nullptr`, which is STRICTLY
+      // WEAKER: a channel can be present and still carry a recurrent group whose
+      // `states` list was never filled (every hand-built `GdnStateCache` in this
+      // tree sets the two named fields and leaves it empty — `qwen3_5.h` says so).
+      // Refusing on the weaker predicate would let exactly that case through onto
+      // a zeroed per-call scratch, which produces a fluent wrong answer and no
+      // error at all. Same predicate, same decision.
+      VT_CHECK(past_len == 0,
+               "Qwen4ExpForConditionalGeneration: this step continues a sequence "
+               "at past_len " + std::to_string(past_len) +
+                   " and the recurrent group carries " +
+                   std::to_string(g.states.size()) +
+                   " state(s), not the four MakeQwen4ExpKVCache publishes "
+                   "([gdn_conv, temporal, ple_conv, ngram]). Without the third "
+                   "and fourth this hook allocates the PLE conv ring and the "
+                   "n-gram history per call, and a per-call buffer is zeroed on "
+                   "entry: the history would be re-seeded with eos_token_id and "
+                   "the ring re-zeroed at every step, so the model would decode "
+                   "as though each token were the first with no shape or dtype "
+                   "error to say so. Owned by MODEL-MM-QWEN4-EXP; see "
+                   ".agents/specs/qwen4-exp-flash-next.md and issue #2031.");
+      // THE SCRATCH ARM, byte-identical to W5j apart from the ring's dtype. It is
+      // zeroed on entry, so it serves a `past_len == 0` call and nothing else,
+      // which is what the refusal directly above enforces.
+      ple_tokens[i].assign(static_cast<size_t>(ctx), 0);
+      // THE SCRATCH RING CARRIES THE STREAM DTYPE, not f32. It was f32 while the
+      // loop ran bf16, which is the widening the block's new equality check
+      // refuses — and which no golden could ever have seen, because on a
+      // `past_len == 0` call the ring is zeroed on entry and only WRITTEN at the
+      // end, so its dtype cannot move a single output value. It moves bytes and
+      // it would have moved the answer the moment a second step read it.
+      // Sized in FLOATS and viewed at the stream dtype, so the storage is >= the
+      // bytes any dtype up to f32 needs and is zero-filled either way (all-zero
+      // bits is +0.0 in f32 and bf16 alike). Over-allocating a per-call scratch
+      // by a factor of two is not worth a second length expression to get wrong.
+      ple_convs[i].assign(static_cast<size_t>(stream * state_len), 0.0F);
+      ple_conv_bufs.emplace_back(d, kQwen4ExpStreamDType,
+                                 std::vector<int64_t>{1, stream, state_len},
+                                 ple_convs[i].data());
+      caches.ple[i].conv_state = ple_conv_bufs.back().t();
+      caches.ple[i].tokens = dense_attn::MakeTensor(
+          ple_tokens[i].data(), vt::DType::kI64,
+          vt::Device{vt::DeviceType::kCPU, 0}, {1, ctx});
+    }
+    // ONE SEQUENCE PER CALL, so the state row is the one this step's recurrent
+    // metadata names. `gdn_meta.non_spec_state_indices_tensor` is the runner's own
+    // per-request slot assignment and is what every other recurrent consumer in
+    // this tree reads; defaulting to 0 would put a second sequence's state on the
+    // first sequence's row with no shape error.
+    int64_t row = 0;
+    if (published && input.gdn_meta.non_spec_state_indices_tensor.has_value() &&
+        !input.gdn_meta.non_spec_state_indices_tensor->empty()) {
+      row = (*input.gdn_meta.non_spec_state_indices_tensor)[0];
+    }
+    caches.ple[i].state_row = row;
   }
 
   const Qwen4ExpTextModelOutput hidden = Qwen4ExpTextModelForward(

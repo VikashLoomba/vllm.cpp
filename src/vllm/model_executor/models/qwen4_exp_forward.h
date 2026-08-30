@@ -77,16 +77,20 @@
 // in another model.
 //
 // ─── SCOPE, AND WHAT IS NOT HERE ─────────────────────────────────────────────
-// MULTI-STEP DECODE. `ModelForwardInput` carries exactly two POSITIONAL cache
-// channels, `attn_kv` and `gdn_state` (`model_registry.h:439-440`). The QSA
-// INDEXER side cache and the PLE layer's two states are NEITHER, and the only
-// channel that could carry them is `multi_kv`, which `ModelRegistry::Forward`
-// refuses by name (`model_registry.cpp:461-478`) — a refusal
-// [#2353](https://github.com/mudler/vllm.cpp/issues/2353) establishes must NOT
-// be lifted yet. So the engine entry point below serves a SINGLE-SHOT PREFILL at
-// `past_len == 0`, where those three states are per-call scratch, and refuses
-// anything else BY NAME rather than continuing from a state it cannot address.
-// The loop itself takes the caches as operands and has no such limit.
+// MULTI-STEP DECODE IS HERE NOW (W5k), and this paragraph used to say it was not.
+// It read that `multi_kv` "is refused by name" so the entry point "serves a
+// SINGLE-SHOT PREFILL at `past_len == 0`". W5j narrowed that engine refusal to a
+// model-declared capability and W5k settled the last two blockers against the
+// running lane oracle, so on the BY-NAME channel the QSA indexer side cache lives
+// in the engine's group-2 pages and the PLE layer's conv ring and n-gram history
+// live in the recurrent group's third and fourth published states. A `past_len >
+// 0` step returns a token.
+//
+// WHAT IS STILL NOT HERE is the POSITIONAL arm's second step, and the reason is
+// that arm's own: nothing publishes those three states there, so they are
+// per-call scratch and a per-call buffer is zeroed on entry. Refused by name, on
+// the same predicate that routes. The loop itself takes the caches as operands
+// and has never had either limit.
 //
 // ONE SEQUENCE PER CALL, as `RunQwen4ExpQsaBlockPaged` takes one: its
 // `block_table` is i32 `[1, max_pages]` and `RunQwen4ExpPleBlock`'s n-gram
@@ -141,6 +145,22 @@ struct Qwen4ExpForwardCaches {
 // IT IS THE MIXER'S OUTPUT, NOT LOGITS. `Qwen4ExpTextModel` carries no
 // `lm_head` — that is `Qwen4ExpForCausalLM` — so the `lm_head` GEMM belongs to
 // the registry hook and not to the loop.
+// ─── THE MODEL'S ONE STREAM DTYPE (W5k, #2031) ──────────────────────────────
+// AGENTS.md "Inherit vLLM defaults": vLLM resolves ONE model dtype and every
+// layer inherits it. This is that value for `qwen4_exp`, exported because THREE
+// places now have to agree on it and a literal in each is three facts that can
+// drift: the layer loop's activations, the PLE conv ring the recurrent group
+// publishes (`MakeQwen4ExpKVCache`'s `conv_dtype`), and the per-call scratch the
+// positional arm allocates.
+//
+// The ring MUST equal it — that is not a house convention but upstream's own
+// construction, which types each cache slot from the tensor that first reaches
+// it (`cache_utils.py:1019-1023` over the `hidden_states` at
+// `modeling_qwen4_exp.py:1157-1159`). `RunQwen4ExpPleBlock` enforces the equality;
+// this constant is what lets the producers satisfy it from one place instead of
+// three.
+inline constexpr vt::DType kQwen4ExpStreamDType = vt::DType::kBF16;
+
 struct Qwen4ExpTextModelOutput {
   vt::Tensor tensor;              // [T, hidden_size] at the stream dtype
   std::shared_ptr<void> storage;  // owns the pool block (Pool().Put on release)

@@ -332,6 +332,24 @@ arithmetic** -- and it takes **65.9% of the layer**. Measured rates: the GEMM at
 **153.3 GFLOP/s**, the attention at **3.2 GFLOP/s**. A 48x gap between two
 kernels in the same loop.
 
+**One lever that looks obvious is closed by measurement rather than by argument.**
+After `Ltx2ConnectorReplaceRegisters` the additive mask is ALL ZEROS, so a reader
+naturally asks whether routing that case to the unbiased `vt::Attention` -- which
+`Ltx2Attention` already selects when `args.bias == nullptr` -- would help. It
+would not: at the same shape the unbiased op costs **0.94x to 1.03x** of the
+biased one, inside both arms' own spread, because `AttentionKernel` reads its
+operands through the identical per-element `LoadF32`. Routing on the VALUES would
+also be exactly what `ltx2.cpp` refuses in writing ("Route on what the call
+MEANS, never on what its numbers happen to be"). It is recorded here so the next
+row does not spend a day on it.
+
+**The attention timings move by about 10% between quiet runs and that is stated
+rather than smoothed.** Two separate processes on a box at loadavg 10-15 read the
+video kernel at 5.361 s and 4.828 s, and the audio kernel at 2.966 s and 2.294 s.
+The SHARE this row rests on -- attention against the whole layer -- is taken from
+figures measured in the same session, and the hoisted-vs-shipped comparison is
+taken inside a single process, which is why neither depends on that drift.
+
 ### Why the attention kernel is 48x off, and what the repair is
 
 `AttentionCrossKernel` (`src/vt/cpu/cpu_ops.cpp`) reads every operand element

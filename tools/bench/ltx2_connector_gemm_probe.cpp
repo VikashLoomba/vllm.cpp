@@ -464,6 +464,30 @@ int ModeAttn(int64_t tq, int reps) {
                        c.d, s, a.scale);
       hoisted.push_back(Seconds(t0, Clock::now()));
     }
+    // THE UNBIASED OP AT THE SAME SHAPE, because "route the all-zero bias to
+    // `vt::Attention` instead" is the lever a reader reaches for next and it is
+    // not one. After `Ltx2ConnectorReplaceRegisters` the additive mask IS all
+    // zeros, so the bias adds nothing -- but `AttentionKernel` reads its
+    // operands through the SAME per-element `LoadF32`, so the two cost the same
+    // and the routing change would buy nothing. Measured rather than argued,
+    // and measured here so the next row does not spend a day on it. (Routing on
+    // the VALUES would also be the thing `ltx2.cpp` explicitly refuses: "Route
+    // on what the call MEANS, never on what its numbers happen to be.")
+    std::vector<double> unbiased;
+    {
+      std::vector<float> ob3(ob.size());
+      vt::Tensor to3 = vt::Tensor::Contiguous(ob3.data(), vt::DType::kF32, dev,
+                                              {tq, c.heads, c.d});
+      vt::AttentionArgs ua;
+      ua.scale = a.scale;
+      ua.causal = false;
+      for (int r = 0; r < reps; ++r) {
+        const Clock::time_point t0 = Clock::now();
+        vt::Attention(q, to3, tq_t, tk_t, tv_t, ua);
+        unbiased.push_back(Seconds(t0, Clock::now()));
+      }
+    }
+    const Stat un = Summarize(unbiased);
     const Stat sh = Summarize(shipped);
     const Stat ho = Summarize(hoisted);
     const bool eq = std::memcmp(ob.data(), ob2.data(), ob.size() * sizeof(float)) == 0;
@@ -475,6 +499,10 @@ int ModeAttn(int64_t tq, int reps) {
                 c.what, static_cast<long long>(c.heads), static_cast<long long>(c.d), sh.median,
                 flop / sh.median / 1e9, sh.spread * 100.0, ho.median, flop / ho.median / 1e9,
                 eq ? "byte-equal" : "DIFFER");
+    std::printf("#   unbiased vt::Attention at the same shape = %.3f s (%.1f GF), "
+                "unbiased/shipped = %.3f\n",
+                un.median, flop / un.median / 1e9,
+                sh.median > 0 ? un.median / sh.median : 0.0);
     if (!eq) {
       std::fprintf(stderr, "FATAL: the hoisted reference is not byte-identical (%s)\n", c.what);
       return 2;

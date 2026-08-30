@@ -6393,6 +6393,34 @@ makes them agree again and hides the very asymmetry the real build has (host
 pinned off, nvcc `-fmad` on and unpinned). A single-flag emulation is not a test
 of this property.
 
+**`rc run` IS NOT FIRE-AND-FORGET, AND THIS COST THIS WAVE ITS QUEUE SLOT.** The
+`rc run` client streams the job's output, and **killing the client CANCELS a job
+that is still queued.** It is not merely a lost stream. When this wave's
+streaming process was reaped, `rc jobs` recorded
+`killed (killed by mudler@mudler-ubuntu-box)` and the client's own log printed
+`rc: cancelled queued job 7d58cbb7-...`. The job had reached position #1 after a
+roughly three-hour wait and was next to run; the resubmission started again at
+position #5.
+
+The fix is to detach the client from the session that launched it, so that
+reaping a shell or a background task cannot take the job with it:
+
+```sh
+setsid nohup rc run -d dgx:gpu0 --max-runtime 3h -- bash /workspace/<dir>/run.sh \
+    > run.log 2>&1 < /dev/null &
+```
+
+Verify it took: the client must show `ppid=1` and a session id equal to its own
+pid (`ps -o pid,ppid,sid -p <pid>`). Anything else is still tied to the launching
+session and is one reap away from cancelling the job.
+
+This compounds with the `--as` finding recorded above. Together they are the two
+ways this wave lost a lease without ever touching a device: `--as` makes a job
+you cannot cancel, and an attached client makes a job that cancels itself.
+**Owed: `.agents/environment.md` should carry both, because they are fleet facts
+rather than facts about this row**, and no issue could be filed for them (GitHub
+writes are `403` from this host).
+
 **Still owed after this wave, in order:**
 
 - **The CUDA arms of the four reduction ops**, each with the decision named in the

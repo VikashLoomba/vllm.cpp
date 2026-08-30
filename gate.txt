@@ -1,0 +1,129 @@
+Session role:
+  --   role=UNDECLARED session=ppid:2363503 branch=row/MODEL-MM-QWEN4-EXP-W5L
+       This session has not declared a role. Run scripts/agent-start.py
+       for the canonical role interview and exact next actions.
+Record gates:
+  ok   check-conflict-markers
+  ok   check-prompt-contract
+  ok   check-agent-record
+  ok   check-release-binary-contract
+  ok   check-release-workflow
+  ok   check-windows-release-state
+  ok   check-container-matrix
+  ok   check-container-workflow
+  ok   check-build-runtime-deps
+  ok   check-role-discipline
+  ok   claim-view
+  ok   check-readme-structure
+  ok   check-quickstart-recipes
+  ok   check-benchmark-index
+  ok   check-model-checklist
+  ok   check-supported-models
+  ok   check-env-doc
+  ok   check-fusion-consistency
+  ok   check-attention-rung-consistency
+  ok   check-fp4-resident-consistency
+  ok   check-cuda-op-arch-gate
+  ok   check-runner-routing-consistency
+  ok   check-surface-coverage
+  ok   check-test-registration
+  ok   check-snapshot-pins
+  ok   check-oracle-pins
+  ok   check-oracle-denominator-flags
+  ok   check-now-current
+  ok   check-gate-commands
+  ok   check-symbol-anchors
+  ok   ready-for-helper
+  ok   upstream-inventory
+  ok   audit-live-rows
+Mutation suites:
+  ok   test_check_prompt_contract
+  ok   test_agent_gates
+  ok   test_agent_record
+  ok   test_check_issue_index_append_only
+  ok   test_check_release_binary_contract
+  ok   test_release_manifest
+  ok   test_release_archive
+  ok   test_release_pipeline
+  ok   test_check_windows_release_state
+  ok   test_release_postpublish_audit
+  ok   test_check_container_matrix
+  ok   test_check_container_workflow
+  ok   test_check_build_runtime_deps
+  ok   test_validate_container_image
+  ok   test_release_index
+  ok   test_release_metadata
+  ok   test_release_accelerator_metadata
+  ok   test_release_macos_metadata
+  ok   test_release_windows_metadata
+  ok   test_cpu_release_gates
+  ok   test_agent_role
+  ok   test_agent_onboard
+  ok   test_agent_start
+  ok   test_gate_bringup
+  ok   test_env_agnostic_tooling
+  ok   test_claim_view
+  ok   test_upstream_inventory
+  ok   test_check_readme_structure
+  ok   test_check_quickstart_recipes
+  ok   test_check_benchmark_index
+  ok   test_check_model_checklist
+  ok   test_check_supported_models
+  ok   test_check_env_doc
+  ok   test_checker_text
+  ok   test_check_fusion_consistency
+  ok   test_check_attention_rung_consistency
+  ok   test_check_fp4_resident_consistency
+  ok   test_check_cuda_op_arch_gate
+  ok   test_check_runner_routing_consistency
+  ok   test_check_surface_coverage
+  ok   test_check_test_registration
+  ok   test_check_snapshot_pins
+  ok   test_check_oracle_pins
+  ok   test_cpu_x86_llamacpp_floor
+  ok   test_audit_live_rows
+  ok   test_check_gate_commands
+  ok   test_gpu_lock_one_truth
+  ok   test_main_baseline
+  ok   test_agent_preflight_skip_report
+  ok   test_agent_pr_body
+  ok   test_check_symbol_anchors
+  ok   test_check_oracle_denominator_flags
+  ok   test_check_conflict_markers
+  ok   test_prepush_checker_names
+  ok   test_ab_arms_differ
+  ok   test_ltx25_pixel_ab_harness
+  ok   test_ltx2_dit_attn_knob_arms
+  ok   test_ltx25_ab_memwatch
+  ok   test_ltx2_oracle_goldens
+  ok   test_tower_skip_rss_report
+  ok   test_tower_skip_rss_arm
+  ok   test_ci_walk_base
+  ok   test_rc_stage_checkpoint
+  ok   test_sglang_lease_identity
+  ok   test_ltx25_render_compare
+  ok   test_ltx25_absolute_reference
+  ok   test_convert_glm5_next_gguf
+  ok   test_check_windows_portability
+  ok   trailer suites
+  ok   commit style suites
+  ok   tools suites
+Committed range vs origin/main 03e0dcd19c9a7539bbaad0e17bebe9a2a892c699:
+  ok   now-current range
+  ok   issue-index append-only
+Commit trailers vs origin/main 03e0dcd19c9a7539bbaad0e17bebe9a2a892c699:
+  SKIP commit-trailers
+         origin/main 03e0dcd19c9a7539bbaad0e17bebe9a2a892c699 is not an ancestor of HEAD, so this
+         branch is behind it and the trailer gates did NOT run. Merge origin/main and
+         rerun. Neither gate reported anything about this tree.
+  SKIP commit-style
+         origin/main 03e0dcd19c9a7539bbaad0e17bebe9a2a892c699 is not an ancestor of HEAD, so this
+         branch is behind it and the trailer gates did NOT run. Merge origin/main and
+         rerun. Neither gate reported anything about this tree.
+
+2 gate(s) SKIPPED: commit-trailers commit-style
+NOT a green preflight: a skipped gate reported nothing about this tree.
+Each reason is printed beside its SKIP above.
+
+1 gate(s) failed: role-undeclared
+Repair the record. Never weaken a checker to make a transition pass.

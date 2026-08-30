@@ -4285,9 +4285,19 @@ All six mutations were re-run after this refactor.
   `payload_slots` and made all five of this model's caches resolvable, which is 5
   of 5 and not 2 of 5, and this entry never caught up. What REMAINS is the
   `query_start_loc` plumbing a ragged multi-request batch needs, which no block on
-  this row carries, PLUS the second-step blocker above, which is this row's own
-  and not the engine's. Until both land there is no token number, no speed
-  number, no `examples/server` end to end and no `docs/USAGE.md` weights row.
+  this row carries. **THE REST OF THAT SENTENCE IS NOW WRONG AND IS REPAIRED IN
+  FLOW BY W5L.** It continued "PLUS the second-step blocker above, which is this
+  row's own and not the engine's. Until both land there is no token number, no
+  speed number, no `examples/server` end to end and no `docs/USAGE.md` weights
+  row." W5k landed the second step and W5L serves a `POST /v1/completions`
+  through `examples/server` on CPU, so BOTH did not have to land: the ragged
+  batch is still owed and serving does not wait on it, because
+  `ModelFactory::serves_one_sequence_per_step` clamps the engine to one sequence
+  rather than letting it build a step the forward refuses. What survives
+  unchanged is the pair that never depended on batching: there is no token number
+  and no speed number, because every byte served came from the synthetic fixture,
+  and the `docs/USAGE.md` WEIGHTS row is owed by the wave that serves a published
+  checkpoint.
 - **CLOSED by W5i as a STORE, and what remains is a REACH.** This entry read
   "the QSA indexer side cache's paged store is still owed". The store and the
   read are paged now, and the registry hook allocates the scratch IN THE ENGINE'S
@@ -6394,21 +6404,32 @@ ONE ROW PER TOKEN since W5h — over real per-layer names, so the runner takes i
 multi-cache path and allocates every published cache. The engine half was
 `ENG-RECURRENT-MULTISTATE` (#2131); the second half that row expected to be
 needed, more than one recurrent group, is NOT on this path, because upstream
-declares one recurrent shape model-wide. Three things it does not do, each under
-`## Owed`: the n-gram history the runner allocates is ZERO-SEEDED where it needs
-EOS and nothing on that path corrects it — W5e-2 seeds it inside
-`RunQwen4ExpPleBlock`, and no forward calls that block, so the correction does
-not yet reach the runner's own row; nothing READS the side cache's block table
-yet (W5c-2 made the runner gather it and hand it to the forward; no consumer
-takes it); and every byte figure is derived on a CPU host rather than measured on
-a device.
+declares one recurrent shape model-wide. **THE THREE THINGS THIS PARAGRAPH SAID IT DOES NOT DO ARE NOW TWO
+DONE AND ONE STANDING, AND W5L REPAIRS IT IN FLOW.** It read: "the n-gram history
+the runner allocates is ZERO-SEEDED where it needs EOS and nothing on that path
+corrects it — W5e-2 seeds it inside `RunQwen4ExpPleBlock`, and no forward calls
+that block, so the correction does not yet reach the runner's own row; nothing
+READS the side cache's block table yet (W5c-2 made the runner gather it and hand
+it to the forward; no consumer takes it); and every byte figure is derived on a
+CPU host rather than measured on a device." W5f gave the block a caller, W5j gave
+the side cache's table a consumer, and W5L measures both on the RUNNER's own
+buffers: `test_qwen4_exp_runner.cpp` reads the runner-allocated n-gram history
+after a prefill and finds the prompt's last two ids in it rather than zeros, and
+deleting `gather_group_block_tables`'s call site reds that same case by name.
+What SURVIVES is the third: every byte figure here is still derived on a CPU host
+and none is measured on a device, because no CUDA kernel exists for any
+`qwen4_exp` op.
 
 **"NO GATE HERE CAN SEE THAT" WAS TRUE WHEN IT WAS WRITTEN AND IS NOT TRUE NOW**,
 so it is corrected rather than carried. W5e-2's mutation M2 replaces the EOS seed
 with zero and reds 4 of 11 cases against the lane-pinned end-to-end golden, at a
 measured separation of 1.2892 versus a 1e-5 tolerance. What survives is the
-narrower statement above: the SEEDING is gated, the ROUTING of the runner's slot
-into it is not, because there is no loop to route it.
+narrower statement above: the SEEDING is gated. **THE ROUTING IS GATED TOO SINCE
+W5L, and the clause that said otherwise is corrected here.** It read "the ROUTING
+of the runner's slot into it is not [gated], because there is no loop to route
+it": there is a loop, the runner routes its own slot into it, and W5L's M2 sets
+`caches.ple[i].state_row` one row wrong and reds four assertions — the history at
+the runner's assigned slot stays all zeros while the prompt's tail is `{7, 2}`.
 
 **(superseded by W5k and W5L)** This paragraph read "**Reached, and still
 refusing:** the forward. Nothing decodes a token, so there is still no token

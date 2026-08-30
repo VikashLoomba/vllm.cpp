@@ -82,16 +82,6 @@ untracked snapshot so the record gates can run offline; nothing commits it, so
 no pull request writes it. A tracked index was a surface every pull request had
 to write, and 16 of 21 open pull requests conflicted on it (#2290, #883).
 
-**A cited issue number that does not resolve is not a broken record.** On
-2026-08-29 the tracker went from 707 open issues to 89, and 817 of the 889 issues
-this repository had ever filed were deleted from GitHub. Every one of them
-survives, with its full text, in
-[`.agents/completed/issue-index.md`](.agents/completed/issue-index.md) — the
-frozen archive of the retired index. Read a dangling `#NNNN` there before
-concluding that the prose citing it is wrong. That archive is now the only record
-of those issues, which is the reason §Records says to move superseded detail
-rather than delete it.
-
 A bug that you find during other work still needs an issue. Filing the issue
 does not defer the fix. File it, fix it in the same flow, reference it in the
 commit, and close it. The person who found the bug has the context to fix it.

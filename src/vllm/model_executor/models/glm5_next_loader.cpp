@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -21,8 +22,10 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/models/glm5_next_diag.h"
 #include "vllm/model_executor/models/glm5_next_weights.h"     // the name map
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
+#include "vt/quant.h"  // vt::cpu::QuantRepackActive
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -113,6 +116,43 @@ OwnedTensor ExpandBf16(const GgufFile& g, const std::string& name,
   return Bf16From(DequantAll(g, name, shape), shape, nk);
 }
 
+// THE REPACK IS DECLINED ON THIS ROW, and the constant exists so the three
+// call sites below say so once rather than three times.
+//
+// `GgufLoadPolicy::quant_repack` is
+// `keep_quant && !cpu_ref && vt::cpu::QuantRepackActive()`, and
+// `QuantRepackActive()` is TRUE on every aarch64 i8mm box in this fleet. It
+// permutes an eligible q8_0 weight into the `block_q8_0x4` interleave for the
+// CPU i8mm GEMM. **Nothing on this row consumes that layout.** The forward is a
+// host f32 reference (`glm5_next_forward.h`): every weight it touches goes
+// through `DecodeOwnedTensorToF32` / `DecodeOwnedTensorRowsToF32`, which decode
+// blocks with `vt::cpu::BlockToFloat(dtype)`. No `vt::Tensor` is ever built
+// over these buffers, so `QuantRepackMatmul` is unreachable from here and the
+// repack buys this model nothing while costing it a load-time copy that
+// defeats the mmap borrow.
+//
+// What it did cost was the model. The interleave keeps the dtype at `kQ8_0`
+// and the byte count identical, so it passed every check the bridge had and
+// the bridge read it as plain blocks: 346 Q8_0 tensors on the published
+// artifact -- both mHC mixers on all 45 layers, the whole KDA gate chain, and
+// the DSA and indexer projections -- decoded to wrong values with no error,
+// and the model emitted token id 0 for every position. Declining the repack is
+// the repair; `DecodeOwnedTensorToF32` refusing a repacked buffer by name is
+// the guard that keeps it from coming back silently. Issue #2241.
+//
+// A later wave that gives this row a quantized GEMM should turn this back on
+// AT THAT SEAM, and will find the bridge's refusal waiting if it forgets one.
+constexpr bool kGlm5NextQuantRepack = false;
+
+// The elementwise sibling, declined for the same reason and stated separately
+// because it is a different flag with a different consequence: it transposes an
+// F16 or bf16 `[N,K]` weight to `[K,N]` while LEAVING THE SHAPE at `[N,K]`, so
+// this bridge's `memcpy`/widen would read the wrong axis. It is opt-in
+// (`VT_CPU_ELEM_KN_REPACK=1`) and the published artifact carries no F16 tensor,
+// so this is not live today -- which is exactly why it is declined now rather
+// than after somebody sets that variable.
+constexpr bool kGlm5NextElemKnRepack = false;
+
 const GgufFile* MmapSrc(const GgufFile& g, const GgufLoadPolicy& pol) {
   return pol.mmap_residency ? &g : nullptr;
 }
@@ -144,10 +184,10 @@ OwnedTensor LoadMatmul(const GgufFile& g, const GgufLoadPolicy& pol,
   const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
   if (r == GgufResidency::kKeepQuant)
     return OwnGgufQuantBlocks(t, n, k, /*row_offset=*/0, MmapSrc(g, pol),
-                              pol.quant_repack);
+                              kGlm5NextQuantRepack);
   if (r == GgufResidency::kKeepF16)
     return OwnGgufF16(t, n, k, /*row_offset=*/0, MmapSrc(g, pol), /*nk=*/true,
-                      pol.elem_kn_repack);
+                      kGlm5NextElemKnRepack);
   return ExpandBf16(g, name, {n, k}, /*nk=*/true);
 }
 
@@ -177,7 +217,7 @@ OwnedTensor LoadStackedExperts(const GgufFile& g, const GgufLoadPolicy& pol,
     // and reshaped back. The bytes are identical either way; only the recorded
     // shape differs, and the consumer slices by expert.
     OwnedTensor o = OwnGgufQuantBlocks(t, e * n, k, /*row_offset=*/0,
-                                       MmapSrc(g, pol), pol.quant_repack);
+                                       MmapSrc(g, pol), kGlm5NextQuantRepack);
     o.rank = 3;
     o.shape[0] = e;
     o.shape[1] = n;
@@ -200,7 +240,7 @@ OwnedTensor LoadHeadStacked(const GgufFile& g, const GgufLoadPolicy& pol,
   const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
   if (r == GgufResidency::kKeepQuant) {
     OwnedTensor o = OwnGgufQuantBlocks(t, h * n, k, /*row_offset=*/0,
-                                       MmapSrc(g, pol), pol.quant_repack);
+                                       MmapSrc(g, pol), kGlm5NextQuantRepack);
     o.rank = 3;
     o.shape[0] = h;
     o.shape[1] = n;
@@ -441,6 +481,27 @@ Glm5NextWeights LoadGlm5NextFromGguf(const GgufFile& gguf,
                                      const GgufLoadPolicy* policy) {
   const GgufLoadPolicy pol =
       policy != nullptr ? *policy : GgufLoadPolicy::FromEnv();
+
+  // WHAT THIS BOX WOULD HAVE DONE, printed beside what this row does instead.
+  // The repack defect (#2241) was reachable only where `QuantRepackActive()` is
+  // true, so an investigation that does not record that bit cannot tell a box
+  // that never repacked from a repair that worked. This line is the record.
+  if (glm5_next::diag::Level() > 0) {
+    glm5_next::diag::Banner("LoadGlm5NextFromGguf");
+    std::fprintf(stderr,
+                 "[glm5-diag] load policy: keep_quant=%d cpu_ref=%d "
+                 "policy.quant_repack=%d QuantRepackActive()=%d "
+                 "policy.elem_kn_repack=%d mmap_residency=%d | this row uses "
+                 "quant_repack=%d elem_kn_repack=%d\n",
+                 static_cast<int>(pol.keep_quant), static_cast<int>(pol.cpu_ref),
+                 static_cast<int>(pol.quant_repack),
+                 static_cast<int>(vt::cpu::QuantRepackActive()),
+                 static_cast<int>(pol.elem_kn_repack),
+                 static_cast<int>(pol.mmap_residency),
+                 static_cast<int>(kGlm5NextQuantRepack),
+                 static_cast<int>(kGlm5NextElemKnRepack));
+    std::fflush(stderr);
+  }
 
   Glm5NextWeights w;
   // The SAME resolver the config hook runs, so a file whose metadata the

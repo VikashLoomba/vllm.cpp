@@ -450,7 +450,7 @@ and no wave has an owner.
 | **W2** | `MakeDeepseekV4KVCache` publishes the real topology: one group per (spec class × compress ratio), real per-layer names, the 167 entries enumerated under `## The geometry, derived from source`. Nothing consumes it yet; the gate is the published spec set. | **CPU** | M |
 | **W3** | The runner carries more than one attention group and more than one cache per layer: generalize `full_attn_group_id_`/`gdn_group_id_` (`runner.h:571-572`) and the three-valued `LayerKvClass` (`runner.h:366-370`), and add the third forward channel that `## Why our KV interface cannot represent it` item (5) says is absent. **This is the wave that touches every model**, so its obligation is byte-neutrality for the uniform case, on the model of the `per_layer_attn_specs` contract (`kv_cache_interface.h:384-393`). | **CPU** | L |
 | **W4** | Non-uniform `block_size` across groups: `HybridKVCacheCoordinator`'s deferral (`kv_cache_coordinator.cpp:340-346`) and the block-table geometry (`runner.cpp:311-319`). May land inside W3 if W3's design needs it; kept separate because it is where a wrong answer is silent under `NDEBUG`. | **CPU** | M |
-| **W5** | `Forward`/`ForwardDevice` CONSUME `attn_kv`: the published caches reach the model keyed by layer name and each layer routes to its own, replacing `(void)attn_kv` and the `ModelRegistry::Forward` refusal (`model_registry.cpp:430-440`). **The cache plumbing only** -- see the scope boundary below. | CPU at synthetic config; **GPU** for the real geometry | L |
+| **W5** | `Forward`/`ForwardDevice` CONSUME `attn_kv`: the published caches reach the model keyed by layer name and each layer routes to its own, replacing `(void)attn_kv` and the `ModelRegistry::Forward` refusal (`model_registry.cpp:430-440`). **The cache plumbing only** -- see the scope boundary below, and `### W5 design` for the design ([#2323](https://github.com/mudler/vllm.cpp/issues/2323)). | CPU at synthetic config; **GPU** for the real geometry | L |
 | **W6** | Reachability + ABI: the capability reachable from `ModelRegistry::Forward` and exposed through `include/vllm.h`, so `examples/deepseek_v4_gen` stops including an internal header (`## Our baseline`). | **CPU** | S |
 | **W7** | The oracle gate of `## Gates`. | **GPU**, ≥2 GB10 | M |
 
@@ -481,6 +481,121 @@ W1, W2, W4 and W6 are fully CPU-gateable. W3 is CPU-gateable for its own
 guarantees but its byte-neutrality obligation reaches every model, so its full
 gate includes the SACRED `test_qwen35_paged_engine` regression. W5 and W7 need
 the GPU.
+
+### W5 design - the forward consumes the caches, and the refusal becomes a dispatch ([#2323](https://github.com/mudler/vllm.cpp/issues/2323))
+
+W5 had no design section until now, and that absence had a cost worth recording:
+its whole scope lived in one wave-table cell, so `MODEL-DSV4-DSA-COMPOSE`
+([#2286](https://github.com/mudler/vllm.cpp/issues/2286)) was specced over it and
+had to be split back apart (#2302). The boundary above is binding on this
+section: **W5 is the plumbing, and it deliberately does not remove the DSA
+refusal.**
+
+#### W5-1. What the tree does today
+
+W3 (`ca3dcda21`) made the runner allocate a buffer for EVERY published cache and
+hand them to the forward keyed by the name each was published under. A
+DeepSeek-V4 engine therefore constructs, publishes and ALLOCATES all 167 caches
+today, and then refuses at the first forward
+(`src/vllm/model_executor/models/model_registry.cpp:430-440`):
+
+> `... and no registered forward consumes a cache set keyed by layer name.
+> Refusing rather than discarding an allocated KV topology in silence (row
+> KV-DSV4-MULTICACHE W5 owns the consuming forward; #1925, #2068)`
+
+That refusal fires **unconditionally on `input.multi_kv != nullptr`**, and it is
+doing its job: `DeepseekV4Model::Forward` and `::ForwardDevice` still open with
+`(void)attn_meta; (void)attn_kv;` (`deepseek_v4.cpp:3033-3034`, `:3105-3106`) and
+recompute the whole prefix per token, so letting the step run would report a
+decode rate for a full-recompute path.
+
+#### W5-2. The refusal becomes a DISPATCH, never a deletion
+
+**Deleting the refusal is the one thing W5 must not do.** It would restore
+exactly the silent-discard failure W3 built it to prevent, and restore it for
+every FUTURE model that publishes a topology it cannot consume - a
+wrong-answer-not-a-crash, invisible to a token gate because the tokens stay right
+while the decode recomputes.
+
+So the forward declares the capability, and `ModelFactory` already has the
+pattern with its rationale written down (`model_registry.h`, beside
+`supports_weight_offload`):
+
+> Declaring the capability makes that case LOUD instead: the engine refuses a
+> configured offload against a model that does not claim support, naming the
+> architecture. A new model inherits false and is refused until someone wires it.
+
+W5 adds one more flag in that shape, defaulting **false**:
+
+```cpp
+// KV-DSV4-MULTICACHE W5: whether THIS model's forward consumes a cache set
+// keyed by layer name (`ModelForwardInput::multi_kv`) rather than the
+// positional `attn_kv` convention.
+bool consumes_multi_kv = false;
+```
+
+`ModelRegistry::Forward` then refuses only when a name-keyed set arrived AND the
+registration does not claim it. Every other model keeps its exact behaviour by
+construction, because `multi_kv` is `nullptr` for every topology the positional
+convention expresses.
+
+#### W5-3. How a layer finds its caches
+
+By name, which is what W3's channel exists for and what upstream does - every
+cache upstream is registered under its own prefix and `get_kv_cache_spec()`
+returns a `dict[str, KVCacheSpec]` keyed by it. `MultiKvCacheIndex::Find(name)`
+returns the index into `attn_kv`, or -1.
+
+The forward therefore resolves each layer's caches by the same names
+`MakeDeepseekV4KVCache` published, and **-1 is a refusal, not a fallback**: a
+name that does not resolve means the published topology and the consuming
+forward disagree, and continuing would silently drop a cache. That is the same
+polarity as W2's refusal and W3's, and it is the third time this row has needed
+it.
+
+`Find` is linear over 167 entries and a forward looks a name up once per layer
+per role; W3 recorded that as a deliberate decision rather than an oversight, and
+W5 does not change it. If profiling later shows it, an index is a follow-up with
+a measurement behind it.
+
+#### W5-4. What W5 does NOT reach, and why the gate is synthetic
+
+DeepSeek-V4-Flash has 21 `compress_ratio == 4` layers, and their DSA algorithm
+belongs to `MODEL-DSV4-DSA-COMPOSE`. **W5 leaves
+`VT_CHECK(!is_indexer && !is_comp, ...)` (`deepseek_v4.cpp:786-787`) exactly
+where it is.** So the real artifact still does not run after W5, and saying so
+here prevents the next reader from expecting it.
+
+What W5 makes true is that a DeepSeek-V4 config WITHOUT DSA layers decodes from
+the published caches instead of recomputing the prefix - which is the whole
+point of the topology and is gateable on CPU at a synthetic config, as the wave
+table says.
+
+`DeepseekV4ForwardGgufCached` (`deepseek_v4.cpp:2804`) is the precedent to build
+on: it already caches, with indexer and compressor forced OFF on every layer
+(`:677-679`).
+
+#### W5-5. Gate
+
+Red-first, on CPU at a synthetic config:
+
+1. A config with no DSA layers publishes its caches, the forward consumes them,
+   and a multi-token decode is **token-identical** to the same prompt decoded by
+   the full-recompute path. Caching a value must not change it.
+2. **The saving is real, not nominal**: the cached decode must not recompute the
+   prefix. Asserted by counting work rather than by timing, so it cannot flake.
+3. A registration that does NOT claim `consumes_multi_kv` still refuses by name
+   when a name-keyed set arrives - mutation-proven by clearing the flag and
+   seeing exactly that case go red.
+4. An unresolvable layer name refuses rather than proceeding.
+5. Every model whose topology the positional convention expresses is
+   byte-identical, which the existing suites already assert and which case 3
+   protects by construction.
+
+**NOT gateable at or below 512 tokens** for the DSA arms, per `## Gates` - the
+one arm that caches today is exact only while `seq_len <= index_topk`. W5's own
+gate is a non-DSA config, so the bound does not bind it, and it is named here so
+nobody carries a 512-token result into the DSA row.
 
 ### W1 design — allocation metadata ([#1960](https://github.com/mudler/vllm.cpp/issues/1960))
 

@@ -485,8 +485,9 @@ makes it conditional: *"This is `KV-DSV4-MULTICACHE`'s work and this row
 consumes it; if that row does not schedule it, this row's W5 is where it lands
 and the ownership is recorded in both places before a line is written."*
 
-**That condition resolved FALSE on 2026-08-30, so the GLM row does NOT take
-it.** This row scheduled W5: it has a `### W5 design` section (W5-1 through
+**That condition resolved FALSE on 2026-08-30, so W5 is STRUCK from the GLM row
+and re-sequenced there as a consumption site — struck, not deferred, because the
+wave does not belong to that row at any date.** This row scheduled W5: it has a `### W5 design` section (W5-1 through
 W5-6) tracked by [#2323](https://github.com/mudler/vllm.cpp/issues/2323), and
 its first implementation commit — W5-2's gated dispatch — is already written.
 GLM-5.3 is therefore a CONSUMER of the same by-name multi-KV channel that

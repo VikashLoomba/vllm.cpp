@@ -1745,7 +1745,22 @@ are CPU-gateable and need no GPU. W5, W7 and W8 need a GPU.** Sizes are the
 author's estimate of reviewable diff, not a budget. W1 and W2 are independent of
 each other; everything else is ordered.
 
-#### W1 — the `IQ4_XS` encoding (CPU, medium)
+#### W1 — the `IQ4_XS` encoding (CPU, medium) — **LANDED, by another row**
+
+**DISCHARGED on `origin/main` before this row reached it, and verified at the
+three sites rather than taken on report.** `2e9f4d88d`
+([#2247](https://github.com/mudler/vllm.cpp/issues/2247),
+[#2256](https://github.com/mudler/vllm.cpp/issues/2256)) landed the keep-quant
+`vec_dot` for the sibling Flash row: `VecDotIQ4_XSQ8_K` is defined at
+`cpu_quant_dot.cpp:844` and dispatched at `:1004`, its `QuantTypeTraits` row is
+`MakeTraits(DType::kIQ4_XS, DType::kQ8_K)` at `cpu_quant_traits.cpp:121-122`,
+and `KeepQuantDType` gates on `HasQuantDotKernel` at `gguf_keep_quant.cpp:176`.
+So `HasQuantDotKernel(kIQ4_XS)` is TRUE and the type is no longer expanded to
+bf16. `QUANT-GGUF-IQ4_XS` records the same at `quantization-matrix.md:78`
+(`C = Y` since #2247). **`kIQ2_XS` landed in the same commit** (`:1003`), which
+discharges the IQ4_XS and IQ2_XS halves of O2 and O3 together.
+
+The original scope is kept below as history. Nothing in it remains to do.
 
 **Scope:** the keep-quant `VecDotIQ4_XSQ8_K` and its `QuantTypeTraits` row, so
 `vt::cpu::HasQuantDotKernel(kIQ4_XS)` becomes true and
@@ -1853,8 +1868,11 @@ arrive from the config parsed in W2, not be constructed in the test.
 
 #### W5 — the indexer KV side cache (GPU, large) — [#1925](https://github.com/mudler/vllm.cpp/issues/1925)
 
-**OWNERSHIP RESOLVED 2026-08-30: this wave is NOT this row's, and the
-conditional below is retained because reading how it resolved is the point.**
+**STRUCK FROM THIS ROW 2026-08-30, and RE-SEQUENCED as a consumption site.**
+This is not a deferral: the wave does not belong to this row at any date, and
+what remains here is the site that consumes `KV-DSV4-MULTICACHE` W5 once that
+row lands it. The conditional below is retained because reading how it resolved
+is the point.
 
 **Scope:** the indexer's own 132 B/token cache in its own kv-cache group, so a
 resumed request no longer refuses. This is `KV-DSV4-MULTICACHE`'s work and this
@@ -1891,9 +1909,13 @@ so a later reader does not reopen this on the ownership point alone:
    the type by hand — which proves the class works, never that anything reaches
    it.
 
-**Order:** this wave now falls after W7, and after `KV-DSV4-MULTICACHE` W5
-lands, at which point it is a consumption site on a proven channel rather than
-a wave.
+**What is left here, and its shape.** Not a wave — a CONSUMPTION SITE that
+opens when `KV-DSV4-MULTICACHE` W5 lands, built on the form
+`MODEL-MM-GLM53-FLASH` already proved: `glm5_next_kv.{h,cpp}`,
+`ModelFactory::consumes_multi_kv_cache`, and each layer resolving its own caches
+by the names they were published under, where an unresolved name refuses rather
+than falling back. It is ordered after W7, because a consumption site needs a
+forward and a loaded weight to consume anything, and W7 supplies both.
 **Exclusions:** sparse prefill, which is W6.
 **Anchors:** `DeepseekV32IndexerCache` `deepseek_v2.py:696-701`; the
 `MLAAttentionSpec` merge rule `vllm/v1/kv_cache_interface.py:399-429` that forces
@@ -1925,6 +1947,12 @@ W3 seam; the resident class staged to device; safetensors refused by name (D1);
 `allow_mtp_tail` skipping block 78. Stage `UD-IQ1_S` (201.83 GiB, 6 shards) to
 `/mnt/nas_share` — 2.2 TiB free — and record the sha256 of each shard.
 **Exclusions:** no speed number.
+**No decoder or keep-quant question remains on this path (verified 2026-08-30):**
+all six encodings the `UD-IQ1_S` arm uses — IQ1_S, IQ3_XXS, IQ2_XXS, IQ4_XS,
+Q2_K, Q3_K — have a `vec_dot` row in `cpu_quant_dot.cpp` on `origin/main`, 6 of
+6, so the arm keeps its blocks and `gguf_device_fit.cpp`'s all-or-nothing rule
+admits it to the streaming lane. `IQ1_M` is still absent, which refuses only the
+`UD-IQ1_M` arm this wave does not stage.
 **Tests:** **G2** structurally over the real shard headers, env-gated; the model
 loads and produces a first token; the resident footprint measured against the
 14.511 GiB this section predicts, and the difference explained if it is not
@@ -2008,13 +2036,23 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   multi-device execution path this project does not have. Tracked by
   [#2214](https://github.com/mudler/vllm.cpp/issues/2214). Discharged by either
   of those two things and by nothing else.
-- **O2 — `IQ4_XS` has a decoder and no keep-quant `vec_dot`, so the target arm
+- **O2 — DISCHARGED 2026-08-30 by `2e9f4d88d`** (#2247, #2256), which landed
+  `VecDotIQ4_XSQ8_K` (`cpu_quant_dot.cpp:844`, dispatched `:1004`) and its
+  traits row (`cpu_quant_traits.cpp:121-122`). `HasQuantDotKernel(kIQ4_XS)` is
+  true, so the arm keeps its blocks and stays in the streaming lane. Verified at
+  the three sites on `origin/main`, not taken on report. Original text: `IQ4_XS`
+  has a decoder and no keep-quant `vec_dot`, so the target arm
   loads by EXPANDING four expert towers from 6.375 GiB to 24.000 GiB and, worse,
   drops out of the streaming lane entirely** (`gguf_device_fit.cpp:85-100` is
   all-or-nothing across a model's `*_exps` tensors). Discharged by W1 landing
   `VecDotIQ4_XSQ8_K`. Owned by `QUANT-GGUF-IQ4_XS`.
-- **O3 — `IQ2_XS` (id 17) is in the same state and `IQ1_M` (id 29) has no reader
-  traits at all.** `UD-Q2_K_XL` would expand 148 towers from 128.344 GiB to
+- **O3 — HALF DISCHARGED 2026-08-30. `IQ2_XS` (id 17) landed in the same
+  commit as O2** (`2e9f4d88d`, dispatched `cpu_quant_dot.cpp:1003`), so
+  `UD-Q2_K_XL` no longer expands. **`IQ1_M` (id 29) still has no reader traits
+  at all** — zero occurrences in `cpu_quant_dot.cpp` and `gguf_reader.cpp` on
+  `origin/main`, re-measured 2026-08-30 — so `UD-IQ1_M` still refuses at file
+  open and that half stands. Original text: `IQ2_XS` (id 17) is in the same
+  state and `IQ1_M` (id 29) has no reader traits at all.** `UD-Q2_K_XL` would expand 148 towers from 128.344 GiB to
   888.000 GiB; `UD-IQ1_M` refuses at file open. Discharged by a
   `VecDotIQ2_XSQ8_K` and an `IQ1_M` port, or by this row permanently recording
   those two arms as unreachable. Nothing here needs either; they are named so a
@@ -2169,8 +2207,14 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   O4 and §3.7 here; the product-code string is W2's surface and is left to the
   wave that next edits that file, named rather than silently repaired, because
   editing a refusal message is a behaviour change to a registered model and not
-  this record's to make. Verified at parity pin `5559679229`. Discharged when
-  `kForwardRefusal` cites `:1204-1227`.
+  this record's to make. Verified at parity pin `5559679229`.
+  **DISPOSITION, decided 2026-08-30: repaired IN FLOW by the next wave that
+  touches `glm_moe_dsa.cpp`, referencing O20 — not by a row of its own.** It is
+  a wrong `file:line` inside a user-visible refusal string, so a user who hits
+  the refusal is sent to a comment rather than to the check; worth fixing, and
+  not worth its own branch, gate run and fresh review. Discharged when
+  `kForwardRefusal` cites the predicate `!elig.prunes || elig.Active()` rather
+  than a line range — cite the predicate, not the line.
   **The other three anchors in §3.7 W5 verified CLEAN at the same pin**, and
   are recorded so they are not re-checked: `DeepseekV32IndexerCache`
   (`deepseek_v2.py:696-701`) is exact; the **132 B/token** figure is exact and
@@ -2192,7 +2236,7 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
 
 ### 3.10 Now
 
-**W5 DOES NOT BELONG TO THIS ROW, 2026-08-30**
+**W5 IS STRUCK FROM THIS ROW AND RE-SEQUENCED, 2026-08-30**
 ([#1925](https://github.com/mudler/vllm.cpp/issues/1925),
 [#2214](https://github.com/mudler/vllm.cpp/issues/2214)). W5 was dispatched as a
 wave of this row, and the first obligation in its own scope paragraph — settle
@@ -2244,17 +2288,36 @@ factor 2. One of four anchors wrong, one drifted, two clean.
 
 **Even with the ownership question set aside, there is nothing to build.**
 `glm_moe_dsa.cpp` is a config parser and a `kForwardRefusal` string: W2
-registered the architecture with a forward that refuses by name, and W1
-(`IQ4_XS` keep-quant) and W7 (the loader and the streamed towers) are both
-undone, so no GLM-5.3 weight can be materialized. A cache wired into a refusal
-stub is a shell under `## Nothing lands dead` — provable only by a unit test
-that constructs the type by hand, which shows the class works and never that
-anything reaches it.
+registered the architecture with a forward that refuses by name, and **W7** (the
+loader and the streamed towers) is undone, so no GLM-5.3 weight can be
+materialized. A cache wired into a refusal stub is a shell under `## Nothing
+lands dead` — provable only by a unit test that constructs the type by hand,
+which shows the class works and never that anything reaches it.
 
-**Next action:** W1, which is still independent and still unlocks two arms at
-once, then W6 (sparse prefill) and W7. This row's W5 becomes a consumption site
-once `KV-DSV4-MULTICACHE` W5 lands, on the shape `MODEL-MM-GLM53-FLASH` already
-proved (`glm5_next_kv.{h,cpp}`, `ModelFactory::consumes_multi_kv_cache`).
+**W1 IS ALREADY DONE, and this section said otherwise for one commit.** The
+first draft of this entry carried "W1 and W7 are both undone" from the wave
+table without checking the tree. `2e9f4d88d` (#2247, #2256) had already landed
+`VecDotIQ4_XSQ8_K` for the sibling Flash row: defined `cpu_quant_dot.cpp:844`,
+dispatched `:1004`, traits `cpu_quant_traits.cpp:121-122`, and
+`KeepQuantDType` gates on `HasQuantDotKernel` at `gguf_keep_quant.cpp:176`.
+`kIQ2_XS` landed with it at `:1003`. That is the SAME defect this entry was
+written to record — a wave's status read off a record instead of off the code —
+committed by the same session that had just documented it, one screen further
+down. It is kept rather than quietly fixed for that reason. O2 is discharged,
+O3's IQ2_XS half with it, and `IQ1_M` remains absent.
+
+**A second thing falls out of that table, and it removes a question from W7's
+path:** every encoding the `UD-IQ1_S` arm uses — IQ1_S, IQ3_XXS, IQ2_XXS,
+IQ4_XS, Q2_K and Q3_K — now has a `vec_dot` row on `origin/main`, verified 6 of
+6 on 2026-08-30. W7 therefore has no decoder or keep-quant question left to
+answer; the whole arm keeps its blocks and stays in the streaming lane.
+
+**Next action: W7**, which is now the critical path — it is what turns O19 from
+a staged slice into a reached one, and what gives this row's re-sequenced W5 a
+forward to consume caches into. Then W6 (sparse prefill). This row's W5 opens as
+a consumption site once `KV-DSV4-MULTICACHE` W5 lands, on the shape
+`MODEL-MM-GLM53-FLASH` already proved (`glm5_next_kv.{h,cpp}`,
+`ModelFactory::consumes_multi_kv_cache`).
 
 ---
 

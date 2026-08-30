@@ -522,6 +522,49 @@ TEST_CASE("qwen4_exp: the config refuses every unrepresentable combination BY NA
     doc["text_config"]["full_attention_interval"] = 0;
     CHECK(ThrowText(doc).find("full_attention_interval") != std::string::npos);
   }
+  // ─── W5g (#2031) — the container's own n-gram head arrays ────────────────
+  //
+  // A `qwen4exp` GGUF states `ple.head_vocab_sizes` and `ple.head_offsets` as
+  // two arrays read separately off the checkpoint, and until W5g the offsets
+  // were written into the text config by `Qwen4ExpHfConfigFromGguf` and read by
+  // NOTHING. They are now the layout's, so the parse checks them against the
+  // sizes. The defect they catch is SILENT: the offsets select rows inside a
+  // table whose row count both arrays agree on, so a wrong one gathers another
+  // head's vectors and no shape anywhere is wrong.
+  //
+  // 16 heads on this config ((3 - 1) * 8), and the sizes below are arbitrary
+  // positive numbers rather than the real primes: the check is a relation
+  // BETWEEN the two arrays and does not care what the sizes are.
+  SUBCASE("[LOCAL] stated head offsets must be the prefix sum of the stated sizes") {
+    nlohmann::json doc = FixtureDoc();
+    std::vector<int64_t> sizes, offsets;
+    int64_t running = 0;
+    for (int i = 0; i < 16; ++i) {
+      sizes.push_back(100 + i);
+      offsets.push_back(running);
+      running += 100 + i;
+    }
+    doc["text_config"]["ple_head_vocab_sizes"] = sizes;
+    doc["text_config"]["ple_head_offsets"] = offsets;
+    // AGREEING first, or the refusal below could be firing on the presence of
+    // the keys rather than on the disagreement.
+    CHECK(ThrowText(doc).empty());
+    doc["text_config"]["ple_head_offsets"][15] = offsets[15] + 1;
+    CHECK(ThrowText(doc).find("`ple_head_offsets`[15] is") != std::string::npos);
+  }
+  SUBCASE("[LOCAL] stated head offsets without stated sizes are refused") {
+    nlohmann::json doc = FixtureDoc();
+    doc["text_config"]["ple_head_offsets"] = std::vector<int64_t>(16, 0);
+    CHECK(ThrowText(doc).find("stated without `ple_head_vocab_sizes`") !=
+          std::string::npos);
+  }
+  SUBCASE("[LOCAL] a stated head offset array of the wrong length is refused") {
+    nlohmann::json doc = FixtureDoc();
+    doc["text_config"]["ple_head_vocab_sizes"] = std::vector<int64_t>(16, 100);
+    doc["text_config"]["ple_head_offsets"] = std::vector<int64_t>(15, 0);
+    CHECK(ThrowText(doc).find("`ple_head_offsets` has 15 entries") !=
+          std::string::npos);
+  }
   SUBCASE("[LOCAL] hc_lowrank must be positive") {
     nlohmann::json doc = FixtureDoc();
     doc["text_config"]["hc_lowrank"] = 0;

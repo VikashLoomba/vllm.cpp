@@ -502,9 +502,15 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
   //   (`glm5_next_registry.cpp:156-157`) and re-runs the whole prefix each step,
   //   which its own comment says in those words.
   //
-  //   `ForwardQwen4ExpForConditionalGeneration` refuses unconditionally
-  //   (`qwen4_exp_registry.cpp:142`): `Qwen4ExpTextModel::Forward` does not
-  //   exist, so there is no forward to consume anything.
+  //   `ForwardQwen4ExpForConditionalGeneration` NO LONGER refuses
+  //   unconditionally. This head composed W5f and W5g (#2031), so
+  //   `Qwen4ExpTextModel::Forward` exists and that hook calls it — see the
+  //   `Qwen4ExpTextModelForward` call site in `qwen4_exp_registry.cpp`. It is
+  //   still not a CONSUMING forward: it serves a SINGLE-SHOT prefill of one
+  //   sequence, reads `attn_kv` and `gdn_state` POSITIONALLY, and never touches
+  //   `multi_kv`. Its own refusals are BY NAME — `num_reqs == 1`, and the QSA
+  //   indexer side cache and the PLE conv ring and n-gram history having
+  //   nowhere to persist across steps.
   //
   // Letting the step run would discard a correctly allocated topology in silence
   // and report a decode rate for a full-recompute path, which is the
@@ -538,8 +544,12 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
     // reach it now and the clause is false for two of them:
     //
     //   DeepseekV4ForCausalLM            7 groups, all attention. W5 does own it.
-    //   Qwen4ExpForConditionalGeneration 3 groups. Owned by MODEL-MM-QWEN4-EXP;
-    //                                    Qwen4ExpTextModel::Forward does not exist.
+    //   Qwen4ExpForConditionalGeneration 3 groups. Owned by MODEL-MM-QWEN4-EXP.
+    //                                    `Qwen4ExpTextModel::Forward` EXISTS on
+    //                                    this head, but it prefills once from
+    //                                    the two POSITIONAL channels and reads
+    //                                    `multi_kv` nowhere, so it consumes
+    //                                    nothing this guard holds.
     //   Glm5NextForConditionalGeneration 3 groups. Owned by that model's own row.
     //
     // KV-DSV4-MULTICACHE W5 owns ONE of those three, under either of the two

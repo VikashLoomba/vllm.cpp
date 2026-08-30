@@ -185,7 +185,10 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   //     there is nowhere to persist them.
   //   * The only channel that could carry them is `multi_kv`, which
   //     `ModelRegistry::Forward` refuses by name before this hook is entered
-  //     (`model_registry.cpp:461-478`), and this model publishes three groups so
+  //     (`model_registry.cpp`, the `if (input.multi_kv != nullptr)` block —
+  //     named rather than numbered because the line anchor this carried,
+  //     `:461-478`, had drifted onto `MultiKvCacheIndex::PayloadAt`), and this
+  //     model publishes three groups so
   //     the runner sets it. #2353 established that this refusal must NOT be
   //     lifted yet: none of the three arriving architectures has a consuming
   //     forward, and the by-name channel cannot address recurrent (`MambaSpec`)

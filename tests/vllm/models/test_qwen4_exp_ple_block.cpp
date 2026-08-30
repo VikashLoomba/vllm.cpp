@@ -166,6 +166,13 @@ Qwen4ExpParams GoldenParams() {
   p.ple.ngram_size = kTinyNgramSize;
   p.ple.heads_per_ngram = kTinyHeadsPerNgram;
   p.ple.ngram_vocab_size_base = kTinyNgramVocabBase;
+  // The golden config is a `config.json`-shaped source: it STATES the base, so
+  // the prime chain has the file's own inputs and the cross-check against a
+  // stated head-size set is a comparison between two things the source said.
+  // A GGUF-derived config sets this false, and W5g narrows the cross-check to
+  // the sources that can support it. Set explicitly rather than left at the
+  // default so this file's cases keep driving the refusal.
+  p.ple.ngram_vocab_size_base_stated = true;
   p.ple.make_ngram_vocab_size_divisible_by = kTinyVocabDivisor;
   p.ple.seed = kTinySeed;
   return p;
@@ -687,6 +694,76 @@ TEST_CASE("Qwen4ExpPleLayout refuses STATED head vocabulary sizes that disagree"
     p.ple.head_vocab_sizes.assign(kTinyHeadVocabSizes, kTinyHeadVocabSizes + kHeads - 1);
     CHECK_THROWS_WITH_AS(vllm::Qwen4ExpPleLayout(p, 0),
                          doctest::Contains("per-head vocabulary sizes"),
+                         std::runtime_error);
+  }
+}
+
+// ─── W5g (#2031) — THE STATED SET IS THE AUTHORITY ───────────────────────────
+//
+// The case above drives the arm where the SOURCE stated the base, which is a
+// `config.json`. This one drives the arm a `qwen4exp` GGUF actually takes: the
+// resolved head sizes are stated, `ngram_vocab_size_base` is NOT, and the value
+// sitting in the field is upstream's 20,000,000 default rather than anything the
+// file said.
+//
+// Both halves matter and each is asserted against the OTHER's failure mode. The
+// derived chain from 20,000,000 opens at 20,000,003, so a layout that still
+// derived would be off by seven orders of magnitude on head 0's offset and the
+// table's row count — visible in the numbers below, not merely in a throw.
+TEST_CASE("Qwen4ExpPleLayout takes the STATED sizes when the source stated no base") {
+  Qwen4ExpParams p = GoldenParams();
+  p.ple.head_vocab_sizes.assign(kTinyHeadVocabSizes, kTinyHeadVocabSizes + kHeads);
+
+  SUBCASE("no stated base: the stated set builds the layout and nothing is refused") {
+    p.ple.ngram_vocab_size_base_stated = false;
+    p.ple.ngram_vocab_size_base = 20000000;  // upstream's default, as a GGUF leaves it
+    const qwen4_exp::NGramTableLayout l = vllm::Qwen4ExpPleLayout(p, 0);
+    // The VALUES, not merely "it did not throw". Every one of these is what the
+    // stated set gives and none of them is what the chain from 20,000,000 gives.
+    REQUIRE(l.head_vocab_sizes.size() == static_cast<size_t>(kHeads));
+    int64_t running = 0;
+    for (int64_t h = 0; h < kHeads; ++h) {
+      CHECK(l.head_vocab_sizes[static_cast<size_t>(h)] == kTinyHeadVocabSizes[h]);
+      CHECK(l.head_offsets[static_cast<size_t>(h)] == running);
+      running += kTinyHeadVocabSizes[h];
+    }
+    CHECK(l.total_vocab_size == running);
+    CHECK(l.padded_vocab_size == kTinyPaddedVocabSize);
+    // The chain's own head 0 is the FIRST prime after 19,999,999, which is what
+    // a layout that ignored the stated set would have used. Asserted as ABSENT
+    // so this case cannot pass on a coincidence.
+    CHECK(l.head_offsets[0] == 0);
+    CHECK(l.padded_vocab_size < 20000000);
+  }
+
+  SUBCASE("the container's own head_offsets are cross-checked against its sizes") {
+    p.ple.ngram_vocab_size_base_stated = false;
+    p.ple.head_offsets.assign(static_cast<size_t>(kHeads), 0);
+    int64_t running = 0;
+    for (int64_t h = 0; h < kHeads; ++h) {
+      p.ple.head_offsets[static_cast<size_t>(h)] = running;
+      running += kTinyHeadVocabSizes[h];
+    }
+    // Agreeing offsets pass through and reach the layout unchanged.
+    const qwen4_exp::NGramTableLayout ok = vllm::Qwen4ExpPleLayout(p, 0);
+    CHECK(ok.head_offsets == p.ple.head_offsets);
+    // ONE wrong offset is refused, and the message names both numbers. This is
+    // the defect no shape check downstream can see: the row COUNT is unchanged,
+    // so a wrong offset gathers another head's rows out of a correctly sized
+    // table.
+    p.ple.head_offsets[static_cast<size_t>(kHeads - 1)] += 1;
+    CHECK_THROWS_WITH_AS(vllm::Qwen4ExpPleLayout(p, 0),
+                         doctest::Contains("offset disagrees"),
+                         std::runtime_error);
+  }
+
+  SUBCASE("a stated set on a PLE layer OTHER than index 0 is refused") {
+    // Upstream derives a different vocabulary for every PLE layer, from the
+    // GLOBAL head index. The container states one flat array and says nothing
+    // about which layer it describes, so only index 0 is unambiguous.
+    p.ple.ngram_vocab_size_base_stated = false;
+    CHECK_THROWS_WITH_AS(vllm::Qwen4ExpPleLayout(p, 1),
+                         doctest::Contains("cannot be known to describe it"),
                          std::runtime_error);
   }
 }

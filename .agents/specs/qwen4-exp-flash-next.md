@@ -3317,7 +3317,200 @@ resolved `output_gate_type` value. The shared reader types most of them, so
 nothing is lost — but a wave titled "config resolution" owes the statement, and it
 is listed under `## Owed`.
 
+## The PLE layout's two sources, and which one is the authority (W5g, #2031)
+
+**A TOKEN CAME OUT.** On 2026-08-30, on `row/MODEL-MM-QWEN4-EXP-E2E` (W5e-2 + W5f
++ `ENG-MULTIKV-FORWARD-1925` + `ENG-MULTIKV-BYNAME` composed onto `origin/main`
+at `7d53ae3b4`), `ModelRegistry::Forward` ran a complete single-shot prefill on a
+model loaded by `ModelRegistry::Load` from a synthetic `qwen4exp` GGUF, returned
+`[1, 16]` f32 logits with every element finite, and `vt::GreedyArgmax` sampled
+token id **15**. Logit range `[3290.84, 95090.7]`. CPU, no GPU, no released
+checkpoint. `tests/vllm/models/test_qwen4_exp_layer_loop.cpp`, case
+`ModelRegistry::Forward reaches it on a loaded qwen4exp GGUF`.
+
+That is a REACH and a SAMPLE, not a token gate. The fixture's weights are a
+deterministic ramp, so no reference token stream exists and id 15 is compared
+against nothing. The tower's ARITHMETIC is gated separately against the
+lane-pinned transformers 5.16.0 oracle, unchanged by this wave at
+`max|diff| = 0.00982457` against a 3.0e-2 bound.
+
+### What stood in the way, and why it was not only the fixture
+
+W5f recorded the blocker as a fixture defect. **It is a port defect that the
+fixture was the first thing to expose**, and the correction matters because the
+fixture repairs W5e-2 proposed would each have left the port defect standing.
+
+The n-gram head vocabulary has two possible sources and they never coexist:
+
+| source | states `ngram_vocab_size_base` | states `ple.head_vocab_sizes` / `ple.head_offsets` |
+|---|---|---|
+| `config.json` | yes | no — HF derives them |
+| `qwen4exp` GGUF | **no** | yes — llama.cpp #27742 writes the resolved arrays |
+
+`NgramTableRows` (`qwen4_exp_weights.cpp`) already took the stated set as the
+authority, and `Qwen4ExpPleParams::head_vocab_sizes`'s own field comment already
+said so in those words: "Where the source states them they are the AUTHORITY,
+because they are what the shipped tensor was actually built against."
+`Qwen4ExpPleLayout` did not. It built `head_vocab_sizes`, `head_offsets` and
+`padded_vocab_size` from the prime chain, ALWAYS, and then refused when a stated
+set disagreed with the chain. On the GGUF arm the chain's input is a defaulted
+20,000,000, so:
+
+1. **The comparison was against a default, never against the file.** It can hold
+   for exactly one artifact in existence — the released checkpoint, whose base
+   really is 20,000,000 — and refuses every other `qwen4exp` file with correctly
+   loaded weights. That is what stopped W5f inside layer 1.
+2. **Had it not refused, this was a HEAP OVER-READ and not merely wrong rows.**
+   This is the W5g review's correction to an earlier wording here, which said
+   the layout "would have been wrong" and left the reader to infer how badly.
+   The mechanism is exact, and it is worth stating because the guard that looks
+   like it would catch this is the thing that fails:
+
+   `qwen4_exp_ple.cpp:293` picks the gather row as
+   `(mixed % layout.head_vocab_sizes[head]) + layout.head_offsets[head]`, and
+   `:389` bounds-checks it with
+   `if (row < 0 || row >= layout.padded_vocab_size)` — **against the LAYOUT's own
+   `padded_vocab_size`, not against the rows the buffer actually holds.** So when
+   the layout and the tensor disagree, the check is computed from the same wrong
+   number that produced the row, and it passes.
+
+   The fixture makes the size of the gap concrete. It states head vocabularies
+   23 and 29; `NgramTableRows` returns the stated padded size, so
+   `per_layer_token_embd.weight` is allocated with **128 rows**. Pre-W5g
+   `Qwen4ExpPleLayout` derived the chain from the defaulted base 20,000,000,
+   giving head sizes 20,000,003 and 20,000,023, offsets 0 and 20,000,003, and
+   `padded_vocab_size = 40,000,128`. Row indices therefore ranged over
+   `[0, 40,000,026)` and the bounds check admitted every one of them, while
+   `weights.ngram_embedding + row * head_dim` addressed a 128-row allocation.
+   Essentially every gathered row would have read past the end of the buffer —
+   an out-of-bounds read of up to ~40 M rows beyond it, with no shape error and
+   no refusal anywhere on the path.
+
+   The refusal in consequence 1 was the only thing standing between the GGUF arm
+   and that read, which is why "narrow the cross-check" on its own — W5e-2's
+   option (b), and one of the two repairs W5f proposed — would have converted a
+   loud refusal into a silent over-read. The released checkpoint escapes it
+   because its own base IS 20,000,000, so the chain reproduces the file; that
+   coincidence, not the code, is why nothing observed this until a forward ran
+   the PLE layer on a small fixture.
+
+So the repair is neither of the two W5e-2 listed. **(a) teaching the GGUF config
+builder an optional `qwen4exp.ple.ngram_vocab_size_base` is refused**: it invents
+a container key the container oracle (`llama-cpp-qwen4exp`, ggml-org/llama.cpp
+PR #27742) does not write, so the fixture would exercise our invention rather
+than the container, and consequence 2 above would survive untouched for every
+real file. **(b) narrowing the cross-check is right and insufficient on its own**
+— narrowing silences the refusal and leaves the wrong offsets. W5g does (b) AND
+promotes the stated set to the authority for the layout, which is the rule the
+rest of the port already followed.
+
+### What W5g changes
+
+- `Qwen4ExpPleParams` gains `head_offsets` (the container's own array, written
+  into the text config by `Qwen4ExpHfConfigFromGguf` since W6a and read by
+  NOTHING until now) and `ngram_vocab_size_base_stated` (whether the SOURCE said
+  it; the VALUE cannot say, because 20,000,000 is both upstream's default and the
+  released checkpoint's own base).
+- `ParseQwen4ExpParams` checks a stated offset array against the stated sizes.
+  The defect that catches is silent: the offsets select rows inside a table whose
+  row count both arrays agree on, so a wrong one gathers another head's vectors
+  and no shape anywhere is wrong.
+- `Qwen4ExpPleLayout` builds the layout from the stated set when there is one,
+  derives the chain when there is not, and runs the chain-vs-stated cross-check
+  only where the SOURCE stated the base. `layer_multipliers` stays the
+  derivation's: it is a splitmix chain over `vocab_size`, `ngram_size`, the layer
+  index and `seed`, none of which the stated arrays carry.
+- A stated set on a PLE layer OTHER than index 0 is REFUSED BY NAME. Upstream
+  derives a different vocabulary per PLE layer from the global head index
+  (`ple_layer_index * ngram_heads + head`), while the container states one flat
+  array of `ngram_heads` entries and says nothing about which layer it describes.
+  The released checkpoint has one PLE layer, so index 0 is the only unambiguous
+  case. Silence here would give layer 1 layer 0's vocabulary.
+
+Nothing is widened and no tolerance moved. The old refusal keeps its message and
+its three subcases and now fires exactly where it can be true.
+
+### Mutation evidence
+
+Each guard was deleted in place, rebuilt, run, and the tree restored (`git diff`
+empty, `touch` after restore so ninja could not skip).
+
+| mutation | what was removed | result |
+|---|---|---|
+| MUT-REACH | the `Qwen4ExpTextModelForward` call site in `qwen4_exp_registry.cpp`, replaced by a zeroed `[T, hidden]` | `test_qwen4_exp_layer_loop` RED, 90/91, at `CHECK(hi > lo)` |
+| MUT-AUTHORITY | `layout.head_vocab_sizes.assign(stated...)` — keep the derived chain | `test_qwen4_exp_layer_loop` RED at `ple_block.cpp:218`, `head 1 offset disagrees ... 23 ... 20000003` |
+| MUT-NARROW | the `ngram_vocab_size_base_stated` condition — compare always | `test_qwen4_exp_ple_block` RED **and** `test_qwen4_exp_layer_loop` RED with W5f's exact blocker restored |
+| MUT-OFFSET | the container-offset cross-check in `Qwen4ExpPleLayout` | `test_qwen4_exp_ple_block` RED, `did NOT throw at all` |
+| MUT-LAYERIDX | the `ple_layer_index == 0` guard | `test_qwen4_exp_ple_block` RED, `did NOT throw at all` |
+| MUT-PARSE | the whole `ple_head_offsets` validation in `ParseQwen4ExpParams` | `test_qwen4_exp_scaffold` RED on all three subcases |
+| MUT-INPUT | (W5g review repair) the hook IGNORES `token_ids`: `ForwardQwen4ExpForConditionalGeneration` forwards a fixed `std::vector<int32_t>(T, 1)` in its place, every other input untouched | build rc 0. `test_qwen4_exp_layer_loop` RED **103/104, on `CHECK(moved > 0.0)` alone**, `moved = 0`. The golden case stays GREEN at `0.00982457` |
+
+**MUT-REACH is the finding worth reading twice.** With the whole 4-layer tower
+deleted, the hook still returned `[1, 16]` logits, every element finite, and
+`vt::GreedyArgmax` still sampled a token — id 0, from an all-zero row. Shape,
+finiteness, range and "the argmax is the row's maximum" ALL passed. Only
+`CHECK(hi > lo)` fired. A reachability case that asserted "a token came out"
+without asserting that the logits VARY is a mute switch, and this row already
+found that exact defect in another form today.
+
+**AND `hi > lo` IS NOT THE WHOLE REPAIR, which is the W5g review's finding.**
+Because MUT-REACH reds on exactly ONE assertion, that one assertion is the whole
+of what separates a reached tower from an unreached one — and all it says is that
+the row is not CONSTANT. `lm_head` times ANY non-constant hidden clears it. So a
+hook that never read `token_ids` at all would have passed the case as written:
+90 assertions that do not look at the prompt, plus one that only asks the output
+to vary. "A token came out" was not yet "a token came out of THIS prompt".
+
+The case now runs a SECOND prompt on FRESH caches and asserts the logits moved
+(`vllm_test::MaxAbsDiff(host, host2) > 0.0`, measured at **0.0546875**). The
+caches are rebuilt rather than reused because the first forward writes the paged
+KV and both recurrent states, and a difference sourced from a dirty cache would
+let a `token_ids`-ignoring hook pass this assertion too. This is the sibling
+row's own shape one file away — `test_glm5_next_forward.cpp` runs a second `Step`
+and asserts the same property — and MUT-INPUT above is the proof that it bites:
+with the prompt ignored, `moved` reads exactly 0 and 103 of the case's 104
+assertions still pass.
+
+### `multi_kv` is NOT lifted, and W5f is not the condition that would change that
+
+The prior investigation said the guard must not be lifted without a consuming
+forward. W5f is a forward and it is NOT a consuming one, so the premise did not
+in fact move. `ForwardQwen4ExpForConditionalGeneration` reads `input.attn_kv` and
+`input.gdn_state` — the POSITIONAL channels — and never touches
+`input.multi_kv`. Three independent reasons lifting would be wrong today, in
+increasing order of how quickly they bite:
+
+1. **It would not produce a token, it would produce a different refusal.** The
+   runner publishes three groups for `qwen4_exp`, of which TWO are
+   `AttentionSpec` (group 0 QSA paged, group 2 the MLA indexer side cache), so
+   `attn_kv` arrives carrying both groups' caches while the hook checks
+   `attn_kv.size() == n_qsa` (`qwen4_exp_registry.cpp:254`). The step would stop
+   there instead.
+2. **The second step has nowhere to live.** The hook refuses `past_len != 0`
+   (`qwen4_exp_registry.cpp:221`) because `ModelForwardInput` carries no home for
+   the QSA indexer side cache or the PLE conv ring and n-gram history. A lifted
+   guard buys step 1 and refuses at step 2 — which is not decode.
+3. **A refusal nothing can drive red is a claim, not a guarantee.** Letting a
+   shape through that nothing consumes is exactly the mute-switch the guard
+   exists to prevent, and `CHECK_THROWS` satisfied by an unrelated exception is
+   the defect this row already found once today.
+
+**What WOULD change the answer**, precisely: a forward that resolves its caches
+through `MultiKvCacheIndex::Resolve` by layer name — which `ENG-MULTIKV-BYNAME`
+now makes possible for recurrent members too, 5 of 5 on this shape where it was
+2 of 5 — together with a `ModelForwardInput` that can carry the two states no
+channel carries. Then the guard becomes the per-architecture capability bit
+`.agents/specs/kv-dsv4-multicache.md` describes, and this row owns its arm.
+
 ## Owed
+
+- **CLOSED BY W5g, AND ITS DIAGNOSIS WAS HALF RIGHT.** The entry below is kept
+  because its measurement is what bought the fix, and because BOTH repairs it
+  proposed would have left the real defect standing: the layout, not only the
+  fixture, took the wrong source as authority. See
+  `## The PLE layout's two sources, and which one is the authority (W5g, #2031)`
+  above. The issue is still OWED — GitHub writes are `403` from this host, so
+  nothing could be filed for W5g either.
 
 - **THE SHARED `qwen4exp` GGUF FIXTURE IS INTERNALLY INCONSISTENT, AND NOTHING
   COULD SEE IT UNTIL A FORWARD RAN THE PLE LAYER ON IT (found by W5f).**
@@ -5040,6 +5233,68 @@ and three things are still owed before a single cell of that table exists.
   name, and the vllm.cpp cell must be a TEXT-ONLY configuration on the same
   UD-IQ1_S artifact, because the denominator reports every modality false.
 
+
+- **`ple.layer_multipliers` IS WRITTEN INTO THE TEXT CONFIG AND READ BY NOTHING,
+  exactly as `ple.head_offsets` was until W5g.** `Qwen4ExpHfConfigFromGguf` sets
+  `text["ple_layer_multipliers"]` and no code path consumes it;
+  `BuildNGramTableLayout` always derives the multipliers from a splitmix chain
+  over `vocab_size`, `ngram_size`, the PLE layer index and `seed`, where `seed`
+  is 1234 because the published `config.json` states none.
+
+  **WHAT IS NOT AT RISK, corrected by the W5g review.** An earlier wording of
+  this entry said the released artifact "has not been read for it" and that a
+  converter disagreement would make "every n-gram row from a real file somebody
+  else's". Both overstate it. `tests/vllm/models/qwen4_exp_ple_goldens.inc`
+  records `kRealLayerMultipliers = {23703573157769, 20109073645365,
+  8052911324071}` with the provenance "matches the three values published in
+  issue #1987 and range-read from the released safetensors", and
+  `test_qwen4_exp_ple.cpp` asserts our seed-1234 derivation against them
+  element-wise. So for the artifact that matters our derivation is already
+  verified against the shipped buffer, and the released file's rows are not in
+  question.
+
+  **WHAT IS STILL UNREAD is the GGUF CONTAINER KEY** — `qwen4exp.ple.layer_multipliers`
+  as llama.cpp #27742's converter writes it, at its pin. The residual risk is
+  narrower than the derivation being wrong: a file generated at a DIFFERENT seed,
+  or a converter that writes multipliers disagreeing with the checkpoint's own
+  buffer. Either would gather rows we could not detect, because we ignore the key
+  and the mismatch produces no shape error. The synthetic fixture writes no such
+  key, so nothing here observes it either way. NOT fixed in this wave because the
+  repair needs the container oracle read at its pin, which is the same evidence
+  W5g gathered for the head arrays and did not gather for this one.
+  Owned by `MODEL-MM-QWEN4-EXP`; NO ISSUE NUMBER, GitHub writes are `403`.
+
+- **A STATED HEAD-VOCABULARY SET IS REFUSED ON ANY PLE LAYER BUT INDEX 0.** W5g
+  makes this explicit rather than silently wrong (see above). It is a real
+  limitation of the container format as read at the pin: one flat array of
+  `ngram_heads` entries, with nothing saying which PLE layer it describes, while
+  upstream derives a different set per layer. The released checkpoint has one PLE
+  layer so nothing published hits it. Closing it needs the converter re-read to
+  learn whether a multi-PLE-layer file states a longer array or one per layer.
+  Owned by `MODEL-MM-QWEN4-EXP`; NO ISSUE NUMBER, GitHub writes are `403`.
+
+- **THE RETAINED CHAIN-VS-STATED CROSS-CHECK IS REACHABLE FROM NO SHIPPED
+  SOURCE.** W5g narrowed the head-vocabulary cross-check in `Qwen4ExpPleLayout`
+  to sources that STATE `ngram_vocab_size_base`, which is correct — the
+  unnarrowed form compared a file against a default and refused correctly loaded
+  weights. The consequence, which the W5g review established and this entry
+  records rather than leaves implicit: the guard now needs a stated head-size set
+  AND a stated base, and nothing shipped states both. A `qwen4exp` GGUF states
+  the sizes and never the base (`Qwen4ExpHfConfigFromGguf` writes
+  `ple_head_vocab_sizes` and no `ngram_vocab_size_base`); the released
+  `config.json` states the base and never the sizes. The only thing that drives
+  it on this head is `test_qwen4_exp_ple_block.cpp`'s `GoldenParams()`, which
+  sets `ngram_vocab_size_base_stated` by hand. "Narrowed, kept" without this
+  sentence implies a production arm that does not exist.
+
+  It is KEPT rather than deleted because the case it protects is real and one
+  converter commit away — a source that writes the resolved arrays AND the base
+  it derived them from — and because the failure is silent: `head_offsets` is an
+  exclusive prefix sum, so one wrong size re-points every later head at another
+  head's rows with no shape error. Closing this means either reading llama.cpp
+  #27742's converter at its pin to learn whether it can be made to state both,
+  or removing the guard and saying what replaces it. Owned by
+  `MODEL-MM-QWEN4-EXP`; NO ISSUE NUMBER, GitHub writes are `403`.
 
 ## Now
 

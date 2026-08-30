@@ -106,16 +106,40 @@ qwen4_exp::NGramTableLayout Qwen4ExpPleLayout(const Qwen4ExpParams& p,
   qwen4_exp::NGramTableLayout layout =
       qwen4_exp::BuildNGramTableLayout(geom, ple_layer_index);
 
-  // THE TWO SOURCES ARE CROSS-CHECKED WHERE BOTH EXIST, AND NOWHERE ELSE DOES
-  // THAT. `NgramTableRows` (`qwen4_exp_weights.cpp`) takes the STATED sizes when
-  // the file has them and derives the prime chain otherwise, so it never sees
-  // both at once and cannot compare them. Here the derivation has just run and
-  // the stated set is in hand.
+  // THE STATED SET IS THE AUTHORITY, AND THE CROSS-CHECK ONLY RUNS WHERE IT
+  // CAN BE TRUE. W5g (#2031) corrects both halves of what W5e-2 landed here.
   //
-  // A disagreement is not a shape error and would not throw anywhere
-  // downstream: `head_offsets` is an exclusive prefix sum, so ONE wrong size
-  // shifts every later head's rows inside a table whose row count both sides
-  // agree on. Every gathered vector would be somebody else's, with no crash.
+  // W5e-2 always built the layout from the prime chain and then REFUSED when a
+  // stated set disagreed with it. That is right for a `config.json`, which
+  // states `ngram_vocab_size_base` and no sizes. It is wrong for a `qwen4exp`
+  // GGUF, which states the resolved sizes and NO base
+  // (`qwen4_exp_gguf_weights.cpp`: "the resolved arrays are the authority here,
+  // because they are what the shipped tensor was built against"), so the chain
+  // ran from a DEFAULTED 20,000,000 and the comparison was against a default
+  // rather than against the file. Two consequences, and only the first was
+  // visible:
+  //
+  //   1. Every `qwen4exp` GGUF whose base is not 20,000,000 was refused by
+  //      name, correctly loaded weights and all. That is what stopped W5f's
+  //      reachability case inside layer 1.
+  //   2. Had it not refused, this was a HEAP OVER-READ, not merely wrong rows.
+  //      `head_offsets` and `padded_vocab_size` would have been the chain's —
+  //      hundreds of millions — while `NgramTableRows`
+  //      (`qwen4_exp_weights.cpp`) sized the actual tensor from the STATED set.
+  //      AND THE BOUNDS CHECK DOES NOT CATCH IT: `qwen4_exp_ple.cpp:389` tests
+  //      the row against `layout.padded_vocab_size`, the LAYOUT's own value, so
+  //      it is computed from the same wrong number that produced the row and it
+  //      passes. On the synthetic fixture that is a row index in
+  //      `[0, 40000026)` indexing a 128-row allocation. The refusal was the only
+  //      thing standing between the GGUF arm and reading off the end of the
+  //      buffer. The released checkpoint escapes both because its own base IS
+  //      20,000,000, so the chain reproduces the file — which is why nothing
+  //      saw this until a forward ran the PLE layer on a small fixture.
+  //
+  // So: where the source STATES the sizes they build the layout, exactly as
+  // `NgramTableRows` already treats them and as `Qwen4ExpPleParams` already
+  // documents ("Where the source states them they are the AUTHORITY"). The
+  // prime chain is derived only where the source states nothing.
   const std::vector<int64_t>& stated = p.ple.head_vocab_sizes;
   if (!stated.empty()) {
     VT_CHECK(static_cast<int64_t>(stated.size()) == p.ple.ngram_heads(),
@@ -123,18 +147,106 @@ qwen4_exp::NGramTableLayout Qwen4ExpPleLayout(const Qwen4ExpParams& p,
                  " per-head vocabulary sizes but this geometry has " +
                  std::to_string(p.ple.ngram_heads()) +
                  " n-gram heads ((ngram_size - 1) * heads_per_ngram)");
-    for (size_t h = 0; h < stated.size(); ++h) {
-      VT_CHECK(stated[h] == layout.head_vocab_sizes[h],
-               "qwen4_exp ple layout: head " + std::to_string(h) +
-                   " vocabulary size disagrees — the source STATES " +
-                   std::to_string(stated[h]) + " and the prime chain from "
-                   "ngram_vocab_size_base " +
-                   std::to_string(p.ple.ngram_vocab_size_base) + " derives " +
-                   std::to_string(layout.head_vocab_sizes[h]) +
-                   ". The stated set is what the shipped table was built against, so "
-                   "this is a real disagreement and not a rounding one: the head "
-                   "offsets are an exclusive prefix sum, so one wrong size silently "
-                   "re-points every later head at another head's rows");
+    // THE STATED ARRAY COVERS ONE PLE LAYER, and refusing is the honest
+    // reading rather than a limitation invented here. Upstream derives head
+    // sizes from a GLOBAL head index — `ple_layer_index * heads + head_idx`
+    // (`BuildNGramTableLayout`) — so every PLE layer has a DIFFERENT set,
+    // while the container states a single flat array of `ngram_heads` entries
+    // and says nothing about which layer it belongs to. The released
+    // checkpoint has exactly one PLE layer, so index 0 is the only one the
+    // array can mean. A file with two would silently give layer 1 layer 0's
+    // vocabulary and gather every later head's rows from the wrong offset.
+    VT_CHECK(ple_layer_index == 0,
+             "qwen4_exp ple layout: the source STATES per-head vocabulary "
+             "sizes, but a stated array is one flat set of " +
+                 std::to_string(stated.size()) +
+                 " entries and upstream derives a DIFFERENT set for every PLE "
+                 "layer (from the global head index "
+                 "`ple_layer_index * ngram_heads + head`). This is PLE layer "
+                 "index " +
+                 std::to_string(ple_layer_index) +
+                 ", so the stated array cannot be known to describe it. Only "
+                 "index 0 is unambiguous, and the released checkpoint has one "
+                 "PLE layer");
+    // THE CROSS-CHECK SURVIVES, NARROWED TO THE SOURCES THAT CAN SUPPORT IT.
+    // A disagreement is not a shape error and would not throw anywhere
+    // downstream: `head_offsets` is an exclusive prefix sum, so ONE wrong size
+    // shifts every later head's rows inside a table whose row count both sides
+    // agree on. Every gathered vector would be somebody else's, with no crash.
+    // It runs only when the SOURCE stated the base, because otherwise the
+    // chain's inputs are a default and the comparison measures nothing about
+    // the file.
+    //
+    // AND NO SHIPPED SOURCE SATISFIES BOTH HALVES TODAY. Said here rather than
+    // left for the next reader to derive: the guard needs a stated head-size
+    // set AND a stated base. A `qwen4exp` GGUF states the sizes and never the
+    // base — `Qwen4ExpHfConfigFromGguf` writes `ple_head_vocab_sizes` and no
+    // `ngram_vocab_size_base`, so `ParseQwen4ExpParams` leaves this flag false.
+    // The released `config.json` states the base and never the sizes, so
+    // `stated` is empty and the whole branch is skipped. On this head the only
+    // thing that drives the loop below is `test_qwen4_exp_ple_block.cpp`'s
+    // `GoldenParams()`, which sets the flag by hand.
+    //
+    // IT IS KEPT RATHER THAN DELETED, and the reason is not inertia. A source
+    // that states both is exactly the case it protects — a converter that
+    // writes the resolved arrays AND the base it derived them from, which is
+    // one commit away in llama.cpp #27742's own converter — and the failure it
+    // catches is silent: `head_offsets` is an exclusive prefix sum, so one
+    // wrong size re-points every later head at another head's rows with no
+    // shape error. Deleting a correct invariant to make the remaining code
+    // reachable is the wrong direction. `MODEL-MM-QWEN4-EXP` owns either
+    // producing a source that reaches it or removing it; see `## Owed` in
+    // `.agents/specs/qwen4-exp-flash-next.md`.
+    if (p.ple.ngram_vocab_size_base_stated) {
+      for (size_t h = 0; h < stated.size(); ++h) {
+        VT_CHECK(stated[h] == layout.head_vocab_sizes[h],
+                 "qwen4_exp ple layout: head " + std::to_string(h) +
+                     " vocabulary size disagrees — the source STATES " +
+                     std::to_string(stated[h]) + " and the prime chain from "
+                     "ngram_vocab_size_base " +
+                     std::to_string(p.ple.ngram_vocab_size_base) + " derives " +
+                     std::to_string(layout.head_vocab_sizes[h]) +
+                     ". The stated set is what the shipped table was built against, so "
+                     "this is a real disagreement and not a rounding one: the head "
+                     "offsets are an exclusive prefix sum, so one wrong size silently "
+                     "re-points every later head at another head's rows");
+      }
+    }
+    // REBUILD FROM THE STATED SET. `layer_multipliers` stays the derivation's:
+    // it is a splitmix chain over `vocab_size`, `ngram_size`, the layer index
+    // and `seed`, none of which the stated array carries.
+    layout.head_vocab_sizes.assign(stated.begin(), stated.end());
+    layout.head_offsets.clear();
+    layout.head_offsets.reserve(stated.size());
+    layout.total_vocab_size = 0;
+    for (int64_t sz : layout.head_vocab_sizes) {
+      layout.head_offsets.push_back(layout.total_vocab_size);
+      layout.total_vocab_size += sz;
+    }
+    const int64_t divisor = p.ple.make_ngram_vocab_size_divisible_by;
+    VT_CHECK(divisor > 0,
+             "qwen4_exp ple layout: make_ngram_vocab_size_divisible_by must be "
+             "positive to pad a stated vocabulary");
+    layout.padded_vocab_size =
+        ((layout.total_vocab_size + divisor - 1) / divisor) * divisor;
+    // THE CONTAINER'S OWN OFFSETS, where it states them. `ParseQwen4ExpParams`
+    // has already checked them against the stated sizes; this asserts the
+    // array that actually reaches the gather is that one, so the two reads
+    // cannot drift apart in a later edit.
+    if (!p.ple.head_offsets.empty()) {
+      VT_CHECK(p.ple.head_offsets.size() == layout.head_offsets.size(),
+               "qwen4_exp ple layout: the source states " +
+                   std::to_string(p.ple.head_offsets.size()) +
+                   " head offsets against " +
+                   std::to_string(layout.head_offsets.size()) + " heads");
+      for (size_t h = 0; h < layout.head_offsets.size(); ++h) {
+        VT_CHECK(p.ple.head_offsets[h] == layout.head_offsets[h],
+                 "qwen4_exp ple layout: head " + std::to_string(h) +
+                     " offset disagrees — the source STATES " +
+                     std::to_string(p.ple.head_offsets[h]) +
+                     " and the exclusive prefix sum over the stated sizes puts "
+                     "it at " + std::to_string(layout.head_offsets[h]));
+      }
     }
   }
   return layout;

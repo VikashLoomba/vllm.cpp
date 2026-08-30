@@ -575,7 +575,8 @@ TEST_CASE(
 // `multi_kv`, which `ModelRegistry::Forward` refuses by name for every model, a
 // refusal #2353 established must NOT be lifted yet. What it IS: proof that the
 // registered hook is entered, opens its handle, assembles the caches, runs all
-// four block seams over 4 layers and returns finite logits of the right shape.
+// four block seams over 4 layers, returns finite logits of the right shape, and
+// that `vt::GreedyArgmax` turns them into a token id.
 // The mutation that reds it is deleting the `Qwen4ExpTextModelForward` call
 // site, which is exactly the mutation `.agents/reachability.md` step 5 asks for
 // and which the three preceding waves could only record as VACUOUS.
@@ -677,55 +678,158 @@ TEST_CASE(
   in.num_reqs = 1;
   in.gdn_state_slots = 1;
 
-  // ─── WHAT THIS CASE ASSERTS, AND WHY IT IS NOT A COMPLETED FORWARD ────────
+  // ─── WHAT THIS CASE ASSERTS: A COMPLETED FORWARD AND A SAMPLED TOKEN ──────
   //
-  // THE SHARED GGUF FIXTURE IS INTERNALLY INCONSISTENT AND NOTHING COULD SEE IT
-  // UNTIL A FORWARD RAN THE PLE LAYER ON IT. `tests/support/qwen4_exp_gguf_fixture.h`
-  // STATES `qwen4exp.ple.head_vocab_sizes = {23, 29}`, and its own comment says
-  // those are "what the HF derivation would produce from
-  // `ngram_vocab_size_base = 20`". But the GGUF CONTAINER HAS NO
-  // `ngram_vocab_size_base` KEY — `Qwen4ExpHfConfigFromGguf` never reads one, and
-  // ggml-org/llama.cpp#27742 writes the RESOLVED sizes instead of the base — so
-  // the parsed config carries upstream's DEFAULT of 20,000,000 and the prime
-  // chain derives 20,000,003. W5e-2's `Qwen4ExpPleLayout` cross-checks the two
-  // and refuses BY NAME, which is correct behaviour on a genuine disagreement
-  // and is what a tiny fixture stating sizes from a tiny base will always hit.
+  // W5f could only get to layer 1's PLE block, because W5e-2's
+  // `Qwen4ExpPleLayout` derived the n-gram head vocabulary from a DEFAULTED
+  // `ngram_vocab_size_base` and refused when the file's stated sizes disagreed.
+  // A `qwen4exp` GGUF never states that base — llama.cpp #27742's converter
+  // writes the RESOLVED arrays instead — so the comparison was against a
+  // default, and it held for exactly one file in the world: the released
+  // checkpoint, whose base really is 20,000,000. W5g makes the stated set the
+  // authority for the layout, which is what `NgramTableRows` and
+  // `Qwen4ExpPleParams`'s own field comment already said it was, and narrows
+  // the cross-check to sources that state the base. See
+  // `.agents/specs/qwen4-exp-flash-next.md` `## The PLE layout's two sources`.
   //
-  // ON A REAL `qwen4exp` FILE THE TWO AGREE, which is why this is a fixture
-  // defect and not a port one: the released config's base IS 20,000,000, so the
-  // chain derives exactly the sizes the file states. A fixture cannot have both
-  // — a table addressed from base 20,000,000 needs 40 million rows.
+  // SO THE FORWARD NOW COMPLETES. `ModelRegistry::Forward` enters the hook, the
+  // hook opens its handle, assembles the caches, runs all four block seams over
+  // 4 layers, gathers the requested row and multiplies it by the lm_head, and
+  // returns `[1, vocab]` f32 logits. `vt::GreedyArgmax` — the on-device sampler
+  // AGENTS.md routes decode through — then turns them into a token id. That is
+  // the FIRST token this architecture has ever produced in this tree.
   //
-  // SO THE REACH THIS CASE PROVES IS EXACT AND IT IS STATED AS SUCH:
-  // `ModelRegistry::Forward` enters the registered hook, the hook opens its
-  // handle, assembles the caches and CALLS `Qwen4ExpTextModelForward`, and the
-  // loop runs layer 0 (Gated DeltaNet, MoE, both hyper-connection sites) and
-  // reaches layer 1's PLE block, where the fixture's own inconsistency stops it.
-  // The ARITHMETIC of the whole tower — PLE included — is gated by the golden
-  // case above, which drives the same function directly.
+  // WHAT IT IS NOT. It is not a token GATE. The fixture's weights are a
+  // deterministic ramp, not a checkpoint, so no reference token stream exists
+  // and the id below is not compared against one. The ARITHMETIC of the whole
+  // tower is gated by the golden case above against transformers 5.16.0.
   //
-  // TWO-SIDED ON PURPOSE. Asserting only that the PLE message appears would be a
-  // spelling gate; asserting ALSO that the old unconditional refusal is GONE is
-  // what makes it a reach claim. Deleting the `Qwen4ExpTextModelForward` call
-  // site reds both halves, which is the mutation `.agents/reachability.md`
-  // step 5 asks for and which W5b-5, W5d-3, W5d-4, W5e-1 and W5e-2 could each
-  // only record as VACUOUS.
-  std::string message;
-  try {
-    (void)vllm::ModelRegistry::Forward(*model, in);
-    FAIL("ModelRegistry::Forward returned; the fixture cannot get past the PLE "
-         "layout cross-check, so this case's premise is stale");
-  } catch (const std::exception& e) {
-    message = e.what();
+  // FINITENESS IS ASSERTED BEFORE ANYTHING ELSE, and it is not decoration.
+  // `MaxAbsDiff`-style folds over `std::max` return the non-NaN operand, so an
+  // all-NaN logit row reads as a perfect match to any tolerance and an argmax
+  // over it still returns an index in range. Every element is checked.
+  vllm::ForwardLogits fl;
+  REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  CHECK(fl.rows == 1);
+  CHECK(fl.vocab == kVocab);
+  REQUIRE(fl.on_device());
+  REQUIRE(fl.device_tensor.data != nullptr);
+  REQUIRE(fl.device_tensor.dtype == DType::kF32);
+
+  std::vector<float> host(static_cast<size_t>(fl.rows * fl.vocab), 0.0F);
+  d.b.Copy(q, host.data(), fl.device_tensor.data, host.size() * sizeof(float));
+  d.b.Synchronize(q);
+
+  int finite = 0;
+  for (float v : host) finite += std::isfinite(v) ? 1 : 0;
+  REQUIRE(finite == static_cast<int>(host.size()));
+  // A CONSTANT row would satisfy every check above and mean the tower
+  // contributed nothing — the lm_head times a zero hidden is finite, in range,
+  // and argmaxes to 0. So the row must actually VARY.
+  float lo = host[0];
+  float hi = host[0];
+  for (float v : host) {
+    lo = v < lo ? v : lo;
+    hi = v > hi ? v : hi;
   }
-  INFO("ModelRegistry::Forward said: ", message);
-  // It got INTO the loop and INTO the PLE block.
-  CHECK(message.find("qwen4_exp ple layout") != std::string::npos);
-  CHECK(message.find("vocabulary size disagrees") != std::string::npos);
-  // And it is NOT the pre-W5f unconditional refusal, which is what deleting the
-  // call site would put back.
-  CHECK(message.find("the forward is not ported") == std::string::npos);
-  CHECK(message.find("LAYER LOOP") == std::string::npos);
+  CHECK(hi > lo);
+
+  // ─── THE TOKEN ────────────────────────────────────────────────────────────
+  // `vt::GreedyArgmax` is the production greedy sampler (`vt/ops.h`), the same
+  // primitive `GPUModelRunner` samples with, and it is driven here on the
+  // device tensor the forward returned rather than on a host copy.
+  std::vector<int64_t> tok(1, -1);
+  {
+    vllm::dense_attn::DBuf tok_b(d, DType::kI64, {1});
+    vt::Tensor tt = tok_b.t();
+    vt::GreedyArgmax(q, tt, fl.device_tensor);
+    tok_b.Download(d, tok.data());
+  }
+  MESSAGE("qwen4_exp sampled token id: " << tok[0] << " of " << fl.vocab
+                                         << " (logit range [" << lo << ", "
+                                         << hi << "])");
+  CHECK(tok[0] >= 0);
+  CHECK(tok[0] < fl.vocab);
+  // The argmax must be the row's own maximum, so the sampler is reading THESE
+  // logits and not an uninitialised buffer.
+  CHECK(host[static_cast<size_t>(tok[0])] == hi);
+  // And the old refusals must be gone: neither the pre-W5f unconditional one
+  // nor W5f's PLE layout stop can still be reachable on this input.
+  CHECK(finite > 0);
+
+  // ─── AND THE FORWARD DEPENDS ON ITS INPUT ─────────────────────────────────
+  //
+  // EVERY ASSERTION ABOVE IS SATISFIED BY A HOOK THAT NEVER READS `token_ids`.
+  // MUT-REACH measured exactly that: with the whole four-layer tower deleted,
+  // 90 of this case's assertions still held and only `CHECK(hi > lo)` went red.
+  // But `hi > lo` says the row is not CONSTANT, and `lm_head` times any
+  // non-constant hidden clears it — including a hidden derived from nothing but
+  // the shapes. A forward that ignored the prompt entirely would still pass
+  // every check above, so "a token came out" is not yet "a token came out of
+  // THIS prompt".
+  //
+  // A SECOND PROMPT IS THE MISSING HALF, and it is the sibling row's own shape:
+  // `test_glm5_next_forward.cpp` runs a second `Step` and asserts the logits
+  // moved. THE CACHES ARE REBUILT RATHER THAN REUSED. The first forward WRITES
+  // the paged KV and both recurrent states, so a second call on the same
+  // buffers could differ because the cache was dirty rather than because the
+  // tokens changed — which a `token_ids`-ignoring hook would also produce. Fresh
+  // zeroed buffers leave the prompt as the only input that moved.
+  std::vector<int32_t> ids2(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    // A DIFFERENT prompt, still every id in range and still EOS-terminated, so
+    // the n-gram hash sees the same segment structure and a different history.
+    ids2[static_cast<size_t>(t)] =
+        static_cast<int32_t>(t == T - 1 ? kEosTokenId : (t + 1) * 4 + 1);
+    REQUIRE(ids2[static_cast<size_t>(t)] < static_cast<int32_t>(kVocab));
+  }
+  REQUIRE(ids2 != ids);
+
+  std::vector<std::vector<float>> ssm2(3), conv2(3);
+  std::vector<vllm::dense_attn::DBuf> ssm2_b, conv2_b;
+  std::vector<vllm::GdnStateCache> gdn2(3);
+  ssm2_b.reserve(3);
+  conv2_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm2[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv2[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm2_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm2[i].data());
+    conv2_b.emplace_back(d, DType::kF32,
+                         std::vector<int64_t>{1, conv_dim, conv_len},
+                         conv2[i].data());
+    gdn2[static_cast<size_t>(i)].ssm_state = ssm2_b.back().t();
+    gdn2[static_cast<size_t>(i)].conv_state = conv2_b.back().t();
+  }
+  std::vector<uint16_t> kv2(
+      static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv2_b(d, DType::kBF16,
+                               {2, 1, T, kKvHeads, kHeadDim}, kv2.data());
+  std::vector<vllm::PagedKvCache> attn_kv2(1);
+  attn_kv2[0] = attn_kv[0];
+  attn_kv2[0].data = kv2_b.t().data;
+
+  vllm::ModelForwardInput in_p2{ids2, pos,    am, gm, attn_kv2,
+                                gdn2, config, q,  logits_indices};
+  in_p2.num_reqs = 1;
+  in_p2.gdn_state_slots = 1;
+
+  vllm::ForwardLogits fl2;
+  REQUIRE_NOTHROW(fl2 = vllm::ModelRegistry::Forward(*model, in_p2));
+  REQUIRE(fl2.on_device());
+  REQUIRE(fl2.device_tensor.data != nullptr);
+  REQUIRE(fl2.rows == fl.rows);
+  REQUIRE(fl2.vocab == fl.vocab);
+  std::vector<float> host2(static_cast<size_t>(fl2.rows * fl2.vocab), 0.0F);
+  d.b.Copy(q, host2.data(), fl2.device_tensor.data, host2.size() * sizeof(float));
+  d.b.Synchronize(q);
+  // `MaxAbsDiff` RAISES on a non-finite operand rather than folding it away, so
+  // this is also the second row's finiteness check.
+  const double moved = vllm_test::MaxAbsDiff(host, host2);
+  MESSAGE("qwen4_exp second-prompt logit movement: " << moved);
+  CHECK(moved > 0.0);
 
   // ─── THE TWO REFUSALS THIS HOOK ADVERTISES, GATED BY THEIR MESSAGE ────────
   //

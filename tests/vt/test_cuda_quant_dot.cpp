@@ -42,6 +42,21 @@
 #include "vt/quant.h"      // vt::cpu::BlockToFloat
 #include "vt/tensor.h"
 
+// The ORACLE's own numbers for the two encodings this row adds: real weight
+// bytes out of the staged GLM-5.3-Flash artifact, the oracle's own Q8_K
+// activation blocks, and the f32 result llama.cpp `b10451` computed from them.
+#include "iq2xs_iq4xs_dot_golden.h"
+#include "iq2xs_iq4xs_golden_vectors.h"
+
+// The production GGUF reader and the production residency decision, so the
+// reachability case below can start at a real file header instead of at a
+// hand-built block. `../vllm/gguf_builder.h` is the same cross-directory
+// include tests/vllm/test_gguf_dequant.cpp already makes in the other
+// direction for the golden vectors above.
+#include "../vllm/gguf_builder.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
+#include "vllm/model_executor/model_loader/gguf_reader.h"
+
 #ifdef VLLM_CPP_CUDA
 // The device-codebook seal: the CPU tables it is measured against, and the copy
 // out of device memory (only the CUDA TU that defines them can address them).
@@ -128,6 +143,22 @@ const WeightCase kCases[] = {
     // the weakest decode defect (2.7e-2, measured by mutation on the CPU arm).
     {DType::kIQ1_S, 256, 50, 0, -1, "iq1_s", 2e-3},       // Qwen3.8 UD-IQ1_S experts
     {DType::kIQ1_XXXS, 256, 38, 0, -1, "iq1_xxxs", 2e-3},  // Qwen3.8 UD-Q1_0 experts
+    // QUANT-CUDA-IQ4XS-IQ2XS (#2260). The two encodings the staged
+    // `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL arm stores 85 of its 1412 tensors
+    // in -- 82 IQ2_XS (`blk.N.ffn_{gate,up}_exps.weight`) and 3 IQ4_XS -- and
+    // IQ4_XS is ALSO the last encoding the GLM-5.3 non-flash UD-IQ1_S arm had
+    // no device kernel for, its other five all being here already. Adding the
+    // rows drives all five gates in this file, and the fused gate+up+SwiGLU one
+    // is the RED: with no `case` in that switch the seam THROWS by name, which
+    // is why both models say `--device cpu` today.
+    //
+    // Offsets restated from ggml-common.h @ b10451 rather than copied:
+    //   iq2_xs :388-393  d@0  qs@2 (u16[32])  scales@66 (u8[8])        (74 B)
+    //   iq4_xs :454-460  d@0  scales_h@2 (u16)  scales_l@4  qs@8      (136 B)
+    // Neither carries a `dmin`; IQ4_XS's per-sub-block delta is `d * (ls - 32)`
+    // spliced out of scales_l/scales_h, so there is no second f16 field to name.
+    {DType::kIQ2_XS, 256, 74, 0, -1, "iq2_xs"},     // GLM-5.3-Flash gate/up exps
+    {DType::kIQ4_XS, 256, 136, 0, -1, "iq4_xs"},    // GLM-5.3-Flash + GLM-5.3 down exps
     {DType::kQ2_K, 256, 84, 80, 82, "q2_K"},        // DeepSeek-V4 UD-Q2_K_XL
     {DType::kQ3_K, 256, 110, 108, -1, "q3_K"},
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
@@ -933,6 +964,416 @@ TEST_CASE("CUDA keep-quant GEMM registers the native kCUDA provider") {
   CHECK(vt::OpRegistered(vt::OpId::kMatmulBTQuant, DeviceType::kCUDA));
 }
 
+// ─── QUANT-CUDA-IQ4XS-IQ2XS (#2260): the two gates the kCases rows cannot be ──
+//
+// Adding IQ2_XS and IQ4_XS to `kCases` drives the five gates above, and four of
+// them compare the CUDA arm against OUR OWN CPU kernel. That is the right bound
+// for a port -- the integer core is bit-identical by construction -- but it is
+// consistency, not correctness: a defect present in both arms agrees with
+// itself. And the fifth, "vs an f64 dequantize-then-dot", reads OUR decoder.
+//
+// The two cases below are the ones that answer a question the others cannot.
+
+namespace {
+
+// tests/vt/test_ops_quant_dot.cpp::MakeDotActivation, restated rather than
+// shared: this file has no dependency on that translation unit, and the signal
+// is the load-bearing half of the golden's provenance. Every value is an
+// integer in [-1024, 1023] over 64, so it is exact in binary32 on any compiler
+// and the same bytes come out of any build.
+void MakeDotActivation(int n, uint32_t seed, float* x) {
+  uint32_t st = seed;
+  for (int i = 0; i < n; ++i) {
+    st = st * 1664525U + 1013904223U;
+    const int32_t v = static_cast<int32_t>((st >> 16) & 0x7ffU) - 1024;
+    x[i] = static_cast<float>(v) / 64.0F;
+  }
+}
+
+uint32_t FloatBits(float f) {
+  uint32_t u = 0;
+  std::memcpy(&u, &f, sizeof(u));
+  return u;
+}
+
+float BitsFloat(uint32_t u) {
+  float f = 0.0F;
+  std::memcpy(&f, &u, sizeof(f));
+  return f;
+}
+
+// One oracle-gated device case, shared by both encodings. `weights` is FOUR
+// whole super-blocks read out of the staged artifact; `expected_per_block` and
+// `expected_total` are what llama.cpp b10451's OWN vec_dot returned for them
+// against the oracle's OWN Q8_K activation blocks.
+//
+// WHAT IS COMPARED AGAINST WHAT, in words, because a reader cannot audit wiring
+// they cannot see:
+//   * at k=256 the CUDA GEMM's f32 output is compared BIT FOR BIT against the
+//     ORACLE's per-super-block number. One super-block means ONE contributing
+//     warp lane, the other 31 contribute an exact +0.0f, and `FinalFactor` is a
+//     power of two -- so no reassociation exists to explain a difference away.
+//     Nothing in this comparison reads our decoder, our CPU vec_dot, or our
+//     activation encoder: the device quantizes the f32 signal itself, and if it
+//     produced anything but the oracle's Q8_K bytes these bits would move.
+//   * at k=1024 FOUR lanes contribute, and `QuantDotGemmKernel` reduces them
+//     with __shfl_down_sync at offsets 16,8,4,2,1 -- which over four live lanes
+//     is (v0+v2)+(v1+v3), where the oracle accumulates ((v0+v1)+v2)+v3. So the
+//     PRIMARY assertion is bit equality against the oracle's own four numbers
+//     recombined in THAT order, and a SECONDARY one bounds the difference from
+//     the oracle's sequential total by the reassociation error. If the primary
+//     ever fails while the secondary holds, the warp reduction moved; that is a
+//     different finding from a wrong codebook and it should not read the same.
+void CheckCudaOracleDot(DType dtype, const char* name, const uint8_t* weights,
+                        size_t wbytes, uint32_t act_seed, uint32_t expected_total,
+                        const uint32_t (&expected_per_block)[4]) {
+  constexpr int kBlocks = 4;
+  constexpr int kK = 256 * kBlocks;
+  CAPTURE(name);
+
+  // The pairing is a CLAIM and it has been got wrong before: IQ4_XS shares
+  // IQ4_NL's 16-entry codebook but NOT its 32-element block, so it dots Q8_K.
+  REQUIRE(vt::cpu::QuantTraits(dtype).vec_dot_type == DType::kQ8_K);
+  const size_t block_bytes = wbytes / kBlocks;
+  REQUIRE(block_bytes * kBlocks == wbytes);
+
+  std::vector<float> act(kK);
+  MakeDotActivation(kK, act_seed, act.data());
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+
+  void* d_a = gpu.Alloc(act.size() * sizeof(float));
+  void* d_w = gpu.Alloc(wbytes);
+  void* d_o = gpu.Alloc(kBlocks * sizeof(float));
+  gpu.Copy(gq, d_a, act.data(), act.size() * sizeof(float));
+  gpu.Copy(gq, d_w, weights, wbytes);
+  gpu.Synchronize(gq);
+
+  // --- k=256, one super-block at a time: BIT FOR BIT against the oracle ------
+  for (int b = 0; b < kBlocks; ++b) {
+    CAPTURE(b);
+    const float poison = kPoison;
+    gpu.Copy(gq, d_o, &poison, sizeof(float));
+    gpu.Synchronize(gq);
+    Tensor at = DevTensor(static_cast<uint8_t*>(d_a) + b * 256 * sizeof(float),
+                          DType::kF32, {1, 256});
+    Tensor wt = DevTensor(static_cast<uint8_t*>(d_w) + b * block_bytes, dtype, {1, 256});
+    Tensor ot = DevTensor(d_o, DType::kF32, {1, 1});
+    vt::MatmulBTQuant(gq, ot, at, wt);
+    float got = 0.0F;
+    gpu.Copy(gq, &got, d_o, sizeof(float));
+    gpu.Synchronize(gq);
+    // isfinite FIRST: every comparison against NaN is false, so an all-NaN
+    // forward reads as agreement to any mismatch counter.
+    REQUIRE(std::isfinite(got));
+    CHECK(got != kPoison);
+    CAPTURE(got);
+    CAPTURE(BitsFloat(expected_per_block[b]));
+    CHECK(FloatBits(got) == expected_per_block[b]);
+  }
+
+  // --- k=1024, all four at once ---------------------------------------------
+  {
+    const float poison = kPoison;
+    gpu.Copy(gq, d_o, &poison, sizeof(float));
+    gpu.Synchronize(gq);
+    Tensor at = DevTensor(d_a, DType::kF32, {1, kK});
+    Tensor wt = DevTensor(d_w, dtype, {1, kK});
+    Tensor ot = DevTensor(d_o, DType::kF32, {1, 1});
+    vt::MatmulBTQuant(gq, ot, at, wt);
+    float got = 0.0F;
+    gpu.Copy(gq, &got, d_o, sizeof(float));
+    gpu.Synchronize(gq);
+    REQUIRE(std::isfinite(got));
+    CHECK(got != kPoison);
+
+    const float p0 = BitsFloat(expected_per_block[0]);
+    const float p1 = BitsFloat(expected_per_block[1]);
+    const float p2 = BitsFloat(expected_per_block[2]);
+    const float p3 = BitsFloat(expected_per_block[3]);
+    const float tree = (p0 + p2) + (p1 + p3);   // the warp reduction's order
+    CAPTURE(got);
+    CAPTURE(tree);
+    CHECK(FloatBits(got) == FloatBits(tree));
+
+    // The reassociation bound, stated from the data rather than chosen: four
+    // f32 additions over these magnitudes, each carrying at most one ULP of the
+    // running sum. It is printed as a MARGIN so a reader sees how much room the
+    // gate actually had, not only that it passed.
+    const float seq = BitsFloat(expected_total);
+    const double mag = static_cast<double>(std::fabs(p0)) + std::fabs(p1) +
+                       std::fabs(p2) + std::fabs(p3);
+    const double bound = 4.0 * 1.1920929e-7 * mag;
+    const double margin = std::fabs(static_cast<double>(got) - seq);
+    CAPTURE(seq);
+    CAPTURE(margin);
+    CAPTURE(bound);
+    CHECK(margin <= bound);
+  }
+
+  gpu.Free(d_a);
+  gpu.Free(d_w);
+  gpu.Free(d_o);
+  gpu.DestroyQueue(gq);
+}
+
+}  // namespace
+
+TEST_CASE("CUDA IQ2_XS / IQ4_XS dot the ORACLE's own numbers on REAL checkpoint bytes") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; CUDA oracle-dot gate skipped");
+    return;
+  }
+  // Weights: `blk.3.ffn_gate_exps.weight` and `blk.11.ffn_down_exps.weight` of
+  // the staged `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL artifact. Expected
+  // values: llama.cpp b10451 `ggml/src/ggml-cpu/quants.c:948`
+  // `ggml_vec_dot_iq2_xs_q8_K_generic` and `:1283`
+  // `ggml_vec_dot_iq4_xs_q8_K_generic`. Provenance, the reproduction recipe and
+  // what these particular blocks exercise are in iq2xs_iq4xs_dot_golden.h.
+  CheckCudaOracleDot(DType::kIQ2_XS, "iq2_xs", vllm_test::kIq2xsGoldenBlocks,
+                     std::size(vllm_test::kIq2xsGoldenBlocks), 0x2247U,
+                     vllm_test::kIq2xsDotExpectedBits,
+                     vllm_test::kIq2xsDotPerBlockBits);
+  CheckCudaOracleDot(DType::kIQ4_XS, "iq4_xs", vllm_test::kIq4xsGoldenBlocks,
+                     std::size(vllm_test::kIq4xsGoldenBlocks), 0x4247U,
+                     vllm_test::kIq4xsDotExpectedBits,
+                     vllm_test::kIq4xsDotPerBlockBits);
+}
+
+// ─── the gate that separates "ran on the device" from "drained to the host" ──
+//
+// `IsCudaKeepQuantSupported` returning false is NOT a refusal: the dense and
+// grouped seams call `cudaStreamSynchronize` and then run the CPU keep-quant
+// kernel over the same unified-memory tensors. On GB10 that produces CORRECT
+// numbers at host speed, so every value comparison in this file reads it as a
+// pass, and the only visible symptom is a throughput deficit nobody attributed.
+//
+// Stream capture is what tells them apart, and it is not a contrivance: decode
+// here is graph-captured, so a keep-quant GEMM that cannot be captured is a
+// keep-quant GEMM the decode path cannot use. `cudaStreamSynchronize` on a
+// capturing stream fails, which invalidates the capture -- so this case is RED
+// for exactly the dtypes that fall back and green for the ones that do not.
+// ─── from a REAL GGUF header to the device kernel, in one chain ─────────────
+//
+// Every other gate in this file hands the GEMM bytes this test made up. That
+// proves the kernel and says nothing about whether a checkpoint can reach it,
+// and the two have come apart here before: a dtype can decode, keep its blocks,
+// and still be absent from the device dispatch, which is exactly the state
+// #2260 found and fixed.
+//
+// So this one starts where a user starts. It writes a GGUF whose tensors are
+// REAL bytes of the staged `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL artifact,
+// opens it with the production reader (`GgufFile::Open` resolves a single-shard
+// path through `GgufFile::OpenOne`), asks the production residency decision what
+// to do with each tensor, and then dots the bytes the READER handed back --
+// never a local copy -- on the device. The expected value is the pinned
+// oracle's own, so a defect anywhere along that chain moves it.
+//
+// The residency half runs everywhere, including the CPU CI leg; only the GEMM
+// half needs a device.
+//
+// It is NOT a red-first discriminator and must not be read as one. Before the
+// kernels landed, `vt::MatmulBTQuant` on a CUDA queue drained the stream and ran
+// the CPU keep-quant kernel over the same unified tensors, which returns the
+// oracle's bits exactly -- so this case would have PASSED on the broken tree.
+// That is the point being made: correctness gates cannot see a host fallback,
+// which is why the capture case below exists and why this one is about the
+// CHAIN. Its red comes from the reachability mutation.
+TEST_CASE("a REAL GGUF header carries IQ2_XS / IQ4_XS to the CUDA keep-quant GEMM") {
+  gguf_test::GgufModelBuilder b;
+  // ne0 is the fastest-varying dim: 1024 elements is four whole 256-element
+  // super-blocks of either encoding, which is exactly the golden slice.
+  b.AddTensor("blk.3.ffn_gate_exps.weight", {1024}, 17,
+              std::string(reinterpret_cast<const char*>(vllm_test::kIq2xsGoldenBlocks),
+                          sizeof(vllm_test::kIq2xsGoldenBlocks)));
+  b.AddTensor("blk.11.ffn_down_exps.weight", {1024}, 23,
+              std::string(reinterpret_cast<const char*>(vllm_test::kIq4xsGoldenBlocks),
+                          sizeof(vllm_test::kIq4xsGoldenBlocks)));
+  const gguf_test::TempFile f(b.Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  struct Arm {
+    const char* tensor;
+    uint32_t ggml_type;
+    DType dtype;
+    size_t block_bytes;
+    uint32_t seed;
+    const uint32_t* per_block;
+  };
+  const Arm arms[] = {
+      {"blk.3.ffn_gate_exps.weight", 17U, DType::kIQ2_XS, 74U, 0x2247U,
+       vllm_test::kIq2xsDotPerBlockBits},
+      {"blk.11.ffn_down_exps.weight", 23U, DType::kIQ4_XS, 136U, 0x4247U,
+       vllm_test::kIq4xsDotPerBlockBits},
+  };
+
+  const bool cuda = HasCuda();
+  if (!cuda) MESSAGE("no CUDA backend on this host; only the residency half of this chain runs");
+
+  int64_t dotted = 0;
+  for (const Arm& arm : arms) {
+    const std::string tensor(arm.tensor);
+    CAPTURE(tensor);
+    const vllm::GgufTensorInfo& t = g.Get(arm.tensor);
+    REQUIRE(t.ggml_type == arm.ggml_type);
+    REQUIRE(t.nbytes == 4U * arm.block_bytes);
+
+    // The production residency decision. It must answer keep-quant, because an
+    // EXPANDED tensor never reaches a keep-quant GEMM at all -- which is the
+    // other way this chain can break, and the way #2245 found it broken.
+    // `[out=1, in=1024]` is the `kMatmulWeight` orientation `KeepQuantKDim`
+    // reads (shape[1] is K); the real artifact stores these towers stacked as
+    // `kStackedExpertWeight` `[E, out, in]`, which takes shape[2] and is
+    // already gated in tests/vllm/test_gguf_keep_quant.cpp. Both land on the
+    // same encoding rule, and this file exercises the one whose K matches the
+    // four super-blocks it then dots.
+    const vllm::GgufResidency res = vllm::RouteGgufTensor(
+        /*keep_quant=*/true, /*keep_f16=*/true, /*nvfp4_fp4=*/false,
+        /*cpu_ref=*/false, vllm::GgufTensorRole::kMatmulWeight,
+        arm.ggml_type, {1, 1024});
+    CHECK(res == vllm::GgufResidency::kKeepQuant);
+
+    if (!cuda) continue;
+    Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+    Queue gq = gpu.CreateQueue();
+    std::vector<float> act(1024);
+    MakeDotActivation(1024, arm.seed, act.data());
+
+    void* d_a = gpu.Alloc(act.size() * sizeof(float));
+    void* d_w = gpu.Alloc(t.nbytes);
+    void* d_o = gpu.Alloc(sizeof(float));
+    gpu.Copy(gq, d_a, act.data(), act.size() * sizeof(float));
+    gpu.Copy(gq, d_w, t.data, t.nbytes);   // the READER's bytes, not a copy of ours
+    gpu.Synchronize(gq);
+
+    for (int blk = 0; blk < 4; ++blk) {
+      CAPTURE(blk);
+      const float poison = kPoison;
+      gpu.Copy(gq, d_o, &poison, sizeof(float));
+      gpu.Synchronize(gq);
+      Tensor at = DevTensor(static_cast<uint8_t*>(d_a) + blk * 256 * sizeof(float),
+                            DType::kF32, {1, 256});
+      Tensor wt = DevTensor(static_cast<uint8_t*>(d_w) + blk * arm.block_bytes,
+                            arm.dtype, {1, 256});
+      Tensor ot = DevTensor(d_o, DType::kF32, {1, 1});
+      vt::MatmulBTQuant(gq, ot, at, wt);
+      float got = 0.0F;
+      gpu.Copy(gq, &got, d_o, sizeof(float));
+      gpu.Synchronize(gq);
+      REQUIRE(std::isfinite(got));
+      CHECK(got != kPoison);
+      CAPTURE(got);
+      CHECK(FloatBits(got) == arm.per_block[blk]);
+      ++dotted;
+    }
+    gpu.Free(d_a);
+    gpu.Free(d_w);
+    gpu.Free(d_o);
+    gpu.DestroyQueue(gq);
+  }
+  CAPTURE(dotted);
+  CHECK(dotted == (cuda ? 8 : 0));
+}
+
+TEST_CASE("CUDA keep-quant runs every kCases dtype INSIDE a stream capture") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; keep-quant capture gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  if (!gpu.SupportsGraphCapture()) {
+    MESSAGE("this CUDA backend does not support graph capture; gate skipped");
+    return;
+  }
+
+  int64_t captured = 0;
+  for (const WeightCase& c : kCases) {
+    const std::string case_name(c.name);
+    CAPTURE(case_name);
+    const int64_t k = 8 * c.block_elems;
+    const int64_t n = 4;
+
+    std::vector<uint8_t> wq = RandomBlocks(c, n * (k / c.block_elems), 0x5EEDU);
+    std::vector<float> a(static_cast<size_t>(k));
+    GenerateData(1.0F, a.size(), a.data());
+
+    // A queue per dtype: a capture that fails leaves its stream in an invalid
+    // capture state, and sharing one queue would spread the first failure over
+    // every dtype after it and make the RED unreadable.
+    Queue gq = gpu.CreateQueue();
+    void* d_a = gpu.Alloc(a.size() * sizeof(float));
+    void* d_w = gpu.Alloc(wq.size());
+    void* d_o = gpu.Alloc(static_cast<size_t>(n) * sizeof(float));
+    gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+    gpu.Copy(gq, d_w, wq.data(), wq.size());
+    gpu.Synchronize(gq);
+    Tensor at = DevTensor(d_a, DType::kF32, {1, k});
+    Tensor wt = DevTensor(d_w, c.dtype, {n, k});
+    Tensor ot = DevTensor(d_o, DType::kF32, {1, n});
+
+    // Warm up OUTSIDE the capture, at the SAME shape, so the per-stream Q8_K
+    // scratch already exists and this gate measures the dispatch rather than
+    // the allocator. The eager result is also the reference the replay must
+    // reproduce bit for bit.
+    vt::MatmulBTQuant(gq, ot, at, wt);
+    std::vector<float> eager(static_cast<size_t>(n), 0.0F);
+    gpu.Copy(gq, eager.data(), d_o, eager.size() * sizeof(float));
+    gpu.Synchronize(gq);
+
+    std::vector<float> poison(static_cast<size_t>(n), kPoison);
+    gpu.Copy(gq, d_o, poison.data(), poison.size() * sizeof(float));
+    gpu.Synchronize(gq);
+
+    std::string threw;
+    void* graph = nullptr;
+    try {
+      gpu.BeginCapture(gq);
+      vt::MatmulBTQuant(gq, ot, at, wt);
+      graph = gpu.EndCaptureGraph(gq);
+      gpu.ReplayGraph(gq, graph);
+      gpu.Synchronize(gq);
+    } catch (const std::exception& e) {
+      threw = e.what();
+      try {                       // close a capture the throw left open
+        if (graph == nullptr) graph = gpu.EndCaptureGraph(gq);
+      } catch (const std::exception&) {
+        graph = nullptr;
+      }
+    }
+    CAPTURE(threw);
+    CHECK(threw.empty());
+
+    if (threw.empty()) {
+      std::vector<float> replayed(static_cast<size_t>(n), 0.0F);
+      gpu.Copy(gq, replayed.data(), d_o, replayed.size() * sizeof(float));
+      gpu.Synchronize(gq);
+      int64_t poisoned = 0, nonfinite = 0, differ = 0;
+      for (size_t i = 0; i < replayed.size(); ++i) {
+        if (replayed[i] == kPoison) ++poisoned;
+        if (!std::isfinite(replayed[i])) ++nonfinite;
+        if (FloatBits(replayed[i]) != FloatBits(eager[i])) ++differ;
+      }
+      CAPTURE(poisoned);
+      CAPTURE(nonfinite);
+      CAPTURE(differ);
+      CHECK(poisoned == 0);
+      CHECK(nonfinite == 0);
+      CHECK(differ == 0);   // a captured graph replays the eager result exactly
+      ++captured;
+    }
+    if (graph != nullptr) gpu.DestroyGraph(graph);
+    gpu.Free(d_a);
+    gpu.Free(d_w);
+    gpu.Free(d_o);
+    gpu.DestroyQueue(gq);
+  }
+  // Say how many dtypes actually got captured; a loop that captured none would
+  // otherwise print the same SUCCESS as one that captured all of them.
+  CAPTURE(captured);
+  CHECK(captured == static_cast<int64_t>(std::size(kCases)));
+}
+
 #ifdef VLLM_CPP_CUDA
 // Brick 12 (ds4-gap "launch consolidation") A/B gate — PAIRED Q8_0 decode GEMV. The
 // paired kernel (one launch, two weights, one shared activation) must be BYTE-IDENTICAL
@@ -1101,16 +1542,25 @@ TEST_CASE("CUDA device codebooks == the CPU host tables (byte-exact)") {
   seal("d_iq2xxs_grid", snap->iq2xxs_grid, vt::cpu::kIq2xxsGrid, sizeof(snap->iq2xxs_grid));
   seal("d_iq3xxs_grid", snap->iq3xxs_grid, vt::cpu::kIq3xxsGrid, sizeof(snap->iq3xxs_grid));
   seal("d_iq2s_grid", snap->iq2s_grid, vt::cpu::kIq2sGrid, sizeof(snap->iq2s_grid));
+  // QUANT-CUDA-IQ4XS-IQ2XS. d_iq2xs_grid is the one table here a SIBLING could
+  // be mistaken for and still index in range: iq2xxs (256), iq2xs (512) and
+  // iq2s (1024) all hold 8 bytes per entry, so a kernel reading the wrong one
+  // returns a plausible magnitude rather than misbehaving.
+  seal("d_iq2xs_grid", snap->iq2xs_grid, vt::cpu::kIq2xsGrid, sizeof(snap->iq2xs_grid));
+  seal("d_kvalues_iq4nl", snap->kvalues_iq4nl, vt::cpu::kValuesIq4nl,
+       sizeof(snap->kvalues_iq4nl));
   seal("d_kvalues_mxfp4", snap->kvalues_mxfp4, vt::cpu::kValuesMxfp4,
        sizeof(snap->kvalues_mxfp4));
   // Say how many tables were examined: a seal that compared nothing would
   // otherwise print the same "SUCCESS!" as one that compared all eight.
   CAPTURE(sealed);
-  CHECK(sealed == 8);
+  CHECK(sealed == 10);
   // And the extents themselves, so a snapshot that silently shrank is a failure
   // rather than a shorter memcmp that trivially passes.
   CHECK(sizeof(snap->iq1s_grid) == sizeof(vt::cpu::kIq1sGrid));
   CHECK(sizeof(snap->iq1xxxs_grid) == sizeof(vt::cpu::kIq1xxxsGrid));
   CHECK(sizeof(snap->iq2s_grid) == sizeof(vt::cpu::kIq2sGrid));
+  CHECK(sizeof(snap->iq2xs_grid) == sizeof(vt::cpu::kIq2xsGrid));
+  CHECK(sizeof(snap->kvalues_iq4nl) == sizeof(vt::cpu::kValuesIq4nl));
 }
 #endif  // VLLM_CPP_CUDA

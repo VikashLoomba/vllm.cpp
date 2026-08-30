@@ -6278,6 +6278,74 @@ OWED (GitHub writes are `403` from this host, account suspended, so nothing coul
 be filed and no row was appended to `.agents/issue-index.md`; an index row
 pointing at an issue that does not exist is worse than an absent one).
 
+#### Evidence, and the exact boundary of what it covers
+
+**NO KERNEL IN THIS WAVE HAS BEEN COMPILED BY `nvcc` OR EXECUTED ON A GPU AT THE
+TIME THIS SECTION WAS WRITTEN.** The authoring host has no CUDA compiler
+(`cmake` reports `Looking for a CUDA compiler - NOTFOUND`), a `dgx:gpu0` lease
+was submitted and sat queued behind the developer's own job, and this paragraph
+is the honest state until a line below names the device, the toolkit and the
+build rc. Everything in this subsection is a HOST measurement and is labelled as
+one. A reader who needs "does it run on a GPU" has not been told yet.
+
+**What WAS measured, and why it is worth having.** The two `.cu` files were
+compiled and EXECUTED on the host under a shim that makes `__global__` a plain
+function and the launch indices a single-thread grid, so every grid-stride loop
+walks its whole index space serially. `RegisterOp` was stubbed to CAPTURE what
+each Registrar registers, which is how the driver reaches kernels that live in
+anonymous namespaces, and BOTH arms were then driven through the same function
+pointers the dispatcher would hand a caller. This exercises the arithmetic and
+the INDEXING — a transposed stride, a wrong tap lag, a ring read-after-write
+hazard, a swallowed NaN — and it exercises nothing CUDA-specific: not a launch,
+not memory, not a generated instruction, not `__fmul_rn` versus a contracted fma.
+
+| host simulation, tree `ad436f49` | result |
+|---|---|
+| conv vs the transformers ORACLE, dilation 1 / 2 / 3 | `max abs diff` 5.96e-08 / 5.96e-08 / 2.98e-08 |
+| conv vs the CPU arm, output, tokens 1 / 4 / 9 / 12, NON-ZERO incoming ring | **0 of 16 / 64 / 144 / 192 elements differ — bitwise** |
+| conv vs the CPU arm, RING write-back, same four | **0 of 144 differ — bitwise**, all four |
+| conv double-accumulator fixture (taps 1.0, 2^40, -2^40, 0) | cpu 0.731058598, sim 0.731058598, double answer 0.731058579; an f32 accumulator gives **0** |
+| gate vs the transformers ORACLE | `max abs diff` 4.77e-07 |
+| gate vs the CPU arm at T=17, hc=4, hidden=129 | **0 of 8772 differ — bitwise** |
+| gate NaN arm | `out[0]` is NaN, not the `0.5 * value = 1.0` a dropped guard returns |
+| write-back vs the CPU arm, 1x2x1 / 3x4x8 / 7x3x129 / **2x4x2560** | **0 of 2 / 96 / 2709 / 20480 differ — bitwise**, at the released hyper-connection geometry |
+| write-back hc/hidden stride, structurally, with hc == hidden | 0 of 48 misplaced |
+
+**Mutations, on the host simulation.** Each was applied with a sha256 before/after
+pair proving it changed the file, built with the rc read FIRST, run, and the tree
+restored (`git status` clean at `ad436f49`). All six build, so none is withdrawn.
+
+| mutation | build | result |
+|---|---|---|
+| M1 the conv IGNORES `args.dilation` | rc 0 | **RED.** Oracle dilation 2 and 3 both wrong (`max abs diff` 0.982 / 0.563), CPU comparison wrong at every token count (up to 6.74). Dilation 1 correctly stays green, which is the control: the mutation hard-codes 1 |
+| M2 the `SignedSqrt` NaN guard is DELETED | rc 0 | **RED, and it reproduces the recorded hazard exactly**: `out[0]` reads **1.0**, which is `0.5 * value` — a poison value rendered as a plausible number. No tolerance can see this; only the NaN case can |
+| M3 the write-back contracts into an fma | rc 0 | **RED — but only after an instrument defect was found.** See below |
+| M4 the conv accumulates in FLOAT | rc 0 | **RED** on the designed fixture (sim reads **0** against the double answer 0.731) and on all four random cases (7/16, 31/64, 75/144, 96/192 elements differ) |
+| M5 the `kQwen4ExpPleConv` kCUDA registration is DELETED | rc 0 | **RED**, abort at the lookup: the op is simply absent from the table. In the built gate this is `GetOp` throwing, which is what the registration case asserts |
+| M6 the conv's RING write-back is dropped | rc 0 | **RED ON THE RING GATE ONLY.** Every output comparison stayed GREEN and only the four ring comparisons fired. This is the separation the ring is gated apart from the output FOR: a kernel that computes every output correctly and leaves the cache unshifted is wrong on the NEXT step and a value-only gate cannot see it |
+
+**M3 IS THE FINDING WORTH READING TWICE, AND IT IS AN INSTRUMENT DEFECT, NOT A
+KERNEL ONE.** At `-O1` the mutated write-back compiled and the simulation stayed
+GREEN — 0 of 20480 elements differing at the model geometry — which reads exactly
+like a surviving mutation. It was not: `objdump` found **zero** `vfmadd`
+instructions in that object. gcc had not contracted anything, so the mutation was
+inert and "survived" meant "never took effect". At `-O3 -mfma` the same object
+carries **2** `vfmadd` instructions and the mutation REDS: 28 of 96, 634 of 2709
+and **4459 of 20480** elements differ, `max|diff|` 4.77e-07. The applied-proof for
+this mutation is therefore the FMA COUNT (0 -> 2), not the sha256, because the
+sha256 was already correct while the mutation did nothing. The unmutated control
+was re-run at the same `-O3 -mfma` and reads 0 mismatches, so the flag change is
+not what turned it red. This is the [[mutation-build-failure-reads-as-a-passing-test]]
+family in a third guise — the build succeeded, the mutation applied, and the
+COMPILER declined to express it.
+
+It also has to be said that the M3 emulation needed the two sides compiled with
+DIFFERENT flags — the mutated TU with `-ffp-contract=fast -mfma`, the CPU arm with
+the project's pinned `-ffp-contract=off` — because compiling both with contraction
+makes them agree again and hides the very asymmetry the real build has (host
+pinned off, nvcc `-fmad` on and unpinned). A single-flag emulation is not a test
+of this property.
+
 **Still owed after this wave, in order:**
 
 - **The CUDA arms of the four reduction ops**, each with the decision named in the

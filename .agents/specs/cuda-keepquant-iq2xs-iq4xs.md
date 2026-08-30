@@ -223,6 +223,43 @@ and the oracle's sequential order differ by ONE ULP on both encodings, so
 asserting bit equality against the oracle's total would have been red on the
 device for a reason that is not a defect.
 
+### The f64-dequant band was PREDICTED before the lease, not discovered on it
+
+The CUDA gate asserts each dtype against an independent f64
+dequantize-then-dot at upstream's 5e-4 (`test-backend-ops.cpp:4277`), and that
+comparison holds a Q8_K-quantized activation against an f32 reference, so what
+it measures is ACTIVATION error and how far that error travels depends on the
+weight distribution the encoding produces. `IQ1_S` and `IQ1_XXXS` needed a
+per-case ceiling for exactly that reason. A third harness therefore ran the
+device dots over the SAME `RandomBlocks` weights, the same `GenerateData`
+activation and the same M{1,4,32,512} x N{1,7,16} shapes the device case uses,
+with the production `Q8_K` encoder and `BlockToFloat` as the reference:
+
+```text
+iq2_xs worst NMSE vs f64 dequant = 1.601e-04 at M=32  N=1   (band 5e-4)  UNDER
+iq4_xs worst NMSE vs f64 dequant = 6.027e-05 at M=512 N=1   (band 5e-4)  UNDER
+```
+
+Both sit under the shared band with room, so **neither dtype takes a per-case
+ceiling and none was added**. Had either come out over, the answer would have
+been `NEEDS_DECISION`, not a wider band.
+
+### `check-pr-size.py` is red on this branch and it is BASE-CAUSED
+
+```text
+ERROR: PR size check could not classify the change:
+       unclassified repository path '.agents/scripts/glm53-dsa-first-load.sh'
+```
+
+Measured both ways. Against this row's own four commits
+(`673464ee1..HEAD`) the checker reports `OK: every explicit path class is
+within its review budget`. Against `origin/main..origin/land/glm53-flash-and-dsa`
+alone, with none of this row's commits present, it reports the identical error.
+The unclassified path is `land/glm53-flash-and-dsa`'s, added by `fe2117c63`, and
+that branch cannot pass this gate today whoever merges it. Reported rather than
+repaired: the fix is a path class in another row's change, and adding one here
+would put a checker edit into a kernel port.
+
 The generated `d_iq2xs_grid` was checked a second way, independently of the
 device seal: its 512 entries serialized little-endian FNV-1a-64 to
 `0xc9b1ee61e79909bd`, the digest `cpu_quant_iq_tables.h` states for `kIq2xsGrid`

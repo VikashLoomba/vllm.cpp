@@ -30,6 +30,7 @@
 #include <limits>
 #include <vector>
 
+#include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -323,4 +324,103 @@ TEST_CASE("W5: the SLIDING WINDOW matches upstream's swa_only layer, and bounds 
   // THE WINDOW IS LOAD-BEARING: with kv_base=40 and win=8 the full-context answer
   // is a different function, so a no-op window could not pass this.
   CHECK(vs_full > 1e-3 * mag);
+}
+
+namespace {
+
+// A `MultiKvCacheIndex` over a name list, the way the runner builds one.
+struct FakeIndex {
+  std::vector<std::string> names;
+  vllm::MultiKvCacheIndex Index() const {
+    vllm::MultiKvCacheIndex mk;
+    mk.layer_names = &names;
+    return mk;
+  }
+};
+
+vllm::DeepseekV4Params SwaOnlyParams(int64_t layers, int64_t head_dim) {
+  vllm::DeepseekV4Params p;
+  p.num_hidden_layers = layers;
+  p.head_dim = head_dim;
+  p.compress_ratios.assign(static_cast<size_t>(layers), 0);  // every layer SWA-only
+  return p;
+}
+
+std::vector<vllm::PagedKvCache> FakeCaches(size_t n, int64_t head_dim,
+                                           std::vector<std::vector<float>>* storage) {
+  std::vector<vllm::PagedKvCache> v(n);
+  storage->assign(n, std::vector<float>(static_cast<size_t>(2 * 4 * head_dim), 0.0f));
+  for (size_t i = 0; i < n; ++i) {
+    v[i].data = (*storage)[i].data();
+    v[i].dtype = vt::DType::kF32;
+    v[i].num_blocks = 2;
+    v[i].block_size = 4;
+    v[i].num_kv_heads = 1;
+    v[i].head_size = head_dim;
+  }
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every other") {
+  // `KV-DSV4-MULTICACHE` W5 (#2323). Every safety-critical decision of the paged
+  // engine path lives in this pure function, so that it is gateable WITHOUT a
+  // runner, a checkpoint or a GPU -- the same reason W1 made the staging budget
+  // pure. The registry adapter around it is glue.
+  //
+  // EACH REFUSAL GUARDS A SILENT WRONG ANSWER, not a crash: batching would attend
+  // the wrong history for every request but one, a compressor layer would attend
+  // the raw prefix instead of window-plus-compressed-history, and an unresolved
+  // name would drop a cache. All three produce plausible tokens.
+  const int64_t L = 3, HD = 32;
+  const vt::Device dev{vt::DeviceType::kCPU, 0};
+  std::vector<std::vector<float>> storage;
+  const auto caches = FakeCaches(static_cast<size_t>(L), HD, &storage);
+  FakeIndex fx;
+  for (int64_t l = 0; l < L; ++l)
+    fx.names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  const auto mk = fx.Index();
+  const auto params = SwaOnlyParams(L, HD);
+
+  // THE SERVED SHAPE: one request, every layer SWA-only, every name resolving.
+  std::vector<vt::Tensor> pages;
+  CHECK(vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 1, dev, &pages).empty());
+  REQUIRE(pages.size() == static_cast<size_t>(L));
+  for (const auto& t : pages) {
+    CHECK(t.rank == 3);
+    CHECK(t.shape[2] == HD);
+    CHECK(t.data != nullptr);
+  }
+
+  // 1. A BATCH refuses -- one `kv_base` cannot serve several context lengths.
+  pages.clear();
+  const std::string batched =
+      vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 2, dev, &pages);
+  CHECK(batched.find("one request per step only") != std::string::npos);
+  CHECK(pages.empty());
+
+  // 2. A COMPRESSOR layer refuses, naming the row that owns it.
+  auto with_comp = params;
+  with_comp.compress_ratios[1] = 128;
+  const std::string comp =
+      vllm::ResolveDeepseekV4SwaPages(with_comp, mk, caches, 1, dev, &pages);
+  CHECK(comp.find("has a compressor") != std::string::npos);
+  CHECK(comp.find("#2286") != std::string::npos);
+
+  // 3. AN UNRESOLVED NAME refuses rather than silently dropping that layer.
+  FakeIndex missing;
+  missing.names = fx.names;
+  missing.names[1] = "model.layers.1.attn.some_other_cache";
+  const auto mk_missing = missing.Index();
+  const std::string unresolved =
+      vllm::ResolveDeepseekV4SwaPages(params, mk_missing, caches, 1, dev, &pages);
+  CHECK(unresolved.find("no published cache named") != std::string::npos);
+
+  // 4. A WRONG head_size refuses -- the cache would be read at the wrong width.
+  auto wrong = caches;
+  wrong[2].head_size = HD / 2;
+  const std::string bad_width =
+      vllm::ResolveDeepseekV4SwaPages(params, mk, wrong, 1, dev, &pages);
+  CHECK(bad_width.find("head_size") != std::string::npos);
 }

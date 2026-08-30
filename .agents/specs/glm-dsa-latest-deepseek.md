@@ -1853,10 +1853,47 @@ arrive from the config parsed in W2, not be constructed in the test.
 
 #### W5 — the indexer KV side cache (GPU, large) — [#1925](https://github.com/mudler/vllm.cpp/issues/1925)
 
+**OWNERSHIP RESOLVED 2026-08-30: this wave is NOT this row's, and the
+conditional below is retained because reading how it resolved is the point.**
+
 **Scope:** the indexer's own 132 B/token cache in its own kv-cache group, so a
 resumed request no longer refuses. This is `KV-DSV4-MULTICACHE`'s work and this
 row consumes it; if that row does not schedule it, this row's W5 is where it
 lands and the ownership is recorded in both places before a line is written.
+
+**The condition resolved FALSE.** `KV-DSV4-MULTICACHE` HAS scheduled W5. It
+carries a `### W5 design` section (W5-1 through W5-6) tracked by
+[#2323](https://github.com/mudler/vllm.cpp/issues/2323), and its first
+implementation commit — W5-2's "the refusal becomes a gated dispatch" — is
+already written on `row/KV-DSV4-W5-IMPL`. Three further branches are working the
+same by-name multi-KV plumbing concurrently (`ENG-MULTIKV-BYNAME`,
+`ENG-MULTIKV-FORWARD-1925`, `MODEL-MM-GLM53-FLASH-MULTIKV`). So this row
+CONSUMES that channel and takes no cache-plumbing scope of its own; the decision
+is recorded in `.agents/specs/kv-dsv4-multicache.md` beside its W5 boundary
+table, per the sentence above.
+
+**Two further reasons, either of which is independently sufficient**, recorded
+so a later reader does not reopen this on the ownership point alone:
+
+1. **The test this wave named would have deleted another row's guard.** The
+   refusal below guards `Dots3NoteForCausalLM` and belongs to
+   `MODEL-DOTS3-NOTE` ([#699](https://github.com/mudler/vllm.cpp/issues/699)) —
+   a different model. Its own comment already says the indexer cache "is
+   `KV-DSV4-MULTICACHE` (#1925), **not this row**", and `kv-dsv4-multicache.md`
+   W5-2 says **"deleting the refusal is the one thing W5 must not do"**,
+   because it would restore the silent-discard failure W3 built it to prevent.
+   The replacement is a DISPATCH on a declared capability, not an absence.
+2. **There is no GLM-5.3 forward to wire a cache into.**
+   `glm_moe_dsa.cpp` is a config parser plus `kForwardRefusal`; W1 (`IQ4_XS`)
+   and W7 (the loader and the streamed towers) are both undone, so no GLM-5.3
+   weight can be materialized. A cache routed into a refusal stub is a shell
+   under `## Nothing lands dead`, gateable only by a unit test that constructs
+   the type by hand — which proves the class works, never that anything reaches
+   it.
+
+**Order:** this wave now falls after W7, and after `KV-DSV4-MULTICACHE` W5
+lands, at which point it is a consumption site on a proven channel rather than
+a wave.
 **Exclusions:** sparse prefill, which is W6.
 **Anchors:** `DeepseekV32IndexerCache` `deepseek_v2.py:696-701`; the
 `MLAAttentionSpec` merge rule `vllm/v1/kv_cache_interface.py:399-429` that forces
@@ -1988,9 +2025,14 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   record to repair. Named here because a reader who checks `gguf_dequant.cpp` and
   stops will conclude both types are supported.
 - **O4 — the indexer KV side cache does not exist**, so sparse decode refuses any
-  resumed request (`dots3_note_device.cpp:1147-1180`). Discharged by W5, whose
-  work is `KV-DSV4-MULTICACHE`'s
-  ([#1925](https://github.com/mudler/vllm.cpp/issues/1925)).
+  resumed request (`dots3_note_device.cpp:1204-1227`; the anchor read
+  `:1147-1180` until 2026-08-30, see O20). Discharged by `KV-DSV4-MULTICACHE`
+  W5 ([#1925](https://github.com/mudler/vllm.cpp/issues/1925),
+  [#2323](https://github.com/mudler/vllm.cpp/issues/2323)) and consumed here,
+  NOT by a wave of this row — the §3.7 W5 conditional resolved FALSE on
+  2026-08-30 and the decision is recorded in both specs. The refusal is not
+  discharged by DELETION under any owner: it guards `Dots3NoteForCausalLM`
+  (`MODEL-DOTS3-NOTE`, #699) and its replacement is a gated dispatch.
 - **O5 — MTP is skipped, not implemented.** `num_nextn_predict_layers: 1` and
   `index_share_for_mtp_iteration: true` are dropped through `allow_mtp_tail`.
   There is no MTP drafter in the tree (`src/vllm/v1/spec_decode/` holds three
@@ -2111,6 +2153,29 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   W7, tracked by [#2214](https://github.com/mudler/vllm.cpp/issues/2214), and
   discharged when W7's forward drives the 78 layers in order over one
   `MlaSharedSelection`.
+- **O20 — this section's `dots3_note_device.cpp:1147-1180` anchor was WRONG,
+  and it had already propagated into product code.** The refusing `VT_CHECK` is
+  at `:1204-1227`; `:1147-1180` is the explanatory comment block above it, so
+  the anchor pointed at prose rather than at the guard it claimed to cite. The
+  same wrong range is compiled into `kForwardRefusal`
+  (`glm_moe_dsa.cpp`), which means a GLM-5.3 user meeting the refuse-by-name
+  forward is handed a line range that does not contain a refusal. Corrected in
+  O4 and §3.7 here; the product-code string is W2's surface and is left to the
+  wave that next edits that file, named rather than silently repaired, because
+  editing a refusal message is a behaviour change to a registered model and not
+  this record's to make. Verified at parity pin `5559679229`. Discharged when
+  `kForwardRefusal` cites `:1204-1227`.
+  **The other three anchors in §3.7 W5 verified CLEAN at the same pin**, and
+  are recorded so they are not re-checked: `DeepseekV32IndexerCache`
+  (`deepseek_v2.py:696-701`) is exact; the **132 B/token** figure is exact and
+  DERIVED rather than quoted — `head_dim + head_dim // quant_block_size * 4` is
+  `128 + 128//128*4 = 132` at `dtype=torch.uint8` (`:697-698`); the
+  `MLAAttentionSpec` merge rule (`kv_cache_interface.py:399-429`) is imprecise
+  rather than wrong — the class opens at `:381` and `merge` at `:419`, so the
+  cited range's first half is `real_page_size_bytes`. That property carries **no
+  factor 2**, which is the sibling Flash row's hard-won lesson: an MLA latent is
+  ONE vector per token, not a K+V pair, and reading it pair-strided yields
+  finite, correctly-shaped, WRONG numbers.
 - **O16 and O17 were authored by W2 as O13 and O14, and are renumbered here.**
   W2 and W3 were developed on parallel branches and each appended two owed
   items to this list, so both claimed O13 and O14. W3's three items landed on
@@ -2120,6 +2185,69 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   either item.
 
 ### 3.10 Now
+
+**W5 DOES NOT BELONG TO THIS ROW, 2026-08-30**
+([#1925](https://github.com/mudler/vllm.cpp/issues/1925),
+[#2214](https://github.com/mudler/vllm.cpp/issues/2214)). W5 was dispatched as a
+wave of this row, and the first obligation in its own scope paragraph — settle
+the ownership before a line is written — resolved against it. No product code
+was written. §3.7 W5 carries the evidence and `kv-dsv4-multicache.md` carries
+the other half, as that paragraph requires.
+
+**The short version: the conditional was already false when it was written
+down.** §3.7 W5 says this wave lands here "if that row does not schedule it".
+`KV-DSV4-MULTICACHE` had scheduled it — a `### W5 design` section, W5-1 through
+W5-6, tracked by [#2323](https://github.com/mudler/vllm.cpp/issues/2323), with
+W5-2's gated dispatch already implemented. Four branches are working that
+plumbing right now. What made this worth an hour rather than a glance is that
+the roadmap sentence and the code disagreed in the ordinary direction: the
+record said "if nobody schedules it", and `git log --grep` said somebody had,
+two days earlier.
+
+**The near miss is the reusable part.** This wave's test list said *"the refusal
+at `dots3_note_device.cpp:1147-1180` is deleted"*. Three things were wrong with
+that one line and each was found by opening the file rather than trusting the
+citation:
+
+1. **It is not our refusal.** It guards `Dots3NoteForCausalLM` —
+   `MODEL-DOTS3-NOTE`, [#699](https://github.com/mudler/vllm.cpp/issues/699) —
+   and its own comment says the indexer cache "is `KV-DSV4-MULTICACHE` (#1925),
+   **not this row**".
+2. **Deleting it is forbidden by the owning row in as many words.** W5-2:
+   "deleting the refusal is the one thing W5 must not do", because it restores
+   the silent-discard failure W3 built it to prevent — a wrong-answer-not-a-crash
+   invisible to a token gate, since the tokens stay right while the decode
+   recomputes. The replacement is a DISPATCH on a declared capability.
+3. **The line range does not contain the refusal.** The `VT_CHECK` is at
+   `:1204-1227`; `:1147-1180` is the comment above it. That wrong range is
+   compiled into `kForwardRefusal` in `glm_moe_dsa.cpp`, so it is shipping to
+   users today. Recorded as O20 rather than repaired here, because editing a
+   registered model's refusal message is a behaviour change and not a record's
+   to make.
+
+**Anchors verified at parity pin `5559679229`**, so the next reader does not
+re-run them. `DeepseekV32IndexerCache` (`deepseek_v2.py:696-701`) — exact. The
+**132 B/token** figure — exact, and derived rather than quoted:
+`128 + 128//128*4 = 132` at `dtype=torch.uint8`. The `MLAAttentionSpec` merge
+rule (`kv_cache_interface.py:399-429`) — imprecise, not wrong; `merge` opens at
+`:419` and the range's first half is `real_page_size_bytes`, which carries no
+factor 2. One of four anchors wrong, one drifted, two clean.
+
+**Even with the ownership question set aside, there is nothing to build.**
+`glm_moe_dsa.cpp` is a config parser and a `kForwardRefusal` string: W2
+registered the architecture with a forward that refuses by name, and W1
+(`IQ4_XS` keep-quant) and W7 (the loader and the streamed towers) are both
+undone, so no GLM-5.3 weight can be materialized. A cache wired into a refusal
+stub is a shell under `## Nothing lands dead` — provable only by a unit test
+that constructs the type by hand, which shows the class works and never that
+anything reaches it.
+
+**Next action:** W1, which is still independent and still unlocks two arms at
+once, then W6 (sparse prefill) and W7. This row's W5 becomes a consumption site
+once `KV-DSV4-MULTICACHE` W5 lands, on the shape `MODEL-MM-GLM53-FLASH` already
+proved (`glm5_next_kv.{h,cpp}`, `ModelFactory::consumes_multi_kv_cache`).
+
+---
 
 **W4 LANDED, 2026-08-30** ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)).
 The heterogeneous indexer schedule, the `skip_topk` selection reuse and the fp32

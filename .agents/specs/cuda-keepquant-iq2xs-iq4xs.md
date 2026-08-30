@@ -158,6 +158,15 @@ would mean the gate measures the `__device__` function rather than the seam.
 - On the leased box, `scripts/check-cuda-fat-gencode.py --compile-commands` over
   that build's `compile_commands.json`, which no CPU preflight can supply.
 
+**Where the device evidence lands, so a later session does not re-queue it.**
+The job is `bash /workspace/cudaiq2260/run.sh` on `dgx:gpu0`, staged from a git
+bundle rather than a clone so it has no network dependency, and it writes
+`/workspace/cudaiq2260/out/` (= `/mnt/nas_share/rc/cudaiq2260/out/` from the
+development box): `run.log` plus `red.txt`, `green.txt`, `mutant_a.txt`,
+`mutant_b.txt`, `restored.txt`, `cubin.log`, the two `compile_commands*.json`
+and the `src_before/after` hashes. `RED_SHA` and `GREEN_SHA` are pinned in the
+script. Read those files before submitting another lease.
+
 ### The end-to-end check this row was asked for cannot run, and #2260 is not why
 
 Driving the staged GLM-5.3-Flash `UD-Q2_K_XL` through `--device cuda` was the

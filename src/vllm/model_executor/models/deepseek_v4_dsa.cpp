@@ -213,4 +213,59 @@ template std::vector<float> GroupedOutputLora<uint16_t>(const std::vector<float>
                                                         int64_t, int64_t, int64_t, int64_t,
                                                         int64_t, int64_t);
 
+
+// KV-DSV4-MULTICACHE W5 (#2323). See the header for the batch<-T mapping.
+std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<float>& q,
+                                           vt::Tensor& kv_cache, int64_t num_blocks,
+                                           int64_t block_size, int64_t num_tokens,
+                                           int64_t num_heads, int64_t head_dim,
+                                           int64_t kv_base, const std::vector<float>& sink,
+                                           float scale, bool no_sink) {
+  VT_CHECK(num_tokens > 0 && num_heads > 0 && head_dim > 0,
+           "PagedCausalMlaAttention: num_tokens/num_heads/head_dim must be > 0");
+  VT_CHECK(static_cast<int64_t>(q.size()) == num_tokens * num_heads * head_dim,
+           "PagedCausalMlaAttention: q must be [T, num_heads, head_dim]");
+  VT_CHECK(static_cast<int64_t>(sink.size()) == num_heads,
+           "PagedCausalMlaAttention: sink must be [num_heads]");
+
+  // `seq_lens[t] = kv_base + t + 1` IS the causal mask: query t's global position
+  // is `kv_base + t` and it may see `[0, kv_base + t]`, which is that many keys.
+  std::vector<int32_t> seq_lens(static_cast<size_t>(num_tokens));
+  for (int64_t t = 0; t < num_tokens; ++t)
+    seq_lens[static_cast<size_t>(t)] = static_cast<int32_t>(kv_base + t + 1);
+
+  // Every query row reads the SAME pages, so the table is one row repeated. The
+  // op indexes it per batch row, so this cannot be a single shared row.
+  std::vector<int32_t> block_table(static_cast<size_t>(num_tokens * num_blocks));
+  for (int64_t b = 0; b < num_tokens; ++b)
+    for (int64_t i = 0; i < num_blocks; ++i)
+      block_table[static_cast<size_t>(b * num_blocks + i)] = static_cast<int32_t>(i);
+
+  // The `kNoAttnSink` miswire feeds -inf, which adds nothing to the denominator
+  // and is therefore EXACTLY "no sink" rather than an approximation of it.
+  std::vector<float> sink_v = sink;
+  if (no_sink)
+    for (float& sv : sink_v) sv = -std::numeric_limits<float>::infinity();
+
+  std::vector<float> out(static_cast<size_t>(num_tokens) * num_heads * head_dim, 0.0f);
+  const vt::Device dev = queue.device;
+  vt::Tensor t_out =
+      vt::Tensor::Contiguous(out.data(), vt::DType::kF32, dev, {num_tokens, num_heads, head_dim});
+  vt::Tensor t_q = vt::Tensor::Contiguous(const_cast<float*>(q.data()), vt::DType::kF32, dev,
+                                          {num_tokens, num_heads, head_dim});
+  vt::Tensor t_bt = vt::Tensor::Contiguous(block_table.data(), vt::DType::kI32, dev,
+                                           {num_tokens, num_blocks});
+  vt::Tensor t_sl =
+      vt::Tensor::Contiguous(seq_lens.data(), vt::DType::kI32, dev, {num_tokens});
+  vt::Tensor t_sink =
+      vt::Tensor::Contiguous(sink_v.data(), vt::DType::kF32, dev, {num_heads});
+  (void)block_size;
+
+  vt::MlaDecodeAttentionArgs args;
+  args.scale = scale;
+  args.attn_sink = &t_sink;
+  vt::MlaDecodeAttention(queue, t_out, nullptr, t_q, kv_cache, t_bt, t_sl, args);
+  return out;
+}
+
 }  // namespace vllm::deepseek_v4

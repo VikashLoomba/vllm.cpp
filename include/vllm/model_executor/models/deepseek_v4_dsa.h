@@ -56,6 +56,8 @@
 #pragma once
 
 #include <cstdint>
+
+#include "vt/ops.h"
 #include <vector>
 
 namespace vllm::deepseek_v4 {
@@ -148,5 +150,35 @@ std::vector<float> GroupedOutputLora(const std::vector<float>& o,
                                      int64_t num_tokens, int64_t n_heads,
                                      int64_t head_dim, int64_t n_groups,
                                      int64_t o_lora_rank, int64_t hidden_size);
+
+
+// `KV-DSV4-MULTICACHE` W5 (#2323) — DENSE-CAUSAL MLA attention over a PAGED cache.
+//
+// The paged counterpart of the forward's step-5 loop, for the arms with no
+// indexer selection. It exists so DeepSeek-V4 can stop attending over a
+// contiguous `DeepseekV4KvCache::deck` that grows without bound and read the
+// runner's paged topology instead.
+//
+// THE MAPPING THAT MAKES ONE DECODE OP SERVE T QUERIES. `vt::MlaDecodeAttention`
+// attends ONE query per batch row over `[0, seq_lens[b])`. A V4 step carries T
+// queries whose global positions are `kv_base + t` and whose causal key set is
+// `[0, kv_base + t]` (`deepseek_v4.cpp`, the dense-causal `sel` arm). Presenting
+// the step as `batch = T` with `seq_lens[t] = kv_base + t + 1` therefore
+// reproduces the causal mask EXACTLY, with no mask tensor and no per-token
+// launch. Every row shares the same blocks, so `block_table` is the same row
+// repeated.
+//
+//   q       [T * num_heads * head_dim] f32, row-major (t, h, d)
+//   sink    [num_heads] f32 — per-head, denominator-only
+//   returns [T * num_heads * head_dim] f32
+//
+// `no_sink` is the `kNoAttnSink` miswire: it feeds `-inf`, which contributes
+// nothing to the denominator and so is exactly "no sink".
+std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<float>& q,
+                                           vt::Tensor& kv_cache, int64_t num_blocks,
+                                           int64_t block_size, int64_t num_tokens,
+                                           int64_t num_heads, int64_t head_dim,
+                                           int64_t kv_base, const std::vector<float>& sink,
+                                           float scale, bool no_sink);
 
 }  // namespace vllm::deepseek_v4

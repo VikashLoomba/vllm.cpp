@@ -169,6 +169,7 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
                                        const std::vector<int32_t>& token_ids,
                                        const std::vector<int32_t>& logits_indices,
                                        vt::Queue& queue,
+                                       std::vector<LayerCache>* caches,
                                        int64_t lm_head_chunk_bytes) {
   const Glm5NextParams& p = weights.params;
   const int64_t H = p.hidden_size;
@@ -225,11 +226,13 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
   const std::vector<float> norm =
       DecodeOwnedTensorToF32(weights.norm, "output_norm.weight");
   Glm5NextGgufLayerSource layers(weights);
-  // `caches` is null: this path re-runs the whole prefix each step and owns no
-  // state. See the header for why, and for what it costs.
+  // `caches` non-null carries the history; `TextModelForward` refuses a vector
+  // that is not exactly `num_hidden_layers` long by name
+  // (`glm5_next_layer.cpp`), so a binding that produced the wrong count stops
+  // here rather than reading a default-constructed state as a zero one.
   const std::vector<float> hidden =
       TextModelForward(p, norm, layers, embeds, mask, /*batch=*/1, /*seq_len=*/T,
-                       /*caches=*/nullptr, queue);
+                       caches, queue);
   if (static_cast<int64_t>(hidden.size()) != T * H) {
     Fail("the text model returned " + std::to_string(hidden.size()) +
          " floats, expected " + std::to_string(T * H));

@@ -1668,6 +1668,86 @@ registry TU's decode file set, and this model's f32 residual declarations live
 in `glm5_next_forward.cpp`. Teaching it to follow the hop is a semantic checker
 change, which AGENTS.md routes to its own row, spec and red-before.
 
+### W5b-2c — the engine's multi-KV index, consumed (CPU, medium). [#2348](https://github.com/mudler/vllm.cpp/issues/2348)
+
+The last thing between this model and a token, and it is not more plumbing on
+W5b-2b: it is the piece W5b-2b deliberately did not write and O27 declared as a
+staged slice.
+
+**What stood in the way, measured.** O28 drove the production C ABI at the
+staged artifact on `dgx:gpu0` and the engine refused above this row's hook:
+`22 KV cache(s) from 2 published group(s) reached this forward ... and no
+registered forward consumes a cache set keyed by layer name`. That is the
+`input.multi_kv` guard KV-DSV4-MULTICACHE W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068))
+landed, and it fires for ANY model publishing a multi-cache topology BEFORE
+dispatch.
+
+**What the engine actually hands over, read off the code and confirmed by that
+refusal's own numbers.** The three counts in it are three different
+denominators and reading them as one is the first way this mapping goes wrong:
+
+| the number | what it counts |
+|---:|---|
+| 3 published groups | `MakeGlm5NextKVCache`'s MLA latent (512), KDA recurrent state, indexer side cache (257) |
+| 22 caches in `attn_kv` | one entry per published NAME of every ATTENTION group: 11 + 11 |
+| 2 groups in `attn_kv` | the recurrent group contributes NOTHING there — its 34 layers land in `gdn_state` |
+| 3 of 3 block tables | gathered per GROUP ID, not parallel to `attn_kv` |
+
+The first published name is `model.layers.3.self_attn.attn` because the 22
+arrive in PUBLICATION order — group 0's eleven, then group 2's eleven — and
+layer 3 is this checkpoint's first DSA layer. **Nothing is resolved by
+position.** Every attention cache is found through `MultiKvCacheIndex::Find` on
+the name `MakeGlm5NextKVCache` published it under, and its group id is READ off
+the channel rather than assumed to be 0 and 2.
+
+**GROUP 0 IS AN MLA LATENT AND NOT A K+V PAIR**, and this is the one error on
+the wave that does not crash. `MLAAttentionSpec` stores ONE vector per token —
+no factor 2, no separate V — so the buffer is `[num_blocks, block_size,
+head_size]` and a row is at `(block * block_size + offset) * head_size`. A
+reader that took the ordinary pair layout indexes at twice the stride and hands
+the layer finite, correctly shaped, wrong numbers; the model then generates
+fluent text. `ResolveKvBinding` refuses `num_kv_heads != 1` and a `head_size`
+that is not the published row, and `PagedRowOffset` is the ONE place this row
+turns a logical position into an element offset.
+
+**And the arithmetic is checked against the engine's own.** The runner computes
+`attn_meta.slot_mapping` for the target attention group with its own walk of the
+same table. The binding recomputes those slots and refuses by name on a
+disagreement, so a misread block table is a refusal on the first step rather
+than a wrong token on every step after it.
+
+**The recurrent group is NOT keyed by name and the spec says so rather than
+leaving it to be discovered.** `MultiKvCacheIndex` describes `attn_kv` only; the
+KDA states arrive on `gdn_state` in ascending layer order with no name, so the
+correspondence is positional and the strongest available check is the count
+against `num_kda_layers()`. The state SLOT is the engine's —
+`GDNAttentionMetadata::non_spec_state_indices_tensor`, the compact index the
+runner remapped block-table column 0 to — because the raw block id would index a
+`[gdn_state_slots, ...]` buffer with an attention block number.
+
+**A sentence W5b-2b landed that this wave retires.** `glm5_next_forward.h` said
+the forward "re-runs the whole prefix every step", following Nemotron-H and
+Kimi-Linear. The runner does not offer that: `ModelForwardInput::token_ids` is
+the step's SCHEDULED tokens, so on the second step of a decode it is ONE id, and
+a forward that treats it as a sequence attends to an empty prefix. The house
+pattern carries the same defect and this row does not inherit it.
+
+**The guard is NARROWED, not dropped.** `ModelFactory` grows
+`consumes_multi_kv_cache`, default false, and `ModelRegistry::Forward` refuses
+only when a keyed cache set arrives AND the registered forward does not declare
+that it consumes one — which is the pair of facts the message already asserted.
+Every model refused before this change is refused after it, DeepSeek-V4
+included; #1925 still owns its consuming forward. This is the same capability
+shape `streams_routed_experts` and `supports_weight_offload` already use, and
+for the same reason: the fact is a property of a model's forward and it lives
+beside the forward.
+
+**What this wave does NOT close.** O1 stands: no end-to-end token gate for this
+model exists or can exist on this fleet, and what CI runs is the synthetic
+4-layer miniature. Ragged batching and the device arm stay refused by name. The
+forward still re-decodes every layer's weights from the block-resident tower on
+every step, which is a residency decision and not a speed one; W8 owns speed.
+
 ### W5c — the weight tower and `load_weights` — SUPERSEDED, see the LANDED section below
 
 This was W5's PLAN for W5c, and it is kept only so the two readings do not look

@@ -3656,6 +3656,80 @@ Debts this row carries, each visible rather than waived:
   — no released config selects it — and the binding hydrates its side cache as
   EMPTY, which is what `Attention` writes for such a layer.
 
+- **O30 — THE FIRST GENERATION FROM THIS ARTIFACT WAS GARBAGE, and the cause is
+  a WEIGHT LAYOUT this row's bridge cannot see. Repaired here; the coverage gap
+  that let it through is NOT.** The W5b-2c run
+  (`/mnt/nas_share/rc/glm5-w5b2c/out-20260830T080947Z`, `dgx:gpu0`, branch
+  `row/MODEL-MM-GLM53-FLASH-MULTIKV` @ `3f8c4a275`) generated 8 tokens and every
+  one was token id 0. That is not a coincidence of encoding: this file's own
+  `tokenizer.ggml.tokens[0]` is `"!"`, read directly from shard 1's KV block, so
+  `!!!!!!!!` IS eight ids of 0 and the detokenizer is exonerated.
+
+  **The mechanism, and it is silent by construction.**
+  `GgufLoadPolicy::FromEnv` sets
+  `quant_repack = keep_quant && !cpu_ref && vt::cpu::QuantRepackActive()`
+  (`gguf_keep_quant.cpp`). `OwnGgufQuantBlocks` then permutes each eligible q8_0
+  weight into the `block_q8_0x4` i8mm interleave and sets
+  `OwnedTensor::repacked` — leaving the DTYPE at `kQ8_0` and the byte count
+  IDENTICAL, because `sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0)`.
+  `DecodeOwnedTensorToF32` and `DecodeOwnedTensorRowsToF32` keyed on `t.dtype`
+  alone, so the whole-blocks check passed, the byte-span check passed, and
+  `BlockToFloat(kQ8_0)` read the interleave as plain blocks and returned finite,
+  plausible, WRONG floats with no error.
+
+  **ALL 346 of the artifact's 346 q8_0 tensors are repack-eligible**, computed
+  over the real file's own tensor table: every one satisfies `N % 4 == 0` and
+  `K % 32 == 0`. That includes `hc_attn_fn.weight` and `hc_ffn_fn.weight` on
+  **45 layers each** — both mHC mixers of every decoder layer — plus the whole
+  KDA gate chain (`ssm_f_a`, `ssm_f_b`, `ssm_g_a`, `ssm_g_b`, `ssm_beta`, 34
+  each) and the DSA and indexer projections (12 each). A residual manifold whose
+  `hc_attn_fn` is a permutation of itself is wrong at layer 0, which is why no
+  amount of reading the arithmetic found anything: the arithmetic was right and
+  its inputs were not.
+
+  **THIS ROW WAS THE ONLY MODEL WITHOUT THE TRIPWIRE.** `deepseek_v4.cpp`,
+  `laguna.cpp` and `qwen3_5.cpp` each carry `VT_CHECK(!w.repacked, ...)` at
+  their host-side consumers, and `qwen3_5.cpp` names the class exactly — issue
+  [#1320](https://github.com/mudler/vllm.cpp/issues/1320), "silent wrong tokens,
+  not a crash". `glm5_next` had neither that check nor the propagation to
+  `vt::Tensor::repacked`, so it inherited the hazard and none of the guard.
+
+  **The repair is two changes of different kinds.** The loader DECLINES the
+  repack (`kGlm5NextQuantRepack`, `kGlm5NextElemKnRepack`), because nothing on
+  this row consumes it: the forward is a host f32 reference, every weight it
+  touches goes through the two decode functions, no `vt::Tensor` is built over
+  these buffers, and `QuantRepackMatmul` is unreachable from here — so the
+  repack was buying this model nothing while costing it a load-time copy that
+  defeats the mmap borrow. The bridge then REFUSES a `repacked`, `q8_0_aligned`
+  or `elem_kn_repacked` buffer BY NAME, so a later wave that gives this row a
+  quantized GEMM gets a named refusal instead of a fluent wrong model.
+
+  **WHY ELEVEN GREEN SUITES AND A FULL PREFLIGHT MISSED IT, stated because it is
+  the reusable part.** `cpu_quant_repack_arm.cpp` guards its body with
+  `#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)` and the
+  `#else` arm returns `false`, so on x86-64 `QuantRepackActive()` is COMPILED
+  OUT and the loader never repacks. Measured, not assumed: the same load-policy
+  line that reads `QuantRepackActive()=1` on the fleet prints
+  `policy.quant_repack=0 QuantRepackActive()=0` on an x86 dev box. Every box
+  this 101.25 GiB model fits on is aarch64 with i8mm, and every box CI runs the
+  glm5 suites on is x86-64, so **the defect was unreachable in CI and
+  unavoidable in production** — the two populations do not intersect at all.
+
+  **NOT REPAIRED, and it is the part with teeth.** CI HAS an aarch64 lane,
+  `build-test-cpu-arm64` on `ubuntu-24.04-arm`, and it builds **no glm5 target**
+  (`grep -c glm5` over the job is 0): its list is `test_cpu_isa_arm`,
+  `test_ops_matmul_elem`, `test_ops_quant_dot`, `test_ops_quant_repack` and nine
+  tokenizer targets. The miniature WOULD have caught this there — its three
+  stacked expert banks are written at Q8_0 and load as `N = kExperts * kMoeI =
+  128`, `K = kH = 32`, both repack-eligible, and
+  `test_glm5_next_bridge`'s "the BLOCK-QUANT residency decodes" case asserts
+  decoded VALUES against `Q8_0ValueAt` rather than a shape. Adding the target is
+  not a one-line change to make blind: that lane builds only small targets at
+  `-j 2` and `test_glm5_next_bridge` links the whole library, so its build
+  budget has to be MEASURED before the target is added, and it cannot be
+  measured while the forge is unreachable. Owed as its own row with a measured
+  CI run behind it.
+
 ## Now
 
 `ACTIVE`, 2026-08-30. **The engine's guard above this model's forward no longer

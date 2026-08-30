@@ -2385,6 +2385,15 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   tensors, header ending exactly at end-of-file. A dry run over the real shard
   produces a 9,428,810-byte file, 64 keys becoming 65, sha256
   `b3e9838651a5c279533c98390ab4bc03cf1d8c176d5be0754180f07d9ed85c01`.
+  **CONFIRMED ON THE REAL BYTES BY W9, 2026-08-30.** The dry run above was a dry
+  run; W9 ran the script against the STAGED shard 1 with the committed
+  `config.json` and wrote the output: 9,428,677 -> 9,428,810 bytes, 64 keys ->
+  65, `21 full of 78`, full layers `{0,1,2} u {6,10,...,74}`, read back and
+  re-parsed by the script itself, sha256
+  `b3e9838651a5c279533c98390ab4bc03cf1d8c176d5be0754180f07d9ed85c01` — bit for
+  bit the dry run's predicted hash. Both hashes are now recorded side by side in
+  `docs/USAGE.md`. What remains owed is only the LOAD: the repaired shard has
+  never been fed to the loader, because shards 4-6 are not staged.
   **The output is a DERIVED artifact and must never be quoted as the published
   one.** The loader's refusal is NOT weakened, which is D3's whole point: a
   hardcoded 78-entry constant that happens to be right is the shape that silently
@@ -2515,6 +2524,51 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   exactly that: the published arm is unfeedable as shipped (O17), no load of the
   real artifact has run, and no token exists. Discharged when the row can state a
   driven load instead of a reachable loader.
+
+- **O24 — the routed-expert MoE runs the PER-EXPERT reference loop, and the
+  grouped keep-quant arm is deliberately not taken.** `vt::MoeGateUpSwiGLUGrouped`
+  consumes the WHOLE stacked tower, so it bypasses the slot lane entirely —
+  the same conflict `qwen3_5.cpp` resolves by turning grouping OFF whenever
+  streaming is on, and saying so on stderr. This row has no speed axis (O10) and
+  a grouped MoE that silently un-streams a 187.312 GiB expert set is the
+  invisible-fallback shape this campaign keeps finding, so W9 takes the loop.
+  Discharged by a row that wants the lever and can gate it, which is
+  `ENG-EXPERT-STREAM` W6 / `ENG-EXPERT-STREAM-DEVICE` W2 territory rather than
+  this row's.
+- **O25 — W9 adds a THIRD host-slice helper beside the two `ResidentWeight`
+  definitions O13 names.** `GlmResidentExpertSlice` (`glm_moe_dsa_forward.cpp`)
+  is the resident fallback `expert_stream::ExpertSlice` takes when streaming was
+  never requested or the device is discrete. It is NOT a third `ResidentWeight`:
+  it aliases the borrowed mmap at a row offset and REFUSES a discrete device by
+  name, where both `ResidentWeight`s would stage. But it is a third place in
+  this tree that decides how a weight becomes a device tensor, which is the
+  count O13 was already unhappy about. Discharged with O13, which still has no
+  owner.
+- **O26 — the router GEMM is deliberately WIDER than vLLM, on one op, and
+  nothing gates the difference.** Upstream's `GateLinear` holds the gate at the
+  model dtype and takes a bf16 x bf16 -> f32 tier
+  (`fused_moe/router/gate_linear.py`); the published GGUF stores
+  `ffn_gate_inp` at F32, and W9's forward keeps it there and widens the
+  ACTIVATION to match, so the GEMM is f32 x f32 -> f32. Three reasons are
+  recorded at the call site: it is the smallest GEMM in the model, vLLM's own
+  `force_fp32_compute` arm stores this exact weight in fp32 when no specialized
+  kernel is available, and the output feeds a DISCRETE top-k where narrowing the
+  artifact's own f32 would be us discarding precision the file carries. O18
+  already records that no numerical gate on a tiny fixture can SEE a router
+  dtype; this is the same blindness pointed the other way, and it is named
+  rather than left for a reader to find. Discharged by a fixture whose routing
+  is precision-sensitive enough to separate the two arms.
+- **O27 — the absorbed MLA trio costs 4.48 GiB that §3.3's residency plan does
+  not contain, and O9's prediction is restated rather than met.** Per layer:
+  `kv_b_proj` 29.4 MB + `w_uk_t` 12.6 MB + `w_uv` 16.8 MB = 58.8 MB, over 78
+  layers. So the resident class this port actually holds is ~18.99 GiB against
+  the 14.511 GiB §3.3 computed from the shard headers, and the §3.10 arithmetic
+  that put resident + a 4096-slot cache at 40.01 GiB becomes ~44.5 GiB against
+  119.631 GiB. It is not avoidable at this pin: `vt::BatchedMatmul` shares
+  "f32 or bf16" across its operands and there is no quantized bmm, which is the
+  same constraint `mla_attention.py:876-878` records upstream. Discharged by a
+  quantized batched GEMM, or by W7's measured-footprint number landing against
+  this figure instead of against 14.511 GiB.
 
 ### 3.10 Now
 

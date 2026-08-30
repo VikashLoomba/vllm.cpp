@@ -225,6 +225,35 @@ Stop and report, do not work around:
   Removing both entirely leaves 2.20x. Naming it here is what stops this row's
   result being read as the whole answer.
 
+## The arms, pinned
+
+| arm | commit | what it is |
+|---|---|---|
+| A | `c221c43559cbc09f6176b33d00412194762e2613` | the split instrument, no behaviour change |
+| B | `055707217c4a9820490488f596675d200996b03e` | A, plus one materialization per render |
+
+Both share the base `85f65b0e8` and differ by this row's commits ALONE. That is
+the point rather than a detail: an A/B whose arms also differ by `main`'s traffic
+measures `main`'s traffic. The merge commit this branch later takes is OUTSIDE
+the measured pair, and no claim here covers it.
+
+Archived to `/mnt/nas_share/rc/ltx25-text-cond/src{A,B}.tar.gz` with their SHAs
+beside them, which the harness reads back and records in `PROVENANCE`.
+
 ## Now
 
-`ACTIVE`. W1 and W2 are in this change; W3 and W4 follow in the same PR.
+`ACTIVE`. W1 and W2 are in this change, with red-first evidence and three
+mutations, one of which changed the design rather than confirming it.
+
+W3 and W4 are DISPATCHED and not yet read: `rc` job
+`ab8a0831-4ae4-4698-8068-40ded708df5c` on `dgx:gpu0`, submitted 2026-08-30 at
+queue position 4 behind three other jobs, `--timeout 8h --max-runtime 5h`.
+Evidence will land at `/mnt/nas_share/rc/ltx25-text-cond/run/<RUN_ID>`. Until
+that job's `SUMMARY.txt` exists this row has NO speed number and no correctness
+verdict on the device, and saying so is better than leaving the section empty.
+
+**The remote is blocked and that is recorded rather than worked around.** The
+`mudler-agent` GitHub account returned `Your account is suspended` (HTTP 403) on
+`git push` and on `gh api user`, roughly forty minutes after `gh issue create`
+succeeded for #2354. The branch is committed locally and unpushed, and there is
+no pull request. `REMOTE_UNVERIFIED` for every remote fact after that point.

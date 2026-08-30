@@ -232,6 +232,27 @@ and the oracle's sequential order differ by ONE ULP on both encodings, so
 asserting bit equality against the oracle's total would have been red on the
 device for a reason that is not a defect.
 
+### The instrument's own precondition, checked before it was trusted
+
+The device oracle-dot case does not feed the oracle's Q8_K activation blocks to
+the GEMM -- it cannot, because the CUDA path quantizes the activation itself.
+It regenerates the ORACLE's f32 signal from an LCG **restated** inside
+`tests/vt/test_cuda_quant_dot.cpp` and lets the device quantizer do the rest. A
+one-character drift in that restatement would fail the case on the device for a
+reason that is not the kernel, and the reader would have no way to tell the two
+apart from the output.
+
+So the link was checked first, with the function's exact bytes lifted out of the
+test file by line range:
+
+```text
+iq2_xs: our Q8_K of the restated signal vs the ORACLE's activation bytes: IDENTICAL (1168 B)
+iq4_xs: our Q8_K of the restated signal vs the ORACLE's activation bytes: IDENTICAL (1168 B)
+```
+
+Both seeds, both 1168-byte blobs, byte for byte. The device case therefore fails
+only about the kernel.
+
 ### The f64-dequant band was PREDICTED before the lease, not discovered on it
 
 The CUDA gate asserts each dtype against an independent f64

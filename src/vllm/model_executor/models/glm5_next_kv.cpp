@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>  // std::pair, in the per-cache geometry loop
 #include <vector>
 
 #include "vllm/model_executor/models/glm5_next_attn.h"  // IndexerRoleFor

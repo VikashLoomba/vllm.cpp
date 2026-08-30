@@ -53,8 +53,11 @@
 
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // ResolveMambaSsmCacheDType
+#include "vllm/model_executor/models/dense_attn_block.h"   // ResidentWeight
 #include "vllm/model_executor/models/qwen4_exp.h"
+#include "vllm/model_executor/models/qwen4_exp_forward.h"  // W5f: the layer loop
 #include "vllm/model_executor/models/qwen4_exp_weights.h"
+#include "vt/ops.h"
 #include "vllm/v1/kv_cache_dtype.h"     // ResolveKvCacheDType
 #include "vllm/v1/kv_cache_interface.h"
 
@@ -139,204 +142,235 @@ void PrepareQwen4ExpForConditionalGeneration(LoadedModel& model,
   (void)queue;
 }
 
+// The single-shot prefill this hook serves is assembled below from the two
+// POSITIONAL cache channels plus the three states no channel carries.
+//
+// WHY THE SCRATCH IS BUILT HERE AND NOT IN THE LOOP. `Qwen4ExpTextModelForward`
+// takes every cache as an operand and has no opinion about where they came
+// from, which is what lets its gate drive it at any `past_len`. The RESTRICTION
+// is the engine's: `ModelForwardInput` carries `attn_kv` and `gdn_state` and
+// nothing else, so the QSA indexer side cache and the PLE layer's conv ring and
+// n-gram history have no home across steps. Putting the scratch — and the
+// refusal that makes it sound — at this boundary keeps the limit where it is
+// true instead of baking it into the loop.
+
 ForwardLogits ForwardQwen4ExpForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
-  (void)model;
-  (void)input;
-  // THE REFUSAL COMES FIRST, AND THERE IS NO DOWNCAST ABOVE IT. That ordering
-  // is what makes it reachable at all, and the first draft had it the other way
-  // round.
+  // THE DOWNCAST COMES FIRST NOW, and the inversion this comment used to argue
+  // for is retired with the refusal it protected. The house shape opens the
+  // type-erased handle with `ModelAs<Qwen4ExpLoadedModel>` before doing anything
+  // else, because a bare `static_cast` down the hierarchy is undefined behaviour
+  // on an object that is not really that type (#775, #730). W5a made
+  // `load_weights` produce a genuine `Qwen4ExpLoadedModel`, and this wave gives
+  // the opened handle something to be used FOR, which is exactly the condition
+  // the previous comment named for restoring it: "W5b restores `ModelAs` in the
+  // same change that gives it something to read."
+  Qwen4ExpLoadedModel& m =
+      ModelAs<Qwen4ExpLoadedModel>(model, "Qwen4ExpForConditionalGeneration");
+  Qwen4ExpWeights& w = m.weights();
+  const Qwen4ExpParams& p = w.params;
+
+  // ─── WHAT THIS HOOK STILL REFUSES, AND WHY IT IS NOT THE LOOP ──────────────
   //
-  // The house shape opens the type-erased handle with
-  // `ModelAs<Qwen4ExpLoadedModel>` before doing anything else, because a bare
-  // `static_cast` down the hierarchy is undefined behaviour on an object that
-  // is not really that type (#775, #730). The ordering stays inverted here, and
-  // the REASON changed at W5a (#2031): the original one was that nothing could
-  // produce a loaded Qwen4-Exp while `load_weights` refused unconditionally, so
-  // every handle was a foreign one. `load_weights` LOADS now, so a caller can
-  // present a genuine `Qwen4ExpLoadedModel`, and a downcast placed first would
-  // simply succeed and then refuse one line later — no worse, but no longer the
-  // argument.
+  // THE REFUSAL NO LONGER NAMES THE LAYER LOOP, because W5f wrote it and a
+  // refusal that enumerates finished work sends the next reader to rebuild it —
+  // #2288, which this string has now produced eight times. What refuses is the
+  // ENGINE's cache plumbing, and the boundary is exact:
   //
-  // What still holds is the second half: there is nothing for the opened handle
-  // to be used FOR until W5b writes the forward, so a cast in front of an
-  // unconditional refusal buys the reader nothing and costs the #775 axis its
-  // strictly safer direction — no cast happens, so no type confusion can. W5b
-  // restores `ModelAs` in the same change that gives it something to read.
+  //   * `ModelForwardInput` carries exactly two POSITIONAL cache channels,
+  //     `attn_kv` and `gdn_state` (`model_registry.h:439-440`). The QSA INDEXER
+  //     side cache and the PLE layer's conv ring and n-gram history are NEITHER.
+  //     At `past_len == 0` all three are per-call scratch and this hook
+  //     allocates them; at any other `past_len` they would have to persist, and
+  //     there is nowhere to persist them.
+  //   * The only channel that could carry them is `multi_kv`, which
+  //     `ModelRegistry::Forward` refuses by name before this hook is entered
+  //     (`model_registry.cpp:461-478`), and this model publishes three groups so
+  //     the runner sets it. #2353 established that this refusal must NOT be
+  //     lifted yet: none of the three arriving architectures has a consuming
+  //     forward, and the by-name channel cannot address recurrent (`MambaSpec`)
+  //     members at all — their states go to `gdn_state` POSITIONALLY and their
+  //     layer names do not resolve. That is engine work, owned by
+  //     KV-DSV4-MULTICACHE W5 (#1925, #2068) and #2353, and not by this row.
+  //   * `RunQwen4ExpQsaBlockPaged` takes a `block_table` of i32 `[1, max_pages]`
+  //     — ONE sequence per call — so `num_reqs > 1` is out of reach for the same
+  //     seam work.
   //
-  // `VT_CHECK(false, ...)` IN THE HOOK BODY, and not a bare throw behind a
-  // `Class::ForwardDevice` delegate. Two constraints meet here.
-  //
-  // `scripts/check-runner-routing-consistency.py` recognises a refuse-by-name
-  // stub by exactly this token (`_REFUSE`), and it classifies the hook body
-  // itself. A model it cannot classify lands in the silently-exempt NONE
-  // bucket, which is the hole that checker exists to close — so tripping it
-  // would be the defect, not the gate. The delegate hop dots3-note uses does
-  // not help a model like this one: it resolves `Class::ForwardDevice` across
-  // translation units or through a file-local `ForwardLogits` helper, and this
-  // TU has neither.
-  //
-  // And `[[noreturn]]` on a non-void return type is MSVC C4646, promoted to
-  // C2220 under /W4 /WX; `check-windows-portability.py` caught that on the
-  // first draft of this function.
-  // THE REFUSAL NAMES WHAT IS ACTUALLY MISSING, AND IT IS NOT WHAT IT SAID.
-  // Until #2031's W5b survey this message still owed the n-gram embedding to
-  // W2, the gated residual to W3 and Qwen Sparse Attention to W4 — all three
-  // landed waves. A refusal that names finished work sends the next reader to
-  // rebuild it. The enumeration below is measured against this tree, and so is
-  // what it no longer contains: of #2249's five prerequisites, NONE remain, and
-  // the row spec's `## Owed` carries the gaps that outlive them.
-  //
-  // IT WENT STALE AGAIN WITHIN TWO WAVES, WHICH IS WHY IT IS EDITED HERE AND
-  // NOT LEFT FOR THE LOOP WAVE. That staleness is #2288, filed for traceability
-  // and fixed in the same flow by #2265. The survey listed FIVE. The grouped
-  // RMS norm is `vt::RmsNormGroup`, landed by W5d-1 (#2249 item 1) — the change
-  // that file was merged alongside, so leaving the clause would have shipped a
-  // commit whose product output denies what the commit adds. The mRoPE builder
-  // is `BuildMropeCosSinHost`, which W5d-2 (#2249 item 5, `3ed2378a3`) gave
-  // external linkage behind
-  // `include/vllm/model_executor/models/qwen3_5_mrope.h`; that wave corrected
-  // the row spec's prose and did NOT correct this string, so the refusal had
-  // been naming a finished seam since it merged. Each clause is removed rather
-  // than reworded, because a refusal enumerates what is missing and a present
-  // item is not missing.
-  //
-  // AND IT WENT STALE A FOURTH TIME, IN THE SAME WAY, WHILE W5d-4's BRANCH SAT
-  // BEHIND `main`. #2288's own residual — recorded under `## Owed` in the row
-  // spec — predicted that nothing mechanical prevents the fourth instance, and
-  // the fourth was that one. W5d-4 (#2249 item 4) IS the adapter from the
-  // stacked [E, I, H] qwen4_exp MoE tensors onto `MoeBlockWeights`
-  // (`qwen4_exp_moe.{h,cpp}`), which was an enumerated item here until
-  // `3f9177f7f` landed it. The adapter is a SEAM and not a call: it landed
-  // unreached, the row spec says so under `## Owed`, and the refusal below
-  // still refuses because the loop that would call it does not exist.
-  //
-  // AND A FIFTH TIME, ON THIS MERGE — WHERE NEITHER SIDE OF THE CONFLICT WAS
-  // TRUE, AND THE TRUE COUNT IS ON NEITHER SIDE'S LIST. The two sides were
-  // authored against DIFFERENT baselines, and each closed the one item the
-  // other still enumerated. `main` carries W5d-3 (#2249 item 2), which gave the
-  // QSA layers' PAGED K/V a consumer (`RunQwen4ExpQsaBlockPaged`), so `main`'s
-  // literal enumerated only the group-2 block table — which THIS commit
-  // gathers. This branch is W5c-2 (#2249 item 3):
-  // `GPUModelRunner::gather_group_block_tables` now gathers EVERY published
-  // group's block table and publishes it on `MultiKvCacheIndex`, so this
-  // branch's literal enumerated only the paged QSA consumer — which W5d-3
-  // closed. Each side is exactly one item too long, both sides say ONE, and
-  // TAKING EITHER SIDE WHOLE PUTS A REFUSAL THAT NAMES FINISHED WORK ON `main`
-  // — #2288 again, in its fifth instance on this row. The enumeration is the
-  // SET DIFFERENCE of the five-item survey against every landed wave, not the
-  // shorter of two lists, so the count is ZERO and neither side's ONE is
-  // reachable by keeping one side. Deleting the enumeration would be the other
-  // error: the refusal must SAY that the prerequisites are done, because a
-  // silent list reads as an unfinished one.
-  //
-  // ZERO IS READ OFF THE TREE, NOT OFF EITHER SIDE'S PROSE, and each item has a
-  // symbol a reader can grep. Item 1 is `vt::RmsNormGroup` (`include/vt/ops.h`);
-  // item 2 is `RunQwen4ExpQsaBlockPaged` (`qwen4_exp_qsa_block.{h,cpp}`); item 3
-  // is `GPUModelRunner::gather_group_block_tables`, which this merge brings;
-  // item 4 is `qwen4_exp_moe.{h,cpp}`; item 5 is `BuildMropeCosSinHost`,
-  // declared in `include/vllm/model_executor/models/qwen3_5_mrope.h`. All five
-  // resolve.
-  //
-  // AND THE REFUSAL STILL REFUSES, WHICH IS NOT A CONTRADICTION. The
-  // prerequisites being BUILT is not the loop being WRITTEN:
-  // `Qwen4ExpTextModel::Forward` does not exist, so nothing calls any of them
-  // (#2031). One gap that was never among the five outlives them — the QSA
-  // indexer side cache's PAGED STORE. The MAP into its pages arrives with this
-  // commit, and `Qwen4ExpQsaPagedCaches::index_key` is still the contiguous
-  // `[max_kv, indexer_head_dim]` tensor, so the loop wave inherits that store
-  // rather than finding it done; it is carried under `## Owed`. And
-  // `ModelRegistry::Forward` refuses any multi-cache topology by name, which
-  // this model's three published groups trigger — an ENGINE seam that #2249
-  // records as belonging to an engine row and not to this model port.
-  //
-  // AND A SIXTH TIME, IN THE OPPOSITE POLARITY — AN OVERSTATED REFUSAL, WHICH
-  // IS #2254's SHAPE AND NOT #2276's. The clause "the ops and block seams ARE
-  // on main" was FALSE when it was written and stayed false through two more
-  // waves. #2336 measured it: `git grep -n 'clamp_min\|signed_sqrt\|copysign'
-  // src/vt include/vt` returned ZERO lines, so the PLE GATE
-  // (modeling_qwen4_exp.py:1181-1182) had no `vt::` op at all — it was never
-  // one of #2249's five, so closing all five could not and did not supply it.
-  // W5e-1 supplies it as `vt::Qwen4ExpPleGate`, and the clause is SPLIT here
-  // rather than extended, because the two halves now have different answers:
-  // the ops are complete and the block seams are not. `RunQwen4ExpPleBlock`
-  // does not exist, `vt::RmsNormGroup` and `vt::Qwen4ExpPleGate` therefore have
-  // no production caller, and the PLE block is the last seam the loop is
-  // missing (#2336, W5e-2). Naming the missing SYMBOL rather than a wave label
-  // is the closest this string can get to the truth-linked check #2288's
-  // residual asks for: a reader can grep for it, and it resolves the day
-  // W5e-2 lands.
-  //
-  // AND A SEVENTH TIME, ON THE WAVE THAT LANDED THE SYMBOL THE SIXTH REPAIR
-  // NAMED. W5e-1 wrote "there is no RunQwen4ExpPleBlock beside
-  // RunQwen4ExpQsaBlock and RunQwen4ExpMoeBlock", deliberately naming the
-  // SYMBOL so a reader could grep for it and so the sentence would resolve the
-  // day W5e-2 landed. This is that day: `RunQwen4ExpPleBlock`
-  // (`qwen4_exp_ple_block.{h,cpp}`) exists, so the clause is removed rather than
-  // reworded — a refusal enumerates what is MISSING and a present item is not
-  // missing — and the sentence that called PLE "the LAST one" goes with it,
-  // because the population it counted is now empty.
-  //
-  // "IN THIS TREE" AND NOT "ON MAIN", which is a repair in its own right. The
-  // sixth instance wrote "is now on main" while sitting on a branch whose own op
-  // was not on main yet, so the sentence was false at the commit that authored
-  // it and true only after a merge nobody had made. "In this tree" is checkable
-  // at every commit and cannot go stale in that direction.
-  //
-  // THE COUNT OF BLOCK SEAMS IS ZERO AND EACH ONE HAS A SYMBOL, read off this
-  // tree rather than off any wave's prose: `RunQwen4ExpQsaBlock` /
-  // `RunQwen4ExpQsaBlockPaged` (W5b-5, W5d-3), `RunQwen4ExpMoeBlock` (W5d-4),
-  // `RunQwen4ExpPleBlock` (W5e-2). What is left is the LAYER LOOP, which is a
-  // different kind of thing and is why the refusal still refuses: three blocks
-  // that nothing calls decode no token. W5e-2 lands UNREACHED and the spec's
-  // `## Owed` says so with the row and the issues that own the wiring.
-  //
-  // "A SIXTH TIME" ABOVE AND "#2288 IN ITS SEVENTH TURN" IN #2336 COUNT
-  // DIFFERENT POPULATIONS, AND BOTH ARE RIGHT. This comment counts instances
-  // #2288 has produced IN THIS REFUSAL STRING; #2336 and the spec's `## Now`
-  // count turns of #2288 ON THE ROW, which includes the two live enumerations
-  // in `## Now` that never touched this file. A reader who meets both numbers
-  // in one session will read them as a contradiction, so the difference is
-  // stated here rather than left to be rediscovered. Neither number is
-  // corrected: correcting one to match the other would make it false.
-  //
-  // AND THE COMPLETENESS CLAUSE IS SCOPED, because an unbounded one cannot be
-  // held. It read "every op the loop composes is now on main", which no gate
-  // and no reading can establish — the loop is not written, so the set of ops
-  // it composes is not yet a fact. It now reads "every op #2336 surveyed",
-  // which is a closed set a reader can check against that issue. This is the
-  // same failure this string has had three times in the other polarity, and
-  // the repair is the same one: name a population, never "every".
-  //
-  // WHAT PINS THIS STRING, checked rather than assumed. The `SUBCASE("the
-  // forward")` of `tests/vllm/models/test_qwen4_exp_scaffold.cpp:767` drives
-  // this hook with a foreign handle and asserts FIVE substrings:
-  // "Qwen4ExpForConditionalGeneration", "forward is not ported", "W2", "W4",
-  // "#1978", and the ABSENCE of "was not produced by". All five survive every
-  // one of these edits and the absence still holds, so the suite is unchanged
-  // at 12 cases / 296 assertions. The clauses removed across them are prose no
-  // assertion reads — which is the point, and it is now demonstrated five times
-  // rather than argued: the gate holds the refusal REACHABLE and names the
-  // owing waves, it cannot hold the enumeration TRUE, so keeping this list
-  // honest is a reading and not a checker. Verify it by READING THE EMITTED
-  // BYTES, not by grepping this file: a substring assertion passes on a message
-  // that is wrong.
-  VT_CHECK(false,
-           "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
-           "The five prerequisites #2249 surveyed are ZERO, every op "
-           "#2336 surveyed is now in this tree, and so is every BLOCK SEAM "
-           "(RunQwen4ExpQsaBlock, RunQwen4ExpQsaBlockPaged, "
-           "RunQwen4ExpMoeBlock, RunQwen4ExpPleBlock; "
-           "W2/W3/W4/W6a/W5a/W5b-1..6, W5c-1, W5c-2, W5d-1..4, W5e-1, "
-           "W5e-2). What is missing is the LAYER LOOP itself, "
-           "Qwen4ExpTextModel::Forward: nothing calls any of those blocks, so "
-           "no token has been decoded by this architecture. It is owned by "
-           "W5f under #2031, with the QSA indexer side cache's PAGED STORE "
-           "still owed. ModelRegistry::Forward additionally refuses any "
-           "multi-cache topology by name, and this model publishes one. See "
-           ".agents/specs/qwen4-exp-flash-next.md and issues #2031, #2336 and "
-           "#1978.");
-  return ForwardLogits{};  // unreachable; VT_CHECK always throws here
+  // So this hook SERVES a single-shot prefill of one sequence and refuses
+  // everything else BY NAME. It does not refuse unconditionally any more, which
+  // is the difference this wave makes: `Qwen4ExpTextModel::Forward` exists, it
+  // is called from here, and a reachable production path runs all four block
+  // seams. Nothing about that is a decode: a decode needs the second step, and
+  // the second step is what the engine cannot address.
+  VT_CHECK(input.num_reqs == 1,
+           "Qwen4ExpForConditionalGeneration: this forward serves ONE sequence "
+           "per call and the step carries " +
+               std::to_string(input.num_reqs) +
+               ". RunQwen4ExpQsaBlockPaged's block_table is i32 [1, max_pages], "
+               "so a ragged multi-request batch needs query_start_loc plumbing "
+               "no block on this row carries. Owned by W5f under #2031; see "
+               ".agents/specs/qwen4-exp-flash-next.md.");
+  const auto T = static_cast<int64_t>(input.token_ids.size());
+  VT_CHECK(T > 0,
+           "Qwen4ExpForConditionalGeneration: the step carries no tokens");
+  VT_CHECK(input.attn_meta.seq_lens.size() == 1,
+           "Qwen4ExpForConditionalGeneration: one sequence per call, so "
+           "attn_meta.seq_lens must hold exactly one entry");
+  const int64_t past_len =
+      static_cast<int64_t>(input.attn_meta.seq_lens[0]) - T;
+  VT_CHECK(
+      past_len == 0,
+      "Qwen4ExpForConditionalGeneration: this forward serves a SINGLE-SHOT "
+      "PREFILL (past_len == 0) and this step continues a sequence at past_len " +
+          std::to_string(past_len) +
+          ". The layer loop itself has no such limit — it takes every cache as "
+          "an operand — but ModelForwardInput carries only the POSITIONAL "
+          "attn_kv and gdn_state channels, and the QSA indexer side cache and "
+          "the PLE conv ring and n-gram history are neither, so at past_len > 0 "
+          "there is nowhere for them to have persisted. The channel that would "
+          "carry them is multi_kv, which ModelRegistry::Forward refuses by name "
+          "and which #2353 established must not be lifted until a consuming "
+          "forward and a recurrent-member channel exist. Owned by "
+          "KV-DSV4-MULTICACHE W5 (#1925, #2068) and #2353; see "
+          ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #2336.");
+
+  vt::Backend& backend = vt::GetBackend(input.queue.device.type);
+  dense_attn::Dev d{backend, input.queue};
+
+  // ─── the caches, in the loop's own three-vector shape ─────────────────────
+  int64_t n_gdn = 0, n_qsa = 0;
+  for (Qwen4ExpLayerKind k : p.layer_types) {
+    if (k == Qwen4ExpLayerKind::kLinearAttention) {
+      ++n_gdn;
+    } else {
+      ++n_qsa;
+    }
+  }
+  VT_CHECK(static_cast<int64_t>(input.gdn_state.size()) == n_gdn,
+           "Qwen4ExpForConditionalGeneration: the runner handed " +
+               std::to_string(input.gdn_state.size()) +
+               " recurrent state caches for " + std::to_string(n_gdn) +
+               " linear_attention layers");
+  VT_CHECK(static_cast<int64_t>(input.attn_kv.size()) == n_qsa,
+           "Qwen4ExpForConditionalGeneration: the runner handed " +
+               std::to_string(input.attn_kv.size()) +
+               " paged K/V caches for " + std::to_string(n_qsa) +
+               " qwen_sparse_attention layers");
+
+  Qwen4ExpForwardCaches caches;
+  caches.gdn = input.gdn_state;
+
+  // ONE block table and ONE slot mapping for the whole step, taken from the
+  // runner's own metadata rather than rebuilt: `dense_attn::AttnBlock` does not
+  // build them either (`StepInputs` carries the runner's own), and a locally
+  // invented mapping would store this step's K/V at pages nothing else reads.
+  const int64_t cols = input.attn_meta.block_table_num_cols;
+  VT_CHECK(cols > 0 && static_cast<int64_t>(
+                           input.attn_meta.block_table_tensor.size()) >= cols,
+           "Qwen4ExpForConditionalGeneration: the step carries no block table");
+  VT_CHECK(static_cast<int64_t>(input.attn_meta.slot_mapping.size()) == T,
+           "Qwen4ExpForConditionalGeneration: the slot mapping has " +
+               std::to_string(input.attn_meta.slot_mapping.size()) +
+               " entries for " + std::to_string(T) + " tokens");
+  std::vector<int32_t> bt(input.attn_meta.block_table_tensor.begin(),
+                          input.attn_meta.block_table_tensor.begin() + cols);
+  std::vector<int64_t> slots(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    slots[static_cast<size_t>(t)] = input.attn_meta.slot_mapping[static_cast<size_t>(t)];
+
+  // The scratch buffers live for exactly this call, which is what `past_len ==
+  // 0` buys and what the refusal above protects.
+  std::vector<std::vector<uint16_t>> index_keys(static_cast<size_t>(n_qsa));
+  std::vector<std::vector<float>> ple_convs(p.ple.layer_ids_zero_based.size());
+  std::vector<std::vector<int64_t>> ple_tokens(p.ple.layer_ids_zero_based.size());
+
+  dense_attn::DBuf d_bt(d, vt::DType::kI32, {1, cols}, bt.data());
+  dense_attn::DBuf d_slots(d, vt::DType::kI64, {T}, slots.data());
+
+  std::vector<dense_attn::DBuf> idx_bufs;
+  idx_bufs.reserve(static_cast<size_t>(n_qsa));
+  caches.qsa.resize(static_cast<size_t>(n_qsa));
+  for (int64_t i = 0; i < n_qsa; ++i) {
+    const int64_t id = p.qsa.head_dim;
+    index_keys[static_cast<size_t>(i)].assign(
+        static_cast<size_t>(T * id), 0);
+    idx_bufs.emplace_back(d, vt::DType::kBF16, std::vector<int64_t>{T, id},
+                          index_keys[static_cast<size_t>(i)].data());
+    caches.qsa[static_cast<size_t>(i)].kv = input.attn_kv[static_cast<size_t>(i)];
+    caches.qsa[static_cast<size_t>(i)].block_table = d_bt.t();
+    caches.qsa[static_cast<size_t>(i)].slot_mapping = d_slots.t();
+    caches.qsa[static_cast<size_t>(i)].index_key = idx_bufs.back().t();
+  }
+
+  std::vector<dense_attn::DBuf> ple_conv_bufs;
+  ple_conv_bufs.reserve(p.ple.layer_ids_zero_based.size());
+  caches.ple.resize(p.ple.layer_ids_zero_based.size());
+  for (size_t i = 0; i < p.ple.layer_ids_zero_based.size(); ++i) {
+    const int64_t stream = p.stream_width();
+    const int64_t state_len = p.ple.short_conv_state_len();
+    const int64_t ctx = p.ple.ngram_size - 1;
+    ple_convs[i].assign(static_cast<size_t>(stream * state_len), 0.0F);
+    ple_tokens[i].assign(static_cast<size_t>(ctx), 0);
+    ple_conv_bufs.emplace_back(d, vt::DType::kF32,
+                               std::vector<int64_t>{1, stream, state_len},
+                               ple_convs[i].data());
+    caches.ple[i].conv_state = ple_conv_bufs.back().t();
+    // HOST-RESIDENT AND REFUSED OTHERWISE by the PLE block itself: the n-gram
+    // hash is a host int64 computation, so the history is a host tensor over
+    // this vector's bytes rather than a device buffer.
+    caches.ple[i].tokens = dense_attn::MakeTensor(
+        ple_tokens[i].data(), vt::DType::kI64,
+        vt::Device{vt::DeviceType::kCPU, 0}, {1, ctx});
+    caches.ple[i].state_row = 0;
+  }
+
+  const Qwen4ExpTextModelOutput hidden = Qwen4ExpTextModelForward(
+      d, w, input.config, input.token_ids, input.positions, input.attn_meta,
+      input.gdn_meta, caches, past_len);
+
+  // ─── the lm_head, which is `Qwen4ExpForCausalLM` and not the text model ────
+  // `Qwen4ExpTextModel` has NO final RMSNorm (the mixer's `hc_norm` is the last
+  // normalization in the model), so the tail is the loop's output straight into
+  // one `kMatmulBT`. The head is TIED to the embedding table when the file
+  // carries no `output.weight`, which is read off the FILE by the loader.
+  const OwnedTensor& head =
+      w.tied_word_embeddings ? w.embed_tokens : w.lm_head;
+  VT_CHECK(head.rank == 2 && head.shape[0] == p.vocab_size &&
+               head.shape[1] == p.hidden_size,
+           "Qwen4ExpForConditionalGeneration: the lm_head must be [vocab, "
+           "hidden_size]");
+
+  // ONLY THE ROWS THE SAMPLER ASKED FOR, which on a prefill is the last token
+  // of each sequence. Computing the full [T, vocab] and discarding it is the
+  // shape every other forward in this tree avoids.
+  std::vector<int32_t> rows = input.logits_indices;
+  if (rows.empty()) rows.push_back(static_cast<int32_t>(T - 1));
+  const auto R = static_cast<int64_t>(rows.size());
+  for (int32_t r : rows) {
+    VT_CHECK(r >= 0 && static_cast<int64_t>(r) < T,
+             "Qwen4ExpForConditionalGeneration: logits index " +
+                 std::to_string(r) + " is outside this step's " +
+                 std::to_string(T) + " tokens");
+  }
+  dense_attn::DBuf gathered(d, hidden.tensor.dtype, {R, p.hidden_size});
+  {
+    dense_attn::DBuf d_rows(d, vt::DType::kI32, {R}, rows.data());
+    vt::Tensor g = gathered.t();
+    vt::IndexSelect(input.queue, g, hidden.tensor, d_rows.t());
+  }
+  dense_attn::DBuf logits(d, vt::DType::kF32, {R, p.vocab_size});
+  {
+    vt::Tensor o = logits.t();
+    vt::MatmulBT(input.queue, o, gathered.t(),
+                 dense_attn::ResidentWeight(d, head, {p.vocab_size, p.hidden_size}));
+  }
+
+  ForwardLogits r;
+  r.rows = R;
+  r.vocab = p.vocab_size;
+  r.device_tensor = logits.t();
+  r.device_storage = logits.ReleaseShared();
+  return r;
 }
 
 // ─── The KV-cache spec (W5c, #2031) ──────────────────────────────────────────

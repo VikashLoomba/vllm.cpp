@@ -394,6 +394,20 @@ struct MlaBlockWeights {
   //     path — and narrowing the GEMM is what closed it. Both are measured in
   //     `tests/vllm/models/test_dots3_note_attn.cpp`, not assumed.
   vt::Tensor attn_gate_proj;
+  // KV-DSV4-MULTICACHE W5 (#2323): the PER-HEAD ATTENTION SINK, `[num_heads]`
+  // f32, or absent.
+  //
+  // One extra logit per head that joins the attention softmax's DENOMINATOR and
+  // contributes no value, so a row can attend to "nothing"
+  // (`vllm/models/deepseek_v4/attention.py:218-222`). It is a loaded WEIGHT, not
+  // cache state -- which is why it lives here beside the projections rather than
+  // in the KV topology, and why `kv-dsv4-multicache.md` puts it out of that
+  // row's scope.
+  //
+  // ABSENT for every model that does not load one, which is every current caller
+  // of this block: the sink never reaches `vt::MlaDecodeAttention` and the
+  // kernel keeps its `-inf`/0 softmax seeds, so those models are bit-identical.
+  vt::Tensor attn_sink;
 
   // ─── the DSA indexer's five tensors (W4b-3c, #699) ────────────────────────
   // EMPTY is the ABSENT state, and empty is what every DeepSeek registration
@@ -503,7 +517,17 @@ void ForwardMlaAttentionBlock(dense_attn::Dev d, const MlaBlockDims& dims,
                               const MlaBlockWeights& w, const vt::Tensor& hidden,
                               const vt::Tensor& positions, vt::Tensor& kv_cache,
                               const vt::Tensor& slot_mapping, const MlaBlockMetadata& meta,
-                              v1::TritonMLAImpl& impl, vt::Tensor& out);
+                              v1::TritonMLAImpl& impl, vt::Tensor& out,
+                              // KV-DSV4-MULTICACHE W5 (#2323): when given, the
+                              // block writes the attention output
+                              // `[T, num_heads*v_head_dim]` here and RETURNS
+                              // without applying `o_proj`, which it then does not
+                              // require. For a model whose output projection is
+                              // not a dense matrix -- DeepSeek-V4 factorizes it
+                              // as a grouped LoRA -- and a mirror of upstream,
+                              // where `_o_proj` is a separate step. Null for
+                              // every existing caller.
+                              vt::Tensor* attn_pre_o_proj = nullptr);
 
 // The `kv_b_proj` up-projection callback W5 left OPEN (`MlaUpProjectFn`,
 // mla_chunked_context.h:228). Binds the model's `kv_b_proj` weight and the block

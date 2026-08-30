@@ -601,7 +601,7 @@ copy is exactly the work the paged cache exists to avoid. The engine would then
 report a decode rate for a path that is asymptotically no better than the
 full-recompute one it replaced. That is the same shape as
 `## Why our KV interface cannot represent it`: a wrong-answer-not-a-crash, only
-here the wrong answer is a NUMBER rather than a token. It is also why W5-6's
+here the wrong answer is a NUMBER rather than a token. It is also why W5-7's
 gate asserts the saving by COUNTING WORK rather than by timing -- a timing gate on
 a small synthetic config would not separate (a) from (b), and a token gate cannot
 separate them at all.
@@ -685,7 +685,43 @@ tempting now that (a) is smaller, because "just adapt the existing forward" look
 close. The work-counting gate below is what separates them.
 
 
-#### W5-6. Gate
+#### W5-6. The SECOND thing the seam cannot represent: DeepSeek-V4's output projection
+
+The sink was the first. Tracing the routing further found the second, and it is
+structural rather than a missing field.
+
+`ForwardMlaAttentionBlock` applies the output projection ITSELF, as step 6, and
+requires a dense one: `RequireWeight(w.o_proj, "o_proj")` then
+`vt::MatmulBT(d.q, out, attn_flat, w.o_proj)`, with
+`o_proj [hidden, num_heads*v_head_dim]` (`mla_attention.cpp:958-960`,
+`mla_attention.h:338`).
+
+DeepSeek-V4 does not have one. Its output side is a **grouped LoRA**:
+`wo_a [n_groups, o_lora_rank, in_per_group]` applied as a block-diagonal bmm,
+then `wo_b [H, n_groups*o_lora_rank]` (`deepseek_v4.h:183-191`). That is a
+low-rank, per-group factorization; expanding it into a dense
+`[hidden, num_heads*v_head_dim]` would reproduce the arithmetic while discarding
+the entire saving the factorization exists for.
+
+**UPSTREAM ALREADY SPLITS THESE, and that is the answer rather than a workaround.**
+`DeepseekV4Attention.forward` (`attention.py:345-391`) runs
+`self.attention_impl(...)` to fill `o_padded`, slices it, and only then calls
+`return self._o_proj(o, positions)` -- a SEPARATE, platform-specific method. The
+attention block and the output projection are distinct steps upstream, and it is
+our block that fused them.
+
+So the routing shape is: expose the attention output BEFORE the output
+projection, let each model apply its own. That is additive for the seam's current
+users -- Kimi-Linear and dots3-note keep calling the fused entry point and stay
+byte-identical -- and it is the mirror of upstream rather than a divergence from
+it.
+
+**Order matters here.** This is a bigger change than the sink, it touches the
+seam's public shape, and it must land BEFORE any DeepSeek-V4 routing: a V4 layer
+cannot reach `ForwardMlaAttentionBlock` at all while step 6 requires a weight the
+model does not have.
+
+#### W5-7. Gate
 
 Red-first, on CPU at a synthetic config:
 

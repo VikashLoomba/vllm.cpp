@@ -354,7 +354,7 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
                               const Tensor& hidden, const Tensor& positions,
                               Tensor& kv_cache, const Tensor& slot_mapping,
                               const MlaBlockMetadata& meta, v1::TritonMLAImpl& impl,
-                              Tensor& out) {
+                              Tensor& out, Tensor* attn_pre_o_proj) {
   dims.Validate();
   // ─── dots3-note's headwise gate: PRECONDITIONS, checked at ENTRY ─────────
   // Both are properties of the CONFIG and the WEIGHT, knowable before any op
@@ -760,6 +760,31 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   // ─── 5a. PREFILL — the materialized-MHA form (mla_attention.py:722-737) ──
   // Runs on the TAIL `q[num_mqa_tokens:]`, because decode tokens are packed
   // first.
+  // KV-DSV4-MULTICACHE W5 (#2323): the sink is implemented on the DECODE half
+  // only, so a batch that would take the prefill path with one loaded REFUSES
+  // rather than attending without it.
+  //
+  // WHY REFUSE INSTEAD OF IGNORING. A sink removes probability mass; dropping it
+  // leaves every prefill row normalized over the keys alone, which is a WRONG
+  // ANSWER that still produces plausible tokens -- the invisible class this tree
+  // rejects. Refusing makes the missing half loud at the first forward instead.
+  //
+  // WHY IT IS NOT IMPLEMENTED HERE YET, recorded so the next reader does not
+  // assume it was an oversight. The prefill softmax is TWO-PASS and its chunked
+  // arm merges a prefix and a suffix through their LSEs
+  // (`cpu_mla_prefill.cpp`). A sink added inside the kernel would therefore be
+  // counted once PER CHUNK rather than once per row -- the same double-count the
+  // decode kernel avoids by seeding stage 2 rather than stage 1. Getting that
+  // right needs its own design and its own gate, and a gate that ran only the
+  // unchunked case could not see the error.
+  if (w.attn_sink.data != nullptr && prefill_toks > 0) {
+    throw std::invalid_argument(
+        "MLA block: a per-head attention sink is loaded, but this batch takes "
+        "the PREFILL path and the sink is implemented on the decode half only "
+        "(KV-DSV4-MULTICACHE W5, #2323). Refusing rather than attending without "
+        "it, because a dropped sink is a wrong answer that still produces "
+        "plausible tokens.");
+  }
   if (prefill_toks > 0) {
     RequireWeight(w.kv_b_proj, "kv_b_proj");
     if (meta.prefill_cu_seqlens_q.data == nullptr) {
@@ -860,6 +885,10 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     impl.num_heads = static_cast<int>(N);
     impl.head_size = static_cast<int>(dims.head_size());
     impl.scale = dims.scale;
+    // W5 (#2323). Set unconditionally: an absent weight is a null tensor, which
+    // `forward_mqa` reads as "no sink" -- so this is inert for every model that
+    // does not load one rather than needing a branch here.
+    impl.attn_sink = w.attn_sink;
     impl.queue = &d.q;  // W4 deviation (i), wired here.
     // dots3-note's windowed decode (#699 W4b-2). Upstream expresses it as the
     // `Dots3NoteTritonMLAImpl` subclass keeping `self.sliding_window`
@@ -927,6 +956,38 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   }
 
   // ─── 6. o_proj (deepseek_v2.py:526; mla.py:181) ──────────────────────────
+  //
+  // OPTIONAL, because not every MLA model HAS a dense output projection
+  // (KV-DSV4-MULTICACHE W5, #2323). DeepSeek-V4's output side is a grouped LoRA
+  // -- `wo_a` as a block-diagonal bmm, then `wo_b` -- and flattening that into a
+  // `[hidden, num_heads*v_head_dim]` matrix would reproduce the arithmetic while
+  // discarding the whole saving the factorization exists for.
+  //
+  // THIS MIRRORS UPSTREAM RATHER THAN DIVERGING FROM IT.
+  // `DeepseekV4Attention.forward` (`attention.py:345-391`) fills `o_padded` via
+  // `attention_impl(...)`, slices it, and only THEN calls a separate,
+  // platform-specific `self._o_proj(o, positions)`. Attention and the projection
+  // are distinct steps upstream; this block had fused them.
+  //
+  // Given `attn_pre_o_proj`, the block writes the attention output
+  // `[T, num_heads*v_head_dim]` there and returns, and the caller applies its own
+  // projection. `o_proj` is then NOT required -- which is the point, since a
+  // model routed this way does not have one.
+  //
+  // NULL for every existing caller, so Kimi-Linear and dots3-note take the fused
+  // path unchanged and are byte-identical.
+  if (attn_pre_o_proj != nullptr) {
+    // A RAW BYTE COPY, not a cast. `vt::CastF32`/`CastBf16` are CONVERTERS and
+    // refuse a same-dtype input ("cast_f32: in must be bf16"), which is what the
+    // first draft of this hit. Both tensors are contiguous `[T, N*V]` in the
+    // block's own dtype, so the transfer is exact by construction and carries no
+    // rounding of its own.
+    const int64_t nv = dims.num_heads * dims.v_head_dim;
+    const size_t bytes =
+        static_cast<size_t>(T) * static_cast<size_t>(nv) * vt::SizeOf(dt);
+    d.b.Copy(d.q, attn_pre_o_proj->data, attn_flat.data, bytes);
+    return;
+  }
   RequireWeight(w.o_proj, "o_proj");
   vt::MatmulBT(d.q, out, attn_flat, w.o_proj);
 }

@@ -1520,6 +1520,10 @@ config parse and upstream's disagree about the layer partition (that would be a
   one. Owned by this row, FIXED IN FLOW and closed by that change. Listed rather
   than omitted because the index row has to name an owner.
 
+- **CLOSED by `ENG-MULTIKV-BYNAME`, see the entry at the end of this list.**
+  Kept rather than deleted, because the measurement it cites is the evidence
+  that bought the fix.
+
 - **THE BY-NAME CHANNEL DOES NOT COVER RECURRENT MEMBERS, and that is a mirror
   divergence rather than a gap in this row's own shape.** `MultiKvCacheIndex`
   addresses exactly the caches in `attn_kv`, and `attn_kv` is filled from
@@ -1602,6 +1606,25 @@ config parse and upstream's disagree about the layer partition (that would be a
   and that decision belongs to its row because it re-makes a product claim #2343
   had just corrected to false. `qwen4_exp` needs `Qwen4ExpTextModel::Forward`
   written, which is a model wave and not an engine one.
+- **The by-name channel could not address a RECURRENT cache, and now can.**
+  W3's three vectors were parallel to `attn_kv` and were filled from
+  `attn_group_ids_`, which collects only `AttentionSpec` groups, so a `MambaSpec`
+  group's layers were named nowhere: their states reached the forward through
+  `gdn_state` positionally and `Find()` answered -1 for all of them. DeepSeek-V4
+  never showed it — it publishes only MLA / SlidingWindowMLA specs, so all 167 of
+  its caches are attention ones — while both three-group hybrids (`qwen4_exp`,
+  `glm5_next`) carry a `MambaSpec`.
+  [#2343](https://github.com/mudler/vllm.cpp/issues/2343) measured it on
+  GLM-5.3-Flash as `22 KV cache(s) from 2 published group(s)` reported beside
+  `block tables gathered for 3 of 3 published group(s)`. CLOSED by row
+  `ENG-MULTIKV-BYNAME` ([`eng-multikv-byname.md`](eng-multikv-byname.md)), which
+  makes the index cover every published cache in upstream's own insertion order
+  and adds the `KvCachePayload` locator; the refusal in `ModelRegistry::Forward`
+  is UNCHANGED as a guard and now reports the paged/recurrent split, because the
+  total it printed stopped meaning "attention caches". **That row could file no
+  issue** — GitHub writes are `403` from this host — so the issue and its index
+  row are OWED and are listed under that spec's own `## Owed`. The consuming
+  forward remains W5's.
 
 ## Evidence
 

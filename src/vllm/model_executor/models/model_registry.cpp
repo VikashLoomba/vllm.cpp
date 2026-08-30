@@ -438,6 +438,47 @@ int64_t MultiKvCacheIndex::Find(std::string_view layer_name) const {
   return -1;
 }
 
+// ENG-MULTIKV-BYNAME. The counts and the payload locator. Counted rather than
+// stored: a stored count is a second derivation of the vectors it describes, and
+// a second derivation is the thing that can disagree with them.
+int MultiKvCacheIndex::num_paged() const {
+  if (payload_kinds == nullptr) return 0;
+  int n = 0;
+  for (uint8_t k : *payload_kinds)
+    if (static_cast<KvCachePayload>(k) == KvCachePayload::kPaged) ++n;
+  return n;
+}
+
+int MultiKvCacheIndex::num_recurrent() const {
+  if (payload_kinds == nullptr) return 0;
+  int n = 0;
+  for (uint8_t k : *payload_kinds)
+    if (static_cast<KvCachePayload>(k) == KvCachePayload::kRecurrent) ++n;
+  return n;
+}
+
+bool MultiKvCacheIndex::PayloadAt(int64_t index, KvCachePayload* kind,
+                                  int32_t* slot) const {
+  // Written FIRST and in every path, so the false answer cannot leave a caller
+  // holding a slot from a previous call.
+  if (kind != nullptr) *kind = KvCachePayload::kPaged;
+  if (slot != nullptr) *slot = -1;
+  if (payload_kinds == nullptr || payload_slots == nullptr) return false;
+  if (index < 0 || static_cast<size_t>(index) >= payload_kinds->size() ||
+      static_cast<size_t>(index) >= payload_slots->size())
+    return false;
+  if (kind != nullptr)
+    *kind = static_cast<KvCachePayload>(
+        (*payload_kinds)[static_cast<size_t>(index)]);
+  if (slot != nullptr) *slot = (*payload_slots)[static_cast<size_t>(index)];
+  return true;
+}
+
+bool MultiKvCacheIndex::Resolve(std::string_view layer_name,
+                                KvCachePayload* kind, int32_t* slot) const {
+  return PayloadAt(Find(layer_name), kind, slot);
+}
+
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,
                                      const ModelForwardInput& input) {
   // KV-DSV4-MULTICACHE W3 (#2068): a MULTI-CACHE topology reached the shared
@@ -469,8 +510,16 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
   // and report a decode rate for a full-recompute path, which is the
   // wrong-answer-not-a-crash shape this row exists to remove. So it refuses, and
   // it refuses by READING the channel rather than testing its nullness: the
-  // count, the distinct group count and the first published name all come out of
-  // the payload, so a channel that arrived empty says something different.
+  // count, the paged/recurrent split, the distinct group count and the first
+  // published name all come out of the payload, so a channel that arrived empty
+  // says something different.
+  //
+  // ENG-MULTIKV-BYNAME added the paged/recurrent split to this message, because
+  // the total stopped meaning "attention caches" the moment the channel started
+  // carrying a recurrent group's layers. #2343 read the pre-split wording as a
+  // contradiction — `22 KV cache(s) from 2 published group(s)` beside
+  // `block tables gathered for 3 of 3` — which is what a total that silently
+  // omitted 34 recurrent states looked like from the outside.
   //
   // WHAT REPLACES THIS IS NOT ONE WAVE, which is the correction #2353 carries.
   // The line here read "W5 replaces this with the DSA-sparse forward that reads
@@ -522,7 +571,9 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
     VT_CHECK(false,
              std::string("model forward: architecture '") + arch +
                  "' reached this forward with " + std::to_string(mk.size()) +
-                 " KV cache(s) from " + std::to_string(mk.num_groups()) +
+                 " KV cache(s) (" + std::to_string(mk.num_paged()) +
+                 " paged, " + std::to_string(mk.num_recurrent()) +
+                 " recurrent) from " + std::to_string(mk.num_groups()) +
                  " published group(s), first '" +
                  std::string(mk.first_name()) +
                  "', with block tables gathered for " +

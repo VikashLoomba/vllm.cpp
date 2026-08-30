@@ -334,8 +334,27 @@ struct MultiModalForwardInput {
   const std::vector<int32_t>* ple_token_ids = nullptr;
 };
 
-// KV-DSV4-MULTICACHE W3 (#2068): THE THIRD FORWARD CHANNEL — the name each paged
-// cache was published under, carried beside the cache itself.
+// ENG-MULTIKV-BYNAME: WHERE a published cache's payload lives.
+//
+// Upstream needs no such thing. `_reshape_kv_cache_tensors` builds ONE
+// `kv_caches: dict[str, torch.Tensor]` (`vllm/v1/worker/gpu_model_runner.py:7354`
+// @ pin 5559679229) and fills it from both arms of the same loop — the attention
+// arm at `:7418-7427` and the `MambaSpec` arm at `:7429-7441`, whose own comment
+// says "Keeping one tensor per layer lets the KV connector register it without
+// special-casing Mamba" — and `bind_kv_cache`
+// (`vllm/v1/worker/utils.py:450-465`) binds every layer out of that one dict.
+// A Mamba page is a `torch.Tensor` like any other, so one dict is enough.
+//
+// This tree carries the two payloads in two typed containers instead:
+// `ModelForwardInput::attn_kv` holds `PagedKvCache` and `::gdn_state` holds
+// `GdnStateCache`. That is a C++ type distinction, not an addressing one, so
+// this enum records the ONE fact the name cannot: which container the slot
+// indexes. Every published name still lives in ONE list, in ONE order, and
+// resolves through ONE `Find`.
+enum class KvCachePayload : uint8_t { kPaged = 0, kRecurrent = 1 };
+
+// KV-DSV4-MULTICACHE W3 (#2068): THE THIRD FORWARD CHANNEL — the name each
+// published cache was addressed by, carried beside the cache itself.
 //
 // `ModelForwardInput::attn_kv` is POSITIONAL: entry `i` is the i-th
 // full-attention layer. That is the only thing a position CAN be while a layer
@@ -352,17 +371,50 @@ struct MultiModalForwardInput {
 // (`vllm/v1/worker/gpu_model_runner.py:7785-7801`). A cache is addressed BY NAME
 // upstream, so this struct carries the name.
 //
-// `layer_names`, `group_ids` and `layer_indices` are PARALLEL to
-// `ModelForwardInput::attn_kv`: entry `i` describes `attn_kv[i]`. The vectors are
-// owned by the runner and stay valid for the forward's duration.
+// ENG-MULTIKV-BYNAME: the five vectors below are PARALLEL to EACH OTHER and
+// cover EVERY published cache — recurrent as well as attention. They are NOT
+// parallel to `ModelForwardInput::attn_kv`, and W3's original contract that they
+// were is what this row removes.
+//
+// WHY THAT CONTRACT COULD NOT STAND. W3 built these three off
+// `attn_group_ids_`, which collects only the groups whose spec is an
+// `AttentionSpec`, so a `MambaSpec` group's layers were never named at all:
+// their states reached the forward through `gdn_state` POSITIONALLY, and
+// `Find()` answered -1 for every one of them. DeepSeek-V4 hid this, because it
+// publishes only MLA / SlidingWindowMLA specs and all 167 of its caches are
+// attention ones. Both three-group hybrids do not: `qwen4_exp` and `glm5_next`
+// each carry a `MambaSpec`, and #2343 measured the consequence as
+// `22 KV cache(s) from 2 published group(s)` reported beside
+// `block tables gathered for 3 of 3` — 34 recurrent states invisible while
+// their group's block table was not.
+//
+// THE ORDER IS UPSTREAM'S INSERTION ORDER: published GROUP order, then that
+// group's own `layer_names` order, which is exactly how
+// `_reshape_kv_cache_tensors` fills its dict
+// (`vllm/v1/worker/gpu_model_runner.py:7365-7372`,
+// `for group in ...: for layer_name in group.layer_names`). A recurrent group
+// between two attention groups therefore sits BETWEEN them here, and an entry's
+// index is NOT its slot in either payload container. That is what
+// `payload_kinds` / `payload_slots` are for: entry `i`'s cache is
+// `attn_kv[(*payload_slots)[i]]` when its kind is `kPaged` and
+// `gdn_state[(*payload_slots)[i]]` when it is `kRecurrent`.
+//
+// The vectors are owned by the runner and stay valid for the forward's
+// duration.
 //
 // NULL on `ModelForwardInput` for every model whose topology the positional
-// convention can express — which is every model in the tree except DeepSeek-V4 —
+// convention can express — every model in the tree except the multi-cache ones —
 // so every existing forward is byte-identical by construction.
 struct MultiKvCacheIndex {
   const std::vector<std::string>* layer_names = nullptr;
   const std::vector<int32_t>* group_ids = nullptr;
   const std::vector<int32_t>* layer_indices = nullptr;
+  // ENG-MULTIKV-BYNAME: parallel to the three above. `payload_kinds` holds
+  // `KvCachePayload` values widened to `uint8_t` so the header needs no
+  // `std::vector<KvCachePayload>` instantiation on either side of the seam;
+  // read them through `PayloadAt` / `Resolve` rather than by hand.
+  const std::vector<uint8_t>* payload_kinds = nullptr;
+  const std::vector<int32_t>* payload_slots = nullptr;
 
   // MODEL-MM-QWEN4-EXP W5c-2 ([#2249](https://github.com/mudler/vllm.cpp/issues/2249)
   // item 3): ONE GATHERED BLOCK TABLE PER PUBLISHED GROUP, indexed by GROUP ID
@@ -396,17 +448,39 @@ struct MultiKvCacheIndex {
   const std::vector<std::vector<int32_t>>* group_block_tables = nullptr;
   const std::vector<int32_t>* group_block_table_cols = nullptr;
 
-  // How many caches arrived. 0 when the channel is empty.
+  // How many caches arrived, paged and recurrent together. 0 when the channel is
+  // empty.
   size_t size() const;
   // How many DISTINCT published groups they came from.
   int num_groups() const;
   // The first published name, for a diagnostic. Empty when the channel is empty.
   std::string_view first_name() const;
-  // The index into `attn_kv` of the cache published under `layer_name`, or -1.
+  // The FLAT index of the cache published under `layer_name`, or -1. Feed it to
+  // `PayloadAt` to reach the cache itself; it is NOT a slot in either payload
+  // container, and on any topology carrying a recurrent group it is not equal to
+  // one either.
   // LINEAR: the list is 167 entries at DeepSeek-V4-Flash and a forward looks a
   // name up once per layer per role, so an index structure would be premature.
   // Recorded as a decision rather than left as an oversight.
   int64_t Find(std::string_view layer_name) const;
+
+  // ENG-MULTIKV-BYNAME. How many of the published caches are paged, and how many
+  // are recurrent. `num_paged() + num_recurrent() == size()`.
+  int num_paged() const;
+  int num_recurrent() const;
+
+  // Where flat entry `index` lives. FALSE when `index` is out of range or the
+  // channel carries no locators. `*kind` and `*slot` are written in EVERY case —
+  // `kPaged` and -1 on the false answer — so a caller that forgets the bool
+  // indexes out of range rather than reading a stale slot, which is the failure
+  // mode `BlockTableForGroup` above already guards the same way.
+  bool PayloadAt(int64_t index, KvCachePayload* kind, int32_t* slot) const;
+
+  // `Find` and `PayloadAt` in one call, which is what a forward wants: it holds
+  // a layer name and needs the cache. FALSE when nothing was published under
+  // that name, with `*kind` / `*slot` written as above.
+  bool Resolve(std::string_view layer_name, KvCachePayload* kind,
+               int32_t* slot) const;
 
   // How many groups the model PUBLISHED, which is not `num_groups()`: that one
   // counts the distinct groups the caches in `attn_kv` came from, and a

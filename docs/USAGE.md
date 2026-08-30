@@ -701,8 +701,11 @@ layer name.
 Those are the bytes emitted at the SHA that run was measured on. The guard now
 names the arriving architecture and leaves ownership of the consuming forward to
 that architecture's own row ([#2353](https://github.com/mudler/vllm.cpp/issues/2353)),
-so a run today reads `architecture 'Glm5NextForConditionalGeneration' reached
-this forward with 22 KV cache(s) ...` and says in the message what the paragraph
+and it now reports the paged/recurrent split, because a total that counted only
+attention caches omitted the 34 recurrent states while the block-table
+denominator still counted their group (`ENG-MULTIKV-BYNAME`). A run today reads
+`architecture 'Glm5NextForConditionalGeneration' reached this forward with 56 KV
+cache(s) (22 paged, 34 recurrent) ...` and says in the message what the paragraph
 below had to say in prose. The transcript is kept as measured rather than
 rewritten, because it is dated evidence and not a specimen of current output.
 

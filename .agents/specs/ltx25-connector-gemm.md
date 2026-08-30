@@ -213,4 +213,215 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1 in this change.
+`ACTIVE`. W1, W2 and W3 are complete on x86-64 and the aarch64 half is under a
+queued lease. W4 is a **measured redirection** rather than a repair, and the
+reason is in `## Outcome`.
+
+## Outcome
+
+### The headline, stated before the evidence because it overturns a landed record
+
+**`conditioning.connector.compute` is not dominated by the GEMM.** Two
+independent instruments, sharing no code, put `vt::AttentionCross` at 54% to 66%
+of `Ltx2ConnectorForward` and the specialized GEMM micro-kernels at 29% to 31%.
+The connector's attention performs **4.2% of the layer's arithmetic and takes
+66% of its time.**
+
+**So #2354's 37 GFLOP/s is not the GEMM's rate.** That number is
+`leaf_seconds / gemm_flops`, which is the GEMM's rate only if the leaf is the
+GEMM. On the machine measured here the same construction reads **50.7 GFLOP/s**
+for a video layer while the GEMM inside it runs at **153.3 GFLOP/s**. The
+agreement between #2354's predicted 34 GFLOP/s and its measured 37 was real and
+was a coincidence of construction: both sides divided the whole leaf by the
+GEMM's flops, so both were bound to agree whatever else was in the leaf.
+
+`a-number-quoted-often-becomes-treated-as-measured` is the shape, and this row is
+where it is caught, one row after it was written.
+
+### W1 — which kernel runs, proved by execution
+
+`--mode tier`, run on the devbox, verbatim:
+
+```
+tier_name=avx512
+elem_gemm_use_ref=0
+mr=6
+f32_bt=set f32_nk=set f32_btm=set f32_nkm=set
+elem_kind_of_f32=1
+repack_eligible_f32_4096x4096=1
+```
+
+and the resolver moves when told to, which is what says it was read rather than
+printed from a constant: `VT_CPU_MATMUL_TIER=ref` gives `tier_name=ref`,
+`elem_gemm_use_ref=1`; `=portable` gives `tier_name=portable`, `mr=4`,
+`f32_btm=NULL`.
+
+**The symbol-level proof is a `perf` profile of `Ltx2ConnectorForward` itself**,
+not of a model of it. `sudo perf record -e cpu-clock -F 199`, two video layers,
+devbox at loadavg 10:
+
+| symbol | self |
+|---|---:|
+| `LoadF32(Tensor const&, long)` | 23.09% |
+| `vt::SizeOf(vt::DType)` | 20.49% |
+| `BtM6Avx512<kF32>` | 17.40% |
+| `AttentionCrossKernel(...)::{lambda(long, long)#1}` | 10.74% |
+| `Bt16Avx512<kF32>` | 6.81% |
+| `Transpose16(__m512*)` | 6.75% |
+| `Threadpool::Barrier()` | 6.10% |
+| `Threadpool::PollForWork(...)` | 4.32% |
+| `__memmove_avx512_unaligned_erms` | 1.11% |
+
+**`BtM6Avx512` and `Bt16Avx512` ARE the tier's f32 `[N,K]` entry points, so the
+specialized kernel is what executes.** `MatmulOneChunkRef` does not appear
+anywhere in the flat profile down to a 0.05% limit; `MatmulOneChunk<true>` shows
+0.10%, which is the driver frame whose work is in the two inlined tier calls
+above it. The `Transpose16` line is the BT orientation's own 4x4-group register
+transpose, which is what says the call took `MatmulChunked<true>` rather than the
+repacked branch.
+
+An earlier profile of ONE layer taken while the box was at loadavg 40 gives the
+same ranking with the threadpool terms inflated (Barrier 14.74%, PollForWork
+2.72%) and everything else within 3 points. Both are recorded because the
+difference between them is the contention, not the finding.
+
+### W2 — the rate, and the orientation lever refuted on this architecture
+
+`--mode gemm`, M = 1024, the connector's own `(N, K)` set, arms **interleaved**
+with a same-arm control leg, n = 3, devbox at loadavg 15-27 (**not idle, and
+that is stated rather than smoothed**):
+
+| | seconds for one `RunConnector` call | rate |
+|---|---:|---:|
+| `MatmulChunked<true>`, the shipped orientation | **26.924** | **153.3 GFLOP/s** |
+| `MatmulChunked<false>` over an `ElemRepackWeight`-ed `[K,N]` weight | 55.435 | 74.4 GFLOP/s |
+
+**The repack is 2.06x SLOWER here, and every shape is byte-identical**, so this
+is a layout result and not a numerical one. Per shape the ratio is 1.47x to
+1.84x on the four large shapes; the same-arm control ran at 0.96x to 1.17x, so
+the effect is far outside its own control's spread. The two `heads x dim`
+projections (N = 32) go the other way and are 0.4% of the call's flops.
+
+**This qualifies a record.** `include/vt/quant.h` states the elementwise repack
+as "measured 1.16x to 1.30x on dgx and BYTE-IDENTICAL". The byte-identity half
+reproduces exactly. The speed half does not generalize: it was measured on
+aarch64 at another row's shapes, and on x86-64 AVX-512 at the connector's shapes
+the same lever is a 2x regression. The plausible mechanism is that the AVX-512
+tier's `Transpose16` costs less than the `[K,N]` path's 16 KB-strided weight
+walk, which is exactly the trade that inverts between ISAs. **This row does not
+edit that header**, because the aarch64 measurement that would say whether the
+sentence needs a scope qualifier or a correction is still queued.
+
+### W3 — the decomposition, and it closes
+
+`--mode connector` and `--mode attn`, same binary, same box, same hour:
+
+| | video (dim 4096) | audio (dim 2048) | x8 layers, both streams |
+|---|---:|---:|---:|
+| `Ltx2ConnectorForward`, one layer | 8.132 s (spread 12.04%) | 3.366 s (7.18%) | **91.98 s** |
+| `vt::AttentionCross` at that layer's shape | 5.361 s (3.07%) | 2.966 s (7.69%) | **66.62 s** |
+| the layer's six GEMMs | — | — | **26.92 s** |
+
+**66.62 + 26.92 = 93.54 against 91.98 measured, which closes to 1.7%.** That is
+what makes this a decomposition rather than a set of intervals: there is no third
+term of any size, and the two named terms are the whole leaf.
+
+**The efficiency gap is the finding.** One video layer's attention is
+1.718e10 FLOP against the layer's 4.123e11 of GEMM -- **4.2% of the
+arithmetic** -- and it takes **65.9% of the layer**. Measured rates: the GEMM at
+**153.3 GFLOP/s**, the attention at **3.2 GFLOP/s**. A 48x gap between two
+kernels in the same loop.
+
+### Why the attention kernel is 48x off, and what the repair is
+
+`AttentionCrossKernel` (`src/vt/cpu/cpu_ops.cpp`) reads every operand element
+through `LoadF32(const Tensor&, int64_t)`, which switches on `t.dtype` and
+computes its byte offset with `vt::SizeOf(t.dtype)`. **`vt::SizeOf` is an
+out-of-line function in `src/vt/dtype.cpp` and the build enables no LTO**
+(`CMakeLists.txt` sets no `INTERPROCEDURAL_OPTIMIZATION` and passes no `-flto`),
+so it is a cross-translation-unit call that cannot be inlined away. The profile
+shows the consequence directly: `LoadF32` 23.09% plus `SizeOf` 20.49% is
+**43.6% of a connector layer spent resolving an element type and an address**,
+inside a loop whose body is one multiply and one add.
+
+**The repair is the transformation `MatmulOneChunk` already applies against
+`MatmulOneChunkRef`:** resolve the element type once, outside the loops, and walk
+typed pointers. It touches no output's accumulation order -- the same indices are
+summed in the same sequence -- so it is **bit-exact, not merely close**.
+
+`--mode attn` prices it. `AttnCrossHoisted` in the probe is that transformation,
+written in the probe rather than in product code so the headroom could be
+measured before anything was changed:
+
+| | shipped kernel, 20 threads | hoisted reference, ONE thread | equality |
+|---|---:|---:|---|
+| video, heads 32, d 128 | 5.361 s | **3.775 s** | byte-equal |
+| audio, heads 32, d 64 | 2.966 s | **2.161 s** | byte-equal |
+
+**A single thread with the dtype hoisted beats twenty threads without it**, on
+both streams, with `memcmp`-identical output. That is the headroom, measured, and
+it bounds nothing from above: the hoisted form here is scalar and unthreaded.
+
+### W4 — a redirection, and why no kernel was changed
+
+The repair is obvious, bit-exact, and prototyped byte-equal. **It is not landed
+here, and that is a scope decision rather than a lack of one.**
+
+`AttentionCrossKernel` is a `vt` shared seam. Every model that reaches
+`vt::AttentionCross` runs it -- the LTX-2.5 DiT among them -- and
+`AttentionKernel` beside it carries the identical defect. Doing this properly is
+the `CPU-ELEM-GEMM` shape: keep the current scalar kernel as the reference arm,
+add a typed one, gate the two byte-identical, and put a same-binary A/B switch
+between them. `AGENTS.md` `## Changing the rules or a checker` and `## Spec
+before code` both point that work at its own row with its own spec and a fresh
+reviewer, and this row's own scope excludes it.
+
+Three further reasons, each measured rather than asserted:
+
+- **This devbox is not the machine the render was measured on.** Every number
+  above is x86-64 AVX-512. The GB10's aarch64 tier is NEON with `mr = 4` and a
+  weaker GEMM, so the attention/GEMM split there is an open question that the
+  queued lease answers and this row does not guess at.
+- **The disk cannot hold a CMake build tree** (`/` at 99%), so the project's full
+  suite could not be run against a change to a seam every model uses. What COULD
+  be run is `tests/vt/test_ops_attention_cross.cpp`, compiled directly:
+  **21 cases / 33 assertions / 0 failed** on this tree, which is the baseline the
+  next row starts from and is recorded here so it does not have to re-derive it.
+- **The existing byte-identity gate for the orientation lever already exists**
+  and needed nothing added. `test_ops_matmul_elem.cpp`'s "load-time [N,K]->[K,N]
+  repack is byte-identical" covers T1 for three dtypes at five ragged shapes, and
+  the probe's own per-shape `memcmp` extends it to the connector's shapes. **No
+  new test was written, because the guarantee was already gated** and a second
+  copy is how two rules start.
+
+### What could not be measured
+
+- **The aarch64 side.** `rc` jobs `ea2631f3-aed2-46df-b419-3628078f9882`
+  (`dgx:gpu0`) and `75800c9e-0b55-406e-9958-ba0048a5a751` (`thor:gpu0`) were
+  submitted with the full probe and were still queued at positions 5 and 3 when
+  this row was written. `orin:gpu0` was tried first and refused: its `/workspace`
+  is local to that host and is NOT the shared NAS the other two mount, which is
+  recorded here because it is not written anywhere else.
+- **An idle box.** Every devbox number was taken with other agents compiling on
+  the same 20 cores, at loadavg 10 to 40. The RATIOS are what this row rests on
+  and each carries its own same-arm control; the absolute GFLOP/s are lower
+  bounds.
+- **A render.** No end-to-end before/after exists, because nothing changed.
+
+## Owed
+
+- **THE ATTENTION KERNEL'S PER-ELEMENT DTYPE SWITCH IS UNOWNED.** 43.6% of a
+  connector layer is `LoadF32` plus a cross-TU `vt::SizeOf`, and the fix is
+  bit-exact and prototyped. It is a `vt` seam change and needs its own row, its
+  own spec, and a fresh reviewer. It is not LTX-2.5-specific: `AttentionKernel`
+  carries the same defect and every CPU attention path pays it. Owner: this row,
+  until that row exists.
+- **`include/vt/quant.h`'s "1.16x to 1.30x on dgx" needs a scope qualifier or a
+  correction.** On x86-64 AVX-512 at the connector's shapes the same lever is
+  2.06x SLOWER. Which of the two it needs depends on the queued aarch64 run.
+  Owner: this row.
+- **The aarch64 numbers.** Both leases are submitted and neither had started.
+  Owner: this row.
+- **No issue could be filed.** `gh api user` returns `Your account is suspended`.
+  `REMOTE_UNVERIFIED`; the branch is pushed over SSH and there is no pull
+  request. Owner: this row, until the account is restored.

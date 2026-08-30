@@ -211,6 +211,14 @@ Stop and report, do not work around:
 
 ## Owed
 
+- **The AUDIO-ONLY arm still materializes the connector weights twice.**
+  `GenerateAudioOnly` is a private static declared in
+  `include/vllm/multimodal/ltx2_video.h`, so it cannot take a type defined in
+  `ltx2_video.cpp`'s anonymous namespace, and reaching the render's weight set
+  from there would mean putting an internal class into a shipped header for an
+  arm this row does not measure. It keeps `RunConnectorFromFile`, which is the
+  same code path with the materialization inlined rather than a second copy of
+  it. Owner: this row, through #2354.
 - **The oracle's 93.8 s is still undecomposed.** Inherited from #2296 unchanged.
 - **`decode.audio.mel` at 47 s is still unattributed.** Not this row.
 - **The 206.0 s that remains after `guiders` and `connector` is still open.**
@@ -219,4 +227,4 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1 is in this change.
+`ACTIVE`. W1 and W2 are in this change; W3 and W4 follow in the same PR.

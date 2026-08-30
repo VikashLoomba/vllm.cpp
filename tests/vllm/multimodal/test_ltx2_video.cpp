@@ -8316,10 +8316,14 @@ TEST_CASE("ltx2 phases: the connector leaf SPLITS into weights and compute, nest
   // `std::string`, not `const char*`: doctest stringifies a bare pointer through
   // its bool overload, so `INFO("phase = " << name)` printed `phase = 1` for all
   // five names and the RED it produced named none of them.
+  // `guiders.connector.weights` is NOT in this list, and its absence is the
+  // other half of this row rather than an oversight: the negative pass reuses
+  // the positive pass's materialization, so there is no second weights leaf to
+  // find. The case below owns that claim as a COUNT, which is the form that can
+  // tell "reused" from "never ran".
   for (const std::string& name : {std::string("conditioning.connector.weights"),
                                  std::string("conditioning.connector.compute"),
                                  std::string("guiders.tower"),
-                                 std::string("guiders.connector.weights"),
                                  std::string("guiders.connector.compute")}) {
     INFO("phase = " << name);
     int64_t seen = 0;
@@ -8335,6 +8339,64 @@ TEST_CASE("ltx2 phases: the connector leaf SPLITS into weights and compute, nest
     CHECK_MESSAGE(seen == 1, "expected exactly one `" << name << "` record for render " << render
                                                       << ", saw " << seen);
   }
+}
+
+// ── ONE MATERIALIZATION PER RENDER (row LTX25-TEXT-COND-DEVICE, #2354) ──────
+//
+// A guided render encodes the positive prompt and the negative one, and each
+// pass used to re-open the DiT file, re-parse its plan and re-materialize the
+// connector's parameters into f32. On the shipped 21B that is 2.016 B
+// parameters, about 8 GB, twice, out of one file that cannot change mid-render.
+//
+// THE COUNT IS THE ASSERTION, not the presence, and that distinction is the
+// whole test. `CHECK(guiders.connector.weights is absent)` would also pass on a
+// build where the negative pass stopped running at all -- which is why the
+// preconditions below assert that it DID run: one unconditional forward, and a
+// `guiders.connector.compute` leaf beside the positive one. Two computes and one
+// materialization is the shape this row claims; either number alone is not.
+TEST_CASE("ltx2 phases: a guided render materializes the connector weights ONCE") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = PromptedGen(ws.root + "/connector_once", "a b c");
+  gen.steps = 2;
+  OneStageFixtureGuidance(&gen);
+  gen.extras[vllm::multimodal::kLtx2NegativePromptExtra] = "c b a";
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  REQUIRE(trace.completed);
+  REQUIRE_MESSAGE(trace.video_uncond_forwards == 1,
+                  "this render did no unconditional forward, so nothing encoded a negative "
+                  "prompt and a count of one materialization would be trivially true");
+  REQUIRE_MESSAGE(!result.phase_log_path.empty(), "the render wrote no phase table");
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(result.phase_log_path));
+  const int64_t render = LastRender(table);
+  REQUIRE(render > 0);
+
+  int64_t weights = 0;
+  int64_t computes = 0;
+  for (const nlohmann::json& e : table.at("phases")) {
+    if (e.at("render").get<int64_t>() != render) continue;
+    const std::string name = e.at("name").get<std::string>();
+    if (name.size() > 8 && name.compare(name.size() - 8, 8, ".weights") == 0) ++weights;
+    if (name.size() > 8 && name.compare(name.size() - 8, 8, ".compute") == 0) ++computes;
+  }
+  // BOTH PASSES STILL RUN THE CONNECTOR. Without this the case would pass on a
+  // build that dropped the negative conditioning entirely, which is a render
+  // that no longer does classifier-free guidance and is not what this row did.
+  CHECK_MESSAGE(computes == 2,
+                "expected the positive and the negative pass to each run the connector, saw "
+                    << computes << " `.compute` leaves");
+  CHECK_MESSAGE(weights == 1,
+                "expected ONE connector weight materialization for the whole render, saw "
+                    << weights);
 }
 
 TEST_CASE("ltx2: the AUDIO guider knobs are NOT t2a-only, and this case used to say they were") {

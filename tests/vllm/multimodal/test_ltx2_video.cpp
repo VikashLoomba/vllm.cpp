@@ -8261,6 +8261,82 @@ TEST_CASE("ltx2 t2a: the refusals name what is missing, and each is checked HERE
   }
 }
 
+// ── THE CONNECTOR SPLIT (row LTX25-TEXT-COND-DEVICE, issue #2354) ───────────
+//
+// #2296 measured `conditioning.connector` at 122.388 s -- 23.61% of an LTX-2.5
+// render, the second largest phase, at the lowest spread in its whole table
+// (0.44%) -- and then had to write in its own `## Owed` that nothing says
+// whether that is the two `Ltx2LoadConnectorWeights` calls or the
+// `Ltx2ConnectorCreateEmbeddings` call. Those are DIFFERENT REPAIRS: one is
+// caching, the other is a kernel. It named the same gap on `generate.guiders`,
+// where it read 39.3 s out of one leaf BY SUBTRACTION and called the result "a
+// reading rather than a measurement" for exactly that reason.
+//
+// This case is the executable form of the split. It asserts the five names, and
+// it asserts that each one is `nested`, which is the part a "does the record
+// exist" check would miss: `render_phase_log.h` excludes a nested leaf from
+// `sum_leaf_seconds`, so a sub-leaf that landed NON-nested would enter the sum,
+// shrink `unaccounted_seconds` by its own duration, and change every residue
+// this campaign has published -- silently, and while still being present.
+TEST_CASE("ltx2 phases: the connector leaf SPLITS into weights and compute, nested") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("one_stage");
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+
+  // `one_stage` resolves `cfg_scale = 3.0`, so `wants_negative` is true and the
+  // NEGATIVE prompt goes through the tower and the connector as well. That is
+  // the only shape in this suite that reaches ltx2_video.cpp's guiders branch
+  // with a live tower: every other guided case supplies negative prompt EMBEDS
+  // and takes the fallback, which encodes nothing.
+  vllm::multimodal::VideoGenParams gen = PromptedGen(ws.root + "/connector_split", "a b c");
+  gen.steps = 2;
+  OneStageFixtureGuidance(&gen);
+  gen.extras[vllm::multimodal::kLtx2NegativePromptExtra] = "c b a";
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  REQUIRE(trace.completed);
+  // THE PRECONDITION, ASSERTED RATHER THAN ASSUMED. Without an unconditional
+  // forward the guiders branch never runs, and the three `guiders.*` names below
+  // would be absent for a reason that has nothing to do with the instrument.
+  REQUIRE_MESSAGE(trace.video_uncond_forwards == 1,
+                  "this render did no unconditional forward, so the negative prompt was never "
+                  "encoded and the `guiders.*` leaves below cannot exist for a reason this case "
+                  "is not about");
+  REQUIRE_MESSAGE(!result.phase_log_path.empty(), "the render wrote no phase table");
+  const nlohmann::json table = nlohmann::json::parse(ReadAll(result.phase_log_path));
+  const int64_t render = LastRender(table);
+  REQUIRE(render > 0);
+
+  // `std::string`, not `const char*`: doctest stringifies a bare pointer through
+  // its bool overload, so `INFO("phase = " << name)` printed `phase = 1` for all
+  // five names and the RED it produced named none of them.
+  for (const std::string& name : {std::string("conditioning.connector.weights"),
+                                 std::string("conditioning.connector.compute"),
+                                 std::string("guiders.tower"),
+                                 std::string("guiders.connector.weights"),
+                                 std::string("guiders.connector.compute")}) {
+    INFO("phase = " << name);
+    int64_t seen = 0;
+    for (const nlohmann::json& e : table.at("phases")) {
+      if (e.at("name").get<std::string>() != name) continue;
+      if (e.at("render").get<int64_t>() != render) continue;
+      ++seen;
+      CHECK_MESSAGE(e.at("nested").get<bool>(),
+                    "this sub-leaf is NOT nested, so `sum_leaf_seconds` adds it and the residue "
+                    "of every phase table this campaign publishes moved by its duration");
+      CHECK_FALSE(e.at("span").get<bool>());
+    }
+    CHECK_MESSAGE(seen == 1, "expected exactly one `" << name << "` record for render " << render
+                                                      << ", saw " << seen);
+  }
+}
+
 TEST_CASE("ltx2: the AUDIO guider knobs are NOT t2a-only, and this case used to say they were") {
   // WHAT THIS CASE ASSERTED UNTIL ROW LTX25-GUIDED-VIDEO (#1092): that
   // `audio_cfg_guidance_scale` on a video pipeline is refused "text-to-audio's

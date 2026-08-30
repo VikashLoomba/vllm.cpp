@@ -414,7 +414,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 930 940 941 1027 1123 1139 1228 1232 1335 1397 1505 1547 1589 1591
+// 972 982 983 1069 1165 1181 1270 1274 1377 1439 1547 1589 1631 1633
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -521,17 +521,59 @@ std::string RecipeVersionKey(const std::string& declared) {
 // a value gate cannot catch. It is taken because `Ltx2ConnectorForward` is L5's
 // declared PARITY dtype and this is the arm its goldens cover, and its output is
 // narrowed to the stream dtype on the first upload like every other activation.
+// A phase leaf that a caller can DECLINE, which is what an empty prefix means.
+// `phase::Scope` has no disabled state and is not movable, so the choice is
+// expressed by whether the optional holds one. Named rather than written inline
+// because two call sites in this file need the same "measure this only when the
+// caller asked for it" shape, and a second copy is how two rules start.
+class SubPhase {
+ public:
+  SubPhase(const std::string& prefix, const char* suffix) {
+    if (!prefix.empty()) scope_.emplace(prefix + suffix);
+  }
+
+ private:
+  std::optional<phase::Scope> scope_;
+};
+
+//
+// `phase_prefix` SPLITS THIS CALL INTO ITS TWO HALVES, and it is the whole
+// reason this signature grew an argument. #2296 measured `conditioning.connector`
+// at 122.388 s -- 23.61% of an LTX-2.5 render, the SECOND largest phase, and
+// more stable (0.44% spread) than anything else in the table -- and then had to
+// say in its own `## Owed` that it could not tell whether that number is the two
+// `Ltx2LoadConnectorWeights` calls above or the `Ltx2ConnectorCreateEmbeddings`
+// call below. Those are DIFFERENT REPAIRS: one is caching, the other is a
+// kernel. A row that picks between them from a single leaf is guessing, so this
+// emits the boundary instead. Empty prefix = no sub-leaves, which is what the
+// load-time callers pass: their cost is inside `load` and is not what #2296 is
+// about.
+//
+// The two scopes are NESTED leaves. `render_phase_log.h` marks a leaf opened
+// inside another leaf `nested` and EXCLUDES it from `sum_leaf_seconds`, so
+// adding them cannot move `unaccounted_seconds` and cannot change what the
+// coverage gate reads. They decompose a leaf; they do not join the table.
 Ltx2ConnectorEmbeddings RunConnector(const SafetensorsFile& dit_file,
                                      const Ltx2ConnectorConfig& video_cfg,
                                      const Ltx2ConnectorConfig& audio_cfg,
                                      const std::vector<float>& video_in,
                                      const std::vector<float>& audio_in,
-                                     const std::vector<float>& additive, int64_t rows) {
-  const Ltx2VaeWeights video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg);
-  const Ltx2VaeWeights audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg);
-  Ltx2ConnectorEmbeddings encoded = Ltx2ConnectorCreateEmbeddings(
-      video_cfg, video_weights, video_in.data(), audio_cfg, audio_weights, audio_in.data(),
-      additive.data(), /*batch=*/1, rows);
+                                     const std::vector<float>& additive, int64_t rows,
+                                     const std::string& phase_prefix) {
+  Ltx2VaeWeights video_weights;
+  Ltx2VaeWeights audio_weights;
+  {
+    const SubPhase weights_phase(phase_prefix, ".weights");
+    video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg);
+    audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg);
+  }
+  Ltx2ConnectorEmbeddings encoded;
+  {
+    const SubPhase compute_phase(phase_prefix, ".compute");
+    encoded = Ltx2ConnectorCreateEmbeddings(
+        video_cfg, video_weights, video_in.data(), audio_cfg, audio_weights, audio_in.data(),
+        additive.data(), /*batch=*/1, rows);
+  }
   // The processor returns the mask the DiT's cross-attention is supposed to
   // honour (embeddings_processor.py:89). `Ltx2ModalityInput` carries no context
   // mask, so a mask with a masked position would be silently dropped — the DiT
@@ -1570,9 +1612,9 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
       }
       // ONE statement of the connector call and its mask contract, shared with
       // the per-request prompt path (`RunConnector`).
-      const Ltx2ConnectorEmbeddings encoded =
-          RunConnector(dit_file, im.video_connector_cfg, im.audio_connector_cfg,
-                       im.video_prompt_embeds, im.audio_prompt_embeds, additive, v_rows);
+      const Ltx2ConnectorEmbeddings encoded = RunConnector(
+          dit_file, im.video_connector_cfg, im.audio_connector_cfg, im.video_prompt_embeds,
+          im.audio_prompt_embeds, additive, v_rows, /*phase_prefix=*/"");
       im.video_prompt_embeds = encoded.video;
       im.audio_prompt_embeds = encoded.audio;
     }
@@ -1625,7 +1667,8 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
         }
         const Ltx2ConnectorEmbeddings encoded = RunConnector(
             dit_file, im.video_connector_cfg, im.audio_connector_cfg,
-            im.negative_video_prompt_embeds, im.negative_audio_prompt_embeds, additive, v_rows);
+            im.negative_video_prompt_embeds, im.negative_audio_prompt_embeds, additive, v_rows,
+            /*phase_prefix=*/"");
         im.negative_video_prompt_embeds = encoded.video;
         im.negative_audio_prompt_embeds = encoded.audio;
       }
@@ -2371,7 +2414,8 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       phase::Scope connector_phase("conditioning.connector");
       const Ltx2ConnectorEmbeddings through = RunConnector(
           SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
-          im.audio_connector_cfg, prompt_video, prompt_audio, mask, context_tokens);
+          im.audio_connector_cfg, prompt_video, prompt_audio, mask, context_tokens,
+          /*phase_prefix=*/"conditioning.connector");
       connector_phase.Close();
       prompt_video = through.video;
       prompt_audio = through.audio;
@@ -3072,9 +3116,21 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "request this engine can serve");
       }
       vt::Queue text_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-      const Ltx2PromptConditioning encoded = Ltx2EncodePromptToConditioning(
-          *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
-          negative, text_queue);
+      // THE NEGATIVE HALF OF THE SAME TWO STAGES the positive pass already
+      // names as `conditioning.tower` and `conditioning.connector`. Until this
+      // scope existed `generate.guiders` was ONE leaf covering both, and #2296
+      // could only subtract: it read the positive halves at 150.731 s against a
+      // `generate.guiders` of 190.016 s and had to call the remaining 39.3 s
+      // "a reading rather than a measurement" because the leaf it came out of
+      // was not split. Nested, so it decomposes that leaf without joining the
+      // sum (`render_phase_log.h`).
+      Ltx2PromptConditioning encoded;
+      {
+        const phase::Scope guiders_tower("guiders.tower");
+        encoded = Ltx2EncodePromptToConditioning(
+            *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
+            negative, text_queue);
+      }
       negative_video = encoded.conditioning.video;
       negative_audio = encoded.conditioning.audio;
       if (encoded.seq != context_tokens) {
@@ -3091,7 +3147,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
             RunConnector(SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
                          im.audio_connector_cfg, encoded.conditioning.video,
                          encoded.conditioning.audio, encoded.conditioning.additive_mask,
-                         context_tokens);
+                         context_tokens, /*phase_prefix=*/"guiders.connector");
         negative_video = through.video;
         negative_audio = through.audio;
       }
@@ -5646,7 +5702,7 @@ VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& g
           RunConnector(SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
                        im.audio_connector_cfg, encoded.conditioning.video,
                        encoded.conditioning.audio, encoded.conditioning.additive_mask,
-                       context_tokens);
+                       context_tokens, /*phase_prefix=*/"guiders.connector");
       negative_audio = through.audio;
     }
     negative_context = negative_audio.data();

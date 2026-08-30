@@ -3772,6 +3772,68 @@ Debts this row carries, each visible rather than waived:
   case (c), finite and wrong; the mechanism is the same and the prediction about
   which bucket the LOGITS land in was wrong.
 
+  **THE REPAIR IS MEASURED ON THE SAME BOX, and the A/B is single-variable.**
+  `/mnt/nas_share/rc/glm5-diag/out-fix-20260830T125313Z`, `thor:gpu0`, the fixed
+  tree `d84db105b`, same checkpoint, same prompt. `blk.0 hc_attn.fn` goes from
+  `nan=12032, +-8.2e6, sd 4.59e5` to `nan=0, -0.379 / +0.398, sd 0.0332`, and
+  `hc_ffn.fn` likewise; `L0 mhc_pre.collapsed` from 20480/20480 NaN to `nan=0`;
+  all 64 per-layer `streams out` lines to `nan=0`; `hidden (final)` to
+  `nan=0, -13.94 / +8.49, sd 1.30`; and `logits[row 4]` from 154880/154880 NaN
+  to `nan=0, -9.14 / +16.43, sd 2.14`. **NO line in the entire repaired run
+  carries a non-zero NaN count.** The top-5 for `The capital of France is` is
+  `(12089, 16.427) (825, 15.148) (7407, 14.672) (3881, 14.582) (264, 14.376)`
+  with `margin(top1-top2)=1.2794`, which against the file's own vocabulary reads
+  **` Paris`, ` one`, ` located`, ` known`, ` a`** -- the right answer first, and
+  every runner-up a plausible English continuation. The engine then arrives at
+  step 2 with `step token_ids n=1: 12089`, so the sampled token is observed
+  INSIDE the engine exactly as the id 0 was in the broken run. The single
+  variable is checked rather than asserted: every non-q8_0 tensor prints
+  byte-identical statistics across the two runs and only the two q8_0 mixers
+  moved.
+
+
+  **THE FOUR-TOKEN TRACE, every step coherent.** `thor:gpu0`, fixed tree,
+  `--max-tokens 4`, `DONE rc=0` at 14:51:34. Emitted ` Paris. Paris is`.
+
+  | step | input | top-1 | logit | margin | the rest of the top-5 |
+  |---|---|---|---:|---:|---|
+  | 1 (prefill, T=5) | `The capital of France is` | ` Paris` | 16.427 | 1.279 | ` one`, ` located`, ` known`, ` a` |
+  | 2 | ` Paris` | `.` | 17.989 | 1.083 | `,`, ` (`, `.\n\n`, ` and` |
+  | 3 | `.` | ` Paris` | 14.619 | 0.404 | ` In`, ` It`, ` The`, ` France` |
+  | 4 | ` Paris` | ` is` | 19.383 | 2.971 | ` has`, `,`, ` was`, `'s` |
+
+  Every candidate at every step is grammatically and semantically appropriate to
+  its position -- a place name or a hedge after "France is", punctuation after a
+  proper noun, a sentence opener after a full stop, a verb after a subject. All
+  180 per-layer `streams out` readings across the four steps are `nan=0`. **Peak
+  RSS 89,315,324 kB = 85.18 GiB** (`VmHWM`, polled). This is the model answering
+  the question, and it is the fact O30 exists to establish.
+
+  **The box is `thor:gpu0` and NOT `dgx:gpu0`, and that is a real limit on this
+  entry.** Both are aarch64 with i8mm, so both take the repack path and the
+  defect and its repair are the same on each; `dgx:gpu0` was held by another
+  session for the whole diagnostic window. Nothing else differed -- same
+  checkpoint, same prompt, same `--device cpu`, same defaults, no flag or arm
+  changed. The one number that is NOT comparable across the two boxes is peak
+  RSS, because the weights are mmap-resident and `VmHWM` then tracks page-cache
+  eviction pressure rather than a fixed footprint: the same unfixed binary read
+  99.47 GiB on `dgx:gpu0` and 72.05 GiB on `thor:gpu0`. A GB10 confirmation of
+  the repaired arm is owed and is running.
+
+  **A SPEED NUMBER THIS ROW MIGHT OTHERWISE HAVE INHERITED IS VOID, and it is
+  worth more than the repair.** The unfixed forward ran a 45-layer pass in about
+  2.3 minutes and the repaired one takes about 39. The probe is not the cause --
+  the unfixed run printed MORE, at level 2, and was faster. The likely cause is
+  the MoE: with NaN router logits every `>` is false, so the top-k almost
+  certainly selected the SAME 8 of 288 experts at every layer and every token,
+  decoding one hot set out of page cache, while the repaired run selects real,
+  scattered experts and pays cold reads for them. If that holds, EVERY speed
+  number this model has produced, including the 73 s/token of the W5b-2c run,
+  came from an all-NaN forward with degenerate expert selection and measures
+  nothing about this model. O6 already claims no speed number, so nothing
+  published depends on it. Recorded as a hypothesis with its reasoning rather
+  than as a measurement, and owed to whoever opens O6.
+
   **NOT REPAIRED, and it is the part with teeth.** CI HAS an aarch64 lane,
   `build-test-cpu-arm64` on `ubuntu-24.04-arm`, and it builds **no glm5 target**
   (`grep -c glm5` over the job is 0): its list is `test_cpu_isa_arm`,

@@ -3715,6 +3715,63 @@ Debts this row carries, each visible rather than waived:
   glm5 suites on is x86-64, so **the defect was unreachable in CI and
   unavoidable in production** — the two populations do not intersect at all.
 
+  **MEASURED, on `thor:gpu0`, and the bisect is a partition rather than a
+  gradient.** Run `/mnt/nas_share/rc/glm5-diag/out-20260830T111015Z`, the
+  UNFIXED tree (`0716fce0e`, which is W5b-2c plus the instrument and nothing
+  else), `vllm-cli --device cpu --max-tokens 2` at `VT_GLM5_DIAG=2`. The prompt
+  tokenizes correctly -- `785 6722 315 9621 374` is `The| capital| of| France|
+  is` -- and the step is `T=5 H=4096 V=154880 layers=45 hc=4
+  logits_indices=1`, so the engine handed the forward exactly what it should.
+
+  | buffer | encoding | nan | min / max |
+  |---|---|---:|---|
+  | `embeds` (gather) | Q5_K | 0 | -0.0420 / 0.0415 |
+  | `output_norm.weight` | F32 | 0 | -0.0146 / 1.984 |
+  | `blk.0 attn_norm` | F32 | 0 | 0.0703 / 0.157 |
+  | **`blk.0 hc_attn.fn`** | **Q8_0** | **12032 / 393216** | **-7.82e6 / +8.17e6** |
+  | `blk.0 hc_attn.base`, `.scale` | F32 | 0 | sane |
+  | **`blk.0 hc_ffn.fn`** | **Q8_0** | **13536** | **+-8.31e6** |
+  | `blk.0 kda.q/k/v/o_proj` | Q5_K, Q6_K | 0 | +-0.37 |
+  | `blk.0 mlp.gate/up/down` | Q5_K, Q6_K | 0 | +-0.14 |
+  | `L0 in.streams` | -- | **0** | -0.042 / 0.042 |
+  | **`L0 mhc_pre.collapsed`** | -- | **20480 / 20480** | -- |
+  | every buffer after, layers 0..44 | -- | 100% | -- |
+  | `hc_head collapse`, `hidden (final)` | -- | 100% | -- |
+  | `lm_head chunk[0]` | Q4_K | **0** | -0.175 / 0.199 |
+  | `logits[row 4]` | -- | **154880 / 154880** | -- |
+
+  **The first NaN is the first arithmetic that touches a Q8_0 weight.**
+  `L0 in.streams` -- the embedding, expanded to four identical streams -- is
+  clean, and `MhcPre`, which reads `hc_attn.fn`, is 100% NaN. Everything
+  downstream follows. The census over the first nine layers is a partition:
+  `hc_attn.fn` 9/9 NaN, `hc_ffn.fn` 9/9, `mla.q_b_proj` 2/2,
+  `mla.kv_a_proj_with_mqa` 2/2 -- every one Q8_0, rank-2 and kept-quant -- and
+  every other tensor clean. `mla.k_b_proj` and `mla.v_b_proj` are Q8_0 and CLEAN,
+  which is explained rather than anomalous: `KeepQuantKDim(kMatmulWeight, shape)`
+  returns `shape.size() == 2 ? shape[1] : -1`, so those rank-3 halves are routed
+  to `ExpandBf16` and never reach the repack at all.
+
+  **WHY NaN AND NOT MERELY WRONG, which is the part a static reading got
+  wrong.** `block_q8_0` is `{fp16 d; int8 qs[32]}` at 34 bytes and
+  `block_q8_0x4` is `{fp16 d[4]; int8 qs[128]}` at 136, so reading the interleave
+  as four plain blocks misaligns the `d` field from the second block onward and
+  QUANT BYTES ARE READ AS AN FP16 SCALE. An fp16 whose five exponent bits are all
+  set with a non-zero mantissa IS NaN, which is 3.06% of the blocks here; the
+  finite remainder is bounded by max-fp16 times max-int8,
+  `65504 * 127 = 8,319,008`, against a measured max of `8.31901e+06`. The
+  envelope is the mechanism's own arithmetic and not an inference from it.
+
+  **The sampler, the head and the tokenizer are each exonerated by the same
+  run.** `lm_head chunk[0]` is clean, so the Q4_K head is intact and only its
+  input is not. The logits line reads `nan=154880` of 154880 and the top-5 is
+  `(3, -nan) (4, -nan) (1, -nan) (0, -nan) (2, -nan)` with
+  `margin(top1-top2)=-nan` -- index order, because every `>` against NaN is
+  false. The next step then arrives with `step token_ids n=1: 0`, so the id 0 is
+  observed INSIDE the engine rather than inferred from the eight `!` on the wire.
+  This is case (a) of the four, and a static reading of the hazard had predicted
+  case (c), finite and wrong; the mechanism is the same and the prediction about
+  which bucket the LOGITS land in was wrong.
+
   **NOT REPAIRED, and it is the part with teeth.** CI HAS an aarch64 lane,
   `build-test-cpu-arm64` on `ubuntu-24.04-arm`, and it builds **no glm5 target**
   (`grep -c glm5` over the job is 0): its list is `test_cpu_isa_arm`,

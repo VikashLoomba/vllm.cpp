@@ -3508,3 +3508,15 @@ vllm_cpp_add_test(test_qwen4_exp_ple_gate vllm/models/test_qwen4_exp_ple_gate.cp
 # translation unit reaching the definition only through the new public header.
 # No src/ grant — the whole point is that the header is public.
 vllm_cpp_add_test(test_qwen3_5_mrope vllm/models/test_qwen3_5_mrope.cpp)
+
+# GLM-5.3 (`GlmMoeDsaForCausalLM`) W2 -- the config, the registration, the
+# `glm-dsa` GGUF arm and the refuse-by-name forward (#2214, spec
+# `.agents/specs/glm-dsa-latest-deepseek.md` §3.7). The suite reads the
+# COMMITTED `zai-org/GLM-5.3` config.json (`vllm/models/glm_moe_dsa_config_glm53.inc`,
+# revision `935644c05e76fc198714f4cca449fd8b970ff6d7`) so the three-way indexer
+# schedule agreement is gated with no asset, and it enters through
+# `LoadedEngine::FromModelDir` so the registration and the dispatch-table row
+# are gated as REACHED rather than merely present.
+vllm_cpp_add_test(test_glm_moe_dsa_config vllm/models/test_glm_moe_dsa_config.cpp)
+target_include_directories(test_glm_moe_dsa_config PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)

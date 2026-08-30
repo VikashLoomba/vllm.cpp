@@ -34,6 +34,7 @@
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/glm5_next_weights.h"  // glm5next GGUF arm
+#include "vllm/model_executor/models/glm_moe_dsa.h"  // glm-dsa GGUF arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"  // qwen4exp GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
@@ -1017,6 +1018,15 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
 //    which asserts its own three architectures by name; a fourth family routed
 //    there would refuse as "qwen3_5 gguf: unexpected architecture", which is the
 //    #809 defect this table exists to prevent (see the default arm below).
+//  * `glm-dsa` -> GlmMoeDsaHfConfigFromGguf. GLM-5.3, and the first row here
+//    whose family vLLM DOES implement at the pin -- `registry.py:117` routes
+//    `GlmMoeDsaForCausalLM` into `deepseek_v2` -- while our own DeepSeek-V2
+//    loader refuses the checkpoint at its `index_topk` tripwire. It is a
+//    SEPARATE row rather than a `deepseek2` one for that reason: the tripwire
+//    stays a wall for DeepSeek-V2 and this family gets its own config, its own
+//    registration and its own refusals. The builder synthesizes an HF-shaped
+//    config and hands it to the same `ParseGlmMoeDsaParams` a config.json
+//    descends through.
 //  * `glm5next` -> Glm5NextHfConfigFromGguf, whose builder synthesizes an
 //    HF-shaped config and hands it to the SAME `ParseGlm5NextParams` a
 //    config.json descends through, so both sources meet one validator. This is
@@ -1036,6 +1046,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen3next", &vllm::HfConfigFromGguf},
     {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
     {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
+    {vllm::kGlmMoeDsaGgufArch, &vllm::GlmMoeDsaHfConfigFromGguf},
 };
 
 std::string SupportedGgufArchitectures() {

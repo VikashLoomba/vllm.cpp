@@ -2057,8 +2057,76 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   without a model to attach it to would be the shell several waves on this row
   stopped rather than ship. Discharged by W7 routing GLM-5.3's `_exps.weight`
   towers through the seam.
+- **O16 — W2 lands three surfaces that NOTHING reaches yet**, and it says so
+  rather than letting a reader infer reachability from a green suite. The
+  registration, its config hook, the `glm-dsa` `kGgufArchArms` row and
+  `GlmMoeDsaHfConfigFromGguf` ARE reached, from `LoadedEngine::FromModelDir`
+  through `HfConfigFromGgufDispatch` and `ModelRegistry::Resolve`, and the
+  focused suite enters through that entry point. `GlmMoeDsaModel::Forward` /
+  `ForwardDevice`, the registry's `forward` hook and `MakeGlmMoeDsaKVCache` are
+  NOT: every arm of `load_weights` refuses, so no `LoadedModel` of this type can
+  exist and neither the forward nor the KV-cache hook can be called through
+  production. Owned by this row; discharged by W7, which is the first wave that
+  produces a loaded model. Tracked by
+  [#2214](https://github.com/mudler/vllm.cpp/issues/2214).
+- **O17 — the one staged GGUF arm cannot be fed, because it states no indexer
+  schedule.** D3 records that the published conversion writes no
+  `glm-dsa.attention.indexer.types`, and W2 refuses such a file by name rather
+  than substituting llama.cpp's hardcoded table. So the `glm-dsa` arm is
+  implemented and the published artifact still does not load. Discharged by a
+  conversion that writes the key — `b10451:conversion/glm.py:337-339` already
+  writes it whenever the source `config.json` carries `indexer_types`, which
+  GLM-5.3's does — or by W7 recording the published arm as unfeedable and naming
+  the converter run that replaces it.
+- **O16 and O17 were authored by W2 as O13 and O14, and are renumbered here.**
+  W2 and W3 were developed on parallel branches and each appended two owed
+  items to this list, so both claimed O13 and O14. W3's three items landed on
+  this row's integration branch first and keep their numbers; W2's two move to
+  O16 and O17, and the `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm` row
+  in `.agents/model-matrix.md` cites the new numbers. Nothing else changed in
+  either item.
 
 ### 3.10 Now
+
+W2 LANDED, 2026-08-30. The row moves `SPIKE` -> `ACTIVE` (`📋` -> `🚧`),
+which is what D4 said would happen when W2 landed. `ACTIVE` rather than
+`PARTIAL` because `CLAIM-MODEL-GLM-MOE-DSA` is still open over seven remaining
+waves, and `scripts/check-agent-record.py` holds an active claim's rows to
+`SPIKE` or `ACTIVE`; the row moves to `PARTIAL` when the claim closes. What is on `main`
+now: `GlmMoeDsaForCausalLM` is registered from its own translation unit, its
+config resolves from a `config.json` and from a `glm-dsa` GGUF header through
+ONE validator, `kGgufArchArms` carries a `glm-dsa` row, and the forward refuses
+by name and lists all seven missing primitives. It loads no weight and computes
+no token, and O16 names the three surfaces nothing reaches yet.
+
+**The three-way agreement of §3.5.1 is now executable, and it holds.** The
+checkpoint's own 78-entry `indexer_types` (committed verbatim as
+`tests/vllm/models/glm_moe_dsa_config_glm53.inc`, `zai-org/GLM-5.3` revision
+`935644c05e76fc198714f4cca449fd8b970ff6d7`), upstream's derived rule at
+`deepseek_v2.py:1097-1101` evaluated at `freq = 4` / `offset = 3`, and
+llama.cpp's `GLM_5_2_DEFAULT_INDEXER_TYPES` (`b10451:src/models/glm-dsa.cpp:6-27`)
+agree on all 78 entries, 21 of them `full`. The same case proves the derivation
+is not a constant: three other (freq, offset) pairs produce three other
+schedules. `mlp_layer_types` likewise reproduces exactly from
+`first_k_dense_replace = 3`, and a config whose two statements disagree is
+refused rather than resolved to either.
+
+**Everything else in this section still holds.** The port is smaller than §0.2
+implies, the blocker that remains is one quantization kernel, and the gate is
+the honest cost: vLLM at the pin implements this architecture and cannot run it
+on any device this project can reach, so no wave may promise a token-exact
+number against it.
+
+**Next action:** W1, which is independent of W2 and unlocks two arms at once.
+W3 has since landed on this row's integration branch; its own record is the
+`W3 LANDED` paragraph further down this section. W2's own residue is O16 (the
+unreached forward) and O17 (the staged artifact states no indexer schedule, so
+the arm that exists still cannot be fed).
+
+---
+
+The state this section recorded when the spike was written, kept because the
+arithmetic is what makes the row's position defensible:
 
 `SPIKE`, 2026-08-29. The row moves off `🚫 BLOCKED` because the blocker was
 computed in the wrong frame, and the correct frame is measured here: **97.49% of

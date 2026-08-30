@@ -446,10 +446,24 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
   // W3 makes the runner allocate every published cache — DeepSeek-V4-Flash's 167
   // across 43 layers, in seven groups at four different page sizes — and hand
   // them here keyed by the name each was published under. What no forward yet
-  // knows is what to DO with a cache set keyed that way:
-  // `DeepseekV4Model::Forward` and `::ForwardDevice` still open with
-  // `(void)attn_kv;` and recompute the whole prefix per token
-  // (`src/vllm/model_executor/models/deepseek_v4.cpp:2886-2887`, `:2959-2960`).
+  // knows is what to DO with a cache set keyed that way, and that is still true
+  // of all THREE architectures that reach this guard, each in its own way
+  // (#2353, surveyed at `85f65b0e8`):
+  //
+  //   `DeepseekV4Model::Forward` and `::ForwardDevice` open with
+  //   `(void)attn_meta; (void)attn_kv;`
+  //   (`src/vllm/model_executor/models/deepseek_v4.cpp:3033-3034`, `:3105-3106`
+  //   — the anchors this comment carried, `:2886-2887` and `:2959-2960`, were
+  //   the values at the SHA W3 was written on and had moved by 147 lines).
+  //
+  //   `ForwardGlm5NextForConditionalGeneration` opens with
+  //   `(void)input.attn_kv; (void)input.gdn_state;`
+  //   (`glm5_next_registry.cpp:156-157`) and re-runs the whole prefix each step,
+  //   which its own comment says in those words.
+  //
+  //   `ForwardQwen4ExpForConditionalGeneration` refuses unconditionally
+  //   (`qwen4_exp_registry.cpp:142`): `Qwen4ExpTextModel::Forward` does not
+  //   exist, so there is no forward to consume anything.
   //
   // Letting the step run would discard a correctly allocated topology in silence
   // and report a decode rate for a full-recompute path, which is the
@@ -458,23 +472,73 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
   // count, the distinct group count and the first published name all come out of
   // the payload, so a channel that arrived empty says something different.
   //
-  // W5 replaces this with the DSA-sparse forward that reads the caches.
+  // WHAT REPLACES THIS IS NOT ONE WAVE, which is the correction #2353 carries.
+  // The line here read "W5 replaces this with the DSA-sparse forward that reads
+  // the caches", and KV-DSV4-MULTICACHE W5 is scoped as the DeepSeek-V4 path
+  // alone. Lifting the guard is a per-architecture capability the MODEL declares
+  // — the polarity `ModelFactory`'s existing `stage_on_load` and offload bits
+  // already use — and each of the three rows above owns its own arm of it. This
+  // guard stays until at least one forward can set that bit true, because a
+  // capability nothing can turn on has no arm a test could drive.
   if (input.multi_kv != nullptr) {
     const MultiKvCacheIndex& mk = *input.multi_kv;
+    // #2353: NAME THE ARRIVING ARCHITECTURE, and compute it rather than
+    // enumerate. When W3 wrote this string DeepSeek-V4 was the only thing that
+    // could publish a multi-cache topology, so "row KV-DSV4-MULTICACHE W5 owns
+    // the consuming forward" was true by construction. THREE architectures
+    // reach it now and the clause is false for two of them:
+    //
+    //   DeepseekV4ForCausalLM            7 groups, all attention. W5 does own it.
+    //   Qwen4ExpForConditionalGeneration 3 groups. Owned by MODEL-MM-QWEN4-EXP;
+    //                                    Qwen4ExpTextModel::Forward does not exist.
+    //   Glm5NextForConditionalGeneration 3 groups. Owned by that model's own row.
+    //
+    // KV-DSV4-MULTICACHE W5 owns ONE of those three, under either of the two
+    // scopings it has carried this week. At `85f65b0e8`, the base this was
+    // written on, `## Work breakdown` gave it the DeepSeek-V4 DSA-sparse path
+    // that removes `deepseek_v4.cpp`'s `(void)attn_kv`. `44d795d96` (#2352)
+    // then NARROWED it to the plumbing — "the caches REACHING the model and
+    // each layer routing to its own", plus lifting this guard — and moved the
+    // DSA algorithm to `MODEL-DSV4-DSA-COMPOSE`. Both scopings are DeepSeek-V4's
+    // model half, so neither reaches `Qwen4ExpTextModel::Forward` or
+    // `ForwardGlm5NextForConditionalGeneration`, which is the whole point of
+    // naming the architecture instead of a row.
+    //
+    // THE THREE ARE NOT ENUMERATED IN THE STRING, DELIBERATELY. A hard-coded
+    // list of rows in a refusal is precisely the construct #2288 has already
+    // driven stale six times over on the sibling row, in both polarities. The
+    // registered architecture is read at run time from the handle this function
+    // already holds, so it cannot rot, and it is the one value that routes the
+    // reader to the row that owes the work.
+    //
+    // WHAT MADE THE OMISSION EXPENSIVE, measured rather than supposed. #2343
+    // drove GLM-5.3-Flash on `dgx:gpu0` on 2026-08-30 and stopped here on the
+    // first step. Its index row, `docs/FEATURES.md`, `docs/USAGE.md` and
+    // `.agents/claims/CLAIM-GLM53-FLASH-W5B2B.md` each then had to say in prose
+    // what this string should have said: that the guard is the ENGINE's, that
+    // it fires before dispatch to the model's own hook, and that the consuming
+    // forward is owed by the model's row.
+    const std::string arch(model.registration().architecture);
     VT_CHECK(false,
-             std::string("model forward: ") + std::to_string(mk.size()) +
+             std::string("model forward: architecture '") + arch +
+                 "' reached this forward with " + std::to_string(mk.size()) +
                  " KV cache(s) from " + std::to_string(mk.num_groups()) +
-                 " published group(s) reached this forward, first '" +
-                 std::string(mk.first_name()) + "', with block tables gathered "
-                 "for " +
+                 " published group(s), first '" +
+                 std::string(mk.first_name()) +
+                 "', with block tables gathered for " +
                  std::to_string(mk.num_group_block_tables()) + " of " +
                  std::to_string(mk.num_published_groups()) +
-                 " published group(s), and no registered forward consumes a "
-                 "cache set keyed by "
-                 "layer name. Refusing rather than discarding an allocated KV "
-                 "topology in silence "
-                 "(row KV-DSV4-MULTICACHE W5 owns the consuming forward; "
-                 "#1925, #2068)");
+                 " published group(s), and the forward registered for '" +
+                 arch +
+                 "' does not consume a cache set keyed by layer name. Refusing "
+                 "rather than discarding an allocated KV topology in silence. "
+                 "THIS GUARD IS THE ENGINE'S (KV-DSV4-MULTICACHE W3, #2068) and "
+                 "it fires for ANY architecture that publishes a multi-cache "
+                 "topology, BEFORE dispatch to that architecture's own forward "
+                 "hook, so the consuming forward is owed by the row that ports '" +
+                 arch +
+                 "' and not by the engine row that owns this guard. "
+                 "#1925, #2068, #2353");
   }
   return model.registration().factory->forward(model, input);
 }

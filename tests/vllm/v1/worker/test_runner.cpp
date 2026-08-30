@@ -2375,9 +2375,11 @@ TEST_CASE("runner: a multi-cache topology ALLOCATES its N-state recurrent group"
 // `ModelRegistry::Forward` is the shared decode seam AGENTS.md routes every
 // forward through, and `GPUModelRunner::execute_model` reaches it. It REFUSES a
 // multi-cache index, because no registered forward consumes a cache set keyed by
-// layer name yet (W5 owns that). The refusal reads the channel's PAYLOAD — how
-// many caches, from how many groups, and the first name — so a channel that
-// arrived empty produces a different message.
+// layer name yet. THREE architectures reach it and no ONE row owns all three
+// consuming forwards (#2353), so the refusal names the ARRIVING architecture and
+// leaves ownership to that architecture's row. The refusal reads the channel's
+// PAYLOAD — how many caches, from how many groups, and the first name — so a
+// channel that arrived empty produces a different message.
 TEST_CASE("runner: a multi-cache forward is REFUSED, naming the channel") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);
@@ -2406,10 +2408,45 @@ TEST_CASE("runner: a multi-cache forward is REFUSED, naming the channel") {
   } catch (const std::runtime_error& e) {
     msg = e.what();
   }
+  MESSAGE("EMITTED REFUSAL BYTES: [" << msg << "]");
   CHECK(msg.find("10 KV cache(s)") != std::string::npos);
   CHECK(msg.find("7 published group(s)") != std::string::npos);
   CHECK(msg.find("model.layers.2.attn") != std::string::npos);
-  CHECK(msg.find("KV-DSV4-MULTICACHE W5") != std::string::npos);
+
+  // ─── #2353 ────────────────────────────────────────────────────────────────
+  //
+  // THE ARRIVING ARCHITECTURE IS NAMED. Three architectures publish a
+  // multi-cache topology today -- `DeepseekV4ForCausalLM` (7 groups),
+  // `Qwen4ExpForConditionalGeneration` (3) and `Glm5NextForConditionalGeneration`
+  // (3) -- and the message named none of them, so a reader who met it could not
+  // tell which row owed the consuming forward. #2343 is the measured cost: the
+  // guard fired on `dgx:gpu0` and four separate records had to reconstruct in
+  // prose what the string should have said itself.
+  //
+  // THE EXPECTATION IS NOT A BARE LITERAL. `Qwen3_5MoeForConditionalGeneration`
+  // is the architecture `BorrowQwen3_5MoeLoadedModel` registers this runner's
+  // model under (`qwen3_5_moe.cpp:241-245`), and it is asserted through
+  // `RegistrationFor`, which is the same registry the message reads and a
+  // different code path from the one that builds it. The NEGATIVE assertion is
+  // what stops a hard-coded architecture from passing: a message that named
+  // `DeepseekV4ForCausalLM` for every arrival would satisfy the positive check
+  // on a DeepSeek-V4 run and fail here.
+  const std::string arch(
+      vllm::RegistrationFor("Qwen3_5MoeForConditionalGeneration").architecture);
+  REQUIRE_FALSE(arch.empty());
+  CHECK(msg.find(arch) != std::string::npos);
+  CHECK(msg.find("DeepseekV4ForCausalLM") == std::string::npos);
+
+  // THE OWNERSHIP PIN MOVED, IT WAS NOT DELETED. It read
+  // "KV-DSV4-MULTICACHE W5", which asserts that row's W5 owns the consuming
+  // forward for whatever architecture arrives. That row's W5 is scoped in
+  // `.agents/specs/kv-dsv4-multicache.md` as the DeepSeek-V4 DSA-sparse path
+  // that removes `deepseek_v4.cpp`'s `(void)attn_kv`, so it is true for one of
+  // the three arrivals and false for the other two. The string now names the
+  // row that owns THE GUARD -- W3 landed it -- and leaves the consuming forward
+  // to the arriving architecture's own row.
+  CHECK(msg.find("KV-DSV4-MULTICACHE W3") != std::string::npos);
+  CHECK(msg.find("KV-DSV4-MULTICACHE W5") == std::string::npos);
 }
 
 // ─── MODEL-MM-QWEN4-EXP W5c-2 (#2249 item 3) — EVERY published group gathered ─
@@ -2447,8 +2484,11 @@ TEST_CASE("runner: a multi-cache forward is REFUSED, naming the channel") {
 //
 // THIS DRIVES THE PRODUCTION ENTRY POINT. `GPUModelRunner::execute_model` is
 // what an engine calls; the gather runs inside it, and the forward it reaches
-// then REFUSES the multi-cache channel (KV-DSV4-MULTICACHE W5 owns the consuming
-// forward). The refusal is caught and READ, because the count it reports is the
+// then REFUSES the multi-cache channel. The consuming forward is owed by the row
+// that ports the ARRIVING architecture, which is what the refusal now names and
+// what #2353 corrected: this comment said "KV-DSV4-MULTICACHE W5 owns the
+// consuming forward", and that row's W5 is the DeepSeek-V4 DSA-sparse path
+// alone. The refusal is caught and READ, because the count it reports is the
 // production reader of the gathered tables — a value nothing reads is a value
 // nothing can be wrong about.
 TEST_CASE("runner: EVERY published KV group's block table is gathered (#2249)") {

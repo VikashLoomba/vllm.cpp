@@ -36,7 +36,7 @@ in both specs:
 
 | row | owns |
 |---|---|
-| `KV-DSV4-MULTICACHE` W5 | the caches REACHING the model and each layer routing to its own: `attn_kv` consumed rather than `(void)`-ed, and `ModelRegistry::Forward` (`model_registry.cpp:430-440`) stopping its refusal |
+| `KV-DSV4-MULTICACHE` W5 | the caches REACHING the model and each layer routing to its own: `attn_kv` consumed rather than `(void)`-ed, and `ModelRegistry::Forward`'s `input.multi_kv` guard (`model_registry.cpp`) stopping its refusal |
 | **this row** | what RUNS on those caches: the three layer shapes, the compressor's two stages, the `coff` role selection and boundary emission, the indexer's `qr`-sourced query, and the `!is_indexer && !is_comp` refusal at `deepseek_v4.cpp:786-787` |
 
 W5 lands first and deliberately does NOT remove the DSA refusal; it makes a cache
@@ -194,7 +194,7 @@ a cache the forward is not handed. This is a hard ordering, not a preference.
 **W5, not W3** (#2302). An earlier revision of this spec named W3, which had
 already landed when it was written. The wall today is the one the code names
 itself, in `ModelRegistry::Forward`
-(`src/vllm/model_executor/models/model_registry.cpp:430-440`):
+(`src/vllm/model_executor/models/model_registry.cpp`, the `input.multi_kv` guard at the top of `ModelRegistry::Forward`):
 
 > `... and no registered forward consumes a cache set keyed by layer name.
 > Refusing rather than discarding an allocated KV topology in silence (row

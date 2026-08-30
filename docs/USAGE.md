@@ -698,6 +698,14 @@ published group(s), and no registered forward consumes a cache set keyed by
 layer name.
 ```
 
+Those are the bytes emitted at the SHA that run was measured on. The guard now
+names the arriving architecture and leaves ownership of the consuming forward to
+that architecture's own row ([#2353](https://github.com/mudler/vllm.cpp/issues/2353)),
+so a run today reads `architecture 'Glm5NextForConditionalGeneration' reached
+this forward with 22 KV cache(s) ...` and says in the message what the paragraph
+below had to say in prose. The transcript is kept as measured rather than
+rewritten, because it is dated evidence and not a specimen of current output.
+
 That is the `multi_kv` guard at the TOP of `ModelRegistry::Forward`, landed by
 KV-DSV4-MULTICACHE W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068)).
 It fires for ANY model publishing a multi-cache topology, BEFORE dispatch to that

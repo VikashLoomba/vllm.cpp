@@ -3487,6 +3487,21 @@ target_include_directories(test_qwen4_exp_ple_device PRIVATE ${CMAKE_SOURCE_DIR}
 # grant — this test reaches nothing but the public vt:: surface.
 vllm_cpp_add_test(test_qwen4_exp_ple_gate vllm/models/test_qwen4_exp_ple_gate.cpp)
 
+# MODEL-MM-QWEN4-EXP W5e-2 (#2336) — `RunQwen4ExpPleBlock`, the PLE layer as ONE
+# production composition and the LAST of the three block seams. Gated end to end
+# against the SAME lane-pinned goldens the W2 host reference is held to
+# (`kPleExpectedOutput` and `kPleMaskedExpectedOutput`, upstream's own
+# `Qwen4ExpTextPLELayer.forward` executed under torch), single-shot and
+# incremental, so the composition and the reference answer to ONE oracle. Carries
+# the three FIXTURE-separation measurements that make this wave's mutation
+# battery interpretable, the conv_mask's paired EOS obligation, and the
+# analytic bound on the f32 score accumulator inside the clamp band at the
+# RELEASED width. CPU only: every op it is the first production caller of is
+# registered on kCPU alone. Reaches the model-private qwen4_exp_ple_block.h /
+# qwen4_exp_ple.h / qwen4_exp_weights.h, hence the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_ple_block vllm/models/test_qwen4_exp_ple_block.cpp)
+target_include_directories(test_qwen4_exp_ple_block PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # MODEL-MM-QWEN4-EXP W5d-2 (#2249 item 5) — behaviour-neutrality gate for giving
 # `BuildMropeCosSinHost` external linkage. Pins the interleaved and chunked
 # mRoPE cos|sin tables BITWISE against the values the file-static definition

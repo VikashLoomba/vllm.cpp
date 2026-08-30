@@ -267,6 +267,30 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // residual asks for: a reader can grep for it, and it resolves the day
   // W5e-2 lands.
   //
+  // AND A SEVENTH TIME, ON THE WAVE THAT LANDED THE SYMBOL THE SIXTH REPAIR
+  // NAMED. W5e-1 wrote "there is no RunQwen4ExpPleBlock beside
+  // RunQwen4ExpQsaBlock and RunQwen4ExpMoeBlock", deliberately naming the
+  // SYMBOL so a reader could grep for it and so the sentence would resolve the
+  // day W5e-2 landed. This is that day: `RunQwen4ExpPleBlock`
+  // (`qwen4_exp_ple_block.{h,cpp}`) exists, so the clause is removed rather than
+  // reworded — a refusal enumerates what is MISSING and a present item is not
+  // missing — and the sentence that called PLE "the LAST one" goes with it,
+  // because the population it counted is now empty.
+  //
+  // "IN THIS TREE" AND NOT "ON MAIN", which is a repair in its own right. The
+  // sixth instance wrote "is now on main" while sitting on a branch whose own op
+  // was not on main yet, so the sentence was false at the commit that authored
+  // it and true only after a merge nobody had made. "In this tree" is checkable
+  // at every commit and cannot go stale in that direction.
+  //
+  // THE COUNT OF BLOCK SEAMS IS ZERO AND EACH ONE HAS A SYMBOL, read off this
+  // tree rather than off any wave's prose: `RunQwen4ExpQsaBlock` /
+  // `RunQwen4ExpQsaBlockPaged` (W5b-5, W5d-3), `RunQwen4ExpMoeBlock` (W5d-4),
+  // `RunQwen4ExpPleBlock` (W5e-2). What is left is the LAYER LOOP, which is a
+  // different kind of thing and is why the refusal still refuses: three blocks
+  // that nothing calls decode no token. W5e-2 lands UNREACHED and the spec's
+  // `## Owed` says so with the row and the issues that own the wiring.
+  //
   // "A SIXTH TIME" ABOVE AND "#2288 IN ITS SEVENTH TURN" IN #2336 COUNT
   // DIFFERENT POPULATIONS, AND BOTH ARE RIGHT. This comment counts instances
   // #2288 has produced IN THIS REFUSAL STRING; #2336 and the spec's `## Now`
@@ -299,17 +323,17 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // that is wrong.
   VT_CHECK(false,
            "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
-           "The five prerequisites #2249 surveyed are ZERO, and every op "
-           "#2336 surveyed is now on main (W2/W3/W4/W6a/W5a/W5b-1..6, "
-           "W5c-1, W5c-2, W5d-1..4, W5e-1). The BLOCK SEAMS are not: the "
-           "PLE block has "
-           "no production composition — there is no RunQwen4ExpPleBlock beside "
-           "RunQwen4ExpQsaBlock and RunQwen4ExpMoeBlock — and it is the LAST "
-           "one, owned by W5e-2 under #2336. Beyond it the LAYER LOOP itself, "
-           "Qwen4ExpTextModel::Forward, is missing, owned by #2031, with the "
-           "QSA indexer side cache's PAGED STORE still owed. "
-           "ModelRegistry::Forward additionally refuses any multi-cache "
-           "topology by name, and this model publishes one. See "
+           "The five prerequisites #2249 surveyed are ZERO, every op "
+           "#2336 surveyed is now in this tree, and so is every BLOCK SEAM "
+           "(RunQwen4ExpQsaBlock, RunQwen4ExpQsaBlockPaged, "
+           "RunQwen4ExpMoeBlock, RunQwen4ExpPleBlock; "
+           "W2/W3/W4/W6a/W5a/W5b-1..6, W5c-1, W5c-2, W5d-1..4, W5e-1, "
+           "W5e-2). What is missing is the LAYER LOOP itself, "
+           "Qwen4ExpTextModel::Forward: nothing calls any of those blocks, so "
+           "no token has been decoded by this architecture. It is owned by "
+           "W5f under #2031, with the QSA indexer side cache's PAGED STORE "
+           "still owed. ModelRegistry::Forward additionally refuses any "
+           "multi-cache topology by name, and this model publishes one. See "
            ".agents/specs/qwen4-exp-flash-next.md and issues #2031, #2336 and "
            "#1978.");
   return ForwardLogits{};  // unreachable; VT_CHECK always throws here

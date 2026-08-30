@@ -482,14 +482,17 @@ bool MultiKvCacheIndex::Resolve(std::string_view layer_name,
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,
                                      const ModelForwardInput& input) {
   // KV-DSV4-MULTICACHE W3 (#2068): a MULTI-CACHE topology reached the shared
-  // decode seam, and no registered forward consumes one.
+  // decode seam, and the forward registered for this architecture does not
+  // consume one. ONE now does — see `consumes_multi_kv` below — so the sentence
+  // that read "no registered forward consumes one" is the one thing in this
+  // comment that W5j had to change rather than extend.
   //
   // W3 makes the runner allocate every published cache — DeepSeek-V4-Flash's 167
   // across 43 layers, in seven groups at four different page sizes — and hand
-  // them here keyed by the name each was published under. What no forward yet
-  // knows is what to DO with a cache set keyed that way, and that is still true
-  // of all THREE architectures that reach this guard, each in its own way
-  // (#2353, surveyed at `85f65b0e8`):
+  // them here keyed by the name each was published under. What to DO with a cache
+  // set keyed that way is known by exactly ONE of the three architectures that
+  // reach this guard (#2353, surveyed at `85f65b0e8`; the count was ZERO until
+  // W5j). Each of the three, in its own way:
   //
   //   `DeepseekV4Model::Forward` and `::ForwardDevice` open with
   //   `(void)attn_meta; (void)attn_kv;`
@@ -502,15 +505,15 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
   //   (`glm5_next_registry.cpp:156-157`) and re-runs the whole prefix each step,
   //   which its own comment says in those words.
   //
-  //   `ForwardQwen4ExpForConditionalGeneration` NO LONGER refuses
-  //   unconditionally. This head composed W5f and W5g (#2031), so
-  //   `Qwen4ExpTextModel::Forward` exists and that hook calls it — see the
-  //   `Qwen4ExpTextModelForward` call site in `qwen4_exp_registry.cpp`. It is
-  //   still not a CONSUMING forward: it serves a SINGLE-SHOT prefill of one
-  //   sequence, reads `attn_kv` and `gdn_state` POSITIONALLY, and never touches
-  //   `multi_kv`. Its own refusals are BY NAME — `num_reqs == 1`, and the QSA
-  //   indexer side cache and the PLE conv ring and n-gram history having
-  //   nowhere to persist across steps.
+  //   `ForwardQwen4ExpForConditionalGeneration` IS THE FIRST CONSUMER, and this
+  //   bullet used to be the third refusal in the list. W5j (#2031) makes it
+  //   resolve every cache through `MultiKvCacheIndex::Resolve` — group 0's paged
+  //   K/V, group 2's indexer side cache and group 1's recurrent states, each by
+  //   the name `MakeQwen4ExpKVCache` published it under — and read group 2's own
+  //   gathered block table through `BlockTableForGroup`. It sets
+  //   `consumes_multi_kv` and is therefore the one architecture this guard lets
+  //   past. It still serves a SINGLE-SHOT prefill of one sequence and says so
+  //   itself, BY NAME, at its own boundary.
   //
   // Letting the step run would discard a correctly allocated topology in silence
   // and report a decode rate for a full-recompute path, which is the
@@ -532,10 +535,26 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
   // the caches", and KV-DSV4-MULTICACHE W5 is scoped as the DeepSeek-V4 path
   // alone. Lifting the guard is a per-architecture capability the MODEL declares
   // — the polarity `ModelFactory`'s existing `stage_on_load` and offload bits
-  // already use — and each of the three rows above owns its own arm of it. This
-  // guard stays until at least one forward can set that bit true, because a
-  // capability nothing can turn on has no arm a test could drive.
-  if (input.multi_kv != nullptr) {
+  // already use — and each of the three rows above owns its own arm of it.
+  //
+  // THAT BIT EXISTS NOW, AND IT LANDED WITH ITS FIRST CONSUMER (W5j, #2031).
+  // `ModelFactory::consumes_multi_kv` is the declaration and
+  // `ForwardQwen4ExpForConditionalGeneration` is the arm that sets it, which is
+  // the condition #2353 named for lifting this at all: "a capability nothing can
+  // turn on has no arm a test could drive". The guard did not go away — it
+  // NARROWED, from "any multi-cache topology" to "any multi-cache topology
+  // reaching a forward that does not ask by name", which is still DeepSeek-V4
+  // and GLM-5-Next and still every model ported after them until one of them
+  // wires the channel.
+  //
+  // LETTING A DECLARED CONSUMER PAST IS NOT LETTING ITS INPUT PAST. The channel
+  // can be malformed in ways only the model can see — a layer name nothing was
+  // published under, a name that resolves to the wrong payload kind, a group
+  // whose block table was never gathered — and the consuming forward refuses
+  // each of those by name at its own boundary. This guard cannot: it does not
+  // know which names the model expects.
+  if (input.multi_kv != nullptr &&
+      !model.registration().factory->consumes_multi_kv) {
     const MultiKvCacheIndex& mk = *input.multi_kv;
     // #2353: NAME THE ARRIVING ARCHITECTURE, and compute it rather than
     // enumerate. When W3 wrote this string DeepSeek-V4 was the only thing that
@@ -591,7 +610,8 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
                  std::to_string(mk.num_published_groups()) +
                  " published group(s), and the forward registered for '" +
                  arch +
-                 "' does not consume a cache set keyed by layer name. Refusing "
+                 "' does not consume a cache set keyed by layer name — its "
+                 "ModelFactory leaves `consumes_multi_kv` false. Refusing "
                  "rather than discarding an allocated KV topology in silence. "
                  "THIS GUARD IS THE ENGINE'S (KV-DSV4-MULTICACHE W3, #2068) and "
                  "it fires for ANY architecture that publishes a multi-cache "

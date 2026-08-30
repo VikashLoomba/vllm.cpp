@@ -43,6 +43,7 @@
 // the property that makes the bound a gate rather than a mute switch.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -899,4 +900,674 @@ TEST_CASE(
   // The VALUE again: the count the step actually carried.
   CHECK(num_reqs_msg.find("the step carries 2") != std::string::npos);
   CHECK(num_reqs_msg.find("qwen4_exp ple layout") == std::string::npos);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5j — THE BY-NAME CACHE CHANNEL, THROUGH THE PRODUCTION ENTRY POINT.
+//
+// The case above enters `ModelRegistry::Forward` with `multi_kv == nullptr`,
+// which is the shape no engine step has: `qwen4_exp` publishes THREE KV cache
+// groups, so `GPUModelRunner` sets `multi_cache_topology_` and hands the forward
+// a `MultiKvCacheIndex`. Three things stood between that step and a token, and
+// this case drives all three.
+//
+//   1. `ModelRegistry::Forward` refused ANY non-null `multi_kv`. It now refuses
+//      only a topology reaching a forward whose `ModelFactory::consumes_multi_kv`
+//      is false, and this architecture sets it. A green run below IS the proof
+//      that the guard let it past; every refusal asserted further down also
+//      asserts the ENGINE's message is ABSENT, so a case that stopped at the
+//      guard cannot read as this hook refusing.
+//
+//   2. `attn_kv` ARRIVES AT 2 x n_qsa, not n_qsa. The runner allocates one paged
+//      buffer per (attention group x layer) and this model publishes TWO
+//      attention groups over the same QSA layers — group 0's K/V and group 2's
+//      indexer side cache. The hook's old `attn_kv.size() == n_qsa` assertion
+//      would have turned the lifted guard into a DIFFERENT refusal rather than a
+//      token, which is why the channel is resolved by NAME here.
+//
+//   3. W5i's production path used a per-call scratch behind an IDENTITY block
+//      table, so the permutation it gates was never exercised by an allocator.
+//      Group 2's own buffer and its own gathered table reach the block now.
+//
+// ─── HOW THE PAGING IS GATED, AND WHY NOT BY VALUE ───────────────────────────
+// W5i measured the trap: 9 of 23 rows landed in the wrong physical page and BOTH
+// the paged-vs-contiguous value diff (0 of 1472 words) and the oracle bound
+// stayed green, because the store and the read share ONE translation and a
+// consistently wrong one returns the right answer. So the gate here is
+// STRUCTURAL and comparative:
+//
+//   * the group-2 buffer is POISONED with a sentinel before the step, and after
+//     it exactly the rows the group's OWN table names for logical [0, T) differ
+//     from the sentinel — every other row is byte-for-byte the sentinel still;
+//   * the SAME step is run twice with two DIFFERENT group-2 tables. The logits
+//     must be BIT-IDENTICAL (paging is transparent to the arithmetic) and the
+//     written row sets must DIFFER (paging is not transparent to the buffer).
+//     A hook that ignored the table would pass the first half and fail this one;
+//   * the written set is asserted to be neither the IDENTITY set nor group 0's
+//     translation, which are the two wrong tables physically present in the step.
+//
+// The tables are NON-IDENTITY and FIXED-POINT-FREE over the pages actually used,
+// and the final page is PARTIAL (T = 6 over a page size of 4), so a translation
+// that dropped the row-within-page term or clamped the last page is separated.
+TEST_CASE(
+    "qwen4_exp: ModelRegistry::Forward serves the BY-NAME multi-cache channel") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  // The fixture's topology: layers 0,1,2 linear_attention and layer 3
+  // qwen_sparse_attention, so ONE QSA layer and THREE recurrent ones.
+  constexpr int64_t kQsaLayer = 3;
+  constexpr int64_t kGdnLayers = 3;
+  constexpr int64_t T = 6;
+  // `RunQwen4ExpQsaBlockPaged` requires the K/V page size to be a multiple of
+  // `indexer_compress_ratio`, so 4 is the smallest legal page here — and it
+  // leaves T = 6 spanning two pages with a PARTIAL final one.
+  constexpr int64_t kPage = 4;
+  static_assert(kPage % kCompressRatio == 0, "the QSA page must hold whole compress blocks");
+  constexpr int64_t kCols = 2;   // pages named per sequence
+  constexpr int64_t kBlocks0 = 3;  // group 0's pool
+  constexpr int64_t kBlocks2 = 4;  // group 2's pool — a DIFFERENT size on purpose
+
+  // THE THREE PERMUTATIONS, all distinct over the two pages this step uses and
+  // none of them the identity or a fixed point there.
+  const std::vector<int32_t> bt0{2, 0};        // group 0's map
+  const std::vector<int32_t> bt2_a{1, 3};      // group 2's map, run A
+  const std::vector<int32_t> bt2_b{2, 0};      // group 2's map, run B — same
+                                               // pages as group 0's, in group
+                                               // 2's OWN pool
+  const std::vector<int32_t> bt_recurrent{0};  // the recurrent group's row
+
+  // The physical row a logical position lands on under a given table.
+  const auto rows_of = [](const std::vector<int32_t>& table, int64_t n) {
+    std::vector<int64_t> r(static_cast<size_t>(n));
+    for (int64_t t = 0; t < n; ++t)
+      r[static_cast<size_t>(t)] =
+          static_cast<int64_t>(table[static_cast<size_t>(t / kPage)]) * kPage + t % kPage;
+    return r;
+  };
+
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    ids[static_cast<size_t>(t)] =
+        static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+  for (int32_t v : ids) REQUIRE(v < static_cast<int32_t>(kVocab));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  // The bf16 sentinel the group-2 buffer is poisoned with: 0x3F80 is 1.0f.
+  // A row the block wrote is a raw indexer key and is not plausibly sixteen
+  // consecutive exact 1.0s, and a row it did not write is EXACTLY this.
+  constexpr uint16_t kPoison = 0x3F80;
+  const int64_t kIdxRows = kBlocks2 * kPage;
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  // ─── ONE BY-NAME STEP, ASSEMBLED THE WAY THE RUNNER ASSEMBLES ONE ─────────
+  // Every buffer is FRESH per call: the first step writes the paged K/V, both
+  // recurrent states and the indexer pages, so reusing them would let a second
+  // run differ because the caches were dirty rather than because the input was.
+  struct StepResult {
+    std::vector<float> logits;
+    std::vector<uint16_t> index_cache;
+    std::vector<uint16_t> kv_cache;
+    int64_t vocab = 0;
+    int64_t token = -1;
+  };
+  // `corrupt` names ONE way the channel can be malformed; 0 is a well-formed
+  // step. When `err` is non-null the call is expected to refuse and the message
+  // is returned through it instead of the step's results.
+  enum Corrupt { kNone = 0, kWrongName = 1, kWrongKind = 2, kNoGroupTable = 3 };
+  const auto run_step = [&](const std::vector<int32_t>& idx_table,
+                            const std::vector<int32_t>& prompt,
+                            int corrupt = kNone, std::string* err = nullptr) {
+    vllm::v1::CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = static_cast<int>(T);
+    am.block_table_num_cols = static_cast<int>(kCols);
+    am.block_table_tensor = bt0;
+    am.seq_lens.assign(1, static_cast<int32_t>(T));
+    am.query_start_loc = {0, static_cast<int32_t>(T)};
+    am.slot_mapping.resize(static_cast<size_t>(T));
+    {
+      const std::vector<int64_t> r0 = rows_of(bt0, T);
+      for (int64_t t = 0; t < T; ++t)
+        am.slot_mapping[static_cast<size_t>(t)] =
+            static_cast<int32_t>(r0[static_cast<size_t>(t)]);
+    }
+
+    vllm::v1::GDNAttentionMetadata gm;
+    gm.num_prefills = 1;
+    gm.num_prefill_tokens = static_cast<int>(T);
+    gm.num_actual_tokens = static_cast<int>(T);
+    gm.has_initial_state = std::vector<uint8_t>{0};
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+    gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+    gm.prefill_state_indices = std::vector<int32_t>{0};
+    gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+    {
+      const auto conv =
+          vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+      gm.batch_ptr = conv.batch_ptr;
+      gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+    }
+
+    const int64_t key_dim = kNumKHeads * kLinHeadDim;
+    const int64_t value_dim = kNumVHeads * kLinHeadDim;
+    const int64_t conv_dim = 2 * key_dim + value_dim;
+    const int64_t conv_len = kConvKernel - 1;
+    const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+    std::vector<std::vector<float>> ssm(kGdnLayers), conv(kGdnLayers);
+    std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+    std::vector<vllm::GdnStateCache> gdn(kGdnLayers);
+    ssm_b.reserve(kGdnLayers);
+    conv_b.reserve(kGdnLayers);
+    for (int i = 0; i < kGdnLayers; ++i) {
+      ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+      conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+      ssm_b.emplace_back(d, DType::kF32,
+                         std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+                         ssm[i].data());
+      conv_b.emplace_back(d, DType::kF32,
+                          std::vector<int64_t>{1, conv_dim, conv_len}, conv[i].data());
+      gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+      gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+    }
+
+    // GROUP 0: [2, num_blocks, block_size, num_kv_heads, head_size].
+    std::vector<uint16_t> kv(
+        static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
+    vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                                {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+    // GROUP 2: the fused MLA page, [num_blocks, block_size, indexer_head_dim],
+    // POISONED so an unwritten row is distinguishable from a written zero.
+    std::vector<uint16_t> idx(static_cast<size_t>(kIdxRows * kIdxHeadDim), kPoison);
+    vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
+                                 idx.data());
+
+    std::vector<vllm::PagedKvCache> attn_kv(2);
+    attn_kv[0].data = kv_b.t().data;
+    attn_kv[0].dtype = DType::kBF16;
+    attn_kv[0].num_blocks = kBlocks0;
+    attn_kv[0].block_size = kPage;
+    attn_kv[0].num_kv_heads = kKvHeads;
+    attn_kv[0].head_size = kHeadDim;
+    attn_kv[1].data = idx_b.t().data;
+    attn_kv[1].dtype = DType::kBF16;
+    attn_kv[1].num_blocks = kBlocks2;
+    attn_kv[1].block_size = kPage;
+    // `indexer_kv_heads` is 1 — upstream requires it — so the MLA page is one
+    // vector of `indexer_head_dim` per token slot.
+    attn_kv[1].num_kv_heads = kIdxKvHeads;
+    attn_kv[1].head_size = kIdxHeadDim;
+
+    // ─── THE CHANNEL, IN THE RUNNER'S OWN PUBLICATION ORDER ────────────────
+    // One pass over the groups in the order `MakeQwen4ExpKVCache` published
+    // them, emitting each group's names in the group's own order — which is
+    // exactly `runner.cpp`'s by-name index build. The recurrent group sits
+    // BETWEEN the two attention groups, so a flat index is NOT a payload slot.
+    std::vector<std::string> names;
+    std::vector<int32_t> group_ids, layer_indices, payload_slots;
+    std::vector<uint8_t> payload_kinds;
+    names.push_back("model.layers." + std::to_string(kQsaLayer) + ".self_attn.attn");
+    group_ids.push_back(0);
+    layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+    payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+    payload_slots.push_back(0);
+    for (int i = 0; i < kGdnLayers; ++i) {
+      names.push_back("model.layers." + std::to_string(i) + ".linear_attn");
+      group_ids.push_back(1);
+      layer_indices.push_back(i);
+      payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kRecurrent));
+      payload_slots.push_back(i);
+    }
+    names.push_back("model.layers." + std::to_string(kQsaLayer) +
+                    ".self_attn.indexer.k_cache");
+    group_ids.push_back(2);
+    layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+    payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+    payload_slots.push_back(1);
+
+    std::vector<std::vector<int32_t>> group_tables{bt0, bt_recurrent, idx_table};
+    std::vector<int32_t> group_cols{static_cast<int32_t>(kCols), 1,
+                                    static_cast<int32_t>(kCols)};
+
+    // ─── THE THREE MALFORMED CHANNELS ─────────────────────────────────────
+    // Each is a shape the ENGINE cannot judge — it does not know which names
+    // this model expects — and each returns a wrong buffer with no shape error
+    // if the hook trusts it.
+    if (corrupt == kWrongName) {
+      // The publisher and the consumer disagree about where the side cache is.
+      names.back() = "model.layers." + std::to_string(kQsaLayer) +
+                     ".self_attn.indexer.key_cache";
+    } else if (corrupt == kWrongKind) {
+      // A recurrent group classified as paged: `gdn_state[0]` would be read out
+      // of `attn_kv` instead.
+      payload_kinds[1] = static_cast<uint8_t>(vllm::KvCachePayload::kPaged);
+    } else if (corrupt == kNoGroupTable) {
+      // Group 2 allocated and its page map never gathered — the exact state
+      // W5c-2 exists to remove, and the one that leaves a cache unreadable.
+      group_tables[2].clear();
+    }
+
+    vllm::MultiKvCacheIndex mk;
+    mk.layer_names = &names;
+    mk.group_ids = &group_ids;
+    mk.layer_indices = &layer_indices;
+    mk.payload_kinds = &payload_kinds;
+    mk.payload_slots = &payload_slots;
+    mk.group_block_tables = &group_tables;
+    mk.group_block_table_cols = &group_cols;
+    if (corrupt == kNone) {
+      REQUIRE(mk.size() == names.size());
+      REQUIRE(mk.num_paged() == 2);
+      REQUIRE(mk.num_recurrent() == kGdnLayers);
+      REQUIRE(mk.num_published_groups() == 3);
+      REQUIRE(mk.num_group_block_tables() == 3);
+    }
+
+    const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+    vllm::ModelForwardInput in{prompt,  pos,    am, gm, attn_kv,
+                               gdn,     config, q,  logits_indices};
+    in.num_reqs = 1;
+    in.gdn_state_slots = 1;
+    in.multi_kv = &mk;
+
+    StepResult out;
+    vllm::ForwardLogits fl;
+    if (err != nullptr) {
+      try {
+        (void)vllm::ModelRegistry::Forward(*model, in);
+        *err = "<the step RETURNED; the refusal is gone>";
+      } catch (const std::exception& e) {
+        *err = e.what();
+      }
+      return out;
+    }
+    // The guard is what this must get past: `ModelRegistry::Forward` refused
+    // every non-null `multi_kv` before W5j.
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+    REQUIRE(fl.on_device());
+    REQUIRE(fl.device_tensor.data != nullptr);
+    REQUIRE(fl.device_tensor.dtype == DType::kF32);
+    REQUIRE(fl.rows == 1);
+    out.vocab = fl.vocab;
+    out.logits.assign(static_cast<size_t>(fl.rows * fl.vocab), 0.0F);
+    d.b.Copy(q, out.logits.data(), fl.device_tensor.data,
+             out.logits.size() * sizeof(float));
+    d.b.Synchronize(q);
+    out.index_cache.assign(idx.size(), 0);
+    idx_b.Download(d, out.index_cache.data());
+    out.kv_cache.assign(kv.size(), 0);
+    kv_b.Download(d, out.kv_cache.data());
+    // THE TOKEN, sampled on the device the forward returned, by the same
+    // `vt::GreedyArgmax` `GPUModelRunner` samples with. AGENTS.md routes decode
+    // through on-device sampling and this is that primitive, not a host argmax.
+    {
+      std::vector<int64_t> t1(1, -1);
+      vllm::dense_attn::DBuf tok_b(d, DType::kI64, {1});
+      vt::Tensor tt = tok_b.t();
+      vt::GreedyArgmax(q, tt, fl.device_tensor);
+      tok_b.Download(d, t1.data());
+      out.token = t1[0];
+    }
+    return out;
+  };
+
+  // ─── RUN A ────────────────────────────────────────────────────────────────
+  StepResult a;
+  REQUIRE_NOTHROW(a = run_step(bt2_a, ids));
+  CHECK(a.vocab == kVocab);
+
+  int finite = 0;
+  for (float v : a.logits) finite += std::isfinite(v) ? 1 : 0;
+  REQUIRE(finite == static_cast<int>(a.logits.size()));
+  float lo = a.logits[0];
+  float hi = a.logits[0];
+  for (float v : a.logits) {
+    lo = v < lo ? v : lo;
+    hi = v > hi ? v : hi;
+  }
+  // Not a constant row: the lm_head times a zero hidden would be finite, in
+  // range and argmax to 0.
+  CHECK(hi > lo);
+
+  MESSAGE("qwen4_exp by-name step: sampled token id "
+          << a.token << " of " << a.vocab << " (logit range [" << lo << ", "
+          << hi << "])");
+  CHECK(a.token >= 0);
+  CHECK(a.token < a.vocab);
+  // The argmax must be THIS row's maximum, so the sampler read these logits and
+  // not an uninitialised buffer.
+  CHECK(a.logits[static_cast<size_t>(a.token)] == hi);
+
+  // ─── THE STRUCTURAL ROW-SET ASSERTION ─────────────────────────────────────
+  // Exactly the rows group 2's OWN table names for logical [0, T) were written,
+  // and nothing else was touched. A value gate cannot see this; W5i measured a
+  // 9-of-23 mis-page that left every value check green.
+  const auto written_rows = [&](const std::vector<uint16_t>& cache) {
+    std::vector<int64_t> w;
+    for (int64_t r = 0; r < kIdxRows; ++r) {
+      bool touched = false;
+      for (int64_t c = 0; c < kIdxHeadDim; ++c)
+        if (cache[static_cast<size_t>(r * kIdxHeadDim + c)] != kPoison) touched = true;
+      if (touched) w.push_back(r);
+    }
+    return w;
+  };
+  std::vector<int64_t> expect_a = rows_of(bt2_a, T);
+  std::sort(expect_a.begin(), expect_a.end());
+  const std::vector<int64_t> got_a = written_rows(a.index_cache);
+  {
+    std::string s;
+    for (int64_t r : got_a) s += std::to_string(r) + " ";
+    INFO("group-2 rows written under table {1,3}: ", s);
+    CHECK(got_a == expect_a);
+  }
+  // And it is NEITHER of the two wrong maps physically present in the step.
+  std::vector<int64_t> identity(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) identity[static_cast<size_t>(t)] = t;
+  CHECK(got_a != identity);
+  std::vector<int64_t> via_group0 = rows_of(bt0, T);
+  std::sort(via_group0.begin(), via_group0.end());
+  CHECK(got_a != via_group0);
+
+  // ─── RUN B: THE SAME STEP THROUGH A DIFFERENT GROUP-2 MAP ─────────────────
+  // Paging is transparent to the ARITHMETIC and not to the BUFFER. A hook that
+  // ignored the group's table would pass the first half of this pair and fail
+  // the second.
+  StepResult b;
+  REQUIRE_NOTHROW(b = run_step(bt2_b, ids));
+  REQUIRE(b.logits.size() == a.logits.size());
+  const double drift = vllm_test::MaxAbsDiff(a.logits, b.logits);
+  MESSAGE("qwen4_exp by-name: logit drift across two group-2 page maps = " << drift);
+  CHECK(drift == 0.0);
+  std::vector<int64_t> expect_b = rows_of(bt2_b, T);
+  std::sort(expect_b.begin(), expect_b.end());
+  const std::vector<int64_t> got_b = written_rows(b.index_cache);
+  CHECK(got_b == expect_b);
+  CHECK(got_b != got_a);
+
+  // ─── AND THE STEP STILL DEPENDS ON ITS PROMPT ─────────────────────────────
+  // Every assertion above is satisfied by a hook that never reads `token_ids`:
+  // MUT-REACH on this row measured 90 of 91 assertions surviving the deletion of
+  // the whole tower.
+  std::vector<int32_t> ids2(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    ids2[static_cast<size_t>(t)] =
+        static_cast<int32_t>(t == T - 1 ? kEosTokenId : (t + 1) * 2 + 1);
+  for (int32_t v : ids2) REQUIRE(v < static_cast<int32_t>(kVocab));
+  REQUIRE(ids2 != ids);
+  StepResult c;
+  REQUIRE_NOTHROW(c = run_step(bt2_a, ids2));
+  const double moved = vllm_test::MaxAbsDiff(a.logits, c.logits);
+  MESSAGE("qwen4_exp by-name second-prompt logit movement: " << moved);
+  CHECK(moved > 0.0);
+  // The indexer keys are the prompt's own, so the CONTENT of the written rows
+  // moves too while the row SET does not.
+  CHECK(written_rows(c.index_cache) == expect_a);
+  // ─── WHAT THIS FIXTURE CANNOT GATE, MEASURED RATHER THAN ASSUMED ─────────
+  // The CONTENT of neither cache moves with the prompt here, and the count
+  // below is printed so the next reader does not write the assertion that
+  // reddened on this exact line. It is a DYNAMIC-RANGE property of the fixture,
+  // not a defect: the four-layer ramp puts the layer-3 activations near 2^18,
+  // where one bf16 ULP is ~1024, and the two prompts move the logits by 31.84
+  // out of 95090 — 0.03%, an order of magnitude under one ULP at that exponent.
+  // The paged K/V, whose store is `vt::ReshapeAndCache` and is gated by every
+  // other model in this tree, is prompt-invariant here for the same reason and
+  // by the same count, which is what separates "the fixture saturates" from
+  // "the indexer writes one row T times".
+  //
+  // So the ROW SET is what gates the paging on this fixture, exactly as
+  // `.agents/reachability.md` and W5i's measurement require, and the CONTENT is
+  // gated at the block instead (`test_qwen4_exp_qsa_block.cpp`, the W5i case,
+  // whose values are chosen to separate). Recorded in the spec's `## Owed` as a
+  // fixture the row may want to rescale.
+  {
+    int idx_moved = 0;
+    for (size_t i = 0; i < a.index_cache.size(); ++i)
+      idx_moved += a.index_cache[i] != c.index_cache[i] ? 1 : 0;
+    int kv_moved = 0;
+    for (size_t i = 0; i < a.kv_cache.size(); ++i)
+      kv_moved += a.kv_cache[i] != c.kv_cache[i] ? 1 : 0;
+    MESSAGE("qwen4_exp by-name: across two prompts, "
+            << idx_moved << " of " << a.index_cache.size()
+            << " indexer-cache words moved and " << kv_moved << " of "
+            << a.kv_cache.size() << " paged K/V words moved");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5j — WHAT THE LIFTED GUARD STILL REFUSES.
+//
+// `ModelRegistry::Forward` no longer stops this architecture's multi-cache
+// topology, so the model is now the only thing that can judge the CONTENT of the
+// channel: the engine does not know which layer names `qwen4_exp` expects, which
+// payload kind each is, or which group's block table has to have been gathered.
+// Three ways the channel can lie, each refused by name at the hook's boundary.
+//
+// A BARE `CHECK_THROWS` HERE WOULD BE A MUTE SWITCH — that exact defect was
+// found on this row, where the only assertion on a refusal was satisfied by a
+// DIFFERENT exception thrown earlier. So each is asserted TWO-SIDED on its
+// message: the bytes that identify THIS refusal are present, and the bytes of
+// two OTHER refusals are absent —
+//
+//   * `qwen4_exp ple layout`, which is where an input that got past the boundary
+//     and into the loop lands;
+//   * `does not consume a cache set keyed by layer name`, the ENGINE's guard. A
+//     case that stopped there proves nothing about the hook, and its absence is
+//     what makes the green run above a lift and not a coincidence.
+TEST_CASE(
+    "qwen4_exp: the by-name channel is refused by name when it cannot be "
+    "consumed") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  constexpr int64_t kQsaLayer = 3;
+  constexpr int64_t kGdnLayers = 3;
+  constexpr int64_t T = 6;
+  constexpr int64_t kPage = 4;
+  constexpr int64_t kCols = 2;
+  constexpr int64_t kBlocks0 = 3;
+  constexpr int64_t kBlocks2 = 4;
+  const std::vector<int32_t> bt0{2, 0};
+  const std::vector<int32_t> bt2{1, 3};
+  const std::vector<int32_t> bt_recurrent{0};
+
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    ids[static_cast<size_t>(t)] =
+        static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  enum Corrupt { kWrongName = 1, kWrongKind = 2, kNoGroupTable = 3 };
+  const auto refusal = [&](int corrupt) {
+    vllm::v1::CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = static_cast<int>(T);
+    am.block_table_num_cols = static_cast<int>(kCols);
+    am.block_table_tensor = bt0;
+    am.seq_lens.assign(1, static_cast<int32_t>(T));
+    am.query_start_loc = {0, static_cast<int32_t>(T)};
+    am.slot_mapping.resize(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(
+          static_cast<int64_t>(bt0[static_cast<size_t>(t / kPage)]) * kPage + t % kPage);
+
+    vllm::v1::GDNAttentionMetadata gm;
+    gm.num_prefills = 1;
+    gm.num_prefill_tokens = static_cast<int>(T);
+    gm.num_actual_tokens = static_cast<int>(T);
+    gm.has_initial_state = std::vector<uint8_t>{0};
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+    gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+    gm.prefill_state_indices = std::vector<int32_t>{0};
+    gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+    {
+      const auto conv =
+          vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+      gm.batch_ptr = conv.batch_ptr;
+      gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+    }
+
+    const int64_t key_dim = kNumKHeads * kLinHeadDim;
+    const int64_t value_dim = kNumVHeads * kLinHeadDim;
+    const int64_t conv_dim = 2 * key_dim + value_dim;
+    const int64_t conv_len = kConvKernel - 1;
+    const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+    std::vector<std::vector<float>> ssm(kGdnLayers), conv(kGdnLayers);
+    std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+    std::vector<vllm::GdnStateCache> gdn(kGdnLayers);
+    ssm_b.reserve(kGdnLayers);
+    conv_b.reserve(kGdnLayers);
+    for (int i = 0; i < kGdnLayers; ++i) {
+      ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+      conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+      ssm_b.emplace_back(d, DType::kF32,
+                         std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+                         ssm[i].data());
+      conv_b.emplace_back(d, DType::kF32,
+                          std::vector<int64_t>{1, conv_dim, conv_len}, conv[i].data());
+      gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+      gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+    }
+
+    std::vector<uint16_t> kv(
+        static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
+    vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                                {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+    std::vector<uint16_t> idx(
+        static_cast<size_t>(kBlocks2 * kPage * kIdxHeadDim), 0);
+    vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
+                                 idx.data());
+    std::vector<vllm::PagedKvCache> attn_kv(2);
+    attn_kv[0].data = kv_b.t().data;
+    attn_kv[0].dtype = DType::kBF16;
+    attn_kv[0].num_blocks = kBlocks0;
+    attn_kv[0].block_size = kPage;
+    attn_kv[0].num_kv_heads = kKvHeads;
+    attn_kv[0].head_size = kHeadDim;
+    attn_kv[1].data = idx_b.t().data;
+    attn_kv[1].dtype = DType::kBF16;
+    attn_kv[1].num_blocks = kBlocks2;
+    attn_kv[1].block_size = kPage;
+    attn_kv[1].num_kv_heads = kIdxKvHeads;
+    attn_kv[1].head_size = kIdxHeadDim;
+
+    std::vector<std::string> names;
+    std::vector<int32_t> group_ids, layer_indices, payload_slots;
+    std::vector<uint8_t> payload_kinds;
+    names.push_back("model.layers." + std::to_string(kQsaLayer) + ".self_attn.attn");
+    group_ids.push_back(0);
+    layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+    payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+    payload_slots.push_back(0);
+    for (int i = 0; i < kGdnLayers; ++i) {
+      names.push_back("model.layers." + std::to_string(i) + ".linear_attn");
+      group_ids.push_back(1);
+      layer_indices.push_back(i);
+      payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kRecurrent));
+      payload_slots.push_back(i);
+    }
+    names.push_back("model.layers." + std::to_string(kQsaLayer) +
+                    ".self_attn.indexer.k_cache");
+    group_ids.push_back(2);
+    layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+    payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+    payload_slots.push_back(1);
+    std::vector<std::vector<int32_t>> group_tables{bt0, bt_recurrent, bt2};
+    std::vector<int32_t> group_cols{static_cast<int32_t>(kCols), 1,
+                                    static_cast<int32_t>(kCols)};
+
+    if (corrupt == kWrongName) {
+      names.back() = "model.layers." + std::to_string(kQsaLayer) +
+                     ".self_attn.indexer.key_cache";
+    } else if (corrupt == kWrongKind) {
+      payload_kinds[1] = static_cast<uint8_t>(vllm::KvCachePayload::kPaged);
+    } else if (corrupt == kNoGroupTable) {
+      group_tables[2].clear();
+    }
+
+    vllm::MultiKvCacheIndex mk;
+    mk.layer_names = &names;
+    mk.group_ids = &group_ids;
+    mk.layer_indices = &layer_indices;
+    mk.payload_kinds = &payload_kinds;
+    mk.payload_slots = &payload_slots;
+    mk.group_block_tables = &group_tables;
+    mk.group_block_table_cols = &group_cols;
+
+    const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+    vllm::ModelForwardInput in{ids,  pos,    am, gm, attn_kv,
+                               gdn,  config, q,  logits_indices};
+    in.num_reqs = 1;
+    in.gdn_state_slots = 1;
+    in.multi_kv = &mk;
+
+    std::string msg = "<the step RETURNED; this refusal is gone>";
+    try {
+      (void)vllm::ModelRegistry::Forward(*model, in);
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    return msg;
+  };
+
+  // The two strings that must be ABSENT from every one of them.
+  const char* kPle = "qwen4_exp ple layout";
+  const char* kEngine = "does not consume a cache set keyed by layer name";
+
+  SUBCASE("a published name this model does not expect") {
+    const std::string m = refusal(kWrongName);
+    INFO("the wrong-name refusal said: ", m);
+    CHECK(m.find("Qwen4ExpForConditionalGeneration") != std::string::npos);
+    CHECK(m.find("published no KV cache under") != std::string::npos);
+    // The NAME, not only the shape of the complaint: the hook reports the string
+    // it asked for, which is what routes the reader to the disagreement.
+    CHECK(m.find("self_attn.indexer.k_cache") != std::string::npos);
+    CHECK(m.find(kPle) == std::string::npos);
+    CHECK(m.find(kEngine) == std::string::npos);
+  }
+
+  SUBCASE("a recurrent group published as a paged one") {
+    const std::string m = refusal(kWrongKind);
+    INFO("the wrong-kind refusal said: ", m);
+    CHECK(m.find("Qwen4ExpForConditionalGeneration") != std::string::npos);
+    CHECK(m.find("model.layers.0.linear_attn") != std::string::npos);
+    CHECK(m.find("RECURRENT") != std::string::npos);
+    CHECK(m.find("PAGED") != std::string::npos);
+    CHECK(m.find(kPle) == std::string::npos);
+    CHECK(m.find(kEngine) == std::string::npos);
+  }
+
+  SUBCASE("the indexer group's block table was never gathered") {
+    const std::string m = refusal(kNoGroupTable);
+    INFO("the ungathered-table refusal said: ", m);
+    CHECK(m.find("Qwen4ExpForConditionalGeneration") != std::string::npos);
+    CHECK(m.find("gathered no block table for published group 2") !=
+          std::string::npos);
+    // The DENOMINATOR, so a partial gather reads as partial: two of three.
+    CHECK(m.find("2 of 3 published group(s) carry one") != std::string::npos);
+    CHECK(m.find(kPle) == std::string::npos);
+    CHECK(m.find(kEngine) == std::string::npos);
+  }
 }

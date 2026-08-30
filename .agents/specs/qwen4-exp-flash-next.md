@@ -3502,6 +3502,20 @@ now makes possible for recurrent members too, 5 of 5 on this shape where it was
 channel carries. Then the guard becomes the per-architecture capability bit
 `.agents/specs/kv-dsv4-multicache.md` describes, and this row owns its arm.
 
+**SETTLED BY W5j, AND THE THREE REASONS ARE WHY IT TOOK A WAVE OF ITS OWN.** This
+section stays as written because it is the argument that scoped W5j, and each
+numbered reason is answered rather than withdrawn. (1) held exactly: `attn_kv`
+does arrive at 2 x n_qsa and the assertion this section names as
+`qwen4_exp_registry.cpp:254` would have produced a different refusal, so W5j
+resolves BY NAME and leaves that assertion guarding the positional arm alone.
+(3) held: the capability bit landed WITH its consumer and M4 drives the refusal
+red by clearing it, so it is not a claim. (2) is the ONE that did not fully move
+— the hook still refuses `past_len != 0`, but its REASON changed: the indexer
+side cache now persists in the engine's group-2 pages and the PLE conv ring and
+n-gram history are published in the recurrent group, so what blocks the second
+step is a dtype and a residency the block refuses, not a missing home. See
+`## Mutation record — W5j` and the PLE entry under `## Owed`.
+
 ## Mutation record — W5h (#2031, issue OWED)
 
 **THE INDEXER SIDE CACHE WAS FOUR TIMES TOO SMALL, AND THE VIEW OVER IT WAS
@@ -3725,7 +3739,207 @@ block table is the IDENTITY, so the PERMUTATION is exercised only by the block's
 gate and never on the production path. That is stated in `## Owed` and it is
 W5j's to close.
 
+## Mutation record — W5j (#2031, #2353, issue OWED)
+
+**W5j makes the forward CONSUME the by-name channel and narrows the engine's
+`multi_kv` refusal to a model-declared capability.** Three things stood between a
+`GPUModelRunner` step and this hook, and all three are gone:
+
+1. **The hook read the caches POSITIONALLY.** It now resolves every published
+   cache through `MultiKvCacheIndex::Resolve` when the channel is present —
+   group 0's paged K/V under `model.layers.<N>.self_attn.attn`, group 2's indexer
+   side cache under `model.layers.<N>.self_attn.indexer.k_cache`, and each
+   recurrent state under `model.layers.<N>.linear_attn`, which is the recurrent
+   arm `ENG-MULTIKV-BYNAME` added and which #2353's survey recorded as
+   unaddressable.
+2. **`attn_kv` ARRIVES AT 2 x n_qsa.** The runner allocates one paged buffer per
+   (attention group x layer) and this model publishes TWO attention groups over
+   the same QSA layers, so the hook's `attn_kv.size() == n_qsa` assertion would
+   have turned the lifted guard into a DIFFERENT refusal rather than a token.
+   That assertion now guards the POSITIONAL arm only, where it is still exact.
+3. **W5i's production path used a per-call scratch behind an IDENTITY table.**
+   The by-name arm hands `RunQwen4ExpQsaBlockPaged` the engine's own group-2
+   buffer, viewed as the fused MLA page `[num_blocks, block_size,
+   indexer_head_dim]`, and group 2's own gathered table from
+   `BlockTableForGroup`. W5i said the substitution was "two lines in the hook and
+   nothing in the block"; that held — no line of `qwen4_exp_qsa_block.cpp`
+   changed except one stale comment repaired in flow (see below).
+
+**THE GUARD DID NOT GO AWAY, IT NARROWED.** `ModelFactory::consumes_multi_kv` is
+a model-declared capability bit in the `stage_on_load` / `supports_weight_offload`
+style, and it landed WITH its first consumer, which is the condition #2353 named:
+"a capability nothing can turn on has no arm a test could drive".
+`ModelRegistry::Forward` still refuses any multi-cache topology reaching a
+forward that leaves it false, which is `DeepseekV4ForCausalLM`,
+`Glm5NextForConditionalGeneration` and every model ported after them. It is NOT a
+licence to serve any shape: the hook refuses a name nothing was published under,
+a name resolving to the wrong payload kind, and a group whose block table was
+never gathered, each by name at its own boundary.
+
+### What this does NOT do: a second step still does not decode
+
+`past_len > 0` is still refused, and W5j CHANGES ITS REASON rather than removing
+it. The old message said the QSA indexer side cache and the PLE conv ring and
+n-gram history had "nowhere to persist"; two thirds of that is now false — the
+channel reaches the hook and group 2's pages persist. What remains is the PLE
+layer's PAIR OF STATES, and it is a DTYPE and a RESIDENCY rather than a missing
+channel:
+
+- `MakeQwen4ExpKVCache` publishes the PLE conv ring at the recurrent group's
+  uniform `conv_dtype`, which is bf16, and `RunQwen4ExpPleBlock` requires f32
+  (`qwen4_exp_ple_block.cpp:320`) because it walks the ring through `Ptr<float>()`.
+- It publishes the n-gram history as a DEVICE i64 state, and the same block
+  requires it HOST-resident (`:327`, read through a host pointer at `:351`)
+  because the splitmix64 hash is a host int64 computation.
+
+Which side of each is wrong is an ORACLE question. W5h called it "a design call I
+did not have the oracle to settle" and it is not settled here either: the lane
+pin's `modeling_qwen4_exp.py` is not readable on this host — the local
+`transformers` checkout is at `7d06b1a5` and has no `models/qwen4_exp/` directory,
+and the installed wheel is 5.3.0. Per the row's own rule this is RECORDED under
+`## Owed` and not guessed at. **Nothing decoded a second token in this wave, on
+any device.**
+
+### Gate
+
+Base `7c8b06b87de2bbc41932abf773405bf781e88719` (`row/MODEL-MM-QWEN4-EXP-W5I`).
+CPU-only build, `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+-DVLLM_CPP_BUILD_EXAMPLES=OFF -DVLLM_CPP_SERVER=OFF`, `-j 2`, named targets only.
+
+| Suite | Before | After |
+|---|---|---|
+| `test_qwen4_exp_layer_loop` | 2 cases / 104 assertions, `SUCCESS` | 4 cases / 197 assertions, `SUCCESS` |
+| `test_qwen4_exp_kv_cache` | 5 cases / 414 assertions, `SUCCESS` | 5 cases / 414 assertions, `SUCCESS` |
+| `test_qwen4_exp_scaffold` | not measured separately | 12 cases / 305 assertions, `SUCCESS` |
+| `test_qwen4_exp_qsa_block` | not measured separately | 12 cases / 5937 assertions, `SUCCESS` |
+| `test_qwen4_exp_ple_block` | not measured separately | 12 cases / 100 assertions, `SUCCESS` |
+| `test_model_registry` | not measured separately | 24 cases / 975 assertions, `SUCCESS` |
+| `test_registry_downcast_refusal` | not measured separately | 6 cases / 33 assertions, `SUCCESS` |
+| `test_runner` | not measured separately | 36 cases / 1851 assertions, `SUCCESS` |
+| `test_glm5_next_forward` | not measured separately | 9 cases / 118 assertions, `SUCCESS` |
+| `test_glm5_next_scaffold` | not measured separately | 38 cases / 2652 assertions, `SUCCESS` |
+
+The `test_qwen4_exp_layer_loop` `Before` row is MEASURED on this worktree at the
+head that carried the hook and guard changes and NOT the new test cases, which is
+what makes it a statement about the POSITIONAL arm: it is byte-identically the
+count W5i recorded. The seven suites marked "not measured separately" were run at
+the W5j head only; each is green and none of them is claimed as a delta.
+`test_qwen4_exp_qsa_block` is the one that matters most among them: W5j changed
+no line of `qwen4_exp_qsa_block.cpp` except one stale comment, and its 5937
+assertions are the evidence for that claim rather than a reading of the diff.
+
+The transformers 5.16.0 end-to-end golden is UNMOVED: `max|diff| = 0.00982457`
+against a bound of `0.03`, the same value W5f, W5g, W5h and W5i recorded.
+
+`scripts/agent-preflight.sh --fail-on-skip` exits 1 with ONE failing gate,
+`role-undeclared`, which is the operator's record and not this change's. The
+first run, against `origin/main` at `7d53ae3b4`, reported **zero SKIPs** and
+`ok commit-trailers` / `ok commit-style`. A second run minutes later reported
+TWO SKIPs on exactly those two gates, because `origin/main` had moved to
+`03e0dcd19` underneath a shared checkout and the checker refuses to judge a
+branch its base is not an ancestor of. That is structural for this whole local
+stack — the base is `7c8b06b87`, which is not on `main` — and not something this
+wave introduced, so the two gates were run DIRECTLY against this wave's own
+range instead: `check-commit-trailers.py --range 7c8b06b87..HEAD --filled` and
+`check-commit-style.py --range 7c8b06b87..HEAD` both exit 0. Recorded rather
+than reported as a clean sweep, because a SKIP is not an `ok`.
+
+### Mutations
+
+Every mutation was sha256-proved applied before the build, the build rc was read
+BEFORE any test output, and the tree was restored with a sha256 equality check
+against the pre-mutation digest. Base digest of
+`src/vllm/model_executor/models/qwen4_exp_registry.cpp`:
+`f4f60b86d80b1bc4e64a3e39d621ae52c5bd61d9caf0cca5040ccf09f5e958b8`. All six were
+RE-RUN against that digest after the shared-name-builder refactor below, so the
+record describes the bytes that ship and not an earlier head.
+
+| ID | Mutation | Build rc | Result |
+|---|---|---|---|
+| M1 | resolve the side cache to a WRONG NAME (`Qwen4ExpQsaIndexerName(l)` replaced by a literal `...self_attn.indexer.kcache`) | 0 | RED, `4 cases / 2 passed / 2 failed`, `145 assertions / 5 failed`. The by-name case's `REQUIRE_NOTHROW` threw the hook's own "the engine published no KV cache under 'model.layers.3.self_attn.indexer.kcache'", and the wrong-name SUBCASE's name assertion flipped. A first attempt appended `"X"` to the shared builder's result instead and separated by only 4 assertions, because `...k_cacheX` still CONTAINS the substring the SUBCASE looks for — recorded because it is the same substring-containment trap this row's two-sided message assertions exist to avoid |
+| M2 | read the side cache through GROUP 0's block table (`group_ids[k.first]` to `group_ids[a.first]`) | 0 | RED, `197 assertions / 7 failed`, on `got_a == expect_a`, `got_a != via_group0`, `got_b != got_a` and the third run's row set. **NOT ONE VALUE ASSERTION MOVED** — the logits, the two-map drift and the second-prompt movement all stayed green, which reproduces W5i's measured lesson inside this wave's own gate |
+| M3 | drop the engine's group-2 buffer and keep the per-call scratch | 0 | RED, `145 assertions / 2 failed`. The step threw `vt: index_copy: idx out of range` because a permuted table names a page a T-sized scratch does not have. Detected, but by the OP and not by an assertion, so the row-set gate never ran — recorded as the weaker of the six |
+| M4 | clear `consumes_multi_kv` — the guard must still refuse | 0 | RED, `145 assertions / 12 failed`. `ModelRegistry::Forward` threw its own message naming the architecture, `5 KV cache(s) (2 paged, 3 recurrent) from 3 published group(s)` and "its ModelFactory leaves `consumes_multi_kv` false", and every `kEngine`-absent half of the three two-sided refusal assertions flipped. This is the "must still refuse" arm |
+| M5 | drop the indexer side cache from the resolution entirely, AND delete the adjacent same-slot guard so no neighbouring check can catch it | 0 | RED, `197 assertions / 10 failed`, on the row-set assertions and the wrong-name SUBCASE. Again NO value assertion moved |
+| M6 | REACHABILITY: delete the `Qwen4ExpTextModelForward` production call site, substituting a zeroed hidden of the right shape | 0 | RED, `197 assertions / 7 failed`. NOT VACUOUS: the call site exists and the by-name case depends on it, reddening `hi > lo`, both row-set assertions, the two-map row-set difference and the second-prompt movement |
+
+**What the six do NOT prove.** No mutation deletes `RunQwen4ExpPleBlock`'s call
+site, so the PLE ops remain reached-by-argument on this row, exactly as W5i left
+them. And M3's red is an op range check rather than an assertion, so the by-name
+buffer substitution is proved DETECTED but not proved detected BY THE GATE.
+
+### ONE builder for the published names, which the spec asked for
+
+`## Owed`'s W5j entry said the hook "must build its layer names through ONE
+builder shared with `MakeQwen4ExpKVCache` — two derivations of one name set is
+the shape that can disagree". A first cut of this wave deliberately did the
+OPPOSITE and argued for it in the source: that a shared helper would make a
+publisher/consumer disagreement invisible. That argument is wrong in the
+direction that matters. A disagreement between the two is a RUN-TIME refusal with
+no compile error behind it, and making it impossible by construction is strictly
+better than making it detectable; the resolution failure then means only that the
+ENGINE did not carry what the model published, which is the one thing the refusal
+should be able to say. The three builders are file-local — both sides live in
+`qwen4_exp_registry.cpp`, so exporting them would only invite a third derivation.
+All six mutations were re-run after this refactor.
+
+### Repaired in flow
+
+- `qwen4_exp_qsa_block.cpp`'s paged precondition said "`MakeQwen4ExpKVCache`
+  already refuses a `block_size` the compress ratio does not divide". **W5h
+  deleted that refusal**, correctly, and the sentence survived. The check at that
+  site is still right and its reason is group 0's own — it keeps a compress block
+  of CR tokens inside one page — so the comment now says that instead of citing a
+  refusal that no longer exists.
+- `model_registry.h`'s `multi_kv` field said the topology is "DeepSeek-V4 and
+  nothing else". THREE architectures publish one.
+- `ModelRegistry::Forward`'s comment said "no registered forward consumes one"
+  and "that is still true of all THREE architectures". One consumes one now.
+
 ## Owed
+
+- **W5j's ISSUE IS OWED.** GitHub writes are `403` from this host (account
+  suspended), so nothing could be filed and no row was appended to
+  `.agents/issue-index.md`; an index row pointing at an issue that does not exist
+  is worse than an absent one. The change rides under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031) and
+  [#2353](https://github.com/mudler/vllm.cpp/issues/2353).
+
+- **THE SECOND STEP IS NOW BLOCKED ON ONE ENTRY AND ONE ENTRY ONLY.** W5j
+  removed every other reason `past_len != 0` refuses — the channel reaches the
+  hook, all five published caches resolve by name, and group 2's pages persist —
+  so what remains is the PLE conv dtype and the n-gram history's residency, which
+  this file already tracks under **THE PUBLISHED PLE CONV STATE IS bf16 AND
+  `RunQwen4ExpPleBlock` REQUIRES f32** below. That entry carries W5j's
+  re-measurement and its two anchor corrections; this one exists so a reader
+  scanning for "what stops a decode" finds one answer and not two. Not
+  duplicated on purpose: a second copy of a live claim is the drift lock this
+  section keeps filing against itself.
+
+- **THE BY-NAME PATH IS CPU-ONLY, FOR THE SAME REASON THE PAGED ARM ALWAYS WAS.**
+  `IndexerRows` refuses a device-resident block table by name, and the hook hands
+  it group 2's gathered row through a `dense_attn::DBuf`, which is CPU-resident on
+  a CPU queue and device-resident on a CUDA one. So a CUDA step reaches the by-name
+  resolution and then stops inside the block. This is the same owed CUDA arm the
+  QSA ops already carry and it is not new debt, but W5j is the wave that makes it
+  reachable, so it is named here. A cheaper fix than a device translation exists —
+  the table is read on the host and nowhere else, so it could be a host tensor over
+  the runner's own vector rather than a `DBuf` — and it is deliberately NOT taken
+  here, because it would change the POSITIONAL arm's shape too and this wave's
+  gate does not cover that.
+
+- **THE SHARED GGUF FIXTURE CANNOT GATE CACHE CONTENT, MEASURED.** Across two
+  different prompts through the by-name path, **0 of 128** indexer-cache words and
+  **0 of 192** paged-K/V words moved, while the logits moved by 31.84. It is a
+  dynamic-range property and not a defect: the four-layer ramp puts the layer-3
+  activations near 2^18, where one bf16 ULP is about 1024, and 31.84 of 95090 is
+  0.03% — an order of magnitude under one ULP. The paged K/V, whose store is
+  gated by every other model in the tree, is invariant by the same count, which is
+  what separates "the fixture saturates" from "the indexer writes one row T
+  times". So the ROW SET is what gates the paging in `test_qwen4_exp_layer_loop`
+  and the CONTENT is gated at the block instead. Owed: a fixture rescaled so cache
+  content is prompt-separable, which would let this suite gate both.
+
 
 - **W5h's ISSUE IS OWED.** GitHub writes are `403` from this host (account
   suspended), so nothing could be filed. The change rides under
@@ -3778,9 +3992,16 @@ W5j's to close.
   and the page translation is a HOST read of the block table, so a device-
   resident table is refused by name and the CUDA arm owes it a device-side home.
 
-- **W5j — THE FORWARD MUST RESOLVE ITS CACHES BY NAME, AND THE ENGINE GUARD
-  MUST BECOME A PER-ARCHITECTURE CAPABILITY.** Measured on this head, not
-  supposed:
+- **CLOSED by W5j — THE FORWARD RESOLVES ITS CACHES BY NAME AND THE ENGINE GUARD
+  IS A PER-ARCHITECTURE CAPABILITY.** All three bullets below were measured
+  before the wave and all three are done: the hook resolves through
+  `MultiKvCacheIndex::Resolve`, the three published names are built by ONE
+  file-local builder both `MakeQwen4ExpKVCache` and the forward call, and
+  `ModelFactory::consumes_multi_kv` is the declared bit. M4 drives the guard red
+  by clearing it, against its own message and not a bare `CHECK_THROWS`. The
+  bullets are kept as written because they are the measurement that scoped the
+  wave. What is NOT closed is the second step; see the PLE entry below. The
+  ORIGINAL text, still accurate as a statement of the gap W5j found:
   - `ForwardQwen4ExpForConditionalGeneration` asserts
     `input.attn_kv.size() == n_qsa` (`qwen4_exp_registry.cpp`, the "paged K/V
     caches for ... qwen_sparse_attention layers" refusal). The runner allocates
@@ -3818,12 +4039,34 @@ W5j's to close.
   same class of error W5h just removed. It blocks multi-step decode either way.
   ISSUE OWED.
 
+  **W5j RE-MEASURED THIS AND IT IS NOW THE LAST STRUCTURAL BLOCKER, WITH TWO
+  CORRECTIONS.** The anchors have moved: the host read of the n-gram history is
+  `:351` and not `:386-389`, and the CPU-residency refusal is its own `VT_CHECK`
+  at `:327`. And the reason for `past_len != 0` is now THIS entry alone — before
+  W5j the indexer side cache and these two states all had "nowhere to persist",
+  and since W5j the indexer side cache lives in the engine's group-2 pages and
+  these two are PUBLISHED in the recurrent group and merely unreadable by the
+  block. The oracle is still unavailable HERE and that was checked rather than
+  assumed: the local `transformers` checkout is at `7d06b1a5` with no
+  `models/qwen4_exp/` directory and the installed wheel is 5.3.0, so W5j STOPPED
+  rather than guessed. The tree's own convention argues one way and is not the
+  oracle: `nemotron_h_device.cpp:1313-1314` accepts bf16, f16 or f32 for a conv
+  state and `qwen3_5.cpp:9621` hands one as bf16, so the block requiring f32 is
+  this model's exception and AGENTS.md "Inherit vLLM defaults" makes an f32 model
+  buffer the annotated-exception direction. **Until this is settled no second
+  step decodes and the server can serve exactly one forward per sequence.**
+
 - **NOTHING SERVES YET, AND THE SECOND STEP IS STILL THE THING.** `past_len ==
   0` still refuses (`qwen4_exp_registry.cpp`, the SINGLE-SHOT PREFILL refusal),
-  `GPUModelRunner` still cannot reach this model's hook because the engine
-  guard fires above it, and no `examples/server` end-to-end and no
-  `docs/USAGE.md` weights row are owed until an arm SERVES. W5h moved one of
-  the four blockers between here and there and did not move the other three.
+  and no `examples/server` end-to-end and no `docs/USAGE.md` weights row are owed
+  until an arm SERVES. **W5j moved the SECOND of the four blockers and the clause
+  naming the third is now wrong**: this entry read "`GPUModelRunner` still cannot
+  reach this model's hook because the engine guard fires above it", and since W5j
+  the guard passes this architecture and the hook resolves the whole three-group
+  topology by name. What has NOT moved is the one that decides serving: the
+  second step, blocked on the PLE conv dtype and the n-gram history's residency
+  above. A server on this head would answer one forward per sequence and then
+  refuse, which is not serving, so nothing in `docs/` changes yet.
 
 - **CLOSED BY W5g, AND ITS DIAGNOSIS WAS HALF RIGHT.** The entry below is kept
   because its measurement is what bought the fix, and because BOTH repairs it
@@ -3907,29 +4150,38 @@ W5j's to close.
   `Qwen4ExpTextModelForward` on a model `ModelRegistry::Load` produced from a
   real `qwen4exp` GGUF — the first production forward this architecture has ever
   had — and the hook refuses `past_len != 0` and `num_reqs != 1` by name. What
-  is owed is the engine's, in three named pieces, none of which belongs to this
-  row: `ModelRegistry::Forward`'s `multi_kv` refusal
-  (KV-DSV4-MULTICACHE W5, [#1925](https://github.com/mudler/vllm.cpp/issues/1925),
-  [#2068](https://github.com/mudler/vllm.cpp/issues/2068)); a channel that can
-  address recurrent (`MambaSpec`) members, which the by-name index cannot,
-  because their states go to `gdn_state` positionally and their layer names do
-  not resolve ([#2353](https://github.com/mudler/vllm.cpp/issues/2353)); and the
-  `query_start_loc` plumbing a ragged multi-request batch needs, which no block
-  on this row carries. Until all three land there is no token number, no speed
+  is owed was described here as "the engine's, in three named pieces, none of
+  which belongs to this row". **TWO OF THE THREE ARE GONE AND THE THIRD WAS
+  ALREADY WRONG WHEN IT WAS WRITTEN.** W5j closed
+  `ModelRegistry::Forward`'s `multi_kv` refusal for this architecture, by the
+  per-architecture capability bit the guard's own comment had named as the
+  intended polarity, and it closed it in THIS row rather than in
+  KV-DSV4-MULTICACHE W5 ([#1925](https://github.com/mudler/vllm.cpp/issues/1925),
+  [#2068](https://github.com/mudler/vllm.cpp/issues/2068)), whose scope is
+  DeepSeek-V4's model half. The second piece — "a channel that can address
+  recurrent (`MambaSpec`) members, which the by-name index cannot" — was already
+  false at W5i's head: `ENG-MULTIKV-BYNAME` had added `payload_kinds` /
+  `payload_slots` and made all five of this model's caches resolvable, which is 5
+  of 5 and not 2 of 5, and this entry never caught up. What REMAINS is the
+  `query_start_loc` plumbing a ragged multi-request batch needs, which no block on
+  this row carries, PLUS the second-step blocker above, which is this row's own
+  and not the engine's. Until both land there is no token number, no speed
   number, no `examples/server` end to end and no `docs/USAGE.md` weights row.
 - **CLOSED by W5i as a STORE, and what remains is a REACH.** This entry read
   "the QSA indexer side cache's paged store is still owed". The store and the
   read are paged now, and the registry hook allocates the scratch IN THE ENGINE'S
   OWN PAGED SHAPE and addresses it through a table, so the code the engine's
-  buffer will run is the code that runs today. What is NOT closed: that buffer
-  does not REACH the block. `ModelRegistry::Forward` refuses `multi_kv` by name
-  (#2353) and this row must not lift it, so `group_block_tables[2]` — the vector
-  W5c-2 already gathers — never arrives. **Owned by W5j.** The substitution is
-  two lines in `ForwardQwen4ExpForConditionalGeneration` and nothing in the
-  block; that is what paging it here bought. The scratch's table is the IDENTITY,
-  which is what a private per-call buffer means rather than a shortcut — there is
-  no allocator behind it, so there are no physical pages to permute — and the
-  permutation is exercised by the block's own gate instead.
+  buffer will run is the code that runs today. **THE REACH IS CLOSED TOO, BY
+  W5j.** On a step carrying `multi_kv` the hook hands the block group 2's OWN
+  buffer, viewed as the fused MLA page, and `group_block_tables[<group 2>]` — the
+  vector W5c-2 already gathers — through `BlockTableForGroup`. This entry's
+  prediction held to the letter: the substitution was two lines in
+  `ForwardQwen4ExpForConditionalGeneration` and nothing in the block, which is
+  what paging it here bought. The scratch arm SURVIVES for a caller with no
+  engine behind it, where the IDENTITY table is the correct map because there is
+  no allocator and so no physical pages to permute; it is no longer the
+  production path, so the permutation is exercised by the allocator's own pages
+  as well as by the block's gate.
 - **THE GATHER COSTS ONE EXTRA PASS OVER THE VISIBLE PREFIX, per QSA layer per
   step, and it is recorded rather than hidden.** `vt::IndexSelect` materialises
   `[kv_len, indexer_head_dim]` before `vt::Qwen4ExpQsaCompress` reads it. It is
@@ -5707,7 +5959,8 @@ a row here, and every row says whether anything in production reaches it:
 | W5f | `Qwen4ExpTextModel::Forward` — THE LAYER LOOP, and the `lm_head` tail | **yes** — `ModelRegistry::Forward` calls it on a loaded `qwen4exp` GGUF | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2336](https://github.com/mudler/vllm.cpp/issues/2336) |
 | W5g | the STATED n-gram vocabulary as the layout's authority, and a heap over-read closed on the GGUF arm | **yes** — `Qwen4ExpPleLayout`, reached from `qwen4_exp_forward.cpp` inside the loop W5f wired | [#2031](https://github.com/mudler/vllm.cpp/issues/2031) |
 | W5h | the indexer side cache sized at ONE ROW PER TOKEN: `compress_ratio` 1, not 4 | **yes** — `make_kv_cache`, the same production hook W5c-1 reaches | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5h's own issue OWED |
-| W5i | the indexer side cache PAGED: the engine's fused MLA page + group 2's own block table, gathered and scattered with `vt::IndexSelect`/`vt::IndexCopy` | **path yes, ENGINE BUFFER no** — `ModelRegistry::Forward` reaches the translation on a loaded `qwen4exp` GGUF (M4a, M4b), but over a per-call scratch in that paged shape; `multi_kv` is still refused so group 2's real buffer and its non-identity table do not arrive (W5j) | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2249](https://github.com/mudler/vllm.cpp/issues/2249), W5i's own issue OWED |
+| W5i | the indexer side cache PAGED: the engine's fused MLA page + group 2's own block table, gathered and scattered with `vt::IndexSelect`/`vt::IndexCopy` | **yes, and W5j closed the gap this row named** — `ModelRegistry::Forward` reached the translation over a per-call scratch (M4a, M4b); since W5j a by-name step reaches it over the engine's OWN group-2 buffer through group 2's OWN gathered table | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2249](https://github.com/mudler/vllm.cpp/issues/2249), W5i's own issue OWED |
+| W5j | the forward CONSUMES the by-name channel, and `ModelFactory::consumes_multi_kv` narrows the engine's `multi_kv` refusal to a model-declared capability | **yes** — `ModelRegistry::Forward` dispatches a THREE-GROUP topology to this hook, which resolves all five published caches by name and reads group 2's own block table; M4 proves the guard still refuses with the bit cleared, M6 proves the tower is entered. It is still a SINGLE-SHOT prefill: nothing decodes a second token | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2353](https://github.com/mudler/vllm.cpp/issues/2353), W5j's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than
@@ -5763,10 +6016,14 @@ which is a weaker claim and is written as one.
   through to the `lm_head` and a sampled token.
 - **Reached by NOTHING in production, at this merge commit:** the terminal
   `use_combine=false` hyper-connection mixer at `:1430`, which is after the loop.
-  And, one level out from the code: the ENGINE's group-2 buffer, because
-  `ModelRegistry::Forward` refuses `multi_kv` and the registry hook substitutes a
-  per-call scratch — so W5i's translation runs on the production path over an
-  IDENTITY table and the permutation is exercised only by the block's own gate.
+  **THAT IS THE WHOLE LIST NOW.** This bullet carried a second item — the
+  ENGINE's group-2 buffer, unreached "because `ModelRegistry::Forward` refuses
+  `multi_kv` and the registry hook substitutes a per-call scratch" — and W5j
+  removed it: a step carrying `multi_kv` reaches the hook, which hands the block
+  group 2's own buffer through group 2's own gathered table. The permutation is
+  therefore exercised by the allocator's pages and not only by the block's gate,
+  and `test_qwen4_exp_layer_loop`'s W5j case asserts the written ROW SET rather
+  than a value, because a value gate cannot see a paging defect.
 
 **THE `Reached?` COLUMN IS THE AUTHORITY AND THIS PROSE IS NOT A SECOND COUNT.**
 Rows that still read `no` do so for the ordinary reason — nothing composes them
@@ -5901,6 +6158,17 @@ name and this model publishes one, which #2249 records as belonging to an
 engine row. The refusal in `qwen4_exp_registry.cpp` says exactly this at this
 merge commit, and the emitted bytes were read back out of the running hook to
 prove it.
+
+**SUPERSEDED BY W5j, AND THE PART THAT WAS WRONG IS THE OWNERSHIP.** The
+paragraph above is kept because it is the argument that scoped two waves, but two
+of its statements no longer describe the tree. The engine's group-2 buffer DOES
+reach the block, over group 2's own gathered table. And "the `multi_kv` refusal
+is not this row's" was true of the GUARD and false of the FIX: #2353 resolved it
+as a per-architecture capability each model row owns an arm of, so
+`ModelFactory::consumes_multi_kv` and its arm landed HERE, in the row that ports
+this architecture. The guard itself is still the engine's and still refuses
+DeepSeek-V4 and GLM-5-Next. The refusal bytes were read back out of the running
+hook again for W5j — see the mutation record's M1 and M4, which quote them.
 
 **AND THIS PARAGRAPH CONTRADICTED ONE ELEVEN LINES BELOW IT, WHICH IS #2288 IN
 ITS SEVENTH TURN AND IN A SHAPE THIS ROW HAD NOT PRODUCED BEFORE.** Not a stale

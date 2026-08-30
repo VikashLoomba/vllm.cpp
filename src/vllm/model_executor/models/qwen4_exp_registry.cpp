@@ -142,6 +142,41 @@ void PrepareQwen4ExpForConditionalGeneration(LoadedModel& model,
   (void)queue;
 }
 
+// ─── THE PUBLISHED LAYER NAMES, DERIVED ONCE (W5j) ───────────────────────────
+//
+// `MakeQwen4ExpKVCache` PUBLISHES the caches under these names and
+// `ForwardQwen4ExpForConditionalGeneration` RESOLVES them by the same names, so
+// the two must agree or the model is refused at run time with no compile error
+// to catch it. The spec's `## Owed` names the requirement in those words: "it
+// must build its layer names through ONE builder shared with
+// `MakeQwen4ExpKVCache` — two derivations of one name set is the shape that can
+// disagree."
+//
+// A FILE-LOCAL HELPER IS ENOUGH AND A HEADER WOULD BE WORSE. Both the publisher
+// and the consumer live in THIS translation unit, so there is no seam to widen
+// and nothing outside needs the names; exporting them would invite a third
+// derivation somewhere else, which is the failure this exists to remove.
+//
+// The suffixes are not free choices. `.linear_attn` is what
+// `ResolveKVCacheGroupLayerNames` builds for a recurrent layer, so the runner's
+// by-name membership sees the same string either way. `.self_attn.indexer.k_cache`
+// mirrors upstream's own side-cache prefix
+// (`vllm/models/deepseek_v4/attention.py:761-767` registers the indexer key cache
+// under `...indexer.k_cache`); the runner parses the `.layers.<N>.` segment out of
+// it, so the suffix is free to say WHICH cache it is.
+std::string Qwen4ExpLayerPrefix(size_t layer) {
+  return "model.layers." + std::to_string(layer) + ".";
+}
+std::string Qwen4ExpLinearAttnName(size_t layer) {
+  return Qwen4ExpLayerPrefix(layer) + "linear_attn";
+}
+std::string Qwen4ExpQsaAttnName(size_t layer) {
+  return Qwen4ExpLayerPrefix(layer) + "self_attn.attn";
+}
+std::string Qwen4ExpQsaIndexerName(size_t layer) {
+  return Qwen4ExpLayerPrefix(layer) + "self_attn.indexer.k_cache";
+}
+
 // The single-shot prefill this hook serves is assembled below from the two
 // POSITIONAL cache channels plus the three states no channel carries.
 //
@@ -177,34 +212,38 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // #2288, which this string has now produced eight times. What refuses is the
   // ENGINE's cache plumbing, and the boundary is exact:
   //
-  //   * `ModelForwardInput` carries exactly two POSITIONAL cache channels,
-  //     `attn_kv` and `gdn_state` (`model_registry.h:439-440`). The QSA INDEXER
-  //     side cache and the PLE layer's conv ring and n-gram history are NEITHER.
-  //     At `past_len == 0` all three are per-call scratch and this hook
-  //     allocates them; at any other `past_len` they would have to persist, and
-  //     there is nowhere to persist them.
-  //   * The only channel that could carry them is `multi_kv`, which
-  //     `ModelRegistry::Forward` refuses by name before this hook is entered
-  //     (`model_registry.cpp`, the `if (input.multi_kv != nullptr)` block —
-  //     named rather than numbered because the line anchor this carried,
-  //     `:461-478`, had drifted onto `MultiKvCacheIndex::PayloadAt`), and this
-  //     model publishes three groups so
-  //     the runner sets it. #2353 established that this refusal must NOT be
-  //     lifted yet: none of the three arriving architectures has a consuming
-  //     forward, and the by-name channel cannot address recurrent (`MambaSpec`)
-  //     members at all — their states go to `gdn_state` POSITIONALLY and their
-  //     layer names do not resolve. That is engine work, owned by
-  //     KV-DSV4-MULTICACHE W5 (#1925, #2068) and #2353, and not by this row.
+  //   * THE ENGINE'S `multi_kv` REFUSAL IS GONE FOR THIS ARCHITECTURE (W5j).
+  //     `ModelRegistry::Forward` used to stop every multi-cache topology before
+  //     this hook was entered; it now stops only a topology reaching a forward
+  //     whose `ModelFactory::consumes_multi_kv` is false, and this factory sets
+  //     it. So the three-group cache set the runner allocates REACHES here, and
+  //     this hook resolves every member of it by the name
+  //     `MakeQwen4ExpKVCache` published — including the recurrent ones, which
+  //     `ENG-MULTIKV-BYNAME` made addressable and which the paragraph this
+  //     replaces said "cannot be addressed at all".
+  //   * WHAT STILL REFUSES IS THE PLE LAYER'S PAIR OF STATES, and it is a DTYPE
+  //     and a RESIDENCY, not a missing channel. `MakeQwen4ExpKVCache` publishes
+  //     the PLE conv ring as the recurrent group's third state at the group's
+  //     uniform `conv_dtype`, which is bf16, and `RunQwen4ExpPleBlock` requires
+  //     f32 (`qwen4_exp_ple_block.cpp:320`) because it walks the ring through
+  //     `Ptr<float>()`. It publishes the n-gram history as an i64 state, which
+  //     the block requires to be HOST-resident (`:327`, and `:351` reads it
+  //     through a host pointer) because the splitmix64 hash is a host int64
+  //     computation. Which side of each is wrong is a design call this row does
+  //     not have the oracle to settle — the lane pin's `modeling_qwen4_exp.py`
+  //     is not readable on this host — so it is recorded under `## Owed` in
+  //     `.agents/specs/qwen4-exp-flash-next.md` rather than guessed at.
   //   * `RunQwen4ExpQsaBlockPaged` takes a `block_table` of i32 `[1, max_pages]`
   //     — ONE sequence per call — so `num_reqs > 1` is out of reach for the same
   //     seam work.
   //
-  // So this hook SERVES a single-shot prefill of one sequence and refuses
-  // everything else BY NAME. It does not refuse unconditionally any more, which
-  // is the difference this wave makes: `Qwen4ExpTextModel::Forward` exists, it
-  // is called from here, and a reachable production path runs all four block
-  // seams. Nothing about that is a decode: a decode needs the second step, and
-  // the second step is what the engine cannot address.
+  // So this hook SERVES a single-shot prefill of one sequence, from EITHER cache
+  // channel, and refuses everything else BY NAME. What W5j changes is which
+  // buffers that prefill runs on: the QSA indexer side cache is now the engine's
+  // own group-2 pages read through group 2's own gathered block table, rather
+  // than a per-call scratch behind an identity table. Nothing about that is a
+  // decode: a decode needs a second step, and the second step is what the two
+  // PLE states above still cannot carry.
   VT_CHECK(input.num_reqs == 1,
            "Qwen4ExpForConditionalGeneration: this forward serves ONE sequence "
            "per call and the step carries " +
@@ -227,14 +266,17 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
       "PREFILL (past_len == 0) and this step continues a sequence at past_len " +
           std::to_string(past_len) +
           ". The layer loop itself has no such limit — it takes every cache as "
-          "an operand — but ModelForwardInput carries only the POSITIONAL "
-          "attn_kv and gdn_state channels, and the QSA indexer side cache and "
-          "the PLE conv ring and n-gram history are neither, so at past_len > 0 "
-          "there is nowhere for them to have persisted. The channel that would "
-          "carry them is multi_kv, which ModelRegistry::Forward refuses by name "
-          "and which #2353 established must not be lifted until a consuming "
-          "forward and a recurrent-member channel exist. Owned by "
-          "KV-DSV4-MULTICACHE W5 (#1925, #2068) and #2353; see "
+          "an operand — and since W5j neither does the CHANNEL: multi_kv reaches "
+          "this hook, every published cache resolves by name, and the QSA "
+          "indexer side cache persists in the engine's own group-2 pages. What "
+          "cannot persist is the PLE layer's PAIR OF STATES, and the reason is a "
+          "dtype and a residency rather than a missing channel: the recurrent "
+          "group publishes the PLE conv ring at the group's uniform bf16 and "
+          "RunQwen4ExpPleBlock requires f32 (qwen4_exp_ple_block.cpp:320), and "
+          "it publishes the n-gram history as a DEVICE i64 state that the same "
+          "block requires to be HOST-resident (:327). Which side of each is "
+          "wrong is an oracle question this row could not settle on this host; "
+          "it is recorded under `## Owed`. Owned by MODEL-MM-QWEN4-EXP; see "
           ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #2336.");
 
   vt::Backend& backend = vt::GetBackend(input.queue.device.type);
@@ -249,19 +291,194 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
       ++n_qsa;
     }
   }
-  VT_CHECK(static_cast<int64_t>(input.gdn_state.size()) == n_gdn,
-           "Qwen4ExpForConditionalGeneration: the runner handed " +
-               std::to_string(input.gdn_state.size()) +
-               " recurrent state caches for " + std::to_string(n_gdn) +
-               " linear_attention layers");
-  VT_CHECK(static_cast<int64_t>(input.attn_kv.size()) == n_qsa,
-           "Qwen4ExpForConditionalGeneration: the runner handed " +
-               std::to_string(input.attn_kv.size()) +
-               " paged K/V caches for " + std::to_string(n_qsa) +
-               " qwen_sparse_attention layers");
+  // ─── WHICH CACHE IS WHICH: POSITIONALLY, OR BY NAME (W5j, #2031, #2353) ───
+  //
+  // This hook reads the caches TWO ways, because the engine's answer to "which
+  // cache is this" changes shape the moment the model publishes a group the
+  // positional convention cannot address.
+  //
+  //   POSITIONAL (`multi_kv == nullptr`). `attn_kv[i]` is the i-th
+  //   qwen_sparse_attention layer's paged K/V and `gdn_state[i]` the i-th
+  //   linear_attention layer's state. NOTHING publishes an indexer side cache on
+  //   this arm, so the hook allocates the per-call scratch it always did. Every
+  //   hand-built caller takes this arm, and it is byte-identical to W5i.
+  //
+  //   BY NAME (`multi_kv != nullptr`). The runner allocated all THREE published
+  //   groups. `attn_kv` then holds `2 * n_qsa` entries — group 0's K/V AND
+  //   group 2's indexer pages, one buffer per (attention group x layer), in
+  //   PUBLICATION order (`runner.cpp`, the `for (int g : attn_group_ids_)` loop)
+  //   — so a POSITIONAL read of it is off by a whole group from the second QSA
+  //   layer onward and returns another layer's keys with no shape error. The
+  //   assertion that used to stand here, `attn_kv.size() == n_qsa`, was the only
+  //   thing between that and a wrong answer, and it would have fired on every
+  //   real step: this is why lifting the engine guard without fixing the count
+  //   would have changed a refusal into a different refusal and not into a
+  //   token.
+  //
+  // The NAMES `MakeQwen4ExpKVCache` published are the only thing that says which
+  // buffer is which, and `MultiKvCacheIndex::Resolve` is how they are asked. Both
+  // sides build those names through the SAME three helpers above, which is what
+  // the spec's `## Owed` requires: two derivations of one name set is the shape
+  // that can disagree, and a disagreement between the publisher and the consumer
+  // is a run-time refusal with no compile error behind it. A resolution failure
+  // therefore means the ENGINE did not carry what this model published, which is
+  // exactly what the refusal below says.
+  const MultiKvCacheIndex* mk = input.multi_kv;
+
+  std::vector<PagedKvCache> qsa_kv(static_cast<size_t>(n_qsa));
+  // Group 2, one per QSA layer. EMPTY on the positional arm, where the hook
+  // allocates scratch instead.
+  std::vector<PagedKvCache> qsa_idx;
+  std::vector<GdnStateCache> gdn(static_cast<size_t>(n_gdn));
+  // Group 2's page map for THIS sequence, i32 `[cols]`. On the positional arm it
+  // is the identity over a private buffer; on the by-name arm it is the row the
+  // runner gathered.
+  std::vector<int32_t> idx_bt;
+
+  if (mk == nullptr) {
+    VT_CHECK(static_cast<int64_t>(input.gdn_state.size()) == n_gdn,
+             "Qwen4ExpForConditionalGeneration: the runner handed " +
+                 std::to_string(input.gdn_state.size()) +
+                 " recurrent state caches for " + std::to_string(n_gdn) +
+                 " linear_attention layers");
+    VT_CHECK(static_cast<int64_t>(input.attn_kv.size()) == n_qsa,
+             "Qwen4ExpForConditionalGeneration: the runner handed " +
+                 std::to_string(input.attn_kv.size()) +
+                 " paged K/V caches for " + std::to_string(n_qsa) +
+                 " qwen_sparse_attention layers, and no by-name cache index. "
+                 "A step that publishes the QSA indexer side cache carries "
+                 "multi_kv; a step without it carries exactly one paged cache "
+                 "per QSA layer");
+    for (int64_t i = 0; i < n_qsa; ++i)
+      qsa_kv[static_cast<size_t>(i)] = input.attn_kv[static_cast<size_t>(i)];
+    for (int64_t i = 0; i < n_gdn; ++i)
+      gdn[static_cast<size_t>(i)] = input.gdn_state[static_cast<size_t>(i)];
+  } else {
+    qsa_idx.resize(static_cast<size_t>(n_qsa));
+    VT_CHECK(mk->group_ids != nullptr && mk->group_ids->size() == mk->size(),
+             "Qwen4ExpForConditionalGeneration: the by-name cache index carries "
+             "no group ids, so the QSA indexer side cache's own block table "
+             "cannot be found. See .agents/specs/qwen4-exp-flash-next.md and "
+             "issues #2031 and #2249.");
+    // Resolve ONE published name, refusing each of the three ways the answer can
+    // be wrong SEPARATELY, because they mean different things: a name nothing
+    // was published under is a publisher/consumer disagreement, a wrong payload
+    // kind is a group classified as the other arm, and an out-of-range slot is a
+    // channel whose locators disagree with the payload it describes.
+    const auto locate = [&](const std::string& name, KvCachePayload want,
+                            const char* role) {
+      const int64_t flat = mk->Find(name);
+      VT_CHECK(flat >= 0,
+               std::string("Qwen4ExpForConditionalGeneration: the engine "
+                           "published no KV cache under '") +
+                   name + "', which is where this model keeps its " + role +
+                   ". The channel carries " + std::to_string(mk->size()) +
+                   " cache(s), first '" + std::string(mk->first_name()) +
+                   "'. MakeQwen4ExpKVCache publishes that name; a step that "
+                   "does not carry it is not this model's topology. See "
+                   ".agents/specs/qwen4-exp-flash-next.md and issue #2031.");
+      KvCachePayload kind = KvCachePayload::kPaged;
+      int32_t slot = -1;
+      VT_CHECK(mk->PayloadAt(flat, &kind, &slot),
+               std::string("Qwen4ExpForConditionalGeneration: the by-name cache "
+                           "index names '") +
+                   name + "' but carries no payload locator for it");
+      VT_CHECK(kind == want,
+               std::string("Qwen4ExpForConditionalGeneration: '") + name +
+                   "' is this model's " + role + ", which is a " +
+                   (want == KvCachePayload::kPaged ? "PAGED" : "RECURRENT") +
+                   " cache, and the engine published it as a " +
+                   (kind == KvCachePayload::kPaged ? "PAGED" : "RECURRENT") +
+                   " one. Reading it from the other payload container returns "
+                   "an unrelated buffer with no shape error, so this refuses.");
+      VT_CHECK(slot >= 0,
+               std::string("Qwen4ExpForConditionalGeneration: '") + name +
+                   "' resolved to no payload slot");
+      return std::pair<int64_t, int32_t>(flat, slot);
+    };
+
+    int64_t qi = 0;
+    int64_t gi = 0;
+    int idx_group = -1;
+    for (size_t l = 0; l < p.layer_types.size(); ++l) {
+      const std::string idx = std::to_string(l);
+      if (p.layer_types[l] == Qwen4ExpLayerKind::kLinearAttention) {
+        const auto r = locate(Qwen4ExpLinearAttnName(l),
+                              KvCachePayload::kRecurrent, "recurrent state");
+        VT_CHECK(static_cast<size_t>(r.second) < input.gdn_state.size(),
+                 "Qwen4ExpForConditionalGeneration: layer " + idx +
+                     "'s recurrent state resolved to slot " +
+                     std::to_string(r.second) + " of " +
+                     std::to_string(input.gdn_state.size()) + " states");
+        gdn[static_cast<size_t>(gi++)] =
+            input.gdn_state[static_cast<size_t>(r.second)];
+      } else {
+        const auto a = locate(Qwen4ExpQsaAttnName(l), KvCachePayload::kPaged,
+                              "paged K/V");
+        const auto k = locate(Qwen4ExpQsaIndexerName(l), KvCachePayload::kPaged,
+                              "QSA indexer side cache");
+        VT_CHECK(static_cast<size_t>(a.second) < input.attn_kv.size() &&
+                     static_cast<size_t>(k.second) < input.attn_kv.size(),
+                 "Qwen4ExpForConditionalGeneration: layer " + idx +
+                     " resolved to paged slots " + std::to_string(a.second) +
+                     " and " + std::to_string(k.second) + " of " +
+                     std::to_string(input.attn_kv.size()) + " paged caches");
+        VT_CHECK(a.second != k.second,
+                 "Qwen4ExpForConditionalGeneration: layer " + idx +
+                     "'s paged K/V and its indexer side cache resolved to the "
+                     "SAME slot " + std::to_string(a.second) +
+                     "; they are two published groups and two buffers");
+        qsa_kv[static_cast<size_t>(qi)] =
+            input.attn_kv[static_cast<size_t>(a.second)];
+        qsa_idx[static_cast<size_t>(qi)] =
+            input.attn_kv[static_cast<size_t>(k.second)];
+        // The GROUP the side cache came from, taken from the entry rather than
+        // assumed to be 2: `MakeQwen4ExpKVCache` publishes it third today, and a
+        // hard-coded id would keep answering after a reordering that this
+        // resolution would otherwise survive.
+        const int32_t g = (*mk->group_ids)[static_cast<size_t>(k.first)];
+        VT_CHECK(idx_group < 0 || idx_group == g,
+                 "Qwen4ExpForConditionalGeneration: the QSA indexer side caches "
+                 "came from more than one published group (" +
+                     std::to_string(idx_group) + " and " + std::to_string(g) +
+                     "), so they do not share one block table");
+        idx_group = g;
+        ++qi;
+      }
+    }
+    VT_CHECK(qi == n_qsa && gi == n_gdn,
+             "Qwen4ExpForConditionalGeneration: resolved " +
+                 std::to_string(qi) + " of " + std::to_string(n_qsa) +
+                 " QSA layers and " + std::to_string(gi) + " of " +
+                 std::to_string(n_gdn) + " linear_attention layers by name");
+
+    // GROUP 2'S OWN GATHERED TABLE, which is the whole point of W5c-2's fourth
+    // vector: group 0's table names group 0's physical pages in group 0's pool,
+    // and reading the side cache through it returns another sequence's keys with
+    // no shape error.
+    int cols = 0;
+    const std::vector<int32_t>* bt = mk->BlockTableForGroup(idx_group, &cols);
+    VT_CHECK(bt != nullptr && cols > 0,
+             "Qwen4ExpForConditionalGeneration: the engine gathered no block "
+             "table for published group " + std::to_string(idx_group) +
+                 ", the QSA indexer side cache's group; " +
+                 std::to_string(mk->num_group_block_tables()) + " of " +
+                 std::to_string(mk->num_published_groups()) +
+                 " published group(s) carry one. A cache with no page map is "
+                 "allocated and unreadable. See "
+                 ".agents/specs/qwen4-exp-flash-next.md and issue #2249.");
+    VT_CHECK(static_cast<int64_t>(bt->size()) >= cols,
+             "Qwen4ExpForConditionalGeneration: group " +
+                 std::to_string(idx_group) + "'s block table has " +
+                 std::to_string(bt->size()) + " entries for a declared width of " +
+                 std::to_string(cols));
+    // ROW 0, because this hook already refused `num_reqs != 1` above; the table
+    // is row-major `[num_reqs, cols]`.
+    idx_bt.assign(bt->begin(), bt->begin() + cols);
+  }
 
   Qwen4ExpForwardCaches caches;
-  caches.gdn = input.gdn_state;
+  caches.gdn = gdn;
 
   // ONE block table and ONE slot mapping for the whole step, taken from the
   // runner's own metadata rather than rebuilt: `dense_attn::AttnBlock` does not
@@ -281,9 +498,13 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   for (int64_t t = 0; t < T; ++t)
     slots[static_cast<size_t>(t)] = input.attn_meta.slot_mapping[static_cast<size_t>(t)];
 
-  // The scratch buffers live for exactly this call, which is what `past_len ==
-  // 0` buys and what the refusal above protects.
-  std::vector<std::vector<uint16_t>> index_keys(static_cast<size_t>(n_qsa));
+  // The PLE scratch buffers live for exactly this call, which is what
+  // `past_len == 0` buys and what the refusal above protects. The QSA indexer
+  // scratch beside them is the POSITIONAL arm's only; see below.
+  // POSITIONAL ARM ONLY: on the by-name arm the engine's own group-2 pages are
+  // the buffer and nothing here is allocated.
+  std::vector<std::vector<uint16_t>> index_keys(
+      mk == nullptr ? static_cast<size_t>(n_qsa) : 0U);
   std::vector<std::vector<float>> ple_convs(p.ple.layer_ids_zero_based.size());
   std::vector<std::vector<int64_t>> ple_tokens(p.ple.layer_ids_zero_based.size());
 
@@ -310,31 +531,80 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // which runs a non-identity `{2, 6, 1}` against a logical `{0, 1, 2}` with a
   // partial final page (`test_qwen4_exp_qsa_block.cpp`, the W5i case).
   //
-  // WHAT REPLACES IT. When `ModelRegistry::Forward` stops refusing `multi_kv`
-  // (#2353, W5j), these two lines become group 2's own cache and
-  // `group_block_tables[2]` — the vector W5c-2 already gathers — and NOTHING in
-  // the block changes. That substitution is the whole point of paging it here.
-  const int64_t idx_page =
-      input.attn_kv[0].block_size > 0 ? input.attn_kv[0].block_size : T;
-  const int64_t idx_pages = (T + idx_page - 1) / idx_page;
-  std::vector<int32_t> idx_bt(static_cast<size_t>(idx_pages));
-  for (int64_t k = 0; k < idx_pages; ++k) idx_bt[static_cast<size_t>(k)] = static_cast<int32_t>(k);
+  // WHAT REPLACED IT (W5j). On the by-name arm these are group 2's OWN cache and
+  // `group_block_tables[<group 2>]` — the vector W5c-2 already gathers — and
+  // NOTHING in the block changed: `RunQwen4ExpQsaBlockPaged` takes the same
+  // rank-3 page tensor and the same i32 `[1, pages]` table either way. That
+  // substitution is the whole point of having paged it here.
+  //
+  // THE SCRATCH ARM SURVIVES, AND NOT AS A FALLBACK. It is what a caller with no
+  // engine behind it gets — the block's own gate, and any hand-built step — and
+  // on it the identity table is the CORRECT map, because a private buffer's
+  // logical page `i` really is its physical page `i`. What it is NOT is the
+  // production path any more: an engine step arrives with `multi_kv` and takes
+  // the other arm, so the permutation is exercised by the allocator's pages and
+  // not only by the block's `{2, 6, 1}` case.
+  const int64_t id_dim = p.qsa.head_dim;
+  int64_t idx_page = 0;
+  int64_t idx_pages = 0;
+  if (mk == nullptr) {
+    idx_page = input.attn_kv[0].block_size > 0 ? input.attn_kv[0].block_size : T;
+    idx_pages = (T + idx_page - 1) / idx_page;
+    idx_bt.assign(static_cast<size_t>(idx_pages), 0);
+    for (int64_t k = 0; k < idx_pages; ++k)
+      idx_bt[static_cast<size_t>(k)] = static_cast<int32_t>(k);
+  } else {
+    // The geometry comes from the ENGINE's own view of group 2's buffer, never
+    // from a second derivation here: `MLAAttentionSpec::real_page_size_bytes` is
+    // `storage_block_size() * num_kv_heads * head_size`, and at
+    // `compress_ratio == 1` and the `indexer_kv_heads == 1` upstream requires,
+    // that is exactly `[num_blocks, block_size, indexer_head_dim]`.
+    idx_page = qsa_idx[0].block_size;
+    idx_pages = static_cast<int64_t>(idx_bt.size());
+  }
   dense_attn::DBuf d_idx_bt(d, vt::DType::kI32, {1, idx_pages}, idx_bt.data());
 
   std::vector<dense_attn::DBuf> idx_bufs;
   idx_bufs.reserve(static_cast<size_t>(n_qsa));
   caches.qsa.resize(static_cast<size_t>(n_qsa));
   for (int64_t i = 0; i < n_qsa; ++i) {
-    const int64_t id = p.qsa.head_dim;
-    index_keys[static_cast<size_t>(i)].assign(
-        static_cast<size_t>(idx_pages * idx_page * id), 0);
-    idx_bufs.emplace_back(d, vt::DType::kBF16,
-                          std::vector<int64_t>{idx_pages, idx_page, id},
-                          index_keys[static_cast<size_t>(i)].data());
-    caches.qsa[static_cast<size_t>(i)].kv = input.attn_kv[static_cast<size_t>(i)];
+    vt::Tensor index_key;
+    if (mk == nullptr) {
+      index_keys[static_cast<size_t>(i)].assign(
+          static_cast<size_t>(idx_pages * idx_page * id_dim), 0);
+      idx_bufs.emplace_back(d, vt::DType::kBF16,
+                            std::vector<int64_t>{idx_pages, idx_page, id_dim},
+                            index_keys[static_cast<size_t>(i)].data());
+      index_key = idx_bufs.back().t();
+    } else {
+      const PagedKvCache& ic = qsa_idx[static_cast<size_t>(i)];
+      VT_CHECK(ic.data != nullptr && ic.num_blocks > 0 && ic.block_size > 0,
+               "Qwen4ExpForConditionalGeneration: the QSA indexer side cache "
+               "for qwen_sparse_attention layer " + std::to_string(i) +
+                   " is unallocated");
+      VT_CHECK(ic.num_kv_heads == 1 && ic.head_size == id_dim,
+               "Qwen4ExpForConditionalGeneration: the QSA indexer side cache is "
+               "published as an MLAAttentionSpec of " +
+                   std::to_string(ic.num_kv_heads) + " head(s) x " +
+                   std::to_string(ic.head_size) +
+                   ", and this model stores ONE raw key of indexer_head_dim " +
+                   std::to_string(id_dim) +
+                   " per token slot. upstream requires indexer_kv_heads == 1, "
+                   "so any other view is a different cache");
+      VT_CHECK(ic.block_size == idx_page,
+               "Qwen4ExpForConditionalGeneration: the QSA indexer side caches "
+               "do not share one page size (" + std::to_string(ic.block_size) +
+                   " against " + std::to_string(idx_page) +
+                   "), so one gathered block table cannot address them all");
+      // The FUSED 3-dim MLA page, over the runner's own buffer. Not a copy: the
+      // block WRITES this step's raw keys into it, and a copy would drop them.
+      index_key = dense_attn::MakeTensor(ic.data, ic.dtype, input.queue.device,
+                                         {ic.num_blocks, ic.block_size, id_dim});
+    }
+    caches.qsa[static_cast<size_t>(i)].kv = qsa_kv[static_cast<size_t>(i)];
     caches.qsa[static_cast<size_t>(i)].block_table = d_bt.t();
     caches.qsa[static_cast<size_t>(i)].slot_mapping = d_slots.t();
-    caches.qsa[static_cast<size_t>(i)].index_key = idx_bufs.back().t();
+    caches.qsa[static_cast<size_t>(i)].index_key = index_key;
     caches.qsa[static_cast<size_t>(i)].index_block_table = d_idx_bt.t();
   }
 
@@ -546,21 +816,14 @@ v1::KVCacheConfig MakeQwen4ExpKVCache(const HfConfig& config, int block_size,
   std::vector<std::string> qsa_layers;
   std::vector<std::string> qsa_indexer_layers;
   std::vector<std::string> linear_layers;
+  // THE SAME THREE BUILDERS THE FORWARD RESOLVES THROUGH. See their definition
+  // above for why they exist and why they are file-local.
   for (size_t l = 0; l < p.layer_types.size(); ++l) {
-    const std::string idx = std::to_string(l);
     if (p.layer_types[l] == Qwen4ExpLayerKind::kLinearAttention) {
-      // The name `ResolveKVCacheGroupLayerNames` builds for a recurrent layer,
-      // so the runner's by-name membership sees the same string either way.
-      linear_layers.push_back("model.layers." + idx + ".linear_attn");
+      linear_layers.push_back(Qwen4ExpLinearAttnName(l));
     } else {
-      qsa_layers.push_back("model.layers." + idx + ".self_attn.attn");
-      // Upstream addresses a side cache by its own module prefix
-      // (`vllm/models/deepseek_v4/attention.py:761-767` registers the indexer
-      // key cache under `...indexer.k_cache`); the runner parses the
-      // `.layers.<N>.` segment out of it, so the suffix is free to say which
-      // cache it is.
-      qsa_indexer_layers.push_back("model.layers." + idx +
-                                   ".self_attn.indexer.k_cache");
+      qsa_layers.push_back(Qwen4ExpQsaAttnName(l));
+      qsa_indexer_layers.push_back(Qwen4ExpQsaIndexerName(l));
     }
   }
 
@@ -674,6 +937,14 @@ const ModelFactory kQwen4ExpFactory{
     .forward = &ForwardQwen4ExpForConditionalGeneration,
     .make_kv_cache = &MakeQwen4ExpKVCache,
     .is_dense_model = false,
+    // W5j (#2031, #2353): THE DECLARATION, landed with its first consumer.
+    // `ForwardQwen4ExpForConditionalGeneration` resolves every published cache
+    // through `MultiKvCacheIndex::Resolve` and reads group 2's own gathered
+    // block table, so `ModelRegistry::Forward` lets this architecture's
+    // three-group topology past its guard. Setting this on a forward that read
+    // `attn_kv` positionally would move a silent mis-index out of the engine and
+    // into the model: `attn_kv` carries 2 x n_qsa entries on this topology.
+    .consumes_multi_kv = true,
 };
 
 }  // namespace

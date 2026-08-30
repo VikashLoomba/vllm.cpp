@@ -415,11 +415,14 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
     VT_CHECK(pc.kv.dtype == hidden.dtype,
              "qwen4_exp qsa block: the paged KV cache dtype must be the block dtype — "
              "vt::ReshapeAndCache's `auto` path copies raw elements and does not cast");
-    // `MakeQwen4ExpKVCache` already refuses a `block_size` the compress ratio
-    // does not divide, and the reason is upstream's truncating
-    // `storage_block_size`. It matters a SECOND time here: it is what keeps a
-    // compress block of CR tokens inside one page, so the consumer never has to
-    // resolve two pages for one selected block.
+    // THIS IS THE ONLY SITE THAT REFUSES IT NOW, and the sentence here used to
+    // say otherwise. It read "`MakeQwen4ExpKVCache` already refuses a
+    // `block_size` the compress ratio does not divide"; W5h DELETED that
+    // refusal, correctly — it guarded a COMPRESSED page geometry and group 2 is
+    // not one, so at `compress_ratio` 1 there is no division to truncate. The
+    // reason the check survives HERE is a different one and it is group 0's:
+    // it keeps a compress block of CR tokens inside ONE page, so the consumer
+    // never has to resolve two pages for one selected block.
     VT_CHECK(pc.kv.block_size % CR == 0,
              "qwen4_exp qsa block: the KV page size must be a multiple of "
              "`indexer_compress_ratio`, which MakeQwen4ExpKVCache already requires");

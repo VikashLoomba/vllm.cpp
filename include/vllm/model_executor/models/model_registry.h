@@ -585,9 +585,14 @@ struct ModelForwardInput {
   const int32_t* device_token_ids = nullptr;
   // KV-DSV4-MULTICACHE W3 (#2068): the THIRD cache channel. Non-null only when
   // the runner allocated a MULTI-CACHE topology — one whose published groups the
-  // positional `attn_kv` convention cannot address, which today is DeepSeek-V4
-  // and nothing else. NULL on every other step, so every other forward is
-  // byte-identical. Set after aggregate construction, like `device_token_ids`
+  // positional `attn_kv` convention cannot address. THREE architectures publish
+  // one today (`DeepseekV4ForCausalLM`, `Qwen4ExpForConditionalGeneration` and
+  // `Glm5NextForConditionalGeneration`); this line said "DeepSeek-V4 and nothing
+  // else", which was true when W3 wrote it and stopped being true two rows
+  // later. NULL on every other step, so every other forward is byte-identical.
+  //
+  // A forward may only READ it when its `ModelFactory::consumes_multi_kv` is
+  // true; `ModelRegistry::Forward` refuses the step otherwise. Set after aggregate construction, like `device_token_ids`
   // above, so no positional initializer moves.
   const MultiKvCacheIndex* multi_kv = nullptr;
 };
@@ -620,6 +625,35 @@ struct ModelFactory {
   // per-tensor stage-and-release; Kimi-Linear's 91.5 GiB bf16-resident loader).
   // Default false: every existing arch's engine load path is byte-identical.
   bool stage_on_load = false;
+  // MODEL-MM-QWEN4-EXP W5j ([#2031](https://github.com/mudler/vllm.cpp/issues/2031),
+  // [#2353](https://github.com/mudler/vllm.cpp/issues/2353)): whether THIS
+  // model's forward RESOLVES its caches through `MultiKvCacheIndex` — by the
+  // name each was published under — instead of reading `attn_kv` / `gdn_state`
+  // positionally.
+  //
+  // THE DEFAULT IS FALSE AND THAT IS THE MECHANISM, the same polarity
+  // `stage_on_load` and `supports_weight_offload` above already use.
+  // `ModelRegistry::Forward` refuses a multi-cache topology for every model that
+  // leaves it false, so a model that publishes three groups and then reads two
+  // positional channels is stopped rather than served a cache set it silently
+  // mis-indexes. On a topology whose groups the positional convention CAN
+  // express the runner sends no channel at all (`multi_kv == nullptr`), so this
+  // bit is inert for every uniform model whatever its value.
+  //
+  // WHY A BIT AND NOT AN ARCHITECTURE LIST IN THE GUARD. The fact is a property
+  // of the forward and it lives beside the forward: the one translation unit
+  // that resolves by name is the one that sets this. A list in
+  // `ModelRegistry::Forward` would have to be edited by every model row, which
+  // is the shared-file lock AGENTS.md `## Records` forbids, and it is the
+  // construct #2288 has already driven stale six times on this row.
+  //
+  // IT IS NOT A LICENCE TO SERVE ANY SHAPE. It says the forward ASKS by name;
+  // the forward still refuses a channel that answers wrongly — a name that
+  // resolves to nothing, to the wrong payload kind, or to a group with no
+  // gathered block table. Setting it true on a forward that reads positionally
+  // would move a silent mis-index from the engine into the model, so it lands
+  // WITH its first consumer and never before one.
+  bool consumes_multi_kv = false;
   // ENG-WEIGHT-OFFLOAD: whether THIS model's loader asks
   // `WeightOffloader::ConsiderWeight` for each weight and honours the answer.
   //

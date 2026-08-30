@@ -3538,3 +3538,12 @@ vllm_cpp_add_test(test_glm_moe_dsa_gguf_census
   vllm/models/test_glm_moe_dsa_gguf_census.cpp)
 target_include_directories(test_glm_moe_dsa_gguf_census PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# W7: the load itself, on a COMPLETE synthetic `glm-dsa` GGUF with the same
+# structure as the 201.83 GiB artifact -- heterogeneous indexer schedule, a
+# leading dense block, stacked keep-quant towers and an MTP tail to drop. Enters
+# through `LoadedEngine::FromModelDir`, which is the reachability proof.
+vllm_cpp_add_test(test_glm_moe_dsa_gguf_load
+  vllm/models/test_glm_moe_dsa_gguf_load.cpp)
+target_include_directories(test_glm_moe_dsa_gguf_load PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)

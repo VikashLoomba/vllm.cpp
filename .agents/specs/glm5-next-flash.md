@@ -1668,6 +1668,86 @@ registry TU's decode file set, and this model's f32 residual declarations live
 in `glm5_next_forward.cpp`. Teaching it to follow the hop is a semantic checker
 change, which AGENTS.md routes to its own row, spec and red-before.
 
+### W5b-2c — the engine's multi-KV index, consumed (CPU, medium). [#2348](https://github.com/mudler/vllm.cpp/issues/2348)
+
+The last thing between this model and a token, and it is not more plumbing on
+W5b-2b: it is the piece W5b-2b deliberately did not write and O27 declared as a
+staged slice.
+
+**What stood in the way, measured.** O28 drove the production C ABI at the
+staged artifact on `dgx:gpu0` and the engine refused above this row's hook:
+`22 KV cache(s) from 2 published group(s) reached this forward ... and no
+registered forward consumes a cache set keyed by layer name`. That is the
+`input.multi_kv` guard KV-DSV4-MULTICACHE W3 ([#2068](https://github.com/mudler/vllm.cpp/issues/2068))
+landed, and it fires for ANY model publishing a multi-cache topology BEFORE
+dispatch.
+
+**What the engine actually hands over, read off the code and confirmed by that
+refusal's own numbers.** The three counts in it are three different
+denominators and reading them as one is the first way this mapping goes wrong:
+
+| the number | what it counts |
+|---:|---|
+| 3 published groups | `MakeGlm5NextKVCache`'s MLA latent (512), KDA recurrent state, indexer side cache (257) |
+| 22 caches in `attn_kv` | one entry per published NAME of every ATTENTION group: 11 + 11 |
+| 2 groups in `attn_kv` | the recurrent group contributes NOTHING there — its 34 layers land in `gdn_state` |
+| 3 of 3 block tables | gathered per GROUP ID, not parallel to `attn_kv` |
+
+The first published name is `model.layers.3.self_attn.attn` because the 22
+arrive in PUBLICATION order — group 0's eleven, then group 2's eleven — and
+layer 3 is this checkpoint's first DSA layer. **Nothing is resolved by
+position.** Every attention cache is found through `MultiKvCacheIndex::Find` on
+the name `MakeGlm5NextKVCache` published it under, and its group id is READ off
+the channel rather than assumed to be 0 and 2.
+
+**GROUP 0 IS AN MLA LATENT AND NOT A K+V PAIR**, and this is the one error on
+the wave that does not crash. `MLAAttentionSpec` stores ONE vector per token —
+no factor 2, no separate V — so the buffer is `[num_blocks, block_size,
+head_size]` and a row is at `(block * block_size + offset) * head_size`. A
+reader that took the ordinary pair layout indexes at twice the stride and hands
+the layer finite, correctly shaped, wrong numbers; the model then generates
+fluent text. `ResolveKvBinding` refuses `num_kv_heads != 1` and a `head_size`
+that is not the published row, and `PagedRowOffset` is the ONE place this row
+turns a logical position into an element offset.
+
+**And the arithmetic is checked against the engine's own.** The runner computes
+`attn_meta.slot_mapping` for the target attention group with its own walk of the
+same table. The binding recomputes those slots and refuses by name on a
+disagreement, so a misread block table is a refusal on the first step rather
+than a wrong token on every step after it.
+
+**The recurrent group is NOT keyed by name and the spec says so rather than
+leaving it to be discovered.** `MultiKvCacheIndex` describes `attn_kv` only; the
+KDA states arrive on `gdn_state` in ascending layer order with no name, so the
+correspondence is positional and the strongest available check is the count
+against `num_kda_layers()`. The state SLOT is the engine's —
+`GDNAttentionMetadata::non_spec_state_indices_tensor`, the compact index the
+runner remapped block-table column 0 to — because the raw block id would index a
+`[gdn_state_slots, ...]` buffer with an attention block number.
+
+**A sentence W5b-2b landed that this wave retires.** `glm5_next_forward.h` said
+the forward "re-runs the whole prefix every step", following Nemotron-H and
+Kimi-Linear. The runner does not offer that: `ModelForwardInput::token_ids` is
+the step's SCHEDULED tokens, so on the second step of a decode it is ONE id, and
+a forward that treats it as a sequence attends to an empty prefix. The house
+pattern carries the same defect and this row does not inherit it.
+
+**The guard is NARROWED, not dropped.** `ModelFactory` grows
+`consumes_multi_kv_cache`, default false, and `ModelRegistry::Forward` refuses
+only when a keyed cache set arrives AND the registered forward does not declare
+that it consumes one — which is the pair of facts the message already asserted.
+Every model refused before this change is refused after it, DeepSeek-V4
+included; #1925 still owns its consuming forward. This is the same capability
+shape `streams_routed_experts` and `supports_weight_offload` already use, and
+for the same reason: the fact is a property of a model's forward and it lives
+beside the forward.
+
+**What this wave does NOT close.** O1 stands: no end-to-end token gate for this
+model exists or can exist on this fleet, and what CI runs is the synthetic
+4-layer miniature. Ragged batching and the device arm stay refused by name. The
+forward still re-decodes every layer's weights from the block-resident tower on
+every step, which is a residency decision and not a speed one; W8 owns speed.
+
 ### W5c — the weight tower and `load_weights` — SUPERSEDED, see the LANDED section below
 
 This was W5's PLAN for W5c, and it is kept only so the two readings do not look
@@ -3476,7 +3556,376 @@ Debts this row carries, each visible rather than waived:
   the script does not sample RSS, so the peak this row owes did not come out of
   a run that would otherwise have produced it.
 
+- **O29 — W5b-2c CONSUMES the engine's keyed cache set, and O28's guard is
+  NARROWED rather than removed.** [#2348](https://github.com/mudler/vllm.cpp/issues/2348).
+  This entry records what the mapping IS, because the next reader should not
+  have to re-derive it from a refusal message.
+
+  **WHAT THE ENGINE HANDS OVER.** Three denominators, three different numbers,
+  all four established from `runner.cpp` and confirmed by O28's own message:
+
+  | the number | what it counts |
+  |---:|---|
+  | 3 published groups | `MakeGlm5NextKVCache`'s MLA latent (512), KDA recurrent state, indexer side cache (257) |
+  | 22 caches in `attn_kv` | one entry per published NAME of every ATTENTION group: 11 + 11 |
+  | 2 groups among those 22 | the 34-layer recurrent group contributes NOTHING there; it lands on `gdn_state` |
+  | 3 of 3 block tables | gathered per GROUP ID, not parallel to `attn_kv` |
+
+  The first published name is `model.layers.3.self_attn.attn` because the 22
+  arrive in PUBLICATION order — group 0's eleven, then group 2's eleven — and
+  layer 3 is this checkpoint's first DSA layer.
+
+  **THE MAPPING.** Every attention cache is resolved through
+  `MultiKvCacheIndex::Find` on the name `MakeGlm5NextKVCache` published it under
+  and its group id is READ off the channel, never assumed to be 0 and 2. The
+  suite makes that observable rather than asserting it: the miniature has ONE
+  DSA layer, so a resolver that indexed `attn_kv[0]` would be right at the
+  fixture and wrong on the checkpoint, and a case that PERMUTES the published
+  channel — names, group ids, layer indices and caches together — is what
+  separates the two. It is bit-identical under the correct code and reds the
+  mutant that resolves by position.
+
+  **GROUP 0 IS AN MLA LATENT AND NOT A K+V PAIR, and this is the error on the
+  wave that does not crash.** `MLAAttentionSpec::real_page_size_bytes` is
+  `storage_block_size * 1 * head_size * dtype_size` — no factor 2, no separate V
+  (`kv_cache_interface.h:27-29`) — so the buffer is `[num_blocks, block_size,
+  head_size]`. `ResolveKvBinding` refuses `num_kv_heads != 1` and a `head_size`
+  that is not the published row, and `PagedRowOffset` is the ONE place this row
+  turns a logical position into an element offset. The mutation that gives it a
+  pair stride does not merely fail an assertion: it walks off the page and the
+  binary ABORTS (rc=134), which is the M5-by-SIGSEGV shape W5b-2b recorded.
+
+  **THE ENGINE IS A SECOND OPINION ON THIS ROW'S ARITHMETIC.** The runner builds
+  `attn_meta.slot_mapping` for the target attention group with its own walk of
+  the same block table. The binding recomputes those slots and refuses by name
+  on a disagreement, so a misread table is a refusal on the first step rather
+  than a wrong token on every step after it.
+
+  **THE RECURRENT GROUP IS NOT KEYED BY NAME.** `MultiKvCacheIndex` describes
+  `attn_kv` only; the KDA states arrive on `gdn_state` in ascending layer order
+  with no name, so the correspondence is POSITIONAL and the count against
+  `num_kda_layers()` is the only check that exists. That is a limit of the
+  channel, recorded rather than hidden. The state SLOT is the engine's —
+  `GDNAttentionMetadata::non_spec_state_indices_tensor`, the compact index the
+  runner remapped block-table column 0 to — because the raw block id would index
+  a `[gdn_state_slots, ...]` buffer with an attention block number.
+
+  **A SENTENCE W5b-2b LANDED IS RETIRED HERE.** `glm5_next_forward.h` said the
+  forward "re-runs the whole prefix every step", following Nemotron-H and
+  Kimi-Linear. The runner does not offer that: `ModelForwardInput::token_ids` is
+  the step's SCHEDULED tokens, so on the second step of a decode it is ONE id,
+  and a forward that treats it as a sequence attends to an empty prefix. Both
+  house precedents carry the same defect; this row does not inherit it, and
+  whether it is a defect in THEIR models is not this row's to answer.
+
+  **THE GUARD IS NARROWED, NOT DROPPED.** `ModelFactory` grows
+  `consumes_multi_kv_cache`, default false, and `ModelRegistry::Forward` refuses
+  only when a keyed cache set arrives AND the registered forward does not
+  declare that it consumes one — the pair of facts the message already asserted.
+  Restoring the unconditional form reds 18 of 23 cases, which is the measure of
+  how much this narrowing carries; DeepSeek-V4 keeps the default, is still
+  refused, and #1925 still owns its consuming forward.
+
+  **WHAT IS GATED, EXACTLY.** `prefill(5) + continue(3)` through
+  `ModelRegistry::Forward` agrees with a one-shot forward over the same eight
+  tokens on the continuation's rows **EXACTLY (0.0)** on an f32 cache. That is
+  stronger than W5b-2a's 5e-4 tolerance because W5b-2a compared against the
+  ORACLE, whose own cached and uncached runs differ by 3.01e-06, and this
+  compares our two paths, whose split identity is exact by construction:
+  `ExpandKv` is token-wise under NoPE, the conv and delta recurrence step per
+  token, the indexer's causal window is the same absolute position either way,
+  and the router, the mHC folds and the head are per token.
+
+  **WHAT THE FIXTURE CANNOT SEE, said rather than papered over.** At the
+  miniature's geometry the logits sit near 2.65e5, where an f32 ULP is 0.03125.
+  Changing three of the eight prompt tokens moves the tail logits by exactly
+  that — two ULP — because the fixture's ramp weights dominate its attention
+  output. So a bf16 cache's round-trip cost (one ULP, 0.015625) and a WRONG
+  PROMPT are both at the floor, and a ratio between them would be a coincidence
+  rather than a gate. The bf16 case therefore asserts only what it can support —
+  the gap is at most one ULP of the largest logit, computed from the data — and
+  the f32 case, whose answer is exactly zero, is the one that separates a read
+  cache from an ignored one.
+
+  **NOT DISCHARGED.** O1 stands entirely: no end-to-end token gate for this
+  model exists or can exist on this fleet, and nothing here is a claim about the
+  321.32B model. Ragged batching and the device arm stay refused by name. O6
+  stands: the forward still re-decodes every layer from the block-resident tower
+  each step, which is a residency decision and not a speed one, and W8 owns the
+  axis. The `shared` indexer arm stays unreached for the reason O25 and O26 give
+  — no released config selects it — and the binding hydrates its side cache as
+  EMPTY, which is what `Attention` writes for such a layer.
+
+- **O30 — THE FIRST GENERATION FROM THIS ARTIFACT WAS GARBAGE, and the cause is
+  a WEIGHT LAYOUT this row's bridge cannot see. Repaired here; the coverage gap
+  that let it through is NOT.** The W5b-2c run
+  (`/mnt/nas_share/rc/glm5-w5b2c/out-20260830T080947Z`, `dgx:gpu0`, branch
+  `row/MODEL-MM-GLM53-FLASH-MULTIKV` @ `3f8c4a275`) generated 8 tokens and every
+  one was token id 0. That is not a coincidence of encoding: this file's own
+  `tokenizer.ggml.tokens[0]` is `"!"`, read directly from shard 1's KV block, so
+  `!!!!!!!!` IS eight ids of 0 and the detokenizer is exonerated.
+
+  **The mechanism, and it is silent by construction.**
+  `GgufLoadPolicy::FromEnv` sets
+  `quant_repack = keep_quant && !cpu_ref && vt::cpu::QuantRepackActive()`
+  (`gguf_keep_quant.cpp`). `OwnGgufQuantBlocks` then permutes each eligible q8_0
+  weight into the `block_q8_0x4` i8mm interleave and sets
+  `OwnedTensor::repacked` — leaving the DTYPE at `kQ8_0` and the byte count
+  IDENTICAL, because `sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0)`.
+  `DecodeOwnedTensorToF32` and `DecodeOwnedTensorRowsToF32` keyed on `t.dtype`
+  alone, so the whole-blocks check passed, the byte-span check passed, and
+  `BlockToFloat(kQ8_0)` read the interleave as plain blocks and returned finite,
+  plausible, WRONG floats with no error.
+
+  **ALL 346 of the artifact's 346 q8_0 tensors are repack-eligible**, computed
+  over the real file's own tensor table: every one satisfies `N % 4 == 0` and
+  `K % 32 == 0`. That includes `hc_attn_fn.weight` and `hc_ffn_fn.weight` on
+  **45 layers each** — both mHC mixers of every decoder layer — plus the whole
+  KDA gate chain (`ssm_f_a`, `ssm_f_b`, `ssm_g_a`, `ssm_g_b`, `ssm_beta`, 34
+  each) and the DSA and indexer projections (12 each). A residual manifold whose
+  `hc_attn_fn` is a permutation of itself is wrong at layer 0, which is why no
+  amount of reading the arithmetic found anything: the arithmetic was right and
+  its inputs were not.
+
+  **THIS ROW WAS THE ONLY MODEL WITHOUT THE TRIPWIRE.** `deepseek_v4.cpp`,
+  `laguna.cpp` and `qwen3_5.cpp` each carry `VT_CHECK(!w.repacked, ...)` at
+  their host-side consumers, and `qwen3_5.cpp` names the class exactly — issue
+  [#1320](https://github.com/mudler/vllm.cpp/issues/1320), "silent wrong tokens,
+  not a crash". `glm5_next` had neither that check nor the propagation to
+  `vt::Tensor::repacked`, so it inherited the hazard and none of the guard.
+
+  **The repair is two changes of different kinds.** The loader DECLINES the
+  repack (`kGlm5NextQuantRepack`, `kGlm5NextElemKnRepack`), because nothing on
+  this row consumes it: the forward is a host f32 reference, every weight it
+  touches goes through the two decode functions, no `vt::Tensor` is built over
+  these buffers, and `QuantRepackMatmul` is unreachable from here — so the
+  repack was buying this model nothing while costing it a load-time copy that
+  defeats the mmap borrow. The bridge then REFUSES a `repacked`, `q8_0_aligned`
+  or `elem_kn_repacked` buffer BY NAME, so a later wave that gives this row a
+  quantized GEMM gets a named refusal instead of a fluent wrong model.
+
+  **WHY ELEVEN GREEN SUITES AND A FULL PREFLIGHT MISSED IT, stated because it is
+  the reusable part.** `cpu_quant_repack_arm.cpp` guards its body with
+  `#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)` and the
+  `#else` arm returns `false`, so on x86-64 `QuantRepackActive()` is COMPILED
+  OUT and the loader never repacks. Measured, not assumed: the same load-policy
+  line that reads `QuantRepackActive()=1` on the fleet prints
+  `policy.quant_repack=0 QuantRepackActive()=0` on an x86 dev box. Every box
+  this 101.25 GiB model fits on is aarch64 with i8mm, and every box CI runs the
+  glm5 suites on is x86-64, so **the defect was unreachable in CI and
+  unavoidable in production** — the two populations do not intersect at all.
+
+  **MEASURED, on `thor:gpu0`, and the bisect is a partition rather than a
+  gradient.** Run `/mnt/nas_share/rc/glm5-diag/out-20260830T111015Z`, the
+  UNFIXED tree (`0716fce0e`, which is W5b-2c plus the instrument and nothing
+  else), `vllm-cli --device cpu --max-tokens 2` at `VT_GLM5_DIAG=2`. The prompt
+  tokenizes correctly -- `785 6722 315 9621 374` is `The| capital| of| France|
+  is` -- and the step is `T=5 H=4096 V=154880 layers=45 hc=4
+  logits_indices=1`, so the engine handed the forward exactly what it should.
+
+  | buffer | encoding | nan | min / max |
+  |---|---|---:|---|
+  | `embeds` (gather) | Q5_K | 0 | -0.0420 / 0.0415 |
+  | `output_norm.weight` | F32 | 0 | -0.0146 / 1.984 |
+  | `blk.0 attn_norm` | F32 | 0 | 0.0703 / 0.157 |
+  | **`blk.0 hc_attn.fn`** | **Q8_0** | **12032 / 393216** | **-7.82e6 / +8.17e6** |
+  | `blk.0 hc_attn.base`, `.scale` | F32 | 0 | sane |
+  | **`blk.0 hc_ffn.fn`** | **Q8_0** | **13536** | **+-8.31e6** |
+  | `blk.0 kda.q/k/v/o_proj` | Q5_K, Q6_K | 0 | +-0.37 |
+  | `blk.0 mlp.gate/up/down` | Q5_K, Q6_K | 0 | +-0.14 |
+  | `L0 in.streams` | -- | **0** | -0.042 / 0.042 |
+  | **`L0 mhc_pre.collapsed`** | -- | **20480 / 20480** | -- |
+  | every buffer after, layers 0..44 | -- | 100% | -- |
+  | `hc_head collapse`, `hidden (final)` | -- | 100% | -- |
+  | `lm_head chunk[0]` | Q4_K | **0** | -0.175 / 0.199 |
+  | `logits[row 4]` | -- | **154880 / 154880** | -- |
+
+  **The first NaN is the first arithmetic that touches a Q8_0 weight.**
+  `L0 in.streams` -- the embedding, expanded to four identical streams -- is
+  clean, and `MhcPre`, which reads `hc_attn.fn`, is 100% NaN. Everything
+  downstream follows. The census over the first nine layers is a partition:
+  `hc_attn.fn` 9/9 NaN, `hc_ffn.fn` 9/9, `mla.q_b_proj` 2/2,
+  `mla.kv_a_proj_with_mqa` 2/2 -- every one Q8_0, rank-2 and kept-quant -- and
+  every other tensor clean. `mla.k_b_proj` and `mla.v_b_proj` are Q8_0 and CLEAN,
+  which is explained rather than anomalous: `KeepQuantKDim(kMatmulWeight, shape)`
+  returns `shape.size() == 2 ? shape[1] : -1`, so those rank-3 halves are routed
+  to `ExpandBf16` and never reach the repack at all.
+
+  **WHY NaN AND NOT MERELY WRONG, which is the part a static reading got
+  wrong.** `block_q8_0` is `{fp16 d; int8 qs[32]}` at 34 bytes and
+  `block_q8_0x4` is `{fp16 d[4]; int8 qs[128]}` at 136, so reading the interleave
+  as four plain blocks misaligns the `d` field from the second block onward and
+  QUANT BYTES ARE READ AS AN FP16 SCALE. An fp16 whose five exponent bits are all
+  set with a non-zero mantissa IS NaN, which is 3.06% of the blocks here; the
+  finite remainder is bounded by max-fp16 times max-int8,
+  `65504 * 127 = 8,319,008`, against a measured max of `8.31901e+06`. The
+  envelope is the mechanism's own arithmetic and not an inference from it.
+
+  **The sampler, the head and the tokenizer are each exonerated by the same
+  run.** `lm_head chunk[0]` is clean, so the Q4_K head is intact and only its
+  input is not. The logits line reads `nan=154880` of 154880 and the top-5 is
+  `(3, -nan) (4, -nan) (1, -nan) (0, -nan) (2, -nan)` with
+  `margin(top1-top2)=-nan` -- index order, because every `>` against NaN is
+  false. The next step then arrives with `step token_ids n=1: 0`, so the id 0 is
+  observed INSIDE the engine rather than inferred from the eight `!` on the wire.
+  This is case (a) of the four, and a static reading of the hazard had predicted
+  case (c), finite and wrong; the mechanism is the same and the prediction about
+  which bucket the LOGITS land in was wrong.
+
+  **THE REPAIR IS MEASURED ON THE SAME BOX, and the A/B is single-variable.**
+  `/mnt/nas_share/rc/glm5-diag/out-fix-20260830T125313Z`, `thor:gpu0`, the fixed
+  tree `d84db105b`, same checkpoint, same prompt. `blk.0 hc_attn.fn` goes from
+  `nan=12032, +-8.2e6, sd 4.59e5` to `nan=0, -0.379 / +0.398, sd 0.0332`, and
+  `hc_ffn.fn` likewise; `L0 mhc_pre.collapsed` from 20480/20480 NaN to `nan=0`;
+  all 64 per-layer `streams out` lines to `nan=0`; `hidden (final)` to
+  `nan=0, -13.94 / +8.49, sd 1.30`; and `logits[row 4]` from 154880/154880 NaN
+  to `nan=0, -9.14 / +16.43, sd 2.14`. **NO line in the entire repaired run
+  carries a non-zero NaN count.** The top-5 for `The capital of France is` is
+  `(12089, 16.427) (825, 15.148) (7407, 14.672) (3881, 14.582) (264, 14.376)`
+  with `margin(top1-top2)=1.2794`, which against the file's own vocabulary reads
+  **` Paris`, ` one`, ` located`, ` known`, ` a`** -- the right answer first, and
+  every runner-up a plausible English continuation. The engine then arrives at
+  step 2 with `step token_ids n=1: 12089`, so the sampled token is observed
+  INSIDE the engine exactly as the id 0 was in the broken run. The single
+  variable is checked rather than asserted: every non-q8_0 tensor prints
+  byte-identical statistics across the two runs and only the two q8_0 mixers
+  moved.
+
+
+  **THE FOUR-TOKEN TRACE, every step coherent.** `thor:gpu0`, fixed tree,
+  `--max-tokens 4`, `DONE rc=0` at 14:51:34. Emitted ` Paris. Paris is`.
+
+  | step | input | top-1 | logit | margin | the rest of the top-5 |
+  |---|---|---|---:|---:|---|
+  | 1 (prefill, T=5) | `The capital of France is` | ` Paris` | 16.427 | 1.279 | ` one`, ` located`, ` known`, ` a` |
+  | 2 | ` Paris` | `.` | 17.989 | 1.083 | `,`, ` (`, `.\n\n`, ` and` |
+  | 3 | `.` | ` Paris` | 14.619 | 0.404 | ` In`, ` It`, ` The`, ` France` |
+  | 4 | ` Paris` | ` is` | 19.383 | 2.971 | ` has`, `,`, ` was`, `'s` |
+
+  Every candidate at every step is grammatically and semantically appropriate to
+  its position -- a place name or a hedge after "France is", punctuation after a
+  proper noun, a sentence opener after a full stop, a verb after a subject. All
+  180 per-layer `streams out` readings across the four steps are `nan=0`. **Peak
+  RSS 89,315,324 kB = 85.18 GiB** (`VmHWM`, polled). This is the model answering
+  the question, and it is the fact O30 exists to establish.
+
+
+  **CONFIRMED ON `dgx:gpu0` (GB10), WITH THE INSTRUMENT OFF.** Run
+  `/mnt/nas_share/rc/glm5-diag/out-fix2-20260830T143718Z`, the fixed tree
+  `d84db105b`, `vllm-cli --device cpu --max-tokens 2`, `VT_GLM5_DIAG` UNSET --
+  the shipped configuration, so no probe can be said to have changed what it
+  measures. Output **` Paris.`**, `rc=0`,
+  `finish_reason=length prompt_tokens=5 completion_tokens=2`. **Peak RSS
+  104,792,300 kB = 99.94 GiB** (`VmHWM`, polled), against the 99.47 GiB the
+  UNFIXED binary read on this same box -- the fix removes about 0.76 GiB of q8_0
+  copies and the mmap pages take their place, so residency is unchanged in
+  practice.
+
+  This is the same box, the same 101.2535 GiB artifact and the same prompt as
+  the W5b-2c run that emitted `!!!!!!!!`. **Before: `!!!!!!!!`. After:
+  ` Paris.`** The `thor:gpu0` runs above supply the mechanism and the per-layer
+  bisect; this one supplies the product claim on the box the row is gated
+  against.
+
+  **AND IT PRICES THE VOID SPEED NUMBER, on one box.** This run generated 2
+  tokens in 390.929 s, **195.5 s/token**, where the all-NaN W5b-2c run on this
+  same box read 73.1 s/token. The broken forward was 2.7x "faster" than the
+  working one. That is consistent with the degenerate-routing account below and
+  settles the only thing that matters about it: 73 s/token was never a
+  measurement of this model, and 195.5 s/token is the first honest one. It is
+  still not a benchmark -- one leg, one concurrency, a host f32 reference that
+  re-decodes every layer each step -- and O6 owns the axis.
+
+  **The box is `thor:gpu0` and NOT `dgx:gpu0`, and that is a real limit on this
+  entry.** Both are aarch64 with i8mm, so both take the repack path and the
+  defect and its repair are the same on each; `dgx:gpu0` was held by another
+  session for the whole diagnostic window. Nothing else differed -- same
+  checkpoint, same prompt, same `--device cpu`, same defaults, no flag or arm
+  changed. The one number that is NOT comparable across the two boxes is peak
+  RSS, because the weights are mmap-resident and `VmHWM` then tracks page-cache
+  eviction pressure rather than a fixed footprint: the same unfixed binary read
+  99.47 GiB on `dgx:gpu0` and 72.05 GiB on `thor:gpu0`. The GB10 confirmation is no longer
+  owed: it is the `out-fix2-20260830T143718Z` run recorded above.
+
+  **A SPEED NUMBER THIS ROW MIGHT OTHERWISE HAVE INHERITED IS VOID, and it is
+  worth more than the repair.** The unfixed forward ran a 45-layer pass in about
+  2.3 minutes and the repaired one takes about 39. The probe is not the cause --
+  the unfixed run printed MORE, at level 2, and was faster. The likely cause is
+  the MoE: with NaN router logits every `>` is false, so the top-k almost
+  certainly selected the SAME 8 of 288 experts at every layer and every token,
+  decoding one hot set out of page cache, while the repaired run selects real,
+  scattered experts and pays cold reads for them. If that holds, EVERY speed
+  number this model has produced, including the 73 s/token of the W5b-2c run,
+  came from an all-NaN forward with degenerate expert selection and measures
+  nothing about this model. O6 already claims no speed number, so nothing
+  published depends on it. Recorded as a hypothesis with its reasoning rather
+  than as a measurement, and owed to whoever opens O6.
+
+  **NOT REPAIRED, and it is the part with teeth.** CI HAS an aarch64 lane,
+  `build-test-cpu-arm64` on `ubuntu-24.04-arm`, and it builds **no glm5 target**
+  (`grep -c glm5` over the job is 0): its list is `test_cpu_isa_arm`,
+  `test_ops_matmul_elem`, `test_ops_quant_dot`, `test_ops_quant_repack` and nine
+  tokenizer targets. The miniature WOULD have caught this there — its three
+  stacked expert banks are written at Q8_0 and load as `N = kExperts * kMoeI =
+  128`, `K = kH = 32`, both repack-eligible, and
+  `test_glm5_next_bridge`'s "the BLOCK-QUANT residency decodes" case asserts
+  decoded VALUES against `Q8_0ValueAt` rather than a shape. Adding the target is
+  not a one-line change to make blind: that lane builds only small targets at
+  `-j 2` and `test_glm5_next_bridge` links the whole library, so its build
+  budget has to be MEASURED before the target is added, and it cannot be
+  measured while the forge is unreachable. Owed as its own row with a measured
+  CI run behind it.
+
 ## Now
+
+`ACTIVE`, 2026-08-30. **The engine's guard above this model's forward no longer
+refuses it.** W5b-2c ([#2348](https://github.com/mudler/vllm.cpp/issues/2348),
+`CLAIM-GLM53-FLASH-W5B2C`) writes the consuming forward O28 measured the absence
+of: `ForwardGlm5NextForConditionalGeneration` maps the engine's layer-name-keyed
+`MultiKvCacheIndex` onto the three groups `MakeGlm5NextKVCache` publishes and
+hands `TextModelForward` a real `std::vector<LayerCache>`, hydrated from the
+engine's paged buffers and written back into them. The row's lifecycle state
+does not move, because O1 does not.
+
+**The mapping is the work, and O29 records it rather than leaving the next
+reader to re-derive it.** The three counts in O28's refusal are three different
+denominators: three published GROUPS, twenty-two caches in `attn_kv` (one per
+published NAME of every ATTENTION group, 11 latents plus 11 indexer caches, the
+34-layer recurrent group contributing none because it lands on `gdn_state`), two
+distinct groups among those 22, and block tables gathered per GROUP ID for all
+three. Every attention cache is resolved BY NAME through
+`MultiKvCacheIndex::Find` and its group id is read off the channel; the
+recurrent group carries no names at all, so its correspondence is positional and
+a count against `num_kda_layers()` is the only check there is, which is stated
+rather than hidden.
+
+**GROUP 0 IS AN MLA LATENT AND NOT A K+V PAIR**, and that is the one error here
+that produces a fluent wrong model instead of a crash. `num_kv_heads != 1` and a
+`head_size` that is not the published row are refused by name, and the row's
+page arithmetic is cross-checked against the engine's own
+`attn_meta.slot_mapping`, so a misread block table is a refusal on the first step
+rather than a wrong token on every step after it.
+
+**A sentence W5b-2b landed is retired.** The forward did not "re-run the whole
+prefix each step": `ModelForwardInput::token_ids` is the step's SCHEDULED
+tokens, so on the second step of a decode it is ONE id, and a forward that treats
+it as a sequence attends to an empty prefix. Nemotron-H and Kimi-Linear carry the
+same defect and this row does not inherit it.
+
+**Gated:** `prefill(5) + continue(3)` through `ModelRegistry::Forward` agrees
+with the one-shot forward over the same eight tokens EXACTLY on an f32 cache,
+and nine negative mutations all kill their gate — including the reachability one
+`.agents/reachability.md` asks for and a restoration of the unconditional W3
+guard, which reds 18 of 23 cases. What the fixture CANNOT see is recorded in
+O29: at `hidden_size` 32 a wrong prompt moves the tail logits by two ULP, so the
+bf16 case asserts a one-ULP bound and nothing about discrimination.
+
+The next actions are W6 (the vision tower, processor and placeholder expansion),
+W7b (the first fitting artifact, whenever the developer grants a large-asset
+download), and the two narrow debts O27 and O29 both name: ragged batching and
+the device arm.
+
+### Before W5b-2c
 
 `ACTIVE`, 2026-08-30. **`ModelRegistry::Forward` reaches this model.** W5b-2b
 ([#2337](https://github.com/mudler/vllm.cpp/issues/2337), split out of

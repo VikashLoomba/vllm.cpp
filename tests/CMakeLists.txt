@@ -1726,6 +1726,20 @@ target_include_directories(test_resident_weight_host_addressable PRIVATE ${CMAKE
 # singleton, so a case asking that question must run before anything ends a step.
 vllm_cpp_add_test(test_expert_stream_steps vllm/model_executor/test_expert_stream_steps.cpp)
 target_include_directories(test_expert_stream_steps PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MODEL-TEXT-GLM-MOE-DSA W3 (#2214): G3 on a model with MORE THAN 4 experts and
+# MORE THAN 4 layers, which is the bound `expert-streaming.md` `## Owed` records
+# against every fixture this row inherited. Its own binary because the wider
+# model needs a larger VT_MOE_EXPERT_STREAM_SLOTS than test_expert_stream_wiring
+# sets, and that knob is read once into a function-local static behind a
+# process-lifetime singleton.
+vllm_cpp_add_test(test_expert_stream_wide_logits
+  vllm/model_executor/test_expert_stream_wide_logits.cpp)
+target_include_directories(test_expert_stream_wide_logits PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the LOAD-TIME slot-capacity refusal. Pure
+# arithmetic over the shared seam, so it needs neither a forward nor the
+# environment latch its siblings above are separated by.
+vllm_cpp_add_test(test_expert_stream_capacity
+  vllm/model_executor/test_expert_stream_capacity.cpp)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.
@@ -3494,3 +3508,42 @@ vllm_cpp_add_test(test_qwen4_exp_ple_gate vllm/models/test_qwen4_exp_ple_gate.cp
 # translation unit reaching the definition only through the new public header.
 # No src/ grant — the whole point is that the header is public.
 vllm_cpp_add_test(test_qwen3_5_mrope vllm/models/test_qwen3_5_mrope.cpp)
+
+# GLM-5.3 (`GlmMoeDsaForCausalLM`) W2 -- the config, the registration, the
+# `glm-dsa` GGUF arm and the refuse-by-name forward (#2214, spec
+# `.agents/specs/glm-dsa-latest-deepseek.md` §3.7). The suite reads the
+# COMMITTED `zai-org/GLM-5.3` config.json (`vllm/models/glm_moe_dsa_config_glm53.inc`,
+# revision `935644c05e76fc198714f4cca449fd8b970ff6d7`) so the three-way indexer
+# schedule agreement is gated with no asset, and it enters through
+# `LoadedEngine::FromModelDir` so the registration and the dispatch-table row
+# are gated as REACHED rather than merely present.
+vllm_cpp_add_test(test_glm_moe_dsa_config vllm/models/test_glm_moe_dsa_config.cpp)
+target_include_directories(test_glm_moe_dsa_config PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# W4: the heterogeneous indexer schedule, the `skip_topk` selection reuse and the
+# fp32 router gate GEMM. It reads the SAME committed `config.json` fixture the
+# W2 suite does, so the 21/57 split it asserts is the checkpoint's own and not a
+# literal, and it drives `mla::ForwardMlaAttentionBlock` on a sparse step —
+# which nothing else in `tests/` does outside the dots3-note model forward.
+vllm_cpp_add_test(test_glm_moe_dsa_schedule vllm/models/test_glm_moe_dsa_schedule.cpp)
+target_include_directories(test_glm_moe_dsa_schedule PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# W7 / G2: the structural loader gate. Two cases run with no artifact (the claim
+# set against the checkpoint's own committed config.json); the third reads the
+# six real UD-IQ1_S shard HEADERS and is skipped unless VT_GLM_DSA_GGUF names
+# shard 1. Spec `.agents/specs/glm-dsa-latest-deepseek.md` §3.6 G2.
+vllm_cpp_add_test(test_glm_moe_dsa_gguf_census
+  vllm/models/test_glm_moe_dsa_gguf_census.cpp)
+target_include_directories(test_glm_moe_dsa_gguf_census PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# W7: the load itself, on a COMPLETE synthetic `glm-dsa` GGUF with the same
+# structure as the 201.83 GiB artifact -- heterogeneous indexer schedule, a
+# leading dense block, stacked keep-quant towers and an MTP tail to drop. Enters
+# through `LoadedEngine::FromModelDir`, which is the reachability proof.
+vllm_cpp_add_test(test_glm_moe_dsa_gguf_load
+  vllm/models/test_glm_moe_dsa_gguf_load.cpp)
+target_include_directories(test_glm_moe_dsa_gguf_load PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)

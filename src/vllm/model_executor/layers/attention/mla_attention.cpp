@@ -373,7 +373,8 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
                               const Tensor& hidden, const Tensor& positions,
                               Tensor& kv_cache, const Tensor& slot_mapping,
                               const MlaBlockMetadata& meta, v1::TritonMLAImpl& impl,
-                              Tensor& out, MlaSharedSelection* shared) {
+                              Tensor& out, Tensor* attn_pre_o_proj,
+                              MlaSharedSelection* shared) {
   dims.Validate();
   // ─── dots3-note's headwise gate: PRECONDITIONS, checked at ENTRY ─────────
   // Both are properties of the CONFIG and the WEIGHT, knowable before any op
@@ -1062,6 +1063,38 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   }
 
   // ─── 6. o_proj (deepseek_v2.py:526; mla.py:181) ──────────────────────────
+  //
+  // OPTIONAL, because not every MLA model HAS a dense output projection
+  // (KV-DSV4-MULTICACHE W5, #2323). DeepSeek-V4's output side is a grouped LoRA
+  // -- `wo_a` as a block-diagonal bmm, then `wo_b` -- and flattening that into a
+  // `[hidden, num_heads*v_head_dim]` matrix would reproduce the arithmetic while
+  // discarding the whole saving the factorization exists for.
+  //
+  // THIS MIRRORS UPSTREAM RATHER THAN DIVERGING FROM IT.
+  // `DeepseekV4Attention.forward` (`attention.py:345-391`) fills `o_padded` via
+  // `attention_impl(...)`, slices it, and only THEN calls a separate,
+  // platform-specific `self._o_proj(o, positions)`. Attention and the projection
+  // are distinct steps upstream; this block had fused them.
+  //
+  // Given `attn_pre_o_proj`, the block writes the attention output
+  // `[T, num_heads*v_head_dim]` there and returns, and the caller applies its own
+  // projection. `o_proj` is then NOT required -- which is the point, since a
+  // model routed this way does not have one.
+  //
+  // NULL for every existing caller, so Kimi-Linear and dots3-note take the fused
+  // path unchanged and are byte-identical.
+  if (attn_pre_o_proj != nullptr) {
+    // A RAW BYTE COPY, not a cast. `vt::CastF32`/`CastBf16` are CONVERTERS and
+    // refuse a same-dtype input ("cast_f32: in must be bf16"), which is what the
+    // first draft of this hit. Both tensors are contiguous `[T, N*V]` in the
+    // block's own dtype, so the transfer is exact by construction and carries no
+    // rounding of its own.
+    const int64_t nv = dims.num_heads * dims.v_head_dim;
+    const size_t bytes =
+        static_cast<size_t>(T) * static_cast<size_t>(nv) * vt::SizeOf(dt);
+    d.b.Copy(d.q, attn_pre_o_proj->data, attn_flat.data, bytes);
+    return;
+  }
   RequireWeight(w.o_proj, "o_proj");
   vt::MatmulBT(d.q, out, attn_flat, w.o_proj);
 }

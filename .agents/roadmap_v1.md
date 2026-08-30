@@ -28,7 +28,7 @@ accumulated here through 2026-08-03 is archived verbatim at
 
 ## Open issues
 
-The intake surface moved to [`issue-index.md`](issue-index.md). It is
+The intake surface moved to [`issue-index.md`](completed/issue-index.md). It is
 append-only and carries `merge=union`, because a table every pull request
 writes is a lock when it lives beside keyed records. The portfolio table below
 remains the ordering surface, and it remains a keyed record: update in place,

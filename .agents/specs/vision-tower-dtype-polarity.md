@@ -2,7 +2,7 @@
 
 Issue: [#1359](https://github.com/mudler/vllm.cpp/issues/1359).
 Row: `ENG-MM-INPUT-PIPELINE` ([engine-matrix.md](../engine-matrix.md)).
-Index: [`issue-index.md`](../issue-index.md) line 649.
+Index: [`issue-index.md`](../completed/issue-index.md) line 649.
 Sibling spec: [`multimodal-track.md`](multimodal-track.md) §1.5 L3 owns the
 tower-SKIP measurement; this spec owns the tower's storage DTYPE. §8 below
 states exactly what this row makes stale over there.

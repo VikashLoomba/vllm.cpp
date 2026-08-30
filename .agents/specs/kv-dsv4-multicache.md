@@ -766,6 +766,34 @@ than a record (#2302's wrong dependency; "from scratch" versus an existing seam;
 the `o_proj` requirement; and now the block versus the op). Each move made the
 work smaller.
 
+##### W5-7a. Step one in detail: the latent write needs no new op and no copy
+
+`vt::ConcatAndCacheMla(q, kv_c, k_pe, kv_cache, slot_mapping)` already expresses
+V4's cache write exactly, and the mapping is worth writing down because it is not
+obvious from the names:
+
+| the op wants | V4 supplies |
+|---|---|
+| `kv_c [num_tokens, kv_lora_rank]` | the latent's first **448** columns (nope/v) |
+| `k_pe [num_tokens, qk_rope_head_dim]` | the latent's last **64** columns (rope) |
+| `kv_cache [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]` | `head_dim == 512` |
+| `slot_mapping [num_slots] i64` | from the runner's metadata |
+
+**And it needs no copy.** The op's own contract says indexing is driven by the
+tensor STRIDES -- "a strided cache view or a split-projection source view is
+handled without a copy" -- so V4's CONTIGUOUS `[T, 512]` deck is passed as two
+views over the same buffer: offset 0 width 448, and offset 448 width 64, both
+with row stride 512. Nothing is materialized to split nope from rope.
+
+**One constraint to respect rather than discover.** The op takes the "auto" path
+only: the cache dtype must equal `kv_c`'s, and the `fp8_ds_mla` and int4 layouts
+are REFUSED loudly rather than silently mis-written. V4's published compressed
+latent is `fp8_ds_mla` at 584 B/token (`## The geometry`), so step one lands on
+the plain arm first and the fp8 layout is a later wave -- `KV-DSV4-MULTICACHE`
+already lists it, and this is where the two meet.
+
+So step one is a call, two views and a dtype check, not a kernel.
+
 #### W5-8. Gate
 
 Red-first, on CPU at a synthetic config:

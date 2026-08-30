@@ -821,6 +821,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/glm5_next_kv.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
   src/vllm/model_executor/models/glm_moe_dsa.cpp
+  src/vllm/model_executor/models/glm_moe_dsa_loader.cpp
   src/vllm/model_executor/models/glm_moe_dsa_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp

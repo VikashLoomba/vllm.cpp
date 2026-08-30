@@ -62,22 +62,15 @@ std::unique_ptr<LoadedModel> LoadGlmMoeDsaForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
   if (source.kind != ModelSource::Kind::kSafetensors) {
-    // The GGUF arm: the config is resolved, and no tensor is read. W7 owns the
-    // materialization (the streamed expert towers and the first load); until it
-    // lands the refusal names the wave rather than letting a caller believe a
-    // 201.83 GiB model quietly loaded.
-    (void)registration;
-    (void)source;
-    const GlmMoeDsaParams params = ParseGlmMoeDsaParams(config);
-    (void)params;
-    throw std::runtime_error(
-        "Model architecture GlmMoeDsaForCausalLM parses its `glm-dsa` GGUF "
-        "config but loads no weight yet: the streamed expert towers, the slot "
-        "cache and the first load are W7 of "
-        ".agents/specs/glm-dsa-latest-deepseek.md §3.7 (issue #2214), and the "
-        "target arm additionally needs the `IQ4_XS` keep-quant `vec_dot` of W1 "
-        "(spec O2, row QUANT-GGUF-IQ4_XS) or it expands four expert towers "
-        "from 6.375 GiB to 24.000 GiB and drops out of the streaming lane.");
+    // The GGUF arm, W7. `ModelSource::FromGguf` is the only producer of a
+    // non-safetensors source here, so `source.gguf` is the file the entrypoint
+    // opened -- split-aware, so one `GgufFile` sees all six shards.
+    VT_CHECK(source.gguf != nullptr,
+             "GlmMoeDsaForCausalLM: a non-safetensors ModelSource carried no "
+             "GgufFile");
+    return std::make_unique<GlmMoeDsaLoadedModel>(
+        registration, LoadGlmMoeDsaFromGguf(*source.gguf, config,
+                                            /*policy=*/nullptr));
   }
   (void)registration;
   throw std::runtime_error(GlmMoeDsaSafetensorsRefusal());

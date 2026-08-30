@@ -32,10 +32,12 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"  // GgufLoadPolicy
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/mla_attention.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, ForwardLogits
+#include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
 #include "vllm/v1/kv_cache_interface.h"
@@ -211,12 +213,135 @@ HfConfig GlmMoeDsaHfConfigFromGguf(const GgufFile& gguf);
 v1::KVCacheConfig MakeGlmMoeDsaKVCache(const HfConfig& config, int block_size,
                                        int num_blocks);
 
-// The weights this model would carry. W2 loads none: the struct exists so the
-// registry's `LoadedModel` subclass has something to hold and so the shape of
-// what W7 fills is visible.
+// ─── W7: the weights, and the two classes the artifact splits into ───────────
+//
+// The split is the GGUF tensor NAME, and it is the streamer's own admission
+// rule: `_exps.weight` (`model_loader.cpp:2486`, `kStreamedExpertSuffix`). On
+// `unsloth/GLM-5.3-GGUF UD-IQ1_S` that draws the line exactly where §3.3
+// predicts — 228 stacked `[256, out, in]` towers at 187.312 GiB against 1581
+// per-layer tensors at 14.511 GiB, both reproduced from the six shard headers
+// by `tests/vllm/models/test_glm_moe_dsa_gguf_census.cpp`.
+
+// The DSA lightning indexer of ONE `kFull` layer. Absent on a `kShared` layer,
+// which runs no indexer at all and attends through the preceding full layer's
+// selection (`vllm/model_executor/layers/mla.py:180`).
+//
+// THE PUBLISHED FILE SHIPS THESE ON ALL 79 BLOCKS AND ONLY 22 ARE REAL. The
+// conversion broadcast the shared layers' weights (spec D3), so the loader
+// reads the schedule and drops the surplus rather than believing the file —
+// which is upstream's own posture at `deepseek_v2.py:1566-1582`.
+struct GlmMoeDsaIndexerWeights {
+  OwnedTensor wq_b;           // [index_n_heads * index_head_dim, q_lora_rank]
+  OwnedTensor wk;             // [index_head_dim, hidden_size]
+  OwnedTensor k_norm_weight;  // [index_head_dim]
+  // The BIAS is what makes this a LayerNorm rather than an RMSNorm
+  // (`deepseek_v2.py:803-842`; ours `mla_attention.cpp:663-664`, eps 1e-6), so
+  // it is required rather than optional: a file without it describes a
+  // different operator.
+  OwnedTensor k_norm_bias;  // [index_head_dim]
+  // `nn.Linear(hidden_size, n_heads)` — one row per INDEXER head (32), not per
+  // MLA head (64). The published file stores it F32 and it stays F32.
+  OwnedTensor weights_proj;  // [index_n_heads, hidden_size]
+  bool Empty() const { return wq_b.Empty(); }
+};
+
+// One layer's MLA operands, in the file's own orientation.
+//
+// `attn_k_b` / `attn_v_b` ARRIVE ALREADY ABSORBED. llama.cpp's DeepSeek
+// converter splits `kv_b_proj` into the two halves and transposes `k_b`, so
+// there is no `AbsorbKvBProjBf16` at load on this arm — unlike the safetensors
+// DeepSeek-V2 path (`deepseek_v2_weights.cpp:138-153`). The two are NOT the
+// same shape even though `qk_nope_head_dim` and `v_head_dim` are both 256 on
+// this checkpoint: `[64, 512, 192]` against `[64, 256, 512]`.
+struct GlmMoeDsaMlaWeights {
+  OwnedTensor q_a_proj;            // [q_lora_rank, hidden]
+  OwnedTensor q_a_layernorm;       // [q_lora_rank]
+  OwnedTensor q_b_proj;            // [heads * (qk_nope + qk_rope), q_lora_rank]
+  OwnedTensor kv_a_proj_with_mqa;  // [kv_lora_rank + qk_rope, hidden]
+  OwnedTensor kv_a_layernorm;      // [kv_lora_rank]
+  OwnedTensor k_b_proj;            // [heads, kv_lora_rank, qk_nope]
+  OwnedTensor v_b_proj;            // [heads, v_head_dim, kv_lora_rank]
+  OwnedTensor o_proj;              // [hidden, heads * v_head_dim]
+  GlmMoeDsaIndexerWeights indexer;  // populated on a `kFull` layer only
+};
+
+// A SwiGLU MLP: the three leading dense layers, and every MoE layer's shared
+// expert. The shared expert is `moe_intermediate_size * n_shared_experts`
+// (2048), NOT `intermediate_size` (12288, what blocks 0-2 use).
+struct GlmMoeDsaMlpWeights {
+  OwnedTensor gate_proj;  // [inter, hidden]
+  OwnedTensor up_proj;    // [inter, hidden]
+  OwnedTensor down_proj;  // [hidden, inter]
+  bool Empty() const { return gate_proj.Empty(); }
+};
+
+// One MoE layer.
+//
+// THE THREE TOWERS ARE STACKED AND STAY STACKED, and that is the whole reason
+// this model is loadable at all. DeepSeek-V2 holds `std::vector<OwnedTensor>`
+// per expert (`deepseek_v2.h:250-259`), which at 256 experts x 75 layers x 3
+// is 57,600 host tensors and no streaming source. Only the stacked keep-quant
+// form reaches `expert_stream::ExpertSlice`, because a slice of it is a pure
+// byte offset over whole rows of the same K (`gguf_expert_span.h:11-16`).
+struct GlmMoeDsaMoeWeights {
+  OwnedTensor router;                   // f32 [n_routed_experts, hidden]
+  OwnedTensor e_score_correction_bias;  // f32 [n_routed_experts]
+  OwnedTensor gate_exps;  // [E, moe_inter, hidden], held flat as [E*out, K]
+  OwnedTensor up_exps;    // [E, moe_inter, hidden]
+  OwnedTensor down_exps;  // [E, hidden, moe_inter]
+  GlmMoeDsaMlpWeights shared;
+  bool Empty() const { return router.Empty(); }
+};
+
+struct GlmMoeDsaLayerWeights {
+  OwnedTensor input_layernorm;           // [hidden]
+  OwnedTensor post_attention_layernorm;  // [hidden]
+  GlmMoeDsaMlaWeights attn;
+  bool is_moe = false;
+  GlmMoeDsaMlpWeights dense;  // populated iff !is_moe
+  GlmMoeDsaMoeWeights moe;    // populated iff  is_moe
+};
+
+// The loaded model.
 struct GlmMoeDsaWeights {
   GlmMoeDsaParams params;
+  OwnedTensor embed_tokens;  // [vocab, hidden]
+  OwnedTensor final_norm;    // [hidden]
+  // NOT tied on this checkpoint: the file ships `output.weight` beside
+  // `token_embd.weight`, both Q4_K. The tie is read OFF THE FILE rather than
+  // out of the config, because the config's `tie_word_embeddings` describes the
+  // source checkpoint and a converter is free to materialize either shape.
+  OwnedTensor lm_head;             // [vocab, hidden]; empty only when tied
+  OwnedTensor rope_cos_sin_cache;  // bf16 [rows, qk_rope_head_dim]
+  std::vector<GlmMoeDsaLayerWeights> layers;  // num_hidden_layers, MTP excluded
+
+  // Structural accounting, so a load that silently skipped a tensor is visible
+  // rather than inferred from a green suite. `accounted + dropped` must equal
+  // the file's own tensor count; the load refuses when it does not.
+  int64_t file_tensors = 0;
+  int64_t accounted_tensors = 0;
+  // Block 78 is the multi-token-prediction block. It is READ, COUNTED and
+  // DROPPED, which is what `allow_mtp_tail` means here (spec O5); there is no
+  // MTP drafter in this tree.
+  int64_t mtp_block_tensors_dropped = 0;
+  // The `indexer.*` tensors the conversion broadcast onto `kShared` blocks.
+  // Counted as dropped rather than ignored, because the count is what makes
+  // spec D3 executable: 57 shared backbone layers x 5 tensors = 285.
+  int64_t broadcast_indexer_tensors_dropped = 0;
 };
+
+// Load the `glm-dsa` GGUF arm. `policy` may be null, in which case the process
+// policy is read from the environment. Throws `std::runtime_error` by name on
+// every tensor this port cannot serve.
+GlmMoeDsaWeights LoadGlmMoeDsaFromGguf(const GgufFile& gguf,
+                                       const HfConfig& config,
+                                       const GgufLoadPolicy* policy);
+
+// Every tensor name this port CLAIMS for a given config. Exposed so the census
+// gate can assert the claim set against the real shard headers without loading
+// 201.83 GiB, which is the only way that assertion runs in CI.
+std::vector<std::string> EnumerateGlmMoeDsaGgufTensors(
+    const GlmMoeDsaParams& params);
 
 // The forward, REFUSE-by-name. Both entry points list every missing primitive.
 class GlmMoeDsaModel {

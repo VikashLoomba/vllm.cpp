@@ -367,14 +367,39 @@ TEST_CASE("glm_moe_dsa: a non-`glm_moe_dsa` model_type is refused by name") {
 
 TEST_CASE("glm_moe_dsa: the forward refusal NAMES each missing primitive") {
   const std::string msg = vllm::GlmMoeDsaForwardRefusal();
+  // What is STILL missing, and only that. Two primitives, each with the record
+  // that owns it.
   for (const char* needle :
-       {"indexer KV side cache", "DeepseekV32IndexerCache", "expert-streaming",
-        "sparse prefill", "MlaPrefillAttention", "selection-reuse", "IQ4_XS",
-        "streamed towers", "fp32 router", "#1925", "W1", "W3", "W4", "W5", "W6",
-        "W7", "§3.7", ".agents/specs/glm-dsa-latest-deepseek.md"}) {
+       {"indexer KV side cache", "DeepseekV32IndexerCache",
+        "!elig.prunes || elig.Active()", "sparse prefill",
+        "MlaPrefillAttentionArgs", "MlaPrefillAttention", "#1925", "#2323",
+        "W6", "W7", "§3.7", ".agents/specs/glm-dsa-latest-deepseek.md"}) {
     CAPTURE(needle);
     CHECK(msg.find(needle) != std::string::npos);
   }
+
+  // AND WHAT IT MUST NO LONGER NAME. This half is the point of the case: W2
+  // wrote a seven-item list and four items have since landed, so a refusal that
+  // still named them would send its reader looking for work that is done. Each
+  // needle below is a thing this build HAS, and the assertion is that the
+  // message stopped claiming otherwise.
+  //
+  //   `IQ4_XS`      -> `VecDotIQ4_XSQ8_K`, `2e9f4d88d` (spec O2, DISCHARGED)
+  //   `qwen3_5.cpp` -> the seam is `expert_stream_seam.{h,cpp}` (spec O8)
+  //   `selection-reuse` / `mla.py:180` -> `GlmMoeDsaMlaSchedule` (W4)
+  //   `fp32 router` -> `deepseek_v2.cpp:363` reads `router_dtype_is_f32`
+  //   `1147-1180`   -> the wrong `dots3_note_device.cpp` range (spec O20)
+  for (const char* stale :
+       {"IQ4_XS", "welded", "selection-reuse", "fp32 router GEMM", "1147-1180",
+        "QUANT-GGUF-IQ4_XS"}) {
+    CAPTURE(stale);
+    CHECK(msg.find(stale) == std::string::npos);
+  }
+
+  // The loader is no longer owed, and the message says so rather than staying
+  // silent about the half of W7 that landed.
+  CHECK(msg.find("loader IS implemented") != std::string::npos);
+
   // And it is what the forward actually raises, both arms.
   vllm::GlmMoeDsaWeights weights;
   vllm::v1::CommonAttentionMetadata meta;
@@ -531,10 +556,20 @@ TEST_CASE(
   // NOT the registry's unsupported-architecture message: `GlmMoeDsaForCausalLM`
   // resolved from the config the builder synthesized.
   CHECK(msg.find("are not supported for now") == std::string::npos);
-  // It got all the way to this architecture's own loader, which names W7.
-  CHECK(msg.find("GlmMoeDsaForCausalLM") != std::string::npos);
-  CHECK(msg.find("W7") != std::string::npos);
-  CHECK(msg.find("#2214") != std::string::npos);
+  // IT REACHED THE WEIGHT LOADER. W2 asserted the loader's refusal text here,
+  // because at W2 the GGUF arm's whole body was a `throw` naming the wave. W7
+  // replaced that throw with `LoadGlmMoeDsaFromGguf`, so what this header-only
+  // fixture now produces is the loader asking for the second tensor it needs
+  // and not finding it — which is a STRICTLY DEEPER reach than W2 could prove,
+  // and still fails if either the `kGgufArchArms` row or the
+  // `REGISTER_VLLM_MODEL` line is removed.
+  //
+  // The complete-model load, with every tensor present and the accounting
+  // asserted, is `test_glm_moe_dsa_gguf_load.cpp`. This case keeps the narrow
+  // question — does a `glm-dsa` header reach this architecture at all — because
+  // that is the one a fixture without weights can answer.
+  CHECK(msg.find("no tensor named") != std::string::npos);
+  CHECK(msg.find("output_norm.weight") != std::string::npos);
 }
 
 TEST_CASE("glm_moe_dsa GGUF: the header builds the config the config.json does") {

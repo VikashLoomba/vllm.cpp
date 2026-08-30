@@ -1100,15 +1100,15 @@ TEST_CASE("glm5_next W5b-2c: a HISTORY the engine does not believe in is refused
 TEST_CASE("glm5_next W5b-2c: ModelRegistry::Forward NARROWS its refusal, not drops it") {
   // The W3 guard (#2068) refused ANY keyed cache set. This row's forward
   // declares that it consumes one; every other model still inherits
-  // `consumes_multi_kv_cache == false` and is still refused with the same
+  // `consumes_multi_kv == false` and is still refused with the same
   // message, which is what keeps the narrowing from being a removal.
   const std::vector<std::string> archs{"Glm5NextForConditionalGeneration"};
   const vllm::ModelRegistration& reg = vllm::ModelRegistry::Resolve(archs);
   REQUIRE(reg.factory != nullptr);
-  CHECK(reg.factory->consumes_multi_kv_cache);
+  CHECK(reg.factory->consumes_multi_kv);
 
   const std::vector<std::string> dsv4_archs{"DeepseekV4ForCausalLM"};
   const vllm::ModelRegistration& dsv4 = vllm::ModelRegistry::Resolve(dsv4_archs);
   REQUIRE(dsv4.factory != nullptr);
-  CHECK_FALSE(dsv4.factory->consumes_multi_kv_cache);
+  CHECK_FALSE(dsv4.factory->consumes_multi_kv);
 }

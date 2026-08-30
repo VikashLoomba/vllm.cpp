@@ -1647,6 +1647,8 @@ vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
 vllm_cpp_add_test(test_weight_residency_config
   vllm/config/test_weight_residency_config.cpp)
 
+vllm_cpp_add_test(test_multi_kv_refusal
+  vllm/model_executor/test_multi_kv_refusal.cpp)
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 

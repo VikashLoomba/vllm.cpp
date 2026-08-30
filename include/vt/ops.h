@@ -1855,6 +1855,26 @@ struct MlaDecodeAttentionArgs {
   // so a windowed layer carries no indexer at all.
   const Tensor* topk_indices = nullptr;
   const Tensor* valid_counts = nullptr;
+  // PER-HEAD ATTENTION SINK — `[num_heads]` f32, or null.
+  //
+  // A sink is one extra logit that contributes to the softmax DENOMINATOR ONLY:
+  // it removes probability mass from the row without contributing a value, so a
+  // row can attend to "nothing" (`vllm/models/deepseek_v4/attention.py:218-222`;
+  // this tree's host reference is `SoftmaxWithSink`,
+  // `src/vllm/model_executor/models/deepseek_v4_dsa.cpp:121-139`).
+  //
+  // NULL BY DEFAULT, so every existing caller -- Kimi-Linear, dots3-note,
+  // MiniCPM3, DeepSeek-V2 -- is BIT-IDENTICAL: the online softmax seeds `m` at
+  // `-inf` and `l` at 0 exactly as it did before. Present, it seeds `m` at the
+  // head's sink and `l` at 1 (`exp(sink - sink)`), which is the same arithmetic
+  // the host reference does in its two-pass form.
+  //
+  // WHERE A SPLIT KERNEL MUST PUT IT. A CUDA implementation that splits the KV
+  // over `num_kv_splits` must add the sink in the FINAL reduction, not per
+  // split, or it is counted once per split instead of once per row. At
+  // `num_kv_splits == 1` both placements agree, so a gate that only ran the
+  // batch-invariant path would pass a kernel that is wrong everywhere else.
+  const Tensor* attn_sink = nullptr;
 };
 
 // Arguments for vt::DsaIndexerLogits (dots3-note W4b-3c, #699). The two

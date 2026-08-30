@@ -428,6 +428,20 @@ struct MultiKvCacheIndex {
                                                  int* num_cols) const;
 };
 
+// KV-DSV4-MULTICACHE W5 (#2323): does a name-keyed cache set reaching this model
+// have to be REFUSED?
+//
+// A PURE PREDICATE, deliberately, and this row has the precedent: W1 made the
+// staging budget a pure function "so it is gateable without a device". The same
+// applies here -- the decision is gateable without a model, a runner or a
+// registry, so both polarities can be pinned directly instead of only through a
+// full engine construction.
+//
+// True when a set arrived (`mk != nullptr`) and the registration has not claimed
+// it. Note it reads NULLNESS for arrival: an EMPTY set that arrived is still an
+// arrival, and the refusal's message reads the payload so it can say so.
+bool MultiKvRefusalApplies(const MultiKvCacheIndex* mk, bool consumes_multi_kv);
+
 // One MRV2 forward invocation. References stay valid for the duration of the
 // registered forward hook; model-specific decode-graph state lives in the
 // concrete LoadedModel rather than leaking concrete weight types into runner.
@@ -560,6 +574,23 @@ struct ModelFactory {
   // `gguf_keep_quant.cpp`, expressed at run time because there is no enum to
   // switch over.
   bool supports_weight_offload = false;
+  // KV-DSV4-MULTICACHE W5 (#2323): whether THIS model's forward consumes a cache
+  // set keyed by LAYER NAME (`ModelForwardInput::multi_kv`) instead of the
+  // positional `attn_kv` convention.
+  //
+  // THE DEFAULT IS FALSE, AND THAT IS THE MECHANISM, exactly as it is for
+  // `supports_weight_offload` above. W3 made the runner allocate every published
+  // cache and hand them over keyed by name; a model whose forward does not know
+  // what to do with that set would otherwise DISCARD an allocated topology in
+  // silence and decode by recomputing the whole prefix -- a wrong-answer-not-a-
+  // crash, and one a token gate cannot see, because the tokens stay right while
+  // the decode does asymptotically more work.
+  //
+  // So `ModelRegistry::Forward` refuses a name-keyed set that reaches a model
+  // which has not claimed it, naming the architecture, and a NEW model inherits
+  // false and is refused until someone wires it. That polarity is the whole
+  // point: the failure it prevents is invisible, so it must be opt-in.
+  bool consumes_multi_kv = false;
   // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124): whether THIS model's forward
   // reads its routed-expert weights through the expert-stream slot seam
   // (`KqExpertSlice`), so the stacked `*_exps.weight` towers are served a slice
@@ -610,7 +641,6 @@ struct ModelFactory {
   // DeepSeek-V4 keeps the default: `DeepseekV4Model::Forward` still opens with
   // `(void)attn_kv;` and row KV-DSV4-MULTICACHE W5 (#1925) owns its consuming
   // forward.
-  bool consumes_multi_kv_cache = false;
 };
 
 struct ModelRegistration {

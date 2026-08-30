@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vt/dtype.h"  // VT_CHECK
@@ -246,6 +247,23 @@ GlmMoeDsaParams ParseGlmMoeDsaParams(const HfConfig& config) {
   p.rms_norm_eps = config.rms_norm_eps;
   p.max_position_embeddings = config.max_position_embeddings;
   p.rope_theta = config.rope_theta;
+  // W4 (#2214) closes a hole W2 left and W4 is the first wave that would fall
+  // into it. `MlaAttentionScale` (`mla_attention.cpp:320-325`) multiplies the
+  // softmax scale by `yarn_get_mscale(factor, mscale_all_dim)` SQUARED whenever
+  // a YaRN factor is present, and `ParseGlmMoeDsaParams` reads no factor at all
+  // — so a YaRN checkpoint resolving through here would silently get the plain
+  // `qk_head_dim ** -0.5`, which is a WRONG attention scale that no structural
+  // gate would notice. GLM-5.3 ships `rope_parameters: {"rope_type": "default"}`
+  // (revision `935644c05e76fc198714f4cca449fd8b970ff6d7`), so the value this
+  // port needs is the plain one; refusing anything else keeps that a measured
+  // fact about this checkpoint rather than an assumption about the family.
+  if (config.rope_parameters.rope_type != "default") {
+    Refuse("rope_parameters.rope_type is '" + config.rope_parameters.rope_type +
+           "'; this port resolves the MLA softmax scale as `qk_head_dim ** -0.5` "
+           "and reads no YaRN factor, so a scaled rope would silently get the "
+           "unscaled mscale^2 correction (deepseek_v2.py:1053-1058, "
+           "MlaAttentionScale). GLM-5.3 ships 'default'");
+  }
   if (p.num_hidden_layers <= 0) {
     Refuse("num_hidden_layers is " + std::to_string(p.num_hidden_layers) +
            "; every per-layer schedule below is sized from it");
@@ -447,10 +465,120 @@ GlmMoeDsaParams ParseGlmMoeDsaParams(const HfConfig& config) {
   return p;
 }
 
+// ─── W4: the heterogeneous per-layer MLA schedule ────────────────────────────
+// Upstream never builds a schedule OBJECT. It constructs one
+// `DeepseekV2MLAAttention` per layer and decides that layer's shape inside the
+// constructor (`deepseek_v2.py:1092-1103` for `_skip_topk`, `:1115` for whether
+// an indexer exists, `:1175` for the flag the MLA wrapper keeps). Materializing
+// the same decisions as a vector is a HARNESS adaptation, not a semantic one:
+// this tree's layers are `mla::MlaBlockDims` values rather than modules, so the
+// per-layer decision has to live somewhere a caller can hold.
+mla::MlaBlockDims GlmMoeDsaMlaBlockDims(const GlmMoeDsaParams& p, int64_t layer) {
+  if (layer < 0 || layer >= static_cast<int64_t>(p.indexer_types.size())) {
+    throw std::out_of_range(
+        "GlmMoeDsaMlaBlockDims: layer " + std::to_string(layer) +
+        " is outside [0, " + std::to_string(p.indexer_types.size()) +
+        ") — the indexer schedule is num_hidden_layers long");
+  }
+  mla::MlaBlockDims d{};
+  d.hidden_size = p.hidden_size;
+  d.num_heads = p.num_attention_heads;
+  d.q_lora_rank = p.q_lora_rank;
+  d.kv_lora_rank = p.kv_lora_rank;
+  d.qk_nope_head_dim = p.qk_nope_head_dim;
+  d.qk_rope_head_dim = p.qk_rope_head_dim;
+  d.v_head_dim = p.v_head_dim;
+  // `is_neox_style=False` unconditionally at `deepseek_v2.py:1073`. W2 made this
+  // an explicit parsed field precisely so it is not two defaults agreeing.
+  d.is_neox_style = p.is_neox_style;
+  // `rope_type: "default"` on this checkpoint — no YaRN, so `MlaAttentionScale`
+  // reduces to `qk_head_dim ** -0.5` and the mscale^2 term is absent. Computed
+  // through the shared helper rather than written as a literal so a checkpoint
+  // that DOES carry a YaRN factor gets the correction instead of a wrong number.
+  mla::DeepseekYarnRopeParams rope{};
+  rope.base = p.rope_theta;
+  rope.rotary_dim = p.qk_rope_head_dim;
+  // `rope_parameters["rope_type"] != "default"` is upstream's `yarn` predicate
+  // (`deepseek_v2.py:1053-1058`), and `ParseGlmMoeDsaParams` refuses every value
+  // but "default", so this is false by a CHECKED fact rather than by a default.
+  rope.yarn = false;
+  d.scale = mla::MlaAttentionScale(d, rope);
+
+  // THE SPLIT, and it is the whole of this function. A `kFull` layer carries the
+  // indexer geometry and `skip_topk` false; a `kShared` layer carries NEITHER
+  // piece of geometry and `skip_topk` true, which is exactly upstream's
+  // `self.indexer = None` (`:1134-1135`) plus `skip_topk=True` (`:1175`).
+  //
+  // The geometry is CLEARED rather than left set on a shared layer, and
+  // `MlaBlockDims::Validate` refuses the combination, because a shared layer
+  // whose `index_topk` survived would run an indexer over weights the checkpoint
+  // does not ship for it — GLM-5.3 stores `self_attn.indexer.*` on 22 of 79
+  // blocks and on no other.
+  if (p.indexer_types[static_cast<size_t>(layer)] == GlmMoeDsaIndexerKind::kFull) {
+    d.index_n_heads = p.index_n_heads;
+    d.index_head_dim = p.index_head_dim;
+    d.index_topk = p.index_topk;
+    d.indexer_rope_is_neox_style = p.indexer_rope_is_neox_style;
+    d.skip_topk = false;
+  } else {
+    d.index_n_heads = 0;
+    d.index_head_dim = 0;
+    d.index_topk = 0;
+    d.indexer_rope_is_neox_style = false;
+    d.skip_topk = true;
+  }
+  d.Validate();
+  return d;
+}
+
+std::vector<mla::MlaBlockDims> GlmMoeDsaMlaSchedule(const GlmMoeDsaParams& p) {
+  std::vector<mla::MlaBlockDims> out;
+  out.reserve(p.indexer_types.size());
+  for (int64_t i = 0; i < static_cast<int64_t>(p.indexer_types.size()); ++i) {
+    out.push_back(GlmMoeDsaMlaBlockDims(p, i));
+  }
+  // LAYER 0 CANNOT BE SHARED, and this is the one ordering property the reuse
+  // depends on that the derivation does not state. `mla.py:180` reuses whatever
+  // is in the shared buffer, and on the first layer of a forward pass that is
+  // the buffer's UNINITIALIZED contents — a selection of arbitrary positions
+  // that attention would accept without complaint. Upstream's rule cannot
+  // produce it (`max(0 - offset + 1, 0) % freq == 0` for every non-negative
+  // offset, because `max(...)` clamps to 0 and 0 % freq is 0), so a schedule
+  // that starts shared came from an explicit `indexer_types` list or an
+  // `index_topk_pattern`, and it is a checkpoint this port must refuse rather
+  // than read past.
+  if (!out.empty() && out.front().skip_topk) {
+    throw std::runtime_error(
+        "GlmMoeDsaMlaSchedule: layer 0 is `shared`, so there is no preceding "
+        "full layer whose selection it could attend through (mla.py:180 reuses "
+        "the shared topk_indices_buffer, which at layer 0 holds nothing). "
+        "Upstream's derived rule at deepseek_v2.py:1097-1101 always makes layer "
+        "0 full; this schedule did not come from it");
+  }
+  return out;
+}
+
+int64_t GlmMoeDsaFullIndexerLayerCount(const GlmMoeDsaParams& p) {
+  return static_cast<int64_t>(std::count(p.indexer_types.begin(), p.indexer_types.end(),
+                                         GlmMoeDsaIndexerKind::kFull));
+}
+
 void ParseGlmMoeDsaConfig(const HfConfig& config) {
   // The resolve IS the validation: `ParseGlmMoeDsaParams` throws with a precise
   // message on every field this port cannot serve.
-  (void)ParseGlmMoeDsaParams(config);
+  const GlmMoeDsaParams p = ParseGlmMoeDsaParams(config);
+  // W4: and the per-layer MLA geometry is part of what "this port cannot serve"
+  // means. `MlaBlockDims::Validate` is the block's own refusal set — the
+  // `v_head_dim <= qk_head_dim` rule, the even rope width, the
+  // skip_topk/indexer mutual exclusion — and running it HERE means a config
+  // whose attention the block would refuse is refused where the user meets it,
+  // at resolve, rather than on the first forward of a 201 GiB load.
+  //
+  // This is also the only production call site the schedule has until W7 builds
+  // a forward, and it is a real one: `ModelRegistry::Resolve` reaches it for
+  // every `GlmMoeDsaForCausalLM` config, from a `config.json` and from a
+  // `glm-dsa` GGUF header alike.
+  (void)GlmMoeDsaMlaSchedule(p);
 }
 
 bool IsGlmMoeDsaGguf(const GgufFile& gguf) {

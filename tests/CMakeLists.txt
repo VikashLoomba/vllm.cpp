@@ -3520,3 +3520,12 @@ vllm_cpp_add_test(test_qwen3_5_mrope vllm/models/test_qwen3_5_mrope.cpp)
 vllm_cpp_add_test(test_glm_moe_dsa_config vllm/models/test_glm_moe_dsa_config.cpp)
 target_include_directories(test_glm_moe_dsa_config PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# W4: the heterogeneous indexer schedule, the `skip_topk` selection reuse and the
+# fp32 router gate GEMM. It reads the SAME committed `config.json` fixture the
+# W2 suite does, so the 21/57 split it asserts is the checkpoint's own and not a
+# literal, and it drives `mla::ForwardMlaAttentionBlock` on a sparse step —
+# which nothing else in `tests/` does outside the dots3-note model forward.
+vllm_cpp_add_test(test_glm_moe_dsa_schedule vllm/models/test_glm_moe_dsa_schedule.cpp)
+target_include_directories(test_glm_moe_dsa_schedule PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)

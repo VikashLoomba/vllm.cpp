@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/models/mla_attention.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, ForwardLogits
 #include "vllm/transformers_utils/hf_config.h"
@@ -166,6 +167,30 @@ std::vector<GlmMoeDsaMlpKind> DeriveGlmMoeDsaMlpSchedule(
 // a precise message on every field this port cannot serve. Pure/host — testable
 // without a checkpoint.
 GlmMoeDsaParams ParseGlmMoeDsaParams(const HfConfig& config);
+
+// ─── W4: the heterogeneous per-layer MLA schedule ────────────────────────────
+// The `mla::MlaBlockDims` for ONE backbone layer, with the indexer geometry
+// present on a `kFull` layer and `skip_topk` set on a `kShared` one. This is the
+// only place the two-way split becomes block geometry, and it reads
+// `p.indexer_types` — the schedule `ParseGlmMoeDsaParams` resolved from the
+// checkpoint — rather than re-deriving the rule. On GLM-5.3 it puts an indexer
+// on 21 of the 78 backbone layers; the 22nd is the MTP block, which upstream
+// forces full at `deepseek_v2.py:1110-1115` and which this row skips (spec O5).
+//
+// Throws `std::out_of_range` when `layer` is outside `[0, num_hidden_layers)`,
+// and whatever `mla::MlaBlockDims::Validate` throws when the resolved geometry
+// is one the MLA block refuses.
+mla::MlaBlockDims GlmMoeDsaMlaBlockDims(const GlmMoeDsaParams& p, int64_t layer);
+
+// Every backbone layer's dims, in layer order, each already `Validate()`d. The
+// caller allocates ONE `mla::MlaSharedSelection` for the model and hands it to
+// every layer in this order, which is what makes a `kShared` layer read the
+// selection its owning `kFull` layer wrote (`mla.py:180`).
+std::vector<mla::MlaBlockDims> GlmMoeDsaMlaSchedule(const GlmMoeDsaParams& p);
+
+// How many of `p.indexer_types` are `kFull`. Named because the split is the
+// wave's headline number and a reader should not have to count a vector.
+int64_t GlmMoeDsaFullIndexerLayerCount(const GlmMoeDsaParams& p);
 
 // The registry's config hook. The resolve IS the validation.
 void ParseGlmMoeDsaConfig(const HfConfig& config);

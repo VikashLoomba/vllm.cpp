@@ -2078,6 +2078,39 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   writes it whenever the source `config.json` carries `indexer_types`, which
   GLM-5.3's does — or by W7 recording the published arm as unfeedable and naming
   the converter run that replaces it.
+- **O18 — the fp32 router GEMM's dtype SELECTION has no discriminating
+  numerical gate, and this is measured rather than suspected.** W4 makes
+  `MoeBlock` size `dlog` from `DeepseekV2Params::router_dtype_is_f32`
+  (`deepseek_v2.cpp:363`), and the line is REACHED — `MoeBlock` is on
+  `DeepseekV2Model::Forward`, which `test_deepseek_v2_forward` drives on the CPU.
+  What no test can see is the dtype itself. Over the tiny fixture's 500 output
+  logits the f32 arm and the bf16 arm are BIT-IDENTICAL (`differing = 0/500`,
+  `maxabs = 0`): the router logits feed an f32 softmax and top-k, and every
+  activation downstream of the combine is stored at bf16, so the ~4e-3 relative
+  rounding the wider store removes is re-introduced two ops later. Forcing
+  `DType::kF32` unconditionally at `:363` also leaves every case in that file
+  green, which was measured as mutation M7. So what W4 gates is the PARSE
+  (against the pinned oracle's own return values on eight configs), that an f32
+  and a bf16 store of one GEMM genuinely differ (13 of 24 exact-integer
+  products), and that the f32 arm RUNS end to end through `vt::MoeRouterTopK`;
+  the selection at `:363` is proven by reading. Discharged by a fixture whose
+  routing is precision-sensitive enough to separate the two arms, or by an
+  end-to-end gate against a checkpoint that declares `moe_router_dtype:
+  "float32"` — neither of which this row needs, because GLM-5.3's own forward is
+  W7's. Named so a reader who sees a green suite does not conclude the dtype is
+  gated. This is the `## Gates` hazard AGENTS.md states — "a token gate cannot
+  detect a dtype that is too wide" — landing as a concrete instance.
+- **O19 — the `skip_topk` reuse arm of `ForwardMlaAttentionBlock` has no
+  PRODUCTION caller yet.** W4 lands the semantics, the refusals and the shared
+  buffer, and the only thing that sets `dims.skip_topk` on a real forward is a
+  GLM-5.3 decoder layer, which does not exist: `GlmMoeDsaModel::Forward` still
+  refuses by name (O16). What IS reached is the SCHEDULE — `ParseGlmMoeDsaConfig`
+  runs `GlmMoeDsaMlaSchedule` for every `GlmMoeDsaForCausalLM` config resolved
+  through `ModelRegistry::Resolve`, and deleting that call reds the focused gate.
+  The reuse arm itself is a staged slice under `## Nothing lands dead`, owned by
+  W7, tracked by [#2214](https://github.com/mudler/vllm.cpp/issues/2214), and
+  discharged when W7's forward drives the 78 layers in order over one
+  `MlaSharedSelection`.
 - **O16 and O17 were authored by W2 as O13 and O14, and are renumbered here.**
   W2 and W3 were developed on parallel branches and each appended two owed
   items to this list, so both claimed O13 and O14. W3's three items landed on
@@ -2087,6 +2120,79 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   either item.
 
 ### 3.10 Now
+
+**W4 LANDED, 2026-08-30** ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)).
+The heterogeneous indexer schedule, the `skip_topk` selection reuse and the fp32
+router gate GEMM are on this row's integration branch, on top of W2 and W3.
+`GlmMoeDsaMlaSchedule` turns the parsed `indexer_types` into 78
+`mla::MlaBlockDims`, 21 of them carrying an indexer and 57 carrying `skip_topk`;
+with the MTP block upstream forces full at `deepseek_v2.py:1110-1115` that is the
+22 of 79 §3.5.1 counted, and the test asserts the split from the checkpoint's own
+`config.json` rather than from a literal.
+
+**The reuse is the ABSENCE of a write, and reading it as a copy is how a port
+gets it wrong.** Upstream allocates ONE `topk_indices_buffer` per model
+(`deepseek_v2.py:1372-1377`) and hands the same tensor to every layer (`:1395`,
+`mla.py:120`). `mla.py:180` — `if self.indexer and self.is_sparse and not
+self.skip_topk:` — runs the indexer only on a full layer, and a shared layer's
+indexer does not exist at all (`:1134-1135`). So the bytes a shared layer attends
+through are the ones its owning full layer left there earlier in the same forward
+pass; nothing is copied, cached or carried across steps.
+`sparse_mla_attention.py:303-305` says it in upstream's own words. Mirrored as
+`mla::MlaSharedSelection`: a full layer writes INTO it, a shared layer reads it,
+and a `skip_topk` layer handed no buffer is REFUSED rather than falling through
+to the dense contiguous key loop — which would have produced a finite, plausible,
+wrong output on 57 of 79 blocks that no token gate could see.
+
+**One polarity in this seam now points both ways, deliberately.**
+`mla_attention.cpp:943-945` already said the decode metadata is copied so that "a
+sliding layer must not inherit a full layer's selection". That is still true and
+still dots3-note's. GLM's shared layer inherits BY CONFIGURATION, from a buffer
+the caller allocated for it, and never from leftover metadata. Both statements
+are in the file, next to each other.
+
+**The fp32 router turned out to be a DeepSeek-V2 parity repair as well as a GLM
+need.** `_get_moe_router_dtype` (`deepseek_v2.py:123-133`) returns f32 for
+`model_type == "glm_moe_dsa"` at `:127` AND for any config declaring
+`moe_router_dtype: "float32"` at `:131`; the tree hardcoded bf16, so a DeepSeek-V2
+or V3 checkpoint asking for an f32 router silently did not get one.
+`DeepseekV2Params::router_dtype_is_f32` is read in `ParseDeepseekV2Params` and
+consumed at `deepseek_v2.cpp:363`. The dtype answers are the pinned oracle's own
+return values, not a transcription: `_get_moe_router_dtype` was extracted from
+`5559679229` and EXECUTED on eight configs with torch 2.11.0+cu130. The order of
+its two arms is what the table gates — `:127` wins even against an explicit
+`"bfloat16"`, and a rule written the other way round passes every other row.
+
+**And the dtype selection at `:363` is not gateable, which is measured.** The f32
+and bf16 arms of the tiny DeepSeek-V2 forward are bit-identical over all 500
+logits, because every activation downstream of the router combine is stored at
+bf16. Forcing f32 unconditionally leaves that whole file green. That is O18, and
+it is AGENTS.md's "a token gate cannot detect a dtype that is too wide" arriving
+as a concrete instance rather than a warning.
+
+**What W4 does NOT reach.** The reuse arm has no production caller: only a GLM
+decoder layer sets `skip_topk` on a real forward, and `GlmMoeDsaModel::Forward`
+still refuses by name. The SCHEDULE is reached — `ParseGlmMoeDsaConfig` runs it
+for every config `ModelRegistry::Resolve` sees, and deleting that call reds the
+focused gate — but the block arm is a staged slice, owned by W7 and recorded as
+O19. W4 also closed a hole W2 left and W4 would have been first to fall into: a
+non-`default` `rope_type` is now refused, because `MlaAttentionScale` would
+otherwise have handed a YaRN checkpoint the unscaled softmax scale.
+
+Gates: 24 cases and 2594 assertions across the two new/extended suites, plus
+`test_mla_attention_block` (18 cases, 2,255,433 assertions), `test_dots3_note_attn`
+(51 / 6888), `test_glm_moe_dsa_config` (15 / 380) and `test_deepseek_v2_load`
+(4 / 14) all green and unmoved. Seven mutations: deleting the reuse read kills
+G1; making the full layer keep its selection local kills G1 and the tautology
+guard; deleting the schedule's production call site kills the reachability case;
+neutering the router-dtype parse kills two; dropping either refusal kills one
+each; and forcing f32 at the GEMM call site kills NOTHING, which is O18.
+
+**Next action:** W1, still independent and still unlocking two arms at once, then
+W5 (the indexer KV side cache, GPU) and W6 (sparse prefill, GPU). W7 is what
+turns O19 from a staged slice into a reached one.
+
+---
 
 W2 LANDED, 2026-08-30. The row moves `SPIKE` -> `ACTIVE` (`📋` -> `🚧`),
 which is what D4 said would happen when W2 landed. `ACTIVE` rather than

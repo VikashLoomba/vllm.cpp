@@ -190,6 +190,25 @@ void MlaBlockDims::Validate() const {
         "(model.py:171-172 passes `q_c` to `attention.indexer`), so it cannot "
         "run on the DIRECT q_proj branch");
   }
+  // GLM-5.3's shared indexer schedule (W4, #2214). Upstream cannot build a layer
+  // that is BOTH: `deepseek_v2.py:1115` constructs the indexer only when
+  // `not _skip_topk or is_mtp_layer`, and `:1175` passes
+  // `skip_topk=_skip_topk and not is_mtp_layer` — so on the MTP block the
+  // indexer exists and the flag is false, and on a trunk shared layer the flag
+  // is true and `:1134-1135` leaves `self.indexer = None`. The two are never on
+  // at once. Refusing the combination matters because it is the shape a caller
+  // reaches by setting the flag and forgetting to CLEAR the geometry it copied
+  // from the preceding full layer, and the block would then run an indexer on a
+  // layer whose weights the checkpoint does not ship.
+  if (skip_topk && has_indexer()) {
+    throw std::invalid_argument(
+        "MlaBlockDims: skip_topk and an indexer geometry are mutually "
+        "exclusive — a shared layer runs NO indexer of its own and attends "
+        "through the preceding full layer's selection (deepseek_v2.py:1115 "
+        "builds the indexer only when `not _skip_topk or is_mtp_layer`, and "
+        ":1134-1135 leaves `self.indexer = None` otherwise). Clear "
+        "index_n_heads / index_head_dim / index_topk on a shared layer");
+  }
 }
 
 // mla_attention.py:880-900 + :959-962. Upstream's chain is
@@ -354,7 +373,7 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
                               const Tensor& hidden, const Tensor& positions,
                               Tensor& kv_cache, const Tensor& slot_mapping,
                               const MlaBlockMetadata& meta, v1::TritonMLAImpl& impl,
-                              Tensor& out) {
+                              Tensor& out, MlaSharedSelection* shared) {
   dims.Validate();
   // ─── dots3-note's headwise gate: PRECONDITIONS, checked at ENTRY ─────────
   // Both are properties of the CONFIG and the WEIGHT, knowable before any op
@@ -411,8 +430,22 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   // answer, so an empty `indexer_cu_seqlens_q` is mirroring rather than a
   // shortcut — and it is what keeps every gate this seam already passes
   // byte-identical.
-  const bool run_indexer = dims.has_indexer() && !meta.indexer_cu_seqlens_q.empty();
-  if (run_indexer) {
+  //
+  // ONE step predicate, TWO layer roles, and they must not be two predicates.
+  // `sparse_step` is the STEP property above. On a sparse step a full layer runs
+  // its indexer and a shared layer reuses; on a dense step NEITHER does anything
+  // sparse, because upstream's `use_dense_mha` is a property of the step and not
+  // of the layer. Deriving the shared layer's route from a second, differently
+  // spelled condition is how a refusal and its route come apart — the shape that
+  // makes a wrong answer silent rather than loud.
+  const bool sparse_step = !meta.indexer_cu_seqlens_q.empty();
+  const bool run_indexer = dims.has_indexer() && sparse_step;
+  // `mla.py:180` reduced to this tree's terms. Upstream writes
+  // `self.indexer and self.is_sparse and not self.skip_topk` for the WRITE side;
+  // the READ side is everything else that is `is_sparse`, which here is exactly
+  // `skip_topk` because `has_indexer()` is the only other way to be sparse.
+  const bool reuse_selection = dims.skip_topk && sparse_step;
+  if (run_indexer || reuse_selection) {
     if (decode_toks != T) {
       throw std::invalid_argument(
           "MLA block: a sparse step routes EVERY token through MQA "
@@ -673,10 +706,44 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
       vt::RopeFromCache(d.q, iq3, &ik3, positions, w.rope_cos_sin_cache, irope);
     }
 
-    ix_bufs.emplace_back(d, DType::kI32, std::vector<int64_t>{T, K});
-    topk_idx = ix_bufs.back().t();
-    ix_bufs.emplace_back(d, DType::kI32, std::vector<int64_t>{T});
-    topk_cnt = ix_bufs.back().t();
+    // THE DESTINATION IS THE SHARED BUFFER WHEN THERE IS ONE, and that is the
+    // whole of the reuse mechanism. Upstream's indexer writes straight into the
+    // per-model `topk_indices_buffer` (`sparse_attn_indexer.py:663`:
+    // `topk_indices_buffer[:rows, :topk] = topk_indices`), which is why a later
+    // shared layer that runs nothing still finds this layer's answer there. A
+    // block-local buffer would make the selection die with the call, and the
+    // shared layer would then read whatever the caller allocated — most likely
+    // zeros, which is a VALID-LOOKING selection of position 0 and would gate
+    // green while attending to the wrong keys.
+    if (shared != nullptr) {
+      if (shared->Empty()) {
+        throw std::invalid_argument(
+            "MLA block: MlaSharedSelection was passed with an empty tensor — "
+            "allocate [max_tokens, index_topk] i32 indices and [max_tokens] i32 "
+            "counts, or pass nullptr (deepseek_v2.py:1372-1377)");
+      }
+      if (shared->topk_indices.rank != 2 || shared->topk_indices.shape[0] < T ||
+          shared->topk_indices.shape[1] != K || shared->valid_counts.rank != 1 ||
+          shared->valid_counts.shape[0] < T) {
+        throw std::invalid_argument(
+            "MLA block: MlaSharedSelection must be [>= num_tokens, index_topk] "
+            "i32 indices and [>= num_tokens] i32 counts (deepseek_v2.py:1372-1377 "
+            "sizes it `[max_num_batched_tokens, index_topk]`)");
+      }
+      if (shared->topk_indices.dtype != DType::kI32 ||
+          shared->valid_counts.dtype != DType::kI32) {
+        throw std::invalid_argument(
+            "MLA block: MlaSharedSelection tensors must be i32 "
+            "(deepseek_v2.py:1375 `dtype=torch.int32`)");
+      }
+      topk_idx = shared->topk_indices.Slice(0, 0, T);
+      topk_cnt = shared->valid_counts.Slice(0, 0, T);
+    } else {
+      ix_bufs.emplace_back(d, DType::kI32, std::vector<int64_t>{T, K});
+      topk_idx = ix_bufs.back().t();
+      ix_bufs.emplace_back(d, DType::kI32, std::vector<int64_t>{T});
+      topk_cnt = ix_bufs.back().t();
+    }
 
     // The candidate range, as two contiguous i32 arrays over the LONGEST
     // request in the step: `win_start` is all zeros and `win_end[i] = i + 1`,
@@ -876,10 +943,49 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     // byte-identical contiguous key loop. The metadata is COPIED rather than
     // mutated because `meta` is the caller's and is shared by every layer of
     // the step — a sliding layer must not inherit a full layer's selection.
+    //
+    // GLM-5.3 (W4) adds the ONE layer kind for which inheriting IS the answer,
+    // and the two are not in tension. A dots3-note sliding layer inherits by
+    // ACCIDENT if the metadata is mutated, and it is not sparse at all. A GLM
+    // shared layer inherits BY CONFIGURATION, through `dims.skip_topk`, from a
+    // buffer the caller allocated for exactly that purpose. The metadata stays
+    // copied in both cases; what changed is that there is now an explicit
+    // second source for the selection, and it is never the previous layer's
+    // leftover metadata.
     v1::MLACommonMetadata dec = meta.decode;
     if (run_indexer) {
       dec.topk_indices = topk_idx;
       dec.valid_counts = topk_cnt;
+    } else if (reuse_selection) {
+      // `mla.py:180`'s else. This layer ran no indexer, so the selection it
+      // attends through is the one the preceding FULL layer wrote into the
+      // shared buffer earlier in this same forward pass. Nothing is copied and
+      // nothing is recomputed; the bytes are simply still there.
+      //
+      // REFUSING A MISSING BUFFER IS THE POINT. Falling through to the dense
+      // contiguous key loop would produce a full-context attention output that
+      // is finite, plausible and wrong, and no token gate would see it — a
+      // shared layer attending to everything is exactly the thing this schedule
+      // exists to avoid. Upstream cannot reach this state because the buffer is
+      // allocated once for the model and handed to every layer
+      // (`deepseek_v2.py:1372-1377`, `:1395`); here the caller can forget it.
+      if (shared == nullptr || shared->Empty()) {
+        throw std::invalid_argument(
+            "MLA block: a skip_topk layer attends through the preceding full "
+            "layer's selection (mla.py:180) and no MlaSharedSelection was "
+            "passed — there is nothing to reuse. Allocate the shared buffer "
+            "once per model and pass it to EVERY layer in order "
+            "(deepseek_v2.py:1372-1377, :1395)");
+      }
+      if (shared->topk_indices.shape[0] < static_cast<int64_t>(T) ||
+          shared->valid_counts.shape[0] < static_cast<int64_t>(T)) {
+        throw std::invalid_argument(
+            "MLA block: the shared selection is shorter than this step's token "
+            "count — it must be sized for max_num_batched_tokens "
+            "(deepseek_v2.py:1373)");
+      }
+      dec.topk_indices = shared->topk_indices.Slice(0, 0, T);
+      dec.valid_counts = shared->valid_counts.Slice(0, 0, T);
     }
     impl.forward_mqa(layer, mqa_q_t, kv_cache, dec, mqa_out_t, nullptr);
     // `self._v_up_proj(attn_out, out=mqa_output_slice)` (:830, :1024-1034):

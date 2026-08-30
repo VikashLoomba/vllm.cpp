@@ -296,6 +296,23 @@ MoeLayerWeights BridgeMoeLayer(const Glm5NextMoeWeights& src, const MoeDims& d,
                                const std::string& what,
                                int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
 
+// W9a: view this layer's three routed-expert banks as the stacked keep-quant
+// towers `vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` declare,
+// WITHOUT decoding anything. `BridgeMoeLayer` calls it; it is declared here
+// because its three outcomes are the contract, and two of them are refusals a
+// gate has to be able to drive directly.
+//
+//   true   -- admitted, `*out` filled.
+//   false  -- declined: the banks are not block-quantized (the loader's bf16
+//             expansion route) or were staged to a device and their host bytes
+//             released. The f32 arm runs, and that is a designed residency.
+//   throws -- refused: the banks ARE block-quantized and the seam cannot
+//             represent them. A silent f32 fallback here would be correct
+//             tokens at decode speed on a path nobody selected, which is
+//             precisely what no token gate can see.
+bool AdmitMoeQuantBanks(const Glm5NextMoeWeights& src, const MoeDims& d,
+                        const std::string& what, MoeQuantBanks* out);
+
 }  // namespace vllm::glm5_next
 
 #endif  // VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_BRIDGE_H_

@@ -3529,3 +3529,21 @@ target_include_directories(test_glm_moe_dsa_config PRIVATE
 vllm_cpp_add_test(test_glm_moe_dsa_schedule vllm/models/test_glm_moe_dsa_schedule.cpp)
 target_include_directories(test_glm_moe_dsa_schedule PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# W7 / G2: the structural loader gate. Two cases run with no artifact (the claim
+# set against the checkpoint's own committed config.json); the third reads the
+# six real UD-IQ1_S shard HEADERS and is skipped unless VT_GLM_DSA_GGUF names
+# shard 1. Spec `.agents/specs/glm-dsa-latest-deepseek.md` §3.6 G2.
+vllm_cpp_add_test(test_glm_moe_dsa_gguf_census
+  vllm/models/test_glm_moe_dsa_gguf_census.cpp)
+target_include_directories(test_glm_moe_dsa_gguf_census PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# W7: the load itself, on a COMPLETE synthetic `glm-dsa` GGUF with the same
+# structure as the 201.83 GiB artifact -- heterogeneous indexer schedule, a
+# leading dense block, stacked keep-quant towers and an MTP tail to drop. Enters
+# through `LoadedEngine::FromModelDir`, which is the reachability proof.
+vllm_cpp_add_test(test_glm_moe_dsa_gguf_load
+  vllm/models/test_glm_moe_dsa_gguf_load.cpp)
+target_include_directories(test_glm_moe_dsa_gguf_load PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)

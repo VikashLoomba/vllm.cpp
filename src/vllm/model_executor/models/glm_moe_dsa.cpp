@@ -156,29 +156,51 @@ bool OptIndexerTypes(const GgufFile& g, const std::string& key,
 // Every primitive this model needs that this tree does not have, each with the
 // wave that owes it and the record that tracks it. A refusal that says only
 // "not implemented" makes the reader go looking; this one hands over the list.
+//
+// ─── THIS LIST SHRANK, AND THE ENTRIES THAT LEFT ARE NAMED HERE ──────────────
+// W2 wrote seven entries. Four of them have since landed and the text is
+// corrected in the same change that made the fourth of them false, rather than
+// left to accumulate: (a) the expert-streaming seam is
+// `expert_stream_seam.{h,cpp}` since W3 (spec O8, DISCHARGED); (b) the
+// per-layer heterogeneous `MlaBlockDims` and the `skip_topk` reuse are
+// `GlmMoeDsaMlaSchedule` since W4; (c) the `IQ4_XS` keep-quant `vec_dot` landed
+// as `VecDotIQ4_XSQ8_K` in `2e9f4d88d` (spec O2, DISCHARGED), so all six
+// encodings of the target arm keep their blocks; (d) the fp32 router GEMM is
+// `deepseek_v2.cpp:363` sizing its output from `router_dtype_is_f32`, which is
+// no longer a hardcoded bf16. A refusal that keeps naming work that is done
+// sends its reader to look for something they will not find.
+//
+// ─── O20: THE `dots3_note_device.cpp` ANCHOR IS CITED BY PREDICATE ───────────
+// This string used to carry `dots3_note_device.cpp:1147-1180`, which is the
+// explanatory COMMENT above the guard and not the guard, so a user meeting this
+// refusal was handed a line range containing no refusal. The range moved again
+// inside the branch that found it (`:1204-1227` on `origin/main` `03e0dcd19`,
+// `:1205-1228` after W4's own three-line edit to the same file), which is the
+// reason the durable citation is the PREDICATE. `!elig.prunes || elig.Active()`
+// is unique repo-wide, verified over `src`, `include` and `tests`. Spec O20,
+// repaired in flow by the wave that next touched this file, as O20's
+// DISPOSITION directs.
 constexpr const char* kForwardRefusal =
-    "GlmMoeDsaForCausalLM forward is not implemented — W2 registers the "
-    "architecture, its config and its `glm-dsa` GGUF arm, and nothing else. "
-    "The primitives it composes that this build does NOT have, each with the "
-    "wave that owes it: (1) the indexer KV side cache, upstream's "
-    "`DeepseekV32IndexerCache` (deepseek_v2.py:696-701) — without it sparse "
-    "decode refuses every resumed request (dots3_note_device.cpp:1147-1180) — "
-    "W5, spec O4, issue #1925; (2) the expert-streaming seam, which is welded "
-    "into qwen3_5.cpp and reachable from exactly one translation unit — W3, "
-    "spec O8; (3) sparse prefill: `MlaPrefillAttentionArgs` carries no topk "
-    "member and `MlaPrefillAttention` has no selection arm — W6, spec O6; "
-    "(4) the per-layer heterogeneous `MlaBlockDims` and the `shared` "
-    "selection-reuse semantics, in which a skip layer runs no indexer and "
-    "attends through the preceding full layer's top-k (mla.py:180) — W4; "
-    "(5) the `IQ4_XS` keep-quant `vec_dot`, without which the target arm "
-    "expands four expert towers from 6.375 GiB to 24.000 GiB and drops out of "
-    "the streaming lane — W1, spec O2, row QUANT-GGUF-IQ4_XS; (6) the GGUF "
-    "loader and the streamed towers — W7; (7) the fp32 router GEMM "
-    "(deepseek_v2.cpp:350 hardcodes a bf16 gate output). Multi-token "
-    "prediction is skipped, not implemented (spec O5). No end-to-end token "
-    "gate against vLLM is reachable on this fleet at all (spec O1, §3.6): "
-    "vLLM at the pin implements this architecture and cannot fit its "
-    "703.74 GiB. See .agents/specs/glm-dsa-latest-deepseek.md §3.7.";
+    "GlmMoeDsaForCausalLM forward is not implemented. The `glm-dsa` GGUF "
+    "loader IS implemented and this model's weights DO materialize (W7): the "
+    "1581 resident tensors load and the 228 `_exps.weight` towers are held as "
+    "raw ggml blocks for the expert-streaming lane. What is missing is the "
+    "forward that consumes them, and the two primitives it needs that this "
+    "build does NOT have: (1) the indexer KV side cache, upstream's "
+    "`DeepseekV32IndexerCache` (deepseek_v2.py:696-701) — without it a sparse "
+    "step refuses every RESUMED request, at the `VT_CHECK` whose predicate is "
+    "`!elig.prunes || elig.Active()` in dots3_note_device.cpp (cited by "
+    "predicate rather than by line, spec O20: the range moved twice while this "
+    "message was being written) — owned by KV-DSV4-MULTICACHE, spec O4, issues "
+    "#1925 and #2323; (2) sparse prefill: `MlaPrefillAttentionArgs` carries no "
+    "topk member and `MlaPrefillAttention` has no selection arm, so a sparse "
+    "step must route EVERY token through MQA and only a request with no "
+    "previously computed context can do that — W6, spec O6. Multi-token "
+    "prediction is skipped, not implemented: block 78 is read, counted and "
+    "dropped (spec O5). No end-to-end token gate against vLLM is reachable on "
+    "this fleet at all (spec O1, §3.6): vLLM at the pin implements this "
+    "architecture and cannot fit its 703.74 GiB on any device this project "
+    "reaches. See .agents/specs/glm-dsa-latest-deepseek.md §3.7.";
 
 constexpr const char* kSafetensorsRefusal =
     "Model architecture GlmMoeDsaForCausalLM does not support safetensors "

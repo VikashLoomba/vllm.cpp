@@ -609,32 +609,49 @@ separate them at all.
 **(c) Alias the paged storage from the deck.** Not available: pages are not
 contiguous, which is the entire point of paging.
 
-**HOW BIG (a) ACTUALLY IS, measured rather than estimated.**
-`src/vllm/model_executor/models/deepseek_v4.cpp` contains **zero** occurrences of
-`ReshapeAndCache` or `PagedAttention`, and does not route through
-`dense_attn::AttnBlock` at all. Every other paged model in this tree reaches the
-cache through that seam; DeepSeek-V4's attention is bespoke over the contiguous
-deck end to end.
+**CORRECTION 2026-08-30.** An earlier revision of this section said (a) is "not a
+wiring change... a PORT of DeepSeek-V4's MLA attention onto the paged seam", on
+the evidence that `deepseek_v4.cpp` contains no `ReshapeAndCache` or
+`PagedAttention`. That evidence was real and the conclusion drawn from it was
+wrong: it searched for the DENSE paged primitives, and MLA does not use them.
 
-So (a) is **not a wiring change** -- there is no existing paged path in this model
-to connect a cache to. It is a PORT of DeepSeek-V4's MLA attention onto the paged
-seam: the 512-wide latent, the nope/rope split, the per-head sinks and the
-compressor/indexer interaction all have to be expressed against block-table
-storage rather than a growing `std::vector<float>`.
+**A paged MLA seam already exists, is implemented on CPU and CUDA, and has two
+users.**
 
-That is the honest size of W5 and it should be planned as such. It also explains
-why (b) is tempting enough to need naming: (b) is an afternoon and (a) is the
-wave. A reader who assumes "the channel exists, so the forward just reads it"
-will under-scope this by an order of magnitude.
+| piece | where |
+|---|---|
+| `ForwardMlaAttentionBlock(Dev, MlaBlockDims, MlaBlockWeights, hidden, positions, Tensor& kv_cache, const Tensor& slot_mapping, MlaBlockMetadata, TritonMLAImpl&, out)` | `src/vllm/model_executor/layers/attention/mla_attention.cpp:353` |
+| `vt::ConcatAndCacheMla` -- the paged MLA WRITE | `cpu/cpu_cache.cpp`, `cuda/cuda_cache.cu`, called at `mla_attention.cpp:754` |
+| `vt::GatherMlaCache` -- the paged MLA read | `cpu/cpu_mla_prefill.cpp`, `cuda/cuda_mla_prefill.cu` |
+| existing users | Kimi-Linear (`kimi_linear*.cpp`), dots3-note (`dots3_note_attn.h`, `dots3_note_device.cpp`) |
 
-**A DTYPE DECISION RIDES ALONG, and it is not incidental.** The deck is `f32`
-while the pages are `bf16`/`fp8`, so (a) does not merely change WHERE the KV
-lives, it halves or quarters what it costs, and it changes the arithmetic the
-attention reads. That is the same polarity as the carried tower's f32 widening
-(#2186): a model-dtype value materialized wider, invisible to a token gate
-because the tokens still match while the path moves more bytes. W5 should
-therefore state the KV dtype it reads and gate it, rather than inherit `f32`
-from the deck by accident.
+So W5 is **routing DeepSeek-V4 onto an existing shared seam**, not building one.
+That is also what AGENTS.md `## Shared seams` REQUIRES rather than merely
+permits -- "Never write a parallel path by hand" -- and V4's bespoke MLA is
+already such a path.
+
+**WHAT THE SEAM CANNOT REPRESENT TODAY, and it is exactly one thing.**
+`include/vllm/model_executor/models/mla_attention.h` contains **zero**
+occurrences of `sink`, and DeepSeek-V4 carries a per-head attention sink loaded
+from the checkpoint (`attention.py:218-222`; ours at `deepseek_v4.h`,
+`attn_sink[n_heads]`). AGENTS.md's rule for that case is explicit: "Extend a
+shared seam when it cannot represent the upstream behavior. Otherwise, record
+one exact tracked exception."
+
+So the shape of W5 is:
+
+1. extend `MlaBlockWeights` / `ForwardMlaAttentionBlock` with the per-head sink,
+   inert by default so Kimi-Linear and dots3-note stay byte-identical;
+2. route DeepSeek-V4's NON-DSA layers through it;
+3. leave the DSA layers refusing -- the indexer and compressor belong to
+   `MODEL-DSV4-DSA-COMPOSE` (#2286).
+
+**The correction does not move the trap.** Option (b) -- copy paged to contiguous
+each step -- remains available, still produces identical tokens, still passes a
+token gate, and still leaves the decode O(context) per token. It is arguably MORE
+tempting now that (a) is smaller, because "just adapt the existing forward" looks
+close. The work-counting gate below is what separates them.
+
 
 #### W5-6. Gate
 

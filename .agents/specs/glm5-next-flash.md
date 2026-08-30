@@ -3809,6 +3809,33 @@ Debts this row carries, each visible rather than waived:
   RSS 89,315,324 kB = 85.18 GiB** (`VmHWM`, polled). This is the model answering
   the question, and it is the fact O30 exists to establish.
 
+
+  **CONFIRMED ON `dgx:gpu0` (GB10), WITH THE INSTRUMENT OFF.** Run
+  `/mnt/nas_share/rc/glm5-diag/out-fix2-20260830T143718Z`, the fixed tree
+  `d84db105b`, `vllm-cli --device cpu --max-tokens 2`, `VT_GLM5_DIAG` UNSET --
+  the shipped configuration, so no probe can be said to have changed what it
+  measures. Output **` Paris.`**, `rc=0`,
+  `finish_reason=length prompt_tokens=5 completion_tokens=2`. **Peak RSS
+  104,792,300 kB = 99.94 GiB** (`VmHWM`, polled), against the 99.47 GiB the
+  UNFIXED binary read on this same box -- the fix removes about 0.76 GiB of q8_0
+  copies and the mmap pages take their place, so residency is unchanged in
+  practice.
+
+  This is the same box, the same 101.2535 GiB artifact and the same prompt as
+  the W5b-2c run that emitted `!!!!!!!!`. **Before: `!!!!!!!!`. After:
+  ` Paris.`** The `thor:gpu0` runs above supply the mechanism and the per-layer
+  bisect; this one supplies the product claim on the box the row is gated
+  against.
+
+  **AND IT PRICES THE VOID SPEED NUMBER, on one box.** This run generated 2
+  tokens in 390.929 s, **195.5 s/token**, where the all-NaN W5b-2c run on this
+  same box read 73.1 s/token. The broken forward was 2.7x "faster" than the
+  working one. That is consistent with the degenerate-routing account below and
+  settles the only thing that matters about it: 73 s/token was never a
+  measurement of this model, and 195.5 s/token is the first honest one. It is
+  still not a benchmark -- one leg, one concurrency, a host f32 reference that
+  re-decodes every layer each step -- and O6 owns the axis.
+
   **The box is `thor:gpu0` and NOT `dgx:gpu0`, and that is a real limit on this
   entry.** Both are aarch64 with i8mm, so both take the repack path and the
   defect and its repair are the same on each; `dgx:gpu0` was held by another
@@ -3817,8 +3844,8 @@ Debts this row carries, each visible rather than waived:
   changed. The one number that is NOT comparable across the two boxes is peak
   RSS, because the weights are mmap-resident and `VmHWM` then tracks page-cache
   eviction pressure rather than a fixed footprint: the same unfixed binary read
-  99.47 GiB on `dgx:gpu0` and 72.05 GiB on `thor:gpu0`. A GB10 confirmation of
-  the repaired arm is owed and is running.
+  99.47 GiB on `dgx:gpu0` and 72.05 GiB on `thor:gpu0`. The GB10 confirmation is no longer
+  owed: it is the `out-fix2-20260830T143718Z` run recorded above.
 
   **A SPEED NUMBER THIS ROW MIGHT OTHERWISE HAVE INHERITED IS VOID, and it is
   worth more than the repair.** The unfixed forward ran a 45-layer pass in about

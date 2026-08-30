@@ -357,6 +357,141 @@ std::vector<float> RunWriteBack(DeviceType dt, const std::vector<float>& hyper_i
   return hyper;
 }
 
+// ── dtype staging. The three ops carry a RUNTIME dtype tag rather than a
+// template parameter, so every (operand, dtype) pairing goes through the same
+// kernel and a wrong tag mapping is invisible to an f32-only gate.
+std::vector<uint8_t> Pack(const std::vector<float>& f, DType dt) {
+  std::vector<uint8_t> o(f.size() * vt::SizeOf(dt));
+  if (dt == DType::kF32) {
+    std::memcpy(o.data(), f.data(), o.size());
+    return o;
+  }
+  auto* p = reinterpret_cast<uint16_t*>(o.data());
+  for (size_t i = 0; i < f.size(); ++i) {
+    p[i] = dt == DType::kBF16 ? vt::F32ToBF16(f[i]) : vt::F32ToF16(f[i]);
+  }
+  return o;
+}
+
+std::vector<float> Unpack(const std::vector<uint8_t>& b, DType dt) {
+  const size_t n = b.size() / vt::SizeOf(dt);
+  std::vector<float> o(n);
+  if (dt == DType::kF32) {
+    std::memcpy(o.data(), b.data(), b.size());
+    return o;
+  }
+  const auto* p = reinterpret_cast<const uint16_t*>(b.data());
+  for (size_t i = 0; i < n; ++i) {
+    o[i] = dt == DType::kBF16 ? vt::BF16ToF32(p[i]) : vt::F16ToF32(p[i]);
+  }
+  return o;
+}
+
+const char* DName(DType d) {
+  return d == DType::kF32 ? "f32" : (d == DType::kBF16 ? "bf16" : "f16");
+}
+
+// The write-back over an arbitrary dtype triple, on either device. `hyper` is
+// read-modify-write, so its dtype is both the input and the output width.
+std::vector<float> RunWriteBackDt(DeviceType dev, const std::vector<float>& hyper_in,
+                                  const std::vector<float>& block_in,
+                                  const std::vector<float>& inj_in, int64_t T, int64_t hc,
+                                  int64_t hidden, DType hdt, DType bdt, DType idt) {
+  Qwen4ExpGatedResidualArgs args;
+  args.hc_count = hc;
+  args.hidden_size = hidden;
+  args.lowrank = 7;
+  args.eps = 0.5f;
+  std::vector<uint8_t> H = Pack(hyper_in, hdt), B = Pack(block_in, bdt), I = Pack(inj_in, idt);
+  const int64_t flat = hc * hidden;
+  if (dev == DeviceType::kCPU) {
+    Queue q = CpuQ();
+    Tensor th = MakeTensor(H.data(), hdt, Cpu(), {T, flat});
+    Tensor tb = MakeTensor(B.data(), bdt, Cpu(), {T, hidden});
+    Tensor ti = MakeTensor(I.data(), idt, Cpu(), {T, hc});
+    vt::Qwen4ExpGatedResidualWriteBack(q, th, tb, ti, args);
+    return Unpack(H, hdt);
+  }
+  Backend& bk = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard qg(bk);
+  DeviceTensor dh(bk, qg.q, hdt, {T, flat}, H.data());
+  DeviceTensor db(bk, qg.q, bdt, {T, hidden}, B.data());
+  DeviceTensor di(bk, qg.q, idt, {T, hc}, I.data());
+  vt::Qwen4ExpGatedResidualWriteBack(qg.q, dh.tensor(), db.tensor(), di.tensor(), args);
+  bk.Synchronize(qg.q);
+  dh.Download(qg.q, H.data());
+  return Unpack(H, hdt);
+}
+
+// The conv over a dtype pair, returning the output AND the ring concatenated so
+// one comparison gates both. The ring carries the STREAM dtype by W5k's finding
+// and is never widened, which is why it shares `sdt` with the output here.
+std::vector<float> RunConvDt(DeviceType dev, int64_t dilation, const std::vector<float>& x_in,
+                             int64_t tokens, const std::vector<float>& w_in,
+                             const std::vector<float>& state_in, DType xdt, DType sdt) {
+  const int64_t state_len = (kKernel - 1) * dilation;
+  std::vector<int32_t> qsl = {0, static_cast<int32_t>(tokens)};
+  Qwen4ExpPleConvArgs args;
+  args.dilation = dilation;
+  std::vector<uint8_t> X = Pack(x_in, xdt), W = Pack(w_in, xdt), S = Pack(state_in, sdt);
+  std::vector<uint8_t> O(static_cast<size_t>(tokens * kChannels) * vt::SizeOf(sdt), 0);
+  if (dev == DeviceType::kCPU) {
+    Queue q = CpuQ();
+    Tensor to = MakeTensor(O.data(), sdt, Cpu(), {tokens, kChannels});
+    Tensor tx = MakeTensor(X.data(), xdt, Cpu(), {tokens, kChannels});
+    Tensor tw = MakeTensor(W.data(), xdt, Cpu(), {kChannels, kKernel});
+    Tensor ts = MakeTensor(S.data(), sdt, Cpu(), {1, kChannels, state_len});
+    Tensor tq = MakeTensor(qsl.data(), DType::kI32, Cpu(), {2});
+    vt::Qwen4ExpPleConv(q, to, tx, tw, ts, tq, nullptr, args);
+  } else {
+    Backend& bk = vt::GetBackend(DeviceType::kCUDA);
+    QueueGuard qg(bk);
+    DeviceTensor dO(bk, qg.q, sdt, {tokens, kChannels}, O.data());
+    DeviceTensor dX(bk, qg.q, xdt, {tokens, kChannels}, X.data());
+    DeviceTensor dW(bk, qg.q, xdt, {kChannels, kKernel}, W.data());
+    DeviceTensor dS(bk, qg.q, sdt, {1, kChannels, state_len}, S.data());
+    DeviceTensor dQ(bk, qg.q, DType::kI32, {2}, qsl.data());
+    vt::Qwen4ExpPleConv(qg.q, dO.tensor(), dX.tensor(), dW.tensor(), dS.tensor(), dQ.tensor(),
+                        nullptr, args);
+    bk.Synchronize(qg.q);
+    dO.Download(qg.q, O.data());
+    dS.Download(qg.q, S.data());
+  }
+  std::vector<float> out = Unpack(O, sdt);
+  const std::vector<float> ring = Unpack(S, sdt);
+  out.insert(out.end(), ring.begin(), ring.end());
+  return out;
+}
+
+// The gate over a (value, out) pair. `score` is f32 by the op contract.
+std::vector<float> RunGateDt(DeviceType dev, const std::vector<float>& score,
+                             const std::vector<float>& value, int64_t tokens, int64_t hc,
+                             int64_t hidden, float divisor, DType vdt, DType odt) {
+  Qwen4ExpPleGateArgs args;
+  args.gate_divisor = divisor;
+  args.clamp_min = 1e-6f;
+  std::vector<float> s = score;
+  std::vector<uint8_t> V = Pack(value, vdt);
+  std::vector<uint8_t> O(static_cast<size_t>(tokens * hc * hidden) * vt::SizeOf(odt), 0);
+  if (dev == DeviceType::kCPU) {
+    Queue q = CpuQ();
+    Tensor to = MakeTensor(O.data(), odt, Cpu(), {tokens, hc * hidden});
+    Tensor ts = MakeTensor(s.data(), DType::kF32, Cpu(), {tokens, hc});
+    Tensor tv = MakeTensor(V.data(), vdt, Cpu(), {tokens, hidden});
+    vt::Qwen4ExpPleGate(q, to, ts, tv, args);
+    return Unpack(O, odt);
+  }
+  Backend& bk = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard qg(bk);
+  DeviceTensor dO(bk, qg.q, odt, {tokens, hc * hidden}, O.data());
+  DeviceTensor dS(bk, qg.q, DType::kF32, {tokens, hc}, s.data());
+  DeviceTensor dV(bk, qg.q, vdt, {tokens, hidden}, V.data());
+  vt::Qwen4ExpPleGate(qg.q, dO.tensor(), dS.tensor(), dV.tensor(), args);
+  bk.Synchronize(qg.q);
+  dO.Download(qg.q, O.data());
+  return Unpack(O, odt);
+}
+
 const float* ConvExpectedFor(int64_t dilation) {
   switch (dilation) {
     case 1: return &kConvExpectedD1[0];
@@ -668,4 +803,78 @@ TEST_CASE("the qwen4_exp CUDA arms are registered for kCUDA and refuse BY NAME e
   CHECK_THROWS(vt::GetOp(vt::OpId::kQwen4ExpQsaGatherAttention, DeviceType::kCUDA));
   CHECK_THROWS(vt::GetOp(vt::OpId::kRmsNormGroup, DeviceType::kCUDA));
 #endif
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The runtime dtype tag
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("the qwen4_exp CUDA arms agree with the CPU arms on EVERY admitted dtype") {
+  if (SkipNoCuda("qwen4_exp CUDA dtype-tag arms")) return;
+  // These three kernels carry the dtype as a RUNTIME TAG rather than a template
+  // parameter (each .cu header argues why), so every operand/dtype pairing goes
+  // through ONE kernel and a wrong tag mapping is invisible to an f32-only gate.
+  // The f32 cases above are all f32; this one walks the whole admitted matrix.
+  //
+  // The bound is ZERO. Widening a value from bf16 or f16 to f32, doing identical
+  // arithmetic, and rounding once on the store is the same operation on both
+  // arms, so anything but bitwise equality is a defect and not a dtype cost.
+  const DType kAll[3] = {DType::kF32, DType::kBF16, DType::kF16};
+  const DType kOut[2] = {DType::kF32, DType::kBF16};  // outputs are f32/bf16
+
+  SUBCASE("write-back: all 18 (hyper, block, injection) triples") {
+    constexpr int64_t T = 3, hc = 4, H = 17;
+    const std::vector<float> hy = RandomF32(static_cast<size_t>(T * hc * H), 5u);
+    const std::vector<float> bo = RandomF32(static_cast<size_t>(T * H), 6u);
+    const std::vector<float> inj = RandomF32(static_cast<size_t>(T * hc), 7u);
+    for (DType hdt : kOut) {
+      for (DType bdt : kAll) {
+        for (DType idt : kAll) {
+          CAPTURE(DName(hdt));
+          CAPTURE(DName(bdt));
+          CAPTURE(DName(idt));
+          char nm[80];
+          std::snprintf(nm, sizeof nm, "writeback h=%s b=%s i=%s", DName(hdt), DName(bdt),
+                        DName(idt));
+          CheckBitwise(RunWriteBackDt(DeviceType::kCUDA, hy, bo, inj, T, hc, H, hdt, bdt, idt),
+                       RunWriteBackDt(DeviceType::kCPU, hy, bo, inj, T, hc, H, hdt, bdt, idt),
+                       nm);
+        }
+      }
+    }
+  }
+
+  SUBCASE("conv: all 6 (x/weight, ring/out) pairs, output AND ring together") {
+    constexpr int64_t kDil = 3, kTokens = 5;
+    const std::vector<float> x = RandomF32(static_cast<size_t>(kTokens * kChannels), 41u);
+    const std::vector<float> w = RandomF32(static_cast<size_t>(kChannels * kKernel), 42u);
+    const std::vector<float> st =
+        RandomF32(static_cast<size_t>(kChannels * (kKernel - 1) * kDil), 43u);
+    for (DType xdt : kAll) {
+      for (DType sdt : kOut) {
+        CAPTURE(DName(xdt));
+        CAPTURE(DName(sdt));
+        char nm[80];
+        std::snprintf(nm, sizeof nm, "conv x/w=%s ring/out=%s", DName(xdt), DName(sdt));
+        CheckBitwise(RunConvDt(DeviceType::kCUDA, kDil, x, kTokens, w, st, xdt, sdt),
+                     RunConvDt(DeviceType::kCPU, kDil, x, kTokens, w, st, xdt, sdt), nm);
+      }
+    }
+  }
+
+  SUBCASE("gate: all 6 (value, out) pairs") {
+    constexpr int64_t T = 7, hc = 3, H = 33;
+    const std::vector<float> sc = RandomF32(static_cast<size_t>(T * hc), 61u, -6.0f, 6.0f);
+    const std::vector<float> v = RandomF32(static_cast<size_t>(T * H), 62u);
+    for (DType vdt : kAll) {
+      for (DType odt : kOut) {
+        CAPTURE(DName(vdt));
+        CAPTURE(DName(odt));
+        char nm[80];
+        std::snprintf(nm, sizeof nm, "gate value=%s out=%s", DName(vdt), DName(odt));
+        CheckBitwise(RunGateDt(DeviceType::kCUDA, sc, v, T, hc, H, 2.5f, vdt, odt),
+                     RunGateDt(DeviceType::kCPU, sc, v, T, hc, H, 2.5f, vdt, odt), nm);
+      }
+    }
+  }
 }

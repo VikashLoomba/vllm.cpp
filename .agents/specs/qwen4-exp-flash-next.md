@@ -6409,12 +6409,18 @@ of this property.
   loses `ResidentWeight::d_dev` and re-uploads the tower. Hoisting it to load time
   remains owed WITH the remaining CUDA arms, and no speed claim on this row is
   admissible before it. **This wave makes NO speed claim and measured none.**
-- **f16 is admitted by these three device arms and is not gated against an
-  oracle.** The op contract admits f32/f16/bf16 and the runtime-tag design made
-  admitting f16 free, so it is admitted rather than refused — a device arm that
-  refused a dtype its CPU sibling accepts would be a divergence to record. But
-  the goldens are f32 and the model dtype is bf16, so the f16 path is covered by
-  neither. Owed: an f16 CPU-vs-CUDA case, or a named refusal.
+- **f16 is admitted by these three device arms and has no ORACLE, only a CPU
+  comparison.** The op contract admits f32/f16/bf16 and the runtime-tag design
+  made admitting f16 free, so it is admitted rather than refused — a device arm
+  that refused a dtype its CPU sibling accepts would be a divergence to record.
+  The CPU-vs-CUDA half is now GATED: `test_qwen4_exp_cuda.cpp` walks all 18
+  write-back `(hyper, block, injection)` triples, all 6 conv `(x/weight,
+  ring/out)` pairs and all 6 gate `(value, out)` pairs, each held to BITWISE
+  equality, because widening on load and rounding once on the store is the same
+  operation on both arms and anything else is a defect rather than a dtype cost.
+  What is still owed is the ORACLE half: the transformers goldens are f32 and the
+  model dtype is bf16, so nothing upstream has ever been run at f16 for these
+  ops. Owed: an f16 golden, or a recorded statement that no caller produces one.
 - **The dtype tag is a runtime switch, not a template parameter**, which is a
   deliberate divergence from the `<Tin, Tout>` house style of `cuda_ops.cu`
   argued in each TU's header (the tag is a kernel-wide scalar, so the branch is

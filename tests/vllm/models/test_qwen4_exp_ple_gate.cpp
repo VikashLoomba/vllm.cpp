@@ -51,7 +51,11 @@
 // against the same golden, so #2336's claim that the dot needs no new op is
 // measured here rather than asserted in a comment.
 //
-// SCOPE, HONESTLY. CPU only — no CUDA arm of this op exists, and one written on
+// SCOPE, HONESTLY. This file is the CPU arm's gate. A CUDA arm of this op DOES
+// now exist (`src/vt/cuda/cuda_qwen4_exp_ple.cu`, W6-CUDA) and is gated in
+// `test_qwen4_exp_cuda.cpp`, which carries the NaN case this op's declaration
+// requires of a device arm; nothing below runs on a device. The text that stood
+// here said no CUDA arm exists, and it read: CPU only — no CUDA arm of this op exists, and one written on
 // this CPU-only host could not be gated on it. Nothing calls this op from a
 // production entry point yet: `ForwardQwen4ExpForConditionalGeneration` still
 // refuses by name, the PLE block that will call it is W5e-2, the wiring is owned

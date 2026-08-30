@@ -6231,6 +6231,87 @@ moves every value the oracle golden measures. And `num_reqs > 1` is still refuse
 what changed is that the refusal no longer kills the engine.
 
 
+### W6-CUDA — the first CUDA arms this architecture has ever had
+
+**THE SPLIT, AND THE CRITERION IT WAS MADE ON.** Six `qwen4_exp` ops were
+CPU-only, plus `vt::RmsNormGroup` and the block-decoding n-gram gather. This wave
+gives CUDA arms to **three**: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate` and
+`vt::Qwen4ExpGatedResidualWriteBack`.
+
+The line is not leverage and it is not convenience. It is **whether the op
+performs a reduction across a parallel axis**, because that is precisely the
+question every `## Owed` CUDA entry above already poses:
+
+| op | reduction across a parallel axis | decision a device arm must make | this wave |
+|---|---|---|---|
+| `vt::Qwen4ExpGatedResidualWriteBack` | none — one multiply, one add per output | none | **done** |
+| `vt::Qwen4ExpPleGate` | none — elementwise | none | **done** |
+| `vt::Qwen4ExpPleConv` | four taps, walked by ONE thread in the host's order | none | **done** |
+| `vt::Qwen4ExpGatedResidual` | grouped sum of squares, `double` here | the reduction WIDTH: a 571x separation from f32 at group size 2560 | owed |
+| `vt::RmsNormGroup` | grouped sum of squares, **f32** here, in the dumped order | same question, opposite answer — the two must NOT be unified | owed |
+| `vt::Qwen4ExpQsaCompress` | pooled-key sum of squares, f32 ascending | the width, plus the `round_intermediates_to_bf16` arm | owed |
+| `vt::Qwen4ExpQsaGatherAttention` | two softmax passes over a gathered prefix | the VISIT ORDER (ascending is what makes a sub-budget gather bit-identical to dense), a DEVICE-side `keys_visited`, and gather-vs-mask | owed |
+
+The three done ops inherit their CPU arms' recorded precision contracts
+**unchanged** — the conv's `double` four-tap accumulator, the gate's all-double
+interior and its `SignedSqrt` NaN guard — so no wave has to make a decision on
+their behalf and none was made. The four owed ops each own a decision this spec
+already records and this wave did not pre-empt.
+
+**NOTHING IN PRODUCTION REACHES THESE THREE KERNELS, AND THAT IS NOT A SPLIT
+ARTEFACT.** `ModelRegistry::Forward` is all-or-nothing: a `qwen4_exp` step calls
+all six ops plus `vt::RmsNormGroup` plus a block-decoding `vt::Embedding` gather,
+and `GetOp` THROWS on an unregistered (op, device) rather than falling back —
+the portable CPU reference tier cannot rescue it, because that tier is gated on
+`Backend::DeviceMemoryIsHostAddressable()` and `CudaBackend` leaves it at the
+base `false` (CUDA on GB10 allocates with `cudaMalloc`; #844, #1435). So **no
+split short of all six plus `vt::RmsNormGroup` plus `EmbeddingKernelCuda`'s
+missing keep-quant arm makes `--device cuda` run this model**, and a wave that
+had written all seven blind on a host with no CUDA compiler would have been
+guessing at four recorded decisions at once. The reachability of these three arms
+from a production entry point is therefore **VACUOUS, not proven**, under
+AGENTS.md "Nothing lands dead": the wiring is owned by row
+`MODEL-MM-QWEN4-EXP` under campaign
+[#1978](https://github.com/mudler/vllm.cpp/issues/1978), tracked by
+[#2031](https://github.com/mudler/vllm.cpp/issues/2031), and its own issue is
+OWED (GitHub writes are `403` from this host, account suspended, so nothing could
+be filed and no row was appended to `.agents/issue-index.md`; an index row
+pointing at an issue that does not exist is worse than an absent one).
+
+**Still owed after this wave, in order:**
+
+- **The CUDA arms of the four reduction ops**, each with the decision named in the
+  table above. Unchanged by this wave except that the precedent for HOW a
+  `qwen4_exp` device arm is written, gated and mutated now exists.
+- **`EmbeddingKernelCuda` decodes no blocks.** `src/vt/cuda/cuda_ops.cu` refuses a
+  block-quantized table BY NAME (f32/bf16 only) while the CPU `EmbeddingKernel`
+  carries the keep-quant arm that holds the 51.2 G-parameter n-gram table at
+  28.8 GB of IQ4_NL instead of 102.4 GB of bf16. The n-gram gather therefore
+  cannot run on CUDA even before the six ops. This entry already existed above;
+  it is restated here because it is now one of the LAST things between this
+  architecture and a device step, rather than one of many.
+- **The MoE adapter is still rebuilt per layer per step**, which on a device arm
+  loses `ResidentWeight::d_dev` and re-uploads the tower. Hoisting it to load time
+  remains owed WITH the remaining CUDA arms, and no speed claim on this row is
+  admissible before it. **This wave makes NO speed claim and measured none.**
+- **f16 is admitted by these three device arms and is not gated against an
+  oracle.** The op contract admits f32/f16/bf16 and the runtime-tag design made
+  admitting f16 free, so it is admitted rather than refused — a device arm that
+  refused a dtype its CPU sibling accepts would be a divergence to record. But
+  the goldens are f32 and the model dtype is bf16, so the f16 path is covered by
+  neither. Owed: an f16 CPU-vs-CUDA case, or a named refusal.
+- **The dtype tag is a runtime switch, not a template parameter**, which is a
+  deliberate divergence from the `<Tin, Tout>` house style of `cuda_ops.cu`
+  argued in each TU's header (the tag is a kernel-wide scalar, so the branch is
+  warp-UNIFORM). Templated specialisations are a SPEED item and are owed with the
+  MoE hoist above; nothing here has been measured for throughput.
+- **The QSA indexer's page translation is still a HOST read.** `vt::Qwen4ExpPleConv`'s
+  device arm discharges the SMALLER instance of that problem — it reads
+  `query_start_loc` and `conv_state_indices` on the device rather than on the
+  host — so the pattern the QSA arm needs now has an in-tree precedent on this
+  row. The QSA entry itself is unchanged and still owed.
+
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**
@@ -6279,6 +6360,7 @@ a row here, and every row says whether anything in production reaches it:
 | W5j | the forward CONSUMES the by-name channel, and `ModelFactory::consumes_multi_kv` narrows the engine's `multi_kv` refusal to a model-declared capability | **yes** — `ModelRegistry::Forward` dispatches a THREE-GROUP topology to this hook, which resolves all five published caches by name and reads group 2's own block table; M4 proves the guard still refuses with the bit cleared, M6 proves the tower is entered. It is still a SINGLE-SHOT prefill: nothing decodes a second token | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2353](https://github.com/mudler/vllm.cpp/issues/2353), W5j's own issue OWED |
 | W5k | the PLE conv ring's DTYPE and the n-gram history's RESIDENCY settled against the running lane oracle, and the SECOND STEP | **yes, and it DECODES** — `ModelRegistry::Forward` runs a prefill at `past_len` 0 and then a decode at `past_len` 6 over the engine's own persistent recurrent group, sampling a token on each; M1 deletes the n-gram write-back INSIDE `RunQwen4ExpPleBlock` and the step-1 history assertion reds, which is the first measured reach of that block's body | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5k's own issue OWED |
 | W5L | `GPUModelRunner` and `LoadedEngine` DRIVEN end to end, and the model-declared concurrency ceiling that keeps a server alive | **yes, and it SERVES** — a real `GPUModelRunner` allocates all three published groups, gathers all three block tables and runs a prefill then a decode through `execute_model` / `sample_tokens`; `LoadedEngine::FromModelDir` loads a `qwen4exp` GGUF and `generate` returns tokens; `examples/server` answers `POST /v1/completions` on CPU. M1 deletes the runner's `multi_kv` handoff, M3 deletes the per-group gather call site, and M4 deletes the clamp's production call site — each reds | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5L's own issue OWED |
+| W6-CUDA | the first CUDA arms of this architecture: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpGatedResidualWriteBack` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and four ops plus `vt::RmsNormGroup` plus the block-decoding n-gram gather still have no CUDA arm, so no `qwen4_exp` step can reach a CUDA queue at all. The gate is `tests/vllm/models/test_qwen4_exp_cuda.cpp`: the lane-pinned transformers goldens ON DEVICE plus a byte comparison against the CPU arms. Its RESULT is recorded in the W6-CUDA section of `## Owed`, and until a line there names the device it ran on, nothing here has been measured on one | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than

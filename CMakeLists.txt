@@ -1826,7 +1826,14 @@ if(VLLM_CPP_CUDA)
     # General 3-D convolution (LTX25-DEVICE-RESIDENCY W5, #1007) — the device arm
     # the LTX-2.5 video VAE decode never had.
     src/vt/cuda/cuda_conv3d.cu
-    src/vt/cuda/cuda_attention_cross.cu)
+    src/vt/cuda/cuda_attention_cross.cu
+    # Qwen4-Exp (Qwen3.8-Flash-Next) device arms, row MODEL-MM-QWEN4-EXP W6-CUDA:
+    # the first CUDA kernels this architecture has ever had. Split to mirror the
+    # cpu_qwen4_exp*.cpp units listed above. Unconditional and at
+    # if(VLLM_CPP_CUDA) depth one, which is what check-cuda-op-arch-gate.py
+    # requires of any TU that registers an op.
+    src/vt/cuda/cuda_qwen4_exp.cu
+    src/vt/cuda/cuda_qwen4_exp_ple.cu)
   find_package(CUDAToolkit REQUIRED)
   # cublasLt is linked now so the Task 4 matmul lands without a build change.
   target_link_libraries(vllm PUBLIC CUDA::cudart CUDA::cublasLt)

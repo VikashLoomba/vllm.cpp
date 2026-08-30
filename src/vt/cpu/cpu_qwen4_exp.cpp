@@ -58,12 +58,20 @@
 // in and a wider accumulator there would make the two arms disagree for a reason
 // no oracle authorises.
 //
-// A CUDA ARM INHERITS A DECISION FROM THIS, and does not yet exist: a straight
-// f32-accumulate block reduction will not meet the same bound on the norm, so
-// that kernel must either accumulate wider than f32 or be gated against the
-// oracle directly. Deciding which belongs to the wave that writes it. Nothing
-// here is registered for any device but kCPU, so the dispatcher refuses by name
-// on every other one rather than silently falling back.
+// A CUDA ARM OF `vt::Qwen4ExpGatedResidual` INHERITS A DECISION FROM THIS, and
+// still does not exist: a straight f32-accumulate block reduction will not meet
+// the same bound on the norm, so that kernel must either accumulate wider than
+// f32 or be gated against the oracle directly. Deciding which belongs to the
+// wave that writes it, and the spec's `## Owed` carries it.
+//
+// `vt::Qwen4ExpGatedResidualWriteBack` IS DIFFERENT AND W6-CUDA GAVE IT A
+// DEVICE ARM (`src/vt/cuda/cuda_qwen4_exp.cu`). It has no reduction — every
+// output element is one multiply and one add — so there is no width to choose,
+// and the device kernel spells the host's two roundings with
+// `__fmul_rn`/`__fadd_rn` against this build's `-ffp-contract=off`, making it
+// BYTE-IDENTICAL rather than merely close. Nothing else here is registered for
+// any device but kCPU, so the dispatcher refuses those by name on every other
+// one rather than silently falling back.
 #include <cmath>
 #include <cstdint>
 #include <vector>

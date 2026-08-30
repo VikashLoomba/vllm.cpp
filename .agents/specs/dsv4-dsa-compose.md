@@ -137,6 +137,54 @@ forward refuses because `AttentionBlock` indexes the COLLAPSED geometry. So W1
 is a forward change, not a loader change — and the refusal's own text is the
 specification of what to build.
 
+### W1 design — the compressor-only shape is COMPOSITION, not new kernels
+
+Traced before estimating, because every earlier estimate on this row family moved
+once the tree was read.
+
+**Every primitive W1 needs already exists, on CPU and CUDA.**
+
+| the shape needs | what exists |
+|---|---|
+| the window pass | `vt::MlaDecodeAttention` with `window_size` (`left == sliding_window - 1`) -- landed by `KV-DSV4-MULTICACHE` W5 |
+| the compressed-history pass | the SAME op's SELECTED-SLOT arm, `topk_indices` + `valid_counts` |
+| combining the two | `vt::MergeAttnStates` -- an LSE merge with both `+inf` and both-`-inf` edge cases ported |
+| the pool | `CompressorPoolNorm` -- per-column softmax over the window, then RMSNorm |
+| the APE save | `CompressorSaveScoreApe` |
+| the per-head sink | `MlaDecodeAttentionArgs::attn_sink`, landed by W5 |
+
+So W1 composes: save state each step, pool at a boundary into the compressed
+cache, then TWO attention passes merged by their LSEs -- rather than the single
+fused two-cache kernel upstream calls
+(`flash_mla_with_kvcache(k_cache=swa, extra_k_cache=compressed, ...)`). The
+composition is mathematically the same; only the kernel fusion differs, and that
+is a performance question for a later wave, not a correctness one.
+
+**`compress_ratio == 128` FIRST because `coff == 1` there.** `overlap` is
+`compress_ratio == 4`, so the 128 shape has no overlapping windows and no
+`head_offset` role selection -- the mechanism W5-4 of `dsv4-dsa-compose.md`
+describes. It exercises the state cache, the boundary gate and the two-pass merge
+without the hardest part.
+
+#### THE SINK MUST ENTER EXACTLY ONE PASS
+
+The trap, written down before anyone hits it. A sink is one extra logit in the
+DENOMINATOR. `MergeAttnStates` combines two states by their LSEs, and each pass's
+LSE is `log sum exp(its scores)`. **If both passes seed the denominator with the
+sink, the merged denominator counts it TWICE**, and the result is a plausible,
+slightly-too-small attention output that no token gate would catch.
+
+This is the same defect family as the split double-count `MlaDecodeAttentionArgs`
+already documents: a sink added per split rather than in the final reduction. It
+has now appeared twice in this design, which is why it is stated as a rule --
+**the sink belongs to exactly one contributor to any merged denominator** --
+rather than as a note about one kernel.
+
+The gate must therefore compare a two-pass merged result against a SINGLE-pass
+reference over the union of both key sets, with a non-zero sink, at a length
+where both passes are non-empty. A gate where either pass is empty cannot see a
+double-count.
+
 ## Our baseline
 
 What this tree has TODAY, so a later reader does not re-derive it:

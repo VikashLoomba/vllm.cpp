@@ -42,13 +42,26 @@ per write (offset views are publicly constructible through
 merged write cannot exist), and the production staging
 fan-in is causally interleaved (each restage is produced by a host
 round-trip between writes), so a merged write would carry bytes that do
-not exist yet. Owed next: the **round-trip-elimination lever** — the
-`MarkHostWritten` → `CommitHost` → restage host↔device cycle produces
-the staging writes themselves; removing the round-trips removes the
-per-op tax multiplicatively, inside our file set, on the `vt::FusedChain`
-seam. The tt-metal-side residual (a multi-destination write that reaches
-several offset views at once) stays recorded as the upstream-shaped
-alternative.
+not exist yet. **W7**
+([#2282](https://github.com/mudler/vllm.cpp/issues/2282)) — the
+round-trip-elimination lever — landed 2026-08-30 as a **measured null
+with an inverted premise, plus the safety rule the attempt proved
+necessary**: on both production workloads the staging write count is
+byte-identical before/after and the wall is unchanged (e2e ambient:
+`pwrite`=989 per 8640 steps in both arms, wall 1385.53 s vs 1385.93 s
+mean; vllm-cli: identical counters, wall noise), so the residency state
+does NOT manufacture the writes — they are the causally required ones
+W6 already identified (each produced by a host round-trip). The first
+gate run caught a REAL latent defect in the reservation arm (it served
+a stale persistent buffer over a live device shadow — wrong tokens on
+the default decode path); the fix spends the reservation on every
+content-establishing transition and refuses to serve when
+`device_current` is set (`d2fd05c6e`); suite 51/51 · 5852, sacred pair
+16/16 STRICT both legs. The review's latent geometry finding landed as its
+own red-first fix ([#2294](https://github.com/mudler/vllm.cpp/issues/2294));
+see `## Evidence`. The tt-metal-side residual (a multi-destination
+write that reaches several offset views at once) stays recorded as the
+upstream-shaped alternative.
 
 ## Scope
 
@@ -311,6 +324,32 @@ column above is the entry point, not the whole chain.
   stays recorded as the upstream-shaped alternative.
   **Outcome (2026-08-29): named unreachable** — see `## Evidence`, W6.
   The successor lever is round-trip elimination, not write amortization.
+- **W7 — staging-write elimination: a residency state that stops
+  manufacturing restages (#2282).** The W6 probe counted 30 restages ≈
+  7-8 per step, and every one is our own doing: `MarkHostWritten`
+  (`tenstorrent_ops.cpp:5654`; callers `tenstorrent_backend.cpp:56,66,70`)
+  marks a slot device-stale — including scratch-block acquisition, where
+  the device bytes are garbage but the pending op may fully overwrite
+  them anyway — and `CommitHost` (`:1231`) drops the whole shadow on a
+  host in-place write, forcing a full-tensor restage (`:561`) on the
+  next device use. Make the residency state precise: a decode step
+  stages each slot's bytes once, or zero times when the consumer
+  overwrites the full buffer on device. The implementer derives the
+  mechanism (device-will-overwrite reservation, narrowed
+  `CommitHost`, upload-on-write for host-written device-resident
+  slots) and records it with explicit restage semantics. `StagingStats`
+  must observe the per-step write count; a needed new counter lands
+  red-first. Invariant: staging is bit-identical — the sacred golden
+  pair stays 16/16 and the full TT suite stays green; this wave changes
+  SPEED, never tokens; capture-unsafe refusals keep their semantics;
+  the f32 arms keep their declared dtypes; the #1486 never-destroy rule
+  holds; the route must move the production decode path's write count.
+  Evidence owed: same-method before/after on the P150 (identical leg,
+  JIT-discard per arm, one lock hold) reporting BOTH the per-step write
+  count and the wall time, plus a fresh benchmark-record entry; a count
+  that does not drop or a wall that does not move is a reported result
+  — the attribution shifts or the lever is named unreachable with the
+  trace that proves it.
 
 Each wave lands focused-green before the next; the full gate + fresh review close
 the row.
@@ -348,14 +387,21 @@ the row.
   `SupportsCompressedConvState()` flip in `src/vt/tenstorrent/tenstorrent_backend.cpp`,
   outside the W1 delegated file set. Escalated to the operator 2026-08-23; blocks the
   W2 e2e gate on the default (bf16-state) arm, not on `VT_GDN_STATE_BF16=0`.
+- **W7 serve arms are production-unreached on the measured workloads** —
+  the avoided counters read 0 in every probed leg (vllm-cli ×3, e2e
+  ambient ×2 per arm); the arms are guard-evaluated on every staging
+  call and the W7 drift proved they DO serve when the guard allows.
+  LEG A (host-hybrid opt-out) was not dump-probed. The
+  `VT_TT_STAGE_DUMP` counters stay in-tree as the detector.
 - On landing, the GDN row's lifecycle moves (`ACTIVE` → `DONE` + `## Outcome`) in
   the same change: its ops become production-reached.
 
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `017c3277f` (bumped
-2026-08-29; W5 #2244 via #2258 landed since the previous `a456e6eaf`). Branch
+in `.agents/developer-preferences.md`). Base `origin/main` @ `c31b2496e` (rebased
+2026-08-30 for the PR's up-to-date requirement; the previous base `785d4304f`
+carried W6 #2273 via #2280). Branch
 `row/BACKEND-TENSTORRENT-QWEN35`, worktree
 `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 
@@ -431,6 +477,58 @@ round-trip elimination (remove the `CommitHost`/`Backend::Copy` host↔device
 cycle that produces the restages; `vt::FusedChain` seam), and the
 upstream-shaped alternative is a multi-destination write that reaches several
 offset views at once in tt-metal.
+
+### W7 — the staging-write elimination is null: the premise inverts, and the gate failure is the real find (A/B log [tt-qwen35-staging-w7-20260830.log](../../docs/bench-evidence/tt-qwen35-staging-w7-20260830.log))
+
+`bd81430a9` + `d2fd05c6e` (#2282): the reservation state
+(`MarkScratchAcquired` arms `device_reserved` where base called
+`MarkHostWritten`), the `EnsureDevice2D` reservation arm, the eager
+full-slot memset fill and the device-resident D2D copy arms, and the
+rule that every content-establishing transition spends the reservation.
+Red-first implementer, fresh reviewer PASS, repair, scoped re-review
+PASS, full gate rerun on the immutable head.
+
+**The first gate run failed ambient — and the failure was a real latent
+defect, not noise.** LEG B drifted at prompt[1] tok=0 on the W7 head,
+deterministically, with base `785d4304f` green on the identical leg.
+Root cause: the reservation arm served `*s->persistent` whenever
+`device_reserved` was set, even after a producer had committed a live
+device shadow (the pool hands the block to a new tenant → a matmul
+commits `[8,256]` → the next bf16 stage at the block's earlier
+`[5,1024]` geometry received the PREVIOUS tenant's bytes and dropped
+the live shadow). Fixed on two independent layers: every
+content-establishing transition spends the flag, and the arm refuses
+when `device_current` is set. The new suite case pins the joint
+invariant — single-layer mutations pass by design, joint removal is red
+— and reaches the arm through the production staging path. Suite
+51/51 · 5852, sacred 16/16 STRICT both legs on the final head
+`b142a4683`.
+
+**The A/B is a null on both production workloads, and the counter
+identity is the mechanism.** Same method per arm (ambient default leg;
+the symmetric `VT_TT_STAGE_DUMP` atexit probe, temporary, reverted
+before this record; one lock hold; interleaved legs). vllm-cli 3-token:
+the arms never fire (avoided 0/0/0 in every leg), every counter is
+identical before/after (bulk=277 pwrite=169 palloc=139), wall 18.844 s
+vs 18.946 s mean (−0.54%, noise). E2E ambient 16-prompt (8640 GDN
+steps): AFTER `bulk=10205 pwrite=989 palloc=173 pbytes=1459288064
+avoided 0/0/0` vs BEFORE the same four counters to the byte in all four
+legs; wall 1385.527 s vs 1385.927 s mean (−0.03%, noise); per-step
+staging writes 0.114 in both arms. Why: in base the pool-acquire marks
+the slot device-stale, but a content op commits a fresh shadow before
+any restage can fire — the same commit that spends the W7 flag — so
+both worlds restage identically; the arm's serve requires
+`device_reserved && !device_current`, which no production interleaving
+reaches. The W6-probe restages (7-8/step on vllm-cli) are the causally
+required ones W6 already identified, not residency-state manufacture.
+**Verdict: the premise of #2282 is inverted — reported result, not a
+ceiling.** The staging-write-elimination lane is closed with evidence;
+the landed value is the spend/refuse safety rule (the drift proves the
+unguarded reservation was a live wrong-tokens hazard on the default
+path), the test that pins it, and the counters that keep the serve
+observable. The serve arms are production-evaluated but never serve on
+the measured workloads; LEG A was not dump-probed (both named in
+`## Owed`).
 
 ### W0 — refusal sweep (runs 1-8, `/tmp/w0_sweep_run{1..8}.log`)
 
@@ -1171,3 +1269,22 @@ Gates: opt-out leg 16/16 PASS (9 strict, 7 near-tie, max gap 0.5 nats at
 prompt[15] tok=9) exit 0; ambient leg 16/16 (10 strict, max 0.375) exit 0 —
 unchanged; suite 40/40 / 3757/3757 exit 0. Evidence:
 `docs/bench-evidence/tt-2115-eager-arm-pair-20260828.log`.
+
+### #2294 — the capture-lane copy records the served geometry (2026-08-30)
+
+The W7 review's latent finding, fixed red-first. `CopyDeviceDeviceIfCapture`
+installed a SRC-shaped clone into dst's slot but left `dev_rows`/`dev_cols`
+naming dst's old geometry; its guard checks slot byte sizes only, so equal
+bytes at differing `[rows,cols]` passed, and a later exact-shape
+`EnsureDevice2D` false-hit the fast path and served the wrongly-shaped
+shadow. The red is the ttnn inner-dim throw (`a_shape[-1] == b_shape[-2]`,
+8 vs 16) on the consume matmul — a loud failure, not silent corruption —
+plus the lane's missing avoided-copy counter. Fix: record src's
+`logical_shape()` in the commit block (the same lines W7 put on
+`CopyDeviceDeviceIfResident`) and bump `StagingAvoidedDeviceCopy` so both
+D2D arms are observable (the eager tests' `ForceEager` scopes decline the
+capture lane, so no existing counter assertion shifts). Focused case
+131/131 green; suite 52/52 · 5983 (baseline on the unmodified tree:
+51/51 · 5852 green first). No differing-geometry D2D caller exists in
+production today (the W7-review audit); the test is the guard for the one
+that appears.

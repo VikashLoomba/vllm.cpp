@@ -517,7 +517,17 @@ void ForwardMlaAttentionBlock(dense_attn::Dev d, const MlaBlockDims& dims,
                               const MlaBlockWeights& w, const vt::Tensor& hidden,
                               const vt::Tensor& positions, vt::Tensor& kv_cache,
                               const vt::Tensor& slot_mapping, const MlaBlockMetadata& meta,
-                              v1::TritonMLAImpl& impl, vt::Tensor& out);
+                              v1::TritonMLAImpl& impl, vt::Tensor& out,
+                              // KV-DSV4-MULTICACHE W5 (#2323): when given, the
+                              // block writes the attention output
+                              // `[T, num_heads*v_head_dim]` here and RETURNS
+                              // without applying `o_proj`, which it then does not
+                              // require. For a model whose output projection is
+                              // not a dense matrix -- DeepSeek-V4 factorizes it
+                              // as a grouped LoRA -- and a mirror of upstream,
+                              // where `_o_proj` is a separate step. Null for
+                              // every existing caller.
+                              vt::Tensor* attn_pre_o_proj = nullptr);
 
 // The `kv_b_proj` up-projection callback W5 left OPEN (`MlaUpProjectFn`,
 // mla_chunked_context.h:228). Binds the model's `kv_b_proj` weight and the block

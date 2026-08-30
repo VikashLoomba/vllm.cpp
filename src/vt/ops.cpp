@@ -1990,6 +1990,53 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
       q, out, x, weight, conv_state, query_start_loc, conv_state_indices, args);
 }
 
+// vt::Qwen4ExpPleGate — `Qwen4ExpTextPLELayer.forward` :1181-1182 (+ :1184),
+// transformers v5.16.0. The DOT that feeds it is vt::BatchedMatmul and is
+// deliberately not here; see the kQwen4ExpPleGate comment in include/vt/ops.h.
+void Qwen4ExpPleGate(Queue& q, Tensor& out, const Tensor& score, const Tensor& value,
+                     const Qwen4ExpPleGateArgs& args) {
+  constexpr const char* name = "qwen4_exp_ple_gate";
+  VT_CHECK(out.rank == 2 && score.rank == 2 && value.rank == 2,
+           std::string(name) + ": out [T,hc*H], score [T,hc], value [T,H]");
+  const int64_t T = score.shape[0], hc = score.shape[1], h = value.shape[1];
+  VT_CHECK(out.shape[0] == T && value.shape[0] == T,
+           std::string(name) + ": out/score/value must agree on T");
+  VT_CHECK(hc >= 1 && h >= 1, std::string(name) + ": hc and H must be >= 1");
+  // THE ONE CHECK THIS OP EXISTS FOR, after the arithmetic itself. `out` is the
+  // FLATTENED [T, hc*H] the conv and the norm downstream want, and a caller that
+  // flattened (H, hc) instead of (hc, H) produces a buffer of exactly the right
+  // size holding a transposed answer. The product is therefore named against
+  // both factors, so the message says which two numbers were multiplied.
+  VT_CHECK(out.shape[1] == hc * h,
+           std::string(name) + ": out must be [T, hc*H] = [T," + std::to_string(hc) + "*" +
+               std::to_string(h) + "] = [T," + std::to_string(hc * h) + "], got [T," +
+               std::to_string(out.shape[1]) + "]");
+  // f32 score only, the reason SigmoidGateBf16 gives for its own gate operand:
+  // this value is the argument of a sigmoid AND of a square root, and rounding a
+  // transcendental's input is a value change no downstream tolerance owns.
+  VT_CHECK(score.dtype == DType::kF32,
+           std::string(name) + ": score must be f32 (it is the sigmoid/sqrt argument)");
+  VT_CHECK(IsFloat(value.dtype) && IsOutFloat(out.dtype),
+           std::string(name) + ": float value, f32/bf16 out");
+  VT_CHECK(args.gate_divisor > 0.0f,
+           std::string(name) + ": gate_divisor must be > 0 (it is math.sqrt(hidden_size)), got " +
+               std::to_string(args.gate_divisor));
+  // 0 is NOT "no floor". Upstream's literal is 1e-6 and its whole effect is the
+  // 1e-3 floor it puts on |output|; a zero here would silently mean "port the
+  // line without the clamp", which is the defect the op is gated against.
+  VT_CHECK(args.clamp_min > 0.0f,
+           std::string(name) +
+               ": clamp_min must be > 0; 0 is NOT 'no floor'. Upstream's literal is 1e-6 "
+               "(modeling_qwen4_exp.py:1181) and it is applied BEFORE the sqrt, so the "
+               "floor on |out| is its square root");
+  VT_CHECK(out.IsContiguous() && score.IsContiguous() && value.IsContiguous(),
+           std::string(name) + ": out/score/value must be contiguous");
+  VT_CHECK(out.device == q.device && score.device == q.device && value.device == q.device,
+           std::string(name) + ": device mismatch (out/score/value/queue)");
+  reinterpret_cast<Qwen4ExpPleGateFn>(GetOp(OpId::kQwen4ExpPleGate, q.device.type))(
+      q, out, score, value, args);
+}
+
 void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                             const Tensor* bias, Tensor& conv_state,
                             const Tensor& conv_state_indices,
@@ -2533,10 +2580,11 @@ namespace {
 // "contiguous, float, on this queue" means is how a caller silently reads
 // somebody else's device memory.
 void CheckQsaOperand(const Queue& q, const Tensor& t, const char* name, const char* what,
-                     bool is_out) {
+                     bool is_out, bool require_contiguous = true) {
   VT_CHECK(IsFloat(t.dtype) && (!is_out || IsOutFloat(t.dtype)),
            std::string(name) + ": " + what + " must be float (f32/bf16 for outputs)");
-  VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
+  VT_CHECK(!require_contiguous || t.IsContiguous(),
+           std::string(name) + ": " + what + " must be contiguous");
   VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
 }
 
@@ -2612,19 +2660,56 @@ void Qwen4ExpQsaGatherAttention(Queue& q, Tensor& out, const Tensor& query, cons
   VT_CHECK(args.compress_ratio > 1,
            std::string(name) + ": compress_ratio must be > 1, got " +
                std::to_string(args.compress_ratio));
-  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
-           std::string(name) + ": query/key/value/out must be [tokens, heads, head_dim]");
+  // The PAGED address mode (W5d-3, #2249 item 2). It changes the RANK and the
+  // CONTIGUITY of key/value and nothing else, so the checks below fork exactly
+  // there; every other operand is validated once for both arms.
+  const bool paged = args.kv_block_table != nullptr;
+  VT_CHECK(paged == (args.kv_block_size > 0),
+           std::string(name) +
+               ": kv_block_table and a positive kv_block_size must be set TOGETHER — a "
+               "page table with no page size cannot address a row, and a page size with "
+               "no table is a paged read that silently falls back to a contiguous one");
+  VT_CHECK(query.rank == 3 && out.rank == 3,
+           std::string(name) + ": query/out must be [tokens, heads, head_dim]");
+  VT_CHECK(key.rank == value.rank && key.rank == (paged ? 4 : 3),
+           std::string(name) + ": key/value must be " +
+               (paged ? "[num_pages, kv_block_size, num_kv_heads, head_dim] in the paged "
+                        "address mode"
+                      : "[max_kv, num_kv_heads, head_dim]"));
   const int64_t T = query.shape[0];
   const int64_t HQ = query.shape[1];
   const int64_t DH = query.shape[2];
-  const int64_t HKV = key.shape[1];
+  const int64_t HKV = key.shape[paged ? 2 : 1];
   VT_CHECK(HQ > 0 && HKV > 0 && DH > 0, std::string(name) + ": bad attention shape");
   VT_CHECK(HQ % HKV == 0,
            std::string(name) + ": GQA needs num_q_heads divisible by num_kv_heads, got " +
                std::to_string(HQ) + " over " + std::to_string(HKV));
-  VT_CHECK(key.shape[0] == value.shape[0] && value.shape[1] == HKV && key.shape[2] == DH &&
-               value.shape[2] == DH,
-           std::string(name) + ": key/value must be [max_kv, num_kv_heads, head_dim]");
+  for (int i = 0; i < key.rank; ++i) {
+    VT_CHECK(key.shape[i] == value.shape[i],
+             std::string(name) + ": key and value must have the SAME shape");
+  }
+  VT_CHECK(key.shape[key.rank - 1] == DH,
+           std::string(name) + ": the key/value head_dim must match the query's");
+  if (paged) {
+    const Tensor& bt = *args.kv_block_table;
+    VT_CHECK(key.shape[1] == args.kv_block_size,
+             std::string(name) + ": the cache view's page height " +
+                 std::to_string(key.shape[1]) + " disagrees with kv_block_size " +
+                 std::to_string(args.kv_block_size));
+    VT_CHECK(bt.rank == 2 && bt.shape[0] == 1 && bt.shape[1] > 0,
+             std::string(name) +
+                 ": kv_block_table must be [1, max_pages] i32 — this op serves ONE "
+                 "sequence per call, as the contiguous arm does");
+    VT_CHECK(bt.dtype == DType::kI32, std::string(name) + ": kv_block_table must be i32");
+    VT_CHECK(bt.IsContiguous(), std::string(name) + ": kv_block_table must be contiguous");
+    VT_CHECK(bt.device == q.device, std::string(name) + ": kv_block_table device mismatch");
+    // The row within a page is contiguous even though the PAGE stride is not
+    // (K and V interleave at dim 1 of the flash cache), so the kernel resolves a
+    // base offset from the strides and then reads `head_dim` elements running.
+    VT_CHECK(key.stride[3] == 1 && value.stride[3] == 1,
+             std::string(name) +
+                 ": a paged key/value view must be contiguous WITHIN a head row");
+  }
   VT_CHECK(out.shape[0] == T && out.shape[1] == HQ && out.shape[2] == DH,
            std::string(name) + ": out must match query's shape");
   VT_CHECK(block_ids.rank == 2 && block_ids.shape[0] == T,
@@ -2635,8 +2720,12 @@ void Qwen4ExpQsaGatherAttention(Queue& q, Tensor& out, const Tensor& query, cons
            std::string(name) + ": kv_lens must be [tokens]");
   VT_CHECK(kv_lens.dtype == DType::kI32, std::string(name) + ": kv_lens must be i32");
   CheckQsaOperand(q, query, name, "query", false);
-  CheckQsaOperand(q, key, name, "key", false);
-  CheckQsaOperand(q, value, name, "value", false);
+  // The paged views are STRIDED by construction — `dense_attn::KvSlice` gives
+  // each of K and V a page stride of `2 * block_size * Hkv * Dh` — so the
+  // contiguity half of the shared check cannot apply to them. Dtype and device
+  // still must.
+  CheckQsaOperand(q, key, name, "key", false, /*require_contiguous=*/!paged);
+  CheckQsaOperand(q, value, name, "value", false, /*require_contiguous=*/!paged);
   CheckQsaOperand(q, out, name, "out", true);
   VT_CHECK(block_ids.IsContiguous() && kv_lens.IsContiguous(),
            std::string(name) + ": block_ids/kv_lens must be contiguous");

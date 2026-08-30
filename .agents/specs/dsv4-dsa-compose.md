@@ -74,10 +74,21 @@ nothing here and reads as "upstream does not implement it", which is wrong.
 | SWA-only | 0 | 5 | neither |
 
 Counts are `config.json`'s `compress_ratios` histogram `{0: 5, 4: 21, 128: 20}`
-= 46 entries. **46 is not 43**, and the row's older records say "43 layers" /
-"41 of 43"; 43 is the trellis shard count (`exl3-layer-000..042`). W1 must
-reconcile which number each claim means rather than inherit either (#2186
-raised this and it is still open).
+= 46 entries.
+
+**RESOLVED, and it was already answered elsewhere in this row family.**
+`dsv4-dsa-geometry.md` read the artifact's own `config.json` and records that the
+46 entries are **43 layers + 3 MTP blocks**: layers 0 and 1 are `0`, layers 2..42
+alternate `4` and `128`, and the MTP tail is `0`. So `num_hidden_layers == 43`,
+2 layers are dense, 21 carry an indexer and 20 a compressor-only -- which is
+exactly the "41 of 43 carry a compressor, 21 carry an indexer" the row already
+recorded. There is no contradiction: 43 counts LAYERS, 46 counts the config list
+INCLUDING the MTP tail, and the trellis shard count matches the layers.
+
+W1 therefore inherits 43 and does not need to reconcile anything. The entry is
+kept rather than deleted because #2186 raised it as open and a reader who saw
+that deserves to find the answer here, with its source, rather than a silent
+deletion.
 
 ### D2. The 3-way stream overlap is performance, not correctness
 

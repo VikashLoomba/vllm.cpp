@@ -3898,6 +3898,77 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **THE FORWARD REFUSES THE ONLY PUBLISHED ARTIFACT THAT FITS, AND THIS IS THE
+  BLOCKER. W5n MEASURED IT; NOTHING FIXES IT YET. ISSUE OWED.**
+
+  ```text
+  vt: qwen4_exp_gated_residual: input_mix_weight_down must be float
+  (f32/bf16 for outputs)          at src/vt/ops.cpp:2552
+  ```
+
+  Measured on `rc` job `0f188dd1`, `thor:gpu0`, 2026-08-30, on
+  `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S loaded through `examples/server`
+  at `--device cpu`. The model loads, the engine sizes all three cache groups,
+  the server listens, `POST /v1/completions` is accepted, prefill begins at
+  `prompt_tokens=5`, and the first forward throws. The throw is inside the
+  EngineCore busy loop, so the engine dies and the request returns 500.
+  **Zero tokens.** Evidence:
+  [`docs/bench-evidence/qwen4exp-released-checkpoint-serve-20260830.md`](../../docs/bench-evidence/qwen4exp-released-checkpoint-serve-20260830.md).
+
+  **The cause is a dtype contract, not a bad checkpoint**, and every step is
+  measured:
+
+  1. The published file stores **194** hyper-connection mix weights as **Q8_0**:
+     `blk.N.hc_attn_down`, `blk.N.hc_attn_up`, `blk.N.hc_ffn_down`,
+     `blk.N.hc_ffn_up` (48 each, `[10240, 320]` and `[320, 10240]`) plus
+     `output_hc_down` and `output_hc_up`. The `hc_*_norm` and `hc_*_inject`
+     tensors are F32, which is why the norm is not what refused.
+  2. `qwen4_exp_weights.cpp:265-266` loads `down`/`up` with
+     `LoadMatmul(g, pol, ...)`, which honours the keep-quant policy. Q8_0 has a
+     `vec_dot` and 10240 and 320 are multiples of its 32-element block, so
+     `RouteGgufTensor` returns `kKeepQuant`. **That decision is correct** — it is
+     what keeps this model inside 122.80 GiB.
+  3. `vt::Qwen4ExpGatedResidual` accepts float only
+     (`src/vt/ops.cpp:2551-2559`, `check_operand`).
+  4. **The fixture cannot express the failing case.**
+     `tests/support/qwen4_exp_gguf_fixture.h:367,369,378,380` writes those same
+     tensor names with ggml type `0` (F32). Every green gate on this
+     row has handed that op a float operand; the published artifact hands it a
+     block. **No gate on this row could have caught this**, which is the same
+     shape as W5b-6's gamma polarity: a contradiction that is unreachable while
+     only one side of it is ever built.
+
+  **W5n deliberately did NOT fix it.** The wave was scoped to run the released
+  artifact and report, and a workaround would have destroyed the measurement. The
+  fix is its own wave and needs a design decision this row should not take
+  silently: either `vt::Qwen4ExpGatedResidual` grows a quantized-operand arm
+  (two `kMatmulBT`-shaped `[10240,320]`/`[320,10240]` products against a Q8_0
+  weight, which `vt::` already has kernels for), or the loader narrows the
+  policy for the `hc_*_{down,up}` role and expands just these 194 tensors —
+  measured cost 2 × 48 × 10240 × 320 × 2 B ≈ **1.17 GiB** of bf16 for the
+  per-layer pairs plus 12.5 MiB for the model-level mixer, which fits. The first
+  is faster and mirrors what the file asks for; the second is smaller and lands
+  in one place. **Neither is chosen here.** A gate for whichever lands must build
+  the fixture tensors QUANTIZED, or it will be green for the same reason the
+  current one is.
+
+- **THE FIXTURE IS FLOAT-ONLY WHERE THE ARTIFACT IS QUANTIZED, AND THAT IS A
+  GENERAL GAP, NOT ONE OP'S. ISSUE OWED.** `qwen4_exp_gguf_fixture.h` writes
+  every tensor at ggml type `0` EXCEPT ONE: `per_layer_token_embd.weight` is
+  emitted at type `8` (Q8_0) on line 363, because the n-gram gather is the one
+  path this row already knew had to be exercised quantized. The published UD-IQ1_S file uses NINE encodings
+  (F32, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ1_S, IQ4_NL, BF16) over 1224 tensors.
+  The refusal above is the first place that difference reached a production path;
+  it is unlikely to be the last, because every `vt::` op this loop composes has a
+  dtype contract that the fixture exercises on exactly one side. A fixture arm
+  that emits the real encodings — or a gate driven from the published header
+  manifest already committed at `tests/vllm/models/qwen4_exp_gguf_manifest.inc` —
+  would convert a class of latent refusals into failing tests.
+
+- **W5n's OWN ISSUE IS OWED.** GitHub writes are `403` from this host, so nothing
+  could be filed. W5n rides under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031).
+
 - **W5L's ISSUE IS OWED, and so is the ISSUE FOR THE WAVE IT PROPOSES.** GitHub
   writes are `403` from this host (account suspended), so nothing could be filed
   and no row was appended to `.agents/issue-index.md`; an index row pointing at
@@ -3934,16 +4005,20 @@ All six mutations were re-run after this refactor.
   clamp's stderr line names this spec so the operator who hits the ceiling finds
   the entry.
 
-- **THE `docs/USAGE.md` WEIGHTS ROW IS STILL OWED, AND W5L IS NOT THE CHANGE THAT
-  PAYS IT.** AGENTS.md "Say which weights, and from where" binds the change that
-  makes a capability reachable, and W5L makes serving reachable — but every byte
-  it served came from `tests/support/qwen4_exp_gguf_fixture.h`, a synthetic file
-  whose weights are a deterministic ramp. No byte of
-  `unsloth/Qwen3.8-Flash-Next-GGUF` has been read on any host this row reaches, so
-  a registry row stating a size, a sha256 and a served arm would be a row nobody
-  measured. `docs/USAGE.md` gained the CONCURRENCY CEILING instead, which is a
-  fact about this port that W5L did measure. The weights row is owed by the wave
-  that serves a published checkpoint.
+- **PAID BY W5n, AND THE ROW IT PAYS SAYS THE ARM DOES NOT DECODE.** This entry
+  read "THE `docs/USAGE.md` WEIGHTS ROW IS STILL OWED, AND W5L IS NOT THE CHANGE
+  THAT PAYS IT", on the correct ground that every byte W5L served came from
+  `tests/support/qwen4_exp_gguf_fixture.h`, a synthetic file whose weights are a
+  deterministic ramp. **W5n read the published bytes.** `rc` job `0f188dd1` on
+  `thor:gpu0`, 2026-08-30, drove `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S
+  (67.564 GiB, 3 shards, 1224 tensors) through `examples/server` on
+  `--device cpu`. The registry row now states a size, three sha256 values, a
+  revision and an arm that WAS measured — and what it records is that the arm
+  **LOADS and LISTENS and produces ZERO TOKENS**: 4446 s to `/health`, 69.206 GiB
+  peak RSS, then `POST /v1/completions` returns 500. See
+  [the evidence](../../docs/bench-evidence/qwen4exp-released-checkpoint-serve-20260830.md)
+  and the entry below for the refusal. A row that claimed a served completion
+  would have been the row nobody measured; this one says what happened.
 
 - **THE FIXTURE'S TOKENIZER IS 16 SINGLE-CHARACTER TOKENS, SO `/v1/chat/completions`
   CANNOT BE EXERCISED ON IT.** `FixtureOpts::with_tokenizer` emits a byte-level
@@ -4170,7 +4245,9 @@ All six mutations were re-run after this refactor.
   persistent caches"). The clause this replaces said the second step was "blocked
   on the PLE conv dtype and the n-gram history's residency"; both are settled
   above. What remains before an `examples/server` end-to-end or a
-  `docs/USAGE.md` weights row is owed:
+  `docs/USAGE.md` weights row is owed (**the weights row itself is PAID by W5n**;
+  what follows is the rest of that list, and W5n adds a new first item to it —
+  the `qwen4_exp_gated_residual` quantized-operand refusal, below):
 
   - `num_reqs > 1` is still refused. `RunQwen4ExpQsaBlockPaged` takes a
     `block_table` of i32 `[1, max_pages]`, so a ragged multi-request batch needs
@@ -4296,8 +4373,11 @@ All six mutations were re-run after this refactor.
   rather than letting it build a step the forward refuses. What survives
   unchanged is the pair that never depended on batching: there is no token number
   and no speed number, because every byte served came from the synthetic fixture,
-  and the `docs/USAGE.md` WEIGHTS row is owed by the wave that serves a published
-  checkpoint.
+  and the `docs/USAGE.md` WEIGHTS row was owed by the wave that serves a
+  published checkpoint. **W5n PAID IT** — see the entry above and
+  [the evidence](../../docs/bench-evidence/qwen4exp-released-checkpoint-serve-20260830.md).
+  It is paid as a LOAD, not as a decode: the released artifact loads and the
+  server listens, and the forward then refuses it by name.
 - **CLOSED by W5i as a STORE, and what remains is a REACH.** This entry read
   "the QSA indexer side cache's paged store is still owed". The store and the
   read are paged now, and the registry hook allocates the scratch IN THE ENGINE'S
@@ -6279,6 +6359,7 @@ a row here, and every row says whether anything in production reaches it:
 | W5j | the forward CONSUMES the by-name channel, and `ModelFactory::consumes_multi_kv` narrows the engine's `multi_kv` refusal to a model-declared capability | **yes** — `ModelRegistry::Forward` dispatches a THREE-GROUP topology to this hook, which resolves all five published caches by name and reads group 2's own block table; M4 proves the guard still refuses with the bit cleared, M6 proves the tower is entered. It is still a SINGLE-SHOT prefill: nothing decodes a second token | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2353](https://github.com/mudler/vllm.cpp/issues/2353), W5j's own issue OWED |
 | W5k | the PLE conv ring's DTYPE and the n-gram history's RESIDENCY settled against the running lane oracle, and the SECOND STEP | **yes, and it DECODES** — `ModelRegistry::Forward` runs a prefill at `past_len` 0 and then a decode at `past_len` 6 over the engine's own persistent recurrent group, sampling a token on each; M1 deletes the n-gram write-back INSIDE `RunQwen4ExpPleBlock` and the step-1 history assertion reds, which is the first measured reach of that block's body | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5k's own issue OWED |
 | W5L | `GPUModelRunner` and `LoadedEngine` DRIVEN end to end, and the model-declared concurrency ceiling that keeps a server alive | **yes, and it SERVES** — a real `GPUModelRunner` allocates all three published groups, gathers all three block tables and runs a prefill then a decode through `execute_model` / `sample_tokens`; `LoadedEngine::FromModelDir` loads a `qwen4exp` GGUF and `generate` returns tokens; `examples/server` answers `POST /v1/completions` on CPU. M1 deletes the runner's `multi_kv` handoff, M3 deletes the per-group gather call site, and M4 deletes the clamp's production call site — each reds | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5L's own issue OWED |
+| W5n | the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact driven through `examples/server` on `thor:gpu0` — the first published `qwen4exp` bytes this row has ever read | **LOAD yes, TOKEN no** — all three shards load on `--device cpu` in 4446 s at 69.206 GiB peak RSS with every encoding keeping its blocks, the engine sizes its caches and the server answers `/health`; the first forward then refuses the artifact by name (`qwen4_exp_gated_residual: input_mix_weight_down must be float`, `src/vt/ops.cpp:2552`) because the file stores 194 hyper-connection mix weights as Q8_0, and `/v1/completions` returns 500. **Zero tokens.** No code changed; the defect is recorded, not worked around | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5n's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than
@@ -6436,12 +6517,20 @@ refusing:** the forward. Nothing decodes a token, so there is still no token
 number, no speed number, no `examples/server` e2e and no `docs/USAGE.md` weights
 row". Three of those four are now wrong. The forward decodes (W5k), and W5L
 serves a `POST /v1/completions` through `examples/server` on CPU over a synthetic
-`qwen4exp` GGUF. **The `docs/USAGE.md` WEIGHTS ROW IS STILL OWED, and its reason
-has changed rather than gone:** it is owed for a PUBLISHED checkpoint, and no
-byte of `unsloth/Qwen3.8-Flash-Next-GGUF` has been served on any host this row
-reaches. Everything measured here ran on the fixture, whose weights are a
-deterministic ramp, so there is still NO token number and NO speed number. W2, W3
-and W4 remain host reference math with no production call site.
+`qwen4exp` GGUF. **THE `docs/USAGE.md` WEIGHTS ROW IS PAID, BY W5n, AND WHAT IT
+RECORDS IS A REFUSAL.** This paragraph read "no byte of
+`unsloth/Qwen3.8-Flash-Next-GGUF` has been served on any host this row reaches",
+and that stopped being true on 2026-08-30. `rc` job `0f188dd1` on `thor:gpu0`
+loaded the released UD-IQ1_S artifact — 67.564 GiB, 3 shards, 1224 tensors —
+through `examples/server` on `--device cpu`, and the server listened. **The
+LOAD is the good half and it is real**: 4446 s to `/health`, peak RSS `VmHWM`
+69.206 GiB against a 67.564 GiB file, with every one of the file's nine
+encodings keeping its blocks (anonymous memory moved 4 → 11 GiB across a load
+whose n-gram table alone would have added 95.368 GiB). **The FORWARD then
+refuses the artifact by name and ZERO tokens come out**, so there is still NO
+token number and NO speed number, and the reason is no longer "nothing has been
+read" but a named defect — see `## Owed`, first entry. W2, W3 and W4 remain host
+reference math with no production call site.
 
 **W5b-6 ([#2218](https://github.com/mudler/vllm.cpp/issues/2218)) closes the
 gamma polarity and it does NOT decode.** `vt::Qwen4ExpGatedResidual` now takes

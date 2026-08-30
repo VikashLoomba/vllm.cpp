@@ -609,6 +609,24 @@ separate them at all.
 **(c) Alias the paged storage from the deck.** Not available: pages are not
 contiguous, which is the entire point of paging.
 
+**HOW BIG (a) ACTUALLY IS, measured rather than estimated.**
+`src/vllm/model_executor/models/deepseek_v4.cpp` contains **zero** occurrences of
+`ReshapeAndCache` or `PagedAttention`, and does not route through
+`dense_attn::AttnBlock` at all. Every other paged model in this tree reaches the
+cache through that seam; DeepSeek-V4's attention is bespoke over the contiguous
+deck end to end.
+
+So (a) is **not a wiring change** -- there is no existing paged path in this model
+to connect a cache to. It is a PORT of DeepSeek-V4's MLA attention onto the paged
+seam: the 512-wide latent, the nope/rope split, the per-head sinks and the
+compressor/indexer interaction all have to be expressed against block-table
+storage rather than a growing `std::vector<float>`.
+
+That is the honest size of W5 and it should be planned as such. It also explains
+why (b) is tempting enough to need naming: (b) is an afternoon and (a) is the
+wave. A reader who assumes "the channel exists, so the forward just reads it"
+will under-scope this by an order of magnitude.
+
 **A DTYPE DECISION RIDES ALONG, and it is not incidental.** The deck is `f32`
 while the pages are `bf16`/`fp8`, so (a) does not merely change WHERE the KV
 lives, it halves or quarters what it costs, and it changes the arithmetic the

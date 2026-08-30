@@ -1754,12 +1754,19 @@ config parse and upstream's disagree about the layer partition (that would be a
   that reads whichever cache it happened to find -- the silent-wrong-context
   failure this row has refused twice already.
 
-  Also owed, and noticed while reading that code: this file and the row's records
-  describe the no-MLA-cache layers as `compress_ratio == 0` (the `{0: 5, 4: 21,
-  128: 20}` histogram), while the registry accepts **1, 4 or 128** and skips
-  `ratio == 1`. One of the two is wrong. It is flagged rather than corrected here
-  because only one side was read, and it is the same class as the unreconciled
-  "43 vs 46" layer count.
+  **A `0` versus `1` discrepancy was flagged here and is WITHDRAWN**, because the
+  second side had not been read. The registry NORMALIZES before validating --
+  `const int64_t ratio = raw < 1 ? 1 : raw;`, commented as "`max(1,
+  config.compress_ratios[layer_id])` -- upstream's own guard ... Our parser keeps
+  the raw 0 for layers 0 and 1". So raw `0` and raw `1` both mean "no MLA latent
+  cache", the histogram's `{0: 5, ...}` is the raw value and correct, and the
+  registry's "accepts 1, 4 or 128" is the normalized one. Nothing is wrong.
+
+  Left in rather than deleted, because the flag was landed and a reader who saw
+  it deserves to see it withdrawn -- and because it is a fair example of the rule
+  this row keeps relearning: a discrepancy between two records is not a defect
+  until BOTH sides have been read in the tree. Reading one side and inferring the
+  other is how the four earlier wrong estimates on this row were made.
 
 
 - **W5's dispatch mechanism has landed UNREACHED, and this entry is the record

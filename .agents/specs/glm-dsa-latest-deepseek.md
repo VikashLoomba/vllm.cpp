@@ -2570,6 +2570,32 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   quantized batched GEMM, or by W7's measured-footprint number landing against
   this figure instead of against 14.511 GiB.
 
+- **O28 — the post-load absorption's ORIENTATION has no gate, and this is
+  measured rather than suspected.** W9's mutation M5 dropped the per-head
+  transpose entirely — reading `attn_k_b` verbatim into `kv_b_proj`'s nope rows
+  — and every shape, every byte count, all 7 forward cases and all 4 load cases
+  stayed GREEN. Only the logit VALUES moved (the fixture's top-2 margin went
+  0.00482 -> 0.00068), and nothing on this row compares a value to anything,
+  because there is no oracle (O1). The orientation is therefore established by
+  READING two conventions against each other: llama.cpp's `ggml_mul_mat`
+  contracts over `ne[0]`, so `attn_k_b`'s rows run along `qk_nope_head_dim`,
+  while `vt::BatchedMatmul` is `torch.bmm`, so `w_uk_t`'s rows run along
+  `kv_lora_rank`. The dimensions cannot disambiguate it either: the wrong index
+  order stays in bounds on both the real checkpoint and the fixture.
+  `test_glm_moe_dsa_gguf_load.cpp` now carries a DRIFT LOCK that fires on M5,
+  and its own comment says what it is — a transcription of the rule the loader
+  implements, which catches a later edit that changes one without the other and
+  proves nothing about which rule is right. Discharged by G4, llama.cpp `b10451`
+  on the identical artifact (§3.6, W8), which needs the complete checkpoint.
+- **O29 — `streams_routed_experts` is set and NOTHING on a CPU can see it, and
+  W9 measured that rather than reading it.** Mutation M4 deleted the flag from
+  `kGlmMoeDsaFactory` and all 7 forward cases stayed green, because the only
+  reader is `model_loader.cpp`'s streamed-lane block, which is guarded on
+  `needs_weight_staging() && host_memory_is_device_addressable()` — true on
+  `dgx:gpu0` and false on every CI runner. This is O14's statement for O22's
+  flag, and it converts both from "proven by reading" into a measured negative.
+  Discharged by the wave that drives the load on `dgx:gpu0`.
+
 ### 3.10 Now
 
 **W7 LANDED ITS LOADER AND DID NOT PRODUCE A TOKEN, 2026-08-30**

@@ -252,15 +252,40 @@ TEST_CASE("glm-dsa W9: the model produces a first token through LoadedEngine") {
   REQUIRE(!out.outputs.empty());
   const std::vector<int32_t>& got = out.outputs[0].token_ids;
   REQUIRE(got.size() == 1);
-  std::printf("[glm-dsa W9] first token id = %d (vocab %lld)\n", got[0],
-              static_cast<long long>(kVocab));
+
+  // THE ASSERTION IS THAT THE ENGINE'S TOKEN IS THIS FORWARD'S ANSWER, and the
+  // first version of this case did not make it. It checked only
+  // `0 <= id < vocab`, which is a property of every integer the sampler could
+  // possibly return — so when the reachability mutation replaced the whole body
+  // of `ForwardGlmMoeDsaForCausalLM` with a zero-filled carrier, the argmax of
+  // 32 zeros was 0, 0 is a legal id, and all seven cases stayed GREEN on a
+  // build whose engine never called the forward at all. The mutation found the
+  // gate, which is what mutations are for; this is the repair.
+  //
+  // Comparing against the DIRECT forward rather than against a literal is what
+  // keeps this an assertion about reach instead of an assertion about the
+  // fixture: nobody has to know which id is right, only that the two production
+  // paths agree on it. A stub cannot agree by accident — it would have to
+  // reproduce 32 logits it never computed.
+  const GlmMoeDsaWeights w = LoadFixture(f);
+  MlaCachePool pool(w.params);
+  const std::vector<float> direct =
+      RunForward(w, FreshPrefill(kTokens), pool, kTokens);
+  const std::vector<float> row = LastRow(direct, kVocab, kTokens);
+  const LogitReport r = Describe(row, "engine-vs-direct");
+  REQUIRE(r.finite());
+  REQUIRE(!r.top5.empty());
+  const int32_t expect = static_cast<int32_t>(r.top5[0].first);
+  std::printf("[glm-dsa W9] engine token=%d direct argmax=%d (margin %.6g)\n",
+              got[0], expect,
+              r.top5.size() > 1
+                  ? static_cast<double>(r.top5[0].second - r.top5[1].second)
+                  : 0.0);
   std::fflush(stdout);
-  // A token id, not a token VALUE: the fixture's weights are structural, so
-  // WHICH id comes out is not meaningful and asserting one would be asserting
-  // the fixture. What is meaningful is that a whole forward ran and produced a
-  // legal id rather than throwing the refusal it used to.
-  CHECK(got[0] >= 0);
-  CHECK(got[0] < kVocab);
+  // The MARGIN is printed because a discrete selection's error is bimodal: a
+  // near-tie that flips is a different event from a forward that computed
+  // nothing, and only the margin separates them in a log.
+  CHECK(got[0] == expect);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

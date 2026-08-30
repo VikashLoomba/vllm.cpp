@@ -46,6 +46,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/glm_moe_dsa.h"
 #include "vllm/model_executor/models/model_registry.h"
+#include "vt/dtype.h"
 
 #include "../gguf_builder.h"
 #include "glm_moe_dsa_gguf_fixture.h"
@@ -205,6 +206,59 @@ TEST_CASE("glm-dsa W7: the loaded weights carry the schedule, the towers and the
     // what the census counts and what the absorption reads.
     CHECK(a.k_b_proj.shape[0] == kHeads);
     CHECK(a.v_b_proj.shape[0] == kHeads);
+  }
+
+  // ── THE ABSORPTION'S ORIENTATION: A DRIFT LOCK, AND NOT A CORRECTNESS GATE ──
+  //
+  // SAY WHAT THIS IS, because the difference decides how much it is worth. The
+  // rule below is a TRANSCRIPTION of the rule `AbsorbMla` implements, so it
+  // cannot prove that rule right — it can only fail when someone changes the
+  // loader without changing this statement of it. That is worth having and it
+  // is not a gate.
+  //
+  // WHY THERE IS NO GATE. W9 ran the mutation: dropping the per-head transpose
+  // entirely — reading `attn_k_b` verbatim into the nope rows — leaves every
+  // shape identical, every byte count identical, all 7 forward cases and all 4
+  // load cases GREEN, and moves only the logit values, which nothing on this row
+  // compares to anything (spec O1: there is no oracle). The orientation is
+  // established by READING two conventions against each other: llama.cpp's
+  // `ggml_mul_mat` contracts over `ne[0]`, so `attn_k_b`'s rows run along
+  // `qk_nope_head_dim`; `vt::BatchedMatmul` is `torch.bmm`, so `w_uk_t`'s rows
+  // run along `kv_lora_rank`. Discharged by G4 — llama.cpp `b10451` on the
+  // identical artifact — which needs the complete checkpoint (spec O28).
+  //
+  // The two halves are NOT treated alike, and that asymmetry is the thing most
+  // worth locking: `attn_k_b` is TRANSPOSED and `attn_v_b` is VERBATIM, because
+  // the file states them with different contraction axes.
+  {
+    const vllm::GlmMoeDsaMlaWeights& a = w.layers[0].attn;
+    const vllm::GgufTensorInfo& tkb = g.Get("blk.0.attn_k_b.weight");
+    const vllm::GgufTensorInfo& tvb = g.Get("blk.0.attn_v_b.weight");
+    REQUIRE(tkb.ggml_type == 0);  // F32 in this fixture; read directly
+    REQUIRE(tvb.ggml_type == 0);
+    const auto* kb = reinterpret_cast<const float*>(tkb.data);
+    const auto* vb = reinterpret_cast<const float*>(tvb.data);
+    const auto* got = reinterpret_cast<const uint16_t*>(a.kv_b_proj.bytes.data());
+    const int64_t row = kQkNope + kVHead;
+    int64_t nope_mismatch = 0, v_mismatch = 0;
+    for (int64_t h = 0; h < kHeads; ++h) {
+      for (int64_t i = 0; i < kQkNope; ++i) {
+        for (int64_t j = 0; j < kKvLora; ++j) {
+          // TRANSPOSED: file `[h][j][i]` -> checkpoint layout `[h][i][j]`.
+          const uint16_t want = vt::F32ToBF16(kb[(h * kKvLora + j) * kQkNope + i]);
+          if (got[(h * row + i) * kKvLora + j] != want) ++nope_mismatch;
+        }
+      }
+      for (int64_t i = 0; i < kVHead; ++i) {
+        for (int64_t j = 0; j < kKvLora; ++j) {
+          // VERBATIM: `attn_v_b` is already `[h][i][j]`.
+          const uint16_t want = vt::F32ToBF16(vb[(h * kVHead + i) * kKvLora + j]);
+          if (got[(h * row + kQkNope + i) * kKvLora + j] != want) ++v_mismatch;
+        }
+      }
+    }
+    CHECK(nope_mismatch == 0);
+    CHECK(v_mismatch == 0);
   }
 
   // ── model level ──

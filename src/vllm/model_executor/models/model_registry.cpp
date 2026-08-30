@@ -459,7 +459,19 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
   // the payload, so a channel that arrived empty says something different.
   //
   // W5 replaces this with the DSA-sparse forward that reads the caches.
-  if (input.multi_kv != nullptr) {
+  //
+  // MODEL-MM-GLM53-FLASH W5b-2c (#2348) NARROWS THE REFUSAL WITHOUT WEAKENING
+  // IT. The predicate was "a multi-cache topology reached this seam", which was
+  // exactly right while NO forward consumed one. It is the wrong predicate the
+  // moment one does, because it then refuses the model it was written to wait
+  // for. So the condition is now the pair of facts the message already asserts:
+  // a keyed cache set arrived AND the registered forward does not declare that
+  // it consumes one. `ModelFactory::consumes_multi_kv_cache` defaults to false,
+  // so every model that was refused before this change is refused after it,
+  // DeepSeek-V4 included -- its `Forward` still opens with `(void)attn_kv;` and
+  // #1925 still owns its consuming forward.
+  if (input.multi_kv != nullptr &&
+      !model.registration().factory->consumes_multi_kv_cache) {
     const MultiKvCacheIndex& mk = *input.multi_kv;
     VT_CHECK(false,
              std::string("model forward: ") + std::to_string(mk.size()) +

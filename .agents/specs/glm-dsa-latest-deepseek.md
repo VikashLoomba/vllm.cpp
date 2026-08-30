@@ -2078,12 +2078,23 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   There is no MTP drafter in the tree (`src/vllm/v1/spec_decode/` holds three
   files, none of them one). Discharged by a drafter row that does not exist yet.
 - **O6 — sparse prefill does not exist** (§3.5.2 item 3). Discharged by W6.
-- **O7 — no artifact is staged and no `pread` streaming number exists on any real
-  checkpoint** (`expert-streaming.md` `## Owed`, verbatim: "The `pread` path has
-  never run on the model"). `dgx.casa`'s local disk was 184 GiB free at its last
-  measurement (§0.1 C3, 2026-07-21) against a 201.83 GiB arm, so W7 may be forced
-  onto CIFS. Discharged by W7 staging the shards, recording their sha256, and
-  reporting which filesystem served the `pread`s.
+- **O7 — PARTIALLY DISCHARGED by W7, 2026-08-30; the half that remains is the
+  measurement rather than the staging.** The `UD-IQ1_S` arm is being staged to
+  `/mnt/nas_share/rc/ckpt/GLM-5.3-UD-IQ1_S/` (which IS `/workspace` on a leased
+  worker), sha256-verified per shard by the fetch script as each one lands.
+  Recorded so far, at revision `346b3591c7f28d1a23716f97a065ecf12ec14771`:
+  shard 1 `ff3adab0853dfb00bdf3889ec3f5556196f56b65783115720d57767bbd760dd9`,
+  shard 2 `659d04cf4fc0b6026944f34c0b590a635803bff06c1775361e28490db7b168f8`.
+  Shards 3-6 were still downloading when W7 ended (43% of 201.83 GiB staged) and
+  their hashes are owed to the wave that drives the load. **NO `pread` NUMBER
+  EXISTS AND NONE IS CLAIMED** (`expert-streaming.md` `## Owed`, verbatim: "The
+  `pread` path has never run on the model"). `/mnt/nas_share` is CIFS, and §3.7
+  W7's stop condition binds: a `pread` served across CIFS is a CIFS number and
+  must be labelled one, never reported as a streaming measurement. Whether
+  `dgx.casa`'s local disk can hold 201.83 GiB was NOT re-measured — the last
+  figure is 184 GiB free from 2026-07-21 (§0.1 C3), which is stale rather than
+  current. Discharged by a wave that records the remaining four hashes, drives
+  the load, and states which filesystem served the reads.
 - **O8 — the expert-streaming mechanism has no shared seam**, so it is reachable
   from exactly one model TU (§3.2 gap 1). **DISCHARGED by W3**, 2026-08-30:
   `include/vllm/model_executor/expert_stream_seam.h` and
@@ -2094,8 +2105,15 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
 - **O9 — the resident 14.511 GiB is arithmetic from the shard headers, not a
   measurement.** It excludes KV cache, activations, scratch pools and the CUDA
   context, which is the same omission `expert-streaming.md` `## Owed` already
-  records for its own fit bound. Discharged by W7 reporting the measured resident
-  footprint beside this prediction.
+  records for its own fit bound. **STILL OWED after W7**, which loaded no real
+  weight: no `rc` lease was obtained and the artifact was 43% staged when the
+  wave ended, so the 14.511 GiB stands as arithmetic. When it is measured, note
+  what may and may not establish it: **peak RSS is NOT a residency measurement
+  while the towers are mmap-resident**, because `VmHWM` then tracks page-cache
+  pressure — the sibling Flash row read 99.47, 85.18 and 72.05 GiB for the same
+  model on different boxes. The number that answers this item is the DEVICE pool
+  the resident class occupies, not the process's high-water mark. Discharged by a
+  wave reporting that beside this prediction, and naming what established it.
 - **O10 — no speed axis has a denominator** (§3.6). vLLM cannot run the model, so
   the only comparable is llama.cpp on the same artifact, a labeled secondary
   floor. Open gap by construction, not a waiver.
@@ -2131,14 +2149,26 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   the first wave that loads through that block under an `rc` lease; the same
   device-only reachability problem `test_expert_stream_device_slot` solves with
   a fake platform, which W3 did not extend because the block under test is the
-  loader's and not the seam's.
+  loader's and not the seam's. **STILL OWED after W7.** W7 loaded a model through
+  `FromModelDir`, but on a CPU and on a synthetic fixture, so the device-gated
+  block that calls `RequireSlotCapacity` was not entered: it needs
+  `needs_weight_staging() && host_memory_is_device_addressable()`, which is a
+  GB10 and not a CI runner, and it additionally needs
+  `factory->streams_routed_experts`, which W7 deliberately did NOT set (O22).
+  Discharged by the wave that drives the load on `dgx:gpu0`.
 - **O15 — nothing measures the lifted seam from a SECOND model.** W3 makes the
   lane reachable by a second TU and Qwen3.5 remains its only client, so what is
   gated is that the mechanism still works, not that another architecture can
   take it. This is deliberate: W3's scope is the lift, and a second client
   without a model to attach it to would be the shell several waves on this row
-  stopped rather than ship. Discharged by W7 routing GLM-5.3's `_exps.weight`
-  towers through the seam.
+  stopped rather than ship. **STILL OWED after W7, and this is the most important
+  thing W7 did not do.** W7 loads GLM-5.3's 228 towers and holds them in exactly
+  the shape the seam consumes — stacked keep-quant, borrowed from the mmap, flat
+  `[E*out, K]`, the form `LoadExpertsStackedKq` produces for the seam's only
+  gated client — but nothing calls `expert_stream::ExpertSlice` on them, because
+  the forward that would does not exist (O21). Qwen3.5 therefore remains the
+  seam's only client. Discharged by the wave that writes the forward and routes
+  the towers through it.
 - **O16 — W2 lands three surfaces that NOTHING reaches yet**, and it says so
   rather than letting a reader infer reachability from a green suite. The
   registration, its config hook, the `glm-dsa` `kGgufArchArms` row and
@@ -2148,18 +2178,45 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   `ForwardDevice`, the registry's `forward` hook and `MakeGlmMoeDsaKVCache` are
   NOT: every arm of `load_weights` refuses, so no `LoadedModel` of this type can
   exist and neither the forward nor the KV-cache hook can be called through
-  production. Owned by this row; discharged by W7, which is the first wave that
-  produces a loaded model. Tracked by
+  production. Owned by this row. **HALF DISCHARGED by W7, 2026-08-30**: the GGUF
+  arm of `load_weights` loads, so a `GlmMoeDsaLoadedModel` DOES exist and
+  `MakeGlmMoeDsaKVCache` is reached through it —
+  `tests/vllm/models/test_glm_moe_dsa_gguf_load.cpp` builds one through
+  `LoadedEngine::FromModelDir`, and three mutations (the `kGgufArchArms` row, the
+  `REGISTER_VLLM_MODEL` line, the GGUF branch of `LoadGlmMoeDsaForCausalLM`) each
+  red it. The FORWARD hook is still not reached, because `GlmMoeDsaModel::Forward`
+  still refuses — that half is O21. Tracked by
   [#2214](https://github.com/mudler/vllm.cpp/issues/2214).
 - **O17 — the one staged GGUF arm cannot be fed, because it states no indexer
   schedule.** D3 records that the published conversion writes no
   `glm-dsa.attention.indexer.types`, and W2 refuses such a file by name rather
   than substituting llama.cpp's hardcoded table. So the `glm-dsa` arm is
-  implemented and the published artifact still does not load. Discharged by a
-  conversion that writes the key — `b10451:conversion/glm.py:337-339` already
-  writes it whenever the source `config.json` carries `indexer_types`, which
-  GLM-5.3's does — or by W7 recording the published arm as unfeedable and naming
-  the converter run that replaces it.
+  implemented and the published artifact still does not load.
+  **W7 CONFIRMED THE DIAGNOSIS ON THE REAL FILE AND SHIPPED THE REPAIR,
+  2026-08-30, and the repair is to the FILE and not to the loader.** Shard 1's KV
+  block was read key by key at revision
+  `346b3591c7f28d1a23716f97a065ecf12ec14771`: **64 keys, and none of
+  `glm-dsa.attention.indexer.types`, `index_topk_freq` or
+  `index_skip_topk_offset` is among them.** The file also declares `indexer.*` on
+  all 79 blocks, so its own tensor list cannot be read as the schedule either —
+  D3's broadcast, confirmed by census.
+  `scripts/glm-dsa-write-indexer-types.py` writes the key llama.cpp's own
+  converter would have written (`b10451:conversion/glm.py:337-339`),
+  TRANSCRIBING it from the model author's `config.json` and deriving nothing. It
+  refuses a config that states no `indexer_types`, refuses a shard that carries
+  tensor payload (growing that header would move every tensor's data without
+  moving its recorded offset), refuses a file that already states its schedule,
+  and reads its own output back before reporting success. It rewrites only the
+  metadata shard, which on this artifact is shard 1: 9,428,677 bytes, zero
+  tensors, header ending exactly at end-of-file. A dry run over the real shard
+  produces a 9,428,810-byte file, 64 keys becoming 65, sha256
+  `b3e9838651a5c279533c98390ab4bc03cf1d8c176d5be0754180f07d9ed85c01`.
+  **The output is a DERIVED artifact and must never be quoted as the published
+  one.** The loader's refusal is NOT weakened, which is D3's whole point: a
+  hardcoded 78-entry constant that happens to be right is the shape that silently
+  becomes wrong on GLM-5.4. Fully discharged when a wave runs the script against
+  the complete artifact and records the derived shard's hash beside the published
+  ones.
 - **O18 — the fp32 router GEMM's dtype SELECTION has no discriminating
   numerical gate, and this is measured rather than suspected.** W4 makes
   `MoeBlock` size `dlog` from `DeepseekV2Params::router_dtype_is_f32`
@@ -2215,6 +2272,19 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   not worth its own branch, gate run and fresh review. Discharged when
   `kForwardRefusal` cites the predicate `!elig.prunes || elig.Active()` rather
   than a line range — cite the predicate, not the line.
+  **DISCHARGED by W7, 2026-08-30.** `kForwardRefusal` now cites the predicate
+  `!elig.prunes || elig.Active()` — verified unique repo-wide over `src`,
+  `include` and `tests`, one hit at `dots3_note_device.cpp:1205` — and no line
+  range. `git grep 1147-1180` over `src` and `include` returns only the comment
+  in `glm_moe_dsa.cpp` that records the repair.
+  **The same string had gone stale in four further places and W7 fixed those
+  too**, because a refusal that keeps naming finished work sends its reader
+  looking for something they will not find: it named the expert-streaming seam
+  (landed, W3), the per-layer dims and `skip_topk` reuse (landed, W4), the
+  `IQ4_XS` keep-quant `vec_dot` (landed, `2e9f4d88d`) and the fp32 router GEMM
+  (landed) as missing. `test_glm_moe_dsa_config.cpp` now gates BOTH halves: the
+  two primitives that are genuinely missing, and that the four discharged ones
+  are no longer named.
   **The other three anchors in §3.7 W5 verified CLEAN at the same pin**, and
   are recorded so they are not re-checked: `DeepseekV32IndexerCache`
   (`deepseek_v2.py:696-701`) is exact; the **132 B/token** figure is exact and
@@ -2234,7 +2304,110 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   in `.agents/model-matrix.md` cites the new numbers. Nothing else changed in
   either item.
 
+- **O21 — THE FORWARD DOES NOT EXIST, SO NO TOKEN HAS BEEN OBSERVED, and W7 did
+  not produce one.** This is the plainest thing this record has to say. W7's
+  scope paragraph is the loader and W7 delivered the loader; W7's TEST list
+  additionally says "the model loads and produces a first token", and the second
+  half did not happen. `GlmMoeDsaModel::Forward` still refuses by name.
+  What the forward needs, read out of the tree rather than guessed: a per-layer
+  `RunLayer` that passes `GlmMoeDsaMlaSchedule`'s 78 dims instead of one scalar
+  `p.mla`, and threads an `mla::MlaSharedSelection` into
+  `ForwardMlaAttentionBlock`'s eleventh argument — which exists and defaults to
+  `nullptr`, and which **no production model passes today**; a sparse-step
+  builder that populates `meta.indexer_cu_seqlens_q`, which `BuildMlaStep` never
+  sets and only `BuildDots3NoteSparseStep` does; and a MoE block that slices the
+  stacked towers through `expert_stream::ExpertSlice` rather than DeepSeek-V2's
+  per-expert vectors. **A FIRST token is reachable and a SECOND is not**: a
+  sparse step routes every token through MQA (`mla_attention.cpp:448-453`), which
+  a fresh prompt can do and a resumed request cannot until O4 lands. Owned by
+  this row.
+- **O22 — `ModelFactory::streams_routed_experts` is deliberately NOT set on
+  `kGlmMoeDsaFactory`, and the load on `dgx:gpu0` cannot succeed until it is.**
+  The flag asserts that THIS model's forward reads experts through the slot seam,
+  and `model_registry.h:552-589` argues at length that it is a property of the
+  forward and lives beside it. W7 has no forward, so setting it would be a claim
+  about code that is not there. The cost is exact, and stating it is the point of
+  this item: without the flag `model_loader.cpp:2487-2494` never builds the lane,
+  so `CheckDeviceWeightFit` charges the device the full 187.312 GiB of towers
+  against a 119.631 GiB budget and REFUSES the load. Discharged in the same
+  change that lands the forward, and not before.
+- **O23 — `docs/USAGE.md`'s GLM-5.3 row states a load that has not been driven.**
+  O11 asked for the weights row in the change that makes the capability
+  reachable. W7 makes the LOADER reachable and adds the row, and the row says
+  exactly that: the published arm is unfeedable as shipped (O17), no load of the
+  real artifact has run, and no token exists. Discharged when the row can state a
+  driven load instead of a reachable loader.
+
 ### 3.10 Now
+
+**W7 LANDED ITS LOADER AND DID NOT PRODUCE A TOKEN, 2026-08-30**
+([#2214](https://github.com/mudler/vllm.cpp/issues/2214)). Both halves of that
+sentence are the record. `GlmMoeDsaForCausalLM` now materializes weights from a
+`glm-dsa` GGUF through `LoadedEngine::FromModelDir`, and
+`GlmMoeDsaModel::Forward` still refuses by name. W7's scope paragraph asked for
+the loader and got it; W7's test list also asked for a first token, and that is
+O21 and is owed.
+
+**The census reproduces, and it reproduces exactly.** §3.4's numbers were
+recomputed here from the six published shard headers rather than trusted: 1809
+tensors, 216,705,819,648 payload bytes = 201.823 GiB, **228 expert towers at
+187.312 GiB against 1581 resident tensors at 14.511 GiB**, and the per-type table
+to the tensor — IQ3_XXS 71, IQ1_S 106, IQ2_XXS 44, Q5_K 312, IQ4_XS 4, Q8_0 476,
+Q2_K 2, Q3_K 1, Q6_K 82, Q4_K 2, F32 709. The payload plus the six headers plus
+62 bytes of 32-byte alignment padding is 216,715,365,893, the published byte
+count exactly. The largest per-expert slice is 6,684,672 B, which §3.3 predicted.
+`test_glm_moe_dsa_gguf_census` carries all of it; two of its three cases need no
+artifact.
+
+**The accounting closes at 1782 + 27 = 1809, and that is the gate.** There is no
+token gate on this row and there cannot be one on this fleet (O1), so a tensor
+the port does not claim is weight that is silently absent from the model with
+nothing to catch it. The loader refuses rather than returning a model when the
+sum does not close, and the negative case proves it by adding a tensor.
+
+**Three things the file gets wrong are now handled by name rather than by luck.**
+The MTP block is read, counted and dropped (27 tensors, spec O5). The 285
+`indexer.*` tensors the conversion broadcast onto the 57 `shared` blocks are
+dropped by SCHEDULE, and the mutation that makes the loader believe the file
+instead — build an indexer on every layer — is killed by the gate; that failure
+would otherwise load clean and carry 57 indexers the reference does not build.
+And the file states its indexer schedule nowhere at all, which was confirmed key
+by key on shard 1: **64 metadata keys and not one of `indexer.types`,
+`index_topk_freq`, `index_skip_topk_offset`**. O17 is now diagnosed on the real
+file rather than inferred, and `scripts/glm-dsa-write-indexer-types.py` repairs
+the FILE from the model author's own `config.json` — the loader's refusal is
+untouched, because D3 is right that a hardcoded table which happens to be correct
+is the shape that silently becomes wrong on GLM-5.4.
+
+**The i8mm quant repack is declined, and the reason is correctness rather than
+speed.** It keeps the dtype and the byte count identical, so every assertion in
+this tree passes on a repacked buffer while a consumer reading it as plain blocks
+reads wrong values silently. The sibling Flash row paid for exactly that once
+(#2241) on an artifact from the same publisher, and this arm's 476 Q8_0 tensors
+are the MLA and indexer projections whose values decide the attention selection.
+W7 claims no speed number, so the lever buys nothing here and no gate on this row
+could see it go wrong.
+
+**What did NOT happen, stated before anything else claims otherwise.** No `rc`
+lease was taken: `dgx:gpu0` and `thor:gpu0` were both busy for the whole wave.
+The artifact was **43% staged** when the wave ended, so the load was never
+driven, no resident footprint was measured (O9 stands as arithmetic), no `pread`
+number exists (O7), and **no token was observed** (O21). Every gate reported here
+is a CPU gate on a synthetic model or a header read of the real one.
+
+**One decision is recorded as a refusal to claim rather than as work.**
+`kGlmMoeDsaFactory` does not set `streams_routed_experts`, because that flag
+asserts this model's forward reads experts through the slot seam and this model
+has no forward. The consequence is exact and is O22: without it
+`CheckDeviceWeightFit` charges the device all 187.312 GiB of towers against
+119.631 GiB and refuses. The flag and the forward land together or neither does.
+
+**Next action: the forward (O21).** It is the last thing between this row and a
+token, the pieces it needs are enumerated in O21, and a first token is reachable
+on a fresh prompt while a second waits on O4. Then O22's flag, then the load on
+`dgx:gpu0` under a lease, which discharges O7, O9, O14, O15 and O23 together.
+
+---
 
 **W5 IS STRUCK FROM THIS ROW AND RE-SEQUENCED, 2026-08-30**
 ([#1925](https://github.com/mudler/vllm.cpp/issues/1925),

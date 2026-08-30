@@ -162,6 +162,115 @@ OwnedTensor ExpandBf16(const GgufFile& g, const std::string& name,
   return Bf16From(DequantAll(g, name, shape), shape, nk);
 }
 
+// A tensor the FILE stores at F32 that upstream builds at the MODEL dtype, held
+// at bf16 — and the round-trip PROVED rather than assumed (W9, #2214).
+//
+// llama.cpp's converter writes several small tensors as F32 regardless of the
+// source dtype, so an F32 tensor in a GGUF is usually the lossless upcast of a
+// bf16 one. "Usually" is not a fact, and the consequence of being wrong here is
+// not a tolerance: `indexer.proj.weight` scales the indexer logits and therefore
+// decides a discrete top-k, where the error is bimodal and rounding flips a
+// selection or does nothing at all. So every value must round-trip through bf16
+// EXACTLY, and a file that is genuinely f32 is refused by name instead of being
+// silently rounded into the model dtype.
+OwnedTensor Bf16FromExactF32(const GgufFile& g, const std::string& name,
+                             const std::vector<int64_t>& shape, bool nk,
+                             const char* upstream_reason) {
+  const std::vector<float> f = DequantAll(g, name, shape);
+  for (size_t i = 0; i < f.size(); ++i) {
+    const float back = vt::BF16ToF32(vt::F32ToBF16(f[i]));
+    if (back == f[i]) continue;
+    // NaN never compares equal to itself, so it would fail the test above for
+    // the wrong reason. It is also not a weight, so say which it is.
+    VT_CHECK(false,
+             "glm-dsa gguf: " + name + " element " + std::to_string(i) +
+                 " is " + std::to_string(f[i]) +
+                 ", which does not round-trip through bf16 (bf16 gives " +
+                 std::to_string(back) +
+                 "). This port holds it at the MODEL dtype because " +
+                 std::string(upstream_reason) +
+                 ", and the file's F32 is normally llama.cpp's lossless upcast "
+                 "of exactly that bf16 tensor. A genuinely f32 tensor here is a "
+                 "different operator, and rounding it would move a DISCRETE "
+                 "selection that no tolerance bounds, so it is refused rather "
+                 "than served");
+  }
+  return Bf16From(f, shape, nk);
+}
+
+// ─── the post-load absorption (W9, #2214) ────────────────────────────────────
+// Upstream's `MLAAttention.process_weights_after_loading`
+// (`mla_attention.py:875-962`), placed where `deepseek_v2_weights.cpp:138-153`
+// already places it for the safetensors arm.
+//
+// THE FILE'S TWO HALVES ARE NOT THE SEAM'S TWO HALVES, and the difference is a
+// transpose rather than a rename. llama.cpp's `ggml_mul_mat` contracts over
+// `ne[0]`, so `attn_k_b` reads `[heads, kv_lora, qk_nope]` and `attn_v_b` reads
+// `[heads, v_head, kv_lora]`. `vt::BatchedMatmul` — which is `torch.bmm`, the
+// primitive upstream's absorption is expressed in — wants `w_uk_t`
+// `[heads, qk_nope, kv_lora]` and `w_uv` `[heads, kv_lora, v_head]`, shares
+// "f32 or bf16" across a and b, and requires the innermost dimension to be
+// unit-stride. So neither a transposed view nor the Q8_0 bytes are admissible,
+// and bf16 with the transpose applied is the only form that is. That is exactly
+// upstream's answer and upstream's stated reason (`:876-878`).
+//
+// The CHECKPOINT-layout `kv_b_proj` the PREFILL arm needs is rebuilt here too,
+// because the GGUF does not ship it: per head, rows `[0, qk_nope)` are
+// `attn_k_b` transposed and rows `[qk_nope, qk_nope + v_head)` are `attn_v_b`
+// verbatim — that half is ALREADY in the checkpoint orientation. `w_uk_t` and
+// `w_uv` then come from the SHARED `mla::AbsorbKvBProjBf16` applied to it, so
+// there is one absorber in this tree and not two.
+void AbsorbMla(const GgufFile& g, const GlmMoeDsaParams& p, int64_t il,
+               GlmMoeDsaMlaWeights& w) {
+  const int64_t heads = p.num_attention_heads;
+  const int64_t kv_lora = p.kv_lora_rank;
+  const int64_t qk_nope = p.qk_nope_head_dim;
+  const int64_t v_head = p.v_head_dim;
+  const int64_t row = qk_nope + v_head;
+
+  // f32 throughout the rewrite, so a value is rounded ONCE, on the store.
+  const std::vector<float> kb =
+      DequantAll(g, Blk(il, "attn_k_b.weight"), {heads, kv_lora, qk_nope});
+  const std::vector<float> vb =
+      DequantAll(g, Blk(il, "attn_v_b.weight"), {heads, v_head, kv_lora});
+
+  std::vector<float> kvb(static_cast<size_t>(heads * row * kv_lora), 0.0f);
+  for (int64_t h = 0; h < heads; ++h) {
+    for (int64_t i = 0; i < qk_nope; ++i) {
+      for (int64_t j = 0; j < kv_lora; ++j) {
+        // TRANSPOSED: the file has `[h][j][i]`, the checkpoint layout is
+        // `[h][i][j]`.
+        kvb[static_cast<size_t>((h * row + i) * kv_lora + j)] =
+            kb[static_cast<size_t>((h * kv_lora + j) * qk_nope + i)];
+      }
+    }
+    for (int64_t i = 0; i < v_head; ++i) {
+      for (int64_t j = 0; j < kv_lora; ++j) {
+        // VERBATIM: `attn_v_b` is `[h][i][j]` already.
+        kvb[static_cast<size_t>((h * row + qk_nope + i) * kv_lora + j)] =
+            vb[static_cast<size_t>((h * v_head + i) * kv_lora + j)];
+      }
+    }
+  }
+  w.kv_b_proj = Bf16From(kvb, {heads * row, kv_lora}, /*nk=*/true);
+
+  mla::MlaBlockDims dims = GlmMoeDsaMlaBlockDims(p, il);
+  const mla::AbsorbedKvBProj abs = mla::AbsorbKvBProjBf16(
+      reinterpret_cast<const uint16_t*>(w.kv_b_proj.bytes.data()), dims);
+  VT_CHECK(static_cast<int64_t>(abs.w_uk_t.size()) == heads * qk_nope * kv_lora &&
+               static_cast<int64_t>(abs.w_uv.size()) == heads * kv_lora * v_head,
+           "glm-dsa gguf: the shared MLA absorber returned unexpected sizes for "
+           "block " + std::to_string(il));
+  w.w_uk_t = MakeTensor(vt::DType::kBF16, {heads, qk_nope, kv_lora},
+                        /*nk=*/false, sizeof(uint16_t));
+  std::memcpy(w.w_uk_t.bytes.data(), abs.w_uk_t.data(),
+              abs.w_uk_t.size() * sizeof(uint16_t));
+  w.w_uv = MakeTensor(vt::DType::kBF16, {heads, kv_lora, v_head},
+                      /*nk=*/false, sizeof(uint16_t));
+  std::memcpy(w.w_uv.bytes.data(), abs.w_uv.data(),
+              abs.w_uv.size() * sizeof(uint16_t));
+}
+
 // The file to BORROW kept blocks from, or null to copy them. Borrowing is what
 // keeps 187 GiB of towers out of host RAM, and it is also what gives the
 // streaming lane an `mmap_fd` / `mmap_file_offset` to `pread` from instead of
@@ -301,7 +410,21 @@ GlmMoeDsaIndexerWeights LoadIndexer(const GgufFile& g,
   // file stores it F32, and it is the one operand of the indexer whose scale
   // decides the selection outright, so it stays F32 rather than being rounded
   // into the model dtype.
-  w.weights_proj = LoadMatmulF32(g, Blk(il, "indexer.proj.weight"), nh, h);
+  // W9 (#2214) NARROWED this from the file's F32 to bf16, and the narrowing is
+  // upstream rather than a convenience. `wk_weights_proj` is a
+  // `MergedColumnParallelLinear` with no `params_dtype`
+  // (`deepseek_v2.py:700-707`), so upstream computes it at the MODEL dtype; the
+  // shared MLA block does the same (`mla_attention.cpp`, the indexer's
+  // `vt::MatmulBT(iw, hidden, indexer_weights_proj)` writes `dt`), and
+  // `vt::MatmulBT` needs its two float operands to agree. W2's note that this
+  // tensor "decides the selection outright" is why the round-trip is PROVED
+  // here instead of the value being rounded on trust.
+  w.weights_proj =
+      Bf16FromExactF32(g, Blk(il, "indexer.proj.weight"), {nh, h}, /*nk=*/true,
+                       "upstream's `wk_weights_proj` carries no params_dtype "
+                       "(deepseek_v2.py:700-707) and is therefore the model "
+                       "dtype, which the shared MLA block's indexer GEMM also "
+                       "requires");
   return w;
 }
 
@@ -341,6 +464,11 @@ GlmMoeDsaMlaWeights LoadMla(const GgufFile& g, const GgufLoadPolicy& pol,
   // exist in this file only because the conversion broadcast them (spec D3);
   // they are counted as dropped by the caller and never read.
   if (with_indexer) w.indexer = LoadIndexer(g, pol, p, il);
+  // Upstream's `process_weights_after_loading`, run here for the same reason
+  // `deepseek_v2_weights.cpp:138-153` runs it in ITS loader: the absorbed forms
+  // are what the decode arm consumes, and they are a function of the weights
+  // rather than of the step. See `AbsorbMla`.
+  AbsorbMla(g, p, il, w);
   return w;
 }
 
@@ -596,6 +724,10 @@ GlmMoeDsaWeights LoadGlmMoeDsaFromGguf(const GgufFile& gguf,
     }
   }
 
+  // Every layer went through `AbsorbMla`, so the forward's precondition holds.
+  // Set LAST, after the accounting refuses a file this port cannot account for,
+  // so a partially built model can never read as prepared.
+  w.absorbed = true;
   return w;
 }
 

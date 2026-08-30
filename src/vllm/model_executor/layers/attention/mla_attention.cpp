@@ -369,6 +369,57 @@ MlaUpProjectFn MakeMlaUpProjectFn(Dev d, const MlaBlockDims& dims, const MlaBloc
   };
 }
 
+// ─── the lifted sparse-step eligibility (W9, #2214) ─────────────────────────
+// Moved here VERBATIM from `dots3_note_device.cpp`'s unnamed namespace, where it
+// was written for #699 W4b-3c and where a second architecture could not reach
+// it. The body is unchanged; `p.index_topk` became the `index_topk` argument and
+// the struct lost its `Dots3Note` prefix. dots3-note now calls this one, so the
+// repair its own review paid for — one function answering both the route and the
+// refusal — is not silently duplicated by the next model that needs it.
+int64_t StepComputedTokens(const v1::CommonAttentionMetadata& am, int r) {
+  if (r < static_cast<int>(am.num_computed_tokens_cpu.size())) {
+    return am.num_computed_tokens_cpu[static_cast<size_t>(r)];
+  }
+  if (r + 1 < static_cast<int>(am.query_start_loc.size()) &&
+      r < static_cast<int>(am.seq_lens.size())) {
+    const int64_t query_len = am.query_start_loc[static_cast<size_t>(r + 1)] -
+                              am.query_start_loc[static_cast<size_t>(r)];
+    return static_cast<int64_t>(am.seq_lens[static_cast<size_t>(r)]) - query_len;
+  }
+  return 0;
+}
+
+SparseStepEligibility SparseStepEligibilityOf(
+    int64_t index_topk, const v1::CommonAttentionMetadata& am) {
+  SparseStepEligibility e;
+  const int64_t topk = index_topk;
+  const int num_reqs = am.num_reqs;
+  e.well_formed = topk > 0 && num_reqs > 0 &&
+                  static_cast<int>(am.query_start_loc.size()) == num_reqs + 1 &&
+                  static_cast<int>(am.seq_lens.size()) >= num_reqs;
+  // `num_reqs` is authoritative for a WELL-FORMED step. When the metadata is
+  // NOT well formed there is no authoritative count, so every published
+  // `seq_lens` entry is scanned — the safe direction, because a step that
+  // prunes and is not eligible is refused.
+  const size_t scan =
+      e.well_formed ? static_cast<size_t>(num_reqs) : am.seq_lens.size();
+  for (size_t r = 0; r < scan; ++r) {
+    const int64_t sl = am.seq_lens[r];
+    const int64_t computed = StepComputedTokens(am, static_cast<int>(r));
+    if (sl > topk && !e.prunes) {
+      e.prunes = true;
+      e.prunes_req = static_cast<int>(r);
+      e.prunes_len = sl;
+    }
+    if (computed > 0 && !e.resumes) {
+      e.resumes = true;
+      e.resumes_req = static_cast<int>(r);
+      e.resumes_from = computed;
+    }
+  }
+  return e;
+}
+
 void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWeights& w,
                               const Tensor& hidden, const Tensor& positions,
                               Tensor& kv_cache, const Tensor& slot_mapping,
@@ -513,31 +564,91 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   DBuf q_c(d, dt, {T, dims.q_lora_rank});
   Tensor q_c_t = q_c.t();
   if (dims.has_q_lora()) {
-    RequireWeight(w.fused_qkv_a_proj, "fused_qkv_a_proj");
     RequireWeight(w.q_a_layernorm, "q_a_layernorm");
     RequireWeight(w.q_b_proj, "q_b_proj");
     const int64_t ql = dims.q_lora_rank;
-    const Tensor& fused = w.fused_qkv_a_proj;
-    if (fused.shape[0] != ql + L + R) {
+    // ─── FUSED or SPLIT A-projection (W9, #2214) ────────────────────────
+    // See `mla_attention.h`'s `q_a_proj` for the checkpoint fact that forces the
+    // second arm to exist. Below this point the two are ONE code path over
+    // `w_qa` and `w_kva`, and that is byte-identity by construction rather than
+    // by inspection: on the fused arm those two names ARE `fused.Slice(...)`,
+    // the same data pointer, shape, stride and dtype the previous revision
+    // passed, so every DeepSeek / MiniCPM3 / Kimi-Linear / dots3-note step keeps
+    // its exact operands and its exact launch sequence.
+    const bool split_a = w.q_a_proj.data != nullptr;
+    const bool fused_a = w.fused_qkv_a_proj.data != nullptr;
+    if (split_a == fused_a) {
       throw std::invalid_argument(
-          "MLA block: fused_qkv_a_proj must be [q_lora_rank + kv_lora_rank + "
-          "qk_rope_head_dim, hidden_size] (deepseek_v2.py:1004-1009)");
+          split_a
+              ? "MLA block: BOTH `q_a_proj` and `fused_qkv_a_proj` are "
+                "populated on a q_lora layer. They are two spellings of the "
+                "same projection (deepseek_v2.py:1004-1009, :1812-1820) and "
+                "serving one silently would leave the other's bytes unused"
+              : "MLA block: a q_lora layer must carry EITHER "
+                "`fused_qkv_a_proj` (the fused form upstream's "
+                "packed_modules_mapping builds) OR `q_a_proj` plus "
+                "`kv_a_proj_with_mqa` (the split form a llama.cpp k-quant "
+                "conversion ships, whose two halves carry different block "
+                "encodings and cannot be concatenated); neither is populated");
     }
-    Tensor w_qa = fused.Slice(0, 0, ql);
+    Tensor w_qa{}, w_kva{};
+    if (split_a) {
+      RequireWeight(w.kv_a_proj_with_mqa, "kv_a_proj_with_mqa");
+      if (w.q_a_proj.shape[0] != ql) {
+        throw std::invalid_argument(
+            "MLA block: q_a_proj must be [q_lora_rank, hidden_size] "
+            "(deepseek_v2.py:1004-1009)");
+      }
+      if (w.kv_a_proj_with_mqa.shape[0] != L + R) {
+        throw std::invalid_argument(
+            "MLA block: kv_a_proj_with_mqa must be [kv_lora_rank + "
+            "qk_rope_head_dim, hidden_size] (deepseek_v2.py:511)");
+      }
+      w_qa = w.q_a_proj;
+      w_kva = w.kv_a_proj_with_mqa;
+    } else {
+      const Tensor& fused = w.fused_qkv_a_proj;
+      if (fused.shape[0] != ql + L + R) {
+        throw std::invalid_argument(
+            "MLA block: fused_qkv_a_proj must be [q_lora_rank + kv_lora_rank + "
+            "qk_rope_head_dim, hidden_size] (deepseek_v2.py:1004-1009)");
+      }
+      w_qa = fused.Slice(0, 0, ql);
+      w_kva = fused.Slice(0, ql, ql + L + R);
+    }
     Tensor q_raw_t = q_raw.t();
     vt::MatmulBT(d.q, q_c_t, hidden, w_qa);  // q_c A-proj (own GEMM → contiguous latent)
     if (fused_nr) {
       Tensor kv_merged_t = kv_merged.t();  // A2: ONE merged [T, L+R] kv A-proj GEMM
-      vt::MatmulBT(d.q, kv_merged_t, hidden, fused.Slice(0, ql, ql + L + R));
+      vt::MatmulBT(d.q, kv_merged_t, hidden, w_kva);
     } else {
+      // THE SPLIT PATH ROW-SLICES THE KV WEIGHT, AND A BLOCK-QUANTIZED WEIGHT
+      // HAS NO ROW SLICE. `Tensor::Slice` offsets by `stride[dim] *
+      // SizeOf(dtype)` and `SizeOf` refuses a block dtype outright, so this
+      // would throw four frames deeper with a message about dtypes rather than
+      // about the operator's switch. `vt::FusedNormRope` is registered on CPU
+      // (`cpu_ops.cpp`) and CUDA (`cuda_ops.cu`) and is default-ON, so the only
+      // way here on a keep-quant checkpoint is `VT_MLA_FUSED_NORM_ROPE=0`.
+      if (vt::IsBlockQuant(w_kva.dtype)) {
+        throw std::invalid_argument(
+            "MLA block: the split A-projection path needs vt::FusedNormRope to "
+            "read the merged [kv_lora_rank + qk_rope_head_dim] row, because a "
+            "BLOCK-QUANTIZED kv_a_proj_with_mqa (" +
+            std::string(vt::Name(w_kva.dtype)) +
+            ") has no row slice — a quant block spans whole rows and "
+            "vt::SizeOf refuses a per-element size for it. This is reachable "
+            "only with VT_MLA_FUSED_NORM_ROPE=0 on a keep-quant MLA "
+            "checkpoint; unset it, or load this model with an expanded "
+            "residency");
+      }
       Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
-      vt::MatmulBT(d.q, kv_c_t, hidden, fused.Slice(0, ql, ql + L));
+      vt::MatmulBT(d.q, kv_c_t, hidden, w_kva.Slice(0, 0, L));
       // NoPE (W3, #2213): with no rope slice there are no rope ROWS in the
       // A-projection either — `fused_qkv_a_proj` is [q_lora + kv_lora, hidden]
       // — so the second GEMM is NOT LAUNCHED rather than issued at width 0,
       // which `Tensor::Slice` refuses as an empty range.
       if (R > 0) {
-        vt::MatmulBT(d.q, k_pe_t, hidden, fused.Slice(0, ql + L, ql + L + R));
+        vt::MatmulBT(d.q, k_pe_t, hidden, w_kva.Slice(0, L, L + R));
       }
     }
     // `q_c = self.q_a_layernorm(q_c)` (mla.py:143) — in-place, like upstream.

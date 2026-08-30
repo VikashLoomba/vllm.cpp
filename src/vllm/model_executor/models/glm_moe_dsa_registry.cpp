@@ -15,11 +15,14 @@
 // checkpoint cannot land on the dense-attention forward. Composing here would
 // mean relaxing that refusal for DeepSeek-V2 as well.
 //
-// SCOPE HONESTY: this makes the architecture RESOLVE and its config PARSE, from
-// a `config.json` and from a `glm-dsa` GGUF header alike. It does NOT forward
-// and it loads no weight. `GlmMoeDsaModel` refuses by name and names every
-// missing primitive; the safetensors arm refuses permanently (spec D1) and the
-// GGUF arm is owed by W7. The model-matrix row stays `SPIKE`.
+// SCOPE, AS IT NOW STANDS. W2 made the architecture RESOLVE and its config
+// PARSE, from a `config.json` and from a `glm-dsa` GGUF header alike. W7 made
+// the GGUF arm LOAD. W9 (#2214) makes it FORWARD: `GlmMoeDsaModel::Forward` /
+// `::ForwardDevice` in `glm_moe_dsa_forward.cpp` produce logits, and the
+// refusal that remains is the one STEP shape this build cannot serve — a
+// resumed request whose selection prunes, which needs the indexer KV side cache
+// `KV-DSV4-MULTICACHE` owns (spec O4, #1925, #2323). The safetensors arm
+// refuses permanently (spec D1).
 #include "vllm/model_executor/models/model_registry.h"
 
 #include <memory>
@@ -106,6 +109,21 @@ const ModelFactory kGlmMoeDsaFactory{
     .forward = &ForwardGlmMoeDsaForCausalLM,
     .make_kv_cache = &MakeGlmMoeDsaKVCache,
     .is_dense_model = false,
+    // W9 (#2214), spec O22. THE FLAG AND THE FORWARD LAND TOGETHER, because the
+    // flag is a claim ABOUT the forward: it says this model's routed-expert
+    // compute reads through the slot seam, and `model_registry.h` argues at
+    // length that it therefore lives beside the forward that implements it.
+    // `ForwardGlmMoeDsaForCausalLM` reaches `MoeBlock` -> `ExpertMlp` ->
+    // `GlmExpertSlice` -> `expert_stream::ExpertSlice`
+    // (`glm_moe_dsa_forward.cpp`), so the claim is true; W7 could not make it,
+    // because W7 had no forward.
+    //
+    // THE COST OF NOT SETTING IT IS EXACT AND IS WHY THIS IS NOT COSMETIC.
+    // `model_loader.cpp`'s streamed-lane block is guarded on
+    // `factory->streams_routed_experts`, so without this the lane is never
+    // built, `CheckDeviceWeightFit` charges the device the full 187.312 GiB of
+    // towers against `dgx:gpu0`'s 119.631 GiB budget, and the load REFUSES.
+    .streams_routed_experts = true,
 };
 
 }  // namespace

@@ -5,11 +5,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/glm5_next_diag.h"
 #include "vllm/model_executor/models/glm5_next_dsa.h"
 #include "vllm/model_executor/models/glm5_next_moe.h"
 #include "vt/dtype.h"  // vt::DeviceType
@@ -160,6 +162,47 @@ const DecoderLayerWeights& Glm5NextGgufLayerSource::Layer(int64_t layer_idx) {
   loaded_ = layer_idx;
   ++bridged_;
   slot_f32_bytes_ = SlotF32Bytes(slot_);
+  // PER-TENSOR NORMS RIGHT AFTER THE BRIDGE. An unloaded tensor and an
+  // all-zero tower are the (b) case of the four this instrument separates, and
+  // they are visible here and nowhere later: by the time a zero weight has been
+  // multiplied into a hidden state the hidden state is the only thing left to
+  // look at, and it is zero for reasons this file cannot distinguish.
+  if (diag::Level() > 0) {
+    const std::string tag = what + " ";
+    diag::Stats((tag + "attn_norm").c_str(), slot_.input_layernorm);
+    diag::Stats((tag + "ffn_norm").c_str(), slot_.post_attention_layernorm);
+    diag::Stats((tag + "hc_attn.fn").c_str(), slot_.attn_hc.fn);
+    diag::Stats((tag + "hc_attn.base").c_str(), slot_.attn_hc.base);
+    diag::Stats((tag + "hc_attn.scale").c_str(), slot_.attn_hc.scale);
+    diag::Stats((tag + "hc_ffn.fn").c_str(), slot_.ffn_hc.fn);
+    if (slot_.attn_kind == Glm5NextLayerKind::kLinearAttention) {
+      diag::Stats((tag + "kda.q_proj").c_str(), slot_.kda.q_proj);
+      diag::Stats((tag + "kda.k_proj").c_str(), slot_.kda.k_proj);
+      diag::Stats((tag + "kda.v_proj").c_str(), slot_.kda.v_proj);
+      diag::Stats((tag + "kda.a_log").c_str(), slot_.kda.a_log);
+      diag::Stats((tag + "kda.dt_bias").c_str(), slot_.kda.dt_bias);
+      diag::Stats((tag + "kda.o_norm").c_str(), slot_.kda.o_norm);
+      diag::Stats((tag + "kda.o_proj").c_str(), slot_.kda.o_proj);
+    } else {
+      diag::Stats((tag + "mla.q_a_proj").c_str(), slot_.dsa.mla.q_a_proj);
+      diag::Stats((tag + "mla.q_b_proj").c_str(), slot_.dsa.mla.q_b_proj);
+      diag::Stats((tag + "mla.kv_a_proj_with_mqa").c_str(), slot_.dsa.mla.kv_a_proj_with_mqa);
+      diag::Stats((tag + "mla.k_b_proj").c_str(), slot_.dsa.mla.k_b_proj);
+      diag::Stats((tag + "mla.v_b_proj").c_str(), slot_.dsa.mla.v_b_proj);
+      diag::Stats((tag + "mla.o_proj").c_str(), slot_.dsa.mla.o_proj);
+    }
+    if (slot_.mlp_kind == Glm5NextMlpKind::kDense) {
+      diag::Stats((tag + "mlp.gate_proj").c_str(), slot_.dense_mlp.gate_proj);
+      diag::Stats((tag + "mlp.up_proj").c_str(), slot_.dense_mlp.up_proj);
+      diag::Stats((tag + "mlp.down_proj").c_str(), slot_.dense_mlp.down_proj);
+    } else {
+      diag::Stats((tag + "moe.router_weight").c_str(), slot_.moe.router_weight);
+      diag::Stats((tag + "moe.e_score_bias").c_str(),
+                  slot_.moe.e_score_correction_bias);
+      diag::Stats((tag + "moe.shared.gate").c_str(), slot_.moe.shared.gate_proj);
+      diag::Stats((tag + "moe.shared.down").c_str(), slot_.moe.shared.down_proj);
+    }
+  }
   return slot_;
 }
 
@@ -169,6 +212,7 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
                                        const std::vector<int32_t>& token_ids,
                                        const std::vector<int32_t>& logits_indices,
                                        vt::Queue& queue,
+                                       std::vector<LayerCache>* caches,
                                        int64_t lm_head_chunk_bytes) {
   const Glm5NextParams& p = weights.params;
   const int64_t H = p.hidden_size;
@@ -194,6 +238,19 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
          ".agents/specs/glm5-next-flash.md and issue #2241.");
   }
 
+  diag::Banner("Glm5NextHostForward");
+  if (diag::Level() > 0) {
+    std::fprintf(stderr,
+                 "[glm5-diag] step: T=%lld H=%lld V=%lld layers=%lld hc=%lld "
+                 "caches=%s logits_indices=%zu\n",
+                 static_cast<long long>(T), static_cast<long long>(H),
+                 static_cast<long long>(V),
+                 static_cast<long long>(p.num_hidden_layers),
+                 static_cast<long long>(p.mhc.mult),
+                 caches == nullptr ? "null" : "present", logits_indices.size());
+    diag::Ids("step token_ids", token_ids);
+  }
+
   // ── the embedding gather (`:1447-1448`) ────────────────────────────────────
   //
   // ROW BY ROW out of the block-resident table. `token_embd.weight` is
@@ -215,6 +272,7 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
     }
     std::copy(row.begin(), row.end(), embeds.begin() + t * H);
   }
+  diag::Stats("embeds (token_embd gather)", embeds);
 
   // ── the stack ──────────────────────────────────────────────────────────────
   //
@@ -224,12 +282,16 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
   const std::vector<uint8_t> mask(static_cast<size_t>(T), 1);
   const std::vector<float> norm =
       DecodeOwnedTensorToF32(weights.norm, "output_norm.weight");
+  diag::Stats("output_norm.weight", norm);
   Glm5NextGgufLayerSource layers(weights);
-  // `caches` is null: this path re-runs the whole prefix each step and owns no
-  // state. See the header for why, and for what it costs.
+  // `caches` non-null carries the history; `TextModelForward` refuses a vector
+  // that is not exactly `num_hidden_layers` long by name
+  // (`glm5_next_layer.cpp`), so a binding that produced the wrong count stops
+  // here rather than reading a default-constructed state as a zero one.
   const std::vector<float> hidden =
       TextModelForward(p, norm, layers, embeds, mask, /*batch=*/1, /*seq_len=*/T,
-                       /*caches=*/nullptr, queue);
+                       caches, queue);
+  diag::Stats("hidden (final, entering the head)", hidden);
   if (static_cast<int64_t>(hidden.size()) != T * H) {
     Fail("the text model returned " + std::to_string(hidden.size()) +
          " floats, expected " + std::to_string(T * H));
@@ -283,6 +345,7 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
     const int64_t n = std::min(chunk_rows, V - first);
     const std::vector<float> chunk =
         DecodeOwnedTensorRowsToF32(head, head_name, first, n);
+    if (first == 0) diag::Stats("lm_head chunk[0]", chunk);
     for (size_t r = 0; r < want.size(); ++r) {
       const float* hr = &hidden[static_cast<size_t>(want[r] * H)];
       float* lr = &logits[r * static_cast<size_t>(V)];
@@ -292,6 +355,13 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
         for (int64_t i = 0; i < H; ++i) acc += static_cast<double>(wo[i]) * hr[i];
         lr[first + o] = static_cast<float>(acc);
       }
+    }
+  }
+  if (diag::Level() > 0) {
+    for (size_t r = 0; r < want.size(); ++r) {
+      const std::string tag = "logits[row " + std::to_string(want[r]) + "]";
+      diag::TopK(tag.c_str(), &logits[r * static_cast<size_t>(V)],
+                 static_cast<size_t>(V), 5);
     }
   }
   return logits;

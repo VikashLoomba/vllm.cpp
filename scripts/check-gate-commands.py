@@ -463,6 +463,12 @@ def audit() -> list[dict]:
 # reachable on this fleet. The credit returns when the row reaches a gate-obliged
 # state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
+    # 2026-08-30: +MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm. GROWTH, and
+    # not because the row gained a gate: it re-entered the AUDITED population
+    # when W2 (#2214) moved it `SPIKE` -> `ACTIVE`, and its spec's `### Gates`
+    # section already named commands that can fail. Re-pinned in the same change
+    # that moved the row, as the checker requires.
+    "MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm",
     # MODEL-DSV4-DSA-COMPOSE joined the runnable population when its spec
     # landed (#2286): the row is scoping-only, but its `## Gates` section
     # names commands that can fail, and this ratchet counts a row by what its

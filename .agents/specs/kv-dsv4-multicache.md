@@ -477,6 +477,35 @@ that is stated rather than discovered: W5's synthetic-config gate proves routing
 and the token-exact oracle gate belongs to `MODEL-DSV4-DSA-COMPOSE` above 512
 tokens.
 
+**A SECOND row consumes this W5, and it is recorded here so the count of
+consumers is not rediscovered as a surprise.**
+`MODEL-TEXT-GLM-MOE-DSA` (`.agents/specs/glm-dsa-latest-deepseek.md` §3.7)
+also has a wave numbered W5, "the indexer KV side cache", and its own text
+makes it conditional: *"This is `KV-DSV4-MULTICACHE`'s work and this row
+consumes it; if that row does not schedule it, this row's W5 is where it lands
+and the ownership is recorded in both places before a line is written."*
+
+**That condition resolved FALSE on 2026-08-30, so W5 is STRUCK from the GLM row
+and re-sequenced there as a consumption site — struck, not deferred, because the
+wave does not belong to that row at any date.** This row scheduled W5: it has a `### W5 design` section (W5-1 through
+W5-6) tracked by [#2323](https://github.com/mudler/vllm.cpp/issues/2323), and
+its first implementation commit — W5-2's gated dispatch — is already written.
+GLM-5.3 is therefore a CONSUMER of the same by-name multi-KV channel that
+DeepSeek-V4 consumes, on the shape `MODEL-MM-GLM53-FLASH` already proved
+(`glm5_next_kv.{h,cpp}`, `ModelFactory::consumes_multi_kv_cache`), and it
+acquires no independent cache-plumbing scope.
+
+**The concrete thing that would have gone wrong** is worth keeping, because it
+is the failure this boundary exists to prevent. The GLM row's W5 lists as a
+test *"the refusal at `dots3_note_device.cpp` is deleted"* — and W5-2 above
+says, in this row's own words, that **deleting the refusal is the one thing W5
+must not do**. Two rows working the same wave from two specs would have had one
+of them delete the guard the other built. A third point: that refusal is not
+GLM's to delete under any owner, because it guards `Dots3NoteForCausalLM` and
+belongs to `MODEL-DOTS3-NOTE` ([#699](https://github.com/mudler/vllm.cpp/issues/699)),
+whose own comment already says the cache "is `KV-DSV4-MULTICACHE` (#1925), not
+this row".
+
 W1, W2, W4 and W6 are fully CPU-gateable. W3 is CPU-gateable for its own
 guarantees but its byte-neutrality obligation reaches every model, so its full
 gate includes the SACRED `test_qwen35_paged_engine` regression. W5 and W7 need

@@ -915,6 +915,43 @@ TEST_CASE("glm5_next W5b-2c: the bf16 page dtype is the PRODUCTION default") {
 
 // ═══ (6) W5b-2c — a WRONG mapping refuses rather than answering ═════════════
 
+TEST_CASE("glm5_next W5b-2c: the PUBLICATION ORDER does not matter, the NAME does") {
+  // WITHOUT THIS CASE THE SUITE CANNOT SEE THE DIFFERENCE. The miniature has
+  // exactly ONE DSA layer, so its MLA latent is entry 0 of `attn_kv` and a
+  // resolver that indexed by position instead of asking
+  // `MultiKvCacheIndex::Find` would be right at this fixture and wrong on the
+  // published checkpoint, whose 22 entries arrive as eleven latents followed by
+  // eleven indexer caches. Permuting the channel — the names, the group ids,
+  // the layer indices and the caches together, exactly as the runner would if
+  // it published the groups in the other order — makes position wrong and name
+  // right, and the two runs must be BIT-IDENTICAL.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  const std::vector<int32_t> ids{3, 11, 7, 20};
+
+  Step plain(ids);
+  const vllm::ForwardLogits a = vllm::ModelRegistry::Forward(*model, plain.Get());
+
+  Topology flipped;
+  std::swap(flipped.names[0], flipped.names[1]);
+  std::swap(flipped.group_ids[0], flipped.group_ids[1]);
+  std::swap(flipped.layer_indices[0], flipped.layer_indices[1]);
+  std::swap(flipped.attn_kv[0], flipped.attn_kv[1]);
+  std::swap(flipped.attn_bytes[0], flipped.attn_bytes[1]);
+  flipped.Publish();
+  Step permuted(ids);
+  permuted.Bind(flipped);
+  const vllm::ForwardLogits b =
+      vllm::ModelRegistry::Forward(*model, permuted.Get());
+
+  REQUIRE(a.host.size() == b.host.size());
+  const Gap gap = MaxGap(a.host, b.host);
+  CHECK(gap.nonfinite == 0);
+  MESSAGE("permuted-channel gap: " << gap.max_abs);
+  CHECK(gap.max_abs == 0.0);
+}
+
 TEST_CASE("glm5_next W5b-2c: an MLA latent read as a K+V PAIR is REFUSED") {
   // The single highest-risk error on this wave, and it does not crash. The MLA
   // latent is ONE vector per token (`MLAAttentionSpec` fixes num_kv_heads at 1

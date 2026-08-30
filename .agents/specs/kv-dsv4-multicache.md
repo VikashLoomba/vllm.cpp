@@ -1733,35 +1733,45 @@ config parse and upstream's disagree about the layer partition (that would be a
 
 ## Owed
 
-- **AN OPEN QUESTION about the forward's exactness bound, raised with citations
-  and deliberately NOT asserted as a defect** (#2323). Two things were read
-  directly in the tree and upstream, and they sit uneasily together:
+- **SETTLED, AND THE RECORDED EXACTNESS BOUND IS TOO GENEROUS BY 4x** (#2323).
+  The previous revision of this entry raised it as an open question; the
+  composition has now been traced end to end and the answer is confirmed.
 
-  1. `attention.py:568` comments the KV-insert step as **"kv is unchanged;
-     attention reads kv solely via swa_kv_cache"**, and every attention layer --
-     all 43 -- constructs a `DeepseekV4SWACache` unconditionally
-     (`attention.py:315-321`) whose spec carries `sliding_window = 128`
-     (`sparse_swa.py:86-101`).
-  2. Our forward attends over a `deck` holding EVERY key of the sequence
-     (`deepseek_v4.cpp`, the dense-causal `sel` arm builds `[0, kv_base + t]`),
-     and the new paged arm reproduces that exactly -- which is why the
-     token-identity gate passes.
+  `forward_mqa` issues ONE kernel call
+  (`nvidia/flashmla.py`, `flash_mla_with_kvcache`):
 
-  If upstream's attention really reads only a 128-token window of raw KV, then
-  our full-context attention diverges from it ABOVE 128 TOKENS, and this row's
-  recorded bound -- "exact only while `seq_len <= index_topk` (=512)" -- would be
-  too generous by a factor of four for the arms that have no compressed history
-  to fall back on.
+  ```python
+  out, _ = flash_mla_with_kvcache(
+      k_cache=swa_cache,                                 # PRIMARY: the sliding window
+      indices=swa_indices,
+      extra_k_cache=kv_cache if not swa_only else None,  # compressed latent, SPARSE layers only
+      extra_indices_in_kvcache=topk_indices,
+      out=output.unsqueeze(1))
+  ```
 
-  **It is a question and not a finding**, because the composition was not traced:
-  on the sparse layers the compressed latent may supply the history beyond the
-  window, in which case the two are not comparable term by term, and the bound
-  may be right for a reason this entry has not read. Settling it needs
-  `forward_mqa` and the sparse-MLA path read end to end.
+  with `swa_only = self.compress_ratio <= 1`. So upstream attends the SLIDING
+  WINDOW always, and the selected compressed history ONLY on sparse layers. A
+  `compress_ratio <= 1` layer therefore attends **128 tokens and nothing else**
+  (`sliding_window = 128`, `sparse_swa.py:86-101`).
 
-  It is recorded because it is cheap to check and expensive to be wrong about: it
-  bounds the sequence length at which ANY DeepSeek-V4 token-exactness claim -- including
-  this row's own W5 gate -- stops meaning what it says.
+  Our forward attends the FULL context on every layer (`deepseek_v4.cpp`, the
+  dense-causal `sel` arm over `[0, kv_base + t]`), and the paged arm reproduces
+  it. So:
+
+  | layers | ours | upstream | diverges above |
+  |---|---|---|---|
+  | `ratio <= 1` (5 of 46) | full context | 128-token window | **128 tokens** |
+  | `ratio == 4 / 128` | full context | window + top-k compressed | already refused (#2286) |
+
+  **This row's recorded bound -- "exact only while `seq_len <= index_topk`
+  (=512)" -- is therefore wrong for the SWA-only layers, where the binding
+  constraint is 128.** Any DeepSeek-V4 token-exactness claim above 128 tokens is
+  measuring a different computation from upstream on those five layers, and that
+  includes this row's own W5 gate, which runs far below 128 and so cannot see the
+  difference either way.
+
+  What is owed is the sliding window itself on the SWA-only path, and a bound in
+  the records that says 128 rather than 512.
 
 
 - **The last link of W5 -- `Forward` resolving pages from `multi_kv` -- is NOT

@@ -2025,8 +2025,10 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   record to repair. Named here because a reader who checks `gguf_dequant.cpp` and
   stops will conclude both types are supported.
 - **O4 — the indexer KV side cache does not exist**, so sparse decode refuses any
-  resumed request (`dots3_note_device.cpp:1204-1227`; the anchor read
-  `:1147-1180` until 2026-08-30, see O20). Discharged by `KV-DSV4-MULTICACHE`
+  resumed request — the refusing `VT_CHECK(!elig.prunes || elig.Active(), ...)`,
+  at `dots3_note_device.cpp:1204-1227` on `origin/main` `03e0dcd19` and
+  `:1205-1228` on this row's integration branch, which is W4's own three-line
+  edit moving it. The anchor read `:1147-1180` until 2026-08-30, see O20. Discharged by `KV-DSV4-MULTICACHE`
   W5 ([#1925](https://github.com/mudler/vllm.cpp/issues/1925),
   [#2323](https://github.com/mudler/vllm.cpp/issues/2323)) and consumed here,
   NOT by a wave of this row — the §3.7 W5 conditional resolved FALSE on
@@ -2155,8 +2157,12 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   `MlaSharedSelection`.
 - **O20 — this section's `dots3_note_device.cpp:1147-1180` anchor was WRONG,
   and it had already propagated into product code.** The refusing `VT_CHECK` is
-  at `:1204-1227`; `:1147-1180` is the explanatory comment block above it, so
-  the anchor pointed at prose rather than at the guard it claimed to cite. The
+  at `:1204-1227` on `origin/main` `03e0dcd19` (`:1205-1228` on this row's
+  integration branch, one line down under W4's edit to the same file);
+  `:1147-1180` is the explanatory comment block above it, so the anchor pointed
+  at prose rather than at the guard it claimed to cite. **Cite it by its
+  predicate — `!elig.prunes || elig.Active()` — rather than by a number**, which
+  is the durable form: the range moved by one line inside this very branch. The
   same wrong range is compiled into `kForwardRefusal`
   (`glm_moe_dsa.cpp`), which means a GLM-5.3 user meeting the refuse-by-name
   forward is handed a line range that does not contain a refusal. Corrected in
@@ -2219,7 +2225,10 @@ citation:
    invisible to a token gate, since the tokens stay right while the decode
    recomputes. The replacement is a DISPATCH on a declared capability.
 3. **The line range does not contain the refusal.** The `VT_CHECK` is at
-   `:1204-1227`; `:1147-1180` is the comment above it. That wrong range is
+   `:1204-1227` on `origin/main` `03e0dcd19`, and at `:1205-1228` here — W4's
+   own edit to that file moved it one line, inside this branch, which is why
+   the durable citation is its predicate `!elig.prunes || elig.Active()` and
+   not a range. `:1147-1180` is the comment above it. That wrong range is
    compiled into `kForwardRefusal` in `glm_moe_dsa.cpp`, so it is shipping to
    users today. Recorded as O20 rather than repaired here, because editing a
    registered model's refusal message is a behaviour change and not a record's

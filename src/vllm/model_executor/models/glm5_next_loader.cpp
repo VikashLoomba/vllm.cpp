@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <set>
 #include <stdexcept>
@@ -21,8 +22,10 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/models/glm5_next_diag.h"
 #include "vllm/model_executor/models/glm5_next_weights.h"     // the name map
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
+#include "vt/quant.h"  // vt::cpu::QuantRepackActive
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -478,6 +481,27 @@ Glm5NextWeights LoadGlm5NextFromGguf(const GgufFile& gguf,
                                      const GgufLoadPolicy* policy) {
   const GgufLoadPolicy pol =
       policy != nullptr ? *policy : GgufLoadPolicy::FromEnv();
+
+  // WHAT THIS BOX WOULD HAVE DONE, printed beside what this row does instead.
+  // The repack defect (#2241) was reachable only where `QuantRepackActive()` is
+  // true, so an investigation that does not record that bit cannot tell a box
+  // that never repacked from a repair that worked. This line is the record.
+  if (glm5_next::diag::Level() > 0) {
+    glm5_next::diag::Banner("LoadGlm5NextFromGguf");
+    std::fprintf(stderr,
+                 "[glm5-diag] load policy: keep_quant=%d cpu_ref=%d "
+                 "policy.quant_repack=%d QuantRepackActive()=%d "
+                 "policy.elem_kn_repack=%d mmap_residency=%d | this row uses "
+                 "quant_repack=%d elem_kn_repack=%d\n",
+                 static_cast<int>(pol.keep_quant), static_cast<int>(pol.cpu_ref),
+                 static_cast<int>(pol.quant_repack),
+                 static_cast<int>(vt::cpu::QuantRepackActive()),
+                 static_cast<int>(pol.elem_kn_repack),
+                 static_cast<int>(pol.mmap_residency),
+                 static_cast<int>(kGlm5NextQuantRepack),
+                 static_cast<int>(kGlm5NextElemKnRepack));
+    std::fflush(stderr);
+  }
 
   Glm5NextWeights w;
   // The SAME resolver the config hook runs, so a file whose metadata the

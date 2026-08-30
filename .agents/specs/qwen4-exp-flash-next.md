@@ -6311,6 +6311,33 @@ not memory, not a generated instruction, not `__fmul_rn` versus a contracted fma
 | write-back vs the CPU arm, 1x2x1 / 3x4x8 / 7x3x129 / **2x4x2560** | **0 of 2 / 96 / 2709 / 20480 differ — bitwise**, at the released hyper-connection geometry |
 | write-back hc/hidden stride, structurally, with hc == hidden | 0 of 48 misplaced |
 
+**DTYPE COVERAGE, AND A SECOND INSTRUMENT DEFECT.** The f32 table above leaves
+the runtime dtype TAG's bf16 and f16 arms completely untouched, and a wrong tag
+mapping there would be invisible to every case in it. Thirty-two further
+combinations were therefore run: all **18** write-back `(hyper, block, injection)`
+triples the op admits (`hyper` is an output, so f32/bf16 there), all **6** conv
+`(x/weight, state/out)` pairs, and all **6** gate `(value, out)` pairs. **Every one
+is bitwise equal to the CPU arm — 0 of 204, 0 of 224 and 0 of 693 elements
+differing respectively.**
+
+Getting there cost a second instrument defect worth recording beside M3's. The
+first run of that table failed all 27 non-f32 cases with `max|diff|` up to
+**2.4e9**, which reads exactly like a catastrophic kernel defect. It was not: the
+lint shim's `__bfloat162float` and `__half2float` were stubs returning the raw
+16-bit pattern cast to float, so a bf16 `0x3F80` arrived as 16256. Pointing them
+at the tree's own `vt::BF16ToF32` / `vt::F32ToBF16` / `vt::F16ToF32` /
+`vt::F32ToF16` turned all 27 green with no change to any kernel. Broken
+instruments fail toward a code verdict, and this one nearly convicted three
+correct kernels.
+
+**That substitution is also the sharpest limit on this whole simulation** and it
+is stated rather than buried: using the host helpers in place of the CUDA
+intrinsics means the simulation ASSUMES `__float2bfloat16 == vt::F32ToBF16` and
+`__float2half == vt::F32ToF16` instead of testing it. Both are documented
+round-to-nearest-even and `cuda_ops.cu` already asserts the equality in a comment,
+but only a device run confirms it — and the whole bf16 store path of these three
+kernels rests on it.
+
 **Mutations, on the host simulation.** Each was applied with a sha256 before/after
 pair proving it changed the file, built with the rc read FIRST, run, and the tree
 restored (`git status` clean at `ad436f49`). All six build, so none is withdrawn.

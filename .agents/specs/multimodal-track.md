@@ -980,9 +980,12 @@ comparing the two arms must set the flag on both sides or state that it did not.
   *Read the fall in this number honestly: it is the defect leaving, not the
   saving shrinking.* Half of the pre-#1359 threshold was the host-f32 storage of
   a bf16 tower. The flag now frees the tower the checkpoint ships instead of the
-  tower plus our widening, so a rerun should read about 0.774 GiB where the
-  2026-08-24 run read 1.542, and that halving is CORRECT rather than a
-  regression. The pre-declaration that authorises moving the threshold with it is
+  tower plus our widening, so a rerun reads about 0.774 GiB where the 2026-08-24
+  run read 1.542, and that halving is CORRECT rather than a regression. **That
+  is no longer a prediction: the 2026-08-28 rerun recorded below measured
+  826916864 B = 0.770 GiB, which is 0.499x the 2026-08-24 saving, and MET this
+  threshold on both pairs.** The pre-declaration that authorises moving the
+  threshold with it is
   `.agents/specs/vision-tower-dtype-polarity.md` §6.2: the threshold was not
   renegotiated after a number arrived, it was re-derived because the fixed loader
   changed the quantity it is stated against. `muse-glimmer` still widens, its
@@ -1043,10 +1046,11 @@ comparing the two arms must set the flag on both sides or state that it did not.
      host f32. That is
      [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which the operator
      has confirmed also affects the Qwen3.6-27B path. **#1359's Qwen3-VL half
-     has since LANDED, so this leg rerun should read about 0.774 GiB rather than
-     1.542, and that HALVING IS CORRECT rather than a regression** — the flag now
-     frees the tower the checkpoint actually ships. The figure recorded above is
-     what the run at `41ab550b9` measured and it stays as that record.
+     has since LANDED, and the 2026-08-28 rerun recorded below MEASURED the
+     consequence: 826916864 B = 0.770 GiB, 0.499x this figure. The HALVING IS
+     CORRECT rather than a regression** — the flag now frees the tower the
+     checkpoint actually ships. The figure recorded above is what the run at
+     `41ab550b9` measured and it stays as that record.
      `muse-glimmer-30b`'s tower is still held in host f32, so its own
      90%-of-7.161-GiB threshold is unchanged; that half is blocked on
      [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
@@ -1061,9 +1065,74 @@ comparing the two arms must set the flag on both sides or state that it did not.
      memory" from meaning "we broke the default path" — is a separate run and
      **was not asserted here**. It stays owed.
 
+  **THE RERUN, 2026-08-28: MET on both pairs, first half only, and it is what
+  verifies #1359's Qwen3-VL half.** Harness
+  `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl` at `main` `525d2b991`, on
+  `dgx:gpu0` under an `rc` lease. Same procedure, same `--device cpu` CPU-only
+  build, same staged-to-local-disk checkpoint, different host.
+
+  | pair | default arm | `--language-model-only` | saving |
+  |---|---:|---:|---:|
+  | 1 (binary A then B) | 9381281792 B | 8554364928 B | **826916864 B = 0.770 GiB** |
+  | 2 (SWAPPED, B then A) | 9380958208 B | 8554381312 B | **826576896 B = 0.770 GiB** |
+
+  Against the LIVE threshold declared above — **747625881 B**, 90% of the
+  830695424 B tower the checkpoint ships — **both pairs clear it, so half 1 is
+  MET**. The saving is 99.5% of that tower.
+
+  *What this run proves that the 2026-08-24 run could not.* Three things, and
+  the third is the one that makes the first two admissible.
+
+  1. **#1359 recovered 828219392 B = 0.771 GiB on the default arm.** The default
+     arm went 10209501184 B → 9381281792 B between the two runs. The fix
+     predicted 830695424 B from the checkpoint's own headers, so the recovery is
+     **99.7% of prediction**. The prediction was near-exact, not approximately
+     right.
+  2. **The tower-skip saving halved exactly as predicted.** 1655791616 B →
+     826916864 B is **0.499x**. Every surface that carried this as an
+     expectation now carries it as a measurement.
+  3. **The control held, which is why 1 and 2 attribute to the fix.** The two
+     runs are on DIFFERENT HOSTS, so a raw before/after on the default arm alone
+     would confound the fix with the host. The `--language-model-only` arm is
+     the control: it loads no tower, so #1359 cannot touch it and it should not
+     move. It moved **+655360 B = +0.0077%**, against a 2% bound — 8553709568 B
+     → 8554364928 B. A host change large enough to explain the 0.771 GiB default-
+     arm drop would have moved this arm too, and it did not. Without this arm the
+     cross-host comparison would not be sound, and it should not be quoted
+     without it.
+
+  *The estimator, on this run.* Mean 826746880 B. Spread `|pair 1 − pair 2|` =
+  339968 B, 0.041% of the saving, against a leg-to-leg `|warmup − default|` of
+  24576 B on the same binary and the same arm. The spread is larger than the
+  single repeat here, unlike 2026-08-24, so it is an upper bound on any
+  binary-shaped bias `d` rather than a demonstration that none exists — and the
+  two binaries were again sha256-identical,
+  `fbc540431341a1aa452a6d0d9594412a5ef1cab4f79058ebdb995a790fc33da7`. At 0.041%
+  of the saving it changes no conclusion above.
+
+  *Conditions.* Worker `rc-worker-4b8lj`, `Linux 6.17.0-1029-nvidia aarch64`,
+  119 GB RAM (100 available), load 1.49/0.98/0.42 at start — a much quieter box
+  than the 2026-08-24 run's 5.16/4.48/4.05, which is one more reason the control
+  arm matters. Both arms built `Release`, `-DVLLM_CPP_BUILD_EXAMPLES=ON`, one
+  build directory per arm, live ninja target query green on both. The checkpoint
+  was staged off the NAS to worker-local `/tmp/tower-skip-ckpt` before any leg
+  ran — 29 files, 8887294190 B, verified by relative path and byte size. That
+  manifest is byte-identical to the 2026-08-24 run's, which recorded the
+  artifact as `Qwen/Qwen3-VL-4B-Instruct` at `ebb281ec70b05090aa6165b016eac8ec08e71b17`;
+  this run's log does not restate the revision, so the identity rests on the
+  file count and byte total agreeing rather than on a re-read hash. Leg topology
+  recorded on the first leg, `timer pid 4865 -> server pid 4867
+  comm='vllm-server'`, so the teardown signalled the server and not a wrapper.
+
+  *The caveats above carry over unchanged.* It is load-time peak host RSS with
+  both arms stopping at `/health`, not a served request and not VRAM; half 2 is
+  still not asserted and still owed; and it is one model's tower.
+
   *Evidence.* `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824.log` is
-  the harness report verbatim; `…-20260824.legs.log` beside it carries the five
-  `/usr/bin/time -v` records the report reads, the four server logs whose skip
+  the 2026-08-24 harness report verbatim, and
+  `docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828.log` is the
+  2026-08-28 one. The `…legs.log` beside each carries the five
+  `/usr/bin/time -v` records that report reads, the four server logs whose skip
   line is the receipt that the arms differed, and the cmake configure. They are
   copied into the repository because the run directory
   `/mnt/nas_share/rc/ckpt/rss-out/` is overwritten by the next run.
@@ -1954,15 +2023,28 @@ L4 (§1.6); the second while landing L3 (§1.5).
   MODEL.** The `qwen3-vl` figure below does not stand in for it and is 4.2x
   below this threshold.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
-  `qwen3_vl.cpp` site is MEASURED, half 1 only, 2026-08-24.** The run happened
-  on `thor:gpu0` under an `rc` lease at `main` `41ab550b9` and **MET** the
-  threshold that stood then — 1495251763 B, SUPERSEDED by #1359 and not
-  applicable to a rerun — on BOTH pairs of the swapped assignment: 1655791616 B
-  and 1655992320 B, 1.542 GiB, 99.7% of the 1661390848 B resident tower that
-  binary carried, spread 200704 B against a leg-to-leg 192512 B. The full result, its
-  conditions and its three caveats are in §1.5 L3 under "THE RESULT", and the
+  `qwen3_vl.cpp` site is MEASURED, half 1 only, remeasured 2026-08-28.** It has
+  run twice and MET on both pairs both times.
+
+  The CURRENT figure is the 2026-08-28 rerun on `dgx:gpu0` under an `rc` lease
+  at `main` `525d2b991`, after #1359's Qwen3-VL half landed: **826916864 B and
+  826576896 B, 0.770 GiB**, against the live 747625881 B threshold, 99.5% of the
+  830695424 B tower the checkpoint ships, spread 339968 B against a leg-to-leg
+  24576 B. That run is also what VERIFIES #1359's Qwen3-VL half — the default
+  arm recovered 828219392 B = 99.7% of prediction, while the tower-free
+  `--language-model-only` control arm moved only +655360 B = +0.0077% against a
+  2% bound, which is what makes the cross-host attribution sound.
+
+  The 2026-08-24 run on `thor:gpu0` at `41ab550b9` is HISTORY and is kept as
+  such: it MET the threshold that stood then — 1495251763 B, SUPERSEDED by #1359
+  and NOT applicable to a rerun — with 1655791616 B and 1655992320 B, 1.542 GiB,
+  99.7% of the 1661390848 B resident tower that binary carried, spread 200704 B
+  against a leg-to-leg 192512 B. The fall between the two runs is 0.499x and is
+  CORRECT rather than a regression. The full result of each, its conditions and
+  its caveats are in §1.5 L3 under "THE RESULT" and "THE RERUN", and the
   evidence is
-  `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log`.
+  `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log` and
+  `docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828{,.legs}.log`.
   **What is STILL owed on this kind:** half 2 of the gate, the default arm
   within 2% of the pre-L3 `edbc47ce0` binary, which is a separate run and was
   not asserted; and a GPU-device arm, since this figure is `--device cpu` host

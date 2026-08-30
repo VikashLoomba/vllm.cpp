@@ -74,9 +74,9 @@
 // `o_proj` — is one copy.
 //
 // STILL CONTIGUOUS, AND STILL OWED: the INDEXER side cache. That is KV group 2,
-// an `MLAAttentionSpec` the runner does not gather yet (#2249 item 3, owed as
-// W5c-2), and its paged store is a separate `## Owed` entry. This wave closes
-// item 2 and does not pretend to close item 3.
+// an `MLAAttentionSpec` whose block table W5c-2 now gathers (#2249 item 3), so
+// the MAP into its pages reaches a forward while the paged STORE below is still
+// a separate `## Owed` entry. This wave closed item 2 and did not close item 3.
 #ifndef VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_QSA_BLOCK_H_
 #define VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_QSA_BLOCK_H_
 
@@ -134,9 +134,9 @@ struct Qwen4ExpQsaCaches {
 // this block does not carry; the spec's `## Owed` records it.
 //
 // `index_key` is the QSA INDEXER side cache and it is STILL CONTIGUOUS
-// `[max_kv, indexer_head_dim]`. That is KV group 2, which the runner does not
-// gather yet (#2249 item 3, owed as W5c-2); its paged store is its own `## Owed`
-// entry and is deliberately not smuggled in here.
+// `[max_kv, indexer_head_dim]`. That is KV group 2, whose block table the runner
+// now gathers (#2249 item 3, W5c-2); its paged STORE is its own `## Owed` entry
+// and is deliberately not smuggled in here.
 struct Qwen4ExpQsaPagedCaches {
   PagedKvCache kv;           // the runner's paged K+V for THIS layer  READ-WRITE
   vt::Tensor block_table;    // i32 [1, max_pages]  logical page -> physical page

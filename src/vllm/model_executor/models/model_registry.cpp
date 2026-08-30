@@ -438,6 +438,14 @@ int64_t MultiKvCacheIndex::Find(std::string_view layer_name) const {
   return -1;
 }
 
+// KV-DSV4-MULTICACHE W5 (#2323). Trivial by construction, and that is the point:
+// the rule it encodes ("a name-keyed set that reaches a model which has not
+// claimed it is refused") is the one a future edit is most likely to invert or
+// widen, and as a free function it is pinned by a test that needs no model.
+bool MultiKvRefusalApplies(const MultiKvCacheIndex* mk, bool consumes_multi_kv) {
+  return mk != nullptr && !consumes_multi_kv;
+}
+
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,
                                      const ModelForwardInput& input) {
   // KV-DSV4-MULTICACHE W3 (#2068): a MULTI-CACHE topology reached the shared
@@ -458,8 +466,13 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
   // count, the distinct group count and the first published name all come out of
   // the payload, so a channel that arrived empty says something different.
   //
-  // W5 replaces this with the DSA-sparse forward that reads the caches.
-  if (input.multi_kv != nullptr) {
+  // W5 (#2323) turned this from a BLANKET refusal into a DISPATCH. It is gated on
+  // `ModelFactory::consumes_multi_kv`, so a model that has wired its forward to
+  // read a name-keyed set proceeds, and every model that has not still refuses
+  // here by name. Deleting the refusal outright was the one option W5 rejected:
+  // it would restore this exact silent discard for every FUTURE model that
+  // publishes a topology it cannot consume.
+  if (MultiKvRefusalApplies(input.multi_kv, model.registration().factory->consumes_multi_kv)) {
     const MultiKvCacheIndex& mk = *input.multi_kv;
     VT_CHECK(false,
              std::string("model forward: ") + std::to_string(mk.size()) +

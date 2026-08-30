@@ -1485,6 +1485,30 @@ config parse and upstream's disagree about the layer partition (that would be a
 
 ## Owed
 
+- **W5's dispatch mechanism has landed UNREACHED, and this entry is the record
+  AGENTS.md requires for that** (#2323). `ModelFactory::consumes_multi_kv` and
+  `MultiKvRefusalApplies` turn `ModelRegistry::Forward`'s blanket refusal into a
+  gated dispatch, and **no model sets the flag yet**, so the `true` arm is
+  reachable only from `test_multi_kv_refusal`. Nothing regresses -- every model
+  inherits `false` and hits the same refusal it hit before, which
+  `test_runner`'s "a multi-cache forward is REFUSED, naming the channel" still
+  asserts -- but the capability is not yet a capability.
+
+  What makes it one is the rest of W5: `DeepseekV4Model::Forward` and
+  `::ForwardDevice` consuming `attn_kv` by name instead of `(void)`-ing it, and
+  the DeepSeek-V4 registration then declaring `consumes_multi_kv = true`. The
+  bridge that work has to cross is named here so the next reader does not
+  rediscover it: the runner hands over `PagedKvCache` entries keyed by published
+  name, while `DeepseekV4ForwardGgufCached` (`deepseek_v4.cpp:2804`) takes a
+  model-owned `DeepseekV4KvCache&`. Those two representations have to meet, and
+  that is the substance of the wave rather than an incidental detail.
+
+  Owned by `KV-DSV4-MULTICACHE` W5, tracked by
+  [#2323](https://github.com/mudler/vllm.cpp/issues/2323). It blocks
+  `MODEL-DSV4-DSA-COMPOSE` ([#2286](https://github.com/mudler/vllm.cpp/issues/2286)),
+  which cannot start until a cache reaches the forward.
+
+
 - [#1925](https://github.com/mudler/vllm.cpp/issues/1925) — the defect this
   document scopes. Owned by this row. Not fixed in flow: it is a multi-wave
   capability across the KV interface, the runner and the model, and this spike

@@ -6421,6 +6421,28 @@ you cannot cancel, and an attached client makes a job that cancels itself.
 rather than facts about this row**, and no issue could be filed for them (GitHub
 writes are `403` from this host).
 
+**TWO `rc` FACTS THIS WAVE PAID FOR, BOTH ABOUT WHO OWNS A JOB.** Neither is in
+`.agents/environment.md` and both cost this wave its queue position.
+
+1. **`rc run --as <name>` makes the job unkillable by you.** The submitter it
+   records is the `--as` value, and a later plain `rc kill` answers
+   `not_job_owner: only the submitter or an admin may kill this job`. The escape
+   is `RC_SUBMITTER=<same name> rc kill <id>`, which works — but a job you cannot
+   cancel from the shell that made it is one that fires unattended on a shared
+   box. Submit plainly.
+2. **`rc run` CANCELS ITS OWN QUEUED JOB WHEN THE CLIENT DIES.** It is not
+   fire-and-forget. This wave's job reached queue position #1 on `dgx:gpu0` and
+   was then cancelled outright — `rc: cancelled queued job 7d58cbb7...`, and
+   `rc jobs` records `killed (killed by mudler@mudler-ubuntu-box)` — because the
+   streaming client was stopped. Nothing about the state of the DEVICE changed;
+   the client's death was the whole cause. A submission that has to outlive the
+   shell that made it therefore needs the client detached (`setsid nohup ... &`,
+   which leaves it at `ppid 1` in its own session), and the results read back from
+   `/workspace` or `rc logs` rather than from the stream.
+
+The practical cost was two full queue traversals on a box whose queue ran four to
+six deep, so this is recorded as an environment fact rather than as an anecdote.
+
 **Still owed after this wave, in order:**
 
 - **The CUDA arms of the four reduction ops**, each with the decision named in the

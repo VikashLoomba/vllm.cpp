@@ -1106,6 +1106,18 @@ const ModelFactory kQwen4ExpFactory{
     // `attn_kv` positionally would move a silent mis-index out of the engine and
     // into the model: `attn_kv` carries 2 x n_qsa entries on this topology.
     .consumes_multi_kv = true,
+    // W5L (#2031): THE DECLARATION THAT KEEPS A SERVER ALIVE. This forward's
+    // first check refuses `num_reqs > 1` (see the `input.num_reqs == 1`
+    // VT_CHECK above), and a refusal thrown inside the EngineCore busy loop is
+    // FATAL: it does not fail one request, it ends the engine. Measured on
+    // `examples/server` at `--max-num-seqs 4` — three overlapping
+    // `/v1/completions` calls all returned 500 with this hook's own message and
+    // nothing served afterwards. `LoadedEngine::ResolveMaxNumSeqs` reads this
+    // bit and clamps the scheduler to one sequence, which is why the same
+    // binary at the DEFAULT `max_num_seqs` of 128 now serves those three in
+    // sequence instead. It is cleared by the wave that plumbs the ragged batch,
+    // not by anything smaller.
+    .serves_one_sequence_per_step = true,
 };
 
 }  // namespace

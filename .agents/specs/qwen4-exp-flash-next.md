@@ -3898,6 +3898,69 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **W5L's ISSUE IS OWED, and so is the ISSUE FOR THE WAVE IT PROPOSES.** GitHub
+  writes are `403` from this host (account suspended), so nothing could be filed
+  and no row was appended to `.agents/issue-index.md`; an index row pointing at
+  an issue that does not exist is worse than an absent one. W5L rides under
+  [#2031](https://github.com/mudler/vllm.cpp/issues/2031). Two issues are owed:
+  one for W5L itself, and one for the RAGGED MULTI-REQUEST BATCH described in the
+  next entry, which the `serves_one_sequence_per_step` clamp names in the message
+  it prints to every operator.
+
+- **`num_reqs > 1` IS A SEPARATE WAVE, AND HERE IS THE MEASURED SPLIT.** W5L was
+  asked to address it if it blocked serving. It does not block serving, it blocks
+  BATCHED serving, and the two have different costs. What W5L did instead is make
+  the refusal SURVIVABLE: the forward's refusal is thrown inside the EngineCore
+  busy loop, which treats a throw as fatal, so before this wave a server at
+  `--max-num-seqs 4` answered three overlapping `/v1/completions` calls with three
+  500s and never served again — at the DEFAULT `max_num_seqs` of 128 that was the
+  out-of-the-box behaviour. `ModelFactory::serves_one_sequence_per_step` plus the
+  clamp in `LoadedEngine::ResolveMaxNumSeqs` turn that into serialized service.
+  The refusal in the forward is UNCHANGED and still fires for anyone who builds a
+  batched step by hand. What the batching wave owes, measured on this tree rather
+  than estimated:
+  - `RunQwen4ExpQsaBlockPaged` takes `block_table` as i32 `[1, max_pages]` and
+    asserts it twice (`qwen4_exp_qsa_block.cpp:432` and `:457`, both saying "this
+    block serves ONE sequence per call"). A ragged batch needs a `[num_reqs,
+    max_pages]` table and `query_start_loc` threaded through the indexer, the
+    top-k selection and the gather consumer.
+  - The PLE layer's `state_row` is a SCALAR
+    (`caches.ple[i].state_row`, read from
+    `gdn_meta.non_spec_state_indices_tensor[0]`), so the conv ring and the n-gram
+    history are addressed one sequence at a time.
+  - The mRoPE position table and the hyper-connection stream are built for one
+    contiguous query range.
+  None of that is a hook widening; it is three block seams. It is W5m, and the
+  clamp's stderr line names this spec so the operator who hits the ceiling finds
+  the entry.
+
+- **THE `docs/USAGE.md` WEIGHTS ROW IS STILL OWED, AND W5L IS NOT THE CHANGE THAT
+  PAYS IT.** AGENTS.md "Say which weights, and from where" binds the change that
+  makes a capability reachable, and W5L makes serving reachable — but every byte
+  it served came from `tests/support/qwen4_exp_gguf_fixture.h`, a synthetic file
+  whose weights are a deterministic ramp. No byte of
+  `unsloth/Qwen3.8-Flash-Next-GGUF` has been read on any host this row reaches, so
+  a registry row stating a size, a sha256 and a served arm would be a row nobody
+  measured. `docs/USAGE.md` gained the CONCURRENCY CEILING instead, which is a
+  fact about this port that W5L did measure. The weights row is owed by the wave
+  that serves a published checkpoint.
+
+- **THE FIXTURE'S TOKENIZER IS 16 SINGLE-CHARACTER TOKENS, SO `/v1/chat/completions`
+  CANNOT BE EXERCISED ON IT.** `FixtureOpts::with_tokenizer` emits a byte-level
+  BPE over `'a'..'p'` because the model's vocabulary is 16 wide, and the chat
+  endpoint's fallback role-join prompt contains the literal word `user`, whose
+  `u` is not in that alphabet — measured: `500 tokenizer: symbol "u" not in vocab
+  (incomplete byte-level alphabet?)`. That is a property of the FIXTURE and not of
+  the chat path, and it is recorded rather than worked around: widening the vocab
+  would move every value the oracle golden in `test_qwen4_exp_layer_loop.cpp`
+  measures. `/v1/completions` over in-alphabet prompts is what W5L gated and what
+  it claims.
+
+- **NO CUDA ARM WAS BUILT OR RUN.** There is no CUDA kernel for any `qwen4_exp`
+  op, so the served path is `--device cpu` and a device run is not merely
+  unmeasured, it is unavailable. Unchanged by W5L and restated because the wave
+  that says "it serves" is the wave a reader will quote.
+
 - **W5j's ISSUE IS OWED.** GitHub writes are `403` from this host (account
   suspended), so nothing could be filed and no row was appended to
   `.agents/issue-index.md`; an index row pointing at an issue that does not exist
@@ -3905,7 +3968,13 @@ All six mutations were re-run after this refactor.
   [#2031](https://github.com/mudler/vllm.cpp/issues/2031) and
   [#2353](https://github.com/mudler/vllm.cpp/issues/2353).
 
-- **THE SECOND STEP IS NOW BLOCKED ON ONE ENTRY AND ONE ENTRY ONLY.** W5j
+- **(RESOLVED by W5k, repaired in flow by W5L.)** This entry read "THE SECOND
+  STEP IS NOW BLOCKED ON ONE ENTRY AND ONE ENTRY ONLY" and pointed a reader
+  scanning for "what stops a decode" at the PLE dtype/residency entry below.
+  NOTHING STOPS A DECODE: W5k settled both against the running lane pin and the
+  entry it points at is itself marked RESOLVED, so this one was a live pointer to
+  a dead fact — exactly the drift it was written to avoid. It is kept, struck, and
+  the original text follows for provenance. **W5j**
   removed every other reason `past_len != 0` refuses — the channel reaches the
   hook, all five published caches resolve by name, and group 2's pages persist —
   so what remains is the PLE conv dtype and the n-gram history's residency, which
@@ -6050,6 +6119,108 @@ recorded as a guard rather than claimed as gated. `GPUModelRunner` was not drive
 end to end — the two steps are assembled the way the runner assembles one, not BY
 it. No CUDA arm was built or run; this is a CPU-only host.
 
+## Mutation record — W5L (#2031, issue OWED)
+
+**THE HEADLINE. A REQUEST SERVED, AND `GPUModelRunner` DROVE IT.**
+`build/examples/vllm-server --model <qwen4exp gguf> --port 8733 --block-size 16
+--num-blocks 64 --max-model-len 32` (no `--max-num-seqs`, so the DEFAULT applies)
+answered:
+
+```text
+POST /v1/completions {"prompt":"abcdef","max_tokens":5,"temperature":0}
+{"choices":[{"finish_reason":"length","text":"ppppp"}],
+ "usage":{"prompt_tokens":6,"completion_tokens":5,"total_tokens":11}}
+```
+
+Six prompt tokens prefilled and five decode steps, on CPU, through
+`LoadedEngine` -> `GPUModelRunner::execute_model` -> `ModelRegistry::Forward`.
+Three overlapping requests at the default concurrency were all answered.
+
+**WHAT THE RUNNER DEMANDED THAT THE HOOK LACKED: NOTHING.** This is the wave's
+most useful negative result. W5j and W5k built the by-name resolution, the paged
+indexer and the persistent PLE states against a hand-assembled step, and the
+runner's own step needed no change to any of them. The runner's four demands were
+all satisfied on the base commit, and each was VERIFIED rather than assumed:
+`multi_cache_topology_` set, `multi_kv` published (5 names), all three group
+tables gathered, and `consumes_multi_kv` letting the topology past
+`ModelRegistry::Forward`. The only thing the ENGINE needed is in the next
+paragraph, and it is a scheduling fact, not a cache one.
+
+**WHAT DID BLOCK SERVING, AND IT IS NOT WHAT THE ROW EXPECTED.** `num_reqs > 1`
+does not stop a request; it stops the SERVER. The refusal is thrown inside the
+EngineCore busy loop, which treats a throw as FATAL. Measured at
+`--max-num-seqs 4` BEFORE any change:
+
+```text
+engine-fatal: EngineCore busy loop threw: vt:
+Qwen4ExpForConditionalGeneration: this forward serves ONE sequence per call and
+the step carries 2. ... qwen4_exp_registry.cpp:254
+api-server: 500 endpoint=/v1/completions ... (x3)
+```
+
+All three concurrent requests failed and the engine never served again. The
+default `max_num_seqs` is 128, so that was the out-of-the-box behaviour of a
+server pointed at this architecture. W5L therefore adds
+`ModelFactory::serves_one_sequence_per_step`, read by
+`LoadedEngine::ResolveMaxNumSeqs` AFTER the recurrent-state budget clamp (the
+smaller bound must win), which prints its reduction the way the budget clamp
+beside it does and returns 1. Same binary, same flags, after:
+
+```text
+INFO model concurrency: reduced max_num_seqs from 7 to 1. ...
+== 1 {"text":"pppppp"}   == 2 {"text":"pppppp"}   == 3 {"text":"pppppp"}
+```
+
+The forward's refusal is UNCHANGED and still fires for a hand-built batched step
+(gated by case 3 below). The batching wave itself is W5m, split and costed under
+`## Owed`.
+
+**WHAT THIS FIXTURE CAN GATE, AND WHAT IT STILL CANNOT.** Not cache CONTENT: W5j
+measured 0 of 128 indexer words and 0 of 192 paged K/V words moving while the
+logits moved 31.84, because this fixture's layer-3 activations sit near 2^18
+where one bf16 ULP is about 1024. A rescaled fixture stays owed. The gate is the
+same observable W5k found, read from a different place: the PLE n-gram history is
+int64 TOKEN IDS, and W5L reads it out of the buffer the RUNNER allocated, at the
+slot the RUNNER assigned (taken from group 1's own gathered table, not assumed to
+be 0), after a step the ENGINE scheduled. Its step-2 read's writer is a prior
+`execute_model` call. The prompt asserts its last two ids are DISTINCT, so the
+roll is observable, and the case additionally asserts the history MOVED between
+the two steps — without that the roll assertions pass on a prompt whose tail
+happens to equal the answer.
+
+Nothing in `tests/vllm/models/test_qwen4_exp_runner.cpp` constructs a
+`ModelForwardInput`, a `CommonAttentionMetadata` or a `GDNAttentionMetadata`.
+
+**COUNTS.** `test_qwen4_exp_runner` is new: 5 cases / 136 assertions, green.
+`test_qwen4_exp_layer_loop` unchanged at 5 / 264 and the oracle golden UNMOVED at
+`max|diff| = 0.00982457` against its 0.03 bound. Also rerun green on this head
+because they share the fixture header or the changed engine seam:
+`test_qwen4_exp_gguf_weights` 11 / 2975, `test_qwen4_exp_forward` 1 / 421,
+`test_qwen4_exp_kv_cache` 5 / 414, `test_loaded_engine_dense` 30 / 128.
+
+**THE BATTERY.** Every mutation sha256-proved applied, the build rc read BEFORE
+any test output, the tree restored and the restore sha256-verified against the
+pre-mutation snapshot (all three files byte-identical afterwards).
+
+| # | Mutation | Build | Result |
+|---|---|---|---|
+| M1 | delete the runner's cache handoff — `forward_input.multi_kv = &multi_kv_index_` at `runner.cpp` | rc 0 | **RED** — 2 cases. The runner-driven step and the `LoadedEngine` generate both throw "the runner handed 2 paged K/V caches for 1 qwen_sparse_attention layers, and no by-name cache index". The handoff is what carries the whole three-group topology |
+| M2 | make the step read the WRONG sequence's state — `caches.ple[i].state_row = row + 1` | rc 0 | **RED** — 4 assertions. The history at the runner's assigned slot stays `{0,0}` while the prompt's tail is `{7,2}`; the FIFO roll assertion reds at `0 == 15`; `h1 != h2` reds at `{0,0} != {0,0}`. In the engine case the block's own bound check throws, because a clamped engine has ONE slot |
+| M3 | REACHABILITY: delete `gather_group_block_tables(num_reqs)`'s production call site | rc 0 | **RED** — 2 cases, "the engine gathered no block table for published group 2 ... 0 of 3 published group(s) carry one". NOT VACUOUS: the gather is load-bearing for both the runner-driven step and the engine-driven generate |
+| M4 | REACHABILITY: delete the clamp's production call site — pass `false` instead of `factory->serves_one_sequence_per_step` in the `LoadedEngine` ctor | rc 0 | **RED** — exactly 1 assertion, `eng->max_num_seqs()` reads 3 not 1. The generate still SUCCEEDS, which is the point: with one request in flight the defect is invisible, and only the resolved-concurrency assertion sees it |
+
+**WHAT W5L DID NOT PROVE.** No CUDA arm was built or run — there is no CUDA
+kernel for any `qwen4_exp` op, so a device run is unavailable rather than
+unmeasured. No published checkpoint was served; every byte came from the
+synthetic fixture, so there is no token number and no speed number.
+`/v1/chat/completions` was NOT served: the fixture's 16-token vocabulary is
+`'a'..'p'` and the fallback role-join prompt contains `user`, so it returns
+`500 tokenizer: symbol "u" not in vocab`. That is the fixture's limit and it is
+recorded under `## Owed` rather than worked around, because widening the vocab
+moves every value the oracle golden measures. And `num_reqs > 1` is still refused:
+what changed is that the refusal no longer kills the engine.
+
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**
@@ -6097,6 +6268,7 @@ a row here, and every row says whether anything in production reaches it:
 | W5i | the indexer side cache PAGED: the engine's fused MLA page + group 2's own block table, gathered and scattered with `vt::IndexSelect`/`vt::IndexCopy` | **yes, and W5j closed the gap this row named** — `ModelRegistry::Forward` reached the translation over a per-call scratch (M4a, M4b); since W5j a by-name step reaches it over the engine's OWN group-2 buffer through group 2's OWN gathered table | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2249](https://github.com/mudler/vllm.cpp/issues/2249), W5i's own issue OWED |
 | W5j | the forward CONSUMES the by-name channel, and `ModelFactory::consumes_multi_kv` narrows the engine's `multi_kv` refusal to a model-declared capability | **yes** — `ModelRegistry::Forward` dispatches a THREE-GROUP topology to this hook, which resolves all five published caches by name and reads group 2's own block table; M4 proves the guard still refuses with the bit cleared, M6 proves the tower is entered. It is still a SINGLE-SHOT prefill: nothing decodes a second token | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2353](https://github.com/mudler/vllm.cpp/issues/2353), W5j's own issue OWED |
 | W5k | the PLE conv ring's DTYPE and the n-gram history's RESIDENCY settled against the running lane oracle, and the SECOND STEP | **yes, and it DECODES** — `ModelRegistry::Forward` runs a prefill at `past_len` 0 and then a decode at `past_len` 6 over the engine's own persistent recurrent group, sampling a token on each; M1 deletes the n-gram write-back INSIDE `RunQwen4ExpPleBlock` and the step-1 history assertion reds, which is the first measured reach of that block's body | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5k's own issue OWED |
+| W5L | `GPUModelRunner` and `LoadedEngine` DRIVEN end to end, and the model-declared concurrency ceiling that keeps a server alive | **yes, and it SERVES** — a real `GPUModelRunner` allocates all three published groups, gathers all three block tables and runs a prefill then a decode through `execute_model` / `sample_tokens`; `LoadedEngine::FromModelDir` loads a `qwen4exp` GGUF and `generate` returns tokens; `examples/server` answers `POST /v1/completions` on CPU. M1 deletes the runner's `multi_kv` handoff, M3 deletes the per-group gather call site, and M4 deletes the clamp's production call site — each reds | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5L's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than
@@ -6105,9 +6277,19 @@ here is now false.** It read "Nothing in the table decodes a token, and W5f does
 not change that", which was true of every wave up to W5j and stopped being true
 the moment `past_len > 0` returned logits. A second step now runs through
 `ModelRegistry::Forward` over caches that persist between calls, and samples a
-token. What is still NOT claimed is SERVING: `num_reqs > 1` is refused, the
-positional arm is one-shot, and `GPUModelRunner` has not been driven end to end
-— all three are named in `## Owed`. W5f's own contribution is unchanged by this:
+token. **W5L IS THE ROW THAT SERVES, and this sentence has moved again.** It
+read "What is still NOT claimed is SERVING: `num_reqs > 1` is refused, the
+positional arm is one-shot, and `GPUModelRunner` has not been driven end to
+end". The third is gone: a real `GPUModelRunner` allocates the three groups,
+gathers all three block tables, publishes the five-name index and runs
+`execute_model` / `sample_tokens` for a prefill and then a decode, and
+`LoadedEngine::FromModelDir` plus `examples/server` answer a
+`POST /v1/completions` on CPU. The first two remain, and the FIRST of them has
+changed CONSEQUENCE rather than status: `num_reqs > 1` is still refused, and
+because an EngineCore that meets that refusal DIES rather than degrades, the
+factory now declares `serves_one_sequence_per_step` and the engine clamps
+`--max-num-seqs` to 1. What is still not claimed is a BATCH, a real checkpoint,
+and any number at all. W5f's own contribution is unchanged by this:
 it changed the reason the rows above were unreached. Before it, most of the rows above were
 unreached because nothing composed them; after it, the composition exists and
 runs from a production entry point, and what is missing is the SECOND STEP. The
@@ -6185,9 +6367,13 @@ which is a weaker claim and is written as one.
 **THE `Reached?` COLUMN IS THE AUTHORITY AND THIS PROSE IS NOT A SECOND COUNT.**
 Rows that still read `no` do so for the ordinary reason — nothing composes them
 — and not because the loop stops. What remains true from the sentence this
-replaces is the SCOPE of the claim: this is ONE single-shot prefill of ONE
-sequence, it is not a decode, and rewriting any `no` to `yes` on the strength of
-a prefill would be the overstatement this section exists to prevent.
+replaces is the SCOPE of the claim, and W5k then W5L each narrowed what that
+scope EXCLUDES. It read "this is ONE single-shot prefill of ONE sequence, it is
+not a decode": since W5k it is a prefill AND a decode, and since W5L both are
+driven by the engine rather than assembled by hand. ONE SEQUENCE is the part that
+has not moved, and rewriting any `no` to `yes` on the strength of a served
+request would be the overstatement this section exists to prevent — a served
+request proves the composition RUNS, never that an unreached op is reached.
 
 **Reached, and LOADING — on a CPU device:** a `qwen4exp` file lands on
 `Qwen4ExpHfConfigFromGguf` through the `kGgufArchArms` dispatch row, the registry
@@ -6224,11 +6410,17 @@ measured separation of 1.2892 versus a 1e-5 tolerance. What survives is the
 narrower statement above: the SEEDING is gated, the ROUTING of the runner's slot
 into it is not, because there is no loop to route it.
 
-**Reached, and still refusing:** the forward. Nothing decodes a token, so there
-is still no token number, no speed number, no `examples/server` e2e and no
-`docs/USAGE.md` weights row — that row is owed in the same change that makes an
-arm SERVE, which is W5b, not W5a. W2, W3 and W4
-remain host reference math with no production call site.
+**(superseded by W5k and W5L)** This paragraph read "**Reached, and still
+refusing:** the forward. Nothing decodes a token, so there is still no token
+number, no speed number, no `examples/server` e2e and no `docs/USAGE.md` weights
+row". Three of those four are now wrong. The forward decodes (W5k), and W5L
+serves a `POST /v1/completions` through `examples/server` on CPU over a synthetic
+`qwen4exp` GGUF. **The `docs/USAGE.md` WEIGHTS ROW IS STILL OWED, and its reason
+has changed rather than gone:** it is owed for a PUBLISHED checkpoint, and no
+byte of `unsloth/Qwen3.8-Flash-Next-GGUF` has been served on any host this row
+reaches. Everything measured here ran on the fixture, whose weights are a
+deterministic ramp, so there is still NO token number and NO speed number. W2, W3
+and W4 remain host reference math with no production call site.
 
 **W5b-6 ([#2218](https://github.com/mudler/vllm.cpp/issues/2218)) closes the
 gamma polarity and it does NOT decode.** `vt::Qwen4ExpGatedResidual` now takes

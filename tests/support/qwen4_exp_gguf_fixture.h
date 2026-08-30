@@ -51,6 +51,7 @@ namespace qwen4_exp_fixture {
 using gguf_test::F32Kv;
 using gguf_test::GgufModelBuilder;
 using gguf_test::I32ArrayKv;
+using gguf_test::StrArrayKv;
 using gguf_test::StrKv;
 using gguf_test::TempFile;
 using gguf_test::U32Kv;
@@ -256,6 +257,19 @@ struct FixtureOpts {
   // driven with this option — it reads metadata and never walks the per-layer
   // tensors, which stay at four layers.
   bool mixed_compress_ratios = false;
+
+  // W5L (#2031): emit the `tokenizer.ggml.*` kvs a GGUF needs before
+  // `LoadedEngine` will build a tokenizer over it, so `examples/server` can be
+  // pointed at this fixture. DEFAULT OFF, so every existing caller's file bytes
+  // are unchanged -- the option adds kvs and nothing rewrites one.
+  //
+  // Byte-level BPE ("gpt2") over `kVocab` single-character tokens 'a'..'p'.
+  // Bytes 0x21..0x7E map to THEMSELVES in the byte-level alphabet, so each of
+  // those characters is a whole pretoken that resolves with no merge, which is
+  // why the merge list is legitimately empty rather than truncated: a merge
+  // list here could only name pairs whose concatenation is not in a 16-token
+  // vocabulary, and `InsertMerge` refuses exactly that.
+  bool with_tokenizer = false;
 };
 
 inline void Add(GgufModelBuilder& b, const FixtureOpts& o, const std::string& name,
@@ -306,6 +320,25 @@ inline std::string BuildFixture(const FixtureOpts& o = {}) {
   b.AddKv(U32Kv("qwen4exp.ple.heads_per_ngram", kHeadsPerNgram));
   b.AddKv(U32Kv("qwen4exp.ple.conv_kernel", kConvKernel));
   b.AddKv(U32Kv("qwen4exp.ple.eos_token_id", kEosTokenId));
+  if (o.with_tokenizer) {
+    b.AddKv(StrKv("tokenizer.ggml.model", "gpt2"));
+    // "llama-bpe" is the byte-level pre-tokenizer this vocabulary is; every
+    // other accepted `pre` name selects a DIFFERENT splitting rule.
+    b.AddKv(StrKv("tokenizer.ggml.pre", "llama-bpe"));
+    std::vector<std::string> toks;
+    std::vector<int32_t> types;
+    toks.reserve(static_cast<size_t>(kVocab));
+    types.reserve(static_cast<size_t>(kVocab));
+    for (int64_t i = 0; i < kVocab; ++i) {
+      toks.push_back(std::string(1, static_cast<char>('a' + i)));
+      types.push_back(1);  // normal
+    }
+    b.AddKv(StrArrayKv("tokenizer.ggml.tokens", toks));
+    b.AddKv(I32ArrayKv("tokenizer.ggml.token_type", types));
+    b.AddKv(StrArrayKv("tokenizer.ggml.merges", {}));
+    b.AddKv(U32Kv("tokenizer.ggml.eos_token_id",
+                  static_cast<uint32_t>(kEosTokenId)));
+  }
   b.AddKv(I32ArrayKv("qwen4exp.ple.head_vocab_sizes",
                      {static_cast<int32_t>(kNgramHead0Vocab),
                       static_cast<int32_t>(kNgramHead1Vocab)}));

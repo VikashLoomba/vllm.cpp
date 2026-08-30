@@ -654,6 +654,33 @@ struct ModelFactory {
   // would move a silent mis-index from the engine into the model, so it lands
   // WITH its first consumer and never before one.
   bool consumes_multi_kv = false;
+  // MODEL-MM-QWEN4-EXP W5L ([#2031](https://github.com/mudler/vllm.cpp/issues/2031)):
+  // whether THIS model's forward serves exactly ONE sequence per step, so the
+  // engine must not schedule a batch it will refuse.
+  //
+  // THIS IS NOT A PREFERENCE, IT IS THE ONLY THING BETWEEN A SERVER AND A DEAD
+  // ENGINE. A forward that refuses `num_reqs > 1` throws from inside the
+  // EngineCore busy loop, and that loop treats a throw as FATAL: the process
+  // keeps its socket open, every in-flight request gets a 500 naming the model,
+  // and every later request gets the same. MEASURED on this architecture at
+  // `--max-num-seqs 4` before this bit existed — three concurrent
+  // `/v1/completions` calls returned
+  // "EngineCore encountered an issue ... this forward serves ONE sequence per
+  // call and the step carries 2" and the engine never recovered. The default
+  // `max_num_seqs` is 128, so that was the OUT-OF-THE-BOX behaviour.
+  //
+  // `LoadedEngine::ResolveMaxNumSeqs` therefore clamps the resolved concurrency
+  // to 1 for a model that sets it, and says so on stderr exactly as the
+  // recurrent-state budget clamp beside it does. The refusal in the forward
+  // STAYS: this bit stops the engine producing the batch, and the forward stops
+  // anyone else's.
+  //
+  // THE DEFAULT IS FALSE AND MEANS "no opinion", not "batches fine": a model
+  // that leaves it false is scheduled exactly as it was before this field
+  // existed. It is a statement about the PORT and not about the architecture —
+  // clearing it is what a wave that plumbs a ragged multi-request batch does,
+  // and that wave is owed under `.agents/specs/qwen4-exp-flash-next.md`.
+  bool serves_one_sequence_per_step = false;
   // ENG-WEIGHT-OFFLOAD: whether THIS model's loader asks
   // `WeightOffloader::ConsiderWeight` for each weight and honours the answer.
   //

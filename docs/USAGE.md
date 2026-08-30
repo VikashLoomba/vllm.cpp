@@ -76,6 +76,25 @@ num_speculative_tokens.
 Raise `--num-blocks` or `--kv-cache-memory` to buy more seats, or lower
 `num_speculative_tokens`. A model with no recurrent state is never reduced.
 
+A second, independent ceiling comes from the MODEL rather than from the pool. A
+port whose forward serves one sequence per step declares it, and the engine
+clamps `--max-num-seqs` to 1 and says so:
+
+```text
+INFO model concurrency: reduced max_num_seqs from 7 to 1. This architecture's
+forward serves ONE sequence per step and refuses a batched one, and an
+EngineCore that meets that refusal dies rather than degrades.
+```
+
+The clamp is not tuning. A forward that refuses a batched step throws from
+inside the EngineCore loop, and that loop treats a throw as fatal: without the
+clamp the first pair of overlapping requests ends the engine and every request
+after it returns a 500. Clamped, the same server answers those requests one
+after another. Concurrent clients are still accepted; they are served in
+sequence. Today `Qwen4ExpForConditionalGeneration` (`qwen4exp`) is the only
+architecture that declares it — see the model table in
+[FEATURES.md](FEATURES.md) for exactly what that architecture serves.
+
 Send a completion request from another terminal:
 
 ```sh

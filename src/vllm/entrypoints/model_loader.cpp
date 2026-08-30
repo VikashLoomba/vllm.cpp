@@ -1645,12 +1645,33 @@ void LoadedEngine::ApplyResolvedCacheDType(const EngineParams& params,
 }
 
 int LoadedEngine::ResolveMaxNumSeqs(const EngineParams& params,
-                                    const vllm::v1::KVCacheConfig& kv_cfg) {
+                                    const vllm::v1::KVCacheConfig& kv_cfg,
+                                    bool serves_one_sequence_per_step) {
   const int configured = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
   const vllm::v1::HybridKvBudget budget =
       vllm::v1::ComputeHybridKvBudget(kv_cfg);
-  const int resolved =
-      vllm::v1::ClampMaxNumSeqsToStateBudget(configured, budget);
+  int resolved = vllm::v1::ClampMaxNumSeqsToStateBudget(configured, budget);
+  // MODEL-MM-QWEN4-EXP W5L (#2031): THE MODEL'S OWN CEILING, and it is not a
+  // tuning knob. A forward that refuses `num_reqs > 1` throws from inside the
+  // EngineCore busy loop, which treats a throw as FATAL — the socket stays open
+  // and every request from then on is a 500. The default `max_num_seqs` is 128,
+  // so without this clamp the first pair of overlapping requests kills the
+  // server. Clamping here makes the same engine serve them one after another.
+  //
+  // AFTER the budget clamp because the two bound different quantities and the
+  // smaller has to win; `resolved` is therefore the min of both. The line below
+  // is printed whenever this clamp is the binding one, on the same "a number the
+  // operator did not choose is never silent" rule as the budget message.
+  if (serves_one_sequence_per_step && resolved > 1) {
+    std::cerr << "INFO model concurrency: reduced max_num_seqs from " << resolved
+              << " to 1. This architecture's forward serves ONE sequence per "
+                 "step and refuses a batched one, and an EngineCore that meets "
+                 "that refusal dies rather than degrades. Batching it needs the "
+                 "ragged multi-request plumbing owed under "
+                 ".agents/specs/qwen4-exp-flash-next.md (issue #2031).\n";
+    std::cerr.flush();
+    return 1;
+  }
   if (resolved >= configured) {
     // Attention-only models, pure-recurrent models, and every hybrid whose
     // budget already holds the configured concurrency land here: no line, no
@@ -1909,7 +1930,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
           params.block_size > 0 ? params.block_size : 32)),
       // The serving concurrency, clamped to the recurrent-state budget the KV
       // pool affords. See ResolveMaxNumSeqs (issue #1983).
-      max_num_seqs_(ResolveMaxNumSeqs(params, kv_cfg_)),
+      max_num_seqs_(ResolveMaxNumSeqs(
+          params, kv_cfg_,
+          model_->registration().factory->serves_one_sequence_per_step)),
       max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(

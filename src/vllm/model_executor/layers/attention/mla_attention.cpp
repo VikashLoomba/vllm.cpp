@@ -657,7 +657,7 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   //     this pin — `:160-167` is the `q_lora_rank is not None` assert block, so
   //     that anchor was WRONG under a true claim). It routes through
   //     `vt::RopeFromCache` over a strided leading-slice view.
-  //   * the rope PAIRING follows `indexer_rope_interleave` (`:1159`) and is
+  //   * the rope PAIRING follows `indexer_rope_interleave` (`:1120`) and is
   //     INDEPENDENT of the main rope's, which dots3-note fixes at GPT-J.
   // Both norms and both ropes are existing gated ops. A second copy of either
   // inside this block would be the parallel path AGENTS.md forbids.

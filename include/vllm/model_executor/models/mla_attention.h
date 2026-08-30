@@ -216,7 +216,7 @@ struct MlaBlockDims {
   int64_t index_head_dim = 0;
   int64_t index_topk = 0;
   // `is_neox_style = not getattr(config, "indexer_rope_interleave", False)`
-  // (`deepseek_v2.py:1159`). NOTE this is INDEPENDENT of `is_neox_style` above:
+  // (`deepseek_v2.py:1120`). NOTE this is INDEPENDENT of `is_neox_style` above:
   // dots3-note's main MLA rope is GPT-J (`:1108` passes `is_neox_style=False`)
   // while its indexer rope follows the config flag. The two rotaries are built
   // from the SAME `qk_rope_head_dim`, `max_position_embeddings` and

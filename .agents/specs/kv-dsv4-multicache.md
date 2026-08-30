@@ -646,6 +646,38 @@ So the shape of W5 is:
 3. leave the DSA layers refusing -- the indexer and compressor belong to
    `MODEL-DSV4-DSA-COMPOSE` (#2286).
 
+**THE EXACT CHAIN THE SINK HAS TO TRAVEL**, traced so the next session does not
+re-derive it:
+
+```
+ForwardMlaAttentionBlock            layers/attention/mla_attention.cpp:353
+  -> TritonMLAImpl::forward_mqa     v1/attention/backend.cpp:290
+    -> vt::MlaDecodeAttention       ops.h (MlaDecodeAttentionArgs, ops.h:1777)
+```
+
+`MlaDecodeAttentionArgs` carries `scale`, `num_kv_splits` and the block-table
+metadata, and **no sink**; `include/vt/ops.h` has zero `sink` occurrences
+anywhere. So the extension is four edits, in this order:
+
+1. a sink field on `MlaDecodeAttentionArgs`, defaulting to an absent/`-inf`
+   sentinel so every existing caller is bit-identical;
+2. the CPU and CUDA `MlaDecodeAttention` kernels honouring it -- the sink is one
+   extra logit **in the denominator only**, exactly as
+   `deepseek_v4_dsa.cpp:121-139 SoftmaxWithSink` already does it on the host, so
+   the reference semantics are already written and gated in this tree;
+3. the same for the prefill half;
+4. a `attn_sink` tensor on `MlaBlockWeights`, threaded through
+   `ForwardMlaAttentionBlock` -- null for Kimi-Linear and dots3-note, which must
+   stay byte-identical.
+
+**The online-softmax detail that makes (2) non-trivial.** `MlaDecodeAttention`
+splits the KV over `num_kv_splits` and reduces; a sink added per split would be
+counted once per split rather than once per row. It belongs in the FINAL
+reduction, and the gate has to cover `num_kv_splits > 1` or it will not see the
+difference -- `num_kv_splits = 1` is the batch-invariant path and would pass
+either way.
+
+
 **The correction does not move the trap.** Option (b) -- copy paged to contiguous
 each step -- remains available, still produces identical tokens, still passes a
 token gate, and still leaves the decode O(context) per token. It is arguably MORE

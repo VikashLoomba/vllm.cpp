@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/config/cache.h"  // KV-FP8 W3: --kv-cache-dtype vs the checkpoint
+#include "vllm/config/weight_residency.h"  // LOAD-IO: GGUF prefault bytes/seconds
 #include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
 #include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
@@ -266,6 +267,28 @@ void PrintLoadBytes(const char* when) {
                when, static_cast<double>(c.host_copy_bytes) / gib,
                static_cast<double>(c.borrowed_bytes) / gib,
                static_cast<double>(c.device_upload_bytes) / gib);
+}
+
+// LOAD-IO. The GGUF branch does NOT call ReportLoadBytes: every one of those
+// counters is incremented on the safetensors path only (`AddHostCopy` in
+// safetensors_reader.cpp, `AddBorrowed` in qwen3_5_weights.cpp's
+// `BorrowStTensorBytes`), so on a `.gguf` load that line prints three zeros for
+// an artifact it just moved 67.56 GiB of. A zero that means "nobody counted"
+// printed beside two real timings is worse than no line, because it reads as a
+// measurement. This reports the counters a GGUF load DOES keep.
+void ReportGgufLoadIo() {
+  if (!LoadStatsEnabled()) return;
+  const uint64_t bytes = vllm::GgufPrefaultedBytes();
+  const double seconds = vllm::GgufPrefaultSeconds();
+  const double gib = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+  std::fprintf(stderr,
+               "[vt load] gguf prefault spans=%llu paged_in=%.3f GiB in %.3f s",
+               static_cast<unsigned long long>(vllm::GgufPrefaultedSpanCount()),
+               gib, seconds);
+  if (seconds > 0.0) {
+    std::fprintf(stderr, " (%.1f MiB/s)", gib * 1024.0 / seconds);
+  }
+  std::fprintf(stderr, "\n");
 }
 
 void ReportLoadBytes() {
@@ -2411,7 +2434,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // A single `.gguf` file: config + weights + tokenizer all come from the
   // GGUF (M0.10). The engine stack below is unchanged.
   if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
+    // LOAD-IO: `VT_LOAD_STATS=1` reported NOTHING on a GGUF load. The two
+    // ReportLoadPhase call sites both sat on the safetensors branch, so the one
+    // instrument this repository has for "where did the load time go" was silent
+    // on every `.gguf` model -- and silence reads as "no phases", not as "not
+    // measured". That is the instrument-failure-looks-like-a-result shape, and it
+    // cost a 74-minute load its breakdown (row MODEL-MM-QWEN4-EXP, W5n).
+    const auto t_gguf_open = std::chrono::steady_clock::now();
     vllm::GgufFile gguf = vllm::GgufFile::Open(model_dir);
+    ReportLoadPhase("mmap+header", SecondsSince(t_gguf_open));
     HfConfig config = HfConfigFromGgufDispatch(gguf);
     // Resolve before tokenizer/weight work so unsupported architecture errors
     // are deterministic and match registry.py rather than being masked by a
@@ -2661,7 +2692,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // case is the gate that catches it.
     ModelSource gguf_source = ModelSource::FromGguf(gguf);
     gguf_source.multimodal = &params.multimodal;
+    const auto t_gguf_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
+    ReportLoadPhase("weights", SecondsSince(t_gguf_weights));
+    ReportGgufLoadIo();
     // SPEC-MTP-GGUF: attach the head from the SAME file, mirroring the
     // safetensors branch's maybe_attach_mtp. The GGUF is still mapped here; the
     // loader owns its dequantized copies, so nothing borrows past this scope.

@@ -2087,6 +2087,68 @@ TEST_CASE("L7 load-time prefault is byte-transparent on a borrowed F16 weight") 
   vllm::ResetWeightResidencyConfigForTesting();
 }
 
+TEST_CASE("LOAD-IO the prefault reports the BYTES it paged in, not just spans") {
+  // WHY A SECOND COUNTER. The span count answers "did the prefault run". It
+  // cannot answer the question a slow load poses -- how much of the wall time was
+  // the artifact arriving -- because a span is not a size: one span may be 4 KiB
+  // or 25 GiB. `GgufPrefaultedBytes()` is what turns the prefault's elapsed
+  // seconds into a RATE, and a rate is the only form in which "the file was still
+  // arriving" and "we were computing" can be told apart.
+  //
+  // THE ASSERTION IS AN EQUALITY, NOT A LOWER BOUND. `> 0` is satisfied by a
+  // counter wired to the span count, to a constant, or to the last span only, and
+  // all three are the defects this instrument would be used to hide. The expected
+  // total is summed from the FILE's own tensor table, so it is independent of the
+  // loader that reports it.
+  const DenseDims d;
+  const TempFile f(BuildDenseF16Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  GgufLoadPolicy mmap = KeepF16On();
+  mmap.mmap_residency = true;
+
+  ::setenv("VT_GGUF_PREFAULT", "0", 1);
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
+  { const vllm::Qwen3_5DenseWeights woff = vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap); (void)woff; }
+  // OFF means zero in BOTH units. A bytes counter incremented outside the
+  // resolver's guard would show up here and nowhere else.
+  CHECK(vllm::GgufPrefaultedBytes() == 0);
+  CHECK(vllm::GgufPrefaultSeconds() == 0.0);
+
+  ::setenv("VT_GGUF_PREFAULT", "1", 1);
+  vllm::ResetGgufPrefaultedSpanCountForTesting();
+  const vllm::Qwen3_5DenseWeights won =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  const uint64_t spans = vllm::GgufPrefaultedSpanCount();
+  const uint64_t bytes = vllm::GgufPrefaultedBytes();
+
+  CHECK(spans > 0);
+  CHECK(bytes > 0);
+  // A span is not a size: the counter must not be the span count wearing a
+  // different name. Every borrowed span in this fixture is far larger than the
+  // number of spans, so equality here would mean the wrong quantity was wired.
+  CHECK(bytes != spans);
+
+  // The head really is borrowed in this fixture, and its whole span was paged in.
+  // Read from the FILE's tensor table, so the expectation does not come from the
+  // loader that reports the number.
+  CHECK(won.lm_head.bytes.borrowed());
+  const vllm::GgufTensorInfo& oh = g.Get("output.weight");
+  CHECK(won.lm_head.bytes.data() == oh.data);
+  CHECK(bytes >= static_cast<uint64_t>(oh.nbytes));
+
+  // IT ACCUMULATES. A counter that is ASSIGNED rather than added -- reporting the
+  // last span, or a constant -- passes every assertion above and fails this one:
+  // a second load with no reset in between must add a second load's worth.
+  const vllm::Qwen3_5DenseWeights wtwice =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  (void)wtwice;
+  CHECK(vllm::GgufPrefaultedBytes() == 2 * bytes);
+  CHECK(vllm::GgufPrefaultedSpanCount() == 2 * spans);
+  ::unsetenv("VT_GGUF_PREFAULT");
+}
+
 TEST_CASE("a borrowed F16 weight OUTLIVES the GgufFile and the file") {
   const DenseDims d;
   std::vector<uint8_t> expected;

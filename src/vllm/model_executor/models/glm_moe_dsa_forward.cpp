@@ -453,7 +453,10 @@ void RunLayer(Dev d, const GlmMoeDsaLayerWeights& lw, const GlmMoeDsaParams& p,
   // READS whatever is there, which is the preceding full layer's selection
   // because nothing overwrote it (`mla.py:180`).
   mla::ForwardMlaAttentionBlock(d, dims, mw, dhn.t(), step.positions, kv_cache,
-                                step.slot_mapping, lmeta, impl, attn_t, shared);
+                                step.slot_mapping, lmeta, impl, attn_t,
+                                // `attn_pre_o_proj` is DeepSeek-V4's early return
+                                // (#2323); this model applies `o_proj` in the block.
+                                /*attn_pre_o_proj=*/nullptr, shared);
 
   Tensor w_post = ResidentWeight(d, lw.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});

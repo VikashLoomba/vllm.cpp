@@ -636,7 +636,11 @@ std::vector<float> RunBlock(Backend& b, Queue& q, const MlaBlockDims& d,
                             // KV-DSV4-MULTICACHE W5 (#2323): the per-head
                             // attention sink, `[num_heads]`. nullptr is its
                             // ABSENT state, which every case above passes.
-                            const std::vector<float>* attn_sink = nullptr) {
+                            const std::vector<float>* attn_sink = nullptr,
+                            // W5 (#2323): take the SPLIT o_proj path -- the block
+                            // hands back `[T, N*V]` and this applies `o_proj`
+                            // itself, which must reproduce the fused result.
+                            bool split_o_proj = false) {
   const int64_t L = d.kv_lora_rank, R = d.qk_rope_head_dim, H = d.hidden_size;
   int64_t T = 0;
   for (const Request& r : reqs) T += r.q_len;
@@ -758,8 +762,18 @@ std::vector<float> RunBlock(Backend& b, Queue& q, const MlaBlockDims& d,
   vllm::v1::TritonMLAImpl impl;
   Dev dev = hh.dev();
   Tensor kvc = hh.kv_cache();
-  ForwardMlaAttentionBlock(dev, d, hh.weights(), t_hidden, t_pos, kvc, t_slot, meta, impl,
-                           t_out);
+  if (split_o_proj) {
+    // The block returns the attention output BEFORE the projection; apply the
+    // same dense `o_proj` here so the two paths are comparable.
+    const int64_t NV = d.num_heads * d.v_head_dim;
+    Tensor t_pre = hh.Alloc(dt, {T, NV});
+    ForwardMlaAttentionBlock(dev, d, hh.weights(), t_hidden, t_pos, kvc, t_slot, meta, impl,
+                             t_out, &t_pre);
+    vt::MatmulBT(q, t_out, t_pre, hh.weights().o_proj);
+  } else {
+    ForwardMlaAttentionBlock(dev, d, hh.weights(), t_hidden, t_pos, kvc, t_slot, meta, impl,
+                             t_out);
+  }
   b.Synchronize(q);
   if (raw_out != nullptr) *raw_out = hh.DownRaw(t_out);
   (void)ctx;
@@ -1060,6 +1074,56 @@ TEST_CASE("W5: a loaded sink on the PREFILL path REFUSES, it does not attend wit
       RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/0, 64);
   REQUIRE(!ok.empty());
   for (float v : ok) REQUIRE(!std::isnan(v));
+}
+
+TEST_CASE("W5: the pre-o_proj output, projected by the caller, equals the fused path") {
+  // `KV-DSV4-MULTICACHE` W5 (#2323). `ForwardMlaAttentionBlock` fused attention
+  // and the output projection; DeepSeek-V4 cannot use it that way, because its
+  // output side is a grouped LoRA rather than a dense `o_proj`. The block can now
+  // hand back the attention output BEFORE the projection.
+  //
+  // THE GATE IS EQUIVALENCE, which is the only thing worth asserting here: the
+  // split path must reproduce the fused one EXACTLY when the caller applies the
+  // same dense `o_proj` itself. Anything weaker would let the split quietly
+  // return something else -- pre-gate, wrongly shaped, or stale.
+  Backend& b = vt::GetBackend(DeviceType::kCPU);
+  Queue q{Cpu(), nullptr};
+  MlaBlockDims d = LiteDims();
+  DeepseekYarnRopeParams rp = LiteRope();
+  d.scale = MlaAttentionScale(d, rp);
+  HostWeights hw = MakeWeights(d, rp, 512, 2323u);
+
+  const std::vector<Request> reqs = {{9, 1}, {16, 1}, {35, 1}, {1, 1}};
+  int64_t T = 0;
+  for (const Request& r : reqs) T += r.q_len;
+  auto hidden = RoundBf16(RandF32(static_cast<size_t>(T * d.hidden_size), 5150u, 0.8f));
+  auto pos = MakePositions(reqs);
+  RefContext ctx = MakeContext(d, reqs, 5151u);
+
+  // The FUSED path: the block applies `o_proj` itself.
+  const auto fused =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/4, 64);
+
+  // The SPLIT path: the block returns `[T, N*V]` and this applies the SAME
+  // `o_proj` by hand.
+  const auto split =
+      RunBlock(b, q, d, hw, DType::kF32, hidden, pos, reqs, ctx, /*decode_reqs=*/4, 64,
+               /*raw_out=*/nullptr, /*k_rope_ln=*/nullptr, /*gate=*/nullptr,
+               /*gate_rows=*/0, /*attn_sink=*/nullptr, /*split_o_proj=*/true);
+
+  REQUIRE(fused.size() == split.size());
+  REQUIRE(!fused.empty());
+  double worst = 0.0, scale = 0.0;
+  for (size_t i = 0; i < fused.size(); ++i) {
+    REQUIRE(!std::isnan(split[i]));
+    scale = std::max(scale, std::abs(static_cast<double>(fused[i])));
+    worst = std::max(worst, std::abs(static_cast<double>(fused[i] - split[i])));
+  }
+  // The outputs are NON-TRIVIAL: an all-zero pair would satisfy any difference
+  // bound and prove nothing about either path.
+  REQUIRE(scale > 1e-3);
+  // Same arithmetic in the same order, so this is tight rather than tolerant.
+  CHECK(worst <= 1e-6 * std::max(1.0, scale));
 }
 
 // (3) OURS vs OURS THROUGH TWO DIFFERENT CODE PATHS — the strongest form of the

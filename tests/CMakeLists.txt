@@ -1647,6 +1647,8 @@ vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
 vllm_cpp_add_test(test_weight_residency_config
   vllm/config/test_weight_residency_config.cpp)
 
+vllm_cpp_add_test(test_deepseek_v4_paged_equiv
+  vllm/models/test_deepseek_v4_paged_equiv.cpp)
 vllm_cpp_add_test(test_multi_kv_refusal
   vllm/model_executor/test_multi_kv_refusal.cpp)
 vllm_cpp_add_test(test_device_placement
@@ -3549,3 +3551,23 @@ vllm_cpp_add_test(test_glm_moe_dsa_gguf_load
   vllm/models/test_glm_moe_dsa_gguf_load.cpp)
 target_include_directories(test_glm_moe_dsa_gguf_load PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+# W9: THE FORWARD. Drives a first token through `LoadedEngine::FromModelDir` --
+# the entry point a user arrives through, so deleting the forward call in
+# `ForwardGlmMoeDsaForCausalLM` reds it -- then gates the pieces on the same
+# synthetic model: finite logits with the distribution printed, the `kShared`
+# selection reuse, the routed experts reaching `expert_stream::ExpertSlice`
+# (GLM-5.3 is that lane's SECOND client, spec O15), and the two refusals this
+# build still owes. Spec `.agents/specs/glm-dsa-latest-deepseek.md` §3.7 W9.
+vllm_cpp_add_test(test_glm_moe_dsa_forward
+  vllm/models/test_glm_moe_dsa_forward.cpp)
+target_include_directories(test_glm_moe_dsa_forward PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# THE LANE IS ON FOR THIS TARGET, and that is load-bearing rather than a
+# convenience. Expert streaming is default OFF; with it off `ExpertSlice` builds
+# no store, both arms of the streamed-vs-resident case read the tower in place,
+# and the comparison would pass on a forward that never touched the seam. The
+# suite asserts `StreamRequested()` and the lane's own fill counters, so a run
+# without this environment reds rather than quietly measuring nothing.
+set_tests_properties(test_glm_moe_dsa_forward PROPERTIES
+  ENVIRONMENT "VT_MOE_EXPERT_STREAM=1")

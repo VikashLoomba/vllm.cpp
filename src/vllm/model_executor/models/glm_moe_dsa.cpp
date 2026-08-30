@@ -181,26 +181,25 @@ bool OptIndexerTypes(const GgufFile& g, const std::string& key,
 // repaired in flow by the wave that next touched this file, as O20's
 // DISPOSITION directs.
 constexpr const char* kForwardRefusal =
-    "GlmMoeDsaForCausalLM forward is not implemented. The `glm-dsa` GGUF "
-    "loader IS implemented and this model's weights DO materialize (W7): the "
-    "1581 resident tensors load and the 228 `_exps.weight` towers are held as "
-    "raw ggml blocks for the expert-streaming lane. What is missing is the "
-    "forward that consumes them, and the two primitives it needs that this "
-    "build does NOT have: (1) the indexer KV side cache, upstream's "
-    "`DeepseekV32IndexerCache` (deepseek_v2.py:696-701) — without it a sparse "
-    "step refuses every RESUMED request, at the `VT_CHECK` whose predicate is "
-    "`!elig.prunes || elig.Active()` in dots3_note_device.cpp (cited by "
+    "The GlmMoeDsaForCausalLM forward IS implemented (W9) and this STEP cannot "
+    "be served, because of the two primitives this build does NOT have. (1) The "
+    "indexer KV side cache, upstream's `DeepseekV32IndexerCache` "
+    "(deepseek_v2.py:696-701): without it a sparse step refuses every RESUMED "
+    "request, for the same reason and at the same predicate as the `VT_CHECK` "
+    "spelled `!elig.prunes || elig.Active()` in dots3_note_device.cpp (cited by "
     "predicate rather than by line, spec O20: the range moved twice while this "
-    "message was being written) — owned by KV-DSV4-MULTICACHE, spec O4, issues "
-    "#1925 and #2323; (2) sparse prefill: `MlaPrefillAttentionArgs` carries no "
-    "topk member and `MlaPrefillAttention` has no selection arm, so a sparse "
-    "step must route EVERY token through MQA and only a request with no "
-    "previously computed context can do that — W6, spec O6. Multi-token "
-    "prediction is skipped, not implemented: block 78 is read, counted and "
-    "dropped (spec O5). No end-to-end token gate against vLLM is reachable on "
-    "this fleet at all (spec O1, §3.6): vLLM at the pin implements this "
-    "architecture and cannot fit its 703.74 GiB on any device this project "
-    "reaches. See .agents/specs/glm-dsa-latest-deepseek.md §3.7.";
+    "message was first written) — owned by KV-DSV4-MULTICACHE, spec O4, issues "
+    "#1925 and #2323. A FIRST token on a fresh prompt is reachable and a SECOND "
+    "is not. (2) sparse prefill: `MlaPrefillAttentionArgs` carries no topk "
+    "member and `MlaPrefillAttention` has no selection arm, so a sparse step "
+    "must route EVERY token through MQA and only a request with no previously "
+    "computed context can do that — W6, spec O6. Multi-token prediction is "
+    "skipped, not implemented: block 78 is read, counted and dropped (spec O5); "
+    "the loader that materializes these weights is W7's. No end-to-end token "
+    "gate against vLLM is reachable on this fleet at all (spec O1, §3.6): vLLM "
+    "at the pin implements this architecture and cannot fit its 703.74 GiB on "
+    "any device this project reaches. See "
+    ".agents/specs/glm-dsa-latest-deepseek.md §3.7.";
 
 constexpr const char* kSafetensorsRefusal =
     "Model architecture GlmMoeDsaForCausalLM does not support safetensors "
@@ -774,36 +773,9 @@ v1::KVCacheConfig MakeGlmMoeDsaKVCache(const HfConfig& config, int block_size,
 const char* GlmMoeDsaForwardRefusal() { return kForwardRefusal; }
 const char* GlmMoeDsaSafetensorsRefusal() { return kSafetensorsRefusal; }
 
-std::vector<float> GlmMoeDsaModel::Forward(
-    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
-    const v1::CommonAttentionMetadata& attn_meta,
-    const std::vector<PagedKvCache>& attn_kv, const GlmMoeDsaWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
-  (void)token_ids;
-  (void)positions;
-  (void)attn_meta;
-  (void)attn_kv;
-  (void)weights;
-  (void)queue;
-  (void)logits_indices;
-  VT_CHECK(false, kForwardRefusal);
-  return {};
-}
-
-ForwardLogits GlmMoeDsaModel::ForwardDevice(
-    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
-    const v1::CommonAttentionMetadata& attn_meta,
-    const std::vector<PagedKvCache>& attn_kv, const GlmMoeDsaWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
-  (void)token_ids;
-  (void)positions;
-  (void)attn_meta;
-  (void)attn_kv;
-  (void)weights;
-  (void)queue;
-  (void)logits_indices;
-  VT_CHECK(false, kForwardRefusal);
-  return {};
-}
+// `GlmMoeDsaModel::Forward` and `::ForwardDevice` live in
+// `glm_moe_dsa_forward.cpp` (W9, #2214). They used to refuse here; what remains
+// in this translation unit is the CONFIG surface and the refusal TEXT, which the
+// forward still raises for the one step shape it cannot serve.
 
 }  // namespace vllm

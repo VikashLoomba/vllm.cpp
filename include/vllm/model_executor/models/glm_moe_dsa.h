@@ -263,6 +263,44 @@ struct GlmMoeDsaMlaWeights {
   OwnedTensor v_b_proj;            // [heads, v_head_dim, kv_lora_rank]
   OwnedTensor o_proj;              // [hidden, heads * v_head_dim]
   GlmMoeDsaIndexerWeights indexer;  // populated on a `kFull` layer only
+
+  // ─── W9: the POST-LOAD ABSORPTION (#2214) ─────────────────────────────────
+  // Upstream's own stage, under upstream's own name:
+  // `MLAAttention.process_weights_after_loading` (`mla_attention.py:875-962`).
+  // It runs in the LOADER, which is where `deepseek_v2_weights.cpp:138-153`
+  // already calls the same shared absorber for the safetensors arm — the stage
+  // needs the dequantizer and the open `GgufFile`, and both live there.
+  //
+  // WHY IT EXISTS HERE AT ALL, measured rather than assumed. `attn_k_b` and
+  // `attn_v_b` above arrive in llama.cpp's orientation, where a row runs along
+  // the CONTRACTION axis (`ggml_mul_mat` contracts `ne[0]`), and they arrive
+  // Q8_0. The shared MLA decode arm needs `w_uk_t` `[heads, qk_nope, kv_lora]`
+  // and `w_uv` `[heads, kv_lora, v_head]` for `vt::BatchedMatmul`, whose
+  // contract is "a/b share f32 or bf16" and "only the innermost dimension must
+  // be unit-stride" — so neither a transposed view nor the quantized bytes are
+  // admissible, and a per-head TRANSPOSE INTO BF16 is the only form that is.
+  //
+  // That is exactly upstream's situation and exactly upstream's answer:
+  // `W_UK_T` and `W_UV` are plain bf16 copies, and `mla_attention.py:876-878`
+  // gives the reason — "we currently do not have quantized bmm's which are
+  // needed for W_UV and W_UK_T ... the extra memory overhead of this is fairly
+  // low".
+  //
+  // THE COST IS STATED RATHER THAN DISCOVERED: 58.8 MB per layer over 78 layers
+  // = 4.48 GiB on top of §3.3's 14.511 GiB resident class, so the class this
+  // model actually holds is ~18.99 GiB. Spec §3.7 W9 F4, and O9 is restated
+  // against that number rather than quietly failed.
+  //
+  // `kv_b_proj` is the CHECKPOINT-layout `[heads*(qk_nope+v_head), kv_lora]`
+  // linear the PREFILL (materialized-MHA) arm needs. The GGUF does not ship it
+  // — llama.cpp's converter already split it — so it is rebuilt from the two
+  // halves: rows `[0, qk_nope)` of each head are `attn_k_b` transposed, and rows
+  // `[qk_nope, qk_nope+v_head)` are `attn_v_b` VERBATIM, which is already in
+  // that orientation. `w_uk_t` / `w_uv` are then produced from it by the SHARED
+  // `mla::AbsorbKvBProjBf16` rather than by a second absorber written here.
+  OwnedTensor kv_b_proj;  // bf16 [heads*(qk_nope+v_head), kv_lora]
+  OwnedTensor w_uk_t;     // bf16 [heads, qk_nope, kv_lora]
+  OwnedTensor w_uv;       // bf16 [heads, kv_lora, v_head]
 };
 
 // A SwiGLU MLP: the three leading dense layers, and every MoE layer's shared
@@ -328,6 +366,15 @@ struct GlmMoeDsaWeights {
   // Counted as dropped rather than ignored, because the count is what makes
   // spec D3 executable: 57 shared backbone layers x 5 tensors = 285.
   int64_t broadcast_indexer_tensors_dropped = 0;
+
+  // W9: whether the post-load absorption ran (`GlmMoeDsaMlaWeights`'s
+  // `kv_b_proj` / `w_uk_t` / `w_uv`). The forward REFUSES a model without it BY
+  // NAME rather than reading the empty tensors, because
+  // `mla::MlaBlockWeights`'s own `RequireWeight` would name `w_uk_t` without
+  // saying that a whole stage did not run. Only `LoadGlmMoeDsaFromGguf` sets
+  // it; a hand-constructed `GlmMoeDsaWeights` is therefore refused, which is
+  // the polarity a test that builds the struct by hand needs.
+  bool absorbed = false;
 };
 
 // Load the `glm-dsa` GGUF arm. `policy` may be null, in which case the process
@@ -343,7 +390,48 @@ GlmMoeDsaWeights LoadGlmMoeDsaFromGguf(const GgufFile& gguf,
 std::vector<std::string> EnumerateGlmMoeDsaGgufTensors(
     const GlmMoeDsaParams& params);
 
-// The forward, REFUSE-by-name. Both entry points list every missing primitive.
+// ─── W9: what the post-load absorption does, and the narrowing it verifies ───
+//
+// `LoadGlmMoeDsaFromGguf` runs it and sets `GlmMoeDsaWeights::absorbed`. It does
+// three things, and each is a MEMORY-FORMAT decision a token gate cannot see, so
+// each is named here:
+//
+//  1. builds `kv_b_proj`, `w_uk_t` and `w_uv` (see `GlmMoeDsaMlaWeights`) —
+//     `w_uk_t` and `w_uv` through the SHARED `mla::AbsorbKvBProjBf16`, not a
+//     second absorber;
+//  2. NARROWS every `kFull` layer's `indexer.weights_proj` from the file's F32
+//     to bf16, because the shared MLA block computes the indexer in the block
+//     dtype and `vt::MatmulBT` needs matching float operands. Upstream's
+//     `wk_weights_proj` carries no `params_dtype` (`deepseek_v2.py:700-707`) and
+//     is therefore the model dtype, so bf16 IS the mirror — the file's F32 is
+//     llama.cpp's lossless upcast of a bf16 tensor. That claim is EXECUTABLE
+//     rather than assumed: every value must round-trip through bf16 exactly, and
+//     a file whose indexer projection is genuinely f32 is REFUSED BY NAME rather
+//     than silently rounded, because rounding it would move a discrete top-k
+//     that no tolerance bounds;
+//  3. leaves the ROUTER gate at F32, and this is the one place this port is
+//     deliberately WIDER than vLLM. Upstream's tier-5 path is bf16 x bf16 ->
+//     f32 (`fused_moe/router/gate_linear.py`); the forward here runs f32 x f32
+//     -> f32, on the smallest GEMM in the model (`[T,6144] x [256,6144]`), in
+//     the direction vLLM's OWN `force_fp32_compute` arm takes when no
+//     specialized kernel is available — and it is what llama.cpp does on this
+//     identical artifact, which §3.6 makes the only oracle this row can compare
+//     against. The cost is one `vt::CastF32` of the hidden state per MoE layer.
+//
+// The forward. Composes only shared seams: `mla::ForwardMlaAttentionBlock` over
+// `GlmMoeDsaMlaSchedule`'s per-layer dims and ONE `mla::MlaSharedSelection`,
+// `expert_stream::ExpertSlice` for the 256-expert towers,
+// `layers::MlpGateUpMethodBase` for every dense MLP, `vt::FusedChain` for the
+// residual add + RMSNorm, and `vt::MoeRouterTopK` / `vt::MoeCombine` for the
+// routed-expert composition.
+//
+// WHAT IT STILL REFUSES, BY NAME. A step in which any request RESUMES while the
+// selection PRUNES: the indexer's `k` for a token comes from that token's own
+// hidden state, so a resumed request needs the indexer's own 128-wide side
+// cache, which is `KV-DSV4-MULTICACHE`'s (spec O4,
+// [#1925](https://github.com/mudler/vllm.cpp/issues/1925),
+// [#2323](https://github.com/mudler/vllm.cpp/issues/2323)). A FIRST token on a
+// fresh prompt is reachable and a SECOND is not.
 class GlmMoeDsaModel {
  public:
   static std::vector<float> Forward(const std::vector<int32_t>& token_ids,

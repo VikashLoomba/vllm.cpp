@@ -253,6 +253,35 @@ Both sit under the shared band with room, so **neither dtype takes a per-case
 ceiling and none was added**. Had either come out over, the answer would have
 been `NEEDS_DECISION`, not a wider band.
 
+### `land/glm53-flash-and-dsa` and `main` conflict, and this row inherits it
+
+This row was briefed to merge the landing branch so that a GLM-5.3 end-to-end
+check would be possible. That merge was clean. Merging `origin/main` on top of
+it is not:
+
+```text
+CONFLICT (content): Merge conflict in src/vllm/model_executor/models/model_registry.cpp
+```
+
+Two rows narrowed the SAME `multi_kv` refusal independently and neither knows
+about the other. `land/glm53-flash-and-dsa` W5b-2c gates it on
+`ModelFactory::consumes_multi_kv_cache`; `main`'s `KV-DSV4-MULTICACHE` W5 gates
+it on `consumes_multi_kv` through a new `MultiKvRefusalApplies` helper. Taking
+either side alone silently un-narrows the other row's model, which is why this
+row does not resolve it: picking a side is a semantic change to two other rows'
+dispatch and needs their gates, not a kernel port's.
+
+**Measured as base-caused, not asserted.** `git merge-tree --write-tree`
+between `origin/land/glm53-flash-and-dsa` and `origin/main`, with NONE of this
+row's commits present, reports the identical single conflict on the identical
+file. Whoever lands the landing branch reconciles it.
+
+The consequence for this row is bounded and named: this branch stays on
+`1d1321095` plus the landing branch, so `agent-preflight.sh` skips
+`commit-trailers` and `commit-style` with "origin/main is not an ancestor of
+HEAD". Both were therefore run BY HAND against this branch's real merge base
+and both report OK, so the two gates have answers rather than silence.
+
 ### `check-pr-size.py` is red on this branch and it is BASE-CAUSED
 
 ```text

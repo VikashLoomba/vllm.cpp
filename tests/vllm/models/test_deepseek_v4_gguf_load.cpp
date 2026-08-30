@@ -60,6 +60,12 @@ struct Dims {
   int64_t hc = 2, sinkhorn = 3;
   int64_t inh = 2, ihd = 32, index_topk = 3;
   int64_t n_layer = 4, n_hash = 2;
+  // KV-DSV4-MULTICACHE W5 (#2323): the SWA window, in tokens. Parameterized
+  // because a window CONFOUNDS the paging gate -- with a window the paged arm
+  // legitimately differs from the unwindowed full-recompute path, so a case that
+  // wants to isolate the paging must switch it off. 4 keeps every existing case
+  // byte-identical.
+  int64_t sliding_window = 4;
   std::vector<int32_t> compress_ratios = {0, 4, 2, 4};  // idx {1,3}, comp {1,2,3}
   // The DSA compressor's REAL output width is `coff * head_dim` (ds4: coff==2 for
   // compress_ratio==4). Default 1 collapses it onto head_dim (the historical tiny
@@ -171,7 +177,7 @@ std::string BuildGguf(const Dims& d, const std::string& drop = "",
   b.AddKv(U32Kv(p + "attention.q_lora_rank", d.qlr));
   b.AddKv(U32Kv(p + "attention.output_lora_rank", d.olr));
   b.AddKv(U32Kv(p + "attention.output_group_count", d.o_groups));
-  b.AddKv(U32Kv(p + "attention.sliding_window", 4));
+  b.AddKv(U32Kv(p + "attention.sliding_window", static_cast<uint32_t>(d.sliding_window)));
   b.AddKv(F32Kv(p + "rope.freq_base", 10000.0f));
   b.AddKv(F32Kv(p + "attention.compress_rope_freq_base", 160000.0f));
   b.AddKv(F32Kv(p + "attention.layer_norm_rms_epsilon", 1e-6f));
@@ -573,7 +579,13 @@ TEST_CASE("W5: PAGED incremental decode == full-recompute, token for token") {
   // and the read back -- composes into the same model. A paging defect that the
   // per-op cases cannot see (a slot written to the wrong block, a `kv_base` that
   // drifts by one after several steps) shows up here as a DIFFERENT TOKEN.
+  // NO SLIDING WINDOW, deliberately. With one, the paged arm attends a window on
+  // the `compress_ratio <= 1` layers while the full-recompute anchor attends the
+  // whole prefix -- they diverge above the window BY DESIGN, and mixing that into
+  // this case would hide whether the PAGING is right. The window has its own gate
+  // in `test_deepseek_v4_paged_equiv`, against a windowed reference.
   Dims d;
+  d.sliding_window = 0;
   TempFile f(BuildGguf(d));
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
@@ -581,6 +593,7 @@ TEST_CASE("W5: PAGED incremental decode == full-recompute, token for token") {
   const vllm::DeepseekV4Weights w =
       vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
   REQUIRE(w.has_gguf_weights);
+  REQUIRE(w.params.sliding_window == 0);
 
   const int V = static_cast<int>(d.vocab);
   auto argmax_last = [V](const std::vector<float>& logits) -> int {

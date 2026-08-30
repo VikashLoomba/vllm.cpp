@@ -1042,7 +1042,16 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
         *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],
         (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
         (*be.paged_kv)[static_cast<size_t>(layer)].shape[1], T, nh, hd, kv_base,
-        L.attn_sink, scale, /*no_sink=*/miswire == V4Miswire::kNoAttnSink);
+        L.attn_sink, scale, /*no_sink=*/miswire == V4Miswire::kNoAttnSink,
+        // W5 (#2323): a `compress_ratio <= 1` layer is SWA-ONLY upstream -- it
+        // attends its sliding window and nothing else
+        // (`nvidia/flashmla.py`: `k_cache=swa_cache` with `extra_k_cache=None`
+        // when `swa_only`). Attending the full prefix there diverges above the
+        // window, which is why this row's recorded 512-token exactness bound was
+        // wrong by 4x for these layers. Layers WITH a compressor keep the full
+        // prefix here: their window-plus-compressed-history composition belongs
+        // to MODEL-DSV4-DSA-COMPOSE (#2286) and they refuse above.
+        /*sliding_window=*/p.has_compressor(layer) ? 0 : p.sliding_window);
   } else if (dev_attn) {
     // kv_keys holds the cached deck [n_keys_total, hd]; sel is dense-causal, so the
     // device kernel derives it from kv_base+t (no per-key index list needed).

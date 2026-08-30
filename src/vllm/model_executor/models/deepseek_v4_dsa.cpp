@@ -220,7 +220,8 @@ std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<f
                                            int64_t block_size, int64_t num_tokens,
                                            int64_t num_heads, int64_t head_dim,
                                            int64_t kv_base, const std::vector<float>& sink,
-                                           float scale, bool no_sink) {
+                                           float scale, bool no_sink,
+                                           int64_t sliding_window) {
   VT_CHECK(num_tokens > 0 && num_heads > 0 && head_dim > 0,
            "PagedCausalMlaAttention: num_tokens/num_heads/head_dim must be > 0");
   VT_CHECK(static_cast<int64_t>(q.size()) == num_tokens * num_heads * head_dim,
@@ -264,6 +265,12 @@ std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<f
   vt::MlaDecodeAttentionArgs args;
   args.scale = scale;
   args.attn_sink = &t_sink;
+  // The op's convention is `left == sliding_window - 1` (an INCLUSIVE distance),
+  // and `right == 0` because a decode query is the last position of its own
+  // sequence. Absent (0) the kernel keeps its full-prefix loop byte-identically.
+  if (sliding_window > 0)
+    args.window_size =
+        vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
   vt::MlaDecodeAttention(queue, t_out, nullptr, t_q, kv_cache, t_bt, t_sl, args);
   return out;
 }

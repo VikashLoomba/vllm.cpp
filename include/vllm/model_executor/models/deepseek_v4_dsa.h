@@ -179,6 +179,16 @@ std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<f
                                            int64_t block_size, int64_t num_tokens,
                                            int64_t num_heads, int64_t head_dim,
                                            int64_t kv_base, const std::vector<float>& sink,
-                                           float scale, bool no_sink);
+                                           float scale, bool no_sink,
+                                           // KV-DSV4-MULTICACHE W5 (#2323): the
+                                           // SLIDING WINDOW, in tokens. 0 = none
+                                           // (attend the whole causal prefix).
+                                           // Upstream attends a `swa_only` layer
+                                           // over its window and NOTHING else
+                                           // (`flashmla.py`, `k_cache=swa_cache`
+                                           // with `extra_k_cache=None`), so a
+                                           // full-context read of such a layer
+                                           // diverges above the window.
+                                           int64_t sliding_window = 0);
 
 }  // namespace vllm::deepseek_v4

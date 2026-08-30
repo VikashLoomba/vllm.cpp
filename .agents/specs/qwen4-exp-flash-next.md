@@ -6299,14 +6299,10 @@ nobody is watching fires whenever the device frees and takes a box another wave
 is waiting for. It was killed while still queued and never started, so it cost
 the fleet nothing.
 
-The dgx job did not run either. It was killed from outside this session using
-the `--as w6cuda@qwen4exp` submitter identity, and the same script was then
-re-submitted under the default identity by another session. **`rc run --as
-<name>` is worth avoiding for this reason**: it makes `rc kill` refuse the
-submitter with `not_job_owner` unless `RC_SUBMITTER` is set to match, and it puts
-a kill incantation into circulation that anyone who reads it can use. A plain
-submit leaves the job killable by the session that owns it and by nobody else's
-convenience.
+The dgx job did not run either. It was cancelled deliberately, with
+`RC_SUBMITTER=w6cuda@qwen4exp rc kill`, and the same script re-submitted under
+the default identity so that the job would be killable by a plain `rc kill`. The
+rule that motivated that swap is recorded once, below, rather than argued here.
 
 **What WAS measured, and why it is worth having.** The two `.cu` files were
 compiled and EXECUTED on the host under a shim that makes `__global__` a plain
@@ -6393,34 +6389,6 @@ makes them agree again and hides the very asymmetry the real build has (host
 pinned off, nvcc `-fmad` on and unpinned). A single-flag emulation is not a test
 of this property.
 
-**`rc run` IS NOT FIRE-AND-FORGET, AND THIS COST THIS WAVE ITS QUEUE SLOT.** The
-`rc run` client streams the job's output, and **killing the client CANCELS a job
-that is still queued.** It is not merely a lost stream. When this wave's
-streaming process was reaped, `rc jobs` recorded
-`killed (killed by mudler@mudler-ubuntu-box)` and the client's own log printed
-`rc: cancelled queued job 7d58cbb7-...`. The job had reached position #1 after a
-roughly three-hour wait and was next to run; the resubmission started again at
-position #5.
-
-The fix is to detach the client from the session that launched it, so that
-reaping a shell or a background task cannot take the job with it:
-
-```sh
-setsid nohup rc run -d dgx:gpu0 --max-runtime 3h -- bash /workspace/<dir>/run.sh \
-    > run.log 2>&1 < /dev/null &
-```
-
-Verify it took: the client must show `ppid=1` and a session id equal to its own
-pid (`ps -o pid,ppid,sid -p <pid>`). Anything else is still tied to the launching
-session and is one reap away from cancelling the job.
-
-This compounds with the `--as` finding recorded above. Together they are the two
-ways this wave lost a lease without ever touching a device: `--as` makes a job
-you cannot cancel, and an attached client makes a job that cancels itself.
-**Owed: `.agents/environment.md` should carry both, because they are fleet facts
-rather than facts about this row**, and no issue could be filed for them (GitHub
-writes are `403` from this host).
-
 **TWO `rc` FACTS THIS WAVE PAID FOR, BOTH ABOUT WHO OWNS A JOB.** Neither is in
 `.agents/environment.md` and both cost this wave its queue position.
 
@@ -6436,9 +6404,18 @@ writes are `403` from this host).
    `rc jobs` records `killed (killed by mudler@mudler-ubuntu-box)` — because the
    streaming client was stopped. Nothing about the state of the DEVICE changed;
    the client's death was the whole cause. A submission that has to outlive the
-   shell that made it therefore needs the client detached (`setsid nohup ... &`,
-   which leaves it at `ppid 1` in its own session), and the results read back from
-   `/workspace` or `rc logs` rather than from the stream.
+   shell that made it therefore needs the client detached, and the results read
+   back from `/workspace` or `rc logs` rather than from the stream:
+
+   ```sh
+   setsid nohup rc run -d dgx:gpu0 --max-runtime 3h -- bash /workspace/<dir>/run.sh \
+       > run.log 2>&1 < /dev/null &
+   ```
+
+   **Verify that it took, because nothing in `rc ps` shows this hazard.** The
+   client must report `ppid=1` and a session id equal to its own pid
+   (`ps -o pid,ppid,sid -p <pid>`). Anything else still shares a session with the
+   shell that launched it and is one reap away from cancelling its own job.
 
 The practical cost was two full queue traversals on a box whose queue ran four to
 six deep, so this is recorded as an environment fact rather than as an anecdote.

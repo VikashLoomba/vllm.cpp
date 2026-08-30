@@ -1726,6 +1726,20 @@ target_include_directories(test_resident_weight_host_addressable PRIVATE ${CMAKE
 # singleton, so a case asking that question must run before anything ends a step.
 vllm_cpp_add_test(test_expert_stream_steps vllm/model_executor/test_expert_stream_steps.cpp)
 target_include_directories(test_expert_stream_steps PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MODEL-TEXT-GLM-MOE-DSA W3 (#2214): G3 on a model with MORE THAN 4 experts and
+# MORE THAN 4 layers, which is the bound `expert-streaming.md` `## Owed` records
+# against every fixture this row inherited. Its own binary because the wider
+# model needs a larger VT_MOE_EXPERT_STREAM_SLOTS than test_expert_stream_wiring
+# sets, and that knob is read once into a function-local static behind a
+# process-lifetime singleton.
+vllm_cpp_add_test(test_expert_stream_wide_logits
+  vllm/model_executor/test_expert_stream_wide_logits.cpp)
+target_include_directories(test_expert_stream_wide_logits PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the LOAD-TIME slot-capacity refusal. Pure
+# arithmetic over the shared seam, so it needs neither a forward nor the
+# environment latch its siblings above are separated by.
+vllm_cpp_add_test(test_expert_stream_capacity
+  vllm/model_executor/test_expert_stream_capacity.cpp)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.

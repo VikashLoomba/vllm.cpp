@@ -769,11 +769,40 @@ TEST_CASE("qwen4_exp: the safetensors load, the forward and the KV spec refuse B
     // forward subcase: deleting the `VT_CHECK` left the forward returning an
     // empty `ForwardLogits{}` and the gate green (review mutation M6).
     //
-    // The refusal has to come BEFORE the `ModelAs` downcast, or it is
-    // unreachable rather than merely untested: nothing can produce a loaded
-    // Qwen4-Exp while the loader refuses, so the only handle any caller can
-    // present is a foreign one, and a downcast placed first turns every reach
-    // into a type-mismatch report instead.
+    // W5f (#2031, #2336) INVERTED THIS SUBCASE, AND THE OLD ASSERTIONS ARE
+    // RECORDED HERE SO THE CHANGE IS NOT READ AS A WEAKENING. It used to assert
+    // that the message said "forward is not ported", that it named W2 and W4,
+    // and that it was NOT the type-mismatch report — because the refusal had to
+    // come BEFORE the `ModelAs` downcast or it would be unreachable rather than
+    // merely untested. That argument had one premise: "nothing can produce a
+    // loaded Qwen4-Exp while the loader refuses, so the only handle any caller
+    // can present is a foreign one". W5a made the loader LOAD and W5f made the
+    // forward RUN, so the premise is gone in both halves and the registry TU's
+    // own comment named this as the moment to restore the house ordering: "W5b
+    // restores `ModelAs` in the same change that gives it something to read."
+    //
+    // WHAT IS GATED NOW IS THE STRICTLY SAFER SHAPE. The hook opens its handle
+    // FIRST, so a foreign model is refused BY NAME before any member call rather
+    // than downcast into undefined behaviour (#775, #730) — and the refusal
+    // still names this architecture, which is the property the old assertion
+    // was really protecting. The bytes below were READ OUT OF THE RUNNING HOOK
+    // with a temporary MESSAGE, not grepped out of the source: a substring
+    // assertion passes on a message that is wrong.
+    //
+    // THE REFUSALS THIS MODEL NOW ADVERTISES ARE ON THE OTHER SIDE OF THAT
+    // DOWNCAST — a step at `past_len != 0` and a step with `num_reqs != 1` —
+    // and they cannot be reached with a foreign handle at all, so nothing in
+    // THIS file can gate them. They are gated in
+    // `test_qwen4_exp_layer_loop.cpp` on a model `ModelRegistry::Load` really
+    // produced, which is the only place they are reachable.
+    //
+    // WHAT "GATED" MEANS THERE IS LOAD-BEARING, and this sentence was FALSE when
+    // W5f first wrote it. That suite asserted a bare `CHECK_THROWS`, and both
+    // inputs throw at the PLE layout cross-check even with the guard deleted, so
+    // deleting either `VT_CHECK` left BOTH suites green — this one at 12 / 294.
+    // Each refusal is now asserted two-sided on its own MESSAGE, and each is
+    // mutation-proven one at a time (`## The refusal boundary` in
+    // `.agents/specs/qwen4-exp-flash-next.md`, rows MR1 and MR2).
     REQUIRE(reg.factory->forward != nullptr);
     ForeignLoadedModel foreign(reg);
     EmptyForwardInput in;
@@ -785,15 +814,15 @@ TEST_CASE("qwen4_exp: the safetensors load, the forward and the KV spec refuse B
       msg = e.what();
     }
     CHECK(msg.find("Qwen4ExpForConditionalGeneration") != std::string::npos);
-    CHECK(msg.find("forward is not ported") != std::string::npos);
-    // Each wave that owes a piece of it is named, so the reader is not sent to
-    // the loader for work W2/W3/W4 owe.
-    CHECK(msg.find("W2") != std::string::npos);
-    CHECK(msg.find("W4") != std::string::npos);
-    CHECK(msg.find("#1978") != std::string::npos);
-    // And it is NOT the type-mismatch report, which would mean the refusal this
-    // model advertises is unreachable behind a downcast.
-    CHECK(msg.find("was not produced by") == std::string::npos);
+    // The house type-safety refusal, and it is now the CORRECT answer for a
+    // foreign handle rather than the failure the old assertion guarded against.
+    CHECK(msg.find("was not produced by") != std::string::npos);
+    CHECK(msg.find("#775") != std::string::npos);
+    // And the forward is no longer refused unconditionally, which is the whole
+    // of what W5f changed here. A refusal that still said this would be naming
+    // finished work, which is the #2288 failure this row has produced eight
+    // times.
+    CHECK(msg.find("forward is not ported") == std::string::npos);
   }
 
   SUBCASE("the KV-cache spec no longer refuses") {

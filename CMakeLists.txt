@@ -810,6 +810,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen4_exp.cpp
   src/vllm/model_executor/models/qwen4_exp_weights.cpp
   src/vllm/model_executor/models/qwen4_exp_moe.cpp
+  src/vllm/model_executor/models/qwen4_exp_ple_block.cpp
+  src/vllm/model_executor/models/qwen4_exp_forward.cpp
   src/vllm/model_executor/models/qwen4_exp_registry.cpp
   src/vllm/model_executor/models/glm5_next.cpp
   src/vllm/model_executor/models/glm5_next_kda.cpp

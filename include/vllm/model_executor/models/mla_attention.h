@@ -216,7 +216,7 @@ struct MlaBlockDims {
   int64_t index_head_dim = 0;
   int64_t index_topk = 0;
   // `is_neox_style = not getattr(config, "indexer_rope_interleave", False)`
-  // (`deepseek_v2.py:1159`). NOTE this is INDEPENDENT of `is_neox_style` above:
+  // (`deepseek_v2.py:1120`). NOTE this is INDEPENDENT of `is_neox_style` above:
   // dots3-note's main MLA rope is GPT-J (`:1108` passes `is_neox_style=False`)
   // while its indexer rope follows the config flag. The two rotaries are built
   // from the SAME `qk_rope_head_dim`, `max_position_embeddings` and
@@ -230,6 +230,53 @@ struct MlaBlockDims {
   bool has_indexer() const {
     return index_topk > 0 && index_n_heads > 0 && index_head_dim > 0;
   }
+
+  // ─── GLM-5.3's HETEROGENEOUS indexer schedule (W4, #2214) ────────────────
+  // A layer that is SPARSE and runs NO indexer of its own, because it attends
+  // through the selection the preceding full layer already computed. Upstream
+  // calls this `skip_topk` and builds it in two places that must be read
+  // together:
+  //
+  //   `deepseek_v2.py:1115`      `if self.is_v32 and (not _skip_topk or is_mtp_layer):`
+  //                              — the indexer is CONSTRUCTED only on a full
+  //                                layer, so a shared layer has none at all
+  //                                (`:1134-1135`: `self.indexer_rope_emb = None`,
+  //                                 `self.indexer = None`).
+  //   `deepseek_v2.py:1175`      `skip_topk=_skip_topk and not is_mtp_layer,`
+  //                              — the flag still reaches the MLA wrapper, which
+  //                                stays `is_sparse`.
+  //
+  // and the reuse itself is `vllm/model_executor/layers/mla.py:180`:
+  //
+  //     if self.indexer and self.is_sparse and not self.skip_topk:
+  //         self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+  //
+  // READ THAT LINE FOR WHAT IT DOES NOT DO. There is no copy, no cache and no
+  // cross-step state. Upstream allocates ONE `topk_indices_buffer` per model
+  // (`deepseek_v2.py:1372-1377`, `[max_num_batched_tokens, index_topk]` i32) and
+  // hands the SAME tensor to every layer (`:1395`, `mla.py:120`). A full layer
+  // overwrites it; a shared layer simply does not, so the bytes it attends
+  // through are the ones its owning full layer wrote EARLIER IN THE SAME FORWARD
+  // PASS. `sparse_mla_attention.py:303-305` says so in upstream's own words:
+  // "the explicitly-passed buffer covers backbone skip layers, whose indexer is
+  // not constructed". `MlaSharedSelection` below is that buffer.
+  //
+  // NEVER TRUE TOGETHER WITH `has_indexer()`. Upstream cannot produce a layer
+  // that has both, because `:1115` is the negation of `:1175` everywhere except
+  // the MTP block, which forces `skip_topk=False`. `Validate()` refuses the
+  // combination rather than picking one.
+  //
+  // GLM-5.3 splits 79 blocks 22 / 57 on this flag; DeepSeek-V3.2 leaves it false
+  // on every layer (`index_topk_freq` defaults to 1, so nothing is ever
+  // skipped), and so does every dots3-note, DeepSeek, MiniCPM3 and Kimi-Linear
+  // registration in this tree.
+  bool skip_topk = false;
+
+  // Upstream's `is_sparse`. A shared layer is sparse WITHOUT an indexer, which
+  // is exactly the state `has_indexer()` alone cannot express — and reading
+  // `has_indexer()` as "is sparse" is what would silently route a shared layer
+  // down the dense contiguous key loop with a plausible-looking output.
+  bool is_sparse() const { return has_indexer() || skip_topk; }
 
   // `self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim` (:969) — 192.
   int64_t qk_head_dim() const { return qk_nope_head_dim + qk_rope_head_dim; }
@@ -432,6 +479,27 @@ struct MlaBlockWeights {
 
 // Per-step metadata. `num_decode_tokens` is upstream's `num_mqa_tokens`
 // (mla_attention.py:707) and the tokens it names are PACKED FIRST.
+// Upstream's shared `topk_indices_buffer` (`deepseek_v2.py:1372-1377`), the one
+// tensor a whole model's sparse layers write and read in turn. It is a BUFFER
+// and not a value: the reuse in `mla.py:180` works because a shared layer does
+// not overwrite what the preceding full layer left here.
+//
+// `valid_counts` has no upstream counterpart and is an ADAPTATION of the
+// harness, recorded rather than hidden. Upstream's selection is a fixed
+// `index_topk`-wide row padded with -1 (`sparse_attn_indexer.py:411` fills the
+// buffer with -1 before writing), so the count is implicit in the padding. Our
+// `vt::DsaTopkSelect` returns the count as a second tensor and
+// `MlaDecodeAttentionArgs` consumes it, so the count is part of the selection
+// here and has to be shared with it. Sharing one and not the other would let a
+// shared layer read a full layer's indices against its OWN row lengths.
+struct MlaSharedSelection {
+  vt::Tensor topk_indices;  // [max_tokens, index_topk] i32, device
+  vt::Tensor valid_counts;  // [max_tokens] i32, device
+  bool Empty() const {
+    return topk_indices.data == nullptr || valid_counts.data == nullptr;
+  }
+};
+
 struct MlaBlockMetadata {
   int64_t num_decode_tokens = 0;
   // The decode half's device tensors — `attn_metadata.decode.block_table` /
@@ -499,11 +567,22 @@ struct MlaBlockMetadata {
 //
 // `impl` is the decode backend (TritonMLAImpl on GB10); its `queue` is set to
 // `d.q` for the call, which is the wiring W4's recorded deviation (i) deferred.
+//
+// `shared` is upstream's per-model `topk_indices_buffer` (`deepseek_v2.py:1372`,
+// handed to every layer at `:1395`). Pass the SAME object to every layer of one
+// forward pass, in layer order. A full layer (`dims.has_indexer()`) WRITES its
+// selection into it; a shared layer (`dims.skip_topk`) READS whatever is there,
+// which is the preceding full layer's selection because nothing overwrote it.
+// `nullptr` is the ABSENT state and is what every caller that has no shared
+// layer passes: a full layer then keeps its selection in a block-local buffer
+// and behaves byte-identically to the pre-W4 code. A `skip_topk` layer with no
+// buffer is REFUSED rather than quietly attending densely.
 void ForwardMlaAttentionBlock(dense_attn::Dev d, const MlaBlockDims& dims,
                               const MlaBlockWeights& w, const vt::Tensor& hidden,
                               const vt::Tensor& positions, vt::Tensor& kv_cache,
                               const vt::Tensor& slot_mapping, const MlaBlockMetadata& meta,
-                              v1::TritonMLAImpl& impl, vt::Tensor& out);
+                              v1::TritonMLAImpl& impl, vt::Tensor& out,
+                              MlaSharedSelection* shared = nullptr);
 
 // The `kv_b_proj` up-projection callback W5 left OPEN (`MlaUpProjectFn`,
 // mla_chunked_context.h:228). Binds the model's `kv_b_proj` weight and the block

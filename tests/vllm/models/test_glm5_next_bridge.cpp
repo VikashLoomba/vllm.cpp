@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -47,6 +48,7 @@
 #include "vllm/model_executor/models/glm5_next_moe.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/cpu/cpu_quant_repack.h"
 #include "vt/quant.h"
 
 namespace {
@@ -59,6 +61,7 @@ using vllm::glm5_next::BridgeDsaLayer;
 using vllm::glm5_next::BridgedDsaLayer;
 using vllm::glm5_next::BridgedDsaLayerF32Bytes;
 using vllm::glm5_next::DecodeOwnedTensorToF32;
+using vllm::glm5_next::DecodeOwnedTensorRowsToF32;
 using vllm::glm5_next::HostF32Bytes;
 using vllm::glm5_next::IndexerDims;
 using vllm::glm5_next::kBridgeTensorF32ByteCeiling;
@@ -460,6 +463,137 @@ TEST_CASE("glm5_next bridge: EVERY block dtype this build knows has a decoder") 
   // shape this repository names. The build carries 18 block encodings.
   CHECK(block_dtypes == 18);
   MESSAGE("block dtypes with a CPU decoder: " << block_dtypes);
+}
+
+TEST_CASE("glm5_next bridge: a REPACKED q8_0 buffer is refused rather than misread") {
+  // THE DEFECT THIS PINS, and it was measured on the real checkpoint before it
+  // was written. `GgufLoadPolicy::FromEnv` sets
+  // `quant_repack = keep_quant && !cpu_ref && vt::cpu::QuantRepackActive()`
+  // (`gguf_keep_quant.cpp`), and on an i8mm aarch64 box -- `dgx:gpu0`,
+  // `thor:gpu0`, `orin:gpu0`, which is EVERY box this row can run on --
+  // `QuantRepackActive()` is true. `OwnGgufQuantBlocks` then permutes an
+  // eligible q8_0 weight into the `block_q8_0x4` interleave and sets
+  // `OwnedTensor::repacked`, leaving the dtype at `kQ8_0` and the byte count
+  // UNCHANGED, because `sizeof(BlockQ8_0x4) == 4 * sizeof(BlockQ8_0)`.
+  //
+  // The two decode functions key on `t.dtype` alone. So every span check
+  // passes, `BlockToFloat(kQ8_0)` reads the interleave as plain blocks, and the
+  // bridge returns finite, plausible, WRONG floats with no error. On this
+  // checkpoint that is all 346 Q8_0 tensors -- both mHC mixers on all 45
+  // layers, the whole KDA gate chain, and the DSA/indexer projections.
+  //
+  // The interleave is architecture-INDEPENDENT and always compiled
+  // (`cpu_quant_repack.h`), so this case reproduces the layout on x86 even
+  // though `QuantRepackActive()` is false there and the loader would never
+  // produce it. That is deliberate: the defect is only REACHABLE on aarch64,
+  // and a guard that could only be tested on aarch64 would not be tested.
+  constexpr int64_t kRows = vt::cpu::kQ8_0xNrowsInterleaved;  // 4
+  constexpr int64_t kCols = 2 * 32;                           // two whole blocks
+  constexpr int64_t kNumel = kRows * kCols;
+
+  std::vector<float> src(static_cast<size_t>(kNumel));
+  for (int64_t r = 0; r < kRows; ++r) {
+    for (int64_t c = 0; c < kCols; ++c) {
+      // Distinct per row AND per column, so a permutation cannot coincide with
+      // the original by symmetry.
+      src[static_cast<size_t>(r * kCols + c)] =
+          static_cast<float>(1 + r) * (0.5F + 0.25F * static_cast<float>(c));
+    }
+  }
+
+  const vt::cpu::FromFloatFn quantize = vt::cpu::BlockFromFloat(vt::DType::kQ8_0);
+  REQUIRE(quantize != nullptr);
+  const size_t row_bytes = vt::RowSizeBytes(vt::DType::kQ8_0, kCols);
+  std::vector<uint8_t> plain(static_cast<size_t>(kRows) * row_bytes);
+  for (int64_t r = 0; r < kRows; ++r) {
+    quantize(src.data() + r * kCols, plain.data() + static_cast<size_t>(r) * row_bytes,
+             kCols);
+  }
+
+  // The truth: the PLAIN blocks decoded by the same decoder the bridge uses.
+  const vt::cpu::ToFloatFn decode = vt::cpu::BlockToFloat(vt::DType::kQ8_0);
+  REQUIRE(decode != nullptr);
+  std::vector<float> truth(static_cast<size_t>(kNumel));
+  decode(plain.data(), truth.data(), kNumel);
+
+  // The same quants and the same fp16 deltas, permuted into the i8mm layout.
+  std::vector<uint8_t> woven(plain.size());
+  vt::cpu::InterleaveQ8_0Rows4(
+      reinterpret_cast<const vt::cpu::BlockQ8_0*>(plain.data() + 0 * row_bytes),
+      reinterpret_cast<const vt::cpu::BlockQ8_0*>(plain.data() + 1 * row_bytes),
+      reinterpret_cast<const vt::cpu::BlockQ8_0*>(plain.data() + 2 * row_bytes),
+      reinterpret_cast<const vt::cpu::BlockQ8_0*>(plain.data() + 3 * row_bytes),
+      reinterpret_cast<vt::cpu::BlockQ8_0x4*>(woven.data()), kCols / 32);
+  REQUIRE(woven.size() == plain.size());
+
+  // THE HAZARD ITSELF, asserted on the RAW decoder so it stays true whatever
+  // the bridge does: reading the interleave as plain blocks is not a rounding
+  // difference, it is a different tensor. Without this line the refusal below
+  // could be read as pedantry about a flag.
+  std::vector<float> misread(static_cast<size_t>(kNumel));
+  decode(woven.data(), misread.data(), kNumel);
+  int64_t differing = 0;
+  double worst = 0.0;
+  for (int64_t i = 0; i < kNumel; ++i) {
+    const double d = std::fabs(static_cast<double>(misread[static_cast<size_t>(i)]) -
+                               static_cast<double>(truth[static_cast<size_t>(i)]));
+    if (d > 1e-6) ++differing;
+    worst = std::max(worst, d);
+  }
+  CHECK(differing > kNumel / 2);
+  CHECK(worst > 1.0);
+
+  OwnedTensor t;
+  t.dtype = vt::DType::kQ8_0;
+  t.rank = 2;
+  t.shape[0] = kRows;
+  t.shape[1] = kCols;
+  t.bytes.assign(woven.size(), 0U);
+  std::memcpy(t.bytes.data(), woven.data(), woven.size());
+  t.repacked = true;
+
+  // Both entry points, because a guard on only one of them leaves the streamed
+  // `lm_head` and the expert rows reading the interleave.
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "hc_attn_fn"),
+                       doctest::Contains("repacked"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(t, "hc_attn_fn"),
+                       doctest::Contains("hc_attn_fn"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorRowsToF32(t, "hc_attn_fn", 0, 1),
+                       doctest::Contains("repacked"), std::runtime_error);
+
+  // The CUDA coalesced-load layout and the elementwise [K,N] transpose are the
+  // same class of hazard and the same silence, so they are refused too.
+  OwnedTensor aligned = t;
+  aligned.repacked = false;
+  aligned.q8_0_aligned = true;
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(aligned, "attn_q_b"),
+                       doctest::Contains("q8_0_aligned"), std::runtime_error);
+  OwnedTensor kn;
+  kn.dtype = vt::DType::kF32;
+  kn.rank = 2;
+  kn.shape[0] = kRows;
+  kn.shape[1] = kCols;
+  kn.bytes.assign(static_cast<size_t>(kNumel) * sizeof(float), 0U);
+  kn.elem_kn_repacked = true;
+  CHECK_THROWS_WITH_AS(DecodeOwnedTensorToF32(kn, "o_proj"),
+                       doctest::Contains("elem_kn_repacked"), std::runtime_error);
+
+  // AND THE GUARD IS NOT A BLANKET REFUSAL. The same tensor with the PLAIN
+  // bytes and the flag clear decodes, and decodes to the truth -- so a fix that
+  // simply refused every q8_0 weight would red here.
+  OwnedTensor ok = t;
+  std::memcpy(ok.bytes.data(), plain.data(), plain.size());
+  ok.repacked = false;
+  const std::vector<float> got = DecodeOwnedTensorToF32(ok, "hc_attn_fn");
+  REQUIRE(got.size() == static_cast<size_t>(kNumel));
+  for (int64_t i = 0; i < kNumel; ++i) {
+    CHECK(got[static_cast<size_t>(i)] == truth[static_cast<size_t>(i)]);
+  }
+  const std::vector<float> row2 = DecodeOwnedTensorRowsToF32(ok, "hc_attn_fn", 2, 1);
+  REQUIRE(row2.size() == static_cast<size_t>(kCols));
+  for (int64_t c = 0; c < kCols; ++c) {
+    CHECK(row2[static_cast<size_t>(c)] == truth[static_cast<size_t>(2 * kCols + c)]);
+  }
 }
 
 TEST_CASE("glm5_next bridge: a SHORT elementwise byte span is refused") {

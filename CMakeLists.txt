@@ -748,6 +748,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/model_loader/gguf_expert_span.cpp
   src/vllm/model_executor/expert_streamer.cpp
   src/vllm/model_executor/device_expert_slot_store.cpp
+  src/vllm/model_executor/expert_stream_seam.cpp
   src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
@@ -817,7 +818,11 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/glm5_next_attn.cpp
   src/vllm/model_executor/models/glm5_next_mhc.cpp
   src/vllm/model_executor/models/glm5_next_moe.cpp
+  src/vllm/model_executor/models/glm5_next_kv.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
+  src/vllm/model_executor/models/glm_moe_dsa.cpp
+  src/vllm/model_executor/models/glm_moe_dsa_loader.cpp
+  src/vllm/model_executor/models/glm_moe_dsa_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
   src/vllm/model_executor/models/interfaces.cpp
@@ -834,6 +839,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/glm5_next_bridge.cpp
   src/vllm/model_executor/models/glm5_next_layer.cpp
   src/vllm/model_executor/models/glm5_next_forward.cpp
+  src/vllm/model_executor/models/glm5_next_diag.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
   src/vllm/model_executor/models/muse_glimmer_mm.cpp

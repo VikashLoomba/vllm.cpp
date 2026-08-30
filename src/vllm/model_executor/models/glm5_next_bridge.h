@@ -49,17 +49,25 @@
 // write that loop itself, and the ceiling below will refuse it one tensor
 // before it gets there.
 //
-// ─── O19 / #2260: THIS BRIDGE CANNOT MAKE THE MOE THROW REACHABLE ────────────
+// ─── O19 / #2260: THE MOE THROW IS GONE, AND THIS BRIDGE NEVER REACHED IT ────
 //
-// O19 records that the moment this row routes the experts through
+// O19 recorded that the moment this row routes the experts through
 // `layers::MlpGateUpMethodBase` / `vt::MergedGemmGroup` on CUDA,
-// `MoeGateUpSwiGLUGroupedCuda` throws: neither IQ2_XS nor IQ4_XS is in
+// `MoeGateUpSwiGLUGroupedCuda` throws: neither IQ2_XS nor IQ4_XS was in
 // `IsCudaKeepQuantSupported`, and 85 of this artifact's tensors are those two
 // types. W5's MoE deliberately reaches only `vt::MoeRouterTopK` /
 // `vt::MoeCombine` with host GEMM loops for that reason.
 //
-// This file cannot make that throw reachable, and it is gated rather than
-// argued:
+// **That throw no longer exists.** #2260 landed `DotIQ2XS` and `DotIQ4XS` and
+// wired both into all three CUDA keep-quant dispatch switches, so the fused
+// seam now serves these two encodings instead of refusing them. What still
+// stops this model reaching any of it is one level up and is this row's own:
+// `Glm5NextHostForward` refuses a non-CPU queue by name, because every
+// primitive here is host f32. So the paragraph below is UNCHANGED in force --
+// this file still cannot reach the fused MoE seam -- and only its reason has
+// moved from "the seam would throw" to "the seam is never called from here".
+//
+// It is gated rather than argued:
 //
 //   * **Structurally.** There is no overload taking `Glm5NextMoeWeights`,
 //     `Glm5NextMlpWeights` or any expert bank. The bridge's whole surface is

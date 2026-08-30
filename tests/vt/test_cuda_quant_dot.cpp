@@ -1411,16 +1411,25 @@ TEST_CASE("CUDA device codebooks == the CPU host tables (byte-exact)") {
   seal("d_iq2xxs_grid", snap->iq2xxs_grid, vt::cpu::kIq2xxsGrid, sizeof(snap->iq2xxs_grid));
   seal("d_iq3xxs_grid", snap->iq3xxs_grid, vt::cpu::kIq3xxsGrid, sizeof(snap->iq3xxs_grid));
   seal("d_iq2s_grid", snap->iq2s_grid, vt::cpu::kIq2sGrid, sizeof(snap->iq2s_grid));
+  // QUANT-CUDA-IQ4XS-IQ2XS. d_iq2xs_grid is the one table here a SIBLING could
+  // be mistaken for and still index in range: iq2xxs (256), iq2xs (512) and
+  // iq2s (1024) all hold 8 bytes per entry, so a kernel reading the wrong one
+  // returns a plausible magnitude rather than misbehaving.
+  seal("d_iq2xs_grid", snap->iq2xs_grid, vt::cpu::kIq2xsGrid, sizeof(snap->iq2xs_grid));
+  seal("d_kvalues_iq4nl", snap->kvalues_iq4nl, vt::cpu::kValuesIq4nl,
+       sizeof(snap->kvalues_iq4nl));
   seal("d_kvalues_mxfp4", snap->kvalues_mxfp4, vt::cpu::kValuesMxfp4,
        sizeof(snap->kvalues_mxfp4));
   // Say how many tables were examined: a seal that compared nothing would
   // otherwise print the same "SUCCESS!" as one that compared all eight.
   CAPTURE(sealed);
-  CHECK(sealed == 8);
+  CHECK(sealed == 10);
   // And the extents themselves, so a snapshot that silently shrank is a failure
   // rather than a shorter memcmp that trivially passes.
   CHECK(sizeof(snap->iq1s_grid) == sizeof(vt::cpu::kIq1sGrid));
   CHECK(sizeof(snap->iq1xxxs_grid) == sizeof(vt::cpu::kIq1xxxsGrid));
   CHECK(sizeof(snap->iq2s_grid) == sizeof(vt::cpu::kIq2sGrid));
+  CHECK(sizeof(snap->iq2xs_grid) == sizeof(vt::cpu::kIq2xsGrid));
+  CHECK(sizeof(snap->kvalues_iq4nl) == sizeof(vt::cpu::kValuesIq4nl));
 }
 #endif  // VLLM_CPP_CUDA

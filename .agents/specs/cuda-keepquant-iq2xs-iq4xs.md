@@ -187,6 +187,47 @@ instruction in `docs/FEATURES.md` and `docs/USAGE.md` is therefore kept and its
 REASON is corrected, because a record correction that leaves a wrong reason
 standing is not a correction.
 
+## Evidence
+
+### Host pre-check of the ported math, before any lease was spent
+
+`nvcc` is not on the x86 development box, so a bad port would otherwise have
+been found only after a queue and a build on the leased GB10. The two new
+`__device__` functions were therefore EXTRACTED from
+`src/vt/cuda/cuda_quant_dot.cu` by line range — the exact bytes that will be
+compiled for the device, not a retyped copy — compiled by `g++` with `__device__`
+and `__constant__` defined away, given the GENERATED `cuda_quant_iq_tables.cuh`
+as their codebooks, and run against the oracle's own numbers:
+
+```text
+iq2_xs block 0: got 0x3FED7254 (1.85505152)    oracle 0x3FED7254  BIT-EXACT
+iq2_xs block 1: got 0xBE366684 (-0.178125441)  oracle 0xBE366684  BIT-EXACT
+iq2_xs block 2: got 0xBF0B2FD5 (-0.543698609)  oracle 0xBF0B2FD5  BIT-EXACT
+iq2_xs block 3: got 0x3FAC2A65 (1.34504378)    oracle 0x3FAC2A65  BIT-EXACT
+iq4_xs block 0: got 0xC084FEC1 (-4.15609789)   oracle 0xC084FEC1  BIT-EXACT
+iq4_xs block 1: got 0xBFC39E5A (-1.52827001)   oracle 0xBFC39E5A  BIT-EXACT
+iq4_xs block 2: got 0x3E173704 (0.147670805)   oracle 0x3E173704  BIT-EXACT
+iq4_xs block 3: got 0x3FFF0F4C (1.99265432)    oracle 0x3FFF0F4C  BIT-EXACT
+iq2_xs k=1024: tree 0x401E9BFF  oracle-seq 0x401E9C00  margin 2.38e-07  bound 1.87e-06
+iq4_xs k=1024: tree 0xC062D199  oracle-seq 0xC062D19B  margin 4.77e-07  bound 3.73e-06
+bad=0
+```
+
+**Say what this is and what it is not.** It is `x86_64` `g++`, not `sm_121a`
+`nvcc`, so it measures the ALGORITHM and not the device: it cannot see a wrong
+`__constant__` qualifier, a misaligned device read, a launch that never happens,
+or a codebook that failed to reach the GPU. It settles the port's arithmetic
+against the pinned oracle before a lease is spent, and the device gates settle
+the rest. It also confirmed the k=1024 design decision: the warp tree's order
+and the oracle's sequential order differ by ONE ULP on both encodings, so
+asserting bit equality against the oracle's total would have been red on the
+device for a reason that is not a defect.
+
+The generated `d_iq2xs_grid` was checked a second way, independently of the
+device seal: its 512 entries serialized little-endian FNV-1a-64 to
+`0xc9b1ee61e79909bd`, the digest `cpu_quant_iq_tables.h` states for `kIq2xsGrid`
+and `test_ops_quant_dot` re-derives.
+
 ## Risks
 
 - **A number from `thor:gpu0` is not a number for `dgx:gpu0`.** `sm_110` and

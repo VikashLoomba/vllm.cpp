@@ -279,6 +279,41 @@ carried FP8 half is widened at load, which would move the 8.23 GiB row, and the
 real resident total from `ReportDeepseekV4Exl3Residency` on the box. 90.82 GiB is
 a packed byte count taken from headers, not a residency measurement.
 
+### THE ARTIFACT'S HEAD IS NOT THE SHAPE W1b BUILT FOR
+
+W1b implemented the draft forward against vLLM's `nvidia/mtp.py`, whose checkpoint
+carries `enorm`, `hnorm`, `e_proj`, `h_proj`, `shared_head` and `hc_head_*`
+(`_rewrite_spec_layer_name`, :504-508). `DeepseekV4MtpHostWeights` mirrors exactly
+that.
+
+The SparkInfer artifact this row would gate on carries something else. Its 32
+non-expert tensors per head are, in full: `attn.{attn_sink, kv_norm.weight,
+q_norm.weight, wq_a, wq_b, wkv, wo_a, wo_b}`, `attn_norm.weight`,
+`ffn.gate.{weight, bias}`, `ffn.shared_experts.w{1,2,3}`, `ffn_norm.weight`,
+`hc_attn_{fn, base, scale}`, `hc_ffn_{fn, base, scale}`, and --
+**`main_norm.weight` and `main_proj.weight`**. There is no `enorm`, no `hnorm`,
+no `e_proj`, no `h_proj`, no `shared_head`, and no `hc_head_*`.
+
+`main_proj.weight` is `F8_E4M3 [4096, 12288]`, i.e. `[H, 3H]`. That is not
+DeepSeek-V3's fused `eh_proj`, which is `[H, 2H]` over
+`concat(enorm(embed), hnorm(hidden))`. A THIRD hidden-width input goes into this
+projection and this spec does not yet know what it is. `hc_attn_fn` is
+`[24, 16384]`, so `hc_mult = 4` and `(2 + hc) * hc = 24` -- the head carries its
+own MHC mixing, per-block rather than the single `hc_head` collapse our struct
+holds.
+
+**Nothing here should be mapped onto our struct by name similarity.** Guessing
+that `main_proj` is `eh_proj` with an extra stream would produce a head that runs,
+emits finite logits, and drafts badly -- and because MTP is lossless by
+construction, the OUTPUT would still be correct, so the only symptom would be an
+acceptance rate nobody can explain. That is the most expensive shape of wrong
+available here.
+
+What settles it is the producer, not inference: the artifact was quantized by
+`exllamav3` (this row's registered secondary oracle) at rev `787d1582`, and
+`main_proj` appears nowhere in this tree. Reading that source is a precondition
+for R1c, and R1c is not startable until it is read.
+
 ### R1b — why there is no host float tower for the head
 
 Arithmetic first, because it removes an option rather than choosing one. One
@@ -347,7 +382,7 @@ which is what separates "the function works" from "anything reaches it".
 | W1c gate | `test_deepseek_v4_mtp` (finite + RED-first + lossless verify) | DONE |
 | R1a inventory | the loader CLASSIFIES the `mtp.*` tail instead of only counting it (`ClassifyDeepseekV4MtpTail`); fp8-block at 128x128 and MXFP4 at group 32 are recognised, anything else is reported by name | DONE |
 | R1b routing | the tail is routed to BORROWED views (`RouteDeepseekV4MtpTail`) and dequantized one tensor at a time (`DequantizeDeepseekV4MtpTensor`); the residency question is answered by keeping it quantized, NOT by a host float tower | DONE |
-| R1c head assembly | drive the routed views into a draft forward: which tensors the head needs, in what order, and where the experts live at run time | RESIDUAL |
+| R1c head assembly | drive the routed views into a draft forward. BLOCKED, not merely residual: the artifact's head carries `main_norm`/`main_proj` `[H, 3H]` and no `enorm`/`hnorm`/`e_proj`/`h_proj`, so the mapping onto `DeepseekV4MtpHostWeights` is unknown and must be read out of `exllamav3` rather than guessed | BLOCKED |
 | R2 decode-loop | DS4-native propose/verify over `ForwardResidentDecodeGguf` (stash residual, draft k=1, verify) | RESIDUAL |
 | R3 engine register | wire `DeepSeekV4MTP` as the engine speculator (C++ analogue of registry.py:617) | RESIDUAL |
 | R4 device draft | device MTP forward for decode-graph speed | RESIDUAL |

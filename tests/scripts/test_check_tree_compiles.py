@@ -341,9 +341,14 @@ class ReportTests(ScratchProject):
 INERT_PYTHON3 = """\
 #!/usr/bin/env bash
 # Every record checker succeeds; the compile gate returns what the test chose.
+# Each invocation of the compile gate is LOGGED, because how many times preflight
+# runs it is itself under test: the discovered `scripts/check-*.py` sweep runs
+# every name not listed in NAMED_CHECKERS, and a second run of this one is a
+# second full -fsyntax-only pass rather than a cheap usage error.
 for arg in "$@"; do
   case "$arg" in
     */check-tree-compiles.py|check-tree-compiles.py)
+      [ -n "${VLLM_TEST_COMPILE_LOG:-}" ] && printf '%s\\n' "$*" >> "$VLLM_TEST_COMPILE_LOG"
       exit "${VLLM_TEST_COMPILE_RC:-0}" ;;
   esac
 done
@@ -368,6 +373,14 @@ class PreflightMappingTests(unittest.TestCase):
         stub = self.tmp / "bin" / "python3"
         stub.write_text(INERT_PYTHON3, encoding="utf-8")
         stub.chmod(0o755)
+        self.invocations = self.tmp / "compile-gate.log"
+        # The scratch `scripts/` must CONTAIN the checker, or the discovered
+        # `scripts/check-*.py` sweep has nothing to find and the double-run case
+        # below would pass over a sweep that never ran.
+        (self.tmp / "scripts" / "check-tree-compiles.py").write_text(
+            "# stand-in; the stub python3 above decides the exit code\n",
+            encoding="utf-8",
+        )
 
         self.git("init", "--quiet", ".")
         self.git("config", "user.email", "tree-compiles@test.invalid")
@@ -388,6 +401,8 @@ class PreflightMappingTests(unittest.TestCase):
         environment = dict(os.environ)
         environment["PATH"] = f"{self.tmp / 'bin'}{os.pathsep}{environment['PATH']}"
         environment["VLLM_TEST_COMPILE_RC"] = rc
+        environment["VLLM_TEST_COMPILE_LOG"] = str(self.invocations)
+        self.invocations.write_text("", encoding="utf-8")
         result = subprocess.run(
             ["bash", str(self.script), "--quiet", "--no-require-role"],
             cwd=self.tmp,
@@ -412,6 +427,34 @@ class PreflightMappingTests(unittest.TestCase):
         report = self.preflight("1")
         self.assertIn("FAIL", self.compile_line(report), report)
         self.assertNotIn("All gates green.", report.text, report)
+
+    def test_preflight_runs_the_compile_gate_exactly_once(self) -> None:
+        """The discovered sweep must not start a second compile pass.
+
+        RED before `check-tree-compiles.py` joined `NAMED_CHECKERS`: the
+        `scripts/check-*.py` sweep runs every name that list does not carry, so
+        the gate ran twice. For the four names already on that list the second
+        run is a cheap argparse usage error. For this one it is a second full
+        `-fsyntax-only` pass at -j8 -- 65 s, 39 units and 531 MB measured -- and
+        it starts while the first has only just finished. Parallel builds have
+        OOM-killed this box before.
+        """
+
+        report = self.preflight("0")
+        runs = [
+            line
+            for line in self.invocations.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(
+            1,
+            len(runs),
+            f"preflight invoked the compile gate {len(runs)} time(s):\n"
+            + "\n".join(runs)
+            + f"\n{report}",
+        )
+        # Precondition: the one run is the deliberate block, which passes a base.
+        self.assertIn("--base", runs[0], report)
 
     def test_exit_two_reports_skip_and_denies_the_green_banner(self) -> None:
         report = self.preflight("2")

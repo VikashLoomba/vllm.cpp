@@ -63,7 +63,18 @@ FAIL_ON_SKIP=0
 # Checkers the range and trailer blocks below invoke WITH arguments. The
 # discovered sweep skips these names so a gate that already ran properly is not
 # re-run bare and reported as a usage skip.
-NAMED_CHECKERS="check-agent-record.py check-commit-style.py check-commit-trailers.py check-now-current.py"
+#
+# check-tree-compiles.py is here for a HARDER reason than tidiness, and it is
+# here because the omission cost a run. The sweep runs every `scripts/check-*.py`
+# bare, so a name missing from this list executes TWICE. For the four names above
+# the second run is a cheap usage error. For this one it is a second full
+# `-fsyntax-only` pass at -j8: measured 65 s, 39 units and 531 MB RSS on a branch
+# behind main, started while the first pass had just finished, on a box already
+# at load 157 from other agents' builds. The run it was added to died there
+# without writing an exit line. Parallel builds have OOM-killed this box before,
+# and a gate that spawns a second copy of its own compiler is that hazard wearing
+# a checker's name.
+NAMED_CHECKERS="check-agent-record.py check-commit-style.py check-commit-trailers.py check-now-current.py check-tree-compiles.py"
 # ON by default: an undeclared session is a FAILING gate. The mutation suite
 # anchors on THIS line (`^REQUIRE_ROLE=1$`) and refuses any line-anchored
 # assignment of zero, quoted or not, so a silent revert of the default goes red

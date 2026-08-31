@@ -153,12 +153,21 @@ things keep that out of here.
   every time, so a zero is visible as a zero rather than inferred from silence.
 - An unresolvable base is exit `2`, not exit `0` with an empty diff. A base that
   cannot be read is the `CANNOT-VERIFY` arm.
-- The scope is a union with the staged and unstaged diffs, so a moved base
-  narrows the committed component but cannot empty the set for work in hand.
+- The scope is a union with the staged, unstaged and untracked diffs, so a moved
+  base cannot empty the set for work in hand.
+- The committed component is `git diff <base> <head>`, TWO dots, and that is
+  deliberate. Two dots is symmetric, so when `origin/main` moves ahead the files
+  main changed enter the scope as well. Three dots (`base...head`) would restrict
+  it to the branch's own side and read smaller and cleaner -- and would be blind
+  to exactly the `08fa2f5aa` shape, where main's header change is what breaks the
+  branch's code.
 
-It stays true that a base which moves *forward past your own commits* narrows the
-range. That is the same exposure every range gate in preflight already carries,
-it is stated here rather than argued away, and §Owed names it.
+**That symmetry has a measured cost, and it is the opposite of a silent skip.**
+Run on this row's own branch, which changes no C++ file at all, after `main` had
+moved ahead: 30 changed paths, 11 C++ sources, 39 translation units, 65 s. The
+gate got wider as the branch fell behind, not narrower. A reader sees it,
+because every one of those counts prints. The repair is to merge `main`, which
+is what a branch that far behind owes anyway.
 
 ## Tests
 
@@ -181,13 +190,18 @@ exists:
 8. A TU that does not preprocess is checked anyway. It exists at the base, is
    not in the diff, and the diff is a header edit that breaks nothing, so the
    only route to a non-zero exit is the forced inclusion.
+9. Preflight runs the gate EXACTLY ONCE. Executed against a scratch `scripts/`
+   that contains the checker, so the discovered `scripts/check-*.py` sweep has
+   something to find; the stub `python3` logs every invocation and the case
+   counts them.
 
 Mutations, each applied to a scratch copy and restored under a sha256 check:
 delete the reverse-include closure and case 2 must fail; turn the exit-2 arm
 into exit 0 and cases 4 and 5 must fail; drop `-Werror` from the reconstructed
 command and case 1 must fail; fold the uncompiled sources into the compiled
 total and the un-run case must fail; drop the forced inclusion and case 8 must
-fail; delete preflight's call site and case 7 must fail.
+fail; delete preflight's call site and case 7 must fail; drop
+`check-tree-compiles.py` from preflight's `NAMED_CHECKERS` and case 9 must fail.
 
 ## Risks
 
@@ -197,6 +211,16 @@ fail; delete preflight's call site and case 7 must fail.
 - **Parallelism on a shared box.** `-fsyntax-only` allocates far less than a
   codegen-and-link job, and jobs default to half the CPU count capped at 8.
   Parallel agent builds have OOM-killed this box before.
+- **The gate must not spawn a second copy of itself, and it did.** Preflight's
+  discovered `scripts/check-*.py` sweep runs every name absent from
+  `NAMED_CHECKERS`, so the first wiring executed this gate TWICE: once from its
+  own block with a base, and again bare from the sweep. For the four names
+  already on that list a second run is a cheap argparse usage error; here it was
+  a second full `-fsyntax-only` pass at `-j8` -- 65 s, 39 units, 531 MB RSS --
+  begun as the first finished, on a box at load average 157. The preflight run
+  that found it died at exactly that point without writing an exit line. The
+  name is now on the list and `test_preflight_runs_the_compile_gate_exactly_once`
+  counts the invocations rather than reading the list.
 - **A wide header change costs minutes, on EVERY preflight run.** `3bfd1a738`
   touched a core `vt` header and reaches 783 TUs; a whole-campaign range reaches
   789 and took 4.1 min measured. That is the correct answer for that change and

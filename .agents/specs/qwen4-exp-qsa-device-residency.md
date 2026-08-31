@@ -142,7 +142,70 @@ Stop and report rather than widening scope if:
 
 ## Now
 
-Implementation in flight on `row/MODEL-MM-QWEN4-EXP-QSADEV`.
+Landed on `row/MODEL-MM-QWEN4-EXP-QSADEV`, PR #2422. The device arm is UNMEASURED
+— see `## Owed`.
+
+## Evidence
+
+Host: `mudler-ubuntu-box`, x86-64, g++ 13.3.0, `-DCMAKE_BUILD_TYPE=Release`,
+Ninja, no CUDA in the build. Tree at `97f51f1ad` plus this spec. Every exit
+status below was read from the command's own `$?`, never through a pipe.
+
+### The CPU gate, green and stable
+
+`ninja -j 4 test_qwen4_exp_qsa_block test_qwen4_exp_qsa_device
+test_qwen4_exp_layer_loop test_qwen4_exp_runner` → **rc 0**.
+
+| suite | rc | cases | assertions |
+|---|---|---|---|
+| `test_qwen4_exp_qsa_block` | 0 | 13 / 13 | 5937 / 5937 |
+| `test_qwen4_exp_qsa_device` | 0 | 12 / 12 | 4697 / 4697 |
+| `test_qwen4_exp_layer_loop` | 0 | 6 / 6 | 309 / 309 |
+| `test_qwen4_exp_runner` | 0 | 5 / 5 | 136 / 136 |
+
+Reproduced identically three times. The oracle case reports
+`max|diff| = 0.00982457 against a bound of 0.03`, unmoved from the base SHA, which
+is what "byte-identical on CPU" predicts: on a CPU queue every operand is `kCPU`,
+so `StageHostWords` takes its memcpy arm.
+
+### A FALSE RED, and how it was caught
+
+The FIRST run of this gate was red: `test_qwen4_exp_layer_loop` 4/6, with the
+oracle at `max|diff| = 0.33274` and the by-name case reporting `group-2 rows
+written = {}`. It was not the change. **The mutation harness's dry runs had been
+applied and reverted while `ninja` was still compiling**, so the object for
+`qwen4_exp_forward.cpp` was built from a tree that had M1 applied — the
+production QSA call site deleted. Both symptoms are M1's signature exactly, which
+is what identified it.
+
+It was settled by measurement rather than by argument: the three touched files
+were reverted to the base SHA `4ab04afd6`, rebuilt and rerun (`rc 0`, 6/6,
+309/309), then restored and rebuilt (`rc 0`, 6/6, 309/309). **Never run a
+mutation against a live build.** A build that races a mutation produces a binary
+no source in the tree corresponds to, and it reads as a defect in the change.
+
+### The mutations
+
+Applied one at a time, each with a full rebuild and no other build running, each
+reverted with `git checkout --` and confirmed byte-for-byte by
+`git diff --exit-code` (rc 0). Applied-ness is proven by a COUNTED property, not
+by a patch exit code.
+
+| # | mutation | counted property | result |
+|---|---|---|---|
+| **M1** | REACHABILITY. Delete the production call site — the `RunQwen4ExpQsaBlockPaged` call in `qwen4_exp_forward.cpp`'s layer loop. Not the block. | `count("RunQwen4ExpQsaBlockPaged")` 1 → 0 | `test_qwen4_exp_layer_loop` **RED**, rc 1, 4/6 — including `qwen4_exp layer loop: ModelRegistry::Forward reaches it on a loaded qwen4exp GGUF`. `test_qwen4_exp_runner` stayed GREEN, so that suite does not gate reach into this block. |
+| **M2** | Is the new host read on the path at all? Make `StageHostWords`' CPU arm copy nothing. | `count("std::memcpy(dst, src, bytes);")` 1 → 0 | `test_qwen4_exp_qsa_block` **RED** rc 1, 2/13; `test_qwen4_exp_layer_loop` **RED** rc 1, 1/6 |
+| **M3** | Does the ROPE probe's staged read reach real data? M2 cannot answer it — with the memcpy gone all three buffers stay zero and zeros agree with zeros. Stage `cos` out of the `sin` table instead. | `count("StageHostWords(d, cos, r * rot, rot,")` 1 → 0 | Both suites **RED**, rc 1, with the intended message: `the PACKED cos_sin cache and the SEPARATE cos/sin tables do not describe the same angles` |
+
+M1 answers `AGENTS.md` "Nothing lands dead" for the BLOCK. It does not answer it
+for the device branch, which no queue can reach today; `## Owed` says so.
+
+**The mutations were applied in the reviewed worktree, not a scratch copy, and
+that is a deviation from [`reachability.md`](../reachability.md).** A scratch copy
+needs its own build tree — CMake caches absolute source paths — and one clean
+build of this tree took about 100 minutes on a box at load 130. Each mutation was
+reverted and confirmed byte-for-byte before the next, and the final tree is
+`git diff --exit-code` clean against `HEAD`.
 
 ## Owed
 

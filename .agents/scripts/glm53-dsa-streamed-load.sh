@@ -148,7 +148,8 @@ say "CONFIGURE"
 if ! stamp cfg; then
   cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES="$ARCH" \
-        -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_CUTLASS_DIR="$CUT" > "$OUT/cmake.log" 2>&1
+        -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_CUTLASS_DIR="$CUT" \
+        -DVLLM_CPP_FLASH_ATTN=ON > "$OUT/cmake.log" 2>&1
   rc=$?; note CONFIGURE $rc
   tail -12 "$OUT/cmake.log"
   [ "$rc" -ne 0 ] && { echo "FATAL: configure failed"; exit 93; }
@@ -159,6 +160,13 @@ grep -aE '^(VLLM_CPP_CUDA|VLLM_CPP_CUDA_ARCHITECTURES|VLLM_CPP_TRITON|VLLM_CPP_F
 # manifest is not an error line and it decides whether this model can take a
 # single step, so it is read out loud here rather than discovered at the throw.
 FA2LINE=$(grep -a 'FA2 compiled-arch manifest' "$OUT/cmake.log" | tail -1)
+case "$FA2LINE" in
+  *"manifest: []"*|"")
+    echo "FATAL: FA2 is NOT compiled in ($FA2LINE)."
+    echo "  MLA prefill on sm_121 IS FlashAttention and has no fallback below it,"
+    echo "  so loading 201.83 GiB first would only reach the same throw 866s later."
+    exit 94 ;;
+esac
 echo "### ${FA2LINE:-no FA2 manifest line in the configure log}"
 case "$FA2LINE" in
   *'manifest: []'*)

@@ -159,6 +159,30 @@ int64_t ConfidenceDraftLength(const std::vector<float>& xpre,
                               const std::vector<float>& proj_w, float threshold,
                               int64_t block, int64_t hidden, int64_t rank);
 
+// W-5, THE PROPOSE SIDE'S BOOKKEEPING.
+//
+// The shared `RejectionSampler` needs no new verify path: it already derives each
+// request's draft length from `cu_num_logits` as `cu[r+1] - cu[r]`
+// (`rejection_sampler.cpp:85-86`), which is exactly the shape the confidence cap
+// produces. So W-5 is the propose side plus this.
+//
+// Its contract, from the sampler's own header: row `cu[r]` holds the PREVIOUS
+// step's token and is never compared, and row `cu[r]+i+1` holds request r's i-th
+// draft. `MarkovDraftLoop` already returns `[seed, drafts...]` with the seed
+// first, so the seed IS that uncompared row and the block maps across unchanged.
+//
+// A confidence length of 0 is a REQUEST THAT SKIPS DRAFTING, not an error: it
+// contributes one row carrying the previous token, which yields the bonus token
+// alone and is a valid sampling row rather than an empty one.
+//
+//   drafted   per request, `MarkovDraftLoop`'s output: [seed, d0, d1, ...]
+//   lengths   per request, the confidence-capped draft length in [0, block]
+//   out_cu    [num_reqs + 1] cumulative row offsets
+//   returns   `draft_sampled`, flat over requests
+std::vector<int32_t> ProposeToVerifyInputs(
+    const std::vector<std::vector<int32_t>>& drafted,
+    const std::vector<int64_t>& lengths, std::vector<int32_t>* out_cu);
+
 // W-3, THE BLOCK'S WEIGHTS. A DSpark block IS a V4 decoder layer of the
 // compressor-less kind -- `DSparkAttention` with `compress_rate = None` over a
 // `BlockSparseMLP` with a shared expert and two `HyperConnection`s

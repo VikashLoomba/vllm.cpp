@@ -249,6 +249,20 @@ drafter's cache, and the o path. The first is preferable under
 should attempt first, and it must be gated by proving the trunk's own paths are
 byte-unchanged when the new mode is off.
 
+W-5's BOOKKEEPING LANDED. `ProposeToVerifyInputs` maps a drafted block onto the
+shared sampler's inputs: `cu[r+1] - cu[r]` is `1 + length`, and row `cu[r]` is the
+previous token, uncompared. `MarkovDraftLoop` already returns `[seed, drafts...]`
+with the seed first, so the seed IS that row and the block maps across unchanged.
+
+A confidence length of 0 contributes exactly one row rather than none. That is a
+request skipping the round, and it still yields the bonus token; giving it zero
+rows would desynchronise every later offset, which is why the gate checks a
+three-request case with a zero in the middle.
+
+Three mutations run red: the seed row dropped, `cu` stopping accumulating, and a
+zero-length request contributing nothing. NO verify path was added, as recorded
+when the sampler's contract was read.
+
 W-3's ATTENTION HALF LANDED. `DsparkBlockAttentionHost` drives the SAME
 `AttentionBlock` the trunk uses, with `kv_prewritten` on so the rows
 `BlockKvRows` wrote from the projected taps are attended rather than overwritten.

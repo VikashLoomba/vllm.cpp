@@ -666,3 +666,75 @@ TEST_CASE("W-3: a block carrying a compressor is REFUSED") {
   CHECK(msg.find("COMPRESSOR-LESS") != std::string::npos);
   CHECK(msg.find("sliding") != std::string::npos);
 }
+
+// ── W-5: the propose side's bookkeeping ─────────────────────────────────────
+
+TEST_CASE("W-5: cu_num_logits is 1 + the draft length, per request") {
+  // The sampler derives each request's length as `cu[r+1] - cu[r]`
+  // (`rejection_sampler.cpp:85-86`), and row `cu[r]` is the previous token,
+  // uncompared. `MarkovDraftLoop` returns `[seed, drafts...]`, so the seed IS
+  // that row.
+  const std::vector<std::vector<int32_t>> drafted{
+      {7, 11, 12, 13, 14, 15},  // seed 7, five drafts
+      {9, 21, 22, 23, 24, 25},
+  };
+  const std::vector<int64_t> lengths{5, 2};  // the second request was capped
+  std::vector<int32_t> cu;
+  const auto flat = vllm::dspark::ProposeToVerifyInputs(drafted, lengths, &cu);
+
+  REQUIRE(cu.size() == 3u);
+  CHECK(cu[0] == 0);
+  CHECK(cu[1] == 6);   // 1 + 5
+  CHECK(cu[2] == 9);   // + 1 + 2
+  REQUIRE(flat.size() == 9u);
+  // Request 0: seed then all five drafts.
+  CHECK(flat[0] == 7);
+  CHECK(flat[5] == 15);
+  // Request 1: seed then only the two the confidence cap kept.
+  CHECK(flat[6] == 9);
+  CHECK(flat[7] == 21);
+  CHECK(flat[8] == 22);
+}
+
+TEST_CASE("W-5: a length of 0 is a request that SKIPS drafting, not an error") {
+  // One row carrying the previous token yields the bonus token alone, which is a
+  // valid sampling row. Treating it as empty would give the request zero rows and
+  // desynchronise every later offset.
+  const std::vector<std::vector<int32_t>> drafted{{4, 5, 6}, {8, 9, 10}};
+  const std::vector<int64_t> lengths{0, 2};
+  std::vector<int32_t> cu;
+  const auto flat = vllm::dspark::ProposeToVerifyInputs(drafted, lengths, &cu);
+  REQUIRE(cu.size() == 3u);
+  CHECK(cu[0] == 0);
+  CHECK(cu[1] == 1);  // exactly the previous token
+  CHECK(cu[2] == 4);
+  REQUIRE(flat.size() == 4u);
+  CHECK(flat[0] == 4);   // the skipped request's seed survives
+  CHECK(flat[1] == 8);
+}
+
+TEST_CASE("W-5: cu is CUMULATIVE, so a short request does not shift the rest") {
+  // Three requests at different caps. The offsets must accumulate, since the
+  // sampler indexes rows by them and an off-by-one would compare one request's
+  // drafts against another's logits.
+  const std::vector<std::vector<int32_t>> drafted{
+      {1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
+  const std::vector<int64_t> lengths{3, 0, 1};
+  std::vector<int32_t> cu;
+  const auto flat = vllm::dspark::ProposeToVerifyInputs(drafted, lengths, &cu);
+  REQUIRE(cu.size() == 4u);
+  CHECK(cu[0] == 0);
+  CHECK(cu[1] == 4);
+  CHECK(cu[2] == 5);
+  CHECK(cu[3] == 7);
+  CHECK(static_cast<int32_t>(flat.size()) == cu.back());
+}
+
+TEST_CASE("W-5: a length past the drafted block REFUSES") {
+  // The confidence cap cannot exceed the block the loop produced; a length that
+  // does would name drafts nobody sampled.
+  const std::vector<std::vector<int32_t>> drafted{{1, 2, 3}};
+  std::vector<int32_t> cu;
+  CHECK_THROWS(vllm::dspark::ProposeToVerifyInputs(drafted, {3}, &cu));
+  CHECK_THROWS(vllm::dspark::ProposeToVerifyInputs(drafted, {-1}, &cu));
+}

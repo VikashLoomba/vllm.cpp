@@ -1750,9 +1750,15 @@ bool IsCudaKeepQuantSupported(DType dt, WType* out) {
     case DType::kIQ1_XXXS: *out = WType::kIQ1_XXXS; return true;
     // QUANT-CUDA-IQ4XS-IQ2XS (#2260). Without these two the GLM-5.3-Flash
     // UD-Q2_K_XL artifact's 82 IQ2_XS + 3 IQ4_XS tensors drained the stream and
-    // ran their expert GEMM on the host — correct tokens at CPU speed, which no
-    // token gate can see — and the fused MoE seam below THREW outright, which is
-    // why that model shipped as `--device cpu`. IQ4_XS alone also completes the
+    // ran their expert GEMM on the host, and the fused MoE seam below THREW
+    // outright, which is why that model shipped as `--device cpu`.
+    //
+    // The fallback below is worse than "slow but correct", and this is MEASURED
+    // rather than read off its own comment: `Backend::Alloc` on CUDA is a plain
+    // `cudaMalloc`, so its pointers are not host-addressable, and the CPU kernel
+    // dereferencing them SEGFAULTS. A GB10 run of this file's gate at the commit
+    // before these two lines died with SIGSEGV in the first case. Unified
+    // PHYSICAL memory is not the same thing as a host-mapped pointer. IQ4_XS alone also completes the
     // GLM-5.3 non-flash UD-IQ1_S arm, whose other five encodings are all above.
     case DType::kIQ2_XS: *out = WType::kIQ2_XS; return true;
     case DType::kIQ4_XS: *out = WType::kIQ4_XS; return true;

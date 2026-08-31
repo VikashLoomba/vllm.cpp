@@ -26,8 +26,8 @@ exists:
 
 | Seam | Today, for these two dtypes |
 |---|---|
-| `MatmulBTQuantKernelCuda` | `cudaStreamSynchronize`, then the CPU kernel over the same unified tensors. Correct numbers, host speed, and **not capturable** — the sync invalidates a decode graph. |
-| `MatmulBTQuantGroupedKernelCuda` | the same drain-and-fall-back. |
+| `MatmulBTQuantKernelCuda` | `cudaStreamSynchronize`, then the CPU kernel over the same tensors. **MEASURED on GB10: this SEGFAULTS** when the tensors came from `vt::Backend::Alloc`, which is a plain `cudaMalloc` and is not host-addressable. Where the memory *is* host-accessible it is instead correct, host-speed and **not capturable** — the sync invalidates a decode graph. |
+| `MatmulBTQuantGroupedKernelCuda` | the same drain-and-fall-back, with the same two outcomes. |
 | `MoeGateUpSwiGLUGroupedCuda` | **throws** `gate/up must be the SAME CUDA keep-quant dtype`. There is no fallback behind that seam. |
 
 `gguf_keep_quant.cpp::DeviceKeepQuantSupported` returns `true` for every dtype
@@ -197,6 +197,87 @@ REASON is corrected, because a record correction that leaves a wrong reason
 standing is not a correction.
 
 ## Evidence
+
+### The device gate, on `dgx:gpu0` (GB10, `sm_121a`) -- attempt 2
+
+**Which box.** `rc-worker-4b8lj` under an `rc` lease on `dgx:gpu0`:
+`NVIDIA GB10, GPU-cb5c11ff-4ea1-5472-a9a6-c7a468a4d9f1`, driver `580.173.02`,
+aarch64, 20 cores, `nvcc` release 13.0 V13.0.88, built
+`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`. 2026-08-31T02:59:21Z to 03:24:55Z.
+**No number here transfers to `thor:gpu0`**, which is `sm_110`.
+
+Arch proof, with its denominator: **37 `.cu.o` objects scanned, 37 `sm_121a`
+cubins and nothing else.**
+
+| Leg | commit | build | test | cases | assertions |
+|---|---|---|---|---|---|
+| RED | `52daeecea` | 0 | **139 (SIGSEGV)** | 0 passed, 1 failed, 14 skipped | 66000, 0 failed |
+| GREEN | `2c5dec2e4` | 0 | 1 | 15 passed, **2 failed** | 177284, **5 failed** |
+| MUT_A fused switch | +mutation | 0 | **1** | 13 passed, **4 failed** | 177047, 5 failed |
+| MUT_B dense switch | +mutation | 0 | **1** | 13 passed, **4 failed** | **71589**, 0 failed |
+| RESTORED | `2c5dec2e4` | 0 | 1 | 15 passed, 2 failed | 177284, 5 failed |
+
+**Reachability mutations: both killed, kill count 2 cases each.** GREEN fails 2
+cases (the IQ4_XS rounding, below). Deleting the two `case` labels from the
+FUSED MoE switch takes that to 4; deleting them from the DENSE switch also takes
+it to 4, and drops the assertion count from 177284 to **71589**, because the
+`default:` arm throws by name and aborts the cases mid-run rather than letting
+them finish wrong. Two switches, two separate deletions, two separate kills --
+one deletion would have proved only the site it deleted. Each restore was
+verified byte-identical by sha256 AND rebuilt before being believed, and
+RESTORED reproduces GREEN's counts exactly (177284 / 5 / 15), which is what shows
+the restore was real and not a stale binary.
+
+**Sibling suites on the same box:** `test_ops_quant_dot` 249323 assertions, 0
+failed; `test_gguf_dequant` 0 failed; `test_ops_quant_traits` 7400, 0 failed;
+`test_gguf_keep_quant` **9 failed of 6470** -- BASE-CAUSED, see below.
+
+**The three gates `agent-preflight.sh` skips for want of a build all PASS here**
+on real data: `check-cuda-fat-gencode` 0, `check-cpu-isa-build` 0,
+`check-arm-isa-build` 0 -- the last of those being asked its real question,
+since this box is aarch64.
+
+### `test_gguf_keep_quant`'s 9 failures are the CUDA PLATFORM, not this change
+
+All nine are the same assertion shape:
+`RouteGgufTensor(..., GgufTensorRole::kEmbeddingTable, ...) == kKeepQuant`
+returning `kExpandBf16`. The gather arm's device gate is
+`DeviceQuantGatherSupported(dev) { return dev == vt::DeviceType::kCPU; }`, and
+`RouteGgufTensor` reads `CurrentPlatform().device_type()` -- which on a CUDA
+build running on GB10 is `kCUDA`. The suite encodes the CPU platform's answer.
+
+This row changes neither file: `git diff` over
+`gguf_keep_quant.cpp` and `test_gguf_keep_quant.cpp` between the merged `main`
+and this head is EMPTY. It is a pre-existing property of running that suite on a
+CUDA build, and it is reported rather than repaired because the repair is a
+decision about that suite's platform assumptions, not a kernel port's.
+
+### The RED leg SEGFAULTED, and that corrects a claim this spec made
+
+The RED commit crashed with `SIGSEGV` in the FIRST case rather than failing the
+fused-MoE assertion this row predicted. The reason matters more than the
+prediction: `vt::Backend::Alloc` on CUDA is a plain `cudaMalloc`
+(`cuda_backend.cu:104-107`), so its pointers are **not host-addressable**, and
+`MatmulBTQuantKernelCuda`'s fallback -- `cudaStreamSynchronize` then the CPU
+keep-quant kernel over the same tensors -- dereferences device memory on the
+host.
+
+**So "an absent dtype falls back to the CPU and returns correct tokens at host
+speed" is not what happens for device-allocated tensors. It crashes.** This spec
+and this row's earlier commit messages asserted the slow-but-correct story, and
+that story was read off the source comment at
+`cuda_quant_dot.cu` ("over the SAME unified-memory tensors"), never measured. It
+holds only when the caller's memory really is host-accessible; GB10 has unified
+physical memory, which is not the same thing as a `cudaMalloc` pointer being
+host-mapped.
+
+**What is NOT established, and is not claimed:** what the production loader
+allocates for a kept-quant weight. If it is managed memory the production
+fallback works and is merely slow; if it is `cudaMalloc` it crashes. This row
+did not trace it, so it says so instead of guessing, and the correction is
+limited to what was measured. Either way it strengthens rather than weakens the
+case for #2260, and it is the same shape as the extraction lesson below: a
+confident reading of a comment, standing in for a measurement.
 
 ### The host pre-check below CANNOT SEE A MISSING DECLARATION, and it did not
 

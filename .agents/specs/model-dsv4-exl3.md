@@ -2303,6 +2303,25 @@ which is precisely how this landed green locally in the first place.
   streaming. Coalescing cannot borrow the mmap directly: an OUT split
   interleaves ranks along trellis dim 1, so some copy is inherent and the fix is
   to make the destination device-resident rather than host-resident.
+
+  **The mechanism already exists in this tree, which makes this a port rather
+  than a design.** Two loaders stage weights into a `cudaMalloc` buffer on
+  `OwnedTensor::d_dev` and then release the host bytes:
+  `StageKimiResidentBf16` (`kimi_linear.h:378-382`, per-tensor stage-then-release
+  interleaved with each direct load) and Qwen3.5's adoption path
+  (`qwen3_5_weights.cpp:360-402`), whose non-host-addressable branch is exactly
+  the CUDA case here -- it keeps `d_dev` and leaves the borrow alone. The EXL3
+  coalescer would do the same to each TP1-coalesced trellis tensor as it
+  produces it, so the ~82 GiB is never resident on the host twice, and
+  `Exl3Linear` / `Exl3MoeMlp` would build their `vt::Tensor`s over the device
+  pointer instead of the host owner buffer. The refusal at
+  `deepseek_v4.cpp:1295-1302` then has nothing left to refuse.
+
+  Sizing, from the measured load: 81.952 GiB has to fit in device allocations on
+  a ~119 GiB GB10 beside the 15.726 GiB carried host tower, KV and activations.
+  Stage-then-release per tensor is what keeps the peak near the total rather than
+  near twice it, which is why the interleaving in the Kimi helper matters and is
+  not an implementation detail.
 - **The MTP NVFP4 draft experts.** Skipped-and-counted today (see `## Evidence`);
   no row owns reaching them yet.
 - Upstream's own `ext.reconstruct` run against the W1a anchors, so the

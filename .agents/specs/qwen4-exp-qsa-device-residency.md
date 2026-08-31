@@ -5,7 +5,14 @@
 **Parent spec:** [`qwen4-exp-flash-next.md`](qwen4-exp-flash-next.md), which carries
 this work under `## Owed` as "the QSA CUDA arm must give the translation a
 device-side home or argue it away".
-**Base:** `origin/main` at `4ab04afd66f0eb385c48cc2833817db2192219f4`
+**Base:** `origin/main` at `84f6fac0a`. **Rebased from `4ab04afd6`, and the
+rebase changed what this row can claim.** At the old base a CUDA `qwen4_exp` step
+was unavailable at the LOADER, so the device branch would have landed unreached.
+Both keystones have since merged: #2396 made `DeviceQuantGatherSupported` read
+`vt::OpRegistered(vt::OpId::kEmbeddingQuant, dev)` instead of `dev == kCPU`, and
+#2391 registered the four missing `vt::` `kCUDA` arms. So the refusals this
+change removes are now genuinely reachable from `ModelRegistry::Forward` on a
+`--device cuda` queue.
 
 ## Scope
 
@@ -209,24 +216,25 @@ reverted and confirmed byte-for-byte before the next, and the final tree is
 
 ## Owed
 
-- **THE DEVICE BRANCH LANDS UNREACHED, and AGENTS.md "Nothing lands dead" is
-  satisfied by naming it here rather than by a claim that it is reached.** On a
-  CPU queue every operand is `kCPU`, so `StageHostWords` takes its memcpy arm and
-  the `Backend::Copy` arm never runs. No queue of any other type can reach the
-  block today, and the reason is at the LOADER, before a single `vt::` op
-  dispatches: `src/vllm/model_executor/models/qwen4_exp_weights.cpp:658-670`
-  throws for any device where `DeviceQuantGatherSupported` is false, and that
-  predicate is `return dev == vt::DeviceType::kCPU;`
-  (`src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:167-169`). It is
-  keyed on the device alone, so a float GGUF hits it identically, and the
-  safetensors arm throws unconditionally (`qwen4_exp_registry.cpp:826-830`).
-  Owning row: `MODEL-MM-QWEN4-EXP`. The wiring is owned by
-  [#2083](https://github.com/mudler/vllm.cpp/issues/2083) / PR #2396 (the loader
-  gate) and [#2380](https://github.com/mudler/vllm.cpp/issues/2380) / PR #2391
-  (four missing `vt::` CUDA arms);
-  [#2421](https://github.com/mudler/vllm.cpp/issues/2421) tracks this slice. The
-  CUDA case in `test_qwen4_exp_qsa_block.cpp` measures it the moment a device is
-  available and says `UNMEASURED` until then.
+- **(SUPERSEDED BY THE REBASE.)** This entry read "THE DEVICE BRANCH LANDS
+  UNREACHED" and was correct at base `4ab04afd6`: the loader threw for any device
+  where `DeviceQuantGatherSupported` was false, and that predicate was
+  `return dev == vt::DeviceType::kCPU;`. It is kept, struck, because a reader
+  scanning for "is this dead code" needs to be sent forward rather than told
+  something false. **#2396 replaced that predicate with
+  `vt::OpRegistered(vt::OpId::kEmbeddingQuant, dev)` and #2391 registered the
+  four missing `vt::` `kCUDA` arms**, so a CUDA queue now reaches this block and
+  the `Backend::Copy` arm is on a production path. What remains owed is the
+  MEASUREMENT, below.
+- **NO DEVICE RUN IS RECORDED IN THIS SPEC YET.** On a CPU queue every operand is
+  `kCPU`, so `StageHostWords` takes its memcpy arm and the `Backend::Copy` arm
+  does not run; the CPU gate therefore cannot see the device branch at all, and
+  its greenness is evidence of no regression rather than of the fix. The two CUDA
+  cases — `test_qwen4_exp_qsa_block.cpp`'s block-level parity case and
+  `test_qwen4_exp_layer_loop.cpp`'s `ModelRegistry::Forward` case — each report
+  `UNMEASURED` on a build with no CUDA backend, which is what a CPU CI run
+  produces. Until a leased device runs them, **the predicted stop-point at
+  `CheckRopeLayoutsAgree` is a code read and nothing more.**
 - **THE SHIPPED CHECKPOINT WOULD NOT REACH THE QSA LAYER EITHER, for a worse
   reason than a refusal.** `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S stores
   tensors in IQ4_NL and Q5_0, neither of which `IsCudaKeepQuantSupported`

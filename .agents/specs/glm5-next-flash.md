@@ -4145,6 +4145,48 @@ Debts this row carries, each visible rather than waived:
 
 ## Now
 
+`ACTIVE`, 2026-08-31. **The routed-expert GEMM is on the shared keep-quant seam,
+and the device arm is scoped as three waves rather than one debt.** W9a
+(`CLAIM-GLM53-FLASH-W9A`, no issue number — see O31) moved
+`MoeForward`'s expert arm onto `vt::MoeGateUpSwiGLUGrouped` and
+`vt::MatmulBTQuantGrouped`, which was the last hand-rolled arithmetic in this
+model's MoE. The row's lifecycle state does not move, because O1 does not.
+
+**THE SCOPE CAME FROM A MEASUREMENT AND IT CHANGED THE DESIGN.** Every earlier
+statement about this model's device feasibility used an EXPANSION of the
+checkpoint against `dgx:gpu0`'s ~119.63 GiB. The artifact had never been weighed
+in the encoding it is stored in. It is **101.2446 GiB**, of which the 129
+routed-expert tensors are **94.6758 GiB** and everything else is **6.5688 GiB**.
+So it FITS keep-quant with 18.39 GiB of headroom; the Kimi-Linear
+"stage bf16-resident" shape does NOT fit, because widening only the non-expert
+tower costs +10.39 GiB — 56% of the headroom — to widen 6.5% of the model; and
+Q8_0, the one encoding with no device keep-quant GEMM, is 346 small projections
+totalling 0.8013 GiB and therefore not a blocker. §W9a carries the full census.
+
+**Gated on x86_64 at 13 cases / 9619 assertions** in `test_glm5_next_moe`, of
+which W9a's five are 8005, plus `test_glm5_next_bridge` at 20 / 32562 and the
+forward and layer suites unchanged. Five mutations, each applied to product code
+and killed by an assertion rather than by the compiler. Two are worth the next
+reader's attention. The REACHABILITY mutation is invisible to every band —
+delete the call site and both arms become the f32 arm, so the parity NMSE is
+exactly 0 — and only `GgufExpertSource::decoded()` sees it, because the
+keep-quant arm never consults the source. And dropping `swiglu_limit` SURVIVED
+the first suite: the fixture never drove a pre-clamp value past 10, so no case
+could see the clamp being removed. That was repaired rather than disclosed.
+
+**The CUDA arm of the seam is NOT reached from this model** and O31 says so.
+`glm5_next_forward.cpp:231-238` still refuses a non-CPU queue; **W9b** owns
+keep-quant residency and **W9c** owns the device forward, which is a campaign
+rather than a wave because the ~2,900 lines of this model's forward carry zero
+`vt::Tensor`. The device gate at the published MoE geometry is written and
+PENDING on `dgx:gpu0` and `thor:gpu0`, both queued behind other work; an untaken
+device gate is recorded as PENDING and never as a pass.
+
+The next actions are W6 (the vision tower, processor and placeholder expansion),
+W7b (the first fitting artifact), and W9b.
+
+### Before W9a
+
 `ACTIVE`, 2026-08-30. **The engine's guard above this model's forward no longer
 refuses it.** W5b-2c ([#2348](https://github.com/mudler/vllm.cpp/issues/2348),
 `CLAIM-GLM53-FLASH-W5B2C`) writes the consuming forward O28 measured the absence

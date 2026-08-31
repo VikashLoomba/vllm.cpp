@@ -1,0 +1,46 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:140:
+TEST CASE:  glm5_next bridge: ONE DSA layer is 0.4654 GiB, the tower is 426.72
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:145: MESSAGE: one bridged DSA layer = 499657728 B (0.465343 GiB)
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:164: MESSAGE: tower expanded 426.72 GiB vs block-resident 101.14 GiB vs box 119.63 GiB
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:168:
+TEST CASE:  glm5_next bridge: the 1 GiB ceiling separates the two populations
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:184: MESSAGE: ceiling 1 GiB sits between 0.25 GiB (o_proj) and 9 GiB (up_exps)
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:211:
+TEST CASE:  glm5_next bridge: a DSA layer bridges at the loader's own shapes
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:279: MESSAGE: miniature layer bridged: 33664 B
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:431:
+TEST CASE:  glm5_next bridge: EVERY block dtype this build knows has a decoder
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:465: MESSAGE: block dtypes with a CPU decoder: 18
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:682:
+TEST CASE:  glm5_next bridge: an expert ROW is 32 MiB where the BANK is 9.0 GiB
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:711: MESSAGE: one expert 0.09375 GiB, one layer's banks 27 GiB, all sparse layers 1134 GiB, box ~119.63 GiB
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:848:
+TEST CASE:  glm5_next bridge: ONLY the SELECTED experts are decoded
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:923: MESSAGE: router selected 2 of 4 experts for 1 token
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_bridge.cpp:975: MESSAGE: over 6 tokens the router filled 12 slots from 2 distinct experts
+
+===============================================================================
+[doctest] test cases:    20 |    20 passed | 0 failed | 0 skipped
+[doctest] assertions: 32562 | 32562 passed | 0 failed |
+[doctest] Status: SUCCESS!

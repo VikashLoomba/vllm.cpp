@@ -1817,15 +1817,23 @@ TEST_CASE("Scheduler: a finished request's encoder entry becomes freeable and is
 // For the length of the window the slots are pinned, and `can_allocate` refuses
 // admissions the cache in fact has room for.
 //
-// WHY THE STEP BUDGET IS SPENT TO ZERO. The preempting step must NOT reach the
-// waiting loop. That loop would re-visit the victim (a preemption prepends it to
-// the waiting FRONT) and either re-reference the entry through
-// `check_and_update_cache` or drop it through the `allocate_slots` failure
-// untouch (scheduler.py:938-939) — and BOTH arms converge on the same counter
-// whether or not `preempt_request` freed anything, which is exactly a test that
-// cannot see the defect. So the hog's decode chunk is sized to consume the whole
-// token budget, `while (!waiting->empty() && token_budget > 0)` is false, and
-// the only thing that touched the encoder cache this step is the preemption.
+// WHY THE WAITING LOOP MUST NOT RUN, AND WHAT ACTUALLY STOPS IT. The loop would
+// re-visit the victim (a preemption prepends it to the waiting FRONT) and either
+// re-reference the entry through `CheckAndUpdateCache` or drop it through the
+// `allocate_slots` failure untouch (`free_request_encoder_inputs`,
+// scheduler.cpp:939; scheduler.py:938-939) — and BOTH arms converge on the same
+// counter whether or not `preempt_request` freed anything, which is exactly a
+// test that cannot see the defect. What keeps the loop out is the guard, not the
+// token budget: `Scheduler::schedule` wraps the whole waiting section in
+// `if (preempted_reqs.empty())` (scheduler.cpp:849), which sits BEFORE
+// `while (!waiting->empty() && token_budget > 0)` (scheduler.cpp:855). A step
+// that preempted anything can never reach the loop, whatever the budget is.
+// Upstream is identical at the pin (5559679229): `if not preempted_reqs and
+// self._pause_state == PauseState.UNPAUSED:` (scheduler.py:668). So the sizing
+// below buys the step's SHAPE — one decode chunk, one preemption, one 4-embed
+// item — and it does not buy the loop's skip. Re-sizing it does not disarm this
+// case, and a reviewer who widens the budget will still see both assertions go
+// red when the free in `preempt_request` is deleted.
 // ---------------------------------------------------------------------------
 TEST_CASE("Scheduler.schedule: preemption RELEASES the victim's encoder cache slots") {
   // Budget 16 == one block, so a single decode chunk spends the whole step.
@@ -1877,9 +1885,10 @@ TEST_CASE("Scheduler.schedule: preemption RELEASES the victim's encoder cache sl
   REQUIRE(out.num_scheduled_tokens.at("hog") == 16);
   REQUIRE(img->status == RequestStatus::kPreempted);
   REQUIRE(img->num_computed_tokens == 0);
-  // INSTRUMENT PRECONDITION: the budget is spent, so the waiting loop did not
-  // run and did not touch the victim's encoder references. Without this the two
-  // assertions below would read the resume rather than the preemption.
+  // INSTRUMENT PRECONDITION: this step preempted, so the `preempted_reqs.empty()`
+  // guard (scheduler.cpp:849) skipped the waiting loop and nothing touched the
+  // victim's encoder references after `preempt_request`. Without that skip the
+  // two assertions below would read the resume rather than the preemption.
   REQUIRE(out.num_scheduled_tokens.count("img") == 0);
   REQUIRE(scheduler->waiting->peek_request() == img);
 

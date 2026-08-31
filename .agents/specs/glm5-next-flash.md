@@ -2200,7 +2200,10 @@ what that file would contain is already in this tree and already runs on a GPU.
 
 **The falsified sentence, quoted so it is not softened.** §W9c says the six
 forward files "carry ZERO `vt::Tensor`" and concludes "**This is why the
-DeepSeek-V4 shape does not apply**". Counted on `0b4766c96`:
+DeepSeek-V4 shape does not apply**". Counted on `0b4766c96`, and every count
+and anchor in this section RE-MEASURED after merging `origin/main` at `28d521f90`
+-- because a merge that falsifies its own branch's prose is a failure this
+repository has already paid for:
 
 | file | lines | `vt::Tensor` | `vt::` COMPUTE-op call sites |
 |---|---:|---:|---:|

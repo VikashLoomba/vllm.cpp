@@ -178,12 +178,28 @@ Throughput is claimed only at W-6, against the target's own recipe: 384k context
 
 ## 6. Owed
 
-- **W-2 IS UNREACHED.** `vllm::dspark::StreamMeanTap` and
-  `vllm::dspark::ProjectTaps` land with their gate and nothing else calls them:
-  no production entry point reaches the drafter, because the drafter does not
-  exist yet. This row owns the wiring, and W-1 (the tap seam on the trunk) is the
-  first caller. Recorded here rather than left for a reader to discover, as
-  `AGENTS.md` §"Nothing lands dead" requires of a staged slice.
+- **The trunk's tap gate cannot see the REDUCTION.** Deleting the trunk's tap fill
+  reds `test_deepseek_v4_mtp`, and ordering the taps by layer instead of by request
+  reds it too, so the seam and its order are gated. But mutating `StreamMeanTap`
+  from a mean to a sum leaves that file green: a uniform factor preserves
+  non-triviality, per-layer difference and ordering alike. The mean is pinned only
+  in `test_deepseek_v4_dspark_entry.cpp`, so a change that replaced the trunk's
+  call with an inline reduction of its own would pass both. Closing this needs the
+  trunk to expose the pre-mean stack, or the tap to be compared against an
+  independently computed one.
+
+- **W-1 AND W-2 ARE NOT REACHED FROM PRODUCTION, and the distinction is worth
+  being exact about.** The tap fill now lives INSIDE `ForwardComposeImpl`, which
+  is production code, and it calls `dspark::StreamMeanTap`. But it is inert unless
+  a caller passes a `TapRequest`, and the only caller that does is
+  `DeepseekV4TrunkTapsHost`, which the drafter's gate drives and nothing else.
+  `ProjectTaps` has no caller at all.
+
+  So by `AGENTS.md` §"Nothing lands dead" this is still a staged slice: no
+  production entry point -- not `include/vllm.h`, the loader,
+  `ModelRegistry::Forward`, nor any registered server or CLI path on its default
+  configuration -- reaches either function, because the drafter they exist for is
+  not built yet. This row owns the wiring; W-3 is the first production caller.
 
 - The row's own GitHub issue, once the account is restored.
 - The real-artifact load, which is blocked on `MODEL-DSV4-EXL3` W1c-4's

@@ -38,6 +38,7 @@
 // quant_block == nope_head_dim (one block) at tiny width. Each reuses the SAME
 // landed primitive math the device kernels will call.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_dspark.h"
 #include "vllm/model_executor/models/deepseek_v4_probe.h"
 
 #include <chrono>
@@ -2488,7 +2489,8 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                                              const std::vector<int32_t>& logits_indices,
                                              V4Miswire miswire, V4ForwardTrace* trace,
                                              const V4Backend& be,
-                                             std::vector<float>* mtp_residual_out = nullptr) {
+                                             std::vector<float>* mtp_residual_out = nullptr,
+                                             dspark::TapRequest* taps = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = p.hidden_size;
   const int64_t hc = p.hc_mult;
@@ -2620,6 +2622,38 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
       DumpAct(nm, Slice(x, 0, H));  // #188 per-sub-op diff: routed+shared MoE output [H]
     }
 
+    // DSV4-DSPARK-DRAFTER W-1: the trunk tap. The drafter's entry reads the
+    // POST-block manifold state at `dspark_target_layer_ids`, which is this
+    // layer's output folded back through `MhcPost` -- the same state upstream
+    // exports after its residual add (`exllamav3/modules/transformer.py:198-203`)
+    // -- collapsed to `[T, H]` by its stream mean.
+    //
+    // Costs nothing when no caller asks: `taps` is null on every path but the
+    // drafter's, and the fold below runs only for a REQUESTED layer.
+    if (taps != nullptr) {
+      const auto it =
+          std::find(taps->layer_ids.begin(), taps->layer_ids.end(), layer);
+      if (it != taps->layer_ids.end()) {
+        std::vector<float> stack(static_cast<size_t>(T) * hc * H);
+        for (int64_t t = 0; t < T; ++t) {
+          const std::vector<float> folded =
+              MhcPost(Slice(x, t * H, H), Slice(residual, t * hc * H, hc * H),
+                      Slice(post_mix, t * hc, hc), Slice(res_mix, t * hc * hc, hc * hc),
+                      hc, H);
+          std::copy(folded.begin(), folded.end(),
+                    stack.begin() + static_cast<int64_t>(t) * hc * H);
+        }
+        // Stored AT the request's own index, not appended: the concatenation
+        // order in `main_proj` is the REQUEST order, and appending would order
+        // them by layer instead.
+        const size_t slot =
+            static_cast<size_t>(std::distance(taps->layer_ids.begin(), it));
+        if (taps->taps.size() != taps->layer_ids.size())
+          taps->taps.resize(taps->layer_ids.size());
+        taps->taps[slot] = dspark::StreamMeanTap(stack, T, hc, H);
+      }
+    }
+
     // coherence-debug #188: dump the [hc,H] manifold state AFTER this layer (the
     // MoE output folded back through MhcPost, matching ds4's `cur` after
     // layer_forward_self_one). t=0 only (single-token localization run).
@@ -2693,6 +2727,32 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
                                          V4Miswire miswire, V4ForwardTrace* trace) {
   return ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, miswire, trace,
                             V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr});
+}
+
+// DSV4-DSPARK-DRAFTER W-1: the drafter's trunk taps, host oracle.
+// Runs the SAME composition with the tap arm on, and returns one `[T, H]` stream
+// mean per requested layer, IN REQUEST ORDER -- which is the order `main_proj`
+// concatenates them in.
+std::vector<std::vector<float>> DeepseekV4TrunkTapsHost(
+    const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int64_t>& layer_ids) {
+  for (const int64_t l : layer_ids)
+    VT_CHECK(l >= 0 && l < p.num_hidden_layers,
+             "deepseek-v4 taps: layer " + std::to_string(l) +
+                 " is outside the model's " + std::to_string(p.num_hidden_layers) +
+                 " layers; `dspark_target_layer_ids` names trunk layers");
+  dspark::TapRequest req;
+  req.layer_ids = layer_ids;
+  (void)ForwardComposeImpl(hw, p, token_ids, positions, /*logits_indices=*/{},
+                           V4Miswire::kNone, /*trace=*/nullptr,
+                           V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr},
+                           /*mtp_residual_out=*/nullptr, &req);
+  VT_CHECK(req.taps.size() == layer_ids.size(),
+           "deepseek-v4 taps: the forward filled " + std::to_string(req.taps.size()) +
+               " of " + std::to_string(layer_ids.size()) +
+               " requested taps; a requested layer was never reached");
+  return req.taps;
 }
 
 // ─── DeepSeek-V4 MTP self-speculative draft head (host oracle, W1) ────────────

@@ -55,4 +55,31 @@ std::vector<float> ProjectTaps(const std::vector<std::vector<float>>& taps,
                                const std::vector<float>& main_norm_weight, float eps,
                                int64_t num_tokens, int64_t hidden);
 
+// W-1, THE TAP SEAM. What the trunk fills when a caller wants taps.
+//
+// `layer_ids` are the trunk layers to tap, upstream's `dspark_target_layer_ids`
+// ([40, 41, 42] in the artifact). `taps` comes back with ONE `[num_tokens,
+// hidden]` buffer per requested layer, IN THE ORDER REQUESTED -- that order is
+// load-bearing, because `main_proj`'s input columns are the taps concatenated in
+// exactly this order and a permutation is silent.
+//
+// A tap is taken from the layer's POST-block manifold state, the fold of that
+// layer's output back through `MhcPost`, which is the same state upstream exports
+// after its residual add. It is then collapsed by `StreamMeanTap`.
+struct TapRequest {
+  std::vector<int64_t> layer_ids;
+  std::vector<std::vector<float>> taps;  // filled by the forward
+};
+
 }  // namespace vllm::dspark
+
+namespace vllm {
+
+// W-1's public entry: run the trunk and collect its taps. One `[num_tokens,
+// hidden]` stream mean per requested layer, in REQUEST order.
+std::vector<std::vector<float>> DeepseekV4TrunkTapsHost(
+    const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int64_t>& layer_ids);
+
+}  // namespace vllm

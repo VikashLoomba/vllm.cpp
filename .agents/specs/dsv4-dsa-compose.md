@@ -449,7 +449,20 @@ Read before starting it, because two details change its shape
 So the remaining work is: an indexer-side cache, a second compressor cycle at
 `index_head_dim`, and a selection re-pointed from per-token keys to that cache.
 
-**Whether that cycle rotates is still UNKNOWN, and the cache layout is why.** The
+**RESOLVED: the indexer's cycle DOES rotate, by the same rule.** Both compressors
+go through the `compress_norm_rope_store_*` family, and the dispatch names the
+split explicitly: "cutedsl (head=512) accepts the full-cache flags; triton
+(indexer/AMD) does not" (`compressor.py:414-415`). The rope contract is stated
+directly above it (`:396-399`): applied to the LAST `rope_head_dim` elements of
+`head_dim`, at position `(positions // compress_ratio) * compress_ratio`. That is
+the same rule the attention compressor's fix implements.
+
+The cache-layout difference below is about STORAGE, not about whether rotation
+happens: the rotation is applied before the store, and the indexer's store
+quantizes the result. So it does not make the indexer an exception, and the
+earlier note that it left the question open is superseded.
+
+**The cache layouts still differ, and that matters for the store.** The
 attention compressor's cache carries an explicit bf16 area for the rotated rope
 tail (`fused_compress_quant_cache.py:293`). The indexer's does not: its
 `k_cache_head_dim` is a BYTE layout, `head_dim + head_dim / quant_block_size * 4`

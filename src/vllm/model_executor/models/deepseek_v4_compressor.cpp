@@ -178,4 +178,67 @@ std::vector<float> Fp8DsMlaDecodeToken(const Fp8DsMlaToken& token,
   return out;
 }
 
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286). See the header for the cycle's contract.
+std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
+                                       std::vector<float>* state_score,
+                                       const std::vector<float>& kv,
+                                       const std::vector<float>& score,
+                                       const std::vector<float>& ape,
+                                       const std::vector<int64_t>& positions,
+                                       const std::vector<float>& rms_weight, float eps,
+                                       int64_t compress_ratio, int64_t head_dim) {
+  VT_CHECK(state_kv != nullptr && state_score != nullptr,
+           "CompressorStepCycle: state buffers are required");
+  VT_CHECK(compress_ratio > 0 && head_dim > 0,
+           "CompressorStepCycle: compress_ratio and head_dim must be > 0");
+  const int64_t T = static_cast<int64_t>(positions.size());
+  VT_CHECK(static_cast<int64_t>(kv.size()) == T * head_dim &&
+               static_cast<int64_t>(score.size()) == T * head_dim,
+           "CompressorStepCycle: kv/score must be [num_tokens, head_dim]");
+  VT_CHECK(state_kv->size() == state_score->size(),
+           "CompressorStepCycle: the two state buffers must stay in lockstep");
+
+  // SAVE: the score carries the position-wrapped APE, the kv does not. Reusing
+  // the gated helper rather than re-deriving `position % compress_ratio` here.
+  const std::vector<float> scored =
+      CompressorSaveScoreApe(score, ape, positions, T, head_dim, compress_ratio);
+
+  std::vector<float> emitted;
+  for (int64_t t = 0; t < T; ++t) {
+    state_kv->insert(state_kv->end(), kv.begin() + t * head_dim,
+                     kv.begin() + (t + 1) * head_dim);
+    state_score->insert(state_score->end(), scored.begin() + t * head_dim,
+                        scored.begin() + (t + 1) * head_dim);
+
+    // BOUNDARY-ONLY EMISSION. `(position + 1) % compress_ratio == 0` is upstream's
+    // gate verbatim; a step that crosses none emits nothing, and a step that
+    // crosses several emits several -- which is why prefill and decode need no
+    // separate paths here.
+    const int64_t pos = positions[static_cast<size_t>(t)];
+    if ((pos + 1) % compress_ratio != 0) continue;
+
+    // The window that just CLOSED is the last `compress_ratio` rows of the state.
+    // `coff == 1`, so it is exactly one window with no overlap and no role split.
+    const int64_t have = static_cast<int64_t>(state_kv->size()) / head_dim;
+    const int64_t win = compress_ratio;
+    std::vector<float> wkv(static_cast<size_t>(win * head_dim), 0.0f);
+    std::vector<float> wsc(static_cast<size_t>(win * head_dim), 0.0f);
+    std::vector<uint8_t> valid(static_cast<size_t>(win), 0);
+    for (int64_t i = 0; i < win; ++i) {
+      const int64_t row = have - win + i;  // global row index into the state
+      if (row < 0) continue;               // masked: before the sequence began
+      valid[static_cast<size_t>(i)] = 1;
+      std::copy(state_kv->begin() + row * head_dim, state_kv->begin() + (row + 1) * head_dim,
+                wkv.begin() + i * head_dim);
+      std::copy(state_score->begin() + row * head_dim,
+                state_score->begin() + (row + 1) * head_dim, wsc.begin() + i * head_dim);
+    }
+    const std::vector<float> pooled =
+        CompressorPoolNorm(wkv, wsc, valid, rms_weight, eps, win, head_dim);
+    emitted.insert(emitted.end(), pooled.begin(), pooled.end());
+  }
+  return emitted;
+}
+
 }  // namespace vllm::deepseek_v4

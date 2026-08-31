@@ -30,6 +30,7 @@
 #include <limits>
 #include <vector>
 
+#include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -323,4 +324,205 @@ TEST_CASE("W5: the SLIDING WINDOW matches upstream's swa_only layer, and bounds 
   // THE WINDOW IS LOAD-BEARING: with kv_base=40 and win=8 the full-context answer
   // is a different function, so a no-op window could not pass this.
   CHECK(vs_full > 1e-3 * mag);
+}
+
+namespace {
+
+// A `MultiKvCacheIndex` over a name list, the way the runner builds one.
+struct FakeIndex {
+  std::vector<std::string> names;
+  vllm::MultiKvCacheIndex Index() const {
+    vllm::MultiKvCacheIndex mk;
+    mk.layer_names = &names;
+    return mk;
+  }
+};
+
+vllm::DeepseekV4Params SwaOnlyParams(int64_t layers, int64_t head_dim) {
+  vllm::DeepseekV4Params p;
+  p.num_hidden_layers = layers;
+  p.head_dim = head_dim;
+  p.compress_ratios.assign(static_cast<size_t>(layers), 0);  // every layer SWA-only
+  return p;
+}
+
+std::vector<vllm::PagedKvCache> FakeCaches(size_t n, int64_t head_dim,
+                                           std::vector<std::vector<float>>* storage) {
+  std::vector<vllm::PagedKvCache> v(n);
+  storage->assign(n, std::vector<float>(static_cast<size_t>(2 * 4 * head_dim), 0.0f));
+  for (size_t i = 0; i < n; ++i) {
+    v[i].data = (*storage)[i].data();
+    v[i].dtype = vt::DType::kF32;
+    v[i].num_blocks = 2;
+    v[i].block_size = 4;
+    v[i].num_kv_heads = 1;
+    v[i].head_size = head_dim;
+  }
+  return v;
+}
+
+}  // namespace
+
+TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every other") {
+  // `KV-DSV4-MULTICACHE` W5 (#2323). Every safety-critical decision of the paged
+  // engine path lives in this pure function, so that it is gateable WITHOUT a
+  // runner, a checkpoint or a GPU -- the same reason W1 made the staging budget
+  // pure. The registry adapter around it is glue.
+  //
+  // EACH REFUSAL GUARDS A SILENT WRONG ANSWER, not a crash: batching would attend
+  // the wrong history for every request but one, a compressor layer would attend
+  // the raw prefix instead of window-plus-compressed-history, and an unresolved
+  // name would drop a cache. All three produce plausible tokens.
+  const int64_t L = 3, HD = 32;
+  const vt::Device dev{vt::DeviceType::kCPU, 0};
+  std::vector<std::vector<float>> storage;
+  const auto caches = FakeCaches(static_cast<size_t>(L), HD, &storage);
+  FakeIndex fx;
+  for (int64_t l = 0; l < L; ++l)
+    fx.names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  const auto mk = fx.Index();
+  const auto params = SwaOnlyParams(L, HD);
+
+  // THE SERVED SHAPE: one request, every layer SWA-only, every name resolving.
+  std::vector<vt::Tensor> pages;
+  CHECK(vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 1, dev, &pages).empty());
+  REQUIRE(pages.size() == static_cast<size_t>(L));
+  for (const auto& t : pages) {
+    CHECK(t.rank == 3);
+    CHECK(t.shape[2] == HD);
+    CHECK(t.data != nullptr);
+  }
+
+  // 1. A BATCH refuses -- one `kv_base` cannot serve several context lengths.
+  pages.clear();
+  const std::string batched =
+      vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 2, dev, &pages);
+  CHECK(batched.find("one request per step only") != std::string::npos);
+  CHECK(pages.empty());
+
+  // 2. A COMPRESSOR layer refuses, naming the row that owns it.
+  auto with_comp = params;
+  with_comp.compress_ratios[1] = 128;
+  const std::string comp =
+      vllm::ResolveDeepseekV4SwaPages(with_comp, mk, caches, 1, dev, &pages);
+  CHECK(comp.find("has a compressor") != std::string::npos);
+  CHECK(comp.find("#2286") != std::string::npos);
+
+  // 3. AN UNRESOLVED NAME refuses rather than silently dropping that layer.
+  FakeIndex missing;
+  missing.names = fx.names;
+  missing.names[1] = "model.layers.1.attn.some_other_cache";
+  const auto mk_missing = missing.Index();
+  const std::string unresolved =
+      vllm::ResolveDeepseekV4SwaPages(params, mk_missing, caches, 1, dev, &pages);
+  CHECK(unresolved.find("no published cache named") != std::string::npos);
+
+  // 4. A WRONG head_size refuses -- the cache would be read at the wrong width.
+  auto wrong = caches;
+  wrong[2].head_size = HD / 2;
+  const std::string bad_width =
+      vllm::ResolveDeepseekV4SwaPages(params, mk, wrong, 1, dev, &pages);
+  CHECK(bad_width.find("head_size") != std::string::npos);
+}
+
+TEST_CASE("W1: two LSE-merged passes equal one pass over the union — sink in EXACTLY one") {
+  // `MODEL-DSV4-DSA-COMPOSE` W1 (#2286). Upstream attends a sparse layer with ONE
+  // fused two-cache kernel (`flash_mla_with_kvcache(k_cache=swa,
+  // extra_k_cache=compressed, ...)`). We have no such kernel, so W1 composes two
+  // `vt::MlaDecodeAttention` passes over DISJOINT key sets and merges them with
+  // `vt::MergeAttnStates`. This case is the proof that the composition is the
+  // same function -- written BEFORE the composition, because if it is not, W1
+  // needs a different design.
+  //
+  // AND IT PINS THE RULE THE DESIGN TURNS ON. A sink is one extra logit in the
+  // DENOMINATOR. The merge combines by LSEs, each `log sum exp(scores)`, so a
+  // sink seeded into BOTH passes is counted TWICE in the merged denominator --
+  // giving a plausible, slightly-too-small output that no token gate would catch.
+  // The second half of this case is that double-count, asserted to be WRONG.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 2, n_keys = 24;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  const std::vector<float> kv = Rand(static_cast<size_t>(n_keys * hd), 71u, 0.3f);
+  const std::vector<float> qv = Rand(static_cast<size_t>(nh * hd), 72u, 0.25f);
+  std::vector<float> sink(static_cast<size_t>(nh), -0.15f);
+  std::vector<float> none(static_cast<size_t>(nh), -std::numeric_limits<float>::infinity());
+
+  const int64_t block_size = 8;
+  const int64_t num_blocks = n_keys / block_size;
+  std::vector<float> cache(static_cast<size_t>(num_blocks * block_size * hd), 0.0f);
+  for (int64_t j = 0; j < n_keys; ++j)
+    for (int64_t d = 0; d < hd; ++d)
+      cache[static_cast<size_t>(j * hd + d)] = kv[static_cast<size_t>(j * hd + d)];
+  vt::Tensor t_c = Contig(cache.data(), vt::DType::kF32, q.device, {num_blocks, block_size, hd});
+  std::vector<int32_t> bt(static_cast<size_t>(num_blocks));
+  for (int64_t i = 0; i < num_blocks; ++i) bt[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  std::vector<int32_t> sl{static_cast<int32_t>(n_keys)};
+  vt::Tensor t_bt = Contig(bt.data(), vt::DType::kI32, q.device, {1, num_blocks});
+  vt::Tensor t_sl = Contig(sl.data(), vt::DType::kI32, q.device, {1});
+  vt::Tensor t_q = Contig(const_cast<float*>(qv.data()), vt::DType::kF32, q.device, {1, nh, hd});
+
+  // DISJOINT key sets, selected through the op's own selected-slot arm: evens
+  // and odds. Their union is every key, so a single pass over all of them is the
+  // reference.
+  std::vector<int32_t> even, odd;
+  for (int32_t j = 0; j < n_keys; ++j) (j % 2 == 0 ? even : odd).push_back(j);
+  auto run = [&](const std::vector<int32_t>& sel, const std::vector<float>& sk,
+                 std::vector<float>* out, std::vector<float>* lse) {
+    std::vector<int32_t> idx = sel;
+    std::vector<int32_t> cnt{static_cast<int32_t>(idx.size())};
+    vt::Tensor t_idx = Contig(idx.data(), vt::DType::kI32, q.device,
+                              {1, static_cast<int64_t>(idx.size())});
+    vt::Tensor t_cnt = Contig(cnt.data(), vt::DType::kI32, q.device, {1});
+    vt::Tensor t_sk = Contig(const_cast<float*>(sk.data()), vt::DType::kF32, q.device, {nh});
+    out->assign(static_cast<size_t>(nh * hd), 0.0f);
+    lse->assign(static_cast<size_t>(nh), 0.0f);
+    vt::Tensor t_o = Contig(out->data(), vt::DType::kF32, q.device, {1, nh, hd});
+    vt::Tensor t_l = Contig(lse->data(), vt::DType::kF32, q.device, {1, nh});
+    vt::MlaDecodeAttentionArgs a;
+    a.scale = scale;
+    a.attn_sink = &t_sk;
+    a.topk_indices = &t_idx;
+    a.valid_counts = &t_cnt;
+    vt::MlaDecodeAttention(q, t_o, &t_l, t_q, t_c, t_bt, t_sl, a);
+  };
+
+  std::vector<int32_t> all_keys;
+  for (int32_t j = 0; j < n_keys; ++j) all_keys.push_back(j);
+  std::vector<float> want, want_lse;
+  run(all_keys, sink, &want, &want_lse);   // the reference: ONE pass, ONE sink
+
+  auto merged = [&](const std::vector<float>& sink_b) {
+    std::vector<float> oa, la, ob, lb;
+    run(even, sink, &oa, &la);      // pass A carries the sink
+    run(odd, sink_b, &ob, &lb);     // pass B: -inf (correct) or the sink (the bug)
+    std::vector<float> out(static_cast<size_t>(nh * hd), 0.0f);
+    vt::Tensor t_out = Contig(out.data(), vt::DType::kF32, q.device, {1, nh, hd});
+    vt::Tensor t_pa = Contig(oa.data(), vt::DType::kF32, q.device, {1, nh, hd});
+    vt::Tensor t_pb = Contig(ob.data(), vt::DType::kF32, q.device, {1, nh, hd});
+    vt::Tensor t_la = Contig(la.data(), vt::DType::kF32, q.device, {nh, 1});
+    vt::Tensor t_lb = Contig(lb.data(), vt::DType::kF32, q.device, {nh, 1});
+    vt::MergeAttnStates(q, t_out, nullptr, t_pa, t_la, t_pb, t_lb, -1);
+    return out;
+  };
+
+  // CORRECT: the sink in exactly one pass, the other at -inf (no sink).
+  const std::vector<float> good = merged(none);
+  double worst = 0.0, mag = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(!std::isnan(good[i]));
+    mag = std::max(mag, std::abs(static_cast<double>(want[i])));
+    worst = std::max(worst, std::abs(static_cast<double>(want[i] - good[i])));
+  }
+  REQUIRE(mag > 1e-3);
+  CHECK(worst <= 1e-5 * mag);
+
+  // THE DOUBLE-COUNT IS WRONG, and this is why the rule is a rule: seeding the
+  // sink into BOTH passes still produces finite, plausible output.
+  const std::vector<float> doubled = merged(sink);
+  double bad = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    REQUIRE(!std::isnan(doubled[i]));
+    bad = std::max(bad, std::abs(static_cast<double>(want[i] - doubled[i])));
+  }
+  CHECK(bad > 1e-4 * mag);
 }

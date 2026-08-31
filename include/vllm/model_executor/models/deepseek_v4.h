@@ -533,6 +533,23 @@ struct DeepseekV4KvCache {
 // the cache and attends the new query over the full cached KV — token-IDENTICAL to
 // the full-recompute path (a pure equivalence: same tokens, ~ctx x fewer FLOPs).
 // `logits_indices` are LOCAL indices into the tokens passed THIS call.
+// KV-DSV4-MULTICACHE W5 (#2323): resolve the per-layer SWA pages this forward
+// will read, or REFUSE by name.
+//
+// PURE, and deliberately so -- the same reason W1 made the staging budget a pure
+// function "so it is gateable without a device". Every safety-critical decision
+// of the paged path lives here: one request only, SWA-only layers only, and
+// every published name resolving. The registry adapter is then thin glue, and
+// these refusals are gateable without a runner, a checkpoint or a GPU.
+//
+// Returns an empty string on success and fills `out_pages`; otherwise returns
+// the refusal message and leaves `out_pages` untouched.
+std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
+                                      const MultiKvCacheIndex& multi_kv,
+                                      const std::vector<PagedKvCache>& attn_kv,
+                                      int num_reqs, vt::Device device,
+                                      std::vector<vt::Tensor>* out_pages);
+
 // KV-DSV4-MULTICACHE W5 (#2323): incremental decode over the RUNNER'S PAGES --
 // the paged counterpart of `DeepseekV4ForwardGgufCached`. `paged_kv` holds one
 // `[num_blocks, block_size, head_dim]` tensor per layer; `kv_base` is how many

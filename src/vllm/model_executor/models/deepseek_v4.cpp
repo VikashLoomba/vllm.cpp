@@ -2962,6 +2962,56 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                             logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
 }
 
+// KV-DSV4-MULTICACHE W5 (#2323). See the header for why this is pure.
+std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
+                                      const MultiKvCacheIndex& multi_kv,
+                                      const std::vector<PagedKvCache>& attn_kv,
+                                      int num_reqs, vt::Device device,
+                                      std::vector<vt::Tensor>* out_pages) {
+  // ONE REQUEST. The paged forward carries a single `kv_base` for the whole
+  // step, so a batch at differing context lengths would silently attend the
+  // wrong history for every request but one.
+  if (num_reqs != 1) {
+    return "deepseek-v4 paged forward: one request per step only; a batch at "
+           "differing context lengths needs a per-request kv_base "
+           "(KV-DSV4-MULTICACHE W5, #2323)";
+  }
+  // SWA-ONLY LAYERS. A layer with a compressor composes its window with selected
+  // compressed history; attending the raw prefix instead would produce entirely
+  // plausible tokens from the wrong key set.
+  for (int64_t l = 0; l < params.num_hidden_layers; ++l) {
+    if (params.has_compressor(l)) {
+      return "deepseek-v4 paged forward: layer " + std::to_string(l) +
+             " has a compressor (compress_ratio " +
+             std::to_string(params.compress_ratio(l)) +
+             "), whose window-plus-compressed-history composition is unported. "
+             "Refusing rather than attending over the raw prefix "
+             "(MODEL-DSV4-DSA-COMPOSE, #2286)";
+    }
+  }
+  std::vector<vt::Tensor> pages(static_cast<size_t>(params.num_hidden_layers));
+  for (int64_t l = 0; l < params.num_hidden_layers; ++l) {
+    // BY NAME, the way the runner published it. A name that does not resolve
+    // means the published topology and this forward disagree, and continuing
+    // would drop a cache in silence.
+    const std::string name = "model.layers." + std::to_string(l) + ".attn.swa_cache";
+    const int64_t idx = multi_kv.Find(name);
+    if (idx < 0 || idx >= static_cast<int64_t>(attn_kv.size())) {
+      return "deepseek-v4 paged forward: no published cache named '" + name + "'";
+    }
+    const PagedKvCache& c = attn_kv[static_cast<size_t>(idx)];
+    if (c.head_size != params.head_dim) {
+      return "deepseek-v4 paged forward: the SWA cache for '" + name +
+             "' has head_size " + std::to_string(c.head_size) + ", expected head_dim " +
+             std::to_string(params.head_dim);
+    }
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        c.data, c.dtype, device, {c.num_blocks, c.block_size, c.head_size});
+  }
+  *out_pages = std::move(pages);
+  return {};
+}
+
 double DeepseekV4ProfGemmSeconds() { return prof::g_gemm_s; }
 double DeepseekV4ProfSyncSeconds() { return prof::g_sync_s; }
 

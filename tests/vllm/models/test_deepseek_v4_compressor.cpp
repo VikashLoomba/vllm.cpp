@@ -243,3 +243,103 @@ TEST_CASE("dsv4-fp8_ds_mla: decode(encode(x)) round-trips within fp8 granularity
   std::vector<double> ref(head.begin(), head.end());
   CHECK(RelL2(dec, ref) < 0.05);
 }
+
+TEST_CASE("W1: the compressor CYCLE emits at boundaries only, and pools the closed window") {
+  // `MODEL-DSV4-DSA-COMPOSE` W1 (#2286). The individual ops above are gated; this
+  // gates the STATE MACHINE that drives them, which is where a compressor
+  // actually goes wrong -- it is stateful across steps, so an error surfaces
+  // several tokens later as a plausible value rather than immediately.
+  //
+  // Driven the way a forward drives it: a multi-token prefill step, then
+  // single-token decode steps, with the state carried across.
+  const int64_t hd = 4, cr = 3;
+  const float eps = 1e-6f;
+  const std::vector<float> rms(static_cast<size_t>(hd), 1.0f);
+  std::vector<float> ape(static_cast<size_t>(cr * hd));
+  for (size_t i = 0; i < ape.size(); ++i) ape[i] = 0.01f * static_cast<float>(i + 1);
+
+  auto row = [hd](float base) {
+    std::vector<float> v(static_cast<size_t>(hd));
+    for (int64_t d = 0; d < hd; ++d) v[static_cast<size_t>(d)] = base + 0.1f * static_cast<float>(d);
+    return v;
+  };
+
+  std::vector<float> st_kv, st_sc;
+  std::vector<float> all_emitted;
+  int64_t emitted_steps = 0;
+
+  // Step 1: a 4-token prefill at positions 0..3. Only position 2 is a boundary
+  // ((2+1) % 3 == 0), so exactly ONE row must come out of a four-token step.
+  {
+    std::vector<float> kv, sc;
+    std::vector<int64_t> pos;
+    for (int64_t t = 0; t < 4; ++t) {
+      const auto k = row(1.0f + static_cast<float>(t));
+      const auto c = row(0.5f - 0.05f * static_cast<float>(t));
+      kv.insert(kv.end(), k.begin(), k.end());
+      sc.insert(sc.end(), c.begin(), c.end());
+      pos.push_back(t);
+    }
+    const auto out = vllm::deepseek_v4::CompressorStepCycle(&st_kv, &st_sc, kv, sc, ape, pos,
+                                                            rms, eps, cr, hd);
+    CHECK(out.size() == static_cast<size_t>(hd));  // exactly one boundary crossed
+    all_emitted.insert(all_emitted.end(), out.begin(), out.end());
+    if (!out.empty()) ++emitted_steps;
+  }
+
+  // Steps 2-3: single tokens at positions 4 then 5. Position 5 is the boundary.
+  for (int64_t p = 4; p <= 5; ++p) {
+    const auto k = row(1.0f + static_cast<float>(p));
+    const auto c = row(0.5f - 0.05f * static_cast<float>(p));
+    const auto out = vllm::deepseek_v4::CompressorStepCycle(&st_kv, &st_sc, k, c, ape, {p},
+                                                            rms, eps, cr, hd);
+    if (p == 5) {
+      CHECK(out.size() == static_cast<size_t>(hd));
+      all_emitted.insert(all_emitted.end(), out.begin(), out.end());
+      ++emitted_steps;
+    } else {
+      // NOT a boundary: nothing is emitted. A cycle that emitted every step
+      // would still produce plausible compressed rows, just too many of them.
+      CHECK(out.empty());
+    }
+  }
+
+  CHECK(emitted_steps == 2);
+  REQUIRE(all_emitted.size() == static_cast<size_t>(2 * hd));
+  CHECK(st_kv.size() == static_cast<size_t>(6 * hd));  // every token retained
+
+  // THE SECOND EMISSION IS THE WINDOW THAT JUST CLOSED -- positions 3,4,5 -- and
+  // NOT positions 0..2 again. Computed here from the same gated helpers over the
+  // hand-built window, so this is an independent expectation rather than a
+  // second call to the function under test.
+  {
+    std::vector<float> wkv, wsc;
+    for (int64_t p = 3; p <= 5; ++p) {
+      const auto k = row(1.0f + static_cast<float>(p));
+      const auto c = row(0.5f - 0.05f * static_cast<float>(p));
+      const auto scored = vllm::deepseek_v4::CompressorSaveScoreApe(c, ape, {p}, 1, hd, cr);
+      wkv.insert(wkv.end(), k.begin(), k.end());
+      wsc.insert(wsc.end(), scored.begin(), scored.end());
+    }
+    const std::vector<uint8_t> valid(static_cast<size_t>(cr), 1);
+    const auto want =
+        vllm::deepseek_v4::CompressorPoolNorm(wkv, wsc, valid, rms, eps, cr, hd);
+    REQUIRE(want.size() == static_cast<size_t>(hd));
+    double worst = 0.0, mag = 0.0;
+    for (int64_t d = 0; d < hd; ++d) {
+      const double got = all_emitted[static_cast<size_t>(hd + d)];
+      mag = std::max(mag, std::abs(static_cast<double>(want[static_cast<size_t>(d)])));
+      worst = std::max(worst, std::abs(got - want[static_cast<size_t>(d)]));
+    }
+    REQUIRE(mag > 1e-4);
+    CHECK(worst <= 1e-6 * mag);
+    // And it DIFFERS from the first emission -- a cycle that re-pooled the same
+    // window every time would satisfy every count above.
+    double vs_first = 0.0;
+    for (int64_t d = 0; d < hd; ++d)
+      vs_first = std::max(vs_first, std::abs(static_cast<double>(
+                                        all_emitted[static_cast<size_t>(d)] -
+                                        all_emitted[static_cast<size_t>(hd + d)])));
+    CHECK(vs_first > 1e-4 * mag);
+  }
+}

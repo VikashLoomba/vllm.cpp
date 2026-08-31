@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
@@ -367,6 +368,47 @@ struct DeepseekV4MtpInventory {
 // mis-shaped would otherwise read as a supported tensor and dequantize to noise.
 DeepseekV4MtpInventory ClassifyDeepseekV4MtpTail(
     const std::vector<DeepseekV4MtpTensorDesc>& tail);
+
+// ── R1b: the tail, ROUTED and KEPT QUANTIZED ────────────────────────────────
+// One head's routed experts are 5.44G values. Dequantized to host f32 that is
+// 20.2 GiB per head and 60.8 GiB for the three this artifact carries, so a host
+// float tower for the draft head does not exist as an option -- it would not fit
+// beside the target it is supposed to speed up. The tail is therefore BORROWED:
+// each view points into the shard's mmap and owns nothing, and a caller
+// dequantizes the one tensor it needs, when it needs it.
+struct DeepseekV4MtpTensorView {
+  DeepseekV4MtpFormat format = DeepseekV4MtpFormat::kPlain;
+  std::vector<int64_t> shape;      // the WEIGHT's shape, as stored
+  std::string dtype;               // the weight's dtype, for kPlain dispatch
+  const uint8_t* data = nullptr;   // borrowed: the shard mapping outlives this
+  const uint8_t* scale = nullptr;  // null for kPlain
+  // Logical width. For kMxfp4 the stored shape is [N, K/2] because two e2m1
+  // nibbles share a byte, so `in_dim` is 2 * shape[1] and NOT shape[1]. Getting
+  // this wrong halves the weight and still produces finite numbers.
+  int64_t out_dim = 0;
+  int64_t in_dim = 0;
+};
+
+struct DeepseekV4MtpHead {
+  // Keyed by the name with the `mtp.{L}.` prefix removed, so a consumer asks for
+  // `attn.wkv.weight` without knowing which head it is holding.
+  std::unordered_map<std::string, DeepseekV4MtpTensorView> tensors;
+};
+
+// PURE. Routes an already-classified tail into per-head borrowed views. `descs`
+// and `data`/`scale` pointers must correspond index-for-index.
+struct DeepseekV4MtpRouted {
+  std::vector<DeepseekV4MtpHead> heads;  // dense, indexed by the `mtp.{L}` index
+  std::string refusal;
+};
+DeepseekV4MtpRouted RouteDeepseekV4MtpTail(
+    const std::vector<DeepseekV4MtpTensorDesc>& tail,
+    const std::vector<const uint8_t*>& payloads);
+
+// Dequantizes ONE borrowed view to f32, dispatching on its format. This is the
+// only place the two readers are chosen between, so a consumer cannot pick the
+// wrong one for a layout.
+std::vector<float> DequantizeDeepseekV4MtpTensor(const DeepseekV4MtpTensorView& v);
 
 struct DeepseekV4Exl3Weights {
   int tp = 0;            // the source artifact's tensor-parallel width

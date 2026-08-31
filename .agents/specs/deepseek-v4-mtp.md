@@ -242,6 +242,34 @@ that the oracle does not, once a weight-carrying GGUF exists.
 | Real-model MTP-on==MTP-off + acceptance/speedup | 80.7 GB `ds4flash.gguf` on GB10 | **BLOCKED for the GGUF arm** — that file has no nextn tensors (§4) |
 | Real-model MTP-on==MTP-off + acceptance/speedup | NAS `dsv4-flash-0731-spark-exl3`, `mtp.{0,1,2}.*` un-skipped | **OPEN, not blocked** — three NVFP4 heads are present (§4 correction); needs R1 un-skip + NVFP4 expert dequant + R2/R3 |
 
+### R1b — why there is no host float tower for the head
+
+Arithmetic first, because it removes an option rather than choosing one. One
+head's routed experts are 216 experts x 3 projections x [2048, 4096] = 5.44G
+values. As host f32 that is **20.2 GiB per head and 60.8 GiB for the three this
+artifact carries**, next to a target that already fills the box. So
+`DeepseekV4MtpHostWeights`, which is all `std::vector<float>`, cannot hold this
+head, and R1b does not try.
+
+The tail is BORROWED instead. `RouteDeepseekV4MtpTail` builds per-head views that
+point into the shard mapping and own nothing, and
+`DequantizeDeepseekV4MtpTensor` expands exactly one tensor when a caller wants it,
+choosing the reader from the classified format so a consumer cannot pick the wrong
+one.
+
+One trap is written into the type. For MXFP4 the stored shape is `[N, K/2]`,
+because two e2m1 nibbles share a byte, so the view carries a LOGICAL `in_dim` of
+`2 * shape[1]`. Reading `shape[1]` as the width halves every routed expert and
+still produces finite numbers, which no shape assertion would catch; the gate
+mutates exactly that.
+
+The gate hand-computes its expectations from the formats rather than comparing
+against the same helper the code calls -- otherwise it would prove the two agree
+and still pass if the wrong reader were chosen. It also carries a SECOND fp8
+block row with a different scale, because the first version read only row 0, where
+every block extent picks `scale[0]`, and a mutation changing the extent from 128
+to 64 survived it.
+
 ### R1a — what landed, and what it deliberately does NOT do
 
 `ClassifyDeepseekV4MtpTail` turns the blanket skip into an accounted inventory:
@@ -281,7 +309,8 @@ which is what separates "the function works" from "anything reaches it".
 | W1b draft forward | `DeepseekV4MtpDraftLogitsHost` (nextn layer + compute_logits, 1:1 nvidia/mtp.py) + `DeepseekV4TargetMtpResidualHost` residual stash | DONE |
 | W1c gate | `test_deepseek_v4_mtp` (finite + RED-first + lossless verify) | DONE |
 | R1a inventory | the loader CLASSIFIES the `mtp.*` tail instead of only counting it (`ClassifyDeepseekV4MtpTail`); fp8-block at 128x128 and MXFP4 at group 32 are recognised, anything else is reported by name | DONE |
-| R1b head load | actually READ the classified tail into `DeepseekV4MtpHostWeights` (`DequantFp8BlockToF32` + `DequantMxfp4ToBf16`); a keep-quant residency decision belongs here, since three heads dequantized to host f32 do not fit beside the target | RESIDUAL |
+| R1b routing | the tail is routed to BORROWED views (`RouteDeepseekV4MtpTail`) and dequantized one tensor at a time (`DequantizeDeepseekV4MtpTensor`); the residency question is answered by keeping it quantized, NOT by a host float tower | DONE |
+| R1c head assembly | drive the routed views into a draft forward: which tensors the head needs, in what order, and where the experts live at run time | RESIDUAL |
 | R2 decode-loop | DS4-native propose/verify over `ForwardResidentDecodeGguf` (stash residual, draft k=1, verify) | RESIDUAL |
 | R3 engine register | wire `DeepSeekV4MTP` as the engine speculator (C++ analogue of registry.py:617) | RESIDUAL |
 | R4 device draft | device MTP forward for decode-graph speed | RESIDUAL |

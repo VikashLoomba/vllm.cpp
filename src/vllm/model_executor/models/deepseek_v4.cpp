@@ -124,6 +124,17 @@ struct V4Backend {
   // query's global position is kv_base + local_t (kv_base = cache.len at the call).
   DeepseekV4KvCache* kv = nullptr;
   int64_t kv_base = 0;
+  // KV-DSV4-MULTICACHE W5 (#2323): the PAGED MLA cache, one tensor per layer
+  // `[num_blocks, block_size, head_dim]`. Present => `AttentionBlock` writes each
+  // step's latents into it through `vt::ConcatAndCacheMla` and attends through
+  // `vt::MlaDecodeAttention`, instead of appending to a contiguous `deck` that
+  // grows without bound. `kv_base` means the same thing on both arms.
+  //
+  // The two are mutually exclusive and the block refuses both at once rather
+  // than silently preferring one: they are different sources of truth for the
+  // same keys, and a step that wrote one and read the other would produce
+  // plausible tokens from a stale context.
+  std::vector<vt::Tensor>* paged_kv = nullptr;
   // Re-scoped Stage 2: collapse the routed-expert per-expert keep-quant matvecs
   // into ONE grouped kMatmulBTQuantGrouped launch per {gate,up,down} (fewer host
   // launches + higher GB10 occupancy). Default ON for the GGUF keep-quant path;
@@ -917,6 +928,47 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const std::vector<float>* kv_keys = &deck;
   int64_t kv_base = 0;
   int64_t n_keys = T;
+  // W5 (#2323): THE PAGED ARM. This step's latents are written into the runner's
+  // pages and the attention reads them back, so nothing grows a contiguous deck.
+  VT_CHECK(be.paged_kv == nullptr || be.kv == nullptr,
+           "deepseek-v4: the paged MLA cache and the contiguous deck cache are two "
+           "sources of truth for the same keys; a step that wrote one and read the "
+           "other would produce plausible tokens from a stale context. Refusing "
+           "both at once (KV-DSV4-MULTICACHE W5, #2323)");
+  bool paged_attn = false;
+  if (be.paged_kv != nullptr) {
+    VT_CHECK(!is_indexer && !is_comp,
+             "deepseek-v4: the paged MLA arm is dense-causal only; the indexer and "
+             "compressor layers belong to MODEL-DSV4-DSA-COMPOSE (#2286)");
+    VT_CHECK(static_cast<int64_t>(be.paged_kv->size()) > layer,
+             "deepseek-v4: paged MLA cache has no tensor for this layer");
+    vt::Tensor& page = (*be.paged_kv)[static_cast<size_t>(layer)];
+    VT_CHECK(page.rank == 3 && page.shape[2] == hd,
+             "deepseek-v4: paged MLA cache must be [num_blocks, block_size, head_dim]");
+    kv_base = be.kv_base;
+    n_keys = kv_base + T;
+
+    // WRITE. `vt::ConcatAndCacheMla` takes the latent as its nope part plus its
+    // rope tail, and it is STRIDE-DRIVEN, so both are views over the SAME
+    // contiguous `deck` -- offset 0 width `nope`, offset `nope` width `rope`,
+    // both at row stride `hd`. Nothing is materialized to split them.
+    const int64_t rope_w = rope, nope_w = hd - rope;
+    std::vector<int64_t> slots(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) slots[static_cast<size_t>(t)] = kv_base + t;
+    // Built contiguous then RE-STRIDED: the row stride is the full `hd`, so each
+    // view walks the same buffer and reads its own columns. `ConcatAndCacheMla`
+    // indexes by stride, which is what makes the no-copy split legal.
+    vt::Tensor t_kvc = vt::Tensor::Contiguous(const_cast<float*>(deck.data()),
+                                              vt::DType::kF32, be.q->device, {T, nope_w});
+    t_kvc.stride[0] = hd;
+    vt::Tensor t_pe = vt::Tensor::Contiguous(const_cast<float*>(deck.data()) + nope_w,
+                                             vt::DType::kF32, be.q->device, {T, rope_w});
+    t_pe.stride[0] = hd;
+    vt::Tensor t_slot = vt::Tensor::Contiguous(slots.data(), vt::DType::kI64,
+                                               be.q->device, {T});
+    vt::ConcatAndCacheMla(*be.q, t_kvc, t_pe, page, t_slot);
+    paged_attn = true;
+  }
   if (be.kv != nullptr) {
     VT_CHECK(!is_indexer && !is_comp,
              "kv-cache incremental decode requires dense MLA (no indexer/compressor)");
@@ -980,7 +1032,27 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const bool dev_attn = be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU &&
                         !is_indexer && DeviceAttnEnabled() &&
                         deepseek_v4::V4DeviceKernelsAvailable();
-  if (dev_attn) {
+  if (paged_attn) {
+    // W5 (#2323): read the pages back through the shared op. The causal mask is
+    // carried by `seq_lens[t] = kv_base + t + 1` inside the helper -- no mask
+    // tensor, one op call for the whole step. Proven equal to the loop below by
+    // `test_deepseek_v4_paged_equiv`, at V4-Flash's real widths and across
+    // several `kv_base` values, with both off-by-one directions mutation-proven.
+    o = deepseek_v4::PagedCausalMlaAttention(
+        *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],
+        (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
+        (*be.paged_kv)[static_cast<size_t>(layer)].shape[1], T, nh, hd, kv_base,
+        L.attn_sink, scale, /*no_sink=*/miswire == V4Miswire::kNoAttnSink,
+        // W5 (#2323): a `compress_ratio <= 1` layer is SWA-ONLY upstream -- it
+        // attends its sliding window and nothing else
+        // (`nvidia/flashmla.py`: `k_cache=swa_cache` with `extra_k_cache=None`
+        // when `swa_only`). Attending the full prefix there diverges above the
+        // window, which is why this row's recorded 512-token exactness bound was
+        // wrong by 4x for these layers. Layers WITH a compressor keep the full
+        // prefix here: their window-plus-compressed-history composition belongs
+        // to MODEL-DSV4-DSA-COMPOSE (#2286) and they refuse above.
+        /*sliding_window=*/p.has_compressor(layer) ? 0 : p.sliding_window);
+  } else if (dev_attn) {
     // kv_keys holds the cached deck [n_keys_total, hd]; sel is dense-causal, so the
     // device kernel derives it from kv_base+t (no per-key index list needed).
     deepseek_v4::DsaDevice()->decode_attn(
@@ -2859,6 +2931,87 @@ void DeepseekV4ProfReset() {
   prof::g_gemm_s = 0.0;
   prof::g_sync_s = 0.0;
 }
+// KV-DSV4-MULTICACHE W5 (#2323) — incremental decode over the RUNNER'S PAGES.
+//
+// The paged counterpart of `DeepseekV4ForwardGgufCached`. Same contract: call it
+// once per step with the new tokens and `kv_base` set to how many keys the pages
+// already hold. It writes this step's per-layer latents into `paged_kv` and
+// attends over the pages, so nothing grows a contiguous deck.
+//
+// DENSE-CAUSAL ONLY. The indexer and compressor layers refuse inside
+// `AttentionBlock`; they belong to `MODEL-DSV4-DSA-COMPOSE` (#2286).
+std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
+                                              vt::Queue& queue,
+                                              std::vector<vt::Tensor>& paged_kv,
+                                              int64_t kv_base,
+                                              const std::vector<int32_t>& token_ids,
+                                              const std::vector<int32_t>& positions,
+                                              const std::vector<int32_t>& logits_indices) {
+  VT_CHECK(weights.has_gguf_weights,
+           "DeepseekV4ForwardGgufPaged: no keep-quant tower (call LoadDeepseekV4FromGguf)");
+  VT_CHECK(weights.has_host_weights,
+           "DeepseekV4ForwardGgufPaged: the small f32 host tower is absent");
+  const int64_t nlayers = weights.params.num_hidden_layers;
+  VT_CHECK(static_cast<int64_t>(paged_kv.size()) == nlayers,
+           "DeepseekV4ForwardGgufPaged: one page tensor per layer is required");
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
+  be.paged_kv = &paged_kv;
+  be.kv_base = kv_base;
+  be.grouped_moe = GroupedMoeEnabled();
+  return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
+                            logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
+}
+
+// KV-DSV4-MULTICACHE W5 (#2323). See the header for why this is pure.
+std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
+                                      const MultiKvCacheIndex& multi_kv,
+                                      const std::vector<PagedKvCache>& attn_kv,
+                                      int num_reqs, vt::Device device,
+                                      std::vector<vt::Tensor>* out_pages) {
+  // ONE REQUEST. The paged forward carries a single `kv_base` for the whole
+  // step, so a batch at differing context lengths would silently attend the
+  // wrong history for every request but one.
+  if (num_reqs != 1) {
+    return "deepseek-v4 paged forward: one request per step only; a batch at "
+           "differing context lengths needs a per-request kv_base "
+           "(KV-DSV4-MULTICACHE W5, #2323)";
+  }
+  // SWA-ONLY LAYERS. A layer with a compressor composes its window with selected
+  // compressed history; attending the raw prefix instead would produce entirely
+  // plausible tokens from the wrong key set.
+  for (int64_t l = 0; l < params.num_hidden_layers; ++l) {
+    if (params.has_compressor(l)) {
+      return "deepseek-v4 paged forward: layer " + std::to_string(l) +
+             " has a compressor (compress_ratio " +
+             std::to_string(params.compress_ratio(l)) +
+             "), whose window-plus-compressed-history composition is unported. "
+             "Refusing rather than attending over the raw prefix "
+             "(MODEL-DSV4-DSA-COMPOSE, #2286)";
+    }
+  }
+  std::vector<vt::Tensor> pages(static_cast<size_t>(params.num_hidden_layers));
+  for (int64_t l = 0; l < params.num_hidden_layers; ++l) {
+    // BY NAME, the way the runner published it. A name that does not resolve
+    // means the published topology and this forward disagree, and continuing
+    // would drop a cache in silence.
+    const std::string name = "model.layers." + std::to_string(l) + ".attn.swa_cache";
+    const int64_t idx = multi_kv.Find(name);
+    if (idx < 0 || idx >= static_cast<int64_t>(attn_kv.size())) {
+      return "deepseek-v4 paged forward: no published cache named '" + name + "'";
+    }
+    const PagedKvCache& c = attn_kv[static_cast<size_t>(idx)];
+    if (c.head_size != params.head_dim) {
+      return "deepseek-v4 paged forward: the SWA cache for '" + name +
+             "' has head_size " + std::to_string(c.head_size) + ", expected head_dim " +
+             std::to_string(params.head_dim);
+    }
+    pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        c.data, c.dtype, device, {c.num_blocks, c.block_size, c.head_size});
+  }
+  *out_pages = std::move(pages);
+  return {};
+}
+
 double DeepseekV4ProfGemmSeconds() { return prof::g_gemm_s; }
 double DeepseekV4ProfSyncSeconds() { return prof::g_sync_s; }
 

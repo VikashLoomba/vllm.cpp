@@ -870,6 +870,15 @@ TEST_CASE("glm5_next bridge: ONLY the SELECTED experts are decoded") {
   // The banks are EMPTY by construction. Nothing bridged 27 GiB.
   CHECK(on_demand.expert_gate_up.empty());
   CHECK(on_demand.expert_down.empty());
+  // W9a MOVED THE DEFAULT, and this case is about the arm below it. The bridge
+  // now also admits the checkpoint's blocks as keep-quant towers, and
+  // `MoeForward` prefers them -- so it decodes NOTHING and `decoded()` would be
+  // empty, which is the new behaviour working rather than this gate failing.
+  // What this case gates is the ON-DEMAND arm's residency discipline, which is
+  // still reachable and is still the operand W9a's parity case compares
+  // against, so it is selected explicitly here instead of arriving by default.
+  CHECK(on_demand.has_quant_banks);
+  on_demand.has_quant_banks = false;
   vllm::glm5_next::GgufExpertSource source(src.moe, d, "blk.1.ffn");
   on_demand.expert_source = &source;
 
@@ -1019,6 +1028,14 @@ TEST_CASE("glm5_next bridge: MoeForward refuses NEITHER and BOTH residencies") {
 
   // NEITHER. Without this refusal the router would select and every expert
   // would read as a ZERO weight: a finite, fluent, wrong block.
+  //
+  // W9a added a THIRD residency and the bridge now fills it, so `bare` is no
+  // longer bare: it carries keep-quant banks and `MoeForward` runs on them.
+  // The refusal under test is about a layer with no weights AT ALL, so the
+  // keep-quant arm is switched off to construct that state, exactly as the
+  // f32 banks and the source are left unset.
+  CHECK(bare.has_quant_banks);
+  bare.has_quant_banks = false;
   CHECK_THROWS_WITH_AS(vllm::glm5_next::MoeForward(d, bare, hidden, 1, q),
                        doctest::Contains("NEITHER"), std::runtime_error);
 

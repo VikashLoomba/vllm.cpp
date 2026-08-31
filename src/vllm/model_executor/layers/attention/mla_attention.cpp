@@ -369,11 +369,63 @@ MlaUpProjectFn MakeMlaUpProjectFn(Dev d, const MlaBlockDims& dims, const MlaBloc
   };
 }
 
+// ─── the lifted sparse-step eligibility (W9, #2214) ─────────────────────────
+// Moved here VERBATIM from `dots3_note_device.cpp`'s unnamed namespace, where it
+// was written for #699 W4b-3c and where a second architecture could not reach
+// it. The body is unchanged; `p.index_topk` became the `index_topk` argument and
+// the struct lost its `Dots3Note` prefix. dots3-note now calls this one, so the
+// repair its own review paid for — one function answering both the route and the
+// refusal — is not silently duplicated by the next model that needs it.
+int64_t StepComputedTokens(const v1::CommonAttentionMetadata& am, int r) {
+  if (r < static_cast<int>(am.num_computed_tokens_cpu.size())) {
+    return am.num_computed_tokens_cpu[static_cast<size_t>(r)];
+  }
+  if (r + 1 < static_cast<int>(am.query_start_loc.size()) &&
+      r < static_cast<int>(am.seq_lens.size())) {
+    const int64_t query_len = am.query_start_loc[static_cast<size_t>(r + 1)] -
+                              am.query_start_loc[static_cast<size_t>(r)];
+    return static_cast<int64_t>(am.seq_lens[static_cast<size_t>(r)]) - query_len;
+  }
+  return 0;
+}
+
+SparseStepEligibility SparseStepEligibilityOf(
+    int64_t index_topk, const v1::CommonAttentionMetadata& am) {
+  SparseStepEligibility e;
+  const int64_t topk = index_topk;
+  const int num_reqs = am.num_reqs;
+  e.well_formed = topk > 0 && num_reqs > 0 &&
+                  static_cast<int>(am.query_start_loc.size()) == num_reqs + 1 &&
+                  static_cast<int>(am.seq_lens.size()) >= num_reqs;
+  // `num_reqs` is authoritative for a WELL-FORMED step. When the metadata is
+  // NOT well formed there is no authoritative count, so every published
+  // `seq_lens` entry is scanned — the safe direction, because a step that
+  // prunes and is not eligible is refused.
+  const size_t scan =
+      e.well_formed ? static_cast<size_t>(num_reqs) : am.seq_lens.size();
+  for (size_t r = 0; r < scan; ++r) {
+    const int64_t sl = am.seq_lens[r];
+    const int64_t computed = StepComputedTokens(am, static_cast<int>(r));
+    if (sl > topk && !e.prunes) {
+      e.prunes = true;
+      e.prunes_req = static_cast<int>(r);
+      e.prunes_len = sl;
+    }
+    if (computed > 0 && !e.resumes) {
+      e.resumes = true;
+      e.resumes_req = static_cast<int>(r);
+      e.resumes_from = computed;
+    }
+  }
+  return e;
+}
+
 void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWeights& w,
                               const Tensor& hidden, const Tensor& positions,
                               Tensor& kv_cache, const Tensor& slot_mapping,
                               const MlaBlockMetadata& meta, v1::TritonMLAImpl& impl,
-                              Tensor& out, MlaSharedSelection* shared) {
+                              Tensor& out, Tensor* attn_pre_o_proj,
+                              MlaSharedSelection* shared) {
   dims.Validate();
   // ─── dots3-note's headwise gate: PRECONDITIONS, checked at ENTRY ─────────
   // Both are properties of the CONFIG and the WEIGHT, knowable before any op
@@ -512,31 +564,91 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   DBuf q_c(d, dt, {T, dims.q_lora_rank});
   Tensor q_c_t = q_c.t();
   if (dims.has_q_lora()) {
-    RequireWeight(w.fused_qkv_a_proj, "fused_qkv_a_proj");
     RequireWeight(w.q_a_layernorm, "q_a_layernorm");
     RequireWeight(w.q_b_proj, "q_b_proj");
     const int64_t ql = dims.q_lora_rank;
-    const Tensor& fused = w.fused_qkv_a_proj;
-    if (fused.shape[0] != ql + L + R) {
+    // ─── FUSED or SPLIT A-projection (W9, #2214) ────────────────────────
+    // See `mla_attention.h`'s `q_a_proj` for the checkpoint fact that forces the
+    // second arm to exist. Below this point the two are ONE code path over
+    // `w_qa` and `w_kva`, and that is byte-identity by construction rather than
+    // by inspection: on the fused arm those two names ARE `fused.Slice(...)`,
+    // the same data pointer, shape, stride and dtype the previous revision
+    // passed, so every DeepSeek / MiniCPM3 / Kimi-Linear / dots3-note step keeps
+    // its exact operands and its exact launch sequence.
+    const bool split_a = w.q_a_proj.data != nullptr;
+    const bool fused_a = w.fused_qkv_a_proj.data != nullptr;
+    if (split_a == fused_a) {
       throw std::invalid_argument(
-          "MLA block: fused_qkv_a_proj must be [q_lora_rank + kv_lora_rank + "
-          "qk_rope_head_dim, hidden_size] (deepseek_v2.py:1004-1009)");
+          split_a
+              ? "MLA block: BOTH `q_a_proj` and `fused_qkv_a_proj` are "
+                "populated on a q_lora layer. They are two spellings of the "
+                "same projection (deepseek_v2.py:1004-1009, :1812-1820) and "
+                "serving one silently would leave the other's bytes unused"
+              : "MLA block: a q_lora layer must carry EITHER "
+                "`fused_qkv_a_proj` (the fused form upstream's "
+                "packed_modules_mapping builds) OR `q_a_proj` plus "
+                "`kv_a_proj_with_mqa` (the split form a llama.cpp k-quant "
+                "conversion ships, whose two halves carry different block "
+                "encodings and cannot be concatenated); neither is populated");
     }
-    Tensor w_qa = fused.Slice(0, 0, ql);
+    Tensor w_qa{}, w_kva{};
+    if (split_a) {
+      RequireWeight(w.kv_a_proj_with_mqa, "kv_a_proj_with_mqa");
+      if (w.q_a_proj.shape[0] != ql) {
+        throw std::invalid_argument(
+            "MLA block: q_a_proj must be [q_lora_rank, hidden_size] "
+            "(deepseek_v2.py:1004-1009)");
+      }
+      if (w.kv_a_proj_with_mqa.shape[0] != L + R) {
+        throw std::invalid_argument(
+            "MLA block: kv_a_proj_with_mqa must be [kv_lora_rank + "
+            "qk_rope_head_dim, hidden_size] (deepseek_v2.py:511)");
+      }
+      w_qa = w.q_a_proj;
+      w_kva = w.kv_a_proj_with_mqa;
+    } else {
+      const Tensor& fused = w.fused_qkv_a_proj;
+      if (fused.shape[0] != ql + L + R) {
+        throw std::invalid_argument(
+            "MLA block: fused_qkv_a_proj must be [q_lora_rank + kv_lora_rank + "
+            "qk_rope_head_dim, hidden_size] (deepseek_v2.py:1004-1009)");
+      }
+      w_qa = fused.Slice(0, 0, ql);
+      w_kva = fused.Slice(0, ql, ql + L + R);
+    }
     Tensor q_raw_t = q_raw.t();
     vt::MatmulBT(d.q, q_c_t, hidden, w_qa);  // q_c A-proj (own GEMM → contiguous latent)
     if (fused_nr) {
       Tensor kv_merged_t = kv_merged.t();  // A2: ONE merged [T, L+R] kv A-proj GEMM
-      vt::MatmulBT(d.q, kv_merged_t, hidden, fused.Slice(0, ql, ql + L + R));
+      vt::MatmulBT(d.q, kv_merged_t, hidden, w_kva);
     } else {
+      // THE SPLIT PATH ROW-SLICES THE KV WEIGHT, AND A BLOCK-QUANTIZED WEIGHT
+      // HAS NO ROW SLICE. `Tensor::Slice` offsets by `stride[dim] *
+      // SizeOf(dtype)` and `SizeOf` refuses a block dtype outright, so this
+      // would throw four frames deeper with a message about dtypes rather than
+      // about the operator's switch. `vt::FusedNormRope` is registered on CPU
+      // (`cpu_ops.cpp`) and CUDA (`cuda_ops.cu`) and is default-ON, so the only
+      // way here on a keep-quant checkpoint is `VT_MLA_FUSED_NORM_ROPE=0`.
+      if (vt::IsBlockQuant(w_kva.dtype)) {
+        throw std::invalid_argument(
+            "MLA block: the split A-projection path needs vt::FusedNormRope to "
+            "read the merged [kv_lora_rank + qk_rope_head_dim] row, because a "
+            "BLOCK-QUANTIZED kv_a_proj_with_mqa (" +
+            std::string(vt::Name(w_kva.dtype)) +
+            ") has no row slice — a quant block spans whole rows and "
+            "vt::SizeOf refuses a per-element size for it. This is reachable "
+            "only with VT_MLA_FUSED_NORM_ROPE=0 on a keep-quant MLA "
+            "checkpoint; unset it, or load this model with an expanded "
+            "residency");
+      }
       Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
-      vt::MatmulBT(d.q, kv_c_t, hidden, fused.Slice(0, ql, ql + L));
+      vt::MatmulBT(d.q, kv_c_t, hidden, w_kva.Slice(0, 0, L));
       // NoPE (W3, #2213): with no rope slice there are no rope ROWS in the
       // A-projection either — `fused_qkv_a_proj` is [q_lora + kv_lora, hidden]
       // — so the second GEMM is NOT LAUNCHED rather than issued at width 0,
       // which `Tensor::Slice` refuses as an empty range.
       if (R > 0) {
-        vt::MatmulBT(d.q, k_pe_t, hidden, fused.Slice(0, ql + L, ql + L + R));
+        vt::MatmulBT(d.q, k_pe_t, hidden, w_kva.Slice(0, L, L + R));
       }
     }
     // `q_c = self.q_a_layernorm(q_c)` (mla.py:143) — in-place, like upstream.
@@ -827,6 +939,31 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   // ─── 5a. PREFILL — the materialized-MHA form (mla_attention.py:722-737) ──
   // Runs on the TAIL `q[num_mqa_tokens:]`, because decode tokens are packed
   // first.
+  // KV-DSV4-MULTICACHE W5 (#2323): the sink is implemented on the DECODE half
+  // only, so a batch that would take the prefill path with one loaded REFUSES
+  // rather than attending without it.
+  //
+  // WHY REFUSE INSTEAD OF IGNORING. A sink removes probability mass; dropping it
+  // leaves every prefill row normalized over the keys alone, which is a WRONG
+  // ANSWER that still produces plausible tokens -- the invisible class this tree
+  // rejects. Refusing makes the missing half loud at the first forward instead.
+  //
+  // WHY IT IS NOT IMPLEMENTED HERE YET, recorded so the next reader does not
+  // assume it was an oversight. The prefill softmax is TWO-PASS and its chunked
+  // arm merges a prefix and a suffix through their LSEs
+  // (`cpu_mla_prefill.cpp`). A sink added inside the kernel would therefore be
+  // counted once PER CHUNK rather than once per row -- the same double-count the
+  // decode kernel avoids by seeding stage 2 rather than stage 1. Getting that
+  // right needs its own design and its own gate, and a gate that ran only the
+  // unchunked case could not see the error.
+  if (w.attn_sink.data != nullptr && prefill_toks > 0) {
+    throw std::invalid_argument(
+        "MLA block: a per-head attention sink is loaded, but this batch takes "
+        "the PREFILL path and the sink is implemented on the decode half only "
+        "(KV-DSV4-MULTICACHE W5, #2323). Refusing rather than attending without "
+        "it, because a dropped sink is a wrong answer that still produces "
+        "plausible tokens.");
+  }
   if (prefill_toks > 0) {
     RequireWeight(w.kv_b_proj, "kv_b_proj");
     if (meta.prefill_cu_seqlens_q.data == nullptr) {
@@ -927,6 +1064,10 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
     impl.num_heads = static_cast<int>(N);
     impl.head_size = static_cast<int>(dims.head_size());
     impl.scale = dims.scale;
+    // W5 (#2323). Set unconditionally: an absent weight is a null tensor, which
+    // `forward_mqa` reads as "no sink" -- so this is inert for every model that
+    // does not load one rather than needing a branch here.
+    impl.attn_sink = w.attn_sink;
     impl.queue = &d.q;  // W4 deviation (i), wired here.
     // dots3-note's windowed decode (#699 W4b-2). Upstream expresses it as the
     // `Dots3NoteTritonMLAImpl` subclass keeping `self.sliding_window`
@@ -1033,6 +1174,38 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
   }
 
   // ─── 6. o_proj (deepseek_v2.py:526; mla.py:181) ──────────────────────────
+  //
+  // OPTIONAL, because not every MLA model HAS a dense output projection
+  // (KV-DSV4-MULTICACHE W5, #2323). DeepSeek-V4's output side is a grouped LoRA
+  // -- `wo_a` as a block-diagonal bmm, then `wo_b` -- and flattening that into a
+  // `[hidden, num_heads*v_head_dim]` matrix would reproduce the arithmetic while
+  // discarding the whole saving the factorization exists for.
+  //
+  // THIS MIRRORS UPSTREAM RATHER THAN DIVERGING FROM IT.
+  // `DeepseekV4Attention.forward` (`attention.py:345-391`) fills `o_padded` via
+  // `attention_impl(...)`, slices it, and only THEN calls a separate,
+  // platform-specific `self._o_proj(o, positions)`. Attention and the projection
+  // are distinct steps upstream; this block had fused them.
+  //
+  // Given `attn_pre_o_proj`, the block writes the attention output
+  // `[T, num_heads*v_head_dim]` there and returns, and the caller applies its own
+  // projection. `o_proj` is then NOT required -- which is the point, since a
+  // model routed this way does not have one.
+  //
+  // NULL for every existing caller, so Kimi-Linear and dots3-note take the fused
+  // path unchanged and are byte-identical.
+  if (attn_pre_o_proj != nullptr) {
+    // A RAW BYTE COPY, not a cast. `vt::CastF32`/`CastBf16` are CONVERTERS and
+    // refuse a same-dtype input ("cast_f32: in must be bf16"), which is what the
+    // first draft of this hit. Both tensors are contiguous `[T, N*V]` in the
+    // block's own dtype, so the transfer is exact by construction and carries no
+    // rounding of its own.
+    const int64_t nv = dims.num_heads * dims.v_head_dim;
+    const size_t bytes =
+        static_cast<size_t>(T) * static_cast<size_t>(nv) * vt::SizeOf(dt);
+    d.b.Copy(d.q, attn_pre_o_proj->data, attn_flat.data, bytes);
+    return;
+  }
   RequireWeight(w.o_proj, "o_proj");
   vt::MatmulBT(d.q, out, attn_flat, w.o_proj);
 }

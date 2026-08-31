@@ -370,16 +370,18 @@ TEST_CASE("glm_moe_dsa: the forward refusal NAMES each missing primitive") {
   // What is STILL missing, and only that. Two primitives, each with the record
   // that owns it.
   for (const char* needle :
-       {"indexer KV side cache", "DeepseekV32IndexerCache",
-        "!elig.prunes || elig.Active()", "sparse prefill",
+       {"indexer KV side cache", "DeepseekV32IndexerCache", "sparse prefill",
         "MlaPrefillAttentionArgs", "MlaPrefillAttention", "#1925", "#2323",
         "W6", "W7", "§3.7", ".agents/specs/glm-dsa-latest-deepseek.md"}) {
     CAPTURE(needle);
     CHECK(msg.find(needle) != std::string::npos);
   }
+  // The predicate rather than a line range (spec O20): the range moved twice
+  // while the message was being written.
+  CHECK(msg.find("!elig.prunes || elig.Active()") != std::string::npos);
 
   // AND WHAT IT MUST NO LONGER NAME. This half is the point of the case: W2
-  // wrote a seven-item list and four items have since landed, so a refusal that
+  // wrote a seven-item list and five items have since landed, so a refusal that
   // still named them would send its reader looking for work that is done. Each
   // needle below is a thing this build HAS, and the assertion is that the
   // message stopped claiming otherwise.
@@ -387,34 +389,49 @@ TEST_CASE("glm_moe_dsa: the forward refusal NAMES each missing primitive") {
   //   `IQ4_XS`      -> `VecDotIQ4_XSQ8_K`, `2e9f4d88d` (spec O2, DISCHARGED)
   //   `qwen3_5.cpp` -> the seam is `expert_stream_seam.{h,cpp}` (spec O8)
   //   `selection-reuse` / `mla.py:180` -> `GlmMoeDsaMlaSchedule` (W4)
-  //   `fp32 router` -> `deepseek_v2.cpp:363` reads `router_dtype_is_f32`
+  //   `fp32 router` -> the forward sizes `dlog` from `router_dtype_is_f32`
   //   `1147-1180`   -> the wrong `dots3_note_device.cpp` range (spec O20)
+  //   THE FORWARD ITSELF -> W9, `glm_moe_dsa_forward.cpp`
   for (const char* stale :
        {"IQ4_XS", "welded", "selection-reuse", "fp32 router GEMM", "1147-1180",
-        "QUANT-GGUF-IQ4_XS"}) {
+        "QUANT-GGUF-IQ4_XS", "forward is not implemented"}) {
     CAPTURE(stale);
     CHECK(msg.find(stale) == std::string::npos);
   }
 
-  // The loader is no longer owed, and the message says so rather than staying
-  // silent about the half of W7 that landed.
-  CHECK(msg.find("loader IS implemented") != std::string::npos);
+  // The loader is no longer owed, and neither is the forward. W9 turned this
+  // message from "the forward does not exist" into "this STEP cannot be
+  // served", which is a different and much narrower claim.
+  CHECK(msg.find("forward IS implemented") != std::string::npos);
+  CHECK(msg.find("A FIRST token on a fresh prompt is reachable") !=
+        std::string::npos);
+}
 
-  // And it is what the forward actually raises, both arms.
+TEST_CASE("glm_moe_dsa: the forward refuses a model that never went through the loader") {
+  // W9 (#2214). This case used to assert that the forward refuses EVERY call.
+  // It no longer does — `tests/vllm/models/test_glm_moe_dsa_forward.cpp` drives
+  // a token through it — so what is gated here is the precondition a
+  // hand-constructed `GlmMoeDsaWeights` violates: only
+  // `LoadGlmMoeDsaFromGguf` runs the post-load absorption that produces
+  // `kv_b_proj`, `w_uk_t` and `w_uv`, and reading those empty would fail one
+  // frame deeper with a message about a single missing tensor rather than about
+  // a stage that did not run.
   vllm::GlmMoeDsaWeights weights;
   vllm::v1::CommonAttentionMetadata meta;
   std::vector<vllm::PagedKvCache> kv;
   vt::Queue q;  // CPU-default; the refusal fires before it is touched
+  const std::vector<int32_t> ids = {1};
+  const std::vector<int32_t> pos = {0};
   const std::string thrown = RefusalOf(
-      [&] { vllm::GlmMoeDsaModel::Forward({}, {}, meta, kv, weights, q, {}); },
+      [&] { vllm::GlmMoeDsaModel::Forward(ids, pos, meta, kv, weights, q, {}); },
       "GlmMoeDsaModel::Forward");
-  CHECK(thrown.find("not implemented") != std::string::npos);
-  CHECK(thrown.find("#1925") != std::string::npos);
+  CHECK(thrown.find("post-load absorption") != std::string::npos);
   const std::string thrown_dev = RefusalOf(
-      [&] { (void)vllm::GlmMoeDsaModel::ForwardDevice({}, {}, meta, kv, weights, q, {}); },
+      [&] {
+        (void)vllm::GlmMoeDsaModel::ForwardDevice(ids, pos, meta, kv, weights, q, {});
+      },
       "GlmMoeDsaModel::ForwardDevice");
-  CHECK(thrown_dev.find("W7") != std::string::npos);
-  CHECK(thrown_dev.find("#1925") != std::string::npos);
+  CHECK(thrown_dev.find("post-load absorption") != std::string::npos);
 }
 
 TEST_CASE("glm_moe_dsa: the safetensors arm refuses permanently, and says why") {

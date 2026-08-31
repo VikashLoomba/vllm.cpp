@@ -74,10 +74,21 @@ nothing here and reads as "upstream does not implement it", which is wrong.
 | SWA-only | 0 | 5 | neither |
 
 Counts are `config.json`'s `compress_ratios` histogram `{0: 5, 4: 21, 128: 20}`
-= 46 entries. **46 is not 43**, and the row's older records say "43 layers" /
-"41 of 43"; 43 is the trellis shard count (`exl3-layer-000..042`). W1 must
-reconcile which number each claim means rather than inherit either (#2186
-raised this and it is still open).
+= 46 entries.
+
+**RESOLVED, and it was already answered elsewhere in this row family.**
+`dsv4-dsa-geometry.md` read the artifact's own `config.json` and records that the
+46 entries are **43 layers + 3 MTP blocks**: layers 0 and 1 are `0`, layers 2..42
+alternate `4` and `128`, and the MTP tail is `0`. So `num_hidden_layers == 43`,
+2 layers are dense, 21 carry an indexer and 20 a compressor-only -- which is
+exactly the "41 of 43 carry a compressor, 21 carry an indexer" the row already
+recorded. There is no contradiction: 43 counts LAYERS, 46 counts the config list
+INCLUDING the MTP tail, and the trellis shard count matches the layers.
+
+W1 therefore inherits 43 and does not need to reconcile anything. The entry is
+kept rather than deleted because #2186 raised it as open and a reader who saw
+that deserves to find the answer here, with its source, rather than a silent
+deletion.
 
 ### D2. The 3-way stream overlap is performance, not correctness
 
@@ -125,6 +136,78 @@ each**.
 forward refuses because `AttentionBlock` indexes the COLLAPSED geometry. So W1
 is a forward change, not a loader change — and the refusal's own text is the
 specification of what to build.
+
+### W1 design — the compressor-only shape is COMPOSITION, not new kernels
+
+Traced before estimating, because every earlier estimate on this row family moved
+once the tree was read.
+
+**Every primitive W1 needs already exists, on CPU and CUDA.**
+
+| the shape needs | what exists |
+|---|---|
+| the window pass | `vt::MlaDecodeAttention` with `window_size` (`left == sliding_window - 1`) -- landed by `KV-DSV4-MULTICACHE` W5 |
+| the compressed-history pass | the SAME op's SELECTED-SLOT arm, `topk_indices` + `valid_counts` |
+| combining the two | `vt::MergeAttnStates` -- an LSE merge with both `+inf` and both-`-inf` edge cases ported |
+| the pool | `CompressorPoolNorm` -- per-column softmax over the window, then RMSNorm |
+| the APE save | `CompressorSaveScoreApe` |
+| the per-head sink | `MlaDecodeAttentionArgs::attn_sink`, landed by W5 |
+
+So W1 composes: save state each step, pool at a boundary into the compressed
+cache, then TWO attention passes merged by their LSEs -- rather than the single
+fused two-cache kernel upstream calls
+(`flash_mla_with_kvcache(k_cache=swa, extra_k_cache=compressed, ...)`). The
+composition is mathematically the same; only the kernel fusion differs, and that
+is a performance question for a later wave, not a correctness one.
+
+**`compress_ratio == 128` FIRST because `coff == 1` there.** `overlap` is
+`compress_ratio == 4`, so the 128 shape has no overlapping windows and no
+`head_offset` role selection -- the mechanism W5-4 of `dsv4-dsa-compose.md`
+describes. It exercises the state cache, the boundary gate and the two-pass merge
+without the hardest part.
+
+#### The `c128a` selection is ARITHMETIC, not a learned top-k
+
+The last unknown in W1's shape, and it resolves in W1's favour. The compressed
+pass needs an index list, and the name upstream gives it --
+`c128a_global_decode_topk_indices` -- reads like the Lightning Indexer's output.
+It is not.
+
+`sparse_mla.py:126-129` calls the field "Pre-computed C128A metadata
+(compress_ratio == 128 only). Decode: global slot ids + valid-entry counts
+**(fused from positions)**", and `_build_c128a_metadata` asserts
+`cm.positions is not None` because positions are its only input. The selection is
+therefore arithmetic over the current position -- which compressed windows have
+CLOSED -- and carries no learned component at all.
+
+That is what makes `compress_ratio == 128` the right first shape. It needs:
+
+- the compressor cycle (landed: `CompressorStepCycle`),
+- a window pass and a compressed pass merged by LSE (proven equivalent above),
+- and an index list computable from `positions` alone.
+
+The Lightning Indexer, which DOES learn its selection, belongs only to the
+`compress_ratio == 4` layers and therefore to W3. A reader who assumed "topk
+implies indexer" would have pulled W3's hardest dependency into W1 for no reason.
+
+#### THE SINK MUST ENTER EXACTLY ONE PASS
+
+The trap, written down before anyone hits it. A sink is one extra logit in the
+DENOMINATOR. `MergeAttnStates` combines two states by their LSEs, and each pass's
+LSE is `log sum exp(its scores)`. **If both passes seed the denominator with the
+sink, the merged denominator counts it TWICE**, and the result is a plausible,
+slightly-too-small attention output that no token gate would catch.
+
+This is the same defect family as the split double-count `MlaDecodeAttentionArgs`
+already documents: a sink added per split rather than in the final reduction. It
+has now appeared twice in this design, which is why it is stated as a rule --
+**the sink belongs to exactly one contributor to any merged denominator** --
+rather than as a note about one kernel.
+
+The gate must therefore compare a two-pass merged result against a SINGLE-pass
+reference over the union of both key sets, with a non-zero sink, at a length
+where both passes are non-empty. A gate where either pass is empty cannot see a
+double-count.
 
 ## Our baseline
 

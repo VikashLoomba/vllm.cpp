@@ -1971,6 +1971,180 @@ labeled secondary floor and no vLLM denominator (§3.6).
 **Exclusions:** no correctness claim that names vLLM as the runtime denominator.
 **Needs a GPU and the asset.**
 
+#### W9 — the forward, the first token, and the seam's second client (GPU + asset)
+
+**Why this block exists at all.** §3.7 was authored as eight waves and none of
+them is the forward. W5 was struck to `KV-DSV4-MULTICACHE` (#2323), W6 is sparse
+prefill and W7 was the loader — whose TEST list said "the model loads and
+produces a first token" and whose SCOPE paragraph said only the loader. W7
+delivered the scope and not the second half of the test line, and `## Owed` O21
+records that plainly. This block is the wave O21 names, written before its code
+as `## Spec before code` requires, and it is deliberately numbered W9 rather
+than folded into W7, because W7 has landed and a landed wave's scope is not
+edited afterwards to cover work it did not do.
+
+**Scope.** `GlmMoeDsaModel::Forward` / `ForwardDevice` replacing
+`kForwardRefusal` with logits, composed only of seams that already exist:
+
+1. a per-layer `RunLayer` driving `GlmMoeDsaMlaSchedule(p)`'s 78 `MlaBlockDims`
+   in order, over ONE `mla::MlaSharedSelection` allocated per forward and handed
+   to every layer — which is what makes a `kShared` layer read the selection its
+   owning `kFull` layer wrote (`mla.py:180`). This discharges O19: the eleventh
+   argument of `ForwardMlaAttentionBlock` gets its first production caller.
+2. a sparse-step builder that populates `meta.indexer_cu_seqlens_q`, and the
+   refusal that is the exact complement of the route predicate;
+3. the 256-expert MoE routed through `expert_stream::ExpertSlice`, which makes
+   GLM-5.3 the seam's SECOND client and discharges O15;
+4. the fp32 router gate GEMM, sized from `router_dtype_is_f32` exactly as
+   `deepseek_v2.cpp:363` sizes it;
+5. `ModelFactory::streams_routed_experts = true` on `kGlmMoeDsaFactory` — O22,
+   which is a claim about the forward and may only be made once the forward
+   reads through the slot seam. Without it `CheckDeviceWeightFit` charges
+   187.312 GiB against 119.631 GiB and refuses the load, so the flag and the
+   forward land together or neither is testable on `dgx:gpu0`.
+
+**Exclusions.** No speed number and no denominator (O10 stands). No sparse
+prefill beyond what a FIRST token needs — W6 owns it, and this wave does not
+touch `MlaPrefillAttentionArgs` or `MlaPrefillAttention`. No indexer KV side
+cache: a resumed request is REFUSED BY NAME and O4 keeps its owner. No MTP. No
+safetensors arm. No change to `deepseek_v2.cpp`, `qwen3_5.cpp` or the Qwen3.5
+streamed lane.
+
+**Upstream anchors, verified at parity pin `5559679229bc961848b121ccdeaa8fa5d79bec98`.**
+`DeepseekV2DecoderLayer.forward` `deepseek_v2.py:1262-1345`;
+`DeepseekV2MoE.forward` `:395-424`; the shared `topk_indices_buffer`
+`:1372-1377` allocated once per model and handed to every layer at `:1395`; the
+reuse itself `vllm/model_executor/layers/mla.py:180`; `_get_moe_router_dtype`
+`:123-133` with the `glm_moe_dsa` special case at `:127`; the whole-step MQA
+promotion `vllm/model_executor/layers/attention/mla_attention.py:829-851` and
+its `use_dense_mha` source `sparse_mla_attention.py:296-299`; the absorbed
+decode form `mla_attention.py:739-830`; `process_weights_after_loading`
+`mla_attention.py:875-962` and its own reason for keeping the absorbed halves
+unquantized at `:876-878`.
+Ours: `mla::ForwardMlaAttentionBlock` and `mla::MlaSharedSelection`
+(`mla_attention.h`), `mla::AbsorbKvBProjBf16`, `expert_stream::ExpertSlice` /
+`ExpertStreamStepGuard` (`expert_stream_seam.h`), `vt::MoeRouterTopK`,
+`vt::FusedChain`, `BuildMlaStep` (`deepseek_v2.h`), and the sparse-step shape
+`BuildDots3NoteSparseStep` already builds (`dots3_note_device.cpp`).
+
+**Five findings this wave measured before writing a line, each of which changes
+the work.** O21 named two of them and asked for both to be verified; they are,
+and three more came with them.
+
+- **F1 — `ForwardMlaAttentionBlock`'s `shared` parameter has no production
+  caller.** VERIFIED. `git grep ForwardMlaAttentionBlock` over `src` returns
+  four production call sites — `deepseek_v2.cpp:515`, `dots3_note_device.cpp`,
+  `kimi_linear_device.cpp`, `minicpm3.cpp` — and every one of them passes ten
+  arguments. O21 was right, and this wave is the caller.
+- **F2 — `BuildMlaStep` never sets `indexer_cu_seqlens_q`.** VERIFIED. The only
+  producer in the tree is `BuildDots3NoteSparseStep`. GLM therefore needs its
+  own builder, and it needs it for the same reason dots3-note does: the field
+  being non-empty is what declares the whole step MQA.
+- **F3 — THE PUBLISHED FILE'S `attn_q_a` AND `attn_kv_a_mqa` CARRY DIFFERENT
+  GGML TYPES, so the fused A-projection the MLA seam requires cannot be built by
+  concatenation.** Read off the real shard 2 header (`GLM-5.3-UD-IQ1_S-00002-of-
+  00006.gguf`, 455 tensors): `blk.0.attn_q_a.weight` is `[2048, 6144]` **Q5_K**
+  and `blk.0.attn_kv_a_mqa.weight` is `[576, 6144]` **Q8_0**. Upstream fuses them
+  because `packed_modules_mapping` fuses them (`deepseek_v2.py:1812-1820`) out of
+  a bf16 checkpoint where a row concatenation is meaningful; here the two halves
+  are two different quantizations and no byte concatenation exists. The seam is
+  therefore EXTENDED, additively: `MlaBlockWeights` grows a `q_a_proj`, and the
+  `has_q_lora()` branch takes `{q_a_proj, kv_a_proj_with_mqa}` when it is present
+  and `fused_qkv_a_proj` otherwise. The arithmetic is IDENTICAL — the fused arm
+  already slices the weight's output rows and issues one GEMM per slice
+  (`mla_attention.cpp`, the recorded DEVIATION above the A-projections), so
+  supplying the two slices as two weights is the same two GEMMs on the same
+  bytes. Exactly one of the two must be present; both, or neither, is refused by
+  name. Nothing else in the tree sets `q_a_proj`, so every existing registration
+  is byte-identical.
+- **F4 — the GGUF's `attn_k_b` and `attn_v_b` are the PER-HEAD TRANSPOSES of the
+  seam's `w_uk_t` and `w_uv`, and no quantized batched GEMM exists to consume
+  them in place.** `blk.0.attn_k_b.weight` reads `[64, 512, 192]` =
+  `[heads, kv_lora_rank, qk_nope_head_dim]` and `blk.0.attn_v_b.weight` reads
+  `[64, 256, 512]` = `[heads, v_head_dim, kv_lora_rank]`, both Q8_0 — llama.cpp's
+  `ggml_mul_mat` contracts over `ne[0]`, so its rows run along the contraction
+  axis. The seam's decode arm needs `w_uk_t` `[heads, qk_nope, kv_lora]` and
+  `w_uv` `[heads, kv_lora, v_head]` for `vt::BatchedMatmul`, whose contract is
+  "a/b share f32 or bf16" and "only the innermost dimension must be unit-stride"
+  — so neither a transposed view nor a quantized operand is admissible. This is
+  upstream's own situation and upstream's own answer: `W_UK_T` and `W_UV` are
+  plain bf16 copies produced by `process_weights_after_loading`, and
+  `mla_attention.py:876-878` says why ("we currently do not have quantized bmm's
+  which are needed for W_UV and W_UK_T ... the extra memory overhead of this is
+  fairly low"). So this wave adds upstream's own stage, under upstream's own
+  name — a POST-LOAD ABSORPTION that rebuilds the checkpoint-layout `kv_b_proj`
+  from the two GGUF halves and then calls the SHARED `mla::AbsorbKvBProjBf16` on
+  it rather than writing a second absorber. It runs in the LOADER, which is
+  where `deepseek_v2_weights.cpp:138-153` already calls that same absorber for
+  the safetensors arm: the stage needs the dequantizer and the open `GgufFile`,
+  and both live there.
+  **It costs bytes and the number is stated rather than discovered:** 58.8 MB per
+  layer over 78 layers = **4.48 GiB on top of §3.3's 14.511 GiB resident**, so the
+  resident class this wave actually loads is ~18.99 GiB and O9's prediction is
+  restated against it rather than quietly failed.
+- **F5 — the published file still states no indexer schedule, confirmed by
+  reading its own KV block a second time.** Shard 1 is 9,428,677 bytes, 0
+  tensors, **64 keys**, and none of `glm-dsa.attention.indexer.types`,
+  `index_topk_freq` or `index_skip_topk_offset` is among them. O17's diagnosis
+  holds on the staged bytes, so the run in this wave feeds the file
+  `scripts/glm-dsa-write-indexer-types.py` repaired, and records the sha256 of
+  the published shard 1 and of the derived one side by side. The loader's
+  refusal is not weakened.
+
+**Tests.**
+
+- **The model produces a first token, through the production entry point.**
+  `LoadedEngine::FromModelDir` on the W7 synthetic `glm-dsa` fixture, then
+  `engine().generate(prompt_ids, greedy, id)` — the same two calls a user makes.
+  A unit test that called `GlmMoeDsaModel::Forward` directly would prove the
+  class works and nothing about whether anything reaches it.
+- **Every float comparison is guarded by `isfinite`, and the logits are PRINTED.**
+  The sibling Flash row read an all-NaN forward as a PERFECT match, because every
+  comparison against a NaN is false, and then emitted token id 0 eight times. So
+  the gate asserts the logits are finite BEFORE it asserts anything about their
+  values, and the run report carries NaN/Inf counts, min/max/mean/sd and the
+  top-5 `(id, logit, decoded piece)` whether or not the token looks sensible.
+  Uniform logits and NaN logits both argmax to 0; neither is a token.
+- **The selection reaches attention, and a shared layer reuses it.** A `kShared`
+  layer's selection is byte-identical to the one its owning `kFull` layer wrote,
+  and the two layers produce DIFFERENT attention outputs (the tautology guard).
+  Mutation: re-point the shared buffer at a different layer.
+- **The MoE routes through the seam.** `ExpertStreamLane::SetForceFallback`
+  proves the streamed slice and the resident tower produce identical logits
+  inside one process — G3, extended to a GLM-5.3-shaped model, which is what
+  makes GLM the seam's second client rather than a claim that it is.
+- **The router GEMM's output dtype is f32.** O18 records that no numerical gate
+  can SEE this on a tiny fixture; what is gated is that `router_dtype_is_f32`
+  reaches the buffer that is allocated, proven by mutation rather than by a
+  tolerance.
+- **Reachability.** The production call site of the forward is deleted in a
+  scratch copy and the focused gate must red. The tree is restored
+  byte-for-byte and hashed. A mutation killed by the COMPILER is weaker than one
+  killed by an assertion and is rewritten to compile.
+
+**Gate.** `scripts/agent-preflight.sh --fail-on-skip` with zero skips; the
+focused C++ suites run by hand with their counts; Qwen3.5 streaming inertness,
+because this wave adds a second client to a lane Qwen3.5 owns; dots3-note
+inertness, because the sparse-step eligibility predicate is lifted into the MLA
+seam and dots3-note is made to call the lifted one rather than keeping a second
+copy. Then the real load on `dgx:gpu0` under an `rc` lease, `--max-tokens 1`
+first, resumable.
+
+**Stop conditions.**
+
+- The artifact is incomplete or fails its sha256: report and stop. Do not start
+  a second download and do not kill the running `curl`.
+- The forward refuses on the real artifact: report the refusal VERBATIM and
+  stop. An honest refusal naming the missing piece has been worth more than a
+  speculative patch on every wave of this row.
+- A degenerate token (id 0, a repeated character, uniform logits): print the
+  distribution first and theorise second.
+- `dgx:gpu0` cannot hold the resident class at F4's restated 18.99 GiB: record
+  it against O9 as a measured miss rather than adjusting the prediction.
+- Anything that would need the indexer KV side cache: refuse by name and leave
+  O4 with `KV-DSV4-MULTICACHE`. A FIRST token on a fresh prompt does not need
+  one; a SECOND does.
+
 ### 3.8 Risks and decisions taken in this section
 
 **D1 — the GGUF arm ships and the safetensors arms are refused by name.** This
@@ -2211,6 +2385,15 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   tensors, header ending exactly at end-of-file. A dry run over the real shard
   produces a 9,428,810-byte file, 64 keys becoming 65, sha256
   `b3e9838651a5c279533c98390ab4bc03cf1d8c176d5be0754180f07d9ed85c01`.
+  **CONFIRMED ON THE REAL BYTES BY W9, 2026-08-30.** The dry run above was a dry
+  run; W9 ran the script against the STAGED shard 1 with the committed
+  `config.json` and wrote the output: 9,428,677 -> 9,428,810 bytes, 64 keys ->
+  65, `21 full of 78`, full layers `{0,1,2} u {6,10,...,74}`, read back and
+  re-parsed by the script itself, sha256
+  `b3e9838651a5c279533c98390ab4bc03cf1d8c176d5be0754180f07d9ed85c01` — bit for
+  bit the dry run's predicted hash. Both hashes are now recorded side by side in
+  `docs/USAGE.md`. What remains owed is only the LOAD: the repaired shard has
+  never been fed to the loader, because shards 4-6 are not staged.
   **The output is a DERIVED artifact and must never be quoted as the published
   one.** The loader's refusal is NOT weakened, which is D3's whole point: a
   hardcoded 78-entry constant that happens to be right is the shape that silently
@@ -2321,11 +2504,15 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   sparse step routes every token through MQA (`mla_attention.cpp:448-453`), which
   a fresh prompt can do and a resumed request cannot until O4 lands. Owned by
   this row.
+  **Scheduled as §3.7 W9, written before its code as `## Spec before code`
+  requires. W9 verified both findings this item states and measured three more;
+  see W9's F1..F5.**
 - **O22 — `ModelFactory::streams_routed_experts` is deliberately NOT set on
   `kGlmMoeDsaFactory`, and the load on `dgx:gpu0` cannot succeed until it is.**
   The flag asserts that THIS model's forward reads experts through the slot seam,
   and `model_registry.h:552-589` argues at length that it is a property of the
-  forward and lives beside it. W7 has no forward, so setting it would be a claim
+  forward and lives beside it. Scheduled as part of §3.7 W9, which is
+  the change that lands the forward. W7 has no forward, so setting it would be a claim
   about code that is not there. The cost is exact, and stating it is the point of
   this item: without the flag `model_loader.cpp:2487-2494` never builds the lane,
   so `CheckDeviceWeightFit` charges the device the full 187.312 GiB of towers
@@ -2337,6 +2524,77 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   exactly that: the published arm is unfeedable as shipped (O17), no load of the
   real artifact has run, and no token exists. Discharged when the row can state a
   driven load instead of a reachable loader.
+
+- **O24 — the routed-expert MoE runs the PER-EXPERT reference loop, and the
+  grouped keep-quant arm is deliberately not taken.** `vt::MoeGateUpSwiGLUGrouped`
+  consumes the WHOLE stacked tower, so it bypasses the slot lane entirely —
+  the same conflict `qwen3_5.cpp` resolves by turning grouping OFF whenever
+  streaming is on, and saying so on stderr. This row has no speed axis (O10) and
+  a grouped MoE that silently un-streams a 187.312 GiB expert set is the
+  invisible-fallback shape this campaign keeps finding, so W9 takes the loop.
+  Discharged by a row that wants the lever and can gate it, which is
+  `ENG-EXPERT-STREAM` W6 / `ENG-EXPERT-STREAM-DEVICE` W2 territory rather than
+  this row's.
+- **O25 — W9 adds a THIRD host-slice helper beside the two `ResidentWeight`
+  definitions O13 names.** `GlmResidentExpertSlice` (`glm_moe_dsa_forward.cpp`)
+  is the resident fallback `expert_stream::ExpertSlice` takes when streaming was
+  never requested or the device is discrete. It is NOT a third `ResidentWeight`:
+  it aliases the borrowed mmap at a row offset and REFUSES a discrete device by
+  name, where both `ResidentWeight`s would stage. But it is a third place in
+  this tree that decides how a weight becomes a device tensor, which is the
+  count O13 was already unhappy about. Discharged with O13, which still has no
+  owner.
+- **O26 — the router GEMM is deliberately WIDER than vLLM, on one op, and
+  nothing gates the difference.** Upstream's `GateLinear` holds the gate at the
+  model dtype and takes a bf16 x bf16 -> f32 tier
+  (`fused_moe/router/gate_linear.py`); the published GGUF stores
+  `ffn_gate_inp` at F32, and W9's forward keeps it there and widens the
+  ACTIVATION to match, so the GEMM is f32 x f32 -> f32. Three reasons are
+  recorded at the call site: it is the smallest GEMM in the model, vLLM's own
+  `force_fp32_compute` arm stores this exact weight in fp32 when no specialized
+  kernel is available, and the output feeds a DISCRETE top-k where narrowing the
+  artifact's own f32 would be us discarding precision the file carries. O18
+  already records that no numerical gate on a tiny fixture can SEE a router
+  dtype; this is the same blindness pointed the other way, and it is named
+  rather than left for a reader to find. Discharged by a fixture whose routing
+  is precision-sensitive enough to separate the two arms.
+- **O27 — the absorbed MLA trio costs 4.48 GiB that §3.3's residency plan does
+  not contain, and O9's prediction is restated rather than met.** Per layer:
+  `kv_b_proj` 29.4 MB + `w_uk_t` 12.6 MB + `w_uv` 16.8 MB = 58.8 MB, over 78
+  layers. So the resident class this port actually holds is ~18.99 GiB against
+  the 14.511 GiB §3.3 computed from the shard headers, and the §3.10 arithmetic
+  that put resident + a 4096-slot cache at 40.01 GiB becomes ~44.5 GiB against
+  119.631 GiB. It is not avoidable at this pin: `vt::BatchedMatmul` shares
+  "f32 or bf16" across its operands and there is no quantized bmm, which is the
+  same constraint `mla_attention.py:876-878` records upstream. Discharged by a
+  quantized batched GEMM, or by W7's measured-footprint number landing against
+  this figure instead of against 14.511 GiB.
+
+- **O28 — the post-load absorption's ORIENTATION has no gate, and this is
+  measured rather than suspected.** W9's mutation M5 dropped the per-head
+  transpose entirely — reading `attn_k_b` verbatim into `kv_b_proj`'s nope rows
+  — and every shape, every byte count, all 7 forward cases and all 4 load cases
+  stayed GREEN. Only the logit VALUES moved (the fixture's top-2 margin went
+  0.00482 -> 0.00068), and nothing on this row compares a value to anything,
+  because there is no oracle (O1). The orientation is therefore established by
+  READING two conventions against each other: llama.cpp's `ggml_mul_mat`
+  contracts over `ne[0]`, so `attn_k_b`'s rows run along `qk_nope_head_dim`,
+  while `vt::BatchedMatmul` is `torch.bmm`, so `w_uk_t`'s rows run along
+  `kv_lora_rank`. The dimensions cannot disambiguate it either: the wrong index
+  order stays in bounds on both the real checkpoint and the fixture.
+  `test_glm_moe_dsa_gguf_load.cpp` now carries a DRIFT LOCK that fires on M5,
+  and its own comment says what it is — a transcription of the rule the loader
+  implements, which catches a later edit that changes one without the other and
+  proves nothing about which rule is right. Discharged by G4, llama.cpp `b10451`
+  on the identical artifact (§3.6, W8), which needs the complete checkpoint.
+- **O29 — `streams_routed_experts` is set and NOTHING on a CPU can see it, and
+  W9 measured that rather than reading it.** Mutation M4 deleted the flag from
+  `kGlmMoeDsaFactory` and all 7 forward cases stayed green, because the only
+  reader is `model_loader.cpp`'s streamed-lane block, which is guarded on
+  `needs_weight_staging() && host_memory_is_device_addressable()` — true on
+  `dgx:gpu0` and false on every CI runner. This is O14's statement for O22's
+  flag, and it converts both from "proven by reading" into a measured negative.
+  Discharged by the wave that drives the load on `dgx:gpu0`.
 
 ### 3.10 Now
 

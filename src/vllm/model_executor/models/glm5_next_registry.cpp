@@ -431,7 +431,7 @@ const ModelFactory kGlm5NextFactory{
     // name, so `ModelRegistry::Forward` stops refusing the step above it. The
     // consuming code is `glm5_next_kv.cpp` and the refusals it can raise are
     // all by name.
-    .consumes_multi_kv_cache = true,
+    .consumes_multi_kv = true,
 };
 
 }  // namespace

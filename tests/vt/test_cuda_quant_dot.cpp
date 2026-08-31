@@ -1564,3 +1564,181 @@ TEST_CASE("CUDA device codebooks == the CPU host tables (byte-exact)") {
   CHECK(sizeof(snap->kvalues_iq4nl) == sizeof(vt::cpu::kValuesIq4nl));
 }
 #endif  // VLLM_CPP_CUDA
+
+// ─── GLM-5.3-Flash's PUBLISHED geometry, on its four real encoding triples ───
+//
+// Every grouped case above runs at E<=4, n<=16, k=8 blocks. That is the right
+// shape for a codebook gate and it is the wrong shape for a residency one: the
+// numbers it exercises are four to eight orders of magnitude below the ones
+// this model actually presents, so nothing above can see an index or an offset
+// that only misbehaves when the tower is large.
+//
+// `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL presents `n_routed_experts` 288,
+// `moe_intermediate_size` 2048 and `hidden_size` 4096, so ONE routed-expert
+// tower is 288 * 2048 * 4096 = 2,415,919,104 elements. **That is past INT32**,
+// and it is past it by element count while every BYTE offset in the same tower
+// (287 * 2048 * 1184 = 696 MB for IQ2_XS) still fits — so a 32-bit element
+// count truncates while a 32-bit byte offset does not, and only the real
+// geometry separates them.
+//
+// THE FOUR TRIPLES ARE THE CHECKPOINT'S, read off its GGUF tensor headers
+// across all four shards on 2026-08-30 and recorded in
+// `.agents/specs/glm5-next-flash.md` §W9a:
+//   (IQ2_XS, IQ2_XS, IQ3_XXS) x39   (IQ2_XS, IQ2_XS, IQ4_XS)  x2
+//   (IQ3_XXS, IQ3_XXS, IQ4_XS) x1   (Q2_K,   Q2_K,   Q3_K)    x1
+// gate and up share a dtype in all 43 sparse blocks, which is what lets the
+// FUSED seam represent this checkpoint at all; the down tower is separately
+// encoded and runs through `vt::MatmulBTQuantGrouped`.
+//
+// P = 16 is two tokens at the published `num_experts_per_tok` of 8. Two tokens
+// rather than one, because a single token cannot distinguish an activation
+// gather that reads the wrong row.
+namespace {
+
+const WeightCase& CaseFor(DType dt) {
+  for (const WeightCase& c : kCases)
+    if (c.dtype == dt) return c;
+  FAIL("no WeightCase for the requested dtype");
+  return kCases[0];
+}
+
+struct Glm5Triple {
+  DType gate_up;
+  DType down;
+  const char* what;
+};
+const Glm5Triple kGlm5Triples[] = {
+    {DType::kIQ2_XS, DType::kIQ3_XXS, "blk.3-44 (39 layers)"},
+    {DType::kIQ2_XS, DType::kIQ4_XS, "blk.12, blk.44"},
+    {DType::kIQ3_XXS, DType::kIQ4_XS, "blk.11"},
+    {DType::kQ2_K, DType::kQ3_K, "blk.45"},
+};
+
+}  // namespace
+
+TEST_CASE("CUDA grouped keep-quant at GLM-5.3-Flash's published MoE geometry") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; GLM-5.3-Flash geometry gate skipped");
+    return;
+  }
+  // The published constants, named rather than spelled inline so a reader can
+  // check them against configuration_glm5_next.py and the GGUF kv.
+  constexpr int64_t kE = 288;     // n_routed_experts
+  constexpr int64_t kI = 2048;    // moe_intermediate_size
+  constexpr int64_t kH = 4096;    // hidden_size
+  constexpr int64_t kTopK = 8;    // num_experts_per_tok
+  constexpr int64_t kTokens = 2;
+  constexpr int64_t kP = kTokens * kTopK;
+  static_assert(static_cast<int64_t>(kE) * kI * kH > 2147483647LL,
+                "the point of this case is a tower past INT32 elements");
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+  Queue cq{Cpu(), nullptr};
+
+  int64_t triples = 0;
+  for (const Glm5Triple& tr : kGlm5Triples) {
+    const std::string what(tr.what);
+    CAPTURE(what);
+    const WeightCase& cg = CaseFor(tr.gate_up);
+    const WeightCase& cd = CaseFor(tr.down);
+    CAPTURE(cg.name);
+    CAPTURE(cd.name);
+    ++triples;
+
+    // gate/up are [E * I, H]; down is [E * H, I]. Both are the stacked towers
+    // `LoadStackedExperts` writes and `AdmitMoeQuantBanks` views.
+    const int64_t gu_rows = kE * kI;
+    const int64_t dn_rows = kE * kH;
+    std::vector<uint8_t> gw = RandomBlocks(cg, gu_rows * (kH / cg.block_elems), 0x51EEDU);
+    std::vector<uint8_t> uw = RandomBlocks(cg, gu_rows * (kH / cg.block_elems), 0x52EEDU);
+    std::vector<uint8_t> dw = RandomBlocks(cd, dn_rows * (kI / cd.block_elems), 0x53EEDU);
+
+    // Distinct experts across the 16 slots, spread over the full 288 so the
+    // top of the range is exercised and not just the first few rows.
+    std::vector<int32_t> ids(static_cast<size_t>(kP));
+    for (int64_t p = 0; p < kP; ++p)
+      ids[static_cast<size_t>(p)] = static_cast<int32_t>((p * 37 + 5) % kE);
+    ids[static_cast<size_t>(kP - 1)] = static_cast<int32_t>(kE - 1);  // the last row
+
+    std::vector<float> a(static_cast<size_t>(kP * kH));
+    GenerateData(1.0F, a.size(), a.data());
+
+    const size_t midn = static_cast<size_t>(kP * kI);
+    const size_t outn = static_cast<size_t>(kP * kH);
+    constexpr float kLimit = 10.0F;  // config.swiglu_limit on this checkpoint
+
+    std::vector<float> cpu_mid(midn, kPoison);
+    std::vector<float> cpu_out(outn, kPoison);
+    {
+      Tensor at = Tensor::Contiguous(a.data(), DType::kF32, Cpu(), {kP, kH});
+      Tensor gt = Tensor::Contiguous(gw.data(), DType::kF32, Cpu(), {gu_rows, kH});
+      Tensor ut = Tensor::Contiguous(uw.data(), DType::kF32, Cpu(), {gu_rows, kH});
+      gt.dtype = cg.dtype;
+      ut.dtype = cg.dtype;
+      Tensor et = Tensor::Contiguous(ids.data(), DType::kI32, Cpu(), {kP});
+      Tensor mt = Tensor::Contiguous(cpu_mid.data(), DType::kF32, Cpu(), {kP, kI});
+      vt::MoeGateUpSwiGLUGrouped(cq, mt, at, gt, ut, et, kLimit);
+      Tensor dt = Tensor::Contiguous(dw.data(), DType::kF32, Cpu(), {dn_rows, kI});
+      dt.dtype = cd.dtype;
+      Tensor ot = Tensor::Contiguous(cpu_out.data(), DType::kF32, Cpu(), {kP, kH});
+      vt::MatmulBTQuantGrouped(cq, ot, mt, dt, et);
+    }
+
+    void* d_a = gpu.Alloc(a.size() * sizeof(float));
+    void* d_g = gpu.Alloc(gw.size());
+    void* d_u = gpu.Alloc(uw.size());
+    void* d_d = gpu.Alloc(dw.size());
+    void* d_e = gpu.Alloc(ids.size() * sizeof(int32_t));
+    void* d_m = gpu.Alloc(midn * sizeof(float));
+    void* d_o = gpu.Alloc(outn * sizeof(float));
+    const std::vector<float> poison_mid(midn, kPoison);
+    const std::vector<float> poison_out(outn, kPoison);
+    gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+    gpu.Copy(gq, d_g, gw.data(), gw.size());
+    gpu.Copy(gq, d_u, uw.data(), uw.size());
+    gpu.Copy(gq, d_d, dw.data(), dw.size());
+    gpu.Copy(gq, d_e, ids.data(), ids.size() * sizeof(int32_t));
+    gpu.Copy(gq, d_m, poison_mid.data(), poison_mid.size() * sizeof(float));
+    gpu.Copy(gq, d_o, poison_out.data(), poison_out.size() * sizeof(float));
+    gpu.Synchronize(gq);
+
+    Tensor at = DevTensor(d_a, DType::kF32, {kP, kH});
+    Tensor gt = DevTensor(d_g, cg.dtype, {gu_rows, kH});
+    Tensor ut = DevTensor(d_u, cg.dtype, {gu_rows, kH});
+    Tensor dt = DevTensor(d_d, cd.dtype, {dn_rows, kI});
+    Tensor et = DevTensor(d_e, DType::kI32, {kP});
+    Tensor mt = DevTensor(d_m, DType::kF32, {kP, kI});
+    Tensor ot = DevTensor(d_o, DType::kF32, {kP, kH});
+    vt::MoeGateUpSwiGLUGrouped(gq, mt, at, gt, ut, et, kLimit);
+    vt::MatmulBTQuantGrouped(gq, ot, mt, dt, et);
+
+    std::vector<float> cuda_mid(midn, 0.0F);
+    std::vector<float> cuda_out(outn, 0.0F);
+    gpu.Copy(gq, cuda_mid.data(), d_m, cuda_mid.size() * sizeof(float));
+    gpu.Copy(gq, cuda_out.data(), d_o, cuda_out.size() * sizeof(float));
+    gpu.Synchronize(gq);
+    gpu.Free(d_a); gpu.Free(d_g); gpu.Free(d_u); gpu.Free(d_d);
+    gpu.Free(d_e); gpu.Free(d_m); gpu.Free(d_o);
+
+    const GroupedVerdict vm = Compare(cuda_mid, cpu_mid);
+    const GroupedVerdict vo = Compare(cuda_out, cpu_out);
+    CAPTURE(vm.nmse);
+    CAPTURE(vm.poisoned);
+    CAPTURE(vm.nonfinite);
+    CAPTURE(vo.nmse);
+    CAPTURE(vo.poisoned);
+    CAPTURE(vo.nonfinite);
+    // Both halves, because a fused seam that silently launched nothing would
+    // leave the poison in `mid` and the down GEMM would then faithfully
+    // propagate a poisoned input into a finite-looking output.
+    CHECK(vm.poisoned == 0);
+    CHECK(vo.poisoned == 0);
+    CHECK(vm.nonfinite == 0);
+    CHECK(vo.nonfinite == 0);
+    CHECK(vm.nmse <= kMaxNmseVsCpu);
+    CHECK(vo.nmse <= kMaxNmseVsCpu);
+  }
+  CHECK(triples == static_cast<int64_t>(std::size(kGlm5Triples)));
+  gpu.DestroyQueue(gq);
+}

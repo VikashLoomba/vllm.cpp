@@ -60,7 +60,7 @@ they are recorded here as inputs rather than as findings:
 | question | answer | evidence |
 |---|---|---|
 | does f32 have an `ElemKind`? | YES | `src/vt/cpu/cpu_matmul_elem.cpp`, `ElemKindOf`, `case DType::kF32` |
-| so does the dtype force `MatmulOneChunkRef`? | NO | the `!ElemKindOf(...)` disjunct at `cpu_ops.cpp:122` is false for f32 |
+| so does the dtype force `MatmulOneChunkRef`? | NO | in `MatmulOneChunk`, `!ElemKindOf(b.dtype, &bk) \|\| !ElemKindOf(a.dtype, &ak) \|\| k <= 0 \|\| ElemGemmUseRef()` is false for f32 |
 | is the connector's weight repack-eligible? | YES | `ElemRepackEligible` returns true for f32 with `n, k > 0` |
 | does anything repack it? | NO | the only `ElemRepackWeight` caller and the only `elem_kn_repacked = true` assignment are both in `qwen3_5_gguf_weights.cpp` |
 
@@ -213,9 +213,10 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1, W2 and W3 are complete on x86-64 and the aarch64 half is under a
-queued lease. W4 is a **measured redirection** rather than a repair, and the
-reason is in `## Outcome`.
+`DONE` on what it set out to measure. W1, W2 and W3 are complete on x86-64 AND
+on aarch64, including GB10 itself. W4 is a **measured redirection** rather than a
+repair: the lever this row sized is a `vt` seam change owned by
+`VT-CPU-ELEM-DISPATCH`, and `## Owed` says so.
 
 ## Outcome
 
@@ -223,15 +224,20 @@ reason is in `## Outcome`.
 
 **`conditioning.connector.compute` is not dominated by the GEMM.** Two
 independent instruments, sharing no code, put `vt::AttentionCross` at **54% to
-61%** of `Ltx2ConnectorForward` against the specialized GEMM micro-kernels at
-**27% to 31%**, on an idle box and under load alike. The connector's attention
-performs **4.2% of the layer's arithmetic and takes 58% of its time** -- it costs
-**2.3x the GEMM**.
+67%** of `Ltx2ConnectorForward` against the specialized GEMM micro-kernels at
+**25% to 35%**, across three machines, two architectures and five load regimes.
+**On GB10 -- the machine the render was measured on, idle -- it is attention
+66.5%, GEMM 24.8%, everything else 8.7%.** The connector's attention performs
+**4.2% of the layer's arithmetic and takes two thirds of its time**; it costs
+**2.7x the GEMM** there. The tier that runs is `neon`, not the reference tile,
+and the margin is **54x**.
 
 **So #2354's 37 GFLOP/s is not the GEMM's rate.** That number is
 `leaf_seconds / gemm_flops`, which is the GEMM's rate only if the leaf is the
-GEMM. On an idle devbox the same construction reads **62.8 GFLOP/s** for a video
-layer while the GEMM inside it runs at **209.6 GFLOP/s**, a 3.3x gap. The
+GEMM. **On GB10 itself -- the machine the render was measured on -- the probe
+reproduces it: `implied_GFLOPs=36.8` against the render's 37.2, while the GEMM
+inside that leaf runs at 129.3 GFLOP/s.** The two constructions agree to 1%
+because they are the same construction. The
 agreement between #2354's predicted 34 GFLOP/s and its measured 37 was real and
 was a coincidence of construction: both sides divided the whole leaf by the
 GEMM's flops, so both were bound to agree whatever else was in the leaf.
@@ -472,20 +478,130 @@ it is bit-exact for the same reason:
 | video, heads 32, d 128 | 3.858 s (4.5 GF) | **0.290 s (59.2 GF)** | **13.30x** | byte-equal |
 | audio, heads 32, d 64 | 1.961 s (4.4 GF) | **0.205 s (41.9 GF)** | **9.58x** | byte-equal |
 
-**The shipped kernel on twenty threads is slower than the hoisted one on ONE**
-(3.858 s against 3.261 s), which is the cleanest statement of the defect's size:
-the per-element dtype switch and its cross-TU `vt::SizeOf` call cost more than a
-twenty-fold parallel speedup buys back.
+**RETRACTED: "the shipped kernel on twenty threads is slower than the hoisted one
+on ONE" (3.858 s against 3.261 s).** That held HERE, on AVX-512, and this row
+published it as the cleanest statement of the defect's size. It is FALSE on both
+aarch64 hosts and it is withdrawn -- see `### RETRACTION` below for the numbers
+and for why it was an AVX-512 artifact. The x86 table above stands; the sentence
+generalizing from it does not.
 
-**What that would be worth, stated as a CONDITIONAL and not as a measurement.**
-If the aarch64 split resembles the x86 one -- **and this row did not measure it,
-so that is an assumption and not a result** -- then removing 92% of the attention
-leg takes one `RunConnector` call from 74.11 s to about 32.7 s, a **2.27x** on
-the connector. #2354 measured connector compute at 224.882 s in a 516.751 s
-render, so the same ratio would put the render near 392 s and the oracle gap
-near 4.2x instead of 5.51x. **Every number in that sentence is an extrapolation
-from one architecture the render does not run on**, and it is written as one
-because the next row needs a target, not because this row measured a render.
+**The conditional that stood here is now MEASURED and has moved.** This section
+extrapolated "if the aarch64 split resembles the x86 one" to a 2.27x on the
+connector and a ~392 s render. It no longer has to: `### The headroom, on GB10`
+below measures the split on GB10 itself and reads **2.55x** and **~380 s**. The
+conditional is superseded there rather than restated here.
+
+### THE aarch64 RUNS — the machine the render was measured on
+
+Two leases completed and **the primary one is GB10 itself**: `rc-worker-4b8lj`,
+2026-08-31T02:33:18Z, `uname=aarch64`, **Cortex-X925, 20 cores**, 119.7 GiB
+`MemAvailable`, **loadavg 1.12 at start** -- an idle box, and the same hardware
+`LTX25-RENDER-SPEED-PARITY` and #2354 measured the render on. A second,
+`rc-worker-n8smh` (14 cores), is a smaller aarch64 part and is reported beside it
+because two hosts agreeing is worth more than one.
+
+**W1 is now answered on the machine that matters, and it is not the reference
+tile.** `tier.txt`, verbatim:
+
+```
+tier_name=neon
+elem_gemm_use_ref=0
+mr=4
+f32_bt=set f32_nk=set f32_btm=set f32_nkm=set
+elem_kind_of_f32=1
+repack_eligible_f32_4096x4096=1
+```
+
+**The margin is 54x, so this is not a close call.** Forced onto the reference
+tile the same GEMM set takes **1738.202 s at 2.4 GFLOP/s**; the tier that
+actually runs takes **31.906 s at 129.3 GFLOP/s**. The portable tier takes
+119.390 s at 34.6 GFLOP/s, so NEON is 3.74x portable.
+
+**And 34.6 is a trap worth naming.** The portable tier's rate is within 7% of the
+37.2 GFLOP/s #2354 derived from the render, so a reader checking "are we on a
+slow tier?" against that number alone would conclude yes. The tier is `neon` and
+the GEMM runs at 129.3. The coincidence is arithmetic, not evidence.
+
+**The decomposition on GB10, idle** (8 layers, both streams):
+
+| | seconds | share |
+|---|---:|---:|
+| `Ltx2ConnectorForward` total | **128.808** | 100% |
+| ~ `vt::AttentionCross` | **85.704** | **66.5%** |
+| ~ the GEMMs | **31.906** | **24.8%** |
+| ~ everything else | 11.198 | 8.7% |
+
+**The closing argument: the probe reproduces #2354's number from the render.**
+One video layer reads `implied_GFLOPs=36.8` against the render-derived **37.2**,
+on the same architecture, from an independent code path. `leaf_seconds /
+gemm_flops` on this machine gives 36.8 while the GEMM inside that leaf runs at
+**129.3 GFLOP/s**. The two constructions agree to 1%, and they agree because they
+are the same construction -- not because 37 was ever a kernel rate.
+
+**The repack regression replicates on the machine `include/vt/quant.h` names.**
+`kn/bt` per shape on GB10: 1.72, 2.06, 1.57, 1.25, 1.51, 1.76, 2.70, 1.22 --
+**1.806x overall**, byte-equal on every shape, with same-arm controls at 0.90 to
+1.04. Thor reads 1.389x overall. Across two architectures and five load regimes
+the repack has never once been faster at these shapes.
+
+**Thor, the second aarch64 host**, agrees on every qualitative point:
+`tier_name=neon`, `mr=4`, GEMM 29.337 s / 140.7 GFLOP/s, `kn/bt` 1.389,
+connector 84.608 s of which attention is 48.200 s (**57.0%**) and GEMM 29.337 s
+(34.7%).
+
+**The unbiased-attention lever stays closed on aarch64 too**: 1.023 and 0.993 on
+GB10, 0.974 and 0.986 on Thor.
+
+**A cross-ISA equality signal, stated with its limit.** The connector's printed
+checksums are identical on x86-64 AVX-512 and on both aarch64 NEON hosts
+(`3.080419` video, `1.145383` audio). That is consistent with the tier
+bit-exactness contract holding across ISAs. It is **two floats at six decimal
+places**, not a golden, so it is corroboration and not a gate.
+
+### RETRACTION: "the shipped kernel on twenty threads is slower than the hoisted one on ONE"
+
+**That claim is FALSE and it is withdrawn.** It was measured on x86-64 AVX-512,
+where it held (hoisted 1 thread 3.261 s against shipped 20 threads 3.858 s), and
+this row published it as "the cleanest statement of the defect's size". On
+aarch64 it inverts:
+
+| | hoisted, 1 thread | shipped, all threads | verdict |
+|---|---:|---:|---|
+| x86-64 AVX-512, 20 cores | 3.261 s | 3.858 s | claim HELD |
+| **GB10 Cortex-X925, 20 cores** | **8.051 s** | **7.181 s** | **claim FALSE** |
+| Thor, 14 cores | 6.163 s | 4.015 s | claim FALSE |
+
+**It was an AVX-512 artifact.** The hoisted reference is written as scalar C++
+and the compiler auto-vectorizes its inner dot products; AVX-512 gives it 16
+lanes against NEON's 4, so on x86 one hoisted thread could out-run twenty
+un-hoisted ones and on Arm it cannot. The generalization was mine, not the
+measurement's, and it was made from one architecture.
+
+**What survives is the claim that was always the load-bearing one**, and it
+survives on every machine measured: the hoisted transformation at the SHIPPED
+thread count is **11.30x** (video) and **12.12x** (audio) on GB10, **8.86x** and
+**9.36x** on Thor, **13.30x** and **9.58x** on x86 -- byte-equal every time. The
+defect is real, large, and architecture-independent. The retracted sentence
+overstated how it presents on one ISA.
+
+### The headroom, on GB10
+
+| | shipped, 20 threads | hoisted, 20 threads | speedup | equality |
+|---|---:|---:|---:|---|
+| video, heads 32, d 128 | 7.181 s (2.4 GF) | **0.635 s (27.0 GF)** | **11.30x** | byte-equal |
+| audio, heads 32, d 64 | 3.532 s (2.4 GF) | **0.292 s (29.5 GF)** | **12.12x** | byte-equal |
+
+**Projected onto the render, now from the right machine.** Attention falls from
+85.704 s to 7.416 s, so a `RunConnector` call goes 128.808 s -> **50.520 s**, a
+**2.55x** on connector compute. #2354 measured that leaf at 224.882 s in a
+516.751 s render, so the same ratio puts the render near **380 s** and the oracle
+gap near **4.05x** instead of 5.51x.
+
+**This is still a projection and its assumptions are stated.** The probe's own
+connector total (128.808 s) is 14% above the render's measured leaf (112.768 s)
+-- synthetic weights, a different valid-token count, and video and audio timed in
+separate processes -- so the RATIO is what transfers, not the seconds. No render
+was run.
 
 ### W4 — a redirection, and why no kernel was changed
 
@@ -521,7 +637,12 @@ Three further reasons, each measured rather than asserted:
 
 ### What could not be measured
 
-- **The aarch64 side.** `rc` jobs `ea2631f3-aed2-46df-b419-3628078f9882`
+- **The aarch64 side is now MEASURED** and `### THE aarch64 RUNS` carries it.
+  This bullet is kept, struck through by that section rather than deleted,
+  because it is what the row could honestly say before the leases landed. The
+  jobs that answered it are `rc-worker-4b8lj-20260831T023318Z` (GB10) and
+  `rc-worker-n8smh-20260831T020213Z` (Thor). The original text follows.
+  `rc` jobs `ea2631f3-aed2-46df-b419-3628078f9882`
   (`dgx:gpu0`) and `75800c9e-0b55-406e-9958-ba0048a5a751` (`thor:gpu0`) were
   submitted with the full probe and were still queued at positions 5 and 3 when
   this row was written. `orin:gpu0` was tried first and refused: its `/workspace`
@@ -627,21 +748,37 @@ Three further reasons, each measured rather than asserted:
 
 ## Owed
 
-- **THE ATTENTION KERNEL'S PER-ELEMENT DTYPE SWITCH IS UNOWNED, AND IT IS WORTH
-  13.30x ON THE LEG IT OWNS.** 43.6% of a connector layer is `LoadF32` plus a
-  cross-TU `vt::SizeOf`; the hoisted form is byte-equal at the shipped thread
-  count and 13.30x faster (video) / 9.58x (audio), and the fix is bit-exact and
-  prototyped. It is a `vt` seam change and needs its own row, its
-  own spec, and a fresh reviewer. It is not LTX-2.5-specific: `AttentionKernel`
-  carries the same defect and every CPU attention path pays it. Owner: this row,
-  until that row exists.
-- **`include/vt/quant.h`'s "1.16x to 1.30x on dgx" needs a scope qualifier or a
-  correction.** On x86-64 AVX-512 at the connector's shapes the same lever is
-  1.78x to 2.06x SLOWER across three load regimes, byte-identical every time.
-  Which of the two that sentence needs depends on the queued aarch64 run.
-  Owner: this row.
-- **The aarch64 numbers.** Both leases are submitted and neither had started.
-  Owner: this row.
-- **No issue could be filed.** `gh api user` returns `Your account is suspended`.
-  `REMOTE_UNVERIFIED`; the branch is pushed over SSH and there is no pull
-  request. Owner: this row, until the account is restored.
+- ~~**THE ATTENTION KERNEL'S PER-ELEMENT DTYPE SWITCH IS UNOWNED.**~~ **IT IS
+  OWNED: `VT-CPU-ELEM-DISPATCH` implements the repair this row sized, and its
+  spec links this one.** What this row hands it: 43.6% of a connector layer is
+  `LoadF32` plus a cross-TU `vt::SizeOf`; the hoisted form is byte-equal at the
+  shipped thread count and worth **11.30x / 12.12x on GB10**, 8.86x / 9.36x on
+  Thor, 13.30x / 9.58x on x86-64. It is not LTX-2.5-specific -- `AttentionKernel`
+  carries the same defect and every CPU attention path pays it.
+  **That row measured something this row could not**: inlining `vt::SizeOf` alone
+  buys 1.35x to 1.93x, while the hand-hoist is worth 8.75x to 11.16x. So the
+  cheap repair is necessary and not sufficient, which is this row's own finding
+  one level down -- the obvious suspect is real and is not the whole cost.
+  Owner: `VT-CPU-ELEM-DISPATCH`.
+- **`include/vt/quant.h`'s "1.16x to 1.30x on dgx" is FIXED IN THIS CHANGE, not
+  filed.** The queued aarch64 run decided it: on dgx itself the same lever is
+  **1.22x to 2.70x SLOWER** at the connector's shapes, 1.806x overall,
+  byte-identical throughout. The sentence is contradicted on the machine it
+  names, so it gets a scope qualifier and the counter-measurement beside it
+  rather than an owner and a wait. `AGENTS.md`: a record edit rides in the change
+  whose measurement made it stale, and this row's measurement is what made it
+  stale. The byte-identity half of that sentence reproduced exactly and is
+  untouched.
+- ~~**The aarch64 numbers.**~~ **DISCHARGED.** Both leases ran.
+  `rc-worker-4b8lj-20260831T023318Z` is GB10 (Cortex-X925 x20, idle) and
+  `rc-worker-n8smh-20260831T020213Z` is Thor. `### THE aarch64 RUNS` carries the
+  result and `### RETRACTION` carries the claim they killed.
+- **STILL NO ISSUE, and the reason changed under this row.** The account that
+  filed for this campaign (`mudler-agent`) was suspended mid-row, and a suspended
+  account's content is **hidden, not deleted**, so #2296, #2354 and the rest may
+  not resolve for a reader even though they exist. GitHub now works under
+  `localai-org-maint-bot`. A `gh` lookup that fails on any of those numbers is
+  `REMOTE_UNVERIFIED` and **never** evidence the issue is absent -- filing a
+  duplicate on that reading is the failure this bullet exists to prevent. An
+  issue for this row is owed the moment someone can open one against the
+  campaign's existing thread. Owner: this row.

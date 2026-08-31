@@ -10,8 +10,10 @@ the CUDA half of the `QUANT-GGUF-IQ2_XS` and `QUANT-GGUF-IQ4_XS` rows of
 
 ## Now
 
-`ACTIVE`. The CPU arm of both encodings landed with #2247; this row is the
-device arm of the same two `vec_dot`s.
+`DONE`. The CPU arm of both encodings landed with #2247; this row is the device
+arm of the same two `vec_dot`s, and it is measured green on `dgx:gpu0` (GB10,
+`sm_121a`): 17 of 17 cases, 177,284 of 177,284 assertions, both reachability
+mutations killed and the restore proven. See `## Outcome`.
 
 ## The gap, as measured on `673464ee1`
 
@@ -198,16 +200,71 @@ standing is not a correction.
 
 ## Evidence
 
-### The device gate, on `dgx:gpu0` (GB10, `sm_121a`) -- attempt 2
+### The device gate, on `dgx:gpu0` (GB10, `sm_121a`) -- FINAL, attempt 3
 
 **Which box.** `rc-worker-4b8lj` under an `rc` lease on `dgx:gpu0`:
 `NVIDIA GB10, GPU-cb5c11ff-4ea1-5472-a9a6-c7a468a4d9f1`, driver `580.173.02`,
 aarch64, 20 cores, `nvcc` release 13.0 V13.0.88, built
-`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`. 2026-08-31T02:59:21Z to 03:24:55Z.
+`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`. 2026-08-31T07:20:29Z to 07:45:54Z.
 **No number here transfers to `thor:gpu0`**, which is `sm_110`.
 
 Arch proof, with its denominator: **37 `.cu.o` objects scanned, 37 `sm_121a`
 cubins and nothing else.**
+
+| Leg | commit | build | test rc | cases | assertions |
+|---|---|---|---|---|---|
+| RED | `52daeecea` | 0 | **139 (SIGSEGV)** | 0 passed, **1 failed**, 14 skipped | 66000 |
+| GREEN | `0d595d2b6` | 0 | **0** | **17 passed, 0 failed** | **177284, 0 failed** |
+| MUT_A fused switch | +mutation | 0 | **1** | 15 passed, **2 failed** | 177047 |
+| MUT_B dense switch | +mutation | 0 | **1** | 13 passed, **4 failed** | **71589** |
+| RESTORED | `0d595d2b6` | 0 | **0** | **17 passed, 0 failed** | **177284, 0 failed** |
+
+**RED -> GREEN is measured, not asserted.** The RED commit carries the tests and
+no kernels; it builds clean and its very first case takes the CPU-fallback path
+and SIGSEGVs, aborting the run at 1 failed and 14 skipped. The same tests at the
+implementation head pass 17 of 17 cases and 177,284 of 177,284 assertions,
+including the bit-for-bit comparison against llama.cpp `b10451`'s own `vec_dot`
+output on real GLM-5.3-Flash bytes, the stream-capture case, and the
+real-GGUF-header chain. The RED reproduced identically across two independent
+leases.
+
+**Both reachability mutations killed, with distinct kill counts.** Deleting the
+two `case` labels from the FUSED MoE switch fails 2 cases; deleting them from
+the DENSE switch fails 4 and collapses the assertion count from 177,284 to
+71,589. Two switches, two separate deletions, two separate kills -- one deletion
+would have proved only the site it deleted. Note what kills them: the surviving
+`default:` arm THROWS by name, so doctest records failed CASES with no failed
+assertions, which is why the case count and not the assertion count is the
+signal. That is a stronger kill than a compile error, which is why the mutation
+removes a `case` and leaves the file compiling.
+
+**The restore is proven, not assumed.** Each mutation was reverted, sha256'd
+against the pre-mutation hash, and REBUILT before being re-run -- a restored
+source with a stale binary has read red on a sibling row. RESTORED reproduces
+GREEN exactly: 17 cases, 177,284 assertions, 0 failed.
+
+**Sibling suites on the same box:** `test_ops_quant_dot` 249323/0 failed,
+`test_gguf_dequant` 7400/0 failed, `test_ops_quant_traits` 6210/0 failed,
+`test_gguf_keep_quant` **9 failed of 6470** -- BASE-CAUSED, see below.
+
+**The three gates `agent-preflight.sh` skips for want of a build all PASS here**
+on real data: `check-cuda-fat-gencode` 0, `check-cpu-isa-build` 0,
+`check-arm-isa-build` 0 -- the last being asked its real question, since this box
+is aarch64.
+
+### Attempt 2 is what found the two defects, and it is kept
+
+The run before the one above was GREEN-but-for-5-assertions (15 of 17 cases) and
+its RED leg segfaulted. Those two results are what produced the FMA finding and
+the fallback-segfault correction recorded below; the table above is the rerun
+after both were fixed. Its log is at `/workspace/cudaiq2260/out-attempt2-fma/`
+and attempt 1's staging failure at `/workspace/cudaiq2260/out-attempt1-clone-bug/`.
+Three leases were spent on this row: one on a staging bug, one that found two
+real defects, one green.
+
+### The device gate, on `dgx:gpu0` (GB10, `sm_121a`) -- attempt 2, superseded
+
+Same box, 2026-08-31T02:59:21Z to 03:24:55Z, same 37/37 `sm_121a` cubins.
 
 | Leg | commit | build | test | cases | assertions |
 |---|---|---|---|---|---|
@@ -512,6 +569,51 @@ and `test_ops_quant_dot` re-derives.
 `NEEDS_DECISION` rather than widening a tolerance, bending a golden, or claiming
 device parity not measured in the same tool. `NEEDS_CONTEXT` if the staged
 artifact is absent from the leased worker.
+
+## Outcome
+
+**What was measured.** `IQ2_XS` and `IQ4_XS` run on `dgx:gpu0` (GB10,
+`sm_121a`) through all three CUDA keep-quant dispatch seams, reproducing
+llama.cpp `b10451`'s own `vec_dot` output BIT FOR BIT on real GLM-5.3-Flash
+super-blocks, inside a stream capture, and reached from a real GGUF header
+through the production reader and residency decision. 17 of 17 cases, 177,284 of
+177,284 assertions, both reachability mutations killed, restore proven by hash
+and rebuild. The GB10 job's own summary line reports every expectation met.
+
+**What was rejected, and why.**
+
+- *A tolerance on the IQ4_XS oracle comparison.* The device disagreed by 1 and 4
+  ULP and the obvious move was to bound it. That would have permanently hidden
+  the actual defect, which was nvcc contracting the accumulation into an FMA and
+  thereby computing a different association from upstream's. The cause was
+  identified on the host instead (simulating FMA reproduces the device's bits
+  exactly) and fixed with `__fadd_rn`/`__fmul_rn`. **The gate that would have
+  been widened is the one that found the bug.**
+- *`-fmad=false` on the translation unit.* It would have fixed IQ4_XS and
+  silently moved the numerics of ten other encodings that nobody measured.
+  Scoped intrinsics keep the change to the kernel that needed it.
+- *Hoisting IQ4_XS's eight f32 accumulation steps into one integer core.* A
+  faster kernel computing a different number.
+- *Narrowing `DeviceKeepQuantSupported` to the CUDA kernel list.* It would push
+  Q4_0, IQ4_NL and MXFP4 back to `expand_bf16` on CUDA -- a residency regression
+  on shipped models, and no part of #2260.
+- *Repairing `test_gguf_keep_quant`'s 9 CUDA-platform failures.* Base-caused, and
+  the repair is a decision about that suite's platform assumptions.
+
+**Why each default has its value.** `d_iq2xs_grid` is a `__device__` global
+because warp lanes read different rows and `__constant__` serialises a divergent
+read -- the measured reason its two siblings are; `d_kvalues_iq4nl` stays
+`__constant__` at 16 bytes. `FinalFactor<kIQ2_XS>` is `0.125` because the IQ2
+codebooks store lanes at a fixed 8x magnitude, and `kIQ4_XS` takes the `1.0`
+default because its per-sub-block delta is already folded in as `d * (ls - 32)`.
+Neither dtype takes a per-case NMSE ceiling: both were measured under the shared
+5e-4 band (1.6e-4 and 6.0e-5) rather than assumed to need one.
+
+**Three leases, and what each bought.** One died on a staging bug (a one-ref
+bundle has no HEAD). One found both real defects. One is the green above. The
+two defects are the outcome that matters: a device build is the only instrument
+that could see either, and both were invisible to a host check that had already
+reproduced the oracle bit-exactly on all eight blocks.
 
 ## Owed
 

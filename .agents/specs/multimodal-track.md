@@ -2102,6 +2102,138 @@ mutate for reach here, and the wiring is owned by `ENG-MM-INPUT-PIPELINE` under
 
 ---
 
+## 6. P2 — the RUNNER carries multimodal into the forward ([#2379](https://github.com/mudler/vllm.cpp/issues/2379))
+
+**Scope.** The three hops between `Request.mm_features` and
+`ModelForwardInput::mm`, and nothing else. P1 (§5) settled what the forward seam
+carries; this settles what fills it.
+
+1. `NewRequestData::mm_features` — the scheduler->worker payload.
+2. The scheduler's encoder scheduling: an `EncoderCacheManager` that is actually
+   constructed, `_try_schedule_encoder_inputs` in both admission loops,
+   `scheduled_encoder_inputs`, `free_encoder_mm_hashes`, `_free_encoder_inputs`.
+3. The GPU runner: `CachedRequestState::mm_features` / `mrope_positions` /
+   `mrope_position_delta`, the encoder step, the gather, the merge, and the
+   `.mm` assignment.
+
+Out of scope, and named so a reader does not read silence as coverage: the
+`MM-SERVE-E2E` token-exact closing gate on real Qwen3-VL weights (GPU + a
+checkpoint), any new vision tower, video/audio through the runner, and the
+Qwen3.5/3.6 `ForConditionalGeneration` drivers, whose forwards do not read
+`input.mm`.
+
+### 6.1 Upstream anchors, with uniqueness discriminators
+
+Every row re-read in `/home/mudler/_git/vllm` at `5559679229`, the
+`parity-pin` block's `vllm_commit`. A `grep -c` count is over the named file
+unless the row says `-rn vllm/`.
+
+| Upstream anchor | Discriminator | What it fixes here |
+|---|---|---|
+| `vllm/v1/core/sched/scheduler.py:1379` `def _try_schedule_encoder_inputs` | `grep -c 'def _try_schedule_encoder_inputs'` == **1** | the whole encoder admission decision, both loops |
+| `scheduler.py:526` and `:863` `if request.has_encoder_inputs:` | `grep -c 'if request.has_encoder_inputs:'` == **3** — `:526` running loop, `:863` waiting loop, `:938` the post-admit free; discriminated by the surrounding loop | the two call sites, and that there are exactly two admission ones |
+| `scheduler.py:2017` `def _free_encoder_inputs` | `grep -c 'def _free_encoder_inputs'` == **1** | the free runs in `update_from_output`, AFTER the step executed |
+| `vllm/v1/core/encoder_cache_manager.py` `def check_and_update_cache` | `grep -c 'def check_and_update_cache'` == **2** — `EncoderDecoderCacheManager` overrides every method; the FIRST (`:94`) is `EncoderCacheManager`'s | which of the two classes we mirror (we ported the first) |
+| `vllm/multimodal/utils.py:116` `def get_mm_features_in_window` | `grep -rn 'def get_mm_features_in_window' vllm/` == **1** | the `[lo,hi)` window both the scheduler and the runner use |
+| `vllm/v1/worker/gpu_model_runner.py:1293` `mm_features=new_req_data.mm_features` | `grep -c 'mm_features=new_req_data.mm_features'` == **1** | the payload lands on `CachedRequestState` |
+| `gpu_model_runner.py:2998` `def _execute_mm_encoder` | `grep -c 'def _execute_mm_encoder'` == **1** | the encoder step |
+| `gpu_model_runner.py:2995` `self.encoder_cache[mm_hash] = output` | `grep -c 'self.encoder_cache\[mm_hash\] = output'` == **1** | the runner cache is keyed by **mm_hash**, never by `(req_id, input_id)` |
+| `gpu_model_runner.py:3220` `def _gather_mm_embeddings` | `grep -c 'def _gather_mm_embeddings'` == **1** | returns `(mm_embeds, is_mm_embed)` |
+| `gpu_model_runner.py:3600` `self.model.embed_input_ids(` | `grep -c 'self.model.embed_input_ids('` == **3** in the file (`:3588` prompt-embeds arm, `:3600` the mm arm, `:3635` the token-id-only arm); the mm arm is the one in the `else` of `if self.enable_prompt_embeds and ...` | the merge is a MODEL method, not runner code |
+| `gpu_model_runner.py:3607` `self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(` | `grep -c` == **1** | the merged result is copied into a PERSISTENT device buffer |
+| `gpu_model_runner.py:1654` `def _init_mrope_positions` | `grep -c 'def _init_mrope_positions'` == **1** | MRoPE prompt positions are computed ONCE, at admission |
+| `gpu_model_runner.py:2748` `def _calc_mrope_positions` | `grep -c 'def _calc_mrope_positions'` == **1** | the per-step slice, and the completion part SYNTHESISED from one scalar |
+| `gpu_model_runner.py:2786` `mrope_position_delta=req.mrope_position_delta,` | `grep -c 'mrope_position_delta=req.mrope_position_delta'` == **1** | the cross-step carrier is ONE scalar per request |
+| `vllm/model_executor/models/interfaces.py:383` `multimodal_embeddings: MultiModalEmbeddings \| None = None,` | `grep -c` == **1** in the file. `def embed_input_ids` is NOT unique — **322** hits `-rn vllm/`, **3** in this file, two of them `@overload` stubs | the concrete `SupportsMultiModal.embed_input_ids` |
+| `grep -c deepstack vllm/v1/worker/gpu_model_runner.py` == **0** | — | DeepStack is NOT the runner's business; it rides inside the encoder output and is unpacked model-side |
+
+### 6.2 Design — where each upstream method lands
+
+Upstream's runner calls **model methods** (`model.embed_multimodal`,
+`model.embed_input_ids`, `model.get_mrope_input_positions`) through the
+`SupportsMultiModal` / `SupportsMRoPE` protocols. Our registry is type-erased
+over `LoadedModel`, so the protocol becomes three optional function pointers on
+`ModelFactory`, beside `forward` and `make_kv_cache`:
+
+| Upstream protocol method | Our seam | Required? |
+|---|---|---|
+| `SupportsMultiModal.embed_multimodal` | `ModelFactory::encode_mm` | yes, for any mm model |
+| `SupportsMultiModal.embed_input_ids(ids, multimodal_embeddings, is_multimodal)` | `ModelFactory::embed_mm` | yes, for any mm model |
+| `SupportsMRoPE.get_mrope_input_positions` | `ModelFactory::mrope_prompt_positions` | **optional** — null is upstream's `uses_mrope == False` (Gemma-4's mm branch reads the 1-D `input.positions`) |
+
+All three default null. `GPUModelRunner` runs its mm path only when
+`encode_mm != nullptr && embed_mm != nullptr` **and** some request in the step
+carries `mm_features`, so a text model and a text step are unchanged. That
+condition is a RUNTIME PREDICATE, which is the point of §6.5.
+
+### 6.3 Chunked prefill across a straddling multimodal item
+
+Upstream never chunks the ENCODER. `_try_schedule_encoder_inputs` either
+truncates `num_new_tokens` to stop just before `start_pos`, or (when the prefix
+cache already carried `num_computed_tokens` past `start_pos`) refuses the
+request this step by returning `num_new_tokens = 0`. That truncation is the only
+reason `_gather_mm_embeddings`'s `Encoder cache miss for {mm_hash}` is
+unreachable: without it a decoder chunk can cover placeholder rows whose encoder
+output was never computed, and the gather would splice a stale or absent buffer.
+
+`ServerHarness` runs `enable_chunked_prefill = true`, so this is a live path in
+the CPU gate rather than a GPU-only concern. The gate case is a prompt whose
+image span straddles a chunk boundary under a token budget smaller than the
+prompt: without the guard the step schedules across the span, and the runner
+raises the miss.
+
+`disable_chunked_mm_input` (`SchedulerConfig`) selects the stricter
+roll-back-to-before-the-item arm; the default arm is the budget/cache one.
+
+### 6.4 MRoPE across decode steps
+
+`mrope_positions` `[3, num_prompt_tokens]` is computed once per request at
+admission and sliced per step for the prompt part. The completion part is
+SYNTHESISED from `mrope_position_delta`, one int per request: position
+`context_len + i + delta` on all three axes. Nothing stores completion
+positions, and a request that is preempted and resumed recomputes nothing,
+because the prompt array and the delta both live on `CachedRequestState`.
+
+### 6.5 The SACRED text-neutrality obligation, retired from "by construction"
+
+§5 and `mm-serving.md` both claim every text step is byte-identical **by
+construction**, and that claim was TRUE while the runner had no mm code: the
+field could not be set. After this row it is a live runtime predicate, and the
+claim is therefore retired and replaced by one proven **by mutation**.
+
+The mutation: force the runner's mm path unconditionally (drop the
+`any request carries mm_features` half of the predicate) and require the
+text-only suites to go RED. A green mutant would mean the text gates never
+observe the mm path and the neutrality claim is untested. Named suites:
+`test_runner`, `test_scheduler`, `test_model_registry`, `test_chat_mm`,
+`test_openai_serving`, `test_api_server`.
+
+### 6.6 Gates
+
+- `test_scheduler`: encoder admission, the budget decrement, the cache
+  check-and-update, the straddling-item truncation, and `free_encoder_mm_hashes`.
+- `test_runner`: the encoder step, the gather window, `.mm` assignment, and the
+  MRoPE prompt/completion split.
+- `test_api_server`: the SERVER end-to-end — a `data:image/x-raw-rgb` chat
+  request through the real `ApiServer` -> `AsyncLLM` -> `Scheduler` ->
+  `GPUModelRunner` -> `ModelRegistry::Forward`, asserting the tower ran, the
+  merged rows reached the forward, and the response is a 200.
+
+### 6.7 Reachability
+
+Production entry point: `ApiServer::handle_chat_completions`. The chain is
+`OpenAIServingChat::create_chat_completion` -> `AsyncLLM::generate(MultiModalInputs)`
+-> `EngineCore` -> `Scheduler::schedule` -> `Executor` -> `GPUModelRunner::execute_model`
+-> `ModelRegistry::Forward`. Each of these five call sites is deleted in a scratch
+copy and the focused gate must go RED:
+
+1. the runner's `.mm` assignment;
+2. `mm_features` in `NewRequestData::from_request`;
+3. the runner's encoder-execute call;
+4. the TOWER call inside the encoder step;
+5. the seam install in `server_main.cpp`.
+
+
 ## Owed
 
 Carried by `ENG-MM-INPUT-PIPELINE`. The first block was filed while landing

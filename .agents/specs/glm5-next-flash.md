@@ -4403,8 +4403,9 @@ Debts this row carries, each visible rather than waived:
 this wave measured it rather than inheriting it**: `gh api user` returns 200 as
 `localai-org-maint-bot`, `gh issue list` and `gh issue view` both serve, and
 #2410 was filed for this row. Whoever reads O31 next should re-measure before
-repeating its block; a recorded forge outage outlives the outage. The row's lifecycle state does not move, because O1 does not, and
-`--device cuda` still refuses by name at `glm5_next_forward.cpp:231-238`.
+repeating its block; a recorded forge outage outlives the outage. The row's
+lifecycle state does not move, because O1 does not, and `--device cuda` still
+refuses by name at `glm5_next_forward.cpp:231-238`.
 
 **THREE MEASUREMENTS CHANGED THE PRICE OF THIS DEBT.** §W9c states the six
 forward files "carry ZERO `vt::Tensor`" and draws from it that the DeepSeek-V4
@@ -4413,8 +4414,10 @@ shape cannot apply. Counted on `0b4766c96`: **25 across 2,783 lines** — 15 in
 `vt::` compute-op calls** between them. The claim holds for 1,864 lines and is
 false for 919. Second, **every primitive family this model needs already has a
 registered CUDA provider** — KDA, MLA, DSA, all four MoE ops, RmsNorm, Matmul,
-Embedding, RopeNeox — so no kernel in this campaign has to be written; §W9c
-carries the table with both providers' `file:line`. Third, and the largest
+Embedding, RopeNeox — so no kernel in this campaign has to be written FOR
+CORRECTNESS; §W9c carries the table with both providers' `file:line`, and names
+in the same breath the two speed debts a provider does not close (O14's
+chunked-prefill gap, and the 64-head cliff). Third, and the largest
 single reuse, **this model's own sibling already runs the DSA/MLA block on a
 GPU**: `GlmMoeDsaForCausalLM` drives `mla::ForwardMlaAttentionBlock`
 (`glm_moe_dsa_forward.cpp:157` → `mla_attention.cpp:920-921,1083`), and that

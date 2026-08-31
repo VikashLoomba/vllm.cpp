@@ -448,8 +448,19 @@ Read before starting it, because two details change its shape
 
 So the remaining work is: an indexer-side cache, a second compressor cycle at
 `index_head_dim`, and a selection re-pointed from per-token keys to that cache.
-Whether that cycle rotates is UNKNOWN and must be read from the kernel that writes
-the indexer's cache, not from the constructor flag. All four of its tensors load (previous commit); none of that is a
+
+**Whether that cycle rotates is still UNKNOWN, and the cache layout is why.** The
+attention compressor's cache carries an explicit bf16 area for the rotated rope
+tail (`fused_compress_quant_cache.py:293`). The indexer's does not: its
+`k_cache_head_dim` is a BYTE layout, `head_dim + head_dim / quant_block_size * 4`
+-- 132 bytes for a 128-wide head, being 128 fp8 values plus four fp32 scales
+(`attention.py:751-760`), or an MXFP4 variant at 68. There is no bf16 rope area in
+it at all.
+
+So the two caches are shaped differently and the shared kernel's rope store has
+nowhere to land in the indexer's. Reading the indexer's own write path is the
+precondition for its cycle, and assuming the attention compressor's answer would
+put a rotated tail into a layout with no room for one. All four of its tensors load (previous commit); none of that is a
 width change, and treating it as one would compute a top-k over the wrong
 operand rather than refuse.
 

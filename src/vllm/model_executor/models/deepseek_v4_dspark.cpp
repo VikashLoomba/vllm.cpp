@@ -1,6 +1,7 @@
 #include "vllm/model_executor/models/deepseek_v4_dspark.h"
 
 #include <cmath>
+#include <limits>
 #include <string>
 
 #include "vt/dtype.h"
@@ -92,6 +93,78 @@ std::vector<float> ProjectTaps(const std::vector<std::vector<float>>& taps,
           main_norm_weight[static_cast<size_t>(d)];
   }
   return normed;
+}
+
+std::vector<int32_t> MarkovDraftLoop(const std::vector<float>& logits, int32_t seed_id,
+                                     const std::vector<float>& markov_w1,
+                                     const std::vector<float>& markov_w2, int64_t block,
+                                     int64_t vocab, int64_t rank) {
+  VT_CHECK(block > 0 && vocab > 0 && rank > 0, "dspark draft: degenerate shape");
+  VT_CHECK(static_cast<int64_t>(logits.size()) == block * vocab,
+           "dspark draft: logits must be [block, vocab]");
+  VT_CHECK(static_cast<int64_t>(markov_w1.size()) == vocab * rank,
+           "dspark draft: markov_w1 is an Embedding [vocab, rank]");
+  VT_CHECK(static_cast<int64_t>(markov_w2.size()) == vocab * rank,
+           "dspark draft: markov_w2 is a Linear [vocab, rank]");
+  VT_CHECK(seed_id >= 0 && seed_id < vocab, "dspark draft: seed id out of range");
+
+  std::vector<int32_t> out(static_cast<size_t>(block) + 1, 0);
+  out[0] = seed_id;
+  for (int64_t i = 0; i < block; ++i) {
+    // The bias is conditioned on the PREVIOUSLY SAMPLED id, not on position i's
+    // own argmax -- that is what makes the chain a bigram and the loop serial.
+    const float* emb = &markov_w1[static_cast<size_t>(out[static_cast<size_t>(i)]) *
+                                  static_cast<size_t>(rank)];
+    const float* row = &logits[static_cast<size_t>(i * vocab)];
+    int32_t best = 0;
+    float best_v = -std::numeric_limits<float>::infinity();
+    for (int64_t v = 0; v < vocab; ++v) {
+      double bias = 0.0;
+      const float* w2row = &markov_w2[static_cast<size_t>(v * rank)];
+      for (int64_t r = 0; r < rank; ++r) bias += static_cast<double>(w2row[r]) * emb[r];
+      const float cand = row[v] + static_cast<float>(bias);
+      // Strictly greater, so the LOWEST id wins a tie -- `torch.argmax`'s own
+      // convention, and a draft that disagrees on ties diverges from the oracle
+      // while still being a valid token.
+      if (cand > best_v) {
+        best_v = cand;
+        best = static_cast<int32_t>(v);
+      }
+    }
+    out[static_cast<size_t>(i) + 1] = best;
+  }
+  return out;
+}
+
+int64_t ConfidenceDraftLength(const std::vector<float>& xpre,
+                              const std::vector<float>& markov_emb,
+                              const std::vector<float>& proj_w, float threshold,
+                              int64_t block, int64_t hidden, int64_t rank) {
+  VT_CHECK(block >= 0 && hidden > 0 && rank > 0, "dspark confidence: degenerate shape");
+  VT_CHECK(static_cast<int64_t>(xpre.size()) == block * hidden,
+           "dspark confidence: xpre must be [block, hidden] and PRE-norm");
+  VT_CHECK(static_cast<int64_t>(markov_emb.size()) == block * rank,
+           "dspark confidence: markov_emb must be [block, rank]");
+  VT_CHECK(static_cast<int64_t>(proj_w.size()) == hidden + rank,
+           "dspark confidence: proj is [hidden + markov_rank] -- the head reads the "
+           "pre-norm state CONCATENATED with the step's bigram embedding");
+
+  int64_t len = 0;
+  for (int64_t i = 0; i < block; ++i) {
+    double acc = 0.0;
+    for (int64_t h = 0; h < hidden; ++h)
+      acc += static_cast<double>(proj_w[static_cast<size_t>(h)]) *
+             xpre[static_cast<size_t>(i * hidden + h)];
+    for (int64_t r = 0; r < rank; ++r)
+      acc += static_cast<double>(proj_w[static_cast<size_t>(hidden + r)]) *
+             markov_emb[static_cast<size_t>(i * rank + r)];
+    const double p = 1.0 / (1.0 + std::exp(-acc));
+    // THE PREFIX STOPS HERE. `cumprod` makes every later position zero regardless
+    // of its own confidence, so this is a break and not a `continue`.
+    if (p < static_cast<double>(threshold)) break;
+    ++len;
+  }
+  return len;
 }
 
 }  // namespace vllm::dspark

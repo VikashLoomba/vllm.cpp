@@ -270,6 +270,30 @@ struct FixtureOpts {
   // list here could only name pairs whose concatenation is not in a 16-token
   // vocabulary, and `InsertMerge` refuses exactly that.
   bool with_tokenizer = false;
+
+  // W5p (#2031): store the hyper-connection MIX weights as **Q8_0**, the type
+  // the released `unsloth/Qwen3.8-Flash-Next-GGUF` actually uses for all 194 of
+  // them. DEFAULT OFF, so every existing caller's file bytes are unchanged --
+  // the option rewrites a tensor's TYPE and payload and adds nothing.
+  //
+  // WHY IT EXISTS. Every arm of this fixture wrote these tensors at ggml type 0
+  // (F32), so twelve waves of `MODEL-MM-QWEN4-EXP` never handed the forward a
+  // block-typed mix weight, and the first prefill of the released file died
+  // inside `vt::Qwen4ExpGatedResidual`'s own validation. A fixture that can only
+  // build the arm the code already handles cannot find that class of defect.
+  //
+  // WHICH TENSORS, AND THE ONE IT CANNOT REACH. `hc_{attn,ffn}_down`,
+  // `hc_{attn,ffn}_inject` and `output_hc_down` all have `kStream` (128) as
+  // their FASTEST dim, which is four whole Q8_0 blocks. The two `*_up`
+  // projections have `kHcLowrank` (8) there, and ggml forbids a quantized
+  // tensor whose fastest dim is not a whole block -- so at this miniature's
+  // low-rank the up projection has no legal Q8_0 encoding at all. It is not
+  // skipped because it is awkward; it is unrepresentable. The released config's
+  // low-rank is 320 and has no such problem, and the up projection's quantized
+  // arm is gated at op level by
+  // `tests/vllm/models/test_qwen4_exp_hc_device.cpp`'s Q8_0 case, which picks
+  // its own block-aligned shapes.
+  bool hc_mix_q8_0 = false;
 };
 
 inline void Add(GgufModelBuilder& b, const FixtureOpts& o, const std::string& name,
@@ -364,8 +388,10 @@ inline std::string BuildFixture(const FixtureOpts& o = {}) {
       Q8_0Bytes(kNgramRows, kPleRow));
   Add(b, o, "output_hc_norm.weight", {kStream}, 0,
       NormF32(kStream, kMixerNormTag));
-  Add(b, o, "output_hc_down.weight", {kStream, kHcLowrank}, 0,
-      RampF32(kStream * kHcLowrank, 3.0F));
+  Add(b, o, "output_hc_down.weight", {kStream, kHcLowrank},
+      o.hc_mix_q8_0 ? 8U : 0U,
+      o.hc_mix_q8_0 ? Q8_0Bytes(kHcLowrank, kStream)
+                    : RampF32(kStream * kHcLowrank, 3.0F));
   Add(b, o, "output_hc_up.weight", {kHcLowrank, kStream}, 0,
       RampF32(kStream * kHcLowrank, 4.0F));
 
@@ -375,12 +401,16 @@ inline std::string BuildFixture(const FixtureOpts& o = {}) {
       const std::string p = std::string("hc_") + side + "_";
       Add(b, o, Blk(l, (p + "norm.weight").c_str()), {kStream}, 0,
           NormF32(kStream, HcNormTag(l, side)));
-      Add(b, o, Blk(l, (p + "down.weight").c_str()), {kStream, kHcLowrank}, 0,
-          RampF32(kStream * kHcLowrank, base));
+      Add(b, o, Blk(l, (p + "down.weight").c_str()), {kStream, kHcLowrank},
+          o.hc_mix_q8_0 ? 8U : 0U,
+          o.hc_mix_q8_0 ? Q8_0Bytes(kHcLowrank, kStream)
+                        : RampF32(kStream * kHcLowrank, base));
       Add(b, o, Blk(l, (p + "up.weight").c_str()), {kHcLowrank, kStream}, 0,
           RampF32(kStream * kHcLowrank, base));
-      Add(b, o, Blk(l, (p + "inject.weight").c_str()), {kStream, kHcCount}, 0,
-          RampF32(kStream * kHcCount, base));
+      Add(b, o, Blk(l, (p + "inject.weight").c_str()), {kStream, kHcCount},
+          o.hc_mix_q8_0 ? 8U : 0U,
+          o.hc_mix_q8_0 ? Q8_0Bytes(kHcCount, kStream)
+                        : RampF32(kStream * kHcCount, base));
     }
     Add(b, o, Blk(l, "ffn_gate_inp.weight"), {kH, kExperts}, 0,
         RampF32(kH * kExperts, base));

@@ -1922,3 +1922,223 @@ TEST_CASE("qwen4_exp: a SECOND step decodes on the engine's own persistent cache
   CHECK(std::memcmp(s1.logits.data(), s2.logits.data(),
                     s1.logits.size() * sizeof(float)) != 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5p (#2031) — A Q8_0 MIX WEIGHT REACHES THE PRODUCTION ENTRY POINT.
+//
+// The released `unsloth/Qwen3.8-Flash-Next-GGUF` stores all 194 hyper-connection
+// mix weights as Q8_0 and loaded cleanly into this tree; the first prefill then
+// died inside `vt::Qwen4ExpGatedResidual`'s own validation, because every arm of
+// the fixture and every op-level case wrote those tensors F32. This case is the
+// arm that was missing: the SAME `ModelRegistry::Forward` the case above drives,
+// over a file whose `hc_*_down` and `hc_*_inject` are block-typed.
+//
+// IT IS A REACHABILITY GATE, NOT A NUMERIC ONE. The fixture's weights are a
+// deterministic pattern rather than a checkpoint, so there is no reference token
+// stream; the arithmetic of the quantized route is gated at op level by
+// `test_qwen4_exp_hc_device.cpp` against an independent double reference, and
+// the loader half by `test_qwen4_exp_gguf_weights.cpp`. What is asserted here is
+// that a block-typed mix weight survives the whole path from the file to a
+// sampled token through the entry point AGENTS.md names.
+//
+// `hc_*_up` stays F32 in the file because ggml forbids a quantized tensor whose
+// fastest dim is not a whole 32-element block and this miniature's low-rank is
+// 8. The released config's low-rank is 320.
+TEST_CASE("qwen4_exp: ModelRegistry::Forward runs a Q8_0 hyper-connection mix weight") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  FixtureOpts opts;
+  opts.hc_mix_q8_0 = true;
+  const gguf_test::TempFile f(BuildFixture(opts));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  // THE FILE, ASSERTED BEFORE THE MODEL. An option that quietly wrote F32 would
+  // turn this whole case into a second run of the case above.
+  REQUIRE(g.Get("blk.0.hc_attn_down.weight").ggml_type == 8);
+  REQUIRE(g.Get("blk.0.hc_attn_inject.weight").ggml_type == 8);
+  REQUIRE(g.Get("blk.0.hc_ffn_down.weight").ggml_type == 8);
+  REQUIRE(g.Get("output_hc_down.weight").ggml_type == 8);
+
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] = static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv =
+        vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                              {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos, am, gm, attn_kv, gdn, config, q,
+                             logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  // THE RED THIS CASE WAS WRITTEN AGAINST, in its own words: before this wave
+  // `vt::Qwen4ExpGatedResidual` threw
+  //   `qwen4_exp_gated_residual: input_mix_weight_down must be float
+  //    (f32/bf16 for outputs)`
+  // here, on the FIRST hyper-connection of layer 0.
+  vllm::ForwardLogits fl;
+  REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  CHECK(fl.rows == 1);
+  CHECK(fl.vocab == kVocab);
+  REQUIRE(fl.on_device());
+  REQUIRE(fl.device_tensor.data != nullptr);
+  REQUIRE(fl.device_tensor.dtype == DType::kF32);
+
+  std::vector<float> host(static_cast<size_t>(fl.rows * fl.vocab), 0.0F);
+  d.b.Copy(q, host.data(), fl.device_tensor.data, host.size() * sizeof(float));
+  d.b.Synchronize(q);
+
+  // FINITENESS BEFORE ANY OTHER READING (#449): a max-fold over `std::max`
+  // returns the non-NaN operand, so an all-NaN row reads as a match to any
+  // tolerance and still argmaxes to an index in range.
+  int finite = 0;
+  for (float v : host) finite += std::isfinite(v) ? 1 : 0;
+  REQUIRE(finite == static_cast<int>(host.size()));
+  float lo = host[0];
+  float hi = host[0];
+  for (float v : host) {
+    lo = v < lo ? v : lo;
+    hi = v > hi ? v : hi;
+  }
+  // A CONSTANT row is what a tower contributing nothing produces.
+  CHECK(hi > lo);
+
+  std::vector<int64_t> tok(1, -1);
+  {
+    vllm::dense_attn::DBuf tok_b(d, DType::kI64, {1});
+    vt::Tensor tt = tok_b.t();
+    vt::GreedyArgmax(q, tt, fl.device_tensor);
+    tok_b.Download(d, tok.data());
+  }
+  MESSAGE("qwen4_exp Q8_0-mix sampled token id: " << tok[0] << " of " << fl.vocab
+                                                  << " (logit range [" << lo
+                                                  << ", " << hi << "])");
+  CHECK(tok[0] >= 0);
+  CHECK(tok[0] < fl.vocab);
+  CHECK(host[static_cast<size_t>(tok[0])] == hi);
+
+  // AND IT DEPENDS ON THE PROMPT. Every assertion above is satisfied by a hook
+  // that never reads `token_ids` — MUT-REACH measured exactly that on the
+  // sibling case. Fresh zeroed caches leave the prompt as the only input that
+  // moved.
+  std::vector<int32_t> ids2(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids2[static_cast<size_t>(t)] =
+        static_cast<int32_t>(t == T - 1 ? kEosTokenId : (t + 1) * 4 + 1);
+    REQUIRE(ids2[static_cast<size_t>(t)] < static_cast<int32_t>(kVocab));
+  }
+  REQUIRE(ids2 != ids);
+
+  std::vector<std::vector<float>> ssm2(3), conv2(3);
+  std::vector<vllm::dense_attn::DBuf> ssm2_b, conv2_b;
+  std::vector<vllm::GdnStateCache> gdn2(3);
+  ssm2_b.reserve(3);
+  conv2_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm2[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv2[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm2_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm2[i].data());
+    conv2_b.emplace_back(d, DType::kF32,
+                         std::vector<int64_t>{1, conv_dim, conv_len},
+                         conv2[i].data());
+    gdn2[static_cast<size_t>(i)].ssm_state = ssm2_b.back().t();
+    gdn2[static_cast<size_t>(i)].conv_state = conv2_b.back().t();
+  }
+  std::vector<uint16_t> kv2(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv2_b(d, DType::kBF16,
+                               {2, 1, T, kKvHeads, kHeadDim}, kv2.data());
+  std::vector<vllm::PagedKvCache> attn_kv2(1);
+  attn_kv2[0] = attn_kv[0];
+  attn_kv2[0].data = kv2_b.t().data;
+
+  vllm::ModelForwardInput in2{ids2, pos, am, gm, attn_kv2, gdn2, config, q,
+                              logits_indices};
+  in2.num_reqs = 1;
+  in2.gdn_state_slots = 1;
+
+  vllm::ForwardLogits fl2;
+  REQUIRE_NOTHROW(fl2 = vllm::ModelRegistry::Forward(*model, in2));
+  REQUIRE(fl2.on_device());
+  std::vector<float> host2(static_cast<size_t>(fl2.rows * fl2.vocab), 0.0F);
+  d.b.Copy(q, host2.data(), fl2.device_tensor.data, host2.size() * sizeof(float));
+  d.b.Synchronize(q);
+  const double moved = vllm_test::MaxAbsDiff(host, host2);
+  MESSAGE("qwen4_exp Q8_0-mix second-prompt logit movement: " << moved);
+  CHECK(moved > 0.0);
+}

@@ -667,6 +667,15 @@ struct ModelFactory {
   // gathered block table. Setting it true on a forward that reads positionally
   // would move a silent mis-index from the engine into the model, so it lands
   // WITH its first consumer and never before one.
+  //
+  // THE BIT ITSELF IS KV-DSV4-MULTICACHE W5's
+  // ([#2323](https://github.com/mudler/vllm.cpp/issues/2323)), which introduced
+  // it to turn `ModelRegistry::Forward`'s blanket refusal into a dispatch and
+  // stated the reason this default cannot be flipped for convenience: the
+  // failure it prevents is INVISIBLE. A model that discards a name-keyed set
+  // decodes by recomputing the whole prefix, which keeps the tokens right
+  // while doing asymptotically more work, so no token gate can see it. A
+  // capability whose absence is invisible must be opt-in.
   bool consumes_multi_kv = false;
   // MODEL-MM-QWEN4-EXP W5L ([#2031](https://github.com/mudler/vllm.cpp/issues/2031)):
   // whether THIS model's forward serves exactly ONE sequence per step, so the
@@ -712,23 +721,6 @@ struct ModelFactory {
   // `gguf_keep_quant.cpp`, expressed at run time because there is no enum to
   // switch over.
   bool supports_weight_offload = false;
-  // KV-DSV4-MULTICACHE W5 (#2323): whether THIS model's forward consumes a cache
-  // set keyed by LAYER NAME (`ModelForwardInput::multi_kv`) instead of the
-  // positional `attn_kv` convention.
-  //
-  // THE DEFAULT IS FALSE, AND THAT IS THE MECHANISM, exactly as it is for
-  // `supports_weight_offload` above. W3 made the runner allocate every published
-  // cache and hand them over keyed by name; a model whose forward does not know
-  // what to do with that set would otherwise DISCARD an allocated topology in
-  // silence and decode by recomputing the whole prefix -- a wrong-answer-not-a-
-  // crash, and one a token gate cannot see, because the tokens stay right while
-  // the decode does asymptotically more work.
-  //
-  // So `ModelRegistry::Forward` refuses a name-keyed set that reaches a model
-  // which has not claimed it, naming the architecture, and a NEW model inherits
-  // false and is refused until someone wires it. That polarity is the whole
-  // point: the failure it prevents is invisible, so it must be opt-in.
-  bool consumes_multi_kv = false;
   // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124): whether THIS model's forward
   // reads its routed-expert weights through the expert-stream slot seam
   // (`KqExpertSlice`), so the stacked `*_exps.weight` towers are served a slice

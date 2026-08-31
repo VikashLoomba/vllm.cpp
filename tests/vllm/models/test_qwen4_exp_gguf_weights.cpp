@@ -62,6 +62,7 @@
 #include "support/qwen4_exp_gguf_fixture.h"  // the ONE synthetic `qwen4exp` file
 
 #include "qwen4_exp_gguf_manifest.inc"
+#include "vllm/platforms/interface.h"
 
 namespace {
 
@@ -634,7 +635,7 @@ TEST_CASE("qwen4_exp GGUF: the n-gram gather table KEEPS its blocks on CPU") {
     // parameter Q4_K table expands from 28.8 GB to 102.4 GB at load and the arm
     // dies before the first forward. `FromEnv()` is what a production load gets,
     // and on a CPU build it turns keep-quant on.
-    vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv();
+    vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type());
     pol.keep_quant = true;
     const vllm::Qwen4ExpWeights w =
         vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU, &pol);
@@ -770,7 +771,7 @@ TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load
     for (vt::DeviceType d :
          {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL,
           vt::DeviceType::kVULKAN, vt::DeviceType::kROCM}) {
-      CAPTURE(vt::DeviceTypeName(d));
+      CAPTURE(std::string(vt::DeviceTypeName(d)));
       CHECK_THROWS_AS(
           (void)vllm::LoadQwen4ExpFromGguf(g, cfg, d),
           std::exception);
@@ -944,7 +945,7 @@ TEST_CASE("qwen4_exp GGUF: the hyper-connection MIX weights keep their blocks") 
   CHECK(g.Get("blk.0.hc_attn_up.weight").ggml_type == 0);
   CHECK(g.Get("blk.0.hc_attn_norm.weight").ggml_type == 0);
 
-  vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv();
+  vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv(vllm::platforms::CurrentPlatform().device_type());
   pol.keep_quant = true;
   const vllm::Qwen4ExpWeights w =
       vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU, &pol);
@@ -971,4 +972,70 @@ TEST_CASE("qwen4_exp GGUF: the hyper-connection MIX weights keep their blocks") 
   CHECK_FALSE(w.mixer.has_inject);  // the `use_combine=False` model-level mixer
   CHECK_FALSE(vt::IsBlockQuant(w.mixer.up.dtype));
   CHECK_FALSE(vt::IsBlockQuant(w.mixer.hc_norm.dtype));
+}
+
+// --- (6) the RESOLVED device reaches the production hook ----------------------
+//
+// ENG-GGUF-RESIDENCY-RESOLVED-DEVICE. The case above proves the loader honours
+// the device it is HANDED. This one proves the registry hands it the right one.
+//
+// The two are different claims, and the tree carried the second one broken.
+// `qwen4_exp_registry.cpp` filled that argument from
+// `vllm::platforms::CurrentPlatform().device_type()` — the accelerator PROBE,
+// which answers `kCUDA` on any process where `cuda.cpp`'s `Registrar` saw a
+// usable GPU. The ENGINE resolves the device separately:
+// `LoadedEngine::ResolveExplicitDeviceType` returns `kCPU` for an explicit
+// `--device cpu` "even on a CUDA-capable build/process". So on a CUDA box
+// `--device cpu` selected the CPU queue and got the CUDA residency policy, and
+// on THIS architecture that means the refusal a few hundred lines above — whose
+// remedy text reads "Load this model with `--device cpu`", the thing the user
+// just did.
+//
+// It was invisible because every run that exercised this path was a CPU-only
+// build, where the probe also answers `kCPU`. It becomes live the moment CUDA
+// is enabled in the same build.
+//
+// Reached through `ModelRegistry::Load`, which is the production hook: the
+// engine's own sequence is `ModelSource::FromGguf(gguf,
+// ResolveModelDeviceType(...))` -> `ModelRegistry::Load(config, gguf_source)`.
+// The device now travels ON the source, so a CPU-only host can drive both arms.
+TEST_CASE("qwen4_exp GGUF: the registry hook routes on the ENGINE's resolved "
+          "device, not the platform probe") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+
+  SUBCASE("a CUDA-resolved load refuses THROUGH THE HOOK") {
+    // Fails on the pre-fix tree: the hook discarded the resolved device and
+    // asked the probe, which on this CPU-only build answers `kCPU`, so the
+    // load succeeded and nothing refused.
+    std::string msg;
+    try {
+      (void)LoadThroughRegistry(g, vt::DeviceType::kCUDA);
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    CAPTURE(msg);
+    CHECK_FALSE(msg.empty());
+    CHECK(msg.find("per_layer_token_embd.weight") != std::string::npos);
+    CHECK(msg.find("cuda") != std::string::npos);
+    CHECK(msg.find("gather") != std::string::npos);
+  }
+
+  SUBCASE("a CPU-resolved load LOADS — this is `--device cpu` on a CUDA box") {
+    // The case the bug made unreachable. On a CUDA-capable process the probe
+    // answered `kCUDA` here and the user's explicit `--device cpu` was refused
+    // by a message telling them to pass `--device cpu`.
+    std::unique_ptr<vllm::LoadedModel> m;
+    CHECK_NOTHROW(m = LoadThroughRegistry(g, vt::DeviceType::kCPU));
+    CHECK(m != nullptr);
+  }
+
+  SUBCASE("every non-CPU resolved device refuses through the hook") {
+    for (vt::DeviceType d :
+         {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL,
+          vt::DeviceType::kVULKAN, vt::DeviceType::kROCM}) {
+      CAPTURE(std::string(vt::DeviceTypeName(d)));
+      CHECK_THROWS_AS((void)LoadThroughRegistry(g, d), std::exception);
+    }
+  }
 }

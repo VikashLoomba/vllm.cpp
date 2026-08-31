@@ -62,6 +62,7 @@
 // out of device memory (only the CUDA TU that defines them can address them).
 #include "vt/cpu/cpu_quant_iq_tables.h"
 #include "vt/cuda/cuda_iq_table_seal.h"
+#include "vllm/platforms/interface.h"
 #endif
 
 using vt::Backend;
@@ -1231,7 +1232,7 @@ TEST_CASE("a REAL GGUF header carries IQ2_XS / IQ4_XS to the CUDA keep-quant GEM
     const vllm::GgufResidency res = vllm::RouteGgufTensor(
         /*keep_quant=*/true, /*keep_f16=*/true, /*nvfp4_fp4=*/false,
         /*cpu_ref=*/false, vllm::GgufTensorRole::kMatmulWeight,
-        arm.ggml_type, {1, 1024});
+        arm.ggml_type, {1, 1024}, vllm::platforms::CurrentPlatform().device_type());
     CHECK(res == vllm::GgufResidency::kKeepQuant);
 
     if (!cuda) continue;

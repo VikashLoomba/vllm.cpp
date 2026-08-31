@@ -2536,7 +2536,16 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // `CheckDeviceWeightFit` as well, so the two calls that ask this process's
       // residency policy about this file can never resolve two different
       // answers to the same `getenv` reads.
-      const GgufLoadPolicy gguf_load_policy = GgufLoadPolicy::FromEnv();
+      //
+      // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: from `target.device_type()`, which
+      // is the device `ResolveModelDeviceType` resolved three lines above and
+      // handed the fit check. It used to be `FromEnv()`, which probed
+      // `platforms::CurrentPlatform()` — so on a CUDA-capable process an
+      // explicit `--device cpu` bounded a CPU load with the CUDA residency
+      // policy. That is #1136's finding one level down: the bound and the
+      // policy the bound describes must name the same device.
+      const GgufLoadPolicy gguf_load_policy =
+          GgufLoadPolicy::FromEnv(target.device_type());
       static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
       StreamedExpertLane lane;
       if (target.needs_weight_staging() &&
@@ -2727,7 +2736,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // assignment leaves the flag accepted and inert, which is exactly the
     // failure L2 recorded and L3 exists to close; test_tower_skip's reachability
     // case is the gate that catches it.
-    ModelSource gguf_source = ModelSource::FromGguf(gguf);
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the RESOLVED device travels with the
+    // source, so every GGUF registry hook builds its residency policy from what
+    // the engine chose rather than from `platforms::CurrentPlatform()`. The
+    // same call the #1123 fit check above already makes.
+    ModelSource gguf_source = ModelSource::FromGguf(
+        gguf, ResolveModelDeviceType(gguf_arch.architecture, params.device));
     gguf_source.multimodal = &params.multimodal;
     const auto t_gguf_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
@@ -2743,7 +2757,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                                       ? Qwen3_5MTPKind::kDense
                                       : Qwen3_5MTPKind::kMoe;
       model->AttachMtpDraftWeights(vllm::LoadQwen3_5MTPFromGguf(
-          gguf, config, kind, GgufLoadPolicy::FromEnv()));
+          gguf, config, kind,
+          // The SAME resolved device the target's own load used, taken off the
+          // source rather than resolved a second time.
+          GgufLoadPolicy::FromEnv(gguf_source.device)));
     }
     // SPEC-DFLASH-GGUF B3: the axis-B wiring. Structurally the same three lines
     // as the safetensors branch's maybe_load_dflash - ResolveSpecConfig re-runs

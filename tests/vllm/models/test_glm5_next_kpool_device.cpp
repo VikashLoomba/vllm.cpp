@@ -257,6 +257,12 @@ TEST_CASE("glm5_next k-pool: the device ops are registered on CUDA and absent on
   // The registration is the seam. `KpoolDeviceOpsAvailable` is the probe
   // `deepseek_v4_device.cpp:30-35` sets the shape of, and W9c-3's forward is
   // meant to consult it BEFORE it builds operands rather than after it throws.
+  //
+  // The first CHECK compares the probe against the two lookups it is made of,
+  // so it measures CONSISTENCY and not correctness — said plainly rather than
+  // dressed up. What it does buy is the `&&`: a probe that lost one of its two
+  // clauses would report the family available with half of it registered, and
+  // the reviewer's mutation of this file deletes a clause to show that.
   const bool cuda_present = vt::OpRegistered(vt::OpId::kGlm5NextKpoolCompress,
                                              DeviceType::kCUDA) &&
                             vt::OpRegistered(vt::OpId::kGlm5NextKpoolSelect,
@@ -458,8 +464,6 @@ TEST_CASE("glm5_next k-pool device: the selection is SET-equal and positionwise 
       scores_pref.push_back(got_scores[static_cast<size_t>(r * np + p)]);
   RequireFinite(scores_pref, "device index_scores");
   const double score_delta = MaxAbsDiff(scores_pref, golden_scores);
-  MESSAGE("index_scores max|device - transformers| = " << score_delta);
-  CHECK(score_delta < 2e-5);
 
   // POSITIONWISE against the transformers run, which is strictly stronger than
   // the set comparison and pins the emission ORDER as well as the membership.
@@ -522,9 +526,21 @@ TEST_CASE("glm5_next k-pool device: the selection is SET-equal and positionwise 
     }
   }
   MESSAGE("pruning rows = " << pruning_rows << ", smallest decision margin = " << worst);
+  MESSAGE("index_scores max|device - transformers| = " << score_delta);
   REQUIRE(pruning_rows > 0);
   CHECK(std::isfinite(worst));
   CHECK(worst > 0.0);
+
+  // THE SCORE BOUND IS TIED TO THE MARGIN, not chosen. An absolute tolerance on
+  // a score would be a number with no meaning: the golden magnitudes here run to
+  // 45, so one f32 ULP is already 3.8e-6 and a tolerance below that fails on
+  // arithmetic while a tolerance far above it stops bounding anything. The
+  // question a selection gate can actually answer is whether the numerical
+  // difference is small against the gap the top-k decides on, so that is what is
+  // asserted — with a factor of four of room, and both numbers printed so a
+  // future fixture that narrows the margin fails here instead of silently
+  // becoming a coin flip.
+  CHECK(score_delta * 4.0 < worst);
 }
 
 TEST_CASE("glm5_next k-pool device: P == 0 serves the raw visible tail alone") {

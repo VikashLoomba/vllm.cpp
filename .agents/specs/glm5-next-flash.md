@@ -2366,9 +2366,15 @@ the exit code. The `static_assert` in the case pins what it is FOR —
 offset in the same tower still fits, so a 32-bit element count would truncate
 here and nowhere in the E<=4 codebook cases.
 
-**`dgx:gpu0` is still queued and this gate is NOT closed by the `thor` run.**
-`sm_110` and `sm_121a` are different targets and a number from one does not
-transfer to the other; the GB10 leg stays PENDING until its lease returns.
+**`dgx:gpu0` was still queued when this was written, and the GB10 leg has since
+been TAKEN.** `sm_110` and `sm_121a` are different targets and a number from one
+does not transfer to the other, which is why the leg was held open. It returned
+on 2026-08-31: on `dgx:gpu0` with `CUDA FA2 compiled-arch manifest: [121a]`,
+`test_cuda_quant_dot` ran **17 cases / 177,284 assertions / 0 failed** and the
+GLM-5.3-Flash published MoE geometry case **25 assertions / 0 failed**, the same
+totals `thor` produced, now reproduced on the architecture that counts. Cite the
+GB10 run rather than `thor`'s. Corrected here by W9c-0 rather than left as a
+PENDING that the fleet has already answered.
 
 **One fleet fact bounds the END-TO-END test and is recorded here**, because
 which box can ever take the end-to-end test: on `thor:gpu0` (`compute_cap` 11.0,
@@ -2547,6 +2553,29 @@ tautology:
    made.** An all-NaN forward on this row once read as a perfect match, because
    every comparison against NaN is false, and the model then emitted token id 0
    eight times. A NaN in either arm fails this file rather than passing it.
+
+**A PRE-LEASE ALGORITHM CHECK, AND THE BOUND IT DOES NOT CROSS.** Before a
+device lease was taken, both kernels were transcribed into numpy and run against
+the same goldens, because a lease spent discovering an index error is a lease
+wasted. It reported `P = 5` against `np = 6` (the compaction), `pool_keys`
+max|delta| `3.075e-07`, `index_scores` max|delta| `6.852e-06`, `topk_indices`
+positionwise **0 mismatches of 462**, 17 pruning rows and a smallest decision
+margin of **2.58e-03**. **That transcription is NOT the gate and it is not
+committed.** It bounds the ALGORITHM — indexing, the compaction, the emission
+order, the tail offset, the padded-row rule — and it bounds nothing at all about
+the build, about `nvcc`, about the launch geometry, about the shared-memory
+reductions or about float rounding, because none of those exist in it. A
+transcription cannot gate the function it transcribes. It is recorded here as
+what it is: the reason the lease was taken with some confidence, stated ahead of
+the numbers it does not support.
+
+**THE SCORE BOUND IS TIED TO THE MARGIN RATHER THAN CHOSEN.** The golden score
+magnitudes run to 45.17, so a single f32 ULP there is already 3.8e-6: an
+absolute tolerance below that fails on arithmetic and one far above it bounds
+nothing. The gate instead asserts that the device-versus-oracle difference is
+under a quarter of the smallest gap the top-k decides on, and prints both, so a
+later fixture that narrows the margin fails this file rather than quietly
+becoming a coin flip.
 
 **Gates.** `scripts/agent-preflight.sh --fail-on-skip`; the CPU suites by hand
 with case and assertion counts, including `test_glm5_next_dsa` unchanged and the

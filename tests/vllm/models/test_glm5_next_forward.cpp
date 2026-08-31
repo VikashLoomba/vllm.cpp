@@ -1099,16 +1099,28 @@ TEST_CASE("glm5_next W5b-2c: a HISTORY the engine does not believe in is refused
 
 TEST_CASE("glm5_next W5b-2c: ModelRegistry::Forward NARROWS its refusal, not drops it") {
   // The W3 guard (#2068) refused ANY keyed cache set. This row's forward
-  // declares that it consumes one; every other model still inherits
-  // `consumes_multi_kv == false` and is still refused with the same
-  // message, which is what keeps the narrowing from being a removal.
+  // declares that it consumes one; a model that has NOT wired its forward
+  // still inherits `consumes_multi_kv == false` and is still refused with the
+  // same message, which is what keeps the narrowing from being a removal.
   const std::vector<std::string> archs{"Glm5NextForConditionalGeneration"};
   const vllm::ModelRegistration& reg = vllm::ModelRegistry::Resolve(archs);
   REQUIRE(reg.factory != nullptr);
   CHECK(reg.factory->consumes_multi_kv);
 
+  // DeepSeek-V4 was the negative case when this test was written, and it is
+  // NOT one any more: `KV-DSV4-MULTICACHE` W5 (#2323) landed its consuming
+  // forward, so it now declares consumption for the same reason this row does.
+  // Asserting it still refuses would gate the absence of that work.
   const std::vector<std::string> dsv4_archs{"DeepseekV4ForCausalLM"};
   const vllm::ModelRegistration& dsv4 = vllm::ModelRegistry::Resolve(dsv4_archs);
   REQUIRE(dsv4.factory != nullptr);
-  CHECK_FALSE(dsv4.factory->consumes_multi_kv);
+  CHECK(dsv4.factory->consumes_multi_kv);
+
+  // The negative case has to be a model that genuinely has not wired one.
+  // Kimi-Linear publishes a single attention group, so it never reaches the
+  // guard, and it carries the default.
+  const std::vector<std::string> kimi_archs{"KimiLinearForCausalLM"};
+  const vllm::ModelRegistration& kimi = vllm::ModelRegistry::Resolve(kimi_archs);
+  REQUIRE(kimi.factory != nullptr);
+  CHECK_FALSE(kimi.factory->consumes_multi_kv);
 }

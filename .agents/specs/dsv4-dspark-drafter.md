@@ -140,6 +140,12 @@ block tables.
 W-4. **The markov head and the sampling loop.** Cheap in weights and the whole
 reason the block is affordable, so it is its own wave with its own gate.
 
+W-4 LANDED. `MarkovDraftLoop` is the sequential chain: per step one embedding
+gather, one rank-256 GEMV and an argmax, with the bias conditioned on the
+PREVIOUSLY SAMPLED id. Ties go to the lowest id, matching `torch.argmax`, because
+a drafter that breaks them the other way emits valid text and diverges from the
+oracle -- the exact class of difference acceptance cannot explain afterwards.
+
 W-5. **Propose/verify**, reusing the shared `RejectionSampler` verbatim. The
 lossless property makes the correctness gate exact: drafter-on greedy output must
 be token-IDENTICAL to drafter-off.

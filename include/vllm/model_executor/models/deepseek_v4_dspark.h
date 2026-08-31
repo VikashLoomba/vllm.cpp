@@ -71,6 +71,32 @@ struct TapRequest {
   std::vector<std::vector<float>> taps;  // filled by the forward
 };
 
+// W-4, THE DRAFT LOOP. `DeepseekV4MTPModel.sample_from_state`
+// (`exllamav3/architecture/deepseek_v4_mtp.py:311-340`).
+//
+// The trunk head runs over ALL block positions at once; only this loop is
+// sequential, and all it does per step is one embedding gather, one rank-256
+// GEMV and an argmax. That is what makes a 5-token block affordable: the
+// expensive part is parallel and the serial part is a bigram correction.
+//
+//     out[0] = seed
+//     for i in [0, block):
+//       emb    = markov_w1[out[i]]        // Embedding, [rank]
+//       bias   = markov_w2 @ emb          // Linear rank -> vocab, [vocab]
+//       out[i+1] = argmax(logits[i] + bias)
+//
+// `markov_w1` is an Embedding of width `dspark_markov_rank` and `markov_w2` a
+// Linear whose `in_features` is that same rank
+// (`deepseek_v4_mtp.py:176-190`); both are `[vocab, rank]` in the artifact, at
+// rank 256.
+//
+//   logits  [block, vocab] from the SHARED trunk head
+//   returns block + 1 ids, `[seed, drafts...]` — the caller crops the seed
+std::vector<int32_t> MarkovDraftLoop(const std::vector<float>& logits, int32_t seed_id,
+                                     const std::vector<float>& markov_w1,
+                                     const std::vector<float>& markov_w2, int64_t block,
+                                     int64_t vocab, int64_t rank);
+
 }  // namespace vllm::dspark
 
 namespace vllm {

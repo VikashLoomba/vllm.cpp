@@ -124,3 +124,80 @@ TEST_CASE("W-2: a tap that is still a STREAM STACK refuses") {
   const std::vector<float> gamma{1.0f, 1.0f};
   CHECK_THROWS(vllm::dspark::ProjectTaps(stacked, view, gamma, 0.0f, T, H));
 }
+
+// ── W-4: the sequential draft loop with the factorized-bigram bias ───────────
+//
+// `sample_from_state` (`exllamav3/architecture/deepseek_v4_mtp.py:311-340`). The
+// bias is what makes the chain a BIGRAM: position i's logits are corrected by a
+// term conditioned on the id sampled at i-1, so the loop cannot be reordered or
+// run in parallel, and dropping the bias yields a drafter that still emits valid
+// tokens and drafts worse.
+
+TEST_CASE("W-4: the bias is conditioned on the PREVIOUS sampled id") {
+  // vocab 3, rank 1, block 2. w1 maps each id to a 1-wide code; w2 turns that
+  // code into a per-vocab bias. Chosen so the chain is forced:
+  //   seed 0 -> emb 1.0 -> bias favours id 2 -> out[1] = 2
+  //   id 2   -> emb 0.0 -> bias vanishes     -> out[2] = argmax(logits[1]) = 1
+  const int64_t V = 3, R = 1, B = 2;
+  const std::vector<float> w1{1.0f, 0.0f, 0.0f};       // [V, R]: only id 0 codes 1
+  const std::vector<float> w2{0.0f, 0.0f, 10.0f};      // [V, R]: bias id 2 by 10*emb
+  const std::vector<float> logits{
+      0.0f, 1.0f, 0.0f,   // position 0: without bias id 1 would win
+      0.0f, 1.0f, 0.0f,   // position 1: id 1 wins
+  };
+  const auto out = vllm::dspark::MarkovDraftLoop(logits, /*seed=*/0, w1, w2, B, V, R);
+  REQUIRE(out.size() == static_cast<size_t>(B) + 1);
+  CHECK(out[0] == 0);  // the seed is carried through, uncropped
+  CHECK(out[1] == 2);  // the bias OVERRODE the unbiased argmax of 1
+  CHECK(out[2] == 1);  // and vanished once the chain moved to id 2
+}
+
+TEST_CASE("W-4: with a zero bias the loop is plain per-position argmax") {
+  const int64_t V = 3, R = 2, B = 3;
+  const std::vector<float> w1(static_cast<size_t>(V * R), 0.5f);
+  const std::vector<float> w2(static_cast<size_t>(V * R), 0.0f);  // no bias at all
+  const std::vector<float> logits{
+      0.1f, 0.9f, 0.2f,   // -> 1
+      0.7f, 0.3f, 0.2f,   // -> 0
+      0.0f, 0.1f, 0.8f,   // -> 2
+  };
+  const auto out = vllm::dspark::MarkovDraftLoop(logits, /*seed=*/1, w1, w2, B, V, R);
+  REQUIRE(out.size() == 4u);
+  CHECK(out[0] == 1);
+  CHECK(out[1] == 1);
+  CHECK(out[2] == 0);
+  CHECK(out[3] == 2);
+}
+
+TEST_CASE("W-4: a tie goes to the LOWEST id, as torch.argmax does") {
+  // A draft that breaks ties the other way is still valid text and diverges from
+  // the oracle, which is exactly the class of difference acceptance cannot
+  // explain after the fact.
+  const int64_t V = 3, R = 1, B = 1;
+  const std::vector<float> w1{0.0f, 0.0f, 0.0f};
+  const std::vector<float> w2{0.0f, 0.0f, 0.0f};
+  const std::vector<float> logits{5.0f, 5.0f, 5.0f};
+  const auto out = vllm::dspark::MarkovDraftLoop(logits, /*seed=*/2, w1, w2, B, V, R);
+  CHECK(out[1] == 0);
+}
+
+TEST_CASE("W-4: the bias is a rank-R inner product, hand-computed") {
+  // rank 2, so the GEMV actually sums two terms. emb(seed=1) = {2, 3};
+  // w2 row 0 = {1, 0} -> 2 ; row 1 = {0, 1} -> 3 ; row 2 = {1, 1} -> 5.
+  // logits {0, 1, 0} + bias {2, 3, 5} = {2, 4, 5} -> id 2.
+  const int64_t V = 3, R = 2, B = 1;
+  const std::vector<float> w1{0.0f, 0.0f, 2.0f, 3.0f, 0.0f, 0.0f};
+  const std::vector<float> w2{1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
+  const std::vector<float> logits{0.0f, 1.0f, 0.0f};
+  const auto out = vllm::dspark::MarkovDraftLoop(logits, /*seed=*/1, w1, w2, B, V, R);
+  CHECK(out[1] == 2);
+}
+
+TEST_CASE("W-4: a seed outside the vocabulary REFUSES") {
+  const int64_t V = 3, R = 1, B = 1;
+  const std::vector<float> w1(static_cast<size_t>(V * R), 0.0f);
+  const std::vector<float> w2(static_cast<size_t>(V * R), 0.0f);
+  const std::vector<float> logits{0.0f, 0.0f, 0.0f};
+  CHECK_THROWS(vllm::dspark::MarkovDraftLoop(logits, /*seed=*/V, w1, w2, B, V, R));
+  CHECK_THROWS(vllm::dspark::MarkovDraftLoop(logits, /*seed=*/-1, w1, w2, B, V, R));
+}

@@ -934,6 +934,30 @@ keep-quant arm checks the shape too, so what that produces is an ANONYMOUS
 buys a DIAGNOSTIC over that, which is still the `.agents/verification.md` concern,
 and it is not the difference between wrong tokens and a refusal.
 
+**MEASURED 2026-08-31, and it settles what the shared policy may and may not do.**
+The artifact's own `config.json` gives `compress_ratios` over 46 layers of which
+**41 carry a compressor** (`ratio > 1`), and its weight map carries **248
+`*.attn.compressor.*` tensors** -- `ape`, `norm.weight`, `wgate.weight` per layer.
+`index_topk` is 512.
+
+So a shared dense-MLA policy applied to THIS arm is not a shortcut around a
+geometry mismatch. It would make 41 of 46 layers ignore weights the checkpoint
+actually contains, which is running a different model rather than approximating
+this one, and it is exact only below 512 tokens even for the indexer half it was
+argued for. That is a product decision about correctness, not a mechanical
+unblock, and it is escalated rather than taken: `## Owed` already files the policy,
+and this paragraph records what the policy would COST if it were pointed at the
+EXL3 arm.
+
+The GGUF arm is not a precedent for it. That arm's converter did not carry the
+compressor tensors at all, so `dsa_dense` there discards nothing that exists;
+here it would discard 248 tensors that do.
+
+The correct fix is `MODEL-DSV4-DSA-COMPOSE` (#2286), which implements the
+window-plus-compressed-history composition those weights are for, and whose W1
+primitive (`MergeWindowAndCompressed`) has landed. The real-artifact load waits on
+that row rather than on a policy flag.
+
 **The obvious fix is wrong and the reason is worth recording.** The GGUF arm
 dodges the same geometry by setting `dsa_dense = (be.gguf != nullptr)` and
 running dense MLA, which is EXACT for `seq_len <= index_topk`. Extending that

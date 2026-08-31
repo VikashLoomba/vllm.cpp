@@ -155,8 +155,68 @@ scripts/agent-preflight.sh --staged
 
 ## Evidence
 
-Recorded in the pull request body: the red transcript, the green transcript,
-and the build rcs, each read from the command's own status.
+Measured on the dev box, CPU-only build (`cmake -S . -B build
+-DCMAKE_BUILD_TYPE=Release -G Ninja`, no `VLLM_CPP_CUDA`), every rc read from
+the command's own status and not from a wrapper's.
+
+**RED — behavioural, not a compile error.** With `ModelSource::device` present
+and every other call site already threaded, but `qwen4_exp_registry.cpp` still
+filling the loader's `device` argument from
+`platforms::CurrentPlatform().device_type()`:
+
+```text
+BUILD_RC=0
+./build/tests/test_qwen4_exp_gguf_weights -tc="*resolved device*"
+  test cases:  1 | 0 passed | 1 failed | 12 skipped
+  assertions: 13 | 5 passed | 8 failed
+  Status: FAILURE!    rc=1
+  CHECK( msg.find("cuda") != npos ) is NOT correct!   logged: msg :=
+  CHECK_THROWS_AS( LoadThroughRegistry(g, d) ) did NOT throw at all!  (x4)
+```
+
+The refusal message is EMPTY because the load simply succeeded: a
+CUDA-resolved `ModelSource` reached the loader as `kCPU`, which is the defect.
+
+**GREEN — the same 13 assertions, after the one-line registry change:**
+
+```text
+BUILD_RC=0
+  test cases:  1 | 1 passed | 0 failed | 12 skipped
+  assertions: 13 | 13 passed | 0 failed
+  Status: SUCCESS!    rc=0
+```
+
+**Full suites, re-run ON THE MERGE COMMIT** (`origin/main` moved 23 commits
+mid-row; these are not inherited from the pre-merge measurement), `BUILD_RC=0`:
+
+| target | cases | assertions | rc |
+|---|---|---|---|
+| `test_qwen4_exp_gguf_weights` | 13 | 3087 | 0 |
+| `test_gguf_keep_quant` | 45 | 6504 | 0 |
+| `test_gguf_device_fit` | 21 | 155 | 0 |
+| `test_qwen4_exp_gguf_load_plan` | 10 | 7462 | 0 |
+| `test_glm5_next_gguf_load` | 16 | 8731 | 0 |
+| `test_qwen3_5_gguf_mtp` | 4 | 18 | 0 |
+| `test_weight_residency_reach` | 7 | 76 | 0 |
+| `test_weight_residency_config` | 39 | 516 | 0 |
+
+**MUTATION, taken at the merge commit** so a later commit cannot silently
+disarm it. `source.device` reverted to
+`platforms::CurrentPlatform().device_type()`, rebuilt (`rc 0`, so the mutation
+really compiled and really ran):
+
+```text
+  test cases:   13 |   12 passed | 1 failed
+  assertions: 3087 | 3079 passed | 8 failed
+  Status: FAILURE!    rc=1
+```
+
+Exactly one case moves and 3079 assertions do not. That is the measurement of
+why this survived: the whole pre-existing suite is blind to it. Restored
+byte-for-byte, verified by `sha256sum -c` and a clean `git status`, rebuilt and
+re-run to 13/3087/rc 0.
+
+`scripts/agent-preflight.sh --staged`: `PREFLIGHT_RC=0`.
 
 ## Owed
 
@@ -186,4 +246,6 @@ and the build rcs, each read from the command's own status.
 
 ## Now
 
-ACTIVE. Implementation and tests in one pull request with this spec.
+REVIEW. Spec, implementation and tests are on `row/ENG-GGUF-RESIDENCY-RESOLVED-DEVICE`,
+in that commit order. Awaiting a fresh reviewer and the operator's own gate
+re-run.

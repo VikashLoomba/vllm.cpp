@@ -146,11 +146,42 @@ Implementation in flight on `row/MODEL-MM-QWEN4-EXP-QSADEV`.
 
 ## Owed
 
+- **THE DEVICE BRANCH LANDS UNREACHED, and AGENTS.md "Nothing lands dead" is
+  satisfied by naming it here rather than by a claim that it is reached.** On a
+  CPU queue every operand is `kCPU`, so `StageHostWords` takes its memcpy arm and
+  the `Backend::Copy` arm never runs. No queue of any other type can reach the
+  block today, and the reason is at the LOADER, before a single `vt::` op
+  dispatches: `src/vllm/model_executor/models/qwen4_exp_weights.cpp:658-670`
+  throws for any device where `DeviceQuantGatherSupported` is false, and that
+  predicate is `return dev == vt::DeviceType::kCPU;`
+  (`src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:167-169`). It is
+  keyed on the device alone, so a float GGUF hits it identically, and the
+  safetensors arm throws unconditionally (`qwen4_exp_registry.cpp:826-830`).
+  Owning row: `MODEL-MM-QWEN4-EXP`. The wiring is owned by
+  [#2083](https://github.com/mudler/vllm.cpp/issues/2083) / PR #2396 (the loader
+  gate) and [#2380](https://github.com/mudler/vllm.cpp/issues/2380) / PR #2391
+  (four missing `vt::` CUDA arms);
+  [#2421](https://github.com/mudler/vllm.cpp/issues/2421) tracks this slice. The
+  CUDA case in `test_qwen4_exp_qsa_block.cpp` measures it the moment a device is
+  available and says `UNMEASURED` until then.
+- **THE SHIPPED CHECKPOINT WOULD NOT REACH THE QSA LAYER EITHER, for a worse
+  reason than a refusal.** `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S stores
+  tensors in IQ4_NL and Q5_0, neither of which `IsCudaKeepQuantSupported`
+  (`src/vt/cuda/cuda_quant_dot.cu:1736-1770`) admits, and the fallback at
+  `:1993-2000` calls the CPU kernel on device pointers. That is a SIGSEGV at
+  layer 0's projections rather than a message, and the file's own comment records
+  it. [#2419](https://github.com/mudler/vllm.cpp/issues/2419) owns it; this spec
+  claims nothing about that path.
 - **THE COPY COSTS A QUEUE SYNCHRONIZE PER QSA LAYER PER STEP on a device arm.**
-  Two, in fact: one in `QsaBlockCore` for the rope probe and the page table, and
-  one in `Qwen4ExpQsaIndex` for `kv_lens`. On a 48-layer model with 12
-  `qwen_sparse_attention` layers that is 24 synchronizes per step. NOTHING HAS
-  MEASURED IT, because no CUDA `qwen4_exp` step exists to measure. The fix is the
+  THREE, counted rather than estimated: `CheckRopeLayoutsAgree` synchronises once
+  for its nine staged ranges, `QsaBlockCore` once for group 2's page table on the
+  paged arm, and `Qwen4ExpQsaIndex` once for `kv_lens`. On this architecture's
+  48 layers, of which 12 are `qwen_sparse_attention`, that is 36 synchronizes per
+  step. They are NOT folded into one here: the rope check runs before the cache
+  validation that establishes the table's shape, so staging both would reorder
+  which refusal a doubly-malformed caller sees, and reordering refusals to save a
+  synchronize on a path no step can reach yet is the wrong trade. NOTHING HAS
+  MEASURED ANY OF IT, because no CUDA `qwen4_exp` step exists to measure. The fix is the
   entry the parent spec already carries: fold the page resolution into
   `vt::Qwen4ExpQsaCompress`'s own address mode, which removes the table download,
   and give the rope cross-check a device-side home or argue it away. Owed under

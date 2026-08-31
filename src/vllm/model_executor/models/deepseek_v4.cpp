@@ -39,6 +39,7 @@
 // landed primitive math the device kernels will call.
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/deepseek_v4_dspark.h"
+#include "vllm/model_executor/models/deepseek_v4_rope.h"
 #include "vllm/model_executor/models/deepseek_v4_probe.h"
 
 #include <chrono>
@@ -89,6 +90,8 @@ using deepseek_v4::HcHeadCollapse;
 using deepseek_v4::MakeFp8DsMlaLayout;
 using deepseek_v4::MhcPost;
 using deepseek_v4::MhcPre;
+using deepseek_v4::RopeInplaceLayer;
+using deepseek_v4::YarnCorrDim;
 using deepseek_v4::MhcPreResult;
 using deepseek_v4::MoeRouteResult;
 using deepseek_v4::SoftmaxWithSink;
@@ -644,40 +647,6 @@ std::vector<float> RmsNorm(const std::vector<float>& x, const std::vector<float>
 // `ds4.c:rope_tail_ext_inplace` (+ `rope_yarn_corr_dim`/`rope_yarn_ramp`). Getting
 // this wrong scrambles the rope half of q·k on every compressed layer → the model
 // loses positional/context structure (degenerate repetition).
-double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base) {
-  return static_cast<double>(n_dims) *
-         std::log(static_cast<double>(n_ctx_orig) /
-                  (beta * 2.0 * std::numbers::pi_v<double>)) /
-         (2.0 * std::log(base));
-}
-void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,
-                      double ext_factor, int64_t n_ctx_orig, double beta_fast,
-                      double beta_slow, bool inverse = false) {
-  const double theta_scale = std::pow(base, -2.0 / static_cast<double>(r));
-  const double sin_sign = inverse ? -1.0 : 1.0;  // inverse rope un-rotates (ds4 sin_sign)
-  double corr_lo = 0.0, corr_hi = 0.0;
-  if (ext_factor != 0.0) {
-    corr_lo = std::max(0.0, std::floor(YarnCorrDim(r, n_ctx_orig, beta_fast, base)));
-    corr_hi = std::min(static_cast<double>(r - 1),
-                       std::ceil(YarnCorrDim(r, n_ctx_orig, beta_slow, base)));
-  }
-  double theta_extrap = static_cast<double>(pos);
-  for (int64_t i = 0; i < r; i += 2) {
-    const double theta_interp = freq_scale * theta_extrap;
-    double theta = theta_interp;
-    if (ext_factor != 0.0) {
-      const double y = (static_cast<double>(i / 2) - corr_lo) / std::max(0.001, corr_hi - corr_lo);
-      const double ramp = (1.0 - std::min(1.0, std::max(0.0, y))) * ext_factor;
-      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
-    }
-    const float c = static_cast<float>(std::cos(theta));
-    const float s = static_cast<float>(sin_sign * std::sin(theta));
-    const float x0 = v[i], x1 = v[i + 1];
-    v[i] = x0 * c - x1 * s;
-    v[i + 1] = x0 * s + x1 * c;
-    theta_extrap *= theta_scale;
-  }
-}
 
 std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) {
   return std::vector<float>(v.begin() + off, v.begin() + off + len);
@@ -1620,6 +1589,45 @@ void DumpAct(const char* name, const std::vector<float>& v) {
 }
 
 }  // namespace
+
+namespace deepseek_v4 {
+
+double YarnCorrDim(int64_t n_dims, int64_t n_ctx_orig, double beta, double base) {
+  return static_cast<double>(n_dims) *
+         std::log(static_cast<double>(n_ctx_orig) /
+                  (beta * 2.0 * std::numbers::pi_v<double>)) /
+         (2.0 * std::log(base));
+}
+void RopeInplaceLayer(float* v, int64_t r, int64_t pos, double base, double freq_scale,
+                      double ext_factor, int64_t n_ctx_orig, double beta_fast,
+                      double beta_slow, bool inverse) {
+  const double theta_scale = std::pow(base, -2.0 / static_cast<double>(r));
+  const double sin_sign = inverse ? -1.0 : 1.0;  // inverse rope un-rotates (ds4 sin_sign)
+  double corr_lo = 0.0, corr_hi = 0.0;
+  if (ext_factor != 0.0) {
+    corr_lo = std::max(0.0, std::floor(YarnCorrDim(r, n_ctx_orig, beta_fast, base)));
+    corr_hi = std::min(static_cast<double>(r - 1),
+                       std::ceil(YarnCorrDim(r, n_ctx_orig, beta_slow, base)));
+  }
+  double theta_extrap = static_cast<double>(pos);
+  for (int64_t i = 0; i < r; i += 2) {
+    const double theta_interp = freq_scale * theta_extrap;
+    double theta = theta_interp;
+    if (ext_factor != 0.0) {
+      const double y = (static_cast<double>(i / 2) - corr_lo) / std::max(0.001, corr_hi - corr_lo);
+      const double ramp = (1.0 - std::min(1.0, std::max(0.0, y))) * ext_factor;
+      theta = theta_interp * (1.0 - ramp) + theta_extrap * ramp;
+    }
+    const float c = static_cast<float>(std::cos(theta));
+    const float s = static_cast<float>(sin_sign * std::sin(theta));
+    const float x0 = v[i], x1 = v[i + 1];
+    v[i] = x0 * c - x1 * s;
+    v[i + 1] = x0 * s + x1 * c;
+    theta_extrap *= theta_scale;
+  }
+}
+
+}  // namespace deepseek_v4
 
 // ─── Brick C part 2: the DEVICE-RESIDENT T=1 decode forward ───────────────────
 // The host-orchestrated ForwardComposeImpl drains the stream ~560×/step (each GEMM

@@ -201,3 +201,81 @@ TEST_CASE("W-4: a seed outside the vocabulary REFUSES") {
   CHECK_THROWS(vllm::dspark::MarkovDraftLoop(logits, /*seed=*/V, w1, w2, B, V, R));
   CHECK_THROWS(vllm::dspark::MarkovDraftLoop(logits, /*seed=*/-1, w1, w2, B, V, R));
 }
+
+// ── W-3's first brick: the RoPE seam, now shared ─────────────────────────────
+//
+// `RopeInplaceLayer` was file-local in `deepseek_v4.cpp` until the drafter needed
+// it: a DSpark block derives its KV rows from the projected taps and applies the
+// SAME partial rotation the trunk applies to its own KV. Exported rather than
+// re-implemented, because DeepSeek-V4's RoPE is DUAL and a second copy would be a
+// second place for that split to drift.
+//
+// These cases pin the contract the drafter depends on. The trunk already calls
+// the function, so they are not a reachability claim; they are the guard on what
+// moving it out of an anonymous namespace must not have changed.
+
+#include "vllm/model_executor/models/deepseek_v4_rope.h"
+
+TEST_CASE("W-3 seam: the dense arm is a ROTATION, so it preserves pair norms") {
+  // Dense layers rotate with ext_factor == 0. A rotation of adjacent pairs leaves
+  // each pair's magnitude alone; anything that scales instead would pass a
+  // finiteness check and quietly change attention logits.
+  std::vector<float> v{1.0f, 2.0f, -3.0f, 0.5f, 0.25f, -1.5f};
+  const std::vector<float> before = v;
+  vllm::deepseek_v4::RopeInplaceLayer(v.data(), /*r=*/6, /*pos=*/7, /*base=*/10000.0,
+                                      /*freq_scale=*/1.0, /*ext_factor=*/0.0,
+                                      /*n_ctx_orig=*/4096, /*beta_fast=*/32.0,
+                                      /*beta_slow=*/1.0);
+  bool moved = false;
+  for (size_t i = 0; i < v.size(); i += 2) {
+    const double n0 = std::hypot(before[i], before[i + 1]);
+    const double n1 = std::hypot(v[i], v[i + 1]);
+    CHECK(n1 == doctest::Approx(n0).epsilon(1e-6));
+    if (std::abs(v[i] - before[i]) > 1e-6) moved = true;
+  }
+  CHECK(moved);  // pos 7 must actually rotate; an all-no-op would satisfy the norms
+}
+
+TEST_CASE("W-3 seam: `inverse` un-rotates exactly") {
+  std::vector<float> v{0.3f, -0.7f, 1.1f, 2.0f};
+  const std::vector<float> before = v;
+  for (int pass = 0; pass < 2; ++pass) {
+    vllm::deepseek_v4::RopeInplaceLayer(v.data(), 4, /*pos=*/11, 10000.0, 1.0, 0.0, 4096,
+                                        32.0, 1.0, /*inverse=*/pass == 1);
+  }
+  for (size_t i = 0; i < v.size(); ++i)
+    CHECK(v[i] == doctest::Approx(before[i]).epsilon(1e-5));
+}
+
+TEST_CASE("W-3 seam: `ext_factor` alone changes the rotation") {
+  // 41 of 43 trunk layers take the YaRN arm. The FIRST version of this case varied
+  // `freq_scale` as well, so the two calls differed for that reason alone and a
+  // mutation disabling the ext_factor ramp passed it. Everything but `ext_factor`
+  // is held equal here, which is what makes the ramp observable.
+  const std::vector<float> src{1.0f, 0.0f, 0.0f, 1.0f, 0.5f, -0.5f, 2.0f, 0.25f};
+  std::vector<float> off = src, on = src;
+  const double kFreq = 1.0 / 16.0;
+  vllm::deepseek_v4::RopeInplaceLayer(off.data(), 8, 64, 160000.0, kFreq,
+                                      /*ext_factor=*/0.0, 4096, 32.0, 1.0);
+  vllm::deepseek_v4::RopeInplaceLayer(on.data(), 8, 64, 160000.0, kFreq,
+                                      /*ext_factor=*/1.0, 4096, 32.0, 1.0);
+  double diff = 0.0;
+  for (size_t i = 0; i < src.size(); ++i)
+    diff = std::max(diff, std::abs(static_cast<double>(off[i] - on[i])));
+  CHECK(diff > 1e-3);
+}
+
+TEST_CASE("W-3 seam: `freq_scale` alone changes the rotation") {
+  // The other half of the dual-theta split, held to the same standard: only
+  // `freq_scale` moves.
+  const std::vector<float> src{1.0f, 0.0f, 0.0f, 1.0f, 0.5f, -0.5f, 2.0f, 0.25f};
+  std::vector<float> one = src, scaled = src;
+  vllm::deepseek_v4::RopeInplaceLayer(one.data(), 8, 64, 160000.0, /*freq_scale=*/1.0,
+                                      0.0, 4096, 32.0, 1.0);
+  vllm::deepseek_v4::RopeInplaceLayer(scaled.data(), 8, 64, 160000.0,
+                                      /*freq_scale=*/1.0 / 16.0, 0.0, 4096, 32.0, 1.0);
+  double diff = 0.0;
+  for (size_t i = 0; i < src.size(); ++i)
+    diff = std::max(diff, std::abs(static_cast<double>(one[i] - scaled[i])));
+  CHECK(diff > 1e-3);
+}

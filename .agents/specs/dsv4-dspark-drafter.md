@@ -161,6 +161,20 @@ alongside the existing per-concern V4 headers, with the trunk and the drafter bo
 reading it. That is a refactor of trunk internals and deserves its own review
 rather than riding along with the block composition.
 
+**LANDED.** `deepseek_v4_rope.h` exports `RopeInplaceLayer` and `YarnCorrDim` from
+`vllm::deepseek_v4`; the trunk calls them through the seam. The move is
+behaviour-preserving by construction rather than by assertion -- both function
+bodies were extracted and diffed against their originals and are BYTE-IDENTICAL
+apart from the default argument moving to the declaration, which is the only
+change a header can force.
+
+The seam's contract is gated, and one of those gates had to be repaired before it
+meant anything. The first version of "the YaRN arm is not the dense arm" also
+varied `freq_scale`, so the two calls differed for that reason alone and a mutation
+disabling the ext_factor ramp passed it. The cases now hold everything but one
+parameter equal, one for `ext_factor` and one for `freq_scale`, which is what makes
+each half of the dual-theta split observable.
+
 W-4. **The markov head and the sampling loop.** Cheap in weights and the whole
 reason the block is affordable, so it is its own wave with its own gate.
 

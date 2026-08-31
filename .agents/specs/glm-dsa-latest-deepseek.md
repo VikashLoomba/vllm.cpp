@@ -2736,6 +2736,43 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   `ENG-RESIDENCY-CONFIG` / `QUANT-GGUF-*`, whichever claims
   `tests/vllm/test_gguf_keep_quant.cpp`.
 
+- **O33 — THE SLOT STORE WAS SIZED BY THE FIRST LAYER AND THE ARENA BOUND BY THE
+  WHOLE FILE, SO THE TWO WERE DIFFERENT NUMBERS.** `ExpertStreamLane` is a
+  process-lifetime singleton built on the FIRST slice anyone asks for
+  (`expert_stream_seam.cpp`, `Get` -> `std::max(slot_bytes, Reserved())`), and
+  W9's forward reserves the maximum of the THREE slices of the layer it is
+  running (`glm_moe_dsa_forward.cpp::ExpertMlp`). That is the right maximum for
+  one layer and it is not the model's: a `UD-*` arm mixes encodings ACROSS layers
+  by design. On `UD-IQ1_S` the first MoE block is `blk.3`, whose `ffn_down_exps`
+  is IQ3_XXS at **4,816,896 B**, while `blk.{8,75,76,77}`'s are IQ4_XS at
+  **6,684,672 B** — §3.3 computed exactly that and said slots are sized to the
+  LARGEST slice.
+  **Measured on `dgx:gpu0` (GB10), 2026-08-31.** The lane came up
+  `[expert-stream] ON slots=4096 slot_bytes=4816896 resident=18.38 GiB`, streamed
+  **527 slices / 1,876,328,448 bytes with 0 evictions and 0 exhaustions**, and
+  then refused by name at `blk.8`: `expert stream: a slice of 6684672 bytes
+  exceeds the slot budget of 4816896`. The refusal is correct and its message is
+  actionable; what was wrong is the budget it was given. Note the second symptom,
+  which is the one worth keeping: `CheckDeviceWeightFit` had already charged the
+  device `4096 * 6,684,672 = 25.5 GiB` while the store allocated
+  `4096 * 4,816,896 = 18.38 GiB`. The bound and the store were pricing different
+  arenas.
+  **Fixed in the same flow** by reserving, at load, the same number the bound
+  charges: `model_loader.cpp`'s streamed-lane block already computes
+  `GgufLargestExpertSliceBytes` over the whole file and now passes it to
+  `ExpertStreamLane::Reserve` before `CheckDeviceWeightFit` uses it, so the two
+  cannot disagree. It is in the loader rather than in a model because that is the
+  one place with the whole FILE; `Reserve` takes a maximum and is inert unless
+  streaming was requested, so Qwen3.5's own reservation is unaffected except by
+  gaining a floor that is at least correct. W9's per-layer `Reserve` stays, and is
+  what the CPU suites (which never enter the device-gated loader block) still
+  rely on.
+  **Not CPU-gateable, for the third time on this row.** The call site is inside
+  the block O14 records as device-only, and the synthetic fixture's towers are all
+  Q8_0, so every layer's maximum is the model's and no CPU fixture can separate
+  them. What gates it is the device run before and after, on the same artifact and
+  the same command.
+
 ### 3.10 Now
 
 **THE 201.83 GiB ARTIFACT HAS BEEN DRIVEN, THE MODEL MATERIALIZES, AND NO TOKEN

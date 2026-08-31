@@ -40,6 +40,7 @@
 #include <string>
 #include <vector>
 
+#include "vt/cpu/cpu_threadpool.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -259,6 +260,15 @@ Diff RunOne(int64_t t, int64_t h, DType dx, DType dw, DType dout, bool gemma,
 const DType kIn[3] = {DType::kF32, DType::kF16, DType::kBF16};
 const DType kOut[2] = {DType::kF32, DType::kBF16};
 
+// Swap the pool the CPU kernels dispatch through, and put it back. The hook is
+// there for exactly this ("determinism A/B tests instantiate pools of different
+// sizes in one process", cpu_threadpool.h).
+struct ScopedPool {
+  explicit ScopedPool(vt::cpu::Threadpool* tp) { prev = vt::cpu::Threadpool::SwapForTesting(tp); }
+  ~ScopedPool() { vt::cpu::Threadpool::SwapForTesting(prev); }
+  vt::cpu::Threadpool* prev = nullptr;
+};
+
 }  // namespace
 
 TEST_CASE("rmsnorm elem-dispatch: BYTE-identical over the whole dtype matrix") {
@@ -293,6 +303,39 @@ TEST_CASE("rmsnorm elem-dispatch: the residual stream is BYTE-identical too") {
           CHECK(d.out_bytes == 0u);
           CHECK(d.residual_bytes == 0u);
         }
+      }
+    }
+  }
+}
+
+// WHY THIS CASE EXISTS AND WHY ONE WORKER COUNT WOULD NOT DO. The hoist's claim
+// is about SUMMATION ORDER: each row's variance stays a serial f32 reduction on
+// one thread, and rows are independent, so the threadpool's row partition cannot
+// move a single addend. A run at one worker count cannot test that claim -- it
+// exercises ONE partition, and the defect being excluded is a partition-dependent
+// one. `ForRows` chunks by rows, so a different worker count is a different
+// partition, and T=64 with worker counts up to 20 gives every count a partition
+// no other count produces.
+//
+// The reference is single-threaded by construction, so this is also a
+// parallel-vs-serial identity and not merely a parallel-vs-parallel one.
+TEST_CASE("rmsnorm elem-dispatch: BYTE-identical at every worker count") {
+  const int workers[] = {1, 2, 3, 4, 5, 8, 20};
+  for (int nth : workers) {
+    vt::cpu::Threadpool pool(nth);
+    ScopedPool guard(&pool);
+    REQUIRE(vt::cpu::Threadpool::Global().NThreads() >= 1);
+    for (DType dx : kIn) {
+      for (DType dout : kOut) {
+        // 64 rows so every worker count partitions them differently, and a
+        // non-multiple of most counts so the tail chunk is never uniform.
+        const Diff plain = RunOne(64, 129, dx, DType::kBF16, dout, false, false, DType::kF32);
+        INFO("workers=" << nth << " x=" << N(dx) << " out=" << N(dout) << " no-residual");
+        CHECK(plain.out_bytes == 0u);
+        const Diff res = RunOne(64, 129, dx, DType::kBF16, dout, true, true, DType::kBF16);
+        INFO("workers=" << nth << " x=" << N(dx) << " out=" << N(dout) << " bf16 residual");
+        CHECK(res.out_bytes == 0u);
+        CHECK(res.residual_bytes == 0u);
       }
     }
   }

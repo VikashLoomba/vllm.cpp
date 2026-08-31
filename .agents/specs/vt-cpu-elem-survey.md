@@ -22,13 +22,28 @@ gives the method for sizing them verbatim:
 Nobody has run it. Without the ranking the only ways forward are a 62-kernel
 sweep nobody can review, or a guess about which kernel is next.
 
-**The call sites, counted on this branch's base `43553262c`.** 271 calls across
-67 enclosing functions, all of them in `src/vt/cpu/cpu_ops.cpp`.
-**`src/vt/cpu/cpu_paged_attn.cpp` contains none** — the five matches there are
-its own already-hoisted `KvKind` resolver and its comments, so the predecessor
-row's "two files" is now one. Of the 67, five are the shared helpers rather than
+**The call sites, counted on this branch's base `43553262c`, and this CORRECTS a
+number that was relayed to the developer.** The figure in circulation was "219
+sites across 64 kernels in two files", carried forward from the predecessor row.
+It is wrong on the count and wrong on the file list. The count is **271 calls
+across 67 enclosing functions, all of them in `src/vt/cpu/cpu_ops.cpp`**, and
+**`src/vt/cpu/cpu_paged_attn.cpp` contains none** — the five matches there are its
+own already-hoisted `KvKind` resolver and its comments, so the predecessor row's
+"two files" is one file. Of the 67, five are the shared helpers rather than
 kernels (`LoadF32`, `StoreF32`, `AttnResolveOrRefuse`, `FusedLoad`, `FusedStore`)
-and two are the pair already hoisted, which is where the "other 62" comes from.
+and two are the pair already hoisted.
+
+The correction is stated rather than quietly substituted because a number that has
+been repeated to a human is a claim, and replacing it in silence leaves the wrong
+one standing wherever it was repeated. The method is reproducible: attribute every
+`LoadF32`/`StoreF32` call expression to the top-level definition it sits inside,
+over both files, at that SHA.
+
+**A related negative, verified rather than assumed.** `LTX25-AUDIO-DECODE-COST`
+found `LoadF32`, `StoreF32` and `SizeOf` appear ZERO times in
+`src/vllm/model_executor/models/ltx2_audio_vae.cpp`. That row's serial-`Conv2d`
+defect is the same SHAPE as this one and is NOT this lever, so the audio VAE is
+outside this ranking on evidence rather than by omission.
 
 ## Scope
 
@@ -119,12 +134,21 @@ tree's own, and each is an executable observable.
 | T1 | CPU `vt::RmsNorm` is `memcmp`-identical to a per-element reference over the whole dtype matrix the op accepts, at ragged extents, gemma and non-gemma |
 | T2 | the residual stream's add / round-on-store / RE-READ order is `memcmp`-identical, in BOTH residual dtypes, and the residual bytes are checked as well as the output bytes |
 | T3 | a non-float operand is still refused at the op boundary |
+| T4 | every one of the above is `memcmp`-identical at SEVEN worker counts (1, 2, 3, 4, 5, 8, 20), swapped in through `Threadpool::SwapForTesting`, over 64 rows so no two counts produce the same partition |
 
 `tests/vt/test_ops_rmsnorm_elem_dispatch.cpp`. The reference is the ORIGINAL
 per-element loop, re-derived from the layout contract in `include/vt/ops.h` and
 sharing nothing with `src/vt/cpu` — including its own hand-written f16 and bf16
 conversions, because a gate that compared the kernel against a helper the kernel
 also uses would prove consistency, not correctness.
+
+**ONE WORKER COUNT CANNOT TEST THIS CLAIM, and that is why T4 exists.** The
+hoist's claim is about SUMMATION ORDER: each row's variance stays a serial f32
+reduction on one thread and rows stay independent, so the threadpool's row
+partition cannot move a single addend. A run at one worker count exercises ONE
+partition, and the defect being excluded is a partition-dependent one. `ForRows`
+chunks by rows, so a different worker count is a different partition. M9 in
+`## Outcome` is the proof that this is not ceremony.
 
 **The dtype matrix is bounded by what the OP accepts.** `vt::RmsNorm` takes x and
 weight in {f32, f16, bf16} (`IsFloat`) and out and residual in {f32, bf16}
@@ -139,6 +163,8 @@ before this row every CPU RmsNorm test ran them all f32 or all bf16.
    a transcription of the new code.
 2. The CPU `vt` norm suites green with the SAME case and assertion counts on both
    trees, so nothing was silently skipped.
+2b. Byte equality proven at MORE THAN ONE worker count. A single-thread check does
+   not test a claim about summation order.
 3. A mutation per claimed guarantee, each verified to have APPLIED and BUILT
    before its result is read.
 4. Before/after at one thread AND at the shipped thread count, arms interleaved,
@@ -371,16 +397,21 @@ contended box sees. Both are reported because quoting either alone misleads.
 ### W3 — the correctness evidence
 
 **Byte equality is the whole gate.**
-`tests/vt/test_ops_rmsnorm_elem_dispatch.cpp`: **3 cases / 1,120,646
+`tests/vt/test_ops_rmsnorm_elem_dispatch.cpp`: **4 cases / 1,812,015
 assertions**, every one a `memcmp` against a reference that re-derives the
 original per-element loop and shares nothing with `src/vt/cpu`, down to its own
 hand-written f16 and bf16 conversions.
+
+**At SEVEN worker counts, not one.** T4 swaps in pools of 1, 2, 3, 4, 5, 8 and 20
+through `Threadpool::SwapForTesting` over 64 rows, so no two counts produce the
+same row partition, and the reference it is compared against is serial — making it
+a parallel-vs-SERIAL identity and not merely parallel-vs-parallel.
 
 **Green on a pristine base tree too**, built from `43553262c`'s own
 `cpu_ops.cpp` and `cpu_matmul_elem.cpp`, which is what says the reference is an
 oracle rather than a transcription of the new code.
 
-**The norm suite: 58 cases / 1,132,690 assertions, 0 failed** over `test_dtype`,
+**The norm suite: 59 cases / 1,824,059 assertions, 0 failed** over `test_dtype`,
 `test_fused_chain_additivity`, `test_ops_fused_chain`, `test_ops_layernorm`,
 `test_ops_mamba2_gated_norm`, `test_ops_rmsnorm`, `test_ops_rms_norm_group`,
 `test_rmsnorm_decode_fast`, `test_rmsnorm_gated_fast`,
@@ -390,20 +421,23 @@ is what says nothing was silently skipped rather than silently passing.
 
 **The mutations.** Each is applied to a COPY outside the worktree, so a mutation
 cannot be left behind; each is verified to have changed the file, compiled and
-linked before its result is read. The harness's first run reported eight
-`BUILD-FAILED` rather than eight passes, which is the behaviour that makes the
-rest readable.
+linked before its result is read. The harness's first run reported every row
+`BUILD-FAILED` rather than every row passing, which is the behaviour that makes
+the rest readable. None of the ten is an environment variable, so none can be a
+CI lane's permanent configuration wearing a mutation's clothes.
 
 | # | mutation | result |
 |---|---|---|
-| M1 | split the `sumsq` reduction into two accumulators | KILLED — 60 assertions red |
-| M2 | residual: skip the round-trip RE-READ | KILLED — 12 red |
-| M3 | fold the gemma `+1` unconditionally | KILLED — 66 red |
-| M4 | `NarrowRowFromF32` bf16 truncates instead of round-to-nearest-even | KILLED — 84 red |
+| M1 | split the `sumsq` reduction into two accumulators | KILLED — 81 assertions red |
+| M2 | residual: skip the round-trip RE-READ | KILLED — 54 red |
+| M3 | fold the gemma `+1` unconditionally | KILLED — 108 red |
+| M4 | `NarrowRowFromF32` bf16 truncates instead of round-to-nearest-even | KILLED — 189 red |
 | M5 | `NarrowRowFromF32`'s **f16** branch made wrong | **SURVIVED** |
-| M6 | `WidenRowToF32`'s f16 branch made wrong | KILLED — 72 red |
-| M7 | REACHABILITY: the new hoisted store is inert | KILLED — 132 red |
-| M8 | REACHABILITY: the widened `w` copy is ignored | KILLED — 132 red |
+| M6 | `WidenRowToF32`'s f16 branch made wrong | KILLED — 114 red |
+| M7 | REACHABILITY: the new hoisted store is inert | KILLED — 216 red |
+| M8 | REACHABILITY: the widened `w` copy is ignored | KILLED — 216 red |
+| M9 | PARTITION: the row scratch is hoisted out of `ForRows` and shared across workers | KILLED — 215 red |
+| M10 | PARTITION: `sumsq` carries across rows inside a chunk | KILLED — 72 red |
 
 **M2 SURVIVED on the first version of this gate, and repairing that is the most
 useful thing the mutation set did.** The residual contract is add-in-f32,
@@ -422,6 +456,17 @@ bf16 only, so `NarrowRowFromF32`'s f16 branch is UNREACHABLE from this op. No
 test here can kill it and this row does not claim one does. M4 is the same
 guarantee on the branch that IS reachable, and it dies. This is the predecessor
 row's M3b, on the same op boundary, for the same reason.
+
+**M9 is why T4 is not ceremony, and its isolation is the red-first proof.**
+Hoisting the row scratch out of `ForRows` shares one buffer across every worker:
+a data race that is CORRECT at one thread. With M9 applied and
+`VLLM_CPP_CPU_THREADS=1` — the environment a single-worker runner hands the
+process — the two dtype-matrix cases pass **753,300 and 367,344 assertions with 0
+failed on a broken kernel**, while T4 fails 108. So T4 detects a defect the other
+cases structurally cannot see, and the seven worker counts are load-bearing rather
+than decorative. M10 is the same point from the other side: carrying `sumsq`
+across rows inside a chunk makes the answer depend on where the chunk boundaries
+fall, and it dies with 72 red.
 
 **M7 and M8 are the reachability proof.** Making the new store inert, and making
 the new widened-`w` copy unused, both red the gate THROUGH `vt::RmsNorm` — so

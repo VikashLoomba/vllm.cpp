@@ -412,18 +412,22 @@ Read before starting it, because two details change its shape
 - The indexer owns a `DeepseekV4IndexerCache` keyed by `compress_ratio`, and its
   `DeepseekCompressor` writes INTO that cache (`k_cache_prefix=` is passed to the
   compressor). So the compressed keys are cache rows, not a returned buffer.
-- That compressor is constructed with **`rotate=True`**, where the main
-  compressor is not. The indexer's pooled keys carry RoPE and the attention
-  compressor's do not, so the two cycles are NOT the same call with different
-  dimensions.
+- ~~That compressor is constructed with `rotate=True`, where the main compressor
+  is not.~~ **WRONG, and corrected the commit after it was written.** The MAIN
+  attention compressor passes `rotate=True` too (`attention.py:340`), so it is
+  not a difference between them at all. Worse, `rotate` is assigned to
+  `self.rotate` (`compressor.py:234`) and **never read anywhere in the package**:
+  it is a dead parameter, and it says nothing about either cycle. Nothing about
+  RoPE can be concluded from it in either direction.
 - Selection is `SparseAttnIndexer` over that cache with
   `skip_k_cache_insert=True`, at `topk_tokens = index_topk`. So the top-k scores
   against the COMPRESSED cache rather than against per-token keys, which is what
   `ik` currently feeds `DispLogits`.
 
-So the remaining work is: an indexer-side cache, a second compressor cycle with
-rotation at `index_head_dim`, and a selection re-pointed from per-token keys to
-that cache. All four of its tensors load (previous commit); none of that is a
+So the remaining work is: an indexer-side cache, a second compressor cycle at
+`index_head_dim`, and a selection re-pointed from per-token keys to that cache.
+Whether that cycle rotates is UNKNOWN and must be read from the kernel that writes
+the indexer's cache, not from the constructor flag. All four of its tensors load (previous commit); none of that is a
 width change, and treating it as one would compute a top-k over the wrong
 operand rather than refuse.
 

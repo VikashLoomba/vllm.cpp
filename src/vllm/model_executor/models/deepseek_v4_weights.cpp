@@ -822,6 +822,99 @@ int64_t MtpHeadIndex(const std::string& name) {
 
 }  // namespace
 
+DeepseekV4MtpRouted RouteDeepseekV4MtpTail(
+    const std::vector<DeepseekV4MtpTensorDesc>& tail,
+    const std::vector<const uint8_t*>& payloads) {
+  DeepseekV4MtpRouted out;
+  if (payloads.size() != tail.size()) {
+    out.refusal = "deepseek-v4 mtp: " + std::to_string(tail.size()) +
+                  " descriptors but " + std::to_string(payloads.size()) +
+                  " payloads; a view built from mismatched arrays would borrow the "
+                  "wrong bytes";
+    return out;
+  }
+  const DeepseekV4MtpInventory inv = ClassifyDeepseekV4MtpTail(tail);
+  if (!inv.refusal.empty()) {
+    out.refusal = inv.refusal;
+    return out;
+  }
+
+  std::unordered_map<std::string, size_t> pos;
+  for (size_t i = 0; i < tail.size(); ++i) pos.emplace(tail[i].name, i);
+  out.heads.resize(static_cast<size_t>(inv.num_heads));
+
+  for (size_t i = 0; i < tail.size(); ++i) {
+    const DeepseekV4MtpTensorDesc& d = tail[i];
+    const int64_t head = MtpHeadIndex(d.name);
+    if (head < 0 || head >= static_cast<int64_t>(out.heads.size())) {
+      out.refusal = "deepseek-v4 mtp: '" + d.name + "' names head " +
+                    std::to_string(head) + ", outside the " +
+                    std::to_string(out.heads.size()) + " the tail declares";
+      return out;
+    }
+    const std::string kScale = ".scale";
+    if (d.name.size() > kScale.size() &&
+        d.name.compare(d.name.size() - kScale.size(), kScale.size(), kScale) == 0) {
+      continue;  // reached through its weight
+    }
+    const std::string key = d.name.substr(d.name.find('.', 4) + 1);
+
+    DeepseekV4MtpTensorView v;
+    v.shape = d.shape;
+    v.dtype = d.dtype;
+    v.data = payloads[i];
+    if (d.dtype == "BF16" || d.dtype == "F32") {
+      v.format = DeepseekV4MtpFormat::kPlain;
+      v.out_dim = d.shape.empty() ? 0 : d.shape[0];
+      v.in_dim = d.shape.size() > 1 ? d.shape[1] : 1;
+    } else {
+      const auto sit = pos.find(d.name + kScale);
+      VT_CHECK(sit != pos.end(),
+               "deepseek-v4 mtp: classification passed but '" + d.name +
+                   "' has no scale; the two passes disagree");
+      v.scale = payloads[sit->second];
+      v.out_dim = d.shape[0];
+      if (d.dtype == "I8") {
+        // TWO e2m1 nibbles per stored byte. `in_dim` is the LOGICAL width.
+        v.format = DeepseekV4MtpFormat::kMxfp4;
+        v.in_dim = d.shape[1] * 2;
+      } else {
+        v.format = DeepseekV4MtpFormat::kFp8Block;
+        v.in_dim = d.shape[1];
+      }
+    }
+    out.heads[static_cast<size_t>(head)].tensors.emplace(key, v);
+  }
+  return out;
+}
+
+std::vector<float> DequantizeDeepseekV4MtpTensor(const DeepseekV4MtpTensorView& v) {
+  VT_CHECK(v.data != nullptr, "deepseek-v4 mtp: dequantizing a view with no bytes");
+  const int64_t n = v.out_dim * v.in_dim;
+  std::vector<float> out(static_cast<size_t>(n), 0.0f);
+  switch (v.format) {
+    case DeepseekV4MtpFormat::kPlain: {
+      if (v.dtype == "F32") {
+        std::memcpy(out.data(), v.data, static_cast<size_t>(n) * sizeof(float));
+      } else {
+        const auto* p = reinterpret_cast<const uint16_t*>(v.data);
+        for (int64_t i = 0; i < n; ++i)
+          out[static_cast<size_t>(i)] = vt::BF16ToF32(p[static_cast<size_t>(i)]);
+      }
+      break;
+    }
+    case DeepseekV4MtpFormat::kFp8Block:
+      // 128x128 is not a default here: the classifier REFUSED any tail whose
+      // scale does not tile its weight at exactly that, so by this point it holds.
+      DequantFp8BlockToF32(v.data, v.scale, v.out_dim, v.in_dim, 128, 128, out.data());
+      break;
+    case DeepseekV4MtpFormat::kMxfp4:
+      DequantMxfp4ToF32(v.data, v.scale, v.out_dim, v.in_dim, out.data());
+      break;
+  }
+  return out;
+}
+
 DeepseekV4MtpInventory ClassifyDeepseekV4MtpTail(
     const std::vector<DeepseekV4MtpTensorDesc>& tail) {
   DeepseekV4MtpInventory inv;

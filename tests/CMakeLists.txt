@@ -839,6 +839,7 @@ target_include_directories(test_deepseek_v4_gguf_load PRIVATE ${CMAKE_CURRENT_SO
 # pure target greedy => MTP-on == MTP-off). See .agents/specs/deepseek-v4-mtp.md.
 vllm_cpp_add_test(test_deepseek_v4_mtp vllm/models/test_deepseek_v4_mtp.cpp)
 vllm_cpp_add_test(test_deepseek_v4_mtp_inventory vllm/models/test_deepseek_v4_mtp_inventory.cpp)
+vllm_cpp_add_test(test_deepseek_v4_dspark_entry vllm/models/test_deepseek_v4_dspark_entry.cpp)
 # MODEL-DSV4-EXL3 W1b — the rank-sliced EXL3 loader arm: a hermetic four-rank
 # fixture through the PRODUCTION loader entry, coalesced TP4->TP1 and checked
 # byte-for-byte against the rank inputs, plus refuse-by-name for every arm the
@@ -2831,6 +2832,7 @@ vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.c
 # split, GQA broadcast, ChooseTileCols' halving) is unreachable from every
 # LTX-2.5 call geometry, which is tiles=1/npl=1/nblk=1/Hq==Hkv throughout.
 vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
+vllm_cpp_add_test(test_ops_attention_elem_dispatch vt/test_ops_attention_elem_dispatch.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_dflash_attn_grid vt/test_dflash_attn_grid.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)

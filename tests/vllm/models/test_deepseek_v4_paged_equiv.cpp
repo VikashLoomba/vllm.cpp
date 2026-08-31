@@ -967,3 +967,46 @@ TEST_CASE("W3: selection refuses PER-TOKEN keys, which is the operand it replace
   CHECK_THROWS(vllm::deepseek_v4::IndexerSelectCompressed(
       iq, per_token, folded, {3, 7}, T, /*n_rows=*/3, inh, ihd, topk, cr));
 }
+
+TEST_CASE("W3: the gather drops -1 padding and keeps selection order") {
+  // The `cr == 4` family attends the window plus the rows the indexer CHOSE,
+  // where `cr == 128` attends the window plus ALL closed rows. This is the only
+  // difference at the attention, so it is the whole of what W3 adds there.
+  const int64_t hd = 3, n_rows = 4;
+  std::vector<float> rows(static_cast<size_t>(n_rows * hd), 0.0f);
+  for (int64_t r = 0; r < n_rows; ++r)
+    for (int64_t d = 0; d < hd; ++d)
+      rows[static_cast<size_t>(r * hd + d)] = static_cast<float>(10 * r + d);
+
+  // Selection order is best-first and NOT sorted by row; padding trails it.
+  const std::vector<int64_t> sel{2, 0, -1, -1};
+  const auto got = vllm::deepseek_v4::GatherSelectedCompressed(rows, sel, n_rows, hd);
+  REQUIRE(got.size() == static_cast<size_t>(2 * hd));
+  // Row 2 first, then row 0 -- selection order preserved.
+  CHECK(got[0] == doctest::Approx(20.0f));
+  CHECK(got[1] == doctest::Approx(21.0f));
+  CHECK(got[2] == doctest::Approx(22.0f));
+  CHECK(got[3] == doctest::Approx(0.0f));
+  CHECK(got[4] == doctest::Approx(1.0f));
+  CHECK(got[5] == doctest::Approx(2.0f));
+}
+
+TEST_CASE("W3: an ALL-padding selection gathers nothing") {
+  // Before the first boundary every slot is `-1`. The result must be EMPTY, which
+  // is what makes the caller fall back to the window pass alone rather than merge
+  // against a fabricated row.
+  const int64_t hd = 2, n_rows = 3;
+  const std::vector<float> rows(static_cast<size_t>(n_rows * hd), 1.0f);
+  const auto got =
+      vllm::deepseek_v4::GatherSelectedCompressed(rows, {-1, -1, -1}, n_rows, hd);
+  CHECK(got.empty());
+}
+
+TEST_CASE("W3: an index PAST the closed rows is refused, not clamped") {
+  // Distinct from padding: `-1` means "no row", while `n_rows` means the selection
+  // is wrong. Clamping would attend the newest row whenever selection overran.
+  const int64_t hd = 2, n_rows = 2;
+  const std::vector<float> rows(static_cast<size_t>(n_rows * hd), 1.0f);
+  CHECK_THROWS(
+      vllm::deepseek_v4::GatherSelectedCompressed(rows, {0, 2}, n_rows, hd));
+}

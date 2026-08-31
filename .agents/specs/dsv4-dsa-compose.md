@@ -404,6 +404,25 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## Every W3 MECHANISM is implemented; what remains is wiring
+
+`GatherSelectedCompressed` is the last one. The `cr == 4` family attends its
+window plus the rows the indexer CHOSE, where `cr == 128` attends the window plus
+ALL closed rows -- so the only difference at the attention is which rows reach
+`MergeWindowAndCompressed`, and this narrows them.
+
+`-1` is dropped as padding and never read as row zero, which is the common case
+rather than an edge one: a selection row is padded whenever fewer rows have closed
+than `top_k`. An index PAST the closed rows is refused instead of clamped, because
+that is a selection bug and clamping would attend the newest row whenever
+selection overran. Three mutations run red on exactly those three behaviours.
+
+The mechanism set is now complete: the `qr` query, the `coff == 2` overlapped
+gather with role selection, boundary emission, the compressor's own KV, the
+pooled-row rotation, the indexer's compressed keys, the selection over those rows,
+and this gather. What remains for W3 is WIRING them into `AttentionBlock`'s
+indexer branch and only then narrowing the `idx_wk` refusal -- in that order.
+
 ## The selection over compressed rows LANDED
 
 `IndexerSelectCompressed` scores the indexer's query against the COMPRESSED keys

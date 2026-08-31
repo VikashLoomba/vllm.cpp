@@ -324,4 +324,27 @@ std::vector<int64_t> IndexerSelectCompressed(const std::vector<float>& iq,
                                              int64_t index_head_dim, int64_t top_k,
                                              int64_t compress_ratio);
 
+// `MODEL-DSV4-DSA-COMPOSE` W3 (#2286) — gather the SELECTED compressed rows.
+//
+// The `cr == 4` family attends its sliding window plus the compressed rows the
+// indexer CHOSE, where the `cr == 128` family attends the window plus ALL closed
+// rows. So the only difference at the attention is which rows reach
+// `MergeWindowAndCompressed`, and this is what narrows them.
+//
+// `-1` IS PADDING and is dropped, never read as row zero. A selection row is
+// padded out to `top_k` whenever fewer rows have closed than `top_k`, so the
+// padded slots are the common case rather than an edge one, and treating one as a
+// row attends a real key the indexer did not choose.
+//
+// Rows come back in SELECTION order, best first, because that is the order the
+// indices arrive in; the merge is order-independent, so this is a property of the
+// buffer rather than a requirement on it.
+//
+//   comp_rows  [n_rows, head_dim]   every closed row, oldest first
+//   sel        [top_k]              one token's indices, `-1` padded
+//   returns    [k, head_dim] with k <= top_k, the selected rows compacted
+std::vector<float> GatherSelectedCompressed(const std::vector<float>& comp_rows,
+                                            const std::vector<int64_t>& sel,
+                                            int64_t n_rows, int64_t head_dim);
+
 }  // namespace vllm::deepseek_v4

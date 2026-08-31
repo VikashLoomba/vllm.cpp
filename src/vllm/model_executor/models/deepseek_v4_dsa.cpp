@@ -556,4 +556,27 @@ std::vector<int64_t> IndexerSelectCompressed(const std::vector<float>& iq,
   return out;
 }
 
+std::vector<float> GatherSelectedCompressed(const std::vector<float>& comp_rows,
+                                            const std::vector<int64_t>& sel,
+                                            int64_t n_rows, int64_t head_dim) {
+  VT_CHECK(head_dim > 0, "deepseek-v4 gather: degenerate head_dim");
+  VT_CHECK(static_cast<int64_t>(comp_rows.size()) == n_rows * head_dim,
+           "deepseek-v4 gather: comp_rows is [n_rows, head_dim]");
+  std::vector<float> out;
+  out.reserve(sel.size() * static_cast<size_t>(head_dim));
+  for (const int64_t r : sel) {
+    // PADDING, dropped. Reading `-1` as row zero would attend a real key the
+    // indexer did not choose, at every unfilled slot.
+    if (r < 0) continue;
+    VT_CHECK(r < n_rows,
+             "deepseek-v4 gather: selection names compressed row " +
+                 std::to_string(r) + " but only " + std::to_string(n_rows) +
+                 " have closed; an index past the end is a selection bug, not "
+                 "padding");
+    out.insert(out.end(), comp_rows.begin() + r * head_dim,
+               comp_rows.begin() + (r + 1) * head_dim);
+  }
+  return out;
+}
+
 }  // namespace vllm::deepseek_v4

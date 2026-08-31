@@ -2299,11 +2299,16 @@ Carried by `ENG-MM-INPUT-PIPELINE`. The first block was filed while landing
 L4 (§1.6); the second while landing L3 (§1.5); the P2 block below while landing
 §6 (#2379).
 
-### Owed by P2 — the runner multimodal path (#2379)
+### Owed by P2 — the runner multimodal path ([#2408](https://github.com/mudler/vllm.cpp/issues/2408))
 
 Each of these is a path P2 made REACHABLE without making it complete. They are
 listed rather than left to be discovered, and each one refuses by name in the
 code instead of producing an answer.
+
+**Owner.** [#2408](https://github.com/mudler/vllm.cpp/issues/2408). These five
+first pointed at #2379, which is the issue P2 CLOSED, so the owner would have
+been a closed issue the moment the work landed. #2379 stays below as the history
+of how the path landed; #2408 is who owes the rest.
 
 - **Qwen3-VL serves ONE request per step.** `ForwardQwen3VLForConditionalGeneration`
   returns the last token's logits and does not read `input.logits_indices`, so a
@@ -2311,7 +2316,8 @@ code instead of producing an answer.
   than letting the sampler index past a one-row tensor. Closing it is a per-row
   gather inside the VL forward (`VLForwardLastLogitsDBuf`), which moves the
   numbers the M2c golden was measured on and therefore needs its own gate run.
-  Owned by `ENG-MM-INPUT-PIPELINE`, tracked under #2379.
+  Owned by `ENG-MM-INPUT-PIPELINE`, tracked under
+  [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed by #2379).
 - **The merge pays a HOST round-trip.** `EmbedMmQwen3VLForConditionalGeneration`
   downloads the gathered tower rows, runs `Qwen3VLMergeMultimodal` and
   `Qwen3VLComputeDeepstack` on the host in f32, and uploads the result. That is
@@ -2319,13 +2325,14 @@ code instead of producing an answer.
   the registered runner path is numerically identical to the path the golden
   tokens were measured on. A device-resident merge is a measured change against
   that golden, not a cleanup. Owned by `ENG-MM-INPUT-PIPELINE`, tracked under
-  #2379.
+  [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed by #2379).
 - **Only the `image` modality reaches the runner.** `EncodeMmQwen3VL...` refuses
   `video` and `audio` by name. Qwen3-VL has a video tower and a video driver
   (§3) but no runner path: the video item's placeholder structure is
   timestamp-interleaved and needs `Qwen3VLGetRopeIndexVideo`, a different M-RoPE
   entry point from the one the hook calls. Owned by `ENG-MM-INPUT-PIPELINE`,
-  tracked under #2379.
+  tracked under [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed
+  by #2379).
 - **Gemma-4's `ForwardMm` and Muse Glimmer's are still compile-only, and P2 did
   NOT change that.** Both consume `ModelForwardInput::mm` and both are exercised
   only by their own tests, because neither registration declares `encode_mm` /
@@ -2335,13 +2342,15 @@ code instead of producing an answer.
   producing `mm_features` (the only one in the tree is
   `MakeQwen3VLImageChatFn`, which is Qwen3-VL-shaped), so nothing upstream of
   the runner would ever build an item for them. Each needs its own brick.
-  Owned by `ENG-MM-INPUT-PIPELINE`, tracked under #2379.
+  Owned by `ENG-MM-INPUT-PIPELINE`, tracked under
+  [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed by #2379).
 - **The seam install in `server_main.cpp` has no reachability mutation of its
   own.** `chat.set_multimodal_chat_fn(...)` is the production install and it
   landed before P2; the P2 e2e gate installs the same seam itself, because a
   unit test cannot drive `server_main`'s argv path. Deleting the production line
   therefore leaves the P2 suite green. Owned by `ENG-MM-INPUT-PIPELINE`, tracked
-  under #2379.
+  under [#2408](https://github.com/mudler/vllm.cpp/issues/2408) (landed by
+  #2379).
 
 - [#1340](https://github.com/mudler/vllm.cpp/issues/1340) — `VT_FUSE_ATTN_PREAMBLE=0`
   on the MRoPE path silently applies 1-D RoPE instead of refusing. Needs a GPU

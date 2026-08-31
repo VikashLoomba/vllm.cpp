@@ -1799,3 +1799,98 @@ TEST_CASE("Scheduler: a finished request's encoder entry becomes freeable and is
   REQUIRE(second.free_encoder_mm_hashes.size() == 1);
   CHECK(second.free_encoder_mm_hashes[0] == "hash-a");
 }
+
+// ---------------------------------------------------------------------------
+// PREEMPTION frees the victim's encoder references — `_preempt_request`'s
+// `self.encoder_cache_manager.free(request)` (scheduler.py:1213), which sits
+// beside the block free and had NO test: deleting the call left this whole file
+// and `test_openai_api_server_mm_forward` green, because no case constructed a
+// preempted request that carried `mm_features`.
+//
+// WHAT GOES WRONG WITHOUT IT, precisely. A preemption resets
+// `num_computed_tokens` to 0, and `_free_encoder_inputs` frees an entry only
+// once `offset + length <= num_computed_tokens`. So the victim's references
+// survive the preemption and nothing drops them until the request either
+// re-passes the span or finishes. That is an UNRECLAIMABLE WINDOW, not an
+// unbounded leak: on resume `check_and_update_cache` re-references the same
+// entry idempotently, and the entry frees normally once the span is re-passed.
+// For the length of the window the slots are pinned, and `can_allocate` refuses
+// admissions the cache in fact has room for.
+//
+// WHY THE STEP BUDGET IS SPENT TO ZERO. The preempting step must NOT reach the
+// waiting loop. That loop would re-visit the victim (a preemption prepends it to
+// the waiting FRONT) and either re-reference the entry through
+// `check_and_update_cache` or drop it through the `allocate_slots` failure
+// untouch (scheduler.py:938-939) — and BOTH arms converge on the same counter
+// whether or not `preempt_request` freed anything, which is exactly a test that
+// cannot see the defect. So the hog's decode chunk is sized to consume the whole
+// token budget, `while (!waiting->empty() && token_budget > 0)` is false, and
+// the only thing that touched the encoder cache this step is the preemption.
+// ---------------------------------------------------------------------------
+TEST_CASE("Scheduler.schedule: preemption RELEASES the victim's encoder cache slots") {
+  // Budget 16 == one block, so a single decode chunk spends the whole step.
+  // 8 blocks (one is the null block) leaves 7 usable: 5 for the hog's 80-token
+  // prompt and 2 for the image request's 32. The encoder cache holds exactly one
+  // 4-embed item, so "released" and "still pinned" are the only two states.
+  auto scheduler = CreateMmScheduler(/*max_num_batched_tokens=*/16,
+                                     /*encoder_compute_budget=*/64,
+                                     /*encoder_cache_size=*/4,
+                                     /*disable_chunked_mm_input=*/false,
+                                     /*max_num_seqs=*/16,
+                                     /*num_blocks=*/8, /*block_size=*/16);
+  // The KV hog is TEXT and its prompt is all zeros, while MmRequest's is all
+  // sevens: distinct prompts, so prefix caching cannot let one ride on the
+  // other's blocks.
+  auto hog_owner = CreateRequests(/*num_requests=*/1, /*num_tokens=*/80, {"hog"});
+  Request* hog = hog_owner[0].get();
+  AddRequest(*scheduler, std::move(hog_owner[0]));
+  for (int i = 0; i < 5; ++i) {
+    const SchedulerOutput out = scheduler->schedule();
+    REQUIRE(out.num_scheduled_tokens.at("hog") == 16);
+  }
+  REQUIRE(hog->num_computed_tokens == 80);
+
+  // The image request is admitted BEHIND the hog, so it is the FCFS tail and
+  // therefore the preemption victim. Its item spans [0, 4), inside the first
+  // 16-token chunk, so this step is the one that runs the encoder.
+  Request* img = AddRequest(
+      *scheduler, MmRequest("img", /*num_tokens=*/32,
+                            {Item("hash-a", /*offset=*/0, /*length=*/4)}));
+  const SchedulerOutput admit = scheduler->schedule();
+  REQUIRE(admit.scheduled_encoder_inputs.count("img") == 1);
+  // The item is allocated: the whole 4-slot cache is spoken for, and none of it
+  // is reclaimable while the reference stands.
+  REQUIRE(scheduler->encoder_cache_manager->num_free_slots() == 0);
+  REQUIRE(scheduler->encoder_cache_manager->num_freeable_slots() == 0);
+
+  // Finish the image request's prefill so both requests hold their full block
+  // count and the cache is exactly full.
+  const SchedulerOutput fill = scheduler->schedule();
+  REQUIRE(fill.num_scheduled_tokens.at("img") == 16);
+  REQUIRE(img->num_computed_tokens == 32);
+
+  // The hog now has 16 sampled tokens the scheduler has not seen: one full
+  // budget's worth, needing a sixth block that the KV cache cannot give. The
+  // FCFS tail (the image request) is preempted to pay for it.
+  for (int i = 0; i < 16; ++i) hog->AppendOutputToken(0);
+  const SchedulerOutput out = scheduler->schedule();
+  REQUIRE(out.num_scheduled_tokens.at("hog") == 16);
+  REQUIRE(img->status == RequestStatus::kPreempted);
+  REQUIRE(img->num_computed_tokens == 0);
+  // INSTRUMENT PRECONDITION: the budget is spent, so the waiting loop did not
+  // run and did not touch the victim's encoder references. Without this the two
+  // assertions below would read the resume rather than the preemption.
+  REQUIRE(out.num_scheduled_tokens.count("img") == 0);
+  REQUIRE(scheduler->waiting->peek_request() == img);
+
+  // THE ASSERTION. The victim's reference is gone, so the entry is reclaimable
+  // again and the counter is back at the value it had before the allocation
+  // (cache_size == 4). Without the free in preempt_request this reads 0.
+  CHECK(scheduler->encoder_cache_manager->num_freeable_slots() == 4);
+  // And the consequence that makes it matter: an admission the pinned slots
+  // would have refused now succeeds. can_allocate has no free slot to give, so
+  // it can only say yes by reclaiming the preempted request's entry.
+  CHECK(scheduler->encoder_cache_manager->CanAllocate(
+      /*num_embeds=*/4, /*encoder_compute_budget=*/64,
+      /*num_embeds_to_schedule=*/0));
+}

@@ -515,8 +515,16 @@ struct MmServerHarness {
     SchedulerConfig cfg;
     cfg.max_num_seqs = 1;
     cfg.max_num_batched_tokens = kMaxModelLen * 4;
-    // Chunked prefill is ON, exactly as the production server runs it, which is
-    // why the scheduler's straddling-item clamp is a live path here.
+    // Chunked prefill is ON, exactly as the production server runs it — but it
+    // never CHUNKS here, and this harness therefore does NOT gate the
+    // straddling-item clamp. The budget above is kMaxModelLen * 4 == 1024
+    // against a prompt of seven tokens, so every step covers the whole prompt
+    // in one piece and the clamp is never reached: deleting the budget/cache
+    // clamp in `Scheduler` leaves every case in this file green. What gates the
+    // clamp is test_scheduler's pair of truncation cases ("an unschedulable
+    // encoder input TRUNCATES the chunk before its span" and "the encoder
+    // CACHE, not only the budget, truncates"). The flag stays ON because it is
+    // the production value, not because this file measures it.
     cfg.enable_chunked_prefill = true;
     cfg.max_model_len = kMaxModelLen;
     cfg.watermark = 0.0;

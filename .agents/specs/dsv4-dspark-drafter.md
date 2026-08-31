@@ -322,6 +322,33 @@ bookkeeping.
 
 W-6. **The device arm**, and only then a throughput claim.
 
+**W-6 IS NOT THE FIRST BLOCKER, and this row was sequenced as if it were**
+([#2442](https://github.com/mudler/vllm.cpp/issues/2442)). Read
+from the source rather than measured, and decisive either way: on the EXL3 arm
+the routed experts CANNOT run on a CUDA queue at all today. `Exl3Linear`
+(`src/vllm/model_executor/models/deepseek_v4.cpp:1295-1302`) refuses a non-CPU
+queue unless `Backend::DeviceMemoryIsHostAddressable()`, because W1b copies each
+TP1-coalesced linear into HOST owner buffers and the kernel would have to
+dereference them. `CudaBackend` answers **false** to that predicate, and does so
+deliberately even on GB10: `cuda_backend.cu:354-391` pins it with a
+`static_assert` and states the reason -- a `cudaMalloc` pointer is not
+host-dereferenceable even where `UnifiedMemory()` is true, and reading the wider
+predicate is what SIGSEGV'd the reference tier (#844, #1435).
+
+So on this arm every one of the 216 routed experts executes on a CPU queue. No
+drafter recovers that: speculation multiplies the step rate by accepted tokens
+per step, and 2.64x a CPU-bound MoE step is still a CPU-bound MoE step. The
+44-47 tok/s target is unreachable until **"Real-checkpoint residency for the
+coalesced tower" (`model-dsv4-exl3.md` W2)** lands and the tower is
+device-resident.
+
+That reorders this row's dependencies without changing its content: W-1 through
+W-5 are the drafter and stay as written, and W-6's device arm is downstream of a
+device-resident tower it does not own. State this before measuring anything,
+because a throughput number taken on a CPU-expert arm would be a measurement of
+the wrong thing, and reading it as "the drafter did not help" is exactly the
+silent-failure mode §4 is built against.
+
 ## 4. Gates
 
 The correctness gate is exact and cheap to state: **drafter-on == drafter-off,

@@ -2287,7 +2287,16 @@ which is precisely how this landed green locally in the first place.
   `indexer.wq_b` input-space defect (`x` where upstream uses `qr`) is real at any
   geometry. Design, anchors and mutations in
   [`specs/dsv4-dsa-loader-accept-forward-refuse.md`](dsv4-dsa-loader-accept-forward-refuse.md).
-- **Real-checkpoint residency for the coalesced tower — W2.** W1b copies each
+- **Real-checkpoint residency for the coalesced tower — W2. THIS NOW BLOCKS THE
+  THROUGHPUT TARGET** ([#2442](https://github.com/mudler/vllm.cpp/issues/2442)).
+  `Exl3Linear` refuses a non-CPU queue unless
+  `Backend::DeviceMemoryIsHostAddressable()`, and `CudaBackend` answers false by
+  design even on GB10 (`cuda_backend.cu:354-391` pins it with a `static_assert`;
+  a `cudaMalloc` pointer is not host-dereferenceable even where `UnifiedMemory()`
+  is true). So every routed expert on this arm runs on a CPU queue, and no
+  drafter recovers that -- speculation multiplies the step rate, and 2.64x a
+  CPU-bound MoE step is still CPU-bound. This item is therefore ahead of
+  `DSV4-DSPARK-DRAFTER` W-6 rather than beside it. W1b copies each
   TP1-coalesced linear into host owner buffers. That is right for the fixture
   and for W2's byte-parity gate, and it is ~100 GB on the real 216-expert
   artifact, so the real load needs borrow / device-resident / per-layer

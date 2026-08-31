@@ -2287,6 +2287,28 @@ which is precisely how this landed green locally in the first place.
   `indexer.wq_b` input-space defect (`x` where upstream uses `qr`) is real at any
   geometry. Design, anchors and mutations in
   [`specs/dsv4-dsa-loader-accept-forward-refuse.md`](dsv4-dsa-loader-accept-forward-refuse.md).
+- **No production path gives an EXL3 checkpoint a paged KV cache**
+  ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)), and this sits IN
+  FRONT of the residency item below. `DeepseekV4ForwardExl3Paged` is the only V4
+  forward taking both `paged_kv` and a `DeepseekV4CompressorState`, and it has
+  only test callers. The registered `ForwardDeepseekV4ForCausalLM` has three
+  branches and none reaches it: `gather_logits` goes to `ForwardDevice` (binds
+  neither), `multi_kv` goes to `DeepseekV4ForwardGgufPaged` (which REFUSES by
+  name without a GGUF tower, so it is not a path for this arm), and the fallback
+  goes to `DeepseekV4ForwardExl3` (binds neither).
+
+  `V4Backend` states the consequence itself: a null `paged_kv` is "stateless
+  full-recompute (the default / --gpu path)". The EXL3 arm recomputes the whole
+  prefix every decode step. The 44-47 tok/s target is measured at 384k context,
+  so a step that recomputes 384k tokens is not a decode and no tower residency or
+  speculation changes that.
+
+  It also leaves W3's DSA composition unreachable in production: `compressor` is
+  non-null only on the paged entry. The gates are real; the callers are tests.
+  §"Nothing lands dead" allows a staged slice to land unreached ONLY when the
+  commit body, the pull-request body and this section all name it, and this was
+  named in none of them until now.
+
 - **Real-checkpoint residency for the coalesced tower — W2. THIS NOW BLOCKS THE
   THROUGHPUT TARGET** ([#2442](https://github.com/mudler/vllm.cpp/issues/2442)).
   `Exl3Linear` refuses a non-CPU queue unless

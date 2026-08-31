@@ -221,8 +221,267 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1 is taken on x86-64; the GB10 half is under a lease.
+`ACTIVE`. W1 is taken on x86-64 and on `thor:gpu0` (aarch64) under a lease. W2
+is landed and gated. The GB10 half of W1 is queued and is named in `## Owed`.
 
 ## Outcome
 
-To be written when W3 lands. Nothing above this line may be read as a result.
+### The headline, and it is the one the parent row was owed
+
+**The attention hoist already took most of the 224.9 s, and the connector leaf
+is now a GEMM.** Measured with the same probe, at the same shapes, on
+`thor:gpu0` under an `rc` lease -- an aarch64 host with nothing else on it --
+one `RunConnector` call went from `LTX25-CONNECTOR-GEMM`'s **84.608 s** to
+**40.14 s**, a **2.11x**, and its composition inverted:
+
+| | before (`LTX25-CONNECTOR-GEMM`, same host, same probe) | now |
+|---|---:|---:|
+| `Ltx2ConnectorForward`, 8 layers x 2 streams | **84.608 s** | **40.14 s** |
+| ~ `vt::AttentionCross` | 48.200 s (**57.0%**) | **5.51 s (13.7%)** |
+| ~ the GEMMs | 29.337 s (34.7%) | 29.98 s (**74.7%**) |
+| ~ everything else | 7.07 s (8.4%) | 4.65 s (11.6%) |
+
+**`vt::AttentionCross` at the connector's own shape is 8.75x smaller and the
+GEMM did not move**, which is the shape a repair to one leg and not the other
+has to have. The probe's own hoisted reference, which was worth 8.86x / 9.36x
+on this host before the hoist, is now worth **1.06x / 1.02x on x86-64**: the
+instrument that found the defect finds no defect. That is the control this row
+wanted and it is why the 2.11x is attributed to the hoist rather than to the
+box.
+
+**So `.agents/specs/ltx25-render-speed-parity.md`'s first `## Owed` line --
+"The repair is not here" -- is answered, and it was answered by
+`VT-CPU-ELEM-DISPATCH` rather than by this row.** What this row adds is the
+measurement that says so, and one further repair on the leg that is left.
+
+**Projected onto the render, and it is a PROJECTION.** #2354 measured connector
+compute at **224.882 s in a 516.751 s render**. At thor's 2.11x that leaf falls
+to about **107 s**, the render to about **399 s**, and the oracle gap from
+**5.51x to about 4.3x**. GB10's own pre-hoist split (attention 66.5%) predicts a
+larger ratio there, near 2.55x, which is `LTX25-CONNECTOR-GEMM`'s own
+projection. **No render was run.** The probe's connector total is not the
+render's leaf -- synthetic weights, a different valid-token count, and the two
+streams timed in one process -- so the RATIO transfers and the seconds do not.
+The end-to-end re-measurement is under `## Owed` with the reason it is not here.
+
+### W1 — the leaf, re-measured, and the load it was measured at
+
+**`thor:gpu0`, `rc` job `76d149ba-a737-4940-b3f2-b13f623e7512`, worker
+`rc-worker-n8smh`, 2026-08-31T22:10:42Z, aarch64, 14 cores, 118 GiB
+`MemAvailable`, loadavg 5.5 at the first leg** (the probe itself runs 14
+threads, so most of that is the measurement). `tier_name=neon`,
+`elem_gemm_use_ref=0`, `mr=4`; forced to `ref` the same resolver prints
+`tier_name=ref`, so it was read rather than printed from a constant. The
+portable tier runs the same GEMM set at **50.6 GFLOP/s** against neon's
+**137.6**, so the tier that runs is 2.7x the portable one and is not the
+reference tile.
+
+Per-leg, `n = 6` for arm A (three rounds, each with a same-arm control leg):
+
+| | median | spread | legs |
+|---|---:|---:|---|
+| `Ltx2ConnectorForward`, one video layer | **3.909 s** | 5.9% | 4.056 3.898 3.919 3.824 3.950 3.843 |
+| `Ltx2ConnectorForward`, one audio layer | **1.110 s** | 11.8% | 1.105 1.118 1.233 1.104 1.114 1.102 |
+| `vt::AttentionCross`, video shape | **0.443 s** | 22.3% | 0.440 0.438 0.443 0.443 0.537 0.532 |
+| `vt::AttentionCross`, audio shape | **0.245 s** | 17.5% | 0.281 0.238 0.244 0.244 0.247 0.268 |
+| the connector's whole GEMM set | **29.956 s** | 2.3% | 29.637 29.902 29.930 29.982 29.984 30.323 |
+
+The GEMM row is the quietest at 2.3%, and it is the row this row's remaining
+attribution rests on. (A seventh GEMM figure, 81.545 s, is the FORCED-PORTABLE
+leg and is excluded from that median rather than averaged into it.)
+
+**On x86-64 the same re-measurement gives the same shape.** Devbox, 20 cores,
+`tier_name=avx512`, `mr=6` before this change: the connector's video layer reads
+**3.079 s** where `LTX25-CONNECTOR-GEMM` measured **6.567 s** idle before the
+hoist, and `vt::AttentionCross` at that shape reads **0.352 s** against
+**3.831 s**. This devbox is shared and its load moved from 3 to 29 across the
+session, so its absolute seconds are lower bounds and every ratio below carries
+its own control.
+
+### W2 — the repair, and the mechanism it removes
+
+`MatmulOneChunk` widens a 16-row activation tile and walks it in blocks of the
+tier's `mr`. One `btm` call is one pass over the 16-column weight block -- the
+load, and on `[N,K]` the 16x16 register transpose `Transpose16` -- and that pass
+is what M blocking exists to amortize. **`mr = 6` does not divide 16**: rows
+0-11 took two M-blocked calls and rows 12-15 fell through to the ONE-ROW kernel,
+one whole weight pass and one whole transpose each. Six passes where the
+blocking factor allows three.
+
+Two changes, and the second is where the x86 result comes from:
+
+1. The tile is padded up to a whole number of `mr` blocks, the pad rows are
+   zeroed, and the store is clamped to the rows the tile holds. **It pads only
+   where padding removes a pass.** With `rem = nrows % mr` the tile costs
+   `floor(nrows/mr) + rem` passes unpadded and `ceil(nrows/mr)` padded, so
+   padding saves `rem - 1` passes and is declined at `rem < 2` and at
+   `nrows < mr`. A one-row or two-row decode chunk therefore keeps today's
+   kernel exactly, which is the regression this guard exists to refuse: without
+   it a single-token GEMV would compute `mr` rows to store one, for no fewer
+   weight passes.
+2. `kMrAvx512` becomes 8, so a 16-row tile is exactly two passes. The kernel
+   holds 16 transposed weight vectors plus `mr` accumulators plus one broadcast:
+   25 of 32 ZMM at 8, against 23 at 6.
+
+`kElemMaxMr` is new and every tier `static_assert`s its own `mr` against it,
+because `MatmulOneChunk`'s stack accumulator tile is what bounds `mr` and the
+tier that sets the value is where the refusal belongs.
+
+### W3 — the measurement, paired and interleaved
+
+**x86-64, on the two binaries that LAND**, sha256 asserted to differ before any
+timing. Eight adjacent `(main, change)` pairs on the connector's own GEMM
+shapes, each leg `--reps 2` so the probe medians internally, devbox at loadavg
+36 to 53 with another agent's work on it throughout:
+
+| | value |
+|---|---|
+| paired ratios | 1.298 1.294 1.487 1.131 1.288 **0.983** 1.334 1.553 |
+| **median** | **1.296x** |
+| same-arm control, `A(i+1)/A(i)` | median **1.034**, range **0.782 to 1.231** |
+| pooled medians | A 44.727 s, C 35.868 s -> 1.247x |
+
+Seven of eight pairs are above 1.13 and the median is outside the control's
+whole range. **The eighth is 0.983 and is printed rather than dropped**: it is
+the pair whose `other_hot` counter reads 9, the highest external load in the
+run, and a row that quotes only the seven would be selecting on the outcome.
+
+**An earlier replicate on a quieter box agrees**, taken on a pre-guard build of
+the same change at loadavg 14 to 29: ten pairs, **median 1.331x**, one outlier
+at 0.872 at that run's highest external load, same-arm control median 1.032 and
+range 0.896 to 1.203. Two runs, two binaries, two load regimes, 1.30x and 1.33x.
+
+**On aarch64 the same lever is REFUTED, and it is not landed.** The arm that
+raises `kMrNeon` from 4 to 6 (with the same padding, which on NEON fires because
+`16 % 6 = 4`) reads **31.252 / 31.442 / 31.229 s** against arm A's
+**29.637 to 30.323 s** -- **1.043x SLOWER**, outside arm A's own 2.3% spread --
+and the connector layer is unchanged at 3.978 s against 3.909 s. `kMrNeon`
+therefore stays 4. **The x86 figure is not carried across**, which is the
+failure `LTX25-CONNECTOR-GEMM`'s own `### RETRACTION` section paid for one row
+ago: its "one thread beats twenty" held on AVX-512 and was false on both aarch64
+hosts.
+
+**THE DECODE SHAPES ESTABLISH NOTHING ON THIS BOX, and that is reported rather
+than filled in with the prefill result.** Six pairs at `--reps 10` on each of
+the two row counts a decode step uses, at loadavg ~49 with another agent
+working:
+
+| rows | paired ratios | median | same-arm control |
+|---:|---|---:|---|
+| 16 (a `c16` step) | 1.281 0.809 1.397 0.836 1.373 2.240 | 1.327 | median **1.340**, range 0.534-1.681 |
+| 1 (one token) | 1.783 1.184 1.269 1.175 0.848 0.832 | 1.180 | median **0.789**, range 0.618-0.994 |
+
+**Each control swallows its own effect**, so neither row is a result. What is
+NOT at risk is stated from the source instead: at `nrows = 1` the guard declines
+the padding (`nrows < mr`) and `mr_end` equals the tile start, so the M-blocked
+loop does not execute and the emitted work is the one-row kernel exactly as
+before. M4 corroborates it from the other side -- a perturbation confined to the
+padded remainder does not fire there. At `nrows = 16` the tile is two `mr = 8`
+passes against six at `mr = 6`, so an improvement is what the mechanism
+predicts; the measurement is consistent with one and does not establish it.
+
+**On NEON the padding is INERT at these shapes** and that is stated rather than
+implied: `mr = 4` divides the 16-row tile, so `rem = 0` and the guard declines.
+What the padding does on aarch64 is cover the ragged tiles a non-multiple `M`
+produces, and that is what the byte-equality gate exercises there.
+
+### The correctness evidence
+
+**Byte equality is the whole gate.** `tests/vt/test_ops_matmul_elem_mblock.cpp`:
+**3 cases / 1,802 assertions / 0 failed**, and the SAME counts on a pristine
+`main` tree, which is what says the reference is a valid oracle rather than a
+transcription of the new code. `tests/vt/test_ops_matmul_elem.cpp` is unchanged
+and green on both trees.
+
+**A mutation per claimed guarantee, each proved to have applied and built before
+its result was read.** The harness refuses an unapplied edit and a failed build
+in those words, because both otherwise read as a passing test.
+
+| ID | mutation | expected | result |
+|---|---|---|---|
+| M1 | drop the store clamp, so the pad rows are written out | RED | **RED** — `malloc(): invalid size`, the heap corruption an unclamped store causes |
+| M2 | do not zero the pad rows | PASS | **PASS** — see below |
+| M3 | reverse the K order of the LAST M-blocked row in `BtM6Avx512` | RED | **RED**, 333 of 1802 |
+| M4 | perturb ONLY when `rows_here < mr`, i.e. only on the padded remainder | RED | **RED**, 360 of 1802 |
+| M5 | perturb on `ir1_start > 0`, a chunk-position-dependent defect | RED | **RED**, 666 of 1802 |
+| M6 | `kMrAvx512 = 9`, past the accumulator tile | BUILD FAILS | **BUILD FAILED**: `static assertion failed: cpu_ops.cpp's accumulator tile bounds mr` |
+| M7 | wrong at ONE worker count only (`nth == 5`) | RED | **RED**, 144 of 1802 |
+
+**M4 is the reachability mutation.** It perturbs the padded remainder and
+nothing else, and the gate reds through `vt::MatmulBT` / `vt::Matmul` — the
+production entry points — so the new path is entered by the shipped call and not
+only by a test that constructs it.
+
+**M7 is why T3 exists, and it is the M9 precedent reproduced.** On the M7 binary
+the whole-dtype-matrix case passes **864 of 864** assertions and only the
+seven-worker-count case fails, **144 of 936**. A single worker count does not
+test this claim, and that sentence is now executable rather than argued.
+
+**M2 PASSED and that is recorded rather than dressed up as a guarantee.** Not
+zeroing the pad rows changes no output, because the pad rows' products are never
+stored. The `memset` is there so a `thread_local` buffer cannot carry a previous
+call's operands -- including the inf and nan values
+`test_ops_matmul_elem.cpp` feeds -- into the FP pipeline. It is a hygiene
+property, not a value property, and this row does not claim a gate it does not
+have.
+
+### The gates
+
+- `tests/vt/test_ops_matmul_elem_mblock.cpp`: 3 / 1802 / 0, on the changed tree
+  and on a pristine base tree.
+- Seven mutations, every one matching its prediction.
+- The A/B above, two SEPARATE build directories, binaries asserted to differ by
+  sha256 before any timing.
+- `scripts/check-tree-compiles.py` and `scripts/agent-preflight.sh`.
+
+### What this row does not claim
+
+One request, one geometry, one probe. **No render was run**, so the render-level
+figure above is a projection and is labelled as one. Every x86 number is one
+shared devbox at a stated load. The GB10 half of the leaf split is queued and is
+owed. And the GEMM that is left is **not at a ceiling**: it runs at 137.6
+GFLOP/s on 14 Arm cores and 172 to 236 GFLOP/s on 20 AVX-512 ones, against a
+mul-then-add roofline several times higher, so what follows is a named
+hypothesis and not a limit.
+
+## Owed
+
+- **The GB10 leaf split.** `rc` job `a719dc37-580b-4c59-8bd4-0601f17d343f` is
+  queued on `dgx:gpu0` behind another agent's job and had not started when this
+  row was written. GB10 is the machine `LTX25-RENDER-SPEED-PARITY` measured the
+  render on and the machine whose pre-hoist split read attention 66.5%, so its
+  post-hoist split is the number that converts this row's 2.11x into a render
+  prediction. thor agrees with GB10 on every qualitative point measured so far
+  and disagreed with x86 on the one that inverted, which is why thor is quoted
+  here and GB10 is still owed rather than assumed. The same job also runs the
+  byte-equality gate on the landed tree on aarch64. Owner: this row.
+- **THE END-TO-END RENDER IS NOT RE-MEASURED, and the harness is why.**
+  `scripts/ltx25-render-speed-repeat.sh` asserts the binary's sha256 against
+  `4b0666ee`'s and exits 51 otherwise. That is correct for what it measures -- a
+  timing of the tree that took the correctness verdict -- and it means a
+  post-hoist render needs that pin advanced to a new head that has itself taken
+  a correctness verdict. That is a row of its own and it is the one that can
+  close `ltx25-render-speed-parity.md`'s owed line with a wall rather than a
+  projection. Owner: unowned; this row files it here.
+- **THE REMAINING GEMM IS THE LEAF, at 74.7%, and the contained lever does not
+  reach it.** After this change the connector's cost on aarch64 is
+  `vt::MatmulBT` at 137.6 GFLOP/s, and the M-blocking lever is refuted there.
+  The next traceable hypothesis is the one
+  `.agents/specs/cpu-elem-gemm-wide-isa-and-tiling.md` already carries as a
+  SPIKE with no active row: `KERNEL-GEMM-CPU-TILED`, a K-blocked macro-kernel
+  that keeps its accumulators live across K panels. That is bit-exact by the
+  same argument this row used -- continuing one f32 accumulator across a split
+  `p` loop is the same addition sequence -- and it is what turns the weight from
+  something re-read per `mr` rows into something read once per panel. **It is
+  not opened here**, because it is a `vt` seam campaign and this row's scope
+  excludes it. Owner: unowned; sizing is here.
+- **A DEVICE ARM FOR THE CONNECTOR remains the other branch and remains a PORT.**
+  `Ltx2Attention` interleaves host `RmsNormRows` and `Ltx2ApplyRotaryEmb` on raw
+  `float*` between its GEMMs and `Ltx2ConnectorForward` reads its weights as
+  host `std::vector<float>`, so it is a weight-arm port with its own numerics
+  gate. #2354 and `LTX25-CONNECTOR-GEMM` both say so and this row does not
+  contradict them. Owner: unowned.
+- **The `mr` sweep was two points, not a curve.** AVX-512 was measured at 6 and
+  8 and NEON at 4 and 6. Whether AVX-512 at some other `mr`, or a restructured
+  kernel that decouples `mr` from the register file by spilling the accumulator
+  tile to L1, does better is unmeasured. Owner: unowned.

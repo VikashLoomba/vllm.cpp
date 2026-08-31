@@ -224,7 +224,13 @@ the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
 does not get one yet; it is listed under `## Owed
 
-- **The INDEXER's own compressor**, the last refused tensor. Three of its four
+- **The INDEXER's compressor CYCLE.** Its four tensors now all load
+  (`idx_comp_ape`, `idx_comp_wgate`, `idx_comp_norm_weight` beside `idx_wk`), at
+  upstream's widths. What remains is running the cycle at `index_head_dim` and
+  re-pointing the selection at the compressed keys it produces, after which the
+  `idx_wk` refusal may narrow -- and NOT before.
+
+- **(closed) The INDEXER's own compressor tensors**, formerly the last refused. Three of its four
   tensors have no host destination, it needs a second compressor state per layer
   at `index_head_dim`, and its pooled rows are the KEYS the top-k scores against
   rather than an attention contributor. See the section above; it is a wave, not

@@ -204,6 +204,14 @@ struct DeepseekV4LayerHostWeights {
   HostBf16 idx_wq;               // [index_n_heads*index_head_dim, q_lora_rank] (FP8)
   std::vector<float> idx_wk;     // [coff*index_head_dim, H]
   std::vector<float> idx_wproj;  // [index_n_heads, H]  (not widened upstream)
+  // W3 (#2286): the INDEXER's own `DeepseekCompressor`, at
+  // `head_dim = index_head_dim` and the same ratio (`attention.py:768-776`). Its
+  // pooled rows are the KEYS the top-k scores against, not an attention
+  // contributor -- which is why widening `idx_wk` alone would feed `DispLogits`
+  // an operand twice the width it expects rather than refuse.
+  std::vector<float> idx_comp_ape;          // [compress_ratio, coff*index_head_dim]
+  std::vector<float> idx_comp_wgate;        // [coff*index_head_dim, H]
+  std::vector<float> idx_comp_norm_weight;  // [index_head_dim]  (NOT widened)
   // W3 (#2286): the compressor's OWN KV projection. Upstream's compressor owns a
   // `fused_wkv_wgate` producing BOTH halves from the hidden state
   // (`compressor.py:279-287`); it does NOT reuse the MLA latent. Empty on a

@@ -1136,3 +1136,52 @@ TEST_CASE("W3: the compressor pools its OWN projection, not the MLA latent (#228
   REQUIRE(mag > 1e-6);
   CHECK(diff > 1e-6);  // the projection is READ, not decoration
 }
+
+TEST_CASE("W3: the INDEXER's compressor family is materialized (#2286)") {
+  // The indexer carries its own `DeepseekCompressor` at `head_dim =
+  // index_head_dim` (`attention.py:768-776`). Three of its four tensors were
+  // accounted and dropped; only `idx_wk` had a host slot. They load now.
+  //
+  // Loading them does NOT make the indexer's compressor run, and this case does
+  // not pretend otherwise: the forward still refuses on `idx_wk`'s width. That
+  // order is deliberate -- narrowing a refusal before the capability exists turns
+  // it into a silent wrong answer, which this row has established twice.
+  FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 4};      // the indexer exists ONLY at cr == 4
+  opt.real_dsa_geometry = true;      // the artifact's widths, coff == 2
+  opt.index_n_heads = 2;
+  opt.index_head_dim = 8;
+  opt.index_topk = 2;
+  auto f = BuildFixture(opt);
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+
+  const auto& L = w.host.layers[1];
+  const int64_t ihd = w.params.index_head_dim, H = w.params.hidden_size;
+  const int64_t cr = w.params.compress_ratio(1);
+  const int64_t iw = 2 * ihd;  // coff == 2, always, where the indexer exists
+
+  // Present, and at upstream's widths: the ape and the fused gate carry `coff`,
+  // the norm does NOT (`compressor.py:288`).
+  CHECK(static_cast<int64_t>(L.idx_comp_ape.size()) == cr * iw);
+  CHECK(static_cast<int64_t>(L.idx_comp_wgate.size()) == iw * H);
+  CHECK(static_cast<int64_t>(L.idx_comp_norm_weight.size()) == ihd);
+  // Its KV projection was already loaded and keeps the same width as the gate.
+  CHECK(static_cast<int64_t>(L.idx_wk.size()) == iw * H);
+
+  // NON-TRIVIAL: an all-zero slot would satisfy every size check above while
+  // carrying nothing the checkpoint wrote.
+  double mag = 0.0;
+  for (const float v : L.idx_comp_wgate) mag = std::max(mag, std::abs((double)v));
+  CHECK(mag > 1e-6);
+
+  // The refusal is UNCHANGED, because the cycle does not run yet.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::string msg = ThrowMessage([&] {
+    (void)vllm::DeepseekV4Model::Forward({1}, {0}, {}, {}, w, q, {0});
+  });
+  CAPTURE(msg);
+  CHECK(dsv4_exl3_fixture::Mentions(msg, "indexer.compressor.wkv.weight"));
+}

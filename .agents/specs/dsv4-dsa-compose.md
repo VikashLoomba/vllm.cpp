@@ -222,7 +222,12 @@ compressed row -- a closed window is history, so no causal bound applies among
 them -- and `VT_CHECK(num_tokens == 1 || num_heads == 1)` holds the point where
 the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
-does not get one yet; it is listed under `## Owed`.
+does not get one yet; it is listed under `## Owed
+
+- **The compressor state's relationship to PREFIX CACHING**, before the runner
+  carries it. See the section above: `has_inner_state` is architecture-wide and
+  gates prefix caching, while the compressor state is one arm's, and a prefix hit
+  would leave that state missing the rows the skipped tokens owed it.`.
 
 The gate this section demanded is `tests/vllm/models/test_deepseek_v4_paged_equiv.cpp`,
 "W1: two LSE-merged passes equal one pass over the union". Three mutations prove
@@ -341,6 +346,35 @@ no-rows-closed case bit for bit against the sinked window pass is what pins it.
 
 The four mutations that now run red: the state reset each step, the emitted rows
 dropped, `coff == 2` accepted, and the window pass losing its sink.
+
+## The runner cannot simply hold the compressor state, and the reason is prefix caching
+
+The remaining step before the resolver's refusal may narrow is the runner carrying
+the compressor state across steps, since the gate supplies it by hand.
+`DeepseekV4LoadedModel` persists and could hold it, so the change looks like three
+lines. It is not, and the constraint was found before writing them.
+
+**`has_inner_state` gates prefix caching.**
+`LoadedEngine::ResolveEnablePrefixCaching` returns
+`!is_hybrid && !has_inner_state` (`model_loader.cpp:1179`), so declaring inner
+state turns prefix caching OFF by default. This row's registration currently
+declares `false`, and flipping it is model-wide: it would disable prefix caching
+for the GGUF arm too, which carries no compressor state and would lose the
+optimisation for nothing. The flag describes an ARCHITECTURE; the compressor
+state belongs to one arm.
+
+**And the interaction is real, not merely a flag.** A prefix-cache hit skips
+recomputing tokens whose KV is already cached. The compressor's pooled history is
+DERIVED from those tokens, so on a hit the carried state would be missing exactly
+the rows the skipped tokens would have contributed, and the layer would attend a
+compressed history with holes in it. That is the silent-plausible-output failure
+this row exists to avoid, and it would appear only on cache hits.
+
+So the next brick owes a decision rather than an implementation: either the
+compressor state is REBUILDABLE from a cached prefix, or a prefix hit must
+invalidate it, or the arm must declare itself incompatible with prefix caching
+per-arm rather than per-architecture. That is a scheduler-facing choice this row
+does not own, and it is filed here rather than guessed at.
 
 ## W1's arm is REACHED from production
 

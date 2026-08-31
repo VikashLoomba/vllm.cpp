@@ -6354,9 +6354,43 @@ All six mutations were re-run after this refactor.
 
   W5a's repair takes the device as an argument to `LoadQwen4ExpFromGguf` — no
   default, so a caller cannot disable the guard by saying nothing — and refuses
-  BY NAME ahead of any tensor I/O. **Owed: the CUDA block-decoding gather
-  kernel.** Until it exists this is a CPU-only arm, which is now a named refusal
-  instead of a discovery.
+  BY NAME ahead of any tensor I/O.
+
+  **KGATHER WROTE THAT KERNEL AND FLIPPED THE GATE**
+  ([`cuda-quant-gather.md`](cuda-quant-gather.md)), so the sentence above —
+  "`DeviceQuantGatherSupported` is true for `kCPU` alone" — is now true only of
+  METAL, VULKAN, ROCM and TENSTORRENT. `EmbeddingKernelCuda` decodes a block row
+  across all 18 encodings `vt::cpu::BlockToFloat` decodes, and the gate is no
+  longer a device list at all: `vt::Embedding` routes a block table to
+  `OpId::kEmbeddingQuant` and `DeviceQuantGatherSupported` is
+  `OpRegistered(kEmbeddingQuant, dev)`, so a backend advertises the capability by
+  registering the kernel. MEASURED on `thor:gpu0` (sm_110, nvcc 13.0.88,
+  2026-08-31, job `e53a20f5`): 6 of 6 cases at 231 assertions, every encoding
+  bit-exact against the CPU arm, against a pre-arm RED leg that failed by name at
+  32 assertions. The guard itself is UNCHANGED and still refuses the other four
+  devices by name.
+
+  **The n-gram table therefore stays block-resident on a CUDA card**, 26.822 GiB
+  instead of 95.368 GiB, which is what the load-side blocker was. It does NOT
+  make this model run on a GPU: `ModelRegistry::Forward` is all-or-nothing and
+  several `qwen4_exp` ops have no CUDA arm, so `--device cpu` is still the answer
+  for a token. **What KGATHER does NOT do:** it removes the
+  LOAD-side blocker and produces no token on a GPU, because no `qwen4_exp` op
+  reaches a CUDA queue (W6-CUDA landed four arms; `vt::RmsNormGroup`, the QSA
+  block and the rest are still host-only, and `ModelRegistry::Forward` is
+  all-or-nothing). It claims no throughput number.
+
+  **Still owed after KGATHER, and named rather than implied:**
+  - **sm_121a, and M2 on a device** —
+    [#2393](https://github.com/mudler/vllm.cpp/issues/2393). The device gate ran
+    on sm_110 (thor). A `dgx:gpu0` job is queued to confirm the target
+    architecture and to close the one mutation that did not build there (M2, an
+    `-Werror` artifact on an unreferenced local, now fixed). No sm_121a claim is
+    made.
+  - The gather arms of METAL, VULKAN, ROCM and TENSTORRENT —
+    [#2394](https://github.com/mudler/vllm.cpp/issues/2394).
+  - Any performance claim. The decoders read byte-wise for alignment safety and
+    one thread decodes a whole block; no benchmark ID moves.
 
   **Also owed, and only NARROWED by that guard: the load still runs to
   completion on `--device cpu` and then dies in `MakeQwen4ExpKVCache`.** Before

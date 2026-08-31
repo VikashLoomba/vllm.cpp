@@ -69,25 +69,30 @@
 // now have CUDA arms and the registration case at the bottom of this file
 // asserts each one RESOLVES.
 //
-// WHAT IS STILL MISSING IS NOT ONE OF THEM: the block-decoding n-gram gather
-// `vt::Embedding` needs (`EmbeddingKernelCuda` refuses a block-quantized table
-// by name), which is a separate wave's file territory. `ModelRegistry::Forward`
-// is all-or-nothing, so until that lands NOTHING IN PRODUCTION REACHES THESE
-// KERNELS and their reachability from a production entry point is VACUOUS rather
-// than proven.
+// THE GATHER THIS PARAGRAPH NAMED AS MISSING HAS LANDED (KGATHER,
+// `.agents/specs/cuda-quant-gather.md`). `EmbeddingKernelCuda` decodes a
+// block-quantized table across all 18 encodings `vt::cpu::BlockToFloat` decodes,
+// and `DeviceQuantGatherSupported` answers yes on CUDA through
+// `OpRegistered(kEmbeddingQuant, dev)` -- so the loader no longer refuses this
+// device, and the sentence that the gather "refuses a block-quantized table by
+// name" is FALSE and is replaced.
 //
-// **AND THE LOADER REFUSAL THAT ENFORCES THAT IS CONDITIONAL, WHICH AN EARLIER
-// REVISION OF THIS PARAGRAPH DID NOT SAY.** `qwen4_exp_weights.cpp` refuses a
-// non-CPU device only `if (!p.ple.layer_ids_zero_based.empty() &&
-// !DeviceQuantGatherSupported(device))` -- a `qwen4exp` config that names NO PLE
-// layer has no n-gram table, so nothing gathers from blocks and there is nothing
-// to refuse. For such a config the load proceeds, and `vt::RmsNormGroup`'s three
-// call sites are all inside `RunQwen4ExpPleBlock` so they are still not reached
-// -- but `vt::Qwen4ExpGatedResidual` and both QSA ops are NOT PLE-gated and
-// would be dispatched on a CUDA queue. No published `qwen4exp` checkpoint has
-// that shape, so this is a reachable code path with no artifact behind it, not a
-// live one. The spec's `## Owed` names the remaining blocker and the row that
-// owns the wiring. No token claim and no speed claim.
+// SO THE REACHABILITY OF THESE KERNELS IS NO LONGER VACUOUS FOR THE REASON GIVEN
+// ABOVE -- AND IT IS ALSO NOT YET PROVEN, WHICH IS A DIFFERENT CLAIM. With the
+// ops registered and the loader admitting the device, what a CUDA step meets
+// next is a PREDICTION and not a measurement: partial dispatch through the PLE,
+// then a NAMED REFUSAL at the first QSA layer, because `qwen4_exp_qsa_block.cpp`
+// still reads three operands on the HOST -- `CheckRopeLayoutsAgree`,
+// `IndexerRows` on the block table, and `Qwen4ExpQsaIndex` on `kv_lens`. That is
+// the QSADEV wave's territory, not this file's and not KGATHER's.
+//
+// A SECOND WALL THE SYNTHETIC FIXTURE NEVER REACHES: `IsCudaKeepQuantSupported`
+// still excludes IQ4_NL and Q5_0, which the released UD-IQ1_S stores its tensors
+// in, so the real checkpoint stops for a reason no fixture here can show
+// (issue #2423).
+//
+// NO TOKEN HAS COME OUT OF A GPU FOR THIS MODEL, no token claim, and no speed
+// claim. What changed is which blocker is next, not that there is none.
 #include <doctest/doctest.h>
 
 #include <algorithm>

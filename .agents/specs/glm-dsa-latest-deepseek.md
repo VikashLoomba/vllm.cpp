@@ -2596,6 +2596,41 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   flag, and it converts both from "proven by reading" into a measured negative.
   Discharged by the wave that drives the load on `dgx:gpu0`.
 
+- **O30 — THE LOADER PREFAULTED THE 187.312 GiB IT EXISTS NOT TO READ, and the
+  first drive of the real artifact is what found it.** `OwnGgufQuantBlocks` and
+  `OwnGgufF16` end their BORROW arm with `PrefaultBorrowedSpan(src, bytes)`,
+  which `madvise(MADV_WILLNEED)`s the span and then touches one byte per page —
+  L7's repair for a page trap landing in the timed prefill
+  (`gguf_keep_quant.cpp:267`). For a weight the forward reads in place that is
+  right. For a routed-expert tower it is not a latency trade at all: the slot
+  lane `pread`s each slice into its own slot and never reads the tower through
+  the mapping, so the prefault reads the whole expert set off disk to populate
+  pages nothing will look at.
+  **Measured, not inferred.** `thor:gpu0`, 2026-08-31, `--device cuda`,
+  `VT_MOE_EXPERT_STREAM=1`, `VT_MOE_EXPERT_STREAM_SLOTS=4096`, the derived
+  artifact: the load's `VmHWM` rose LINEARLY through 6.16, 12.05, 17.54, 21.45,
+  26.75, 32.99, 38.77, 44.49 and 48.62 GiB at 158-second intervals — ~35 MB/s,
+  the CIFS read rate — with no plateau anywhere near the 18.99 GiB resident class
+  O27 predicts. The run was killed at 23 minutes rather than left to read all
+  201.83 GiB, because what it was measuring was the page-cache path under a
+  streaming label, which is exactly what §3.3 refuses to publish.
+  **Fixed in the same flow** ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)):
+  both functions take a `prefault` parameter defaulted to `true`, so every
+  existing caller is byte-identical, and `LoadStackedExperts`
+  (`glm_moe_dsa_loader.cpp`) passes `false`. Gated by
+  `test_glm_moe_dsa_gguf_load.cpp`'s "the streamed towers are borrowed and NOT
+  prefaulted", which asserts the towers took the BORROW arm (the positive
+  control, `mmap_fd >= 0`) and that the prefaulted-span count is zero — sound in
+  this fixture because every non-tower tensor in it is F32 and therefore
+  dequantized into an owned buffer, so the Q8_0 towers are the only spans that
+  reach the borrow arm at all.
+  **What is NOT discharged: the same defect on the Qwen3.5 lane.**
+  `qwen3_5_gguf_weights.cpp`'s own `LoadExpertsStackedKq` still prefaults the
+  towers it hands to the same seam. It is invisible there because no Qwen3.5
+  artifact is large enough for anyone to notice, and it is `ENG-EXPERT-STREAM`'s
+  to generalise rather than this row's to reach into another model's loader.
+  Named here so a reader does not conclude the lane is clean.
+
 ### 3.10 Now
 
 **W7 LANDED ITS LOADER AND DID NOT PRODUCE A TOKEN, 2026-08-30**

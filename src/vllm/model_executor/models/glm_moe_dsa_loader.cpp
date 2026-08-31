@@ -349,12 +349,24 @@ OwnedTensor LoadStackedExperts(const GgufFile& g, const GgufLoadPolicy& pol,
                "all of them — and this model's towers are 187.312 GiB "
                "compressed. Check VT_GGUF_KEEP_QUANT and that this encoding has "
                "a keep-quant vec_dot (vt::cpu::HasQuantDotKernel)");
+  // `prefault = false`, and this is the line that decides whether this model
+  // STREAMS or only says it does (#2214, spec §3.3, O30). Every other borrowed
+  // weight is faulted in at load so a page trap does not land in the timed
+  // prefill; a routed-expert tower is the one class where that trade does not
+  // exist, because `expert_stream::ExpertSlice` preads each slice into a slot
+  // and NEVER reads the tower through the mapping. Prefaulting these 228 towers
+  // therefore reads 187.312 GiB off the filesystem at load to populate pages
+  // nothing looks at — measured on the real artifact before this line existed:
+  // RSS climbed linearly past 48 GiB against a 18.99 GiB resident class, at the
+  // filesystem's read rate, with no plateau. It is also the exact shape §3.3
+  // refuses to publish, a page-cache number under a streaming label.
   if (r == GgufResidency::kKeepQuant) {
     return OwnGgufQuantBlocks(t, e * n, k, /*row_offset=*/0, MmapSrc(g, pol),
-                              kGlmMoeDsaQuantRepack);
+                              kGlmMoeDsaQuantRepack, /*cuda_align=*/false,
+                              /*prefault=*/false);
   }
   return OwnGgufF16(t, e * n, k, /*row_offset=*/0, MmapSrc(g, pol), /*nk=*/true,
-                    /*elem_kn_repack=*/false);
+                    /*elem_kn_repack=*/false, /*prefault=*/false);
 }
 
 // A 3-D [H, N, K] tensor that is NOT an expert bank and is never sliced by

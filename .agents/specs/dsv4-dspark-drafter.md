@@ -215,6 +215,16 @@ block's are 20.2 GiB as host f32 -- and the caller is told through
 Shapes are checked at assembly rather than inside a forward, where a mismatch
 surfaces as an anonymous MatVec size error naming no tensor and no layer.
 
+W-4b LANDED. `ConfidenceDraftLength` is the draft-length cap:
+`sigmoid(proj(cat(pre_norm_hidden, markov_emb))) >= threshold`, and the length is
+`cumprod(keep).sum()` -- the longest CONTIGUOUS prefix of confident positions, not
+the count of confident ones. `[yes, no, yes]` is 1 and never 2. Counting instead
+would let the drafter propose past a position the model flagged, and since
+verification is lossless the only symptom is a worse acceptance rate. The
+projection reads the PRE-norm hidden state concatenated with that step's bigram
+embedding, which is why the artifact's `confidence_head.proj` is
+`[1, 4352] = [1, 4096 + 256]`.
+
 W-4 LANDED. `MarkovDraftLoop` is the sequential chain: per step one embedding
 gather, one rank-256 GEMV and an argmax, with the bias conditioned on the
 PREVIOUSLY SAMPLED id. Ties go to the lowest id, matching `torch.argmax`, because

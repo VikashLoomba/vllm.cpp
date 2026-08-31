@@ -27,11 +27,11 @@ SLOTS=${SLOTS:-4096}
 # tree's name. Keying the stamps to the source makes that impossible to express.
 SRCSHA=$(sha256sum "$W/src.tar.gz" 2>/dev/null | cut -c1-12)
 # The RECIPE version rides in the key beside the source hash, because the stamps
-# also outlive a change to the BUILD (r2 adds CUTLASS, without which
+# also outlive a change to the BUILD (r2 adds CUTLASS, r3 adds the CPU arm; without CUTLASS
 # FlashAttention-2 compiles for no arch and MLA prefill refuses at the first
 # step). A configure-time change that reused a stamp would report the previous
 # recipe's binary under this one's name.
-RECIPE=r2
+RECIPE=r3
 OUT=$W/out/$BOX-${SRCSHA:-nosrc}-$RECIPE
 
 mkdir -p "$OUT"
@@ -285,6 +285,50 @@ head -5 "$OUT/mem.samples"; echo ...; tail -5 "$OUT/mem.samples"
   echo "arch=$ARCH"; } > "$OUT/result.env"
 cat "$OUT/result.env"
 [ "$rc" -ne 0 ] && say "THE LOAD DID NOT COMPLETE -- the message above is the FINDING and is recorded verbatim"
+
+say "LEG 1b -- THE CPU ARM. IT IS NOT A STREAMING MEASUREMENT AND IS LABELLED ONE"
+# RUN ONLY WHEN THE CUDA ARM DID NOT PRODUCE A TOKEN, so a box that CAN stream
+# spends its lease on the arm the goal names rather than on this one.
+#
+# READ WHAT THIS ARM IS BEFORE READING ITS NUMBER. `--device cpu` makes
+# `needs_weight_staging()` false, so `model_loader.cpp` never builds the
+# streamed-expert lane at all: `expert_stream::ExpertSlice` takes the RESIDENT
+# fallback and every routed-expert slice is read IN PLACE out of the 201.83 GiB
+# mmap, over CIFS. That is the page-cache path spec §3.3 refuses to publish under
+# a streaming label, and nothing below may be quoted as an expert-streaming
+# result. What it CAN answer is the other half of the question -- whether this
+# port computes a token from this checkpoint at all -- on a queue whose MLA
+# prefill is not FlashAttention and therefore does not need FA2.
+if [ "$rc" -ne 0 ]; then
+  export VT_MOE_EXPERT_STREAM=0
+  echo "VT_MOE_EXPERT_STREAM=0 (the lane is not built on a CPU queue; saying so rather than implying one)"
+  ( "$CLI" --model "$DERIVED/GLM-5.3-UD-IQ1_S-00001-of-00006.gguf" \
+           --device cpu --prompt "$PROMPT" --max-tokens "$MAX_TOKENS" --temperature 0 \
+           > "$OUT/cpu.stdout" 2> "$OUT/cpu.stderr" ) &
+  cpid=$!
+  chwm=0; c0=$(date +%s)
+  : > "$OUT/cpu.mem.samples"
+  while kill -0 "$cpid" 2>/dev/null; do
+    v=$(awk '/VmHWM/{print $2}' "/proc/$cpid/status" 2>/dev/null)
+    [ -n "${v:-}" ] && [ "$v" -gt "$chwm" ] && chwm=$v
+    printf '%s vmhwm_kb=%s\n' "$(( $(date +%s) - c0 ))" "$chwm" >> "$OUT/cpu.mem.samples"
+    sleep 15
+  done
+  wait "$cpid"; crc=$?
+  celapsed=$(( $(date +%s) - c0 ))
+  note CPU_LOAD $crc
+  echo "### CPU_RC=$crc   wall=${celapsed}s"
+  awk -v k="$chwm" 'BEGIN{printf "### CPU VmHWM peak = %d kB = %.2f GiB\n", k, k/1048576}'
+  echo "--- CPU stdout (the emitted text, verbatim) ---"
+  cat "$OUT/cpu.stdout"
+  echo "--- CPU stderr (tail 60) ---"; tail -60 "$OUT/cpu.stderr"
+  echo "--- CPU expert-stream lines (EXPECTED ABSENT: no lane is built on a CPU queue) ---"
+  grep -a '\[expert-stream\]' "$OUT/cpu.stderr" | tail -10
+  { echo "cpu_rc=$crc"; echo "cpu_wall_s=$celapsed"; echo "cpu_vmhwm_kb=$chwm"; } >> "$OUT/result.env"
+  export VT_MOE_EXPERT_STREAM=1
+else
+  echo "### SKIPPED: the CUDA arm succeeded, so this box spent its lease on the arm the goal names."
+fi
 
 say "LEG 2 -- THE FOCUSED C++ SUITES, BY HAND, WITH THEIR COUNTS"
 # AFTER the load, so a truncated lease still carries the primary result.

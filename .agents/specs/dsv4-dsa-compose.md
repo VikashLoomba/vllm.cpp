@@ -404,6 +404,30 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## What the top-k INDEXES, which was the last unknown
+
+`_fill_short_context_topk_indices` (`attention.py:71-87`) settles it, and it is
+the short-context arm writing the answer in the clear:
+
+    num_compressed = (positions + 1) // COMPRESS_RATIO
+    store(offsets < num_compressed ? offsets : -1)
+
+So a selection index addresses a **COMPRESSED ROW**, not a token: index `i` means
+the i-th compressed entry, the count available at a position is
+`(position + 1) / compress_ratio`, and `-1` is the invalid marker padding the row
+out to `TOP_K`.
+
+That is the same arithmetic the `c128a` path uses, where selection is "which
+compressed windows have CLOSED" and needs no learned component. The `cr == 4`
+family differs only in that the indexer LEARNS which of those closed rows to
+take.
+
+**This tree's `sel[t]` holds TOKEN indices into `kv_keys`.** Re-pointing the
+selection is therefore not a change of operand alone: the attention must attend
+compressed rows at the selected indices, and `-1` must be honoured as padding
+rather than read as a row. Both are behaviour changes to the attention path, not
+to the indexer, which is why this is recorded before either is attempted.
+
 ## The indexer's compressed KEYS are produced
 
 `IndexerCompressedKeys` runs the indexer's second `DeepseekCompressor` at

@@ -404,6 +404,28 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## The indexer's compressed KEYS are produced
+
+`IndexerCompressedKeys` runs the indexer's second `DeepseekCompressor` at
+`index_head_dim`: both halves projected from the hidden state, then the SAME cycle
+with `coff == 2` and rotation on. Its output is keys and nothing else, because the
+indexer's pooled rows are what the top-k scores against.
+
+Two details are read from upstream rather than derived. `rope_dim` is the MODEL's
+`qk_rope_head_dim` whatever the compressor's own head is (`compressor.py:240`), so
+at the real geometry it is 64 inside a 128-wide indexer head -- deriving it from
+`index_head_dim` is the likely mistake. And `coff` is always 2, because the
+indexer exists only at `compress_ratio == 4` (`attention.py:274`).
+
+**The gate needed two repairs, both the same shape as earlier ones.** With
+`T == 4` only one window closes, at base position 0, where RoPE is the identity --
+so a rotated row compared equal to an unrotated one and the rotation looked inert.
+And every remaining assertion was STRUCTURAL (size, finiteness, magnitude), which
+holds for any non-degenerate KV, so a mutation pooling the GATE as the KV survived
+untouched. The case now closes two windows and compares the KV and gate slots
+against each other. Three mutations run red: the gate pooled as the KV, `coff`
+collapsed to 1, and the keys left unrotated.
+
 ## The pooled row IS rotated, and W1 was not doing it
 
 Chasing whether the INDEXER's cycle rotates answered a question about the

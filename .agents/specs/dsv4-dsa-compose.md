@@ -342,6 +342,26 @@ no-rows-closed case bit for bit against the sinked window pass is what pins it.
 The four mutations that now run red: the state reset each step, the emitted rows
 dropped, `coff == 2` accepted, and the window pass losing its sink.
 
+## The compressor arm is wired, and the GGUF forward CANNOT reach it
+
+`V4Backend::compressor` carries the per-layer state and `AttentionBlock`'s paged
+arm routes a `compress_ratio == 128` layer through `CompressorLayerStep` when it
+is supplied. `DeepseekV4ForwardGgufPaged` surfaces it as an optional argument, and
+null keeps the existing refusal.
+
+**That public entry can never reach it, and two tests written against it failed
+before the assumption was caught.** `dsa_dense` is `(be.gguf != nullptr)` and
+`is_comp` is `has_compressor(layer) && !dsa_dense`, so on the GGUF arm EVERY layer
+is dense regardless of `compress_ratios`. A ratio-128 layer driven through that
+forward leaves the carried state empty and the guard silent, because neither is
+consulted. It is what the arm IS: the GGUF converter never carried compressor
+tensors, and `dsa_dense` says so once for the whole arm.
+
+So the arm is reachable only from a NON-GGUF paged forward, and this tree has no
+public one. That is now the concrete blocker for W1's reachability, ahead of the
+refusal narrowing, and it is smaller than it sounds: the EXL3 arm already loads
+and composes, it simply has no paged entry point yet.
+
 ## The refusal narrows LAST, not first
 
 Attempted 2026-08-31 and REVERTED, because the attempt is the natural first move

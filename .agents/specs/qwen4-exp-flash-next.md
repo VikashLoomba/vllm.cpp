@@ -3898,8 +3898,86 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
-- **W5r NAMES A SITE FOR THE DEGENERATE OUTPUT BELOW, AND IT IS A TRACED
-  CANDIDATE RATHER THAN A PROVEN CAUSE. ISSUE OWED.** The entry below says
+- **W5s SETTLED THE ROW'S BLOCKER: THE RELEASED CHECKPOINT NOW EMITS REAL
+  TOKENS, AND THE CAUSE WAS W5r's DROPPED REPACK MARKER. ISSUE OWED.** On
+  `origin/main` `52f7ccbfc` — W5p *and* W5r — the artifact answers two different
+  prompts with two different, correct, prompt-dependent completions on
+  `thor:gpu0`, `--device cpu`:
+
+  ```text
+  prompt "The capital of France is"  (prompt_tokens=5) -> " Paris. Given this fact, what is"
+  prompt "Water boils at"            (prompt_tokens=3) -> " 100°C at sea level"
+  ```
+
+  Eight distinct token ids (`11751, 13, 15767, 411, 2029, 11, 1092, 369`), none
+  of them 0, against W5q's eight consecutive id 0 on the same box and artifact.
+  Evidence:
+  [`docs/bench-evidence/qwen4exp-released-checkpoint-tokens-20260831.md`](../../docs/bench-evidence/qwen4exp-released-checkpoint-tokens-20260831.md).
+
+  **THE MECHANISM IS MEASURED, NOT INFERRED.** Reusing W7DIAG's read-only probe,
+  the pre-W5r tree (`701606e51`) and this one agree *numerically* on `embed`
+  (l2 0.473868) and `stream.after_widen` (l2 0.947736) and then diverge at
+  exactly one place: `stream.after_layer_0` was `nan=51200` and is now `nan=0`,
+  and `LOGITS` was `zero=248320` — a row with no maximum, which is why `argmax`
+  returned index 0 — and is now a ranked distribution, `min -9.89818
+  max 15.7873`, whose argmax id **11751** is the `" Paris"` token that came out
+  of HTTP. The identical prefix rows make the pre-fix run a control rather than
+  a different experiment.
+
+  **`VT_CPU_QUANT_REPACK=0` IS NOW A CONFIRMATION, NOT A DISCRIMINATOR.** With
+  the marker fix in, repack ON and repack OFF give byte-identical text, the
+  identical eight ids, and bit-identical probe rows at every stage. That is the
+  correct outcome for a performance transform, and it is the thing that was
+  false before W5r.
+
+  **WHAT W5s DOES NOT CLAIM.** It is not a token gate: no oracle decoded these
+  prompts, and llama.cpp is not a usable same-box control (the sibling wave's
+  arm exited 126; it aborts in `build_delta_net_chunking` before loading a
+  byte). No speed number — the box carried four other sessions' processes and
+  every arm is n=1. Only the UD-IQ1_S arm ran. `num_reqs > 1` is still refused
+  by name. **A TOKEN GATE AGAINST AN ORACLE IS THE NEXT OWED STEP.**
+
+- **`logprobs` VALUES ARE NOT PRODUCED FOR THIS MODEL, ON EITHER TREE. ISSUE
+  OWED.** W5q owed a `logprobs` request; W5s made it, on both trees, and it
+  settles nothing about the logits. The request is accepted and the payload is
+  built, but `token_logprobs` and `top_logprobs` come back all-`null`. **That is
+  not a serialized NaN.** It is the
+  `step == nullptr || step->empty() || step_token == nullptr` branch of
+  `BuildCompletionLogProbs` (`serving_utils.cpp:130-135`), which emits the
+  `"token_id:N"` fallback string beside the nulls — exactly what both runs show —
+  so the engine produced no logprobs dict for those positions.
+  `serving_completion.cpp:457` gates the payload on
+  `output.logprobs.has_value()`, and that is false here. Why it is false is
+  unread. **Anyone reading a `null` logprob on this row as evidence of a NaN
+  logit is reading the wrong branch.**
+
+- **`VT_DEBUG_SAMPLED=1` PRINTED NOTHING AND W5s CANNOT SAY WHY. ISSUE OWED.**
+  The variable is real (`runner.cpp:3078-3086`), its guard is
+  `kDebugSampled && !toks.empty()`, `fprintf(stderr, ...)` is unbuffered and the
+  job captured stderr — and all four arms logged zero `vt-debug sampled` lines.
+  Recorded as a **failed instrument that contributed nothing**, never as
+  evidence about the sampler; the ids above come from the `logprobs` array and
+  the decoded text, which do not depend on it. W5s also asserted this variable's
+  file and line in its own job script *before verifying them*, and the line
+  number was wrong by ~115 lines; the variable's existence was not.
+
+- **W5q's STAGED-COPY RECLAMATION QUESTION IS ANSWERED.** W5q could not say
+  whether its 67 GB staged copy was reclaimed, because its `df` ran one line
+  after the `rm`. W5s reaped the server first, then `sync`ed, then waited 10 s,
+  then measured: `364G used / 508G avail`, byte-identical to the `df` taken
+  before the job. It is reclaimed.
+
+- **W5q's `tee` EXIT-TRAP HANG DID NOT RECUR, AND THE LIKELY CAUSE IS NAMED.**
+  W5q printed `DONE` and still held `thor` for 42 minutes. W5s dropped
+  `exec > >(tee ...)` entirely (rc captures stdout), sent the high-frequency
+  sampler to a file, and killed **all four** background children in the trap —
+  W5q killed its heartbeat but never its sampler subshell, which inherits the
+  job's stdout and is the most likely reason the pipe stayed open. W5s released
+  the device on its own, 18 s before the next queued job started.
+
+- **W5r NAMED A SITE FOR THE DEGENERATE OUTPUT BELOW AS A TRACED CANDIDATE, AND
+  W5s ABOVE MEASURED IT AND CONFIRMED IT WAS THE CAUSE. KEPT IN THE PAST TENSE
+  BECAUSE IT IS THE REASONING THAT FOUND THE DEFECT.** The entry below says
   "W5q identifies no site and no line". W5r identifies one, by reading the
   chain rather than by guessing, and the whole chain is on the box W5q ran on:
 
@@ -3927,13 +4005,14 @@ All six mutations were re-run after this refactor.
   that three causes sample id 0 and that guessing between them is the error to
   avoid; this is one candidate with a traced mechanism, not a verdict.
 
-  **THE DISCRIMINATING MEASUREMENT IS CHEAP AND IT IS OWED.** Re-run W5q's exact
-  request on a `thor` lease with `VT_CPU_QUANT_REPACK=0`, which forces
-  `QuantRepackActive()` false and takes the whole chain out. If the output stops
-  being constant, this was it. If it does not, this fix is correct hardening and
-  the blocker is elsewhere — and either way the answer costs one request. Pair
-  it with W5q's `logprobs` request so the NaN / zero / constant question is
-  settled in the same lease.
+  **THAT DISCRIMINATING MEASUREMENT IS DONE — W5s RAN IT.** The prediction in
+  this entry held: the output stopped being constant. Step 2, the only link this
+  entry read off policy rather than measured, was confirmed on the box
+  (`i8mm PRESENT`, so `QuantRepackActive()` is TRUE there). The paired
+  `logprobs` request was also made and did NOT settle the NaN / zero / constant
+  question, for the reason recorded in its own entry above; the per-stage probe
+  settled it instead, and the answer is a NaN born in layer 0 collapsing to an
+  all-zero logit row.
 
 - **W5r's FIX IS GATED BY CONSTRUCTION AND HAS NEVER RUN ON A HOST THAT SETS THE
   MARKER. ISSUE OWED.** `dense_attn::ResidentWeight` now carries `repacked` and
@@ -3978,8 +4057,9 @@ All six mutations were re-run after this refactor.
   `.agents/issue-index.md` is retired to `.agents/completed/`, so no index row
   is owed.
 
-- **THE RELEASED CHECKPOINT NOW SERVES AND ITS OUTPUT IS DEGENERATE. THIS IS
-  THE ROW'S BLOCKER AND ITS CAUSE IS NOT IDENTIFIED. ISSUE OWED.** W5q drove
+- **THE RELEASED CHECKPOINT SERVED AND ITS OUTPUT WAS DEGENERATE. THIS WAS THE
+  ROW'S BLOCKER; W5s ABOVE IDENTIFIED THE CAUSE AND THE OUTPUT IS NO LONGER
+  DEGENERATE. KEPT AS THE MEASUREMENT THAT DEFINED THE PROBLEM.** W5q drove
   `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S through `examples/server` on the
   composed W5p + LOAD-IO tree, on `thor:gpu0`, `--device cpu`, staged to
   worker-local disk. **The W5n refusal is gone**: the prefill completes, eight
@@ -7027,10 +7107,19 @@ six deep, so this is recorded as an environment fact rather than as an anecdote.
 **W5q ATTEMPTED IT AND THAT LAST CLAIM HELD.** On the composed W5p + LOAD-IO
 tree the released artifact prefills and decodes without throwing, and
 `POST /v1/completions` returns 200 rather than W5n's 500. What W5q found instead
-is a degenerate forward — eight id-0 tokens, byte-identical across two prompts —
-whose cause is unidentified. That does not weaken W5p's claim, and W5p's claim
-never covered it: the op-level and miniature gates say nothing about the values
-the released geometry produces.
+is a degenerate forward — eight id-0 tokens, byte-identical across two prompts.
+That did not weaken W5p's claim, and W5p's claim never covered it: the op-level
+and miniature gates say nothing about the values the released geometry produces.
+
+**W5s THEN IDENTIFIED THE CAUSE, AND IT WAS NOT W5p's.** The composed tree W5q
+ran predates W5r, so on `thor` — aarch64 i8mm, where
+`vt::cpu::QuantRepackActive()` is TRUE — the shared `dense_attn::ResidentWeight`
+was still dropping the repack marker and `kMatmulBTQuant` was reading
+`block_q8_0x4` buffers as flat `q8_0` on every hyper-connection mix weight. That
+produced a NaN in layer 0 which propagated to an all-zero logit row, and `argmax`
+over a row with no maximum returns index 0. On `origin/main` `52f7ccbfc`, which
+carries W5r, the same artifact on the same box answers `" Paris. Given this
+fact, what is"` and `" 100°C at sea level"`. See the W5s entry under `## Owed`.
 
 ## Now
 
@@ -7085,6 +7174,8 @@ a row here, and every row says whether anything in production reaches it:
 | W6-CUDA | the first CUDA arms of this architecture: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpGatedResidualWriteBack` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and four ops plus `vt::RmsNormGroup` plus the block-decoding n-gram gather still have no CUDA arm, so no `qwen4_exp` step can reach a CUDA queue at all. The gate RAN on TWO architectures. `thor:gpu0` (`sm_110`, nvcc 13.0.88): 12 cases, 323 assertions, 322 passing, with the CPU arms matched BITWISE at 0 of 8772, 0 of 20480 and 0 across all 30 dtype combinations; 5 of 6 mutations red and M5 a compiler proof. The single failure was this suite's OWN oracle bound, which was re-derived and bitwise-backstopped. `dgx:gpu0` (`sm_121a`, GB10, nvcc 13.0.88) then ran the corrected suite green: 12 cases, 351 assertions, 351 passing, every rc READ rather than derived, and `cuobjdump` reporting `cuda_qwen4_exp_ple.cu.1.sm_121a.cubin` so the objects are genuinely built for that architecture. The two runs' mutation counts agree. Full result in the W6-CUDA section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA's own issue OWED |
 | W5-LOADIO | `VT_LOAD_STATS` reports on the GGUF branch, and `PrefaultBorrowedSpan` counts BYTES rather than only spans | **yes** — the timing and `ReportGgufLoadIo` sit on the `.gguf` branch of `LoadedEngine::FromModelDir`, the production loader entry point, so `VT_LOAD_STATS=1` on any GGUF model now prints `mmap+header`, `weights` and the prefault's bytes/seconds where it previously printed NOTHING. It deliberately does NOT call `ReportLoadBytes`, whose three counters are incremented on the safetensors path only and would print zeros for an artifact the load had just moved 67.56 GiB of. Gated by a new case in `test_gguf_keep_quant.cpp` asserting an EQUALITY over a double load, because `> 0` is satisfied by a counter wired to the span count, to a constant, or to the last span alone | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), its own issue OWED |
 | W5q | the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact driven through `examples/server` on the COMPOSED W5p+LOAD-IO tree, staged to worker-local disk | **SERVES yes, USABLE TOKEN no** — the W5n refusal is gone: a 5-token prefill and eight decode steps run with `model_executed=1` each, nothing throws, and `POST /v1/completions` returns **HTTP 200** with 8 completion tokens where W5n got a 500. **Every one of those tokens is id 0**, which this checkpoint's own `tokenizer.ggml.tokens` gives as `!`, and the answer is BYTE-IDENTICAL for two prompts of different lengths. So the forward is degenerate and prompt-independent on the real weights. Load 61 s from local disk (against 4446 s from CIFS), `VmHWM` 73.935 GiB, gate 72 cases / 10,380 assertions / 0 failed / 0 skipped with the oracle golden unmoved at `0.00982457`. **The CAUSE is NOT identified**: `logprobs` was not requested, so nothing distinguishes NaN, zero and constant logits, and no per-op probe was run | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5q's own issue OWED |
+| W5r | the shared `dense_attn::ResidentWeight` stops dropping the load-time repack markers (`repacked`, `elem_kn_repacked`), and refuses to stage an `elem_kn_repacked` weight to a device | **yes, and W5s PROVED IT IS THE FIX** — `dense_attn_block.h:235-236` sits on the path `qwen4_exp_forward.cpp` takes for every hyper-connection mix weight, so on an aarch64 i8mm host the mixer stops reading `block_q8_0x4` bytes as flat `q8_0` across 48 layers x 2 sides plus the terminal mixer. W5r itself could neither run nor gate this: it was CPU-only on x86, where `vt::cpu::QuantRepackActive()` is false (`cpu_quant_repack_arm.cpp:275`) and the whole chain is inert, so its gate sets the flag BY HAND and asserts propagation. **W5s ran it on `thor`, where the chain is live** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5r's own issue OWED |
+| W5s | the RELEASED UD-IQ1_S artifact re-driven on `origin/main` `52f7ccbfc` (W5p **and** W5r), four arms, one build, one staged copy | **SERVES yes, and the TOKENS ARE REAL** — `" Paris. Given this fact, what is"` and `" 100°C at sea level"` for two different prompts, eight distinct ids none of them 0, against W5q's eight consecutive id 0 on the same box and artifact. Reusing W7DIAG's read-only probe, the pre-W5r tree and this one agree numerically on `embed` and `after_widen` and diverge at exactly `stream.after_layer_0` (`nan=51200` -> `nan=0`); `LOGITS` was `zero=248320` with no maximum and is now `min -9.89818 max 15.7873`, argmax id 11751 = the `" Paris"` token. `VT_CPU_QUANT_REPACK=0` is byte-identical to the default, which is the correct outcome for a performance transform and the thing that was false before W5r. **NOT a token gate** (no oracle decoded these prompts; llama.cpp aborts in `build_delta_net_chunking`), no speed number, UD-IQ1_S only, one sequence. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5s's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than

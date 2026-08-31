@@ -213,11 +213,23 @@ b = s.index(')GLM53"')
 open(sys.argv[2], 'w').write(s[a:b] + "\n")
 PY
   echo "config.json extracted: $(wc -c < "$OUT/GLM-5.3-config.json") bytes  sha256=$(sha256sum "$OUT/GLM-5.3-config.json" | cut -d' ' -f1)"
+  # IDEMPOTENT. `$DERIVED` is shared across runs and boxes, so the links are
+  # usually already there; `ln -f` onto an existing link to the SAME inode fails
+  # on this share, and a second job doing this at the same moment is a race. A
+  # link that is already correct -- same size as the source -- is left alone, and
+  # only a missing or wrong one is (re)made.
   for f in "$CKPT"/GLM-5.3-UD-IQ1_S-*-of-00006.gguf; do
     b=$(basename "$f")
     [ "$b" = "GLM-5.3-UD-IQ1_S-00001-of-00006.gguf" ] && continue
-    ln -f "$f" "$DERIVED/$b" || { echo "FATAL: cannot hardlink $b into $DERIVED"; exit 96; }
+    want=$(stat -c %s "$f")
+    have=$(stat -c %s "$DERIVED/$b" 2>/dev/null || echo 0)
+    if [ "$have" != "$want" ]; then
+      rm -f "$DERIVED/$b"
+      ln "$f" "$DERIVED/$b" || cp -l "$f" "$DERIVED/$b" \
+        || { echo "FATAL: cannot hardlink $b into $DERIVED"; exit 96; }
+    fi
   done
+  ls -la "$DERIVED" | head -8
   python3 "$SRC/scripts/glm-dsa-write-indexer-types.py" \
       --shard "$SHARD1" --from-config "$OUT/GLM-5.3-config.json" \
       --out "$DERIVED/GLM-5.3-UD-IQ1_S-00001-of-00006.gguf" --force > "$OUT/indexer_types.log" 2>&1

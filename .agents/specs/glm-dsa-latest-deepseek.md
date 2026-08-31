@@ -2378,8 +2378,18 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   the resident class. **No slice was ever served**, because the forward threw in
   MLA prefill before the first expert, so `ExpertStreamLane` was never
   constructed, no `[expert-stream]` line was printed, and there are no
-  `fills`/`hits`/`bytes` counters to quote. Discharged by the wave that takes one
-  step and prints them.
+  `fills`/`hits`/`bytes` counters to quote.
+  **DISCHARGED on `dgx:gpu0` the same day, and by counters rather than by an
+  argument.** With FlashAttention-2 compiled for `121a` the step reaches the
+  experts, `ExpertStreamLane` is constructed —
+  `[expert-stream] ON slots=4096 slot_bytes=4816896 resident=18.38 GiB` — and one
+  step reports `steps=1 hits=0 misses=527 evictions=0 fills=527
+  bytes=1876328448 exhausted=0 advised=0`. GLM-5.3 is therefore the seam's second
+  client in the only sense that matters: 527 slices of a second architecture's
+  towers were paged out of a real file into slots. `exhausted=0` is the part to
+  read twice — no slice fell back to reading the tower in place, so nothing in
+  those bytes is a page-cache number wearing a streaming label. It is also the
+  first time the `pread` path has run on a real checkpoint at all.
 - **O16 — W2 lands three surfaces that NOTHING reaches yet**, and it says so
   rather than letting a reader infer reachability from a green suite. The
   registration, its config hook, the `glm-dsa` `kGgufArchArms` row and
@@ -2775,19 +2785,75 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
 
 ### 3.10 Now
 
-**THE 201.83 GiB ARTIFACT HAS BEEN DRIVEN, THE MODEL MATERIALIZES, AND NO TOKEN
-EXISTS YET, 2026-08-31** ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)).
-All three clauses are the record and none of them may be quoted without the
-others.
+**GLM-5.3 EMITS ` Paris` FROM ITS REAL 201.83 GiB ARTIFACT ON GB10, AND THAT
+TOKEN IS NOT A STREAMING RESULT, 2026-08-31**
+([#2214](https://github.com/mudler/vllm.cpp/issues/2214)). Both halves are the
+record and neither may be quoted without the other.
 
-**What ran, and where.** `thor:gpu0` under an `rc` lease — `NVIDIA Thor`,
+**The token, exactly.** `dgx:gpu0` — `NVIDIA GB10`, `aarch64`, 20 cores, 119 GB,
+compute capability 12.1, driver 580.173.02 — under an `rc` lease, base
+`65a821980`, `vllm-cli --model <derived shard 1> --device cpu --prompt "The
+capital of France is" --max-tokens 1 --temperature 0`. `rc=0`,
+`prompt_tokens=5 completion_tokens=1`, and `stdout` is seven bytes,
+`0x20 P a r i s 0x0a`:
+
+```text
+ Paris
+```
+
+Wall 1198 s for the whole process, of which `generate` is 950.249 s. **No speed
+number is claimed and none may be read off that** (O10): it is one token, on a
+CPU queue, reading expert slices out of a CIFS-backed mmap. `VmHWM` peaks at
+46,618,820 kB = **44.46 GiB**.
+
+**Why that token is NOT the goal, said before anything else quotes it.**
+`--device cpu` makes `needs_weight_staging()` false, so `model_loader.cpp` never
+builds the streamed-expert lane at all: `expert_stream::ExpertSlice` takes the
+RESIDENT fallback and every routed-expert slice is read IN PLACE out of the
+201.83 GiB mapping. That is the page-cache path §3.3 refuses to publish under a
+streaming label, and the 44.46 GiB above is a page-cache figure. What this arm
+establishes is the other half of the question — this port computes a coherent
+first token from this checkpoint — and nothing about streaming.
+
+**THE STREAMING LANE RAN, ON GB10, AND ITS COUNTERS EXIST.** Same box, same
+artifact, `--device cuda`, `VT_MOE_EXPERT_STREAM=1`,
+`VT_MOE_EXPERT_STREAM_SLOTS=4096`:
+
+```text
+[expert-stream] ON slots=4096 slot_bytes=4816896 resident=18.38 GiB
+[expert-stream] steps=1 hits=0 misses=527 evictions=0 fills=527
+                bytes=1876328448 exhausted=0 advised=0
+```
+
+**527 slices were paged out of the file into slots and 1,876,328,448 bytes moved,
+with zero evictions and zero exhaustions.** That is the direct evidence the
+loader-side argument below could only approximate, and it is the first time the
+`pread` path has run on a real checkpoint at all (`expert-streaming.md` `## Owed`
+said it never had). The load itself took 349 s and `VmHWM` peaked at 42.04 GiB —
+the 18.38 GiB arena plus about 20.3 GiB of resident weight. The step then refused
+by name at `blk.8`, on the slot BUDGET rather than on anything it computed, and
+that is O33: the store was sized from the first layer's largest slice instead of
+the file's, so `blk.8`'s IQ4_XS `ffn_down_exps` at 6,684,672 B did not fit the
+4,816,896 B slots. Fixed here; the re-run is queued.
+
+**One operational lesson, because it cost two legs.** The runner on the share was
+EDITED while two leases were executing it. `bash` reads a script incrementally,
+so both jobs resumed at a shifted byte offset: one died with
+`syntax error near unexpected token '('` immediately after printing its result,
+and the other re-ran a stale block and refused on a hard link that already
+existed. Neither corrupted a measurement, and both lost their remaining legs.
+Stage a NEW path for a changed recipe instead.
+
+**The earlier `thor:gpu0` legs, kept because they are what found two of the
+three defects.** `thor:gpu0` under an `rc` lease — `NVIDIA Thor`,
 `aarch64`, 14 cores, 122 GB, compute capability 11.0, CUDA arch `sm_110a`, driver
 595.78 — built `-DVLLM_CPP_CUDA=ON -DCMAKE_BUILD_TYPE=Release` from base
 `65a821980`, `--device cuda`, `VT_MOE_EXPERT_STREAM=1`,
 `VT_MOE_EXPERT_STREAM_SLOTS=4096`, prompt `The capital of France is`,
-`--max-tokens 1`. `dgx:gpu0` is the box the goal names and its queue did not
-clear inside this wave, so **every number below is a thor number and none of them
-is a GB10 number.** The recipe is
+`--max-tokens 1`. **Every number in the rest of this section is a thor number**, and thor cannot
+reach a token at all: `cmake/CudaArchFeatures.cmake`'s `fa2` row covers
+`8.0,8.6,8.7,8.9,12.0a,12.1a`, thor is `sm_110a`, and MLA prefill on this family
+IS FlashAttention with no fallback below it. The recipe is
 [`.agents/scripts/glm53-dsa-streamed-load.sh`](../scripts/glm53-dsa-streamed-load.sh),
 which is the script that ran rather than a description of one.
 
@@ -2839,8 +2905,8 @@ before any result is believed. **That repairs `dgx:gpu0` and it cannot repair
 `dgx` is `sm_121a` and is. A first token on this row is therefore a GB10 result
 by construction, which is what the goal already said.
 
-**NO TOKEN HAS BEEN OBSERVED. `load.stdout` is empty and this record says so
-rather than describing what a token would have looked like.**
+**No token was observed on THIS box.** `load.stdout` is empty. The token above
+is GB10's, on a different arm, and is labelled there.
 
 **The streaming evidence, stated exactly, because this is the claim most easily
 overstated.** No `[expert-stream]` line was printed, and that is not a failure of
@@ -2873,9 +2939,10 @@ prefault at its call site and rebuilding reds the new case with
 cases passing; the tree is then restored byte-for-byte, verified by sha256, and
 rebuilt to 5/5 and 228/228.
 
-**Next action: the same script on `dgx:gpu0`.** It is the box the goal names, it
-is the one arch that can compile the MLA prefill this model's first step needs,
-and the run is queued. Everything else this row owes is downstream of that step.
+**Next action: the streaming arm on `dgx:gpu0` with O33's fix.** Everything else
+is in hand — the artifact, the repair, the lane, the counters and a token — and
+what is owed is one run in which the slot budget is the file's own maximum, so the
+step that streamed 527 slices runs to a token instead of refusing at `blk.8`.
 
 ---
 

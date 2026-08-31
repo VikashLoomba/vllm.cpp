@@ -1999,6 +1999,13 @@ pieces).**
 
 ## 5. P1 — the forward seam carries DEVICE handles (#1358, #2300)
 
+> **A claim below has been retired.** Every "text steps are byte-identical BY
+> CONSTRUCTION" in this section — and in the LANDED records above it — was true
+> when it was written, because nothing could set `ModelForwardInput::mm`. P2
+> (§6) makes that assignment a live runtime predicate in the runner, so from its
+> landing the property is proven **by test**, not by construction. §6.5 states
+> the mutation that proves it. Read the sentences below as history.
+
 **Scope.** `MultiModalForwardInput`'s five fields, the three sites that construct
 it, and what the three registered forwards do to read them. Nothing else. The
 scheduler, the GPU runner, `NewRequestData` and `EncoderCacheManager` are the NEXT
@@ -2201,12 +2208,43 @@ construction**, and that claim was TRUE while the runner had no mm code: the
 field could not be set. After this row it is a live runtime predicate, and the
 claim is therefore retired and replaced by one proven **by mutation**.
 
-The mutation: force the runner's mm path unconditionally (drop the
-`any request carries mm_features` half of the predicate) and require the
+The mutation: force the runner's mm path unconditionally and require the
 text-only suites to go RED. A green mutant would mean the text gates never
 observe the mm path and the neutrality claim is untested. Named suites:
 `test_runner`, `test_scheduler`, `test_model_registry`, `test_chat_mm`,
-`test_openai_serving`, `test_api_server`.
+`test_openai_serving`, `test_openai_api_server`.
+
+**THE FIRST WORDING OF THIS MUTATION WAS NOT DISCRIMINATING, and the implementer
+found that by running it.** It said "drop the `any request carries mm_features`
+half of the predicate", which was written before the predicate existed in code.
+The landed predicate is `supports_mm_inputs() && batch_carries_mm()`, and
+`supports_mm_inputs()` is FALSE for every model the text suites load — they run
+Qwen3.5-MoE, whose registration declares no `encode_mm`. Dropping only the
+second conjunct therefore leaves every named suite GREEN while proving nothing.
+The mutation that discriminates replaces the WHOLE predicate with `true`: the
+text suites then reach `ModelRegistry::EmbedMm` on a registration that leaves
+`embed_mm` null, it refuses by name, and they go red. That is the form to run.
+
+**RUN, and only HALF the named suites can observe it.** With
+`if (supports_mm_inputs() && batch_carries_mm())` replaced by `if (true)` in
+`GPUModelRunner::execute_model`:
+
+| Suite | Result under the mutant | Why |
+|---|---|---|
+| `test_runner` | **RED** — 5 cases fail, exit 139 | it drives `execute_model` |
+| `test_openai_serving` | **RED** — 24 of 48 cases fail | it drives the engine |
+| `test_openai_api_server` | **RED** — 28 of 79 cases fail | it drives the server |
+| `test_scheduler` | green, 46/46 | constructs NO runner |
+| `test_model_registry` | green, 24/24 | constructs NO runner |
+| `test_chat_mm` | green, 11/11 | constructs NO runner |
+
+The three green ones are not a hole in the gate; they are suites with nothing to
+observe, and listing them as neutrality witnesses was the error. The
+obligation is discharged by the three that go red. The `139` is a segfault
+rather than the refusal's message, because forcing the predicate reaches
+`ModelRegistry::EmbedMm` on the direct-runner adapter models those cases build;
+a crash is a stronger red than a throw and no weaker, so it is recorded as it
+came out rather than tuned into a message.
 
 ### 6.6 Gates
 
@@ -2233,11 +2271,77 @@ copy and the focused gate must go RED:
 4. the TOWER call inside the encoder step;
 5. the seam install in `server_main.cpp`.
 
+**RUN.** Each mutation was applied to the tree, built, and the focused gate
+re-run; the tree was restored and re-verified green (7 suites, 4623 assertions,
+0 failed) after the last one.
+
+| Mutation | Gate | Result |
+|---|---|---|
+| 1. delete `forward_input.mm = mm_buffers->mm` | `test_openai_api_server_mm_forward` | **RED** 3/4 cases — `registered forward requires multimodal inputs` |
+| 2. delete `data.mm_features = request.mm_features` | same, and `test_scheduler` | **RED** 3/4 and 1/46 — `the scheduler named multimodal item 0 … which carries 0 items` |
+| 3. delete `execute_mm_encoder(scheduler_output)` | `test_openai_api_server_mm_forward` | **RED** 3/4 — `Encoder cache miss for 209fe433…` |
+| 4a. tower replaced by a correctly SHAPED constant | same | **RED** 1/4 — only the two-different-images case, which is the case that exists for it |
+| 4b. delete the `Qwen3VLVisionForward` call site | same | **RED** 3/4 — `tower produced 0 floats` |
+| 5. delete `chat.set_multimodal_chat_fn` in `server_main.cpp` | — | **NOT RED, and recorded as owed.** The P2 gate installs the seam itself, because a unit test cannot drive `server_main`'s argv path. |
+
+4a is the one worth reading twice. Every other mutation trips a shape or a
+presence check, so a hook that returned a correctly sized constant would satisfy
+all of them — and that is exactly what "the tower ran" would have meant without
+a case comparing TWO DIFFERENT images. That case compares the first generated
+token's LOGPROBS rather than the sampled text, because on a random tiny
+checkpoint the argmax over 17 vocabulary entries does not move for a small
+change in the hidden state while the float logprobs do (measured: -2.7739384 vs
+-2.7739506, same sampled text).
 
 ## Owed
 
 Carried by `ENG-MM-INPUT-PIPELINE`. The first block was filed while landing
-L4 (§1.6); the second while landing L3 (§1.5).
+L4 (§1.6); the second while landing L3 (§1.5); the P2 block below while landing
+§6 (#2379).
+
+### Owed by P2 — the runner multimodal path (#2379)
+
+Each of these is a path P2 made REACHABLE without making it complete. They are
+listed rather than left to be discovered, and each one refuses by name in the
+code instead of producing an answer.
+
+- **Qwen3-VL serves ONE request per step.** `ForwardQwen3VLForConditionalGeneration`
+  returns the last token's logits and does not read `input.logits_indices`, so a
+  batched step cannot be answered; it now refuses with `num_reqs <= 1` rather
+  than letting the sampler index past a one-row tensor. Closing it is a per-row
+  gather inside the VL forward (`VLForwardLastLogitsDBuf`), which moves the
+  numbers the M2c golden was measured on and therefore needs its own gate run.
+  Owned by `ENG-MM-INPUT-PIPELINE`, tracked under #2379.
+- **The merge pays a HOST round-trip.** `EmbedMmQwen3VLForConditionalGeneration`
+  downloads the gathered tower rows, runs `Qwen3VLMergeMultimodal` and
+  `Qwen3VLComputeDeepstack` on the host in f32, and uploads the result. That is
+  exactly the arithmetic the gated M2c driver runs, which is why it was chosen —
+  the registered runner path is numerically identical to the path the golden
+  tokens were measured on. A device-resident merge is a measured change against
+  that golden, not a cleanup. Owned by `ENG-MM-INPUT-PIPELINE`, tracked under
+  #2379.
+- **Only the `image` modality reaches the runner.** `EncodeMmQwen3VL...` refuses
+  `video` and `audio` by name. Qwen3-VL has a video tower and a video driver
+  (§3) but no runner path: the video item's placeholder structure is
+  timestamp-interleaved and needs `Qwen3VLGetRopeIndexVideo`, a different M-RoPE
+  entry point from the one the hook calls. Owned by `ENG-MM-INPUT-PIPELINE`,
+  tracked under #2379.
+- **Gemma-4's `ForwardMm` and Muse Glimmer's are still compile-only, and P2 did
+  NOT change that.** Both consume `ModelForwardInput::mm` and both are exercised
+  only by their own tests, because neither registration declares `encode_mm` /
+  `embed_mm` — so `ModelRegistry::SupportsMmInputs` is false for them and the
+  runner's whole multimodal arm is never entered. Declaring the hooks is the
+  small half; the blocker is that neither model has a chat seam or a processor
+  producing `mm_features` (the only one in the tree is
+  `MakeQwen3VLImageChatFn`, which is Qwen3-VL-shaped), so nothing upstream of
+  the runner would ever build an item for them. Each needs its own brick.
+  Owned by `ENG-MM-INPUT-PIPELINE`, tracked under #2379.
+- **The seam install in `server_main.cpp` has no reachability mutation of its
+  own.** `chat.set_multimodal_chat_fn(...)` is the production install and it
+  landed before P2; the P2 e2e gate installs the same seam itself, because a
+  unit test cannot drive `server_main`'s argv path. Deleting the production line
+  therefore leaves the P2 suite green. Owned by `ENG-MM-INPUT-PIPELINE`, tracked
+  under #2379.
 
 - [#1340](https://github.com/mudler/vllm.cpp/issues/1340) — `VT_FUSE_ATTN_PREAMBLE=0`
   on the MRoPE path silently applies 1-D RoPE instead of refusing. Needs a GPU

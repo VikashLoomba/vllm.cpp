@@ -232,8 +232,7 @@ and the oracle's sequential order differ by ONE ULP on both encodings, so
 asserting bit equality against the oracle's total would have been red on the
 device for a reason that is not a defect.
 
-### A bundle built from one ref has no HEAD, and `git clone` of it checks out
-### nothing -- this cost attempt 1
+### A one-ref bundle has no HEAD, so `git clone` of it checks out nothing
 
 Attempt 1 reached `dgx:gpu0` at 2026-08-31T00:12:03Z as `rc-worker-4b8lj` and
 died 14 seconds later, after the CUDA toolkit had already installed:

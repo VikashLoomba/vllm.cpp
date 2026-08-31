@@ -655,4 +655,58 @@ bool ModelRegistry::IsDenseModel(const LoadedModel& model) {
   return model.registration().factory->is_dense_model;
 }
 
+// ── ENG-MM-INPUT-PIPELINE P2 (#2379) ────────────────────────────────────────
+bool ModelRegistry::SupportsMmInputs(const LoadedModel& model) {
+  const ModelFactory& factory = *model.registration().factory;
+  return factory.encode_mm != nullptr && factory.embed_mm != nullptr;
+}
+
+bool ModelRegistry::UsesMrope(const LoadedModel& model) {
+  return model.registration().factory->mrope_prompt_positions != nullptr;
+}
+
+MmEncoderOutput ModelRegistry::EncodeMm(
+    LoadedModel& model, const HfConfig& config, vt::Queue& queue,
+    const multimodal::MultiModalFeatureSpec& item) {
+  const ModelFactory& factory = *model.registration().factory;
+  // Refuse rather than return an empty tensor. An absent encoder output is
+  // indistinguishable, downstream, from an encoder cache miss the scheduler was
+  // supposed to have made unreachable — and that failure produces fluent wrong
+  // tokens, because the placeholder rows keep whatever the embedding table gave
+  // them. The runner never calls this unless SupportsMmInputs said yes, so
+  // reaching it means the registration changed under a live engine.
+  VT_CHECK(factory.encode_mm != nullptr,
+           std::string("model '") + std::string(model.registration().architecture) +
+               "' was asked to run a multimodal encoder but its ModelFactory "
+               "leaves `encode_mm` null. ENG-MM-INPUT-PIPELINE P2 (#2379).");
+  return factory.encode_mm(model, config, queue, item);
+}
+
+MmForwardBuffers ModelRegistry::EmbedMm(LoadedModel& model,
+                                        const HfConfig& config,
+                                        vt::Queue& queue,
+                                        const MmEmbedInputs& inputs) {
+  const ModelFactory& factory = *model.registration().factory;
+  VT_CHECK(factory.embed_mm != nullptr,
+           std::string("model '") + std::string(model.registration().architecture) +
+               "' was asked to build multimodal forward inputs but its "
+               "ModelFactory leaves `embed_mm` null. "
+               "ENG-MM-INPUT-PIPELINE P2 (#2379).");
+  return factory.embed_mm(model, config, queue, inputs);
+}
+
+MropePromptPositions ModelRegistry::MropePromptPositionsFor(
+    LoadedModel& model, const HfConfig& config,
+    const std::vector<int32_t>& prompt_token_ids,
+    const std::vector<multimodal::MultiModalFeatureSpec>& mm_features) {
+  const ModelFactory& factory = *model.registration().factory;
+  VT_CHECK(factory.mrope_prompt_positions != nullptr,
+           std::string("model '") + std::string(model.registration().architecture) +
+               "' was asked for M-RoPE prompt positions but its ModelFactory "
+               "leaves `mrope_prompt_positions` null. "
+               "ENG-MM-INPUT-PIPELINE P2 (#2379).");
+  return factory.mrope_prompt_positions(model, config, prompt_token_ids,
+                                        mm_features);
+}
+
 }  // namespace vllm

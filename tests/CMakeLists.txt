@@ -2121,6 +2121,14 @@ if(VLLM_CPP_SERVER)
     endif()
   endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # ENG-MM-INPUT-PIPELINE P2 (#2379): the SERVED image request, end to end
+  # through the real ApiServer -> AsyncLLM -> Scheduler -> GPUModelRunner ->
+  # ModelRegistry::Forward chain on a CPU queue. Its own target rather than a
+  # case inside test_openai_api_server, because it needs a different model (a
+  # registry LoadedModel carrying a vision tower) and a different tokenizer
+  # fixture (one whose added tokens are the vision markers).
+  vllm_cpp_add_test(test_openai_api_server_mm_forward
+    vllm/entrypoints/openai/test_api_server_mm_forward.cpp)
   # #1982: WHEN the first chat SSE frame reaches the client. Its own target so
   # the gated-runner fixture cannot perturb the keepalive suite's timings, and
   # inside this guard because it drives the production ApiServer dispatch,

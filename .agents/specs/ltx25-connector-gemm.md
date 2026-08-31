@@ -441,6 +441,44 @@ Three further reasons, each measured rather than asserted:
   is local to that host and is NOT the shared NAS the other two mount, which is
   recorded here because it is not written anywhere else.
 
+  **The first aarch64 run LINK-FAILED, and the job design is why that cost
+  minutes instead of the whole slot.** `rc` job
+  `75800c9e-0b55-406e-9958-ba0048a5a751` reached `thor:gpu0` (`rc-worker-n8smh`,
+  2026-08-31T00:42:22Z) -- **aarch64, 14 cores, `sve2 i8mm bf16 svebf16`, max
+  2601 MHz, 118 GiB free, loadavg 4.84**. It failed at the link:
+
+  ```
+  cpu_quant_repack_arm.cpp:230: undefined reference to
+    vt::cpu::InterleaveQ8_0Rows4(...)
+  LINK FAILED (vt)
+  ```
+
+  The cause is a translation-unit pair this row's hand-picked list split.
+  `cpu_quant_repack_arm.cpp` defines `QuantRepackActive` and CALLS
+  `InterleaveQ8_0Rows4`; `cpu_quant_repack.cpp` defines `InterleaveQ8_0Rows4` and
+  CALLS `QuantRepackActive`. They are mutually complete and `CMakeLists.txt`
+  compiles BOTH unconditionally, on every architecture. The recipe compiled the
+  `_arm` one only on aarch64 and the other one nowhere.
+
+  **The x86 validation had not caught it, and the reason is worth keeping.** The
+  first fix -- adding `cpu_quant_repack.cpp` -- then failed the x86 validation on
+  `QuantRepackActive`, which is what revealed that the pair has to be on both
+  arches rather than that one file was missing. **Each arch caught a different
+  half of the same defect**, so neither validation alone was sufficient and the
+  aarch64 failure was worth its minutes.
+
+  A wide-TU link fallback was written, TRIED, and REMOVED rather than shipped:
+  every non-per-ISA `src/vt/cpu` TU drags in `cpu_quant_gemm.cpp`, which needs
+  `QuantMmlaVecDot` from an ISA-gated file, so the fallback failed its own
+  validation. An untested recovery path is not a recovery path, and shipping one
+  would have put a second failure mode in front of the measurement.
+
+  The corrected recipe (`run.sh` sha256 `242b8c8d...`) builds and runs W1 end to
+  end on x86-64 from the staged tarball. `rc` job
+  `6280a660-dd97-471e-bc7f-ef6b0bc62def` re-queues `thor:gpu0`, and
+  `ea2631f3-aed2-46df-b419-3628078f9882` on `dgx:gpu0` picks the same file up.
+  The failed run's log is left in place as evidence rather than deleted.
+
   **How to read the result when it lands.** Each run writes `tier.txt`,
   `gemm-default.txt`, `gemm-ref.txt`, `gemm-portable.txt`, and -- if the larger
   binary built -- `connector.txt` and `attn.txt`, under
@@ -461,7 +499,7 @@ Three further reasons, each measured rather than asserted:
   the jobs were left to queue and both binaries built, so what is untested in it
   is exactly the aarch64 per-ISA branch, which mirrors `CMakeLists.txt`'s own
   `set_source_files_properties` calls. Staged artifacts: `run.sh` sha256
-  `a6a9f55e...`, `src.tar.gz` sha256 `50d4ff0d...`, the latter a `git archive` of
+  `242b8c8d...`, `src.tar.gz` sha256 `50d4ff0d...`, the latter a `git archive` of
   this row's committed head, so the binary that runs under the lease is built
   from the same probe the branch carries.
 

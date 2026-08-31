@@ -268,4 +268,94 @@ No GPU and no lease. The whole leaf is host arithmetic.
 
 ## Now
 
-`ACTIVE`. W1 is this file. W2 is in the same pull request, after it.
+`DONE`, pending review. W1 is this file and W2 is the commit after it, in the
+same pull request. The attribution is measured, the repair is byte-identical at
+seven worker counts, and the end-to-end GB10 leaf after the change is NOT
+measured and is said so in `## Outcome`.
+
+## Outcome
+
+**Where the leaf goes, at the shipped geometry.** 28 convolutions, 31.46 GMAC
+(62.9 GFLOP), and the eleven distinct shapes, from the instrumented build:
+
+| shape | seconds | GMAC | GMAC/s |
+|---|---:|---:|---:|
+| `ci=512 co=512 out=26x16 k=3` | 7.420 | 9.815 | 1.323 |
+| `ci=128 co=128 out=101x64 k=3` | 4.103 | 4.766 | 1.162 |
+| `ci=256 co=256 out=51x32 k=3` | 3.120 | 4.813 | 1.543 |
+| `ci=512 co=512 out=52x32 k=3` | 3.065 | 3.926 | 1.281 |
+| `ci=256 co=256 out=102x64 k=3` | 2.993 | 3.850 | 1.287 |
+| `ci=256 co=128 out=101x64 k=3` | 1.356 | 1.906 | 1.406 |
+| `ci=512 co=256 out=51x32 k=3` | 1.265 | 1.925 | 1.522 |
+| `ci=256 co=128 out=101x64 k=1` | 0.537 | 0.212 | 0.394 |
+| `ci=512 co=256 out=51x32 k=1` | 0.339 | 0.214 | 0.631 |
+| `ci=128 co=2 out=101x64 k=3` | 0.010 | 0.015 | 1.509 |
+| `ci=8 co=512 out=26x16 k=3` | 0.009 | 0.015 | 1.621 |
+| **`Conv2d` total** | **24.216** | **31.46** | **1.299** |
+| `PixelNorm` | 0.013 | | |
+| `SiLU` | 0.040 | | |
+| **`Ltx2AudioDecoderForward`** | **24.288** | | |
+
+**No shape is an outlier and that is the point.** The rate band is 1.16 to 1.62
+GMAC/s across every 3x3 convolution regardless of channel count or output size,
+which is what a latency-bound dependent accumulator looks like and what a
+bandwidth- or cache-bound loop does not. The two 1x1 `nin_shortcut` convolutions
+are the SLOWEST per MAC, at 0.39 and 0.63, because their reduction chain is 9x
+shorter per output element and the per-element overhead is a larger share -- the
+opposite of what a work-volume explanation predicts.
+
+**The per-element dtype dispatch is NOT the defect here, checked rather than
+assumed.** `LoadF32`, `StoreF32` and `vt::SizeOf` appear **zero** times in
+`ltx2_audio_vae.cpp`: this loop indexes `std::vector<float>` directly. The 219
+call sites `VT-CPU-ELEM-DISPATCH` names are a real and separate lever and none of
+them is on this path.
+
+**Byte identity, measured at the shipped geometry.** The decoder output is
+byte-identical to the pre-change binary's at worker counts **1, 2, 3, 5, 8, 16
+and 20** — seven counts, one `cmp`, no tolerance. Inside the suite, the two new
+cases are green and every pre-existing golden is unmoved.
+
+**Red-first, by mutation on the built tree.** Reverting only `Conv2d` to its
+serial form and rebuilding that one translation unit takes `test_ltx2_vae` from
+**47 cases / 3189 assertions green** to **46/47 with 3188/3189**, the single
+failure being the new dispatch case reading a chunk cursor of **0** against
+**16**. Every golden is green in both arms, so the change repriced nothing. The
+tree was restored and rebuilt to 47/47 afterwards.
+
+**Speed, same-binary A/B on `VLLM_CPP_CPU_THREADS`, interleaved.** Worker count 1
+short-circuits `ParallelForRows` to `body(0, nr)` on the caller
+(`cpu_threadpool.cpp:423-426`), so that arm IS the pre-change serial path byte
+for byte and no second artifact or hash is involved.
+
+| sweep | box loadavg (1 min) | n | 1 worker, median | 20 workers, median | ratio |
+|---|---|---:|---:|---:|---:|
+| A | 40 - 61 | 3 | 41.30 s | 5.46 s | **7.57x** |
+| B | 62 - 90 | 3 | 68.47 s | 11.32 s | **6.05x** |
+| C | 67 - 94 | 5 | 56.99 s | 10.80 s | **5.28x** |
+
+Sweep A also read 4 workers at 11.25 s and 16 at 5.85 s.
+
+**The ratio is a FLOOR, and the data says which way the bias runs.** The measured
+ratio falls monotonically as the foreign load rises across A, B and C. This is a
+shared devbox that carried up to twenty-five foreign compiler processes and
+several concurrent preflights from other sessions throughout, and contention
+inflates the multi-threaded arm relative to the single-threaded one. So a loaded
+box UNDER-states a parallel speedup: 7.57x is the best available lower bound and
+an idle-box figure would be higher. The video half's identical change measured
+~9x at 16 to 20 workers under #1009, also on a box that was not idle.
+
+**No idle-box reading was obtainable and that is recorded rather than worked
+around.** The 1-worker arm's spread reaches 121% in sweep C, which is not a
+quotable figure under `.agents/benchmarking.md`; what carries the claim is the
+mechanism, the byte identity and the monotone direction, not the decimals.
+
+**Every shipped-geometry convolution crosses the dispatch guard**, so none of
+them stays serial by accident: the smallest is `conv_out` at 202 output rows and
+73,728 inner-loop trips per row, against `kMinParallelWork` of 65,536.
+
+**What this row does NOT claim.** The end-to-end GB10 render leaf after the
+change. `scripts/ltx25-render-speed-repeat.sh` asserts the binary's sha256
+against `4b0666ee`'s (its H1), which by design refuses any rebuild, so measuring
+the repaired render needs a lease and a harness change and is a separate piece of
+work. `decode.audio` was 50.745 s of which mel is 47.171 s and the vocoder
+3.823 s; what the leaf reads after this change on that box is **unmeasured**.

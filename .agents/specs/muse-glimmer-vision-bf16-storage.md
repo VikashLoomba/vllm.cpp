@@ -48,7 +48,7 @@ itself, and it is what separates this from a golden that cannot fail.
 
 | Surface | What changes |
 |---|---|
-| `include/vllm/model_executor/models/muse_glimmer_vision.h:97-118` | `MuseGlimmerVisionBlockWeights`, `MuseGlimmerVisionWeights`, `MuseGlimmerVisionAdapterWeights` store raw bf16 bits, except `pos_emb` |
+| `include/vllm/model_executor/models/muse_glimmer_vision.h:95-118` | `MuseGlimmerVisionBlockWeights`, `MuseGlimmerVisionWeights`, `MuseGlimmerVisionAdapterWeights` store raw bf16 bits, except `pos_emb`. The span opens at `:95` because the struct comment there reads "Host-side row-major f32 weights" and the change falsifies it |
 | `include/vllm/model_executor/models/muse_glimmer.h:287` | `MuseGlimmerVisionTower::projection` |
 | `src/vllm/model_executor/models/muse_glimmer_weights.cpp:651-739` | `Bf16TensorToF32` and `MergeQkvF32` stop widening |
 | `src/vllm/model_executor/models/muse_glimmer_vision.cpp:109-123` | `Upload` grows the two-storage shape the parent §4.4 requires |
@@ -142,11 +142,20 @@ values originated bf16" — is TRUE for the loader and FALSE for the fixture:
 
 - **Loader.** `Bf16TensorToF32`
   (`src/vllm/model_executor/models/muse_glimmer_weights.cpp:651-675`) asserts
-  `t.dtype == "BF16"` at `:653-654` and produces `BF16ToF32(bits)`. Every stored
+  `t.dtype == "BF16"` at `:654-655` and produces `BF16ToF32(bits)`. Every stored
   value is the image of a bf16 pattern, so `F32ToBF16` returns that pattern
-  again. Verified EXHAUSTIVELY here rather than argued: applying the
-  `src/vt/dtype.cpp:319-326` formula to all 65,536 finite bf16 patterns via
-  `BF16ToF32` and back gives **0 failures**.
+  again. Verified EXHAUSTIVELY here rather than argued: applying
+  `vt::F32ToBF16` — `src/vt/dtype.cpp:292-299`; `:266-290` is `F32ToF16` and is
+  a DIFFERENT function — to all **65,280 finite** bf16 patterns via
+  `vt::BF16ToF32` and back gives **0 failures**. "Finite" is load-bearing and
+  is not a rounding of 65,536: the 256 patterns with `exp == 0xFF` are inf and
+  NaN, and 126 of them do NOT round-trip, because `:294-296` sets the quiet bit
+  on a NaN. No weight is one, so nothing this row claims depends on them.
+  **Name the function, then the line.** `BF16ToF32` was still in
+  `src/vt/dtype.cpp` when this row opened and is now
+  `include/vt/dtype.h:244`, moved there inline by #2376 while `F32ToBF16`
+  stayed behind and slid 51 lines up its own file. A line number in this pair
+  of files has a short half-life.
 - **Fixture.** `Weights.__init__`
   (`scripts/mm/muse_glimmer_vision_ref.py:278-312`) builds every weight from
   `lcg()` (`:52-61`), which returns `torch.float32` and never rounds through
@@ -196,7 +205,7 @@ tensors it was applied to.
 
 `Upload`'s `kBF16` arm computes `F32ToBF16(stored)`. With bf16 storage it copies
 `stored` directly. Since the loader's stored value is `BF16ToF32(b)` and the
-round trip is exact (§3.1, 0 failures over 65,536 patterns), the device bytes are
+round trip is exact (§3.1, 0 failures over 65,280 finite patterns), the device bytes are
 identical. The earlier wave measured this rather than assuming it: in a tree with
 the store narrowed, the bf16 arm read `rel_l2=5.951e-03 max_abs=3.675e-02`,
 byte-for-byte what it reads today.
@@ -255,10 +264,13 @@ the parent §4.3 keeps the positional table host-f32, and pixels are activations
    close.** The fixture's whole design is that both sides hold identical bits
    without shipping a weight blob. That property is what the storage change
    breaks and what this restores. It is checked and not assumed: applying the
-   `src/vt/dtype.cpp:319-326` integer formula to all **26,192** fixture weight
-   values across 43 tensors and comparing against `torch.Tensor.to(bfloat16)`
-   gives **0 mismatches**. Both are round-to-nearest-even, and they agree here in
-   fact, not only in intent.
+   `vt::F32ToBF16` integer formula (`src/vt/dtype.cpp:292-299`) to all **25,712**
+   fixture weight values across **43** tensors and comparing against
+   `torch.Tensor.to(bfloat16)` gives **0 mismatches**. That population is the
+   bf16-STORAGE set: `pos_emb`'s 512 values are excluded because this section
+   does not round them, so the whole fixture is 44 tensors / 26,224 values, and
+   26,192 was neither figure. Both are round-to-nearest-even, and they agree
+   here in fact, not only in intent.
 3. **The f32 arm therefore returns to its residual by construction.** With
    identical weight values on both sides and f32 arithmetic on both sides, the
    only remaining difference is accumulation order — exactly today's ~1e-7. The
@@ -359,7 +371,11 @@ So the declared numbers follow:
 | `pos_emb`, kept f32 | 3,145,728 B on disk, 6,291,456 B resident | 0.0818% of the tower |
 
 The `pos_emb` exception costs 3,145,728 B of the saving, which is 0.08% of the
-tower and 0.09% of the floor's headroom. It does not endanger the threshold.
+tower and 0.09% of the floor. Of the floor's HEADROOM — the
+`3,843,691,520 - 3,459,322,368 = 384,369,152 B` that the 90% leaves, or the
+381,223,424 B remaining once `pos_emb` is paid for — it is 0.83%. Neither
+reading endangers the threshold, but they are not the same quantity and the
+sentence previously named the wrong one.
 
 ## 6. Gates — declared before any number exists
 
@@ -382,7 +398,8 @@ at all.
 
 Instrument: `scripts/mm/tower_skip_rss.sh --model-kind muse-glimmer`, reading the
 per-leg `peak RSS default` / `peak RSS lang-model-only` keys. Muse Glimmer's
-workload is `completion`, not `load-only` (`tower_skip_rss.sh:429-461`).
+workload is `completion`, not `load-only` (`tower_skip_rss.sh:431`, in
+`declare_model`'s `muse-glimmer` arm at `:428-432`).
 
 An outcome below either half is a FAILING axis, recorded as failing and left
 open. The parent's §6.1 deviation is instructive and must not be repeated: run
@@ -432,7 +449,7 @@ at all.
   CORRECT, not a loosening: the golden and the implementation now agree about the
   weights, so the residual is the activation envelope alone.
 
-**D. The routing assertion is untouched.** `:406`'s
+**D. The routing assertion is untouched.** `:397`'s
 `flash_after - flash_before == 12` is derived from the fixture geometry, not
 from weight values, and must not move.
 
@@ -471,8 +488,19 @@ from weight values, and must not move.
   fails for the intended reason, and it is what proves the golden is load-bearing
   rather than decorative.
 - **Mutation 1 — a second rounding function.** Replace the narrowing with
-  truncation (`u >> 16`, dropping the round-to-nearest-even addend at
-  `src/vt/dtype.cpp:323`) in a scratch copy. The f32 arm must red. This is the
+  truncation (`u >> 16`, dropping the round-to-nearest-even addend
+  `uint32_t rounding = 0x7FFF + ((u >> 16) & 1);`) in a scratch copy.
+  **Mutate `vt::F32ToBF16`, not `vt::F32ToF16`.** At this row's merge base the
+  addend is `src/vt/dtype.cpp:297`, inside `F32ToBF16` at `:292-299`, and
+  `:266-290` is the fp16 converter whose own `:274` reads
+  `if (exp >= 0x1F) return ... // overflow -> inf` and is not an addend at all.
+  Edited there the mutation never reaches bf16, `F32ToBF16` survives untouched,
+  the f32 arm stays GREEN, and a green run then reads as a weak gate rather
+  than as a mutation that never applied — which is the failure this line is
+  worded to prevent. **Grep for the function before you edit a line number**:
+  #2376 moved `SizeOf`, `F16ToF32` and `BF16ToF32` out of this file into
+  `include/vt/dtype.h` and slid `F32ToBF16` 51 lines up it, so these numbers
+  are true at the merge base and nowhere else by right. The f32 arm must red. This is the
   parent §5 risk 1 in this row's context, and here it is sharp: with the fixture
   rounded on both sides, the two sides agree only if both use RNE.
 - **Mutation 2 — the golden is not merely current.** Regenerate the golden from
@@ -484,7 +512,8 @@ from weight values, and must not move.
   argument is wrong.
 - **Mutation 3 — reachability.** Delete the `LoadVisionTower` call at
   `muse_glimmer_weights.cpp:806` in a scratch copy. `test_muse_glimmer_wiring`'s
-  `REQUIRE(w.vision.loaded)` (`:436`) and `test_tower_skip` must red, and the
+  `REQUIRE(w.vision.loaded)` (`:495`; `:436` is an unrelated
+  `CHECK_MESSAGE(it->second.dtype == "BF16", ...)`) and `test_tower_skip` must red, and the
   §6.1 measurement must have nothing left to measure.
 
 Restore the tree byte-for-byte after each, and verify with `sha256sum -c`.
@@ -513,30 +542,53 @@ They move in ONE change, or `test_tower_skip_rss_report` is red.
 
 **Load-bearing — a gate fails otherwise:**
 
-- `scripts/mm/tower_skip_rss.sh:429-461` — the `muse-glimmer` case of
-  `TOWER_RESIDENT_BYTES`, which becomes `TOWER_ONDISK_BYTES`, and the
-  `TOWER_RESIDENT_NOTE` that travels with it. `MUSE_GLIMMER_TOWER_ONDISK_BYTES`
-  at `:215` does NOT change — the checkpoint's bytes are unchanged. The file's
-  header comment at `:20-22` still says "7.161 GiB resident" and moves too, as
-  does `:69`, which names #2166 as the block.
-- `tests/scripts/test_tower_skip_rss_report.py:120` — `WIDEN["muse-glimmer"]`
-  becomes `1`, and the docstring at `:348` naming `need("muse-glimmer") ==
-  6918644736` moves to `3459322368`.
+- `scripts/mm/tower_skip_rss.sh:474` — `TOWER_RESIDENT_BYTES=$((TOWER_ONDISK_BYTES * 2))`,
+  in the SECOND `case`, which becomes `TOWER_ONDISK_BYTES`, and the
+  `TOWER_RESIDENT_NOTE` at `:475` that travels with it. This is the line the row
+  exists to delete. It is NOT at `:429-431`, which is `declare_model`'s
+  `muse-glimmer` arm and carries no `x 2`; the comment explaining the `x 2` at
+  `:449-455` moves with the code. `MUSE_GLIMMER_TOWER_ONDISK_BYTES` at `:215`
+  does NOT change — the checkpoint's bytes are unchanged. The file's header
+  comment at `:19-22` still says "7.161 GiB resident" and moves too, as does
+  `:66-70`, which names #2166 as the block.
+- `tests/scripts/test_tower_skip_rss_report.py:129` — `WIDEN["muse-glimmer"]`
+  becomes `1`. The comment at `:125-128` explaining why it is still `2`, the
+  module docstring's "Muse Glimmer's 7.161 GiB" at `:21`, and the docstring at
+  `:348` naming `need("muse-glimmer") == 6918644736` (which moves to
+  `3459322368`) travel with it.
 - `.agents/specs/multimodal-track.md:889-900` — the half-1 DECLARATION.
   `test_spec_carries_the_threshold_the_instrument_applies` (`:527`) asserts
   `3459322368` appears within 240 characters of that kind's half-1 marker. This
-  reds until it does. `:875-886` and `:908`, `:1055`, `:1141`, `:2021`,
-  `:2083-2087` carry the 7.161 GiB prose.
+  reds until it does. `:875-886` and `:908`, `:991-993`, `:1055`, `:1141`,
+  `:2126`, `:2188`, `:2192` carry the 7.161 GiB prose or the "still widens"
+  claim. Not `:2021` / `:2083-2087`, which carry neither.
 
 **Prose that would otherwise read the halving as a loss:**
 
 - `.agents/specs/vision-tower-dtype-polarity.md` — §4.4 (its `kF32` ruling gains
   this row's refutation for the fixture), §6.2's `muse-glimmer` row moves from
-  prediction to measurement, `## Now` and `## Owed`.
-- `.agents/benchmark-record.md:28748`, `:29258`, `:29273`
-- `docs/benchmarks/memory.md:16` and `docs/benchmarks/open-gaps.md:79` — both
-  say `muse-glimmer-30b` "still widens, blocked on #2166"
-- `docs/guides/multimodal-input.md:185` and `:201`
+  prediction to measurement, `## Now` and `## Owed`. Named lines: `:325`, the
+  `muse-glimmer` row of the resident table stating `7,687,383,040 B
+  (7.1594 GiB)`; `:285` and `:538`, which both state `6918644736` as that kind's
+  half-1 threshold and move to `3459322368`; and `:507-508`, "NOT in the landed
+  slice". **Read that spec's own stale-surface list as a warning, not as a
+  source.** Its `:530-533` cite `tower_skip_rss.sh:429-431` and
+  `test_tower_skip_rss_report.py:113-120` for surfaces that now live at `:474`
+  and `:129`. Those are pre-#1359 anchors. Inheriting them instead of re-reading
+  the files is how a spec ships an edit instruction that lands on the wrong line.
+- `.agents/benchmark-record.md:28732-28733` ("still widens, blocked on #2166"),
+  `:28748`, `:29258`, `:29273`
+- `docs/benchmarks/memory.md:16` and `:17`, and `docs/benchmarks/open-gaps.md:79`
+  — all say `muse-glimmer-30b` "still widens, blocked on #2166", or list #2166
+  as owed
+- `docs/guides/multimodal-input.md:180-186`, including the DERIVED `9.3x` at
+  `:184`. That ratio exists only because Muse Glimmer widens while Qwen3-VL no
+  longer does; once both store bf16 it is the on-disk `4.6x` again, and a
+  recomputed number is easy to miss beside a copied one. Also `:200-201`.
+- `include/vllm/model_executor/models/muse_glimmer_vision.h:95-96` — "Host-side
+  row-major f32 weights". It sits one line above the struct, which is why §1's
+  span was widened from `:97-118` to `:95-118` rather than left to a reader to
+  notice.
 - `.agents/engine-matrix.md` — the `ENG-MM-INPUT-PIPELINE` RSS paragraph
 - Per AGENTS.md §"Public documents", a lifecycle change owes the moved row spec's
   `## Now`. `docs/BENCHMARKS.md` changes only when a public benchmark ID is
@@ -582,10 +634,12 @@ GPU lease was taken, no fleet box was contacted, and no `gh` call was made.**
 - Checkpoint headers read from `/mnt/nas_share/checkpoints/muse-glimmer-30b`,
   header-only, no payload. 1436 tensors, all BF16; 809 vision tensors totalling
   3,843,691,520 B. Independently reproduced from the config dimensions. §5.
-- `F32ToBF16(BF16ToF32(b)) == b` over all 65,536 finite bf16 patterns: 0
-  failures. §3.1.
-- `vt::F32ToBF16` against `torch.Tensor.to(bfloat16)` over all 26,192 fixture
-  weight values in 43 tensors: 0 mismatches. §4.2.
+- `F32ToBF16(BF16ToF32(b)) == b` over all **65,280 finite** bf16 patterns: 0
+  failures. Not 65,536 — 126 of the 256 non-finite patterns do not round-trip.
+  §3.1.
+- `vt::F32ToBF16` against `torch.Tensor.to(bfloat16)` over all **25,712**
+  fixture weight values in **43** tensors — the bf16-storage set, `pos_emb`
+  excluded: 0 mismatches. §4.2.
 - The committed generator re-run twice on `torch 2.11.0+cu130`, CPU, single
   thread, producing the five stage figures in §3.2 — which match the earlier
   wave's C++ measurement to every recorded digit — the `pos_emb` zero control,

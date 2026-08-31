@@ -222,15 +222,16 @@ reason is in `## Outcome`.
 ### The headline, stated before the evidence because it overturns a landed record
 
 **`conditioning.connector.compute` is not dominated by the GEMM.** Two
-independent instruments, sharing no code, put `vt::AttentionCross` at 54% to 66%
-of `Ltx2ConnectorForward` and the specialized GEMM micro-kernels at 29% to 31%.
-The connector's attention performs **4.2% of the layer's arithmetic and takes
-66% of its time.**
+independent instruments, sharing no code, put `vt::AttentionCross` at **54% to
+61%** of `Ltx2ConnectorForward` against the specialized GEMM micro-kernels at
+**27% to 31%**, on an idle box and under load alike. The connector's attention
+performs **4.2% of the layer's arithmetic and takes 58% of its time** -- it costs
+**2.3x the GEMM**.
 
 **So #2354's 37 GFLOP/s is not the GEMM's rate.** That number is
 `leaf_seconds / gemm_flops`, which is the GEMM's rate only if the leaf is the
-GEMM. On the machine measured here the same construction reads **50.7 GFLOP/s**
-for a video layer while the GEMM inside it runs at **153.3 GFLOP/s**. The
+GEMM. On an idle devbox the same construction reads **62.8 GFLOP/s** for a video
+layer while the GEMM inside it runs at **209.6 GFLOP/s**, a 3.3x gap. The
 agreement between #2354's predicted 34 GFLOP/s and its measured 37 was real and
 was a coincidence of construction: both sides divided the whole leaf by the
 GEMM's flops, so both were bound to agree whatever else was in the leaf.
@@ -322,15 +323,18 @@ sentence needs a scope qualifier or a correction is still queued.
 | `vt::AttentionCross` at that layer's shape | 5.361 s (3.07%) | 2.966 s (7.69%) | **66.62 s** |
 | the layer's six GEMMs | — | — | **26.92 s** |
 
-**66.62 + 26.92 = 93.54 against 91.98 measured, which closes to 1.7%.** That is
-what makes this a decomposition rather than a set of intervals: there is no third
-term of any size, and the two named terms are the whole leaf.
+**66.62 + 26.92 = 93.54 against 91.98 measured.** These were taken under
+contention, and the idle replicate below **supersedes them**: on an idle box the
+two named legs are 61.3% and 26.6% and there IS a third term, 12.1%, which is the
+per-layer `RmsNormRows`, RoPE, gelu and residual-stream copies. The contended
+pair is left standing as it was measured rather than edited away, because the
+direction of its error is itself a finding and the idle section states it.
 
-**The efficiency gap is the finding.** One video layer's attention is
-1.718e10 FLOP against the layer's 4.123e11 of GEMM -- **4.2% of the
-arithmetic** -- and it takes **65.9% of the layer**. Measured rates: the GEMM at
-**153.3 GFLOP/s**, the attention at **3.2 GFLOP/s**. A 48x gap between two
-kernels in the same loop.
+**The efficiency gap is the finding, and it survives at both load levels.** One
+video layer's attention is 1.718e10 FLOP against the layer's 4.123e11 of GEMM --
+**4.2% of the arithmetic** -- and it takes **58.3% of the layer idle, 65.9%
+loaded**. Measured rates idle: the GEMM at **209.6 GFLOP/s**, the attention at
+**4.5 GFLOP/s**. A 47x gap between two kernels in the same loop.
 
 **One lever that looks obvious is closed by measurement rather than by argument.**
 After `Ltx2ConnectorReplaceRegisters` the additive mask is ALL ZEROS, so a reader
@@ -349,6 +353,58 @@ video kernel at 5.361 s and 4.828 s, and the audio kernel at 2.966 s and 2.294 s
 The SHARE this row rests on -- attention against the whole layer -- is taken from
 figures measured in the same session, and the hoisted-vs-shipped comparison is
 taken inside a single process, which is why neither depends on that drift.
+
+### The IDLE replicate, which supersedes the numbers above and corrects one of them
+
+Every figure in W2 and W3 was taken with other agents compiling on the same 20
+cores. At 00:54Z the box reached **loadavg 1.24** for the first time in this
+session, and the whole set was retaken there. **These are the primary numbers.**
+
+| | idle | at loadavg ~20 | at loadavg ~45 |
+|---|---:|---:|---:|
+| connector GEMM set, `MatmulChunked<true>` | **19.688 s / 209.6 GFLOP/s** | 26.924 s / 153.3 | 45.027 s / 91.6 |
+| the same over a `[K,N]` repack | 35.041 s / 117.8 | 55.435 s / 74.4 | 88.066 s / 46.9 |
+| **`kn/bt`** | **1.78x** | 2.06x | 1.96x |
+| `Ltx2ConnectorForward`, video layer | **6.567 s** (spread 2.82%) | 8.132 s (12.04%) | 12.874 s (4.48%) |
+| `vt::AttentionCross`, video shape | **3.831 s** (6.16%) | 5.361 s (3.07%) | 7.350 s (12.41%) |
+
+**The repack regression is the most robust thing this row measured.** `kn/bt`
+reads 1.78x, 1.96x and 2.06x across three independent load regimes, every shape
+byte-identical every time. Whatever else contention did, it did not manufacture
+this.
+
+**The idle decomposition of one `RunConnector` call** (8 layers, both streams):
+
+| | seconds | share |
+|---|---:|---:|
+| `Ltx2ConnectorForward` total | **74.11** | 100% |
+| ~ `vt::AttentionCross` | **45.42** | **61.3%** |
+| ~ the GEMMs | **19.69** | **26.6%** |
+| ~ everything else | 9.00 | 12.1% |
+
+**This CORRECTS the 1.7% closure claimed earlier in this section, and the
+direction of the error is instructive.** Under contention the two legs that
+matter -- attention and GEMM -- are both 20-thread work, while the residue
+(`RmsNormRows` with its f64 accumulator, `Ltx2ApplyRotaryEmb`, the gelu, and
+three full `std::vector<float>` copies of the 16 MB residual stream per layer) is
+largely SINGLE-threaded and therefore inflates far less. So contention
+overstated the two measured legs relative to the residue and made the sum look
+tighter than it is. On an idle box the residue is **12.1%**, not 1.7%, and it is
+real work rather than measurement slack.
+
+**Every conclusion of this row survives the correction, and one number moves.**
+Attention is still **2.3x the GEMM's cost** and still the largest term. The GEMM
+still runs at **209.6 GFLOP/s** against the leaf's implied 62.8, so
+`leaf_seconds / gemm_flops` is still not the GEMM's rate -- the gap is 3.3x on an
+idle box rather than 3.0x on a loaded one. What moves is the hoisted-reference
+margin: on an idle box one thread costs **3.174 s** against the shipped kernel's
+**3.831 s** on twenty, a **1.21x** lead rather than the 1.42x measured under
+load, because the shipped 20-thread kernel gains more from an idle box than a
+single-threaded reference can. The claim "one thread beats twenty" holds; the
+margin is smaller and the smaller number is the one to quote.
+
+The unbiased-attention control also survives: 0.96x video, 1.15x audio, still
+inside the arms' own spread and still no lever.
 
 ### Why the attention kernel is 48x off, and what the repair is
 

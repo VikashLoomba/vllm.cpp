@@ -221,33 +221,44 @@ Stop and report, do not work around:
 
 ## Now
 
-`ACTIVE`. W1 is taken on x86-64 and on `thor:gpu0` (aarch64) under a lease. W2
-is landed and gated. The GB10 half of W1 is queued and is named in `## Owed`.
+`DONE`. W1 is taken on x86-64 and on both `dgx:gpu0` (GB10) and `thor:gpu0`
+under leases. W2 is landed, gated on both architectures, and its aarch64 arm is
+measured and refused. W3 is the A/B below. What is owed is the end-to-end render
+and the GEMM campaign this row deliberately does not open.
 
 ## Outcome
 
 ### The headline, and it is the one the parent row was owed
 
 **The attention hoist already took most of the 224.9 s, and the connector leaf
-is now a GEMM.** Measured with the same probe, at the same shapes, on
-`thor:gpu0` under an `rc` lease -- an aarch64 host with nothing else on it --
-one `RunConnector` call went from `LTX25-CONNECTOR-GEMM`'s **84.608 s** to
-**40.14 s**, a **2.11x**, and its composition inverted:
+is now a GEMM.** Measured with the same probe, at the same shapes, **on GB10
+itself -- the machine the render's 516.751 s was measured on** -- under an `rc`
+lease on an otherwise idle box, one `RunConnector` call went from
+`LTX25-CONNECTOR-GEMM`'s **128.808 s** to **50.34 s**, a **2.56x**, and its
+composition inverted:
 
-| | before (`LTX25-CONNECTOR-GEMM`, same host, same probe) | now |
+| GB10, 8 layers x 2 streams | before (`LTX25-CONNECTOR-GEMM`, same host, same probe) | now |
 |---|---:|---:|
-| `Ltx2ConnectorForward`, 8 layers x 2 streams | **84.608 s** | **40.14 s** |
-| ~ `vt::AttentionCross` | 48.200 s (**57.0%**) | **5.51 s (13.7%)** |
-| ~ the GEMMs | 29.337 s (34.7%) | 29.98 s (**74.7%**) |
-| ~ everything else | 7.07 s (8.4%) | 4.65 s (11.6%) |
+| `Ltx2ConnectorForward` | **128.808 s** | **50.34 s** |
+| ~ `vt::AttentionCross` | 85.704 s (**66.5%**) | **8.47 s (16.8%)** |
+| ~ the GEMMs | 31.906 s (24.8%) | 32.86 s (**65.3%**) |
+| ~ everything else | 11.198 s (8.7%) | 9.01 s (17.9%) |
 
-**`vt::AttentionCross` at the connector's own shape is 8.75x smaller and the
-GEMM did not move**, which is the shape a repair to one leg and not the other
-has to have. The probe's own hoisted reference, which was worth 8.86x / 9.36x
-on this host before the hoist, is now worth **1.06x / 1.02x on x86-64**: the
-instrument that found the defect finds no defect. That is the control this row
-wanted and it is why the 2.11x is attributed to the hoist rather than to the
-box.
+**`vt::AttentionCross` is 10.12x smaller and the GEMM did not move** -- 31.906 s
+to 32.86 s, inside the 6.6% same-arm spread -- which is the shape a repair to
+one leg and not the other has to have. And it lands on the number the
+predecessor row predicted before the repair existed: `LTX25-CONNECTOR-GEMM`
+projected "128.808 s -> **50.520 s**, a **2.55x**". Measured: **50.34 s,
+2.56x**, within 0.4%. A prediction recorded in advance and then met is worth
+more than either number alone.
+
+**`thor:gpu0` agrees, on a different aarch64 part.** 84.608 s -> **40.14 s**
+(2.11x), attention 48.200 -> **5.51 s** (8.75x), GEMM 29.337 -> 29.98 s
+(unchanged), residue 11.6%. Two hosts, same direction, same mechanism.
+
+On x86-64 the same control holds from the other side: the probe's own hoisted
+reference, worth 13.30x / 9.58x there before the hoist, is now worth **1.06x /
+1.02x**. The instrument that found the defect finds no defect.
 
 **So `.agents/specs/ltx25-render-speed-parity.md`'s first `## Owed` line --
 "The repair is not here" -- is answered, and it was answered by
@@ -255,39 +266,52 @@ box.
 measurement that says so, and one further repair on the leg that is left.
 
 **Projected onto the render, and it is a PROJECTION.** #2354 measured connector
-compute at **224.882 s in a 516.751 s render**. At thor's 2.11x that leaf falls
-to about **107 s**, the render to about **399 s**, and the oracle gap from
-**5.51x to about 4.3x**. GB10's own pre-hoist split (attention 66.5%) predicts a
-larger ratio there, near 2.55x, which is `LTX25-CONNECTOR-GEMM`'s own
-projection. **No render was run.** The probe's connector total is not the
-render's leaf -- synthetic weights, a different valid-token count, and the two
-streams timed in one process -- so the RATIO transfers and the seconds do not.
-The end-to-end re-measurement is under `## Owed` with the reason it is not here.
+compute at **224.882 s in a 516.751 s render**. At GB10's measured 2.56x that
+leaf falls to **87.9 s**, the render to about **380 s**, and the oracle gap from
+**5.51x to about 4.05x**. **No render was run.** The probe's connector total is
+not the render's leaf -- synthetic weights, a different valid-token count, and
+the two streams timed in one process -- so the RATIO transfers and the seconds
+do not. The end-to-end re-measurement is under `## Owed` with the reason it is
+not here.
 
 ### W1 — the leaf, re-measured, and the load it was measured at
 
-**`thor:gpu0`, `rc` job `76d149ba-a737-4940-b3f2-b13f623e7512`, worker
-`rc-worker-n8smh`, 2026-08-31T22:10:42Z, aarch64, 14 cores, 118 GiB
-`MemAvailable`, loadavg 5.5 at the first leg** (the probe itself runs 14
-threads, so most of that is the measurement). `tier_name=neon`,
-`elem_gemm_use_ref=0`, `mr=4`; forced to `ref` the same resolver prints
-`tier_name=ref`, so it was read rather than printed from a constant. The
-portable tier runs the same GEMM set at **50.6 GFLOP/s** against neon's
-**137.6**, so the tier that runs is 2.7x the portable one and is not the
-reference tile.
+**Two leases, and the primary one is GB10.** `rc` job
+`a719dc37-580b-4c59-8bd4-0601f17d343f` on `dgx:gpu0`, worker `rc-worker-4b8lj`,
+2026-08-31T22:43:00Z, **aarch64, 20 cores, 120.6 GiB `MemAvailable`, loadavg
+2.12 at the first leg** -- the probe itself runs 20 threads, so almost all of
+the load it ends at is the measurement. The second is `thor:gpu0`, job
+`76d149ba-a737-4940-b3f2-b13f623e7512`, worker `rc-worker-n8smh`,
+2026-08-31T22:10:42Z, 14 cores, loadavg 5.5 at its first leg.
 
-Per-leg, `n = 6` for arm A (three rounds, each with a same-arm control leg):
+`tier_name=neon`, `elem_gemm_use_ref=0`, `mr=4` on both; forced to `ref` the
+same resolver prints `tier_name=ref`, so it was read rather than printed from a
+constant. The portable tier runs the same GEMM set on thor at **50.6 GFLOP/s**
+against neon's **137.6**, so the tier that runs is 2.7x the portable one and is
+not the reference tile.
+
+**GB10, per leg, `n = 6` for arm A** (three rounds, each carrying a same-arm
+control leg):
 
 | | median | spread | legs |
 |---|---:|---:|---|
-| `Ltx2ConnectorForward`, one video layer | **3.909 s** | 5.9% | 4.056 3.898 3.919 3.824 3.950 3.843 |
-| `Ltx2ConnectorForward`, one audio layer | **1.110 s** | 11.8% | 1.105 1.118 1.233 1.104 1.114 1.102 |
-| `vt::AttentionCross`, video shape | **0.443 s** | 22.3% | 0.440 0.438 0.443 0.443 0.537 0.532 |
-| `vt::AttentionCross`, audio shape | **0.245 s** | 17.5% | 0.281 0.238 0.244 0.244 0.247 0.268 |
-| the connector's whole GEMM set | **29.956 s** | 2.3% | 29.637 29.902 29.930 29.982 29.984 30.323 |
+| `Ltx2ConnectorForward`, one video layer | **4.854 s** | 8.4% | 5.189 4.872 4.782 4.814 4.836 4.978 |
+| `Ltx2ConnectorForward`, one audio layer | **1.439 s** | 9.2% | 1.419 1.411 1.524 1.477 1.459 1.392 |
+| `vt::AttentionCross`, video shape | **0.704 s** | 9.7% | 0.693 0.704 0.690 0.758 0.709 0.704 |
+| `vt::AttentionCross`, audio shape | **0.354 s** | 5.9% | 0.353 0.355 0.368 0.371 0.350 0.354 |
+| the connector's whole GEMM set | **32.863 s** | 6.6% | 32.906 33.009 34.699 32.514 32.820 32.691 |
 
-The GEMM row is the quietest at 2.3%, and it is the row this row's remaining
-attribution rests on. (A seventh GEMM figure, 81.545 s, is the FORCED-PORTABLE
+**thor, per leg, `n = 6` for arm A:**
+
+| | median | spread | legs |
+|---|---:|---:|---|
+| video layer | **3.909 s** | 5.9% | 4.056 3.898 3.919 3.824 3.950 3.843 |
+| audio layer | **1.110 s** | 11.8% | 1.105 1.118 1.233 1.104 1.114 1.102 |
+| `vt::AttentionCross`, video | **0.443 s** | 22.3% | 0.440 0.438 0.443 0.443 0.537 0.532 |
+| `vt::AttentionCross`, audio | **0.245 s** | 17.5% | 0.281 0.238 0.244 0.244 0.247 0.268 |
+| the whole GEMM set | **29.956 s** | 2.3% | 29.637 29.902 29.930 29.982 29.984 30.323 |
+
+(One further GEMM figure per host -- 81.545 s on thor -- is the FORCED-PORTABLE
 leg and is excluded from that median rather than averaged into it.)
 
 **On x86-64 the same re-measurement gives the same shape.** Devbox, 20 cores,
@@ -351,12 +375,19 @@ the same change at loadavg 14 to 29: ten pairs, **median 1.331x**, one outlier
 at 0.872 at that run's highest external load, same-arm control median 1.032 and
 range 0.896 to 1.203. Two runs, two binaries, two load regimes, 1.30x and 1.33x.
 
-**On aarch64 the same lever is REFUTED, and it is not landed.** The arm that
-raises `kMrNeon` from 4 to 6 (with the same padding, which on NEON fires because
-`16 % 6 = 4`) reads **31.252 / 31.442 / 31.229 s** against arm A's
-**29.637 to 30.323 s** -- **1.043x SLOWER**, outside arm A's own 2.3% spread --
-and the connector layer is unchanged at 3.978 s against 3.909 s. `kMrNeon`
-therefore stays 4. **The x86 figure is not carried across**, which is the
+**On aarch64 the same lever is REFUTED ON BOTH HOSTS, and it is not landed.**
+The arm that raises `kMrNeon` from 4 to 6 (with the same padding, which on NEON
+fires because `16 % 6 = 4`) is **slower on thor and no better on GB10**:
+
+| host | arm A GEMM set | arm C GEMM set | C/A | arm A's own spread |
+|---|---:|---:|---:|---:|
+| thor | 29.637-30.323, median **29.956** | 31.229 31.442 31.252, median **31.252** | **1.043** | 2.3% |
+| GB10 | 32.514-34.699, median **32.863** | 33.063 33.483 33.894, median **33.483** | **1.019** | 6.6% |
+
+On thor it is outside arm A's own spread and on GB10 it is inside it, so the
+honest reading is a small regression on one host and nothing on the other. The
+connector layer moves with it on neither: 3.978 s against 3.909 s on thor,
+4.861 s against 4.854 s on GB10. `kMrNeon` therefore stays 4. **The x86 figure is not carried across**, which is the
 failure `LTX25-CONNECTOR-GEMM`'s own `### RETRACTION` section paid for one row
 ago: its "one thread beats twenty" held on AVX-512 and was false on both aarch64
 hosts.
@@ -387,11 +418,14 @@ produces, and that is what the byte-equality gate exercises there.
 
 ### The correctness evidence
 
-**Byte equality is the whole gate.** `tests/vt/test_ops_matmul_elem_mblock.cpp`:
-**3 cases / 1,802 assertions / 0 failed**, and the SAME counts on a pristine
-`main` tree, which is what says the reference is a valid oracle rather than a
-transcription of the new code. `tests/vt/test_ops_matmul_elem.cpp` is unchanged
-and green on both trees.
+**Byte equality is the whole gate, and it is proven on BOTH architectures.**
+`tests/vt/test_ops_matmul_elem_mblock.cpp`: **3 cases / 1,802 assertions / 0
+failed** on x86-64, and the SAME counts on a pristine `main` tree, which is what
+says the reference is a valid oracle rather than a transcription of the new
+code. **The same binary built from this branch's own head inside the GB10 lease
+reads 3 / 1,802 / 0 as well, `test_mblock_exit=0`** -- an aarch64 pass is not an
+x86 pass and this row did not assume one.
+`tests/vt/test_ops_matmul_elem.cpp` is unchanged and green on both trees.
 
 **A mutation per claimed guarantee, each proved to have applied and built before
 its result was read.** The harness refuses an unapplied edit and a failed build
@@ -438,23 +472,14 @@ have.
 
 One request, one geometry, one probe. **No render was run**, so the render-level
 figure above is a projection and is labelled as one. Every x86 number is one
-shared devbox at a stated load. The GB10 half of the leaf split is queued and is
-owed. And the GEMM that is left is **not at a ceiling**: it runs at 137.6
+shared devbox at a stated load, while both aarch64 hosts were leased and idle.
+And the GEMM that is left is **not at a ceiling**: it runs at 137.6
 GFLOP/s on 14 Arm cores and 172 to 236 GFLOP/s on 20 AVX-512 ones, against a
 mul-then-add roofline several times higher, so what follows is a named
 hypothesis and not a limit.
 
 ## Owed
 
-- **The GB10 leaf split.** `rc` job `a719dc37-580b-4c59-8bd4-0601f17d343f` is
-  queued on `dgx:gpu0` behind another agent's job and had not started when this
-  row was written. GB10 is the machine `LTX25-RENDER-SPEED-PARITY` measured the
-  render on and the machine whose pre-hoist split read attention 66.5%, so its
-  post-hoist split is the number that converts this row's 2.11x into a render
-  prediction. thor agrees with GB10 on every qualitative point measured so far
-  and disagreed with x86 on the one that inverted, which is why thor is quoted
-  here and GB10 is still owed rather than assumed. The same job also runs the
-  byte-equality gate on the landed tree on aarch64. Owner: this row.
 - **THE END-TO-END RENDER IS NOT RE-MEASURED, and the harness is why.**
   `scripts/ltx25-render-speed-repeat.sh` asserts the binary's sha256 against
   `4b0666ee`'s and exits 51 otherwise. That is correct for what it measures -- a
@@ -463,9 +488,9 @@ hypothesis and not a limit.
   a correctness verdict. That is a row of its own and it is the one that can
   close `ltx25-render-speed-parity.md`'s owed line with a wall rather than a
   projection. Owner: unowned; this row files it here.
-- **THE REMAINING GEMM IS THE LEAF, at 74.7%, and the contained lever does not
-  reach it.** After this change the connector's cost on aarch64 is
-  `vt::MatmulBT` at 137.6 GFLOP/s, and the M-blocking lever is refuted there.
+- **THE REMAINING GEMM IS THE LEAF, at 65.3% on GB10 and 74.7% on thor, and the
+  contained lever does not reach it.** After this change the connector's cost on
+  aarch64 is `vt::MatmulBT` at 125.5 GFLOP/s on GB10 and 137.6 on thor, and the M-blocking lever is refuted there.
   The next traceable hypothesis is the one
   `.agents/specs/cpu-elem-gemm-wide-isa-and-tiling.md` already carries as a
   SPIKE with no active row: `KERNEL-GEMM-CPU-TILED`, a K-blocked macro-kernel

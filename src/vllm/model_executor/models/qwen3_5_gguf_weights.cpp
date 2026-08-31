@@ -4,6 +4,7 @@
 // INVERTS to recover raw-HF weights are in conversion/qwen.py.
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -50,12 +51,23 @@ inline void PrefaultBorrowedSpan(const uint8_t* src, size_t bytes) {
   // byte-transparent") was silently vacuous, because its second `setenv` could not
   // change an already-latched value and both of its arms ran identically.
   if (!ResolveGgufPrefault() || bytes == 0) return;
+  // LOAD-IO: timed, because this loop IS the load's file I/O. Every weight page
+  // of a keep-quant GGUF arrives here and nowhere else, so its elapsed time
+  // separates "the artifact was still arriving" from "we were computing", which
+  // a single weights-phase number cannot.
+  const auto t_pf = std::chrono::steady_clock::now();
   (void)::madvise(const_cast<uint8_t*>(src), bytes, MADV_WILLNEED);
   const long ps_l = ::sysconf(_SC_PAGESIZE);
   const size_t ps = static_cast<size_t>(ps_l > 0 ? ps_l : 4096);
   volatile uint8_t sink = 0;
   for (size_t off = 0; off < bytes; off += ps) sink = sink ^ src[off];
   (void)sink;
+  NoteGgufPrefaultedBytes(
+      static_cast<uint64_t>(bytes),
+      static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - t_pf)
+              .count()));
   // Count the span AFTER faulting it, so the counter means "this actually
   // happened". It is the only way a test can tell a prefault from a skip: the
   // prefault reads pages and changes no byte, which is why the pre-existing

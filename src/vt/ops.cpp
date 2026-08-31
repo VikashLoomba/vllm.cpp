@@ -1948,11 +1948,35 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
                std::to_string(conv_state.shape[2]) + "]");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
            std::string(name) + ": float x/weight, f32/bf16 out");
-  // f32 state ONLY. `CausalConv1dSpecUpdate` admits bf16 on CUDA because a CUDA
-  // kernel there writes it; no CUDA arm of this op exists, so admitting a dtype
-  // nothing can produce would be a promise with no kernel behind it.
-  VT_CHECK(conv_state.dtype == DType::kF32,
-           std::string(name) + ": conv_state must be f32");
+  // THE STATE CARRIES THE MODEL DTYPE, AND THE ORACLE SETTLES IT (W5k, #2031).
+  // This check read `conv_state.dtype == kF32` and argued that "no CUDA arm of
+  // this op exists, so admitting a dtype nothing can produce would be a promise
+  // with no kernel behind it". The premise was about which KERNELS exist; the
+  // question is what UPSTREAM STORES, and those are different questions. The
+  // second one is now answered from the running oracle rather than from the
+  // shape of this tree.
+  //
+  // transformers 5.16.0 (the `qwen4_exp` lane pin, `.agents/oracles/transformers.md`)
+  // types each cache slot from the tensor that FIRST reaches it, per slot and not
+  // per layer: `cache_utils.py:1019-1023` allocates
+  // `torch.zeros(..., dtype=conv_states.dtype, device=conv_states.device)`. The
+  // tensor reaching the PLE conv slot is `hidden_states`
+  // (`modeling_qwen4_exp.py:1157-1159`, `update_conv_state(..., state_idx=1)`), so
+  // the ring carries the MODEL dtype. Observed, not inferred: the same fixture run
+  // at `dtype=torch.bfloat16` reports `conv_states[1] dtype=torch.bfloat16`, and at
+  // `float32` reports `float32`. It NEVER widens to f32.
+  //
+  // Admitting bf16 is therefore mirroring upstream, and refusing it was the
+  // "dtype that is too wide" AGENTS.md names — the defect class a token gate
+  // cannot see, because the tokens match while the path moves twice the bytes.
+  // The CPU kernel reads and writes the ring through the same `LoadF32At` /
+  // `StoreF32At` accessors it already used for `x` and `out`, so this admits no
+  // dtype that has no kernel behind it. f32 stays accepted and every existing
+  // f32 caller is byte-unchanged.
+  VT_CHECK(conv_state.dtype == DType::kF32 || conv_state.dtype == DType::kBF16,
+           std::string(name) +
+               ": conv_state must be f32 or bf16 (upstream types the slot from "
+               "the model dtype, cache_utils.py:1019-1023)");
   VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous() &&
                conv_state.IsContiguous(),
            std::string(name) + ": x/out/weight/conv_state must be contiguous");
@@ -2530,13 +2554,49 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
     VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
     VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
   };
+  // A PROJECTION OPERAND MAY KEEP THE FILE'S BLOCK ENCODING (W5p, #2031). The
+  // released `unsloth/Qwen3.8-Flash-Next-GGUF` stores all 194 hyper-connection
+  // mix weights as Q8_0 — `blk.N.hc_{attn,ffn}_{down,up}.weight` plus
+  // `output_hc_{down,up}` — and the loader keeps their blocks, so demanding a
+  // float here refused the released checkpoint at its first prefill.
+  //
+  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM has
+  // never registered `qwen4_exp` and never loads a GGUF, so it has no opinion on
+  // a block-typed operand; llama.cpp merged the architecture on 2026-08-27
+  // (`6c84c7d5d`, PR #27742) and runs this exact file. It declares each of the
+  // SIX projections `GGML_OP_MUL_MAT` (`src/llama-arch.cpp:759,760,761,763,764,765`
+  // — down, up AND inject, on both the attention and the feed-forward side) and
+  // consumes them with a plain `build_lora_mm` on the file-typed tensor
+  // (`src/models/qwen4exp.cpp:237-241`); it never dequantizes one. It declares
+  // `hc_*_norm` `GGML_OP_MUL` (`:758`, `:762`), and where a weight of this
+  // architecture meets an ELEMENTWISE multiply it casts to f32 first and says so
+  // (`qwen4exp.cpp:1198-1202`, the PLE conv). Matmul operands keep the file's
+  // type; elementwise operands get a cast. `hc_norm_w` therefore stays on
+  // `check_operand` above, and refusing a block-typed gamma by name is a gated
+  // behaviour, not an oversight.
+  //
+  // The BLOCK layout replaces the elementwise stride contract, exactly as
+  // `MatmulBTQuant`'s own validation puts it: a block-typed tensor has no
+  // per-element stride, so `IsContiguous()` is not the question — being a whole
+  // number of blocks per row is. The shape checks above are unaffected, because
+  // `Tensor.shape` is in ELEMENTS for a block dtype too.
+  const auto check_projection = [&](const Tensor& t, const char* what) {
+    if (!IsBlockQuant(t.dtype)) {
+      check_operand(t, what, false);
+      return;
+    }
+    VT_CHECK(t.shape[1] % BlockElems(t.dtype) == 0,
+             std::string(name) + ": " + what +
+                 " keeps its blocks, so K must be a whole number of them");
+    VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " device mismatch");
+  };
   check_operand(hyper, "hyper", false);
   check_operand(hc_norm_w, "hc_norm weight", false);
-  check_operand(mix_down, "input_mix_weight_down", false);
-  check_operand(mix_up, "input_mix_weight_up", false);
+  check_projection(mix_down, "input_mix_weight_down");
+  check_projection(mix_up, "input_mix_weight_up");
   check_operand(mixed, "mixed", true);
   if (block_inject != nullptr) {
-    check_operand(*block_inject, "block_inject_weight", false);
+    check_projection(*block_inject, "block_inject_weight");
     check_operand(*injection, "injection", true);
   }
   reinterpret_cast<Qwen4ExpGatedResidualFn>(

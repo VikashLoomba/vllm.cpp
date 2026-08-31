@@ -2335,7 +2335,7 @@ past. 136 checks `ok`; `test_cpu_x86_llamacpp_floor` fails
 its own reason: `NO_QUIET_WINDOW after 30s (busy=340% builders=0 load=129.36)`,
 and `load=80.69` / `load=67.72` / `load=141.56` in the three runs. The dev box
 carried 13 concurrent preflights and two foreign builds throughout. **The
-attribution is structural, not a judgement call: this change is 302 added lines
+attribution is structural, not a judgement call: this change is 313 added lines
 in ONE markdown file and changes nothing under `src/`, `tests/`, `include/` or
 `scripts/`**, so the harness and every input it reads are byte-identical to
 `origin/main`. A contention guard firing on real contention is the test working.

@@ -1,9 +1,6 @@
 # ENG-GGUF-RESIDENCY-RESOLVED-DEVICE — the GGUF residency policy reads the engine's resolved device, not the platform probe
 
-Issue: OWED. The GitHub API refuses writes for this account at the time of this
-row (`gh issue create` returns 403 while `git push` over SSH works), so the
-issue cannot be filed from here. The obligation is recorded under `## Owed`
-below and the row's ID is the anchor until it can be filed.
+Issue: [#2392](https://github.com/mudler/vllm.cpp/issues/2392).
 Base: `9fb40279d` (`origin/main` at the claim).
 
 ## Scope
@@ -220,10 +217,6 @@ re-run to 13/3087/rc 0.
 
 ## Owed
 
-* **File the issue.** The GitHub API refuses writes for this account
-  (`gh issue create` -> 403 while `git push` over SSH works). The issue must be
-  filed against this row ID and linked here, in the row spec, and in the pull
-  request body, once writes are restored.
 * **The hardware half of the test.** Nothing here proves that on a real
   CUDA-capable process `CurrentPlatform()` answers `kCUDA` while
   `ResolveModelDeviceType(..., Device::kCPU)` answers `kCPU`. The test pins that
@@ -234,6 +227,12 @@ re-run to 13/3087/rc 0.
 * **The rest of the tree's `CurrentPlatform()` readers.** This row fixes the
   GGUF residency path. A sweep for other load-time or config-time readers that
   should take the engine's resolved device is not done here and has no owner.
+* **The CUDA gather arm itself.** This row makes `--device cpu` reach the CPU
+  policy on a CUDA box. It does NOT give CUDA a block-decoding gather, so
+  `--device cuda` on `qwen4_exp` still refuses — correctly, and now with a
+  remedy the user can actually follow. That arm is `#2083`, and the sibling
+  CUDA wave's reachability mutation confirms its op arms sit behind this same
+  refusal.
 
 ## Stop conditions
 

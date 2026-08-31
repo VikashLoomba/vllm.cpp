@@ -3898,8 +3898,28 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
-- **THE FORWARD REFUSES THE ONLY PUBLISHED ARTIFACT THAT FITS, AND THIS IS THE
-  BLOCKER. W5n MEASURED IT; NOTHING FIXES IT YET. ISSUE OWED.**
+- **W5p FIXED THE BLOCKER BELOW, AND THE ENTRY IS KEPT IN THE PAST TENSE.** The
+  op now takes a block-quantized `mix_down`, `mix_up` and `block_inject` and
+  routes each through `vt::MatmulBT`, which dispatches `kMatmulBTQuant`. Of the
+  two options this entry laid out, the FIRST was taken: the op grew the arm,
+  rather than the loader narrowing its policy and expanding 1.17 GiB. The reason
+  is not size — it is that llama.cpp merged this architecture to master on
+  2026-08-27 (`6c84c7d5d`, PR #27742, first tag `b10660`) and runs this exact
+  file WITHOUT dequantizing, declaring all six projections `GGML_OP_MUL_MAT`
+  (`src/llama-arch.cpp:759,760,761,763,764,765`) and `hc_*_norm` `GGML_OP_MUL`
+  (`:758`, `:762`). Expanding at load would also be re-triggered by the next
+  re-quant: the Q8_0 is unsloth's own `--tensor-type` override and no `hc_` entry
+  exists in llama.cpp's `src/llama-quant.cpp` allowlist, so a shape fallback
+  would emit IQ4_NL next time. This entry's LAST sentence was heeded: the gate
+  builds the fixture tensors QUANTIZED (`FixtureOpts::hc_mix_q8_0`), and mutation
+  M1 of the W5p record proves that without it the whole thing would have been
+  green for the reason the entry names. **What W5p does NOT claim: nothing has
+  run the RELEASED checkpoint through the repaired path.** The gates are the
+  miniature and the op.
+
+- **THE FORWARD REFUSED THE ONLY PUBLISHED ARTIFACT THAT FITS. W5n MEASURED IT;
+  W5p FIXED IT. Kept because it is the measurement, and because the next reader
+  needs the cause rather than the verdict. ISSUE OWED.**
 
   ```text
   vt: qwen4_exp_gated_residual: input_mix_weight_down must be float
@@ -3928,17 +3948,20 @@ All six mutations were re-run after this refactor.
      `vec_dot` and 10240 and 320 are multiples of its 32-element block, so
      `RouteGgufTensor` returns `kKeepQuant`. **That decision is correct** — it is
      what keeps this model inside 122.80 GiB.
-  3. `vt::Qwen4ExpGatedResidual` accepts float only
-     (`src/vt/ops.cpp:2551-2559`, `check_operand`).
-  4. **The fixture cannot express the failing case.**
-     `tests/support/qwen4_exp_gguf_fixture.h:367,369,378,380` writes those same
-     tensor names with ggml type `0` (F32). Every green gate on this
-     row has handed that op a float operand; the published artifact hands it a
-     block. **No gate on this row could have caught this**, which is the same
-     shape as W5b-6's gamma polarity: a contradiction that is unreachable while
-     only one side of it is ever built.
+  3. `vt::Qwen4ExpGatedResidual` accepted float only
+     (`src/vt/ops.cpp`, `check_operand`). Since W5p a PROJECTION operand takes
+     `check_projection` instead and the three elementwise ones keep
+     `check_operand`.
+  4. **The fixture could not express the failing case.**
+     `tests/support/qwen4_exp_gguf_fixture.h` wrote those same tensor names with
+     ggml type `0` (F32). Every green gate on this row had handed that op a
+     float operand; the published artifact hands it a block. **No gate on this
+     row could have caught this**, which is the same shape as W5b-6's gamma
+     polarity: a contradiction that is unreachable while only one side of it is
+     ever built. W5p added `FixtureOpts::hc_mix_q8_0`, which is the side that was
+     never built.
 
-  **W5n deliberately did NOT fix it.** The wave was scoped to run the released
+  **W5n deliberately did NOT fix it, and W5p did.** The wave was scoped to run the released
   artifact and report, and a workaround would have destroyed the measurement. The
   fix is its own wave and needs a design decision this row should not take
   silently: either `vt::Qwen4ExpGatedResidual` grows a quantized-operand arm
@@ -3948,9 +3971,47 @@ All six mutations were re-run after this refactor.
   measured cost 2 × 48 × 10240 × 320 × 2 B ≈ **1.17 GiB** of bf16 for the
   per-layer pairs plus 12.5 MiB for the model-level mixer, which fits. The first
   is faster and mirrors what the file asks for; the second is smaller and lands
-  in one place. **Neither is chosen here.** A gate for whichever lands must build
+  in one place. **Neither was chosen here.** A gate for whichever lands must build
   the fixture tensors QUANTIZED, or it will be green for the same reason the
-  current one is.
+  one current at W5n was. W5p took the first and built that fixture arm.
+
+- **THE REPAIRED PATH IS A PER-TOKEN MATVEC, AND THAT IS A SPEED DEBT W5p DID NOT
+  PAY. ISSUE OWED.** `ProjectRow` calls `vt::MatmulBTQuant` with `M = 1` inside
+  the kernel's existing per-token loop, so a prefill of `T` tokens makes `T`
+  keep-quant GEMM calls per projection where llama.cpp makes ONE over the whole
+  batch (`build_lora_mm(w_down, xn)` on the `[hc_dim, n_tokens]` activation,
+  `src/models/qwen4exp.cpp:237`). At the released geometry that is
+  `T x 3 projections x 2 hyper-connection sites x 48 layers` calls per forward,
+  each of which allocates its own activation scratch and enters
+  `ParallelForRows`. Batching means hoisting the grouped norm for a TILE of
+  tokens into a `[tile, hc*H]` buffer and running one GEMM per projection, which
+  moves the fused kernel's loop structure and owes its own red-first
+  measurement — so it is a wave, not a follow-up edit. **No number is quoted
+  here**: nothing has profiled it, and a cost derived from a call count is an
+  arithmetic claim rather than a measurement.
+
+- **`.agents/oracles/llama-cpp-qwen4exp.md` IS NOW STALE IN ITS CENTRAL CLAIM.
+  ISSUE OWED. DO NOT READ THIS AS A LICENCE TO ADVANCE THE PIN.** That file's
+  title says "the only llama.cpp that knows `qwen4exp`" and its evidence table
+  records "the PR is unmerged" and "no released llama.cpp has it". Both stopped
+  being true on 2026-08-27. Re-derived on 2026-08-31 from the local
+  `ggml-org/llama.cpp` checkout's fetched `origin/master`, not relayed:
+
+  | Claim | Command | Result |
+  |---|---|---|
+  | #27742 is MERGED | `git merge-base --is-ancestor 6c84c7d5d origin/master` | **rc=0** |
+  | what that object is | `git log -1 --format='%H %ci %s' 6c84c7d5d` | `6c84c7d5d…` `2026-08-27 21:32:31 +0200` `model: add Qwen3.8-Flash-Next (qwen4exp) (#27742)` |
+  | a RELEASED tag has it | `git tag --contains 6c84c7d5d \| head -3` | `b10660`, `b10661`, `b10662` |
+  | the PINNED object is no longer on master | `git merge-base --is-ancestor 035e22731a7fd70b9854b3a2d64ec68e9b1a45d3 origin/master` | **rc=1** — the PR branch was squashed away |
+
+  A follow-up, `6fe749801` "model: qwen4exp: reduce number of graph splits
+  (#27880)", lands after it. The consequence for THIS record is only that the
+  oracle file's framing is wrong; the pin itself is a recorded object with
+  recorded build and run evidence, and advancing it re-measures both. That is a
+  separate gated operation and W5p did not touch the pin, the `oracle-pin` block,
+  or any measurement taken against it. W5p read `6fe749801` for the tensor-op
+  declarations it cites and says so at every citation, which is a READ of a
+  merged upstream and not a change of denominator.
 
 - **THE FIXTURE IS FLOAT-ONLY WHERE THE ARTIFACT IS QUANTIZED, AND THAT IS A
   GENERAL GAP, NOT ONE OP'S. ISSUE OWED.** `qwen4_exp_gguf_fixture.h` writes
@@ -6311,6 +6372,77 @@ moves every value the oracle golden measures. And `num_reqs > 1` is still refuse
 what changed is that the refusal no longer kills the engine.
 
 
+## Mutation record — W5p (#2031, issue OWED)
+
+The wave that makes a **quantized** hyper-connection mix weight run, so the
+released `unsloth/Qwen3.8-Flash-Next-GGUF` can prefill. Base `c45ecce47`
+(`row/MODEL-MM-QWEN4-EXP-W5N`), branch `row/MODEL-MM-QWEN4-EXP-W5P`, CPU host,
+`cmake -G Ninja` with no `CMAKE_BUILD_TYPE` (so `NDEBUG` is NOT set and asserts
+are live), `-j 2`.
+
+### The RED, verbatim
+
+`test_qwen4_exp_hc_device` at the pre-wave head, with the new Q8_0 case added and
+nothing else changed. Build rc 0, zero warnings, read BEFORE the test output:
+
+```text
+tests/vllm/models/test_qwen4_exp_hc_device.cpp:831: ERROR: test case THREW
+exception: vt: qwen4_exp_gated_residual: input_mix_weight_down must be float
+(f32/bf16 for outputs) at src/vt/ops.cpp:2552
+[doctest] test cases:  11 |  10 passed | 1 failed | 0 skipped
+```
+
+That is the SAME string, from the same line, that W5n recorded from the released
+checkpoint on `thor:gpu0`.
+
+### The measurements the gate carries
+
+| Quantity | Value |
+|---|---|
+| f32 arm vs the in-test double reference, `mixed` | `1.00553e-07` |
+| f32 arm vs the in-test double reference, `injection` | `4.4584e-08`, both under `kTol` 1e-5 |
+| Q8_0 arm vs the same double reference, `mixed` | `0.00249794` |
+| Q8_0 arm vs the same double reference, `injection` | `0.00169157`, against a stated bound of `5e-3` |
+| Q8_0 arm vs f32 arm, same logical weights | `0.00249791`, asserted **> 0** |
+| transformers 5.16.0 end-to-end golden | `max\|diff\| = 0.00982457` against 0.03 — **UNMOVED** |
+
+The Q8_0 residual is the ACTIVATION encoding and not weight error, because the
+weights are chosen `d * q` for an f16-exact power-of-two scale and an int8 code,
+so `dequant(quant(w)) == w` to the bit. The `> 0` assertion is the one a
+"dequantize the mix weights at load" workaround fails: with a lossless weight
+encoding the two arms would be BIT-IDENTICAL, and only the quantized route
+introduces an activation encoding to separate them.
+
+### Mutations
+
+Every row: mutation applied and proved by a `sha256sum` that differs from the
+recorded baseline, build return code read BEFORE any test output, tree restored
+with `git checkout --` and proved byte-for-byte by `sha256sum -c` against the
+baseline file plus an empty `git diff HEAD`.
+
+Baseline: `src/vt/ops.cpp` `42719dfc…`, `src/vt/cpu/cpu_qwen4_exp.cpp`
+`622d9fd5…`, `tests/vllm/models/test_qwen4_exp_hc_device.cpp` `4415614f…`.
+
+| # | Mutation | Applied sha256 | Build | Result |
+|---|---|---|---|---|
+| M1 | **REACHABILITY.** `check_projection(mix_down/mix_up, …)` restored to `check_operand(…, false)` — the pre-wave contract, nothing else touched | ops.cpp `d0a01aad…` | rc 0 | **RED in TWO suites.** `test_qwen4_exp_hc_device` 10/11, the Q8_0 case throwing the verbatim refusal above. `test_qwen4_exp_layer_loop` 5/6, and the failure is `REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in))` throwing that SAME string — so a block-typed mix weight really does reach this op through the production entry point on a loaded GGUF, and the end-to-end case is not vacuous. Every other case in both suites, the transformers golden included, stayed green |
+| M2 | **THE ROUTE PREDICATE, one way.** `if (false && IsBlockQuant(w.dtype))` in `ProjectRow` — a quantized weight forced down the float pointer walk | cpu_qwen4_exp.cpp `570ddd04…` | rc 0 | **RED in both suites**, `vt: qwen4_exp_gated_residual: unsupported input dtype at src/vt/cpu/cpu_qwen4_exp.cpp:87` — the `LoadF32At` default, which is the scalar element walk the fusion forced |
+| M3 | **THE ROUTE PREDICATE, the other way.** `if (true \|\| IsBlockQuant(w.dtype))` — a FLOAT weight forced down the quantized path | cpu_qwen4_exp.cpp `69864e4f…` | rc 0 | **RED on 7 of 11 cases**, every golden among them: `vt: matmul_bt_quant: weight must be a block-quantized dtype (use MatmulBT for elementwise weights)`. The predicate is load-bearing in both directions |
+| M4 | **ONE BLOCK'S SCALE CORRUPTED.** In the fixture builder, block 0's stored f16 scale is written as `2d` while the logical f32 weight keeps `d`, so 32 weight elements decode at twice their value. The builder's own exactness `REQUIRE` is lifted in the same mutation so the corruption reaches the op instead of aborting the case | test file `82851d6e…` | rc 0 | **RED on 3 assertions**, `max\|mixed − double ref\| = 0.204279` and `max\|inj − double ref\| = 0.36377` against the 5e-3 bound, and the arm-vs-arm check at `0.204279`. An **82x** separation from the honest `0.00249794`, so the bound discriminates a single wrong block scale rather than merely admitting the encoding error |
+| M5 | **THE ELEMENTWISE HALF OF THE POLICY.** `hc_norm_w` routed through `check_projection` — the gamma loosened to accept blocks | ops.cpp `3570b5ac…` | rc 0 | **RED**, and it is the two-sided form that matters: the gamma gets PAST the named refusal and dies deeper, `threw a DIFFERENT exception! (contents: "…unsupported input dtype at cpu_qwen4_exp.cpp:87")`. A bare `CHECK_THROWS` would have stayed green here, which is why the case asserts on the message |
+
+After restore, rebuild rc 0 and all three suites green: `test_qwen4_exp_hc_device`
+11/11 (516 assertions), `test_qwen4_exp_gguf_weights` 12/12 (3074),
+`test_qwen4_exp_layer_loop` 6/6 (309) with the golden at `0.00982457`.
+
+### What is NOT proved
+
+Nothing has run the RELEASED checkpoint through the repaired path. W5n's run
+needed `thor:gpu0` and 4446 s to load; W5p is a CPU wave with no lease and did
+not attempt it. The claim here is that the op, the loader and
+`ModelRegistry::Forward` all carry a Q8_0 mix weight on the miniature, and that
+the refusal the released file hit is gone at its source.
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**
@@ -6360,6 +6492,7 @@ a row here, and every row says whether anything in production reaches it:
 | W5k | the PLE conv ring's DTYPE and the n-gram history's RESIDENCY settled against the running lane oracle, and the SECOND STEP | **yes, and it DECODES** — `ModelRegistry::Forward` runs a prefill at `past_len` 0 and then a decode at `past_len` 6 over the engine's own persistent recurrent group, sampling a token on each; M1 deletes the n-gram write-back INSIDE `RunQwen4ExpPleBlock` and the step-1 history assertion reds, which is the first measured reach of that block's body | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5k's own issue OWED |
 | W5L | `GPUModelRunner` and `LoadedEngine` DRIVEN end to end, and the model-declared concurrency ceiling that keeps a server alive | **yes, and it SERVES** — a real `GPUModelRunner` allocates all three published groups, gathers all three block tables and runs a prefill then a decode through `execute_model` / `sample_tokens`; `LoadedEngine::FromModelDir` loads a `qwen4exp` GGUF and `generate` returns tokens; `examples/server` answers `POST /v1/completions` on CPU. M1 deletes the runner's `multi_kv` handoff, M3 deletes the per-group gather call site, and M4 deletes the clamp's production call site — each reds | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5L's own issue OWED |
 | W5n | the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact driven through `examples/server` on `thor:gpu0` — the first published `qwen4exp` bytes this row has ever read | **LOAD yes, TOKEN no** — all three shards load on `--device cpu` in 4446 s at 69.206 GiB peak RSS with every encoding keeping its blocks, the engine sizes its caches and the server answers `/health`; the first forward then refuses the artifact by name (`qwen4_exp_gated_residual: input_mix_weight_down must be float`, `src/vt/ops.cpp:2552`) because the file stores 194 hyper-connection mix weights as Q8_0, and `/v1/completions` returns 500. **Zero tokens.** No code changed; the defect is recorded, not worked around | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5n's own issue OWED |
+| W5p | the hyper-connection mixer takes a QUANTIZED mix weight: `mix_down`, `mix_up` and `block_inject` may keep the file's blocks and route through `vt::MatmulBT`, while `hc_norm_w` and the stream stay float and a block-typed one is refused by name | **yes** — `ModelRegistry::Forward` runs a prefill AND a second prompt over a `FixtureOpts::hc_mix_q8_0` file whose `hc_*_down`, `hc_*_inject` and `output_hc_down` are Q8_0, sampling a token that is the row's own maximum and logits that MOVE on the second prompt. M1 restores the pre-wave refusal and that case reds with the exact string the RELEASED checkpoint threw, which is what makes the reach measured rather than assumed. **The released checkpoint itself has NOT been run through the repaired path** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5p's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than

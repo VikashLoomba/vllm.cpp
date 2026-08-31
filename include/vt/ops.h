@@ -3803,6 +3803,21 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // this reduction and meet the same bound; the spec records that choice as owed.
 // Tensors may be f32 or bf16 (widen on load, round once on store), mirroring
 // upstream's `_norm(x.float())` ... `.type_as(x)`.
+//
+// EXCEPT THE THREE PROJECTIONS, WHICH MAY KEEP THE FILE'S BLOCKS (W5p, #2031).
+// `mix_down`, `mix_up` and `block_inject` also accept a block-quantized `[N,K]`
+// dtype, and the kernel then routes that projection through `vt::MatmulBT`,
+// which dispatches `kMatmulBTQuant`. The released
+// `unsloth/Qwen3.8-Flash-Next-GGUF` stores all 194 of these mix weights as Q8_0
+// and cannot prefill otherwise. `hyper`, `hc_norm_w`, `mixed` and `injection`
+// stay float and a block-typed one is refused BY NAME: the gamma is an
+// ELEMENTWISE multiplicand, which is the split llama.cpp makes for this same
+// architecture -- six projections declared `GGML_OP_MUL_MAT`
+// (`src/llama-arch.cpp:759,760,761,763,764,765` at `6c84c7d5d`) against
+// `GGML_OP_MUL` for `hc_*_norm` (`:758`, `:762`), with an explicit f32 cast
+// where a file-typed weight of this architecture meets an elementwise multiply
+// (`src/models/qwen4exp.cpp:1198-1202`). A float weight is bit-identical to
+// before: it keeps the same scalar accumulation in the same index order.
 void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper,
                            const Tensor& hc_norm_w, const Tensor& mix_down,
                            const Tensor& mix_up, const Tensor* block_inject,

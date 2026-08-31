@@ -3898,6 +3898,72 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **THE 74-MINUTE LOAD WAS CIFS, AND STAGING TO LOCAL DISK MAKES IT 60 SECONDS.**
+  W5n set `MODEL=/workspace/q4exp-bench/UD-IQ1_S/...`, and `/workspace` is
+  `//192.168.68.102/Data[/rc]` over SMB 3.1.1 while the worker's own overlay had
+  503 GB free and went unused. Measured on **thor**, the box W5n actually ran on
+  (its header comment says dgx; the run recorded 14 cores, `Mem: 122`, tegra,
+  worker `rc-worker-n8smh`), inside one lease, same binary, same artifact:
+
+  | | rate | how |
+  |---|---|---|
+  | `/workspace` sequential read | **20.9 MiB/s** | 2.0 GiB in 98.28 s, cold |
+  | worker-local `/tmp` sequential read | **953 MiB/s** | 2.0 GiB in 2.11 s, cold |
+  | staging copy, 67.564 GiB CIFS -> local | **23.7 MiB/s** | 2916 s |
+
+  Both `dd` arms were cold: `posix_fadvise(DONTNEED)` then `mincore` VERIFIED
+  `cached kB = 0` before each. Local storage is **45.6x** the share.
+
+  **Load, same binary, only the filesystem changed:** 4446 s from CIFS ->
+  **60 s** from local disk, a **74x** difference. The split is
+  `copy 2916 s + load 60 s`, never one number: paying the copy once still beats
+  the direct CIFS load (2976 s vs 4446 s) and every RELOAD after it is 60 s.
+
+  **CIFS explains essentially all of it.** Our loader's own host work is bounded
+  by that 60 s, i.e. **1.3%** of the 74 minutes. Taking the share's own measured
+  ceiling, the 64.748 GiB the prefault pages would cost ~3172 s at 20.9 MiB/s, so
+  ~71% of W5n's wall is the filesystem at its BEST sequential rate; the residual
+  ~1270 s is the gap between our per-span access and one bulk `dd` stream, plus
+  whatever contention differed between the two windows.
+
+  **Where the local 60 s goes** (`VT_LOAD_STATS=1`, which this change made work on
+  the GGUF path at all): `mmap+header 0.052 s`, `weights 49.482 s`, of which
+  `prefault paged_in 64.748 GiB in 30.959 s (2141.6 MiB/s)` over 290 spans. With
+  `VT_GGUF_PREFAULT=0` the whole load is **15 s** (`weights 13.120 s`, spans 0).
+  So the prefault is 45 s of the 60 s locally -- and on CIFS that same eager,
+  synchronous residency is what turns a slow mount into 74 minutes. `cpu_frac`
+  0.61 locally: the prefault is page-fault bound, not disk bound (it beats the
+  953 MiB/s single-stream `dd` because `madvise(WILLNEED)` readahead is wider).
+
+  **The three suspects the brief named are all excluded, by routing not by
+  timing.** Of 1224 tensors, 67.22 GiB is quantized and 0.33 GiB is F32/BF16;
+  every quantized type present has a `vec_dot`, so all of it is BORROWED.
+  `expand_nk` orients a bf16 expansion 99.5% of this file never takes; the i8mm
+  repack is Q8_0-only (`QuantRepackEligible`) and Q8_0 is 0.74 GiB, ~1%; and seek
+  thrash is unavailable because both shards have `table_order == file_order` with
+  every `blk.N` one contiguous run and the mass in 49 IQ4_NL tensors of ~1 GiB.
+
+  **OWED, not filed because GitHub writes are 403 from this host:**
+  1. Stage model weights to worker-local storage before loading. Every GGUF job
+     under `/workspace/q4exp-*` reads them in place; `.agents/environment.md` says
+     to BUILD in `/tmp` and does not say to stage WEIGHTS.
+  2. A job-template defect: `exec > >(tee ...)` plus a bare `wait` in an EXIT trap
+     hangs the script after it finishes, holding the fleet device. Attempt 1 of
+     this job held thor that way, and W5n has the same shape -- its log prints
+     `=== DONE ===` and never prints `cleanup done`.
+  3. No same-box llama.cpp control exists. On thor the `llama-cpp-qwen4exp` pin
+     ABORTS before loading any weights: `GGML_ASSERT(obj_new) failed`
+     (`ggml.c:1804`) from `ggml_transpose` <- `build_delta_net_chunking` <-
+     `llama_model_qwen4exp::graph::build_layer_attn_linear`, during
+     `graph_reserve`. The 16m27s dgx figure stays non-comparable, and it was
+     always doubly so: different device (`n_threads = 20`) and an ASYNC
+     `posix_madvise(WILLNEED)` prefetch against our synchronous residency.
+  4. Run-to-run spread on the local load is wide -- two nominally identical local
+     arms read 60 s and 45 s -- so 60 s is a scale, not a precise figure. The
+     `local-warm` arm did NOT achieve a warm cache (its own precondition print
+     shows ~3.2 GiB of 67.5 GiB resident), so the host-work floor comes from the
+     prefault-off arm (15 s), not from it.
+
 - **W5L's ISSUE IS OWED, and so is the ISSUE FOR THE WAVE IT PROPOSES.** GitHub
   writes are `403` from this host (account suspended), so nothing could be filed
   and no row was appended to `.agents/issue-index.md`; an index row pointing at

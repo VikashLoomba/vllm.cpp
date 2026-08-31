@@ -177,6 +177,25 @@ case "$FA2LINE" in
 esac
 
 say "BUILD vllm-cli -- -j 4, because unconstrained parallelism has OOM-REBOOTED this box"
+# THE STAMPS ARE ON THE SHARE AND THE BUILD IS IN THE WORKER'S /tmp, so a re-run
+# that lands on a DIFFERENT worker inherits "already built" and an empty build
+# tree. Check the artifact, not the stamp: an absent binary clears the stamps and
+# rebuilds, instead of reaching the identity guard's refusal with the lease spent.
+if stamp build && [ -z "$(find "$BUILD" -maxdepth 3 -name vllm-cli -type f -perm -u+x 2>/dev/null | head -1)" ]; then
+  echo "### stamped as built, but no vllm-cli under $BUILD -- a different worker. Rebuilding."
+  rm -f "$OUT"/stamp.src "$OUT"/stamp.cfg "$OUT"/stamp.build "$OUT"/stamp.suites
+  rm -rf "$SRC" "$BUILD"; mkdir -p "$SRC"
+  tar -xzf "$W/src.tar.gz" -C "$SRC" || { echo "FATAL: extract failed"; exit 92; }
+  find "$SRC" -exec touch {} + 2>/dev/null
+  mark src
+  cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES="$ARCH" \
+        -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_CUTLASS_DIR="$CUT" \
+        -DVLLM_CPP_FLASH_ATTN=ON > "$OUT/cmake.log" 2>&1
+  rc=$?; note RECONFIGURE $rc
+  [ "$rc" -ne 0 ] && { tail -20 "$OUT/cmake.log"; echo "FATAL: reconfigure failed"; exit 93; }
+  mark cfg
+fi
 if ! stamp build; then
   cmake --build "$BUILD" -j 4 --target vllm-cli > "$OUT/build.log" 2>&1
   rc=$?; note BUILD $rc

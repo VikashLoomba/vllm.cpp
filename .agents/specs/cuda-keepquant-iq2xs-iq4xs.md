@@ -198,6 +198,66 @@ standing is not a correction.
 
 ## Evidence
 
+### The host pre-check below CANNOT SEE A MISSING DECLARATION, and it did not
+
+**Read this before the evidence that follows it, because it bounds all of it.**
+The host harness described next reproduced the pinned oracle bit-exactly on all
+eight real checkpoint blocks, and the kernels it validated **did not compile for
+a device**. The first `sm_121a` build of them failed with four errors:
+
+```text
+cuda_quant_dot.cu(482): error: identifier "BlockIQ2_XS" is undefined
+cuda_quant_dot.cu(535): error: identifier "BlockIQ4_XS" is undefined
+cuda_quant_dot.cu(870): error: identifier "BlockIQ2_XS" is undefined
+cuda_quant_dot.cu(874): error: identifier "BlockIQ4_XS" is undefined
+```
+
+The anonymous namespace's `using vt::cpu::...` list named seven sibling block
+types and neither of these two. The structs existed the whole time
+(`cpu_quant_blocks.h:191` and `:205`); only the declarations bringing them into
+scope were missing. Fixed on `main` by `8846e3c4b`, merged here.
+
+**Why the harness was structurally incapable of catching it.** It EXTRACTS the
+two `__device__` functions by line range and compiles them in a translation unit
+it writes itself -- one that does `using namespace vt::cpu;` and therefore has
+every block type already in scope. It compiles the ARITHMETIC out of its file
+and can never compile the FILE. So it can see a wrong grid index, a swapped
+scale nibble or a mis-shifted bit pair, and it cannot see a name that the real
+translation unit does not have. **An extraction is not a build**, and the
+distinction is invisible while the extraction is passing.
+
+That is this repository's recurring shape -- an instrument that returns a
+confident, well-formed answer to a question nobody checked it was asking
+([`verification.md`](../verification.md)) -- in the specific form a CUDA port
+written on a box with no `nvcc` will keep producing, because extraction is the
+only host-side check available. **Anyone doing that again should assume their
+harness is blind to scope, includes, qualifiers and linkage, and say so beside
+the result** rather than letting a bit-exact number imply more than it measured.
+
+Nothing about the arithmetic evidence below is retracted: the same functions,
+unchanged, are the ones `8846e3c4b` made compile. What is retracted is any
+reading of it as "these kernels work", which it was never able to support.
+
+**A check that CAN see this class, and its red-before.** The defect is one
+set-difference away from visible -- the `Block*` types a `.cu` names against the
+ones it declares or qualifies:
+
+```sh
+python3 - <<'EOF'
+import re
+s = open("src/vt/cuda/cuda_quant_dot.cu").read()
+have = {m.group(1) for m in re.finditer(r'^using vt::cpu::(Block\w+);', s, re.M)} | \
+       {m.group(1) for m in re.finditer(r'vt::cpu::(Block\w+)', s)}
+print(sorted({m.group(1) for m in re.finditer(r'\b(Block[A-Z]\w*)\b', s)} - have))
+EOF
+```
+
+At `6e06e4640` it prints `['BlockIQ2_XS', 'BlockIQ4_XS']`; at `2c5dec2e4` it
+prints `[]`. That is a red-before and a green-after on the exact defect, taking
+under a second on a box with no CUDA toolkit at all. It is listed under `## Owed`
+rather than landed here, because a new checker needs its own spec, registration
+and gate, and this row is a kernel port.
+
 ### Host pre-check of the ported math, before any lease was spent
 
 `nvcc` is not on the x86 development box, so a bad port would otherwise have
@@ -302,7 +362,7 @@ Both sit under the shared band with room, so **neither dtype takes a per-case
 ceiling and none was added**. Had either come out over, the answer would have
 been `NEEDS_DECISION`, not a wider band.
 
-### `land/glm53-flash-and-dsa` and `main` conflict, and this row inherits it
+### `land/glm53-flash-and-dsa` conflicted with `main` -- RETIRED by `8846e3c4b`
 
 This row was briefed to merge the landing branch so that a GLM-5.3 end-to-end
 check would be possible. That merge was clean. Merging `origin/main` on top of
@@ -325,27 +385,32 @@ between `origin/land/glm53-flash-and-dsa` and `origin/main`, with NONE of this
 row's commits present, reports the identical single conflict on the identical
 file. Whoever lands the landing branch reconciles it.
 
-The consequence for this row is bounded and named: this branch stays on
-`1d1321095` plus the landing branch, so `agent-preflight.sh` skips
-`commit-trailers` and `commit-style` with "origin/main is not an ancestor of
-HEAD". Both were therefore run BY HAND against this branch's real merge base
-and both report OK, so the two gates have answers rather than silence.
+**RETIRED, and kept here because it is why this branch looked behind for
+several hours.** `main` at `8846e3c4b` now CONTAINS `land/glm53-flash-and-dsa`,
+so whoever landed it reconciled the two narrowings, and merging `origin/main`
+into this row is clean. While it stood, this branch could not take `main`, so
+`agent-preflight.sh` skipped `commit-trailers` and `commit-style` with
+"origin/main is not an ancestor of HEAD" and both were run BY HAND against the
+real merge base instead of left silent. Against the merged tree all three now
+run normally and report OK.
 
-### `check-pr-size.py` is red on this branch and it is BASE-CAUSED
+### `check-pr-size.py` was red on this branch, base-caused -- also RETIRED
 
 ```text
 ERROR: PR size check could not classify the change:
        unclassified repository path '.agents/scripts/glm53-dsa-first-load.sh'
 ```
 
-Measured both ways. Against this row's own four commits
-(`673464ee1..HEAD`) the checker reports `OK: every explicit path class is
-within its review budget`. Against `origin/main..origin/land/glm53-flash-and-dsa`
-alone, with none of this row's commits present, it reports the identical error.
-The unclassified path is `land/glm53-flash-and-dsa`'s, added by `fe2117c63`, and
-that branch cannot pass this gate today whoever merges it. Reported rather than
-repaired: the fix is a path class in another row's change, and adding one here
-would put a checker edit into a kernel port.
+Measured both ways at the time. Against this row's own commits the checker
+reported `OK: every explicit path class is within its review budget`. Against
+`origin/main..origin/land/glm53-flash-and-dsa` alone, with none of this row's
+commits present, it reported the identical error. The unclassified path was
+`land/glm53-flash-and-dsa`'s, added by `fe2117c63`.
+
+**Also RETIRED by the same merge.** Against `main` at `8846e3c4b` the checker
+reports `OK` for this branch. Both entries are kept rather than deleted because
+each was a real red that had to be attributed before it could be dismissed, and
+"it went away" is a different claim from "it was never ours".
 
 The generated `d_iq2xs_grid` was checked a second way, independently of the
 device seal: its 512 entries serialized little-endian FNV-1a-64 to
@@ -382,6 +447,13 @@ artifact is absent from the leased worker.
   `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and the campaign
   that tracks it is [#1998](https://github.com/mudler/vllm.cpp/issues/1998).
   The reachability mutation below therefore proves the SEAM, not a model step.
+- **A checker for the defect class that reached `main` from this row**: the
+  `Block*` types a CUDA translation unit names, minus the ones it declares or
+  qualifies, must be empty. The red-before and green-after are recorded above
+  (`['BlockIQ2_XS', 'BlockIQ4_XS']` at `6e06e4640`, `[]` at `2c5dec2e4`), it
+  needs no CUDA toolkit, and it closes the one gap every host-side check of a
+  CUDA port has. Owed here rather than landed because a new checker needs its own
+  spec, preflight registration and gate.
 - The ROCm arm of both encodings. `rocm-gg-keep-quant.md` owns it and already
   records `IQ2_*` / `IQ3_*` as owed; this row does not touch
   `src/vt/rocm/rocm_grouped_gemm.hip`.

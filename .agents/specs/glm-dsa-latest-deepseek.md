@@ -2663,6 +2663,23 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   Discharged by a fake-platform loader suite, which belongs with O14's, or by the
   CUDA quantized gather `gguf_keep_quant.cpp` already records as owed.
 
+- **O32 — `test_gguf_keep_quant`'s gather case ASSERTS THE CPU'S ANSWER AND IS
+  RED ON ANY CUDA BUILD RUNNING ON A GPU.** Found while running it as the
+  regression control for O30's `prefault` default:
+  `tests/vllm/test_gguf_keep_quant.cpp:589`, `:608` and `:625` assert
+  `RouteGgufTensor(..., kEmbeddingTable, ...) == kKeepQuant`, and that is true
+  only where `DeviceQuantGatherSupported` is true, which is the CPU alone. On
+  `thor:gpu0`, built `-DVLLM_CPP_CUDA=ON` and run on the device, the suite reads
+  43 cases / 42 passed / 1 failed and 6480 assertions / 9 failed, every failure in
+  that one case. It is **base-caused**: nothing on this row touches
+  `RouteGgufTensor`, and the same binary's other seven suites are green.
+  It is also the same fact O31 is about, pointed at a test instead of at a
+  loader — which is why it is worth naming rather than routing around. Not
+  repaired here: making the expectation device-conditional is a semantic change
+  to another row's gate and wants that row's spec and a fresh review. Owned by
+  `ENG-RESIDENCY-CONFIG` / `QUANT-GGUF-*`, whichever claims
+  `tests/vllm/test_gguf_keep_quant.cpp`.
+
 ### 3.10 Now
 
 **W7 LANDED ITS LOADER AND DID NOT PRODUCE A TOKEN, 2026-08-30**

@@ -26,7 +26,13 @@ SLOTS=${SLOTS:-4096}
 # the extract and the build and then report the OLD binary's result under the NEW
 # tree's name. Keying the stamps to the source makes that impossible to express.
 SRCSHA=$(sha256sum "$W/src.tar.gz" 2>/dev/null | cut -c1-12)
-OUT=$W/out/$BOX-${SRCSHA:-nosrc}
+# The RECIPE version rides in the key beside the source hash, because the stamps
+# also outlive a change to the BUILD (r2 adds CUTLASS, without which
+# FlashAttention-2 compiles for no arch and MLA prefill refuses at the first
+# step). A configure-time change that reused a stamp would report the previous
+# recipe's binary under this one's name.
+RECIPE=r2
+OUT=$W/out/$BOX-${SRCSHA:-nosrc}-$RECIPE
 
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/run.log") 2>&1
@@ -119,17 +125,48 @@ case "$CC" in
 esac
 echo "### DEVICE compute_cap=$CC -> CUDA arch $ARCH"
 
+say "CUTLASS -- FlashAttention-2 needs its headers, and without them it compiles for NO ARCH"
+# The first run of this script omitted CUTLASS. The configure then printed
+# `CUDA FA2 compiled-arch manifest: []` -- a line that says the feature is absent
+# and does not say the word "error" -- and the load got all the way to the first
+# step before throwing `cuda mla_prefill_attention: built without the vendored
+# FlashAttention-2`. MLA prefill on this arch IS FlashAttention and the upstream
+# selector has no fallback below it, so the omission is fatal at step 1 rather
+# than slow. The tarball is staged on the share; nothing is downloaded.
+CUT=/tmp/glm53fl/cutlass
+if [ ! -f "$CUT/include/cutlass/cutlass.h" ]; then
+  rm -rf "$CUT"; mkdir -p "$CUT"
+  if [ -s /workspace/cutlass-v4.5.0.tar.gz ]; then
+    tar -xzf /workspace/cutlass-v4.5.0.tar.gz -C "$CUT" || { echo "FATAL: cutlass untar"; exit 93; }
+  else
+    echo "### WARNING: no CUTLASS on the share -- FA2 will compile for no arch and MLA prefill WILL refuse"
+  fi
+fi
+grep -aE '#define CUTLASS_(MAJOR|MINOR|PATCH)' "$CUT/include/cutlass/version.h" 2>/dev/null || echo "### no CUTLASS version header"
+
 say "CONFIGURE"
 if ! stamp cfg; then
   cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES="$ARCH" \
-        -DVLLM_CPP_TRITON=OFF > "$OUT/cmake.log" 2>&1
+        -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_CUTLASS_DIR="$CUT" > "$OUT/cmake.log" 2>&1
   rc=$?; note CONFIGURE $rc
   tail -12 "$OUT/cmake.log"
   [ "$rc" -ne 0 ] && { echo "FATAL: configure failed"; exit 93; }
   mark cfg
 fi
-grep -aE '^(VLLM_CPP_CUDA|VLLM_CPP_CUDA_ARCHITECTURES|VLLM_CPP_TRITON|CMAKE_BUILD_TYPE):' "$BUILD/CMakeCache.txt"
+grep -aE '^(VLLM_CPP_CUDA|VLLM_CPP_CUDA_ARCHITECTURES|VLLM_CPP_TRITON|VLLM_CPP_FLASH_ATTN|VLLM_CPP_CUTLASS_DIR|CMAKE_BUILD_TYPE):' "$BUILD/CMakeCache.txt"
+# THE COMPILED FEATURE SET, ASSERTED BEFORE ANY RESULT IS BELIEVED. An empty FA2
+# manifest is not an error line and it decides whether this model can take a
+# single step, so it is read out loud here rather than discovered at the throw.
+FA2LINE=$(grep -a 'FA2 compiled-arch manifest' "$OUT/cmake.log" | tail -1)
+echo "### ${FA2LINE:-no FA2 manifest line in the configure log}"
+case "$FA2LINE" in
+  *'manifest: []'*)
+    echo "### FA2 COMPILED FOR NO ARCH. On this build MLA prefill CANNOT run: it is FlashAttention"
+    echo "### and the upstream selector has no fallback below it. Expect a refusal at the first step."
+    echo "### On sm_110 (thor) that is the arch table, not the recipe: fa2 covers 8.0,8.6,8.7,8.9,12.0a,12.1a." ;;
+  *) echo "### FA2 IS COMPILED for the arch(es) named above." ;;
+esac
 
 say "BUILD vllm-cli -- -j 4, because unconstrained parallelism has OOM-REBOOTED this box"
 if ! stamp build; then

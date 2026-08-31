@@ -1106,6 +1106,19 @@ target_include_directories(test_glm5_next_dsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_dsa PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 
+# GLM-5.3-Flash W9c-0 -- the k-pool indexer's two DEVICE ops (#2415). The CUDA
+# arm of what `test_glm5_next_dsa` gates on the host, run at the SAME fixture
+# geometry and against the SAME transformers v5.16.1 goldens, so the device
+# answer is compared with the oracle directly and not only with our own C++.
+# `np = ceil(21/4) = 6` against `kNumPools = 5` makes the `keep` compaction
+# observable; a kernel that skipped it puts the ragged tail three columns late.
+# The device cases SKIP without a CUDA backend, so this is a real gate only on a
+# leased device -- an `assertions: 0` line here is a skip wearing a pass.
+vllm_cpp_add_test(test_glm5_next_kpool_device vllm/models/test_glm5_next_kpool_device.cpp)
+target_include_directories(test_glm5_next_kpool_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_kpool_device PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
 # GLM-5.3-Flash W5 -- the 288 routed + 1 shared expert MoE, its grouped
 # `noaux_tc` router and the clamped-SwiGLU epilogue (#2223). The router is gated
 # at the PUBLISHED 288/top-8 and the composed block at 8 experts, because the

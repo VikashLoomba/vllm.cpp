@@ -1318,8 +1318,8 @@ multimodal::Qwen3VLVisionWeights LoadQwen3_5MoeVision(
 // route to the text-only path deliberately instead of discovering the refusal.
 bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 
-// Does a weight of `bytes` still fit as a TRUE DEVICE COPY, leaving the box
-// enough headroom to serve?
+// THE STAGING POLICY. The three declarations below decide ONE question: do this
+// model's dense weights get a true device copy, or do they keep the retag above?
 //
 // WHY THIS EXISTS, MEASURED. The retag above costs real decode throughput on
 // GB10: interleaved A/B on `dgx:gpu0`, one boot, Qwen3.8-27B bf16 + DFlash2
@@ -1334,13 +1334,18 @@ bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards);
 // box precisely because the CUDA arm paid for its weights TWICE — host bytes
 // plus a device copy. Staging is the right default for a model that fits and
 // is fatal for one that does not, so the question has to be asked of the BOX
-// rather than answered once for the file.
+// and of this model's own total, rather than answered once for the file.
 //
-// The rule is deliberately conservative: stage only while the device still has
-// `VT_QWEN35_STAGE_MIN_FREE_FRAC` of its total memory free (default 0.55).
-// A 50 GiB model on a 119.6 GiB box starts at ~94% free and stages; the 2.4T
-// model is already past the floor when its first dense weight arrives, so it
-// never stages and keeps exactly the behaviour #1299 shipped.
+// THE RULE, IN FULL. `StagingFitsModel` below is arithmetic over two STABLE
+// numbers: `2 * model_weight_bytes + reserve_bytes <= device_total_bytes`,
+// where `reserve_bytes` comes from `VT_QWEN35_STAGE_RESERVE_BYTES` (12 GiB by
+// default). `SetSafetensorsWeightBudget` latches that answer ONCE per process.
+// NOTHING here is asked per weight, and no fraction of LIVE FREE memory is read
+// — an earlier form did both, and the comment on `SetSafetensorsWeightBudget`
+// below records what that cost. A 50 GiB model on a 119.6 GiB box clears the
+// rule and stages; the 2.4T checkpoint cannot and never does, keeping exactly
+// the behaviour #1299 shipped.
+
 // Does a model of `model_weight_bytes` leave room for a SECOND, device-resident
 // copy of itself on a device of `device_total_bytes`, keeping `reserve_bytes`
 // for the KV cache and activations?

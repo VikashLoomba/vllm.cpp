@@ -193,6 +193,153 @@ void ReportDevicePlacement(vt::DeviceType engine_device) {
   std::cerr << "engine: device placement: " << described << std::endl;
 }
 
+// ENG-HYBRID-PLACEMENT (#2314): INSTALL the resolved plan, which is the step that
+// makes every part above actually move a weight.
+//
+// W2's neighbour comment says it "RESOLVES AND REPORTS; IT MOVES NOTHING ... W3
+// owns the routing that reads it". W3 built that routing — the `RunMoePlaced`
+// seam and five architectures on it — and never added this call, so the seam read
+// a global nothing ever wrote. `ActiveMoePlacementPlan()` returned the default on
+// every load, `PlacesAnything()` was always false, and NO expert was ever placed.
+//
+// THE ANNOUNCEMENT IS WHY THAT SURVIVED. `ReportDevicePlacement` prints the
+// RESOLVED plan, so an operator running `VT_CPU_MOE=1` read
+// "device placement: N layers on cpu" on stderr and had every reason to believe
+// it. A token gate cannot see it either: with nothing placed the placed arm is
+// byte-identical to the unplaced one, so it passes for the wrong reason.
+//
+// UNCONDITIONAL, including when nothing is placed. The plan lives in a
+// process-wide global, so a second load in the same process must overwrite the
+// first model's plan rather than inherit it; an early return on "no overrides"
+// would leave a stale placement installed against the wrong model.
+void InstallMoePlacementPlan(vt::DeviceType engine_device,
+                             int64_t num_hidden_layers,
+                             const vllm::GgufFile* gguf) {
+  // An EXPLICIT `--fit` beside a manual placement is refused here rather than at
+  // parse time, which closes two holes the parse-time check cannot see: a
+  // multi-document merge, and the environment. A DEFAULTED fit is not a
+  // collision — it yields, and the manual placement wins.
+  if (const std::string collision = vllm::DescribePlacementFitCollision();
+      !collision.empty()) {
+    throw std::invalid_argument(collision);
+  }
+
+  std::vector<vllm::PlacementOverride> overrides =
+      vllm::ResolvePlacementOverrides();
+  vllm::PlacementOrigin origin = overrides.empty()
+                                     ? vllm::PlacementOrigin::kNone
+                                     : vllm::PlacementOrigin::kStated;
+  vllm::MoeFitResolution fit;
+
+  // W4 (#2384): `--fit` asks the resolver to decide the placement instead of
+  // stating it. Mutually exclusive with a manual placement, which the config
+  // parse already refuses, so reaching here with both is not expected.
+  if (vllm::ResolvePlacementFit() && overrides.empty()) {
+    if (gguf == nullptr) {
+      // INERT WHEN DEFAULTED, FATAL WHEN ASKED. `--fit` is on by default
+      // (mirroring llama.cpp), so refusing every safetensors load over a feature
+      // nobody requested would make that default a breaking change. But an
+      // operator who explicitly asked must NOT be told silently that it did not
+      // happen -- that is the #2382 failure, where a placement was announced and
+      // never installed.
+      if (!vllm::PlacementFitWasRequested()) {
+        std::cerr << "engine: device placement: --fit is on by default but "
+                     "cannot apply to a safetensors checkpoint (its weight "
+                     "footprint is not known where the placement must be "
+                     "installed); continuing with no placement"
+                  << std::endl;
+        vllm::MoePlacementPlan bare = vllm::MoePlacementPlan::Resolve(
+            vllm::DevicePlacement::FromOverrides({}, engine_device),
+            num_hidden_layers);
+        bare.set_origin(vllm::PlacementOrigin::kNone);
+        vllm::SetActiveMoePlacementPlan(bare);
+        return;
+      }
+      // REFUSE BY NAME rather than resolve to nothing. The model's weight
+      // footprint is not available at this point on the safetensors path -- the
+      // shards open downstream of where the plan must be installed, because
+      // `ResidentWeight` aliases host bytes on a CPU `Dev` and uploads
+      // otherwise, so installing after the upload pays the round trip the
+      // placement exists to avoid. A silent "fit resolved nothing" here is the
+      // #2382 failure again: the operator asks for a placement, sees no error,
+      // and gets none.
+      throw std::invalid_argument(
+          "device placement: \"vllm_cpp.placement.fit\" (--fit) is implemented "
+          "for GGUF checkpoints only; this is a safetensors checkpoint, whose "
+          "weight footprint is not known at the point the placement must be "
+          "installed. State the placement instead with \"cpu_moe\", "
+          "\"n_cpu_moe\" or \"overrides\"");
+    }
+    const size_t budget = vllm::DeviceWeightBudgetBytes(
+        vllm::platforms::GetPlatform(engine_device)
+            .residency_policy()
+            .device_memory_total_bytes);
+    const vllm::GgufStagedFootprint footprint =
+        vllm::GgufStagedWeightFootprint(*gguf);
+    fit = vllm::ResolveMoeFitFromSizes(
+        footprint.lower_bound_bytes, budget,
+        vllm::GgufRoutedExpertBytesPerLayer(*gguf, num_hidden_layers));
+
+    if (fit.resolved && fit.placed_layers > 0) {
+      overrides.clear();
+      for (int64_t l = num_hidden_layers - fit.placed_layers;
+           l < num_hidden_layers; ++l)
+        overrides.push_back({vllm::LlmFfnExpsBlockRegex(l), "cpu"});
+      origin = vllm::PlacementOrigin::kFit;
+    }
+    // A resolver that declined says why on stderr, because "--fit did nothing"
+    // is otherwise indistinguishable from "--fit is broken".
+    if (!fit.resolved) {
+      std::cerr << "engine: device placement: --fit resolved NO placement: "
+                << fit.reason << std::endl;
+    } else if (fit.placed_layers == 0) {
+      std::cerr << "engine: device placement: --fit places nothing; the model "
+                   "already fits the budget" << std::endl;
+    }
+  }
+
+  vllm::MoePlacementPlan plan = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides(overrides, engine_device),
+      num_hidden_layers);
+  plan.set_origin(plan.PlacesAnything() ? origin : vllm::PlacementOrigin::kNone);
+  plan.set_fit(fit);
+  vllm::SetActiveMoePlacementPlan(plan);
+
+  // Printed FROM THE INSTALLED PLAN, and this is the distinction that matters
+  // rather than a duplicate of `ReportDevicePlacement`. That line prints what
+  // RESOLVED, so it appeared unchanged through the whole period when nothing was
+  // installed and nothing was placed — it is what made #2314 invisible to the one
+  // signal an operator checks. This line cannot appear unless the plan reached
+  // the seam's global, so a gate can distinguish a real placement from a vacuous
+  // one, which a token comparison alone cannot do.
+  //
+  // Only when it actually places, so an ordinary load stays byte-identical on
+  // stderr.
+  if (plan.PlacesAnything()) {
+    std::cerr << "engine: device placement INSTALLED: " << plan.Describe()
+              << " (resolved against " << plan.resolved_layer_count()
+              << " layers, origin "
+              << vllm::PlacementOriginName(plan.origin()) << ")" << std::endl;
+    if (plan.origin() == vllm::PlacementOrigin::kFit) {
+      // The ARITHMETIC, not just the verdict. An operator who cannot see the
+      // budget and the footprint cannot tell a wrong placement from a wrong
+      // budget. The whole-layer granularity is stated here too, because this
+      // resolver cannot place the half-layer upstream can and a user comparing
+      // against llama.cpp would otherwise have to infer that from a number.
+      std::cerr << "engine: device placement: --fit placed " << fit.placed_layers
+                << " layer(s) (" << fit.placed_bytes << " B) to bring a "
+                << fit.footprint_bytes << " B footprint under a "
+                << fit.budget_bytes
+                << " B budget; WHOLE layers only, so a partial layer is taken "
+                   "entirely"
+                << (fit.still_exceeds
+                        ? "; STILL EXCEEDS the budget with every layer placed"
+                        : "")
+                << std::endl;
+    }
+  }
+}
+
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device) {
   if (device != vllm::Device::kAuto) {
@@ -2476,8 +2623,19 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // first-forward throw with the model fully resident that
     // `DeviceQuantGatherSupported` exists to prevent. One resolution cannot
     // disagree with itself.
+    //
+    // The MoE placement plan below was a THIRD call to the same function when
+    // #2314 landed under this row. It takes the carried value for the same
+    // reason the other two do: a placement plan installed for one device while
+    // the residency policy resolves another is the same class of defect this
+    // row exists to remove.
     const vt::DeviceType gguf_device =
         ResolveModelDeviceType(gguf_arch.architecture, params.device);
+    // #2314: before ANY weight I/O, so a CPU-placed layer is never staged onto
+    // the device first — `ResidentWeight` aliases host bytes on a CPU `Dev` and
+    // uploads otherwise, so this ordering is what makes the placement free
+    // rather than a round trip.
+    InstallMoePlacementPlan(gguf_device, config.num_hidden_layers, &gguf);
     // Issue #1123: refuse a GGUF whose weights cannot be STAGED onto the target
     // device, here, before any weight I/O and before the tokenizer.
     //
@@ -2905,6 +3063,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   }
   HfConfig config = vllm::LoadHfConfig(config_path);
   const ModelRegistration& registration = ModelRegistry::Resolve(config);
+  // #2314, and see the GGUF branch above for why this precedes weight I/O.
+  // No `GgufFile` on this path: `--fit` refuses by name rather than resolving to
+  // nothing, because the safetensors footprint is not knowable here.
+  InstallMoePlacementPlan(
+      ResolveModelDeviceType(registration.architecture, params.device),
+      config.num_hidden_layers, /*gguf=*/nullptr);
   // ENG-WEIGHT-OFFLOAD totality guard. Refuse a configured offload against a
   // model whose loader does not consult the offloader, BEFORE any weight I/O.
   // Without this the budget would be accepted and free nothing, with no error
@@ -2995,6 +3159,27 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
+
+    // ENG-WEIGHT-OFFLOAD (#2386): the SECOND guard, and the only one that can
+    // see this particular lie. `RefuseUnsupportedWeightOffload` runs BEFORE the
+    // load and can only ask whether the architecture DECLARES support. A loader
+    // that declares it and then never calls `ConsiderWeight` offloads nothing,
+    // and the run frees no memory with no error anywhere — zero consulted
+    // weights is the only evidence that proves it, and that count does not exist
+    // until the load has finished. Hence here, and not beside its sibling.
+    //
+    // It had no production caller until now: declaration, definition and four
+    // test assertions, while `docs/WEIGHT-OFFLOAD.md` described it in the
+    // present tense as shipped behaviour. It is currently VACUOUS rather than
+    // wrong — no registration sets `supports_weight_offload`, so the first guard
+    // refuses every configured offload before this one is reached — but it stops
+    // being vacuous the day anyone wires a loader, which is exactly when its
+    // absence would be silent.
+    vllm::VerifyWeightOffloadWasConsulted(
+        vllm::GetWeightOffloader(), registration.architecture,
+        registration.factory != nullptr &&
+            registration.factory->supports_weight_offload);
+
     maybe_attach_mtp(*model);
     std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
@@ -3015,6 +3200,27 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
+
+    // ENG-WEIGHT-OFFLOAD (#2386): the SECOND guard, and the only one that can
+    // see this particular lie. `RefuseUnsupportedWeightOffload` runs BEFORE the
+    // load and can only ask whether the architecture DECLARES support. A loader
+    // that declares it and then never calls `ConsiderWeight` offloads nothing,
+    // and the run frees no memory with no error anywhere — zero consulted
+    // weights is the only evidence that proves it, and that count does not exist
+    // until the load has finished. Hence here, and not beside its sibling.
+    //
+    // It had no production caller until now: declaration, definition and four
+    // test assertions, while `docs/WEIGHT-OFFLOAD.md` described it in the
+    // present tense as shipped behaviour. It is currently VACUOUS rather than
+    // wrong — no registration sets `supports_weight_offload`, so the first guard
+    // refuses every configured offload before this one is reached — but it stops
+    // being vacuous the day anyone wires a loader, which is exactly when its
+    // absence would be silent.
+    vllm::VerifyWeightOffloadWasConsulted(
+        vllm::GetWeightOffloader(), registration.architecture,
+        registration.factory != nullptr &&
+            registration.factory->supports_weight_offload);
+
     maybe_attach_mtp(*model);
     std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(

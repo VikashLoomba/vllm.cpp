@@ -56,6 +56,8 @@
 #include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"
 #include "vllm/model_executor/models/qwen4_exp_ple.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vt/op_provider.h"  // vt::OpRegistered — the gather capability is a registry fact
+#include "vt/ops.h"
 #include "vt/dtype.h"
 #include "vt/quant.h"
 
@@ -728,9 +730,10 @@ TEST_CASE("qwen4_exp GGUF: the load accounts every tensor in the file") {
 
 TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load") {
   // #2083. The n-gram table is the ONE gather this model keeps quantized, and
-  // `DeviceQuantGatherSupported` is true for `kCPU` alone
-  // (`gguf_keep_quant.cpp`) because only the CPU `Embedding` kernel decodes
-  // blocks. On any other device `RouteGgufTensor` therefore sends
+  // `DeviceQuantGatherSupported` is true for `kCPU` and `kCUDA`
+  // (`gguf_keep_quant.cpp`) — the two `Embedding` kernels that decode blocks,
+  // CUDA since KGATHER. On METAL, VULKAN, ROCM and TENSTORRENT, whose gather
+  // kernels each assert a float table by name, `RouteGgufTensor` sends
   // `per_layer_token_embd.weight` to `kExpandBf16`, and on the shipped
   // artifact that tensor is [320001536, 160]: 320001536 * 160 * 2 =
   // 102,400,491,520 bytes = 95.368 GiB of ANONYMOUS host memory, against
@@ -752,31 +755,61 @@ TEST_CASE("qwen4_exp GGUF: a device with no block gather refuses BEFORE the load
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
 
-  SUBCASE("cuda refuses, and the message names the tensor and the missing arm") {
+  SUBCASE("metal refuses, and the message names the tensor and the missing arm") {
+    // METAL stands where CUDA stood: `metal_ops.mm`'s `kEmbedding` takes a
+    // float table only. The subcase moved device rather than being deleted,
+    // because what it gates is the REFUSAL'S CONTENT — that it names the
+    // tensor, the device and the missing part — and that obligation outlives
+    // whichever device happens to lack the arm.
     std::string msg;
     try {
-      (void)vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCUDA);
+      (void)vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kMETAL);
     } catch (const std::exception& e) {
       msg = e.what();
     }
     CAPTURE(msg);
     // CHECK, not REQUIRE: a fatal assertion here aborts the whole test case and
-    // the two subcases below never report at all.
+    // the subcases below never report at all.
     CHECK_FALSE(msg.empty());
     CHECK(msg.find("per_layer_token_embd.weight") != std::string::npos);
-    CHECK(msg.find("cuda") != std::string::npos);
+    CHECK(msg.find("metal") != std::string::npos);
     // The refusal has to say what is MISSING, not only that something is.
     CHECK(msg.find("gather") != std::string::npos);
   }
 
-  SUBCASE("every non-CPU device refuses, because none of them decodes blocks") {
+  SUBCASE("every device with no block-decoding gather in ANY build still refuses") {
+    // kCUDA is deliberately NOT in this list any more: it is build-dependent and
+    // the subcase above asks the registry about it. These three have no gather
+    // arm in any build.
     for (vt::DeviceType d :
-         {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL,
-          vt::DeviceType::kVULKAN, vt::DeviceType::kROCM}) {
+         {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
+          vt::DeviceType::kROCM}) {
+      // `std::string`, because doctest stringifies a bare `const char*` as a
+      // BOOL — the capture read `1` for every device and named none of them.
       CAPTURE(std::string(vt::DeviceTypeName(d)));
       CHECK_THROWS_AS(
           (void)vllm::LoadQwen4ExpFromGguf(g, cfg, d),
           std::exception);
+    }
+  }
+
+  SUBCASE("cuda follows the OP TABLE, not a hardcoded verdict") {
+    // KGATHER made the gather a registered capability
+    // (`OpId::kEmbeddingQuant`), so whether this device loads is decided by
+    // whether THIS BUILD linked the CUDA registrar -- not by a constant here.
+    // Asserting a fixed verdict would make this case a second, competing
+    // source of truth about the same fact, and the two would drift the first
+    // time a backend gained or lost the arm.
+    const bool gathers =
+        vt::OpRegistered(vt::OpId::kEmbeddingQuant, vt::DeviceType::kCUDA);
+    CAPTURE(gathers);
+    if (gathers) {
+      CHECK_NOTHROW((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
+                                                     vt::DeviceType::kCUDA));
+    } else {
+      CHECK_THROWS_AS((void)vllm::LoadQwen4ExpFromGguf(g, cfg,
+                                                       vt::DeviceType::kCUDA),
+                      std::exception);
     }
   }
 
@@ -1006,21 +1039,45 @@ TEST_CASE("qwen4_exp GGUF: the registry hook routes on the ENGINE's resolved "
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
 
-  SUBCASE("a CUDA-resolved load refuses THROUGH THE HOOK") {
+  SUBCASE("a NON-GATHERING resolved device refuses THROUGH THE HOOK") {
     // Fails on the pre-fix tree: the hook discarded the resolved device and
     // asked the probe, which on this CPU-only build answers `kCPU`, so the
     // load succeeded and nothing refused.
+    //
+    // METAL, not CUDA. This subcase named `kCUDA` until #2396 landed
+    // `OpId::kEmbeddingQuant` and gave CUDA a real gather arm, at which point
+    // "CUDA refuses" became a build-dependent fact and this assertion became
+    // wrong on exactly the build the flip enables — and invisible here, because
+    // a CPU-only CI leaves `OpRegistered(kEmbeddingQuant, kCUDA)` false. Metal
+    // registers no gather in any build, so it states what this case actually
+    // owns: the RESOLVED DEVICE reaches the loader. The CUDA leg is asked of
+    // the op table below instead.
     std::string msg;
     try {
-      (void)LoadThroughRegistry(g, vt::DeviceType::kCUDA);
+      (void)LoadThroughRegistry(g, vt::DeviceType::kMETAL);
     } catch (const std::exception& e) {
       msg = e.what();
     }
     CAPTURE(msg);
     CHECK_FALSE(msg.empty());
     CHECK(msg.find("per_layer_token_embd.weight") != std::string::npos);
-    CHECK(msg.find("cuda") != std::string::npos);
+    CHECK(msg.find("metal") != std::string::npos);
     CHECK(msg.find("gather") != std::string::npos);
+  }
+
+  SUBCASE("the CUDA leg follows the OP TABLE, through the hook") {
+    // The same contract `LoadQwen4ExpFromGguf`'s own suite states one level
+    // down, asserted where the ENGINE enters: whether a CUDA-resolved load
+    // refuses is decided by whether this build linked the CUDA registrar.
+    const bool gathers =
+        vt::OpRegistered(vt::OpId::kEmbeddingQuant, vt::DeviceType::kCUDA);
+    CAPTURE(gathers);
+    if (gathers) {
+      CHECK_NOTHROW((void)LoadThroughRegistry(g, vt::DeviceType::kCUDA));
+    } else {
+      CHECK_THROWS_AS((void)LoadThroughRegistry(g, vt::DeviceType::kCUDA),
+                      std::exception);
+    }
   }
 
   SUBCASE("a CPU-resolved load LOADS — this is `--device cpu` on a CUDA box") {
@@ -1032,10 +1089,11 @@ TEST_CASE("qwen4_exp GGUF: the registry hook routes on the ENGINE's resolved "
     CHECK(m != nullptr);
   }
 
-  SUBCASE("every non-CPU resolved device refuses through the hook") {
-    for (vt::DeviceType d :
-         {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL,
-          vt::DeviceType::kVULKAN, vt::DeviceType::kROCM}) {
+  SUBCASE("every device with no gather arm in ANY build refuses via the hook") {
+    // `kCUDA` is deliberately absent: #2396 made it build-dependent, and the
+    // subcase above asks the op table about it.
+    for (vt::DeviceType d : {vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
+                             vt::DeviceType::kROCM}) {
       CAPTURE(std::string(vt::DeviceTypeName(d)));
       CHECK_THROWS_AS((void)LoadThroughRegistry(g, d), std::exception);
     }
@@ -1095,12 +1153,19 @@ TEST_CASE("qwen4_exp GGUF: FromModelDir carries the RESOLVED device to the load"
 
   // And the refusal is REACHABLE from this same entry point, so the check above
   // is a real discrimination rather than an assertion about an error that can
-  // never occur here. `kNamedPlatform` is "cuda": on a CPU-only build no CUDA
-  // platform is registered, so `ResolveExplicitDeviceType` refuses BY NAME
-  // instead — a different message, and the one that proves the explicit-device
-  // path is live. On a CUDA build the same request resolves `kCUDA` and the
-  // PLE gather refusal is what comes back. Either way the request must FAIL,
-  // and it must fail differently from the `kCPU` request above.
+  // never occur here. `kNamedPlatform` is "cuda", and what that request does is
+  // BUILD-DEPENDENT in two independent ways, so this asks about each rather
+  // than fixing a verdict:
+  //
+  //   * no CUDA platform registered (a CPU-only build) -> `--device cuda` is
+  //     refused BY NAME by `ResolveExplicitDeviceType`, which is the message
+  //     that proves the explicit-device path is live at all;
+  //   * CUDA registered and `kEmbeddingQuant` NOT registered -> the PLE gather
+  //     refusal, naming the tensor;
+  //   * CUDA registered WITH the gather (#2396) -> no gather refusal is
+  //     legitimate, and this case must not demand one. It said the request
+  //     "must FAIL" until #2396 landed; that was a hardcoded verdict about
+  //     someone else's capability and it would have red on a CUDA lane alone.
   vllm::entrypoints::EngineParams cuda_params;
   cuda_params.device = vllm::Device::kNamedPlatform;
   std::string cuda_msg;
@@ -1110,12 +1175,24 @@ TEST_CASE("qwen4_exp GGUF: FromModelDir carries the RESOLVED device to the load"
     cuda_msg = e.what();
   }
   CAPTURE(cuda_msg);
-  CHECK_FALSE(cuda_msg.empty());
-  const bool cuda_absent =
-      cuda_msg.find("no CUDA platform is available") != std::string::npos;
+  const bool cuda_registered =
+      vllm::platforms::FindPlatformByName("cuda") != nullptr;
+  const bool cuda_gathers =
+      vt::OpRegistered(vt::OpId::kEmbeddingQuant, vt::DeviceType::kCUDA);
+  CAPTURE(cuda_registered);
+  CAPTURE(cuda_gathers);
   const bool cuda_gather_refusal =
       cuda_msg.find("per_layer_token_embd.weight") != std::string::npos &&
       cuda_msg.find("gather") != std::string::npos;
-  CHECK((cuda_absent || cuda_gather_refusal));
-  CHECK(cuda_msg != msg);
+  if (!cuda_registered) {
+    // The only arm this CPU-only build can reach, and it must be REACHED —
+    // otherwise the `kCPU` assertion above is compared against nothing.
+    CHECK(cuda_msg.find("no CUDA platform is available") != std::string::npos);
+    CHECK(cuda_msg != msg);
+  } else if (cuda_gathers) {
+    // A device that gathers must never be refused FOR NOT GATHERING.
+    CHECK_FALSE(cuda_gather_refusal);
+  } else {
+    CHECK(cuda_gather_refusal);
+  }
 }

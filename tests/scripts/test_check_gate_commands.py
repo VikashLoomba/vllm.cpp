@@ -997,7 +997,10 @@ class RatchetTests(unittest.TestCase):
         self.assertIsNone(verdicts.get("ENG-PREFLIGHT-COMPILES"))
         self.assertNotIn("ENG-PREFLIGHT-COMPILES", gates.RUNNABLE_BASELINE)
         spec = ROOT / ".agents/specs/preflight-compiles.md"
-        commands = gates.runnable_commands(spec.read_text(encoding="utf-8"))
+        text = spec.read_text(encoding="utf-8")
+        section = gates.gates_section(text)
+        self.assertIsNotNone(section)
+        commands = gates.runnable_commands(section)
         self.assertIn("python3 tests/scripts/test_check_tree_compiles.py", commands)
         self.assertIn(
             "python3 scripts/check-tree-compiles.py --base origin/main", commands

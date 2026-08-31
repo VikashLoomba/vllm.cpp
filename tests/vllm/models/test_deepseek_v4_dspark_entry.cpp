@@ -419,7 +419,9 @@ vllm::DeepseekV4MtpHead TinyHead(const vllm::DeepseekV4Params& p,
   add("attn.wq_a.weight", p.q_lora_rank, H);
   add("attn.wq_b.weight", p.num_attention_heads * D, p.q_lora_rank);
   add("attn.wkv.weight", D, H);
-  add("attn.wo_a.weight", p.o_groups * p.o_lora_rank, H);
+  // `[n_groups, o_lora_rank, n_heads*head_dim/n_groups]`, so the element count is
+  // `o_lora_rank * n_heads * head_dim` -- NOT `o_groups*o_lora_rank x hidden`.
+  add("attn.wo_a.weight", p.o_lora_rank * p.num_attention_heads, D);
   add("attn.wo_b.weight", H, p.o_groups * p.o_lora_rank);
   add("ffn.gate.weight", p.n_routed_experts, H);
   add("ffn.gate.bias", p.n_routed_experts, 1);
@@ -564,4 +566,103 @@ TEST_CASE("W-4b: a projection sized for the hidden half alone REFUSES") {
   const std::vector<float> short_proj{1.0f, 1.0f};  // H only, missing the rank half
   CHECK_THROWS(
       vllm::dspark::ConfidenceDraftLength(xpre, emb, short_proj, 0.5f, B, H, R));
+}
+
+// ── W-3: one DSpark block's attention half ──────────────────────────────────
+
+TEST_CASE("W-3: a block attends the rows BlockKvRows wrote, without rewriting them") {
+  // The whole point of the `kv_prewritten` seam. A DSpark block's KV comes from
+  // the TARGET's taps, so the block must attend rows it did not compute -- and
+  // must not overwrite them with rows derived from its own hidden state.
+  vllm::DeepseekV4Params p = TinyBlockParams();
+  p.num_hidden_layers = 1;
+  p.num_attention_heads = 2;
+  p.qk_rope_head_dim = 2;
+  p.rms_norm_eps = 1e-6f;
+  p.rope_theta = 10000.0;
+  p.sliding_window = 0;
+
+  std::vector<std::vector<float>> storage;
+  const vllm::DeepseekV4MtpHead h = TinyHead(p, &storage);
+  vllm::DeepseekV4LayerHostWeights L;
+  bool missing = false;
+  REQUIRE(vllm::dspark::AssembleBlockWeights(h, p, &L, &missing).empty());
+  // The block forward needs the routed experts, which assembly deliberately does
+  // not fill (20.2 GiB at the real geometry). Fill them HERE, at tiny shape, so
+  // the attention half can be exercised.
+  const int64_t E = p.n_routed_experts, mi = p.moe_intermediate_size,
+                H = p.hidden_size;
+  L.exp_w1.assign(static_cast<size_t>(E * mi * H), 0.02f);
+  L.exp_w3.assign(static_cast<size_t>(E * mi * H), 0.02f);
+  L.exp_w2.assign(static_cast<size_t>(E * H * mi), 0.02f);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = p.head_dim, bs = 8, nb = 2, T = 1, kv_base = 3;
+  std::vector<float> cache(static_cast<size_t>(nb * bs * hd), 0.0f);
+  // A RECOGNISABLE pattern: these are the rows the taps wrote.
+  for (size_t i = 0; i < cache.size(); ++i)
+    cache[i] = 0.01f * static_cast<float>((i * 5) % 29) - 0.1f;
+  const std::vector<float> before = cache;
+  std::vector<vt::Tensor> pages{vt::Tensor::Contiguous(
+      cache.data(), vt::DType::kF32, q.device, {nb, bs, hd})};
+
+  const std::vector<float> x(static_cast<size_t>(T * H), 0.05f);
+  const std::vector<int32_t> pos{static_cast<int32_t>(kv_base)};
+  const std::vector<float> o = vllm::DsparkBlockAttentionHost(q, L, p, x, pos, pages,
+                                                              /*layer=*/0, kv_base);
+  REQUIRE(o.size() == static_cast<size_t>(T * H));
+  for (const float v : o) REQUIRE(std::isfinite(v));
+
+  // THE CLAIM: the tap-written rows survive byte for byte.
+  for (size_t i = 0; i < before.size(); ++i) {
+    if (before[i] != cache[i]) {
+      CAPTURE(i);
+      REQUIRE(before[i] == cache[i]);
+    }
+  }
+  // ...and the attention actually READ them: zeroing the cache must change the
+  // output, or the block would be attending nothing and still returning finitely.
+  std::vector<float> zeroed(cache.size(), 0.0f);
+  std::vector<vt::Tensor> zpages{vt::Tensor::Contiguous(
+      zeroed.data(), vt::DType::kF32, q.device, {nb, bs, hd})};
+  const std::vector<float> oz =
+      vllm::DsparkBlockAttentionHost(q, L, p, x, pos, zpages, 0, kv_base);
+  double diff = 0.0;
+  for (size_t i = 0; i < o.size(); ++i)
+    diff = std::max(diff, std::abs(static_cast<double>(o[i] - oz[i])));
+  CHECK(diff > 1e-9);
+}
+
+TEST_CASE("W-3: a block carrying a compressor is REFUSED") {
+  // `mtp_layer_types` is asserted "sliding" (`deepseek_v4_mtp.py:61-63`): a
+  // DSpark block is compressor-less and has no indexer. A layer carrying either
+  // is not a DSpark block, and running it as one would take the DSA path.
+  vllm::DeepseekV4Params p = TinyBlockParams();
+  p.num_hidden_layers = 1;
+  std::vector<std::vector<float>> storage;
+  const vllm::DeepseekV4MtpHead h = TinyHead(p, &storage);
+  vllm::DeepseekV4LayerHostWeights L;
+  bool missing = false;
+  REQUIRE(vllm::dspark::AssembleBlockWeights(h, p, &L, &missing).empty());
+  L.comp_wgate.assign(4, 1.0f);  // not a DSpark block any more
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  std::vector<float> cache(static_cast<size_t>(16 * p.head_dim), 0.0f);
+  std::vector<vt::Tensor> pages{vt::Tensor::Contiguous(
+      cache.data(), vt::DType::kF32, q.device, {2, 8, p.head_dim})};
+  const std::vector<float> x(static_cast<size_t>(p.hidden_size), 0.05f);
+  // It must refuse BY NAME. Something downstream throws anyway on the widened
+  // tensor -- an anonymous size error -- so asserting only that it throws proves
+  // nothing about THIS guard, and a mutation removing the guard survived exactly
+  // that weaker assertion.
+  std::string msg;
+  try {
+    (void)vllm::DsparkBlockAttentionHost(q, L, p, x, {0}, pages, 0, 0);
+    FAIL("expected a refusal");
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  CAPTURE(msg);
+  CHECK(msg.find("COMPRESSOR-LESS") != std::string::npos);
+  CHECK(msg.find("sliding") != std::string::npos);
 }

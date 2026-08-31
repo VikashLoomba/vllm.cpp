@@ -195,4 +195,19 @@ std::vector<std::vector<float>> DeepseekV4TrunkTapsHost(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int64_t>& layer_ids);
 
+// W-3: ONE DSpark block's attention half, host oracle.
+//
+// A DSpark block is a compressor-less V4 decoder layer, so this drives the SAME
+// `AttentionBlock` the trunk uses -- extending that seam rather than writing a
+// second attention. The one difference is where the KV comes from: the rows were
+// written by `BlockKvRows` from the projected trunk taps, so the step attends
+// them WITHOUT writing its own, through the `kv_prewritten` mode.
+//
+// `pages` must already hold this block's rows at `[0, kv_base + num_tokens)`.
+std::vector<float> DsparkBlockAttentionHost(
+    vt::Queue& queue, const DeepseekV4LayerHostWeights& L,
+    const DeepseekV4Params& p, const std::vector<float>& x,
+    const std::vector<int32_t>& positions, std::vector<vt::Tensor>& pages,
+    int64_t layer, int64_t kv_base);
+
 }  // namespace vllm

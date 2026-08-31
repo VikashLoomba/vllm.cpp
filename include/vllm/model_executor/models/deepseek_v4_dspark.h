@@ -12,6 +12,7 @@
 // about 2.64 accepted tokens per step.
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4.h"
@@ -130,6 +131,31 @@ std::vector<float> BlockKvRows(const std::vector<float>& main_x,
                                const std::vector<int32_t>& positions, double rope_theta,
                                int64_t num_tokens, int64_t hidden, int64_t head_dim,
                                int64_t rope_dim);
+
+// W-3, THE BLOCK'S WEIGHTS. A DSpark block IS a V4 decoder layer of the
+// compressor-less kind -- `DSparkAttention` with `compress_rate = None` over a
+// `BlockSparseMLP` with a shared expert and two `HyperConnection`s
+// (`exllamav3/architecture/deepseek_v4_mtp.py:60-128`). So it fills the SAME
+// `DeepseekV4LayerHostWeights` the trunk's layers use, and the existing
+// `AttentionBlock` / `MoeBlock` / `MhcPre` / `MhcPost` compose it unchanged.
+// Extending that seam is the point; a parallel block forward would be the thing
+// `AGENTS.md` forbids.
+//
+// The compressor and indexer fields stay EMPTY, because these blocks carry
+// neither -- the artifact has no `mtp.L.attn.compressor.*` or `.indexer.*`.
+//
+// THE ROUTED EXPERTS ARE NOT FILLED, and that is a decision rather than an
+// omission: one block's are 216 x 3 x [2048, 4096] = 5.44G values, which is
+// 20.2 GiB as host f32. `out_missing_experts` is set so a caller learns it from
+// the return rather than from a later empty-vector crash, and the host arm of
+// `MoeBlock` already refuses by name when `exp_w1` is empty.
+//
+// Returns a refusal naming the first tensor it could not resolve, empty on
+// success.
+std::string AssembleBlockWeights(const DeepseekV4MtpHead& head,
+                                 const DeepseekV4Params& p,
+                                 DeepseekV4LayerHostWeights* out,
+                                 bool* out_missing_experts);
 
 }  // namespace vllm::dspark
 

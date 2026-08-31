@@ -200,6 +200,21 @@ The first cases met neither condition, so a mutation that roped before norming
 passed them. The added case uses a non-zero position AND a gamma that differs
 inside the pair, which is the only shape in which the order is observable at all.
 
+W-3's WEIGHT ASSEMBLY LANDED. A DSpark block IS a compressor-less V4 decoder
+layer, so `AssembleBlockWeights` fills the SAME `DeepseekV4LayerHostWeights` the
+trunk's layers use and the existing `AttentionBlock`, `MoeBlock`, `MhcPre` and
+`MhcPost` compose it unchanged. Extending that seam is the point; a parallel block
+forward is what `AGENTS.md` forbids.
+
+Two absences are deliberate and both are gated. The compressor and indexer fields
+stay EMPTY, because these blocks carry neither, and a populated `comp_wgate` would
+send a drafter block down the DSA path. The routed experts are NOT filled -- one
+block's are 20.2 GiB as host f32 -- and the caller is told through
+`out_missing_experts` rather than meeting an empty vector later.
+
+Shapes are checked at assembly rather than inside a forward, where a mismatch
+surfaces as an anonymous MatVec size error naming no tensor and no layer.
+
 W-4 LANDED. `MarkovDraftLoop` is the sequential chain: per step one embedding
 gather, one rank-256 GEMV and an argmax, with the bias conditioned on the
 PREVIOUSLY SAMPLED id. Ties go to the lowest id, matching `torch.argmax`, because

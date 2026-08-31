@@ -2631,6 +2631,38 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   to generalise rather than this row's to reach into another model's loader.
   Named here so a reader does not conclude the lane is clean.
 
+- **O31 — `token_embd.weight` WAS ASKED THE WRONG ROLE, AND ONLY A DEVICE CAN
+  SEE IT.** The GGUF loader routed the vocabulary table through `LoadMatmul`,
+  which asks `GgufTensorRole::kMatmulWeight`. A GEMM weight's device gate is
+  `DeviceKeepQuantSupported`, TRUE on CUDA because the CUDA backend falls back to
+  the CPU kernel for anything it lacks; a GATHER's gate is
+  `DeviceQuantGatherSupported`, true ONLY on the CPU, because
+  `EmbeddingKernelCuda` accepts f32 and bf16 tables and nothing else and has no
+  fallback tier. So on a device queue this checkpoint's `[154880, 6144]` Q4_K
+  table stayed Q4_K and the FIRST forward threw, with all 201.83 GiB of the model
+  already resident and the engine's caches already sized:
+  `vt: cuda embedding: unsupported table dtype (f32/bf16 only) at
+  src/vt/cuda/cuda_ops.cu:861`. Measured on `thor:gpu0`, 2026-08-31, at 892 s of
+  wall clock into the run.
+  **Fixed in the same flow** by asking the role the tensor actually has:
+  `LoadEmbeddingTable` routes `kEmbeddingTable`, and the shared policy then
+  expands to bf16 on a device queue and keeps the blocks on a CPU one. The tied
+  case takes the intersection of both roles, because a gather needs only a row
+  decoder while a GEMM needs a `vec_dot`. The cost is exact and stated rather than
+  discovered: 1.772 GiB of bf16 where 0.5 GiB of Q4_K stood, on top of O27's
+  ~18.99 GiB.
+  **NO CPU GATE CAN SEE THIS, and that is measured rather than assumed.** On a CPU
+  runner `DeviceQuantGatherSupported` is true, so the gather role and the GEMM
+  role reach the SAME residency for every encoding in this tree — the decoder set
+  and the `vec_dot` set differ only on `Q8_K`, which is an activation encoding
+  and never a file weight. There is therefore no fixture that separates the two
+  arms without a fake non-CPU platform, which is a second test binary and a
+  second registered platform. This is O14's and O29's statement for a third
+  surface. What DOES gate it is the row's own declared gate, the load on a leased
+  device, before and after, on the same artifact and the same command.
+  Discharged by a fake-platform loader suite, which belongs with O14's, or by the
+  CUDA quantized gather `gguf_keep_quant.cpp` already records as owed.
+
 ### 3.10 Now
 
 **W7 LANDED ITS LOADER AND DID NOT PRODUCE A TOKEN, 2026-08-30**

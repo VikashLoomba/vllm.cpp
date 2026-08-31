@@ -173,3 +173,399 @@ before this row every CPU RmsNorm test ran them all f32 or all bf16.
 
 `ACTIVE`. W1, W2 and W3 are complete on x86-64. The aarch64 half and the
 unhoisted remainder of the ranked set are owed and named in `## Owed`.
+
+## Outcome
+
+### The headline
+
+**The dispatch is not a two-kernel defect and it is not a 62-kernel sweep. It is
+a ranked list of 24, and this row publishes it.** Of the 47 unhoisted kernels
+measured, **24 read `LoadF32` at or above the recalibrated bar and 23 read below
+it**, so half the population is now excluded by measurement rather than by
+argument, and the other half is ordered.
+
+**One kernel is hoisted here — `RmsNormKernel` — and it is 12.6x, byte-identical.**
+Not because it tops the ranking (it is 8th) but because it is the widest-reaching
+entry on it: every text model in the tree calls `vt::RmsNorm` twice per layer, and
+the `FusedChain` tier-0 walker dispatches `kRmsNorm` to it. The other 23 stay in
+`## Owed`, ranked, because each needs its own byte-equality gate and eight
+mutations, and doing them in one change is the sweep the predecessor row forbade.
+
+**`__attribute__((always_inline))` on `LoadF32` is a win in 43 of 48 kernels, up
+to 4.58x, and it costs one kernel 15-18%.** The predecessor row deferred it for
+want of exactly this measurement. The i-cache regression it feared is real, it is
+measurable, and it is confined to `GdnDecodeKernel`.
+
+### The instrument, and the bar it is read against
+
+`tools/bench/vt_cpu_elem_survey_probe.cpp`, `perf record -e cpu-clock -F 1999`,
+`VLLM_CPP_CPU_THREADS=1`, one `--op` per run. Self percentages are
+whole-process; the probe's setup is amortised by sizing `--reps` so each run is
+about three seconds of the op.
+
+**The ~30% bar is recalibrated onto this instrument rather than carried across,
+because the two instruments do not read the same number.** The predecessor
+profiled at the shipped thread count and read `LoadF32` at 62.68% for
+`AttentionCrossKernel`. Rebuilding that exact pre-hoist `cpu_ops.cpp`
+(`2fd1d72f0^`, the only commit that touched the file in the range) and profiling
+it here reads:
+
+| kernel, PRE-HOIST | `LoadF32` self%, 1 thread | predecessor, shipped threads |
+|---|---:|---:|
+| `AttentionCrossKernel` | **67.93%** | 62.68% |
+| `AttentionKernel` | **72.77%** | — |
+
+So this instrument reads about 1.08x the predecessor's, and the ~30% bar
+translates to **~32.5%** here. That is the line the ranking below is cut at.
+
+The same two binaries also re-measure the predecessor's own result on this
+instrument, which is what says the calibration is of the same effect: at the
+LTX-2.5 connector's video shape, one thread, `AttentionCrossKernel` 57.563 s ->
+5.474 s = **10.52x** and `AttentionKernel` 79.975 s -> 4.100 s = **19.51x**. Both
+sit inside the 8.75x-11.16x the predecessor measured at the shipped thread count,
+and the causal kernel's larger figure is the shape's, not a disagreement.
+
+**Every number in this row is x86-64 AVX-512 on a devbox that was never idle.**
+Three other agents compiled throughout and loadavg ran 63 to 146. That is why the
+ranking is single-threaded: at the shipped thread count on this box
+`Threadpool::Barrier()` reads 46.77% for `RmsNormKernel` against 16.69% in the
+predecessor's profile, so a multithreaded ranking here would rank contention.
+
+### W1 — the ranking
+
+47 candidate kernels plus the two already-hoisted ones, each run alone at the
+shape named beside it. `StoreF32` is printed too, because a kernel whose store
+side is heavy pays for the hoist twice.
+
+| # | kernel | LoadF32 self% | StoreF32 self% | probe shape | the model it comes from |
+|---:|---|---:|---:|---|---|
+| 1 | `BatchedMatmulKernel` | **70.46** | 0.71 | `a[32,1024,128] x b[32,128,128] f32` | LTX-2.5 per-head batched GEMM, 32 heads |
+| 2 | `CausalConv1dFwdKernel` | **55.81** | 2.38 | `x[1024,10240] f32, w[10240,4]` | Qwen3.6-27B GDN prefill conv, 1024 tokens |
+| 3 | `CastBf16Kernel` | **54.34** | 21.74 | `x[1024,5120] f32 -> bf16` | f32 -> bf16 activation cast, prefill |
+| 4 | `RopeFromCacheKernel` | **52.98** | 17.49 | `q[1024,24,256] k[1024,4,256] f32, cache[1024,64]` | Qwen3.6-27B RopeFromCache q/k, prefill |
+| 5 | `FusedNormRopeKernel` | **52.23** | 11.79 | `x[1024,576] f32, latent 512 \| pe 64` | DeepSeek-V3 MLA fused kv_a norm+rope, prefill |
+| 6 | `RmsNormGroupKernel` | **50.74** | 10.89 | `x[1024,5120] f32, group=128` | Qwen4-exp grouped RMSNorm, prefill |
+| 7 | `AttnGateSplitKernel` | **49.87** | 29.30 | `qgate[1024,12288] f32` | Qwen3.6-27B attn_output_gate q\|gate split, prefill |
+| 8 | `RmsNormKernel` | **49.06** | 12.05 | `x[1024,5120] f32, w[5120]` | Qwen3.6-27B input_layernorm, prefill |
+| 9 | `MulScalarKernel` | **47.09** | 23.43 | `x[1024,5120] f32` | Gemma embedding normalizer, prefill |
+| 10 | `AttnQkNormRopeGateKernel` | **47.04** | 15.00 | `qgate[1024,12288] kf[1024,1024] f32` | Qwen3.6-27B fused attention preamble, prefill |
+| 11 | `GdnConvSplitKernel` | **43.61** | 29.48 | `conv[1024,10240] f32` | Qwen3.6-27B GDN mixed-qkv split, prefill |
+| 12 | `CastF32Kernel` | **42.56** | 25.38 | `x[1024,5120] bf16 -> f32` | bf16 -> f32 GEMM-result cast, prefill |
+| 13 | `Mamba2StateUpdateKernel` | **42.30** | 13.58 | `state[16,128,64,128] f32` | NemotronH Mamba2 decode step, c16 |
+| 14 | `L2NormKernel` | **40.97** | 16.70 | `x[1024,16,128] f32` | Qwen3.6-27B GDN q/k l2norm, prefill |
+| 15 | `QkvSplitKernel` | **40.40** | 36.63 | `qkv[1024,8192] f32` | Qwen3.6-27B merged QKV split, prefill |
+| 16 | `GdnPostConvKernel` | **40.15** | 20.16 | `conv[1024,10240] f32` | Qwen3.6-27B fused GDN post-conv prep, prefill |
+| 17 | `GdnStateScatterKernel` | **39.58** | 28.42 | `working[16,...] -> cache[64,48,128,128] f32` | Qwen3.6-27B GDN state scatter, c16 |
+| 18 | `GdnStateGatherKernel` | **36.60** | 28.10 | `cache[64,48,128,128] f32 -> working[16,...]` | Qwen3.6-27B GDN state gather, c16 |
+| 19 | `SharedExpertGateKernel` | **35.93** | 21.57 | `sd[1024,2048] f32, gl[1024]` | Qwen3.6-35B shared-expert sigmoid gate, prefill |
+| 20 | `ConcatMlaNopeRopeKernel` | **35.48** | 34.69 | `nope[1024,128,128] rope[1024,1,64] f32` | DeepSeek-V3 MLA nope\|rope head concat, prefill |
+| 21 | `MoeRelu2Kernel` | **35.12** | 24.97 | `x[8192,512] f32` | NemotronH expert relu^2, prefill x top_k |
+| 22 | `RmsNormGatedKernel` | **34.85** | 6.92 | `x[16,48,128] f32` | Qwen3.6-27B GDN output gated norm, decode |
+| 23 | `MoeCombineKernel` | **33.47** | 2.54 | `expert_out[1024,8,2048] f32` | Qwen3.6-35B weighted expert combine, prefill |
+| 24 | `CausalConv1dUpdateKernel` | **33.01** | 4.22 | `x[16,10240] f32, state[16,10240,3]` | Qwen3.6-27B GDN decode conv step, c16 |
+| 25 | `CastF16Kernel` | **28.37** | 27.75 | `x[1024,5120] f32 -> f16` | EXL3 activation narrowing cast, prefill |
+| 26 | `SigmoidGateBf16Kernel` | **25.03** | 9.34 | `attn/gate[1024,6144] f32 -> bf16` | Qwen3.6-27B attention output gate, prefill |
+| 27 | `RmsNormGatedGroupKernel` | **24.75** | 7.50 | `x[1024,4096] f32, n_groups=8` | Mamba2 Mixer2RMSNormGated, prefill |
+| 28 | `RmsNormQuantFp8Kernel` | **24.45** | 0.00 | `x[1024,5120] f32 -> e4m3 + bf16` | Qwen3.6-27B fused RMSNorm -> fp8, prefill |
+| 29 | `RmsNormGatedQuantFp8Kernel` | **23.55** | 0.00 | `x/gate[16,48,128] f32 -> e4m3` | Qwen3.6-27B GDN gated norm -> fp8, decode |
+| 30 | `ScaledFp4QuantKernel` | **22.51** | 0.00 | `x[1024,5120] f32 -> fp4 + e4m3 scales` | Qwen3.6-27B NVFP4 activation quant, prefill |
+| 31 | `RopeRotateHead` | **21.32** | 5.02 | `q[1024,24,256] k[1024,4,256] f32, rot=64` | Qwen3.6-27B RopeNeox q/k in place, prefill |
+| 32 | `MoeRouterTopKKernel` | **20.41** | 0.00 | `logits[1024,256] f32` | Qwen3.6-35B router softmax top-8 of 256, prefill |
+| 33 | `SiluAndMulKernel` | **19.52** | 6.19 | `x[1024,34816] f32 -> out[1024,17408]` | Qwen3.6-27B dense MLP act, prefill |
+| 34 | `QuantFp8GroupKernel` | **17.78** | 0.00 | `x[1024,5120] f32, group 128` | DeepSeek block-fp8 per-128-group activation quant, prefill |
+| 35 | `MoeSiluMulKernel` | **17.63** | 8.75 | `gate/up[8192,512] f32` | Qwen3.6-35B expert act, prefill x top_k |
+| 36 | `QuantFp8StaticKernel` | **15.80** | 0.00 | `x[1024,5120] f32 -> e4m3` | Qwen3.6-27B static per-tensor fp8 activation quant, prefill |
+| 37 | `GdnGBetaKernel` | **11.50** | 6.18 | `araw/braw[1024,48] f32` | Qwen3.6-27B GDN decay/gate derivation, prefill |
+| 38 | `GeluAndMulKernel` | **11.36** | 3.03 | `x[1024,34816] f32 -> out[1024,17408]` | Gemma GeGLU MLP act, prefill |
+| 39 | `MoeRouterGroupedTopKKernel` | **10.62** | 0.00 | `logits[1024,256] f32, groups 8, topk_group 4` | DeepSeek grouped sigmoid router, prefill |
+| 40 | `SoftCapKernel` | **7.15** | 6.60 | `x[16,248320] f32` | Gemma-2 final logit soft-cap, decode |
+| 41 | `GdnDecodeKernel` | **3.19** | 2.11 | `state[16,48,128,128] f32` | Qwen3.6-27B GDN decode recurrence, c16 |
+| 42 | `KdaHeadTokenStep` | **3.18** | 0.39 | `T=64, state[1,48,128,128] f32` | Kimi KDA per-channel decay recurrence, c16 prefill |
+| 43 | `EmbeddingKernel` | **0.31** | 0.10 | `table[248320,5120] bf16, ids[1024]` | Qwen3.6-27B embed_tokens gather, prefill |
+| 44 | `RopeCosSinCacheKernel` | **0.00** | 6.48 | `cos_sin[1024,64] f32` | Qwen3.6-27B rotary cache build, prefill |
+| 45 | `MatmulOneChunk` | **0.00** | 0.72 | `a[1024,4096] x b[4096,4096]^T f32` | LTX-2.5 connector attn projection, 1024 rows |
+| 46 | `AttentionKernel` | **0.00** | 0.52 | `q/k/v[1024,32,128] f32, causal` | LTX-2.5 DiT self-attention, video stream |
+| 47 | `AttentionCrossKernel` | **0.00** | 0.45 | `q/k/v[1024,32,128] f32` | LTX-2.5 connector cross-attention, video stream |
+| 48 | `MulColVecF32Kernel` | **0.00** | 0.00 | `x[1024,10240] f32, col[10240]` | merged fp8 projection per-shard dequant, prefill |
+
+**Reading it.** `AttentionKernel` and `AttentionCrossKernel` at 0.00% are the
+predecessor's hoist showing up as the absence of the symbol; they are the
+instrument's own control. `RopeCosSinCacheKernel` at 0.00% has no `LoadF32` call
+at all (it is store-only), and `MulColVecF32Kernel` and `MatmulOneChunk` reach
+specialized f32 paths that never enter the per-element helper. `GdnDecodeKernel`
+(3.19%) and `KdaHeadTokenStep` (3.18%) are the clearest below-bar cases in the
+set: their recurrences are dominated by the state outer-product, and a hoist
+there would buy the 3% the profile names.
+
+**24 kernels are at or above 32.5%.** In rank order: `BatchedMatmulKernel`,
+`CausalConv1dFwdKernel`, `CastBf16Kernel`, `RopeFromCacheKernel`,
+`FusedNormRopeKernel`, `RmsNormGroupKernel`, `AttnGateSplitKernel`,
+`RmsNormKernel`, `MulScalarKernel`, `AttnQkNormRopeGateKernel`,
+`GdnConvSplitKernel`, `CastF32Kernel`, `Mamba2StateUpdateKernel`, `L2NormKernel`,
+`QkvSplitKernel`, `GdnPostConvKernel`, `GdnStateScatterKernel`,
+`GdnStateGatherKernel`, `SharedExpertGateKernel`, `ConcatMlaNopeRopeKernel`,
+`MoeRelu2Kernel`, `RmsNormGatedKernel`, `MoeCombineKernel`,
+`CausalConv1dUpdateKernel`.
+
+**23 are below it, and that is the half of the result that closes work rather
+than opening it.** `CastF16Kernel` (28.37%) down to `EmbeddingKernel` (0.31%) are
+bound by something else, and the predecessor's own rule says a hoist there buys
+the fraction the profile names. They need no row.
+
+**15 of the 62 are NOT measured here and are named rather than left implied**:
+`Mamba2ChunkScanKernel`, `GdnPackedDecodeKernel`, `GdnSpecDecodeKernel`,
+`CausalConv1dSpecUpdateKernel`, `KdaChunkPrefillKernel`,
+`DFlashBlockAttentionKernel`, `DFlashPagedBlockAttentionKernel`,
+`DFlashGroupedConvKernel`, `Dflash2SelectorEdgesKernel`,
+`MatmulFp8BlockScaledKernel`, `MatmulFp8CutlassKernel`, `MatmulNvfp4Fp4Kernel`,
+`MatmulOneChunkRef`, `GdnHeadTokenStep` (reached only inside `GdnDecodeKernel`'s
+3.19%), and the `FusedLoad`/`FusedStore` pair inside `FusedChainKernel`. They are
+in `## Owed` with the probe that will take them.
+
+### W2 — the hoist, and why this kernel
+
+`RmsNormKernel`, 8th on the ranking at 49.06% `LoadF32` + 12.05% `StoreF32`,
+chosen over the seven above it because it is the one every model reaches. The
+dispatch is now resolved once per call through the shared `WidenRowToF32` and a
+new `NarrowRowFromF32`; `w` is widened once per CALL rather than once per row,
+and the gemma `+1` folds into that copy.
+
+The profile after, same instrument, same shape: `LoadF32` and `StoreF32` are
+**gone from the profile entirely**; the kernel body is 65.65% and
+`__memmove_avx512_unaligned_erms` (the f32 arm's row widen) is 21.58%.
+
+**The A/B, interleaved, with a same-arm control leg.** Ten `old` legs and five
+`new` legs alternating, `--reps 20`, one thread, loadavg 63-69:
+
+| statistic | old | new | ratio |
+|---|---:|---:|---:|
+| median of legs | 3.47 s | 0.2745 s | **12.6x** |
+| least-contended leg | 1.8237 s | 0.2146 s | **8.5x** |
+| most-contended leg | 4.3019 s | 0.7398 s | 5.8x |
+
+The same-arm control (old against old, in the same interleave) ran **0.45x to
+1.66x**, so the box's own drift is a factor of 3.7 and the effect is a factor of
+8.5 to 12.6. A gap that far outside its own control is a result whatever the box
+was doing, and the spread is quoted rather than smoothed.
+
+**At the shipped thread count it is 2.15x, and that is not a contradiction.**
+Same interleave, `--reps 30`, twenty threads on a twenty-core box already at
+loadavg 73: old median 2.96 s / min 2.1212 s, new median 1.3714 s / min 0.9864 s,
+control 0.95x-1.54x. `Threadpool::Barrier()` is 46.77% of that arm before the
+change and does not shrink when the kernel does, so the single-thread figure is
+the kernel's instruction-level win and the twenty-thread figure is what a
+contended box sees. Both are reported because quoting either alone misleads.
+
+### W3 — the correctness evidence
+
+**Byte equality is the whole gate.**
+`tests/vt/test_ops_rmsnorm_elem_dispatch.cpp`: **3 cases / 1,120,646
+assertions**, every one a `memcmp` against a reference that re-derives the
+original per-element loop and shares nothing with `src/vt/cpu`, down to its own
+hand-written f16 and bf16 conversions.
+
+**Green on a pristine base tree too**, built from `43553262c`'s own
+`cpu_ops.cpp` and `cpu_matmul_elem.cpp`, which is what says the reference is an
+oracle rather than a transcription of the new code.
+
+**The norm suite: 58 cases / 1,132,690 assertions, 0 failed** over `test_dtype`,
+`test_fused_chain_additivity`, `test_ops_fused_chain`, `test_ops_layernorm`,
+`test_ops_mamba2_gated_norm`, `test_ops_rmsnorm`, `test_ops_rms_norm_group`,
+`test_rmsnorm_decode_fast`, `test_rmsnorm_gated_fast`,
+`test_ops_attention_elem_dispatch` and the new file. **The counts are IDENTICAL
+on the pristine base tree, on the changed tree, and on the merged head**, which
+is what says nothing was silently skipped rather than silently passing.
+
+**The mutations.** Each is applied to a COPY outside the worktree, so a mutation
+cannot be left behind; each is verified to have changed the file, compiled and
+linked before its result is read. The harness's first run reported eight
+`BUILD-FAILED` rather than eight passes, which is the behaviour that makes the
+rest readable.
+
+| # | mutation | result |
+|---|---|---|
+| M1 | split the `sumsq` reduction into two accumulators | KILLED — 60 assertions red |
+| M2 | residual: skip the round-trip RE-READ | KILLED — 12 red |
+| M3 | fold the gemma `+1` unconditionally | KILLED — 66 red |
+| M4 | `NarrowRowFromF32` bf16 truncates instead of round-to-nearest-even | KILLED — 84 red |
+| M5 | `NarrowRowFromF32`'s **f16** branch made wrong | **SURVIVED** |
+| M6 | `WidenRowToF32`'s f16 branch made wrong | KILLED — 72 red |
+| M7 | REACHABILITY: the new hoisted store is inert | KILLED — 132 red |
+| M8 | REACHABILITY: the widened `w` copy is ignored | KILLED — 132 red |
+
+**M2 SURVIVED on the first version of this gate, and repairing that is the most
+useful thing the mutation set did.** The residual contract is add-in-f32,
+round-on-store, RE-READ; dropping the re-read is only observable when the sum
+does not survive the round trip. The first operand set drew x and residual from
+one scale, `k*2^-6` with `|k| < 128`, whose sums need at most 8 significant bits
+— which bf16 holds EXACTLY. The gate was reading a tautology on its most subtle
+guarantee. Giving the residual a scale `2^12` above x puts the operands twelve
+binades apart, and M2 now dies with 12 assertions. The values stay exactly
+representable in f32, f16 and bf16 individually; only the SUM rounds, which is
+precisely the thing under test.
+
+**M5 survived and it is a finding, not a hole this row opened.** `vt::RmsNorm`
+validates `IsOutFloat(out.dtype)` (`src/vt/ops.cpp:25`), which admits f32 and
+bf16 only, so `NarrowRowFromF32`'s f16 branch is UNREACHABLE from this op. No
+test here can kill it and this row does not claim one does. M4 is the same
+guarantee on the branch that IS reachable, and it dies. This is the predecessor
+row's M3b, on the same op boundary, for the same reason.
+
+**M7 and M8 are the reachability proof.** Making the new store inert, and making
+the new widened-`w` copy unused, both red the gate THROUGH `vt::RmsNorm` — so
+what the test exercises is the new code on the production path, not a class the
+test constructed.
+
+**The refusal moved and its message did not.** The per-element refusal used to be
+raised inside a threadpool worker; it is now raised on the calling thread before
+any element is read, and it is produced by `LoadF32`/`StoreF32`/`SizeOf`
+themselves rather than by a second message that could drift from theirs. That
+branch is unreachable through `vt::RmsNorm`, which validates `IsFloat` first, and
+T3 asserts the op-boundary refusal rather than claiming a gate on the kernel one.
+
+### W3b — the `always_inline` verdict, which is what the predecessor row could not answer
+
+`__attribute__((always_inline))` on `LoadF32`, against this branch's head, over
+every case in the probe. **`perf stat` counts, not wall time**, because the
+effect being looked for is a few percent of instruction-cache behaviour and this
+box's wall-clock noise is a factor of 3.7. Cycles are the minimum of three runs;
+instructions are deterministic; i-cache misses are normalised per kilo-instruction
+so the two arms are comparable when the instruction count changes.
+
+**The code-size cost, measured rather than asserted:** `cpu_ops.cpp`'s `.text`
+grows 113,995 -> 173,818 bytes = **+52.5%**, and the whole probe binary's text
+grows 1,729,517 -> 1,881,108 = +8.8%.
+
+| kernel | cycles base / always_inline | i-cache misses per kilo-insn, base -> ai | Ginsn base -> ai |
+|---|---:|---|---|
+| `GdnDecodeKernel` | 0.900 | 0.1037 -> 0.1584 | 5.59 -> 5.41 |
+| `SoftCapKernel` | 0.980 | 0.0797 -> 0.1333 | 7.52 -> 6.42 |
+| `RmsNormKernel` | 0.993 | 0.2843 -> 0.2771 | 1.76 -> 1.76 |
+| `CastF16Kernel` | 1.005 | 0.0657 -> 0.0848 | 11.13 -> 8.50 |
+| `RopeCosSinCacheKernel` | 1.016 | 0.1285 -> 0.1301 | 10.65 -> 10.65 |
+| `MatmulOneChunk` | 1.042 | 0.1205 -> 0.1294 | 40.62 -> 40.62 |
+| `RmsNormQuantFp8Kernel` | 1.050 | 0.0515 -> 0.0753 | 11.04 -> 7.77 |
+| `QuantFp8StaticKernel` | 1.053 | 0.0720 -> 0.0816 | 14.25 -> 11.63 |
+| `AttentionCrossKernel` | 1.055 | 0.0688 -> 0.0896 | 121.52 -> 121.55 |
+| `QuantFp8GroupKernel` | 1.062 | 0.0574 -> 0.1431 | 9.38 -> 6.40 |
+| `MoeRouterGroupedTopKKernel` | 1.065 | 0.0977 -> 0.0725 | 7.38 -> 5.90 |
+| `MoeRelu2Kernel` | 1.090 | 0.1712 -> 0.1752 | 5.68 -> 4.00 |
+| `AttentionKernel` | 1.090 | 0.0793 -> 0.0671 | 61.15 -> 61.11 |
+| `GeluAndMulKernel` | 1.091 | 0.1827 -> 0.3589 | 11.29 -> 9.08 |
+| `GdnGBetaKernel` | 1.113 | 0.0397 -> 0.0642 | 9.89 -> 7.74 |
+| `EmbeddingKernel` | 1.119 | 0.9478 -> 0.8786 | 102.32 -> 101.85 |
+| `SharedExpertGateKernel` | 1.170 | 0.0401 -> 0.1018 | 6.47 -> 4.66 |
+| `GdnStateGatherKernel` | 1.208 | 0.3088 -> 0.3748 | 7.21 -> 5.63 |
+| `ScaledFp4QuantKernel` | 1.213 | 0.0879 -> 0.2505 | 8.83 -> 4.60 |
+| `ConcatMlaNopeRopeKernel` | 1.230 | 0.1241 -> 0.2439 | 11.31 -> 8.08 |
+| `MulColVecF32Kernel` | 1.278 | 0.1368 -> 0.1423 | 3.40 -> 3.40 |
+| `QkvSplitKernel` | 1.323 | 0.1607 -> 0.1545 | 6.59 -> 4.90 |
+| `MoeRouterTopKKernel` | 1.377 | 0.0446 -> 0.0386 | 8.95 -> 5.93 |
+| `RopeFromCacheKernel` | 1.383 | 0.1036 -> 0.3389 | 3.58 -> 2.37 |
+| `RopeRotateHead` | 1.400 | 0.2241 -> 0.1205 | 3.92 -> 3.40 |
+| `RmsNormGatedQuantFp8Kernel` | 1.435 | 0.0422 -> 0.0670 | 17.63 -> 11.82 |
+| `SigmoidGateBf16Kernel` | 1.473 | 0.0634 -> 0.0716 | 11.98 -> 8.52 |
+| `MoeSiluMulKernel` | 1.476 | 0.0819 -> 0.0909 | 8.93 -> 6.62 |
+| `GdnStateScatterKernel` | 1.568 | 0.5786 -> 0.4510 | 5.99 -> 4.47 |
+| `GdnConvSplitKernel` | 1.576 | 0.1077 -> 0.1717 | 12.61 -> 9.41 |
+| `GdnPostConvKernel` | 1.590 | 0.1762 -> 0.2215 | 7.31 -> 4.65 |
+| `RmsNormGatedGroupKernel` | 1.704 | 0.1121 -> 0.0817 | 7.81 -> 5.54 |
+| `AttnGateSplitKernel` | 1.705 | 0.1444 -> 0.1737 | 8.65 -> 6.14 |
+| `MulScalarKernel` | 1.709 | 0.0962 -> 0.0954 | 8.54 -> 5.91 |
+| `CastBf16Kernel` | 1.789 | 0.0724 -> 0.0494 | 13.60 -> 9.79 |
+| `Mamba2StateUpdateKernel` | 1.915 | 0.0749 -> 0.2074 | 10.41 -> 5.91 |
+| `L2NormKernel` | 1.946 | 0.1016 -> 0.1468 | 2.86 -> 1.45 |
+| `SiluAndMulKernel` | 1.959 | 0.2677 -> 0.1841 | 12.18 -> 8.79 |
+| `CastF32Kernel` | 1.971 | 0.0607 -> 0.0505 | 14.43 -> 10.10 |
+| `AttnQkNormRopeGateKernel` | 2.025 | 0.1436 -> 0.1966 | 10.89 -> 6.12 |
+| `RmsNormGroupKernel` | 2.058 | 0.0714 -> 0.1419 | 8.57 -> 4.14 |
+| `RmsNormGatedKernel` | 2.200 | 0.0516 -> 0.0538 | 4.85 -> 2.67 |
+| `CausalConv1dUpdateKernel` | 2.521 | 0.0228 -> 0.0289 | 13.73 -> 7.21 |
+| `FusedNormRopeKernel` | 2.674 | 0.0816 -> 0.0301 | 12.41 -> 6.10 |
+| `MoeCombineKernel` | 2.800 | 0.1265 -> 0.2850 | 7.96 -> 2.75 |
+| `CausalConv1dFwdKernel` | 3.023 | 0.1708 -> 0.1939 | 10.64 -> 6.08 |
+| `KdaHeadTokenStep` | 3.214 | 0.0868 -> 0.0517 | 7.55 -> 5.55 |
+| `BatchedMatmulKernel` | 4.584 | 0.0473 -> 0.0361 | 95.26 -> 35.07 |
+
+**The verdict: 43 wins, 4 neutral, 1 regression.** The wins run to 4.58x
+(`BatchedMatmulKernel`), 3.21x, 3.02x and 2.80x, and they are not i-cache effects
+in the other direction — they are instruction-count effects. `BatchedMatmulKernel`
+executes 95.26 Ginsn out of line and 35.07 Ginsn inlined, because once `LoadF32`
+is inlined the loop vectorises. That is the same mechanism the predecessor's
+1.78x came from, and it is much larger than 1.78x on the kernels that stream.
+
+**The regression is real and it is one kernel.** `GdnDecodeKernel` reads 0.900 in
+the sweep, and re-measured on its own at `--reps 40` with the minimum of five
+runs it reads **2.538e9 vs 2.990e9 cycles = 0.849x, 17.8% SLOWER** — with
+i-cache misses per kilo-instruction up 0.1037 -> 0.1584 (**+53%**) at an
+essentially unchanged instruction count (5.59 -> 5.41 Ginsn). Fewer instructions,
+more cycles, more i-cache misses: that is the instruction-cache cost the
+predecessor row named, found, and it is confined to the one kernel whose inner
+loop is a state outer-product that never benefited from the inline in the first
+place.
+
+**`SoftCapKernel`'s 0.980 in the sweep did NOT reproduce.** At `--reps 40`,
+minimum of five, it reads 1.022e10 vs 8.673e9 = **1.178x FASTER**. One sweep leg
+is not a result on this box, which is why both suspected regressions were
+re-measured before either was reported.
+
+**So the idea is not retired and it is not free.** It is a one-line change worth a
+median of about 1.4x across 43 CPU kernels, at 52.5% more `cpu_ops.cpp` text and
+one kernel 18% slower. It is not landed here because it changes 48 kernels at
+once and owes a byte-equality gate across all of them, which is its own row —
+this row's obligation was to produce the measurement that decides it, and the
+measurement says take it, with `GdnDecodeKernel` excluded or accepted explicitly.
+
+### What this row did NOT do, stated rather than implied
+
+- It hoisted **one** of the 24 kernels above the bar. The other 23 are in
+  `## Owed` in rank order with their measured percentages.
+- It did not measure 15 of the 62. They are named above and in `## Owed`.
+- It produced no aarch64 number at all.
+- It did not land `always_inline`.
+
+## Owed
+
+- **THE 23 REMAINING KERNELS ABOVE THE BAR**, in rank order with their measured
+  `LoadF32` self percentage, so the next row picks by number rather than by
+  position in the file: `BatchedMatmulKernel` 70.46, `CausalConv1dFwdKernel`
+  55.81, `CastBf16Kernel` 54.34, `RopeFromCacheKernel` 52.98,
+  `FusedNormRopeKernel` 52.23, `RmsNormGroupKernel` 50.74, `AttnGateSplitKernel`
+  49.87, `MulScalarKernel` 47.09, `AttnQkNormRopeGateKernel` 47.04,
+  `GdnConvSplitKernel` 43.61, `CastF32Kernel` 42.56, `Mamba2StateUpdateKernel`
+  42.30, `L2NormKernel` 40.97, `QkvSplitKernel` 40.40, `GdnPostConvKernel` 40.15,
+  `GdnStateScatterKernel` 39.58, `GdnStateGatherKernel` 36.60,
+  `SharedExpertGateKernel` 35.93, `ConcatMlaNopeRopeKernel` 35.48,
+  `MoeRelu2Kernel` 35.12, `RmsNormGatedKernel` 34.85, `MoeCombineKernel` 33.47,
+  `CausalConv1dUpdateKernel` 33.01. `RmsNormGroupKernel` is the cheapest of them
+  to take next: it is deliberately shaped as `RmsNormKernel` with the reduction
+  extent narrowed, so the same helpers and the same gate structure apply.
+  Owner: unowned; #2416 stays open against this item.
+- **THE 15 UNMEASURED KERNELS.** `Mamba2ChunkScanKernel`,
+  `GdnPackedDecodeKernel`, `GdnSpecDecodeKernel`, `CausalConv1dSpecUpdateKernel`,
+  `KdaChunkPrefillKernel`, `DFlashBlockAttentionKernel`,
+  `DFlashPagedBlockAttentionKernel`, `DFlashGroupedConvKernel`,
+  `Dflash2SelectorEdgesKernel`, `MatmulFp8BlockScaledKernel`,
+  `MatmulFp8CutlassKernel`, `MatmulNvfp4Fp4Kernel`, `MatmulOneChunkRef`,
+  `GdnHeadTokenStep`, and `FusedChainKernel`'s `FusedLoad`/`FusedStore`. Each
+  needs one `Add(...)` case in the committed probe; nothing else. Owner: unowned.
+- **`__attribute__((always_inline))` ON `LoadF32`: MEASURED, AND THE ANSWER IS
+  TAKE IT.** 43 wins of 48 up to 4.58x, 4 neutral, one regression
+  (`GdnDecodeKernel`, 0.849x, i-cache misses per kilo-instruction +53%), at
+  +52.5% `cpu_ops.cpp` text. It is not landed here because it changes 48 kernels
+  at once and owes a byte-equality gate across all of them. Owner: unowned.
+- **THE aarch64 HALF. Every number in this row is x86-64 AVX-512.** The tier is
+  NEON with a different vector width and different inlining economics, and the
+  predecessor row's own single-thread claim inverted between the two
+  architectures, so nothing here may be read as a GB10 statement. The repair is
+  bit-exact by construction on any ISA, so what is owed is the RATE and the
+  RANKING, not the correctness. Reaching those cores needs an `rc` lease.
+  Owner: unowned.
+- **`cpu_paged_attn.cpp`'s file-private `StoreRowF32` should fold into the shared
+  `NarrowRowFromF32` this row adds.** They are the same function; they differ only
+  in the refusal MESSAGE, so folding them changes another kernel's observable
+  behaviour and needs its own gate. Owner: unowned.
+- **A MULTITHREADED RANKING.** Every percentage here is single-threaded, because
+  at the shipped thread count on a box at loadavg 63-146 `Threadpool::Barrier()`
+  takes 46.77% and a ranking would rank contention. Whether the ORDER changes at
+  twenty threads on an idle box is unmeasured, not answered. Owner: unowned.

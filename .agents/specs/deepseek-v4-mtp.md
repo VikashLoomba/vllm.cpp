@@ -229,7 +229,11 @@ that the oracle does not, once a weight-carrying GGUF exists.
 - **R3:** register `DeepSeekV4MTP` as the speculator for `DeepseekV4ForCausalLM` in the engine
   spec-config path (the C++ analogue of registry.py:617) once R2's driver exists.
 - **R4:** device MTP draft forward (reuse the DS4 device kernels) for decode-graph speed; the W1
-  landing is the host oracle, mirroring how the DS4 model itself gated host-first.
+  landing is the host oracle, mirroring how the DS4 model itself gated host-first. This is not
+  optional for the throughput claim: `num_experts_per_tok` is 6 of 216, so one token's routed
+  experts are 6 x 3 x [2048, 4096] = 604 MB of f32 weights, and a host draft forward cannot be
+  the fast path at any batch size. R1b's borrowed views exist so the head can stay quantized
+  until a device path consumes it.
 
 ## Gates
 
@@ -241,6 +245,39 @@ that the oracle does not, once a weight-carrying GGUF exists.
 | No regression | `test_deepseek_v4_forward` 6/6, `test_deepseek_v4_gguf_load` 12/12 (the `ForwardComposeImpl` residual-capture out-param is inert when null) | PASS |
 | Real-model MTP-on==MTP-off + acceptance/speedup | 80.7 GB `ds4flash.gguf` on GB10 | **BLOCKED for the GGUF arm** — that file has no nextn tensors (§4) |
 | Real-model MTP-on==MTP-off + acceptance/speedup | NAS `dsv4-flash-0731-spark-exl3`, `mtp.{0,1,2}.*` un-skipped | **OPEN, not blocked** — three NVFP4 heads are present (§4 correction); needs R1 un-skip + NVFP4 expert dequant + R2/R3 |
+
+### WHICH ARM — the two the goal needs are not the same one
+
+Measured from the safetensors headers of the NAS EXL3 checkpoint (177 files,
+2026-08-31), because this decides where every later brick lands:
+
+| part | GiB |
+|---|---|
+| routed experts | 82.59 |
+| everything else | 8.23 |
+| **resident, tp1, mtp skipped** | **90.82** |
+| MTP heads (all three) | 8.62 |
+
+A GB10's ~119 GiB usable pool leaves **~28 GiB of headroom**, so all three heads
+load with roughly 19.6 GiB left for KV and activations. The loader already
+coalesces TP4 to TP1, so the four rank files are disjoint slices and this is the
+whole tower rather than a quarter of it.
+
+That matters because the two arms split the two properties this row needs. The
+**GGUF** arm runs on one Spark at ~14.96 tok/s and carries NO MTP tensors, the
+converter having dropped them. The **EXL3** arm carries three heads and, by the
+number above, also fits. So the MTP gate belongs on the EXL3 arm, and the GGUF
+nextn re-conversion is one way to reach the other arm rather than a precondition
+for the row.
+
+§0's "MEMORY-INFEASIBLE on one GB10" is NOT a verdict on this checkpoint. It is
+about the 156.7 GiB NVFP4 safetensors. Two artifacts, two verdicts, and this
+spec previously named only one of them.
+
+Still unmeasured, and named so it is not mistaken for settled: whether the
+carried FP8 half is widened at load, which would move the 8.23 GiB row, and the
+real resident total from `ReportDeepseekV4Exl3Residency` on the box. 90.82 GiB is
+a packed byte count taken from headers, not a residency measurement.
 
 ### R1b — why there is no host float tower for the head
 

@@ -224,6 +224,12 @@ the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
 does not get one yet; it is listed under `## Owed
 
+- **The INDEXER's own compressor**, the last refused tensor. Three of its four
+  tensors have no host destination, it needs a second compressor state per layer
+  at `index_head_dim`, and its pooled rows are the KEYS the top-k scores against
+  rather than an attention contributor. See the section above; it is a wave, not
+  a width fix.
+
 - **The indexer's qr projection is UNEXERCISED.** Its shape is accepted and that
   acceptance is gated, but no test runs a forward to completion with the upstream
   geometry, because the layer still refuses on `compressor.wkv`. A mutation that
@@ -391,6 +397,31 @@ one token resuming at `kv_base = 7` refuses, a fresh state at 0 is accepted, and
 the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
+
+## The LAST refused tensor is a wave, not a width
+
+`attn.indexer.compressor.wkv.weight` is the one tensor the real geometry still
+refuses, and it looks like the width fix that cleared the other three. It is not,
+and the loader already says why.
+
+The indexer exists only at `cr == 4` (`attention.py:274`) and carries its OWN
+`DeepseekCompressor` at `head_dim = index_head_dim` with the same ratio
+(`attention.py:768-776`). `DeepseekV4LayerHostWeights` has `idx_wk`, its KV
+projection, and **no destination for the other three** -- `indexer.compressor.ape`,
+`.wgate.weight` and `.norm.weight` are accounted and dropped, exactly as the main
+compressor's KV was before this wave.
+
+And the consumer differs. The main compressor's pooled row joins the attention
+through `MergeWindowAndCompressed`. The indexer's pooled rows are the KEYS its
+selection scores against: `ik` feeds `DispLogits` then `DispTopk`, so widening
+`idx_wk` alone would hand the scorer a `[T, 2*ihd]` operand where it expects
+`[T, ihd]`, and the top-k would be computed over the wrong thing rather than
+refuse.
+
+So the last piece needs three host slots, a second compressor state per layer at
+`index_head_dim`, the cycle run at that geometry, and the selection re-pointed at
+the compressed keys. That is the same shape of work the main compressor just
+took, and sizing it as a width change is how it would go wrong.
 
 ## W3 takes the real geometry from FOUR refused tensors to ONE
 

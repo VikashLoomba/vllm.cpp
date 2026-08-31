@@ -458,6 +458,35 @@ measured before anything was changed:
 both streams, with `memcmp`-identical output. That is the headroom, measured, and
 it bounds nothing from above: the hoisted form here is scalar and unthreaded.
 
+### The headroom, measured at the shipped thread count
+
+The single-threaded reference above understates the ceiling, because it compares
+one thread against twenty. The probe now carries the same hoisted transformation
+**on the same thread count the shipped kernel uses**, partitioned over the (head,
+query) pairs exactly as `AttentionCrossKernel`'s own `ForRows` partitions them --
+each output row independent, each reduction sequential over the same indices, so
+it is bit-exact for the same reason:
+
+| | shipped, 20 threads | hoisted, 20 threads | speedup | equality |
+|---|---:|---:|---:|---|
+| video, heads 32, d 128 | 3.858 s (4.5 GF) | **0.290 s (59.2 GF)** | **13.30x** | byte-equal |
+| audio, heads 32, d 64 | 1.961 s (4.4 GF) | **0.205 s (41.9 GF)** | **9.58x** | byte-equal |
+
+**The shipped kernel on twenty threads is slower than the hoisted one on ONE**
+(3.858 s against 3.261 s), which is the cleanest statement of the defect's size:
+the per-element dtype switch and its cross-TU `vt::SizeOf` call cost more than a
+twenty-fold parallel speedup buys back.
+
+**What that would be worth, stated as a CONDITIONAL and not as a measurement.**
+If the aarch64 split resembles the x86 one -- **and this row did not measure it,
+so that is an assumption and not a result** -- then removing 92% of the attention
+leg takes one `RunConnector` call from 74.11 s to about 32.7 s, a **2.27x** on
+the connector. #2354 measured connector compute at 224.882 s in a 516.751 s
+render, so the same ratio would put the render near 392 s and the oracle gap
+near 4.2x instead of 5.51x. **Every number in that sentence is an extrapolation
+from one architecture the render does not run on**, and it is written as one
+because the next row needs a target, not because this row measured a render.
+
 ### W4 — a redirection, and why no kernel was changed
 
 The repair is obvious, bit-exact, and prototyped byte-equal. **It is not landed
@@ -598,9 +627,11 @@ Three further reasons, each measured rather than asserted:
 
 ## Owed
 
-- **THE ATTENTION KERNEL'S PER-ELEMENT DTYPE SWITCH IS UNOWNED.** 43.6% of a
-  connector layer is `LoadF32` plus a cross-TU `vt::SizeOf`, and the fix is
-  bit-exact and prototyped. It is a `vt` seam change and needs its own row, its
+- **THE ATTENTION KERNEL'S PER-ELEMENT DTYPE SWITCH IS UNOWNED, AND IT IS WORTH
+  13.30x ON THE LEG IT OWNS.** 43.6% of a connector layer is `LoadF32` plus a
+  cross-TU `vt::SizeOf`; the hoisted form is byte-equal at the shipped thread
+  count and 13.30x faster (video) / 9.58x (audio), and the fix is bit-exact and
+  prototyped. It is a `vt` seam change and needs its own row, its
   own spec, and a fresh reviewer. It is not LTX-2.5-specific: `AttentionKernel`
   carries the same defect and every CPU attention path pays it. Owner: this row,
   until that row exists.

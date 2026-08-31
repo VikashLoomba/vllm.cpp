@@ -62,6 +62,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 // The connector mode links the LTX-2.5 model TUs and their transitive audio-VAE
@@ -425,6 +426,62 @@ void AttnCrossHoisted(float* out, const float* q, const float* k, const float* v
   }
 }
 
+// The same hoisted kernel over `threads` workers, partitioned on the (head,
+// query) pairs exactly as `AttentionCrossKernel`'s own `ForRows` partitions
+// them. Each output row is independent and its reduction stays sequential over
+// the same indices, so this is bit-exact for the same reason the single-threaded
+// form is -- and it is what says how much of the gap is the dtype switch rather
+// than the thread count. Written with `std::thread` rather than the vt pool
+// because the probe must not change what the shipped kernel's pool is doing
+// while it is being measured beside it.
+void AttnCrossHoistedMt(float* out, const float* q, const float* k, const float* v,
+                        const float* bias, int64_t tq, int64_t hq, int64_t d, int64_t s,
+                        float scale, int threads) {
+  const int64_t rows = hq * tq;
+  const int64_t per = (rows + threads - 1) / threads;
+  std::vector<std::thread> pool;
+  for (int t = 0; t < threads; ++t) {
+    const int64_t r0 = std::min(static_cast<int64_t>(t) * per, rows);
+    const int64_t r1 = std::min(r0 + per, rows);
+    if (r0 >= r1) break;
+    pool.emplace_back([=] {
+      std::vector<float> probs(static_cast<size_t>(s));
+      std::vector<float> acc(static_cast<size_t>(d));
+      for (int64_t r = r0; r < r1; ++r) {
+        const int64_t h = r / tq;
+        const int64_t i = r % tq;
+        const int64_t qoff = (i * hq + h) * d;
+        const float* qr = q + qoff;
+        float m = -std::numeric_limits<float>::infinity();
+        for (int64_t j = 0; j < s; ++j) {
+          const float* kr = k + (j * hq + h) * d;
+          float dot = 0.0f;
+          for (int64_t e = 0; e < d; ++e) dot += qr[e] * kr[e];
+          dot *= scale;
+          if (bias != nullptr) dot += bias[j];
+          probs[static_cast<size_t>(j)] = dot;
+          if (dot > m) m = dot;
+        }
+        float denom = 0.0f;
+        for (int64_t j = 0; j < s; ++j) {
+          const float e = std::exp(probs[static_cast<size_t>(j)] - m);
+          probs[static_cast<size_t>(j)] = e;
+          denom += e;
+        }
+        const float inv = 1.0f / denom;
+        for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+        for (int64_t j = 0; j < s; ++j) {
+          const float pw = probs[static_cast<size_t>(j)] * inv;
+          const float* vr = v + (j * hq + h) * d;
+          for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += pw * vr[e];
+        }
+        for (int64_t e = 0; e < d; ++e) out[qoff + e] = acc[static_cast<size_t>(e)];
+      }
+    });
+  }
+  for (std::thread& t : pool) t.join();
+}
+
 int ModeAttn(int64_t tq, int reps) {
   vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
   const vt::Device dev{vt::DeviceType::kCPU, 0};
@@ -487,6 +544,19 @@ int ModeAttn(int64_t tq, int reps) {
         unbiased.push_back(Seconds(t0, Clock::now()));
       }
     }
+    // The threaded hoisted arm: the SAME transformation at the SAME thread count
+    // the shipped kernel uses, which is the number the next row needs.
+    std::vector<double> hoisted_mt;
+    std::vector<float> ob4(ob.size());
+    const int threads = static_cast<int>(std::thread::hardware_concurrency());
+    for (int r = 0; r < reps; ++r) {
+      const Clock::time_point t0 = Clock::now();
+      AttnCrossHoistedMt(ob4.data(), qb.data(), kb.data(), vb.data(), bias.data(), tq, c.heads,
+                         c.d, s, a.scale, threads);
+      hoisted_mt.push_back(Seconds(t0, Clock::now()));
+    }
+    const Stat hm = Summarize(hoisted_mt);
+    const bool eq_mt = std::memcmp(ob.data(), ob4.data(), ob.size() * sizeof(float)) == 0;
     const Stat un = Summarize(unbiased);
     const Stat sh = Summarize(shipped);
     const Stat ho = Summarize(hoisted);
@@ -503,6 +573,15 @@ int ModeAttn(int64_t tq, int reps) {
                 "unbiased/shipped = %.3f\n",
                 un.median, flop / un.median / 1e9,
                 sh.median > 0 ? un.median / sh.median : 0.0);
+    std::printf("#   hoisted on %d threads = %.3f s (%.1f GF), speedup vs shipped = %.2fx, %s\n",
+                threads, hm.median, flop / hm.median / 1e9,
+                hm.median > 0 ? sh.median / hm.median : 0.0,
+                eq_mt ? "byte-equal" : "DIFFER");
+    if (!eq_mt) {
+      std::fprintf(stderr, "FATAL: the threaded hoisted arm is not byte-identical (%s)\n",
+                   c.what);
+      return 2;
+    }
     if (!eq) {
       std::fprintf(stderr, "FATAL: the hoisted reference is not byte-identical (%s)\n", c.what);
       return 2;

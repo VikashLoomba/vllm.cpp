@@ -60,8 +60,10 @@ namespace {
 using vt::cpu::BlockIQ1_S;
 using vt::cpu::BlockIQ1_XXXS;
 using vt::cpu::BlockIQ2_S;
+using vt::cpu::BlockIQ2_XS;
 using vt::cpu::BlockIQ2_XXS;
 using vt::cpu::BlockIQ3_XXS;
+using vt::cpu::BlockIQ4_XS;
 using vt::cpu::BlockMXFP4;
 using vt::cpu::BlockQ2_K;
 using vt::cpu::BlockQ3_K;

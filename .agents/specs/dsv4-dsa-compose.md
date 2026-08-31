@@ -320,6 +320,28 @@ is explicit -- "Before you conclude anything about past work, read the spec and
 run `git log -S`" -- and `git log --oneline --grep '2068'` shows `ca3dcda21`
 immediately. It was not run.
 
+## W1's layer step LANDED
+
+`CompressorLayerStep` composes one `compress_ratio == 128` layer's decode step:
+the pool-score projection, `CompressorStepCycle` driving the carried state,
+appending whatever closed, the window pass carrying the sink and keeping its LSE,
+and `MergeWindowAndCompressed` folding in the compressed history with NO sink. It
+refuses `compress_ratio == 4` by name, since that is `coff == 2` and W3's.
+
+Nothing calls it yet, so the resolver's refusal stays exactly where it is.
+
+**Three holes were found in its gate by mutation, and two of them looked like
+coverage.** A six-token run at ratio 128 closes NO window, so `emitted` is always
+empty and dropping the appended rows survived untouched; a 128-token step that
+crosses `(127 + 1) % 128 == 0` is the only shape in which that half is
+observable. And checking finiteness plus "differs from window-only" could not see
+the SINK being dropped from the window pass, because the window-only reference
+kept its own sink and the outputs merely differed more. Comparing the
+no-rows-closed case bit for bit against the sinked window pass is what pins it.
+
+The four mutations that now run red: the state reset each step, the emitted rows
+dropped, `coff == 2` accepted, and the window pass losing its sink.
+
 ## The refusal narrows LAST, not first
 
 Attempted 2026-08-31 and REVERTED, because the attempt is the natural first move

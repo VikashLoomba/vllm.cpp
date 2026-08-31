@@ -167,7 +167,10 @@ Run on this row's own branch, which changes no C++ file at all, after `main` had
 moved ahead: 30 changed paths, 11 C++ sources, 39 translation units, 65 s. The
 gate got wider as the branch fell behind, not narrower. A reader sees it,
 because every one of those counts prints. The repair is to merge `main`, which
-is what a branch that far behind owes anyway.
+is what a branch that far behind owes anyway -- and it is confirmed rather than
+asserted: rebasing this branch onto `origin/main` took the same command from
+39 units and 65 s back to **0 units and 0.11 s**, with no change to the branch's
+own diff.
 
 ## Tests
 

@@ -697,6 +697,18 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               DeepseekV4CompressorState* compressor =
                                                   nullptr);
 
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286): the paged NON-GGUF forward. The GGUF paged
+// arm binds `gguf`, which forces `dsa_dense` and makes `is_comp` false on every
+// layer; this one binds the EXL3 tower instead, so the compressor predicate is
+// live and a `compress_ratio == 128` layer can take the composed arm when
+// `compressor` state is supplied. Null keeps the refusal.
+std::vector<float> DeepseekV4ForwardExl3Paged(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices = {},
+    DeepseekV4CompressorState* compressor = nullptr);
+
 std::vector<float> DeepseekV4ForwardGgufCached(
     const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,

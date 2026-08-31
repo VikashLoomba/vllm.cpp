@@ -3431,6 +3431,36 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
                             V4Miswire::kNone, /*trace=*/nullptr, be);
 }
 
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286): the PAGED non-GGUF forward, which is what
+// makes the compressor arm reachable at all.
+//
+// `DeepseekV4ForwardGgufPaged` cannot host it: that arm binds `gguf`, so
+// `dsa_dense` is true and `is_comp` is false on every layer regardless of
+// `compress_ratios`. This one binds `exl3` and leaves `gguf` null, so the
+// compressor and indexer predicates are live, exactly as in the stateless
+// `DeepseekV4ForwardExl3` beside it.
+//
+// `compressor` is optional and null keeps the refusal, so adding this entry
+// changes no existing behaviour.
+std::vector<float> DeepseekV4ForwardExl3Paged(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices,
+    DeepseekV4CompressorState* compressor) {
+  VT_CHECK(weights.has_exl3_weights,
+           "DeepseekV4ForwardExl3Paged: no EXL3 tower (the load did not take that arm)");
+  VT_CHECK(static_cast<int64_t>(paged_kv.size()) == weights.params.num_hidden_layers,
+           "DeepseekV4ForwardExl3Paged: one page tensor per layer is required");
+  V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
+  be.exl3 = &weights.exl3;
+  be.paged_kv = &paged_kv;
+  be.kv_base = kv_base;
+  be.compressor = compressor;
+  return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
+                            logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
+}
+
 std::vector<float> DeepseekV4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,

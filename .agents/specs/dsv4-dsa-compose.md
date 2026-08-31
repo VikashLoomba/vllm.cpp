@@ -342,6 +342,25 @@ no-rows-closed case bit for bit against the sinked window pass is what pins it.
 The four mutations that now run red: the state reset each step, the emitted rows
 dropped, `coff == 2` accepted, and the window pass losing its sink.
 
+## W1's arm is REACHED from production
+
+`DeepseekV4ForwardExl3Paged` is the paged non-GGUF entry the arm needed. It binds
+the EXL3 tower and leaves `gguf` null, so `dsa_dense` is false and the compressor
+predicate is live -- the stateless `DeepseekV4ForwardExl3` beside it already had
+that shape and simply carried no pages.
+
+Gated in `test_deepseek_v4_exl3_loader`: a two-layer fixture whose layer 1 is
+`compress_ratio == 128`, driven for two single-token steps, must come back with
+that layer's carried state holding one row per step while layer 0's stays empty.
+Only the composed arm produces that; a dense fallback leaves it empty. Three
+mutations run red -- the call site deleted, the guard disabled so a compressor
+layer proceeds without state, and the entry dropping the state before it reaches
+the backend.
+
+So `CompressorLayerStep` is no longer a function that merely works. What remains
+before the resolver's refusal may narrow is the runner carrying this state across
+steps, since the gate supplies it by hand.
+
 ## The compressor arm is wired, and the GGUF forward CANNOT reach it
 
 `V4Backend::compressor` carries the per-layer state and `AttentionBlock`'s paged

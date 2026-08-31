@@ -224,6 +224,22 @@ re-run to 13/3087/rc 0.
   `ResolveExplicitDeviceType`, whose own suite
   (`tests/vllm/entrypoints/test_loaded_engine_dense.cpp`) pins the `kCPU` arm.
   An end-to-end `--device cpu` GGUF load on a fleet GPU box closes it.
+* **`quant_repack` has no device term** ([#2406](https://github.com/mudler/vllm.cpp/issues/2406)).
+  `vt::cpu::QuantRepackActive()` is a host-ISA probe, so an aarch64 i8mm CUDA
+  box on `--device cuda` ARM-repacks its Q8_0 weights and stages them to a card
+  whose kernel has no reader for the marker. Pre-existing and not widened here;
+  the sibling `elem_kn_repack` IS gated `dev == kCPU`. Untestable on this x86
+  CPU-only host, and the CUDA-falls-back-to-CPU-kernel path may make it a
+  performance trade rather than a pure fix, so it wants measuring before anyone
+  changes the line.
+* **Six of eight registry hooks are ungated** (review F4). Pointing
+  `laguna_registry`, `qwen3_5_moe`, `qwen3_5_dense`, `deepseek_v4_registry`,
+  `glm_moe_dsa_registry` or `muse_glimmer_registry` at a wrong device is
+  undetectable; only `glm5_next` and `qwen4_exp` red. The code is correct — this
+  is gate strength, and it is the honest generalisation of this row's own
+  "one case moves, 3079 assertions do not". `qwen4_exp` is gated because its PLE
+  guard makes a wrong device observable without a GPU; the others need a
+  per-architecture residency assertion that does not exist yet.
 * **The rest of the tree's `CurrentPlatform()` readers.** This row fixes the
   GGUF residency path. A sweep for other load-time or config-time readers that
   should take the engine's resolved device is not done here and has no owner.
@@ -233,6 +249,47 @@ re-run to 13/3087/rc 0.
   remedy the user can actually follow. That arm is `#2083`, and the sibling
   CUDA wave's reachability mutation confirms its op arms sit behind this same
   refusal.
+
+## Review
+
+A fresh review returned FINDINGS, not PASS, and reproduced this row's headline
+numbers byte-for-byte before doing so. What it changed:
+
+* **F1 — the production call site was ungated.** The row's own gate entered
+  through `ModelRegistry::Load` but built its `ModelSource` by hand, so
+  `FromModelDir`'s `FromGguf(gguf, gguf_device)` was exercised by nothing:
+  mutating that argument to a wrong constant left 26,509 assertions across
+  eight suites green. Closed by a `FromModelDir` case (section 7 of
+  `test_qwen4_exp_gguf_weights.cpp`), which is possible without a GPU only
+  because this architecture's PLE guard makes a wrong device observable.
+* **F2 — the device was re-resolved, not carried.** Two independent
+  `ResolveModelDeviceType` calls, and that function is not pure on
+  `--device auto`: `ResolveAutoDevice` decides by attempting `CreateQueue()`.
+  The tokenizer and the mmproj vision tower load between the two calls, so a
+  post-growth `cudaStreamCreate` failure could have made one load bound as CUDA
+  and routed as CPU. Now one resolution, carried.
+* **F3 — a silent collision with #2396.** The new gather cases re-encoded
+  "gather is CPU-only" as fact, in sites that merge cleanly with #2396 and stay
+  green on a GPU-less CI. Now expressed with `kMETAL`, which has no gather arm
+  in any build, plus a loop deriving its expectation from
+  `DeviceQuantGatherSupported`. `#2396`'s own `OpRegistered(kEmbeddingQuant, …)`
+  shape cannot be used here yet — that OpId does not exist on this branch — but
+  neither form collides with the other.
+* **F5 — a sentence of this row's own was false**, and it named a real latent
+  bug. See `## Owed` and #2406.
+* **F6 — `(expect_keep ? kept : expanded)++` counted the EXPECTATION**, so the
+  totality table's two totals restated their own arithmetic and could never
+  fire. Now counts the observed residency, and the table runs over three
+  devices instead of one, which turns three compile-time constants back into
+  device-derived terms.
+
+**And a build break this row's own gates could not see.** `test_cuda_quant_dot`
+took its `platforms/interface.h` include INSIDE `#ifdef VLLM_CPP_CUDA` while
+its use site is outside, so `build-newest-gcc` and `build-test-cpu` went red on
+CI while every focused suite here stayed green — because no target in the list
+those suites name builds that TU. A focused green over a target list that omits
+the broken translation unit is indistinguishable from a passing build. The gate
+for this row is a FULL build, and a reported green names the targets it built.
 
 ## Stop conditions
 

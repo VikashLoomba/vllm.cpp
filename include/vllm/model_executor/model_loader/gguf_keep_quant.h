@@ -312,9 +312,20 @@ struct GgufLoadPolicy {
 
   // The device the ENGINE resolved for this load — `ResolveModelDeviceType` in
   // `entrypoints/model_loader.cpp`, which for an explicit `--device cpu`
-  // answers `kCPU` even on a CUDA-capable process. EVERY device-dependent
-  // decision in this struct reads this field, and nothing in the residency path
-  // reads `vllm::platforms::CurrentPlatform()` any more.
+  // answers `kCPU` even on a CUDA-capable process. Nothing in the residency
+  // path reads `vllm::platforms::CurrentPlatform()` any more.
+  //
+  // NOT "every device-dependent decision reads this field". An earlier draft of
+  // this comment said that and it was false. `quant_repack` below is set from
+  // `vt::cpu::QuantRepackActive()`, a pure HOST-ISA probe with no device term
+  // at all, so on an aarch64 i8mm CUDA box a `--device cuda` load still
+  // ARM-repacks its Q8_0 weights into `block_q8_0x4` and stages them to the
+  // card, and `cuda_quant_dot.cu` contains no reader for the `repacked` marker.
+  // Its sibling `elem_kn_repack` IS gated `dev == kCPU` for exactly this
+  // reason. That gap is pre-existing and this row does not widen it, but a
+  // sentence that asserts it away is worse than the gap: it tells the next
+  // reader not to look. Tracked as its own issue and listed under `## Owed` in
+  // `.agents/specs/gguf-residency-resolved-device.md` (issue #2406).
   //
   // The STRUCT default is `kCPU` for the same reason `keep_quant` defaults
   // false: a default-constructed policy is the historical all-expand load, and

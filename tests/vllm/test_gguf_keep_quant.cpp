@@ -447,7 +447,16 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // probe inside `RouteGgufTensor` on the other, so this table's totals were
   // host-dependent and the two sides could only agree by both probing. They are
   // now the same value, and the counts below are the same on every host.
-  constexpr vt::DeviceType kRouteDev = vt::DeviceType::kCPU;
+  //
+  // F6: and it runs over EVERY device rather than one. With a single `kCPU` the
+  // three device terms below (`rocm`, `device_capable`, `gather_device_capable`)
+  // collapse to compile-time constants that still READ as device-derived, so
+  // the ROCm narrowing and the gather gate were asserted by nobody. The totals
+  // are already written per device, so the loop costs nothing and makes them
+  // mean it.
+  for (vt::DeviceType kRouteDev : {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                                   vt::DeviceType::kROCM}) {
+  CAPTURE(std::string(vt::DeviceTypeName(kRouteDev)));
 
   int kept = 0;
   int expanded = 0;
@@ -515,10 +524,18 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
                                            ? GgufResidency::kKeepQuant
                                            : GgufResidency::kExpandBf16;
 
-        CHECK(RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
-                              /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role,
-                              type, shape, kRouteDev) == expected);
-        (expect_keep ? kept : expanded)++;
+        // COUNT WHAT ROUTING DID, not what this case expected it to do.
+        // `(expect_keep ? kept : expanded)++` tallied the EXPECTATION, so the
+        // two totals below were a restatement of the arithmetic that produced
+        // them and could not fail for any routing defect — a tautology that has
+        // never fired. Counting `got` makes them a statement about the
+        // implementation, which is what a total is worth having.
+        const GgufResidency got =
+            RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                            /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role, type,
+                            shape, kRouteDev);
+        CHECK(got == expected);
+        (got == GgufResidency::kKeepQuant ? kept : expanded)++;
 
         // The master switch OFF expands everything, always.
         CHECK(RouteGgufTensor(/*keep_quant=*/false, /*keep_f16=*/false,
@@ -553,6 +570,7 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   const int gather_kept = kRouteDev == vt::DeviceType::kCPU ? 13 : 0;
   CHECK(kept == gemm_kept + gather_kept);
   CHECK(expanded == 16 * 36 - (gemm_kept + gather_kept));
+  }
 }
 
 TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
@@ -2257,14 +2275,36 @@ TEST_CASE("gguf residency: the routed device is a parameter, and it decides") {
                               /*ggml_type=*/8u, table,
                               vt::DeviceType::kCPU) ==
         vllm::GgufResidency::kKeepQuant);
-  for (vt::DeviceType d : {vt::DeviceType::kCUDA, vt::DeviceType::kMETAL,
-                           vt::DeviceType::kVULKAN, vt::DeviceType::kROCM}) {
+  // Metal, NOT CUDA, for the hard-coded contrast. This case owns one claim —
+  // the DEVICE PARAMETER decides — and it must not also freeze WHICH devices
+  // can gather, because #2396 is concurrently giving CUDA a block-decoding
+  // gather. A `kCUDA` literal here would go red on that landing for a reason
+  // this row has no opinion about, and worse, it would do so invisibly: these
+  // cases sit at the end of the file and merge cleanly with #2396, and on a
+  // CPU-only CI build the red would not appear at all. Metal has no gather arm
+  // in any build, so it stays a valid contrast across both.
+  CHECK(vllm::RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                              /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
+                              vllm::GgufTensorRole::kEmbeddingTable,
+                              /*ggml_type=*/8u, table,
+                              vt::DeviceType::kMETAL) ==
+        vllm::GgufResidency::kExpandBf16);
+
+  // Every device, with the expectation DERIVED from the gate rather than from a
+  // list written here. This is what keeps the claim ("the parameter decides")
+  // separable from the fact ("only the CPU gathers today"): when a backend
+  // gains a gather, this loop follows it and the case above still discriminates.
+  for (vt::DeviceType d : {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                           vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
+                           vt::DeviceType::kROCM}) {
     CAPTURE(std::string(vt::DeviceTypeName(d)));
+    const vllm::GgufResidency want = vllm::DeviceQuantGatherSupported(d)
+                                         ? vllm::GgufResidency::kKeepQuant
+                                         : vllm::GgufResidency::kExpandBf16;
     CHECK(vllm::RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
                                 /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
                                 vllm::GgufTensorRole::kEmbeddingTable,
-                                /*ggml_type=*/8u, table, d) ==
-          vllm::GgufResidency::kExpandBf16);
+                                /*ggml_type=*/8u, table, d) == want);
   }
 
   // The GEMM arm's device gate is per DTYPE, and ROCm's kernel set is narrower
@@ -2303,11 +2343,13 @@ TEST_CASE("gguf residency: the policy carries its device, and Route uses it") {
   t.shape = {320001536, 160};
   vllm::GgufLoadPolicy keep_cpu = cpu;
   keep_cpu.keep_quant = true;
-  vllm::GgufLoadPolicy keep_cuda =
-      vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kCUDA);
-  keep_cuda.keep_quant = true;
+  // Metal for the same reason as the case above: this asserts that `Route`
+  // reads `policy.device`, not which devices gather.
+  vllm::GgufLoadPolicy keep_metal =
+      vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kMETAL);
+  keep_metal.keep_quant = true;
   CHECK(keep_cpu.Route(t, vllm::GgufTensorRole::kEmbeddingTable) ==
         vllm::GgufResidency::kKeepQuant);
-  CHECK(keep_cuda.Route(t, vllm::GgufTensorRole::kEmbeddingTable) ==
+  CHECK(keep_metal.Route(t, vllm::GgufTensorRole::kEmbeddingTable) ==
         vllm::GgufResidency::kExpandBf16);
 }

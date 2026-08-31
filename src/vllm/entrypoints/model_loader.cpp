@@ -2460,6 +2460,24 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // are deterministic and match registry.py rather than being masked by a
     // later source-specific missing-tensor/tokenizer error.
     const ModelRegistration& gguf_arch = ModelRegistry::Resolve(config);
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE F2: resolved ONCE, here, and carried.
+    //
+    // `ResolveModelDeviceType` is NOT pure on `--device auto`: `ResolveAutoDevice`
+    // decides by ATTEMPTING `CreateQueue()` and answers `kCPU` when that throws.
+    // Between the fit check below and the `ModelSource` further down, this
+    // function opens the tokenizer and the mmproj vision tower, so host memory
+    // grows; `cudaStreamCreate` failing after exactly that growth is documented
+    // on this project's own target box (examples/laguna_gen/main.cpp:181).
+    //
+    // Two calls could therefore disagree WITHIN ONE LOAD: the fit check bounds a
+    // CUDA load, every registry then builds a CPU policy and keeps the n-gram
+    // table block-resident, and the runner's own resolution hands the forward a
+    // CUDA queue whose `EmbeddingKernelCuda` cannot decode blocks — the exact
+    // first-forward throw with the model fully resident that
+    // `DeviceQuantGatherSupported` exists to prevent. One resolution cannot
+    // disagree with itself.
+    const vt::DeviceType gguf_device =
+        ResolveModelDeviceType(gguf_arch.architecture, params.device);
     // Issue #1123: refuse a GGUF whose weights cannot be STAGED onto the target
     // device, here, before any weight I/O and before the tokenizer.
     //
@@ -2480,8 +2498,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // `gguf_device_fit.h`; it decides nothing on a platform that does not stage
     // weights (every CPU load) and nothing when no budget is known.
     {
-      const platforms::Platform& target = platforms::GetPlatform(
-          ResolveModelDeviceType(gguf_arch.architecture, params.device));
+      const platforms::Platform& target = platforms::GetPlatform(gguf_device);
       // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124). The bound above sums the
       // WHOLE tensor table, so on `Qwen3.8-2.4T-A95B UD-Q1_0` it counts all
       // 335.62 GiB of `*_exps` and refuses before any forward exists to take the
@@ -2538,8 +2555,8 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // answers to the same `getenv` reads.
       //
       // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: from `target.device_type()`, which
-      // is the device `ResolveModelDeviceType` resolved three lines above and
-      // handed the fit check. It used to be `FromEnv()`, which probed
+      // is `gguf_device` — the load's ONE resolution, the same value the fit
+      // check is bounded with and the same value the `ModelSource` carries. It used to be `FromEnv()`, which probed
       // `platforms::CurrentPlatform()` — so on a CUDA-capable process an
       // explicit `--device cpu` bounded a CPU load with the CUDA residency
       // policy. That is #1136's finding one level down: the bound and the
@@ -2739,9 +2756,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the RESOLVED device travels with the
     // source, so every GGUF registry hook builds its residency policy from what
     // the engine chose rather than from `platforms::CurrentPlatform()`. The
-    // same call the #1123 fit check above already makes.
-    ModelSource gguf_source = ModelSource::FromGguf(
-        gguf, ResolveModelDeviceType(gguf_arch.architecture, params.device));
+    // SAME VALUE the #1123 fit check above was bounded with — not a second call
+    // to the same function, which on `--device auto` can answer differently
+    // (see `gguf_device`).
+    ModelSource gguf_source = ModelSource::FromGguf(gguf, gguf_device);
     gguf_source.multimodal = &params.multimodal;
     const auto t_gguf_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);

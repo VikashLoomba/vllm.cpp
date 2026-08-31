@@ -62,8 +62,14 @@
 // out of device memory (only the CUDA TU that defines them can address them).
 #include "vt/cpu/cpu_quant_iq_tables.h"
 #include "vt/cuda/cuda_iq_table_seal.h"
-#include "vllm/platforms/interface.h"
 #endif
+
+// UNCONDITIONAL: `CurrentPlatform()` is used at the `RouteGgufTensor` call in
+// the IQ header case below, which is NOT inside `VLLM_CPP_CUDA`. This include
+// spent one CI cycle inside that guard and broke `build-newest-gcc` and
+// `build-test-cpu` while every CPU-only focused gate stayed green, because no
+// suite in that target list builds this TU.
+#include "vllm/platforms/interface.h"
 
 using vt::Backend;
 using vt::Device;

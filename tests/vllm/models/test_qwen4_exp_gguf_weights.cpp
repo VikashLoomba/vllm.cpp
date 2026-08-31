@@ -63,6 +63,8 @@
 
 #include "qwen4_exp_gguf_manifest.inc"
 #include "vllm/platforms/interface.h"
+#include "vllm/entrypoints/model_loader.h"
+#include "vllm/config/device.h"
 
 namespace {
 
@@ -1038,4 +1040,82 @@ TEST_CASE("qwen4_exp GGUF: the registry hook routes on the ENGINE's resolved "
       CHECK_THROWS_AS((void)LoadThroughRegistry(g, d), std::exception);
     }
   }
+}
+
+// --- (7) the PRODUCTION ENTRY POINT carries the resolved device --------------
+//
+// ENG-GGUF-RESIDENCY-RESOLVED-DEVICE F1. Case (6) enters through
+// `ModelRegistry::Load`, which IS a production hook, but it builds the
+// `ModelSource` itself. Nothing therefore exercised
+// `LoadedEngine::FromModelDir`'s OWN `ModelSource::FromGguf(gguf,
+// gguf_device)`, and the fresh review measured the hole: replacing that second
+// argument with a wrong constant left 26,509 assertions across eight suites
+// green, this row's declared gate included.
+//
+// So this case enters where a user enters. `FromModelDir` on an explicit
+// `--device cpu` must reach the loader with `kCPU`, and on this architecture
+// that is observable WITHOUT a GPU: any non-CPU device trips the PLE gather
+// refusal before a single tensor is read, so a wrong constant at the call site
+// turns a load that must succeed into a refusal that names `gather`.
+TEST_CASE("qwen4_exp GGUF: FromModelDir carries the RESOLVED device to the load") {
+  // WITH the tokenizer. Without it `FromModelDir` dies at
+  // `tokenizer: GGUF missing kv "tokenizer.ggml.model"` — which is BEFORE
+  // `ModelRegistry::Load` — and every assertion below passes for a load that
+  // never reached the code under test. The first draft of this case did
+  // exactly that and survived the mutation it exists to catch.
+  FixtureOpts opts;
+  opts.with_tokenizer = true;
+  TempFile f(BuildFixture(opts));
+  vllm::entrypoints::EngineParams params;
+  params.device = vllm::Device::kCPU;
+
+  std::string msg;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(f.path(), params);
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  CAPTURE(msg);
+
+  // The assertion is NARROW on purpose. This fixture is a weights fixture, not
+  // a serving fixture, so `FromModelDir` may still refuse it further down for
+  // reasons that have nothing to do with this row (a KV/engine field this
+  // synthetic file does not carry). What must NEVER appear on an explicit
+  // `--device cpu` is the device-gated PLE refusal, because reaching that means
+  // the entry point handed the loader a device the engine did not resolve.
+  //
+  // Asserting "no throw at all" would couple this row to every unrelated
+  // serving precondition and would go red for reasons it does not own. Both
+  // halves of the refusal are checked, so a message that merely mentions the
+  // tensor cannot pass for the device gate.
+  const bool refused_by_device_gate =
+      msg.find("per_layer_token_embd.weight") != std::string::npos &&
+      msg.find("gather") != std::string::npos;
+  CHECK_FALSE(refused_by_device_gate);
+
+  // And the refusal is REACHABLE from this same entry point, so the check above
+  // is a real discrimination rather than an assertion about an error that can
+  // never occur here. `kNamedPlatform` is "cuda": on a CPU-only build no CUDA
+  // platform is registered, so `ResolveExplicitDeviceType` refuses BY NAME
+  // instead — a different message, and the one that proves the explicit-device
+  // path is live. On a CUDA build the same request resolves `kCUDA` and the
+  // PLE gather refusal is what comes back. Either way the request must FAIL,
+  // and it must fail differently from the `kCPU` request above.
+  vllm::entrypoints::EngineParams cuda_params;
+  cuda_params.device = vllm::Device::kNamedPlatform;
+  std::string cuda_msg;
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(f.path(), cuda_params);
+  } catch (const std::exception& e) {
+    cuda_msg = e.what();
+  }
+  CAPTURE(cuda_msg);
+  CHECK_FALSE(cuda_msg.empty());
+  const bool cuda_absent =
+      cuda_msg.find("no CUDA platform is available") != std::string::npos;
+  const bool cuda_gather_refusal =
+      cuda_msg.find("per_layer_token_embd.weight") != std::string::npos &&
+      cuda_msg.find("gather") != std::string::npos;
+  CHECK((cuda_absent || cuda_gather_refusal));
+  CHECK(cuda_msg != msg);
 }

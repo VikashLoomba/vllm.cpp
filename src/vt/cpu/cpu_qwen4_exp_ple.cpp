@@ -56,10 +56,15 @@
 // spec's `## Owed` records that.
 //
 // ─── SCOPE ────────────────────────────────────────────────────────────────────
-// Nothing here is registered for any device but kCPU, so the dispatcher refuses
-// BY NAME on every other one rather than silently falling back. The CUDA arm is
-// OWED, not written: this is a CPU-only host and an ungated kernel is worse
-// than an absent one.
+// Both ops here are also registered for kCUDA, in
+// `src/vt/cuda/cuda_qwen4_exp_ple.cu` (W6-CUDA). The spec's evidence table, not
+// this comment, records which device that arm was built and measured on.
+// The device arms inherit THIS file's numeric decisions rather than making new
+// ones — the conv's DOUBLE four-tap accumulator and the gate's all-double
+// interior, including the `SignedSqrt` NaN guard — and are held to these same
+// goldens plus a bitwise comparison against these kernels
+// (`tests/vllm/models/test_qwen4_exp_cuda.cpp`). No OTHER device is registered,
+// so the dispatcher refuses those BY NAME rather than silently falling back.
 #include <cmath>
 #include <cstdint>
 #include <vector>

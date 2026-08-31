@@ -3439,9 +3439,11 @@ target_include_directories(test_qwen4_exp_qsa_block PRIVATE ${CMAKE_SOURCE_DIR}/
 # vt::Qwen4ExpGatedResidual / vt::Qwen4ExpGatedResidualWriteBack against the SAME
 # lane-pinned goldens the host reference is gated on, so the two arms answer to
 # one oracle rather than to each other, plus a MODEL-WIDTH (hidden_size 2560,
-# hc_count 4, hc_lowrank 320) agreement check the golden shapes cannot make. CPU
-# only: no CUDA arm of this op exists and one written on a CPU host could not be
-# gated. Reaches the model-private `qwen4_exp_hc.h`, hence the src/ grant.
+# hc_count 4, hc_lowrank 320) agreement check the golden shapes cannot make.
+# CPU arms only, and the two ops now DIFFER on device coverage: the write-back
+# has a CUDA arm (W6-CUDA) gated byte-identically in test_qwen4_exp_cuda below,
+# the gated residual has none because its grouped norm owes a reduction-width
+# decision first. Reaches the model-private `qwen4_exp_hc.h`, hence the src/ grant.
 vllm_cpp_add_test(test_qwen4_exp_hc_device vllm/models/test_qwen4_exp_hc_device.cpp)
 target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
@@ -3500,9 +3502,9 @@ target_include_directories(test_qwen4_exp_ple PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # vt::Qwen4ExpPleConv against the SAME lane-pinned goldens the W2 host reference
 # is gated on, so the two arms answer to one oracle rather than to each other,
 # plus a MODEL-WIDTH (10240 channels) agreement check the golden shapes cannot
-# make. CPU only: no CUDA arm of this op exists and one written on a CPU host
-# could not be gated. Reaches the model-private `qwen4_exp_ple.h`, hence the
-# src/ grant.
+# make. CPU arm only here; the CUDA arm this op gained in W6-CUDA is gated in
+# test_qwen4_exp_cuda below, against these same goldens. Reaches the
+# model-private `qwen4_exp_ple.h`, hence the src/ grant.
 vllm_cpp_add_test(test_qwen4_exp_ple_device vllm/models/test_qwen4_exp_ple_device.cpp)
 target_include_directories(test_qwen4_exp_ple_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
@@ -3510,10 +3512,21 @@ target_include_directories(test_qwen4_exp_ple_device PRIVATE ${CMAKE_SOURCE_DIR}
 # gate and its broadcast sigmoid scale, against section J of the SAME lane-pinned
 # goldens: modeling_qwen4_exp.py:1181-1182 + the :1184 flatten, exec'd verbatim.
 # Includes the vt::BatchedMatmul composition of the :1180 dot, so the claim that
-# the dot needs no new op is measured rather than asserted. CPU only: no CUDA arm
-# of this op exists and one written on a CPU host could not be gated. No src/
-# grant — this test reaches nothing but the public vt:: surface.
+# the dot needs no new op is measured rather than asserted. CPU arm only here;
+# the CUDA arm this op gained in W6-CUDA is gated in test_qwen4_exp_cuda below.
+# No src/ grant — this test reaches nothing but the public vt:: surface.
 vllm_cpp_add_test(test_qwen4_exp_ple_gate vllm/models/test_qwen4_exp_ple_gate.cpp)
+
+# MODEL-MM-QWEN4-EXP W6-CUDA — the DEVICE-ARM gate for the three qwen4_exp ops
+# that now have CUDA kernels (`vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`,
+# `vt::Qwen4ExpGatedResidualWriteBack`). Holds each to the SAME lane-pinned
+# transformers goldens the CPU arms answer to, AND to the CPU arm itself on
+# identical inputs — byte-identically for the write-back, which is what makes
+# that op's oracle gate transitive. Skips LOUDLY on a box with no CUDA backend,
+# except the registration case, which is guarded on the BUILD and not the
+# device. Compiled unconditionally, like every other CUDA suite here.
+# No src/ grant — it reaches nothing but the public vt:: surface.
+vllm_cpp_add_test(test_qwen4_exp_cuda vllm/models/test_qwen4_exp_cuda.cpp)
 
 # MODEL-MM-QWEN4-EXP W5e-2 (#2336) — `RunQwen4ExpPleBlock`, the PLE layer as ONE
 # production composition and the LAST of the three block seams. Gated end to end

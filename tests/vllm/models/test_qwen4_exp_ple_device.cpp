@@ -30,7 +30,11 @@
 // which sees everything and localises nothing. The dense conv-only goldens this
 // wave adds sit between them.
 //
-// SCOPE, HONESTLY. CPU only — no CUDA arm of this op exists, and one written on
+// SCOPE, HONESTLY. This file is the CPU arm's gate. A CUDA arm of this op DOES
+// now exist (`src/vt/cuda/cuda_qwen4_exp_ple.cu`, W6-CUDA) and is gated in
+// `test_qwen4_exp_cuda.cpp`, against these same goldens and against this arm;
+// nothing below runs on a device. The text that stood here said no CUDA arm
+// exists, and it read: CPU only — no CUDA arm of this op exists, and one written on
 // this CPU-only host could not be gated on it. Nothing calls this op from a
 // production entry point yet: `ModelRegistry::Forward` has no `qwen4_exp` arm,
 // the wiring is owned by row `MODEL-MM-QWEN4-EXP` and tracked by #2031 under

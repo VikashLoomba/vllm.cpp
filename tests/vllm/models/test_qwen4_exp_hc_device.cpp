@@ -31,7 +31,13 @@
 // that walked the low-rank intermediate with the wrong row stride, fails here
 // and could not fail there.
 //
-// SCOPE, HONESTLY. CPU only — no CUDA arm of this op exists, and one written on
+// SCOPE, HONESTLY. This file is the CPU arms' gate, and the two ops it covers
+// now DIFFER on device coverage: `vt::Qwen4ExpGatedResidualWriteBack` has a
+// CUDA arm (`src/vt/cuda/cuda_qwen4_exp.cu`, W6-CUDA), gated BYTE-IDENTICALLY
+// against this arm in `test_qwen4_exp_cuda.cpp` — which is what makes THIS
+// file's oracle gate transitive to it — while `vt::Qwen4ExpGatedResidual` has
+// none, because its grouped norm owes a reduction-width decision first.
+// Nothing below runs on a device. The text that stood here read: CPU only — no CUDA arm of this op exists, and one written on
 // this host could not be gated on it. No token claim and no speed claim: nothing
 // calls these ops from a production entry point yet (the forward is owed, see
 // the spec's `## Owed`), and no `qwen4_exp` arm decodes.

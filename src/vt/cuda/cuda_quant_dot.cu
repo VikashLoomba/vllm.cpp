@@ -532,6 +532,31 @@ __device__ inline float DotIQ2XS(const BlockIQ2_XS* xb, const BlockQ8_K* yb) {
 // kept rather than hoisted into one integer accumulator — which would be a
 // faster kernel computing a different number. FinalFactor<kIQ4_XS> is 1.
 //
+// ─── WHY __fmul_rn/__fadd_rn AND NOT `sumf += d1 * x` ───────────────────────
+// Because nvcc CONTRACTS that expression into an FMA (-fmad=true is the
+// default), and an FMA rounds ONCE where upstream rounds twice. That is not a
+// tolerance question, it is the association above being silently replaced: the
+// paragraph promising upstream's eight accumulation steps was true of the
+// source and false of the SASS.
+//
+// MEASURED, not feared. The first sm_121a run of this kernel disagreed with the
+// pinned oracle on exactly two of eight real checkpoint super-blocks, by 1 and
+// 4 ULP, while IQ2_XS was bit-exact everywhere — the split an FMA predicts,
+// because IQ2_XS's core is integer with a single final multiply and has nothing
+// to contract. Recomputing those same blocks on the host with `std::fma` at
+// this line reproduced the device's bits EXACTLY (0xBFC39E59 and 0x3E173708)
+// and left the other two blocks equal to the oracle, which identifies the cause
+// with no free parameters left over.
+//
+// `__fmul_rn` and `__fadd_rn` are the round-to-nearest primitives nvcc is not
+// permitted to fuse, so they restore upstream's rounding exactly. Scoped to
+// THIS kernel rather than fixed with `-fmad=false` on the translation unit,
+// which would change the numerics of ten other encodings that no one measured.
+// Q4_K and Q5_K end in `d * isum - dmin * sumi`, which is contractable the same
+// way; they are gated against the CPU at NMSE and not bit-exactly, so nothing
+// here has ever been able to see it. Recorded in the row's spec, not fixed
+// here.
+//
 // Alignment: `d` and `scales_h` are u16 at offsets 0 and 2 of a 136-byte block,
 // so both are 2-byte aligned wherever the GEMM addresses a block.
 __device__ inline float DotIQ4XS(const BlockIQ4_XS* xb, const BlockQ8_K* yb) {
@@ -554,7 +579,7 @@ __device__ inline float DotIQ4XS(const BlockIQ4_XS* xb, const BlockQ8_K* yb) {
       sumi1 += q8[j + 0] * d_kvalues_iq4nl[qs[j] & 0xf];
       sumi2 += q8[j + 16] * d_kvalues_iq4nl[qs[j] >> 4];
     }
-    sumf += d1 * (sumi1 + sumi2);
+    sumf = __fadd_rn(sumf, __fmul_rn(d1, static_cast<float>(sumi1 + sumi2)));
     qs += 16;
     q8 += 32;
     sumi1 = 0;
@@ -563,7 +588,7 @@ __device__ inline float DotIQ4XS(const BlockIQ4_XS* xb, const BlockQ8_K* yb) {
       sumi1 += q8[j + 0] * d_kvalues_iq4nl[qs[j] & 0xf];
       sumi2 += q8[j + 16] * d_kvalues_iq4nl[qs[j] >> 4];
     }
-    sumf += d2 * (sumi1 + sumi2);
+    sumf = __fadd_rn(sumf, __fmul_rn(d2, static_cast<float>(sumi1 + sumi2)));
     qs += 16;
     q8 += 32;
   }

@@ -13,9 +13,9 @@ the debt [#2380](https://github.com/mudler/vllm.cpp/issues/2380) records under
 
 `ACTIVE`.
 
-## The gap, as measured on `4ab04afd6`
+## The gap, as measured on `84f6fac0a`
 
-`IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu:1736`) maps twelve
+`IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu:1815`) maps twelve
 `DType`s to a `WType`. Every one is a **256-element super-block** encoding whose
 `vec_dot` pairs it with a `BlockQ8_K` activation, and the templated GEMM behind
 the predicate (`DotSuperblock<W>(const void*, const BlockQ8_K*)`) takes that
@@ -35,15 +35,15 @@ gain this row measures.
 
 ### What the three consumers do today
 
-Line numbers in this section are **at `4ab04afd6`**, the base. This change
+Line numbers in this section are **at `84f6fac0a`**, the base. This change
 inserts a lane above `IsCudaKeepQuantSupported` and moves every one of them, so
 read them against the base rather than the merged tree.
 
 | Seam | Today, for IQ4_NL / Q5_0 / Q4_0 |
 |---|---|
-| `MatmulBTQuantKernelCuda:1993` | `cudaStreamSynchronize` then `GetOp(kMatmulBTQuant, kCPU)` over the same tensors. |
-| `MatmulBTQuantGroupedKernelCuda:2090` | the same drain-and-fall-back. |
-| `MoeGateUpSwiGLUGroupedCuda:2320` | **throws** `moe_gate_up_swiglu: gate/up must be the SAME CUDA keep-quant dtype`. |
+| `MatmulBTQuantKernelCuda:2076` | `cudaStreamSynchronize` then `GetOp(kMatmulBTQuant, kCPU)` over the same tensors. |
+| `MatmulBTQuantGroupedKernelCuda:2170` | the same drain-and-fall-back. |
+| `MoeGateUpSwiGLUGroupedCuda:2402` | **throws** `moe_gate_up_swiglu: gate/up must be the SAME CUDA keep-quant dtype`. |
 
 The fallback is correct and host-speed where `Backend::Alloc`'s memory is
 host-addressable. On CUDA it is a plain `cudaMalloc` (`cuda_backend.cu:104-108`),
@@ -117,7 +117,7 @@ CPU arm's comments already say so. They are reproduced rather than normalised:
 
 `-ffp-contract=off` is CXX-only (`CMakeLists.txt:55`) and never reaches `.cu`,
 so nvcc would contract each of these into an FMA that rounds once where upstream
-rounds twice. `cuda_quant_dot.cu:541-564` records that being MEASURED here — two
+rounds twice. `cuda_quant_dot.cu:620-643` records that being MEASURED here — two
 of eight real super-blocks off by 1 and 4 ULP. Every multiply-add in the new
 dots is therefore spelled `__fmul_rn` / `__fadd_rn`, as `DotIQ4XS` is.
 

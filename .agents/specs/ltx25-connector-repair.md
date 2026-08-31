@@ -459,14 +459,57 @@ call's operands -- including the inf and nan values
 property, not a value property, and this row does not claim a gate it does not
 have.
 
+### Where the evidence is
+
+`/mnt/nas_share/rc/ltx25-connector-repair/run/`, which a leased worker sees as
+`/workspace/ltx25-connector-repair/run/`:
+
+| directory | host | what is in it |
+|---|---|---|
+| `rc-worker-4b8lj-20260831T224259Z` | GB10, `dgx:gpu0` | `log.txt`, `tier-{A,C}.txt`, `connector-{A,C}.txt`, `attn-{A,C}.txt`, `gemm-{A,C}.txt`, `gemm-portable.txt`, `test-mblock.txt` |
+| `rc-worker-n8smh-20260831T221041Z` | thor, `thor:gpu0` | the same set |
+
+`run.sh` and the two source tarballs it builds from sit beside `run/`.
+`src-landed.tar.gz` is a `git archive` of this branch's head, so the binary that
+ran the byte-equality gate under the lease is built from the tree this pull
+request lands.
+
 ### The gates
 
 - `tests/vt/test_ops_matmul_elem_mblock.cpp`: 3 / 1802 / 0, on the changed tree
-  and on a pristine base tree.
+  and on a pristine base tree, and 3 / 1802 / 0 again on aarch64 inside the GB10
+  lease. On the MERGED tree, `test_ops_matmul_elem.cpp` and
+  `test_ops_matmul_elem_mblock.cpp` together read **10 cases / 2,487 assertions
+  / 0 failed**, which is the pair of suites run against the tree that lands
+  rather than against the tree the change was written on.
 - Seven mutations, every one matching its prediction.
 - The A/B above, two SEPARATE build directories, binaries asserted to differ by
   sha256 before any timing.
-- `scripts/check-tree-compiles.py` and `scripts/agent-preflight.sh`.
+- `scripts/check-tree-compiles.py`: **612 of 612** translation units before the
+  merge (a header is in scope, so it ran the 1223-unit dependency scan first),
+  and **9 of 9** after it, when the range narrowed to this branch's own paths.
+- `scripts/agent-preflight.sh`: every checker green after the anchor repair.
+  `check-agent-record` failed first at `stale: 29 > baseline 28`, because this
+  branch's own edit above `DFlashBlockAttentionKernel` moved it off
+  `cpu_ops.cpp:3143`; the anchor is repointed to `:3190` in
+  `.agents/kernel-matrix.md` in this change, which is the rule that a record
+  edit rides in the change whose edit made it stale.
+
+**One suite fails and it is the box, not this branch.** It is the ONLY failing
+gate on the final run. `test_cpu_x86_llamacpp_floor` reds with its own words,
+and WHICH of its ten cases reds moves between runs -- `NO_QUIET_WINDOW` in the
+run quoted below, `test_a_contended_leg_is_discarded_and_never_summarised` in
+the next -- which is itself the signature of a load-dependent refusal rather
+than a defect: `NO_QUIET_WINDOW after
+30s (busy=113% builders=0 load=50.83 45.74 39.03)`. The harness refuses to
+measure without a quiet window and this devbox was at loadavg ~50 with another
+agent on it. **The control was run rather than assumed**: the same suite, from
+the shared checkout, on a tree carrying none of this branch, fails identically
+with `NO_QUIET_WINDOW after 30s (... load=44.90 44.39 39.82)`. And
+`git diff --name-only origin/main...HEAD` on this branch names ten paths, none
+of them under `tests/scripts/`, `benchmarks/` or that harness. It is a
+load-dependent refusal in a harness this row does not touch, and it is not a
+verdict about this change.
 
 ### What this row does not claim
 

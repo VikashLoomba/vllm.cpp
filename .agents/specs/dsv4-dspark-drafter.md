@@ -215,6 +215,27 @@ block's are 20.2 GiB as host f32 -- and the caller is told through
 Shapes are checked at assembly rather than inside a forward, where a mismatch
 surfaces as an anonymous MatVec size error naming no tensor and no layer.
 
+W-3's REMAINING SHAPE, measured rather than estimated. The block weights now
+assemble onto `DeepseekV4LayerHostWeights`, so `MoeBlock`, `MhcPre` and `MhcPost`
+compose the drafter block unchanged. **`AttentionBlock` does not**, and the reason
+is structural rather than incidental.
+
+A trunk layer derives its KV from its OWN hidden state: the paged arm computes
+`deck` and writes it with `vt::ConcatAndCacheMla` before attending, and does so
+unconditionally. A DSpark block does not work that way. Its KV rows come from the
+TARGET's tap state through `update_kv_from_target`, written at the target's own
+positions, and its query comes from the block's hidden state. Query and KV have
+different sources, which is exactly what `AttentionBlock` has no way to express.
+
+So the remaining brick is not "call `AttentionBlock`". It is either an
+externally-supplied-KV mode on that function -- a seam extension, since the write
+is the only part that must be skipped and everything else is shared -- or the
+drafter's own composition of the q path, `PagedCausalMlaAttention` over the
+drafter's cache, and the o path. The first is preferable under
+`AGENTS.md` §"Shared seams" and is the smaller change; it is what the next wave
+should attempt first, and it must be gated by proving the trunk's own paths are
+byte-unchanged when the new mode is off.
+
 W-4b LANDED. `ConfidenceDraftLength` is the draft-length cap:
 `sigmoid(proj(cat(pre_norm_hidden, markov_emb))) >= threshold`, and the length is
 `cumprod(keep).sum()` -- the longest CONTIGUOUS prefix of confident positions, not

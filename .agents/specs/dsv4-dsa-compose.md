@@ -224,6 +224,19 @@ the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
 does not get one yet; it is listed under `## Owed
 
+- **The compressor's OWN KV projection is not materialized, so W1's composition
+  pools the wrong operand on the real artifact.** Upstream's compressor owns a
+  `fused_wkv_wgate` producing both its KV and its gate from the hidden state
+  (`compressor.py:279-287`), and the artifact stores
+  `attn.compressor.wkv.weight` per compressor layer. This tree accounts that
+  tensor and deliberately does not materialize it, because the collapsed
+  geometry reuses the MLA's `kraw` as the compressor's KV
+  (`deepseek_v4_weights.cpp`, the `Account` comment). `CompressorLayerStep`
+  inherits that convention: correct for the synthetic suites, and on the real
+  artifact it would pool the MLA latent where upstream pools a separate
+  projection -- finite, plausible, and wrong. This is a FOURTH piece W3 needs,
+  beyond the three the forward's refusal names.
+
 - **The indexer's qr projection is UNEXERCISED.** Its shape is accepted and that
   acceptance is gated, but no test runs a forward to completion with the upstream
   geometry, because the layer still refuses on `compressor.wkv`. A mutation that

@@ -109,6 +109,29 @@ namespace {
 constexpr double kUlpTol = 1.20e-7;
 constexpr double kAbsFloor = 1e-30;
 
+// THE ORACLE BOUND IS NOT THE ARM-VS-ARM BOUND, and conflating them was a real
+// defect in this file's first device run on sm_110. `kUlpTol` above is what two
+// arms of THIS tree may differ by: they run the same expression in the same
+// order, so one ulp is generous. A golden dumped by EXECUTING torch is an
+// INDEPENDENT f32 computation, and neither of our arms is held to one ulp of it
+// -- `test_qwen4_exp_ple_gate.cpp:94` has always used 1e-5 for exactly this
+// comparison, and this file now uses the same number for the same reason.
+//
+// The measurement that settles it: on the gate's own oracle fixture the CUDA arm
+// misses the golden by 4.76837e-07 and THE CPU ARM MISSES IT BY 4.76837e-07 TOO,
+// on the same 36 of 96 elements, while the two arms are BITWISE equal to each
+// other (0 of 96). A bound the CPU arm also fails is a bound about the bound,
+// not about the device -- which is why this is a re-derivation and not a
+// widening. 4.768e-07 is two ulp of the golden's own max magnitude (3.646); the
+// old bound allowed one.
+//
+// THE LOOSER BOUND IS NOT A WEAKER GATE, because every oracle case below is now
+// BACKSTOPPED by a bitwise CPU-vs-CUDA comparison ON THE SAME ORACLE INPUT. The
+// oracle case says "both arms match transformers"; the backstop says "and they
+// are the same kernel to the bit". A device defect has to break the second one,
+// and no tolerance can absorb it.
+constexpr double kOracleTol = 1e-5;
+
 constexpr int64_t kChannels = 16;  // kConvChannels
 constexpr int64_t kKernel = 4;     // kConvKernel
 constexpr int64_t kT = 6;          // kGateT
@@ -237,6 +260,20 @@ void CheckWithinUlp(const std::vector<float>& got, const std::vector<float>& wan
             << a.not_bitwise_equal << " of " << want.size()
             << " elements not bitwise equal (0 means byte-identical)");
   CHECK(a.worst <= bound);
+}
+
+// Against a torch-dumped golden. Prints the measurement so a drift is visible
+// even though the bound is deliberately loose -- 4.768e-07 today, and a change
+// in that number is a finding whether or not it crosses 1e-5.
+void CheckAgainstOracle(const std::vector<float>& got, const std::vector<float>& want,
+                        const char* what) {
+  const Agreement a = Compare(got, want);
+  std::printf("[MEASURED] %-42s vs ORACLE max|diff| = %.9g  bound = %.9g  differing = %zu/%zu\n",
+              what, a.worst, kOracleTol, a.not_bitwise_equal, want.size());
+  INFO(what << " vs the transformers golden: max|diff| = " << a.worst << " vs bound "
+            << kOracleTol << " (an INDEPENDENT f32 computation; the CPU arm misses it by "
+               "the same amount, see kOracleTol)");
+  CHECK(a.worst <= kOracleTol);
 }
 
 void CheckBitwise(const std::vector<float>& got, const std::vector<float>& want,
@@ -523,7 +560,14 @@ TEST_CASE("CUDA vt::Qwen4ExpPleConv reproduces the pinned transformers oracle") 
     const ConvResult got = RunConv(DeviceType::kCUDA, dilation, x, kConvSeqLen, w, zero);
     const std::vector<float> want(ConvExpectedFor(dilation),
                                   ConvExpectedFor(dilation) + kConvSeqLen * kChannels);
-    CheckWithinUlp(got.out, want, "conv vs oracle");
+    CheckAgainstOracle(got.out, want, "conv");
+    // THE BACKSTOP. `kOracleTol` is loose because the golden is an independent
+    // f32 computation; this line is what stops that looseness from hiding a
+    // device defect, by requiring the two arms to be the SAME KERNEL to the bit
+    // on the very input the oracle case just used.
+    const ConvResult ref = RunConv(DeviceType::kCPU, dilation, x, kConvSeqLen, w, zero);
+    CheckBitwise(got.out, ref.out, "conv on the oracle input");
+    CheckBitwise(got.state, ref.state, "conv ring on the oracle input");
   }
 }
 
@@ -643,7 +687,12 @@ TEST_CASE("CUDA vt::Qwen4ExpPleGate reproduces the pinned transformers oracle") 
   const std::vector<float> value(kGateValueIn, kGateValueIn + kT * kH);
   const std::vector<float> got = RunGate(DeviceType::kCUDA, score, value, kT, kHc, kH, 1.0f);
   const std::vector<float> want(kGateExpectedOut, kGateExpectedOut + kT * kHc * kH);
-  CheckWithinUlp(got, want, "gate vs oracle");
+  CheckAgainstOracle(got, want, "gate");
+  // THE BACKSTOP, and on this fixture it is the measurement that diagnosed the
+  // original bound: both arms miss the golden by 4.76837e-07 on the same 36 of
+  // 96 elements, and are bitwise equal to each other on all 96.
+  const std::vector<float> ref = RunGate(DeviceType::kCPU, score, value, kT, kHc, kH, 1.0f);
+  CheckBitwise(got, ref, "gate on the oracle input");
 }
 
 TEST_CASE("CUDA vt::Qwen4ExpPleGate reproduces the oracle's signed-sqrt table") {

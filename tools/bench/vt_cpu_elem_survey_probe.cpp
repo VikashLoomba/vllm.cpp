@@ -738,6 +738,66 @@ void RegisterCases() {
           vt::RmsNormGatedQuantFp8(q, to, tx, tg, tw, vt::RmsNormGatedArgs{}, 0.5f);
       });
 
+  // --- DFlash draft model (hidden 5120, 32 q-heads / 8 kv-heads / head_dim 128,
+  // include/vllm/model_executor/models/qwen3_dflash.h:14; block = 1 + 15
+  // speculative tokens, .agents/specs/dflash-spec-decode.md:70). ------------
+  Add("DFlashBlockAttentionKernel", "Qwen3-DFlash in-block attention, 16 reqs x 16-token block",
+      "q/k/v[256,32,128] f32", [](Queue& q, int reps) {
+        constexpr int64_t kHq = 32, kD = 128, kBlk = 16;
+        const int64_t nq = kDecode * kBlk;
+        auto a = F32(nq * kHq * kD, 108), k = F32(nq * kHq * kD, 109),
+             v = F32(nq * kHq * kD, 110);
+        std::vector<float> o(nq * kHq * kD);
+        std::vector<int32_t> cu(kDecode + 1);
+        for (size_t i = 0; i < cu.size(); ++i) cu[i] = static_cast<int32_t>(i) * kBlk;
+        Tensor tq = T(a, {nq, kHq, kD}), tk = T(k, {nq, kHq, kD}), tv = T(v, {nq, kHq, kD});
+        Tensor to = T(o, {nq, kHq, kD});
+        vt::DFlashBlockAttentionArgs ar;
+        ar.scale = 1.0f / std::sqrt(static_cast<float>(kD));
+        ar.cu_seqlens = cu.data();
+        ar.num_reqs = static_cast<int>(kDecode);
+        for (int i = 0; i < reps; ++i) vt::DFlashBlockAttention(q, to, tq, tk, tv, ar);
+      });
+
+  Add("DFlashGroupedConvKernel", "Qwen3-DFlash grouped conv prepare, 16 reqs x 16-token block",
+      "x[256,5120] f32, taps 4, groups 40", [](Queue& q, int reps) {
+        constexpr int64_t kBlk = 16, kTaps = 4, kGroup = 128;
+        const int64_t nq = kDecode * kBlk, groups = k27Hidden / kGroup;
+        auto x = F32(nq * k27Hidden, 111),
+             c = F32(nq * 2 * kTaps * groups, 112), b = F32(2 * kTaps * k27Hidden, 113);
+        std::vector<float> o(nq * k27Hidden);
+        Tensor tx = T(x, {nq, k27Hidden}), tc = T(c, {nq, 2, kTaps, groups}),
+               tb = T(b, {2, kTaps, k27Hidden}), to = T(o, {nq, k27Hidden});
+        vt::DFlashGroupedConvArgs ar;
+        ar.block_size = kBlk;
+        ar.taps = kTaps;
+        ar.num_groups = groups;
+        ar.group_size = kGroup;
+        ar.side = 0;
+        for (int i = 0; i < reps; ++i) vt::DFlashGroupedConv(q, to, tx, tc, tb, ar);
+      });
+
+  Add("CausalConv1dSpecUpdateKernel", "Qwen3.6-27B GDN speculative conv step, c16 x 4",
+      "x[64,10240] f32", [](Queue& q, int reps) {
+        constexpr int64_t kSpec = 4;
+        const int64_t nt = kDecode * kSpec;
+        auto x = F32(nt * kGdnConvDim, 114), w = F32(kGdnConvDim * kGdnK, 115),
+             b = F32(kGdnConvDim, 116);
+        std::vector<float> st(kDecode * kGdnConvDim * (kGdnK - 1 + kSpec), 0.1f),
+            o(nt * kGdnConvDim);
+        auto idx = Iota32(kDecode);
+        std::vector<int32_t> acc(kDecode, 1), cu(kDecode + 1);
+        for (size_t i = 0; i < cu.size(); ++i) cu[i] = static_cast<int32_t>(i) * kSpec;
+        Tensor tx = T(x, {nt, kGdnConvDim}), tw = T(w, {kGdnConvDim, kGdnK}),
+               tb = T(b, {kGdnConvDim});
+        Tensor ts = T(st, {kDecode, kGdnConvDim, kGdnK - 1 + kSpec}),
+               to = T(o, {nt, kGdnConvDim});
+        Tensor ti = TI(idx, {kDecode}), ta = TI(acc, {kDecode}), tc = TI(cu, {kDecode + 1});
+        for (int i = 0; i < reps; ++i)
+          vt::CausalConv1dSpecUpdate(q, to, tx, tw, &tb, ts, ti, ta, tc,
+                                     vt::CausalConv1dArgs{});
+      });
+
   Add("ScaledFp4QuantKernel", "Qwen3.6-27B NVFP4 activation quant, prefill",
       "x[1024,5120] f32 -> fp4 + e4m3 scales", [](Queue& q, int reps) {
         auto x = F32(kPrefill * k27Hidden, 107);

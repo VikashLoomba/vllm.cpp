@@ -179,15 +179,15 @@ unhoisted remainder of the ranked set are owed and named in `## Owed`.
 ### The headline
 
 **The dispatch is not a two-kernel defect and it is not a 62-kernel sweep. It is
-a ranked list of 24, and this row publishes it.** Of the 47 unhoisted kernels
-measured, **24 read `LoadF32` at or above the recalibrated bar and 23 read below
-it**, so half the population is now excluded by measurement rather than by
+a ranked list of 27, and this row publishes it.** Of the **49** unhoisted kernels
+measured, **27 read `LoadF32` at or above the recalibrated bar and 22 read below
+it**, so nearly half the population is now excluded by measurement rather than by
 argument, and the other half is ordered.
 
 **One kernel is hoisted here — `RmsNormKernel` — and it is 12.6x, byte-identical.**
-Not because it tops the ranking (it is 8th) but because it is the widest-reaching
+Not because it tops the ranking (it is 9th) but because it is the widest-reaching
 entry on it: every text model in the tree calls `vt::RmsNorm` twice per layer, and
-the `FusedChain` tier-0 walker dispatches `kRmsNorm` to it. The other 23 stay in
+the `FusedChain` tier-0 walker dispatches `kRmsNorm` to it. The other 26 stay in
 `## Owed`, ranked, because each needs its own byte-equality gate and eight
 mutations, and doing them in one change is the sweep the predecessor row forbade.
 
@@ -233,60 +233,71 @@ predecessor's profile, so a multithreaded ranking here would rank contention.
 
 ### W1 — the ranking
 
-47 candidate kernels plus the two already-hoisted ones, each run alone at the
-shape named beside it. `StoreF32` is printed too, because a kernel whose store
+49 candidate kernels plus the two already-hoisted ones — 51 probe cases — each run
+alone at the shape named beside it. `StoreF32` is printed too, because a kernel whose store
 side is heavy pays for the hoist twice.
 
 | # | kernel | LoadF32 self% | StoreF32 self% | probe shape | the model it comes from |
 |---:|---|---:|---:|---|---|
 | 1 | `BatchedMatmulKernel` | **70.46** | 0.71 | `a[32,1024,128] x b[32,128,128] f32` | LTX-2.5 per-head batched GEMM, 32 heads |
-| 2 | `CausalConv1dFwdKernel` | **55.81** | 2.38 | `x[1024,10240] f32, w[10240,4]` | Qwen3.6-27B GDN prefill conv, 1024 tokens |
-| 3 | `CastBf16Kernel` | **54.34** | 21.74 | `x[1024,5120] f32 -> bf16` | f32 -> bf16 activation cast, prefill |
-| 4 | `RopeFromCacheKernel` | **52.98** | 17.49 | `q[1024,24,256] k[1024,4,256] f32, cache[1024,64]` | Qwen3.6-27B RopeFromCache q/k, prefill |
-| 5 | `FusedNormRopeKernel` | **52.23** | 11.79 | `x[1024,576] f32, latent 512 \| pe 64` | DeepSeek-V3 MLA fused kv_a norm+rope, prefill |
-| 6 | `RmsNormGroupKernel` | **50.74** | 10.89 | `x[1024,5120] f32, group=128` | Qwen4-exp grouped RMSNorm, prefill |
-| 7 | `AttnGateSplitKernel` | **49.87** | 29.30 | `qgate[1024,12288] f32` | Qwen3.6-27B attn_output_gate q\|gate split, prefill |
-| 8 | `RmsNormKernel` | **49.06** | 12.05 | `x[1024,5120] f32, w[5120]` | Qwen3.6-27B input_layernorm, prefill |
-| 9 | `MulScalarKernel` | **47.09** | 23.43 | `x[1024,5120] f32` | Gemma embedding normalizer, prefill |
-| 10 | `AttnQkNormRopeGateKernel` | **47.04** | 15.00 | `qgate[1024,12288] kf[1024,1024] f32` | Qwen3.6-27B fused attention preamble, prefill |
-| 11 | `GdnConvSplitKernel` | **43.61** | 29.48 | `conv[1024,10240] f32` | Qwen3.6-27B GDN mixed-qkv split, prefill |
-| 12 | `CastF32Kernel` | **42.56** | 25.38 | `x[1024,5120] bf16 -> f32` | bf16 -> f32 GEMM-result cast, prefill |
-| 13 | `Mamba2StateUpdateKernel` | **42.30** | 13.58 | `state[16,128,64,128] f32` | NemotronH Mamba2 decode step, c16 |
-| 14 | `L2NormKernel` | **40.97** | 16.70 | `x[1024,16,128] f32` | Qwen3.6-27B GDN q/k l2norm, prefill |
-| 15 | `QkvSplitKernel` | **40.40** | 36.63 | `qkv[1024,8192] f32` | Qwen3.6-27B merged QKV split, prefill |
-| 16 | `GdnPostConvKernel` | **40.15** | 20.16 | `conv[1024,10240] f32` | Qwen3.6-27B fused GDN post-conv prep, prefill |
-| 17 | `GdnStateScatterKernel` | **39.58** | 28.42 | `working[16,...] -> cache[64,48,128,128] f32` | Qwen3.6-27B GDN state scatter, c16 |
-| 18 | `GdnStateGatherKernel` | **36.60** | 28.10 | `cache[64,48,128,128] f32 -> working[16,...]` | Qwen3.6-27B GDN state gather, c16 |
-| 19 | `SharedExpertGateKernel` | **35.93** | 21.57 | `sd[1024,2048] f32, gl[1024]` | Qwen3.6-35B shared-expert sigmoid gate, prefill |
-| 20 | `ConcatMlaNopeRopeKernel` | **35.48** | 34.69 | `nope[1024,128,128] rope[1024,1,64] f32` | DeepSeek-V3 MLA nope\|rope head concat, prefill |
-| 21 | `MoeRelu2Kernel` | **35.12** | 24.97 | `x[8192,512] f32` | NemotronH expert relu^2, prefill x top_k |
-| 22 | `RmsNormGatedKernel` | **34.85** | 6.92 | `x[16,48,128] f32` | Qwen3.6-27B GDN output gated norm, decode |
-| 23 | `MoeCombineKernel` | **33.47** | 2.54 | `expert_out[1024,8,2048] f32` | Qwen3.6-35B weighted expert combine, prefill |
-| 24 | `CausalConv1dUpdateKernel` | **33.01** | 4.22 | `x[16,10240] f32, state[16,10240,3]` | Qwen3.6-27B GDN decode conv step, c16 |
-| 25 | `CastF16Kernel` | **28.37** | 27.75 | `x[1024,5120] f32 -> f16` | EXL3 activation narrowing cast, prefill |
-| 26 | `SigmoidGateBf16Kernel` | **25.03** | 9.34 | `attn/gate[1024,6144] f32 -> bf16` | Qwen3.6-27B attention output gate, prefill |
-| 27 | `RmsNormGatedGroupKernel` | **24.75** | 7.50 | `x[1024,4096] f32, n_groups=8` | Mamba2 Mixer2RMSNormGated, prefill |
-| 28 | `RmsNormQuantFp8Kernel` | **24.45** | 0.00 | `x[1024,5120] f32 -> e4m3 + bf16` | Qwen3.6-27B fused RMSNorm -> fp8, prefill |
-| 29 | `RmsNormGatedQuantFp8Kernel` | **23.55** | 0.00 | `x/gate[16,48,128] f32 -> e4m3` | Qwen3.6-27B GDN gated norm -> fp8, decode |
-| 30 | `ScaledFp4QuantKernel` | **22.51** | 0.00 | `x[1024,5120] f32 -> fp4 + e4m3 scales` | Qwen3.6-27B NVFP4 activation quant, prefill |
-| 31 | `RopeRotateHead` | **21.32** | 5.02 | `q[1024,24,256] k[1024,4,256] f32, rot=64` | Qwen3.6-27B RopeNeox q/k in place, prefill |
-| 32 | `MoeRouterTopKKernel` | **20.41** | 0.00 | `logits[1024,256] f32` | Qwen3.6-35B router softmax top-8 of 256, prefill |
-| 33 | `SiluAndMulKernel` | **19.52** | 6.19 | `x[1024,34816] f32 -> out[1024,17408]` | Qwen3.6-27B dense MLP act, prefill |
-| 34 | `QuantFp8GroupKernel` | **17.78** | 0.00 | `x[1024,5120] f32, group 128` | DeepSeek block-fp8 per-128-group activation quant, prefill |
-| 35 | `MoeSiluMulKernel` | **17.63** | 8.75 | `gate/up[8192,512] f32` | Qwen3.6-35B expert act, prefill x top_k |
-| 36 | `QuantFp8StaticKernel` | **15.80** | 0.00 | `x[1024,5120] f32 -> e4m3` | Qwen3.6-27B static per-tensor fp8 activation quant, prefill |
-| 37 | `GdnGBetaKernel` | **11.50** | 6.18 | `araw/braw[1024,48] f32` | Qwen3.6-27B GDN decay/gate derivation, prefill |
-| 38 | `GeluAndMulKernel` | **11.36** | 3.03 | `x[1024,34816] f32 -> out[1024,17408]` | Gemma GeGLU MLP act, prefill |
-| 39 | `MoeRouterGroupedTopKKernel` | **10.62** | 0.00 | `logits[1024,256] f32, groups 8, topk_group 4` | DeepSeek grouped sigmoid router, prefill |
-| 40 | `SoftCapKernel` | **7.15** | 6.60 | `x[16,248320] f32` | Gemma-2 final logit soft-cap, decode |
-| 41 | `GdnDecodeKernel` | **3.19** | 2.11 | `state[16,48,128,128] f32` | Qwen3.6-27B GDN decode recurrence, c16 |
-| 42 | `KdaHeadTokenStep` | **3.18** | 0.39 | `T=64, state[1,48,128,128] f32` | Kimi KDA per-channel decay recurrence, c16 prefill |
-| 43 | `EmbeddingKernel` | **0.31** | 0.10 | `table[248320,5120] bf16, ids[1024]` | Qwen3.6-27B embed_tokens gather, prefill |
-| 44 | `RopeCosSinCacheKernel` | **0.00** | 6.48 | `cos_sin[1024,64] f32` | Qwen3.6-27B rotary cache build, prefill |
-| 45 | `MatmulOneChunk` | **0.00** | 0.72 | `a[1024,4096] x b[4096,4096]^T f32` | LTX-2.5 connector attn projection, 1024 rows |
-| 46 | `AttentionKernel` | **0.00** | 0.52 | `q/k/v[1024,32,128] f32, causal` | LTX-2.5 DiT self-attention, video stream |
-| 47 | `AttentionCrossKernel` | **0.00** | 0.45 | `q/k/v[1024,32,128] f32` | LTX-2.5 connector cross-attention, video stream |
-| 48 | `MulColVecF32Kernel` | **0.00** | 0.00 | `x[1024,10240] f32, col[10240]` | merged fp8 projection per-shard dequant, prefill |
+| 2 | `DFlashBlockAttentionKernel` | **57.08** | 1.09 | `q/k/v[256,32,128] f32` | Qwen3-DFlash in-block attention, 16 reqs x 16-token block |
+| 3 | `CausalConv1dFwdKernel` | **55.81** | 2.38 | `x[1024,10240] f32, w[10240,4]` | Qwen3.6-27B GDN prefill conv, 1024 tokens |
+| 4 | `CastBf16Kernel` | **54.34** | 21.74 | `x[1024,5120] f32 -> bf16` | f32 -> bf16 activation cast, prefill |
+| 5 | `RopeFromCacheKernel` | **52.98** | 17.49 | `q[1024,24,256] k[1024,4,256] f32, cache[1024,64]` | Qwen3.6-27B RopeFromCache q/k, prefill |
+| 6 | `FusedNormRopeKernel` | **52.23** | 11.79 | `x[1024,576] f32, latent 512 \| pe 64` | DeepSeek-V3 MLA fused kv_a norm+rope, prefill |
+| 7 | `RmsNormGroupKernel` | **50.74** | 10.89 | `x[1024,5120] f32, group=128` | Qwen4-exp grouped RMSNorm, prefill |
+| 8 | `AttnGateSplitKernel` | **49.87** | 29.30 | `qgate[1024,12288] f32` | Qwen3.6-27B attn_output_gate q\|gate split, prefill |
+| 9 | `RmsNormKernel` | **49.06** | 12.05 | `x[1024,5120] f32, w[5120]` | Qwen3.6-27B input_layernorm, prefill |
+| 10 | `MulScalarKernel` | **47.09** | 23.43 | `x[1024,5120] f32` | Gemma embedding normalizer, prefill |
+| 11 | `AttnQkNormRopeGateKernel` | **47.04** | 15.00 | `qgate[1024,12288] kf[1024,1024] f32` | Qwen3.6-27B fused attention preamble, prefill |
+| 12 | `GdnConvSplitKernel` | **43.61** | 29.48 | `conv[1024,10240] f32` | Qwen3.6-27B GDN mixed-qkv split, prefill |
+| 13 | `CastF32Kernel` | **42.56** | 25.38 | `x[1024,5120] bf16 -> f32` | bf16 -> f32 GEMM-result cast, prefill |
+| 14 | `Mamba2StateUpdateKernel` | **42.30** | 13.58 | `state[16,128,64,128] f32` | NemotronH Mamba2 decode step, c16 |
+| 15 | `L2NormKernel` | **40.97** | 16.70 | `x[1024,16,128] f32` | Qwen3.6-27B GDN q/k l2norm, prefill |
+| 16 | `QkvSplitKernel` | **40.40** | 36.63 | `qkv[1024,8192] f32` | Qwen3.6-27B merged QKV split, prefill |
+| 17 | `GdnPostConvKernel` | **40.15** | 20.16 | `conv[1024,10240] f32` | Qwen3.6-27B fused GDN post-conv prep, prefill |
+| 18 | `GdnStateScatterKernel` | **39.58** | 28.42 | `working[16,...] -> cache[64,48,128,128] f32` | Qwen3.6-27B GDN state scatter, c16 |
+| 19 | `DFlashGroupedConvKernel` | **37.66** | 3.25 | `x[256,5120] f32, taps 4, groups 40` | Qwen3-DFlash grouped conv prepare, 16 reqs x 16-token block |
+| 20 | `GdnStateGatherKernel` | **36.60** | 28.10 | `cache[64,48,128,128] f32 -> working[16,...]` | Qwen3.6-27B GDN state gather, c16 |
+| 21 | `SharedExpertGateKernel` | **35.93** | 21.57 | `sd[1024,2048] f32, gl[1024]` | Qwen3.6-35B shared-expert sigmoid gate, prefill |
+| 22 | `ConcatMlaNopeRopeKernel` | **35.48** | 34.69 | `nope[1024,128,128] rope[1024,1,64] f32` | DeepSeek-V3 MLA nope\|rope head concat, prefill |
+| 23 | `MoeRelu2Kernel` | **35.12** | 24.97 | `x[8192,512] f32` | NemotronH expert relu^2, prefill x top_k |
+| 24 | `RmsNormGatedKernel` | **34.85** | 6.92 | `x[16,48,128] f32` | Qwen3.6-27B GDN output gated norm, decode |
+| 25 | `CausalConv1dSpecUpdateKernel` | **33.64** | 3.62 | `x[64,10240] f32` | Qwen3.6-27B GDN speculative conv step, c16 x 4 |
+| 26 | `MoeCombineKernel` | **33.47** | 2.54 | `expert_out[1024,8,2048] f32` | Qwen3.6-35B weighted expert combine, prefill |
+| 27 | `CausalConv1dUpdateKernel` | **33.01** | 4.22 | `x[16,10240] f32, state[16,10240,3]` | Qwen3.6-27B GDN decode conv step, c16 |
+| 28 | `CastF16Kernel` | **28.37** | 27.75 | `x[1024,5120] f32 -> f16` | EXL3 activation narrowing cast, prefill |
+| 29 | `SigmoidGateBf16Kernel` | **25.03** | 9.34 | `attn/gate[1024,6144] f32 -> bf16` | Qwen3.6-27B attention output gate, prefill |
+| 30 | `RmsNormGatedGroupKernel` | **24.75** | 7.50 | `x[1024,4096] f32, n_groups=8` | Mamba2 Mixer2RMSNormGated, prefill |
+| 31 | `RmsNormQuantFp8Kernel` | **24.45** | 0.00 | `x[1024,5120] f32 -> e4m3 + bf16` | Qwen3.6-27B fused RMSNorm -> fp8, prefill |
+| 32 | `RmsNormGatedQuantFp8Kernel` | **23.55** | 0.00 | `x/gate[16,48,128] f32 -> e4m3` | Qwen3.6-27B GDN gated norm -> fp8, decode |
+| 33 | `ScaledFp4QuantKernel` | **22.51** | 0.00 | `x[1024,5120] f32 -> fp4 + e4m3 scales` | Qwen3.6-27B NVFP4 activation quant, prefill |
+| 34 | `RopeRotateHead` | **21.32** | 5.02 | `q[1024,24,256] k[1024,4,256] f32, rot=64` | Qwen3.6-27B RopeNeox q/k in place, prefill |
+| 35 | `MoeRouterTopKKernel` | **20.41** | 0.00 | `logits[1024,256] f32` | Qwen3.6-35B router softmax top-8 of 256, prefill |
+| 36 | `SiluAndMulKernel` | **19.52** | 6.19 | `x[1024,34816] f32 -> out[1024,17408]` | Qwen3.6-27B dense MLP act, prefill |
+| 37 | `QuantFp8GroupKernel` | **17.78** | 0.00 | `x[1024,5120] f32, group 128` | DeepSeek block-fp8 per-128-group activation quant, prefill |
+| 38 | `MoeSiluMulKernel` | **17.63** | 8.75 | `gate/up[8192,512] f32` | Qwen3.6-35B expert act, prefill x top_k |
+| 39 | `QuantFp8StaticKernel` | **15.80** | 0.00 | `x[1024,5120] f32 -> e4m3` | Qwen3.6-27B static per-tensor fp8 activation quant, prefill |
+| 40 | `GdnGBetaKernel` | **11.50** | 6.18 | `araw/braw[1024,48] f32` | Qwen3.6-27B GDN decay/gate derivation, prefill |
+| 41 | `GeluAndMulKernel` | **11.36** | 3.03 | `x[1024,34816] f32 -> out[1024,17408]` | Gemma GeGLU MLP act, prefill |
+| 42 | `MoeRouterGroupedTopKKernel` | **10.62** | 0.00 | `logits[1024,256] f32, groups 8, topk_group 4` | DeepSeek grouped sigmoid router, prefill |
+| 43 | `SoftCapKernel` | **7.15** | 6.60 | `x[16,248320] f32` | Gemma-2 final logit soft-cap, decode |
+| 44 | `GdnDecodeKernel` | **3.19** | 2.11 | `state[16,48,128,128] f32` | Qwen3.6-27B GDN decode recurrence, c16 |
+| 45 | `KdaHeadTokenStep` | **3.18** | 0.39 | `T=64, state[1,48,128,128] f32` | Kimi KDA per-channel decay recurrence, c16 prefill |
+| 46 | `EmbeddingKernel` | **0.31** | 0.10 | `table[248320,5120] bf16, ids[1024]` | Qwen3.6-27B embed_tokens gather, prefill |
+| 47 | `RopeCosSinCacheKernel` | **0.00** | 6.48 | `cos_sin[1024,64] f32` | Qwen3.6-27B rotary cache build, prefill |
+| 48 | `MatmulOneChunk` | **0.00** | 0.72 | `a[1024,4096] x b[4096,4096]^T f32` | LTX-2.5 connector attn projection, 1024 rows |
+| 49 | `AttentionKernel` | **0.00** | 0.52 | `q/k/v[1024,32,128] f32, causal` | LTX-2.5 DiT self-attention, video stream |
+| 50 | `AttentionCrossKernel` | **0.00** | 0.45 | `q/k/v[1024,32,128] f32` | LTX-2.5 connector cross-attention, video stream |
+| 51 | `MulColVecF32Kernel` | **0.00** | 0.00 | `x[1024,10240] f32, col[10240]` | merged fp8 projection per-shard dequant, prefill |
+
+**The population, counted exactly, because the predecessor's "62" and this row's
+inventory do not line up on the nose.** The inventory finds 67 enclosing
+functions; five are the shared helpers rather than kernels (`LoadF32`,
+`StoreF32`, `AttnResolveOrRefuse`, and `FusedChainKernel`'s `FusedLoad` /
+`FusedStore`) and two are the pair already hoisted. 49 of the remainder are
+measured below and 13 are not, and both lists are enumerated rather than left to
+subtraction.
 
 **Reading it.** `AttentionKernel` and `AttentionCrossKernel` at 0.00% are the
 predecessor's hoist showing up as the absence of the symbol; they are the
@@ -297,30 +308,31 @@ specialized f32 paths that never enter the per-element helper. `GdnDecodeKernel`
 set: their recurrences are dominated by the state outer-product, and a hoist
 there would buy the 3% the profile names.
 
-**24 kernels are at or above 32.5%.** In rank order: `BatchedMatmulKernel`,
-`CausalConv1dFwdKernel`, `CastBf16Kernel`, `RopeFromCacheKernel`,
-`FusedNormRopeKernel`, `RmsNormGroupKernel`, `AttnGateSplitKernel`,
-`RmsNormKernel`, `MulScalarKernel`, `AttnQkNormRopeGateKernel`,
-`GdnConvSplitKernel`, `CastF32Kernel`, `Mamba2StateUpdateKernel`, `L2NormKernel`,
-`QkvSplitKernel`, `GdnPostConvKernel`, `GdnStateScatterKernel`,
-`GdnStateGatherKernel`, `SharedExpertGateKernel`, `ConcatMlaNopeRopeKernel`,
-`MoeRelu2Kernel`, `RmsNormGatedKernel`, `MoeCombineKernel`,
+**27 kernels are at or above 32.5%.** In rank order: `BatchedMatmulKernel`,
+`DFlashBlockAttentionKernel`, `CausalConv1dFwdKernel`, `CastBf16Kernel`,
+`RopeFromCacheKernel`, `FusedNormRopeKernel`, `RmsNormGroupKernel`,
+`AttnGateSplitKernel`, `RmsNormKernel`, `MulScalarKernel`,
+`AttnQkNormRopeGateKernel`, `GdnConvSplitKernel`, `CastF32Kernel`,
+`Mamba2StateUpdateKernel`, `L2NormKernel`, `QkvSplitKernel`, `GdnPostConvKernel`,
+`GdnStateScatterKernel`, `DFlashGroupedConvKernel`, `GdnStateGatherKernel`,
+`SharedExpertGateKernel`, `ConcatMlaNopeRopeKernel`, `MoeRelu2Kernel`,
+`RmsNormGatedKernel`, `CausalConv1dSpecUpdateKernel`, `MoeCombineKernel`,
 `CausalConv1dUpdateKernel`.
 
-**23 are below it, and that is the half of the result that closes work rather
+**22 are below it, and that is the half of the result that closes work rather
 than opening it.** `CastF16Kernel` (28.37%) down to `EmbeddingKernel` (0.31%) are
 bound by something else, and the predecessor's own rule says a hoist there buys
 the fraction the profile names. They need no row.
 
-**15 of the 62 are NOT measured here and are named rather than left implied**:
+**13 of the enclosing functions the inventory names are NOT measured here, and are
+named rather than left implied**:
 `Mamba2ChunkScanKernel`, `GdnPackedDecodeKernel`, `GdnSpecDecodeKernel`,
-`CausalConv1dSpecUpdateKernel`, `KdaChunkPrefillKernel`,
-`DFlashBlockAttentionKernel`, `DFlashPagedBlockAttentionKernel`,
-`DFlashGroupedConvKernel`, `Dflash2SelectorEdgesKernel`,
-`MatmulFp8BlockScaledKernel`, `MatmulFp8CutlassKernel`, `MatmulNvfp4Fp4Kernel`,
-`MatmulOneChunkRef`, `GdnHeadTokenStep` (reached only inside `GdnDecodeKernel`'s
-3.19%), and the `FusedLoad`/`FusedStore` pair inside `FusedChainKernel`. They are
-in `## Owed` with the probe that will take them.
+`KdaChunkPrefillKernel`, `DFlashPagedBlockAttentionKernel`,
+`Dflash2SelectorEdgesKernel`, `MatmulFp8BlockScaledKernel`,
+`MatmulFp8CutlassKernel`, `MatmulNvfp4Fp4Kernel`, `MatmulOneChunkRef`,
+`GdnHeadTokenStep` (reached only inside `GdnDecodeKernel`'s 3.19%), and the
+`FusedLoad`/`FusedStore` pair inside `FusedChainKernel`. Each needs one `Add(...)`
+case in the committed probe and nothing else; they are in `## Owed`.
 
 ### W2 — the hoist, and why this kernel
 
@@ -518,37 +530,38 @@ measurement says take it, with `GdnDecodeKernel` excluded or accepted explicitly
 
 ### What this row did NOT do, stated rather than implied
 
-- It hoisted **one** of the 24 kernels above the bar. The other 23 are in
+- It hoisted **one** of the 27 kernels above the bar. The other 26 are in
   `## Owed` in rank order with their measured percentages.
-- It did not measure 15 of the 62. They are named above and in `## Owed`.
+- It did not measure 13 of the enclosing functions in the inventory. They are
+  named above and in `## Owed`.
 - It produced no aarch64 number at all.
 - It did not land `always_inline`.
 
 ## Owed
 
-- **THE 23 REMAINING KERNELS ABOVE THE BAR**, in rank order with their measured
+- **THE 26 REMAINING KERNELS ABOVE THE BAR**, in rank order with their measured
   `LoadF32` self percentage, so the next row picks by number rather than by
-  position in the file: `BatchedMatmulKernel` 70.46, `CausalConv1dFwdKernel`
-  55.81, `CastBf16Kernel` 54.34, `RopeFromCacheKernel` 52.98,
+  position in the file: `BatchedMatmulKernel` 70.46,
+  `DFlashBlockAttentionKernel` 57.08, `CausalConv1dFwdKernel` 55.81, `CastBf16Kernel` 54.34, `RopeFromCacheKernel` 52.98,
   `FusedNormRopeKernel` 52.23, `RmsNormGroupKernel` 50.74, `AttnGateSplitKernel`
   49.87, `MulScalarKernel` 47.09, `AttnQkNormRopeGateKernel` 47.04,
   `GdnConvSplitKernel` 43.61, `CastF32Kernel` 42.56, `Mamba2StateUpdateKernel`
   42.30, `L2NormKernel` 40.97, `QkvSplitKernel` 40.40, `GdnPostConvKernel` 40.15,
-  `GdnStateScatterKernel` 39.58, `GdnStateGatherKernel` 36.60,
-  `SharedExpertGateKernel` 35.93, `ConcatMlaNopeRopeKernel` 35.48,
-  `MoeRelu2Kernel` 35.12, `RmsNormGatedKernel` 34.85, `MoeCombineKernel` 33.47,
+  `GdnStateScatterKernel` 39.58, `DFlashGroupedConvKernel` 37.66,
+  `GdnStateGatherKernel` 36.60, `SharedExpertGateKernel` 35.93,
+  `ConcatMlaNopeRopeKernel` 35.48, `MoeRelu2Kernel` 35.12, `RmsNormGatedKernel`
+  34.85, `CausalConv1dSpecUpdateKernel` 33.64, `MoeCombineKernel` 33.47,
   `CausalConv1dUpdateKernel` 33.01. `RmsNormGroupKernel` is the cheapest of them
   to take next: it is deliberately shaped as `RmsNormKernel` with the reduction
   extent narrowed, so the same helpers and the same gate structure apply.
   Owner: unowned; #2416 stays open against this item.
-- **THE 15 UNMEASURED KERNELS.** `Mamba2ChunkScanKernel`,
-  `GdnPackedDecodeKernel`, `GdnSpecDecodeKernel`, `CausalConv1dSpecUpdateKernel`,
-  `KdaChunkPrefillKernel`, `DFlashBlockAttentionKernel`,
-  `DFlashPagedBlockAttentionKernel`, `DFlashGroupedConvKernel`,
-  `Dflash2SelectorEdgesKernel`, `MatmulFp8BlockScaledKernel`,
-  `MatmulFp8CutlassKernel`, `MatmulNvfp4Fp4Kernel`, `MatmulOneChunkRef`,
-  `GdnHeadTokenStep`, and `FusedChainKernel`'s `FusedLoad`/`FusedStore`. Each
-  needs one `Add(...)` case in the committed probe; nothing else. Owner: unowned.
+- **THE 13 UNMEASURED ENCLOSING FUNCTIONS.** `Mamba2ChunkScanKernel`,
+  `GdnPackedDecodeKernel`, `GdnSpecDecodeKernel`, `KdaChunkPrefillKernel`,
+  `DFlashPagedBlockAttentionKernel`, `Dflash2SelectorEdgesKernel`,
+  `MatmulFp8BlockScaledKernel`, `MatmulFp8CutlassKernel`, `MatmulNvfp4Fp4Kernel`,
+  `MatmulOneChunkRef`, `GdnHeadTokenStep`, and `FusedChainKernel`'s
+  `FusedLoad`/`FusedStore`. Each needs one `Add(...)` case in the committed probe
+  and nothing else. Owner: unowned.
 - **`__attribute__((always_inline))` ON `LoadF32`: MEASURED, AND THE ANSWER IS
   TAKE IT.** 43 wins of 48 up to 4.58x, 4 neutral, one regression
   (`GdnDecodeKernel`, 0.849x, i-cache misses per kilo-instruction +53%), at

@@ -245,6 +245,107 @@ makes the first number the common one:
 | 0 | 30 | ~0.2 s, no configure |
 | 1-4 | 20 | 3-22 s |
 | 18-37 | 6 | ~26 s |
+| 358-789 | 4 | 11 min measured at `-j6` under load average 62-87 |
+
+Red-before and green-after, on real trees that pass every existing gate:
+
+| Range | Head | Result |
+|---|---|---|
+| `76fefdca7..77cedc9a5` | `5263ac31f^` | **RED**, 1 of 40 units: `ltx2_connector_gemm_probe.cpp:41:1: error: multi-line comment [-Werror=comment]`. 25.1 s |
+| `76fefdca7..5263ac31f` | the fix | GREEN, 40 of 40 units, 25.5 s |
+| `a7e08aae1..6d803da46` | `6d803da46` | **RED**, 2 of 58 units, 101.8 s |
+| the same range, both upstream repairs applied to the worktree | | GREEN, 58 of 58 units, 108.9 s |
+| `ee5c86031..c27246d37` | `08fa2f5aa^` | **RED**, 1 of 789 units, 663.9 s at `-j6` under load average 62-87 |
+
+**The `6d803da46` row is the one that decides the design.** That commit is where
+both of the GLM defects entered, and the gate names both of them at once:
+
+```
+FAILED to compile src/vllm/model_executor/models/glm_moe_dsa_forward.cpp
+  glm_moe_dsa_forward.cpp:456:73: error: cannot convert
+    'vllm::mla::MlaSharedSelection*' to 'vt::Tensor*'
+FAILED to compile tests/vllm/models/test_glm_moe_dsa_schedule.cpp
+  test_glm_moe_dsa_schedule.cpp:304:86: error: cannot convert
+    'vllm::mla::MlaSharedSelection*' to 'vt::Tensor*'
+```
+
+The first is what `11f34effb` fixed hours later; the second is `08fa2f5aa`, which
+`11f34effb`'s own message says it missed. **Neither file has to be in the diff.**
+`git diff --name-only 6d803da46^ 6d803da46` lists 18 paths and does not name
+`test_glm_moe_dsa_schedule.cpp`; the unit enters the affected set only through
+`include/vllm/model_executor/models/mla_attention.h`, by the reverse-include
+closure. A changed-`.cpp` scope is green on that tree.
+
+The last row is the same defect found from a whole-campaign range -- 227 changed
+paths, 789 units -- and it is the worst-case cost figure: 11 minutes at `-j6` on
+a box whose load average was between 62 and 87 throughout. That run also prints,
+by name, the seven units it did NOT check because no target in this
+configuration compiles them: five `.cu` files and two Tenstorrent units. Limit 2
+below is therefore visible in the output of every run, not only in this document.
+
+Mutations, each applied to a scratch copy and restored under a sha256 check:
+delete the reverse-include closure and case 2 must fail; turn the exit-2 arm
+into exit 0 and cases 4 and 5 must fail; drop `-Werror` from the reconstructed
+command and case 1 must fail; fold the uncompiled sources into the compiled
+total and the un-run case must fail; drop the forced inclusion and case 8 must
+fail; delete preflight's call site and case 7 must fail.
+
+## Risks
+
+- **The checker is itself a TU consumer.** If `compile_commands.json` goes stale
+  against a moved source tree, the checker compiles the wrong file. Mitigated by
+  configuring fresh into a scratch directory on every run; 1.7 s buys that.
+- **Parallelism on a shared box.** `-fsyntax-only` allocates far less than a
+  codegen-and-link job, and jobs default to half the CPU count capped at 8.
+  Parallel agent builds have OOM-killed this box before.
+- **A wide header change costs minutes, on EVERY preflight run.** `3bfd1a738`
+  touched a core `vt` header and reaches 783 TUs; a whole-campaign range reaches
+  789 and took 4.1 min measured. That is the correct answer for that change and
+  it is still cheaper than the build it replaces, but preflight runs more than
+  once per branch and pays it again each time. No cap is imposed, because a cap
+  below the real fanout is a mute switch. The bounded fix is a result cache
+  keyed on each unit's dependency-set hash and its recorded command, which would
+  reduce a repeat run to the dependency scan; it is named under `## Owed` and is
+  not built here.
+
+## Gates
+
+- `python3 tests/scripts/test_check_tree_compiles.py`
+- `python3 scripts/check-tree-compiles.py --base origin/main`
+- `scripts/agent-preflight.sh`
+
+## Evidence
+
+Measured on this box, 20 cores, with concurrent agent builds running throughout:
+load average ~28 for the microbenchmarks and ~62 for the two historical runs.
+Every figure is therefore pessimistic, and the two that matter most were taken
+under the worse of the two.
+
+| Quantity | Value |
+|---|---|
+| `cmake` configure, Ninja, Release | 1.67 s, 14 MB |
+| TUs in `compile_commands.json` | 1218 |
+| `c++ -MM -MG` per TU | 0.02-0.10 s |
+| whole-tree dependency scan at `-j8` | 15.9 s |
+| `c++ -fsyntax-only` per TU | 0.27-3.26 s, mean 1.76 s over 10 sampled TUs |
+| full `cmake --build`, warm | ~12 min, 9.4 GiB |
+
+**The two costs the row is judged on**, both measured end to end with the gate
+as it ships:
+
+| Change shape | Command | Cost |
+|---|---|---|
+| records-only (this branch: 8 paths, no C++) | `check-tree-compiles.py --base origin/main` | **0.20 s**, no configure, no compiler |
+| a code change (a row's worth of `.cpp` and `.h`: 40 TUs) | `--base 76fefdca7 --head 5263ac31f` | **25.5 s** (1.4 s configure + 12.7 s scan + 11.3 s compile) |
+
+Affected-TU fanout over the 60 commits ending at `9fa3be388`, which is what
+makes the first number the common one:
+
+| TUs affected | Commits | Gate cost |
+|---:|---:|---|
+| 0 | 30 | ~0.2 s, no configure |
+| 1-4 | 20 | 3-22 s |
+| 18-37 | 6 | ~26 s |
 | 358-789 | 4 | minutes; see the row below |
 
 Red-before and green-after, on two real trees that pass every existing gate:
@@ -332,9 +433,9 @@ Return `NEEDS_DECISION` rather than widening what preflight demands of a
 
 Landed: `scripts/check-tree-compiles.py`, its 15-case suite, and its wiring into
 `scripts/agent-preflight.sh` and the CI script lane. The gate reddens on
-`5263ac31f^` and on `ee5c86031..08fa2f5aa^`, the two trees that pass every
-existing checker, and greens on both fixes. A records-only change costs 0.20 s
-and a row-sized code change 25.5 s.
+`5263ac31f^` and on `6d803da46`, where both GLM defects entered, and greens on
+their fixes. A records-only change costs 0.20 s and a row-sized code change
+25.5 s.
 
 Owed and unclaimed: the repeat-run cache, the base-vs-head `compile_commands`
 comparison for a flag-only build edit, and the non-default configurations, all

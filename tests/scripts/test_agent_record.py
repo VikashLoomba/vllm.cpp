@@ -307,19 +307,23 @@ class AgentRecordMutationTests(unittest.TestCase):
         errors: list[str] = []
         rows, _ = agent_record.check_matrices(errors)
         self.assertEqual([error for error in errors if "engine rows" in error], [])
-        for item_id in (
-            "ENG-WEIGHT-RESIDENCY",
-            "ENG-STRUCTURED-OUTPUT",
-            "ENG-ATTENTION-WINDOW",
-            "ENG-GATE-ENV-DOC",
-        ):
+        # INVENTORIED, not SPIKE: a SPIKE row obliges a `CLAIM-*` owner, and
+        # inventing one would record work nobody is doing. `ENG-GATE-ENV-DOC`
+        # left that state when #2389 landed the reverse direction of the gate,
+        # so the ratchet's evidence for it is now GATING; the row is still one
+        # of the four the bump paid for, which is what this case measures.
+        expected_state = {
+            "ENG-WEIGHT-RESIDENCY": "INVENTORIED",
+            "ENG-STRUCTURED-OUTPUT": "INVENTORIED",
+            "ENG-ATTENTION-WINDOW": "INVENTORIED",
+            "ENG-GATE-ENV-DOC": "GATING",
+        }
+        for item_id, state in expected_state.items():
             with self.subTest(item_id=item_id):
                 found = [row for row in rows if row.item_id == item_id]
                 self.assertEqual(len(found), 1)
                 self.assertEqual(found[0].path.name, "engine-matrix.md")
-                # INVENTORIED, not SPIKE: a SPIKE row obliges a `CLAIM-*` owner,
-                # and inventing one would record work nobody is doing.
-                self.assertEqual(found[0].state, "INVENTORIED")
+                self.assertEqual(found[0].state, state)
 
     def test_serve_recipe_args_row_is_inside_the_engine_ratchet(self) -> None:
         """The #606 row and its 152 -> 153 ratchet bump are one semantic change.

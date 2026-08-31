@@ -320,6 +320,12 @@ Read-only observability; none change output.
 Discrete-ROCm (gfx1201) bring-up knobs from PR #140. Off by default; no effect
 on CUDA/CPU builds beyond the documented behavior.
 
+`VT_GEMMA4_MLP_MOE_PARALLEL` used to be listed here with a default and an
+effect, and it was never wired: it existed only in the deferred layer-loop path
+that PR #140 did not ship, so nothing in the tree has ever read the name.
+Setting it does nothing, and the row is gone rather than caveated
+([#2389](https://github.com/mudler/vllm.cpp/issues/2389)).
+
 | Variable | Default | What it does |
 |---|---|---|
 | `VT_GEMMA4_EXPERT_VRAM_MB` | off (unset/`0`) | `N>0` enables device expert LRU with N MiB fill budget; unset/`0` = device expert LRU **off** (resident path uses `VT_GEMMA4_RESIDENT_*`). Evict only with `VT_GEMMA4_EXPERT_EVICT=1` |
@@ -335,7 +341,6 @@ on CUDA/CPU builds beyond the documented behavior.
 | `VT_GEMMA4_GPU0_HEADROOM_GB` | `12` | GiB kept free on GPU0 when packing resident experts (decode vs long-prefill trade). Lab dual R9700 + 49k KV: `8` survives 16k+ prefill; `6` OOMs ~11k |
 | `VT_GEMMA4_PREFILL_BATCH_MOE` | auto / `1` in lab recipe | `=1` group-by-expert prefill GEMM for `T>=64`; `=0` serial M=1 (slow). Unset = auto |
 | `VT_GEMMA4_DECODE_INDEXED_MAX_T` | `63` | Widen device-indexed FP8 MoE from T=1 to `T<=N` (`N` clamped `[1,63]`). Unset = 63. `=1` restores the old T=1-only gate. T≥64 still uses prefill-batch |
-| `VT_GEMMA4_MLP_MOE_PARALLEL` | off | `=1` run Gemma4 MLP and MoE on two HIP streams (lab; wall ~flat on R9700). Not wired in this PR tip (decode-graph-free split) |
 | `VT_ATTN_PREFILL_FLASH` | off | `=1` SGLang-style BM×BN GQA flash prefill (lab A/B) |
 | `VT_GEMMA4_PREFILL_GEMM_M` | `2048` | Tokens per expert in prefill-batch GEMM chunks (`16..8192`; out-of-range values are ignored and the default is used). Larger M → fewer launches; lab `512` ~+37% prefill vs `64`, and `512`→`2048` ~+80 eng @11k vs the WMMA baseline (2026-08-10), which is why the default is `2048`. Lab KEEP on dual R9700 uses the default |
 | `VT_GEMMA4_HOST_EXPERT_MB` | `512` | Host-side expert staging budget (MiB) for non-resident paths |
@@ -358,10 +363,26 @@ grep its name under `src/` for the read site and the ledger for the measurement.
 
 ## Keeping this reference honest
 
-`scripts/check-env-doc.py` scans every `VT_*` / `VLLM_*` environment name read
-from `src/` and `include/` and fails if any name is neither documented on this
-page nor listed on the kernel-internal allowlist
+`scripts/check-env-doc.py` runs in both directions, and a knob has to satisfy
+both.
+
+**Read but not documented.** It scans every `VT_*` / `VLLM_*` environment name
+read from `src/` and `include/` and fails if any name is neither documented on
+this page nor listed on the kernel-internal allowlist
 (`scripts/env-doc-allowlist.txt`). A newly-introduced production env var therefore
 cannot land silently: the author must either document it here or classify it
-kernel-internal on the allowlist. The check runs in CI (the `agent-record` job)
-and has a unit/mutation test at `tests/scripts/test_check_env_doc.py`.
+kernel-internal on the allowlist.
+
+**Documented but read by nothing.** Every variable in a table on this page must
+be read by at least one file CMake compiles (`src/`, `include/`, `examples/`),
+and a mention in a comment does not count, so deleting the last reader of a knob
+fails the gate instead of leaving its row here promising behaviour the tree does
+not implement ([#2389](https://github.com/mudler/vllm.cpp/issues/2389)). That is
+the direction the page was missing when `VT_QWEN35_STAGE_MIN_FREE_FRAC` and
+`VT_GEMMA4_MLP_MOE_PARALLEL` outlived their implementations. A knob that is
+legitimately unread carries a stated reason in the checker's `UNREAD_EXCEPTIONS`,
+which is itself gated: an entry with no reason, or one whose variable has since
+left the tables or gained a reader, fails the check.
+
+The check runs in CI (the `agent-record` job) and has a unit/mutation test at
+`tests/scripts/test_check_env_doc.py`.

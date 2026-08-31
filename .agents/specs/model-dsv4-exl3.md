@@ -934,6 +934,21 @@ keep-quant arm checks the shape too, so what that produces is an ANONYMOUS
 buys a DIAGNOSTIC over that, which is still the `.agents/verification.md` concern,
 and it is not the difference between wrong tokens and a refusal.
 
+**AND THE OPTION IS ALREADY A FILED DEFECT, not a novel trade.** The forward's own
+refusal message says dense MLA "is NOT a substitute for it at any sequence
+length", citing [#1964](https://github.com/mudler/vllm.cpp/issues/1964), and
+`dsv4-dsa-loader-accept-forward-refuse.md` records what that issue tracks: the
+GGUF arm's `dsa_dense` routing every layer to dense MLA. So proposing a dense-MLA
+policy for the EXL3 arm is proposing to reproduce an open defect on a second arm.
+
+The earlier note here that dense MLA is "exact below 512 tokens" is true only of
+the INDEXER half, where a top-k over fewer keys than `index_topk` selects
+everything. It is NOT true of the COMPRESSOR, which is a different function at any
+length: a 128-wide boundary-emitted pool over a separate `compressor.wkv`
+projection is not a dense attention over the raw prefix, and no sequence length
+makes it one. With 41 of 46 layers carrying a compressor, that is the governing
+half.
+
 **MEASURED 2026-08-31, and it settles what the shared policy may and may not do.**
 The artifact's own `config.json` gives `compress_ratios` over 46 layers of which
 **41 carry a compressor** (`ratio > 1`), and its weight map carries **248

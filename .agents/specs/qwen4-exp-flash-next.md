@@ -3898,6 +3898,86 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **W5r NAMES A SITE FOR THE DEGENERATE OUTPUT BELOW, AND IT IS A TRACED
+  CANDIDATE RATHER THAN A PROVEN CAUSE. ISSUE OWED.** The entry below says
+  "W5q identifies no site and no line". W5r identifies one, by reading the
+  chain rather than by guessing, and the whole chain is on the box W5q ran on:
+
+  1. `LoadMatmul` routes `hc_*_down` `[320, 10240]` and `hc_*_up` `[10240, 320]`
+     to `kKeepQuant`, which calls `OwnGgufQuantBlocks(..., pol.quant_repack)`
+     (`qwen4_exp_weights.cpp:265-266`, `:136-137`).
+  2. `pol.quant_repack` is `keep_quant && !cpu_ref && vt::cpu::QuantRepackActive()`
+     (`gguf_keep_quant.cpp:347`). `VT_CPU_REF` is off by default and the artifact
+     is kept quantized, so on an i8mm host this is TRUE. `thor` is aarch64 i8mm.
+  3. `QuantRepackEligible` accepts both shapes: Q8_0, `n % 4 == 0` and
+     `k % 32 == 0` hold for `320 x 10240` and for `10240 x 320`
+     (`cpu_quant_repack.cpp:43-51`). The buffers are rewritten to
+     `block_q8_0x4` and `o.repacked = true` (`qwen3_5_gguf_weights.cpp:133`).
+  4. The forward takes them through `dense_attn::ResidentWeight`
+     (`qwen4_exp_forward.cpp:421-422, :479-480, :538-539`), which **dropped the
+     marker** — the defect W5r fixes. `kMatmulBTQuant` then reads
+     `block_q8_0x4` bytes as flat `q8_0`.
+
+  That is a wrong mixer on all 48 layers, both sides, plus the terminal mixer,
+  with no crash and no refusal — the failure mode that produces a logit row with
+  no maximum. **WHAT IS NOT CLAIMED: that this IS the cause.** W5r ran CPU-only
+  on x86, where `QuantRepackActive()` is false and the whole chain is inert, so
+  it reproduced nothing and fixed nothing observable. Step 2 is the only link
+  read off policy rather than measured on that run. The entry below is right
+  that three causes sample id 0 and that guessing between them is the error to
+  avoid; this is one candidate with a traced mechanism, not a verdict.
+
+  **THE DISCRIMINATING MEASUREMENT IS CHEAP AND IT IS OWED.** Re-run W5q's exact
+  request on a `thor` lease with `VT_CPU_QUANT_REPACK=0`, which forces
+  `QuantRepackActive()` false and takes the whole chain out. If the output stops
+  being constant, this was it. If it does not, this fix is correct hardening and
+  the blocker is elsewhere — and either way the answer costs one request. Pair
+  it with W5q's `logprobs` request so the NaN / zero / constant question is
+  settled in the same lease.
+
+- **W5r's FIX IS GATED BY CONSTRUCTION AND HAS NEVER RUN ON A HOST THAT SETS THE
+  MARKER. ISSUE OWED.** `dense_attn::ResidentWeight` now carries `repacked` and
+  `elem_kn_repacked` from the `OwnedTensor` to the `vt::Tensor` the kernel sees,
+  as `qwen3_5.cpp`'s private copy of the same helper always has (:1055, :1060).
+  The gate sets the flag BY HAND on the same `OwnedTensor` type the loader
+  produces and asserts the helper propagates what it is given. It cannot do
+  better on this host: `vt::cpu::QuantRepackActive()` returns false off aarch64
+  (`cpu_quant_repack_arm.cpp:275`) and `elem_kn_repack` defaults OFF
+  (`gguf_keep_quant.cpp:359`), so on x86 both markers are always false and no
+  end-to-end path can set one. What is therefore NOT claimed is that a repacked
+  `hc_*_down` produces correct tokens; that needs the `thor` lease above.
+
+  The same fact bounds the RISK in the other direction, which is why the change
+  is safe to land unmeasured: 25 models inherit this helper, and on every x86
+  host both markers stay false, so the two new lines are inert and no golden can
+  move. Behaviour changes only where the loader actually sets a marker, which is
+  exactly where the old behaviour was silently wrong.
+
+- **`q8_0_aligned` IS A THIRD MARKER AND THE SHARED HELPER STILL DROPS IT.
+  ISSUE OWED.** `OwnedTensor::View()` carries `repacked` AND `q8_0_aligned`
+  (`qwen3_5_weights.cpp:497-499`); W5r taught `ResidentWeight` the first and the
+  `[K,N]` one, and deliberately did not touch the third. That marker is the CUDA
+  coalesced-Q8_0 layout, set at `qwen3_5_gguf_weights.cpp:120`, and it is read on
+  the DEVICE arm — which W5r could neither run nor gate, being CPU-only with no
+  lease. Propagating it blind would change kernel selection for 25 models against
+  no gate at all. It is recorded as a gap rather than guessed at: the audit that
+  found two dropped markers found three, and the third is still dropped.
+
+  Note also what W5r did NOT port from the private copy. `qwen3_5.cpp` also
+  refuses a `repacked` weight (:1105) and an `expert_streamed` tower (:1085) at
+  device staging; only the `elem_kn_repacked` guard came across, because it is
+  the one W5r could reach with a test. The other two are tripwires for lanes the
+  shared helper's 25 callers do not all have, and adding an ungated refusal to a
+  shared path is how a correct guard reds normal work. Same owner, same lease.
+
+- **W5r's ISSUE IS OWED.** The `gh` CLI token on this host is invalid
+  (`gh auth status`: "The token in ~/.config/gh/hosts.yml is invalid"), so
+  `gh issue create` cannot run, while `git push` over SSH does work — the
+  precise split the W5q record already corrected. The work rides #2031, the
+  row's own issue, and this entry names the debt until an issue exists.
+  `.agents/issue-index.md` is retired to `.agents/completed/`, so no index row
+  is owed.
+
 - **THE RELEASED CHECKPOINT NOW SERVES AND ITS OUTPUT IS DEGENERATE. THIS IS
   THE ROW'S BLOCKER AND ITS CAUSE IS NOT IDENTIFIED. ISSUE OWED.** W5q drove
   `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S through `examples/server` on the

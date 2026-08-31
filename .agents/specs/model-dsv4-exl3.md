@@ -153,6 +153,16 @@ assignment, because repeating the assignment gates nothing. Inverting that
 assertion reds `test_loaded_engine_dense` (3 assertions), which is what proves a
 real engine load reaches it.
 
+**The floor is a per-architecture CONSTANT, not a function of the config, and
+that is a real limit worth naming.** `kv_block_size_floor` lives on
+`ModelFactory`, so DeepSeek-V4 declares one number for every DeepSeek-V4 config.
+256 is right for every `compress_ratio` this architecture uses and is the number
+upstream spells, but a future config carrying `compress_ratio > 256` would need a
+larger floor and would not get one. It would not be silent: `MakeDeepseekV4KVCache`
+still refuses that geometry by name, which is the same loud failure as before this
+change. Deriving the floor from the config needs the factory field to become a
+callback, and no config in reach justifies that yet.
+
 **Still owed: the load itself has not been re-measured on the default
 configuration.** The fix removes the refusal that stopped it; that the 97.68 GiB
 artifact now reaches a forward is a claim this row cannot make until the probe

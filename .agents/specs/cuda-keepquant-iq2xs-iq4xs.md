@@ -232,6 +232,35 @@ and the oracle's sequential order differ by ONE ULP on both encodings, so
 asserting bit equality against the oracle's total would have been red on the
 device for a reason that is not a defect.
 
+### A bundle built from one ref has no HEAD, and `git clone` of it checks out
+### nothing -- this cost attempt 1
+
+Attempt 1 reached `dgx:gpu0` at 2026-08-31T00:12:03Z as `rc-worker-4b8lj` and
+died 14 seconds later, after the CUDA toolkit had already installed:
+
+```text
+warning: remote HEAD refers to nonexistent ref, unable to checkout
+FATAL: clone produced no CMakeLists.txt
+```
+
+`git bundle create <file> <one-branch>` writes that branch and no `HEAD`, so
+`git clone <bundle>` succeeds, warns once, and leaves an EMPTY working tree.
+Everything before it had passed -- the mount guard read the bundle's sha256 off
+the share, `nvcc` reported `release 13.0, V13.0.88`, and `nvidia-smi` reported
+`NVIDIA GB10, GPU-cb5c11ff-...`, driver 580.173.02, 20 cores -- so the failure
+was purely staging. The fix is `git clone --branch <branch> <bundle>`, plus a
+`rev-parse --verify` of BOTH pinned SHAs before any build is spent on either.
+
+**The script's own strictness is what made this cheap rather than confusing.**
+The `test -f CMakeLists.txt` guard fired immediately and named the step, instead
+of letting `cmake -S` fail later with a message about a missing project. The
+fix was verified by cloning the same bundle locally, checking out both SHAs, and
+counting `kIQ2_XS|kIQ4_XS` in `cuda_quant_dot.cu`: **0 at the RED commit and 19
+at the GREEN one**, which is the same precondition the job greps on the box.
+
+Attempt 1's log is kept at `/workspace/cudaiq2260/out-attempt1-clone-bug/`
+rather than deleted.
+
 ### The instrument's own precondition, checked before it was trusted
 
 The device oracle-dot case does not feed the oracle's Q8_K activation blocks to

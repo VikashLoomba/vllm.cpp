@@ -137,6 +137,30 @@ W-3. **The three blocks**, composed from the existing pieces. The attention is t
 mechanism is `update_kv_from_target` writing paged rows aligned to the target's
 block tables.
 
+**W-3 starts with a SEAM change, and it is named here so the wave is not
+mis-estimated as pure composition.** Read at
+`exllamav3/modules/arch_specific/dspark.py:134-155`, `update_kv_rows` is:
+
+    kv = wkv(main_x).view(bsz, s, 1, D)
+    ext.rope(kv, kv, ..., positions, kv_norm_w, rms_norm_eps, ..., D - rd)
+    kl.write_rows(kv.view(bsz, s, D), positions, block_table)
+
+which is the operation the TRUNK already performs on its own KV -- project,
+weighted RMSNorm, partial RoPE over the last `rd` dims, paged write -- differing
+only in that it is sourced from `main_x` rather than from the hidden state. The
+blocks are `"sliding"`, so they take the dense RoPE arm (`rope_theta`,
+`freq_scale = 1`), not the compressed layers' YaRN.
+
+The obstacle is that `RopeInplaceLayer` lives in `deepseek_v4.cpp`'s ANONYMOUS
+namespace and has no declaration in any header, while `MhcPost` and friends are
+exported through `deepseek_v4_mhc.h`. The drafter must not re-implement RoPE
+beside it: `AGENTS.md` §"Shared seams" says to extend the seam rather than write a
+parallel path, and a second RoPE would be a second place for the dual-theta rule
+to drift. So W-3's first brick is lifting `RopeInplaceLayer` into a shared header
+alongside the existing per-concern V4 headers, with the trunk and the drafter both
+reading it. That is a refactor of trunk internals and deserves its own review
+rather than riding along with the block composition.
+
 W-4. **The markov head and the sampling loop.** Cheap in weights and the whole
 reason the block is affordable, so it is its own wave with its own gate.
 

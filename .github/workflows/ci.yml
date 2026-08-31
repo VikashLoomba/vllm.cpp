@@ -505,6 +505,12 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
           python3 tests/scripts/test_ltx25_render_compare.py && python3 tests/scripts/test_ltx25_absolute_reference.py
+          # The prompt-adherence half of the same tool (#2295, owning #1854's
+          # first sub-question). 42 of its 47 cases need numpy only; the five
+          # that need the pinned CLIP checkpoint skip themselves individually,
+          # because this lane has no 598 MB checkpoint and a case that cannot
+          # run must say so rather than pass.
+          python3 tests/scripts/test_ltx25_prompt_adherence.py
           # Same numpy-only lane, same reason (#2011): the GLM-5.3-Flash
           # GGUF converter avoids gguf-py on purpose -- upstream has no
           # `glm5_next`, and `gguf.quants.Q2_K` has a dequantizer and NO

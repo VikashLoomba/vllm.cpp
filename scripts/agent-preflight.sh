@@ -423,6 +423,24 @@ else
     "numpy is not importable here, and the tool this suite exercises needs it." \
     "CI installs python3-numpy and runs the same suite."
 fi
+# THE PROMPT-ADHERENCE SUITE (#2295, owning #1854's first sub-question),
+# registered in the SAME change that adds it, for the reason the paragraph above
+# records. It exercises the third half of this tool: not "are these two renders
+# the same" and not "does this render have artefacts in it", but "does it depict
+# what was asked for".
+#
+# Same numpy condition and the same SKIP-never-ok discipline. FIVE of its 47
+# cases need the pinned CLIP checkpoint and skip themselves, individually, with
+# their own reason when `VT_LTX25_ADHERENCE_MODEL` is unset -- the other 42
+# need numpy and nothing else, no checkpoint, no network and no GPU, because
+# every bound they check is arithmetic over a score matrix the case builds.
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_ltx25_prompt_adherence" python3 tests/scripts/test_ltx25_prompt_adherence.py
+else
+  skip "test_ltx25_prompt_adherence" \
+    "numpy is not importable here, and the tool this suite exercises needs it." \
+    "CI installs python3-numpy and runs the same suite."
+fi
 # THE GLM-5.3-Flash GGUF CONVERTER (#2011). Same shape and the same one
 # dependency: `scripts/convert-glm5-next-gguf.py` deliberately does not use
 # gguf-py -- upstream has no `glm5_next` and, decisively, `gguf.quants.Q2_K`

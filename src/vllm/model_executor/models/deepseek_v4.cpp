@@ -719,10 +719,31 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
   };
   if (is_comp) {
     const int64_t cr = p.compress_ratio(layer);
-    want("compressor.ape", "[compress_ratio, head_dim]", L.comp_ape.size(), cr * hd);
-    want("compressor.wgate.weight", "[head_dim, hidden_size]", L.comp_wgate.size(),
-         hd * H);
+    // W3 (#2286): `coff = 1 + (compress_ratio == 4)` (`compressor.py:247-248`)
+    // widens the ape and the fused wkv|wgate; `norm` does NOT, because upstream
+    // is `RMSNorm(self.head_dim, ...)` (`compressor.py:288`).
+    //
+    // Read from the TENSOR rather than derived from `compress_ratio`, the same
+    // way `idx_wq`'s K is. Upstream emits only the derived width, but this tree's
+    // synthetic suites are written at a COLLAPSED `coff == 1` shape on `cr == 4`
+    // layers -- a shape upstream cannot produce and this forward has always
+    // accepted. Deriving the requirement instead would refuse all of them at
+    // once, which is a fixture migration and not this wave.
+    const int64_t cw = (hd > 0 && H > 0 && L.comp_wgate.size() % (hd * H) == 0 &&
+                        L.comp_wgate.size() / (hd * H) == 2)
+                           ? 2 * hd
+                           : hd;
+    const int64_t coff = cw / hd;
+    (void)coff;
+    want("compressor.ape", "[compress_ratio, coff*head_dim]", L.comp_ape.size(), cr * cw);
+    want("compressor.wgate.weight", "[coff*head_dim, hidden_size]", L.comp_wgate.size(),
+         cw * H);
     want("compressor.norm.weight", "[head_dim]", L.comp_norm_weight.size(), hd);
+    // Materialized since W3; empty only on a checkpoint that carries none, where
+    // the collapsed convention still applies.
+    if (!L.comp_wkv.empty())
+      want("compressor.wkv.weight", "[coff*head_dim, hidden_size]", L.comp_wkv.size(),
+           cw * H);
   }
   if (is_indexer) {
     const int64_t inh = p.index_n_heads;

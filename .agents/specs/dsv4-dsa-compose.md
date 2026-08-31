@@ -392,6 +392,26 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## W3 takes the real geometry from FOUR refused tensors to ONE
+
+The forward's geometry check reads `coff` from the TENSOR rather than deriving it
+from `compress_ratio`, the same way `idx_wq`'s K is read, and
+`CompressorLayerStep` accepts `compress_ratio == 4` with the doubled operands.
+
+**Deriving it was tried first and broke every synthetic suite.** Upstream emits
+only the derived width, but this tree's fixtures carry a COLLAPSED `coff == 1`
+shape on `cr == 4` layers -- a shape upstream cannot produce and this forward has
+always accepted. Requiring the derived width refused all of them at once, which is
+a fixture migration rather than this wave. That is the same mistake as narrowing
+the resolver refusal before the forward composed: changing what a check demands
+without moving what feeds it.
+
+On the REAL geometry the refusal now names ONE tensor where it named four:
+`attn.indexer.compressor.wkv.weight`. `compressor.ape`,
+`compressor.wgate.weight` and `indexer.wq_b` are read at the artifact's own
+widths. What remains is the INDEXER's own compressor, a second
+`DeepseekCompressor` at `index_head_dim` (`attention.py:768-776`).
+
 ## W3's fourth piece: the compressor pools its OWN projection
 
 Recorded as owed one commit ago and now closed. Upstream's compressor owns a

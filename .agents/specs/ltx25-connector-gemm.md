@@ -440,6 +440,41 @@ Three further reasons, each measured rather than asserted:
   this row was written. `orin:gpu0` was tried first and refused: its `/workspace`
   is local to that host and is NOT the shared NAS the other two mount, which is
   recorded here because it is not written anywhere else.
+
+  **How to read the result when it lands.** Each run writes `tier.txt`,
+  `gemm-default.txt`, `gemm-ref.txt`, `gemm-portable.txt`, and -- if the larger
+  binary built -- `connector.txt` and `attn.txt`, under
+  `/mnt/nas_share/rc/ltx25-connector-gemm/run/<host>-<stamp>/`, which is
+  `/workspace/ltx25-connector-gemm/run/...` from inside the lease. Two questions
+  come out of it: whether `tier_name` reads `neon` rather than `ref` or
+  `portable`, and whether the `kn/bt` column sits above or below 1 -- the second
+  being what decides whether `include/vt/quant.h`'s "1.16x to 1.30x on dgx" needs
+  a scope note or a correction.
+
+  **The job builds two binaries, smallest first, and runs the small one before
+  attempting the large one.** The tier and orientation questions need only the
+  `vt` runtime; the decomposition additionally needs the LTX-2.5 model TUs and
+  their audio-VAE closure. A link failure in the larger set would otherwise cost
+  the whole queue wait and answer nothing. When the large one does not build the
+  log says so in those words, so an ABSENT W3 cannot be read as a measured one.
+  The recipe was validated end to end on x86-64 from the staged tarball before
+  the jobs were left to queue and both binaries built, so what is untested in it
+  is exactly the aarch64 per-ISA branch, which mirrors `CMakeLists.txt`'s own
+  `set_source_files_properties` calls. Staged artifacts: `run.sh` sha256
+  `a6a9f55e...`, `src.tar.gz` sha256 `50d4ff0d...`, the latter a `git archive` of
+  this row's committed head, so the binary that runs under the lease is built
+  from the same probe the branch carries.
+
+  **That validation run left a directory in the evidence tree and it is
+  quarantined rather than deleted.** `run.sh` derives its output path from
+  `hostname`, and the devbox can see the same share the lease workers mount, so
+  the build check wrote
+  `run/NOT-A-LEASE-devbox-buildcheck-20260831T003240Z/` beside the real runs --
+  with a `README.txt` saying in its first line that it is not a fleet
+  measurement and that no number may be read out of it. An x86-64 log sitting in
+  a directory of aarch64 evidence is exactly the shape of
+  `an-instrument-whose-failure-looks-like-a-result`, and renaming it keeps the
+  provenance of the validation this section claims.
 - **An idle box.** Every devbox number was taken with other agents compiling on
   the same 20 cores, at loadavg 10 to 40. The RATIOS are what this row rests on
   and each carries its own same-arm control; the absolute GFLOP/s are lower

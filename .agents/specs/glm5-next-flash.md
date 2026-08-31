@@ -2328,7 +2328,18 @@ update, and the device-gate evidence below. No product code. No file under
 W9b, W9c-1, W9c-2 and W9c-3. The vision tower (W6). Any speed number: O6 is
 unchanged and there is still no denominator.
 
-**Gates.** `scripts/agent-preflight.sh --fail-on-skip`.
+**Gates.** `scripts/agent-preflight.sh --fail-on-skip` exits **1**, and the
+single failure is environmental and reproduced three times rather than waved
+past. 136 checks `ok`; `test_cpu_x86_llamacpp_floor` fails
+`test_a_contended_leg_is_discarded_and_never_summarised` in every run, printing
+its own reason: `NO_QUIET_WINDOW after 30s (busy=340% builders=0 load=129.36)`,
+and `load=80.69` / `load=67.72` / `load=141.56` in the three runs. The dev box
+carried 13 concurrent preflights and two foreign builds throughout. **The
+attribution is structural, not a judgement call: this change is 302 added lines
+in ONE markdown file and changes nothing under `src/`, `tests/`, `include/` or
+`scripts/`**, so the harness and every input it reads are byte-identical to
+`origin/main`. A contention guard firing on real contention is the test working.
+
 
 **THE DEVICE GATE §W9a LEFT PENDING IS TAKEN, ON `thor:gpu0`, AND IT PASSES.**
 `vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` driven at this

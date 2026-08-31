@@ -402,16 +402,25 @@ decision with an expiry.
   | peak 200-commit window within the last 1000 | **35 / 200 = 17.5%** (2026-08-18 .. 08-23) |
   | peak 200-commit window all-time | **85 / 200 = 42.5%** (2026-08-04 .. 08-07) |
 
-  15% sits below the 17.5% steady-state peak, so the arm is reachable: it would
-  have fired during 2026-08-18 .. 08-23. It sits 1.6x above the 9.1% mean, so it
-  does not fire on this file's ordinary write rate, per §"How we write" — a gate
-  that fires on ordinary work is the defect. The old 25% was never reached in the
-  steady-state era; only the file's own creation burst of 2026-08-04 .. 08-07
-  exceeded it, at 42.5%, and that window is the 2026-08-04 migration that created
-  the archive rather than anything a future writer would repeat. A trigger above
-  everything the file has done since it was established is decorative, and a
-  decision not to act whose review trigger cannot fire is a decision with no
-  expiry.
+  Sweeping every one of the 3070 possible 200-commit windows separates the two
+  thresholds cleanly, and by date rather than by argument:
+
+  | threshold | windows exceeding it | most recent such window |
+  |---|---|---|
+  | old, >25% | 211 of 3070 | ends **2026-08-09** |
+  | new, >15% | 372 of 3070 | ends **2026-08-23** |
+
+  Every window that clears 25% falls between 2026-08-01 and 2026-08-09 — the
+  migration burst that created this archive on 2026-08-04, and nothing a future
+  writer would repeat. So the old arm has been unreachable for the file's entire
+  steady-state life, three weeks by the pin date. 15% sits below the 17.5%
+  steady-state peak and was last cleared on 2026-08-23, eight days before the
+  pin, so it is a live threshold rather than a decorative one. It also sits 1.6x
+  above the 9.1% mean over the last 1000 commits, so it does not fire on this
+  file's ordinary write rate, per §"How we write" — a gate that fires on ordinary
+  work is the defect. A trigger above everything the file has done since it was
+  established is the opposite defect: a decision not to act whose review trigger
+  cannot fire is a decision with no expiry.
 
   **The recalibration does not change the recommendation.** The current rate is
   1.0%, an order of magnitude below the new 15% arm, so option 4 still holds and
@@ -610,6 +619,7 @@ explicitly so that a re-measurement is comparable rather than merely different.
 | 201 internal links break on a move: 163 `.agents/`-relative, 38 `../`-prefixed | `grep -oE '\]\([^)h][^)]*\)'` over the file, then `grep -c '^\](\.\./'` |
 | O1 arm 1 recalibrated to 15%, and it is reachable | G5 at `9fb40279d` (1.0%, rc 0) and at `11ccdcf76` (17.5%, rc 1) |
 | all-time peak 200-commit window is 42.5% | sliding window over 3269 non-merge commits, 2026-08-04 .. 08-07 |
+| >25% was last reachable 2026-08-09, >15% on 2026-08-23 | sweep of all 3070 200-commit windows: 211 clear 25%, 372 clear 15% |
 | growth is decelerating: 687 lines/day life-of-file, 88/day since 2026-08-23 | line counts at `8a0744ae0`, `b426de5ac` and each day's last write |
 | `retire-shared-record-surfaces.md:106` is false in both halves | this spec §Method (23.9%) and `git log -- .gitattributes` (no such attribute, ever) |
 | this file was already measured not-implicated | `.agents/specs/retire-shared-record-surfaces.md`, §Scope and §baseline |

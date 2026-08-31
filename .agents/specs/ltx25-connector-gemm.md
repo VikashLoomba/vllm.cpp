@@ -446,6 +446,25 @@ Three further reasons, each measured rather than asserted:
   bounds.
 - **A render.** No end-to-end before/after exists, because nothing changed.
 
+### The gates
+
+- `scripts/agent-preflight.sh`: every checker green, `check-commit-trailers`
+  `OK: commit trailer contract` and `check-commit-style` `OK: commit writing
+  style` over `origin/main..HEAD` after the merge that made them runnable.
+- `tests/vt/test_ops_attention_cross.cpp`, compiled directly and run:
+  **21 cases / 33 assertions / 0 failed** (the CUDA cases self-skip with `SKIP:
+  no CUDA backend registered`, which is what a devbox with no CUDA reports and
+  is recorded rather than counted as coverage).
+- **One preflight red was MY INSTRUMENT, and it is written down because a
+  broken instrument that fails toward a code verdict is how this repository
+  loses a day.** `check-windows-portability.py` reported `PowerShell AST parse
+  failed: ... GLIBC_2.38 not found (required by .../libstdbuf.so)`. The cause is
+  that this row ran preflight under `stdbuf -oL` to defeat its output buffering,
+  and `stdbuf` injects `libstdbuf.so` into every child -- including the snap
+  `pwsh` the checker shells out to, which links a different libc. Re-run without
+  `stdbuf` the same checker prints `Windows portability contract OK`, exit 0. No
+  file in this branch is a PowerShell file.
+
 ## Owed
 
 - **THE ATTENTION KERNEL'S PER-ELEMENT DTYPE SWITCH IS UNOWNED.** 43.6% of a

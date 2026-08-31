@@ -3898,6 +3898,71 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **THE RELEASED CHECKPOINT NOW SERVES AND ITS OUTPUT IS DEGENERATE. THIS IS
+  THE ROW'S BLOCKER AND ITS CAUSE IS NOT IDENTIFIED. ISSUE OWED.** W5q drove
+  `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S through `examples/server` on the
+  composed W5p + LOAD-IO tree, on `thor:gpu0`, `--device cpu`, staged to
+  worker-local disk. **The W5n refusal is gone**: the prefill completes, eight
+  decode steps run with `model_executed=1` each, nothing throws, and
+  `POST /v1/completions` returns **200** instead of W5n's 500. **And the answer
+  is a constant.** Both of these came back byte-identical:
+
+  ```text
+  prompt "The capital of France is"  (prompt_tokens=5) -> text "!!!!!!!!"
+  prompt "Water boils at"            (prompt_tokens=3) -> text "!!!!!!!!"
+  ```
+
+  `!` is **token id 0** in this artifact's own vocabulary — read off shard 1's
+  `tokenizer.ggml.tokens` (248,320 entries; ids 0-5 are `!`, `"`, `#`, `$`, `%`,
+  `&`), not assumed from another model's tokenizer. Eight id-0 samples that do
+  not move with the prompt is what `argmax` returns over a logit row with no
+  maximum.
+
+  **WHAT THE NEXT WAVE MUST NOT DO IS GUESS.** This run CANNOT distinguish an
+  all-`NaN` logit row, an all-zero row and a constant non-zero row, because
+  `logprobs` was not requested and the response carries `null` for it. All three
+  sample id 0 and all three have different causes. The cheapest discriminating
+  step is one request with `logprobs` on a loaded server, and after that a
+  per-layer probe: the gate cannot see this, because every gate on this row
+  drives the synthetic ramp fixture and the fixture is green.
+
+  **THE SHAPE IS THE ONE W5p ALREADY NAMED**, one level further in: the
+  `## Owed` fixture entry says every `vt::` op this loop composes has a dtype
+  contract the fixture exercises on exactly one side, and that the mixer refusal
+  was unlikely to be the last. It was not. But naming a class is not naming a
+  site, and **W5q identifies no site and no line**. Evidence:
+  [`docs/bench-evidence/qwen4exp-released-checkpoint-serve-20260831.md`](../../docs/bench-evidence/qwen4exp-released-checkpoint-serve-20260831.md).
+
+- **THE `tee` EXIT-TRAP HANG SURVIVED ITS OWN FIX, AND HELD `thor` A THIRD TIME.
+  ISSUE OWED.** LOAD-IO recorded this shape and its workaround: `exec > >(tee)`
+  leaves a `tee` that exits only after the trap, so a bare `wait` in an EXIT trap
+  holds the fleet device. W5q's job carries that fix — there is no `wait` in its
+  trap — and it STILL held the device. The job logged `=== DONE ===` and
+  `cleanup done` at 03:25:55 and `rc devices` reported `thor:gpu0` busy with it
+  at 42m6s elapsed. `rc kill <full job id>` freed it at once and the next queued
+  job started within 8 s. **So the workaround is not sufficient and the bare
+  `wait` was not the whole cause.** Until this is understood, the operational
+  rule is the one that actually caught it: after a job prints DONE, read
+  `rc devices` and kill the job if the device is still held. A job template that
+  does not need `tee` at all — writing the log to a file the submitter can read
+  off the share — avoids the construct rather than working around it.
+
+- **W5q CANNOT SAY WHETHER ITS 67 GB STAGED COPY WAS RECLAIMED. ISSUE OWED.**
+  The cleanup's `du` measured 69 G under `/tmp/w5q`, `rm -rf` ran, and the `df`
+  on the next line — same timestamp — read 431 G used against 364 G before the
+  job. The server process appears in `ps` one second earlier at 316% CPU, so the
+  `df` was taken before an unlink of that size could settle and possibly while
+  the file was still open. This is reported as UNKNOWN rather than resolved
+  either way; a staging job should verify reclamation after the process exits,
+  not one line after issuing the `rm`.
+
+- **`VT_LOAD_STATS` AND `VT_GGUF_PREFAULT` ARE UNDOCUMENTED IN `docs/USAGE.md`.**
+  LOAD-IO made the first one report on the GGUF path and both now change what a
+  user sees and how long a load takes — `VT_GGUF_PREFAULT=0` took the same load
+  from 60 s to 15 s. Neither appears in `docs/USAGE.md`. Pre-existing at W5q and
+  recorded rather than fixed here, because a user-facing knob's documentation is
+  a scoped edit and not this wave's.
+
 - **W5p FIXED THE BLOCKER BELOW, AND THE ENTRY IS KEPT IN THE PAST TENSE.** The
   op now takes a block-quantized `mix_down`, `mix_up` and `block_inject` and
   routes each through `vt::MatmulBT`, which dispatches `kMatmulBTQuant`. Of the
@@ -3913,9 +3978,10 @@ All six mutations were re-run after this refactor.
   would emit IQ4_NL next time. This entry's LAST sentence was heeded: the gate
   builds the fixture tensors QUANTIZED (`FixtureOpts::hc_mix_q8_0`), and mutation
   M1 of the W5p record proves that without it the whole thing would have been
-  green for the reason the entry names. **What W5p does NOT claim: nothing has
-  run the RELEASED checkpoint through the repaired path.** The gates are the
-  miniature and the op.
+  green for the reason the entry names. **What W5p does NOT claim: nothing had
+  run the RELEASED checkpoint through the repaired path AT W5p.** The gates are
+  the miniature and the op. **W5q then ran it**: the refusal is gone and the
+  output is degenerate — see this section's first entry.
 
 - **THE FORWARD REFUSED THE ONLY PUBLISHED ARTIFACT THAT FITS. W5n MEASURED IT;
   W5p FIXED IT. Kept because it is the measurement, and because the next reader
@@ -6510,9 +6576,9 @@ After restore, rebuild rc 0 and all three suites green: `test_qwen4_exp_hc_devic
 
 ### What is NOT proved
 
-Nothing has run the RELEASED checkpoint through the repaired path. W5n's run
-needed `thor:gpu0` and 4446 s to load; W5p is a CPU wave with no lease and did
-not attempt it. The claim here is that the op, the loader and
+Nothing had run the RELEASED checkpoint through the repaired path AT W5p. W5n's
+run needed `thor:gpu0` and 4446 s to load; W5p is a CPU wave with no lease and
+did not attempt it. The claim here is that the op, the loader and
 `ModelRegistry::Forward` all carry a Q8_0 mix weight on the miniature, and that
 the refusal the released file hit is gone at its source.
 ### W6-CUDA — the first CUDA arms this architecture has ever had
@@ -6878,6 +6944,14 @@ six deep, so this is recorded as an environment fact rather than as an anecdote.
   row. The QSA entry itself is unchanged and still owed.
 
 
+**W5q ATTEMPTED IT AND THAT LAST CLAIM HELD.** On the composed W5p + LOAD-IO
+tree the released artifact prefills and decodes without throwing, and
+`POST /v1/completions` returns 200 rather than W5n's 500. What W5q found instead
+is a degenerate forward — eight id-0 tokens, byte-identical across two prompts —
+whose cause is unidentified. That does not weaken W5p's claim, and W5p's claim
+never covered it: the op-level and miniature gates say nothing about the values
+the released geometry produces.
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**
@@ -6927,8 +7001,10 @@ a row here, and every row says whether anything in production reaches it:
 | W5k | the PLE conv ring's DTYPE and the n-gram history's RESIDENCY settled against the running lane oracle, and the SECOND STEP | **yes, and it DECODES** — `ModelRegistry::Forward` runs a prefill at `past_len` 0 and then a decode at `past_len` 6 over the engine's own persistent recurrent group, sampling a token on each; M1 deletes the n-gram write-back INSIDE `RunQwen4ExpPleBlock` and the step-1 history assertion reds, which is the first measured reach of that block's body | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5k's own issue OWED |
 | W5L | `GPUModelRunner` and `LoadedEngine` DRIVEN end to end, and the model-declared concurrency ceiling that keeps a server alive | **yes, and it SERVES** — a real `GPUModelRunner` allocates all three published groups, gathers all three block tables and runs a prefill then a decode through `execute_model` / `sample_tokens`; `LoadedEngine::FromModelDir` loads a `qwen4exp` GGUF and `generate` returns tokens; `examples/server` answers `POST /v1/completions` on CPU. M1 deletes the runner's `multi_kv` handoff, M3 deletes the per-group gather call site, and M4 deletes the clamp's production call site — each reds | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5L's own issue OWED |
 | W5n | the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact driven through `examples/server` on `thor:gpu0` — the first published `qwen4exp` bytes this row has ever read | **LOAD yes, TOKEN no** — all three shards load on `--device cpu` in 4446 s at 69.206 GiB peak RSS with every encoding keeping its blocks, the engine sizes its caches and the server answers `/health`; the first forward then refuses the artifact by name (`qwen4_exp_gated_residual: input_mix_weight_down must be float`, `src/vt/ops.cpp:2552`) because the file stores 194 hyper-connection mix weights as Q8_0, and `/v1/completions` returns 500. **Zero tokens.** No code changed; the defect is recorded, not worked around | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5n's own issue OWED |
-| W5p | the hyper-connection mixer takes a QUANTIZED mix weight: `mix_down`, `mix_up` and `block_inject` may keep the file's blocks and route through `vt::MatmulBT`, while `hc_norm_w` and the stream stay float and a block-typed one is refused by name | **yes** — `ModelRegistry::Forward` runs a prefill AND a second prompt over a `FixtureOpts::hc_mix_q8_0` file whose `hc_*_down`, `hc_*_inject` and `output_hc_down` are Q8_0, sampling a token that is the row's own maximum and logits that MOVE on the second prompt. M1 restores the pre-wave refusal and that case reds with the exact string the RELEASED checkpoint threw, which is what makes the reach measured rather than assumed. **The released checkpoint itself has NOT been run through the repaired path** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5p's own issue OWED |
+| W5p | the hyper-connection mixer takes a QUANTIZED mix weight: `mix_down`, `mix_up` and `block_inject` may keep the file's blocks and route through `vt::MatmulBT`, while `hc_norm_w` and the stream stay float and a block-typed one is refused by name | **yes** — `ModelRegistry::Forward` runs a prefill AND a second prompt over a `FixtureOpts::hc_mix_q8_0` file whose `hc_*_down`, `hc_*_inject` and `output_hc_down` are Q8_0, sampling a token that is the row's own maximum and logits that MOVE on the second prompt. M1 restores the pre-wave refusal and that case reds with the exact string the RELEASED checkpoint threw, which is what makes the reach measured rather than assumed. **W5q ran the released checkpoint through this repaired path: the refusal is GONE and the output is DEGENERATE** — see the W5q row | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5p's own issue OWED |
 | W6-CUDA | the first CUDA arms of this architecture: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpGatedResidualWriteBack` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and four ops plus `vt::RmsNormGroup` plus the block-decoding n-gram gather still have no CUDA arm, so no `qwen4_exp` step can reach a CUDA queue at all. The gate RAN on TWO architectures. `thor:gpu0` (`sm_110`, nvcc 13.0.88): 12 cases, 323 assertions, 322 passing, with the CPU arms matched BITWISE at 0 of 8772, 0 of 20480 and 0 across all 30 dtype combinations; 5 of 6 mutations red and M5 a compiler proof. The single failure was this suite's OWN oracle bound, which was re-derived and bitwise-backstopped. `dgx:gpu0` (`sm_121a`, GB10, nvcc 13.0.88) then ran the corrected suite green: 12 cases, 351 assertions, 351 passing, every rc READ rather than derived, and `cuobjdump` reporting `cuda_qwen4_exp_ple.cu.1.sm_121a.cubin` so the objects are genuinely built for that architecture. The two runs' mutation counts agree. Full result in the W6-CUDA section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA's own issue OWED |
+| W5-LOADIO | `VT_LOAD_STATS` reports on the GGUF branch, and `PrefaultBorrowedSpan` counts BYTES rather than only spans | **yes** — the timing and `ReportGgufLoadIo` sit on the `.gguf` branch of `LoadedEngine::FromModelDir`, the production loader entry point, so `VT_LOAD_STATS=1` on any GGUF model now prints `mmap+header`, `weights` and the prefault's bytes/seconds where it previously printed NOTHING. It deliberately does NOT call `ReportLoadBytes`, whose three counters are incremented on the safetensors path only and would print zeros for an artifact the load had just moved 67.56 GiB of. Gated by a new case in `test_gguf_keep_quant.cpp` asserting an EQUALITY over a double load, because `> 0` is satisfied by a counter wired to the span count, to a constant, or to the last span alone | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), its own issue OWED |
+| W5q | the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact driven through `examples/server` on the COMPOSED W5p+LOAD-IO tree, staged to worker-local disk | **SERVES yes, USABLE TOKEN no** — the W5n refusal is gone: a 5-token prefill and eight decode steps run with `model_executed=1` each, nothing throws, and `POST /v1/completions` returns **HTTP 200** with 8 completion tokens where W5n got a 500. **Every one of those tokens is id 0**, which this checkpoint's own `tokenizer.ggml.tokens` gives as `!`, and the answer is BYTE-IDENTICAL for two prompts of different lengths. So the forward is degenerate and prompt-independent on the real weights. Load 61 s from local disk (against 4446 s from CIFS), `VmHWM` 73.935 GiB, gate 72 cases / 10,380 assertions / 0 failed / 0 skipped with the oracle golden unmoved at `0.00982457`. **The CAUSE is NOT identified**: `logprobs` was not requested, so nothing distinguishes NaN, zero and constant logits, and no per-op probe was run | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5q's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than
@@ -7067,8 +7143,12 @@ buffers: `test_qwen4_exp_runner.cpp` reads the runner-allocated n-gram history
 after a prefill and finds the prompt's last two ids in it rather than zeros, and
 deleting `gather_group_block_tables`'s call site reds that same case by name.
 What SURVIVES is the third: every byte figure here is still derived on a CPU host
-and none is measured on a device, because no CUDA kernel exists for any
-`qwen4_exp` op.
+and none is measured on a device. W6-CUDA has since given `vt::Qwen4ExpPleConv`,
+`vt::Qwen4ExpPleGate` and `vt::Qwen4ExpGatedResidualWriteBack` their first CUDA
+arms, so "no CUDA kernel exists" is no longer the reason; the reason is that four
+further `qwen4_exp` ops plus `vt::RmsNormGroup` and the block-decoding n-gram
+gather still have none, and `ModelRegistry::Forward` is all-or-nothing, so no
+`qwen4_exp` step reaches a CUDA queue.
 
 **"NO GATE HERE CAN SEE THAT" WAS TRUE WHEN IT WAS WRITTEN AND IS NOT TRUE NOW**,
 so it is corrected rather than carried. W5e-2's mutation M2 replaces the EOS seed
@@ -7095,10 +7175,19 @@ through `examples/server` on `--device cpu`, and the server listened. **The
 LOAD is the good half and it is real**: 4446 s to `/health`, peak RSS `VmHWM`
 69.206 GiB against a 67.564 GiB file, with every one of the file's nine
 encodings keeping its blocks (anonymous memory moved 4 → 11 GiB across a load
-whose n-gram table alone would have added 95.368 GiB). **The FORWARD then
-refuses the artifact by name and ZERO tokens come out**, so there is still NO
-token number and NO speed number, and the reason is no longer "nothing has been
-read" but a named defect — see `## Owed`, first entry. W2, W3 and W4 remain host
+whose n-gram table alone would have added 95.368 GiB). **That 4446 s is a
+FILESYSTEM number and the sentence that quoted it alone was misleading**:
+LOAD-IO measured the same artifact at 60 s from worker-local disk on the same
+box, and W5q reproduced 61 s independently, so our loader's own host work is
+~1.3% of it and the rest is the CIFS mount. **The FORWARD then refused the
+artifact by name and ZERO tokens came out**, and W5p removed that refusal at its
+source. **W5q RE-RAN THE ARTIFACT AND THE REFUSAL IS GONE**, so this paragraph's
+verdict has moved rather than been deleted: `POST /v1/completions` now returns
+200 with eight tokens instead of a 500, and every one of those tokens is id 0
+with a BYTE-IDENTICAL answer for two different prompts. There is still NO token
+number and NO speed number, and the reason has moved twice — from "nothing has
+been read", to a named refusal, to a degenerate forward on the real weights
+whose cause nothing has yet identified. See `## Owed`. W2, W3 and W4 remain host
 reference math with no production call site.
 
 **W5b-6 ([#2218](https://github.com/mudler/vllm.cpp/issues/2218)) closes the

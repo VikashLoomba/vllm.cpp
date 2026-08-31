@@ -29286,5 +29286,3 @@ the entering-directory line and on compile order and both end
 `[515/515] Linking CXX executable examples/vllm-server` — the identical binary
 sha256 is the stronger statement — and `cmake-b.log`, which diffs against
 `cmake-a.log` on three lines only, two timings and the build directory name.
-
-[gone](bench-evidence/no-such-file-20260812.md)

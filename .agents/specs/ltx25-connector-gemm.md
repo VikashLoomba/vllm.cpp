@@ -317,9 +317,11 @@ reproduces exactly. The speed half does not generalize: it was measured on
 aarch64 at another row's shapes, and on x86-64 AVX-512 at the connector's shapes
 the same lever is a 2x regression. The plausible mechanism is that the AVX-512
 tier's `Transpose16` costs less than the `[K,N]` path's 16 KB-strided weight
-walk, which is exactly the trade that inverts between ISAs. **This row does not
-edit that header**, because the aarch64 measurement that would say whether the
-sentence needs a scope qualifier or a correction is still queued.
+walk, which is exactly the trade that inverts between ISAs. **This row DID edit
+that header, once the aarch64 run made the question decidable** -- on dgx itself
+the lever is 1.22x to 2.70x SLOWER at these shapes, so the sentence keeps its
+number and gains the scope it lacked. See `### THE aarch64 RUNS`. The paragraph
+above is left as it was written, when the answer was not yet in.
 
 ### W3 — the decomposition, and it closes
 
@@ -619,10 +621,14 @@ reviewer, and this row's own scope excludes it.
 
 Three further reasons, each measured rather than asserted:
 
-- **This devbox is not the machine the render was measured on.** Every number
-  above is x86-64 AVX-512. The GB10's aarch64 tier is NEON with `mr = 4` and a
-  weaker GEMM, so the attention/GEMM split there is an open question that the
-  queued lease answers and this row does not guess at.
+- ~~**This devbox is not the machine the render was measured on.**~~ **ANSWERED.**
+  Every number in the sections above is x86-64 AVX-512, and the prediction made
+  here -- that GB10's tier is NEON with `mr = 4` and a weaker GEMM -- is exactly
+  what `tier.txt` reports. The split there is no longer an open question:
+  `### THE aarch64 RUNS` measures it on GB10 at attention 66.5% / GEMM 24.8%, and
+  the reason to keep this bullet is that its LAST clause -- "this row does not
+  guess at it" -- is the one the retraction below shows should have been applied
+  to the single-thread claim as well.
 - **The disk cannot hold a CMake build tree** (`/` at 99%), so the project's full
   suite could not be run against a change to a seam every model uses. What COULD
   be run is `tests/vt/test_ops_attention_cross.cpp`, compiled directly:

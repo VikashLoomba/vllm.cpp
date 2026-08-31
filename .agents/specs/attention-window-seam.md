@@ -101,6 +101,34 @@ reason, rather than against a shared expectation.
 **Not CPU-testable end to end.** These sites feed paged attention; a value test
 pins the window, not the attention. That is stated rather than implied.
 
+## W1 outcome, including what the mutation FAILED to prove
+
+Five model sites adopted: `gemma2`, `gemma3`, `gemma4`, `olmo2`,
+`muse_glimmer`. Each keeps its own predicate — `use_rope` for muse_glimmer is a
+routing decision (a NoPE layer takes no window at all), not a statement about how
+wide the window is — and only the DERIVATION moved.
+
+Green after adoption: `test_gemma2_forward` 1003, `test_gemma3_forward` 503,
+`test_chunked_local_attention` 18849, `test_attention_window` 22,
+`test_gemma4_honesty` 6, plus the new equality suite at 27.
+
+**The kill switch has NO test coverage, and the mutation is how that was
+found.** Rewiring gemma2's adopted site to ignore `SlidingWindowEnabled()`
+compiles cleanly and `test_gemma2_forward` passes with 1003 assertions in BOTH
+`VT_GEMMA2_SLIDING=0` and the default. So nothing in the suite holds that
+switch, before this change or after. The routing preserves it by construction,
+which is not the same as proven.
+
+That is a pre-existing gap this row exposes rather than one it introduces, and it
+sharpens W3: a debugging switch that exists for two of five models AND is
+untested on both is weaker than the issue suggested.
+
+Two mutations that did NOT compile were rejected before their numbers were
+believed — `-Werror=parentheses` on `false && a || b`, and
+`-Werror=unused-function` when removing the switch's only caller. A mutation
+build failure reads as a passing test, and both would have.
+
 ## Now
 
-W1 in progress. W2 and W3 owed.
+W1 done. W2 (the two shared-path sites) and W3 (the kill-switch asymmetry, now
+also a coverage gap) owed.

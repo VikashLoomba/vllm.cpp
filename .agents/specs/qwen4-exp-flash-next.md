@@ -3956,10 +3956,17 @@ All six mutations were re-run after this refactor.
   measures. `/v1/completions` over in-alphabet prompts is what W5L gated and what
   it claims.
 
-- **NO CUDA ARM WAS BUILT OR RUN.** There is no CUDA kernel for any `qwen4_exp`
-  op, so the served path is `--device cpu` and a device run is not merely
-  unmeasured, it is unavailable. Unchanged by W5L and restated because the wave
-  that says "it serves" is the wave a reader will quote.
+- **(SUPERSEDED by W6-CUDA.)** This entry read "NO CUDA ARM WAS BUILT OR RUN.
+  There is no CUDA kernel for any `qwen4_exp` op, so the served path is
+  `--device cpu` and a device run is not merely unmeasured, it is unavailable."
+  That was true of W5L and is no longer true of the tree: three of the six ops
+  now have CUDA arms, compiled and run on `sm_110`. It is kept, struck, because
+  the wave that says "it serves" is the wave a reader will quote, and a reader
+  arriving here needs to be sent forward rather than told something false. **The
+  served path is STILL `--device cpu`**, for a different reason that has not
+  moved: `ModelRegistry::Forward` is all-or-nothing and the remaining four ops
+  plus `vt::RmsNormGroup` plus the block-decoding n-gram gather have no CUDA arm,
+  so a `qwen4_exp` step still cannot reach a CUDA queue.
 
 - **W5j's ISSUE IS OWED.** GitHub writes are `403` from this host (account
   suspended), so nothing could be filed and no row was appended to
@@ -6280,13 +6287,95 @@ pointing at an issue that does not exist is worse than an absent one).
 
 #### Evidence, and the exact boundary of what it covers
 
-**NO KERNEL IN THIS WAVE HAS BEEN COMPILED BY `nvcc` OR EXECUTED ON A GPU AT THE
-TIME THIS SECTION WAS WRITTEN.** The authoring host has no CUDA compiler
-(`cmake` reports `Looking for a CUDA compiler - NOTFOUND`), a `dgx:gpu0` lease
-was submitted and sat queued behind the developer's own job, and this paragraph
-is the honest state until a line below names the device, the toolkit and the
-build rc. Everything in this subsection is a HOST measurement and is labelled as
-one. A reader who needs "does it run on a GPU" has not been told yet.
+**THE KERNELS COMPILE AND RUN ON A GPU. This paragraph replaces one that said
+they never had**, and the replacement is the point: an out-of-date warning is
+its own defect. The device is `thor:gpu0`, a Jetson Thor at **`sm_110`**, on
+2026-08-30 23:01-23:35 UTC. Toolkit `nvcc` 13.0.88, configure
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110`. Both translation units
+built -- `[3/630] cuda_qwen4_exp.cu.o`, `[4/630] cuda_qwen4_exp_ple.cu.o` -- with
+**zero** lines matching `error:|Error [0-9]|FAILED` in `build-w6.log`, which ends
+at `[630/630] Linking`. Logs: `/workspace/q4exp-w6cuda/out-thor/`.
+
+**THE BUILD RC IS DERIVED, NOT READ, and that distinction is kept.** The literal
+`### W6 BUILD RC=` line goes to the job's stdout, and that job has since aged out
+of `rc jobs`, so it cannot be quoted. What can be shown is control flow:
+`run-thor.sh:90-93` prints the rc and then `if [ "$bld" -ne 0 ]; then ... exit
+94`. Everything the script writes after that point exists -- `gate.log`, six
+`mut-*` logs, `build-final.log`, `gate-final.log` -- so the branch was not taken
+and `bld` was 0. Two further corroborations: ninja prints a terminal `[630/630]`
+only when every step succeeded, and `tests/test_qwen4_exp_cuda` was subsequently
+EXECUTED, which is impossible unless it linked. This is a stronger argument than
+"no error lines", which is an absence-of-evidence claim, but it is still a
+derivation and is labelled one.
+
+**`sm_121a` (GB10) IS NOT COVERED BY THIS.** A `dgx:gpu0` job was running when
+this was written. The kernels are arch-invariant by inspection -- zero
+occurrences of `mma.sync`, `wmma`, `__CUDA_ARCH__`, inline `asm`, CUTLASS,
+`ldmatrix`, `cp.async` or any `sm_*` literal, and only IEEE round-to-nearest
+intrinsics plus sm_80+ converters -- so one arch carries further here than it
+would for a kernel with arch-gated paths. It is still one arch.
+
+### What the sm_110 run measured
+
+`gate.log`, 12 cases, 323 assertions, **322 passing**. Against the CPU arms the
+device output is BITWISE identical everywhere it is compared:
+
+| device gate, `sm_110` | result |
+|---|---|
+| conv vs the transformers ORACLE, dilations 1 / 2 / 3 | 5.96e-08 / 5.96e-08 / 2.98e-08 |
+| conv vs the CPU arm, output, 4 token counts, non-zero ring | **0 differing — bitwise** |
+| conv vs the CPU arm, RING write-back, all four | **0 of 144 — bitwise** |
+| conv under catastrophic cancellation | **0 of 64 — bitwise**; the `double` accumulator holds on device |
+| gate vs the CPU arm at T=17, hc=4, hidden=129 | **0 of 8772 — bitwise** |
+| write-back vs the CPU arm, 1x2x1 / 3x4x8 / 7x3x129 / **2x4x2560** | **0 of 2 / 96 / 2709 / 20480 — bitwise** |
+| all 18 write-back dtype triples | **0 of 204 each — bitwise** |
+| all 6 conv dtype pairs | **0 of 224 each — bitwise** |
+| all 6 gate dtype pairs | **0 of 693 each — bitwise** |
+
+The 2x4x2560 row is the released hyper-connection geometry, and it is where the
+`__fmul_rn`/`__fadd_rn` byte-identity claim either lands or does not. It lands.
+
+**The one failing assertion was this suite's own bound, and the fix is a
+re-derivation rather than a widening.** The gate's oracle case missed at
+4.76837e-07 against 4.37555e-07. The CPU arm misses the SAME golden by the SAME
+4.76837e-07 on the same 36 of 96 elements, while the two arms are bitwise equal
+to each other on all 96 -- so a bound the CPU arm also fails is a statement about
+the bound. `kUlpTol` is an ARM-VS-ARM constant; a torch-dumped golden is an
+independent f32 computation that neither arm is within one ulp of, and
+`test_qwen4_exp_ple_gate.cpp:94` has always used 1e-5 for this comparison. Every
+oracle case is now backstopped by a bitwise CPU-vs-CUDA comparison on the same
+input, and the pairing is measured: under the float-accumulator mutation the
+three conv oracle cases go green at the new bound (1.19e-07, 5.96e-08, 2.98e-08)
+and the three backstops red bitwise on 90, 71 and 86 of 192. The backstop
+recovers exactly what the bound gives up, as an equality rather than a tolerance.
+
+### Mutations, on the device
+
+| mutation | build | result on `sm_110` |
+|---|---|---|
+| M1 the conv IGNORES `args.dilation` | rc 0 | **RED**, 30 assertions; oracle dilations 2 and 3 wrong by 0.982 and 0.563 |
+| M2 the `SignedSqrt` NaN guard DELETED | rc 0 | **RED**, 2 assertions beyond the pre-existing one — the NaN case, which no tolerance can reach |
+| M3 the write-back contracts into an fma | rc 0 | **RED**, 8 byte-gate assertions. The byte-identity claim is load-bearing on a real device, not only in theory |
+| M4 the conv accumulates in FLOAT | rc 0 | **RED**, 21 assertions; the designed fixture reads 0.731059 against a 8.77e-08 bound |
+| M5 the `kQwen4ExpPleConv` kCUDA registration DELETED | **BUILD FAILED** | a COMPILER proof, not a test verdict: `1 error detected in the compilation of cuda_qwen4_exp_ple.cu`. Deleting the registration orphans the kernel and `-Werror` refuses it. Recorded as withdrawn-and-informative rather than counted as a red |
+| M6 the conv's RING write-back dropped | rc 0 | **RED**, 11 assertions, all of them ring gates — the output gates stayed green, which is the separation the ring is gated apart FOR |
+
+Every failing log also carries the pre-existing `4.76837e-07 <= 4.37555e-07`
+line, which is the bound defect above and not a mutation effect; the counts here
+have it subtracted.
+
+### The other suites, and what is NOT this wave's
+
+`ctest -R qwen4_exp` on the **baseline** tree, before the change was applied,
+already failed five: `test_qwen4_exp_gguf_load_plan`, `..._gguf_weights`,
+`..._layer_loop`, `..._runner`, `..._forward`. After the change the failing set
+is **those same five plus `test_qwen4_exp_cuda`**, this wave's own suite with its
+one bound assertion. **The change broke nothing.** `ctest -R cuda` additionally
+reports `test_cuda_ops` and `test_ops_matmul_fp8_block_cuda`, both recorded as
+pre-existing reds on this device in `.agents/environment.md` (#1802 and #1725
+respectively). Neither is reachable from anything this wave touched.
+
+
 
 **THE LEASE ATTEMPT, because "no device" should say what was tried.** A
 `dgx:gpu0` job was submitted at the start of the wave and sat at queue position
@@ -6508,7 +6597,7 @@ a row here, and every row says whether anything in production reaches it:
 | W5j | the forward CONSUMES the by-name channel, and `ModelFactory::consumes_multi_kv` narrows the engine's `multi_kv` refusal to a model-declared capability | **yes** — `ModelRegistry::Forward` dispatches a THREE-GROUP topology to this hook, which resolves all five published caches by name and reads group 2's own block table; M4 proves the guard still refuses with the bit cleared, M6 proves the tower is entered. It is still a SINGLE-SHOT prefill: nothing decodes a second token | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), [#2353](https://github.com/mudler/vllm.cpp/issues/2353), W5j's own issue OWED |
 | W5k | the PLE conv ring's DTYPE and the n-gram history's RESIDENCY settled against the running lane oracle, and the SECOND STEP | **yes, and it DECODES** — `ModelRegistry::Forward` runs a prefill at `past_len` 0 and then a decode at `past_len` 6 over the engine's own persistent recurrent group, sampling a token on each; M1 deletes the n-gram write-back INSIDE `RunQwen4ExpPleBlock` and the step-1 history assertion reds, which is the first measured reach of that block's body | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5k's own issue OWED |
 | W5L | `GPUModelRunner` and `LoadedEngine` DRIVEN end to end, and the model-declared concurrency ceiling that keeps a server alive | **yes, and it SERVES** — a real `GPUModelRunner` allocates all three published groups, gathers all three block tables and runs a prefill then a decode through `execute_model` / `sample_tokens`; `LoadedEngine::FromModelDir` loads a `qwen4exp` GGUF and `generate` returns tokens; `examples/server` answers `POST /v1/completions` on CPU. M1 deletes the runner's `multi_kv` handoff, M3 deletes the per-group gather call site, and M4 deletes the clamp's production call site — each reds | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5L's own issue OWED |
-| W6-CUDA | the first CUDA arms of this architecture: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpGatedResidualWriteBack` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and four ops plus `vt::RmsNormGroup` plus the block-decoding n-gram gather still have no CUDA arm, so no `qwen4_exp` step can reach a CUDA queue at all. The gate is `tests/vllm/models/test_qwen4_exp_cuda.cpp`: the lane-pinned transformers goldens ON DEVICE plus a byte comparison against the CPU arms. Its RESULT is recorded in the W6-CUDA section of `## Owed`, and until a line there names the device it ran on, nothing here has been measured on one | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA's own issue OWED |
+| W6-CUDA | the first CUDA arms of this architecture: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpGatedResidualWriteBack` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and four ops plus `vt::RmsNormGroup` plus the block-decoding n-gram gather still have no CUDA arm, so no `qwen4_exp` step can reach a CUDA queue at all. The gate RAN on `thor:gpu0` (`sm_110`, nvcc 13.0.88): 12 cases, 323 assertions, 322 passing, with the CPU arms matched BITWISE at 0 of 8772, 0 of 20480 and 0 across all 30 dtype combinations; 5 of 6 mutations red and M5 a compiler proof. `sm_121a` is not covered. Full result in the W6-CUDA section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than

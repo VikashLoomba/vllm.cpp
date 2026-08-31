@@ -40,6 +40,31 @@ It is **not** a DeepSeek MTP head, and `DeepseekV4MtpHostWeights` /
 concatenation of the TRUNK'S stream-mean taps at those three layers -- not
 `concat(embed, hidden)`, and not DeepSeek-V3's `[H, 2H]` `eh_proj`.
 
+**What a "tap" IS, exactly.** This is the single definition the port turns on, so
+it is pinned rather than paraphrased. `exllamav3/modules/transformer.py:198-203`,
+at the registered pin:
+
+```python
+# With hyperconnections the residual is a stream stack; export the stream mean as
+# the collapsed hidden state (streams start as broadcast copies of the embedding)
+x_ = x.mean(dim = 2) if self.attn_hc else x
+if x_.dtype == torch.half:
+    s.append(x_.clamp_(-65504.0, 65504.0))
+```
+
+So a tap is the **MEAN over the mHC stream dimension** of the block's residual
+`[bsz, seq, hc, H]`, giving `[bsz, seq, H]`. It is taken **after** the layer's
+residual add, i.e. the post-block state, and only when `layer_idx` is in
+`export_state_layers` AND `params["layer_instance"] == 0`
+(`transformer.py:144`). Half-precision taps are clamped to +/-65504.
+
+Three of those, concatenated on the last axis, are `main_proj`'s `[T, 3H]` input.
+
+Every plausible neighbouring choice is wrong and fails SILENTLY: the raw stream
+stack instead of its mean, the pre-residual state, a different `layer_instance`,
+or the final-norm output. Each yields a drafter that runs, emits correct tokens
+because verification is lossless, and drafts badly.
+
 **Blocks.** `mtp.{0,1,2}` are three blocks of ONE drafter, not three heads. Each
 is `DSparkAttention` + `BlockSparseMLP` + two `HyperConnection`s
 (`hc_attn`, `hc_ffn`, `hc_mult = 4`). `mtp_layer_types[idx]` is asserted

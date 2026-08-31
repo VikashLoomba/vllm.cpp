@@ -404,6 +404,29 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## The indexer's cycle, as upstream builds it
+
+Read before starting it, because two details change its shape
+(`attention.py:761-790`):
+
+- The indexer owns a `DeepseekV4IndexerCache` keyed by `compress_ratio`, and its
+  `DeepseekCompressor` writes INTO that cache (`k_cache_prefix=` is passed to the
+  compressor). So the compressed keys are cache rows, not a returned buffer.
+- That compressor is constructed with **`rotate=True`**, where the main
+  compressor is not. The indexer's pooled keys carry RoPE and the attention
+  compressor's do not, so the two cycles are NOT the same call with different
+  dimensions.
+- Selection is `SparseAttnIndexer` over that cache with
+  `skip_k_cache_insert=True`, at `topk_tokens = index_topk`. So the top-k scores
+  against the COMPRESSED cache rather than against per-token keys, which is what
+  `ik` currently feeds `DispLogits`.
+
+So the remaining work is: an indexer-side cache, a second compressor cycle with
+rotation at `index_head_dim`, and a selection re-pointed from per-token keys to
+that cache. All four of its tensors load (previous commit); none of that is a
+width change, and treating it as one would compute a top-k over the wrong
+operand rather than refuse.
+
 ## The LAST refused tensor is a wave, not a width
 
 `attn.indexer.compressor.wkv.weight` is the one tensor the real geometry still

@@ -132,6 +132,33 @@ std::vector<float> BlockKvRows(const std::vector<float>& main_x,
                                int64_t num_tokens, int64_t hidden, int64_t head_dim,
                                int64_t rope_dim);
 
+// W-4b, THE CONFIDENCE-CAPPED DRAFT LENGTH.
+// `sample_from_state` (`exllamav3/architecture/deepseek_v4_mtp.py:340-353`):
+//
+//     conf = confidence(cat(pre_norm_hidden, markov_emb))   # Linear -> 1
+//     keep = sigmoid(conf) >= threshold                     # EXL3_DSPARK_CONF, 0.5
+//     len  = cumprod(keep).sum()                            # per row
+//
+// `cumprod` THEN `sum` is the whole point and is easy to get wrong: it is the
+// longest CONTIGUOUS PREFIX of confident positions, not the count of confident
+// ones. A run like [yes, no, yes] yields 1, never 2. Counting instead would let a
+// drafter propose past a position the model said it was unsure about, and because
+// verification is lossless the only symptom is a worse acceptance rate.
+//
+// The projection's input is the PRE-norm hidden state concatenated with that
+// step's markov embedding (`:277`, `:344-347`), so its width is
+// `hidden + markov_rank` -- the artifact's `confidence_head.proj` is
+// `[1, 4352] = [1, 4096 + 256]`.
+//
+//   xpre         [block, hidden]  pre-norm hidden, one row per block position
+//   markov_emb   [block, rank]    the embedding fed to that step's bigram bias
+//   proj_w       [hidden + rank]  the confidence projection
+//   returns      the draft length in [0, block]; 0 means skip drafting this round
+int64_t ConfidenceDraftLength(const std::vector<float>& xpre,
+                              const std::vector<float>& markov_emb,
+                              const std::vector<float>& proj_w, float threshold,
+                              int64_t block, int64_t hidden, int64_t rank);
+
 // W-3, THE BLOCK'S WEIGHTS. A DSpark block IS a V4 decoder layer of the
 // compressor-less kind -- `DSparkAttention` with `compress_rate = None` over a
 // `BlockSparseMLP` with a shared expert and two `HyperConnection`s

@@ -504,3 +504,64 @@ TEST_CASE("W-3: a tensor at the WRONG width is refused, not silently accepted") 
   CHECK(!r.empty());
   CHECK(r.find("kv_norm") != std::string::npos);
 }
+
+// ── W-4b: the confidence-capped draft length ─────────────────────────────────
+
+TEST_CASE("W-4b: the length is the longest CONTIGUOUS prefix, not a count") {
+  // The distinction `cumprod(keep).sum()` encodes. With confidence high, low,
+  // high the answer is 1 -- counting confident positions would say 2 and let the
+  // drafter propose past a position the model flagged.
+  const int64_t B = 3, H = 1, R = 1;
+  // proj selects xpre only; markov_emb contributes nothing.
+  const std::vector<float> proj{1.0f, 0.0f};
+  const std::vector<float> emb(static_cast<size_t>(B * R), 0.0f);
+  const std::vector<float> xpre{5.0f, -5.0f, 5.0f};  // sigmoid: ~1, ~0, ~1
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, emb, proj, 0.5f, B, H, R) == 1);
+}
+
+TEST_CASE("W-4b: an all-confident block drafts its full length") {
+  const int64_t B = 4, H = 1, R = 1;
+  const std::vector<float> proj{1.0f, 0.0f};
+  const std::vector<float> emb(static_cast<size_t>(B * R), 0.0f);
+  const std::vector<float> xpre{6.0f, 6.0f, 6.0f, 6.0f};
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, emb, proj, 0.5f, B, H, R) == 4);
+}
+
+TEST_CASE("W-4b: an unconfident FIRST position yields 0, i.e. skip drafting") {
+  const int64_t B = 3, H = 1, R = 1;
+  const std::vector<float> proj{1.0f, 0.0f};
+  const std::vector<float> emb(static_cast<size_t>(B * R), 0.0f);
+  const std::vector<float> xpre{-6.0f, 6.0f, 6.0f};
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, emb, proj, 0.5f, B, H, R) == 0);
+}
+
+TEST_CASE("W-4b: the markov embedding half of the input is LOAD-BEARING") {
+  // The projection reads `cat(xpre, markov_emb)`. If only the hidden half were
+  // consumed the head would be blind to which token the chain actually sampled.
+  const int64_t B = 1, H = 1, R = 1;
+  const std::vector<float> xpre{0.0f};
+  const std::vector<float> proj{1.0f, 4.0f};  // all the signal is in the emb half
+  const std::vector<float> hot{2.0f};   // 8.0 -> confident
+  const std::vector<float> cold{-2.0f}; // -8.0 -> not
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, hot, proj, 0.5f, B, H, R) == 1);
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, cold, proj, 0.5f, B, H, R) == 0);
+}
+
+TEST_CASE("W-4b: the threshold is applied to SIGMOID(conf), not to conf") {
+  // conf = 0.4 is below a 0.5 threshold as a raw logit but sigmoid(0.4) = 0.599,
+  // which is above it. Comparing the raw logit would truncate healthy drafts.
+  const int64_t B = 1, H = 1, R = 1;
+  const std::vector<float> proj{1.0f, 0.0f};
+  const std::vector<float> emb{0.0f};
+  const std::vector<float> xpre{0.4f};
+  CHECK(vllm::dspark::ConfidenceDraftLength(xpre, emb, proj, 0.5f, B, H, R) == 1);
+}
+
+TEST_CASE("W-4b: a projection sized for the hidden half alone REFUSES") {
+  const int64_t B = 1, H = 2, R = 2;
+  const std::vector<float> xpre{1.0f, 1.0f};
+  const std::vector<float> emb{1.0f, 1.0f};
+  const std::vector<float> short_proj{1.0f, 1.0f};  // H only, missing the rank half
+  CHECK_THROWS(
+      vllm::dspark::ConfidenceDraftLength(xpre, emb, short_proj, 0.5f, B, H, R));
+}

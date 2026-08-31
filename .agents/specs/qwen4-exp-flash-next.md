@@ -3898,6 +3898,69 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **W8CONFIRM ISOLATED THE CAUSE TO W5r's TWO LINES, WHICH W5s ASSERTED BUT ITS
+  EVIDENCE COULD NOT SEPARATE FROM W5p. ISSUE OWED.** W5s compares W7DIAG on
+  `701606e51` against itself on `52f7ccbfc`; that span contains W5p **and** W5r,
+  so it cannot apportion the repair, and its `VT_CPU_QUANT_REPACK=0` arm returns
+  no signal at all because with the fix present both arms are correct and come
+  back bit-identical. W8CONFIRM builds TWO binaries from ONE tarball of
+  `52f7ccbfc` differing only in `dense_attn_block.h:235-236`, runs both against
+  ONE staged copy in ONE lease, and gets `X-ON` (fix reverted, repack ON)
+  `"!!!!!!!!!!!!!!!!"` against `X-OFF` (same binary, repack OFF) and both `M`
+  arms coherent. Same binary either side of one environment variable, so the
+  defect needs the chain ACTIVE and the markers DROPPED; W5p is in all four arms
+  and cannot explain a difference between them. See
+  `## Mutation record — W8CONFIRM`. **What is still owed:** W8CONFIRM's own
+  issue, unfilable because the `gh` token is invalid on this host (`gh api user`
+  is 403) while `git push` over SSH works.
+
+- **THE DISCRIMINATOR THIS SECTION PRESCRIBES IS UNDER-SPECIFIED, AND IT WAS RUN
+  IN THE ONE CONFIGURATION WHERE IT CANNOT DISCRIMINATE.** The W5r entry below
+  says "re-run W5q's exact request on a `thor` lease with
+  `VT_CPU_QUANT_REPACK=0` ... If the output stops being constant, this was it."
+  That test only has signal on the PRE-FIX tree, where arm A is still degenerate.
+  Run on a tree that already carries W5r — which is what W5s did — neither arm is
+  constant, the premise never holds, and A ≡ B is a confirmation of the
+  performance-transform invariant rather than evidence about the cause. The
+  prescription should have named the TREE as well as the flag. Recorded because
+  the next person to reach for a one-flag A/B on a fixed tree will get a
+  confident null result, which is the failure mode this file exists to prevent.
+
+- **`docs/USAGE.md` OWES A WEIGHTS ROW FOR THIS ARM, AND IT IS NOW DUE.** The
+  spec has said the row lands "in the same change that makes an arm SERVE".
+  W5s and W8CONFIRM together make it serve coherently on `--device cpu`, so
+  AGENTS.md "Say which weights, and from where" is now live for
+  `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S: file names, 67.564 GiB over three
+  shards, shard1 sha256
+  `88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd`, and the
+  refused arms beside it. Neither wave lands product code, so neither carries it;
+  it is owed by the next wave that touches this arm.
+
+- **THE `q8_0_aligned` MARKER IS STILL DROPPED BY THE SHARED HELPER, AND
+  W8CONFIRM DOES NOT CHANGE THAT.** It is read only in
+  `src/vt/cuda/cuda_quant_dot.cu`, so it is inert on every `--device cpu` arm
+  measured here and none of these four arms can see it. The CPU GEMM keys on
+  `b.repacked` alone (`cpu_quant_gemm.cpp:156`), which is why the two lines W5r
+  restored were sufficient for this path and are NOT sufficient evidence for the
+  device path. Unchanged from W5r's own entry; restated because a reader who sees
+  "the cause is isolated" could conclude the marker family is closed.
+
+- **A JOB THAT PRINTS `cleanup done` CAN STILL HOLD THE FLEET DEVICE, AND THE
+  LAG IS NOT ALWAYS THE HANG.** W5s printed every terminal marker, went
+  byte-static, and `rc` still listed it running until an operator killed it;
+  thor then picked up the next job in 14 s. W8CONFIRM printed `cleanup done` at
+  06:52:24 and `rc devices` still showed it busy at 06:54:11, then released on
+  its own — roughly 110 s of teardown lag with no intervention. The two look
+  identical for the first two minutes, so "still listed" is not by itself the
+  known hang. **AND BYTE-STATIC OUTPUT DOES NOT SEPARATE THEM EITHER**, which is
+  the trap worth writing down: a job in ordinary teardown has ALSO stopped
+  writing, so the check that feels like proof is necessary and not sufficient. It
+  rules out "still working"; it does not rule in "hung". W8CONFIRM was called a
+  fourth occurrence of the hang on exactly that reasoning and it was wrong — the
+  device released itself ~110 s later with no intervention. Confirm byte-static,
+  then WAIT past two minutes, and never kill another session's job on the
+  strength of the listing alone.
+
 - **W5s SETTLED THE ROW'S BLOCKER: THE RELEASED CHECKPOINT NOW EMITS REAL
   TOKENS, AND THE CAUSE WAS W5r's DROPPED REPACK MARKER. ISSUE OWED.** On
   `origin/main` `52f7ccbfc` — W5p *and* W5r — the artifact answers two different
@@ -7111,7 +7174,7 @@ is a degenerate forward — eight id-0 tokens, byte-identical across two prompts
 That did not weaken W5p's claim, and W5p's claim never covered it: the op-level
 and miniature gates say nothing about the values the released geometry produces.
 
-**W5s THEN IDENTIFIED THE CAUSE, AND IT WAS NOT W5p's.** The composed tree W5q
+**W5s NAMED THE CAUSE AND W8CONFIRM ISOLATED IT.** The composed tree W5q
 ran predates W5r, so on `thor` — aarch64 i8mm, where
 `vt::cpu::QuantRepackActive()` is TRUE — the shared `dense_attn::ResidentWeight`
 was still dropping the repack marker and `kMatmulBTQuant` was reading
@@ -7119,7 +7182,106 @@ was still dropping the repack marker and `kMatmulBTQuant` was reading
 produced a NaN in layer 0 which propagated to an all-zero logit row, and `argmax`
 over a row with no maximum returns index 0. On `origin/main` `52f7ccbfc`, which
 carries W5r, the same artifact on the same box answers `" Paris. Given this
-fact, what is"` and `" 100°C at sea level"`. See the W5s entry under `## Owed`.
+fact, what is"` and `" 100°C at sea level"`. **W5s ASSERTED W5r WAS THE CAUSE ON
+EVIDENCE THAT COULD NOT SEPARATE IT FROM W5p**, because its comparison spans
+`701606e51` to `52f7ccbfc` and both commits land inside it. W8CONFIRM closes
+that by building two binaries from ONE `52f7ccbfc` tarball differing only in
+W5r's two lines: with them deleted the SAME tree returns
+`"!!!!!!!!!!!!!!!!"` again, and disabling the repack chain on that same
+defective binary restores coherent output. See the W5s and W8CONFIRM entries
+under `## Owed`.
+
+## Mutation record — W8CONFIRM (#2031, issue OWED)
+
+W5s answered "does the released artifact emit real tokens on `origin/main`" and
+answered it correctly. It did NOT isolate WHICH commit repaired it, and its own
+row says it did. This wave supplies the isolation, on one tree, in one job.
+
+**THE GAP, STATED PRECISELY.** W5s compares W7DIAG's probe on `701606e51`
+against its own run on `52f7ccbfc`. That base predates W5p **and** W5r, so the
+comparison spans two commits and cannot apportion the repair between them. Its
+own `VT_CPU_QUANT_REPACK=0` arm cannot close the gap either: with the marker fix
+present, BOTH arms are correct, so A and B come back bit-identical and the
+comparison has no signal at all. The discriminator prescribed under `## Owed`
+("re-run with `VT_CPU_QUANT_REPACK=0`; if the output stops being constant, this
+was it") only discriminates on the PRE-FIX tree. Run on the fixed tree it
+confirms an invariant; it decides nothing.
+
+**THE SQUARE.** One source tarball (sha256
+`64f068d662aa6ea59a889c835584329e8ec94e7abc6f73383a95b42ceb83892d`, `git archive`
+of `52f7ccbfc`), one staged copy of the artifact, one compiler, TWO binaries that
+differ in exactly the two lines `7a937db8a` added at
+`dense_attn_block.h:235-236`:
+
+| Arm | Binary | Env | Completion for `The capital of France is` |
+|---|---|---|---|
+| `M-ON` | `e18a38a6…` (main) | default, repack ON | `" Paris. Given this fact, what is the capital of France?\n\n<think>\n"` |
+| `M-OFF` | `e18a38a6…` (main) | `VT_CPU_QUANT_REPACK=0` | identical to `M-ON` |
+| `X-ON` | `cfdf47bd…` (reverted) | default, repack ON | **`"!!!!!!!!!!!!!!!!"`** — 16 tokens of id 0 |
+| `X-OFF` | `cfdf47bd…` (reverted) | `VT_CPU_QUANT_REPACK=0` | identical to `M-ON` |
+
+`X-ON` degenerate AND `X-OFF` coherent is the only combination that isolates the
+marker drop. Both X arms are the SAME binary and differ by one environment
+variable, so the defect requires the repack chain ACTIVE and the markers
+DROPPED. That excludes the repack itself, because `X-OFF` runs the defective
+binary with the chain off and is bit-identical to `M-ON` at every probe stage.
+It also excludes W5p's `IsBlockQuant` fork, which is present in all four arms and
+therefore cannot explain a difference between them.
+
+**THE APPLIED-PROOF IS THE LINE COUNT AND THE LINK, NOT THE PATCH RC.** A
+mutation that never applied reads as a surviving one. Recorded: `mutation patch
+rc=0`, fix lines `2 -> 0` counted in the compiled source, `ninja[mutated] rc=0`
+rebuilding 35 of 530 TUs (the `dense_attn_block.h` dependents), and the two
+binary sha256s DIFFERENT. The job aborts the causal arms by name if the count is
+not 2 then 0, if the patch fails, or if the two hashes match.
+
+**THE STAGE WHERE IT DIES, ON ONE TREE.** `M-ON` and `X-ON` are numerically
+identical through the embedding and diverge totally at the first layer:
+
+| Stage | `M-ON` | `X-ON` |
+|---|---|---|
+| `embed` | `nan=0 l2=0.473868` | `nan=0 l2=0.473868` |
+| `stream.after_widen` | `nan=0 l2=0.947736` | `nan=0 l2=0.947736` |
+| `stream.after_layer_0` | `nan=0 l2=3.66967` | `nan=51200` (all), `l2=0` |
+| `LOGITS` | `zero=0`, argmax `[11751] 15.7873` | `zero=248320`, all `0`, argmax `[0]` |
+
+Every later stage stays all-NaN through `after_layer_47` and
+`hidden.after_mixer_collapse`; the Q4_K head quantizes NaN to zero, which is why
+248,320 logits tie at exactly `0` and `argmax` returns index 0 = `!`. `X-ON`
+reproduces `nan=51200` — the SAME figure W5s cites for the pre-fix tree — on a
+binary deliberately mutated for this purpose, which corroborates both runs.
+
+**FOUR MORE PROMPTS, because one prompt cannot separate a fluent model from a
+lucky one.** `M-ON` at 16/12/12/12 tokens, greedy:
+
+| Prompt | Completion | `finish_reason` |
+|---|---|---|
+| `The capital of France is` | `" Paris. Given this fact, what is the capital of France?\n\n<think>\n"` | length |
+| `Once upon a time, in a small village` | `", there was a young boy named Tom. Tom was a"` | length |
+| `def fibonacci(n):` | `"\n    if n <= 1:\n        return n"` | length |
+| `Question: What is the largest planet in our solar system? Answer:` | `" Jupiter."` | **stop** |
+
+Four domains, four correct answers. The code arm is well-formed Python with the
+correct base case, and the Jupiter arm ends on the model's own EOS at 3 tokens
+rather than the cap — a constant-token path always hits `length` and can never
+produce a natural stop.
+
+**MEASUREMENTS.** `thor:gpu0`, worker `rc-worker-n8smh`, aarch64, 14 cores,
+`i8mm` present so `QuantRepackActive()` is true. Staging 2448 s for 67.564 GiB
+CIFS to worker-local, shard1 sha256 `88a14208…` verified against the pin. Build 1
+`rc=0` in 434 s over 530 TUs; build 2 `rc=0` in 61 s over 35. Loads 41 s cold,
+then 20 s warm. `VmHWM` 77,684,708 kB (`M-ON`), 76,842,172 kB (`M-OFF`),
+77,646,824 kB (`X-ON`), 76,842,100 kB (`X-OFF`). Probe live at 2376 lines
+(`M-ON`) and 864 (each other arm); a zero there would have made every reading
+VOID.
+
+**WHAT THIS DOES NOT CLAIM.** It is not a token gate: no oracle decoded these
+four prompts, and the recorded llama.cpp reading covers only the first one.
+Different-but-coherent text was the accepted bar, and this is a 1.6-bit quant.
+No speed number: every arm is n=1 on a shared box. UD-IQ1_S only, one sequence,
+`--device cpu` only. `logprobs` VALUES were again all `null`, which W5s correctly
+attributes to the `step == nullptr` branch of `BuildCompletionLogProbs`; nothing
+here reads them.
 
 ## Now
 
@@ -7174,8 +7336,9 @@ a row here, and every row says whether anything in production reaches it:
 | W6-CUDA | the first CUDA arms of this architecture: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpGatedResidualWriteBack` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and four ops plus `vt::RmsNormGroup` plus the block-decoding n-gram gather still have no CUDA arm, so no `qwen4_exp` step can reach a CUDA queue at all. The gate RAN on TWO architectures. `thor:gpu0` (`sm_110`, nvcc 13.0.88): 12 cases, 323 assertions, 322 passing, with the CPU arms matched BITWISE at 0 of 8772, 0 of 20480 and 0 across all 30 dtype combinations; 5 of 6 mutations red and M5 a compiler proof. The single failure was this suite's OWN oracle bound, which was re-derived and bitwise-backstopped. `dgx:gpu0` (`sm_121a`, GB10, nvcc 13.0.88) then ran the corrected suite green: 12 cases, 351 assertions, 351 passing, every rc READ rather than derived, and `cuobjdump` reporting `cuda_qwen4_exp_ple.cu.1.sm_121a.cubin` so the objects are genuinely built for that architecture. The two runs' mutation counts agree. Full result in the W6-CUDA section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA's own issue OWED |
 | W5-LOADIO | `VT_LOAD_STATS` reports on the GGUF branch, and `PrefaultBorrowedSpan` counts BYTES rather than only spans | **yes** — the timing and `ReportGgufLoadIo` sit on the `.gguf` branch of `LoadedEngine::FromModelDir`, the production loader entry point, so `VT_LOAD_STATS=1` on any GGUF model now prints `mmap+header`, `weights` and the prefault's bytes/seconds where it previously printed NOTHING. It deliberately does NOT call `ReportLoadBytes`, whose three counters are incremented on the safetensors path only and would print zeros for an artifact the load had just moved 67.56 GiB of. Gated by a new case in `test_gguf_keep_quant.cpp` asserting an EQUALITY over a double load, because `> 0` is satisfied by a counter wired to the span count, to a constant, or to the last span alone | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), its own issue OWED |
 | W5q | the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact driven through `examples/server` on the COMPOSED W5p+LOAD-IO tree, staged to worker-local disk | **SERVES yes, USABLE TOKEN no** — the W5n refusal is gone: a 5-token prefill and eight decode steps run with `model_executed=1` each, nothing throws, and `POST /v1/completions` returns **HTTP 200** with 8 completion tokens where W5n got a 500. **Every one of those tokens is id 0**, which this checkpoint's own `tokenizer.ggml.tokens` gives as `!`, and the answer is BYTE-IDENTICAL for two prompts of different lengths. So the forward is degenerate and prompt-independent on the real weights. Load 61 s from local disk (against 4446 s from CIFS), `VmHWM` 73.935 GiB, gate 72 cases / 10,380 assertions / 0 failed / 0 skipped with the oracle golden unmoved at `0.00982457`. **The CAUSE is NOT identified**: `logprobs` was not requested, so nothing distinguishes NaN, zero and constant logits, and no per-op probe was run | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5q's own issue OWED |
-| W5r | the shared `dense_attn::ResidentWeight` stops dropping the load-time repack markers (`repacked`, `elem_kn_repacked`), and refuses to stage an `elem_kn_repacked` weight to a device | **yes, and W5s PROVED IT IS THE FIX** — `dense_attn_block.h:235-236` sits on the path `qwen4_exp_forward.cpp` takes for every hyper-connection mix weight, so on an aarch64 i8mm host the mixer stops reading `block_q8_0x4` bytes as flat `q8_0` across 48 layers x 2 sides plus the terminal mixer. W5r itself could neither run nor gate this: it was CPU-only on x86, where `vt::cpu::QuantRepackActive()` is false (`cpu_quant_repack_arm.cpp:275`) and the whole chain is inert, so its gate sets the flag BY HAND and asserts propagation. **W5s ran it on `thor`, where the chain is live** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5r's own issue OWED |
+| W5r | the shared `dense_attn::ResidentWeight` stops dropping the load-time repack markers (`repacked`, `elem_kn_repacked`), and refuses to stage an `elem_kn_repacked` weight to a device | **yes, and W8CONFIRM PROVED IT IS THE FIX** (W5s asserted it; its `701606e51`-vs-`52f7ccbfc` comparison spans W5p too and cannot apportion) — `dense_attn_block.h:235-236` sits on the path `qwen4_exp_forward.cpp` takes for every hyper-connection mix weight, so on an aarch64 i8mm host the mixer stops reading `block_q8_0x4` bytes as flat `q8_0` across 48 layers x 2 sides plus the terminal mixer. W5r itself could neither run nor gate this: it was CPU-only on x86, where `vt::cpu::QuantRepackActive()` is false (`cpu_quant_repack_arm.cpp:275`) and the whole chain is inert, so its gate sets the flag BY HAND and asserts propagation. **W5s ran it on `thor`, where the chain is live** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5r's own issue OWED |
 | W5s | the RELEASED UD-IQ1_S artifact re-driven on `origin/main` `52f7ccbfc` (W5p **and** W5r), four arms, one build, one staged copy | **SERVES yes, and the TOKENS ARE REAL** — `" Paris. Given this fact, what is"` and `" 100°C at sea level"` for two different prompts, eight distinct ids none of them 0, against W5q's eight consecutive id 0 on the same box and artifact. Reusing W7DIAG's read-only probe, the pre-W5r tree and this one agree numerically on `embed` and `after_widen` and diverge at exactly `stream.after_layer_0` (`nan=51200` -> `nan=0`); `LOGITS` was `zero=248320` with no maximum and is now `min -9.89818 max 15.7873`, argmax id 11751 = the `" Paris"` token. `VT_CPU_QUANT_REPACK=0` is byte-identical to the default, which is the correct outcome for a performance transform and the thing that was false before W5r. **NOT a token gate** (no oracle decoded these prompts; llama.cpp aborts in `build_delta_net_chunking`), no speed number, UD-IQ1_S only, one sequence. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5s's own issue OWED |
+| W8CONFIRM | the SAME artifact on the SAME `52f7ccbfc` tarball, TWO binaries differing only in `dense_attn_block.h:235-236`, four arms in one lease | **CAUSE ISOLATED** — `X-ON` (fix reverted, repack ON) returns `"!!!!!!!!!!!!!!!!"` with `LOGITS zero=248320` and `after_layer_0 nan=51200`, while `X-OFF` (same binary, repack OFF) and both `M` arms return `" Paris. Given this fact, what is the capital of France?\n\n<think>\n"` bit-identically. Same binary either side of one environment variable, so the defect needs the repack chain ACTIVE and the markers DROPPED; W5p is in all four arms and cannot explain a difference between them. Four prompts across factual, narrative and code, all correct, one ending on the model's own EOS. Binaries `e18a38a6…` vs `cfdf47bd…`, mutation applied-proof `2 -> 0` fix lines. **NOT a token gate**, n=1, UD-IQ1_S only, `--device cpu` only. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W8CONFIRM's own issue OWED |
 
 Every `no` in that column has a named `## Owed` entry under AGENTS.md "Nothing
 lands dead", and the qualified `yes` rows say what they reach rather than

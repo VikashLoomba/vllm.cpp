@@ -541,8 +541,13 @@ enum class OpId : uint8_t {
   //     too, saying so: "We cannot use the usual functions/kernels here for the
   //     short conv as the conv1d has dilation".
   //
-  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_ple.cpp). The CUDA arm is
-  // OWED, not written: it cannot be gated on a CPU-only host.
+  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp) and, since W6-CUDA,
+  // on kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu). The device arm inherits this
+  // kernel's DOUBLE four-tap accumulator rather than choosing a width of its
+  // own, reads `query_start_loc` and `conv_state_indices` on the DEVICE, and is
+  // gated against the same lane-pinned transformers goldens at all three
+  // dilations (tests/vllm/models/test_qwen4_exp_cuda.cpp). No other device is
+  // registered, so the dispatcher still refuses those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleConv,
   // MODEL-MM-QWEN4-EXP W5b (#2031) — the Qwen4-Exp 4-branch GATED-RESIDUAL
@@ -567,9 +572,16 @@ enum class OpId : uint8_t {
   // precedent for an architecture's hyper-connection glue as one OpId.
   //
   // Registered on kCPU (cpu_qwen4_exp.cpp) and gated bit-comparably against the
-  // lane-pinned transformers goldens. The CUDA arm is OWED, not written: it
-  // cannot be gated on a CPU host, and the spec records the reduction-width
-  // decision it has to make first.
+  // lane-pinned transformers goldens. THE TWO OPS BELOW NOW DIFFER ON DEVICE
+  // COVERAGE, and the difference is the reduction: `kQwen4ExpGatedResidual`
+  // carries a grouped RMS norm whose sum of squares this kernel accumulates in
+  // DOUBLE, so its CUDA arm is still OWED, not written — the spec records the
+  // reduction-width decision it has to make first, with a measured 571x
+  // separation from an f32 block reduction at group size 2560.
+  // `kQwen4ExpGatedResidualWriteBack` has NO reduction at all, so W6-CUDA gave
+  // it a kCUDA arm (src/vt/cuda/cuda_qwen4_exp.cu) that is BYTE-IDENTICAL to
+  // this one — `__fmul_rn`/`__fadd_rn` against the host's `-ffp-contract=off` —
+  // and therefore meets these goldens by exactly the margin this kernel does.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpGatedResidual,
   kQwen4ExpGatedResidualWriteBack,
@@ -705,10 +717,13 @@ enum class OpId : uint8_t {
   // `0.5 * value`. The kernel tests `isnan` first. `+/-inf` and `+/-0.0` need
   // no guard and get none; they already match the pin term for term.
   //
-  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_ple.cpp). The CUDA arm is
-  // OWED, not written: it cannot be gated on a CPU-only host, and an ungated
-  // kernel is worse than an absent one — the call W5b-3, W5b-4 and W5d-1 made.
-  // A CUDA arm inherits the NaN obligation above and owes its own case for it.
+  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp) and, since W6-CUDA,
+  // on kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu). THE NaN OBLIGATION ABOVE IS
+  // DISCHARGED ON BOTH ARMS: the device kernel tests `isnan` first for the same
+  // reason, and `tests/vllm/models/test_qwen4_exp_cuda.cpp` carries the case
+  // that separates a NaN from the plausible `0.5 * value` a missing guard
+  // returns. No other device is registered, so the dispatcher still refuses
+  // those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleGate,
   kCount
@@ -3823,6 +3838,21 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // this reduction and meet the same bound; the spec records that choice as owed.
 // Tensors may be f32 or bf16 (widen on load, round once on store), mirroring
 // upstream's `_norm(x.float())` ... `.type_as(x)`.
+//
+// EXCEPT THE THREE PROJECTIONS, WHICH MAY KEEP THE FILE'S BLOCKS (W5p, #2031).
+// `mix_down`, `mix_up` and `block_inject` also accept a block-quantized `[N,K]`
+// dtype, and the kernel then routes that projection through `vt::MatmulBT`,
+// which dispatches `kMatmulBTQuant`. The released
+// `unsloth/Qwen3.8-Flash-Next-GGUF` stores all 194 of these mix weights as Q8_0
+// and cannot prefill otherwise. `hyper`, `hc_norm_w`, `mixed` and `injection`
+// stay float and a block-typed one is refused BY NAME: the gamma is an
+// ELEMENTWISE multiplicand, which is the split llama.cpp makes for this same
+// architecture -- six projections declared `GGML_OP_MUL_MAT`
+// (`src/llama-arch.cpp:759,760,761,763,764,765` at `6c84c7d5d`) against
+// `GGML_OP_MUL` for `hc_*_norm` (`:758`, `:762`), with an explicit f32 cast
+// where a file-typed weight of this architecture meets an elementwise multiply
+// (`src/models/qwen4exp.cpp:1198-1202`). A float weight is bit-identical to
+// before: it keeps the same scalar accumulation in the same index order.
 void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Tensor& hyper,
                            const Tensor& hc_norm_w, const Tensor& mix_down,
                            const Tensor& mix_up, const Tensor* block_inject,

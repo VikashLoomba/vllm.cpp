@@ -73,10 +73,22 @@
 // projections, the per-head norms, the RoPE, the indexer, the output gate,
 // `o_proj` — is one copy.
 //
-// STILL CONTIGUOUS, AND STILL OWED: the INDEXER side cache. That is KV group 2,
-// an `MLAAttentionSpec` whose block table W5c-2 now gathers (#2249 item 3), so
-// the MAP into its pages reaches a forward while the paged STORE below is still
-// a separate `## Owed` entry. This wave closed item 2 and did not close item 3.
+// ─── W5i (#2249 item 3): THE INDEXER SIDE CACHE IS PAGED TOO ─────────────────
+// W5d-3 left one cache shape behind: the QSA indexer side cache, KV group 2, an
+// `MLAAttentionSpec` whose block table W5c-2 gathers. The MAP reached a forward
+// while the STORE and the READ still demanded a contiguous `[max_kv, D]` buffer
+// indexed by absolute position, so even with W5h's geometry fix the forward could
+// not address what the engine allocates. W5i closes that with NO NEW OP: the
+// store scatters through `vt::IndexCopy` and the read gathers through
+// `vt::IndexSelect`, both at physical slots resolved from group 2's own block
+// table. `Qwen4ExpQsaIndex`'s contract is UNCHANGED — it still takes a
+// contiguous `[rows, D]` — because the gather is what hands it one.
+//
+// WHAT IS STILL NOT CLOSED, AND WHO OWNS IT. The engine's group-2 buffer does not
+// REACH this block yet: `ModelRegistry::Forward` refuses `multi_kv` by name
+// (#2353), so the registry hook hands a per-call scratch in the same paged shape
+// and with the same translation. Lifting that refusal is W5j's, and #2353 records
+// why it must not be lifted here. The spec's `## Owed` carries both.
 #ifndef VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_QSA_BLOCK_H_
 #define VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_QSA_BLOCK_H_
 
@@ -94,10 +106,10 @@ namespace vllm {
 // The per-sequence caches one QSA layer reads and writes. CONTIGUOUS, not paged,
 // and that is a scope statement rather than a design preference: both `vt::` ops
 // this block drives address their caches as flat `[rows, …]` arrays and never
-// read `stride[0]` (see `Qwen4ExpQsaGatherAttention`'s own contract), and the KV
-// group that would make them paged is blocked behind the runner work in
-// [#2131](https://github.com/mudler/vllm.cpp/issues/2131). The paged store is
-// listed under `## Owed`.
+// read `stride[0]` (see `Qwen4ExpQsaGatherAttention`'s own contract). This arm is
+// what a caller that owns its own flat buffers uses; the arm that serves what the
+// ENGINE allocates is `Qwen4ExpQsaPagedCaches` below, and since W5i that includes
+// the indexer side cache.
 //
 // `key`/`value` hold the RAW model K/V — what upstream's `past_key_values.update`
 // returns — and `index_key` holds the RAW, UN-normed and UN-roped indexer keys,
@@ -133,15 +145,48 @@ struct Qwen4ExpQsaCaches {
 // arm takes one. A ragged multi-request batch needs `query_start_loc` plumbing
 // this block does not carry; the spec's `## Owed` records it.
 //
-// `index_key` is the QSA INDEXER side cache and it is STILL CONTIGUOUS
-// `[max_kv, indexer_head_dim]`. That is KV group 2, whose block table the runner
-// now gathers (#2249 item 3, W5c-2); its paged STORE is its own `## Owed` entry
-// and is deliberately not smuggled in here.
+// `index_key` is the QSA INDEXER side cache, and W5i makes it PAGED too
+// (#2249 item 3). It is KV GROUP 2 — its own `MLAAttentionSpec`, its own
+// physical page pool, and therefore its OWN block table, which is why
+// `index_block_table` is a second field rather than a reuse of `block_table`
+// above. Group 0 and group 2 are allocated from separate pools; a body that read
+// one group's cache through the other group's map would return another
+// sequence's keys with no shape error.
+//
+// THE SHAPE IS THE RUNNER'S OWN. An `MLAAttentionSpec` group is allocated as the
+// FUSED 3-dim page `[num_pages, block_size, head_size]` — there is no K/V pair
+// and no factor 2 (`runner.cpp`, "the fused MLA 3-dim (num_blocks, block_size,
+// head_size) for an MLA group"; `MLAAttentionSpec::real_page_size_bytes`). Taking
+// that shape rather than `{ptr, num_pages, block_size}` is the same argument
+// `PagedKvCache` makes for itself: a geometry carried in the tensor cannot
+// disagree with the buffer it describes.
+//
+// Flattened, those pages are a CONTIGUOUS `[num_pages * block_size,
+// indexer_head_dim]` array of rows addressed by PHYSICAL SLOT, so the map from a
+// sequence's logical position `i` is the ordinary paged one,
+// `index_block_table[i / block_size] * block_size + i % block_size`. That is what
+// makes this addressable with `vt::IndexSelect` / `vt::IndexCopy` and no new op:
+// see `IndexerRows` in the .cpp for the translation and for what it costs.
+//
+// ONE ROW PER TOKEN, not one per `indexer_compress_ratio`. W5h established that
+// against upstream — `Cache.update_indexer` concatenates one raw key per token
+// (`cache_utils.py:350-351`, returning `[batch, total_len, index_head_dim]`) and
+// the ratio is the SELECTION algorithm's (`modeling_qwen4_exp.py:622`,
+// `block_topk = token_budget // compress_ratio`), never the page geometry — and
+// `MakeQwen4ExpKVCache` publishes the group at `compress_ratio = 1` because of
+// it. The page size therefore needs NO relationship to the compress ratio: the
+// gather below linearises the visible prefix before `vt::Qwen4ExpQsaCompress`
+// sees it, so a compress block that straddles two pages costs nothing and is not
+// refused. (The K/V group's `block_size % CR == 0` requirement above is a
+// different one, and it stays: that consumer resolves a selected block through
+// the page table itself.)
 struct Qwen4ExpQsaPagedCaches {
-  PagedKvCache kv;           // the runner's paged K+V for THIS layer  READ-WRITE
-  vt::Tensor block_table;    // i32 [1, max_pages]  logical page -> physical page
-  vt::Tensor slot_mapping;   // i64 [T]             this step's destination slots
-  vt::Tensor index_key;      // [max_kv, indexer_head_dim]  CONTIGUOUS, READ-WRITE
+  PagedKvCache kv;         // the runner's paged K+V for THIS layer  READ-WRITE
+  vt::Tensor block_table;  // i32 [1, max_pages]  group 0: logical -> physical page
+  vt::Tensor slot_mapping; // i64 [T]             this step's destination K/V slots
+  // GROUP 2, the indexer side cache. [num_pages, block_size, indexer_head_dim].
+  vt::Tensor index_key;           // READ-WRITE
+  vt::Tensor index_block_table;   // i32 [1, max_pages]  group 2's OWN page map
 };
 
 // Owning device-resident output of one QSA block: a [T, hidden_size] view plus
@@ -174,11 +219,14 @@ struct Qwen4ExpQsaSelection {
 //
 //   q_index    [T, index_n_heads, index_head_dim]  the indexer query, ALREADY
 //              q-layernormed and roped by the caller (the block below does it)
-//   index_key  rows [0, kv_len) of the [max_kv, indexer_head_dim] side cache:
-//              the raw indexer keys, UN-normed and UN-roped. THE TENSOR, not the
-//              cache struct: this function reads nothing else from it, and W5d-3
-//              gave the K/V two shapes while the side cache kept one, so taking
-//              the struct would mean handing it one with two dead fields
+//   index_key  a CONTIGUOUS [rows, indexer_head_dim] with the sequence's raw
+//              indexer keys at logical positions [0, rows), rows >= kv_len:
+//              UN-normed and UN-roped. THE TENSOR, not the cache struct, and it
+//              stays contiguous after W5i made the side cache paged — the paged
+//              arm GATHERS the visible prefix into one before calling this, so
+//              this function never resolves a page and the two cache arms hand it
+//              the same thing. Taking the struct would mean handing it one with
+//              three dead fields
 //   k_norm_w   [index_head_dim]  the RAW HuggingFace gamma; the compressor
 //              applies `(1.0 + w)` itself, mirroring `Qwen4ExpTextRMSNorm`
 //   cos/sin    [>= kv_len, rotary_dim] f32 FULL-position tables; the compressor
@@ -188,8 +236,11 @@ struct Qwen4ExpQsaSelection {
 //              surface. Two of the four settings cannot be seen any other way;
 //              see the header comment. `nullptr` on the production path.
 //
-// The block-key scratch is allocated per call and dropped; a wave that gives QSA
-// a real KV-cache group turns it into the side cache's paged store.
+// The POOLED-block-key scratch is allocated per call and dropped, which mirrors
+// upstream exactly: `Qwen4ExpTextQSAIndexer.forward` rebuilds its `pooled_keys`
+// from `raw_keys` on every step and caches none of them
+// (`modeling_qwen4_exp.py:679-682`). It is the RAW key that is cached, and that
+// cache is the side cache this function reads.
 Qwen4ExpQsaSelection Qwen4ExpQsaIndex(dense_attn::Dev d, const Qwen4ExpQsaParams& qsa,
                                       float rms_norm_eps, const vt::Tensor& q_index,
                                       const vt::Tensor& index_key, const vt::Tensor& k_norm_w,

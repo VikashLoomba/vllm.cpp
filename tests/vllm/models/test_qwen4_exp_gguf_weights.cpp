@@ -909,3 +909,66 @@ TEST_CASE("qwen4_exp GGUF: a non-negative ssm_a refuses rather than making a NaN
   CHECK(msg.find("ssm_a") != std::string::npos);
   CHECK(msg.find("must be negative") != std::string::npos);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W5p (#2031) — the MIX weights keep their blocks, and the op has to take them.
+//
+// The released `unsloth/Qwen3.8-Flash-Next-GGUF` stores all 194 hyper-connection
+// mix weights as Q8_0. This case is the LOADER half of that: under the
+// production policy, `blk.N.hc_*_down` and `blk.N.hc_*_inject` arrive at
+// `vt::Qwen4ExpGatedResidual` as block-typed `[N, K]` GEMM operands, not as
+// expanded bf16. It is what makes the op-level Q8_0 gate in
+// `test_qwen4_exp_hc_device.cpp` a statement about this model rather than about
+// an isolated op, and it is the assertion that a "dequantize the mix weights at
+// load" workaround would fail.
+//
+// `hc_*_up` is F32 in the fixture BY NECESSITY, not by choice: its fastest dim
+// is the low-rank, 8 here, and ggml forbids a quantized tensor whose fastest dim
+// is not a whole 32-element block. The released config's low-rank is 320 and has
+// no such problem. `hc_*_norm` is F32 BY POLICY — it is an elementwise
+// multiplicand (llama.cpp `src/llama-arch.cpp:758,762` declares it
+// `GGML_OP_MUL`, against `GGML_OP_MUL_MAT` for all six projections at
+// `:759,760,761,763,764,765`), and the op refuses a block-typed one by name.
+TEST_CASE("qwen4_exp GGUF: the hyper-connection MIX weights keep their blocks") {
+  FixtureOpts o;
+  o.hc_mix_q8_0 = true;
+  TempFile f(BuildFixture(o));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
+
+  // THE FILE FIRST. A fixture option that silently wrote F32 anyway would make
+  // every assertion below a statement about the default arm.
+  CHECK(g.Get("blk.0.hc_attn_down.weight").ggml_type == 8);
+  CHECK(g.Get("blk.0.hc_attn_inject.weight").ggml_type == 8);
+  CHECK(g.Get("output_hc_down.weight").ggml_type == 8);
+  CHECK(g.Get("blk.0.hc_attn_up.weight").ggml_type == 0);
+  CHECK(g.Get("blk.0.hc_attn_norm.weight").ggml_type == 0);
+
+  vllm::GgufLoadPolicy pol = vllm::GgufLoadPolicy::FromEnv();
+  pol.keep_quant = true;
+  const vllm::Qwen4ExpWeights w =
+      vllm::LoadQwen4ExpFromGguf(g, cfg, vt::DeviceType::kCPU, &pol);
+
+  for (int64_t l = 0; l < kLayers; ++l) {
+    CAPTURE(l);
+    const auto& lw = w.layers[static_cast<size_t>(l)];
+    for (const auto* hc : {&lw.attn_hc, &lw.mlp_hc}) {
+      CHECK(hc->down.dtype == vt::DType::kQ8_0);
+      CHECK(ShapeOf(hc->down) == std::vector<int64_t>{kHcLowrank, kStream});
+      // `nk` is what routes an operand to `vt::MatmulBT`, which is where the
+      // block dtype is dispatched to the keep-quant GEMM.
+      CHECK(hc->down.nk);
+      REQUIRE(hc->has_inject);
+      CHECK(hc->inject.dtype == vt::DType::kQ8_0);
+      CHECK(ShapeOf(hc->inject) == std::vector<int64_t>{kHcCount, kStream});
+      CHECK(hc->inject.nk);
+      // The two operands that are NOT matmul operands, or cannot be encoded.
+      CHECK_FALSE(vt::IsBlockQuant(hc->up.dtype));
+      CHECK_FALSE(vt::IsBlockQuant(hc->hc_norm.dtype));
+    }
+  }
+  CHECK(w.mixer.down.dtype == vt::DType::kQ8_0);
+  CHECK_FALSE(w.mixer.has_inject);  // the `use_combine=False` model-level mixer
+  CHECK_FALSE(vt::IsBlockQuant(w.mixer.up.dtype));
+  CHECK_FALSE(vt::IsBlockQuant(w.mixer.hc_norm.dtype));
+}

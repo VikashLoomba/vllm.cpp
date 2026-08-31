@@ -243,12 +243,14 @@ re-run to 13/3087/rc 0.
 * **The rest of the tree's `CurrentPlatform()` readers.** This row fixes the
   GGUF residency path. A sweep for other load-time or config-time readers that
   should take the engine's resolved device is not done here and has no owner.
-* **The CUDA gather arm itself.** This row makes `--device cpu` reach the CPU
-  policy on a CUDA box. It does NOT give CUDA a block-decoding gather, so
-  `--device cuda` on `qwen4_exp` still refuses — correctly, and now with a
-  remedy the user can actually follow. That arm is `#2083`, and the sibling
-  CUDA wave's reachability mutation confirms its op arms sit behind this same
-  refusal.
+* ~~**The CUDA gather arm itself.**~~ CLOSED by
+  [#2396](https://github.com/mudler/vllm.cpp/pull/2396), which landed
+  `OpId::kEmbeddingQuant` and made `DeviceQuantGatherSupported` read the op
+  registry. `--device cuda` on `qwen4_exp` now loads on a build that links the
+  CUDA registrar, and [#2391](https://github.com/mudler/vllm.cpp/pull/2391)
+  landed the four op arms behind it. This row's contribution is unchanged and
+  still needed: it is what makes `--device cpu` reach the CPU policy on that
+  same box, which the gather flip does not address.
 
 ## Review
 
@@ -268,13 +270,23 @@ numbers byte-for-byte before doing so. What it changed:
   The tokenizer and the mmproj vision tower load between the two calls, so a
   post-growth `cudaStreamCreate` failure could have made one load bound as CUDA
   and routed as CPU. Now one resolution, carried.
-* **F3 — a silent collision with #2396.** The new gather cases re-encoded
-  "gather is CPU-only" as fact, in sites that merge cleanly with #2396 and stay
-  green on a GPU-less CI. Now expressed with `kMETAL`, which has no gather arm
-  in any build, plus a loop deriving its expectation from
-  `DeviceQuantGatherSupported`. `#2396`'s own `OpRegistered(kEmbeddingQuant, …)`
-  shape cannot be used here yet — that OpId does not exist on this branch — but
-  neither form collides with the other.
+* **F3 — a collision with #2396, which has since become a collision with
+  `main`.** The new gather cases re-encoded "gather is CPU-only" as fact, in
+  sites that merge cleanly and stay green on a GPU-less CI, so the red would
+  have landed unseen. #2396 has now merged, and the repair is in two parts.
+  Cases that only need a NON-GATHERING device use `kMETAL`, which registers no
+  gather in any build. Cases that are ABOUT CUDA ask the op table, mirroring
+  #2396's own pattern. Four assertions of this row's were falsified outright by
+  the flip — two in section (6) and two in section (7) of
+  `test_qwen4_exp_gguf_weights.cpp` — and every one of them was a hardcoded
+  verdict about a capability this row does not own.
+
+  **The merged expression was in neither branch.** #2396 asked the registry
+  about `platforms::CurrentPlatform()`, which was right when one device was
+  routed and it was the host's; this row routes a device parameter over three
+  devices. `gather_device_capable` and `gather_kept` now both ask
+  `OpRegistered(kEmbeddingQuant, kRouteDev)` — #2396's question, this row's
+  device.
 * **F5 — a sentence of this row's own was false**, and it named a real latent
   bug. See `## Owed` and #2406.
 * **F6 — `(expect_keep ? kept : expanded)++` counted the EXPECTATION**, so the

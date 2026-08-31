@@ -315,6 +315,24 @@ struct DeepseekV4Exl3Linear {
   std::vector<uint16_t> svh;      // [n], the fp16 bit patterns
   int32_t mcg = 0;                // codebook marker; never read at inference
                                   // (`exl3_lib/quantize.py:1414-1424`)
+
+  // ── DEVICE RESIDENCY (MODEL-DSV4-EXL3 W2, #2442) ──────────────────────────
+  // The three vectors above are HOST memory, and a device kernel cannot
+  // dereference them: that is why `Exl3Linear` and the fused MoE arm refused a
+  // non-CPU queue. `StageDeepseekV4Exl3LinearToDevice` uploads each one through
+  // the SHARED `dense_attn::ResidentWeight` seam and then frees the host
+  // vector, so only one tensor's host bytes are live at a time and the ~82 GiB
+  // tower is never resident twice.
+  //
+  // These are `OwnedTensor` rather than raw device pointers ON PURPOSE: that is
+  // the type `ResidentWeight` caches `d_dev` on, so this arm uploads through the
+  // same code every other model's weights do rather than a parallel uploader.
+  //
+  // `device_staged` is the ONE predicate the forward reads. When it is false the
+  // host vectors are authoritative (the CPU arm, and every synthetic fixture);
+  // when it is true they are EMPTY and only the device copies exist.
+  mutable OwnedTensor d_trellis, d_suh, d_svh;
+  mutable bool device_staged = false;
   int64_t Bytes() const {
     return static_cast<int64_t>((trellis.size() + suh.size() + svh.size()) *
                                 sizeof(uint16_t));

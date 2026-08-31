@@ -2322,6 +2322,47 @@ which is precisely how this landed green locally in the first place.
   Stage-then-release per tensor is what keeps the peak near the total rather than
   near twice it, which is why the interleaving in the Kimi helper matters and is
   not an implementation detail.
+
+  **IMPLEMENTED 2026-08-31.** `deepseek_v4_exl3_device.{h,cpp}` stages each
+  coalesced linear through `dense_attn::ResidentWeight` -- the same helper every
+  other model's weights go through, not a second uploader -- and frees the host
+  vector immediately after, so only one tensor's host bytes are live at a time.
+  `DeepseekV4Exl3Linear` gained `d_trellis/d_suh/d_svh` (`OwnedTensor`, which is
+  the type `ResidentWeight` memoizes `d_dev` on) and a `device_staged` predicate.
+  Both the per-expert `Exl3Linear` and the fused MoE arm gained device arms, and
+  the fused arm needed MORE than the weights: the nine per-expert POINTER TABLES,
+  the three routing arrays and the four temps were all host `std::vector`s
+  wearing the forward's device label, and the kernel indexes `g_tr[expert]` on
+  the device. The tables were the easier half to miss, being 216 int64s.
+
+  Staging is called from all three production EXL3 entries (`DeepseekV4ForwardExl3`,
+  `DeepseekV4ForwardExl3Paged`, `DeepseekV4Model::ForwardDevice`), because the
+  loader has no queue in hand and a forward is the first point at which the tower
+  and its device both exist.
+
+  **What is gated, and what is NOT.** Staging is a no-op on a CPU queue by
+  construction, so a host-only lane can prove the CPU branch, the per-expert
+  refusal that replaced the blanket one, the partial-tower guard and the
+  vacuous-truth guard -- `test_deepseek_v4_exl3_device_residency.cpp`, 25
+  assertions, three mutations red:
+
+  | mutation | result |
+  |---|---|
+  | empty tower reads as staged | 2 assertions FAIL |
+  | the per-linear CPU guard removed | 2 assertions FAIL |
+  | a partially staged tower reads as staged | 2 assertions FAIL |
+
+  A fourth mutation SURVIVES and is kept as a recorded fact rather than papered
+  over: deleting the tower walk's own CPU early-out changes nothing, because the
+  per-linear guard already no-ops. It is there for the ~28k redundant predicate
+  reads per CPU forward, not for semantics.
+
+  **The upload itself is UNPROVEN on a host-only lane and must not be claimed
+  from one.** `test_cuda_deepseek_v4.cpp` carries the two cases that prove it --
+  bytes moved, `d_dev` non-null, host `capacity() == 0`, and the CUDA forward
+  agreeing with the CPU forward through `DeepseekV4Model::Forward` -- and on a
+  CPU box the whole file reports `assertions: 0`, which is a skip wearing a pass.
+  It is owed a run under an `rc` lease before W2 is called done.
 - **The MTP NVFP4 draft experts.** Skipped-and-counted today (see `## Evidence`);
   no row owns reaching them yet.
 - Upstream's own `ext.reconstruct` run against the W1a anchors, so the

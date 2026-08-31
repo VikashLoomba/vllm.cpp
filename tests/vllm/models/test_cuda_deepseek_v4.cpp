@@ -16,7 +16,10 @@
 #include "vllm/model_executor/models/deepseek_v4_device.h"
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
 #include "vllm/model_executor/models/deepseek_v4_mhc.h"
+#include "vllm/model_executor/models/deepseek_v4_exl3_device.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
+
+#include "dsv4_exl3_fixture.h"
 
 #include <doctest/doctest.h>
 
@@ -1170,4 +1173,112 @@ TEST_CASE("DeepseekV4 device decode_attn_g == eager decode_attn (Brick D graph)"
                                   nh, hd, len_bad.data(), /*max_cap=*/64, scale, /*no_sink=*/false);
   gpu.Synchronize(g.q);
   CHECK(RelL2(got2, got) > 1e-4);
+}
+
+// ─── MODEL-DSV4-EXL3 W2 (#2442): THE DEVICE-RESIDENT ROUTED-EXPERT TOWER ──────
+//
+// The half of the residency gate a CPU box cannot prove. Staging is a no-op on a
+// CPU queue by construction, so `test_deepseek_v4_exl3_device_residency.cpp`
+// gates the CPU branch and the refusals; the UPLOAD only happens where there is
+// a device to upload to, and that is here.
+//
+// This case is the reason the whole change exists: before it, `Exl3Linear` and
+// the fused MoE arm refused every non-CPU queue, so the routed experts of the
+// real 216-expert artifact ran on a CPU queue no matter what device was present.
+TEST_CASE("W2: the EXL3 tower stages to CUDA, and the host bytes are then GONE") {
+  if (!HasCuda()) {
+    // A loud skip. `assertions: 0` reads as a pass in the summary line, so say
+    // out loud that nothing was verified rather than let a silent skip stand in
+    // for a device result.
+    MESSAGE("SKIPPED: no CUDA backend on this host; this case gates the UPLOAD "
+            "and must be run under an rc lease on a GPU before W2 is claimed");
+    return;
+  }
+  auto f = dsv4_exl3_fixture::BuildFixture();
+  vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  REQUIRE(w.has_exl3_weights);
+  REQUIRE(w.exl3.layers.size() > 0);
+  REQUIRE(w.exl3.layers[0].experts.size() > 0);
+
+  const vllm::DeepseekV4Exl3Linear& w1 = w.exl3.layers[0].experts[0].w1;
+  const int64_t tower_bytes = w1.Bytes();
+  REQUIRE(tower_bytes > 0);
+  REQUIRE_FALSE(w1.device_staged);
+
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g{gpu};
+  const int64_t uploaded = vllm::StageDeepseekV4Exl3TowerToDevice(g.q, w.exl3);
+
+  // (1) Bytes actually moved. A staging call that quietly did nothing would
+  //     leave every assertion below about the FLAG still passing.
+  CHECK(uploaded > 0);
+  // (2) The flag, and the whole tower rather than one linear.
+  CHECK(w1.device_staged);
+  CHECK(vllm::DeepseekV4Exl3TowerIsDeviceStaged(w.exl3));
+  // (3) The device copies exist...
+  CHECK(w1.d_trellis.d_dev != nullptr);
+  CHECK(w1.d_suh.d_dev != nullptr);
+  CHECK(w1.d_svh.d_dev != nullptr);
+  // (4) ...and the host copies are GONE. This is the assertion that makes the
+  //     82 GiB tower fit at all: without the free, staging needs the tower twice
+  //     and OOMs a 119 GiB GB10. `capacity()` and not `size()`, because
+  //     `clear()` would satisfy `size() == 0` while holding every byte.
+  CHECK(w1.trellis.capacity() == 0);
+  CHECK(w1.suh.capacity() == 0);
+  CHECK(w1.svh.capacity() == 0);
+  // (5) The borrows the upload went through are dropped, so nothing on this
+  //     struct still points at the memory freed in (4).
+  CHECK(w1.d_trellis.bytes.empty());
+}
+
+TEST_CASE("W2: the EXL3 routed experts COMPUTE on CUDA and agree with the CPU arm") {
+  if (!HasCuda()) {
+    MESSAGE("SKIPPED: no CUDA backend on this host; this case is the one that "
+            "proves the routed experts stopped needing a CPU queue");
+    return;
+  }
+  auto f = dsv4_exl3_fixture::BuildFixture();
+  vllm::DeepseekV4Weights cpu_w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+  vllm::DeepseekV4Weights gpu_w =
+      vllm::LoadDeepseekV4ForCausalLMWeights(f->shards, f->config);
+
+  const std::vector<int32_t> tokens{1, 2, 3};
+  const std::vector<int32_t> positions{0, 1, 2};
+  const std::vector<int32_t> logits_indices{2};
+
+  // THE PRODUCTION ENTRY on both sides (`ModelRegistry::Forward` reaches this),
+  // so what is compared is the forward an operator gets and not a hand-composed
+  // one that could route around the dispatch entirely.
+  const vllm::v1::CommonAttentionMetadata meta{};
+  const std::vector<vllm::PagedKvCache> kv;
+
+  vt::Backend& cpu_b = vt::GetBackend(vt::DeviceType::kCPU);
+  QueueGuard cg{cpu_b};
+  const std::vector<float> host_logits = vllm::DeepseekV4Model::Forward(
+      tokens, positions, meta, kv, cpu_w, cg.q, logits_indices);
+
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard gg{gpu};
+  const std::vector<float> dev_logits = vllm::DeepseekV4Model::Forward(
+      tokens, positions, meta, kv, gpu_w, gg.q, logits_indices);
+
+  // The tower really did move: without this the comparison below could pass on
+  // a run where the device arm was never taken.
+  CHECK(vllm::DeepseekV4Exl3TowerIsDeviceStaged(gpu_w.exl3));
+  CHECK_FALSE(vllm::DeepseekV4Exl3TowerIsDeviceStaged(cpu_w.exl3));
+
+  REQUIRE(dev_logits.size() == host_logits.size());
+  REQUIRE(host_logits.size() > 0);
+  // fp16 trellis decode plus a different reduction order, so this is an
+  // agreement gate and not a bit-exactness one. It is still a real gate: a
+  // device arm reading the WRONG memory does not land near the host arm, it
+  // lands on garbage or faults.
+  double max_abs = 0.0;
+  for (size_t i = 0; i < host_logits.size(); ++i)
+    max_abs = std::max(max_abs, std::abs(static_cast<double>(dev_logits[i]) -
+                                         static_cast<double>(host_logits[i])));
+  MESSAGE("EXL3 CUDA vs CPU routed-expert forward: max |diff| = " << max_abs);
+  CHECK(max_abs < 1e-2);
 }

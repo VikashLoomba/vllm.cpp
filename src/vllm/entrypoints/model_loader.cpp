@@ -1636,6 +1636,21 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(
     const LoadedModel& model, const HfConfig& config, int block_size,
     int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec) {
+  // The architecture may require a larger KV block than the engine's default.
+  // Upstream DERIVES that geometry from the model rather than taking it from an
+  // operator, so raising it here is the mirror; leaving it to a flag would make
+  // the model unreachable on its default configuration, and `vllm-cli` does not
+  // expose one at all.
+  const int resolved_bs =
+      ModelRegistry::ResolveKVBlockSize(model.registration(), block_size);
+  if (resolved_bs != block_size) {
+    std::fprintf(stderr,
+                 "[vllm] kv-cache: raising block_size %d -> %d, the floor this "
+                 "architecture derives (a compress_ratio page cannot be smaller "
+                 "than one token)\n",
+                 block_size, resolved_bs);
+    block_size = resolved_bs;
+  }
   vllm::v1::KVCacheConfig kv;
   if (spec.has_value()) {
     // Speculation is Qwen3.5/3.6-only at this pin (both gate checkpoints); build
@@ -2102,14 +2117,16 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // (num_blocks override > kv_cache_memory_bytes > util fallback) against the
       // model's own per-block byte geometry. FIRST, because max_model_len_ is
       // resolved against this pool.
-      kv_cfg_(MakeKVCacheResolved(
-          *model_, config_, params.block_size > 0 ? params.block_size : 32,
-          params, resolved_spec_config_)),
+      // Resolved ONCE, against the model's declared floor, before anything reads
+      // it. `ResolveKVBlockSize` is idempotent, so the funnel below re-resolving
+      // it is a guarantee for direct callers rather than a second policy.
+      block_size_(ModelRegistry::ResolveKVBlockSize(
+          model_->registration(), params.block_size > 0 ? params.block_size : 32)),
+      kv_cfg_(MakeKVCacheResolved(*model_, config_, block_size_, params,
+                                  resolved_spec_config_)),
       // The serving length, checked (pinned) or auto-fitted (unpinned) against
       // kv_cfg_. See ResolveMaxModelLen.
-      max_model_len_(ResolveMaxModelLen(
-          params, config_, kv_cfg_,
-          params.block_size > 0 ? params.block_size : 32)),
+      max_model_len_(ResolveMaxModelLen(params, config_, kv_cfg_, block_size_)),
       // The serving concurrency, clamped to the recurrent-state budget the KV
       // pool affords. See ResolveMaxNumSeqs (issue #1983).
       max_num_seqs_(ResolveMaxNumSeqs(
@@ -2187,7 +2204,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
           MakeSchedulerConfig(
               max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
-          kv_cfg_, params.block_size > 0 ? params.block_size : 32,
+          kv_cfg_, block_size_,
           /*enable_caching=*/prefix_caching_enabled_,
           &structured_output_manager_, resolved_spec_config_)),
       executor_(runner_),
@@ -2204,11 +2221,28 @@ LoadedEngine::LoadedEngine(HfConfig config,
       output_processor_(&tokenizer_),
       block_hasher_(prefix_caching_enabled_
                         ? vllm::v1::get_request_block_hasher(
-                              params.block_size > 0 ? params.block_size : 32,
-                              vllm::v1::sha256_cbor)
+                              block_size_, vllm::v1::sha256_cbor)
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+  // FOUR consumers page at `block_size_`: the KV config, the max-model-len fit,
+  // the scheduler's block table, and the prefix-cache hasher. Before the floor
+  // existed each spelled the same fallback expression and so could not disagree;
+  // with a floor they can, and the failure is silent -- a pool paged at 256 read
+  // through a block table striding 32 attends over the wrong tokens and returns
+  // plausible output. Assert what the disagreement would look like. Written as a
+  // property of the built config rather than a repetition of the assignment,
+  // because repeating the assignment would gate nothing.
+  for (const auto& group : kv_cfg_.kv_cache_groups) {
+    if (!group.kv_cache_spec) continue;
+    VT_CHECK(group.kv_cache_spec->block_size <= block_size_,
+             std::string("kv-cache: group pages ") +
+                 std::to_string(group.kv_cache_spec->block_size) +
+                 " tokens but the engine's block table strides " +
+                 std::to_string(block_size_) +
+                 ". A page wider than the stride is read as the wrong tokens, "
+                 "not as an error.");
+  }
   // issue #371: REFUSE an unservable recurrent-state budget instead of
   // allocating it. Speculation widens the Mamba/GDN state to k+1 snapshot slots
   // per sequence (runner.cpp:449-451), so a k=15 draft costs SIXTEEN times the

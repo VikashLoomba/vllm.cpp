@@ -342,9 +342,15 @@ Throughput is claimed only at W-6, against the target's own recipe: 384k context
 ## 5. Risks
 
 - **The lossless trap above.** Highest risk on the row, because it fails silently.
-- **Residency.** The tower is 90.82 GiB at tp1 and the tail is 8.62 GiB, leaving
-  roughly 19.6 GiB on a 119 GiB GB10 for KV and activations. Not obviously
-  enough at 384k context, and unmeasured.
+- **Residency. MEASURED 2026-08-31, and the planning number was wrong.** The
+  90.82 GiB header figure was a FLOOR, not the residency: the artifact's weights
+  actually materialize to **97.68 GiB** (81.952 GiB coalesced TP1 tower + 15.726
+  GiB carried host tower) at a **peak RSS of 111 GiB**, because the carried FP8
+  half widens at load -- 15.726 GiB against the 8.23 GiB its packed headers hold,
+  roughly double. See `.agents/specs/model-dsv4-exl3.md`. So the headroom on a
+  119 GiB GB10 is about 8 GiB before the 8.62 GiB MTP tail is resident at all,
+  not the ~19.6 GiB this risk was written against. 384k context is not obviously
+  reachable, and W-6 must size against 97.68/111, never against 90.82.
 - **`hf/inference/model.py`**, the reference implementation exllamav3 names, is
   NOT in the EXL3 repo's file list and not in the NAS staging copy. The port
   currently rests on exllamav3's own implementation, which is a re-implementation

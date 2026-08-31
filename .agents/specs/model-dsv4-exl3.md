@@ -103,18 +103,60 @@ at that size. The refusal is correct and its message is exactly the diagnostic
 this project's discipline exists to produce -- but it means the artifact does NOT
 load on the DEFAULT configuration, which is where `AGENTS.md`
 §"Nothing lands dead" measures reachability. Upstream derives 256. `vllm-server`
-accepts `--block-size`; `vllm-cli` does not. Filed under `## Owed
+accepts `--block-size`; `vllm-cli` does not.
 
-- **The artifact does not load on the DEFAULT configuration.**
-  `EngineParams::block_size` is 32 and a `compress_ratio == 128` layer cannot be
-  paged at that size; upstream derives 256
-  (`sparse_swa.py:76-83`, `compressor.py:174-178`). `vllm-server` takes
-  `--block-size`, `vllm-cli` does not, so the CLI cannot serve this architecture
-  at all. Mirroring upstream means the geometry is DERIVED from the model rather
-  than passed by an operator, which is the fix this owes; a flag on the CLI would
-  only move the problem.
+**FIXED 2026-08-31 (#2441), by deriving the geometry rather than asking for it.**
+`ModelFactory::kv_block_size_floor` is the smallest block size an architecture
+can be paged at, 0 meaning unconstrained. DeepSeek-V4 declares 256, which is the
+number upstream spells throughout (`sparse_swa.py:76-83`,
+`compressor.py:174-178`). `ModelRegistry::ResolveKVBlockSize` is the single
+resolution point, and `LoadedEngine::MakeKVCacheMaybeSpec` -- the funnel BOTH the
+probe config and the resized config pass through -- raises its block size to the
+floor before building the cache. A model that declares no floor gets exactly what
+the caller asked for, so nothing else moves.
 
-.
+A CLI flag was considered and rejected: it leaves the model unreachable on the
+default configuration, which is where `AGENTS.md` §"Nothing lands dead" measures,
+and it is not what upstream does. Upstream never asks an operator for this
+number.
+
+Gated by `tests/vllm/models/test_deepseek_v4_scaffold.cpp`, which enters at
+`MakeKVCacheMaybeSpec` rather than at the resolver beneath it. That choice was
+measured, not assumed: with the gate entering at `ResolveKVBlockSize`, deleting
+the loader's call site left `test_deepseek_v4_scaffold`,
+`test_loaded_engine_dense` and `test_kv_cache_fp8_wiring` ALL GREEN. Entering at
+the funnel reds it. Three mutations, each red, tree restored between:
+
+| mutation | result |
+|---|---|
+| `kv_block_size_floor` 256 -> 0 | 2 assertions FAIL |
+| `ResolveKVBlockSize` ignores the floor | 2 assertions FAIL |
+| the loader stops applying the resolved size | 1 assertion FAILS |
+
+`MakeKVCacheMaybeSpec` became public for that gate. It is a pure function of its
+arguments and holds no engine state, so publishing it widens nothing else.
+
+**The first version of this fix was wrong, and the way it was wrong is the point.**
+Raising the block size inside `MakeKVCacheMaybeSpec` fixed the KV config and left
+the other three consumers reading `params.block_size` -- the max-model-len fit,
+the scheduler's block table, and the prefix-cache hasher. Each spelled the same
+`params.block_size > 0 ? params.block_size : 32` fallback, so before a floor
+existed they could not disagree; with one they can. A pool paged at 256 read
+through a block table striding 32 attends over the wrong tokens and returns
+plausible output. It does not throw.
+
+So the engine resolves the size ONCE into `block_size_`, declared before
+`kv_cfg_`, and all four sites read that member. The constructor then asserts the
+property the disagreement would violate -- no group may page wider than the
+stride -- written over the built config rather than as a repetition of the
+assignment, because repeating the assignment gates nothing. Inverting that
+assertion reds `test_loaded_engine_dense` (3 assertions), which is what proves a
+real engine load reaches it.
+
+**Still owed: the load itself has not been re-measured on the default
+configuration.** The fix removes the refusal that stopped it; that the 97.68 GiB
+artifact now reaches a forward is a claim this row cannot make until the probe
+runs again under an `rc` lease.
 
 Note what this refusal is NOT: it is not an OOM, and it is not the DSA
 composition. W3's path was never reached, because the KV-cache spec is built

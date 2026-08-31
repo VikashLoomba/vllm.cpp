@@ -35,6 +35,10 @@ gain this row measures.
 
 ### What the three consumers do today
 
+Line numbers in this section are **at `4ab04afd6`**, the base. This change
+inserts a lane above `IsCudaKeepQuantSupported` and moves every one of them, so
+read them against the base rather than the merged tree.
+
 | Seam | Today, for IQ4_NL / Q5_0 / Q4_0 |
 |---|---|
 | `MatmulBTQuantKernelCuda:1993` | `cudaStreamSynchronize` then `GetOp(kMatmulBTQuant, kCPU)` over the same tensors. |
@@ -113,7 +117,7 @@ CPU arm's comments already say so. They are reproduced rather than normalised:
 
 `-ffp-contract=off` is CXX-only (`CMakeLists.txt:55`) and never reaches `.cu`,
 so nvcc would contract each of these into an FMA that rounds once where upstream
-rounds twice. `cuda_quant_dot.cu:535-558` records that being MEASURED here — two
+rounds twice. `cuda_quant_dot.cu:541-564` records that being MEASURED here — two
 of eight real super-blocks off by 1 and 4 ULP. Every multiply-add in the new
 dots is therefore spelled `__fmul_rn` / `__fadd_rn`, as `DotIQ4XS` is.
 

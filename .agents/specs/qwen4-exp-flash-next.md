@@ -6308,12 +6308,64 @@ EXECUTED, which is impossible unless it linked. This is a stronger argument than
 "no error lines", which is an absence-of-evidence claim, but it is still a
 derivation and is labelled one.
 
-**`sm_121a` (GB10) IS NOT COVERED BY THIS.** A `dgx:gpu0` job was running when
-this was written. The kernels are arch-invariant by inspection -- zero
-occurrences of `mma.sync`, `wmma`, `__CUDA_ARCH__`, inline `asm`, CUTLASS,
-`ldmatrix`, `cp.async` or any `sm_*` literal, and only IEEE round-to-nearest
-intrinsics plus sm_80+ converters -- so one arch carries further here than it
-would for a kernel with arch-gated paths. It is still one arch.
+**`sm_121a` (GB10) IS ALSO COVERED, AND IT IS THE CLEANER OF THE TWO RUNS.**
+`dgx:gpu0`, nvcc 13.0.88, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a`, 2026-08-31. Here
+the build rc is READ rather than derived, which closes the one soft spot in the
+`sm_110` evidence:
+
+```
+### CONFIGURE RC=0        ### BASELINE BUILD RC=0    ### W6 BUILD RC=0
+### GATE RC=0             ### FINAL BUILD RC=0       ### FINAL GATE RC=0
+```
+
+**12 cases, 12 passed. 351 assertions, 351 passed. `Status: SUCCESS!`** -- and
+the same after the mutation battery restored the tree, which is what
+`### FINAL GATE RC=0` says. The count is 351 rather than `sm_110`'s 323 because
+this run carried the re-derived oracle bound and its bitwise backstops; the one
+assertion that failed on `sm_110` was that bound, and with it corrected the suite
+is green on both arches.
+
+`cuobjdump` confirms the objects are genuinely built for this architecture, which
+no rc can show on its own: `cuda_qwen4_exp_ple.cu.1.sm_121a.cubin`.
+
+**The gated tree is pinned to a commit, not merely described.** The job printed a
+sha256 for each file it applied, and all eleven match this branch's `e9862d864`
+byte for byte (`sha256sum -c`, 11/11 OK). So "the gate passed" and "the gate
+passed on the code in this commit" are the same statement here.
+
+The kernels being arch-invariant by inspection -- zero occurrences of `mma.sync`,
+`wmma`, `__CUDA_ARCH__`, inline `asm`, CUTLASS, `ldmatrix`, `cp.async` or any
+`sm_*` literal, and only IEEE round-to-nearest intrinsics plus sm_80+ converters
+-- is now corroborated rather than merely argued: two architectures, three
+generations apart in the feature table, produce output that is bitwise identical
+to the same CPU arms.
+
+### Mutations on `sm_121a`, with applied-proof and restore-proof
+
+Every mutation printed a `sha256 before=... after=...` pair proving it changed
+the file, and a `RESTORED byte-for-byte` line proving the tree came back. Five
+red, and the sixth is a compiler proof:
+
+| mutation | build rc | run rc | reading |
+|---|---|---|---|
+| M1 dilation ignored | 0 | **1** | RED |
+| M2 NaN guard dropped | 0 | **1** | RED |
+| M3 write-back contracts into an fma | 0 | **1** | RED — the byte-identity claim is load-bearing on GB10 too |
+| M4 conv accumulates in float | 0 | **1** | RED |
+| M5 kCUDA registration deleted | **1** | — | BUILD FAILED: a COMPILER proof, not a test verdict. `-Werror` refuses the orphaned kernel, so no test ran. Not counted as a red |
+| M6 ring write-back dropped | 0 | **1** | RED |
+
+**The `sm_110` mutation counts and the `sm_121a` ones agree**, including M5
+failing to build on both. That is two independent devices reporting the same
+battery.
+
+### The other suites on `sm_121a`
+
+`### BASELINE qwen4 ctest RC=8` before the change and `### qwen4 ctest RC=8`
+after, with an IDENTICAL failing set both times -- `test_qwen4_exp_gguf_load_plan`,
+`..._gguf_weights`, `..._layer_loop`, `..._runner`, `..._forward` -- and
+`test_qwen4_exp_cuda` **absent from it**, because it passed. The change regressed
+nothing and its own suite is green.
 
 ### What the sm_110 run measured
 

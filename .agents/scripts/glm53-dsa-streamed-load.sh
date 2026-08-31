@@ -225,8 +225,18 @@ PY
     have=$(stat -c %s "$DERIVED/$b" 2>/dev/null || echo 0)
     if [ "$have" != "$want" ]; then
       rm -f "$DERIVED/$b"
-      ln "$f" "$DERIVED/$b" || cp -l "$f" "$DERIVED/$b" \
-        || { echo "FATAL: cannot hardlink $b into $DERIVED"; exit 96; }
+      if ! ln "$f" "$DERIVED/$b" 2>/dev/null && ! cp -l "$f" "$DERIVED/$b" 2>/dev/null; then
+        # A PEER JOB WON THE RACE. `$DERIVED` is shared across boxes and this
+        # script is submitted to dgx and thor together, so between the `rm` and
+        # the `ln` the other worker can recreate the same link. That is the
+        # correct outcome, not a failure -- re-read the size and accept it.
+        have=$(stat -c %s "$DERIVED/$b" 2>/dev/null || echo 0)
+        if [ "$have" = "$want" ]; then
+          echo "  $b: a peer job linked it first, size matches -- accepted"
+        else
+          echo "FATAL: cannot hardlink $b into $DERIVED (have=$have want=$want)"; exit 96
+        fi
+      fi
     fi
   done
   ls -la "$DERIVED" | head -8

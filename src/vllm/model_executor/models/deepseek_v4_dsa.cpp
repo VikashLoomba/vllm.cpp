@@ -382,6 +382,26 @@ std::vector<float> CompressorLayerStep(
   VT_CHECK(static_cast<int64_t>(positions.size()) == num_tokens,
            "deepseek-v4 compressor step: one position per token");
 
+  // THE PREFIX-CACHE GUARD. The compressor pools tokens it has SEEN, so its state
+  // must have seen exactly the `kv_base` tokens this step resumes after. A
+  // prefix-cache hit skips recomputing cached tokens, and those tokens are the
+  // ones whose rows this state would have accumulated -- so after a hit it holds
+  // FEWER rows than the position implies, and the layer would attend a compressed
+  // history with holes in it.
+  //
+  // That failure is invisible: the output stays finite and plausible, and it only
+  // appears on cache hits. Refusing is never wrong here, only limiting, so the
+  // mismatch is refused by name rather than resolved by a policy this row does not
+  // own (`## Owed`).
+  const int64_t seen = static_cast<int64_t>(state_kv->size()) / head_dim;
+  VT_CHECK(seen == kv_base,
+           "deepseek-v4 compressor: the carried state has seen " +
+               std::to_string(seen) + " tokens but this step resumes at kv_base " +
+               std::to_string(kv_base) +
+               ". A prefix-cache hit skipped tokens this state needed, and the "
+               "compressed history would have holes in it. Refusing "
+               "(MODEL-DSV4-DSA-COMPOSE, #2286)");
+
   // 1. The pool score this layer selects with.
   std::vector<float> score(static_cast<size_t>(num_tokens) * head_dim, 0.0f);
   for (int64_t t = 0; t < num_tokens; ++t) {

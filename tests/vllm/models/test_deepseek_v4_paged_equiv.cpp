@@ -744,3 +744,46 @@ TEST_CASE("W1: a step that CLOSES a window emits rows and the merge runs") {
     diff = std::max(diff, std::abs(static_cast<double>(out[i] - window_only[i])));
   CHECK(diff > 1e-6);
 }
+
+TEST_CASE("W1: a step resuming past the compressor's state REFUSES (#2286)") {
+  // The prefix-cache interaction, made detectable instead of decided. A cache hit
+  // skips recomputing tokens whose KV is cached; the compressor's pooled history
+  // is DERIVED from those tokens, so its carried state would be missing exactly
+  // the rows they owed it and the layer would attend a compressed history with
+  // holes. The output would stay finite and plausible and would only be wrong on
+  // cache hits, so the mismatch is refused by name.
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const int64_t hd = 512, nh = 1, H = 8, cr = 128, win = 4;
+  const int64_t bs = 16, nb = 4;
+  std::vector<float> cache(static_cast<size_t>(nb * bs * hd), 0.0f);
+  vt::Tensor t_cache = Contig(cache.data(), vt::DType::kF32, q.device, {nb, bs, hd});
+  const std::vector<float> wgate = Rand(static_cast<size_t>(hd * H), 2811u, 0.05f);
+  const std::vector<float> ape = Rand(static_cast<size_t>(cr * hd), 2812u, 0.05f);
+  const std::vector<float> cnorm(static_cast<size_t>(hd), 1.0f);
+  const std::vector<float> sink(static_cast<size_t>(nh), -0.1f);
+  const std::vector<float> x = Rand(static_cast<size_t>(H), 2900u, 0.2f);
+  const std::vector<float> kv = Rand(static_cast<size_t>(hd), 2950u, 0.2f);
+  const std::vector<float> qq = Rand(static_cast<size_t>(nh * hd), 2990u, 0.2f);
+
+  std::vector<float> st_kv, st_score, rows;
+
+  // A FRESH state at kv_base 0 is consistent and must be accepted, or the guard
+  // would simply refuse everything and read as correct.
+  CHECK_NOTHROW(vllm::deepseek_v4::CompressorLayerStep(
+      q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, nb, bs, &st_kv, &st_score,
+      &rows, {0}, /*kv_base=*/0, 1, nh, H, hd, cr, win, 1e-6f, 1.0f));
+  CHECK(st_kv.size() == static_cast<size_t>(hd));  // it saw exactly one token
+
+  // Now resume at kv_base 7 with a state that has seen only 1 token: six tokens
+  // were skipped, which is what a prefix hit looks like from here.
+  CHECK_THROWS(vllm::deepseek_v4::CompressorLayerStep(
+      q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, nb, bs, &st_kv, &st_score,
+      &rows, {7}, /*kv_base=*/7, 1, nh, H, hd, cr, win, 1e-6f, 1.0f));
+
+  // And the CONSISTENT continuation is accepted, so the guard tracks the state
+  // rather than pinning kv_base to zero.
+  CHECK_NOTHROW(vllm::deepseek_v4::CompressorLayerStep(
+      q, x, kv, qq, wgate, ape, cnorm, sink, t_cache, nb, bs, &st_kv, &st_score,
+      &rows, {1}, /*kv_base=*/1, 1, nh, H, hd, cr, win, 1e-6f, 1.0f));
+  CHECK(st_kv.size() == static_cast<size_t>(2 * hd));
+}

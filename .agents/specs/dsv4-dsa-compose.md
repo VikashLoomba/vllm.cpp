@@ -370,11 +370,22 @@ the rows the skipped tokens would have contributed, and the layer would attend a
 compressed history with holes in it. That is the silent-plausible-output failure
 this row exists to avoid, and it would appear only on cache hits.
 
-So the next brick owes a decision rather than an implementation: either the
-compressor state is REBUILDABLE from a cached prefix, or a prefix hit must
-invalidate it, or the arm must declare itself incompatible with prefix caching
-per-arm rather than per-architecture. That is a scheduler-facing choice this row
-does not own, and it is filed here rather than guessed at.
+Three resolutions exist -- the state is REBUILDABLE from a cached prefix, a hit
+INVALIDATES it, or the arm declares incompatibility per-arm -- and choosing among
+them is scheduler-facing and not this row's. **But choosing is not required to be
+safe, because the mismatch is DETECTABLE.** The state knows how many tokens it has
+pooled, and a step knows the `kv_base` it resumes at; if they disagree, tokens
+were skipped that the state needed.
+
+`CompressorLayerStep` therefore refuses on `seen != kv_base`, naming both numbers.
+Refusing is never wrong here, only limiting, so the arm is correct under prefix
+caching today and the policy choice above stays open rather than blocking.
+
+Gated both directions, because a guard can fail either way: a state that has seen
+one token resuming at `kv_base = 7` refuses, a fresh state at 0 is accepted, and
+the consistent continuation at 1 is accepted -- so the guard tracks the state
+rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
+guard and one making it over-fire.
 
 ## W1's arm is REACHED from production
 

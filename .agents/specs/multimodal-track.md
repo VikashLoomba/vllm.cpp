@@ -1965,14 +1965,22 @@ The host contract cost three things, and only the third is invisible to a gate:
    tokens matched throughout. `.agents/porting.md` "Mirror the memory format, not
    just the math" names exactly this class, and this is an instance of it.
 
-**The borrowed-handle rule, and why the forward copies.** The hidden stream is
-written IN PLACE by every decoder layer, so seeding it by aliasing the caller's
-view would corrupt the buffer the runner is about to reuse. All three forwards
-therefore seed their own buffer with a D2D copy — a pure byte copy, so the stream
-starts from the identical bits the host handle used to deliver, which is what makes
-the change bit-neutral rather than merely close. Upstream takes the same shape:
-its decoder layers allocate rather than clobber the persistent `inputs_embeds` they
-are handed.
+**The borrowed-handle rule, and why the forward copies.** NO registered forward
+writes its hidden stream in place at this head, and the reason for the copy is
+stated against that measurement rather than around it: `RunLayer` ends
+`hidden = DBuf(...)` (`muse_glimmer.cpp`), `VLRunLayer` ends
+`hidden = down->Apply(...)` (`qwen3_vl.cpp`), and Gemma-4 copies `tok` into its own
+`hidden`. Aliasing the caller's view would therefore corrupt nothing TODAY, and no
+logits comparison can tell an aliasing implementation from this one. The copy is a
+CONTRACT rather than a caught defect: the invariant that keeps aliasing safe is
+written down nowhere, the runner slice will hand this seam a window into a buffer it
+reuses across steps, and any future in-place fusion would break the alias silently.
+All three forwards therefore seed their own buffer with a D2D copy — a pure byte
+copy, so the stream starts from the identical bits the host handle used to deliver,
+which is what makes the change bit-neutral rather than merely close. Upstream takes
+the same shape: its decoder layers allocate rather than clobber the persistent
+`inputs_embeds` they are handed. The `## Owed` entry below says the same thing, and
+this paragraph used to contradict it.
 
 **The merge-side question, answered rather than assumed.** Upstream's merge lives
 in a MODEL method (`interfaces.py:380`) that the RUNNER calls
@@ -2002,9 +2010,21 @@ mutate for reach here, and the wiring is owned by `ENG-MM-INPUT-PIPELINE` under
   — on a synthetic checkpoint. It gained two cross-tree INSTRUMENTS (an FNV-1a-64
   digest of the logits bytes, and the greedy ids themselves), so a before/after
   comparison reads a number instead of a verdict, and one new case:
-  `ForwardMm does NOT write through its borrowed device handle`, which reads the
-  caller's device buffer back after the forward. Nothing about the logits can see
-  an aliasing implementation; only that read-back can.
+  `MuseGlimmer: ForwardMm reads a SLICE of a larger device buffer and leaves it untouched`,
+  which reads the caller's device buffer back after the forward. Nothing about the
+  logits can see an aliasing implementation; only that read-back can. The name is
+  written out in full and verbatim because it is a `-tc` argument: doctest's filter
+  matches the WHOLE case name, so an approximation of it selects zero cases and
+  exits 0, which reads as a pass.
+- CPU, hermetic, no checkpoint: `tests/vllm/models/test_tower_skip.cpp` gained
+  `mm seam: Qwen3-VL refuses deepstack_levels that no deepstack tensor backs`,
+  which drives `reg.factory->forward` — the function pointer
+  `ModelRegistry::Forward` calls — on a synthetic Qwen3-VL checkpoint. It pins the
+  DeepStack pair the device contract made silently breakable: `deepstack_levels > 0`
+  with an absent `deepstack` tensor is REFUSED by name, while both-absent and
+  both-set are served. The case lives beside the Qwen3-VL fixture that file already
+  carries, because a real `Qwen3VLLoadedModel` is what the entry point needs and
+  only `ModelRegistry::Load` produces one.
 - GPU, checkpoint-gated: `test_qwen3vl_registry_e2e`, `test_qwen3vl_video_e2e` and
   `test_gemma4_registry_e2e` are the token-exact arms. They SKIP without CUDA and
   the cached checkpoints, so their disposition is recorded per run rather than
@@ -2165,3 +2185,36 @@ L4 (§1.6); the second while landing L3 (§1.5).
   comparison, which is why the CPU gate asserts the read-back of the caller's buffer
   instead — and why the copy stays: the invariant that keeps aliasing safe is stated
   nowhere and would be silently broken by any future layer that fuses in place.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — CONTIGUITY and DEVICE
+  are unchecked on the new handles.** `vt::Tensor` carries strides, and
+  `Tensor::Bytes()` itself `VT_CHECK`s `IsContiguous()`, so asserting contiguity is
+  this tree's own convention rather than an extra one. Four consumers do raw BYTE
+  arithmetic on a borrowed handle without checking it — `muse_glimmer.cpp:386`,
+  `qwen3_vl.cpp:326` and `gemma4.cpp:459`, all
+  `d.b.Copy(..., <handle>.data, dst.bytes())`, plus `qwen3_vl.cpp:351`,
+  `static_cast<char*>(deepstack.data) + l * T * H * 2` — and two more pass a handle
+  straight into a kernel (`positions3` into `VLRunLayer`, `ple_token_ids` into
+  `vt::Embedding`). The guards at the entry points test only `data != nullptr` and
+  `Numel()`, both of which a STRIDED view satisfies. The three copy sites size the
+  copy with the DESTINATION's `dst.bytes()` rather than the source's `src.Bytes()`,
+  which is precisely what sidesteps the one check that would already have fired. The
+  handle's `device` is likewise never compared against `input.queue.device`. Impact
+  at this head is ZERO — every constructor of these handles is a contiguous `DBuf`
+  on the queue's own device — which is why it is recorded rather than fixed: it
+  cannot bite until the runner slice starts handing the seam views it did not
+  allocate, and that slice is where the check belongs.
+- **[#2300](https://github.com/mudler/vllm.cpp/issues/2300) — two of the three
+  converted forwards have ZERO EXECUTED coverage.** `tests/vllm/models/test_model_registry.cpp`
+  asserts architecture registration strings and nothing else: it contains no
+  `MultiModalForwardInput` and no `.mm`. So `Gemma4Model::ForwardMm` and
+  `Qwen3VLForwardStepLastLogits{,Device}` are COMPILE-ONLY on CPU, and the arms that
+  would run them (`test_gemma4_registry_e2e`, `test_qwen3vl_registry_e2e`,
+  `test_qwen3vl_video_e2e`) SKIP without CUDA and their cached checkpoints. Only the
+  Muse Glimmer forward is executed by a hermetic gate. Gemma-4's is the most invasive
+  edit in the P1 diff — the `DBuf owned_ids` / `Tensor dids` restructure at
+  `gemma4.cpp:484-491`, which changes WHO owns the id buffer on the text arm as well
+  as the mm one. §5's `Gates` block says the GPU arms skip; it did not say that two
+  of the three forwards are therefore unexecuted, and that is the sentence this entry
+  adds. The Qwen3-VL half is now partly covered on CPU by the DeepStack-pair case in
+  `test_tower_skip.cpp` (§5 `Gates`), which reaches the registered entry point and
+  its shape guards; the numerics of both forwards remain checkpoint-gated.

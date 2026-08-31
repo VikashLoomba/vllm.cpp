@@ -225,20 +225,35 @@ class UnreadDocumentedVarTests(unittest.TestCase):
             found = check_env_doc.scan_read_sites(root)
         self.assertEqual(found, {"VT_ACTUALLY_READ"})
 
-    def test_the_comment_only_knob_is_not_counted_as_read(self) -> None:
-        """VT_QWEN35_STAGE_MIN_FREE_FRAC: the exact case a name grep passes.
+    def test_the_comment_only_knob_that_motivated_this_check_is_now_GONE(self) -> None:
+        """`VT_QWEN35_STAGE_MIN_FREE_FRAC` was the case a name grep passes.
 
-        Its only occurrence in compiled code is a `//` comment in
-        qwen3_5_weights.h, so it must be absent from the read set and present in
-        UNREAD_EXCEPTIONS until ENG-WEIGHT-RESIDENCY / #2385 removes its row.
+        Its only occurrence in compiled code was a `//` comment, so it was
+        documented and unread, and it shipped as the single UNREAD_EXCEPTIONS
+        entry so this gate could land without editing a row another row owned.
+
+        ENG-WEIGHT-RESIDENCY / #2385 then removed the row, the staleness guard
+        reported the entry BY NAME, and the entry was deleted rather than
+        rewritten. So the assertion here is the END STATE: gone from the tables,
+        gone from the header comment, and not allowlisted -- an escape hatch that
+        opened and closed once, end to end, which is the only evidence that it is
+        self-clearing rather than permanent.
+
+        The GUARANTEE this case used to carry -- that a comment-quoted name is
+        not counted as read -- has no real-tree instance left, so it is pinned
+        synthetically by `test_scan_read_sites_ignores_a_comment_quoted_name`.
+        Keeping a real-tree assertion against a subject that no longer exists
+        would be a test that passes because its premise vanished.
         """
 
         name = "VT_QWEN35_STAGE_MIN_FREE_FRAC"
-        header = ROOT / "include/vllm/model_executor/models/qwen3_5_weights.h"
-        self.assertIn(name, header.read_text(encoding="utf-8"))
+        self.assertNotIn(name, check_env_doc.table_documented_names(_doc_text()))
         self.assertNotIn(name, check_env_doc.scan_read_sites(ROOT))
-        self.assertIn(name, check_env_doc.UNREAD_EXCEPTIONS)
-        self.assertTrue(check_env_doc.UNREAD_EXCEPTIONS[name].strip())
+        self.assertNotIn(name, check_env_doc.UNREAD_EXCEPTIONS)
+        # It survives only as PROSE in the page, which the table parser must not
+        # mistake for a documented row -- otherwise removing a knob could never
+        # be explained on the page that documented it.
+        self.assertIn(name, _doc_text())
 
     # --- complication 2: a shipped binary outside src/ still counts ---------
 

@@ -82,15 +82,13 @@ _CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'])'")
 # its variable leaves the table or gains a reader, so the debt cannot outlive
 # the condition that justified it.
 UNREAD_EXCEPTIONS: dict[str, str] = {
-    "VT_QWEN35_STAGE_MIN_FREE_FRAC": (
-        "Genuinely dead: its reader was deleted when the Qwen3.5/3.6 staging "
-        "policy was rewritten to a total-memory rule, and its only occurrence "
-        "in compiled code is a comment. ENG-WEIGHT-RESIDENCY / #2385 owns the "
-        "doc row and is removing it; this entry exists so #2389 can land the "
-        "gate that FOUND it without editing another row's surface underneath "
-        "it, and stale_unread_exceptions reports this entry the moment that "
-        "row goes."
-    ),
+    # EMPTY, and that is the point rather than an oversight. The one entry this
+    # gate shipped with -- `VT_QWEN35_STAGE_MIN_FREE_FRAC` -- existed only so
+    # this checker could land without editing a doc row another row owned. That
+    # row is gone (#2385, landed), `stale_unread_exceptions` reported the entry
+    # by name the moment it went, and the entry was deleted rather than
+    # rewritten. The escape hatch working once, end to end, is the evidence it
+    # is self-clearing.
 }
 
 

@@ -738,11 +738,15 @@ exist on this fleet; what is gated is a synthetic miniature. The forward re-runs
 the whole prefix each step and re-decodes every layer, which is a residency
 decision rather than a speed one, and the speed axis is unopened.
 
-**Use `--device cpu`.** The one artifact that fits any device this project owns
-stores 82 of its tensors as IQ2_XS and 3 as IQ4_XS, and neither encoding has a
-CUDA keep-quant kernel: on a CUDA device the expert GEMM falls back to the host
-cores behind a stream sync and the fused MoE seam throws
-([#2260](https://github.com/mudler/vllm.cpp/issues/2260)).
+**Use `--device cpu`, and the reason is no longer the quantization.** This
+model's forward is a host f32 reference and refuses a non-CPU queue BY NAME,
+before any GEMM runs, so `--device cuda` on this artifact is an error message
+whatever the kernels underneath do; the device arm is owed by the model's own
+row. What changed is the layer below it: the 82 IQ2_XS and 3 IQ4_XS tensors that
+had no CUDA keep-quant kernel now have one
+([#2260](https://github.com/mudler/vllm.cpp/issues/2260)), so the expert GEMM no
+longer drains the stream to the host cores and the fused MoE seam no longer
+throws. That is a prerequisite for a CUDA arm of this model, not a CUDA arm.
 
 **Our own converter has still never been run** against the real 305.78 GiB
 checkpoint; that needs explicit developer authority for the download and a box

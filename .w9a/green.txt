@@ -1,0 +1,19 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:247:
+TEST CASE:  glm5_next moe: the grouped noaux_tc selection is the oracle's SET
+  the SEPARATION MARGIN, printed rather than tolerated
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:316: MESSAGE: token 0: selection margin (last accepted - best rejected) = 0.00184119, oracle 0.00184119
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:316: MESSAGE: token 1: selection margin (last accepted - best rejected) = 0.027631, oracle 0.027631
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:316: MESSAGE: token 2: selection margin (last accepted - best rejected) = 0.00857711, oracle 0.00857711
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:316: MESSAGE: token 3: selection margin (last accepted - best rejected) = 0.0198317, oracle 0.0198317
+
+===============================================================================
+[doctest] test cases:   12 |   12 passed | 0 failed | 0 skipped
+[doctest] assertions: 8075 | 8075 passed | 0 failed |
+[doctest] Status: SUCCESS!

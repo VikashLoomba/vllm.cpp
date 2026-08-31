@@ -555,6 +555,122 @@ void GgufExpertSource::Expert(int64_t e, std::vector<float>& gate_up,
   }
 }
 
+// ─── W9a: the keep-quant expert banks, admitted or declined or refused ───────
+//
+// THREE outcomes, and collapsing them to two is how this goes wrong.
+//
+//   admitted  -> returns true, fills `*out`. The three banks are block-quantized,
+//                gate and up share a dtype, none is repacked, and the shapes are
+//                the stacked towers the seam declares.
+//   declined  -> returns false, `*out` untouched. The banks are NOT block-quantized,
+//                which is the loader's own bf16 expansion route (`LoadStackedExperts`
+//                falls to `ExpandBf16` when the policy says so). That is a designed
+//                residency and not a fault, so the f32 arm runs and says nothing.
+//   refused   -> THROWS. The banks ARE block-quantized and the seam cannot represent
+//                them. Silently falling back here would be the failure this row's
+//                headers keep naming: correct tokens at f32-decode speed, on a path
+//                nobody asked for, which no token gate can see.
+//
+// THE REPACK CHECK IS NOT DEFENSIVE. `Tensor::repacked` marks the i8mm block
+// reordering, which preserves BOTH the dtype and the byte count — so a repacked
+// bank fed to a kernel that does not expect it produces finite, wrongly-ordered
+// numbers, and every shape and dtype assertion in this file passes. This model
+// declines the repack at load (`kGlm5NextQuantRepack = false`,
+// `glm5_next_loader.cpp:145`), and this check is what makes that a fact the seam
+// depends on rather than a constant a later edit can flip silently.
+bool AdmitMoeQuantBanks(const Glm5NextMoeWeights& src, const MoeDims& d,
+                        const std::string& what, MoeQuantBanks* out) {
+  const OwnedTensor* banks[3] = {&src.gate_exps, &src.up_exps, &src.down_exps};
+  const char* names[3] = {".gate_exps", ".up_exps", ".down_exps"};
+
+  // Declined: not a keep-quant residency at all. All three move together,
+  // because `LoadStackedExperts` routes them with one policy call each and a
+  // split would mean the seam ran on some layers and not others.
+  int quant = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (banks[i]->host_released) return false;  // staged to a device, W9b's
+    if (vt::IsBlockQuant(banks[i]->dtype)) ++quant;
+  }
+  if (quant == 0) return false;
+  if (quant != 3) {
+    throw std::runtime_error(
+        "glm5_next bridge: `" + what + "` has " + std::to_string(quant) +
+        " of its 3 routed-expert banks block-quantized and the rest expanded. "
+        "The grouped keep-quant seam takes all three or none, and a partial "
+        "state means the load policy routed one bank differently from its "
+        "siblings. Route all three the same way; see glm5_next_moe.h.");
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    // All THREE shape-preserving transforms, not just the i8mm one. Each
+    // rewrites the buffer while leaving the dtype and the byte count alone:
+    // `repacked` is the i8mm q8_0 interleave, `q8_0_aligned` is the CUDA
+    // coalesced [all qs | all scales] layout, and `elem_kn_repacked` transposes
+    // to [K, N] while the recorded shape stays [N, K]. A bank carrying any of
+    // them is bytes the seam would read in the wrong order.
+    if (banks[i]->repacked || banks[i]->q8_0_aligned ||
+        banks[i]->elem_kn_repacked) {
+      throw std::runtime_error(
+          "glm5_next bridge: `" + what + names[i] +
+          "` carries a load-time REPACK marker (repacked=" +
+          std::to_string(static_cast<int>(banks[i]->repacked)) +
+          " q8_0_aligned=" + std::to_string(static_cast<int>(banks[i]->q8_0_aligned)) +
+          " elem_kn_repacked=" +
+          std::to_string(static_cast<int>(banks[i]->elem_kn_repacked)) +
+          "), and the grouped keep-quant seam "
+          "reads canonical block order. A repack preserves the dtype AND the "
+          "byte count, so nothing else in this bridge can detect it and the "
+          "result would be finite and wrong. This model declines the repack at "
+          "load (kGlm5NextQuantRepack, glm5_next_loader.cpp); if that changed, "
+          "the seam has to change with it.");
+    }
+  }
+
+  if (src.gate_exps.dtype != src.up_exps.dtype) {
+    throw std::runtime_error(
+        "glm5_next bridge: `" + what + "` stores gate_exps as " +
+        std::string(vt::Name(src.gate_exps.dtype)) + " and up_exps as " +
+        std::string(vt::Name(src.up_exps.dtype)) +
+        ". `vt::MoeGateUpSwiGLUGrouped` quantizes the activation ONCE and dots "
+        "both towers with it, so it requires one dtype for the pair and cannot "
+        "represent this checkpoint. Measured across all 43 sparse blocks of "
+        "unsloth/GLM-5.3-Flash-GGUF UD-Q2_K_XL there are 0 such layers, so a "
+        "checkpoint that reaches this message is a NEW mixing pattern and needs "
+        "the split-GEMM shape rather than a silent f32 fallback.");
+  }
+
+  const int64_t E = d.n_routed_experts;
+  const int64_t I = d.moe_intermediate_size;
+  const int64_t H = d.hidden_size;
+  // `[E, N, K]` as `LoadStackedExperts` records it; the bytes are `[E * N, K]`,
+  // which is the stacked tower both ops declare. The rank change is a view.
+  const int64_t want[3][3] = {{E, I, H}, {E, I, H}, {E, H, I}};
+  for (int i = 0; i < 3; ++i) {
+    const OwnedTensor& b = *banks[i];
+    if (b.rank != 3 || b.shape[0] != want[i][0] || b.shape[1] != want[i][1] ||
+        b.shape[2] != want[i][2]) {
+      throw std::runtime_error(
+          "glm5_next bridge: `" + what + names[i] + "` is rank " +
+          std::to_string(b.rank) + " [" + std::to_string(b.shape[0]) + ", " +
+          std::to_string(b.shape[1]) + ", " + std::to_string(b.shape[2]) +
+          "], expected the stacked [" + std::to_string(want[i][0]) + ", " +
+          std::to_string(want[i][1]) + ", " + std::to_string(want[i][2]) + "]");
+    }
+  }
+
+  // Collapse `[E, N, K]` to `[E * N, K]` through `vt::Tensor::View`, which
+  // asserts contiguity and that the element count is unchanged, rather than by
+  // hand-editing strides. It rebuilds the tensor with `Contiguous(data, dtype,
+  // device, shape)`, so the block dtype and the pointer carry and the strides
+  // are recomputed in the same unit `OwnedTensor::View()` used. It drops
+  // `repacked`, which is safe here only because a repacked bank was already
+  // refused above.
+  out->gate = src.gate_exps.View().View({E * I, H});
+  out->up = src.up_exps.View().View({E * I, H});
+  out->down = src.down_exps.View().View({E * H, I});
+  return true;
+}
+
 MoeLayerWeights BridgeMoeLayer(const Glm5NextMoeWeights& src, const MoeDims& d,
                                const std::string& what, int64_t byte_ceiling) {
   d.Validate();
@@ -573,6 +689,11 @@ MoeLayerWeights BridgeMoeLayer(const Glm5NextMoeWeights& src, const MoeDims& d,
   // `kBridgeTensorF32ByteCeiling` refuses the first 9.0 GiB bank by name before
   // any of it is allocated. The caller sets `expert_source`; `MoeForward`
   // refuses a layer that has neither.
+  //
+  // W9a: and when the banks kept their blocks, hand `MoeForward` a view of them
+  // as well. It prefers this arm, and the `expert_source` the caller still sets
+  // stays reachable below it as the parity operand.
+  out.has_quant_banks = AdmitMoeQuantBanks(src, d, what, &out.quant_banks);
   return out;
 }
 

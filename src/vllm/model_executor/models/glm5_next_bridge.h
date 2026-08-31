@@ -49,17 +49,25 @@
 // write that loop itself, and the ceiling below will refuse it one tensor
 // before it gets there.
 //
-// ─── O19 / #2260: THIS BRIDGE CANNOT MAKE THE MOE THROW REACHABLE ────────────
+// ─── O19 / #2260: THE MOE THROW IS GONE, AND THIS BRIDGE NEVER REACHED IT ────
 //
-// O19 records that the moment this row routes the experts through
+// O19 recorded that the moment this row routes the experts through
 // `layers::MlpGateUpMethodBase` / `vt::MergedGemmGroup` on CUDA,
-// `MoeGateUpSwiGLUGroupedCuda` throws: neither IQ2_XS nor IQ4_XS is in
+// `MoeGateUpSwiGLUGroupedCuda` throws: neither IQ2_XS nor IQ4_XS was in
 // `IsCudaKeepQuantSupported`, and 85 of this artifact's tensors are those two
 // types. W5's MoE deliberately reaches only `vt::MoeRouterTopK` /
 // `vt::MoeCombine` with host GEMM loops for that reason.
 //
-// This file cannot make that throw reachable, and it is gated rather than
-// argued:
+// **That throw no longer exists.** #2260 landed `DotIQ2XS` and `DotIQ4XS` and
+// wired both into all three CUDA keep-quant dispatch switches, so the fused
+// seam now serves these two encodings instead of refusing them. What still
+// stops this model reaching any of it is one level up and is this row's own:
+// `Glm5NextHostForward` refuses a non-CPU queue by name, because every
+// primitive here is host f32. So the paragraph below is UNCHANGED in force --
+// this file still cannot reach the fused MoE seam -- and only its reason has
+// moved from "the seam would throw" to "the seam is never called from here".
+//
+// It is gated rather than argued:
 //
 //   * **Structurally.** There is no overload taking `Glm5NextMoeWeights`,
 //     `Glm5NextMlpWeights` or any expert bank. The bridge's whole surface is
@@ -287,6 +295,23 @@ class GgufExpertSource final : public ExpertSource {
 MoeLayerWeights BridgeMoeLayer(const Glm5NextMoeWeights& src, const MoeDims& d,
                                const std::string& what,
                                int64_t byte_ceiling = kBridgeTensorF32ByteCeiling);
+
+// W9a: view this layer's three routed-expert banks as the stacked keep-quant
+// towers `vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` declare,
+// WITHOUT decoding anything. `BridgeMoeLayer` calls it; it is declared here
+// because its three outcomes are the contract, and two of them are refusals a
+// gate has to be able to drive directly.
+//
+//   true   -- admitted, `*out` filled.
+//   false  -- declined: the banks are not block-quantized (the loader's bf16
+//             expansion route) or were staged to a device and their host bytes
+//             released. The f32 arm runs, and that is a designed residency.
+//   throws -- refused: the banks ARE block-quantized and the seam cannot
+//             represent them. A silent f32 fallback here would be correct
+//             tokens at decode speed on a path nobody selected, which is
+//             precisely what no token gate can see.
+bool AdmitMoeQuantBanks(const Glm5NextMoeWeights& src, const MoeDims& d,
+                        const std::string& what, MoeQuantBanks* out);
 
 }  // namespace vllm::glm5_next
 

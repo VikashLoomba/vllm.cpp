@@ -1955,6 +1955,240 @@ before the declared correctness gate stands, and §Gates explains why the
 end-to-end one cannot stand here. W8 opens when W7 closes and its scope is set
 then.
 
+### W9 — the device arm — SPLIT, see W9a below and the two waves it does not claim
+
+The row has carried "the device arm" as an unscoped debt since O17, and O27 and
+O29 both name it as one of the two narrow debts left after W5b-2c. This section
+scopes it, and the first thing it does is establish that the debt is NOT one
+wave. That conclusion is arithmetic, and the arithmetic is below.
+
+#### What the model actually weighs, measured tensor by tensor
+
+Every previous statement about this model's device feasibility used the f32 or
+bf16 expansion of the CHECKPOINT — 305.78 GiB at FP8, 598.5 GiB at BF16, 1,134
+GiB for the expert banks alone — against `dgx:gpu0`'s ~119.63 GiB. §Gates draws
+the end-to-end gate's impossibility from those figures and O1 records it.
+
+**Those figures are all expansions. Nobody had measured what the artifact
+weighs in the encoding it is stored in.** Read on 2026-08-30 by walking the
+GGUF tensor-info region of all four shards of
+`/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` — header only, no tensor
+data — and sizing each tensor with ggml's own `type_traits` block geometry:
+
+| class | tensors | on disk | at bf16 | at f32 |
+|---|---:|---:|---:|---:|
+| routed experts (`ffn_{gate,up,down}_exps`) | 129 | **94.6758 GiB** | 580.50 GiB | 1161.00 GiB |
+| everything else | 1283 | **6.5688 GiB** | 16.96 GiB | 33.92 GiB |
+| **whole artifact** | **1412** | **101.2446 GiB** | 597.46 GiB | 1194.92 GiB |
+
+and by encoding:
+
+| ggml id | type | tensors | on disk | in `IsCudaKeepQuantSupported` |
+|---:|---|---:|---:|---|
+| 17 | IQ2_XS | 82 | 53.3320 GiB | **yes** (#2260) |
+| 18 | IQ3_XXS | 41 | 35.3145 GiB | yes |
+| 23 | IQ4_XS | 3 | 3.5859 GiB | **yes** (#2260) |
+| 13 | Q5_K | 181 | 3.0286 GiB | yes |
+| 14 | Q6_K | 117 | 2.1966 GiB | yes |
+| 10 | Q2_K | 2 | 1.4766 GiB | yes |
+| 11 | Q3_K | 1 | 0.9668 GiB | yes |
+| 8 | Q8_0 | 346 | 0.8013 GiB | **no** — CPU fallback |
+| 12 | Q4_K | 1 | 0.3323 GiB | yes |
+| 0 | F32 | 638 | 0.2100 GiB | n/a |
+
+The counts reproduce §W5's census exactly, which is the check that this walk
+read the same file that walk did. The bytes are new.
+
+**Three conclusions follow, and each of them changes a design choice.**
+
+**(1) The artifact FITS, keep-quant, and O1's impossibility is about the
+oracle rather than about us.** 101.2446 GiB against ~119.63 GiB usable is 18.39
+GiB of headroom. O1 stays exactly as written — it is a statement about running
+`transformers` v5.16.1 as an ORACLE, which needs the bf16 or FP8 expansion and
+therefore genuinely cannot happen on this fleet. What is now false is the
+inference a reader would draw from it, that OUR side cannot be device-resident
+either. It can. The two are different questions and this row had only ever
+answered the first.
+
+**(2) The Kimi-Linear shape does not fit this model, and the census is why.**
+`StageKimiResidentBf16` (`kimi_linear_weights.cpp:555-568`) widens each weight
+to bf16 at load and calls `ReleaseHost()`. Applied here it costs 597.46 GiB and
+is refused by arithmetic. Applied only to the NON-expert tower — the natural
+hybrid, and Nemotron-H's shape — it costs 16.96 GiB where those same tensors
+are 6.57 GiB on disk: **+10.39 GiB, which is 56% of the entire 18.39 GiB
+headroom, spent to widen 6.5% of the model.** The expert banks would still have
+to be keep-quant, so the bf16 widening buys no uniformity either. **All-keep-quant
+residency is the only shape with usable headroom**, and that is a measurement
+and not a preference.
+
+**(3) Q8_0 is the one uncovered encoding and it is not a blocker.** All 346 of
+them are small projections — 45 `hc_attn_fn` + 45 `hc_ffn_fn` (the mHC mixers
+the repack defect NaN'd), 170 `ssm_*` KDA gates, 84 DSA and indexer
+projections, `ffn_down_shexp` and `nextn.eh_proj`. Together they are 0.8013 GiB
+on disk and 1.5083 GiB widened to bf16. The Q8_0 keep-quant GEMM is a 32-element
+Q8_0-activation kernel that does not slot into the Q8_K super-block GEMM
+(`cuda_quant_dot.cu:821-823`), so these tensors take the bf16 expansion arm and
+cost 0.71 GiB more than keeping them. That is 3.9% of the headroom for the one
+encoding the device GEMM cannot read, and it needs no new kernel.
+
+#### A claim on the merged dependency branch that this census falsifies
+
+`cuda_quant_dot.cu:1728-1731` (`row/QUANT-CUDA-IQ4XS-IQ2XS`, merged here) says
+of the IQ2_XS and IQ4_XS arms that without them "the fused MoE seam below THREW
+outright, which is why that model shipped as `--device cpu`."
+
+**The consequence is right and the cause is wrong, and it matters because a
+later reader would conclude the device arm is now unblocked.** GLM-5.3-Flash
+ships `--device cpu` because it has NO device code of any kind:
+`grep -rln glm5 src/vt/` is empty against 49 `.cu` files, there is no
+`cuda_glm5*.cu`, and `ForwardGlm5NextForConditionalGeneration` never reaches a
+keep-quant seam at all — `glm5_next_forward.cpp:231-238` refuses a non-CPU queue
+by name before any GEMM runs. The fused seam cannot have thrown for this model
+because nothing in this model has ever called it. The two kernels were still
+necessary; they were not sufficient, and they were not the reason.
+
+#### W9a — the routed-expert GEMM, onto the shared keep-quant seam (CPU+GPU, medium). THIS WAVE
+
+**The scope is one substitution, and the reason it is the first wave is that it
+is the only hand-rolled arithmetic left in this model's MoE.** `glm5_next_moe.h`
+already states the block's polarity — the router BINDS `vt::MoeRouterTopK`'s
+grouped `noaux_tc` arm and the combine BINDS `vt::MoeCombine`, and neither is
+new numerics. The expert GEMM is the exception: `glm5_next_moe.cpp:357-374` is a
+hand-written double-accumulator matvec pair over host f32 weights that an
+`ExpertSource` decodes from GGUF blocks **on every step, for every hit expert**.
+
+That is a parallel path by hand around a shared seam that already exists, and
+AGENTS.md §"Shared seams" forbids exactly this. The seam is
+`vt::MoeGateUpSwiGLUGrouped` (`include/vt/ops.h:2476-2488`), promoted out of
+DeepSeek-V4's private kernel precisely "so any keep-quant MoE arch inherits it",
+with a CUDA provider (`cuda_quant_dot.cu:2278`) and a CPU provider
+(`cpu_quant_gemm.cpp:282`) that the header declares is "the BYTE-EXACT
+composite ... the golden the fused kernel is gated against". The down projection
+is `vt::MatmulBTQuantGrouped` (`cpu_quant_gemm.cpp:239`, CUDA at
+`cuda_quant_dot.cu:2043`).
+
+**The seam's epilogue IS this model's epilogue, not an approximation of it.**
+`ops.h:2477-2479` specifies `gate = min(F·(gate_w·xq), limit)`,
+`up = clamp(F·(up_w·xq), -limit, limit)`, `out = gate·sigmoid(gate)·up` —
+clamped SwiGLU at α=1, β=0. `glm5_next_moe.h` anchors `ExpertGate` to
+`deepseek_v4::ClampedSwiGLU` at α=1, β=0 against
+`modeling_glm5_next.py:137-142`. Same function, and the seam is where DeepSeek-V4
+already runs it.
+
+**The checkpoint's layout IS the seam's expected layout, byte for byte.** Read
+off the same header walk: every `ffn_gate_exps` / `ffn_up_exps` is
+`ne = [4096, 2048, 288]` and every `ffn_down_exps` is `[2048, 4096, 288]`, which
+in C order is `[E][N][K]` — the `[E*N, K]` stacked tower the op requires, with no
+repack. `OwnGgufQuantBlocks` (`qwen3_5_gguf_weights.cpp:71`) already builds an
+`OwnedTensor` in exactly this shape with `nk = true`, and `GgufExpertSpanOf`
+(`gguf_expert_span.cpp:78`) already offsets an expert slice in BYTES via
+`vt::RowSizeBytes` so a slice never cuts a block.
+
+**The one admission risk was checked rather than assumed.** The fused op
+requires `gate_w.dtype == up_w.dtype`. Unsloth Dynamic mixes encodings per
+layer, so this could have refused the checkpoint outright. Measured across all
+43 sparse blocks: **0 mismatches.** The distinct triples are
+`(IQ2_XS, IQ2_XS, IQ3_XXS)` x39, `(IQ2_XS, IQ2_XS, IQ4_XS)` x2,
+`(IQ3_XXS, IQ3_XXS, IQ4_XS)` x1 and `(Q2_K, Q2_K, Q3_K)` x1 — layers 3-44 plus
+blk.45, whose experts this row does not build (O2). Every one of those six
+encodings is in `IsCudaKeepQuantSupported`.
+
+**In scope.**
+- A per-layer keep-quant bank handle carrying the three expert `OwnedTensor`s
+  (`Glm5NextMoeWeights::{gate,up,down}_exps`, `glm5_next_loader.h:263-265`) as
+  `vt::Tensor` views, host or device, without decoding.
+- `MoeForward` gains a keep-quant arm that builds `act[P, H]` by gathering the
+  routed slots' hidden rows, `expert_ids[P]` i32 from `MoeRouting::topk_ids`,
+  then calls `vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` and
+  hands the same `[T, K, H]` buffer to the unchanged `vt::MoeCombine`.
+- P is `num_tokens * num_experts_per_tok`; the grouped ops sort by `expert_ids`
+  themselves, so the hand-rolled `hit`/`slots` grouping is retired rather than
+  reimplemented.
+- The existing host-f32 `ExpertSource` arm stays reachable BELOW the new arm, as
+  `nemotron_h_registry.cpp:204-213` keeps its host reference: it is the operand
+  the parity gate compares against, and deleting it deletes the gate.
+
+**Out of scope, and named so no reader mistakes this wave for the device arm.**
+- Device RESIDENCY of the banks (`dense_attn::ResidentWeight`, `stage_on_load`)
+  is **W9b**. This wave makes the seam call correct and gates it; it does not
+  upload anything.
+- The other 6.57 GiB — attention, KDA, mHC, norms, embeddings, lm_head — stays
+  host f32 loops, so `glm5_next_forward.cpp:231` still refuses a CUDA queue and
+  **the CUDA provider of this seam is NOT reached by this wave.** That is a
+  staged slice under AGENTS.md §"Nothing lands dead" and O31 discloses it.
+- The shared expert and the dense MLP keep `DenseMlpForward`: they are one
+  tensor each, not a stacked bank, and `MatmulBTQuantGrouped` is a grouped op.
+- Speed. §W8 owns the axis and O6 is unchanged. This wave does not publish a
+  tok/s number for the model.
+
+**Upstream anchors.** `modeling_glm5_next.py:120-135` (`Experts.forward`) and
+`:137-142` (`_apply_gate`) at transformers v5.16.1, sha256
+`2092bbb4efa2a8087b74f4a4da37635c503fe1df9ae73f1e6e8342af8b4b8e8b`, unchanged
+from W5 — this wave changes which of OUR seams computes them, not what they are.
+
+**Tests, red first.**
+1. `MoeForward`'s keep-quant arm agrees with its host-f32 arm on the SAME
+   weights, at the published geometry, to the tolerance the two arms'
+   accumulator orders admit. Red before the arm exists because the arm does not
+   exist; red under a mutation that swaps gate and up; red under a mutation that
+   drops `swiglu_limit`.
+2. The `expert_ids` mapping: a slot's expert id must be `topk_ids[p]` and its
+   activation row must be `hidden[p / K]`. A mutation that uses `p % K`, or that
+   forgets the gather and broadcasts row 0, must red. This is the one place a
+   wrong answer is fluent rather than a crash.
+3. Admission: a layer whose gate and up dtypes differ is refused BY NAME rather
+   than falling silently to the host arm.
+4. Reachability: deleting the production call site in `MoeForward` reds the
+   focused gate.
+
+**Gates.**
+- Focused C++ suites by hand with assertion counts, plus
+  `scripts/agent-preflight.sh --fail-on-skip`.
+- A DEVICE gate on a leased fleet box: the CUDA provider of
+  `vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` driven at THIS
+  model's geometry (E=288, N=2048, K=4096, top-8) on all four encoding triples
+  the artifact actually contains, asserted against the CPU provider that
+  `ops.h:2483-2485` declares is its golden. The box is recorded, because
+  `sm_110` (thor) and `sm_121a` (GB10) are different targets.
+- No end-to-end token claim. The parity operand for the model remains O30's
+  ` Paris.` on `dgx:gpu0` with `--device cpu`, and this wave does not move it.
+
+**Stop conditions.**
+- If the keep-quant arm and the host arm disagree beyond the accumulator
+  tolerance, STOP and report. Do not widen the tolerance to make it pass: the
+  host arm accumulates in `double` and the seam in f32, so a real disagreement
+  and an accumulator difference look alike and only a mutation separates them.
+- If any sparse layer's gate and up dtypes differ, STOP: the fused seam cannot
+  represent that checkpoint and the split-GEMM shape is a different design.
+- If a device gate cannot be taken because the fleet is held, the gate stays
+  `PENDING` with the reason recorded. An untaken device gate is never reported
+  as a pass.
+
+#### W9b — keep-quant device residency (GPU, large). NOT THIS WAVE
+
+Stage the 101.24 GiB of blocks with `dense_attn::ResidentWeight`
+(`dense_attn_block.h:181-234`, dtype-agnostic and already correct for GGUF
+blocks), slice the expert towers with the `KqResidentSlice` shape
+(`qwen3_5.cpp:5675-5688`), widen only the 346 Q8_0 tensors, and add the
+residency flag the dispatch predicate reads. **The open question is unified
+memory**: on GB10 a device copy of an mmap'd weight is a SECOND copy in the same
+pool, so 101.24 GiB resident plus the mmap's clean page cache is the thing to
+measure, not to assume. `V4ResidentExpertBase` (`deepseek_v4.cpp:1708-1715`)
+already answers it with `Synchronize` + `madvise(MADV_DONTNEED)` over the
+borrowed span, which is a move rather than a copy.
+
+#### W9c — the device forward (GPU, large). NOT THIS WAVE
+
+The remaining 6.57 GiB and roughly 2,900 lines of host f32 loops —
+`glm5_next_attn.cpp` (457), `glm5_next_dsa.cpp` (534), `glm5_next_kda.cpp`
+(417), `glm5_next_layer.cpp` (414), `glm5_next_forward.cpp` (370),
+`glm5_next_mhc.cpp` (89) — carry ZERO `vt::Tensor`. **This is why the
+DeepSeek-V4 shape does not apply**: `deepseek_v4.cpp:3100-3122` threads a
+`V4Backend{device=true}` flag through a host compose that already runs on
+device-capable ops, and there is no such compose here to thread a flag through.
+Kimi-Linear's dedicated `kimi_linear_device.cpp` (~2,500 lines) is the
+structural analogue, and it is a campaign rather than a wave.
+
 ## Tests to port
 
 `tests/models/` in transformers `v5.16.1` is the upstream suite. What is
@@ -3876,7 +4110,82 @@ Debts this row carries, each visible rather than waived:
   measured while the forge is unreachable. Owed as its own row with a measured
   CI run behind it.
 
+- **O31 — W9a's CUDA arm is NOT REACHED from a production entry point, and this
+  entry names what owns the wiring.** The substitution W9a lands routes
+  GLM-5.3-Flash's routed-expert GEMM through `vt::MoeGateUpSwiGLUGrouped` and
+  `vt::MatmulBTQuantGrouped`, both of which have a CPU provider and a CUDA
+  provider and dispatch on `q.device.type`. On this model only the CPU provider
+  runs, because `glm5_next_forward.cpp:231-238` still refuses a non-CPU queue by
+  name and nothing constructs a CUDA queue for this forward. **The CUDA arm of
+  the seam is exercised by W9a's device gate at this model's geometry and
+  encodings, and by nothing on this model's production path.**
+
+  Deliberately staged, per AGENTS.md §"Nothing lands dead". What is unreached is
+  specific: the `DeviceType::kCUDA` registration of `OpId::kMoeGateUpSwiGLUGrouped`
+  and `OpId::kMatmulBTQuantGrouped` as reached FROM THIS MODEL. **W9b** owns the
+  residency that puts the banks on a device and **W9c** owns the forward that
+  constructs a CUDA queue; until both land, the seam call is correct and host-only.
+
+  **The reachability half that IS discharged, and it is the point of the wave.**
+  On the CPU arm the substitution is fully reached — `ModelRegistry::Forward` ->
+  `ForwardGlm5NextForConditionalGeneration` -> `TextModelForward` -> the decoder
+  layer -> `MoeForward` -> the two shared ops — and deleting the seam call reds
+  the focused gate. This is not a layer waiting for a wave to call it, which is
+  what O23, O25 and O26 each were; it is a live path whose device PROVIDER is
+  owed.
+
+  **NO ISSUE NUMBER, and the reason is external.** AGENTS.md requires an open
+  GitHub issue before work starts. `gh api user` returns
+  `403 "Sorry. Your account was suspended"` on both identities available here, so
+  no issue can be filed and no existing issue can be read. This is
+  `REMOTE_UNVERIFIED`, which is never a pass: the obligation is not discharged,
+  only unperformable. Whoever regains forge access files it against this row and
+  edits this entry and W9a's heading with the number. Recorded here rather than
+  invented, because a fabricated issue reference is worse than a missing one.
+
 ## Now
+
+`ACTIVE`, 2026-08-31. **The routed-expert GEMM is on the shared keep-quant seam,
+and the device arm is scoped as three waves rather than one debt.** W9a
+(`CLAIM-GLM53-FLASH-W9A`, no issue number — see O31) moved
+`MoeForward`'s expert arm onto `vt::MoeGateUpSwiGLUGrouped` and
+`vt::MatmulBTQuantGrouped`, which was the last hand-rolled arithmetic in this
+model's MoE. The row's lifecycle state does not move, because O1 does not.
+
+**THE SCOPE CAME FROM A MEASUREMENT AND IT CHANGED THE DESIGN.** Every earlier
+statement about this model's device feasibility used an EXPANSION of the
+checkpoint against `dgx:gpu0`'s ~119.63 GiB. The artifact had never been weighed
+in the encoding it is stored in. It is **101.2446 GiB**, of which the 129
+routed-expert tensors are **94.6758 GiB** and everything else is **6.5688 GiB**.
+So it FITS keep-quant with 18.39 GiB of headroom; the Kimi-Linear
+"stage bf16-resident" shape does NOT fit, because widening only the non-expert
+tower costs +10.39 GiB — 56% of the headroom — to widen 6.5% of the model; and
+Q8_0, the one encoding with no device keep-quant GEMM, is 346 small projections
+totalling 0.8013 GiB and therefore not a blocker. §W9a carries the full census.
+
+**Gated on x86_64 at 13 cases / 9619 assertions** in `test_glm5_next_moe`, of
+which W9a's five are 8005, plus `test_glm5_next_bridge` at 20 / 32562 and the
+forward and layer suites unchanged. Five mutations, each applied to product code
+and killed by an assertion rather than by the compiler. Two are worth the next
+reader's attention. The REACHABILITY mutation is invisible to every band —
+delete the call site and both arms become the f32 arm, so the parity NMSE is
+exactly 0 — and only `GgufExpertSource::decoded()` sees it, because the
+keep-quant arm never consults the source. And dropping `swiglu_limit` SURVIVED
+the first suite: the fixture never drove a pre-clamp value past 10, so no case
+could see the clamp being removed. That was repaired rather than disclosed.
+
+**The CUDA arm of the seam is NOT reached from this model** and O31 says so.
+`glm5_next_forward.cpp:231-238` still refuses a non-CPU queue; **W9b** owns
+keep-quant residency and **W9c** owns the device forward, which is a campaign
+rather than a wave because the ~2,900 lines of this model's forward carry zero
+`vt::Tensor`. The device gate at the published MoE geometry is written and
+PENDING on `dgx:gpu0` and `thor:gpu0`, both queued behind other work; an untaken
+device gate is recorded as PENDING and never as a pass.
+
+The next actions are W6 (the vision tower, processor and placeholder expansion),
+W7b (the first fitting artifact), and W9b.
+
+### Before W9a
 
 `ACTIVE`, 2026-08-30. **The engine's guard above this model's forward no longer
 refuses it.** W5b-2c ([#2348](https://github.com/mudler/vllm.cpp/issues/2348),

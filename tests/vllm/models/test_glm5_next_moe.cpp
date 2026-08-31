@@ -39,15 +39,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
+#include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "nlohmann/json.hpp"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
 #include "vllm/model_executor/models/glm5_next.h"
+#include "vllm/model_executor/models/glm5_next_bridge.h"  // W9a: AdmitMoeQuantBanks
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"
 
@@ -513,5 +518,452 @@ TEST_CASE("glm5_next moe: the composed block is routed + shared, the shared UNSC
     gn::MoeLayerWeights bad2 = w;
     bad2.expert_down.pop_back();
     CHECK_THROWS_AS(gn::MoeForward(d, bad2, in, g::kSeq, q), std::exception);
+  }
+}
+
+// ─── W9a: the routed-expert GEMM on the shared keep-quant seam ───────────────
+//
+// The arm this section gates replaces a hand-written per-expert host-f32 matvec
+// pair with `vt::MoeGateUpSwiGLUGrouped` + `vt::MatmulBTQuantGrouped`. The
+// argument for it is in `MoeQuantBanks` (glm5_next_moe.h) and §W9a of the spec.
+//
+// WHY THESE CASES COMPARE TWO OF OUR OWN ARMS AND NOT AN ORACLE. The goldens
+// above are the transformers reference and they gate the BLOCK. What is new
+// here is not the function computed, it is which seam computes it, and the two
+// seams differ by exactly one thing: the keep-quant arm quantizes the
+// ACTIVATION to Q8_K once per call and the f32 arm does not. So the operand
+// this section needs is our own f32 arm on the SAME weights, and the oracle
+// comparison stays where it already is.
+//
+// AND A BAND ON ITS OWN WOULD BE A MUTE SWITCH. Every wrong answer available
+// here — the wrong expert row, the wrong token's activation, the two towers
+// swapped — is an O(1) error, while the activation quantization is O(1e-3). A
+// tolerance that admits the second admits nothing about the first unless the
+// separation is measured, so `the band DISCRIMINATES` below measures it rather
+// than asserting the band and hoping.
+namespace {
+
+// `block_q2_K` (llama.cpp b10451 ggml-common.h): scales[16], qs[64], d at 80,
+// dmin at 82, 84 bytes for 256 elements. Q2_K is one of the four
+// (gate, up, down) encoding triples the published UD-Q2_K_XL arm actually
+// contains — blk.45 is (Q2_K, Q2_K, Q3_K) — so this is the checkpoint's own
+// encoding and not a convenient stand-in.
+constexpr int64_t kQ2KBlockElems = 256;
+constexpr int64_t kQ2KBlockBytes = 84;
+constexpr int kQ2KDOff = 80;
+constexpr int kQ2KDminOff = 82;
+
+// Random block payload with SANE super-block scales, exactly as
+// `tests/vt/test_cuda_quant_dot.cpp` builds its weight cases: uniformly random
+// bits in the quant and scale nibbles, but `d`/`dmin` written as real fp16
+// magnitudes. Random bits in an fp16 scale field are a NaN or a 6e4 half the
+// time, and that would measure the fixture rather than the seam.
+std::vector<uint8_t> Q2KBlocks(int64_t nblocks, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::vector<uint8_t> bytes(static_cast<size_t>(nblocks * kQ2KBlockBytes));
+  for (uint8_t& b : bytes) b = static_cast<uint8_t>(rng() & 0xFFU);
+  for (int64_t i = 0; i < nblocks; ++i) {
+    uint8_t* blk = bytes.data() + static_cast<size_t>(i * kQ2KBlockBytes);
+    const float jitter = 1.0F + 0.05F * static_cast<float>(i % 7);
+    const uint16_t d = vt::F32ToF16(0.0125F * jitter);
+    const uint16_t dmin = vt::F32ToF16(0.0075F * jitter);
+    std::memcpy(blk + kQ2KDOff, &d, sizeof(d));
+    std::memcpy(blk + kQ2KDminOff, &dmin, sizeof(dmin));
+  }
+  return bytes;
+}
+
+vllm::OwnedTensor Q2KBank(int64_t e, int64_t n, int64_t k, uint32_t seed) {
+  REQUIRE(k % kQ2KBlockElems == 0);
+  vllm::OwnedTensor t;
+  t.dtype = vt::DType::kQ2_K;
+  t.rank = 3;
+  t.shape[0] = e;
+  t.shape[1] = n;
+  t.shape[2] = k;
+  t.nk = true;
+  const std::vector<uint8_t> src =
+      Q2KBlocks(e * n * (k / kQ2KBlockElems), seed);
+  t.bytes.assign(src.size(), 0U);
+  std::memcpy(t.bytes.data(), src.data(), src.size());
+  return t;
+}
+
+vllm::OwnedTensor F32Tensor(std::initializer_list<int64_t> shape, uint32_t seed,
+                            float scale) {
+  vllm::OwnedTensor t;
+  t.dtype = vt::DType::kF32;
+  t.rank = static_cast<int>(shape.size());
+  int64_t n = 1;
+  int i = 0;
+  for (int64_t s : shape) {
+    t.shape[i++] = s;
+    n *= s;
+  }
+  std::mt19937 rng(seed);
+  std::vector<float> v(static_cast<size_t>(n));
+  for (float& x : v)
+    x = scale * (static_cast<float>(rng() % 2001) / 1000.0F - 1.0F);
+  t.bytes.assign(v.size() * sizeof(float), 0U);
+  std::memcpy(t.bytes.data(), v.data(), v.size() * sizeof(float));
+  return t;
+}
+
+// Small, and every dimension chosen for a reason. K on both GEMMs must be a
+// whole number of 256-element Q8_K super-blocks, so `hidden_size` and
+// `moe_intermediate_size` are both 256. `num_experts_per_tok` 2 of 4 keeps more
+// than one slot per token, which is what makes the `p / K` vs `p % K` gather
+// observable at all. `n_group`/`topk_group` stay 1 as the published config has
+// them.
+gn::MoeDims KqDims() {
+  gn::MoeDims d;
+  d.hidden_size = 256;
+  d.n_routed_experts = 4;
+  d.n_shared_experts = 1;
+  d.num_experts_per_tok = 2;
+  d.moe_intermediate_size = 256;
+  d.n_group = 1;
+  d.topk_group = 1;
+  d.routed_scaling_factor = 2.5;
+  d.norm_topk_prob = true;
+  d.swiglu_limit = 10.0F;
+  d.Validate();
+  return d;
+}
+
+vllm::Glm5NextMoeWeights KqSource(const gn::MoeDims& d) {
+  vllm::Glm5NextMoeWeights s;
+  s.router = F32Tensor({d.n_routed_experts, d.hidden_size}, 0x8017EU, 0.05F);
+  s.e_score_correction_bias = F32Tensor({d.n_routed_experts}, 0xB1A5U, 0.01F);
+  s.gate_exps = Q2KBank(d.n_routed_experts, d.moe_intermediate_size,
+                        d.hidden_size, 0x6A7EU);
+  s.up_exps = Q2KBank(d.n_routed_experts, d.moe_intermediate_size,
+                      d.hidden_size, 0x0F00U);
+  s.down_exps = Q2KBank(d.n_routed_experts, d.hidden_size,
+                        d.moe_intermediate_size, 0xD0002U);
+  const int64_t si = d.shared_intermediate_size();
+  s.shared.gate_proj = F32Tensor({si, d.hidden_size}, 0x5111U, 0.03F);
+  s.shared.up_proj = F32Tensor({si, d.hidden_size}, 0x5222U, 0.03F);
+  s.shared.down_proj = F32Tensor({d.hidden_size, si}, 0x5333U, 0.03F);
+  return s;
+}
+
+// Normalized mean squared error between two runs of the same block.
+double Nmse(const std::vector<float>& a, const std::vector<float>& b) {
+  REQUIRE(a.size() == b.size());
+  double num = 0.0;
+  double den = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    REQUIRE(std::isfinite(a[i]));
+    REQUIRE(std::isfinite(b[i]));
+    const double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+    num += diff * diff;
+    den += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+  }
+  return den > 0.0 ? num / den : num;
+}
+
+// The activation-quantization band. It is NOT the discriminating assertion;
+// `the band DISCRIMINATES` below is. Q8_K gives the activation 8 bits and one
+// scale per 256 elements, and the block chains two such GEMMs, so a few parts
+// per thousand is the expected agreement between an f32-activation dot and an
+// integer block dot over the identical weights.
+constexpr double kKeepQuantBand = 5e-3;
+
+}  // namespace
+
+TEST_CASE("glm5_next moe keep-quant: the seam arm agrees with the f32 arm") {
+  const gn::MoeDims d = KqDims();
+  const vllm::Glm5NextMoeWeights src = KqSource(d);
+  vt::Queue q = CpuQueue();
+
+  gn::MoeLayerWeights w = gn::BridgeMoeLayer(src, d, "moe");
+  // The bridge ADMITTED the banks. If this ever reads false the two arms below
+  // are the same arm and every comparison in this file becomes a tautology, so
+  // it is asserted rather than assumed.
+  REQUIRE(w.has_quant_banks);
+  gn::GgufExpertSource source(src, d, "moe");
+  w.expert_source = &source;
+
+  // The f32 operand: the SAME struct with the keep-quant arm switched off, so
+  // the only difference between the two runs is which seam ran.
+  gn::MoeLayerWeights wf = w;
+  wf.has_quant_banks = false;
+  wf.expert_source = &source;
+
+  constexpr int64_t kT = 3;
+  std::mt19937 rng(0xBEEF);
+  std::vector<float> hidden(static_cast<size_t>(kT * d.hidden_size));
+  for (float& x : hidden)
+    x = static_cast<float>(rng() % 2001) / 1000.0F - 1.0F;
+
+  // THE KEEP-QUANT ARM IS ASSERTED TO HAVE RUN, not assumed. Without this the
+  // whole case is a tautology under the one mutation that matters: disable the
+  // branch and BOTH runs become the f32 arm, the NMSE is exactly 0, and every
+  // band below passes while the seam is never called.
+  //
+  // `GgufExpertSource::decoded()` is the instrument and it is a direct one. The
+  // keep-quant arm never consults the source, so an empty log after the first
+  // run IS the statement "no expert was decoded to f32 this step" — which is
+  // the whole point of the wave — and a non-empty log after the second is the
+  // statement that the operand it is compared against was really produced the
+  // other way.
+  const std::vector<float> got = gn::MoeForward(d, w, hidden, kT, q);
+  CHECK(source.decoded().empty());
+  const std::vector<float> ref = gn::MoeForward(d, wf, hidden, kT, q);
+  CHECK_FALSE(source.decoded().empty());
+  REQUIRE(got.size() == ref.size());
+  REQUIRE(static_cast<int64_t>(got.size()) == kT * d.hidden_size);
+
+  const double nmse = Nmse(got, ref);
+  CAPTURE(nmse);
+  CHECK(nmse <= kKeepQuantBand);
+  for (float x : got) CHECK(std::isfinite(x));
+  // The f32 arm was actually driven — a zeroed `ref` would make any band pass.
+  double ref_energy = 0.0;
+  for (float x : ref) ref_energy += static_cast<double>(x) * x;
+  CHECK(ref_energy > 0.0);
+}
+
+TEST_CASE("glm5_next moe keep-quant: the band DISCRIMINATES") {
+  // The band above admits the activation quantization. This case measures what
+  // it REFUSES, because a band nobody has separated from a real defect is a
+  // mute switch. The defect injected is the one the arm is most likely to have:
+  // the routed slots read the wrong expert row.
+  const gn::MoeDims d = KqDims();
+  const vllm::Glm5NextMoeWeights src = KqSource(d);
+  vt::Queue q = CpuQueue();
+
+  gn::MoeLayerWeights w = gn::BridgeMoeLayer(src, d, "moe");
+  REQUIRE(w.has_quant_banks);
+  gn::GgufExpertSource source(src, d, "moe");
+  w.expert_source = &source;
+  gn::MoeLayerWeights wf = w;
+  wf.has_quant_banks = false;
+
+  constexpr int64_t kT = 3;
+  std::mt19937 rng(0xBEEF);
+  std::vector<float> hidden(static_cast<size_t>(kT * d.hidden_size));
+  for (float& x : hidden)
+    x = static_cast<float>(rng() % 2001) / 1000.0F - 1.0F;
+
+  const std::vector<float> ref = gn::MoeForward(d, wf, hidden, kT, q);
+  const std::vector<float> good = gn::MoeForward(d, w, hidden, kT, q);
+
+  // ROTATE THE EXPERT TOWERS BY ONE EXPERT. Every shape, dtype, byte count and
+  // block boundary is unchanged; only which expert a slot reads moves. This is
+  // the shape of a real indexing defect, and it is what the band has to be able
+  // to see.
+  vllm::Glm5NextMoeWeights rotated = src;
+  const size_t stride = static_cast<size_t>(
+      d.moe_intermediate_size * (d.hidden_size / kQ2KBlockElems) *
+      kQ2KBlockBytes);
+  auto rotate = [&](vllm::OwnedTensor& t) {
+    std::vector<uint8_t> b(t.bytes.size());
+    std::memcpy(b.data(), t.bytes.data(), t.bytes.size());
+    std::rotate(b.begin(), b.begin() + static_cast<std::ptrdiff_t>(stride),
+                b.end());
+    std::memcpy(t.bytes.data(), b.data(), b.size());
+  };
+  rotate(rotated.gate_exps);
+  rotate(rotated.up_exps);
+  rotate(rotated.down_exps);
+
+  gn::MoeLayerWeights wr = gn::BridgeMoeLayer(rotated, d, "moe");
+  REQUIRE(wr.has_quant_banks);
+  const std::vector<float> wrong = gn::MoeForward(d, wr, hidden, kT, q);
+
+  const double nmse_good = Nmse(good, ref);
+  const double nmse_wrong = Nmse(wrong, ref);
+  CAPTURE(nmse_good);
+  CAPTURE(nmse_wrong);
+  // The separation, printed rather than implied. If a later change narrows this
+  // to single digits the band has stopped gating and the reader can see it.
+  const double separation = nmse_wrong / std::max(nmse_good, 1e-12);
+  CAPTURE(separation);
+  CHECK(nmse_wrong > kKeepQuantBand * 20.0);
+  CHECK(separation > 20.0);
+}
+
+TEST_CASE("glm5_next moe keep-quant: a slot reads ITS OWN token's hidden row") {
+  // `act[p] = hidden[p / top_k]`. Writing `p % top_k` indexes a real token for
+  // every slot, so the result stays finite, correctly shaped and fluent — the
+  // one defect in this arm that no shape, dtype or finiteness assertion can
+  // see. The invariant that catches it: the block is a per-token function, so
+  // row t of a multi-token call must equal the single-token call on that row.
+  const gn::MoeDims d = KqDims();
+  const vllm::Glm5NextMoeWeights src = KqSource(d);
+  vt::Queue q = CpuQueue();
+
+  gn::MoeLayerWeights w = gn::BridgeMoeLayer(src, d, "moe");
+  REQUIRE(w.has_quant_banks);
+  // Attached only as an instrument. If the keep-quant branch stops being taken,
+  // this case would otherwise silently measure the f32 arm instead.
+  gn::GgufExpertSource source(src, d, "moe");
+  w.expert_source = &source;
+
+  constexpr int64_t kT = 4;
+  std::mt19937 rng(0x5107);
+  std::vector<float> hidden(static_cast<size_t>(kT * d.hidden_size));
+  for (float& x : hidden)
+    x = static_cast<float>(rng() % 2001) / 1000.0F - 1.0F;
+
+  const std::vector<float> many = gn::MoeForward(d, w, hidden, kT, q);
+  REQUIRE(static_cast<int64_t>(many.size()) == kT * d.hidden_size);
+
+  int64_t rows_checked = 0;
+  for (int64_t t = 0; t < kT; ++t) {
+    const std::vector<float> one(
+        hidden.begin() + static_cast<std::ptrdiff_t>(t * d.hidden_size),
+        hidden.begin() + static_cast<std::ptrdiff_t>((t + 1) * d.hidden_size));
+    const std::vector<float> got = gn::MoeForward(d, w, one, 1, q);
+    REQUIRE(static_cast<int64_t>(got.size()) == d.hidden_size);
+    for (int64_t h = 0; h < d.hidden_size; ++h) {
+      CAPTURE(t);
+      CAPTURE(h);
+      CHECK(many[static_cast<size_t>(t * d.hidden_size + h)] ==
+            doctest::Approx(got[static_cast<size_t>(h)]).epsilon(1e-5));
+    }
+    ++rows_checked;
+  }
+  CHECK(rows_checked == kT);
+
+  // The rows are DIFFERENT from one another, so the case above cannot pass by
+  // the block emitting one constant row. Without this, a forward that ignored
+  // its input entirely would satisfy every assertion in this case.
+  double spread = 0.0;
+  for (int64_t h = 0; h < d.hidden_size; ++h) {
+    spread += std::fabs(many[static_cast<size_t>(h)] -
+                        many[static_cast<size_t>(d.hidden_size + h)]);
+  }
+  CAPTURE(spread);
+  CHECK(spread > 0.0);
+  // Every call above went through the seam and none of them decoded an expert.
+  CHECK(source.decoded().empty());
+}
+
+TEST_CASE("glm5_next moe keep-quant: the swiglu_limit REACHES the seam") {
+  // MEASURED, then fixed here rather than disclosed. Mutation M4 replaces
+  // `d.swiglu_limit` with +infinity at the seam call site, and every case above
+  // SURVIVED it: this fixture's weights and activations never drive a pre-clamp
+  // value past a limit of 10, so a comparison that never sees the clamp engage
+  // cannot gate whether the clamp was passed at all. A band is only a gate for
+  // the defects its data actually exercises.
+  //
+  // THE GATE IS A DIFFERENCE, NOT A VALUE. Run identical inputs at two limits,
+  // one tight enough to bite and one loose, and require the outputs to differ.
+  // A call site that drops the argument returns the same numbers twice whatever
+  // the epilogue computes, and no golden is needed to see that.
+  //
+  // THE SHARED EXPERT IS ZEROED, and that is the load-bearing part of the
+  // fixture. `DenseMlpForward` takes the SAME limit, so with a live shared term
+  // the two runs would differ through the shared path alone and the case would
+  // pass even under M4 -- gating nothing while looking strict. With the shared
+  // projections zero its contribution is zero at any limit, so every difference
+  // below is the routed seam's.
+  vllm::Glm5NextMoeWeights src = KqSource(KqDims());
+  const int64_t si = KqDims().shared_intermediate_size();
+  const int64_t H = KqDims().hidden_size;
+  src.shared.gate_proj = F32Tensor({si, H}, 0x2001U, 0.0F);
+  src.shared.up_proj = F32Tensor({si, H}, 0x2002U, 0.0F);
+  src.shared.down_proj = F32Tensor({H, si}, 0x2003U, 0.0F);
+
+  gn::MoeDims tight = KqDims();
+  tight.swiglu_limit = 0.05F;
+  gn::MoeDims loose = KqDims();
+  loose.swiglu_limit = 64.0F;
+
+  vt::Queue q = CpuQueue();
+  gn::MoeLayerWeights wt = gn::BridgeMoeLayer(src, tight, "moe");
+  gn::MoeLayerWeights wl = gn::BridgeMoeLayer(src, loose, "moe");
+  REQUIRE(wt.has_quant_banks);
+  REQUIRE(wl.has_quant_banks);
+
+  constexpr int64_t kT = 3;
+  std::mt19937 rng(0xC1A3DU);
+  std::vector<float> hidden(static_cast<size_t>(kT * H));
+  for (float& x : hidden)
+    x = static_cast<float>(rng() % 2001) / 1000.0F - 1.0F;
+
+  const std::vector<float> a = gn::MoeForward(tight, wt, hidden, kT, q);
+  const std::vector<float> b = gn::MoeForward(loose, wl, hidden, kT, q);
+  REQUIRE(a.size() == b.size());
+
+  double diff = 0.0;
+  double energy = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    REQUIRE(std::isfinite(a[i]));
+    REQUIRE(std::isfinite(b[i]));
+    diff += std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+    energy += std::fabs(static_cast<double>(b[i]));
+  }
+  CAPTURE(diff);
+  CAPTURE(energy);
+  // The loose arm is non-trivial, so "they differ" is not satisfied by both
+  // being zero.
+  CHECK(energy > 0.0);
+  // A clamp at 0.05 against a loose 64 must move the block by a visible
+  // fraction of its own magnitude, not by a rounding step.
+  CHECK(diff > 0.01 * energy);
+}
+
+TEST_CASE("glm5_next moe keep-quant: admission declines, refuses, and admits") {
+  const gn::MoeDims d = KqDims();
+
+  SUBCASE("f32 banks DECLINE, and the f32 arm keeps running") {
+    vllm::Glm5NextMoeWeights src = KqSource(d);
+    src.gate_exps = F32Tensor({d.n_routed_experts, d.moe_intermediate_size,
+                               d.hidden_size}, 0x1U, 0.02F);
+    src.up_exps = F32Tensor({d.n_routed_experts, d.moe_intermediate_size,
+                             d.hidden_size}, 0x2U, 0.02F);
+    src.down_exps = F32Tensor({d.n_routed_experts, d.hidden_size,
+                               d.moe_intermediate_size}, 0x3U, 0.02F);
+    gn::MoeQuantBanks banks;
+    CHECK_FALSE(gn::AdmitMoeQuantBanks(src, d, "moe", &banks));
+  }
+
+  SUBCASE("a gate/up dtype MISMATCH is refused BY NAME") {
+    vllm::Glm5NextMoeWeights src = KqSource(d);
+    src.up_exps.dtype = vt::DType::kQ6_K;  // both are block-quant, only differ
+    gn::MoeQuantBanks banks;
+    CHECK_THROWS_WITH_AS(gn::AdmitMoeQuantBanks(src, d, "moe", &banks),
+                         doctest::Contains("requires one dtype for the pair"),
+                         std::runtime_error);
+  }
+
+  SUBCASE("a REPACKED bank is refused BY NAME") {
+    // The transform this refuses preserves the dtype AND the byte count, so no
+    // other assertion in the bridge can see it.
+    vllm::Glm5NextMoeWeights src = KqSource(d);
+    src.gate_exps.repacked = true;
+    gn::MoeQuantBanks banks;
+    CHECK_THROWS_WITH_AS(gn::AdmitMoeQuantBanks(src, d, "moe", &banks),
+                         doctest::Contains("REPACK marker"), std::runtime_error);
+  }
+
+  SUBCASE("a PARTIALLY quantized bank set is refused BY NAME") {
+    vllm::Glm5NextMoeWeights src = KqSource(d);
+    src.down_exps = F32Tensor({d.n_routed_experts, d.hidden_size,
+                               d.moe_intermediate_size}, 0x9U, 0.02F);
+    gn::MoeQuantBanks banks;
+    CHECK_THROWS_WITH_AS(gn::AdmitMoeQuantBanks(src, d, "moe", &banks),
+                         doctest::Contains("takes all three or none"),
+                         std::runtime_error);
+  }
+
+  SUBCASE("the admitted views are the STACKED [E*N, K] towers") {
+    const vllm::Glm5NextMoeWeights src = KqSource(d);
+    gn::MoeQuantBanks banks;
+    REQUIRE(gn::AdmitMoeQuantBanks(src, d, "moe", &banks));
+    CHECK(banks.gate.rank == 2);
+    CHECK(banks.gate.shape[0] == d.n_routed_experts * d.moe_intermediate_size);
+    CHECK(banks.gate.shape[1] == d.hidden_size);
+    CHECK(banks.down.shape[0] == d.n_routed_experts * d.hidden_size);
+    CHECK(banks.down.shape[1] == d.moe_intermediate_size);
+    CHECK(banks.gate.dtype == vt::DType::kQ2_K);
+    CHECK(banks.up.dtype == vt::DType::kQ2_K);
+    CHECK(banks.down.dtype == vt::DType::kQ2_K);
+    // The view aims at the bank's own bytes: no copy, no decode.
+    CHECK(banks.gate.data == static_cast<const void*>(src.gate_exps.bytes.data()));
   }
 }

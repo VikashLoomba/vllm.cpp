@@ -193,6 +193,61 @@ class ExpertSource {
                       std::vector<float>& down) = 0;
 };
 
+// The routed-expert banks in the checkpoint's OWN block encoding, BORROWED.
+//
+// ─── WHY A THIRD RESIDENCY, WHEN THE OTHER TWO ALREADY BOUND THE PEAK ────────
+//
+// `ExpertSource` above bounds the PEAK at one expert and it does that
+// correctly. What it does not bound is the WORK: it decodes an expert's
+// `[2I, H]` + `[H, I]` out of GGUF blocks into host f32 on EVERY step, for
+// every expert that step's tokens hit. The blocks it decodes FROM are 2.20 GiB
+// per sparse layer and are already in the file; the f32 it decodes TO is 27.0
+// GiB per sparse layer and is thrown away before the next step. Reading the
+// blocks where they lie copies nothing and decodes nothing.
+//
+// ─── AND IT IS NOT NEW NUMERICS, WHICH IS THE POINT ──────────────────────────
+//
+// `vt::MoeGateUpSwiGLUGrouped` (`include/vt/ops.h`) is the shared keep-quant
+// seam that DeepSeek-V4's private fused kernel was PROMOTED into, in its own
+// words "so any keep-quant MoE arch inherits it". Its epilogue is specified as
+// `gate = min(F.(gate_w.xq), limit)`, `up = clamp(F.(up_w.xq), -limit, limit)`,
+// `out = gate.sigmoid(gate).up` — clamped SwiGLU at alpha=1, beta=0, which is
+// `ExpertGate` above, which is `deepseek_v4::ClampedSwiGLU` at alpha=1, beta=0,
+// which is `_apply_gate` (`:137-142`). Same function, three spellings, and this
+// arm uses the one that already has two providers. The down projection is
+// `vt::MatmulBTQuantGrouped`. Both dispatch on the queue's device, so this is
+// also the ONLY expert arm a CUDA queue could ever run.
+//
+// ─── THE SHAPES ARE THE CHECKPOINT'S OWN, WITH NO REPACK ─────────────────────
+//
+// `LoadStackedExperts` (`glm5_next_loader.cpp`) builds each bank as
+// `OwnGgufQuantBlocks(t, E * N, K)` and then RESHAPES the record to `[E, N, K]`;
+// its own comment says the bytes are identical either way. `[E * N, K]` is
+// exactly the stacked tower both ops declare, so these views are a rank change
+// over the same pointer and never a copy. Measured on the published artifact:
+// every `ffn_{gate,up}_exps` is `ne = [4096, 2048, 288]` and every
+// `ffn_down_exps` is `[2048, 4096, 288]`.
+//
+// ─── WHAT THIS ARM CHANGES NUMERICALLY, AND IT IS NOT NOTHING ────────────────
+//
+// The seam quantizes the ACTIVATION to Q8_K once per call; the two f32 arms do
+// not. So this arm and the f32 arms do NOT agree bit-for-bit, and a gate
+// between them is an error band and not an equality. The ROUTER is untouched
+// and still runs in f32 (`RouterLogits`), so expert SELECTION is unaffected —
+// which matters, because selection error is bimodal and a tolerance cannot see
+// it, while this one is an ordinary value perturbation that a tolerance can.
+// This is the same activation-quantization the DeepSeek-V4 and Qwen3.5 MoE arms
+// already ship.
+//
+// BORROWED, exactly like `expert_source`: every `data` pointer here aims into
+// the loader's mmap or its owned block bytes, and must outlive every
+// `MoeForward` call that reads the enclosing struct.
+struct MoeQuantBanks {
+  vt::Tensor gate;  // [E * moe_intermediate_size, hidden_size], block-quant
+  vt::Tensor up;    // [E * moe_intermediate_size, hidden_size], the SAME dtype
+  vt::Tensor down;  // [E * hidden_size, moe_intermediate_size], block-quant
+};
+
 // One sparse layer's weights, in the checkpoint's own packing: the routed
 // experts arrive STACKED and gate/up arrive FUSED, which is how
 // `Glm5NextTextExperts` declares them (`:116-117`) and how
@@ -218,6 +273,14 @@ struct MoeLayerWeights {
   // row's headers keep naming. The pointer must outlive every `MoeForward`
   // call that reads this struct.
   ExpertSource* expert_source = nullptr;
+  // The KEEP-QUANT alternative to both shapes above, and the one `MoeForward`
+  // prefers when it is present. Valid iff `has_quant_banks`; borrowed, with the
+  // lifetime `expert_source` has. A layer may carry this together with an
+  // `expert_source` — that is not the ambiguous state the two f32 shapes are in,
+  // because the two are the same weights in two encodings and the keep-quant one
+  // simply wins. What is refused is BOTH f32 shapes at once, as before.
+  MoeQuantBanks quant_banks;
+  bool has_quant_banks = false;
   // The shared expert, at `shared_intermediate_size()`.
   DenseMlpWeights shared;
 };

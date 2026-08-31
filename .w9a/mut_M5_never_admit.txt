@@ -1,0 +1,56 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:675:
+TEST CASE:  glm5_next moe keep-quant: the seam arm agrees with the f32 arm
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:684: FATAL ERROR: REQUIRE( w.has_quant_banks ) is NOT correct!
+  values: REQUIRE( false )
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:728:
+TEST CASE:  glm5_next moe keep-quant: the band DISCRIMINATES
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:738: FATAL ERROR: REQUIRE( w.has_quant_banks ) is NOT correct!
+  values: REQUIRE( false )
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:788:
+TEST CASE:  glm5_next moe keep-quant: a slot reads ITS OWN token's hidden row
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:799: FATAL ERROR: REQUIRE( w.has_quant_banks ) is NOT correct!
+  values: REQUIRE( false )
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:845:
+TEST CASE:  glm5_next moe keep-quant: admission declines, refuses, and admits
+  a gate/up dtype MISMATCH is refused BY NAME
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:864: ERROR: CHECK_THROWS_WITH_AS( gn::AdmitMoeQuantBanks(src, d, "moe", &banks), "requires one dtype for the pair", std::runtime_error ) did NOT throw at all!
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:845:
+TEST CASE:  glm5_next moe keep-quant: admission declines, refuses, and admits
+  a REPACKED bank is refused BY NAME
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:875: ERROR: CHECK_THROWS_WITH_AS( gn::AdmitMoeQuantBanks(src, d, "moe", &banks), "REPACK marker", std::runtime_error ) did NOT throw at all!
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:845:
+TEST CASE:  glm5_next moe keep-quant: admission declines, refuses, and admits
+  a PARTIALLY quantized bank set is refused BY NAME
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:884: ERROR: CHECK_THROWS_WITH_AS( gn::AdmitMoeQuantBanks(src, d, "moe", &banks), "takes all three or none", std::runtime_error ) did NOT throw at all!
+
+===============================================================================
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:845:
+TEST CASE:  glm5_next moe keep-quant: admission declines, refuses, and admits
+  the admitted views are the STACKED [E*N, K] towers
+
+/home/mudler/_git/vllm.cpp-glmgpu/tests/vllm/models/test_glm5_next_moe.cpp:892: FATAL ERROR: REQUIRE( gn::AdmitMoeQuantBanks(src, d, "moe", &banks) ) is NOT correct!
+  values: REQUIRE( false )
+
+===============================================================================
+[doctest] test cases:  4 |  0 passed | 4 failed | 8 skipped
+[doctest] assertions: 32 | 25 passed | 7 failed |
+[doctest] Status: FAILURE!

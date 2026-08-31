@@ -224,19 +224,6 @@ the two LSE layouts coincide, since `MergeAttnStates` wants `[H, T]` and the
 decode op emits `[T, H]`. A general prefill step needs a transpose there and
 does not get one yet; it is listed under `## Owed
 
-- **The compressor's OWN KV projection is not materialized, so W1's composition
-  pools the wrong operand on the real artifact.** Upstream's compressor owns a
-  `fused_wkv_wgate` producing both its KV and its gate from the hidden state
-  (`compressor.py:279-287`), and the artifact stores
-  `attn.compressor.wkv.weight` per compressor layer. This tree accounts that
-  tensor and deliberately does not materialize it, because the collapsed
-  geometry reuses the MLA's `kraw` as the compressor's KV
-  (`deepseek_v4_weights.cpp`, the `Account` comment). `CompressorLayerStep`
-  inherits that convention: correct for the synthetic suites, and on the real
-  artifact it would pool the MLA latent where upstream pools a separate
-  projection -- finite, plausible, and wrong. This is a FOURTH piece W3 needs,
-  beyond the three the forward's refusal names.
-
 - **The indexer's qr projection is UNEXERCISED.** Its shape is accepted and that
   acceptance is gated, but no test runs a forward to completion with the upstream
   geometry, because the layer still refuses on `compressor.wkv`. A mutation that
@@ -404,6 +391,29 @@ one token resuming at `kv_base = 7` refuses, a fresh state at 0 is accepted, and
 the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
+
+## W3's fourth piece: the compressor pools its OWN projection
+
+Recorded as owed one commit ago and now closed. Upstream's compressor owns a
+`fused_wkv_wgate` emitting BOTH its KV and its gate from the hidden state
+(`compressor.py:279-287`), and every compressor layer of the artifact stores
+`attn.compressor.wkv.weight`. This tree accounted that tensor and dropped it,
+because the collapsed geometry reuses the MLA's `kraw`, and `CompressorLayerStep`
+inherited the convention -- right for the synthetic suites, wrong on the real
+artifact.
+
+`DeepseekV4LayerHostWeights::comp_wkv` now materializes it at the same
+`coff * head_dim` width as the gate it is fused with, and the forward projects the
+compressor's KV from it, falling back to the latent only for a checkpoint that
+carries none.
+
+**The gate had to be repaired before it proved anything.** Perturbing `comp_wkv`
+and diffing the logits reported a difference of exactly ZERO: at ratio 128 a
+single token at position 0 closes no window, so the pooled row never reaches the
+output and the projection reads as inert. The case now seeds 127 prior rows so
+`(127 + 1) % 128 == 0` closes a window on the step under test, with `kv_base` set
+to match the prefix guard. Two mutations run red: falling back to the MLA latent
+despite `comp_wkv` being present, and projecting from the gate's weight instead.
 
 ## W3's core mechanism: the coff == 2 overlapped gather
 

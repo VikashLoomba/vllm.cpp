@@ -1065,8 +1065,19 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       VT_CHECK(static_cast<int64_t>(cs.state_kv.size()) > layer,
                "deepseek-v4 compressor: state has no entry for this layer");
       std::vector<int64_t> pos64(positions.begin(), positions.end());
+      // W3 (#2286): pool the compressor's OWN projection of the hidden state when
+      // the checkpoint carries one. Upstream's `fused_wkv_wgate` emits the KV and
+      // the gate together (`compressor.py:279-287`) and never reuses the MLA
+      // latent; `deck` is the collapsed geometry's convention and is kept only
+      // for checkpoints that carry no `compressor.wkv`.
+      const int64_t comp_w =
+          static_cast<int64_t>(L.comp_wgate.size()) / (H > 0 ? H : 1);
+      const std::vector<float> comp_kv =
+          L.comp_wkv.empty()
+              ? deck
+              : Gemm(be, /*kq=*/nullptr, L.comp_wkv, x, T, comp_w, H);
       o = deepseek_v4::CompressorLayerStep(
-          *be.q, x, deck, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
+          *be.q, x, comp_kv, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
           (*be.paged_kv)[static_cast<size_t>(layer)],
           (*be.paged_kv)[static_cast<size_t>(layer)].shape[0],
           (*be.paged_kv)[static_cast<size_t>(layer)].shape[1],

@@ -320,6 +320,41 @@ is explicit -- "Before you conclude anything about past work, read the spec and
 run `git log -S`" -- and `git log --oneline --grep '2068'` shows `ca3dcda21`
 immediately. It was not run.
 
+## The refusal narrows LAST, not first
+
+Attempted 2026-08-31 and REVERTED, because the attempt is the natural first move
+and it is wrong.
+
+`ResolveDeepseekV4SwaPages` refuses every compressor layer. Narrowing it to refuse
+only `compress_ratio == 4` -- W3's `coff == 2` overlapped windows plus the
+Lightning Indexer -- looks like progress, since W1's `MergeWindowAndCompressed`
+has landed and `compress_ratio == 128` is `coff == 1`. It builds, and
+`test_deepseek_v4_paged_equiv` catches it immediately.
+
+The primitive exists; NOTHING CALLS IT. So a narrowed refusal does not enable the
+composition, it removes the guard in front of the arm that cannot do it: those 20
+layers would attend the RAW PREFIX and emit entirely plausible tokens from the
+wrong key set. A loud refusal becomes a silent wrong answer, which is the exact
+trade this row exists to prevent.
+
+**The order is: wire the forward, gate it, THEN narrow the refusal.** The refusal
+is not the work; it is what makes the missing work visible.
+
+## What the REAL artifact needs, counted
+
+From the artifact's own `config.json`, `compress_ratios` over 46 layers:
+
+| shape | layers | wave |
+|---|---|---|
+| dense (`0`) | 5 | already handled |
+| `compress_ratio == 128` (`coff == 1`) | 20 | W1 |
+| `compress_ratio == 4` (`coff == 2` + indexer) | 21 | W3 |
+
+So finishing W1 covers 20 of the 41 compressor layers and does NOT make the real
+artifact loadable. The other 21 need W3, including the Lightning Indexer's learned
+top-k, which is the hardest mechanism in this row. Any plan that reads
+"DSA-COMPOSE finishes" as one more wave is mis-sized by the harder half.
+
 ## Work breakdown
 
 | wave | scope | depends on |

@@ -228,8 +228,8 @@ independent instruments, sharing no code, put `vt::AttentionCross` at **54% to
 **25% to 35%**, across three machines, two architectures and five load regimes.
 **On GB10 -- the machine the render was measured on, idle -- it is attention
 66.5%, GEMM 24.8%, everything else 8.7%.** The connector's attention performs
-**4.2% of the layer's arithmetic and takes two thirds of its time**; it costs
-**2.7x the GEMM** there. The tier that runs is `neon`, not the reference tile,
+**4.0% of the layer's arithmetic and takes two thirds of its time**; it costs
+**2.69x the GEMM** there. The tier that runs is `neon`, not the reference tile,
 and the margin is **54x**.
 
 **So #2354's 37 GFLOP/s is not the GEMM's rate.** That number is
@@ -517,7 +517,7 @@ tile the same GEMM set takes **1738.202 s at 2.4 GFLOP/s**; the tier that
 actually runs takes **31.906 s at 129.3 GFLOP/s**. The portable tier takes
 119.390 s at 34.6 GFLOP/s, so NEON is 3.74x portable.
 
-**And 34.6 is a trap worth naming.** The portable tier's rate is within 7% of the
+**And 34.6 is a trap worth naming.** The portable tier's rate is within 7.5% of the
 37.2 GFLOP/s #2354 derived from the render, so a reader checking "are we on a
 slow tier?" against that number alone would conclude yes. The tier is `neon` and
 the GEMM runs at 129.3. The coincidence is arithmetic, not evidence.
@@ -775,10 +775,21 @@ Three further reasons, each measured rather than asserted:
   result and `### RETRACTION` carries the claim they killed.
 - **STILL NO ISSUE, and the reason changed under this row.** The account that
   filed for this campaign (`mudler-agent`) was suspended mid-row, and a suspended
-  account's content is **hidden, not deleted**, so #2296, #2354 and the rest may
-  not resolve for a reader even though they exist. GitHub now works under
-  `localai-org-maint-bot`. A `gh` lookup that fails on any of those numbers is
-  `REMOTE_UNVERIFIED` and **never** evidence the issue is absent -- filing a
-  duplicate on that reading is the failure this bullet exists to prevent. An
+  account's content is **hidden, not deleted**. GitHub now works under
+  `localai-org-maint-bot` -- `gh api user` returns it, exit 0 -- and **both of
+  this campaign's issues fail to resolve under it**, checked rather than assumed:
+
+  ```
+  gh issue view 2296 -> Could not resolve to an issue or pull request
+  gh issue view 2354 -> Could not resolve to an issue or pull request
+  ```
+
+  **That is `REMOTE_UNVERIFIED` and it is NOT evidence either issue is absent.**
+  #2296 and #2354 are cited by `ltx25-render-speed-parity.md` and
+  `ltx25-text-cond-device.md`, both of which are ON `main`, so the tree says they
+  existed. A reader who takes the 404 at face value would file duplicates of two
+  live issues and re-open a campaign that is already recorded; that is the
+  failure this bullet exists to prevent, and this row did NOT file anything on
+  the strength of it. An
   issue for this row is owed the moment someone can open one against the
   campaign's existing thread. Owner: this row.

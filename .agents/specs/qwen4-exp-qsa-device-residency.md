@@ -214,6 +214,61 @@ build of this tree took about 100 minutes on a box at load 130. Each mutation wa
 reverted and confirmed byte-for-byte before the next, and the final tree is
 `git diff --exit-code` clean against `HEAD`.
 
+## The device measurement
+
+`thor:gpu0` (`rc-worker-n8smh`, aarch64 Tegra), inside an `rc` lease, job
+`51587748-255c-425f-aabf-59663f24a962`. CUDA toolkit 13.0 apt-installed by the
+job; `cmake -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110
+-DVLLM_CPP_TRITON=OFF`, `CMAKE_RC=0`, `BUILD_RC=0`, **40 `.cu.o` objects**. Tree
+`ec666b716` (= `origin/main` `84f6fac0a` + this branch).
+
+**Two legs, differing ONLY in `qwen4_exp_qsa_block.{cpp,h}`.** Leg B substitutes
+`origin/main`'s copies of those two files into the same tree and rebuilds
+(`BUILD_B_RC=0`); the counted property is `grep -c kCPU`, **6 on main against 2
+here**. That is a real ABSENCE, not a mutation.
+
+### The refusal was real, and it was exactly where predicted
+
+| leg | `test_qwen4_exp_qsa_block` | the block stopped with |
+|---|---|---|
+| **B** (main's block) | **rc 1**, 12/13, 5939/5940 — `CHECK_FALSE(IsResidencyRefusal(...))` fired | `qwen4_exp qsa block: the two rope layouts are cross-checked on the host, so both must be CPU-resident …` at **`qwen4_exp_qsa_block.cpp:147`** |
+| **A** (this branch) | **rc 0**, 13/13, 5940/5940 | `vt: cuda rmsnorm: weight dtype must match x` at `src/vt/cuda/cuda_ops.cu:463` |
+
+So `CheckRopeLayoutsAgree` WAS the first stop on a CUDA queue, as the code read
+predicted, and it is gone. **The CUDA-ness of the run is proven by those two
+messages themselves** — the leg-B refusal fires only when `device.type != kCPU`,
+and leg A's names a `src/vt/cuda/` kernel. `test_cuda_backend` returned 127
+because the job built only the two test targets it needed, so that particular
+instrument did NOT run and is not offered as evidence.
+
+### But the FORWARD never reaches the block, and that outranks the fix
+
+Both legs, identically, through `ModelRegistry::Forward` on a CUDA queue:
+
+```text
+vt: qwen4_exp_gated_residual: block_inject_weight device mismatch
+    at src/vt/ops.cpp:2562
+```
+
+That is **decoder layer 0's attention hyper-connection** — before PLE, before any
+MoE block, and long before layer 3's `qwen_sparse_attention`. The QSA block is
+not reached from the forward on CUDA at all, which is why leg A and leg B give
+the same answer for that case.
+`qwen4_exp_forward.cpp:418` and `:476` pass `lw.{attn,mlp}_hc.inject.View()` raw
+while every sibling operand goes through `dense_attn::ResidentWeight`.
+[#2449](https://github.com/mudler/vllm.cpp/issues/2449) owns it, and records the
+worse shape behind it: `check_projection` skips the device check entirely for a
+block-quantized operand, and the released checkpoint stores every inject as Q8_0,
+so on the real weights this would be a host pointer handed to a device kernel
+rather than a message.
+
+### What is therefore NOT measured
+
+**No CPU-vs-CUDA parity numbers exist.** Tier 2 of the block case never ran,
+because the block stops at the `cuda rmsnorm` dtype refusal above. There is no
+`max|diff|`, no selection set comparison and no margin from a device. **No token
+was produced on CUDA, and none is claimed.**
+
 ## Owed
 
 - **(SUPERSEDED BY THE REBASE.)** This entry read "THE DEVICE BRANCH LANDS
@@ -226,7 +281,8 @@ reverted and confirmed byte-for-byte before the next, and the final tree is
   four missing `vt::` `kCUDA` arms**, so a CUDA queue now reaches this block and
   the `Backend::Copy` arm is on a production path. What remains owed is the
   MEASUREMENT, below.
-- **NO DEVICE RUN IS RECORDED IN THIS SPEC YET.** On a CPU queue every operand is
+- **(CLOSED — the device run happened; see `## The device measurement`.)** This
+  entry read "NO DEVICE RUN IS RECORDED IN THIS SPEC YET." On a CPU queue every operand is
   `kCPU`, so `StageHostWords` takes its memcpy arm and the `Backend::Copy` arm
   does not run; the CPU gate therefore cannot see the device branch at all, and
   its greenness is evidence of no regression rather than of the fix. The two CUDA
@@ -243,6 +299,12 @@ reverted and confirmed byte-for-byte before the next, and the final tree is
   layer 0's projections rather than a message, and the file's own comment records
   it. [#2419](https://github.com/mudler/vllm.cpp/issues/2419) owns it; this spec
   claims nothing about that path.
+- **THE CPU-vs-CUDA PARITY OF THIS BLOCK IS STILL OWED.** The gate is written and
+  runs — `test_qwen4_exp_qsa_block.cpp`'s tier 2 compares the output against the
+  oracle golden and the SELECTION by SET EQUALITY with its margin printed — but it
+  cannot execute until `vt::RmsNorm`'s CUDA arm accepts this block's operands
+  (`cuda_ops.cu:463`, "weight dtype must match x"). Until then the device arm is
+  proven to be ENTERED and not to be CORRECT, and this spec claims only the first.
 - **THE COPY COSTS A QUEUE SYNCHRONIZE PER QSA LAYER PER STEP on a device arm.**
   THREE, counted rather than estimated: `CheckRopeLayoutsAgree` synchronises once
   for its nine staged ranges, `QsaBlockCore` once for group 2's page table on the

@@ -311,6 +311,63 @@ struct DeepseekV4Exl3Expert {
 struct DeepseekV4Exl3LayerWeights {
   std::vector<DeepseekV4Exl3Expert> experts;
 };
+// ── The MTP (nextn) tail, CLASSIFIED ────────────────────────────────────────
+// `CLAIM-DEEPSEEK-V4-MTP` R1 (#1314). The loader skips `mtp.*` wholesale, exactly
+// as vLLM does (`AutoWeightsLoader(skip_substrs=["mtp."])`, nvidia/model.py:1474),
+// because upstream gives the head to a SEPARATE model (`DeepSeekV4MTP`,
+// registry.py:617). Skipping is right; skipping BLIND is what cost this row a
+// week -- `deepseek-v4-mtp.md` §4 recorded the MTP gate as weight-BLOCKED while
+// this very loader was meeting 3985 draft-head tensors on each load and dropping
+// them without saying what they were.
+//
+// MEASURED on `/mnt/nas_share/rc/ckpt/dsv4-flash-0731-spark-exl3` (2026-08-31),
+// read from the safetensors headers. The head is NOT EXL3 even though the
+// checkpoint directory says exl3: only the MAIN model was requantized to trellis.
+// Per head, 32 non-expert tensors (0.175 GiB) plus 216 routed experts:
+//
+//   mtp.L.attn.*, mtp.L.ffn.shared_experts.*   F8_E4M3 weight + F8_E8M0 scale,
+//                                              blocks of EXACTLY 128x128
+//   mtp.L.ffn.experts.E.w{1,2,3}               I8-packed e2m1 [N, K/2] +
+//                                              F8_E8M0 scale [N, K/32] -- group
+//                                              32, i.e. MXFP4, NOT NVFP4's 16
+//   norms, gate, hc_*, attn_sink               BF16 / F32, stored plainly
+//
+// Both quantized layouts already have readers here: `DequantFp8BlockToF32` and
+// `DequantMxfp4ToBf16`. That is what makes R1 an un-skip rather than a port.
+enum class DeepseekV4MtpFormat { kPlain, kFp8Block, kMxfp4 };
+
+// One `(name, dtype, shape)` triple. Deliberately NOT an `StTensor`: classifying
+// must not require a mapped 100 GB file, so the gate can state the real shapes
+// as data.
+struct DeepseekV4MtpTensorDesc {
+  std::string name;
+  std::string dtype;
+  std::vector<int64_t> shape;
+};
+
+struct DeepseekV4MtpInventory {
+  int64_t num_heads = 0;   // distinct `mtp.{L}` indices, NOT a config value: the
+                           // measured artifact carries THREE where the config
+                           // says `num_nextn_predict_layers = 1`, and three is
+                           // what makes a K5 draft possible upstream.
+  int64_t plain = 0;
+  int64_t fp8_block = 0;
+  int64_t mxfp4 = 0;
+  // Non-empty when a tensor carries a layout this arm has no reader for. It is a
+  // REPORT, not a throw: the 156.7 GiB NVFP4 checkpoint's tail uses the
+  // double-scale variant (`weight_scale` + `weight_scale_2` + `input_scale`), and
+  // refusing here would break loads that work today. The MTP lane reads this and
+  // refuses when it actually wants a head.
+  std::string refusal;
+};
+
+// PURE. Classifies the `mtp.*` tensors of a checkpoint. A `.scale` companion is
+// not classified on its own -- the `.weight` is classified and its scale must be
+// present with the right shape, because a weight whose scale is missing or
+// mis-shaped would otherwise read as a supported tensor and dequantize to noise.
+DeepseekV4MtpInventory ClassifyDeepseekV4MtpTail(
+    const std::vector<DeepseekV4MtpTensorDesc>& tail);
+
 struct DeepseekV4Exl3Weights {
   int tp = 0;            // the source artifact's tensor-parallel width
   int bits = 0;          // K
@@ -323,6 +380,10 @@ struct DeepseekV4Exl3Weights {
   // draft-head tensors, and a reader must be able to see that the loader met
   // them and chose to skip them.
   int64_t skipped_mtp_tensors = 0;
+  // What those skipped tensors ARE, classified rather than merely counted. See
+  // `ClassifyDeepseekV4MtpTail`. Filled on every safetensors load; consulted by
+  // the MTP lane when it asks whether this checkpoint can supply a draft head.
+  DeepseekV4MtpInventory mtp{};
 };
 
 struct DeepseekV4Weights {

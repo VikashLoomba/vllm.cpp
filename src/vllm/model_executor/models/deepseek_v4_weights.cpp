@@ -56,6 +56,8 @@
 // W1 (single-GB10 oracle run) is MEMORY-INFEASIBLE — needs multi-node TP / offload.
 #include "vllm/model_executor/models/deepseek_v4.h"
 
+#include "vllm/model_executor/model_loader/mxfp4_dequant.h"  // kMxfp4GroupSize
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -805,6 +807,109 @@ int64_t ReportDeepseekV4Exl3Residency(const DeepseekV4Weights& weights,
 
 namespace {
 
+// `mtp.{L}.` -> L, or -1 when the name is not an MTP tensor.
+int64_t MtpHeadIndex(const std::string& name) {
+  if (name.rfind("mtp.", 0) != 0) return -1;
+  const size_t dot = name.find('.', 4);
+  if (dot == std::string::npos || dot == 4) return -1;
+  int64_t v = 0;
+  for (size_t i = 4; i < dot; ++i) {
+    if (name[i] < '0' || name[i] > '9') return -1;
+    v = v * 10 + (name[i] - '0');
+  }
+  return v;
+}
+
+}  // namespace
+
+DeepseekV4MtpInventory ClassifyDeepseekV4MtpTail(
+    const std::vector<DeepseekV4MtpTensorDesc>& tail) {
+  DeepseekV4MtpInventory inv;
+  std::unordered_map<std::string, const DeepseekV4MtpTensorDesc*> by_name;
+  std::unordered_set<int64_t> heads;
+  for (const auto& d : tail) by_name.emplace(d.name, &d);
+
+  for (const auto& d : tail) {
+    const int64_t head = MtpHeadIndex(d.name);
+    if (head < 0) {
+      if (inv.refusal.empty())
+        inv.refusal = "deepseek-v4 mtp: '" + d.name + "' is not an mtp.{L}.* tensor";
+      continue;
+    }
+    heads.insert(head);
+
+    // A scale is accounted WITH its weight, never on its own.
+    const std::string kScale = ".scale";
+    if (d.name.size() > kScale.size() &&
+        d.name.compare(d.name.size() - kScale.size(), kScale.size(), kScale) == 0) {
+      continue;
+    }
+
+    if (d.dtype == "BF16" || d.dtype == "F32") {
+      ++inv.plain;
+      continue;
+    }
+
+    const std::string sname = d.name + ".scale";
+    const auto sit = by_name.find(sname);
+    if (sit == by_name.end()) {
+      if (inv.refusal.empty())
+        inv.refusal = "deepseek-v4 mtp: '" + d.name + "' is " + d.dtype +
+                      " but carries no '" + sname +
+                      "'; a quantized weight without its scale would dequantize to noise";
+      continue;
+    }
+    const DeepseekV4MtpTensorDesc& sc = *sit->second;
+    if (d.shape.size() != 2 || sc.shape.size() != 2) {
+      if (inv.refusal.empty())
+        inv.refusal = "deepseek-v4 mtp: '" + d.name + "' and its scale must both be rank 2";
+      continue;
+    }
+
+    // FP8 BLOCK: E4M3 weight, E8M0 scale, blocks of exactly 128x128.
+    if (d.dtype == "F8_E4M3" && sc.dtype == "F8_E8M0") {
+      const int64_t bn = sc.shape[0] == 0 ? 0 : d.shape[0] / sc.shape[0];
+      const int64_t bk = sc.shape[1] == 0 ? 0 : d.shape[1] / sc.shape[1];
+      if (bn != 128 || bk != 128 || sc.shape[0] * bn != d.shape[0] ||
+          sc.shape[1] * bk != d.shape[1]) {
+        if (inv.refusal.empty())
+          inv.refusal = "deepseek-v4 mtp: '" + d.name +
+                        "' is fp8-block but its scale does not tile it at 128x128";
+        continue;
+      }
+      ++inv.fp8_block;
+      continue;
+    }
+
+    // MXFP4: I8 holding two e2m1 nibbles, so K = 2 * shape[1]; one E8M0 scale per
+    // group of 32 inputs. Group 16 would be NVFP4 and needs a different reader.
+    if (d.dtype == "I8" && sc.dtype == "F8_E8M0") {
+      const int64_t k = d.shape[1] * 2;
+      if (sc.shape[0] != d.shape[0] || sc.shape[1] == 0 ||
+          k / sc.shape[1] != kMxfp4GroupSize || sc.shape[1] * kMxfp4GroupSize != k) {
+        if (inv.refusal.empty())
+          inv.refusal = "deepseek-v4 mtp: '" + d.name +
+                        "' is packed 4-bit but its scale is not one E8M0 byte per " +
+                        std::to_string(kMxfp4GroupSize) + " inputs";
+        continue;
+      }
+      ++inv.mxfp4;
+      continue;
+    }
+
+    if (inv.refusal.empty())
+      inv.refusal = "deepseek-v4 mtp: '" + d.name + "' has layout " + d.dtype + "/" +
+                    sc.dtype + ", which this arm has no reader for";
+  }
+
+  inv.num_heads = static_cast<int64_t>(heads.size());
+  return inv;
+}
+
+namespace {
+
+
+
 DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
                                      const HfConfig& config,
                                      const DeepseekV4Params& p) {
@@ -851,6 +956,7 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
 
   int64_t accounted = 0;
   int64_t skipped_mtp = 0;
+  std::vector<DeepseekV4MtpTensorDesc> mtp_descs;
 
   // ── the CARRIED half: the same name-map the non-EXL3 arm walks, minus the
   //    routed-expert block EXL3 replaced — MATERIALIZED into the host-float
@@ -1092,6 +1198,10 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       // the upstream repo can run a K5 speculative draft at all, and reaching
       // them is a later row's work.
       ++skipped_mtp;
+      // R1 (#1314): say WHAT was skipped, not just how many. Classification is
+      // pure and cheap; the MTP lane reads the result rather than re-opening the
+      // checkpoint to find out whether a draft head is available.
+      mtp_descs.push_back(DeepseekV4MtpTensorDesc{name, tensor->dtype, tensor->shape});
       continue;
     }
     VT_CHECK(false,
@@ -1103,6 +1213,7 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
   }
 
   w.exl3.skipped_mtp_tensors = skipped_mtp;
+  w.exl3.mtp = ClassifyDeepseekV4MtpTail(mtp_descs);
   w.accounted_tensors = accounted;
   // W1c. The carried tower above is what `ForwardComposeImpl` reads on this
   // arm, so the flag every forward entry point gates on is set HERE, on the one

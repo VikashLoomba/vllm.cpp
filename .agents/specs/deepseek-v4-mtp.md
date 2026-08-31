@@ -242,6 +242,28 @@ that the oracle does not, once a weight-carrying GGUF exists.
 | Real-model MTP-on==MTP-off + acceptance/speedup | 80.7 GB `ds4flash.gguf` on GB10 | **BLOCKED for the GGUF arm** — that file has no nextn tensors (§4) |
 | Real-model MTP-on==MTP-off + acceptance/speedup | NAS `dsv4-flash-0731-spark-exl3`, `mtp.{0,1,2}.*` un-skipped | **OPEN, not blocked** — three NVFP4 heads are present (§4 correction); needs R1 un-skip + NVFP4 expert dequant + R2/R3 |
 
+### R1a — what landed, and what it deliberately does NOT do
+
+`ClassifyDeepseekV4MtpTail` turns the blanket skip into an accounted inventory:
+per-format counts, a head count taken from the TENSORS rather than from
+`num_nextn_predict_layers`, and a by-name report for any layout this arm has no
+reader for. The loader fills it on every safetensors load
+(`w.exl3.mtp`), and the skip itself is unchanged -- vLLM skips the tail in the
+main loader too, because a separate model owns it.
+
+It is a REPORT, never a throw. The 156.7 GiB NVFP4 checkpoint's tail uses the
+double-scale variant (`weight_scale` + `weight_scale_2` + `input_scale`), and
+throwing here would break loads that work today. R1b refuses at the point where a
+head is actually wanted.
+
+Gated two ways, because the two claims are different. `test_deepseek_v4_mtp_inventory`
+states the measured artifact's real shapes as data and exercises the classifier
+directly: group-16 NVFP4 is refused rather than read as MXFP4, a quantized weight
+with no scale is refused by name, and a scale that does not tile its weight at
+128x128 is refused. `test_deepseek_v4_exl3_loader` drives the PRODUCTION load and
+reads the inventory off the weights, so deleting the loader's call site reds it --
+which is what separates "the function works" from "anything reaches it".
+
 ## Dependencies
 
 - The DS4 target forward + host composition (`ForwardComposeImpl`, `AttentionBlock`, `MoeBlock`,
@@ -258,6 +280,8 @@ that the oracle does not, once a weight-carrying GGUF exists.
 | W1a loader | `DeepseekV4MtpHostWeights` struct + `DeepseekV4GgufHasMtp` absence guard + un-skip the safetensors `mtp.*` accounting | DONE |
 | W1b draft forward | `DeepseekV4MtpDraftLogitsHost` (nextn layer + compute_logits, 1:1 nvidia/mtp.py) + `DeepseekV4TargetMtpResidualHost` residual stash | DONE |
 | W1c gate | `test_deepseek_v4_mtp` (finite + RED-first + lossless verify) | DONE |
+| R1a inventory | the loader CLASSIFIES the `mtp.*` tail instead of only counting it (`ClassifyDeepseekV4MtpTail`); fp8-block at 128x128 and MXFP4 at group 32 are recognised, anything else is reported by name | DONE |
+| R1b head load | actually READ the classified tail into `DeepseekV4MtpHostWeights` (`DequantFp8BlockToF32` + `DequantMxfp4ToBf16`); a keep-quant residency decision belongs here, since three heads dequantized to host f32 do not fit beside the target | RESIDUAL |
 | R2 decode-loop | DS4-native propose/verify over `ForwardResidentDecodeGguf` (stash residual, draft k=1, verify) | RESIDUAL |
 | R3 engine register | wire `DeepSeekV4MTP` as the engine speculator (C++ analogue of registry.py:617) | RESIDUAL |
 | R4 device draft | device MTP forward for decode-graph speed | RESIDUAL |

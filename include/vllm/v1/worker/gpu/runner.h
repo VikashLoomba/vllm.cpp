@@ -668,8 +668,25 @@ class GPUModelRunner final : public ModelRunnerBase {
   bool multi_cache_topology_ = false;
   std::vector<std::vector<int32_t>> layer_attn_kv_indices_;
   std::vector<std::string> attn_kv_layer_names_;
-  std::vector<int32_t> attn_kv_group_ids_;
-  std::vector<int32_t> attn_kv_layer_indices_;
+  // ENG-MULTIKV-BYNAME: the BY-NAME index over EVERY published cache, paged and
+  // recurrent alike, in published GROUP order and then the group's own
+  // `layer_names` order — upstream's own insertion order for the single
+  // `kv_caches` dict (`vllm/v1/worker/gpu_model_runner.py:7365-7372` @ pin
+  // 5559679229). These five are parallel to EACH OTHER and back
+  // `multi_kv_index_`'s five pointers.
+  //
+  // They are NOT parallel to `attn_kv_`, and that is the whole change: W3's
+  // three vectors were, so a `MambaSpec` group — which contributes no `attn_kv_`
+  // entry — could not be represented in them at all, and `Find()` answered -1
+  // for all 34 of `qwen4_exp`'s recurrent states (#2343). `kv_index_payload_*`
+  // carries the locator a position used to imply: entry `i` is
+  // `attn_kv_[slot]` when its kind is `kPaged` and `gdn_state_[slot]` when it is
+  // `kRecurrent`. Empty on every uniform topology.
+  std::vector<std::string> kv_index_layer_names_;
+  std::vector<int32_t> kv_index_group_ids_;
+  std::vector<int32_t> kv_index_layer_indices_;
+  std::vector<uint8_t> kv_index_payload_kinds_;
+  std::vector<int32_t> kv_index_payload_slots_;
   // W5c-2 (#2249 item 3): one gathered block table per PUBLISHED GROUP, indexed
   // by group id (NOT parallel to `attn_kv_` — a table belongs to a group, and
   // every layer in the group shares it, which is upstream's own fan-out). Sized

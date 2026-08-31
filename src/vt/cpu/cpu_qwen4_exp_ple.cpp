@@ -56,10 +56,15 @@
 // spec's `## Owed` records that.
 //
 // ─── SCOPE ────────────────────────────────────────────────────────────────────
-// Nothing here is registered for any device but kCPU, so the dispatcher refuses
-// BY NAME on every other one rather than silently falling back. The CUDA arm is
-// OWED, not written: this is a CPU-only host and an ungated kernel is worse
-// than an absent one.
+// Both ops here are also registered for kCUDA, in
+// `src/vt/cuda/cuda_qwen4_exp_ple.cu` (W6-CUDA). The spec's evidence table, not
+// this comment, records which device that arm was built and measured on.
+// The device arms inherit THIS file's numeric decisions rather than making new
+// ones — the conv's DOUBLE four-tap accumulator and the gate's all-double
+// interior, including the `SignedSqrt` NaN guard — and are held to these same
+// goldens plus a bitwise comparison against these kernels
+// (`tests/vllm/models/test_qwen4_exp_cuda.cpp`). No OTHER device is registered,
+// so the dispatcher refuses those BY NAME rather than silently falling back.
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -107,7 +112,13 @@ void Qwen4ExpPleConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
   const int32_t* qsl = query_start_loc.Ptr<int32_t>();
   const int32_t* rows =
       conv_state_indices == nullptr ? nullptr : conv_state_indices->Ptr<int32_t>();
-  float* state_base = conv_state.Ptr<float>();
+  // THE RING IS READ AND WRITTEN THROUGH THE DTYPE ACCESSORS, not a `float*`.
+  // Upstream types this slot from the model dtype (`cache_utils.py:1019-1023`
+  // against the `hidden_states` reaching `update_conv_state(..., state_idx=1)`
+  // at `modeling_qwen4_exp.py:1157-1159`), so a bf16 model carries a bf16 ring —
+  // observed on the pinned oracle, not assumed. The window `hist` stays double
+  // either way, so the ONLY effect of a bf16 ring is the rounding upstream
+  // itself performs on the store.
   const int64_t row_stride = channels * state_len;
 
   std::vector<double> hist;
@@ -124,7 +135,7 @@ void Qwen4ExpPleConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
     // produces one, and `test_qwen4_exp_ple_device.cpp` pins the identity.
     if (tokens <= 0) continue;
     const int64_t row = rows == nullptr ? s : static_cast<int64_t>(rows[s]);
-    float* st = state_base + row * row_stride;
+    const int64_t st = row * row_stride;
 
     const int64_t span = state_len + tokens;
     hist.assign(static_cast<size_t>(span), 0.0);
@@ -135,7 +146,7 @@ void Qwen4ExpPleConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
       // cache row IS that padding, which is why this op has no
       // `has_initial_state`.
       for (int64_t j = 0; j < state_len; ++j) {
-        hist[static_cast<size_t>(j)] = st[c * state_len + j];
+        hist[static_cast<size_t>(j)] = LoadF32At(conv_state, st + c * state_len + j);
       }
       for (int64_t t = 0; t < tokens; ++t) {
         hist[static_cast<size_t>(state_len + t)] =
@@ -161,7 +172,8 @@ void Qwen4ExpPleConvKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w
       // activation. `span - state_len == tokens`, so a chunk shorter than the
       // window keeps the tail of the old state ahead of it, unshifted.
       for (int64_t j = 0; j < state_len; ++j) {
-        st[c * state_len + j] = static_cast<float>(hist[static_cast<size_t>(tokens + j)]);
+        StoreF32At(conv_state, st + c * state_len + j,
+                   static_cast<float>(hist[static_cast<size_t>(tokens + j)]));
       }
     }
   }

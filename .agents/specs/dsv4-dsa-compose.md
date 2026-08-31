@@ -392,6 +392,29 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## W3's core mechanism: the coff == 2 overlapped gather
+
+`CompressorStepCycle` takes `coff` and implements upstream's gather verbatim
+(`fused_compress_quant_cache.py:169-183`):
+
+    start  = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    tokens = arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    head_offset = (tokens >= COMPRESS_RATIO) * HEAD_SIZE
+
+So `coff * compress_ratio` rows are gathered ending at the boundary, the state row
+is `coff * head_dim` wide, and **a row's ROLE is its index WITHIN THE GATHERING
+WINDOW** -- the first `compress_ratio` positions read the low half, the rest the
+high half. That is precisely what the forward's refusal means by a role "never
+recoverable from the tensor alone", and it is why the tensors are doubled while
+`norm` stays `head_dim`-wide (`compressor.py:288`).
+
+Gated with halves made distinguishable by sign, so the three plausible readings
+give three different numbers: the correct role split pools to -2.0, ignoring
+`head_offset` gives +4.5, and inverting the roles gives +2.0. Three mutations run
+red -- `head_offset` ignored, roles inverted, and only `compress_ratio` rows
+gathered instead of `coff * compress_ratio`. A separate case pins that `coff == 1`
+is byte-unchanged, since every landed gate was written against it.
+
 ## W3's first tensor: the indexer's query comes from the q-LoRA
 
 One of the three pieces the forward's refusal names is "the indexer's query

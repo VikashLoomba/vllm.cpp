@@ -2391,6 +2391,177 @@ reproduced on the recorded SHA, STOP: a scoping built on a misread anchor is
 worse than no scoping, and this spec family has been caught with drifted anchors
 before.
 
+#### W9c-0 — the k-pool indexer's device selection ops (GPU, large). [#2415](https://github.com/mudler/vllm.cpp/issues/2415)
+
+`CLAIM-GLM53-FLASH-KPOOL-CUDA`, 2026-08-31, row
+`MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, branch
+`row/MODEL-MM-GLM53-FLASH-KPOOL-CUDA`, base `bd2c14ce5`. This wave writes the
+kernel §W9c "RESCOPED" said nobody had to write.
+
+**THE DECISION #2415 ASKS FOR, TAKEN.** #2415 offers two ways to put the 11 DSA
+layers on a GPU: write a k-pool indexer CUDA kernel, or leave the indexer on the
+host and pay a device-to-host round trip per DSA layer per step. **The kernel.**
+The reasoning, so it is not re-litigated: the host arm is not a cheap fallback
+on this model. Each round trip has to move the whole packed key history the pool
+grid is re-formed over — `2 * index_head_dim + 1 = 257` floats per token per
+layer, which at 32k context is 33.7 MiB per layer per step and 371 MiB per step
+across the eleven — plus a `[B, S, 2051]` selection back. That is a synchronous
+stall eleven times on the critical path of a 101.24 GiB model whose entire
+reason for having a device arm is that the weights are already resident. A
+device arm whose indexer is on the host is not a device arm; it is the CPU path
+with a copy tax. #2415 is closed by this wave with that argument recorded, and
+the alternative is not staged, not flagged and not kept as a fallback, because a
+fallback nobody may use is the branch AGENTS.md §"Nothing lands dead" names.
+
+**Scope.** Two new `vt::OpId` entries, one CUDA provider apiece, and a
+model-side availability probe. Nothing else. Named exclusions, each owned
+elsewhere: this wave does **not** wire the model's forward onto the ops (W9c-3),
+does **not** lift the two CPU-only refusals at `glm5_next_kda.cpp:322-325` and
+`glm5_next_moe.cpp:222-225` (W9c-2), does **not** touch residency (W9b), and
+does **not** retire `glm5_next_attn.cpp`'s hand-rolled MLA (W9c-1, O33). It
+lands **unreached** and O36 says so in the specific.
+
+**Oracle.** vLLM implements `glm5_next` at no revision — re-verified for this
+wave rather than inherited: `git grep -n 'glm5_next\|Glm5Next' -- vllm/` in the
+pinned checkout at `555967922` exits 1 with no output, and
+[vllm#53906](https://github.com/vllm-project/vllm/pull/53906) is still OPEN and
+therefore inadmissible under AGENTS.md §"When vLLM has no implementation". The
+reference is `transformers` **v5.16.1**, the lane pin
+[`.agents/oracles/transformers.md`](../oracles/transformers.md) already carries,
+fetched at `refs/tags/v5.16.1` and byte-checked against the size this spec
+records for it (`modular_glm5_next.py`, 95,314 bytes).
+
+**Ported from, `file:line` on both sides, each anchor asserted UNIQUE in its
+file** (`grep -c` on the `def` line = 1 for every one of the four):
+
+| ours | `transformers` v5.16.1 `models/glm5_next/modular_glm5_next.py` |
+|---|---|
+| `vt::Glm5NextKpoolCompress` | `:897-970` `Glm5NextTextIndexer.get_pooled_states` |
+| `vt::Glm5NextKpoolSelect`, the scoring and top-k half | `:821-875` `Glm5NextTextIndexer.forward` |
+| `vt::Glm5NextKpoolSelect`, the visibility it folds in | `:877-895` `Glm5NextTextIndexer.get_visible_tokens` |
+| `vt::Glm5NextKpoolSelect`, the tail half | `:972-1022` `Glm5NextTextIndexer.append_visible_tail` |
+
+The second reference is this tree's own gated host implementation,
+`glm5_next_dsa.{h,cpp}`, whose port map carries the same anchors and whose
+`test_glm5_next_dsa` goldens are the RUN output of that same lane revision. The
+device ops answer to it.
+
+**THE DECOMPOSITION, AND WHY IT IS TWO OPS AND NOT ONE OR FOUR.**
+
+- `PackIndexerStates` (`glm5_next_dsa.cpp:95-142`) is **not** a new op and must
+  not become one. It is `wk` + a `nn.LayerNorm` + `kpool_gate` + a concat, and
+  `vt::Matmul`/`vt::MatmulBT` and `vt::LayerNorm` already serve all of it. The
+  concat is a write into a slice of the packed row. W9c-3 composes it; this wave
+  deliberately adds nothing for it, on the same reasoning
+  `kQwen4ExpQsaCompress`'s `ops.h` comment gives for what it left out.
+- `GetVisibleTokens` (`:147-165`) is **not** a new op either. It is
+  `j <= current_length - q_length + s && valid_keys[b][j]` — two scalars and a
+  mask — and materialising it as a `[B, S, kv_len]` tensor to hand between two
+  device ops would allocate 2.7 GiB at 32k context for a predicate a thread can
+  evaluate in two instructions. `Glm5NextKpoolSelect` takes `valid_keys` and the
+  two lengths and evaluates it inline. Upstream materialises it because torch
+  has no other way to express a gather under it; that is a framework constraint,
+  not the model's semantics, and mirroring the constraint instead of the
+  semantics is the trap `.agents/porting.md` §"Mirror the memory format" names.
+- `Glm5NextKpoolCompress` is the LEARNED pooling — the stage DeepSeek-V4 has no
+  counterpart for and the reason a new op family exists at all.
+- `Glm5NextKpoolSelect` is the selection: score, mask, pool-level top-k, expand
+  to member token indices, append the ragged tail, truncate, mask by the query
+  padding. The tail is inside this op rather than beside it because the tail's
+  WRITE OFFSET is `select_k * index_kpool` and `select_k` depends on `P`, which
+  only this op knows; splitting it would publish an intermediate width whose
+  only consumer re-truncates it.
+
+**`P` IS DATA-DEPENDENT AND IT IS NOT READ BACK TO THE HOST.** Upstream's
+`keep = pool_valid.any(0)` (`:968`) compacts the pool axis, and `select_k =
+min(index_topk // index_kpool, P)` (`:845`) reads the compacted width. This is
+not cosmetic: with `P` too large by even one, `select_k * index_kpool` moves the
+tail's write offset and the final `[..., :output_width]` truncation
+(`:870-872`) cuts a different set. So `Glm5NextKpoolCompress` performs the
+compaction on the device — a per-pool validity pass, a single-block exclusive
+scan over the `keep` predicate, then a compacted write — and publishes `P` as a
+`[1]` i32 **device** scalar that `Glm5NextKpoolSelect` reads on the device.
+Neither op synchronises and neither returns anything to the host. Every output
+buffer is sized at the static upper bound `np = ceil(kv_len / index_kpool)`;
+`topk_indices` is `[B, S, OutputWidth()]`, which is fixed at 2051 on this
+checkpoint regardless of `P`.
+
+**DTYPE: f32, AND THAT IS UPSTREAM'S OWN ARITHMETIC RATHER THAN A CHOICE.**
+Upstream scores in fp32 (`scores = torch.matmul(q.float(), pool_keys...float())`,
+`:823`) and takes the pool softmax in fp32 (`:960-964`). The kernels do the
+same. **The host reference accumulates in `double`** — `Linear`
+(`glm5_next_dsa.cpp:28-37`), the dot at `:465-466`, the pool softmax at
+`:225-261` — which is a host-reference widening this row took deliberately and
+which the device arm must NOT copy: a fp64 pool softmax on `sm_121a` would move
+the model path onto the 1/64-rate pipe to be *more* precise than the reference
+it mirrors, and AGENTS.md §"Inherit vLLM defaults" is explicit that a token gate
+cannot see a dtype that is too wide. So the host↔device delta on this row is
+**fp32-vs-fp64 reduction order and nothing else**, and §Gates below says how it
+is bounded rather than waved at.
+
+`nvcc` contracts `a * b + c` into an FMA by default, which makes the kernel's
+own rounding depend on the optimiser rather than on the source. Every
+accumulation in both kernels uses `__fadd_rn` / `__fmul_rn`, the convention
+`cuda_conv1d_general.cu` sets, so the device answer is reproducible run to run
+and the only remaining difference from the host is the width. `expf` and not
+`__expf`: the fast intrinsic is a different function, not a faster spelling of
+the same one.
+
+**Registration, and the CPU-only build.** Both ops register on `kCUDA` only,
+through `vt::RegisterOp` in `src/vt/cuda/cuda_glm5_next.cu`, in the
+`Registrar`-struct shape `cuda_dsa_indexer.cu:318-325` uses. The `ops.h` free
+functions shape-check and then `GetOp(op, q.device.type)`, so a CPU queue throws
+`GetOp`'s own unregistered-op error and no stub is ever linked. The
+availability probe is `vllm::glm5_next::KpoolDeviceOpsAvailable()`
+(`glm5_next_device.{h,cpp}`), a 1:1 mirror of
+`deepseek_v4::V4DeviceKernelsAvailable` (`deepseek_v4_device.cpp:30-35`), so
+W9c-3's forward can decide before it builds operands rather than after it
+throws. **There is no CPU provider and this wave does not add one**: the CPU
+answer already exists as `glm5_next_dsa.cpp` and is what the gate measures
+against; registering it a second time under an `OpId` would make the seam its
+own oracle, which is the tautology `.agents/verification.md` warns about.
+
+**Tests.** `tests/vllm/models/test_glm5_next_kpool_device.cpp`, which SKIPS
+without a CUDA backend and is therefore a real gate only on a leased device.
+Three properties it must keep, each because dropping it makes the file a
+tautology:
+
+1. It runs the **same fixture geometry** `test_glm5_next_dsa` runs — `seq_len`
+   21 against `index_topk` 8, one row left-padded by three — so the pool grid
+   does not start at slot 0 and the selection is not the identity. It reuses
+   `glm5_next_dsa_goldens.inc` verbatim, which carries the transformers RUN
+   output of the intermediates as well as the result: `kPoolKeys`,
+   `kPoolIndices`, `kPoolValid`, `kIndexScores` and `kTopkIndices`. So the
+   device arm answers to the oracle directly and to the host arm as well, rather
+   than only to our own C++. **The fixture exercises the compaction rather than
+   assuming it**: `np = ceil(21 / 4) = 6` and `kNumPools = 5`, so a kernel that
+   skipped `keep` would place the tail at column 12 instead of 8 and fail on
+   every row. Its four short cases (`kShortNumPools` all 0) exercise `P == 0`,
+   where the entire selection is the raw tail.
+2. **SET equality of the selected token indices, plus the positionwise
+   comparison, plus the printed margin.** Top-k error is bimodal: a wrong pool's
+   scores can be arbitrarily close, so a tolerance on `index_scores` bounds
+   nothing about the selection. The margin between the `select_k`-th and
+   `select_k + 1`-th masked score is printed for every discriminating row.
+3. **Every float comparison is `isfinite`-guarded on both operands before it is
+   made.** An all-NaN forward on this row once read as a perfect match, because
+   every comparison against NaN is false, and the model then emitted token id 0
+   eight times. A NaN in either arm fails this file rather than passing it.
+
+**Gates.** `scripts/agent-preflight.sh --fail-on-skip`; the CPU suites by hand
+with case and assertion counts, including `test_glm5_next_dsa` unchanged and the
+sibling inertness set (`test_cuda_deepseek_v4`, `test_qwen4_exp_qsa_device`,
+`test_glm_moe_dsa*`) since `include/vt/ops.h` and `src/vt/ops.cpp` are shared;
+and the CUDA suite on `dgx:gpu0` under `rc run`. A doctest `assertions: 0` line
+is a skip wearing a pass and the device job reads that line out loud rather than
+trusting the exit code.
+
+**Stop conditions.** If `transformers` v5.16.1 turns out not to implement the
+k-pool indexer, or if the published artifact's tensors do not match what it
+expects, STOP and return the evidence — inventing the semantics of a learned
+pooling is worse than leaving the device arm refused. If the device gate reds,
+that is the RESULT and it lands as one.
+
 ## Tests to port
 
 `tests/models/` in transformers `v5.16.1` is the upstream suite. What is
@@ -4404,7 +4575,78 @@ Debts this row carries, each visible rather than waived:
   [#2099](https://github.com/mudler/vllm.cpp/issues/2099)'s lane-pin finding is
   the same shape one document over.
 
+- **O36 — THE K-POOL DEVICE OPS LAND UNREACHED, and this entry names what is
+  unreached and who owns the wiring.** W9c-0 registers
+  `vt::OpId::kGlm5NextKpoolCompress` and `vt::OpId::kGlm5NextKpoolSelect` on
+  `kCUDA` and gates them on `dgx:gpu0` against the transformers v5.16.1 goldens
+  and the host reference. **Nothing on this model's production path calls
+  either.** `ModelRegistry::Forward` reaches `glm5_next_dsa.cpp`'s host
+  `SelectIndexerTopkFromPacked` and continues to; `glm5_next_forward.cpp:231-238`
+  still refuses a non-CPU queue by name; and the only callers of the two ops are
+  the device gate and the availability probe. This is the shape
+  `.agents/reachability.md` calls "the test-only driver", and it is staged
+  deliberately rather than disclosed after the fact.
+
+  Three things, in the specific, as AGENTS.md §"Nothing lands dead" requires.
+  **What is unreached:** the `DeviceType::kCUDA` registration of both new OpIds
+  as reached FROM THIS MODEL, and `vllm::glm5_next::KpoolDeviceOpsAvailable()`,
+  which no production predicate consults yet. **The row that owns the wiring:**
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, wave **W9c-3**, the
+  compose that constructs a CUDA queue for this forward and deletes the refusal
+  at `glm5_next_forward.cpp:231-238`. W9c-3 also owns the two operands these ops
+  need and the forward does not yet produce on a device: the packed indexer row
+  (`PackIndexerStates`, which W9c-0 deliberately did not make an op because
+  `vt::Matmul` and `vt::LayerNorm` already serve it) and a `k_pass` that is not
+  de-paged into host memory at `glm5_next_kv.cpp:450-456`. **The issue that
+  tracks it:** [#2410](https://github.com/mudler/vllm.cpp/issues/2410).
+
+  The reachability mutation `.agents/reachability.md` asks for is reported as
+  what it is. There is no production call site to delete, so the question is
+  already answered, and the mutation that IS run instead deletes the
+  `RegisterOp` line and shows the device gate reds — which proves the gate
+  measures the registered provider and not a directly-called kernel, and proves
+  nothing about a capability. Read it that way.
+
 ## Now
+
+`ACTIVE`, 2026-08-31. **The k-pool indexer has a device implementation, and it
+is the first kernel this campaign has had to write.** W9c-0
+(`CLAIM-GLM53-FLASH-KPOOL-CUDA`, issue
+[#2415](https://github.com/mudler/vllm.cpp/issues/2415)) answers the question
+#2415 posed — a k-pool CUDA kernel, or eleven device-to-host round trips per
+step — by building the kernel, and closes #2415 with the argument recorded in
+§W9c-0. The row's lifecycle state does not move, because O1 does not, and
+`--device cuda` on this model still refuses by name at
+`glm5_next_forward.cpp:231-238`.
+
+**Two ops, CUDA only, and no CPU provider on purpose.**
+`vt::Glm5NextKpoolCompress` is upstream's `get_pooled_states`
+(`modular_glm5_next.py:897-970`) — the learned per-channel `index_kpool`-way
+softmax over the pool's members, the `keep` compaction, and `P` published as a
+device scalar so nothing synchronises. `vt::Glm5NextKpoolSelect` is the
+selection half of `forward` (`:821-875`) with `get_visible_tokens` (`:877-895`)
+folded in as a predicate and `append_visible_tail` (`:972-1022`) folded in as
+the tail write. The CPU answer already exists as `glm5_next_dsa.cpp` and is what
+the gate measures against; registering it a second time under an `OpId` would
+make the seam its own oracle.
+
+**W9c's "no kernel needs writing for correctness" is now formally retired.** It
+was falsified by W9c-1's measurement and it is discharged by this wave rather
+than left as a correction. What survives it unchanged is the rest of the
+rescoping: every OTHER primitive family this model needs does have a registered
+CUDA provider, and the remaining device work is still a compose.
+
+**The ops are UNREACHED and O36 says so in the specific.** Nothing on the
+production path calls either one; W9c-3 owns the wiring and
+[#2410](https://github.com/mudler/vllm.cpp/issues/2410) tracks it. Do not read
+the device gate below as a capability claim — it measures two registered
+providers at a small real geometry, and that is all it measures.
+
+The next actions are W9c-3 (the compose that reaches these ops), W9b
+(keep-quant residency), W6 (the vision tower) and W7b (the first fitting
+artifact).
+
+### Before W9c-0
 
 `ACTIVE`, 2026-08-31. **The device arm is a PORT, not a kernel campaign, and
 §W9c said otherwise on a premise this wave falsified.** W9c's rescoping

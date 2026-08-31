@@ -210,3 +210,12 @@ mutation that never applied cannot read as a pass.
 - **An end-to-end `qwen4_exp` CUDA forward on the released checkpoint.** Blocked
   independently of this row by the block-decoding n-gram gather having no CUDA
   arm (#2380). This row removes the keep-quant blocker only.
+- **`.agents/quantization-matrix.md` is stale for two of these three, and this row
+  did not fix it.** `QUANT-GGUF-Q5_0` and `QUANT-GGUF-IQ4_NL` read `INVENTORIED`
+  with `-` in every column and an empty evidence cell, while
+  [`docs/FEATURES.md`](../../docs/FEATURES.md) records both as landed for
+  `qwen4exp` with a decode bit-exact against llama.cpp `b10451`
+  ([#1989](https://github.com/mudler/vllm.cpp/issues/1989)). Neither row changes
+  lifecycle state in this change, so no matrix edit is owed by it, and correcting
+  the flags means re-verifying another row's work rather than recording this
+  one's. Named here so the disagreement is visible rather than silently carried.

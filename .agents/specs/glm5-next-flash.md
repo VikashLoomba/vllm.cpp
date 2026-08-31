@@ -2328,10 +2328,38 @@ update, and the device-gate evidence below. No product code. No file under
 W9b, W9c-1, W9c-2 and W9c-3. The vision tower (W6). Any speed number: O6 is
 unchanged and there is still no denominator.
 
-**Gates.** `scripts/agent-preflight.sh --fail-on-skip`. The PENDING device gate
-§W9a declares is SUBMITTED under lease and not yet returned, and it stays
-PENDING in this change rather than being reported on the strength of having been
-started. One fleet fact it has already produced is recorded, because it bounds
+**Gates.** `scripts/agent-preflight.sh --fail-on-skip`.
+
+**THE DEVICE GATE §W9a LEFT PENDING IS TAKEN, ON `thor:gpu0`, AND IT PASSES.**
+`vt::MoeGateUpSwiGLUGrouped` and `vt::MatmulBTQuantGrouped` driven at this
+model's published MoE geometry — E=288, I=2048, H=4096, top-8, P=16 — on all
+four of the artifact's real encoding triples, the CUDA provider asserted against
+the CPU provider `ops.h` names as its golden.
+
+| | |
+|---|---|
+| job | `386accdc-ccf1-4575-81c1-36406a452b1b`, `rc run -d thor:gpu0` |
+| device | NVIDIA Thor, `GPU-a7c66ad2-6dbb-0ab8-c1a2-37ba6dba3600`, driver 595.78, `compute_cap` 11.0, built `sm_110a` |
+| worker | `rc-worker-n8smh`, aarch64, 14 cores, 122 GiB, `boot_id 7ac96c66-5444-4e67-87d2-3b9f0e44f39a` |
+| source | `git archive` of `0b4766c96`, `src.tar.gz` sha256 `35662b6ad93c…` |
+| binary | `test_cuda_quant_dot` sha256 `a78f2e908e236ebeb9635150bb2555c4968a8bfa5f0f8f9528b17974cb42f900` |
+| the GLM-5.3-Flash geometry case | **1 case, 25 assertions, 0 failed** |
+| the whole `test_cuda_quant_dot` suite | **17 cases, 177,284 assertions, 0 failed** |
+| run | 2026-08-31T14:21:53Z → 14:22:36Z |
+
+25 assertions and not 0 is the part that makes this a result: a doctest filter
+that matches nothing exits 0 with `assertions: 0`, which is a skip wearing a
+pass, and the job reads that line out loud and refuses it rather than reporting
+the exit code. The `static_assert` in the case pins what it is FOR —
+`288 * 2048 * 4096 = 2,415,919,104` elements is past INT32 while every byte
+offset in the same tower still fits, so a 32-bit element count would truncate
+here and nowhere in the E<=4 codebook cases.
+
+**`dgx:gpu0` is still queued and this gate is NOT closed by the `thor` run.**
+`sm_110` and `sm_121a` are different targets and a number from one does not
+transfer to the other; the GB10 leg stays PENDING until its lease returns.
+
+**One fleet fact bounds the END-TO-END test and is recorded here**, because
 which box can ever take the end-to-end test: on `thor:gpu0` (`compute_cap` 11.0,
 read off the device) a CUDA build with `-DVLLM_CPP_FLASH_ATTN=ON` and CUTLASS
 4.5.0 configures to `CUDA FA2 compiled-arch manifest: []` (the manifest line is
@@ -4404,11 +4432,13 @@ rather than letting the scoping read as progress. mHC is the one family with a
 real gap and it is small and inverted — a CUDA kernel with no CPU registration
 (O34).
 
-**The device gate §W9a left PENDING is STILL PENDING as this section lands**,
-and it is named here rather than left to be inferred from silence. It has been
-submitted to `thor:gpu0` and `dgx:gpu0` under lease; an untaken device gate is
-recorded as PENDING and never as a pass, so its result lands as its own change
-against this row when the lease returns one.
+**The device gate §W9a left PENDING is TAKEN on `thor:gpu0` and PASSES** — the
+grouped keep-quant seam at this model's published MoE geometry on all four of
+its real encoding triples, 25 assertions in the case and 17 cases / 177,284
+assertions across the suite, with the box, the binary hash and the job id in
+§W9c. **The `dgx:gpu0` leg is still queued and this does not close the gate**:
+`sm_110` and `sm_121a` are different targets. This is the first device evidence
+this row has ever carried.
 
 The next actions are W9b, then W9c-1, and W6 and W7b are unchanged.
 

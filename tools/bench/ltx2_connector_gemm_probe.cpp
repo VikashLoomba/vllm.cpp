@@ -38,13 +38,13 @@
 // failure, where the only named harness for a measurement was compiled by
 // nothing -- but the recorded runs come from:
 //
-//   g++ -std=c++20 -O2 -ffp-contract=off -pthread -Iinclude -Isrc -Ithird_party \
-//       tools/bench/ltx2_connector_gemm_probe.cpp \
-//       src/vllm/model_executor/models/ltx2_connector.cpp \
-//       src/vllm/model_executor/models/ltx2.cpp \
-//       src/vllm/model_executor/models/ltx2_audio_vae.cpp \
-//       src/vt/{tensor,dtype,ops,backend,op_provider,arena}.cpp \
-//       src/vt/cpu/{cpu_ops,cpu_backend,cpu_threadpool,cpu_matmul_elem,...}.cpp \
+//   g++ -std=c++20 -O2 -ffp-contract=off -pthread -Iinclude -Isrc -Ithird_party
+//       tools/bench/ltx2_connector_gemm_probe.cpp
+//       src/vllm/model_executor/models/ltx2_connector.cpp
+//       src/vllm/model_executor/models/ltx2.cpp
+//       src/vllm/model_executor/models/ltx2_audio_vae.cpp
+//       src/vt/{tensor,dtype,ops,backend,op_provider,arena}.cpp
+//       src/vt/cpu/{cpu_ops,cpu_backend,cpu_threadpool,cpu_matmul_elem,...}.cpp
 //       -o /tmp/ltx2_connector_gemm_probe
 //
 // `-ffp-contract=off` is NOT optional: CMakeLists.txt:55 pins it for every TU

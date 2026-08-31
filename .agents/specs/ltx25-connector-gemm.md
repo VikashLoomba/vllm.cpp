@@ -586,7 +586,7 @@ Three further reasons, each measured rather than asserted:
   the jobs were left to queue and both binaries built, so what is untested in it
   is exactly the aarch64 per-ISA branch, which mirrors `CMakeLists.txt`'s own
   `set_source_files_properties` calls. Staged artifacts: `run.sh` sha256
-  `242b8c8d...`, `src.tar.gz` sha256 `50d4ff0d...`, the latter a `git archive` of
+  `242b8c8d...`, `src.tar.gz` sha256 `59465c4c...`, the latter a `git archive` of
   this row's committed head, so the binary that runs under the lease is built
   from the same probe the branch carries.
 

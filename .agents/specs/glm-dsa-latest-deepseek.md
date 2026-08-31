@@ -2390,6 +2390,13 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   read twice — no slice fell back to reading the tower in place, so nothing in
   those bytes is a page-cache number wearing a streaming label. It is also the
   first time the `pread` path has run on a real checkpoint at all.
+  **FULLY DISCHARGED the same day, by a step that COMPLETED.** With O33's slot
+  budget corrected the same command runs to `rc=0` and a token, reporting
+  `steps=1 hits=0 misses=6399 evictions=0 fills=4096 bytes=13939408896
+  exhausted=2303 advised=0`: 4096 slices served from slots, 12.98 GiB moved. GLM-5.3
+  is the seam's second client in the strongest available sense — a second
+  architecture's towers, a real 201.83 GiB file, and a token out the other end.
+  Read `exhausted=2303` with it; O34 owns that number.
 - **O16 — W2 lands three surfaces that NOTHING reaches yet**, and it says so
   rather than letting a reader infer reachability from a green suite. The
   registration, its config hook, the `glm-dsa` `kGgufArchArms` row and
@@ -2782,11 +2789,131 @@ grouped-MoE-disabled number, and that has to be said each time rather than once.
   Q8_0, so every layer's maximum is the model's and no CPU fixture can separate
   them. What gates it is the device run before and after, on the same artifact and
   the same command.
+  **DISCHARGED 2026-08-31, by that before-and-after.** The next run on `dgx:gpu0`,
+  same artifact and same command, came up
+  `[expert-stream] ON slots=4096 slot_bytes=6684672 resident=25.50 GiB` — the
+  IQ4_XS slice and §3.3's arena to the byte, where the run before it read
+  `slot_bytes=4816896` and `18.38 GiB` — passed `blk.8` instead of refusing at it,
+  and finished the step at `rc=0` with a token. The bound and the store now price
+  the same arena.
+
+- **O34 — A PREFILL STEP EXHAUSTS ANY SLOT BUDGET, AND 36% OF THE FIRST TOKEN'S
+  SLICES WERE READ THROUGH THE MAPPING RATHER THAN STREAMED.** Measured on
+  `dgx:gpu0`, 2026-08-31, at `VT_MOE_EXPERT_STREAM_SLOTS=4096`:
+  `misses=6399 fills=4096 exhausted=2303`. The step needed 6399 distinct slices
+  and the cache holds 4096, so 2303 `Acquire` calls returned -1 and
+  `expert_stream::ExpertSlice` fell through to a `HostSliceView` on the tower's
+  own bytes.
+  **This is §3.8 R2 arriving as a number, not a defect.** `RequireSlotCapacity`
+  bounds a `c = 1` DECODE step at `228 towers x 8 experts = 1824`; a PREFILL of
+  `T` tokens touches up to `228 x min(256, 8T)`, and at `T = 5` that measured
+  6399. `expert_stream_seam.cpp`'s `ExpertSlice` says so in as many words and
+  chooses the in-place read deliberately on a host-addressable device, because
+  the alternative — staging the whole tower — is what the load-time refusal
+  exists to prevent. The fallback is COUNTED, which is the property that makes
+  this reportable at all rather than a silent page-cache number.
+  **What it costs the row's claim, exactly:** 64% of the first token's slices were
+  served from streamed slots and 36% were not, so no figure here may be quoted as
+  a fully-streamed step. **A confirmation at 8192 slots is queued** — 6399 needed
+  against 8192 held, a `8192 x 6,684,672 = 51.0 GiB` arena plus ~20.3 GiB resident
+  against 119.631 GiB — and it is the run that can state `exhausted=0`.
+  Discharged either by that run, or by a DECODE-only measurement, where the
+  working set is 1824 and the existing budget covers it. Not discharged by raising
+  the default: an arena is device memory the operator did not ask for, which is
+  the argument `RequireSlotCapacity` already makes for refusing rather than
+  clamping.
 
 ### 3.10 Now
 
-**GLM-5.3 EMITS ` Paris` FROM ITS REAL 201.83 GiB ARTIFACT ON GB10, AND THAT
-TOKEN IS NOT A STREAMING RESULT, 2026-08-31**
+**GLM-5.3 EMITS ` Paris` FROM ITS REAL 201.83 GiB ARTIFACT ON GB10, THROUGH THE
+EXPERT-STREAMING LANE, 2026-08-31**
+([#2214](https://github.com/mudler/vllm.cpp/issues/2214)). The row's question is
+answered, and the answer carries one number that must travel with it.
+
+**The run.** `dgx:gpu0` — `NVIDIA GB10`, 20 cores, 119 GB, compute capability
+12.1, driver 580.173.02 — under an `rc` lease, base `00940ad13`, `vllm-cli`
+built `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_FLASH_ATTN=ON` with CUTLASS 4.5.0, sha256
+`ce80fd3edd756adf0ec17a0e5791d98c061a1e72b78b87b98ebdec18b9581900`, run
+`--device cuda --prompt "The capital of France is" --max-tokens 1
+--temperature 0` with `VT_MOE_EXPERT_STREAM=1` and
+`VT_MOE_EXPERT_STREAM_SLOTS=4096`, against the derived metadata shard beside the
+five published payload shards.
+
+```text
+### LOAD_RC=0   wall=1154s
+--- stdout (the emitted text, verbatim) ---
+ Paris
+vllm-cli: run=1/1 finish_reason=length prompt_tokens=5 completion_tokens=1 secs=852.330
+```
+
+`stdout` is seven bytes, `0x20 P a r i s 0x0a`. `VmHWM` peaks at 60,512,268 kB =
+**57.71 GiB**, against 119.631 GiB on the device and 201.83 GiB of artifact.
+
+**The streaming evidence, which is the half `VmHWM` cannot supply.**
+
+```text
+[expert-stream] ON slots=4096 slot_bytes=6684672 resident=25.50 GiB
+[expert-stream] steps=1 hits=0 misses=6399 evictions=0 fills=4096
+                bytes=13939408896 exhausted=2303 advised=0
+```
+
+`slot_bytes=6684672` is the IQ4_XS `ffn_down_exps` slice §3.3 predicted, and
+`4096 * 6,684,672 = 25.50 GiB` is §3.3's arena to the byte. **4096 slices were
+paged out of the file into slots and 13,939,408,896 bytes = 12.98 GiB moved
+through them, with zero evictions.** The 187.312 GiB of towers were never
+materialized.
+
+**`exhausted=2303`, and it is not a defect — it is §3.8 R2 arriving as a
+number.** The step needed **6399** distinct slices and the budget holds 4096, so
+2303 were refused by the cache and read IN PLACE out of the mapping. That is the
+documented behaviour of a host-addressable device
+(`expert_stream_seam.cpp`'s `ExpertSlice`: a slot the cache cannot serve becomes
+a `HostSliceView` on the tower's own bytes rather than a staged tower), it is
+COUNTED rather than silent, and the arithmetic is R2's: `RequireSlotCapacity`
+bounds a `c = 1` DECODE step at `228 towers x 8 experts = 1824`, while a PREFILL
+of `T` tokens can touch `228 x min(256, 8T)`, here `228 x 28 = 6399`. So
+**64% of this step's slices were served from streamed slots and 36% were read
+through the mapping**, and no number on this row may be quoted as if it were
+100%. O34 records it and the 8192-slot confirmation.
+
+**No speed number is claimed** (O10): `secs=852.330` is one token, on a
+CIFS-backed artifact, with 2303 in-place fallbacks in it.
+
+**Three defects were fixed to get here, all ours, each measured before it was
+repaired.** O30, the loader prefaulting all 228 towers, caught because `VmHWM`
+climbed linearly past 48.62 GiB at the filesystem's read rate. O31,
+`token_embd.weight` routed as a GEMM weight rather than as a gather, caught by
+`EmbeddingKernelCuda` refusing a Q4_K table by name. O33, the slot store sized
+from the first layer instead of the file, caught when the lane streamed 527
+slices and then refused at `blk.8`'s IQ4_XS tower. The run above is the same
+command as the run that found each of them.
+
+---
+
+**The earlier arms, kept because they are what the answer was built out of.**
+
+**`--device cpu` on the same box and artifact also emits ` Paris`** — `rc=0`,
+`prompt_tokens=5 completion_tokens=1`, `generate` 950.249 s, `VmHWM` 44.46 GiB —
+and **that token is NOT a streaming result**: a CPU queue makes
+`needs_weight_staging()` false, no lane is built, and every routed-expert slice
+is read in place. It is kept because two independent arms agreeing on ` Paris`
+is worth more than either alone.
+
+**`thor:gpu0` cannot reach a token on the CUDA arm at all**, and that is the arch
+rather than the recipe: MLA prefill on this family IS FlashAttention, the
+vendored FA2 covers `8.0,8.6,8.7,8.9,12.0a,12.1a`, and thor is `sm_110a`. Its
+legs found O30 and O31.
+
+**One operational lesson, because it cost two legs.** The runner on the share was
+edited while two leases were executing it; `bash` reads a script incrementally,
+so both resumed at a shifted offset. Stage a new path for a changed recipe.
+
+---
+
+**SUPERSEDED, 2026-08-31 — kept for the sequence it records.** The heading below
+read "and that token is not a streaming result" when the CPU arm was the only one
+that had produced one.
 ([#2214](https://github.com/mudler/vllm.cpp/issues/2214)). Both halves are the
 record and neither may be quoted without the other.
 

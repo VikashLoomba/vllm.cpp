@@ -404,6 +404,28 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## The pooled row IS rotated, and W1 was not doing it
+
+Chasing whether the INDEXER's cycle rotates answered a question about the
+ATTENTION compressor instead, and the answer is a defect in what W1 landed.
+
+`fused_compress_quant_cache.py:272-297` applies GPT-J RoPE to the pooled row's
+ROPE TAIL, unconditionally -- there is no `rotate` predicate in the kernel, and
+both compressors pass the dead flag. `CompressorPoolNorm` and the cycle applied
+NO rotation at all, so every compressed key this row produced was
+position-blind: attention over the compressed history could not tell one window
+from another, while every value stayed finite.
+
+The position is the non-obvious part and is now gated: `compressed_pos =
+(position / compress_ratio) * compress_ratio`, the WINDOW'S BASE rather than the
+emitting token's, so all rows of one window share a phase. The gate derives the
+second emitted row by hand at base position 2 and separately shows that rotating
+at the token's own position 3 gives a different, equally finite answer.
+
+Three mutations run red: the token's position used instead of the window's base,
+the nope half rotated instead of the tail, and the rotation skipped entirely --
+which is exactly the state this row shipped in until now.
+
 ## The indexer's cycle, as upstream builds it
 
 Read before starting it, because two details change its shape

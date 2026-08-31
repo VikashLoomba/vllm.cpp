@@ -366,7 +366,8 @@ std::vector<float> CompressorLayerStep(
     std::vector<float>* state_score, std::vector<float>* comp_rows,
     const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
     int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
-    int64_t sliding_window, float eps, float scale) {
+    int64_t sliding_window, float eps, float scale, int64_t rope_dim,
+    double rope_theta) {
   // W3 (#2286): both shapes now. `coff = 1 + (compress_ratio == 4)`
   // (`compressor.py:247-248`); at 2 the projections are doubled and a window
   // position's ROLE picks which half it reads.
@@ -428,7 +429,8 @@ std::vector<float> CompressorLayerStep(
   // 2-3. Drive the state machine and keep whatever closed this step.
   const std::vector<float> emitted =
       CompressorStepCycle(state_kv, state_score, kv, score, comp_ape, positions,
-                          comp_norm_weight, eps, compress_ratio, head_dim, coff);
+                          comp_norm_weight, eps, compress_ratio, head_dim, rope_dim,
+                          rope_theta, coff);
   comp_rows->insert(comp_rows->end(), emitted.begin(), emitted.end());
 
   // 4. The window pass carries the sink and keeps its LSE.

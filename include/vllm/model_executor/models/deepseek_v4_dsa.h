@@ -264,6 +264,9 @@ std::vector<float> CompressorLayerStep(
     std::vector<float>* state_score, std::vector<float>* comp_rows,
     const std::vector<int64_t>& positions, int64_t kv_base, int64_t num_tokens,
     int64_t num_heads, int64_t hidden, int64_t head_dim, int64_t compress_ratio,
-    int64_t sliding_window, float eps, float scale);
+    int64_t sliding_window, float eps, float scale,
+    // The pooled row's rope tail is rotated at the WINDOW'S BASE position
+    // (`fused_compress_quant_cache.py:272-297`). 0 leaves it unrotated.
+    int64_t rope_dim = 0, double rope_theta = 10000.0);
 
 }  // namespace vllm::deepseek_v4

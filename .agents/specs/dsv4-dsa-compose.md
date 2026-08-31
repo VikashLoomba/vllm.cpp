@@ -404,6 +404,23 @@ the consistent continuation at 1 is accepted -- so the guard tracks the state
 rather than pinning `kv_base` to zero. Two mutations run red, one disabling the
 guard and one making it over-fire.
 
+## The selection over compressed rows LANDED
+
+`IndexerSelectCompressed` scores the indexer's query against the COMPRESSED keys
+and returns compressed-row indices, `-1` padded. The availability count is
+upstream's own, `(position + 1) / compress_ratio`, so a row that has not closed is
+not a candidate; below the first boundary the whole row stays padding rather than
+falling back to row zero.
+
+Hand-derived rather than compared against a helper: keys are built so row `r`
+scores monotonically in `r`, and positions 3, 7 and 11 must yield exactly 1, 2 and
+3 candidates with the best first. A separate case flips which head the fold
+favours and requires the winning row to change with it, so the fold is proven
+load-bearing rather than present.
+
+Four mutations run red: padding with row 0, ignoring the availability count,
+dropping the per-head fold, and ordering lowest-score first.
+
 ## What the top-k INDEXES, which was the last unknown
 
 `_fill_short_context_topk_indices` (`attention.py:71-87`) settles it, and it is

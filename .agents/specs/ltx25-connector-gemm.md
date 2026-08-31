@@ -297,7 +297,9 @@ that is stated rather than smoothed**):
 | `MatmulChunked<true>`, the shipped orientation | **26.924** | **153.3 GFLOP/s** |
 | `MatmulChunked<false>` over an `ElemRepackWeight`-ed `[K,N]` weight | 55.435 | 74.4 GFLOP/s |
 
-**The repack is 2.06x SLOWER here, and every shape is byte-identical**, so this
+**The repack is 2.06x SLOWER in THAT run -- 1.78x on the idle replicate below,
+and 1.78x to 2.06x across all three load regimes -- and every shape is
+byte-identical**, so this
 is a layout result and not a numerical one. Per shape the ratio is 1.47x to
 1.84x on the four large shapes; the same-arm control ran at 0.96x to 1.17x, so
 the effect is far outside its own control's spread. The two `heads x dim`
@@ -406,7 +408,7 @@ margin is smaller and the smaller number is the one to quote.
 The unbiased-attention control also survives: 0.96x video, 1.15x audio, still
 inside the arms' own spread and still no lever.
 
-### Why the attention kernel is 48x off, and what the repair is
+### Why the attention kernel is 47x off, and what the repair is
 
 `AttentionCrossKernel` (`src/vt/cpu/cpu_ops.cpp`) reads every operand element
 through `LoadF32(const Tensor&, int64_t)`, which switches on `t.dtype` and
@@ -604,7 +606,8 @@ Three further reasons, each measured rather than asserted:
   until that row exists.
 - **`include/vt/quant.h`'s "1.16x to 1.30x on dgx" needs a scope qualifier or a
   correction.** On x86-64 AVX-512 at the connector's shapes the same lever is
-  2.06x SLOWER. Which of the two it needs depends on the queued aarch64 run.
+  1.78x to 2.06x SLOWER across three load regimes, byte-identical every time.
+  Which of the two that sentence needs depends on the queued aarch64 run.
   Owner: this row.
 - **The aarch64 numbers.** Both leases are submitted and neither had started.
   Owner: this row.

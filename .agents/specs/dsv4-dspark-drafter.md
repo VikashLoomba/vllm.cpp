@@ -178,6 +178,13 @@ Throughput is claimed only at W-6, against the target's own recipe: 384k context
 
 ## 6. Owed
 
+- **W-2 IS UNREACHED.** `vllm::dspark::StreamMeanTap` and
+  `vllm::dspark::ProjectTaps` land with their gate and nothing else calls them:
+  no production entry point reaches the drafter, because the drafter does not
+  exist yet. This row owns the wiring, and W-1 (the tap seam on the trunk) is the
+  first caller. Recorded here rather than left for a reader to discover, as
+  `AGENTS.md` §"Nothing lands dead" requires of a staged slice.
+
 - The row's own GitHub issue, once the account is restored.
 - The real-artifact load, which is blocked on `MODEL-DSV4-EXL3` W1c-4's
   real-geometry DSA tensors and needs a box with more than 84 GiB.

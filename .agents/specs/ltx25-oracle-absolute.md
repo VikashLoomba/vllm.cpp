@@ -864,11 +864,22 @@ the error does not cancel in a ratio, and the same comparison read -25.25% raw
 and +77.51% windowed. `ltx25-adherence-detail-loss.md` `## CORRECTION` carries the
 derivation and the four-convention table.
 
-The interventions settle the direction that the statistics alone could not.
-Blurring our own frames at sigma 1.0 RAISES their CLIP score by **+1.9131** and
-takes them from 6 of 25 frames clearing the adherence bound to **23 of 25**. The
-same blur costs the reference 0.9728. A render failing because it is too smooth
-does not improve when it is smoothed further.
+The intervention settles the direction that the statistics alone could not, and
+it is the one applied to the REFERENCE's frames. Blurring upstream's own render
+until its sharpness is **a fifth** of ours -- a visibly destroyed picture -- costs
+it **1.9687** CLIP points against an observed gap of **2.7305**, and it still
+ranks the true prompt first on 23 of 25 frames. Blurring it merely to our own
+sharpness costs **0.1192**, which is 4.4% of the gap. No achievable amount of
+smoothing reproduces our shortfall, so detail loss is not sufficient to produce
+it.
+
+**An earlier version of this paragraph said "blurring our own frames at sigma
+1.0 RAISES their CLIP score by +1.9131", and that figure is WITHDRAWN.** On our
+frames a decoy outranks the true prompt from sigma 0.50 upward, so those arms
+score no adherence at all; the only row of that sweep the scorer can still read
+moves our score by **-0.0029**. `ltx25-adherence-detail-loss.md`
+`## CORRECTION 2` carries the derivation. The conclusion this paragraph supports
+is unchanged, because the reference sweep above carries it on its own.
 
 The blockiness ceiling this row landed is untouched and its verdict stands. What
 changes is the sentence a reader was left with about WHY: the gate is blind to a

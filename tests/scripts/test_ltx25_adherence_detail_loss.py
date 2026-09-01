@@ -27,6 +27,8 @@ signal is synthesised here.
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import importlib.util
 import os
 import sys
@@ -53,6 +55,11 @@ def _load(name: str, path: str):
 _cmp = _load("ltx25_render_compare_for_detail",
              os.path.join("scripts", "ltx25-render-compare.py"))
 D = _load("ltx25_detail_loss", os.path.join("scripts", "ltx25-adherence-detail-loss.py"))
+
+
+def _sha(path: str) -> str:
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
 
 
 def write_ppm(path: str, a: np.ndarray) -> None:
@@ -214,6 +221,29 @@ class Spectrum(unittest.TestCase):
         sa = float(a[hi].sum() / a[nz].sum()); sb = float(b[hi].sum() / b[nz].sum())
         self.assertAlmostEqual(sa, sb, places=9)
         # and the border DOES move a whole-frame estimator, or the case is vacuous
+        pa = D._power(D.luma(base) - D.luma(base).mean())
+        pb = D._power(D.luma(edged) - D.luma(edged).mean())
+        rr = D._fgrid(192, 320); h2 = (rr >= 0.20); n2 = rr > 0
+        self.assertNotAlmostEqual(float(pa[h2].sum() / pa[n2].sum()),
+                                  float(pb[h2].sum() / pb[n2].sum()), places=4)
+
+    def test_the_inset_is_a_TILE_STEP_and_not_merely_nonzero(self):
+        # THE CASE ABOVE PAINTS ONE ROW AND ONE COLUMN, so it stays green with
+        # an inset of a single pixel: it constrains `lo > 0`, not `lo` being an
+        # inset that keeps whole tiles off the border. Paint a band TILE_STEP
+        # deep instead. A tile placed at any offset below TILE_STEP overlaps it,
+        # so this reds for `lo = 1` and passes only for the real inset.
+        rng = np.random.default_rng(131)
+        base = rng.integers(60, 190, (192, 320, 3), dtype=np.uint8)
+        edged = base.copy()
+        k = D.TILE_STEP
+        edged[:k, :, :] = 0; edged[-k:, :, :] = 255
+        edged[:, :k, :] = 0; edged[:, -k:, :] = 255
+        r = D.tile_freq_grid(); hi = (r >= 0.20); nz = r > 0
+        a = D.welch_psd([base])[0]; b = D.welch_psd([edged])[0]
+        self.assertAlmostEqual(float(a[hi].sum() / a[nz].sum()),
+                               float(b[hi].sum() / b[nz].sum()), places=9)
+        # vacuity guard: the band DOES move a whole-frame estimator
         pa = D._power(D.luma(base) - D.luma(base).mean())
         pb = D._power(D.luma(edged) - D.luma(edged).mean())
         rr = D._fgrid(192, 320); h2 = (rr >= 0.20); n2 = rr > 0
@@ -454,6 +484,432 @@ class Interventions(unittest.TestCase):
         self.assertEqual(b.dtype, np.uint8)
         self.assertGreaterEqual(int(b.min()), 0)
         self.assertLessEqual(int(b.max()), 255)
+
+
+
+class ArmValidity(unittest.TestCase):
+    """THE PRECONDITION IS ASKED OF EVERY ARM, not once of the reference.
+
+    This row published `+1.9131` -- its decisive figure -- from a blurred arm on
+    which the decoy `near:1` outranks the true prompt by 0.4036. The rule that
+    forbids exactly that was already written down and already enforced, once, on
+    the unblurred reference. So these cases are about the SCOPE of a check and
+    not about its logic, and the mutation that kills them is deleting a
+    `scorer_valid` field rather than loosening a threshold.
+    """
+
+    @staticmethod
+    def _disc(true_score, decoy_scores):
+        m = np.array([[true_score] + list(decoy_scores)], dtype=np.float64)
+        labels = ["true"] + [f"near:{i}" for i in range(len(decoy_scores))]
+        return _cmp.discrimination(m, labels)
+
+    def test_an_arm_whose_decoy_outranks_the_true_prompt_is_INVALID(self):
+        v = _cmp.adherence_arm_valid(self._disc(30.0, [30.5, 29.0]))
+        self.assertFalse(v["valid"])
+        self.assertEqual(v["argmax_label"], "near:0")
+        self.assertIn("above the true prompt", v["reason"])
+
+    def test_a_zero_margin_arm_is_INVALID_even_though_it_has_an_argmax(self):
+        # numpy's argmax returns the FIRST maximal index, which is the true
+        # prompt, so a bare `argmax == true` passes a scorer that returns one
+        # number for every prompt.
+        d = self._disc(7.0, [7.0, 7.0])
+        self.assertTrue(d["true_first"], "the trap this case exists for")
+        v = _cmp.adherence_arm_valid(d)
+        self.assertFalse(v["valid"])
+        self.assertIn("no separation", v["reason"])
+
+    def test_a_separating_arm_is_valid_and_reports_its_margin(self):
+        v = _cmp.adherence_arm_valid(self._disc(31.0, [20.0, 12.0]))
+        self.assertTrue(v["valid"])
+        self.assertAlmostEqual(v["margin"], 11.0)
+        self.assertEqual(v["reason"], "")
+
+    def test_S0_AND_the_arm_check_are_the_SAME_predicate(self):
+        # Two copies of a refusal rule drift, and the copy that drifts is the
+        # one nothing calls on the failing path. S0 must raise on exactly the
+        # discriminations this returns invalid for, and on no others.
+        cases = [(30.0, [30.5, 29.0]), (7.0, [7.0, 7.0]), (31.0, [20.0, 12.0]),
+                 (31.0, [30.999999, 1.0]), (0.0, [-1.0])]
+        for t, ds in cases:
+            d = self._disc(t, ds)
+            invalid = not _cmp.adherence_arm_valid(d)["valid"]
+            try:
+                _cmp.scorer_precondition(d)
+                raised = False
+            except _cmp.UnreadableInput:
+                raised = True
+            self.assertEqual(invalid, raised,
+                             f"the two disagree on true={t} decoys={ds}")
+
+
+class TheRunRecordsValidityOnEveryArm(unittest.TestCase):
+    """P: `main()` itself, which is where findings 1 and 6 lived and where no
+    case reached.
+
+    The suite above this one constrains primitives. Every one of them passed
+    while the run printed a rising CLIP delta from arms a decoy had won and
+    labelled its high band with the crossover frequency instead of the band's
+    own cut. So this drives the whole run on synthesised frames with a stub
+    scorer, and the stub is built to reproduce the row's real shape: the
+    reference separates comfortably, our unblurred frames separate narrowly, and
+    blurring ours far enough takes the true prompt below a decoy exactly as it
+    did on the real render.
+
+    `discrimination`, `scorer_precondition` and `adherence_arm_valid` are the
+    REAL ones. Only the checkpoint, the pin, the decoy list and the CLIP forward
+    are stubbed, because those need a 598 MB pickle this lane does not have.
+    """
+
+    # true prompt: 30 + sharpness/4. Every decoy: a flat 35.0. Sharp frames beat
+    # the decoys, blurred ones do not, which is the mechanism under test.
+    DECOY_LEVEL = 35.0
+
+    class _Scorer:
+        def __init__(self, model_dir, pin):
+            self.model_dir = model_dir
+
+        def count_tokens(self, text):
+            return len(text.split())
+
+        def score(self, frames, prompts):
+            out = np.empty((len(frames), len(prompts)), dtype=np.float64)
+            for i, a in enumerate(frames):
+                s = float(D.sharpness_map(D.luma(a)).mean())
+                out[i, 0] = 30.0 + s / 4.0
+                out[i, 1:] = TheRunRecordsValidityOnEveryArm.DECOY_LEVEL
+            return out
+
+    class _Shim:
+        """The real module, with four loaders and the scorer replaced."""
+
+        def __init__(self, real, scorer_cls):
+            self._real, self._scorer_cls = real, scorer_cls
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        ClipAdherenceScorer = property(lambda self: self._scorer_cls)
+
+        def load_json_record(self, path, what):
+            return {"text_context_positions": 77}
+
+        def assert_scorer_identity(self, model_dir, pin):
+            return {"repo": "stub", "files_verified": 0}
+
+        def load_decoys(self, path):
+            return [{"kind": "near", "text": "a grey wolf in a snowy forest"},
+                    {"kind": "far", "text": "a city street at noon"}]
+
+        def true_prompt(self, path):
+            return "a red fox in a snowy pine forest"
+
+        def refuse_overlong_prompts(self, prompts, count, limit):
+            return None
+
+    def _run(self, td):
+        rng = np.random.default_rng(7)
+        ref = [rng.integers(0, 256, (128, 160, 3), dtype=np.uint8) for _ in range(6)]
+        ours = [D.gaussian_blur(a, 0.6) for a in ref]
+        od, rd = os.path.join(td, "ours"), os.path.join(td, "ref")
+        os.mkdir(od); os.mkdir(rd)
+        for i, a in enumerate(ours):
+            write_ppm(os.path.join(od, f"frame_{i:06d}.ppm"), a)
+        sums = os.path.join(td, "SHA256SUMS")
+        with open(sums, "w", encoding="utf-8") as fh:
+            for i, a in enumerate(ref):
+                q = os.path.join(rd, f"frame_{i:06d}.ppm")
+                write_ppm(q, a)
+                fh.write(f"{_sha(q)}  frame_{i:06d}.ppm\n")
+        # The digest guard is real; point it at the set this case just wrote.
+        lines = "".join(f"{_sha(os.path.join(od, n))}  {n}\n"
+                        for n in sorted(os.listdir(od)))
+        digest = hashlib.sha256(lines.encode("ascii")).hexdigest()
+        out_json = os.path.join(td, "out.json")
+        old_digest, old_cmp = D.OURS_SET_DIGEST, D._cmp
+        D.OURS_SET_DIGEST = digest
+        D._cmp = self._Shim(old_cmp, self._Scorer)
+        try:
+            import contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = D.main(["--ours", od, "--reference", rd, "--sha256sums", sums,
+                             "--adherence-model", td, "--blur-sigmas", "0.3",
+                             "--json", out_json])
+        finally:
+            D.OURS_SET_DIGEST, D._cmp = old_digest, old_cmp
+        self.assertEqual(rc, 0)
+        with open(out_json, encoding="utf-8") as fh:
+            return json.load(fh), buf.getvalue()
+
+    def test_every_scored_arm_carries_a_validity_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            out, _ = self._run(td)
+        arms = out["arm_validity"]["arms"]
+        # One per scored arm: both unblurred renders, the reference sweep, our
+        # four-sigma sweep, the tone rescore and the sharpen diagnostic.
+        for want in ("reference_unblurred", "ours_unblurred", "ours_tone_matched",
+                     "ours_unsharp_1.0", "reference_blur_sigma_0.30",
+                     "ours_blur_sigma_0.30", "ours_blur_sigma_0.50",
+                     "ours_blur_sigma_0.70", "ours_blur_sigma_1.00"):
+            self.assertIn(want, arms, f"{want} was scored and not checked")
+        for name, v in arms.items():
+            self.assertIn("valid", v, name)
+        # and the verdict is recorded ON the row a reader reads, not only here
+        for row in out["ours_lowpass_ablation"]["sweep"]:
+            self.assertIn("scorer_valid", row)
+        for row in out["blur_ablation"]["sweep"]:
+            self.assertIn("scorer_valid", row)
+
+    def test_a_blurred_arm_a_decoy_WINS_is_marked_invalid_and_says_so(self):
+        # THE DEFECT, REPRODUCED. The delta rises with sigma while the arm
+        # producing it stops ranking the true prompt first. Both must be visible.
+        with tempfile.TemporaryDirectory() as td:
+            out, log = self._run(td)
+        sweep = {r["sigma"]: r for r in out["ours_lowpass_ablation"]["sweep"]}
+        self.assertTrue(sweep[0.3]["scorer_valid"]["valid"],
+                        "the mildest arm must stay readable or the case is vacuous")
+        for s in (0.5, 0.7, 1.0):
+            self.assertFalse(sweep[s]["scorer_valid"]["valid"], f"sigma {s}")
+            self.assertNotEqual(sweep[s]["argmax_label"], "true")
+        self.assertEqual(out["ours_lowpass_ablation"]["readable_sigmas"], [0.3])
+        self.assertIn("INVALID", log)
+
+    def test_the_console_prints_the_columns_that_decide_the_delta(self):
+        # The reference sweep always printed argmax, margin and wins. Our own
+        # sweep computed all three, recorded all three, and printed none, so the
+        # spec table copied from that console had no column that could show it.
+        with tempfile.TemporaryDirectory() as td:
+            _, log = self._run(td)
+        for line in log.splitlines():
+            if "OUR frames blurred" in line:
+                self.assertIn("argmax", line)
+                self.assertIn("margin", line)
+                self.assertIn("wins", line)
+
+    def test_the_high_band_line_names_the_band_it_measured(self):
+        # It named `f_lo` -- the CROSSOVER -- for numbers `band_terms` cuts at
+        # BAND_HI[0], and on the real frames those differ by 2.2x.
+        with tempfile.TemporaryDirectory() as td:
+            out, log = self._run(td)
+        line = next(l for l in log.splitlines()
+                    if l.startswith("[spectrum] energy"))
+        self.assertIn(f"{D.BAND_HI[0]:.4f}", line)
+        self.assertEqual(out["spectrum"]["hf_cut_cycles_per_pixel"], D.BAND_HI[0])
+        cross = out["spectrum"]["crossover_cycles_per_pixel"]
+        if cross is not None and abs(cross - D.BAND_HI[0]) > 1e-9:
+            self.assertNotIn(f"{cross:.4f}", line)
+
+    def test_the_four_conventions_are_correlated_PER_FRAME_and_recorded(self):
+        # The row published a four-estimator correlation table while the harness
+        # computed one correlation and `_conv_shares` returned whole-render
+        # scalars. Two of that table's four figures existed in no code and no
+        # artifact.
+        with tempfile.TemporaryDirectory() as td:
+            out, _ = self._run(td)
+        for arm in ("ours", "reference"):
+            by = out["correlation"][arm]["pearson_hf_vs_clip_by_convention"]
+            self.assertEqual(set(by), {"raw", "hann", "periodic", "welch"})
+            # welch is the reported one, so it must equal the headline exactly
+            self.assertAlmostEqual(by["welch"],
+                                   out["correlation"][arm]["pearson_hf_vs_clip"],
+                                   places=12)
+            n = len(out["per_frame_clip_true"][arm])
+            for conv in by:
+                self.assertEqual(
+                    len(out["convention_sensitivity"][conv][f"{arm}_high_per_frame"]), n)
+            # FOUR ESTIMATORS, OR THE TABLE IS ONE NUMBER FOUR TIMES. Feeding
+            # every entry the same per-frame array leaves every assertion above
+            # green, which is what a transcribed table looks like from the
+            # inside, so the four must be measurably distinct.
+            self.assertEqual(len({round(v, 9) for v in by.values()}), 4,
+                             f"{arm}: the conventions returned fewer than four "
+                             f"distinct coefficients: {by}")
+            self.assertGreater(abs(by["raw"] - by["welch"]), 0.05,
+                               f"{arm}: raw and welch must not agree; raw is the "
+                               f"convention whose band delta reverses sign")
+            # and the per-frame ARRAYS differ, not only their reductions
+            arrs = [tuple(out["convention_sensitivity"][c][f"{arm}_high_per_frame"])
+                    for c in ("raw", "hann", "periodic", "welch")]
+            self.assertEqual(len(set(arrs)), 4, f"{arm}: duplicate per-frame arrays")
+
+    def test_one_number_is_not_reported_twice_as_two(self):
+        # `pearson_high_band_vs_clip` reduced the same array as
+        # `pearson_hf_vs_clip` and shipped beside it, so the JSON showed two
+        # agreeing coefficients where one measurement existed.
+        with tempfile.TemporaryDirectory() as td:
+            out, _ = self._run(td)
+        for arm in ("ours", "reference"):
+            self.assertNotIn("pearson_high_band_vs_clip", out["correlation"][arm])
+            self.assertIn("pearson_mid_band_vs_clip", out["correlation"][arm])
+
+
+class TheCommittedGoldenIsREAD(unittest.TestCase):
+    """P: the 2980-line artifact had NO consumer -- no test, no script, no CI
+    step, no CMake target -- so the file that falsifies the prose could disagree
+    with it forever and nothing would notice. It disagreed.
+
+    These cases are the consumer. Each figure below is quoted in
+    `.agents/specs/ltx25-adherence-detail-loss.md`, `ltx25-oracle-absolute.md`,
+    `ltx25-prompt-adherence.md` or `docs/USAGE.md`, and each is asserted against
+    the committed JSON. Editing either side alone reds the suite, which is the
+    only mechanism that makes "recomputable rather than trusted" true.
+    """
+
+    GOLDEN = os.path.join(ROOT, "tests", "parity", "goldens",
+                          "ltx25_detail_loss", "detail-loss.json")
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(cls.GOLDEN):
+            raise unittest.SkipTest(f"{cls.GOLDEN} is absent")
+        with open(cls.GOLDEN, encoding="utf-8") as fh:
+            cls.g = json.load(fh)
+
+    def near(self, got, want, places=4, what=""):
+        self.assertAlmostEqual(float(got), want, places=places, msg=what)
+
+    def test_the_absolute_band_powers_the_records_publish(self):
+        b = self.g["bands"]
+        self.near(b["ours_mid_power_over_reference"], 1.0373, 4, "mid 1.0373x")
+        self.near(b["ours_hi_power_over_reference"], 1.4031, 4, "high 1.4031x")
+        self.near(b["ours_total_power_over_reference"], 1.1437, 4, "total 1.1437x")
+
+    def test_the_four_convention_band_deltas(self):
+        c = self.g["convention_sensitivity"]
+        for conv, mid, hi in (("raw", -0.3115, -0.2525), ("hann", -0.0888, 0.7751),
+                              ("periodic", -0.1183, 0.0578), ("welch", -0.0930, 0.2268)):
+            self.near(c[conv]["mid_delta"], mid, 4, f"{conv} mid")
+            self.near(c[conv]["high_delta"], hi, 4, f"{conv} high")
+
+    def test_the_within_render_correlations_and_their_SIGNS(self):
+        c = self.g["correlation"]
+        self.near(c["ours"]["pearson_hf_vs_clip"], -0.6195, 4)
+        self.near(c["reference"]["pearson_hf_vs_clip"], 0.2640, 4)
+        self.near(c["ours"]["spearman_hf_vs_clip"], -0.5985, 4)
+        self.near(c["reference"]["spearman_hf_vs_clip"], 0.2254, 4)
+        # against SHARPNESS both are negative, so that axis carries no contrast
+        # and the records must not present it as one
+        self.assertLess(c["ours"]["pearson_sharpness_vs_clip"], 0.0)
+        self.assertLess(c["reference"]["pearson_sharpness_vs_clip"], 0.0)
+        self.near(c["ours"]["pearson_sharpness_vs_clip"], -0.4450, 4)
+        self.near(c["reference"]["pearson_sharpness_vs_clip"], -0.1889, 4)
+        # the mid band is POSITIVE on both sides: the sign flip is the high band
+        self.assertGreater(c["ours"]["pearson_mid_band_vs_clip"], 0.0)
+        self.assertGreater(c["reference"]["pearson_mid_band_vs_clip"], 0.0)
+        self.near(c["ours"]["pearson_mid_band_vs_clip"], 0.3682, 4)
+        self.near(c["reference"]["pearson_mid_band_vs_clip"], 0.4513, 4)
+
+    def test_the_four_estimators_agree_about_OURS_and_NOT_about_the_reference(self):
+        # "The within-render correlation survives every estimator" was published
+        # from one computed coefficient and two figures that existed nowhere.
+        # Computed per frame, the claim is half true, and the half that fails is
+        # the half the sign flip rests on.
+        by_o = self.g["correlation"]["ours"]["pearson_hf_vs_clip_by_convention"]
+        by_r = self.g["correlation"]["reference"]["pearson_hf_vs_clip_by_convention"]
+        self.assertEqual(set(by_o), {"raw", "hann", "periodic", "welch"})
+        # OURS is robust: four estimators, one tight negative cluster
+        for conv, want in (("raw", -0.5946), ("hann", -0.6097),
+                           ("periodic", -0.6216), ("welch", -0.6195)):
+            self.near(by_o[conv], want, 4, f"ours {conv}")
+            self.assertLess(by_o[conv], -0.5, f"ours {conv} must stay clearly negative")
+        self.assertLess(max(by_o.values()) - min(by_o.values()), 0.05,
+                        "ours must be a tight cluster or 'robust' is the wrong word")
+        # THE REFERENCE IS NOT. Raw reads essentially ZERO, so the positive
+        # coefficient the sign flip needs is estimator-dependent and the records
+        # must not present it as robust.
+        for conv, want in (("raw", 0.0009), ("hann", 0.4514),
+                           ("periodic", 0.1754), ("welch", 0.2640)):
+            self.near(by_r[conv], want, 4, f"reference {conv}")
+        self.assertLess(abs(by_r["raw"]), 0.01,
+                        "the raw convention gives the reference NO association")
+        self.assertGreater(max(by_r.values()) - min(by_r.values()), 0.4,
+                           "the reference's spread is the finding; if it closed, "
+                           "the prose that calls it estimator-dependent is stale")
+
+    def test_the_reference_blur_sweep_HOLDS_the_precondition_throughout(self):
+        # This is the leg the falsification now rests on, so its validity is
+        # asserted rather than assumed.
+        s = self.g["blur_ablation"]["sweep"]
+        for row in s:
+            self.assertEqual(row["argmax_label"], "true", f"sigma {row['sigma']}")
+            self.assertGreater(row["margin_to_best_decoy"], 0.0)
+        last = s[-1]
+        self.near(last["sigma"], 2.0, 6)
+        self.near(last["clip_delta_vs_unblurred"], -1.9687, 4)
+        self.assertEqual(last["per_frame_true_wins"], 23)
+        self.near(self.g["blur_ablation"]["observed_gap"], 2.7305, 4)
+        self.assertLess(abs(last["clip_delta_vs_unblurred"]),
+                        self.g["blur_ablation"]["observed_gap"],
+                        "no achievable blur reproduces the gap")
+
+    def test_our_own_blur_sweep_FAILS_the_precondition_above_sigma_0_3(self):
+        # THE FINDING THAT WITHDREW THE DECISIVE ROW. `+1.9131` comes from an
+        # arm where the decoy `near:1` outranks the true prompt by 0.4036.
+        s = {r["sigma"]: r for r in self.g["ours_lowpass_ablation"]["sweep"]}
+        self.assertEqual(s[0.3]["argmax_label"], "true")
+        self.near(s[0.3]["delta_vs_ours"], -0.0029, 4)
+        for sig, delta, margin in ((0.5, -0.4252, -0.0436), (0.7, 0.8305, -0.3660),
+                                   (1.0, 1.9131, -0.4036)):
+            self.assertNotEqual(s[sig]["argmax_label"], "true", f"sigma {sig}")
+            self.near(s[sig]["delta_vs_ours"], delta, 4)
+            self.near(s[sig]["margin_to_best_decoy"], margin, 4)
+        # and the margin walks off monotonically, which is why no larger sigma
+        # rescues it either
+        margins = [s[k]["margin_to_best_decoy"] for k in (0.3, 0.5, 0.7, 1.0)]
+        self.assertEqual(margins, sorted(margins, reverse=True))
+
+    def test_tone_is_ruled_out_on_a_VALID_arm(self):
+        t = self.g["tone"]["rescored_after_correction"]
+        self.near(t["delta_vs_uncorrected"], 0.1846, 4)
+        self.assertEqual(t["argmax_label"], "true")
+        self.assertGreater(t["margin_to_best_decoy"], 0.0)
+        self.assertEqual(t["frames_clearing_bound"], 9)
+        self.near(self.g["tone"]["fit_ours_to_reference"]["gain"], 0.99144, 5)
+        self.near(self.g["tone"]["fit_ours_to_reference"]["gamma"], 1.04654, 5)
+
+    def test_the_sharpest_five_and_the_best_scoring_five_share_no_member(self):
+        # FFT-free and reproducible from the per-frame table, which is why the
+        # records now lean on it.
+        rows = sorted(self.g["per_frame_table"], key=lambda r: -r["clip_true"])
+        best5 = {r["frame"] for r in rows[:5]}
+        sharp5 = set(self.g["sharpest_five"])
+        self.assertEqual(best5 & sharp5, set())
+        self.assertEqual(self.g["frames_clearing_bound"], [0, 1, 2, 12, 15, 16])
+
+    def test_the_temporal_split_is_FFT_free_and_opposite_in_sign(self):
+        t = self.g["correlation"]["temporal"]
+        self.near(t["ours_r_frame_index_vs_clip"], -0.3351, 4)
+        self.near(t["reference_r_frame_index_vs_clip"], 0.6987, 4)
+        # the hf-GROWTH figures in the same paragraph were published as
+        # +22.8%/+17.9% with the order reversed; they are +4.8%/+7.0%
+        self.near(t["ours_hf_last5_over_first5"] - 1.0, 0.0481, 4)
+        self.near(t["reference_hf_last5_over_first5"] - 1.0, 0.0698, 4)
+        self.assertLess(t["ours_hf_last5_over_first5"],
+                        t["reference_hf_last5_over_first5"],
+                        "ours grows LESS, not more")
+
+    def test_the_axis_to_ring_figures_that_withdrew_the_upsampler_lead(self):
+        b = self.g["bands"]
+        for arm, h, v in (("ours", 2.46, 2.22), ("reference", 2.23, 1.78)):
+            a = b[f"{arm}_nyquist_axes"]
+            self.near(a["horizontal_nyquist"] / a["radial_ring_mean"], h, 2, arm)
+            self.near(a["vertical_nyquist"] / a["radial_ring_mean"], v, 2, arm)
+
+    def test_the_crossover_and_the_wrap_step_the_correction_cites(self):
+        self.near(self.g["spectrum"]["crossover_cycles_per_pixel"], 0.43359375, 8)
+        w = self.g["wrap_discontinuity"]
+        self.near(w["ours"]["top_bottom_jump"], 73.39, 2)
+        self.near(w["reference"]["top_bottom_jump"], 49.48, 2)
+
+    def test_the_scores_the_bound_and_n_equals_one(self):
+        self.near(self.g["bound"], 35.9286, 4)
+        self.near(self.g["blur_ablation"]["ours_clip_mean"], 35.2719, 4)
+        self.near(self.g["blur_ablation"]["reference_clip_mean"], 38.0024, 4)
+        self.assertEqual(self.g["n_ours_renders"], 1)
+        self.near(self.g["ours_discrimination"]["margin"], 0.3370, 4)
+        self.assertEqual(self.g["ours_discrimination"]["per_frame_true_wins"], 15)
 
 
 if __name__ == "__main__":

@@ -134,6 +134,12 @@ valuable available result, because it redirects a repair nobody has started.
 - **Windowing manufactures or destroys high-frequency energy.** The window is
   applied identically to both sets, and the unwindowed spectra are computed too,
   so the conclusion cannot rest on the window choice.
+  **[THIS RISK WAS REAL AND THIS MITIGATION DID NOT WORK.** The unwindowed
+  spectra were computed and never compared against the windowed ones, and the
+  conclusion did rest on the window choice: the two disagreed by a factor of
+  thirteen and in sign. Computing a control is not checking it. See
+  `## CORRECTION`, which replaces the estimator, and `## CORRECTION 2`, which
+  finds the same shape a second time on a non-spectral axis.]**
 - **A correlation over 25 frames of one continuous shot is not 25 independent
   samples.** Adjacent frames of a video are strongly dependent, so the effective
   n is smaller than 25 and any p-value computed against an i.i.d. null is
@@ -152,6 +158,15 @@ a reader can recompute any number in the report. The script verifies both
 digest sets before it reads a pixel and refuses rather than scoring a set it
 cannot identify.
 
+**COMMITTING THE JSON DID NOT MAKE THE REPORT RECOMPUTABLE, and this sentence
+was false for as long as it stood alone.** Nothing read the file -- no test, no
+script, no CI step, no CMake target -- so `## Outcome` drifted away from it
+figure by figure and the artifact that falsified the prose sat beside it in the
+same commit. `tests/scripts/test_ltx25_adherence_detail_loss.py::TheCommittedGoldenIsREAD`
+is the consumer: it asserts each published figure against the committed JSON, so
+changing either side alone reds the suite. A golden with no reader is a
+transcription that cannot fail.
+
 ## Gates
 
 None. This row adds no gate and moves no bound. The adherence gate belongs to
@@ -168,17 +183,33 @@ elsewhere.
   as the finding, in full, and the row does not go looking for a second story to
   tell instead.
 
-## Now
-
-`ACTIVE`.
-
 ## Outcome
 
 Measured on 2026-09-01 on the devbox: CPU only, no GPU, no lease, both frame
 sets already on disk. `scripts/ltx25-adherence-detail-loss.py` takes the whole
 reading and its full JSON is at
-`tests/parity/goldens/ltx25_detail_loss/detail-loss.json`, so every number below
-can be recomputed rather than trusted.
+`tests/parity/goldens/ltx25_detail_loss/detail-loss.json`.
+
+> **THIS SECTION IS THE WITHDRAWN FIRST DRAFT. READ `## CORRECTION` AND
+> `## CORRECTION 2` INSTEAD.** It opened by saying "every number below can be
+> recomputed rather than trusted", and that sentence is the reason it is marked
+> rather than quietly rewritten: recomputed against its own committed JSON, this
+> section's spectral table, its band shares, its correlation table, its per-frame
+> high-frequency column, its temporal growth figures, its axis-to-ring table and
+> its decisive intervention row are each falsified, **one of them by a change of
+> SIGN**. `763ae655e` corrected the headline and the conclusion and re-derived
+> none of the evidence under either.
+>
+> Every falsified figure below now carries an inline `[WITHDRAWN: ...]` marker
+> giving the value the committed artifact actually holds.
+> `tests/scripts/test_ltx25_adherence_detail_loss.py::TheCommittedGoldenIsREAD`
+> asserts the corrected figures against that artifact, so the two can no longer
+> drift apart in silence -- which is what happened here, because until that class
+> existed the 2980-line golden had no consumer at all.
+>
+> **What survives is in `## CORRECTION 2` under "The falsification stands".**
+> The hypothesis this row was created to test is still refuted, and it is refuted
+> on legs that do not depend on any withdrawn number.
 
 ### THE HYPOTHESIS IS FALSIFIED, and its premise is false as well
 
@@ -191,6 +222,17 @@ the reference, not less.** The radially averaged power spectrum has no crossover
 at all: there is no frequency above which our profile stays below the
 reference's. The ratio ours/reference rises with frequency instead of falling.
 
+**[WITHDRAWN: every figure in the table below, and the "no crossover at all"
+claim with them. All six are the HANN-windowed profile, which `## CORRECTION`
+withdrew as the frame's own border. The committed `spectrum/ours_mean_profile`
+is Moisan's periodic component, and against it the profile ratio is nearly FLAT
+and slightly below unity across the range -- 0.9987, 0.9968, 0.9196, 0.9624 and
+0.9567 at the five frequencies listed, with a minimum of 0.4358 at f = 0.0273
+and a maximum of 1.2167 at f = 0.3789. `spectrum/crossover_cycles_per_pixel`
+records **0.43359375**, so a crossover exists and the row's own harness found
+it. "The ratio rises with frequency instead of falling" is not a property of the
+estimator this row settled on.]**
+
 | band | ours / reference |
 |---|---|
 | f = 0.0039 c/px (the lowest populated bin) | **1.1927** |
@@ -202,6 +244,11 @@ reference's. The ratio ours/reference rises with frequency instead of falling.
 That is not a blur. A blur is a monotone rolloff and this is a **band-shaped**
 difference: more energy at the very bottom, a **hole in the middle**, and a large
 excess near Nyquist. As energy shares of the frame,
+
+**[WITHDRAWN: both rows. These are the Hann shares. `## CORRECTION` replaced the
+high-band figure with **+22.68%** and never restated the table it came from. The
+committed border-free (Welch) shares are mid 0.178624 against 0.196926,
+**-9.29%**, and high 0.162515 against 0.132465, **+22.68%**.]**
 
 | band | ours | reference | difference |
 |---|---|---|---|
@@ -224,6 +271,12 @@ from it was not, and no spectrum had ever been taken.
 The hypothesis predicts that within our render, the frames with more fine detail
 score better. They score **worse**.
 
+**[WITHDRAWN: all six figures. These are the Hann shares' coefficients, and the
+row's reported estimator is Welch. The committed `correlation/*` holds ours
+**-0.6195** / rho **-0.5985**, the reference **+0.2640** / rho **+0.2254**, and
+pooled **-0.7963** / rho **-0.7812**. The SIGN of every row survives, which is
+why the sign flip is what `## CORRECTION 2` keeps and the magnitudes are not.]**
+
 | population | n | r(high-frequency share, CLIP) | rho |
 |---|---|---|---|
 | within OURS | 25 | **-0.5862** | -0.5723 |
@@ -241,6 +294,14 @@ The **sign flip between the two renders** is the finding, not the magnitude. In
 upstream's render more fine-scale energy goes with a better score, which is what
 detail does. In ours it goes with a worse one, which is what noise does.
 
+**[WITHDRAWN, and this one is a change of SIGN.** The mid-band coefficients are
+**+0.3682** for ours and **+0.4513** for the reference in
+`correlation/*/pearson_mid_band_vs_clip`. The published `-0.3690` is the same
+magnitude with the opposite sign, so the sentence read as a second sign flip
+where the committed artifact records the two renders AGREEING. The sharpness
+pair `-0.4450` and `-0.1889` is correct and is the axis on which the two renders
+do NOT contrast: both are negative, so nothing in it separates them.**]**
+
 Against sharpness directly the coefficients are `-0.4450` for ours and `-0.1889`
 for the reference; against the mid band, `-0.3690` and `+0.1715`.
 
@@ -252,6 +313,13 @@ are the sharpest frames.
 
 **They are the least sharp frames.** The overlap between the five best-scoring
 frames and the five sharpest is **empty**.
+
+**[WITHDRAWN: the `high-frequency share` COLUMN ONLY, in all eleven rows. Those
+values are Hann shares, 0.047 to 0.065; the committed `per_frame_table`
+`hf_energy_fraction` is the Welch share and runs 0.1517 to 0.1773 -- 0.154504 for
+frame 0, 0.161151 for frame 2, 0.177252 for frame 21. Every other column, and the
+finding this table exists for, are correct as printed and are asserted against
+the artifact by `test_the_sharpest_five_and_the_best_scoring_five_share_no_member`.]**
 
 | frame | CLIP | clears | sharpness | sharpness rank | high-frequency share |
 |---|---|---|---|---|---|
@@ -297,7 +365,42 @@ its sharpness is **a fifth** of ours -- a visibly destroyed frame -- costs
 is also non-monotonic (0.70 costs more than 1.00), which says a small detail
 difference sits inside this instrument's own noise on this axis.
 
+**THIS IS THE DECISIVE ROW, and it is the only intervention in this section that
+holds its own precondition.** Every sigma above ranks the true prompt FIRST, with
+a positive margin, on 25 of 25 frames down to sigma 1.5 and 23 of 25 at 2.0. It
+survives because the reference starts with 1.8068 of separation against our
+0.3370, so there is room to destroy the picture before the scorer stops
+measuring. The table below has no such room, and it ran out.
+
 **Removing OUR excess fine-scale energy RAISES our score, sharply.**
+
+**[WITHDRAWN: every row of this arm except sigma 0.30, and the paragraph under
+it. The two columns this table omitted are the ones that decide whether its
+numbers are readings at all.** The harness computed and recorded `argmax_label`,
+`margin_to_best_decoy` and `per_frame_true_wins` for each row and printed none of
+them, so the table was copied from a console line that could not show them. With
+them, from the same committed `ours_lowpass_ablation.sweep`:
+
+| sigma | delta | argmax | margin to best decoy | wins | readable? |
+|---|---|---|---|---|---|
+| 0.30 | -0.0029 | `true` | +0.3318 | 15/25 | **yes** |
+| 0.50 | -0.4252 | `near:1` | **-0.0436** | 12/25 | **NO** |
+| 0.70 | +0.8305 | `near:1` | **-0.3660** | 6/25 | **NO** |
+| 1.00 | **+1.9131** | `near:1` | **-0.4036** | 5/25 | **NO** |
+
+`scripts/ltx25-render-compare.py`'s S0 states the rule this row wrote itself and
+then applied once: a scorer that cannot rank the true prompt first "measures
+nothing here and no adherence number is published at all". From sigma 0.50 the
+decoy `near:1` outranks the true prompt on our blurred frames, and the margin
+walks off monotonically, so no larger sigma rescues it either. **The `+1.9131`
+that decided this section comes from an arm on which the instrument had stopped
+telling a fox from a wolf.** The only readable row is sigma 0.30, and its delta
+is **-0.0029** -- zero. Blurring our frames by an amount the scorer can still
+read does nothing to our score.
+
+Why the reference's sweep survives the same operation and ours does not is
+measured, not argued: separation. Ours starts at 0.3370, so half a pixel of blur
+exhausts it; the reference starts at 1.8068.]**
 
 | sigma | our sharpness | our CLIP | delta | frames clearing the bound |
 |---|---|---|---|---|
@@ -342,9 +445,30 @@ excess the spectrum's first bin shows, seen in the histogram.
 
 ### WHAT THE MEASUREMENT POINTS AT, stated as a candidate and not a finding
 
+> **THIS WHOLE SUBSECTION IS RETRACTED.** `## CORRECTION` withdrew the
+> separable-upsampler lead and `## Now` says this row names NO cause, but this
+> text was left standing and unmarked, so it still reads as a live candidate
+> naming three rows to dispatch against: `LTX25-TEMPORAL-UPSAMPLER`,
+> `LTX25-TILED-DECODE` and `LTX25-DECODE-DTYPE`. **No row should be dispatched
+> against anything below.** The axis-to-ring table is the Hann one, which was
+> reading the frame's own wrap step -- ours is the larger, 73.39 against 49.48 --
+> and border-free the contrast is 2.46x/2.22x for ours against 2.23x/1.78x for
+> the reference, a difference too weak to name a stage. The temporal
+> high-frequency growth figures beside it are wrong as well, and in the order
+> they claim.
+>
+> The three ablations in "WHAT WOULD CONFIRM IT" remain the right way to
+> attribute the excess to a stage. They are not confirmation of the candidate
+> below, because there is no longer a candidate; they are how one would be found.
+
 The excess is **not isotropic**, and that is the sharpest structural clue.
 Near-Nyquist energy on the two frequency axes, against the radial ring around
 them:
+
+**[WITHDRAWN: every figure. Border-free (`bands/*_nyquist_axes` in the committed
+JSON) the ratios are **2.46x / 2.22x** for ours and **2.23x / 1.78x** for the
+reference. Both renders carry a comparable modest axis structure and the
+difference supports naming no stage.]**
 
 | | horizontal Nyquist | vertical Nyquist | radial ring | axis / ring |
 |---|---|---|---|---|
@@ -364,6 +488,13 @@ spreads that ring evenly.
 share grows along the clip in both renders (+22.8% ours, +17.9% reference, so
 the growth itself is not the anomaly), but the scores diverge:
 
+**[WITHDRAWN: the growth figures, and their ORDER. `correlation/temporal`
+records `ours_hf_last5_over_first5` = 1.0481 and
+`reference_hf_last5_over_first5` = 1.0698, so the growth is **+4.8% ours against
++7.0% reference** -- ours grows LESS, where the published pair has it growing
+more. The CLIP columns in the table below are correct and are the FFT-free part
+of this paragraph; only the high-frequency sentence above them is withdrawn.]**
+
 | | r(frame index, CLIP) | first 5 frames | last 5 frames |
 |---|---|---|---|
 | reference | **+0.6987** | 36.9820 | 38.9851, **+2.0030** |
@@ -372,6 +503,14 @@ the growth itself is not the anomaly), but the scores diverge:
 **Upstream's render improves along the clip and ours decays.** Our first three
 frames clear the bound and our last five are among our worst. A defect that
 grows with frame index is not in the per-frame spatial path.
+
+**[RETRACTED: the sentence below names a cause and three rows to dispatch
+against it. This row names NO cause. The axis excess it rests on was the frame's
+border, the temporal growth it rests on has the wrong sign of difference, and the
+"8.6% short" mid band is **-9.30%** as a share at **1.0373x** absolute power,
+which is equal rather than short. Do not open work against
+`LTX25-TEMPORAL-UPSAMPLER`, `LTX25-TILED-DECODE` or `LTX25-DECODE-DTYPE` on the
+strength of this paragraph.]**
 
 So the candidate this measurement names is: **an upsampling or decode stage that
 injects axis-aligned near-Nyquist energy, growing along the temporal axis, while
@@ -401,6 +540,14 @@ folds our near-Nyquist excess back into the band it does see. That aliasing is a
 plausible route from the excess to the score and this row does not measure it.
 It is a limit on how far the mechanism is traced, not on whether the hypothesis
 was refuted.
+
+**[WITHDRAWN: "recovers 70% of the shortfall". The blur arm recovers nothing
+the instrument can read. From sigma 0.50 a decoy outranks the true prompt on our
+blurred frames, and the one readable row moves our mean by -0.0029. The
+prohibition the sentence carries is UNCHANGED and now has a second reason: an
+operation that raises a CLIP mean by destroying the scorer's ability to rank the
+prompt first is not a repair, it is the gate-fitting this row forbids, wearing a
+number.]**
 
 **Nothing here says our render looks bad to a viewer**, and nothing here is a
 repair. The blur arm recovers 70% of the shortfall and **must not become one**:
@@ -494,30 +641,59 @@ old JSON with the new one would otherwise find an unexplained sign change.
 
 ### What is UNCHANGED
 
+> **TWO ITEMS IN THIS LIST DID NOT SURVIVE, and `## CORRECTION 2` replaces
+> them.** The first bullet's `+1.9131` comes from an arm whose scorer had
+> FAILED, and the estimator table below was transcribed rather than computed.
+> The three middle bullets stand, and they are what the falsification now rests
+> on.
+
 Everything that decided the row. The mechanism falsification is pixel- and
 CLIP-domain and no FFT convention enters it:
 
-- the blur intervention, **+1.9131** on our frames, 6 of 25 clearing the bound to
-  **23 of 25**, against **-0.9728** on the reference's;
+- **[WITHDRAWN]** the blur intervention, **+1.9131** on our frames, 6 of 25
+  clearing the bound to **23 of 25**, against **-0.9728** on the reference's. A
+  decoy outranks the true prompt on our frames from sigma 0.50 upward, so that
+  arm is not a reading; see `## CORRECTION 2`;
 - the reference blur sweep, which never reproduces the 2.7305 gap;
 - tone, ruled out at **+0.1846**;
 - the per-frame table, whose five best-scoring frames share **no member** with its
   five sharpest;
 - the temporal split, ours **-0.3351** against the reference's **+0.6987**.
 
-The within-render correlation survives every estimator, which is what makes it
-evidence rather than an artefact of one:
+**[WITHDRAWN: "survives every estimator", and two of the six figures under it.**
+That table was a transcription. The harness computed exactly ONE correlation --
+Welch -- because `_conv_shares` returned whole-render scalars and a correlation
+needs one number per frame, so no per-frame Hann or periodic coefficient existed
+to quote. `-0.6216 / +0.1754` happens to be the periodic pair and is right;
+`-0.5862 / +0.3943` is neither Hann nor Welch but the earlier radial-profile
+reading this row's own headline used before Welch replaced it. The **raw**
+convention -- the only one whose band delta reverses sign -- was missing from the
+table altogether. All four are now computed per frame and committed under
+`correlation/*/pearson_hf_vs_clip_by_convention`, and the claim is half true:
 
-| r(high-frequency share, CLIP) | ours | reference |
+| r(high-band share, CLIP), per frame | ours | reference |
 |---|---|---|
-| Hann | -0.5862 | +0.3943 |
+| raw | -0.5946 | **+0.0009** |
+| Hann | -0.6097 | +0.4514 |
 | periodic | -0.6216 | +0.1754 |
 | **Welch (reported)** | **-0.6195** | **+0.2640** |
 
+**Our negative coefficient is robust** -- four estimators inside a 0.03 band.
+**The reference's positive one is not**: it runs from +0.0009 to +0.4514, a
+factor of 500, and under the raw convention there is no association on the
+reference side at all. The sign FLIP therefore depends on which estimator reads
+the reference, so `## CORRECTION 2` does not lean on it.]**
+
 And the **mid-band deficit is robust in sign across all four estimators**: -31.15%
-raw, -8.88% Hann, -11.83% periodic, **-9.30% Welch**.
+raw, -8.88% Hann, -11.83% periodic, **-9.30% Welch**. That is a deficit in SHARE.
+In absolute power the mid band is **1.0373x**, which is equal or fractionally
+above, and the two must not be quoted as one quantity.
 
 ### The corrected reading
+
+**[SUPERSEDED IN ONE CLAUSE by `## CORRECTION 2`: "Smoothing our frames raises
+their score" rests on the withdrawn arm. Everything else in this paragraph
+stands.]**
 
 Our render carries **more** absolute high-frequency power than the reference
 (1.40x) at **equal** mid-band power (1.04x), and within our own frames more of
@@ -539,13 +715,153 @@ compared the two. They disagreed by a factor of thirteen and in sign. Every run
 now prints all four conventions and the wrap-jump statistic beside the verdict,
 so the next reader sees the spread instead of discovering it in review.
 
+
+## CORRECTION 2, 2026-09-01: the decisive arm's SCORER had failed, and `## Outcome` was never re-derived
+
+`## CORRECTION` corrected this row's headline band figure and withdrew its
+mechanism. It re-derived neither the evidence under the headline nor the evidence
+under the conclusion, and both were wrong. This section does that work. It is
+written against
+`tests/parity/goldens/ltx25_detail_loss/detail-loss.json`, and
+`tests/scripts/test_ltx25_adherence_detail_loss.py::TheCommittedGoldenIsREAD`
+asserts every figure below against that file, so "recomputable rather than
+trusted" is now enforced rather than promised.
+
+### The defect: a precondition asked of one arm is not a precondition of a run
+
+This row's decisive result was **+1.9131**: blurring our own frames at sigma 1.0
+raises their CLIP mean and takes 6 of 25 frames clearing the bound to 23 of 25.
+`scripts/ltx25-render-compare.py`'s S0 already forbade publishing such a number.
+It requires the scorer to rank the TRUE prompt first, and says that a scorer
+which cannot "measures nothing here and no adherence number is published at all".
+
+S0 ran **once**, on the unblurred reference. On our own blurred frames:
+
+| sigma | delta vs ours | argmax | margin to best decoy | wins | readable |
+|---|---|---|---|---|---|
+| 0.30 | **-0.0029** | `true` | +0.3318 | 15/25 | **yes** |
+| 0.50 | -0.4252 | `near:1` | -0.0436 | 12/25 | no |
+| 0.70 | +0.8305 | `near:1` | -0.3660 | 6/25 | no |
+| 1.00 | **+1.9131** | `near:1` | **-0.4036** | 5/25 | no |
+
+From sigma 0.50 a decoy -- a near-miss prompt, the wolf against the fox -- scores
+higher than the prompt the render was made from, and the margin walks off
+monotonically, so no larger sigma recovers it. **The only readable row of this
+arm is sigma 0.30, whose delta is -0.0029: zero.** Blurring our frames by an
+amount the instrument can still read does nothing to our score.
+
+The reference's sweep survives the identical operation to sigma 2.0 because it
+starts with **1.8068** of separation against our **0.3370**. That is not a
+difference in the operation; it is headroom.
+
+Both arms recorded `argmax_label`, `margin_to_best_decoy` and
+`per_frame_true_wins`. The reference's console line printed all three. Ours
+printed none, and the spec table was copied from that line. The data was
+present at every layer a machine reads and absent at both layers a human reads.
+
+**The repair is the scope of the check, not its logic.** `adherence_arm_valid`
+in `ltx25-render-compare.py` is now the single predicate; `scorer_precondition`
+calls it and raises, every scored arm records its verdict under `scorer_valid`,
+the run prints `READABLE` or `INVALID` beside every delta, and `arm_validity` in
+the JSON is a ledger of all fourteen arms. `test_S0_AND_the_arm_check_are_the_SAME_predicate`
+pins the two together, because two copies of a refusal rule drift and the copy
+that drifts is the one nothing calls on the failing path.
+
+### The falsification STANDS, on four legs, none of them withdrawn
+
+The hypothesis was that our render is smoother than upstream's and that the lost
+fine detail costs it the fox-against-wolf margin. It is still refuted.
+
+1. **The reference blur sweep, which is the strongest leg and the only surviving
+   intervention.** Every row holds its precondition: argmax `true`, a positive
+   margin, 25 of 25 frames down to sigma 1.5 and 23 of 25 at sigma 2.0. Blurring
+   upstream's frames until their sharpness is **a fifth** of ours -- a visibly
+   destroyed picture -- costs **1.9687** CLIP points against an observed gap of
+   **2.7305**, and blurring them only to our own sharpness costs **0.1192**, or
+   4.4% of it. No achievable amount of smoothing reproduces our gap. **This leg
+   alone carries the falsification.**
+2. **The empty overlap between our five sharpest frames and our five
+   best-scoring ones.** FFT-free, and reproducible from `per_frame_table` with no
+   spectral convention involved at all. Our three best-scoring frames are our
+   three least sharp; our sharpest frame, 21, fails the bound.
+3. **Tone, ruled out at +0.1846** on an arm that holds its precondition -- argmax
+   `true`, margin +0.3701. The fitted gain 0.99144 and gamma 1.04654 are the
+   identity, and correcting them takes 6 frames to 9 rather than to 25.
+4. **The temporal split, ours -0.3351 against the reference's +0.6987**, also
+   FFT-free. Upstream's render improves along the clip and ours decays.
+
+### What this row does NOT lean on any more
+
+- **The blurred-ours arm.** Invalid from sigma 0.50. Withdrawn.
+- **"The within-render correlation survives every estimator."** Computed per
+  frame rather than transcribed, ours is robustly negative (-0.5946 to -0.6216
+  across four estimators) and the reference's positive coefficient is NOT: it
+  runs +0.0009 raw, +0.1754 periodic, +0.2640 Welch, +0.4514 Hann. The sign
+  flip depends on which estimator reads the reference.
+- **The sharpness axis as a contrast.** Both renders are negative there,
+  -0.4450 ours against -0.1889 the reference: the same sign, no contrast.
+- **Any named cause.** See the retraction in `## Outcome`.
+
+### What is measured, and what it is not
+
+Our render carries **1.4031x** the reference's absolute high-band power at
+**1.0373x** its mid-band power, with **1.1437x** the total. As shares, the mid
+band is **-9.30%** and the high band **+22.68%**. A share and an absolute power
+are different quantities and this row has already been read wrong once for
+quoting one as the other: **there is no absolute mid-band deficit** -- 1.0373x is
+equal or fractionally above -- and the deficit that exists is a share, which
+moves when either band moves.
+
+So there is no high-frequency rolloff, and "our render is smoother" describes a
+rolloff. What the excess IS remains unattributed. The three ablations named in
+`## Outcome` -- bypassing the temporal upsampler, bypassing the tiled decode, and
+comparing decoder output against the oracle's at the SAME latent -- remain the
+way to attribute it, and none of them is in this row.
+
+### n IS 1 ON OUR SIDE, and that applies to every figure in this section too
+
+`## Outcome` said "every statement about our render says n = 1" and then
+`## CORRECTION` and this section moved the corrected figures out from under that
+sentence. It is restated here so it covers them.
+`[ "$i" = 1 ] || rm -f "$D"/frame_*.ppm` in `scripts/ltx25-render-confirm.sh`
+deletes renders 2 and 3, so the run-to-run spread of our own render does not
+exist in pixels and the S1 verdict itself could still move. The falsification
+does not depend on the gap's exact size: legs 1 to 4 are interventions and
+orderings applied to the same 25 frames.
+
+The instrument also sees a 224x224 centre crop of a 320x192 frame, so it never
+sees the frame's own Nyquist, and the horizontal downscale folds our
+near-Nyquist excess into the band it does see. That is a limit on how far the
+mechanism is traced, not on whether the hypothesis was refuted.
+
+### The lesson, and it is not the one `## CORRECTION` drew
+
+`## CORRECTION` concluded that a spectral share is a fragile statistic and made
+the harness print four conventions. That was right and insufficient, because the
+figure that then decided the row was not spectral at all.
+
+The pattern underneath both is the same: **this row corrected its headline and
+its conclusion twice and never re-derived the evidence under either.** The
+committed JSON held the falsifying values the whole time -- the mid-band sign
+flip, the crossover, the per-frame shares, the four invalid sweep rows -- and
+nothing read it. A 2980-line artifact with no consumer is a transcription that
+cannot fail. It has one now.
+
 ## Now
 
-`DONE`. The hypothesis this row was created to test is refuted, and the records
-it came from are corrected in the same change. **The repair remains unowned and
-this row does NOT name a cause for it.** An earlier version of this line said the
-gap was "now unowned with a direction"; the direction it meant was the
-separable-upsampler lead, and `## CORRECTION` withdraws that. What this row
-leaves is a refuted hypothesis, a measured mid-band deficit at 1.04x absolute
-mid-band power, a 1.40x absolute high-band excess that behaves like noise rather
-than detail, and three named ablations that would attribute it.
+`DONE`. The hypothesis this row was created to test is refuted. **The repair
+remains unowned and this row does NOT name a cause for it**, and the
+separable-upsampler lead an earlier version of this line pointed at is withdrawn
+in `## CORRECTION` and retracted in place in `## Outcome`.
+
+What this row leaves, on **n = 1 for our render**:
+
+- a **refuted** smoothness hypothesis, resting on the reference blur sweep, the
+  empty sharpest-versus-best-scoring overlap, tone at +0.1846 and the temporal
+  split -- four legs, none of which depends on a withdrawn figure;
+- **no measured absolute mid-band deficit**: the mid band is **1.0373x**, equal;
+  the deficit is a **share**, **-9.30%** border-free;
+- a **1.4031x absolute high-band excess** whose stage is unidentified;
+- three named ablations that would attribute it, owned by no row;
+- and one instrument repair that outlives the row: `adherence_arm_valid`, so
+  that no future arm publishes a CLIP delta the scorer could not read.

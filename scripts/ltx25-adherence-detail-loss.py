@@ -225,8 +225,19 @@ def hann2d(h: int, w: int) -> np.ndarray:
 
 
 def periodic_component(u: np.ndarray) -> np.ndarray:
-    """Moisan's periodic-plus-smooth decomposition, and the ONLY spectrum this
-    row reports from.
+    """Moisan's periodic-plus-smooth decomposition, which this row uses for the
+    radial PROFILE's shape and for nothing that decides anything.
+
+    IT IS NOT THE ESTIMATOR ANY VERDICT COMES FROM. `welch_psd` is, and this
+    docstring said the opposite of that one for as long as both existed: this
+    one claimed to be "the ONLY spectrum this row reports from" while
+    `welch_psd` claimed to be "what every reported spectral number in this row
+    comes from". The code settles it -- `band_terms`, `nyquist_axes` and every
+    band figure read `welch_psd`, and `out["spectrum"]["ours_mean_profile"]` is
+    the only consumer of this function's output. Moisan removes the wrap step
+    exactly but leaves a low-frequency counter-term that scales with the
+    boundary jump, which the two renders do not share, so it is not border-free
+    in the sense a band comparison needs.
 
     THE DEFECT IT REPAIRS, MEASURED RATHER THAN ASSERTED. The DFT treats a frame
     as periodic, so the jump from its last row to its first is a step the picture
@@ -239,10 +250,15 @@ def periodic_component(u: np.ndarray) -> np.ndarray:
     against the reference's 49.48, on interior steps of 10.68 and 11.32 -- so the
     contamination is UNEQUAL between the two renders and does not cancel in a
     ratio. Measured on the same 25 frames a side, the high-band comparison reads
-    -25.25% raw, +77.51% Hann-windowed, and +5.78% here. Two of those three are
-    the border talking, and the axis-to-ring contrast that suggested a separable
-    upsampler collapses from 7.3x-against-4.9x to 6.70x-against-5.74x once this
-    runs, which is why that lead was withdrawn.
+    -25.25% raw, +77.51% Hann-windowed, +5.78% here, and +22.68% under Welch.
+
+    THE AXIS-TO-RING FIGURES THAT WITHDREW THE UPSAMPLER LEAD ARE WELCH'S, and
+    they are in the committed JSON under `bands/*_nyquist_axes`: 2.46x/2.22x for
+    ours against 2.23x/1.78x for the reference, down from the published Hann
+    reading of 7.35x/7.27x against 4.86x/3.91x. An earlier version of this
+    docstring gave that collapse as "7.3x-against-4.9x to 6.70x-against-5.74x",
+    a periodic-convention pair that appears in no artifact this row commits and
+    that no reader could recompute. One withdrawal, one derivation.
 
     The decomposition splits `u = p + s` where `s` is smooth and carries the
     boundary jump and `p` is periodic with no wrap discontinuity. It removes the
@@ -271,8 +287,14 @@ TILE_STEP = 32
 
 
 def welch_psd(frames: list[np.ndarray]) -> list[np.ndarray]:
-    """Per-frame Welch PSD over INTERIOR tiles. This is what every reported
-    spectral number in this row comes from, and the reason is measured.
+    """Per-frame Welch PSD over INTERIOR tiles. Every spectral number this row
+    draws a conclusion from comes from here, and the reason is measured.
+
+    The one spectral output that does NOT is the radial profile's shape in
+    `out["spectrum"]["ours_mean_profile"]`, which is Moisan's periodic
+    component and is kept for shape only. `periodic_component`'s own docstring
+    once claimed the opposite of this sentence; the code decides, and it reads
+    this function for `band_terms`, `nyquist_axes` and every band figure.
 
     THREE WHOLE-FRAME CONVENTIONS GAVE THREE ANSWERS ON THESE FRAMES, two of
     them with different signs. The high-band comparison reads -25.25% raw,
@@ -661,7 +683,6 @@ def main(argv: list[str]) -> int:
           f"0.25 {np.interp(0.25, centers, ratio):.4f}, "
           f"0.40 {np.interp(0.40, centers, ratio):.4f}; crossover {cross}")
 
-    f_lo = cross if cross is not None else 0.25
     # THE CORRELATION'S OWN INPUT IS THE WELCH SHARE, not a radial-profile
     # reduction. The radial profile above is kept for shape, but every number
     # that enters a verdict comes from the border-free estimator.
@@ -673,8 +694,12 @@ def main(argv: list[str]) -> int:
     out["spectrum"]["reference_hf_energy_fraction"] = [float(v) for v in hf_r]
     out["spectrum"]["ours_hf_energy_fraction_mean"] = float(hf_o.mean())
     out["spectrum"]["reference_hf_energy_fraction_mean"] = float(hf_r.mean())
-    print(f"[spectrum] energy at or above {f_lo:.4f} c/px: ours "
-          f"{hf_o.mean():.6f}, reference {hf_r.mean():.6f}, "
+    # THE LABEL IS `BAND_HI`, WHICH IS THE BAND THESE NUMBERS ACTUALLY SPAN.
+    # It said `f_lo` -- the CROSSOVER, 0.4336 on these frames -- for numbers
+    # `band_terms` cuts at 0.20, so the console mislabelled its own band by 2.2x
+    # while the JSON's `hf_cut_cycles_per_pixel` recorded 0.20 correctly.
+    print(f"[spectrum] energy in the band [{BAND_HI[0]:.4f}, {BAND_HI[1]:.4f}) "
+          f"c/px: ours {hf_o.mean():.6f}, reference {hf_r.mean():.6f}, "
           f"relative loss {1.0 - hf_o.mean() / hf_r.mean():+.4f}")
 
     # THE CONVENTION SPREAD, printed rather than chosen silently. A reviewer
@@ -682,38 +707,56 @@ def main(argv: list[str]) -> int:
     # OPPOSITE SIGN; both readings were the border, not the picture. The three
     # numbers now ship side by side so that disagreement is visible in the
     # output instead of being discovered in review.
-    def _conv_shares(frames, conv):
-        h_, w_ = luma(frames[0]).shape
-        rr = _fgrid(h_, w_)
-        mm = (rr >= BAND_MID[0]) & (rr < BAND_MID[1])
-        hh = (rr >= BAND_HI[0]) & (rr < BAND_HI[1])
-        tt = rr > 0
+    # PER FRAME, not whole-render. The whole-render share is the share of the
+    # MEAN spectrum, which is what a band comparison wants; a CORRELATION needs
+    # one number per frame, and the row published a four-estimator correlation
+    # table while this helper could only ever return two whole-render scalars.
+    # Both come off the same power arrays here, so they cannot disagree about
+    # which convention they are.
+    def _conv_frame_powers(frames, conv):
         if conv == "welch":
-            rr = tile_freq_grid()
-            mm = (rr >= BAND_MID[0]) & (rr < BAND_MID[1])
-            hh = (rr >= BAND_HI[0]) & (rr < BAND_HI[1])
-            tt = rr > 0
-            acc = np.mean(welch_psd(frames), axis=0)
-            return (float(acc[mm].sum() / acc[tt].sum()),
-                    float(acc[hh].sum() / acc[tt].sum()))
+            return welch_psd(frames), tile_freq_grid()
+        h_, w_ = luma(frames[0]).shape
         win_ = hann2d(h_, w_)
-        acc = None
+        out_ = []
         for a in frames:
             l_ = luma(a)
             if conv == "periodic":
                 l_ = periodic_component(l_)
-            pw_ = _power(l_, win_ if conv == "hann" else None)
-            acc = pw_ if acc is None else acc + pw_
-        acc /= len(frames)
-        return float(acc[mm].sum() / acc[tt].sum()), float(acc[hh].sum() / acc[tt].sum())
+            out_.append(_power(l_, win_ if conv == "hann" else None))
+        return out_, _fgrid(h_, w_)
+
+    def _conv_shares(frames, conv):
+        """(whole-render mid, whole-render high, per-frame mid, per-frame high)."""
+        P_, rr = _conv_frame_powers(frames, conv)
+        mm = (rr >= BAND_MID[0]) & (rr < BAND_MID[1])
+        hh = (rr >= BAND_HI[0]) & (rr < BAND_HI[1])
+        tt = rr > 0
+        if conv == "welch":
+            acc = np.mean(P_, axis=0)
+        else:
+            acc = None
+            for pw_ in P_:
+                acc = pw_ if acc is None else acc + pw_
+            acc = acc / len(P_)
+        per_mid = np.array([float(p[mm].sum() / p[tt].sum()) for p in P_])
+        per_hi = np.array([float(p[hh].sum() / p[tt].sum()) for p in P_])
+        return (float(acc[mm].sum() / acc[tt].sum()),
+                float(acc[hh].sum() / acc[tt].sum()), per_mid, per_hi)
 
     out["convention_sensitivity"] = {}
+    per_frame_hi_by_conv: dict = {}
     for conv in ("raw", "hann", "periodic", "welch"):
-        om, oh = _conv_shares(ours, conv)
-        rm, rh = _conv_shares(ref, conv)
+        om, oh, o_pm, o_ph = _conv_shares(ours, conv)
+        rm, rh, r_pm, r_ph = _conv_shares(ref, conv)
+        per_frame_hi_by_conv[conv] = (o_ph, r_ph)
         out["convention_sensitivity"][conv] = {
             "ours_mid": om, "reference_mid": rm, "mid_delta": om / rm - 1.0,
-            "ours_high": oh, "reference_high": rh, "high_delta": oh / rh - 1.0}
+            "ours_high": oh, "reference_high": rh, "high_delta": oh / rh - 1.0,
+            "ours_high_per_frame": [float(v) for v in o_ph],
+            "reference_high_per_frame": [float(v) for v in r_ph],
+            "ours_mid_per_frame": [float(v) for v in o_pm],
+            "reference_mid_per_frame": [float(v) for v in r_pm]}
         print(f"[conv] {conv:9s} mid {om:.6f}/{rm:.6f} ({om/rm-1:+.2%})  "
               f"high {oh:.6f}/{rh:.6f} ({oh/rh-1:+.2%})")
     out["wrap_discontinuity"] = {"ours": wrap_discontinuity(ours),
@@ -777,6 +820,20 @@ def main(argv: list[str]) -> int:
     out["prompt"] = prompt
     out["labels"] = labels
 
+    # EVERY SCORED ARM IS CHECKED, NOT JUST THE REFERENCE. S0 raises on the
+    # oracle's own frames because a scorer that fails there is broken. An
+    # ablation arm cannot make the scorer broken, so it does not raise -- but a
+    # blurred arm on which a DECOY outranks the true prompt has stopped
+    # measuring prompt adherence just as completely, and its CLIP mean is a
+    # number rather than a reading. This row published `+1.9131` from exactly
+    # such an arm as its decisive result while S0 ran once, on the reference.
+    def _arm(disc: dict, name: str) -> dict:
+        v = _cmp.adherence_arm_valid(disc)
+        if not v["valid"]:
+            print(f"[arm] INVALID: {name} -- {v['reason']}. Nothing derived "
+                  f"from this arm's CLIP mean is a reading of adherence")
+        return v
+
     m_ref = scorer.score(ref, prompts)
     ref_disc = _cmp.discrimination(m_ref, labels)
     # S0 BEFORE ANY NUMBER OF OURS IS PUBLISHED, exactly as the landed tool does.
@@ -785,6 +842,8 @@ def main(argv: list[str]) -> int:
     ours_disc = _cmp.discrimination(m_ours, labels)
     out["reference_discrimination"] = ref_disc
     out["ours_discrimination"] = ours_disc
+    ref_disc["scorer_valid"] = _arm(ref_disc, "reference, unblurred")
+    ours_disc["scorer_valid"] = _arm(ours_disc, "ours, unblurred")
     clip_o = m_ours[:, 0]
     clip_r = m_ref[:, 0]
     out["per_frame_clip_true"] = {"ours": [float(v) for v in clip_o],
@@ -808,9 +867,25 @@ def main(argv: list[str]) -> int:
             "pearson_sharpness_vs_clip": pearson(sh, cl),
             "spearman_sharpness_vs_clip": spearman(sh, cl),
         }
+    # `pearson_high_band_vs_clip` USED TO LIVE HERE AND IT WAS THE SAME NUMBER.
+    # It reduced `band_terms(...)["hi_fraction"]`, which is exactly what `hf_o`
+    # and `hf_r` above are, so the JSON carried one measurement twice under two
+    # names and a reader saw two agreeing coefficients. The high band's
+    # coefficient is `pearson_hf_vs_clip`; only the MID band is a second one.
     for name, b, cl in (("ours", bo, clip_o), ("reference", br, clip_r)):
         corr[name]["pearson_mid_band_vs_clip"] = pearson(b["mid_fraction"], cl)
-        corr[name]["pearson_high_band_vs_clip"] = pearson(b["hi_fraction"], cl)
+    # THE FOUR ESTIMATORS, COMPUTED RATHER THAN TRANSCRIBED. The row published a
+    # table claiming the within-render correlation "survives every estimator"
+    # while the harness computed exactly one of them. Two of that table's four
+    # figures appeared in no code and no artifact, and the raw convention -- the
+    # one whose band delta reverses sign -- was absent from it entirely.
+    for name, cl, sel in (("ours", clip_o, 0), ("reference", clip_r, 1)):
+        corr[name]["pearson_hf_vs_clip_by_convention"] = {
+            conv: pearson(per_frame_hi_by_conv[conv][sel], cl)
+            for conv in ("raw", "hann", "periodic", "welch")}
+        corr[name]["spearman_hf_vs_clip_by_convention"] = {
+            conv: spearman(per_frame_hi_by_conv[conv][sel], cl)
+            for conv in ("raw", "hann", "periodic", "welch")}
     hf_all = np.concatenate([hf_o, hf_r])
     cl_all = np.concatenate([clip_o, clip_r])
     sh_all = np.concatenate([sharp_o, sharp_r])
@@ -886,13 +961,16 @@ def main(argv: list[str]) -> int:
                "clip_delta_vs_unblurred": float(sc[:, 0].mean() - clip_r.mean()),
                "argmax_label": d["argmax_label"],
                "margin_to_best_decoy": d["margin"],
-               "per_frame_true_wins": d["per_frame_true_wins"]}
+               "per_frame_true_wins": d["per_frame_true_wins"],
+               "scorer_valid": _arm(d, f"reference blurred sigma={s:.2f}")}
         sweep.append(row)
         print(f"[ablate] reference blurred sigma={s:.2f}: sharpness "
               f"{sm:.4f} (ours {base_sharp_o:.4f}), clip {row['clip_true_mean']:.4f} "
-              f"({row['clip_delta_vs_unblurred']:+.4f}), margin "
+              f"({row['clip_delta_vs_unblurred']:+.4f}), argmax "
+              f"{row['argmax_label']}, margin "
               f"{row['margin_to_best_decoy']:+.4f}, wins "
-              f"{row['per_frame_true_wins']}/25")
+              f"{row['per_frame_true_wins']}/25, "
+              f"{'READABLE' if row['scorer_valid']['valid'] else 'INVALID'}")
     out["blur_ablation"] = {
         "reference_sharpness": base_sharp_r,
         "ours_sharpness": base_sharp_o,
@@ -934,16 +1012,35 @@ def main(argv: list[str]) -> int:
                         "frames_clearing_bound": int((sc[:, 0] >= bound).sum()),
                         "argmax_label": d_["argmax_label"],
                         "margin_to_best_decoy": d_["margin"],
-                        "per_frame_true_wins": d_["per_frame_true_wins"]})
+                        "per_frame_true_wins": d_["per_frame_true_wins"],
+                        "scorer_valid": _arm(d_, f"ours blurred sigma={s_:.2f}")})
+        # THE COLUMNS THAT DECIDE WHETHER THE DELTA MEANS ANYTHING, PRINTED.
+        # The reference sweep above has always shown argmax, margin and wins.
+        # This arm computed and recorded all three and printed none of them, so
+        # the console -- and the spec table copied from it -- showed a rising
+        # delta on arms where a DECOY outranks the true prompt.
         print(f"[ablate] OUR frames blurred sigma={s_:.2f}: sharpness "
               f"{ours_lp[-1]['sharpness']:.4f}, clip "
               f"{ours_lp[-1]['clip_true_mean']:.4f} "
               f"({ours_lp[-1]['delta_vs_ours']:+.4f}), "
-              f"{ours_lp[-1]['frames_clearing_bound']}/25 clear")
+              f"{ours_lp[-1]['frames_clearing_bound']}/25 clear, argmax "
+              f"{ours_lp[-1]['argmax_label']}, margin "
+              f"{ours_lp[-1]['margin_to_best_decoy']:+.4f}, wins "
+              f"{ours_lp[-1]['per_frame_true_wins']}/25, "
+              f"{'READABLE' if ours_lp[-1]['scorer_valid']['valid'] else 'INVALID'}")
     out["ours_lowpass_ablation"] = {
         "question": ("does removing OUR excess high-frequency energy raise or "
                      "lower our score -- grain, or detail"),
+        "readable_sigmas": [r_["sigma"] for r_ in ours_lp
+                            if r_["scorer_valid"]["valid"]],
         "sweep": ours_lp}
+    _bad = [r_ for r_ in ours_lp if not r_["scorer_valid"]["valid"]]
+    if _bad:
+        _sig = ", ".join("%.2f" % r_["sigma"] for r_ in _bad)
+        print(f"[ablate] {len(_bad)} of {len(ours_lp)} rows of this sweep are "
+              f"INVALID (sigma {_sig}): a decoy outranks the true prompt, so "
+              f"their CLIP means are not adherence readings and no conclusion "
+              f"may rest on them")
 
     # --- tone-corrected rescore, closing item 1 ---
     m_tone = scorer.score(ours_tone, prompts)
@@ -956,11 +1053,14 @@ def main(argv: list[str]) -> int:
         "margin_to_best_decoy": d_tone["margin"],
         "per_frame_true_wins": d_tone["per_frame_true_wins"],
         "sharpness": mean_sharpness(ours_tone),
+        "scorer_valid": _arm(d_tone, "ours, tone-matched"),
     }
     r = out["tone"]["rescored_after_correction"]
     print(f"[tone] our frames tone-matched to the reference score "
           f"{r['clip_true_mean']:.4f} ({r['delta_vs_uncorrected']:+.4f}), "
-          f"{r['frames_clearing_bound']}/25 clear the bound")
+          f"{r['frames_clearing_bound']}/25 clear the bound, argmax "
+          f"{r['argmax_label']}, margin {r['margin_to_best_decoy']:+.4f}, "
+          f"{'READABLE' if r['scorer_valid']['valid'] else 'INVALID'}")
 
     # --- the symmetric diagnostic arm ---
     sharpened = [unsharp(a, 1.0, 1.0) for a in ours]
@@ -975,13 +1075,44 @@ def main(argv: list[str]) -> int:
         "clip_true_mean": float(m_sh[:, 0].mean()),
         "delta_vs_ours": float(m_sh[:, 0].mean() - clip_o.mean()),
         "frames_clearing_bound": int((m_sh[:, 0] >= bound).sum()),
+        "argmax_label": d_sh["argmax_label"],
         "margin_to_best_decoy": d_sh["margin"],
         "per_frame_true_wins": d_sh["per_frame_true_wins"],
+        "scorer_valid": _arm(d_sh, "ours, unsharp(1.0, 1.0)"),
     }
     s = out["sharpen_diagnostic"]
     print(f"[diag] unsharp(1.0, 1.0) on OUR frames: sharpness {s['sharpness']:.4f}, "
           f"clip {s['clip_true_mean']:.4f} ({s['delta_vs_ours']:+.4f}), "
-          f"{s['frames_clearing_bound']}/25 clear the bound")
+          f"{s['frames_clearing_bound']}/25 clear the bound, argmax "
+          f"{s['argmax_label']}, margin {s['margin_to_best_decoy']:+.4f}, "
+          f"{'READABLE' if s['scorer_valid']['valid'] else 'INVALID'}")
+
+    # THE ARM LEDGER, so a reader of the JSON never has to hunt for validity.
+    out["arm_validity"] = {
+        "rule": ("an arm's CLIP mean is a reading of prompt adherence only when "
+                 "the scorer ranks the TRUE prompt first on that arm's own "
+                 "frames, by a strictly positive margin -- the same predicate S0 "
+                 "applies to the oracle's render, `adherence_arm_valid` in "
+                 "ltx25-render-compare.py"),
+        "why": ("this row published its decisive figure, +1.9131 at sigma 1.0, "
+                "from an arm on which the decoy 'near:1' outranks the true "
+                "prompt by 0.4036. S0 had run once, on the unblurred reference. "
+                "A precondition asked of one arm is not a precondition of a run"),
+        "arms": {},
+    }
+    _arms = out["arm_validity"]["arms"]
+    _arms["reference_unblurred"] = ref_disc["scorer_valid"]
+    _arms["ours_unblurred"] = ours_disc["scorer_valid"]
+    _arms["ours_tone_matched"] = r["scorer_valid"]
+    _arms["ours_unsharp_1.0"] = s["scorer_valid"]
+    for _r in sweep:
+        _arms["reference_blur_sigma_%.2f" % _r["sigma"]] = _r["scorer_valid"]
+    for _r in ours_lp:
+        _arms["ours_blur_sigma_%.2f" % _r["sigma"]] = _r["scorer_valid"]
+    _n_bad = sum(1 for _v in _arms.values() if not _v["valid"])
+    print(f"[arm] {len(_arms) - _n_bad} of {len(_arms)} scored arms are "
+          f"READABLE; {_n_bad} are INVALID and nothing may be concluded from "
+          f"them")
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:

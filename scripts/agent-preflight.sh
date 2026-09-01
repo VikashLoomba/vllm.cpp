@@ -525,11 +525,24 @@ run "tools suites" python3 -m unittest discover -s tests/tools -t . -p "test_*.p
 #
 # This block used to name five: check-agent-record, check-commit-style,
 # check-commit-trailers, check-issue-index-append-only and check-now-current.
-# There are 42. "All gates green." therefore described 12% of the gates, and the
-# other 37 reached the working tree only where their own test suite happened to
-# call them against the real ROOT -- a property of the test, not of the gate
-# (#467). A named list is also the record-lock shape AGENTS.md §Records forbids:
-# every new checker would have to edit one shared line here.
+# scripts/ holds many more than five. "All gates green." therefore described a
+# small minority of the gates, and every checker the list omitted reached the
+# working tree only where its own test suite happened to call it against the real
+# ROOT -- a property of the test, not of the gate (#467).
+#
+# How many is deliberately not written here. A count of one file stored inside
+# another goes stale on an edit whose author never reads this line, and it
+# couples every unrelated change to a line it does not own, which AGENTS.md
+# §Records forbids. This comment carried `There are 42.` and it was wrong twice
+# over: `7dc2ef1ea` took the directory to 41, and later checkers have since put
+# it back at 42, so the stale line happened to read true again for a reason
+# nobody intended.
+#
+# `check-issue-index-append-only` above is history, not a file. `7dc2ef1ea`
+# deleted it together with the append-only issue index it gated. The loop below
+# discovers whatever scripts/check-*.py holds today, which is the point, and a
+# named list is the same record-lock shape: every new checker would have to edit
+# one shared line here.
 #
 # A checker that needs arguments this block cannot supply is a SKIP carrying the
 # reason, never silence. The argparse USAGE TEXT is what distinguishes that case,

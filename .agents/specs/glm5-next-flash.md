@@ -5344,12 +5344,16 @@ Debts this row carries, each visible rather than waived:
 
   | leg | device | rc | wall | `secs=` | stdout |
   |---|---|---:|---:|---:|---|
-  | cpu0 | cpu | 0 | 1176 s | 169.3 | ` Paris.` (byte-identical to the base tree) |
+  | cpu0 | cpu | 0 | 1176 s | 169.344 | ` Paris.` (byte-identical to the base tree) |
   | cuda1 | cuda | **139** | 1420 s | -- | **0 bytes** |
-  | cpu1 | cpu | 0 | 1918 s | 220.3 | ` Paris.` |
+  | cpu1 | cpu | 0 | 1918 s | 220.332 | ` Paris.` |
   | cuda2 | cuda | **139** | 1061 s | -- | **0 bytes** |
+  | cpu2 | cpu | 0 | 1983 s | 116.572 | ` Paris.` |
+  | cuda3 | cuda | **139** | 1376 s | -- | **0 bytes** |
 
-  `139` is SIGSEGV. It is REPRODUCIBLE, 2 of 2, and each crashing leg logged
+  `139` is SIGSEGV. **THREE of three CUDA legs crashed and three of three CPU
+  legs emitted ` Paris.`**, interleaved, from one binary on one box -- so this is
+  a property of the arm and not of the box's mood. Each crashing leg logged
   exactly one device-arm announcement followed by exactly one fallback warning
   before dying -- so the fault is in the MIXED residency state the per-layer fit
   guard creates, not in the device arm itself, which the CUDA unit gate exercises
@@ -5427,8 +5431,9 @@ because this is the SECOND inherited block this row has carried past its own
 expiry.
 
 **AND THEN IT SEGFAULTED, so the arm is OPT-IN and defaults OFF.** Driven end to
-end on the 101.24 GiB artifact, both `--device cuda` legs died with SIGSEGV
-(rc=139) emitting no token, reproducibly, once the expert banks stopped fitting
+end on the 101.24 GiB artifact, ALL THREE `--device cuda` legs died with SIGSEGV
+(rc=139) emitting no token, against three CPU legs that all emitted ` Paris.`,
+interleaved on one binary -- once the expert banks stopped fitting
 and the arm fell back to the host mid-model. The base tree produced a clean
 refusal on the same command, so this was a REGRESSION and the default is
 restored byte-for-byte; O46 carries the four legs, the three hypotheses already

@@ -25,10 +25,11 @@ namespace {
 // W9c-3a's device split is OPT-IN and DEFAULTS OFF, and the reason is a
 // measurement rather than caution.
 //
-// Driven on `dgx:gpu0` against the real 101.24 GiB UD-Q2_K_XL artifact, both
+// Driven on `dgx:gpu0` against the real 101.24 GiB UD-Q2_K_XL artifact, all three
 // `--device cuda` legs died with **SIGSEGV** (rc=139) having emitted no token,
 // where `origin/main` produced a clean named refusal in 1066 s. The crash is
-// reproducible (2 of 2) and it appears only in the MIXED residency state this
+// reproducible (3 of 3, against 3 of 3 CPU legs emitting ` Paris.` on the same
+// binary, interleaved) and it appears only in the MIXED residency state this
 // row's per-layer fit guard creates: each leg logged the device arm engaging
 // for one layer and then `DeviceBanksFit` declining a later one, and died after
 // that. 94.6758 GiB of expert banks do not fit beside the KV pool and the GGUF
@@ -331,7 +332,7 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
       Fail("the routed-expert device arm is OPT-IN and is not enabled, so this "
            "forward will not take a non-CPU queue. It defaults off because both "
            "`--device cuda` legs against the published 101.24 GiB UD-Q2_K_XL "
-           "artifact on dgx:gpu0 died with SIGSEGV having emitted no token, "
+           "artifact on dgx:gpu0 died with SIGSEGV having emitted no token, 3 of 3, "
            "reproducibly, once the expert banks stopped fitting and the arm fell "
            "back to the host mid-model. Run this model with --device cpu, which "
            "emits ` Paris.` on that artifact. Set VT_GLM5_NEXT_DEVICE_EXPERTS=1 "

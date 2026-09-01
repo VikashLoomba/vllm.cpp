@@ -28,6 +28,16 @@
 // flows: which stage ran, on how many rows, and that a text request through the
 // same server is untouched.
 //
+// THE SEAM IS INSTALLED BY THE PRODUCTION FUNCTION, NOT BY THIS FILE (#2475).
+// Until ENG-MM-INPUT-PIPELINE's dispatch wave this harness called
+// `oai::MakeQwen3VLImageChatFn` itself, which is exactly why #2408 item 5 could
+// delete the server's `set_multimodal_chat_fn(...)` and watch this suite stay
+// green: the test was re-implementing the thing it was supposed to gate. It now
+// calls `oai::InstallMultiModalChatSeam` — the one function `server_main.cpp`
+// calls — against a temporary model directory carrying real
+// `preprocessor_config.json` and `config.json` files, so the processor is
+// loaded from disk on the production path rather than handed in pre-built.
+//
 // The tiny vision tower is built directly rather than loaded, because
 // `LoadQwen3VLWeights` hard-codes the 4B tower geometry (hidden 1024, depth 24,
 // 2304 position embeddings, ~300M parameters) and a unit test cannot synthesise
@@ -38,13 +48,17 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <random>
+#include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -53,6 +67,7 @@
 #include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
+#include "vllm/entrypoints/openai/mm_chat_registry.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
@@ -402,6 +417,65 @@ oai::ImageCodecFn RawRgbCodec() {
   };
 }
 
+// ─── The model DIRECTORY the production factory reads ───────────────────────
+//
+// `MakeQwen3VLChatSeam` loads its processor config from
+// `<model_dir>/preprocessor_config.json` + `<model_dir>/config.json`, exactly as
+// the server does. These two documents reproduce `MakeProcessorConfig()`'s
+// geometry on disk, so the seam the production install builds is the same
+// processor the hand-wired harness used to pass in. `config.json` deliberately
+// carries NO `vision_config`: the loader lets that sub-key override merge and
+// patch size (qwen3vl_processor.cpp:53-59), and the fixture's values live in
+// `preprocessor_config.json`.
+json Qwen3VLPreprocessorJson() {
+  return json{{"patch_size", 16},
+              {"temporal_patch_size", 2},
+              {"merge_size", 2},
+              {"size", {{"shortest_edge", 1024}, {"longest_edge", 1 << 24}}}};
+}
+
+json Qwen3VLConfigJson() {
+  return json{{"image_token_id", kImagePadId},
+              {"vision_start_token_id", kVisionStartId},
+              {"vision_end_token_id", kVisionEndId}};
+}
+
+// A throwaway checkpoint directory holding those two documents. Removed on
+// destruction so a ctest run leaves nothing behind.
+struct TempModelDir {
+  std::filesystem::path path;
+
+  TempModelDir() {
+    static int counter = 0;
+    static const unsigned salt = std::random_device{}();
+    path = std::filesystem::temp_directory_path() /
+           ("vllm_mmchat_model_" + std::to_string(salt) + "_" +
+            std::to_string(counter++));
+    std::filesystem::create_directories(path);
+    std::ofstream(path / "preprocessor_config.json", std::ios::binary)
+        << Qwen3VLPreprocessorJson().dump();
+    std::ofstream(path / "config.json", std::ios::binary)
+        << Qwen3VLConfigJson().dump();
+  }
+  ~TempModelDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
+  TempModelDir(const TempModelDir&) = delete;
+  TempModelDir& operator=(const TempModelDir&) = delete;
+
+  std::string dir() const { return path.string(); }
+  std::string config_path() const { return (path / "config.json").string(); }
+};
+
+// The architecture the model registry resolves this fixture's weights to, and
+// the one Qwen3-VL's chat factory is registered under.
+constexpr const char* kQwen3VLArch = "Qwen3VLForConditionalGeneration";
+// An architecture NOTHING registers a chat seam for. It stands in for the next
+// multimodal model to reach this seam before its own factory exists; the cases
+// below assert its premise rather than assume it.
+constexpr const char* kUnregisteredMmArch = "UnregisteredMmForConditionalGeneration";
+
 std::string EncodeBase64(const std::vector<uint8_t>& raw) {
   static const char* kAlpha =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -541,12 +615,36 @@ struct MmServerHarness {
     return get_request_block_hasher(kBlockSize, sha256_cbor);
   }
 
-  void wire_multimodal_seam(const vllm::multimodal::Qwen3VLImageProcessor& proc,
-                            const vllm::multimodal::BaseProcessingInfo& info) {
-    chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
-        proc, Fixture(), &ConcatChatPrompt, RawRgbCodec(), info));
+  // THE PRODUCTION INSTALL, not a copy of it. `server_main.cpp` builds the same
+  // context and calls the same function; what it adds on top is reading the
+  // architecture and the multimodal declaration off `LoadedEngine` and pointing
+  // `model_dir` at the real checkpoint. Anything this method proves about the
+  // dispatch, the server gets for free; the ONE line it cannot reach is
+  // `server_main.cpp`'s own call, which lives inside `main` (see the mutation
+  // note in `.agents/specs/mm-chat-seam-registry.md`).
+  //
+  // `log` is captured rather than sent to stderr so a case can assert on WHAT
+  // the install announced, which is the only externally visible difference
+  // between the installed and the refusing arm at startup.
+  oai::MultiModalChatInstall install_multimodal_seam(
+      std::string_view architecture, bool is_multimodal_model,
+      const TempModelDir& model, std::ostream& log) {
+    oai::MultiModalChatContext ctx;
+    ctx.architecture = architecture;
+    ctx.model_dir = model.dir();
+    ctx.config_path = model.config_path();
+    ctx.served_model_name = "tiny-qwen3-vl";
+    ctx.tokenizer = &Fixture();
+    ctx.prompt_fn = &ConcatChatPrompt;
+    ctx.codec = RawRgbCodec();
+    ctx.mm_config = &mm_cfg;
+    return oai::InstallMultiModalChatSeam(chat, is_multimodal_model, ctx, log);
   }
 
+  // Declared FIRST so it outlives `chat`: the seam's `BaseProcessingInfo` holds
+  // it by reference (context.h:105), exactly as the engine's own config is held
+  // in production.
+  vllm::MultiModalConfig mm_cfg;
   Scheduler scheduler;
   GPUModelRunner runner;
   Executor executor;
@@ -586,6 +684,71 @@ TEST_CASE("mm forward: the Qwen3-VL registration declares the encode/embed/mrope
 }
 
 // ---------------------------------------------------------------------------
+// 1b. THE CHAT SEAM IS REGISTERED BY ARCHITECTURE (#2475). The serving half of
+//     the same split: the model registration says the model can EMBED image
+//     features, this registration says the server can BUILD them from an
+//     `image_url` part. Both are keyed on the architecture, and an architecture
+//     nobody registered resolves to NOTHING rather than to the first entry.
+// ---------------------------------------------------------------------------
+TEST_CASE("mm chat registry: the seam is keyed on the architecture, and an unregistered one resolves to nothing") {
+  const oai::MultiModalChatRegistration* qwen =
+      oai::MultiModalChatRegistry::Find(kQwen3VLArch);
+  REQUIRE(qwen != nullptr);
+  CHECK(qwen->architecture == kQwen3VLArch);
+  CHECK(qwen->make_seam != nullptr);
+
+  // The premise of the refusal cases below, asserted rather than assumed.
+  CHECK(oai::MultiModalChatRegistry::Find(kUnregisteredMmArch) == nullptr);
+
+  // The registration is reached through the static library's --whole-archive,
+  // so a link that dropped `mm_chat_qwen3vl.cpp` reads as an EMPTY registry
+  // rather than as a subtly wrong one.
+  const std::vector<std::string_view> archs =
+      oai::MultiModalChatRegistry::SupportedArchs();
+  CHECK(std::find(archs.begin(), archs.end(), std::string_view(kQwen3VLArch)) !=
+        archs.end());
+
+  // The on-disk fixture reproduces the geometry the rest of this file assumes.
+  // The production factory loads its processor from those two files, so a
+  // directory that loaded to a DIFFERENT config would move
+  // `kExpectedImageTokens` and quietly make every case below measure something
+  // else.
+  const TempModelDir model_dir;
+  const vllm::multimodal::Qwen3VLProcessorConfig on_disk =
+      vllm::multimodal::LoadQwen3VLProcessorConfig(
+          (model_dir.path / "preprocessor_config.json").string(),
+          model_dir.config_path(), "tiny-qwen3-vl");
+  const vllm::multimodal::Qwen3VLProcessorConfig in_memory =
+      MakeProcessorConfig();
+  CHECK(on_disk.patch_size == in_memory.patch_size);
+  CHECK(on_disk.temporal_patch_size == in_memory.temporal_patch_size);
+  CHECK(on_disk.merge_size == in_memory.merge_size);
+  CHECK(on_disk.min_pixels == in_memory.min_pixels);
+  CHECK(on_disk.max_pixels == in_memory.max_pixels);
+  CHECK(on_disk.image_token_id == in_memory.image_token_id);
+  CHECK(on_disk.vision_start_token_id == in_memory.vision_start_token_id);
+  CHECK(on_disk.vision_end_token_id == in_memory.vision_end_token_id);
+  CHECK(on_disk.model_id == in_memory.model_id);
+
+  // And the dispatch refuses BY NAME rather than substituting a processor,
+  // which is the whole of #2475 (mirrors registry.py:182-185).
+  oai::MultiModalChatContext ctx;
+  ctx.architecture = kUnregisteredMmArch;
+  bool threw = false;
+  try {
+    (void)oai::MultiModalChatRegistry::MakeSeam(ctx);
+  } catch (const std::exception& e) {
+    threw = true;
+    const std::string what = e.what();
+    INFO("what: ", what);
+    CHECK(what.find(kUnregisteredMmArch) != std::string::npos);
+    CHECK(what.find("no multimodal CHAT seam is registered") !=
+          std::string::npos);
+  }
+  CHECK(threw);
+}
+
+// ---------------------------------------------------------------------------
 // 2. THE SERVED REQUEST. One image chat request, through HTTP dispatch.
 // ---------------------------------------------------------------------------
 TEST_CASE("mm forward: a served image chat request reaches the model forward") {
@@ -595,12 +758,12 @@ TEST_CASE("mm forward: a served image chat request reaches the model forward") {
   vt::Queue q = Q();
   vllm::ModelRegistry::Prepare(*model, c, q);
 
+  const TempModelDir model_dir;
   MmServerHarness h(c, *model, Fixture());
-  const vllm::multimodal::Qwen3VLImageProcessor proc(MakeProcessorConfig());
-  const vllm::MultiModalConfig mm_cfg;
-  const vllm::multimodal::BaseProcessingInfo info(
-      mm_cfg, oai::Qwen3VLChatSupportedMmLimits());
-  h.wire_multimodal_seam(proc, info);
+  std::ostringstream install_log;
+  REQUIRE(h.install_multimodal_seam(kQwen3VLArch, /*is_multimodal_model=*/true,
+                                    model_dir, install_log) ==
+          oai::MultiModalChatInstall::kInstalled);
 
   const ApiServer::DispatchResult r =
       h.server.handle_chat_completions(ChatBodyWithImage(/*max_tokens=*/3));
@@ -632,12 +795,12 @@ TEST_CASE("mm forward: two image requests on one server both answer, and share n
   vt::Queue q = Q();
   vllm::ModelRegistry::Prepare(*model, c, q);
 
+  const TempModelDir model_dir;
   MmServerHarness h(c, *model, Fixture());
-  const vllm::multimodal::Qwen3VLImageProcessor proc(MakeProcessorConfig());
-  const vllm::MultiModalConfig mm_cfg;
-  const vllm::multimodal::BaseProcessingInfo info(
-      mm_cfg, oai::Qwen3VLChatSupportedMmLimits());
-  h.wire_multimodal_seam(proc, info);
+  std::ostringstream install_log;
+  REQUIRE(h.install_multimodal_seam(kQwen3VLArch, /*is_multimodal_model=*/true,
+                                    model_dir, install_log) ==
+          oai::MultiModalChatInstall::kInstalled);
 
   // The SAME image twice. The second request hits the encoder cache by mm_hash,
   // so the tower runs once; both must still answer with the same shape.
@@ -673,12 +836,12 @@ TEST_CASE("mm forward: two DIFFERENT images give two different completions") {
   vt::Queue q = Q();
   vllm::ModelRegistry::Prepare(*model, c, q);
 
+  const TempModelDir model_dir;
   MmServerHarness h(c, *model, Fixture());
-  const vllm::multimodal::Qwen3VLImageProcessor proc(MakeProcessorConfig());
-  const vllm::MultiModalConfig mm_cfg;
-  const vllm::multimodal::BaseProcessingInfo info(
-      mm_cfg, oai::Qwen3VLChatSupportedMmLimits());
-  h.wire_multimodal_seam(proc, info);
+  std::ostringstream install_log;
+  REQUIRE(h.install_multimodal_seam(kQwen3VLArch, /*is_multimodal_model=*/true,
+                                    model_dir, install_log) ==
+          oai::MultiModalChatInstall::kInstalled);
 
   const ApiServer::DispatchResult a =
       h.server.handle_chat_completions(ChatBodyWithImageLogprobs(4, /*variant=*/0));
@@ -707,4 +870,123 @@ TEST_CASE("mm forward: two DIFFERENT images give two different completions") {
   // reader is not surprised by two identical completions beside a passing case.
   MESSAGE("image A text '", CompletionText(a), "'  image B text '",
           CompletionText(b), "'");
+}
+
+// ---------------------------------------------------------------------------
+// 5. THE WRONG ARCHITECTURE GETS NOTHING (#2475), through the same HTTP
+//    dispatch.
+//
+//    This is the case the old install could not have. Its gate was the
+//    EXISTENCE of `<model_dir>/preprocessor_config.json`, and this model
+//    directory has one — so an install that keys on the file, or a registry
+//    lookup that ignores its key and returns the first entry, builds Qwen3-VL's
+//    processor here and answers 200. Only a lookup that actually reads the
+//    architecture refuses.
+//
+//    The refusal is the SECOND half of the requirement: never fall through to
+//    another model's processor, and never be swallowed into the text path. A
+//    200 on this body means one of those two happened.
+// ---------------------------------------------------------------------------
+TEST_CASE("mm chat registry: an architecture with no registered seam REFUSES the image request by name") {
+  const HfConfig c = MakeConfig();
+  const vllm::Qwen3VLWeights w = MakeVlWeights(c);
+  std::unique_ptr<vllm::LoadedModel> model = vllm::BorrowQwen3VLLoadedModel(w);
+  vt::Queue q = Q();
+  vllm::ModelRegistry::Prepare(*model, c, q);
+
+  // A populated Qwen3-VL model directory, deliberately: the file is present and
+  // must not be what decides.
+  const TempModelDir model_dir;
+  MmServerHarness h(c, *model, Fixture());
+  std::ostringstream install_log;
+  REQUIRE(h.install_multimodal_seam(kUnregisteredMmArch,
+                                    /*is_multimodal_model=*/true, model_dir,
+                                    install_log) ==
+          oai::MultiModalChatInstall::kRefusing);
+  INFO("install log: ", install_log.str());
+  CHECK(install_log.str().find(kUnregisteredMmArch) != std::string::npos);
+
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(ChatBodyWithImage(/*max_tokens=*/3));
+  INFO("body: ", r.body);
+  // 200 here is the defect: it means the request was served, either by
+  // Qwen3-VL's processor or by the text path with the image dropped.
+  CHECK(r.status == 400);
+  const json j = json::parse(r.body);
+  const std::string message =
+      j.at("error").at("message").get<std::string>();
+  INFO("message: ", message);
+  CHECK(message.find(kUnregisteredMmArch) != std::string::npos);
+  CHECK(message.find("multimodal input is not available") != std::string::npos);
+  // And it names the missing part, so the reader of the log knows what to
+  // register rather than only that something failed.
+  CHECK(message.find("REGISTER_VLLM_MM_CHAT") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// 6. THE REFUSAL IS SCOPED TO MULTIMODAL PARTS. A refusing seam that fired on
+//    every request would take the text path down with the images, which is a
+//    different way of breaking the server than the one this row is fixing.
+//
+//    The tiny Qwen3-VL forward refuses a step with no multimodal request by
+//    name, so a text request on THIS harness does not reach 200. What is
+//    asserted is that whatever it reaches, it is not the seam's refusal.
+// ---------------------------------------------------------------------------
+TEST_CASE("mm chat registry: the refusing seam leaves a text request alone") {
+  const HfConfig c = MakeConfig();
+  const vllm::Qwen3VLWeights w = MakeVlWeights(c);
+  std::unique_ptr<vllm::LoadedModel> model = vllm::BorrowQwen3VLLoadedModel(w);
+  vt::Queue q = Q();
+  vllm::ModelRegistry::Prepare(*model, c, q);
+
+  const TempModelDir model_dir;
+  MmServerHarness h(c, *model, Fixture());
+  std::ostringstream install_log;
+  REQUIRE(h.install_multimodal_seam(kUnregisteredMmArch,
+                                    /*is_multimodal_model=*/true, model_dir,
+                                    install_log) ==
+          oai::MultiModalChatInstall::kRefusing);
+
+  const json body = {{"model", "test-model"},
+                     {"messages", json::array({{{"role", "user"},
+                                                {"content", "hello"}}})},
+                     {"max_completion_tokens", 2},
+                     {"temperature", 0.0}};
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(body.dump());
+  INFO("body: ", r.body);
+  // The seam let it through: what refuses is the tiny fixture's OWN registered
+  // forward, several layers further in, and its message says so by name. That
+  // is a stronger statement than the absence of the seam's message, because it
+  // says how far the request got rather than only which error it avoided.
+  CHECK(r.body.find("multimodal input is not available") == std::string::npos);
+  CHECK(r.body.find("requires multimodal inputs (ModelForwardInput.mm)") !=
+        std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// 7. A TEXT-ONLY ARCHITECTURE INSTALLS NOTHING (registry.py:109-110). The old
+//    install had no way to know this: it asked the filesystem, so a text-only
+//    checkpoint that happened to ship a `preprocessor_config.json` went into
+//    the Qwen3-VL branch and out through the swallowed catch.
+//
+//    An install that dropped the declaration and keyed on the file alone would
+//    report kInstalled here, because this directory has the file and the
+//    architecture is the registered one.
+// ---------------------------------------------------------------------------
+TEST_CASE("mm chat registry: an architecture that declares no multimodal support installs no seam") {
+  const HfConfig c = MakeConfig();
+  const vllm::Qwen3VLWeights w = MakeVlWeights(c);
+  std::unique_ptr<vllm::LoadedModel> model = vllm::BorrowQwen3VLLoadedModel(w);
+  vt::Queue q = Q();
+  vllm::ModelRegistry::Prepare(*model, c, q);
+
+  const TempModelDir model_dir;
+  MmServerHarness h(c, *model, Fixture());
+  std::ostringstream install_log;
+  CHECK(h.install_multimodal_seam(kQwen3VLArch, /*is_multimodal_model=*/false,
+                                  model_dir, install_log) ==
+        oai::MultiModalChatInstall::kTextOnlyModel);
+  // Nothing to announce: this is the ordinary text-only server, not a failure.
+  CHECK(install_log.str().empty());
 }

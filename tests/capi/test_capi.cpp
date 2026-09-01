@@ -1442,7 +1442,8 @@ TEST_CASE("capi: EngineParams::multimodal reaches LoadedEngine::mm_config()") {
 // permanent public contract, and the thing it must not claim is that setting
 // these fields makes a C-ABI call REFUSE a multimodal request. It does not:
 // ValidateNumItems is reached only behind the multimodal chat seam, and
-// server_main.cpp is the sole caller of set_multimodal_chat_fn — vllm_chat and
+// server_main.cpp's InstallMultiModalChatSeam is the sole PRODUCTION caller of
+// set_multimodal_chat_fn (#2475) — vllm_chat and
 // vllm_chat_stream never install one, so serving_chat.cpp's `if (mm_chat_fn_)`
 // gate is never taken on this path and no MultiModalInputs is ever built.
 //

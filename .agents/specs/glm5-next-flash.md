@@ -4734,6 +4734,22 @@ Debts this row carries, each visible rather than waived:
   wants that row's own sibling-inertness gate rather than this one's. Tracked by
   [#2456](https://github.com/mudler/vllm.cpp/issues/2456), which names
   `MODEL-DSV4-*` as its owner.
+- **O39 — `MultiKvCacheIndex::num_groups()` COUNTS SOMETHING ITS COMMENT DOES
+  NOT DESCRIBE, and it is the second stale sentence `9e7621efc` left on this
+  seam.** The accessor is documented as "how many DISTINCT published groups they
+  came from" about the caches in `attn_kv`, and `num_published_groups()`'s
+  comment spells the contrast out with a worked `qwen4_exp` example. Both
+  describe the pre-widening channel. The implementation counts distinct ids over
+  the whole `group_ids` vector, which `9e7621efc` repointed at
+  `kv_index_group_ids_` — one entry per PUBLISHED cache, recurrent included — so
+  on any hybrid it now equals `num_published_groups()`. Measured on this model's
+  miniature: it answers **3**, not 2, and W5b-2d asserts that value with the
+  reason beside it rather than asserting the prose. Nothing on this row reads it
+  for a decision; `glm5_next_kv.cpp`'s `ChannelSummary` printed it under an
+  `attn_kv` label and now says what each number is. **NOT fixed in flow:** the
+  shared header belongs to ENG-MULTIKV-BYNAME's row, and reverting the accessor
+  rather than the comment would change three models' seam. Tracked by
+  [#2459](https://github.com/mudler/vllm.cpp/issues/2459).
 - **O38 — THE DEVICE ARM HAS NO NUMBER AND THIS WAVE DID NOT PRODUCE ONE, which
   is a stronger statement than O6's "no number on any axis" and belongs beside
   it.** W5b-2d makes `--device cuda` REACH `glm5_next_forward.cpp:231-238`
@@ -4748,6 +4764,38 @@ Debts this row carries, each visible rather than waived:
   where the four named waves already said it was.
 
 ## Now
+
+`ACTIVE`, 2026-09-01. **THE SENTENCE THIS ROW HAS REPEATED FOR FOUR WAVES WAS
+FALSE, and W5b-2d is what makes it true.** Every `## Now` below says
+`--device cuda` "still refuses by name at `glm5_next_forward.cpp:231-238`". On
+the real artifact it did not: it loaded, auto-fitted, entered the engine and
+died earlier, in the KV binding, on `'model.layers.3.self_attn.indexer.k_cache'
+resolved to attn_kv index 45 but only 22 cache(s) arrived`
+([#2445](https://github.com/mudler/vllm.cpp/issues/2445)). Those lines described
+code that exists and behaviour nobody could reach.
+
+**AND IT WAS NOT A DEVICE DEFECT.** #2445 declined to guess and named the one
+measurement that would settle it. The answer is that `--device cpu` reproduces
+it identically, because `9e7621efc` (ENG-MULTIKV-BYNAME) widened the by-name
+channel over EVERY published cache 65 minutes after O30's ` Paris.` was taken,
+and `MultiKvCacheIndex::Find` stopped answering an `attn_kv` index. This row's
+consumer was never reconciled; qwen4_exp's was. §W5b-2d carries the two commits,
+their timestamps and the ancestry check. `ResolveAttnCache` now goes through
+`PayloadAt`, and the KDA states go by name too — the header sentence justifying
+their positional derivation, "no name travels with them", was falsified by the
+same commit.
+
+**What that buys and what it does not.** `--device cuda` now REACHES
+`glm5_next_forward.cpp:231-238` and is refused there by name, which is what the
+row always claimed and is now measured. It buys no device number: the forward is
+a host `std::vector<float>` reference end to end, so there is no CUDA arm to
+time, and O38 records that rather than letting "the KV binding is fixed" read as
+"the device arm is close". W9c-1, W9c-2 and W9c-3 are each still unstarted per
+O32, and they are still the price.
+
+The next actions are unchanged — W9b, then W9c-1 — with W6 and W7b behind them.
+
+### Before W5b-2d
 
 `ACTIVE`, 2026-08-31. **The k-pool indexer has a device implementation, and it
 is the first kernel this campaign has had to write.** W9c-0

@@ -33,14 +33,27 @@ std::string LatentName(int64_t l) {
 std::string IndexerName(int64_t l) {
   return "model.layers." + std::to_string(l) + ".self_attn.indexer.k_cache";
 }
+// W5b-2d (#2445): the KDA layer's recurrent state, which the channel CAN now
+// address by name. `MakeGlm5NextKVCache` publishes it at
+// `glm5_next_registry.cpp:311`, the same one-definition rule as the two above.
+std::string RecurrentName(int64_t l) {
+  return "model.layers." + std::to_string(l) + ".linear_attn";
+}
 
 // The first few names the channel actually carried, for a diagnostic that says
 // what was there instead of only what was missing.
 std::string ChannelSummary(const MultiKvCacheIndex& mk) {
-  std::string s = std::to_string(mk.size()) + " cache(s) from " +
-                  std::to_string(mk.num_groups()) + " group(s) in attn_kv, " +
+  // W5b-2d (#2445): `size()` and `num_groups()` are counts over EVERY published
+  // cache and not over `attn_kv` — `9e7621efc` widened both and left
+  // `num_groups()`'s own comment saying otherwise (#2459). The wording here says
+  // what the numbers are, because a diagnostic that mislabels its denominators
+  // is how the 45-against-22 confusion reads as a topology error.
+  std::string s = std::to_string(mk.size()) + " published cache(s) (" +
+                  std::to_string(mk.num_paged()) + " paged, " +
+                  std::to_string(mk.num_recurrent()) + " recurrent) from " +
+                  std::to_string(mk.num_groups()) + " group(s), " +
                   std::to_string(mk.num_published_groups()) +
-                  " published group(s); names begin: ";
+                  " with a block table; names begin: ";
   if (mk.layer_names == nullptr || mk.layer_names->empty()) return s + "(none)";
   const size_t n = mk.layer_names->size() < 4 ? mk.layer_names->size() : 4;
   for (size_t i = 0; i < n; ++i) {
@@ -115,18 +128,46 @@ int64_t ResolveAttnCache(const MultiKvCacheIndex& mk,
                          const std::vector<PagedKvCache>& attn_kv,
                          const std::string& name, int64_t expect_head,
                          const std::string& what, int32_t* group_out) {
-  const int64_t i = mk.Find(name);
-  if (i < 0) {
+  // W5b-2d (#2445). `Find` answers a FLAT index over EVERY published cache,
+  // paged and recurrent together, and NOT a slot in `attn_kv` — see the header's
+  // "THE FLAT INDEX IS NOT THE PAGED SLOT". Using it as one is what this wave
+  // repaired, and the flat index is still what `group_ids` is parallel to, so
+  // both values are kept and each is used against the vector it indexes.
+  const int64_t flat = mk.Find(name);
+  if (flat < 0) {
     Fail("the engine published no cache named '" + name + "' (" + what +
          "). The channel carried " + ChannelSummary(mk) +
          ". `MakeGlm5NextKVCache` publishes this name for every "
          "deepseek_sparse_attention layer, so a channel without it is a cache "
          "topology this forward cannot address.");
   }
-  if (static_cast<size_t>(i) >= attn_kv.size()) {
-    Fail("'" + name + "' resolved to attn_kv index " + std::to_string(i) +
-         " but only " + std::to_string(attn_kv.size()) +
-         " cache(s) arrived; the name index and attn_kv disagree.");
+  KvCachePayload kind = KvCachePayload::kPaged;
+  int32_t slot = -1;
+  if (!mk.PayloadAt(flat, &kind, &slot)) {
+    Fail("'" + name + "' (" + what + ") is named at flat index " +
+         std::to_string(flat) +
+         " but the channel carries no payload locator for it. Without one there "
+         "is no way to turn a published name into a slot in `attn_kv`, and the "
+         "flat index is NOT that slot on any topology carrying a recurrent "
+         "group. The channel carried " + ChannelSummary(mk) + ".");
+  }
+  // A RECURRENT PAYLOAD UNDER AN ATTENTION NAME. `attn_kv` and `gdn_state` are
+  // two different containers, so a slot read against the wrong one is an
+  // unrelated buffer with no shape error — the same wrong-answer-not-a-crash
+  // shape the MLA-latent refusal below exists for.
+  if (kind != KvCachePayload::kPaged) {
+    Fail("'" + name + "' (" + what +
+         ") was published as a RECURRENT cache, and this model keeps it in a "
+         "PAGED one. `MakeGlm5NextKVCache` publishes it under an "
+         "`MLAAttentionSpec` group; reading it out of `gdn_state` instead would "
+         "return an unrelated buffer with no shape error.");
+  }
+  const int64_t i = slot;
+  if (i < 0 || static_cast<size_t>(i) >= attn_kv.size()) {
+    Fail("'" + name + "' is at flat index " + std::to_string(flat) +
+         " and resolved to attn_kv slot " + std::to_string(i) + " but only " +
+         std::to_string(attn_kv.size()) +
+         " cache(s) arrived; the payload locator and attn_kv disagree.");
   }
   const PagedKvCache& kv = attn_kv[static_cast<size_t>(i)];
   RequirePlainFloatPage(kv, "'" + name + "' (" + what + ")");
@@ -156,13 +197,63 @@ int64_t ResolveAttnCache(const MultiKvCacheIndex& mk,
          std::to_string(kv.num_blocks) + " and " +
          (kv.data == nullptr ? "no" : "a") + " data pointer.");
   }
+  // BY THE FLAT INDEX, deliberately. `group_ids` is parallel to `layer_names`
+  // and the other three locator vectors — one entry per PUBLISHED cache — and
+  // not to `attn_kv` (`runner.cpp`, the by-name index pass). Reading it at the
+  // paged slot would answer with a different cache's group on any topology
+  // whose recurrent group is not published last.
   if (mk.group_ids == nullptr ||
-      static_cast<size_t>(i) >= mk.group_ids->size()) {
+      static_cast<size_t>(flat) >= mk.group_ids->size()) {
     Fail("'" + name + "' has no published group id; the name index is out of "
          "sync with the group index.");
   }
-  *group_out = (*mk.group_ids)[static_cast<size_t>(i)];
+  *group_out = (*mk.group_ids)[static_cast<size_t>(flat)];
   return i;
+}
+
+// W5b-2d (#2445). The recurrent twin of `ResolveAttnCache`, and the reason it
+// exists at all: before `9e7621efc` the by-name channel described `attn_kv`
+// only, so this row derived a KDA layer's state slot POSITIONALLY and said so in
+// the header. That channel now carries every published cache with a payload
+// locator, which makes the derivation expressible and therefore no longer a
+// stated limit.
+int64_t ResolveRecurrentCache(const MultiKvCacheIndex& mk,
+                              const std::vector<GdnStateCache>& gdn,
+                              const std::string& name, int64_t layer) {
+  const int64_t flat = mk.Find(name);
+  if (flat < 0) {
+    Fail("the engine published no cache named '" + name +
+         "' (layer " + std::to_string(layer) +
+         "'s KDA recurrent state). The channel carried " + ChannelSummary(mk) +
+         ". `MakeGlm5NextKVCache` publishes this name for every "
+         "linear_attention layer.");
+  }
+  KvCachePayload kind = KvCachePayload::kPaged;
+  int32_t slot = -1;
+  if (!mk.PayloadAt(flat, &kind, &slot)) {
+    Fail("'" + name + "' is named at flat index " + std::to_string(flat) +
+         " but the channel carries no payload locator for it, so its slot in "
+         "`gdn_state` cannot be found. The channel carried " +
+         ChannelSummary(mk) + ".");
+  }
+  // The mirror of the paged refusal. A KDA state read out of `attn_kv` would be
+  // a paged buffer of the wrong rank, and the layer forward would zero-fill or
+  // reshape it rather than notice.
+  if (kind != KvCachePayload::kRecurrent) {
+    Fail("'" + name +
+         "' was published as a PAGED cache, and this model's KDA state is a "
+         "RECURRENT one. `MakeGlm5NextKVCache` publishes it under a "
+         "`MambaSpec` group; reading it out of `attn_kv` would return an "
+         "unrelated buffer with no shape error.");
+  }
+  if (slot < 0 || static_cast<size_t>(slot) >= gdn.size()) {
+    Fail("'" + name + "' is at flat index " + std::to_string(flat) +
+         " and resolved to gdn_state slot " + std::to_string(slot) +
+         " but only " + std::to_string(gdn.size()) +
+         " recurrent state set(s) arrived; the payload locator and gdn_state "
+         "disagree.");
+  }
+  return slot;
 }
 
 }  // namespace
@@ -241,7 +332,24 @@ KvBinding ResolveKvBinding(const Glm5NextParams& p,
     LayerKvBinding& lb = b.layers[static_cast<size_t>(l)];
     lb.kind = p.layer_types[static_cast<size_t>(l)];
     if (lb.kind == Glm5NextLayerKind::kLinearAttention) {
-      lb.recurrent = kda_seen++;
+      // W5b-2d (#2445): BY NAME, like every other cache on this model. The
+      // ordinal `kda_seen` is still counted, and it is now a CHECK rather than
+      // the answer: it is what the positional convention would have said, and a
+      // disagreement with the channel's own slot is a topology this forward
+      // must not guess at.
+      lb.recurrent = ResolveRecurrentCache(mk, gdn, RecurrentName(l), l);
+      if (lb.recurrent != kda_seen) {
+        Fail("layer " + std::to_string(l) +
+             "'s recurrent state is published at gdn_state slot " +
+             std::to_string(lb.recurrent) + ", and it is this model's " +
+             std::to_string(kda_seen) +
+             "th linear_attention layer in ascending order. The runner "
+             "allocates one state set per recurrent layer in layer order "
+             "(`alloc_recurrent_layer_states`), so the two agree on every "
+             "topology this tree builds; a disagreement means the channel and "
+             "the config describe different models.");
+      }
+      ++kda_seen;
       continue;
     }
     lb.latent = ResolveAttnCache(mk, attn_kv, LatentName(l), latent_row,
@@ -281,15 +389,17 @@ KvBinding ResolveKvBinding(const Glm5NextParams& p,
          " linear_attention layer(s) against `num_kda_layers()` = " +
          std::to_string(p.num_kda_layers()) + ".");
   }
-  // THE RECURRENT GROUP CARRIES NO NAMES, so the count is the whole check.
+  // The count STILL runs, and it is no longer the only check. Each state was
+  // already resolved by name above; this catches the other direction — a
+  // `gdn_state` carrying MORE sets than the config declares layers, which no
+  // per-layer lookup can see because it never asks about the extras.
   if (static_cast<int64_t>(gdn.size()) != kda_seen) {
     Fail("the engine handed " + std::to_string(gdn.size()) +
          " recurrent state set(s) but the config declares " +
          std::to_string(kda_seen) +
-         " linear_attention layer(s). `MultiKvCacheIndex` keys the ATTENTION "
-         "caches only; the recurrent group arrives on `gdn_state` in ascending "
-         "layer order with no name, so this count is the only check there is "
-         "and a mismatch means the positional correspondence is broken.");
+         " linear_attention layer(s). Every one of those layers resolved its "
+         "own state BY NAME through the channel's payload locator, so this "
+         "counts the sets nothing claimed rather than the correspondence.");
   }
   if (b.block_size <= 0) {
     Fail("the config declares no deepseek_sparse_attention layer, so no paged "

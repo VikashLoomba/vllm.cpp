@@ -219,6 +219,22 @@ HOST compiler's answer for these two bodies, not the HIP compiler's answer for
 `gfx1151`. The on-device check is the leg's own output text, which `q6k.sh`
 prints per leg, and which must read ` Paris` on both arms.
 
+## Why a green ROCm suite coexists with this
+
+`tests/vt/test_backend_cross_device.cpp` DOES cover `kMatmulBTQuant` on ROCm for
+Q6_K, and it passes. It runs `M = 3, N = 8, K = 512`, which is `nsb = 2` and a
+grid of `ceil(3*8/4) = 6` blocks. The cooperative case beside it runs `N = 64`
+at `K` in {4096, 12288}, and only at `m == 1`.
+
+The launch that dies is `m = 5, n = 5120, nsb = 68` -- **6400 blocks**, and
+`nsb = 68` against the covered `nsb = 2`. The gate is three orders of magnitude
+below the production launch on the grid axis and 34x below it on the superblock
+axis, so it exercises the kernel's ARITHMETIC and has never exercised its launch.
+That is the gap, and it is the shape any regression test for #2511 has to take:
+the `## Acceptance` line in the issue asks for a test that "runs the arm enough
+times to see a 1-in-3 failure", and a test at `N = 8` would not see it however
+many times it ran.
+
 ## Stop conditions
 
 - A cause that is in the AMD driver or firmware rather than in this tree ends the

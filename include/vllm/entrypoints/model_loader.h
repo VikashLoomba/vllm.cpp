@@ -585,6 +585,9 @@ class LoadedEngine {
   // selected. Exposed so a gate reads what the loader actually sized instead of
   // re-deriving the arithmetic it is supposed to be checking.
   const vllm::v1::KVCacheConfig& kv_cache_config() const { return kv_cfg_; }
+  // The block size actually in force, which is the requested one raised to the
+  // architecture's floor. Not `EngineParams::block_size`.
+  int block_size() const { return block_size_; }
   // The RESOLVED serving concurrency: `--max-num-seqs` after the recurrent-state
   // budget clamp (issue #1983). Equal to the configured value on every
   // attention-only model.
@@ -684,9 +687,19 @@ class LoadedEngine {
   // config is set (the extra GDN k+1 state slots + widened conv row + the
   // `fa_draft` full-attn group, MakeQwen3_5KVCacheSpec num_spec>0). With no spec
   // config it is exactly ModelRegistry::MakeKVCache (byte-identical).
+ public:
+  //
+  // PUBLIC because it is the only entry to the KV geometry the engine actually
+  // uses, and a gate that enters below it cannot see the engine stop calling it.
+  // Measured 2026-08-31: deleting the block-size resolution from this function's
+  // body left test_deepseek_v4_scaffold, test_loaded_engine_dense and
+  // test_kv_cache_fp8_wiring all green. It is a pure function of its arguments
+  // and holds no engine state, so publishing it widens nothing else.
   static vllm::v1::KVCacheConfig MakeKVCacheMaybeSpec(
       const LoadedModel& model, const HfConfig& config, int block_size,
       int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec);
+ private:
+
   // ROAD-V1-MEM M1: resolve the KV block count from the sizing knobs against the
   // model's own per-block byte geometry. `probe` is a KVCacheConfig already
   // built for this model (its num_blocks is ignored; only the group/page
@@ -787,6 +800,13 @@ class LoadedEngine {
   // every consumer below — max_num_batched_tokens_, runner_, scheduler_,
   // input_processor_ — takes the already-resolved value. MakeKVCacheResolved
   // depends only on model_/config_/resolved_spec_config_, all declared above.
+  // THE block size this engine pages at, resolved ONCE against the model's
+  // declared floor. Declared before `kv_cfg_` so it initializes first, and used
+  // at every site that previously spelled `params.block_size > 0 ? ... : 32` --
+  // the KV config, the max-model-len fit, and the scheduler. Those three must
+  // agree: a pool paged at 256 with a block table indexing at 32 is silent
+  // corruption, not a refusal.
+  int block_size_;
   vllm::v1::KVCacheConfig kv_cfg_;
   int max_model_len_;
   // Declared AFTER kv_cfg_ (it is resolved against the KV pool's recurrent-state

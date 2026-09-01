@@ -653,6 +653,13 @@ v1::KVCacheConfig ModelRegistry::MakeKVCache(const LoadedModel& model,
                                                       num_blocks);
 }
 
+int ModelRegistry::ResolveKVBlockSize(const ModelRegistration& reg,
+                                      int requested) {
+  const int floor_bs = reg.factory->kv_block_size_floor;
+  if (floor_bs > 0 && requested < floor_bs) return floor_bs;
+  return requested;
+}
+
 bool ModelRegistry::IsDenseModel(const LoadedModel& model) {
   return model.registration().factory->is_dense_model;
 }

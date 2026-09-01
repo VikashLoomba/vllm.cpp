@@ -505,6 +505,14 @@ skips with that refusal quoted.
 - On ROCm, mixture-of-experts models run the shared-expert gate and both
   expert-combine steps on device. Before these ops were registered the
   engine refused with `no kernel for op` on that path.
+- Some architectures cannot be paged at the default KV block size of 32, and the
+  engine RAISES it for them rather than refusing. DeepSeek-V4-Flash needs 256,
+  because a `compress_ratio`-128 layer stores `block_size / compress_ratio`
+  tokens per page and 32 gives zero. The number is read from the model, not from
+  a flag, so `vllm-cli` -- which has no `--block-size` -- serves these models as
+  well as `vllm-server` does. A `--block-size` smaller than the model's floor is
+  raised to it and a line on stderr says so; a larger one is kept. Models with no
+  such constraint are unaffected.
 - A KV-cache block size that is not a multiple of 16 is refused while the
   engine SELECTS an attention backend, with `No valid attention backend for
   device type ...` naming each candidate and `block_size not supported`. On

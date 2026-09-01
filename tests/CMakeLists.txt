@@ -846,6 +846,11 @@ vllm_cpp_add_test(test_deepseek_v4_dspark_entry vllm/models/test_deepseek_v4_dsp
 # wave does not implement. See .agents/specs/model-dsv4-exl3.md.
 vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
 target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_deepseek_v4_exl3_device_residency
+                  vllm/models/test_deepseek_v4_exl3_device_residency.cpp)
+target_include_directories(test_deepseek_v4_exl3_device_residency
+                           PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_deepseek_v4_exl3_forward vllm/models/test_deepseek_v4_exl3_forward.cpp)
 # MODEL-DSV4-EXL3 W2d: the SAME suite under the rollback arm. The fused MoE flag
 # is read once per process, so the only way to gate both arms is to run the
@@ -864,6 +869,7 @@ target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SKIP on a CPU-only build; on the DGX GB10 they are the RUNTIME evidence the
 # kernels match the references. NOT a real-checkpoint token gate (W8, multi-Spark).
 vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
+target_include_directories(test_cuda_deepseek_v4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;

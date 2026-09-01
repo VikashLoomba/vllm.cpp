@@ -146,6 +146,13 @@ const ModelFactory kDeepseekV4Factory{
     .prepare = &PrepareDeepseekV4ForCausalLM,
     .forward = &ForwardDeepseekV4ForCausalLM,
     .make_kv_cache = &MakeDeepseekV4KVCache,
+    // Upstream derives `[256 // compress_ratio, head_dim]` everywhere
+    // (`sparse_swa.py:76-83`, `compressor.py:174-178`), and a
+    // `compress_ratio == 128` layer cannot be paged below 256: at the engine's
+    // default of 32 the storage block would hold zero tokens and
+    // `MakeDeepseekV4KVCache` refuses. Declaring the floor is what makes this
+    // architecture load on its DEFAULT configuration.
+    .kv_block_size_floor = 256,
     .is_dense_model = false,
     // KV-DSV4-MULTICACHE W5 (#2323): this forward consumes a cache set keyed by
     // layer name. Declaring it is what stops `ModelRegistry::Forward` refusing

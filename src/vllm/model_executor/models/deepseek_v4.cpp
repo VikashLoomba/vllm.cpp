@@ -62,6 +62,8 @@
 
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
 #include "vllm/model_executor/models/deepseek_v4_device.h"
+#include "vllm/model_executor/models/deepseek_v4_exl3_device.h"
+#include "vllm/model_executor/models/dense_attn_block.h"  // Dev, DBuf, ResidentWeight
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
 #include "vllm/model_executor/models/deepseek_v4_mhc.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
@@ -1292,16 +1294,57 @@ std::vector<float> Exl3Linear(const V4Backend& be, const DeepseekV4Exl3Linear& l
     own_local = true;
     q = &local;
   }
-  if (q->device.type != vt::DeviceType::kCPU) {
-    VT_CHECK(vt::GetBackend(q->device).DeviceMemoryIsHostAddressable(),
-             "deepseek-v4 exl3: the coalesced trellis tower is HOST-resident (W1b copies "
-             "each TP1 linear into a host owner buffer) and this device cannot dereference "
-             "host pointers. The device-resident tower is MODEL-DSV4-EXL3's owed "
-             "'Real-checkpoint residency for the coalesced tower'; run the EXL3 arm on a "
-             "CPU queue until it lands.");
-  }
   const vt::Device dev = q->device;
 
+  // ── THE DEVICE ARM (MODEL-DSV4-EXL3 W2, #2442) ────────────────────────────
+  // Every buffer a kernel touches has to live where the kernel runs. The weights
+  // get there once, at staging time, through `dense_attn::ResidentWeight`; the
+  // activation, the Hadamard scratch and the output are per-call and get there
+  // through `DBuf`, the same pooled device scratch every other device forward
+  // uses. Before this, ALL SIX were host `std::vector`s wearing the forward's
+  // device label -- which is why this function refused a non-CPU queue rather
+  // than dereference them.
+  if (dev.type != vt::DeviceType::kCPU) {
+    VT_CHECK(lin.device_staged,
+             "deepseek-v4 exl3: this expert linear is not device-staged, so its "
+             "trellis tower is still HOST memory and a device kernel cannot "
+             "dereference it (#844 / #1435). Call "
+             "StageDeepseekV4Exl3TowerToDevice before the first device forward; "
+             "a CPU queue serves an unstaged tower.");
+    dense_attn::Dev d{vt::GetBackend(dev), *q};
+
+    std::vector<uint16_t> a_host(static_cast<size_t>(k));
+    for (int64_t i = 0; i < k; ++i) a_host[static_cast<size_t>(i)] = vt::F32ToF16(xin[i]);
+    dense_attn::DBuf a(d, vt::DType::kF16, {1, k}, a_host.data());
+    dense_attn::DBuf a_had(d, vt::DType::kF16, {1, k});
+    dense_attn::DBuf c(d, vt::DType::kF16, {1, n});
+
+    // The memoized device views. `ResidentWeight` returns the `d_dev` copy
+    // staging already uploaded, so this costs a pointer read per call and NOT a
+    // second upload -- the reason the shapes live on the OwnedTensor.
+    vt::Tensor tb = dense_attn::ResidentWeight(d, lin.d_trellis);
+    vt::Tensor tsuh = dense_attn::ResidentWeight(d, lin.d_suh);
+    vt::Tensor tsvh = dense_attn::ResidentWeight(d, lin.d_svh);
+
+    vt::Exl3GemmArgs dargs;
+    dargs.bits = lin.bits;
+    dargs.codebook = 1;  // mcg; the loader refuses any other marker by name
+    vt::Exl3Gemm(*q, c.t(), a.t(), tb, tsuh, tsvh, a_had.t(), dargs);
+    vt::GetBackend(dev).Synchronize(*q);
+
+    std::vector<uint16_t> c_host(static_cast<size_t>(n), 0);
+    vt::GetBackend(dev).Copy(*q, c_host.data(), c.t().data,
+                             static_cast<size_t>(n) * sizeof(uint16_t));
+    vt::GetBackend(dev).Synchronize(*q);
+    if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
+    std::vector<float> dout(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i)
+      dout[static_cast<size_t>(i)] = vt::F16ToF32(c_host[static_cast<size_t>(i)]);
+    return dout;
+  }
+
+  // ── THE HOST ARM, unchanged. Aliasing host pointers into a tensor is correct
+  // exactly here, where the "device" IS the host.
   std::vector<uint16_t> a(static_cast<size_t>(k));
   for (int64_t i = 0; i < k; ++i) a[static_cast<size_t>(i)] = vt::F32ToF16(xin[i]);
   std::vector<uint16_t> a_had(static_cast<size_t>(k), 0);
@@ -1322,7 +1365,6 @@ std::vector<float> Exl3Linear(const V4Backend& be, const DeepseekV4Exl3Linear& l
   args.bits = lin.bits;
   args.codebook = 1;  // mcg; the loader refuses any other marker by name
   vt::Exl3Gemm(*q, tc, ta, tb, tsuh, tsvh, tah, args);
-  if (dev.type != vt::DeviceType::kCPU) vt::GetBackend(dev).Synchronize(*q);
   if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
 
   std::vector<float> out(static_cast<size_t>(n));
@@ -1375,15 +1417,14 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
     own_local = true;
     q = &local;
   }
-  if (q->device.type != vt::DeviceType::kCPU &&
-      !vt::GetBackend(q->device).DeviceMemoryIsHostAddressable()) {
-    VT_CHECK(false,
-             "deepseek-v4 exl3: the coalesced trellis tower is HOST-resident (W1b copies each "
-             "TP1 linear into a host owner buffer) and this device cannot dereference host "
-             "pointers. The device-resident tower is MODEL-DSV4-EXL3's owed 'Real-checkpoint "
-             "residency for the coalesced tower'; run the EXL3 arm on a CPU queue until it "
-             "lands.");
-  }
+  // MODEL-DSV4-EXL3 W2 (#2442). This used to refuse EVERY non-CPU queue, because
+  // the tower was host memory and the kernel dereferences the per-expert pointer
+  // tables ON THE DEVICE. It now asks the narrower question that is actually
+  // load-bearing: are these experts staged? An unstaged tower on a device queue
+  // is still the #844 / #1435 crash, and a PARTIALLY staged one is the same
+  // crash for whichever expert the router happens to pick -- so this is checked
+  // per expert in the table loop below rather than once here.
+  const bool device_arm = q->device.type != vt::DeviceType::kCPU;
   const vt::Device dev = q->device;
 
   // The nine per-expert pointer tables. Every expert must agree on shape and
@@ -1404,6 +1445,49 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
              "deepseek-v4 exl3: the fused MoE op carries ONE bit width per projection "
              "(exl3_moe.cu:114-116) and expert " + std::to_string(e) + " disagrees");
     const size_t i = static_cast<size_t>(e);
+    if (device_arm) {
+      // PER EXPERT, not once for the tower: the kernel dereferences whichever
+      // expert the router picked, so one unstaged expert among 216 is a crash
+      // that a tower-level check would have called safe.
+      VT_CHECK(xe.w1.device_staged && xe.w2.device_staged && xe.w3.device_staged,
+               "deepseek-v4 exl3: expert " + std::to_string(e) +
+                   " is not device-staged, so its trellis tower is still HOST "
+                   "memory and the fused MoE kernel cannot dereference it "
+                   "(#844 / #1435). Call StageDeepseekV4Exl3TowerToDevice before "
+                   "the first device forward; a CPU queue serves an unstaged tower.");
+      dense_attn::Dev dd{vt::GetBackend(dev), *q};
+      // `ResidentWeight` returns the memoized `d_dev` view staging uploaded, so
+      // these are DEVICE addresses and the read costs no copy.
+      //
+      // VALIDATED AS THEY ARE FILLED (#2458). A null here is not a crash where
+      // it happens: the kernel dereferences `g_tr[expert]` on the device and the
+      // fault surfaces later at the next synchronising call, as
+      // `cudaStreamDestroy: an illegal memory access`, naming neither the expert
+      // nor the projection. compute-sanitizer had to be run to learn that much.
+      // One predicate per pointer, at the site that knows both names, turns that
+      // into a refusal a reader can act on.
+      const auto dev_ptr = [&](const OwnedTensor& t, const char* proj,
+                               const char* part) {
+        void* p = dense_attn::ResidentWeight(dd, t).data;
+        VT_CHECK(p != nullptr,
+                 std::string("deepseek-v4 exl3: expert ") + std::to_string(e) +
+                     " projection " + proj + " has a NULL device " + part +
+                     " after staging. The fused MoE kernel would dereference "
+                     "this on the device and surface the fault later as an "
+                     "illegal memory access naming nothing (#2458).");
+        return reinterpret_cast<int64_t>(p);
+      };
+      g_tr[i] = dev_ptr(xe.w1.d_trellis, "w1", "trellis");
+      g_su[i] = dev_ptr(xe.w1.d_suh, "w1", "suh");
+      g_sv[i] = dev_ptr(xe.w1.d_svh, "w1", "svh");
+      u_tr[i] = dev_ptr(xe.w3.d_trellis, "w3", "trellis");
+      u_su[i] = dev_ptr(xe.w3.d_suh, "w3", "suh");
+      u_sv[i] = dev_ptr(xe.w3.d_svh, "w3", "svh");
+      d_tr[i] = dev_ptr(xe.w2.d_trellis, "w2", "trellis");
+      d_su[i] = dev_ptr(xe.w2.d_suh, "w2", "suh");
+      d_sv[i] = dev_ptr(xe.w2.d_svh, "w2", "svh");
+      continue;
+    }
     g_tr[i] = reinterpret_cast<int64_t>(xe.w1.trellis.data());
     g_su[i] = reinterpret_cast<int64_t>(xe.w1.suh.data());
     g_sv[i] = reinterpret_cast<int64_t>(xe.w1.svh.data());
@@ -1453,6 +1537,94 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
   std::vector<uint16_t> in_g(static_cast<size_t>(max_rows * mi), 0);
   std::vector<uint16_t> in_u(in_g.size(), 0);
 
+  vt::Exl3MoeArgs args;
+  args.bits_gate = e0.w1.bits;
+  args.bits_up = e0.w3.bits;
+  args.bits_down = e0.w2.bits;
+  args.codebook = 1;  // mcg; the loader refuses any other marker by name
+  args.act = vt::Exl3MoeAct::kSiluAndMulClamp;
+  args.act_limit = lim;
+  args.num_active = num_active;
+
+  if (device_arm) {
+    // EVERY operand the kernel touches, on the device. The weights got there at
+    // staging; these are the per-call ones. The nine pointer TABLES need it as
+    // much as the weights do -- the kernel indexes `g_tr[expert]` on the device,
+    // so a host table is dereferenced there just the same, and it was the easier
+    // half of this defect to miss because the table is only 216 int64s.
+    dense_attn::Dev d{vt::GetBackend(dev), *q};
+    // `out` is ACCUMULATED into by the fused arm, so its current contents are an
+    // input and not just a destination. Uploading it is what keeps the device
+    // arm's arithmetic identical to the host arm's rather than dropping whatever
+    // a previous call had already summed there.
+    dense_attn::DBuf b_out(d, vt::DType::kF32, {T, H}, out->data());
+    dense_attn::DBuf b_hid(d, vt::DType::kF16, {T, H}, hidden.data());
+    auto dpt = [&](std::vector<int64_t>& v) {
+      return dense_attn::DBuf(d, vt::DType::kI64, {ne}, v.data());
+    };
+    dense_attn::DBuf bg1 = dpt(g_tr), bg2 = dpt(g_su), bg3 = dpt(g_sv);
+    dense_attn::DBuf bu1 = dpt(u_tr), bu2 = dpt(u_su), bu3 = dpt(u_sv);
+    dense_attn::DBuf bd1 = dpt(d_tr), bd2 = dpt(d_su), bd3 = dpt(d_sv);
+    vt::Tensor tg1 = bg1.t(), tg2 = bg2.t(), tg3 = bg3.t();
+    vt::Tensor tu1 = bu1.t(), tu2 = bu2.t(), tu3 = bu3.t();
+    vt::Tensor td1 = bd1.t(), td2 = bd2.t(), td3 = bd3.t();
+    vt::Exl3MoeExpertTables dtables{&tg1, &tg2, &tg3, &tu1, &tu2, &tu3, &td1, &td2, &td3};
+
+    dense_attn::DBuf b_cnt(d, vt::DType::kI64, {ne + 1}, expert_count.data());
+    dense_attn::DBuf b_tok(d, vt::DType::kI64, {assignments}, token_sorted.data());
+    dense_attn::DBuf b_wgt(d, vt::DType::kF16, {assignments}, weight_sorted.data());
+    vt::Tensor t_cnt = b_cnt.t(), t_tok = b_tok.t(), t_wgt = b_wgt.t();
+    vt::Exl3MoeRouting drouting{&t_cnt, &t_tok, &t_wgt};
+
+    // The temps are pure scratch, so they are ALLOCATED on the device and never
+    // uploaded -- the host vectors above exist only to size them on the CPU arm.
+    dense_attn::DBuf b_sg(d, vt::DType::kF16, {1, max_rows, H});
+    dense_attn::DBuf b_su(d, vt::DType::kF16, {1, max_rows, H});
+    dense_attn::DBuf b_ig(d, vt::DType::kF16, {1, max_rows, mi});
+    dense_attn::DBuf b_iu(d, vt::DType::kF16, {1, max_rows, mi});
+    vt::Tensor s_g = b_sg.t(), s_u = b_su.t(), i_g = b_ig.t(), i_u = b_iu.t();
+    vt::Exl3MoeTemps dtemps{&s_g, &s_u, &i_g, &i_u};
+
+    vt::Tensor t_out_d = b_out.t();
+    vt::Tensor t_hid_d = b_hid.t();
+
+    // EVERY operand, checked by name before the launch (#2458). The kernel takes
+    // eighteen pointers and dereferences them on the device, so a null among
+    // them is an asynchronous fault reported at the next synchronising call --
+    // `cudaStreamDestroy: an illegal memory access` -- which names none of them.
+    // The pool can also hand back a null (`DevicePool::Get`), and that failure
+    // is silent by construction. Checking here costs eighteen predicates per
+    // layer against a kernel that decodes a 216-expert trellis tower.
+    const auto need = [](const vt::Tensor& t, const char* what) {
+      VT_CHECK(t.data != nullptr,
+               std::string("deepseek-v4 exl3: the fused MoE device arm has a "
+                           "NULL ") + what +
+                   " operand. The kernel dereferences it on the device and the "
+                   "fault surfaces later as an illegal memory access naming "
+                   "nothing (#2458).");
+    };
+    need(t_out_d, "output");
+    need(t_hid_d, "hidden");
+    need(tg1, "gate trellis table"); need(tg2, "gate suh table");
+    need(tg3, "gate svh table");     need(tu1, "up trellis table");
+    need(tu2, "up suh table");       need(tu3, "up svh table");
+    need(td1, "down trellis table"); need(td2, "down suh table");
+    need(td3, "down svh table");
+    need(t_cnt, "expert_count"); need(t_tok, "token_sorted");
+    need(t_wgt, "weight_sorted");
+    need(s_g, "state_g"); need(s_u, "state_u");
+    need(i_g, "intermediate_g"); need(i_u, "intermediate_u");
+
+    vt::Exl3MoeMlp(*q, t_out_d, t_hid_d, dtables, drouting, dtemps, args);
+    vt::GetBackend(dev).Synchronize(*q);
+    vt::GetBackend(dev).Copy(*q, out->data(), b_out.t().data,
+                             static_cast<size_t>(T) * static_cast<size_t>(H) * sizeof(float));
+    vt::GetBackend(dev).Synchronize(*q);
+    if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
+    (void)p;
+    return taken;
+  }
+
   vt::Tensor t_out = vt::Tensor::Contiguous(out->data(), vt::DType::kF32, dev, {T, H});
   vt::Tensor t_hid = vt::Tensor::Contiguous(hidden.data(), vt::DType::kF16, dev, {T, H});
   auto pt = [&](std::vector<int64_t>& v) {
@@ -1477,16 +1649,7 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
   vt::Tensor i_u = vt::Tensor::Contiguous(in_u.data(), vt::DType::kF16, dev, {1, max_rows, mi});
   vt::Exl3MoeTemps temps{&s_g, &s_u, &i_g, &i_u};
 
-  vt::Exl3MoeArgs args;
-  args.bits_gate = e0.w1.bits;
-  args.bits_up = e0.w3.bits;
-  args.bits_down = e0.w2.bits;
-  args.codebook = 1;  // mcg; the loader refuses any other marker by name
-  args.act = vt::Exl3MoeAct::kSiluAndMulClamp;
-  args.act_limit = lim;
-  args.num_active = num_active;
   vt::Exl3MoeMlp(*q, t_out, t_hid, tables, routing, temps, args);
-  if (dev.type != vt::DeviceType::kCPU) vt::GetBackend(dev).Synchronize(*q);
   if (own_local) vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(local);
   (void)p;
   return taken;
@@ -3589,6 +3752,12 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
   // `has_exl3_weights`, and it now materializes the carried tower and sets
   // `has_host_weights` in the same function before returning, so
   // `has_exl3_weights && !has_host_weights` cannot come out of a load.
+  // MODEL-DSV4-EXL3 W2 (#2442): make the routed-expert tower device-resident
+  // before anything dispatches on it. THE PRODUCTION CALL SITE -- the loader has
+  // no queue in hand, so this is the first point at which the tower and the
+  // device it will run on both exist. A no-op on a CPU queue and on an already
+  // staged tower, so the host arm and every repeat forward pay one predicate.
+  (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
@@ -3616,6 +3785,12 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
            "DeepseekV4ForwardExl3Paged: no EXL3 tower (the load did not take that arm)");
   VT_CHECK(static_cast<int64_t>(paged_kv.size()) == weights.params.num_hidden_layers,
            "DeepseekV4ForwardExl3Paged: one page tensor per layer is required");
+  // MODEL-DSV4-EXL3 W2 (#2442): make the routed-expert tower device-resident
+  // before anything dispatches on it. THE PRODUCTION CALL SITE -- the loader has
+  // no queue in hand, so this is the first point at which the tower and the
+  // device it will run on both exist. A no-op on a CPU queue and on an already
+  // staged tower, so the host arm and every repeat forward pay one predicate.
+  (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
   be.paged_kv = &paged_kv;
@@ -3706,12 +3881,17 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
   (void)attn_kv;
   VT_CHECK(weights.has_host_weights, kHostPending);
   VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending);
-  // MODEL-DSV4-EXL3 W2: the device entry point routes the routed experts through
-  // the same trellis op rather than carrying a second policy. `Exl3Linear`
-  // refuses BY NAME when the queue's device cannot dereference the host-resident
-  // tower, which is the owed residency item and not a silent wrong number.
+  // MODEL-DSV4-EXL3 W2 (#2442): the device entry point routes the routed experts
+  // through the same trellis op rather than carrying a second policy, and it is
+  // THE path on which the tower has to be device-resident -- this is the forward
+  // the runner's default `gather` reaches. Staging first is what turns
+  // `Exl3Linear`'s refusal from "this arm cannot run on a GPU" into a
+  // precondition that is already satisfied.
   V4Backend dev_be{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr};
-  if (weights.has_exl3_weights) dev_be.exl3 = &weights.exl3;
+  if (weights.has_exl3_weights) {
+    (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
+    dev_be.exl3 = &weights.exl3;
+  }
   std::vector<float> flat =
       ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                          V4Miswire::kNone, /*trace=*/nullptr, dev_be);

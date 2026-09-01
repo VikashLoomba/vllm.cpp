@@ -770,6 +770,19 @@ struct ModelFactory {
   // False`, and the runner then leaves `MmEmbedInputs::mrope_positions` empty
   // and the model reads the ordinary 1-D positions.
   ModelMropePromptFn mrope_prompt_positions = nullptr;
+  // The SMALLEST KV block size this architecture can be paged at, or 0 when it
+  // has no constraint. Upstream DERIVES this geometry rather than taking it from
+  // an operator: DeepSeek-V4 spells `[256 // compress_ratio, head_dim]`
+  // throughout (`sparse_swa.py:76-83`, `compressor.py:174-178`), so a
+  // `compress_ratio == 128` layer cannot be paged below 256 -- at the engine's
+  // default of 32, `block_size / compress_ratio` is 0 and the page holds no
+  // token.
+  //
+  // Declared here rather than left to a flag because `AGENTS.md` measures
+  // reachability on the DEFAULT configuration. A model that loads only when an
+  // operator happens to pass `--block-size 256` is not reachable by default, and
+  // `vllm-cli` does not expose that flag at all.
+  int kv_block_size_floor = 0;
   // Preserves the already-gated per-arch scheduler default. This is execution
   // policy, not an upstream _ModelInfo capability.
   bool is_dense_model = false;
@@ -993,6 +1006,15 @@ class ModelRegistry {
   static v1::KVCacheConfig MakeKVCache(const LoadedModel& model,
                                        const HfConfig& config, int block_size,
                                        int num_blocks);
+
+  // The block size the engine must page this architecture at, given what the
+  // caller asked for. Returns `requested` unchanged for an architecture that
+  // declares no floor. THE single resolution point: `LoadedEngine` calls this
+  // before `MakeKVCache`, and a gate calls it with `EngineParams{}.block_size`
+  // to prove the model's DEFAULT configuration reaches a buildable geometry
+  // (writing the arithmetic out a second time in a test would only transcribe
+  // it, and could not detect it changing here).
+  static int ResolveKVBlockSize(const ModelRegistration& reg, int requested);
   static bool IsDenseModel(const LoadedModel& model);
 
   // ── ENG-MM-INPUT-PIPELINE P2 (#2379): the multimodal model seam ──

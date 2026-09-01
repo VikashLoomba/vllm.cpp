@@ -801,6 +801,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
   src/vllm/model_executor/models/deepseek_v4_dspark.cpp
   src/vllm/model_executor/models/deepseek_v4_compressor.cpp
+  src/vllm/model_executor/models/deepseek_v4_exl3_device.cpp
   src/vllm/model_executor/models/deepseek_v4_mhc.cpp
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
   src/vllm/model_executor/models/deepseek_v4_device.cpp

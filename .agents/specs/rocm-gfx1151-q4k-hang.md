@@ -242,6 +242,22 @@ many times it ran.
 - No fix lands on a single passing leg. One green leg proves nothing at this
   failure rate.
 
+## Queued measurements
+
+Both are staged and queued behind another agent's lease on `strix:gpu0`. Their
+results land on the share whether or not anyone is watching.
+
+| rc job | script | what it decides | lands in |
+|---|---|---|---|
+| `2e569341-0e46-4b4f-9744-c65c15467554` | `q6k.sh` | the private-memory A/B: `orig` / `newoff` / `newon`, interleaved, 6 rounds | `/mnt/nas_share/rc/rocm-strix-hang/evidence3/q6k.log` |
+| `0e388979-2077-4baa-a484-f836096fbd0e` | `codeobj.sh` | `private_segment_fixed_size` per `KQuantGemmK` instantiation, read out of the gfx1151 code object | `/mnt/nas_share/rc/rocm-strix-hang/evidence4/codeobj.log` |
+
+The second is the one that can REFUTE the hypothesis without a GPU-side leg: if
+`Fmt == 2` and `Fmt == 3` carry the same private segment, then the A/B changes
+nothing it claims to change and a green `newon` would mean something else.
+Reading it costs a minute and no GPU compute, which is why it is queued rather
+than deferred.
+
 ## Evidence
 
 Raw logs under `/mnt/nas_share/rc/rocm-strix-hang/evidence`, and the earlier

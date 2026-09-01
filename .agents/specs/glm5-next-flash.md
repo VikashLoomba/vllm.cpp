@@ -5624,6 +5624,17 @@ Debts this row carries, each visible rather than waived:
   after the announcement, after the fallback warning, on a step that emitted no
   token, with no message.
 
+  **AND THE MIXED STATE CANNOT BE IT, which is a stronger statement than "the
+  fault is elsewhere".** The two arms of `MoeExpertsKeepQuant` share no mutable
+  state across layers except `OwnedTensor::d_dev`, which is per tensor.
+  `DeviceBanksFit` returns true whenever `need == 0`, so a layer whose three
+  banks are resident ALWAYS takes the device arm and never the host one; a layer
+  that falls back is one whose banks were never staged, and its host views
+  (`src.gate_exps.View()`) aim at bytes staging did not touch, because
+  `AdoptDeviceBytesAsHost` returns at `!DeviceMemoryIsHostAddressable()` on CUDA
+  (O46's own hypothesis 2, correctly killed). There is no ordering of staged and
+  unstaged layers that makes one arm read the other's memory.
+
   W9c-3a did not introduce it. `origin/main` refused a non-CPU queue before
   `StoreCaches` could run; removing that refusal made a pre-existing hole
   reachable. O46's three eliminated hypotheses are all inside

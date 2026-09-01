@@ -5477,11 +5477,21 @@ Debts this row carries, each visible rather than waived:
 
   `139` is SIGSEGV. **THREE of three CUDA legs crashed and three of three CPU
   legs emitted ` Paris.`**, interleaved, from one binary on one box -- so this is
-  a property of the arm and not of the box's mood. Each crashing leg logged
+  a property of the run and not of the box's mood. Each crashing leg logged
   exactly one device-arm announcement followed by exactly one fallback warning
-  before dying -- so the fault is in the MIXED residency state the per-layer fit
-  guard creates, not in the device arm itself, which the CUDA unit gate exercises
-  cleanly at NMSE 3.833e-15 against the host arm.
+  before dying.
+
+  **THE SENTENCE THAT USED TO FOLLOW IS FALSIFIED, and O49 carries the
+  replacement.** It read "so the fault is in the MIXED residency state the
+  per-layer fit guard creates". Both of those log lines are `static bool said`
+  once-flags, so their order says only that at least one layer staged and at
+  least one LATER layer did not; it is not a location. The fault is in
+  `StoreCaches`, which host-stores into the runner's `cudaMalloc` KV pages after
+  the whole forward has returned -- a defect older than this arm, which only
+  became reachable when the non-CPU refusal above it was removed. Read O49
+  before spending anything on the mixed-residency story. The device arm itself is
+  unimplicated either way: the CUDA unit gate exercises it cleanly at NMSE
+  3.833e-15 against the host arm.
 
   **This is a REGRESSION and it is named as one.** On the base tree the same
   command produced a clean refusal at 1066 s (the operand table above, leg C).
@@ -5622,11 +5632,14 @@ expiry.
 **AND THEN IT SEGFAULTED, so the arm is OPT-IN and defaults OFF.** Driven end to
 end on the 101.24 GiB artifact, ALL THREE `--device cuda` legs died with SIGSEGV
 (rc=139) emitting no token, against three CPU legs that all emitted ` Paris.`,
-interleaved on one binary -- once the expert banks stopped fitting
-and the arm fell back to the host mid-model. The base tree produced a clean
-refusal on the same command, so this was a REGRESSION and the default is
-restored byte-for-byte; O46 carries the four legs, the three hypotheses already
-eliminated, and the one that is untested. O47 records the other half of that
+interleaved on one binary. The base tree produced a clean refusal on the same
+command, so this was a REGRESSION and the default is restored byte-for-byte;
+O46 carries the four legs and the three hypotheses eliminated inside the MoE
+arm. **O46's own MECHANISM is falsified and O49 replaces it**: the process dies
+in `StoreCaches`, host-storing into the runner's `cudaMalloc` KV pages after the
+forward has already returned, which is a defect W9c-3a exposed rather than
+introduced. W9c-3b ([#2480](https://github.com/mudler/vllm.cpp/issues/2480))
+owns the fix and the four `dgx:gpu0` legs that decide it. O47 records the other half of that
 job: THREE identical cpu legs spread 69% on wall and 89% on generation, so NO
 speed number was available on any axis and none is claimed. The n=2 mechanism
 this row briefly asserted -- page-cache eviction moving generation -- was

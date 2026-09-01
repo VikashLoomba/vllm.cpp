@@ -481,8 +481,9 @@ void DispatchRmsNormWeight(cudaStream_t s, Tensor& out, const Tensor& x, const T
     case DType::kF32: LaunchRmsNorm<Tin, float>(s, out, x, w, args, residual); break;
     case DType::kBF16: LaunchRmsNorm<Tin, __nv_bfloat16>(s, out, x, w, args, residual); break;
     default:
-      VT_CHECK(false, "cuda rmsnorm: unsupported weight dtype (f32/bf16 only), got ",
-               Name(w.dtype));
+      VT_CHECK(false, std::string("cuda rmsnorm: unsupported weight dtype "
+                                  "(f32/bf16 only), got ") +
+                          Name(w.dtype));
   }
 }
 

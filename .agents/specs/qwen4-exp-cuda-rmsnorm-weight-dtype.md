@@ -163,6 +163,15 @@ The tarball did carry the fix. `old_check` grepped the bare phrase
 deliberately does not touch. The correct count of the RmsNorm message is 0 and
 was 0. The grep was too broad, so it counted its own neighbours.
 
+A grep precondition also cannot detect the defect that actually mattered. The
+same tree failed `cuda-fat-build` on
+`cuda_ops.cu:485: error: macro "VT_CHECK" passed 3 arguments, but takes just 2` —
+the refusal message was written in a 3-argument form the 2-argument macro does
+not accept. Every `FIX IN SOURCE` grep passed on that tree, because the strings
+they look for were all present. **Only a compiler can say a change compiles**, so
+the CI build is the precondition that matters and the greps only assert which
+change is being compiled.
+
 It is recorded because of the direction it failed in. A precondition that is too
 broad **refuses a good tree**, which costs a lease and a staging run and is
 visible immediately. A precondition that is too narrow **passes a bad tree**, and

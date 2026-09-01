@@ -1,12 +1,12 @@
 # ROCm fp8 KV cache decode attention (`GFX1100-TG200`, fork issue #7)
 
-Rows: `GFX1100-TG200` (campaign, fork issue #5) and `KV-FP8` (engine-matrix,
-the W6 ROCm arm). Issue: fork
+Row: `GFX1100-TG200` (campaign, fork issue #5). Issue: fork
 [#7](https://github.com/ghazni101/vllm.cpp/issues/7). The fp8 KV cache store
 and correctness-grade read landed in W6
 ([`fp8-kv-cache.md`](fp8-kv-cache.md) `## W6`); this spec covers the
 performance gap the W6 spec named as owed: the fp8 read through the fast
-decode kernel.
+decode kernel. The `KV-FP8` engine-matrix row owns the store/read
+correctness surface; this row owns the decode performance arm on top of it.
 
 ## Scope
 
@@ -169,7 +169,13 @@ confirm the dispatch falls back to `PagedAttnOnline`.
 
 ## Now
 
-Spec committed, implementation pending.
+Implementation landed. Review-driven updates (PR #2168 review 5070827757):
+added exact-geometry GQA4 FP8 kernel reach test (G6), C ABI v24
+`kv_cache_dtype` gate, `vllm-cli --kv-cache-dtype` end-to-end gate,
+ROCM_ATTN FP8 cache config acceptance test, and updated public C-ABI/FP8
+capability documentation. History rebuilt so the spec commit precedes
+implementation. Issue, spec, and PR body reconciled onto owning row
+`GFX1100-TG200`.
 
 ## Outcome
 

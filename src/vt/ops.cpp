@@ -2567,9 +2567,9 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
   // `output_hc_{down,up}` — and the loader keeps their blocks, so demanding a
   // float here refused the released checkpoint at its first prefill.
   //
-  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM has
-  // never registered `qwen4_exp` and never loads a GGUF, so it has no opinion on
-  // a block-typed operand; llama.cpp merged the architecture on 2026-08-27
+  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM
+  // never loads a GGUF, so it has no opinion on a block-typed operand;
+  // llama.cpp merged the architecture on 2026-08-27
   // (`6c84c7d5d`, PR #27742) and runs this exact file. It declares each of the
   // SIX projections `GGML_OP_MUL_MAT` (`src/llama-arch.cpp:759,760,761,763,764,765`
   // — down, up AND inject, on both the attention and the feed-forward side) and
@@ -2581,6 +2581,20 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
   // type; elementwise operands get a cast. `hc_norm_w` therefore stays on
   // `check_operand` above, and refusing a block-typed gamma by name is a gated
   // behaviour, not an oversight.
+  //
+  // WHAT vLLM SAYS, SINCE 2026-08-31 (#2489). The clause above used to open "vLLM
+  // has never registered `qwen4_exp`", and that is now false: `e126687a9a` added
+  // `vllm/models/qwen4_exp/`. It does NOT overturn the split, because vLLM still
+  // reads safetensors and never meets a Q8_0 hyper-connection weight, so
+  // llama.cpp remains the only oracle that reads this file. What vLLM does say is
+  // what its HC path is BUILT for, and it says it twice, explicitly rather than
+  // incidentally: all three HC projections pass `quant_config=None` and a
+  // hardcoded `params_dtype=torch.bfloat16` rather than `model_config.dtype`
+  // (`nvidia/hyperconnection.py:100-130`, `nvidia/model.py:260`, `:436`), and its
+  // decode GEMM then demands packed row-major with BOTH operands bf16
+  // (`nvidia/low_latency_gemm.py:93-104`). Read that as evidence about intent,
+  // not as a refusal of the keep-quant arm, and see #2406 for the residency
+  // hazard the arm creates on an aarch64 i8mm host.
   //
   // The BLOCK layout replaces the elementwise stride contract, exactly as
   // `MatmulBTQuant`'s own validation puts it: a block-typed tensor has no

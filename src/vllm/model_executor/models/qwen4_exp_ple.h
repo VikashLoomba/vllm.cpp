@@ -17,6 +17,20 @@
 // in a comment: "We cannot use the usual functions/kernels here for the short
 // conv as the conv1d has dilation".
 //
+// ─── SUPERSEDED 2026-08-31: vLLM DOES IMPLEMENT BOTH OF THESE ────────────────
+// The paragraph above is kept because it is why this file was written the way it
+// was, and it was true when it was written. It is no longer true. vLLM landed
+// `[Model] Support Qwen3.8-Flash-Next (#53896)` at `e126687a9a` on 2026-08-31,
+// adding `vllm/models/qwen4_exp/` with `nvidia/` and `amd/` backends and three
+// registry entries. `e126687a9a` is NOT reachable from our parity pin
+// `555967922` and is 595 commits ahead of it, so it is a FORWARD REFERENCE to an
+// unpinned upstream, but it is this row's primary oracle from now on. Both
+// components this file exists for are there: `nvidia/ple_layer.py:592-601` is
+// the dilated depthwise conv and `:240-436` is the n-gram hashed embedding, and
+// the vLLM form is the one to mirror. See
+// `.agents/specs/qwen4-exp-flash-next.md`
+// `### Component-by-component reconciliation`, rows 19 to 21 (#2489).
+//
 // ORACLE: huggingface/transformers **v5.16.0**, this row's ACCEPTED lane pin
 // (spec `## Oracles`; `v5.16.0` is the FIRST release containing `qwen4_exp` —
 // `v5.15.0` returns HTTP 404 for the same path). Every `file:line` below is at

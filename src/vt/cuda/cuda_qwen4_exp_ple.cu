@@ -21,6 +21,18 @@
 // and `src/vt/cuda/cuda_conv1d_general.cu` (the round-to-nearest intrinsics, and
 // the "byte-identical, not within a tolerance" position its own header argues).
 //
+// ─── SUPERSEDED 2026-08-31: vLLM DOES REGISTER `qwen4_exp` ────────────────────
+// The paragraph above is kept because it is why this file was written the way it
+// was, and it was true when it was written. It is no longer true. vLLM landed
+// `[Model] Support Qwen3.8-Flash-Next (#53896)` at `e126687a9a` on 2026-08-31,
+// adding `vllm/models/qwen4_exp/` with `nvidia/` and `amd/` backends and three
+// registry entries. `e126687a9a` is NOT reachable from our parity pin
+// `555967922` and is 595 commits ahead of it, so it is a FORWARD REFERENCE to an
+// unpinned upstream and this file still carries no pinned anchor. It is, from now
+// on, this row's primary oracle. See `.agents/specs/qwen4-exp-flash-next.md`
+// `### Component-by-component reconciliation` for what upstream does here and
+// where this file agrees with it (#2489).
+//
 // ─── WHY THESE TWO OPS ARE IN THE FIRST CUDA TRANCHE ─────────────────────────
 // Neither performs a reduction across a parallel axis. The conv's reduction is
 // the FOUR TAPS of one output element, walked by one thread in the kernel's own

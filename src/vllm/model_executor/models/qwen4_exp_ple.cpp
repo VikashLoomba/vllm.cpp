@@ -1,4 +1,6 @@
-// Qwen4-Exp W2 — host reference for the two components with no vLLM op.
+// Qwen4-Exp W2 — host reference for the two components that had no vLLM op when
+// this file was written. vLLM implements both since `e126687a9a`, 2026-08-31;
+// `qwen4_exp_ple.h` carries the correction and the anchors (#2489).
 // Issue #1987, spec `.agents/specs/qwen4-exp-flash-next.md`. The header carries
 // the scope statement, the upstream anchors, the batching seam and the reason
 // this is host code; read it first.

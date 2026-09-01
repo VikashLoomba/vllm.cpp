@@ -4054,6 +4054,47 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **WHAT THE 2026-08-31 vLLM LANDING OWES THIS ROW (Q4RECONCILE, #2489).** The
+  oracle reconciliation is done and the divergences are classified in
+  `### Component-by-component reconciliation`. What it did not do is act on any of
+  them, and each item below needs its own wave, its own issue and its own gate.
+  They are listed so the next reader inherits a list rather than a rediscovery.
+
+  - **The f32 QSA query into `vt::RmsNorm` (verdict (a),
+    [#2477](https://github.com/mudler/vllm.cpp/issues/2477)).** Upstream's norm
+    input is bf16 and this tree's is f32 at exactly one site,
+    `qwen4_exp_qsa_block.cpp:705`. Owned by the wave on #2477.
+  - **The keep-quant hyper-connection arm (verdict (b),
+    [#2406](https://github.com/mudler/vllm.cpp/issues/2406)).** vLLM's HC
+    projections are unquantized bf16 by explicit construction. Owned by #2406.
+  - **The merged HC down-plus-inject GEMM (verdict (b)).** Upstream stacks them
+    into one padded `MergedColumnParallelLinear`; this tree runs three GEMMs. It
+    is a `vt::MergedGemmGroup` seam question and has NO issue yet.
+  - **The deferred, norm-fused HC combine (verdict (b)).** Upstream reads the
+    residual once; this tree reads it twice. NO issue yet.
+  - **The f32 QSA output gate (verdict (b)).** Upstream sigmoids a bf16 gate. It
+    rides with #2477 because it is the same buffer.
+  - **The single indexer side cache and the every-step re-pool (verdict (b)).**
+    Upstream keeps a raw ring plus a persistent compressed cache, both bf16 by
+    construction; this tree keeps one cache at `ResolveKvCacheDType()` and rebuilds
+    the pooled keys every step. NO issue yet, and the cost grows with context.
+  - **The mRoPE position tail on the raw side cache (verdict (c) today, (a) on
+    the image path).** Upstream stores the exact three-axis position beside each
+    raw key. This tree forces the three axes equal and ropes at `b * CR`, which is
+    correct only while they are equal. It becomes wrong the moment the image or
+    video path lands, and that path is already owed.
+  - **MTP.** `Qwen4ExpMTP` is registered upstream and implemented at
+    `nvidia/mtp.py`; this tree parses `mtp_num_hidden_layers` and consumes it
+    nowhere. Previously owed against `qwen3_5_mtp.py` as the nearest form; it is
+    now owed against a real upstream implementation of this model's own drafter.
+  - **The decode GEMM plan table.** `nvidia/low_latency_gemm.py` carries measured
+    skinny-GEMM configurations keyed on this model's shapes. It is a lever, not a
+    gap, and it cannot be evaluated until a device exists.
+  - **Three things this pass could not determine** and which are therefore still
+    open questions rather than agreements: the top-k tie semantics, the recurrent
+    KV group against upstream's two new state classmethods, and the vision path.
+    See `### What this pass could NOT determine`.
+
 - **WHAT #2396 CHANGES FOR THIS ROW, AND WHAT STILL BLOCKS A CUDA FORWARD AFTER
   IT. TRACED IN THE CODE, NOT PREDICTED FROM THE PULL REQUEST.** #2396 adds
   `kEmbeddingQuant`, gives `EmbeddingKernelCuda` a block-decoding arm and makes

@@ -57,6 +57,9 @@
 #include <vector>
 
 #include "vllm/v1/core/sched/output.h"
+#include <string>
+#include <unordered_map>
+
 #include "vllm/v1/worker/gpu/input_batch.h"
 
 namespace vllm::v1 {
@@ -152,8 +155,17 @@ struct StepInputs {
 // Matches gpu_model_runner.py::_update_states ordering (finished/unscheduled
 // removal -> collect new -> cached diffs -> add_request -> condense). The
 // deferred PP / spec / async / resumed-store paths are documented in the header.
-void update_states(InputBatch& input_batch,
-                   const SchedulerOutput& scheduler_output);
+//
+// `req_states` (ENG-MM-INPUT-PIPELINE P2, #2379) is upstream's
+// `self.requests: dict[str, CachedRequestState]` (gpu_model_runner.py), the
+// per-REQUEST state that lives BESIDE the per-SLOT input batch. Upstream keeps
+// it unconditionally; the runner passes non-null ONLY for a model that declares
+// the multimodal seam, because the map holds a full copy of every prompt and a
+// text engine has no reader for it. NULL — every existing caller — leaves this
+// function byte-identical.
+void update_states(
+    InputBatch& input_batch, const SchedulerOutput& scheduler_output,
+    std::unordered_map<std::string, CachedRequestState>* req_states = nullptr);
 
 // prepare_inputs: build the flattened StepInputs from the (already
 // update_states'd) persistent InputBatch + the scheduler output. Mirrors

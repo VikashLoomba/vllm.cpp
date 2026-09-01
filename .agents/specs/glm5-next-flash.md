@@ -5673,6 +5673,102 @@ Debts this row carries, each visible rather than waived:
   is admissible from this row anyway (O47); it is written down so the next reader
   does not have to rediscover the shape of the cost.
 
+- **O50 -- THE DIAGNOSIS IS CONFIRMED ON `dgx:gpu0`, BY A NAMED FRAME AND BY A
+  ONE-VARIABLE FALSIFICATION TEST.** Run 1 of the W9c-3b job, `dgx:gpu0` (GB10,
+  `sm_121a`), against the published 101.24 GiB UD-Q2_K_XL artifact, base
+  `3cd467643`:
+
+  | leg | binary | device | env | rc | wall | stdout |
+  |---|---|---|---|---:|---:|---|
+  | B | base | cuda | default | **139** | -- | 0 bytes |
+  | A | base | cuda | `VT_DEVICE_KV_CACHE=0` | **0** | 1756 s | ` Paris Paris` |
+
+  Leg B's `gdb` backtrace names the frame O49 predicted, and it is the whole
+  chain rather than a symbol on its own:
+
+  ```text
+  Thread 4 "vllm-cli" received signal SIGSEGV, Segmentation fault.
+  #0  vllm::glm5_next::StoreCaches(...)
+  #1  vllm::(anonymous namespace)::ForwardGlm5NextForConditionalGeneration(...)
+  #2  vllm::ModelRegistry::Forward(...)
+  #3  vllm::v1::GPUModelRunner::execute_model(...)
+  ```
+
+  Leg A moved the engine's KV pages into host memory and changed nothing else --
+  same binary, same box, minutes later -- and it SURVIVED. A predicted frame and
+  a one-variable falsification that fails to falsify are two independent
+  confirmations, and O46's mixed-residency mechanism is retired rather than
+  merely doubted.
+
+- **O51 -- THE JOB'S OWN IDENTITY GUARD REFUSED A PAIR THAT WAS GENUINELY
+  DIFFERENT, and the reason is that it hashed the wrong artifact.** Run 1 built
+  base and fixed into ONE directory and compared `sha256sum vllm-cli` across the
+  two halves. They matched, the guard declared "the two halves are the SAME
+  BINARY" and refused to report legs C and D, so **the fix went unmeasured on
+  hardware**. The `.so` hashes the same script RECORDED show the halves were not
+  the same at all:
+
+  | artifact | base | fixed |
+  |---|---|---|
+  | `examples/vllm-cli` | `bbc55a61...` | `bbc55a61...` |
+  | `libvllm.so.0.0.3` | `bfd0a6e7...` | **`66412203...`** |
+
+  `vllm-cli` is a thin ABI client (AGENTS.md §"Shared seams": examples never
+  include internal headers), so this change cannot alter it and its hash is
+  identical BY CONSTRUCTION. The model code is in `libvllm.so`. **Separate build
+  directories do not fix this** -- `vllm-cli` would hash identically across them
+  too -- so the repair is the PREDICATE: digest the executable AND every `.so`
+  beside it, which is exactly the breadth the same script's identity SCAN
+  already used two blocks earlier. Run 2 does both, and adds a source-level
+  sentinel (a string present only in the patched file) checked in the linked
+  set, so "is this the fixed tree" is answered by content rather than by a build
+  artifact's timestamp.
+
+  The guard firing was correct behaviour and is kept. A gate that refuses to
+  report is the right failure mode; a gate that refuses for a reason that is not
+  the one it names is the defect.
+
+- **O52 -- LEG A EMITTED ` Paris Paris`, ITS FIRST TOKEN AGREES WITH THE CPU ARM
+  AND ITS SECOND DOES NOT, so PREFILL is clean and the DECODE step is not.**
+  `PARIS_A=NO` in the run-1 log is a string match against ` Paris.` and is an
+  artifact of that flag, not the finding. The finding is the divergence under it,
+  and it is recorded here rather than folded into a summary as noise.
+
+  **The discriminator that suggests itself does not work, and this is why.**
+  Running leg A's configuration with `VT_GLM5_NEXT_DEVICE_EXPERTS` unset does not
+  run the model with the expert arm off: `Glm5NextHostForward` refuses a non-CPU
+  queue BY NAME when the flag is unset, so the leg emits no token at all. An
+  engine-fatal refusal that prints nothing is indistinguishable at the file level
+  from the crash it would be mistaken for -- the "instrument whose failure looks
+  like a result" shape this row has already paid for.
+
+  **THE CANDIDATE WITH A MECHANISM, and it is one this spec already flagged as
+  unestablished.** `GPUModelRunner::async_device_mirror()` is DEFAULT ON for an
+  integrated CUDA GPU (`runner.cpp:4437-4459`; `AsyncDeviceMirrorEnvDefault` is
+  "on unless the value is `0`", and GB10 satisfies `is_integrated_gpu()`). On
+  that path the combine patches the DEVICE input ids and leaves the host
+  `token_ids` "deliberately stale for decode rows" -- the runner's own words
+  (`runner.cpp:2374-2414`, assigned at `:2748`). **This model references
+  `device_token_ids` ZERO times** in `glm5_next_registry.cpp` and
+  `glm5_next_forward.cpp`; it embeds `input.token_ids`. On a decode step that is
+  a stale id, so the model never sees the token it just emitted -- which is
+  precisely what re-emitting ` Paris` looks like, and precisely why prefill,
+  which has no decode row, is unaffected.
+
+  It is a candidate and not a conclusion. Run 2's leg E is `VT_ASYNC_DEVICE_MIRROR=0`,
+  the documented rollback: a second token of `.` implicates that path and
+  exonerates the routed-expert arm, and a second token of ` Paris` rules it out.
+  Leg F (`--max-tokens 1`) separates prefill from decode by construction, and
+  leg G repeats run 1's leg A inside run 2 so the comparison is within-job.
+
+  **A bimodal reading is required here.** The routed-expert arm's unit gate is
+  NMSE 3.833e-15, and the prefill argmax margin measured on `thor` was 1.279
+  (` Paris` 16.427 over ` one`). A perturbation far too small to move token 1
+  can still flip a near-tie at token 2, because an argmax is a discrete
+  selection and its error is bimodal, not proportional. So "token 1 matched"
+  does NOT by itself clear the arm, and whatever run 2 returns, the top-5 and
+  the MARGIN are what settle it rather than the token string.
+
 ## Now
 
 `ACTIVE`, 2026-09-01. **THE KERNEL THAT BLOCKED THIS MODEL'S DEVICE ARM LANDED

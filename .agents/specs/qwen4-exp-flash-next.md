@@ -154,6 +154,141 @@ is answered by `llama-cpp-qwen4exp` and by the checkpoint, and vLLM cannot rule 
 it. That boundary is where the dtype question in #2477 actually lives, and the
 reconciliation below says so precisely.
 
+### Component-by-component reconciliation (Q4RECONCILE, 2026-09-01, #2489)
+
+Read at vLLM `e126687a9a`, `vllm/models/qwen4_exp/nvidia/` unless a path says
+otherwise. **Every vLLM anchor in this table is a forward reference to an
+unpinned upstream.** `amd/` is the same shape and is not the mirror source for
+this row; where the two could differ the NVIDIA path is authoritative.
+
+Each divergence carries one of three verdicts. **(a)** this tree is wrong.
+**(b)** a deliberate deviation that was argued against `transformers` or
+`llama.cpp` and must now be re-argued against vLLM. **(c)** a structural
+difference that does not change behaviour.
+
+| # | Component | vLLM `e126687a9a` | This tree | Verdict |
+|---|---|---|---|---|
+| 1 | Model dtype | refuses every dtype but bf16, three times: `nvidia/qsa.py:188`, `nvidia/qsa.py:70`, `nvidia/indexer_qsa.py:113` | resolves bf16 from the GGUF (`qwen4_exp_gguf_weights.cpp:206`) | agree |
+| 2 | RMSNorm weight dtype | the one model dtype. `GemmaRMSNorm.__init__` takes no dtype, so `nn.Parameter(torch.zeros(hidden_size))` gets `torch.get_default_dtype()`, which `model_loader/base_loader.py:53` pins to `model_config.dtype` for the whole construction; `default_weight_loader`'s `param.data.copy_(loaded_weight)` casts the checkpoint value into it | bf16 gammas: `LoadNormBf16` dequantizes and re-narrows (`qwen4_exp_weights.cpp:114-121`), used for all four QSA norms (`:409`, `:411`, `:423`, `:425`) | agree |
+| 3 | RMSNorm activation dtype | bf16. `qwen3_next.py:424-431` chunks the gate off the **bf16** GEMM output and hands `q` to `self.q_norm` unwidened; both operands are promoted to f32 inside the kernel (`GemmaRMSNorm.forward_native`, `nvidia/ops/hc.py:42`, `:48`) | **f32 at one site.** `qwen4_exp_qsa_block.cpp:694` allocates `q_f32` as `DType::kF32`, and `:705` hands it to `vt::RmsNorm` beside a bf16 gamma | **(a)**, and it is #2477 |
+| 4 | Grouped Gemma RMSNorm | `(1.0 + w.float())` over `group_size = hidden_size`, affine width `hc_count * hidden_size` (`common/hyperconnection.py:56-85`, `nvidia/model.py:264` `hc_per_branch_norm=True`) | same polarity, same grouping, same `[10240]` width (`cuda_qwen4_exp.cu:290`, `ops.cpp:2536`) | agree |
+| 5 | HC mix arithmetic | norm, down, `silu(x / hc_count)`, up, sigmoid, gated mean over the **normed** streams (`nvidia/hyperconnection.py:135-152`, `nvidia/ops/hc.py:100`, `:155`) | identical, including the division inside the SiLU and the mean over `normed` (`cpu_qwen4_exp.cpp:248-268`, `cuda_qwen4_exp.cu:302`, `:332`) | agree |
+| 6 | HC down and inject GEMMs | **merged into one** `MergedColumnParallelLinear`, `[lora_rank, hc_count]` padded to a multiple of 16 rows, with a `WeightsMapper` that stacks the two checkpoint tensors (`nvidia/hyperconnection.py:100-110`, `nvidia/model.py:146-155`), and a decode plan keyed on that merged `(336, 10240)` shape (`nvidia/low_latency_gemm.py:76-81`) | three separate GEMMs, `hc_*_down` and `hc_*_inject` never stacked (`cuda_qwen4_exp.cu:414`, `:418`, `:428`) | **(b)** — upstream's merge is exactly the `vt::MergedGemmGroup` seam AGENTS.md mandates, and the padded 16-row shape is what its decode plan indexes |
+| 7 | HC combine formula | `2 * sigmoid(inject(x_normed) / hc_count)`, inject read from the **normalized** hyper input (`common/hyperconnection.py:229-233`) | same, and also from `normed` (`cpu_qwen4_exp.cpp:282-286`, `cuda_qwen4_exp.cu:428`, `:346`) | agree |
+| 8 | HC combine scheduling | **deferred** to the next mix boundary and **fused with that mix's RMSNorm** (`nvidia/hyperconnection.py:155-180` `combine_and_mix`, kernel `nvidia/ops/hc.py:267-331`); it is materialized early only where PLE adds into the stream (`nvidia/model.py:270-274`) | applied immediately, its own op, on the raw stream (`qwen4_exp_forward.cpp:466`, `:544`) | **(c)** for the arithmetic, **(b)** for the schedule: upstream reads the residual once instead of twice, and the fused kernel is the reason |
+| 9 | HC projection quantization | never quantized. All three linears pass `quant_config=None` **explicitly** and `params_dtype=torch.bfloat16` **hardcoded**, not `model_config.dtype` (`nvidia/hyperconnection.py:100-130`, `nvidia/model.py:260`, `:436`); the decode GEMM then demands `weight.dtype == torch.bfloat16` and packed row-major on both operands (`nvidia/low_latency_gemm.py:93-104`) | `hc_*_down` / `hc_*_up` route through `GgufLoadPolicy` and may keep Q8_0 blocks (`qwen4_exp_weights.cpp:134-141`, admitted by name at `ops.cpp:2564-2568`) | **(b)** — see #2406 below |
+| 10 | QSA block score | `sum_h relu(dot(k, q_h))` then `/ sqrt(index_head_dim)` **after** the head sum (`nvidia/ops/qsa.py:110-113`, divisor at `:628`) | the fold multiplies **before** the sum (`cpu_dsa_indexer.cpp:87`, `:103`, `:120`), with `n_head_scale = 1` and unit weights (`qwen4_exp_qsa_block.cpp:381-391`) | **(c)** — the reassociation W5b-4 already named, now confirmed against vLLM rather than transformers |
+| 11 | Compressor pool | unweighted mean, `accumulator / COMPRESS_RATIO` (`nvidia/ops/qsa.py:543`) | unweighted mean, `acc / CR` (`cpu_qwen4_exp_qsa.cpp:152`, `cuda_qwen4_exp_qsa.cu:256`) | agree, and this **confirms** the call this spec made from transformers against the closest-named CuteDSL kernel |
+| 12 | Compressor state | a per-request **ring of raw keys** sized `compress_ratio * cdiv(compress_ratio + num_speculative_tokens, compress_ratio)`, plus a **persistent compressed key cache**; a group spanning steps is closed out of the ring (`common/qsa_cache.py:763-783`, kernel `nvidia/ops/qsa.py:512-539`) | no ring. The raw prefix is cached in full and **every complete block is re-pooled on every step**, the pooled keys being per-call scratch (`qwen4_exp_qsa_block.cpp:287`, `:293`, `:305`) | **(b)** — a compute-for-memory trade upstream does not make, and it grows with context |
+| 13 | Indexer side caches | **two per QSA layer**: raw `CircularBufferSpec(block_size=capacity, 1, head_size, bf16)` (`common/qsa_cache.py:775`) and compressed `MLAAttentionSpec(..., tokens_per_state=compress_ratio)` (`:789-794`). Both dtypes are `torch.bfloat16` **hardcoded** at construction (`nvidia/indexer_qsa.py:154`, `:163`) and re-checked in `bind_kv_cache` (`common/qsa_cache.py:725`) | **one**: `MLAAttentionSpec(..., compress_ratio=1)` at `ResolveKvCacheDType()` (`qwen4_exp_registry.cpp:1089-1099`) | **(b)** for the count, which follows from #12; **(b)** for the dtype, because upstream does not let the KV dtype knob reach this cache |
+| 14 | With mRoPE, the raw side cache | widens to carry the exact three-axis int64 position beside each key, `rope_position_offset + 3*4` (`common/qsa_cache.py:738-752`) | no position tail; the pooled key is roped at the scalar `b * CR` (`cpu_qwen4_exp_qsa.cpp:183`) | **(c)** while the three mRoPE axes are forced equal (`qwen4_exp_forward.cpp:191-198`); **(a)** the moment the image or video path makes them differ |
+| 15 | Pooled-key RoPE position | the **first member's** position, `end_position - COMPRESS_RATIO + 1`, read from the position cache when mRoPE is on (`nvidia/ops/qsa.py:548`, `:565-580`) | `b * CR`, which is the same value at a boundary (`cpu_qwen4_exp_qsa.cpp:183`) | agree |
+| 16 | Top-k output shape | a fixed `[rows, token_topk + compress_ratio - 1]` int32 buffer, block ids expanded into it by `expand_qsa_block_indices_cuda` (`nvidia/ops/qsa.py:753-758`, `:805`), `block_topk = token_topk // compress_ratio` (`:761`) | no token buffer; block `b` becomes addresses `[b*CR, b*CR+CR)` inside the gather (`cpu_qwen4_exp_qsa.cpp:302`, `cuda_qwen4_exp_qsa.cu:463`). The fixed width exists only in the test-only host reference (`qwen4_exp_qsa.h:150`) | **(c)** |
+| 17 | Q/K/V projection | one fused `qkv_proj`, the output gate carried inside the doubled q half (`qwen3_next.py:392`, `:424-428`) | separate `attn_q` (at `qdim*2`), `attn_k`, `attn_v` matmuls (`qwen4_exp_qsa_block.cpp:692`, `:733`, `:741`); the doubled q half and the per-head split agree | **(c)** for the split, but the fusion is a `vt::MergedGemmGroup` question like #6 |
+| 18 | Output gate | `flat_output * torch.sigmoid(gate)` on the **bf16** gate, after attention and before `o_proj` (`nvidia/qsa.py:425-427`) | same place, but the gate is materialized f32 to keep the sigmoid argument unrounded (`qwen4_exp_qsa_block.cpp:695`, `:794`) | **(b)** — wider than upstream, and a token gate cannot see it |
+| 19 | PLE n-gram embedding | **IMPLEMENTED.** splitmix64 multipliers seeded per PLE layer, xor-mix of the shifted id planes, per-head vocabulary at the nth prime after `ngram_vocab_size_base`, offsets accumulated (`nvidia/ple_layer.py:390-436`, `:283-294`) | same construction (`qwen4_exp_ple.cpp:112-117`, `:185-197`, `:236-303`) | **the Port map row flips**: this is no longer a component with no vLLM op |
+| 20 | PLE dilated depthwise conv | **IMPLEMENTED.** `nn.Conv1d(hc*H, hc*H, ple_conv_kernel_size, groups=hc*H, dilation=short_conv_dilation)` with `short_conv_dilation = ngram_size` and a short-conv state (`nvidia/ple_layer.py:592-601`, `nvidia/model.py:697-700`) | `vt::Qwen4ExpPleConv`, same kernel size and same `dilation = ngram_size` (`qwen4_exp_ple_block.cpp:271-272`, `:576-581`) | **the Port map row flips** |
+| 21 | PLE grouped norms | three `Qwen4ExpPLEGroupedNorm` over `hc*H` with `group_size = hidden_size`, key/query/conv (`nvidia/ple_layer.py:580-588`) | three `vt::RmsNormGroup(gemma=true, group=H)` (`qwen4_exp_ple_block.cpp:488-539`) | agree |
+| 22 | MTP | **IMPLEMENTED.** `Qwen4ExpMTP` is registered (`registry.py:670`); the drafter reuses the backbone with PLE forced off, fuses via `residual_linear_shared`, and emits two hidden streams (`nvidia/mtp.py:1-14`, `:159-240`) | not implemented. `mtp_num_hidden_layers` is parsed (`qwen4_exp.cpp:549`) and never consumed; the registry states the head is deliberately unregistered (`qwen4_exp_registry.cpp:16-20`) | **owed**, and upstream now defines the target |
+| 23 | Decode GEMM | `QWEN4_EXP_GEMM_PLANS` selects a CuteDSL skinny GEMM by `(N, K)` and token count, sm103 and bf16 only (`nvidia/low_latency_gemm.py:26-81`, `:158-160`) | none for this model; the shared `vt::MatmulBT` seam, deliberately, rather than a private GEMV (`cuda_qwen4_exp.cu:219`) | **(c)** today; the plan table is a lever once a device exists |
+| 24 | Vision tower | `Qwen4ExpVisionConfig(Qwen3VLVisionConfig)`, reused unchanged (`config.py:23-26`) | the Qwen3.5-Moe tower, reused unchanged | agree, **not re-verified in this pass** |
+
+### What this pass could NOT determine
+
+Named rather than left silent, because a reconciliation that hides its gaps is
+worse than one that is smaller.
+
+- **Top-k tie and emission semantics.** Upstream calls
+  `torch.ops._C.cooperative_topk` / `persistent_topk` (`nvidia/ops/qsa.py:797-803`),
+  which are CUDA kernels outside the model directory. This tree's contract is
+  all-select-below-k, ties to the LOWER index, ASCENDING emission
+  (`cpu_dsa_indexer.cpp:146-177`). The two agree on `block_topk` and on the shape;
+  whether they agree on ties was NOT read, and it cannot be settled from
+  `vllm/models/qwen4_exp/` alone.
+- **The recurrent KV group.** The W5c argument for ONE uniform `MambaSpec` was
+  derived at the pin. `nvidia/model.py:748-800` now declares PLE and GDN state
+  through two separate `get_*_mamba_state_*_from_config` classmethods. Whether
+  that changes the one-group conclusion was NOT determined here and needs its own
+  read.
+- **The vision path.** Reused unchanged on both sides by inspection of the config
+  classes only. No forward was compared.
+- **`amd/` against `nvidia/`.** Not diffed. This row mirrors NVIDIA.
+- **Anything measured.** Nothing in this table was run. `gateable = no` still
+  holds, and a transcription of upstream is a reference, never a test.
+
+### The two live questions vLLM now answers
+
+**#2477, `vt: cuda rmsnorm: weight dtype must match x`. The mismatch is on the
+ACTIVATION side, not the weight side, and there is exactly one site.**
+
+vLLM's answer to "what dtype are the RMSNorm weight and the activation" is: **both
+are the one model dtype, bf16**, and the kernel promotes both to f32 internally.
+The weight is bf16 because `GemmaRMSNorm` declares no dtype and is built under
+`set_default_torch_dtype(model_config.dtype)` (`model_loader/base_loader.py:53`),
+and because `default_weight_loader` casts the checkpoint tensor into that
+parameter. The activation is bf16 because `qwen3_next.py:424-431` chunks the gate
+off the bf16 GEMM output and never widens `q`. vLLM has **no** f32 activation
+entering a norm anywhere on this architecture's NVIDIA path, and it refuses the
+model outright if `model_config.dtype` is not bf16.
+
+In this tree all four QSA gammas are bf16 (`LoadNormBf16`,
+`qwen4_exp_weights.cpp:409`, `:411`, `:423`, `:425`), and two of the three
+`vt::RmsNorm` sites are bf16 on both operands: `qwen4_exp_qsa_block.cpp:632`
+normalizes `q_index_raw`, allocated at `hidden.dtype` (`:592`), and `:736`
+normalizes `k_raw`, also `hidden.dtype` (`:733`). **The third is not.**
+`:694` allocates `DBuf q_f32(d, DType::kF32, ...)`, `:696` splits the query and the
+output gate into it, and `:705` hands that f32 tensor to `vt::RmsNorm` beside the
+bf16 `w.q_norm`. `RmsNormKernelCuda`'s `VT_CHECK(w.dtype == x.dtype)`
+(`cuda_ops.cu:463`) then fires.
+
+**Why it is CUDA-only.** `RmsNormKernel` on the CPU widens `w` and `x` to f32
+independently and folds the gemma `+1` into the widened weight
+(`src/vt/cpu/cpu_ops.cpp:546-566`). It accepts the mixed pair, which is why the
+same model serves on `--device cpu` and refuses on `--device cuda`. The generic
+dispatcher agrees with the CPU arm: `ops.cpp:1030` asks only `IsFloat` of each
+operand. So the CUDA equality check is stricter than this tree's own contract as
+well as than vLLM's.
+
+**What the fix is not.** Widening the check is the one repair vLLM does not
+support, because upstream's norm input is bf16 and an f32 one is a model-path
+buffer that is too wide, which no token gate can see (AGENTS.md, "Inherit vLLM
+defaults"). The f32 `q_f32` and the f32 `gate` exist to keep the sigmoid argument
+unrounded, a deviation this spec records at row 18 and which now has to be argued
+against `nvidia/qsa.py:425-427` rather than against transformers.
+
+This is a finding, not a repair. The wave that owns #2477 owns the change.
+
+**#2406, device-blind `quant_repack` on the hyper-connection weights.**
+
+vLLM's HC projections are **never quantized and never anything but bf16**. All
+three linears pass `quant_config=None` explicitly, and `params_dtype` is the
+literal `torch.bfloat16` rather than `model_config.dtype`
+(`nvidia/hyperconnection.py:100-130`; the two config sites are
+`nvidia/model.py:260` and `:436`, and the MTP one is `nvidia/mtp.py:229`). The
+layout it then expects on device is stated by the decode GEMM's own predicate:
+packed row-major `[N, K]`, `x.dtype == torch.bfloat16` **and**
+`weight.dtype == torch.bfloat16` (`nvidia/low_latency_gemm.py:93-104`), and the
+plan it looks up is keyed on the merged `(336, 10240)` HC shape
+(`:76-81`). The specialization is installed only over an
+`UnquantizedLinearMethod` (`:158-168`), which `quant_config=None` guarantees.
+
+**What that does and does not settle.** vLLM loads safetensors and never meets a
+Q8_0 hyper-connection weight, so this is not a proof that a keep-quant HC arm is
+wrong. It is a positive statement that upstream's HC path is designed around an
+unquantized bf16 row-major operand, and it is the strongest statement available
+about intent. The GGUF question itself stays with `llama-cpp-qwen4exp`, which is
+the only oracle that reads this file at all, and the argument recorded at
+`ops.cpp:2564-2583` stands on that oracle. What changes is that its **opening
+premise is now false**: it says vLLM "has never registered `qwen4_exp`", and vLLM
+has.
+
+**The concrete lever this hands #2406.** Dequantizing `hc_*_down` and `hc_*_up` to
+bf16 at load would mirror vLLM exactly, and it would remove all 194 of the
+repack-hazard tensors from the issue's population in one step, because a bf16
+weight never enters `OwnGgufQuantBlocks` and so never carries an i8mm marker. That
+is a trade against memory and against llama.cpp's own choice to keep them typed,
+so it is a decision for #2406's owner and not a conclusion of this pass.
+
 ### Gateability
 
 `gateable = no` for the vLLM oracle on this row, and the reason is unchanged and is
@@ -221,14 +356,20 @@ of that. The port is the delta below.
 | Indexer side cache | `Cache.update_indexer` | `MLAAttentionSpec(num_kv_heads=1, head_size=128, tokens_per_state=4)` + `get_compressed_slot_mapping`, as-is; M3 supplies only the registration precedent | new KV spec |
 | Gated Residual | `Qwen4ExpTextGatedResidual` | `layers/mhc.py`, `kernels/mhc/*` (**different math**, same fused shape) | partial: `deepseek_v4_mhc.cpp` |
 | MoE 512 / top-10 + 1 shared / intermediate 640 | `Qwen4ExpTextSparseMoeBlock` | FusedMoE, grouped GEMM | HAVE, shape change only |
-| MTP, 1 layer, `hybrid: true` | config `mtp` | `qwen3_5_mtp.py` | HAVE, needs extension |
-| PLE dilated depthwise conv | `Qwen4ExpTextPLELayer._short_conv` | **NONE** | new, no vLLM op |
-| N-gram hashed embedding | `Qwen4ExpTextNGramEmbedding` | **NONE** | new, no vLLM op |
+| MTP, 1 layer, `hybrid: true` | config `mtp` | **`nvidia/mtp.py`**, `Qwen4ExpMTP` registered at `registry.py:670`, since 2026-08-31; `qwen3_5_mtp.py` is no longer the nearest form | NOT implemented for this model, `## Owed` |
+| PLE dilated depthwise conv | `Qwen4ExpTextPLELayer._short_conv` | **`nvidia/ple_layer.py:592-601`** since 2026-08-31: `nn.Conv1d(groups=hc*H, dilation=ngram_size)` plus a short-conv state. Was `NONE` | new when written; mirror the vLLM form now |
+| N-gram hashed embedding | `Qwen4ExpTextNGramEmbedding` | **`nvidia/ple_layer.py:240-436`** since 2026-08-31: splitmix64 multipliers, xor mix, per-head prime vocabulary. Was `NONE` | new when written; mirror the vLLM form now |
 | Vision tower | `Qwen4ExpVisionModel` = `Qwen3_5MoeVisionModel` | qwen3_5 vision | HAVE. `deepstack_visual_indexes: []`, so no deepstack |
 
-**Exactly two components have no vLLM op**, and they are the two where transformers
-is the sole source and we author the kernel ourselves. Everything else has an
-optimized vLLM form to mirror, and mirroring it is mandatory rather than optional.
+**That was true until 2026-08-31 and it is not true now.** The sentence this
+paragraph replaces read "exactly two components have no vLLM op", and the two it
+named were the PLE conv and the n-gram embedding. `e126687a9a` implements both.
+**No component of this model except the vision tower is now without a vLLM form**,
+so nothing here is authored from transformers alone any more, and the two rows the
+change touches are marked above. See `### Component-by-component reconciliation`
+for what each one does and where this tree agrees with it. Mirroring the vLLM form
+is mandatory rather than optional, and that obligation now reaches every row of
+this table.
 
 ### QSA maps to DeepSeek-V4's C4 indexer lane, NOT to MiniMax-M3
 

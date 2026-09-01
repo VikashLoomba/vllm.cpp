@@ -340,20 +340,92 @@ it. So the state of #1150 is **REMOTE_UNVERIFIED**, not absent, and nothing here
 concludes that the flip is unowned. It needs a check from a client that can read
 that range.
 
+## Phase A RAN, and its control PASSED
+
+`rc` job `a24f9336-897f-4810-9851-13dade5acb52`, `dgx:gpu0` (GB10),
+2026-09-01T23:45Z, 1954 s wall of which the render was **75.9 s**.
+
+**All 25 decoded video frames reproduce
+`tests/parity/goldens/ltx2_oracle/SHA256SUMS` byte for byte** -- `matched = 25`
+of `committed_frames = 25`, no mismatch, no missing frame, no unlisted extra.
+Recomputed independently from the retained frames rather than read off the
+driver's own manifest. That single control establishes all three things it was
+built to establish: the oracle is reproducible at this request, installing
+upstream's own `RecordingDiffusionStage` perturbed nothing, and the in-process
+driver is equivalent to upstream's `main()`.
+
+The latents are therefore the reference render's own, and they are committed at
+`tests/parity/goldens/ltx2_oracle_latent/`: video `(1,128,4,6,10)` bf16, 61,440
+bytes; audio `(1,8,26,16)` bf16, 6,656 bytes. **The cross-decode now needs no
+lease at any point**, which is why 68 KB is worth committing.
+
+### The condition on every `AGREE` row is now settled, by this run
+
+`## Risks` records that upstream does not hold its defaults as constants: it
+resolves them from checkpoint metadata and `detect_params` falls back SILENTLY
+to `LTX_2_PARAMS`, which carries `stg_blocks=[29]` and 40 steps rather than
+`[28]` and 30. Phase A's log answers which branch it took, in upstream's own
+words:
+
+    INFO:ltx_pipelines.utils.constants:Checkpoint declares model_version=2.5.0 (parsed as (2, 5, 0))
+
+So upstream took the 2.5 branch and the silent fallback did NOT fire. The
+`stg_blocks [28]` row and the 30-step row are unconditional for this render, and
+the sigma anchor stands as the one divergence. Our side reaches `[28]` the same
+way: `Ltx2Params20()` sets `{29}` at `ltx2_pipeline.cpp:955` and `:961`, and
+`Ltx2Params23()` overrides both to `{28}` at `:969-970`, mirroring upstream's
+own base-plus-override shape.
+
+### The video half is bit-exact and the audio half is NOT
+
+Recorded because it bounds what this control covers. The re-run's `audio.wav`
+has the same header and sample count as the committed one and differs on
+**94.2%** of its samples, by at most **215 LSB** of int16 against a peak
+amplitude of 13010 (rms 36.4 LSB). The container moved too: 225,174 bytes
+against the committed 225,151.
+
+So the DiT plus video-VAE path reproduced exactly while the audio path did not.
+The frame control gates only `frame_*.ppm`, which is the half this row needs and
+the half it claims. `audio_latent_bfloat16.raw` is recorded WITHOUT a
+reproducibility claim, and nothing in this row's verdict rests on it.
+
+### The instrument shipped two defects, and review caught them, not I
+
+Recorded because the spec's `## Tests` section claims these controls work, and
+for one commit they did not. `326f4970b` carried an incomplete rename -- a `sed`
+that matched `"raw_bf16"` but not `rec['raw_bf16']` inside f-strings -- so the
+reporting loop raised `KeyError` on the FIRST latent record and killed the byte
+assertion, the frame control and the manifest before any of them ran, exiting rc
+1, a code this module documents nowhere. The frame check also iterated the
+OBSERVATION set, so a decode producing zero frames yielded no mismatches,
+`matched = 0`, and printed `CONTROL PASSED`. An `av` failure read as a passing
+control.
+
+Both were catchable with no GPU, no torch and no weights, and neither was
+caught: the local validation exercised `write_latent` in isolation and never
+drove `main()`. `962db2598` extracts both controls into callable functions,
+derives the expected frame set from `SHA256SUMS` instead of a literal 25, and
+fails on a missing frame, a wrong digest, an unlisted extra or an empty
+expectation. `tests/scripts/test_ltx2_latent_dump.py` covers all of it and
+asserts `main()` reaches both, and it is red against `326f4970b`. **The job above
+ran the REPAIRED driver**, which is why its control means anything.
+
 ## Now
 
-`ACTIVE`. The spec, the oracle latent instrument and the lease harness are
-committed. The static half of the question is ANSWERED and its answer is
-LATENT, with the mechanism named above.
+`ACTIVE`. The static half is ANSWERED -- **LATENT**, mechanism named -- and Phase
+A has RUN and PASSED its control, so the oracle's own latent is committed and
+digest-verified in the tree.
 
-What is outstanding is one `rc` job each:
+What remains needs no oracle lease at all:
 
-- **Phase A**, `rc` job `a24f9336-897f-4810-9851-13dade5acb52`, queued on
-  `dgx:gpu0`, which produces the oracle's latent and its control. The
-  cross-decode that EXONERATES or CHARGES the VAE follows from it, and needs no
-  further GPU.
+- **The cross-decode**, which is what EXONERATES or CHARGES the video VAE. It
+  decodes `tests/parity/goldens/ltx2_oracle_latent/video_latent_bfloat16.raw`
+  through our VAE and scores it on the pinned CLIP instrument against the
+  reference's 38.1278 and our 35.2719. It needs our engine to accept a latent
+  from disk, which is a code change this row has not made.
 - **Phase B**, `KEEP_FRAMES=1 N=3 scripts/ltx25-render-confirm.sh`, which gives
-  the -0.7368 S1 margin the error bar it has never had.
+  the -0.7368 S1 margin the error bar it has never had. `KEEP_FRAMES` is landed;
+  the renders are not taken. **n is still 1.**
 
-Neither is a blocker on the finding above, which was taken from source at both
-pins and recomputed rather than transcribed.
+Neither is a blocker on the finding, which was taken from source at both pins,
+recomputed rather than transcribed, and whose one open condition Phase A closed.

@@ -3110,6 +3110,130 @@ raised. The predicate was replaced by the op-table probe described above,
   non-expert tower is what makes this model fit, and moving 94.6758 GiB of
   experts to the device does not remove it.
 
+### W9c-3b — the KV binding reads the engine's pages where they ARE (GPU, medium)
+
+Issue: [#2480](https://github.com/mudler/vllm.cpp/issues/2480).
+Claim: `CLAIM-GLM53-FLASH-W9C3B`. Base `3cd467643`.
+
+**O46's mechanism is FALSE, and the correction is the point of this wave.** O46
+reads the crashing legs' log order — one device-arm announcement, then one
+fallback warning, then SIGSEGV — as evidence that "the fault is in the MIXED
+residency state the per-layer fit guard creates". Both of those lines are
+`static bool said` once-flags (`glm5_next_moe.cpp`, `AnnounceDeviceArmOnce` and
+`WarnDeviceFallbackOnce`). Their order says only that at least one layer staged
+and at least one LATER layer did not. It is not evidence about WHERE the process
+died, and the process died somewhere else.
+
+**WHERE IT DIED, read off four files rather than guessed:**
+
+1. `GPUModelRunner::initialize_kv_cache` resolves
+   `kv_cache_backend_resident_ = !platforms::GetPlatform(dev.type).is_cpu() && (VT_DEVICE_KV_CACHE != "0")`
+   (`src/vllm/v1/worker/gpu/runner.cpp:1119-1122`). On `--device cuda` it is
+   **true**, and its own comment says the predicate is deliberately "has a
+   device", not "is CUDA".
+2. `GPUModelRunner::CacheBuffer` then allocates every paged cache and every
+   recurrent state with `vt::Alloc(device_, ...)` (`runner.cpp:575-593`). On
+   CUDA that is `cudaMalloc`. The `host_data_` vector is the CPU-queue arm and
+   is not taken.
+3. A `cudaMalloc` pointer is **not host-dereferenceable, on GB10 included**.
+   `src/vt/cuda/cuda_backend.cu:354-391` says so and holds it with a
+   `static_assert` that CUDA keeps the inherited
+   `DeviceMemoryIsHostAddressable() == false`, naming #844 and #1435 as the
+   SIGSEGVs that came from reading the WIDE predicate (`UnifiedMemory()`)
+   instead.
+4. `glm5_next_kv.cpp` reads and writes those pages with **plain host loops**:
+   `ReadElem`/`WriteElem` are `static_cast<float*>(kv.data)[i]` and
+   `ReadTensorElem`/`WriteTensorElem` are `t.Ptr<float>()[i]`. `LoadCaches` and
+   `StoreCaches` are their only callers, and
+   `ForwardGlm5NextForConditionalGeneration` is the only caller of those two.
+
+`LoadCaches` returns before touching any page on a fresh sequence
+(`if (b.cached_len <= 0) return;` — "A FRESH SEQUENCE READS NOTHING"), so on
+step 1 the FIRST host access to device memory is in `StoreCaches`, **after the
+whole forward has returned**. That is after the announcement, after the fallback
+warning, on a step that emitted no token, with no message — which is the
+recorded signature exactly, and it is why the wall of a crashing leg sits at
+roughly one forward step past its load.
+
+**THE DEFECT IS OLDER THAN THE ARM THAT EXPOSED IT.** Nothing in W9c-3a's diff
+touches a KV page. `origin/main` never reached this because
+`Glm5NextHostForward` refused a non-CPU queue several thousand instructions
+earlier; W9c-3a removed that refusal, and a hole that had been unreachable
+became reachable on the first `--device cuda` step that got past it. The three
+hypotheses O46 eliminated are all inside `MoeExpertsKeepQuant` and are all
+correctly eliminated. They were aimed at the wrong subsystem.
+
+**AND NOTHING GATED IT.** `ResolveKvBinding`, `LoadCaches` and `StoreCaches`
+have **zero** call sites in `tests/` across the whole tree. The engine binding's
+read/write path — the one W5b-2c landed and the one this crash is in — has no
+unit coverage of its own; it is exercised only incidentally, through
+`ModelRegistry::Forward` on a CPU queue, where every page IS host memory and the
+defect cannot appear.
+
+#### Scope
+
+`src/vllm/model_executor/models/glm5_next_kv.cpp` only. Every span this file
+reads or writes goes through `vt::Backend::Copy` instead of being dereferenced.
+`Backend::Copy` is direction-agnostic on CUDA (`cudaMemcpyAsync` with
+`cudaMemcpyDefault`, `cuda_backend.cu:116-118`), so ONE code path is correct
+whether the pages are device memory or host memory. That is what keeps this file
+from re-deriving the runner's residency policy: it never asks where the pages
+are, and `VT_DEVICE_KV_CACHE=0` therefore needs no second branch here.
+
+On a CPU queue there is no backend to ask and the direct `memcpy` path is kept,
+so every `--device cpu` run is byte-for-byte unchanged.
+
+Every span this file addresses is already contiguous, which is what makes the
+change a substitution rather than a redesign: one paged row is `head_size`
+elements at `PagedRowOffset(...)`, and a recurrent state is `conv_elems` or
+`rec_elems` elements at `slot * elems`.
+
+#### Not in scope
+
+The other ten host arms O43 lists. The engine's residency policy. A
+`ModelInfo` flag that would let a model ask for host-resident caches — that is a
+shared-seam change with more than one consumer to survey, and it is not needed
+to make this model correct.
+
+#### Gates
+
+* `test_glm5_next_forward` — a new case drives `ResolveKvBinding`,
+  `StoreCaches` and `LoadCaches` over the file's existing three-group
+  `Topology` fixture, with the pages re-pointed at a backend whose allocations
+  are NOT host-readable. RED before the change and GREEN after.
+* The whole `glm5_next` suite set unchanged, by hand, with counts.
+* Sibling inertness: `GlmMoeDsaForCausalLM`, DeepSeek-V4, dots3-note, Kimi.
+* `dgx:gpu0`, the real 101.2535 GiB `UD-Q2_K_XL` artifact, four interleaved
+  legs on two binaries — see `## Evidence required` below.
+
+#### Evidence required
+
+The hermetic gate cannot prove the diagnosis, only the property. The diagnosis
+is proved on the box, by a leg that changes NOTHING but where the pages live:
+
+| leg | binary | device | env | expected if the diagnosis holds |
+|---|---|---|---|---|
+| A | base `3cd467643` | cuda | `VT_GLM5_NEXT_DEVICE_EXPERTS=1 VT_DEVICE_KV_CACHE=0` | ` Paris.`, rc=0 |
+| B | base `3cd467643` | cuda | `VT_GLM5_NEXT_DEVICE_EXPERTS=1` | SIGSEGV, rc=139 (the reproduction) |
+| C | fixed | cuda | `VT_GLM5_NEXT_DEVICE_EXPERTS=1` | ` Paris.`, rc=0 |
+| D | fixed | cpu | — | ` Paris.`, rc=0, byte-identical to C |
+
+A alone is the discriminator: it moves the pages to host memory and changes
+nothing else, so an A that survives while B dies puts the fault in the page
+residency and nowhere else. C is the fix. D is the control that says the fix did
+not change the host arm.
+
+**No speed number is admissible from any of them** (O47: 89% generation spread
+across three identical legs, cause unknown), and none is claimed.
+
+#### Stop conditions
+
+* If leg A dies too, the diagnosis is wrong: report it, keep O46 open, and do
+  not ship the change on a hermetic gate alone.
+* If a fifth arm of this model turns out to host-dereference engine device
+  memory, that is a wider residency question than this wave, and it goes back as
+  `NEEDS_DECISION` rather than being absorbed here.
+
 ## Tests to port
 
 `tests/models/` in transformers `v5.16.1` is the upstream suite. What is
@@ -5440,6 +5564,45 @@ Debts this row carries, each visible rather than waived:
   gets waved away in either direction -- as a regression it is not, or as noise
   without checking -- and because the ordering that caused it is this row's own
   script putting the sibling suites after the legs.
+
+- **O49 -- O46's MECHANISM IS FALSIFIED, and the crash is a KV-page residency
+  defect that is OLDER than the arm which exposed it.** O46 infers "the fault is
+  in the MIXED residency state the per-layer fit guard creates" from the log
+  order of one device-arm announcement followed by one fallback warning. Both of
+  those lines are `static bool said` once-flags
+  (`glm5_next_moe.cpp`, `AnnounceDeviceArmOnce`, `WarnDeviceFallbackOnce`), so
+  the order carries only "at least one layer staged, at least one LATER layer did
+  not". It is not a location.
+
+  The location is `StoreCaches`. On `--device cuda` the runner sets
+  `kv_cache_backend_resident_` true (`runner.cpp:1119-1122`) and allocates every
+  paged cache and every recurrent state with `vt::Alloc` — `cudaMalloc`
+  (`runner.cpp:575-593`) — while `glm5_next_kv.cpp` reads and writes those pages
+  with plain host loops. A `cudaMalloc` pointer is not host-dereferenceable on
+  GB10 (`cuda_backend.cu:354-391`, held by a `static_assert`, naming #844 and
+  #1435 as the same fault twice before). `LoadCaches` returns before touching a
+  page on a fresh sequence, so the FIRST host access to device memory on step 1
+  is in `StoreCaches`, after the whole forward has returned — which is exactly
+  after the announcement, after the fallback warning, on a step that emitted no
+  token, with no message.
+
+  W9c-3a did not introduce it. `origin/main` refused a non-CPU queue before
+  `StoreCaches` could run; removing that refusal made a pre-existing hole
+  reachable. O46's three eliminated hypotheses are all inside
+  `MoeExpertsKeepQuant` and are all correctly eliminated — they were aimed at the
+  wrong subsystem, because the ordering that pointed them there was an artifact
+  of two once-flags.
+
+  **NOTHING GATED THE PATH IT IS IN.** `ResolveKvBinding`, `LoadCaches` and
+  `StoreCaches` have ZERO call sites anywhere in `tests/`. The engine binding
+  W5b-2c landed is reached only incidentally, through `ModelRegistry::Forward` on
+  a CPU queue, where every page IS host memory and this defect cannot appear.
+  W9c-3b ([#2480](https://github.com/mudler/vllm.cpp/issues/2480)) owns the fix
+  and the first direct gate over those three functions.
+
+  What this costs the next reader is the general lesson, and it is O44's shape
+  once more: an ordering in a log is evidence about ORDER and not about place,
+  and a once-flag makes it evidence about even less than that.
 
 ## Now
 

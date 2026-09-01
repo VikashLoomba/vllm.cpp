@@ -1045,6 +1045,10 @@ target_include_directories(test_qwen4_exp_layer_loop PRIVATE ${CMAKE_SOURCE_DIR}
 vllm_cpp_add_test(test_qwen4_exp_runner vllm/models/test_qwen4_exp_runner.cpp)
 target_include_directories(test_qwen4_exp_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+vllm_cpp_add_test(test_qwen4_exp_matmul_bt_dtype
+  vllm/models/test_qwen4_exp_matmul_bt_dtype.cpp)
+target_include_directories(test_qwen4_exp_matmul_bt_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_qwen4_exp_kv_cache vllm/models/test_qwen4_exp_kv_cache.cpp)
 target_compile_definitions(test_qwen4_exp_kv_cache PRIVATE
   QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")

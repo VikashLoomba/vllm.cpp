@@ -1618,6 +1618,38 @@ std::vector<uint16_t> MatmulNvfp4Bf16(Dev d, const std::vector<uint16_t>& x, int
 // Linear [N,K], LoadBf16RawNK) -> vt::MatmulBT, the cuBLASLt TN fast path;
 // nk=false (loader-transposed [K,N]) -> row-major vt::Matmul, unchanged.
 
+// --- The model's ONE resolved activation dtype (#2534) -----------------------
+//
+// vLLM resolves one model dtype and every layer inherits it; this is that value
+// for the qwen35 trunk. It stays BF16, which is what the device tiers measured
+// and ship, and it resolves to F32 on the CPU tier when `VT_ACT_F32=1`.
+//
+// WHY THE CPU TIER GETS ITS OWN ANSWER AT ALL. On a device tier a BF16
+// activation is what the GEMM consumes, so the narrow store is the format the
+// hardware wants. On the CPU tier nothing consumes it: `LoadActF32`
+// (cpu_quant_gemm.cpp:41) widens every activation element straight back to f32
+// before the row is quantized, and `WidenRowToF32` (cpu_ops.cpp:577) does the
+// same in RMSNorm. So on CPU the BF16 store buys memory traffic and costs up to
+// 2^-9 = 1.95e-3 relative per store, twice per layer on the residual alone,
+// with no compensating compute win.
+//
+// That difference is the leading suspect behind the Q4_K_M token gate failure
+// (#2534): the arm's oracle, llama.cpp b10451, runs an f32 CPU graph with an
+// f16 KV cache, so the two engines are being compared at different precisions.
+// This knob is the SAME-BINARY A/B that measures it. It is OFF by default, so
+// no shipped default moves until that measurement exists; see
+// .agents/specs/qwen38-27b-q4km-token-exactness.md.
+bool ActF32FlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] == '1';
+}
+
+DType ActDType(Dev d) {
+  static const bool f32 = ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
+  if (!f32) return DType::kBF16;
+  return vllm::platforms::GetPlatform(d.q.device.type).is_cpu() ? DType::kF32
+                                                                : DType::kBF16;
+}
+
 DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
   const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
@@ -1632,7 +1664,7 @@ DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
 DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
   const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
-  DBuf dout(d, DType::kBF16, {M, N});
+  DBuf dout(d, ActDType(d), {M, N});
   if (w.nk)
     vt::MatmulBT(d.q, dout.t(), x, dw);
   else
@@ -2482,7 +2514,7 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
                                  direct_scale ? &as.t() : nullptr);
   }
 #endif
-  DBuf gated(d, DType::kBF16, {T, K});
+  DBuf gated(d, ActDType(d), {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
   // the same dtype every other arm of this o_proj returns.
@@ -2967,7 +2999,7 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
         vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
                           static_cast<int>(K), false});
   }
-  DBuf act(d, DType::kBF16, {M, N});
+  DBuf act(d, ActDType(d), {M, N});
   vt::SiluAndMul(d.q, act.t(), gu.t());
   return act;
 }
@@ -3480,11 +3512,15 @@ using detail::GdnOutDType;
 // f32 variance/normalize accumulation regardless — only the residual load/store
 // dtype changes) and halves that traffic. A/B: VT_BF16_RESIDUAL=0 restores the f32
 // residual in the same binary.
-DType ResidualDType() {
+// #2534 added the second term: when the trunk resolves f32 (the CPU tier under
+// `VT_ACT_F32=1`) the residual inherits it, because a residual narrower than the
+// stream it accumulates is the same lost mantissa twice per layer.
+DType ResidualDType(Dev d) {
   static const bool bf16 = [] {
     const char* e = std::getenv("VT_BF16_RESIDUAL");
     return e == nullptr || e[0] != '0';
   }();
+  if (ActDType(d) == DType::kF32) return DType::kF32;
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
@@ -4276,7 +4312,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -4753,7 +4789,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -5243,7 +5279,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -6889,7 +6925,7 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
   const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
 
@@ -6898,7 +6934,7 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
                   : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T, h_fp8);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
   // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
@@ -6950,7 +6986,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                                w.down_proj_fp4.input_global_scale_inv,
                                scale_layout);
       } else {
-        DBuf act(d, DType::kBF16, {T, I});
+        DBuf act(d, ActDType(d), {T, I});
         vt::SiluAndMul(d.q, act.t(), gate_up.t());
         vt::ScaledFp4Quant(d.q, ap.t(), as.t(), act.t(),
                            w.down_proj_fp4.input_global_scale_inv,
@@ -6960,7 +6996,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                                    DType::kBF16,
                                    direct_scale ? &as.t() : nullptr);
     }
-    DBuf act(d, DType::kBF16, {T, I});
+    DBuf act(d, ActDType(d), {T, I});
     vt::SiluAndMul(d.q, act.t(), gate_up.t());
     return MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4);
   }
@@ -6980,7 +7016,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     // Qwen3.5's MergedColumnParallelLinear: one raw-NK [2I,H] projection,
     // followed by SiluAndMul and the raw-NK down projection.
     DBuf gate_up = MatmulBf16D(d, dh, w.gate_up_proj);
-    DBuf act(d, DType::kBF16, {T, I});
+    DBuf act(d, ActDType(d), {T, I});
     vt::SiluAndMul(d.q, act.t(), gate_up.t());
     return MatmulBf16D(d, act.t(), w.down_proj);
   }
@@ -7098,7 +7134,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
         d, ap.t(), as.t(), w.down_proj_fp4, DType::kBF16,
         direct_scale ? &as.t() : nullptr);
   }
-  DBuf act(d, DType::kBF16, {T, I});
+  DBuf act(d, ActDType(d), {T, I});
   vt::MoeSiluMul(d.q, act.t(), gate.t(), up.t());  // silu(gate)*up -> bf16
   return fp4 ? MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4)
              : MatmulBf16D(d, act.t(), w.down_proj);  // [T,H] bf16
@@ -7115,7 +7151,7 @@ void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
 
   DBuf attn = layer.is_linear_attention
@@ -7123,7 +7159,7 @@ void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
                   : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
   hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
@@ -7142,7 +7178,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
   const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
 
@@ -7157,7 +7193,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   }();
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   // KERNEL-FUSION-FRAMEWORK W0 — the first production adoption of the declared
   // fusion seam. post_attention_layernorm is a plain add+residual+gemma-RMSNorm
   // (res += attn; dh2 = norm(res)), the exact chain kFusedAddRmsNorm transcribes.
@@ -7217,7 +7253,7 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   };
 
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
   if (std::getenv("VT_DUMP_ACT_SUB") != nullptr)
     std::fprintf(stderr, "[TT-DUMP] post_input_norm ptr=%p rows=%lld\n",
@@ -7266,7 +7302,7 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
     if (f2 != nullptr) { std::fwrite(raw2.data(), 1, raw2.size(), f2); std::fclose(f2); }
   }
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   DumpStage("post_attn_norm", dh2);
 
@@ -7840,11 +7876,11 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Working copy of the embedded hidden (device->device; captured). RunLayerPaged
   // reassigns `hidden` per layer, so this must NOT alias the persistent buffer.
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
            static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   // Upload the per-step inputs ONCE (positions + full-attn metadata + GDN decode
@@ -7921,7 +7957,7 @@ for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // Hidden-state tap (SPEC-MTP I5c): the full [T,H] post-final-norm hidden the
@@ -7979,7 +8015,7 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const Tensor* aux_out = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                        gdn_state, weights, config, logits_indices, hidden_tap,
@@ -8364,10 +8400,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   Tensor dtab =
       Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
@@ -8376,7 +8412,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   // Final norm is GemmaRMSNorm too (weight applied as 1+w).
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
@@ -8411,10 +8447,10 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   Tensor dtab =
       Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
@@ -8423,7 +8459,7 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // lm_head (the one host Download): PACKED NVFP4 (PERF-27B-LMHEAD-FP4) when the
@@ -8509,7 +8545,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
   // RMSNorms + cat + fc (extracted into MtpHeadHidden, shared with ForwardPaged).
   DBuf hidden = MtpHeadHidden(device, *weights_, *config_, *embed_tokens_,
                               input_ids, target_hidden_states, tokens);
-  DBuf residual(device, ResidualDType(), {tokens, hidden_size});
+  DBuf residual(device, ResidualDType(device), {tokens, hidden_size});
   residual.Zero(device);
   const size_t layer_index =
       static_cast<size_t>(spec_step_idx % num_layers);
@@ -8563,7 +8599,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   // paged (writes/reads the draft KV layer via slot_mapping/block_table).
   DBuf hidden = MtpHeadHidden(device, *weights_, *config_, *embed_tokens_,
                               input_ids, target_hidden_states, tokens);
-  DBuf residual(device, ResidualDType(), {tokens, hidden_size});
+  DBuf residual(device, ResidualDType(device), {tokens, hidden_size});
   residual.Zero(device);
 
   // Per-step device inputs for the single full-attention layer (no GDN state) +
@@ -8747,11 +8783,11 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Working copy of the embedded hidden (device->device; captured). RunDenseLayer
   // Paged reassigns `hidden` per layer, so this must NOT alias the persistent buf.
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
            static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.
@@ -8832,7 +8868,7 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // Hidden-state tap (SPEC-MTP I5c): the full [T,H] post-final-norm hidden the MTP
@@ -8882,7 +8918,7 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                             gdn_state, weights, config, logits_indices, hidden_tap,
@@ -9512,7 +9548,7 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   // Seed the fused stream with the combined residual input: res = hidden_in,
   // hidden delta = 0. The layer's input_layernorm then normalizes hidden_in.
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   hidden.Zero(d);
   // `Qwen3_5ReplayLayer` replays ONE layer in isolation and is not told which,
   // so it cannot consult a per-layer placement. Passing -1 makes the plan answer
@@ -9547,7 +9583,7 @@ std::vector<float> Qwen3_5ReplayDenseLayer(
   // input is the combined stream, so seed it as `res` and start the bf16 delta
   // at zero before running the real dense attention + SwiGLU layer.
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   hidden.Zero(d);
   RunDenseLayer(d, layer, config, hidden, res, positions, T);
 

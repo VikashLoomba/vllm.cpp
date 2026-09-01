@@ -5415,6 +5415,32 @@ Debts this row carries, each visible rather than waived:
   whatever drives an 89% generation spread on an unchanged binary -- which has to
   be found before any number from this row means anything.
 
+- **O48 -- THE DEVICE JOB'S SIBLING-INERTNESS RESULT IS INCONCLUSIVE FOR THREE
+  CASES, and the reason is O46's crash rather than the seam.** On `dgx:gpu0`
+  `test_mla_attention_block` read `21 cases | 18 passed | 3 failed` while the
+  same run reported `assertions: 2282069 | 2282069 passed | 0 failed`. Those two
+  lines are not in conflict: the three failures are THROWN cases, which the
+  assertions line does not count, and reading only the assertions line would have
+  reported this suite as clean. Each of the three threw `out of memory` --
+  `cudaStreamCreate: out of memory` twice and `rmsnorm launch: out of memory`
+  once -- and none failed a comparison.
+
+  **They ran one second after the third SIGSEGV.** The job's own timestamps put
+  `WALL_cuda3=1376 RC_cuda3=139` immediately before
+  `SIBLING INERTNESS ... 13:03:11`, so this suite executed while the device
+  allocations of a just-segfaulted process that had staged tens of GiB were still
+  being reclaimed. `test_cuda_deepseek_v4` (25 cases / 90,062 assertions) and
+  `test_qwen4_exp_qsa_device` (12 / 4,697) both passed on the same box moments
+  later, which is what reclamation completing looks like.
+
+  **The claim of inertness rests on the CLEAN-BOX run, not on the dgx one.** On
+  x86_64 at `20ec7dbbd`: `test_mla_attention_block` **21 of 21 cases, 2,282,067
+  assertions, 0 thrown**, and `test_glm_moe_dsa_schedule` 12 / 533. Recorded at
+  this length because "3 failed" next to "0 assertions failed" is the shape that
+  gets waved away in either direction -- as a regression it is not, or as noise
+  without checking -- and because the ordering that caused it is this row's own
+  script putting the sibling suites after the legs.
+
 ## Now
 
 `ACTIVE`, 2026-09-01. **THE KERNEL THAT BLOCKED THIS MODEL'S DEVICE ARM LANDED

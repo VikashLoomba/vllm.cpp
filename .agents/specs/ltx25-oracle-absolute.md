@@ -474,8 +474,12 @@ Stop and report, do not work around:
   `93a60151-7d4d-4718-842c-ef724208be0e` retained at this row's exact request and
   ran them through the landed gate. S1 reads 35.2719 against a bound of 36.0087,
   a margin of -0.7368, and S2 PASSES with the true prompt first by +0.3370.
-  #1854 still stays OPEN, and the reason has changed: it is now a MEASURED
-  shortfall rather than an unmeasured question. Owner is unchanged.
+  **It is ONE render, n = 1**: that lease retained only its first render's
+  frames, so the run-to-run stability of the reading is UNMEASURED, and a
+  reading that moved by 0.74 between runs would make the verdict a coin toss
+  rather than a finding. #1854 still stays OPEN, and the reason has changed: it
+  is now a MEASURED shortfall rather than an unmeasured question. Owner is
+  unchanged.
 - The three REPORTED statistics of §5 stay reported. Each has a stated
   derivation that failed, not an absence of effort. Owner: this row.
 
@@ -787,10 +791,12 @@ correction lives here rather than in a rewrite of it.
 **UPDATE, 2026-09-01.** The last sentence of the paragraph above is itself no
 longer true. `LTX25-PROMPT-ADHERENCE` W3 scored our render from the 25 frames a
 later lease retained, without committing them, and it reads a mean of 35.2719
-against the reference's 38.1278. That is 2.8559 below, or 3.00 of the
-reference's own per-frame standard deviations, and it FAILS the S1 bound this
-row's reference supplies. S2 PASSES, so our render depicts the asked-for scene
-and depicts it less well. **It is consistent with the smoothness this row's
+against the reference's 38.1278. That is 2.8559 below, with 20 of our 25 frames
+under the bound, and it FAILS the S1 bound this row's reference supplies. S2
+PASSES, so our render depicts the asked-for scene and depicts it less well.
+**It is ONE render, n = 1**, because that lease retained only its first render's
+frames, so nothing here measures how far the reading moves between runs.
+**It is consistent with the smoothness this row's
 `## Outcome` declared its blockiness ceiling was blind to, and consistency is
 all it is.** No measurement here connects the two, the ablation that would is
 not specified, and this row does not own it.

@@ -675,16 +675,46 @@ not have to be: a LATER lease, `rc` job `93a60151-7d4d-4718-842c-ef724208be0e`,
 took the `LTX25-RENDER-CONFIRM` measurement on `dgx:gpu0` on 2026-09-01 at the
 same request, and **retained its first render's 25 PPM frames** at
 `/mnt/nas_share/rc/ltx25-render-confirm/run/20260901T075837Z/r1/`. Its two later
-renders kept only `audio.wav` and the phase log, which is why n is 1 below.
+renders kept only `audio.wav` and the phase log, and that is the harness's
+DESIGN rather than a circumstance: at `592e224e7`,
+`scripts/ltx25-render-confirm.sh:551` is
+`[ "$i" = 1 ] || rm -f "$D"/frame_*.ppm`, under the comment "only render 1 is
+judged". The pixels of renders 2 and 3 were deleted before the lease ended, so
+no re-copy can recover them. That is why n is 1 below, and it is why closing
+n=1 costs a new lease rather than a fetch.
 
 **They are the reference's request, and that is verified rather than assumed.**
 The run's `PROVENANCE` records `prompt_sha256 =
 a65a14fe11dc5296b6747e62f412c949d00f455e4ffabce794f3f3d939f4cb93`, which is the
 sha256 of `ltx2_oracle_manifest.json`'s `request.prompt` with no trailing
 newline. The same file records `geometry=320x192/25f steps=8 seed=42`, which is
-that manifest's `request` in full. The binary was built inside the lease from source
-`790c582bbba45ab0f7b74aafee361e4557a84bf2`, `binary_sha256
+that manifest's `request` in full. The binary was built inside the lease,
+`binary_sha256
 600cf798c48ebabebc1fa25fb4891fe0b550f31f995501105aea856cced4c54d`.
+
+**The tree that binary was built from is `7905607af`, and that is the sha to
+read.** `PROVENANCE` names `source_sha
+790c582bbba45ab0f7b74aafee361e4557a84bf2`, and that commit is REACHABLE FROM NO
+REF: `git branch -a --contains 790c582b` is empty, and it is an ancestor of
+neither `origin/main` nor this branch. It was the pre-squash tip of
+`row/LTX25-RENDER-CONFIRM`, whose content landed as `592e224e7`. Its merge-base
+with `main` is `7905607af`, and its ONLY delta over that base is
+`.agents/specs/ltx25-render-confirm.md` plus `scripts/ltx25-render-confirm.sh`.
+So the ENGINE that produced these frames is `main` at `7905607af`, and the
+harness that drove it is identified by digest rather than by a dangling sha:
+`PROVENANCE` records `harness_sha256 =
+f32cc8ca5fd16a1780af6196821d8ae7d5df4e42741da2f37200d184f12e10b7`, which equals
+`git show 592e224e7:scripts/ltx25-render-confirm.sh | sha256sum`.
+
+**`7905607af` is 112 commits behind `origin/main` at `855905f59`, and no file
+whose PATH names LTX, video, VAE or diffusion changed across that range.** Of
+the 56 files under `src/` and `include/` that did change, none matches
+`ltx|video|vae|diffus`: the list is DeepSeek-V4, GLM-5.3-Next, Qwen, Laguna,
+Muse-Glimmer, the scheduler, the GPU runner and two CUDA kernels. That is a
+path-name scan and not a call-graph one, so it does not exclude a shared
+primitive moving under the LTX path. It is enough to say the reading is not
+obviously stale on the LTX sources. It is NOT enough to say today's engine would
+score the same.
 
 **The frames scored here are the frames the lease measured.** `sha256sum
 frame_*.ppm | sha256sum` over the 25 reads
@@ -714,12 +744,24 @@ the reference by +1.8240, per-frame 25 of 25, against a null of 1/7 = 0.1429.
 | reference | 38.1278 | [36.0087, 39.8198] | 0.9518 | 25 |
 | **ours** | **35.2719** | [33.1911, 37.0408] | 1.0382 | 25 |
 
-The mean gap is **2.8559**, which is **3.00 of the reference's own per-frame
-standard deviations**. **5 of our 25 frames clear the bound and 20 do not**, and
-our best frame (37.0408) still beats the reference's worst (36.0087). So this is
-a whole distribution shifted down, not two or three bad frames, and the bound
-being an order statistic rather than a mean is what kept the verdict from being
-even further out.
+The mean gap is **2.8559**. **5 of our 25 frames clear the bound and 20 do
+not**, and our best frame (37.0408) still beats the reference's worst
+(36.0087). So this is a whole distribution shifted down, not two or three bad
+frames, and the bound being an order statistic rather than a mean is what kept
+the verdict from being even further out.
+
+**The `sd` column is NOT an error bar on this reading, and no multiple of it is
+quoted here.** It is the frame-to-frame dispersion WITHIN one render, which
+measures how much the 25 frames of one video differ from each other. An earlier
+draft of this section divided the 2.8559 mean gap by the reference's 0.9518 and
+called the result "3.00 of the reference's own per-frame standard deviations".
+The arithmetic is right and the statistic is not one: a BETWEEN-render mean
+difference over a WITHIN-render dispersion is not a significance statement, and
+at n = 1 this row has no run-to-run dispersion to normalise by at all. "3 sigma"
+reads as significance to every reader who meets it, so it is dropped rather than
+annotated. What the shortfall is worth is the sentence above -- 20 of 25 frames
+below the bound, and our best frame still above their worst -- which carries the
+same content without borrowing a sigma's authority.
 
 **S2 PASSES, and its margin is the interesting number.** The true prompt still
 ranks first over all six committed decoys, so our render does depict the asked-for
@@ -819,18 +861,39 @@ refused rather than scored.
   this row, through #1854, which is the issue that asked the question and is the
   right place for the answer. Owner of the REPAIR: **no row exists**, and naming
   one needs the attribution first. This is the sharpest hole W3 leaves.
-- **n IS 1.** Only the first of `93a60151`'s three renders retained its frames, so
-  the run-to-run stability of our own adherence reading is UNMEASURED. The three
-  renders differ in wall time by 8.03%, and whether they differ in CLIP score at
-  all is not known. A reading that moves by 0.74 between runs would make the S1
-  verdict a coin toss rather than a finding, and nothing in this row excludes
-  that. Owner: this row.
+- **n IS 1.** Only the first of `93a60151`'s three renders retained its frames,
+  by the harness's design as `## Outcome` now records, so the run-to-run
+  stability of our own adherence reading is UNMEASURED. A reading that moves by
+  0.74 between runs would make the S1 verdict a coin toss rather than a finding,
+  and nothing in this row excludes that. **The wall-time spread is NOT evidence
+  for that doubt, and an earlier draft of this bullet offered it as such.** The
+  three phase logs read `wall_seconds` 289.002, 313.335 and 306.525, so
+  `(max - min) / mean` is 8.032%; `max / min - 1` reads 8.42% and `PROVENANCE`'s
+  integer seconds read 8.16%, which is why the formula is stated here rather than
+  the number alone. That spread is what a box getting three times busier looks
+  like: the same `PROVENANCE` records `loadavg` 1.97, 10.10 and 12.51 and GPU
+  clock 2411, 208 and 383 MHz at the three renders' starts. **The render that was
+  retained is the one taken in the quietest state**, which cuts the other way
+  from the doubt and is recorded because it was nowhere. The doubt stands on its
+  own ground -- n really is 1 -- and not on this evidence. Owner: this row.
 - **`ltx25-render-confirm.sh` does not pass `--adherence-model`**, so the next
   lease will re-take the blockiness verdict and NOT this one. W3's reading was
   taken by hand, off retained frames, and the exact command is in `## Outcome`
   rather than in a script. Wiring the harness to score adherence when a verified
   checkpoint is present, and to SAY SO when one is not, is what makes the reading
-  repeatable in-lease and is what n=1 above needs. Owner: this row.
+  repeatable in-lease. Owner: this row.
+- **THAT WIRING DOES NOT ON ITS OWN CLOSE n=1, and an earlier draft of the bullet
+  above claimed it did.** In that harness the whole compare block is guarded by
+  `if [ "$i" = 1 ]` at `scripts/ltx25-render-confirm.sh:471`, and `:551` is
+  `[ "$i" = 1 ] || rm -f "$D"/frame_*.ppm`; the anchors are read at `592e224e7`,
+  which is where that script landed. Passing `--adherence-model` at `:477`
+  therefore scores render 1 and nothing else: the next lease returns ONE MORE
+  SINGLE SAMPLE, while the record would read as if the weakest point had been
+  closed. Closing n=1 needs one of two further changes. Either run the compare
+  block per render instead of only for `i = 1`, or retain every render's frames
+  past the loop and score them after it. Both cost the 4.4 MB a render that the
+  deletion was written to save, neither is specified anywhere, and the choice
+  between them is not made here. Owner: this row.
 - **The frames of `rc` job `4b0666ee-248c-45fc-9de6-372b6d0c1fab` are still not
   established to exist**, and W3 no longer needs them: a later lease's frames at
   the same request answered the question. Recorded so that a reader does not

@@ -179,8 +179,11 @@ ForwardLogits ForwardGlm5NextForConditionalGeneration(
 
   // THE BINDING, resolved BY NAME and refusing by name. `glm5_next_kv.h`
   // carries the whole argument: what the engine hands over, why the MLA latent
-  // is not a K+V pair, and why the recurrent group's correspondence is a count
-  // rather than a name.
+  // is not a K+V pair, and — since W5b-2d (#2445) — why a published name has to
+  // go through the channel's PAYLOAD LOCATOR before it is an index into
+  // anything. `MultiKvCacheIndex::Find` answers a flat index over every
+  // published cache, and using it as an `attn_kv` slot is what stopped this
+  // model on the real artifact.
   VT_CHECK(input.multi_kv != nullptr,
            "Glm5NextForConditionalGeneration: this step arrived with no "
            "multi-KV channel. `MakeGlm5NextKVCache` publishes THREE groups -- "

@@ -468,6 +468,14 @@ Stop and report, do not work around:
   kept rather than rewritten because it records what was true at
   `fa9903b86`. #1854 stays OPEN: what is still owed is OUR render's frames,
   scored. Owner is unchanged.
+
+  **UPDATE, 2026-09-01: our frames HAVE now been scored, and they FAIL.**
+  `LTX25-PROMPT-ADHERENCE` W3 took the 25 frames `rc` job
+  `93a60151-7d4d-4718-842c-ef724208be0e` retained at this row's exact request and
+  ran them through the landed gate. S1 reads 35.2719 against a bound of 36.0087,
+  a margin of -0.7368, and S2 PASSES with the true prompt first by +0.3370.
+  #1854 still stays OPEN, and the reason has changed: it is now a MEASURED
+  shortfall rather than an unmeasured question. Owner is unchanged.
 - The three REPORTED statistics of §5 stay reported. Each has a stated
   derivation that failed, not an absence of effort. Owner: this row.
 
@@ -775,3 +783,14 @@ that prompt, ranking it first over six committed decoys on 25 of 25 frames. What
 is still not measured is OUR render, whose frames were never committed. The
 paragraph stays as written because it records this row's own state, and the
 correction lives here rather than in a rewrite of it.
+
+**UPDATE, 2026-09-01.** The last sentence of the paragraph above is itself no
+longer true. `LTX25-PROMPT-ADHERENCE` W3 scored our render from the 25 frames a
+later lease retained, without committing them, and it reads a mean of 35.2719
+against the reference's 38.1278. That is 2.8559 below, or 3.00 of the
+reference's own per-frame standard deviations, and it FAILS the S1 bound this
+row's reference supplies. S2 PASSES, so our render depicts the asked-for scene
+and depicts it less well. **It is consistent with the smoothness this row's
+`## Outcome` declared its blockiness ceiling was blind to, and consistency is
+all it is.** No measurement here connects the two, the ablation that would is
+not specified, and this row does not own it.

@@ -195,7 +195,17 @@ MATRICES = {
     # kernels have existed since `MODEL-DSV4-EXL3` W2 and are device-proven, but
     # the ONLY consumer is the DeepSeek-V4 loader, so no other architecture can
     # reach the scheme -- which is what the row is for (#2181).
-    "QUANT": (AGENTS / "quantization-matrix.md", 85),
+    # 86 since 2026-09-01: +`QUANT-EXL3-MUL1`, exllamav3's `mul1` codebook (cb 2)
+    # and the 4- and 5-bit trellis widths. A separate row from `QUANT-EXL3` and
+    # not a state transition on it, because cb 2 is a DIFFERENT DECODE rather
+    # than a third multiplier: cb 0 and cb 1 mask, xor and sum the two fp16
+    # halves of the product, while cb 2 sums the product's four bytes into an
+    # fp16 bit pattern and maps it with a fused fp16 affine
+    # (`codebook.cuh:82-89`). It has its own artifact
+    # (`Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`), its own widths, and its own owed
+    # GEMV arm, none of which `QUANT-EXL3`'s cells can carry without saying two
+    # things at once (#2495).
+    "QUANT": (AGENTS / "quantization-matrix.md", 86),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block

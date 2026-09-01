@@ -5523,8 +5523,17 @@ float Exl3DecodeMcg(uint16_t codeword);
 //   cb 0  the original QTIP 3INST: `x *= 89226354; x += 64248484`
 //   cb 1  MCG:                     `x *= 0xCBAC1FED`
 //
-// then, for both, `x = (x & 0x8fff8fff) ^ 0x3b603b60` and the two fp16 halves
-// summed in fp16. Any other value REFUSES BY NAME.
+// then, for those two, `x = (x & 0x8fff8fff) ^ 0x3b603b60` and the two fp16
+// halves summed in fp16.
+//
+//   cb 2  `mul1`: `x *= 0x83DCD12D`, then a DIFFERENT SHAPE — the four unsigned
+//         bytes of the product are summed into 0x6400 (`__dp4a`), the sum is
+//         reinterpreted as an fp16 bit pattern, and an fp16 fused affine map
+//         (`* 0x1eee + 0xc931`) yields the value. It is not the mask/xor/pair-sum
+//         of the other two, so it cannot be reached by swapping the multiplier.
+//         `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` marks every linear this way (#2495).
+//
+// Any other value REFUSES BY NAME. Upstream defines no other value either.
 //
 // WHICH ONE A CHECKPOINT USES IS DECIDED BY TENSOR PRESENCE, AND THE POLARITY
 // IS THE OPPOSITE OF THE OBVIOUS GUESS. `LinearEXL3` sets `self.mcg =

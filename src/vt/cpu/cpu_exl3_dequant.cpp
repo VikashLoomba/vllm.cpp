@@ -108,9 +108,45 @@ uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t) {
 float Exl3DecodeMcg(uint16_t codeword) { return Exl3DecodeCodeword(codeword, 1); }
 
 float Exl3DecodeCodeword(uint16_t codeword, int codebook) {
-  // codebook.cuh:56-90. The two arms differ ONLY in the scramble; the mask, the
-  // xor and the fp16 pair-sum are shared.
+  // codebook.cuh:56-90. Codebooks 0 and 1 differ ONLY in the scramble; the mask,
+  // the xor and the fp16 pair-sum are shared. Codebook 2 is a DIFFERENT SHAPE
+  // and is handled first, below, rather than folded into that pair.
   uint32_t x = static_cast<uint32_t>(codeword);
+  if (codebook == 2) {
+    // cb 2 -- `mul1` (codebook.cuh:82-89, `decode_3inst<2>`). NOT the
+    // mask/xor/pair-sum of cb 0 and cb 1: the 32-bit product's four UNSIGNED
+    // BYTES are summed into a fixed accumulator, the sum is REINTERPRETED as an
+    // fp16 bit pattern, and an fp16 affine map turns it into the codebook value.
+    x *= 0x83DCD12Du;
+    // `__dp4a(x, 0x01010101u, acc)` == `acc + (b0 + b1 + b2 + b3)` over the four
+    // unsigned bytes of `x`. Upstream notes it is bit-identical to the
+    // `vabsdiff4(x, 0, acc)` it replaced and native on Blackwell.
+    const uint32_t byte_sum = (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) +
+                              ((x >> 24) & 0xffu);
+    // acc == 0x6400, and upstream's own comment says why that constant: the fp16
+    // binade [1024, 2048) has an ULP of exactly 1.0, so `0x6400 + byte_sum` read
+    // AS AN FP16 BIT PATTERN is exactly the integer `1024 + byte_sum`. The byte
+    // sum is at most 4*255 == 1020, so the pattern never leaves that binade and
+    // the reinterpretation is exact for every one of the 1021 reachable sums.
+    const uint32_t sum = 0x6400u + byte_sum;
+    const float h = F16ToF32(static_cast<uint16_t>(sum));
+    // The two fp16 constants are taken as BIT PATTERNS from upstream rather than
+    // as decimals, because the decimals in its comments are rounded: 0x1eee is
+    // 0.00676727294921875 (887/131072), not "0.00677", and 0xc931 is -10.3828125
+    // (-1329/128), not "-10.39".
+    const float k_inv = F16ToF32(static_cast<uint16_t>(0x1eeeu));
+    const float k_bias = F16ToF32(static_cast<uint16_t>(0xc931u));
+    // Upstream ends in `__hfma`, a FUSED multiply-add with a SINGLE rounding to
+    // fp16. Evaluating the product and the sum separately in f32 reproduces it
+    // exactly, and that is a proof rather than a hope: `h` is an integer in
+    // [1024, 2044]; `k_inv` is 887 * 2^-17, so `h * k_inv` needs at most 21
+    // significant bits and is exact in f32; `k_bias` is -1329 * 2^-7 and is an
+    // integer multiple of the same 2^-17 quantum, so the sum is too, and its
+    // magnitude stays below 2^2. Every reachable value therefore lands exactly on
+    // an f32, so the only rounding is the one `RoundHalf` performs -- which is
+    // where `__hfma` rounds as well. Verified over all 1021 reachable sums.
+    return RoundHalf(h * k_inv + k_bias);
+  }
   if (codebook == 0) {
     // cb 0 — the original QTIP 3INST, and the DEFAULT: a checkpoint that ships
     // no `mcg` and no `mul1` tensor lands here, because `LinearEXL3` derives
@@ -122,8 +158,9 @@ float Exl3DecodeCodeword(uint16_t codeword, int codebook) {
   } else {
     VT_CHECK(false,
              "exl3: codebook " + std::to_string(codebook) +
-                 " is not implemented (0 == 3INST, 1 == MCG). cb 2 is upstream's "
-                 "dp4a byte-sum variant and needs its own port.");
+                 " is not implemented (0 == 3INST, 1 == MCG, 2 == mul1). Upstream "
+                 "defines no other value: `decode_3inst<cb>` (codebook.cuh:56-90) "
+                 "has arms for 0, 1 and 2 and falls off the end for anything else.");
   }
   x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
   const float lo = F16ToF32(static_cast<uint16_t>(x & 0xffffu));

@@ -1112,6 +1112,19 @@ target_include_directories(test_glm5_next_dsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_dsa PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 
+# GLM-5.3-Flash W9c-0 -- the k-pool indexer's two DEVICE ops (#2415). The CUDA
+# arm of what `test_glm5_next_dsa` gates on the host, run at the SAME fixture
+# geometry and against the SAME transformers v5.16.1 goldens, so the device
+# answer is compared with the oracle directly and not only with our own C++.
+# `np = ceil(21/4) = 6` against `kNumPools = 5` makes the `keep` compaction
+# observable; a kernel that skipped it puts the ragged tail three columns late.
+# The device cases SKIP without a CUDA backend, so this is a real gate only on a
+# leased device -- an `assertions: 0` line here is a skip wearing a pass.
+vllm_cpp_add_test(test_glm5_next_kpool_device vllm/models/test_glm5_next_kpool_device.cpp)
+target_include_directories(test_glm5_next_kpool_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_kpool_device PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
 # GLM-5.3-Flash W5 -- the 288 routed + 1 shared expert MoE, its grouped
 # `noaux_tc` router and the clamped-SwiGLU epilogue (#2223). The router is gated
 # at the PUBLISHED 288/top-8 and the composed block at 8 experts, because the
@@ -1697,6 +1710,10 @@ target_include_directories(test_placement_dump_dtype PRIVATE ${CMAKE_SOURCE_DIR}
 vllm_cpp_add_test(test_moe_fit_resolver
   vllm/model_executor/test_moe_fit_resolver.cpp)
 target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_attention_window_adoption
+  vllm/model_executor/layers/attention/test_attention_window_adoption.cpp)
+target_include_directories(test_attention_window_adoption PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # `vllm-cli`'s `--offload-config` (#1135). It runs the BINARY, because that is the
 # only thing that proves the FLAG arrives: `test_weight_residency_reach` already
 # drives `vllm_engine_load` with the same JSON string, so a test that called the
@@ -2141,6 +2158,14 @@ if(VLLM_CPP_SERVER)
     endif()
   endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # ENG-MM-INPUT-PIPELINE P2 (#2379): the SERVED image request, end to end
+  # through the real ApiServer -> AsyncLLM -> Scheduler -> GPUModelRunner ->
+  # ModelRegistry::Forward chain on a CPU queue. Its own target rather than a
+  # case inside test_openai_api_server, because it needs a different model (a
+  # registry LoadedModel carrying a vision tower) and a different tokenizer
+  # fixture (one whose added tokens are the vision markers).
+  vllm_cpp_add_test(test_openai_api_server_mm_forward
+    vllm/entrypoints/openai/test_api_server_mm_forward.cpp)
   # #1982: WHEN the first chat SSE frame reaches the client. Its own target so
   # the gated-runner fixture cannot perturb the keepalive suite's timings, and
   # inside this guard because it drives the production ApiServer dispatch,
@@ -2524,6 +2549,15 @@ target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}
 # domain. Reaches src/ for the tier header and the threadpool test hook.
 vllm_cpp_add_test(test_ops_matmul_elem vt/test_ops_matmul_elem.cpp)
 target_include_directories(test_ops_matmul_elem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# LTX25-CONNECTOR-REPAIR (#2434): the M-BLOCKING half of the same contract.
+# `MatmulOneChunk` now pads its 16-row activation tile up to a whole number of
+# `mr` blocks, so the rows that used to fall through to the one-row kernel are
+# computed by the M-blocked one instead. That decides WHICH ROWS SHARE ONE
+# ACCUMULATOR SET, and which rows a chunk covers is the threadpool's partition,
+# so the gate runs the whole dtype matrix at ragged M and repeats it at SEVEN
+# worker counts. The file above gates one shape in one dtype at four counts.
+vllm_cpp_add_test(test_ops_matmul_elem_mblock vt/test_ops_matmul_elem_mblock.cpp)
+target_include_directories(test_ops_matmul_elem_mblock PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # LTX25-TEXT-LINEAR-MEM (#1286): the seam's ALLOCATION bound, on both
 # `MatmulOneChunk` instantiations. Every other GEMM gate here asserts values or
 # byte equality, so a kernel that allocated a whole intermediate per worker

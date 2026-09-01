@@ -824,6 +824,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/glm5_next_moe.cpp
   src/vllm/model_executor/models/glm5_next_kv.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
+  src/vllm/model_executor/models/glm5_next_device.cpp
   src/vllm/model_executor/models/glm_moe_dsa.cpp
   src/vllm/model_executor/models/glm_moe_dsa_forward.cpp
   src/vllm/model_executor/models/glm_moe_dsa_loader.cpp
@@ -1075,6 +1076,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_vl_registry.cpp
   src/vllm/model_executor/models/voxtral.cpp
   src/vllm/multimodal/hasher.cpp
+  src/vllm/multimodal/utils.cpp
   # Per-modality input-count limits and the refusal they carry
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp
@@ -1824,6 +1826,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu
     src/vt/cuda/cuda_deepseek_v4.cu
+    src/vt/cuda/cuda_glm5_next.cu
     src/vt/cuda/cuda_exl3.cu
     src/vt/cuda/cuda_laguna.cu
     src/vt/cuda/cuda_minimax_h3.cu

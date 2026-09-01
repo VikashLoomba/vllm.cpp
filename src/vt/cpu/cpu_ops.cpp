@@ -224,35 +224,82 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
   // per worker for the process lifetime (no per-chunk allocation).
   static thread_local std::vector<float> af;
 
+  // M blocking applies to BOTH orientations. It used to be gated on kBT, so
+  // the [K,N] path always ran mr=1 and re-read the whole weight tile once per
+  // activation row (a 131-row activation read it 131 times). Each family is
+  // guarded on its own function pointer because a tier may provide one and
+  // not the other (the portable tier has no btm, having no transpose to
+  // amortize, but its nkm still amortizes the weight load).
+  const ElemNkMFn nkm_fn = tier.nkm[bi];
+  const int mr = (kBT ? (tier.btm[bi] != nullptr) : (nkm_fn != nullptr)) ? tier.mr : 1;
+  VT_CHECK(mr >= 1 && mr <= kElemMaxMr,
+           "cpu matmul: the tier's mr exceeds the accumulator tile the chunk walker "
+           "carries; raise kElemMaxMr in cpu_matmul_elem.h together with it");
+
   for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
     const int64_t i_hi = std::min(iir1 + blck_1, ir1_end);
     const int64_t nrows = i_hi - iir1;
-    af.resize(static_cast<size_t>(nrows * k));
+    // PAD THE TILE UP TO A WHOLE NUMBER OF `mr` BLOCKS. One `btm`/`nkm` call
+    // costs one pass over the 16-column weight block -- the load, and on the
+    // [N,K] orientation the 4x4-group register transpose -- and that pass is
+    // what M blocking exists to amortize. `mr` does not have to divide
+    // `blck_1`: at mr = 6 a 16-row tile used to take two M-blocked calls and
+    // then send its last FOUR rows through the one-row kernel, one whole weight
+    // pass each, so the tile performed SIX passes where its own blocking factor
+    // allows three. Padding the tile and clamping the store below puts every
+    // row on the M-blocked kernel; the pad rows are computed and never stored.
+    //
+    // It moves no output's accumulation order. `ElemBtMFn` accumulates lane `l`
+    // of row `r` over `p` in strict increasing order whatever `mr` is, exactly
+    // as `ElemBt16Fn` does for one row -- which is why the tree already ran some
+    // rows of the same call through `btm` and the rest through `bt` and asserted
+    // both byte-identical to `MatmulOneChunkRef`.
+    //
+    // IT PADS ONLY WHERE PADDING REMOVES A PASS, which is what stops it being
+    // a decode regression. With `rem = nrows % mr`, the tile costs
+    // `floor(nrows/mr) + rem` passes unpadded and `ceil(nrows/mr)` padded, so
+    // padding saves `rem - 1` passes and is a strict win only at `rem >= 2`.
+    // At `nrows < mr` -- a decode chunk of one or two rows -- both forms cost
+    // ONE pass and padding would only add arithmetic, so it is declined there
+    // and those shapes keep today's kernel exactly.
+    const int64_t rem = mr > 1 ? nrows % mr : 0;
+    const bool pad = mr > 1 && nrows >= mr && rem >= 2;
+    const int64_t nrows_padded = pad ? ((nrows + mr - 1) / mr) * mr : nrows;
+    af.resize(static_cast<size_t>(nrows_padded * k));
     for (int64_t i = iir1; i < i_hi; ++i) {
       WidenRowToF32(a.dtype, ElemPtr(a, i * a_rs), k, af.data() + (i - iir1) * k);
     }
-    // M blocking applies to BOTH orientations. It used to be gated on kBT, so
-    // the [K,N] path always ran mr=1 and re-read the whole weight tile once per
-    // activation row (a 131-row activation read it 131 times). Each family is
-    // guarded on its own function pointer because a tier may provide one and
-    // not the other (the portable tier has no btm, having no transpose to
-    // amortize, but its nkm still amortizes the weight load).
-    const ElemNkMFn nkm_fn = tier.nkm[bi];
-    const int mr = (kBT ? (tier.btm[bi] != nullptr) : (nkm_fn != nullptr)) ? tier.mr : 1;
+    if (nrows_padded > nrows) {
+      // `af` is thread_local and reused across calls, so without this the pad
+      // rows would carry whatever the previous call left there -- including the
+      // inf and nan operands tests/vt/test_ops_matmul_elem.cpp feeds. Their
+      // products are never stored, so this changes no output; it keeps stale
+      // operands out of the FP pipeline rather than out of the result.
+      std::memset(af.data() + nrows * k, 0,
+                  static_cast<size_t>((nrows_padded - nrows) * k) * sizeof(float));
+    }
     for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
       const int64_t j_hi = std::min(iir0 + blck_0, ir0_end);
       int64_t i = iir1;
       // M-blocked fast path: `mr` activation rows share one weight load +
       // transpose per column block (see ElemBtMFn).
       if (j_hi - iir0 == blck_0 && mr > 1) {
-        float accm[kElemLanes * 8];
-        for (; i + mr <= i_hi; i += mr) {
+        float accm[kElemLanes * kElemMaxMr];
+        // Padded: every row of the tile, the last block partly discarded.
+        // Unpadded: the whole blocks only, and the one-row loop below takes the
+        // remainder exactly as it did before this change.
+        const int64_t mr_end = pad ? i_hi : (iir1 + (nrows / mr) * mr);
+        for (; i < mr_end; i += mr) {
           if (kBT) {
             tier.btm[bi](af.data() + (i - iir1) * k, k, ElemPtr(b, iir0 * k), k, accm);
           } else {
             nkm_fn(af.data() + (i - iir1) * k, k, ElemPtr(b, iir0), k, n, accm);
           }
-          for (int r = 0; r < mr; ++r) {
+          // Only the rows the tile actually holds are stored; the padded
+          // remainder above `i_hi` was computed against zeroed activations and
+          // is discarded here.
+          const int rows_here = static_cast<int>(std::min<int64_t>(mr, i_hi - i));
+          for (int r = 0; r < rows_here; ++r) {
             for (int64_t j = iir0; j < j_hi; ++j) {
               StoreF32(out, (i + r) * n + j, accm[r * kElemLanes + (j - iir0)]);
             }

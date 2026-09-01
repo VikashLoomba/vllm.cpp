@@ -114,12 +114,32 @@ struct Topology {
   static int64_t ConvElems() { return 3 * kKdaHeads * kKdaHeadDim * kConvKernel; }
   static int64_t RecElems() { return kKdaHeads * kKdaHeadDim * kKdaHeadDim; }
 
+  // ─── W5b-2d (#2445): THE FLAT CHANNEL, and it is NOT `attn_kv`'s order ────
+  //
+  // This fixture used to publish TWO names, both paged, with no payload
+  // locators — which made `MultiKvCacheIndex::Find` answer an `attn_kv` index
+  // and every case below pass against a channel shape the runner STOPPED
+  // producing at `9e7621efc`. The runner emits one entry per published cache in
+  // PUBLICATION order over ALL groups (`runner.cpp`, the by-name index pass),
+  // so the recurrent group lands BETWEEN the two attention groups and the flat
+  // index of the indexer side cache is not 1.
+  //
+  // At this miniature: flat 0 is the MLA latent (paged slot 0), flat 1..3 are
+  // the three KDA layers' recurrent states (gdn_state slots 0..2), and flat 4
+  // is the indexer side cache (paged slot 1). `Find(indexer) == 4` against
+  // `attn_kv.size() == 2` is the published checkpoint's `45` against `22`,
+  // scaled down.
+  static constexpr size_t kLatentFlat = 0;
+  static constexpr size_t kIndexerFlat = 1 + static_cast<size_t>(kLayers - 1);
+
   vt::DType dtype = vt::DType::kF32;
   std::vector<std::vector<uint8_t>> attn_bytes;
   std::vector<vllm::PagedKvCache> attn_kv;
   std::vector<std::string> names;
   std::vector<int32_t> group_ids;
   std::vector<int32_t> layer_indices;
+  std::vector<uint8_t> payload_kinds;
+  std::vector<int32_t> payload_slots;
   std::vector<std::vector<int32_t>> group_bt;
   std::vector<int32_t> group_cols;
   std::vector<std::vector<uint8_t>> conv_bytes;
@@ -133,15 +153,35 @@ struct Topology {
     // vector per token each (`MLAAttentionSpec`), so the page is
     // block_size * 1 * head_size and NOT twice that.
     const int64_t rows[2] = {LatentRow(), IndexerRow()};
-    const int32_t gid[2] = {0, 2};
     const char* suffix[2] = {".self_attn.attn", ".self_attn.indexer.k_cache"};
     for (int i = 0; i < 2; ++i) {
       attn_bytes.emplace_back(
           static_cast<size_t>(kNumBlocks * kBlockSize * rows[i] * elt), 0);
-      names.push_back("model.layers." + std::to_string(kDsaLayer) + suffix[i]);
-      group_ids.push_back(gid[i]);
-      layer_indices.push_back(static_cast<int32_t>(kDsaLayer));
     }
+    // THE FLAT CHANNEL, in PUBLICATION order: group 0, then group 1, then group
+    // 2 — one pass over the groups, exactly as `runner.cpp` builds it. The
+    // paged slot is a RUNNING COUNTER over the paged entries only, which is the
+    // whole distinction this fixture exists to carry.
+    const auto emit = [&](const std::string& name, int32_t gid, int32_t layer,
+                          vllm::KvCachePayload kind, int32_t slot) {
+      names.push_back(name);
+      group_ids.push_back(gid);
+      layer_indices.push_back(layer);
+      payload_kinds.push_back(static_cast<uint8_t>(kind));
+      payload_slots.push_back(slot);
+    };
+    emit("model.layers." + std::to_string(kDsaLayer) + suffix[0], 0,
+         static_cast<int32_t>(kDsaLayer), vllm::KvCachePayload::kPaged, 0);
+    {
+      int32_t rslot = 0;
+      for (int64_t l = 0; l < kLayers; ++l) {
+        if (l == kDsaLayer) continue;
+        emit("model.layers." + std::to_string(l) + ".linear_attn", 1,
+             static_cast<int32_t>(l), vllm::KvCachePayload::kRecurrent, rslot++);
+      }
+    }
+    emit("model.layers." + std::to_string(kDsaLayer) + suffix[1], 2,
+         static_cast<int32_t>(kDsaLayer), vllm::KvCachePayload::kPaged, 1);
     for (int i = 0; i < 2; ++i) {
       vllm::PagedKvCache kv;
       kv.data = attn_bytes[static_cast<size_t>(i)].data();
@@ -152,10 +192,21 @@ struct Topology {
       kv.head_size = rows[i];
       attn_kv.push_back(kv);
     }
-    // Three published groups, so three gathered tables; group 1 is the
-    // recurrent one and nothing on this path reads its table.
+    // Three published groups, so three gathered tables — `gather_group_block_tables`
+    // walks EVERY published group, the recurrent one included, so an empty entry
+    // here would be a shape the runner does not produce.
+    //
+    // W5b-2d (#2445): group 1's table is the RECURRENT group's and it is
+    // deliberately NOT a copy of the attention groups'. On the real model that
+    // table is one unified page per sequence, not `kNumBlocks` of them, and the
+    // difference is what makes reading `group_ids` at the wrong index fatal
+    // instead of invisible: a binding that took the indexer's group id from the
+    // PAGED slot rather than the FLAT index lands on group 1 and finds a table
+    // one column wide.
     group_bt.assign(3, std::vector<int32_t>(kBlockPerm, kBlockPerm + kNumBlocks));
     group_cols.assign(3, static_cast<int32_t>(kNumBlocks));
+    group_bt[1] = std::vector<int32_t>{0};
+    group_cols[1] = 1;
 
     // The recurrent group: one state set per KDA layer, in ASCENDING LAYER
     // ORDER, exactly as `alloc_recurrent_layer_states` pushes them. ONE slot,
@@ -192,6 +243,8 @@ struct Topology {
     mk.layer_names = &names;
     mk.group_ids = &group_ids;
     mk.layer_indices = &layer_indices;
+    mk.payload_kinds = &payload_kinds;
+    mk.payload_slots = &payload_slots;
     mk.group_block_tables = &group_bt;
     mk.group_block_table_cols = &group_cols;
   }
@@ -934,9 +987,16 @@ TEST_CASE("glm5_next W5b-2c: the PUBLICATION ORDER does not matter, the NAME doe
   const vllm::ForwardLogits a = vllm::ModelRegistry::Forward(*model, plain.Get());
 
   Topology flipped;
-  std::swap(flipped.names[0], flipped.names[1]);
-  std::swap(flipped.group_ids[0], flipped.group_ids[1]);
-  std::swap(flipped.layer_indices[0], flipped.layer_indices[1]);
+  // The runner publishing group 2 BEFORE group 0: the two attention entries
+  // trade flat positions, the recurrent group stays where it is, and the paged
+  // SLOTS stay 0 and 1 because the runner's counter is positional — so
+  // `attn_kv` is allocated in the new group order too and moves with them.
+  std::swap(flipped.names[Topology::kLatentFlat],
+            flipped.names[Topology::kIndexerFlat]);
+  std::swap(flipped.group_ids[Topology::kLatentFlat],
+            flipped.group_ids[Topology::kIndexerFlat]);
+  std::swap(flipped.layer_indices[Topology::kLatentFlat],
+            flipped.layer_indices[Topology::kIndexerFlat]);
   std::swap(flipped.attn_kv[0], flipped.attn_kv[1]);
   std::swap(flipped.attn_bytes[0], flipped.attn_bytes[1]);
   flipped.Publish();
@@ -983,7 +1043,8 @@ TEST_CASE("glm5_next W5b-2c: the two DSA caches cannot be SWAPPED") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
   Topology topo;
-  std::swap(topo.names[0], topo.names[1]);
+  std::swap(topo.names[Topology::kLatentFlat],
+            topo.names[Topology::kIndexerFlat]);
   topo.Publish();
   Step s({1, 2, 3});
   s.Bind(topo);
@@ -996,7 +1057,8 @@ TEST_CASE("glm5_next W5b-2c: a MISSING published name is refused BY NAME") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
   Topology topo;
-  topo.names[1] = "model.layers.2.self_attn.indexer.WRONG";
+  topo.names[Topology::kIndexerFlat] =
+      "model.layers.2.self_attn.indexer.WRONG";
   topo.Publish();
   Step s({1, 2, 3});
   s.Bind(topo);
@@ -1013,7 +1075,8 @@ TEST_CASE("glm5_next W5b-2c: ONE group cannot hold both DSA caches") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
   Topology topo;
-  topo.group_ids[1] = topo.group_ids[0];
+  topo.group_ids[Topology::kIndexerFlat] =
+      topo.group_ids[Topology::kLatentFlat];
   topo.Publish();
   Step s({1, 2, 3});
   s.Bind(topo);
@@ -1021,10 +1084,13 @@ TEST_CASE("glm5_next W5b-2c: ONE group cannot hold both DSA caches") {
                        doctest::Contains("SAME group id"), std::runtime_error);
 }
 
-TEST_CASE("glm5_next W5b-2c: the RECURRENT set count is the only check there is") {
-  // `MultiKvCacheIndex` keys the ATTENTION caches only. The KDA states arrive
-  // on `gdn_state` positionally with no name, so the count is the whole check
-  // and it has to be a real one.
+TEST_CASE("glm5_next W5b-2d: a SHORT gdn_state is refused, by name and by count") {
+  // This case was titled "the RECURRENT set count is the only check there is",
+  // and W5b-2d made that sentence false: the channel carries every published
+  // recurrent cache with a payload locator, so each KDA layer now resolves its
+  // own state BY NAME. The count survives beside the lookup because it catches
+  // the other direction — sets no declared layer claimed — and a short
+  // `gdn_state` must still refuse rather than read slot 2 of a two-entry vector.
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
@@ -1034,6 +1100,145 @@ TEST_CASE("glm5_next W5b-2c: the RECURRENT set count is the only check there is"
   s.Bind(topo);
   CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
                        doctest::Contains("recurrent state set"),
+                       std::runtime_error);
+}
+
+// ═══ (6b) W5b-2d — the FLAT index against the PAYLOAD SLOT (#2445) ══════════
+
+TEST_CASE("glm5_next W5b-2d: the FLAT index is NOT the paged slot") {
+  // THE DEFECT THIS WAVE REPAIRED, pinned as an assertion rather than as a
+  // shape. `MultiKvCacheIndex::Find` answers a cache's place among EVERY
+  // published cache; `PayloadAt` answers its slot in the container it lives in.
+  // Before `9e7621efc` those were the same number and `glm5_next_kv.cpp` used
+  // `Find`'s directly; after it they are not, and on the real artifact the
+  // indexer side cache of the first DSA layer is flat 45 against an `attn_kv`
+  // of 22. A future edit that reverts to `Find` fails HERE, on a stated
+  // inequality, instead of on an out-of-range access that another topology
+  // would not even produce.
+  Topology topo;
+  const vllm::MultiKvCacheIndex& mk = topo.mk;
+  const std::string latent = "model.layers.2.self_attn.attn";
+  const std::string indexer = "model.layers.2.self_attn.indexer.k_cache";
+
+  // The channel covers every published cache, not only the paged ones.
+  CHECK(mk.size() == static_cast<size_t>(kLayers + 1));
+  CHECK(mk.num_paged() == 2);
+  CHECK(mk.num_recurrent() == static_cast<int>(kLayers - 1));
+  // THREE, and the header of `MultiKvCacheIndex` still says TWO. `num_groups()`
+  // is documented as "how many DISTINCT published groups THEY came from" about
+  // the caches in `attn_kv`, and it is implemented as a distinct-count over the
+  // whole `group_ids` vector — which `9e7621efc` widened to cover the recurrent
+  // group as well. So the accessor answers 3 here and `glm5_next_kv.h` used to
+  // repeat the stale 2. The value is asserted rather than the prose, and #2459
+  // owns the shared header. `num_published_groups()` is unaffected: it counts
+  // the block-table vector, which was always per published group.
+  CHECK(mk.num_groups() == 3);
+  CHECK(mk.num_published_groups() == 3);
+  CHECK(topo.attn_kv.size() == 2);
+
+  CHECK(mk.Find(latent) == static_cast<int64_t>(Topology::kLatentFlat));
+  CHECK(mk.Find(indexer) == static_cast<int64_t>(Topology::kIndexerFlat));
+  // 4 against 2 here IS 45 against 22 on the published checkpoint.
+  CHECK(mk.Find(indexer) >= static_cast<int64_t>(topo.attn_kv.size()));
+
+  vllm::KvCachePayload kind = vllm::KvCachePayload::kRecurrent;
+  int32_t slot = -1;
+  REQUIRE(mk.Resolve(indexer, &kind, &slot));
+  CHECK(kind == vllm::KvCachePayload::kPaged);
+  CHECK(slot == 1);
+  // The inequality is the whole point, stated so it cannot silently collapse.
+  CHECK(static_cast<int64_t>(slot) != mk.Find(indexer));
+
+  REQUIRE(mk.Resolve(latent, &kind, &slot));
+  CHECK(kind == vllm::KvCachePayload::kPaged);
+  CHECK(slot == 0);
+
+  // The recurrent half, addressable by name since `9e7621efc` and consumed by
+  // this wave. Layer 3 is this miniature's LAST KDA layer and its state is
+  // gdn_state slot 2 — not 3, which is what its layer index would have said.
+  REQUIRE(mk.Resolve("model.layers.3.linear_attn", &kind, &slot));
+  CHECK(kind == vllm::KvCachePayload::kRecurrent);
+  CHECK(slot == static_cast<int32_t>(kLayers - 2));
+  CHECK(mk.Find("model.layers.3.linear_attn") == static_cast<int64_t>(kLayers - 1));
+  CHECK(static_cast<int64_t>(slot) != mk.Find("model.layers.3.linear_attn"));
+
+  // And the group id is read at the FLAT index, which is the other half of the
+  // repair: `group_ids` is parallel to the flat list and not to `attn_kv`.
+  REQUIRE(mk.group_ids != nullptr);
+  CHECK((*mk.group_ids)[Topology::kLatentFlat] == 0);
+  CHECK((*mk.group_ids)[Topology::kIndexerFlat] == 2);
+  CHECK((*mk.group_ids)[1] == 1);
+}
+
+TEST_CASE("glm5_next W5b-2d: the recurrent slot is READ, not counted") {
+  // WITHOUT THIS CASE THE BY-NAME RECURRENT RESOLUTION IS NOT GATED. The runner
+  // assigns gdn_state slots in ascending layer order, which is exactly what a
+  // KDA-ordinal counter would produce, so on every topology this tree builds the
+  // two agree and a test that only ran the forward could not tell them apart.
+  // Permuting the published slots makes them disagree — and the binding must
+  // then REFUSE, because it read the channel. A counter would sail through.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  Topology topo;
+  // Flat 1 is layer 0's state (slot 0) and flat 3 is layer 3's (slot 2).
+  REQUIRE(topo.payload_slots[1] == 0);
+  REQUIRE(topo.payload_slots[3] == static_cast<int32_t>(kLayers - 2));
+  std::swap(topo.payload_slots[1], topo.payload_slots[3]);
+  topo.Publish();
+  Step s({1, 2, 3});
+  s.Bind(topo);
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
+                       doctest::Contains("gdn_state slot"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next W5b-2d: an attention name published as RECURRENT is refused") {
+  // `attn_kv` and `gdn_state` are two containers, so a slot read against the
+  // wrong one is an unrelated buffer with NO shape error — the same
+  // wrong-answer-not-a-crash shape the MLA-latent refusal exists for.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  Topology topo;
+  topo.payload_kinds[Topology::kIndexerFlat] =
+      static_cast<uint8_t>(vllm::KvCachePayload::kRecurrent);
+  topo.payload_slots[Topology::kIndexerFlat] = 0;  // in range for gdn_state
+  topo.Publish();
+  Step s({1, 2, 3});
+  s.Bind(topo);
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
+                       doctest::Contains("RECURRENT cache"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next W5b-2d: a recurrent name published as PAGED is refused") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  Topology topo;
+  topo.payload_kinds[1] = static_cast<uint8_t>(vllm::KvCachePayload::kPaged);
+  topo.payload_slots[1] = 0;  // in range for attn_kv
+  topo.Publish();
+  Step s({1, 2, 3});
+  s.Bind(topo);
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
+                       doctest::Contains("PAGED cache"), std::runtime_error);
+}
+
+TEST_CASE("glm5_next W5b-2d: a channel with NO payload locator is refused") {
+  // The pre-`9e7621efc` channel shape, which is what this fixture published
+  // until this wave. It is not silently tolerated: without the locator there is
+  // no way to turn a name into a slot, and the flat index is not one.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  Topology topo;
+  topo.Publish();
+  topo.mk.payload_kinds = nullptr;
+  topo.mk.payload_slots = nullptr;
+  Step s({1, 2, 3});
+  s.Bind(topo);
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, s.Get()),
+                       doctest::Contains("no payload locator"),
                        std::runtime_error);
 }
 

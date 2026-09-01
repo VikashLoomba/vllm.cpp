@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "vllm/config/multimodal.h"
+#include "vllm/multimodal/inputs.h"  // MultiModalFeatureSpec (the P2 encoder seam)
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/device.h"
@@ -632,6 +633,91 @@ struct ModelForwardInput {
   const MultiKvCacheIndex* multi_kv = nullptr;
 };
 
+// ── ENG-MM-INPUT-PIPELINE P2 (#2379): the multimodal MODEL seam ─────────────
+//
+// Upstream's runner does not implement multimodal itself. It calls three MODEL
+// methods through two protocols, and the runner code is generic over them:
+//
+//   SupportsMultiModal.embed_multimodal      -> the vision/audio tower
+//   SupportsMultiModal.embed_input_ids       -> embed ids + splice the mm rows
+//   SupportsMRoPE.get_mrope_input_positions  -> the 3-D prompt positions
+//
+// `ModelRegistry` is type-erased over `LoadedModel`, so a Python protocol
+// becomes three optional function pointers on `ModelFactory`. All three default
+// null, and `GPUModelRunner` runs its multimodal path only when the first two
+// are set AND some request in the step carries mm_features — so a text model
+// and a text step are byte-identical.
+//
+// WHY DEEPSTACK IS NOT IN THIS SEAM. `grep -c deepstack` over upstream's
+// `gpu_model_runner.py` is 0. Qwen3-VL's multiscale features ride INSIDE the
+// tower output and are unpacked model-side into a model-owned buffer
+// (`qwen3_vl.py:1757 self.deepstack_input_embeds`, the ctor one of two,
+// discriminated by its `# register buffer for deepstack` comment). A runner
+// that knew about DeepStack would be a runner that knows about one
+// architecture, so the runner here does not either: `MmEncoderOutput` carries
+// exactly one tensor, and what a model chooses to stash beside it is its own.
+
+// One multimodal item's encoder output — the mirror of one element of
+// `MultiModalEmbeddings` (`embed_multimodal`'s return).
+struct MmEncoderOutput {
+  // Owns the device allocation `embeds` views. The runner keeps this alive for
+  // as long as the mm_hash stays in its encoder cache, and drops it when the
+  // scheduler reports the hash freed.
+  std::shared_ptr<void> storage;
+  // [num_embeds, hidden] in the model dtype.
+  vt::Tensor embeds;
+};
+
+// What the runner hands the model's `embed_input_ids` mirror for ONE step.
+// Every pointer is BORROWED and valid only for the duration of the call.
+struct MmEmbedInputs {
+  // [num_scheduled_tokens] the step's input ids, in batch (dense) order.
+  const std::vector<int32_t>* token_ids = nullptr;
+  // The gathered encoder-output ROW SLICES, in the order their `true` positions
+  // appear in `is_mm_embed` — upstream's `multimodal_embeddings` list.
+  const std::vector<vt::Tensor>* mm_embeds = nullptr;
+  // [num_scheduled_tokens] upstream's `is_multimodal` bool mask. `char` rather
+  // than `bool` because `std::vector<bool>` has no contiguous buffer to upload.
+  const std::vector<char>* is_mm_embed = nullptr;
+  // [3 * num_scheduled_tokens] row-major M-RoPE positions, or EMPTY when the
+  // registration declares no `mrope_prompt_positions` (upstream's
+  // `uses_mrope == False`, which is Gemma-4's multimodal arm: it reads the 1-D
+  // `ModelForwardInput::positions` instead).
+  const std::vector<int32_t>* mrope_positions = nullptr;
+};
+
+// The per-step device buffers the model staged, plus the seam view over them.
+// `storage` keeps them alive until the runner's forward has returned.
+struct MmForwardBuffers {
+  std::vector<std::shared_ptr<void>> storage;
+  MultiModalForwardInput mm;
+};
+
+// `get_mrope_input_positions` (`SupportsMRoPE`). Computed ONCE per request at
+// admission (upstream `_init_mrope_positions`, gpu_model_runner.py:1654,
+// grep -c == 1) because it needs the WHOLE prompt; the per-step slice and the
+// synthesised completion part are the runner's.
+struct MropePromptPositions {
+  // [3 * num_prompt_tokens] row-major.
+  std::vector<int32_t> positions;
+  // The ONE scalar that carries M-RoPE across decode steps
+  // (gpu_model_runner.py:2786, grep -c == 1): a completion position is
+  // `context_len + i + delta` on all three axes.
+  int64_t delta = 0;
+};
+
+using ModelEncodeMmFn = MmEncoderOutput (*)(
+    LoadedModel& model, const HfConfig& config, vt::Queue& queue,
+    const multimodal::MultiModalFeatureSpec& item);
+using ModelEmbedMmFn = MmForwardBuffers (*)(LoadedModel& model,
+                                            const HfConfig& config,
+                                            vt::Queue& queue,
+                                            const MmEmbedInputs& inputs);
+using ModelMropePromptFn = MropePromptPositions (*)(
+    LoadedModel& model, const HfConfig& config,
+    const std::vector<int32_t>& prompt_token_ids,
+    const std::vector<multimodal::MultiModalFeatureSpec>& mm_features);
+
 using ModelConfigHook = void (*)(const HfConfig& config);
 using ModelWeightLoader = std::unique_ptr<LoadedModel> (*)(
     const ModelRegistration& registration, const HfConfig& config,
@@ -652,6 +738,15 @@ struct ModelFactory {
   ModelPrepareFn prepare = nullptr;
   ModelForwardFn forward = nullptr;
   KVCacheSpecBuilder make_kv_cache = nullptr;
+  // ENG-MM-INPUT-PIPELINE P2 (#2379). See the seam note above the typedefs.
+  // Null on every text architecture, which is what keeps `GPUModelRunner`'s
+  // multimodal path off for them entirely rather than merely inert.
+  ModelEncodeMmFn encode_mm = nullptr;
+  ModelEmbedMmFn embed_mm = nullptr;
+  // OPTIONAL even for a multimodal model: null is upstream's `uses_mrope ==
+  // False`, and the runner then leaves `MmEmbedInputs::mrope_positions` empty
+  // and the model reads the ordinary 1-D positions.
+  ModelMropePromptFn mrope_prompt_positions = nullptr;
   // Preserves the already-gated per-arch scheduler default. This is execution
   // policy, not an upstream _ModelInfo capability.
   bool is_dense_model = false;
@@ -876,6 +971,25 @@ class ModelRegistry {
                                        const HfConfig& config, int block_size,
                                        int num_blocks);
   static bool IsDenseModel(const LoadedModel& model);
+
+  // ── ENG-MM-INPUT-PIPELINE P2 (#2379): the multimodal model seam ──
+  // SupportsMmInputs mirrors upstream's `self.supports_mm_inputs`
+  // (gpu_model_runner.py:530, `grep -c 'self.supports_mm_inputs ='` == 1), which
+  // is the predicate the whole mm arm of `execute_model` hangs on. Here it asks
+  // whether the REGISTRATION declares the two required hooks, which is the same
+  // question: a model that cannot run a tower and cannot embed with a splice has
+  // no mm path to take.
+  static bool SupportsMmInputs(const LoadedModel& model);
+  static bool UsesMrope(const LoadedModel& model);
+  static MmEncoderOutput EncodeMm(LoadedModel& model, const HfConfig& config,
+                                  vt::Queue& queue,
+                                  const multimodal::MultiModalFeatureSpec& item);
+  static MmForwardBuffers EmbedMm(LoadedModel& model, const HfConfig& config,
+                                  vt::Queue& queue, const MmEmbedInputs& inputs);
+  static MropePromptPositions MropePromptPositionsFor(
+      LoadedModel& model, const HfConfig& config,
+      const std::vector<int32_t>& prompt_token_ids,
+      const std::vector<multimodal::MultiModalFeatureSpec>& mm_features);
 };
 
 // Compatibility adapters for synthetic in-memory Qwen tests and callers that

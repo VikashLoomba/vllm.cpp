@@ -18,10 +18,18 @@ namespace vllm::v1 {
 // subset: finished/unscheduled removal, new-request admission, in-batch cached
 // diffs, condense; PP / spec / async / resumed-store paths deferred).
 void update_states(InputBatch& input_batch,
-                   const SchedulerOutput& scheduler_output) {
+                   const SchedulerOutput& scheduler_output,
+                   std::unordered_map<std::string, CachedRequestState>*
+                       req_states) {
   // Remove the finished requests from the persistent batch.
   for (const std::string& req_id : scheduler_output.finished_req_ids) {
     input_batch.remove_request(req_id);
+    // ENG-MM-INPUT-PIPELINE P2 (#2379): upstream's `self.requests.pop(req_id)`
+    // (_update_states, the finished-ids loop). Only FINISHED ids leave the map:
+    // a request that is merely unscheduled this step keeps its entry, because
+    // the next step gathers from it again. Null on every text engine, and the
+    // three lines this pointer guards are then not executed at all.
+    if (req_states != nullptr) req_states->erase(req_id);
   }
 
   // Remove the unscheduled requests from the persistent batch:
@@ -78,6 +86,28 @@ void update_states(InputBatch& input_batch,
   // Add the new (or resumed-as-new) requests. Smaller empty indices first.
   for (const CachedRequestState& request : reqs_to_add) {
     input_batch.add_request(request);
+  }
+
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): the per-REQUEST map upstream keeps beside
+  // the per-SLOT batch (`self.requests[req_id] = CachedRequestState(...)` in
+  // _update_states, and the `req_state.num_computed_tokens = ...` line in its
+  // cached-diff loop). The runner's encoder step, gather and M-RoPE all address
+  // state by REQUEST ID and none of them can use a slot index, because a slot is
+  // reused by a different request after a condense. A resumed-from-preemption
+  // request re-arrives through scheduled_new_reqs under this scheduler, so the
+  // assignment below deliberately OVERWRITES: its mm_features are the same items
+  // and its M-RoPE prompt array is recomputed by the runner from the same prompt.
+  if (req_states != nullptr) {
+    for (const CachedRequestState& request : reqs_to_add) {
+      (*req_states)[request.req_id] = request;
+    }
+    for (int i = 0; i < cached.num_reqs(); ++i) {
+      const std::string& req_id = cached.req_ids[static_cast<size_t>(i)];
+      const auto it = req_states->find(req_id);
+      if (it == req_states->end()) continue;
+      it->second.num_computed_tokens =
+          cached.num_computed_tokens[static_cast<size_t>(i)];
+    }
   }
 
   // Condense to close any gaps left by removed requests.

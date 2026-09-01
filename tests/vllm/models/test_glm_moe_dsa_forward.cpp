@@ -48,6 +48,8 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
+#include "support/test_env.h"
+
 #include "../gguf_builder.h"
 #include "glm_moe_dsa_gguf_fixture.h"
 
@@ -57,6 +59,22 @@ using namespace glm_dsa_fixture;  // NOLINT: the fixture IS this file's vocabula
 using vllm::GlmMoeDsaWeights;
 using vllm::PagedKvCache;
 using vllm::v1::CommonAttentionMetadata;
+
+// THE LANE'S ENVIRONMENT, SET BEFORE DOCTEST'S MAIN RUNS (#2450).
+// `tests/CMakeLists.txt` also sets `VT_MOE_EXPERT_STREAM=1` on this target, and
+// that property is kept, but it is a CTEST property: it exists only when ctest
+// launches the binary. Run the binary DIRECTLY -- which is what an implementer
+// debugging one case does -- and the variable is absent, so
+// `expert_stream::StreamRequested()` latches its function-local static to false
+// in whichever case reads it first and the W9 seam case reds on a REQUIRE that
+// says nothing about the seam. Namespace-scope static initialisation runs before
+// main, so this sets the variable ahead of the first latch on either launch
+// path. Same hazard and same remedy as
+// `tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp:362-385`.
+struct EnableExpertStreaming {
+  EnableExpertStreaming() { vllm_test::SetEnv("VT_MOE_EXPERT_STREAM", "1"); }
+};
+const EnableExpertStreaming kEnableExpertStreaming;
 
 // LONGER THAN `index_topk` (64), ON PURPOSE. The sparse route is a property of
 // the STEP: `use_dense_mha = prefill_max_seq_len <= self.topk_tokens`
@@ -394,9 +412,10 @@ TEST_CASE("glm-dsa W9: the routed experts go through the expert-stream seam") {
   // OFF, and with it off `ExpertSlice` never builds a store, both arms below
   // read the tower in place, and the comparison passes on a forward that never
   // touched the seam at all — the "instrument whose failure looks like a
-  // result" shape. `VT_MOE_EXPERT_STREAM=1` is set on this target in
-  // `tests/CMakeLists.txt`, and the assertions after the first run are what
-  // prove it took effect.
+  // result" shape. `VT_MOE_EXPERT_STREAM=1` is set twice on purpose -- by this
+  // file's own `EnableExpertStreaming` static, which covers a direct run of the
+  // binary, and by the ctest property on this target -- and the assertions after
+  // the first run are what prove it took effect.
   REQUIRE(vllm::expert_stream::StreamRequested());
 
   MlaCachePool pool_a(w.params);

@@ -3716,5 +3716,11 @@ target_include_directories(test_glm_moe_dsa_forward PRIVATE
 # and the comparison would pass on a forward that never touched the seam. The
 # suite asserts `StreamRequested()` and the lane's own fill counters, so a run
 # without this environment reds rather than quietly measuring nothing.
+#
+# The suite ALSO sets the variable from its own namespace-scope static (#2450),
+# because this property only exists when ctest launches the binary and an
+# implementer debugging one case runs the binary directly. Both are kept: the
+# static is what makes a direct run honest, and this line is what states the
+# lane's environment where a reader of the build looks for it.
 set_tests_properties(test_glm_moe_dsa_forward PROPERTIES
   ENVIRONMENT "VT_MOE_EXPERT_STREAM=1")

@@ -225,9 +225,26 @@ constants. Three new cases, all on ROCm's real flag shape
   the load for any other reason cannot produce those three numbers. This is the
   case that distinguishes "the lane engaged" from "the refusal stopped firing",
   which a tolerance-free boolean gate cannot otherwise tell apart.
-- **The `||` guard.** `staging=true, bounded=false, host_addressable=true`: the
-  lane must NOT be built, so the load refuses at `kLaneOffBound`. Red under a
-  `||`, red under the old predicate, green only under the plain new one.
+- **The `||` guard, and a correction.** The first draft of this case asserted on
+  the thrown MESSAGE for `staging=true, bounded=false`, and that discriminated
+  NOTHING: with `bounded=false` the fit check returns before it can emit either a
+  refusal or a lane note, so the load reaches the tokenizer whether a lane was
+  built or not. It passed under the old predicate, the new one, and a `||` alike,
+  while reading as if it excluded them. Caught by noticing it was green in the RED
+  arm.
+  The observable that does discriminate is the LATCH.
+  `ResolveExpertStreamRequested()` is the guard's fifth term and freezes the
+  process's streaming answer; `WeightResidencyLatched(ResidencyLatch::kExpertStream)`
+  reports whether it was reached, and `ResetWeightResidencyConfigForTesting()`
+  clears it. The guard short-circuits before that term iff its FIRST term is
+  false, so the latch reads the first term directly — false under the plain new
+  predicate, true under a `||` or the old one. That latch is also precisely the
+  side effect this row's argument is about, so the case now tests the claim
+  rather than a proxy for it.
+- **The positive control for it.** ROCm's own shape with the same file, budget and
+  host-addressable bit, asserting the latch IS reached. Without it, "did not
+  latch" is equally true of a guard deleted outright, and the pair would pass on
+  a lane block that no longer exists.
 
 **Inertness.** Every existing case in the file constructs the platform with both
 flags `true`, which is CUDA's real shape, and must be byte-for-byte unmoved. The

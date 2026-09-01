@@ -1040,19 +1040,31 @@ TEST_CASE(
 
 TEST_CASE(
     "device fit lane: a platform that STAGES but reports no bounded memory "
-    "builds NO lane") {
+    "never REACHES the latch") {
   // The `||` guard, and the reason the repair is a REPLACEMENT rather than a
   // widening. `needs_weight_staging() || allocates_bounded_device_memory()`
   // would admit ROCm too, and would be wrong: for this platform
   // `CheckDeviceWeightFit` computes no footprint at all, so a lane here is pure
-  // side effect — it would latch the process's streaming answer and fix the
-  // slot store's geometry on a load whose fit check is inert.
+  // side effect.
   //
-  // The assertion is on the REFUSAL rather than on the absence of a lane note,
-  // because this platform's fit check returns before it can emit either. So the
-  // bit is read one level up: with `bounded=false` the load is never refused,
-  // and it must reach the tokenizer for THAT reason and not because a lane
-  // exempted the tower. `kLaneOffBound` is asserted absent to separate the two.
+  // THE OBSERVABLE HAD TO BE THE LATCH, and the first draft of this case got it
+  // wrong in a way worth recording. It asserted on the thrown MESSAGE, which
+  // cannot see this at all: with `bounded=false` the fit check returns before
+  // it can emit a refusal or a lane note, so the load reaches the tokenizer
+  // whether a lane was built or not. That case passed under the OLD predicate,
+  // under the NEW one, and under a `||` — it discriminated nothing while
+  // reading as if it did.
+  //
+  // `ResolveExpertStreamRequested()` is the guard's fifth term and it LATCHES
+  // the process's streaming answer. That latch is exactly the side effect the
+  // repair's argument is about, and `WeightResidencyLatched` reports it. The
+  // guard short-circuits before the latch iff its FIRST term is false, so this
+  // reads the first term directly: false here under the plain new predicate,
+  // TRUE under a `||` or under the old `needs_weight_staging()`.
+  vllm::ResetWeightResidencyConfigForTesting();
+  REQUIRE_FALSE(
+      vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream));
+
   RegisterFakeStagingPlatform();
   Platform().needs_weight_staging_flag = true;
   Platform().allocates_bounded_device_memory_flag = false;
@@ -1063,12 +1075,52 @@ TEST_CASE(
                     std::to_string(kLaneOnBound - 1));
   const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
   vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  const bool latched =
+      vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream);
   Platform().needs_weight_staging_flag = true;
   Platform().allocates_bounded_device_memory_flag = true;
   Platform().host_addressable = false;
 
+  // THE assertion: the guard never reached its fifth term, so no lane was even
+  // considered for a load whose fit check is inert.
+  CHECK_FALSE(latched);
+  // The load still got where it was going, asserted positively so that "did not
+  // latch" cannot be satisfied by a load that died before the guard.
   REQUIRE_FALSE(message.empty());
   CAPTURE(message);
   CHECK(message.find("cannot serve this GGUF") == std::string::npos);
   CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}
+
+TEST_CASE(
+    "device fit lane: ROCm's own state DOES reach the latch -- the positive "
+    "control for the case above") {
+  // Without this, "did not latch" above is also what a guard that never fires
+  // for ANY platform would produce, and the pair would pass on a lane block
+  // that had been deleted outright. Same file, same budget, same host-addressable
+  // bit; the ONE thing that moves is the pair of staging flags.
+  vllm::ResetWeightResidencyConfigForTesting();
+  REQUIRE_FALSE(
+      vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream));
+
+  RegisterFakeStagingPlatform();
+  Platform().needs_weight_staging_flag = false;
+  Platform().allocates_bounded_device_memory_flag = true;
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kLaneOnBound - 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  const bool latched =
+      vllm::WeightResidencyLatched(vllm::ResidencyLatch::kExpertStream);
+  Platform().needs_weight_staging_flag = true;
+  Platform().allocates_bounded_device_memory_flag = true;
+  Platform().host_addressable = false;
+
+  CHECK(latched);
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("the expert-stream lane IS active") != std::string::npos);
 }

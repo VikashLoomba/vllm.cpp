@@ -326,6 +326,27 @@ investigation row but MUST be addressed by the item-5 port:
 
 ## Owed
 
+- **The capture arm's cold step emits a deterministic wrong first decode
+  token ([#2461](https://github.com/mudler/vllm.cpp/issues/2461)) — BLOCKS
+  the wave's own "answer coherent vs the default arm" gate line.** Found by
+  the wave's fresh mutation review (2026-09-01): the reviewer's rerun of the
+  capture-armed focused gate printed deterministic gibberish where the
+  operator's evidence record claimed "coherent" — the gate's `words>20`
+  criterion was tt-metal log lines on stdout, and the A/B/C capture-leg logs
+  hold the same bytes. Per-step adjudication (`VT_TT_DUMP_KV`): prefill
+  exact, COLD step wrong (48755 vs plain-eager 3364 " story" on the same
+  binary and inputs, top-2 gap 1.69 — not a near-tie), capture step and
+  replays then consistent on the corrupted history. The capture-armed golden
+  battery's single 1/32 failure (prompt[0] tok=1) is the same defect — it
+  was mis-filed as a near-tie earlier in this record. Replays are
+  token-exact (battery prompts 1-15), so the defect is the driver's eager
+  cold pre-warm step (`qwen3.cpp:1086-1111`) under the Warm*-staged
+  cached-device-tensor paths leg A never exercises; driver-side attn
+  metadata on that step is verified correct. Pre-exists both R4 fixes (fix 1
+  is warm-branch-only, fix 2's fresh-slot arm is capture-only). Likely an
+  R5-era latent defect: no token gate ever ran on the captured CLI path.
+  The PR is blocked on the repair; the throughput ratios below stand as
+  machinery measurements, not as a capability verdict.
 - **The default-polarity question reopened by
   [#2003](https://github.com/mudler/vllm.cpp/issues/2003): RESOLVED as a
   documented stand-pat (2026-08-30, closed by the W2 record PR).** The
@@ -373,9 +394,11 @@ investigation row but MUST be addressed by the item-5 port:
   the 16-prompt battery spins in pure userspace after one capture. The
   trigger is a cross-prompt KV-geometry re-warm under a live trace, and
   tt-metal spins (state R, stime=0) instead of the R5-era futex sleep.
-  Blocked on this fix: the capture-armed battery dump, the capture-arm
-  near-tie pair for `qwen3_greedy_0_6b`, and the capture-default flip —
-  the throughput verdict (27.57 vs 17.68/12.95, `## Now`) is in.)
+  (2026-09-01, later: the capture-armed golden battery itself COMPLETES at
+  tip — 31/32 exact, the single failure is #2461's cold-step token, not a
+  hang; what still spins is the `VT_DUMP_IDS` battery dump. Blocked on this
+  fix: the capture-arm near-tie pair for `qwen3_greedy_0_6b`. The
+  capture-default flip is blocked on BOTH this fix and #2461.)
 - **TT never advertises async sampled-token readback
   ([#1627](https://github.com/mudler/vllm.cpp/issues/1627)).** The
   async-serving battery FATALs on TT at its anti-vacuous-pass guard
@@ -656,16 +679,26 @@ capture-armed arm is the fastest measured arm at tip.
   those pool blocks — `EnsureHost` then aborted on a `[1,16777216]` bf16
   shadow against a `[256,32,8,128]` f32 request. An eager fresh-slot
   zero keeps the host fallback; bytes do not name a dtype.
-- Focused gate (capture-armed 80-token CLI): PASS — rc 0, 0 fatals, 78
-  replays, coherent answer. `CaptureDecodePosAdvance` records inside the
-  trace with no fatal and correct replay tokens (empirical audit; no
-  warm needed).
+- Focused gate (capture-armed 80-token CLI): mechanics GREEN — rc 0, 0
+  fatals, 78 replays — but the answer was deterministic gibberish, not
+  coherent. The "coherent" claim first recorded here was a measurement
+  error (the gate's word-count criterion counted tt-metal log lines);
+  corrected 2026-09-01 after the fresh reviewer's rerun flagged it, and
+  root-caused as [#2461](https://github.com/mudler/vllm.cpp/issues/2461)
+  (cold-step defect, pre-existing, replay-exact — only step 1 diverges).
+  What survives of the original audit: `CaptureDecodePosAdvance` records
+  inside the trace with no fatal, and replays are token-exact given their
+  history (golden battery prompts 1-15 exact); no warm needed.
 - Same-binary A/B/C (Qwen3-0.6B, 3 order-alternated triples,
   `--repeat 5`, discard run 1, warm medians): default 12.95 / opt-out
   17.68 / CAPTURED 27.57 tok/s. Captured replay is 2.13x the default and
-  1.56x the opt-out; the R5-era 27.1 reproduces at tip; the wave's
-  "beat ~18.5" bar is cleared. Every capture leg: replays=474, 0 fatals,
-  rc 0, repeat-5 same-prompt multi-generate safe.
+  1.56x the opt-out; the R5-era 27.1 reproduces at tip. Every capture
+  leg: replays=474, 0 fatals, rc 0, repeat-5 same-prompt multi-generate
+  safe. CORRECTNESS CAVEAT (2026-09-01, #2461): the capture legs' output
+  text was the deterministic cold-step corruption, so these ratios stand
+  as measurements of the replay MACHINERY's speed only — not a capability
+  verdict. Re-measuring a token-clean captured arm is part of #2461's
+  repair gate.
 - The verdict replicates at Qwen3-4B (same recipe, 2 triples): default
   9.25 / opt-out 8.86 / CAPTURED 13.90 tok/s — 1.50x / 1.57x, replays=474
   and 0 fatals on every leg. Captured replay dominates at both sizes.
@@ -684,11 +717,13 @@ capture-armed arm is the fastest measured arm at tip.
   ptrace is unavailable on this host) — a cross-prompt KV-geometry
   re-warm under a live trace, tt-metal spin rather than the R5-era futex
   sleep. See `## Owed`.
-- BLOCKED on #1625 despite the throughput verdict: the capture-armed
-  golden battery and the capture-arm near-tie pair (the dump is 16
-  different prompts), and therefore the capture-default flip decision.
-  The wave's gate line "capture completes (no TT_FATAL)" is MET; the
-  flip itself waits for #1625.
+- BLOCKED: the capture-armed golden battery RUNS (31/32 exact; the one
+  failure is #2461's cold-step token) and the capture-arm near-tie pair
+  stays blocked on #1625 (the `VT_DUMP_IDS` dump is 16 different prompts
+  and spins). The wave's gate line "capture completes (no TT_FATAL)" is
+  MET; "answer coherent vs the default arm under the near-tie rules" is
+  NOT met — #2461 owns it, and with it the capture-default flip decision
+  (blocked on #2461 + #1625).
 
 **Wave scope (spec-first, one PR per the recorded row preference).** The R4
 gate line "capture completes (no TT_FATAL)" is still unmet at tip; meet it.

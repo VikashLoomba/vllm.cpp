@@ -1075,6 +1075,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_vl_registry.cpp
   src/vllm/model_executor/models/voxtral.cpp
   src/vllm/multimodal/hasher.cpp
+  src/vllm/multimodal/utils.cpp
   # Per-modality input-count limits and the refusal they carry
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp

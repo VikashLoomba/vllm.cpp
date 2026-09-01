@@ -85,6 +85,7 @@ void Nk16Portable(const float* af, const void* bv, int64_t k, int64_t n, float* 
 // amortize without any transpose: the 16-wide weight load per p is shared by
 // every activation row. Accumulation order per output is unchanged.
 constexpr int kMrNkPortable = 4;
+static_assert(kMrNkPortable <= kElemMaxMr, "cpu_ops.cpp's accumulator tile bounds mr");
 
 template <ElemKind K>
 void NkM4Portable(const float* af, int64_t a_stride, const void* bv, int64_t k,
@@ -190,6 +191,7 @@ void Bt16Neon(const float* af, const void* bv, int64_t k, float* acc) {
 // transpose. 16 accumulator vectors + 4 weight vectors + the broadcast row
 // values fit AArch64's 32 SIMD registers.
 constexpr int kMrNeon = 4;
+static_assert(kMrNeon <= kElemMaxMr, "cpu_ops.cpp's accumulator tile bounds mr");
 
 template <ElemKind K>
 void BtM4Neon(const float* af, int64_t a_stride, const void* bv, int64_t k, float* acc) {
@@ -334,6 +336,7 @@ void Bt16Sse2(const float* af, const void* bv, int64_t k, float* acc) {
 // registers, so 2 rows x 4 groups of accumulators plus the 4 transposed weight
 // vectors is what fits without spilling.
 constexpr int kMrSse2 = 2;
+static_assert(kMrSse2 <= kElemMaxMr, "cpu_ops.cpp's accumulator tile bounds mr");
 
 template <ElemKind K>
 void BtM2Sse2(const float* af, int64_t a_stride, const void* bv, int64_t k, float* acc) {

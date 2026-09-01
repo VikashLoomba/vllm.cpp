@@ -1488,9 +1488,16 @@ int VllmServerMain(int argc, char** argv) {
     // image codec (PNG/JPEG → RGB) is a NAMED residual: no codec is vendored, so
     // the production codec rejects encoded images with a clear message (the M2c
     // single-sequence gate consumes pre-decoded raw RGB). The mm FORWARD (vision
-    // tower + merge + MRoPE/DeepStack on the GPU worker consuming
-    // Request.mm_features) is the remaining MM-SERVE-E2E residual — the engine
-    // model runner has no mm-forward path yet. Kept alive for the server loop.
+    // tower + merge + MRoPE/DeepStack on the worker consuming
+    // Request.mm_features) is NO LONGER a residual: ENG-MM-INPUT-PIPELINE P2
+    // (#2379) gave `GPUModelRunner` that path, so an image_url request served
+    // through this seam is answered by `ModelRegistry::Forward` — the runner
+    // calls the registration's `encode_mm` per item, `embed_mm` per step, and
+    // fills `ModelForwardInput::mm` (runner.cpp `execute_mm_encoder`,
+    // `ModelRegistry::EmbedMm`, `forward_input.mm = mm_buffers->mm`). What P2
+    // left owed is named in `.agents/specs/multimodal-track.md` `## Owed`: one
+    // request per step, the host round-trip inside the merge, and image as the
+    // only modality that reaches the runner. Kept alive for the server loop.
     //
     // #607 L2 / #686: the seam now REFUSES rather than truncates. It is
     // constructed with a BaseProcessingInfo folding the engine's limits

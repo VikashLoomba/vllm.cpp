@@ -6,6 +6,8 @@
 // contract composition, the four-way ordering contract, and the deferred paths.
 #include "vllm/v1/worker/gpu/runner.h"
 
+#include "vllm/multimodal/utils.h"  // GetMmFeaturesInWindow (P2, #2379)
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -1885,6 +1887,260 @@ void GPUModelRunner::remap_gdn_state_slots(
   }
 }
 
+// ─── ENG-MM-INPUT-PIPELINE P2 (#2379): the runner's multimodal path ──────────
+//
+// Three hops separate `Request.mm_features` from `ModelForwardInput::mm`. The
+// scheduler owns the first two (the payload and the encoder admission); these
+// five functions are the third. Every one of them returns immediately for a
+// request with no multimodal items, and none of them is CALLED at all unless the
+// registration declares the encode/embed pair — see `supports_mm_inputs()`.
+
+void GPUModelRunner::free_evicted_encoder_outputs(
+    const SchedulerOutput& scheduler_output) {
+  // The worker half of the scheduler's eviction. `free_encoder_mm_hashes` names
+  // the entries the EncoderCacheManager actually evicted since the previous step
+  // (encoder_cache_manager.py:255), and the two caches would otherwise disagree
+  // about what is resident: the scheduler would stop reserving space for an
+  // entry this map still holds, and the runner would hold vision embeddings for
+  // a request that finished a thousand steps ago.
+  for (const std::string& mm_hash : scheduler_output.free_encoder_mm_hashes) {
+    encoder_cache_.erase(mm_hash);
+  }
+}
+
+void GPUModelRunner::init_mrope_positions(
+    const SchedulerOutput& scheduler_output) {
+  // `_init_mrope_positions` (gpu_model_runner.py:1654). Computed ONCE, at
+  // admission, because `get_mrope_input_positions` needs the WHOLE prompt: the
+  // temporal/height/width rows of an image span are assigned relative to the
+  // running maximum over everything before it, so a per-step recomputation over
+  // a chunk would produce different numbers for the same token.
+  for (const NewRequestData& new_req : scheduler_output.scheduled_new_reqs) {
+    if (new_req.mm_features.empty()) continue;
+    const auto it = req_states_.find(new_req.req_id);
+    if (it == req_states_.end()) continue;
+    CachedRequestState& state = it->second;
+    MropePromptPositions positions = ModelRegistry::MropePromptPositionsFor(
+        *model_, config_, state.prompt_token_ids, state.mm_features);
+    state.mrope_positions = std::move(positions.positions);
+    state.mrope_position_delta = positions.delta;
+  }
+}
+
+void GPUModelRunner::execute_mm_encoder(
+    const SchedulerOutput& scheduler_output) {
+  // `_execute_mm_encoder` (gpu_model_runner.py:2998). THE TOWER CALL. The
+  // scheduler already decided which items run this step and already reserved
+  // cache space for each of them, so this loop neither budgets nor evicts: it
+  // runs exactly what it was told to and stores the result under the item's
+  // MM_HASH (gpu_model_runner.py:2995), never under (req_id, input_id). Two
+  // requests carrying the same image therefore share one encoder run, which is
+  // the whole reason the key is a content hash.
+  for (const auto& [req_id, input_ids] :
+       scheduler_output.scheduled_encoder_inputs) {
+    const auto state_it = req_states_.find(req_id);
+    if (state_it == req_states_.end()) continue;
+    const CachedRequestState& state = state_it->second;
+    for (const int input_id : input_ids) {
+      VT_CHECK(input_id >= 0 &&
+                   input_id < static_cast<int>(state.mm_features.size()),
+               "runner mm encoder: the scheduler named multimodal item " +
+                   std::to_string(input_id) + " for request '" + req_id +
+                   "', which carries " +
+                   std::to_string(state.mm_features.size()) +
+                   " items. ENG-MM-INPUT-PIPELINE P2 (#2379).");
+      const multimodal::MultiModalFeatureSpec& item =
+          state.mm_features[static_cast<size_t>(input_id)];
+      // Already encoded by an earlier step or by another request holding the
+      // same hash. The scheduler's `check_and_update_cache` normally answers
+      // this first and never names the item, so reaching it means two requests
+      // were admitted in the SAME step for one hash.
+      if (encoder_cache_.count(item.mm_hash) != 0) continue;
+      encoder_cache_[item.mm_hash] =
+          ModelRegistry::EncodeMm(*model_, config_, queue_, item);
+    }
+  }
+}
+
+bool GPUModelRunner::batch_carries_mm() const {
+  // The second half of the multimodal predicate. It asks whether any request in
+  // the batch HAS multimodal items, not whether this step's window covers one:
+  // a decode step of an image request covers no placeholder row at all, and
+  // taking the text path for it would hand a merged-embeds-only forward
+  // (Qwen3-VL's) a step it refuses by name.
+  const int num_reqs = input_batch_.num_reqs();
+  for (int i = 0; i < num_reqs; ++i) {
+    const std::optional<std::string>& req_id =
+        input_batch_.req_ids[static_cast<size_t>(i)];
+    if (!req_id.has_value()) continue;
+    const auto it = req_states_.find(*req_id);
+    if (it == req_states_.end()) continue;
+    if (!it->second.mm_features.empty()) return true;
+  }
+  return false;
+}
+
+GPUModelRunner::MmGather GPUModelRunner::gather_mm_embeddings(
+    const SchedulerOutput& scheduler_output, int total_num_scheduled_tokens) {
+  // `_gather_mm_embeddings` (gpu_model_runner.py:3220). For every request in
+  // batch order, take the multimodal items whose placeholder span overlaps the
+  // token window this step covers, and slice the ROWS of their cached encoder
+  // output that the window reaches.
+  MmGather out;
+  out.is_mm_embed.assign(static_cast<size_t>(total_num_scheduled_tokens), 0);
+
+  // Batch order, bounded by num_reqs: the slots past it are stale nullopt
+  // entries a removal left behind, and `req_start_idx` below only advances in
+  // step with a SCHEDULED request.
+  int req_start_idx = 0;
+  const int num_reqs = input_batch_.num_reqs();
+  for (int index = 0; index < num_reqs; ++index) {
+    const std::string& req_id = *input_batch_.req_ids[static_cast<size_t>(index)];
+    const int num_scheduled_tokens =
+        scheduler_output.num_scheduled_tokens.at(req_id);
+    const auto state_it = req_states_.find(req_id);
+    VT_CHECK(state_it != req_states_.end(),
+             "runner mm gather: no cached state for scheduled request '" +
+                 req_id + "'. ENG-MM-INPUT-PIPELINE P2 (#2379).");
+    const CachedRequestState& state = state_it->second;
+    const int num_computed_tokens = state.num_computed_tokens;
+
+    const std::pair<int, int> window = multimodal::GetMmFeaturesInWindow(
+        state.mm_features, num_computed_tokens,
+        num_computed_tokens + num_scheduled_tokens);
+    for (int i = window.first; i < window.second; ++i) {
+      const multimodal::MultiModalFeatureSpec& item =
+          state.mm_features[static_cast<size_t>(i)];
+      const int start_pos = item.offset;
+      const int num_encoder_tokens = item.length;
+      const int start_idx = std::max(num_computed_tokens - start_pos, 0);
+      const int end_idx =
+          std::min(num_computed_tokens - start_pos + num_scheduled_tokens,
+                   num_encoder_tokens);
+      if (end_idx - start_idx <= 0) continue;
+
+      const auto cached = encoder_cache_.find(item.mm_hash);
+      // THE MISS THE SCHEDULER MAKES UNREACHABLE. `_try_schedule_encoder_inputs`
+      // truncates `num_new_tokens` to stop before an item whose encoder could
+      // not run, so a decoder chunk can never cover placeholder rows with no
+      // encoder output. Without that clamp this fires, and refusing here is the
+      // only honest answer: splicing whatever the embedding table gave the
+      // placeholder rows produces fluent, confidently WRONG tokens.
+      VT_CHECK(cached != encoder_cache_.end(),
+               "Encoder cache miss for " + item.mm_hash +
+                   ". The scheduler admitted decoder tokens across a multimodal "
+                   "span whose encoder was never run — see "
+                   "Scheduler::try_schedule_encoder_inputs. "
+                   "ENG-MM-INPUT-PIPELINE P2 (#2379).");
+
+      // The row slice, as a BORROWED view into the cached device buffer. The
+      // encoder output is [num_embeds, width] where `width` is whatever the
+      // model's tower produced for one placeholder row — for Qwen3-VL that is
+      // hidden * (1 + deepstack_levels), because DeepStack rides INSIDE the
+      // encoder output and is unpacked model-side (`grep -c deepstack` over
+      // upstream's runner is 0). The runner slices rows and never reads a
+      // column, so it stays generic over that width.
+      const vt::Tensor& full = cached->second.embeds;
+      VT_CHECK(full.rank == 2 && full.data != nullptr,
+               "runner mm gather: encoder output for " + item.mm_hash +
+                   " is not a 2-D device tensor");
+      VT_CHECK(end_idx <= static_cast<int>(full.shape[0]),
+               "runner mm gather: encoder output for " + item.mm_hash +
+                   " has " + std::to_string(full.shape[0]) + " rows, but the "
+                   "placeholder span asks for row " + std::to_string(end_idx));
+      const int64_t width = full.shape[1];
+      vt::Tensor slice = full;
+      slice.data = static_cast<char*>(full.data) +
+                   static_cast<size_t>(start_idx) *
+                       static_cast<size_t>(full.stride[0]) *
+                       vt::SizeOf(full.dtype);
+      slice.shape[0] = end_idx - start_idx;
+      slice.shape[1] = width;
+      out.mm_embeds.push_back(slice);
+
+      const int req_start_pos = req_start_idx + start_pos - num_computed_tokens;
+      for (int t = req_start_pos + start_idx; t < req_start_pos + end_idx; ++t) {
+        VT_CHECK(t >= 0 && t < total_num_scheduled_tokens,
+                 "runner mm gather: placeholder row " + std::to_string(t) +
+                     " is outside this step's " +
+                     std::to_string(total_num_scheduled_tokens) + " tokens");
+        out.is_mm_embed[static_cast<size_t>(t)] = 1;
+      }
+    }
+    req_start_idx += num_scheduled_tokens;
+  }
+  return out;
+}
+
+std::vector<int32_t> GPUModelRunner::calc_mrope_positions(
+    const SchedulerOutput& scheduler_output, int total_num_scheduled_tokens) {
+  // `_calc_mrope_positions` (gpu_model_runner.py:2748). [3, T] row-major.
+  std::vector<int32_t> out(static_cast<size_t>(3) *
+                           static_cast<size_t>(total_num_scheduled_tokens));
+  int ptr = 0;
+  const int num_reqs = input_batch_.num_reqs();
+  for (int index = 0; index < num_reqs; ++index) {
+    const std::string& req_id = *input_batch_.req_ids[static_cast<size_t>(index)];
+    const auto state_it = req_states_.find(req_id);
+    VT_CHECK(state_it != req_states_.end(),
+             "runner M-RoPE: no cached state for scheduled request '" + req_id +
+                 "'. ENG-MM-INPUT-PIPELINE P2 (#2379).");
+    const CachedRequestState& state = state_it->second;
+    const int num_computed_tokens =
+        input_batch_.num_computed_tokens_cpu[static_cast<size_t>(index)];
+    const int num_scheduled_tokens =
+        scheduler_output.num_scheduled_tokens.at(req_id);
+    const int num_prompt_tokens = state.num_prompt_tokens;
+
+    int prompt_part_len = num_scheduled_tokens;
+    int completion_part_len = 0;
+    if (num_computed_tokens + num_scheduled_tokens > num_prompt_tokens) {
+      prompt_part_len = std::max(0, num_prompt_tokens - num_computed_tokens);
+      completion_part_len = std::max(0, num_scheduled_tokens - prompt_part_len);
+    }
+
+    if (prompt_part_len > 0) {
+      // The prompt part is pre-computed; this is a SLICE, never a recomputation.
+      VT_CHECK(static_cast<int>(state.mrope_positions.size()) >=
+                   3 * (num_computed_tokens + prompt_part_len),
+               "runner M-RoPE: request '" + req_id +
+                   "' has no pre-computed prompt positions for this window. A "
+                   "request that carries multimodal items on an M-RoPE model "
+                   "must have gone through init_mrope_positions at admission.");
+      for (int axis = 0; axis < 3; ++axis) {
+        for (int j = 0; j < prompt_part_len; ++j) {
+          out[static_cast<size_t>(axis) *
+                  static_cast<size_t>(total_num_scheduled_tokens) +
+              static_cast<size_t>(ptr + j)] =
+              state.mrope_positions[static_cast<size_t>(axis) *
+                                        static_cast<size_t>(num_prompt_tokens) +
+                                    static_cast<size_t>(num_computed_tokens + j)];
+        }
+      }
+      ptr += prompt_part_len;
+    }
+    if (completion_part_len > 0) {
+      // `get_next_input_positions_tensor`: NOTHING stores a completion position.
+      // All three axes take `context_len + i + delta`, so one int per request
+      // carries M-RoPE across a thousand decode steps.
+      const int64_t context_len = num_computed_tokens + prompt_part_len;
+      for (int axis = 0; axis < 3; ++axis) {
+        for (int j = 0; j < completion_part_len; ++j) {
+          out[static_cast<size_t>(axis) *
+                  static_cast<size_t>(total_num_scheduled_tokens) +
+              static_cast<size_t>(ptr + j)] =
+              static_cast<int32_t>(context_len + j + state.mrope_position_delta);
+        }
+      }
+      ptr += completion_part_len;
+    }
+  }
+  VT_CHECK(ptr == total_num_scheduled_tokens,
+           "runner M-RoPE: filled " + std::to_string(ptr) + " of " +
+               std::to_string(total_num_scheduled_tokens) + " positions");
+  return out;
+}
+
 std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     const SchedulerOutput& scheduler_output) {
   // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD. Under async scheduling the previous
@@ -1932,7 +2188,25 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // + remove finished/unscheduled + condense (M1.5). Reads/mutates input_batch_
   // only (never exec_state_), so on the mirror path it is safe to run while the
   // previous step's kernels still read exec_state_.
-  update_states(input_batch_, scheduler_output);
+  //
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): `req_states_` is upstream's
+  // `self.requests`, and it is passed ONLY for a model that declares the
+  // multimodal seam. A text engine passes null and update_states is
+  // byte-identical.
+  update_states(input_batch_, scheduler_output,
+                supports_mm_inputs() ? &req_states_ : nullptr);
+
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): the encoder half of the step, in
+  // upstream's order — drop what the scheduler evicted, compute the M-RoPE
+  // prompt positions of every newly admitted multimodal request, then run the
+  // TOWER over exactly the items the scheduler admitted. All three iterate
+  // scheduler-output collections that are EMPTY on every text step, so a text
+  // engine pays one predicate.
+  if (supports_mm_inputs()) {
+    free_evicted_encoder_outputs(scheduler_output);
+    if (uses_mrope()) init_mrope_positions(scheduler_output);
+    execute_mm_encoder(scheduler_output);
+  }
 
   // Reset the stash. A 0-token step (e.g. an aborted-request flush) runs no
   // forward — mark num_reqs == 0 so sample_tokens returns an empty output
@@ -2273,6 +2547,40 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     positions.push_back(static_cast<int32_t>(position));
   }
 
+  // ─── ENG-MM-INPUT-PIPELINE P2 (#2379): what FILLS ModelForwardInput::mm ────
+  //
+  // The gather takes the encoder-output rows this step's window reaches; the
+  // model's `embed_mm` (upstream's `SupportsMultiModal.embed_input_ids`,
+  // interfaces.py:383, whose `multimodal_embeddings` parameter `grep -c` == 1 in
+  // that file) embeds the ids and splices those rows into the masked positions.
+  // The merge is a MODEL method upstream and it is a model hook here, because
+  // what a placeholder row means — and what else rides in the encoder output,
+  // DeepStack included — is architecture knowledge the runner must not carry.
+  //
+  // `mm_buffers` OWNS the device staging the model produced and must outlive the
+  // forward, so it is declared here rather than inside the branch.
+  std::optional<MmForwardBuffers> mm_buffers;
+  if (supports_mm_inputs() && batch_carries_mm()) {
+    // The flattened token count, taken from the array the model is about to
+    // embed rather than from the attention metadata, so the mask and the ids
+    // cannot disagree about length.
+    const int num_step_tokens = static_cast<int>(token_ids.size());
+    const MmGather gathered =
+        gather_mm_embeddings(scheduler_output, num_step_tokens);
+    std::vector<int32_t> mrope_positions;
+    if (uses_mrope()) {
+      mrope_positions = calc_mrope_positions(scheduler_output, num_step_tokens);
+    }
+    MmEmbedInputs embed_inputs;
+    embed_inputs.token_ids = &token_ids;
+    embed_inputs.mm_embeds = &gathered.mm_embeds;
+    embed_inputs.is_mm_embed = &gathered.is_mm_embed;
+    // EMPTY, not null, when the model declares no M-RoPE hook — upstream's
+    // `uses_mrope == False`, where the model reads the 1-D positions instead.
+    embed_inputs.mrope_positions = &mrope_positions;
+    mm_buffers = ModelRegistry::EmbedMm(*model_, config_, queue_, embed_inputs);
+  }
+
   // THE FORWARD (Task 3, over the persistent KV caches). Returns f32 logits
   // (lm_head already applied): [num_reqs, vocab] when the gather-before-lm_head
   // path is on (prefill/mixed) or pure-decode, else the full
@@ -2438,6 +2746,11 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // Set after construction because the field sits at the END of the struct, where
   // it cannot shift the positional aggregate initializers other callers use.
   forward_input.device_token_ids = device_input_ids;
+  // ENG-MM-INPUT-PIPELINE P2 (#2379): THE assignment this row exists for. Set
+  // after aggregate construction for the same reason `device_token_ids` is —
+  // the field sits past the positional initializers other callers use. nullopt
+  // on every text step, and the forward is then byte-identical.
+  if (mm_buffers.has_value()) forward_input.mm = mm_buffers->mm;
   // KV-DSV4-MULTICACHE W3 (#2068): the third cache channel. Null on every
   // uniform topology (`multi_kv_index_` is default-constructed there), so every
   // existing forward receives exactly what it received before.

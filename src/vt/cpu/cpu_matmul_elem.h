@@ -34,6 +34,15 @@ namespace vt::cpu {
 // FP-add latency bottleneck of the one-accumulator scalar loop.
 inline constexpr int kElemLanes = 16;
 
+// The largest `mr` any tier may declare. `MatmulOneChunk` carries ONE
+// stack accumulator tile of `kElemLanes * kElemMaxMr` floats and pads its
+// activation tile up to a whole number of `mr` blocks against it, so a tier
+// that raised `mr` past this bound would write past that tile. Every tier
+// static_asserts its own `mr` against this constant, so the refusal is at
+// compile time in the file that sets the value rather than at run time in the
+// file that trusts it.
+inline constexpr int kElemMaxMr = 8;
+
 // The three elementwise dtypes a GEMM operand may have.
 enum class ElemKind : int { kF32 = 0, kF16 = 1, kBF16 = 2, kCount = 3 };
 

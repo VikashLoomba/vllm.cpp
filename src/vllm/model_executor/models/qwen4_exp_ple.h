@@ -25,8 +25,8 @@
 // registry entries. `e126687a9a` is NOT reachable from our parity pin
 // `555967922` and is 595 commits ahead of it, so it is a FORWARD REFERENCE to an
 // unpinned upstream, but it is this row's primary oracle from now on. Both
-// components this file exists for are there: `nvidia/ple_layer.py:592-601` is
-// the dilated depthwise conv and `:240-436` is the n-gram hashed embedding, and
+// components this file exists for are there: `nvidia/ple_layer.py:589-599` is
+// the dilated depthwise conv and `:151-436` is the n-gram hashed embedding, and
 // the vLLM form is the one to mirror. See
 // `.agents/specs/qwen4-exp-flash-next.md`
 // `### Component-by-component reconciliation`, rows 19 to 21 (#2489).

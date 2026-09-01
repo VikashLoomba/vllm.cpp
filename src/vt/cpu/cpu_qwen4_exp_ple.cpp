@@ -22,8 +22,8 @@
 // and `vllm/models/qwen4_exp/nvidia/ple_layer.py` implements BOTH components
 // this file was written for: the dilated depthwise conv as
 // `nn.Conv1d(groups=hc*H, dilation=short_conv_dilation)` with a short-conv state
-// (:592-601), and the n-gram hashed embedding with splitmix64 multipliers, an
-// xor mix and a per-head prime vocabulary (:240-436). `e126687a9a` is NOT
+// (:589-599), and the n-gram hashed embedding with splitmix64 multipliers, an
+// xor mix and a per-head prime vocabulary (:151-436). `e126687a9a` is NOT
 // reachable from our parity pin `555967922` and is 595 commits ahead of it, so
 // it is a FORWARD REFERENCE to an unpinned upstream, but it is this row's
 // primary oracle from now on and the vLLM form is the one to mirror. See

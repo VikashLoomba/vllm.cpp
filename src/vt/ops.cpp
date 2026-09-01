@@ -2590,9 +2590,9 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
   // what its HC path is BUILT for, and it says it twice, explicitly rather than
   // incidentally: all three HC projections pass `quant_config=None` and a
   // hardcoded `params_dtype=torch.bfloat16` rather than `model_config.dtype`
-  // (`nvidia/hyperconnection.py:100-130`, `nvidia/model.py:260`, `:436`), and its
+  // (`nvidia/hyperconnection.py:102`, `:113`, `:122`; `nvidia/model.py:260`), and its
   // decode GEMM then demands packed row-major with BOTH operands bf16
-  // (`nvidia/low_latency_gemm.py:93-104`). Read that as evidence about intent,
+  // (`nvidia/low_latency_gemm.py:95-96`). Read that as evidence about intent,
   // not as a refusal of the keep-quant arm, and see #2406 for the residency
   // hazard the arm creates on an aarch64 i8mm host.
   //

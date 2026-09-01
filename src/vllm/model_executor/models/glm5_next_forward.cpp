@@ -14,7 +14,8 @@
 #include "vllm/model_executor/models/glm5_next_diag.h"
 #include "vllm/model_executor/models/glm5_next_dsa.h"
 #include "vllm/model_executor/models/glm5_next_moe.h"
-#include "vt/backend.h"  // vt::TryGetBackend
+#include "vt/backend.h"      // vt::TryGetBackend
+#include "vt/op_provider.h"  // vt::OpRegistered
 #include "vt/dtype.h"    // vt::DeviceType
 
 namespace vllm::glm5_next {
@@ -258,26 +259,38 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
   // built once, below, at the only place that has one to build.
   vt::Backend* dev_backend = nullptr;
   if (queue.device.type != vt::DeviceType::kCPU) {
-    // CUDA and nothing else. The two grouped ops have CPU and CUDA providers and
-    // no others, and a device with no provider would throw from inside the op
-    // with a message about the op rather than about this model. A ROCm or Metal
-    // queue is therefore refused HERE, by name, while the name is in hand.
-    if (queue.device.type != vt::DeviceType::kCUDA) {
-      Fail("this forward has a HOST arm and a CUDA arm and was handed neither. "
-           "The one primitive of this model that runs on a device is the "
-           "routed-expert keep-quant GEMM, and `vt::MoeGateUpSwiGLUGrouped` / "
-           "`vt::MatmulBTQuantGrouped` are registered on kCPU and kCUDA only. "
-           "Run this model with --device cpu or --device cuda. See "
-           ".agents/specs/glm5-next-flash.md section W9c-3a and issue #2464.");
-    }
-    // `TryGetBackend`, not `GetBackend`: a CUDA queue whose backend is not
-    // registered is a build without CUDA, and the message for that says so
-    // instead of throwing from the registry about a device type.
+    // ASK THE OP TABLE, NOT A DEVICE LIST. This read
+    // `queue.device.type != kCUDA` for one commit, and
+    // `scripts/check-device-leakage.py` was right to red it: a device name in
+    // the device-agnostic layer is a list that goes stale the day another
+    // backend registers these ops, and it answers the wrong question anyway.
+    // The question is whether THIS device has a provider for the two grouped
+    // keep-quant GEMMs, which is exactly what `OpRegistered` answers -- the
+    // same move `gguf_keep_quant.cpp` made when its device list became
+    // `OpRegistered(kEmbeddingQuant, dev)` (`ops.h:735`).
+    //
+    // Both ops, because half the pair is not half the capability: the fused
+    // gate/up op produces the operand the grouped down-projection consumes.
+    const bool gate_up_here =
+        vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, queue.device.type);
+    const bool down_here =
+        vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, queue.device.type);
+    // `TryGetBackend`, not `GetBackend`: a registered op with no backend to run
+    // it on is a different fault from an unregistered op, and the message says
+    // which rather than throwing out of the registry about a device type.
     vt::Backend* backend = vt::TryGetBackend(queue.device);
-    if (backend == nullptr) {
-      Fail("this step arrived on a CUDA queue and no CUDA backend is "
-           "registered, so the routed-expert GEMM has nothing to run on. This "
-           "is a build without CUDA rather than a model problem.");
+    if (!gate_up_here || !down_here || backend == nullptr) {
+      Fail(std::string(
+               "this device cannot run the one primitive of this model that "
+               "leaves the host -- the routed-expert keep-quant GEMM. "
+               "`vt::MoeGateUpSwiGLUGrouped` provider: ") +
+           (gate_up_here ? "yes" : "NO") +
+           ", `vt::MatmulBTQuantGrouped` provider: " + (down_here ? "yes" : "NO") +
+           ", backend registered: " + (backend != nullptr ? "yes" : "NO") +
+           ". Every other primitive here is a host reference, so a device that "
+           "cannot run that GEMM has nothing to offer this forward: run it with "
+           "--device cpu. See .agents/specs/glm5-next-flash.md section W9c-3a "
+           "and issue #2464.");
     }
     dev_backend = backend;
   }

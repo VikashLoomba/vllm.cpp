@@ -78,6 +78,7 @@
 #include "vllm/v1/attention/backend.h"               // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"     // GDNAttentionMetadata
 #include "vt/backend.h"  // W9c-3a: vt::TryGetBackend
+#include "vt/op_provider.h"  // W9c-3a: vt::OpRegistered
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
@@ -737,31 +738,53 @@ TEST_CASE("glm5_next forward W9c-3a: the queue is SPLIT, and a device that is "
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
 
   SUBCASE("a device with no provider for the two grouped ops") {
-    // kMETAL has neither a CPU-alias arm nor a registered
-    // `kMoeGateUpSwiGLUGrouped`. Refusing here names this model and the two
-    // ops; letting it through would throw from inside an op about a device
-    // type, several frames from anything a reader could act on.
+    // kMETAL registers neither `kMoeGateUpSwiGLUGrouped` nor
+    // `kMatmulBTQuantGrouped`. Refusing here names this model, both ops and
+    // which of them is missing; letting it through would throw from inside an
+    // op about a device type, several frames from anything a reader could act
+    // on.
+    //
+    // The refusal asks the OP TABLE and names no device, which is what
+    // `scripts/check-device-leakage.py` requires of the device-agnostic layer
+    // and is why this case asserts on the provider words rather than on
+    // "--device cuda".
     Step step({1, 2});
     step.queue = vt::Queue{vt::Device{vt::DeviceType::kMETAL, 0}, nullptr};
+    REQUIRE_FALSE(vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped,
+                                   vt::DeviceType::kMETAL));
     CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
-                         doctest::Contains("--device cpu or --device cuda"),
+                         doctest::Contains("routed-expert keep-quant GEMM"),
                          std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("provider: NO"), std::runtime_error);
     CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
                          doctest::Contains("#2464"), std::runtime_error);
   }
 
-  SUBCASE("a CUDA queue in a build with no CUDA backend") {
-    // On a CPU-only build this is the arm a `--device cuda` step takes, and the
-    // message says "build without CUDA" rather than throwing out of the backend
-    // registry about a device type. On a CUDA build the same step proceeds --
-    // which is what the `dgx:gpu0` end-to-end leg measures, and what this host
-    // lane cannot.
+  SUBCASE("the probe follows the OP TABLE and not a device name") {
+    // The discriminating half of the previous case. A refusal that hardcoded a
+    // device name would answer identically for kMETAL and differently for a
+    // device that DOES register the pair -- so the assertion is that the
+    // predicate and the op table agree, whatever this build registered.
+    //
+    // On a CPU-only build no non-CPU device registers the pair and every such
+    // queue is refused. On a CUDA build kCUDA registers both and the step
+    // proceeds, which is what the `dgx:gpu0` end-to-end leg measures and what
+    // this host lane cannot.
+    const vt::DeviceType dev = vt::DeviceType::kCUDA;
+    const bool pair_here = vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, dev) &&
+                           vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, dev) &&
+                           vt::TryGetBackend(vt::Device{dev, 0}) != nullptr;
     Step step({1, 2});
-    step.queue = vt::Queue{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
-    if (vt::TryGetBackend(vt::Device{vt::DeviceType::kCUDA, 0}) == nullptr) {
+    step.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+    if (!pair_here) {
       CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
-                           doctest::Contains("no CUDA backend is registered"),
+                           doctest::Contains("routed-expert keep-quant GEMM"),
                            std::runtime_error);
+    } else {
+      MESSAGE("this build registers the grouped pair on CUDA: the refusal is "
+              "correctly NOT taken, and the device arm itself is gated on "
+              "dgx:gpu0");
     }
   }
 

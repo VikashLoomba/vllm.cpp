@@ -2984,7 +2984,7 @@ labelled that way or it is wrong.
 **Evidence, measured on `c4df6dcee` (base `839ea1ced`).**
 
 Green on x86_64: `test_glm5_next_moe` **18 cases / 12,731 assertions** (13 /
-9,619 before this wave), `test_glm5_next_forward` 28 / 200,
+9,619 before this wave), `test_glm5_next_forward` 28 / 202,
 `test_glm5_next_layer` 10 / 1,656, `test_glm5_next_bridge` 20 / 32,562. The CUDA
 case reports `SKIPPED` by name on a host lane, and the harness reads that line
 rather than the exit code.
@@ -2997,7 +2997,7 @@ because a stale binary prints green:
 | M1 | the device branch is never taken (`dev` ignored) | ASSERTION kill, `CHECK( 0 > 256 )` |
 | M2 | the bridge stops publishing the three source pointers | ASSERTION kill, 5 assertions over 2 cases |
 | M3 | `DeviceBanksFit` loses its CPU clause | ASSERTION kill, same discriminator |
-| M4 | the forward stops refusing a non-CPU, non-CUDA device | ASSERTION kill, 2 assertions |
+| M4 | the forward stops refusing a device with no provider for the pair | ASSERTION kill, 4 assertions |
 | M5 | the LAYER stops threading `dev` to the MoE block | **COMPILER kill only** |
 
 **M5 IS THE WEAK ONE AND IT IS REPORTED AS WEAK.** `-Werror=unused-parameter`
@@ -3011,6 +3011,19 @@ does not have. What DOES observe it end to end is the device job's
 `[glm5-next] the routed-expert keep-quant GEMM is running on DEVICE` line, which
 is a production stderr line and not a test hook, and whose absence on a
 `--device cuda` leg means the device arm did not run. O43 records this.
+
+**THE FORWARD'S DEVICE PREDICATE ASKS THE OP TABLE, AND IT DID NOT AT FIRST.**
+For one commit it read `queue.device.type != vt::DeviceType::kCUDA`, and
+`scripts/check-device-leakage.py` red it: `DSR REGRESSION in bucket 'kcuda':
+1 > baseline 0`. The checker was right on both counts. A device name in the
+device-agnostic layer is a list that goes stale the day another backend
+registers these ops, and it answers the wrong question -- the question is
+whether THIS device has a provider for `kMoeGateUpSwiGLUGrouped` and
+`kMatmulBTQuantGrouped`, which `vt::OpRegistered` answers directly. That is the
+same move `gguf_keep_quant.cpp` made when its device list became
+`OpRegistered(kEmbeddingQuant, dev)` (`ops.h:735`). The baseline was NOT raised;
+the predicate was replaced, `kcuda` is back to 0, and the refusal now names
+which of the two providers is missing rather than naming a device.
 
 **M1 and M3 are the same discriminator and that is the point.** The two arms
 agree BIT-FOR-BIT on a CPU-backed `Dev` -- same provider, same bytes, same

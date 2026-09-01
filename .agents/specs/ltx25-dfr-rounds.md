@@ -89,6 +89,31 @@ Three options were considered.
    the workaround, and the declaration is never checked against the header
    (`docs/FEATURES.md:175`), so the lie would be undetectable — which makes it
    worse, not safer.
+
+   **BOTH anchors in that sentence are dead, re-resolved 2026-09-01 by row
+   `LTX25-ANCHOR-REPAIR`** ([`ltx25-anchor-repair.md`](ltx25-anchor-repair.md)
+   §6). `docs/USAGE.md` is 862 lines and contains no `keyframe_slot_sft` at all;
+   the topic moved to `docs/models/ltx-2-5.md`, under "Declare the checkpoint
+   family with `--checkpoint-class`". `docs/FEATURES.md:175` is worse than dead:
+   it resolves, and at `ed5ecea2e` it is a sentence about
+   `Ltx2TokenizeGemmaPrompt` and Gemma tokenization with nothing to do with
+   checkpoint classes — the shape where a stale anchor reads as evidence and
+   points at whatever now occupies the line.
+   The checkpoint-class row is the "LTX-2.5 checkpoint class" row of that
+   file's feature table.
+
+   **The REJECTION stands and the reason beneath it is now contradicted by the
+   documentation, which this row records rather than settles.**
+   `docs/models/ltx-2-5.md` now states the opposite of "never checked": *"The
+   loader checks it against the checkpoint rather than using it as an unchecked
+   hint, and refuses a missing or mismatched class before generation."* Either
+   the sentence above is stale or the document is wrong, and deciding which is a
+   read of the loader, not of an anchor. Repointing a citation at a document
+   that says the reverse of the claim it supports would be worse than leaving it
+   dead, so the disagreement is named here and owed to whoever owns the
+   checkpoint-class refusal. The workaround stays REJECTED either way: under the
+   document's version the declaration is checked and the lie is refused, which
+   is a stronger reason to reject it, not a weaker one.
 3. **Gate on reduced-dimension synthetic fixtures through the production entry
    point.** TAKEN. This is how `test_ltx2_dfr` and every DFR case in
    `test_ltx2_video` already work (`test_ltx2_video.cpp:112` returns

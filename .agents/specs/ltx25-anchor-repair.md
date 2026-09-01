@@ -41,8 +41,11 @@ OUT OF SCOPE, and each says why:
 
 ## 1. The census
 
-`.agents/specs/ltx25-*.md`, 46 files, matched with the line-anchor form of
-`check-symbol-anchors.py`'s own `CITATION_RE`:
+`.agents/specs/ltx25-*.md`, 46 files at `ed5ecea2e`, matched with the
+line-anchor form of `check-symbol-anchors.py`'s own `CITATION_RE`
+(`scripts/check-symbol-anchors.py:87-90`, an anchor this row re-resolved and
+found FRESH). Every count below is stamped with that tree, because a bare count
+in a document is a drift lock:
 
 | Class | Count |
 |---|---:|

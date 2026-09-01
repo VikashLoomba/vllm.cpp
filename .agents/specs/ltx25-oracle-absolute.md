@@ -436,16 +436,48 @@ Stop and report, do not work around:
   that flatters us, and passed. `OneStagePhase` (`ltx2_pipeline.cpp:1124-1147`)
   sets no sigmas and `OneStageRecipe` (`:1149-1163`) never assigns
   `allow_request_sigmas`, so `one_stage` takes the branch that reads `steps`.
-- **Five line anchors into `examples/ltx2_gen/main.cpp` are now STALE and cannot
-  be repaired, because they live in the append-only issue index.** Adding
-  `--steps` moved that file's later lines by +12, and
-  `.agents/issue-index.md` rows 324, 325, 356, 373 and **821** cite it by line.
-  Row 821 is this row's own #2130 entry, so one of the five is mine: the guidance
+- **Five line anchors into `examples/ltx2_gen/main.cpp` are STALE and cannot be
+  repaired in the index.** Adding `--steps` moved that file's later lines by
+  +12, and the index rows for #1096, #1097, #1151, #1191 and this row's own
+  #2130 all cite it by line. One of the five is mine: the guidance
   `never-cite-a-line-number-in-an-append-only-file` names exactly this, and I
-  wrote a line number into an append-only row anyway. AGENTS.md forbids editing a
-  row, so the correction lives here instead: **`tools/oracle/ltx2_oracle.py:88` in
-  that row should read `:89`**, and its `examples/ltx2_gen/main.cpp:306-451`
-  should read `:318-476`. Owner: this row.
+  wrote a line number into an append-only row anyway. The correction lives here
+  instead: **`tools/oracle/ltx2_oracle.py:88` in that row should read `:89`**,
+  and its `examples/ltx2_gen/main.cpp:306-451` should read `:318-476`.
+  Owner: this row.
+
+  **RE-RESOLVED 2026-09-01 by row `LTX25-ANCHOR-REPAIR`**, spec
+  [`ltx25-anchor-repair.md`](ltx25-anchor-repair.md) §4 and §5, and the paragraph
+  above is now wrong in two places rather than one.
+
+  1. **The reason it cannot be repaired changed.** `.agents/issue-index.md` was
+     RETIRED; the index is derived at read time by
+     `scripts/agent-issue-index.py --refresh` and the old file moved to
+     `.agents/completed/issue-index.md`. The rows are unreachable because that
+     directory is the FROZEN ARCHIVE, whose provenance AGENTS.md `## Records`
+     keeps and which `check-symbol-anchors.py` skips by prefix -- not because a
+     live append-only rule forbids the edit. The conclusion holds under the new
+     rule too, and the row NUMBERS are dropped above because a row number in a
+     retired file is itself an anchor into a moving document; the five rows are
+     named by their issue instead.
+  2. **One of the two corrections has expired, and it is the one that names our
+     own file.** `tools/oracle/ltx2_oracle.py:89` still reads
+     `NUM_INFERENCE_STEPS = 8`, so that half HOLDS -- the oracle script is
+     stable. `examples/ltx2_gen/main.cpp:318-476` does NOT: at `ed5ecea2e` the
+     flag loop runs past `:490`, with `--steps` at `:461` and `--seed` at
+     `:464`. Twelve days, and a correction written as a line number was wrong
+     again. Those three numbers are stamped with the tree they were read on,
+     because a coordinate written to explain why coordinates rot would otherwise
+     rot in the same paragraph.
+
+  The correction is therefore restated in a form that cannot expire, and it is
+  a form the existing gate checks. What #2130's row was pointing at is the
+  argument loop of `examples/ltx2_gen/main.cpp::main`, whose flag cases are
+  greppable by their own literals: `git grep -n '"--steps"' examples/ltx2_gen/`
+  returns exactly ONE line, the assignment to `vp.steps`. Uniqueness is the
+  property asserted, not existence -- AGENTS.md asks for the first and a line
+  number gives neither. A reader following the row wants the flag, not a
+  coordinate, and the flag string survives every insertion above it.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854) sub-question 1,
   prompt adherence, stays OPEN and is not narrowed by this row.** It needs a
   vision-language model scoring frames against the prompt, with its own

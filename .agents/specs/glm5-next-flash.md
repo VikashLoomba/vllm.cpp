@@ -2591,6 +2591,196 @@ expects, STOP and return the evidence — inventing the semantics of a learned
 pooling is worse than leaving the device arm refused. If the device gate reds,
 that is the RESULT and it lands as one.
 
+### W10 — the ROCm arm, SCOPED and PRICED on `strix:gpu0` — [#2462](https://github.com/mudler/vllm.cpp/issues/2462)
+
+Row `MODEL-MM-GLM53-FLASH-ROCM`, claim `CLAIM-GLM53-FLASH-ROCM`. This wave
+answers one question — what does ROCm cost for this model, arm by arm — and it
+writes no ROCm kernel, because the measurement that precedes the port decides
+that no kernel written here could be reached.
+
+**The device, named before any number it produced.** `strix:gpu0` is an **AMD
+Ryzen AI MAX+ 395 w/ Radeon 8060S**, `gcnArchName` **`gfx1151`**, 40 CU on the
+GPU agent, ROCm **7.2.4**, HIP `7.2.53211-97f5574fe2`, AMD clang 22.0.0git,
+PCI `1002:1586`. Every number in this section was measured there and nowhere
+else. **`gfx1151` is a third target, not either of the two this tree already
+records**: `.agents/specs/rocm-gg-keep-quant.md` measured `gfx1100` and
+`.agents/specs/rocm-gfx1200-m2-correctness.md` names `gfx1200`. A number from
+one is not a number for another, exactly as `sm_110` is not `sm_121a`.
+
+#### The finding: this model cannot be made RESIDENT on this box, in any arm
+
+Measured, not inferred. `.agents/scripts/glm53-rocm-memfit.hip`, driven by
+`.agents/scripts/glm53-rocm-memfit.sh` so the run is reproducible, mirrors
+`vt::rocm::RocmBackend::Alloc`'s managed branch (`rocm_backend.hip:177`,
+`hipMallocManaged(..., hipMemAttachGlobal)`) and walks a staircase of
+allocations, GPU-touching one byte per 2 MiB page to force physical backing and
+host-dereferencing the tail to prove the aliasing the CPU reference tier
+depends on. Compiled `--offload-arch=gfx1151` and the offload bundle asserted
+(`llvm-objdump --offloading` prints exactly
+`hipv4-amdgcn-amd-amdhsa--gfx1151`) BEFORE the run, so an empty arch manifest
+fails at configure rather than at the throw.
+
+| run | granularity | job | ceiling |
+|---|---|---|---|
+| 1 | 4 GiB | `08b6baee-4ec8-41ff-a22e-cba6c018e0c4` | **56.000 GiB**, then `hipErrorOutOfMemory` |
+| 2 | 2 GiB | `e87ec9b6-4672-468d-9eaa-1b346a1f2af6` | **58.000 GiB**, then `hipErrorOutOfMemory` |
+
+**`MAX_MANAGED_RESIDENT` is 56.000 GiB at 4 GiB granularity and 58.000 GiB at
+2 GiB granularity — two samples on two separately compiled binaries, and 56 is
+simply the last multiple of 4 below 58, so they agree. The artifact is
+101.2535 GiB.** Taking the more generous of the two, it overshoots by
+**43.2535 GiB — 1.75x** — before one byte of KV cache, activation scratch, or
+the ViT. This is reported as two runs because one would be an anecdote.
+
+**`hipMemGetInfo` is a broken instrument here and it fails toward a pass.** It
+reported `free = 63.703 GiB` unchanged across every successful allocation in
+BOTH runs, from 2 GiB resident to 58 GiB resident, and was still reporting
+63.703 GiB free at the allocation that returned out-of-memory. A residency
+budget computed from `hipMemGetInfo` on this box would have concluded 64 GiB
+was available and would have been wrong by the entire measurement. The
+staircase is the instrument; the free counter is not.
+
+For completeness, the static ceilings, also measured on the box:
+`mem_info_vram_total = 68719476736` (64.0000 GiB),
+`mem_info_gtt_total = 33519345664` (31.2173 GiB), container host RAM 62 GiB.
+Even the paper VRAM+GTT sum of 95.2173 GiB is below 101.2535 GiB; the measured
+managed ceiling is lower still.
+
+**What would have to be true for it to fit.** With the non-expert tower at its
+keep-quant 6.5688 GiB and the 311.65B routed-expert parameters taking the rest
+of 58 GiB, the experts would have to encode at **1.417 bpw** with a zero-byte
+KV cache, or **1.197 bpw** with 8 GiB of KV. The published artifact's experts
+are at **2.609 bpw**, and IQ1_S — the floor any released llama.cpp defines — is
+about 1.75. No published GLM-5.3-Flash artifact encodes below what this box can
+hold, and the sub-IQ1 encodings that could
+(`.agents/oracles/llama-cpp-unsloth.md`) have no GLM-5.3-Flash artifact.
+
+**This is a device-fit refusal, not a kernel gap**, and it is the reason this
+wave stops. Writing a ROCm MLA, k-pool, or i-quant kernel would land dead:
+nothing on this fleet's AMD device could load the weights to reach it.
+
+#### Arm by arm: what ROCm has, what this model calls, what is missing
+
+Measured on `263f6d50d`. The model makes **exactly five `vt::` op calls across
+the 2,783 lines of its seven forward-path files** (`glm5_next_{forward,layer,
+attn,dsa,kda,moe,mhc}.cpp` — the same 2,783 §W9c counts); every other primitive
+is a hand-rolled host loop over
+`std::vector<float>` with a `double` accumulator. So the op table answers only
+5/45ths of the port question, and the honest denominator is the hand-rolled
+remainder.
+
+| # | call | `file:line` | kROCM provider | kCPU provider |
+|---|---|---|---|---|
+| 1 | `vt::KdaGatedDeltaRule` | `glm5_next_kda.cpp:404` | **NONE** | `cpu_ops.cpp:4046` |
+| 2 | `vt::MoeGateUpSwiGLUGrouped` | `glm5_next_moe.cpp:131` | **NONE** | `cpu_quant_gemm.cpp:308` |
+| 3 | `vt::MatmulBTQuantGrouped` | `glm5_next_moe.cpp:137` | `rocm_ops.hip:213` | `cpu_quant_gemm.cpp:305` |
+| 4 | `vt::MoeRouterTopK` | `glm5_next_moe.cpp:264` | `rocm_ops.hip:170` | `cpu_ops.cpp:4075` |
+| 5 | `vt::MoeCombine` | `glm5_next_moe.cpp:497` | `rocm_ops.hip:206` | `cpu_ops.cpp:4077` |
+
+**All 50 ROCm registrations live in one file**, `rocm_ops.hip:117-245`; the
+other 20 `.hip` files carry zero `OpId::` and are helper kernels reached from
+those 50, or (`rocm_gemma4_*.hip`) `namespace vllm` model code that calls HIP
+directly and bypasses the registry.
+
+**The two missing providers do NOT throw on THIS box, and the reason matters
+more than the gap.** `gfx1151` reports `integrated=1, managedMemory=1,
+concurrentManagedAccess=1` — measured by this wave's probe, and already
+recorded in-tree at `rocm_backend.hip:131-138`, which names gfx1151 (Strix
+Halo) explicitly. So `UseManagedAlloc()` (`rocm_backend.hip:142`) is true,
+`unified_memory_` is true, and
+`RocmBackend::DeviceMemoryIsHostAddressable()` (`rocm_backend.hip:371`)
+returns true. That is exactly `ReferenceTierEligible`'s safety gate
+(`op_provider.cpp:888-907`), so `MaybeInstallReferenceTier`
+(`op_provider.cpp:204-225`) installs the **CPU host kernel** as a
+negative-priority provider for every unregistered ROCm op that has a CPU one.
+
+Read that carefully, because it cuts both ways and the second edge is the
+sharper one. On `strix:gpu0` all five ops above resolve — three natively, two
+through the reference tier — so **the vt op table is not this model's ROCm
+blocker.** But a reference-tier resolution is a *host* kernel running at host
+speed over managed memory; it is a correctness fallback, and counting it as
+ROCm coverage would be the "shape-valid gate passes a wrong artifact" error.
+And on a **discrete** AMD card — `rocm-gfx1200-m2-correctness.md:18`'s RX 9060
+XT is one this tree already records — `integrated=0`, the branch is provably dead,
+`DeviceMemoryIsHostAddressable()` is false, and those same two ops throw. The
+ROCm arm therefore has two different answers depending on the card, and this
+spec records both rather than the convenient one.
+
+| arm | layers | what ROCm has | what the model calls | missing |
+|---|---|---|---|---|
+| KDA linear attention | 34 | no `kKdaGatedDeltaRule`; `kCausalConv1dFwd` `rocm_ops.hip:222`, `kGdnPostConv` `:228`, `kGdnPrefill` `:231`, `kGdnDecode` `:233`, `kRmsNormGated` `:235`, `kGdnStateGather/Scatter` `:216,:219` | 1 vt op (`glm5_next_kda.cpp:404`) + ~10 hand-rolled primitives (`:28-47` matvec, `:69-139` forget gate, `:143-186` gated norm, `:190-208` L2, `:231-300` conv) | the ROCm KDA provider, plus every hand-rolled primitive |
+| DSA / MLA | 11 | **NOTHING.** `kMlaDecodeAttention` (121), `kMlaPrefillAttention` (122), `kConcatAndCacheMla` (120), `kGatherMlaCache` (132), `kMergeAttnStates` (133), `kDsaIndexerLogits` (130), `kDsaTopkSelect` (131) all kROCM NONE | **zero `vt::` calls** — `grep -c 'vt::' glm5_next_attn.cpp glm5_next_dsa.cpp` = 0/0. Eager attention hand-rolled at `glm5_next_attn.cpp:403-443` | the whole arm, on every backend |
+| k-pool compress/select | — | `kGlm5NextKpoolCompress`/`Select` are **CUDA-only** (`cuda_glm5_next.cu:561,564`), and have **no CPU provider**, so the reference tier cannot rescue them even here | hand-rolled at `glm5_next_dsa.cpp:168-305` (compress) and `:382-532` (select); the device ops are never called (O36) | a ROCm k-pool, and a CPU one before the tier could help |
+| mHC manifold | all | **NOTHING.** `kDeepseekV4Mhc` (294) is CUDA-only (`cuda_deepseek_v4.cu:2102`) with **no CPU provider** (O34) | zero `vt::` calls; `glm5_next_mhc.cpp:22-88` delegating to `deepseek_v4_mhc.cpp:72-165`, per-token, `std::vector` slabs allocated inside the loop | everything, and O34's inverted gap bites here too |
+| MoE 288+1 | 43 blocks | 3 of 4 ops native (`rocm_ops.hip:170,206,213`); `kMoeGateUpSwiGLUGrouped` NONE | 4 vt ops; router-logits GEMM, shared expert and dense MLP hand-rolled (`glm5_next_moe.cpp:200-210, 291-325`) | one provider; **best-served arm by far** |
+| ViT | 24 | n/a | **does not exist.** No vision forward file; `glm5_next_loader.cpp:519-526` refuses any config declaring `vision_config` | the whole tower (W6), on every backend |
+| keep-quant residency | — | Q8_0/Q4_K/Q5_K/Q6_K only | this artifact is IQ2_XS/IQ3_XXS/IQ4_XS/Q2_K/Q3_K | see below — **the exact blocker** |
+
+#### `rocm_grouped_gemm.hip` serves exactly what the predicate claims — do NOT widen it
+
+The obvious cheap slice was to widen `DeviceKeepQuantSupported`'s ROCm arm
+(`gguf_keep_quant.cpp:128-140`). **Measured, and refused.** The kernel
+implements four dot products and no more: `DotQ8_0`
+(`rocm_grouped_gemm.hip:182`), `DotQ4K` (`:191`), `DotQ5K` (`:225`), `DotQ6K`
+(`:261`), dispatched at `:641,:657` (non-grouped) and `:712,:734` (grouped),
+with everything else falling to a `throw` at `:692` and `:761`. There is no
+IQ2_XS, IQ3_XXS, IQ4_XS, Q2_K or Q3_K path of any kind. **The predicate is
+exactly as wide as the kernel**, and widening it would make the loader keep
+blocks it cannot execute and throw at first forward with the model resident —
+which is precisely the regression `.agents/specs/rocm-gg-keep-quant.md` was
+written to repair. A predicate that claims more than the kernel does is worse
+than a narrow one, so this wave leaves it alone and records why.
+
+The cost of that honesty, by the census in §W9a, is exact and total:
+
+| encoding | tensors | on disk | ROCm keep-quant |
+|---|---:|---:|---|
+| IQ2_XS | 82 | 53.3320 GiB | **no** |
+| IQ3_XXS | 41 | 35.3145 GiB | **no** |
+| IQ4_XS | 3 | 3.5859 GiB | **no** |
+| Q2_K | 2 | 1.4766 GiB | **no** |
+| Q3_K | 1 | 0.9668 GiB | **no** |
+| Q5_K | 181 | 3.0286 GiB | yes |
+| Q6_K | 117 | 2.1966 GiB | yes |
+| Q8_0 | 346 | 0.8013 GiB | yes |
+| Q4_K | 1 | 0.3323 GiB | yes |
+
+The five unservable encodings sum to **94.6758 GiB**, which is to four decimal
+places the routed-expert total §W9a measured independently (94.6758 GiB). That
+is not a coincidence worth glossing: **every byte ROCm cannot keep quantized is
+a routed expert, and every routed expert is a byte ROCm cannot keep
+quantized.** ROCm can keep 6.3588 GiB of 101.0346 GiB quantized — **6.29%**.
+The other 94.6758 GiB takes its pre-existing `expand_bf16` residency, 580.50
+GiB, for a total of 587.07 GiB — **10.1x the measured 58 GiB ceiling.**
+
+#### Scope and price of what is NOT done here
+
+Priced so the option is a decision rather than a vague debt. None is started.
+
+1. **Five i-quant/k-quant ROCm dot kernels** (IQ2_XS, IQ3_XXS, IQ4_XS, Q2_K,
+   Q3_K) on both the grouped and non-grouped arms, against the CPU keep-quant
+   oracle at the NMSE<=5e-4 bar `rocm-gg-keep-quant.md` already sets. This is
+   `rocm-gg-keep-quant.md`'s owed list and it is that row's to take, not this
+   one's. It is a prerequisite for any ROCm arm of this model and it is **not
+   sufficient**, because of the residency ceiling above.
+2. **A ROCm MLA/DSA family** — seven op ids, none registered. Not a wave.
+3. **A ROCm k-pool**, which needs a CPU provider first if the reference tier is
+   ever to answer for it.
+4. **mHC on any device but CUDA**, which O34 already records as inverted.
+5. **The refusals themselves.** `glm5_next_forward.cpp:231-238`,
+   `glm5_next_kda.cpp:322-325` and `glm5_next_moe.cpp:222-225` each carry a
+   `queue.device.type == kCPU` guard, verified present on `origin/main`. This
+   wave leaves all three standing. It claims only that they EXIST, not that
+   they are what stops a device run: W5b-2d measured the first one unreached on
+   the real artifact, because the engine dies earlier in the KV binding. On
+   ROCm the question does not arise, since residency fails before any forward.
+
+**Stop condition, and it fired.** The wave was scoped to land the cheapest
+complete slice if the map showed one. The map shows that the only cheap slice —
+widening the keep-quant predicate — is a lie the kernel does not support, and
+that every expensive slice is unreachable on the one AMD device this fleet has.
+The correct result is the map and the refusal, and it lands as one.
+
 ## Tests to port
 
 `tests/models/` in transformers `v5.16.1` is the upstream suite. What is
@@ -4636,7 +4826,107 @@ Debts this row carries, each visible rather than waived:
   measures the registered provider and not a directly-called kernel, and proves
   nothing about a capability. Read it that way.
 
+- **O40 — THE ROCm ARM IS BLOCKED ON DEVICE FIT, NOT ON KERNELS, and the fleet's
+  only AMD device was measured rather than assumed.** `strix:gpu0` (`gfx1151`,
+  ROCm 7.2.4) holds at most **58.000 GiB** of `hipMallocManaged` memory —
+  measured twice, at 2 GiB and 4 GiB granularity, jobs
+  `e87ec9b6-4672-468d-9eaa-1b346a1f2af6` and
+  `08b6baee-4ec8-41ff-a22e-cba6c018e0c4`. The artifact is 101.2535 GiB, so it
+  overshoots by 1.75x in its BEST case, in which every missing ROCm keep-quant
+  kernel has already been written. In the case that actually obtains today it
+  overshoots by 10.1x, because the five encodings ROCm cannot keep quantized are
+  exactly the 129 routed-expert tensors and they expand to 580.50 GiB. Owed
+  against an AMD device that can hold ~101 GiB, or against a published
+  GLM-5.3-Flash artifact whose experts encode below ~1.2 bpw, and neither exists
+  today. Tracked by [#2462](https://github.com/mudler/vllm.cpp/issues/2462).
+  **This entry is why no ROCm kernel was written**: on this fleet a ROCm MLA,
+  k-pool or i-quant kernel would land dead, with no device able to load the
+  weights that would reach it. W10 carries the arm-by-arm map and the price of
+  each piece.
+- **O41 — THE ROCm KEEP-QUANT PREDICATE MUST NOT BE WIDENED, and this entry
+  exists so the next reader does not repeat the attempt.**
+  `DeviceKeepQuantSupported`'s ROCm arm (`gguf_keep_quant.cpp:128-140`) admits
+  Q8_0/Q4_K/Q5_K/Q6_K, and `rocm_grouped_gemm.hip` implements exactly four dot
+  products — `DotQ8_0` (`:182`), `DotQ4K` (`:191`), `DotQ5K` (`:225`), `DotQ6K`
+  (`:261`) — dispatched at `:641,:657,:712,:734` and throwing at `:692,:761`
+  otherwise. The predicate is exactly as wide as the kernel. Widening it to
+  reach this artifact's IQ2_XS/IQ3_XXS/IQ4_XS/Q2_K/Q3_K would keep blocks the
+  device cannot execute and throw at first forward with the model resident,
+  reintroducing the regression `.agents/specs/rocm-gg-keep-quant.md` was written
+  to repair. The five kernels remain owed to THAT row, not to this one.
+- **O42 — THE ROCm REFERENCE-TIER FALLBACK MAKES THIS MODEL'S TWO MISSING
+  PROVIDERS INVISIBLE ON AN APU AND FATAL ON A dGPU, and a coverage claim must
+  say which.** `kKdaGatedDeltaRule` and `kMoeGateUpSwiGLUGrouped` — 2 of the 5
+  `vt::` ops this model calls — have no ROCm provider. On `gfx1151`
+  `integrated=1, managedMemory=1, concurrentManagedAccess=1` (measured by W10's
+  probe; already stated in-tree at `rocm_backend.hip:131-138`), so
+  `UseManagedAlloc()` (`:142`) and `DeviceMemoryIsHostAddressable()` (`:371`)
+  are true, `ReferenceTierEligible` (`op_provider.cpp:888`) passes, and
+  `MaybeInstallReferenceTier` (`:204`) silently installs the CPU HOST kernel for
+  both. They therefore resolve on this box at host speed, and a gate that only
+  asks "did it run" would score them as ROCm coverage. On a discrete AMD card
+  `integrated=0`, the branch is provably dead, and both throw. That case is not
+  hypothetical in this tree: `.agents/specs/rocm-gfx1200-m2-correctness.md:18`
+  records an AMD Radeon RX 9060 XT, `gfx1200`, Navi 44, called "discrete" there
+  in as many words. Any future ROCm claim on this row states which of the two
+  devices it measured.
+
 ## Now
+
+`ACTIVE`, 2026-09-01. **The ROCm arm is SCOPED and BLOCKED ON DEVICE FIT, and
+the block was measured on the box rather than inferred from a spec sheet.**
+W10 (`CLAIM-GLM53-FLASH-ROCM`, row `MODEL-MM-GLM53-FLASH-ROCM`, issue
+[#2462](https://github.com/mudler/vllm.cpp/issues/2462)) writes no ROCm kernel.
+The row's lifecycle state does not move, because O1 does not. The CUDA
+device-arm waves are untouched by this and remain the next actions there.
+**This section deliberately does not repeat the "`--device cuda` still refuses
+by name at `glm5_next_forward.cpp:231-238`" sentence**, because W5b-2d
+falsified it on the real artifact: the guard exists in the source, and the
+engine never reaches it, dying earlier in the KV binding. W10 asked nothing of
+that guard — the ROCm arm stops on residency, which is upstream of any forward.
+
+**`strix:gpu0` is `gfx1151`** — AMD Ryzen AI MAX+ 395 w/ Radeon 8060S, ROCm
+7.2.4 — and it is a THIRD target, not `gfx1100` (`rocm-gg-keep-quant.md`) and
+not `gfx1200` (`rocm-gfx1200-m2-correctness.md`). Every W10 number is attributed
+to it.
+
+**THE MEASUREMENT THAT ENDS THE WAVE.** The box holds at most **58.000 GiB** of
+`hipMallocManaged` memory, measured twice on two separately compiled binaries
+(2 GiB granularity, job `e87ec9b6`; 4 GiB granularity, job `08b6baee`, which
+read 56.000 GiB — the last multiple of 4 below 58, so the two agree). The
+artifact is **101.2535 GiB**. It overshoots by **1.75x in the best imaginable
+case**, the one where every missing ROCm keep-quant kernel has already been
+written, and by **10.1x in the case that obtains today**. To fit, the experts
+would have to encode at ~1.2 bpw against the published 2.609. **So a ROCm MLA,
+k-pool or i-quant kernel written now would land dead**, and O40 records that as
+the reason none was written.
+
+**`hipMemGetInfo` fails toward a pass on this box and would have hidden it.** It
+reported `free = 63.703 GiB` unchanged from 2 GiB resident all the way to 58 GiB
+resident, and was still reporting 63.703 GiB free at the call that returned
+out-of-memory. A budget computed from it would have been wrong by the entire
+measurement. The staircase is the instrument.
+
+**The cheap slice was refused on evidence.** W10 was scoped to widen
+`DeviceKeepQuantSupported`'s ROCm arm if the kernel supported it. It does not:
+`rocm_grouped_gemm.hip` implements exactly `DotQ8_0`/`DotQ4K`/`DotQ5K`/`DotQ6K`
+and throws on everything else, so the predicate is already exactly as wide as
+the kernel and widening it would be a lie that throws at first forward. O41
+records that so the attempt is not repeated.
+
+**Two findings the arm-by-arm map turned up that outlive this wave.** The model
+makes **exactly five `vt::` op calls across the 2,783 lines of its seven
+forward-path files** — `glm5_next_attn.cpp` and `glm5_next_dsa.cpp` contain
+**zero** — so the op-provider table answers only a
+small fraction of any device port, and the honest denominator is the hand-rolled
+remainder. And two of those five ops have no ROCm provider yet do not throw on
+`gfx1151`, because it is an APU: `DeviceMemoryIsHostAddressable()` is true there
+(`rocm_backend.hip:371`), so the CPU host kernel is silently installed as a
+reference-tier provider. The same two ops throw on a discrete AMD card. O42
+names both edges, because a ROCm coverage claim that does not say which device
+it measured is not a claim.
+
+### Before the ROCm scoping
 
 `ACTIVE`, 2026-08-31. **The k-pool indexer has a device implementation, and it
 is the first kernel this campaign has had to write.** W9c-0

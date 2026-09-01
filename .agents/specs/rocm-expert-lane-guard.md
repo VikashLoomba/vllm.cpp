@@ -293,4 +293,93 @@ neither attributable.
 
 ## Now
 
-`ACTIVE`.
+`ACTIVE`. The predicate repair is implemented, gated on `strix:gpu0`, and
+correct. The bar the row was raised to — GLM-5.3 generating text on that board —
+is NOT met, and §`## What the hardware said` records why with evidence.
+
+## What the hardware said
+
+Measured on `strix:gpu0`, `gfx1151`, ROCm 7.2.4, rc job
+`b36f58f0-958d-4078-93d0-6d073e2c46e2`, log
+`/workspace/glm53-lanefix/out/run.log`.
+
+**The repair works and is proven.** On a HIP build of this branch: with the one
+line reverted, 2 of 20 cases fail, and they are exactly the two new lane cases,
+failing because the whole 8464-byte table is charged and no lane note is emitted.
+With the line restored, 20 of 20 cases and 94 of 94 assertions pass. Deleting the
+production lane block reds 4 cases — the two new ones plus the two pre-existing
+CUDA-shape W0d lane cases — so the tests enter through the production loader and
+not through a hand-built predicate. `test_platform` is 17 of 17 and 133 of 133,
+so no platform's answer to either predicate moved.
+
+**The model still does not load, and the lane guard was never the only blocker.**
+Two further conditions are false on this board, both independently of the
+predicate this row repairs, and both already measured before #2507 was filed:
+
+- `host_memory_is_device_addressable()` is FALSE. It reads
+  `integrated && pageable_memory_access` (`rocm_backend.hip:474-481`), and
+  `pageableMemoryAccess=0` on `gfx1151` — recorded at
+  `.agents/specs/rocm-glm53-dsa.md:29` and measured at
+  `/mnt/nas_share/rc/glm53-rocm/out2/probe2.log:55`. #2507 asserted this
+  condition was satisfied, citing `managedMemory=1 concurrentManagedAccess=1`;
+  those are the inputs to `UseManagedAlloc`, a different predicate. Filed as
+  #2515.
+- `GgufExpertTowersReachSlotLane()` is FALSE. ROCm registers no IQ `vec_dot`, so
+  `RouteGgufTensor` answers `kExpandBf16` for the IQ2_XS/IQ4_XS
+  `kStackedExpertWeight` towers this checkpoint stores its experts in. This also
+  makes `test_gguf_device_fit` RED on any ROCm build, 1 case and 2 assertions,
+  pre-existing on `main`. Filed as #2516.
+
+The second of those is a kernel-coverage gap and is closable. **The first is
+physical.** The same predicate gates the lane at RUNTIME — `ExpertSlice`
+(`expert_stream_seam.cpp:431`) serves from a `std::vector<uint8_t>` arena only
+when `cpu || host_memory_is_device_addressable()` — so a device kernel on this
+board may not dereference the slot store at all. Forcing the lane on would delete
+a correct refusal and restore the load-then-die shape #1123 exists to prevent.
+**The host-slot streaming lane is not a mechanism that can work on Strix Halo**,
+and the bar's requirement that the lane's fill/served/bytes counters be present
+is therefore unreachable here. It needs a device-side slot store
+(`ENG-EXPERT-STREAM-DEVICE` W2), which is a different row.
+
+**A trap worth recording.** The refusal's printed footprint cannot be used to
+infer that keep-quant applied. `StagedBytes` (`gguf_device_fit.cpp:41-57`)
+charges `min(expanded, on-disk)`, and for a sub-2-bit encoding the expanded size
+is far larger, so the number equals the on-disk size whether the tower is kept or
+expanded. Reading 216433205760 B as evidence of keep-quant routing is wrong, and
+this row made that inference before checking `StagedBytes` and had to withdraw it.
+
+## The two adjacent defects, disposition REVISED
+
+Filed, not fixed here — but the reasoning has changed and the reader should have
+the current version rather than the one written before the hardware answered.
+
+They were expected to be non-load-bearing because the lane would carry the model.
+The lane cannot. With streaming unavailable on this board, the hybrid MoE
+placement is the ONLY remaining mechanism that could fit this checkpoint on
+`gfx1151`, which makes both defects part of the critical path rather than beside
+it:
+
+- **A**, the placement/fit disagreement (#2517): the plan reports the model
+  63.92 GiB, under budget by 81 MiB, and the refusal on the next line quotes the
+  un-reduced 201.56 GiB.
+- **B**, the budget source (#2518): 68719476736 B from `hipMemGetInfo` against a
+  measured 62277025792 B `hipMallocManaged` ceiling. The two interact — A's own
+  reduced figure sits ABOVE B's real ceiling — so honouring the plan without
+  correcting the budget would move the failure from load time to allocation time
+  rather than remove it.
+
+They stay out of this row anyway, and the reason is unchanged: A is a design
+question about whether a resolved placement plan is an input to the footprint or
+a consumer of its verdict, and B changes what
+`device_memory_total_bytes` means for every ROCm load on every model. Each wants
+its own row, spec and hardware evidence. Bundling either into a one-predicate
+repair would make neither attributable.
+
+## Owed (revised)
+
+- #2515 — the device-side expert slot store, the only lane mechanism that does
+  not depend on `pageable_memory_access`.
+- #2516 — IQ `vec_dot` for ROCm, or a platform scope on the test case that is
+  currently red for an unstated reason on every ROCm build.
+- #2517 and #2518 — the two adjacent defects, now the critical path to a load on
+  this board.

@@ -3211,17 +3211,26 @@ to make this model correct.
 The hermetic gate cannot prove the diagnosis, only the property. The diagnosis
 is proved on the box, by a leg that changes NOTHING but where the pages live:
 
-| leg | binary | device | env | expected if the diagnosis holds |
-|---|---|---|---|---|
-| A | base `3cd467643` | cuda | `VT_GLM5_NEXT_DEVICE_EXPERTS=1 VT_DEVICE_KV_CACHE=0` | ` Paris.`, rc=0 |
-| B | base `3cd467643` | cuda | `VT_GLM5_NEXT_DEVICE_EXPERTS=1` | SIGSEGV, rc=139 (the reproduction) |
-| C | fixed | cuda | `VT_GLM5_NEXT_DEVICE_EXPERTS=1` | ` Paris.`, rc=0 |
-| D | fixed | cpu | — | ` Paris.`, rc=0, byte-identical to C |
+**RUN 1 IS TAKEN and legs A and B are SETTLED** (O50): B died with SIGSEGV at
+`StoreCaches` with the whole call chain named, and A survived at rc=0 in 1756 s
+with one variable moved. **Legs C and D did not run**, because the job's identity
+guard hashed `vllm-cli` alone and refused a pair whose `libvllm.so` genuinely
+differed (O51). Run 2 carries the repaired predicate and these legs:
 
-A alone is the discriminator: it moves the pages to host memory and changes
-nothing else, so an A that survives while B dies puts the fault in the page
-residency and nowhere else. C is the fix. D is the control that says the fix did
-not change the host arm.
+| leg | binary | device | env | the question it answers |
+|---|---|---|---|---|
+| D | fixed | cpu | -- | the OPERAND, from this binary on this box; taken FIRST |
+| C | fixed | cuda | `VT_GLM5_NEXT_DEVICE_EXPERTS=1` | **the merge criterion**: rc=0 and byte-identical to D |
+| E | fixed | cuda | + `VT_ASYNC_DEVICE_MIRROR=0` | is the stale decode input id the second-token cause? |
+| F | fixed | cuda | `--max-tokens 1` | prefill against decode, separated by construction |
+| G | base | cuda | `VT_DEVICE_KV_CACHE=0` | run 1's leg A, repeated WITHIN run 2 |
+
+C is the fix. D is the operand every other leg is byte-compared against, taken
+from the same binary on the same box, because the ` Paris.` in the records came
+from a different build and is not a byte operand. E, F and G separate the
+second-token question O52 opens -- and none of them is a discriminator unless it
+RUNS: the obvious one, unsetting `VT_GLM5_NEXT_DEVICE_EXPERTS`, emits no token,
+because without it the forward refuses a non-CPU queue by name.
 
 **No speed number is admissible from any of them** (O47: 89% generation spread
 across three identical legs, cause unknown), and none is claimed.
@@ -3268,7 +3277,11 @@ and they are not the reachability proof, which is why both are kept.
 #### Stop conditions
 
 * If leg A dies too, the diagnosis is wrong: report it, keep O46 open, and do
-  not ship the change on a hermetic gate alone.
+  not ship the change on a hermetic gate alone. **DISCHARGED: A survived at rc=0
+  and B's backtrace names `StoreCaches` -- O50.**
+* If leg C emits a token but does not match leg D byte-for-byte, the CRASH is
+  fixed and the SECOND-TOKEN question (O52) is open. Those are two results, and
+  the first is not reported without the second beside it.
 * If a fifth arm of this model turns out to host-dereference engine device
   memory, that is a wider residency question than this wave, and it goes back as
   `NEEDS_DECISION` rather than being absorbed here.

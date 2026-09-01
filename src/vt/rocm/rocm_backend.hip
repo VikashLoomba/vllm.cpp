@@ -225,6 +225,34 @@ class RocmBackend final : public Backend {
     Check(hipStreamSynchronize(AsStream(q)), "hipStreamSynchronize");
   }
 
+  // Drains without a Queue in hand, for the portable CPU reference tier
+  // (#2498). `GetOp` calls this before returning a reference-tier kernel
+  // (op_provider.cpp:707-711), as does the decline path (762-765), because that
+  // kernel is a HOST function that reads and writes DEVICE memory directly.
+  //
+  // The `{}` default in vt/backend.h documents itself as suiting "every backend
+  // that submits eagerly". HIP submits eagerly and COMPLETES asynchronously:
+  // CreateQueue above builds a genuine hipStreamCreate stream, so work is still
+  // in flight when the host regains control. Inheriting the default therefore
+  // let a host kernel read managed memory that device kernels were still
+  // writing, with nothing ordering the two. Metal (metal_backend.mm) and Vulkan
+  // (vulkan_backend.cpp) both override this; ROCm was the only backend
+  // reporting DeviceMemoryIsHostAddressable() that did not.
+  //
+  // hipDeviceSynchronize rather than a stream sync BECAUSE there is no Queue
+  // here: the tier's caller cannot say which stream produced the bytes it is
+  // about to read, and this backend hands out a fresh stream per CreateQueue.
+  // Waiting on the device waits on all of them.
+  //
+  // Cost is confined to the path that needs it. The call site is guarded by
+  // `slot.ref_selected` (op_provider.cpp:707), so a run that reaches no
+  // reference-tier op never calls this at all, and a discrete AMD board never
+  // installs the tier in the first place.
+  void FlushPending() override {
+    Check(hipSetDevice(device_), "hipSetDevice");
+    Check(hipDeviceSynchronize(), "hipDeviceSynchronize");
+  }
+
   // --- hipGraph capture/replay (BACKEND-ROCM W1) ------------------------------
   // The hipGraph mirror of cuda_backend.cu's capture block, call for call. Every
   // name below is a long-stable HIP runtime API with the same signature and

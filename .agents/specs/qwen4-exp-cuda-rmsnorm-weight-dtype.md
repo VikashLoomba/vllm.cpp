@@ -186,10 +186,23 @@ released UD-IQ1_S artifact (72,546,461,344 bytes, shard-1 sha256
 `88a1420825a9…`, verified before any arm ran). Binary sha256 `70e522df28d7…`
 built for `sm_110` from `e934fb002` (1662 s, `cuda_libs=2`, `cu_objects=41`).
 
-Focused test on the device: `rc=0`, `assertions=4`, `skip_lines=0`,
-`CUDA ARM EXERCISED: YES`. **That run was of the PREVIOUS revision of the test**,
-which pinned only the bf16-activation/f32-gamma pairing. The three cases above
-have not yet been run on a device.
+**The three cases above have run on a device**, at this head, on `thor:gpu0`
+with the CUDA architecture PROBED from the device rather than guessed (`110`):
+
+```
+TEST SOURCE: case1=1 case2=1 case3=1 prodH256=1
+UNIT rc=0 assertions=9 skip_lines=0
+UNIT CUDA ARMS EXERCISED: YES
+[doctest] test cases: 5 | 5 passed | 0 failed | 0 skipped
+[doctest] assertions: 9 | 9 passed | 0 failed |
+```
+
+Nine is the exact expected count (2 + 2 + 1 + 2 + 2), which is what makes
+`0 skipped` mean something. The kF16 case threw the message it claims to pin:
+`vt: cuda rmsnorm: unsupported weight dtype (f32/bf16 only), got f16`.
+
+An earlier device run reported `assertions=4`; that was the PREVIOUS revision of
+the test, which pinned only the bf16-activation/f32-gamma pairing.
 
 | arm | `CUDA_LAUNCH_BLOCKING` | outcome | wall | IMA | refusal |
 |---|---|---|---|---|---|
@@ -211,6 +224,27 @@ CPU : 11751 13 15767 411 2029 11 1092 369  " Paris. Given this fact, what is"
 Token 0 agrees; tokens 1-7 do not. That is
 [#2496](https://github.com/mudler/vllm.cpp/issues/2496). The CPU sequence is the
 control recorded by the previous wave and was **not** re-measured here.
+
+**#2496 and #2476 are TWO defects, and the tempting shared-cause reading is
+DISPROVED.** I proposed that one out-of-bounds read explained both, faulting when
+the overrun hit an unmapped page and returning garbage when it hit a mapped one.
+The TOKENDIV wave measured #2496's serialized token sequence as **bit-stable
+across builds** — byte-identical to a run of a different binary on a different
+tree. A single defect cannot be both bit-reproducible across builds and
+suppressible by serialisation. That bit-identity also rules out the whole
+async-copy and ordering class as a cause of #2496.
+
+#2496 is therefore **deterministic and structural, not timing-dependent**, and
+its cause is unknown. Any candidate must explain a correct token 0 **and** a
+bit-stable wrong decode, which points at an extent depending on **token count**
+(prefill `T=5` versus decode `T=1`) rather than on timing. The GDN QKVZ over-read
+stays the leading candidate on those grounds, and the GDNGEMM wave is testing it
+by printing operand extents at both token counts.
+
+**#2488 is excluded as a cause of #2496**: `q_f32` has no device branch and no
+prefill/decode fork, so it was present on the CORRECT CPU run too. #2488 remains
+the cause of #2477. Both statements are true and they are about different
+defects.
 
 [#2476](https://github.com/mudler/vllm.cpp/issues/2476) did not dissolve.
 `compute-sanitizer memcheck` localised it to a cuBLASLt GEMM reading out of
@@ -257,8 +291,9 @@ A further wall after #2477 clears is a reportable result, not a failure.
   `cuda_ops.cu:578` `RmsNormQuantFp8KernelCuda` (latent).
 - [#2476](https://github.com/mudler/vllm.cpp/issues/2476), localised, still
   blocking the gate.
-- [#2496](https://github.com/mudler/vllm.cpp/issues/2496), the token divergence.
-- A device run of the three test cases as they now stand.
+- [#2496](https://github.com/mudler/vllm.cpp/issues/2496), the token divergence —
+  a SECOND defect, deterministic and structural, cause unknown. Not this change's
+  and not #2476's.
 - A CI lane that executes GPU tests. Until one exists, every `[SKIP]`ped CUDA arm
   in this suite is documentation of intent rather than an executing gate.
 

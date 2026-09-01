@@ -1239,6 +1239,24 @@ target_compile_definitions(test_dots3_note_attn PRIVATE
 # Same model-private-header arrangement as the scaffold gate above.
 target_include_directories(test_dots3_note_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# dots3-note W6a (#2512, spec §4.11): the DENSE VISION TOWER against an
+# INDEPENDENT double-precision reference written from vLLM `nvidia/vision.py` +
+# `nvidia/vision_attention.py` at `9035151d6`, plus the config traps, the
+# refuse-by-name table, the 235-tensor enumeration and the image processor.
+#
+# A CONSISTENCY gate and not a correctness one, and the file says so in its own
+# header: spec §6.4 option B records that NO oracle for this model runs on any
+# hardware this project owns, so nothing here is compared against vLLM and no
+# performance number is claimable. CPU-only, no checkpoint download, no GPU.
+vllm_cpp_add_test(test_dots3_note_vision vllm/models/test_dots3_note_vision.cpp)
+target_compile_definitions(test_dots3_note_vision PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+# Same model-private-header arrangement as the two gates above: dots3_note.h and
+# dots3_note_vision.h live under src/, because W1 ships nothing on the public ABI
+# and include/vllm/ is a USER_USAGE_PREFIXES surface (#515).
+target_include_directories(test_dots3_note_vision PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 # Nemotron-H (NemotronHForCausalLM) W3 STRUCTURAL gate (#517,
 # .agents/specs/nemotron-h-model.md §4 W3): registry-resolve + config descent off
 # the REAL released config.json (52-entry layers_block_type schedule, the legacy
@@ -2180,6 +2198,20 @@ if(VLLM_CPP_SERVER)
   # fixture (one whose added tokens are the vision markers).
   vllm_cpp_add_test(test_openai_api_server_mm_forward
     vllm/entrypoints/openai/test_api_server_mm_forward.cpp)
+  # dots3-note W6a (#2512): the SERVED image request for the SECOND multimodal
+  # architecture, end to end through the same production chain. Its own target
+  # for the same reason the Qwen3-VL one has one: a different model (a registry
+  # LoadedModel carrying a dots3-note DENSE vision tower, loaded from a
+  # synthetic on-disk checkpoint) and a different tokenizer fixture (one whose
+  # added tokens are dots3-note's own image markers).
+  vllm_cpp_add_test(test_openai_api_server_dots3_mm_forward
+    vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp)
+  target_compile_definitions(test_openai_api_server_dots3_mm_forward PRIVATE
+    DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+  # The tiny-checkpoint fixture header lives beside the model gates, and
+  # dots3_note.h is a MODEL-PRIVATE header under src/ (#515).
+  target_include_directories(test_openai_api_server_dots3_mm_forward PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
   # #1982: WHEN the first chat SSE frame reaches the client. Its own target so
   # the gated-runner fixture cannot perturb the keepalive suite's timings, and
   # inside this guard because it drives the production ApiServer dispatch,

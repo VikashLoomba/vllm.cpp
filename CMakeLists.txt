@@ -808,6 +808,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dots3_note.cpp
   src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_device.cpp
+  src/vllm/model_executor/models/dots3_note_vision.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
@@ -1080,6 +1081,7 @@ add_library(vllm STATIC
   # Per-modality input-count limits and the refusal they carry
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp
+  src/vllm/multimodal/dots3_note_processor.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
@@ -1243,6 +1245,7 @@ add_library(vllm STATIC
   # registry, and Qwen3-VL's registration into it. The registration TU is
   # SELF-REGISTERING and is reached through vllm's INTERFACE --whole-archive.
   src/vllm/entrypoints/openai/mm_chat_registry.cpp
+  src/vllm/entrypoints/openai/mm_chat_dots3note.cpp
   src/vllm/entrypoints/openai/mm_chat_qwen3vl.cpp
   src/vllm/entrypoints/openai/serving_utils.cpp
   src/vllm/entrypoints/openai/serving_completion.cpp

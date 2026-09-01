@@ -169,15 +169,61 @@ class Spectrum(unittest.TestCase):
         return 128.0 + 100.0 * np.sin(2.0 * np.pi * f * x) * np.ones((h, 1))
 
     def test_a_pure_sinusoid_lands_in_the_bin_that_names_its_frequency(self):
-        for f in (0.08, 0.19, 0.33):
-            c, p = D.radial_power(self._sine(f), None, nbins=64)
+        # RAW, because this case is about the radial BINNING and nothing else.
+        # `periodic_component` deliberately injects a low-frequency counter-term
+        # whose size scales with the boundary jump, and a high-frequency sinusoid
+        # is almost all boundary jump, so under that convention the counter-term
+        # outweighs the signal's own ring mean and the peak lands in bin 0. That
+        # is the decomposition behaving correctly on a pathological fixture, not
+        # a binning defect, and `test_the_periodic_counter_term_is_real` below
+        # pins it as a known property rather than leaving it to be rediscovered.
+        for f in (10 / 128, 24 / 128, 42 / 128):
+            c, p = D.radial_power(self._sine(f), None, nbins=64, convention="raw")
             self.assertAlmostEqual(float(c[int(np.nanargmax(p))]), f, delta=0.012,
                                    msg=f"peak misplaced for f={f}")
 
+    def test_the_periodic_counter_term_is_real_and_scales_with_the_boundary(self):
+        # WHY THE REPORTED ESTIMATOR IS WELCH AND NOT THIS. `p = u - s` removes
+        # the wrap step exactly, but `s` carries it into a low-frequency
+        # counter-term, and the two renders do not share a boundary jump -- so
+        # this convention is not neutral between them either.
+        x = np.arange(128)[None, :]
+        hi_f = 128.0 + 100.0 * np.sin(2 * np.pi * (24 / 128) * x) * np.ones((96, 1))
+        c, p = D.radial_power(hi_f, None, nbins=64, convention="periodic")
+        self.assertLess(float(c[int(np.nanargmax(p))]), 0.05,
+                        "the counter-term no longer dominates; the note in "
+                        "welch_psd's docstring and this row's Outcome would "
+                        "need re-deriving")
+
     def test_the_dc_term_is_not_reported_as_signal(self):
         flat = np.full((96, 128), 200.0)
-        _, p = D.radial_power(flat, None, nbins=32)
+        _, p = D.radial_power(flat, None, nbins=32, convention="raw")
         self.assertLess(float(np.nansum(p)), 1e-6)
+
+    def test_welch_never_sees_the_frame_border(self):
+        # THE PROPERTY THE WHOLE CORRECTION RESTS ON. Paint a cliff into the
+        # outermost rows and columns only. A whole-frame estimator's answer moves;
+        # Welch's interior tiles must not see it at all.
+        rng = np.random.default_rng(31)
+        base = rng.integers(60, 190, (192, 320, 3), dtype=np.uint8)
+        edged = base.copy()
+        edged[0, :, :] = 0; edged[-1, :, :] = 255
+        edged[:, 0, :] = 0; edged[:, -1, :] = 255
+        r = D.tile_freq_grid(); hi = (r >= 0.20); nz = r > 0
+        a = D.welch_psd([base])[0]; b = D.welch_psd([edged])[0]
+        sa = float(a[hi].sum() / a[nz].sum()); sb = float(b[hi].sum() / b[nz].sum())
+        self.assertAlmostEqual(sa, sb, places=9)
+        # and the border DOES move a whole-frame estimator, or the case is vacuous
+        pa = D._power(D.luma(base) - D.luma(base).mean())
+        pb = D._power(D.luma(edged) - D.luma(edged).mean())
+        rr = D._fgrid(192, 320); h2 = (rr >= 0.20); n2 = rr > 0
+        self.assertNotAlmostEqual(float(pa[h2].sum() / pa[n2].sum()),
+                                  float(pb[h2].sum() / pb[n2].sum()), places=4)
+
+    def test_welch_refuses_a_frame_too_small_to_hold_an_interior_tile(self):
+        tiny = np.zeros((32, 32, 3), dtype=np.uint8)
+        with self.assertRaises(D.UnreadableInput):
+            D.welch_psd([tiny])
 
     def test_blurring_moves_high_frequency_energy_DOWN(self):
         # The direction the smoothness hypothesis needed. If this case cannot
@@ -185,8 +231,8 @@ class Spectrum(unittest.TestCase):
         rng = np.random.default_rng(9)
         a = rng.integers(0, 256, (96, 128, 3), dtype=np.uint8)
         b = D.gaussian_blur(a, 1.2)
-        c, pa = D.radial_power(_cmp.luma(a), None, nbins=64)
-        _, pb = D.radial_power(_cmp.luma(b), None, nbins=64)
+        c, pa = D.radial_power(_cmp.luma(a), None, nbins=64, convention="raw")
+        _, pb = D.radial_power(_cmp.luma(b), None, nbins=64, convention="raw")
         fa = D.hf_fraction(c, np.array([pa]), 0.25)[0]
         fb = D.hf_fraction(c, np.array([pb]), 0.25)[0]
         self.assertLess(fb, fa / 2.0)
@@ -197,8 +243,8 @@ class Spectrum(unittest.TestCase):
         # one everywhere, and the crossover belongs at the bottom of the range.
         rng = np.random.default_rng(13)
         l = rng.normal(128.0, 30.0, (96, 128))
-        c, p1 = D.radial_power(l, None, nbins=64)
-        _, p2 = D.radial_power(l * 0.5, None, nbins=64)
+        c, p1 = D.radial_power(l, None, nbins=64, convention="raw")
+        _, p2 = D.radial_power(l * 0.5, None, nbins=64, convention="raw")
         ratio = p2 / p1
         have = np.isfinite(ratio)
         self.assertTrue(np.all(ratio[have] < 1.0))
@@ -212,13 +258,84 @@ class Spectrum(unittest.TestCase):
         self.assertEqual(cross, float(c[int(np.argmax(have))]))
 
 
+class PeriodicDecomposition(unittest.TestCase):
+    """The repair that changed this row's headline, so it is the most heavily
+    guarded thing in the file.
+
+    A reviewer reproduced the high-band comparison with the raw convention and
+    got the OPPOSITE SIGN. Both readings were the DFT's wrap step, which the two
+    renders do not carry equally. These cases pin that the decomposition removes
+    that step, leaves interior content alone, and actually changes the answer on
+    a frame whose borders disagree -- because a no-op would read as "the
+    convention did not matter" and put the withdrawn headline straight back.
+    """
+
+    @staticmethod
+    def _ramp(h=64, w=96):
+        # Borders disagree by construction: a horizontal ramp wraps as a cliff.
+        return np.linspace(10.0, 240.0, w)[None, :] * np.ones((h, 1))
+
+    def test_the_periodic_component_removes_the_wrap_step(self):
+        u = self._ramp()
+        p = D.periodic_component(u)
+        before = float(np.abs(u[:, 0] - u[:, -1]).mean())
+        after = float(np.abs(p[:, 0] - p[:, -1]).mean())
+        self.assertGreater(before, 100.0)
+        self.assertLess(after, before / 10.0)
+
+    def test_an_already_periodic_image_is_left_alone(self):
+        # A sinusoid at an integer number of cycles has no wrap DISCONTINUITY,
+        # so the decomposition must be near the identity on it. A transform that
+        # "cleans" such an image is altering content, not removing an artefact.
+        #
+        # The bound is ONE ORDINARY INTERIOR STEP and not a constant, because a
+        # sampled sinusoid's last-to-first difference is not zero: the wrap runs
+        # from sample N-1 to sample 0, which is one step like any other. A
+        # tighter bound would be asserting the fixture is continuous when it is
+        # merely periodic, and it failed here for exactly that reason.
+        x = np.arange(96)[None, :]
+        u = 128.0 + 40.0 * np.sin(2 * np.pi * 3 * x / 96) * np.ones((64, 1))
+        step = float(np.abs(np.diff(u, axis=1)).mean())
+        self.assertLess(float(np.abs(D.periodic_component(u) - u).max()), step)
+
+    def test_it_changes_the_high_band_share_on_a_frame_with_a_wrap_step(self):
+        # THE CASE THAT MATTERS. If this passed with a no-op decomposition the
+        # withdrawn headline would come back silently.
+        u = self._ramp() + np.random.default_rng(3).normal(0, 4.0, (64, 96))
+        r = D._fgrid(64, 96)
+        hi = (r >= 0.20) & (r < 0.71)
+        tot = r > 0
+        raw = D._power(u - u.mean())
+        per = D._power(D.periodic_component(u))
+        s_raw = float(raw[hi].sum() / raw[tot].sum())
+        s_per = float(per[hi].sum() / per[tot].sum())
+        self.assertGreater(s_per, 1.5 * s_raw,
+                           f"decomposition barely moved the share: {s_raw} -> {s_per}")
+
+    def test_the_wrap_statistic_ranks_a_cliff_above_a_seamless_frame(self):
+        seam = np.repeat((self._ramp())[:, :, None], 3, axis=2).astype(np.uint8)
+        x = np.arange(96)[None, :]
+        smooth = 128.0 + 40.0 * np.sin(2 * np.pi * 3 * x / 96) * np.ones((64, 1))
+        per = np.repeat(smooth[:, :, None], 3, axis=2).astype(np.uint8)
+        a = D.wrap_discontinuity([seam, seam])
+        b = D.wrap_discontinuity([per, per])
+        self.assertGreater(a["jump_over_interior_step"],
+                           10.0 * b["jump_over_interior_step"])
+
+    def test_radial_power_rejects_nothing_and_the_conventions_differ(self):
+        u = self._ramp() + np.random.default_rng(5).normal(0, 3.0, (64, 96))
+        c, p_raw = D.radial_power(u, None, 32, "raw")
+        _, p_per = D.radial_power(u, None, 32, "periodic")
+        self.assertFalse(np.allclose(np.nan_to_num(p_raw), np.nan_to_num(p_per)))
+
+
 class Bands(unittest.TestCase):
     """Mid against high, and the churn that separates detail from grain."""
 
     def test_a_mid_band_sinusoid_lands_in_the_mid_share_and_not_the_high_one(self):
         f = 0.09
-        x = np.arange(128)[None, :]
-        img = np.clip(128.0 + 90.0 * np.sin(2 * np.pi * f * x) * np.ones((96, 1)),
+        x = np.arange(320)[None, :]
+        img = np.clip(128.0 + 90.0 * np.sin(2 * np.pi * f * x) * np.ones((192, 1)),
                       0, 255).astype(np.uint8)
         frames = [np.repeat(img[:, :, None], 3, axis=2)] * 3
         t = D.band_terms(frames)
@@ -231,27 +348,51 @@ class Bands(unittest.TestCase):
         # near or above one. If this case cannot tell them apart, the churn
         # number reported for the two renders decides nothing.
         rng = np.random.default_rng(5)
-        tex = rng.integers(0, 256, (96, 128, 3), dtype=np.uint8)
+        tex = rng.integers(0, 256, (192, 320, 3), dtype=np.uint8)
         static = [tex.copy() for _ in range(6)]
-        grain = [rng.integers(0, 256, (96, 128, 3), dtype=np.uint8) for _ in range(6)]
+        grain = [rng.integers(0, 256, (192, 320, 3), dtype=np.uint8) for _ in range(6)]
         self.assertLess(D.band_terms(static)["hi_temporal_churn"], 0.05)
         self.assertGreater(D.band_terms(grain)["hi_temporal_churn"], 1.0)
 
     def test_an_axis_aligned_nyquist_pattern_beats_its_own_radial_ring(self):
         # What a separable upsampling stage leaves behind, and the probe has to
         # see it as an AXIS excess rather than as ordinary fine texture.
-        y = np.arange(96)[:, None]
-        img = np.clip(128.0 + 60.0 * np.cos(np.pi * y) * np.ones((1, 128)),
+        y = np.arange(192)[:, None]
+        img = np.clip(128.0 + 60.0 * np.cos(np.pi * y) * np.ones((1, 320)),
                       0, 255).astype(np.uint8)
         frames = [np.repeat(img[:, :, None], 3, axis=2)] * 2
         a = D.nyquist_axes(frames)
         self.assertGreater(a["vertical_nyquist"], 20.0 * a["radial_ring_mean"])
 
-    def test_a_smooth_gradient_has_no_axis_excess(self):
-        y = np.linspace(20, 230, 96)[:, None] * np.ones((1, 128))
-        img = np.repeat(np.clip(y, 0, 255).astype(np.uint8)[:, :, None], 3, axis=2)
+    def test_a_smooth_image_with_broadband_content_has_no_axis_excess(self):
+        # THE NOISE IS NOT DECORATION. A noiseless smooth fixture has essentially
+        # nothing near Nyquist, so its ring mean is floating-point dust and ANY
+        # ratio against it is meaningless -- the earlier version of this case
+        # failed for that reason and not because the probe was wrong. Every real
+        # frame carries broadband content, so the fixture does too, and the
+        # assertion is then about the AXES against a populated ring.
+        rng = np.random.default_rng(41)
+        y = np.arange(192)[:, None]
+        smooth = 128.0 + 90.0 * np.cos(2 * np.pi * y / 192) * np.ones((1, 320))
+        img8 = np.clip(smooth + rng.normal(0, 6.0, (192, 320)), 0, 255).astype(np.uint8)
+        img = np.repeat(img8[:, :, None], 3, axis=2)
         a = D.nyquist_axes([img, img])
-        self.assertLess(a["vertical_nyquist"], 5.0 * a["radial_ring_mean"] + 1e-6)
+        self.assertLess(a["vertical_nyquist"], 5.0 * a["radial_ring_mean"])
+
+    def test_the_axis_probe_SEPARATES_a_lattice_pattern_from_ordinary_texture(self):
+        # The comparative form, which is what the probe is actually used for:
+        # ours against the reference. A probe that scored both alike would have
+        # nothing to say about either.
+        rng = np.random.default_rng(43)
+        noise = rng.integers(0, 256, (192, 320, 3), dtype=np.uint8)
+        y = np.arange(192)[:, None]
+        lattice8 = np.clip(128.0 + 50.0 * np.cos(np.pi * y) * np.ones((1, 320))
+                           + rng.normal(0, 20.0, (192, 320)), 0, 255).astype(np.uint8)
+        lattice = np.repeat(lattice8[:, :, None], 3, axis=2)
+        a = D.nyquist_axes([lattice, lattice])
+        b = D.nyquist_axes([noise, noise])
+        self.assertGreater(a["vertical_nyquist"] / a["radial_ring_mean"],
+                           10.0 * b["vertical_nyquist"] / b["radial_ring_mean"])
 
 
 class Correlation(unittest.TestCase):

@@ -407,8 +407,145 @@ repair. The blur arm recovers 70% of the shortfall and **must not become one**:
 it would be fitting the output to the gate, on an instrument whose absolute
 value is uncalibrated and a gate that is one sample deep.
 
+## CORRECTION, 2026-09-01: the high-band headline was an ARTEFACT, and the upsampler lead is WITHDRAWN
+
+A reviewer recomputed the band shares without a window and got the **opposite
+sign** for the high band. Both readings were wrong, and chasing the disagreement
+found a defect that changes two of this row's published claims. The reviewer's
+figures reproduce on this row's own code to six digits, so nothing below is a
+dispute about arithmetic.
+
+### What the defect is
+
+The DFT treats a frame as periodic, so the jump from its last row to its first is
+a step the picture does not contain. That step leaks as `1/f^2` into the **low**
+bins, which inflates the denominator of every band SHARE, and it lands on the
+**fx and fy axes**, which is exactly where a separable-upsampling artefact would
+be read.
+
+**The two renders do not carry the same step, so it does not cancel in a ratio.**
+Our frames' top-to-bottom wrap jump is **73.39** against the reference's
+**49.48**, on near-identical interior steps (10.68 and 11.32).
+
+Three whole-frame conventions therefore give three answers, two of them with
+different signs:
+
+| high band (>= 0.20 c/px) | ours | reference | delta |
+|---|---|---|---|
+| raw, unwindowed | 0.069311 | 0.092724 | **-25.25%** |
+| Hann-windowed (what this row published) | 0.081442 | 0.045880 | **+77.51%** |
+| Moisan periodic-plus-smooth | 0.105520 | 0.099757 | +5.78% |
+| **Welch, interior tiles (now reported)** | **0.162547** | **0.132493** | **+22.68%** |
+
+The raw figure is our own larger border. The Hann figure tapers roughly half the
+frame's area to nothing, so it weights the picture's middle and discards its
+edges. Moisan removes the wrap step exactly but leaves a low-frequency
+counter-term whose size scales with the boundary jump, which the two renders
+again do not share -- `test_the_periodic_counter_term_is_real_and_scales_with_the_boundary`
+pins that as a measured property rather than a suspicion.
+
+**Welch tiling has none of the three.** Interior 64-pixel tiles at 32-pixel stride
+never touch the frame border, so no wrap step enters and no counter-term is
+created; every tile is weighted equally, so there is no whole-frame taper bias.
+It costs frequency resolution, which a band comparison does not need.
+`test_welch_never_sees_the_frame_border` paints a cliff into the outermost rows
+and columns and requires the Welch share to be unchanged to nine places while a
+whole-frame estimator's share moves.
+
+### What changes
+
+**"77.79% MORE high-frequency energy" is WITHDRAWN.** The border-free figure is
+**+22.68%** as a share, and the cleanest statement avoids shares altogether,
+because a share moves when either band moves:
+
+| absolute band power, Welch interior tiles | ours / reference |
+|---|---|
+| mid band, 0.04-0.14 c/px | **1.0373x** -- equal |
+| high band, >= 0.20 c/px | **1.4031x** |
+| total | 1.1437x |
+
+So our render carries about **40% more absolute high-frequency power at
+essentially equal mid-band power**, with 14% more total variance. The DIRECTION
+of the original claim survives -- there is no high-frequency rolloff, so "our
+render is smoother" is still false -- but the magnitude was inflated more than
+threefold against the best estimator and the sign was never the reviewer's to
+lose.
+
+**THE SEPARABLE-UPSAMPLER LEAD IS WITHDRAWN, and this is the more serious of the
+two.** The wrap step lands on the axes, and ours is the larger one, so the probe
+was reading a border difference as a decoder signature. Border-free:
+
+| near-Nyquist axis / radial ring | ours | reference |
+|---|---|---|
+| published (Hann) | 7.35x / 7.27x | 4.86x / 3.91x |
+| **Welch, interior tiles** | **2.46x / 2.22x** | **2.23x / 1.78x** |
+
+Both renders carry a comparable modest axis structure. The difference is weak and
+it does not support naming a stage. **No reader should act on that lead**, and
+this row names no replacement cause: it was wrong once about a mechanism and the
+data it has does not identify a second one.
+
+**One more quantity flipped and was never quoted, which is luck rather than
+care.** The high-band temporal churn read ours 0.6892 against the reference's
+0.6222 windowed, and reads ours **0.6415** against **0.7297** border-free -- the
+order reverses. It appears in the committed JSON and in no prose, so no record
+had to be corrected for it. It is recorded here because a reader comparing the
+old JSON with the new one would otherwise find an unexplained sign change.
+
+### What is UNCHANGED
+
+Everything that decided the row. The mechanism falsification is pixel- and
+CLIP-domain and no FFT convention enters it:
+
+- the blur intervention, **+1.9131** on our frames, 6 of 25 clearing the bound to
+  **23 of 25**, against **-0.9728** on the reference's;
+- the reference blur sweep, which never reproduces the 2.7305 gap;
+- tone, ruled out at **+0.1846**;
+- the per-frame table, whose five best-scoring frames share **no member** with its
+  five sharpest;
+- the temporal split, ours **-0.3351** against the reference's **+0.6987**.
+
+The within-render correlation survives every estimator, which is what makes it
+evidence rather than an artefact of one:
+
+| r(high-frequency share, CLIP) | ours | reference |
+|---|---|---|
+| Hann | -0.5862 | +0.3943 |
+| periodic | -0.6216 | +0.1754 |
+| **Welch (reported)** | **-0.6195** | **+0.2640** |
+
+And the **mid-band deficit is robust in sign across all four estimators**: -31.15%
+raw, -8.88% Hann, -11.83% periodic, **-9.30% Welch**.
+
+### The corrected reading
+
+Our render carries **more** absolute high-frequency power than the reference
+(1.40x) at **equal** mid-band power (1.04x), and within our own frames more of
+that high-frequency energy predicts a **worse** CLIP score. Smoothing our frames
+raises their score. So the smoothness hypothesis stays refuted, and what replaces
+it is not a decoder-geometry story but an unattributed excess of fine-scale energy
+that behaves like noise rather than detail. **What stage produces it is not
+identified by this row**, and the ablations named above -- bypassing the temporal
+upsampler and the tiled decode, and comparing decoder output at the same latent
+-- remain the way to find out.
+
+### The lesson this row owes its reader
+
+A spectral SHARE is a ratio whose denominator is the whole frame, so any artefact
+anywhere in the spectrum moves it. This row published a headline from a single
+convention, asserted in its own `## Risks` that "the unwindowed spectra are
+computed too, so the conclusion cannot rest on the window choice", and never
+compared the two. They disagreed by a factor of thirteen and in sign. Every run
+now prints all four conventions and the wrap-jump statistic beside the verdict,
+so the next reader sees the spread instead of discovering it in review.
+
 ## Now
 
-`DONE`. The hypothesis this row was created to test is refuted, the record it
-came from is corrected in the same change, and the repair remains unowned --
-but it is now unowned with a direction, which it did not have before.
+`DONE`. The hypothesis this row was created to test is refuted, and the records
+it came from are corrected in the same change. **The repair remains unowned and
+this row does NOT name a cause for it.** An earlier version of this line said the
+gap was "now unowned with a direction"; the direction it meant was the
+separable-upsampler lead, and `## CORRECTION` withdraws that. What this row
+leaves is a refuted hypothesis, a measured mid-band deficit at 1.04x absolute
+mid-band power, a 1.40x absolute high-band excess that behaves like noise rather
+than detail, and three named ablations that would attribute it.

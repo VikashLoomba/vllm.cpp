@@ -816,9 +816,12 @@ in this row.
 
 **THAT HYPOTHESIS IS NOW MEASURED AND IT IS FALSE (2026-09-01).**
 `LTX25-ADHERENCE-DETAIL-LOSS` ([#2513](https://github.com/mudler/vllm.cpp/issues/2513))
-ran the ablation on these same 25 frames. Our render is not smoother: it holds
-**77.79% MORE** energy above 0.20 cycles per pixel than the reference and is
-short only in the MID band, by 8.64%. Within our 25 frames more fine-scale
+ran the ablation on these same 25 frames. Our render is not smoother: measured
+border-free it carries **1.4031x the reference's absolute high-band power**
+(>= 0.20 cycles per pixel) at **1.0373x its mid-band power**, so there is no
+high-frequency rolloff to call smoothness. (That row first published this as
+"77.79% MORE" from a windowed whole-frame spectrum and withdrew the figure; its
+`## CORRECTION` carries the four-convention table and the reason.) Within our 25 frames more fine-scale
 energy predicts a WORSE score, `r = -0.5862`, where within the reference's it
 predicts a better one, `r = +0.3943`. Our three best-scoring frames are our three
 LEAST sharp of 25, our single sharpest frame fails the bound, and the overlap
@@ -874,13 +877,15 @@ refused rather than scored.
   attribution this bullet said was missing now exists and it is NEGATIVE**:
   `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) specified and ran the ablation, and the
   smoothness hypothesis is refuted -- our render carries MORE fine-scale energy
-  than the reference, not less, and blurring it RAISES its score. What that row
-  names instead is an axis-aligned near-Nyquist excess, 2.8 to 3.4 times the
-  reference's, growing along the temporal axis while the mid band stays 8.6%
-  short. Owner of the RECORD: this row, through #1854, which is the issue that
-  asked the question and is the right place for the answer. Owner of the REPAIR:
-  **still no row**, but it is now unowned with a direction rather than with a
-  hypothesis, and #2513 states what would confirm the candidate.
+  than the reference, not less, and blurring it RAISES its score. **That row does
+  NOT name a replacement cause.** It first named an axis-aligned near-Nyquist
+  excess and WITHDREW it: the probe was reading the frame's own wrap step, which
+  our render carries more of, and border-free the axis-to-ring contrast is
+  2.46x/2.22x against 2.23x/1.78x, which supports nothing. Owner of the RECORD:
+  this row, through #1854, which is the issue that asked the question and is the
+  right place for the answer. Owner of the REPAIR: **still no row**, and still no
+  attribution -- what #2513 leaves is a refuted hypothesis and three named
+  ablations that would produce one.
 - **n IS 1.** Only the first of `93a60151`'s three renders retained its frames,
   by the harness's design as `## Outcome` now records, so the run-to-run
   stability of our own adherence reading is UNMEASURED. A reading that moves by

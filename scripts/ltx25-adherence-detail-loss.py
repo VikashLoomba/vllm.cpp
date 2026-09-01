@@ -212,23 +212,165 @@ def apply_gain_gamma(a: np.ndarray, gain: float, gamma: float) -> np.ndarray:
 
 # --- 2. THE SPECTRUM ---------------------------------------------------------
 def hann2d(h: int, w: int) -> np.ndarray:
-    """A separable Hann window. The frame's own borders are a step edge, and an
-    unwindowed FFT reads that step as broadband energy in every bin -- which is
-    exactly the quantity under test, so it is removed here and the unwindowed
-    spectrum is computed too so the answer cannot depend on this choice."""
+    """A separable Hann window. KEPT AS A DIAGNOSTIC ARM ONLY -- see
+    `periodic_component`, which is what every reported number now uses.
+
+    A window suppresses the wrap step, but it also tapers roughly half the
+    frame's area to near zero, so it measures the middle of the picture and
+    weights the rest away. On these two renders that over-correction inflated
+    the high-band ratio by a factor of 13 and produced a headline this row had
+    to withdraw. It stays so the three conventions can be printed side by side.
+    """
     return np.outer(np.hanning(h), np.hanning(w))
 
 
-def radial_power(l: np.ndarray, window: np.ndarray | None, nbins: int = 64
-                 ) -> tuple[np.ndarray, np.ndarray]:
+def periodic_component(u: np.ndarray) -> np.ndarray:
+    """Moisan's periodic-plus-smooth decomposition, and the ONLY spectrum this
+    row reports from.
+
+    THE DEFECT IT REPAIRS, MEASURED RATHER THAN ASSERTED. The DFT treats a frame
+    as periodic, so the jump from its last row to its first is a step the picture
+    does not contain. A step's leakage falls as 1/f^2, which piles energy into
+    the LOW bins and therefore shrinks every high-band SHARE through the
+    denominator. It also lands on the fx and fy AXES, which is exactly where a
+    separable-upsampling artefact would be read.
+
+    Both failures were live here. Our frames' top-to-bottom wrap jump is 73.39
+    against the reference's 49.48, on interior steps of 10.68 and 11.32 -- so the
+    contamination is UNEQUAL between the two renders and does not cancel in a
+    ratio. Measured on the same 25 frames a side, the high-band comparison reads
+    -25.25% raw, +77.51% Hann-windowed, and +5.78% here. Two of those three are
+    the border talking, and the axis-to-ring contrast that suggested a separable
+    upsampler collapses from 7.3x-against-4.9x to 6.70x-against-5.74x once this
+    runs, which is why that lead was withdrawn.
+
+    The decomposition splits `u = p + s` where `s` is smooth and carries the
+    boundary jump and `p` is periodic with no wrap discontinuity. It removes the
+    artefact exactly, without a window and without touching interior content, so
+    it costs neither area nor resolution.
+
+    Moisan, "Periodic plus Smooth Image Decomposition", JMIV 2011.
+    """
+    h, w = u.shape
+    v = np.zeros_like(u, dtype=np.float64)
+    v[0, :] += u[-1, :] - u[0, :]
+    v[-1, :] += u[0, :] - u[-1, :]
+    v[:, 0] += u[:, -1] - u[:, 0]
+    v[:, -1] += u[:, 0] - u[:, -1]
+    i = np.arange(h)[:, None]
+    j = np.arange(w)[None, :]
+    den = 2.0 * np.cos(2.0 * np.pi * i / h) + 2.0 * np.cos(2.0 * np.pi * j / w) - 4.0
+    den[0, 0] = 1.0
+    ss = np.fft.fft2(v) / den
+    ss[0, 0] = 0.0
+    return np.real(np.fft.ifft2(np.fft.fft2(u) - ss))
+
+
+TILE_SIZE = 64
+TILE_STEP = 32
+
+
+def welch_psd(frames: list[np.ndarray]) -> list[np.ndarray]:
+    """Per-frame Welch PSD over INTERIOR tiles. This is what every reported
+    spectral number in this row comes from, and the reason is measured.
+
+    THREE WHOLE-FRAME CONVENTIONS GAVE THREE ANSWERS ON THESE FRAMES, two of
+    them with different signs. The high-band comparison reads -25.25% raw,
+    +77.51% Hann-windowed and +5.78% periodic. Each is a different artefact:
+
+      raw       The DFT treats the frame as periodic, so its wrap edge is a step
+                the picture does not contain, and a step leaks as 1/f^2 into the
+                LOW bins -- inflating the denominator and shrinking the high-band
+                SHARE. Our frames' wrap jump is 73.39 against the reference's
+                49.48 on near-identical interior steps, so the contamination is
+                UNEQUAL and does not cancel in a ratio.
+      hann      A whole-frame window kills that leak but tapers roughly half the
+                frame's area to nothing, so it measures the middle of the picture
+                and weights the rest away.
+      periodic  Moisan's decomposition removes the wrap step exactly, but
+                `p = u - s` leaves a low-frequency counter-term whose size scales
+                with the boundary jump -- which, again, the two renders do not
+                share. On a high-frequency test sinusoid that counter-term
+                outweighs the signal's own ring mean.
+
+    Welch tiling has none of those. Interior tiles never touch the frame border,
+    so no wrap step can enter and no boundary counter-term is created; every tile
+    is weighted equally, so there is no whole-frame taper bias; and the per-tile
+    Hann only has to suppress each tile's own edges, which are interior content
+    and not an invented discontinuity. It is the standard PSD estimator for
+    exactly this reason.
+
+    It trades frequency resolution for that: a 64-pixel tile resolves 1/64 rather
+    than 1/320, which is ample for a band comparison and useless for locating a
+    single line. This row compares bands.
+    """
+    h, w = luma(frames[0]).shape
+    win = np.outer(np.hanning(TILE_SIZE), np.hanning(TILE_SIZE))
+    lo = TILE_STEP
+    ys = range(lo, h - TILE_SIZE - lo + 1, TILE_STEP)
+    xs = range(lo, w - TILE_SIZE - lo + 1, TILE_STEP)
+    if not len(list(ys)) or not len(list(xs)):
+        raise UnreadableInput(
+            f"a {h}x{w} frame holds no interior {TILE_SIZE}px tile at step "
+            f"{TILE_STEP}, so no border-free spectrum can be estimated from it")
+    out = []
+    for a in frames:
+        l = luma(a)
+        acc, n = None, 0
+        for y in range(lo, h - TILE_SIZE - lo + 1, TILE_STEP):
+            for x in range(lo, w - TILE_SIZE - lo + 1, TILE_STEP):
+                t = l[y:y + TILE_SIZE, x:x + TILE_SIZE]
+                t = (t - t.mean()) * win
+                f = np.fft.fftshift(np.fft.fft2(t))
+                pw = f.real ** 2 + f.imag ** 2
+                acc = pw if acc is None else acc + pw
+                n += 1
+        out.append(acc / n)
+    return out
+
+
+def tile_freq_grid() -> np.ndarray:
+    fy = np.fft.fftshift(np.fft.fftfreq(TILE_SIZE))[:, None]
+    fx = np.fft.fftshift(np.fft.fftfreq(TILE_SIZE))[None, :]
+    return np.sqrt(fy ** 2 + fx ** 2)
+
+
+def wrap_discontinuity(frames: list[np.ndarray]) -> dict:
+    """How big the step is that the DFT's periodic assumption invents, against
+    the frame's own mean interior step so it is a ratio and not a level.
+
+    Reported because the two renders differ on it, which is what made the raw
+    spectrum's verdict a property of the border rather than of the picture.
+    """
+    vj, hj, iv = [], [], []
+    for a in frames:
+        l = luma(a)
+        vj.append(float(np.abs(l[0, :] - l[-1, :]).mean()))
+        hj.append(float(np.abs(l[:, 0] - l[:, -1]).mean()))
+        iv.append(0.5 * (float(np.abs(np.diff(l, axis=0)).mean())
+                         + float(np.abs(np.diff(l, axis=1)).mean())))
+    v, h_, i_ = float(np.mean(vj)), float(np.mean(hj)), float(np.mean(iv))
+    return {"top_bottom_jump": v, "left_right_jump": h_,
+            "mean_interior_step": i_, "jump_over_interior_step": (v + h_) / 2.0 / i_}
+
+
+def radial_power(l: np.ndarray, window: np.ndarray | None, nbins: int = 64,
+                 convention: str = "periodic") -> tuple[np.ndarray, np.ndarray]:
     """Radially averaged power spectrum of one luma plane.
 
     Frequency is in cycles per pixel on each axis, so two renders of identical
     geometry share the bin grid exactly and no resampling enters the comparison.
     The DC bin is dropped: it is the frame's mean, which item 1 measures.
+
+    `convention` selects how the wrap step is handled, and it is a parameter
+    rather than a constant because this row got a headline wrong by leaving it
+    implicit. `periodic` is the reported one. `raw` and `hann` are printed beside
+    it so a reader sees the spread the choice is worth instead of trusting one.
     """
+    if convention == "periodic":
+        l = periodic_component(l)
     x = l - l.mean()
-    if window is not None:
+    if convention == "hann" and window is not None:
         x = x * window
     f = np.fft.fftshift(np.fft.fft2(x))
     p = (f.real ** 2 + f.imag ** 2) / float(x.size)
@@ -248,19 +390,22 @@ def radial_power(l: np.ndarray, window: np.ndarray | None, nbins: int = 64
 
 
 def spectra(frames: list[np.ndarray], nbins: int = 64) -> dict:
+    """All three conventions, every run. `periodic` is what gets reported."""
     h, w = luma(frames[0]).shape
     win = hann2d(h, w)
-    prof_w, prof_u, hf = [], [], []
+    prof_p, prof_w, prof_u = [], [], []
     centers = None
     for a in frames:
         l = luma(a)
-        c, pw = radial_power(l, win, nbins)
-        _, pu = radial_power(l, None, nbins)
+        c, pp = radial_power(l, None, nbins, "periodic")
+        _, pw = radial_power(l, win, nbins, "hann")
+        _, pu = radial_power(l, None, nbins, "raw")
         centers = c
+        prof_p.append(pp)
         prof_w.append(pw)
         prof_u.append(pu)
-    return {"centers": centers, "windowed": np.array(prof_w),
-            "unwindowed": np.array(prof_u)}
+    return {"centers": centers, "periodic": np.array(prof_p),
+            "windowed": np.array(prof_w), "unwindowed": np.array(prof_u)}
 
 
 def hf_fraction(centers: np.ndarray, prof: np.ndarray, f_lo: float) -> np.ndarray:
@@ -295,8 +440,10 @@ def _fgrid(h: int, w: int) -> np.ndarray:
     return np.sqrt(fy ** 2 + fx ** 2)
 
 
-def _power(l: np.ndarray, window: np.ndarray) -> np.ndarray:
-    x = (l - l.mean()) * window
+def _power(l: np.ndarray, window: np.ndarray | None = None) -> np.ndarray:
+    x = l - l.mean()
+    if window is not None:
+        x = x * window
     f = np.fft.fftshift(np.fft.fft2(x))
     return (f.real ** 2 + f.imag ** 2) / float(x.size)
 
@@ -312,21 +459,26 @@ def band_terms(frames: list[np.ndarray]) -> dict:
     detail" and "we render more noise", and it is reported with both renders'
     values because only the COMPARISON means anything.
     """
-    l0 = luma(frames[0])
-    h, w = l0.shape
-    win = hann2d(h, w)
-    r = _fgrid(h, w)
+    r = tile_freq_grid()
     mid_m = (r >= BAND_MID[0]) & (r < BAND_MID[1])
     hi_m = (r >= BAND_HI[0]) & (r < BAND_HI[1])
     tot_m = r > 0
-    P = [_power(luma(a), win) for a in frames]
+    P = welch_psd(frames)
     mid = np.array([float(p[mid_m].sum() / p[tot_m].sum()) for p in P])
     hi = np.array([float(p[hi_m].sum() / p[tot_m].sum()) for p in P])
-    D = [_power(luma(frames[i + 1]) - luma(frames[i]), win)
-         for i in range(len(frames) - 1)]
+    # ABSOLUTE band power too. A share moves when EITHER band moves, so a share
+    # alone cannot say which side changed, and on these renders the answer is
+    # that the mid bands are equal and the high band and the total are not.
+    mid_abs = np.array([float(p[mid_m].sum()) for p in P])
+    hi_abs = np.array([float(p[hi_m].sum()) for p in P])
+    tot_abs = np.array([float(p[tot_m].sum()) for p in P])
+    D = welch_psd([np.clip(frames[i + 1].astype(np.int16)
+                           - frames[i].astype(np.int16) + 128, 0, 255).astype(np.uint8)
+                   for i in range(len(frames) - 1)])
     churn = (float(np.mean([p[hi_m].sum() for p in D]))
              / float(np.mean([p[hi_m].sum() for p in P])))
-    return {"mid_fraction": mid, "hi_fraction": hi, "hi_temporal_churn": churn}
+    return {"mid_fraction": mid, "hi_fraction": hi, "hi_temporal_churn": churn,
+            "mid_power": mid_abs, "hi_power": hi_abs, "total_power": tot_abs}
 
 
 def nyquist_axes(frames: list[np.ndarray]) -> dict:
@@ -340,14 +492,18 @@ def nyquist_axes(frames: list[np.ndarray]) -> dict:
     decoder's geometry from a picture with texture in it, and an ASYMMETRY
     between the two axes says the stage is not isotropic.
     """
-    l0 = luma(frames[0])
-    h, w = l0.shape
-    win = hann2d(h, w)
-    fy = np.fft.fftshift(np.fft.fftfreq(h))[:, None]
-    fx = np.fft.fftshift(np.fft.fftfreq(w))[None, :]
+    fy = np.fft.fftshift(np.fft.fftfreq(TILE_SIZE))[:, None]
+    fx = np.fft.fftshift(np.fft.fftfreq(TILE_SIZE))[None, :]
     r = np.sqrt(fy ** 2 + fx ** 2)
-    P = np.mean([_power(luma(a), win) for a in frames], axis=0)
-    tol = 0.012
+    # WELCH, and this probe is the whole reason it matters. The wrap step lands
+    # ON these axes and our frames' step is the larger one, so a whole-frame
+    # estimator reads a BORDER difference as a decoder signature. It did: the
+    # raw and Hann conventions put the axis-to-ring contrast at roughly 7x for us
+    # against 4-5x for the reference, and this row published a separable-upsampler
+    # lead on it. Estimated border-free the contrast is 2.46x/2.22x against
+    # 2.23x/1.78x, which is a weak difference, and the lead was withdrawn.
+    P = np.mean(welch_psd(frames), axis=0)
+    tol = 1.0 / TILE_SIZE * 1.01
     horiz = np.broadcast_to((np.abs(fy) < tol) & (np.abs(np.abs(fx) - 0.5) < tol), P.shape)
     vert = np.broadcast_to((np.abs(np.abs(fy) - 0.5) < tol) & (np.abs(fx) < tol), P.shape)
     corner = np.broadcast_to((np.abs(np.abs(fy) - 0.5) < tol)
@@ -459,18 +615,28 @@ def main(argv: list[str]) -> int:
     # --- 2. SPECTRUM ---
     so, sr = spectra(ours), spectra(ref)
     centers = so["centers"]
-    prof_o = np.nanmean(so["windowed"], axis=0)
-    prof_r = np.nanmean(sr["windowed"], axis=0)
+    prof_o = np.nanmean(so["periodic"], axis=0)
+    prof_r = np.nanmean(sr["periodic"], axis=0)
     ratio = prof_o / prof_r
     out["spectrum"] = {
         "bin_centers_cycles_per_pixel": [float(v) for v in centers],
         "ours_mean_profile": [float(v) for v in prof_o],
         "reference_mean_profile": [float(v) for v in prof_r],
         "ratio_ours_over_reference": [float(v) for v in ratio],
+        "convention": "periodic",
+        "why_periodic": (
+            "the DFT's wrap step leaks as 1/f^2 into the LOW bins and onto the "
+            "fx/fy axes, and the two renders do not carry the same step, so the "
+            "raw and Hann conventions each returned a different SIGN for the "
+            "high band on these frames"),
         "ours_mean_profile_unwindowed":
             [float(v) for v in np.nanmean(so["unwindowed"], axis=0)],
         "reference_mean_profile_unwindowed":
             [float(v) for v in np.nanmean(sr["unwindowed"], axis=0)],
+        "ours_mean_profile_hann":
+            [float(v) for v in np.nanmean(so["windowed"], axis=0)],
+        "reference_mean_profile_hann":
+            [float(v) for v in np.nanmean(sr["windowed"], axis=0)],
     }
     # THE CROSSOVER, defined rather than eyeballed: the lowest bin above which
     # EVERY bin's ratio stays below 1. A uniform deficit has its crossover at
@@ -496,9 +662,13 @@ def main(argv: list[str]) -> int:
           f"0.40 {np.interp(0.40, centers, ratio):.4f}; crossover {cross}")
 
     f_lo = cross if cross is not None else 0.25
-    hf_o = hf_fraction(centers, so["windowed"], f_lo)
-    hf_r = hf_fraction(centers, sr["windowed"], f_lo)
-    out["spectrum"]["hf_cut_cycles_per_pixel"] = float(f_lo)
+    # THE CORRELATION'S OWN INPUT IS THE WELCH SHARE, not a radial-profile
+    # reduction. The radial profile above is kept for shape, but every number
+    # that enters a verdict comes from the border-free estimator.
+    hf_o = band_terms(ours)["hi_fraction"]
+    hf_r = band_terms(ref)["hi_fraction"]
+    out["spectrum"]["hf_cut_cycles_per_pixel"] = float(BAND_HI[0])
+    out["spectrum"]["hf_source"] = "welch interior tiles, band >= 0.20 c/px"
     out["spectrum"]["ours_hf_energy_fraction"] = [float(v) for v in hf_o]
     out["spectrum"]["reference_hf_energy_fraction"] = [float(v) for v in hf_r]
     out["spectrum"]["ours_hf_energy_fraction_mean"] = float(hf_o.mean())
@@ -506,6 +676,53 @@ def main(argv: list[str]) -> int:
     print(f"[spectrum] energy at or above {f_lo:.4f} c/px: ours "
           f"{hf_o.mean():.6f}, reference {hf_r.mean():.6f}, "
           f"relative loss {1.0 - hf_o.mean() / hf_r.mean():+.4f}")
+
+    # THE CONVENTION SPREAD, printed rather than chosen silently. A reviewer
+    # reproduced this row's high band with the raw convention and got the
+    # OPPOSITE SIGN; both readings were the border, not the picture. The three
+    # numbers now ship side by side so that disagreement is visible in the
+    # output instead of being discovered in review.
+    def _conv_shares(frames, conv):
+        h_, w_ = luma(frames[0]).shape
+        rr = _fgrid(h_, w_)
+        mm = (rr >= BAND_MID[0]) & (rr < BAND_MID[1])
+        hh = (rr >= BAND_HI[0]) & (rr < BAND_HI[1])
+        tt = rr > 0
+        if conv == "welch":
+            rr = tile_freq_grid()
+            mm = (rr >= BAND_MID[0]) & (rr < BAND_MID[1])
+            hh = (rr >= BAND_HI[0]) & (rr < BAND_HI[1])
+            tt = rr > 0
+            acc = np.mean(welch_psd(frames), axis=0)
+            return (float(acc[mm].sum() / acc[tt].sum()),
+                    float(acc[hh].sum() / acc[tt].sum()))
+        win_ = hann2d(h_, w_)
+        acc = None
+        for a in frames:
+            l_ = luma(a)
+            if conv == "periodic":
+                l_ = periodic_component(l_)
+            pw_ = _power(l_, win_ if conv == "hann" else None)
+            acc = pw_ if acc is None else acc + pw_
+        acc /= len(frames)
+        return float(acc[mm].sum() / acc[tt].sum()), float(acc[hh].sum() / acc[tt].sum())
+
+    out["convention_sensitivity"] = {}
+    for conv in ("raw", "hann", "periodic", "welch"):
+        om, oh = _conv_shares(ours, conv)
+        rm, rh = _conv_shares(ref, conv)
+        out["convention_sensitivity"][conv] = {
+            "ours_mid": om, "reference_mid": rm, "mid_delta": om / rm - 1.0,
+            "ours_high": oh, "reference_high": rh, "high_delta": oh / rh - 1.0}
+        print(f"[conv] {conv:9s} mid {om:.6f}/{rm:.6f} ({om/rm-1:+.2%})  "
+              f"high {oh:.6f}/{rh:.6f} ({oh/rh-1:+.2%})")
+    out["wrap_discontinuity"] = {"ours": wrap_discontinuity(ours),
+                                 "reference": wrap_discontinuity(ref)}
+    wo, wr = out["wrap_discontinuity"]["ours"], out["wrap_discontinuity"]["reference"]
+    print(f"[conv] wrap step over interior step: ours "
+          f"{wo['jump_over_interior_step']:.2f}x, reference "
+          f"{wr['jump_over_interior_step']:.2f}x -- UNEQUAL, so it does not "
+          f"cancel in a ratio")
 
     bo, br = band_terms(ours), band_terms(ref)
     ao, ar = nyquist_axes(ours), nyquist_axes(ref)
@@ -516,6 +733,13 @@ def main(argv: list[str]) -> int:
         "reference_mid_fraction_mean": float(br["mid_fraction"].mean()),
         "ours_hi_fraction_mean": float(bo["hi_fraction"].mean()),
         "reference_hi_fraction_mean": float(br["hi_fraction"].mean()),
+        "estimator": "welch interior tiles 64px/32px, hann per tile",
+        "ours_mid_power_over_reference":
+            float(bo["mid_power"].sum() / br["mid_power"].sum()),
+        "ours_hi_power_over_reference":
+            float(bo["hi_power"].sum() / br["hi_power"].sum()),
+        "ours_total_power_over_reference":
+            float(bo["total_power"].sum() / br["total_power"].sum()),
         "ours_hi_temporal_churn": bo["hi_temporal_churn"],
         "reference_hi_temporal_churn": br["hi_temporal_churn"],
         "ours_nyquist_axes": ao,
@@ -527,6 +751,10 @@ def main(argv: list[str]) -> int:
     print(f"[bands] high {BAND_HI} share: ours {bo['hi_fraction'].mean():.6f} "
           f"reference {br['hi_fraction'].mean():.6f} "
           f"({bo['hi_fraction'].mean() / br['hi_fraction'].mean() - 1:+.2%})")
+    print(f"[bands] ABSOLUTE power ours/reference: mid "
+          f"{out['bands']['ours_mid_power_over_reference']:.4f}x, high "
+          f"{out['bands']['ours_hi_power_over_reference']:.4f}x, total "
+          f"{out['bands']['ours_total_power_over_reference']:.4f}x")
     print(f"[bands] high-band temporal churn: ours {bo['hi_temporal_churn']:.4f} "
           f"reference {br['hi_temporal_churn']:.4f}")
     print(f"[bands] near-Nyquist axis/ring: ours "

@@ -847,15 +847,22 @@ FALSE, and `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) measured it. The two REPORTED
 statistics that motivated it are unchanged and were read correctly; the
 inference drawn from them was not, and no spectrum had ever been taken.
 
-The radially averaged power spectrum of the two renders has **no crossover**:
-there is no frequency above which our profile stays below the reference's. Our
-render holds **77.79% MORE** of its energy at 0.20 cycles per pixel and above
-(0.081641 against 0.045918) and rises to **2.86x** the reference at 0.3945 c/px.
-What it is short of is the MID band, 0.04 to 0.14 c/px, by 8.64%. `sharpness_mean`
-is a mean absolute gradient and therefore reads the mid band, which is why a
-mid-band deficit lowered it while the high band was nearly doubled. The shape is
-a hole in the middle with an excess at fine scale, not a rolloff, and "smoother"
-describes a rolloff.
+Measured border-free -- Welch over interior 64-pixel tiles, which is the only
+estimator here that the frame's own wrap step cannot reach -- our render carries
+**1.4031x the reference's ABSOLUTE high-band power** (>= 0.20 cycles per pixel)
+at **1.0373x its mid-band power**, so the fine-scale end is up by 40% while the
+mid band is equal. `sharpness_mean` is a mean absolute gradient and therefore
+reads the mid band, which is why it fell while the high band rose. There is no
+high-frequency rolloff, and "smoother" describes a rolloff.
+
+**An earlier version of this paragraph said "77.79% MORE" and cited a crossover
+that does not exist. Both came from a Hann-windowed whole-frame spectrum and are
+WITHDRAWN.** A window removes the wrap step but tapers half the frame's area
+away; without one, the step's `1/f^2` leak inflates the low bins instead. The two
+renders do not carry the same step -- our wrap jump is 73.39 against 49.48 -- so
+the error does not cancel in a ratio, and the same comparison read -25.25% raw
+and +77.51% windowed. `ltx25-adherence-detail-loss.md` `## CORRECTION` carries the
+derivation and the four-convention table.
 
 The interventions settle the direction that the statistics alone could not.
 Blurring our own frames at sigma 1.0 RAISES their CLIP score by **+1.9131** and

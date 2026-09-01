@@ -2305,6 +2305,37 @@ which is precisely how this landed green locally in the first place.
 
   It also leaves W3's DSA composition unreachable in production: `compressor` is
   non-null only on the paged entry. The gates are real; the callers are tests.
+
+  **The dispatch is sharper than "one branch of three".** `ModelForwardInput::gather_logits`
+  DEFAULTS TO TRUE (`model_registry.h:585`) and only multimodal models set it
+  false, so for DeepSeek-V4 the FIRST branch always wins: production is
+  `ForwardDevice`, always, and the `multi_kv` and fallback branches are not
+  reached in ordinary serving at all. The factory does declare
+  `.consumes_multi_kv = true`, so the runner does hand it a cache set -- which
+  the first branch then ignores.
+
+  **What the fix needs, from reading rather than guessing.** The paged arm is NOT
+  gated on `V4Backend::device`: `ForwardComposeImpl` keys on `be.paged_kv !=
+  nullptr` and `be.compressor != nullptr` independently of the device flag
+  (`deepseek_v4.cpp:860, 915, 987`). So `ForwardDevice` can bind both and the
+  paged DSA path engages -- this is a wiring gap, not a missing composition.
+  Three pieces:
+
+  1. Resolve the pages, which `ResolveDeepseekV4SwaPages` already does for the
+     GGUF branch.
+  2. Hold a `DeepseekV4CompressorState` that PERSISTS ACROSS STEPS. It is
+     currently constructed per call by tests, and decode state cannot be.
+     `DeepseekV4LoadedModel` holds only `weights_`, so this is a new member.
+  3. Bind both on `dev_be` and let the existing predicates do the rest.
+
+  **A limit to record before it is discovered as a bug.**
+  `DeepseekV4CompressorState` is `std::vector<std::vector<float>>` PER LAYER with
+  no request dimension -- one sequence's state machine. The 44-47 tok/s target is
+  1 seq, so it is sufficient for the target and NOT sufficient for a server with
+  concurrent requests. Whoever wires this owes either a per-request state or a
+  refusal by name when `num_reqs > 1`; silently sharing one state across requests
+  is the "refusal and its route predicate must be the same predicate" failure
+  this tree has already paid for once.
   §"Nothing lands dead" allows a staged slice to land unreached ONLY when the
   commit body, the pull-request body and this section all name it, and this was
   named in none of them until now.

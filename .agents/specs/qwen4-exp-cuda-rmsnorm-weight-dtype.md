@@ -77,6 +77,20 @@ the same bf16 stream — pass, and why only the plain `RmsNorm` refuses.
 `RmsNormRowKernel` is therefore the outlier among three siblings that all get
 it right.
 
+**This row had already written the rule down.** `src/vt/cuda/cuda_qwen4_exp.cu:60-62`,
+from an earlier wave of this same campaign, states it in as many words:
+
+> a device arm that refused a dtype its CPU sibling accepts would be a divergence
+> to record, and the tag design below makes admitting it free.
+
+That file names `cuda_ops.cu`'s `<Tin, Tout>` house style as the thing it
+deliberately diverged from, and carries each operand's dtype as an independent
+runtime tag instead — `HcGroupedNormKernel(float* normed, const void* hyper,
+DTag hyper_tag, const void* hc_norm_w, DTag w_tag, ...)` at `:258-259`. So the
+qwen4_exp-specific CUDA ops already accept the f32 gamma this checkpoint stores.
+`RmsNormRowKernel` is the op that had not caught up, and the fix below is that
+principle applied in `cuda_ops.cu`'s own template idiom rather than a new one.
+
 ### Why `ResidentWeightF32` is not the fix here
 
 `qwen3_5.cpp:1226` exists for the mirror-image pairing (f32 activation, gamma

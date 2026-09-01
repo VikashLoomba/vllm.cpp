@@ -179,10 +179,38 @@ on `auto` that is the model's bf16, so the early-out misses and
 declares a layout the retype path then refuses, and no flag was passed -- the
 message's "requesting it here" misattributes it.
 
-That refusal is CORRECT and must not be widened: W1 landed the page formula and
-neither the store nor the read, so accepting it would size every MLA page at 584
-bytes while the attention block writes a bf16 latent into it. Wrong tokens, not a
-crash. The store and read are owed to `KV-DSV4-MULTICACHE` W5.
+That refusal is CORRECT and must not be widened, and the investigation behind
+that sentence is worth keeping because both obvious small fixes are harmful.
+
+The published topology is a GATED mirror: `test_deepseek_v4_scaffold.cpp` pins
+`real_page_size_bytes() == 37376` (64 x 584) and `== 1168` (2 x 584), seven
+assertions anchored to upstream's 448B NoPE + 128B RoPE + 8B scale. The paged
+STORE, meanwhile, writes **f32** -- `deepseek_v4.cpp:1013-1036` builds `t_kvc` /
+`t_pe` as `kF32` views over `deck` and calls `vt::ConcatAndCacheMla`, which at
+`head_dim` 512 is 2048 bytes/token, **3.5x** the declared page. The
+`Fp8DsMlaLayout` round-trip in the same function is NUMERIC and not storage: it
+encodes and decodes back to floats.
+
+So the model declares a 584-byte layout and writes 2048 bytes, and the refusal is
+the system noticing.
+
+- **Widening the guard** (skipping the retype for specs that declare their own
+  `cache_dtype_str`) would let the runner allocate 584-byte pages the forward
+  overruns by 3.5x. It would appear to work only because no production path binds
+  a paged cache at all ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)),
+  so the pages are allocated and never read -- a trap set for whoever fixes that.
+- **Republishing the topology at f32/bf16** would red seven gated assertions that
+  correctly mirror upstream, and triple the KV footprint at the 384k context the
+  throughput target is measured at.
+
+The fix is the fp8_ds_mla **store and read**, owed to `KV-DSV4-MULTICACHE` W5.
+The encode/decode reference already exists (`Fp8DsMlaEncodeToken`); what is
+missing is the packed 584-byte store in `vt::ConcatAndCacheMla` and the matching
+read in `PagedCausalMlaAttention`. That is a vt-level change owned by that row.
+
+What this row DID change is the refusal message, which blamed
+`--kv-cache-dtype` when `vllm-cli` has no such flag and none was passed. It now
+names both causes and points at W5.
 
 So the reachability claim this row can make is exact: the block-size floor is
 proven on the real artifact, and the artifact still does not reach a forward,

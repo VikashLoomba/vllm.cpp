@@ -2497,8 +2497,28 @@ which is precisely how this landed green locally in the first place.
   next synchronising call -- so the kernel and address are being located with
   `compute-sanitizer` rather than guessed at.
 
-  **W2 is therefore NOT done, and the residency half must not be read as the
-  whole** ([#2458](https://github.com/mudler/vllm.cpp/issues/2458)). Staging works; the experts do not yet compute on the device. The
+  **THE ARM IS BISECTED, AND THE EXPERTS DO COMPUTE ON CUDA.** Re-run on
+  `thor:gpu0` with the tree's own `VT_DSV4_EXL3_FUSED_MOE=0` lever
+  (`deepseek_v4.h:552-566`), which selects the per-expert `vt::Exl3Gemm` loop
+  instead of the fused kernel:
+
+  | arm | result |
+  |---|---|
+  | per-expert loop, `VT_DSV4_EXL3_FUSED_MOE=0` | **rc=0, 5/5 assertions, `max \|diff\| = 0`** |
+  | fused `vt::Exl3MoeMlp`, default ON | illegal memory access, 0 assertions |
+
+  The loop arm's logits are **BIT-IDENTICAL** to the CPU arm's through the
+  production entry `DeepseekV4Model::Forward`, on a tower the same case asserts is
+  device-staged (and asserts the CPU side is not). So the routed experts of an
+  EXL3 checkpoint compute on a GPU, which is what W2 set out to make possible and
+  what the blanket refusal prevented entirely.
+
+  **The FUSED arm is where the defect is** ([#2458](https://github.com/mudler/vllm.cpp/issues/2458)),
+  and it is the fast path, so W2 is not finished. `compute-sanitizer` places it in
+  `exl3_moe_kernel` as an 8-byte read at `base + tid*8` with base NULL (`0x0,
+  0x8 ... 0x200, 0x208`). The per-pointer and eighteen-operand checks added here
+  do NOT fire, so every pointer is valid at launch and the null arises inside the
+  kernel rather than at the boundary. Staging works; the experts do not yet compute on the device. The
   refusal that stood before this change is gone, so what replaced a loud refusal
   is currently a crash rather than a wrong answer -- loud, but not correct.
 

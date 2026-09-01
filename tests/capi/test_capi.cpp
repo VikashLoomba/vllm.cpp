@@ -1621,8 +1621,9 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // The multimodal input limits are ABI v19; the speech/music slice
   // (vllm_speech_* / vllm_synthesize) is ABI v20; the speech device selector is
   // v21; `vllm_model_params.mmproj_path` (issue #821) is v22; the render phase
-  // table (vllm_video_last_phase_log, issue #1010) is v23.
-  CHECK(vllm_abi_version() >= 23);
+  // table (vllm_video_last_phase_log, issue #1010) is v23;
+  // `vllm_model_params.kv_cache_dtype` (fork issue #7) is v24.
+  CHECK(vllm_abi_version() >= 24);
   // And the symbol is LINKED, not merely declared: a NULL handle answers NULL
   // rather than crashing, which is the contract every other handle query here
   // holds to.
@@ -1643,6 +1644,34 @@ TEST_CASE("capi: v16 KV-sizing knobs default and round-trip") {
   p.kv_cache_memory_bytes = int64_t{4} * 1024 * 1024 * 1024;
   CHECK(p.gpu_memory_utilization == doctest::Approx(0.85));
   CHECK(p.kv_cache_memory_bytes == int64_t{4} * 1024 * 1024 * 1024);
+}
+
+// ─── ABI v24: KV-cache storage dtype (fork issue #7) ─────────────────────────
+TEST_CASE("capi: v24 kv_cache_dtype defaults to NULL (auto)") {
+  vllm_model_params p = vllm_model_params_default();
+  CHECK(p.kv_cache_dtype == nullptr);
+}
+
+TEST_CASE("capi: v24 kv_cache_dtype reaches the engine load") {
+  // A valid kv_cache_dtype string is accepted by the ABI layer and reaches
+  // FromModelDir, where it fails on the missing checkpoint. The proof that the
+  // field was read — not merely tolerated — is that the load fails with
+  // VLLM_ERR_MODEL_LOAD (the code every FromModelDir failure reports) rather
+  // than VLLM_ERR_INVALID_ARGUMENT (which the ABI layer returns for fields it
+  // rejects before any model I/O). Deleting the `ep.kv_cache_dtype = ...`
+  // assignment in vllm_engine_load leaves the field inert, and the load still
+  // fails with MODEL_LOAD — but so does a load that never set the field, so
+  // the mutation evidence is the ABI version bump and the default-NULL check
+  // above, not this case alone. This case gates the field's ACCEPTANCE.
+  for (const char* dtype : {"fp8", "fp8_e4m3", "auto", "bfloat16"}) {
+    vllm_model_params p = vllm_model_params_default();
+    p.model_path = "/nonexistent/vllm-cpp/model/dir";
+    p.kv_cache_dtype = dtype;
+    vllm_engine* eng = nullptr;
+    CAPTURE(dtype);
+    CHECK(vllm_engine_load(&p, &eng) == VLLM_ERR_MODEL_LOAD);
+    CHECK(eng == nullptr);
+  }
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────

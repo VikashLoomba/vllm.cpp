@@ -327,8 +327,11 @@ investigation row but MUST be addressed by the item-5 port:
 ## Owed
 
 - **The capture arm's cold step emits a deterministic wrong first decode
-  token ([#2461](https://github.com/mudler/vllm.cpp/issues/2461)) — BLOCKS
-  the wave's own "answer coherent vs the default arm" gate line.** Found by
+  token ([#2461](https://github.com/mudler/vllm.cpp/issues/2461)) — REPAIR
+  LANDED in this change (2026-09-01, root cause and evidence in `## Now`);
+  the issue closes on merge. RESIDUAL, a separate defect to file: the
+  capture-armed battery's one remaining failure at prompt[1] tok=1 is
+  cross-request persistent shadow state, not the slab swap.** Found by
   the wave's fresh mutation review (2026-09-01): the reviewer's rerun of the
   capture-armed focused gate printed deterministic gibberish where the
   operator's evidence record claimed "coherent" — the gate's `words>20`
@@ -342,11 +345,13 @@ investigation row but MUST be addressed by the item-5 port:
   token-exact (battery prompts 1-15), so the defect is the driver's eager
   cold pre-warm step (`qwen3.cpp:1086-1111`) under the Warm*-staged
   cached-device-tensor paths leg A never exercises; driver-side attn
-  metadata on that step is verified correct. Pre-exists both R4 fixes (fix 1
-  is warm-branch-only, fix 2's fresh-slot arm is capture-only). Likely an
-  R5-era latent defect: no token gate ever ran on the captured CLI path.
-  The PR is blocked on the repair; the throughput ratios below stand as
-  machinery measurements, not as a capability verdict.
+  metadata on that step is verified correct; the root cause is the
+  stride-fabricated shadow descriptor (`## Now`). Pre-exists both R4
+  fixes (fix 1 is warm-branch-only, fix 2's fresh-slot arm is
+  capture-only). R5-era latent: no token gate ever ran on the captured
+  CLI path. The repair carries red→green evidence and a token-clean
+  A/B/C re-measurement (`## Now`); the machinery-only caveat on the
+  earlier captured-arm ratios is superseded by it.
 - **The default-polarity question reopened by
   [#2003](https://github.com/mudler/vllm.cpp/issues/2003): RESOLVED as a
   documented stand-pat (2026-08-30, closed by the W2 record PR).** The
@@ -739,3 +744,53 @@ captured replay vs hybrid opt-out. R5-era measured the captured arm at
 27.1 tok/s against a 5.34 opt-out; the opt-out is now 17.8-18.6, so the
 bar is "beat ~18.5". Only then do #1625 (captured multi-request hang) and
 the capture-default flip decision come back within reach.
+- **#2461 REPAIRED in this change (2026-09-01): the cold-step defect was a
+  stride-fabricated KV shadow descriptor, not driver attn metadata.**
+  `WarmPagedKvShadow` (`src/vt/tenstorrent/tenstorrent_ops.cpp:6278`)
+  described the driver's flash-KV unbind(1) slice — a rank-4 view of the
+  combined `[nb,2,bs,nkv,d]` store whose true block stride is
+  `2*bs*nkv*d` (`dense_attn_block.h` `KvSlice`; observed shape
+  `[256,32,8,128]`, stride `[65536,1024,128,1]`, `IsContiguous()==false`)
+  — as `Tensor::Contiguous`, so `NhdToTtnnLayoutPrefix`
+  (`tenstorrent_ops.cpp:834`) indexed the shadow prefix upload with dense
+  strides: block `b` read `b*bs*nkv*d` elements from the view base, one
+  slab early inside the combined buffer. For every physical block >= 1
+  the K shadow received the previous block's V slab (zeros at prefill
+  positions) and the V shadow the next block's K slab, so the cold step
+  attended over zeros. Block 0 was accidentally safe because offset 0 is
+  each view's own base; leg A never stages a shadow; and replays replayed
+  the same corrupted shadow self-consistently — hence leg A coherence,
+  token-exact replays (battery prompts 1-15), and the "consistent after
+  step 1" shape. The fix stages the descriptor with the view's real
+  strides and threads an `accept_unbind_view` flag (default false) through
+  `EnsurePagedKvTtnn` → `NhdToTtnnLayoutPrefix`, admitting the view only on
+  the warm/capture staging path; every existing caller keeps strict
+  contiguity and the eager path is untouched.
+  Red→green at this HEAD (Qwen3-0.6B, logs `$HOME/hf-repair-*`): RED —
+  capture arm cold argmax 48755 (top-2 gap 1.69, word salad), default arm
+  3364 and coherent, capture-armed golden battery 1 failed of 32
+  assertions at prompt[0] tok=1. GREEN — capture arm cold argmax 3364
+  (top-2 gap 1.125; default 3364, gap 1.375), text coherent;
+  capture-armed battery 1 failed of 37 assertions, prompt[0] now exact and
+  the single failure moved to prompt[1] tok=1 (engine 374 vs committed
+  anchor 572 — the documented residual); default golden battery 125/125;
+  `test_tenstorrent_backend` rc 0. Per-step adjudication
+  (`VT_TT_DUMP_KV`, 12-token CLI pair, same binary): prefill and the cold
+  step argmax-exact; the first divergence is step 2, capture top-2 gap
+  0.375 nats — inside the near-tie band (`qwen3-neartie-gap.py`, ≤0.5) —
+  after which both arms greedy-decode their own coherent prefixes.
+  Token-clean A/B/C re-measurement (`hf-gate3.sh`, same binary, 3
+  order-alternated triples, `--repeat 5`, cold repeat discarded, warm
+  medians): default 12.90 / opt-out 17.80 / CAPTURED 27.47 tok/s — 2.13x
+  the default, 1.54x the opt-out; replays=474 and 0 fatals on every leg,
+  and every capture leg's output verified coherent this time. The captured
+  replay ratios are now a capability verdict, not only a machinery
+  measurement; the CORRECTNESS CAVEAT on the earlier 27.57 figure is
+  superseded by this re-measurement.
+  RESIDUAL, owned separately: the capture-armed 16-prompt battery still
+  fails exactly one assertion, now at prompt[1] tok=1 — cross-request
+  persistent shadow state, a different defect from the slab swap (prompt[1]
+  passes in isolation). The battery's fatal REQUIRE stops the case at the
+  first drift, so this run proves prompt[0] exact and the move of the
+  failure cell; the scratch clone's verification covered prompts 1-15.
+  File it as its own issue.

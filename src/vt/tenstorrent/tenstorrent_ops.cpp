@@ -816,19 +816,40 @@ void DropPagedKvShadow(void* host) {
   PagedKvShadows().erase(reinterpret_cast<uintptr_t>(host));
 }
 
+// The flash-KV unbind(1) slice of the combined [nb,2,bs,nkv,d] paged store
+// (dense_attn_block.h KvSlice): dense inner dims, block stride 2*bs*nkv*d.
+// WarmPagedKvShadow stages exactly this view; nothing else may relax the
+// contiguity requirement.
+bool IsFlashKvUnbindView(const Tensor& t) {
+  return t.rank == 4 && t.stride[1] == t.shape[2] * t.shape[3] &&
+         t.stride[2] == t.shape[3] && t.stride[3] == 1;
+}
+
 // Convert host NHD blocks [0, used_nb) → ttnn [used_nb, nkv, bs, d] f32.
-std::vector<float> NhdToTtnnLayoutPrefix(const Tensor& cache, uint32_t used_nb) {
+// `accept_unbind_view` also admits the flash-KV unbind view above — vetted,
+// never assumed: the caller must pass the flag and the inner strides must
+// still be dense, so a genuinely misdescribed cache still fails the check
+// instead of silently reading the wrong slab. Default false keeps every
+// existing caller strict.
+std::vector<float> NhdToTtnnLayoutPrefix(const Tensor& cache, uint32_t used_nb,
+                                         bool accept_unbind_view = false) {
   EnsureHost(cache);
-  VT_CHECK(cache.rank == 4 && cache.IsContiguous(), "NhdToTtnn: rank-4 contiguous");
+  VT_CHECK(cache.rank == 4, "NhdToTtnn: rank-4");
   const int64_t nb = cache.shape[0], bs = cache.shape[1], nkv = cache.shape[2],
                 d = cache.shape[3];
+  VT_CHECK(cache.IsContiguous() || (accept_unbind_view && IsFlashKvUnbindView(cache)),
+           "NhdToTtnn: rank-4 contiguous (or vetted unbind view)");
   VT_CHECK(used_nb > 0 && static_cast<int64_t>(used_nb) <= nb, "NhdToTtnn: used_nb");
   std::vector<float> out(static_cast<size_t>(used_nb) * static_cast<size_t>(nkv * bs * d));
   for (int64_t b = 0; b < static_cast<int64_t>(used_nb); ++b) {
     for (int64_t g = 0; g < nkv; ++g) {
       for (int64_t off = 0; off < bs; ++off) {
         for (int64_t e = 0; e < d; ++e) {
-          const int64_t src = ((b * bs + off) * nkv + g) * d + e;
+          // General stride form: for a contiguous cache this is exactly the
+          // previous dense formula; for the unbind view it is the only form
+          // that reads block b's own slab instead of its neighbor's.
+          const int64_t src = b * cache.stride[0] + off * cache.stride[1] +
+                              g * cache.stride[2] + e;
           const int64_t dst = ((b * nkv + g) * bs + off) * d + e;
           out[static_cast<size_t>(dst)] = LoadElemF32(cache, src);
         }
@@ -1177,9 +1198,12 @@ void NotePagedKvRacWrites(Tensor& k_cache, Tensor& v_cache, const std::vector<ui
 // ("buffers may be corrupted once a trace is executed"). Observed as every
 // replay collapsing to all-zero logits at the first block-table growth
 // (slot 63→64 with block_size 32). A pool-sized shadow never moves.
-ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint32_t used_nb) {
-  VT_CHECK(cache_nhd.rank == 4 && cache_nhd.IsContiguous(),
-           "EnsurePagedKvTtnn: contiguous rank-4 NHD cache");
+ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint32_t used_nb,
+                               bool accept_unbind_view = false) {
+  VT_CHECK(cache_nhd.rank == 4, "EnsurePagedKvTtnn: rank-4 NHD cache");
+  VT_CHECK(cache_nhd.IsContiguous() ||
+               (accept_unbind_view && IsFlashKvUnbindView(cache_nhd)),
+           "EnsurePagedKvTtnn: contiguous rank-4 NHD cache (or vetted unbind view)");
   const uint32_t pool_nb = static_cast<uint32_t>(cache_nhd.shape[0]);
   const uint32_t bs = static_cast<uint32_t>(cache_nhd.shape[1]);
   const uint32_t nkv = static_cast<uint32_t>(cache_nhd.shape[2]);
@@ -1208,7 +1232,7 @@ ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint
       s.mirror_valid = false;  // content below [0,used) not trustworthy yet
     }
   }
-  used = NhdToTtnnLayoutPrefix(cache_nhd, used_nb);
+  used = NhdToTtnnLayoutPrefix(cache_nhd, used_nb, accept_unbind_view);
   {
     std::lock_guard<std::mutex> g(PagedKvMutex());
     PagedKvShadow& s = PagedKvShadows()[reinterpret_cast<uintptr_t>(cache_nhd.data)];
@@ -6259,12 +6283,32 @@ void WarmPagedKvShadow(void* k_cache_data, void* v_cache_data,
   if (num_blocks < 1 || block_size < 1 || used_blocks < 1) return;
   MeshDevice& device = SharedMeshDevice();
   auto warm_one = [&](void* data) {
-    Tensor cache = Tensor::Contiguous(
-        data, DType::kBF16, Device{DeviceType::kTENSTORRENT, 0},
-        {num_blocks, block_size, num_kv_heads, head_size});
+    // The flash KV store is one combined [nb,2,bs,nkv,d] buffer and the driver
+    // hands us its dim-1 unbind slices (dense_attn_block.h KvSlice): rank-4
+    // views whose block stride is 2*bs*nkv*d. Describing that view as
+    // Tensor::Contiguous fabricated dense strides, so the shadow prefix upload
+    // read block b at b*bs*nkv*d — one slab early inside the combined store.
+    // For every block >= 1 the K shadow received the previous block's V slab
+    // (zeros at prefill positions) and the V shadow the next block's K slab;
+    // block 0 stayed correct only because offset 0 is each view's own base.
+    // Describe the view with its real strides instead, and let
+    // EnsurePagedKvTtnn admit it explicitly.
+    Tensor cache;
+    cache.data = data;
+    cache.dtype = DType::kBF16;
+    cache.device = Device{DeviceType::kTENSTORRENT, 0};
+    cache.rank = 4;
+    cache.shape[0] = num_blocks;
+    cache.shape[1] = block_size;
+    cache.shape[2] = num_kv_heads;
+    cache.shape[3] = head_size;
+    cache.stride[0] = 2 * block_size * num_kv_heads * head_size;
+    cache.stride[1] = num_kv_heads * head_size;
+    cache.stride[2] = head_size;
+    cache.stride[3] = 1;
     const uint32_t used = static_cast<uint32_t>(
         std::min(used_blocks, num_blocks));
-    EnsurePagedKvTtnn(cache, device, used);
+    EnsurePagedKvTtnn(cache, device, used, /*accept_unbind_view=*/true);
     if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr) {
       std::lock_guard<std::mutex> pg(PagedKvMutex());
       auto& sh = PagedKvShadows();

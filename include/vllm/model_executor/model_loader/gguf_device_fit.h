@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 #include <string_view>
 
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
@@ -282,6 +283,16 @@ GgufStagedFootprint GgufStagedWeightFootprint(
 // TOTAL rather than FREE on purpose: `free` at load time carries the page cache
 // and whatever else the box is doing, which would make the verdict a function
 // of contention. `total` is a device property.
+// Routed-expert bytes per layer, indexed by layer; a dense layer contributes 0.
+// The `fit` resolver's right-hand side (#2384).
+//
+// Counted with `LlmFfnExpsBlockRegex(idx)` — the SAME pattern a `cpu_moe` or
+// `n_cpu_moe` override is expanded from — so the bytes priced here are exactly
+// the bytes a resulting placement moves. Pricing with a second, similar pattern
+// would let the resolver believe it freed memory the placement never touches.
+std::vector<size_t> GgufRoutedExpertBytesPerLayer(const GgufFile& gguf,
+                                                  int64_t num_hidden_layers);
+
 size_t DeviceWeightBudgetBytes(size_t device_memory_total_bytes);
 
 // The verdict. `refuse == false` with a zero budget means "not decided",
@@ -342,6 +353,30 @@ struct DeviceWeightFit {
 // `policy_forces_full_expand` — see `GgufStagedWeightFootprint`, which this
 // forwards to unchanged. Default `false` keeps this function's own existing
 // callers and tests byte-for-byte unchanged.
+// MODEL-TEXT-GLM-MOE-DSA W3 (#2214, spec §3.3). The streamed-expert lane's
+// DECODE GEOMETRY, read off the same file the lane will serve, so the capacity
+// refusal in `expert_stream_seam.h` and the towers the forward actually streams
+// cannot disagree about a checkpoint.
+//
+// WHY BOTH TERMS COME FROM THE FILE. `streamed_tower_count` uses the SAME suffix
+// predicate as `GgufLargestExpertSliceBytes` and `GgufExpertTowersReachSlotLane`
+// above, so it counts exactly the tensors the lane admits — for a gate/up/down
+// MoE that is `moe_layers * 3`, which is the arithmetic §3.3 states without
+// having to be told the layer count. `experts_per_tok` is `<arch>.expert_used_count`,
+// the key every llama.cpp MoE export writes and every GGUF config parser in this
+// tree already reads.
+//
+// A term this function could not determine is left at 0, and 0 is the caller's
+// signal that the geometry is unknown rather than that it is small. The refusal
+// is inert on a zero for exactly that reason: a checkpoint whose metadata this
+// function did not understand must not be refused BY a number it invented.
+struct GgufExpertLaneGeometry {
+  int64_t streamed_tower_count = 0;
+  int64_t experts_per_tok = 0;
+};
+GgufExpertLaneGeometry GgufStreamedExpertLaneGeometry(
+    const GgufFile& gguf, std::string_view tensor_name_suffix);
+
 DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      std::string_view device_name,
                                      bool needs_weight_staging,

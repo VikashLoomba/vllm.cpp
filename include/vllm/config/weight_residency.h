@@ -446,6 +446,17 @@ bool ResolveGgufMmap(bool builtin_default);
 uint64_t GgufPrefaultedSpanCount();
 void ResetGgufPrefaultedSpanCountForTesting();
 
+// LOAD-IO: the same instrument in the two units an attribution needs. The bytes
+// say how much of the artifact the load actually paged in; the seconds say how
+// long that took, so `bytes / seconds` is the load's OWN measured read rate and
+// `weights_phase - seconds` is the host work beside it. `NoteGgufPrefaultedBytes`
+// is called from the prefault itself, so both are zero on a load that skipped it
+// and on a copy-arm load that borrows nothing -- which is the true answer in both
+// cases, not a missing measurement.
+uint64_t GgufPrefaultedBytes();
+double GgufPrefaultSeconds();
+void NoteGgufPrefaultedBytes(uint64_t bytes, uint64_t nanos);
+
 // The slot geometry the expert-stream store was actually BUILT with; both zero
 // until something builds one. Same reason as the counter above, and the same
 // measurement behind it: with the slot-count site mutated to a hardcoded 64, so
@@ -552,6 +563,37 @@ std::vector<PlacementOverride> ResolvePlacementOverrides();
 // because it is the one placement input that is NOT an override: it is a request
 // to COMPUTE them, and the two are mutually exclusive (`common/fit.cpp:398-399`).
 bool ResolvePlacementFit();
+
+// Whether the operator ASKED for `--fit`, as opposed to inheriting it from the
+// built-in default.
+//
+// The distinction decides what an arm the resolver cannot answer must do. An
+// explicit request that cannot be honoured is an ERROR — the operator asked for
+// something and must not be told silently that it did not happen. A DEFAULT that
+// does not apply is a no-op, because refusing a load over a feature nobody asked
+// for would make `--fit` defaulting on a breaking change for every safetensors
+// checkpoint. Same condition, opposite correct behaviour, so the two cases have
+// to be distinguishable.
+bool PlacementFitWasRequested();
+
+// The message for an EXPLICIT `--fit` standing beside a manual placement, or
+// empty when there is no collision.
+//
+// Mirrors `common/fit.cpp:398-399` ("model_params::tensor_buft_overrides already
+// set by user, abort"): auto and manual are mutually exclusive, not merged.
+//
+// RESOLVE-TIME, and that is what makes it complete. The parse-time refusal sees
+// ONE document, so it misses two ways to reach the same state: a multi-document
+// merge, which copies `fit` and the override fields field by field and never
+// re-runs the check, and the environment, where `VT_PLACEMENT_FIT=1` beside
+// `VT_CPU_MOE=1` was refused nowhere at all. Asking the resolved values closes
+// both without a second checker.
+//
+// ONLY for an explicit fit. Since `fit` now defaults ON, a defaulted fit stands
+// beside every manual placement ever configured; refusing that would make
+// `cpu_moe` unusable. A default that yields to an explicit instruction is not a
+// collision -- the manual placement simply wins.
+std::string DescribePlacementFitCollision();
 
 // THE mmap/placement COLLISION, DECIDED: it WARNS, it does not refuse, and it
 // does not silently win. Returns the warning line, or an empty string when the

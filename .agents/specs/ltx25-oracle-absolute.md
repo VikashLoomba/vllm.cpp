@@ -448,8 +448,26 @@ Stop and report, do not work around:
   should read `:318-476`. Owner: this row.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854) sub-question 1,
   prompt adherence, stays OPEN and is not narrowed by this row.** It needs a
-  vision-language model scoring frames against the prompt, pinned as an oracle
-  with its own gateability measurement. This tree has none. Owner: this row.
+  vision-language model scoring frames against the prompt, with its own
+  gateability measurement. This tree runs none. **Ownership has MOVED** to row
+  `LTX25-PROMPT-ADHERENCE`, spec
+  [`ltx25-prompt-adherence.md`](ltx25-prompt-adherence.md), issue
+  [#2295](https://github.com/mudler/vllm.cpp/issues/2295), which investigated it
+  and found the scorer inside the PRIMARY oracle rather than outside the table:
+  vLLM at `5559679229` registers `CLIPEmbeddingModel` (`registry.py:251`). That
+  row ends in a `NEEDS_DECISION` — whether a scoring model is an oracle or an
+  instrument — and it implements nothing until that is answered. The sentence
+  above stays as this row wrote it, because it was true when this row landed.
+
+  **UPDATE, 2026-08-31: that decision is ANSWERED and the scorer now RUNS.** The
+  developer's answer is INSTRUMENT, so `ltx-2` remains the oracle and AGENTS.md's
+  table is unchanged. `LTX25-PROMPT-ADHERENCE` W1 and W2 landed the pinned
+  checkpoint, an S0 precondition, an S1 bound recomputed from THIS row's
+  reference render, and an S2 argmax over committed decoys. So "this tree runs
+  none" and "is not narrowed by this row" are both superseded, and the bullet is
+  kept rather than rewritten because it records what was true at
+  `fa9903b86`. #1854 stays OPEN: what is still owed is OUR render's frames,
+  scored. Owner is unchanged.
 - The three REPORTED statistics of §5 stay reported. Each has a stated
   derivation that failed, not an absence of effort. Owner: this row.
 
@@ -749,3 +767,11 @@ worse on blockiness.
 Nothing above says the 25 frames depict a red fox in a snowy pine forest. That is
 #1854's first sub-question, it needs a vision-language model pinned as an oracle,
 and it stays open.
+
+**UPDATE, 2026-08-31.** The paragraph above was true at `fa9903b86` and is no
+longer. `LTX25-PROMPT-ADHERENCE` (#2295) landed `--adherence-model`, and the
+reference render's own 25 frames now read a mean CLIP score of 38.1278 against
+that prompt, ranking it first over six committed decoys on 25 of 25 frames. What
+is still not measured is OUR render, whose frames were never committed. The
+paragraph stays as written because it records this row's own state, and the
+correction lives here rather than in a rewrite of it.

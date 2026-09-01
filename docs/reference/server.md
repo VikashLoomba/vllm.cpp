@@ -199,7 +199,7 @@ a stop token early.
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | model default | Override automatic prefix caching |
 | `--scheduling-policy fcfs\|priority\|lpm` | `fcfs` | Scheduler policy (`lpm` is the SGLang cache-aware policy, see [the SGLang compatibility guide](../SGLANG-COMPAT.md)) |
 | `--enable-radix-attention` / `--disable-radix-attention` | model default | SGLang-named alias for the prefix-cache toggle |
-| `--enable-jump-forward` | off | Jump-forward decoding for structured output (token-unique subset) |
+| `--enable-jump-forward` / `--disable-jump-forward` | off | **Accepted and validated, and nothing decodes with it yet.** See [What `--enable-jump-forward` does not do yet](#what---enable-jump-forward-does-not-do-yet) |
 | `--enable-force-include-usage` | off | Force the usage block in responses |
 | `--generation-config auto\|vllm\|<dir>` | `auto` | Where the server's default sampling parameters come from. `auto` takes `temperature`, `top_k`, `top_p`, `min_p` and `repetition_penalty` from the checkpoint's own `generation_config.json`, and a request that OMITS one of those knobs then gets the checkpoint's value; a request that sends one still wins. `vllm` loads no file and keeps the neutral OpenAI defaults. A directory path reads a `generation_config.json` from there instead. `Qwen/Qwen3.8-27B` ships `top_k: 20` and `top_p: 0.95`, so under `auto` an unparameterised request samples from 20 candidates rather than all 248,320. The server prints what it resolved at startup. `--override-generation-config` is unavailable ([#1985](https://github.com/mudler/vllm.cpp/issues/1985)). |
 | `--tool-call-parser <name>` | `hermes` | Select one of 42 registered names across 38 dialect families. `auto` detects the dialect from the chat template, and `none` disables parsing. Gemma-4 accepts wrapped or bare text calls. Inkling requests require `"skip_special_tokens": false`. The `inkling` reasoning parser is unavailable. |
@@ -207,7 +207,7 @@ a stop token early.
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [the KV offload guide](../KV-OFFLOAD.md) |
 | `--offload-config '<json>'` | (unset) | Configure vLLM weight-offload fields and the `vllm_cpp` disk-residency and hybrid-placement tiers. vLLM offload backends currently refuse at startup because loaders do not use them. A `vllm_cpp`-only config works. Transcription refuses this flag. See [Weight offload and placement](../WEIGHT-OFFLOAD.md) and [Expert streaming](../guides/expert-streaming.md). |
 | `--speculative-config '<json>'` | (unset) | Configure `mtp`, `dflash`, `ngram`, or `dspark`. Unknown fields, unsupported methods, incompatible targets, and invalid depths refuse at startup. Sampling defaults to `greedy` with `standard` rejection. The document also accepts a `vllm_cpp` extension object whose only key is `drafter_chain`, a preference-ordered list of speculators; it is validated but refused at startup, because nothing resolves a chain yet. See [Speculative decoding](../SPECULATIVE-DECODING.md). |
-| `--language-model-only` / `--no-language-model-only` | off | Set every multimodal limit to zero. Multimodal requests then return HTTP 400. It also skips loading any tower whose every modality it zeroes, mirroring vLLM's `_mark_tower_model` (`interfaces.py:288-293`); the server names what it skipped. Measured on **Qwen3-VL-4B-Instruct only**: **1.542 GiB of host RSS at load**, `--device cpu`, `thor:gpu0`, 2026-08-24 ([#607](https://github.com/mudler/vllm.cpp/issues/607)). Read that as one model's tower rather than a general saving, about half of it was our own bf16→f32 widening ([#1359](https://github.com/mudler/vllm.cpp/issues/1359)), whose Qwen3-VL half has since landed so a rerun should read about 0.774 GiB and that fall is correct, and it is load-time host RAM, not VRAM. Other models are unmeasured. See [Multimodal input](../guides/multimodal-input.md) and [Memory benchmarks](../benchmarks/memory.md). |
+| `--language-model-only` / `--no-language-model-only` | off | Set every multimodal limit to zero. Multimodal requests then return HTTP 400. It also skips loading any tower whose every modality it zeroes, mirroring vLLM's `_mark_tower_model` (`interfaces.py:288-293`); the server names what it skipped. Measured on **Qwen3-VL-4B-Instruct only**: **0.770 GiB of host RSS at load**, `--device cpu`, `dgx:gpu0`, 2026-08-28 ([#607](https://github.com/mudler/vllm.cpp/issues/607)). Read that as one model's tower rather than a general saving, and note it is load-time host RAM, not VRAM. An earlier 2026-08-24 run read 1.542 GiB; about half of that was our own bf16→f32 widening ([#1359](https://github.com/mudler/vllm.cpp/issues/1359)), whose Qwen3-VL half has since landed, and the 2026-08-28 rerun measured the resulting 0.499x fall — correct, not a regression. Other models are unmeasured. See [Multimodal input](../guides/multimodal-input.md) and [Memory benchmarks](../benchmarks/memory.md). |
 | `--limit-mm-per-prompt '<json>'` | `999` per modality | Set lower per-prompt limits with a JSON object such as `'{"image": 2, "video": 0}'`. Malformed JSON, negative counts, and unknown image, video, or audio options refuse at startup. Dotted flag syntax is unavailable. See [Multimodal input](../guides/multimodal-input.md). |
 | `--mmproj <mmproj-*.gguf>` | (unset) | Load and validate a `clip` GGUF projector for a GGUF model. The server refuses incompatible model types, architectures, projector types, and incomplete temporal patch weights. HTTP multimodal inference for GGUF is unavailable, so this option does not produce image answers. See [Multimodal input](../guides/multimodal-input.md). |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
@@ -291,6 +291,42 @@ host RAM as well. A value of 0.85 has hard-rebooted a GB10 box. When M3 lands
 and this flag starts to bind, choose the fraction on such a board against the
 whole 119 GiB pool and leave the host its headroom. Until then the flag reserves
 nothing, on any board.
+
+### What `--enable-jump-forward` does not do yet
+
+The server accepts the flag, refuses it when you pass it twice, and resolves it
+into the engine as `LoadedEngine::jump_forward_enabled()`. Nothing then reads the
+resolved value. Passing `--enable-jump-forward` therefore leaves the decode path
+exactly as passing nothing leaves it. `--disable-jump-forward` turns off
+something that was never on.
+
+Everything up to that latch exists, and each part has unit tests:
+
+- `NativeGrammar::forced_token`, the grammar hook that reports the single valid
+  next token at a non-accepting state.
+- `vllm::v1::DrainForcedTokens`, the driver that drains a run of forced tokens
+  and advances the grammar over them.
+- The tri-state resolution of the flag against the `VT_ENABLE_JUMP_FORWARD`
+  environment override.
+- The C ABI field `vllm_model_params.enable_jump_forward`, added in ABI v10.
+
+One call site is missing. Draining forced tokens between model steps means
+recomputing KV for the tokens the model never ran, and that scheduler splice is
+not implemented. Until it lands, `DrainForcedTokens` is called only from
+`tests/vllm/v1/structured_output/test_jump_forward.cpp`, and
+`jump_forward_enabled()` is read only from `tests/capi/test_capi.cpp`.
+
+The work is `ENG-STRUCTURED-OUTPUT`, tracked by
+[issue #2387](https://github.com/mudler/vllm.cpp/issues/2387).
+
+The server accepts the flag rather than refusing it because the knob is already
+published: ABI v10 added the field, and the [SGLang compatibility
+guide](../SGLANG-COMPAT.md) documents it. Refusing it now would break a caller
+that already sets it, and setting it cannot give a wrong answer, because it
+changes no answer at all.
+
+**Note.** Unlike `--gpu-memory-utilization`, this flag prints no startup warning,
+so a log tells you nothing either way. This page is the only signal.
 
 ### Context length vs the KV pool
 

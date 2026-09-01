@@ -960,18 +960,49 @@ std::atomic<uint64_t>& PrefaultedSpans() {
   static std::atomic<uint64_t> n{0};
   return n;
 }
+// LOAD-IO. The span COUNT answers "did the prefault run". It cannot answer the
+// question a 74-minute load actually poses, which is "how much of that wall time
+// was the file arriving, and how much was our own host work". Bytes and seconds
+// answer it: the prefault is the only place a keep-quant GGUF load touches every
+// weight page, so its elapsed time IS the load's I/O time, and everything else
+// inside the weights phase is compute. Without this split the two are one number
+// and any attribution between them is a guess.
+std::atomic<uint64_t>& PrefaultedBytes() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+std::atomic<uint64_t>& PrefaultNanos() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
 }  // namespace
 
 uint64_t GgufPrefaultedSpanCount() {
   return PrefaultedSpans().load(std::memory_order_relaxed);
 }
 
+uint64_t GgufPrefaultedBytes() {
+  return PrefaultedBytes().load(std::memory_order_relaxed);
+}
+
+double GgufPrefaultSeconds() {
+  return static_cast<double>(PrefaultNanos().load(std::memory_order_relaxed)) /
+         1e9;
+}
+
 void ResetGgufPrefaultedSpanCountForTesting() {
   PrefaultedSpans().store(0, std::memory_order_relaxed);
+  PrefaultedBytes().store(0, std::memory_order_relaxed);
+  PrefaultNanos().store(0, std::memory_order_relaxed);
 }
 
 void NoteGgufPrefaultedSpan() {
   PrefaultedSpans().fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteGgufPrefaultedBytes(uint64_t bytes, uint64_t nanos) {
+  PrefaultedBytes().fetch_add(bytes, std::memory_order_relaxed);
+  PrefaultNanos().fetch_add(nanos, std::memory_order_relaxed);
 }
 
 ExpertStreamGeometry BuiltExpertStreamGeometry() {
@@ -1140,9 +1171,40 @@ std::string DescribePlacementResidencyCollision() {
 bool ResolvePlacementFit() {
   const std::optional<PlacementConfig>& cfg =
       ActiveWeightResidencyConfig().placement;
+  // ON by default, mirroring llama.cpp's `fit_params = true` (`common/common.h:468`
+   // @ b10451). Upstream's headline behaviour is that a model too large for the
+  // device just runs, without the operator configuring anything; shipping the
+  // mechanism switched off would give us the machinery and not the experience.
+  //
+  // Three conditions make that safe, and each is tested: an UNKNOWN budget places
+  // NOTHING rather than everything, an arm the resolver cannot answer is INERT
+  // unless explicitly requested, and a placement that happens is announced with
+  // the arithmetic behind it.
   return ResolveResidencyBool("VT_PLACEMENT_FIT",
                               cfg.has_value() ? cfg->fit : std::nullopt,
-                              /*builtin_default=*/false);
+                              /*builtin_default=*/true);
+}
+
+std::string DescribePlacementFitCollision() {
+  if (!PlacementFitWasRequested()) return "";  // a default yields; it collides with nothing
+  if (!ResolvePlacementFit()) return "";       // explicitly OFF collides with nothing
+  const std::vector<PlacementOverride> overrides = ResolvePlacementOverrides();
+  if (overrides.empty()) return "";
+  return "offload config: \"vllm_cpp.placement.fit\" (--fit) was asked for "
+         "explicitly and a manual placement is also in effect (" +
+         std::to_string(overrides.size()) +
+         " override(s) from \"overrides\", \"cpu_moe\", \"n_cpu_moe\" or their "
+         "environment variables). The resolver would have to override what the "
+         "operator asked for, so these are mutually exclusive rather than "
+         "merged. Drop one: unset the manual placement to let --fit decide, or "
+         "set VT_PLACEMENT_FIT=0 to keep the placement you stated";
+}
+
+bool PlacementFitWasRequested() {
+  if (std::getenv("VT_PLACEMENT_FIT") != nullptr) return true;
+  const std::optional<PlacementConfig>& cfg =
+      ActiveWeightResidencyConfig().placement;
+  return cfg.has_value() && cfg->fit.has_value();
 }
 
 size_t ResolveDeviceWeightBudgetBytes(size_t probed_total_bytes) {

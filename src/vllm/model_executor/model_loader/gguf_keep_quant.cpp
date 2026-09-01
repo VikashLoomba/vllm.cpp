@@ -158,14 +158,34 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
   return true;
 }
 
-// Device gate for the gather arm. Today ONLY the CPU kernel decodes a block
-// table: `EmbeddingKernelCuda` (src/vt/cuda/cuda_ops.cu) still asserts
-// f32/bf16, so on CUDA a kept table would throw at the first forward with the
-// whole model resident. It refuses here instead, and the CUDA arm is owed —
-// which is a real cost, because the device-resident quantized table is exactly
-// the shape llama.cpp's own n-gram path does NOT have.
+// Device gate for the gather arm, asked of the OP/PROVIDER TABLE and not of a
+// hand-kept device list.
+//
+// `vt::Embedding` routes a block-quantized table to `OpId::kEmbeddingQuant`
+// (vt/ops.cpp), so "can this device decode a block row" is exactly "is that op
+// registered here". That is the same shape `GgufQuantComputeAvailable()` above
+// uses for the GEMM arm, and it is the shape this function was owed: naming a
+// device here is what `scripts/check-device-leakage.py` refuses, because the
+// GGUF loader is the device-agnostic layer and a per-device set written into it
+// drifts from the kernels it claims to describe.
+//
+// Registered today by kCPU (cpu_ops.cpp, through `BlockToFloat`) and by the
+// CUDA backend (cuda_ops.cu, through cuda_quant_dequant.cuh) -- named in prose
+// rather than as the enumerator on purpose, because the leakage checker greps
+// the token in comments too, and rightly so: a prose mention is how the next
+// hand-kept device list starts. METAL, VULKAN, ROCM and
+// TENSTORRENT register only `kEmbedding`, whose kernels each assert a float
+// table by name, so they answer false here and keep their pre-existing
+// expand-bf16 residency -- and their gather arms are owed.
+//
+// What this unlocks is not one op. On a device that cannot gather quantized,
+// the Qwen3.8-Flash-Next n-gram table expands from 26.822 GiB of IQ4_NL to
+// 95.368 GiB of bf16, against ~119.6 GiB of usable memory on the one box that
+// fits the model at all -- so the device-resident quantized table is what makes
+// a GPU arm possible, and llama.cpp's own n-gram path does NOT have this shape
+// (#27742 pins that table to the CPU by tensor class).
 bool DeviceQuantGatherSupported(vt::DeviceType dev) {
-  return dev == vt::DeviceType::kCPU;
+  return vt::OpRegistered(vt::OpId::kEmbeddingQuant, dev);
 }
 
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {

@@ -15,6 +15,7 @@
 #include <string>
 #include <type_traits>
 
+#include "vt/cuda/cuda_embedding_quant.h"  // the KGATHER seam: block-table gather + its error record
 #include "vt/cuda/rmsnorm_decode_fast.h"
 #include "vt/ops.h"
 #include "vt/dflash_attn_grid.h"
@@ -740,11 +741,11 @@ void SoftCapKernelCuda(Queue& q, Tensor& out, const Tensor& x, double cap) {
 // M0.9/M2).
 // No direct csrc counterpart (upstream uses torch embedding); keep vt-native.
 
-struct EmbeddingErr {
-  int status;    // 0 = ok, 1 = bad id recorded
-  int pad;       // keep `id` naturally aligned
-  long long id;  // first out-of-range id seen (valid when status != 0)
-};
+// The error record moved to vt/cuda/cuda_embedding_quant.h when the BLOCK arm
+// landed: the block kernels live in cuda_quant_dot.cu (the only TU that may
+// include the device codebooks) and write this same latch, and two hand-mirrored
+// layouts would report a wrong id without ever failing to compile.
+using EmbeddingErr = EmbeddingQuantErr;
 
 template <typename Tin, typename Tout, typename Tid>
 __global__ void EmbeddingKernel(Tout* out, const Tin* table, const Tid* ids, int64_t n,
@@ -858,8 +859,23 @@ bool ConsumeEmbeddingErr(EmbeddingErrSlot& slot, bool force, EmbeddingErr* err_o
 
 void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   // Validate dtypes before touching the ring so a throw cannot leave a slot armed.
-  VT_CHECK(table.dtype == DType::kF32 || table.dtype == DType::kBF16,
-           "cuda embedding: unsupported table dtype (f32/bf16 only)");
+  //
+  // BLOCK-QUANTIZED tables are admitted here (KGATHER). This kernel asserted
+  // f32/bf16 until then, which is why `DeviceQuantGatherSupported` refused every
+  // non-CPU device and a kept table expanded at load instead -- 26.822 GiB of
+  // IQ4_NL becoming 95.368 GiB of bf16 for the shipped n-gram table, which fits
+  // nothing in this fleet. The decode is one row per gathered id, mirroring the
+  // CPU arm (cpu_ops.cpp EmbeddingKernel) and `ggml_compute_forward_get_rows_q`.
+  const bool block_table = IsBlockQuant(table.dtype);
+  VT_CHECK(block_table || table.dtype == DType::kF32 || table.dtype == DType::kBF16,
+           "cuda embedding: unsupported table dtype (f32/bf16 or a block quant)");
+  // A block dtype with NO device decoder must say so by name. It cannot be
+  // reached from the loader, whose `DeviceQuantGatherSupported` gate is pinned
+  // to this same list, but a direct `vt::Embedding` caller can reach it and the
+  // alternative to a named refusal is a silently untouched output buffer.
+  VT_CHECK(!block_table || EmbeddingQuantSupported(table.dtype),
+           std::string("cuda embedding: no device row decoder for block dtype ") +
+               Name(table.dtype));
   VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
            "cuda embedding: unsupported out dtype");
   const int64_t n = ids.shape[0] * table.shape[1];
@@ -895,7 +911,8 @@ void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tenso
 
   cudaError_t st = cudaMemsetAsync(slot.dev, 0, sizeof(EmbeddingErr), s);
   if (st == cudaSuccess) {
-    st = table.dtype == DType::kF32
+    st = block_table ? LaunchEmbeddingQuant(s, out, table, ids, slot.dev)
+         : table.dtype == DType::kF32
              ? LaunchEmbeddingIn<float>(s, out, table, ids, slot.dev)
              : LaunchEmbeddingIn<__nv_bfloat16>(s, out, table, ids, slot.dev);
   }
@@ -3929,6 +3946,25 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<SoftCapFn>(&SoftCapKernelCuda)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
+    // KGATHER. `EmbeddingKernelCuda` branches on `IsBlockQuant(table.dtype)` and
+    // routes a block table to `LaunchEmbeddingQuant` (decoders in
+    // vt/cuda/cuda_quant_dequant.cuh). Registering it under the quant id is what
+    // makes this device's block-gather capability visible to `OpRegistered`,
+    // which is what `DeviceQuantGatherSupported` asks -- so this call IS the
+    // GGUF residency flip, and there is no separate boolean anywhere.
+    //
+    // It was withheld until a GPU had executed the decoders, because registering
+    // it early would route EVERY GGUF model's block-typed gather table on CUDA
+    // into never-executed code, with no throw and no log if a decode were wrong.
+    // MEASURED on thor:gpu0 (Jetson Thor, sm_110, nvcc 13.0.88, aarch64),
+    // 2026-08-31, job e53a20f5: the RED leg without this arm failed BY NAME on
+    // 4 of 5 cases at 32 assertions ("cuda embedding: unsupported table dtype"),
+    // and with it `tests/vt/test_cuda_embedding_quant.cpp` passed 6 of 6 cases
+    // at 231 of 231 assertions -- every one of the 18 block encodings gathered
+    // BIT-EXACTLY against the CPU arm, in f32 and bf16 out, i32 and i64 ids.
+    // Deleting this call reds that gate, which is how the mutation leg proved it
+    // is the reachable call site and not a duplicate.
+    RegisterCudaBlockGather();
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernelCuda)));
     RegisterOp(
@@ -3973,4 +4009,13 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+// See vt/cuda/cuda_embedding_quant.h. Defined out here, outside the anonymous
+// namespace, because `EmbeddingKernelCuda` has internal linkage and the gate
+// cannot name it -- this function is the only way in, which is also what keeps
+// the flip auditable as a single call site.
+void RegisterCudaBlockGather() {
+  RegisterOp(OpId::kEmbeddingQuant, DeviceType::kCUDA,
+             reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
+}
+
 }  // namespace vt::cuda

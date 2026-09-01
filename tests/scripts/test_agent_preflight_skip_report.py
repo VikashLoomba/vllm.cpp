@@ -83,11 +83,15 @@ fi
 exit 0
 """
 
-# The five gates that take the pinned base as an argument, by the script name
-# each one is invoked with. Every one of them must be handed `BASE_SHA`.
+# The gates that take the pinned base as an argument, by the script name each one
+# is invoked with. Every one of them must be handed `BASE_SHA`.
+#
+# `check-issue-index-append-only.py` was a fifth until #2290 deleted it. It
+# guarded a tracked append-only file against a wrong union merge, and the index
+# is derived now -- nothing appends to a generated file, so there is no ordering
+# to violate. The entry is removed with the gate, not to quiet a red.
 BASE_ARGUMENT_GATES = (
     "scripts/check-now-current.py",
-    "scripts/check-issue-index-append-only.py",
     "scripts/check-commit-trailers.py",
     "scripts/check-commit-style.py",
 )
@@ -280,50 +284,51 @@ class PreflightHarness(unittest.TestCase):
 
 
 class SkipIsReportedTests(PreflightHarness):
-    def test_a_non_ancestor_base_reports_skip_and_no_green_banner(self) -> None:
-        """RED before: prints `All gates green.` with the trailer block absent.
+    def test_a_branch_behind_the_base_runs_both_trailer_gates(self) -> None:
+        """RED before: both trailer gates reported SKIP and the ok count fell.
 
-        Occurrence 1 of #998: a branch behind `main`. The two trailer gates were
-        not run, nothing said so, and the banner claimed otherwise.
+        The first occurrence of #998 was a branch behind `main` whose trailer
+        block said nothing. The SKIP arm that replaced the silent `&&` is gone
+        now (#2366): a base that is not an ancestor of HEAD no longer deletes
+        the two gates from the report. `rev-list BASE..HEAD` selects the
+        branch's own commits under any ancestry, and check-commit-style.py
+        walks from the merge base, so a branch behind the base is gated, not
+        skipped.
         """
 
         self.set_origin_main(self.divergent)
         report = self.preflight()
         self.assert_ran_something(report)
 
-        self.assertTrue(
-            any("commit-trailers" in line for line in report.skip),
-            f"the trailer block did not report a SKIP:\n{report}",
+        for label in ("commit-trailers", "commit-style"):
+            with self.subTest(gate=label):
+                self.assertNotIn(
+                    f"SKIP {label}",
+                    report.text,
+                    f"{label} skipped on a branch behind the base:\n{report}",
+                )
+                self.assertIn(
+                    label,
+                    report.ok,
+                    f"{label} did not report ok:\n{report}",
+                )
+        self.assertEqual(
+            [],
+            report.skip,
+            f"a behind-base branch reported a skip:\n{report}",
         )
         self.assertTrue(
-            any("commit-style" in line for line in report.skip),
-            f"the style gate did not report a SKIP:\n{report}",
-        )
-        self.assertFalse(
             report.green,
-            f"a run that skipped {len(report.skip)} gate(s) still printed the "
-            f"green banner:\n{report}",
-        )
-        self.assertIn(
-            "SKIPPED",
-            report.text,
-            f"the summary does not count the skipped gates:\n{report}",
-        )
-        # The reason has to travel with the skip, or the reader learns only that
-        # something did not happen.
-        self.assertIn(
-            "ancestor",
-            report.text,
-            f"no reason printed beside the SKIP:\n{report}",
+            f"both trailer gates ran and passed, but no green banner:\n{report}",
         )
 
     def test_the_ok_count_falls_only_with_a_reported_skip(self) -> None:
-        """RED before: the count falls by two and there are zero SKIP lines.
+        """A gate that stops running has to say so; a behind base stops none.
 
-        This is occurrence 3 exactly, and it is the case that makes a SILENT
-        drop impossible rather than merely unlikely. Asserting the presence of a
-        SKIP line elsewhere does not cover it: a future block could vanish the
-        same way and every other case here would stay green.
+        This was occurrence 3 of #998, back when a non-ancestor base deleted
+        the two trailer gates and the ok count fell without a word. Since
+        #2366 the behind run executes the same gates as the control, so the
+        count cannot fall and no skip is owed for the ancestry alone.
         """
 
         self.set_origin_main(self.base)
@@ -335,19 +340,17 @@ class SkipIsReportedTests(PreflightHarness):
         behind = self.preflight()
         self.assert_ran_something(behind)
 
-        missing = len(ancestor.ok) - len(behind.ok)
-        self.assertGreater(
-            missing,
-            0,
-            "harness precondition failed: the two runs report the same number "
-            f"of gates, so there is no drop to account for.\n{behind}",
+        self.assertEqual(
+            len(ancestor.ok),
+            len(behind.ok),
+            f"{len(ancestor.ok) - len(behind.ok)} gate(s) disappeared from the "
+            "report and no SKIP accounts for them. Every gate that stops "
+            f"running has to say so.\n{behind}",
         )
         self.assertEqual(
-            missing,
-            len(behind.skip),
-            f"{missing} gate(s) disappeared from the report and "
-            f"{len(behind.skip)} were reported as skipped. Every gate that "
-            f"stops running has to say so.\n{behind}",
+            [],
+            behind.skip,
+            f"a behind-base branch reported a skip:\n{behind}",
         )
 
     def test_a_base_that_moves_mid_run_does_not_change_the_verdict(self) -> None:
@@ -413,7 +416,6 @@ class SkipIsReportedTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "issue-index append-only",
             "commit-trailers",
             "commit-style",
         ):
@@ -464,12 +466,12 @@ class TheBannerStaysReachableTests(PreflightHarness):
     def test_a_skipped_run_exits_zero_and_a_failing_run_does_not(self) -> None:
         """SKIP and FAIL are different facts and keep different exit codes.
 
-        A branch behind `main` is ordinary work, so a skip does not fail the
-        run. Widening exit 1 to mean "a gate did not run" would merge the two
-        facts into one signal, which is the conflation this row removes.
+        A base that does not resolve is ordinary work, so a skip does not fail
+        the run. Widening exit 1 to mean "a gate did not run" would merge the
+        two facts into one signal, which is the conflation this row removes.
         """
 
-        self.set_origin_main(self.divergent)
+        self.unset_origin_main()
         skipped = self.preflight()
         self.assert_ran_something(skipped)
         self.assertNotEqual([], skipped.skip, f"nothing was skipped:\n{skipped}")
@@ -515,8 +517,12 @@ class ThePinnedBaseReachesTheCheckersTests(PreflightHarness):
         # PRECONDITION: a log that recorded nothing satisfies every `assertNotIn`
         # below. Count first, and count ALL of them, so a gate that stops being
         # invoked at all cannot pass as a gate invoked correctly.
+        # DERIVED from the tuple, not written as a literal. It was `4` and went
+        # stale the moment a gate was deleted (#2290), which turned a
+        # precondition into the only red in the suite. One invocation per gate is
+        # the property; the number is an implementation detail of the list.
         self.assertEqual(
-            4,
+            len(BASE_ARGUMENT_GATES),
             sum(len(lines) for lines in recorded.values()),
             f"precondition failed: the stub recorded {recorded}, which is not "
             f"one base-carrying invocation per gate.\n{report}",
@@ -579,7 +585,6 @@ class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "issue-index append-only",
             "commit-trailers",
             "commit-style",
         ):
@@ -665,7 +670,6 @@ class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
         # three. Asserting it on the other two would pass on the wrong message.
         for label in (
             "now-current range",
-            "issue-index append-only",
         ):
             with self.subTest(gate=label):
                 reason = self.skip_reason(report, label)
@@ -761,7 +765,6 @@ class StderrIsNotTheValueTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "issue-index append-only",
             "commit-trailers",
             "commit-style",
         ):
@@ -817,7 +820,6 @@ class StderrIsNotTheValueTests(PreflightHarness):
 
         for label in (
             "now-current range",
-            "issue-index append-only",
             "commit-trailers",
             "commit-style",
         ):
@@ -846,13 +848,13 @@ class FailOnSkipTests(PreflightHarness):
     def test_the_flag_makes_a_skip_exit_1_and_the_default_still_exits_0(self) -> None:
         """Both facts in one case, because each is the other's justification.
 
-        Exit 0 by default is the row's own §3.4 decision: a branch behind
-        `origin/main` is ordinary work. Exit 1 under the flag is what a program
+        Exit 0 by default is the row's own §3.4 decision: a checkout whose
+        base does not resolve is ordinary work. Exit 1 under the flag is what a program
         needs, because the exit status carries two of the three states and a
         program cannot read the report that carries the third.
         """
 
-        self.set_origin_main(self.divergent)
+        self.unset_origin_main()
 
         plain = self.preflight()
         self.assert_ran_something(plain)
@@ -921,9 +923,9 @@ class AgentReadyRefusesASkipTests(PreflightHarness):
         )
 
     def test_a_skipped_preflight_stops_the_handoff_gate(self) -> None:
-        """RED before: preflight exits 0 over two skipped gates and this passes."""
+        """RED before: preflight exits 0 over skipped gates and this passes."""
 
-        self.set_origin_main(self.divergent)
+        self.unset_origin_main()
 
         # PRECONDITION: the same tree must actually make preflight skip, or the
         # case below proves nothing about a skip.

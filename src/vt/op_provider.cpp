@@ -286,6 +286,8 @@ const char* OpNameImpl(OpId op) {
       return "RopeNeox";
     case OpId::kEmbedding:
       return "Embedding";
+    case OpId::kEmbeddingQuant:
+      return "EmbeddingQuant";
     case OpId::kCausalConv1dFwd:
       return "CausalConv1dFwd";
     case OpId::kCausalConv1dUpdate:
@@ -529,6 +531,10 @@ const char* OpNameImpl(OpId op) {
       return "Ltx2Vae";
     case OpId::kQwen4ExpPleConv:
       return "Qwen4ExpPleConv";
+    case OpId::kRmsNormGroup:
+      return "RmsNormGroup";
+    case OpId::kQwen4ExpPleGate:
+      return "Qwen4ExpPleGate";
     case OpId::kQwen4ExpGatedResidual:
       return "Qwen4ExpGatedResidual";
     case OpId::kQwen4ExpGatedResidualWriteBack:

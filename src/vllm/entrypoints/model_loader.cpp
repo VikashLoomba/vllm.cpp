@@ -23,9 +23,11 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/config/cache.h"  // KV-FP8 W3: --kv-cache-dtype vs the checkpoint
+#include "vllm/config/weight_residency.h"  // LOAD-IO: GGUF prefault bytes/seconds
 #include "vllm/model_executor/layers/quantization/kv_cache.h"  // k/v scale arms
 #include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/weight_offloader.h"
+#include "vllm/model_executor/expert_stream_seam.h"  // MODEL-TEXT-GLM-MOE-DSA W3 (#2214): the load-time slot-capacity refusal
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -33,6 +35,7 @@
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
 #include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/model_executor/models/glm5_next_weights.h"  // glm5next GGUF arm
+#include "vllm/model_executor/models/glm_moe_dsa.h"  // glm-dsa GGUF arm
 #include "vllm/model_executor/models/muse_glimmer_gguf_weights.h"  // muse-glimmer GGUF arm
 #include "vllm/model_executor/models/qwen4_exp_gguf_weights.h"  // qwen4exp GGUF arm
 #include "vllm/model_executor/models/nemotron_h.h"  // the OWED nemotron_h* GGUF refusal (#809)
@@ -190,6 +193,153 @@ void ReportDevicePlacement(vt::DeviceType engine_device) {
   std::cerr << "engine: device placement: " << described << std::endl;
 }
 
+// ENG-HYBRID-PLACEMENT (#2314): INSTALL the resolved plan, which is the step that
+// makes every part above actually move a weight.
+//
+// W2's neighbour comment says it "RESOLVES AND REPORTS; IT MOVES NOTHING ... W3
+// owns the routing that reads it". W3 built that routing — the `RunMoePlaced`
+// seam and five architectures on it — and never added this call, so the seam read
+// a global nothing ever wrote. `ActiveMoePlacementPlan()` returned the default on
+// every load, `PlacesAnything()` was always false, and NO expert was ever placed.
+//
+// THE ANNOUNCEMENT IS WHY THAT SURVIVED. `ReportDevicePlacement` prints the
+// RESOLVED plan, so an operator running `VT_CPU_MOE=1` read
+// "device placement: N layers on cpu" on stderr and had every reason to believe
+// it. A token gate cannot see it either: with nothing placed the placed arm is
+// byte-identical to the unplaced one, so it passes for the wrong reason.
+//
+// UNCONDITIONAL, including when nothing is placed. The plan lives in a
+// process-wide global, so a second load in the same process must overwrite the
+// first model's plan rather than inherit it; an early return on "no overrides"
+// would leave a stale placement installed against the wrong model.
+void InstallMoePlacementPlan(vt::DeviceType engine_device,
+                             int64_t num_hidden_layers,
+                             const vllm::GgufFile* gguf) {
+  // An EXPLICIT `--fit` beside a manual placement is refused here rather than at
+  // parse time, which closes two holes the parse-time check cannot see: a
+  // multi-document merge, and the environment. A DEFAULTED fit is not a
+  // collision — it yields, and the manual placement wins.
+  if (const std::string collision = vllm::DescribePlacementFitCollision();
+      !collision.empty()) {
+    throw std::invalid_argument(collision);
+  }
+
+  std::vector<vllm::PlacementOverride> overrides =
+      vllm::ResolvePlacementOverrides();
+  vllm::PlacementOrigin origin = overrides.empty()
+                                     ? vllm::PlacementOrigin::kNone
+                                     : vllm::PlacementOrigin::kStated;
+  vllm::MoeFitResolution fit;
+
+  // W4 (#2384): `--fit` asks the resolver to decide the placement instead of
+  // stating it. Mutually exclusive with a manual placement, which the config
+  // parse already refuses, so reaching here with both is not expected.
+  if (vllm::ResolvePlacementFit() && overrides.empty()) {
+    if (gguf == nullptr) {
+      // INERT WHEN DEFAULTED, FATAL WHEN ASKED. `--fit` is on by default
+      // (mirroring llama.cpp), so refusing every safetensors load over a feature
+      // nobody requested would make that default a breaking change. But an
+      // operator who explicitly asked must NOT be told silently that it did not
+      // happen -- that is the #2382 failure, where a placement was announced and
+      // never installed.
+      if (!vllm::PlacementFitWasRequested()) {
+        std::cerr << "engine: device placement: --fit is on by default but "
+                     "cannot apply to a safetensors checkpoint (its weight "
+                     "footprint is not known where the placement must be "
+                     "installed); continuing with no placement"
+                  << std::endl;
+        vllm::MoePlacementPlan bare = vllm::MoePlacementPlan::Resolve(
+            vllm::DevicePlacement::FromOverrides({}, engine_device),
+            num_hidden_layers);
+        bare.set_origin(vllm::PlacementOrigin::kNone);
+        vllm::SetActiveMoePlacementPlan(bare);
+        return;
+      }
+      // REFUSE BY NAME rather than resolve to nothing. The model's weight
+      // footprint is not available at this point on the safetensors path -- the
+      // shards open downstream of where the plan must be installed, because
+      // `ResidentWeight` aliases host bytes on a CPU `Dev` and uploads
+      // otherwise, so installing after the upload pays the round trip the
+      // placement exists to avoid. A silent "fit resolved nothing" here is the
+      // #2382 failure again: the operator asks for a placement, sees no error,
+      // and gets none.
+      throw std::invalid_argument(
+          "device placement: \"vllm_cpp.placement.fit\" (--fit) is implemented "
+          "for GGUF checkpoints only; this is a safetensors checkpoint, whose "
+          "weight footprint is not known at the point the placement must be "
+          "installed. State the placement instead with \"cpu_moe\", "
+          "\"n_cpu_moe\" or \"overrides\"");
+    }
+    const size_t budget = vllm::DeviceWeightBudgetBytes(
+        vllm::platforms::GetPlatform(engine_device)
+            .residency_policy()
+            .device_memory_total_bytes);
+    const vllm::GgufStagedFootprint footprint =
+        vllm::GgufStagedWeightFootprint(*gguf);
+    fit = vllm::ResolveMoeFitFromSizes(
+        footprint.lower_bound_bytes, budget,
+        vllm::GgufRoutedExpertBytesPerLayer(*gguf, num_hidden_layers));
+
+    if (fit.resolved && fit.placed_layers > 0) {
+      overrides.clear();
+      for (int64_t l = num_hidden_layers - fit.placed_layers;
+           l < num_hidden_layers; ++l)
+        overrides.push_back({vllm::LlmFfnExpsBlockRegex(l), "cpu"});
+      origin = vllm::PlacementOrigin::kFit;
+    }
+    // A resolver that declined says why on stderr, because "--fit did nothing"
+    // is otherwise indistinguishable from "--fit is broken".
+    if (!fit.resolved) {
+      std::cerr << "engine: device placement: --fit resolved NO placement: "
+                << fit.reason << std::endl;
+    } else if (fit.placed_layers == 0) {
+      std::cerr << "engine: device placement: --fit places nothing; the model "
+                   "already fits the budget" << std::endl;
+    }
+  }
+
+  vllm::MoePlacementPlan plan = vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides(overrides, engine_device),
+      num_hidden_layers);
+  plan.set_origin(plan.PlacesAnything() ? origin : vllm::PlacementOrigin::kNone);
+  plan.set_fit(fit);
+  vllm::SetActiveMoePlacementPlan(plan);
+
+  // Printed FROM THE INSTALLED PLAN, and this is the distinction that matters
+  // rather than a duplicate of `ReportDevicePlacement`. That line prints what
+  // RESOLVED, so it appeared unchanged through the whole period when nothing was
+  // installed and nothing was placed — it is what made #2314 invisible to the one
+  // signal an operator checks. This line cannot appear unless the plan reached
+  // the seam's global, so a gate can distinguish a real placement from a vacuous
+  // one, which a token comparison alone cannot do.
+  //
+  // Only when it actually places, so an ordinary load stays byte-identical on
+  // stderr.
+  if (plan.PlacesAnything()) {
+    std::cerr << "engine: device placement INSTALLED: " << plan.Describe()
+              << " (resolved against " << plan.resolved_layer_count()
+              << " layers, origin "
+              << vllm::PlacementOriginName(plan.origin()) << ")" << std::endl;
+    if (plan.origin() == vllm::PlacementOrigin::kFit) {
+      // The ARITHMETIC, not just the verdict. An operator who cannot see the
+      // budget and the footprint cannot tell a wrong placement from a wrong
+      // budget. The whole-layer granularity is stated here too, because this
+      // resolver cannot place the half-layer upstream can and a user comparing
+      // against llama.cpp would otherwise have to infer that from a number.
+      std::cerr << "engine: device placement: --fit placed " << fit.placed_layers
+                << " layer(s) (" << fit.placed_bytes << " B) to bring a "
+                << fit.footprint_bytes << " B footprint under a "
+                << fit.budget_bytes
+                << " B budget; WHOLE layers only, so a partial layer is taken "
+                   "entirely"
+                << (fit.still_exceeds
+                        ? "; STILL EXCEEDS the budget with every layer placed"
+                        : "")
+                << std::endl;
+    }
+  }
+}
+
 vt::Queue SelectQueueForModel(std::string_view architecture,
                               vllm::Device device) {
   if (device != vllm::Device::kAuto) {
@@ -266,6 +416,28 @@ void PrintLoadBytes(const char* when) {
                when, static_cast<double>(c.host_copy_bytes) / gib,
                static_cast<double>(c.borrowed_bytes) / gib,
                static_cast<double>(c.device_upload_bytes) / gib);
+}
+
+// LOAD-IO. The GGUF branch does NOT call ReportLoadBytes: every one of those
+// counters is incremented on the safetensors path only (`AddHostCopy` in
+// safetensors_reader.cpp, `AddBorrowed` in qwen3_5_weights.cpp's
+// `BorrowStTensorBytes`), so on a `.gguf` load that line prints three zeros for
+// an artifact it just moved 67.56 GiB of. A zero that means "nobody counted"
+// printed beside two real timings is worse than no line, because it reads as a
+// measurement. This reports the counters a GGUF load DOES keep.
+void ReportGgufLoadIo() {
+  if (!LoadStatsEnabled()) return;
+  const uint64_t bytes = vllm::GgufPrefaultedBytes();
+  const double seconds = vllm::GgufPrefaultSeconds();
+  const double gib = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+  std::fprintf(stderr,
+               "[vt load] gguf prefault spans=%llu paged_in=%.3f GiB in %.3f s",
+               static_cast<unsigned long long>(vllm::GgufPrefaultedSpanCount()),
+               gib, seconds);
+  if (seconds > 0.0) {
+    std::fprintf(stderr, " (%.1f MiB/s)", gib * 1024.0 / seconds);
+  }
+  std::fprintf(stderr, "\n");
 }
 
 void ReportLoadBytes() {
@@ -1016,6 +1188,15 @@ std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
 //    which asserts its own three architectures by name; a fourth family routed
 //    there would refuse as "qwen3_5 gguf: unexpected architecture", which is the
 //    #809 defect this table exists to prevent (see the default arm below).
+//  * `glm-dsa` -> GlmMoeDsaHfConfigFromGguf. GLM-5.3, and the first row here
+//    whose family vLLM DOES implement at the pin -- `registry.py:117` routes
+//    `GlmMoeDsaForCausalLM` into `deepseek_v2` -- while our own DeepSeek-V2
+//    loader refuses the checkpoint at its `index_topk` tripwire. It is a
+//    SEPARATE row rather than a `deepseek2` one for that reason: the tripwire
+//    stays a wall for DeepSeek-V2 and this family gets its own config, its own
+//    registration and its own refusals. The builder synthesizes an HF-shaped
+//    config and hands it to the same `ParseGlmMoeDsaParams` a config.json
+//    descends through.
 //  * `glm5next` -> Glm5NextHfConfigFromGguf, whose builder synthesizes an
 //    HF-shaped config and hands it to the SAME `ParseGlm5NextParams` a
 //    config.json descends through, so both sources meet one validator. This is
@@ -1035,6 +1216,7 @@ constexpr GgufArchArm kGgufArchArms[] = {
     {"qwen3next", &vllm::HfConfigFromGguf},
     {vllm::kQwen4ExpGgufArch, &vllm::Qwen4ExpHfConfigFromGguf},
     {vllm::kGlm5NextGgufArch, &vllm::Glm5NextHfConfigFromGguf},
+    {vllm::kGlmMoeDsaGgufArch, &vllm::GlmMoeDsaHfConfigFromGguf},
 };
 
 std::string SupportedGgufArchitectures() {
@@ -1645,12 +1827,33 @@ void LoadedEngine::ApplyResolvedCacheDType(const EngineParams& params,
 }
 
 int LoadedEngine::ResolveMaxNumSeqs(const EngineParams& params,
-                                    const vllm::v1::KVCacheConfig& kv_cfg) {
+                                    const vllm::v1::KVCacheConfig& kv_cfg,
+                                    bool serves_one_sequence_per_step) {
   const int configured = params.max_num_seqs > 0 ? params.max_num_seqs : 8;
   const vllm::v1::HybridKvBudget budget =
       vllm::v1::ComputeHybridKvBudget(kv_cfg);
-  const int resolved =
-      vllm::v1::ClampMaxNumSeqsToStateBudget(configured, budget);
+  int resolved = vllm::v1::ClampMaxNumSeqsToStateBudget(configured, budget);
+  // MODEL-MM-QWEN4-EXP W5L (#2031): THE MODEL'S OWN CEILING, and it is not a
+  // tuning knob. A forward that refuses `num_reqs > 1` throws from inside the
+  // EngineCore busy loop, which treats a throw as FATAL — the socket stays open
+  // and every request from then on is a 500. The default `max_num_seqs` is 128,
+  // so without this clamp the first pair of overlapping requests kills the
+  // server. Clamping here makes the same engine serve them one after another.
+  //
+  // AFTER the budget clamp because the two bound different quantities and the
+  // smaller has to win; `resolved` is therefore the min of both. The line below
+  // is printed whenever this clamp is the binding one, on the same "a number the
+  // operator did not choose is never silent" rule as the budget message.
+  if (serves_one_sequence_per_step && resolved > 1) {
+    std::cerr << "INFO model concurrency: reduced max_num_seqs from " << resolved
+              << " to 1. This architecture's forward serves ONE sequence per "
+                 "step and refuses a batched one, and an EngineCore that meets "
+                 "that refusal dies rather than degrades. Batching it needs the "
+                 "ragged multi-request plumbing owed under "
+                 ".agents/specs/qwen4-exp-flash-next.md (issue #2031).\n";
+    std::cerr.flush();
+    return 1;
+  }
   if (resolved >= configured) {
     // Attention-only models, pure-recurrent models, and every hybrid whose
     // budget already holds the configured concurrency land here: no line, no
@@ -1909,7 +2112,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
           params.block_size > 0 ? params.block_size : 32)),
       // The serving concurrency, clamped to the recurrent-state budget the KV
       // pool affords. See ResolveMaxNumSeqs (issue #1983).
-      max_num_seqs_(ResolveMaxNumSeqs(params, kv_cfg_)),
+      max_num_seqs_(ResolveMaxNumSeqs(
+          params, kv_cfg_,
+          model_->registration().factory->serves_one_sequence_per_step)),
       max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
@@ -2388,12 +2593,27 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // A single `.gguf` file: config + weights + tokenizer all come from the
   // GGUF (M0.10). The engine stack below is unchanged.
   if (fs::is_regular_file(dir) && dir.extension() == ".gguf") {
+    // LOAD-IO: `VT_LOAD_STATS=1` reported NOTHING on a GGUF load. The two
+    // ReportLoadPhase call sites both sat on the safetensors branch, so the one
+    // instrument this repository has for "where did the load time go" was silent
+    // on every `.gguf` model -- and silence reads as "no phases", not as "not
+    // measured". That is the instrument-failure-looks-like-a-result shape, and it
+    // cost a 74-minute load its breakdown (row MODEL-MM-QWEN4-EXP, W5n).
+    const auto t_gguf_open = std::chrono::steady_clock::now();
     vllm::GgufFile gguf = vllm::GgufFile::Open(model_dir);
+    ReportLoadPhase("mmap+header", SecondsSince(t_gguf_open));
     HfConfig config = HfConfigFromGgufDispatch(gguf);
     // Resolve before tokenizer/weight work so unsupported architecture errors
     // are deterministic and match registry.py rather than being masked by a
     // later source-specific missing-tensor/tokenizer error.
     const ModelRegistration& gguf_arch = ModelRegistry::Resolve(config);
+    // #2314: before ANY weight I/O, so a CPU-placed layer is never staged onto
+    // the device first — `ResidentWeight` aliases host bytes on a CPU `Dev` and
+    // uploads otherwise, so this ordering is what makes the placement free
+    // rather than a round trip.
+    InstallMoePlacementPlan(
+        ResolveModelDeviceType(gguf_arch.architecture, params.device),
+        config.num_hidden_layers, &gguf);
     // Issue #1123: refuse a GGUF whose weights cannot be STAGED onto the target
     // device, here, before any weight I/O and before the tokenizer.
     //
@@ -2488,8 +2708,53 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
         // the computed default, so the number here is the number that gets
         // allocated and not an estimate of it.
         lane.tensor_name_suffix = kStreamedExpertSuffix;
+        // MODEL-TEXT-GLM-MOE-DSA W3 (#2214, spec §3.3). The budget must hold
+        // ONE decode step's whole slice working set, because every `Acquire`
+        // marks its entry protected until `EndStep` clears it. Below that, the
+        // cache does not fail: `Slice` returns nullptr and the caller reads the
+        // tower IN PLACE out of the mmap, counted on stderr and reported as
+        // success. On the model this row targets that is a 187 GiB random read
+        // per token, and a benchmark measuring it would publish a page-cache
+        // number under a streaming label.
+        //
+        // HERE, not inside the store's constructor, because "at load" is the
+        // point of it: the constructor first runs on the FIRST expert slice of
+        // the first forward, after the weights are read and the device pool is
+        // built, which is exactly the 26-minute-then-die shape the refusal a few
+        // lines above exists to avoid. This block is already the one place that
+        // has both the file and the resolved budget.
+        //
+        // Reached on every streaming load, not only this row's: the geometry
+        // comes from the file, so Qwen3.5 is checked by the same call. Streaming
+        // is default OFF and this branch needs `ResolveExpertStreamRequested()`,
+        // so a run that never asked for the lane cannot reach the refusal.
+        const GgufExpertLaneGeometry lane_geom =
+            GgufStreamedExpertLaneGeometry(gguf, lane.tensor_name_suffix);
+        expert_stream::RequireSlotCapacity(
+            std::string(gguf_arch.architecture), lane_geom.streamed_tower_count,
+            lane_geom.experts_per_tok, ResolveExpertStreamSlots());
         const size_t slice =
             GgufLargestExpertSliceBytes(gguf, lane.tensor_name_suffix);
+        // MODEL-TEXT-GLM-MOE-DSA (#2214, spec O33). RESERVE the same number the
+        // bound below is about to charge the device for, so the arena
+        // `CheckDeviceWeightFit` prices and the arena the store allocates cannot
+        // be two different numbers.
+        //
+        // They WERE two different numbers, and it cost a step. `ExpertStreamLane`
+        // is a process-lifetime singleton built on the FIRST slice anyone asks
+        // for, and a model whose forward reserves per LAYER sizes it from
+        // whichever layer runs first. On GLM-5.3's `UD-IQ1_S` that is `blk.3`,
+        // whose `ffn_down_exps` is IQ3_XXS at 4,816,896 B; `blk.8`'s is IQ4_XS at
+        // 6,684,672 B, so the store was built 28% too small and refused by name
+        // mid-step after streaming 527 slices — measured on `dgx:gpu0`,
+        // 2026-08-31. A `UD-*` arm mixes encodings ACROSS layers by design, so no
+        // per-layer maximum is the model's maximum.
+        //
+        // Here rather than in a model, because this is the one place that has the
+        // whole FILE. `Reserve` takes a maximum and is inert unless streaming was
+        // requested, so a model that reserves for itself as well (Qwen3.5 does)
+        // is unaffected except by being given a floor that is at least correct.
+        if (slice > 0) expert_stream::ExpertStreamLane::Reserve(slice);
         if (slice > 0) {
           lane.arena_bytes =
               static_cast<size_t>(ResolveExpertStreamSlots()) *
@@ -2638,7 +2903,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // case is the gate that catches it.
     ModelSource gguf_source = ModelSource::FromGguf(gguf);
     gguf_source.multimodal = &params.multimodal;
+    const auto t_gguf_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
+    ReportLoadPhase("weights", SecondsSince(t_gguf_weights));
+    ReportGgufLoadIo();
     // SPEC-MTP-GGUF: attach the head from the SAME file, mirroring the
     // safetensors branch's maybe_attach_mtp. The GGUF is still mapped here; the
     // loader owns its dequantized copies, so nothing borrows past this scope.
@@ -2756,6 +3024,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   }
   HfConfig config = vllm::LoadHfConfig(config_path);
   const ModelRegistration& registration = ModelRegistry::Resolve(config);
+  // #2314, and see the GGUF branch above for why this precedes weight I/O.
+  // No `GgufFile` on this path: `--fit` refuses by name rather than resolving to
+  // nothing, because the safetensors footprint is not knowable here.
+  InstallMoePlacementPlan(
+      ResolveModelDeviceType(registration.architecture, params.device),
+      config.num_hidden_layers, /*gguf=*/nullptr);
   // ENG-WEIGHT-OFFLOAD totality guard. Refuse a configured offload against a
   // model whose loader does not consult the offloader, BEFORE any weight I/O.
   // Without this the budget would be accepted and free nothing, with no error
@@ -2846,6 +3120,27 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
+
+    // ENG-WEIGHT-OFFLOAD (#2386): the SECOND guard, and the only one that can
+    // see this particular lie. `RefuseUnsupportedWeightOffload` runs BEFORE the
+    // load and can only ask whether the architecture DECLARES support. A loader
+    // that declares it and then never calls `ConsiderWeight` offloads nothing,
+    // and the run frees no memory with no error anywhere — zero consulted
+    // weights is the only evidence that proves it, and that count does not exist
+    // until the load has finished. Hence here, and not beside its sibling.
+    //
+    // It had no production caller until now: declaration, definition and four
+    // test assertions, while `docs/WEIGHT-OFFLOAD.md` described it in the
+    // present tense as shipped behaviour. It is currently VACUOUS rather than
+    // wrong — no registration sets `supports_weight_offload`, so the first guard
+    // refuses every configured offload before this one is reached — but it stops
+    // being vacuous the day anyone wires a loader, which is exactly when its
+    // absence would be silent.
+    vllm::VerifyWeightOffloadWasConsulted(
+        vllm::GetWeightOffloader(), registration.architecture,
+        registration.factory != nullptr &&
+            registration.factory->supports_weight_offload);
+
     maybe_attach_mtp(*model);
     std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(
@@ -2866,6 +3161,27 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, source);
     ReportLoadPhase("weights", SecondsSince(t_weights));
     ReportLoadBytes();
+
+    // ENG-WEIGHT-OFFLOAD (#2386): the SECOND guard, and the only one that can
+    // see this particular lie. `RefuseUnsupportedWeightOffload` runs BEFORE the
+    // load and can only ask whether the architecture DECLARES support. A loader
+    // that declares it and then never calls `ConsiderWeight` offloads nothing,
+    // and the run frees no memory with no error anywhere — zero consulted
+    // weights is the only evidence that proves it, and that count does not exist
+    // until the load has finished. Hence here, and not beside its sibling.
+    //
+    // It had no production caller until now: declaration, definition and four
+    // test assertions, while `docs/WEIGHT-OFFLOAD.md` described it in the
+    // present tense as shipped behaviour. It is currently VACUOUS rather than
+    // wrong — no registration sets `supports_weight_offload`, so the first guard
+    // refuses every configured offload before this one is reached — but it stops
+    // being vacuous the day anyone wires a loader, which is exactly when its
+    // absence would be silent.
+    vllm::VerifyWeightOffloadWasConsulted(
+        vllm::GetWeightOffloader(), registration.architecture,
+        registration.factory != nullptr &&
+            registration.factory->supports_weight_offload);
+
     maybe_attach_mtp(*model);
     std::unique_ptr<DflashDraft> dflash = maybe_load_dflash();
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(

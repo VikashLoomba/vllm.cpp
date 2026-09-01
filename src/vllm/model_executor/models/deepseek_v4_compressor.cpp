@@ -2,6 +2,8 @@
 // See deepseek_v4_compressor.h for the full port map (file:line on both sides).
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
 
+#include "vllm/model_executor/models/deepseek_v4_rope.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -176,6 +178,104 @@ std::vector<float> Fp8DsMlaDecodeToken(const Fp8DsMlaToken& token,
     out[static_cast<size_t>(layout.nope_head_dim + j)] =
         vt::BF16ToF32(token.rope_bf16[static_cast<size_t>(j)]);
   return out;
+}
+
+
+// MODEL-DSV4-DSA-COMPOSE W1 (#2286). See the header for the cycle's contract.
+std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
+                                       std::vector<float>* state_score,
+                                       const std::vector<float>& kv,
+                                       const std::vector<float>& score,
+                                       const std::vector<float>& ape,
+                                       const std::vector<int64_t>& positions,
+                                       const std::vector<float>& rms_weight, float eps,
+                                       int64_t compress_ratio, int64_t head_dim,
+                                       int64_t rope_dim, double rope_theta,
+                                       int64_t coff) {
+  VT_CHECK(state_kv != nullptr && state_score != nullptr,
+           "CompressorStepCycle: state buffers are required");
+  VT_CHECK(compress_ratio > 0 && head_dim > 0,
+           "CompressorStepCycle: compress_ratio and head_dim must be > 0");
+  VT_CHECK(coff == 1 || coff == 2,
+           "CompressorStepCycle: coff is 1 + (compress_ratio == 4) and is 1 or 2 "
+           "(compressor.py:247-248)");
+  const int64_t T = static_cast<int64_t>(positions.size());
+  // At `coff == 2` the projections are DOUBLED: a row carries BOTH roles, and the
+  // gather below picks which half each window position reads.
+  const int64_t width = coff * head_dim;
+  VT_CHECK(static_cast<int64_t>(kv.size()) == T * width &&
+               static_cast<int64_t>(score.size()) == T * width,
+           "CompressorStepCycle: kv/score must be [num_tokens, coff*head_dim]");
+  VT_CHECK(state_kv->size() == state_score->size(),
+           "CompressorStepCycle: the two state buffers must stay in lockstep");
+
+  // SAVE: the score carries the position-wrapped APE, the kv does not. Reusing
+  // the gated helper rather than re-deriving `position % compress_ratio` here.
+  const std::vector<float> scored =
+      CompressorSaveScoreApe(score, ape, positions, T, width, compress_ratio);
+
+  std::vector<float> emitted;
+  for (int64_t t = 0; t < T; ++t) {
+    state_kv->insert(state_kv->end(), kv.begin() + t * width,
+                     kv.begin() + (t + 1) * width);
+    state_score->insert(state_score->end(), scored.begin() + t * width,
+                        scored.begin() + (t + 1) * width);
+
+    // BOUNDARY-ONLY EMISSION. `(position + 1) % compress_ratio == 0` is upstream's
+    // gate verbatim; a step that crosses none emits nothing, and a step that
+    // crosses several emits several -- which is why prefill and decode need no
+    // separate paths here.
+    const int64_t pos = positions[static_cast<size_t>(t)];
+    if ((pos + 1) % compress_ratio != 0) continue;
+
+    // THE GATHERING WINDOW, 1:1 with `fused_compress_quant_cache.py:169-183`:
+    //
+    //     start  = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    //     tokens = arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    //     head_offset = (tokens >= COMPRESS_RATIO) * HEAD_SIZE
+    //
+    // So `coff * compress_ratio` rows are gathered ending at the boundary, and a
+    // row's ROLE is its index WITHIN THIS WINDOW, not a property of the row: the
+    // first `compress_ratio` positions read the state's low half, the rest read
+    // the high half. That is why the tensors are doubled and why the role "is
+    // never recoverable from the tensor alone".
+    const int64_t have = static_cast<int64_t>(state_kv->size()) / width;
+    const int64_t win = coff * compress_ratio;
+    std::vector<float> wkv(static_cast<size_t>(win * head_dim), 0.0f);
+    std::vector<float> wsc(static_cast<size_t>(win * head_dim), 0.0f);
+    std::vector<uint8_t> valid(static_cast<size_t>(win), 0);
+    for (int64_t i = 0; i < win; ++i) {
+      const int64_t row = have - win + i;  // global row index into the state
+      if (row < 0) continue;               // masked: `pos >= 0`, before the start
+      valid[static_cast<size_t>(i)] = 1;
+      const int64_t head_offset = (i >= compress_ratio) ? head_dim : 0;
+      const int64_t base = row * width + head_offset;
+      std::copy(state_kv->begin() + base, state_kv->begin() + base + head_dim,
+                wkv.begin() + i * head_dim);
+      std::copy(state_score->begin() + base, state_score->begin() + base + head_dim,
+                wsc.begin() + i * head_dim);
+    }
+    std::vector<float> pooled =
+        CompressorPoolNorm(wkv, wsc, valid, rms_weight, eps, win, head_dim);
+    // ROTATE THE POOLED ROW. `fused_compress_quant_cache.py:272-297` applies
+    // GPT-J RoPE to the rope tail only, and does so UNCONDITIONALLY -- the
+    // `rotate` constructor flag is dead and both compressors pass it. The
+    // position is `(position / compress_ratio) * compress_ratio`, the window's
+    // BASE rather than the emitting token's, so every row of one window shares a
+    // phase.
+    if (rope_dim > 0) {
+      VT_CHECK(rope_dim % 2 == 0 && rope_dim <= head_dim,
+               "CompressorStepCycle: the rope tail is rotated in PAIRS and lies "
+               "inside the head");
+      const int64_t compressed_pos = (pos / compress_ratio) * compress_ratio;
+      RopeInplaceLayer(pooled.data() + (head_dim - rope_dim), rope_dim,
+                       compressed_pos, rope_theta, /*freq_scale=*/1.0,
+                       /*ext_factor=*/0.0, /*n_ctx_orig=*/0, /*beta_fast=*/0.0,
+                       /*beta_slow=*/0.0);
+    }
+    emitted.insert(emitted.end(), pooled.begin(), pooled.end());
+  }
+  return emitted;
 }
 
 }  // namespace vllm::deepseek_v4

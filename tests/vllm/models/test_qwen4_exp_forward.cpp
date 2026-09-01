@@ -26,8 +26,10 @@
 
 #include "support/qwen4_exp_gguf_fixture.h"
 
+#include "vllm/model_executor/models/dense_attn_block.h"  // dense_attn::ResidentWeight
 #include "vllm/model_executor/models/qwen4_exp_hc.h"
 #include "vllm/model_executor/models/qwen4_exp_weights.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -237,5 +239,95 @@ TEST_CASE(
                         "polarity and the comment above is stale");
       }
     }
+  }
+}
+
+// --- W5r (#2031): the shared ResidentWeight carries the load-time layout -----
+
+TEST_CASE(
+    "dense_attn::ResidentWeight carries the repack markers the qwen4_exp "
+    "forward's mix weights depend on") {
+  // THE DEFECT, AND WHY IT IS THIS ROW'S. `vt::Tensor::repacked` says the
+  // block-quant bytes were rewritten at load into the CPU i8mm interleave
+  // (`q8_0 -> block_q8_0x4`), and `kMatmulBTQuant` keys on it to pick the
+  // repacked GEMM. `MakeTensor` drops it, and the SHARED
+  // `dense_attn::ResidentWeight` — the helper 25 models use — did not put it
+  // back, while `qwen3_5.cpp`'s private copy of the same helper always has
+  // (:1055, :1060). So a repacked weight taken through the shared helper
+  // reached the kernel flagged as plain q8_0 and was decoded as garbage, with
+  // no crash and no refusal anywhere.
+  //
+  // It is this row's because the qwen4_exp forward is the caller that makes it
+  // reachable AND visibly inconsistent: it hands `hc_*_down`/`hc_*_up` to
+  // `vt::Qwen4ExpGatedResidual` through `ResidentWeight`
+  // (`qwen4_exp_forward.cpp:421-422, :479-480, :538-539`) and `hc_*_inject`
+  // through `OwnedTensor::View()` (:417, :475), which has carried the marker
+  // all along — two operands of one op disagreeing about the same flag. W5p
+  // (#2031) is what made that matter: before it those two tensors were float
+  // weights on `LinearNoBias`, and now they are block-quant operands routed to
+  // `vt::MatmulBTQuant`, which is the consumer that reads `repacked`.
+  //
+  // THIS CASE IS THE ONLY GATE THAT CAN RUN ON THIS HOST, and that is stated
+  // rather than glossed. `vt::cpu::QuantRepackActive()` is true only on aarch64
+  // with i8mm, so on x86 the loader never sets the marker and no end-to-end
+  // path can exercise it. The flag is therefore set by hand here, on the same
+  // `OwnedTensor` type the loader produces, and the assertion is that the
+  // helper propagates what it is given. `thor` — the box the released
+  // Qwen3.8-Flash-Next checkpoint loads on — is an aarch64 i8mm host.
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  vllm::OwnedTensor w;
+  w.dtype = vt::DType::kQ8_0;
+  w.rank = 2;
+  w.shape[0] = 4;
+  w.shape[1] = 32;
+  w.nk = true;
+  // One Q8_0 block per row: 4 rows x 34 bytes. The bytes are never read; only
+  // the metadata the helper copies is under test, and `ResidentWeight` refuses
+  // an empty buffer by name (#1953), so the buffer has to be real.
+  w.bytes.assign(4 * 34, 0);
+
+  SUBCASE("a repacked weight stays repacked") {
+    w.repacked = true;
+    const vt::Tensor t = vllm::dense_attn::ResidentWeight(d, w);
+    CHECK(t.repacked);
+    CHECK(t.dtype == vt::DType::kQ8_0);
+    CHECK(t.data == static_cast<const void*>(w.bytes.data()));
+  }
+  SUBCASE("and an unrepacked one stays unrepacked") {
+    // The other polarity, so the fix cannot be "always true", which would send
+    // a plain q8_0 weight to the repacked GEMM and break the far larger set of
+    // callers that never repack.
+    w.repacked = false;
+    const vt::Tensor t = vllm::dense_attn::ResidentWeight(d, w);
+    CHECK_FALSE(t.repacked);
+  }
+  SUBCASE("the elementwise [K,N] transpose marker rides across too") {
+    vllm::OwnedTensor e;
+    e.dtype = vt::DType::kBF16;
+    e.rank = 2;
+    e.shape[0] = 4;
+    e.shape[1] = 8;
+    e.nk = true;
+    e.bytes.assign(4 * 8 * 2, 0);
+    e.elem_kn_repacked = true;
+    const vt::Tensor t = vllm::dense_attn::ResidentWeight(d, e);
+    CHECK(t.elem_kn_repacked);
+  }
+  SUBCASE("and the mix weights the forward routes keep it through the real shape") {
+    // THE ROW'S OWN OPERAND SHAPE, not a generic one: `hc_*_down` is
+    // `[hc_lowrank, hc_count * hidden_size]` and the forward passes that shape
+    // explicitly at `qwen4_exp_forward.cpp:421`. A helper that propagated the
+    // marker only on the default-shape arm would pass the subcases above and
+    // still drop it on every call this row makes.
+    w.repacked = true;
+    w.shape[0] = 2;
+    w.shape[1] = 64;
+    w.bytes.assign(2 * 2 * 34, 0);
+    const vt::Tensor t = vllm::dense_attn::ResidentWeight(d, w, {2, 64});
+    CHECK(t.repacked);
+    CHECK(t.shape[0] == 2);
+    CHECK(t.shape[1] == 64);
   }
 }

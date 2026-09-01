@@ -1458,15 +1458,34 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
       dense_attn::Dev dd{vt::GetBackend(dev), *q};
       // `ResidentWeight` returns the memoized `d_dev` view staging uploaded, so
       // these are DEVICE addresses and the read costs no copy.
-      g_tr[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w1.d_trellis).data);
-      g_su[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w1.d_suh).data);
-      g_sv[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w1.d_svh).data);
-      u_tr[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w3.d_trellis).data);
-      u_su[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w3.d_suh).data);
-      u_sv[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w3.d_svh).data);
-      d_tr[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w2.d_trellis).data);
-      d_su[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w2.d_suh).data);
-      d_sv[i] = reinterpret_cast<int64_t>(dense_attn::ResidentWeight(dd, xe.w2.d_svh).data);
+      //
+      // VALIDATED AS THEY ARE FILLED (#2458). A null here is not a crash where
+      // it happens: the kernel dereferences `g_tr[expert]` on the device and the
+      // fault surfaces later at the next synchronising call, as
+      // `cudaStreamDestroy: an illegal memory access`, naming neither the expert
+      // nor the projection. compute-sanitizer had to be run to learn that much.
+      // One predicate per pointer, at the site that knows both names, turns that
+      // into a refusal a reader can act on.
+      const auto dev_ptr = [&](const OwnedTensor& t, const char* proj,
+                               const char* part) {
+        void* p = dense_attn::ResidentWeight(dd, t).data;
+        VT_CHECK(p != nullptr,
+                 std::string("deepseek-v4 exl3: expert ") + std::to_string(e) +
+                     " projection " + proj + " has a NULL device " + part +
+                     " after staging. The fused MoE kernel would dereference "
+                     "this on the device and surface the fault later as an "
+                     "illegal memory access naming nothing (#2458).");
+        return reinterpret_cast<int64_t>(p);
+      };
+      g_tr[i] = dev_ptr(xe.w1.d_trellis, "w1", "trellis");
+      g_su[i] = dev_ptr(xe.w1.d_suh, "w1", "suh");
+      g_sv[i] = dev_ptr(xe.w1.d_svh, "w1", "svh");
+      u_tr[i] = dev_ptr(xe.w3.d_trellis, "w3", "trellis");
+      u_su[i] = dev_ptr(xe.w3.d_suh, "w3", "suh");
+      u_sv[i] = dev_ptr(xe.w3.d_svh, "w3", "svh");
+      d_tr[i] = dev_ptr(xe.w2.d_trellis, "w2", "trellis");
+      d_su[i] = dev_ptr(xe.w2.d_suh, "w2", "suh");
+      d_sv[i] = dev_ptr(xe.w2.d_svh, "w2", "svh");
       continue;
     }
     g_tr[i] = reinterpret_cast<int64_t>(xe.w1.trellis.data());
@@ -1568,6 +1587,34 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
 
     vt::Tensor t_out_d = b_out.t();
     vt::Tensor t_hid_d = b_hid.t();
+
+    // EVERY operand, checked by name before the launch (#2458). The kernel takes
+    // eighteen pointers and dereferences them on the device, so a null among
+    // them is an asynchronous fault reported at the next synchronising call --
+    // `cudaStreamDestroy: an illegal memory access` -- which names none of them.
+    // The pool can also hand back a null (`DevicePool::Get`), and that failure
+    // is silent by construction. Checking here costs eighteen predicates per
+    // layer against a kernel that decodes a 216-expert trellis tower.
+    const auto need = [](const vt::Tensor& t, const char* what) {
+      VT_CHECK(t.data != nullptr,
+               std::string("deepseek-v4 exl3: the fused MoE device arm has a "
+                           "NULL ") + what +
+                   " operand. The kernel dereferences it on the device and the "
+                   "fault surfaces later as an illegal memory access naming "
+                   "nothing (#2458).");
+    };
+    need(t_out_d, "output");
+    need(t_hid_d, "hidden");
+    need(tg1, "gate trellis table"); need(tg2, "gate suh table");
+    need(tg3, "gate svh table");     need(tu1, "up trellis table");
+    need(tu2, "up suh table");       need(tu3, "up svh table");
+    need(td1, "down trellis table"); need(td2, "down suh table");
+    need(td3, "down svh table");
+    need(t_cnt, "expert_count"); need(t_tok, "token_sorted");
+    need(t_wgt, "weight_sorted");
+    need(s_g, "state_g"); need(s_u, "state_u");
+    need(i_g, "intermediate_g"); need(i_u, "intermediate_u");
+
     vt::Exl3MoeMlp(*q, t_out_d, t_hid_d, dtables, drouting, dtemps, args);
     vt::GetBackend(dev).Synchronize(*q);
     vt::GetBackend(dev).Copy(*q, out->data(), b_out.t().data,

@@ -256,10 +256,34 @@ tree and this head. Its own commit subject names the 47 s; the leaf reads
 never carried it, which is why the render beat a projection whose own leaf it
 met.
 
-**The residue closes.** The wall fell 215.444 s. Named: connector compute
--143.5, `decode.audio` -42.0, `decode.video` -5.0, `conditioning.tower` -1.3,
-`load.text_encoder` -1.0, `load.dit` +1.1. Sum **-215.2 s**, which is the wall's
-own fall to within 0.2 s.
+**The residue closes, and the itemisation is over THIS TABLE'S OWN LEAVES.**
+The wall fell **215.444 s**. Summed over every leaf both tables share:
+
+| leaf | delta |
+|---|---:|
+| `generate.guiders` | **-94.510** |
+| `conditioning.connector` | **-72.428** |
+| `decode.audio` | -41.972 |
+| `decode.video` | -5.043 |
+| `conditioning.tower` | -1.329 |
+| `load.text_encoder` | -0.996 |
+| `artifacts.frames` | -0.100 |
+| `load.video_vae` | +0.068 |
+| `load.dit` | **+1.067** |
+| everything else | < 0.05 each |
+| **sum** | **-215.285** |
+
+against the wall's **-215.444**: a residual of **0.159 s**, 0.05% of the fall.
+
+**THE 143.5 s OF CONNECTOR COMPUTE IS NOT A TERM IN THAT SUM, and an earlier
+draft of this section wrongly made it one.** 224.882 -> 81.338 is measured
+against #2354's connector figure, which was taken in a DIFFERENT run and is not
+a leaf of the #2296 baseline table. The baseline binary predates the `.compute`
+split, so its connector cost is spread across `generate.guiders` and
+`conditioning.connector` together with the two towers, and those two leaves are
+what the residue sum may use. Adding the cross-run figure to the same total
+double-counts it and does not even add up: it gives 191.7 s against a 215.4 s
+fall. The two comparisons are both valid and they are kept apart.
 
 **`decode.video` MOVED AND THE PROJECTION SAID IT WOULD NOT.** 15.970 ->
 10.927 s, 1.46x, and it is outside its own 1.71% spread, so it is a real move

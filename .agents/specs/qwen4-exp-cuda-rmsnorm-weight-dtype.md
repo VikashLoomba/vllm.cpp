@@ -145,11 +145,19 @@ A third wall after #2477 and #2476 clear is a reportable result, not a failure.
 
 ## Owed
 
-- `src/vt/rocm/rocm_rmsnorm.hip:105-177` carries the identical weld
-  (`RmsNormRowKernel<Tin, Tout, ...>` with `const Tin* w`, and
-  `VT_CHECK(w.dtype == x.dtype)` at `:170`). No ROCm device is in the fleet, so
-  this wave cannot build or gate it; editing an untestable backend blind is
-  worse than recording it.
+- **Two unreached twins of this same weld**, tracked by
+  [#2492](https://github.com/mudler/vllm.cpp/issues/2492):
+  - `src/vt/rocm/rocm_rmsnorm.hip:105-177` is a line-for-line twin
+    (`RmsNormRowKernel<Tin, Tout, ...>` with `const Tin* w`, and
+    `VT_CHECK(w.dtype == x.dtype)` at `:170`), so it will refuse a GGUF f32 gamma
+    exactly as CUDA did. No ROCm device is in the `rc` fleet, so this wave can
+    neither build nor gate it, and editing an untestable backend blind is worse
+    than recording it.
+  - `src/vt/cuda/cuda_ops.cu:578`, `RmsNormQuantFp8KernelCuda`, welds the same two
+    dtypes over `LaunchRmsNormQuantFp8<Tin>`. It is latent rather than live: its
+    consumers load safetensors checkpoints whose gammas already sit at the model
+    dtype, and `qwen4_exp` does not reach the op at all. Fixing it here would add
+    untested surface to a path this row cannot exercise.
 - [#2476](https://github.com/mudler/vllm.cpp/issues/2476), the illegal memory
   access, whose ordering against this refusal this wave measures.
 - [#2488](https://github.com/mudler/vllm.cpp/issues/2488) tracks the widening below.

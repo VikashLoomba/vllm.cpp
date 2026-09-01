@@ -76,10 +76,92 @@ instrumentation in `vt::MatmulBT` that prints a backtrace for every
 `a.dtype != b.dtype` dispatch. That names the site without a lease. The FIX is
 then gated on a GPU, because the CPU tier cannot gate this refusal at all.
 
+## The call site, measured
+
+`Qwen4ExpGatedResidualKernelCuda`, `src/vt/cuda/cuda_qwen4_exp.cu:414` (then
+`:418` and `:428`). The CUDA arm of `vt::Qwen4ExpGatedResidual` is four kernels
+and THREE `vt::MatmulBT` calls where the CPU arm is one fused loop, because at
+the released config `hc*H` is thousands of floats and a device block cannot hold
+the intermediates. It keeps the grouped-RMSNorm result in an f32 device scratch
+(`ScratchF32`, `:361`) and projects that scratch through `mix_down`, `mix_up` and
+`block_inject`, which on this fixture are bf16.
+
+**Localized on the CPU tier, then confirmed on the device.** An uncommitted
+`vt::MatmulBT` trace over the CPU `LoadedEngine` forward of the same fixture
+(`test_qwen4_exp_runner`, case 5) printed 260 dispatches and **not one mixed
+pair** — every CPU GEMM is `(bf16,bf16)`. That negative is the finding: the mix
+is a device-only branch, and the only device-only decomposition of an op into
+`vt::MatmulBT` calls on this forward is this one. The same trace on `thor:gpu0`
+then named it directly: dispatch **#0** of the whole CUDA forward is
+`(f32,bf16)->f32 m=4 k=128 n=8` — `t_normed [T, hc*H=128]` against
+`mix_down [R=8, 128]` — with `vt::MatmulBT` <- `Qwen4ExpTextModelForward` <-
+`ModelRegistry::Forward` in its backtrace.
+
+That refines #2452, which placed the stop "after the layer-0 MLP hyper-
+connection". It is the layer-0 **attention** hyper-connection, and it is the
+FIRST GEMM the forward issues — before PLE, before the GDN input projection.
+
+## Which of the three shapes this is
+
+**Shape 3: the CPU arm is not laxer by accident; the CUDA elementwise lane is
+narrower than every sibling.** `vt::MatmulBT`'s contract is
+`IsFloat(a) && IsFloat(b)` (`src/vt/ops.cpp`), and three of the four
+implementations behind it already answer an f32 activation against a typed
+weight — the CPU elementwise kernel (`cpu_ops.cpp` `MatmulChunked<true>`, a
+dtype-generic getter per operand), the CPU block-quant kernel, and **this
+device's own `kMatmulBTQuant`**, whose validation admits any
+`IsFloat(a.dtype)` and which is the arm the RELEASED `unsloth/…-GGUF`
+checkpoint's Q8_0 mix weights take at these three call sites. Only the cuBLASLt
+elementwise lane refused. The tree had already paid for that: `RouterGateKernel`
+(`src/vt/cuda/cuda_deepseek_v4.cu:1877-1882`) is a hand-written GEMV whose own
+comment says it exists because "the CUDA elementwise MatmulBT lacks" this pair —
+a private path beside the seam, which is the failure `AGENTS.md`
+"Shared seams" names.
+
+**Shape 2 is ruled out by the oracle.** `transformers` 5.16.0 does NOT run a
+mixed-precision GEMM here. `Qwen4ExpTextRMSNorm.forward`
+(`modeling_qwen4_exp.py:173-178`) computes in `float()` and returns
+`output.type_as(x)`; `Qwen4ExpTextGatedResidual.forward` (`:955-969`) then feeds
+that narrowed tensor to all three `nn.Linear`s. Every `f32` in that file is an
+interior accumulation cast back before the next parameterized layer, and
+`Qwen4ExpTextRMSNormGated` (`:192-201`) does the same through `input_dtype`. So
+the oracle cannot be cited in favour of the mixed pair, and it is not cited.
+
+**Shape 1 is ruled out because the widening is ratified and GATED, not
+accidental.** Upstream narrows and this tree deliberately does not:
+`.agents/specs/qwen4-exp-flash-next.md` `## Owed` records it as "One deliberate
+divergence from upstream, in the bf16 arm … This op does not: it widens on load,
+computes in f32 and rounds once on the store, which is this tree's house contract
+and what `vt::RmsNorm` says of itself in the same terms." Reproducing upstream's
+rounding is that row's mutation **M13**, RED in the host suite and the device
+suite alike (1 of 9 cases, 8 assertions). Narrowing `t_normed` here to satisfy
+cuBLASLt would BE M13. What upstream's `.type_as(x)` costs is already owed there
+— "that term stated in whatever first compares a bf16 arm to the oracle" — and
+that debt belongs to the mixer's dtype policy, which spans both arms and the
+committed goldens. It is not this GEMM's, and this row does not reopen it.
+
 ## Design
 
-Filled in once the call site is measured; the fix follows the shape the
-measurement selects, and this section records which one it was and why.
+`MatmulBTKernelCuda` grows one arm: `a.dtype == kF32 && b.dtype == kBF16`.
+
+cuBLASLt takes ONE data type for A and B, so a mixed pair has to be made
+uniform, and there are exactly two ways. Rounding the ACTIVATION to bf16 is M13,
+so the WEIGHT is upcast instead: `bf16 -> f32` is exact (`bits << 16`, the same
+widening `RouterGateKernel` and the CPU `LoadF32` perform), so the existing f32
+lane then computes the CPU arm's values with only the GEMM's own
+K-reassociation between them — the divergence this file already owns for every
+other lane.
+
+The cost is stated in the code rather than discovered later: one `[N,K]` f32
+scratch per call, so the weight is touched at 10 bytes/element instead of 2.
+Today's only caller projects the hyper-connection mix weights, which are small
+(`k=128 n=8`, `k=8 n=128`, `k=128 n=2` on the fixture); a large-weight caller
+wants a native mixed kernel, and that is a performance row, not a correctness
+one. Recorded under `## Owed`.
+
+`cudaMallocAsync`/`cudaFreeAsync` rather than `cudaMalloc`/`cudaFree`: the latter
+pair is ILLEGAL during CUDA-graph capture and implicitly synchronizes the device,
+and this is a shared GEMM seam that capture paths reach.
 
 ## Risks
 
@@ -108,7 +190,24 @@ focused gate go red.
 
 ## Owed
 
-Recorded when the measurement lands.
+* **A native mixed kernel for a large weight.** The arm upcasts the `[N,K]`
+  weight into an f32 scratch per call, which is correct and costs 5x the weight
+  traffic of an ideal `(f32 x bf16)` GEMM. Nothing on a hot path takes it today
+  — the only production caller is the hyper-connection mixer's three small
+  projections, and the released Q8_0 checkpoint routes to `kMatmulBTQuant`
+  instead — so this is a performance item, not a correctness one. It becomes a
+  question the moment a wide projection reaches this pair.
+* **`RouterGateKernel`'s private GEMV** (`cuda_deepseek_v4.cu:1877-1882`) exists
+  only because this arm did not. It can now route through the seam. Out of scope
+  here: it is a DeepSeek-V4 decode path with its own bit-identity claim against
+  the CPU `MatmulBT`, and re-pointing it needs that claim re-measured.
+* **`vt::Matmul` (the row-major NN lane) still refuses the pair.** This row
+  closes `matmul_bt` only, which is what the forward reaches; the NN lane's
+  callers pass `nk == false` weights and none of them hands it an f32
+  activation today. Named rather than silently left.
+* **The `.type_as(x)` term** upstream applies and this tree does not is already
+  owed by `.agents/specs/qwen4-exp-flash-next.md` `## Owed`; this row does not
+  move or discharge it.
 
 ## Stop conditions
 
@@ -118,4 +217,5 @@ Recorded when the measurement lands.
 
 ## Now
 
-`ACTIVE` — localizing the call site.
+`ACTIVE` — fix committed and gated on `thor:gpu0`; the forward now stops at the
+QSA rope host-residency check (#2422), which is another wave's file.

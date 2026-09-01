@@ -2385,6 +2385,12 @@ which is precisely how this landed green locally in the first place.
   agreeing with the CPU forward through `DeepseekV4Model::Forward` -- and on a
   CPU box the whole file reports `assertions: 0`, which is a skip wearing a pass.
   It is owed a run under an `rc` lease before W2 is called done.
+
+  That file now EXITS 77 on a host with no CUDA, so the skip cannot be read as a
+  pass. `vllm_cpp_add_test` has registered `SKIP_RETURN_CODE 77` since #463 for
+  exactly this, and this suite was not using it: its W2 residency cases -- the
+  only proof the tower reaches a GPU -- reported `Status: SUCCESS!` and exit 0 on
+  a box with no GPU.
 - **The MTP NVFP4 draft experts.** Skipped-and-counted today (see `## Evidence`);
   no row owns reaching them yet.
 - Upstream's own `ext.reconstruct` run against the W1a anchors, so the

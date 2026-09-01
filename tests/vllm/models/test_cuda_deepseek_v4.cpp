@@ -21,6 +21,16 @@
 
 #include "dsv4_exl3_fixture.h"
 
+// THIS SUITE OWNS ITS MAIN so it can exit 77.
+//
+// On a CPU box every case here returns early and doctest prints
+// "assertions: 0 | 0 passed | 0 failed" and "Status: SUCCESS!", which in a log
+// or a `&&` chain is indistinguishable from a suite that ran a model on a GPU
+// and matched an oracle. `vllm_cpp_add_test` registers `SKIP_RETURN_CODE 77`
+// for exactly this (tests/CMakeLists.txt:30-38, issue #463), and until now this
+// file did not use it -- so its W2 device-residency cases, the ONLY proof that
+// the EXL3 tower reaches a GPU at all, reported a pass on a host with no GPU.
+#define DOCTEST_CONFIG_IMPLEMENT
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -1281,4 +1291,25 @@ TEST_CASE("W2: the EXL3 routed experts COMPUTE on CUDA and agree with the CPU ar
                                          static_cast<double>(host_logits[i])));
   MESSAGE("EXL3 CUDA vs CPU routed-expert forward: max |diff| = " << max_abs);
   CHECK(max_abs < 1e-2);
+}
+
+
+// Exit 77 -> CTest reports SKIPPED. The real rc comes FIRST: a genuine failure
+// must never be laundered into a skip, so 77 is reached only on a clean run that
+// had no device to run on.
+int main(int argc, char** argv) {
+  doctest::Context context;
+  context.applyCommandLine(argc, argv);
+  const int rc = context.run();
+  if (context.shouldExit() || rc != 0) return rc;
+  if (!HasCuda()) {
+    std::fprintf(stderr,
+                 "test_cuda_deepseek_v4: no CUDA backend on this host - the "
+                 "device cases did not run, including the MODEL-DSV4-EXL3 W2 "
+                 "tower-residency pair that is the only proof the routed experts "
+                 "reach a GPU. Exiting 77 (SKIPPED) rather than 0, because "
+                 "\"assertions: 0 ... SUCCESS!\" is not a pass.\n");
+    return 77;
+  }
+  return 0;
 }

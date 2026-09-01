@@ -157,6 +157,13 @@ discharged: it belongs to the wave that ports the queue.
 - Re-derivation of every PORT-NOW disposition against this tree (#2524).
 - Gateability of `cdefd9d499`: a measured build that runs a model, and the
   measured `vllm.__version__` carrying its `+g<sha>` segment (#2524, #2490).
+  The first attempt ran in an `rc` lease on `orin:gpu0` and its partial evidence
+  is recorded in the sync report §9.1: the clone is confirmed at the target with
+  complete history (`REVCOUNT=20692`, `SHALLOW=false`), so #1185's
+  `setuptools_scm` fallback does not apply, and `git describe` puts the target
+  233 commits after `v0.28.1rc0`. No `vllm.__version__` was measured, so
+  `gateable` stays `no` and that tag distance must NOT be transcribed into the
+  `parity-pin` block.
 - Step 6 re-measurement of any vLLM baseline at the target before comparison
   (#2524).
 - Tiering the 356 INVENTORY entries (#2524).

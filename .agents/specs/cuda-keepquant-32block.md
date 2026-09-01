@@ -317,6 +317,15 @@ at **1.3% of the budget**, and the ratio FALLS as nb grows, so it points the way
 the error grows. A constant would have tightened as K rose and begun failing on
 the long rows this lane exists to serve.
 
+**That 1.3% is a HOST SIMULATION and it understated the device by roughly 9x.**
+Measured on GB10, the worst fraction of the bound is **11.8%**. The bound still
+holds with ~8.5x headroom and no shape came close to failing, but the number
+this spec published first was not the device's, and the difference is the part
+the simulation could not model -- the warp shuffle-down reduction, whose
+accumulation is a plain `+=` and is contractable where the per-block folds are
+`_rn`-guarded. Recorded because a bound quoted at 1.3% invites a later
+tightening that the hardware would not survive.
+
 ### Which arm the released checkpoint actually takes
 
 Worth stating precisely, because "the qwen4_exp MoE now runs on device" could be

@@ -1541,8 +1541,12 @@ TEST_CASE("32-block keep-quant lane: crosses the lane stride, and takes K = 640"
     // ALWAYS printed, unlike CAPTURE, which doctest emits only for a FAILING
     // assertion -- so a green run reported no number at all and the measured
     // device-vs-CPU margin could not be quoted from a passing gate.
-    MESSAGE("32-block lane " << c.name << ": worst device-vs-CPU max|diff| = " << worst_diff
-                             << ", worst fraction of the derived bound = " << worst_ratio);
+    // std::string, NOT the bare `c.name`: doctest stringifies a `const char*`
+    // as a BOOL, so the first run of this line labelled all three dtypes "1"
+    // and the margins could only have been attributed by trusting loop order.
+    MESSAGE("32-block lane " << std::string(c.name) << ": worst device-vs-CPU max|diff| = "
+                             << worst_diff << ", worst fraction of the derived bound = "
+                             << worst_ratio);
   }
   // A loop that ran nothing prints the same SUCCESS as one that ran everything.
   CAPTURE(combos);

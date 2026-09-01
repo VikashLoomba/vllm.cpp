@@ -1748,6 +1748,85 @@ model exists or can exist on this fleet, and what CI runs is the synthetic
 forward still re-decodes every layer's weights from the block-resident tower on
 every step, which is a residency decision and not a speed one; W8 owns speed.
 
+### W5b-2d — the by-name channel's PAYLOAD LOCATOR, consumed (CPU, small) — [#2445](https://github.com/mudler/vllm.cpp/issues/2445)
+
+**W5b-2c's mapping was correct when it landed and a shared-seam widening made it
+wrong 65 minutes later.** This wave is the reconciliation, and it is a CORRECTNESS
+repair rather than a device one: the defect reproduces on `--device cpu` and has
+nothing to do with the device arm.
+
+**THE MEASUREMENT THAT SETTLES THE OWNERSHIP QUESTION #2445 LEFT OPEN.** #2445
+filed the failure as "observed on `--device cuda`", deliberately not as
+"device-specific", and said the first thing to do was one `--device cpu` run at
+the same shard. The answer is that `--device cpu` reproduces it exactly, and the
+cause is a dated pair of commits rather than an argument:
+
+| commit | UTC | `multi_kv_index_.layer_names` points at | what `Find` returns |
+|---|---|---|---|
+| `d84db105b` — the tree that emitted ` Paris.` (O30) | 2026-08-30T11:37:56 | `attn_kv_layer_names_` (`runner.cpp:1544`) | an `attn_kv` index |
+| `9e7621efc` — ENG-MULTIKV-BYNAME | 2026-08-30T12:42:28 | `kv_index_layer_names_` (`runner.cpp:1664`) | a FLAT index over EVERY published cache |
+
+`d84db105b` is NOT an ancestor of `9e7621efc`, and `git show d84db105b:...runner.cpp`
+carries no `payload_kinds` at all. So O30's ` Paris.` was taken on a tree where
+`Find`'s answer WAS an `attn_kv` index — and `glm5_next_kv.cpp` has had no commit
+since. `9e7621efc` touched six files and none of them was this row's; qwen4_exp
+was reconciled onto `Resolve` by `6db82520e` and this row was not.
+
+**THE ARITHMETIC OF THE 45.** `kv_index_layer_names_` is built in ONE pass over
+the groups in PUBLICATION order (`runner.cpp:1370-1394`), so this model's channel
+is group 0's 11 latents, then group 1's 34 recurrent states, then group 2's 11
+indexer caches — 56 entries. Layer 3's indexer is the first entry of group 2, at
+flat index 11 + 34 = **45**, while its PAGED SLOT is 11. `attn_kv` carries 22.
+`45` was never a layer index leaking into a position lookup; it is the correct
+answer to a question the caller was no longer asking. The `payload_slots` vector
+`9e7621efc` added is the translation, and `MultiKvCacheIndex::Resolve` is the one
+call that performs it.
+
+**Scope.** `ResolveAttnCache` resolves through `PayloadAt`, refuses a
+`kRecurrent` payload under an attention name by name, and indexes `attn_kv` by the
+returned SLOT. The group id keeps being read at the FLAT index, because
+`group_ids` is parallel to the flat list and not to `attn_kv`
+(`runner.cpp:1374-1376`). The recurrent binding moves onto the same channel: its
+positional derivation was justified by "no name travels with them", a sentence
+`9e7621efc` falsified, and a comment that lies about why code is shaped a certain
+way is what the next reader ports forward.
+
+**Out of scope.** The forward's non-CPU refusal (`glm5_next_forward.cpp:231-238`)
+stays exactly as it is. This wave makes `--device cuda` REACH it; deleting it is
+W9c-3's, behind W9c-1 and W9c-2, and O32 says none is started. `deepseek_v4.cpp:3415`
+uses `Find`'s answer as an `attn_kv` index the same way, and is NOT touched here:
+its topology publishes no `MambaSpec` group, so every published cache is paged and
+flat index equals paged slot for it. That is correct-by-accident rather than a
+live defect, it belongs to another row, and O37 records it instead of a
+speculative patch reaching across.
+
+**Why eleven green suites and a full preflight missed it, which is the reusable
+part and it is O30's shape again.** `tests/vllm/models/test_glm5_next_forward.cpp`'s
+`Topology` opens with the comment "built the way the runner builds it", and it was
+— at `d84db105b`. It publishes TWO names, both paged, and sets neither
+`payload_kinds` nor `payload_slots`. On that fixture `Find` returns 0 and 1, which
+are `attn_kv` indices, so every case passes against a channel shape the runner
+stopped producing. The fixture is a SECOND DERIVATION of the runner's order, and a
+second derivation is the thing that can disagree with the first. The repair is to
+the fixture, not to the assertions: it now emits all three groups in publication
+order with both locator vectors, which puts `Find(indexer) == 4` against
+`attn_kv.size() == 2` and reproduces the production throw in a 4-layer miniature.
+
+**Tests.** RED first, and the red is the production message verbatim modulo the
+numbers. One new case pins the flat-index-vs-paged-slot distinction directly —
+that `Find` answers the flat index, that `PayloadAt` answers the slot, and that
+the two DIFFER at this topology — so a future edit that reverts to `Find` fails on
+an assertion rather than on a shape. A second pins the refusal when an attention
+name resolves to a `kRecurrent` payload.
+
+**Gates.** `scripts/agent-preflight.sh --fail-on-skip`; the glm5 suites by hand
+with assertion counts; `test_runner` and `test_multi_kv_refusal` for the seam;
+DeepSeek-V4 and qwen4_exp sibling inertness because the channel is shared. The
+device gate is `dgx:gpu0`: the UNFIXED binary on `--device cpu` throwing the
+binding error, the FIXED binary on `--device cpu` emitting ` Paris.`, and the
+FIXED binary on `--device cuda` reaching the forward's refusal — three legs, two
+binaries, both hashed.
+
 ### W5c — the weight tower and `load_weights` — SUPERSEDED, see the LANDED section below
 
 This was W5's PLAN for W5c, and it is kept only so the two readings do not look
@@ -4635,6 +4714,38 @@ Debts this row carries, each visible rather than waived:
   `RegisterOp` line and shows the device gate reds — which proves the gate
   measures the registered provider and not a directly-called kernel, and proves
   nothing about a capability. Read it that way.
+
+- **O37 — `deepseek_v4.cpp:3415` MAKES THE SAME FLAT-INDEX MISTAKE W5b-2d
+  REPAIRED HERE, and it is not a live defect only because of that model's
+  topology.** `DeepseekV4PagedSwaPages` reads
+  `const int64_t idx = multi_kv.Find(name)` and indexes `attn_kv[idx]` directly,
+  which is exactly what `ResolveAttnCache` did before this wave. It is correct
+  today because DeepSeek-V4-Flash publishes no `MambaSpec` group: every one of
+  its 167 published caches is paged, so the flat index and the paged slot are
+  equal for every entry, and `MultiKvCacheIndex::Find` and
+  `MultiKvCacheIndex::PayloadAt` cannot disagree. The moment that model — or any
+  model reaching that function — publishes a recurrent group anywhere in its
+  group list, the same 45-against-22 failure appears there, and it appears at a
+  DIFFERENT severity: this row's caller happened to index out of range and throw,
+  while an in-range flat index would have read a plausible float buffer for the
+  wrong layer and produced fluent wrong tokens. **NOT fixed in flow, and the
+  reason is scope rather than convenience:** it is a different row's file, it
+  produces no wrong answer at any topology this tree can build today, and the fix
+  wants that row's own sibling-inertness gate rather than this one's. Tracked by
+  [#2456](https://github.com/mudler/vllm.cpp/issues/2456), which names
+  `MODEL-DSV4-*` as its owner.
+- **O38 — THE DEVICE ARM HAS NO NUMBER AND THIS WAVE DID NOT PRODUCE ONE, which
+  is a stronger statement than O6's "no number on any axis" and belongs beside
+  it.** W5b-2d makes `--device cuda` REACH `glm5_next_forward.cpp:231-238`
+  instead of dying before it. What it reaches there is a refusal: the whole
+  forward is a host `std::vector<float>` reference, and there is no CUDA arm to
+  time. **A benchmark of this model's device arm is therefore not blocked on a
+  lease, a harness or a denominator — the arm does not exist**, and W9c-1
+  (DSA/MLA onto the shared seam), W9c-2 (the KDA and MoE CPU-only refusals) and
+  W9c-3 (the compose) are each unstarted per O32. Recorded because "the KV
+  binding is fixed" reads like "the device arm is close" and it is not: fixing
+  the binding moved the first obstacle from the engine into the model, which is
+  where the four named waves already said it was.
 
 ## Now
 

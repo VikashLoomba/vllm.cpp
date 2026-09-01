@@ -44,6 +44,36 @@ Facts that constrain the diagnosis, read off `server.log`:
   `kAliasedInPlace` branch forever after, so a `rehomed` counter that keeps
   climbing proves that **fresh owned host buffers appear each step**.
 
+## The extents, at both token counts
+
+Read off the code for the released geometry (`hidden_size` 2560, 16 key heads
+and 48 value heads at `head_dim` 128, so `key_dim` 2048, `value_dim` 6144,
+`conv_dim` 10240). `MatmulBf16D` -> `vt::MatmulBT` -> `MatmulBTKernelCuda` sets
+`m = a.shape[0]`, `k = a.shape[1]`, `n = b.shape[0]` and builds column-major
+layouts `A[k,n] ld=k`, `B[k,m] ld=a.stride[0]`, `C[n,m] ld=n`.
+
+| operand | told (elements) | allocated | prefill `T=5` | decode `T=1` |
+|---|---|---|---|---|
+| `in_proj_qkv` (A) | `k*n` = 2560 x 10240 | `[10240,2560]` bf16 | 52,428,800 B | 52,428,800 B |
+| `in_proj_z` (A) | 2560 x 6144 | `[6144,2560]` bf16 | 31,457,280 B | 31,457,280 B |
+| `mixed` (B) | `k*m` = 2560 x `T`, ld 2560 | `DBuf [T,2560]` bf16 | 25,600 B | 5,120 B |
+| `mixed_qkv` (C/D) | `n*m` = 10240 x `T`, ld 10240 | `DBuf [T,10240]` bf16 | 102,400 B | 20,480 B |
+
+**Every told extent equals its allocation at both token counts, and no extent
+is derived from a token count other than the one the operand was allocated
+with.** `T` reaches the GEMM only as `m`, and `m` is read from the activation's
+own `shape[0]`; the activation is the `DBuf(d, dt, {T, H})` the same layer
+allocated. `vt::MatmulBT` re-checks `a.shape[1] == b.shape[1]`,
+`out.shape == {a.shape[0], b.shape[0]}` and contiguity before dispatch, so a
+disagreement would refuse by name rather than fault.
+
+So the token-count hypothesis is REFUTED for this GEMM: there is no dimension
+that is right at `T=5` and wrong at `T=1`. The one `T`-dependent behaviour worth
+naming is `DevicePool`'s size-class rounding, which serves a `T=1` request from
+a block that may have held a `T=5` activation. That gives a block LARGER than
+the request, never shorter, and `Qwen4ExpGatedResidual` writes every logical row
+before the GEMM reads it, so no stale row is reachable.
+
 ## The defect
 
 `qwen4_exp_forward.h` states the invariant this code breaks:
@@ -129,7 +159,15 @@ forward. Without it this row claims the defect and the fix, not the arm.
 
 - The GPU rerun of `compute-sanitizer` on the fixed binary, and the token
   sequence with no `CUDA_LAUNCH_BLOCKING`.
-- Whether #2496's garbage tokens share this root cause. The mechanism predicts
-  they can (a freed range re-mapped and refilled before the GEMM runs returns
-  another layer's bytes rather than faulting), but that is a hypothesis until
-  the fixed binary is measured.
+- Whether #2496's garbage tokens share this root cause. The evidence available
+  here says NO, on two independent grounds. First, #2496 was measured UNDER
+  `CUDA_LAUNCH_BLOCKING=1`, and blocking launches complete this GEMM before the
+  scope that owned its operand closes, so this defect is inert on the arm that
+  produced it. Second, the sibling wave measured #2496's wrong decode as
+  bit-stable across builds, and this defect's wrong read is whatever the
+  allocator last put at a freed address, which is not stable. The extent table
+  above adds a third: no operand of this GEMM has a token-count-dependent
+  extent, so the "correct prefill, wrong decode" shape does not come from here.
+  The fixed binary should still be re-measured, because this defect is live on
+  the production (non-blocking) arm and can corrupt what decode carries forward
+  there.

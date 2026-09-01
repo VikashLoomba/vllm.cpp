@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -89,15 +90,31 @@ struct TinySpec {
   std::string v_adapter_type = "patch_merger";
   bool v_pre_pixel_shuffle = true;
   bool v_post_norm = true;
+  // THE TWO ADAPTER KEYS A CONFORMANT CHECKPOINT TIES TO SOMETHING ELSE, and
+  // the only reason either is settable. `adapter_out_dim` is the TEXT hidden
+  // size because the encoder's rows are scattered into the prompt; and
+  // `adapter_merge_size` is `spatial_merge_size` because the PROMPT side
+  // expands placeholders by that key while the tower folds by this one. A case
+  // that wants the install-time refusal for a checkpoint whose keys disagree
+  // sets one of these positive. Zero means "follow the conformant value".
+  int64_t v_adapter_out_override = 0;
+  int64_t v_adapter_merge_override = 0;
 
   int64_t v_head_dim() const { return v_embed / v_heads; }
   int64_t v_patch_row() const {
     return v_channels * v_temporal * v_patch * v_patch;
   }
-  int64_t v_merged_dim() const { return v_embed * v_merge * v_merge; }
+  int64_t v_adapter_merge() const {
+    return v_adapter_merge_override > 0 ? v_adapter_merge_override : v_merge;
+  }
+  int64_t v_merged_dim() const {
+    return v_embed * v_adapter_merge() * v_adapter_merge();
+  }
   // The adapter lands in the TEXT hidden space; anything else cannot be
   // scattered into the prompt.
-  int64_t v_adapter_out() const { return hidden; }
+  int64_t v_adapter_out() const {
+    return v_adapter_out_override > 0 ? v_adapter_out_override : hidden;
+  }
   int64_t qk_head_dim() const { return qk_nope + qk_rope; }
 };
 
@@ -260,7 +277,7 @@ inline nlohmann::json TinyConfigDoc(const std::string& fixture_dir,
     v["adapter_type"] = s.v_adapter_type;
     v["adapter_in_dim"] = s.v_embed;
     v["adapter_out_dim"] = s.v_adapter_out();
-    v["adapter_merge_size"] = s.v_merge;
+    v["adapter_merge_size"] = s.v_adapter_merge();
     d["vision_config"] = v;
   } else {
     d.erase("vision_config");
@@ -442,8 +459,14 @@ class TinyCheckpoint {
   const std::vector<double>& value_of(const std::string& name) const {
     for (const StOut& e : entries_)
       if (e.name == name) return e.values;
-    static const std::vector<double> kEmpty;
-    return kEmpty;
+    // AN UNKNOWN NAME IS A TEST DEFECT AND SAYS SO. Returning an empty vector
+    // made a typo or a renamed tensor read as a tensor of zero elements, which
+    // `ref::Tower` then INDEXES — undefined behaviour whose most likely shape
+    // is a reference driven from garbage that the gate compares against
+    // itself. An instrument must be able to report its own failure.
+    throw std::runtime_error(
+        "dots3_tiny::TinyCheckpoint::value_of: this fixture checkpoint has no "
+        "tensor named '" + name + "'");
   }
 
  private:

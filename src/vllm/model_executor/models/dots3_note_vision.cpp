@@ -118,7 +118,11 @@ Dots3NoteVisionParams ParseDots3NoteVisionParams(const HfConfig& config) {
   v.present = true;
 
   v.embed_dim = ReadIntOr(j, "embed_dim", 1536);
-  v.hidden_size = ReadIntOr(j, "hidden_size", 2048);
+  // From the LANGUAGE config, not from `j`. See the field's comment: this is
+  // the width `EncodeMmDots3NoteForCausalLM` compares `adapter_out_dim`
+  // against, and reading `vision_config`'s own copy of it instead would leave
+  // the refusal answering a different question from the route.
+  v.text_hidden_size = config.hidden_size;
   v.intermediate_size = ReadIntOr(j, "intermediate_size", 4224);
   v.moe_intermediate_size = ReadIntOr(j, "moe_intermediate_size", 2112);
   v.num_hidden_layers = ReadIntOr(j, "num_hidden_layers", 42);
@@ -261,15 +265,52 @@ std::string Dots3NoteVisionRefusal(
            "and the multi-frame `cu_seqlens` builder is a different one "
            "(vision.py:613-624). Video is W7";
   }
-  if (v.adapter_merge_size * v.adapter_merge_size * v.adapter_in_dim !=
-      v.merged_dim()) {
-    return "the adapter's merged width does not follow from its own keys";
-  }
   if (v.adapter_in_dim != v.embed_dim) {
     return "`adapter_in_dim` " + std::to_string(v.adapter_in_dim) +
            " is not the tower's `embed_dim` " + std::to_string(v.embed_dim) +
            ", so `ln_q` would normalize a width the trunk does not produce "
            "(vision.py:466 @ 9035151d6). W6b";
+  }
+  // ── THE TWO THE ENCODER ASSERTS ON ─────────────────────────────────────────
+  //
+  // These name NO brick, because nothing is owed: they are configs no
+  // dots3-note tower can be served under. They are here because a refusal
+  // predicate that is a strict SUBSET of the request-time asserts is not a
+  // refusal. `EncodeMmDots3NoteForCausalLM` makes both comparisons again inside
+  // the ENGINE's busy loop, where a throw sets `AsyncLLM::errored_`
+  // permanently (`async_llm.cpp:584-601`) — the server then starts, serves
+  // text, 500s the first image, and answers every LATER request, text ones
+  // included, with "request submitted to a stopped AsyncLLM". Asking here turns
+  // the same answer into a REFUSING seam: HTTP 400, text path untouched.
+  //
+  // The refusal and the route must be the SAME predicate. This is the row's
+  // second recurrence of that finding (the first is the sparse-routing entry
+  // under `## Owed`), and it is what retired the tautology that used to sit
+  // where the second check now is: `adapter_merge_size**2 * adapter_in_dim !=
+  // merged_dim()` compared `merged_dim()` against its own definition.
+  if (v.adapter_out_dim != v.text_hidden_size) {
+    return "`adapter_out_dim` " + std::to_string(v.adapter_out_dim) +
+           " is not the TEXT tower's `hidden_size` " +
+           std::to_string(v.text_hidden_size) +
+           ", so `adapter.mlp.2` emits rows that cannot be scattered into the "
+           "prompt at all (vision.py:461 @ 9035151d6 against "
+           "`config.hidden_size`). This is the comparison "
+           "`EncodeMmDots3NoteForCausalLM` makes on a served request";
+  }
+  if (v.adapter_merge_size != v.spatial_merge_size) {
+    return "`adapter_merge_size` " + std::to_string(v.adapter_merge_size) +
+           " is not `spatial_merge_size` " +
+           std::to_string(v.spatial_merge_size) +
+           ". The PROMPT side expands one image marker into "
+           "`prod(grid) // spatial_merge_size**2` placeholders "
+           "(multimodal.py:151-155 @ 9035151d6, and this port's "
+           "`Dots3NoteProcessorConfig::merge_size`, which is read from that "
+           "key) while the ADAPTER folds `adapter_merge_size**2` trunk tokens "
+           "into each emitted row (vision.py:441-449). Upstream keeps the two "
+           "as independent keys with independent defaults, so a checkpoint can "
+           "carry them disagreeing; serving it would either leave the trunk "
+           "length not grouping into whole merger rows, or emit a row count "
+           "the placeholder span cannot hold";
   }
   return "";
 }

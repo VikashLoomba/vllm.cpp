@@ -87,7 +87,14 @@ struct Dots3NoteVisionParams {
   bool present = false;
 
   int64_t embed_dim = 1536;
-  int64_t hidden_size = 0;           // the TEXT width the adapter lands in
+  // The TEXT tower's `hidden_size`, copied from the LANGUAGE config at parse.
+  // It is NOT a `vision_config` key, and it replaces one that was: upstream's
+  // `vision_config.hidden_size` is a SECOND copy of the same number, nothing
+  // read it, and a refusal that read it would still not be the predicate the
+  // encoder applies. `EncodeMmDots3NoteForCausalLM` compares `adapter_out_dim`
+  // against `config.hidden_size`, so that is the value that has to be here for
+  // `Dots3NoteVisionRefusal` to answer the same question the route asks.
+  int64_t text_hidden_size = 0;
   int64_t intermediate_size = 4224;  // the DENSE SwiGLU width
   int64_t moe_intermediate_size = 2112;  // W6b's; read only to report it
   int64_t num_hidden_layers = 42;
@@ -104,10 +111,15 @@ struct Dots3NoteVisionParams {
   // `pre_pixel_shuffle` (`vision.py:60-63`): when TRUE the PREPROCESSOR already
   // emits patch rows in 2x2-grouped order (`common/processor.py:185-197`), so
   // the RoPE positions are regrouped to match (`get_pos_ids_by_grid:566-575`).
-  // The released checkpoint sets it TRUE. It is NOT the same switch as
-  // `adapter_type`, and conflating the two is the reading #2512's prose
-  // invites — see `.agents/specs/dots3-note.md` §4.11.1.
-  bool pre_pixel_shuffle = true;
+  // It is NOT the same switch as `adapter_type`, and conflating the two is the
+  // reading #2512's prose invites — see `.agents/specs/dots3-note.md` §4.11.1.
+  //
+  // FALSE is `DotsMoEVitConfig`'s own default (`vision.py:64`), which is why it
+  // is the default here; the RELEASED checkpoint sets it TRUE in its
+  // `vision_config` and the parser reads that. The struct default matters
+  // because this field selects between two INCOMPATIBLE token orders, so a
+  // default-constructed params must not silently claim the regrouped one.
+  bool pre_pixel_shuffle = false;
 
   // The per-block routed-expert counts (`vision.py:90`). `is_moe` is
   // `pyramid_num_routed[i] > 0` (`vision.py:346-350`), so the released

@@ -218,16 +218,25 @@ ImageKwargs Dots3NoteImageProcessor::ProcessImage(const uint8_t* rgb,
   const int64_t rh = rs[0], rw = rs[1];
   if (rh != height || rw != width) {
     // A genuine bicubic resize (`Image.Resampling.BICUBIC`,
-    // `processor.py:164`). NAMED, exactly as the Qwen3-VL processor beside this
+    // `processor.py:174`). NAMED, exactly as the Qwen3-VL processor beside this
     // one names it: patchifying at the wrong grid would change the placeholder
-    // count and serve a well-shaped wrong prompt. Recorded under `## Owed` in
-    // `.agents/specs/dots3-note.md`.
+    // count and serve a well-shaped wrong prompt.
+    //
+    // THIS IS A CAPABILITY GAP, NOT A CORNER. `factor` is
+    // `patch_size * merge_size`, which on the released checkpoint is 28, and
+    // upstream ALWAYS resizes — so once W6b lifts the MoE ViT refusal, almost
+    // no real image clears this. It is owed by W8 (the MM front end brick that
+    // owns the processor), recorded under `## Owed` in
+    // `.agents/specs/dots3-note.md`, and tracked by issue #2537. Both this
+    // comment and the message below claimed that record before it existed; the
+    // fresh review of #2523 found the claim false and this is the repair.
     throw std::runtime_error(
         "Dots3NoteImageProcessor: image requires resize (" +
         std::to_string(width) + "x" + std::to_string(height) + " -> " +
         std::to_string(rw) + "x" + std::to_string(rh) +
         "); the bicubic resize path is not ported (W6a uses conformant "
-        "images). See .agents/specs/dots3-note.md and issue #2512.");
+        "images). Owed by W8 and tracked by issue #2537; see "
+        ".agents/specs/dots3-note.md `## Owed`.");
   }
 
   const int64_t grid_h = rh / patch;

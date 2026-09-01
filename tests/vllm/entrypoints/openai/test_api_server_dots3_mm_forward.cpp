@@ -598,3 +598,92 @@ TEST_CASE("dots3-note W6a: the chat seam declares ONE image, and refuses a secon
   CHECK(r.status == 400);
   CHECK(r.body.find("image") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// 8 and 9. THE REFUSAL PREDICATE AND THE ROUTE PREDICATE ARE THE SAME
+//    PREDICATE, or the engine-fatal cascade case 5 removed is still reachable
+//    (fresh review of #2523).
+//
+//    Case 5 proves the shape works for ONE condition — a pyramid block. These
+//    two prove it holds for the conditions the ENCODER asserts on. Before this
+//    repair `Dots3NoteVisionRefusal` was a strict SUBSET of
+//    `EncodeMmDots3NoteForCausalLM`'s `VT_CHECK`s: an all-dense checkpoint whose
+//    `adapter_out_dim` is not the text width, or whose `adapter_merge_size` is
+//    not `spatial_merge_size`, INSTALLED cleanly, served text, and then threw
+//    inside the engine's busy loop on the first image — after which
+//    `AsyncLLM::errored_` is set for the life of the process
+//    (`async_llm.cpp:584-601`) and every later request, text included, is dead.
+//
+//    Each case therefore asserts BOTH halves, exactly as case 5 does: HTTP 400
+//    on the image, and HTTP 200 on a TEXT request sent afterwards on the SAME
+//    server. The second assertion is the one the pre-repair tree cannot pass.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6a: an adapter that does not land in the TEXT hidden space refuses at INSTALL") {
+  TinySpec spec;
+  // Every block is dense and every other key is conformant, so this checkpoint
+  // clears every refusal case 5 exercises. What it gets wrong is the ONE thing
+  // the encoder compares `adapter_out_dim` against: the text tower's width.
+  spec.v_adapter_out_override = spec.hidden + 8;
+  Served s(spec);
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kRefusing);
+  INFO("install log: ", log.str());
+  CHECK(log.str().find("adapter_out_dim") != std::string::npos);
+
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(ChatBody(2, 0, false).dump());
+  INFO("body: ", r.body);
+  CHECK(r.status == 400);
+  CHECK(r.body.find("adapter_out_dim") != std::string::npos);
+
+  // THE ASSERTION THE PRE-REPAIR TREE FAILS. A 500 here — "request submitted to
+  // a stopped AsyncLLM" — is the cascade: the image request threw inside the
+  // busy loop and took the text path down with it.
+  const json text = {{"model", "test-model"},
+                     {"messages", json::array({{{"role", "user"},
+                                                {"content", "hello"}}})},
+                     {"max_completion_tokens", 2},
+                     {"temperature", 0.0}};
+  const ApiServer::DispatchResult t =
+      h.server.handle_chat_completions(text.dump());
+  INFO("text body: ", t.body);
+  CHECK(t.status == 200);
+  CHECK(t.body.find("stopped") == std::string::npos);
+}
+
+TEST_CASE("dots3-note W6a: an adapter merge that is not the PROMPT's merge refuses at INSTALL") {
+  TinySpec spec;
+  // `spatial_merge_size` stays 2, so the prompt side expands the placeholder to
+  // prod(grid)/4 = FOUR tokens; the adapter folds `adapter_merge_size**2` = ONE
+  // trunk token per row and emits SIXTEEN. Upstream keeps the two as
+  // independent keys with independent defaults, so this is a config a
+  // checkpoint can carry — not a shape the parse can rule out.
+  spec.v_adapter_merge_override = 1;
+  Served s(spec);
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kRefusing);
+  INFO("install log: ", log.str());
+  CHECK(log.str().find("adapter_merge_size") != std::string::npos);
+
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(ChatBody(2, 0, false).dump());
+  INFO("body: ", r.body);
+  CHECK(r.status == 400);
+  CHECK(r.body.find("adapter_merge_size") != std::string::npos);
+  CHECK(r.body.find("spatial_merge_size") != std::string::npos);
+
+  const json text = {{"model", "test-model"},
+                     {"messages", json::array({{{"role", "user"},
+                                                {"content", "hello"}}})},
+                     {"max_completion_tokens", 2},
+                     {"temperature", 0.0}};
+  const ApiServer::DispatchResult t =
+      h.server.handle_chat_completions(text.dump());
+  INFO("text body: ", t.body);
+  CHECK(t.status == 200);
+  CHECK(t.body.find("stopped") == std::string::npos);
+}

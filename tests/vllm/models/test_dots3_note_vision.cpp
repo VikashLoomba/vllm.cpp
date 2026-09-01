@@ -560,6 +560,57 @@ TEST_CASE("dots3-note W6a: every unported vision shape refuses BY NAME with its 
       CHECK(why.find(key) != std::string::npos);
     }
   }
+  // THE THREE CONDITIONS THE ENCODER ASSERTS ON, asked HERE too. Before the
+  // fresh review of #2523 the refusal was a strict SUBSET of
+  // `EncodeMmDots3NoteForCausalLM`'s `VT_CHECK`s, and the gap was reachable
+  // from an all-dense config the seam ACCEPTED — after which the throw lands in
+  // the engine's busy loop and stops `AsyncLLM` for the life of the process.
+  // The refusal predicate and the route predicate must be the SAME predicate.
+  SUBCASE("`adapter_out_dim` that is not the TEXT hidden_size refuses") {
+    nlohmann::json d = released;
+    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
+    d["vision_config"]["adapter_out_dim"] = d["hidden_size"].get<int64_t>() + 8;
+    const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
+    INFO(why);
+    CHECK_FALSE(why.empty());
+    CHECK(why.find("adapter_out_dim") != std::string::npos);
+    CHECK(why.find("hidden_size") != std::string::npos);
+  }
+  SUBCASE("the TEXT hidden_size is what it compares against, not vision_config's") {
+    // The two documents' copies of the number are made to DISAGREE. The
+    // encoder's assert reads `config.hidden_size`, so a refusal that read
+    // `vision_config.hidden_size` instead would accept the left case and refuse
+    // the right one — both of them backwards.
+    nlohmann::json d = released;
+    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
+    d["vision_config"]["hidden_size"] = d["hidden_size"].get<int64_t>() + 8;
+    CHECK(Dots3NoteVisionRefusal(ParseDoc(d), "", {}).empty());
+
+    nlohmann::json e2 = released;
+    for (auto& e : e2["vision_config"]["pyramid_num_routed"]) e = -1;
+    e2["hidden_size"] = e2["hidden_size"].get<int64_t>() + 8;
+    const std::string why = Dots3NoteVisionRefusal(ParseDoc(e2), "", {});
+    INFO(why);
+    CHECK_FALSE(why.empty());
+    CHECK(why.find("adapter_out_dim") != std::string::npos);
+  }
+  SUBCASE("`adapter_merge_size` that is not `spatial_merge_size` refuses") {
+    // BOTH directions, because they reach DIFFERENT asserts on a served
+    // request: 1 makes the tower emit more rows than the placeholder span holds
+    // (`rows == item.length`), and 3 makes the trunk length not group into
+    // whole merger rows at all (`L % merge_unit == 0`). One refusal covers
+    // both, because both are the same disagreement between two keys.
+    for (int64_t m : {int64_t{1}, int64_t{3}}) {
+      nlohmann::json d = released;
+      for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
+      d["vision_config"]["adapter_merge_size"] = m;
+      const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
+      INFO("adapter_merge_size ", m, " -> ", why);
+      CHECK_FALSE(why.empty());
+      CHECK(why.find("adapter_merge_size") != std::string::npos);
+      CHECK(why.find("spatial_merge_size") != std::string::npos);
+    }
+  }
   SUBCASE("a checkpoint with NO vision_config refuses, naming the absence") {
     nlohmann::json d = released;
     d.erase("vision_config");

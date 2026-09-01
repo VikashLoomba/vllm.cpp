@@ -199,6 +199,13 @@ MmEncoderOutput EncodeMmDots3NoteForCausalLM(
   const int64_t width = v.adapter_out_dim;
   // The tower lands in the TEXT hidden space, and a checkpoint whose adapter
   // does not is one whose rows cannot be scattered into the prompt at all.
+  //
+  // DEFENCE IN DEPTH, and no longer the FIRST line. `Dots3NoteVisionRefusal`
+  // now makes this same comparison, and the one on the merge sizes below it, at
+  // INSTALL — because reaching either of them here throws inside the engine's
+  // busy loop, which stops `AsyncLLM` for the life of the process. Keep the two
+  // predicates identical: a check added here and not there re-opens that
+  // cascade through a narrower door (fresh review of #2523).
   VT_CHECK(width == config.hidden_size,
            "Dots3NoteForCausalLM encoder: the vision adapter emits " +
                std::to_string(width) + "-wide rows but the text tower is " +

@@ -12,6 +12,11 @@ Two unrelated correctness defects that share one property: both are invisible to
 every gate that currently runs, and both were found by reading rather than by a
 red.
 
+**This wave does not turn `sanitize-cpu` green on its own.** It removes the
+finding #2435 names; the sweep in `## Evidence` found a second, unrelated one
+(#2540) that the lane's abort-on-first-finding had been hiding. Both facts are
+recorded rather than one.
+
 1. **#2435** — `vllm::dense_attn::MakeTensor`
    (`include/vllm/model_executor/models/dense_device_glue.h`, `MakeTensor`) writes
    `t.shape[i]` and `t.stride[i]` for `i` up to `shape.size() - 1` with no bound,
@@ -294,6 +299,59 @@ discriminating on an aarch64 i8mm box, and it is inert here. The CPU control
 another wave. It is unchanged by construction rather than by measurement — on
 `dev == kCPU` the gated expression is character-for-character the old one.
 
+### Every test that constructs the glue types, under the same sanitizers
+
+The static scan for rank-5 shapes reads brace literals; a shape built into a
+`std::vector` at run time would escape it. So every test file that includes
+`dense_device_glue.h` or `dense_attn_block.h` — the fifteen that can construct a
+`DBuf` or call `MakeTensor` at all — was built and run:
+
+| binary | rc | UBSan | leaks | assertions |
+|---|---|---|---|---|
+| `test_device_pool` | 0 | 0 | 0 | 42 / 42 |
+| `test_glm5_next_moe` | 0 | 0 | 0 | 12731 / 12731 |
+| `test_kv_cache_fp8_wiring` | 0 | 0 | 0 | 487 / 487 |
+| `test_load_direct_upload` | 0 | 0 | 0 | 203 / 203 |
+| `test_qwen3_5_gdn_spec_routing` | 0 | 0 | 0 | 82 / 82 |
+| `test_qwen3_dflash2_draft` | 0 | 0 | 0 | 449 / 449 |
+| `test_qwen4_exp_forward` | 0 | 0 | 0 | 429 / 429 |
+| `test_qwen4_exp_layer_loop` | 0 | 0 | 0 | 341 / 341 |
+| `test_qwen4_exp_qsa_block` | 0 | 0 | 0 | 5937 / 5937 |
+| `test_mistral_paged_engine` | 0 | 0 | 0 | 0 / 0 — a SELF-DECLARED skip, not a silent one: "mistral-7B-v0.3 checkpoint absent; skipping (dgx-only)" |
+| `test_dots3_note_attn` | **1** | **1** | 0 | aborted before any |
+| `test_muse_glimmer_text` | **1** | **1** | 0 | aborted before any |
+
+No rank-5 caller survived the scan, and none of the twelve reports a leak.
+
+### THE LANE HAS A SECOND FINDING, AND IT IS NOT THIS ONE
+
+`test_dots3_note_attn` and `test_muse_glimmer_text` both abort on the SAME
+UBSan report, and it is not the rank overrun:
+
+```
+src/vt/cpu/cpu_matmul_elem.cpp:577:61: runtime error: load of misaligned address
+0x782f0e901907 for type 'const uint16_t', which requires 2 byte alignment
+    #0 vt::cpu::WidenRowToF32   cpu_matmul_elem.cpp:577
+    #1 RmsNormKernel            cpu_ops.cpp:557
+    #2 vt::RmsNorm              ops.cpp:1043
+    ...
+    #7 Dots3NoteModel::ForwardDevice / muse_glimmer.cpp:298
+    #9 vllm::ModelRegistry::Forward   model_registry.cpp:646
+```
+
+The operand is the RMSNorm **gamma** (`cpu_ops.cpp:557` widens `w.data` once per
+call), reached through `ResidentWeight(d, layer.input_layernorm, {H})` on both
+models, at an odd address. **It is a different subsystem and a different defect**,
+and this branch touches none of the nine files in either stack — `git diff
+--name-only 63889449c HEAD` and the stacks' file list have an empty intersection.
+
+It was hidden behind #2435 because the lane aborts at the first finding and
+`test_qwen4_exp_layer_loop` sorts earlier. Filed as
+[#2540](https://github.com/mudler/vllm.cpp/issues/2540) and listed under
+`## Owed` below. **The claim this wave can make is therefore narrower than the
+one it was asked for**: the finding that #2435 names is gone, and
+`sanitize-cpu (address,undefined)` has at least one more before it is green.
+
 ### The mutations
 
 Each applied in this worktree, rebuilt, run, then restored and verified
@@ -349,6 +407,14 @@ a bounds question, and it is a different row.
 * Dequantizing the `qwen4_exp` hyper-connection weights at load
   (`MODEL-MM-QWEN4-EXP`), with the residency and token evidence that needs.
 * The aarch64 CUDA measurement of the repack trade that #2406 asks for.
+* **The misaligned bf16 gamma load**
+  ([#2540](https://github.com/mudler/vllm.cpp/issues/2540)). `WidenRowToF32`
+  reads an RMSNorm gamma at an odd address on `dots3_note` and `muse_glimmer`,
+  reached from `ModelRegistry::Forward` on both. Found by this wave's sweep,
+  filed rather than fixed: it is a different subsystem, the root cause is
+  wherever `ResidentWeight` produced an odd `bytes.data()`, and silencing it with
+  a `memcpy` in `WidenRowToF32` would fix the wrong end. It is the second
+  `sanitize-cpu` finding and it blocks that lane after this branch lands.
 
 ## Now
 

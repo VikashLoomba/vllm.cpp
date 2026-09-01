@@ -241,6 +241,21 @@ output gate into it, and `:705` hands that f32 tensor to `vt::RmsNorm` beside th
 bf16 `w.q_norm`. `RmsNormKernelCuda`'s `VT_CHECK(w.dtype == x.dtype)`
 (`cuda_ops.cu:463`) then fires.
 
+**`:705` is the UNCONDITIONAL one, and that is what makes it the site rather than
+a candidate.** Its `x` is a literal `DType::kF32` allocation, so it mismatches a
+bf16 gamma whatever the model dtype resolves to. The other two track
+`hidden.dtype` and agree with the gamma whenever that is bf16, which the GGUF
+path fixes at `qwen4_exp_gguf_weights.cpp:206`. It also sits in `QsaBlockCore`
+(`qwen4_exp_qsa_block.cpp:417`) outside any `if (paged)`, so both arms reach it,
+including the paged one that `qwen4_exp_forward.cpp:449` actually calls.
+
+**One ordering caveat, stated because the issue asks for the order.** `:632` runs
+BEFORE `:705` in every QSA layer. If `hidden.dtype` were ever not bf16, `:632`
+would fire first and `:705` would never be reached. So `:705` is the site under
+the dtype this tree resolves; it is not proof that no earlier site can fire under
+a different one. A per-op trace, which #2477 already owes, settles that and
+nothing here replaces it.
+
 **Why it is CUDA-only.** `RmsNormKernel` on the CPU widens `w` and `x` to f32
 independently and folds the gemma `+1` into the widened weight
 (`src/vt/cpu/cpu_ops.cpp:546-566`). It accepts the mixed pair, which is why the

@@ -445,7 +445,14 @@ MATRICES = {
      # linear-attention op chain as native TT kernels — the hard prerequisite
      # for every Qwen3.5/3.8 arch on Tenstorrent. ACTIVE, spec-first; no
      # implementation yet.
-    "BACKEND": (AGENTS / "backend-matrix.md", 87),
+    # 88 since 2026-09-01: +`BACKEND-GATE-ROCM-LLAMACPP` (#2497), the ROCm
+    # GGUF k-quant floor. Every other backend already had its llama.cpp
+    # gate row; ROCm had only the vLLM and SGLang rows, and neither has a
+    # denominator on `gfx1151` because vLLM has no entry on that
+    # architecture. The first measurement landed with nowhere to record
+    # it. `INVENTORIED`, no owner, no spec of its own. Bumped for a real
+    # new row, never to make a failing state transition pass.
+    "BACKEND": (AGENTS / "backend-matrix.md", 88),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

@@ -3967,6 +3967,254 @@ widening it. Stop if the nearest mechanism cannot be pushed above the residue by
 fixture design. Stop if W5c needs more than the classifier-deferral shape. Stop
 and return `NEEDS_DECISION` if the seam needs a new `vt` op.
 
+### 4.11 W6a puts the DENSE vision tower on a SERVED request, and refuses the pyramid by name
+
+W6a is the first brick on this row whose output a client can ask for. Every
+brick before it ended at a `ctest` binary: W3 wrote host maths, W4a/W4b put the
+two attention geometries on the decode path, W5 put the MoE layers there. None
+of them could be reached from `ApiServer::handle_chat_completions`, because
+until #2398 and #2481 landed there was no engine path by which a vision tower
+could be fed from a production entry point at all. Both are on `main` now, so
+the remaining work was this model's own half: a tower, a processor, a chat
+registration and the two `ModelFactory` hooks.
+
+**The oracle, and the SHA every anchor here was read at.** vLLM is the oracle
+and no secondary oracle is admissible, because vLLM implements this tower. It is
+BEYOND our parity pin: `5559679229bc961848b121ccdeaa8fa5d79bec98` has no
+`dots3_note` directory at all. The sources were read in the local clone
+`~/_git/vllm` at **`9035151d6`**, the merge of
+[vllm#51255](https://github.com/vllm-project/vllm/pull/51255) that added them:
+
+| Upstream | Lines at `9035151d6` | What W6a ported from it |
+|---|---|---|
+| `vllm/models/dots3_note/nvidia/vision.py` | 677 | `DotsMoEVitConfig:27`, `RMSNorm:107`, `DotsSwiGLUFFN:126`, `DotsPatchEmbed:302`, `MoEVisionBlock:334`, `PatchMergerAdapter:441`, `DotsMoEVitModel:492` (`get_pos_ids_by_grid:566`, `rot_pos_emb:604`, `_build_single_temporal_cu_seqlens_from_grid:625`, `forward:634`) |
+| `vllm/models/dots3_note/nvidia/vision_attention.py` | 477 | `rotate_half:33`, `apply_rotary_pos_emb_vision:39`, `VisionRotaryEmbedding:52`, `_RMSNorm:97`, `_VisionAttentionBase:134` (`_qkv_with_rope:149`), `VisionAttentionV2:207`, `apply_vision_attention_residual:436` |
+| `vllm/models/dots3_note/common/processor.py` | 811 | `IMAGE_START/PAD/END:41-43`, `Dots3NoteImageProcessor:63` (`resized_size:97`, `preprocess:147`) |
+| `vllm/models/dots3_note/nvidia/multimodal.py` | 304 | `hf_to_vllm_mapper:54-62` (`vision_encoder.` -> `visual.`), `get_placeholder_str:65`, `_process_image_input:144` |
+| `vllm/models/dots3_note/nvidia/vision_moe.py` | 149 | NOTHING. It is the W6b/W9 arm and is refused by name. |
+
+**Every anchor above names the SHA it was read at, because upstream has already
+moved.** `vision_attention.py` is 477 lines at `9035151d6` and 494 lines at vLLM
+`main` `7a100bb61`. An anchor read in the wrong tree is a recorded failure mode
+on this project, and a `file:line` with no revision beside it is one.
+
+#### 4.11.1 The geometry, and one word in #2512 that the fixture corrects
+
+Every number below was read from the COMMITTED fixture
+(`tests/vllm/models/fixtures/dots3_note_prev/config.json` and
+`index_full.json`), not from the issue text:
+
+| `vision_config` key | Released value | Consequence |
+|---|---|---|
+| `embed_dim` | 1536 | tower width; `head_dim` = 1536/24 = 64 |
+| `num_attention_heads` | 24 | |
+| `num_hidden_layers` | 42 | 25 dense + 17 MoE |
+| `intermediate_size` | 4224 | the DENSE SwiGLU width |
+| `moe_intermediate_size` | 2112 | W6b's, unread here |
+| `patch_size` | 14 | patch row is 3*1*14*14 = 588 wide |
+| `temporal_patch_size` | 1 | `DotsPatchEmbed.forward` takes `[:, :, 0]` of a one-deep temporal axis |
+| `spatial_merge_size` | 2 | |
+| `rms_norm_eps` | 1e-05 | |
+| `use_bias` | false | `attn.qkv`, `attn.proj` and every `mlp.fc*` carry NO bias |
+| `use_qk_norm` | true | `q_norm`/`k_norm` [64], per head, BEFORE rope |
+| `is_causal` | false | the attention is bidirectional |
+| `post_norm` | true | `post_trunk_norm` exists |
+| `pre_pixel_shuffle` | true | the PREPROCESSOR emits 2x2-grouped patch rows and RoPE regroups to match |
+| `adapter_type` | `"patch_merger"` | `PatchMergerAdapter`, NOT `PixelShuffleAdapter` |
+| `adapter_in_dim` / `adapter_out_dim` | 1536 / 5120 | 4x1536 = 6144 folded to the text tower's 5120 |
+| `pyramid_num_routed` | `[-1 x 25, 4, 8, ..., 60, 64, 64]` | `is_moe` is `pyramid_num_routed[i] > 0` (vision.py:346-350), so -1 is DENSE |
+
+**One word in #2512 needs correcting, and the fixture is what corrects it.** The
+issue's scope prose says the dense arm is "`post_trunk_norm` -> pixel shuffle ->
+`adapter`". The released `vision_config` sets `adapter_type: "patch_merger"`,
+and `PatchMergerAdapter` is upstream's own name for the arm that **skips the
+pixel-shuffle permutation** and instead views every 4 consecutive 2x2-grouped
+tokens as one row (`vision.py:441-449`, its docstring). The 2x2 regrouping has
+not disappeared; `pre_pixel_shuffle: true` moved it into the PREPROCESSOR
+(`processor.py:185-197`, the nine-way reshape and the `(0,3,6,4,7,2,1,5,8)`
+transpose) and into the RoPE position builder
+(`get_pos_ids_by_grid:566-575`, `rope_merge_size = spatial_merge_size`).
+
+This is not a disagreement about geometry, and it did not need escalating.
+#2512's own tensor inventory says `adapter.{ln_q, mlp.0, mlp.2}`, which is
+`PatchMergerAdapter`'s state dict and nothing else — `PixelShuffleAdapter`
+spells its parameters `proj.0` / `proj.1` / `proj.3` (`vision.py:397-406`). The
+inventory is right and the prose word is loose. W6a implements
+`patch_merger`, and `pixel_shuffle_mlp` is REFUSED BY NAME rather than
+silently mapped onto it, because the two produce different token orders from
+the same pixels and neither shape-checks against the other.
+
+#### 4.11.2 The 235 dense tensors, counted
+
+Of the 2195 `vision_encoder.*` tensors in the released index, W6a's arm claims
+**235** and refuses **1960**:
+
+```
+dense blocks 0..24, 9 each     225   norm_1, norm_2, attn.{qkv,proj,q_norm,k_norm},
+                                     mlp.{fc1,fc2,fc3}          (all BF16)
+patch_embed                      3   proj.weight [1536,3,14,14], proj.bias [1536],
+                                     norm.weight [1536]
+post_trunk_norm                  1
+adapter                          6   ln_q.{weight,bias} [1536],
+                                     mlp.0.{weight,bias} [6144,6144]/[6144],
+                                     mlp.2.{weight,bias} [5120,6144]/[5120]
+                              ----
+                               235
+MoE blocks 25..41 (W6b)       1960   17 x {norm_1, norm_2, attn x4, gate_weight,
+                                     router_bias} = 136, plus 608 experts x 3 = 1824
+                              ----
+                              2195
+```
+
+The 608 is the sum of `pyramid_num_routed[25..41]`, and it is what makes the
+released checkpoint still refuse.
+
+#### 4.11.3 What W6a refuses, BY NAME
+
+The released `dots-studio/dots3-note-prev` has 17 MoE ViT blocks, so a load of
+it REFUSES at the vision tower and names W6b. **That is correct and it is this
+row's established pattern rather than a new exception.** W3 refused the language
+tower's MoE layers by name for four bricks before W5 lifted it; the vision
+tower is at W3's stage, not at W5's. Refusing is what stops the port from
+serving a tower whose pyramid it silently skipped, on a row that §6.4 records as
+having no oracle to catch it.
+
+| Refused | Named brick | Where |
+|---|---|---|
+| any block with `pyramid_num_routed[i] > 0` | **W6b** | `Dots3NoteVisionRefusal` |
+| `quantization_config.weight_block_size` on the vision tower | **W9** | `Dots3NoteVisionRefusal` |
+| `video` modality | **W7** | `EncodeMmDots3Note`, and the chat seam's `allowed_limits` |
+| `audio` modality | **W8** | same |
+| `adapter_type == "pixel_shuffle_mlp"` | W6b | `ParseDots3NoteVisionParams` |
+| `post_norm == false` | W6b | `ParseDots3NoteVisionParams` |
+| `use_bias == true` | W6b | `ParseDots3NoteVisionParams` |
+| `temporal_patch_size != 1` | W7 (video) | `ParseDots3NoteVisionParams` |
+
+A refused tower leaves the 2195 `vision_encoder.*` tensors in the accounting's
+existing `vision` bucket as a NAMED deferral, exactly as before, so every W2
+count assertion is byte-for-byte unchanged. What moved is the deferral's
+`brick` field: `W6` -> `W6b`, because W6a is landed and W6b is what is owed.
+
+#### 4.11.4 The gate is a CONSISTENCY gate, and says so
+
+§6.4's option B stands. The checkpoint is 298.67 GB fp8 / 576.89 GB bf16 against
+119-122 GiB hosts, so vLLM cannot be run on it here and no denominator exists.
+Correctness for the tower is therefore argued by an **independent in-test
+double-precision reference** written from `vision.py` / `vision_attention.py` at
+`9035151d6`, sharing NO helper with the implementation, with RED-first mutation
+proof.
+
+**That establishes two implementations agree. It does not establish that either
+matches vLLM.** No performance number is claimable on any axis while B holds,
+and none is claimed. The reference and the implementation differ deliberately at
+every step that has a choice: the reference is a scalar `double` loop with its
+own softmax, its own rope and its own norms; the implementation is
+`vt::MatmulBT` / `vt::RmsNorm` / `vt::RopeFromCache` / `vt::AttentionDenseFlash`
+over bf16 device buffers through the shared seams.
+
+**One formula difference is deliberate and is recorded rather than hidden.**
+Upstream's vision `RMSNorm.forward` (`vision.py:112-114`) casts the normalized
+value back to the activation dtype BEFORE multiplying by the weight; `vt::RmsNorm`
+keeps f32 through the weight multiply and rounds once on the store (its own
+header says so). Using the shared op is the seam rule. The reference does NOT
+copy the cast: at infinite precision the two are the same function, so a double
+reference is the algebra BOTH implement, and the gate's tolerance covers our
+bf16 storage and upstream's intermediate cast together. Copying the cast into
+the reference would make the reference agree with a rounding choice instead of
+with the maths. §4.11.6 records the measured deviation, the bound, and the
+mutation that proves the bound is not a mute switch.
+
+**The discrete-selection rule does not bind W6a and that is a fact about the
+arm, not an omission.** The dense blocks have no top-k anywhere: routing is
+W6b's. When W6b lands it owes a SET-equality assertion on the router's top-k
+plus the printed minimum decision margin, because a tolerance alone cannot see a
+bimodal selection flip.
+
+**The memory format is asserted against upstream explicitly** (porting.md), and
+this row has already been bitten on that axis: W2's F1 fixture row proves a
+re-typed `router_bias` fires. Every dense vision tensor is BF16 on disk and BF16
+in the resident tower, and the gate asserts the tower's stored dtype rather than
+only its values — a token gate cannot see a dtype that is too wide.
+
+#### 4.11.6 Evidence, measured 2026-09-01
+
+Host: the developer's x86-64 Linux box, CPU queue, `-DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`. No
+GPU lease was taken and no number below is a performance number.
+
+| Suite | Result |
+|---|---|
+| `test_dots3_note_vision` (new) | 8 cases, **4981 assertions**, 0 failed |
+| `test_openai_api_server_dots3_mm_forward` (new) | 7 cases, **55 assertions**, 0 failed |
+| `test_dots3_note_scaffold` | 26 cases, **110835 assertions**, 0 failed |
+| `test_dots3_note_attn` | 51 cases, **6888 assertions**, 0 failed |
+| `test_openai_api_server_mm_forward` (Qwen3-VL, untouched) | 9 cases, **73 assertions**, 0 failed |
+
+**The consistency measurement.** The tower against the independent
+double-precision reference: `max |diff| 0.0533141 over a scale of 6.31441 =>
+relative 8.44e-3`. The gate's bound is **0.02**, a 2.4x margin — wide enough that
+a different libm or a different GEMM reduction order does not red it, tight
+enough that M5 below (relative 5.9e-2) exceeds it by 2.95x. A bound at the round
+0.05 a first draft carried would have cleared M5 by only 1.18x, which is one
+compiler from a mute switch.
+
+**Mutations.** Each was applied to the tree, REBUILT, and its test binary's
+sha256 compared against the green baseline — a mutation that never reached the
+binary reads as a passing test. Each file was then restored and `cmp` reported
+byte-for-byte identity, and the rebuilt binaries hashed back to the EXACT green
+baselines (`c6e83b90...` served, `b03f59e3...` tower).
+
+| # | Mutation | Binary sha256 (served gate) | Result |
+|---|---|---|---|
+| — | green baseline | `c6e83b90359f1402…` | 7/7, 55 assertions |
+| M1 | the `Dots3NoteVisionForward` call inside `encode_mm` DELETED | `936574cab156b69b…` | **RED** — 3 of 7 cases, 43 assertions reached |
+| M2 | the tower REPLACED by a correctly-SHAPED constant | `5664578c254c8fa4…` | **RED — and only ONE case: "two DIFFERENT images give two different forwards".** 6 of 7 pass, including status 200, `prompt_tokens` and `completion_tokens`. This is the measurement behind §4.11.5: without the logprob case this mutation is invisible |
+| M3 | the `.mm` read in `Dots3NoteModel::ForwardDevice` DELETED (`have_mm_embeds = false`) | `7285bd3e44221bcb…` | **RED** — the same single case, for the same reason: the vision rows never reach the residual stream |
+| M4 | the production `MaterializeDots3NoteVision` call site in the LOADER deleted | `80901ec80645b598…` | **RED** — 3 of 7 cases |
+| M5 | the per-head `q_norm`/`k_norm` moved from BEFORE the rope to AFTER it | tower gate `b39c3e36a0abbfad…` | **RED** — relative 5.9e-2 against the 2.0e-2 bound, a 7x jump from the green 8.4e-3 |
+
+**M4 leaves the TOWER GATE GREEN, and that is the point of having two files.**
+`test_dots3_note_vision` materializes the tower itself, so deleting the
+production call site does not move it: 8/8, 4981 assertions, on a tree where
+nothing in the loader builds a vision tower at all. Only the served-request gate
+sees it. That is AGENTS.md's "a unit test that constructs the type by hand proves
+that the class works, never that anything reaches it", demonstrated rather than
+argued.
+
+**M5's first attempt did not compile** (`-Werror=unused-but-set-variable` on the
+two tensor views the move orphaned) and the stale binary printed the GREEN
+result. A build failure reading as a passing test is a recorded trap in this
+tree; the row above is the SECOND attempt, whose `RC=0` and changed sha256 are
+what make it evidence.
+
+**One behaviour changed under measurement, and it is recorded rather than
+smoothed over.** The first version refused a MoE tower only inside
+`EncodeMmDots3NoteForCausalLM`. That throw happens in the engine's busy loop: it
+stopped `AsyncLLM`, and every LATER request — TEXT ones included — came back 500.
+The served-request gate caught it. The refusal now also runs in the chat
+FACTORY, which turns it into a REFUSING seam: HTTP 400 naming the architecture
+and the block, with the text path still answering afterwards. The encoder check
+stays as defence in depth, on the same polarity Qwen3-VL's carries ("reaching
+this point is a defect"). The gate asserts BOTH halves: 400 on the image, 200 on
+a text request sent after it.
+
+#### 4.11.5 Reachability — the production entry point, and what it costs to fake
+
+The production entry point is `ApiServer::handle_chat_completions` on the
+server's default configuration. The smallest failing test enters THROUGH it, over
+a synthetic in-memory checkpoint at tiny geometry with a generated tokenizer
+fixture whose added tokens are `<|img|>` / `<|imgpad|>` / `<|endofimg|>`. A unit
+test that constructs the tower by hand proves the class works, never that
+anything reaches it.
+
+The load-bearing case is **two DIFFERENT images, one prompt, compared on
+LOGPROBS**. It is the only one that survives a tower replaced by a correctly
+SHAPED constant: every text-only assertion — status 200, `prompt_tokens`,
+`completion_tokens` — passes under that mutation, and the logprobs of the first
+generated token do not.
+
+---
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -4447,14 +4695,38 @@ dispatchable in order, under the constraints that answer imposes.
   `Dots3NoteDeviceRefusal(released_params)` EMPTY. What that does NOT mean is
   recorded in §4.10 and in the row header: the MoE is 94.62% of a 576.89 GB
   checkpoint and nothing here can hold it.
-- **W6 — vision tower.** Dense ViT half first, then the pyramid MoE and the
-  FP32-scale FP8 formula. Reuses `qwen3_vl_vision` structure.
+- **W6a — the DENSE vision tower, SERVED. LANDED** (evidence §4.11,
+  [#2512](https://github.com/mudler/vllm.cpp/issues/2512)). `patch_embed` ->
+  blocks 0-24 (`attn.qkv` + per-head `q_norm`/`k_norm` + 2-D vision RoPE +
+  bidirectional attention, then the three-tensor SwiGLU) -> `post_trunk_norm` ->
+  the `patch_merger` adapter, reached from
+  `ApiServer::handle_chat_completions` through the model's `encode_mm` /
+  `embed_mm` hooks and its own `REGISTER_VLLM_MM_CHAT` translation unit.
+  Structurally reuses `qwen3_vl_vision`'s outline; shares no code with it,
+  because the two towers agree on almost nothing below that outline (RMSNorm vs
+  LayerNorm, no bias, qk-norm, a three-tensor SwiGLU, a patch-merger adapter, no
+  DeepStack, no position-embedding table, no M-RoPE).
+- **W6b — the pyramid MoE ViT.** Blocks 25-41: `mlp.gate_weight` +
+  `mlp.router_bias`, sigmoid scoring, `capacity_factor`-derived top-k, and the
+  `moe_intermediate_size` experts. It OWES a SET-equality assertion on the top-k
+  plus the printed minimum decision margin; a tolerance alone cannot see a
+  bimodal selection flip. The RELEASED checkpoint has 17 such blocks, so its
+  vision tower still refuses BY NAME until this lands, which is W3's polarity
+  applied to the second tower rather than a new exception.
 - **W7 — audio tower.** The `dots` stem deltas over our Whisper encoder.
 - **W8 — MM front end + ABI.** Processor, video sampling, placeholder expansion,
   `<|audio_comp_*|>`, `include/vllm.h` surface, the example server as a thin
   client.
 - **W9 — quantized arms.** Blockwise FP8 and the owed GGUF k-quant arm +
-  converter.
+  converter. **The vision MoE's FP32-scale FP8 formula belongs HERE, not to W6**
+  (moved 2026-09-01 with W6a, [#2512](https://github.com/mudler/vllm.cpp/issues/2512)).
+  The evidence that moved it is the row's own W2 census: the released bf16
+  `dots-studio/dots3-note-prev` carries 37944 BF16 + 62 F32 tensors and NO scale
+  tensors at all (§4.4), so there is no FP8 formula anywhere in the arm W6
+  loads; `MoESwiGLUFFNFP8.process_weights_after_loading` (`vision.py:226-268` @
+  `9035151d6`) CASTS bf16 experts to block-FP8 at load, which is a quantized
+  path this port does not take, and the `-fp8` sibling that ships those scales
+  is already refused BY NAME as W9. **R5 moved with it** (§8).
 - **W10 — MTP.** `Dots3NoteMTPModel` over the existing speculator seam.
 - **W11 — gates.** Whatever §6.4 permits: full SACRED if A, the recorded-gap
   form if B.
@@ -4476,7 +4748,15 @@ dispatchable in order, under the constraints that answer imposes.
 - **R5 — the vision MoE's FP32 activation scales** (§2.4) are the exact shape of
   a too-wide/too-narrow dtype defect that a token gate cannot see. Check the
   memory format against upstream explicitly, per
-  [porting.md](../porting.md).
+  [porting.md](../porting.md). **FILED AGAINST W9, not W6** (moved 2026-09-01
+  with W6a, [#2512](https://github.com/mudler/vllm.cpp/issues/2512)). It was
+  filed against W6 when this section was written, and the row's own W2 census
+  (§4.4) contradicts that: the released bf16 checkpoint ships 37944 BF16 + 62
+  F32 tensors and no scale tensor at all, so W6's arm has no activation scale to
+  get wrong, while the `-fp8` sibling that does ship them is refused BY NAME as
+  W9. The RISK is unchanged and is not waived; only its owner moved. The
+  memory-format obligation it names still binds every brick, and W6a discharged
+  its own share of it in §4.11.4.
 - **R6 — no llama.cpp comparison** for the GGUF arm, so the quantized floor has
   no external reference. Record it as a gap rather than substituting a different
   model's number.
@@ -5180,8 +5460,34 @@ released config becoming loadable made a claim this port cannot honour: the
 2195 vision and 430 audio tensors are named W6/W7 deferrals and the multimodal
 front end (W8) does not exist. W8 flips it back.
 
-**Next dispatchable: W6 — the vision tower**, or W9 for the quantized arms if
-the fp8 sibling is wanted before the towers. `## Owed` is unchanged except that
-`vt::QuantFp8Group`'s missing `use_ue8m0` rounding is now recorded against W9
-with the reason, because upstream's blockwise-fp8 MoE routes through DeepGEMM
-with e8m0 scales.
+**W6a — LANDED, and this row can now be asked for something over HTTP.**
+([#2512](https://github.com/mudler/vllm.cpp/issues/2512), evidence §4.11.) The
+DENSE half of the vision tower — `patch_embed`, blocks 0-24, `post_trunk_norm`
+and the `patch_merger` adapter — runs on a served `image_url` chat request
+through `ApiServer::handle_chat_completions` -> the architecture-dispatched chat
+seam -> `GPUModelRunner::execute_mm_encoder` -> `ModelRegistry::EmbedMm` ->
+`ModelRegistry::Forward`. `supports_multimodal` went FALSE -> TRUE, which is the
+second half of the true -> false -> true trail W5 predicted, and this time the
+flag is backed: `kDots3NoteFactory` sets `encode_mm` and `embed_mm`, and
+`Dots3NoteForCausalLM` has its own `REGISTER_VLLM_MM_CHAT` translation unit.
+
+**Say the other half in the same breath, again.** The RELEASED checkpoint STILL
+REFUSES, at its first MoE ViT block. 17 of its 42 vision blocks are MoE, so 1960
+of the 2195 `vision_encoder.*` tensors are W6b's and the tower refuses BY NAME
+before it loads one of them. That is W3's polarity applied to the second tower,
+not a new exception. What W6a changed is that a config whose vision blocks are
+all DENSE is now served end to end rather than refused, and that the seam every
+future arm plugs into exists and is gated.
+
+**The gate is a CONSISTENCY gate and nothing more** (§6.4 option B, §4.11.4):
+an independent in-test double-precision reference written from `vision.py` and
+`vision_attention.py` at `9035151d6`, sharing no helper with the implementation.
+It establishes that two implementations agree. It does not establish that either
+matches vLLM, and no performance number is claimed on any axis.
+
+**Next dispatchable: W6b — the pyramid MoE ViT**, which is what the released
+checkpoint's vision tower is waiting on, or W7 for the audio tower, or W9 for
+the quantized arms. `## Owed` is unchanged except that `vt::QuantFp8Group`'s
+missing `use_ue8m0` rounding is now recorded against W9 with the reason, because
+upstream's blockwise-fp8 MoE routes through DeepGEMM with e8m0 scales, and that
+R5 and the vision FP8 formula moved from W6 to W9 (§7, §8).

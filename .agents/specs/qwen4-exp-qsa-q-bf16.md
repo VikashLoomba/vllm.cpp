@@ -112,11 +112,12 @@ device runs them, and `## Evidence` says which arms actually ran.
 3. **The seam's refusals.** `gate_out` at bf16 and `q_out` at f16 each refuse by
    name.
 
-4. **Qwen3.5 does not move.** `tests/vt/test_ops_attn_preamble.cpp` already
-   compares the unfused `AttnGateSplit + RmsNorm + RmsNorm + RopeNeox` sequence
-   against the fused kernel byte-for-byte over f32 buffers. It is re-run
-   unchanged, and item 2 adds the direct statement that the f32 arm's bytes are
-   the pre-change bytes.
+4. **Qwen3.5 does not move.** `tests/vt/test_ops_attn_preamble.cpp` compares the
+   unfused `AttnGateSplit + RmsNorm + RmsNorm + RopeNeox` sequence against the
+   fused kernel byte-for-byte over f32 buffers, and is the right gate — but it
+   opens `if (!HasCuda()) return;` and so gates nothing on a CPU-only build.
+   `## Evidence` answers the question by counting Qwen3.5's executed calls
+   instead, and reports what that measurement can and cannot support.
 
 5. **The CPU behavioural control.** The released UD-IQ1_S artifact's CPU
    sequence `11751 13 15767 411 2029 11 1092 369` must not move.
@@ -162,6 +163,40 @@ Each mutation was applied to a tree that had just built green, each rebuild
 returned 0 before the run, and the tree was restored to a clean `git status`
 after each.
 
+### Qwen3.5, measured rather than argued
+
+`## Tests` item 4 named `test_ops_attn_preamble`, which does not run here. So the
+question was answered by counting instead. A scratch `fprintf` counter was placed
+in the CPU `AttnGateSplitKernel`, the affected binaries were rebuilt (rc 0), and
+the counter was read. It was then removed and the tree restored to a clean
+`git status`, and the rebuilt binary prints zero probe lines.
+
+| Run | AttnGateSplit CPU calls | `q_out.dtype` | Suite |
+|---|---|---|---|
+| `test_qwen4_exp_layer_loop -tc='*MODEL dtype*'` | 1 | `2` = `kBF16` | pass |
+| `test_qwen35_paged_forward`, `VT_FUSE_ATTN_PREAMBLE=1` (default) | 0 | — | 63/63 pass |
+| `test_qwen35_paged_forward`, `VT_FUSE_ATTN_PREAMBLE=0` | **14** | `0` = `kF32`, all 14 | 63/63 pass |
+| `test_qwen3_5_fa2_class`, either arm | 0 | — | 15/15 pass |
+
+Three things follow, and only these three.
+
+1. **Qwen3.5 still passes f32.** Fourteen executed calls, every one of them
+   `kF32`, dispatching to the arm the kernel had before. Its goldens hold in that
+   arm.
+2. **The qwen4_exp buffer is bf16 at the production entry point**, read off the
+   kernel rather than off the caller's own assertion.
+3. **On its DEFAULT configuration Qwen3.5 does not reach this op on CPU at all.**
+   `kAttnQkNormRopeGate` is registered on kCPU (`cpu_ops.cpp:4136`) and
+   `FuseAttnPreambleOn` defaults true (`qwen3_5.cpp:1930-1934`), so the split is
+   the `VT_FUSE_ATTN_PREAMBLE=0` rollback branch. Running the suite without that
+   knob would have measured nothing and reported a pass — which is what the
+   counter was installed to find out.
+
+`test_qwen35_paged_engine` is UNRUN, not green: it exits 77 with
+`*** GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass ***` because the pinned
+Qwen3.5-0.8B snapshot is not cached and its oracle was captured on gfx1100. That
+is its pre-existing environment gate, not this change.
+
 ### What was NOT measured, and is not claimed
 
 - **The CUDA arm did not compile.** This host has no `nvcc`, and the fleet's two
@@ -180,6 +215,15 @@ after each.
   value argument is the bit-identity above, and the executable substitutes are
   G2 (5937 assertions against the oracle's own `Qwen4ExpTextAttention.forward`
   goldens) and G3 (352, including the forward goldens).
+- **The rest of the suite.** `include/vt/ops.h` changed, so a full test build is
+  1382 targets. At a load average of 45 on 20 cores with four other waves
+  building, it advanced 4 targets in 5 minutes and was stopped rather than left
+  to thrash the box. What ran instead is the set that touches the seam or the
+  model: `test_op_provider` (497), `test_backend_cross_device` (3 — the rest of
+  its cases are CUDA-gated), `test_qwen4_exp_forward` (429), `test_qwen4_exp_qsa`
+  (7263), `test_qwen4_exp_qsa_device` (4697), `test_qwen4_exp_runner` (136),
+  `test_qwen4_exp_ple_block` (112), `test_ops_fused_chain` (379),
+  `test_fused_chain_additivity` (25), `test_ops_nvfp4_fp4` (919), all rc 0.
 - **No throughput axis.** The change removes `T*Hq*Dh*2` bytes of traffic per
   QSA layer per step. That is arithmetic, not a measurement, and it is stated as
   arithmetic. Nothing here claims a speedup.

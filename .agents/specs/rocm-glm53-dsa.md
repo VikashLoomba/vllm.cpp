@@ -210,6 +210,13 @@ Unreached or unported after this wave, none of it claimed here:
   performance gap, not a correctness one.
 - ROCm i-quant keep-quant for the expert class (IQ1_S, IQ3_XXS, IQ2_XXS, IQ4_XS,
   Q2_K, Q3_K). Existing gap, #1940.
+- The hipBLASLt build asymmetry, #2499: `VLLM_CPP_HIP=ON` configures on a ROCm
+  install without hipBLASLt and then fails at TU 539/570, because CMake treats
+  the library as optional while `rocm_matmul_hipblaslt.hip` includes its header
+  unconditionally. Found while building this wave on `strix:gpu0`; not fixed here
+  because the repair is a deliberate choice between making the library required
+  and compile-guarding the TU, and that choice belongs to `BACKEND-ROCM` rather
+  than to a model bring-up. Worked around in the lease by installing the package.
 - No speed number is claimed or owed for this board by this wave. Any run of this
   model on ROCm reaches eight reference-tier ops, which `docs/ROCM.md:60-61`
   disqualifies as a performance result.

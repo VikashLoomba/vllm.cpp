@@ -138,6 +138,17 @@ Neither vectorized fast path changes: `TryLaunchRmsNormDecodeFast` requires
    radius).
 3. **The kF16 divergence** — CPU accepts, CUDA throws. This exists so the
    `default:` arm cannot be replaced by a fall-through without a test going red.
+   It asserts the dispatcher's own message rather than merely that something
+   threw: a bare `CHECK_THROWS` would pass on a mutated build whose 256-byte
+   over-read happened to fault, because `Check(cudaGetLastError(), ...)` would
+   throw and the case could not tell the two apart.
+
+**"Pinned by a test" is not "pinned in CI".** Every CUDA arm above sits behind a
+`[SKIP]` when no device is present, and no CI lane here runs GPU tests. In CI
+today the `default:` arm and the production instantiation are held by nothing
+that executes; the device evidence comes from a leased run and is recorded as
+such. That is a property of this repository's lanes, not of this change, and it
+is listed under `## Owed` rather than presented as coverage.
 
 **Red-before-green, stated as it was taken:** the pre-fix dispatcher refused any
 `w.dtype != x.dtype`, so case 1 could not have run. That refusal was observed as
@@ -248,6 +259,8 @@ A further wall after #2477 clears is a reportable result, not a failure.
   blocking the gate.
 - [#2496](https://github.com/mudler/vllm.cpp/issues/2496), the token divergence.
 - A device run of the three test cases as they now stand.
+- A CI lane that executes GPU tests. Until one exists, every `[SKIP]`ped CUDA arm
+  in this suite is documentation of intent rather than an executing gate.
 
 ## Now
 

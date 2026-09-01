@@ -296,6 +296,13 @@ TEST_CASE("rmsnorm: a kF16 gamma is admitted by the seam, taken by CPU, refused 
   Tensor gx = Tensor::Contiguous(xd, DType::kBF16, gpu, {kRows, kIdxH});
   Tensor gw = Tensor::Contiguous(wd, DType::kF16, gpu, {kIdxH});
   Tensor go = Tensor::Contiguous(od, DType::kBF16, gpu, {kRows, kIdxH});
-  CHECK_THROWS(vt::RmsNorm(q, go, gx, gw, args));
+  // CHECK_THROWS would accept ANY exception, including one from an unrelated
+  // allocation failure -- and worse for this case's purpose: if a fall-through
+  // mutation's 256-byte over-read happened to fault, `Check(cudaGetLastError(), ...)`
+  // would throw and a bare CHECK_THROWS would PASS on the mutated build, reading as
+  // "mutation detected" when it was not. Assert the dispatcher's own message, so the
+  // case is true by construction rather than by allocator luck.
+  CHECK_THROWS_WITH(vt::RmsNorm(q, go, gx, gw, args),
+                    doctest::Contains("unsupported weight dtype"));
   b.Free(xd); b.Free(wd); b.Free(od); b.DestroyQueue(q);
 }

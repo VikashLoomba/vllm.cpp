@@ -413,13 +413,18 @@ into "ccache was used".
   read off the phase table. **It is not attributed here**, because a leaf that
   moves for a reason nobody named is exactly the shape of a wall that moved by
   accident. Owner: unowned; sizing is one lease.
-- **`ccache` IS MANDATORY ON THIS HOST AND DID NOTHING.** Configured per the
-  usage sheet and it recorded zero hits, zero misses and zero stores, so a 23.4
-  minute build was paid in full. The next probe is two lines inside a lease:
-  `ccache -s -v` for the real counters, and one `ccache gcc -c` of a single file
-  with `CCACHE_DIR` on `/tmp` against the same on `/workspace`, which separates
-  "the launcher never ran" from "CIFS refused the cache". Until that runs, every
-  job on this box pays a cold build while believing it does not. Owner: unowned.
+- **`ccache` IS MANDATORY ON THIS HOST AND DID NOTHING. ANSWERED, and it was
+  CIFS.** The probe this bullet asked for ran as `rc` jobs `9b287a1f` and
+  `e4793984`: `/workspace` is mounted `nounix`, `symlink(2)` on it returns
+  `EOPNOTSUPP`, and `ccache` 4.9.1 takes every cache **and stats** lock by
+  creating a symlink. Every store and every counter update was refused, which is
+  why the counters read zero rather than reading misses. The CMake launcher was
+  never the problem: it reached the compile line and produced
+  `Cacheable calls: 9 / 9`. The fix and its measurement are
+  [`eng-rc-ccache.md`](eng-rc-ccache.md), and this script now puts `CCACHE_DIR`
+  on local disk and persists it through ccache's remote storage.
+  Owner: `ENG-RC-CCACHE`,
+  [#2473](https://github.com/mudler/vllm.cpp/issues/2473).
 - **The oracle side has no spread.** `render_seconds = 93.8` is `n = 1` at the
   pin. Re-running upstream `n >= 3` at the same request would give the
   denominator its own error bar. Our own 8.03% is measured; theirs is unknown,

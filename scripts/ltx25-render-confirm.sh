@@ -143,15 +143,42 @@ python3 -c 'import numpy' || { echo "FATAL: no numpy, and the comparison tool ne
 # CCACHE IS MANDATORY ON THIS HOST, and `rc describe dgx:gpu0`'s usage sheet says
 # so in those words. It is a REFUSAL rather than a warning because the failure it
 # prevents has already been paid repeatedly: a cold 20-25 minute build inside a
-# lease whose subject is a render. The cache lives on the NAS so it survives the
-# container, which is the sheet's instruction and not a choice made here.
+# lease whose subject is a render.
+#
+# THE CACHE MUST NOT LIVE ON THE NAS, and the usage sheet's instruction to keep
+# it there is what made this whole block a no-op until 2026-09-01 (#2473).
+# `/workspace` is CIFS mounted `nounix`; ccache 4.9.1 takes every cache AND stats
+# lock by creating a symlink; symlink(2) on that mount returns EOPNOTSUPP. So
+# nothing is stored, no counter is written, and `ccache -s` reports zero hits,
+# zero misses and zero stores. That reading is the trap: a cache consulted and
+# empty records MISSES, so zero-of-everything looks like a launcher that never
+# ran. `rc` job 93a60151 configured all three launchers correctly and paid its
+# 1404 s build in full. It is also WORSE than a no-op, because each refused lock
+# costs a retry timeout and `ccache -s` walks 256 buckets. It is the same CIFS
+# limitation that destroys the staged CUDA toolkit's SONAME link (#2220).
+#
+# CCACHE_DIR therefore goes on LOCAL disk, and persistence across the container
+# comes from ccache's own remote storage, which MAY live on the NAS: the `file`
+# backend stores through open plus rename, which this mount serves, and takes no
+# lock. Measured: a fresh empty local cache against a populated remote store went
+# 18 s -> 5 s at 8/8 remote hits (`rc` job e4793984).
 command -v ccache >/dev/null || { echo "FATAL: ccache is mandatory for a C/C++/CUDA build on this host and is not installed"; exit 37; }
-export CCACHE_DIR=${CCACHE_DIR:-/workspace/ccache}
+export CCACHE_DIR=${CCACHE_DIR:-/root/ccache}
 mkdir -p "$CCACHE_DIR" || { echo "FATAL: cannot create $CCACHE_DIR"; exit 37; }
+# THE ONE CAPABILITY THAT DECIDES IT, asserted in milliseconds rather than
+# discovered 23 minutes later in a counter nobody reads.
+if ! ln -sf . "$CCACHE_DIR/.symlink-probe" 2>/dev/null; then
+  echo "FATAL: $CCACHE_DIR cannot hold a symlink, so ccache cannot take its locks there (#2473)"
+  echo "       Point CCACHE_DIR at local disk and keep only CCACHE_REMOTE_STORAGE on /workspace."
+  exit 37
+fi
+rm -f "$CCACHE_DIR/.symlink-probe"
+export CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE:-file:/workspace/ccache-remote}
+mkdir -p "${CCACHE_REMOTE_STORAGE#file:}" 2>/dev/null || true
 export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-20G}
 ccache --version | head -1
 ccache -s > "$OUT/ccache-before.txt" 2>&1 || true
-echo "ccache_dir=$CCACHE_DIR ccache_version=$(ccache --version | head -1)" >> "$OUT/PROVENANCE"
+echo "ccache_dir=$CCACHE_DIR ccache_remote=$CCACHE_REMOTE_STORAGE ccache_version=$(ccache --version | head -1)" >> "$OUT/PROVENANCE"
 
 say "=== [A] CUDA toolkit ==="
 # THE SONAME IS WHAT MUST EXIST, AND IT IS WHAT CIFS DESTROYS (#2220).
@@ -270,11 +297,30 @@ else
   cp -f "$BIN/ltx2-gen" "$BIN/libvllm.so.0.0.3" "$BIN/test_ltx2_device" "$CACHE"/ 2>/dev/null
   echo "$WANT_SHA" > "$CACHE/SRC_SHA"
 fi
-# WHETHER CCACHE ACTUALLY HIT, recorded rather than assumed. Configuring the
+# WHETHER CCACHE ACTUALLY HIT, REFUSED rather than recorded. Configuring the
 # launcher and getting no hits is the shape of a cache that is present and
 # useless, and it reads identically to a fast build in a log that does not say.
-ccache -s > "$OUT/ccache-after.txt" 2>&1 || true
-say "  ccache after: $(grep -iE 'cache hit|hits|cache miss|misses' "$OUT/ccache-after.txt" | tr '\n' ' ')"
+# This line used to print the counters and continue; that is exactly what #2473
+# did for a month while every lease paid a full build.
+#
+# The assertion is CACHEABLE CALLS, not hits. A genuinely first build on a new
+# source has every right to zero hits, and demanding one would red an honest
+# cold run. Zero cacheable calls after a build that compiled something means the
+# cache was never able to participate at all, which is the defect.
+ccache -s -v > "$OUT/ccache-after.txt" 2>&1 || true
+say "  ccache after: $(grep -iE 'cacheable calls|^ +hits|^ +misses' "$OUT/ccache-after.txt" | tr '\n' ' ')"
+if [ "$BUILT_FROM" = "in-lease" ]; then
+  CALLS=$(sed -n 's/^Cacheable calls: *\([0-9]*\).*/\1/p' "$OUT/ccache-after.txt" | head -1)
+  [ -n "$CALLS" ] && [ "$CALLS" -gt 0 ] 2>/dev/null || {
+    echo "FATAL: this lease compiled and ccache recorded ${CALLS:-no} cacheable calls, so the"
+    echo "       cache took no part in it. That is the #2473 shape: the launchers are"
+    echo "       configured, every write is refused, and the build is paid in full."
+    echo "       CCACHE_DIR=$CCACHE_DIR CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE:-none}"
+    head -20 "$OUT/ccache-after.txt"
+    exit 37; }
+  say "  ccache took part: $CALLS cacheable calls"
+  echo "ccache_cacheable_calls=$CALLS" >> "$OUT/PROVENANCE"
+fi
 export LD_LIBRARY_PATH="$BIN:$TKLIB/targets/sbsa-linux/lib:${LD_LIBRARY_PATH:-}"
 # BOTH HASHES, AND THE LIBRARY IS THE ONE THAT MATTERS (#1881): `ltx2-gen` is a
 # small launcher whose digest has been byte-identical across builds hundreds of

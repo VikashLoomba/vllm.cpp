@@ -109,6 +109,10 @@ CHECKERS=(
   check-container-matrix
   check-container-workflow
   check-build-runtime-deps
+  # A lease script that keeps its ccache cache on the CIFS share reads as
+  # compliance and caches nothing: symlink(2) is EOPNOTSUPP there, so every
+  # lock fails and `ccache -s` shows zero of everything (#2473).
+  check-lease-ccache
   check-role-discipline
   claim-view
   check-readme-structure
@@ -145,6 +149,7 @@ SUITES=(
   test_check_container_matrix
   test_check_container_workflow
   test_check_build_runtime_deps
+  test_check_lease_ccache
   test_validate_container_image
   test_release_index
   test_release_metadata

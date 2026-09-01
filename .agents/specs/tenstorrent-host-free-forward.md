@@ -341,6 +341,11 @@ investigation row but MUST be addressed by the item-5 port:
   the movement while the default arm is unchanged — so until the corrected
   mechanism is named, the inversion is a real, unexplained performance
   property of the shipped polarity, and a flip would be a guess.
+  (2026-08-31: a second candidate — per-step overhead from the default arm's
+  failed device-PA attempts — is REJECTED by measurement: the opt-out probe
+  shows the identical regime, 896 PA attempts / 868 failures / 0 device RAC /
+  0 warm hooks, under `VT_TT_HOST_FREE_DECODE=0`; see `## Now`. The
+  mechanism stays unnamed.)
 - **No case pins `HostFreeDecodeEnabled()`'s no-caching contract on the RAC
   path ([#1688](https://github.com/mudler/vllm.cpp/issues/1688)).** The R5
   fresh review found `ReshapeAndCacheKernel` still latching the flag in a
@@ -551,3 +556,79 @@ teardown class after the doctest SUCCESS); re-adjudication max gaps 375
 opt-out; default leg 10.94/10.95/11.06 tok/s vs the 5.34 opt-out (2.1x,
 same-binary A/B). The async-serving battery outcome is pre-existing and
 filed (#1627, under `## Owed`). Pending: fresh review, PR, operator merge.
+
+**R4-at-tip wave opened (2026-08-31, worktree
+`row/BACKEND-TENSTORRENT-HOST-FREE-FORWARD` @ main `6a544bdb8`).** Operator
+gate rerun on the merged tip, all under one `flock $HOME/gpu.lock`:
+
+- Golden gate, default arm, this P150: PASS — 16/16 prompts, 125/125
+  assertions, max gap 0.375 nats, 0 forward-divergent; device-op proof
+  0 declines (`kPagedAttention selections=7168`).
+- Same-binary A/B (3 order-alternated pairs, `--repeat 5`, discard run 1,
+  warm medians): default 12.92 vs `VT_TT_HOST_FREE_DECODE=0` 17.78 tok/s —
+  the inversion widened to 1.376x after W2c/#1476 (1.300 on 2026-08-30).
+- Capture never armed in any default-arm leg. Root-cause chain, measured
+  with `VT_TT_TRACE_DEBUG=1`: `VT_TT_DECODE_CAPTURE` unset keeps
+  `support_static_graph_mode()` false (`platforms/tenstorrent.cpp:85-88`),
+  so `Qwen3DenseDecodeGraph::Step` never runs (`qwen3.cpp:1120`), so the
+  warm hooks (`qwen3.cpp:813-864`) never prime the paged-KV shadows, so
+  every decode's `TryPagedAttentionDeviceDecode` shadow-misses and the
+  `EnsurePagedKvTtnn` VT_CHECK throws on the strided `KvSlice` view
+  (`tenstorrent_ops.cpp:1179`) — 868 of 896 decode calls — and the host
+  oracle runs. The default TT arm in the CLI has never exercised the device
+  host-free path; both A/B arms are host-PA arms.
+- The opt-out arm is measurably NOT faster because of PA: under
+  `VT_TT_HOST_FREE_DECODE=0` the identical probe shows the identical regime
+  (896 attempts / 868 failures / 0 device RAC / 0 warm hooks). The
+  failed-attempt-overhead candidate is REJECTED (see `## Owed`).
+- Capture-armed (`VT_TT_DECODE_CAPTURE=1`): warm hooks run, PA device
+  failures drop to 0, capture arms (1 captured size) — and the FIRST
+  capture dies: `TT_FATAL mesh_workload.cpp:153 !is_capturing_trace`.
+  `EmbedDeviceIdsInto`'s `ttnn::copy(dev_out, *s->device)`
+  (`tenstorrent_ops.cpp:5705`) is capture-only — the eager step's
+  `EmbedInto` never runs it — so its program is cold mid-capture. The copy
+  is unchanged since `79ff8f310`; the R5-era 27.1 tok/s single-request arm
+  predates the QWEN35-wave edits to `tenstorrent_ops.cpp` (#1486
+  cache-lifetime conversions, GDN staging), one of which dropped whatever
+  accidentally warmed that program. The archaeology is not owed; the fix
+  makes the invariant explicit.
+- **The inversion is model-specific, not backend-wide (Mistral-7B A/B,
+  same night, same recipe: 3 order-alternated pairs, `--repeat 5`,
+  discard run 1, warm medians).** Mistral-7B-v0.3 on this P150: default
+  host-free eager 11.51 tok/s vs opt-out 5.91 — the DEFAULT wins ~1.95x,
+  the opposite of Qwen3-0.6B's 1.38x the other way. Against the R5-era
+  record the default barely moved (12.2-13.8 then) while the opt-out more
+  than doubled (2.35 then). The owed mechanism question therefore narrows:
+  whatever makes the hybrid arm faster applies to Qwen3-0.6B and not to
+  Mistral-7B; a single backend-wide explanation is ruled out by
+  measurement.
+- **The attempt-overhead mechanism is REJECTED on both models; the
+  mechanism lives in the arms' successful paths (regime probe, 32 tokens,
+  `VT_TT_TRACE_DEBUG=1`).** Per decode step the two arms' FAILED device
+  work is identical on both models — Qwen3-0.6B: 896/896 PA attempts fail
+  on both arms, 896 device-RAC attempts on the default arm with 0
+  successes; Mistral-7B: 1024/1024 PA failures on both arms, 1024
+  default-arm RAC attempts with 0 successes, 0 warm hooks anywhere. The
+  default arm therefore does strictly MORE device work than the opt-out
+  on both models, yet loses on 0.6B and wins ~2x on 7B. What differs is
+  the work that SUCCEEDS: the host-free arm's device-resident R1 ops
+  (RmsNorm/RoPE) succeed on both models and scale with hidden size
+  (Mistral 4096 vs Qwen3 1024), while both arms run the same host PA
+  oracle and host RAC fallback. Remaining attribution — how much of each
+  arm's wall clock is the device R1 ops vs the host fallbacks — needs
+  per-op timing and is future work, not this wave.
+
+**Wave scope (spec-first, one PR per the recorded row preference).** The R4
+gate line "capture completes (no TT_FATAL)" is still unmet at tip; meet it.
+On the capture step (`s.warm`), warm every capture-only segment before
+`GraphCaptureScope` — the `_dummy_run` mirror: run `EmbedDeviceIdsInto`
+once OUTSIDE the scope before the captured call, and audit the remaining
+capture-only calls (`CaptureDecodePosAdvance`, captured RAC copies) the
+same way, iterating until the capture-armed CLI completes 80 tokens with
+replays > 0. Focused gate: capture-armed 80-token CLI run — no TT_FATAL,
+`[Qwen3DenseDecodeGraph]` replay count > 0, answer coherent vs the default
+arm under the near-tie rules. Then the real measurement: same-binary A/B,
+captured replay vs hybrid opt-out. R5-era measured the captured arm at
+27.1 tok/s against a 5.34 opt-out; the opt-out is now 17.8-18.6, so the
+bar is "beat ~18.5". Only then do #1625 (captured multi-request hang) and
+the capture-default flip decision come back within reach.

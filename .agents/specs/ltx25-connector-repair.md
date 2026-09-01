@@ -523,14 +523,22 @@ hypothesis and not a limit.
 
 ## Owed
 
-- **THE END-TO-END RENDER IS NOT RE-MEASURED, and the harness is why.**
-  `scripts/ltx25-render-speed-repeat.sh` asserts the binary's sha256 against
-  `4b0666ee`'s and exits 51 otherwise. That is correct for what it measures -- a
-  timing of the tree that took the correctness verdict -- and it means a
-  post-hoist render needs that pin advanced to a new head that has itself taken
-  a correctness verdict. That is a row of its own and it is the one that can
-  close `ltx25-render-speed-parity.md`'s owed line with a wall rather than a
-  projection. Owner: unowned; this row files it here.
+- ~~**THE END-TO-END RENDER IS NOT RE-MEASURED, and the harness is why.**~~
+  **ANSWERED, and the projection was right on its own leaf and conservative on
+  the render.** `LTX25-RENDER-CONFIRM` ([#2457](https://github.com/mudler/vllm.cpp/issues/2457))
+  advanced the pin the way this bullet asked -- it built the head, re-took
+  #1864's blockiness verdict on that same binary, and only then timed it. `rc`
+  job `93a60151` on `dgx:gpu0`: **`VERDICT PASS`** with margins +0.113 and +0.124
+  on the two gated ratios, then **302.954 s at n = 3, spread 8.03%**, against
+  this row's 518.398 s baseline. That is **1.711x** and **3.230x the oracle**,
+  where the projection above said ~380 s and ~4.05x. **The leaf this row
+  projected was met**: `conditioning.connector.compute` + `guiders.connector.compute`
+  read **81.338 s** against #2354's 224.882 s, a **2.765x**, where 87.9 s was
+  projected. The render beat its projection because `4fef1f413`
+  (`LTX25-AUDIO-DECODE-COST`) took `decode.audio.mel` from 47.175 to 4.926 s in
+  the same range, which no connector projection carried. `denoise` is unchanged
+  at 15.129 -> 15.122 s and `load` at 94.483 -> 94.550 s, so the wall moved for
+  the leaves it was predicted to move for. Owner: `LTX25-RENDER-CONFIRM`, closed.
 - **THE REMAINING GEMM IS THE LEAF, at 65.3% on GB10 and 74.7% on thor, and the
   contained lever does not reach it.** After this change the connector's cost on
   aarch64 is `vt::MatmulBT` at 125.5 GFLOP/s on GB10 and 137.6 on thor, and the M-blocking lever is refuted there.

@@ -353,6 +353,12 @@ Qwen4ExpWeights MakeWeights(const Qwen4ExpParams& p) {
   return w;
 }
 
+// The address of a weight's bytes as a NUMBER, so a red prints the two
+// addresses instead of doctest's bool-stringified `1 == 1` for a `uint8_t*`.
+uintptr_t Addr(const OwnedTensor& t) {
+  return reinterpret_cast<uintptr_t>(t.bytes.data());
+}
+
 std::vector<float> Download(vllm::dense_attn::Dev d, const vt::Tensor& t) {
   int64_t n = 1;
   for (int i = 0; i < t.rank; ++i) n *= t.shape[i];
@@ -2357,4 +2363,215 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward on a CUDA queue gets past the QSA b
   CHECK(tok[0] >= 0);
   CHECK(tok[0] < kVocab);
   gpu.DestroyQueue(q);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPERAND LIFETIME (issue #2476, spec `.agents/specs/gdn-qkvz-operand-lifetime.md`)
+//
+// WHAT FAILED, AND WHY NO EXISTING CASE COULD SEE IT. `compute-sanitizer` on
+// `thor:gpu0` reported `Warp illegal address` inside
+// `nvjet_sm110_tst_512x8_64x3_2x1_v_bz_TNT`, reached through `cublasLtMatmul` <-
+// `MatmulBTKernelCuda` <- `MatmulBf16D` <- `ProjectGdnQkvz`. Every extent that
+// GEMM was given — `M`, `N`, `K`, and the declared byte length of each operand —
+// agreed with the allocation AT LAUNCH TIME. What did not survive was the
+// allocation: `Qwen4ExpGdnBlockWeights` DEEP-COPIED the loader's owned weight
+// bytes into a per-step temporary, `ResidentWeight`'s host-alias arm handed
+// cuBLASLt a pointer INTO that temporary, and the temporary was destroyed at the
+// end of the layer's scope while the GEMM was still only queued.
+//
+// A CPU forward cannot fault on that, so this case does not try to. It asserts
+// the PROPERTY whose violation is the defect: the bytes a block hands to a
+// kernel belong to the model, not to a temporary. That is checkable with no
+// device, and it is what `qwen4_exp_forward.h` already CLAIMS above the
+// declaration ("nothing is ... reallocated here — the returned `OwnedTensor`s
+// are COPIES OF THE HANDLES and share the loader's bytes"). The claim was true
+// of the comment and false of the code.
+TEST_CASE(
+    "qwen4_exp: the GDN block adapter shares the loader's bytes rather than "
+    "copying them into a per-step temporary") {
+  const Qwen4ExpParams p = MakeParams();
+  Qwen4ExpWeights w = MakeWeights(p);
+
+  // The layer the fixture builds as a Gated DeltaNet one.
+  vllm::Qwen4ExpLayerWeights& lw = w.layers[0];
+  REQUIRE(lw.is_linear_attention);
+  REQUIRE(!lw.gdn.in_proj_qkv.bytes.empty());
+
+  const vllm::GdnLayerWeights gw = vllm::Qwen4ExpGdnBlockWeights(lw.gdn, p);
+
+  // POINTER IDENTITY, PER TENSOR. A pair that compares EQUAL is a view; a pair
+  // that differs is a second allocation the kernel will be pointed at and the
+  // model will not keep alive. Listed one by one rather than folded, so a red
+  // names the tensor.
+  // `Addr` and not the raw `const uint8_t*`: doctest stringifies a `char`-like
+  // pointer as a bool, so a raw comparison reds with the useless `1 == 1` and a
+  // reader cannot tell a second allocation from an offset one.
+  CHECK(Addr(gw.in_proj_qkv) == Addr(lw.gdn.in_proj_qkv));
+  CHECK(Addr(gw.in_proj_z) == Addr(lw.gdn.in_proj_z));
+  CHECK(Addr(gw.in_proj_b) == Addr(lw.gdn.in_proj_b));
+  CHECK(Addr(gw.in_proj_a) == Addr(lw.gdn.in_proj_a));
+  CHECK(Addr(gw.conv1d_weight) == Addr(lw.gdn.conv1d));
+  CHECK(Addr(gw.a_log) == Addr(lw.gdn.a_log));
+  CHECK(Addr(gw.dt_bias) == Addr(lw.gdn.dt_bias));
+  CHECK(Addr(gw.norm_weight) == Addr(lw.gdn.norm_weight));
+  CHECK(Addr(gw.out_proj) == Addr(lw.gdn.out_proj));
+
+  // ...AND THE VIEW CARRIES ITS OWN KEEP-ALIVE, which is the half that makes
+  // the identity SAFE rather than merely equal: a raw equal pointer with no
+  // ownership is the dangling operand this case exists to stop.
+  CHECK(gw.in_proj_qkv.bytes.borrowed());
+  CHECK(gw.out_proj.bytes.borrowed());
+
+  // The shape/orientation metadata a wrong-answer defect would ride on is
+  // unchanged by the sharing.
+  CHECK(gw.in_proj_qkv.nk == lw.gdn.in_proj_qkv.nk);
+  CHECK(gw.in_proj_qkv.dtype == lw.gdn.in_proj_qkv.dtype);
+  CHECK(gw.in_proj_qkv.bytes.size() == lw.gdn.in_proj_qkv.bytes.size());
+  CHECK(gw.out_proj.bytes.size() == lw.gdn.out_proj.bytes.size());
+
+  // AND THE BYTES OUTLIVE THE ADAPTER. Destroying the block's view must leave
+  // the model's own buffer readable and unchanged — the exact ordering the CUDA
+  // arm violated, stated where a host run can check it.
+  const uint8_t* base = lw.gdn.in_proj_qkv.bytes.data();
+  const size_t nb = lw.gdn.in_proj_qkv.bytes.size();
+  std::vector<uint8_t> before(base, base + nb);
+  {
+    const vllm::GdnLayerWeights scoped =
+        vllm::Qwen4ExpGdnBlockWeights(lw.gdn, p);
+    CHECK(Addr(scoped.in_proj_qkv) == reinterpret_cast<uintptr_t>(base));
+  }
+  REQUIRE(lw.gdn.in_proj_qkv.bytes.data() == base);
+  REQUIRE(lw.gdn.in_proj_qkv.bytes.size() == nb);
+  CHECK(std::memcmp(lw.gdn.in_proj_qkv.bytes.data(), before.data(), nb) == 0);
+}
+
+// The same property, entered through a PRODUCTION entry point rather than the
+// adapter, because a unit assertion on `Qwen4ExpGdnBlockWeights` proves the
+// function shares and proves nothing about what the forward calls.
+// `ModelRegistry::Forward` runs the layer loop over a real `qwen4exp` GGUF; the
+// observable afterwards is that the loaded model's OWN Gated DeltaNet buffers
+// have been shared with the step's adapter (`OwnedBytes::borrowed()`), which is
+// only reachable through the sharing construction the loop performs. Before the
+// fix the loop copied instead, the model's buffers stayed owned, and every step
+// allocated and freed a duplicate underneath a queued kernel.
+TEST_CASE(
+    "qwen4_exp: a forward through ModelRegistry::Forward leaves the model's own "
+    "GDN buffers shared, not duplicated") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  auto* loaded = dynamic_cast<vllm::Qwen4ExpLoadedModel*>(model.get());
+  REQUIRE(loaded != nullptr);
+
+  // The loader leaves them OWNED. Asserted, so the case cannot pass because the
+  // load already shared them for some unrelated reason.
+  {
+    const vllm::Qwen4ExpWeights& before = loaded->weights();
+    REQUIRE(before.layers[0].is_linear_attention);
+    REQUIRE(!before.layers[0].gdn.in_proj_qkv.bytes.borrowed());
+  }
+  const uint8_t* base = loaded->weights().layers[0].gdn.in_proj_qkv.bytes.data();
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] =
+        static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv =
+        vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, 1, T, kKvHeads, kHeadDim},
+                              kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos,     am, gm, attn_kv,
+                             gdn, config,  q,  logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  vllm::ForwardLogits fl;
+  REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  REQUIRE(fl.rows == 1);
+
+  // THE OBSERVABLE. The forward's own adapter took a view of these bytes, which
+  // `OwnedBytes::KeepAlive()` records ON THE SOURCE by turning it into a shared
+  // read-only buffer. A forward that copied instead leaves this false.
+  const vllm::Qwen4ExpWeights& after = loaded->weights();
+  CHECK(after.layers[0].gdn.in_proj_qkv.bytes.borrowed());
+  CHECK(after.layers[0].gdn.out_proj.bytes.borrowed());
+  // ...and sharing did not MOVE the bytes: the address the first step handed a
+  // kernel is the address every later step hands it.
+  CHECK(Addr(after.layers[0].gdn.in_proj_qkv) ==
+        reinterpret_cast<uintptr_t>(base));
 }

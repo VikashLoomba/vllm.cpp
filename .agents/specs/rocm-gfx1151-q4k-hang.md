@@ -187,6 +187,38 @@ is the already-recorded load flakiness of that harness test. It is not reachable
 from this diff, which touches one ROCm `.hip` file, one allowlist line and this
 spec.
 
+## The A/B arm computes the same number, checked rather than asserted
+
+An A/B is only a measurement of private memory if the two arms compute the SAME
+thing; otherwise a green `newon` leg could be a different kernel giving different
+tokens. So the substitution was checked off-device, on the host, before any leg
+ran.
+
+`DotQ6K` and `DotQ6KIsumRange` were extracted VERBATIM from
+`src/vt/rocm/rocm_grouped_gemm.hip` (by `sed` range, not retyped) into a
+standalone program with the real `BlockQ6_K` / `BlockQ8_K` layouts and the real
+`DF16ToF32`, and driven over 200,000 random superblocks. It compares
+`DotQ6K(xb, yb)` against `(DF16ToF32(xb->d) * yb->d) * DotQ6KIsumRange(xb, yb, 0,
+8)` -- exactly the substitution `Fmt == 3` makes -- by `memcmp` on the float, not
+by a tolerance.
+
+```text
+compared DotQ6K(float) against (DF16ToF32(d)*y.d)*DotQ6KIsumRange(0,8):
+    200000 blocks, 0 BIT-DIFFERENT
+```
+
+**Negative mutation, because a comparison that cannot fail proves nothing.**
+Changing `qh_shift` from `2 * r` to `2 * r + 1` inside `DotQ6KIsumRange` ALONE
+gives `200000 blocks, 200000 BIT-DIFFERENT` and a non-zero exit. The unmutated
+source is byte-unchanged afterwards (sha256
+`7e2eaf51fd56816a04f83ae826b572a2961ddbdfe6593dbb5dfc10d1936af5bd`) and green
+again.
+
+**What this does NOT establish**, stated so nobody reads it as more: it is the
+HOST compiler's answer for these two bodies, not the HIP compiler's answer for
+`gfx1151`. The on-device check is the leg's own output text, which `q6k.sh`
+prints per leg, and which must read ` Paris` on both arms.
+
 ## Stop conditions
 
 - A cause that is in the AMD driver or firmware rather than in this tree ends the

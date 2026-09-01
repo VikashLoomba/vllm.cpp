@@ -166,7 +166,8 @@ is how the recipe spread in the first place. The gate is a static read of
 | the defect, as found | `/workspace/ltx25-render-confirm/run/20260901T075837Z/ccache-{before,after}.txt`, `rc` job `93a60151-7d4d-4718-842c-ef724208be0e` |
 | causes 1-4 separated, and the CIFS mechanism | `/workspace/eng-rc-ccache/probe/strix/`, `rc` job `9b287a1f-d94d-476d-9732-0f649509cdd8` |
 | the remedy measured on a toy | `/workspace/eng-rc-ccache/probe2/strix/`, `rc` job `e4793984-10e8-4b2e-b6a7-7f931d6d40fe` |
-| the remedy measured on this tree | `/workspace/eng-rc-ccache/build-ab/dgx/`, `rc` job `54b75579-3809-4856-922b-3e8b077859eb` |
+| the remedy measured on this tree, CPU arm | `/workspace/eng-rc-ccache/build-ab-cpu/strix/`, `rc` job `dec8ab1f-4522-4dd7-8bcb-34e885c2c3e5` |
+| the remedy measured on this tree, CUDA arm | `/workspace/eng-rc-ccache/build-ab/dgx/`, `rc` job `54b75579-3809-4856-922b-3e8b077859eb` |
 
 ## Stop conditions
 
@@ -178,10 +179,75 @@ is how the recipe spread in the first place. The gate is a static read of
   would mean the mount options differ per host and the finding does not
   generalise.
 
+## The measurement on this tree
+
+`strix:gpu0`, `rc` job `dec8ab1f-4522-4dd7-8bcb-34e885c2c3e5`, base
+`a56890f960cdc557727b7e7c1415d2067877ff09`, target `vllm`, 540 objects, `-j 16`.
+
+| Arm | Local `CCACHE_DIR` | Build | `ccache` |
+|---|---|---|---|
+| cold | created empty, remote store created empty | **165 s** | 538 / 538 misses, 1076 writes |
+| warm | **created empty again**, same remote store | **56 s** | **538 / 538 hits (100.0%)** |
+
+**2.95x, and every hit came off the NAS.** The warm arm's local storage line
+reads `Hits: 0 / 538, Misses: 538 / 538`: its own cache had nothing, so all 538
+hits were served by remote storage. The build tree was deleted between the arms,
+so ninja recompiled every object rather than skipping it. Nothing else differs
+between the two arms, which is what makes the saving attributable.
+
+The remote store is 1077 files and 32.0 MB for this target. `/workspace` is the
+same folder on `dgx`, `thor`, `orin` and `strix`, so the persistence crosses
+leases AND hosts: a job on one box can hit a cache another box filled, subject
+to ccache's own key, which hashes the compiler binary and so cannot collide
+across architectures.
+
+### The three readings side by side, which is where the diagnosis closes
+
+| Configuration | Hits | Misses | Stores |
+|---|---:|---:|---:|
+| NAS `CCACHE_DIR`, the usage sheet's instruction | 0 | **0** | 0 |
+| local, cold | 0 | **538** | 538 |
+| local, warm from the NAS remote store | **538** | 0 | -- |
+
+**Zero misses was never "the cache was empty".** A working cold cache records
+538 of them, on the same tree, in the same job shape. Zero-of-everything is a
+reading the broken configuration is uniquely able to produce, and no healthy
+configuration can.
+
+This row was briefed with the opposite inference -- that zero misses meant
+`ccache` was never invoked, because a cache consulted and empty would record
+misses. The first half of that is sound and the conclusion does not follow: it
+silently assumes the counters can be written. They are stored inside
+`CCACHE_DIR` under the same symlink lock as the cache entries, so on this mount
+the instrument and the thing it measures fail together. The measurement that
+settled it was `Cacheable calls: 9 / 9 (100.0%)` from the CMake launcher probe,
+which refuted "never invoked" directly rather than by argument.
+
+**The generalisation worth keeping: when a counter reads zero, ask whether the
+counter could have been written at all before reading the zero as a measurement.**
+A dead instrument and a null result are the same bytes.
+
+### The mount advertises a capability it does not have
+
+The option line carries `symlink=native` while `nounix` is what actually
+governs, so a reader who checks the options concludes symlinks work. Only
+attempting one tells the truth, and the errno varies by client: `EOPNOTSUPP`
+(`Operation not supported`) from the `vers=3.1.1` mount inside the worker,
+`EIO` (`Input/output error`) from the `vers=3.0` mount on the devbox. Both are
+the same absent capability. This is why the shipped guard ATTEMPTS a symlink
+rather than parsing the mount options.
+
+The equivalent CUDA measurement on `dgx:gpu0` -- the host where the 1404 s was
+paid -- is `rc` job `54b75579-3809-4856-922b-3e8b077859eb`, queued behind other
+work at the time of writing. `dgx` and `strix` mount the same share with the same
+options, and the CIFS capability probe runs on both, so the finding is expected
+to reproduce; until that job returns, the cold-versus-warm ratio above is
+measured on the CPU arm and is stated as such.
+
 ## Now
 
-`ACTIVE`. The cause is established and the remedy is measured on a toy. The
-cold-versus-warm build of this tree on `dgx:gpu0` is the remaining measurement.
+`ACTIVE`. The cause is established, the remedy is measured on this tree at 2.95x,
+and the gate is green. The CUDA arm on `dgx:gpu0` is the remaining measurement.
 
 ## Owed
 
@@ -193,5 +259,11 @@ cold-versus-warm build of this tree on `dgx:gpu0` is the remaining measurement.
   pay a cold build every time. The gate this row adds stops them acquiring the
   WRONG recipe; it does not give them the right one. Owner: unowned; sizing is
   one pass with no lease.
+- **The share is `soft`-mounted, so a streaming read off it can fail.** The
+  first A/B attempt died with `gzip: stdin: Resource temporarily unavailable`
+  mid-archive on a 100 MB tarball whose digest was intact (`rc` job `6a737c16`).
+  The A/B harness now stages local with retries and verifies sha256 before
+  unpacking. The lease scripts under `scripts/` still `tar xzf` straight off
+  `/workspace` and carry the same hazard. Owner: unowned.
 - **The remote store has no eviction.** `ccache --trim-dir` is not run by
   anything. It grows until somebody trims it. Owner: unowned.

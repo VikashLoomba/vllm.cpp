@@ -2607,13 +2607,35 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // are deterministic and match registry.py rather than being masked by a
     // later source-specific missing-tensor/tokenizer error.
     const ModelRegistration& gguf_arch = ModelRegistry::Resolve(config);
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE F2: resolved ONCE, here, and carried.
+    //
+    // `ResolveModelDeviceType` is NOT pure on `--device auto`: `ResolveAutoDevice`
+    // decides by ATTEMPTING `CreateQueue()` and answers `kCPU` when that throws.
+    // Between the fit check below and the `ModelSource` further down, this
+    // function opens the tokenizer and the mmproj vision tower, so host memory
+    // grows; `cudaStreamCreate` failing after exactly that growth is documented
+    // on this project's own target box (examples/laguna_gen/main.cpp:181).
+    //
+    // Two calls could therefore disagree WITHIN ONE LOAD: the fit check bounds a
+    // CUDA load, every registry then builds a CPU policy and keeps the n-gram
+    // table block-resident, and the runner's own resolution hands the forward a
+    // CUDA queue whose `EmbeddingKernelCuda` cannot decode blocks — the exact
+    // first-forward throw with the model fully resident that
+    // `DeviceQuantGatherSupported` exists to prevent. One resolution cannot
+    // disagree with itself.
+    //
+    // The MoE placement plan below was a THIRD call to the same function when
+    // #2314 landed under this row. It takes the carried value for the same
+    // reason the other two do: a placement plan installed for one device while
+    // the residency policy resolves another is the same class of defect this
+    // row exists to remove.
+    const vt::DeviceType gguf_device =
+        ResolveModelDeviceType(gguf_arch.architecture, params.device);
     // #2314: before ANY weight I/O, so a CPU-placed layer is never staged onto
     // the device first — `ResidentWeight` aliases host bytes on a CPU `Dev` and
     // uploads otherwise, so this ordering is what makes the placement free
     // rather than a round trip.
-    InstallMoePlacementPlan(
-        ResolveModelDeviceType(gguf_arch.architecture, params.device),
-        config.num_hidden_layers, &gguf);
+    InstallMoePlacementPlan(gguf_device, config.num_hidden_layers, &gguf);
     // Issue #1123: refuse a GGUF whose weights cannot be STAGED onto the target
     // device, here, before any weight I/O and before the tokenizer.
     //
@@ -2634,8 +2656,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // `gguf_device_fit.h`; it decides nothing on a platform that does not stage
     // weights (every CPU load) and nothing when no budget is known.
     {
-      const platforms::Platform& target = platforms::GetPlatform(
-          ResolveModelDeviceType(gguf_arch.architecture, params.device));
+      const platforms::Platform& target = platforms::GetPlatform(gguf_device);
       // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124). The bound above sums the
       // WHOLE tensor table, so on `Qwen3.8-2.4T-A95B UD-Q1_0` it counts all
       // 335.62 GiB of `*_exps` and refuses before any forward exists to take the
@@ -2690,7 +2711,16 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // `CheckDeviceWeightFit` as well, so the two calls that ask this process's
       // residency policy about this file can never resolve two different
       // answers to the same `getenv` reads.
-      const GgufLoadPolicy gguf_load_policy = GgufLoadPolicy::FromEnv();
+      //
+      // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: from `target.device_type()`, which
+      // is `gguf_device` — the load's ONE resolution, the same value the fit
+      // check is bounded with and the same value the `ModelSource` carries. It used to be `FromEnv()`, which probed
+      // `platforms::CurrentPlatform()` — so on a CUDA-capable process an
+      // explicit `--device cpu` bounded a CPU load with the CUDA residency
+      // policy. That is #1136's finding one level down: the bound and the
+      // policy the bound describes must name the same device.
+      const GgufLoadPolicy gguf_load_policy =
+          GgufLoadPolicy::FromEnv(target.device_type());
       static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
       StreamedExpertLane lane;
       if (target.needs_weight_staging() &&
@@ -2901,7 +2931,13 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // assignment leaves the flag accepted and inert, which is exactly the
     // failure L2 recorded and L3 exists to close; test_tower_skip's reachability
     // case is the gate that catches it.
-    ModelSource gguf_source = ModelSource::FromGguf(gguf);
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the RESOLVED device travels with the
+    // source, so every GGUF registry hook builds its residency policy from what
+    // the engine chose rather than from `platforms::CurrentPlatform()`. The
+    // SAME VALUE the #1123 fit check above was bounded with — not a second call
+    // to the same function, which on `--device auto` can answer differently
+    // (see `gguf_device`).
+    ModelSource gguf_source = ModelSource::FromGguf(gguf, gguf_device);
     gguf_source.multimodal = &params.multimodal;
     const auto t_gguf_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
@@ -2917,7 +2953,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                                       ? Qwen3_5MTPKind::kDense
                                       : Qwen3_5MTPKind::kMoe;
       model->AttachMtpDraftWeights(vllm::LoadQwen3_5MTPFromGguf(
-          gguf, config, kind, GgufLoadPolicy::FromEnv()));
+          gguf, config, kind,
+          // The SAME resolved device the target's own load used, taken off the
+          // source rather than resolved a second time.
+          GgufLoadPolicy::FromEnv(gguf_source.device)));
     }
     // SPEC-DFLASH-GGUF B3: the axis-B wiring. Structurally the same three lines
     // as the safetensors branch's maybe_load_dflash - ResolveSpecConfig re-runs

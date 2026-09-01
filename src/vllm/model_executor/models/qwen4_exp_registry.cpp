@@ -40,7 +40,6 @@
 // that would catch a forward returning plausible garbage. Refusing is the only
 // safe default.
 #include "vllm/model_executor/models/model_registry.h"
-#include "vllm/platforms/interface.h"  // CurrentPlatform — the load-time device gate
 
 #include "vt/dtype.h"  // VT_CHECK
 
@@ -114,10 +113,20 @@ std::unique_ptr<LoadedModel> LoadQwen4ExpForConditionalGeneration(
           "carries no file. See .agents/specs/qwen4-exp-flash-next.md and "
           "issue #2031.");
     }
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: `source.device`, which is the device
+    // the ENGINE resolved for this load, and NOT
+    // `platforms::CurrentPlatform().device_type()`.
+    //
+    // The probe answers `kCUDA` on any process where `platforms/cuda.cpp`'s
+    // `Registrar` saw a usable GPU, while
+    // `LoadedEngine::ResolveExplicitDeviceType` returns `kCPU` for an explicit
+    // `--device cpu` "even on a CUDA-capable build/process". Reading the probe
+    // here therefore handed the PLE guard below a device nothing was going to
+    // run on: on a CUDA box, `--device cpu` got the CUDA refusal, whose own
+    // remedy text is "Load this model with `--device cpu`".
     return std::make_unique<Qwen4ExpLoadedModel>(
         registration,
-        LoadQwen4ExpFromGguf(*source.gguf, config,
-                             platforms::CurrentPlatform().device_type()));
+        LoadQwen4ExpFromGguf(*source.gguf, config, source.device));
   }
   (void)registration;
   (void)config;

@@ -22,6 +22,7 @@
 #include "vllm/model_executor/model_loader/gguf_device_fit.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/platforms/interface.h"
 
 namespace {
 
@@ -704,7 +705,7 @@ TEST_CASE(
     CHECK(vllm::RouteGgufTensor(true, false, false, false,
                                 vllm::GgufTensorRole::kStackedExpertWeight,
                                 t.ggml_type,
-                                t.shape) == vllm::GgufResidency::kKeepQuant);
+                                t.shape, vllm::platforms::CurrentPlatform().device_type()) == vllm::GgufResidency::kKeepQuant);
   }
 }
 

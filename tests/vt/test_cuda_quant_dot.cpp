@@ -64,6 +64,13 @@
 #include "vt/cuda/cuda_iq_table_seal.h"
 #endif
 
+// UNCONDITIONAL: `CurrentPlatform()` is used at the `RouteGgufTensor` call in
+// the IQ header case below, which is NOT inside `VLLM_CPP_CUDA`. This include
+// spent one CI cycle inside that guard and broke `build-newest-gcc` and
+// `build-test-cpu` while every CPU-only focused gate stayed green, because no
+// suite in that target list builds this TU.
+#include "vllm/platforms/interface.h"
+
 using vt::Backend;
 using vt::Device;
 using vt::DeviceType;
@@ -1231,7 +1238,7 @@ TEST_CASE("a REAL GGUF header carries IQ2_XS / IQ4_XS to the CUDA keep-quant GEM
     const vllm::GgufResidency res = vllm::RouteGgufTensor(
         /*keep_quant=*/true, /*keep_f16=*/true, /*nvfp4_fp4=*/false,
         /*cpu_ref=*/false, vllm::GgufTensorRole::kMatmulWeight,
-        arm.ggml_type, {1, 1024});
+        arm.ggml_type, {1, 1024}, vllm::platforms::CurrentPlatform().device_type());
     CHECK(res == vllm::GgufResidency::kKeepQuant);
 
     if (!cuda) continue;

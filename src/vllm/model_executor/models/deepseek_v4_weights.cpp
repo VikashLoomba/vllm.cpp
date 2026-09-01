@@ -1850,7 +1850,10 @@ HfConfig DeepseekV4HfConfigFromGguf(const GgufFile& g) {
 DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& config,
                                         const GgufLoadPolicy* policy) {
   (void)config;  // params resolved from the GGUF KV (self-describing vehicle)
-  const GgufLoadPolicy env = GgufLoadPolicy::FromEnv();
+  // A null `policy` means NO ENGINE RESOLVED A DEVICE: every production GGUF
+  // entry point now builds one from `ModelSource::device` in its registry hook.
+  // `kCPU` is STATED rather than probed — see `GgufLoadPolicy::FromEnv`.
+  const GgufLoadPolicy env = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env;
   const DeepseekV4Params p = DeepseekV4ParamsFromGguf(g);
 

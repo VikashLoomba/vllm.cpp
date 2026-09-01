@@ -50,6 +50,7 @@
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"  // v1::ResolveKvCacheDType
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -105,8 +106,15 @@ std::unique_ptr<LoadedModel> LoadGlm5NextForConditionalGeneration(
           "carries no file. See .agents/specs/glm5-next-flash.md and issue "
           "#2242.");
     }
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+    // the device the ENGINE resolved for this load, never from
+    // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+    // CUDA-capable process, and this hook is where the disagreement reached the
+    // loader.
+    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
     return std::make_unique<Glm5NextLoadedModel>(
-        registration, LoadGlm5NextFromGguf(*source.gguf, config));
+        registration,
+        LoadGlm5NextFromGguf(*source.gguf, config, &gguf_policy));
   }
   (void)registration;
   (void)config;

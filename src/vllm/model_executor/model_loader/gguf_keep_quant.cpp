@@ -7,7 +7,6 @@
 #include <cstring>
 
 #include "vllm/config/weight_residency.h"
-#include "vllm/platforms/interface.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
 
@@ -80,14 +79,12 @@ bool EnvOnOr(const char* name, bool fallback) {
 
 }  // namespace
 
-bool GgufQuantComputeAvailable() {
-  return vt::OpRegistered(vt::OpId::kMatmulBTQuant,
-                   vllm::platforms::CurrentPlatform().device_type());
+bool GgufQuantComputeAvailable(vt::DeviceType dev) {
+  return vt::OpRegistered(vt::OpId::kMatmulBTQuant, dev);
 }
 
-bool GgufNvfp4ComputeAvailable() {
-  return vt::OpRegistered(vt::OpId::kMatmulNvfp4,
-                   vllm::platforms::CurrentPlatform().device_type());
+bool GgufNvfp4ComputeAvailable(vt::DeviceType dev) {
+  return vt::OpRegistered(vt::OpId::kMatmulNvfp4, dev);
 }
 
 const char* Name(GgufTensorRole role) {
@@ -201,7 +198,8 @@ bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
 GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               bool cpu_ref, GgufTensorRole role,
                               uint32_t ggml_type,
-                              const std::vector<int64_t>& shape) {
+                              const std::vector<int64_t>& shape,
+                              vt::DeviceType dev) {
   // The oracle switch wins over everything (spec gate 2).
   if (cpu_ref) return GgufResidency::kExpandBf16;
 
@@ -232,7 +230,6 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
     const int64_t k = KeepQuantKDim(role, shape);
     const bool gather = role == GgufTensorRole::kEmbeddingTable;
     vt::DType dt = vt::DType::kF32;
-    const vt::DeviceType dev = vllm::platforms::CurrentPlatform().device_type();
     // ggml_row_size's precondition: a row is a whole number of blocks. A weight
     // whose K is ragged cannot be dotted OR decoded block-wise, so it expands.
     // The device gate (review #523): a format the RUNNING device cannot execute
@@ -259,13 +256,16 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   return GgufResidency::kExpandBf16;
 }
 
-GgufLoadPolicy GgufLoadPolicy::FromEnv() {
+GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   GgufLoadPolicy p;
+  // FIRST, because every device-dependent flag below reads it. It is the
+  // ENGINE's resolved device, not `CurrentPlatform()`: see the field comment.
+  p.device = dev;
   p.cpu_ref = EnvOn("VT_CPU_REF");
   // CIQ G4 flipped this default: keep-quant is ON wherever the running device
   // can execute the quantized GEMM. VT_GGUF_KEEP_QUANT is the two-way
   // override that survives the flip (=0 is the opt-out the spec promised).
-  p.keep_quant = EnvOnOr("VT_GGUF_KEEP_QUANT", GgufQuantComputeAvailable());
+  p.keep_quant = EnvOnOr("VT_GGUF_KEEP_QUANT", GgufQuantComputeAvailable(dev));
   // The orientation win rides the same availability condition, and the oracle
   // switch turns it off with everything else so VT_CPU_REF=1 reproduces the
   // historical load byte for byte.
@@ -331,14 +331,13 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
   // under VT_CPU_REF regardless (the oracle load stays byte-identical).
   p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk &&
-               DeviceKeepF16Supported(
-                   vllm::platforms::CurrentPlatform().device_type());
+               DeviceKeepF16Supported(dev);
   // `QUANT-GGUF-NVFP4` column C. Same shape as the keep-quant default: ON
   // wherever the running device can execute the NVFP4 GEMM (CUDA today; a CPU
   // build keeps expanding, which is correct but unquantized), with
   // VT_GGUF_NVFP4_FP4=0 the same-binary opt-out and the oracle switch forcing it
   // off so VT_CPU_REF=1 still reproduces the historical bf16 load byte for byte.
-  p.nvfp4_fp4 = EnvOnOr("VT_GGUF_NVFP4_FP4", GgufNvfp4ComputeAvailable()) &&
+  p.nvfp4_fp4 = EnvOnOr("VT_GGUF_NVFP4_FP4", GgufNvfp4ComputeAvailable(dev)) &&
                 !p.cpu_ref;
   // Both of vLLM's NVFP4 modes are mirrored; W4A4 is the default because it is
   // what the sibling compressed-tensors container of the same model runs, and
@@ -372,13 +371,12 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // transform, so VT_CPU_REF=1 still reproduces the historical load.
   // Gated on the CPU platform, not just the env var. Only the CPU
   // MatmulBTKernel honours Tensor::elem_kn_repacked, and a staged device would
-  // upload the transposed bytes and read them as [N,K]. CurrentPlatform() is
-  // the same seam GgufQuantComputeAvailable() above already uses to decide a
-  // load transform, so the policy CAN see this and should not be left to a
-  // runtime backstop alone (ResidentWeight also VT_CHECKs, belt and braces).
+  // upload the transposed bytes and read them as [N,K]. `dev` is the same
+  // seam GgufQuantComputeAvailable(dev) above already uses to decide a load
+  // transform, so the policy CAN see this and should not be left to a runtime
+  // backstop alone (ResidentWeight also VT_CHECKs, belt and braces).
   p.elem_kn_repack = !p.cpu_ref && EnvOnOr("VT_CPU_ELEM_KN_REPACK", false) &&
-                     vllm::platforms::CurrentPlatform().device_type() ==
-                         vt::DeviceType::kCPU;
+                     dev == vt::DeviceType::kCPU;
   return p;
 }
 
@@ -386,7 +384,7 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                                     GgufTensorRole role) const {
   const GgufResidency r =
       RouteGgufTensor(keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role,
-                      tensor.ggml_type, tensor.shape);
+                      tensor.ggml_type, tensor.shape, device);
   if (audit) audit(tensor.name, role, r);
   return r;
 }
@@ -400,7 +398,8 @@ GgufLoadPolicy NoKeepQuant(const GgufLoadPolicy& policy) {
 GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tensor,
                         GgufTensorRole role) {
   return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
-                         policy.cpu_ref, role, tensor.ggml_type, tensor.shape);
+                         policy.cpu_ref, role, tensor.ggml_type, tensor.shape,
+                         policy.device);
 }
 
 }  // namespace vllm

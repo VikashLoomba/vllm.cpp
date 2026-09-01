@@ -224,7 +224,122 @@ frames, every retained render's frames, and one `compare-*.json` per scored arm.
 - If the S1 gap sits inside run-to-run noise, that result outranks the
   bisection and the row leads with it.
 
+## Findings so far
+
+### A LATENT-side divergence is PROVEN statically, and it needed no GPU
+
+The cross-decode is still queued, but a static read of the two denoise loops at
+their pinned revisions already answers half the question, and it answers it in
+the direction the cross-decode was built to test.
+
+**Of everything the denoise loop resolves, exactly one thing differs: the sigma
+schedule's shift anchor.** Guidance, the negative prompt, the sampler and STG
+all AGREE, each checked to a `file:line` on both sides:
+
+| Parameter | Upstream | Ours | |
+|---|---|---|---|
+| video `cfg_scale` / `stg_scale` / `rescale_scale` / `modality_scale` / `skip_step` | 3.0 / 1.0 / 0.7 / 3.0 / 0 (`constants.py:51-55`) | same (`ltx2_pipeline.cpp:949-953`) | AGREE |
+| `stg_blocks` (both modalities) | `[28]`, the 2.3 override the 2.5 key inherits (`constants.py:86`, `:124`, `:130-133`) | `{28}` (`ltx2_pipeline.cpp:1069`, `:974-981`, `:1005-1014`) | AGREE |
+| audio guidance | 7.0 / 1.0 / 0.7 / 3.0 / 0 (`constants.py:61-65`) | same (`ltx2_pipeline.cpp:955-959`) | AGREE |
+| negative prompt | `DEFAULT_NEGATIVE_PROMPT` (`constants.py:186-199`) | `LightricksNegativePrompt()` (`ltx2_pipeline.cpp:1101-1107`) | AGREE, byte for byte, 1171 chars |
+| sampler | `euler_denoising_loop` + `EulerDiffusionStep`, deterministic, no per-step noise (`samplers.py:39-81`, `diffusion_steps.py:25-40`) | the first-order arm with `kEuler` (`ltx2_video.cpp:4732-4820`, `ltx2_pipeline.cpp:241-258`) | AGREE |
+| STG application | `SKIP_VIDEO_SELF_ATTN` + `SKIP_AUDIO_SELF_ATTN` on block 28 (`denoisers.py:111-119`) | `kSkipVideoSelfAttn` + `kSkipAudioSelfAttn` (`ltx2_denoisers.cpp:143-155`) | AGREE |
+| **sigma shift anchor** | **4096** | **240** | **DIFFER** |
+
+Upstream's `LTX2Scheduler.execute` takes an OPTIONAL latent and
+`packages/ltx-core/src/ltx_core/components/schedulers.py:32` reads
+`tokens = math.prod(latent.shape[2:]) if latent is not None else
+default_number_of_tokens`. `ti2vid_one_stage.py:207` calls
+`self._scheduler.execute(steps=num_inference_steps)` and passes **no latent**,
+so upstream takes `MAX_SHIFT_ANCHOR = 4096` (`schedulers.py:11`, `:29`).
+
+Our `Ltx2SigmaSchedule` (`src/vllm/model_executor/models/ltx2_pipeline.cpp:105-146`)
+mirrors that formula exactly -- same `max_shift` 2.05, `base_shift` 0.95,
+`stretch`, `terminal` 0.1, `power` 1. The formula is not the divergence. The
+ARGUMENT is. `src/vllm/multimodal/ltx2_video.cpp:4227-4231` passes
+`target_tokens` unless the phase asks for the scheduler default, and
+`OneStagePhase` (`ltx2_pipeline.cpp:1124-1147`) never sets `schedule_tokens`, so
+it keeps the struct default `kTargetLatent`
+(`include/vllm/model_executor/models/ltx2_pipeline.h:725`). The only two
+assignments of `kSchedulerDefault` in that file are at `:1776` and `:1961`, and
+neither is `one_stage`.
+
+At this render's geometry `target_tokens = ceil(25/8) * (192/32) * (320/32)
+= 4 * 6 * 10 = 240`, so `sigma_shift = 240*mm + b = 0.669271` against upstream's
+`2.050000`, and `exp` is 1.952813 against 7.767901. Recomputed here from both
+sources rather than transcribed:
+
+| step | upstream (4096) | ours (240) | delta |
+|---|---|---|---|
+| 0 | 1.000000 | 1.000000 | 0 |
+| 1 | 0.965712 | 0.921534 | -0.044178 |
+| 2 | 0.921875 | 0.832166 | -0.089708 |
+| 3 | 0.863856 | 0.729457 | -0.134399 |
+| 4 | 0.783445 | 0.610176 | -0.173269 |
+| 5 | 0.664579 | 0.469962 | **-0.194617** |
+| 6 | 0.471003 | 0.302774 | -0.168228 |
+| 7 | 0.100000 | 0.100000 | 0 (pinned by `stretch`/`terminal`) |
+| 8 | 0.000000 | 0.000000 | 0 |
+
+Every intermediate sigma differs, by up to 0.1946. Our schedule leaves the
+high-noise regime EARLY -- at step 4 we are at 0.610 where upstream is at 0.783 --
+and the high-noise steps are where classifier-free guidance sets global
+composition and prompt semantics, which is what a CLIP prompt-adherence score
+measures. That is a mechanism, and it points the right way.
+
+**This is not a new discovery about upstream; it is a new attribution.** The
+tree already carries the reading, in this row's own words, at
+`include/vllm/model_executor/models/ltx2_pipeline.h:660-707`: it enumerates
+upstream's seven `.execute()` call sites, records that six pass no latent, names
+`ti2vid_one_stage.py:207 -> our one_stage x4` in that list, calls the divergence
+"REAL rather than a rounding", and states that the default was left at today's
+behaviour deliberately because flipping it re-samples six shipped arms and
+rewrites their goldens. What was NOT known is that this arm is the one carrying
+a measured 2.8559-point adherence FAIL. The comment's own worked example is at
+the recipe default geometry, 6144 tokens and shift 2.78, where the error points
+the OTHER way; at 320x192x25 it points down and is larger.
+
+### What this does and does not establish
+
+- **ESTABLISHED: our final latent cannot be upstream's**, and for a reason that
+  is not the noise draw. Two engines walking different sigma trajectories are
+  solving different problems at every intermediate step.
+- **NOT ESTABLISHED: that our VAE decode is faithful.** Both halves can be
+  wrong at once. Only the cross-decode exonerates the VAE, and it is queued.
+- **NOT ESTABLISHED: that this schedule difference CAUSES the 2.8559 points.**
+  It is a mechanism with the right sign and the right regime, which is a
+  hypothesis and not a measurement. The ablation that would test it is one line
+  -- setting `OneStagePhase`'s `schedule_tokens` to `kSchedulerDefault` -- and
+  this row does not run it, because changing a value until a score improves is
+  the tuning the scope forbids and because that flip belongs to whoever owns the
+  six arms it re-samples.
+
+### The owner reference in that comment does not resolve, and that is REMOTE_UNVERIFIED
+
+`ltx2_pipeline.h` names `https://github.com/mudler/vllm.cpp/issues/1150` as the
+owner of the flip. `gh api repos/mudler/vllm.cpp/issues/1150` returns 404 --
+**and so do 1148, 1149, 1151 and 1152**, while 2513 and 2514 resolve normally in
+the same session. Five consecutive numbers failing together is a range effect in
+the client, not five deletions, and this repository has already written the
+"they were all deleted" conclusion into a policy file once and had to retract
+it. So the state of #1150 is **REMOTE_UNVERIFIED**, not absent, and nothing here
+concludes that the flip is unowned. It needs a check from a client that can read
+that range.
+
 ## Now
 
-`ACTIVE`. The spec is the first commit. The measurement follows in this row's
-branch.
+`ACTIVE`. The spec, the oracle latent instrument and the lease harness are
+committed. The static half of the question is ANSWERED and its answer is
+LATENT, with the mechanism named above.
+
+What is outstanding is one `rc` job each:
+
+- **Phase A**, `rc` job `a24f9336-897f-4810-9851-13dade5acb52`, queued on
+  `dgx:gpu0`, which produces the oracle's latent and its control. The
+  cross-decode that EXONERATES or CHARGES the VAE follows from it, and needs no
+  further GPU.
+- **Phase B**, `KEEP_FRAMES=1 N=3 scripts/ltx25-render-confirm.sh`, which gives
+  the -0.7368 S1 margin the error bar it has never had.
+
+Neither is a blocker on the finding above, which was taken from source at both
+pins and recomputed rather than transcribed.

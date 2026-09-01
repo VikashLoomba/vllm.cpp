@@ -663,12 +663,21 @@ struct Ltx2ConditioningTrace {
   // `video_tokens` is the length of the sequence the DiT forward actually ran
   // over on the LAST phase — the target grid plus whatever an appending
   // conditioning item added (keyframe_cond.py:79-82). `schedule_tokens` is the
-  // count the sigma schedule read, which upstream fixes at the TARGET: its shift
-  // comes from `math.prod(latent.shape[2:])` (schedulers.py:32), the
-  // UNPATCHIFIED target latent, and the pipelines compute sigmas before any state
-  // exists (ti2vid_one_stage.py:207, distilled.py:200-201). So a render that
-  // appends must show `video_tokens > schedule_tokens`, and a build that let the
-  // append re-shift the schedule shows them equal.
+  // count the sigma schedule read, which upstream fixes BEFORE any state exists
+  // (ti2vid_one_stage.py:207, distilled.py:200-201) and which therefore cannot
+  // see an append.
+  //
+  // WHICH count that is depends on the phase, and after #2521 it is usually not
+  // the target grid: `LTX2Scheduler.execute` takes an OPTIONAL latent
+  // (schedulers.py:32) and six of upstream's seven call sites pass none, so they
+  // get `default_number_of_tokens` = 4096. See `Ltx2PhaseScheduleTokens`.
+  //
+  // SO DO NOT READ `video_tokens > schedule_tokens` AS THE APPEND INVARIANT.
+  // It was one while every derived arm sampled on its target grid, and it
+  // reversed on `one_stage` the moment that arm took the 4096 anchor — with the
+  // invariant itself untouched. The claim "an append must not re-shift the
+  // schedule" is a statement about TWO renders, and the test that makes it
+  // compares `schedule_tokens` across a pair that differs only by the keyframe.
   //
   // Both are written INSIDE the phase loop, like `image_tokens` and unlike every
   // field above them. That distinction is the whole reason they exist: the rest

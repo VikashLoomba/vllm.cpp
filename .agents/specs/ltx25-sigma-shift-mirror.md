@@ -184,10 +184,14 @@ assertion.
 ## Gates
 
 ```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
 cmake --build build -j 4 --target test_ltx2_video test_ltx2_pipeline
 ./build/tests/test_ltx2_pipeline
 ./build/tests/test_ltx2_video
 ```
+
+Built at `-j 4` or lower, deliberately: parallel builds have OOM-rebooted this
+box and other agents compile concurrently.
 
 ## Risks
 
@@ -222,10 +226,80 @@ the score gets worse it is still correct and is reported as such.
 - `Ltx2PhaseRecipe::use_official_sigma_schedule` is written by seven recipe
   builders and read by no code in `src/` or `include/`. Upstream it selects
   between two real branches (`ltx2_denoise.py:249-260`), which for the shift
-  agree at 4096 but differ in how the rest of the schedule is built. Filed
-  separately; not repaired here.
+  agree at 4096 but differ in how the rest of the schedule is built. Owed by
+  this section rather than repaired here: removing a dead field and wiring a
+  live one are different changes with different blast radii, and neither is
+  the anchor this row is about.
 - `retake`'s non-distilled arm, which upstream derives at
   `retake.py:287` and this engine does not port.
+
+## Evidence
+
+Built at `/dev/shm/sigmashift-build` rather than in the worktree: the root
+filesystem was 100% full (66M free of 447G) during this row and the first build
+died with `fatal error: error writing to /tmp/ccaClw1v.s: No space left on
+device`. `TMPDIR` was moved with it. That is a box condition, not a property of
+this change, and it is reported rather than worked around silently.
+
+### Red first
+
+New case `ltx2 one_stage: stage 1's sigma shift takes the 4096 anchor, not the
+target grid`, built against the tree WITHOUT the recipe edits:
+
+```
+MESSAGE: one_stage: 8 / 32   res2s: 2 / 8
+ERROR: CHECK( one_small == anchor ) is NOT correct!  values: CHECK( 8 == 4096 )
+ERROR: CHECK( one_large == anchor ) is NOT correct!  values: CHECK( 32 == 4096 )
+[doctest] assertions: 37 | 35 passed | 2 failed |   Status: FAILURE!
+```
+
+`8 / 32` is the defect stated as a measurement: the anchor tracked the geometry.
+37 assertions RAN, so this is not a skip wearing a pass, and the 35 that passed
+include the oracle-derived sigma comparisons — which is the cross-check that the
+arithmetic was already right and only its argument was wrong.
+
+After the recipe edits, same binary path, same case:
+
+```
+MESSAGE: one_stage: 4096 / 4096   res2s: 2 / 8
+[doctest] assertions: 37 | 37 passed | 0 failed |   Status: SUCCESS!
+```
+
+`res2s` stayed at `2 / 8` across both runs. The control still discriminates, so
+the equalities are not a constant.
+
+### Full LTX gate, after
+
+All thirteen LTX-2.5 suites, 407 cases, zero failures:
+
+| suite | cases | suite | cases |
+|---|---|---|---|
+| `test_ltx2` | 43 | `test_ltx2_retake` | 4 |
+| `test_ltx2_device` | 23 | `test_ltx2_text_encoder` | 27 |
+| `test_ltx2_dfr` | 11 | `test_ltx2_tiling` | 10 |
+| `test_ltx2_image_cond` | 15 | `test_ltx2_vae` | 47 |
+| `test_ltx2_loader` | 41 | `test_ltx2_video` | 109 |
+| `test_ltx2_lora` | 15 | `test_ltx2_video_device_forward` | 1 |
+| `test_ltx2_pipeline` | 61 | | |
+
+`test_ltx2_retake` green is the executable half of the record correction: retake
+does not move, because it never derives a schedule.
+
+### Mutations, each applied, built, and restored byte-exact
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | delete `stage1.schedule_tokens = kTargetLatent` from `Res2sTwoStageRecipe`, so it inherits the NEW default | RED: 3 cases in `test_ltx2_pipeline`, 3 in `test_ltx2_video` |
+| M2 | revert the `dmd2` arm alone to `kTargetLatent` | RED: exactly 2 assertions, both in the new anchor-table case |
+
+M1 is the one that matters for the default flip: it proves the `res2s` line is
+load-bearing and that sweeping that arm silently is detected rather than
+tolerated. M2 proves the anchor table adds coverage that did not exist — `dmd2`
+was reached by no previous assertion at all, in either suite.
+
+Restores were verified with `sha256sum -c`, not by inspection. Both suites
+returned to 61/3545 and 109/4860 after each.
+
 
 ## Stop conditions
 

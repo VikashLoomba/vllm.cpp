@@ -1094,14 +1094,25 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   // interleave, and it was missing until now (issue #1320). The CUDA
   // quant dot reads `block_q8_0`; `VT_CPU_QUANT_REPACK` rewrites the buffer to
   // `block_q8_0x4` at load and only the CPU MatmulBTKernel understands that.
-  // Unlike `elem_kn_repack`, whose policy IS gated on the CPU platform
-  // (gguf_keep_quant.cpp), `quant_repack` rides `QuantRepackActive()` alone —
-  // a HOST-CPU i8mm probe — so an aarch64 box doing `--device cuda` can repack a
-  // Q8_0 weight and then upload it verbatim to a kernel that misreads it. That is
-  // silent wrong tokens, not a crash. Measured harmless on the target checkpoint
-  // (one Q8_0 tensor, 0.01% of parameters, and the instrumented load recorded
-  // `quant_repack = 0`), which is why it is a tripwire here rather than a
-  // campaign; `VT_CPU_QUANT_REPACK=0` is the operator's way past it.
+  // THE POLICY NOW AGREES WITH THIS GUARD (#2406). `quant_repack` used to ride
+  // `QuantRepackActive()` alone — a HOST-CPU i8mm probe with no device term —
+  // so an aarch64 box doing `--device cuda` repacked a Q8_0 weight and uploaded
+  // it verbatim to a kernel that misreads it. `GgufLoadPolicy::FromEnv` now
+  // resolves it through `QuantRepackForDevice(..., dev)`, gated `dev == kCPU`
+  // exactly as its sibling `elem_kn_repack` always was.
+  //
+  // TWO CORRECTIONS TO WHAT THIS COMMENT USED TO SAY. It called the gap
+  // "measured harmless on the target checkpoint (one Q8_0 tensor, 0.01% of
+  // parameters, and the instrumented load recorded `quant_repack = 0`)". The
+  // released `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S stores **194** Q8_0
+  // hyper-connection mix weights (docs/USAGE.md), so the population was never
+  // one tensor; and a repacked `block_q8_0x4` weight DID reach device residency
+  // and refuse here by name on `thor:gpu0`, so the reading of `quant_repack = 0`
+  // did not generalise past the run that took it. The guard stays as belt to
+  // the policy's braces — a runtime refusal is what catches a future caller that
+  // builds a policy by hand — but it is no longer the only thing standing
+  // between an i8mm host and a device upload. `VT_CPU_QUANT_REPACK=0` remains
+  // the operator's same-binary way past the transform entirely.
   VT_CHECK(!w.repacked,
            "qwen3_5: an i8mm-repacked (block_q8_0x4) weight reached device "
            "residency; VT_CPU_QUANT_REPACK is a CPU-only load transform and the "

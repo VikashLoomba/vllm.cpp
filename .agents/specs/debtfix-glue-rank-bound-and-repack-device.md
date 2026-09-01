@@ -108,13 +108,21 @@ This spec rejects it, for reasons and not for size.
    eight-token control `11751 13 15767 411 2029 11 1092 369` would have to be
    re-earned on a box this wave has no lease for.
 3. **The upstream evidence is about intent, and it is off-pin.** vLLM's
-   hyper-connection linears pass `quant_config=None` explicitly
-   (`vllm/model_executor/models/nvidia/hyperconnection.py:102`, `:113`, `:122`)
-   with `params_dtype=torch.bfloat16` hardcoded, and the decode GEMM demands
-   packed row-major bf16 on both operands (`nvidia/low_latency_gemm.py:95-96`).
-   That is real, and it is a **forward reference**: the revision that carries it
-   is 1,566 commits past this tree's parity pin and unreachable from it. vLLM
-   loads safetensors and never meets a Q8_0 hyper-connection weight, so it
+   hyper-connection linears pass `quant_config=None` explicitly, and the decode
+   GEMM demands packed row-major bf16 on both operands. **Read at
+   `vllm-project/vllm` `e126687a9a`, which is 1,465 commits past this tree's
+   parity pin `555967922` — a forward reference to an unpinned upstream, quoted
+   as intent and never as an anchor.** Verified in a local clone of that
+   revision, not transcribed from the issue:
+
+   | claim | `file:line` at `e126687a9a` | read |
+   |---|---|---|
+   | the three HC linears are unquantized | `vllm/models/qwen4_exp/nvidia/hyperconnection.py:102`, `:113`, `:122` | `quant_config=None,` |
+   | their dtype is bf16 by literal | `vllm/models/qwen4_exp/nvidia/model.py:260`, `:436` | `params_dtype=torch.bfloat16,` |
+   | the decode GEMM's operand predicate | `vllm/models/qwen4_exp/nvidia/low_latency_gemm.py:92-99` | `_is_packed_row_major(weight) and ... weight.dtype == torch.bfloat16` |
+
+   The paths are `vllm/models/qwen4_exp/`, not `vllm/model_executor/models/`.
+   vLLM loads safetensors and never meets a Q8_0 hyper-connection weight, so it
    states no position on the GGUF arm. The oracle that does is
    `llama-cpp-qwen4exp`, which keeps them typed and declares all six
    `GGML_OP_MUL_MAT`.
@@ -156,7 +164,9 @@ host that is not that device."
 ## Tests
 
 **#2435.** The red is a sanitizer run, not an assertion. `test_qwen4_exp_layer_loop`
-reports `SUCCESS!` and exits 1. The gate is therefore the process exit code of
+exits 1; under this lane's `-fno-sanitize-recover=all` it aborts at the first
+finding, so it reports no assertions at all (see `## Evidence` — the issue's own
+`309/309, SUCCESS!` was measured on a recoverable build). The gate is therefore the process exit code of
 the `address,undefined` build, plus a count: the number of
 `dense_device_glue.h:5[678]: runtime error` lines, which must go 3 → 0. A doctest
 case is added beside it (`tests/vllm/models/test_dense_device_glue_rank.cpp`)
@@ -183,6 +193,99 @@ UBSAN_OPTIONS=print_stacktrace=1 ASAN_OPTIONS=detect_leaks=1:strict_string_check
 
 plus the ordinary CPU suite, and `scripts/agent-preflight.sh --staged`.
 
+## Evidence
+
+Host: this development box, x86-64, `g++ 13.3.0`, Debug + `-fsanitize=address,undefined`
+with the lane's own `-fno-sanitize-recover=all`. Base `origin/main` `63889449c`.
+
+### #2435 — red, then green
+
+**RED**, on the base tree with nothing applied:
+
+```
+$ UBSAN_OPTIONS=print_stacktrace=1 ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 \
+    VT_POOL_BYPASS=1 ./tests/test_qwen4_exp_layer_loop ; echo $?
+dense_device_glue.h:56:14: runtime error: index 4 out of bounds for type 'long int [4]'
+    #0 vllm::dense_attn::MakeTensor(...)
+    #1 vllm::dense_attn::DBuf::DBuf(...)
+    #2 DOCTEST_ANON_FUNC_2 tests/vllm/models/test_qwen4_exp_layer_loop.cpp:497
+1
+```
+
+Ten lines of output and **not one doctest assertion**, reproduced three times.
+
+**THE ISSUE'S DESCRIPTION OF THE RED IS WRONG ON THIS TREE, and the correction
+matters.** #2435 records three UBSan lines (`:56`, `:57`, `:58`), a
+`LeakSanitizer` report, and `309/309, SUCCESS!` beside them. This lane compiles
+`-fno-sanitize-recover=all` (`CMakeLists.txt:260`), so the FIRST finding aborts:
+there is one line, no leak check runs at all, and no assertion executes. The
+figure quoted for the assertions was measured on a recoverable build. Nothing
+about the defect changes; what changes is that the sanitizer lane never reported
+whether this test passes — it reported that it started.
+
+**GREEN**, with the bound and the thirteen fixture repairs:
+
+```
+test_qwen4_exp_layer_loop            rc=0 ubsan=0 leaks=0 assertions: 341 | 341 passed
+test_device_pool                     rc=0 ubsan=0 leaks=0 assertions:  42 |  42 passed
+test_gguf_keep_quant                 rc=0 ubsan=0 leaks=0 assertions: 9987 | 9987 passed
+test_qwen4_exp_inject_residency      rc=0 ubsan=0 leaks=0 assertions:   8 |   8 passed
+test_qwen4_exp_matmul_bt_dtype       rc=0 ubsan=0 leaks=0 assertions:   2 |   2 passed
+test_glm5_next_bridge                rc=0 ubsan=0 leaks=0 assertions: 32562 | 32562 passed
+test_resident_weight_host_addressable rc=0 ubsan=0 leaks=0 assertions:  85 |  85 passed
+```
+
+The counted property is `grep -c "runtime error"`: **1 → 0**, and the process
+exit code `1 → 0`.
+
+### The "384 byte leak" is the DevicePool cache, not a leak
+
+#2435's second half asks for "the 4-allocation leak in the same path". There
+isn't one. Under the `sanitize-cpu` lane's own environment
+(`VT_POOL_BYPASS: "1"`, set by `.github/workflows/ci.yml`) LeakSanitizer reports
+**nothing** on any of the seven binaries above. Drop that one variable and the
+same binary reports `53696 byte(s) leaked in 114 allocation(s)`, and every stack
+is the same four frames:
+
+```
+#1 AllocAligned64            src/vt/cpu/cpu_backend.cpp:20
+#2 Alloc                     src/vt/cpu/cpu_backend.cpp:42
+#3 vllm::DevicePool::Get(vt::Backend&, unsigned long)
+#4 vllm::dense_attn::DBuf::DBuf(...)
+```
+
+That is the production pool deliberately retaining its scratch blocks, which is
+exactly what the CI job's own comment says the variable exists to switch off:
+"the production DevicePool deliberately retains scratch blocks. Its detector lane
+uses exact allocations and real frees so ASan can distinguish that cache from a
+leak." The issue's 384 bytes were measured without it. **No pool change is made
+here**, and none is owed: retention is the design, and the lane already has the
+switch.
+
+### #2406 — red, then green
+
+The predicate's discriminating row, run on this x86 host where the whole
+`FromEnv` path is blind:
+
+| assertion | before the device term | after |
+|---|---|---|
+| `QuantRepackForDevice(true, false, true, kCPU)` | `true` | `true` |
+| `QuantRepackForDevice(true, false, true, kCUDA)` | `true` (RED) | `false` |
+| `QuantRepackForDevice(true, false, true, kROCM)` | `true` (RED) | `false` |
+
+`test_gguf_keep_quant -tc="quant_repack is decided WITH the resolved device (#2406)"`
+runs 10 assertions, all passing, `rc=0`. The whole binary is 9987/9987, `rc=0`.
+
+**WHAT THIS EVIDENCE CANNOT DO, stated plainly.** No x86 host can gate the WIRE.
+`vt::cpu::QuantRepackActive()` is a literal `false` off aarch64
+(`src/vt/cpu/cpu_quant_repack_arm.cpp:275`), so `FromEnv(kCUDA).quant_repack` is
+`false` on this box whether the device term exists or not. The truth table gates
+the rule; the wire assertion carries `VT_GGUF_KEEP_QUANT=1` so that it becomes
+discriminating on an aarch64 i8mm box, and it is inert here. The CPU control
+`11751 13 15767 411 2029 11 1092 369` was NOT re-run: `thor:gpu0` is held by
+another wave. It is unchanged by construction rather than by measurement — on
+`dev == kCPU` the gated expression is character-for-character the old one.
+
 ## Risks
 
 * The rank bound turns a silent corruption into a throw. If any caller outside
@@ -202,6 +305,8 @@ a bounds question, and it is a different row.
 ## Owed
 
 * Raising `vt::kMaxRank`, if a production path ever needs rank 5.
+* Nothing for the "384-byte leak" half of #2435: it is the DevicePool's
+  deliberate retention read without `VT_POOL_BYPASS=1`. See `## Evidence`.
 * Dequantizing the `qwen4_exp` hyper-connection weights at load
   (`MODEL-MM-QWEN4-EXP`), with the residency and token evidence that needs.
 * The aarch64 CUDA measurement of the repack trade that #2406 asks for.

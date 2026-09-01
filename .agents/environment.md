@@ -1899,14 +1899,20 @@ environment:
   16 GB Mac mini only** — it is not general advice, and in particular the DGX
   profile above requires `-j 1` because its unified memory OOM-reboots the box
   under a parallel CUDA suite.
-  `test_engine_core_proc` is likewise a timing flake under heavy parallel ctest:
-  the case "EngineCoreProc: abort-mode shutdown aborts in-flight requests"
-  (`test_engine_core_proc.cpp:315`) races the busy-loop teardown against the
-  abort-output enqueue and intermittently misses `abort_seen` (measured ~1/5 in
-  isolation under load, 2026-07-28); it is a pre-existing test-side timing race
-  (untouched by the C7 sampling work) and passes on rerun. A dedicated fix would
-  make the loop block for the abort frame (bounded wait) instead of a
-  best-effort non-blocking `try_get` sweep.
+  `test_engine_core_proc` used to fail under heavy parallel ctest in the case
+  "EngineCoreProc: abort-mode shutdown aborts in-flight requests" (measured ~1/5
+  in isolation under load, 2026-07-28). **FIXED 2026-09-01
+  ([#2482](https://github.com/mudler/vllm.cpp/issues/2482)), and this page named
+  the wrong cause and the wrong remedy until then.** It was never a race with the
+  teardown: `InprocClient::shutdown()` JOINS the engine thread, so the abort frame
+  is already on the queue by the time the scan starts. The scan was capped at 1000
+  dequeues while the request carried `max_tokens=100000`, so it free-ran token
+  deltas into an unbounded queue and, given more scheduler time under load, wrote
+  more than 1000 of them ahead of the abort frame. The failing run reported 1004
+  assertions against a solo run's 11 -- all 1000 `try_get`s returned true, so the
+  scan ran out of budget on a queue that was never empty. The fix drains the queue
+  to empty. Waiting for the frame, which this page recommended, would have waited
+  on a frame that had already arrived.
 
   **LOCALAI WORKER — must be DOWN for any timing/benchmark work on this box
   (user-directed 2026-07-22).** It is a **root LaunchDaemon**, not a container

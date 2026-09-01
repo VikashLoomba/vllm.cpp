@@ -2513,31 +2513,52 @@ which is precisely how this landed green locally in the first place.
   EXL3 checkpoint compute on a GPU, which is what W2 set out to make possible and
   what the blanket refusal prevented entirely.
 
-  **THE DEFAULT DEVICE PATH NOW WORKS, MEASURED 2026-09-01 on `thor:gpu0`.** With
-  the fused arm defaulted off on a device queue, the path an operator actually
-  gets -- no environment variables set -- computes on CUDA and matches the CPU
-  arm exactly:
+  **THE DEFAULT DEVICE PATH FIRST WORKED ON 2026-09-01 on `thor:gpu0`, on the
+  PER-EXPERT arm.** That run is kept here because it is what the kernel fix below
+  is measured against. With the fused arm defaulted off on a device queue, the
+  path an operator got -- no environment variables set -- computed on CUDA and
+  matched the CPU arm exactly:
 
-  | run | result |
+  | run, pre-fix | result |
   |---|---|
   | default path, no env vars | rc=0, 5/5 assertions, `max \|diff\| = 0` |
   | the same under `compute-sanitizer --tool memcheck` | **`ERROR SUMMARY: 0 errors`** (was 66) |
   | `VT_DSV4_EXL3_FUSED_MOE=1` (forced fused) | rc=134, still faults |
 
   The zero-error sanitizer run is the one that matters beyond the diff: it says
-  the device path this row now serves has no out-of-bounds or invalid access at
-  all, not merely that its numbers happen to agree. And the forced run still
-  faulting is what proves the predicate gates something rather than decorating a
-  path that was already fine.
+  the device path this row serves has no out-of-bounds or invalid access at all,
+  not merely that its numbers happen to agree. And the forced run still faulting
+  is what proved the predicate gated something rather than decorating a path that
+  was already fine.
 
-  **The FUSED arm is where the defect is** ([#2458](https://github.com/mudler/vllm.cpp/issues/2458)),
-  and it is the fast path, so W2 is not finished. `compute-sanitizer` places it in
-  `exl3_moe_kernel` as an 8-byte read at `base + tid*8` with base NULL (`0x0,
-  0x8 ... 0x200, 0x208`). The per-pointer and eighteen-operand checks added here
-  do NOT fire, so every pointer is valid at launch and the null arises inside the
-  kernel rather than at the boundary. Staging works; the experts do not yet compute on the device. The
-  refusal that stood before this change is gone, so what replaced a loud refusal
-  is currently a crash rather than a wrong answer -- loud, but not correct.
+  **THE FUSED ARM IS FIXED, MEASURED 2026-09-01 on `thor:gpu0` (sm_110).**
+  `compute-sanitizer` had placed the fault in `exl3_moe_kernel` as an 8-byte read
+  at `base + tid*8` with base NULL (`0x0, 0x8 ... 0x200, 0x208`), and the
+  per-pointer and eighteen-operand checks did not fire, so the null arose inside
+  the kernel rather than at the boundary. It did: the port of
+  `exl3_gemm_kernel_inner` had DROPPED upstream's `shmem_out_had` template
+  parameter (`exl3_gemm_inner.cuh:22`) and hardwired the output Hadamard on, so
+  the epilogue called `output_had_sh_gl()` unconditionally and dereferenced the
+  NULL `post_scale` that upstream's own MoE bands pass
+  (`exl3_moe_kernel.cuh:138,212` instantiate it `false`; `exl3_gemm_kernel.cuh:40`
+  instantiates `true` with a real `svh`). Restoring the parameter takes the
+  `write_sum_gl()` store on the MoE path, which rounds the f32 accumulator to fp16
+  through `__floats2half2_rn` -- exactly the rounding
+  `src/vt/cpu/cpu_exl3_kernels.cpp:420-425` reproduces on the host and the MoE
+  header comment already claimed. So the fix is the numerically correct answer and
+  not merely the non-faulting one.
+
+  | run, fused arm ON | result |
+  |---|---|
+  | default path, no env vars | rc=0, 5/5 assertions, `max \|diff\| = 0` |
+  | `VT_DSV4_EXL3_FUSED_MOE=1` | rc=0, 5/5 assertions, `max \|diff\| = 0` |
+  | `VT_DSV4_EXL3_FUSED_MOE=0` (per-expert control) | rc=0, 5/5 assertions, `max \|diff\| = 0` |
+  | `compute-sanitizer --tool memcheck`, `VT_POOL_BYPASS=1` | **`ERROR SUMMARY: 0 errors`** (was 66) |
+
+  The device-queue predicate that kept the fused arm off is DELETED with the
+  defect it was written for. One flag, `VT_DSV4_EXL3_FUSED_MOE`, selects the arm
+  on the host and on a device queue alike, and the routed experts of an EXL3
+  checkpoint now compute on a GPU through the FAST arm.
 
   **The upload was UNPROVEN on a host-only lane and must not be claimed
   from one.** `test_cuda_deepseek_v4.cpp` carries the two cases that prove it --

@@ -10,6 +10,7 @@
 
 #include "vt/ops.h"
 #include "vt/fp8_kv.h"
+#include "vt/rocm/rocm_f16_codec.h"
 
 namespace vt::rocm {
 namespace {
@@ -390,6 +391,52 @@ void CastF32KernelRocm(Queue& q, Tensor& out, const Tensor& in) {
   CastF32K<<<GridFor(n), kBlock, 0, AsStream(q)>>>(out.Ptr<float>(), in.Ptr<__hip_bfloat16>(),
                                                      n, row_size, in.stride[0]);
   Check(hipGetLastError(), "cast_f32");
+}
+
+// ---------------- CastF16 (QUANT-EXL3 W1a #2181; BACKEND-ROCM-EXL3 #2433) ----
+// The NARROWING sibling of the two casts above, and the third of the three the
+// header calls siblings — registered on CPU and CUDA only until this row, while
+// `kCastBf16` and `kCastF32` each had six backends. It is what a bf16 or f32
+// residual stream goes through on the way into an EXL3 linear, whose activation
+// is fp16 and nothing else, so on ROCm its absence is one of the exactly two
+// CPU reference-tier operations #2433 measured on `strix:gpu0`.
+//
+// A bf16 source is read through its f32 VALUE (widening is exact) and rounded
+// ONCE to f16 — never reinterpreted. An f16 source is refused rather than
+// copied, which is what `ops.cpp` checks and what the two casts either side of
+// this one also do: a cast that accepted anything would make a wrong-dtype
+// activation invisible at its call site.
+//
+// The round is `DF32ToF16`, the transcription of `vt::F32ToF16`, and NOT
+// `__float2half`. The gate on this op is byte equality with that host function,
+// so the device runs the same arithmetic rather than a conversion that happens
+// to agree.
+//
+// Same packed-view row handling as its two siblings: each logical row is dense
+// while `row_stride` may span a parent Q+K+V tensor.
+template <typename Src>
+__global__ void CastF16K(uint16_t* out, const Src* in, int64_t n, int64_t row_size,
+                         int64_t row_stride) {
+  for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += gridDim.x * blockDim.x) {
+    const int64_t row = i / row_size, col = i - row * row_size;
+    out[i] = DF32ToF16(Ld(in, row * row_stride + col));
+  }
+}
+
+void CastF16KernelRocm(Queue& q, Tensor& out, const Tensor& in) {
+  const int64_t n = out.Numel();
+  if (n == 0) return;
+  const int64_t rows = in.shape[0];
+  const int64_t row_size = n / rows;
+  if (in.dtype == DType::kF32) {
+    CastF16K<float><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        out.Ptr<uint16_t>(), in.Ptr<float>(), n, row_size, in.stride[0]);
+  } else {
+    CastF16K<__hip_bfloat16><<<GridFor(n), kBlock, 0, AsStream(q)>>>(
+        out.Ptr<uint16_t>(), in.Ptr<__hip_bfloat16>(), n, row_size, in.stride[0]);
+  }
+  Check(hipGetLastError(), "cast_f16");
 }
 
 // ---------------- QkvSplit ----------------

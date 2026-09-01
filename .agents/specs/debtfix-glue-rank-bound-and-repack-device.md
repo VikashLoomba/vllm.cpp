@@ -70,6 +70,14 @@ carries the five dimensions to `PagedKvCache` as separate scalars
 block_size, num_kv_heads, head_size}` is the same bytes, the same element count
 and the same truth, at a rank the type can hold.
 
+**Production already spells it at rank 4**, which is the strongest argument that
+this is a fixture spelling and not a lost dimension. `dense_attn::KvSlice`
+(`include/vllm/model_executor/models/dense_attn_block.h:364-382`) is what every
+attention block reads the page through, and it builds a **rank-4 strided view**
+by hand — `shape = {num_blocks, block_size, Hkv, Dh}`, `stride[0] = 2 * bs * h *
+dd`, with the K/V axis carried as a byte offset rather than a dimension. Nothing
+in `src/` ever asks `vt::Tensor` to hold five dimensions of a KV page.
+
 ### Design
 
 `MakeTensor` gains

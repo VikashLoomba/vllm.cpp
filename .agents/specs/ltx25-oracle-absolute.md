@@ -840,3 +840,32 @@ frames, so nothing here measures how far the reading moves between runs.
 `## Outcome` declared its blockiness ceiling was blind to, and consistency is
 all it is.** No measurement here connects the two, the ablation that would is
 not specified, and this row does not own it.
+
+**UPDATE, 2026-09-01, and this one CORRECTS a claim above rather than extending
+it.** The sentence "**our render is somewhat SMOOTHER than upstream's**" is
+FALSE, and `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) measured it. The two REPORTED
+statistics that motivated it are unchanged and were read correctly; the
+inference drawn from them was not, and no spectrum had ever been taken.
+
+The radially averaged power spectrum of the two renders has **no crossover**:
+there is no frequency above which our profile stays below the reference's. Our
+render holds **77.79% MORE** of its energy at 0.20 cycles per pixel and above
+(0.081641 against 0.045918) and rises to **2.86x** the reference at 0.3945 c/px.
+What it is short of is the MID band, 0.04 to 0.14 c/px, by 8.64%. `sharpness_mean`
+is a mean absolute gradient and therefore reads the mid band, which is why a
+mid-band deficit lowered it while the high band was nearly doubled. The shape is
+a hole in the middle with an excess at fine scale, not a rolloff, and "smoother"
+describes a rolloff.
+
+The interventions settle the direction that the statistics alone could not.
+Blurring our own frames at sigma 1.0 RAISES their CLIP score by **+1.9131** and
+takes them from 6 of 25 frames clearing the adherence bound to **23 of 25**. The
+same blur costs the reference 0.9728. A render failing because it is too smooth
+does not improve when it is smoothed further.
+
+The blockiness ceiling this row landed is untouched and its verdict stands. What
+changes is the sentence a reader was left with about WHY: the gate is blind to a
+smoothness difference by construction, and on these two renders there is no
+smoothness difference for it to be blind to. The numbers are in
+[`ltx25-adherence-detail-loss.md`](ltx25-adherence-detail-loss.md) `## Outcome`
+and the full JSON is at `tests/parity/goldens/ltx25_detail_loss/detail-loss.json`.

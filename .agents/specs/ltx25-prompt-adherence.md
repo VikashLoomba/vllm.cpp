@@ -814,6 +814,22 @@ markings that separate a fox from a wolf would produce exactly the two numbers
 above. Nothing here measures that mechanism, and the ablation that would is not
 in this row.
 
+**THAT HYPOTHESIS IS NOW MEASURED AND IT IS FALSE (2026-09-01).**
+`LTX25-ADHERENCE-DETAIL-LOSS` ([#2513](https://github.com/mudler/vllm.cpp/issues/2513))
+ran the ablation on these same 25 frames. Our render is not smoother: it holds
+**77.79% MORE** energy above 0.20 cycles per pixel than the reference and is
+short only in the MID band, by 8.64%. Within our 25 frames more fine-scale
+energy predicts a WORSE score, `r = -0.5862`, where within the reference's it
+predicts a better one, `r = +0.3943`. Our three best-scoring frames are our three
+LEAST sharp of 25, our single sharpest frame fails the bound, and the overlap
+between our five best-scoring frames and our five sharpest is EMPTY. Blurring the
+reference until its sharpness matches ours costs it 0.1192 CLIP points, 4.4% of
+the shortfall, and blurring OUR frames RAISES their score by **+1.9131** and
+takes 6 of 25 frames clearing the bound to **23 of 25**. The paragraph above
+stays as written because it records what this row knew when it landed; the
+correction lives in that row's `## Outcome`, which also names the candidate the
+measurement points at instead.
+
 **It also does not say our render is bad for a viewer.** CLIP is an instrument
 with an uncalibrated absolute value, which is why S1 is a comparison and why the
 `20.0` floor of vLLM-Omni's own gate is still refused here. 35.2719 is a number
@@ -854,13 +870,17 @@ refused rather than scored.
   [#2295](https://github.com/mudler/vllm.cpp/issues/2295).
 - **NOTHING OWNS CLOSING THE ADHERENCE GAP**, which reads 2.8559 against the
   committed mp4 reference and 2.7305 against its lossless frames. That is an engine
-  question, not an instrument one, and this row measures rather than fixes. The
-  hypothesis in `## Outcome`, that the smoothness `ltx25-oracle-absolute.md`
-  records is what costs the fox-against-wolf margin, is untested, and the
-  ablation that would test it is not specified anywhere. Owner of the RECORD:
-  this row, through #1854, which is the issue that asked the question and is the
-  right place for the answer. Owner of the REPAIR: **no row exists**, and naming
-  one needs the attribution first. This is the sharpest hole W3 leaves.
+  question, not an instrument one, and this row measures rather than fixes. **The
+  attribution this bullet said was missing now exists and it is NEGATIVE**:
+  `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) specified and ran the ablation, and the
+  smoothness hypothesis is refuted -- our render carries MORE fine-scale energy
+  than the reference, not less, and blurring it RAISES its score. What that row
+  names instead is an axis-aligned near-Nyquist excess, 2.8 to 3.4 times the
+  reference's, growing along the temporal axis while the mid band stays 8.6%
+  short. Owner of the RECORD: this row, through #1854, which is the issue that
+  asked the question and is the right place for the answer. Owner of the REPAIR:
+  **still no row**, but it is now unowned with a direction rather than with a
+  hypothesis, and #2513 states what would confirm the candidate.
 - **n IS 1.** Only the first of `93a60151`'s three renders retained its frames,
   by the harness's design as `## Outcome` now records, so the run-to-run
   stability of our own adherence reading is UNMEASURED. A reading that moves by

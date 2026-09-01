@@ -82,86 +82,101 @@ record. They are settled here so a fresh implementer does not re-derive them.
 
 ## Oracles
 
-**vLLM implements nothing here.** Read live at `origin/main` = `6a5e8f5979`,
-2026-08-26: no `qwen4*` path, no registry entry, and a repository-wide GitHub search
-for `qwen4` returns zero results. `vllm-omni` likewise. This is absence from vLLM
-`main`, not staleness in our pin (`555967922`), so a pin advance does not reach it.
+**vLLM is this row's primary oracle from 2026-08-31.** `[Model] Support
+Qwen3.8-Flash-Next (#53896)` landed at `e126687a9a828d513c01a07cd69f025f27d63280`
+and added `vllm/models/qwen4_exp/`: a shared `common/`, a `config.py`, and two
+complete backends, `nvidia/` and `amd/`. The registry carries three entries,
+`Qwen4ExpForCausalLM` (`vllm/model_executor/models/registry.py:114`),
+`Qwen4ExpForConditionalGeneration` (`:580`) and `Qwen4ExpMTP` (`:670`). Every
+component this row lists except the vision tower now has a vLLM implementation
+whose behaviour, defaults and naming this port must mirror.
 
-**Developer direction, 2026-08-26: transformers is the oracle for the ALGORITHM,
-vLLM supplies the OPS.** Recorded verbatim because it is the axis the whole row
-hangs on: "use transformers as oracle for algorithmic side. but use ops from vllm so
-we account for optimized path."
+**It is 595 commits ahead of the parity pin, and it is NOT reachable from the
+pin.** `git merge-base --is-ancestor e126687a9a 555967922` exits 1, and so does the
+reverse test. Every anchor cited from `e126687a9a` in this spec is therefore a
+**forward reference to an unpinned upstream**, labelled as one at each use.
+Advancing the pin belongs to the sync wave and NOT to this row; an implementer who
+needs the ops at the pin still has none. Issue
+[#2489](https://github.com/mudler/vllm.cpp/issues/2489) owns the reconciliation.
 
-This is the correct reading of what each upstream is, and not a split of
-convenience. transformers [#48337](https://github.com/huggingface/transformers/pull/48337)
-(MERGED 2026-08-26, 5211 lines) is a semantics reference that says so in its own
-code: `Qwen4ExpTextQSAIndexer.forward` loops in Python over `(batch_idx, query_idx)`
-and carries the comment "we only allow eager and sdpa". Ported as written it yields
-a correct model at an indefensible speed. AGENTS.md's "Mirror vLLM" polarity
-continues to bind every primitive vLLM implements, even though vLLM has never
-assembled this particular model from them.
+### The 2026-08-26 direction, and why it is superseded
 
-Therefore: **every component resolves against exactly one oracle, named in the
-`## Design` table. An implementer who cannot name the oracle for the line they are
-writing has found a gap in this spec and returns `NEEDS_CONTEXT`.**
+**Recorded verbatim, and NOT deleted, because a record that quietly drops a
+superseded reading cannot be audited.** The direction was: "use transformers as
+oracle for algorithmic side. but use ops from vllm so we account for optimized
+path."
 
-SGLang [#36497](https://github.com/sgl-project/sglang/pull/36497) is OPEN and is not
-admissible while it stays open. Re-check it at each wave; if it merges it becomes a
-second op source under the `sglang` registry id, still ranked below vLLM.
+The premise it rested on was stated in this section and was true when it was
+written: **vLLM implemented nothing here.** Read live at `origin/main` =
+`6a5e8f5979` on 2026-08-26, there was no `qwen4*` path, no registry entry, and a
+repository-wide GitHub search for `qwen4` returned zero results. `vllm-omni`
+likewise. On that premise the split was the correct reading of what each upstream
+is, rather than a split of convenience: transformers
+[#48337](https://github.com/huggingface/transformers/pull/48337) is a semantics
+reference that says so in its own code, and its `Qwen4ExpTextQSAIndexer.forward`
+loops in Python over `(batch_idx, query_idx)` under the comment "we only allow
+eager and sdpa".
 
-### The transformers lane pin (ACCEPTED 2026-08-26)
+**The premise expired on 2026-08-31 and the direction expired with it.** AGENTS.md
+makes vLLM the primary reference and "the only reference wherever it implements the
+behavior", and requires a row to reconcile onto vLLM and record the change in the
+spec once vLLM implements the path. The lane exception in
+[`../oracles/transformers.md`](../oracles/transformers.md) also names its own
+expiry in its own words: it "expires the moment vLLM registers `qwen4_exp`, at
+which point the row reconciles onto vLLM and transformers demotes to the
+preprocessing role it holds everywhere else."
 
-`.agents/oracles/transformers.md` pins transformers to **5.14.1**, deliberately tied
-to what the pinned vLLM environment resolves, on the stated ground that an
-independent pin "would let the oracle environment hold two different `transformers`
-at once, which is the drift this registry exists to stop".
+**Nothing that was built under the direction is thereby wrong.** The reconciliation
+below checks each component against vLLM rather than assuming either agreement or
+divergence, and it found the two load-bearing algorithm calls the direction
+produced, the unweighted mean pool and the divide-after-the-head-sum block score,
+**confirmed** by vLLM's own kernels. What changes is the authority, not the answer,
+and the components where the authority now differs are named individually.
 
-**5.14.1 does not contain `Qwen4Exp`**, so this row cannot run its algorithmic
-oracle under the existing pin.
+### What each oracle is for, from 2026-09-01
 
-The exception argued here is narrow: the invariant guards against a vLLM environment
-and its transformers drifting apart, and for `qwen4_exp` there is no vLLM
-implementation to drift from. A lane-scoped second pin therefore cannot create the
-inconsistency the rule exists to prevent. It is recorded in the oracle file as a
-lane exception naming this row and this issue, and it expires the moment vLLM
-registers `qwen4_exp`, at which point the row reconciles onto vLLM and transformers
-demotes to the preprocessing role it holds everywhere else.
+| Oracle | Role now | Reach for it |
+|---|---|---|
+| `vllm` at `e126687a9a` (**unpinned**, forward reference) | **primary**: algorithm, ops, defaults, dtype policy, refusals, cache shapes, naming | every component of this model except the two below |
+| `transformers` `v5.16.0` (lane pin) | **secondary**, demoted from algorithm to what it is everywhere else: the processor, tokenizer and checkpoint-semantics reference | preprocessing, the checkpoint's own tensor names and layout, and any question vLLM's two backends leave open |
+| `llama-cpp-qwen4exp` (`ggml-org/llama.cpp` PR #27742) | unchanged | the GGUF conversion, its architecture string and its k-quant floor. vLLM reads safetensors and has no GGUF arm, so it cannot answer a GGUF question |
+| `Qwen/Qwen3.8-Flash-Next` | unchanged | config and weights |
 
-**Accepted by the developer on 2026-08-26**, having been put as an explicit
-accept-or-reject rather than passed as housekeeping, because it changes the
-semantics of a registry invariant.
+**The lane exception in `.agents/oracles/transformers.md` has fired its own expiry
+condition and is spent.** It does not need to be argued down; it needs to be
+recorded as expired, which is what this section does. The transformers pin itself
+stays where it is, because `transformers` remains a registry oracle for its normal
+role, and the lane pin is now the ordinary pin for that role on this row.
 
-**The lane pin is `transformers` 5.16.0, and it is a real release, not a branch
-SHA.** That was not the expected outcome and it is better than one. `Qwen4Exp`
-merged to `main` at 12:03:40Z on 2026-08-26 and `v5.16.0` was published at
-12:35:15Z, 32 minutes later. Bounded rather than assumed, by fetching the model
-source at each tag on 2026-08-26: `v5.16.0` returns HTTP 200 and `v5.15.0` returns
-HTTP 404, so 5.16.0 is the FIRST release containing the architecture, which is the
-tightest pin available. Its `auto_mappings.py` carries 5 `qwen4_exp` occurrences, so
-the registration landed with the model rather than trailing it.
-
-The version string is **unmeasured**: it is the release that provably contains the
-model, not a `transformers.__version__` read off a running oracle. Resolving the
-runtime string is owed to the first wave that stands one up. Full record and the
-`oracle-pin-lane` block: [`../oracles/transformers.md`](../oracles/transformers.md).
+**One thing vLLM still does not supply, and it is the same thing as before.** vLLM
+loads safetensors. Every GGUF question this row has, the quantized arms included,
+is answered by `llama-cpp-qwen4exp` and by the checkpoint, and vLLM cannot rule on
+it. That boundary is where the dtype question in #2477 actually lives, and the
+reconciliation below says so precisely.
 
 ### Gateability
 
-`gateable = no` at the time of writing, and the reason is memory rather than
-software: see `## Hardware`. The oracle must demonstrably build **and run the
-model**, and no published artifact fits any fleet device. The first wave's real
-deliverable is the arm that makes an oracle run possible at all.
+`gateable = no` for the vLLM oracle on this row, and the reason is unchanged and is
+memory rather than software: see `## Hardware`. An oracle must demonstrably build
+**and run the model**, and no published artifact fits any fleet device. Registration
+is not gateability. `e126687a9a` gives this row an authoritative **source** to mirror
+today; it does not yet give it a denominator, and nothing in this section should be
+read as claiming one.
 
 ## Upstream chain
 
 | Source | Revision | Role |
 |---|---|---|
-| `huggingface/transformers` | **`v5.16.0`** (lane pin; first release containing `qwen4_exp`, landed by `#48337` merged 2026-08-26) | algorithm; `models/qwen4_exp/modular_qwen4_exp.py` is the authored delta, `modeling_qwen4_exp.py` the generated expansion |
-| `vllm-project/vllm` | `origin/main` `6a5e8f5979` (survey only; the parity pin stays `555967922`) | ops |
+| `huggingface/transformers` | `v5.16.0` (first release containing `qwen4_exp`, landed by `#48337` merged 2026-08-26) | **secondary since 2026-08-31**, demoted from algorithm to preprocessing and checkpoint semantics; `models/qwen4_exp/modular_qwen4_exp.py` is the authored delta, `modeling_qwen4_exp.py` the generated expansion |
+| `vllm-project/vllm` | **`e126687a9a`** (`[Model] Support Qwen3.8-Flash-Next (#53896)`, 2026-08-31; **NOT reachable from the parity pin `555967922`, and 595 commits ahead of it**, so every anchor into it is a forward reference to an unpinned upstream) | **primary**: algorithm, ops, defaults, dtype policy, refusals, cache shapes and naming, at `vllm/models/qwen4_exp/` with `nvidia/` and `amd/` backends |
 | `Qwen/Qwen3.8-Flash-Next` | HF `main`, read 2026-08-26 | config and weights |
 
 Read the **modular** file, not the generated one. It is 1186 lines against 2707 and
 it is the file that states what is inherited unchanged, which is most of the model.
+
+On the vLLM side read `nvidia/`, not `amd/`. The two are the same shape and this
+row's target is CUDA; where they differ the NVIDIA path is the one to mirror, and
+any component where they diverge is called out in the reconciliation above.
 
 ## Our baseline
 

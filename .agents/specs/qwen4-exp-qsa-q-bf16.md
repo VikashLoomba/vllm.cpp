@@ -1,0 +1,162 @@
+# The QSA block keeps `q` at the model dtype, as vLLM does
+
+**Row:** `MODEL-MM-QWEN4-EXP` (wave QSABF16)
+**Issue:** [#2488](https://github.com/mudler/vllm.cpp/issues/2488)
+**State:** `ACTIVE`
+**Base:** `origin/main` at `63889449c`
+
+## Scope
+
+`src/vllm/model_executor/models/qwen4_exp_qsa_block.cpp` splits the fused
+`q_proj` output into an f32 `q` buffer and hands that to `vt::RmsNorm`. vLLM
+keeps the same value at the model dtype, which for this architecture is bf16.
+This spec narrows the query buffer to `hidden.dtype` and widens the shared
+`vt::AttnGateSplit` seam by exactly the amount that requires.
+
+**This is the cause of [#2477](https://github.com/mudler/vllm.cpp/issues/2477).**
+[#2493](https://github.com/mudler/vllm.cpp/pull/2493) treated the symptom — it
+taught the CUDA `RmsNorm` kernel to read a gamma whose dtype differs from the
+activation — and said so in its own body and in
+`.agents/specs/qwen4-exp-cuda-rmsnorm-weight-dtype.md`. That change stays. It is
+correct on its own terms and it serves other callers. This change removes the
+pairing that made it necessary here.
+
+**In scope:** the query half. **Out of scope and recorded under `## Owed`:** the
+output-gate half of #2488.
+
+## Upstream anchors
+
+vLLM implements this architecture. [#2502](https://github.com/mudler/vllm.cpp/pull/2502)
+reconciled the row onto it, so vLLM is the primary oracle here.
+
+**Every citation below is a FORWARD REFERENCE to an unpinned upstream.** The
+pin in `.agents/upstream-sync.md` is `5559679229` (2026-07-26) and has no
+`vllm/models/qwen4_exp/` at all — vLLM landed the architecture after the row was
+pinned. The revision read for this spec is `origin/main` `cdefd9d499`
+(2026-09-02), 1566 commits ahead of the pin. It is not a gateable oracle for this
+row and is cited as a source of upstream *shape*, not of measured values.
+
+| What | Where (`cdefd9d499`) |
+|---|---|
+| `Qwen4ExpQSAAttention(Qwen3NextAttention, ...)` — the QSA layer inherits the projection | `vllm/models/qwen4_exp/nvidia/qsa.py:168` |
+| `self.attn_output_gate = True` for every Qwen4Exp full-attention checkpoint | `vllm/models/qwen4_exp/nvidia/qsa.py:230` |
+| `self.q_norm = GemmaRMSNorm(self.head_dim, eps=...)` | `vllm/models/qwen4_exp/nvidia/qsa.py:254` |
+| `q, gate = torch.chunk(q_gate, 2, dim=-1)` — a **view** of the qkv GEMM output; no dtype change | `vllm/model_executor/models/qwen3_next.py:430` |
+| `q = self.q_norm(q.view(-1, num_heads, head_dim))` — `q` reaches the norm **unwidened** | `vllm/model_executor/models/qwen3_next.py:437` |
+| `hidden_states.float()` … `.to(input_dtype)` — the promotion is INSIDE the norm | `vllm/models/qwen4_exp/nvidia/ple_layer.py:70,80` |
+
+The last row is the whole argument. Upstream's `.float()` is a value promotion
+inside one kernel's registers. It is not a materialised `[T, Hq, Dh]` allocation,
+and the comment this change replaces read it as if it were.
+
+## Design
+
+**The seam.** `vt::AttnGateSplit(q, q_out, gate_out, qgate)` refused any
+`q_out.dtype != kF32`, and `AttnGateSplitKernel` took `float* q_out` literally.
+The op now accepts `q_out` at f32 **or** bf16 and templates the CUDA kernel on
+that type. `gate_out` stays f32, because `vt::SigmoidGateBf16` — its only
+consumer, on four backends — requires an f32 gate. Narrowing `gate_out` is the
+`## Owed` half.
+
+This is the extension the shared seam needed, not a parallel path. The op already
+templated its INPUT on `Tin` for exactly the same reason (`VT_BF16_GEMM_OUT`
+makes the `q_proj` GEMM emit bf16); the output was the half that stayed welded.
+
+**The caller.** `q_f32` becomes `q_split` at `hidden.dtype`, and the norm reads
+it. Two bf16 buffers replace one f32 and one bf16 buffer, which is upstream's own
+shape: `torch.chunk` + `reshape` materialises the split at the model dtype and
+`q_norm` returns a second tensor at the same dtype.
+
+**Why the values cannot move.** `qgate` is allocated at `hidden.dtype` and the
+`q_proj` GEMM stores into it, so the split's SOURCE is already bf16 on this
+path. Widening each element to f32 and narrowing it back is the identity —
+`F32ToBF16(BF16ToF32(x)) == x` for every bf16 `x`. The rounding count is
+unchanged at one, at the `qgate` store, which is where upstream has its one.
+
+## Risks
+
+**Qwen3.5 shares the op.** `qwen3_5.cpp:5328` and `:5501` pass f32 `q_out`
+buffers. They keep dispatching to the same `<float, Tin>` instantiation the
+kernel had before, so the risk is a dispatch mistake, not a behaviour choice.
+`## Tests` gates it directly rather than by argument.
+
+**A token gate cannot see this.** `AGENTS.md` names the case: the tokens still
+match while the path moves twice the bytes. Every gate below therefore observes a
+dtype or a byte count, and the value gates exist only to prove nothing ELSE moved.
+
+**The CUDA arm is unmeasured by CI.** No CI lane executes GPU tests. The CUDA
+assertions in this change are `[SKIP]`ped documentation of intent unless a leased
+device runs them, and `## Evidence` says which arms actually ran.
+
+## Tests
+
+1. **The production gate (`tests/vllm/models/test_qwen4_exp_layer_loop.cpp`).**
+   A pass-through provider is installed for `OpId::kAttnGateSplit` on `kCPU` at a
+   priority above `vt-native`; it records `q_out.dtype` and
+   `q_out.Numel() * SizeOf(q_out.dtype)` and forwards to the native kernel
+   captured before registration. The case then runs
+   `vllm::ModelRegistry::Forward` over the GGUF fixture — whose layer 3 is
+   `qwen_sparse_attention` — and asserts (a) the recorded call count is non-zero,
+   (b) every recorded `q_out` is `kBF16`, and (c) its byte count is
+   `T * kQHeads * kHeadDim * 2`.
+
+   The count is the applied-ness property: deleting the QSA call site in
+   `qwen4_exp_forward.cpp` takes it to zero, which is what makes this a
+   reachability gate and not a class test.
+
+2. **The seam's value identity (`tests/vt/test_ops_glue.cpp`).** Over a bf16
+   `qgate`, the bf16 `q_out` arm is BIT-IDENTICAL to the f32 arm's values rounded
+   to bf16, and `gate_out` is byte-identical between the two runs — the Qwen3.5
+   operand, unchanged by the presence of the new one.
+
+3. **The seam's refusals.** `gate_out` at bf16 and `q_out` at f16 each refuse by
+   name.
+
+4. **Qwen3.5 does not move.** `tests/vt/test_ops_attn_preamble.cpp` already
+   compares the unfused `AttnGateSplit + RmsNorm + RmsNorm + RopeNeox` sequence
+   against the fused kernel byte-for-byte over f32 buffers. It is re-run
+   unchanged, and item 2 adds the direct statement that the f32 arm's bytes are
+   the pre-change bytes.
+
+5. **The CPU behavioural control.** The released UD-IQ1_S artifact's CPU
+   sequence `11751 13 15767 411 2029 11 1092 369` must not move.
+
+## Gates
+
+```sh
+cmake --build build -j 2 --target test_qwen4_exp_layer_loop test_ops_glue \
+                            test_ops_attn_preamble test_qwen4_exp_qsa_block
+ctest --test-dir build -R 'qwen4_exp_layer_loop|ops_glue|ops_attn_preamble|qwen4_exp_qsa_block' -V
+scripts/agent-preflight.sh --staged
+```
+
+## Evidence
+
+Recorded in `## Outcome` when the row reaches `DONE`, and in the pull request
+body meanwhile. The arms that ran and the arms that did not are named separately;
+an unmeasured CUDA arm is reported as unmeasured.
+
+## Stop conditions
+
+- Stop if narrowing `q_out` moves any Qwen3.5 byte. That would mean the dispatch
+  is wrong, and no value argument rescues it.
+- Stop if the CPU control sequence moves. The narrowing is an identity on this
+  path; a moved token means the premise that `qgate` is bf16 is false somewhere.
+- Stop and hand back if closing the gate half needs `vt::SigmoidGateBf16` widened
+  on four backends. It does, which is why it is `## Owed` and not scope.
+
+## Owed
+
+- [#2488](https://github.com/mudler/vllm.cpp/issues/2488) stays open for its
+  **output-gate half**: `gate` is still allocated f32. Closing it means widening
+  `vt::SigmoidGateBf16`'s gate operand on kCPU, kCUDA, kVULKAN (a GLSL shader
+  with dtype specialisation constants) and kTENSTORRENT, each of which states an
+  f32 gate in its own refusal. That is a different unit of work with a different
+  blast radius, and the value it buys here is zero rounding change — the same
+  bandwidth argument and none of the precision one.
+- The CUDA arm of every assertion in this change, until a CI lane executes GPU
+  tests.
+
+## Now
+
+`ACTIVE`. The query buffer is narrowed; the gate buffer is `## Owed`.

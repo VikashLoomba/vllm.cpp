@@ -2671,6 +2671,131 @@ expects, STOP and return the evidence — inventing the semantics of a learned
 pooling is worse than leaving the device arm refused. If the device gate reds,
 that is the RESULT and it lands as one.
 
+
+### W9c-3a — the routed-expert GEMM, device-resident, and a forward that admits CUDA (GPU, medium)
+
+Issue: [#2464](https://github.com/mudler/vllm.cpp/issues/2464).
+Claim: `CLAIM-GLM53-FLASH-W9C3A`. Base `839ea1ced`.
+
+**This wave exists because O19's blocker is stale, and that was re-measured
+rather than inherited.** O19 records that on `dgx:gpu0` this artifact's expert
+GEMM "runs on the CPU, and the fused seam THROWS", because
+`IsCudaKeepQuantSupported` admitted neither `IQ2_XS` nor `IQ4_XS`. On
+`839ea1ced` it admits both, and the comment above those two lines
+(`src/vt/cuda/cuda_quant_dot.cu:1832-1843`) names this artifact and this
+consequence:
+
+> QUANT-CUDA-IQ4XS-IQ2XS (#2260). Without these two the GLM-5.3-Flash
+> UD-Q2_K_XL artifact's 82 IQ2_XS + 3 IQ4_XS tensors drained the stream and ran
+> their expert GEMM on the host, and the fused MoE seam below THREW outright,
+> which is why that model shipped as `--device cpu`.
+
+Cross-checked against §W9a's own census: this artifact's four distinct expert
+triples are `(IQ2_XS, IQ2_XS, IQ3_XXS)` x39, `(IQ2_XS, IQ2_XS, IQ4_XS)` x2,
+`(IQ3_XXS, IQ3_XXS, IQ4_XS)` x1 and `(Q2_K, Q2_K, Q3_K)` x1, with 0 gate/up
+dtype mismatches across all 43 sparse blocks. **All six encodings are now in
+`IsCudaKeepQuantSupported`.** §W9a's correction of #2260's causal claim still
+stands and is not withdrawn — this model ships `--device cpu` because it has no
+device code, not because the seam threw — but the KERNEL half of that debt is
+discharged and the row had not noticed.
+
+**What was missing is glue in `glm5_next_*`, and it is named in the specific.**
+
+| Where | What it is today |
+|---|---|
+| `glm5_next_bridge.cpp:668-670` | banks are `OwnedTensor::View()` — host bytes, `device` deliberately left CPU |
+| `glm5_next_moe.cpp:110-137` | `act` / `mid` / `expert_out` / `topk_ids` are `std::vector`, wrapped by `MakeT` |
+| `glm5_next_forward.cpp:231-238` | refuses a non-CPU queue, CORRECTLY |
+
+That refusal is not a stray guard and is not "lifted". `vt::MatmulBTQuant`,
+`vt::MatmulBTQuantGrouped` and `vt::MoeGateUpSwiGLUGrouped` each require
+`a.device == b.device == out.device == q.device`
+(`src/vt/ops.cpp:214`, `:243`, `:277`), so a CUDA queue over those host pointers
+is a refusal or a crash and never a fallback. The way past it is to make the
+operands device-resident, which is what this wave does.
+
+**In scope.**
+
+1. `MoeQuantBanks` (`glm5_next_moe.h:245-249`) carries the three source
+   `const OwnedTensor*` beside the host views, so `dense_attn::ResidentWeight`
+   memoizes the upload on `OwnedTensor::d_dev` (the tower) rather than
+   re-uploading per step. `AdmitMoeQuantBanks` fills them.
+2. `MoeExpertsKeepQuant` gains a DEVICE arm behind `dense_attn::Dev`:
+   `ResidentWeight` for the three banks (`dense_attn_block.h:181`, which uploads
+   `w.bytes` verbatim and keeps the block dtype), `DBuf` for the f32/i32
+   activations (`dense_device_glue.h:109`), the two grouped ops on the device
+   queue, one download of `[P, H]`.
+3. `Glm5NextHostForward` admits a CUDA queue. It interposes a CPU queue —
+   `vt::Queue{vt::Device{kCPU, 0}, nullptr}`, the shape `VaeCpuQueue()`
+   (`ltx2_video_vae.cpp:459`) already uses — for every host-reference arm, and
+   hands the device queue to the expert GEMM alone.
+4. A FIT GUARD over `Backend::DeviceMemoryInfo` (`cuda_backend.cu:93`,
+   `cudaMemGetInfo`). A bank set that will not fit falls back to the host arm
+   BY NAME rather than OOM-ing a shared lease. `deepseek_v4.cpp`'s
+   `VT_V4_RESIDENT_EXPERTS` defaults OFF for the same 70 GiB hazard; this wave
+   defaults ON with a measured guard instead of a switch nobody sets.
+
+**Out of scope, and this is the sentence to read if you are wondering whether
+the device arm is done. It is not.** Everything else in the 2,783-line forward
+stays on the host through the interposed CPU queue: the KDA recurrence, the DSA
+k-pool indexer, the eager MLA attention, the mHC sites, the router, the dense
+MLPs, the embedding gather and the chunked `lm_head`. O40 records that as the
+staged-slice disclosure AGENTS.md §"Nothing lands dead" requires, and it is
+DISCLOSURE and not a waiver.
+
+**The remaining price is measured, not estimated.** The two closest siblings in
+this tree that carry a real device arm are `kimi_linear_device.cpp` at **2,539
+lines** and `nemotron_h_device.cpp` at **2,144 lines**, both of them MLA +
+linear-attention hybrids like this row. This model additionally owes the mHC
+family (O34) and the wiring of W9c-0's two k-pool device ops (O36). A
+`glm5_next_device.cpp` in the house shape is therefore a 2,500-3,500-line port,
+which is why W9c-1/2/3 are waves and not a compose.
+
+**W9c-1 is re-priced by this wave and stays REFUSED.** The seam map was read
+again at `839ea1ced` and the earlier refusal holds for a further reason its own
+section did not name: `MlaBlockWeights` wants `w_uk_t` and `w_uv` as **bf16
+tensors absorbed at LOAD**, which the sibling produces in
+`glm_moe_dsa_loader.cpp:223-272` (`AbsorbMla` -> `mla::AbsorbKvBProjBf16`) and
+which `glm5_next_loader.cpp` has no analogue of. Routing onto
+`mla::ForwardMlaAttentionBlock` therefore owes a loader absorb step, a
+`BuildMlaStep` equivalent (`deepseek_v2.cpp:179-255`), a sparse per-token block
+table (`glm_moe_dsa_forward.cpp:199-256`) and a `TritonMLAImpl`, on top of the
+paging and transpose W9c-1 already priced. It is a port of
+`glm_moe_dsa_forward.cpp`'s machinery, not a call-site change.
+
+**Gates.**
+- `scripts/agent-preflight.sh --fail-on-skip`, and the CPU suites by hand with
+  case and assertion counts: `test_glm5_next_moe`, `test_glm5_next_forward`,
+  `test_glm5_next_layer`, `test_glm5_next_bridge`.
+- Sibling inertness, because `glm5_next_moe.{h,cpp}` and the forward's signature
+  are this row's but `dense_attn_block.h` and the three ops are shared:
+  `test_glm_moe_dsa*`, `test_cuda_deepseek_v4`, `test_mla_attention_block`,
+  `test_qwen4_exp*`.
+- A DEVICE gate on `dgx:gpu0` (`sm_121a`; `thor` is `sm_110` and FA2's arch
+  table has no 11.0, `cmake/CudaArchFeatures.cmake:349`) built with
+  `-DVLLM_CPP_FLASH_ATTN=ON` plus CUTLASS, asserted FATAL at configure time on a
+  non-empty `[121a]` manifest.
+- The END-TO-END leg: `vllm-cli --device cuda --max-tokens 2` on the FIRST SHARD
+  of `GLM-5.3-Flash-UD-Q2_K_XL`, and the same on `--device cpu`, INTERLEAVED, on
+  one box, one binary, one prompt.
+
+**This is not a vLLM parity claim and no part of it may be read as one.** vLLM
+implements `glm5_next` at no revision (O38, §Oracles), so the only comparison
+available is our CUDA arm against our CPU arm on one box. Any number below is
+labelled that way or it is wrong.
+
+**Stop conditions.**
+- If the device arm and the host arm disagree beyond the activation-quantization
+  band, STOP. Both arms quantize the activation to Q8_K, so they agree to a band
+  and not exactly; a real disagreement and a reduction-order difference look
+  alike, and only a mutation separates them. Do not widen a tolerance.
+- If the resident banks do not fit, the FIT GUARD reports it and the run falls
+  to the host arm. That is a RESULT and it lands as one; it is not a reason to
+  remove the guard.
+- If the device arm is SLOWER, say so plainly. O6's per-step re-decode of the
+  non-expert tower is what makes this model fit, and moving 94.6758 GiB of
+  experts to the device does not remove it.
+
 ## Tests to port
 
 `tests/models/` in transformers `v5.16.1` is the upstream suite. What is
@@ -3537,8 +3662,17 @@ Debts this row carries, each visible rather than waived:
   belongs to W7b, which owns that sentence, rather than to a dequant change that
   merely walked past it.
 
-- **O19 — the 101.14 GiB is a RESIDENCY result. On `dgx:gpu0` the expert GEMM
-  for both new types runs on the CPU, and the fused seam THROWS.**
+- **O19 — NARROWED by W9c-3a ([#2464](https://github.com/mudler/vllm.cpp/issues/2464)):
+  the KERNEL half is DISCHARGED and only the residency half is still owed.**
+  `IsCudaKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu:1815-1848`) now
+  admits `IQ2_XS` and `IQ4_XS` — #2260 landed both naming THIS artifact — so
+  every one of its six expert encodings runs the device GEMM, the fused seam
+  no longer throws, and no grouped call drains the stream to the host. What
+  the entry said when it was written, kept verbatim because the measurement
+  below is still the reason the residency shape is what it is:
+
+  ~~the 101.14 GiB is a RESIDENCY result. On `dgx:gpu0` the expert GEMM
+  for both new types runs on the CPU, and the fused seam THROWS.~~
   [#2260](https://github.com/mudler/vllm.cpp/issues/2260).
   [#2247](https://github.com/mudler/vllm.cpp/issues/2247) landed the two CPU
   keep-quant `vec_dot` kernels, which is what flips the artifact's 82 IQ2_XS and
@@ -4764,7 +4898,80 @@ Debts this row carries, each visible rather than waived:
   shared header belongs to ENG-MULTIKV-BYNAME's row, and reverting the accessor
   rather than the comment would change three models' seam. Tracked by
   [#2459](https://github.com/mudler/vllm.cpp/issues/2459).
+- **O40 — W9c-3a PUTS ONE ARM ON THE DEVICE AND LEAVES THE OTHER TEN ON THE
+  HOST, and this entry is the staged-slice disclosure AGENTS.md §"Nothing lands
+  dead" requires rather than a note after the fact.** On `--device cuda` this
+  model now computes its routed-expert GEMM on the GPU against device-resident
+  keep-quant banks, and reaches it from `ModelRegistry::Forward`. **What is
+  UNREACHED on a device, named individually:** the KDA recurrence
+  (`glm5_next_kda.cpp`), the DSA k-pool indexer (`glm5_next_dsa.cpp`), the eager
+  MLA attention (`glm5_next_attn.cpp`), both mHC sites (`glm5_next_mhc.cpp`),
+  the router's `vt::MoeRouterTopK` and `vt::MoeCombine`, the dense and shared
+  MLPs, the embedding gather and the chunked `lm_head`. Each of those runs on an
+  INTERPOSED CPU queue that `Glm5NextHostForward` constructs, which is a real
+  host computation and not a device one. **The row that owns the wiring:**
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, waves W9c-1, W9c-2
+  and W9c-3. **The issue that tracks it:**
+  [#2410](https://github.com/mudler/vllm.cpp/issues/2410). Read
+  "`--device cuda` works" as "one arm of eleven is on the device", because that
+  is what was built.
+
+- **O41 — A SLICE OF THIS ROW WAS BLOCKED FOR EIGHT DAYS BY A DEBT ANOTHER ROW
+  HAD ALREADY PAID, and nothing here noticed.** O19 was written when
+  `IsCudaKeepQuantSupported` rejected `IQ2_XS` and `IQ4_XS`; #2260 added both,
+  citing this artifact by name and by tensor count, and this row's records went
+  on saying the device expert GEMM was blocked. No gate could catch that: O19 is
+  prose about another file, and the only thing that falsifies it is reading that
+  file again. The general shape is the one AGENTS.md §"History is git" warns
+  about — an inherited block outlives the block — and it has now cost this row
+  twice, the other time being O31's "gh is 403", re-measured false by the W9c
+  rescoping. **NOT fixed by a checker, deliberately:** a gate that re-derived
+  every `## Owed` entry's premise on every change would be a shared-file lock
+  and would fail `main` for reasons no commit caused. What is owed instead is
+  the habit, and this entry is the record of the second instance so a third one
+  is visible as a pattern.
+
 ## Now
+
+`ACTIVE`, 2026-09-01. **THE KERNEL THAT BLOCKED THIS MODEL'S DEVICE ARM LANDED
+EIGHT DAYS AGO IN ANOTHER ROW, AND NOTHING HERE READ IT.** O19 says the expert
+GEMM for this artifact's `IQ2_XS` and `IQ4_XS` tensors "runs on the CPU, and the
+fused seam THROWS". Re-measured on `839ea1ced`,
+`IsCudaKeepQuantSupported` (`cuda_quant_dot.cu:1815-1848`) admits both, and the
+comment above those two lines names this artifact, its 82 + 3 tensors, and the
+consequence: "which is why that model shipped as `--device cpu`". W9c-3a
+(`CLAIM-GLM53-FLASH-W9C3A`, issue
+[#2464](https://github.com/mudler/vllm.cpp/issues/2464)) is the wave that spends
+the discharge. O19 is narrowed to its residency half and O41 records the pattern,
+because this is the SECOND inherited block this row has carried past its own
+expiry.
+
+**One arm of eleven is on the device, and O40 names the other ten.** The routed-
+expert keep-quant GEMM now runs on the GPU against banks made resident through
+`dense_attn::ResidentWeight`, reached from `ModelRegistry::Forward` on
+`--device cuda`. The KDA recurrence, the k-pool indexer, the eager MLA
+attention, both mHC sites, the router, the MLPs, the embedding gather and the
+`lm_head` all still run on the host, through a CPU queue the forward interposes.
+That is a staged slice with a named owner, not a device arm.
+
+**The rest of the arm is now PRICED off the two siblings that have one rather
+than estimated.** `kimi_linear_device.cpp` is 2,539 lines and
+`nemotron_h_device.cpp` is 2,144, both MLA + linear-attention hybrids like this
+row; this model additionally owes mHC (O34) and W9c-0's two k-pool ops (O36). A
+`glm5_next_device.cpp` in the house shape is a 2,500-3,500-line port. §W9c-3a
+also re-prices W9c-1 and it stays REFUSED for one more reason its own section
+did not name: `MlaBlockWeights` wants `w_uk_t`/`w_uv` as bf16 tensors absorbed
+at LOAD (`glm_moe_dsa_loader.cpp:223-272`), and this row's loader has no
+analogue, so the MLA route owes a loader change before it owes a call site.
+
+**No number here is a vLLM comparison.** vLLM implements `glm5_next` at no
+revision (O38), so the only denominator available is our own CPU arm on the same
+box, and every figure this wave reports is labelled that way.
+
+The next actions are W9c-2 and W9c-3 on top of this slice, then W9b for the
+non-expert tower, with W6 and W7b behind them.
+
+### Before W9c-3a
 
 `ACTIVE`, 2026-09-01. **THE SENTENCE THIS ROW HAS REPEATED FOR FOUR WAVES WAS
 FALSE, and W5b-2d is what makes it true.** Every `## Now` below says

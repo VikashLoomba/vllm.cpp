@@ -1,11 +1,46 @@
-# `qwen4_exp` CUDA decode: the n-gram history is read before its copy lands
+# `qwen4_exp` CUDA decode: an undrained n-gram history read — REAL, and MEASURED NOT TO BE #2496
 
-**Row:** `QWEN4EXP-TOKENDIV-2496`
+**Row:** `MODEL-MM-QWEN4-EXP` (wave TOKENDIV; the branch is
+`row/QWEN4EXP-TOKENDIV-2496`, the owning row is the campaign row named in the
+issue's own `Row:` line)
 **Issue:** [#2496](https://github.com/mudler/vllm.cpp/issues/2496)
 **Sibling:** [#2476](https://github.com/mudler/vllm.cpp/issues/2476) — the illegal
 memory access that `CUDA_LAUNCH_BLOCKING=1` suppresses. This spec says what it
 does and does not claim about that one.
 **State:** `ACTIVE`
+
+## THE HEADLINE RESULT: THIS IS NOT #2496's CAUSE
+
+Measured on `thor:gpu0` 2026-09-01, job `2b8df779`, binary
+`127b2c6a6c0a2c00b648b6e3b6fca33fc6e0ef2a0be58592031a9bac13169b32` built from
+`895d2c430` with the drain asserted present in the source (`drains=2`):
+
+```
+CPU-CTRL  (--device cpu,  re-taken in this lease) : 11751 13 15767 411 2029 11 1092 369
+CUDA-FIX  (--device cuda, CUDA_LAUNCH_BLOCKING=1) : 11751 271 271 271 271 271 0 0
+```
+
+The CUDA arm WITH this fix is **byte-identical to the #2496 measurement**, which
+was taken on a DIFFERENT binary
+(`70e522df28d7748d8925ce9fc54dffd4909b3e8fd53d72fafd87bb13bed62056`) built from a
+DIFFERENT tree (`e934fb002`). This change moved nothing at all in the output.
+
+**Two conclusions follow, and the second is the more useful one.**
+
+1. The hypothesis this spec was written on is FALSIFIED as the cause of #2496.
+   The hazard below is real and is proven real by a red-then-green mutation, but
+   on this hardware the undrained read was in practice landing before the host
+   read it, so it is LATENT rather than active.
+2. #2496 is DETERMINISTIC and reproduces bit-for-bit across two independent
+   builds of two different trees. That rules out the whole async-copy and
+   ordering class — including this one — as its cause, because a race does not
+   reproduce byte-identical garbage across builds. The cause is structural, and
+   it is upstream of the PLE block: the released `layer_types` makes layers 0-2
+   `linear_attention` and `ple_layer_ids` is `[2]`, so the order within a step is
+   layer 0 GDN, layer 1 PLE, layer 2 GDN, layer 3 QSA.
+
+This spec therefore lands a latent-hazard fix and its gate, and does NOT close
+#2496. The token work is handed to the GDN projection over-read.
 
 ## Scope
 
@@ -18,7 +53,7 @@ Out of scope, each named under `## Owed`: the illegal access of #2476 (this
 spec's fix is a candidate for it and is not asserted to be it), the `q_f32`
 query-path width (#2488, #2502), and any throughput claim.
 
-## The defect
+## The hazard this DOES close (latent, not #2496)
 
 `src/vllm/model_executor/models/qwen4_exp_ple_block.cpp`, one site, two hazards.
 Both are live only when the n-gram history cache is NOT host-resident, which on
@@ -133,11 +168,20 @@ branch, so the CPU arm is byte-identical.
 
 ## Gates
 
-The completion condition is the GPU emitting the CPU control sequence
-`11751 13 15767 411 2029 11 1092 369`, not merely emitting tokens.
+The completion condition for #2496 is the GPU emitting the CPU control sequence
+`11751 13 15767 411 2029 11 1092 369`. **IT IS NOT MET AND THIS CHANGE DOES NOT
+MEET IT** — see the headline result. What is gated here is the hazard alone:
+`test_qwen4_exp_ple_block`, red before and green after over a backend whose
+host-bound copies enqueue.
 
 ## Owed
 
+- **#2496 ITSELF, which this does not fix.** The next hypothesis is the GDN QKVZ
+  projection over-read in layer 0, which is upstream of this site and which a
+  sibling wave is chasing. Whatever explains #2496 has to explain a byte-identical
+  degenerate sequence across two builds AND a correct token 0, so it is
+  structural and its extent must depend on the token count (5 at prefill, 1 at
+  decode) rather than on timing.
 - The measurement that says whether H2 is #2476's illegal access. Not claimed.
 - The `q_f32` query-path width (`qwen4_exp_qsa_block.cpp:694`). vLLM keeps the
   query at the model dtype; this tree widens it to f32 and hands it to

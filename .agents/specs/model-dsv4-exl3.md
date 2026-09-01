@@ -2435,7 +2435,40 @@ which is precisely how this landed green locally in the first place.
   per-linear guard already no-ops. It is there for the ~28k redundant predicate
   reads per CPU forward, not for semantics.
 
-  **The upload itself is UNPROVEN on a host-only lane and must not be claimed
+  **THE UPLOAD IS PROVEN ON HARDWARE (2026-09-01), AND THE COMPUTE IS NOT.**
+  Measured under an `rc` lease on `thor:gpu0` (Jetson Thor, **sm_110** -- the
+  arch is DERIVED from `nvidia-smi` now, because the first script hardcoded
+  dgx's 121 and a wrong arch does not fail loudly, it builds kernels the device
+  cannot launch), source `693f17e08`, CUDA build, 27 cases and 90,077 assertions.
+
+  Case 1, `the EXL3 tower stages to CUDA`, PASSES on the device:
+
+  | assertion | value |
+  |---|---|
+  | bytes uploaded | `304128 > 0` |
+  | `device_staged` / tower staged | `true` / `true` |
+  | `d_trellis.d_dev` | `0x32a800000` (a device pointer) |
+  | `d_suh.d_dev` / `d_svh.d_dev` | `0x32a80c000` / `0x32a80c200` |
+  | host `trellis/suh/svh.capacity()` | `0` -- the host bytes are GONE |
+  | the staging borrows | dropped |
+
+  So the tower reaches device memory and the host copy is released, which is
+  exactly what W2 owed and what no host lane could show.
+
+  Case 2, `the EXL3 routed experts COMPUTE on CUDA and agree with the CPU arm`,
+  **CRASHES**: `terminate called after throwing an instance of
+  'std::runtime_error', what(): vt cuda: cudaStreamDestroy: an illegal memory
+  access was encountered` (SIGABRT). `cudaStreamDestroy` is where the fault
+  SURFACED, not where it happened -- CUDA reports an asynchronous fault at the
+  next synchronising call -- so the kernel and address are being located with
+  `compute-sanitizer` rather than guessed at.
+
+  **W2 is therefore NOT done, and the residency half must not be read as the
+  whole** ([#2458](https://github.com/mudler/vllm.cpp/issues/2458)). Staging works; the experts do not yet compute on the device. The
+  refusal that stood before this change is gone, so what replaced a loud refusal
+  is currently a crash rather than a wrong answer -- loud, but not correct.
+
+  **The upload was UNPROVEN on a host-only lane and must not be claimed
   from one.** `test_cuda_deepseek_v4.cpp` carries the two cases that prove it --
   bytes moved, `d_dev` non-null, host `capacity() == 0`, and the CUDA forward
   agreeing with the CPU forward through `DeepseekV4Model::Forward` -- and on a

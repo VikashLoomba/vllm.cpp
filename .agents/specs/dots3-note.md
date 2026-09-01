@@ -4149,6 +4149,17 @@ GPU lease was taken and no number below is a performance number.
 | `test_dots3_note_scaffold` | 26 cases, **110835 assertions**, 0 failed |
 | `test_dots3_note_attn` | 51 cases, **6888 assertions**, 0 failed |
 | `test_openai_api_server_mm_forward` (Qwen3-VL, untouched) | 9 cases, **73 assertions**, 0 failed |
+| `test_model_registry` (repaired here) | 24 cases, **993 assertions**, 0 failed |
+| **the FULL gate** — `ninja` all 1375 targets then `ctest -j 2` | **702/702, 0 failed**, 7 skipped for absent checkpoints, `CTEST_RC=0`, 931 s |
+| `scripts/agent-preflight.sh` | rc 0 |
+| `check-commit-style.py` / `check-commit-trailers.py` over `$(git merge-base origin/main HEAD)..HEAD` | rc 0 / rc 0 |
+
+**The full gate found one thing reading did not.** `test_model_registry`'s
+`registry_model_property` partitions every registration into hybrid,
+multimodal-non-hybrid and text-only and asserts `supports_multimodal` per branch;
+W5 had moved `Dots3NoteForCausalLM` into the text-only branch, and W6a's flag flip
+made it red. It is repaired here, and its comment records the true -> false ->
+true round trip rather than erasing it.
 
 **The consistency measurement.** The tower against the independent
 double-precision reference: `max |diff| 0.0533141 over a scale of 6.31441 =>

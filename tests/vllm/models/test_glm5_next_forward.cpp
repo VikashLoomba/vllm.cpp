@@ -77,6 +77,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"      // ForwardLogits, *KvCache
 #include "vllm/v1/attention/backend.h"               // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"     // GDNAttentionMetadata
+#include "vt/backend.h"  // W9c-3a: vt::TryGetBackend
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
@@ -721,20 +722,53 @@ TEST_CASE("glm5_next forward: a TIED head reads the embedding table") {
 
 // ═══ (4) the narrow refusals ═══════════════════════════════════════════════
 
-TEST_CASE("glm5_next forward: a NON-CPU queue is refused BY NAME") {
-  // Every buffer on this path is a host `std::vector<float>` and
-  // `vt::MoeRouterTopK` dispatches on the queue's device, so a device queue
-  // here hands a kernel host pointers. That is a crash and not a fallback, and
-  // a refusal is what stands between the two.
+TEST_CASE("glm5_next forward W9c-3a: the queue is SPLIT, and a device that is "
+          "neither CPU nor CUDA is refused BY NAME") {
+  // W9c-3a replaced the blanket non-CPU refusal. The premise it stood on is
+  // unchanged and is now asserted one level down (`MoeExpertsKeepQuant`'s host
+  // arm refuses a non-CPU queue): nearly every buffer on this path is a host
+  // `std::vector<float>`, and the ops dispatch on the queue's device. What
+  // changed is that ONE arm can put its operands on a device, so the forward
+  // interposes a CPU queue for the rest instead of refusing the step.
+  //
+  // Two things must still be refused, and this case is both of them.
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
-  Step step({1, 2});
-  step.queue = vt::Queue{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
-  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
-                       doctest::Contains("non-CPU queue"), std::runtime_error);
-  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
-                       doctest::Contains("#2241"), std::runtime_error);
+
+  SUBCASE("a device with no provider for the two grouped ops") {
+    // kMETAL has neither a CPU-alias arm nor a registered
+    // `kMoeGateUpSwiGLUGrouped`. Refusing here names this model and the two
+    // ops; letting it through would throw from inside an op about a device
+    // type, several frames from anything a reader could act on.
+    Step step({1, 2});
+    step.queue = vt::Queue{vt::Device{vt::DeviceType::kMETAL, 0}, nullptr};
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("--device cpu or --device cuda"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("#2464"), std::runtime_error);
+  }
+
+  SUBCASE("a CUDA queue in a build with no CUDA backend") {
+    // On a CPU-only build this is the arm a `--device cuda` step takes, and the
+    // message says "build without CUDA" rather than throwing out of the backend
+    // registry about a device type. On a CUDA build the same step proceeds --
+    // which is what the `dgx:gpu0` end-to-end leg measures, and what this host
+    // lane cannot.
+    Step step({1, 2});
+    step.queue = vt::Queue{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
+    if (vt::TryGetBackend(vt::Device{vt::DeviceType::kCUDA, 0}) == nullptr) {
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("no CUDA backend is registered"),
+                           std::runtime_error);
+    }
+  }
+
+  SUBCASE("a CPU queue is NOT refused, so the split is not a blanket") {
+    Step step({1, 2});
+    CHECK_NOTHROW(vllm::ModelRegistry::Forward(*model, step.Get()));
+  }
 }
 
 TEST_CASE("glm5_next forward: a MULTI-REQUEST step is refused BY NAME") {

@@ -1041,27 +1041,48 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     Muse Glimmer on 2026-08-08, well after the parity pin `555967922`
     (2026-07-26). There is no `muse_glimmer` code at the pin — `grep -ril
     'muse\|glimmer' vllm/model_executor/models/` at the pin returns nothing —
-    and none on vLLM `main` either. The ONLY upstream implementation is
-    [vllm#51655](https://github.com/vllm-project/vllm/pull/51655), OPEN and
-    approved but unmerged, with 3 of 20 CI checks red, at head `075d645af`
-    (a descendant of the pin). Every `file:line` this row cites therefore points
+    and none on vLLM `main` either. The upstream implementation is
+    [vllm#51655](https://github.com/vllm-project/vllm/pull/51655). When this row
+    landed it was OPEN and approved but unmerged, with 3 of 20 CI checks red, at
+    head `075d645af` (a descendant of the pin). **It MERGED on 2026-08-14 as the
+    squash `6adad08767`**, `Add Muse Glimmer model support (#51655)`, which is an
+    ancestor of the sync target `cdefd9d499` (verified with `git merge-base
+    --is-ancestor`, and `MuseGlimmerForCausalLM` is absent from `registry.py` at
+    the pin and present exactly once at the target). Every `file:line` this row cites therefore points
     at a **branch head, not the pin** — a deliberate exception to "port from the
     pinned oracle", taken on explicit developer direction (2026-08-10). It is
     recorded here, and argued for in the commit that introduced it, because no
     checker enforces the anchor rule and the waiver registry has since been
     retired (`a4f72f86`): an exception now lives in the commit message that
     needs it, attached to the diff it excuses. Consequences, all binding while this stands:
-    (a) the anchor is mutable — a force-push or review round on #51655 rewrites
-    what we cite, so the fetched ref is kept and re-diffed before every
-    re-anchor; (b) upstream's own gates have NOT fully passed, so where our
-    HF-reference gate disagrees with #51655 the HF reference wins and the
-    divergence is reported upstream rather than mirrored; (c) **no speed axis is
-    claimable for this model** — the pinned oracle cannot load `muse_glimmer`
-    at all (and the checkpoint wants transformers 5.15.0.dev0 vs the pin's
-    5.14.1), so there is no honest denominator and every performance axis is an
-    OPEN GAP by construction, not a waived one. The exception is discharged by
-    #51655 merging plus a pin advance that includes it; until then the row
-    carries this deviation. Scope and gates: [muse-glimmer
+    (a) **DISCHARGED by the merge.** "The anchor is mutable — a force-push or
+    review round on #51655 rewrites what we cite" was true of a branch head. A
+    merged squash is immutable, so the re-diff-before-re-anchor duty ends.
+    (b) **DISCHARGED by the merge.** "Upstream's own gates have NOT fully passed,
+    so where our HF-reference gate disagrees with #51655 the HF reference wins"
+    was true while the pull request was red. The merged commit passed upstream's
+    gates, and under AGENTS.md vLLM then outranks the HF reference.
+    (c) **STILL BINDING, and it is the one consequence the pin advance does not
+    discharge on its own.** "No speed axis is claimable for this model" is TRUE
+    AT THE PIN and FALSE AT THE TARGET: the pinned oracle cannot load
+    `muse_glimmer` at all, so at `555967922` there is no honest denominator and
+    every performance axis is an OPEN GAP by construction rather than a waived
+    one. At `cdefd9d499` the architecture is registered and a denominator becomes
+    obtainable, so the axis stops being closed by construction and becomes merely
+    unmeasured. It does NOT open on the pin advance alone: a denominator needs a
+    gateable oracle, and `cdefd9d499` is `gateable = no` until somebody builds it
+    and runs the model (#2524). Until that measurement exists, quote no speed
+    number for this model and cite this line rather than the pin.
+    **Anchor drift, measured 2026-09-01.** Our port is anchored on the UNMERGED
+    branch head `075d645af6`, not on the merge. `muse_glimmer.py` moves +93/-46
+    between that head and the target, of which +54/-30 lands in the 6 commits
+    after the merge (`76f3249fbd`, `8c2bbe00d5`, `ebcd606467`, `0b19ebcacd`,
+    `b00f475f09`, `deeeae75d0`). Re-anchoring onto `6adad08767` and then onto the
+    target is owed by #2524; it is not done here, because this cycle does not
+    advance the pin.
+    The exception is discharged by #51655 merging plus a pin advance that
+    includes it. **The first half is met.** The second half is what the cycle in
+    #2524 prepares, so the row still carries this deviation. Scope and gates: [muse-glimmer
     spec](specs/muse-glimmer.md) §0.
 17. **From-necessity dense non-causal CROSS attention (`vt::OpId::kAttentionCross`,
     2026-08-11, `MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model` phase L2,
@@ -1634,7 +1655,20 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     (a) this row does **not** advance the pin and reconciles nothing else in the
     `555967922..ad5d29db7` range — the next [upstream-sync](upstream-sync.md)
     cycle reconciles it deliberately, and until then a Qwen3.5 change must check
-    both anchors; (b) **no token or speed axis is claimable for
+    both anchors. **Status 2026-09-01: the anchor is confirmed real, reachable
+    and merged.** `ad5d29db70` is the merged squash of vllm#50210, dated
+    2026-07-29, and it IS an ancestor of the sync target `cdefd9d499` (verified
+    with `git merge-base --is-ancestor`; both `Qwen3_5ForCausalLM` and
+    `Qwen3_5MoeForCausalLM` are absent from `registry.py` at the pin and present
+    exactly once at the target). A first pass of the `cdefd9d499` sync report
+    recorded that `ad5d29db7` "is not an ancestor of the target, for the same
+    squash reason"; that was an artefact of a shallow reference checkout, in
+    which `merge-base --is-ancestor` answers no for an unreachable object, and it
+    is retracted. **The anchor is now BEHIND the target rather than off it**: 8
+    commits touch `qwen3_5.py` after `ad5d29db70`, +60/-22 (`d154d90d6c`,
+    `1fe3a1571a`, `5a4c8d9924`, `88b2bff2c6`, `80d6d557f3`, `f2bfad9167`,
+    `febea17f6a`, `0601850791`). Re-anchoring is owed by #2524 and is not done
+    here, because this cycle does not advance the pin; (b) **no token or speed axis is claimable for
     `Qwen/Qwen3.8-2.4T-A95B`** — 2.4T bf16 is ~4.8 TB and the released FP8
     variant ~2.4 TB against GB10's 128 GB unified, so the run gate for that
     checkpoint is OWED (both rows are `PARTIAL`, never `DONE`, and
@@ -1757,9 +1791,23 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     is recorded here, and argued for in the commit that introduced it,
     because no checker enforces the anchor rule. Consequences, binding while
     this stands: (a) this row advances nothing in `555967922..main` and the
-    next [upstream-sync](upstream-sync.md) cycle reconciles it deliberately;
+    next [upstream-sync](upstream-sync.md) cycle reconciles it deliberately.
+    **Status 2026-09-01: the origin commit is identified.** vllm#51255 merged on
+    2026-08-12 as `9035151d6c`, `[Model] Add native Dots3 NOTE multimodal
+    support`, an ancestor of the sync target `cdefd9d499` (verified with `git
+    merge-base --is-ancestor`; `Dots3NoteForCausalLM` is absent from
+    `registry.py` at the pin and present exactly once at the target).
+    Reconciliation onto the target is owed by #2524 and is not done here,
+    because this cycle does not advance the pin;
     (b) upstream is STILL MOVING here — vllm#52172 landed 2026-08-13 — so a
-    dots3 change re-reads its anchors rather than trusting a cited line;
+    dots3 change re-reads its anchors rather than trusting a cited line.
+    **That warning stayed correct, and it is now measured.** Exactly one commit
+    touches `vllm/models/dots3_note/` after W3's re-read at `06ecec7a84`:
+    `da0b2d8b17` vllm#53517 `[Performance] Optimize Dots3 NOTE runtime`, +92/-85
+    over five files (`nvidia/attention.py`, `nvidia/model.py`, `nvidia/mtp.py`,
+    `nvidia/vision.py`, `nvidia/vision_attention.py`). W3's anchors therefore
+    predate the current upstream content, and a dots3 change re-reads at the
+    revision it names rather than inheriting W3's;
     (c) **no token, throughput, latency or memory number is claimable for
     this model on any axis**, and that is a memory ceiling rather than a
     scheduling gap: `dots-studio/dots3-note-prev` is ~576 GB bf16 and its

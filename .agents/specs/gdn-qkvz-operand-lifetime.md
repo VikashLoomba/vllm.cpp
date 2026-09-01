@@ -34,10 +34,18 @@ Facts that constrain the diagnosis, read off `server.log`:
   `ProjectGdnQkvz` <- `GdnBlockPaged` <- `Qwen4ExpTextModelForward` <-
   `ModelRegistry::Forward`.
 - The reports are **block 17 threads 128..159, then block 18 threads 128..135**
-  (`--print-limit 40` truncates there). Blocks 0..16 do not fault. At the
-  released geometry `conv_dim = 2*16*128 + 48*128 = 10240`, so the col-major
-  `M` axis of this GEMM is 10240 and a 512-wide tile ladder has 20 blocks: the
-  first ~17 tiles of the operand are addressable and the tail is not.
+  (`--print-limit 40` truncates there). No lower block index appears before
+  them. At the released geometry `conv_dim = 2*16*128 + 48*128 = 10240`, so the
+  col-major `M` axis of this GEMM is 10240 and a 512-wide tile ladder has 20
+  blocks.
+
+  READ THAT AS A SHAPE, NOT AS AN ADDRESS. It says the fault is PARTIAL — some
+  of the operand is addressable and some of it is not — which is what a
+  contiguous freed-and-partly-remapped range looks like and what a wholly
+  invalid base pointer does not. It does NOT establish which rows are missing:
+  the block-index-to-operand-row mapping of a closed-source `nvjet` kernel is
+  not published, and `--print-limit` truncated the report. Nothing below depends
+  on the row number.
 - `[vt load] w0f-alias per-call totals` grows `rehomed` by about 1 GiB on
   **every** step (3.381 -> 3.673 -> ... -> 6.079 -> 6.406 GiB). A weight that
   has been re-homed once is 256-byte aligned and takes the

@@ -8,7 +8,9 @@ the CUDA row-gather codec set this change has to extend in step.
 
 ## Now
 
-`ACTIVE`.
+`READY`. The reader, the vt dtype, the CPU row decoder and the CUDA gather
+codec have landed; the keep-quant `vec_dot` pair is `## Owed` and #2510 stays
+open for it.
 
 ## The gap, as measured on `6bf3abb58`
 
@@ -256,11 +258,166 @@ dequant-only harness never calls; each aborts, so a stub cannot quietly
 contribute to a golden value. The harness prints the oracle's own
 `sizeof(block_iq3_s)`, which is where the 110 in the reader trait comes from.
 
+**The CUDA gather codec is checked, and it is checked HONESTLY.** This host
+carries no CUDA toolkit and no NVIDIA device, so `DqIQ3_S` cannot be compiled by
+`nvcc` here and no CUDA gate is claimed. What IS measured is a HOST
+TRANSLITERATION: the `struct DqIQ3_S` body is extracted verbatim from
+`cuda_quant_dequant.cuh`, the CUDA qualifiers and the two device symbols it
+reads (`d_iq3s_grid`, `d_kmask_iq2xs`) are re-declared for the host, and the
+result is run over the same four golden blocks. It agrees with the oracle
+**1024 of 1024 values, bit-exactly**. That is a logic and syntax check on the
+body, not a verdict on the device arm; the device verdict is owed and named as
+such.
+
 Inputs: the first 440 bytes (four whole blocks) of `blk.11.ffn_gate.weight` at
 absolute offset 4,262,628,128 in
 `/mnt/nas_share/rc/ckpt/qwen38-27b-ud-q4km/Qwen3.8-27B-UD-Q4_K_M.gguf`
 (sha256 `322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`) —
 the exact tensor `GgufFile::Open` refuses today.
+
+## Result
+
+Measured on this branch, x86_64, Debug, `-DVLLM_ENABLE_CUDA=OFF`, clean build
+with zero warnings.
+
+**RED, before the reader case, for the intended reason:**
+
+```text
+TEST CASE:  DequantGgufRowToF32 IQ3_S row matches the pinned oracle
+  ERROR: test case THREW exception: gguf: unknown ggml type id 21
+TEST CASE:  GgufFile reads an IQ3_S tensor and it dequants
+  ERROR: test case THREW exception: gguf: tensor "blk.11.ffn_gate.weight"
+         has unknown ggml type id 21 in /tmp/vllm_gguf_test_...gguf
+[doctest] test cases: 2 | 0 passed | 2 failed | 25 skipped
+[doctest] assertions: 0 | 0 passed | 0 failed |
+```
+
+That second line is the message #2510 reports verbatim.
+
+**The same red and green ON THE REAL ARTIFACT, not only on a synthetic block.**
+A synthetic fixture proves the decoder; it cannot prove the file the issue names
+now opens. `examples/dump_container` calls `vllm::GgufFile::Open` -- the exact
+function that threw -- and prints one line per tensor. Run against
+`/mnt/nas_share/rc/ckpt/qwen38-27b-ud-q4km/Qwen3.8-27B-UD-Q4_K_M.gguf`
+(16,464,440,224 B, sha256 `322e194f...123482`), reading only the header and a
+64 KiB prefix per tensor through the mmap, never copying the 16 GB:
+
+```text
+# base reader (case 21 reverted, one TU rebuilt, same binary otherwise)
+$ dump_container .../Qwen3.8-27B-UD-Q4_K_M.gguf
+dump_container: gguf: tensor "blk.11.ffn_gate.weight" has unknown ggml type id 21
+  in /mnt/nas_share/rc/ckpt/qwen38-27b-ud-q4km/Qwen3.8-27B-UD-Q4_K_M.gguf
+EXIT=1
+
+# this branch
+$ dump_container .../Qwen3.8-27B-UD-Q4_K_M.gguf
+blk.11.ffn_gate.weight IQ3_S [17408,5120] 38297600 f73a86bd...
+blk.14.ffn_down.weight IQ3_S [5120,17408] 38297600 4a482429...
+blk.15.ffn_down.weight IQ3_S [5120,17408] 38297600 759b5656...
+blk.17.ffn_down.weight IQ3_S [5120,17408] 38297600 66c38045...
+TOTAL 866 tensors
+EXIT=0
+```
+
+The reader was restored byte-for-byte afterwards and the manifest re-run is
+byte-identical to the green above.
+
+**The manifest agrees with an INDEPENDENT census.** A standalone Python GGUF
+header parser (not this reader) counts the same 866 tensors and the same
+per-type totals, so the C++ side is checked against something that shares no
+code with it:
+
+| ggml id | type | count |
+|---|---|---|
+| 0 | F32 | 360 |
+| 13 | Q5_K | 131 |
+| 23 | IQ4_XS | 117 |
+| 8 | Q8_0 | 106 |
+| 12 | Q4_K | 104 |
+| 14 | Q6_K | 30 |
+| 11 | Q3_K | 7 |
+| 20 | IQ4_NL | 7 |
+| **21** | **IQ3_S** | **4** |
+
+862 of the 866 were already handled; the 4 that were not refused the other 862.
+Both sides also agree on 38,297,600 B per IQ3_S tensor, which is
+`89,128,960 / 256 * 110` -- the block geometry this change adds, arrived at from
+the file's own byte layout rather than from the struct.
+
+**GREEN, after:**
+
+```text
+[doctest] test cases:    2 |    2 passed | 0 failed | 25 skipped
+[doctest] assertions: 2052 | 2052 passed | 0 failed |
+```
+
+Every affected suite, whole:
+
+| Suite | Cases | Assertions |
+|---|---|---|
+| `test_gguf_dequant` | 27/27 | 9,452 |
+| `test_gguf` | 36/36 | 133 |
+| `test_ops_quant_traits` | 10/10 | 6,220 |
+| `test_ops_quant_dot` | 33/33 | 253,314 |
+| `test_gguf_keep_quant` | 46/46 | 10,301 |
+| `test_glm5_next_bridge` | 20/20 | 32,563 |
+| `test_cuda_embedding_quant` | exit 77 SKIPPED | no CUDA backend on this host, and it SAYS so rather than printing a 0-assertion pass |
+
+**Mutations.** Each was applied, built, measured, and the tree restored and
+re-verified by `md5sum` and by a re-run.
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | `kIq3sGrid` -> `kIq3xxsGrid` in `DequantIQ3_S` | 2048 of 2052 assertions FAIL |
+| M2 | odd-lane shift `(7 - 2*l)` -> `(8 - 2*l)`, dropping the ninth-bit asymmetry | 358 of 2052 FAIL |
+| M3 | IQ2-family scale `d*(0.5+ls)*0.25` in place of `d*(1+2*ls)` | 2048 of 2052 FAIL |
+| M4 | REACHABILITY: delete `FindGgmlTraits` case 21 | both cases THROW `unknown ggml type id 21` |
+| M5 | give IQ3_S a `vec_dot` row so `HasQuantDotKernel` flips true | `test_ops_quant_traits` 1 case / 2 assertions FAIL, `test_gguf_keep_quant` 1 case / 8 assertions FAIL |
+
+M2 is the one worth reading twice. A symmetric shift pair leaves 1694 of 2052
+values correct, so it is exactly the defect a spot check or a tolerance would
+pass; only the bit-exact comparison over a golden set carrying 73 high-bit
+indices catches it. M4 is the reachability proof this row owes: the smallest
+failing test enters through `GgufFile::Open`, the production entry point, and
+deleting that call site reds it. M5 is the proof that the expand-bf16
+disposition in `## Per-tier compute disposition` is asserted rather than merely
+described.
+
+The staged artifact's SHA-256 was re-derived locally over all 16,464,440,224
+bytes and equals
+`322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482`, the value
+#2510 reports.
+
+**`scripts/agent-preflight.sh --staged`:** 34 of 34 record gates `ok`,
+`tree-compiles` `ok` at 808 of 808 translation units in scope, `commit-trailers`
+and `commit-style` `ok`, 5 gates SKIPPED (`check-arm-isa-build`,
+`check-cpu-isa-build`, `check-cuda-fat-gencode`, `check-pr-size`,
+`check-triton-aot-multiarch` — each a pre-existing arch or argument skip this
+change neither causes nor repairs, and the run therefore prints `NOT a green
+preflight`).
+
+**One gate failed, and it is the host and not this change:
+`test_cpu_x86_llamacpp_floor`.** It is a benchmark HARNESS test that refuses to
+measure a contended box, and it printed its own reason: `NO_QUIET_WINDOW after
+30s (busy=127% builders=0 load=48.06 67.13 55.68)`. Three facts pin the
+attribution rather than assert it.
+
+1. The file is byte-identical to `6bf3abb58`'s
+   (`md5 7c7cc2fefc8242eb96af9cd737ba75ba` on both sides), it drives
+   `scripts/cpu-x86-llamacpp-floor.sh`, and `git diff 6bf3abb58..HEAD --
+   scripts/ tests/scripts/` is EMPTY. Nothing in this change is reachable from
+   it.
+2. **The failing test MOVED between runs.** At load 43 the failure was
+   `test_a_contended_leg_is_discarded_and_never_summarised` (rc 4 where 2 was
+   expected); at load 48 it was
+   `test_g5_load_is_recorded_before_and_after_every_leg` (rc 4 where 0 was
+   expected). A defect does not migrate across cases with the load average.
+3. **It passes on the identical tree once the box quiets:** `Ran 10 tests in
+   4.827s ... OK`, exit 0, at load 14.17 — against 263.674 s and a failure at
+   load 48. The 55x wall-clock difference IS the contention the harness is
+   refusing to measure through.
+
+No other gate failed.
 
 ## Owed
 

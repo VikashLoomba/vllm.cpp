@@ -577,8 +577,14 @@ __global__ __launch_bounds__(32) void had_ff_r_128_kernel(const float* __restric
 
 // ── the pipelined tile loop (exl3_gemm_inner.cuh:22-733) ─────────────────────
 
+// SHMEM_OUT_HAD is upstream's `shmem_out_had` (exl3_gemm_inner.cuh:22). It
+// selects the epilogue: `true` stages the finished tile in shared memory and
+// applies the output Hadamard against `post_scale`; `false` stores the f32
+// accumulator straight to global memory as fp16. Only the caller knows whether
+// a `post_scale` exists, so the branch is a template parameter and not a
+// run-time test on the pointer.
 template <int bits, bool c_fp32, int cb, int TILESIZE_M, int TILESIZE_K, int TILESIZE_N,
-          int SH_STAGES, int FRAG_STAGES>
+          int SH_STAGES, int FRAG_STAGES, bool SHMEM_OUT_HAD>
 __device__ inline void exl3_gemm_kernel_inner(const half* __restrict__ A,
                                               const uint16_t* __restrict__ B,
                                               void* __restrict__ C, const int size_m,
@@ -995,9 +1001,20 @@ __device__ inline void exl3_gemm_kernel_inner(const half* __restrict__ A,
     bool last = lock_i + lock_d == tiles_k;
     if (!sub_k && !first) read_sum_gl();
     if (!sub_k && !last) write_sum_gl();
-    if (!sub_k && last) write_sum_tile_sh();
-    if (last) __syncthreads();
-    if (!sub_k && last) output_had_sh_gl();
+    // exl3_gemm_inner.cuh:610-623. The last block in the column stages the tile
+    // for the output Hadamard only when the caller supplied a `post_scale`.
+    // Without one it takes the same global store as the intermediate blocks,
+    // which rounds the f32 accumulator to fp16 through __floats2half2_rn.
+    if (!sub_k && last) {
+      if constexpr (SHMEM_OUT_HAD)
+        write_sum_tile_sh();
+      else
+        write_sum_gl();
+    }
+    if constexpr (SHMEM_OUT_HAD) {
+      if (last) __syncthreads();
+      if (!sub_k && last) output_had_sh_gl();
+    }
     barrier_release(lock, lock_d, last);
     clear_frag_c();
   };
@@ -1103,9 +1120,11 @@ __global__ __launch_bounds__(kBaseThreads* TILESIZE_K / 16) void exl3_gemm_kerne
   void* C_ = C;
 
   while (size_m_ > 0) {
+    // exl3_gemm_kernel.cuh:40 instantiates shmem_out_had = true here, and `svh`
+    // is the post_scale the output Hadamard reads.
     exl3_gemm_kernel_inner<bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES,
-                           FRAG_STAGES>(A_, B, C_, EXL3_MIN(size_m_, 16), size_k, size_n, locks,
-                                        svh);
+                           FRAG_STAGES, true>(A_, B, C_, EXL3_MIN(size_m_, 16), size_k, size_n,
+                                              locks, svh);
     A_ += 16 * size_k;
     if constexpr (c_fp32)
       C_ = static_cast<void*>(static_cast<float*>(C_) + 16 * size_n);
@@ -1677,8 +1696,10 @@ __global__ __launch_bounds__(kBaseThreads* kMoeTilesizeK / 16) void exl3_moe_ker
       (void)K;
       int size_m = token_count;
       while (size_m > 0) {
+        // exl3_moe_kernel.cuh:138 and :212 instantiate shmem_out_had = false in
+        // both MoE bands, which is what makes the NULL post_scale legal.
         exl3_gemm_kernel_inner<bits, false, cb, kMoeTilesizeM, kMoeTilesizeK, MOE_TILESIZE_N,
-                               kMoeShStages, kMoeFragStages>(
+                               kMoeShStages, kMoeFragStages, false>(
             in_addr, trellis, static_cast<void*>(out_addr), EXL3_MIN(size_m, 16), size_k, size_n,
             locks, nullptr);
         in_addr += 16 * size_k;

@@ -1382,16 +1382,6 @@ bool Dsv4Exl3FusedMoe() {
   return on;
 }
 
-// EXPLICITLY '1', not merely "not '0'". The default-ON flag above cannot express
-// "the operator asked for the fused arm on a device queue", because absence and
-// consent look identical to it. #2458 needs that distinction: the fused arm is
-// off by default on a device queue and an operator can still demand it.
-bool Dsv4Exl3FusedMoeForcedOn() {
-  static const bool forced =
-      Dsv4Exl3FusedMoeForcedOnFlag(std::getenv("VT_DSV4_EXL3_FUSED_MOE"));
-  return forced;
-}
-
 // ── MODEL-DSV4-EXL3 W2d: the fused routed-expert pass ────────────────────────
 //
 // `vt::Exl3MoeMlp` replaces `3 * topk * T` `vt::Exl3Gemm` calls with one. Its
@@ -1803,31 +1793,16 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   //    keep-quant tower and a trellis tower cannot have its routed experts
   //    accumulated twice.
   std::vector<char> exl3_fused_expert;
-  // THE FUSED ARM IS HOST-ONLY UNTIL #2458, AND THAT IS A MEASUREMENT, NOT A
-  // PREFERENCE. On a device queue `vt::Exl3MoeMlp` faults: `compute-sanitizer`
-  // on `thor:gpu0` puts it inside `exl3_moe_kernel<3, 256, 1>` as an 8-byte read
-  // at `base + tid*8` with base NULL, while `VT_DSV4_EXL3_MOE_TRACE=1` shows
-  // every operand it was handed is non-null and every routing count consistent.
-  // The per-expert loop arm on the SAME queue is bit-exact against the CPU arm
-  // (`max |diff| = 0`, 5/5), so this selects the arm that is proven rather than
-  // the arm that is faster-in-principle.
-  //
-  // WHY THE KERNEL AND NOT THE CALLER. `tests/vt/test_exl3_moe.cpp:544` is the
-  // fused kernel's only device gate and it has NEVER executed: it skips on
-  // `DeviceMemoryIsHostAddressable()`, which CUDA answers false by design, so
-  // the kernel was unreachable until W2 made the tower device-resident. Its
-  // geometry (`I = 128`) also cannot select the `MOE_TILESIZE_N == 256`
-  // instantiation that faults here. This model is the first caller to reach that
-  // instantiation at all, which is why a latent defect surfaced now.
-  //
-  // NOT a silent downgrade: `VT_DSV4_EXL3_FUSED_MOE=1` still forces the fused
-  // arm on a device queue for whoever fixes #2458, and the host arm is unchanged
-  // because the fault is device-side. The moment the kernel is fixed this
-  // predicate is what should be deleted, and #2458 says so.
-  const bool device_queue = be.q != nullptr && be.q->device.type != vt::DeviceType::kCPU;
-  const bool fused_ok = Dsv4Exl3FusedMoe() &&
-                        (!device_queue || Dsv4Exl3FusedMoeForcedOn());
-  if (!kq && Le != nullptr && fused_ok)
+  // The fused arm ran on the host only until #2458, because `vt::Exl3MoeMlp`
+  // faulted on a device queue: `compute-sanitizer` on `thor:gpu0` put it inside
+  // `exl3_moe_kernel<3, 256, 1>` as an 8-byte read at `base + tid*8` with base
+  // NULL. The port of `exl3_gemm_kernel_inner` had dropped upstream's
+  // `shmem_out_had` template parameter and hardwired the output Hadamard on, so
+  // the MoE epilogue dereferenced the NULL `post_scale` that upstream's own MoE
+  // bands pass (`exl3_moe_kernel.cuh:138,212` instantiate it `false`). With that
+  // parameter restored the kernel takes the fp16 store the CPU arm reproduces,
+  // so the arm is selected by the flag alone on every queue again.
+  if (!kq && Le != nullptr && Dsv4Exl3FusedMoe())
     exl3_fused_expert = Exl3FusedMoePass(be, *Le, p, x, route, T, H, mi, topk, lim, &out);
 
   for (int64_t t = 0; t < T; ++t) {

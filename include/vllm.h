@@ -194,7 +194,9 @@ extern "C" {
  * and that config is what BaseProcessingInfo::ValidateNumItems refuses against.
  * The caller that reaches ValidateNumItems on a live request is the OPENAI
  * SERVER: it is the one place that installs the multimodal chat seam
- * (server_main.cpp `chat.set_multimodal_chat_fn(...)`), and serving_chat.cpp
+ * (server_main.cpp `oai::InstallMultiModalChatSeam(...)`, which since #2475 is
+ * the ONE production caller of `set_multimodal_chat_fn` and dispatches on the
+ * model's architecture), and serving_chat.cpp
  * gates the whole multimodal branch on that seam being set. So a server started
  * with --language-model-only answers a multimodal chat request with HTTP 400
  * "At most 0 image(s) may be provided in one prompt." rather than serving it.

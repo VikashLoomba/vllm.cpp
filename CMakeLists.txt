@@ -1239,6 +1239,11 @@ add_library(vllm STATIC
   src/capi/chat_prompt.cpp
   src/vllm/entrypoints/openai/protocol.cpp
   src/vllm/entrypoints/openai/chat_mm.cpp
+  # ENG-MM-INPUT-PIPELINE (#2475): the per-architecture multimodal chat seam
+  # registry, and Qwen3-VL's registration into it. The registration TU is
+  # SELF-REGISTERING and is reached through vllm's INTERFACE --whole-archive.
+  src/vllm/entrypoints/openai/mm_chat_registry.cpp
+  src/vllm/entrypoints/openai/mm_chat_qwen3vl.cpp
   src/vllm/entrypoints/openai/serving_utils.cpp
   src/vllm/entrypoints/openai/serving_completion.cpp
   src/vllm/entrypoints/openai/serving_chat.cpp

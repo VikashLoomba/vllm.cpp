@@ -2991,11 +2991,26 @@ tree byte-identical to this branch's base (`TREE_SHA 4cf473bef`), at the prompt
 |---|---|---|---:|---:|---:|---|
 | A | pre-W5b-2d `glm5_next_kv` | cpu | 1 | 1095 s | 91.42 GiB | throws the #2445 binding error |
 | B | base (`839ea1ced`) | cpu | 0 | 1290 s | 100.68 GiB | ` Paris.` |
+| C | base (`839ea1ced`) | **cuda** | 1 | 1066 s | — | throws the forward's blanket non-CPU refusal |
+
+**Leg C is the exact "before" of this wave, and it is now measured rather than
+asserted.** It reaches `glm5_next_forward.cpp` and is refused there by name --
+"this forward is a HOST f32 reference and was handed a non-CPU queue ... the
+device arm is owed ... issue #2241" -- and NOT in the KV binding. That is the
+sentence the row repeated for four waves and that W5b-2d could only claim from
+ancestry; it is measured here, on the artifact, at this branch's base. It is
+also the precise message W9c-3a replaces.
 
 **Leg A settles a question #2445 explicitly declined to guess: the binding
 defect was never device-specific.** It reproduces identically on `--device cpu`.
 
-**And the two legs together separate LOAD from COMPUTE, which no single leg
+**The three legs are mutually consistent, which is the check that they measured
+what they claim.** C throws at the forward's entry and costs 1066 s; A throws a
+little later, in the KV binding, and costs 1095 s; B does the same load and then
+computes, and costs 1290 s. Both refusal legs land within 3% of each other and
+below the leg that generates, which is what a clean load boundary looks like.
+
+**And the legs together separate LOAD from COMPUTE, which no single leg
 can.** The two binaries differ only in `glm5_next_kv.{h,cpp}`, so the load path
 is identical, and leg A throws in the first forward's KV binding BEFORE any
 arithmetic. So 1095 s is load and engine init, and the remaining **195 s** is

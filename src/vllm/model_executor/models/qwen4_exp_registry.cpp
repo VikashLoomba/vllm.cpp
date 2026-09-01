@@ -43,6 +43,10 @@
 
 #include "vt/dtype.h"  // VT_CHECK
 
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -199,6 +203,94 @@ std::string Qwen4ExpQsaIndexerName(size_t layer) {
 // the BY-NAME arm all three DO have one and a second step runs. Putting the
 // scratch — and the refusal that makes it sound — at this boundary keeps the
 // limit where it is true instead of baking it into the loop.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODEDIV (#2496) — THE PER-STEP STATE FINGERPRINT, DEFAULT OFF.
+//
+// #2496 is a whole-output symptom on the RELEASED artifact: `--device cuda`
+// emits `11751 271 271 271 271 271 0 0` where `--device cpu` on the same tree
+// and the same file emits `11751 13 15767 411 2029 11 1092 369`. Token 0 agrees,
+// so prefill is right; every decode token is wrong, and bit-stably so across
+// builds and across `CUDA_LAUNCH_BLOCKING`. What is left is state the second
+// step carries, computed differently on the two arms.
+//
+// The hermetic CPU-vs-CUDA comparison in `test_qwen4_exp_layer_loop.cpp` asks
+// the same question on a fixture, and the fixture may not be able to hold the
+// answer: its layer-3 activations sit near 2^18, where one bf16 ULP is ~1024 and
+// the K/V store saturates (W5j measured 0 of 192 paged K/V words moving across
+// two prompts). This is the arm that runs on the REAL weights, where that
+// objection does not apply.
+//
+// IT PRINTS A SUMMARY, NOT A HASH, AND THAT IS THE POINT. The two arms are two
+// processes and two orders of arithmetic, so a checksum disagrees on a CORRECT
+// pair and says nothing. A count of non-finite words, a maximum magnitude, a sum
+// of magnitudes and the first four values separate a state that is WRONG — zero,
+// saturated, NaN, or a different tensor entirely — from one that differs in its
+// last bits, which is the only distinction this defect needs.
+//
+// `VT_Q4EXP_STATE_FP=1` turns it on. Off it costs one `getenv` per step, read
+// once. On it costs one device-to-host copy per state per step, which is a
+// diagnostic price paid deliberately and never on a default run.
+bool Q4ExpStateFpEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_Q4EXP_STATE_FP");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
+void Q4ExpStateSummary(dense_attn::Dev d, long step, const std::string& what,
+                       const vt::Tensor& t) {
+  const int64_t n = t.Numel();
+  if (t.data == nullptr || n <= 0) {
+    std::cerr << "Q4EXP_FP step=" << step << " " << what << " ABSENT\n";
+    return;
+  }
+  const size_t bytes = static_cast<size_t>(n) * vt::SizeOf(t.dtype);
+  std::vector<unsigned char> host(bytes);
+  // ONE entry point for both residencies. `Backend::Copy` infers its direction
+  // from the pointer values, and `Synchronize` is a no-op on the host backend,
+  // so the host arm pays nothing and the device arm cannot forget the drain.
+  d.b.Copy(d.q, host.data(), t.data, bytes);
+  d.b.Synchronize(d.q);
+  const auto at = [&](int64_t i) -> double {
+    switch (t.dtype) {
+      case vt::DType::kF32:
+        return static_cast<double>(reinterpret_cast<const float*>(host.data())[i]);
+      case vt::DType::kBF16:
+        return static_cast<double>(
+            vt::BF16ToF32(reinterpret_cast<const uint16_t*>(host.data())[i]));
+      case vt::DType::kF16:
+        return static_cast<double>(
+            vt::F16ToF32(reinterpret_cast<const uint16_t*>(host.data())[i]));
+      case vt::DType::kI64:
+        return static_cast<double>(reinterpret_cast<const int64_t*>(host.data())[i]);
+      case vt::DType::kI32:
+        return static_cast<double>(reinterpret_cast<const int32_t*>(host.data())[i]);
+      default:
+        // A block-quantized or otherwise unreadable state: report the byte at
+        // this index rather than pretend to read a value, so the line is still
+        // comparable between the two arms and is not silently empty.
+        return static_cast<double>(host[static_cast<size_t>(i)]);
+    }
+  };
+  int64_t nonfinite = 0, nonzero = 0;
+  double maxabs = 0.0, sumabs = 0.0;
+  for (int64_t i = 0; i < n; ++i) {
+    const double v = at(i);
+    if (!std::isfinite(v)) { ++nonfinite; continue; }
+    if (v != 0.0) ++nonzero;
+    const double a = std::fabs(v);
+    if (a > maxabs) maxabs = a;
+    sumabs += a;
+  }
+  std::cerr << "Q4EXP_FP step=" << step << " " << what << " dtype="
+            << vt::Name(t.dtype) << " n=" << n << " nonfinite=" << nonfinite
+            << " nonzero=" << nonzero << " maxabs=" << maxabs
+            << " sumabs=" << sumabs << " v=";
+  for (int64_t i = 0; i < 4 && i < n; ++i) std::cerr << at(i) << (i + 1 < 4 ? "," : "");
+  std::cerr << "\n";
+}
 
 ForwardLogits ForwardQwen4ExpForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
@@ -803,6 +895,35 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   const Qwen4ExpTextModelOutput hidden = Qwen4ExpTextModelForward(
       d, w, input.config, input.token_ids, input.positions, input.attn_meta,
       input.gdn_meta, caches, past_len);
+
+  // DECODEDIV (#2496): the per-step state fingerprint, default OFF. See
+  // `Q4ExpStateSummary` above for why it prints a summary and not a hash, and
+  // why it is the arm that runs on the REAL weights.
+  if (Q4ExpStateFpEnabled()) {
+    static long q4exp_fp_step = 0;
+    const long step = q4exp_fp_step++;
+    std::cerr << "Q4EXP_FP step=" << step << " BEGIN T=" << T
+              << " past_len=" << past_len << " device="
+              << static_cast<int>(input.queue.device.type) << "\n";
+    for (size_t i = 0; i < caches.gdn.size(); ++i) {
+      const GdnStateCache& g = caches.gdn[i];
+      Q4ExpStateSummary(d, step, "gdn[" + std::to_string(i) + "].conv", g.conv_state);
+      Q4ExpStateSummary(d, step, "gdn[" + std::to_string(i) + "].ssm", g.ssm_state);
+      for (size_t k = 2; k < g.states.size(); ++k)
+        Q4ExpStateSummary(d, step, "gdn[" + std::to_string(i) + "].state" +
+                                       std::to_string(k), g.states[k]);
+    }
+    for (size_t i = 0; i < caches.ple.size(); ++i) {
+      Q4ExpStateSummary(d, step, "ple[" + std::to_string(i) + "].ring",
+                        caches.ple[i].conv_state);
+      Q4ExpStateSummary(d, step, "ple[" + std::to_string(i) + "].ngram",
+                        caches.ple[i].tokens);
+    }
+    for (size_t i = 0; i < caches.qsa.size() && i < 2; ++i)
+      Q4ExpStateSummary(d, step, "qsa[" + std::to_string(i) + "].index_key",
+                        caches.qsa[i].index_key);
+    Q4ExpStateSummary(d, step, "hidden", hidden.tensor);
+  }
 
   // ─── the lm_head, which is `Qwen4ExpForCausalLM` and not the text model ────
   // `Qwen4ExpTextModel` has NO final RMSNorm (the mixer's `hc_norm` is the last

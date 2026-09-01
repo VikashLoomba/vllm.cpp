@@ -198,6 +198,12 @@ SUITES=(
   test_ltx2_dit_attn_knob_arms
   test_ltx25_ab_memwatch
   test_ltx2_oracle_goldens
+  # The latent-dump driver's own controls (#2514). Nothing executed that file,
+  # so an incomplete rename (`raw_bf16` for `raw_native`) killed every control
+  # in it with an uncaught KeyError, and its frame check passed on ZERO decoded
+  # frames. Both were catchable with no GPU, no torch and no weights; neither
+  # was caught, and both reached a queued dgx lease.
+  test_ltx2_latent_dump
   test_tower_skip_rss_report
   # The other half of that harness: `run_arm`, its readiness poll and its
   # teardown, against a fake server on a scratch port (#1844). The reporter

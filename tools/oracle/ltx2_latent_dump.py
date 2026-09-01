@@ -30,8 +30,12 @@ runs verbatim, with upstream's own argv, which is what makes the dumped latent
 the oracle's rather than a re-implementation's.
 
 THE CONTROL IS THE POINT, AND IT IS ONE CHECK THAT PROVES THREE THINGS.
-The 25 frames this run decodes must match the digests committed in
-`tests/parity/goldens/ltx2_oracle/SHA256SUMS`. If they do, then at this request
+EVERY frame named in `tests/parity/goldens/ltx2_oracle/SHA256SUMS` must be
+decoded by this run and must match its committed digest. The expected count is
+derived from that file, so it cannot drift from it. Comparing only the frames
+that happened to appear would let a decode producing NONE of them pass on an
+empty intersection, and that is what this check used to do. If they all match,
+then at this request
 the oracle is reproducible, the recording substitution perturbed nothing, and
 this driver is equivalent to upstream's `main()`. If they do not, the latent is
 NOT the reference's latent and this script says so rather than scoring it -- a
@@ -48,8 +52,10 @@ Exit codes:
   61 the recording stage captured no state (the hook never fired)
   62 the written latent's byte length disagrees with its recorded shape
   63 the render itself failed
-  64 the decoded frames do NOT match the committed digests (the probe perturbed
-     the run, or the run is not reproducible; either way the latent is not usable)
+  64 the decoded frames do NOT reproduce the committed digests: a committed
+     frame is missing, a digest disagrees, an unnamed frame appeared, or the
+     expectation itself names no frame (the probe perturbed the run, or the run
+     is not reproducible; either way the latent is not usable)
 """
 
 from __future__ import annotations
@@ -57,6 +63,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -78,6 +85,7 @@ from ltx2_oracle import (  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMMITTED_SUMS = REPO_ROOT / "tests/parity/goldens/ltx2_oracle/SHA256SUMS"
+_FRAME_NAME = re.compile(r"frame_\d+\.ppm")
 
 
 def read_committed_digests(path: Path) -> dict[str, str]:
@@ -174,6 +182,97 @@ def write_latent(tensor, out_dir: Path, stem: str) -> dict:
     return record
 
 
+def committed_frame_digests(committed: dict[str, str]) -> dict[str, str]:
+    """The frame rows of the committed sums, which ARE the expected frame set.
+
+    The count is DERIVED from `SHA256SUMS` and is never written here as a
+    literal. `NUM_FRAMES` would be a second transcription of the same number,
+    and a transcription cannot gate the thing it transcribes: were the reference
+    render ever recut at a different length, a hardcoded 25 would keep reading
+    as a pass while comparing against nothing.
+    """
+    return {name: digest for name, digest in committed.items()
+            if _FRAME_NAME.fullmatch(name)}
+
+
+def report_latents(latents: dict) -> int:
+    """Print each latent record and return the code its byte length earns.
+
+    0 when every record's written length equals the product of its own recorded
+    shape and itemsize, 62 otherwise.
+
+    The key is `raw_native` everywhere, because `write_latent` writes that name.
+    Two reads here spelled it `raw_bf16`, left over from an incomplete rename,
+    and `latents` always holds at least one entry -- so the loop always ran and
+    always raised `KeyError` on the first record. That killed the byte
+    assertion, the frame control below it and the manifest, every control in
+    this file, before any of them executed, and exited rc 1, which is not one of
+    the codes this module documents. `tests/scripts/test_ltx2_latent_dump.py`
+    now holds every key this function reads against the keys `write_latent`
+    writes, so the next rename cannot half-land either.
+    """
+    for name, rec in latents.items():
+        print(f"  {name:6s} shape={rec['shape']} dtype={rec['torch_dtype']} "
+              f"expected={rec['expected_bytes']} raw={rec['raw_native']['bytes']}")
+        if rec["raw_native"]["bytes"] != rec["expected_bytes"]:
+            print(f"FATAL: {name} latent wrote {rec['raw_native']['bytes']} bytes for a "
+                  f"shape that needs {rec['expected_bytes']}. A short write reads "
+                  f"exactly like a successful one to every later consumer.")
+            return 62
+    return 0
+
+
+def check_frames(frames_dir: Path, committed: dict[str, str], n_frames: int) -> dict:
+    """Hold the decoded frames against EVERY frame the committed sums name.
+
+    The comparison runs over the EXPECTATION set, not over the observation set.
+    An earlier revision iterated `frames_dir.glob("frame_*.ppm")` and counted
+    disagreements among whatever appeared, so a decode that produced no frames
+    yielded an empty glob, no mismatches, `matched = n_frames - 0 = 0 - 0 = 0`,
+    and the caller printed "CONTROL PASSED: this run reproduces the committed
+    reference byte for byte" and returned 0. An `av` failure, a truncated mp4 or
+    a wrong output path each read as a PASSING control. That is precisely the
+    defect this module's docstring names -- a counter that could not be written
+    reads exactly like a counter that was never incremented -- and upstream's
+    own `ltx2_oracle.py` `main()` aborts on zero frames where this driver had
+    dropped the check.
+
+    So a committed frame that did not appear is a mismatch, a decoded frame the
+    committed file does not name is a mismatch, and `ok` additionally requires
+    that `matched` reach the derived expectation. An expectation carrying no
+    frame rows at all cannot pass either, because a vacuous comparison is not
+    evidence.
+    """
+    expected = committed_frame_digests(committed)
+    observed = {path.name: path for path in sorted(frames_dir.glob("frame_*.ppm"))}
+    mismatches: list[tuple[str, str, str]] = []
+    matched = 0
+    for name in sorted(expected):
+        path = observed.get(name)
+        if path is None:
+            mismatches.append((name, expected[name], "MISSING: this run decoded no such frame"))
+            continue
+        got = sha256_file(path)
+        if got == expected[name]:
+            matched += 1
+        else:
+            mismatches.append((name, expected[name], got))
+    for name in sorted(observed):
+        if name not in expected:
+            mismatches.append((name, "not in SHA256SUMS", sha256_file(observed[name])))
+    return {
+        "committed_entries": len(committed),
+        "committed_frames": len(expected),
+        "frames_decoded": n_frames,
+        "frames_observed": len(observed),
+        "matched": matched,
+        "ok": bool(expected) and not mismatches and matched == len(expected),
+        "mismatches": [
+            {"frame": m[0], "expected": m[1], "got": m[2]} for m in mismatches
+        ],
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ltx2-source", required=True, type=Path)
@@ -244,38 +343,27 @@ def main() -> int:
     audio_state = (getattr(stage, "audio_states", []) or [None])[-1]
     if audio_state is not None and getattr(audio_state, "latent", None) is not None:
         latents["audio"] = write_latent(audio_state.latent, args.out, "audio_latent")
-    for name, rec in latents.items():
-        print(f"  {name:6s} shape={rec['shape']} dtype={rec['torch_dtype']} "
-              f"expected={rec['expected_bytes']} raw={rec['raw_bf16']['bytes']}")
-        if rec["raw_native"]["bytes"] != rec["expected_bytes"]:
-            print(f"FATAL: {name} latent wrote {rec['raw_bf16']['bytes']} bytes for a "
-                  f"shape that needs {rec['expected_bytes']}. A short write reads "
-                  f"exactly like a successful one to every later consumer.")
-            return 62
+    rc = report_latents(latents)
+    if rc:
+        return rc
 
     print("=== DECODE (the control: these frames must match the committed digests) ===")
     frames_dir = args.out / "recorded_frames"
     n_frames = decode(video, frames_dir)
     committed = read_committed_digests(COMMITTED_SUMS)
-    frame_check: dict = {"committed_entries": len(committed), "frames_decoded": n_frames}
     if not committed:
         print(f"FATAL: parsed ZERO digests out of {COMMITTED_SUMS}. An empty "
               f"expectation would make this check vacuous and still exit 0.")
         return 64
-    mismatches = []
-    for path in sorted(frames_dir.glob("frame_*.ppm")):
-        want = committed.get(path.name)
-        got = sha256_file(path)
-        if want is None:
-            mismatches.append((path.name, "not in SHA256SUMS", got))
-        elif want != got:
-            mismatches.append((path.name, want, got))
-    frame_check["mismatches"] = [
-        {"frame": m[0], "expected": m[1], "got": m[2]} for m in mismatches
-    ]
-    frame_check["matched"] = n_frames - len(mismatches)
-    print(f"  frames decoded = {n_frames}, matched committed digests = "
-          f"{frame_check['matched']} of {n_frames}")
+    frame_check = check_frames(frames_dir, committed, n_frames)
+    if not frame_check["committed_frames"]:
+        print(f"FATAL: parsed ZERO frame_*.ppm rows out of {COMMITTED_SUMS}. The "
+              f"file has non-frame rows, so it parsed, but an expectation naming "
+              f"no frame cannot be compared against and must not read as a pass.")
+        return 64
+    print(f"  committed frames = {frame_check['committed_frames']}, decoded = "
+          f"{n_frames}, matched committed digests = {frame_check['matched']} of "
+          f"{frame_check['committed_frames']}")
 
     manifest = {
         "issue": 2514,
@@ -296,14 +384,16 @@ def main() -> int:
         json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest["frame_control"], indent=2))
 
-    if mismatches:
-        print("FATAL: the recorded run's frames do NOT reproduce the committed "
-              "reference. Either the recording substitution perturbed the render "
-              "or this request is not reproducible on this worker. The dumped "
-              "latent is therefore NOT the reference render's latent and must "
-              "not be cross-decoded against it.")
-        for name, want, got in mismatches[:5]:
-            print(f"  {name}: expected {want} got {got}")
+    if not frame_check["ok"]:
+        print(f"FATAL: the recorded run's frames do NOT reproduce the committed "
+              f"reference: {frame_check['matched']} of "
+              f"{frame_check['committed_frames']} committed frames matched. Either "
+              f"a committed frame was never decoded, or the recording substitution "
+              f"perturbed the render, or this request is not reproducible on this "
+              f"worker. The dumped latent is therefore NOT the reference render's "
+              f"latent and must not be cross-decoded against it.")
+        for m in frame_check["mismatches"][:5]:
+            print(f"  {m['frame']}: expected {m['expected']} got {m['got']}")
         return 64
 
     print("CONTROL PASSED: this run reproduces the committed reference byte for "

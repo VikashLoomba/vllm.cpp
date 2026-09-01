@@ -173,3 +173,7 @@ discharged: it belongs to the wave that ports the queue.
   is written and attached to the issue, and it is UNCOMPILED: this wave could not
   build, so it did not land product code it could not gate. The issue owes a red
   test, a build and a focused green.
+- [#2531](https://github.com/mudler/vllm.cpp/issues/2531), the async-scheduling
+  placeholder underflow, the second live defect the re-derivation found. Its
+  `assert` is compiled out under `NDEBUG`, so a release build goes negative
+  silently. Same reason it did not land here: no build was possible.

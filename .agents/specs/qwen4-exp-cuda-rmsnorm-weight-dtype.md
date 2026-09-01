@@ -43,6 +43,24 @@ upstream says they should be:
   `blk.N.hc_*_norm.weight` `[10240]`, `blk.N.ple_norm_*.weight` `[10240]`.
   Measured by parsing the three shards' GGUF tensor tables directly.
 
+### Which of the three shapes this is
+
+`qwen4-exp-matmul-bt-mixed-dtype.md` set this row's taxonomy for a mixed-dtype
+refusal, and it applies unchanged here. This is its **shape 2**: the reference
+genuinely runs the op mixed, so mirror it and match the accumulate and output
+dtypes.
+
+It is explicitly **not shape 1**, an activation widened to f32 that should have
+stayed bf16. At the site that refuses first (`:632`) the activation is
+`q_index_raw`, allocated at `hidden.dtype` (`:592`) and therefore bf16. Nothing
+on that path was widened.
+
+It is also **not shape 3**, and this matters. That spec records that
+`vt::MatmulBT` on CPU reads both operands through a dtype-generic getter, "which
+makes CPU a value oracle and never a dtype-policy oracle". The CPU `RmsNorm`
+being laxer is therefore corroboration and never the argument. The argument is
+vLLM: `GemmaRMSNorm` upcasts the gamma itself.
+
 vLLM never requires the two to agree. `GemmaRMSNorm` upcasts the gamma on its
 own (`ple_layer.py:80`: `normalized * (1.0 + self.weight.float())`), and the
 `vllm.cpp` **CPU** kernel already does exactly that: `cpu_ops.cpp:554-557`
@@ -134,6 +152,22 @@ A third wall after #2477 and #2476 clear is a reportable result, not a failure.
   worse than recording it.
 - [#2476](https://github.com/mudler/vllm.cpp/issues/2476), the illegal memory
   access, whose ordering against this refusal this wave measures.
+- [#2488](https://github.com/mudler/vllm.cpp/issues/2488) tracks the widening below.
+- **A genuine shape-1 widening, found while reading this path and not fixed
+  here.** `qwen4_exp_qsa_block.cpp:694-696` allocates `q_f32` and `gate` at
+  `DType::kF32` and `vt::AttnGateSplit` fills them, where vLLM reaches the same
+  point through `torch.chunk` (`qwen3_next.py:426-435`), which does not change
+  dtype and leaves `q` at the bf16 model dtype. The value is already bf16-rounded
+  by the `qgate` store at `:691`, so the widening costs bandwidth rather than
+  precision — `T * Hq * Dh * 4` bytes where upstream moves half that, for `Hq=24`,
+  `Dh=256`. It is exactly the too-wide dtype a token gate cannot see.
+
+  It is not fixed in this wave for two reasons. It is not a wall: that site
+  pairs an f32 activation with the f32 gamma and passes today. And
+  `AttnGateSplit`'s f32 output is welded into the op's own CUDA signature
+  (`cuda_glue.cu:181`, `AttnGateSplitKernel(float* q_out, float* gate_out, ...)`)
+  and is shared with `qwen3_5.cpp:5328` and `:5501`, so narrowing it changes a
+  second model's path and needs that model's gate, not this one's.
 
 ## Now
 

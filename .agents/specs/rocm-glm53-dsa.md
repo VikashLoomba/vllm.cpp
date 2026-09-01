@@ -60,8 +60,12 @@ from each tensor's ggml type block size, so they are the on-disk footprint.
 | Resident (everything else) | 1581 | 15,580,554,240 | **14.5105** |
 | Total | 1809 | 216,705,819,648 | 201.8230 |
 
-**The premise holds.** 14.5105 GiB of resident class against a 58.000 GiB managed
-ceiling is **25.0%**, leaving 43.49 GiB of headroom. For contrast the Flash
+**The arithmetic holds; the load still refuses.** 14.5105 GiB of resident class
+against a 58.000 GiB managed ceiling is **25.0%**, leaving 43.49 GiB of headroom
+-- and W6 records that the device path never gets to use that split, because one
+predicate stops the streaming lane being built on ROCm. The arithmetic below is
+correct and was worth deriving; it is not on its own a statement that the model
+runs here, and this spec does not make that statement. For contrast the Flash
 sibling's 101.2535 GiB is 1.75x over the same ceiling with no streaming path,
 which is why that row stopped and this one does not.
 
@@ -307,14 +311,81 @@ clean across three runs but the mechanism is not established, and this wave does
 not claim one. It matters because `/workspace/ccache` is shared fleet
 infrastructure that other ROCm rows may reach for. Filed as #2506.
 
+## W6. THE ACTUAL BLOCKER, and it is none of the things this wave expected
+
+The model was run on `strix:gpu0` through the production CLI on `--device auto`
+(rc job `79fb8bab`, probe6). It **refuses at load**:
+
+```text
+vllm_engine_load: device 'rocm' cannot serve this GGUF: staging its weights needs
+at least 216433205760 bytes (201.56 GiB) of device memory across 1809 tensors ...
+and this device's memory pool is 68719476736 bytes (64.00 GiB).
+```
+
+The whole expert set is charged to the device, although this model declares
+`streams_routed_experts = true`
+(`glm_moe_dsa_registry.cpp:133`) precisely so it is not.
+
+**The cause is one predicate.** The streamed-expert lane is guarded at
+`model_loader.cpp:2761-2768`, and its FIRST condition is
+`target.needs_weight_staging()`. `RocmPlatform` returns **false** for it
+(`platforms/rocm.cpp:98`) -- deliberately, because that flag selects the
+fully-optimized GDN forward whose consumers lack per-op fallbacks, a decision
+#1934 made and this wave does not reopen. The other five conditions hold on this
+board. So the lane is never built, `lane` stays empty, and `CheckDeviceWeightFit`
+charges the 187.312 GiB of towers.
+
+**It is the same defect #1934 fixed, one call site short.** #1934 split the wide
+predicate because it was answering a narrower question, and added
+`allocates_bounded_device_memory()` -- which `RocmPlatform` overrides to **true**
+(`platforms/rocm.cpp:122`). The refusal was moved onto the narrow predicate. The
+lane guard was not. ROCm therefore gets the worst pairing available: the refusal
+fires, and the exemption that would satisfy it does not. On CUDA both are true,
+the lane engages, and the same checkpoint generates on GB10.
+
+Filed as #2507. Not fixed here: it changes load-path behaviour for every ROCm MoE
+model, which is a surprising fix owing its own row, spec and fresh review rather
+than an in-flow edit.
+
+### Two further observations from the same load
+
+The hybrid MoE placement resolved and installed a plan, and the refusal ignored
+it. `216433205760 - 147798884352 = 68634321408` B = 63.92 GiB, **under** the
+64.00 GiB budget by 81 MiB, yet the next line refuses quoting the un-reduced
+201.56 GiB. Two lines of one load contradict each other.
+
+And the budget itself is optimistic here: 64.00 GiB is `hipMemGetInfo` total,
+while every `Backend::Alloc` on this board is `hipMallocManaged`, whose measured
+ceiling is 58.000 GiB. Even the reduced 63.92 GiB is 5.92 GiB above what this
+allocator reaches, so honouring the plan alone would have produced a late OOM.
+
+### What this changes about the rest of this spec
+
+The arm-by-arm map in W1.3 stands: the MLA/DSA arm really is eight ops short. But
+it is **not** what stops GLM-5.3 on ROCm today, and neither is keep-quant, and
+neither is memory. The load never reaches a forward, so no MLA op is ever asked
+for. **The ordering is: #2507 first, then the MLA arm.** Porting MLA kernels
+before #2507 is settled would produce eight kernels nothing can reach.
+
+**No token is claimed.** `reference-tier distinct=0` and no expert-stream counter
+was emitted, because the process refused before any forward -- consistent with a
+load-time refusal and not evidence about any kernel.
+
 ## Owed
 
 Unreached or unported after this wave, none of it claimed here:
 
-- The ROCm MLA/DSA attention arm: `kBatchedMatmul`, `kConcatAndCacheMla`,
-  `kConcatMlaNopeRope`, `kDsaIndexerLogits`, `kDsaTopkSelect`, `kFusedNormRope`,
-  `kGatherMlaCache`, `kMlaDecodeAttention`. Owner `BACKEND-ROCM`; needs its own
-  issue and spec before any of it is written.
+- **#2507 first**: the streamed-expert lane guard reads `needs_weight_staging()`,
+  so GLM-5.3 is refused at load on ROCm before any forward runs. Nothing in the
+  MLA arm is reachable until this is settled.
+- The ROCm MLA/DSA attention arm, AFTER #2507: `kBatchedMatmul`,
+  `kConcatAndCacheMla`, `kConcatMlaNopeRope`, `kDsaIndexerLogits`,
+  `kDsaTopkSelect`, `kFusedNormRope`, `kGatherMlaCache`, `kMlaDecodeAttention`.
+  Owner `BACKEND-ROCM`; needs its own issue and spec. Porting these before #2507
+  would produce eight kernels nothing can reach.
+- Whether the device-fit budget should track the managed ceiling (58.000 GiB
+  measured) rather than the reported pool (64.00 GiB), and whether the installed
+  MoE placement plan should be credited by the fit check. Both in #2507.
 - `kFusedChain` on ROCm. The forward falls back to a standalone `vt::RmsNorm`
   when the recipe is unavailable (`glm_moe_dsa_forward.cpp:85-89`), so this is a
   performance gap, not a correctness one.

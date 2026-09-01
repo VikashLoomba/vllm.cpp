@@ -953,3 +953,122 @@ TEST_CASE(
   // be true of a load that died earlier for an unrelated reason.
   CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
 }
+
+// --- BACKEND-ROCM-LANE-GUARD (#2507): the streamed-expert LANE is gated on ----
+// --- the same predicate the REFUSAL is, never on `needs_weight_staging()` -----
+//
+// #1934 moved the refusal onto `allocates_bounded_device_memory()` and left the
+// lane guard six lines above on `needs_weight_staging()`. The lane is the
+// EXEMPTION inside the refusal's own arithmetic, so keying the two on different
+// predicates lets them disagree — and on ROCm they deliberately do
+// (`staging=false, bounded=true`), which is the one combination that loses: the
+// refusal fires and the exemption does not. Measured on `strix:gpu0`, where
+// GLM-5.3 was charged all 187.3125 GiB of towers it declares it streams.
+//
+// These three cases pin the repair. All of them use ROCm's REAL flag shape, and
+// they differ from each other only in the bit under test.
+//
+// `host_addressable` is the guard's second term and is NOT what these cases
+// move: it is already correct, and it is the same predicate `ExpertSlice`
+// (`expert_stream_seam.cpp`) reads at RUNTIME to decide whether the lane can
+// serve at all — which carries no staging term either. That agreement is the
+// point of the repair.
+
+TEST_CASE(
+    "device fit lane: ROCm's own state (staging=false, bounded=true) BUILDS "
+    "the lane") {
+  RegisterFakeStagingPlatform();
+  Platform().needs_weight_staging_flag = false;
+  Platform().allocates_bounded_device_memory_flag = true;
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  // The SAME budget the W0d cases use: above the lane-ON figure, below the
+  // lane-OFF one. It is exactly the band in which the lane decides the verdict.
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kLaneOnBound + 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().needs_weight_staging_flag = true;
+  Platform().allocates_bounded_device_memory_flag = true;
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  // RED before this row: the guard read `needs_weight_staging()`, which is false
+  // here, so no lane was built and the whole table was charged.
+  CHECK(message.find("cannot serve this GGUF") == std::string::npos);
+  CHECK(message.find(std::to_string(kLaneOffBound)) == std::string::npos);
+  // The LATER error, asserted POSITIVELY. "No refusal" on its own is also true
+  // of a load that died earlier for an unrelated reason, and this suite has
+  // carried that shape before.
+  CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}
+
+TEST_CASE(
+    "device fit lane: on ROCm's state the lane is COMPUTED, not merely "
+    "permissive") {
+  // The case that separates "the lane engaged" from "the refusal stopped
+  // firing". Those are different facts and the case above cannot tell them
+  // apart: a guard that permitted the load for ANY other reason would also
+  // reach the tokenizer. Only a footprint built WITH the lane can carry the
+  // lane note, the streamed-tower byte count and the arena byte count, and the
+  // arena is the number the two resolvers actually resolve rather than an
+  // estimate of it.
+  RegisterFakeStagingPlatform();
+  Platform().needs_weight_staging_flag = false;
+  Platform().allocates_bounded_device_memory_flag = true;
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kLaneOnBound - 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().needs_weight_staging_flag = true;
+  Platform().allocates_bounded_device_memory_flag = true;
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") != std::string::npos);
+  CHECK(message.find("the expert-stream lane IS active") != std::string::npos);
+  CHECK(message.find(std::to_string(kLaneOnBound)) != std::string::npos);
+  CHECK(message.find(std::to_string(kExpertTowerStaged)) != std::string::npos);
+  CHECK(message.find(std::to_string(kArenaBytes)) != std::string::npos);
+}
+
+TEST_CASE(
+    "device fit lane: a platform that STAGES but reports no bounded memory "
+    "builds NO lane") {
+  // The `||` guard, and the reason the repair is a REPLACEMENT rather than a
+  // widening. `needs_weight_staging() || allocates_bounded_device_memory()`
+  // would admit ROCm too, and would be wrong: for this platform
+  // `CheckDeviceWeightFit` computes no footprint at all, so a lane here is pure
+  // side effect — it would latch the process's streaming answer and fix the
+  // slot store's geometry on a load whose fit check is inert.
+  //
+  // The assertion is on the REFUSAL rather than on the absence of a lane note,
+  // because this platform's fit check returns before it can emit either. So the
+  // bit is read one level up: with `bounded=false` the load is never refused,
+  // and it must reach the tokenizer for THAT reason and not because a lane
+  // exempted the tower. `kLaneOffBound` is asserted absent to separate the two.
+  RegisterFakeStagingPlatform();
+  Platform().needs_weight_staging_flag = true;
+  Platform().allocates_bounded_device_memory_flag = false;
+  Platform().host_addressable = true;
+  TempFile f(BuildSyntheticMoeGgufWithExpertTower());
+
+  vllm_test::SetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES",
+                    std::to_string(kLaneOnBound - 1));
+  const std::string message = ThrownMessage(f.path(), vllm::Device::kNamedPlatform);
+  vllm_test::UnsetEnv("VT_DEVICE_WEIGHT_BUDGET_BYTES");
+  Platform().needs_weight_staging_flag = true;
+  Platform().allocates_bounded_device_memory_flag = true;
+  Platform().host_addressable = false;
+
+  REQUIRE_FALSE(message.empty());
+  CAPTURE(message);
+  CHECK(message.find("cannot serve this GGUF") == std::string::npos);
+  CHECK(message.find("tokenizer: GGUF missing kv") != std::string::npos);
+}

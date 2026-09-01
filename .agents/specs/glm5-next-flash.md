@@ -3032,6 +3032,28 @@ ran, and a value gate is blind to the wiring. The separating case points the
 host VIEWS and the device SOURCES at different weights and requires the two arms
 to disagree on a majority of outputs.
 
+**`scripts/agent-preflight.sh --fail-on-skip` EXITS 1, AND THAT EXIT IS NOT A
+FAILURE — read the reason, not the status.** 140 gates `ok`, **0 FAIL**,
+`check-tree-compiles: 10 of 10 translation unit(s) in scope compiled`. The
+non-zero exit is `--fail-on-skip` firing on five gates that take REQUIRED
+arguments preflight does not supply — `check-arm-isa-build.py`,
+`check-cpu-isa-build.py` and `check-cuda-fat-gencode.py` need
+`--compile-commands`, `check-pr-size.py` needs `--base/--head`, and
+`check-triton-aot-multiarch.py` needs `--vendored-root`. Those five skip on ANY
+tree, including a clean `main`, and CI supplies their arguments in dedicated
+jobs (`ci.yml:999`, `:1073`, `:1076`, `:1334`, `:1444`). The runner says so
+itself: "Nothing here failed, and nothing here passed."
+
+It is recorded at this length because the shape is a known trap on this row — an
+exit code that is not a verdict — and because ONE run of this gate on this
+branch WAS a real failure, described next.
+
+**`check-device-leakage.py` red this wave, and it was right.** The forward's
+device predicate read `queue.device.type != vt::DeviceType::kCUDA` for one
+commit: `DSR REGRESSION in bucket 'kcuda': 1 > baseline 0`. The baseline was NOT
+raised. The predicate was replaced by the op-table probe described above,
+`kcuda` returned to 0, the ratchet holds at 32, and the checker now reports `ok`.
+
 **Stop conditions.**
 - If the device arm and the host arm disagree beyond the activation-quantization
   band, STOP. Both arms quantize the activation to Q8_K, so they agree to a band

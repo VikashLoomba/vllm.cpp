@@ -1735,11 +1735,23 @@ TEST_CASE("glm5_next W9c-3b: the KV binding COPIES the engine's pages instead "
   }
 }
 
-TEST_CASE("glm5_next W9c-3b: a CPU queue keeps the DIRECT path, byte-for-byte") {
-  // The other half of the discriminator. The bounce must be selected by the
-  // QUEUE and by nothing else, so on a CPU queue the pages are written in place
-  // and `ShadowBackend::Copy` is never reached -- which is also what keeps every
-  // `--device cpu` run unchanged by this wave.
+TEST_CASE("glm5_next W9c-3b: a CPU queue writes the pages IN PLACE, and the "
+          "shadow backend is not involved") {
+  // The `--device cpu` arm, which is the one this wave must not move. The bytes
+  // land in the topology's OWN host vectors, at the slot the block permutation
+  // maps each position to, and no other backend is touched on the way.
+  //
+  // WHAT THIS CASE CANNOT SEE, stated because a mutation proved it. Deleting
+  // `PageIo`'s `if (q.device.type == kCPU) return;` -- so that a CPU queue
+  // resolves `vt::GetBackend(kCPU)` and bounces through it as well -- SURVIVES
+  // this case and the whole suite. It has to: the CPU backend's `Copy` IS
+  // `std::memcpy`, so the bytes are identical either way, and `Shadow().copies`
+  // below counts the SHADOW backend, which a CPU queue never reaches under
+  // either version. The early return is therefore not load-bearing for
+  // correctness. It is there so that a build with no CPU backend registered
+  // does not `Fail` on the host path, and so the `--device cpu` instruction
+  // stream is the one that was already measured. Spec `## Owed` O49 records the
+  // survival rather than leaving it for the next reader to rediscover.
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);

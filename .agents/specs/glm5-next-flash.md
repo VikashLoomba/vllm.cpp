@@ -3226,6 +3226,34 @@ not change the host arm.
 **No speed number is admissible from any of them** (O47: 89% generation spread
 across three identical legs, cause unknown), and none is claimed.
 
+#### Mutations, with what each one killed
+
+Every mutation is applied to PRODUCT code and rebuilt, because a mutation the
+compiler rejects and a mutation the binary never contained both read as a pass.
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `PageIo::Write` always takes the direct `memcpy` arm | KILLED, 1 case / 5637 assertions |
+| M2 | `PageIo::Read` always takes the direct `memcpy` arm | KILLED, 1 case / 2818 assertions |
+| M3 | `PageIo` drops its CPU early return, so a CPU queue bounces too | **SURVIVED** |
+| M4 | delete the production `StoreCaches` call in `glm5_next_registry.cpp` | KILLED, 2 cases / 3 assertions -- the REACHABILITY mutation |
+
+**M3 SURVIVED and that is a finding rather than a gap to paper over.** It has
+to survive: the CPU backend's `Copy` IS `std::memcpy`, so the bytes are
+identical whichever arm runs, and the case's counter watches the SHADOW backend,
+which a CPU queue never reaches under either version. The early return is
+therefore not load-bearing for correctness. It is there so a build with no CPU
+backend registered does not `Fail` on the host path, and so the `--device cpu`
+instruction stream stays the one that was already measured. The case says so in
+its own comment instead of asserting something it cannot see.
+
+M4 is the reachability answer: the production call site is
+`ForwardGlm5NextForConditionalGeneration`, `ModelRegistry::Forward` is the entry
+point, and deleting the `StoreCaches` line reds the two W5b-2c cases that read
+the engine's pages back on a second step. The two W9c-3b cases do NOT red under
+M4, because they call the three functions directly -- they localise the defect
+and they are not the reachability proof, which is why both are kept.
+
 #### Stop conditions
 
 * If leg A dies too, the diagnosis is wrong: report it, keep O46 open, and do
@@ -5613,6 +5641,15 @@ Debts this row carries, each visible rather than waived:
   What this costs the next reader is the general lesson, and it is O44's shape
   once more: an ordering in a log is evidence about ORDER and not about place,
   and a once-flag makes it evidence about even less than that.
+
+  **OWED, and small: the staging is PER ROW.** `PageIo` copies one paged row per
+  `Backend::Copy` and synchronises on each, so a step that hydrates a full 8192
+  token prefix pays about 180,000 round trips across 11 DSA layers and two
+  caches. Every row inside one block is contiguous with the next, so coalescing
+  a block at a time would cut that to about 5,600. It is not done here because
+  this forward is a host reference at roughly 85 s per step and no speed number
+  is admissible from this row anyway (O47); it is written down so the next reader
+  does not have to rediscover the shape of the cost.
 
 ## Now
 

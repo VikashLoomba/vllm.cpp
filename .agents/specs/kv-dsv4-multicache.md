@@ -2097,6 +2097,26 @@ config parse and upstream's disagree about the layer partition (that would be a
   is the same seam. Tracked under
   [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
 
+
+- **W8 slice 1, the host fp8_ds_mla PAGE PACKER, has landed UNREACHED**
+  ([#2455](https://github.com/mudler/vllm.cpp/issues/2455)).
+  `Fp8DsMlaPageLayout` / `MakeFp8DsMlaPageLayout` / `Fp8DsMlaStoreToken` /
+  `Fp8DsMlaLoadToken` are in `deepseek_v4_compressor.{h,cpp}` beside the existing
+  encode/decode pair, gated byte-exactly against a poison-filled block, and
+  **nothing calls them**: no op, no dispatch entry, no model edit, no header
+  publishes them. That is deliberate. They are the single host reference that
+  W8 slices 2 (`kConcatAndCacheDsMla` over a rank-2 byte page), 3 (the dequant
+  gather) and 5 (the CUDA kernels) are each a port of, so the layout is written
+  and gated once rather than three times, and a slice that landed the op first
+  would have had no reference to be byte-compared against.
+
+  What is owed is the wiring, and it is `### W8 design` slices 2 through 4 in
+  this document: the op, the read, and the model bridge that picks the packed
+  store when the bound page is `kI8`/fp8_ds_mla. Until slice 4 lands,
+  `ApplyCacheDType` still refuses every `MLAAttentionSpec` on the default path
+  and the real artifact still dies there. Owned by this row, tracked under
+  [#2455](https://github.com/mudler/vllm.cpp/issues/2455).
+
 ## Evidence
 
 Every structural claim in this document was read from a file at the SHA below.

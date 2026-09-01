@@ -13,14 +13,14 @@ every gate that currently runs, and both were found by reading rather than by a
 red.
 
 1. **#2435** — `vllm::dense_attn::MakeTensor`
-   (`include/vllm/model_executor/models/dense_device_glue.h:47-60`) writes
+   (`include/vllm/model_executor/models/dense_device_glue.h`, `MakeTensor`) writes
    `t.shape[i]` and `t.stride[i]` for `i` up to `shape.size() - 1` with no bound,
    while `vt::Tensor` fixes `kMaxRank = 4`. Any rank-5 shape writes past both
    fixed arrays. Give the write site the bound its sibling
    `vt::Tensor::Contiguous` (`src/vt/tensor.cpp:19-20`) has carried all along,
    and repair every caller the bound then refuses.
 2. **#2406** — `GgufLoadPolicy::FromEnv`
-   (`src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:366`) resolves
+   (`src/vllm/model_executor/model_loader/gguf_keep_quant.cpp`) resolves
    `quant_repack` from a pure host-ISA probe with no device term, so an aarch64
    i8mm host loading `--device cuda` repacks Q8_0 weights into the ARM
    `block_q8_0x4` interleave and stages them to a card whose kernels read plain
@@ -165,7 +165,7 @@ is a hard compile-time `false` on every non-aarch64 target
 wrong reason, and the assertion would be a mute switch that passes whether the
 device term exists or not. Taking `host_repack_active` as a parameter is the same
 move `RouteGgufTensor` already made for the device — the ROCm routing case
-(`tests/vllm/test_gguf_keep_quant.cpp:238`) says so in its own comment: "the
+(`tests/vllm/test_gguf_keep_quant.cpp`, "keep-quant routing respects the RUNNING DEVICE's format set") says so in its own comment: "the
 whole point of removing the probe is that a device's routing is checkable from a
 host that is not that device."
 
@@ -185,8 +185,8 @@ ones with no sanitizer.
 **#2406.** A doctest case over `QuantRepackForDevice`'s full truth table, run on
 every host. The discriminating row is
 `QuantRepackForDevice(true, false, /*host_repack_active=*/true, kCUDA) == false`
-against `... kCPU) == true`. `tests/vllm/test_gguf_keep_quant.cpp:1361`'s
-`expect.quant_repack` mirror is updated to the same predicate so the env-load
+against `... kCPU) == true`. The `expect.quant_repack` mirror in the same file's
+"production default is keep-quant" case is updated to the same predicate so the env-load
 comparison stays apples-to-apples on an i8mm host.
 
 ## Gates

@@ -727,7 +727,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     Check(hipGetLastError(), "K-quant gemm");
     return;
   }
-  throw std::runtime_error("vt rocm: matmul_bt_quant: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/MXFP4 -- the loader pre-filters to the ported set, so reaching here is a bug)");
+  throw std::runtime_error("vt rocm: matmul_bt_quant: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ3_S/IQ2_S/MXFP4 -- the loader pre-filters to the ported set, so reaching here is a bug)");
 }
 
 

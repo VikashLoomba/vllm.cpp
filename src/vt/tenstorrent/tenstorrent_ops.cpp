@@ -2697,6 +2697,22 @@ namespace {
 struct DecodePosEntry {
   ttnn::Tensor cur_pos;  // int32 [num_reqs] device — advanced in-trace
   bool allocated = false;
+  // #2469: host mirror of what cur_pos holds on device. The seed branch
+  // records seq_lens-1 (its copy_to_device lands); the replay branch adds 1
+  // per step it declines seeding for (each launched trace plus_one'd the
+  // device). WarmPaMeta echoes this into PaMetaEntry.cp_host so the
+  // TryPagedAttentionDeviceDecode guard reads what the DEVICE holds — a
+  // stale device tensor can no longer be masked by echoing the step's
+  // freshly computed seq_lens-1 into the entry.
+  std::vector<int32_t> host_val;
+  // #2469: the plus_one program-cache warm runs its op on a scratch tensor.
+  // Allocate it ONCE, at this entry's first (always trace-free) seed, and
+  // reuse it after: a fresh device allocation per seed is what the allocator
+  // warns about under a live trace ("these buffers may be corrupted once a
+  // trace is executed"), and the boundary seed is the one seeding step that
+  // runs with THIS slot's trace still live.
+  ttnn::Tensor plus_one_scratch;
+  bool scratch_ready = false;
 };
 std::mutex& DecodePosMutex() { static std::mutex m; return m; }
 std::map<int64_t, DecodePosEntry>& DecodePosCache() {
@@ -6550,6 +6566,8 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
                 ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
   std::lock_guard<std::mutex> g(PaMetaMutex());
   PaMetaEntry& e = PaMetaCache()[key];
+  bool cur_pos_aliased = false;  // e.cur_pos shares the DecodePos device buffer
+  bool pt_changed = true;        // a fresh allocation is a content change
   if (!e.allocated) {
     e.page_table = ttnn::Tensor::from_vector<int32_t>(
         pt, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_reqs),
@@ -6566,6 +6584,7 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
       if (dit != DecodePosCache().end() && dit->second.allocated) {
         e.cur_pos = dit->second.cur_pos;  // share the same device buffer
         aliased = true;
+        cur_pos_aliased = true;
       }
     }
     // After the first capture, a standalone cur_pos is never plus_one'd.
@@ -6583,7 +6602,7 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
   } else {
     // R2 steady state: page_table refreshes ONLY when content changed (block
     // boundary crossed). cur_pos/update_idxs advance on-device via plus_one.
-    const bool pt_changed = (e.pt_host != pt);
+    pt_changed = (e.pt_host != pt);
     if (pt_changed || !r2_steady) {
       ttnn::copy_to_device(pt_host, e.page_table);
     }
@@ -6593,13 +6612,45 @@ void WarmPaMeta(const int32_t* block_table, int64_t num_reqs, int64_t max_blocks
                        ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
       ttnn::copy_to_device(cp_host, e.cur_pos);
     }
+    // #2469: the alias was recorded at allocation; it still holds. Detect it
+    // here too — flagging only the alloc branch left cp_host frozen at the
+    // last seeding step's value for every steady step, so the guard compared
+    // a stale host value against the step's expectation.
+    if (HostFreeDecodeEnabled()) {
+      std::lock_guard<std::mutex> dg(DecodePosMutex());
+      auto dit = DecodePosCache().find(num_reqs);
+      if (dit != DecodePosCache().end() && dit->second.allocated) {
+        cur_pos_aliased = true;
+      }
+    }
   }
   e.pt_host = pt;
-  e.cp_host = cpos;
+  // #2469: cp_host must reflect what the DEVICE holds, not what this step
+  // computes. For an aliased cur_pos the device side is the DecodePos buffer,
+  // advanced in trace; at a request boundary this step's cpos is exactly the
+  // value the device does NOT hold, and echoing it unconditionally made
+  // TryPagedAttentionDeviceDecode's `cp_host[0] == seq_lens[0]-1` guard
+  // compare the host against itself — it could never fire on a stale device
+  // tensor.
+  if (cur_pos_aliased) {
+    std::lock_guard<std::mutex> dg(DecodePosMutex());
+    auto dit = DecodePosCache().find(num_reqs);
+    if (dit != DecodePosCache().end() && !dit->second.host_val.empty()) {
+      e.cp_host = dit->second.host_val;  // the seeded/advanced device value
+    } else if (!r2_steady) {
+      e.cp_host = cpos;  // this call seeded the buffer with cpos content
+    }
+    // else: no mirror to read — leave the entry's last recorded value.
+  } else if (!r2_steady) {
+    e.cp_host = cpos;  // the copy/allocation above made the device hold cpos
+  }
+  // else: standalone in steady state — the copy was skipped, so the device
+  // still holds the value cp_host already records. Leave it stale, honestly.
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
-    std::fprintf(stderr, "[TT-TRACE] WarmPaMeta n=%lld mb=%lld cp0=%d r2=%d pt_chg=%d\n",
+    std::fprintf(stderr, "[TT-TRACE] WarmPaMeta n=%lld mb=%lld cp0=%d host0=%d r2=%d pt_chg=%d\n",
                  (long long)num_reqs, (long long)max_blocks, (int)cpos[0],
-                 (int)r2_steady, (int)(e.pt_host != pt));
+                 e.cp_host.empty() ? -1 : (int)e.cp_host[0],
+                 (int)r2_steady, (int)pt_changed);
 }
 
 // R2: seed the persistent cur_pos device tensor (= seq_lens - 1) and warm the
@@ -6618,6 +6669,12 @@ void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime
              "tenstorrent: WarmDecodePos after capture for a num_reqs that "
              "was never seeded — cur_pos would freeze. Seed DecodePos per "
              "cache entry; recapture does NOT clear this (#1105).");
+    // No device update here: the previous step's trace plus_one'd it once.
+    // Keep the host mirror exactly one plus_one ahead of the last recorded
+    // seed so WarmPaMeta's cp_host stays honest (#2469).
+    if (!it->second.host_val.empty()) {
+      for (auto& v : it->second.host_val) v += 1;
+    }
     return;
   }
   // Cold/warm/capture step: (re-)seed cur_pos = seq_lens - 1 for THIS step.
@@ -6646,15 +6703,24 @@ void WarmDecodePos(const int32_t* seq_lens, int64_t num_reqs, bool replay_regime
                      ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR));
     ttnn::copy_to_device(cp_host, e.cur_pos);
   }
+  e.host_val = cpos;  // the copy/allocation above made the device hold cpos
   // Warm plus_one (program cache) on a SCRATCH tensor so the in-trace call
   // doesn't trigger "Cannot load new binaries during trace capture" — but
   // leave e.cur_pos at its seeded value (the warm must NOT advance it, or the
-  // captured body reads cur_pos+1).
+  // captured body reads cur_pos+1). The scratch is allocated ONCE per entry
+  // (the first seed always runs before any trace is live) and only REUSED
+  // after: the boundary seed runs with this slot's trace live, and a fresh
+  // device allocation then is the corruption the allocator warns about — it
+  // made the first post-boundary replay read garbage KV rows and emit flaky
+  // near-tie tokens (#2469).
   {
-    ttnn::Tensor scratch = ttnn::Tensor::from_vector<int32_t>(
-        cpos, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_reqs)}),
-                     ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR), &device);
-    ttnn::operations::experimental::plus_one(scratch,
+    if (!e.scratch_ready) {
+      e.plus_one_scratch = ttnn::Tensor::from_vector<int32_t>(
+          cpos, SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(num_reqs)}),
+                       ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR), &device);
+      e.scratch_ready = true;
+    }
+    ttnn::operations::experimental::plus_one(e.plus_one_scratch,
         /*sub_core_grids=*/std::nullopt, /*skip_negative_entries=*/true);
   }
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)

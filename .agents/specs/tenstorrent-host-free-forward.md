@@ -329,9 +329,11 @@ investigation row but MUST be addressed by the item-5 port:
 - **The capture arm's cold step emits a deterministic wrong first decode
   token ([#2461](https://github.com/mudler/vllm.cpp/issues/2461)) — REPAIR
   LANDED in this change (2026-09-01, root cause and evidence in `## Now`);
-  the issue closes on merge. RESIDUAL, a separate defect to file: the
-  capture-armed battery's one remaining failure at prompt[1] tok=1 is
-  cross-request persistent shadow state, not the slab swap.** Found by
+  the issue closes on merge. RESIDUAL, a separate defect, now filed and
+  repaired: the capture-armed battery's one remaining failure at prompt[1]
+  tok=1 is cross-request persistent shadow state, not the slab swap
+  ([#2469](https://github.com/mudler/vllm.cpp/issues/2469), REPAIR LANDED
+  in this change — see its own `## Owed` entry below).** Found by
   the wave's fresh mutation review (2026-09-01): the reviewer's rerun of the
   capture-armed focused gate printed deterministic gibberish where the
   operator's evidence record claimed "coherent" — the gate's `words>20`
@@ -352,6 +354,36 @@ investigation row but MUST be addressed by the item-5 port:
   CLI path. The repair carries red→green evidence and a token-clean
   A/B/C re-measurement (`## Now`); the machinery-only caveat on the
   earlier captured-arm ratios is superseded by it.
+- **The recycled same-size slot replays the previous request's final decode
+  position ([#2469](https://github.com/mudler/vllm.cpp/issues/2469)) —
+  REPAIR LANDED in this change (2026-09-01, root cause and evidence in
+  `## Now`); the issue closes on merge.** A same-size request boundary
+  under capture kept the previous request's final `cur_pos` on the shared
+  device tensor, so PA attended the dead request's decode KV rows and RAC
+  wrote at the stale virtual position, decoding the previous prompt's
+  tokens. The repair adds the per-slot continuation predicate and
+  `expected_cur_pos` bookkeeping, routes a same-size boundary through the
+  #1476 re-capture lane (seed-only measured insufficient: 13/11/264 with
+  device state verified correct), and makes `WarmPaMeta`'s `cp_host` read
+  the `DecodePos` host mirror so the device-PA guard reads what the device
+  actually holds. Green: capture-armed battery 125/125 assertions, 16/16
+  prompts PASS, max gap 0.375 nats @ prompt[1] tok=1 (inside the ≤0.5
+  near-tie band), 1344 device-PA selections / 0 declines; default arm
+  unchanged (125/125); captured CLI deterministic and coherent across a
+  card reset. Residual near-tie at that cell stays within the row's
+  adjudication band.
+- **Continuous-batching blind spot: the continuation predicate reads only
+  `seq_lens[0]` — a mid-batch request replacement on row r>0 at constant
+  num_reqs (continuous batching) leaves `cur_pos[r]` stale and the predicate
+  blind.** Unexercisable by the single-slot battery; same defect class as
+  #2469. The continuation predicate `seq_lens[0]-1 == expected_cur_pos`
+  covers row 0 / the single-request slot the capture path serves today;
+  multi-row decode request swap is unexercised and unsolved.
+- **The PA decline counter does not count guard-thrown declines (the `PA meta
+  not warmed for this step` fallback path).** Wiring it in measured 6720
+  declines on the default arm's battery vs the asserted 0, so it owes its
+  own change with the test's expectation re-baselined, owned by this row
+  (2026-09-01).
 - **The default-polarity question reopened by
   [#2003](https://github.com/mudler/vllm.cpp/issues/2003): RESOLVED as a
   documented stand-pat (2026-08-30, closed by the W2 record PR).** The
@@ -793,4 +825,57 @@ the capture-default flip decision come back within reach.
   passes in isolation). The battery's fatal REQUIRE stops the case at the
   first drift, so this run proves prompt[0] exact and the move of the
   failure cell; the scratch clone's verification covered prompts 1-15.
-  File it as its own issue.
+  Filed as [#2469](https://github.com/mudler/vllm.cpp/issues/2469); REPAIR
+  LANDED in this change (2026-09-01) — the `## Owed` #2469 entry and the
+  dated `## Now` repair block below carry the evidence.
+
+**#2469 repair landed (2026-09-01, this branch, P150, all runs under
+`flock $HOME/gpu.lock`).** The filed cross-request residual — a recycled
+same-size slot replaying the previous request's final decode position — is
+fixed at its three consumed surfaces.
+
+- Root cause: `DecodePosCache()[num_reqs].cur_pos` is a persistent device
+  tensor aliased into `RacIdxEntry.update_idxs` and `PaMetaEntry.cur_pos`
+  and only `WarmDecodePos`'s seed branch re-seeds it; under capture the
+  replay regime early-returns on `captured()` and `WarmPaMeta`'s
+  `r2_steady` is process-global, so a recycled size slot kept the dead
+  request's final position: PA attended the dead request's decode KV rows,
+  RAC wrote at the stale virtual position. The investigation session's
+  tokenizer decode showed the previous prompt's tokens (" Paris"/" France"/"
+  is") from prompt[1] tok=1; the kept red artifacts document the failure as
+  anchor drift with ids 374 (cap.out), 11 and 13 (diag/boundary).
+- The repair: `Qwen3DenseDecodeGraph` size slots carry `expected_cur_pos`
+  (seeded `seq_lens-1` on seeding steps, +1 per completed replay/capture
+  launch) and `Step` gates `WarmDecodePos`'s replay regime on the
+  continuation predicate `seq_lens[0]-1 == expected_cur_pos`; a same-size
+  request boundary (captured && !continuation) routes through the proven
+  #1476 re-capture lane — Reset the trace, run this step eagerly against
+  the freshly seeded position, re-capture next step. On the device side,
+  `DecodePosEntry.host_val` mirrors what `cur_pos` holds and `WarmPaMeta`
+  echoes it into `cp_host`, repairing a vacuous guard: the unconditional
+  `e.cp_host = cpos` made `TryPagedAttentionDeviceDecode`'s
+  `cp_host[0] == seq_lens[0]-1` check compare the host against itself, so
+  it could never fire on a stale device tensor. `plus_one_scratch` is
+  allocated once per entry and reused, so the boundary seed performs no
+  fresh device allocation under a live trace (the allocator's
+  corruption-under-trace warning).
+- Seed-only was tried and REJECTED: with the boundary seed verified
+  correct on device, the first post-boundary replay still drifted to a
+  near-tie wrong token (battery ids 11 and 13 across builds vs 374
+  unfixed; id 264 appears in no kept artifact), so the boundary re-capture
+  lane is required, not optional.
+- Green on the stripped build (this session's diagnostic probes — KV row
+  checksums, cur_pos/page-table/id readbacks — were investigation
+  instruments and do not ride in the fix, per session precedent):
+  capture-armed golden battery 125/125 assertions, 16/16 prompts PASS,
+  max gap 0.375 nats @ prompt[1] tok=1 — inside the ≤0.5 near-tie band
+  this row already adjudicates — 0 forward-divergent, `kPagedAttention
+  selections=1344` with 0 declines; default arm unchanged (125/125,
+  16/16, same max gap); captured CLI coherent and byte-identical across
+  three runs including one after a `tt-smi -r 0` reset, and the
+  default-arm CLI is coherent with a first-token near-tie flip — no
+  stale-prompt tokens anywhere.
+- The near-tie residual at prompt[1] tok=1 stays inside the row's ≤0.5
+  band adjudication (max gap 0.375 nats), not a strict-token failure; the
+  cross-request replay of the previous prompt's tokens — the actual #2469
+  defect — is gone.

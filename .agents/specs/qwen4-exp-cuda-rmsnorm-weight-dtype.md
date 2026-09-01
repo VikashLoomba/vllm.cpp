@@ -225,6 +225,60 @@ A third wall after #2477 and #2476 clear is a reportable result, not a failure.
   and is shared with `qwen3_5.cpp:5328` and `:5501`, so narrowing it changes a
   second model's path and needs that model's gate, not this one's.
 
+## Evidence
+
+Measured on `thor:gpu0` (NVIDIA Thor, `compute_cap 11.0`, driver 595.78, CUDA
+13.0.88, aarch64), serving the released `unsloth/Qwen3.8-Flash-Next-GGUF`
+UD-IQ1_S artifact: 72,546,461,344 bytes, shard-1 sha256
+`88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd`, staged in
+2195 s and verified by both byte count and hash before any arm ran.
+
+Binary sha256 `70e522df28d7748d8925ce9fc54dffd4909b3e8fd53d72fafd87bb13bed62056`,
+built for `sm_110` from `e934fb0020ba099125994e9a44e93e8c89d87977` (1662 s,
+`cuda_libs=2`, `cu_objects=41`). The source was asserted before compiling:
+`Tw=1 dispatch=3 old_check=0 test=1`.
+
+**Focused test, on the device:** `rc=0`, `assertions=4`, `skip_lines=0`,
+`FOCUSED CUDA ARM EXERCISED: YES`. The assertion count is reported because
+`assertions: 0 ... SUCCESS!` at rc 0 is a skip wearing a pass; four assertions
+and zero `[SKIP]` lines mean the CUDA arm ran.
+
+**End to end**, prompt `The capital of France is`, `max_tokens=8`,
+`temperature=0`, `VT_CPU_QUANT_REPACK=0`:
+
+| arm | `CUDA_LAUNCH_BLOCKING` | outcome | wall | IMA | refusal |
+|---|---|---|---|---|---|
+| ARM FIX | 0 | HTTP 500, #2476 | 237 s | 3 | **0** |
+| ARM FIXLB | 1 | **HTTP 200, 8 tokens** | 200 s | 0 | **0** |
+
+`rmsnorm-dtype refusal present: 0` in both arms is this change's own result: the
+wall at `cuda_ops.cu:463` is gone from a real forward, not only from a unit test.
+
+Host `sys_used` peaked at 40.0 GiB (ARM FIX) and 42.5 GiB (ARM FIXLB), so the
+n-gram table stayed quantized and residency is not implicated.
+
+## What this did NOT fix
+
+A token now comes out of a GPU, and it is **wrong after the first one**:
+
+```
+GPU : 11751 271 271 271 271 271 0 0        " Paris\n\n\n\n\n\n\n\n\n\n!!"
+CPU : 11751 13 15767 411 2029 11 1092 369  " Paris. Given this fact, what is"
+```
+
+Token 0 agrees; tokens 1-7 do not. That is [#2496](https://github.com/mudler/vllm.cpp/issues/2496),
+a third wall this change does not touch and does not claim to. The CPU sequence is
+the control recorded in the wave brief for this artifact and was **not** re-measured
+in this run, so re-taking it is the first step on that issue.
+
+[#2476](https://github.com/mudler/vllm.cpp/issues/2476) also did not dissolve. It
+is independent, it is FIRST in program order — its faulting kernel runs in layers
+0-2, ahead of the layer-3 QSA block that holds the first plain `vt::RmsNorm` — and
+it is timing-dependent: serialising launches suppresses it entirely, which is why
+the pre-fix binary showed this refusal under `CUDA_LAUNCH_BLOCKING=1` and the
+illegal access without it. It blocks the gate, because the only arm that completes
+a forward is not a production configuration.
+
 ## Now
 
-`ACTIVE`.
+`ACTIVE`. The row's CUDA forward is unblocked at this wall and stops at #2476.

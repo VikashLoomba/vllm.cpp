@@ -4089,6 +4089,32 @@ having no oracle to catch it.
 | `post_norm == false` | W6b | `ParseDots3NoteVisionParams` |
 | `use_bias == true` | W6b | `ParseDots3NoteVisionParams` |
 | `temporal_patch_size != 1` | W7 (video) | `ParseDots3NoteVisionParams` |
+| `adapter_out_dim != config.hidden_size` | none — unservable | `Dots3NoteVisionRefusal` |
+| `adapter_merge_size != spatial_merge_size` | none — unservable | `Dots3NoteVisionRefusal` |
+
+**The last two rows name no brick, and that is the point of them.** They are not
+capabilities owed to a later brick; they are configs no dots3-note tower can be
+served under at all. They are here because the fresh review of #2523 measured
+the refusal predicate to be a strict SUBSET of the `VT_CHECK`s
+`EncodeMmDots3NoteForCausalLM` makes on a served request. Three of those checks
+— the adapter width against the text width
+(`dots3_note_registry.cpp`), the emitted row count against the placeholder span,
+and `L % merge_unit` inside the tower — were reachable from an all-dense config
+the seam ACCEPTED. Reaching any of them throws inside the engine's busy loop,
+which sets `AsyncLLM::errored_` permanently (`async_llm.cpp:584-601`), so the
+server starts, text works, the first image request 500s, and every later
+request is dead for the life of the process. That is the exact cascade the
+factory-side refusal was introduced to remove, still reachable through a
+narrower door. **A refusal and its route predicate must be the SAME predicate**,
+which is this row's second recurrence of the finding: the W4b-3c review made it
+about sparse routing, recorded in the first `## Owed` entry.
+
+A tautology went with them. `adapter_merge_size**2 * adapter_in_dim !=
+merged_dim()` read as a cross-key check and was `x != x` — `merged_dim()` is
+that product, reordered (`dots3_note_vision.h`) — so it could never fire, and it
+was the only refusal in the table that named no brick because it stood for no
+condition. The `adapter_merge_size` row above is the real cross-key check that
+belongs in its place.
 
 A refused tower leaves the 2195 `vision_encoder.*` tensors in the accounting's
 existing `vision` bucket as a NAMED deferral, exactly as before, so every W2
@@ -4136,6 +4162,21 @@ re-typed `router_bias` fires. Every dense vision tensor is BF16 on disk and BF16
 in the resident tower, and the gate asserts the tower's stored dtype rather than
 only its values — a token gate cannot see a dtype that is too wide.
 
+#### 4.11.5 Reachability — the production entry point, and what it costs to fake
+
+The production entry point is `ApiServer::handle_chat_completions` on the
+server's default configuration. The smallest failing test enters THROUGH it, over
+a synthetic in-memory checkpoint at tiny geometry with a generated tokenizer
+fixture whose added tokens are `<|img|>` / `<|imgpad|>` / `<|endofimg|>`. A unit
+test that constructs the tower by hand proves the class works, never that
+anything reaches it.
+
+The load-bearing case is **two DIFFERENT images, one prompt, compared on
+LOGPROBS**. It is the only one that survives a tower replaced by a correctly
+SHAPED constant: every text-only assertion — status 200, `prompt_tokens`,
+`completion_tokens` — passes under that mutation, and the logprobs of the first
+generated token do not.
+
 #### 4.11.6 Evidence, measured 2026-09-01
 
 Host: the developer's x86-64 Linux box, CPU queue, `-DVLLM_CPP_SERVER=ON
@@ -4144,13 +4185,13 @@ GPU lease was taken and no number below is a performance number.
 
 | Suite | Result |
 |---|---|
-| `test_dots3_note_vision` (new) | 8 cases, **4981 assertions**, 0 failed |
-| `test_openai_api_server_dots3_mm_forward` (new) | 7 cases, **55 assertions**, 0 failed |
+| `test_dots3_note_vision` (new) | 8 cases, **4996 assertions**, 0 failed |
+| `test_openai_api_server_dots3_mm_forward` (new) | 9 cases, **68 assertions**, 0 failed |
 | `test_dots3_note_scaffold` | 26 cases, **110835 assertions**, 0 failed |
 | `test_dots3_note_attn` | 51 cases, **6888 assertions**, 0 failed |
 | `test_openai_api_server_mm_forward` (Qwen3-VL, untouched) | 9 cases, **73 assertions**, 0 failed |
 | `test_model_registry` (repaired here) | 24 cases, **993 assertions**, 0 failed |
-| **the FULL gate** — `ninja` all 1375 targets then `ctest -j 2` | **702/702, 0 failed**, 7 skipped for absent checkpoints, `CTEST_RC=0`, 931 s |
+| **the FULL gate** — `ninja` all 1381 targets then `ctest -j 2` | **702/702, 0 failed**, 7 skipped for absent checkpoints, `NINJA_RC=0`, `CTEST_RC=0`, 158.06 s of `ctest` (rerun 2026-09-02 for the fresh-review repair) |
 | `scripts/agent-preflight.sh` | rc 0 |
 | `check-commit-style.py` / `check-commit-trailers.py` over `$(git merge-base origin/main HEAD)..HEAD` | rc 0 / rc 0 |
 
@@ -4169,11 +4210,44 @@ enough that M5 below (relative 5.9e-2) exceeds it by 2.95x. A bound at the round
 0.05 a first draft carried would have cleared M5 by only 1.18x, which is one
 compiler from a mute switch.
 
+**WHAT THE 0.02 BOUND CANNOT SEE.** On a row with no oracle the honest statement
+of what the gate does NOT detect is part of its evidence, not a caveat outside
+it. Both numbers below were measured by the fresh review of #2523, on this
+tree's own gate:
+
+- **A uniform scale error passes until about 1.5%.** Multiplying the tower's
+  output by 1.01 reads relative **0.0152** against the 0.02 bound, and the gate
+  stays GREEN. The detection floor for a systematic MULTIPLICATIVE error is
+  therefore ~1.5%: a missing or doubled scalar smaller than that is invisible
+  here, and no assertion in the suite bounds the output's SCALE independently of
+  its shape.
+- **A named formula choice is below the gate's resolution.** Replacing the
+  exact-erf GELU with the tanh approximation leaves the measurement
+  BYTE-IDENTICAL to the baseline — the same printed digits, max |diff|
+  **0.0533141** — because the bf16 store of `fc1` absorbs the whole difference.
+  The gate cannot tell the two formulas apart at this geometry, so "we use
+  upstream's GELU" is a claim the CODE and the upstream anchor carry, never one
+  this measurement supports.
+
+Neither weakens the two claims above: the 8.44e-3 agreement and M5's 5.9e-2 red
+both stand. What they bound is the CLASS of defect the gate detects — a change
+to the ORDER or the STRUCTURE of the arithmetic, which is what M5 is — and not a
+small uniform rescale, and not a rounding-equivalent formula swap.
+
 **Mutations.** Each was applied to the tree, REBUILT, and its test binary's
 sha256 compared against the green baseline — a mutation that never reached the
 binary reads as a passing test. Each file was then restored and `cmp` reported
 byte-for-byte identity, and the rebuilt binaries hashed back to the EXACT green
 baselines (`c6e83b90...` served, `b03f59e3...` tower).
+
+**A CHANGED SHA IS NECESSARY AND NOT SUFFICIENT, and the argument below
+originally overstated it.** The sha proves the build was not STALE, which is the
+trap it was chosen for. It does not prove the mutation reached the code under
+test: M4 changed the TOWER gate's binary sha purely by relinking a translation
+unit that gate does not exercise, while that binary's behaviour was unchanged —
+8/8, 4981 assertions, as the paragraph after the table records. The evidence
+that a mutation was DETECTED is the CASE COUNT in the Result column, and nothing
+else in this table can carry that weight.
 
 | # | Mutation | Binary sha256 (served gate) | Result |
 |---|---|---|---|
@@ -4183,6 +4257,39 @@ baselines (`c6e83b90...` served, `b03f59e3...` tower).
 | M3 | the `.mm` read in `Dots3NoteModel::ForwardDevice` DELETED (`have_mm_embeds = false`) | `7285bd3e44221bcb…` | **RED** — the same single case, for the same reason: the vision rows never reach the residual stream |
 | M4 | the production `MaterializeDots3NoteVision` call site in the LOADER deleted | `80901ec80645b598…` | **RED** — 3 of 7 cases |
 | M5 | the per-head `q_norm`/`k_norm` moved from BEFORE the rope to AFTER it | tower gate `b39c3e36a0abbfad…` | **RED** — relative 5.9e-2 against the 2.0e-2 bound, a 7x jump from the green 8.4e-3 |
+
+**THE REFUSAL REPAIR IS RED-FIRST, and its RED is the CASCADE rather than a
+missing message.** The two served cases were written and built BEFORE the
+refusal was widened, on binary `05848d1f4226e416…` (tower gate
+`2d2dc86de602c004…`). Both failed at the install assertion — `kInstalled` where
+`kRefusing` is required — so to show what that install then costs, the two
+`REQUIRE`s were downgraded to `CHECK` in a scratch build (`34ff9a39094e0e18…`)
+and the cases ran to the end. Verbatim, from that run:
+
+```text
+engine-fatal: EngineCore busy loop threw: vt: Dots3NoteForCausalLM encoder: the
+  vision adapter emits 24-wide rows but the text tower is 16 wide
+  (`adapter_out_dim`, vision.py:461 @ 9035151d6) at dots3_note_registry.cpp:202
+async-llm: output handler saw engine death: EngineCore encountered an issue.
+  CHECK( r.status == 400 ) is NOT correct!  values: CHECK( 500 == 400 )
+  ...the TEXT request sent AFTERWARDS on the same server:
+  {"error":{"code":500,"message":"EngineCore encountered an issue. ...
+    [request submitted to a stopped AsyncLLM]"}}
+  CHECK( t.status == 200 ) is NOT correct!  values: CHECK( 500 == 200 )
+```
+
+The merge-size case reaches the OTHER assert on the same path
+(`dots3_note_registry.cpp:221`, "the tower produced 16 embedding rows for a
+placeholder span of 4 tokens") and ends in the same
+`request submitted to a stopped AsyncLLM`. The tower gate's own RED was 11
+failed assertions over 4996 in 1 of 8 cases. The scratch file was restored and
+`cmp` reported byte-for-byte identity before the fix was applied.
+
+| # | State | Served-gate sha256 | Tower-gate sha256 | Result |
+|---|---|---|---|---|
+| — | new cases, refusal NOT widened | `05848d1f4226e416…` | `2d2dc86de602c004…` | **RED** — 2 of 9 cases; 11 of 4996 tower assertions |
+| — | the same, `REQUIRE` -> `CHECK` so the cases run on | `34ff9a39094e0e18…` | — | **RED**, and the 500 + `stopped AsyncLLM` above is why |
+| — | refusal widened (this repair) | `c8d9573ef3d605a7…` | `8f2b81436dcdac81…` | **GREEN** — 9/9, 68 assertions; 8/8, 4996 assertions |
 
 **M4 leaves the TOWER GATE GREEN, and that is the point of having two files.**
 `test_dots3_note_vision` materializes the tower itself, so deleting the
@@ -4208,21 +4315,6 @@ and the block, with the text path still answering afterwards. The encoder check
 stays as defence in depth, on the same polarity Qwen3-VL's carries ("reaching
 this point is a defect"). The gate asserts BOTH halves: 400 on the image, 200 on
 a text request sent after it.
-
-#### 4.11.5 Reachability — the production entry point, and what it costs to fake
-
-The production entry point is `ApiServer::handle_chat_completions` on the
-server's default configuration. The smallest failing test enters THROUGH it, over
-a synthetic in-memory checkpoint at tiny geometry with a generated tokenizer
-fixture whose added tokens are `<|img|>` / `<|imgpad|>` / `<|endofimg|>`. A unit
-test that constructs the tower by hand proves the class works, never that
-anything reaches it.
-
-The load-bearing case is **two DIFFERENT images, one prompt, compared on
-LOGPROBS**. It is the only one that survives a tower replaced by a correctly
-SHAPED constant: every text-only assertion — status 200, `prompt_tokens`,
-`completion_tokens` — passes under that mutation, and the logprobs of the first
-generated token do not.
 
 ---
 
@@ -4788,6 +4880,35 @@ change as the lifecycle move, not afterwards.
 
 Carried openly under option B (§6.4), not waived:
 
+- **The image processor REFUSES instead of resizing, so no non-conformant image
+  is servable.** `Dots3NoteImageProcessor::ProcessImage`
+  (`src/vllm/multimodal/dots3_note_processor.cpp`) computes the resized size and
+  then throws when it differs from the input size, rather than performing the
+  `Image.Resampling.BICUBIC` resample upstream always performs
+  (`common/processor.py:174` @ `9035151d6`). `Dots3NoteResizedSize` itself is
+  ported and correct, including the `min_pixels`/`max_pixels` rebalance
+  (`processor.py:97`); it is the resample AFTER it that is missing. **This is a
+  capability gap and not only a bookkeeping one.** `factor` is
+  `patch_size * merge_size`, which on the released `dots-studio/dots3-note-prev`
+  is 28, so an image is servable only when BOTH dimensions are already multiples
+  of 28 and the pixel count already sits inside the bounds — which almost no
+  real photograph or screenshot does. W6a never reaches the throw because its
+  fixture image is conformant by construction, and once W6b lifts the MoE ViT
+  refusal this becomes what a user hits instead. Refusing remains the right
+  INTERIM behaviour: patchifying at the wrong grid changes the placeholder count
+  and serves a well-shaped wrong prompt, which §6.4 records as having no oracle
+  to catch it. Closing it needs the resample matched to PIL's kernel
+  (`a = -0.5`, its support radius, its per-axis two-pass order and its clamping),
+  a gate that measures the resampler against a reference on a NON-conformant
+  image rather than only checking that the placeholder count comes out right,
+  and the refusal deleted in the same change so message and behaviour cannot
+  drift. **The record it claimed did not exist.** The code comment and the
+  runtime message both said "Recorded under `## Owed` in
+  `.agents/specs/dots3-note.md`" while this section named it nowhere and no
+  issue tracked it; the fresh review of #2523 found that, and this entry and
+  the issue below are the repair. Owner: this row, W8 (the MM front end brick
+  that owns the processor, §7). Issue
+  [#2537](https://github.com/mudler/vllm.cpp/issues/2537).
 - **PER-REQUEST sparse routing for a MIXED step, and the refusal that stands in
   for it.** The W4b-3c review found the route predicate and the refusal
   predicate to be different predicates with a reachable gap between them, and

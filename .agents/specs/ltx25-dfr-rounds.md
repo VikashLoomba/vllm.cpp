@@ -92,7 +92,7 @@ Three options were considered.
 
    **BOTH anchors in that sentence are dead, re-resolved 2026-09-01 by row
    `LTX25-ANCHOR-REPAIR`** ([`ltx25-anchor-repair.md`](ltx25-anchor-repair.md)
-   §6). `docs/USAGE.md` is 862 lines and contains no `keyframe_slot_sft` at all;
+   §4.1). `docs/USAGE.md` is 862 lines and contains no `keyframe_slot_sft` at all;
    the topic moved to `docs/models/ltx-2-5.md`, under "Declare the checkpoint
    family with `--checkpoint-class`". `docs/FEATURES.md:175` is worse than dead:
    it resolves, and at `ed5ecea2e` it is a sentence about
@@ -102,18 +102,27 @@ Three options were considered.
    The checkpoint-class row is the "LTX-2.5 checkpoint class" row of that
    file's feature table.
 
-   **The REJECTION stands and the reason beneath it is now contradicted by the
-   documentation, which this row records rather than settles.**
-   `docs/models/ltx-2-5.md` now states the opposite of "never checked": *"The
-   loader checks it against the checkpoint rather than using it as an unchecked
-   hint, and refuses a missing or mismatched class before generation."* Either
-   the sentence above is stale or the document is wrong, and deciding which is a
-   read of the loader, not of an anchor. Repointing a citation at a document
-   that says the reverse of the claim it supports would be worse than leaving it
-   dead, so the disagreement is named here and owed to whoever owns the
-   checkpoint-class refusal. The workaround stays REJECTED either way: under the
-   document's version the declaration is checked and the lie is refused, which
-   is a stronger reason to reject it, not a weaker one.
+   **The REJECTION stands, and the documentation that contradicted it was the
+   side that was wrong.** `docs/models/ltx-2-5.md` stated the opposite of "never
+   checked": *"The loader checks it against the checkpoint rather than using it
+   as an unchecked hint, and refuses a missing or mismatched class before
+   generation."* Deciding between them is a read of the loader, not of an
+   anchor, so the loader was read.
+   `src/vllm/model_executor/models/ltx2_pipeline.cpp::Ltx2CheckpointClassRefusal`
+   compares the declared class against `recipe.checkpoint_class` — what the
+   PIPELINE needs — and against nothing in the checkpoint. Its own
+   `WhyNoDetector()` string says why, and is quoted into the refusal: the full
+   and distilled bf16 transformers are both 42,018,190,584 bytes with
+   byte-identical safetensors headers apart from `__metadata__` key order, so
+   *"this engine cannot tell, and it refuses rather than guessing"*. The
+   pre-#1491 text agreed, under the heading "`checkpoint_class` is REQUIRED, and
+   it is a declaration rather than a check"; the docs restructure in `aee6c48d6`
+   inverted it. **Fixed in flow** by row `LTX25-ANCHOR-REPAIR`, which rewrote
+   that paragraph of `docs/models/ltx-2-5.md` to say the loader refuses a
+   missing, unknown or pipeline-mismatched class and cannot check the file. The
+   sentence above therefore stands as written and the workaround stays REJECTED
+   for its original reason: the lie is undetectable, which makes it worse than a
+   refusal, not safer.
 3. **Gate on reduced-dimension synthetic fixtures through the production entry
    point.** TAKEN. This is how `test_ltx2_dfr` and every DFR case in
    `test_ltx2_video` already work (`test_ltx2_video.cpp:112` returns

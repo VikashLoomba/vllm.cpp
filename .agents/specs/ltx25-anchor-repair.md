@@ -41,19 +41,42 @@ OUT OF SCOPE, and each says why:
 
 ## 1. The census
 
-`.agents/specs/ltx25-*.md`, 46 files at `ed5ecea2e`, matched with the
-line-anchor form of `check-symbol-anchors.py`'s own `CITATION_RE`
-(`scripts/check-symbol-anchors.py:87-90`, an anchor this row re-resolved and
-found FRESH). Every count below is stamped with that tree, because a bare count
-in a document is a drift lock:
+`.agents/specs/ltx25-*.md`, **50 files at `855905f59`** — `origin/main` as this
+branch merged it — matched with the line-anchor form of
+`check-symbol-anchors.py`'s own `CITATION_RE` (`scripts/check-symbol-anchors.py:87-90`,
+an anchor this row re-resolved and found FRESH). The branch adds one more, this
+row's own spec, for 51. The denominator is re-derivable rather than asserted:
+
+```sh
+git ls-tree -r --name-only 855905f59 -- .agents/specs/ \
+  | grep -c '^\.agents/specs/ltx25-.*\.md$'
+```
+
+**The first version of this section said 46, and 46 was wrong.** The tree holds
+50 at that stamp, so up to four `ltx25-*` specs were never censused, and which
+four cannot be recovered after the fact — a count taken once and not re-derived
+is exactly the drift lock this row exists to name, and it caught this row's own
+denominator. The census was therefore re-run over all 50, and the table below
+replaces the earlier one. Every count is stamped with that tree:
 
 | Class | Count |
 |---|---:|
-| Total `path:line` citations | 1,668 |
-| Resolvable in this tree (full path, or a basename unique among tracked files) | 649 |
-| Not a repo path — the pinned `ltx-2`, `vllm-omni` and `diffusers` oracles, or an external file | 1,013 |
+| Total `path:line` citations | 1,708 |
+| Resolvable in this tree (full path, or a basename unique among tracked files) | 651 |
+| Not a repo path — the pinned `ltx-2`, `vllm-omni` and `diffusers` oracles, or an external file | 1,051 |
 | Basename ambiguous across tracked files | 6 |
-| Resolvable and **out of range** — the cited file is shorter than the cited line | 10, of which 1 is a deliberate illustration |
+| Resolvable and **out of range** — the cited file is shorter than the cited line | 11, of which 1 is a deliberate illustration |
+
+The re-run moves the out-of-range set by exactly one site, and that site is not a
+new repair. `ltx25-retire-dead-arms.md:527` cites `docs/USAGE.md:1650-1654`
+against an 862-line file, and reading it shows the citation is a QUOTATION: that
+spec records the anchor as stale in the same paragraph and already replaced it
+with the paragraph's opening words. It is the §9 hazard — prose that quotes a
+dead anchor in order to say it is dead — and rewriting it would forge the
+finding. `ltx25-retire-dead-arms.md` is named nowhere else in this row, which is
+consistent with its being one of the four the earlier count missed. The other ten
+out-of-range sites are unchanged, and §6 disposes of the two that an owed item
+names.
 
 Out-of-range is the weakest available test and it is the only *mechanical* one:
 a line number carries no claim, so "line 504 exists" is true of any file with
@@ -105,22 +128,54 @@ takeable here rather than owed on:
 - The sweep touches only comments and spec prose. No expression, declaration or
   test assertion moves.
 
-## 4. The corrections that have themselves rotted
+## 4. The recorded corrections, re-resolved — one of the three had rotted
 
 Three owed items recorded a correction in prose because the record they were
-correcting could not be edited. Two of those corrections are now stale:
+correcting could not be edited. Re-resolved against `origin/main` at
+`855905f59`, **one of the three is stale and two hold**:
 
-| Owed item | It recorded | At `origin/main` today |
+| Owed item | It recorded | At `855905f59` |
 |---|---|---|
-| `ltx25-text-linear-mem` | `cpu_ops.cpp:125` should read `:130` for `static thread_local std::vector<float> af` | `af` is at `:225`. `:130` is not it |
-| `ltx25-oracle-absolute` | `examples/ltx2_gen/main.cpp:306-451` should read `:318-476` | The flag loop reaches past `:490`. `:318-476` no longer covers it |
-| `ltx25-oracle-absolute` | `tools/oracle/ltx2_oracle.py:88` should read `:89` | HOLDS. `:89` is `NUM_INFERENCE_STEPS = 8` |
+| `ltx25-text-linear-mem` | `cpu_ops.cpp:125` should read `:130` for `static thread_local std::vector<float> af` | **ROTTED.** `af` is at `src/vt/cpu/cpu_ops.cpp:225`, inside `MatmulOneChunk` at `:205`. `:130` is not it |
+| `ltx25-oracle-absolute` | `examples/ltx2_gen/main.cpp:306-451` should read `:318-476` | **HOLDS.** `:318` opens the one `argc` loop in the file, `:476` is its closing brace, and `:477` is `if (mp.dit_path == nullptr) Usage(2);`, outside it |
+| `ltx25-oracle-absolute` | `tools/oracle/ltx2_oracle.py:88` should read `:89` | **HOLDS.** `:89` is `NUM_INFERENCE_STEPS = 8` |
 
-The repair is not a third line number. It is the anchor form AGENTS.md and
-`check-symbol-anchors.py` both ask for: name the SYMBOL, which survives every
-edit that does not rename it, and which the existing gate already checks. A
-correction written as a line number is a correction with an expiry date, and
-these two expired inside two weeks.
+An earlier draft of this row claimed the middle row had rotted too, on a reading
+that the flag loop now ran past `:490`. It does not: `:490` is
+`if (!last_frame.empty()) vp.last_frame = last_frame.c_str();`, a post-parse
+assignment fourteen lines below the loop's closing brace, and the file holds
+exactly one `for (int i = 1; i < argc; ++i)`. A row whose subject is a stale
+anchor read as evidence had made a staleness claim about an anchor that is
+fresh, which is the same defect pointed the other way, so it is corrected here
+rather than softened.
+
+Both replacements still land, because the argument for the symbol form never
+rested on the count. The repair is not a third line number: it is the anchor
+form AGENTS.md and `check-symbol-anchors.py` both ask for — name the SYMBOL,
+which survives every edit that does not rename it, and which the existing gate
+already checks. A correction written as a line number is a correction with an
+expiry date; one of these two expired inside two weeks and the other has not yet.
+Replacing the one that holds is a strict improvement rather than a repair, and
+this section says which is which so that a later reader does not have to guess.
+
+### 4.1 An anchor that RESOLVES, onto unrelated prose
+
+The out-of-range test cannot see the worst case, and `ltx25-dfr-rounds.md:89`
+carries it. That bullet cites `docs/FEATURES.md:175` for the claim that a
+`checkpoint_class` declaration is never checked against the checkpoint header.
+`docs/FEATURES.md:175` resolves — the file is long enough — and at `855905f59`
+it is a sentence about `Ltx2TokenizeGemmaPrompt` and Gemma tokenization, with
+nothing to do with checkpoint classes. Nothing mechanical reports that. A line
+number carries no claim, so the only test is to read the citing prose for what
+it asserts and then read the cited line, which is what
+`check-symbol-anchors.py`'s own header describes and what §"Scope" hands back as
+`NEEDS_DECISION`.
+
+The same bullet's other anchor, `docs/USAGE.md:1528`, is merely dead: that file
+is 862 lines and holds no `keyframe_slot_sft` at all, because #1491 moved the
+model recipes to `docs/models/ltx-2-5.md`. Both are replaced in that spec by
+what survives a move — the feature table's row label, and the section heading —
+rather than by two more numbers.
 
 ## 5. What the tree has falsified
 
@@ -171,8 +226,17 @@ scripts/agent-preflight.sh --staged
 ```
 
 The symbol anchors this row introduces are gated by the first command, which is
-the point of writing them in that form. The line anchors it corrects are gated
-by nothing, which is the debt §"Scope" hands back as `NEEDS_DECISION`.
+the point of writing them in that form. **Only one of the two carries a
+DETECTABLE violation.** `src/vt/cpu/cpu_ops.cpp::MatmulOneChunk` does: renaming
+that function is an ordinary edit, and the mutation in the pull request body
+proves the gate reds on it by name. `examples/ltx2_gen/main.cpp::main` does not,
+in any practical sense: the gate can only fire if the token `main` leaves
+`main.cpp`, which will not happen while the file is a program, so that anchor is
+checked in form and unfalsifiable in fact. The claim it actually supports — that
+`git grep -n '"--steps"' examples/ltx2_gen/` returns exactly one line — is prose,
+and prose is gated by nothing. That is the same debt in a second place, and it is
+named rather than counted as coverage. The line anchors this row corrects are
+gated by nothing either, which is what §"Scope" hands back as `NEEDS_DECISION`.
 
 ## 9. Risks
 
@@ -190,10 +254,10 @@ by nothing, which is the debt §"Scope" hands back as `NEEDS_DECISION`.
 
 ## Owed
 
-- **The `path:line` class is still gated by nothing.** 1,668 of them in the
-  `ltx25-*` specs alone. Extending `check-symbol-anchors.py` is
+- **The `path:line` class is still gated by nothing.** 1,708 of them in the
+  `ltx25-*` specs alone, at `855905f59`. Extending `check-symbol-anchors.py` is
   `NEEDS_DECISION`, returned rather than taken: see §"Scope".
-- **The 643 resolvable, in-range `path:line` citations are not individually
+- **The 640 resolvable, in-range `path:line` citations are not individually
   verified.** Out-of-range is mechanical; in-range is a reading. This row read
   the ones the twelve owed items name and the ones a corroboration sweep flagged,
   and it does not claim the remainder are fresh — it claims nothing about them.

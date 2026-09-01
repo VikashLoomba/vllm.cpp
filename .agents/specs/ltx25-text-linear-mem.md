@@ -227,7 +227,7 @@ paragraph describes the plan rather than what shipped.
   it wrong and nothing tells the next reader which count is the measurement.
   Nine hundred more line anchors landed in the twelve days between the two
   readings and the gap did not narrow. Row `LTX25-ANCHOR-REPAIR` resolved the
-  1,668 of them that live in the `ltx25-*` specs and returned the checker
+  1,708 of them that live in the `ltx25-*` specs at `855905f59` and returned the checker
   extension as `NEEDS_DECISION` rather than taking it, for the reason this
   bullet gives and for one more that is design rather than budget: a bare line
   number carries no claim, so a checker for it has no expectation to check

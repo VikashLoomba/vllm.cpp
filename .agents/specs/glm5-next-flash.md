@@ -5288,6 +5288,25 @@ Debts this row carries, each visible rather than waived:
   the habit, and this entry is the record of the second instance so a third one
   is visible as a pattern.
 
+  **The third one arrived before this wave finished, and it came from the
+  DISPATCH BRIEFING rather than from a record.** W9c-3a was briefed that "the
+  `agent-record` CI job reds on every PR (`ci.yml:189` invokes a file
+  `7dc2ef1ea` deleted), owned by #2407/#2409", with an instruction to verify it
+  by diff rather than inherit it. Verified on `16442292b`, every clause is
+  false: `ci.yml:189` is `python3 tests/scripts/test_agent_issue_index.py` and
+  that file EXISTS; `7dc2ef1ea` deleted exactly
+  `scripts/check-issue-index-append-only.py` and
+  `tests/scripts/test_check_issue_index_append_only.py`, and `ci.yml` references
+  NEITHER (0 hits each); all three commands that job runs exit 0 locally; and
+  [#2407](https://github.com/mudler/vllm.cpp/issues/2407) and
+  [#2409](https://github.com/mudler/vllm.cpp/issues/2409) are both CLOSED.
+
+  That variant is worth separating from the other two. A stale entry in `##
+  Owed` is at least in a file somebody will read again; a stale block in the
+  prose that DISPATCHES a wave is read once, by an agent with no reason to doubt
+  it, at the moment it is deciding what is possible. The instruction to verify
+  it is what caught this one, and it is the only thing that could have.
+
 - **O45 -- NO TOKEN HAS COME OUT OF THIS MODEL ON A GPU, and W9c-3a did not
   produce one.** The end-to-end `--device cuda` leg on the 101.24 GiB artifact
   is written (`/workspace/glm53-devexp/run.sh`) and SUBMITTED to `dgx:gpu0` as

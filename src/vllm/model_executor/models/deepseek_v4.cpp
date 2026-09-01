@@ -1615,6 +1615,42 @@ std::vector<char> Exl3FusedMoePass(const V4Backend& be, const DeepseekV4Exl3Laye
     need(s_g, "state_g"); need(s_u, "state_u");
     need(i_g, "intermediate_g"); need(i_u, "intermediate_u");
 
+    // VT_DSV4_EXL3_MOE_TRACE=1 dumps every operand the kernel receives (#2458).
+    // The per-pointer and per-operand checks above pass and the kernel still
+    // faults at a NULL base, so what is left to establish is what the VALUES
+    // are -- pointer identity, the routing arithmetic, and the launch geometry.
+    // Deduction has already cost two hardware round-trips; this makes one round
+    // trip answer it. Off by default and read once per call, which is the same
+    // shape as VT_POOL_BYPASS and the fused-arm rollback beside it.
+    if (const char* tr = std::getenv("VT_DSV4_EXL3_MOE_TRACE");
+        tr != nullptr && tr[0] == '1') {
+      int64_t cnt_sum = 0;
+      for (int64_t e = 0; e < ne; ++e) cnt_sum += expert_count[static_cast<size_t>(e)];
+      std::fprintf(stderr,
+                   "[dsv4 moe trace] ne=%lld T=%lld topk=%lld H=%lld mi=%lld "
+                   "assignments=%lld max_rows=%lld num_active=%d cnt_sum=%lld "
+                   "cnt[ne]=%lld\n",
+                   (long long)ne, (long long)T, (long long)topk, (long long)H,
+                   (long long)mi, (long long)assignments, (long long)max_rows,
+                   args.num_active, (long long)cnt_sum,
+                   (long long)expert_count[static_cast<size_t>(ne)]);
+      std::fprintf(stderr,
+                   "[dsv4 moe trace] tables g_tr=%p g_su=%p cnt=%p tok=%p wgt=%p "
+                   "out=%p hid=%p s_g=%p i_g=%p\n",
+                   tg1.data, tg2.data, t_cnt.data, t_tok.data, t_wgt.data,
+                   t_out_d.data, t_hid_d.data, s_g.data, i_g.data);
+      // The ENTRIES, which is what the kernel actually dereferences. A null here
+      // with a non-null table is the shape the sanitizer's NULL base implies.
+      for (int64_t e = 0; e < ne && e < 4; ++e)
+        std::fprintf(stderr,
+                     "[dsv4 moe trace] expert %lld count=%lld g_tr=%p g_su=%p "
+                     "g_sv=%p d_tr=%p\n",
+                     (long long)e, (long long)expert_count[static_cast<size_t>(e)],
+                     (void*)g_tr[static_cast<size_t>(e)],
+                     (void*)g_su[static_cast<size_t>(e)],
+                     (void*)g_sv[static_cast<size_t>(e)],
+                     (void*)d_tr[static_cast<size_t>(e)]);
+    }
     vt::Exl3MoeMlp(*q, t_out_d, t_hid_d, dtables, drouting, dtemps, args);
     vt::GetBackend(dev).Synchronize(*q);
     vt::GetBackend(dev).Copy(*q, out->data(), b_out.t().data,

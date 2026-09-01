@@ -1766,7 +1766,7 @@ Ltx2PipelineRecipe Ti2VidTwoStageRecipe(const Ltx2PipelineParams& params,
   // (`:243-245`) is resolved at run time from the request's step count.
   stage1.sigmas = {};
   stage1.use_official_sigma_schedule = true;
-  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:31` reads as
+  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:32` reads as
   // `default_number_of_tokens` = 4096 rather than as the target grid. This is
   // the field this arm could not be written with before row
   // LTX25-TI2VID-RECIPE, and the ONE upstream site that goes the other way is
@@ -1953,7 +1953,7 @@ Ltx2PipelineRecipe KeyframeInterpolationRecipe(const Ltx2PipelineParams& params,
   // (`:199-200`) is resolved at run time from the request's step count.
   stage1.sigmas = {};
   stage1.use_official_sigma_schedule = true;
-  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:31` reads as
+  // ...AND THAT SAME CALL PASSES NO LATENT, which `schedulers.py:32` reads as
   // `default_number_of_tokens` = 4096 rather than as the target grid. The ONE
   // upstream site that goes the other way is `ti2vid_two_stages_hq.py:267`, i.e.
   // `Res2sTwoStageRecipe`, which leaves this at the default. That three shipped

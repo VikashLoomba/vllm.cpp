@@ -11262,7 +11262,7 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   // rather than on the recipe struct — the recipe case proves the field is SET,
   // and this one proves it is CONSUMED (#1013).
   //
-  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:32` is
   // `tokens = math.prod(latent.shape[2:]) if latent is not None else
   // default_number_of_tokens`, with `default_number_of_tokens` = MAX_SHIFT_ANCHOR
   // = 4096 (`:11`, `:29`). `ti2vid_two_stages.py:243-245` passes NO latent;
@@ -11513,7 +11513,7 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
   // `image_conditionings_by_adding_guiding_latent` (helpers.py:343-367) from
   // `combined_image_conditionings` (:272-308): the second sends `frame_idx == 0`
   // to `VideoConditionByLatentIndex`, which REPLACES latent frame 0's clean
-  // tokens and never changes the token count (latent_cond.py:38-39); the first
+  // tokens and never changes the token count (latent_cond.py:40-41); the first
   // has NO branch and sends it to `VideoConditionByKeyframeIndex`, which APPENDS
   // a latent frame of tokens (keyframe_cond.py:79-82).
   //
@@ -11593,7 +11593,7 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
   CHECK_MESSAGE(ti.video_tokens == bare.video_tokens,
                 "`combined_image_conditionings` sends frame 0 to "
                 "`VideoConditionByLatentIndex`, which replaces tokens that already exist "
-                "(latent_cond.py:38-39), so the count must not move — it went from "
+                "(latent_cond.py:40-41), so the count must not move — it went from "
                     << bare.video_tokens << " to " << ti.video_tokens);
   CHECK(kf_bare.video_tokens == bare.video_tokens);
 
@@ -11862,7 +11862,7 @@ TEST_CASE("ltx2 keyframe: the pipeline renders through vllm.h, guided on the UNA
 }
 
 TEST_CASE("ltx2 keyframe: stage 1's sigma shift takes the 4096 anchor, not the target grid") {
-  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:32` is
   // `tokens = math.prod(latent.shape[2:]) if latent is not None else
   // default_number_of_tokens`, with `default_number_of_tokens` = MAX_SHIFT_ANCHOR
   // = 4096 (`:11`, `:29`). `keyframe_interpolation.py:199-200` passes NO latent;

@@ -211,9 +211,23 @@ mutation that never applied cannot read as a pass.
 - **`__dp4a`-vectorised 32-block dot.** The scalar loop here is correct and
   on-device; llama.cpp's `vec_dot_q4_0_q8_1_impl` is the shape to port. No
   throughput floor is claimed by this row.
-- **An end-to-end `qwen4_exp` CUDA forward on the released checkpoint.** Blocked
-  independently of this row by the block-decoding n-gram gather having no CUDA
-  arm (#2380). This row removes the keep-quant blocker only.
+- **An end-to-end `qwen4_exp` CUDA forward on the released checkpoint.** This row
+  removes the keep-quant blocker only, and it does NOT claim the forward runs.
+
+  An earlier draft of this entry named the block-decoding n-gram gather as the
+  independent blocker, citing #2380. **That is now false, and merging `main`
+  is what falsified it** rather than any measurement here:
+  [#2396](https://github.com/mudler/vllm.cpp/issues/2396) landed
+  `OpId::kEmbeddingQuant` for CUDA (`src/vt/cuda/cuda_ops.cu:4017`) and rewrote
+  `DeviceQuantGatherSupported` to ask `vt::OpRegistered(kEmbeddingQuant, dev)`
+  (`gguf_keep_quant.cpp:187-189`), so a block-quantized gather table is admitted
+  on CUDA and that blocker is gone. The claim is corrected rather than deleted,
+  because a spec that quietly drops a refuted sentence teaches nothing.
+
+  What this row can still NOT speak for: the QSA block reads two tables on the
+  HOST (`qwen4_exp_qsa_block.cpp:142` says so in the tree), which is the wave
+  QSADEV owns and this row must not touch. Whether anything else refuses after
+  that is unmeasured HERE and is not this row's to assert.
 - **`.agents/quantization-matrix.md` is stale for two of these three, and this row
   did not fix it.** `QUANT-GGUF-Q5_0` and `QUANT-GGUF-IQ4_NL` read `INVENTORIED`
   with `-` in every column and an empty evidence cell, while

@@ -3226,6 +3226,17 @@ not change the host arm.
 **No speed number is admissible from any of them** (O47: 89% generation spread
 across three identical legs, cause unknown), and none is claimed.
 
+**C-against-D byte-identity also answers a SECOND question, and that is why the
+legs run two tokens rather than one.** The async runner can hand a forward
+`ModelForwardInput::device_token_ids` and leave `token_ids` deliberately stale
+for decode rows (`v1/worker/gpu/runner.cpp:2374-2414, 2748`); this model reads
+`token_ids` and ignores the device field. Whether that path ENGAGES here is not
+established -- it needs `async_input_combine_`, and this row has never observed a
+decode step on a device queue -- so it is not filed as a defect. It is named
+here because a two-token leg contains exactly one decode step, so a leg C whose
+stdout matches leg D byte-for-byte has measured it, and a leg C that emits
+` Paris` followed by the wrong second token has found it.
+
 #### Mutations, with what each one killed
 
 Every mutation is applied to PRODUCT code and rebuilt, because a mutation the

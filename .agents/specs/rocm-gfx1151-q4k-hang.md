@@ -156,6 +156,37 @@ reader will otherwise re-derive them.
   exactly, so the repair belongs on both backends together and not inside a
   gfx1151 row.
 
+## Gate state on this change
+
+`scripts/agent-preflight.sh --staged` on `d6fc76152`: **no gate FAILED** and no
+`gate(s) failed` line. It still reports `NOT a green preflight`, and the reason is
+five SKIPS, each printed with its cause:
+
+| skipped gate | why |
+|---|---|
+| `check-arm-isa-build.py` | needs `--compile-commands` |
+| `check-cpu-isa-build.py` | needs `--compile-commands` |
+| `check-cuda-fat-gencode.py` | needs `--compile-commands` |
+| `check-triton-aot-multiarch.py` | needs `--vendored-root` |
+| `check-pr-size.py` | needs `--base` / `--head`; there is no pull request |
+
+**Say the consequence plainly: nothing on the dev box compiles the `.hip` edit.**
+The three build gates want a compile-commands database, and this row was worked
+under an instruction not to compile locally (another agent holds the box's
+compile slot, and parallel builds have OOM-killed it). So the ONLY compile
+evidence for `Fmt == 3` is the rc job's own rebuild on `strix:gpu0`, which is why
+`q6k.sh` aborts on a non-zero build and again if the rebuilt binary is
+byte-identical to the original -- a leg run after a build that silently did
+nothing would read as a result and be none.
+
+One earlier preflight run reported `test_cpu_x86_llamacpp_floor` FAILED at
+`test_a_contended_leg_is_discarded_and_never_summarised`. It passes standalone
+(10 tests, `OK`) and passes in the next full preflight. The box load was 21-31
+from other agents' builds at the failing run and 12.7 at the passing one, which
+is the already-recorded load flakiness of that harness test. It is not reachable
+from this diff, which touches one ROCm `.hip` file, one allowlist line and this
+spec.
+
 ## Stop conditions
 
 - A cause that is in the AMD driver or firmware rather than in this tree ends the

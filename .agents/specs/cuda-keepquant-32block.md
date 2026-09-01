@@ -187,8 +187,27 @@ three rows drives every case in the file at once.
 | `CUDA keep-quant runs every kCases dtype INSIDE a stream capture` | **the path.** `cudaStreamSynchronize` on a capturing stream fails, so this is red for exactly the dtypes that drain and green for the ones that do not. Asserts the counted property `captured == std::size(kCases)`. | *which* device kernel ran, or how fast |
 | fused-MoE grouped case | that `MoeGateUpSwiGLUGrouped` returns values instead of throwing by name | end-to-end MoE numerics on the real checkpoint |
 
-The capture gate is the red-first discriminator. The parity gate is what says
-the new kernel is *correct* once it runs.
+**MEASURED CORRECTION: on GB10 the capture gate is NOT the observed
+discriminator, and this row does not get to claim it was.** The design argument
+above stands -- a drained stream cannot be captured -- and it is what makes the
+gate's GREEN meaningful after the change. But on the pre-change tree the crash
+described above arrives first: `Backend::Alloc` is a plain `cudaMalloc`, the CPU
+fallback dereferences a device pointer, and the run dies with SIGSEGV inside the
+FIRST case in the file (`test_cuda_quant_dot.cpp:268`, the dense parity gate).
+doctest then aborts the binary and reports the remaining **17 cases skipped**,
+the capture case at `:1307` among them.
+
+So the capture gate has only ever been observed GREEN here, never RED. The
+red-first evidence on this hardware is the crash, not the capture. That is a
+stronger red and a weaker gate-attribution at the same time, and both halves are
+recorded because only the first half flatters this row.
+
+What would make the capture gate the actual discriminator is a device where
+`Backend::Alloc` is host-addressable, so the fallback returns correct numbers at
+host speed instead of faulting. No device on this fleet does that, so the claim
+stays UNMEASURED rather than false, and it is not offered as evidence.
+
+The parity gate is what says the new kernel is *correct* once it runs.
 
 Neither needs the real checkpoint, and neither can speak for it. What is proven
 on a fixture is the dot, the dispatch and the capturability; what is **not**

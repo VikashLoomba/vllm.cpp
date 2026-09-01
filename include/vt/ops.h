@@ -748,6 +748,68 @@ enum class OpId : uint8_t {
   // name, and their arms are owed.
   // Appended before kCount so no existing op's id shifts.
   kEmbeddingQuant,
+  // MODEL-MM-GLM53-FLASH W9c-0 ([#2415]) — GLM-5.3-Flash's K-POOL DSA indexer,
+  // the one primitive family on this model's critical path that nothing in this
+  // tree implemented on a device.
+  //
+  // THIS IS NOT THE LIGHTNING INDEXER AND THE PAIR ABOVE CANNOT SERVE IT.
+  // `kDsaIndexerLogits` / `kDsaTopkSelect` score RAW TOKENS and pick the top
+  // `index_topk` of them. `Glm5NextTextIndexer` (transformers v5.16.1,
+  // `models/glm5_next/modular_glm5_next.py`) compresses `index_kpool = 4`
+  // consecutive VALID tokens into one candidate under a LEARNED per-channel
+  // 4-way softmax, picks the top `index_topk / index_kpool = 512` POOLS, expands
+  // each back into its member token indices, and then appends the ragged visible
+  // tail raw and UNSCORED. Feeding raw candidates into a pooled top-k, or pooled
+  // candidates into a consumer expecting raw ones, yields plausible indices
+  // either way — which is why this is a separate op family and not a mode.
+  //
+  // Composition out of what already exists was checked and is not available:
+  // this `OpId` inventory has no general softmax, no general reduction and no
+  // pooled gather, and its only top-k entries are `kMoeRouterTopK` and the
+  // sampler's `kTopKValuesIndices`, neither of which selects over pools or
+  // expands a pool back to its members.
+  //
+  // kGlm5NextKpoolCompress — `get_pooled_states` (`:897-970`). The pool grid
+  // starts at the first VALID token and not at slot 0, so a left-padded row
+  // groups differently; a pool is a candidate only when ALL of its members are
+  // valid; and `keep = pool_valid.any(0)` (`:968`) COMPACTS the pool axis. That
+  // compaction is not cosmetic: `select_k = min(index_topk // index_kpool, P)`
+  // reads the compacted width, and a `P` too large by one moves the ragged
+  // tail's write offset and changes what the final truncation keeps. So the op
+  // compacts ON THE DEVICE and publishes `P` as a `[1]` i32 DEVICE scalar. It
+  // never synchronises and never returns anything to the host.
+  //
+  // kGlm5NextKpoolSelect — the selection half of `forward` (`:821-875`), with
+  // `get_visible_tokens` (`:877-895`) folded in as a PREDICATE rather than
+  // materialised (a `[B, S, kv_len]` visibility tensor is 2.7 GiB at 32k
+  // context for something a thread evaluates in two instructions; upstream
+  // materialises it because torch has no other way to gather under it) and
+  // `append_visible_tail` (`:972-1022`) folded in as the tail write, because the
+  // tail's write offset is `select_k * index_kpool` and only this op knows `P`.
+  // Output width is `index_topk + index_kpool - 1` = **2051** on the published
+  // checkpoint, not 2048, and it carries `-1` sentinels and duplicates, which
+  // upstream absorbs downstream with `scatter_add_` + `ne(0)`.
+  //
+  // f32 THROUGHOUT, which is upstream's own arithmetic and not a choice:
+  // `:823` scores in fp32 and `:960-964` takes the pool softmax in fp32. The
+  // HOST reference `glm5_next_dsa.cpp` accumulates in `double`, a
+  // host-reference widening the device deliberately does not copy — a fp64 pool
+  // softmax would put the model path on the 1/64-rate pipe to be more precise
+  // than the thing it mirrors.
+  //
+  // Registered on kCUDA ONLY (src/vt/cuda/cuda_glm5_next.cu). There is
+  // deliberately NO CPU provider: the CPU answer is `glm5_next_dsa.cpp`, which
+  // is this family's ORACLE, and registering it a second time under these ids
+  // would make the seam its own oracle. A CPU queue is therefore refused BY NAME
+  // by the dispatcher.
+  //
+  // Additive, and NOT REACHED from any production entry point yet: only
+  // `tests/vllm/models/test_glm5_next_kpool_device.cpp` and the availability
+  // probe `vllm::glm5_next::KpoolDeviceOpsAvailable()` call them. W9c-3 owns the
+  // wiring and #2410 tracks it; the spec's O36 says so in the specific.
+  // Appended before kCount so no existing op's id shifts.
+  kGlm5NextKpoolCompress,
+  kGlm5NextKpoolSelect,
   kCount
 };
 
@@ -2316,6 +2378,37 @@ using Qwen4ExpQsaGatherAttentionFn = void (*)(Queue&, Tensor& /*out*/,
                                               const Tensor& /*block_ids*/,
                                               const Tensor& /*kv_lens*/,
                                               const Qwen4ExpQsaAttnArgs&);
+// GLM-5.3-Flash k-pool DSA indexer (MODEL-MM-GLM53-FLASH W9c-0, #2415). The
+// pooled-candidate selection `vt::DsaIndexerLogits` / `vt::DsaTopkSelect`
+// cannot express, because those two score RAW TOKENS. See the OpId comments.
+struct Glm5NextKpoolSelectArgs {
+  // `config.index_topk` — 2048 on the published checkpoint. The pool budget is
+  // `index_topk // index_kpool` and `validate_architecture` enforces that the
+  // division is exact (`configuration_glm5_next.py:219-220`).
+  int64_t index_topk = 0;
+  // `cache_layer.get_seq_length()` (`modular_glm5_next.py:811`). It differs from
+  // `kv_len` only on a STATIC cache padded to a maximum length; the query at
+  // step `s` sits at `current_length - seq_len + s`, which is what lets a decode
+  // step's single query see the whole cached prefix instead of only slot 0.
+  int64_t current_length = 0;
+  // `self.softmax_scale = self.head_dim ** -0.5` (`modeling_glm5_next.py:765`).
+  // The INDEXER head dim, not the MLA one.
+  float softmax_scale = 0.0f;
+  // `config.index_kpool_always_select_tail`. True on the published checkpoint,
+  // and it is what widens the output to `index_topk + index_kpool - 1`.
+  bool always_select_tail = true;
+};
+using Glm5NextKpoolCompressFn = void (*)(Queue&, Tensor& /*pool_keys*/,
+                                         Tensor& /*pool_indices*/, Tensor& /*pool_valid*/,
+                                         Tensor& /*num_pools*/, const Tensor& /*packed*/,
+                                         const Tensor& /*ape*/);
+using Glm5NextKpoolSelectFn =
+    void (*)(Queue&, Tensor& /*topk_indices*/, Tensor& /*index_scores*/,
+             const Tensor& /*q_states*/, const Tensor& /*head_weights*/,
+             const Tensor& /*pool_keys*/, const Tensor& /*pool_indices*/,
+             const Tensor& /*pool_valid*/, const Tensor& /*num_pools*/,
+             const Tensor& /*valid_keys*/, const Tensor& /*q_mask*/,
+             const Glm5NextKpoolSelectArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -4880,6 +4973,56 @@ void DsaIndexerLogits(Queue& q, Tensor& logits, const Tensor& q_states, const Te
 // because the online softmax then sees the identical summation order. CPU + CUDA.
 void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logits,
                    const Tensor& win_start, const Tensor& win_end);
+
+// GLM-5.3-Flash's k-pool DSA indexer — the LEARNED pooled compression
+// (`Glm5NextTextIndexer.get_pooled_states`, `modular_glm5_next.py:897-970` @
+// transformers v5.16.1) and the pooled selection that consumes it
+// (`forward` `:821-875`, with `get_visible_tokens` `:877-895` folded in as a
+// predicate and `append_visible_tail` `:972-1022` as the tail write). vLLM
+// implements `glm5_next` at no revision, so transformers is the reference here
+// under AGENTS.md "When vLLM has no implementation". CUDA only.
+//
+//   packed       f32 [batch, kv_len, 2 * head_dim + 1] — `concat[k, gate, valid]`
+//                (`:798-801`), the FULL key history the pool grid is re-formed
+//                over on every call
+//   ape          f32 [index_kpool, head_dim] — `index_kpool_compress_ape`
+//   pool_keys    f32 [batch, np, head_dim]        np = ceil(kv_len / index_kpool)
+//   pool_indices i32 [batch, np, index_kpool]     -1 for an invalid member
+//   pool_valid   i32 [batch, np]                  1 iff ALL members are valid
+//   num_pools    i32 [1]                          `P` AFTER `keep` (`:968-970`)
+//
+// `np` is the STATIC upper bound and `P <= np` is the live width. Only
+// `[0, P)` carries meaning; the slack is zeroed (and `pool_indices` filled with
+// the -1 sentinel) so a downstream read of it is empty rather than undefined.
+// `num_pools` stays on the DEVICE: the whole point of the family is that the
+// eleven DSA layers stop paying a device-to-host round trip per step.
+void Glm5NextKpoolCompress(Queue& q, Tensor& pool_keys, Tensor& pool_indices,
+                           Tensor& pool_valid, Tensor& num_pools, const Tensor& packed,
+                           const Tensor& ape);
+
+// The selection over those pooled candidates.
+//
+//   q_states     f32 [batch, seq_len, index_n_heads, head_dim] — `wq_b(q_resid)` (`:795`)
+//   head_weights f32 [batch, seq_len, index_n_heads] — `weights_proj(hidden)` BEFORE
+//                the `n_heads ** -0.5` scale, which this op applies (`:827`)
+//   valid_keys   i32 [batch, kv_len] — the packed row's validity channel (`:814`)
+//   q_mask       i32 [batch, seq_len] — the query-side padding mask (`:873`)
+//   topk_indices i32 [batch, seq_len, index_topk (+ index_kpool - 1)] — **2051**
+//                wide on the published checkpoint, NOT 2048, carrying -1
+//                sentinels and possible duplicates, which upstream absorbs with
+//                `scatter_add_` + `ne(0)` (`:1119-1129`)
+//   index_scores f32 [batch, seq_len, np] — the per-pool score BEFORE the
+//                validity mask (`:828`). It is an output rather than an internal
+//                because it is the only way a gate can show the selection is a
+//                strict separation and not a coin flip: top-k error is BIMODAL,
+//                so a tolerance on the selected values passes a wrong set whose
+//                values happen to be close.
+void Glm5NextKpoolSelect(Queue& q, Tensor& topk_indices, Tensor& index_scores,
+                         const Tensor& q_states, const Tensor& head_weights,
+                         const Tensor& pool_keys, const Tensor& pool_indices,
+                         const Tensor& pool_valid, const Tensor& num_pools,
+                         const Tensor& valid_keys, const Tensor& q_mask,
+                         const Glm5NextKpoolSelectArgs& args);
 
 // --- MLA prefill attention (MLA campaign W5) --------------------------------
 // The MHA prefill half of Multi-head Latent Attention — upstream's

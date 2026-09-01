@@ -4345,6 +4345,166 @@ void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logi
       q, indices, counts, logits, win_start, win_end);
 }
 
+void Glm5NextKpoolCompress(Queue& q, Tensor& pool_keys, Tensor& pool_indices,
+                           Tensor& pool_valid, Tensor& num_pools, const Tensor& packed,
+                           const Tensor& ape) {
+  VT_CHECK(packed.rank == 3,
+           "glm5_next_kpool_compress: packed must be rank-3 [batch, kv_len, "
+           "2 * index_head_dim + 1] — the indexer cache row is "
+           "`concat[k, gate_scores, valid]` (modular_glm5_next.py:798-801 @ "
+           "transformers v5.16.1), not the 128-wide key DeepSeek-V4 caches");
+  VT_CHECK(ape.rank == 2,
+           "glm5_next_kpool_compress: ape must be rank-2 [index_kpool, index_head_dim]");
+  VT_CHECK(pool_keys.rank == 3 && pool_indices.rank == 3 && pool_valid.rank == 2 &&
+               num_pools.rank == 1,
+           "glm5_next_kpool_compress: pool_keys/pool_indices must be rank-3, pool_valid "
+           "rank-2, num_pools rank-1");
+  const int64_t batch = packed.shape[0];
+  const int64_t kv_len = packed.shape[1];
+  const int64_t kpool = ape.shape[0];
+  const int64_t head_dim = ape.shape[1];
+  VT_CHECK(batch > 0 && kv_len > 0 && head_dim > 0,
+           "glm5_next_kpool_compress: batch/kv_len/index_head_dim must be > 0");
+  VT_CHECK(kpool >= 1,
+           "glm5_next_kpool_compress: index_kpool must be >= 1 "
+           "(configuration_glm5_next.py:216-217); it is 4 on the published checkpoint "
+           "and 16 in the config class, so a defaulted value is wrong by a factor of "
+           "four");
+  VT_CHECK(packed.shape[2] == 2 * head_dim + 1,
+           "glm5_next_kpool_compress: packed's row must be 2 * index_head_dim + 1 wide");
+  const int64_t np = (kv_len + kpool - 1) / kpool;
+  VT_CHECK(pool_keys.shape[0] == batch && pool_keys.shape[1] == np &&
+               pool_keys.shape[2] == head_dim,
+           "glm5_next_kpool_compress: pool_keys must be [batch, ceil(kv_len / "
+           "index_kpool), index_head_dim] — the STATIC upper bound, because the live "
+           "width P is only known after the `keep` compaction (:968-970)");
+  VT_CHECK(pool_indices.shape[0] == batch && pool_indices.shape[1] == np &&
+               pool_indices.shape[2] == kpool,
+           "glm5_next_kpool_compress: pool_indices must be [batch, np, index_kpool]");
+  VT_CHECK(pool_valid.shape[0] == batch && pool_valid.shape[1] == np,
+           "glm5_next_kpool_compress: pool_valid must be [batch, np]");
+  VT_CHECK(num_pools.shape[0] == 1,
+           "glm5_next_kpool_compress: num_pools must be a [1] DEVICE scalar — reading P "
+           "back to the host is the round trip this op family exists to remove");
+  VT_CHECK(packed.dtype == DType::kF32 && ape.dtype == DType::kF32 &&
+               pool_keys.dtype == DType::kF32,
+           "glm5_next_kpool_compress: packed/ape/pool_keys must be f32 — upstream scores "
+           "and pools in fp32 (:823, :960-964)");
+  VT_CHECK(pool_indices.dtype == DType::kI32 && pool_valid.dtype == DType::kI32 &&
+               num_pools.dtype == DType::kI32,
+           "glm5_next_kpool_compress: pool_indices/pool_valid/num_pools must be i32");
+  VT_CHECK(packed.IsContiguous() && ape.IsContiguous() && pool_keys.IsContiguous() &&
+               pool_indices.IsContiguous() && pool_valid.IsContiguous() &&
+               num_pools.IsContiguous(),
+           "glm5_next_kpool_compress: every operand must be contiguous");
+  VT_CHECK(packed.device == q.device && ape.device == q.device &&
+               pool_keys.device == q.device && pool_indices.device == q.device &&
+               pool_valid.device == q.device && num_pools.device == q.device,
+           "glm5_next_kpool_compress: device mismatch (operands/queue)");
+  reinterpret_cast<Glm5NextKpoolCompressFn>(
+      GetOp(OpId::kGlm5NextKpoolCompress, q.device.type))(q, pool_keys, pool_indices,
+                                                          pool_valid, num_pools, packed,
+                                                          ape);
+}
+
+void Glm5NextKpoolSelect(Queue& q, Tensor& topk_indices, Tensor& index_scores,
+                         const Tensor& q_states, const Tensor& head_weights,
+                         const Tensor& pool_keys, const Tensor& pool_indices,
+                         const Tensor& pool_valid, const Tensor& num_pools,
+                         const Tensor& valid_keys, const Tensor& q_mask,
+                         const Glm5NextKpoolSelectArgs& args) {
+  VT_CHECK(q_states.rank == 4,
+           "glm5_next_kpool_select: q_states must be rank-4 [batch, seq_len, "
+           "index_n_heads, index_head_dim]");
+  VT_CHECK(head_weights.rank == 3,
+           "glm5_next_kpool_select: head_weights must be rank-3 [batch, seq_len, "
+           "index_n_heads] — the weights_proj output BEFORE the n_heads ** -0.5 scale, "
+           "which this op applies (:827)");
+  VT_CHECK(pool_keys.rank == 3 && pool_indices.rank == 3 && pool_valid.rank == 2,
+           "glm5_next_kpool_select: the pooled candidate set must come from "
+           "vt::Glm5NextKpoolCompress unchanged");
+  VT_CHECK(num_pools.rank == 1 && num_pools.shape[0] == 1,
+           "glm5_next_kpool_select: num_pools must be the [1] DEVICE scalar the compress "
+           "op published");
+  VT_CHECK(valid_keys.rank == 2 && q_mask.rank == 2,
+           "glm5_next_kpool_select: valid_keys must be [batch, kv_len] and q_mask "
+           "[batch, seq_len]");
+  VT_CHECK(topk_indices.rank == 3 && index_scores.rank == 3,
+           "glm5_next_kpool_select: topk_indices/index_scores must be rank-3");
+  const int64_t batch = q_states.shape[0];
+  const int64_t seq_len = q_states.shape[1];
+  const int64_t n_heads = q_states.shape[2];
+  const int64_t head_dim = q_states.shape[3];
+  const int64_t np = pool_keys.shape[1];
+  const int64_t kpool = pool_indices.shape[2];
+  const int64_t kv_len = valid_keys.shape[1];
+  VT_CHECK(batch > 0 && seq_len > 0 && n_heads > 0 && head_dim > 0 && kv_len > 0,
+           "glm5_next_kpool_select: batch/seq_len/index_n_heads/index_head_dim/kv_len "
+           "must be > 0");
+  VT_CHECK(kpool >= 1, "glm5_next_kpool_select: index_kpool must be >= 1");
+  VT_CHECK(args.index_topk > 0, "glm5_next_kpool_select: index_topk must be > 0");
+  VT_CHECK(args.index_topk % kpool == 0,
+           "glm5_next_kpool_select: index_topk must be divisible by index_kpool — the "
+           "pool budget `index_topk // index_kpool` is exact upstream "
+           "(configuration_glm5_next.py:219-220)");
+  VT_CHECK(kv_len >= seq_len,
+           "glm5_next_kpool_select: kv_len must be at least seq_len — the current window "
+           "is always part of the key history it selects over");
+  VT_CHECK(args.current_length >= seq_len,
+           "glm5_next_kpool_select: current_length must be at least seq_len; the query at "
+           "step s sits at current_length - seq_len + s (:892)");
+  VT_CHECK(pool_keys.shape[0] == batch && pool_keys.shape[2] == head_dim,
+           "glm5_next_kpool_select: pool_keys must be [batch, np, index_head_dim]");
+  VT_CHECK(pool_indices.shape[0] == batch && pool_indices.shape[1] == np,
+           "glm5_next_kpool_select: pool_indices must be [batch, np, index_kpool]");
+  VT_CHECK(pool_valid.shape[0] == batch && pool_valid.shape[1] == np,
+           "glm5_next_kpool_select: pool_valid must be [batch, np]");
+  VT_CHECK(np == (kv_len + kpool - 1) / kpool,
+           "glm5_next_kpool_select: np must be ceil(kv_len / index_kpool), the same "
+           "static bound the compress op allocated against");
+  VT_CHECK(head_weights.shape[0] == batch && head_weights.shape[1] == seq_len &&
+               head_weights.shape[2] == n_heads,
+           "glm5_next_kpool_select: head_weights must be [batch, seq_len, index_n_heads]");
+  VT_CHECK(q_mask.shape[0] == batch && q_mask.shape[1] == seq_len,
+           "glm5_next_kpool_select: q_mask must be [batch, seq_len]");
+  VT_CHECK(valid_keys.shape[0] == batch,
+           "glm5_next_kpool_select: valid_keys must be [batch, kv_len]");
+  const int64_t out_w = args.index_topk + (args.always_select_tail ? kpool - 1 : 0);
+  VT_CHECK(topk_indices.shape[0] == batch && topk_indices.shape[1] == seq_len &&
+               topk_indices.shape[2] == out_w,
+           "glm5_next_kpool_select: topk_indices must be [batch, seq_len, index_topk + "
+           "index_kpool - 1] with the always-kept tail (:864-867) — 2051 and not 2048 on "
+           "the published checkpoint; sizing it 2048 truncates the tail the model always "
+           "keeps");
+  VT_CHECK(index_scores.shape[0] == batch && index_scores.shape[1] == seq_len &&
+               index_scores.shape[2] == np,
+           "glm5_next_kpool_select: index_scores must be [batch, seq_len, np]");
+  VT_CHECK(q_states.dtype == DType::kF32 && head_weights.dtype == DType::kF32 &&
+               pool_keys.dtype == DType::kF32 && index_scores.dtype == DType::kF32,
+           "glm5_next_kpool_select: q_states/head_weights/pool_keys/index_scores must be "
+           "f32");
+  VT_CHECK(pool_indices.dtype == DType::kI32 && pool_valid.dtype == DType::kI32 &&
+               num_pools.dtype == DType::kI32 && valid_keys.dtype == DType::kI32 &&
+               q_mask.dtype == DType::kI32 && topk_indices.dtype == DType::kI32,
+           "glm5_next_kpool_select: every integer operand must be i32");
+  VT_CHECK(q_states.IsContiguous() && head_weights.IsContiguous() &&
+               pool_keys.IsContiguous() && pool_indices.IsContiguous() &&
+               pool_valid.IsContiguous() && num_pools.IsContiguous() &&
+               valid_keys.IsContiguous() && q_mask.IsContiguous() &&
+               topk_indices.IsContiguous() && index_scores.IsContiguous(),
+           "glm5_next_kpool_select: every operand must be contiguous");
+  VT_CHECK(q_states.device == q.device && head_weights.device == q.device &&
+               pool_keys.device == q.device && pool_indices.device == q.device &&
+               pool_valid.device == q.device && num_pools.device == q.device &&
+               valid_keys.device == q.device && q_mask.device == q.device &&
+               topk_indices.device == q.device && index_scores.device == q.device,
+           "glm5_next_kpool_select: device mismatch (operands/queue)");
+  reinterpret_cast<Glm5NextKpoolSelectFn>(GetOp(OpId::kGlm5NextKpoolSelect,
+                                                q.device.type))(
+      q, topk_indices, index_scores, q_states, head_weights, pool_keys, pool_indices,
+      pool_valid, num_pools, valid_keys, q_mask, args);
+}
+
 void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
                          const Tensor& key, const Tensor& value, const Tensor& cu_seqlens_q,
                          const Tensor& cu_seqlens_k, const MlaPrefillAttentionArgs& args) {

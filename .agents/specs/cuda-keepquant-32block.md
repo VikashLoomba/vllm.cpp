@@ -317,6 +317,29 @@ at **1.3% of the budget**, and the ratio FALLS as nb grows, so it points the way
 the error grows. A constant would have tightened as K rose and begun failing on
 the long rows this lane exists to serve.
 
+### Which arm the released checkpoint actually takes
+
+Worth stating precisely, because "the qwen4_exp MoE now runs on device" could be
+read as all three arms serving it, and that is not what was traced.
+
+`RunQwen4ExpMoeBlock` -> `RunMoeBlock` -> `KqGrouped` -> **`vt::MatmulBTQuantGrouped`**,
+three separate grouped GEMMs (gate, up, down). That is the GROUPED arm. The
+shared MoE block on this path never calls the fused seam, which
+`grep` over `src/vllm/` confirms: the three production callers of
+`vt::MoeGateUpSwiGLUGrouped` are `glm5_next_moe.cpp:131`, `laguna.cpp:1032` and
+the shared `vt::MergedGemmGroup` seam in `merged_gemm.cpp:29`, none of them this
+model's path.
+
+So for the released artifact the load-bearing arms are the **dense** and
+**grouped** ones. The **fused** arm removes a real refusal -- that seam has no
+fallback behind it and THREW by name for these dtypes, so any model routing
+32-block gate/up towers through `vt::MergedGemmGroup` was refused outright --
+but **no checkpoint this row measured takes it**. It is reachable through the
+production op rather than dead: the fused gate drives it via
+`vt::MoeGateUpSwiGLUGrouped`, never by constructing a kernel by hand, and
+mutation C deleted that call site along with the other two and turned the gate
+red.
+
 ### What this row does NOT claim
 
 - **No speed number.** Nothing here measures throughput; the win claimed is that

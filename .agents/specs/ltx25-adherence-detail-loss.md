@@ -44,12 +44,25 @@ there rather than scored across the mount.
 Geometry `320x192`, 25 frames, `steps=8`, `seed=42`, prompt
 `A red fox walks slowly through a snowy pine forest at sunrise, cinematic.`
 
-The engine that produced our frames is `main` at `7905607af`. No file under
-`src/` or `include/` whose PATH matches `ltx|video|vae|diffus` changed between
-that commit and today's `main`. That is a path-name scan and not a call-graph
-one, so it does not exclude a shared primitive moving under the LTX path; it is
-enough to say the reading is not obviously stale, and not enough to say today's
-engine would score the same.
+The engine that produced our frames is `main` at `7905607af`. **The claim this
+row was dispatched with -- that no file whose PATH matches `ltx|video|vae|diffus`
+changed since -- was true when it was made and is NOT true today**, which is why
+it is re-measured here against a named revision rather than inherited. Against
+`origin/main` at `63889449c`, **four** such files changed:
+`ltx2_conditioning.h`, `ltx2_pipeline.h`, `ltx2_pipeline.cpp` and
+`ltx2_video.cpp`, all in one commit, `565359bed`
+(`fix(LTX25-ANCHOR-REPAIR)`).
+
+That commit changes **no executable line**. Three of the four files have zero
+non-comment changed lines, and the fourth has two, which are the tail of one
+assertion's message string: `latent_cond.py:38-39` becomes
+`latent_cond.py:40-41`. It is a sweep of upstream anchor line numbers in
+comments. So the reading is not stale, and the reason it is not stale is a
+measurement rather than an absence.
+
+This is still a path-name scan and not a call-graph one, so it does not exclude
+a shared primitive moving under the LTX path, and it is not enough to say
+today's engine would score the same.
 
 ## Design
 
@@ -108,8 +121,12 @@ valuable available result, because it redirects a repair nobody has started.
 
 ## Risks
 
-- **n = 1 on our side.** `scripts/ltx25-render-confirm.sh:551` deletes renders 2
-  and 3 by design, so no run-to-run spread of our own render exists in pixels.
+- **n = 1 on our side.** The line `[ "$i" = 1 ] || rm -f "$D"/frame_*.ppm` in
+  `scripts/ltx25-render-confirm.sh` deletes renders 2 and 3 by design, so no
+  run-to-run spread of our own render exists in pixels. It is quoted rather than
+  cited by number because the number is not stable: it is `:505` in `592e224e7`,
+  which is the revision that produced these frames, and `:551` on `origin/main`
+  at `63889449c`.
   Every statement about our render says n = 1. No single-render statistic is
   presented as a between-render one, which is the error
   `ltx25-prompt-adherence.md` corrected once already when a mean gap was divided
@@ -373,7 +390,7 @@ this whole reading rests on one render.
 ### WHAT THIS DOES NOT SAY
 
 **n IS 1 ON OUR SIDE.** Every number here about our render is one render, and
-`ltx25-render-confirm.sh:551` is why. The run-to-run spread of our own adherence
+`[ "$i" = 1 ] || rm -f "$D"/frame_*.ppm` in `ltx25-render-confirm.sh` is why. The run-to-run spread of our own adherence
 reading remains UNMEASURED, so the S1 verdict itself could still move; the
 falsification above does not depend on that, because it rests on interventions
 applied to the same 25 frames rather than on the gap's exact size.

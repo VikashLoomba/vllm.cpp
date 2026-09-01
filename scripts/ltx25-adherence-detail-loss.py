@@ -43,9 +43,12 @@ output to raise a gate score is what AGENTS.md forbids; measuring what would
 raise it is how you find out what is broken. The two are distinguished by
 whether anything is landed, and this lands nothing.
 
-n IS 1 ON OUR SIDE. `scripts/ltx25-render-confirm.sh:551` deletes renders 2 and
-3 by design, so the run-to-run spread of our own render does not exist in
-pixels. Every number this script prints about our render is one render.
+n IS 1 ON OUR SIDE. The line `[ "$i" = 1 ] || rm -f "$D"/frame_*.ppm` in
+`scripts/ltx25-render-confirm.sh` deletes renders 2 and 3 by design, so the
+run-to-run spread of our own render does not exist in pixels. The line is quoted
+rather than numbered because the number moved: `:505` at `592e224e7`, which
+produced these frames, and `:551` on `origin/main` at `63889449c`. Every number
+this script prints about our render is one render.
 
 The CLIP scores come from the landed instrument itself: `ClipAdherenceScorer`
 and the pin check are imported from `ltx25-render-compare.py` rather than

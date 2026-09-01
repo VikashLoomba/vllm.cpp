@@ -16,9 +16,14 @@ Measured on `thor:gpu0` 2026-09-01, job `2b8df779`, binary
 `895d2c430` with the drain asserted present in the source (`drains=2`):
 
 ```
-CPU-CTRL  (--device cpu,  re-taken in this lease) : 11751 13 15767 411 2029 11 1092 369
-CUDA-FIX  (--device cuda, CUDA_LAUNCH_BLOCKING=1) : 11751 271 271 271 271 271 0 0
+CPU-CTRL  (--device cpu,  re-taken in this lease) : 11751 13 15767 411 2029 11 1092 369   http 200,   7s
+CUDA-FIX  (--device cuda, CUDA_LAUNCH_BLOCKING=1) : 11751 271 271 271 271 271 0 0        http 200, 188s
+CUDA-PROD (--device cuda, no launch blocking)     : (none)                               http 500,  61s
 ```
+
+`CUDA-PROD` died with `vt cuda: cudaMemcpyAsync: an illegal memory access was
+encountered`, three occurrences, from the SAME binary that completed `CUDA-FIX`
+without one.
 
 The CUDA arm WITH this fix is **byte-identical to the #2496 measurement**, which
 was taken on a DIFFERENT binary
@@ -41,6 +46,27 @@ DIFFERENT tree (`e934fb002`). This change moved nothing at all in the output.
 
 This spec therefore lands a latent-hazard fix and its gate, and does NOT close
 #2496. The token work is handed to the GDN projection over-read.
+
+## #2496 AND #2476 ARE TWO DEFECTS, AND THIS LEASE MEASURED IT
+
+One binary, three arms, one lease. The two issues have DIFFERENT signatures on
+that one binary, and this fix moved NEITHER:
+
+| | serialised | not serialised |
+|---|---|---|
+| tokens | wrong, and bit-stable | none |
+| illegal access | 0 | 3 |
+
+- **#2496 is deterministic and structural.** It reproduces byte-identically
+  across two independent builds of two different trees, and it survives
+  serialisation. A race cannot do that.
+- **#2476 is timing-dependent.** Same binary, same artifact, same prompt; it
+  fires only with launch blocking off, and it fired at 61 s here.
+- A single defect cannot be simultaneously bit-reproducible across builds and
+  suppressible by serialisation. **They are two.**
+
+That also disposes of the hypothesis this spec was written on, which was that
+one async-copy site produced both.
 
 ## Scope
 

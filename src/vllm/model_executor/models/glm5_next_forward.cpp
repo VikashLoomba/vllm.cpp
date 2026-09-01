@@ -250,7 +250,7 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
   // one arm of eleven on the GPU. The KDA recurrence, the k-pool indexer, the
   // eager MLA attention, both mHC sites, the router, the combine, the MLPs, the
   // embedding gather and the `lm_head` all still run on the host. The row's
-  // spec records it as O40 and issue #2410 owns the rest.
+  // spec records it as O43 and issue #2410 owns the rest.
   vt::Queue host_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
   vt::Queue& hq = queue.device.type == vt::DeviceType::kCPU ? queue : host_queue;
   // A POINTER and not a `dense_attn::Dev`, because `Dev` holds two references

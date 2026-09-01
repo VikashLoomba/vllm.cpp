@@ -154,7 +154,7 @@ void AnnounceDeviceArmOnce(const vt::Device& dev) {
   std::fprintf(stderr,
                "[glm5-next] the routed-expert keep-quant GEMM is running on "
                "DEVICE type %d index %d; every other primitive of this model is "
-               "on the host (spec section W9c-3a, O40, issue #2464).\n",
+               "on the host (spec section W9c-3a, O43, issue #2464).\n",
                static_cast<int>(dev.type), static_cast<int>(dev.index));
 }
 
@@ -211,7 +211,7 @@ void MoeExpertsKeepQuant(const MoeDims& d, const MoeQuantBanks& b,
   // The ONE arm of this model that computes on a GPU. Everything above and below
   // it -- the router that produced `r`, the combine that consumes `expert_out`,
   // and every other primitive in this forward -- runs on the host, and the row's
-  // spec records that as O40 rather than leaving it to be inferred from a
+  // spec records that as O43 rather than leaving it to be inferred from a
   // `--device cuda` that returns a token.
   //
   // Nothing is retagged. The three banks become DEVICE tensors by being
@@ -634,7 +634,7 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
   // this is the combine's HOST device. The combine reads `expert_out` and
   // `topk_weights`, both host buffers, whichever arm filled them -- the device
   // arm downloads before it returns -- so the combine stays on the host queue
-  // and W9c-3a does not move it. O40 lists it among the ten arms still there.
+  // and W9c-3a does not move it. O43 lists it among the ten arms still there.
   const vt::Device cdev = queue.device;
   vt::Tensor t_out = MakeT(out.data(), vt::DType::kF32, cdev, {num_tokens, H});
   vt::Tensor t_eo = MakeT(expert_out.data(), vt::DType::kF32, cdev, {num_tokens, K, H});

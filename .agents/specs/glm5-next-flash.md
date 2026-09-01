@@ -2695,26 +2695,34 @@ Measured, not inferred. `.agents/scripts/glm53-rocm-memfit.hip`, driven by
 `hipMallocManaged(..., hipMemAttachGlobal)`) and walks a staircase of
 allocations, GPU-touching one byte per 2 MiB page to force physical backing and
 host-dereferencing the tail to prove the aliasing the CPU reference tier
-depends on. Compiled `--offload-arch=gfx1151` and the offload bundle asserted
-(`llvm-objdump --offloading` prints exactly
-`hipv4-amdgcn-amd-amdhsa--gfx1151`) BEFORE the run, so an empty arch manifest
-fails at configure rather than at the throw.
+depends on. It compiles `--offload-arch=gfx1151` and then ASSERTS the offload
+bundle before running anything: it parses `llvm-objdump --offloading` for
+`amdhsa--gfx*` targets, exits 4 on an empty manifest and exits 5 on any target
+that is not `gfx1151`. That check is a hard failure at configure rather than a
+throw mid-run, because a host-only binary would allocate happily and measure
+nothing at all about the GPU. On the runs below it printed
+`ARCH_ASSERT_OK: gfx1151 present`.
+
+All three runs report `compiled device targets: [gfx1151]` and
+`ARCH_ASSERT_OK: gfx1151 present` before allocating anything.
 
 | run | granularity | job | ceiling |
 |---|---|---|---|
 | 1 | 4 GiB | `08b6baee-4ec8-41ff-a22e-cba6c018e0c4` | **56.000 GiB**, then `hipErrorOutOfMemory` |
 | 2 | 2 GiB | `e87ec9b6-4672-468d-9eaa-1b346a1f2af6` | **58.000 GiB**, then `hipErrorOutOfMemory` |
+| 3 | 2 GiB | `625084ba-5a89-47fd-ab31-75940d530cc6`, the committed script verbatim | **58.000 GiB**, then `hipErrorOutOfMemory` |
 
-**`MAX_MANAGED_RESIDENT` is 56.000 GiB at 4 GiB granularity and 58.000 GiB at
-2 GiB granularity — two samples on two separately compiled binaries, and 56 is
-simply the last multiple of 4 below 58, so they agree. The artifact is
-101.2535 GiB.** Taking the more generous of the two, it overshoots by
-**43.2535 GiB — 1.75x** — before one byte of KV cache, activation scratch, or
-the ViT. This is reported as two runs because one would be an anecdote.
+**`MAX_MANAGED_RESIDENT` is 56.000 GiB at 4 GiB granularity and 58.000 GiB in
+both 2 GiB runs, and 56 is simply the last multiple of 4 below 58, so all three
+agree. The artifact is 101.2535 GiB.** Taking the most generous reading, it
+overshoots by **43.2535 GiB — 1.75x** — before one byte of KV cache, activation
+scratch, or the ViT. This is reported as three runs because one would be an
+anecdote, and run 3 executed `.agents/scripts/glm53-rocm-memfit.sh` exactly as
+committed, so the artifact in the tree is the one that produced the number.
 
 **`hipMemGetInfo` is a broken instrument here and it fails toward a pass.** It
 reported `free = 63.703 GiB` unchanged across every successful allocation in
-BOTH runs, from 2 GiB resident to 58 GiB resident, and was still reporting
+ALL THREE runs, from 2 GiB resident to 58 GiB resident, and was still reporting
 63.703 GiB free at the allocation that returned out-of-memory. A residency
 budget computed from `hipMemGetInfo` on this box would have concluded 64 GiB
 was available and would have been wrong by the entire measurement. The

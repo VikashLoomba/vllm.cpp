@@ -8,11 +8,50 @@ Issue [#2497](https://github.com/mudler/vllm.cpp/issues/2497), row
 
 ## Disposition
 
-**Our arm is 2.71x behind the pinned llama.cpp on the same file, the same box
-and the same lease, and it hangs the GPU on 2 of 3 legs.** The hang is the
-headline: the throughput figure comes from the one leg that completed, so it is
-a measurement of a path that does not reliably run. No floor is claimed and
-nothing here gates. The hang is [#2511](https://github.com/mudler/vllm.cpp/issues/2511).
+**The speed axis on this arm is INADMISSIBLE, and the reliability finding is
+the result.**
+
+This run's throughput figures are recorded below for completeness and are
+quotable as nothing. `AGENTS.md` §Gates requires the declared token-exact gate
+before a performance result is accepted, and this arm does not have one: see
+the correctness precondition immediately below. That precondition was not
+checked before this run was taken, which is a defect in this measurement and
+not a caveat on it.
+
+What the run does establish, and what stands on its own:
+
+- **Our arm hangs the GPU on 2 of 3 legs** on the plain Q4_K GGUF target, with
+  zero CPU reference-tier ops and no DFlash2, while llama.cpp completes 3 of 3
+  on the identical bytes in the same lease. That is a reliability finding, not
+  a speed claim, and nothing about the token gate weakens it.
+  [#2511](https://github.com/mudler/vllm.cpp/issues/2511) owns it.
+- **Our GGUF reader cannot load the `UD` quant family** over one missing ggml
+  type. [#2510](https://github.com/mudler/vllm.cpp/issues/2510) owns it.
+- **The rig reproduces the published llama.cpp band on this silicon.** That is
+  a single-engine measurement of the oracle and carries no cross-engine ratio,
+  so it is unaffected.
+
+## The correctness precondition this run did not meet
+
+`docs/bench-evidence/qwen38-27b-q4km-token-gate-20260823.md` records
+`TOKEN_GATE=FAIL` for **this exact artifact** — `gguf_sha256`
+`7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169`,
+`gguf_size` 17,106,775,008, against the same `b10451` oracle. The tokenizer is
+exact on 6 of 6 prompts; the generation diverges on 5 of 6. That document
+states in its own words: "**No speed axis was run and none may be quoted**",
+and "No memory axis is accepted either, for the same reason."
+
+The divergences are rank-2 losses under 0.18 logits, with 282 of 288 steps at
+rank 1 — a precision difference in the quantized compute path rather than a
+wiring defect. That makes the arm *close*, and close is not the standard. The
+ratified distributional band does not rescue it either: `AGENTS.md` admits that
+band only where the oracle's greedy decode is non-deterministic, and this
+oracle's is deterministic, so the band's premise fails and was explicitly not
+reached for.
+
+So the correct reading of the numbers below is that they rank two engines that
+are not yet computing the same thing. A speed comparison becomes admissible on
+this arm when its token gate passes, and not before.
 
 The deficit sits in the band already measured on `gfx1200` (2.40x dense in
 [#1863](https://github.com/mudler/vllm.cpp/issues/1863), 4.25x MoE in
@@ -157,7 +196,12 @@ direction: `UD-Q4_K_M` is 6.2% fewer bytes than `UD-Q4_K_XL`, and `llama-bench`
 holds a minimal context against their 32K–131K. The rig therefore agrees with
 the community's numbers rather than merely citing them.
 
-## Results
+## Results, recorded for completeness and quotable as nothing
+
+Read the correctness precondition above before reading this section. These
+figures do not establish a floor, a ratio of record, or a gap that may be cited
+elsewhere. They are kept because the run happened and deleting evidence to
+reduce context is forbidden.
 
 Prompt `The capital of France is`, 64 output tokens, batch 1, greedy, `-ngl 99`
 against 64 trunk blocks resident, three order-alternated rounds.
@@ -175,7 +219,7 @@ against 64 trunk blocks resident, three order-alternated rounds.
 |---|---|---|
 | vllm.cpp ROCm, warm median of 3 | **4.510** | spread 4.382–4.523, 3.2% |
 | llama.cpp `b10451` HIP, median of 3 legs | **12.242** | legs agree to 0.08% |
-| **Ratio** | **2.71x behind** | |
+| Ratio | 2.71x behind, **INADMISSIBLE** | |
 
 Run 1 of the completing leg (2.837 tok/s) is the in-process cold run and is
 discarded for that named cause, not for being inconvenient; the three warm runs

@@ -1,0 +1,172 @@
+# ROCm fp8 KV cache decode attention (`GFX1100-TG200`, fork issue #7)
+
+Rows: `GFX1100-TG200` (campaign, fork issue #5) and `KV-FP8` (engine-matrix,
+the W6 ROCm arm). Issue: fork
+[#7](https://github.com/ghazni101/vllm.cpp/issues/7). The fp8 KV cache store
+and correctness-grade read landed in W6
+([`fp8-kv-cache.md`](fp8-kv-cache.md) `## W6`); this spec covers the
+performance gap the W6 spec named as owed: the fp8 read through the fast
+decode kernel.
+
+## Scope
+
+- **In:** widen the `PagedAttnDecodeGqaF32Q` dispatch guard in
+  `src/vt/rocm/rocm_paged_attn.hip` to accept `DType::kI8` KV cache when
+  `args.kv_cache_dtype != kAuto`; add an fp8 dequant load path inside the
+  kernel; pass `k_scale`/`v_scale` to the kernel; add a `LoadRowEplFp8`
+  device helper that does vectorized uint8_t loads + `F8E4M3ToF32Dev` dequant
+  with scale.
+- **Out:** the bf16 decode-opt kernels (`PagedAttnDecodeGqaBf16`,
+  `PagedAttnDecodeOptBf16T`) — those stage `__hip_bfloat16` fragments and a
+  tensor-core fp8 read is a separate performance brick, same scope line as
+  the CUDA W2 arm. The prefill path stays on `PagedAttnOnline` for fp8. The
+  `bf16_decode_opt` guard at line 1925 is not touched. fp8_e5m2 compute.
+  Per-head scales. Non-gfx1100 architectures.
+
+## Upstream chain
+
+vLLM's fp8 KV cache read dequantizes inside the attention kernel:
+`scaled_vec_conversion<float, uint8_t>` (`quant_utils.cuh:419-429`) =
+`half_to_float(fp8_to_half(byte)) * scale`. The ROCm `LoadKv(uint8_t*, ...)`
+helper at `rocm_paged_attn.hip:176` already mirrors this arithmetic exactly:
+`F8E4M3ToF32Dev(p[i]) * scale`. The CUDA arm's `LoadKv` at
+`cuda_paged_attn.cu:175-185` is the same. The dequant is not new code; it is
+existing code that the fast kernel does not call.
+
+## Our baseline
+
+The `PagedAttnDecodeGqaF32Q` kernel (`rocm_paged_attn.hip:674`) is the
+f32-query + bf16-KV decode kernel activated by `VT_ATTN_DECODE_GQA4=1`. It
+fuses QG=4 query heads per KV group, walks the KV sequence warp-strided with
+online softmax, and uses vectorized 128-bit `uint4` bf16 loads
+(`LoadRowEplBf16`, line 342). The dispatch guard at line 2186-2189 requires
+`k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16`.
+
+With `--kv-cache-dtype fp8`, the KV cache is `DType::kI8`. The guard fails,
+and the dispatch falls through to `PagedAttnOnline` (line 2223) — the
+reference kernel that processes one key at a time with a full-block
+`__syncthreads()` reduction per key (line 290-294). The code acknowledges
+this at line 2231-2235.
+
+## Measured gap
+
+A/B benchmark on `kind_tharp` (Qwen3.5-4B Q4_K_M, RX 7900 XTX, ROCm 7.14.0,
+128-token greedy decode, single request, 4 reps, 2026-08-27):
+
+| Context | fp8 KV tok/s | bf16 KV tok/s | Speedup |
+|--------:|-------------:|--------------:|--------:|
+| 256     | 99.94        | 143.15        | 1.43x   |
+| 1024    | 56.28        | 129.02        | 2.29x   |
+| 4096    | 20.53        | 92.08         | 4.49x   |
+| 8192    | 11.08        | 66.85         | 6.03x   |
+| 16384   | 5.78         | 43.16         | 7.47x   |
+
+The gap widens with context because `PagedAttnOnline` is O(n) per key with
+full-block sync, while `PagedAttnDecodeGqaF32Q` is warp-strided with online
+softmax and no per-key sync. Qwen3.5-4B has 8 full-attention layers
+(`full_attention_interval=4`, 32 total); the O(n) cost is paid on those 8
+layers x 4 KV heads x 256 head_dim.
+
+## Design
+
+### 1. `LoadRowEplFp8` device helper
+
+Add a new `LoadRowEplFp8<EPL>` function alongside `LoadRowEplBf16` (after
+line 367). For fp8, each element is 1 byte. The vectorized load width
+matches the bf16 path's register pressure:
+
+- EPL=4: 4 bytes per lane = one `uint32_t` load
+- EPL=8: 8 bytes per lane = one `uint2` load (64 bits)
+- EPL=16: 16 bytes per lane = one `uint4` load (128 bits)
+
+After the vectorized load, dequantize each byte with
+`F8E4M3ToF32Dev(byte) * scale` into the float register array. The scale is
+passed as a parameter.
+
+### 2. Template `PagedAttnDecodeGqaF32Q` on `TKV`
+
+Change the kernel signature from hardcoded `const __hip_bfloat16* k_cache`
+to `template <typename TKV>` with `const TKV* k_cache, const TKV* v_cache`.
+Add `float k_scale, float v_scale` parameters. Inside the kernel, replace
+the two `LoadRowEplBf16<kEpl>(k_cache, ...)` / `LoadRowEplBf16<kEpl>(v_cache, ...)`
+calls with a `LoadRowEplKv<kEpl>(k_cache, ..., k_scale)` dispatch that
+selects `LoadRowEplBf16` for `__hip_bfloat16` and `LoadRowEplFp8` for
+`uint8_t` via `if constexpr`.
+
+### 3. Widen the dispatch guard
+
+At line 2186-2189, widen the condition from:
+```
+k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16
+```
+to:
+```
+(k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16) ||
+(k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8 &&
+ args.kv_cache_dtype != Fp8KVCacheDataType::kAuto)
+```
+
+When the KV is fp8, launch with `k_cache.Ptr<uint8_t>()`,
+`v_cache.Ptr<uint8_t>()`, and pass `args.k_scale`/`args.v_scale`. The
+`PagedAttnDecodeGqaF32Q` template instantiation `PagedAttnDecodeGqaF32Q<QG,
+EPL, NWARPS, uint8_t>` is the new instantiation; the existing
+`PagedAttnDecodeGqaF32Q<QG, EPL, NWARPS, __hip_bfloat16>` is the unchanged
+bf16 path.
+
+### 4. No new test file
+
+The correctness gate is the existing `test_ops_fp8_kv_cache` suite (W1,
+CPU oracle) plus the served-model token-exact gate on the `kind_tharp`
+container. The fp8 dequant arithmetic is already gated bit-identical against
+the CPU codec; the new code path only changes which kernel reads the same
+dequantized values. A red-first mutation: revert the guard widening and
+confirm the dispatch falls back to `PagedAttnOnline`.
+
+## Risks
+
+- **Reduction order difference:** `PagedAttnDecodeGqaF32Q` uses warp-strided
+  online softmax, which reduces the KV sequence in a different order than
+  `PagedAttnOnline`'s per-key loop. Greedy decode tokens can move at exact
+  ties, same as the d128 decode-opt flip (line 1912-1921). The
+  `VT_ATTN_DECODE_GQA4=1` flag is already opt-in and already carries this
+  risk for bf16 KV; the fp8 arm inherits it.
+- **Vectorized fp8 load alignment:** the uint8_t KV cache pages must be
+  4-byte aligned for `uint32_t` loads and 8-byte aligned for `uint2` loads.
+  The KV cache block allocation uses `hipMalloc` with block_size *
+  num_kv_heads * head_dim bytes per block; for head_dim=256 and block_size=16,
+  that is 16*4*256 = 16384 bytes per block, which is naturally aligned. The
+  bf16 path already assumes `kc_hd % 8 == 0` (line 1925); the fp8 path needs
+  `kc_hd % 4 == 0` for the uint32_t load, which holds for head_dim=128 and
+  256 (both are multiples of 4).
+- **Register pressure:** the fp8 load path uses the same `float k_reg[kEpl]`
+  registers as the bf16 path. The dequant happens in registers; no shared
+  memory change. The smem allocation is unchanged.
+
+## Gates
+
+- **Correctness (CPU oracle):** `test_ops_fp8_kv_cache` GREEN — the W1
+  suite already gates the fp8 dequant arithmetic; this change does not touch
+  the CPU path.
+- **Correctness (served model, token-exact):** run `kind_tharp` with fp8 KV
+  + `VT_ATTN_DECODE_GQA4=1` and compare greedy decode output against the
+  bf16 KV baseline at short context (256 tokens). Tokens must match; at
+  longer context, the reduction-order risk applies and is recorded.
+- **Performance (A/B):** re-run `/tmp/bench_context_scale.py` with the
+  optimized fp8 path and compare against the bf16 baseline. The target is
+  fp8 KV decode throughput within 2x of bf16 KV at 16K context (vs the
+  current 7.47x gap). fp8 should be faster than bf16 at long context due to
+  halved KV bandwidth.
+- **Red-first:** revert the guard widening, confirm the dispatch falls back
+  to `PagedAttnOnline`, confirm the benchmark shows the original regression.
+
+## Git integration
+
+- Separate spec and implementation PRs (developer preference, recorded
+  2026-08-27).
+- Branch: `row/GFX1100-TG200` (existing campaign branch).
+- Push to `origin` (fork `ghazni101/vllm.cpp`) only.
+- Spec commit first, then implementation commits.
+
+## Now
+
+Spec committed, implementation pending.

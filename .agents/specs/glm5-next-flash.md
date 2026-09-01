@@ -1764,7 +1764,7 @@ cause is a dated pair of commits rather than an argument:
 | commit | UTC | `multi_kv_index_.layer_names` points at | what `Find` returns |
 |---|---|---|---|
 | `d84db105b` — the tree that emitted ` Paris.` (O30) | 2026-08-30T11:37:56 | `attn_kv_layer_names_` (`runner.cpp:1544`) | an `attn_kv` index |
-| `9e7621efc` — ENG-MULTIKV-BYNAME | 2026-08-30T12:42:28 | `kv_index_layer_names_` (`runner.cpp:1664`) | a FLAT index over EVERY published cache |
+| `9e7621efc` — ENG-MULTIKV-BYNAME | 2026-08-30T12:42:28 | `kv_index_layer_names_` (`runner.cpp`, the unique `multi_kv_index_.layer_names =` assignment) | a FLAT index over EVERY published cache |
 
 `d84db105b` is NOT an ancestor of `9e7621efc`, and `git show d84db105b:...runner.cpp`
 carries no `payload_kinds` at all. So O30's ` Paris.` was taken on a tree where
@@ -1773,7 +1773,8 @@ since. `9e7621efc` touched six files and none of them was this row's; qwen4_exp
 was reconciled onto `Resolve` by `6db82520e` and this row was not.
 
 **THE ARITHMETIC OF THE 45.** `kv_index_layer_names_` is built in ONE pass over
-the groups in PUBLICATION order (`runner.cpp:1370-1394`), so this model's channel
+the groups in PUBLICATION order (`runner.cpp`, the `ENG-MULTIKV-BYNAME: THE BY-NAME
+INDEX OVER EVERY PUBLISHED CACHE` block), so this model's channel
 is group 0's 11 latents, then group 1's 34 recurrent states, then group 2's 11
 indexer caches — 56 entries. Layer 3's indexer is the first entry of group 2, at
 flat index 11 + 34 = **45**, while its PAGED SLOT is 11. `attn_kv` carries 22.
@@ -1786,7 +1787,7 @@ call that performs it.
 `kRecurrent` payload under an attention name by name, and indexes `attn_kv` by the
 returned SLOT. The group id keeps being read at the FLAT index, because
 `group_ids` is parallel to the flat list and not to `attn_kv`
-(`runner.cpp:1374-1376`). The recurrent binding moves onto the same channel: its
+(`runner.cpp`, the same block). The recurrent binding moves onto the same channel: its
 positional derivation was justified by "no name travels with them", a sentence
 `9e7621efc` falsified, and a comment that lies about why code is shaped a certain
 way is what the next reader ports forward.
@@ -4734,6 +4735,19 @@ Debts this row carries, each visible rather than waived:
   wants that row's own sibling-inertness gate rather than this one's. Tracked by
   [#2456](https://github.com/mudler/vllm.cpp/issues/2456), which names
   `MODEL-DSV4-*` as its owner.
+- **O38 — THE DEVICE ARM HAS NO NUMBER AND THIS WAVE DID NOT PRODUCE ONE, which
+  is a stronger statement than O6's "no number on any axis" and belongs beside
+  it.** W5b-2d makes `--device cuda` REACH `glm5_next_forward.cpp:231-238`
+  instead of dying before it. What it reaches there is a refusal: the whole
+  forward is a host `std::vector<float>` reference, and there is no CUDA arm to
+  time. **A benchmark of this model's device arm is therefore not blocked on a
+  lease, a harness or a denominator — the arm does not exist**, and W9c-1
+  (DSA/MLA onto the shared seam), W9c-2 (the KDA and MoE CPU-only refusals) and
+  W9c-3 (the compose) are each unstarted per O32. Recorded because "the KV
+  binding is fixed" reads like "the device arm is close" and it is not: fixing
+  the binding moved the first obstacle from the engine into the model, which is
+  where the four named waves already said it was.
+
 - **O39 — `MultiKvCacheIndex::num_groups()` COUNTS SOMETHING ITS COMMENT DOES
   NOT DESCRIBE, and it is the second stale sentence `9e7621efc` left on this
   seam.** The accessor is documented as "how many DISTINCT published groups they
@@ -4750,19 +4764,6 @@ Debts this row carries, each visible rather than waived:
   shared header belongs to ENG-MULTIKV-BYNAME's row, and reverting the accessor
   rather than the comment would change three models' seam. Tracked by
   [#2459](https://github.com/mudler/vllm.cpp/issues/2459).
-- **O38 — THE DEVICE ARM HAS NO NUMBER AND THIS WAVE DID NOT PRODUCE ONE, which
-  is a stronger statement than O6's "no number on any axis" and belongs beside
-  it.** W5b-2d makes `--device cuda` REACH `glm5_next_forward.cpp:231-238`
-  instead of dying before it. What it reaches there is a refusal: the whole
-  forward is a host `std::vector<float>` reference, and there is no CUDA arm to
-  time. **A benchmark of this model's device arm is therefore not blocked on a
-  lease, a harness or a denominator — the arm does not exist**, and W9c-1
-  (DSA/MLA onto the shared seam), W9c-2 (the KDA and MoE CPU-only refusals) and
-  W9c-3 (the compose) are each unstarted per O32. Recorded because "the KV
-  binding is fixed" reads like "the device arm is close" and it is not: fixing
-  the binding moved the first obstacle from the engine into the model, which is
-  where the four named waves already said it was.
-
 ## Now
 
 `ACTIVE`, 2026-09-01. **THE SENTENCE THIS ROW HAS REPEATED FOR FOUR WAVES WAS

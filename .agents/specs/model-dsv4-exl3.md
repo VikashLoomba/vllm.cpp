@@ -163,7 +163,32 @@ still refuses that geometry by name, which is the same loud failure as before th
 change. Deriving the floor from the config needs the factory field to become a
 callback, and no config in reach justifies that yet.
 
-**Still owed: the load itself has not been re-measured on the default
+**MEASURED 2026-09-01 on the real artifact, and the refusal this fixed is GONE.**
+Under an `rc` lease on `thor:gpu0`, source `693f17e08`, through `vllm-cli` with
+NO flags, the tower loads (81.952 GiB + 15.726 GiB carried, MemAvailable 101.407
+GiB) and the `block_size 32 cannot express a compress_ratio-128 page` refusal
+does not appear at all -- 0 occurrences in the run log. The load now proceeds
+PAST the KV geometry.
+
+**It then stops one layer deeper, and that one is not this change's**
+([#2455](https://github.com/mudler/vllm.cpp/issues/2455)). `MakeDeepseekV4KVCache`
+publishes an fp8_ds_mla topology on purpose, mirroring upstream, with `kI8`
+specs; `ApplyCacheDType`'s early-out needs `spec.dtype == resolved.storage` and
+on `auto` that is the model's bf16, so the early-out misses and
+`RetypeAttentionSpec` refuses every `MLAAttentionSpec`. The model's own factory
+declares a layout the retype path then refuses, and no flag was passed -- the
+message's "requesting it here" misattributes it.
+
+That refusal is CORRECT and must not be widened: W1 landed the page formula and
+neither the store nor the read, so accepting it would size every MLA page at 584
+bytes while the attention block writes a bf16 latent into it. Wrong tokens, not a
+crash. The store and read are owed to `KV-DSV4-MULTICACHE` W5.
+
+So the reachability claim this row can make is exact: the block-size floor is
+proven on the real artifact, and the artifact still does not reach a forward,
+for a different and separately owned reason.
+
+**Superseded: the load has not been re-measured on the default
 configuration.** The fix removes the refusal that stopped it; that the 97.68 GiB
 artifact now reaches a forward is a claim this row cannot make until the probe
 runs again under an `rc` lease.

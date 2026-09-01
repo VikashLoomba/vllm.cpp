@@ -5,23 +5,11 @@
 //
 // ─── WHAT THIS IS A PORT OF ───────────────────────────────────────────────────
 // This row splits its oracles by developer direction (spec `## Oracles`):
-// transformers supplies the ALGORITHM, vLLM supplies the OP FORM. vLLM has never
-// registered `qwen4_exp` at any revision, so there is no vLLM kernel to mirror
-// for QSA itself; what vLLM supplies is the shape of the DeepSeek-V4 indexer
-// lane, which QSA matches on nine independent structural points including the
-// literal `compress_ratio == 4`.
-//
-// ─── SUPERSEDED 2026-08-31: vLLM DOES REGISTER `qwen4_exp` ────────────────────
-// The paragraph above is kept because it is why this file was written the way it
-// was, and it was true when it was written. It is no longer true. vLLM landed
-// `[Model] Support Qwen3.8-Flash-Next (#53896)` at `e126687a9a` on 2026-08-31,
-// adding `vllm/models/qwen4_exp/` with `nvidia/` and `amd/` backends and three
-// registry entries. `e126687a9a` is NOT reachable from our parity pin
-// `555967922` and is 595 commits ahead of it, so it is a FORWARD REFERENCE to an
-// unpinned upstream and this file still carries no pinned anchor. It is, from now
-// on, this row's primary oracle. See `.agents/specs/qwen4-exp-flash-next.md`
-// `### Component-by-component reconciliation` for what upstream does here and
-// where this file agrees with it (#2489).
+// transformers supplied the ALGORITHM and vLLM the OP FORM. SUPERSEDED
+// 2026-08-31 (#2489): vLLM registers `qwen4_exp` at `e126687a9a`, beyond our pin
+// `555967922`, and `nvidia/ops/qsa.py` is QSA's own kernel. It CONFIRMS the two
+// calls made from the DeepSeek-V4 shape below: the mean pool over
+// `compress_ratio`, and the divide placed after the head sum.
 //
 //   ALGORITHM  transformers v5.16.0 (the lane pin),
 //              `models/qwen4_exp/modeling_qwen4_exp.py`

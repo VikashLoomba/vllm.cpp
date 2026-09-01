@@ -7,28 +7,14 @@
 //
 // ─── WHAT THIS IS A PORT OF ───────────────────────────────────────────────────
 // This row splits its oracles by developer direction (spec `## Oracles`):
-// transformers supplies the ALGORITHM, vLLM supplies the OP FORM. Here vLLM
-// supplies NEITHER, and that negative is confirmed rather than unfound: at vLLM
+// transformers supplied the ALGORITHM and vLLM the OP FORM. SUPERSEDED
+// 2026-08-31 (#2489): `nvidia/ple_layer.py:589-599` IS this conv. Formerly: at
 // `origin/main` = `6a5e8f5979`, `git grep -in dilat` returns zero lines in
 // `vllm/model_executor/layers/mamba/`, zero in `csrc/` and zero in `tests/`, and
 // `layers/conv.py` defines only `Conv2dLayer` and `Conv3dLayer`. Upstream
 // reached the same conclusion from the other side and hand-rolled it, saying so
 // in a comment: "We cannot use the usual functions/kernels here for the short
 // conv as the conv1d has dilation".
-//
-// ─── SUPERSEDED 2026-08-31: vLLM DOES IMPLEMENT THE PLE ───────────────────────
-// The negative above was correctly measured and is now false. vLLM landed
-// `[Model] Support Qwen3.8-Flash-Next (#53896)` at `e126687a9a` on 2026-08-31,
-// and `vllm/models/qwen4_exp/nvidia/ple_layer.py` implements BOTH components
-// this file was written for: the dilated depthwise conv as
-// `nn.Conv1d(groups=hc*H, dilation=short_conv_dilation)` with a short-conv state
-// (:589-599), and the n-gram hashed embedding with splitmix64 multipliers, an
-// xor mix and a per-head prime vocabulary (:151-436). `e126687a9a` is NOT
-// reachable from our parity pin `555967922` and is 595 commits ahead of it, so
-// it is a FORWARD REFERENCE to an unpinned upstream, but it is this row's
-// primary oracle from now on and the vLLM form is the one to mirror. See
-// `.agents/specs/qwen4-exp-flash-next.md`
-// `### Component-by-component reconciliation`, rows 19 to 21 (#2489).
 //
 //   ALGORITHM  transformers v5.16.0 (this row's accepted lane pin),
 //              `models/qwen4_exp/modeling_qwen4_exp.py`

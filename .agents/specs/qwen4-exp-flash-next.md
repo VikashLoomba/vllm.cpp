@@ -8304,6 +8304,79 @@ No speed number: every arm is n=1 on a shared box. UD-IQ1_S only, one sequence,
 attributes to the `step == nullptr` branch of `BuildCompletionLogProbs`; nothing
 here reads them.
 
+## DECODEDIV (#2496) — the CUDA decode divergence, and the instrument that names it
+
+**Scope.** One defect: on `thor:gpu0`, over the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact through `examples/server`,
+greedy, `max_tokens=8`, the CUDA arm emits `11751 271 271 271 271 271 0 0` where
+the CPU control on the same tree and the same file emits
+`11751 13 15767 411 2029 11 1092 369`. Token 0 agrees. This wave finds the cause
+and fixes it. It changes no behaviour the CPU arm has today.
+
+**What the measurement already excludes,** each by measurement rather than by
+argument, and each recorded on [#2496](https://github.com/mudler/vllm.cpp/issues/2496):
+
+* the GDN adapter lifetime defect ([#2476](https://github.com/mudler/vllm.cpp/issues/2476),
+  fixed by [#2509](https://github.com/mudler/vllm.cpp/issues/2509)) — a freed
+  operand returns what the allocator left there, not the launch-blocking arm's
+  exact sequence;
+* timing, ordering and the whole async-copy class — the production and
+  `CUDA_LAUNCH_BLOCKING=1` sequences are byte-identical, and both are identical
+  to the original pre-fix measurement on a different tree;
+* the GDN QKVZ GEMM extents — every operand extent agrees with its allocation at
+  `T=5` and at `T=1`;
+* the f32 QSA query buffer ([#2488](https://github.com/mudler/vllm.cpp/issues/2488))
+  — no device branch and no prefill/decode fork, so it is present on the CORRECT
+  CPU run too;
+* the PLE n-gram history read ([#2504](https://github.com/mudler/vllm.cpp/issues/2504))
+  — a real defect, fixed and gated, and it moved the output not at all.
+
+**The shape that survives.** A correct token 0 with a bit-stable wrong decode is
+state that the second step carries, computed differently on the two arms. The
+list of such state is short and this spec can enumerate it, which is what makes
+the wave finite: within one step every buffer the forward writes is also read
+back by that same step EXCEPT three. The paged K/V and the indexer side cache are
+written and then read inside the prefill, so a defect in either is visible in
+token 0. The three that are written at prefill and first read at decode are
+
+1. the GDN conv ring and the GDN temporal state (`MambaSpec` states 0 and 1),
+2. the PLE conv ring (`MambaSpec` state 2),
+3. the PLE n-gram history (`MambaSpec` state 3).
+
+**Method — the instrument comes before the hypothesis.** A whole-output symptom
+cannot name a tensor, so the first artifact of this wave is a comparison, not a
+fix: `test_qwen4_exp_layer_loop.cpp`'s `#2496` case drives one prefill and one
+decode through `ModelRegistry::Forward` on a CPU queue and on a CUDA queue over
+one fixture and one pinned pair of token ids, and reports, in order, the prefill
+logits, every persistent buffer above, and the decode logits. The FIRST row that
+disagrees is the finding. The second step's token is a constant rather than the
+first step's argmax, because sampling per arm would feed the two arms different
+ids the moment the prefill logits differ at all.
+
+**What the instrument cannot see, stated before it is run.** `qwen4_exp_gguf_fixture.h`
+is a miniature whose layer-3 activations sit near 2^18, where one bf16 ULP is
+~1024; W5j measured 0 of 192 paged K/V words moving across two different prompts
+on it. A CPU/CUDA difference small enough to be absorbed by that store is
+invisible here, so a green result is NOT a claim that the device arm decodes
+correctly at released width. It is the statement that the difference is not one
+this fixture can hold, and the wave then escalates to the released artifact.
+
+**Gates.** The focused gate is the new case plus `test_qwen4_exp_layer_loop`,
+`test_qwen4_exp_cuda` and `test_qwen4_exp_cuda_reductions` on `thor:gpu0`
+(`sm_110`, the only device in the fleet at this capability), inside an `rc`
+lease. The wave's acceptance gate is the released artifact through
+`examples/server`: **the GPU must emit `11751 13 15767 411 2029 11 1092 369`**.
+Nothing short of that token sequence is a fix, and a green hermetic case is not a
+substitute for it.
+
+**Stop conditions.** Stop and report rather than widen scope if: the hermetic
+comparison is green AND the released-artifact run still diverges (the fixture
+cannot hold the difference — report that as the finding and escalate to a
+per-layer tap on the real artifact); the divergence is in a `vt::` op with an
+existing CPU-vs-CUDA gate that the defect passes (the gate's coverage is the
+defect, and widening it is its own change); or `thor:gpu0` is out of the pool,
+in which case the sm_110 axis is UNMEASURED and says so.
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**

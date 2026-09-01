@@ -865,6 +865,23 @@ struct FullAttnLayerWeights {
   // wherever the site exposes packed q/k/v views, because there is nothing to
   // trade off. Empty on every non-block owner.
   Fp8BlockMergedResident qkv_fp8_block_merged;
+
+  // QUANT-EXL3 (#2181) / MODEL-QWEN35-EXL3 (#2495 item 3): the exllamav3
+  // trellis arm of this tower. Q/K/V stay SEPARATE where the bf16, NVFP4 and
+  // block-FP8 arms above hold (or build) one merged owner: a trellis is
+  // `[k/16, n/16, 32*bits]`, so joining on the output dim interleaves per input
+  // tile rather than row-stacking, which is a real transform and owed its own
+  // gate (`## Owed` in `specs/quant-exl3-shared.md`). Exactly one of {bf16,
+  // fp4, per-tensor fp8, block fp8, exl3} is populated per layer.
+  Exl3Weight q_proj_exl3;  // [K=H,       N=2*Hq*Dh]
+  Exl3Weight k_proj_exl3;  // [K=H,       N=Hkv*Dh]
+  Exl3Weight v_proj_exl3;  // [K=H,       N=Hkv*Dh]
+  Exl3Weight o_proj_exl3;  // [K=Hq*Dh,   N=H]
+
+  // `q_proj_exl3` and not "any of the four": the loader fills all four together
+  // or none, and asking about the FIRST one keeps this predicate the same
+  // question the loader's own `IsExl3Projection(has, "...q_proj")` probe asked.
+  bool IsExl3() const { return !q_proj_exl3.Empty(); }
 };
 
 // Exact scalar processing for the three-shard CT NVFP4 QKVParallelLinear.

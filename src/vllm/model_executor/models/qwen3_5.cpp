@@ -19,6 +19,7 @@
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
 #include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
+#include "vllm/model_executor/models/dense_exl3_linear.h"  // MODEL-QWEN35-EXL3 (#2495): the EXL3 linear seam
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // MODEL-FP8-BLOCK-LINEAR (#1189 M4)
 #include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
@@ -2484,6 +2485,14 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
 #endif
   DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
+  // MODEL-QWEN35-EXL3 (#2495 item 3): o_proj is a single projection in every
+  // arm, so the EXL3 form differs from the bf16 one only in the kernel the
+  // shared linear seam binds. The gated bf16 activation IS the input the
+  // trellis GEMM stages to fp16.
+  if (w.IsExl3()) {
+    return dense_exl3::Linear(d, gated.t(), w.o_proj, w.o_proj_exl3,
+                              DType::kBF16);
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
   // the same dtype every other arm of this o_proj returns.
   if (!w.o_proj_fp8_block.Empty()) {
@@ -2517,6 +2526,31 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
   FullAttnQkvOutput out;
   out.fp4 = !w.q_proj_fp4.Empty();
   const bool fp8 = !w.q_proj_fp8.Empty();
+
+  // MODEL-QWEN35-EXL3 (#2495 item 3). FIRST and exclusive: the loader fills the
+  // trellis fields and leaves the bf16, fp4, per-tensor fp8 and block fp8 ones
+  // EMPTY, so a non-empty EXL3 weight IS the scheme -- the same rung order the
+  // loader uses, read from the forward's end.
+  //
+  // THREE projections, never the merged operand the branches below build. A
+  // trellis is `[k/16, n/16, 32*bits]`, so joining on the output dim
+  // interleaves per input tile rather than row-stacking; that merge is valid
+  // for this family and worth doing, and it is owed its own gate (`## Owed` in
+  // `specs/quant-exl3-shared.md`). `packed_consumers` is therefore never
+  // consulted here, and no `QkvSplit` runs.
+  //
+  // `out_dtype` is bf16 -- upstream's `out_dtype` at this site, the MODEL dtype
+  // every layer inherits -- and NOT the f32 the plain-bf16 arm below happens to
+  // emit. A token gate cannot see a dtype that is too wide.
+  if (w.IsExl3()) {
+    out.q_owner.emplace(dense_exl3::Linear(d, h, w.q_proj, w.q_proj_exl3, DType::kBF16));
+    out.k_owner.emplace(dense_exl3::Linear(d, h, w.k_proj, w.k_proj_exl3, DType::kBF16));
+    out.v_owner.emplace(dense_exl3::Linear(d, h, w.v_proj, w.v_proj_exl3, DType::kBF16));
+    out.qgate = out.q_owner->t();
+    out.key = out.k_owner->t();
+    out.value = out.v_owner->t();
+    return out;
+  }
 
   // MODEL-FP8-BLOCK-MERGED (#1189 M6): vLLM's QKVParallelLinear, as ONE
   // block-scaled GEMM over the N-concatenated q|k|v operand
@@ -3075,6 +3109,14 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
 // (eager ForwardDense, the gathered and non-gathered paged arms) routes here, so
 // exactly one head layout is selected; the bf16 arm keeps both of its shapes.
 DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights) {
+  // MODEL-QWEN35-EXL3 (#2495 item 5): a trellis head, kept quantized and read
+  // through the shared linear seam. f32 out, because that is the dtype every
+  // other arm of this function returns and the sampler's contract; the trellis
+  // GEMM writes f32 directly, so nothing is widened on the way.
+  if (!weights.lm_head_exl3.Empty()) {
+    return dense_exl3::Linear(d, x, weights.lm_head, weights.lm_head_exl3,
+                              DType::kF32);
+  }
   if (!weights.lm_head_fp4.Empty())
     return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
   const OwnedTensor& lm_head = DenseLmHead(weights);
@@ -6923,6 +6965,17 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
 DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                    const Tensor& dh, int64_t T) {
   const int64_t I = cfg.intermediate_size;
+  // MODEL-QWEN35-EXL3 (#2495 item 3). FIRST and exclusive. Routed through the
+  // SHARED `layers::MlpGateUpMethodBase` seam AGENTS.md names, exactly as
+  // `qwen3.cpp:136-145` does for the Llama/Qwen3 dense MLP -- the model calls
+  // one method and never asks which scheme it bound.
+  if (w.IsExl3()) {
+    DBuf act = dense_exl3::GateUp(d, dh, w.gate_up_proj, w.gate_proj_exl3,
+                                  w.up_proj_exl3, I);
+    (void)T;
+    return dense_exl3::Linear(d, act.t(), w.down_proj, w.down_proj_exl3,
+                              DType::kBF16);
+  }
   // fp4-resident W4A4 path (real 27B, notes §5 step-6a) when populated; else the
   // bf16 path (synthetic CPU tests). Exactly one representation is filled.
   const bool fp4 = !w.gate_proj_fp4.Empty();

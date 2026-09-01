@@ -2784,6 +2784,44 @@ implements `glm5_next` at no revision (O38, §Oracles), so the only comparison
 available is our CUDA arm against our CPU arm on one box. Any number below is
 labelled that way or it is wrong.
 
+**Evidence, measured on `c4df6dcee` (base `839ea1ced`).**
+
+Green on x86_64: `test_glm5_next_moe` **18 cases / 12,731 assertions** (13 /
+9,619 before this wave), `test_glm5_next_forward` 28 / 200,
+`test_glm5_next_layer` 10 / 1,656, `test_glm5_next_bridge` 20 / 32,562. The CUDA
+case reports `SKIPPED` by name on a host lane, and the harness reads that line
+rather than the exit code.
+
+Five mutations, each applied to PRODUCT code and REBUILT before the reading,
+because a stale binary prints green:
+
+| # | Mutation | Result |
+|---|---|---|
+| M1 | the device branch is never taken (`dev` ignored) | ASSERTION kill, `CHECK( 0 > 256 )` |
+| M2 | the bridge stops publishing the three source pointers | ASSERTION kill, 5 assertions over 2 cases |
+| M3 | `DeviceBanksFit` loses its CPU clause | ASSERTION kill, same discriminator |
+| M4 | the forward stops refusing a non-CPU, non-CUDA device | ASSERTION kill, 2 assertions |
+| M5 | the LAYER stops threading `dev` to the MoE block | **COMPILER kill only** |
+
+**M5 IS THE WEAK ONE AND IT IS REPORTED AS WEAK.** `-Werror=unused-parameter`
+turns the dropped argument into a build failure, so the hand-off cannot be
+removed silently -- but no assertion on this lane OBSERVES its effect, and a
+compiler kill is weaker than an assertion kill. The reason is structural rather
+than an omission: `DecoderLayerForward` and `TextModelForward` only take a
+non-null `dev` on a device run, and the host lane has no CUDA backend to build
+one from, while a CPU `Dev` would need a quant-bank MoE fixture the layer suite
+does not have. What DOES observe it end to end is the device job's
+`[glm5-next] the routed-expert keep-quant GEMM is running on DEVICE` line, which
+is a production stderr line and not a test hook, and whose absence on a
+`--device cuda` leg means the device arm did not run. O40 records this.
+
+**M1 and M3 are the same discriminator and that is the point.** The two arms
+agree BIT-FOR-BIT on a CPU-backed `Dev` -- same provider, same bytes, same
+reduction order -- so every numeric assertion in the file passes whichever arm
+ran, and a value gate is blind to the wiring. The separating case points the
+host VIEWS and the device SOURCES at different weights and requires the two arms
+to disagree on a majority of outputs.
+
 **Stop conditions.**
 - If the device arm and the host arm disagree beyond the activation-quantization
   band, STOP. Both arms quantize the activation to Q8_K, so they agree to a band
@@ -4915,6 +4953,33 @@ Debts this row carries, each visible rather than waived:
   [#2410](https://github.com/mudler/vllm.cpp/issues/2410). Read
   "`--device cuda` works" as "one arm of eleven is on the device", because that
   is what was built.
+
+  **One hand-off inside that arm is COMPILER-guarded and not assertion-gated on
+  the host lane, and this is the part of O40 a reader should not round up.**
+  `Glm5NextHostForward` hands `dev` to `TextModelForward`, which hands it to
+  `DecoderLayerForward`, which hands it to `MoeForward`. Dropping the last of
+  those reds the build under `-Werror=unused-parameter` (mutation M5) and
+  nothing else; no assertion on x86_64 observes the effect, because a non-null
+  `dev` only reaches those two functions on a device run. The end-to-end
+  observable is the production stderr line
+  `[glm5-next] the routed-expert keep-quant GEMM is running on DEVICE`, whose
+  absence on a `--device cuda` leg means the arm did not run and every number on
+  that leg is a host number. Closing this properly wants a quant-bank MoE
+  fixture in the layer suite, and it is owed rather than waived.
+
+- **O42 -- NO TOKEN HAS COME OUT OF THIS MODEL ON A GPU, and W9c-3a did not
+  produce one.** The end-to-end `--device cuda` leg on the 101.24 GiB artifact
+  is written (`/workspace/glm53-devexp/run.sh`) and SUBMITTED to `dgx:gpu0` as
+  job `0b0d9c90-0b6d-488e-afb5-076d3d018ed6`, queued at position 3 behind three
+  other sessions' work. An untaken device gate is PENDING and is never a pass,
+  so what this wave establishes is exactly this: on x86_64 the forward admits a
+  CUDA-typed queue instead of throwing, and the routed-expert arm's device path
+  -- residency, operand construction, arm selection, the fit guard -- runs and
+  agrees bit-for-bit with the host arm on a CPU-backed `Dev`. The CUDA KERNELS
+  themselves are gated by #2260 on this artifact's own encodings; what is
+  unmeasured is the COMPOSITION of the two. The same lease also owes the
+  interleaved arm-vs-arm timing, which is our CUDA arm against our CPU arm and
+  never a vLLM comparison (O38).
 
 - **O41 — A SLICE OF THIS ROW WAS BLOCKED FOR EIGHT DAYS BY A DEBT ANOTHER ROW
   HAD ALREADY PAID, and nothing here noticed.** O19 was written when

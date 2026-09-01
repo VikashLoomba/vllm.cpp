@@ -9,8 +9,21 @@ this defect makes provisional).
 
 ## Now
 
-`ACTIVE` — diagnosis. No fix is proposed in this document yet; §"Findings"
-records what is measured and §"Refuted" records what is ruled out.
+`ACTIVE` — the site is measured, the mechanism is not.
+
+**Measured:** the failure rate, that one prefill forward reproduces it, that both
+symptoms are one defect, and that every failing leg dies inside
+`KQuantGemmK<OutT, 2>` with its three pointer arguments exactly sized. That is a
+kernel, and it is enough to stop anyone else re-deriving the eight candidates in
+`## Refuted`.
+
+**Not measured:** WHY that kernel faults. `DotQ6K`'s 256-byte per-thread private
+array is the leading hypothesis because it is the one property this arm has and
+nothing else on the path has. It is a hypothesis. The two jobs in
+`## Queued measurements` decide it, and either one can refute it.
+
+**No fix is claimed.** The `Fmt == 3` arm this row adds defaults OFF and changes
+no byte any configuration serves; it exists to be measured against, not to ship.
 
 ## Scope
 

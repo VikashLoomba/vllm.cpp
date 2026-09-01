@@ -268,6 +268,45 @@ Vulkan, XPU and Tenstorrent are all shipped backends with no ABI selector.
 Filed as #2505. Not fixed here: extending the ABI enum is a public-surface change
 that owes its own row, spec and version note, and it is not a model bring-up.
 
+## W5. A ccache-enabled HIP build does not link (observed, cause not yet isolated)
+
+Two runs on the same box, same source archive, same ROCm, differing only in
+whether `ccache` was installed and `CCACHE_DIR` exported:
+
+| Run | ccache | `vllm-cli` link |
+|---|---|---|
+| probe4 (`0d94bc20`) | no | **rc=0**, binary ran |
+| probe5b (`529b9edc`) | yes | rc=1 |
+| probe5c (`7894a2bc`) | yes | rc=1, identical failure |
+
+Both failures are the same set of undefined references while linking `vllm-cli`
+against `libvllm.so.0.0.3` -- the HIP runtime and hipBLASLt entry points
+together:
+
+```text
+/usr/bin/ld: libvllm.so.0.0.3: undefined reference to `hipSetDevice@hip_4.2'
+/usr/bin/ld: libvllm.so.0.0.3: undefined reference to `hipblasLtMatrixLayoutCreate'
+/usr/bin/ld: libvllm.so.0.0.3: undefined reference to `__hipUnregisterFatBinary@hip_4.2'
+```
+
+The configure output is byte-identical between the runs -- both resolve
+`ROCm hipBLAS: /opt/rocm/lib/libhipblas.so` and
+`ROCm hipBLASLt: /opt/rocm/lib/libhipblaslt.so`, and both print
+`ROCm backend: ENABLED for arch(es) [gfx1151]` -- and both used a freshly deleted
+build directory, so this is not a stale cache. The `target_link_libraries(vllm
+PUBLIC ...)` calls for `amdhip64` and the math libraries are unconditional inside
+`if(VLLM_CPP_HIP)` (`CMakeLists.txt:1747-1775`), so nothing in the project's own
+conditionals explains it.
+
+`-DVLLM_CPP_BUILD_TESTS=ON` was tested as the candidate discriminator and
+**refuted**: the option already defaults to `ON` (`CMakeLists.txt:58`), so passing
+it is a no-op, and probe5c failed exactly as probe5b did.
+
+**This is recorded as an observation, not a diagnosis.** The correlation is
+clean across three runs but the mechanism is not established, and this wave does
+not claim one. It matters because `/workspace/ccache` is shared fleet
+infrastructure that other ROCm rows may reach for. Filed as #2506.
+
 ## Owed
 
 Unreached or unported after this wave, none of it claimed here:
@@ -292,6 +331,8 @@ Unreached or unported after this wave, none of it claimed here:
   `vllm_model_params.device` past `0=auto/1=cpu/2=cuda` is a public-surface
   change owing its own row, spec and ABI version note, so this wave records it
   rather than making it. `--device auto` is the working route meanwhile.
+- The ccache/HIP link correlation in W5, #2506. Observed three times, mechanism
+  not isolated; this wave routes around it rather than diagnosing it.
 - `MoeSiluMul` bf16 is +/-1 ULP off the CPU oracle on `gfx1151` as well as the
   `gfx1200` boards #1954 and #1513 name. Pre-existing and untouched here.
 - No speed number is claimed or owed for this board by this wave. Any run of this

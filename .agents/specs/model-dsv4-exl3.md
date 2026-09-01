@@ -183,8 +183,14 @@ That refusal is CORRECT and must not be widened, and the investigation behind
 that sentence is worth keeping because both obvious small fixes are harmful.
 
 The published topology is a GATED mirror: `test_deepseek_v4_scaffold.cpp` pins
-`real_page_size_bytes() == 37376` (64 x 584) and `== 1168` (2 x 584), seven
-assertions anchored to upstream's 448B NoPE + 128B RoPE + 8B scale. The paged
+`real_page_size_bytes() == 37376` (64 x 584) twice and `== 1168` (2 x 584) once
+-- **three** `CHECK` assertions, at `:253`, `:269` and `:319`, anchored to
+upstream's 448B NoPE + 128B RoPE + 8B scale. (An earlier revision of this
+paragraph and commit `b12523e08` said "seven". That number came from
+`grep -c "584"`, which counts COMMENT mentions as well as assertions. Three is
+the gate; seven was the word count.)
+
+The paged
 STORE, meanwhile, writes **f32** -- `deepseek_v4.cpp:1013-1036` builds `t_kvc` /
 `t_pe` as `kF32` views over `deck` and calls `vt::ConcatAndCacheMla`, which at
 `head_dim` 512 is 2048 bytes/token, **3.5x** the declared page. The
@@ -199,9 +205,9 @@ the system noticing.
   overruns by 3.5x. It would appear to work only because no production path binds
   a paged cache at all ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)),
   so the pages are allocated and never read -- a trap set for whoever fixes that.
-- **Republishing the topology at f32/bf16** would red seven gated assertions that
-  correctly mirror upstream, and triple the KV footprint at the 384k context the
-  throughput target is measured at.
+- **Republishing the topology at f32/bf16** would red the three gated assertions
+  above, which correctly mirror upstream, and triple the KV footprint at the 384k
+  context the throughput target is measured at.
 
 The fix is the fp8_ds_mla **store and read**, owed to `KV-DSV4-MULTICACHE` W5.
 The encode/decode reference already exists (`Fp8DsMlaEncodeToken`); what is

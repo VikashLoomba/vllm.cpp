@@ -96,7 +96,12 @@ struct ModelSource {
   static ModelSource FromSafetensorsOwned(
       std::shared_ptr<const std::vector<SafetensorsFile>> shards,
       vt::Queue* load_queue = nullptr);
-  static ModelSource FromGguf(const GgufFile& gguf);
+  // `device` is the device the ENGINE resolved for this load
+  // (`ResolveModelDeviceType`), and it has NO DEFAULT. Every GGUF weight
+  // loader reaches its residency policy through this value; the parameter is
+  // required so a new GGUF entry point cannot fall back to the accelerator
+  // probe by saying nothing. See `.agents/specs/gguf-residency-resolved-device.md`.
+  static ModelSource FromGguf(const GgufFile& gguf, vt::DeviceType device);
 
   Kind kind = Kind::kSafetensors;
   const std::vector<SafetensorsFile>* safetensors = nullptr;
@@ -125,6 +130,24 @@ struct ModelSource {
   // NULL means "no limits configured for this load": load everything, which is
   // byte-identical to pre-L3 and is what every non-engine caller gets.
   const MultiModalConfig* multimodal = nullptr;
+  // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the device the ENGINE RESOLVED for this
+  // load, which is what the GGUF residency policy must read.
+  //
+  // It is NOT `vllm::platforms::CurrentPlatform().device_type()`. That probe
+  // answers `kCUDA` on any process where the CUDA platform registered, while
+  // `LoadedEngine::ResolveExplicitDeviceType` returns `kCPU` for an explicit
+  // `--device cpu` "even on a CUDA-capable build/process". The two therefore
+  // disagreed by construction, and the GGUF registries — the only production
+  // loaders with no policy argument of their own — took the probe's answer.
+  // `--device cpu` on a CUDA box got the CUDA residency policy, and on
+  // `qwen4_exp` that is a refusal whose own remedy text is `--device cpu`.
+  //
+  // It belongs on `ModelSource` for the reason `load_queue` and `multimodal`
+  // do: this struct is already the per-load CONTEXT and not only the
+  // checkpoint. `FromGguf` REQUIRES it. The struct default below is only ever
+  // reached by a safetensors source, and no safetensors path reads it — the
+  // residency policy is GGUF-only.
+  vt::DeviceType device = vt::DeviceType::kCPU;
 };
 
 struct ModelFactory;

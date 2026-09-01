@@ -620,7 +620,7 @@ Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
                                      vt::DeviceType device,
                                      const GgufLoadPolicy* policy) {
   const GgufLoadPolicy pol =
-      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv();
+      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv(device);
 
   Qwen4ExpWeights w;
   // The SAME resolver the config hook runs, so a file whose metadata the

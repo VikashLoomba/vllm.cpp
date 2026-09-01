@@ -39,6 +39,7 @@
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -82,8 +83,15 @@ std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
     if (source.gguf == nullptr) {
       throw std::runtime_error("deepseek-v4 GGUF model source is empty");
     }
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+    // the device the ENGINE resolved for this load, never from
+    // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+    // CUDA-capable process, and this hook is where the disagreement reached the
+    // loader.
+    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
     return std::make_unique<DeepseekV4LoadedModel>(
-        registration, LoadDeepseekV4FromGguf(*source.gguf, config));
+        registration,
+        LoadDeepseekV4FromGguf(*source.gguf, config, &gguf_policy));
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");

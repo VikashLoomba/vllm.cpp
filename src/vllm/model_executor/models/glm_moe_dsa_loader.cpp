@@ -630,7 +630,7 @@ GlmMoeDsaWeights LoadGlmMoeDsaFromGguf(const GgufFile& gguf,
                                        const HfConfig& config,
                                        const GgufLoadPolicy* policy) {
   const GgufLoadPolicy pol =
-      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv();
+      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
 
   GlmMoeDsaWeights w;
   // ONE validator for both sources: a `config.json` and a `glm-dsa` GGUF header

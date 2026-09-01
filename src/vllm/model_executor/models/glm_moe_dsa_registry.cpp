@@ -33,6 +33,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -71,9 +72,15 @@ std::unique_ptr<LoadedModel> LoadGlmMoeDsaForCausalLM(
     VT_CHECK(source.gguf != nullptr,
              "GlmMoeDsaForCausalLM: a non-safetensors ModelSource carried no "
              "GgufFile");
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+    // the device the ENGINE resolved for this load, never from
+    // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+    // CUDA-capable process, and this hook is where the disagreement reached the
+    // loader.
+    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
     return std::make_unique<GlmMoeDsaLoadedModel>(
-        registration, LoadGlmMoeDsaFromGguf(*source.gguf, config,
-                                            /*policy=*/nullptr));
+        registration,
+        LoadGlmMoeDsaFromGguf(*source.gguf, config, &gguf_policy));
   }
   (void)registration;
   throw std::runtime_error(GlmMoeDsaSafetensorsRefusal());

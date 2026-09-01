@@ -480,7 +480,7 @@ Glm5NextWeights LoadGlm5NextFromGguf(const GgufFile& gguf,
                                      const HfConfig& config,
                                      const GgufLoadPolicy* policy) {
   const GgufLoadPolicy pol =
-      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv();
+      policy != nullptr ? *policy : GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
 
   // WHAT THIS BOX WOULD HAVE DONE, printed beside what this row does instead.
   // The repack defect (#2241) was reachable only where `QuantRepackActive()` is

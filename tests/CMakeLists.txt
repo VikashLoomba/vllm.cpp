@@ -1051,9 +1051,23 @@ target_include_directories(test_qwen4_exp_layer_loop PRIVATE ${CMAKE_SOURCE_DIR}
 vllm_cpp_add_test(test_qwen4_exp_runner vllm/models/test_qwen4_exp_runner.cpp)
 target_include_directories(test_qwen4_exp_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+vllm_cpp_add_test(test_qwen4_exp_matmul_bt_dtype
+  vllm/models/test_qwen4_exp_matmul_bt_dtype.cpp)
+target_include_directories(test_qwen4_exp_matmul_bt_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_qwen4_exp_kv_cache vllm/models/test_qwen4_exp_kv_cache.cpp)
 target_compile_definitions(test_qwen4_exp_kv_cache PRIVATE
   QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
+
+# MODEL-MM-QWEN4-EXP (#2449): the hyper-connection INJECT weight's residency.
+# Its own target rather than another case in the layer loop, because the claim
+# is a DEVICE one and the case that carries it needs a CUDA queue: on the CPU
+# tier it reports UNMEASURED and the CPU case beside it is a regression guard
+# that cannot see the defect. `qwen4_exp_weights.h` is a MODEL-PRIVATE header
+# under src/, the same grant the layer-loop target takes.
+vllm_cpp_add_test(test_qwen4_exp_inject_residency
+  vllm/models/test_qwen4_exp_inject_residency.cpp)
+target_include_directories(test_qwen4_exp_inject_residency PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) W1 -- the config layer and
 # the two production entry points that reach it: `ModelRegistry::Resolve` and

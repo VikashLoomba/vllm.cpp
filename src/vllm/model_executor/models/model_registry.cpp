@@ -221,10 +221,12 @@ ModelSource ModelSource::FromSafetensorsOwned(
   return source;
 }
 
-ModelSource ModelSource::FromGguf(const GgufFile& gguf) {
+ModelSource ModelSource::FromGguf(const GgufFile& gguf,
+                                  vt::DeviceType device) {
   ModelSource source;
   source.kind = Kind::kGguf;
   source.gguf = &gguf;
+  source.device = device;
   return source;
 }
 

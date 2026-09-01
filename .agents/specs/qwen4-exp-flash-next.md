@@ -3909,6 +3909,20 @@ All six mutations were re-run after this refactor.
   `tests/vllm/models/test_qwen4_exp_cuda.cpp` (the SCOPE paragraph) and in this
   spec.
 
+  **OUTCOME, RECORDED BECAUSE THE PREDICTION WAS ONLY TWO-THIRDS RIGHT.** Both
+  merged within an hour: #2391 (`27aaf199a`) then #2396 (`f937e8063`). KGATHER's
+  author reconciled `docs/FEATURES.md` -- the row now reads "ALL SIX ... NOW HAVE
+  CUDA ARMS ... **THAT LEAVES THE GATHER, AND KGATHER LANDED IT**", one story
+  rather than two, and the contradiction this entry warned about did NOT survive
+  -- and repaired the SCOPE paragraph in `test_qwen4_exp_cuda.cpp`. **The spec
+  was the location that was missed**: three live claims in
+  `### The neighbouring suites, and the LOAD-TIME refusal that settles
+  reachability` survived on `main` stating a gap that KGATHER had closed, one of
+  them with a literal `grep -c` that had changed answer. Repaired above by the
+  wave that wrote them, tracked by
+  [#2443](https://github.com/mudler/vllm.cpp/issues/2443). Nothing is
+  outstanding.
+
   **THE MODEL STILL WILL NOT RUN A CUDA FORWARD, AND THE REASON MOVES FROM THE
   LOADER INTO THE QSA BLOCK.** `qwen4_exp_forward.cpp` builds its rope tables as
   `DBuf rope_packed/rope_cos/rope_sin`, and `DBuf`'s constructor ends
@@ -7933,7 +7947,33 @@ checkpoint, which the on-disk device-fit guard (issue #1123) cannot see. The
 CUDA gather arm is owed. Load this model with --device cpu.
 ```
 
-So on a CUDA build this architecture **does not load**, and the refusal is at
+**EVERYTHING FROM HERE TO THE END OF THIS SUBSECTION WAS TRUE WHEN W6-CUDA-B
+MEASURED IT AND IS FALSE ON `main` NOW.** KGATHER (#2396, `f937e8063`) landed
+after W6-CUDA-B (#2391, `27aaf199a`) and closed the gap this subsection is
+about. It is kept rather than deleted because the measurement below is what the
+gate actually observed on `thor:gpu0`, and a record that quietly loses its own
+superseded reading cannot be audited; the correction rides here instead.
+
+WHAT CHANGED, checked against `main` rather than against the pull request:
+`include/vt/ops.h` now has `kEmbeddingQuant` (`grep -c` is **2**, not 0),
+`gguf_keep_quant.cpp`'s `DeviceQuantGatherSupported` is now
+`return vt::OpRegistered(vt::OpId::kEmbeddingQuant, dev);` rather than
+`dev == kCPU`, and `EmbeddingKernelCuda` decodes a block-quantized table instead
+of refusing one -- its "unsupported table dtype" string still exists, but it no
+longer covers the block case, so citing it as the gather's blocker is
+misleading now even though the string is still greppable. **So a `qwen4exp`
+GGUF LOADS on a CUDA device today.**
+
+WHAT DID NOT CHANGE, and is the reason this row still claims no GPU run: the
+three host reads in `qwen4_exp_qsa_block.cpp` (`CheckRopeLayoutsAgree`,
+`IndexerRows`, `Qwen4ExpQsaIndex`) are still on `main`, and
+`IsCudaKeepQuantSupported` still excludes IQ4_NL and Q5_0, which the released
+UD-IQ1_S uses. Both are live waves' territory. **No token has come out of a GPU
+and none is claimed.**
+
+The superseded reading follows, as W6-CUDA-B recorded it:
+
+So on a CUDA build this architecture **did not load**, and the refusal was at
 LOAD time rather than at the first forward.
 
 **THE REFUSAL IS CONDITIONAL, AND THE SENTENCE ABOVE SAID "AT ALL" WHERE IT
@@ -7951,13 +7991,14 @@ M8's, and the two agree: M8 says nothing in production reaches these kernels;
 this says nothing in production can even construct the model that would. Both are
 measured.
 
-`DeviceQuantGatherSupported` returns `dev == vt::DeviceType::kCPU` and nothing
-else (`gguf_keep_quant.cpp`), `EmbeddingKernelCuda` refuses a table that is not
-f32/bf16 by name (`cuda_ops.cu`, "cuda embedding: unsupported table dtype
-(f32/bf16 only)"), and **there is no `kEmbeddingQuant` OpId at all** — `grep -c
-kEmbeddingQuant include/vt/ops.h` is 0. Three independent readings of one gap.
-Closing it is another wave's file territory; this wave does not touch it, and
-does not work around it.
+At the time of that run `DeviceQuantGatherSupported` returned
+`dev == vt::DeviceType::kCPU` and nothing else (`gguf_keep_quant.cpp`),
+`EmbeddingKernelCuda` refused a table that is not f32/bf16 by name, and there was
+no `kEmbeddingQuant` OpId at all — `grep -c kEmbeddingQuant include/vt/ops.h`
+was 0. Three independent readings of one gap. **All three are false on `main`
+now**; KGATHER closed that gap and the paragraph opening this subsection carries
+the current values. Closing it was another wave's file territory, and that wave
+closed it.
 
 ## Mutation record — W8CONFIRM (#2031, issue OWED)
 

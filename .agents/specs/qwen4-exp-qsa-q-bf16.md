@@ -132,9 +132,66 @@ scripts/agent-preflight.sh --staged
 
 ## Evidence
 
-Recorded in `## Outcome` when the row reaches `DONE`, and in the pull request
-body meanwhile. The arms that ran and the arms that did not are named separately;
-an unmeasured CUDA arm is reported as unmeasured.
+Measured on `mudler-ubuntu-box`, a CPU-only build (`cmake -G Ninja
+-DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_BUILD_TESTS=ON`, no `nvcc` on this host),
+at `origin/main` `63889449c` plus this branch. Every rc below is the literal exit
+status of the command named.
+
+### Red, then green
+
+| # | What | Command | rc | Read |
+|---|---|---|---|---|
+| R1 | The seam refuses a bf16 `q_out` | `./build/tests/test_ops_glue -tc='attn_gate_split*'` at BASE | 1 | `vt: attn_gate_split: q_out/gate_out must be f32 at src/vt/ops.cpp:5092`; `assertions: 18 \| 16 passed \| 2 failed` |
+| R2 | The production gate sees the f32 buffer | `./build/tests/test_qwen4_exp_layer_loop -tc='*MODEL dtype*'` at BASE | 1 | `CHECK( 256 == 128 )`, `calls seen through ModelRegistry::Forward: 1` |
+| G1 | `test_ops_glue` | after | 0 | `15 passed`, `assertions: 192 \| 192 passed` |
+| G2 | `test_qwen4_exp_qsa_block` | after | 0 | `13 passed`, `assertions: 5937 \| 5937 passed` |
+| G3 | `test_qwen4_exp_layer_loop` | after | 0 | `10 passed`, `assertions: 352 \| 352 passed` |
+
+R2 is the number this change exists for: the same tokens, `256` bytes where
+upstream moves `128`.
+
+### Mutations
+
+| # | Mutation | Rebuild rc | Result |
+|---|---|---|---|
+| M1 | Delete the `RunQwen4ExpQsaBlockPaged` call in `qwen4_exp_forward.cpp` | 0 | `REQUIRE( 0 > 0 )` — `calls` goes 1 -> 0. The gate measures the production path, not a hand-built block. |
+| M2 | (= R2) `DBuf q_split` back to `DType::kF32` | 0 | `CHECK( 256 == 128 )` |
+| M3 | Drop the f32 arm from `AttnGateSplit`'s dtype check | 0 | The PRE-EXISTING `attn_gate_split: splits [q\|gate] per head` case — f32 in, f32 out, which is Qwen3.5's exact operand shape — reds. An existing gate covers the arm Qwen3.5 uses. |
+
+Each mutation was applied to a tree that had just built green, each rebuild
+returned 0 before the run, and the tree was restored to a clean `git status`
+after each.
+
+### What was NOT measured, and is not claimed
+
+- **The CUDA arm did not compile.** This host has no `nvcc`, and the fleet's two
+  x86 devices were held by other waves for the whole session (`thor:gpu0` by the
+  #2509 verification this wave was told not to compete with). `cuda_glue.cu`'s
+  templated dispatch is therefore reviewed and not built. The pull request's
+  CUDA lane is the first thing that compiles it.
+- **`test_ops_attn_preamble` is a SKIP wearing a PASS here.** It exits 0 with
+  `assertions: 0` because both its cases open with `if (!HasCuda()) return;`.
+  It is listed in `## Gates` because it is the right gate; on this build it
+  gated nothing, and `## Tests` item 4 leans on M3 instead.
+- **The released UD-IQ1_S control sequence was not re-run.** The artifact is
+  71 GB across three shards on the NAS; this box had 61 GB available at a load
+  average of 47, with four other waves building. Running it would have thrashed
+  the box for everyone else and produced a number nobody could reproduce. The
+  value argument is the bit-identity above, and the executable substitutes are
+  G2 (5937 assertions against the oracle's own `Qwen4ExpTextAttention.forward`
+  goldens) and G3 (352, including the forward goldens).
+- **No throughput axis.** The change removes `T*Hq*Dh*2` bytes of traffic per
+  QSA layer per step. That is arithmetic, not a measurement, and it is stated as
+  arithmetic. Nothing here claims a speedup.
+
+### One route that could have moved and does not
+
+Narrowing `x` to bf16 makes `LaunchRmsNorm<__nv_bfloat16>` the CUDA
+instantiation, which is the arm that can reach `TryLaunchRmsNormDecodeFast`.
+It cannot here: that path returns false on `residual == nullptr`
+(`cuda_ops.cu:395`) and again on `h < 1024` (`:396`), and the QSA `q_norm` call
+passes no residual and `h = head_dim`. So the kernel is `RmsNormRowKernel` before
+and after.
 
 ## Stop conditions
 

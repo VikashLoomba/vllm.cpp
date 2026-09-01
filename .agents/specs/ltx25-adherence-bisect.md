@@ -179,6 +179,20 @@ score is the tuning this row forbids itself.
   between renders of one unchanged binary, the -0.7368 margin is not a finding
   and neither is any bisection built on it. This row reports that FIRST if it
   happens.
+- **Every `AGREE` row rests on checkpoint metadata that neither side re-reads
+  here.** Upstream does not hold these defaults as constants: it resolves them
+  from the checkpoint, through `resolve_cli_params` (`args.py:485-495`) into
+  `detect_checkpoint_path` (`:460-477`) and `detect_params`
+  (`constants.py:166-179`), and that reader falls back to `LTX_2_PARAMS`
+  silently for "older, unset, or unreadable versions". `LTX_2_PARAMS` carries
+  `stg_blocks=[29]` and 40 steps (`constants.py:47`, `:56`, `:66`, `:80`), not
+  `[28]` and 30. So `stg_blocks [28] AGREE` is conditional on the BF16
+  transformer's `model_version` parsing as at or above `(2,4)` on upstream's own
+  reader, and a checkpoint whose metadata does not parse would put upstream on a
+  different STG block and a different step count while this table still read
+  AGREE. Phase A's own run confirms it: `detect_model_version` logs the version
+  it read (`constants.py:162`), so the run's log settles which branch upstream
+  took, and no separate experiment is owed.
 - **`dgx` has crashed roughly hourly under long sequences.** The lease job is
   phase-structured and checkpoints each phase's artefacts to `/workspace` before
   the next begins, so a crash costs one phase and not the run.
@@ -238,9 +252,9 @@ all AGREE, each checked to a `file:line` on both sides:
 
 | Parameter | Upstream | Ours | |
 |---|---|---|---|
-| video `cfg_scale` / `stg_scale` / `rescale_scale` / `modality_scale` / `skip_step` | 3.0 / 1.0 / 0.7 / 3.0 / 0 (`constants.py:51-55`) | same (`ltx2_pipeline.cpp:949-953`) | AGREE |
-| `stg_blocks` (both modalities) | `[28]`, the 2.3 override the 2.5 key inherits (`constants.py:86`, `:124`, `:130-133`) | `{28}` (`ltx2_pipeline.cpp:1069`, `:974-981`, `:1005-1014`) | AGREE |
-| audio guidance | 7.0 / 1.0 / 0.7 / 3.0 / 0 (`constants.py:61-65`) | same (`ltx2_pipeline.cpp:955-959`) | AGREE |
+| video `cfg_scale` / `stg_scale` / `rescale_scale` / `modality_scale` / `skip_step` | 3.0 / 1.0 / 0.7 / 3.0 / 0 (`constants.py:51-55`) | same (`ltx2_pipeline.cpp:950-954`) | AGREE |
+| `stg_blocks` (both modalities) | `[28]`, the 2.3 override the 2.5 key inherits (`constants.py:86`, `:124`, `:130-133`) | `{28}` (`ltx2_pipeline.cpp:969-970`, `:974-981`, `:1005-1014`) | AGREE |
+| audio guidance | 7.0 / 1.0 / 0.7 / 3.0 / 0 (`constants.py:61-65`) | same (`ltx2_pipeline.cpp:956-960`) | AGREE |
 | negative prompt | `DEFAULT_NEGATIVE_PROMPT` (`constants.py:186-199`) | `LightricksNegativePrompt()` (`ltx2_pipeline.cpp:1101-1107`) | AGREE, byte for byte, 1171 chars |
 | sampler | `euler_denoising_loop` + `EulerDiffusionStep`, deterministic, no per-step noise (`samplers.py:39-81`, `diffusion_steps.py:25-40`) | the first-order arm with `kEuler` (`ltx2_video.cpp:4732-4820`, `ltx2_pipeline.cpp:241-258`) | AGREE |
 | STG application | `SKIP_VIDEO_SELF_ATTN` + `SKIP_AUDIO_SELF_ATTN` on block 28 (`denoisers.py:111-119`) | `kSkipVideoSelfAttn` + `kSkipAudioSelfAttn` (`ltx2_denoisers.cpp:143-155`) | AGREE |

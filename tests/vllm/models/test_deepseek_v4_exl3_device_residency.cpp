@@ -137,32 +137,25 @@ TEST_CASE("W2: staging is idempotent, so a per-forward call costs one predicate"
   CHECK(vllm::StageDeepseekV4Exl3TowerToDevice(cpu.q, w.exl3) == 0);
 }
 
-// ─── #2458: the fused arm's device default ───────────────────────────────────
+// ─── #2458: the fused arm's flag, on every queue ─────────────────────────────
 //
-// `vt::Exl3MoeMlp` faults on a device queue and the per-expert loop arm on the
-// same queue is bit-exact against the CPU arm, so the fused arm is off BY
-// DEFAULT on a device queue and unchanged on the host arm it is correct on.
-// That needs a predicate the default-ON flag cannot express: absence and consent
-// are the same value to `Dsv4Exl3FusedMoeFlagIsOn`.
-TEST_CASE("W2/#2458: 'explicitly asked for the fused arm' is not 'did not say no'") {
-  // The DEFAULT flag: silence and every non-'0' value read as ON. This is what
-  // keeps the host arm byte-identical.
+// `vt::Exl3MoeMlp` faulted on a device queue until #2458, so the fused arm
+// carried a second predicate that kept it off there unless an operator wrote an
+// explicit '1'. The kernel is fixed -- the port had dropped upstream's
+// `shmem_out_had` template parameter, so the MoE epilogue dereferenced the NULL
+// `post_scale` its own bands pass -- and the second predicate is gone with it.
+// One flag now selects the arm on the host and on a device queue alike, and
+// this pins its parse so a later edit cannot make silence read as OFF.
+TEST_CASE("W2/#2458: one flag selects the fused arm on every queue") {
+  // Silence and every non-'0' value read as ON. Silence is the DEFAULT path, so
+  // this is the case that says the device arm ships enabled.
   CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn(nullptr));
   CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn("1"));
   CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn("yes"));
+  CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn(""));
+
+  // Only a LEADING '0' turns it off, which is the shape the other
+  // `VT_DSV4_EXL3_*` knobs use and not the repository-wide flag rule.
   CHECK_FALSE(vllm::Dsv4Exl3FusedMoeFlagIsOn("0"));
-
-  // The FORCED flag: only an explicit '1'. Silence must NOT read as consent,
-  // because silence is the default path and the default path is the one the
-  // faulting kernel is off on.
-  CHECK_FALSE(vllm::Dsv4Exl3FusedMoeForcedOnFlag(nullptr));
-  CHECK_FALSE(vllm::Dsv4Exl3FusedMoeForcedOnFlag("0"));
-  CHECK_FALSE(vllm::Dsv4Exl3FusedMoeForcedOnFlag("yes"));
-  CHECK(vllm::Dsv4Exl3FusedMoeForcedOnFlag("1"));
-
-  // THE DISTINCTION ITSELF, stated as a property rather than as four more
-  // literals: the two predicates must disagree on silence. If a later edit made
-  // `ForcedOn` merely "not '0'", every case above still passes except this one.
-  CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn(nullptr) !=
-        vllm::Dsv4Exl3FusedMoeForcedOnFlag(nullptr));
+  CHECK_FALSE(vllm::Dsv4Exl3FusedMoeFlagIsOn("0ff"));
 }

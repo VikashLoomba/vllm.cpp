@@ -2513,6 +2513,23 @@ which is precisely how this landed green locally in the first place.
   EXL3 checkpoint compute on a GPU, which is what W2 set out to make possible and
   what the blanket refusal prevented entirely.
 
+  **THE DEFAULT DEVICE PATH NOW WORKS, MEASURED 2026-09-01 on `thor:gpu0`.** With
+  the fused arm defaulted off on a device queue, the path an operator actually
+  gets -- no environment variables set -- computes on CUDA and matches the CPU
+  arm exactly:
+
+  | run | result |
+  |---|---|
+  | default path, no env vars | rc=0, 5/5 assertions, `max \|diff\| = 0` |
+  | the same under `compute-sanitizer --tool memcheck` | **`ERROR SUMMARY: 0 errors`** (was 66) |
+  | `VT_DSV4_EXL3_FUSED_MOE=1` (forced fused) | rc=134, still faults |
+
+  The zero-error sanitizer run is the one that matters beyond the diff: it says
+  the device path this row now serves has no out-of-bounds or invalid access at
+  all, not merely that its numbers happen to agree. And the forced run still
+  faulting is what proves the predicate gates something rather than decorating a
+  path that was already fine.
+
   **The FUSED arm is where the defect is** ([#2458](https://github.com/mudler/vllm.cpp/issues/2458)),
   and it is the fast path, so W2 is not finished. `compute-sanitizer` places it in
   `exl3_moe_kernel` as an 8-byte read at `base + tid*8` with base NULL (`0x0,

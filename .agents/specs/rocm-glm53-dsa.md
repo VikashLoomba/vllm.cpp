@@ -197,6 +197,77 @@ ported natively, because the remainder still run on the tier.
   (`src/vt/op_provider.cpp:707`) — so the CUDA, CPU and discrete-ROCm paths are
   untouched by construction.
 
+## W3. Measured result (rc job `0d94bc20`, `strix:gpu0`, 2026-09-01)
+
+Build: hipBLASLt installed to clear #2499, `cmake rc=0`,
+`ROCm backend: ENABLED for arch(es) [gfx1151]` asserted fatally at configure time.
+
+### The mutation ladder
+
+| Step | Tree | Case | Result |
+|---|---|---|---|
+| A | override **deleted** (= pre-fix) | by-hand | **RED** `exit=1`, 1 case / 6 assertions, 1 failed |
+| B | restored byte-identical | by-hand | GREEN `exit=0`, 6/6 |
+| C | production call site **deleted** | by-hand | GREEN 6/6 — *it does not go through the call site* |
+| C | production call site **deleted** | GetOp-entry | **RED** `exit=1`, 10 assertions, 1 failed |
+| D | call site restored byte-identical | GetOp-entry | GREEN 10/10 |
+
+Both restores verified by sha256 (`ae6eea5b...` for `rocm_backend.hip`,
+`7a449104...` for `op_provider.cpp`). Every mutated build was `rc=0` first, so no
+RED here is a build error wearing a test result, and every run reports a non-zero
+selected-case and assertion count, so none is an empty filter wearing a pass.
+
+**The failure signature is the race itself.** In steps A and C the failing
+assertion is the LAST element of the buffer:
+
+```text
+test_rocm_backend.cpp:282: ERROR: CHECK( dout[n - 1] == doctest::Approx(2.0f) )
+  values: CHECK( -1 == Approx( 2 ) )
+```
+
+`dout[0]` and `dout[n/2]` pass in the same run. The host observed the front of a
+2048x1024 output the device had already written and the tail it had not, which is
+what an undrained stream looks like and not what a wrong kernel looks like.
+
+Steps C and D are the reachability proof §"Nothing lands dead" asks for: deleting
+the production call site reds the GetOp-entry case while the by-hand case stays
+green, so the two cases demonstrably measure different things.
+
+### Suites
+
+- `test_rocm_backend` on the restored tree: **11 cases / 11 passed / 1087
+  assertions / 0 failed**.
+- `test_backend_cross_device`: 26 cases / 25 passed / **1 failed**; 80253
+  assertions / 1 failed. The failure is `MoeSiluMul matches the CPU oracle within
+  NMSE <= 5e-4`, logged `bf16 := true`, `DeviceName(dt) := ROCM`, differing by
+  +/-1 ULP in bf16. That is the **pre-existing** #1954 / #1513 defect, and this
+  wave's diff touches neither that file nor any arithmetic path -- the three
+  changed files are this spec, `rocm_backend.hip` and `test_rocm_backend.cpp`.
+  Recorded here because #1954 and #1513 name `gfx1200`: it reproduces on
+  `gfx1151` too.
+
+## W4. `--device rocm` does not exist, and that is a seam gap
+
+The model run did not happen, and the reason is not the model:
+
+```text
+vllm-cli: unknown --device 'rocm' (expected auto, cpu, or cuda)
+```
+
+`examples/cli/main.cpp:143-150` maps only `auto`/`cpu`/`cuda`, mirroring the C ABI
+it is a thin client of: `vllm_model_params.device` is documented at
+`include/vllm.h:113-120` as `0=auto, 1=cpu, 2=cuda`, where `2` *requires* the CUDA
+platform and fails the load when it is absent rather than substituting.
+
+So on an AMD box `auto` is the only route to the GPU, and ROCm cannot be pinned
+explicitly. A user cannot distinguish "ran on the Radeon" from "auto fell back to
+the CPU queue" by configuration; they have to read the log. §"Shared seams" says
+every shipped capability is exposed through `include/vllm.h`, and ROCm, Metal,
+Vulkan, XPU and Tenstorrent are all shipped backends with no ABI selector.
+
+Filed as #2505. Not fixed here: extending the ABI enum is a public-surface change
+that owes its own row, spec and version note, and it is not a model bring-up.
+
 ## Owed
 
 Unreached or unported after this wave, none of it claimed here:
@@ -217,6 +288,12 @@ Unreached or unported after this wave, none of it claimed here:
   because the repair is a deliberate choice between making the library required
   and compile-guarding the TU, and that choice belongs to `BACKEND-ROCM` rather
   than to a model bring-up. Worked around in the lease by installing the package.
+- No explicit ROCm device selector in the C ABI or the CLI, #2505. Extending
+  `vllm_model_params.device` past `0=auto/1=cpu/2=cuda` is a public-surface
+  change owing its own row, spec and ABI version note, so this wave records it
+  rather than making it. `--device auto` is the working route meanwhile.
+- `MoeSiluMul` bf16 is +/-1 ULP off the CPU oracle on `gfx1151` as well as the
+  `gfx1200` boards #1954 and #1513 name. Pre-existing and untouched here.
 - No speed number is claimed or owed for this board by this wave. Any run of this
   model on ROCm reaches eight reference-tier ops, which `docs/ROCM.md:60-61`
   disqualifies as a performance result.

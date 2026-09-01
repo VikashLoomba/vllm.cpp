@@ -3556,7 +3556,7 @@ TEST_CASE("ltx2 ti2vid: the recipe is the PLAIN two-stage pipeline, not the HQ o
 
   // THE SCHEDULE ANCHOR, and the one field this arm could not be written with
   // before this row. That same `execute` call passes NO latent, so
-  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // `schedulers.py:32` resolves `tokens` to `default_number_of_tokens` = 4096
   // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
   // recipe below — is the ONE upstream site that passes `latent=empty_latent`,
   // and it is the control here precisely because it is the exception. Six other
@@ -3821,7 +3821,7 @@ TEST_CASE("ltx2 keyframe: the recipe is the INTERPOLATION pipeline, not the plai
   CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control
 
   // THE SCHEDULE ANCHOR. That same `execute` call passes NO latent, so
-  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // `schedulers.py:32` resolves `tokens` to `default_number_of_tokens` = 4096
   // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
   // recipe — is the ONE upstream site that passes `latent=empty_latent`, and it
   // is the control here precisely because it is the exception. That three other

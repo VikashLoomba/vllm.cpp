@@ -2560,6 +2560,28 @@ which is precisely how this landed green locally in the first place.
   on the host and on a device queue alike, and the routed experts of an EXL3
   checkpoint now compute on a GPU through the FAST arm.
 
+  **READ THOSE `max |diff| = 0` ROWS NARROWLY: they gate the ABSENCE OF A FAULT,
+  not the arithmetic** ([#2500](https://github.com/mudler/vllm.cpp/issues/2500)).
+  Measured on `thor:gpu0` after the fix: doubling EVERY value the fused MoE band
+  stores moves the compared logits by `4.57764e-05`, which is exactly `3/65536`
+  -- one fp16 quantization step, against this case's `1e-2` tolerance. That is
+  **218x of headroom over a 2x error**, so the suite cannot see a wrong number
+  out of that kernel, and two smaller mutations of the same epilogue read as
+  exactly `0` for the same reason.
+
+  The routing is NOT degenerate, which is what rules out the comfortable
+  explanation: the fixture sends 3 tokens to one expert with `num_active=1` and
+  `3 <= max_rows=128`, so the fused arm owns that expert and the host loop skips
+  it -- its output is the sole source of those logits. The CPU-side sibling
+  proves the algebra IS gateable when measured closer: doubling the CPU
+  scatter-add takes `test_deepseek_v4_exl3_forward`'s `rel_rms` from ~0 to 0.373
+  and reds at once.
+
+  So the fault fix stands on the M1 evidence -- putting `shmem_out_had = true`
+  back reproduces the original crash exactly -- and the numeric claim was
+  deliberately never made. #2500 owns the replacement gate, and its acceptance
+  condition is stated there: doubling the band's stored intermediate must red it.
+
   **The upload was UNPROVEN on a host-only lane and must not be claimed
   from one.** `test_cuda_deepseek_v4.cpp` carries the two cases that prove it --
   bytes moved, `d_dev` non-null, host `capacity() == 0`, and the CUDA forward

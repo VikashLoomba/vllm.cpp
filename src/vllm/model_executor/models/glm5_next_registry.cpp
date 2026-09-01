@@ -29,8 +29,11 @@
 // ~119.63 GiB on GB10), so there is no downstream token gate that would catch a
 // forward returning plausible garbage, and O1 still says so. What replaces the
 // blanket refusal is a set of NARROW ones, each naming what is owed rather than
-// the whole capability: a non-CPU queue, a multi-request step, and the
-// safetensors load are each refused by name in place.
+// the whole capability: a multi-request step and the safetensors load are each
+// refused by name in place, and since W9c-3a (#2464) a CUDA queue is ADMITTED
+// -- for one arm, the routed-expert GEMM, with every other primitive still on a
+// CPU queue this forward interposes. A queue that is neither CPU nor CUDA is
+// still refused by name.
 #include "vllm/model_executor/models/model_registry.h"
 
 #include "vt/dtype.h"  // VT_CHECK

@@ -570,6 +570,22 @@ inline bool Dsv4Exl3FusedMoeFlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
 }
 
+// Whether the operator EXPLICITLY asked for the fused arm, which is a different
+// question from the default-ON flag above and cannot be derived from it: absence
+// and consent are the same value there.
+//
+// MODEL-DSV4-EXL3 #2458 needs the distinction. `vt::Exl3MoeMlp` faults on a
+// device queue -- `compute-sanitizer` places it inside
+// `exl3_moe_kernel<3, 256, 1>` as an 8-byte read at `base + tid*8` with base
+// NULL, while every operand handed to it is non-null -- so the fused arm is off
+// by default THERE while staying on for the host arm it is correct on. An
+// operator fixing that kernel still needs a way to demand it, and `=1` is that
+// way. Parsed here rather than at the getenv so it is testable without touching
+// the environment, exactly as the flag above is.
+inline bool Dsv4Exl3FusedMoeForcedOnFlag(const char* env_value) {
+  return env_value != nullptr && env_value[0] == '1';
+}
+
 // Resolve DeepseekV4Params directly from a `deepseek4`-arch GGUF's KV metadata
 // (block_count, hash_layer_count, expert_count, key/value_length, q_lora_rank,
 // output_group_count, sinkhorn_iterations, indexer head/key/top_k, compress_ratios,

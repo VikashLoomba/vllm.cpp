@@ -146,6 +146,16 @@ reader will otherwise re-derive them.
 3. A red-before reproduction exists for the named cause, and the repair turns it
    green.
 
+## Owed
+
+- [#2522](https://github.com/mudler/vllm.cpp/issues/2522) — `GdnStateGatherK` /
+  `GdnStateScatterK` index the GDN state cache at an unbounded `state_idx[row]`
+  and are never passed the slot count, while the sibling `GdnScanK` in the same
+  family bounds the identical index. Found while diagnosing this row and NOT its
+  fault site, so it is filed rather than folded in. It mirrors `cuda_gdn.cu`
+  exactly, so the repair belongs on both backends together and not inside a
+  gfx1151 row.
+
 ## Stop conditions
 
 - A cause that is in the AMD driver or firmware rather than in this tree ends the

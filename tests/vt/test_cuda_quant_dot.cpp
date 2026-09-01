@@ -1453,6 +1453,10 @@ TEST_CASE("32-block keep-quant lane: crosses the lane stride, and takes K = 640"
 
   int64_t combos = 0;
   for (const WeightCase& c : k32) {
+    // Worst margin over this dtype's shapes. A gate that only says "within
+    // tolerance" cannot be read for HOW MUCH room it had, so a later tightening
+    // or a slow drift has nothing to be compared against. Reported below.
+    double worst_ratio = 0.0, worst_diff = 0.0;
     for (int64_t k : kKs) {
       const int64_t nb = k / c.block_elems;
       for (int64_t m : {int64_t{1}, int64_t{5}}) {
@@ -1529,9 +1533,16 @@ TEST_CASE("32-block keep-quant lane: crosses the lane stride, and takes K = 640"
           CHECK(poisoned == 0);
           CHECK(max_abs_diff <= bound);
           CHECK(nmse <= kMaxNmseVsCpu);
+          if (bound > 0 && max_abs_diff / bound > worst_ratio) worst_ratio = max_abs_diff / bound;
+          if (max_abs_diff > worst_diff) worst_diff = max_abs_diff;
         }
       }
     }
+    // ALWAYS printed, unlike CAPTURE, which doctest emits only for a FAILING
+    // assertion -- so a green run reported no number at all and the measured
+    // device-vs-CPU margin could not be quoted from a passing gate.
+    MESSAGE("32-block lane " << c.name << ": worst device-vs-CPU max|diff| = " << worst_diff
+                             << ", worst fraction of the derived bound = " << worst_ratio);
   }
   // A loop that ran nothing prints the same SUCCESS as one that ran everything.
   CAPTURE(combos);

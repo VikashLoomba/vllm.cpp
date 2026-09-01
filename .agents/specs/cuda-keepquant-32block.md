@@ -11,7 +11,7 @@ the debt [#2380](https://github.com/mudler/vllm.cpp/issues/2380) records under
 
 ## Now
 
-`ACTIVE`.
+`DONE` on the kernels and their gates. See `## Outcome`.
 
 ## The gap, as measured on `84f6fac0a`
 
@@ -256,3 +256,72 @@ mutation that never applied cannot read as a pass.
   lifecycle state in this change, so no matrix edit is owed by it, and correcting
   the flags means re-verifying another row's work rather than recording this
   one's. Named here so the disagreement is visible rather than silently carried.
+
+## Outcome
+
+Measured on `dgx:gpu0` (GB10, `sm_121a`, CUDA 13.0, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a`)
+over the tree `fd3dd549`, whose `src/`, `tests/` and `include/` are byte-identical
+to the head this row hands over. One lease, five stages, every rc read literally
+from the job log:
+
+| Stage | Tree | seam call sites | `BUILD_RC` | `TEST_RC` | assertions |
+|---|---|---:|---:|---:|---:|
+| A | pre-change kernel + these tests | 0 | 0 | **139** | 171,600 |
+| B | the change | 5 | 0 | **0** | **218,359** |
+| C | B, three production call sites DELETED | 1 | 0 | **139** | 171,600 |
+| C2 | B, every call site kept, ADMISSION neutered | 5 | 0 | **139** | 171,600 |
+| D | B restored | 5 | 0 | **0** | 218,359 |
+
+`RESTORE=IDENTICAL` (byte-for-byte against the staged source), `CONFIGURE_RC=0`.
+
+### What the numbers say
+
+**The pre-change tree does not drain, it FAULTS.** Stage A dies with SIGSEGV in
+the first case in the file. So on this hardware the blocker was never "correct
+but slow": the released artifact's expert GEMM could not run on CUDA at all.
+
+**Both mutations kill, against a green baseline, by two independent
+mechanisms.** C removes the call sites; C2 leaves every call site in place and
+makes the predicate refuse. Both land on **exactly** stage A's 171,600
+assertions and rc 139. Two different edits reproducing the pre-change count to
+the assertion is what rules out a mutation that merely broke something else.
+
+The counted property is the seam occurrence count printed per stage
+(5 / 1 / 5), not a patch exit code -- and it earned its keep. The FIRST attempt
+at C failed to BUILD (`BUILD_RC[C]=1`) because an unreferenced explicit
+specialization is emitted and warned under this TU's `-Werror=all-warnings`,
+where an uninstantiated primary template is not. A build failure reads as a
+passing test; the harness reported it as `STAGE C BUILD FAILED` and the mutation
+was recorded VOID rather than counted. `[[maybe_unused]]` on all five affected
+entities is what made C build, and C2 exists so that a mutation would still be
+available had it not.
+
+### Ported, and how it was checked
+
+The three device dots reproduce this tree's CPU arm **bit-exactly**, per block
+and across a 40-block row, verified on the host independently of any GPU by
+compiling the CPU `vec_dot`s into the same translation unit as a transcription
+of the device bodies: 0 of 40 blocks differ for each of q4_0, q5_0 and iq4_nl.
+That checks the parts most likely to be wrong -- nibble extraction, Q5_0's `qh`
+bit splicing, the IQ4_NL codebook index, and the three DIFFERENT scale
+association orders upstream uses.
+
+### The bound, and why it is not fitted
+
+`max|diff| <= 8 * nb * FLT_EPSILON * max|cpu|`. Derived from the only difference
+between the two sides -- association, the CPU arm summing blocks sequentially
+against the kernel's per-lane partials plus a 32-wide warp tree -- rather than
+fitted to a fixture. Simulating the kernel's exact reduction order on the host
+over nb in {8, 20, 40, 128, 512, 2048} and 24 rows per shape puts the worst case
+at **1.3% of the budget**, and the ratio FALLS as nb grows, so it points the way
+the error grows. A constant would have tightened as K rose and begun failing on
+the long rows this lane exists to serve.
+
+### What this row does NOT claim
+
+- **No speed number.** Nothing here measures throughput; the win claimed is that
+  the path runs on the device at all.
+- **No run of the released checkpoint.** Every gate is a fixture. What the real
+  artifact does through a full forward is unmeasured here.
+- **The capture gate did not supply the red** -- see the correction above.
+- **The scalar dot is a throughput ceiling**, recorded under `## Owed`.

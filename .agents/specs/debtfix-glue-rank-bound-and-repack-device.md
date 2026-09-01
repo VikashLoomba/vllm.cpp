@@ -286,6 +286,37 @@ discriminating on an aarch64 i8mm box, and it is inert here. The CPU control
 another wave. It is unchanged by construction rather than by measurement — on
 `dev == kCPU` the gated expression is character-for-character the old one.
 
+### The mutations
+
+Each applied in this worktree, rebuilt, run, then restored and verified
+byte-for-byte (`git status --porcelain` empty, `md5sum` recorded). No mutation
+ran against a red baseline, and every build returned rc 0 before its run.
+
+| # | mutation | rebuilt | result |
+|---|---|---|---|
+| M1 | delete `CheckRank` from `MakeTensor` only | `test_device_pool`, rc 0 | rc **1**: UBSan `index 4 out of bounds` at the `CHECK_THROWS` line, process aborted |
+| M2 | delete `CheckRank` from `DBuf`'s constructor only | `test_device_pool`, rc 0 | rc **1**: `CHECK(a.allocs() == 0)` reads `1 == 0` — the pool block really is stranded, 11/12 assertions pass |
+| M3 | make `CheckRank` throw unconditionally | `test_qwen4_exp_layer_loop`, rc 0 | rc **1**: `ModelRegistry::Forward reaches it on a loaded qwen4exp GGUF` THREW the bound's own message |
+| M4 | revert the `FromEnv` wire to the old inline expression | `test_gguf_keep_quant`, rc 0 | rc **0**, 9987/9987 — **SURVIVED**, see below |
+| M5 | drop `&& dev == kCPU` from `QuantRepackForDevice` | `test_gguf_keep_quant`, rc 0 | rc **1**: the `kCUDA`, `kROCM` and `kXPU` rows read `true == false`, 7/10 assertions pass |
+
+**M3 is the reachability evidence.** The guard is not reached only by the case
+written for it: a production entry point, `ModelRegistry::Forward`, allocates
+through `dense_attn::DBuf` and therefore through `CheckRank` on every step.
+
+**M4 SURVIVED, and that is a finding rather than a footnote.** On an x86 host no
+test in this tree can tell the wired predicate from the expression it replaced,
+because `vt::cpu::QuantRepackActive()` is a compile-time `false` here and makes
+`quant_repack` false under either wiring. M5 shows the RULE is gated; the WIRE
+is gated only on an aarch64 i8mm host, where the case's `VT_GGUF_KEEP_QUANT=1`
+arm becomes discriminating. This is stated in the case's own comment.
+
+What stands behind the ungated wire is the pair of runtime tripwires that
+already existed — `qwen3_5.cpp`'s `VT_CHECK(!w.repacked)` at device staging and
+`ResidentWeight`'s — and those ARE gated everywhere, by
+`test_resident_weight_host_addressable` (85/85, rc 0). A reverted wire on an
+aarch64 CUDA box therefore refuses by name instead of emitting wrong tokens.
+
 ## Risks
 
 * The rank bound turns a silent corruption into a throw. If any caller outside

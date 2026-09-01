@@ -52,7 +52,7 @@ are our reading of their documented behavior, not measurements.
 | Block-paged KV with refcount and LRU evict | ✅ | ✅ | ✅ | ◐ |
 | Hybrid KV groups (full attention + GDN/Mamba) | ◐ GDN gate activation resolved from the checkpoint's `output_gate_type` (silu/swish/sigmoid; anything else refused at load, #489) | ✅ | ◐ | ◐ |
 | Sliding-window and chunked-local attention | ◐ | ✅ | ✅ | ✅ |
-| fp8 KV cache | ◐ `--kv-cache-dtype fp8` halves the block, so a fixed `--kv-cache-memory` buys 2x the blocks and the DEFAULT 256-block path halves the pool bytes instead. Costs the bf16-native FA-2/WMMA/vector kernels (net UNMEASURED). 16 archs, MLA, the C ABI are refused before any write; only 1 arch names fp8 back. CUDA UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
+| fp8 KV cache | ◐ `--kv-cache-dtype fp8` halves the block, so a fixed `--kv-cache-memory` buys 2x the blocks and the DEFAULT 256-block path halves the pool bytes instead. Costs the bf16-native FA-2/WMMA/vector kernels (net UNMEASURED on most archs; the ROCm GQA4 f32-Q decode arm recovers parity, fork issue #7). 16 archs and MLA refuse before any write; only 1 arch names fp8 back. C ABI: `vllm_model_params.kv_cache_dtype` (ABI v24). CUDA UNRUN ([spec](../.agents/specs/fp8-kv-cache.md)) | ✅ | ✅ | ✅ |
 | KV offload to host memory | ✅ | ✅ | ✅ | ☐ |
 | External KV provider ABI (LMCache) | ☐ | ✅ | ◐ | ☐ |
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
@@ -363,6 +363,7 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Explicit device selection (auto/cpu/cuda) | `device` field on `vllm_model_params` (ABI v14; 0=auto keeps the probe, explicit absent device fails loud) | reachable |
 | Run the OpenAI server (server as a thin ABI client) | `vllm_server_main` (ABI v18) | reachable |
 | Speech + music generation (MiniMax-Music3; the IndexTTS-2.5 seam) | `vllm_speech_engine_load`, `vllm_synthesize`, `vllm_speech_result_free`, `vllm_speech_engine_family`, `vllm_speech_engine_sample_rate`, `vllm_speech_engine_requires_reference_audio` (ABI v20) | reachable |
+| KV-cache storage dtype (fp8) | `kv_cache_dtype` field on `vllm_model_params` (ABI v24; NULL/"auto" is byte-identical default) | reachable |
 | Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 
 ## Parallelism and scale-out

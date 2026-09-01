@@ -950,6 +950,22 @@ ForwardLogits Qwen3DenseDecodeGraph::Step(
       // Stage ids for the captured embedding (outside capture).
       vt::tenstorrent::WarmDecodeIds(
           s.token_ids.data(), static_cast<int64_t>(s.token_ids.size()));
+      // HOST-FREE-FORWARD R4 (#1105): _dummy_run mirror for the capture-only
+      // embed segment. The eager step's EmbedInto never runs the device
+      // embedding or the hidden-shadow copy, so both programs are cold at
+      // first capture and tt-metal refuses to load new binaries mid-trace
+      // (TT_FATAL mesh_workload.cpp:153 !is_capturing_trace). Run the exact
+      // captured segment once OUTSIDE the scope; the captured pass then hits
+      // the program cache. Safe to run twice: the hold in
+      // EmbedDeviceIdsInto replaces the previous out tensor, and nothing
+      // references the dummy run's output.
+      Tensor dtab = ResidentWeight(d, impl_->weights.embed_tokens,
+                                   {impl_->config.vocab_size,
+                                    impl_->config.hidden_size});
+      vt::tenstorrent::EmbedDeviceIdsInto(
+          s.hidden->ptr(), S, impl_->config.hidden_size, dtab.data,
+          impl_->config.vocab_size, impl_->config.hidden_size,
+          static_cast<int64_t>(s.token_ids.size()));
     } else {
       EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
     }

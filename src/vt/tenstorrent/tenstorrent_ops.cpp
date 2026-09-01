@@ -551,7 +551,8 @@ std::atomic<uint64_t>& StagingAvoidedDeviceCopy() {
 ttnn::Tensor UploadRowsBf16(const Tensor& t, uint32_t rows, uint32_t cols,
                             MeshDevice& device) {
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-    std::fprintf(stderr, "[TT-UP] UploadRowsBf16 from_span WRITE during capture\n");
+    std::fprintf(stderr, "[TT-UP] UploadRowsBf16 from_span WRITE during capture ptr=%p rows=%u cols=%u\n",
+                 (const void*)t.data, rows, cols);
   const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
   // The bytes at t.Ptr are the window's own bf16 bits (bfloat16 is a 2-byte
   // class wrapping the same uint16 pattern).
@@ -588,7 +589,8 @@ ttnn::Tensor UploadRowsBf16(const Tensor& t, uint32_t rows, uint32_t cols,
     // tensor creation. Bytes on the device are the same packed bytes, into a
     // buffer of the same geometry, fully overwritten: bit-identical.
     if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-      std::fprintf(stderr, "[TT-UP] UploadRowsBf16 persistent enqueue_write during capture\n");
+      std::fprintf(stderr, "[TT-UP] UploadRowsBf16 persistent enqueue_write during capture ptr=%p rows=%u cols=%u\n",
+                   (const void*)t.data, rows, cols);
     ttnn::Tensor host = ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
                                                 TileSpecOf(rows, cols),
                                                 /*device=*/nullptr);
@@ -5996,9 +5998,76 @@ bool MemsetDeviceIfCapture(void* p, int value) {
       dev = *s->device;
     }
   }
+  std::optional<ttnn::Tensor> fresh;
   if (!dev.has_value()) {
-    // No shadow yet: DBuf::Zero on a brand-new buffer with no device tensor.
-    return false;  // fall back to host memset; the buffer is host-only for now
+    // HOST-FREE-FORWARD R4 (#1105): a brand-new buffer (registered at Alloc,
+    // no device tensor yet) still takes the device lane. res.Zero at the top
+    // of the captured layer region must leave the slot device-resident, or
+    // the first EnsureDevice2D(*residual) restages from the recycled slot's
+    // persistent buffer — an enqueue_write, which trace capture fatals on
+    // (fd_mesh_command_queue.cpp:760).
+    // bf16-only, the same polarity as the W7 reservation arm: the geometry
+    // is derived from the registered byte size, which is dtype-unambiguous
+    // only for 2-byte elements.
+    // CAPTURE-ONLY: an eager fresh-slot zero keeps the host fallback. The
+    // byte size does not name a dtype (the f32 KV masters share these pool
+    // blocks), so serving one eagerly would install a wrongly-typed shadow;
+    // inside the capture the write is banned and the buffer is scratch whose
+    // every consumer reads on device, which is what makes the guess safe.
+    // The capture-time zero still finds its tensor: the cold step's
+    // EnsureDevice2D restage primed the zero at this exact spec
+    // (ZeroCachePrime) and the copy program is warm from the eager copy
+    // lane — ZeroCacheGet refuses a capture-time miss by design.
+    if (!tt_capture_active()) return false;
+    MeshDevice& device_fresh = SharedMeshDevice();
+    device_fresh.enable_program_cache();
+    uint32_t cols = 0;
+    {
+      std::lock_guard<std::mutex> g(SlotMutex());
+      BufferSlot* s = FindSlot(p);
+      if (s == nullptr) return false;  // untracked buffer: host memset
+      if (s->bytes == 0 || (s->bytes % 2) != 0) return false;
+      cols = static_cast<uint32_t>(s->bytes / 2);
+      if (s->persistent.has_value() && s->persist_rows == 1 &&
+          s->persist_cols == cols) {
+        // Recycled staging: zero the persistent buffer IN PLACE — the device
+        // address stays stable across steps, which is what lets the captured
+        // zero-copy replay against the same buffer.
+        fresh = *s->persistent;
+      }
+    }
+    if (!fresh.has_value()) {
+      fresh = ttnn::empty(ttnn::Shape({1u, cols}), ttnn::DataType::BFLOAT16,
+                          ttnn::Layout::TILE, &device_fresh,
+                          ttnn::MemoryConfig{});
+      std::lock_guard<std::mutex> g(SlotMutex());
+      if (BufferSlot* s = FindSlot(p)) {
+        // W5 semantics: the allocation becomes the slot's persistent buffer,
+        // so the next zero reuses the same device address.
+        s->persistent = fresh;
+        s->persist_rows = 1;
+        s->persist_cols = cols;
+      }
+    }
+    ttnn::Tensor zero_src = ZeroCacheGet(*fresh, device_fresh);
+    if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
+      std::fprintf(stderr, "[TT-TRACE] device zero-fill (fresh slot %p cols=%u)\n",
+                   p, cols);
+    ttnn::Tensor z = ttnn::copy(zero_src, *fresh);
+    (void)z;
+    {
+      std::lock_guard<std::mutex> g(SlotMutex());
+      BufferSlot* s = FindSlot(p);
+      if (s == nullptr) return false;
+      s->device = *fresh;
+      s->dev_rows = 1;
+      s->dev_cols = cols;
+      s->device_current = true;
+      s->host_current = false;
+      s->conv_transposed = false;
+      s->device_reserved = false;  // real zeros installed — reservation spent
+    }
+    return true;
   }
   MeshDevice& device = SharedMeshDevice();
   const ttnn::Tensor& shadow = *dev;

@@ -367,6 +367,15 @@ investigation row but MUST be addressed by the item-5 port:
   `support_static_graph_mode()` declined by default (opt-in
   `VT_TT_DECODE_CAPTURE`); the captured 27.1 tok/s arm stays one hang fix
   away, and that fix owns flipping this default back.
+  (2026-09-01, this branch: boundary SHARPENED — same-prompt sequential
+  generates are clean under capture (`--repeat 2`, 45 replays, rc 0; the
+  A/B/C capture legs ran `--repeat 5` in-process, 474 replays each), while
+  the 16-prompt battery spins in pure userspace after one capture. The
+  trigger is a cross-prompt KV-geometry re-warm under a live trace, and
+  tt-metal spins (state R, stime=0) instead of the R5-era futex sleep.
+  Blocked on this fix: the capture-armed battery dump, the capture-arm
+  near-tie pair for `qwen3_greedy_0_6b`, and the capture-default flip —
+  the throughput verdict (27.57 vs 17.68/12.95, `## Now`) is in.)
 - **TT never advertises async sampled-token readback
   ([#1627](https://github.com/mudler/vllm.cpp/issues/1627)).** The
   async-serving battery FATALs on TT at its anti-vacuous-pass guard
@@ -617,6 +626,69 @@ gate rerun on the merged tip, all under one `flock $HOME/gpu.lock`:
   oracle and host RAC fallback. Remaining attribution — how much of each
   arm's wall clock is the device R1 ops vs the host fallbacks — needs
   per-op timing and is future work, not this wave.
+
+**Wave executed and green (2026-09-01, this branch, P150, all under one
+`flock $HOME/gpu.lock`).** Both capture fatals are fixed and the
+capture-armed arm is the fastest measured arm at tip.
+
+- Fix 1 (embed, `qwen3.cpp` warm branch): the capture step now runs the
+  exact captured embed segment once OUTSIDE the scope before opening it —
+  the `_dummy_run` mirror. `EmbedDeviceIdsInto`'s hold semantics make the
+  second run safe (the hold replaces; nothing reads the dummy output).
+  This clears the first fatal (cold program mid-capture,
+  `mesh_workload.cpp:153`).
+- Fix 2 (fresh-slot zero, `tenstorrent_ops.cpp`
+  `MemsetDeviceIfCapture`): `res.Zero` at the top of the captured layer
+  region left the fresh slot host-only — the no-shadow arm refused,
+  `MemsetDeviceFill` refuses under capture — so layer-0
+  `EnsureDevice2D(*residual)` restaged from the recycled slot's stale
+  persistent `[1,1024]` buffer: an enqueue_write, fatal at
+  `fd_mesh_command_queue.cpp:760`. The no-shadow arm now serves the zero
+  ON-DEVICE, capture-only: in-place into the slot's persistent buffer
+  when the `[1, bytes/2]` geometry matches (stable device address, so the
+  captured zero-copy replays against the same buffer), else a fresh
+  `ttnn::empty` installed as persistent (W5). The zero tensor and the
+  copy program are already warm: the cold step's `EnsureDevice2D` restage
+  primes the zero at the exact spec (`ZeroCachePrime`) and the eager copy
+  lane warms the program. bf16-only, the W7 reservation arm's polarity.
+  CAPTURE-ONLY is load-bearing: the first attempt served eager fresh-slot
+  zeros too, guessed bf16 from a byte size, and the f32 KV masters share
+  those pool blocks — `EnsureHost` then aborted on a `[1,16777216]` bf16
+  shadow against a `[256,32,8,128]` f32 request. An eager fresh-slot
+  zero keeps the host fallback; bytes do not name a dtype.
+- Focused gate (capture-armed 80-token CLI): PASS — rc 0, 0 fatals, 78
+  replays, coherent answer. `CaptureDecodePosAdvance` records inside the
+  trace with no fatal and correct replay tokens (empirical audit; no
+  warm needed).
+- Same-binary A/B/C (Qwen3-0.6B, 3 order-alternated triples,
+  `--repeat 5`, discard run 1, warm medians): default 12.95 / opt-out
+  17.68 / CAPTURED 27.57 tok/s. Captured replay is 2.13x the default and
+  1.56x the opt-out; the R5-era 27.1 reproduces at tip; the wave's
+  "beat ~18.5" bar is cleared. Every capture leg: replays=474, 0 fatals,
+  rc 0, repeat-5 same-prompt multi-generate safe.
+- The verdict replicates at Qwen3-4B (same recipe, 2 triples): default
+  9.25 / opt-out 8.86 / CAPTURED 13.90 tok/s — 1.50x / 1.57x, replays=474
+  and 0 fatals on every leg. Captured replay dominates at both sizes.
+  The default-vs-opt-out inversion narrows with hidden size exactly as
+  the successful-path attribution predicts (0.6B opt-out wins 1.37x;
+  4B default wins 1.04x; Mistral-7B default wins 1.95x) — but with the
+  captured arm measured, the inversion no longer decides the flip: the
+  captured arm beats BOTH eager arms at every measured size.
+- Default arm untouched by the fixes: golden re-run 16/16, 125/125 PASS
+  (the embed dummy also runs in the default arm's inert-scope warm step;
+  no regression, same 0.375-nat pair).
+- [#1625](https://github.com/mudler/vllm.cpp/issues/1625) boundary
+  sharpened: same-prompt `--repeat 2` capture is clean (45 replays, one
+  capture); the 16-prompt battery with capture armed spins in pure
+  userspace after ONE capture (thread state R, stime=0, ~41 CPU-min;
+  ptrace is unavailable on this host) — a cross-prompt KV-geometry
+  re-warm under a live trace, tt-metal spin rather than the R5-era futex
+  sleep. See `## Owed`.
+- BLOCKED on #1625 despite the throughput verdict: the capture-armed
+  golden battery and the capture-arm near-tie pair (the dump is 16
+  different prompts), and therefore the capture-default flip decision.
+  The wave's gate line "capture completes (no TT_FATAL)" is MET; the
+  flip itself waits for #1625.
 
 **Wave scope (spec-first, one PR per the recorded row preference).** The R4
 gate line "capture completes (no TT_FATAL)" is still unmet at tip; meet it.

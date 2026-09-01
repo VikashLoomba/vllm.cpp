@@ -319,12 +319,24 @@ Stop and report, do not work around:
 
 ## Owed
 
-- **The repair is not here.** `conditioning.connector` and `generate.guiders` are
-  measured and unowned by any row that could move them.
-  [#1269](https://github.com/mudler/vllm.cpp/issues/1269) owns the tower's CPU
-  pinning and is the closest existing owner; it does not carry the connector, and
-  it does not carry that all four passes are two duplicated halves. Owner of the
-  gap record: this row, through #2296.
+- ~~**The repair is not here.**~~ **THE CONNECTOR HALF OF IT IS DONE, and it was
+  done by a `vt` row rather than by an LTX-2.5 one.** `VT-CPU-ELEM-DISPATCH`
+  (#2376) hoisted the per-element dtype dispatch out of `AttentionCrossKernel`,
+  and `LTX25-CONNECTOR-REPAIR` (#2434) re-measured this leaf on GB10 with the
+  probe `LTX25-CONNECTOR-GEMM` decomposed it with: one `RunConnector` call is
+  **128.808 s -> 50.34 s, 2.56x**, its attention leg **85.704 -> 8.47 s**, and
+  the GEMM unmoved. At that ratio the 224.882 s of connector compute this row
+  measured becomes about **87.9 s** and the render about **380 s**, which would
+  put the oracle gap near **4.05x** instead of 5.53x. **That last sentence is a
+  PROJECTION and no render has been re-run**, because
+  `scripts/ltx25-render-speed-repeat.sh` pins the binary sha256 of the tree that
+  took the correctness verdict and correctly refuses a rebuild. Advancing that
+  pin to a head that has itself taken a verdict, and re-running this row's
+  reading against it, is the work that turns the projection into a wall. That is
+  now the owed item, and it is unowned.
+  `generate.guiders` is the same connector twice, so it moves with it; the tower
+  half remains [#1269](https://github.com/mudler/vllm.cpp/issues/1269)'s.
+  Owner of the gap record: this row, through #2296.
 - **The oracle's own 93.8 s is undecomposed.** Upstream emits no phase table and
   this row did not instrument it, so which part of the 5.4x is load and which is
   compute is known on our side only. Owner: this row.

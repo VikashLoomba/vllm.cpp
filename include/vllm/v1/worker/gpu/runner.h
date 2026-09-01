@@ -655,6 +655,82 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Null for every text arch: the sampler path below is byte-identical.
   std::unique_ptr<vllm::PoolingRunner> pooling_runner_;
 
+  // ─── ENG-MM-INPUT-PIPELINE P2 (#2379): the multimodal step state ──────────
+  //
+  // `supports_mm_inputs()` mirrors `self.supports_mm_inputs`
+  // (gpu_model_runner.py:530, `grep -c 'self.supports_mm_inputs ='` == 1),
+  // resolved ONCE at construction from the registration's two required hooks.
+  // FALSE for every text architecture, and then every member below stays empty
+  // and every mm branch in execute_model is not entered.
+  //
+  // The PREDICATE the mm branch actually takes is this flag AND some request in
+  // the batch carrying mm_features — one condition wider than upstream's, which
+  // routes an mm model's text-only step through inputs_embeds too. The reason is
+  // that our registered mm forwards are not all embeds-only: Muse Glimmer's has
+  // both branches and Qwen3-VL's has only the mm one, so the runner cannot force
+  // either shape for a step that carries no multimodal request at all. That is a
+  // RUNTIME predicate, which is why §6.5 of the spec retires the "text steps are
+  // byte-identical by construction" claim and proves it by mutation instead.
+  // Derived at READ time from the registration rather than cached in a member,
+  // because this runner has four constructors and a cached flag is four places
+  // to forget. The lookup is one pointer dereference on a ModelFactory.
+  bool supports_mm_inputs() const {
+    return model_ != nullptr && ModelRegistry::SupportsMmInputs(*model_);
+  }
+  // `self.uses_mrope`: whether the registration supplies the OPTIONAL M-RoPE
+  // hook. False is upstream's `uses_mrope == False`, and the model then reads
+  // the ordinary 1-D `ModelForwardInput::positions`.
+  bool uses_mrope() const {
+    return model_ != nullptr && ModelRegistry::UsesMrope(*model_);
+  }
+  // `self.requests: dict[str, CachedRequestState]` — the per-REQUEST state that
+  // lives beside the per-SLOT InputBatch. Kept only when supports_mm_inputs(),
+  // because it holds a copy of every prompt and a text engine has no reader.
+  std::unordered_map<std::string, CachedRequestState> req_states_;
+  // `self.encoder_cache: dict[str, torch.Tensor]`, keyed by MM_HASH and never by
+  // (req_id, input_id) — gpu_model_runner.py:2995
+  // (`grep -c 'self.encoder_cache\[mm_hash\] = output'` == 1). Two requests that
+  // send the same image share one entry, which is the whole point of the hash
+  // key, and an entry leaves only when the SCHEDULER reports it evicted.
+  std::unordered_map<std::string, MmEncoderOutput> encoder_cache_;
+
+  // The row slices this step's placeholder positions take from the encoder
+  // cache, plus the per-token mask that says which positions they are.
+  struct MmGather {
+    // Borrowed views into `encoder_cache_` entries, in the order their `true`
+    // positions appear in `is_mm_embed`. Valid only while this step runs.
+    std::vector<vt::Tensor> mm_embeds;
+    // [total_num_scheduled_tokens]; `char` because std::vector<bool> has no
+    // contiguous buffer to hand a model.
+    std::vector<char> is_mm_embed;
+  };
+
+  // `free_encoder_mm_hashes` -> drop those entries (the worker half of the
+  // scheduler's eviction). No-op on a step whose list is empty, which is every
+  // text step.
+  void free_evicted_encoder_outputs(const SchedulerOutput& scheduler_output);
+  // `_init_mrope_positions` (gpu_model_runner.py:1654, grep -c == 1): the 3-D
+  // prompt positions, computed ONCE per request at admission because they need
+  // the WHOLE prompt. Only for a request that carries mm_features.
+  void init_mrope_positions(const SchedulerOutput& scheduler_output);
+  // `_execute_mm_encoder` (gpu_model_runner.py:2998, grep -c == 1): run the
+  // TOWER over exactly the items the scheduler named this step and store each
+  // output under its mm_hash. This is the first `src/` caller of a vision tower.
+  void execute_mm_encoder(const SchedulerOutput& scheduler_output);
+  // `_gather_mm_embeddings` (gpu_model_runner.py:3220, grep -c == 1).
+  MmGather gather_mm_embeddings(const SchedulerOutput& scheduler_output,
+                                int total_num_scheduled_tokens);
+  // `_calc_mrope_positions` (gpu_model_runner.py:2748, grep -c == 1): [3, T]
+  // row-major. The prompt part is SLICED from the per-request array; the
+  // completion part is SYNTHESISED as `context_len + i + delta` on all three
+  // axes, which is why one int per request carries M-RoPE across every decode
+  // step (gpu_model_runner.py:2786, grep -c == 1).
+  std::vector<int32_t> calc_mrope_positions(
+      const SchedulerOutput& scheduler_output, int total_num_scheduled_tokens);
+  // Whether ANY request in the current batch carries multimodal items. The
+  // second half of the mm predicate; see supports_mm_inputs() above.
+  bool batch_carries_mm() const;
+
   // KV group layout (resolved from the KVCacheConfig).
   int full_attn_group_id_ = -1;
   int gdn_group_id_ = -1;

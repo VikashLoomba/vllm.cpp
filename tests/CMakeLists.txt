@@ -2152,6 +2152,14 @@ if(VLLM_CPP_SERVER)
     endif()
   endif()
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)
+  # ENG-MM-INPUT-PIPELINE P2 (#2379): the SERVED image request, end to end
+  # through the real ApiServer -> AsyncLLM -> Scheduler -> GPUModelRunner ->
+  # ModelRegistry::Forward chain on a CPU queue. Its own target rather than a
+  # case inside test_openai_api_server, because it needs a different model (a
+  # registry LoadedModel carrying a vision tower) and a different tokenizer
+  # fixture (one whose added tokens are the vision markers).
+  vllm_cpp_add_test(test_openai_api_server_mm_forward
+    vllm/entrypoints/openai/test_api_server_mm_forward.cpp)
   # #1982: WHEN the first chat SSE frame reaches the client. Its own target so
   # the gated-runner fixture cannot perturb the keepalive suite's timings, and
   # inside this guard because it drives the production ApiServer dispatch,
@@ -2535,6 +2543,15 @@ target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}
 # domain. Reaches src/ for the tier header and the threadpool test hook.
 vllm_cpp_add_test(test_ops_matmul_elem vt/test_ops_matmul_elem.cpp)
 target_include_directories(test_ops_matmul_elem PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# LTX25-CONNECTOR-REPAIR (#2434): the M-BLOCKING half of the same contract.
+# `MatmulOneChunk` now pads its 16-row activation tile up to a whole number of
+# `mr` blocks, so the rows that used to fall through to the one-row kernel are
+# computed by the M-blocked one instead. That decides WHICH ROWS SHARE ONE
+# ACCUMULATOR SET, and which rows a chunk covers is the threadpool's partition,
+# so the gate runs the whole dtype matrix at ragged M and repeats it at SEVEN
+# worker counts. The file above gates one shape in one dtype at four counts.
+vllm_cpp_add_test(test_ops_matmul_elem_mblock vt/test_ops_matmul_elem_mblock.cpp)
+target_include_directories(test_ops_matmul_elem_mblock PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # LTX25-TEXT-LINEAR-MEM (#1286): the seam's ALLOCATION bound, on both
 # `MatmulOneChunk` instantiations. Every other GEMM gate here asserts values or
 # byte equality, so a kernel that allocated a whole intermediate per worker

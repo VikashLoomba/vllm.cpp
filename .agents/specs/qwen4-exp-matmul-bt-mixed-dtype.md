@@ -209,6 +209,84 @@ focused gate go red.
   owed by `.agents/specs/qwen4-exp-flash-next.md` `## Owed`; this row does not
   move or discharge it.
 
+## Evidence
+
+Two `rc` leases on `thor:gpu0` (`sm_110`, aarch64 Tegra), nvcc **13.0.88**,
+`-DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+-DVLLM_CPP_BUILD_TESTS=ON`. Every rc below was read from the job's own output,
+never derived. Jobs `ef3f2da0-3148-4365-9c2c-b5f08e5f3033` (localization, tree
+`31bd51e9b`) and `ce266e08-d053-44d7-9ea6-b10b1dd9bb9d` (gate, tree
+`aa3ce2f30`).
+
+**Both trees are this branch MERGED with `row/2449-inject-resident`.** The
+mixer's GEMM sits inside the op whose operand #2453 stages, so it is
+unreachable without it, and a measurement on this branch alone would have been
+of an earlier stop. The suite says so itself rather than passing quietly: the
+reach case detects that stop by name and reports `UNMEASURED`.
+
+### Job 1 — the localization, and the A/B on the stop point
+
+| Leg | `test_qwen4_exp_inject_residency` reports the forward stopped with |
+|---|---|
+| A1, arm absent | `vt cuda: matmul_bt: unsupported dtype combo (f32,bf16)->f32` |
+| A3, arm absent, traced | `[MIXED_BT] #0 (f32,bf16)->f32 m=4 k=128 n=8`, backtrace `vt::MatmulBT` <- `Qwen4ExpTextModelForward` <- `ModelRegistry::Forward` |
+| B1, arm present (`PATCH_RC=0`, `BUILD_B_RC=0`) | `qwen4_exp qsa block: … both must be CPU-resident … qwen4_exp_qsa_block.cpp:147` |
+| C1, arm removed again (`MUT_PATCH_RC=0`, `BUILD_C_RC=0`) | back to `matmul_bt: unsupported dtype combo (f32,bf16)->f32` |
+
+The B1 trace shows the three mixed projections (`k=128 n=8`, `k=8 n=128`,
+`k=128 n=2`) twice per layer for layers 0-2, beside the GDN, PLE and MoE GEMMs,
+so the arm is exercised 18 times per step on this fixture rather than once.
+
+### Job 2 — the committed gate, red first, with two mutations
+
+Target `test_qwen4_exp_matmul_bt_dtype`. Applied-ness is proven by a COUNTED
+property, not by a patch exit code, and each leg's binary mtime is printed so a
+build that did not happen cannot read as a result.
+
+| Leg | counted property | build rc | run rc |
+|---|---|---|---|
+| P0, arm removed | `f32_act_bf16_w` occurrences **0** | 0, mtime 03:12:22 | **1 (RED)** |
+| P1, arm restored | occurrences **3** | 0, mtime 03:12:45 | **0 (GREEN)** |
+| M-B, upcast zeroed | `MUTANT` 1, exact-upcast lines **0** | 0, mtime 03:13:10 | **1 (RED)** |
+| Restore | bytes `IDENTICAL` to P1 | 0, mtime 03:13:34 | **0 (GREEN)** |
+
+P0 is both the red baseline and the reachability mutation: removing the arm is
+removing the production call site of this change, and it reds the forward case
+(`CHECK_FALSE(IsMixedComboRefusal(...))`) and the value case
+(`REQUIRE_NOTHROW` throws naming the combo) together, 8 assertions with 2 failed.
+
+**CPU-vs-CUDA parity, and the margin.** The value case's oracle is a host
+`double` dot over the same bytes, not the CPU arm, so it measures correctness
+rather than agreement. Measured at P1:
+
+| m, k, n | max abs diff | relative | bound | margin |
+|---|---|---|---|---|
+| 4, 64, 8 | 4.3994e-07 | 7.50e-08 | 7.63e-06 | 102x |
+| 6, 1024, 16 | 2.63019e-06 | 1.01e-07 | 3.05e-05 | 303x |
+| 6, 16, 1024 | 5.67081e-07 | 1.14e-07 | 3.81e-06 | 33x |
+| 1, 4096, 4 | 3.92919e-06 | 3.66e-07 | 6.10e-05 | 167x |
+
+The bound is `8 * sqrt(K) * eps_f32`, DERIVED from the reduction-order term
+rather than fitted: the measured relative error grows more slowly than `sqrt(K)`
+across those four rows, so the bound does not point the wrong way as K scales.
+Under M-B the relative error is exactly **1.0** on all four, four to six orders
+over. The CPU arm reads 6.21905e-07 against the same oracle at K=32.
+
+### What is NOT proven
+
+* **No token came out on a GPU.** The forward still stops at layer 3
+  (`qwen4_exp_qsa_block.cpp:147`, #2422), so there are no device logits and no
+  logit comparison. The gate asserts the stop MOVED and prints where.
+* **The value case cannot be killed by the reach case and vice versa.** M-B
+  leaves the reach case green, because that case is one-sided by construction.
+  Both are needed and neither is claimed to cover the other.
+* **`check-cuda-fat-gencode.py` did not run.** It needs a built library plus
+  `cuobjdump` over a FAT build, and both jobs built one architecture on purpose.
+  CI's `cuda-fat-build` is the reader for it.
+* **CI cannot gate any of this.** CI has no GPU; the CPU case in this suite is a
+  regression guard that says so in its own output.
+
 ## Stop conditions
 
 * The forward stops at a NEW wall that belongs to another wave's files. Report
@@ -217,5 +295,12 @@ focused gate go red.
 
 ## Now
 
-`ACTIVE` — fix committed and gated on `thor:gpu0`; the forward now stops at the
-QSA rope host-residency check (#2422), which is another wave's file.
+`DONE` pending review — fix committed and gated on `thor:gpu0`, red first, with
+a reachability mutation and a value mutation both killed. The forward now stops
+at the QSA rope host-residency check (#2422), which is another wave's file. This
+change must land AFTER #2453; before it does, the reach case reports UNMEASURED
+on a device rather than passing.
+
+No public document changes: `src/` and `tests/` on their own owe none, and this
+adds no command, C API, config key, feature, model, backend or quantization
+surface.

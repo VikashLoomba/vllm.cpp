@@ -11,18 +11,22 @@ fresh review are accepted. Review of immutable head
 `be70d25bbc67e3ce4d242c44d1bd4b47cdd52328` found no findings and returned
 `PASS`.
 
-Issue #1876 and publication remain open and `PENDING` pull request #2270 or an
-equivalent maintainer-landed evidence commit. Runtime and default validation on
-gfx1200 and gfx1201 remain `PENDING` external hardware. Nothing in this outcome
-claims upstream landing. The owning `BACKEND-ROCM` row remains `ACTIVE`.
+Pull request [#2270](https://github.com/mudler/vllm.cpp/pull/2270) landed as
+`5575f689f`. Its tracked `tools/tg200-prompt.txt` satisfies the publication
+ordering prerequisite. The Q8_K implementation in this branch is not yet
+upstream. Runtime and default validation on gfx1200 and gfx1201 remain
+`PENDING` external hardware. The owning `BACKEND-ROCM` row remains `ACTIVE`.
 
 ## Issue ownership
 
-Issue #1876 owns this `BACKEND-ROCM` performance slice. The issue-index row
-names `BACKEND-ROCM` as the owner and `perf` as the kind.
+Live issue #1876 remains `OPEN` and lacks a canonical `Row:` line. Under the
+current derived policy, the full issue link in this spec's `## Owed` section
+supplies `BACKEND-ROCM` ownership. The retired issue index and its historical
+`perf` classification do not supply current ownership.
 
-The issue stays open until the accepted implementation and its evidence land.
-A negative result also leaves the issue open.
+The proposed pull request lands the accepted gfx1100 slice and addresses #1876
+without closing it. Issue #1876 remains open because gfx1200 and gfx1201
+runtime and default acceptance are still owed.
 
 ## Git integration
 
@@ -32,10 +36,10 @@ the repository default and is recorded in the local developer preferences.
 The specification commit must precede all product and test commits. A fresh
 implementer must start from this committed specification.
 
-Local correctness and performance evidence can proceed against the reviewed
-external prompt source in the real-checkpoint gate. Publication and merge of
-#1876 remain ordered after records-only pull request #2270 or an equivalent
-maintainer-landed evidence commit that tracks the same reviewed prompt artifact.
+The accepted pre-landing evidence used the reviewed external prompt source in
+the real-checkpoint gate. Pull request #2270 later tracked the same reviewed
+prompt artifact as `tools/tg200-prompt.txt`. Commit `5575f689f` satisfies the
+publication ordering prerequisite for issue #1876.
 
 ## Scope
 
@@ -427,21 +431,17 @@ Use this exact model artifact:
 
 Use `tools/tg200-prompt.txt` with SHA-256
 `e2b801cc6a5739cd317c2f77adfb67040667de524ab60ca64aac39f79c846bba`.
-Use these prompt sources in order:
+Pull request #2270 landed as `5575f689f`, so use the tracked
+`tools/tg200-prompt.txt` and verify its SHA-256. The accepted pre-landing
+validation used only
+`/home/vikash/vllm.cpp-rocm-launch-evidence/tools/tg200-prompt.txt`. Its
+worktree had HEAD `88b1b1bc80c7c7024d64b9ab10626a93ff279a95`, tree
+`e2fb82f523d9572a5a3e26437d912c5ea0a5f76c`, an empty
+`git status --porcelain=v1`, the tracked prompt path, and the required SHA-256.
 
-1. After #2270 lands, use the tracked `tools/tg200-prompt.txt` and verify its
-   SHA-256.
-2. Until #2270 lands, local validation can use only
-   `/home/vikash/vllm.cpp-rocm-launch-evidence/tools/tg200-prompt.txt`. Before
-   each validation, assert that the worktree has HEAD
-   `88b1b1bc80c7c7024d64b9ab10626a93ff279a95`, tree
-   `e2fb82f523d9572a5a3e26437d912c5ea0a5f76c`, an empty
-   `git status --porcelain=v1`, the tracked path `tools/tg200-prompt.txt`, and
-   the required SHA-256.
-
-If neither verified source exists, the real-checkpoint gate stays `PENDING`.
-Never substitute prompt text copied from prose. Do not import the prompt into
-this branch. No product file from pull request #1936 is imported.
+If the tracked source is absent or its hash differs, a real-checkpoint rerun
+stays `PENDING`. Never substitute prompt text copied from prose or another
+worktree. No product file from pull request #1936 was imported.
 
 The correctness run uses batch 1, greedy decode, `--max-tokens 256`,
 `--temperature 0`, and `--seed 0`. Both arms must return byte-identical
@@ -557,8 +557,8 @@ Record these items:
 - Full Release gate result.
 - All mutation failures and restoration checks.
 - Model and prompt hashes.
-- The prompt source path, its tracked commit and tree, and its clean-worktree
-  assertion when local validation uses the reviewed #2270 worktree.
+- The pre-landing prompt source path, its tracked commit and tree, and its
+  clean-worktree assertion.
 - Binary and relevant source hashes.
 - Route counters and profiler kernel names.
 - Ten measured A/B legs and their raw completion hashes.
@@ -682,9 +682,10 @@ the quantizer silently.
 The clean pinned llama.cpp `b10451` floor remains secondary and cannot alter
 the Q8_K byte oracle or this default decision. Gfx1200 and gfx1201 runtime and
 default validation remain `PENDING` external hardware, including gfx1201
-validation from @bakon11. Issue #1876, publication, and merge remain ordered
-after pull request #2270 or equivalent maintainer-landed prompt evidence. The
-broader `BACKEND-ROCM` row therefore remains `ACTIVE`.
+validation from @bakon11. Pull request #2270 landed as `5575f689f`, so the
+tracked prompt and publication ordering prerequisite are satisfied. The Q8_K
+implementation in this pull request is not yet upstream. The broader
+`BACKEND-ROCM` row therefore remains `ACTIVE`.
 
 ## Risks
 
@@ -702,12 +703,9 @@ broader `BACKEND-ROCM` row therefore remains `ACTIVE`.
 
 ## Owed
 
-- `gfx1200` runtime validation is `PENDING` external hardware.
-- `gfx1201` runtime validation is `PENDING` external hardware, including
-  validation from @bakon11.
-- The architecture-scoped public control documentation is complete locally;
-  its publication remains ordered after pull request #2270 or equivalent
-  maintainer-landed prompt evidence.
+- [Issue #1876](https://github.com/mudler/vllm.cpp/issues/1876) owns gfx1200 and
+  gfx1201 runtime and default validation. Both remain `PENDING` external
+  hardware, and the gfx1201 scope includes validation from @bakon11.
 - A llama.cpp floor measurement is owed if a clean pinned build cannot run in
   this implementation flow.
 

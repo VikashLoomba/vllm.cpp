@@ -1,0 +1,215 @@
+# GLM-5.3 (`GlmMoeDsaForCausalLM`) on ROCm / `strix:gpu0`
+
+Row: `BACKEND-ROCM` (the landed fix) and `MODEL-TEXT-GLM-MOE-DSA` (the survey).
+Issue: [#2498](https://github.com/mudler/vllm.cpp/issues/2498).
+Base SHA: `11fed3ba56b8f823c07032416982a44a8c0967b5`.
+
+## Scope
+
+Establish whether GLM-5.3 non-flash can run on `strix:gpu0`, map the ROCm arms
+arm by arm against what the model actually calls, and land the smallest complete
+and gated slice that the map identifies. It does **not** port the MLA/DSA
+attention arm; §W1.5 records why that is a campaign and not a wave.
+
+## W1. The box, and every number attributed to it
+
+Measured on `strix:gpu0`, rc jobs `0fca4182` and `8293713b`, 2026-09-01.
+Numbers from `gfx1100`, `gfx1200` or `gfx1201` in other ROCm specs do not
+transfer to this board and are not reused here.
+
+| Fact | Value |
+|---|---|
+| Marketing name | AMD RYZEN AI MAX+ 395 w/ Radeon 8060S |
+| `gfx` target | `gfx1151` (also advertises `gfx11-generic`) |
+| ROCm / HIP | 7.2.4 / 7.2.53211-97f5574fe2 |
+| Compiler | AMD clang 22.0.0git, `roc-7.2.4` |
+| CUs | 40 (`rocminfo`); `hipDeviceProp.multiProcessorCount` reports 20 WGPs |
+| `warpSize` | 32 |
+| `integrated` / `managedMemory` / `concurrentManagedAccess` | 1 / 1 / 1 |
+| `pageableMemoryAccess` | 0 |
+| System RAM | 62 GiB total, 58 GiB available |
+| `hipMemGetInfo` total | 64.000 GiB |
+
+`amdgpu-arch` and `rocm_agent_enumerator` both answer `gfx1151`; `rocm-smi` is
+not installed in the leased container.
+
+### Memory ceiling
+
+Walked in 1 GiB steps, every block retained and both end pages touched with a
+`hipDeviceSynchronize` after each:
+
+| Allocator | Ceiling | Samples |
+|---|---|---|
+| `hipMallocManaged` | **58.000 GiB** (62,277,025,792 B) | 3 of 3 identical |
+| `hipMalloc` | 63.000 GiB (67,645,734,912 B) | 1 |
+
+`hipMallocManaged` is the operative one: on this board the registrar sets
+`managed_alloc`, so **every** `Backend::Alloc` is a managed allocation
+(`src/vt/rocm/rocm_backend.hip:163-181`). This independently reproduces the
+prior wave's 58.000 GiB figure on the same board.
+
+## W1.1 The residency arithmetic, re-derived
+
+Parsed from the six staged shards' own GGUF headers, not inherited
+(`/workspace/glm53-rocm/census.py`, rc job `0fca4182`). Byte counts are computed
+from each tensor's ggml type block size, so they are the on-disk footprint.
+
+| Class | Tensors | Bytes | GiB |
+|---|---|---|---|
+| Expert (`*_exps.weight`) | 228 | 201,125,265,408 | **187.3125** |
+| Resident (everything else) | 1581 | 15,580,554,240 | **14.5105** |
+| Total | 1809 | 216,705,819,648 | 201.8230 |
+
+**The premise holds.** 14.5105 GiB of resident class against a 58.000 GiB managed
+ceiling is **25.0%**, leaving 43.49 GiB of headroom. For contrast the Flash
+sibling's 101.2535 GiB is 1.75x over the same ceiling with no streaming path,
+which is why that row stopped and this one does not.
+
+The experts are 92.8% of the bytes and stream through the slot lane, which is
+device-agnostic and host-backed: `ExpertStreamLane` always constructs a
+`HostExpertSlotStore` (`src/vllm/model_executor/expert_stream_seam.cpp:343`) and
+`ExpertStreamer::Fetch` writes through `SlotForWrite`/`CommitSlot` with no device
+predicate (`src/vllm/model_executor/expert_streamer.cpp:60-108`).
+
+## W1.2 Which encodings the resident class needs
+
+This is the finding that removes the presumed keep-quant blocker.
+
+| Class | Encodings present |
+|---|---|
+| **Resident** | Q5_K (312, 7.1543 GiB), Q8_0 (476, 4.8517 GiB), Q6_K (82, 0.9998 GiB), Q4_K (2, 0.9970 GiB), F32 (709, 0.5078 GiB) |
+| **Expert only** | IQ3_XXS (71, 81.5391 GiB), IQ1_S (106, 62.1094 GiB), IQ2_XXS (44, 34.0312 GiB), IQ4_XS (4, 6.3750 GiB), Q2_K (2, 1.9688 GiB), Q3_K (1, 1.2891 GiB) |
+
+ROCm keep-quant serves exactly {Q8_0, Q4_K, Q5_K, Q6_K}
+(`.agents/specs/rocm-gg-keep-quant.md`, `src/vt/rocm/rocm_grouped_gemm.hip`).
+That set **covers the resident class exactly**; F32 needs no keep-quant path.
+Every i-quant in this checkpoint is expert-side, and the experts reach the GEMM
+through the streaming lane rather than the resident path.
+
+So `.agents/specs/rocm-gg-keep-quant.md`'s owed formats and #1940's "ROCm ports
+zero I-quant formats" are **not blockers for this model's resident arm**. They
+remain owed for the expert arm.
+
+## W1.3 Arm-by-arm map
+
+Ops the model actually calls, resolved from
+`src/vllm/model_executor/models/glm_moe_dsa_forward.cpp` and
+`src/vllm/model_executor/layers/attention/mla_attention.cpp`, against
+`RegisterOp(OpId::...)` sites under `src/vt/rocm/`:
+
+| Op | ROCm | CUDA | CPU | Used by |
+|---|---|---|---|---|
+| `kEmbedding` | YES | yes | yes | forward |
+| `kMatmulBT` | YES | yes | yes | forward, MLA |
+| `kMoeRouterTopK` | YES | yes | yes | forward |
+| `kMoeSiluMul` | YES | yes | yes | forward |
+| `kMoeCombine` | YES | yes | yes | forward |
+| `kCastF32` | YES | yes | yes | forward, MLA |
+| `kRmsNorm` | YES | yes | yes | forward, MLA |
+| `kLayerNorm` | YES | yes | yes | MLA |
+| `kMulScalar` | YES | yes | yes | MLA |
+| `kRopeFromCache` | YES | - | yes | MLA |
+| `kSharedExpertGate` | YES | - | yes | MLA |
+| `kFusedChain` | MISSING | yes | yes | forward |
+| `kBatchedMatmul` | **MISSING** | yes | yes | MLA |
+| `kConcatAndCacheMla` | **MISSING** | - | - | MLA |
+| `kConcatMlaNopeRope` | **MISSING** | yes | - | MLA |
+| `kDsaIndexerLogits` | **MISSING** | yes | yes | MLA |
+| `kDsaTopkSelect` | **MISSING** | yes | yes | MLA |
+| `kFusedNormRope` | **MISSING** | - | - | MLA |
+| `kGatherMlaCache` | **MISSING** | yes | yes | MLA |
+| `kMlaDecodeAttention` | **MISSING** | - | - | MLA |
+
+ROCm registers 50 distinct `OpId` values; CUDA registers 118.
+
+### Two briefing premises this map corrects
+
+1. **`kMoeGateUpSwiGLUGrouped` is not on this model's path at all.** Its only
+   model call site is the Flash sibling, `glm5_next_forward.cpp:308`. The
+   non-flash forward runs experts one at a time as `vt::MatmulBT` over
+   `GlmExpertSlice` with `vt::MoeSiluMul` and `vt::MoeCombine`
+   (`glm_moe_dsa_forward.cpp:293-298, 422-424`). Porting that provider would
+   have been dead code for this model.
+2. **The MoE arm is already complete for this model.** Every op the routed and
+   shared expert path calls is registered on ROCm today.
+
+The single genuinely missing arm is **MLA/DSA**: eight ops, including the
+attention kernel itself and the sparse indexer's logits and top-k select.
+
+## W1.4 The reference tier, and the defect it exposes
+
+`gfx1151` reports `managedMemory=1` and `integrated=1`, so the registrar sets
+`unified_memory_`, `DeviceMemoryIsHostAddressable()` returns true
+(`src/vt/rocm/rocm_backend.hip:371`), and the portable CPU reference tier is
+eligible. `docs/ROCM.md:53-58` documents that tier as the intended bring-up path
+for Strix Halo. So the eight missing MLA ops do not refuse; they install CPU host
+kernels and run.
+
+**The briefing's O42 claim that this happens silently is stale.** The tier is
+announced: `GetOp` warns once per `(op, device)` on stderr as
+`[vt reference-tier] op=... device=... has NO native kernel`
+(`src/vt/op_provider.cpp:605-616`), counts every hit in `GetReferenceTierHits()`
+(`include/vt/op_provider.h:269`), and `OpRegistered` deliberately excludes the
+tier so it stays a native-only probe (`src/vt/op_provider.cpp:788-806`).
+`docs/ROCM.md:60-61` already forbids a performance result with a non-zero hit
+count. Device-vs-host is therefore assertable today with no new mechanism, and
+#2433 shows the lines being read off this exact board.
+
+**What is not sound is the tier's memory ordering on ROCm.** `FlushPending()`
+exists so a host reference kernel does not read device memory an unfinished
+submission has not written (`include/vt/backend.h:53-59`). `GetOp` calls it at
+`src/vt/op_provider.cpp:708-711` and the decline path at `762-765`. Metal
+overrides it (`src/vt/metal/metal_backend.mm:101`) and Vulkan overrides it
+(`src/vt/vulkan/vulkan_backend.cpp:118`). **`RocmBackend` does not**, so it takes
+the default no-op — while `CreateQueue` builds a genuine asynchronous stream with
+`hipStreamCreate` (`src/vt/rocm/rocm_backend.hip:214-217`).
+
+The default's contract says it "suits every backend that submits eagerly". HIP
+submits eagerly and **completes** asynchronously, so the contract does not hold.
+ROCm is the only host-addressable backend in the tree that inherits the no-op.
+
+## W1.5 Why the MLA/DSA arm is a campaign — NEEDS_DECISION
+
+Eight ops, two of which (`kMlaDecodeAttention`, `kConcatAndCacheMla`) have no
+CUDA registration to mirror either and two more (`kDsaIndexerLogits`,
+`kDsaTopkSelect`) are the sparse-attention indexer. That is not one wave's work,
+and a partial arm is worse than none: with the tier eligible, a half-ported arm
+still runs, still emits tokens, and hides which half executed on the device.
+This wave does not open it. It is recorded as owed below.
+
+## W2. The slice this wave lands
+
+`RocmBackend::FlushPending()`, issue #2498.
+
+It is the smallest change that is complete on its own, and it is on this model's
+path eight times over. It is a precondition for every one of the eight MLA ops
+being *correct* on this board, and it stays load-bearing after any of them is
+ported natively, because the remainder still run on the tier.
+
+- **Red first.** A HIP device kernel that spins long enough to still be running
+  when the host regains control writes a managed buffer; the host reads it after
+  `FlushPending()`. With the default no-op the host observes the pre-kernel
+  value. The test asserts the post-kernel value.
+- **Mutation.** Delete the override; the focused case must fail. Restore and
+  re-run.
+- **Inertness.** A run reaching zero reference-tier ops calls `FlushPending()`
+  never — the call site is guarded by `slot.ref_selected`
+  (`src/vt/op_provider.cpp:707`) — so the CUDA, CPU and discrete-ROCm paths are
+  untouched by construction.
+
+## Owed
+
+Unreached or unported after this wave, none of it claimed here:
+
+- The ROCm MLA/DSA attention arm: `kBatchedMatmul`, `kConcatAndCacheMla`,
+  `kConcatMlaNopeRope`, `kDsaIndexerLogits`, `kDsaTopkSelect`, `kFusedNormRope`,
+  `kGatherMlaCache`, `kMlaDecodeAttention`. Owner `BACKEND-ROCM`; needs its own
+  issue and spec before any of it is written.
+- `kFusedChain` on ROCm. The forward falls back to a standalone `vt::RmsNorm`
+  when the recipe is unavailable (`glm_moe_dsa_forward.cpp:85-89`), so this is a
+  performance gap, not a correctness one.
+- ROCm i-quant keep-quant for the expert class (IQ1_S, IQ3_XXS, IQ2_XXS, IQ4_XS,
+  Q2_K, Q3_K). Existing gap, #1940.
+- No speed number is claimed or owed for this board by this wave. Any run of this
+  model on ROCm reaches eight reference-tier ops, which `docs/ROCM.md:60-61`
+  disqualifies as a performance result.

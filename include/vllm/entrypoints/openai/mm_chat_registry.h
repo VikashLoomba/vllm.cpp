@@ -75,8 +75,13 @@ namespace vllm::entrypoints::openai {
 // need, because upstream renders the chat template and decodes images
 // elsewhere.
 struct MultiModalChatContext {
-  // The architecture the model registry resolved, and the registry key.
-  std::string_view architecture;
+  // The architecture the model registry resolved, and the registry key. OWNED,
+  // like every other string here: the two current callers pass static-lifetime
+  // data (`LoadedEngine::architecture()` points into the registration, a test
+  // passes a literal), but a `string_view` field on a struct a caller fills in
+  // field by field dangles the moment somebody assigns a temporary to it, and
+  // the copy costs one allocation once per server start.
+  std::string architecture;
   // The checkpoint directory. A factory reads its own processor config out of
   // it BY NAME; the directory is never the thing that decides whether the seam
   // is installed at all.
@@ -162,7 +167,12 @@ class MultiModalChatRegistry {
 
   // Mirrors `create_processor` (registry.py:211-230): resolve by architecture,
   // refuse by name, then build. Throws `std::runtime_error` when nothing is
-  // registered for `ctx.architecture`; propagates whatever the factory throws.
+  // registered for `ctx.architecture`; propagates whatever the factory throws;
+  // and throws when a registered factory RETURNS a seam whose `chat_fn` is
+  // empty. That last arm is the symmetric half of the null-`make_seam` check:
+  // an empty `std::function` installs as nothing, so the model would answer
+  // image requests from the text path under a "seam wired" success log. Every
+  // seam this returns therefore has a callable `chat_fn`.
   static MultiModalChatSeam MakeSeam(const MultiModalChatContext& ctx);
 };
 
@@ -180,13 +190,16 @@ MultiModalChatFn MakeRefusingMultiModalChatFn(std::string architecture,
 enum class MultiModalChatInstall {
   // The architecture declares no multimodal support. NOTHING is installed and
   // the chat path stays byte-identical to the text-only server
-  // (registry.py:109-110).
+  // (registry.py:110-111).
   kTextOnlyModel,
   // The architecture's registered factory built a seam and it is installed.
   kInstalled,
-  // The architecture declares multimodal support but either has no registered
-  // factory or its factory threw. A REFUSING seam is installed: an mm request
-  // gets HTTP 400 naming the architecture, and never a silent text answer.
+  // The architecture declares multimodal support but has no registered factory,
+  // or its factory threw, or its factory returned a seam with no callable
+  // `chat_fn`. A REFUSING seam is installed: an mm request gets HTTP 400 naming
+  // the architecture, and never a silent text answer. The third arm matters as
+  // much as the first two: an empty `chat_fn` installs as NOTHING, so without it
+  // a success log would sit over the text path answering image requests.
   kRefusing,
 };
 
@@ -196,7 +209,7 @@ enum class MultiModalChatInstall {
 // `is_multimodal_model` is the architecture's own declaration —
 // `ModelInfo::supports_multimodal`, reachable as
 // `LoadedEngine::is_multimodal_model()` — and mirrors
-// `model_config.is_multimodal_model` (registry.py:109). It is NOT the presence
+// `model_config.is_multimodal_model` (registry.py:110). It is NOT the presence
 // of a file.
 //
 // Every outcome is announced on `log`. The previous code caught the factory's

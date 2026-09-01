@@ -101,7 +101,33 @@ MultiModalChatSeam MultiModalChatRegistry::MakeSeam(
   if (reg == nullptr || reg->make_seam == nullptr) {
     RaiseForUnregistered(ctx.architecture);
   }
-  return reg->make_seam(ctx);
+  MultiModalChatSeam seam = reg->make_seam(ctx);
+  // The SYMMETRIC half of the null-factory check above, and the easy one to
+  // miss because it fails LATER and QUIETLY. A factory that returns a
+  // default-constructed `MultiModalChatSeam` hands back an EMPTY
+  // `std::function`. Installing that calls
+  // `set_multimodal_chat_fn(<empty std::function>)`, `serving_chat.cpp:699`'s
+  // `if (mm_chat_fn_)` is then false, and the image request is answered from
+  // the TEXT path — while the install reports `kInstalled` and logs "seam wired
+  // for architecture 'X'". That is #2475's silent arm restored under a SUCCESS
+  // log, which is worse than the swallowed catch it replaced, because the
+  // startup output now says it worked.
+  //
+  // Raising here rather than in `InstallMultiModalChatSeam` puts the guard
+  // beside the null-pointer check it mirrors, gives it to every caller of
+  // `MakeSeam` and not only to the install, and routes the failure into the
+  // same `catch` a throwing factory already takes. The outcome is therefore
+  // `kRefusing`, the existing third outcome, and not a fourth one.
+  if (!seam.chat_fn) {
+    throw std::runtime_error(
+        "architecture '" + std::string(ctx.architecture) +
+        "' has a registered multimodal chat factory, but that factory produced "
+        "no callable chat function. A seam whose chat_fn is empty installs as "
+        "nothing and answers image requests from the TEXT path. Return a "
+        "chat_fn, or throw from the factory naming what is missing. "
+        "ENG-MM-INPUT-PIPELINE (#2475)");
+  }
+  return seam;
 }
 
 MultiModalChatFn MakeRefusingMultiModalChatFn(std::string architecture,
@@ -134,7 +160,7 @@ MultiModalChatFn MakeRefusingMultiModalChatFn(std::string architecture,
 MultiModalChatInstall InstallMultiModalChatSeam(
     OpenAIServingChat& chat, bool is_multimodal_model,
     const MultiModalChatContext& ctx, std::ostream& log) {
-  // registry.py:109-110: a model that is not multimodal has no processor and
+  // registry.py:110-111: a model that is not multimodal has no processor and
   // needs none. Nothing is installed, `mm_chat_fn_` stays null, and every chat
   // request takes the byte-identical text path. No diagnostic, because this is
   // the ordinary text-only server and not a failure.
@@ -144,9 +170,11 @@ MultiModalChatInstall InstallMultiModalChatSeam(
   try {
     seam = MultiModalChatRegistry::MakeSeam(ctx);
   } catch (const std::exception& e) {
-    // Both failure modes land here: nothing registered for this architecture
-    // (RaiseForUnregistered) and a registered factory that could not build —
-    // a GGUF checkpoint with no `preprocessor_config.json` beside it, say.
+    // All three failure modes land here: nothing registered for this
+    // architecture (RaiseForUnregistered); a registered factory that could not
+    // build — a GGUF checkpoint with no `preprocessor_config.json` beside it,
+    // say; and a registered factory that RETURNED a seam with no callable
+    // `chat_fn`, which MakeSeam raises on so that it cannot install as silence.
     //
     // The previous code printed one line and left the seam UNSET, so an image
     // request was answered as text. It now installs a seam that REFUSES, which
@@ -158,7 +186,7 @@ MultiModalChatInstall InstallMultiModalChatSeam(
         << "); multimodal requests are REFUSED with HTTP 400 and the text path "
            "is unaffected\n";
     chat.set_multimodal_chat_fn(
-        MakeRefusingMultiModalChatFn(std::string(ctx.architecture), e.what()));
+        MakeRefusingMultiModalChatFn(ctx.architecture, e.what()));
     return MultiModalChatInstall::kRefusing;
   }
 

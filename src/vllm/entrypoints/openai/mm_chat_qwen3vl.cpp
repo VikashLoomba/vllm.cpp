@@ -10,8 +10,10 @@
 // Nothing about Qwen3-VL's behaviour changes here. The processor config is read
 // from the same two files with the same loader, the seam body is the same
 // `MakeQwen3VLImageChatFn`, and the per-modality ceiling is the same
-// `Qwen3VLChatSupportedMmLimits()` — which moves into this file because it is
-// this architecture's own ceiling, exactly as upstream reads
+// `Qwen3VLChatSupportedMmLimits()`. That function does NOT move: it stays
+// declared in `chat_mm.h` and defined in `chat_mm.cpp`. What moves here is the
+// CALL, which `main` used to make. Reading this architecture's own ceiling from
+// this architecture's own factory is what upstream does when it takes
 // `info.supported_mm_limits` off the model class (context.py:378-390).
 #include <filesystem>
 #include <memory>

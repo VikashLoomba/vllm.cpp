@@ -125,7 +125,7 @@ enum class MultiModalChatInstall { kTextOnlyModel, kInstalled, kRefusing };
 - **`kTextOnlyModel`** — the architecture's `ModelInfo::supports_multimodal` is
   false. Nothing is installed, `mm_chat_fn_` stays null, and the chat path is
   byte-identical to the text-only server. This mirrors
-  `supports_multimodal_inputs`' first line (`registry.py:109-110`) and it is
+  `supports_multimodal_inputs`' first line (`registry.py:110-111`) and it is
   already strictly better than today's gate, which tries and fails on any
   text-only checkpoint that happens to ship a `preprocessor_config.json`.
 - **`kInstalled`** — the architecture declares multimodal support and its
@@ -181,9 +181,10 @@ and the Qwen3-VL factory captures the processor and the `BaseProcessingInfo` as
 `shared_ptr` inside `chat_fn`. Two locals and their ordering comment leave
 `main`, and a future architecture cannot get its own lifetime wrong by
 forgetting to add a third. The `BaseProcessingInfo` still holds the engine's
-`MultiModalConfig` by reference, exactly as it does today; `chat` is declared at
-`server_main.cpp:1441` and `loaded` at `:1342`, so the closure is destroyed
-first, and `~BaseProcessingInfo` never reads the reference in any case.
+`MultiModalConfig` by reference, exactly as it does today; `chat` is declared
+AFTER `loaded` in `server_main.cpp` and destruction runs in reverse of
+declaration order, so the closure is destroyed first, and `~BaseProcessingInfo`
+never reads the reference in any case.
 
 `Qwen3VLChatSupportedMmLimits()` — this seam's own per-modality ceiling — is
 now read by the Qwen3-VL factory instead of by `main`, which is where upstream
@@ -228,12 +229,85 @@ that already reads the registration (`model_loader.h:561-568`):
   instead of a text answer. That is the intended change and it is the whole
   point; it is not a new refusal for `--language-model-only`, which already
   answers "At most 0 image(s)".
-- **The one line no unit test reaches.** `server_main.cpp`'s single call to
-  `InstallMultiModalChatSeam` is inside `main`, which no test binary enters with
-  a real checkpoint. Deleting *that* call still leaves the suite green. What the
-  change buys is that it is now one obviously named call rather than fifty lines
-  of duplicated install logic, and that the entire body behind it is mutated.
-  This residual is named here rather than hidden.
+- **The production call site is ungated, and it is wider than one line.** An
+  earlier draft of this bullet said the residual was "the one line no unit test
+  reaches", and that understated it in two ways.
+
+  First, #2408 item 5's literal sentence — deleting the production line leaves
+  the P2 suite green — is **still true** after this change. Two mutations on
+  `server_main.cpp` prove it, each applied to the head, each with the test
+  binary's sha256 showing the mutation reached the binary:
+
+  | mutation | `test_openai_api_server_mm_forward` sha256 | full suite |
+  |---|---|---|
+  | none (the head) | `8df0aedf…d581f32` | GREEN 9/9 cases, 73/73 assertions |
+  | `mm_ctx.architecture = "";` | `0b45f1f5…727c0bd8` | GREEN 9/9 cases, 73/73 assertions |
+  | `InstallMultiModalChatSeam(chat, /*is_multimodal_model=*/false, …)` | `5570ca07…663dba1f` | GREEN 9/9 cases, 73/73 assertions |
+
+  `server_main.cpp` is compiled into the `vllm` library
+  (`CMakeLists.txt:2528`), so the test binary links it and the changed sha256 is
+  what proves each mutation reached the binary rather than being skipped.
+
+  The second reintroduces exactly the defect #2475 names: a multimodal model
+  answers image requests from the text path. So what no test reaches is not one
+  line. It is the whole eight-field `MultiModalChatContext` assembly in `main`
+  together with both new `LoadedEngine` accessors, `architecture()` and
+  `is_multimodal_model()` — every input the install reads.
+
+  Second, the earlier claim that "no test binary enters `main`" is false as
+  stated; `examples/CMakeLists.txt:283-320` is an in-tree counter-example, a set
+  of `ctest` cases that drive `$<TARGET_FILE:server>` and assert on its output.
+  The accurate statement is narrower: this install runs **after**
+  `LoadedEngine::FromModelDir`, so a `--model /nonexistent-model-dir`
+  invocation — the whole trick that precedent turns on, and which its own
+  comment says is what makes a direct-call unit test prove "NOTHING about
+  reach" — exits at the model load and never reaches the install.
+
+  What is closed, and verified: the **harness-duplication** half of item 5.
+  `test_api_server_mm_forward.cpp` no longer calls `MakeQwen3VLImageChatFn`
+  itself, so M1 — deleting `chat.set_multimodal_chat_fn(seam.chat_fn)` inside
+  `InstallMultiModalChatSeam` — now goes red where before this change it did
+  not. The **production-call-site** half is not closed.
+
+  What closing it would need. A checkpoint the real loader accepts, whose
+  architecture **declares multimodal support**. The declaration is not optional:
+  on a text-only checkpoint the mutated call
+  `InstallMultiModalChatSeam(chat, false, ...)` and the real one are
+  observationally identical — both return `kTextOnlyModel` and print nothing —
+  so neither mutation above is detectable. The only committed checkpoint
+  carrying weights is `tests/vllm/models/fixtures/llama_embed_e2e`
+  (`LlamaModel`, 154 KB, text-only). Every architecture whose
+  `ModelInfo::supports_multimodal` is true is large — Qwen3-VL, Qwen3.5,
+  Gemma4, GLM5-Next, Qwen4-Exp, Kimi-K3, MuseGlimmer — and every multimodal
+  fixture in-tree is config-only with no weights, for the reason
+  `test_api_server_mm_forward.cpp`'s own header records: `LoadQwen3VLWeights`
+  hard-codes the 4B tower geometry (hidden 1024, depth 24, ~300M parameters)
+  and a test cannot synthesise a checkpoint for it.
+
+  This was measured against the built binary rather than argued, and the
+  measurement is what makes it a residual rather than a guess:
+
+  ```
+  $ ./build/examples/vllm-server --model tests/vllm/models/fixtures/qwen4_exp --port 1
+  server: fatal: tokenizer: cannot open .../qwen4_exp/tokenizer.json
+
+  $ ./build/examples/vllm-server --model tests/vllm/models/fixtures/glm5_next --port 1
+  server: fatal: tokenizer: cannot open .../glm5_next/tokenizer.json
+
+  $ ./build/examples/vllm-server --model tests/vllm/models/fixtures/llama_embed_e2e --port 1
+  server: failed to bind 0.0.0.0:1
+  ```
+
+  The third line is the point. The one checkpoint that loads DOES carry the
+  server past the install and out through a controlled exit, so neither the
+  reach nor the exit path is the obstacle; the install on that model returns
+  `kTextOnlyModel` and prints NOTHING, so there is nothing for a
+  `PASS_REGULAR_EXPRESSION` to hold and both residual mutations stay invisible.
+  The two multimodal fixtures do not even reach the model load. What is missing
+  is exactly one thing: a multimodal-declaring checkpoint with a `tokenizer.json`
+  and weights the production loader accepts. Committing one is a fixture with
+  its own generator and its own review, not a test, so it stays owed here and
+  #2408 item 5's production half stays open.
 
 ## Tests
 
@@ -265,20 +339,36 @@ Cases:
    refusal is scoped to multimodal parts.
 7. **new** — *a text-only architecture installs nothing*: the install reports
    `kTextOnlyModel` and an image request is not touched by any seam.
+8. **new (fresh-review F2)** — *a registered factory that returns an EMPTY seam
+   refuses rather than reporting success*. The null `make_seam` POINTER was
+   checked and the empty `chat_fn` it can RETURN was not, and the second hole is
+   the quiet one: `set_multimodal_chat_fn(<empty std::function>)` leaves
+   `serving_chat.cpp:699`'s `if (mm_chat_fn_)` false, so the image request takes
+   the text path while the install reports `kInstalled` and logs "seam wired for
+   architecture 'X'". The case registers a factory through the production macro
+   from the test translation unit, asserts the install does NOT report success,
+   and asserts the image request does NOT reach the text path — the second by
+   the absence of the fixture forward's own "requires multimodal inputs
+   (ModelForwardInput.mm)" refusal, which is what the dropped image produces.
 
 ## Gates
 
 ```sh
 cmake -S . -B build -G Ninja -DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON \
   -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j 2 --target test_api_server_mm_forward test_chat_mm \
-  test_openai_serving test_serve_mm_limits test_api_server test_tower_skip
-./build/tests/test_api_server_mm_forward
+# The target names are `test_openai_api_server*`, not `test_api_server*`; an
+# earlier draft of this block wrote the short spelling, which cmake answers with
+# "unknown target" and a reader reads as a compile failure.
+cmake --build build -j 2 --target test_openai_api_server_mm_forward \
+  test_chat_mm test_openai_serving test_serve_mm_limits \
+  test_openai_api_server test_tower_skip test_capi
+./build/tests/test_openai_api_server_mm_forward
 ./build/tests/test_chat_mm
 ./build/tests/test_openai_serving
 ./build/tests/test_serve_mm_limits
-./build/tests/test_api_server
+./build/tests/test_openai_api_server
 ./build/tests/test_tower_skip
+./build/tests/test_capi
 scripts/agent-preflight.sh --staged
 ```
 
@@ -293,6 +383,13 @@ pass:
   `MultiModalChatRegistry::Find` ignore its key and return the first
   registration. Case 5 must go red, because the unregistered architecture then
   gets Qwen3-VL's seam and answers 200 instead of refusing.
+- **M4, the empty-seam guard removed** (fresh-review F2). Delete the
+  `if (!seam.chat_fn)` raise from `MultiModalChatRegistry::MakeSeam`. Case 8
+  must go red, on both of its halves: the install reports `kInstalled` and the
+  image request comes back carrying the forward's text-path refusal. M3 and M3b
+  are the two residual mutations recorded under `## Risks`; they are green by
+  construction and are named there rather than listed here, because a mutation
+  nothing detects is a gap and not a gate.
 
 ## Evidence
 

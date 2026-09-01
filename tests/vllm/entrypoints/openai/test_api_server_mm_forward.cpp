@@ -475,6 +475,11 @@ constexpr const char* kQwen3VLArch = "Qwen3VLForConditionalGeneration";
 // multimodal model to reach this seam before its own factory exists; the cases
 // below assert its premise rather than assume it.
 constexpr const char* kUnregisteredMmArch = "UnregisteredMmForConditionalGeneration";
+// An architecture whose factory IS registered and returns an EMPTY seam. It
+// stands in for the mistake a second architecture's author makes once: build
+// the processor, fill in `detail` and `allowed_limits`, and forget `chat_fn`.
+// See the registration below `}  // namespace`.
+constexpr const char* kEmptySeamMmArch = "EmptySeamMmForConditionalGeneration";
 
 std::string EncodeBase64(const std::vector<uint8_t>& raw) {
   static const char* kAlpha =
@@ -619,9 +624,11 @@ struct MmServerHarness {
   // context and calls the same function; what it adds on top is reading the
   // architecture and the multimodal declaration off `LoadedEngine` and pointing
   // `model_dir` at the real checkpoint. Anything this method proves about the
-  // dispatch, the server gets for free; the ONE line it cannot reach is
-  // `server_main.cpp`'s own call, which lives inside `main` (see the mutation
-  // note in `.agents/specs/mm-chat-seam-registry.md`).
+  // dispatch, the server gets for free. What it does NOT reach is that addition
+  // in `main`: the eight-field context assembly plus `LoadedEngine::
+  // architecture()` and `is_multimodal_model()`. Both remain mutable to green,
+  // and `## Risks` in `.agents/specs/mm-chat-seam-registry.md` records the two
+  // mutations that prove it and why a server-binary test cannot close it here.
   //
   // `log` is captured rather than sent to stderr so a case can assert on WHAT
   // the install announced, which is the only externally visible difference
@@ -658,6 +665,34 @@ struct MmServerHarness {
 };
 
 }  // namespace
+
+// ─── A REGISTERED FACTORY THAT PRODUCES NOTHING ─────────────────────────────
+// The null `make_seam` POINTER is checked; the empty `chat_fn` it can RETURN is
+// the same hole one step later, and it fails silently rather than loudly.
+// `chat.set_multimodal_chat_fn(<empty std::function>)` leaves
+// `serving_chat.cpp:699`'s `if (mm_chat_fn_)` false, so the image request is
+// answered from the TEXT path while the install reports success and logs "seam
+// wired for architecture 'X'". #2475's defect, restored under a success log.
+//
+// Registered through the production macro from this translation unit, exactly
+// as an architecture registers its real one, so the case below enters
+// `InstallMultiModalChatSeam` through the same dispatch the server uses rather
+// than by handing it a hand-built seam.
+namespace vllm::entrypoints::openai {
+namespace {
+MultiModalChatSeam MakeEmptyMultiModalChatSeam(const MultiModalChatContext&) {
+  MultiModalChatSeam seam;
+  // Everything EXCEPT the one field that matters, which is what makes this the
+  // realistic mistake rather than a contrived one: the install has plenty to
+  // print and still nothing to call.
+  seam.allowed_limits["image"] = 1;
+  seam.detail = "a factory that filled in everything but chat_fn";
+  return seam;
+}
+}  // namespace
+REGISTER_VLLM_MM_CHAT(empty_seam_fixture, kEmptySeamMmArch,
+                      &MakeEmptyMultiModalChatSeam)
+}  // namespace vllm::entrypoints::openai
 
 // ---------------------------------------------------------------------------
 // 1. THE REGISTRATION declares the seam. Without these three hooks
@@ -989,4 +1024,69 @@ TEST_CASE("mm chat registry: an architecture that declares no multimodal support
         oai::MultiModalChatInstall::kTextOnlyModel);
   // Nothing to announce: this is the ordinary text-only server, not a failure.
   CHECK(install_log.str().empty());
+}
+
+// ---------------------------------------------------------------------------
+// 8. A REGISTERED FACTORY THAT RETURNS AN EMPTY SEAM IS A REFUSAL, NOT A
+//    SUCCESS (#2475, fresh-review F2). `MakeSeam` checked that `make_seam` was
+//    not null and then trusted whatever it returned. A seam whose `chat_fn` is
+//    an empty `std::function` installs as NOTHING: `mm_chat_fn_` is falsy, the
+//    image request takes the text path, and the startup log says
+//    "multimodal chat seam wired for architecture 'X'".
+//
+//    Two assertions, because either alone is satisfiable by the wrong tree.
+//    The install must not report success — a case that only checked the
+//    dispatch would pass on a server that reported `kInstalled` and happened to
+//    fail later. And the REQUEST must not reach the text path — a case that
+//    only checked the enum would pass on an install that returned `kRefusing`
+//    and installed nothing.
+//
+//    The second assertion is what makes this a reachability case rather than an
+//    enum case: on the unguarded tree the body carries the tiny fixture's own
+//    forward refusal, "requires multimodal inputs (ModelForwardInput.mm)",
+//    which is the text path saying out loud that the image was dropped.
+// ---------------------------------------------------------------------------
+TEST_CASE("mm chat registry: a registered factory that returns an EMPTY seam refuses, and never installs as success") {
+  const HfConfig c = MakeConfig();
+  const vllm::Qwen3VLWeights w = MakeVlWeights(c);
+  std::unique_ptr<vllm::LoadedModel> model = vllm::BorrowQwen3VLLoadedModel(w);
+  vt::Queue q = Q();
+  vllm::ModelRegistry::Prepare(*model, c, q);
+
+  // The premise: this architecture IS registered, and its factory IS callable.
+  // Without this the case could pass for the unregistered-architecture reason
+  // that case 5 already covers.
+  const oai::MultiModalChatRegistration* empty =
+      oai::MultiModalChatRegistry::Find(kEmptySeamMmArch);
+  REQUIRE(empty != nullptr);
+  REQUIRE(empty->make_seam != nullptr);
+
+  const TempModelDir model_dir;
+  MmServerHarness h(c, *model, Fixture());
+  std::ostringstream install_log;
+  const oai::MultiModalChatInstall outcome = h.install_multimodal_seam(
+      kEmptySeamMmArch, /*is_multimodal_model=*/true, model_dir, install_log);
+  INFO("install log: ", install_log.str());
+  CHECK(outcome != oai::MultiModalChatInstall::kInstalled);
+  CHECK(outcome == oai::MultiModalChatInstall::kRefusing);
+  // And it announced the refusal rather than a wiring. The success log is the
+  // half that makes the defect invisible to an operator reading startup.
+  CHECK(install_log.str().find("UNAVAILABLE") != std::string::npos);
+  CHECK(install_log.str().find(kEmptySeamMmArch) != std::string::npos);
+  CHECK(install_log.str().find("seam wired") == std::string::npos);
+
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(ChatBodyWithImage(/*max_tokens=*/3));
+  INFO("body: ", r.body);
+  CHECK(r.status == 400);
+  CHECK(r.body.find("multimodal input is not available") != std::string::npos);
+  CHECK(r.body.find(kEmptySeamMmArch) != std::string::npos);
+  CHECK(r.body.find("no callable chat function") != std::string::npos);
+  // THE FALL-THROUGH ASSERTION. This string is the fixture forward's own
+  // refusal of a step carrying no multimodal request (the same one case 6
+  // asserts a TEXT request reaches). Seeing it here means the image request was
+  // answered from the text path with the image dropped, which on a model that
+  // also serves text is a 200 with no error at all.
+  CHECK(r.body.find("requires multimodal inputs (ModelForwardInput.mm)") ==
+        std::string::npos);
 }

@@ -1514,8 +1514,12 @@ int VllmServerMain(int argc, char** argv) {
     // The seam OWNS its processor and its `BaseProcessingInfo` (the factory
     // captures them), so no locals live here for them and a future architecture
     // cannot get their lifetime wrong by forgetting to add one. `chat` is
-    // declared above `loaded`, so the closure is destroyed before the
-    // `MultiModalConfig` the info references.
+    // declared AFTER `loaded`, and destruction runs in REVERSE of declaration
+    // order, so the closure is destroyed BEFORE the `MultiModalConfig` its
+    // `BaseProcessingInfo` holds by reference. Reordering those two
+    // declarations reverses that and leaves the info holding a dangling
+    // `const MultiModalConfig&`, so the order is load-bearing rather than
+    // incidental.
     oai::MultiModalChatContext mm_ctx;
     mm_ctx.architecture = loaded->architecture();
     mm_ctx.model_dir = PathUtf8(dir);

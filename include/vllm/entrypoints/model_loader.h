@@ -571,7 +571,7 @@ class LoadedEngine {
   // The OpenAI server's multimodal chat install dispatches on these two, exactly
   // as upstream reads `get_model_architecture(model_config)` and
   // `model_config.is_multimodal_model` before it looks up a processor
-  // (vllm/multimodal/registry.py:109,178-180 @ 5559679229bc). The install used
+  // (vllm/multimodal/registry.py:110,178-180 @ 5559679229bc). The install used
   // to branch on the presence of `preprocessor_config.json`, which is not an
   // architecture and gave a second multimodal model Qwen3-VL's processor.
   std::string_view architecture() const {

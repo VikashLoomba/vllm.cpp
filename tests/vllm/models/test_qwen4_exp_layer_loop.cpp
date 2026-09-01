@@ -2575,3 +2575,430 @@ TEST_CASE(
   CHECK(Addr(after.layers[0].gdn.in_proj_qkv) ==
         reinterpret_cast<uintptr_t>(base));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DECODEDIV (#2496) — WHERE THE CUDA ARM LEAVES THE CPU ARM, BY STEP AND BY
+// TENSOR.
+//
+// The defect this case was written against is a whole-output symptom: on
+// `thor:gpu0`, over the released `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S
+// artifact, a CUDA server emits `11751 271 271 271 271 271 0 0` where the CPU
+// arm on the same tree and the same file emits `11751 13 15767 411 2029 11 1092
+// 369`. Token 0 agrees, so PREFILL is right; every decode token is wrong, and
+// bit-stably so across builds, trees and `CUDA_LAUNCH_BLOCKING`. That excludes
+// the whole async/ordering class and points at STATE the second step carries.
+//
+// A whole-output symptom cannot name a tensor. This case converts it into one:
+// it drives the SAME two steps — one prefill, one decode — through
+// `ModelRegistry::Forward` on a CPU queue and on a CUDA queue over the SAME
+// fixture and the SAME token ids, and compares, in order:
+//
+//   1. the prefill logits,
+//   2. every PERSISTENT buffer the prefill wrote and the decode reads — the GDN
+//      conv ring, the GDN temporal state, the PLE conv ring, the PLE n-gram
+//      history, the paged K/V and the indexer side cache,
+//   3. the decode logits.
+//
+// The first row of that list that disagrees IS the answer, and the ordering is
+// the point: a state buffer that differs after a prefill whose logits agree is
+// exactly the shape "prefill right, decode wrong" describes. Every difference is
+// PRINTED whether or not it trips an assertion, because a diagnostic that only
+// says pass/fail cannot name a tensor either.
+//
+// WHY THE INPUTS ARE PINNED RATHER THAN SAMPLED. The second step's token is a
+// CONSTANT here, not the first step's argmax. Sampling it per arm would feed the
+// two arms different ids the moment the prefill logits disagree at all, and the
+// decode comparison would then be measuring two different questions.
+//
+// WHAT IT CANNOT SEE. `qwen4_exp_gguf_fixture.h` is a miniature whose layer-3
+// activations sit near 2^18, where one bf16 ULP is ~1024 and the K/V store
+// saturates — W5j measured 0 of 192 paged K/V words moving across two different
+// prompts. A CPU/CUDA difference small enough to be absorbed by that store is
+// invisible here. So a GREEN result on this case is NOT a claim that the device
+// arm decodes correctly at released width; it is the statement that the
+// difference is not one this fixture can hold.
+namespace {
+
+struct DecodeDivArm {
+  std::vector<float> logits1, logits2;
+  // After the prefill, in the published order: [gdn_conv, temporal, ple_conv,
+  // ngram] per linear layer, then the two paged pools.
+  std::vector<std::vector<unsigned char>> gdn_conv, ssm, ple_conv;
+  std::vector<std::vector<int64_t>> ngram;
+  std::vector<uint16_t> kv, idx;
+  // The same six after the decode.
+  std::vector<std::vector<unsigned char>> gdn_conv2, ssm2, ple_conv2;
+  std::vector<std::vector<int64_t>> ngram2;
+  std::vector<uint16_t> kv2, idx2;
+};
+
+// The largest absolute difference between two f32 vectors, and the largest
+// magnitude on the CPU side, so the caller can report a RELATIVE figure without
+// dividing by a zero row.
+void DecodeDivMaxAbs(const std::vector<float>& a, const std::vector<float>& b,
+                     double* max_diff, double* max_mag) {
+  *max_diff = 0.0;
+  *max_mag = 0.0;
+  REQUIRE(a.size() == b.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    const double x = static_cast<double>(a[i]);
+    const double y = static_cast<double>(b[i]);
+    const double m = std::fabs(x) > std::fabs(y) ? std::fabs(x) : std::fabs(y);
+    if (m > *max_mag) *max_mag = m;
+    const double dd = std::fabs(x - y);
+    if (dd > *max_diff) *max_diff = dd;
+  }
+}
+
+// How many bytes of two raw buffers differ, and the index of the FIRST one. Raw
+// rather than typed because these snapshots carry three different element
+// widths and the question here is "did the two arms write the same bytes", not
+// "how far apart are the values".
+size_t DecodeDivBytesDiffer(const std::vector<unsigned char>& a,
+                            const std::vector<unsigned char>& b, size_t* first) {
+  *first = a.size();
+  size_t n = 0;
+  REQUIRE(a.size() == b.size());
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i] != b[i]) {
+      if (n == 0) *first = i;
+      ++n;
+    }
+  }
+  return n;
+}
+
+DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
+                                     const vllm::HfConfig& config,
+                                     vt::DeviceType dev_type,
+                                     const std::vector<int32_t>& prompt,
+                                     int32_t next_id) {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g, dev_type);
+  REQUIRE(model != nullptr);
+
+  constexpr int64_t kQsaLayer = 3;
+  constexpr int64_t kGdnLayers = 3;
+  constexpr int64_t kPleIdx = 1;  // ple_layer_ids = [2], one-based
+  constexpr int64_t kPage = 4;
+  constexpr int64_t kCols = 3;
+  constexpr int64_t kBlocks0 = 4;
+  constexpr int64_t kBlocks2 = 5;
+  const int64_t kIdxRows = kBlocks2 * kPage;
+  const auto T1 = static_cast<int64_t>(prompt.size());
+
+  const int64_t kConvDimL = 2 * kKeyDim + kValueDim;
+  const int64_t kGdnConvLen = kConvKernel - 1;
+  const int64_t kSsmRow = kNumVHeads * kLinHeadDim * kLinHeadDim;
+  const int64_t kPleStateLen = (kConvKernel - 1) * kNgramSize;
+  const int64_t kCtx = kNgramSize - 1;
+
+  const std::vector<int32_t> bt0{2, 0, 3};
+  const std::vector<int32_t> bt2{1, 3, 4};
+
+  vt::Backend& backend = vt::GetBackend(dev_type);
+  vt::Queue q = dev_type == vt::DeviceType::kCPU
+                    ? vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}
+                    : backend.CreateQueue();
+  vllm::dense_attn::Dev d{backend, q};
+
+  const size_t gdn_conv_bytes =
+      static_cast<size_t>(kConvDimL * kGdnConvLen) * sizeof(float);
+  const size_t ssm_bytes = static_cast<size_t>(kSsmRow) * sizeof(float);
+  const size_t ple_conv_bytes = static_cast<size_t>(kStream * kPleStateLen) *
+                                vt::SizeOf(vllm::kQwen4ExpStreamDType);
+
+  std::vector<std::vector<unsigned char>> host_gdn_conv(kGdnLayers),
+      host_ssm(kGdnLayers), host_ple_conv(kGdnLayers);
+  std::vector<std::vector<int64_t>> host_ngram(kGdnLayers);
+  std::vector<vllm::dense_attn::DBuf> b_gdn_conv, b_ssm, b_ple_conv, b_ngram;
+  std::vector<vllm::GdnStateCache> gdn(kGdnLayers);
+  b_gdn_conv.reserve(kGdnLayers);
+  b_ssm.reserve(kGdnLayers);
+  b_ple_conv.reserve(kGdnLayers);
+  b_ngram.reserve(kGdnLayers);
+  for (int i = 0; i < kGdnLayers; ++i) {
+    host_gdn_conv[i].assign(gdn_conv_bytes, 0);
+    host_ssm[i].assign(ssm_bytes, 0);
+    host_ple_conv[i].assign(ple_conv_bytes, 0);
+    host_ngram[i].assign(static_cast<size_t>(kCtx), 0);
+    b_gdn_conv.emplace_back(d, DType::kF32,
+                            std::vector<int64_t>{1, kConvDimL, kGdnConvLen},
+                            host_gdn_conv[i].data());
+    b_ssm.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        host_ssm[i].data());
+    b_ple_conv.emplace_back(
+        d, vllm::kQwen4ExpStreamDType,
+        std::vector<int64_t>{1, qwen4_exp_fixture::kStream, kPleStateLen},
+        host_ple_conv[i].data());
+    b_ngram.emplace_back(d, DType::kI64, std::vector<int64_t>{1, kCtx},
+                         host_ngram[i].data());
+    gdn[static_cast<size_t>(i)].conv_state = b_gdn_conv.back().t();
+    gdn[static_cast<size_t>(i)].ssm_state = b_ssm.back().t();
+    gdn[static_cast<size_t>(i)].states = {b_gdn_conv.back().t(), b_ssm.back().t(),
+                                          b_ple_conv.back().t(), b_ngram.back().t()};
+  }
+
+  std::vector<uint16_t> kv_host(
+      static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                              {2, kBlocks0, kPage, kKvHeads, kHeadDim},
+                              kv_host.data());
+  constexpr uint16_t kPoison = 0x3F80;
+  std::vector<uint16_t> idx_host(static_cast<size_t>(kIdxRows * kIdxHeadDim),
+                                 kPoison);
+  vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
+                               idx_host.data());
+
+  std::vector<vllm::PagedKvCache> attn_kv(2);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = kBlocks0;
+  attn_kv[0].block_size = kPage;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+  attn_kv[1].data = idx_b.t().data;
+  attn_kv[1].dtype = DType::kBF16;
+  attn_kv[1].num_blocks = kBlocks2;
+  attn_kv[1].block_size = kPage;
+  attn_kv[1].num_kv_heads = kIdxKvHeads;
+  attn_kv[1].head_size = kIdxHeadDim;
+
+  std::vector<std::string> names;
+  std::vector<int32_t> group_ids, layer_indices, payload_slots;
+  std::vector<uint8_t> payload_kinds;
+  names.push_back("model.layers." + std::to_string(kQsaLayer) + ".self_attn.attn");
+  group_ids.push_back(0);
+  layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+  payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+  payload_slots.push_back(0);
+  for (int i = 0; i < kGdnLayers; ++i) {
+    names.push_back("model.layers." + std::to_string(i) + ".linear_attn");
+    group_ids.push_back(1);
+    layer_indices.push_back(i);
+    payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kRecurrent));
+    payload_slots.push_back(i);
+  }
+  names.push_back("model.layers." + std::to_string(kQsaLayer) +
+                  ".self_attn.indexer.k_cache");
+  group_ids.push_back(2);
+  layer_indices.push_back(static_cast<int32_t>(kQsaLayer));
+  payload_kinds.push_back(static_cast<uint8_t>(vllm::KvCachePayload::kPaged));
+  payload_slots.push_back(1);
+
+  const std::vector<int32_t> bt_recurrent{0};
+  std::vector<std::vector<int32_t>> group_tables{bt0, bt_recurrent, bt2};
+  std::vector<int32_t> group_cols{static_cast<int32_t>(kCols), 1,
+                                  static_cast<int32_t>(kCols)};
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+  mk.group_ids = &group_ids;
+  mk.layer_indices = &layer_indices;
+  mk.payload_kinds = &payload_kinds;
+  mk.payload_slots = &payload_slots;
+  mk.group_block_tables = &group_tables;
+  mk.group_block_table_cols = &group_cols;
+
+  const auto slot_of = [&](int64_t t) {
+    return static_cast<int32_t>(bt0[static_cast<size_t>(t / kPage)] * kPage +
+                                t % kPage);
+  };
+
+  const auto run = [&](const std::vector<int32_t>& tok_ids, int64_t past_len) {
+    const auto T = static_cast<int64_t>(tok_ids.size());
+    std::vector<int32_t> pos(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      pos[static_cast<size_t>(t)] = static_cast<int32_t>(past_len + t);
+
+    vllm::v1::CommonAttentionMetadata am;
+    am.num_reqs = 1;
+    am.num_actual_tokens = static_cast<int>(T);
+    am.max_query_len = static_cast<int>(T);
+    am.query_start_loc.assign({0, static_cast<int32_t>(T)});
+    am.seq_lens.assign(1, static_cast<int32_t>(past_len + T));
+    am.block_table_tensor = bt0;
+    am.block_table_num_cols = static_cast<int>(kCols);
+    am.max_seq_len = static_cast<int>(past_len + T);
+    am.slot_mapping.resize(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t)
+      am.slot_mapping[static_cast<size_t>(t)] = slot_of(past_len + t);
+
+    vllm::v1::GDNAttentionMetadata gm;
+    gm.num_actual_tokens = static_cast<int>(T);
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+    if (past_len == 0) {
+      gm.num_prefills = 1;
+      gm.num_prefill_tokens = static_cast<int>(T);
+      gm.has_initial_state = std::vector<uint8_t>{0};
+      gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+      gm.prefill_state_indices = std::vector<int32_t>{0};
+      gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+      const auto conv =
+          vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+      gm.batch_ptr = conv.batch_ptr;
+      gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+    } else {
+      gm.num_decodes = 1;
+      gm.num_decode_tokens = static_cast<int>(T);
+    }
+
+    const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+    vllm::ModelForwardInput in{tok_ids, pos,    am, gm, attn_kv,
+                               gdn,     config, q,  logits_indices};
+    in.num_reqs = 1;
+    in.gdn_state_slots = 1;
+    in.multi_kv = &mk;
+
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+    REQUIRE(fl.on_device());
+    REQUIRE(fl.rows == 1);
+    std::vector<float> out(static_cast<size_t>(fl.rows * fl.vocab), 0.0F);
+    d.b.Copy(q, out.data(), fl.device_tensor.data, out.size() * sizeof(float));
+    d.b.Synchronize(q);
+    return out;
+  };
+
+  DecodeDivArm r;
+  r.gdn_conv.resize(kGdnLayers);
+  r.ssm.resize(kGdnLayers);
+  r.ple_conv.resize(kGdnLayers);
+  r.ngram.resize(kGdnLayers);
+  r.gdn_conv2.resize(kGdnLayers);
+  r.ssm2.resize(kGdnLayers);
+  r.ple_conv2.resize(kGdnLayers);
+  r.ngram2.resize(kGdnLayers);
+
+  const auto snapshot = [&](std::vector<std::vector<unsigned char>>& gc,
+                            std::vector<std::vector<unsigned char>>& ss,
+                            std::vector<std::vector<unsigned char>>& pc,
+                            std::vector<std::vector<int64_t>>& ng,
+                            std::vector<uint16_t>& kvo, std::vector<uint16_t>& idxo) {
+    for (int i = 0; i < kGdnLayers; ++i) {
+      gc[static_cast<size_t>(i)].assign(gdn_conv_bytes, 0);
+      ss[static_cast<size_t>(i)].assign(ssm_bytes, 0);
+      pc[static_cast<size_t>(i)].assign(ple_conv_bytes, 0);
+      ng[static_cast<size_t>(i)].assign(static_cast<size_t>(kCtx), 0);
+      b_gdn_conv[static_cast<size_t>(i)].Download(d, gc[static_cast<size_t>(i)].data());
+      b_ssm[static_cast<size_t>(i)].Download(d, ss[static_cast<size_t>(i)].data());
+      b_ple_conv[static_cast<size_t>(i)].Download(d, pc[static_cast<size_t>(i)].data());
+      b_ngram[static_cast<size_t>(i)].Download(d, ng[static_cast<size_t>(i)].data());
+    }
+    kvo.assign(kv_host.size(), 0);
+    idxo.assign(idx_host.size(), 0);
+    kv_b.Download(d, kvo.data());
+    idx_b.Download(d, idxo.data());
+  };
+
+  r.logits1 = run(prompt, /*past_len=*/0);
+  snapshot(r.gdn_conv, r.ssm, r.ple_conv, r.ngram, r.kv, r.idx);
+  r.logits2 = run(std::vector<int32_t>{next_id}, /*past_len=*/T1);
+  snapshot(r.gdn_conv2, r.ssm2, r.ple_conv2, r.ngram2, r.kv2, r.idx2);
+  return r;
+}
+
+}  // namespace
+
+TEST_CASE("qwen4_exp #2496: the CUDA decode step agrees with the CPU decode step") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  if (!LayerLoopHasCuda()) {
+    MESSAGE("no CUDA backend in this build: #2496's CPU-vs-CUDA decode "
+            "comparison is UNMEASURED by this run");
+    return;
+  }
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+
+  // The prompt carries an EOS in the INTERIOR, which is a segment boundary in
+  // the hashed n-gram construction, so the ids after it are not a straight ramp.
+  const std::vector<int32_t> prompt{5, 9, 13, static_cast<int32_t>(kEosTokenId), 7, 2};
+  const int32_t next_id = 11;  // PINNED; see the header for why it is not sampled.
+  for (int32_t v : prompt) REQUIRE(v < static_cast<int32_t>(kVocab));
+  REQUIRE(next_id < static_cast<int32_t>(kVocab));
+
+  DecodeDivArm cpu = RunQwen4ExpDecodeDivArm(g, config, vt::DeviceType::kCPU,
+                                             prompt, next_id);
+  DecodeDivArm gpu = RunQwen4ExpDecodeDivArm(g, config, vt::DeviceType::kCUDA,
+                                             prompt, next_id);
+
+  for (float v : cpu.logits1) REQUIRE(std::isfinite(v));
+  for (float v : cpu.logits2) REQUIRE(std::isfinite(v));
+  for (float v : gpu.logits1) REQUIRE(std::isfinite(v));
+  for (float v : gpu.logits2) REQUIRE(std::isfinite(v));
+
+  double d1 = 0.0, m1 = 0.0, d2 = 0.0, m2 = 0.0;
+  DecodeDivMaxAbs(cpu.logits1, gpu.logits1, &d1, &m1);
+  DecodeDivMaxAbs(cpu.logits2, gpu.logits2, &d2, &m2);
+  const double rel1 = m1 > 0.0 ? d1 / m1 : d1;
+  const double rel2 = m2 > 0.0 ? d2 / m2 : d2;
+  MESSAGE("#2496 STEP 1 (prefill) logits: max|cpu-cuda| = " << d1 << " over a max "
+          "magnitude of " << m1 << " (relative " << rel1 << ")");
+  MESSAGE("#2496 STEP 2 (decode)  logits: max|cpu-cuda| = " << d2 << " over a max "
+          "magnitude of " << m2 << " (relative " << rel2 << ")");
+
+  // EVERY PERSISTENT BUFFER, PRINTED WHETHER OR NOT IT TRIPS. This is the list
+  // whose first disagreeing row names the defect; a diagnostic that only reports
+  // the logits repeats the symptom instead of locating it.
+  const char* kNames[4] = {"gdn_conv", "gdn_temporal", "ple_conv_ring", "ngram_history"};
+  for (int i = 0; i < 3; ++i) {
+    const std::vector<std::vector<unsigned char>>* pairs[3][2] = {
+        {&cpu.gdn_conv, &gpu.gdn_conv},
+        {&cpu.ssm, &gpu.ssm},
+        {&cpu.ple_conv, &gpu.ple_conv}};
+    for (int k = 0; k < 3; ++k) {
+      size_t first = 0;
+      const size_t n = DecodeDivBytesDiffer((*pairs[k][0])[static_cast<size_t>(i)],
+                                            (*pairs[k][1])[static_cast<size_t>(i)],
+                                            &first);
+      MESSAGE("#2496 after PREFILL, linear layer " << i << " " << kNames[k]
+              << ": " << n << " differing bytes, first at " << first);
+    }
+    MESSAGE("#2496 after PREFILL, linear layer " << i << " " << kNames[3]
+            << ": cpu/cuda equal = "
+            << (cpu.ngram[static_cast<size_t>(i)] == gpu.ngram[static_cast<size_t>(i)]));
+    // THE HISTORY IS INT64 TOKEN IDS, so it is the one cross-step state whose
+    // disagreement cannot be a rounding difference.
+    CHECK(cpu.ngram[static_cast<size_t>(i)] == gpu.ngram[static_cast<size_t>(i)]);
+    CHECK(cpu.ngram2[static_cast<size_t>(i)] == gpu.ngram2[static_cast<size_t>(i)]);
+  }
+  {
+    std::vector<unsigned char> a(reinterpret_cast<const unsigned char*>(cpu.kv.data()),
+                                 reinterpret_cast<const unsigned char*>(cpu.kv.data()) +
+                                     cpu.kv.size() * sizeof(uint16_t));
+    std::vector<unsigned char> b(reinterpret_cast<const unsigned char*>(gpu.kv.data()),
+                                 reinterpret_cast<const unsigned char*>(gpu.kv.data()) +
+                                     gpu.kv.size() * sizeof(uint16_t));
+    size_t first = 0;
+    MESSAGE("#2496 after PREFILL, paged K/V: " << DecodeDivBytesDiffer(a, b, &first)
+            << " differing bytes, first at " << first);
+  }
+  {
+    std::vector<unsigned char> a(reinterpret_cast<const unsigned char*>(cpu.idx.data()),
+                                 reinterpret_cast<const unsigned char*>(cpu.idx.data()) +
+                                     cpu.idx.size() * sizeof(uint16_t));
+    std::vector<unsigned char> b(reinterpret_cast<const unsigned char*>(gpu.idx.data()),
+                                 reinterpret_cast<const unsigned char*>(gpu.idx.data()) +
+                                     gpu.idx.size() * sizeof(uint16_t));
+    size_t first = 0;
+    MESSAGE("#2496 after PREFILL, indexer side cache: "
+            << DecodeDivBytesDiffer(a, b, &first) << " differing bytes, first at "
+            << first);
+  }
+
+  // THE HEADLINE, AND IT IS A COMPARISON OF THE TWO STEPS RATHER THAN AN
+  // ABSOLUTE BAND. #2496's whole shape is that the prefill agrees and the decode
+  // does not, so the assertion that convicts it is that the decode's arm-to-arm
+  // distance is not an order of magnitude worse than the prefill's. An absolute
+  // tolerance would have to be picked against this fixture's own noise floor and
+  // would say nothing about the defect.
+  const double floor = 1.0e-3;
+  CHECK(rel1 <= floor);
+  CHECK(rel2 <= floor);
+}

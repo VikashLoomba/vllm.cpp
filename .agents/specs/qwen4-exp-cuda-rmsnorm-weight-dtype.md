@@ -133,6 +133,31 @@ requires `w.dtype == DType::kBF16` and `TryLaunchRmsNormDecodeFastF32` requires
 Red before green: a `RmsNorm` with bf16 `x`/`out` and an f32 `w` must produce
 the CPU kernel's values rather than a refusal, on every registered device.
 
+## The precondition that refused a good tree
+
+Run 1 on `thor:gpu0` staged the artifact in 1766 s, asserted the fix was in the
+tarball it was about to compile, and refused:
+
+```text
+RESULT FIX IN SOURCE: Tw=1 dispatch=3 old_check=2 test=1
+FATAL: the tarball does not carry the fix. REFUSING to measure it.
+```
+
+The tarball did carry the fix. `old_check` grepped the bare phrase
+`weight dtype must match x`, which also appears at `cuda_ops.cu:578`
+(`rmsnorm_quant_fp8`) and `:3689` (`fused_chain`) — two different ops this change
+deliberately does not touch. The correct count of the RmsNorm message is 0 and
+was 0. The grep was too broad, so it counted its own neighbours.
+
+It is recorded because of the direction it failed in. A precondition that is too
+broad **refuses a good tree**, which costs a lease and a staging run and is
+visible immediately. A precondition that is too narrow **passes a bad tree**, and
+then every arm below it reports a measurement of something other than what it
+names. This project's standing hazard is the second one, so the cost here bought
+the right polarity. The repair is to match the op's own message rather than a
+phrase several ops share, and to stage persistently so a refusal costs the lease
+and not the 1766 s as well.
+
 ## Gates
 
 - `tests/vt/test_ops_rmsnorm*` focused, then the full gate.

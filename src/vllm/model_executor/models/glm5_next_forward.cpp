@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>  // std::getenv
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,37 @@
 
 namespace vllm::glm5_next {
 namespace {
+
+// W9c-3a's device split is OPT-IN and DEFAULTS OFF, and the reason is a
+// measurement rather than caution.
+//
+// Driven on `dgx:gpu0` against the real 101.24 GiB UD-Q2_K_XL artifact, both
+// `--device cuda` legs died with **SIGSEGV** (rc=139) having emitted no token,
+// where `origin/main` produced a clean named refusal in 1066 s. The crash is
+// reproducible (2 of 2) and it appears only in the MIXED residency state this
+// row's per-layer fit guard creates: each leg logged the device arm engaging
+// for one layer and then `DeviceBanksFit` declining a later one, and died after
+// that. 94.6758 GiB of expert banks do not fit beside the KV pool and the GGUF
+// page cache on a 119 GiB box, which was always the risk; what is broken is the
+// FALLBACK that was supposed to make that safe.
+//
+// Turning a clean refusal into a segfault is strictly worse for a user, so the
+// default is restored to exactly what it was and the arm is reachable only when
+// asked for by name. The mechanism is not diagnosed -- O46 records the three
+// hypotheses already killed, so the next wave does not spend a lease re-killing
+// them -- and shipping a guessed fix for a defect that cannot be reproduced off
+// the box is the failure this comment exists to refuse.
+//
+// `1` and nothing else, deliberately: this enables a path MEASURED to crash on
+// the one artifact it has been driven against, so it does not get the tree's
+// usual "any first character but 0" polarity.
+bool DeviceExpertsOptedIn() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GLM5_NEXT_DEVICE_EXPERTS");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
 
 [[noreturn]] void Fail(const std::string& why) {
   throw std::runtime_error("glm5_next forward: " + why);
@@ -291,6 +323,20 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
            "cannot run that GEMM has nothing to offer this forward: run it with "
            "--device cpu. See .agents/specs/glm5-next-flash.md section W9c-3a "
            "and issue #2464.");
+    }
+    // ORDER MATTERS: the op-table refusal above is the more specific diagnosis
+    // and must win, so a device with no provider still gets told that rather
+    // than being told to set a variable that would not help it.
+    if (!DeviceExpertsOptedIn()) {
+      Fail("the routed-expert device arm is OPT-IN and is not enabled, so this "
+           "forward will not take a non-CPU queue. It defaults off because both "
+           "`--device cuda` legs against the published 101.24 GiB UD-Q2_K_XL "
+           "artifact on dgx:gpu0 died with SIGSEGV having emitted no token, "
+           "reproducibly, once the expert banks stopped fitting and the arm fell "
+           "back to the host mid-model. Run this model with --device cpu, which "
+           "emits ` Paris.` on that artifact. Set VT_GLM5_NEXT_DEVICE_EXPERTS=1 "
+           "to reach the arm anyway -- that is for debugging the crash, not for "
+           "serving. See .agents/specs/glm5-next-flash.md O46 and issue #2464.");
     }
     dev_backend = backend;
   }

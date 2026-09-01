@@ -5336,6 +5336,63 @@ Debts this row carries, each visible rather than waived:
   interleaved arm-vs-arm timing, which is our CUDA arm against our CPU arm and
   never a vLLM comparison (O38).
 
+- **O46 -- `--device cuda` SEGFAULTS ON THE REAL ARTIFACT, the device split is
+  therefore OPT-IN and DEFAULTS OFF, and this entry carries the evidence plus
+  the hypotheses already eliminated.** Measured on `dgx:gpu0` (GB10, `sm_121a`),
+  job `0b0d9c90-0b6d-488e-afb5-076d3d018ed6`, binary identity asserted, against
+  the published 101.24 GiB UD-Q2_K_XL artifact:
+
+  | leg | device | rc | wall | `secs=` | stdout |
+  |---|---|---:|---:|---:|---|
+  | cpu0 | cpu | 0 | 1176 s | 169.3 | ` Paris.` (byte-identical to the base tree) |
+  | cuda1 | cuda | **139** | 1420 s | -- | **0 bytes** |
+  | cpu1 | cpu | 0 | 1918 s | 220.3 | ` Paris.` |
+  | cuda2 | cuda | **139** | 1061 s | -- | **0 bytes** |
+
+  `139` is SIGSEGV. It is REPRODUCIBLE, 2 of 2, and each crashing leg logged
+  exactly one device-arm announcement followed by exactly one fallback warning
+  before dying -- so the fault is in the MIXED residency state the per-layer fit
+  guard creates, not in the device arm itself, which the CUDA unit gate exercises
+  cleanly at NMSE 3.833e-15 against the host arm.
+
+  **This is a REGRESSION and it is named as one.** On the base tree the same
+  command produced a clean refusal at 1066 s (the operand table above, leg C).
+  Turning a named error into a segfault is strictly worse for a user, so the
+  default is restored byte-for-byte and the arm is reachable only through
+  `VT_GLM5_NEXT_DEVICE_EXPERTS=1`, which exists to debug this crash and not to
+  serve.
+
+  **THREE HYPOTHESES ARE ALREADY DEAD, recorded so the next wave does not spend a
+  lease re-killing them.** (1) `Alloc` returning null under pressure: no,
+  `CudaBackend::Alloc` wraps `cudaMalloc` in `Check()`, so an OOM throws and
+  would surface as `engine-fatal`. (2) `AdoptDeviceBytesAsHost` re-homing host
+  bytes onto a device pointer: no, it returns early because CUDA answers
+  `DeviceMemoryIsHostAddressable() == false` (`cuda_backend.cu:354-362`), and the
+  GGUF banks set no `mmap_src`. (3) A stride mismatch between the device tensor
+  and the host view: no, `Tensor::Contiguous` and `dense_attn::MakeTensor`
+  compute identical element strides with no block special-casing.
+  **UNTESTED, and named as untested:** deciding residency ONCE per model instead
+  of per layer would remove the mixed state, but at this scale it would simply
+  decline to stage (94.6758 GiB against the ~15-20 GiB free after the KV pool)
+  and turn `--device cuda` into an all-host run, which is the shell this row has
+  four times declined to ship.
+
+- **O47 -- NO SPEED NUMBER WAS AVAILABLE FROM THIS JOB ON ANY AXIS, and that
+  would have held even if the CUDA legs had survived.** Two IDENTICAL cpu legs,
+  same binary, same device, same prompt, differ by **+69% on load** (1007 s ->
+  1698 s) and **+30% on generation** (169.3 s -> 220.3 s). The mechanism is
+  visible in the ordering: a cuda leg stages expert banks into device memory and
+  evicts the GGUF page cache, and because this row's tower stays block-resident
+  and re-reads expert blocks from that mmap on EVERY step, the eviction moves
+  generation and not just load. So wall is unusable (86% load, and each cuda leg
+  poisons the next cpu leg), and `secs=` -- the generation-only figure
+  `vllm-cli` prints, which is the right axis -- still carries a 30% spread at
+  n=2. A CPU-against-CUDA ratio from this job would have been substantially an
+  artifact of leg ORDER. The interleaving is what exposed that; one leg per arm
+  would have looked authoritative and been wrong. O6 stands, and this entry says
+  what it would take to move it: many more samples per arm, and a leg order that
+  does not let one arm evict the other's page cache.
+
 ## Now
 
 `ACTIVE`, 2026-09-01. **THE KERNEL THAT BLOCKED THIS MODEL'S DEVICE ARM LANDED
@@ -5351,7 +5408,24 @@ the discharge. O19 is narrowed to its residency half and O44 records the pattern
 because this is the SECOND inherited block this row has carried past its own
 expiry.
 
-**One arm of eleven is on the device, and O43 names the other ten.** The routed-
+**AND THEN IT SEGFAULTED, so the arm is OPT-IN and defaults OFF.** Driven end to
+end on the 101.24 GiB artifact, both `--device cuda` legs died with SIGSEGV
+(rc=139) emitting no token, reproducibly, once the expert banks stopped fitting
+and the arm fell back to the host mid-model. The base tree produced a clean
+refusal on the same command, so this was a REGRESSION and the default is
+restored byte-for-byte; O46 carries the four legs, the three hypotheses already
+eliminated, and the one that is untested. O47 records the other half of that
+job: two IDENTICAL cpu legs differ by 69% on load and 30% on generation because
+a cuda leg evicts the page cache this block-resident tower re-reads every step,
+so NO speed number was available on any axis and none is claimed.
+
+**What the device arm IS gated at, which is not nothing:** the CUDA unit gate on
+`dgx:gpu0` ran `test_glm5_next_moe` at 18 cases / 37,317 assertions with the
+device case agreeing with the host arm at NMSE **3.833e-15**, and the assertion
+`nmse > 0` proves the GPU actually executed it rather than falling back. The
+kernel is right; the residency compose is not.
+
+**One arm of eleven is on the device WHEN OPTED IN, and O43 names the other ten.** The routed-
 expert keep-quant GEMM now runs on the GPU against banks made resident through
 `dense_attn::ResidentWeight`, reached from `ModelRegistry::Forward` on
 `--device cuda`. The KDA recurrence, the k-pool indexer, the eager MLA

@@ -61,6 +61,7 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <string>
@@ -761,6 +762,39 @@ TEST_CASE("glm5_next forward W9c-3a: the queue is SPLIT, and a device that is "
                          doctest::Contains("#2464"), std::runtime_error);
   }
 
+  SUBCASE("the device arm is OPT-IN, so the DEFAULT refuses a device queue") {
+    // W9c-3a's device split defaults OFF after both `--device cuda` legs on the
+    // real artifact died with SIGSEGV (spec O46). The default must therefore be
+    // a REFUSAL, byte-for-byte the behaviour of the tree before this wave --
+    // turning a clean error into a segfault is strictly worse for a user.
+    //
+    // This case only has something to assert where the op table admits the
+    // device, because the op-table refusal above is ordered first and wins.
+    // On a CPU-only build nothing registers the pair, so the guard under test
+    // is unreachable and the case says so rather than asserting a message it
+    // would get for the wrong reason.
+    const vt::DeviceType dev = vt::DeviceType::kCUDA;
+    const bool pair_here = vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, dev) &&
+                           vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, dev) &&
+                           vt::TryGetBackend(vt::Device{dev, 0}) != nullptr;
+    if (!pair_here) {
+      MESSAGE("no CUDA provider for the grouped pair: the OPT-IN guard is "
+              "unreachable on this build and is gated on dgx:gpu0 instead");
+    } else if (std::getenv("VT_GLM5_NEXT_DEVICE_EXPERTS") != nullptr) {
+      MESSAGE("VT_GLM5_NEXT_DEVICE_EXPERTS is set in this environment: the "
+              "default-off guard cannot be observed here");
+    } else {
+      Step step({1, 2});
+      step.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("OPT-IN"), std::runtime_error);
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("SIGSEGV"), std::runtime_error);
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("--device cpu"), std::runtime_error);
+    }
+  }
+
   SUBCASE("the probe follows the OP TABLE and not a device name") {
     // The discriminating half of the previous case. A refusal that hardcoded a
     // device name would answer identically for kMETAL and differently for a
@@ -782,9 +816,19 @@ TEST_CASE("glm5_next forward W9c-3a: the queue is SPLIT, and a device that is "
                            doctest::Contains("routed-expert keep-quant GEMM"),
                            std::runtime_error);
     } else {
-      MESSAGE("this build registers the grouped pair on CUDA: the refusal is "
-              "correctly NOT taken, and the device arm itself is gated on "
-              "dgx:gpu0");
+      // The op-table refusal is correctly NOT taken here. The step is still
+      // refused, by the OPT-IN guard the subcase above covers, so this branch
+      // asserts only that whatever fires is NOT the op-table one -- caught by
+      // hand, because doctest::Contains has no negation.
+      Step s2({1, 2});
+      s2.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+      std::string what;
+      try {
+        vllm::ModelRegistry::Forward(*model, s2.Get());
+      } catch (const std::exception& e) {
+        what = e.what();
+      }
+      CHECK(what.find("cannot run the one primitive") == std::string::npos);
     }
   }
 

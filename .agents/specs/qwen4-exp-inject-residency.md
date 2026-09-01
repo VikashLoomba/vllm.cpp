@@ -178,6 +178,58 @@ Stop and report if the CUDA leg cannot be built or leased, if the fix does not
 move the stop point, or if the forward's next stop is inside another wave's
 files. Do not repair another wave's stop.
 
+## 10. Evidence
+
+Measured on `thor:gpu0` (`rc-worker-n8smh`, aarch64 Tegra), nvcc 13.0,
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`,
+inside an `rc` lease, job `134ab22f-e541-4409-9933-174efdcec393`, tree
+`df8b5d3a0`. `CMAKE_RC=0`, `BUILD_RC=0`, 41 `.cu.o` objects, `libcudart.so.13`
+and `libcublasLt.so.13` linked into the test binary, and the case's own
+`REQUIRE(CurrentPlatform().device_type() == kCUDA)` passed, which is what
+separates a CUDA run from a CPU load reporting a pass.
+
+**Leg A, the branch as it lands.** `test_qwen4_exp_inject_residency` rc 0,
+2 cases, 13 assertions, 13 passed. The CUDA forward gets past layer 0 and stops
+elsewhere:
+
+```text
+CUDA ModelRegistry::Forward stopped with: vt cuda: matmul_bt:
+  unsupported dtype combo (f32,bf16)->f32;
+  supported: (bf16,bf16)->f32|bf16, (f32,f32)->f32|bf16
+```
+
+**Leg B, the reachability mutation.** Both production call sites restored to
+`.View()` in place, applied-ness proved by a counted property rather than by a
+patch exit code — `ResidentWeight(d, lw.*_hc.inject` 2 -> 0 and
+`_hc.inject.View()` 0 -> 2 — and `BUILD_B_RC=0`, so this is not a build failure
+reading as a pass. `test_qwen4_exp_inject_residency` rc 1, 12 of 13 assertions,
+the one failure being
+
+```text
+CUDA ModelRegistry::Forward stopped with: vt: qwen4_exp_gated_residual:
+  block_inject_weight device mismatch at src/vt/ops.cpp:2562
+ERROR: CHECK_FALSE( IsInjectResidencyRefusal(stopped_with) ) is NOT correct!
+```
+
+Red to green through `ModelRegistry::Forward` on a CUDA queue, on one binary,
+one box, one run.
+
+**CPU parity, measured not argued.** The same mutation applied on an x86_64 CPU
+build leaves all four suites green — `test_qwen4_exp_inject_residency` 8/8,
+`test_qwen4_exp_layer_loop` 309/309, `test_qwen4_exp_runner` 136/136,
+`test_qwen4_exp_forward` 429/429 — and the CPU forward's logit range reads
+`[3290.84, 95090.7]` in both arms, as does the layer loop's
+`max|diff| = 0.00982457` against the transformers 5.16.0 goldens. So the change
+is invisible on the CPU arm, and the CPU tier cannot gate it. The CUDA leg is
+the only real gate here, and §6 says so rather than leaving a green CPU run to
+be read as one.
+
+**`test_qwen4_exp_runner` fails on a CUDA build in BOTH legs**, at
+`test_qwen4_exp_runner.cpp:464`, the `LoadedEngine` case. Leg B throws
+`block_inject_weight device mismatch`; leg A throws the `matmul_bt` dtype
+refusal. It is a pre-existing CUDA gap that this change moves forward rather
+than a regression it introduces, and #2452 owns it.
+
 ## Owed
 
 * `ResidentWeight`'s device-staging arm drops `repacked` without refusing it, so
@@ -185,6 +237,10 @@ files. Do not repair another wave's stop.
   the device GEMM reads as plain. Pre-existing for `hc_*_down`/`hc_*_up`; owned
   by `ENG-GGUF-RESIDENCY-RESOLVED-DEVICE` (#2397), which is making the residency
   policy read the engine's resolved device.
+* The next stop, `vt cuda: matmul_bt: unsupported dtype combo (f32,bf16)->f32`,
+  is filed as [#2452](https://github.com/mudler/vllm.cpp/issues/2452) against
+  this row. It was measured, not localized: the call site is unnamed, and
+  `MatmulF32D` in the MoE seam is a reading rather than a measurement.
 
 ## Now
 

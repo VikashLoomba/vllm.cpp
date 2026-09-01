@@ -415,7 +415,15 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
                    "`use_combine=False` is the MODEL-level mixer alone");
       Tensor m = mixed.t();
       Tensor inj = injection.t();
-      Tensor bi = lw.attn_hc.inject.View();
+      // W5r/#2449: THROUGH THE SAME STAGING ITS SIBLINGS USE. `View()` builds a
+      // tensor over the OwnedTensor's HOST bytes and tags it with the queue's
+      // device, so on a CUDA queue `vt::Qwen4ExpGatedResidual` refused this
+      // operand -- `block_inject_weight device mismatch` -- at decoder layer 0,
+      // before PLE and before the MoE, which is every CUDA forward for this
+      // architecture. `hc_norm`, `down` and `up` in this same call already go
+      // through `dense_attn::ResidentWeight`; the inject weight is a matmul
+      // operand of the same op and had no reason to be the exception.
+      Tensor bi = dense_attn::ResidentWeight(d, lw.attn_hc.inject, {hc, W});
       vt::Qwen4ExpGatedResidual(
           d.q, m, &inj, stream.t(),
           dense_attn::ResidentWeight(d, lw.attn_hc.hc_norm, {W}),
@@ -473,7 +481,9 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
                    "'s MLP hyper-connection has no block_inject_weight");
       Tensor m = mlp_in.t();
       Tensor inj = mlp_injection.t();
-      Tensor bi = lw.mlp_hc.inject.View();
+      // #2449, the MLP twin of the attention site above: same op, same operand
+      // role, same staging.
+      Tensor bi = dense_attn::ResidentWeight(d, lw.mlp_hc.inject, {hc, W});
       vt::Qwen4ExpGatedResidual(
           d.q, m, &inj, stream.t(),
           dense_attn::ResidentWeight(d, lw.mlp_hc.hc_norm, {W}),

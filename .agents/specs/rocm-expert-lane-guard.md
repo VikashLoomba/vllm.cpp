@@ -40,8 +40,9 @@ OUT OF SCOPE:
   moves ONE read of it and no platform's answer to it.
 - The eight-op MLA/DSA arm (`kBatchedMatmul`, `kConcatAndCacheMla`,
   `kConcatMlaNopeRope`, `kDsaIndexerLogits`, `kDsaTopkSelect`, `kFusedNormRope`,
-  `kGatherMlaCache`, `kMlaDecodeAttention`). Those kernels are downstream of a
-  load that does not happen; they are a separate campaign.
+  `kGatherMlaCache`, `kMlaDecodeAttention`). Out of scope, and §`## The eight ops
+  do not block text` records the measurement that says porting them is not
+  required to reach generation.
 - The two adjacent defects measured on the same load. See `## The two adjacent
   defects` below for the disposition and the reasoning.
 
@@ -205,6 +206,43 @@ load (`/mnt/nas_share/rc/glm53-firstload/run.sh:287`) exports
 The predicate defect is unchanged by this: with streaming requested, the guard
 still fails on its first term today and passes after the fix. The correction is
 to the evidence, not to the diagnosis.
+
+## The eight ops do not block text
+
+Asked directly, because the row was raised to an end-to-end generation bar and
+the answer decides whether porting is on the critical path. It is not.
+
+The reference tier is a **generic, device-capability-gated fallback**, not a
+per-op opt-in registry. `ReferenceTierEligible`
+(`src/vt/op_provider.cpp:888-919`) returns true for any non-CPU device whose
+registered backend answers `DeviceMemoryIsHostAddressable()`, and
+`MaybeInstallReferenceTier` (`op_provider.cpp:204-222`) is called from the
+dispatch-miss path for ANY `OpId`: if the device is eligible and the CPU has a
+kernel for that same op, it installs the CPU function pointer as a
+`kReferenceTierPriority` provider. `Resolve` throws only when that also comes
+back empty (`op_provider.cpp:597-601`).
+
+`RocmBackend::DeviceMemoryIsHostAddressable()` returns `unified_memory_`, which
+the registrar sets from `managed_alloc || (pageable_memory_access && integrated)`
+— and `managed_alloc` is true on this board. So the tier IS eligible on
+`gfx1151`, even though `host_memory_is_device_addressable()` (the OPPOSITE
+direction: may a device kernel read a HOST pointer) is false. The two predicates
+are mirrors, and this board answers them differently. That is why the reference
+tier works here while the host-slot expert lane cannot.
+
+All eight ops have a CPU registration — verified individually:
+`cpu_ops.cpp:3956` (`kBatchedMatmul`), `cpu_cache.cpp:188`
+(`kConcatAndCacheMla`), `cpu_ops.cpp:3959` (`kConcatMlaNopeRope`),
+`cpu_dsa_indexer.cpp:183` and `:185` (`kDsaIndexerLogits`, `kDsaTopkSelect`),
+`cpu_ops.cpp:4017` (`kFusedNormRope`), `cpu_mla_prefill.cpp:277`
+(`kGatherMlaCache`), `cpu_mla_attn.cpp:222` (`kMlaDecodeAttention`). None is
+registered for ROCm.
+
+So the forward reaches them, they install host kernels, and they run. Generation
+would be correct at host speed for that arm, and `docs/ROCM.md:60-61` forbids any
+performance result from a run whose `GetReferenceTierHits()` is non-zero. **No
+kernel port is required to reach text.** Porting them is a throughput row, not a
+correctness blocker, and this row does not open it.
 
 ## Tests
 

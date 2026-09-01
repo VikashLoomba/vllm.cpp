@@ -5378,20 +5378,38 @@ Debts this row carries, each visible rather than waived:
   four times declined to ship.
 
 - **O47 -- NO SPEED NUMBER WAS AVAILABLE FROM THIS JOB ON ANY AXIS, and that
-  would have held even if the CUDA legs had survived.** Two IDENTICAL cpu legs,
-  same binary, same device, same prompt, differ by **+69% on load** (1007 s ->
-  1698 s) and **+30% on generation** (169.3 s -> 220.3 s). The mechanism is
-  visible in the ordering: a cuda leg stages expert banks into device memory and
-  evicts the GGUF page cache, and because this row's tower stays block-resident
-  and re-reads expert blocks from that mmap on EVERY step, the eviction moves
-  generation and not just load. So wall is unusable (86% load, and each cuda leg
-  poisons the next cpu leg), and `secs=` -- the generation-only figure
-  `vllm-cli` prints, which is the right axis -- still carries a 30% spread at
-  n=2. A CPU-against-CUDA ratio from this job would have been substantially an
-  artifact of leg ORDER. The interleaving is what exposed that; one leg per arm
-  would have looked authoritative and been wrong. O6 stands, and this entry says
-  what it would take to move it: many more samples per arm, and a leg order that
-  does not let one arm evict the other's page cache.
+  would have held even if the CUDA legs had survived.** THREE identical cpu legs
+  -- same binary, same device, same prompt, same box, minutes apart:
+
+  | leg | load | `secs=` (generation) |
+  |---|---:|---:|
+  | cpu0 | 1007 s | 169.344 |
+  | cpu1 | 1698 s | 220.332 |
+  | cpu2 | 1866 s | 116.572 |
+
+  **Spread: 69% on wall, 89% on generation.** That is the axis with load removed,
+  on an unchanged binary, and it is within reach of the 127% this fleet has
+  produced before. No CPU-against-CUDA comparison is supportable at this
+  variance, and a ratio from this job would have been mostly an artifact of leg
+  ORDER. The interleaving is what exposed it; one leg per arm would have looked
+  authoritative and been wrong.
+
+  **A MECHANISM WAS ASSERTED AT n=2 AND THE THIRD LEG REFUTED IT, which is
+  recorded because the claim was already published elsewhere before this leg
+  landed.** At n=2 the loads (1007 -> 1698) and the generations (169.3 -> 220.3)
+  both rose, and the tidy explanation was that a cuda leg evicts the GGUF page
+  cache which this block-resident tower re-reads every step, so eviction moved
+  generation as well as load. `cpu2` has the WORST load (1866 s) and the BEST
+  generation (116.6 s). Load does trend upward monotonically across the run,
+  which is consistent with progressive page-cache pressure; **generation does not
+  track it at all**, so the eviction story explains load and explains nothing
+  about generation. What is established is the variance. The mechanism behind the
+  generation spread is NOT established and is not guessed at here.
+
+  O6 stands. What it would take to move it: many more samples per arm, a leg
+  order that does not let one arm evict the other's page cache, and a control for
+  whatever drives an 89% generation spread on an unchanged binary -- which has to
+  be found before any number from this row means anything.
 
 ## Now
 
@@ -5415,9 +5433,10 @@ and the arm fell back to the host mid-model. The base tree produced a clean
 refusal on the same command, so this was a REGRESSION and the default is
 restored byte-for-byte; O46 carries the four legs, the three hypotheses already
 eliminated, and the one that is untested. O47 records the other half of that
-job: two IDENTICAL cpu legs differ by 69% on load and 30% on generation because
-a cuda leg evicts the page cache this block-resident tower re-reads every step,
-so NO speed number was available on any axis and none is claimed.
+job: THREE identical cpu legs spread 69% on wall and 89% on generation, so NO
+speed number was available on any axis and none is claimed. The n=2 mechanism
+this row briefly asserted -- page-cache eviction moving generation -- was
+refuted by the third leg and O47 says so.
 
 **What the device arm IS gated at, which is not nothing:** the CUDA unit gate on
 `dgx:gpu0` ran `test_glm5_next_moe` at 18 cases / 37,317 assertions with the

@@ -659,7 +659,7 @@ enum class Ltx2PhaseLoraScope {
 // WHICH token count the sigma SHIFT is fitted on, for a phase whose schedule is
 // derived rather than frozen.
 //
-// `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+// `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:32` is
 // `tokens = math.prod(latent.shape[2:]) if latent is not None else
 // default_number_of_tokens`. So upstream selects between two anchors by passing
 // a latent or not, and `default_number_of_tokens` is `MAX_SHIFT_ANCHOR` = 4096
@@ -751,7 +751,7 @@ struct Ltx2PhaseRecipe {
 // The second has no branch at all — one loop, one item type. And the two items
 // do different things to the state: `VideoConditionByLatentIndex` REPLACES the
 // clean tokens of latent frame 0 and the token count never changes
-// (latent_cond.py:38-39), while `VideoConditionByKeyframeIndex` APPENDS a latent
+// (latent_cond.py:40-41), while `VideoConditionByKeyframeIndex` APPENDS a latent
 // frame of tokens at the end (keyframe_cond.py:79-82).
 //
 // A RECIPE FIELD RATHER THAN A PHASE ONE, because upstream picks the builder per
@@ -1094,7 +1094,7 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //                                  the derived arms it fits its sigma shift on
 //                                  the 4096 anchor rather than the target grid,
 //                                  because `execute(steps=...)` passes no latent
-//                                  (schedulers.py:31) — see
+//                                  (schedulers.py:32) — see
 //                                  `Ltx2PhaseScheduleTokens`
 //   ("t2a_one_stage",      "2")    Lightricks t2a_one_stage.py:43,109 (row
 //   ("t2a_one_stage",      "2.3")  LTX25-T2A-ONE-STAGE, #1005). The one_stage

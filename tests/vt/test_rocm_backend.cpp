@@ -539,12 +539,18 @@ TEST_CASE("ROCm backend: a pre-warmed GEMM captures and replays") {
   rocm.DestroyQueue(q);
 }
 
+// NO COMMA IN THE NAME BELOW, DELIBERATELY. doctest's -tc filter splits its
+// argument on commas, so a case whose name contains one can never be selected by
+// name: the filter matches nothing, the binary runs zero cases and exits 0, and
+// that reads as a pass. Any mutation run that selects this case by -tc would then
+// be measuring nothing at all.
+//
 // DELIBERATELY LAST IN THIS FILE. It installs the portable reference tier, which
 // makes GetReferenceTierHits() non-zero for the rest of the process, and the
 // native-RmsNorm case above asserts that counter is exactly 0. doctest runs cases
 // in declaration order, so keeping this one at the end is what keeps the two
 // compatible. Do not move it, and do not weaken the absolute assertion above.
-TEST_CASE("the reference tier's flush is REACHED through GetOp, not just callable (#2498)") {
+TEST_CASE("the reference tier's flush is REACHED through GetOp and not merely callable (#2498)") {
   if (NoDevice()) return;
   Backend& rocm = vt::GetBackend(DeviceType::kROCM);
   if (!rocm.UnifiedMemory()) return;

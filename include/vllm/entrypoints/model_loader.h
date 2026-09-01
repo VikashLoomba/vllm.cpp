@@ -566,6 +566,20 @@ class LoadedEngine {
   bool is_pooling_model() const {
     return model_->registration().info.is_pooling_model;
   }
+  // ENG-MM-INPUT-PIPELINE (#2475): the architecture the model registry resolved
+  // this engine's model to, and that architecture's own multimodal declaration.
+  // The OpenAI server's multimodal chat install dispatches on these two, exactly
+  // as upstream reads `get_model_architecture(model_config)` and
+  // `model_config.is_multimodal_model` before it looks up a processor
+  // (vllm/multimodal/registry.py:110,178-180 @ 5559679229bc). The install used
+  // to branch on the presence of `preprocessor_config.json`, which is not an
+  // architecture and gave a second multimodal model Qwen3-VL's processor.
+  std::string_view architecture() const {
+    return model_->registration().architecture;
+  }
+  bool is_multimodal_model() const {
+    return model_->registration().info.supports_multimodal;
+  }
   // Lazily start W2's EngineCoreProc + output-handler threads. Once created,
   // online/server callers use this frontend rather than the synchronous
   // LLMEngine over the same scheduler/executor.

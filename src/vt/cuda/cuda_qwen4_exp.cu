@@ -18,8 +18,8 @@
 //     injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
 //     hidden_states = hyper_input + injection.flatten(-2)
 //
-// vLLM has never registered `qwen4_exp` at any revision, so there is no vLLM
-// kernel to mirror; the KERNEL STRUCTURE (self-registering TU, `Check`,
+// SUPERSEDED 2026-08-31 (#2489): `nvidia/ops/hc.py` at `e126687a9a` is the vLLM
+// kernel to mirror, beyond our pin. The KERNEL STRUCTURE (self-registering TU,
 // `AsStream`, `GridFor`, grid-stride loop, one `Check(cudaGetLastError(), ...)`
 // per launch site) is mirrored from `src/vt/cuda/cuda_layernorm.cu` and
 // `src/vt/cuda/cuda_ops.cu`'s `MulScalarKernel`, which is this tree's template

@@ -2981,6 +2981,35 @@ implements `glm5_next` at no revision (O38, §Oracles), so the only comparison
 available is our CUDA arm against our CPU arm on one box. Any number below is
 labelled that way or it is wrong.
 
+**THE OPERAND IS RE-MEASURED ON THIS BRANCH'S BASE, and O30's figure could not
+be reused.** O30's ` Paris.` at 195.5 s/token was taken at `d84db105b`, which is
+NOT an ancestor of `839ea1ced`. Job `3095a43b` on `dgx:gpu0`, 2026-09-01, over a
+tree byte-identical to this branch's base (`TREE_SHA 4cf473bef`), at the prompt
+`The capital of France is` with `--max-tokens 2 --temperature 0`:
+
+| leg | tree | device | rc | wall | `VmHWM` | output |
+|---|---|---|---:|---:|---:|---|
+| A | pre-W5b-2d `glm5_next_kv` | cpu | 1 | 1095 s | 91.42 GiB | throws the #2445 binding error |
+| B | base (`839ea1ced`) | cpu | 0 | 1290 s | 100.68 GiB | ` Paris.` |
+
+**Leg A settles a question #2445 explicitly declined to guess: the binding
+defect was never device-specific.** It reproduces identically on `--device cpu`.
+
+**And the two legs together separate LOAD from COMPUTE, which no single leg
+can.** The two binaries differ only in `glm5_next_kv.{h,cpp}`, so the load path
+is identical, and leg A throws in the first forward's KV binding BEFORE any
+arithmetic. So 1095 s is load and engine init, and the remaining **195 s** is
+the whole of a 5-token prefill plus 2 decode steps. Load is therefore **85% of
+wall**, and the per-token cost is at most 97.5 s and is NOT separable from the
+prefill by these two legs.
+
+**That has a consequence for the device benchmark this section owes, and it is
+written down before the numbers exist so they cannot be read the lazy way.** A
+CUDA-against-CPU comparison of TOTAL WALL on this model is 85% a measurement of
+GGUF load from a CIFS share. Load is common to both arms, so the DIFFERENCE
+between legs carries the signal and the RATIO does not. Report the difference,
+and report it against the interleaved spread rather than one leg per arm.
+
 **Evidence, measured on `c4df6dcee` (base `839ea1ced`).**
 
 Green on x86_64: `test_glm5_next_moe` **18 cases / 12,731 assertions** (13 /

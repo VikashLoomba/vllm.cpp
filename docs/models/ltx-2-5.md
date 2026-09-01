@@ -252,9 +252,17 @@ loader refuses a config beside a checkpoint that already declares one.
 Declare the checkpoint family with `--checkpoint-class`: use `full` for the
 development transformer, `distilled` for the distilled transformer, and
 `keyframe_slot_sft` for that specialized arm. Every pipeline except `dmd2`
-requires a declaration. The loader checks it against the checkpoint rather than
-using it as an unchecked hint, and refuses a missing or mismatched class before
-generation.
+requires a declaration, and the loader refuses a missing, unknown or
+pipeline-mismatched class before generation.
+
+It is a declaration, not a check against the file. The loader compares what you
+declare with the class the selected pipeline needs; it cannot compare it with the
+checkpoint, because nothing in a checkpoint header separates the classes. The
+full and the distilled bf16 transformers are the same size and their safetensors
+headers agree on every tensor name, dtype, shape, offset and metadata value.
+Declaring a class the file does not hold is therefore undetectable here, and it
+renders a clip of the requested size in a sampling regime the weights were never
+trained for. The refusal quotes that measurement when it fires.
 
 ## Where video VAE decode runs
 

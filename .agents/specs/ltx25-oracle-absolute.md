@@ -436,16 +436,56 @@ Stop and report, do not work around:
   that flatters us, and passed. `OneStagePhase` (`ltx2_pipeline.cpp:1124-1147`)
   sets no sigmas and `OneStageRecipe` (`:1149-1163`) never assigns
   `allow_request_sigmas`, so `one_stage` takes the branch that reads `steps`.
-- **Five line anchors into `examples/ltx2_gen/main.cpp` are now STALE and cannot
-  be repaired, because they live in the append-only issue index.** Adding
-  `--steps` moved that file's later lines by +12, and
-  `.agents/issue-index.md` rows 324, 325, 356, 373 and **821** cite it by line.
-  Row 821 is this row's own #2130 entry, so one of the five is mine: the guidance
+- **Five line anchors into `examples/ltx2_gen/main.cpp` are STALE and cannot be
+  repaired in the index.** Adding `--steps` moved that file's later lines by
+  +12, and the index rows for #1096, #1097, #1151, #1191 and this row's own
+  #2130 all cite it by line. One of the five is mine: the guidance
   `never-cite-a-line-number-in-an-append-only-file` names exactly this, and I
-  wrote a line number into an append-only row anyway. AGENTS.md forbids editing a
-  row, so the correction lives here instead: **`tools/oracle/ltx2_oracle.py:88` in
-  that row should read `:89`**, and its `examples/ltx2_gen/main.cpp:306-451`
-  should read `:318-476`. Owner: this row.
+  wrote a line number into an append-only row anyway. The correction lives here
+  instead: **`tools/oracle/ltx2_oracle.py:88` in that row should read `:89`**,
+  and its `examples/ltx2_gen/main.cpp:306-451` should read `:318-476`.
+  Owner: this row.
+
+  **RE-RESOLVED 2026-09-01 by row `LTX25-ANCHOR-REPAIR`**, spec
+  [`ltx25-anchor-repair.md`](ltx25-anchor-repair.md) §4 and §5. The paragraph
+  above is wrong in ONE place: its REASON. Both of its line numbers hold.
+
+  1. **The reason it cannot be repaired changed.** `.agents/issue-index.md` was
+     RETIRED; the index is derived at read time by
+     `scripts/agent-issue-index.py --refresh` and the old file moved to
+     `.agents/completed/issue-index.md`. The rows are unreachable because that
+     directory is the FROZEN ARCHIVE, whose provenance AGENTS.md `## Records`
+     keeps and which `check-symbol-anchors.py` skips by prefix -- not because a
+     live append-only rule forbids the edit. The conclusion holds under the new
+     rule too, and the row NUMBERS are dropped above because a row number in a
+     retired file is itself an anchor into a moving document; the five rows are
+     named by their issue instead.
+  2. **NEITHER correction has expired.** Both were re-resolved at `855905f59`.
+     `tools/oracle/ltx2_oracle.py:89` still reads `NUM_INFERENCE_STEPS = 8`.
+     `examples/ltx2_gen/main.cpp:318-476` still covers the flag loop exactly:
+     `:318` is the file's only `for (int i = 1; i < argc; ++i)`, `:476` is its
+     closing brace, and `:477` is `if (mp.dit_path == nullptr) Usage(2);`, which
+     is outside it. `--steps` is at `:461` and `--seed` at `:464`, both inside
+     the range. An earlier draft of `LTX25-ANCHOR-REPAIR` asserted that the loop
+     now ran past `:490` and that this correction had rotted; that assertion was
+     FALSE -- `:490` is a post-parse assignment to `vp.last_frame` -- and it is
+     withdrawn here rather than left standing, because a row about stale anchors
+     read as evidence must not leave a fresh anchor recorded as stale. All four
+     numbers are stamped with the tree they were read on, because a coordinate
+     written to explain why coordinates rot would otherwise rot in the same
+     paragraph.
+
+  The `main.cpp` correction is nonetheless restated in a form that cannot expire,
+  which is an IMPROVEMENT rather than a repair and is labelled as one. What
+  #2130's row was pointing at is the argument loop of
+  `examples/ltx2_gen/main.cpp::main`, whose flag cases are greppable by their own
+  literals: `git grep -n '"--steps"' examples/ltx2_gen/` returns exactly ONE
+  line, the assignment to `vp.steps`. Uniqueness is the property asserted, not
+  existence -- AGENTS.md asks for the first and a line number gives neither. A
+  reader following the row wants the flag, not a coordinate, and the flag string
+  survives every insertion above it. That grep is prose and no gate checks it;
+  `ltx25-anchor-repair.md` §8 says so, and says which of that row's two symbol
+  anchors a gate can actually falsify.
 - **[#1854](https://github.com/mudler/vllm.cpp/issues/1854) sub-question 1,
   prompt adherence, stays OPEN and is not narrowed by this row.** It needs a
   vision-language model scoring frames against the prompt, with its own

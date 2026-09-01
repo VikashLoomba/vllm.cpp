@@ -136,3 +136,33 @@ TEST_CASE("W2: staging is idempotent, so a per-forward call costs one predicate"
   CHECK(vllm::StageDeepseekV4Exl3TowerToDevice(cpu.q, w.exl3) == 0);
   CHECK(vllm::StageDeepseekV4Exl3TowerToDevice(cpu.q, w.exl3) == 0);
 }
+
+// ─── #2458: the fused arm's device default ───────────────────────────────────
+//
+// `vt::Exl3MoeMlp` faults on a device queue and the per-expert loop arm on the
+// same queue is bit-exact against the CPU arm, so the fused arm is off BY
+// DEFAULT on a device queue and unchanged on the host arm it is correct on.
+// That needs a predicate the default-ON flag cannot express: absence and consent
+// are the same value to `Dsv4Exl3FusedMoeFlagIsOn`.
+TEST_CASE("W2/#2458: 'explicitly asked for the fused arm' is not 'did not say no'") {
+  // The DEFAULT flag: silence and every non-'0' value read as ON. This is what
+  // keeps the host arm byte-identical.
+  CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn(nullptr));
+  CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn("1"));
+  CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn("yes"));
+  CHECK_FALSE(vllm::Dsv4Exl3FusedMoeFlagIsOn("0"));
+
+  // The FORCED flag: only an explicit '1'. Silence must NOT read as consent,
+  // because silence is the default path and the default path is the one the
+  // faulting kernel is off on.
+  CHECK_FALSE(vllm::Dsv4Exl3FusedMoeForcedOnFlag(nullptr));
+  CHECK_FALSE(vllm::Dsv4Exl3FusedMoeForcedOnFlag("0"));
+  CHECK_FALSE(vllm::Dsv4Exl3FusedMoeForcedOnFlag("yes"));
+  CHECK(vllm::Dsv4Exl3FusedMoeForcedOnFlag("1"));
+
+  // THE DISTINCTION ITSELF, stated as a property rather than as four more
+  // literals: the two predicates must disagree on silence. If a later edit made
+  // `ForcedOn` merely "not '0'", every case above still passes except this one.
+  CHECK(vllm::Dsv4Exl3FusedMoeFlagIsOn(nullptr) !=
+        vllm::Dsv4Exl3FusedMoeForcedOnFlag(nullptr));
+}

@@ -62,6 +62,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>  // W9c-3b: the shadow backend's memcpy/memset
 #include <limits>
 #include <memory>
 #include <string>
@@ -71,6 +72,7 @@
 #include "support/glm5_next_gguf_fixture.h"
 #include "vllm/model_executor/models/glm5_next_bridge.h"
 #include "vllm/model_executor/models/glm5_next_forward.h"
+#include "vllm/model_executor/models/glm5_next_kv.h"  // W9c-3b (#2480)
 #include "vllm/model_executor/models/glm5_next_layer.h"
 #include "vllm/model_executor/models/glm5_next_loader.h"
 #include "vllm/model_executor/models/glm5_next_moe.h"
@@ -1429,4 +1431,356 @@ TEST_CASE("glm5_next W5b-2c: ModelRegistry::Forward NARROWS its refusal, not dro
   const vllm::ModelRegistration& kimi = vllm::ModelRegistry::Resolve(kimi_archs);
   REQUIRE(kimi.factory != nullptr);
   CHECK_FALSE(kimi.factory->consumes_multi_kv);
+}
+
+// ─── W9c-3b (#2480): THE ENGINE'S PAGES ARE NOT ALWAYS HOST MEMORY ───────────
+//
+// WHAT WENT WRONG AND WHY NOTHING SAW IT. Every case above hands this model a
+// CPU queue, and on a CPU queue `GPUModelRunner::CacheBuffer` keeps its pages in
+// a `std::vector<uint8_t>` (`v1/worker/gpu/runner.cpp:575-593`). On any other
+// queue `kv_cache_backend_resident_` is true (`:1119-1122`) and every paged
+// cache and every recurrent state is a `vt::Alloc` allocation -- `cudaMalloc` on
+// CUDA, which is NOT host-dereferenceable even on GB10
+// (`src/vt/cuda/cuda_backend.cu:354-391`, held by a `static_assert` that names
+// #844 and #1435 as the same fault twice already).
+//
+// `glm5_next_kv.cpp` read and wrote those pages with plain host loops, so a
+// `--device cuda` step was a host store into device memory. `LoadCaches` returns
+// before touching a page on a fresh sequence, so the first such access on step 1
+// is inside `StoreCaches`, AFTER the whole forward has returned -- which is why
+// the three legs in spec O46 died with SIGSEGV having emitted no token, and why
+// the last two lines on their stderr were the MoE arm's two once-flags. O49
+// carries the bisect.
+//
+// WHAT THIS CASE MEASURES, AND WHY IT IS NOT A CRASH TEST. A test binary cannot
+// hold a `cudaMalloc` pointer, and a SIGSEGV is not an assertion. `ShadowBackend`
+// is the next-strongest thing and is deterministic on every platform: the
+// pointer `Alloc` hands back is a DECOY filled with a poison pattern, and the
+// real storage lives in a side block only `Copy` can reach. Code that
+// dereferences the pointer therefore reads poison and writes where nothing will
+// ever look, and code that goes through the backend is correct -- which is
+// exactly the distinction the defect is, with the fault turned into a value.
+namespace {
+
+class ShadowBackend final : public vt::Backend {
+ public:
+  void* Alloc(size_t bytes) override {
+    const size_t n = bytes == 0 ? 1 : bytes;
+    auto block = std::make_unique<Block>();
+    block->decoy.assign(n, kPoison);
+    block->shadow.assign(n, 0);
+    void* p = block->decoy.data();
+    blocks_.push_back(std::move(block));
+    ++allocs;
+    return p;
+  }
+  void Free(void*) override {}
+  void Memset(vt::Queue&, void* p, int v, size_t bytes) override {
+    uint8_t* dst = Translate(p, bytes);
+    std::memset(dst, v, bytes);
+  }
+  void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
+    ++copies;
+    uint8_t* d = Translate(dst, bytes);
+    const uint8_t* s = Translate(const_cast<void*>(src), bytes);
+    std::memcpy(d, s, bytes);
+  }
+  vt::Queue CreateQueue() override {
+    return vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  }
+  void DestroyQueue(vt::Queue&) override {}
+  // The GB10 CUDA backend's own two answers (`cuda_backend.cu:113` and the
+  // inherited default): one physical RAM, and still not host-dereferenceable.
+  bool UnifiedMemory() const override { return true; }
+  bool DeviceMemoryIsHostAddressable() const override { return false; }
+
+  // Is `p` a byte a HOST loop would have had to fault on? Used by the case to
+  // read the shadow without going through `Copy` twice.
+  const uint8_t* ShadowOf(const void* p, size_t bytes) const {
+    for (const std::unique_ptr<Block>& b : blocks_) {
+      const uint8_t* base = b->decoy.data();
+      const auto* q = static_cast<const uint8_t*>(p);
+      if (q >= base && q + bytes <= base + b->decoy.size())
+        return b->shadow.data() + (q - base);
+    }
+    return nullptr;
+  }
+
+  static constexpr uint8_t kPoison = 0xDD;
+  int allocs = 0;
+  int copies = 0;
+
+ private:
+  struct Block {
+    std::vector<uint8_t> decoy;
+    std::vector<uint8_t> shadow;
+  };
+  // A pointer into one of our decoys resolves to the SAME offset in its shadow;
+  // anything else is an ordinary host buffer and is used as it is.
+  uint8_t* Translate(void* p, size_t bytes) {
+    for (const std::unique_ptr<Block>& b : blocks_) {
+      uint8_t* base = b->decoy.data();
+      auto* q = static_cast<uint8_t*>(p);
+      if (q >= base && q + bytes <= base + b->decoy.size())
+        return b->shadow.data() + (q - base);
+    }
+    return static_cast<uint8_t*>(p);
+  }
+  std::vector<std::unique_ptr<Block>> blocks_;
+};
+
+ShadowBackend& Shadow() {
+  static ShadowBackend b;
+  return b;
+}
+
+struct ShadowRegistrar {
+  ShadowRegistrar() {
+    vt::RegisterBackend(vt::Device{vt::DeviceType::kXPU, 0}, &Shadow());
+  }
+};
+const ShadowRegistrar kShadowRegistrar;
+
+// A `Topology` whose every page and every recurrent state has been re-homed
+// onto the shadow backend, with the sizes and the block permutation unchanged.
+// The `vt::Tensor` device tags move with them, because a state that says kCPU
+// while its bytes are on a device is the lie this whole case is about.
+struct ShadowTopology {
+  Topology t;
+  ShadowTopology() {
+    for (size_t i = 0; i < t.attn_kv.size(); ++i) {
+      const size_t n = t.attn_bytes[i].size();
+      t.attn_kv[i].data = Shadow().Alloc(n);
+    }
+    for (size_t j = 0; j < t.gdn.size(); ++j) {
+      t.gdn[j].conv_state.data = Shadow().Alloc(t.conv_bytes[j].size());
+      t.gdn[j].conv_state.device = vt::Device{vt::DeviceType::kXPU, 0};
+      t.gdn[j].ssm_state.data = Shadow().Alloc(t.ssm_bytes[j].size());
+      t.gdn[j].ssm_state.device = vt::Device{vt::DeviceType::kXPU, 0};
+      t.gdn[j].states = {t.gdn[j].conv_state, t.gdn[j].ssm_state};
+    }
+    // NOT `Publish()`: that re-points `attn_kv[i].data` back at the host
+    // vectors, which would silently undo this whole fixture.
+    t.mk.layer_names = &t.names;
+    t.mk.group_ids = &t.group_ids;
+    t.mk.layer_indices = &t.layer_indices;
+    t.mk.payload_kinds = &t.payload_kinds;
+    t.mk.payload_slots = &t.payload_slots;
+    t.mk.group_block_tables = &t.group_bt;
+    t.mk.group_block_table_cols = &t.group_cols;
+  }
+};
+
+// Read `n` f32 values out of the SHADOW at element offset `first`. Deliberately
+// not `Copy`: a case that read the storage the same way the code under test does
+// would pass whenever the two agreed, including when both were the decoy.
+std::vector<float> ShadowFloats(const void* base, int64_t first, int64_t n) {
+  const auto* p = static_cast<const uint8_t*>(base) +
+                  static_cast<size_t>(first) * sizeof(float);
+  const uint8_t* s = Shadow().ShadowOf(p, static_cast<size_t>(n) * sizeof(float));
+  REQUIRE(s != nullptr);
+  std::vector<float> out(static_cast<size_t>(n));
+  std::memcpy(out.data(), s, out.size() * sizeof(float));
+  return out;
+}
+
+// A deterministic, non-constant pattern. Constant fill would pass against a
+// zeroed shadow for the zero value and against poison for nothing, so the values
+// are spread and none of them is 0.
+float Pattern(int64_t tag, int64_t i) {
+  return 1.0F + static_cast<float>(tag) * 0.125F + static_cast<float>(i) * 0.03125F;
+}
+
+}  // namespace
+
+TEST_CASE("glm5_next W9c-3b: the KV binding COPIES the engine's pages instead "
+          "of dereferencing them") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  REQUIRE(model != nullptr);
+  const vllm::Glm5NextParams& p = Weights(model).params;
+  REQUIRE(p.num_hidden_layers == kLayers);
+
+  ShadowTopology pages;
+  const int64_t latent_row = Topology::LatentRow();
+  const int64_t indexer_row = Topology::IndexerRow();
+  const int64_t conv_elems = Topology::ConvElems();
+  const int64_t rec_elems = Topology::RecElems();
+  constexpr int64_t kNewTokens = 2;
+
+  Step s1({1, 2});
+  s1.queue = vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  s1.Bind(pages.t);
+  const vllm::ModelForwardInput in1 = s1.Get();
+  const gn::KvBinding b1 = gn::ResolveKvBinding(p, in1);
+  REQUIRE(b1.cached_len == 0);
+  REQUIRE(b1.new_tokens == kNewTokens);
+
+  // A fresh sequence reads NOTHING, so this call must not touch a page at all.
+  std::vector<gn::LayerCache> caches;
+  gn::LoadCaches(p, b1, in1, &caches);
+  REQUIRE(caches.size() == static_cast<size_t>(kLayers));
+
+  // Fill the states the forward would have produced. The VALUES are the point:
+  // they have to arrive in the shadow, at the offsets the block permutation
+  // puts them at, or the write went to the decoy.
+  for (int64_t l = 0; l < kLayers; ++l) {
+    gn::LayerCache& c = caches[static_cast<size_t>(l)];
+    if (l == Topology::kDsaLayer) {
+      c.dsa.cached_len = kNewTokens;
+      c.dsa.k_pass.resize(static_cast<size_t>(kNewTokens * latent_row));
+      for (size_t i = 0; i < c.dsa.k_pass.size(); ++i)
+        c.dsa.k_pass[i] = Pattern(l, static_cast<int64_t>(i));
+      c.dsa.indexer_packed.resize(static_cast<size_t>(kNewTokens * indexer_row));
+      for (size_t i = 0; i < c.dsa.indexer_packed.size(); ++i)
+        c.dsa.indexer_packed[i] = Pattern(l + 64, static_cast<int64_t>(i));
+      continue;
+    }
+    c.kda.assign(1, vllm::glm5_next_kda::Glm5NextKdaCache{});
+    c.kda[0].conv_state.resize(static_cast<size_t>(conv_elems));
+    for (size_t i = 0; i < c.kda[0].conv_state.size(); ++i)
+      c.kda[0].conv_state[i] = Pattern(l + 128, static_cast<int64_t>(i));
+    c.kda[0].recurrent_state.resize(static_cast<size_t>(rec_elems));
+    for (size_t i = 0; i < c.kda[0].recurrent_state.size(); ++i)
+      c.kda[0].recurrent_state[i] = Pattern(l + 192, static_cast<int64_t>(i));
+  }
+
+  const int copies_before = Shadow().copies;
+  gn::StoreCaches(p, b1, caches, in1);
+  // The write went through the backend at all. Necessary, never sufficient --
+  // the value checks below are what say it went to the right place.
+  CHECK(Shadow().copies > copies_before);
+
+  // (1) THE PAGED ROWS. Read out of the SHADOW, at the flat slot the gathered
+  // block table maps each logical position to, so an implementation that
+  // addressed page `p` at block `p` lands on the wrong row rather than passing.
+  const gn::LayerKvBinding& lb =
+      b1.layers[static_cast<size_t>(Topology::kDsaLayer)];
+  const void* lat = in1.attn_kv[static_cast<size_t>(lb.latent)].data;
+  const void* ix = in1.attn_kv[static_cast<size_t>(lb.indexer)].data;
+  for (int64_t t = 0; t < kNewTokens; ++t) {
+    const std::vector<float> got =
+        ShadowFloats(lat, Topology::Slot(t) * latent_row, latent_row);
+    for (int64_t i = 0; i < latent_row; ++i) {
+      CHECK(got[static_cast<size_t>(i)] ==
+            doctest::Approx(Pattern(Topology::kDsaLayer, t * latent_row + i)));
+    }
+    const std::vector<float> gix =
+        ShadowFloats(ix, Topology::Slot(t) * indexer_row, indexer_row);
+    for (int64_t i = 0; i < indexer_row; ++i) {
+      CHECK(gix[static_cast<size_t>(i)] ==
+            doctest::Approx(Pattern(Topology::kDsaLayer + 64, t * indexer_row + i)));
+    }
+  }
+
+  // (2) THE RECURRENT STATES, which are the FIRST thing `StoreCaches` writes on
+  // this model and therefore the byte the three `dgx:gpu0` legs died on.
+  for (int64_t l = 0; l < kLayers; ++l) {
+    if (l == Topology::kDsaLayer) continue;
+    const gn::LayerKvBinding& rb = b1.layers[static_cast<size_t>(l)];
+    const vllm::GdnStateCache& gs =
+        in1.gdn_state[static_cast<size_t>(rb.recurrent)];
+    const std::vector<float> conv = ShadowFloats(gs.conv_state.data, 0, conv_elems);
+    for (int64_t i = 0; i < conv_elems; ++i) {
+      CHECK(conv[static_cast<size_t>(i)] == doctest::Approx(Pattern(l + 128, i)));
+    }
+    const std::vector<float> rec = ShadowFloats(gs.ssm_state.data, 0, rec_elems);
+    for (int64_t i = 0; i < rec_elems; ++i) {
+      CHECK(rec[static_cast<size_t>(i)] == doctest::Approx(Pattern(l + 192, i)));
+    }
+  }
+
+  // (3) THE READ DIRECTION, on a second step that has history. The decoy still
+  // holds nothing but poison, so a `LoadCaches` that dereferenced the page would
+  // hydrate every state from 0xDDDDDDDD instead of from what step 1 stored.
+  Step s2({3}, {}, kNewTokens);
+  s2.queue = vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  s2.Bind(pages.t);
+  const vllm::ModelForwardInput in2 = s2.Get();
+  const gn::KvBinding b2 = gn::ResolveKvBinding(p, in2);
+  REQUIRE(b2.cached_len == kNewTokens);
+  std::vector<gn::LayerCache> back;
+  gn::LoadCaches(p, b2, in2, &back);
+  REQUIRE(back.size() == static_cast<size_t>(kLayers));
+
+  const gn::LayerCache& dsa = back[static_cast<size_t>(Topology::kDsaLayer)];
+  REQUIRE(dsa.dsa.k_pass.size() ==
+          static_cast<size_t>(kNewTokens * latent_row));
+  for (size_t i = 0; i < dsa.dsa.k_pass.size(); ++i) {
+    CHECK(dsa.dsa.k_pass[i] ==
+          doctest::Approx(Pattern(Topology::kDsaLayer, static_cast<int64_t>(i))));
+  }
+  REQUIRE(dsa.dsa.indexer_packed.size() ==
+          static_cast<size_t>(kNewTokens * indexer_row));
+  for (size_t i = 0; i < dsa.dsa.indexer_packed.size(); ++i) {
+    CHECK(dsa.dsa.indexer_packed[i] ==
+          doctest::Approx(Pattern(Topology::kDsaLayer + 64,
+                                  static_cast<int64_t>(i))));
+  }
+  for (int64_t l = 0; l < kLayers; ++l) {
+    if (l == Topology::kDsaLayer) continue;
+    const gn::LayerCache& c = back[static_cast<size_t>(l)];
+    REQUIRE(c.kda.size() == 1);
+    REQUIRE(c.kda[0].conv_state.size() == static_cast<size_t>(conv_elems));
+    for (size_t i = 0; i < c.kda[0].conv_state.size(); ++i) {
+      CHECK(c.kda[0].conv_state[i] ==
+            doctest::Approx(Pattern(l + 128, static_cast<int64_t>(i))));
+    }
+    REQUIRE(c.kda[0].recurrent_state.size() == static_cast<size_t>(rec_elems));
+    for (size_t i = 0; i < c.kda[0].recurrent_state.size(); ++i) {
+      CHECK(c.kda[0].recurrent_state[i] ==
+            doctest::Approx(Pattern(l + 192, static_cast<int64_t>(i))));
+    }
+  }
+}
+
+TEST_CASE("glm5_next W9c-3b: a CPU queue keeps the DIRECT path, byte-for-byte") {
+  // The other half of the discriminator. The bounce must be selected by the
+  // QUEUE and by nothing else, so on a CPU queue the pages are written in place
+  // and `ShadowBackend::Copy` is never reached -- which is also what keeps every
+  // `--device cpu` run unchanged by this wave.
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  const vllm::Glm5NextParams& p = Weights(model).params;
+
+  Topology host;
+  Step s({1, 2});
+  s.Bind(host);
+  const vllm::ModelForwardInput in = s.Get();
+  const gn::KvBinding b = gn::ResolveKvBinding(p, in);
+  std::vector<gn::LayerCache> caches;
+  gn::LoadCaches(p, b, in, &caches);
+  const int64_t latent_row = Topology::LatentRow();
+  gn::LayerCache& c = caches[static_cast<size_t>(Topology::kDsaLayer)];
+  c.dsa.cached_len = 2;
+  c.dsa.k_pass.assign(static_cast<size_t>(2 * latent_row), 0.0F);
+  for (size_t i = 0; i < c.dsa.k_pass.size(); ++i)
+    c.dsa.k_pass[i] = Pattern(7, static_cast<int64_t>(i));
+  c.dsa.indexer_packed.assign(
+      static_cast<size_t>(2 * Topology::IndexerRow()), 0.5F);
+  for (int64_t l = 0; l < kLayers; ++l) {
+    if (l == Topology::kDsaLayer) continue;
+    gn::LayerCache& k = caches[static_cast<size_t>(l)];
+    k.kda.assign(1, vllm::glm5_next_kda::Glm5NextKdaCache{});
+    k.kda[0].conv_state.assign(static_cast<size_t>(Topology::ConvElems()), 0.25F);
+    k.kda[0].recurrent_state.assign(static_cast<size_t>(Topology::RecElems()), 0.75F);
+  }
+  const int copies_before = Shadow().copies;
+  gn::StoreCaches(p, b, caches, in);
+  CHECK(Shadow().copies == copies_before);
+
+  // And the bytes landed in the topology's OWN host vectors, at the permuted
+  // slot, so "no backend" did not become "no write".
+  const gn::LayerKvBinding& lb =
+      b.layers[static_cast<size_t>(Topology::kDsaLayer)];
+  const auto* lat = static_cast<const float*>(
+      in.attn_kv[static_cast<size_t>(lb.latent)].data);
+  for (int64_t t = 0; t < 2; ++t) {
+    for (int64_t i = 0; i < latent_row; ++i) {
+      CHECK(lat[Topology::Slot(t) * latent_row + i] ==
+            doctest::Approx(Pattern(7, t * latent_row + i)));
+    }
+  }
 }

@@ -4,6 +4,7 @@
 #include "vllm/model_executor/models/glm5_next_kv.h"
 
 #include <cstdint>
+#include <cstring>  // std::memcpy, the CPU-queue arm of PageIo
 #include <stdexcept>
 #include <string>
 #include <utility>  // std::pair, in the per-cache geometry loop
@@ -12,6 +13,7 @@
 #include "vllm/model_executor/models/glm5_next_attn.h"  // IndexerRoleFor
 #include "vllm/v1/attention/backend.h"                  // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"        // GDNAttentionMetadata
+#include "vt/backend.h"  // vt::Backend, vt::TryGetBackend — W9c-3b (#2480)
 #include "vt/dtype.h"
 
 namespace vllm::glm5_next {
@@ -64,33 +66,111 @@ std::string ChannelSummary(const MultiKvCacheIndex& mk) {
   return s;
 }
 
-// Read one element of a paged buffer. `kAuto` fp8 means the dtype IS the
-// storage type; anything else is refused before this is reached.
-float ReadElem(const PagedKvCache& kv, int64_t i) {
-  if (kv.dtype == vt::DType::kF32)
-    return static_cast<const float*>(kv.data)[i];
-  return vt::BF16ToF32(static_cast<const uint16_t*>(kv.data)[i]);
+// Read one element out of a HOST-side span of `dt` storage. `kAuto` fp8 means
+// the dtype IS the storage type; anything else is refused before this is
+// reached.
+//
+// W9c-3b (#2480): these four take a raw host pointer rather than the
+// `PagedKvCache` or the `vt::Tensor`, because the buffer they address is no
+// longer necessarily the engine's own. On a device queue it is the staging span
+// `PageIo` below filled, and giving these functions the cache would let a
+// future edit reach past the staging and dereference the engine's pointer again
+// -- which is the whole defect.
+float ReadSpanElem(const void* host, vt::DType dt, int64_t i) {
+  if (dt == vt::DType::kF32) return static_cast<const float*>(host)[i];
+  return vt::BF16ToF32(static_cast<const uint16_t*>(host)[i]);
 }
 
-void WriteElem(const PagedKvCache& kv, int64_t i, float v) {
-  if (kv.dtype == vt::DType::kF32) {
-    static_cast<float*>(kv.data)[i] = v;
+void WriteSpanElem(void* host, vt::DType dt, int64_t i, float v) {
+  if (dt == vt::DType::kF32) {
+    static_cast<float*>(host)[i] = v;
     return;
   }
-  static_cast<uint16_t*>(kv.data)[i] = vt::F32ToBF16(v);
+  static_cast<uint16_t*>(host)[i] = vt::F32ToBF16(v);
 }
 
-float ReadTensorElem(const vt::Tensor& t, int64_t i) {
-  if (t.dtype == vt::DType::kF32) return t.Ptr<float>()[i];
-  return vt::BF16ToF32(t.Ptr<uint16_t>()[i]);
-}
-
-void WriteTensorElem(const vt::Tensor& t, int64_t i, float v) {
-  if (t.dtype == vt::DType::kF32) {
-    t.Ptr<float>()[i] = v;
-    return;
+// ─── W9c-3b (#2480): THE ENGINE'S PAGES ARE NOT ALWAYS HOST MEMORY ───────────
+//
+// EVERY reader and writer in this file used to dereference `PagedKvCache::data`
+// and `GdnStateCache`'s tensors directly, and on `--device cuda` those are
+// `cudaMalloc` pointers. `GPUModelRunner::initialize_kv_cache` resolves
+// `kv_cache_backend_resident_` from `!platform.is_cpu()`
+// (`v1/worker/gpu/runner.cpp:1119-1122`) and `CacheBuffer` then allocates every
+// paged cache and every recurrent state through `vt::Alloc(device, ...)`
+// (`:575-593`); a `cudaMalloc` pointer is NOT host-dereferenceable, on GB10
+// included, and `src/vt/cuda/cuda_backend.cu:354-391` holds CUDA to
+// `DeviceMemoryIsHostAddressable() == false` with a `static_assert` naming #844
+// and #1435 as the two SIGSEGVs that came from believing otherwise.
+//
+// So this was a host store into device memory, and it is why `--device cuda`
+// died with SIGSEGV after a forward that had already completed: `LoadCaches`
+// returns before touching a page on a fresh sequence, so the FIRST such access
+// on step 1 is in `StoreCaches`, after the whole stack has run and before any
+// token is emitted. Spec `## Owed` O49 carries the bisect and falsifies O46's
+// mixed-residency reading of the same evidence.
+//
+// COPY THE SPAN, DO NOT ASK WHERE IT LIVES. `vt::Backend::Copy` is
+// direction-agnostic on CUDA (`cudaMemcpyAsync` with `cudaMemcpyDefault`,
+// `cuda_backend.cu:116-118`), so one path is correct whether the pages are
+// device memory or host memory. That is deliberate and it is what keeps this
+// file from re-deriving the runner's residency policy: `VT_DEVICE_KV_CACHE=0`
+// moves the pages back to the host and needs no branch here.
+//
+// A CPU QUEUE KEEPS THE DIRECT PATH, byte-for-byte. There is no backend to ask
+// and the host IS the device, so every `--device cpu` run copies exactly the
+// bytes it copied before, through `std::memcpy` rather than through a backend.
+class PageIo {
+ public:
+  explicit PageIo(vt::Queue& q) : q_(q) {
+    if (q.device.type == vt::DeviceType::kCPU) return;
+    b_ = vt::TryGetBackend(q.device);
+    if (b_ == nullptr) {
+      Fail("this step arrived on a non-CPU queue whose backend is not "
+           "registered in this build, so the engine's KV pages cannot be "
+           "staged to the host. Every reader and writer of a cache on this "
+           "model's forward is a host loop, and the runner allocates those "
+           "pages on the queue's device.");
+    }
   }
-  t.Ptr<uint16_t>()[i] = vt::F32ToBF16(v);
+
+  // `bytes` from `base + byte_off` into the host buffer `dst`.
+  void Read(const void* base, size_t byte_off, size_t bytes, void* dst) {
+    const uint8_t* src = static_cast<const uint8_t*>(base) + byte_off;
+    if (b_ == nullptr) {
+      std::memcpy(dst, src, bytes);
+      return;
+    }
+    b_->Copy(q_, dst, src, bytes);
+    // SYNCHRONISE ON EVERY SPAN, not once at the end. `Copy` is asynchronous on
+    // this queue and the staging buffer is REUSED by the next span, so a
+    // deferred wait would read one row while the driver is still writing the
+    // one before it -- and would hand the driver a pageable source that the
+    // next iteration has already overwritten.
+    b_->Synchronize(q_);
+  }
+
+  // `bytes` from the host buffer `src` into `base + byte_off`.
+  void Write(void* base, size_t byte_off, size_t bytes, const void* src) {
+    uint8_t* dst = static_cast<uint8_t*>(base) + byte_off;
+    if (b_ == nullptr) {
+      std::memcpy(dst, src, bytes);
+      return;
+    }
+    b_->Copy(q_, dst, src, bytes);
+    b_->Synchronize(q_);
+  }
+
+ private:
+  vt::Queue& q_;
+  vt::Backend* b_ = nullptr;
+};
+
+// The host staging buffer for one span, grown to fit and never shrunk. One per
+// `LoadCaches` / `StoreCaches` call, so the largest span a step touches is the
+// whole cost.
+uint8_t* Staging(std::vector<uint8_t>* buf, size_t bytes) {
+  if (buf->size() < bytes) buf->resize(bytes);
+  return buf->data();
 }
 
 // Every storage type this row can address. A quantized or fp8 page is refused
@@ -532,6 +612,12 @@ void LoadCaches(const Glm5NextParams& p, const KvBinding& b,
   const int64_t conv_elems = kd.conv_dim() * kd.conv_kernel_size;
   const int64_t rec_elems = kd.num_heads * kd.head_dim * kd.head_dim;
 
+  // W9c-3b (#2480): every span below is STAGED through the backend rather than
+  // dereferenced, because on a device queue these pointers are the runner's
+  // `vt::Alloc` allocations. See `PageIo`.
+  PageIo io(input.queue);
+  std::vector<uint8_t> span;
+
   for (int64_t l = 0; l < L; ++l) {
     const LayerKvBinding& lb = b.layers[static_cast<size_t>(l)];
     LayerCache& c = (*out)[static_cast<size_t>(l)];
@@ -542,27 +628,39 @@ void LoadCaches(const Glm5NextParams& p, const KvBinding& b,
       c.kda.assign(1, glm5_next_kda::Glm5NextKdaCache{});
       glm5_next_kda::Glm5NextKdaCache& kc = c.kda[0];
       kc.conv_state.resize(static_cast<size_t>(conv_elems));
+      const size_t conv_elt = vt::SizeOf(gs.conv_state.dtype);
       const int64_t cbase = b.state_slot * conv_elems;
+      uint8_t* cbuf = Staging(&span, static_cast<size_t>(conv_elems) * conv_elt);
+      io.Read(gs.conv_state.data, static_cast<size_t>(cbase) * conv_elt,
+              static_cast<size_t>(conv_elems) * conv_elt, cbuf);
       for (int64_t i = 0; i < conv_elems; ++i)
         kc.conv_state[static_cast<size_t>(i)] =
-            ReadTensorElem(gs.conv_state, cbase + i);
+            ReadSpanElem(cbuf, gs.conv_state.dtype, i);
       kc.recurrent_state.resize(static_cast<size_t>(rec_elems));
+      const size_t ssm_elt = vt::SizeOf(gs.ssm_state.dtype);
       const int64_t rbase = b.state_slot * rec_elems;
+      uint8_t* rbuf = Staging(&span, static_cast<size_t>(rec_elems) * ssm_elt);
+      io.Read(gs.ssm_state.data, static_cast<size_t>(rbase) * ssm_elt,
+              static_cast<size_t>(rec_elems) * ssm_elt, rbuf);
       for (int64_t i = 0; i < rec_elems; ++i)
         kc.recurrent_state[static_cast<size_t>(i)] =
-            ReadTensorElem(gs.ssm_state, rbase + i);
+            ReadSpanElem(rbuf, gs.ssm_state.dtype, i);
       continue;
     }
     c.dsa.cached_len = b.cached_len;
     const PagedKvCache& lat = attn_kv[static_cast<size_t>(lb.latent)];
     const std::vector<int32_t>& lblocks =
         b.group_blocks[static_cast<size_t>(lb.latent_group)];
+    const size_t lat_elt = vt::SizeOf(lat.dtype);
     c.dsa.k_pass.resize(static_cast<size_t>(b.cached_len * latent_row));
     for (int64_t t = 0; t < b.cached_len; ++t) {
       const int64_t off = PagedRowOffset(lblocks, b.block_size, latent_row, t);
+      uint8_t* row = Staging(&span, static_cast<size_t>(latent_row) * lat_elt);
+      io.Read(lat.data, static_cast<size_t>(off) * lat_elt,
+              static_cast<size_t>(latent_row) * lat_elt, row);
       for (int64_t i = 0; i < latent_row; ++i)
         c.dsa.k_pass[static_cast<size_t>(t * latent_row + i)] =
-            ReadElem(lat, off + i);
+            ReadSpanElem(row, lat.dtype, i);
     }
     // A `shared` layer never appends to its side cache and never validates it
     // (`glm5_next_attn.cpp:353-366`), so its stored rows do not exist and
@@ -571,12 +669,16 @@ void LoadCaches(const Glm5NextParams& p, const KvBinding& b,
     const PagedKvCache& ix = attn_kv[static_cast<size_t>(lb.indexer)];
     const std::vector<int32_t>& iblocks =
         b.group_blocks[static_cast<size_t>(lb.indexer_group)];
+    const size_t ix_elt = vt::SizeOf(ix.dtype);
     c.dsa.indexer_packed.resize(static_cast<size_t>(b.cached_len * indexer_row));
     for (int64_t t = 0; t < b.cached_len; ++t) {
       const int64_t off = PagedRowOffset(iblocks, b.block_size, indexer_row, t);
+      uint8_t* row = Staging(&span, static_cast<size_t>(indexer_row) * ix_elt);
+      io.Read(ix.data, static_cast<size_t>(off) * ix_elt,
+              static_cast<size_t>(indexer_row) * ix_elt, row);
       for (int64_t i = 0; i < indexer_row; ++i)
         c.dsa.indexer_packed[static_cast<size_t>(t * indexer_row + i)] =
-            ReadElem(ix, off + i);
+            ReadSpanElem(row, ix.dtype, i);
     }
   }
 }
@@ -597,6 +699,12 @@ void StoreCaches(const Glm5NextParams& p, const KvBinding& b,
   const glm5_next_kda::Glm5NextKdaDims kd = KdaDimsFrom(p);
   const int64_t conv_elems = kd.conv_dim() * kd.conv_kernel_size;
   const int64_t rec_elems = kd.num_heads * kd.head_dim * kd.head_dim;
+  // W9c-3b (#2480): the row is BUILT in the staging buffer and then copied
+  // through the backend. Writing straight into `lat.data` was a host store into
+  // a `cudaMalloc` allocation on every `--device cuda` step, and it is where the
+  // three SIGSEGV legs of O46 died. See `PageIo` and spec `## Owed` O49.
+  PageIo io(input.queue);
+  std::vector<uint8_t> span;
 
   for (int64_t l = 0; l < L; ++l) {
     const LayerKvBinding& lb = b.layers[static_cast<size_t>(l)];
@@ -623,14 +731,22 @@ void StoreCaches(const Glm5NextParams& p, const KvBinding& b,
              std::to_string(rec_elems) + ".");
       }
       const GdnStateCache& gs = gdn[static_cast<size_t>(lb.recurrent)];
+      const size_t conv_elt = vt::SizeOf(gs.conv_state.dtype);
       const int64_t cbase = b.state_slot * conv_elems;
+      uint8_t* cbuf = Staging(&span, static_cast<size_t>(conv_elems) * conv_elt);
       for (int64_t i = 0; i < conv_elems; ++i)
-        WriteTensorElem(gs.conv_state, cbase + i,
-                        kc.conv_state[static_cast<size_t>(i)]);
+        WriteSpanElem(cbuf, gs.conv_state.dtype, i,
+                      kc.conv_state[static_cast<size_t>(i)]);
+      io.Write(gs.conv_state.data, static_cast<size_t>(cbase) * conv_elt,
+               static_cast<size_t>(conv_elems) * conv_elt, cbuf);
+      const size_t ssm_elt = vt::SizeOf(gs.ssm_state.dtype);
       const int64_t rbase = b.state_slot * rec_elems;
+      uint8_t* rbuf = Staging(&span, static_cast<size_t>(rec_elems) * ssm_elt);
       for (int64_t i = 0; i < rec_elems; ++i)
-        WriteTensorElem(gs.ssm_state, rbase + i,
-                        kc.recurrent_state[static_cast<size_t>(i)]);
+        WriteSpanElem(rbuf, gs.ssm_state.dtype, i,
+                      kc.recurrent_state[static_cast<size_t>(i)]);
+      io.Write(gs.ssm_state.data, static_cast<size_t>(rbase) * ssm_elt,
+               static_cast<size_t>(rec_elems) * ssm_elt, rbuf);
       continue;
     }
     if (c.dsa.cached_len != total) {
@@ -646,11 +762,15 @@ void StoreCaches(const Glm5NextParams& p, const KvBinding& b,
     const PagedKvCache& lat = attn_kv[static_cast<size_t>(lb.latent)];
     const std::vector<int32_t>& lblocks =
         b.group_blocks[static_cast<size_t>(lb.latent_group)];
+    const size_t lat_elt = vt::SizeOf(lat.dtype);
     for (int64_t t = b.cached_len; t < total; ++t) {
       const int64_t off = PagedRowOffset(lblocks, b.block_size, latent_row, t);
+      uint8_t* row = Staging(&span, static_cast<size_t>(latent_row) * lat_elt);
       for (int64_t i = 0; i < latent_row; ++i)
-        WriteElem(lat, off + i,
-                  c.dsa.k_pass[static_cast<size_t>(t * latent_row + i)]);
+        WriteSpanElem(row, lat.dtype, i,
+                      c.dsa.k_pass[static_cast<size_t>(t * latent_row + i)]);
+      io.Write(lat.data, static_cast<size_t>(off) * lat_elt,
+               static_cast<size_t>(latent_row) * lat_elt, row);
     }
     if (!lb.has_own_indexer) {
       if (!c.dsa.indexer_packed.empty()) {
@@ -671,11 +791,15 @@ void StoreCaches(const Glm5NextParams& p, const KvBinding& b,
     const PagedKvCache& ix = attn_kv[static_cast<size_t>(lb.indexer)];
     const std::vector<int32_t>& iblocks =
         b.group_blocks[static_cast<size_t>(lb.indexer_group)];
+    const size_t ix_elt = vt::SizeOf(ix.dtype);
     for (int64_t t = b.cached_len; t < total; ++t) {
       const int64_t off = PagedRowOffset(iblocks, b.block_size, indexer_row, t);
+      uint8_t* row = Staging(&span, static_cast<size_t>(indexer_row) * ix_elt);
       for (int64_t i = 0; i < indexer_row; ++i)
-        WriteElem(ix, off + i,
-                  c.dsa.indexer_packed[static_cast<size_t>(t * indexer_row + i)]);
+        WriteSpanElem(row, ix.dtype, i,
+                      c.dsa.indexer_packed[static_cast<size_t>(t * indexer_row + i)]);
+      io.Write(ix.data, static_cast<size_t>(off) * ix_elt,
+               static_cast<size_t>(indexer_row) * ix_elt, row);
     }
   }
 }

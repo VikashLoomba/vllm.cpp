@@ -27,9 +27,14 @@ Nothing else differed. The knob gates the allocator and only the allocator;
 `UnifiedMemory()` and `DeviceMemoryIsHostAddressable()` are byte-identical
 across the two columns and cannot explain the split.
 
-**No fix has landed.** `VT_ROCM_MANAGED_ALLOC` defaults ON, so every shipped
-configuration still takes the faulting branch. What to do about that is
-`## The decision this row cannot make alone`.
+**The repair has now landed and the default has moved.** The maintainer took
+the decision `## The decision this row cannot make alone` was written for, and
+chose shape 1: `UseManagedAlloc` is narrowed by `pageable_memory_access`, so a
+part that cannot fault and recover never gets a migratable allocation. The
+capability answers follow the allocator, which withdraws the CPU reference tier
+on this class of board; an op that loses its fallback refuses by name and now
+says why. Design, the reason shape 1 beat shapes 2 and 3, and the measured
+consequence are in `## W11: the repair, and the shape chosen for it`.
 
 ## Scope
 
@@ -1125,6 +1130,156 @@ measurement:
 Issue [#41](https://github.com/mudler/vllm.cpp/issues/41) F6 ratified approach
 (b) with the maintainer, so narrowing it is that decision being revisited, and
 the person who took it should take it again with this measurement in hand.
+
+## W11: the repair, and the shape chosen for it
+
+Issue [#2511](https://github.com/mudler/vllm.cpp/issues/2511). The maintainer
+has taken the decision `## The decision this row cannot make alone` was written
+for, and it is **shape 1: narrow `UseManagedAlloc` by `pageable_memory_access`,
+and let the capability answers follow the allocator.** This section records the
+design, why shape 1 and not shape 2 or 3, what the reference tier loses, and
+what refuses in its place.
+
+### The predicate, and why the narrowing collapses `unified_memory_`
+
+Before this change:
+
+```text
+managed_capable = integrated && managed_memory && concurrent_managed_access
+managed_alloc   = managed_capable && knob_on
+unified_memory  = managed_capable || (pageable_memory_access && integrated)
+```
+
+After:
+
+```text
+managed_capable = integrated && managed_memory && concurrent_managed_access
+managed_alloc   = managed_capable && (override ? override : pageable_memory_access)
+unified_memory  = managed_alloc  || (pageable_memory_access && integrated)
+```
+
+The second line is the whole fix, and the third line is its consequence stated
+rather than hidden. With `pageable_memory_access` inside the managed predicate,
+`managed_alloc` now IMPLIES `(pageable_memory_access && integrated)`, so under
+the default the unified claim collapses to exactly the W0 CUDA-shaped
+conjunction that `cuda_backend.cu:295-303` computes. **The managed branch no
+longer widens the unified claim at all.** That is the honest polarity: approach
+(b) existed to make host addressability an API guarantee on a part where the
+attribute conjunction read false, and this row measured that the same API
+guarantee is what breaks the part. A guarantee that faults is not a guarantee.
+
+`unified_memory` is deliberately written over `managed_alloc` rather than over
+`managed_capable`, because that is the sentence the capability actually makes:
+every block `Backend::Alloc` hands out is host-addressable, by the
+`hipMallocManaged` contract on one branch and by the `PageableMemoryAccess`
+attribute on the other. Reading it off a capability the allocator did not take
+is how the two could ever disagree.
+
+### Why shape 1, and not the other two
+
+**Shape 2 (plain `hipMalloc`, keep `unified_memory_` true) is what the 21 clean
+legs actually ran, and it is still rejected.** It rests on
+`rocm_backend.hip`'s own recorded observation that host dereference of
+`hipMalloc` memory demonstrably works on `gfx1151` — and the same comment says
+approach (b) exists precisely because this project "refuses to gate memory
+safety on" that architectural accident. Nothing in W9 or W10 measured host
+dereference of a plain `hipMalloc` block; both arms reported
+`reference_tier_hits = 0`, so no leg on this row ever exercised the property
+shape 2 would have to assert. Shipping it would assert an unmeasured
+memory-safety claim on the strength of legs that never tested it, which is the
+#844 / #1435 failure with the sign flipped. If someone later measures host
+dereference of `hipMalloc` memory on this class of part, shape 2 becomes
+available on evidence; today it is available only on inference.
+
+**Shape 3 (keep the default, ship the knob) is what landed in W9 and is not a
+fix.** Every shipped configuration still takes the faulting branch, and a knob
+nobody sets does not stop a GPU reset.
+
+**Shape 1 costs the CPU reference tier on this class of board, and that cost is
+paid deliberately.** It is the only shape whose safety claim is the same one the
+attributes report.
+
+### What the reference tier loses, and what refuses instead
+
+On `gfx1151` (and any XNACK-less integrated part: `PageableMemoryAccess = 0`
+with `ManagedMemory = 1`), `UnifiedMemory()` and
+`DeviceMemoryIsHostAddressable()` both become **false**. The portable CPU
+reference tier is therefore not eligible (`op_provider.cpp`
+`ReferenceTierEligible`), and an op with no native ROCm kernel no longer falls
+back — it refuses.
+
+Three consequences, each checked rather than assumed:
+
+1. **The refusal is by name, and now says WHY.** `GetOp` already refuses with
+   the op name, the device, and the failed precondition
+   (`ReferenceTierRefusalReason`). What it could not say is why THIS backend
+   answers the precondition false, which on this board is a deliberate
+   narrowing rather than a discrete card's ordinary state. `Backend` therefore
+   gains one optional virtual, `HostAddressabilityNote()`, defaulting to
+   `nullptr`; `RocmBackend` returns a sentence naming `PageableMemoryAccess = 0`,
+   issue #2511, and `VT_ROCM_MANAGED_ALLOC=1` as the documented way back. The
+   refusal path appends it. A reader who hits the refusal learns the cause at
+   the point of failure instead of in a spec.
+2. **The other two consumers of the narrow predicate degrade, they do not
+   break.** `apply_logits_processors` (`v1/sample/logits_processor/builtin.cpp`)
+   stages the logits down and copies them back instead of wrapping them in
+   place — one bounce per request that registers a processor, exactly what the
+   CPU device already pays. `ResidentWeight`'s device-byte adoption
+   (`qwen3_5_weights.cpp`) declines to adopt and leaves the mmap borrow as a
+   valid re-faultable view, which its own comment already specifies as the
+   not-host-addressable path. Neither needs a refusal.
+3. **`is_integrated_gpu()` on ROCm answers `UnifiedMemory()` and so flips
+   false.** Its one consumer that could change behaviour is the runner's async
+   device mirror, whose predicate is
+   `!UnifiedMemory() || is_integrated_gpu()` — true before (unified and
+   integrated) and true after (not unified). No move.
+
+The measured basis for paying this cost: **both W9 arms and every W10 arm
+reported `reference_tier_hits = 0`**, including twelve gate-sized legs in #2546.
+The Q4_K path this row runs is served entirely by native ROCm kernels, so
+withdrawing the tier withdraws something nothing on this workload used. That is
+a measurement about THIS workload and is stated as one; a model reaching an
+unregistered op on this board now gets a refusal where it previously got a slow
+answer, and that is the visible debt this shape buys.
+
+### The knob keeps its name and gains a third state
+
+`VT_ROCM_MANAGED_ALLOC` becomes tri-state, because a two-state knob cannot
+express the red-before arm any more once the default moves:
+
+| value | effect |
+|---|---|
+| unset | the narrowed default: managed allocation only where `PageableMemoryAccess` is 1 |
+| `0` | never take the managed branch, on any device |
+| `1` | take it wherever the managed ATTRIBUTES allow, ignoring `PageableMemoryAccess` — the pre-fix behaviour, byte-for-byte |
+
+`=1` cannot conjure a capability: `managed_capable` still gates it, so a
+discrete card stays on `hipMalloc` and the branch stays provably dead there.
+`=1` restores `unified_memory` too, because a faithful red-before arm has to be
+the whole pre-fix configuration and not half of it. That is what makes the
+green-after measurement a single-binary, single-boot, interleaved A/B rather
+than two builds.
+
+### Where the decision lives, and how it is tested without a board
+
+The decision moves OUT of the `.hip` anonymous namespace and into
+`include/vt/rocm/rocm_arch.h` as `vt::rocm::ResolveMemoryPolicy`, a pure
+function of the four probed attributes and the override. That is the precedent
+this file already sets: `CapabilityFromGcnArch` was lifted there for exactly
+this reason — "the one piece with a DECISION in it ... IS compiled and
+unit-tested on a CPU-only box". `RocmBackend`'s registrar becomes a caller.
+
+`tests/vt/test_rocm_arch.cpp` gains the policy table, which runs in ordinary
+preflight with no AMD hardware: the gfx1151 row, the gfx1103 row, a discrete
+row, an NVIDIA-shaped integrated row (`pageable = 1`), and all three override
+states on each. `tests/vt/test_reference_tier.cpp` gains the refusal-note case
+against a fake backend on `kXPU`. `tests/vt/test_rocm_backend.cpp`'s
+board-gated "approach (b)" case is rewritten to assert the NEW coupling, since
+the old one asserts the behaviour this change removes.
+
+`tests/vt/test_backend_cross_device.cpp`'s production-geometry Q6_K launch gate
+is untouched and stays: this change does not move the kernel it exercises, and
+the class of regression it was added for is still real.
 
 ## Gate 2 is still owed, and the first attempt at it failed on its own instrument
 

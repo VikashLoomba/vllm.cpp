@@ -1052,7 +1052,7 @@ namespace {
 // at the arguments `ops.py:40` passes, which is to say at every default. Returns
 // `new_freq` phase rows of `2 * width + orig_freq` taps, row-major. `orig_freq`
 // and `new_freq` are already REDUCED by their gcd, as upstream reduces them at
-// `:1341-1342`.
+// `:1340-1341`.
 //
 // THE WINDOW IS HANN, and nine comments in this tree used to say kaiser.
 // `resample` defaults `resampling_method="sinc_interp_hann"` (`:1441`) and only
@@ -1065,19 +1065,19 @@ namespace {
 // SHORTCUT. Upstream's waveform is float32 from the decoder on
 // (`decode.py:173-176`), `encode_audio` moves it without casting
 // (`audio_vae.py:271`), and the kernel is built with `dtype=waveform.dtype`
-// (`:1483`), so `idx`, `t`, the clamp, the window and `sin(t)/t` are all f32
+// (`:1487`), so `idx`, `t`, the clamp, the window and `sin(t)/t` are all f32
 // (`:1376-1397`). Measured against the pinned oracle, a `double`-built kernel
-// narrowed to `float` lands 1.03e-05 away where an f32-built one lands 1.79e-07:
-// widening here does not improve the port, it loosens the gate by a factor of 57
-// and hides exactly what AGENTS.md's "a token gate cannot detect a dtype that is
-// too wide" is about.
+// narrowed to `float` lands 3.39746e-06 away where this f32-built one lands
+// 1.19209e-07: widening here does not improve the port, it loosens the gate by a
+// factor of 28 and hides exactly what AGENTS.md's "a token gate cannot detect a
+// dtype that is too wide" is about.
 std::vector<float> Ltx2SincResampleKernel(int64_t orig_freq, int64_t new_freq,
                                           int64_t* out_width) {
   constexpr int64_t kLowpassFilterWidth = 6;  // functional.py:1439
   constexpr double kRolloff = 0.99;           // functional.py:1440
 
   // `base_freq` and `width` are Python floats, i.e. f64, and stay f64: only the
-  // TENSOR arithmetic below narrows (`:1357-1370`).
+  // TENSOR arithmetic below narrows (`:1350`, `:1369`; the first tensor is `:1376`).
   const double base_freq64 = static_cast<double>(std::min(orig_freq, new_freq)) * kRolloff;
   const int64_t width = static_cast<int64_t>(
       std::ceil(static_cast<double>(kLowpassFilterWidth) * static_cast<double>(orig_freq) /
@@ -1142,8 +1142,8 @@ std::vector<float> Ltx2ResampleWaveform(const std::vector<float>& waveform, int6
   if (orig_freq == new_freq) return waveform;
 
   const int64_t gcd = std::gcd(orig_freq, new_freq);
-  const int64_t orig = orig_freq / gcd;  // `:1341`, `:1414`
-  const int64_t next = new_freq / gcd;   // `:1342`, `:1415`
+  const int64_t orig = orig_freq / gcd;  // `:1340`, `:1416`
+  const int64_t next = new_freq / gcd;   // `:1341`, `:1417`
   int64_t width = 0;
   const std::vector<float> kernel = Ltx2SincResampleKernel(orig, next, &width);
   const int64_t taps = 2 * width + orig;
@@ -1152,11 +1152,29 @@ std::vector<float> Ltx2ResampleWaveform(const std::vector<float>& waveform, int6
   // orig), convolve with stride `orig`, transpose the phase axis in front of the
   // block axis, and truncate to `ceil(new * length / orig)`.
   const int64_t blocks = samples / orig + 1;
-  const int64_t target = (next * samples + orig - 1) / orig;  // `:1427`
+  // `target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()`
+  // (`:1427`), and this is NOT an exact integer ceil. `torch.as_tensor` of a
+  // PYTHON FLOAT takes `torch.get_default_dtype()`, which is float32, so the f64
+  // quotient is rounded to f32 BEFORE the ceil. Where the exact quotient sits
+  // above an integer by less than half an f32 ulp, the narrowing lands ON that
+  // integer and upstream keeps one sample FEWER than `(next * samples + orig - 1)
+  // / orig` gives — first at 180697 samples for 44100 -> 16000 (4.097 s), then
+  // for 48102 of the first 60 s worth of lengths. The extra sample moves the last
+  // STFT windows and, where `samples % hop == 0`, the mel FRAME COUNT.
+  //
+  // `next * samples` is exact in `int64_t` and exact again as a `double` for any
+  // length under 2^53 / next, so the division below is Python's own
+  // correctly-rounded f64 `int / int`; the narrowing and the ceil then mirror
+  // `as_tensor` and `torch.ceil`, and the cast to `int64_t` mirrors `.long()`.
+  // Checked against torchaudio over 276060 (ratio, length) pairs — twelve ratios
+  // by 23005 lengths, including a run either side of 2^24, where f32 no longer
+  // holds every integer: zero divergences.
+  const double quotient = static_cast<double>(next * samples) / static_cast<double>(orig);
+  const int64_t target = static_cast<int64_t>(std::ceil(static_cast<float>(quotient)));
   if (out_samples != nullptr) *out_samples = target;
 
   // ONE kernel for every channel. torchaudio packs the batch and resamples the
-  // last axis (`:1416-1418`), so the channels are independent; this walks them
+  // last axis (`:1419-1421`), so the channels are independent; this walks them
   // rather than approximating that.
   std::vector<float> out(static_cast<size_t>(channels) * static_cast<size_t>(target));
   for (int64_t c = 0; c < channels; ++c) {

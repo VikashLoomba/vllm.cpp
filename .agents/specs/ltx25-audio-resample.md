@@ -104,7 +104,7 @@ The nine sites: `ltx2_audio_input.cpp:101`, `ltx2_audio_vae.cpp:1057`,
 | 6 | `ops.py:36-42` | `resample_audio` returns `audio` unchanged when the rates are equal; otherwise `torchaudio.functional.resample(waveform, orig, target)` and then `.to(device=..., dtype=waveform.dtype)` |
 | 7 | `functional.py:1470-1476` | `orig_freq <= 0 or new_freq <= 0` raises; `orig_freq == new_freq` returns the input; `gcd` reduces the ratio |
 | 8 | `functional.py:1305-1402` | the kernel: `base_freq = min(o, n) * rolloff`, `width = ceil(lpw * o / base_freq)`, one row per output phase |
-| 9 | `functional.py:1405-1432` | zero-pad `(width, width + o)`, `conv1d` stride `o`, transpose-interleave, truncate to `ceil(n * L / o)` |
+| 9 | `functional.py:1405-1432` | zero-pad `(width, width + o)`, `conv1d` stride `o`, transpose-interleave, truncate to `ceil(n * L / o)` — with the quotient **narrowed to f32 before the ceil** (`:1427`; `torch.as_tensor` of a Python float takes the default dtype), which keeps one sample fewer than an exact integer ceil at 180697 samples for 44100 -> 16000 |
 | 10 | `a2vid_two_stage.py:301-303` | the returned soundtrack is the caller's **original** `Audio`, at its **native** rate. The resample never reaches the output |
 
 Hop 10 is why nothing downstream of the encoder changes: the file's own rate
@@ -136,8 +136,8 @@ does not cast it, and `_get_sinc_resample_kernel` is called with
 This is not a detail to round up. Building the same filter in `double` and
 storing it as `float` is *more accurate than upstream* and therefore **further
 from it**: measured against the pinned oracle, a double-built kernel differs by
-up to **1.03e-05** where a float-built one differs by **1.79e-07**, a factor of
-57. AGENTS.md's *Inherit vLLM defaults* names exactly this failure — a dtype that
+up to **3.39746e-06** where a float-built one differs by **1.19209e-07**, a
+factor of 28 and 13.6 times the gate's own 2.5e-07 bound. AGENTS.md's *Inherit vLLM defaults* names exactly this failure — a dtype that
 is too wide, which no token gate can see. The port mirrors the float32
 arithmetic operation for operation, including the association `sinc * (window *
 scale)` (`:1397`) and the fact that `scale = base_freq / orig_freq` is computed
@@ -184,16 +184,29 @@ and the video-level case must red. Recorded in `## Outcome`.
 Upstream ships none (§0). What this change does instead:
 
 1. **Goldens by execution.** `scripts/gen-ltx2-vae-goldens.py` gains sections
-   **8d** and **8e**, importing `ltx_core.model.audio_vae.ops.AudioProcessor`
+   **8d**, **8e** and **8f**, importing `ltx_core.model.audio_vae.ops.AudioProcessor`
    from the `--ltx2` checkout and running `resample_audio` and `waveform_to_mel`.
    They ride the generator's existing `kLtx2VaeUpstreamRevision` anchor, which the
    C++ suite already asserts against a pinned SHA, so a regeneration against a
    different upstream fails the gate rather than replacing the oracle.
 2. **The rate pairs are chosen to reach distinct arms**, not for coverage
-   arithmetic: 16000 -> 24000 (pure upsample, `o = 2`), 44100 -> 24000
-   (`gcd = 300`, `o = 147`, `width = 12`, the widest kernel), 48000 -> 24000
-   (pure downsample, `o = 2`), and 24000 -> 24000 (the equal-rate early return,
-   which must be a **copy** and not a filtered pass).
+   arithmetic. What section 8d ships is 16000 -> 48000 (pure upsample, `o = 1`,
+   the degenerate ratio the tree already ports for the vocoder's BWE stage),
+   48000 -> 16000 (pure downsample, `o = 3`, `n = 1`, `width = 19`, one phase
+   row), 44100 -> 16000 (`gcd = 100`, `o = 441`, `n = 160`, `width = 17`, the
+   widest kernel and the pair a real 44.1 kHz take hits), and 16000 -> 16000 (the
+   equal-rate early return, which must be a **copy** and not a filtered pass).
+   This paragraph named a different four before the port ran; the shipped set is
+   the one above, and `RESAMPLE_CASES` in the generator is its record.
+2b. **Section 8f reaches the truncation boundary, which 8d cannot.** The 8d arms
+   top out at 218 output samples, and upstream's f32-narrowed ceil (hop 9) first
+   disagrees with an exact integer ceil at 180697 input samples — 4.097 s at
+   44.1 kHz, three orders of magnitude further out. 8f carries four LENGTH-plus-
+   tail goldens: 180696 / 180697 / 180698 at 44100 -> 16000, which bracket that
+   boundary, and 90569 at 22050 -> 16000, where the same effect starts. The
+   generator asserts which of them an exact integer ceil gets right and which it
+   does not, so an arm that stopped discriminating fails generation rather than
+   gating nothing.
 3. **A lower bound, not only a tolerance.** A resampler that returned zeros, or
    that returned the input untouched, satisfies a `max|diff| < tol` gate against
    the wrong golden and any shape check. The cases assert the output's absmax is
@@ -272,18 +285,29 @@ Three filters were built and compared against the pinned oracle's own
 
 | Filter built in | max abs diff vs the oracle |
 |---|---|
-| `double`, narrowed to `float` | **1.03e-05** |
-| torchaudio's own f64-internal path (`dtype=None`) | 4.71e-06 |
-| `float`, mirroring `dtype=waveform.dtype` | **1.79e-07** |
+| `double` throughout `Ltx2SincResampleKernel`, narrowed to `float` at the store | **3.39746e-06** |
+| torchaudio's own `dtype=None` kernel (`idx` in f64, `t` in the default f32) | 2.37e-06 |
+| `float`, mirroring `dtype=waveform.dtype` | **1.19209e-07** |
 
-The `double` filter is *more accurate than upstream* and therefore fifty-seven
+All three re-measured on 2026-09-02, because the first two rows were first
+recorded as 1.03e-05 and 4.71e-06 and neither reproduces. The mutation each row
+names is exact: row 1 makes `base_freq`, `scale`, `lpw`, `kPi`, `phase`, `idx`,
+`t`, `shaped`, `window` and `sinc` `double` and casts only at
+`kernel[j * taps + k] = ...`; it reds the `Wide` arm at 3.39746e-06 and all four
+8f tails between 1.55e-06 and 3.09e-06. Row 2 is torchaudio's own
+`_get_sinc_resample_kernel(..., dtype=None)` over the same 8d inputs. Row 3 is
+this port at the committed head, read by setting `kResampleTol` to `0.0`.
+
+The `double` filter is *more accurate than upstream* and therefore twenty-eight
 times further from it. It would have passed a gate written around it and read as
 a careful implementation. §4 states the chain that fixes the answer at f32, and
 the gate's 2.5e-07 is set so that a widening fails it.
 
 **The tolerance is twice the measured floor, not a hedge.** Setting
-`kResampleTol` to `0.0` reds three of the four arms, at 5.96e-08 (Up), 5.96e-08
-(Down) and 1.19e-07 (Wide). `Same` passes at zero, because it is a copy.
+`kResampleTol` to `0.0` reds three of the four 8d arms, at 5.96e-08 (Up),
+5.96e-08 (Down) and 1.19209e-07 (Wide), and all four 8f tails, at 1.49e-08,
+4.47e-08, 2.98e-08 and 7.45e-09. `Same` passes at zero, because it is a copy.
+2.5e-07 is 2.10x the worst of those.
 
 **`audio_latent_absmax` cannot gate this, and that is a finding rather than a
 gap.** The obvious video-level claim — "the 44.1 kHz take must land nearer the
@@ -293,14 +317,74 @@ genuinely different waveforms, because the trace's absmax is dominated by the
 encoder's per-channel statistics. The assertion was removed rather than inverted
 or loosened, and the reason is recorded where the assertion was.
 
+### The truncation was NOT upstream's, and no arm here could see it
+
+`_apply_sinc_resample_kernel` ends
+`target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()`
+(`functional.py:1427`). That reads as an integer ceil and this port first shipped
+one, `(next * samples + orig - 1) / orig`. It is not one: `torch.as_tensor` of a
+**Python float** takes `torch.get_default_dtype()`, which is float32, so the f64
+quotient is rounded to f32 **before** the ceil. Where the exact quotient sits
+above an integer by less than half an f32 ulp, the narrowing lands on that
+integer and upstream keeps one sample FEWER.
+
+Measured at 44100 -> 16000: 180696 samples give 65559 both ways, 180697 give
+65559 upstream and 65560 from the exact ceil, 180698 give 65560 both ways. 48102
+of the first 60 s worth of lengths diverge, and the density grows with duration.
+22050 -> 16000 starts at 90569 and 44100 -> 24000 at 240854. At 48000 -> 16000
+(`o = 3`) and 16000 -> 48000 (`o = 1`) it never happens at any audio length,
+which is why three of the four 8d arms look clean at any length. One extra output
+sample changes the last mel frames' STFT window content and, where
+`samples % hop == 0`, the frame count — the audio latent length, and so the
+conditioning shape.
+
+**The gate could not see it, and that is the reason 8f exists.** The four 8d
+arms top out at 218 output samples. Substituting torchaudio's real float32 ceil
+into this port and rebuilding left `*resampl*` 26/26, `*waveform_to_mel*` 9/9 and
+`*RESAMPLED*` 14/14 green: the right ratio at the wrong length. Section 8f adds
+the four boundary arms of §6.2b, and with them the old formula reds on exactly
+the two divergent lengths (65560 vs 65559 and 65720 vs 65719, plus their tails at
+0.257 and 0.359) and stays green on the two that bracket them.
+
+The repair mirrors the computation rather than describing it: the int64 product
+`next * samples` is exact as a `double` for any length under 2^53 / next, so
+`double(next * samples) / double(orig)` is Python's own correctly-rounded `int /
+int`; `static_cast<float>` is `as_tensor`, `std::ceil` on the float is
+`torch.ceil`, and the cast back to `int64_t` is `.long()`. Checked against
+torchaudio over 276060 (ratio, length) pairs — twelve ratios by 23005 lengths,
+covering 1 to 20000, the runs around 90569 and 180697, a thousand lengths either
+side of 2^24 where f32 no longer holds every integer, and 2^25: zero
+divergences.
+
+### One more kaiser statement, in product output
+
+The row's first pass repaired eight of the nine statements that misnamed the
+filter. The ninth was `examples/ltx2_gen/main.cpp`'s `--help` text, which is not
+a comment: it told users that the sample rate "must equal the audio VAE's mel
+front-end rate", that "neither is converted, because upstream resamples with a
+polyphase kaiser resampler that is not ported here", and that "both mismatches
+are refused". All three were false at that head. Repaired, and the sweep re-run
+over every git-tracked file rather than over source and specs: `git grep -inE
+"(^|[^a-z])kaiser"` now returns only the vocoder's genuine kaiser-sinc
+anti-aliasing filter, this row's own prose about the repair, and unrelated
+tokenizer and HuggingFace-org byte matches.
+
 ### Red before, green after
 
 | | Before | After |
 |---|---|---|
-| `test_ltx2_vae -tc='*waveform_to_mel*'` | THREW the rate refusal at `ltx2_audio_vae.cpp:1053` | 48/48 cases, 3217/3217 assertions |
+| `test_ltx2_vae -tc='*waveform_to_mel*'` | THREW the rate refusal at `ltx2_audio_vae.cpp:1053` | 48/48 cases, 3245/3245 assertions |
 | `test_ltx2_video -tc='*RESAMPLED*'` | THREW `'high.wav' is sampled at 44100 Hz ...` | 110/110 cases, 4870/4870 assertions |
+| `test_ltx2_vae -tc='*resampl*'`, section 8f | 50/54 with the EXACT INTEGER CEIL in place: `CeilAt` 65560 vs 65559 and its tail 0.256834 out, `CeilAlt` 65720 vs 65719 and its tail 0.358731 out | 54/54 |
 
-Both reds are the refusal itself, which is what the row exists to delete.
+The first two reds are the refusal itself, which is what the row exists to
+delete. The third is the truncation repair below, and it is red-first in the
+strict sense: the two bracketing arms `CeilBelow` and `CeilAbove` stay GREEN
+under the same old formula, so the arm discriminates rather than simply failing.
+The same old formula against the test file as it stood BEFORE section 8f leaves
+`*resampl*` 26/26, `*waveform_to_mel*` 9/9 and `test_ltx2_video`'s `*RESAMPLED*`
+14/14 all green — the measurement that says the gate was blind, rather than an
+argument that it was.
 
 ### The reachability mutation, and what it proved
 
@@ -316,8 +400,22 @@ rebuilding:
 * **the section-8d unit case still PASSES.** That is the point of the mutation:
   `Ltx2ResampleWaveform` works whether or not anything calls it, and a test that
   constructs it by hand measures the class. The tree was restored byte-for-byte
-  (sha256 `88055b01e9c2bf0bb29d826b2c61dc4c8439a1d8ae6d779a46969b50b0c0212b`) and
-  both suites re-run green.
+  and both suites re-run green.
+
+The mutation was RE-RUN at the truncation-repair head, because the repair moves
+the very line the mutation deletes and a mutation proof does not survive an edit
+to its own subject. It behaves identically there: 8d/8f 54/54, the mel case red
+at 38 vs 14 frames and 608 vs 224, the video case red on the same digest
+`18285287296143238670`. `ltx2_audio_vae.cpp` sha256 before and after that
+restore: `fd1b68a71594d7bfd28dcb7f16e67e8c0abe91d5c267e089eb0bee3e3755af03`
+(the earlier run's subject was the same file at `052047579`, sha256
+`88055b01e9c2bf0bb29d826b2c61dc4c8439a1d8ae6d779a46969b50b0c0212b`).
+
+The mutation's FIRST build failed `-Werror` on the now-unused `sampling_rate`,
+and the three suites then re-ran the STALE binaries and printed green — the
+shape in which a mutation that never applied reads as a passing test. Recorded
+because the reading it produced was indistinguishable from the real one until
+the build's exit status was checked.
 
 ### Rejected
 

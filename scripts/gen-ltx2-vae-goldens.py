@@ -18,7 +18,7 @@ Upstream sources (Lightricks/LTX-2, packages/ltx-core/src/ltx_core/):
   model/video_vae/video_vae.py          -> section 6 (VideoEncoder)
   model/audio_vae/audio_vae.py          -> section 7 (AudioEncoder)
   model/audio_vae/ops.py                -> section 8 (AudioProcessor mel front-end,
-                                           and 8d/8e its RESAMPLER)
+                                           and 8d-8f its RESAMPLER)
   conditioning/types/*.py               -> section 9 (the conditioning items)
 
 Usage:
@@ -1038,6 +1038,39 @@ RESAMPLE_CHANNELS = 2
 MEL_SOURCE_RATE = 44100
 MEL_SOURCE_SAMPLES = 600
 
+# Section 8f — the TRUNCATION BOUNDARY, which no arm above can reach.
+#
+# `_apply_sinc_resample_kernel` truncates to
+# `torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()`
+# (functional.py:1427). `torch.as_tensor` of a PYTHON FLOAT takes
+# `torch.get_default_dtype()`, which is float32, so the f64 quotient is narrowed
+# to f32 BEFORE the ceil. Where the exact quotient sits above an integer by less
+# than half an f32 ulp, the narrowing lands ON that integer and upstream keeps one
+# sample FEWER than an exact integer ceil would.
+#
+# The four arms of 8d top out at 218 output samples, three orders of magnitude
+# below where that first happens, so they cannot see it: at 44100 -> 16000 the
+# first divergent length is 180697 (4.097 s) and 48102 of the first 60 s worth of
+# lengths diverge. One extra output sample moves the last STFT windows and, where
+# `samples % hop == 0`, the mel FRAME COUNT — that is, the conditioning shape.
+#
+# Two ratios, because the effect needs `orig_freq` large enough for the quotient
+# to land that close: at 48000 -> 16000 (o = 3) and 16000 -> 48000 (o = 1) it
+# never happens at any audio length, which is why the clean-looking arms are
+# clean. Each ratio carries the first divergent length and, for 44100, the
+# lengths either side of it, where an exact ceil is RIGHT — an arm that only
+# carried divergent lengths could be satisfied by always subtracting one.
+RESAMPLE_CEIL_CASES = (
+    ("CeilBelow", 44100, 16000, 180696, False),
+    ("CeilAt", 44100, 16000, 180697, True),
+    ("CeilAbove", 44100, 16000, 180698, False),
+    ("CeilAlt", 22050, 16000, 90569, True),
+)
+# The goldens carry the LENGTH and the last few samples rather than 65 559 floats
+# per arm. The length is the discriminator; the tail is there so a port that
+# produced the right count from a shifted signal cannot pass on the count alone.
+RESAMPLE_CEIL_TAIL = 8
+
 
 def section_video_encoder(out) -> None:
     import torch
@@ -1402,6 +1435,49 @@ def section_audio_mel(out) -> None:
     emit_scalar(out, "kLtx2MelResampledFrames", resampled_mel.shape[2])
     out.write("\n")
     emit_f32(out, "kLtx2MelResampledGolden", resampled_mel.numpy())
+
+    # --- 8f: the truncation boundary (functional.py:1427) ---
+    #
+    # Same call as 8d, at lengths that reach where upstream's f32-narrowed ceil
+    # and an exact integer ceil disagree. Emitted as a length plus a tail window,
+    # because the full arm is 65 559 samples wide.
+    out.write("// --- section 8f: the truncation boundary (functional.py:1427) ---\n")
+    emit_scalar(out, "kLtx2ResampleCeilTail", RESAMPLE_CEIL_TAIL)
+    for tag, orig, target, length, diverges in RESAMPLE_CEIL_CASES:
+        wave = make_input(f"ltx2.resample.{tag}", (1, 1, length), 0.5)
+        proc = AudioProcessor(
+            target_sample_rate=target,
+            mel_bins=MEL["mel_bins"],
+            mel_hop_length=MEL["mel_hop_length"],
+            n_fft=MEL["n_fft"],
+        )
+        got = proc.resample_audio(Audio(waveform=wave, sampling_rate=orig))
+        assert got.sampling_rate == target
+        assert got.waveform.dtype == torch.float32
+        produced = int(got.waveform.shape[-1])
+        # The POSITIVE CONTROL on this arm. An exact integer ceil is what a
+        # reader writes from the formula as printed; assert here which lengths it
+        # gets right and which it does not, so an arm that stopped discriminating
+        # fails the GENERATOR rather than quietly gating nothing.
+        exact_ceil = -(-((target // math.gcd(orig, target)) * length) //
+                       (orig // math.gcd(orig, target)))
+        if diverges:
+            assert exact_ceil == produced + 1, (
+                f"{tag}: expected upstream to keep one sample FEWER than an exact "
+                f"integer ceil, got upstream={produced} exact={exact_ceil}"
+            )
+        else:
+            assert exact_ceil == produced, (
+                f"{tag}: expected the two ceils to AGREE here, got "
+                f"upstream={produced} exact={exact_ceil}"
+            )
+        tail = got.waveform.reshape(-1)[-RESAMPLE_CEIL_TAIL:]
+        assert float(tail.abs().max()) > 0.0, "an all-zero tail gates nothing"
+        emit_scalar(out, f"kLtx2Resample{tag}OrigRate", orig)
+        emit_scalar(out, f"kLtx2Resample{tag}NewRate", target)
+        emit_scalar(out, f"kLtx2Resample{tag}InSamples", length)
+        emit_scalar(out, f"kLtx2Resample{tag}OutSamples", produced)
+        emit_f32(out, f"kLtx2Resample{tag}TailGolden", tail.numpy())
 
 
 # ---------------------------------------------------------------------------

@@ -175,9 +175,13 @@ std::vector<float> Ltx2SlaneyMelFilterbank(int64_t n_freqs, double f_min, double
 //
 // `waveform` is [channels, samples] channel-major and each channel resamples
 // independently against one kernel, as torchaudio's packed batch does. Returns
-// `ceil(new_freq * samples / orig_freq)` samples per channel, and returns the
-// INPUT unfiltered when the rates already match (ops.py:38-39). Computed in f32,
-// which is the dtype upstream resamples in — see the note at the definition.
+// `ceil(new_freq * samples / orig_freq)` samples per channel — the quotient
+// NARROWED TO f32 BEFORE the ceil, because `torch.as_tensor` of a Python float
+// takes the default dtype (functional.py:1427), which keeps one sample fewer
+// than an exact integer ceil at 180697 samples for 44100 -> 16000 and at 48102
+// of the first 60 s worth of lengths. Returns the INPUT unfiltered when the
+// rates already match (ops.py:38-39). Computed in f32, which is the dtype
+// upstream resamples in — see the note at the definition.
 std::vector<float> Ltx2ResampleWaveform(const std::vector<float>& waveform, int64_t channels,
                                         int64_t samples, int64_t orig_freq, int64_t new_freq,
                                         int64_t* out_samples);

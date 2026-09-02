@@ -4906,6 +4906,44 @@ inline constexpr float kLtx2MelResampledGolden[] = {
     -6.03300667f, -5.81140184f,
 };
 
+// --- section 8f: the truncation boundary (functional.py:1427) ---
+inline constexpr int64_t kLtx2ResampleCeilTail = 8;
+inline constexpr int64_t kLtx2ResampleCeilBelowOrigRate = 44100;
+inline constexpr int64_t kLtx2ResampleCeilBelowNewRate = 16000;
+inline constexpr int64_t kLtx2ResampleCeilBelowInSamples = 180696;
+inline constexpr int64_t kLtx2ResampleCeilBelowOutSamples = 65559;
+inline constexpr float kLtx2ResampleCeilBelowTailGolden[] = {
+    0.0894216299f, 0.0131077049f, -0.0238793846f, -0.0588569939f, 0.0581167452f, 0.219902992f,
+    -0.0258866604f, -0.171903431f,
+};
+
+inline constexpr int64_t kLtx2ResampleCeilAtOrigRate = 44100;
+inline constexpr int64_t kLtx2ResampleCeilAtNewRate = 16000;
+inline constexpr int64_t kLtx2ResampleCeilAtInSamples = 180697;
+inline constexpr int64_t kLtx2ResampleCeilAtOutSamples = 65559;
+inline constexpr float kLtx2ResampleCeilAtTailGolden[] = {
+    -0.190139741f, 0.06196668f, -0.194867074f, -0.0171126947f, 0.11970146f, 0.0139573188f,
+    -0.063427873f, 0.152270317f,
+};
+
+inline constexpr int64_t kLtx2ResampleCeilAboveOrigRate = 44100;
+inline constexpr int64_t kLtx2ResampleCeilAboveNewRate = 16000;
+inline constexpr int64_t kLtx2ResampleCeilAboveInSamples = 180698;
+inline constexpr int64_t kLtx2ResampleCeilAboveOutSamples = 65560;
+inline constexpr float kLtx2ResampleCeilAboveTailGolden[] = {
+    0.138243884f, -0.0549423918f, 0.164882183f, 0.0120501379f, -0.0783000514f, 0.365968585f,
+    -0.0271436367f, -0.185848534f,
+};
+
+inline constexpr int64_t kLtx2ResampleCeilAltOrigRate = 22050;
+inline constexpr int64_t kLtx2ResampleCeilAltNewRate = 16000;
+inline constexpr int64_t kLtx2ResampleCeilAltInSamples = 90569;
+inline constexpr int64_t kLtx2ResampleCeilAltOutSamples = 65719;
+inline constexpr float kLtx2ResampleCeilAltTailGolden[] = {
+    0.00326456479f, 0.0271689408f, 0.162618577f, 0.348693013f, -0.00762261869f, 0.0951811969f,
+    -0.0475787744f, -0.406309605f,
+};
+
 // --- section 9a: the INITIAL video state (tools.py:139-186) ---
 inline constexpr int64_t kLtx2CondVideoBaseTokens = 12;
 inline constexpr int64_t kLtx2CondVideoBaseWidth = 4;

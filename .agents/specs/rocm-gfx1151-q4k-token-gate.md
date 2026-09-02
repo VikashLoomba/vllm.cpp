@@ -60,6 +60,11 @@ most valuable output.
 - Verdict: `TOKEN_GATE=PASS` only when the tokenizer matches on 6 of 6 and the
   generation matches on 6 of 6. Anything else is `FAIL`. The tolerance is exact
   and no band is reached for.
+- There is a third outcome, and it is not a softened `FAIL`:
+  `TOKEN_GATE=NOT_MEASURABLE`, when every leg faulted or when the clean legs
+  disagree with each other. It says the instrument could not read the arm, which
+  is a different claim from the arm being wrong, and collapsing the two would
+  misreport a board problem as a numerics problem.
 
 ## Pinning the oracle's EXECUTED PATH, not only its revision
 
@@ -125,16 +130,42 @@ voids the oracle side and the job says so instead of reporting a gate result.
 
 ## Confirming the legs, not assuming them
 
-Without `HSA_ENABLE_SDMA=0` this board faults on roughly 8 of 10 plain Q4_K
-decode legs, and a fault is a `GPU Hang` or a `Memory access fault` that kills
-the process. A single clean leg is therefore not evidence that the arm ran.
+**`HSA_ENABLE_SDMA=0` halves the fault rate. It does not remove it.** An earlier
+tally reported 0 failures in 10 legs with the flag against 8 in 10 without it,
+and that tally double-counted its own log lines: 50 `MLEG` lines, 25 unique.
+Corrected and pooled over every #2511 job the rate is **16 of 21 legs without the
+flag and 6 of 18 with it**, and the later properly-alternated 20-leg A/B reads
+9 of 10 against 4 of 10. So a leg here has roughly a **two-in-five chance of
+dying in a GPU reset**, and the flag is the best arm available rather than a fix.
 
-Every one of our legs sets `HSA_ENABLE_SDMA=0`. The gate leg is repeated N
-times independently, each with its own process and its own model load, and the
-record carries `failures / N` for our arm. A verdict is reported only from legs
-that reached their own completion marker. Where two clean legs exist, their id
-sequences are compared to each other, because an arm that does not reproduce
-its own ids has no business being compared to anything else.
+Three consequences, each wired into the job rather than noted beside it.
+
+**Legs are expected to fault, so they are counted.** Five independent legs run,
+each its own process and its own model load. The record carries `failures / N`.
+A faulted leg produced no ids at all and is not scored; a verdict from a leg
+that died mid-generation would be meaningless.
+
+**A completed leg is not evidence the flag works.** At `p = 0.4` five clean legs
+in a row happens about one run in a hundred. Reporting only the run that came
+out clean is exactly the survivorship error that produced the 0-in-10 figure, so
+the observed rate is reported with the verdict and the run is not repeated until
+the board cooperates.
+
+**Reproducibility is a precondition of the verdict, not a diagnostic.** The
+surviving hypothesis is managed-memory migration on a device that reports
+`PageableMemoryAccess = 0` and so cannot take a recoverable page fault, and the
+fault site is `KQuantGemmK<u16, 0>` — the **Q4_K** arm, which is the path this
+gate scores. A defect that can corrupt a page can in principle hand back wrong
+bytes *without* faulting, and that would present as a token divergence. So the
+clean legs are compared to each other first, and a disagreement between them
+yields `TOKEN_GATE=NOT_MEASURABLE` rather than a divergence count.
+
+**The kernel itself is exonerated.** A standalone launch at the exact production
+geometry ran 9,000 launches over 30 legs with zero failures while the board
+failed 5 of 6 model legs in the same lease, so the fault is not an
+out-of-bounds index inside that kernel. That is #2511's finding and is recorded
+here only because it shapes what this measurement's limitations section may
+claim.
 
 ## The tree this measures, stated as a bounded claim
 
@@ -220,8 +251,12 @@ Raw logs on the share under `/mnt/nas_share/rc/rocm-tokgate-strix/`.
 
 ## Stop conditions
 
-- The board faults with `HSA_ENABLE_SDMA=0` set: stop, report it, produce no
-  gate verdict from a partial set of legs.
+- **Every leg faults**: report `TOKEN_GATE=NOT_MEASURABLE` with the count out of
+  N. This is an ordinary outcome at the corrected rate, not a contradiction of
+  anything, and it is a legitimate result rather than a reason to retry until
+  the board yields a clean run.
+- **The clean legs disagree with each other**: report `TOKEN_GATE=NOT_MEASURABLE`.
+  A non-deterministic arm cannot be scored for token-exactness.
 - The oracle's chain of custody is not `EXACT` or `PREFIX`: stop, the oracle
   side is not bound to the stock binary.
 - A reference-tier hit count above zero on our arm: stop, the leg did not

@@ -123,7 +123,7 @@ configuration, and its output is consumable rather than merely computed.
 Entry point: the `upsampler_path` load extra
 (`include/vllm/multimodal/ltx2_video.h`), read by `LoadVideoEngine` and applied
 by the second phase's input transform at
-`src/vllm/multimodal/ltx2_video.cpp:3505-3508`.
+`src/vllm/multimodal/ltx2_video.cpp:3521-3508`.
 
 Consumability is the part worth stating, because it is what separates A9 from
 A8. With the default flags a `dims=2` upsampler returns `[c, f, 2h, 2w]`:
@@ -134,9 +134,9 @@ frames preserved by the fold, `h` and `w` doubled by `PixelShuffleND(2)`.
 
 | # | Call site | What it requires of the frame axis |
 |---|---|---|
-| 1 | `:3505`, the video latent | `up.frames == vshape.frames`, checked at `:3509-3516` |
-| 2 | `:3532`, the generated keyframe slots (`dfr_pipeline.py:348`) | `up_slots.frames == slot_positions.size()`, checked at `:3536-3548` |
-| 3 | `:5042`, DFR's temporal rounds | the **temporal** arm, not this one |
+| 1 | `:3521`, the video latent | `up.frames == vshape.frames`, checked at `:3525-3531` |
+| 2 | `:3548`, the generated keyframe slots (`dfr_pipeline.py:348`) | `up_slots.frames == slot_positions.size()`, checked at `:3552-3563` |
+| 3 | `:5058`, DFR's temporal rounds | the **temporal** arm, not this one |
 
 Sites 1 and 2 are the spatial arm's, and both require the frame count to come
 back unchanged. A `dims=2` upsampler does exactly that, so the shapes agree at
@@ -157,21 +157,21 @@ upstream golden is available for the asking.
 
 The consumers are the problem, and there are two of them rather than one. The
 arm returns `[c, 2f-1, 2h, 2w]`, while both spatial call sites in §4's table
-require the frame count back unchanged — `vshape.frames` at `:3509-3516` and
-`slot_positions.size()` at `:3536-3548`. Those agree only when `f == 1`, that is
+require the frame count back unchanged — `vshape.frames` at `:3525-3531` and
+`slot_positions.size()` at `:3552-3563`. Those agree only when `f == 1`, that is
 when the temporal doubling is exactly undone by the mandatory drop.
 
-`vshape.frames` is `(frames - 1) / factors.time + 1` (`:3395`) and
+`vshape.frames` is `(frames - 1) / factors.time + 1` (`:3411`) and
 `factors.time` is the default-constructed 8
-(`ltx2_video.cpp:2855`, `ltx2_pipeline.h:460-462`), so `f == 1` needs
+(`ltx2_video.cpp:2853`, `ltx2_pipeline.h:460-462`), so `f == 1` needs
 `frames <= 8`. That is reachable — `num_frames` in 2..8 passes through verbatim
-at `:2837`, and the only lower bound anywhere on the path is `frames < 1` at
+at `:2853`, and the only lower bound anywhere on the path is `frames < 1` at
 `:2853` — but it is the one configuration in which the capability's whole point,
 the doubled frame axis, is cancelled before anything can observe it.
 
 For every other clip, porting the operator would replace the named refusal at
 `ltx2_upsampler.cpp:465` with the generic shape complaint at `:3511`. The guard
-immediately above it (`ltx2_video.cpp:3455-3477`) exists to prevent precisely
+immediately above it (`ltx2_video.cpp:3473-3502`) exists to prevent precisely
 that substitution for the temporal-only arm, and its comment says so.
 
 So the choice is between mirroring upstream's compute and keeping a diagnosis
@@ -262,10 +262,10 @@ header warns about twice, and it passes an end-to-end render.
 
 ### A sibling defect this row did NOT fix, and why
 
-`src/vllm/multimodal/ltx2_video.cpp:3484-3486` tells a caller who supplies the
+`src/vllm/multimodal/ltx2_video.cpp:3499-3501` tells a caller who supplies the
 temporal-only checkpoint that "no phase of any recipe this engine serves
 consumes it, because its only upstream consumer is DFRPipeline's rounds loop,
-which is not ported". DFR **is** ported and drives that arm at `:5042`. It is
+which is not ported". DFR **is** ported and drives that arm at `:5058`. It is
 the same false statement this row corrected in `ltx2_upsampler.h` under
 [#2580](https://github.com/mudler/vllm.cpp/issues/2580), one file over, and it
 is user-facing where the header's was not.
@@ -275,6 +275,18 @@ It is already tracked as **D11b** in
 than re-filed — intake without an exit is what that document says produced 701
 open issues. Left to its owner because repairing a user-facing refusal is its
 own red-first change, not a comment fix ridden along on this one.
+
+### The anchors this row cited went stale inside this row
+
+The load-time guard adds 16 lines near the top of `ltx2_video.cpp`, so every
+anchor below it moved by exactly 16 -- including the ones this spec, the header
+and two issues use to argue A8's case. `test_ltx2_video`'s recorded-reader-anchor
+gate caught its own list and nothing catches prose, so the prose anchors were
+re-derived by grepping for the statements themselves rather than by adding 16.
+
+Worth stating because the numbers were correct when written and wrong when
+pushed, with no edit in between: a line anchor is a claim about a file that a
+later hunk in the SAME change can falsify.
 
 ### What was NOT done
 
@@ -303,7 +315,7 @@ checkpoint row: there is no artifact to pin.
 `.agents/specs/ltx25-completion-scope.md:371` calls A8 "the single cheapest real
 gap and the only reachable unported-feature refusal", and its §8 sizes it S
 beside A9. §5 above falsifies the sizing: the operator is cheap and the landing
-is not, because the second consumer at `ltx2_video.cpp:3532` was not counted.
+is not, because the second consumer at `ltx2_video.cpp:3548` was not counted.
 
 That document is operator-owned and a shared-file lock under AGENTS.md
 §Records, so it is **not edited from this row**. The contradiction is recorded

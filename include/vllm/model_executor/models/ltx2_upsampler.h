@@ -24,17 +24,17 @@
 // reader opens. `Ltx2UpsampleVideoLatent` has THREE product call sites, all in
 // multimodal/ltx2_video.cpp, and each one pins the frame axis:
 //
-//   :3505  the video latent, the `kSpatialUpsample` phase input transform.
-//          Requires `up.frames == vshape.frames` at :3509-3516.
-//   :3532  the generated keyframe slots, which take the SAME spatial upsampler
-//          (dfr_pipeline.py:348). Requires `slot_positions.size()` at :3536-3548.
-//   :5042  DFR's temporal-refinement rounds, the TEMPORAL arm. Reached through
+//   :3521  the video latent, the `kSpatialUpsample` phase input transform.
+//          Requires `up.frames == vshape.frames` at :3525-3531.
+//   :3548  the generated keyframe slots, which take the SAME spatial upsampler
+//          (dfr_pipeline.py:348). Requires `slot_positions.size()` at :3552-3563.
+//   :5058  DFR's temporal-refinement rounds, the TEMPORAL arm. Reached through
 //          the `temporal_upsample_rounds` load extra, and instrumented by
 //          `trace.temporal_upsample_calls` (multimodal/ltx2_video.h:741).
 //
 // This paragraph said "NOTHING, today" of the temporal arm and "the engine's ONE
 // upsampler call site" of the spatial one. Both were false by the time they were
-// read: site :5042 drives the temporal arm and is not a phase input transform at
+// read: site :5058 drives the temporal arm and is not a phase input transform at
 // all. Corrected under issue #2580; the count is what the dims=2 port's
 // reachability argument rests on, so it is derived here rather than remembered.
 // The shipped temporal checkpoint

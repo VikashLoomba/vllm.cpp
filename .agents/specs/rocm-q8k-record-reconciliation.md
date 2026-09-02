@@ -239,9 +239,29 @@ not push, open a pull request, merge, or edit GitHub state.
 
 ## Outcome
 
-`PENDING`: fill this section after the record-only implementation passes its
-focused checks, mutations, record gate, and staged preflight. Record the final
-file set and dispositions without storing a derived operation total.
+`COMPLETE`: issue #2599's record-only repair changes exactly these files:
+
+- `.agents/specs/rocm-q8k-cooperative-quantizer.md`
+- `.agents/specs/rocm-q8k-record-reconciliation.md`
+- `docs/FEATURES.md`
+
+The focused assertion recorded the required stale-state failure. It then
+passed against both public cells and all corrected Q8_K current-state sections.
+The wrapped-call-safe, device-specific recount exited 0 with its output
+suppressed.
+
+Six separate scratch mutations each failed for the intended reason. They
+covered both numeric totals, both guide references, one stale state, and one
+external-architecture default. Every restoration was byte-identical and
+returned the focused assertion to exit 0.
+
+The whitespace, local-link, scoped-prose, record, and documentation gates
+exited 0. The controlled full preflight returned skip-aware exit 0. It is not
+green because five NumPy-dependent suites and five argument-dependent tools
+were skipped. The tree compile scope was a derived empty set, not a skip.
+
+No derived operation total is stored. The accepted `gfx1100` result and default
+remain unchanged, and #1876 stays open for `gfx1200` and `gfx1201` validation.
 
 ## Stop conditions
 

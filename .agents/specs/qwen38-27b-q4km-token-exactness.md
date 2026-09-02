@@ -204,6 +204,16 @@ reproduced #857 byte for byte from a different build.
   kernels are not ported, so our CPU decode cannot be bit-identical to an
   aarch64 oracle build even at equal precision. Tracked by #2534 until this row
   closes and then re-filed if it survives.
+- The KV cache cannot be made to MATCH the oracle, only to out-precision it.
+  `ResolveKvCacheDType` ([kv_cache_dtype.h:28](../../include/vllm/v1/kv_cache_dtype.h#L28))
+  offers bf16 or f32 and no f16, while llama.cpp's context defaults to
+  `GGML_TYPE_F16` (`src/llama-context.cpp:3538-3539`). The f32 arm is strictly
+  more precise than the oracle's store, which removes our error but leaves the
+  oracle's own f16 rounding unmatched, so a KV-cache-driven residual cannot be
+  closed from our side alone.
+- `VT_ACT_F32` is an instrument, not a default. Whether the CPU tier SHIPS f32 is
+  a product default and is decided by the A/B this row runs, not by the commit
+  that added the resolver.
 
 ## Now
 

@@ -130,16 +130,17 @@ TEST_CASE("the reference tier follows UnifiedMemory, which is the memory-safety 
   }
 }
 
-TEST_CASE("approach (b): the alloc path and UnifiedMemory() move together") {
+TEST_CASE("#2511: the alloc path, the unified claim and the fault window move together") {
   if (NoDevice()) return;
   Backend& rocm = vt::GetBackend(DeviceType::kROCM);
   const bool integrated = vt::rocm::IntegratedDevice(0);
   const bool managed = vt::rocm::ManagedAllocActive(0);
   const bool unified = rocm.UnifiedMemory();
-  // Printed unconditionally: this triple is the first thing a bring-up report
-  // on issue #41 should carry.
+  const bool host_pageable = vt::rocm::HostMemoryIsDeviceAddressable(0);
+  // Printed unconditionally: this quadruple is the first thing a bring-up report
+  // on issue #41 or #2511 should carry.
   MESSAGE("ROCm device 0 integrated: ", integrated, " managed-alloc: ", managed,
-          " UnifiedMemory(): ", unified);
+          " UnifiedMemory(): ", unified, " integrated+pageable: ", host_pageable);
 
   if (!integrated) {
     // DISCRETE (7900 XTX, R9700): the managed branch must be provably dead and
@@ -150,20 +151,38 @@ TEST_CASE("approach (b): the alloc path and UnifiedMemory() move together") {
     CHECK_FALSE(unified);
     return;
   }
-  // INTEGRATED. Every board measured on issue #41 (gfx1151 F6 attribute table,
-  // gfx1103 confirmation) reports ManagedMemory=1 + ConcurrentManagedAccess=1,
-  // so the managed branch is active and UnifiedMemory() is true by
-  // construction. An integrated device that probes NOT managed-capable would
-  // fail here: that is a hardware class the (b) fix does not cover, and a loud
-  // failure carrying the triple above is more useful than a silent skip —
-  // please post it on https://github.com/mudler/vllm.cpp/issues/41.
-  CHECK_MESSAGE(managed,
-                "integrated device without the managed-alloc branch: "
-                "ManagedMemory or ConcurrentManagedAccess probed 0 — post the "
-                "triple above on issue #41");
-  CHECK_MESSAGE(unified == managed,
-                "UnifiedMemory() must be true EXACTLY when the managed branch "
-                "is active on an XNACK-less integrated part");
+
+  // INTEGRATED. This case asserted the OPPOSITE until #2511, and the reason it
+  // changed is measured rather than argued: approach (b) gave every integrated
+  // managed-capable device migratable memory, and on an XNACK-less part —
+  // PageableMemoryAccess = 0, so no recoverable page fault — the driver
+  // migrating a page out from under a live queue is a hard violation. gfx1151
+  // measured 17 GPU faults in 21 legs on that branch and 0 in 21 without it.
+  //
+  // So the managed branch now requires the part to be able to fault and recover,
+  // which is exactly `HostMemoryIsDeviceAddressable(0)` on an integrated device.
+  CHECK_MESSAGE(managed == host_pageable,
+                "the managed branch must be taken EXACTLY where the device can "
+                "take a recoverable page fault (#2511) — post the quadruple "
+                "above on https://github.com/mudler/vllm.cpp/issues/2511");
+  // And the capability claim follows the ALLOCATOR, never the capability the
+  // allocator declined. Under the shipped default the managed branch implies
+  // ground 1, so this collapses to the W0 conjunction on every integrated part.
+  CHECK_MESSAGE(unified == host_pageable,
+                "UnifiedMemory() must follow the allocation path actually taken");
+  CHECK(rocm.DeviceMemoryIsHostAddressable() == unified);
+
+  // The reference tier is the consequence, and it is the whole reason this
+  // needed a decision. Where the claim was withdrawn, the backend must be able
+  // to SAY WHY: an op that loses its fallback is refused with this sentence
+  // appended, so a Strix Halo owner learns the cause at the point of failure.
+  if (!unified) {
+    CHECK_FALSE(vt::ReferenceTierEligible(DeviceType::kROCM));
+    REQUIRE(rocm.HostAddressabilityNote() != nullptr);
+    CHECK(std::string(rocm.HostAddressabilityNote()).find("2511") != std::string::npos);
+  } else {
+    CHECK(rocm.HostAddressabilityNote() == nullptr);
+  }
 }
 
 TEST_CASE("unified path: a kernel-written value is host-readable with no copy") {

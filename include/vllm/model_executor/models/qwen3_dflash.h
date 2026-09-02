@@ -246,6 +246,20 @@ struct Qwen3DFlashWeights {
   // selector's whole input is the target head's exact top-K, and widening the
   // head is the case `RefuseQuantizedDflash2LmHead` refuses.
   Nvfp4Weight lm_head_fp4;   // NVFP4 [N=draft_vocab, K=H] (else empty)
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 6): the SHARED head when the target
+  // stores it as an exllamav3 trellis. THE THIRD owner of the same
+  // exactly-one-of rule above, and it is packed for the same reason
+  // `lm_head_fp4` is: `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships
+  // `lm_head.{trellis,suh,svh,mul1}` and NO `lm_head.weight` at all
+  // (k=5120, n=248320, bits 6, codebook 2 — read from its safetensors header by
+  // range request, #2569), so there is nothing to read as dense floats and a
+  // dequantized copy would be a 2.543 GB buffer of a tensor the target itself
+  // never widens. Upstream needs no branch here because its head is an
+  // `nn.Module`: `compute_candidates` -> `LogitsProcessor.get_top_k_tokens` ->
+  // `_apply_head` -> `lm_head.quant_method.apply` IS the target's own logits
+  // path (logits_processor.py:241-286,:132-142 @ the merged
+  // vllm-project/vllm#52816 head `b389ac29`).
+  Exl3Weight lm_head_exl3;   // trellis [K=H, N=draft_vocab] (else empty)
   // Optional dedicated mask embedding [H] substituted at mask_token_id
   // (has_separate_mask_embedding). Empty for the z-lab 27B (in-vocab mask token).
   OwnedTensor mask_embedding;
@@ -357,12 +371,23 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
 // `lm_head.quant_method.apply` (logits_processor.py:241-286,132-142), which IS
 // the target's own logits path.
 //
-// EXACTLY ONE output is populated. Throws, naming the target shards, when the
-// head is absent; throws naming the arm when the head is NVFP4 with an
-// ACTIVATION scale in force (`VT_MODELOPT_W4A4=1`), because the fp4-activation
-// GEMM is not the W4A16 dispatcher this draft's logits GEMM takes.
+// MODEL-QWEN35-EXL3-HEAD (#2495 item 6) adds the THIRD arm and the fourth
+// parameter: an exllamav3 trellis head lands PACKED in `head_exl3`. The
+// parameter is REQUIRED and has no default, for the reason
+// `SharedHeadSource::LoadInto` gives at length for the two it already has: a
+// defaulted owner is what silently turns an arm off and leaves every gate green.
+// `nullptr` means "this lane cannot compute with a trellis head", and the read
+// then refuses the checkpoint by name rather than returning an empty head.
+//
+// EXACTLY ONE output is populated. Throws, naming the target shards AND the arms
+// it tried, when no arm matches (#2569 — this function used to fall off the end
+// of its bf16 loop and return silently, leaving the refusal to whichever caller
+// happened to check emptiness); throws naming the arm when the head is NVFP4
+// with an ACTIVATION scale in force (`VT_MODELOPT_W4A4=1`), because the
+// fp4-activation GEMM is not the W4A16 dispatcher this draft's logits GEMM takes.
 void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
-                            OwnedTensor* head_bf16, Nvfp4Weight* head_fp4);
+                            OwnedTensor* head_bf16, Nvfp4Weight* head_fp4,
+                            Exl3Weight* head_exl3);
 
 // SPEC-DFLASH2 W9 (#1849). Fill the draft's SHARED embedding table from the
 // TARGET's safetensors shards, borrow-first: a whole-range verbatim bf16 read

@@ -3218,6 +3218,39 @@ DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights)
   if (!weights.lm_head_fp4.Empty())
     return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
   const OwnedTensor& lm_head = DenseLmHead(weights);
+  // #2534: a GGUF KEEP-QUANT head takes the f32-output GEMM, joining the EXL3
+  // and NVFP4 heads above rather than the bf16 helper below.
+  //
+  // It used to take the bf16 helper, and only because `nk` is a LAYOUT flag:
+  // `qwen3_5_gguf_weights.cpp::OwnGgufQuantBlocks` sets it true because "GGUF
+  // disk order [out, in] IS the MatmulBT [N, K] orientation", which says nothing
+  // about numerics. It therefore inherited a rule authored for the TIED BF16
+  // torch-Linear head the helper's own comment names. Measured cost of that
+  // inheritance: 288 of 288 of the Q4_K_M arm's top-1 logits landed exactly on
+  // the bf16 grid, whose ULP is 0.125 at the magnitude 16-32 these logits carry,
+  // while the six near-ties the llama.cpp token gate convicts us on are gaps of
+  // 0.027 to 0.178 -- five of six below our own resolution, and six steps EXACT
+  // TIES (#2534, docs/bench-evidence/qwen38-27b-q4km-logit-delta-20260902.md).
+  //
+  // This DIVERGES from vLLM's default, deliberately, and the divergence is
+  // argued in .agents/specs/qwen38-27b-q4km-logits-f32.md rather than assumed.
+  // Upstream keeps the head in the model dtype (`logits_processor.py:99-136`
+  // `_apply_head`; `config/model.py:2187-2208` `_get_head_dtype` defaults a
+  // GENERATION model to the model dtype) and widens afterwards in the sampler
+  // (`v1/sample/sampler.py:96`), exactly as `MatmulBf16LogitsF32D` does. But
+  // vLLM has no in-tree GGUF reader at the pin, so it resolves no model dtype
+  // for this checkpoint at all (#979); and where upstream DOES select an f32
+  // head it accumulates straight into f32 rather than casting operands
+  // (`logits_processor.py:127-131`, `torch.mm(..., out_dtype=...)`), which is
+  // what this arm now does -- the keep-quant kernels already accumulate in f32
+  // and only round at the store, so no weight copy and no cast pass is added.
+  // Upstream's refusal of an f32 head on a QUANTIZED head
+  // (`logits_processor.py:111-115`) guards its `.to(f32)` weight-cast fallback,
+  // a mechanism we do not use.
+  //
+  // Elementwise bf16/f16 heads are untouched below, so no safetensors default
+  // and no recorded device measurement on those arms moves.
+  if (vt::IsBlockQuant(lm_head.dtype)) return MatmulF32D(d, x, lm_head);
   return lm_head.nk ? MatmulBf16LogitsF32D(d, x, lm_head)
                     : MatmulF32D(d, x, lm_head);
 }
@@ -7574,6 +7607,15 @@ DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
     device.b.Copy(device.q, cat + target_offset + row_bytes, target + source_offset,
                   row_bytes);
   }
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): the fc-cat projection through the ONE
+  // EXL3 linear seam when the checkpoint quantized it, bf16 out because that is
+  // what `MatmulBf16D` returns and what the decoder layer below consumes. There
+  // is no second matmul: `dense_exl3::Linear` forwards to
+  // `layers::Exl3LinearMethod`, which calls `dense_attn::Exl3MatmulD`.
+  if (weights.IsExl3()) {
+    return dense_exl3::Linear(device, concatenated.t(), weights.fc,
+                              weights.fc_exl3, DType::kBF16);
+  }
   return MatmulBf16D(device, concatenated.t(), weights.fc);
 }
 
@@ -8696,7 +8738,12 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       lm_head_(&DenseLmHead(target)),
       // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must see
       // the packed one too. Empty on every BF16/FP8/tied dense target.
-      lm_head_fp4_(&target.lm_head_fp4) {
+      lm_head_fp4_(&target.lm_head_fp4),
+      // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): and the TRELLIS one, for the same
+      // reason. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships no `lm_head.weight` at
+      // all, so on that target `DenseLmHead(target)` above is EMPTY and this is
+      // the only head there is. Empty on every other dense target.
+      lm_head_exl3_(&target.lm_head_exl3) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -8708,7 +8755,12 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       config_(&config),
       embed_tokens_(&target.embed_tokens),
       lm_head_(&target.lm_head),
-      lm_head_fp4_(&target.lm_head_fp4) {
+      lm_head_fp4_(&target.lm_head_fp4),
+      // `Qwen3_5MoeWeights` has NO EXL3 head owner, so there is nothing to point
+      // at. Said out loud rather than left to a default, and rather than adding a
+      // field to the MoE container that no loader fills: no EXL3 MoE checkpoint
+      // is in scope (.agents/specs/model-qwen35-exl3-head.md `## Owed`).
+      lm_head_exl3_(nullptr) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kMoe,
            "qwen3_5 MTP: MoE target requires MoE MTP weights");
 }
@@ -8735,10 +8787,18 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                target_hidden_states.device == queue.device,
            "qwen3_5 MTP forward: target hidden states must be contiguous "
            "bf16 [T,H] on the queue device");
-  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
-               weights_->fc.shape[0] == hidden_size &&
-               weights_->fc.shape[1] == 2 * hidden_size,
-           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): ONE precondition, two containers.
+  // The trellis stores [K=2H, N=H] where the torch Linear stores [N=H, K=2H],
+  // so the same projection is asserted through the orientation its own owner
+  // uses. `IsExl3()` is the loader's answer, not a second derivation.
+  VT_CHECK(weights_->IsExl3()
+               ? (weights_->fc_exl3.InFeatures() == 2 * hidden_size &&
+                  weights_->fc_exl3.OutFeatures() == hidden_size)
+               : (weights_->fc.rank == 2 && weights_->fc.nk &&
+                  weights_->fc.shape[0] == hidden_size &&
+                  weights_->fc.shape[1] == 2 * hidden_size),
+           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H] or an EXL3 trellis "
+           "[K=2H, N=H]");
 
   (void)vocab_size;
   // ONE decode step. A DRAFT forward is a complete forward with its own working
@@ -8798,10 +8858,18 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
                target_hidden_states.device == queue.device,
            "qwen3_5 MTP paged forward: target hidden states must be contiguous "
            "bf16 [T,H] on the queue device");
-  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
-               weights_->fc.shape[0] == hidden_size &&
-               weights_->fc.shape[1] == 2 * hidden_size,
-           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H]");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): ONE precondition, two containers.
+  // The trellis stores [K=2H, N=H] where the torch Linear stores [N=H, K=2H],
+  // so the same projection is asserted through the orientation its own owner
+  // uses. `IsExl3()` is the loader's answer, not a second derivation.
+  VT_CHECK(weights_->IsExl3()
+               ? (weights_->fc_exl3.InFeatures() == 2 * hidden_size &&
+                  weights_->fc_exl3.OutFeatures() == hidden_size)
+               : (weights_->fc.rank == 2 && weights_->fc.nk &&
+                  weights_->fc.shape[0] == hidden_size &&
+                  weights_->fc.shape[1] == 2 * hidden_size),
+           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H] or an EXL3 trellis "
+           "[K=2H, N=H]");
   VT_CHECK(attn_meta.num_actual_tokens == tokens,
            "qwen3_5 MTP paged forward: attn metadata token count must equal T");
   VT_CHECK(draft_kv.num_kv_heads == config_->num_key_value_heads &&
@@ -8891,9 +8959,20 @@ ForwardLogits Qwen3_5MTPModel::ComputeLogits(
            "qwen3_5 MTP logits: hidden states must be contiguous bf16 [T,H] "
            "on the queue device");
   Dev device{vt::GetBackend(queue.device.type), queue};
-  DBuf logits = (lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
-                    ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
-                    : MatmulF32D(device, hidden_states, *lm_head_);
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5). The arms are ordered
+  // `exl3 -> fp4 -> bf16`, which is `DenseLogitsF32D`'s order and
+  // `DflashLogitsF32D`'s, so the three readers of ONE target head cannot
+  // disagree about precedence. The trellis head is COMPUTED WITH, never widened:
+  // a dequantized copy of the real 248320x5120 head is 2.543 GB, and upstream
+  // reaches the packed path without a branch because `_apply_head` calls
+  // `lm_head.quant_method.apply` (logits_processor.py:132-142).
+  DBuf logits =
+      (lm_head_exl3_ != nullptr && !lm_head_exl3_->Empty())
+          ? dense_exl3::Linear(device, hidden_states, *lm_head_, *lm_head_exl3_,
+                               DType::kF32)
+          : ((lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
+                 ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
+                 : MatmulF32D(device, hidden_states, *lm_head_));
   return WrapDeviceLogits(device, std::move(logits), config_->vocab_size);
 }
 

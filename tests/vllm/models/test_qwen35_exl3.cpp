@@ -54,6 +54,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -71,7 +72,10 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/model_executor/models/qwen3_dflash.h"
+#include "vllm/model_executor/models/qwen3_dflash2.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -91,6 +95,9 @@ using vllm::ModelRegistry;
 using vllm::ModelSource;
 using vllm::PagedKvCache;
 using vllm::Qwen3_5DenseWeights;
+using vllm::Qwen3_5MTPKind;
+using vllm::Qwen3_5MTPModel;
+using vllm::Qwen3_5MTPWeights;
 using vllm::SafetensorsFile;
 using vllm::v1::CommonAttentionMetadata;
 using vllm::v1::GDNAttentionMetadata;
@@ -558,6 +565,75 @@ std::vector<FixtureTensor> DenseCheckpoint(
 }
 
 // ---------------------------------------------------------------------------
+// The `mtp.*` draft head — MODEL-QWEN35-EXL3-HEAD (#2495 item 5)
+// ---------------------------------------------------------------------------
+//
+// NINE tensors of `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` live under `mtp.` and are
+// quantized: `fc`, the four `self_attn` projections and the three `mlp` ones.
+// Read from `model-00002-of-00002.safetensors`'s own header by HTTP range
+// request (no payload downloaded): each carries `.trellis` / `.suh` / `.svh` /
+// `.mul1`, and each trellis last dim is 64 -- FOUR bits, which is what
+// `quantization_config.mtp_bits` also says and which the loader reads from the
+// tensor rather than from that key.
+//
+// TWO asymmetries with the body, and neither is a free choice here.
+//
+// `mtp.fc` is [K=2H, N=H] -- the fc-cat projection consumes the concatenated
+// [embed_norm | target_norm] row. The bf16 twin therefore writes a torch Linear
+// `.weight` of [N=H, K=2H], which is the orientation `AppendDecodedBf16`
+// already produces from the same `Exl3Proj`.
+//
+// The `mtp.*` REMAINDER is BF16, not F16. The body's remainder is F16 because
+// exllamav3 runs its linears in fp16, and the parent row had to widen the
+// readers for it; the artifact stores `mtp.norm`, `mtp.pre_fc_norm_*`, the two
+// layernorms and the two per-head norms as BF16 regardless. Writing them F16
+// here would test a widening this row does not do and the artifact does not
+// need.
+void AppendMtp(std::vector<FixtureTensor>& t, const Geometry& g, Arm arm) {
+  const Exl3Proj fc = MakeProj(2 * g.hidden, g.hidden, 7101);
+  if (arm == Arm::kExl3) {
+    AppendExl3(t, "mtp.fc", fc);
+  } else {
+    AppendDecodedBf16(t, "mtp.fc", fc);
+  }
+  // BF16 in BOTH arms, and from ONE set of values, so the two checkpoints hold
+  // bit-identical norms and the forward comparison measures the projections.
+  t.push_back({"mtp.pre_fc_norm_embedding.weight", "BF16", {g.hidden},
+               RemainderBytes({g.hidden}, 7110, 0.5F, false)});
+  t.push_back({"mtp.pre_fc_norm_hidden.weight", "BF16", {g.hidden},
+               RemainderBytes({g.hidden}, 7111, 0.5F, false)});
+  t.push_back({"mtp.norm.weight", "BF16", {g.hidden},
+               RemainderBytes({g.hidden}, 7112, 0.5F, false)});
+
+  const std::string base = "mtp.layers.0.";
+  t.push_back({base + "input_layernorm.weight", "BF16", {g.hidden},
+               RemainderBytes({g.hidden}, 7120, 0.5F, false)});
+  t.push_back({base + "post_attention_layernorm.weight", "BF16", {g.hidden},
+               RemainderBytes({g.hidden}, 7121, 0.5F, false)});
+  const std::string sa = base + "self_attn.";
+  AppendProjection(t, sa + "q_proj", g.q_n, g.hidden, arm, 7130);
+  AppendProjection(t, sa + "k_proj", g.kv_n, g.hidden, arm, 7140);
+  AppendProjection(t, sa + "v_proj", g.kv_n, g.hidden, arm, 7150);
+  AppendProjection(t, sa + "o_proj", g.hidden, g.attn_out_k, arm, 7160);
+  t.push_back({sa + "q_norm.weight", "BF16", {g.head_dim},
+               RemainderBytes({g.head_dim}, 7170, 0.5F, false)});
+  t.push_back({sa + "k_norm.weight", "BF16", {g.head_dim},
+               RemainderBytes({g.head_dim}, 7171, 0.5F, false)});
+  const std::string mlp = base + "mlp.";
+  AppendProjection(t, mlp + "gate_proj", g.inter, g.hidden, arm, 7180);
+  AppendProjection(t, mlp + "up_proj", g.inter, g.hidden, arm, 7181);
+  AppendProjection(t, mlp + "down_proj", g.hidden, g.inter, arm, 7182);
+}
+
+// A whole checkpoint that ALSO carries the draft head, which is what the
+// published artifact is.
+std::vector<FixtureTensor> DenseCheckpointWithMtp(Arm arm, const Geometry& g) {
+  std::vector<FixtureTensor> t = DenseCheckpoint(arm, g);
+  AppendMtp(t, g, arm);
+  return t;
+}
+
+// ---------------------------------------------------------------------------
 // Driving the production paths
 // ---------------------------------------------------------------------------
 
@@ -716,6 +792,86 @@ std::vector<float> RegistryForward(const HfConfig& c, const Geometry& g,
   const ForwardLogits out = ModelRegistry::Forward(*model, in);
   REQUIRE(out.host.size() == static_cast<size_t>(T * c.vocab_size));
   return out.host;
+}
+
+// ---------------------------------------------------------------------------
+// Driving the MTP draft — MODEL-QWEN35-EXL3-HEAD (#2495 item 5)
+// ---------------------------------------------------------------------------
+
+// The draft's KV, one block, sized for the ONE full-attention layer the MTP head
+// is (`qwen3_5_mtp.py:105-112`).
+struct DraftKv {
+  std::vector<uint16_t> buf;
+  PagedKvCache kv;
+  DraftKv(const HfConfig& c, int64_t num_blocks, int64_t block_size) {
+    buf.assign(static_cast<size_t>(num_blocks * 2 * block_size *
+                                   c.num_key_value_heads * c.head_dim),
+               0);
+    kv.data = buf.data();
+    kv.dtype = DType::kBF16;
+    kv.num_blocks = num_blocks;
+    kv.block_size = block_size;
+    kv.num_kv_heads = c.num_key_value_heads;
+    kv.head_size = c.head_dim;
+  }
+};
+
+// THE PRODUCTION DRAFT PATH. `ForwardPaged` is what the spec-decode runner calls
+// (`Qwen3_5MTPModel::ForwardPaged`, reached from the MTP speculator);
+// `ComputeLogits` applies the TARGET's shared head to its output. Both are
+// entered over weights the LOADER produced from a checkpoint on disk, so a
+// deleted call site reds this rather than leaving a class-level gate green.
+std::vector<float> MtpPagedLogits(const HfConfig& c, const Geometry& g,
+                                  const Qwen3_5MTPWeights& mtp,
+                                  const Qwen3_5DenseWeights& target,
+                                  vt::Backend& backend, vt::Queue& queue) {
+  const int64_t T = 4;
+  const std::vector<int32_t> ids = {5, 9, 2, 17};
+  const std::vector<int32_t> pos = {0, 1, 2, 3};
+  const Qwen3_5MTPModel model(mtp, target, c);
+  // The target's hidden-state tap, bf16 [T,H]. Deterministic and identical for
+  // both arms, so the comparison below measures the head and nothing else.
+  std::vector<uint16_t> hidden(static_cast<size_t>(T * g.hidden));
+  Rng r;
+  r.s = 8181u;
+  for (auto& v : hidden) v = vt::F32ToBF16(r.unit() * 0.25F);
+  const vt::Tensor th = vt::Tensor::Contiguous(
+      hidden.data(), DType::kBF16, queue.device, {T, g.hidden});
+
+  DraftKv pool(c, /*num_blocks=*/1, /*block_size=*/8);
+  CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.query_start_loc_cpu = am.query_start_loc;
+  am.seq_lens = {static_cast<int32_t>(T)};
+  am.seq_lens_cpu = am.seq_lens;
+  am.max_query_len = static_cast<int>(T);
+  am.max_seq_len = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor = {0};
+  for (int64_t t = 0; t < T; ++t) am.slot_mapping.push_back(t);
+  am.causal = true;
+
+  const vllm::Qwen3_5MTPHiddenStates hs =
+      model.ForwardPaged(ids, pos, th, am, pool.kv, queue);
+  const ForwardLogits logits = model.ComputeLogits(hs.tensor, queue);
+  std::vector<float> host(static_cast<size_t>(logits.rows) * logits.vocab);
+  backend.Copy(queue, host.data(), logits.device_tensor.data,
+               host.size() * sizeof(float));
+  backend.Synchronize(queue);
+  return host;
+}
+
+double RelRms(const std::vector<float>& got, const std::vector<float>& ref) {
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < got.size(); ++i) {
+    const double d = static_cast<double>(got[i]) - ref[i];
+    num += d * d;
+    den += static_cast<double>(ref[i]) * ref[i];
+  }
+  REQUIRE(den > 0.0);  // a zeroed forward satisfies any relative bound
+  return std::sqrt(num / den);
 }
 
 }  // namespace
@@ -1166,4 +1322,210 @@ TEST_CASE("qwen3_5 exl3: the bf16, per-tensor FP8 and NVFP4 arms are UNCHANGED")
     CHECK_FALSE(w.layers[0].gdn.IsExl3());
     CHECK_FALSE(w.layers[0].gdn.in_proj_qkvz.Empty());
   }
+}
+
+// ===========================================================================
+// MODEL-QWEN35-EXL3-HEAD (#2495 item 5 remainder, item 6, #2569)
+//
+// ONE representation decision, three readers. The target's own logits already
+// compute against the trellis (the parent row). These cases are the other two:
+// the MTP draft, which SHARES the target's head, and the DFlash/DSpark draft's
+// shared-head read. Plus the `mtp.*` half of item 5, which is nine quantized
+// tensors the loader refused as "expected BF16".
+// ===========================================================================
+
+// H1 + H2 + H3 ---------------------------------------------------------------
+TEST_CASE("qwen3_5 exl3: the mtp.* draft head LOADS, and its PAGED forward "
+          "agrees with the decoded twin") {
+  const Geometry g;
+  const HfConfig c = DenseConfig(/*with_exl3_quant_config=*/true);
+  const HfConfig c_plain = DenseConfig(/*with_exl3_quant_config=*/false);
+
+  const TempCheckpoint exl3_ckpt(DenseCheckpointWithMtp(Arm::kExl3, g));
+  const TempCheckpoint bf16_ckpt(DenseCheckpointWithMtp(Arm::kBf16, g));
+
+  std::vector<SafetensorsFile> se;
+  se.push_back(SafetensorsFile::Open(exl3_ckpt.path()));
+  std::vector<SafetensorsFile> sb;
+  sb.push_back(SafetensorsFile::Open(bf16_ckpt.path()));
+
+  // THE PRODUCTION LOADER ENTRY. `model_loader.cpp`'s `maybe_attach_mtp` calls
+  // exactly this overload on exactly these shards.
+  const Qwen3_5MTPWeights me =
+      vllm::LoadQwen3_5MTP(se, c, Qwen3_5MTPKind::kDense);
+  const Qwen3_5MTPWeights mb =
+      vllm::LoadQwen3_5MTP(sb, c_plain, Qwen3_5MTPKind::kDense);
+
+  // H1. The arm is active, and it is keyed on the TRELLIS.
+  REQUIRE(me.IsExl3());
+  REQUIRE_FALSE(mb.IsExl3());
+  CHECK(me.fc.Empty());
+  CHECK_FALSE(mb.fc.Empty());
+  CHECK(mb.fc.nk);
+
+  // The codebook is the half a shape check cannot see: the wrong multiplier
+  // decodes to the right RMS and uncorrelated values.
+  CHECK(me.fc_exl3.codebook == kCodebook);
+  CHECK(me.fc_exl3.Bits() == kBits);
+  // [K=2H, N=H] -- the fc-cat orientation, which the torch Linear stores the
+  // other way round. Both directions are asserted so a transposed read cannot
+  // pass on a square-ish fixture.
+  CHECK(me.fc_exl3.InFeatures() == 2 * g.hidden);
+  CHECK(me.fc_exl3.OutFeatures() == g.hidden);
+
+  REQUIRE(me.dense_layers.size() == 1);
+  CHECK(me.dense_layers[0].attn.IsExl3());
+  CHECK(me.dense_layers[0].mlp.IsExl3());
+  CHECK(me.dense_layers[0].attn.q_proj_exl3.codebook == kCodebook);
+  CHECK(me.dense_layers[0].mlp.down_proj_exl3.Bits() == kBits);
+  CHECK_FALSE(mb.dense_layers[0].attn.IsExl3());
+  CHECK_FALSE(mb.dense_layers[0].mlp.IsExl3());
+
+  // The remainder is BF16 on BOTH arms, which is what the artifact stores under
+  // `mtp.` even though its BODY remainder is F16.
+  CHECK(me.final_norm.dtype == DType::kBF16);
+  CHECK(std::memcmp(me.final_norm.bytes.data(), mb.final_norm.bytes.data(),
+                    me.final_norm.bytes.size()) == 0);
+
+  // H3. The TARGET's head is a trellis too, and the draft SHARES it. On this
+  // artifact there is no `lm_head.weight` at all, so the trellis is the only
+  // head there is.
+  const Qwen3_5DenseWeights te = LoadDense(exl3_ckpt, c);
+  const Qwen3_5DenseWeights tb = LoadDense(bf16_ckpt, c_plain);
+  REQUIRE_FALSE(te.lm_head_exl3.Empty());
+  REQUIRE(te.lm_head.Empty());
+  REQUIRE(tb.lm_head_exl3.Empty());
+  REQUIRE_FALSE(tb.lm_head.Empty());
+
+  // H2. Both drafts run their PAGED forward and apply their target's head.
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  const std::vector<float> le = MtpPagedLogits(c, g, me, te, backend, queue);
+  const std::vector<float> lb =
+      MtpPagedLogits(c_plain, g, mb, tb, backend, queue);
+  backend.DestroyQueue(queue);
+
+  REQUIRE(le.size() == lb.size());
+  REQUIRE(!le.empty());
+  for (const float x : le) REQUIRE(std::isfinite(x));
+  for (const float x : lb) REQUIRE(std::isfinite(x));
+
+  const double rel = RelRms(le, lb);
+  MESSAGE("mtp exl3 paged logits vs decoded-bf16 twin: rel_rms = ", rel);
+  // A BOUND, not an equality, for the reason the dense case gives: EXL3 rides
+  // the Hadamards on the activations while the decoded twin has them baked in,
+  // and the twin rounds the decode to bf16. The head is 6 bits in the artifact
+  // and 4 here, so this bound is the fixture's and not the artifact's.
+  CHECK(rel <= 5.0e-2);
+}
+
+// H4 -------------------------------------------------------------------------
+TEST_CASE("qwen3_5 exl3: the DFlash draft's SHARED head read takes the trellis "
+          "arm, and ONLY it") {
+  const Geometry g;
+  const HfConfig c = DenseConfig(/*with_exl3_quant_config=*/true);
+  const TempCheckpoint ckpt(DenseCheckpointWithMtp(Arm::kExl3, g));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(ckpt.path()));
+
+  vllm::Qwen3DFlashWeights w;
+  vllm::LoadDflashSharedLmHead(shards, &w.lm_head, &w.lm_head_fp4,
+                               &w.lm_head_exl3);
+
+  // EXACTLY ONE owner, which is the rule the target's own head already obeys.
+  REQUIRE_FALSE(w.lm_head_exl3.Empty());
+  CHECK(w.lm_head.Empty());
+  CHECK(w.lm_head_fp4.Empty());
+  CHECK(w.lm_head_exl3.codebook == kCodebook);
+  CHECK(w.lm_head_exl3.Bits() == kBits);
+  CHECK(w.lm_head_exl3.InFeatures() == g.hidden);
+  CHECK(w.lm_head_exl3.OutFeatures() == g.vocab);
+
+  // The SAME tensor the target loads for itself, byte for byte. Two readings of
+  // one head that disagreed would be the "two descriptions of one rule" defect.
+  const Qwen3_5DenseWeights target = LoadDense(ckpt, c);
+  REQUIRE(target.lm_head_exl3.trellis.bytes.size() ==
+          w.lm_head_exl3.trellis.bytes.size());
+  CHECK(std::memcmp(target.lm_head_exl3.trellis.bytes.data(),
+                    w.lm_head_exl3.trellis.bytes.data(),
+                    w.lm_head_exl3.trellis.bytes.size()) == 0);
+
+  // THE REFUSAL DOES NOT MOVE. `lm_head_dequantized` means "this head was
+  // WIDENED on the way in", which only the GGUF arm can do; a packed trellis is
+  // the opposite state and must not set it. Deleting the guard's trigger is what
+  // #1314's fresh review caught, so the guard is exercised in both directions.
+  w.conv_taps = 2;
+  REQUIRE(w.IsDflash2());
+  CHECK_FALSE(w.lm_head_dequantized);
+  CHECK_NOTHROW(vllm::RefuseQuantizedDflash2LmHead(w));
+  vllm::Qwen3DFlashWeights widened = w;
+  widened.lm_head_dequantized = true;
+  CHECK_THROWS(vllm::RefuseQuantizedDflash2LmHead(widened));
+}
+
+// H5 -------------------------------------------------------------------------
+TEST_CASE("qwen3_5 exl3: a lane with no trellis owner REFUSES an EXL3 target "
+          "head by name") {
+  // The DSpark shape: its backbone holds ONE bf16 `lm_head`, so it passes
+  // `head_fp4 = nullptr` and `head_exl3 = nullptr`. On this artifact there is no
+  // `lm_head.weight` to fall back to.
+  //
+  // THIS IS #2569's CASE. Before this row the read fell off the end of its bf16
+  // loop and RETURNED, leaving every owner empty and no sentence anywhere; the
+  // refusal was left to whichever caller happened to test emptiness, and the one
+  // that does names bf16 tensors -- the wrong reason for a head that is present
+  // and simply not dense. Deleting the throw makes this case pass silently.
+  const Geometry g;
+  const TempCheckpoint ckpt(DenseCheckpointWithMtp(Arm::kExl3, g));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(ckpt.path()));
+
+  vllm::OwnedTensor bf16_only;
+  std::string message;
+  try {
+    vllm::LoadDflashSharedLmHead(shards, &bf16_only, /*head_fp4=*/nullptr,
+                                 /*head_exl3=*/nullptr);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  REQUIRE_FALSE(message.empty());
+  CHECK(Names(message, "matched NO arm"));
+  CHECK(Names(message, "NOT OFFERED"));
+  CHECK(Names(message, "2569"));
+  CHECK(bf16_only.Empty());
+}
+
+// H5b ------------------------------------------------------------------------
+TEST_CASE("qwen3_5 exl3: a head that matches no arm at all REFUSES, with every "
+          "owner offered") {
+  // The pure #2569 case: all three owners available and none of them selectable.
+  // A half-written EXL3 head is the shape -- `.suh` present, `.trellis` absent
+  // -- which `Linear.is_exl3_storage` correctly declines, leaving nothing.
+  const Geometry g;
+  std::vector<FixtureTensor> t = DenseCheckpoint(Arm::kExl3, g);
+  t.erase(std::remove_if(t.begin(), t.end(),
+                         [](const FixtureTensor& f) {
+                           return f.name.rfind("lm_head.", 0) == 0;
+                         }),
+          t.end());
+  t.push_back({"lm_head.suh", "F16", {g.hidden},
+               RemainderBytes({g.hidden}, 9101, 1.0F, true)});
+  const TempCheckpoint ckpt(t);
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(ckpt.path()));
+
+  vllm::OwnedTensor bf16;
+  vllm::Nvfp4Weight packed;
+  Exl3Weight trellis;
+  std::string message;
+  try {
+    vllm::LoadDflashSharedLmHead(shards, &bf16, &packed, &trellis);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  REQUIRE_FALSE(message.empty());
+  CHECK(Names(message, "matched NO arm"));
+  CHECK(bf16.Empty());
+  CHECK(packed.Empty());
+  CHECK(trellis.Empty());
 }

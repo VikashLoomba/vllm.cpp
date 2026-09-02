@@ -221,8 +221,14 @@ bool detail::ActF32FlagIsOn(const char* env_value) {
 vt::DType detail::ActDType(vt::DeviceType dev_type) {
   static const bool f32 = detail::ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
   if (!f32) return vt::DType::kBF16;
-  return vllm::platforms::GetPlatform(dev_type).is_cpu() ? vt::DType::kF32
-                                                         : vt::DType::kBF16;
+  // Compare the ENUM, not `GetPlatform(dev_type).is_cpu()`. The platform
+  // registry holds only the platforms a given binary linked, and asking it about
+  // an unregistered type THROWS ("no platform registered for device type 1",
+  // platform.cpp:74). A dtype resolver has to be total: it is asked what a device
+  // type WOULD resolve to, including by a gate running in a CPU-only binary, and
+  // it must answer rather than abort. Measured: the CUDA/ROCM/METAL assertions in
+  // test_qwen27_paged_forward threw exactly that under VT_ACT_F32=1.
+  return dev_type == vt::DeviceType::kCPU ? vt::DType::kF32 : vt::DType::kBF16;
 }
 
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
@@ -2528,7 +2534,15 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
                                  direct_scale ? &as.t() : nullptr);
   }
 #endif
-  DBuf gated(d, ActDType(d), {T, K});
+  // BF16 here is `vt::SigmoidGateBf16`'s own contract ("out must be bf16",
+  // ops.cpp:5105), NOT the trunk's activation dtype, so it does NOT follow
+  // `ActDType`. Every other consumer this row retyped takes `IsOutFloat`, which
+  // admits f32; this one does not, and routing an f32 buffer into it aborted 9
+  // cases of test_qwen27_paged_forward under VT_ACT_F32=1. Widening the trunk
+  // therefore leaves ONE bf16 rounding on the gated-attention output, which the
+  // spec records as owed: closing it needs an f32-capable gate kernel, not a
+  // dtype change here.
+  DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first, out_dtype bf16 --
   // the same dtype every other arm of this o_proj returns.

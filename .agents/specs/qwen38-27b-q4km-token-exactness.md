@@ -322,6 +322,14 @@ reproduced #857 byte for byte from a different build.
   more precise than the oracle's store, which removes our error but leaves the
   oracle's own f16 rounding unmatched, so a KV-cache-driven residual cannot be
   closed from our side alone.
+- ONE bf16 rounding survives the f32 trunk. `vt::SigmoidGateBf16` fixes its
+  output dtype by contract ("out must be bf16", `ops.cpp:5105`), so the
+  gated-attention output at
+  [qwen3_5.cpp `SigmoidGateOProjD`](../../src/vllm/model_executor/models/qwen3_5.cpp)
+  stays bf16 under `VT_ACT_F32=1`. Closing it needs an f32-capable gate kernel,
+  which is a new op and not a dtype change. Every other consumer this row
+  retyped takes `IsOutFloat` and admits f32; this is the only exception, and it
+  was found by running, not by reading.
 - `VT_ACT_F32` is an instrument, not a default. Whether the CPU tier SHIPS f32 is
   a product default and is decided by the A/B this row runs, not by the commit
   that added the resolver.

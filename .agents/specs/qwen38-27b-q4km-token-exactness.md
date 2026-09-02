@@ -285,6 +285,67 @@ resolver's device predicate, which the second test registration pins in both
 directions.
 
 
+## The residual dtype is NOT the dominant term: measured, and it cuts against the hypothesis
+
+rc job `25cbca74-df63-43e4-b7db-1315497c4d41`, `thor:gpu0`, worker
+`rc-worker-n8smh`, log `out/lever-rc-worker-n8smh-20260902T035957Z/`. Same binary
+as the red-before, same artifact, prompts, token count and sampling; the only
+difference is `VT_BF16_RESIDUAL=0`, a lever that PREDATES this row and whose own
+comment documents it as the f32 rollback. Its unit arm is 33 of 33 green, and
+`vllm-bench` exited 0.
+
+```text
+ARM A (shipped default, bf16 residual)  GENERATION_DIVERGENCES=5/6  TOKEN_GATE=FAIL
+ARM E (VT_BF16_RESIDUAL=0, f32 residual) GENERATION_DIVERGENCES=5/6  TOKEN_GATE=FAIL
+```
+
+| prompt | A first diff | E first diff | |
+|---|---:|---:|---|
+| 0 | 7 | 7 | same |
+| 1 | 34 | **21** | earlier |
+| 2 | 20 | **4** | earlier |
+| 3 | 48 (exact) | 48 (exact) | same |
+| 4 | 14 | 14 | same |
+| 5 | 32 | 32 | same |
+
+Agreeing-prefix total 155 tokens against 126. **Making the residual stream f32 did
+not reduce the divergence count, and it made two prompts diverge EARLIER.**
+
+**The lever is live, which is the control that makes this readable.** The outputs
+changed, so this is not a knob that did nothing; it is a knob that did something
+and did not help.
+
+### What this does and does not license
+
+**It refutes the residual store as the dominant term.** The residual was the
+single largest suspect -- two roundings per layer on the 64-layer accumulator --
+and removing it moved the rate not at all.
+
+**It does NOT refute the bf16 activation hypothesis as a whole, and saying so
+would be overclaiming.** Arm E removes ONE of roughly eight bf16 stores per
+layer. `hidden`, the six `MatmulBf16D` projection outputs, the KV cache and the
+GDN state are all still bf16 in this arm, because the lever that would move them
+together is incomplete (`VT_ACT_F32`, above) and the KV lever does not run at all
+([#2548](https://github.com/mudler/vllm.cpp/issues/2548)). A partial dose that
+does not move a rate is weak evidence about the full dose.
+
+**What it does support is the chaotic reading.** A perturbation large enough to
+relocate two first-divergence indices by 13 and 16 tokens left the RATE at 5 of
+6. That is the same behaviour the oracle showed against itself: a change of
+comparable size reshuffles which near-ties flip without changing how many do. On
+that reading the rate is set by the total perturbation budget rather than by any
+one term, and no single dtype will move it.
+
+**Consequence for the row.** The bf16 term is no longer the leading named cause;
+it is one term among several, and the honest position is that the DOMINANT term
+is not yet identified. The instrument that would identify it is the one the
+2026-08-23 evidence already said was owed and that this row still has not built:
+a logit dump on OUR side, so our per-step logit delta against the oracle can be
+compared with the 0.2020-to-1.3657 self-perturbation band measured for the oracle.
+Without it, every remaining hypothesis is ranked by per-store magnitude rather
+than by measurement.
+
+
 ## Scope
 
 1. Measure whether the oracle's own greedy decode is stable across its own

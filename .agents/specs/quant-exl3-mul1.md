@@ -79,9 +79,9 @@ Three facts make that port exact rather than approximate, and each is asserted:
 ## Scope
 
 IN: the codebook-2 decode on the host and on the device; the loader's resolution
-of a `mul1` marker; the `(bits, codebook)` arms `(4,2)`, `(5,2)` and `(6,2)` on
-the device; the `dq_dispatch` routes for widths 4 and 5; and the records those
-changes make stale.
+of a `mul1` marker; the `(bits, codebook)` arms `(3,2)`, `(4,2)`, `(5,2)` and
+`(6,2)` on the device; the `dq_dispatch` routes for widths 4 and 5; and the
+records those changes make stale.
 
 OUT: the `m <= 8` GEMV, which stays specialized to `bits == 3`; the fused MoE
 mgemm, which stays `(3, 1)`; every codebook-0 and codebook-1 decode path, which
@@ -176,9 +176,12 @@ gate does not depend on any implementation of it.
   codebook; the device launcher validates the `(bits, codebook)` PAIR. Both are
   asserted, in both directions, so a future widening of one cannot be mistaken
   for the other.
-- **Six arms, not sixteen.** Upstream's dense table is affordable because it
-  splits per `(K, cb)` into one TU each; this tree has one TU in a fat build
-  over ten architectures. Widening past six should carry that split.
+- **Seven arms, not twenty-four.** Upstream's dense table is affordable because
+  it splits per `(K, cb)` into one TU each; this tree has one TU in a fat build
+  over ten architectures. This line said SIX and said the seventh pair should
+  carry the split; slice F added a seventh that does not, because it is not a
+  new artifact's width but the same artifact's, missed by the census. Widening
+  for a NEW artifact still carries the split.
 
 ## Slices
 

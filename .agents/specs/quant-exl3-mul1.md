@@ -281,6 +281,25 @@ and it is what makes the M2 row below a bimodal mutation rather than a
 tolerance nudge. If the device ever reports an M2 number NEAR 1.0e-3 rather
 than near 1.7, the mutation did not apply and the row is not evidence.
 
+### What the gate does NOT reach: three of the four shapes
+
+Each arm is FOUR kernel instantiations, one per entry of the shape table
+(`GemmKernelForArm`: `(16,16,128)`, `(16,32,128)`, `(16,32,256)`,
+`(16,16,512)`), and `Exl3SelectGemmShape` picks one at runtime from `cc`, `k`
+and `n`. The device case runs `m = 4, k = 256, n = 256`. On a Blackwell-class
+`cc` with `K = 3` that path is `mod_256 && size_n <= 4096` and `size_k` is not
+`> 8192`, so it returns **shape 2** and shape 2 alone launches. Shape 4 could
+not be reached from that call at all: it tiles `n` by 512 and
+`Exl3GemmShapeCompat` refuses `n = 256`.
+
+So the gate proves the ARM is reachable and decodes correctly, not that all four
+of its shapes do. This is the pre-existing coverage of that table --- it is the
+same for `(3, 0)`, `(6, 0)`, `(4, 2)`, `(5, 2)` and `(6, 2)` --- so slice F
+neither improves nor worsens it, and it is recorded here rather than left to be
+discovered. Closing it is a loop over `force_shape_idx` gated by
+`Exl3GemmShapeCompat`, with a second `n` for shape 4; it belongs to the table
+and to every arm in it, not to this one arm.
+
 ### Not in scope
 
 - **The `m <= 8` GEMV** (#2570). `exl3_gemv_kernel` carries
@@ -347,6 +366,9 @@ green is not a device result and is never reported as one.
   compiled for every architecture in the fat build. Upstream's own answer is a
   per-K compilation-unit split (`comp_units/exl3_comp_unit_K_cbX.cu`, 24 TUs of
   16 instantiations each); this tree has one TU.
+- **The shape table is gated at ONE of its four shapes, for every arm.** See
+  "What the gate does NOT reach" above. `force_shape_idx` already exists, so
+  this is a test loop rather than a port, and it is owed by the table.
 - **Slice F is UNVERIFIED ON A DEVICE until a CUDA build runs it**, on the same
   terms as slice C: a CPU preflight never compiles `cuda_exl3.cu`.
 - **Slice F adds a seventh pair to a table this spec argued should stay at

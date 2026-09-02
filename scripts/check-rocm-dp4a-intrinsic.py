@@ -2,7 +2,7 @@
 """Fail if the ROCm Dp4a function does not use the hardware dot-product intrinsic.
 
 The `Dp4a` function in `src/vt/rocm/rocm_grouped_gemm.hip` must call
-`__ockl_sdot4` (which emits the `v_dot4_i32_iu8` instruction on gfx1100).
+`__ockl_sdot4` (which emits the `v_dot4_i32_i8` instruction on gfx1100).
 The scalar expansion — four int8 multiplies plus four adds — is bit-identical
 but ~1.4x slower on the KQuantGemmK prefill path.  A CPU-only `ctest` gate
 stays green with either form, because the ROCm kernel is not compiled on the
@@ -24,7 +24,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SOURCE = REPO / "src/vt/rocm/rocm_grouped_gemm.hip"
 
-# The intrinsic that emits v_dot4_i32_iu8 on gfx1100.
+# The intrinsic that emits v_dot4_i32_i8 on gfx1100.
 INTRINSIC = "__ockl_sdot4"
 
 # The scalar expansion that the intrinsic replaced.  If this pattern appears

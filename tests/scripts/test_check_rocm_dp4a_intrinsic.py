@@ -108,7 +108,7 @@ class TestRocmDp4aIntrinsic(unittest.TestCase):
     def test_live_scalar_mutation_fails(self) -> None:
         """Replace __ockl_sdot4 in the REAL source and verify the checker
         catches it.  This is the mutation the reviewer asked for: prove the
-        gate fails when v_dot4_i32_iu8 is not emitted."""
+        gate fails when v_dot4_i32_i8 is not emitted."""
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / "src/vt/rocm").mkdir(parents=True)

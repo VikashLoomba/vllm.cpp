@@ -74,7 +74,7 @@ __device__ __forceinline__ int GetIntB2(const int8_t* qs, int i32) {
   return static_cast<int>(x16[2 * i32 + 0]) | (static_cast<int>(x16[2 * i32 + 1]) << 16);
 }
 
-// Signed 8-bit x4 dot-product-accumulate. Uses the HW v_dot4_i32_iu8
+// Signed 8-bit x4 dot-product-accumulate. Uses the HW v_dot4_i32_i8
 // instruction (__ockl_sdot4) on gfx1100 — one instruction instead of 4
 // int8 multiplies + 4 adds. Bit-identical: signed int8×int8→int32 dot
 // product is exact either way (the HW instruction and the scalar expansion

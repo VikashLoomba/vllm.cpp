@@ -1,4 +1,4 @@
-# ROCm gfx1100: hardware Dp4a for KQuantGemmK (v_dot4_i32_iu8)
+# ROCm gfx1100: hardware Dp4a for KQuantGemmK (v_dot4_i32_i8)
 
 - Issue: [#2362](https://github.com/mudler/vllm.cpp/issues/2362)
 - Row: `BACKEND-ROCM`
@@ -196,7 +196,7 @@ without any benefit — the weight is already cached. The stop condition fired.
 
 The actual bottleneck was **software Dp4a**: the `Dp4a` function did 4 int8
 multiplies + 4 adds in scalar instructions. Replacing it with the hardware
-`v_dot4_i32_iu8` instruction (`__ockl_sdot4`) collapses 8 scalar operations
+`v_dot4_i32_i8` instruction (`__ockl_sdot4`) collapses 8 scalar operations
 into 1 instruction. The change is a 6-line function body replacement — no
 kernel structure change, no shared memory, no synchronization.
 

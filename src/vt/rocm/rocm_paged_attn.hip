@@ -180,6 +180,19 @@ __device__ inline float LoadKv(const uint8_t* p, int64_t i, float scale) {
 __device__ inline float Softcap(float s, float cap) {
   return cap > 0.f ? cap * tanhf(s / cap) : s;
 }
+template <int EPL>
+__device__ inline void LoadRowEplF32(const float* p, int64_t base, int lane, float r[EPL]) {
+  static_assert(EPL == 4 || EPL == 8 || EPL == 16, "EPL");
+#pragma unroll
+  for (int i = 0; i < EPL; ++i) r[i] = p[base + lane * EPL + i];
+}
+
+template <int EPL>
+__device__ inline void StoreRowEplF32(float* p, int64_t base, int lane, const float r[EPL]) {
+  static_assert(EPL == 4 || EPL == 8 || EPL == 16, "EPL");
+#pragma unroll
+  for (int i = 0; i < EPL; ++i) p[base + lane * EPL + i] = r[i];
+}
 
 // gfx1201: exp2 is the native path; expf often lowers slower. Used in online softmax.
 __device__ inline float FastExp(float x) {
@@ -353,6 +366,59 @@ __device__ inline void LoadRowEplBf16(const __hip_bfloat16* p, int64_t base, int
     }
   }
 }
+
+// fp8-e4m3 vectorized row load: EPL bytes per lane, dequant + scale.
+// Mirrors LoadRowEplBf16's vectorized load pattern, adapted for 1-byte elements.
+template <int EPL>
+__device__ inline void LoadRowEplFp8(const uint8_t* p, int64_t base, int lane,
+                                     float scale, float r[EPL]) {
+  static_assert(EPL == 4 || EPL == 8 || EPL == 16, "EPL");
+  if constexpr (EPL == 4) {
+    const uint32_t* u = reinterpret_cast<const uint32_t*>(p + base);
+    const uint32_t w = u[lane];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      r[i] = F8E4M3ToF32Dev(static_cast<uint8_t>((w >> (i * 8)) & 0xFF)) * scale;
+  } else if constexpr (EPL == 8) {
+    const uint2* u = reinterpret_cast<const uint2*>(p + base);
+    const uint2 w = u[lane];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      r[i] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.x >> (i * 8)) & 0xFF)) * scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      r[i + 4] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.y >> (i * 8)) & 0xFF)) * scale;
+  } else {
+    const uint4* u = reinterpret_cast<const uint4*>(p + base);
+    const uint4 w = u[lane];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      r[i] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.x >> (i * 8)) & 0xFF)) * scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      r[i + 4] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.y >> (i * 8)) & 0xFF)) * scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      r[i + 8] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.z >> (i * 8)) & 0xFF)) * scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      r[i + 12] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.w >> (i * 8)) & 0xFF)) * scale;
+  }
+}
+
+// Generic KV row load: dispatches to LoadRowEplBf16 or LoadRowEplFp8 based on TKV.
+// For bf16, scale is unused (inert). For fp8, dequant + scale.
+template <int EPL, typename TKV>
+__device__ inline void LoadRowEplKv(const TKV* p, int64_t base, int lane,
+                                    float scale, float r[EPL]) {
+  if constexpr (std::is_same_v<TKV, __hip_bfloat16>) {
+    (void)scale;
+    LoadRowEplBf16<EPL>(p, base, lane, r);
+  } else {
+    LoadRowEplFp8<EPL>(p, base, lane, scale, r);
+  }
+}
+
 
 template <int EPL>
 __device__ inline void StoreRowEplBf16(__hip_bfloat16* p, int64_t base, int lane, const float r[EPL]) {
@@ -655,6 +721,152 @@ __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16
     StoreRowEplBf16<kEpl>(out, (t * hq + (h0 + hh)) * d, lane, acc);
   }
 }
+
+
+template <int QG, int EPL, int NWARPS, typename TKV = __hip_bfloat16>
+__global__ void PagedAttnDecodeGqaF32Q(float* out, const float* query_f32,
+                                       const TKV* k_cache, const TKV* v_cache,
+                                       const int32_t* block_table, const int32_t* seq_lens,
+                                       const int32_t* query_start_loc, int64_t num_reqs, int64_t hq,
+                                       int64_t num_kv_heads, int64_t d, int64_t block_size,
+                                       int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
+                                       int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
+                                       float scale, float softcap, bool causal, int window_left,
+                                       int window_right, float k_scale,
+                                       float v_scale) {
+  constexpr int kEpl = EPL;
+  constexpr int d_expect = kEpl * 32;
+  const int64_t t = blockIdx.x;
+  const int64_t g = blockIdx.y;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  if (g >= num_kv_heads || d != d_expect) return;
+
+  int64_t r = -1, q0 = 0, q1 = 0;
+  if (num_reqs == 1) {
+    r = 0;
+    q0 = query_start_loc[0];
+    q1 = query_start_loc[1];
+    if (t < q0 || t >= q1) return;
+  } else {
+    for (int64_t rr = 0; rr < num_reqs; ++rr) {
+      const int64_t a = query_start_loc[rr], b = query_start_loc[rr + 1];
+      if (t >= a && t < b) {
+        r = rr;
+        q0 = a;
+        q1 = b;
+        break;
+      }
+    }
+    if (r < 0) return;
+  }
+
+  const int64_t query_len = q1 - q0;
+  const int64_t seqlen = seq_lens[r];
+  const int64_t context = seqlen - query_len;
+  const int64_t p = context + (t - q0);
+  int64_t jmin = 0;
+  if (window_left >= 0) {
+    jmin = p - window_left;
+    if (jmin < 0) jmin = 0;
+  }
+  int64_t jmax = causal ? p : (seqlen - 1);
+  if (window_right >= 0) {
+    const int64_t jr = p + window_right;
+    if (jr < jmax) jmax = jr;
+  }
+  if (jmax > seqlen - 1) jmax = seqlen - 1;
+
+  const int64_t qg_total = hq / num_kv_heads;
+  // blockIdx.z splits a large GQA group into QG-sized tiles (e.g. global QG=8 → two×4).
+  const int64_t h0 = g * qg_total + static_cast<int64_t>(blockIdx.z) * QG;
+  if (h0 + QG > (g + 1) * qg_total) return;
+  float q_reg[QG][kEpl];
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh)
+    LoadRowEplF32<kEpl>(query_f32, (t * hq + (h0 + hh)) * d, lane, q_reg[hh]);
+
+  float m[QG], lsum[QG];
+  float o_reg[QG][kEpl];
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh) {
+    m[hh] = -INFINITY;
+    lsum[hh] = 0.f;
+#pragma unroll
+    for (int i = 0; i < kEpl; ++i) o_reg[hh][i] = 0.f;
+  }
+
+  for (int64_t j = jmin + warp; j <= jmax; j += NWARPS) {
+    const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+    const int64_t off = j % block_size;
+    float k_reg[kEpl];
+    LoadRowEplKv<kEpl, TKV>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_scale, k_reg);
+
+    float s_h[QG];
+#pragma unroll
+    for (int hh = 0; hh < QG; ++hh) {
+      float dot = 0.f;
+#pragma unroll
+      for (int i = 0; i < kEpl; ++i) dot += q_reg[hh][i] * k_reg[i];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) dot += __shfl_down(dot, o);
+      s_h[hh] = Softcap(__shfl(dot, 0) * scale, softcap);
+    }
+
+    float v_reg[kEpl];
+    LoadRowEplKv<kEpl, TKV>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_scale, v_reg);
+#pragma unroll
+    for (int hh = 0; hh < QG; ++hh) {
+      const float m_new = fmaxf(m[hh], s_h[hh]);
+      const float corr = FastExp(m[hh] - m_new);
+      const float pw = FastExp(s_h[hh] - m_new);
+#pragma unroll
+      for (int i = 0; i < kEpl; ++i) o_reg[hh][i] = o_reg[hh][i] * corr + pw * v_reg[i];
+      lsum[hh] = lsum[hh] * corr + pw;
+      m[hh] = m_new;
+    }
+  }
+
+  extern __shared__ float smem_gqa[];
+  float* o_sh = smem_gqa;
+  float* m_sh = o_sh + static_cast<size_t>(NWARPS) * QG * d;
+  float* l_sh = m_sh + static_cast<size_t>(NWARPS) * QG;
+#pragma unroll
+  for (int hh = 0; hh < QG; ++hh) {
+    float* dst = o_sh + (static_cast<size_t>(warp) * QG + hh) * d + lane * kEpl;
+#pragma unroll
+    for (int i = 0; i < kEpl; ++i) dst[i] = o_reg[hh][i];
+    if (lane == 0) {
+      m_sh[warp * QG + hh] = m[hh];
+      l_sh[warp * QG + hh] = lsum[hh];
+    }
+  }
+  __syncthreads();
+
+  for (int hh = warp; hh < QG; hh += NWARPS) {
+    float gm = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < NWARPS; ++w) gm = fmaxf(gm, m_sh[w * QG + hh]);
+    float gl = 0.f;
+    float acc[kEpl];
+#pragma unroll
+    for (int i = 0; i < kEpl; ++i) acc[i] = 0.f;
+#pragma unroll
+    for (int w = 0; w < NWARPS; ++w) {
+      const float sc = FastExp(m_sh[w * QG + hh] - gm);
+      gl += l_sh[w * QG + hh] * sc;
+      const float* src = o_sh + (static_cast<size_t>(w) * QG + hh) * d + lane * kEpl;
+#pragma unroll
+      for (int i = 0; i < kEpl; ++i) acc[i] += sc * src[i];
+    }
+    const float inv = (gl > 0.f) ? (1.f / gl) : 0.f;
+#pragma unroll
+    for (int i = 0; i < kEpl; ++i) acc[i] *= inv;
+    StoreRowEplF32<kEpl>(out, (t * hq + (h0 + hh)) * d, lane, acc);
+  }
+}
+
+
 
 
 // SGLang-style flash prefill GQA (steal base 2026-08-10):
@@ -2011,6 +2223,79 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   const size_t smem = sizeof(float) * (static_cast<size_t>(d) + threads);
   dim3 grid(static_cast<unsigned>(total_q), static_cast<unsigned>(hq));
 
+  // F32-query decode GQA arm (GFX1100-TG150): the GGUF dense path runs
+  // attention with an f32 query and f32 output over a bf16 KV cache
+  // ("Phase 1" numerics), which excludes every bf16-decode kernel above and
+  // falls to the generic PagedAttnOnline — a per-context-token
+  // __syncthreads() walk measuring ~803us/call on the RX 7900 XTX (6.1
+  // ms/token across the model's full-attention layers). This arm routes that
+  // exact dtype combination through the DecodeGqa geometry (QG=4 fused
+  // q-heads per KV group, warp-strided sequence walk). DEFAULT OFF via
+  // VT_ATTN_DECODE_GQA4=1: correctness-complete but the reduction order
+  // differs from PagedAttnOnline's, so greedy anchors can move at exact ties.
+  static const bool decode_gqa4_f32q = [] {
+    const char* e = std::getenv("VT_ATTN_DECODE_GQA4");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (decode_opt && decode_gqa4_f32q && total_q <= hq &&
+      query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
+      (k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16 ||
+       k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8 &&
+       args.kv_cache_dtype != Fp8KVCacheDataType::kAuto) &&
+      (d == 128 || d == 256) && hq == 16 && num_kv_heads == 4) {
+    constexpr int kDecWarpsG = 8;
+    constexpr int kQgG = 4;
+    constexpr int kNwarpsG = kDecWarpsG;
+    // EPL = d / 32 lanes: 8 at head_dim 256 (the original TG150 arm), 4 at
+    // head_dim 128 (Qwen3-dense class, TG200). One kernel body; it
+    // self-guards d != EPL*32, so a wrong pairing exits without reading.
+    const size_t smem = sizeof(float) *
+        (static_cast<size_t>(kNwarpsG) * kQgG * static_cast<size_t>(d) +
+         2 * static_cast<size_t>(kNwarpsG) * kQgG);
+    dim3 grid3(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), 1);
+    dim3 block3(static_cast<unsigned>(kNwarpsG * 32));
+    const bool gqa4_fp8 = k_cache.dtype == DType::kI8;
+    if (d == 128) {
+      if (gqa4_fp8) {
+        PagedAttnDecodeGqaF32Q<kQgG, 4, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
+            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
+            v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+            args.logits_soft_cap, args.causal, window_left, window_right,
+            args.k_scale, args.v_scale);
+      } else {
+        PagedAttnDecodeGqaF32Q<kQgG, 4, kDecWarpsG><<<grid3, block3, smem, st>>>(
+            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+            args.logits_soft_cap, args.causal, window_left, window_right,
+            1.0f, 1.0f);
+      }
+    } else {
+      if (gqa4_fp8) {
+        PagedAttnDecodeGqaF32Q<kQgG, 8, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
+            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
+            v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+            args.logits_soft_cap, args.causal, window_left, window_right,
+            args.k_scale, args.v_scale);
+      } else {
+        PagedAttnDecodeGqaF32Q<kQgG, 8, kDecWarpsG><<<grid3, block3, smem, st>>>(
+            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+            args.logits_soft_cap, args.causal, window_left, window_right,
+            1.0f, 1.0f);
+      }
+    }
+    Check(hipGetLastError(), "paged_attention decode_gqa_f32q launch");
+
+    return;
+  }
   auto launch = [&](auto q_tag, auto kv_tag, auto o_tag) {
     using TQ = decltype(q_tag);
     using TKV = decltype(kv_tag);

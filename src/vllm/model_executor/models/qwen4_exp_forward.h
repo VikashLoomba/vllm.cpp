@@ -241,6 +241,25 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
     const v1::GDNAttentionMetadata& gdn_meta,
     const Qwen4ExpForwardCaches& caches, int64_t past_len);
 
+namespace detail {
+
+// Re-read `VT_Q4EXP_LAYER_FP` and put the fingerprint's step and tap counters
+// back to zero. TEST HOOK, and the only caller is the case that gates the
+// instrument.
+//
+// It exists because the budget is read ONCE per process. Every case in a doctest
+// binary shares that process, so whichever forward runs first spends the budget
+// and the case that sets the variable measures nothing and reports a pass --
+// which is `assertions: 0 ... SUCCESS!` wearing the instrument's own clothes.
+// Same shape and same reason as `detail::ExpertStreamSetForceFallback`.
+void Qwen4ExpLayerFpResetForTest();
+
+// Lines the instrument has printed since the last reset. The counted property a
+// gate asserts on, rather than grepping the process's stderr for a prefix.
+int64_t Qwen4ExpLayerFpTapsForTest();
+
+}  // namespace detail
+
 }  // namespace vllm
 
 #endif  // VLLM_MODEL_EXECUTOR_MODELS_QWEN4_EXP_FORWARD_H_

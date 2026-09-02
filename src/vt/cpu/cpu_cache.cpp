@@ -5,7 +5,9 @@
 //    layout — see .agents/discipline.md and the M1.6 Task-2 layout trap note).
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
+#include "vllm/model_executor/models/deepseek_v4_compressor.h"  // the W8 slice-1 packer
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -177,6 +179,80 @@ void ReshapeAndCacheFp8Kernel(Queue&, const Tensor& k, const Tensor& v, Tensor& 
   }
 }
 
+// ── The fp8_ds_mla paged K cache (KV-DSV4-MULTICACHE W8, #2455) ─────────────
+// These two are the CPU arms of `vt::ConcatAndCacheDsMla` and
+// `vt::DequantAndGatherDsMla`, and they are deliberately THIN: the byte layout
+// lives once, in the W8 slice-1 host packer
+// (`vllm/model_executor/models/deepseek_v4_compressor.{h,cpp}`), which the CUDA
+// kernels of slice 5 are the other port of. Writing the region arithmetic a
+// second time here is exactly the drift the shared packer exists to prevent.
+
+// One source row of `k` as f32. The encoder's first act is upstream's own
+// fp32 -> bf16 round (`cache_utils.py:110-118`), so widening f16/bf16 to f32
+// here changes no stored byte.
+void LoadDsMlaRow(const Tensor& k, int64_t token, std::vector<float>* head) {
+  const int64_t width = k.shape[1];
+  const int64_t off = token * k.stride[0];
+  head->resize(static_cast<size_t>(width));
+  switch (k.dtype) {
+    case DType::kF32:
+      std::memcpy(head->data(), k.Ptr<float>() + off,
+                  static_cast<size_t>(width) * sizeof(float));
+      break;
+    case DType::kF16:
+      for (int64_t d = 0; d < width; ++d)
+        (*head)[static_cast<size_t>(d)] = F16ToF32(k.Ptr<uint16_t>()[off + d]);
+      break;
+    case DType::kBF16:
+      for (int64_t d = 0; d < width; ++d)
+        (*head)[static_cast<size_t>(d)] = BF16ToF32(k.Ptr<uint16_t>()[off + d]);
+      break;
+    default:
+      VT_CHECK(false, "concat_and_cache_ds_mla: unsupported k dtype");
+  }
+}
+
+const vllm::deepseek_v4::Fp8DsMlaLayout& DsMlaTokenLayout() {
+  // 448 / 64 / 64 — upstream's TOKEN_FP8_DIM, TOKEN_BF16_DIM and
+  // QUANT_BLOCK_SIZE (`cache_utils.py:180-183`), named once in vt/ops.h.
+  static const vllm::deepseek_v4::Fp8DsMlaLayout layout =
+      vllm::deepseek_v4::MakeFp8DsMlaLayout(kFp8DsMlaNopeDim, kFp8DsMlaRopeDim,
+                                            kFp8DsMlaQuantBlock);
+  return layout;
+}
+
+// `quantize_and_insert_k_kernel` (`cache_utils.py:36-159`), one program per
+// token (`:71`), serialised.
+void ConcatAndCacheDsMlaKernel(Queue&, const Tensor& k, Tensor& kv_cache,
+                               const Tensor& slot_mapping, int64_t block_size) {
+  const vllm::deepseek_v4::Fp8DsMlaLayout& L = DsMlaTokenLayout();
+  const vllm::deepseek_v4::Fp8DsMlaPageLayout page =
+      vllm::deepseek_v4::MakeFp8DsMlaPageLayout(L, block_size);
+  // Upstream reads the block stride from the TENSOR (`:189`, `k_cache.stride(0)`),
+  // so a padded page row (37440 for the 37376-byte C4A block) works unchanged.
+  const int64_t block_stride = kv_cache.stride[0];
+  // Upstream's token count is slot_mapping's, never k's (`:186-188`).
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  auto* base = kv_cache.Ptr<uint8_t>();
+
+  std::vector<float> head;
+  for (int64_t t = 0; t < num_slots; ++t) {
+    const int64_t slot = slots[t];
+    // `if slot_idx == -1: return` (`:77-78`). Load-bearing, and not merely
+    // duplicated by `Fp8DsMlaStoreToken`'s own negative-position skip: C++
+    // truncating division sends slot == -block_size to (block -1, pos 0), which
+    // the packer would happily write — one whole block BELOW the page.
+    if (slot < 0) continue;
+    const int64_t block_idx = slot / block_size;   // `:80`
+    const int64_t pos_in_block = slot % block_size;  // `:81`
+    LoadDsMlaRow(k, t, &head);
+    vllm::deepseek_v4::Fp8DsMlaStoreToken(base + block_idx * block_stride, page,
+                                          pos_in_block,
+                                          vllm::deepseek_v4::Fp8DsMlaEncodeToken(head, L));
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kCPU,
@@ -187,6 +263,9 @@ struct Registrar {
     RegisterOp(
         OpId::kConcatAndCacheMla, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<ConcatAndCacheMlaFn>(&ConcatAndCacheMlaKernel)));
+    RegisterOp(OpId::kConcatAndCacheDsMla, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<ConcatAndCacheDsMlaFn>(&ConcatAndCacheDsMlaKernel)));
   }
 } registrar;
 

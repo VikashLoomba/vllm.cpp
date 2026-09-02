@@ -4101,6 +4101,63 @@ void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor&
       q, kv_c, k_pe, kv_cache, slot_mapping);
 }
 
+void ConcatAndCacheDsMla(Queue& q, const Tensor& k, Tensor& kv_cache,
+                         const Tensor& slot_mapping, int64_t block_size) {
+  // Upstream: `assert k.dim() == 2 and k.shape[1] == 512` (cache_utils.py:167-169).
+  VT_CHECK(k.rank == 2 && k.shape[1] == kFp8DsMlaInputDim,
+           "concat_and_cache_ds_mla: k must be rank-2 [num_tokens, 512] — the "
+           "compressed latent, NoPE in [0, 448) and the rotated RoPE in [448, 512)");
+  // The page is RANK-2 BYTES. This is the difference from concat_and_cache_mla
+  // and it is not a formality: a token's scales live in a different REGION of
+  // the block from its data (cache_utils.py:59-66), so no (block, row, column)
+  // indexing reaches both and a rank-3 page cannot describe this cache.
+  VT_CHECK(kv_cache.rank == 2,
+           "concat_and_cache_ds_mla: kv_cache must be rank-2 "
+           "[num_blocks, block_bytes] — the fp8_ds_mla block is REGION-SPLIT "
+           "(cache_utils.py:59-66), so it is not a rank-3 page");
+  VT_CHECK(kv_cache.dtype == DType::kI8,
+           "concat_and_cache_ds_mla: kv_cache must be DType::kI8 (a BYTE page). A "
+           "float cache here would be the 3.5x overrun this op exists to stop: "
+           "2048 f32 bytes per token against the 584 the spec declares");
+  VT_CHECK(slot_mapping.rank == 1,
+           "concat_and_cache_ds_mla: slot_mapping must be rank-1 [num_slots]");
+  VT_CHECK(slot_mapping.dtype == DType::kI64,
+           "concat_and_cache_ds_mla: slot_mapping must be i64");
+  // Upstream asserts bf16 (`:170-171`). We accept any float dtype because the
+  // encoder's first act is upstream's own fp32 -> bf16 round
+  // (`:110-118`, "Load bf16 input"), so an f32 row and its bf16 rounding
+  // produce identical bytes; a non-float source has no such reading.
+  VT_CHECK(IsFloat(k.dtype),
+           "concat_and_cache_ds_mla: k must be a float dtype (upstream asserts "
+           "bf16; the encoder rounds to bf16 first, so f32/f16 agree bit for bit)");
+  VT_CHECK(block_size > 0,
+           "concat_and_cache_ds_mla: block_size must be > 0 (it is the STORAGE "
+           "block size, block_size / compress_ratio)");
+  // 584 bytes per token (kv_cache_interface.py:401-403). Everything past that is
+  // the block's alignment padding (`:63`) and no store may reach it, so the page
+  // must be at least the real size; a LARGER row is the padded page and is fine.
+  const int64_t real_block_bytes = block_size * kFp8DsMlaTokenBytes;
+  VT_CHECK(kv_cache.shape[1] >= real_block_bytes,
+           "concat_and_cache_ds_mla: kv_cache row must hold block_size * 584 bytes");
+  VT_CHECK(k.stride[1] == 1 && kv_cache.stride[1] == 1 && slot_mapping.IsContiguous(),
+           "concat_and_cache_ds_mla: k/kv_cache innermost stride must be 1 and "
+           "slot_mapping contiguous");
+  VT_CHECK(k.stride[0] >= kFp8DsMlaInputDim,
+           "concat_and_cache_ds_mla: k token rows must not overlap");
+  VT_CHECK(kv_cache.stride[0] >= kv_cache.shape[1],
+           "concat_and_cache_ds_mla: kv_cache blocks must not overlap");
+  // Upstream takes the token count from slot_mapping (`:186-188`): the tail of
+  // `k` is DP padding and is ignored.
+  VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
+           "concat_and_cache_ds_mla: num_tokens must be >= slot_mapping length");
+  VT_CHECK(k.device == q.device && kv_cache.device == q.device &&
+               slot_mapping.device == q.device,
+           "concat_and_cache_ds_mla: device mismatch (k/kv_cache/slot_mapping/queue)");
+  reinterpret_cast<ConcatAndCacheDsMlaFn>(
+      GetOp(OpId::kConcatAndCacheDsMla, q.device.type))(q, k, kv_cache, slot_mapping,
+                                                        block_size);
+}
+
 void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
                         const Tensor& kv_cache, const Tensor& block_table,
                         const Tensor& seq_lens, const MlaDecodeAttentionArgs& args) {

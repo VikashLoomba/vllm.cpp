@@ -508,9 +508,11 @@ TEST_CASE("Vulkan platform is registered and reports unified/no-pool residency")
     CHECK(prio[0] == "FLASH_ATTN");
   }
   // MLA stays EMPTY, and that is a capability statement rather than a stub:
-  // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla have no
-  // Vulkan kernel, so naming a backend here would route an MLA model into one
-  // that cannot serve it. Selection must fail loudly instead.
+  // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla — and
+  // kConcatAndCacheDsMla, the fp8_ds_mla byte-page store (KV-DSV4-MULTICACHE W8,
+  // #2455) — have no Vulkan kernel, so naming a backend
+  // here would route an MLA model into one that cannot serve it. Selection must
+  // fail loudly instead.
   {
     vllm::platforms::AttnSelectorConfig mla;
     mla.use_mla = true;

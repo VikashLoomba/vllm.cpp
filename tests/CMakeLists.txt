@@ -2995,6 +2995,10 @@ vllm_cpp_add_test(test_ops_fp8_kv_cache vt/test_ops_fp8_kv_cache.cpp)
 vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 # MLA campaign W3: the compressed-latent cache write + the grouped-topk router.
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
+# KV-DSV4-MULTICACHE W8 slices 2 and 3 (#2455): the fp8_ds_mla STORE and READ
+# over DeepSeek-V4's REGION-SPLIT rank-2 byte page, which no rank-3 cache op can
+# express. Byte-exact against a poison-filled block, all host-side.
+vllm_cpp_add_test(test_ops_ds_mla_cache vt/test_ops_ds_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
 vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
 # dots3-note W4b-3c (#699): the DSA "Lightning Indexer" selection pair, gated

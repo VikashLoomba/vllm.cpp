@@ -10519,6 +10519,10 @@ struct Qwen3_5DecodeGraph::Impl {
         // `Backend::DestroyGraph`. That routing is what lets
         // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
         // editing this driver (spec `## Risks/decisions` D4).
+        // #2274: the graph dies with this slot, so its baked scratch stops being
+        // baked. Give the pinned blocks back before the pool outlives us.
+        Pool(b).UnpinForGraph(b, s.pinned);
+        s.pinned.clear();
         if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
       }
   }
@@ -10558,6 +10562,13 @@ struct Qwen3_5DecodeGraph::Impl {
     // than per pool because two shapes interleave through one pool and the pool's
     // own last-step state would answer for whichever step ran most recently.
     DevicePool::StepDemand demand;
+    // #2274: the pool blocks this slot's CAPTURE baked, held OUT of the free
+    // list for as long as the graph that baked them lives. Taken right after the
+    // capture succeeds and given back at every site that drops the graph. The
+    // counterpart to the `PreGrowForCapture` above: pre-grow guarantees the
+    // blocks exist before the capture, this keeps them from being handed to
+    // anyone else after it.
+    std::vector<std::pair<size_t, void*>> pinned;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -10774,6 +10785,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     // next capture open a scope on it (the scope refuses a container that
     // already holds one).
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     s.aux.reset();
     s.aux_taps = aux_taps;
@@ -10825,6 +10838,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   s.fa_cols = cols;
   if (cols_changed && s.graph.captured()) {
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
     // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
@@ -11004,6 +11019,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       if (s.graph.capture_failed()) {
         const std::exception_ptr err = s.graph.capture_error();
         s.graph.Reset();  // clear the failure with the graph it described
+        Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+        s.pinned.clear();
         // The runtime's OWN diagnosis where the seam holds it. It is empty only
         // on the arm where an exception was already propagating THROUGH the
         // scope, which cannot reach this line; the refusal below makes that
@@ -11023,6 +11040,30 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       }
       return drained;
     }
+    // #2274 THE FIX. The capture succeeded, so from here the graph's replays
+    // write through the device pointers it just baked. `ForwardLayers` has
+    // already RETURNED its working scratch to the pool's free list, and the
+    // comment at `PreGrowForCapture` above argues that is safe because the two
+    // graphs "replay sequentially on one stream". That argument covers the two
+    // GRAPHS. It does not cover a THIRD party: a DFlash2 draft store created
+    // later takes a pool block for its block table, is handed one of these
+    // blocks, and the next replay writes f32 activations over the table -- which
+    // is why a live block table reads `bt[0] = 1060730955` (0.727f) and
+    // `vt::PagedAttention` indexes page 1.06e9 in a 513-page pool.
+    //
+    // So take the capture's demand back OUT of the free list. `PreGrowForCapture`
+    // guaranteed `s.demand` free blocks per class BEFORE the capture and nothing
+    // else allocated in between, so the free list is LIFO-ordered with exactly
+    // those blocks on top; this pops the same count off the same end.
+    //
+    // BEFORE the `s.logits` assignment below, and the order is load-bearing on
+    // the RE-capture path (a column-count change resets this slot's graph, which
+    // is what a new draft store's wider block table causes). That assignment
+    // destroys the previous `s.logits` and frees ITS block to the same free list,
+    // where it would be popped first and leave one of the graph's own blocks
+    // reachable. Freeing the old logits is correct -- the graph it belonged to
+    // was Reset -- it just must not happen while we are counting.
+    if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
     s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     s.graph.Replay(impl_->queue);
@@ -11101,6 +11142,10 @@ struct Qwen3_5DenseDecodeGraph::Impl {
         // `Backend::DestroyGraph`. That routing is what lets
         // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
         // editing this driver (spec `## Risks/decisions` D4).
+        // #2274: the graph dies with this slot, so its baked scratch stops being
+        // baked. Give the pinned blocks back before the pool outlives us.
+        Pool(b).UnpinForGraph(b, s.pinned);
+        s.pinned.clear();
         if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
       }
   }
@@ -11136,6 +11181,13 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     // than per pool because two shapes interleave through one pool and the pool's
     // own last-step state would answer for whichever step ran most recently.
     DevicePool::StepDemand demand;
+    // #2274: the pool blocks this slot's CAPTURE baked, held OUT of the free
+    // list for as long as the graph that baked them lives. Taken right after the
+    // capture succeeds and given back at every site that drops the graph. The
+    // counterpart to the `PreGrowForCapture` above: pre-grow guarantees the
+    // blocks exist before the capture, this keeps them from being handed to
+    // anyone else after it.
+    std::vector<std::pair<size_t, void*>> pinned;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -11349,6 +11401,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // next capture open a scope on it (the scope refuses a container that
     // already holds one).
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     s.aux.reset();
     s.aux_taps = aux_taps;
@@ -11399,6 +11453,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   s.fa_cols = cols;
   if (cols_changed && s.graph.captured()) {
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
     // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
@@ -11586,6 +11642,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       if (s.graph.capture_failed()) {
         const std::exception_ptr err = s.graph.capture_error();
         s.graph.Reset();  // clear the failure with the graph it described
+        Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+        s.pinned.clear();
         // The runtime's OWN diagnosis where the seam holds it. It is empty only
         // on the arm where an exception was already propagating THROUGH the
         // scope, which cannot reach this line; the refusal below makes that
@@ -11605,6 +11663,30 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       }
       return drained;
     }
+    // #2274 THE FIX. The capture succeeded, so from here the graph's replays
+    // write through the device pointers it just baked. `ForwardLayers` has
+    // already RETURNED its working scratch to the pool's free list, and the
+    // comment at `PreGrowForCapture` above argues that is safe because the two
+    // graphs "replay sequentially on one stream". That argument covers the two
+    // GRAPHS. It does not cover a THIRD party: a DFlash2 draft store created
+    // later takes a pool block for its block table, is handed one of these
+    // blocks, and the next replay writes f32 activations over the table -- which
+    // is why a live block table reads `bt[0] = 1060730955` (0.727f) and
+    // `vt::PagedAttention` indexes page 1.06e9 in a 513-page pool.
+    //
+    // So take the capture's demand back OUT of the free list. `PreGrowForCapture`
+    // guaranteed `s.demand` free blocks per class BEFORE the capture and nothing
+    // else allocated in between, so the free list is LIFO-ordered with exactly
+    // those blocks on top; this pops the same count off the same end.
+    //
+    // BEFORE the `s.logits` assignment below, and the order is load-bearing on
+    // the RE-capture path (a column-count change resets this slot's graph, which
+    // is what a new draft store's wider block table causes). That assignment
+    // destroys the previous `s.logits` and frees ITS block to the same free list,
+    // where it would be popped first and leave one of the graph's own blocks
+    // reachable. Freeing the old logits is correct -- the graph it belonged to
+    // was Reset -- it just must not happen while we are counting.
+    if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
     s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)

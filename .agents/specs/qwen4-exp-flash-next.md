@@ -4069,6 +4069,30 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+### PREFILLDIV: the MoE second source, and the instrument it needs (#2552)
+
+Wave PREFILLDIV isolated TWO sources of CPU/CUDA prefill divergence at decoder
+layer 0, the only layer whose input is bit-identical on both CUDA arms. The
+first is the chunked Gated DeltaNet prefill and it is NOT a defect: it mirrors
+vLLM's own Flash-Linear-Attention precision map at every anchor (evidence file
+§4). The second is the MoE block, which turns a `2.1e-05` input difference into
+a `7.269e-05` output difference and which `VT_GDN_CHUNKED=0` barely moves
+(1.7x, against 332x on the Gated DeltaNet tap).
+
+**It lands NOT DIAGNOSED and it is owed.** `VT_Q4EXP_LAYER_FP` taps values, and
+a value tap cannot separate an expert-selection flip from re-association in
+`vt::MatmulBTQuantGrouped`. The instrument that can is a tap on the SELECTED
+EXPERT IDS per token per layer, asserting set equality and printing the margin
+between the last selected and the first rejected logit — a discrete selection
+has bimodal error, not a tolerance.
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) owns it.
+
+**Also owed by this wave, and smaller.** The `q4fp` line is a `sum|x|`
+aggregate. It is coarse enough that it read `0.000e+00` for
+`vt::Qwen4ExpGatedResidual`, which is the correct answer at this operand
+distribution and is not a proof of bit-identity element by element. A tap that
+needs to claim bit-identity should compare bytes, not an aggregate.
+
 - **WHAT THE 2026-08-31 vLLM LANDING OWES THIS ROW (Q4RECONCILE, #2489).** The
   oracle reconciliation is done and the divergences are classified in
   `### Component-by-component reconciliation`. What it did not do is act on any of
@@ -8425,6 +8449,74 @@ Stop and report if the instrument shows the first jump inside an op whose repair
 moves a shared seam's contract; that needs its own spec and its own issue. Stop
 if the released artifact cannot be staged, and report `PENDING` rather than
 substituting another checkpoint.
+
+### Outcome
+
+**MEASURED, AND IT FALSIFIES THIS WAVE'S OWN PREMISE.** Full result in
+[the evidence file](../../docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md);
+`thor:gpu0`, `sm_110`, one binary
+`c3b355deb75efb0071fe6ec21d5067f5e2520722c672487fd67939c363e1ee58`, three arms,
+437 taps per step on every one of them.
+
+**The first tensor that differs is decoder layer 0's Gated DeltaNet block
+output**, `rel(sum|x|) = 3.525e-04`, produced from an input that is BIT-IDENTICAL
+on both arms — `emb`, `wide`, `L00 in`, `L00 ahc.mix` and `L00 ahc.inj` all read
+`0.000e+00`.
+
+**That clears the only named candidate by measurement.** #2547 named
+`vt::Qwen4ExpGatedResidual`'s CUDA arm as the largest non-bit-identical surface
+on the path, on the strength of the source's own admission that its device GEMM
+re-associates the K reduction. On the released weights at the model's real width
+it is bit-identical to its CPU sibling at both hyper-connection sites of layer 0.
+The re-association is absorbed by the bf16 store. Reading a source comment is not
+a measurement, and this is the second time on this row that a candidate named
+that way did not survive one.
+
+**The mechanism is the chunked prefill decomposition, and the proof is a
+same-binary A/B.** `VT_GDN_CHUNKED=0` routes the CUDA arm to `GdnScanCuda`, the
+same sequential recurrence the CPU arm runs, and `L00 blk` falls to `1.062e-06`
+— **332x**. Layer 0 is the only layer that can carry this proof, because it is
+the only one whose input is bit-identical on both CUDA arms; every later `blk`
+measures propagation.
+
+**AND IT IS NOT A DEFECT.** vLLM's vendored Flash-Linear-Attention kernel keeps
+`h`, `u`, `w` and `v_new` in bf16 with fp32 accumulation, `A` in fp32 for the
+triangular solve, and `final_state` in fp32 — and our chunked port matches all
+five, anchor by anchor (evidence §4, vLLM `5559679229`, a forward reference).
+The CUDA arm mirrors the oracle. **The CPU arm's exact sequential f32 recurrence
+is the arm that does not**, and it is more accurate than vLLM rather than more
+correct. Moving CUDA onto the CPU arm would move it away from vLLM.
+
+**The GPU does not emit the control sequence, and the honest count is:**
+
+| arm | ids | agrees |
+|---|---|---|
+| `--device cpu` | `11751 13 15767 411 2029 11 1092 369` | the control |
+| `--device cuda` | `11751 13 15767 411 1928 11 628 567` | 5 of 8 |
+| `--device cuda`, `VT_GDN_CHUNKED=0` | `11751 13 15767 264 1103 314 5656 321` | 3 of 8 |
+
+**The sequential arm is 2.8x closer on the hidden state and agrees on FEWER
+ids** (`out` rel `1.130e-03` against `3.189e-03`). Token agreement between our
+two arms is not monotone in the distance between them, because the decode is an
+argmax over near-ties. A CPU-vs-CUDA token-exactness gate is therefore not well
+posed for this architecture at this precision, and this wave does not propose
+one.
+
+**What is still open is the SECOND source.** Layer 0 separates it: with the GDN
+contribution removed, `L00 moe` still differs by `7.269e-05` from an input
+differing by `2.1e-05`, and `L00 s.mlp` barely moves (`7.160e-05` ->
+`6.815e-05`). The MoE block is the only remaining candidate for an actual defect
+on this path. It is named here and NOT diagnosed; the discriminating instrument
+it needs is a tap on the router's SELECTED EXPERT IDS asserting set equality and
+printing the margin, because a bf16 router logit over this model's expert count
+can flip a discrete selection and a flip is a large local change rather than a
+rounding one -- and a value-only tap can never tell that from re-association in
+the grouped keep-quant GEMM.
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) owns it.
+
+**What landed.** The instrument and its gate, and nothing else. There is no
+product-behaviour change in this wave, because the measurement says there is no
+defect at the first divergence to change.
 
 
 ## Now

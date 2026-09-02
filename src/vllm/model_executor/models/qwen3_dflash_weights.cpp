@@ -13,6 +13,7 @@
 #include "vllm/model_executor/models/qwen3_dflash.h"
 // SPEC-DFLASH2-QUANT-LMHEAD (#1628): the draft SHARES the target's head, so it
 // takes the target loader's own routing decision for it.
+#include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 // MODEL-DFLASH2-EXL3 (#2495 item 7): the SHARED EXL3 reader, the presence
 // predicate and the F16 remainder conversion. Nothing here re-derives them.
@@ -20,6 +21,7 @@
 
 #include <cstring>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -738,16 +740,18 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
 }
 
 void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
-                            OwnedTensor* head_bf16, Nvfp4Weight* head_fp4) {
+                            OwnedTensor* head_bf16, Nvfp4Weight* head_fp4,
+                            Exl3Weight* head_exl3) {
   VT_CHECK(head_bf16 != nullptr, "qwen3_dflash: shared lm_head needs a bf16 owner");
   *head_bf16 = OwnedTensor{};
   if (head_fp4 != nullptr) *head_fp4 = Nvfp4Weight{};
+  if (head_exl3 != nullptr) *head_exl3 = Exl3Weight{};
 
-  // The PACKED arm, taken by asking the target's own routing question rather
+  // The PACKED arms, taken by asking the target's own routing question rather
   // than by testing the stored dtype. A lane with nowhere to put a packed head
-  // (`head_fp4 == nullptr`, DSpark) never asks it and falls through to the bf16
-  // read, which then refuses the checkpoint by name.
-  if (head_fp4 != nullptr) {
+  // (`head_fp4 == nullptr` and `head_exl3 == nullptr`, DSpark) never asks it and
+  // falls through to the bf16 read, which then refuses the checkpoint by name.
+  {
     std::unordered_map<std::string, const SafetensorsFile*> where;
     for (const SafetensorsFile& shard : shards)
       for (const std::string& name : shard.Names()) where[name] = &shard;
@@ -758,7 +762,22 @@ void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
     };
     const std::function<bool(const std::string&)> has =
         [&where](const std::string& name) { return where.count(name) != 0; };
-    if (DenseLmHeadTakesNvfp4(has, "lm_head")) {
+    // MODEL-QWEN35-EXL3-HEAD (#2495 item 6): the TRELLIS arm, asked FIRST for the
+    // same reason the dense resolver puts its EXL3 rung first — an EXL3
+    // projection ships no `.weight` and no `.weight_scale`, so every later probe
+    // reads a tensor this arm correctly does not carry. The question is
+    // `dense_loaders::IsExl3Projection`, which is the SAME predicate
+    // `LoadQwen3_5Dense` asks about the same tensor for the target itself
+    // (qwen3_5_dense_weights.cpp), so the draft and the target cannot disagree
+    // about what this head is.
+    if (head_exl3 != nullptr && dense_loaders::IsExl3Projection(has, "lm_head")) {
+      *head_exl3 = dense_loaders::LoadExl3(get, has, "lm_head");
+      VT_CHECK(!head_exl3->Empty() && head_bf16->Empty(),
+               "qwen3_dflash: the target's EXL3 lm_head did not take the trellis "
+               "arm of LoadDflashSharedLmHead");
+      return;
+    }
+    if (head_fp4 != nullptr && DenseLmHeadTakesNvfp4(has, "lm_head")) {
       // LIFETIME. Unlike the bf16 arm below, this one can BORROW the shard's
       // mapping rather than copy it (`BorrowStTensorBytes`), and the draft
       // outlives the `SafetensorsFile` objects the caller passes -- both live
@@ -813,6 +832,29 @@ void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,
       return;
     }
   }
+
+  // NO ARM MATCHED (#2569). Every `return` above populates exactly one owner, so
+  // reaching here means the target ships a head this function cannot read — and
+  // until this row it fell off the end of the loop above and returned SILENTLY
+  // with all three owners empty. Nothing in the function said so; the refusal
+  // was left to whichever caller happened to test emptiness afterwards, and the
+  // one that does (`SharedHeadSource::LoadInto`) reports "the target's bf16
+  // embed_tokens + lm_head were not found", which names the wrong tensor and the
+  // wrong reason for an EXL3 target whose head is present and simply not bf16.
+  // The refusal belongs to the function that made the routing decision, and it
+  // names the arms it tried so the next storage form is a sentence rather than
+  // an empty tensor.
+  throw std::runtime_error(
+      "dflash: the target's lm_head matched NO arm of LoadDflashSharedLmHead in "
+      "the target safetensors shards. Tried: EXL3 trellis (`lm_head.trellis` " +
+      std::string(head_exl3 == nullptr ? "-- NOT OFFERED by this lane, which "
+                                         "computes with a dense head only"
+                                       : "-- absent") +
+      "), ModelOpt/compressed-tensors NVFP4 (`lm_head.weight_scale` " +
+      std::string(head_fp4 == nullptr ? "-- NOT OFFERED by this lane"
+                                      : "-- absent") +
+      "), dense BF16 (`lm_head.weight` -- absent or not BF16). Issue #2569 "
+      "(https://github.com/mudler/vllm.cpp/issues/2569).");
 }
 
 OwnedTensor LoadDflashSharedEmbedBf16(const std::vector<SafetensorsFile>& shards,

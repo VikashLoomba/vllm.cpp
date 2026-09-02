@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "vllm/config/weight_residency.h"
+#include "vllm/model_executor/device_placement.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
 
@@ -398,11 +399,52 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   return p;
 }
 
+// THE DEVICE A RESIDENCY DECISION IS ACTUALLY ABOUT (#2516).
+//
+// `GgufLoadPolicy::device` is the ENGINE's resolved device, and its own field
+// comment says every device-dependent decision in the struct reads it. Hybrid
+// placement (#2023, #2314) introduced a SECOND, narrower answer for exactly one
+// class of tensor: `ActiveMoePlacementPlan().DeviceForLayer(l)` is the device a
+// layer's routed experts are COMPUTED on, and `RunMoePlaced` hands that device
+// to `MoeBlock`. A keep-quant decision asks "does the device that will execute
+// this GEMM have a `vec_dot` for this encoding", so for a PLACED routed-expert
+// tower it is a question about the placement device, not about the engine.
+//
+// Measured, on GLM-5.3 `UD-IQ1_S` on `strix:gpu0`: `DeviceKeepQuantSupported`
+// serves {Q8_0, Q4_K, Q5_K, Q6_K} on ROCm, so all 228 IQ1_S/IQ3_XXS/IQ2_XXS/
+// IQ4_XS/Q2_K/Q3_K towers routed `kExpandBf16` and `LoadStackedExperts` refused
+// the load by name -- for towers whose bytes never reach the GPU at all (that
+// model reads a tower only through `GlmExpertSlice`, never through
+// `ResidentWeight`) and which the installed plan had already sent to the CPU,
+// whose `vec_dot` table covers every one of those six encodings.
+//
+// THIS IS #1136 AND #2406 ONE SEAM FURTHER ALONG. Both were the same shape: a
+// residency decision resolved against a device other than the one that would
+// read the bytes. The repair is the same shape too -- ask the device that will
+// run it.
+//
+// INERT BY CONSTRUCTION, in four terms, and the last one is the load-bearing
+// one. The plan is a process-global that a load with no placement never writes,
+// and a DEFAULT-CONSTRUCTED plan's `engine_device()` is `kCPU`. Returning its
+// answer unconditionally would therefore route a CUDA load's experts as though
+// they were on the host. So the placed answer is ADOPTED only when the plan
+// actively moves THIS tensor somewhere other than the device the plan itself was
+// resolved for; every other path returns the policy's own device unchanged.
+vt::DeviceType GgufLoadPolicy::ComputeDeviceFor(const std::string& name,
+                                                GgufTensorRole role) const {
+  if (role != GgufTensorRole::kStackedExpertWeight) return device;
+  const MoePlacementPlan& plan = ActiveMoePlacementPlan();
+  if (!plan.PlacesAnything()) return device;
+  const vt::DeviceType placed = plan.DeviceForRoutedExpertTensor(name);
+  if (placed == plan.engine_device()) return device;
+  return placed;
+}
+
 GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                                     GgufTensorRole role) const {
-  const GgufResidency r =
-      RouteGgufTensor(keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role,
-                      tensor.ggml_type, tensor.shape, device);
+  const GgufResidency r = RouteGgufTensor(
+      keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role, tensor.ggml_type,
+      tensor.shape, ComputeDeviceFor(tensor.name, role));
   if (audit) audit(tensor.name, role, r);
   return r;
 }
@@ -415,9 +457,15 @@ GgufLoadPolicy NoKeepQuant(const GgufLoadPolicy& policy) {
 
 GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tensor,
                         GgufTensorRole role) {
+  // THROUGH THE SAME RESOLVER `Route` USES, not a copy of the expression. This
+  // function exists so a caller can ask what the loader WILL do without
+  // notifying the audit, and `GgufExpertTowersReachSlotLane` is one such caller
+  // -- it peeks the very tensors the loader then routes. Two spellings of the
+  // device term is exactly how the bound and the forward come to disagree about
+  // one file, which is the defect #1378 records.
   return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
                          policy.cpu_ref, role, tensor.ggml_type, tensor.shape,
-                         policy.device);
+                         policy.ComputeDeviceFor(tensor.name, role));
 }
 
 }  // namespace vllm

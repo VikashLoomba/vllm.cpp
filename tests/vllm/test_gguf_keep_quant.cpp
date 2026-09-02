@@ -35,6 +35,7 @@
 
 #include "gguf_builder.h"
 #include "vllm/config/weight_residency.h"
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
@@ -2518,5 +2519,166 @@ TEST_CASE("gguf residency: the policy carries its device, and Route uses it") {
   CHECK(keep_cpu.Route(t, vllm::GgufTensorRole::kEmbeddingTable) ==
         vllm::GgufResidency::kKeepQuant);
   CHECK(keep_metal.Route(t, vllm::GgufTensorRole::kEmbeddingTable) ==
+        vllm::GgufResidency::kExpandBf16);
+}
+
+// ── BACKEND-ROCM-IQ-EXPERT-RESIDENCY (#2516) ────────────────────────────────
+//
+// A residency decision is a question about the device that will EXECUTE the
+// tensor. Hybrid placement (#2023/#2314) made that device differ from the engine
+// for exactly one role, and the loader kept asking the engine.
+//
+// The file this exists for: GLM-5.3 `UD-IQ1_S` on `strix:gpu0`. Its routed
+// experts are IQ1_S/IQ3_XXS/IQ2_XXS/IQ4_XS/Q2_K/Q3_K,
+// `DeviceKeepQuantSupported` serves {Q8_0, Q4_K, Q5_K, Q6_K} on ROCm, and the
+// towers are never uploaded to any device — so every one of them expanded and
+// `LoadStackedExperts` refused a load whose experts the CPU can execute.
+namespace {
+
+// A routed-expert tower as the file stores it: [E, N, K] with a K that is a
+// whole number of 256-element super-blocks, which is what `KeepQuantKDim` reads.
+vllm::GgufTensorInfo IqTower(const std::string& name) {
+  vllm::GgufTensorInfo t;
+  t.name = name;
+  t.ggml_type = 19u;  // IQ1_S
+  t.shape = {4, 2, 256};
+  return t;
+}
+
+// The plan the loader installs: `cpu_moe` over `layers` layers on an engine that
+// is NOT the CPU, built through the SAME resolver production uses so a pass here
+// cannot come from a hand-made per-layer vector.
+vllm::MoePlacementPlan CpuMoePlan(vt::DeviceType engine, int64_t layers,
+                                  int64_t first_placed) {
+  std::vector<vllm::PlacementOverride> ov;
+  for (int64_t l = first_placed; l < layers; ++l)
+    ov.push_back({vllm::LlmFfnExpsBlockRegex(l), "cpu"});
+  return vllm::MoePlacementPlan::Resolve(
+      vllm::DevicePlacement::FromOverrides(ov, engine), layers);
+}
+
+// RAII, because the plan is a process global and a case that leaked one would
+// change the answer of every case that ran after it — including the inertness
+// pins, which would then pass for the wrong reason.
+struct ScopedPlan {
+  explicit ScopedPlan(const vllm::MoePlacementPlan& p) {
+    vllm::SetActiveMoePlacementPlan(p);
+  }
+  ~ScopedPlan() { vllm::ResetActiveMoePlacementPlanForTesting(); }
+};
+
+}  // namespace
+
+TEST_CASE(
+    "#2516: a routed-expert tower PLACED on the CPU keeps its blocks on a ROCm "
+    "engine") {
+  vllm::ResetActiveMoePlacementPlanForTesting();
+  vllm::GgufLoadPolicy rocm;
+  rocm.keep_quant = true;
+  rocm.device = vt::DeviceType::kROCM;
+  const vllm::GgufTensorInfo t = IqTower("blk.3.ffn_gate_exps.weight");
+
+  // NO PLAN INSTALLED — the inertness pin, and the state every load in this
+  // tree that configured no placement is in. IQ1_S has no ROCm `vec_dot`
+  // (#1940), so the tower expands, exactly as before this row.
+  CHECK(rocm.Route(t, vllm::GgufTensorRole::kStackedExpertWeight) ==
+        vllm::GgufResidency::kExpandBf16);
+
+  // WITH the plan installed, the same tensor under the same policy keeps its
+  // blocks, because the device that will run it is the CPU and
+  // `vt::cpu::HasQuantDotKernel(kIQ1_S)` is true.
+  {
+    ScopedPlan guard(CpuMoePlan(vt::DeviceType::kROCM, /*layers=*/8,
+                                /*first_placed=*/0));
+    CHECK(rocm.Route(t, vllm::GgufTensorRole::kStackedExpertWeight) ==
+          vllm::GgufResidency::kKeepQuant);
+  }
+
+  // ...and the plan going away restores the old answer, so the override is the
+  // plan's and not a latch.
+  CHECK(rocm.Route(t, vllm::GgufTensorRole::kStackedExpertWeight) ==
+        vllm::GgufResidency::kExpandBf16);
+}
+
+TEST_CASE("#2516: the override is PER LAYER, not per load") {
+  // Layers 4..7 placed, 0..3 not. One assertion pair on one file under one
+  // policy: a change that keyed the override on "a plan exists" rather than on
+  // THIS tensor's layer passes the case above and fails this one.
+  ScopedPlan guard(CpuMoePlan(vt::DeviceType::kROCM, /*layers=*/8,
+                              /*first_placed=*/4));
+  vllm::GgufLoadPolicy rocm;
+  rocm.keep_quant = true;
+  rocm.device = vt::DeviceType::kROCM;
+
+  CHECK(rocm.Route(IqTower("blk.5.ffn_up_exps.weight"),
+                   vllm::GgufTensorRole::kStackedExpertWeight) ==
+        vllm::GgufResidency::kKeepQuant);
+  CHECK(rocm.Route(IqTower("blk.1.ffn_up_exps.weight"),
+                   vllm::GgufTensorRole::kStackedExpertWeight) ==
+        vllm::GgufResidency::kExpandBf16);
+}
+
+TEST_CASE("#2516: only the STACKED-EXPERT role moves; the plan places nothing "
+          "else") {
+  // The plan moves a routed-expert BLOCK. An attention weight and the vocabulary
+  // table of a placed layer's block stay on the engine and must keep answering
+  // the engine's own capability — widening the override to every role would
+  // keep a Q8_0 attention weight quantized for a device that will execute it.
+  ScopedPlan guard(CpuMoePlan(vt::DeviceType::kROCM, /*layers=*/8,
+                              /*first_placed=*/0));
+  vllm::GgufLoadPolicy rocm;
+  rocm.keep_quant = true;
+  rocm.device = vt::DeviceType::kROCM;
+
+  vllm::GgufTensorInfo w;
+  w.name = "blk.3.attn_q.weight";
+  w.ggml_type = 19u;  // IQ1_S: kept on the CPU, expanded on ROCm
+  w.shape = {2, 256};
+  CHECK(rocm.ComputeDeviceFor(w.name, vllm::GgufTensorRole::kMatmulWeight) ==
+        vt::DeviceType::kROCM);
+  CHECK(rocm.Route(w, vllm::GgufTensorRole::kMatmulWeight) ==
+        vllm::GgufResidency::kExpandBf16);
+  CHECK(rocm.ComputeDeviceFor("blk.3.ffn_gate_exps.weight",
+                              vllm::GgufTensorRole::kStackedExpertWeight) ==
+        vt::DeviceType::kCPU);
+}
+
+TEST_CASE("#2516: PeekRoute and Route resolve the device the same way") {
+  // `GgufExpertTowersReachSlotLane` peeks the very tensors the loader routes.
+  // Two spellings of the device term is how a bound and a forward come to
+  // disagree about one file (#1378), so this pins that they cannot.
+  ScopedPlan guard(CpuMoePlan(vt::DeviceType::kROCM, /*layers=*/8,
+                              /*first_placed=*/4));
+  vllm::GgufLoadPolicy rocm;
+  rocm.keep_quant = true;
+  rocm.device = vt::DeviceType::kROCM;
+  for (const char* name : {"blk.5.ffn_gate_exps.weight",
+                           "blk.1.ffn_gate_exps.weight",
+                           "blk.5.attn_q.weight"}) {
+    CAPTURE(name);
+    const vllm::GgufTensorInfo t = IqTower(name);
+    CHECK(vllm::PeekRoute(rocm, t,
+                          vllm::GgufTensorRole::kStackedExpertWeight) ==
+          rocm.Route(t, vllm::GgufTensorRole::kStackedExpertWeight));
+  }
+}
+
+TEST_CASE("#2516: a plan that places NOTHING never overrides the engine") {
+  // `cpu_moe` on a CPU engine resolves to a plan over every layer that places
+  // nothing (`DevicePlacement::IsTrivial`). A default-constructed plan's engine
+  // device is also `kCPU`. Either one, adopted unconditionally, would route a
+  // ROCm load's experts as though they were on the host — which is the same
+  // silent wrong answer in the opposite direction.
+  ScopedPlan guard(CpuMoePlan(vt::DeviceType::kCPU, /*layers=*/8,
+                              /*first_placed=*/0));
+  CHECK_FALSE(vllm::ActiveMoePlacementPlan().PlacesAnything());
+  vllm::GgufLoadPolicy rocm;
+  rocm.keep_quant = true;
+  rocm.device = vt::DeviceType::kROCM;
+  CHECK(rocm.ComputeDeviceFor("blk.3.ffn_gate_exps.weight",
+                              vllm::GgufTensorRole::kStackedExpertWeight) ==
+        vt::DeviceType::kROCM);
+  CHECK(rocm.Route(IqTower("blk.3.ffn_gate_exps.weight"),
+                   vllm::GgufTensorRole::kStackedExpertWeight) ==
         vllm::GgufResidency::kExpandBf16);
 }

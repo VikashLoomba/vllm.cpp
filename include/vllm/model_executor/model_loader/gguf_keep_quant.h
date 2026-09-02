@@ -381,6 +381,24 @@ struct GgufLoadPolicy {
   // Route one tensor and notify `audit`. This is the ONLY entry point the
   // loader uses, so every routed tensor is observable.
   GgufResidency Route(const GgufTensorInfo& tensor, GgufTensorRole role) const;
+
+  // The device that will EXECUTE this tensor, which is what a residency decision
+  // is about and is not always `device`.
+  //
+  // It differs for exactly one role. A routed-expert tower whose layer the
+  // installed `MoePlacementPlan` places away from the engine is computed on the
+  // PLACEMENT device (`RunMoePlaced` hands that device to the MoE block), so
+  // asking the engine whether its `vec_dot` covers the encoding refuses a
+  // checkpoint the placement device can execute perfectly well. Every other
+  // role, and every load with no placement installed, answers `device`
+  // unchanged -- see the implementation for the four inertness terms and why the
+  // last one is required rather than defensive.
+  //
+  // Public because `PeekRoute` must resolve the device THE SAME WAY `Route`
+  // does; a second spelling is how a bound and a forward come to disagree about
+  // one file.
+  vt::DeviceType ComputeDeviceFor(const std::string& name,
+                                  GgufTensorRole role) const;
 };
 
 // A policy copy with the KEEP-QUANT residency disabled.

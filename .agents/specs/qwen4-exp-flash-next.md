@@ -8489,8 +8489,10 @@ in which case the sm_110 axis is UNMEASURED and says so.
 
 ### What this wave is for
 
-[#2496](https://github.com/mudler/vllm.cpp/issues/2496) is fixed and the CUDA arm
-is fluent. It is not token-exact:
+[#2496](https://github.com/mudler/vllm.cpp/issues/2496) is fixed -- its fix
+LANDED as [#2550](https://github.com/mudler/vllm.cpp/pull/2550) at `bb78d1ee8`,
+so this wave's measurement tree is now the composition `main` carries -- and the
+CUDA arm is fluent. It is not token-exact:
 
 | arm | token ids |
 |---|---|

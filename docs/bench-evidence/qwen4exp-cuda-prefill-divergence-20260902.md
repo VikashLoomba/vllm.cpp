@@ -23,6 +23,14 @@ is not a landing shape and is not on any row branch, so it is pushed as
 above resolvable: an evidence file whose tree cannot be checked out is a
 citation, not evidence.
 
+**#2550 HAS SINCE LANDED**, at `bb78d1ee8`, so the dependency this measurement
+was composed to satisfy is now on `main` on its own. The measured tree stops
+being a tree that exists nowhere and becomes the composition `main` now carries:
+the decode fix plus this wave's fingerprint. Nothing measured here is restated on
+that basis -- the numbers below were taken on `0283fae36` and are reported
+against it -- but a reader no longer has to reconstruct the pairing to reproduce
+them.
+
 **Host.** `thor:gpu0` under an `rc` lease, job
 `814d530c-e742-4706-8ba3-85f39ccb7c31`, pod `rc-worker-n8smh`, aarch64, NVIDIA
 Thor, compute capability 11.0, driver 595.78, nvcc 13.0.88, built `sm_110`.

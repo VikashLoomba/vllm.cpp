@@ -69,8 +69,9 @@ that each step ran rather than inferring it from the next step's result:
 > a directory, so it lost its whole build-and-import half and a second job was
 > needed to repair the instrument. Neither script is committed; see
 > [`../sync/2026-09-02-e126687.md`](../sync/2026-09-02-e126687.md) §5.3, C6 and
-> C10, the last of which records why the attempt to commit them was reverted. The stop condition in §5 was about not spending a lease on upstream
-> `main`, and that held: no lease measured `main`.
+> C10, the last of which records why the attempt to commit them was reverted.
+> The stop condition in §5 was about not spending a lease on upstream `main`,
+> and that held: no lease measured `main`.
 
 - Every leg captures `$?` into its own named variable on the line after the
   command, never after a pipe, and the report prints the six variables verbatim.

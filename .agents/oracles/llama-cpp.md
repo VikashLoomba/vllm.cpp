@@ -70,6 +70,48 @@ superseded measurements stay where they are, with their provenance, including
 [`../specs/cpu-llamacpp-floor-remeasure-2026-07-22.md`](../specs/cpu-llamacpp-floor-remeasure-2026-07-22.md)
 and the A76 dot-product, elementwise-GEMM, GDN-orientation and threadpool specs.
 
+**This oracle's greedy decode is NOT deterministic across its own supported
+kernel paths, so a gate must pin the EXECUTED PATH and not only the revision.**
+Measured 2026-09-02 on `thor:gpu0` (aarch64, `NEON=1 MATMUL_INT8=1 SVE=1
+DOTPROD=1 REPACK=1`), rc job `deb6322d-bd06-4dd1-a5ac-2dec9987fbe1`. Stock
+`b10451`, one artifact, one recipe, greedy, run twice with the only difference
+being `use_extra_bufts` — the field the STOCK `-nr/--no-repack` flag sets
+(`common/arg.cpp:2411-2418`, `LLAMA_ARG_REPACK`; `common/common.cpp:1669` feeds
+`make_cpu_buft_list`, `src/llama-model.cpp:910,942,1304`, default true). Both
+arms are supported stock configurations, and they emit different greedy tokens:
+
+```text
+ORACLE_SELF_DIVERGENCES=1/6
+prompt 1, index 34: repack ON -> 3095,  repack OFF -> 198
+```
+
+Teacher-forcing one arm along the other's ids and diffing all 71,516,160 final
+logits, the per-step max abs logit delta is **min 0.2020, median 0.3790, max
+1.3657** over 288 steps (rms min 0.0412, median 0.0729, max 0.1856). The repack
+is a byte permutation of the same quantized values (`make_block_q4_Kx8`,
+`ggml/src/ggml-cpu/repack.cpp:2836-2870`), so the dequantized weights are
+identical and only the order and granularity of the fp32 arithmetic differs.
+`b10451` has four distinct fp32 rounding schedules for a Q4_K matvec — the
+aarch64 repacked gemv, the aarch64 NEON/SVE vec_dot, the portable `_generic`
+vec_dot, and the generic repacked gemv — and which one runs is decided by host
+architecture, `-mcpu` feature set, repack state and batch size.
+
+**What this obliges of any token gate against this oracle on the CPU tier.**
+Record the executed path, not just the pin: either pass `-nr/--no-repack`
+explicitly, or assert and record `use_extra_bufts` (and the `system_info`
+capability line) in the run record, alongside the host architecture and the
+feature set the binary was compiled for. A gate that pins only the revision is
+under-specified, and a 6-of-6 token-exactness demand at a sub-0.2-logit margin is
+asking for bit-reproduction of one specific kernel rather than for arithmetic
+quality — `b10451` scores 5 of 6 against itself when asked.
+
+**This is not a licence to excuse a divergence against this oracle.** Being
+inside the oracle's noise band per divergence is not the same as being at its
+noise floor by rate: that perturbation flips 1 of 6 prompts, and an engine that
+flips more than that carries an additional term of its own. Evidence and the
+worked case:
+[`../../docs/bench-evidence/qwen38-27b-q4km-oracle-self-consistency-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-oracle-self-consistency-20260902.md).
+
 **Assert the tree, not only the commit.** A pin names a commit, and a commit
 cannot tell you what was built. The measurements above came from a directory
 somebody develops in. Before any number is recorded against this oracle, either

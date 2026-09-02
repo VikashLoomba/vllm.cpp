@@ -221,6 +221,26 @@ struct OwnedTensor {
 // behavior (house convention for a default-on residency change).
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 
+// The whole of `src` as a ZERO-COPY view: same bytes, shape, dtype, `nk` and
+// layout markers, with a keep-alive on `src`'s buffer.
+//
+// WHY THIS EXISTS RATHER THAN `OwnedTensor b = a;`. `OwnedTensor`'s implicit
+// copy DEEP-COPIES an owned `OwnedBytes`, and a per-step block adapter that
+// spells the pass-through as assignment therefore reallocates the weight on
+// every step. That is not only traffic. `ResidentWeight`'s host-alias arm hands
+// a device kernel `w.bytes.data()` directly, so the copy's buffer becomes the
+// GEMM's operand, and the copy dies at the end of the layer's scope while the
+// GEMM is still queued: `Warp illegal address` inside cuBLASLt, with every
+// declared extent correct (issue #2476, `.agents/specs/gdn-qkvz-operand-lifetime.md`).
+// The view keeps the operand owned by the model, which is the invariant.
+//
+// `src` is NON-CONST because `OwnedBytes::KeepAlive()` converts an owned buffer
+// into a shared read-only one in place. Nothing may write through `src` after
+// that, which is already true of every weight this serves: they are read-only
+// from the end of the load. `KeepAlive()` is taken BEFORE `data()`, so the view
+// can never depend on `std::vector`'s move preserving the heap address.
+OwnedTensor BorrowWholeOwnedTensor(OwnedTensor& src);
+
 // The alignment a HOST pointer must meet before a device kernel may be handed it
 // in place of the `Backend::Alloc` pointer it would otherwise have received.
 //

@@ -54,6 +54,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kMXFP4:
     case DType::kIQ2_XS:
     case DType::kIQ4_XS:
+    case DType::kIQ3_S:
       break;
   }
   VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");
@@ -2567,9 +2568,9 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
   // `output_hc_{down,up}` — and the loader keeps their blocks, so demanding a
   // float here refused the released checkpoint at its first prefill.
   //
-  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM has
-  // never registered `qwen4_exp` and never loads a GGUF, so it has no opinion on
-  // a block-typed operand; llama.cpp merged the architecture on 2026-08-27
+  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM
+  // registered `qwen4_exp` on 2026-08-31 (#2489) but never loads a GGUF, so it
+  // has no opinion on a block-typed operand; llama.cpp merged it on 2026-08-27
   // (`6c84c7d5d`, PR #27742) and runs this exact file. It declares each of the
   // SIX projections `GGML_OP_MUL_MAT` (`src/llama-arch.cpp:759,760,761,763,764,765`
   // — down, up AND inject, on both the attention and the feed-forward side) and

@@ -65,6 +65,7 @@ using vt::cpu::BlockIQ1_XXXS;
 using vt::cpu::BlockIQ2_S;
 using vt::cpu::BlockIQ2_XS;
 using vt::cpu::BlockIQ2_XXS;
+using vt::cpu::BlockIQ3_S;
 using vt::cpu::BlockIQ3_XXS;
 using vt::cpu::BlockIQ4_NL;
 using vt::cpu::BlockIQ4_XS;
@@ -203,6 +204,7 @@ static_assert(DqIQ3_XXS::kBytes == sizeof(vt::cpu::BlockIQ3_XXS), "iq3_xxs gathe
 static_assert(DqIQ2_XS::kBytes == sizeof(vt::cpu::BlockIQ2_XS), "iq2_xs gather stride");
 static_assert(DqIQ2_S::kBytes == sizeof(vt::cpu::BlockIQ2_S), "iq2_s gather stride");
 static_assert(DqIQ4_XS::kBytes == sizeof(vt::cpu::BlockIQ4_XS), "iq4_xs gather stride");
+static_assert(DqIQ3_S::kBytes == sizeof(vt::cpu::BlockIQ3_S), "iq3_s gather stride");
 static_assert(DqIQ1_S::kBytes == sizeof(vt::cpu::BlockIQ1_S), "iq1_s gather stride");
 static_assert(DqIQ1_XXXS::kBytes == sizeof(vt::cpu::BlockIQ1_XXXS), "iq1_xxxs gather stride");
 
@@ -228,6 +230,7 @@ static_assert(DqIQ1_XXXS::kBytes == sizeof(vt::cpu::BlockIQ1_XXXS), "iq1_xxxs ga
   X(kIQ1_XXXS, DqIQ1_XXXS)        \
   X(kIQ4_NL, DqIQ4_NL)            \
   X(kIQ4_XS, DqIQ4_XS)            \
+  X(kIQ3_S, DqIQ3_S)              \
   X(kMXFP4, DqMXFP4)
 
 template <typename Tout, typename Tid>

@@ -3381,10 +3381,19 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
       const float* row = host + static_cast<size_t>(i) * static_cast<size_t>(vocab);
 
       const std::string base = std::string(kDumpLogitsDir) + "/ours_" + req_id;
-      if (std::FILE* f = std::fopen((base + ".f32").c_str(), "ab")) {
-        std::fwrite(row, sizeof(float), static_cast<size_t>(vocab), f);
-        std::fclose(f);
-      }
+      // FAIL LOUDLY. A dump that silently writes nothing when the directory is
+      // missing is an instrument whose failure looks like a result: the operator
+      // gets no files, no error, and then diffs nothing against the oracle. The
+      // directory is the caller's to create.
+      std::FILE* f = std::fopen((base + ".f32").c_str(), "ab");
+      VT_CHECK(f != nullptr,
+               "VT_DUMP_LOGITS: cannot open the dump file -- does the directory "
+               "exist? The instrument does not create it.");
+      const size_t wrote = std::fwrite(row, sizeof(float),
+                                       static_cast<size_t>(vocab), f);
+      std::fclose(f);
+      VT_CHECK(wrote == static_cast<size_t>(vocab),
+               "VT_DUMP_LOGITS: short write; the dump would be misaligned");
       // The ALIGNMENT control the spec requires: this argmax must equal the id
       // `--output-token-ids` records for the same step, or the two sides are not
       // describing the same context and no delta computed from them means
@@ -3395,10 +3404,10 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
       }
       const int step = input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] -
                        input_batch_.num_prompt_tokens[static_cast<size_t>(i)];
-      if (std::FILE* g = std::fopen((base + ".ids.txt").c_str(), "a")) {
-        std::fprintf(g, "%d %lld\n", step, static_cast<long long>(best));
-        std::fclose(g);
-      }
+      std::FILE* g = std::fopen((base + ".ids.txt").c_str(), "a");
+      VT_CHECK(g != nullptr, "VT_DUMP_LOGITS: cannot open the ids sidecar");
+      std::fprintf(g, "%d %lld\n", step, static_cast<long long>(best));
+      std::fclose(g);
     }
   }
 

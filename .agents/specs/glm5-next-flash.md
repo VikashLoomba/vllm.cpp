@@ -3215,7 +3215,8 @@ is proved on the box, by a leg that changes NOTHING but where the pages live:
 `StoreCaches` with the whole call chain named, and A survived at rc=0 in 1756 s
 with one variable moved. **Legs C and D did not run**, because the job's identity
 guard hashed `vllm-cli` alone and refused a pair whose `libvllm.so` genuinely
-differed (O51). Run 2 carries the repaired predicate and these legs:
+differed (O51). **RUN 2 IS NOW ALSO TAKEN** (O53 below); it carried the repaired
+predicate and these legs:
 
 | leg | binary | device | env | the question it answers |
 |---|---|---|---|---|
@@ -3245,6 +3246,63 @@ decode step on a device queue -- so it is not filed as a defect. It is named
 here because a two-token leg contains exactly one decode step, so a leg C whose
 stdout matches leg D byte-for-byte has measured it, and a leg C that emits
 ` Paris` followed by the wrong second token has found it.
+
+#### O53 -- RUN 2 IS TAKEN, and the criterion FAILED ON A CLAUSE I MIS-SPECIFIED
+
+`glm53-kvres/submit2.log`, `dgx:gpu0`, finished 2026-09-01T21:56:05Z, 12068 s
+wall, five legs interleaved on ONE box from TWO separate build directories. The
+tested bytes are the PR's bytes: `glm5_next_kv.cpp` hashes
+`cb34a6d198476864...` at PR head `868b49bdd` and `37d337a7538fcefb...` at base
+`3cd467643`, matching the `fix`/`base` digests the job recorded.
+
+| leg | binary | device | env | rc | stdout | bytes |
+|---|---|---|---|---|---|---|
+| D | fixed | cpu | -- | 0 | ` Paris.` | `2050 6172 6973 2e0a` |
+| C | fixed | cuda | `…DEVICE_EXPERTS=1` | 0 | ` Paris Paris` | `2050 6172 6973 2050 6172 6973 0a` |
+| E | fixed | cuda | + `VT_ASYNC_DEVICE_MIRROR=0` | 0 | ` Paris.` | `2050 6172 6973 2e0a` |
+| F | fixed | cuda | `--max-tokens 1` | 0 | ` Paris` | `2050 6172 6973 0a` |
+| G | base | cuda | `VT_DEVICE_KV_CACHE=0` | 0 | ` Paris Paris` | `2050 6172 6973 2050 6172 6973 0a` |
+
+Binary identity held this time on the repaired predicate: linked-set digests
+`e6762476d2b97ded...` (base) against `f643a2f1bb540f49...` (fixed), with
+`fix_sentinel=no` / `fix_sentinel=yes`.
+
+**THE CRASH IS FIXED.** Run 1 leg B died `rc=139` with `StoreCaches` at frame #0
+(`+840`); leg C is the same workload on the same box at `rc=0`.
+
+**THE STATED CRITERION -- "C byte-identical to D" -- FAILED, and the fault is in
+the criterion.** C and D differ by TWO variables, not one: where the KV pages
+live AND whether the async device mirror is engaged. A `StoreCaches` fix can
+only be held to the first. The single-variable operand is **leg G**, the BASE
+binary on host pages, and:
+
+    C (fixed, device KV)  == G (base, host KV)   byte-for-byte, 13 bytes
+
+So the fix reproduces the already-working path exactly. It converts a SIGSEGV
+into the same bytes, and it changes nothing else.
+
+This is recorded as a mis-specified criterion rather than a widened one. The
+clause as written is still red, and nothing was deleted to make it green.
+
+**THE SECOND TOKEN IS A SEPARATE, PRE-EXISTING DEFECT, AND RUN 2 CONVICTS IT.**
+Leg G is a base build and diverges identically, so the divergence predates this
+fix and is neither caused nor cured by it. Leg F shows prefill is clean
+(` Paris` matches D's first token). Leg E flips ONE variable,
+`VT_ASYNC_DEVICE_MIRROR=0`, and the divergence disappears into byte-identity
+with D. That is exactly the pre-registered read-key above, and it promotes
+[#2544](https://github.com/mudler/vllm.cpp/issues/2544) -- which names
+`Glm5NextForConditionalGeneration` on a grep and calls itself "a candidate, not
+a conviction" -- to a measured conviction for this model. O52 is answered and
+its ownership moves to #2544.
+
+**What run 2 does NOT establish, stated rather than glossed:** leg A as
+originally specified (FIXED binary with `VT_DEVICE_KV_CACHE=0`) was never run;
+what exists is the BASE binary on host pages, twice, rc=0 both times, which
+serves the falsification purpose but is not the literal leg. Legs B and C were
+never in the same job -- B is run 1's binary, C is run 2's, source-anchored to
+the same `3cd467643` but not interleaved with each other, so **leg C is n=1**.
+No speed number is admissible or claimed from any leg; the walls are durations
+of which ~85% is GGUF load.
 
 #### Mutations, with what each one killed
 

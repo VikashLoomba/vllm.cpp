@@ -128,6 +128,113 @@ join the host arm is `## Owed` O2: it is a pure rename-and-move across ten
 translation units, it would conflict with every open branch that touches a
 registry, and it is not this row's unit of work.
 
+### The divergence from `glm_moe_dsa`, answered on the three points it is owed
+
+`glm_moe_dsa` (`d8683402b`) publishes the device pointer with
+`detail::DeviceTokenIdsScope` and splices DEVICE-side with
+`detail::ApplyDeviceTokenIds`, enqueued on the main queue so it is ordered after
+the combine rather than racing it. This row reads the ids back to the HOST
+instead. That is a divergence and it needs justifying, because a device-to-host
+read on the decode path is exactly the synchronise the async mirror exists to
+remove.
+
+**1. Where each forward gathers, and where the read-back happens.** Every one of
+the three gathers embedding rows on the HOST, out of a host weight vector,
+indexing a host `std::vector<int32_t>`:
+
+| registration | the gather | what it indexes |
+|---|---|---|
+| `Glm5NextForConditionalGeneration` | `glm5_next_forward.cpp:366` `const int32_t tok = token_ids[t];` | a host row read out of `weights.embed_tokens` |
+| `DeepseekV4ForCausalLM` | `deepseek_v4.cpp:2929` (in `ForwardComposeImpl`, `:2891`) `const int64_t tok = token_ids[t]; ... x[t*H+h] = hw.embed[tok*H+h];` | `hw.embed`, a host `std::vector<float>` |
+| `LagunaForCausalLM` | `laguna.cpp:1457` `const int64_t tok = token_ids[t];` then `memcpy(hidden, embed.data() + tok*H, ...)` | `ReadF32(weights.embed)`, a host vector |
+
+`glm_moe_dsa` does not look like this. It uploads
+`DBuf dids(d, DType::kI32, {T}, token_ids.data())` and embeds from that DEVICE
+buffer, which is why `ApplyDeviceTokenIds` — whose `dst` is a device allocation —
+is the right consumer there and cannot be the right consumer here.
+
+The read-back happens ONCE per forward, at the registry, before the first read of
+the identifiers and before any cache work.
+
+**2. What it costs per decode step, named rather than waved past.** One
+`vt::Backend::Copy` of `4 * token_ids.size()` bytes device-to-host (4 bytes per
+row on a pure-decode step), plus one `Backend::Synchronize` on `input.queue`.
+
+**The synchronise is real, and on these three forwards it is not a new
+serialisation point.** Each of them already computes its logits into a host
+`std::vector<float>` and returns it by value — `HostLogits(...)` for `glm5_next`
+and `laguna`, and for `deepseek_v4`'s so-called device arm
+`WrapV4DeviceLogits` (`deepseek_v4.cpp:3946`) merely WRAPS a host
+`std::vector<float>` in a `vt::Tensor` pointing at `buf->data()`. A host vector of
+logits cannot exist before every device operation that produced it has completed,
+and each forward's FIRST act on the identifiers is a host dereference. So there is
+no device execution left for this wait to overlap with; the wait these forwards
+impose is the one they already imposed.
+
+It WOULD be a genuine regression on a forward whose embed and tower are on the
+device, and that is stated in the header rather than left to be discovered: a
+caller that later grows a device embed must move to `detail::ApplyDeviceTokenIds`
+and stop using this. For `deepseek_v4` in particular, the long-term repair is to
+move `ForwardComposeImpl`'s embed onto the device, at which point this call is
+replaced rather than kept. That is `## Owed` O7.
+
+The comparison that matters is not "slower against faster". It is "correct
+against silently wrong": the arm this replaces reads identifiers the runner never
+wrote and generates from token id 0.
+
+**3. Why the shared seam could not carry it, and where the seam should live.**
+`detail::ApplyDeviceTokenIds(backend, queue, void* dst, dst_count, what)` splices
+over a DEVICE destination. None of these three has one. Passing a host vector's
+`data()` as `dst` would be a device-to-host copy through an interface documented
+as device-to-device, AND — because that copy is enqueued and never awaited — it
+would race the host gather three lines later. So the seam as written cannot
+express these callers, which is the condition CLAUDE.md §"Shared seams" gives for
+extending a seam rather than routing through it.
+
+There are now three arms of ONE contract, not two competing spellings:
+
+| arm | destination | entry point | who uses it |
+|---|---|---|---|
+| eager DEVICE | a device embed buffer | `detail::ApplyDeviceTokenIds` | `qwen3`, `qwen3_5`, `qwen3_moe`, `deepseek_v2`, `glm_moe_dsa` |
+| decode-GRAPH slot | a slot's persistent device destination | `vllm::StepTokenIds` | the graph drivers |
+| HOST gather | the caller's own `std::vector<int32_t>` | `vllm::ResolveHostTokenIds` | `glm5_next`, `deepseek_v4`, `laguna` |
+
+The selector is not a preference: it is where that forward's embed reads from.
+
+**And the seam's home is wrong, which is a finding this row reports rather than
+fixes.** The device arm lives in `src/vllm/model_executor/models/qwen3_5_internal.h`,
+a MODEL-PRIVATE header that now publishes a runner contract to ten unrelated
+translation units — `llama`, `mistral`, `internlm2`, `glm4_moe_lite`,
+`deepseek_v2`, `glm_moe_dsa` and four Qwen files. A model that has nothing to do
+with Qwen3.5 including `qwen3_5_internal.h` to reach a runner contract is a home
+that has outgrown its name. The host arm therefore goes to
+`include/vllm/model_executor/models/host_token_ids.h`, beside `step_token_ids.h`,
+which is the graph arm of the same contract and already lives there. Moving the
+DEVICE arm to join them is a pure rename across ten translation units that would
+conflict with every open branch touching a registry, so it is `## Owed` O2 and not
+this row's unit of work.
+
+**4. The null path, which is every non-async and every CPU run.**
+`if (input.device_token_ids == nullptr) return input.token_ids;` is the first
+statement after the argument check. It returns the caller's own vector by
+`const&` and never touches `storage`, so the forward receives the identical
+object it received before this change — byte-identical by construction, not by
+comparison.
+
+The lifetime is safe by the struct's own declaration:
+`ModelForwardInput::token_ids` is itself a `const std::vector<int32_t>&`
+(`model_registry.h:571`) bound to a vector the caller owns for the duration of
+the forward, so the returned reference cannot outlive its referent any more than
+`input.token_ids` could.
+
+It is EXERCISED rather than assumed: every other case in both suites — 32 in
+`test_glm5_next_forward` and 22 in `test_deepseek_v4_exl3_loader` — passes a step
+with no mirror, so the null path runs in all of them and all of them stayed green.
+Mutation M4, which makes the body return `input.token_ids` unconditionally, reds
+BOTH device-id gates while leaving every one of those cases green, which is the
+two-sided proof that the null path and the mirror path are distinct and that each
+is reached.
+
 ### The three call sites
 
 Each is one `std::vector<int32_t>` of storage plus one call, placed immediately
@@ -349,6 +456,10 @@ queued on `dgx:gpu0`. Nothing is claimed for them until they run.
   forward `LagunaForwardGguf` has no registry caller. A registry step on the only
   runnable checkpoint fixture SIGSEGVs. Tracked by
   [#2618](https://github.com/mudler/vllm.cpp/issues/2618). See `## Risks/decisions` D5.
+* **O7** — move `DeepseekV4ForCausalLM`'s embed (`ForwardComposeImpl`,
+  `deepseek_v4.cpp:2929`) onto the device, so its arm takes
+  `detail::ApplyDeviceTokenIds` and drops the host read-back entirely. Owned by
+  [#2544](https://github.com/mudler/vllm.cpp/issues/2544).
 * **O5** — the DEVICE half of the contract (the copy reads device memory; it is
   ordered on the main queue after the combine) is untested for these three on any
   device; only GLM-5.3-Flash gets a hardware leg here. Owned by

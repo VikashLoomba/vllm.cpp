@@ -521,8 +521,11 @@ The three smaller decisions that rode along, and their answers:
   reference, calls that one coherent picture — "our render is somewhat SMOOTHER
   than upstream's" — and states that a one-sided blockiness ceiling is blind to
   smoothness by construction. Whether a smoother render still depicts the prompt
-  is exactly the question this row is about, and nothing in the tree can answer
-  it.
+  is exactly the question this row is about. **ANSWERED, 2026-09-01**, by
+  `LTX25-ADHERENCE-DETAIL-LOSS` (#2513): the premise is false, our render is not
+  smoother, and the correction below in this file carries the measured reading.
+  This bullet is kept because it records why the row was opened; "nothing in the
+  tree can answer it" is no longer true of the tree.
 - **Scoring frames independently is not scoring a VIDEO.** Every candidate is an
   image-text model. Temporal adherence — "walks SLOWLY" — is invisible to all of
   them. vLLM-Omni scores one middle frame and claims no more; this spec scores
@@ -814,6 +817,37 @@ markings that separate a fox from a wolf would produce exactly the two numbers
 above. Nothing here measures that mechanism, and the ablation that would is not
 in this row.
 
+**THAT HYPOTHESIS IS NOW MEASURED AND IT IS FALSE (2026-09-01).** Every number
+in this paragraph is **n = 1 on our side** -- one render, for the reason the
+`## Owed` bullet below records -- and each is recomputable from
+`tests/parity/goldens/ltx25_detail_loss/detail-loss.json`.
+`LTX25-ADHERENCE-DETAIL-LOSS` ([#2513](https://github.com/mudler/vllm.cpp/issues/2513))
+ran the ablation on these same 25 frames. Our render is not smoother: measured
+border-free it carries **1.4031x the reference's absolute high-band power**
+(>= 0.20 cycles per pixel) at **1.0373x its mid-band power**, so there is no
+high-frequency rolloff to call smoothness. (That row first published this as
+"77.79% MORE" from a windowed whole-frame spectrum and withdrew the figure; its
+`## CORRECTION` carries the four-convention table and the reason.) Within our 25 frames more fine-scale
+energy predicts a WORSE score, `r = -0.6195` and negative under all four
+spectral conventions; within the reference's it predicts a better one,
+`r = +0.2640`, though that positive coefficient is estimator-dependent and reads
++0.0009 under the raw convention, so the sign flip is weaker evidence than it
+first appeared. Our three best-scoring frames are our three LEAST sharp of 25,
+our single sharpest frame fails the bound, and the overlap between our five
+best-scoring frames and our five sharpest is EMPTY -- an FFT-free ordering that
+no convention can move. The intervention that settles the direction is on
+UPSTREAM's frames: blurring them until their sharpness is a fifth of ours costs
+only 1.9687 against the 2.7305 gap, and blurring them merely to our sharpness
+costs 0.1192, 4.4% of it, so no achievable smoothing reproduces our shortfall.
+**A "blurring OUR frames RAISES their score by +1.9131, 6 of 25 to 23 of 25"
+figure stood here and is WITHDRAWN**: a decoy outranks the true prompt on our
+blurred frames from sigma 0.50 upward, so those arms measure no adherence, and
+the readable row moves us by -0.0029. The paragraph above stays as written
+because it records what this row knew when it landed; the corrections live in
+that row's `## CORRECTION` and `## CORRECTION 2`. **That row names NO cause**,
+and the separable-upsampler candidate an earlier version of this sentence
+pointed at is withdrawn.
+
 **It also does not say our render is bad for a viewer.** CLIP is an instrument
 with an uncalibrated absolute value, which is why S1 is a comparison and why the
 `20.0` floor of vLLM-Omni's own gate is still refused here. 35.2719 is a number
@@ -854,13 +888,21 @@ refused rather than scored.
   [#2295](https://github.com/mudler/vllm.cpp/issues/2295).
 - **NOTHING OWNS CLOSING THE ADHERENCE GAP**, which reads 2.8559 against the
   committed mp4 reference and 2.7305 against its lossless frames. That is an engine
-  question, not an instrument one, and this row measures rather than fixes. The
-  hypothesis in `## Outcome`, that the smoothness `ltx25-oracle-absolute.md`
-  records is what costs the fox-against-wolf margin, is untested, and the
-  ablation that would test it is not specified anywhere. Owner of the RECORD:
+  question, not an instrument one, and this row measures rather than fixes. **The
+  attribution this bullet said was missing now exists and it is NEGATIVE**:
+  `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) specified and ran the ablation, and the
+  smoothness hypothesis is refuted -- our render carries MORE fine-scale energy
+  than the reference, not less, and blurring UPSTREAM's frames to a fifth of our
+  sharpness still costs only 1.9687 of the 2.7305 gap. (A "blurring OURS raises
+  its score" figure was published and is withdrawn: those arms fail the scorer's
+  own precondition.) **That row does NOT name a replacement cause.** It first named an axis-aligned near-Nyquist
+  excess and WITHDREW it: the probe was reading the frame's own wrap step, which
+  our render carries more of, and border-free the axis-to-ring contrast is
+  2.46x/2.22x against 2.23x/1.78x, which supports nothing. Owner of the RECORD:
   this row, through #1854, which is the issue that asked the question and is the
-  right place for the answer. Owner of the REPAIR: **no row exists**, and naming
-  one needs the attribution first. This is the sharpest hole W3 leaves.
+  right place for the answer. Owner of the REPAIR: **still no row**, and still no
+  attribution -- what #2513 leaves is a refuted hypothesis and three named
+  ablations that would produce one.
 - **n IS 1.** Only the first of `93a60151`'s three renders retained its frames,
   by the harness's design as `## Outcome` now records, so the run-to-run
   stability of our own adherence reading is UNMEASURED. A reading that moves by

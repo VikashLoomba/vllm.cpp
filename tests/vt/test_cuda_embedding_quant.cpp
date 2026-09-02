@@ -106,7 +106,7 @@ const DType kGatherDTypes[] = {
     DType::kQ3_K,   DType::kQ4_K,     DType::kQ5_K,   DType::kQ6_K,
     DType::kQ8_K,   DType::kIQ2_XXS,  DType::kIQ3_XXS, DType::kIQ2_S,
     DType::kIQ2_XS, DType::kIQ1_S,    DType::kIQ1_XXXS, DType::kIQ4_NL,
-    DType::kIQ4_XS, DType::kMXFP4,
+    DType::kIQ4_XS, DType::kMXFP4,    DType::kIQ3_S,
 };
 
 // Random block bytes whose CPU decode is finite. A block is redrawn (not
@@ -196,10 +196,14 @@ TEST_CASE("the CPU row-decoder set is PINNED, because the device gate is dtype-b
       DType::kQ3_K,   DType::kQ4_K,     DType::kQ5_K,     DType::kQ6_K,
       DType::kQ8_K,   DType::kIQ2_XXS,  DType::kIQ3_XXS,  DType::kIQ2_S,
       DType::kIQ2_XS, DType::kIQ1_S,    DType::kIQ1_XXXS, DType::kIQ4_NL,
-      DType::kIQ4_XS, DType::kMXFP4,
+      DType::kIQ4_XS, DType::kMXFP4,    DType::kIQ3_S,
   };
+  // The bound is the LAST enumerator, and it has to move with the enum: while
+  // it read `kIQ4_XS` this loop stopped one short of `kIQ3_S`, so a MISSING
+  // decoder for the newest dtype would have read as present. QUANT-IQ3S
+  // (#2510) is the change that made that true.
   int decodable = 0;
-  for (int i = 0; i <= static_cast<int>(DType::kIQ4_XS); ++i) {
+  for (int i = 0; i <= static_cast<int>(DType::kIQ3_S); ++i) {
     const DType dt = static_cast<DType>(i);
     if (vt::cpu::BlockToFloat(dt) != nullptr) ++decodable;
   }

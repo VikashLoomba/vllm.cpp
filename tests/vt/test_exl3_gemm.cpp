@@ -425,23 +425,35 @@ TEST_CASE("exl3 gemm: unrepresentable inputs REFUSE BY NAME") {
   CHECK(m_dtype.find("exl3_gemm") != std::string::npos);
   CHECK(m_dtype.find("f16") != std::string::npos);
 
-  // A codebook this tree does not decode, which is cb 2 — upstream's `mul1`
-  // dp4a byte-sum variant.
+  // The codebook seam, in BOTH directions.
   //
-  // THIS CASE USED cb 0, AND THAT WAS WRONG RATHER THAN MERELY OUTDATED. It
-  // asserted "the artifact is mcg (cb 1)" as though cb 0 were exotic; cb 0 is
-  // the original QTIP 3INST and is what EVERY stock `turboderp/*-exl3`
-  // checkpoint uses, because `LinearEXL3` derives the codebook from tensor
-  // PRESENCE (`exl3.py:74-77`) and those artifacts ship no marker. The
-  // DeepSeek-V4 artifact this row was written against ships an `mcg` marker and
-  // is the exception. cb 0 is now implemented (QUANT-EXL3, #2181) and gated by
-  // `test_exl3_native_loader`; the refusal it leaves behind is cb 2's.
+  // THIS CASE HAS BEEN WRONG ONCE ALREADY, and the history is why it now asserts
+  // acceptance as well as refusal. It first used cb 0, asserting "the artifact
+  // is mcg (cb 1)" as though cb 0 were exotic; cb 0 is the original QTIP 3INST
+  // and is what EVERY stock `turboderp/*-exl3` checkpoint uses, because
+  // `LinearEXL3` derives the codebook from tensor PRESENCE (`exl3.py:74-77`) and
+  // those artifacts ship no marker. It then moved to cb 2, which was true until
+  // cb 2 was ported (QUANT-EXL3-MUL1, #2495).
+  //
+  // A refusal-only case cannot tell "not yet ported" from "ported and this seam
+  // never learned", so the positive half is the load-bearing one: cb 2 must
+  // reach the host arm and RUN.
   vt::Tensor ta = vt::Tensor::Contiguous(a_h.data(), vt::DType::kF16, q.device, {m, k});
   vt::Exl3GemmArgs cb2 = ok;
   cb2.codebook = 2;
-  const std::string m_cb = refusal(ta, cb2);
+  CHECK(refusal(ta, cb2).empty());
+
+  // What is left to refuse is a value UPSTREAM DOES NOT DEFINE.
+  // `decode_3inst<cb>` (`codebook.cuh:56-90`) has arms for 0, 1 and 2 and falls
+  // off the end for anything else, so cb 3 is not an arm awaiting a port.
+  vt::Exl3GemmArgs cb3 = ok;
+  cb3.codebook = 3;
+  const std::string m_cb = refusal(ta, cb3);
   CHECK(m_cb.find("exl3_gemm") != std::string::npos);
   CHECK(m_cb.find("codebook") != std::string::npos);
+  vt::Exl3GemmArgs cbneg = ok;
+  cbneg.codebook = -1;
+  CHECK_FALSE(refusal(ta, cbneg).empty());
 }
 
 // ─── the device arms ─────────────────────────────────────────────────────────
@@ -595,8 +607,20 @@ TEST_CASE("exl3 device: the widened (bits, codebook) arms agree with the CPU arm
     int codebook;
     const char* what;
   };
-  // (3, 1) is covered by the case above; these are the two W3 added.
-  const Arm arms[] = {{3, 0, "a stock exl3 body"}, {6, 0, "a stock exl3 lm_head"}};
+  // (3, 1) is covered by the case above; these are the two W3 added and the
+  // three QUANT-EXL3-MUL1 added for `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` (#2495).
+  //
+  // The cb 2 rows are the ones that carry a NEW DECODE and not only a new width:
+  // `decode_mul1_product_2` sums the four bytes of the product instead of adding
+  // the two fp16 halves, so agreement with the host arm here is agreement on
+  // that decode. The host side of it is gated against hand-computed upstream
+  // values in `tests/vt/test_exl3_dequant.cpp`, which is what keeps this
+  // cross-check from being two ports of the same mistake.
+  const Arm arms[] = {{3, 0, "a stock exl3 body"},
+                      {6, 0, "a stock exl3 lm_head"},
+                      {4, 2, "the Qwen3.8-27B mul1 body, 270 of its 272 tensors"},
+                      {5, 2, "the Qwen3.8-27B mul1 5-bit tensor, and all 36 of its draft"},
+                      {6, 2, "the Qwen3.8-27B mul1 lm_head"}};
 
   for (const Arm& arm : arms) {
     CAPTURE(arm.bits);

@@ -488,6 +488,7 @@ jobs:
           python3 tests/scripts/test_ab_arms_differ.py
           python3 tests/scripts/test_tier_hidden_delta.py
           python3 tests/scripts/test_tier_delta_attribution.py
+          python3 tests/scripts/test_tier_logit_delta.py
       - name: The LTX-2.5 pixel comparison and its harness run on a lane (#1612)
         # Registered in TWO places, like the baseline and preflight suites above:
         # here and in `scripts/agent-preflight.sh`. Both suites ran on NO lane

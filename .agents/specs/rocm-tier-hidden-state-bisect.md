@@ -21,7 +21,9 @@ records why one statistic was not enough.
 
 ## Now
 
-`ACTIVE` — the instrument is being built. No measurement has been taken.
+`ACTIVE` — measured. The instrument is built and gated, the comparison ran on
+`strix:gpu0`, and §7's outcomes **P2 and P3 are both selected, on different
+steps**. Nothing is fixed, because nothing here is a defect. See `## Outcome`.
 
 ## 1. Why this row is different from every predecessor on this arm
 
@@ -393,3 +395,90 @@ mutation-proven: deleting the guard reds exactly its own case.
 - If the eager/graph control of §3.3 fails, stop and report that; no per-layer
   profile is readable until it is resolved.
 - `NEEDS_CONTEXT` rather than guessing.
+
+## Outcome
+
+Measured 2026-09-02, `rc` job `5af7552a-5fba-4e51-92d8-f4cdfd3b21ca` (the profile)
+and `b2d8024c-273c-4207-8f38-4b23756c133b` (the logits) on `strix:gpu0`, worker
+`rc-worker-lcjhd`, one boot, one `libvllm.so`
+`3b752d296144dda7b00779f25cfe95f9dfe131fdbf523e5e4e923948783ea7aa`, built from
+`007012e49c9b1389725accd07ca30bdc1404e677`. Evidence:
+[`qwen38-27b-q4km-tier-divergence-bisect-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-tier-divergence-bisect-20260902.md).
+
+**Two of §7's outcomes are selected, and the pre-registration is what makes that
+readable rather than a hedge.**
+
+**P3 for `p4/14`.** It does not reproduce. With both arms on one host our x86-64
+CPU tier and our ROCm tier emit all 48 ids identically, `22486` at step 14
+included. #2590's `A vs D` column crossed an ARCHITECTURE as well as a tier — the
+recorded CPU-tier run was `thor`, aarch64 — so p4/14 is the CPU tier's own
+architecture dependence and #2590 narrows from three steps to two.
+[#2608](https://github.com/mudler/vllm.cpp/issues/2608) owns it, against
+`QUANT-QWEN38-27B-GGUF-ARM`.
+
+**P2 for `p1/45` and `p3/45`.** Both reproduce exactly, ids for ids. The profile
+is a smooth ramp with no discontinuity: the final `rel_l2` is 2.63e-02, 2.84e-02
+and 2.68e-02 on the three prompts against a bf16 random-walk prediction of
+2.55e-02, so **1.03, 1.11 and 1.05 times what two independent bf16 residual
+streams MUST differ by**. The run-to-run floor is exactly zero over 9360 compared
+per-layer rows, so every part of that is the tier.
+
+**And the amplitude closes it.** The cross-tier pre-sampler logit delta is
+`max_abs` 0.33 to 0.39 on every comparable step, while the margins at the two
+flips are 0.044262 / 0.123070 and 0.011835 / 0.058807. Over the three prompts,
+**17 steps are at risk (their smaller margin is below that step's delta), 2 of
+them flipped, and 0 flips occur outside that set.** Being at risk is necessary
+and not sufficient — 15 of 17 did not flip — so the account is not a tautology,
+and no flip needs a cause beyond the size of the delta.
+
+**Localised anyway, and this is the part the pre-registration did not anticipate.**
+P2 was written as "no localisation, it is arithmetic". It is arithmetic AND it
+localises: the 16 full-attention layers carry 84% / 74% / 79% of the variance
+against the 48 GDN layers, and inside the layer the full-attention mixer
+amplifies the incoming relative error by **2.160** where the GDN mixer returns
+1.500 — with the SHARED MLP amplifying 1.697 and 1.671, agreeing to 1.6%, which
+is what makes the mixer difference a localisation rather than a scaling artefact.
+The right reading is that the attention block is the one with the most bf16
+stores and two reduction orders over a paged KV cache, not that it is wrong.
+
+**What the row measured that it did not set out to.**
+
+- **The token embedding is bit-identical on every comparable step of all three
+  prompts.** §3.4 flagged the `token_embd` residency asymmetry as live — Q4_K
+  blocks on the CPU tier, expanded bf16 on ROCm. It contributes nothing. The two
+  dequantizers agree to the bit.
+- **The two tiers take different GDN conv1d branches on the prefill step**: ROCm
+  the indexed `GdnStateGather` arm, the CPU tier the `GatherStateF32` fallback.
+  96 keys appear only on ROCm and 48 only on the CPU tier, all on step 0. It is
+  not the cause of anything measured, and it is a real difference in which code
+  runs. Visible only because the comparator refuses a key-set mismatch.
+- **Prompt 4 is the control that makes the size of the effect concrete**: the
+  same 2.7% divergence, and identical tokens at all 48 steps. The divergence
+  produces a different token only where the model's own margin is smaller than
+  it.
+
+**What this means for the row, stated because it is the useful part.**
+Token-exactness BETWEEN our tiers is not available at bf16 and never was. It is a
+different and weaker claim than token-exactness against an oracle, and this is
+the first measurement of it in this project. `TOKEN_GATE` is unchanged, `FAIL`,
+and no speed, latency or memory axis becomes admissible.
+
+**Lesson, kept because it cost a mutation.** The first version of this row's
+reachability gate keyed on the TOTAL blob count and passed with both production
+call sites deleted, because the GDN stage probes fire off the same environment
+variable. A count that cannot reach zero when the thing it counts is removed is
+not a measurement of it. The counter is now split, and the mutation reds the gate
+while leaving the plain binary and the hermetic writer suite green — which is the
+difference between measuring a class and measuring a capability, visible in one
+run.
+
+## Owed
+
+- [#2608](https://github.com/mudler/vllm.cpp/issues/2608): the aarch64-vs-x86-64
+  CPU-tier divergence at p4/14, against `QUANT-QWEN38-27B-GGUF-ARM`. The
+  instrument this row built runs on two CPU arms with no GPU on either side.
+- The GDN prefill conv branch asymmetry between the tiers. Measured, not
+  explained, and not the cause of anything here.
+- #2590 stays open on `p1/45` and `p3/45`, now with a cause and no fix: they are
+  near-ties decided by an irreducible bf16 accumulation, and closing them would
+  mean changing what the residual stream is stored in.

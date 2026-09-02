@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "vt/dtype.h"
+#include "vt/device.h"           // vt::DeviceType, for the ActDType resolver
 #include "vt/paged_attn_route.h"  // W10 repair (#1865): the uniform-spec shape guard
 #include "vt/tensor.h"
 
@@ -319,6 +320,24 @@ bool GdnOutBf16FlagIsOn(const char* env_value);
 // SAME binary is registered a second time with `VT_GDN_OUT_BF16=0`, and the case
 // asserts against the environment as it reads it directly.
 vt::DType GdnOutDType();
+
+// #2534. The qwen35 trunk's ONE resolved activation dtype, and the parser that
+// feeds it, declared here for exactly the reason `GdnOutDType` is: a gate that
+// can only reach the parser cannot see a resolver that has been severed from it,
+// and this lever is the denominator of the Q4_K_M arm's same-binary A/B.
+//
+// `ActF32FlagIsOn` is opt-IN (only a leading '1' turns it on), the OPPOSITE
+// polarity to `GdnOutBf16FlagIsOn`, because turning it on changes numerics on a
+// shipped path and the default must be the behaviour every recorded measurement
+// was taken under. `ActDType` answers BF16 for every device type when the flag
+// is off, and F32 only for a CPU device type when it is on -- so a test that
+// asserts the CUDA answer is unchanged is a real assertion and not a tautology.
+// The getenv is cached in a function-local static, so one process observes one
+// value; the second registration of the same binary under `VT_ACT_F32=1` is what
+// exercises the other arm, as tests/CMakeLists.txt already does for
+// `VT_GDN_OUT_BF16`.
+bool ActF32FlagIsOn(const char* env_value);
+vt::DType ActDType(vt::DeviceType dev_type);
 
 // W2 merged-qkvz dispatch. vLLM always issues one in_proj_qkvz GEMM
 // (qwen_gdn_linear_attn.py:923-936 @ 702f4814); locally the single GEMM is

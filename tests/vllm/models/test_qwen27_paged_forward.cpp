@@ -700,6 +700,55 @@ TEST_CASE("qwen27 GDN out dtype is bf16 by default and keys on no model shape") 
   CHECK(GdnOutBf16FlagIsOn(""));  // not a leading '0'.
 }
 
+// #2534. The qwen35 trunk's ONE resolved activation dtype. Two cases, because
+// the parser and the resolver are separable and severing them is silent: an
+// `ActDType` hardwired to BF16 keeps every default-environment gate green while
+// `VT_ACT_F32=1` stops doing anything, and that variable is the denominator of
+// the Q4_K_M arm's same-binary A/B, so a disconnected lever would invalidate the
+// measurement rather than merely lose coverage. That is the same failure
+// `test_qwen35_paged_forward_gdn_out_f32` exists for.
+//
+// The polarity is opt-IN and is the OPPOSITE of `GdnOutBf16FlagIsOn` above:
+// nothing but a leading '1' turns it on, because turning it on changes numerics
+// on a shipped path and the default has to stay the behaviour every recorded
+// device measurement was taken under.
+TEST_CASE("qwen27 activation-dtype flag is opt-in on a leading 1 only") {
+  using vllm::detail::ActF32FlagIsOn;
+
+  CHECK_FALSE(ActF32FlagIsOn(nullptr));  // unset IS the production default.
+  CHECK_FALSE(ActF32FlagIsOn("0"));
+  CHECK_FALSE(ActF32FlagIsOn(""));
+  CHECK_FALSE(ActF32FlagIsOn("true"));  // leading char decides, as elsewhere.
+  CHECK(ActF32FlagIsOn("1"));
+  CHECK(ActF32FlagIsOn("1x"));
+}
+
+// The RESOLVER, asked against the environment this process actually has.
+// `ActDType` caches its getenv in a function-local static, so one process
+// observes exactly one value; the second registration of this binary under
+// `VT_ACT_F32=1` (tests/CMakeLists.txt) is what executes the other arm, and
+// without it the f32 arm an operator is told to run would be ungated.
+//
+// Two things are asserted and BOTH are load-bearing. The CPU answer must follow
+// the lever, which is what a hardwired resolver fails. The CUDA answer must NOT,
+// which is what a resolver that ignores the device type fails — every recorded
+// device measurement was taken at BF16 and this change must not move one.
+TEST_CASE("qwen27 activation dtype follows the lever on CPU and never off it") {
+  using vllm::detail::ActDType;
+  using vllm::detail::ActF32FlagIsOn;
+
+  const bool on = ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
+  INFO("VT_ACT_F32 as this process reads it: on=" << on);
+
+  CHECK(ActDType(vt::DeviceType::kCPU) ==
+        (on ? vt::DType::kF32 : vt::DType::kBF16));
+
+  // Every non-CPU tier keeps BF16 under BOTH settings of the lever.
+  CHECK(ActDType(vt::DeviceType::kCUDA) == vt::DType::kBF16);
+  CHECK(ActDType(vt::DeviceType::kROCM) == vt::DType::kBF16);
+  CHECK(ActDType(vt::DeviceType::kMETAL) == vt::DType::kBF16);
+}
+
 // GDN-MOE-BF16-OUT (#1168), Edit 2. The eligibility carries NO model-shape term:
 // an eligibility whose every remaining term is true selects packed decode, and
 // nothing in it can say whether the checkpoint is dense or MoE.

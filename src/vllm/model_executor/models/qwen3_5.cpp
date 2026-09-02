@@ -187,6 +187,44 @@ vt::DType detail::GdnOutDType() {
   return bf16 ? vt::DType::kBF16 : vt::DType::kF32;
 }
 
+// --- The model's ONE resolved activation dtype (#2534) -----------------------
+//
+// vLLM resolves one model dtype and every layer inherits it; this is that value
+// for the qwen35 trunk. It answers BF16 everywhere by default, which is what the
+// device tiers measured and ship, and it answers F32 on the CPU tier -- and only
+// there -- when `VT_ACT_F32=1`.
+//
+// WHY THE CPU TIER CAN HAVE A DIFFERENT ANSWER AT ALL. On a device tier the BF16
+// activation is the format the GEMM consumes, so the narrow store is what the
+// hardware wants. On the CPU tier nothing consumes it: `LoadActF32`
+// (cpu_quant_gemm.cpp:41) widens every activation element straight back to f32
+// before the row is quantized, and `WidenRowToF32` (cpu_ops.cpp:577) does the
+// same inside RMSNorm. There the narrow store buys memory traffic and costs up
+// to 2^-9 = 1.95e-3 relative per store -- twice per layer on the residual alone,
+// which is added in f32, rounded, and then RE-READ (cpu_ops.cpp:576-583).
+//
+// WHY IT EXISTS. The Q4_K_M arm's declared oracle is llama.cpp b10451, whose CPU
+// graph is f32 with an f16 KV cache (llama-context.cpp:3538-3539), so the token
+// gate has been comparing two engines at different precisions. That difference
+// is about two hundred times ggml's own arch-versus-generic k-quant spread,
+// measured at the pin at 1.4e-05 to 9.8e-05 rms relative. This is the
+// same-binary A/B that separates the two. See
+// .agents/specs/qwen38-27b-q4km-token-exactness.md and issue #2534.
+//
+// Default OFF, so no shipped default and no recorded device measurement moves
+// until that A/B exists. The polarity is opt-IN, unlike `VT_GDN_OUT_BF16`: a
+// leading '1' is the only thing that turns it on.
+bool detail::ActF32FlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] == '1';
+}
+
+vt::DType detail::ActDType(vt::DeviceType dev_type) {
+  static const bool f32 = detail::ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
+  if (!f32) return vt::DType::kBF16;
+  return vllm::platforms::GetPlatform(dev_type).is_cpu() ? vt::DType::kF32
+                                                         : vt::DType::kBF16;
+}
+
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
 }
@@ -1620,35 +1658,11 @@ std::vector<uint16_t> MatmulNvfp4Bf16(Dev d, const std::vector<uint16_t>& x, int
 
 // --- The model's ONE resolved activation dtype (#2534) -----------------------
 //
-// vLLM resolves one model dtype and every layer inherits it; this is that value
-// for the qwen35 trunk. It stays BF16, which is what the device tiers measured
-// and ship, and it resolves to F32 on the CPU tier when `VT_ACT_F32=1`.
-//
-// WHY THE CPU TIER GETS ITS OWN ANSWER AT ALL. On a device tier a BF16
-// activation is what the GEMM consumes, so the narrow store is the format the
-// hardware wants. On the CPU tier nothing consumes it: `LoadActF32`
-// (cpu_quant_gemm.cpp:41) widens every activation element straight back to f32
-// before the row is quantized, and `WidenRowToF32` (cpu_ops.cpp:577) does the
-// same in RMSNorm. So on CPU the BF16 store buys memory traffic and costs up to
-// 2^-9 = 1.95e-3 relative per store, twice per layer on the residual alone,
-// with no compensating compute win.
-//
-// That difference is the leading suspect behind the Q4_K_M token gate failure
-// (#2534): the arm's oracle, llama.cpp b10451, runs an f32 CPU graph with an
-// f16 KV cache, so the two engines are being compared at different precisions.
-// This knob is the SAME-BINARY A/B that measures it. It is OFF by default, so
-// no shipped default moves until that measurement exists; see
-// .agents/specs/qwen38-27b-q4km-token-exactness.md.
-bool ActF32FlagIsOn(const char* env_value) {
-  return env_value != nullptr && env_value[0] == '1';
-}
-
-DType ActDType(Dev d) {
-  static const bool f32 = ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
-  if (!f32) return DType::kBF16;
-  return vllm::platforms::GetPlatform(d.q.device.type).is_cpu() ? DType::kF32
-                                                                : DType::kBF16;
-}
+// The RESOLVER lives in `detail::` (qwen3_5_internal.h) beside `GdnOutDType`
+// and for the same reason: a gate that only reads the parser proves nothing
+// about what the model calls, and this lever is the denominator of the arm's
+// same-binary A/B. This file keeps only the `Dev` adapter.
+DType ActDType(Dev d) { return detail::ActDType(d.q.device.type); }
 
 DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
   const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];

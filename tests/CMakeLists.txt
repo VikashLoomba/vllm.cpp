@@ -1401,6 +1401,16 @@ target_include_directories(test_glm4_moe_lite_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# #2534. `detail::ActDType` caches its getenv in a function-local static, so one
+# process observes exactly ONE value of VT_ACT_F32 and a single run cannot tell a
+# resolver that READS the lever from one hardwired to its default answer. Re-run
+# the SAME binary with the lever ON, the shape `test_qwen35_paged_forward_gdn_out_f32`
+# and `_glue_fuse_off` above already use. The f32 arm is the one the Q4_K_M token
+# gate is instructed to run, so without this entry that arm is ungated.
+add_test(NAME test_qwen27_paged_forward_act_f32
+  COMMAND test_qwen27_paged_forward)
+set_tests_properties(test_qwen27_paged_forward_act_f32 PROPERTIES
+  ENVIRONMENT "VT_ACT_F32=1")
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
 vllm_cpp_add_test(test_pretokenizer vllm/test_pretokenizer.cpp)
 # Metaspace split=true + Metaspace decoder (Parakeet tokenizer shape) —

@@ -404,9 +404,21 @@ inline OwnedTensor LoadBf16Transposed(const TensorResolver& get,
 // output rows, preserving the exact listed order and setting `nk=true` for
 // vt::MatmulBT (the cuBLASLt TN fast path). This is vLLM's physical ownership
 // rule for MergedColumnParallelLinear/QKVParallelLinear (one merged param).
+//
+// MODEL-QWEN35-GDN-EXL3 (#2495 item 4): `allow_f16` is OPT-IN and scoped to an
+// EXL3 load, the same polarity `LoadModelVectorForScheme` uses for the same
+// reason. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` stores `linear_attn.in_proj_a` and
+// `linear_attn.in_proj_b` at F16 -- exllamav3 keeps the unquantized linear
+// remainder at fp16 because it runs the linear in fp16 -- while storing
+// `conv1d`, `norm`, `A_log` and `dt_bias` beside them at BF16. Without this the
+// EXL3 GDN tower is refused a second time, on a tensor that is not quantized at
+// all. Teaching this loader F16 UNCONDITIONALLY would widen acceptance for every
+// dense model through a conversion that drops three mantissa bits, which is the
+// argument `LoadF16AsBf16Direct` already makes at its own declaration.
 inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
                                        const std::vector<std::string>& names,
-                                       const TensorParallel* tp = nullptr) {
+                                       const TensorParallel* tp = nullptr,
+                                       bool allow_f16 = false) {
   VT_CHECK(!names.empty(),
            "dense loader: merged BF16 projection requires at least one shard");
   int64_t in_dim = -1;
@@ -420,9 +432,11 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
     // in_proj_qkv F8_E4M3 [10240,5120] + scalar weight_scale/input_scale). The
     // shard is materialized to BF16 below so the merge, the TP row split and the
     // nk=true MatmulBT orientation stay exactly as they were for a BF16 shard.
-    VT_CHECK(tensor.dtype == "BF16" || tensor.dtype == "F8_E4M3",
+    VT_CHECK(tensor.dtype == "BF16" || tensor.dtype == "F8_E4M3" ||
+                 (allow_f16 && tensor.dtype == "F16"),
              "dense loader: unsupported dtype '" + tensor.dtype + "' for " + name +
-                 "; supported: BF16, F8_E4M3 (+ <name>_scale)");
+                 "; supported: BF16, F8_E4M3 (+ <name>_scale)" +
+                 (allow_f16 ? ", F16" : ""));
     VT_CHECK(tensor.shape.size() == 2,
              "dense loader: expected 2-D weight for " + name);
     VT_CHECK(tensor.shape[0] > 0 && tensor.shape[1] > 0,
@@ -472,6 +486,23 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
     }
     const int64_t rows = shard.shape[0];
     const int64_t cols = shard.shape[1];
+    // MODEL-QWEN35-GDN-EXL3: the F16 shard is CONVERTED, never reinterpreted.
+    // The two formats share a width and nothing else, so a byte copy would read
+    // an exponent field as a mantissa and produce a correctly shaped, entirely
+    // wrong weight.
+    if (shard.dtype == "F16") {
+      staged[i].resize(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+      const auto* src = static_cast<const uint8_t*>(shard.data);
+      for (size_t e = 0; e < staged[i].size(); ++e) {
+        uint16_t half = 0;
+        std::memcpy(&half, src + e * 2, 2);
+        staged[i][e] = vt::F32ToBF16(vt::F16ToF32(half));
+      }
+      MaybeReleaseSourcePages(shard.data, shard.nbytes);
+      src_ptr[i] = reinterpret_cast<const uint8_t*>(staged[i].data());
+      src_bytes[i] = staged[i].size() * sizeof(uint16_t);
+      continue;
+    }
     const StTensor& sc = get(names[i] + "_scale");
     const int64_t n_scale =
         static_cast<int64_t>(sc.nbytes) / (sc.dtype == "BF16" ? 2 : 4);

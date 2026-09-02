@@ -20,9 +20,14 @@ that only knows two. When that branch lands, merge `origin/main` and re-verify.
 
 ## Now
 
-`ACTIVE`. The two ROCm kernels are written and the CPU-side gate is green. The
-device half is what a `strix:gpu0` lease still owes; §Gates says exactly which
-lines are unmeasured until it runs.
+`DONE` for the two ops in scope, on the one AMD device this fleet has. Both are
+registered, both are byte-identical to the CPU arm on `gfx1151`, and the
+checkpoint #2433 measured now completes with **zero** reference-tier hits at
+**10.0x** the warm throughput of the same tree with the two registrations
+disabled. §Evidence carries the run. #2433 is NOT closed: its fourth acceptance
+line wants the throughput recorded against the BF16 control with AMD clock
+attribution, and the BF16 control HUNG THE GPU in the same lease (§Evidence,
+"what did not work"). Three of its four lines are met.
 
 ## The gap, as measured
 
@@ -234,15 +239,153 @@ the reference tier is OFF on a discrete board by design, the discrete arm of R2
 is the arm that turns a refusal into a run — and it is the arm no device here
 can execute.
 
+## Evidence
+
+Two `rc` leases on `strix:gpu0`, worker `rc-worker-lcjhd`, boot id
+`a5bc8128-f6ad-4767-8614-6923f88032e1`, `gfx1151`, ROCm 7.2.4, Ubuntu 24.04
+container, Release, `-DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1151`.
+Configure printed `ROCm backend: ENABLED for arch(es) [gfx1151]`, and
+`rocm_exl3.hip.o` carries a real `hipv4-amdgcn-amd-amdhsa--gfx1151` offload
+bundle (`llvm-objdump --offloading`), so the file was COMPILED for the board
+rather than merely added to a source list.
+
+**The dev box has no HIP toolchain.** `check-tree-compiles` covered 617 C++
+translation units and none of the `.hip` ones; every statement below about this
+code compiling or running comes from the lease.
+
+### Job 1 -- `ea90cf10-d298-46c3-9298-7a0c257c7f8d`, 767 s
+
+Tree: the index tree `8fbfeba50fa71a579e3f838820ae3c610e5407f7` (the job's
+`BASE_SHA` names the SPEC commit `fe6208cbf`, because the implementation was
+staged and not yet committed when the tarball was cut; the tarball is the tree,
+not that commit).
+
+`ctest -R '^test_exl3_rocm$'`: **7 test cases, 7 passed, 33 assertions, 0
+failed.** Every GEMM arm reported `first differing byte = -1` -- byte equality
+with the CPU arm, on `(bits, codebook)` = (3,0) at m=1 and m=20, (6,0), (3,1)
+into an f16 C and into an f32 C, and (4,2), (5,2), (6,2). The in-place
+`a_had == a` case and the codebook-discrimination case passed. Neighbours
+unchanged: `test_exl3_dequant`, `test_exl3_gemm`, `test_cast_f16` all pass.
+
+**Mutation table.** Each arm rebuilt one TU and relinked, asserted the binary's
+mtime CHANGED before reading a verdict, then restored the file and verified it
+with `sha256sum -c`. All four touched files ended byte-identical, and the
+restored tree re-ran 7/7.
+
+| # | Mutation | Result | Suite after |
+|---|---|---|---|
+| M1 | cb 2 multiplier `0x83DCD12D` -> `0x83DCD12E` | DETECTED | 5/7 cases, 29/33 assertions; **only the three cb-2 rows moved**, cb 0 and cb 1 stayed at `-1` |
+| M2 | tile permutation `q + 6` -> `q + 5` | DETECTED | 4/7, 21/33 |
+| M3 | `kInvSqrt128` `0.088388347648f` -> `0.088388f` (~50 f32 ulps) | DETECTED | 4/7, 21/33 -- **a 1.0e-3 tolerance would have passed this** |
+| M4 | `codebook` argument replaced by a hardcoded `1` | DETECTED | 5/7, 22/33 |
+| M5 | inner `rr` loop reversed (same algebra, different f32 order) | DETECTED | 4/7, 24/33 -- the ORDER claim is load-bearing |
+| M6 | `CastF16` narrowing through `DF32ToBF16` instead of `DF32ToF16` | DETECTED | 6/7, 31/33 |
+
+Job 1 produced **no end-to-end evidence**. It wrapped every generation in
+`/usr/bin/time -v`, which is not in this container, so each leg exited 127
+before the model ran and then printed a reassuring `reference_tier_notices=0`
+computed over an empty log. That is an instrument failure wearing a result and
+it is recorded, not quietly re-run.
+
+### Job 3 -- `33f794b2-486b-4d96-a24d-d6e2e4af7a2b`, 136 s
+
+Tree `46e60acef1a0209a72539b65cec647c0434ae4e0`. (Job 2 was killed: it passed
+`--device rocm`, and `vllm-cli` accepts `auto|cpu|cuda` and nothing else, so
+every leg exited 2 on the usage text. Job 3 passes no `--device` at all, which
+is what #2433's own sweep did, and it now refuses to read a number from a log
+that contains the usage banner or a nonzero exit.)
+
+Model `llama32-1b-exl3-3bpw` (`turboderp/Llama-3.2-1B-Instruct-exl3` @ 3.0bpw,
+`model.safetensors` 1,089,087,416 B), staged from the NAS to worker-local
+`/tmp`. `VT_OP_PROVIDER_STATS=1`, prompt `The capital of France is`,
+`--temperature 0 --max-num-seqs 1`.
+
+**BEFORE is the same tree with the two `RegisterOp` lines wrapped in
+`if (false)`, rebuilt and relinked in the same lease.** One difference, one box,
+one binary recipe -- so the delta is the registrations and not the weather.
+
+| Arm | reference-tier notices | 1 token | warm 8-token legs |
+|---|---|---|---|
+| BEFORE (registrations disabled) | **2** | 1.301 s | 9.711 s, 9.661 s -> 0.824, 0.828 tok/s |
+| AFTER (native ROCm) | **0** | 0.300 s | 0.966 s, 0.968 s -> 8.278, 8.262 tok/s |
+
+**10.01x** on the warm leg, **4.34x** on the single-token leg. Against #2433's
+own 1.436 s for one token it is 4.8x, cited separately because that number came
+from a different tree.
+
+Every op resolved `selected=vt-native` on `device=5`, and the two arms emit the
+**identical** greedy continuation, ` Paris. Paris is known for its famous`.
+That is the correctness statement on the real artifact: the CPU reference tier
+and the native kernel agree token for token on the checkpoint, not only on a
+synthetic fixture.
+
+One instrument note. `vllm-cli` is a 26,656-byte client and the registrations
+live in `libvllm.so`, so the CLI's sha256 is `43e996fb...` in all three prints
+including the BEFORE arm's. The mtime guard and the 10x behavioural difference
+are what establish that a different library was linked; the CLI hash does not.
+
+### What did NOT work, on the same board in the same lease
+
+The **BF16 control aborted with a GPU hang**: exit 134, `HW Exception by GPU
+node-1 (Agent handle: 0x5f5a094c6ca0) reason :GPU Hang`, with zero
+reference-tier ops and every op `selected=vt-native`. Nothing in this row is
+implicated -- the EXL3 legs immediately before and after it completed cleanly on
+the same GPU -- but it means this row has **no BF16 denominator and no clock
+attribution**, which is #2433's fourth acceptance line.
+
+It is also a data point for
+[#2511](https://github.com/mudler/vllm.cpp/issues/2511), whose hypothesis is
+that "the bf16 arm runs and the Q4_K arm hangs ... points at the quantized
+compute path rather than at anything the two arms share". Here a **bf16
+safetensors Llama-3.2-1B** hung with the same signature, no quantized path
+involved. That weakens the quantized-path framing rather than settling it: this
+leg followed two EXL3 generations on the same device within seconds, so prior
+GPU state is not excluded. Recorded as an observation, owned by `BACKEND-ROCM`
+through #2511, not re-filed.
+
+## Outcome
+
+- **The donor decision was the whole design, and it held.** Transcribing the
+  portable CPU reference rather than porting `cuda_exl3.cu` cost three plain
+  kernels and bought a BYTE gate: the arm passed byte-equality on all eight
+  `(bits, codebook, m, C dtype)` rows on the FIRST device run. The CUDA arm
+  cannot claim that and does not try -- its 1.0e-3 bound exists for
+  `mma.m16n8k16`'s unspecified accumulation order, and M3 shows a 50-ulp
+  constant error slipping under exactly that kind of bound.
+- **`kSmemMax = 90 * 1024` was the decisive fact and it was checkable in
+  seconds.** Reading it first is what kept this row from spending its budget
+  translating PTX that could never have been launched.
+- **Why one thread owns one output element.** It is not a tiling choice. It is
+  the only assignment under which a thread's accumulator sees the host's `ti`
+  and `rr` sequence, which is what turns "close" into "equal". M5 is the proof:
+  reversing the inner loop alone reds the suite.
+- **Why a scratch `raw` buffer rather than a fused kernel.** The three steps are
+  three launches with an `[m, n]` f32 staging buffer between the GEMM and the
+  output Hadamard. Fusing them is what a speed row would do; here it would have
+  changed the accumulation order and cost the byte gate for a number this row
+  does not claim.
+- **The rejected alternative was `__float2half`.** It agrees with
+  `vt::F32ToF16` on everything the tests generate. It is still wrong for this
+  file, because the gate asserts equality with a specific host function and an
+  intrinsic that "agrees" is a coincidence a NaN payload or a compiler version
+  can withdraw. The tree already made this call once, in
+  `rocm_grouped_gemm.hip`; the codec moved to a header so it is made once.
+- **`ccache` earned the second and third leases.** Job 3 reused the extracted
+  tree and the build directory after proving both registrations were present
+  unmodified at the start of their lines, and finished in 136 s where a fresh
+  extract cost eleven minutes.
+
 ## Owed
 
 - **`kExl3MoeMlp` on ROCm.** Unreached, unwritten, and unmeasurable on this
   fleet for the memory reason in §Scope.
 - **`kExl3HadR128` as a registered ROCm op.** The transform exists; the
   registration does not, because nothing on a dense forward path calls it.
-- **Speed.** This row records a per-token time as a diagnostic. It offers no
-  throughput result and no AMD clock attribution, which #2433's fourth
-  acceptance line asks for; that line stays open on this row.
+- **The BF16 denominator and the AMD clock attribution**, which are #2433's
+  fourth acceptance line. The control hung the GPU (§Evidence), so the 8.27
+  tok/s above is an EXL3-vs-EXL3 A/B and NOT a ratio against a bf16 target, and
+  no clock state was captured on either leg. Both fall due before any
+  competitive claim is made for this arm.
 - **A discrete AMD board.** Until one exists here, "EXL3 now runs on discrete
   ROCm" is a code claim and not a measurement.
 - **`kCastF16` on Vulkan, Metal and Tenstorrent**, the other three quarters of

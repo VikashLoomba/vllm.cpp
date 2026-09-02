@@ -5480,9 +5480,15 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dqn2d = Reshape(dq3.t(), {T * Hq, Dh});
     vt::RmsNorm(d.q, dqn2d, Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
-    // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
-    // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
-    // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32.
+    // `RmsNorm` NO LONGER requires `w.dtype == x.dtype`; #2477/#2493 gave the CUDA
+    // kernel its own `Tw`, and #2492 did the same for the ROCm and fp8 twins. This
+    // selection is therefore a WORK-AROUND FOR A CONSTRAINT THAT NO LONGER EXISTS,
+    // and it is left in place rather than removed because it is behaviourally
+    // neutral (the f32 upcast of a bf16 on-disk gamma is exact, so both arms feed
+    // the kernel the same values) and removing it changes a shipped model's code
+    // for no measured gain. When kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use
+    // the raw bf16 on-disk k_norm; otherwise (fp8/35B or toggle off) keep the f32
+    // upcast. bf16 kf · bf16 dkw -> f32.
     Tensor dkw = (kf.dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
                                            : ResidentWeightF32(d, w.k_norm, {Dh});
     Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});

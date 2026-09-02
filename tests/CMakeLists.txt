@@ -1775,6 +1775,12 @@ vllm_cpp_add_test(test_cli_offload_config
 if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_cli_offload_config
     PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+vllm_cpp_add_test(test_cli_kv_cache_dtype
+  vllm/entrypoints/test_cli_kv_cache_dtype.cpp)
+if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
+  target_compile_definitions(test_cli_kv_cache_dtype
+    PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+endif()
 endif()
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)

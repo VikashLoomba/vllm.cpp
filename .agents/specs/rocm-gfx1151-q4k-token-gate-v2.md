@@ -317,8 +317,20 @@ match argued into existence.
 - **The ROCm-local divergence term at p1/45, p3/45 and p4/14.** The divergences
   did NOT match the CPU tier's, so ROCm carries a term of its own and it has its
   own issue against this row:
-  [#2590](https://github.com/mudler/vllm.cpp/issues/2590). It is measured, not
-  fixed, and this row owns the fix.
+  [#2590](https://github.com/mudler/vllm.cpp/issues/2590).
+
+  **ANSWERED 2026-09-02, and one third of it was not ours.**
+  [`rocm-tier-hidden-state-bisect.md`](rocm-tier-hidden-state-bisect.md) ran the
+  per-layer comparison on ONE host, from one `libvllm.so`, with no oracle in it.
+  `p4/14` does not reproduce: our x86-64 CPU tier and the ROCm tier emit all 48
+  ids identically, so that step was this document's CPU comparison point crossing
+  an ARCHITECTURE (`thor`, aarch64) and not a ROCm term at all —
+  [#2608](https://github.com/mudler/vllm.cpp/issues/2608) owns it.
+  `p1/45` and `p3/45` reproduce exactly and are the arithmetic: the final
+  cross-tier `rel_l2` is 1.03 to 1.11 times what two independent bf16 residual
+  streams must produce, the run-to-run floor is exactly zero, and every flip sits
+  at a step whose own margin is below the cross-tier logit delta. **There is no
+  layer or op to fix.** This row's gate is unchanged and still `FAIL`.
 - #2534's residual magnitude term still owns the CPU tier's three steps. It does
   not explain ROCm's.
 - #2497's quant-matched decode number stays blocked until this gate passes.

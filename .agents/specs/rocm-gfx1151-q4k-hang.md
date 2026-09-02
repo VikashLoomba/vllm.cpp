@@ -815,6 +815,51 @@ rc job `d535e65c-33a6-40a0-918e-0e21b82a6df2`, results in
 staging change in this tree — `needs_weight_staging()` is the policy that
 produces the interleave. All four clean rules the pattern out.
 
+## The device attributes, finally read on the board
+
+rc job `d535e65c-33a6-40a0-918e-0e21b82a6df2` PHASE -1, output
+`/mnt/nas_share/rc/rocm-strix-shape/evidence6/attrs.out`. `Radeon 8060S
+Graphics`, `gfx1151`:
+
+| attribute | value |
+|---|---|
+| `Integrated` | 1 |
+| `ManagedMemory` | 1 |
+| `ConcurrentManagedAccess` | 1 |
+| **`PageableMemoryAccess`** | **0** |
+| `PageableMemoryAccessUsesHostPageTables` | 0 |
+| `DirectManagedMemAccessFromHost` | 0 |
+
+Two consequences, and the first retires a candidate that was otherwise the best
+one this issue has had.
+
+**`ResidentWeight`'s alias branch is DEAD on this board.**
+`src/vllm/model_executor/models/qwen3_5.cpp:1139-1183` will hand a kernel
+`w.bytes.data()` — a raw `PROT_READ MAP_PRIVATE` GGUF page-cache address that
+nothing pins and nothing registers with HIP — whenever
+`host_memory_is_device_addressable()` is true and
+`MakeHostBytesDeviceAliasable` finds the borrow 256-aligned
+(`qwen3_5_weights.cpp:256`). On an XNACK-less part a reclaimed page there is a
+hard memory violation, and a fault on an unregistered VA is exactly the
+"nowhere near any argument, not a valid user address" shape. But
+`vt::rocm::HostMemoryIsDeviceAddressable` is
+`caps.integrated && caps.pageable_memory_access`
+(`src/vt/rocm/rocm_backend.hip:474-480`), and `pageable_memory_access` reads 0.
+The branch cannot be entered here, `VT_QWEN35_ALIAS_HOST_WEIGHTS` would change
+nothing, and the A/B that was staged for it correctly skipped itself. Ruled out
+by an attribute rather than by legs, which is the cheap way round.
+
+**And the hardware fact underneath the whole row is now measured rather than
+inferred.** `PageableMemoryAccess = 0` and
+`PageableMemoryAccessUsesHostPageTables = 0` mean this part is XNACK-less: the
+GPU CANNOT take a recoverable page fault. Meanwhile `UseManagedAlloc` is on, so
+every `Backend::Alloc` block is `hipMallocManaged` — migratable memory — on a
+device that cannot fault and recover. Any access to a page not currently mapped
+in the GPU's tables is a hard violation, reported at whatever address the walk
+produced, against whatever kernel was resident. That is the class W8 measures,
+and it is the reason `HSA_ENABLE_SDMA=0` is interesting: SDMA is what moves
+managed pages on an HMM board.
+
 ## Next hypotheses, in the order they are worth testing
 
 The kernel is exonerated at its own geometry, so the remaining surface is what

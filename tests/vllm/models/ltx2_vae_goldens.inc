@@ -4906,7 +4906,7 @@ inline constexpr float kLtx2MelResampledGolden[] = {
     -6.03300667f, -5.81140184f,
 };
 
-// --- section 8f: the truncation boundary (functional.py:1427) ---
+// --- section 8f: the truncation boundary (functional.py:1427-1428) ---
 inline constexpr int64_t kLtx2ResampleCeilTail = 8;
 inline constexpr int64_t kLtx2ResampleCeilBelowOrigRate = 44100;
 inline constexpr int64_t kLtx2ResampleCeilBelowNewRate = 16000;
@@ -4942,6 +4942,24 @@ inline constexpr int64_t kLtx2ResampleCeilAltOutSamples = 65719;
 inline constexpr float kLtx2ResampleCeilAltTailGolden[] = {
     0.00326456479f, 0.0271689408f, 0.162618577f, 0.348693013f, -0.00762261869f, 0.0951811969f,
     -0.0475787744f, -0.406309605f,
+};
+
+inline constexpr int64_t kLtx2ResampleCeilOverOrigRate = 44100;
+inline constexpr int64_t kLtx2ResampleCeilOverNewRate = 22050;
+inline constexpr int64_t kLtx2ResampleCeilOverInSamples = 33554438;
+inline constexpr int64_t kLtx2ResampleCeilOverOutSamples = 16777220;
+inline constexpr float kLtx2ResampleCeilOverTailGolden[] = {
+    0.0221856236f, 0.0468633883f, -0.132173866f, -0.12634559f, 0.0887228921f, -0.0181573387f,
+    -0.0313661657f, 0.163116992f,
+};
+
+inline constexpr int64_t kLtx2ResampleCeilClampOrigRate = 48000;
+inline constexpr int64_t kLtx2ResampleCeilClampNewRate = 16000;
+inline constexpr int64_t kLtx2ResampleCeilClampInSamples = 100663303;
+inline constexpr int64_t kLtx2ResampleCeilClampOutSamples = 33554435;
+inline constexpr float kLtx2ResampleCeilClampTailGolden[] = {
+    -0.0265753325f, -0.199371979f, 0.122137107f, -0.0448058061f, 0.155681744f, 0.252254397f,
+    0.124835931f, 0.0412690751f,
 };
 
 // --- section 9a: the INITIAL video state (tools.py:139-186) ---

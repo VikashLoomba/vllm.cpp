@@ -119,7 +119,7 @@ exactly these nine, rather than transcribed.
 | 6 | `ops.py:36-42` | `resample_audio` returns `audio` unchanged when the rates are equal; otherwise `torchaudio.functional.resample(waveform, orig, target)` and then `.to(device=..., dtype=waveform.dtype)` |
 | 7 | `functional.py:1470-1476` | `orig_freq <= 0 or new_freq <= 0` raises; `orig_freq == new_freq` returns the input; `gcd` reduces the ratio |
 | 8 | `functional.py:1305-1402` | the kernel: `base_freq = min(o, n) * rolloff`, `width = ceil(lpw * o / base_freq)`, one row per output phase |
-| 9 | `functional.py:1405-1432` | zero-pad `(width, width + o)`, `conv1d` stride `o`, transpose-interleave, truncate to `ceil(n * L / o)` — with the quotient **narrowed to f32 before the ceil** (`:1427`; `torch.as_tensor` of a Python float takes the default dtype), which keeps one sample fewer than an exact integer ceil at 180697 samples for 44100 -> 16000 |
+| 9 | `functional.py:1405-1432` | zero-pad `(width, width + o)`, `conv1d` stride `o`, transpose-interleave, then **two** closing lines: `target_length = ceil(n * L / o)` with the quotient **narrowed to f32 before the ceil** (`:1427`; `torch.as_tensor` of a Python float takes the default dtype), which lands one sample either side of an exact integer ceil — fewer at 180697 samples for 44100 -> 16000, more at 33554438 for 44100 -> 22050 — and `resampled[..., :target_length]` (`:1428`), a Python slice, so it **clamps** to the `(L // o + 1) * n` columns the convolution produced |
 | 10 | `a2vid_two_stage.py:301-303` | the returned soundtrack is the caller's **original** `Audio`, at its **native** rate. The resample never reaches the output |
 
 Hop 10 is why nothing downstream of the encoder changes: the file's own rate
@@ -216,12 +216,16 @@ Upstream ships none (§0). What this change does instead:
 2b. **Section 8f reaches the truncation boundary, which 8d cannot.** The 8d arms
    top out at 218 output samples, and upstream's f32-narrowed ceil (hop 9) first
    disagrees with an exact integer ceil at 180697 input samples — 4.097 s at
-   44.1 kHz, three orders of magnitude further out. 8f carries four LENGTH-plus-
+   44.1 kHz, three orders of magnitude further out. 8f carries six LENGTH-plus-
    tail goldens: 180696 / 180697 / 180698 at 44100 -> 16000, which bracket that
-   boundary, and 90569 at 22050 -> 16000, where the same effect starts. The
-   generator asserts which of them an exact integer ceil gets right and which it
-   does not, so an arm that stopped discriminating fails generation rather than
-   gating nothing.
+   boundary; 90569 at 22050 -> 16000, where the same effect starts; 33554438 at
+   44100 -> 22050, where the narrowing rounds the OTHER way and upstream keeps one
+   sample more; and 100663303 at 48000 -> 16000, where it rounds up past the last
+   column the convolution produced and upstream's SLICE decides the answer. Each
+   arm declares `target_length - exact_ceil` and whether the slice clamps, and the
+   generator asserts both against upstream's own numbers **and** asserts the
+   returned `.shape[-1]` against `min(target_length, columns)`. An arm that
+   stopped discriminating fails generation rather than gating nothing.
 3. **A lower bound, not only a tolerance.** A resampler that returned zeros, or
    that returned the input untouched, satisfies a `max|diff| < tol` gate against
    the wrong golden and any shape check. The cases assert the output's absmax is
@@ -371,6 +375,75 @@ covering 1 to 20000, the runs around 90569 and 180697, a thousand lengths either
 side of 2^24 where f32 no longer holds every integer, and 2^25: zero
 divergences.
 
+### The formula was upstream's; the SLICE was not
+
+`_apply_sinc_resample_kernel` ends on **two** lines, and the repair above ported
+one of them:
+
+```python
+target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()
+resampled = resampled[..., :target_length]
+```
+
+`resampled` carries exactly `blocks * next` columns (`functional.py:1424-1426`),
+and a Python slice **clamps**. Where `target_length` exceeds those columns
+upstream returns the columns. This port allocated `target`, filled `blocks *
+next`, and reported `out_samples = target`, so it emitted a trailing sample
+upstream never computed — value-initialised zero, reported as real.
+
+It fires when the f32 narrowing rounds **up** past the exact ceil, the opposite
+direction from the one the first repair studied. The slack between the columns
+and the exact ceil is `next - ceil(next * (samples % orig) / orig)`, whose
+minimum over the residues is `next / orig` in integer division — **zero for
+every downsampling ratio**. So any ratio with `next < orig` has lengths whose columns are exactly
+the exact ceil, and an upward narrowing there overshoots. Measured: at
+48000 -> 16000 and 100663303 samples (2097.2 s), `target_length` is 33554436 and
+the convolution produced 33554435. `resample_audio` returns 33554435 on the 8f
+input; this port returned 33554436, and its last eight samples were the golden's
+window shifted by one and closed with a zero, `max|diff| = 0.321509` against a
+`2.5e-07` tolerance. 32000 -> 16000 at 67108869 samples is the same arithmetic:
+`target_length` 33554436, columns 33554435.
+
+**Reachable from the default command line.** `ltx2_gen --audio-path <file>` ->
+`Ltx2VideoEngine::Generate` -> `Ltx2DecodeAudioWav` -> `Ltx2EncodeAudioToLatent`
+-> `Ltx2WaveformToLogMel` -> `Ltx2ResampleWaveform`. `--audio-max-duration` is
+opt-in, so without it the whole file passes through, and the extra sample moves
+`frames = 1 + (samples + 2 * pad - n_fft) / hop` wherever it crosses a hop
+boundary. That is the conditioning shape — the consequence the truncation
+arithmetic exists to get right.
+
+**Why the 276060-pair sweep missed it.** That sweep compared the port's
+expression against **the formula**. It never called
+`torchaudio.functional.resample(...).shape[-1]`. It validated `:1427`, and the
+clamp lives outside the expression, on `:1428`. A reimplementation checked
+against a transcription of the reference's arithmetic agrees perfectly and is
+still wrong about what the reference *returns*.
+
+The coverage was inverted as well: the two ratios 8f gated, 44100 -> 16000 and
+22050 -> 16000, are precisely the safe ones, because their exact ceil is
+divisible by 32 or 64 and stays f32-representable. Section 8f was the right
+lengths at the wrong ratios, exactly as 8d was the right ratios at the wrong
+lengths.
+
+**The repair** is `const int64_t clamped = std::min(target, columns);`, used for
+the allocation, both fill bounds, and `out_samples`. The ordinary path is
+`target < columns` and still truncates exactly as before; `std::min` changes
+nothing there.
+
+**The re-run sweep calls the function.** 496194 (ratio, length) pairs across
+nineteen ratios — 495900 lengths under 2 million, plus 294 in six bands around
+2^25 where the clamp bites — comparing `min(target, columns)` against
+`torchaudio.functional.resample(...).shape[-1]`: zero divergences. The scripts
+are not committed; they are two loops over the ratio table above, and the point
+that survives is the method, not the file.
+
+**The new arms.** `CeilClamp` is 48000 -> 16000 at 100663303 samples — 8d's own
+`Down` ratio at a length 8d cannot reach. `CeilOver` is 44100 -> 22050 at
+33554438 samples, where the narrowing rounds up and the columns hold it, so
+upstream returns `exact_ceil + 1`; it is there because a clamp to the exact
+integer ceil would satisfy `CeilClamp` and fail this. Both expected lengths come
+from executing `resample_audio` and reading `.shape[-1]`, not from a formula.
+
 ### One more kaiser statement, in product output
 
 The row's first pass repaired eight of the nine statements that misnamed the
@@ -388,9 +461,10 @@ tokenizer and HuggingFace-org byte matches.
 
 | | Before | After |
 |---|---|---|
-| `test_ltx2_vae -tc='*waveform_to_mel*'` | THREW the rate refusal at `ltx2_audio_vae.cpp:1053` (at `6643b2bbf`) | 48/48 cases, 3245/3245 assertions |
+| `test_ltx2_vae -tc='*waveform_to_mel*'` | THREW the rate refusal at `ltx2_audio_vae.cpp:1053` (at `6643b2bbf`) | 48/48 cases, 3259/3259 assertions |
 | `test_ltx2_video -tc='*RESAMPLED*'` | THREW `'high.wav' is sampled at 44100 Hz ...` | 110/110 cases, 4876/4876 assertions |
 | `test_ltx2_vae -tc='*resampl*'`, section 8f | 50/54 with the EXACT INTEGER CEIL in place: `CeilAt` 65560 vs 65559 and its tail 0.256834 out, `CeilAlt` 65720 vs 65719 and its tail 0.358731 out | 54/54 |
+| `test_ltx2_vae -tc='*resampl*'`, section 8f's two clamp arms | 66/68 with `:1427` ported and `:1428` NOT: `CeilClamp` 33554436 vs 33554435 and its tail 0.321509 out | 68/68 |
 
 The first two reds are the refusal itself, which is what the row exists to
 delete. The third is the truncation repair below, and it is red-first in the
@@ -400,6 +474,13 @@ The same old formula against the test file as it stood BEFORE section 8f leaves
 `*resampl*` 26/26, `*waveform_to_mel*` 9/9 and `test_ltx2_video`'s `*RESAMPLED*`
 14/14 all green — the measurement that says the gate was blind, rather than an
 argument that it was.
+
+The fourth is the slice repair. It is red-first in the same strict sense and one
+step further: `CeilOver`, the other new arm, stays GREEN without the clamp,
+because upstream's answer there is `exact_ceil + 1` and the unclamped port
+already produced it. So the pair discriminates in both directions — `CeilClamp`
+fails a port that trusts `:1427` alone, and `CeilOver` fails a port that
+"corrects" it by clamping to the exact integer ceil.
 
 ### The reachability mutation, and what it proved
 
@@ -430,6 +511,19 @@ at 38 vs 14 frames and 608 vs 224, the video case red on the same digest
 restore: `fd1b68a71594d7bfd28dcb7f16e67e8c0abe91d5c267e089eb0bee3e3755af03`
 (the earlier run's subject was the same file at `052047579`, sha256
 `88055b01e9c2bf0bb29d826b2c61dc4c8439a1d8ae6d779a46969b50b0c0212b`).
+
+Re-run a third time at the SLICE-repair head, for the same reason: that repair
+edits `Ltx2ResampleWaveform`, so it rewrites the file the mutation's subject
+lives in and a proof recorded against the old bytes no longer describes these.
+It behaves identically again — `*resampl*` 68/68 GREEN under the mutation, the
+mel case red at 38 vs 14 frames and 608 vs 224, `test_ltx2_video -tc='*RESAMPLED*'`
+red on the same digest `18285287296143238670`, and `test_ltx2_video -tc='*audio*'`
+162/162 green, which is why `*RESAMPLED*` and not `*audio*` is the filter that
+carries this proof. `ltx2_audio_vae.cpp` sha256 before and after the restore:
+`b82b05a913c91d952783224aebc1f72e669f05c5e350c9f8b3e02746688cc78b`. Both builds
+exited 0, checked rather than assumed, because on this row a mutation build that
+failed `-Werror` once already let three suites re-run stale binaries and print
+green.
 
 The mutation's FIRST build failed `-Werror` on the now-unused `sampling_rate`,
 and the three suites then re-ran the STALE binaries and printed green — the

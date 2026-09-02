@@ -2897,25 +2897,43 @@ TEST_CASE("ltx2 vae: resample_audio matches upstream at every ratio it can take"
 
   // Section 8f — THE TRUNCATION BOUNDARY, which no arm above can reach.
   //
-  // Upstream truncates to
-  // `torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()`
-  // (functional.py:1427), and `torch.as_tensor` of a PYTHON FLOAT takes
-  // `torch.get_default_dtype()` — float32. The f64 quotient is therefore rounded
-  // to f32 BEFORE the ceil, and where the exact quotient sits above an integer by
-  // less than half an f32 ulp the narrowing lands ON that integer: upstream keeps
-  // one sample FEWER than the exact integer ceil `(next * samples + orig - 1) /
-  // orig` this port used to compute.
+  // `_apply_sinc_resample_kernel` ends on TWO lines (functional.py:1427-1428):
   //
-  // The four arms above top out at 218 output samples and cannot see it. At
-  // 44100 -> 16000 the first divergent length is 180697 (4.097 s) and 48102 of
-  // the first 60 s worth of lengths diverge; at 22050 -> 16000 it starts at
-  // 90569. At 48000 -> 16000 (o = 3) and 16000 -> 48000 (o = 1) it never happens,
-  // which is why three of the four arms above look clean at any length. One extra
-  // output sample moves the last STFT windows and, where `samples % hop == 0`,
-  // the mel FRAME COUNT — the conditioning shape.
+  //     target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()
+  //     resampled = resampled[..., :target_length]
   //
-  // `CeilBelow` and `CeilAbove` bracket the boundary and are lengths where the
-  // exact ceil is RIGHT, so an arm that always subtracted one would fail them.
+  // and BOTH of them decide the output length.
+  //
+  // `torch.as_tensor` of a PYTHON FLOAT takes `torch.get_default_dtype()` —
+  // float32 — so the f64 quotient is rounded to f32 BEFORE the ceil, and the
+  // narrowing moves in both directions: DOWN onto an integer the exact quotient
+  // sits just above, giving one sample fewer than the exact integer ceil
+  // `(next * samples + orig - 1) / orig` this port first computed; and UP past
+  // that integer, giving one MORE.
+  //
+  // The second line is a Python slice, so it CLAMPS. `resampled` carries exactly
+  // `(samples / orig + 1) * next` columns, and the slack between that and the
+  // exact ceil is `next - ceil(next * (samples % orig) / orig)`, whose minimum
+  // over the residues is `next / orig` in INTEGER division — ZERO for every
+  // downsampling ratio. So on
+  // any ratio with `next < orig` there are lengths where an upward narrowing asks
+  // for one column more than the convolution produced, and upstream returns what
+  // it has. A port that trusts `target_length` alone emits a trailing sample
+  // upstream never computed.
+  //
+  // The four arms above top out at 218 output samples and cannot see any of it.
+  // At 44100 -> 16000 the first downward-divergent length is 180697 (4.097 s) and
+  // 48102 of the first 60 s worth of lengths diverge; at 22050 -> 16000 it starts
+  // at 90569. One output sample either way moves the last STFT windows and, where
+  // `samples % hop == 0`, the mel FRAME COUNT — the conditioning shape.
+  //
+  // `CeilBelow` and `CeilAbove` bracket 180697 and are lengths where the exact
+  // ceil is RIGHT, so an arm that always subtracted one would fail them.
+  // `CeilOver` and `CeilClamp` are lengths where the exact ceil is one too SMALL,
+  // so an arm that clamped to it instead would fail them. `CeilClamp` is 8d's own
+  // 48000 -> 16000 ratio at a length 8d cannot reach: `target_length` is 33554436
+  // there and the convolution produced 33554435, so it is the only arm where the
+  // two upstream lines disagree and the SLICE decides.
   struct CeilArm {
     const char* tag;
     const char* input;
@@ -2947,6 +2965,16 @@ TEST_CASE("ltx2 vae: resample_audio matches upstream at every ratio it can take"
        vllm_test::kLtx2ResampleCeilAltNewRate, vllm_test::kLtx2ResampleCeilAltInSamples,
        vllm_test::kLtx2ResampleCeilAltOutSamples, vllm_test::kLtx2ResampleCeilAltTailGolden,
        std::size(vllm_test::kLtx2ResampleCeilAltTailGolden)},
+      {"CeilOver (the narrowing rounds UP, and the columns hold it)",
+       "ltx2.resample.CeilOver", vllm_test::kLtx2ResampleCeilOverOrigRate,
+       vllm_test::kLtx2ResampleCeilOverNewRate, vllm_test::kLtx2ResampleCeilOverInSamples,
+       vllm_test::kLtx2ResampleCeilOverOutSamples, vllm_test::kLtx2ResampleCeilOverTailGolden,
+       std::size(vllm_test::kLtx2ResampleCeilOverTailGolden)},
+      {"CeilClamp (the narrowing rounds UP past the last column, so :1428 clamps)",
+       "ltx2.resample.CeilClamp", vllm_test::kLtx2ResampleCeilClampOrigRate,
+       vllm_test::kLtx2ResampleCeilClampNewRate, vllm_test::kLtx2ResampleCeilClampInSamples,
+       vllm_test::kLtx2ResampleCeilClampOutSamples, vllm_test::kLtx2ResampleCeilClampTailGolden,
+       std::size(vllm_test::kLtx2ResampleCeilClampTailGolden)},
   };
 
   for (const CeilArm& arm : ceil_arms) {

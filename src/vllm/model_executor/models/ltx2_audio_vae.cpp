@@ -1151,37 +1151,66 @@ std::vector<float> Ltx2ResampleWaveform(const std::vector<float>& waveform, int6
   // `_apply_sinc_resample_kernel` (`:1405-1432`): zero-pad by (width, width +
   // orig), convolve with stride `orig`, transpose the phase axis in front of the
   // block axis, and truncate to `ceil(new * length / orig)`.
+  //
+  // `blocks * next` is exactly how many columns the convolution leaves for that
+  // truncation to slice (`:1424-1426`).
   const int64_t blocks = samples / orig + 1;
+  const int64_t columns = blocks * next;
   // `target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()`
   // (`:1427`), and this is NOT an exact integer ceil. `torch.as_tensor` of a
   // PYTHON FLOAT takes `torch.get_default_dtype()`, which is float32, so the f64
-  // quotient is rounded to f32 BEFORE the ceil. Where the exact quotient sits
-  // above an integer by less than half an f32 ulp, the narrowing lands ON that
-  // integer and upstream keeps one sample FEWER than `(next * samples + orig - 1)
-  // / orig` gives — first at 180697 samples for 44100 -> 16000 (4.097 s), then
-  // for 48102 of the first 60 s worth of lengths. The extra sample moves the last
-  // STFT windows and, where `samples % hop == 0`, the mel FRAME COUNT.
+  // quotient is rounded to f32 BEFORE the ceil, and the narrowing moves BOTH
+  // ways. Where the exact quotient sits above an integer by less than half an f32
+  // ulp, the narrowing lands ON that integer and upstream keeps one sample FEWER
+  // than `(next * samples + orig - 1) / orig` gives — first at 180697 samples for
+  // 44100 -> 16000 (4.097 s), then for 48102 of the first 60 s worth of lengths.
+  // Where it rounds the other way, upstream asks for one sample MORE — at 33554438
+  // samples for 44100 -> 22050 (12.7 min), for instance. Either way the count
+  // moves the last STFT windows and, where `samples % hop == 0`, the mel FRAME
+  // COUNT.
   //
   // `next * samples` is exact in `int64_t` and exact again as a `double` for any
   // length under 2^53 / next, so the division below is Python's own
   // correctly-rounded f64 `int / int`; the narrowing and the ceil then mirror
   // `as_tensor` and `torch.ceil`, and the cast to `int64_t` mirrors `.long()`.
-  // Checked against torchaudio over 276060 (ratio, length) pairs — twelve ratios
-  // by 23005 lengths, including a run either side of 2^24, where f32 no longer
-  // holds every integer: zero divergences.
+  // The whole rule below — the cast chain AND the clamp — is checked against what
+  // `torchaudio.functional.resample` RETURNS, `.shape[-1]`, and not against the
+  // formula at `:1427`. That distinction is the reason this clamp is here: the
+  // first pass compared expression to expression over 276060 pairs, found zero
+  // divergences, and could not see `:1428` at all, because the clamp is not in the
+  // expression. 496194 (ratio, length) pairs across nineteen ratios — 495900
+  // lengths under 2 million, plus 294 in six bands around 2^25 where the clamp
+  // bites: zero divergences.
   const double quotient = static_cast<double>(next * samples) / static_cast<double>(orig);
   const int64_t target = static_cast<int64_t>(std::ceil(static_cast<float>(quotient)));
-  if (out_samples != nullptr) *out_samples = target;
+  // `resampled = resampled[..., :target_length]` (`:1428`). The truncation is a
+  // PYTHON SLICE, so it clamps, and mirroring `:1427` without `:1428` is not a
+  // port of the two lines. The slack between the columns and the exact integer
+  // ceil is `next - ceil(next * (samples % orig) / orig)`, whose minimum over the
+  // residues is `next / orig` in INTEGER division — ZERO for every DOWNsampling
+  // ratio. So on any ratio
+  // with `next < orig` there are lengths whose columns are exactly the exact ceil,
+  // and an upward narrowing there asks for a column the convolution never
+  // produced: at 48000 -> 16000 and 100663303 samples (2097.2 s), `target` is
+  // 33554436 and `columns` is 33554435. Without this `std::min` the loops below
+  // would stop at `columns` and leave the last element of `out` at its
+  // value-initialised zero — a trailing sample upstream never emitted, reported as
+  // real through `out_samples`.
+  //
+  // The ordinary path is the other one, `target < columns`, and it still
+  // truncates exactly as before: `std::min` changes nothing there.
+  const int64_t clamped = std::min(target, columns);
+  if (out_samples != nullptr) *out_samples = clamped;
 
   // ONE kernel for every channel. torchaudio packs the batch and resamples the
   // last axis (`:1419-1421`), so the channels are independent; this walks them
   // rather than approximating that.
-  std::vector<float> out(static_cast<size_t>(channels) * static_cast<size_t>(target));
+  std::vector<float> out(static_cast<size_t>(channels) * static_cast<size_t>(clamped));
   for (int64_t c = 0; c < channels; ++c) {
     const float* in = waveform.data() + c * samples;
-    float* dst = out.data() + c * target;
+    float* dst = out.data() + c * clamped;
     for (int64_t b = 0; b < blocks; ++b) {
-      if (b * next >= target) break;
+      if (b * next >= clamped) break;
       // Where tap 0 of this block lands in the UNPADDED signal. The zero pad is
       // skipped rather than materialised, which is the same sum.
       const int64_t base = b * orig - width;
@@ -1189,7 +1218,7 @@ std::vector<float> Ltx2ResampleWaveform(const std::vector<float>& waveform, int6
       const int64_t last = std::min<int64_t>(taps, samples - base);
       for (int64_t j = 0; j < next; ++j) {
         const int64_t index = b * next + j;
-        if (index >= target) break;
+        if (index >= clamped) break;
         const float* row = kernel.data() + j * taps;
         // The one `double` in this function, and it is an ACCUMULATOR rather
         // than a stored dtype: torch's vectorised conv1d reduction order is not

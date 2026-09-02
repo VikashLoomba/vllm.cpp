@@ -1040,31 +1040,61 @@ MEL_SOURCE_SAMPLES = 600
 
 # Section 8f — the TRUNCATION BOUNDARY, which no arm above can reach.
 #
-# `_apply_sinc_resample_kernel` truncates to
-# `torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()`
-# (functional.py:1427). `torch.as_tensor` of a PYTHON FLOAT takes
-# `torch.get_default_dtype()`, which is float32, so the f64 quotient is narrowed
-# to f32 BEFORE the ceil. Where the exact quotient sits above an integer by less
-# than half an f32 ulp, the narrowing lands ON that integer and upstream keeps one
-# sample FEWER than an exact integer ceil would.
+# `_apply_sinc_resample_kernel` ends on TWO lines, not one (functional.py:1427-1428):
+#
+#     target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()
+#     resampled = resampled[..., :target_length]
+#
+# and both of them decide the output length.
+#
+# The FIRST line is not an exact integer ceil. `torch.as_tensor` of a PYTHON
+# FLOAT takes `torch.get_default_dtype()`, which is float32, so the f64 quotient
+# is narrowed to f32 BEFORE the ceil, and the narrowing moves in BOTH directions:
+#
+#   * it rounds DOWN onto an integer the exact quotient sits just above, and
+#     `target_length` comes out one BELOW the exact integer ceil;
+#   * it rounds UP past that integer, and `target_length` comes out one ABOVE.
+#
+# The SECOND line is a Python slice, so it CLAMPS. `resampled` carries exactly
+# `(length // o + 1) * n` columns, and the slack `n - ceil(n * (length % o) / o)`
+# between that and the exact ceil has minimum `n // o` over the residues — ZERO
+# for every downsampling ratio. So on any ratio with `n < o` there are lengths
+# where the columns are exactly the exact ceil, and an upward narrowing then asks
+# for one column more than the convolution produced. Upstream returns what it
+# has; a port that trusts `target_length` alone emits a trailing sample upstream
+# never computed.
 #
 # The four arms of 8d top out at 218 output samples, three orders of magnitude
-# below where that first happens, so they cannot see it: at 44100 -> 16000 the
-# first divergent length is 180697 (4.097 s) and 48102 of the first 60 s worth of
-# lengths diverge. One extra output sample moves the last STFT windows and, where
-# `samples % hop == 0`, the mel FRAME COUNT — that is, the conditioning shape.
+# below where any of this happens, so they cannot see it: at 44100 -> 16000 the
+# first downward-divergent length is 180697 (4.097 s) and 48102 of the first 60 s
+# worth of lengths diverge. One output sample either way moves the last STFT
+# windows and, where `samples % hop == 0`, the mel FRAME COUNT — that is, the
+# conditioning shape.
 #
-# Two ratios, because the effect needs `orig_freq` large enough for the quotient
-# to land that close: at 48000 -> 16000 (o = 3) and 16000 -> 48000 (o = 1) it
-# never happens at any audio length, which is why the clean-looking arms are
-# clean. Each ratio carries the first divergent length and, for 44100, the
-# lengths either side of it, where an exact ceil is RIGHT — an arm that only
-# carried divergent lengths could be satisfied by always subtracting one.
+# Four ratios, because no single one shows all three behaviours. The downward
+# narrowing needs `orig_freq` large enough for the quotient to land within half
+# an ulp below an integer; the upward one needs the quotient past 2^24, where an
+# f32 ulp is at least 2. `CeilBelow` and `CeilAbove` bracket 180697 and are
+# lengths where an exact ceil is RIGHT, so an arm that always subtracted one
+# would fail them; `CeilOver` and `CeilClamp` are lengths where an exact ceil is
+# one too SMALL, so an arm that always clamped to it would fail them too.
+#
+# Each arm declares `ceil_delta = target_length - exact_ceil` and whether the
+# slice clamps, and the generator asserts both against upstream's own numbers.
 RESAMPLE_CEIL_CASES = (
-    ("CeilBelow", 44100, 16000, 180696, False),
-    ("CeilAt", 44100, 16000, 180697, True),
-    ("CeilAbove", 44100, 16000, 180698, False),
-    ("CeilAlt", 22050, 16000, 90569, True),
+    # tag, orig_freq, new_freq, length, ceil_delta, clamps
+    ("CeilBelow", 44100, 16000, 180696, 0, False),
+    ("CeilAt", 44100, 16000, 180697, -1, False),
+    ("CeilAbove", 44100, 16000, 180698, 0, False),
+    ("CeilAlt", 22050, 16000, 90569, -1, False),
+    # The narrowing rounds UP, and the columns happen to accommodate it: upstream
+    # returns exact_ceil + 1 and the slice takes everything. 12.7 min of audio.
+    ("CeilOver", 44100, 22050, 33554438, +1, False),
+    # The narrowing rounds UP past the last column: `target_length` is 33554436
+    # and the convolution produced 33554435, so the SLICE decides the answer.
+    # 48000 -> 16000 is 8d's `Down` ratio at a length 8d cannot reach — 2097.2 s,
+    # ~34.95 min. This is the only arm where the two lines disagree.
+    ("CeilClamp", 48000, 16000, 100663303, +1, True),
 )
 # The goldens carry the LENGTH and the last few samples rather than 65 559 floats
 # per arm. The length is the discriminator; the tail is there so a port that
@@ -1436,14 +1466,16 @@ def section_audio_mel(out) -> None:
     out.write("\n")
     emit_f32(out, "kLtx2MelResampledGolden", resampled_mel.numpy())
 
-    # --- 8f: the truncation boundary (functional.py:1427) ---
+    # --- 8f: the truncation boundary (functional.py:1427-1428) ---
     #
     # Same call as 8d, at lengths that reach where upstream's f32-narrowed ceil
-    # and an exact integer ceil disagree. Emitted as a length plus a tail window,
-    # because the full arm is 65 559 samples wide.
-    out.write("// --- section 8f: the truncation boundary (functional.py:1427) ---\n")
+    # and an exact integer ceil disagree, in BOTH directions, and where the slice
+    # on the next line clamps that ceil to the columns the convolution produced.
+    # Emitted as a length plus a tail window, because the widest arm is 33 554 435
+    # samples.
+    out.write("// --- section 8f: the truncation boundary (functional.py:1427-1428) ---\n")
     emit_scalar(out, "kLtx2ResampleCeilTail", RESAMPLE_CEIL_TAIL)
-    for tag, orig, target, length, diverges in RESAMPLE_CEIL_CASES:
+    for tag, orig, target, length, ceil_delta, clamps in RESAMPLE_CEIL_CASES:
         wave = make_input(f"ltx2.resample.{tag}", (1, 1, length), 0.5)
         proc = AudioProcessor(
             target_sample_rate=target,
@@ -1454,23 +1486,39 @@ def section_audio_mel(out) -> None:
         got = proc.resample_audio(Audio(waveform=wave, sampling_rate=orig))
         assert got.sampling_rate == target
         assert got.waveform.dtype == torch.float32
+        # `.shape[-1]` — what upstream RETURNS, which is the only thing a port has
+        # to reproduce. The 276060-pair sweep that this row ran on its first pass
+        # compared the port's expression against the FORMULA at :1427 and found
+        # zero divergences, and it still missed the clamp at :1428, because the
+        # clamp is not in the expression. So every number below is measured from
+        # this tensor, and the two predictions are checked against it.
         produced = int(got.waveform.shape[-1])
-        # The POSITIVE CONTROL on this arm. An exact integer ceil is what a
-        # reader writes from the formula as printed; assert here which lengths it
-        # gets right and which it does not, so an arm that stopped discriminating
-        # fails the GENERATOR rather than quietly gating nothing.
-        exact_ceil = -(-((target // math.gcd(orig, target)) * length) //
-                       (orig // math.gcd(orig, target)))
-        if diverges:
-            assert exact_ceil == produced + 1, (
-                f"{tag}: expected upstream to keep one sample FEWER than an exact "
-                f"integer ceil, got upstream={produced} exact={exact_ceil}"
-            )
-        else:
-            assert exact_ceil == produced, (
-                f"{tag}: expected the two ceils to AGREE here, got "
-                f"upstream={produced} exact={exact_ceil}"
-            )
+        # The POSITIVE CONTROL on this arm, in both directions.
+        #
+        # `exact_ceil` is what a reader writes from the formula as printed;
+        # `narrowed` is what :1427 actually computes; `columns` is what the
+        # convolution at :1425-1426 leaves for :1428 to slice. Declaring the
+        # relation between the three per arm is what stops an arm from quietly
+        # ceasing to discriminate: a torchaudio that stopped narrowing, or a
+        # length whose arithmetic moved, fails the GENERATOR here rather than
+        # emitting a golden that gates nothing.
+        gcd = math.gcd(orig, target)
+        o, n = orig // gcd, target // gcd
+        exact_ceil = -(-(n * length) // o)
+        narrowed = int(torch.ceil(torch.as_tensor(n * length / o)).long())
+        columns = (length // o + 1) * n
+        assert narrowed - exact_ceil == ceil_delta, (
+            f"{tag}: expected the f32 narrowing to land {ceil_delta:+d} from the "
+            f"exact integer ceil, got narrowed={narrowed} exact={exact_ceil}"
+        )
+        assert (narrowed > columns) == clamps, (
+            f"{tag}: expected clamps={clamps}, got narrowed={narrowed} "
+            f"columns={columns}"
+        )
+        assert produced == min(narrowed, columns), (
+            f"{tag}: upstream returned {produced}, but :1427-1428 predict "
+            f"min({narrowed}, {columns}) = {min(narrowed, columns)}"
+        )
         tail = got.waveform.reshape(-1)[-RESAMPLE_CEIL_TAIL:]
         assert float(tail.abs().max()) > 0.0, "an all-zero tail gates nothing"
         emit_scalar(out, f"kLtx2Resample{tag}OrigRate", orig)

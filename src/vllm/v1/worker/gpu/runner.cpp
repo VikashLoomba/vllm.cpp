@@ -3297,6 +3297,144 @@ ModelRunnerOutput GPUModelRunner::pool_tokens() {
   return out;
 }
 
+// --- #2534 INSTRUMENT: the final-logit dump ---------------------------------
+//
+// ONE implementation, called from BOTH sampling paths. It has to be both,
+// because `async_input_combine_` is assigned DIRECTLY at the two ctor sites
+// below (`AsyncRunnerEnvDefault() && ...`) and `AsyncRunnerFlagIsOn` answers
+// TRUE when VT_ASYNC_RUNNER is unset -- so the production default is the
+// DEVICE-RESIDENT branch of `sample_tokens_async`, not `sample_tokens`.
+//
+// Instrumenting only `sample_tokens` cost a 40-minute lease on 2026-09-02: the
+// dump wrote nothing, and so did `VT_DEBUG_SAMPLED`, which sits a few lines
+// below it in the same function and predates this row. Two silent probes in a
+// function the engine never calls is what "wrong function" looks like. Grepping
+// the SETTER `set_async_input_combine` and finding no caller is what made it
+// look like the sync path; the field is not written through the setter.
+void GPUModelRunner::dump_step_logits(const vt::Tensor& logits) {
+  //
+  // `VT_DUMP_LOGITS=<dir>` appends this step's full logit row for every live
+  // request to `<dir>/ours_<req_id>.f32`, and its argmax to
+  // `<dir>/ours_<req_id>.ids.txt`. Off unless the variable is set, read ONCE at
+  // static init like `VT_DEBUG_SAMPLED` below -- never a per-step getenv in the
+  // sampling loop.
+  //
+  // WHY HERE, and not inside the sampler. The comment above says sampling
+  // mutates `logits` IN PLACE, so a dump taken after it would not be the vector
+  // argmax saw; and `Sampler` has no request identity at all (SamplingMetadata
+  // is keyed by dense index). This point is the last one that has BOTH the
+  // untouched vector and `exec_state_.req_ids`, and it is after
+  // `assemble_sample_logits` has applied the grammar bitmask, so it is the
+  // vector the greedy path selects from.
+  //
+  // WHY IT EXISTS: the arm's whole remaining question is how big OUR per-step
+  // logit delta against llama.cpp b10451 is, against the oracle's own measured
+  // 0.2020-to-1.3657 self-perturbation band. Four candidate causes have died on
+  // this row because nothing here could produce a logit vector. See
+  // .agents/specs/qwen38-27b-q4km-logit-dump.md.
+  //
+  // The file layout is deliberately the one `job/oracle_logits.cpp` already
+  // writes -- one file per sequence, steps concatenated, `n_steps * n_vocab`
+  // little-endian f32 -- so `cmp_logits.c` diffs the two sides unmodified.
+  static const char* const kDumpLogitsDir = [] {
+    const char* e = std::getenv("VT_DUMP_LOGITS");
+    return (e != nullptr && e[0] != '\0') ? e : nullptr;
+  }();
+  if (kDumpLogitsDir != nullptr) {
+    // NO SILENT SKIP. The first version of this guard folded `rank == 2 &&
+    // shape[0] > 0` into the `if`, so an unexpected shape wrote nothing, raised
+    // nothing, and left an empty dump directory that read exactly like "the
+    // instrument is off". That cost a 40-minute lease on 2026-09-02: the run
+    // completed, both engines exited 0, and the alignment control reported six
+    // MISSING sidecars with no way to tell which condition had failed. An
+    // instrument states why it did not fire.
+    VT_CHECK(logits.rank == 2,
+             "VT_DUMP_LOGITS: the sample logits are not rank 2");
+    VT_CHECK(logits.dtype == vt::DType::kF32,
+             "VT_DUMP_LOGITS: the sample logits are not f32");
+    const int64_t rows = logits.shape[0];
+    const int64_t vocab = logits.shape[1];
+    // Printed ONCE, so the log says what the instrument saw rather than leaving
+    // an empty directory to be interpreted.
+    static bool announced = false;
+    if (!announced) {
+      announced = true;
+      std::fprintf(stderr,
+                   "vt-dump-logits: dir=%s rows=%lld vocab=%lld req_ids=%zu "
+                   "discard=%zu\n",
+                   kDumpLogitsDir, static_cast<long long>(rows),
+                   static_cast<long long>(vocab), exec_state_.req_ids.size(),
+                   exec_state_.discard.size());
+      for (size_t k = 0; k < exec_state_.req_ids.size() && k < 8; ++k) {
+        std::fprintf(stderr, "vt-dump-logits: req_ids[%zu]=\"%s\"\n", k,
+                     exec_state_.req_ids[k].c_str());
+      }
+    }
+    VT_CHECK(rows > 0, "VT_DUMP_LOGITS: no sample rows");
+    VT_CHECK(!exec_state_.req_ids.empty(),
+             "VT_DUMP_LOGITS: exec_state_.req_ids is EMPTY at the sample point, "
+             "so no row can be keyed by request");
+
+    // Same staging the reviewed logits-processor path uses
+    // (sample/logits_processor/builtin.cpp): a backend that answers the NARROW
+    // host-addressable predicate is wrapped in place, everything else -- CPU
+    // included -- copies down. Read-only here, so nothing is copied back.
+    vt::Backend& b = vt::GetBackend(queue_.device.type);
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(vocab);
+    std::vector<float> staging;
+    const float* host = nullptr;
+    if (b.DeviceMemoryIsHostAddressable()) {
+      host = static_cast<const float*>(logits.data);
+    } else {
+      staging.resize(total);
+      if (total != 0) b.Copy(queue_, staging.data(), logits.data, total * sizeof(float));
+      b.Synchronize(queue_);
+      host = staging.data();
+    }
+
+    for (int64_t i = 0; i < rows && i < static_cast<int64_t>(exec_state_.req_ids.size()); ++i) {
+      // A row still consuming prefill samples a token the scheduler throws
+      // away, so dumping it would put a step in the file that never appears in
+      // `--output-token-ids` and silently shift every later step.
+      if (i < static_cast<int64_t>(exec_state_.discard.size()) &&
+          exec_state_.discard[static_cast<size_t>(i)]) {
+        continue;
+      }
+      const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+      const float* row = host + static_cast<size_t>(i) * static_cast<size_t>(vocab);
+
+      const std::string base = std::string(kDumpLogitsDir) + "/ours_" + req_id;
+      // FAIL LOUDLY. A dump that silently writes nothing when the directory is
+      // missing is an instrument whose failure looks like a result: the operator
+      // gets no files, no error, and then diffs nothing against the oracle. The
+      // directory is the caller's to create.
+      std::FILE* f = std::fopen((base + ".f32").c_str(), "ab");
+      VT_CHECK(f != nullptr,
+               "VT_DUMP_LOGITS: cannot open the dump file -- does the directory "
+               "exist? The instrument does not create it.");
+      const size_t wrote = std::fwrite(row, sizeof(float),
+                                       static_cast<size_t>(vocab), f);
+      std::fclose(f);
+      VT_CHECK(wrote == static_cast<size_t>(vocab),
+               "VT_DUMP_LOGITS: short write; the dump would be misaligned");
+      // The ALIGNMENT control the spec requires: this argmax must equal the id
+      // `--output-token-ids` records for the same step, or the two sides are not
+      // describing the same context and no delta computed from them means
+      // anything.
+      int64_t best = 0;
+      for (int64_t v = 1; v < vocab; ++v) {
+        if (row[v] > row[best]) best = v;
+      }
+      const int step = input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] -
+                       input_batch_.num_prompt_tokens[static_cast<size_t>(i)];
+      std::FILE* g = std::fopen((base + ".ids.txt").c_str(), "a");
+      VT_CHECK(g != nullptr, "VT_DUMP_LOGITS: cannot open the ids sidecar");
+      std::fprintf(g, "%d %lld\n", step, static_cast<long long>(best));
+      std::fclose(g);
+    }
+  }
+}
+
 ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::optional<GrammarOutput>& grammar_output) {
   ModelRunnerOutput out;
@@ -3316,6 +3454,8 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
 
   std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+
+  dump_step_logits(logits);
 
   // SAMPLE-PROMPT-LOGPROBS (gpu_model_runner.py:3841-3845): score the prompt
   // rows off the SAME forward result. Done before sampling because sampling
@@ -4608,6 +4748,8 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
 
   std::vector<float> sampled_logits;
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+  // #2534: the SAME dump, on the branch the production default actually takes.
+  dump_step_logits(logits);
   // SAMPLE-PROMPT-LOGPROBS: same seam as the synchronous path. The prompt rows
   // are read off this step's forward result HERE, synchronously, because that
   // is where the logits still are — the async output only defers the sampled

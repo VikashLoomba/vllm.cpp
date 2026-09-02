@@ -297,7 +297,7 @@ and the kF16 arm is reached by nothing, which is declared above.
 | `tests/vt/test_ops_rmsnorm_weight_dtype.cpp` | this host, `cmake --build build -j 2` | this host, `ctest` |
 | `tests/vt/test_ops_rmsnorm_quant_fp8_weight_dtype.cpp` | this host | this host |
 | `src/vt/cuda/cuda_ops.cu` | `cuda-fat-build` in CI ONLY -- there is no `nvcc` on this host | nothing; no CI lane runs GPU tests |
-| `src/vt/rocm/rocm_rmsnorm.hip` | **`hipcc` 7.2.4 for gfx1151 on `strix:gpu0`, clean, 0 warnings** -- see below. NOT by this host and NOT by CI: there is no `hipcc` and no HIP header here, and `grep -rlE 'hipcc\|ROCM\|rocm' .github/workflows/` returns nothing | nothing |
+| `src/vt/rocm/rocm_rmsnorm.hip` | **`hipcc` 7.2.4 for gfx1151 on `strix:gpu0`, clean, 0 warnings, TWICE -- once as a single TU and once inside a full 22-object HIP build of the MERGED tree** -- see below. NOT by this host and NOT by CI: there is no `hipcc` and no HIP header here, and `grep -rlE 'hipcc\|ROCM\|rocm' .github/workflows/` returns nothing | nothing |
 
 ### The ROCm compile, and why it is a lease rather than a lane
 
@@ -365,6 +365,41 @@ The job compiled tree `2d1fdc19b`; this branch has since taken two merges from
 EMPTY and the file's sha256 is `164392b422f93f65...` at both, so the report
 covers the bytes that are landing. If this file changes again the report does
 not follow it -- a leased compile is a dated report, not a standing gate.
+
+**A SECOND job compiled the WHOLE ROCm backend on the MERGED tree.** Job 1
+proved one TU at `2d1fdc19b`; this branch then took two merges, and
+BACKEND-ROCM-EXL3 had just written up that exact gap for itself (`2e200e2c6`:
+"the merged tree had never been compiled under HIP ... I should have queued that
+before pushing, not after"). Its own full-HIP build was at `9dcc34cc3`, which
+PREDATES this change and therefore compiled the OLD `rocm_rmsnorm.hip`. Neither
+existing result covered the merged tree WITH this change, so job
+`f1323c94-cbe0-469d-b2d4-8a3e553b336f` did:
+
+```
+HEAD_SHA=fcd446b033877fc436a75aabbeb1231465909a59   (this branch's head)
+const Tw* w  1 (want 1)   DispatchRmsNormWeight  4 (want 4)
+removed weld 0 (want 0)   cuda fp8 dispatcher    3 (want 3)
+CMAKE_RC=0        hip_object_targets=22
+NINJA_RC=0        hip_objects_built=22 (configured 22)
+rocm_rmsnorm.hip.o  187176 bytes
+RESULT HIPBUILD=PASS  target=vllm hip_objects=22 arch=gfx1151
+RESULT WARNINGS=6     RESULT ELAPSED=291s
+```
+
+It asserts `hip_objects_built >= 20` after the build rather than trusting
+`NINJA_RC`, because a configure that quietly dropped the HIP sources would give a
+green ninja with nothing to show for it.
+
+**The 6 warnings are NOT in this wave's file.** They are three distinct
+`-Wunused-value` diagnostics in `src/vt/graph_dedup_runtime.h` (`:146`, `:279`,
+`:283`), each emitted from two TUs. All three are intentional discards of a
+`hipError_t`: `:146` is `ClearLatchedError`, whose own comment says its whole job
+is to CONSUME the runtime's sticky per-thread error, and the other two are
+`DestroyExec`/`DestroyGraph` cleanup helpers. They appear only under HIP because
+ROCm marks `hipError_t` `nodiscard` where CUDA does not, which is precisely the
+class of thing no lane can currently see. `rocm_rmsnorm.hip` itself compiles with
+ZERO warnings in both jobs. They are reported here rather than filed, because an
+intentional discard in a destroy path is not a defect.
 
 **What it does NOT say.** No kernel in that file has been RUN on an AMD device;
 this is a compile, and the row's `## Owed` still carries the absence of any lane

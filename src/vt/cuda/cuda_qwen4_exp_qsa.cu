@@ -27,7 +27,7 @@
 //                SCAFFOLDING ONLY, for the reason the CPU sibling's header
 //                gives: DSv4's pool is a LEARNED softmax over an OVERLAPPING
 //                window driven by a score channel this checkpoint has no tensor
-//                for. vLLM has never registered `qwen4_exp` at any revision.
+//                for. SUPERSEDED 2026-08-31: vLLM registers it, see #2489.
 //
 // The KERNEL STRUCTURE (`Check`, `AsStream`, the runtime dtype tag, the
 // unconditional `Registrar`) is mirrored from `src/vt/cuda/cuda_qwen4_exp_ple.cu`.

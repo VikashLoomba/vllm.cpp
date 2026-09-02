@@ -453,15 +453,16 @@ TEST_CASE("glm5_next bridge: EVERY block dtype this build knows has a decoder") 
   int block_dtypes = 0;
   for (int raw = 0; raw <= 255; ++raw) {
     const auto d = static_cast<vt::DType>(raw);
-    if (raw > static_cast<int>(vt::DType::kIQ4_XS)) break;
+    if (raw > static_cast<int>(vt::DType::kIQ3_S)) break;
     if (!vt::IsBlockQuant(d)) continue;
     ++block_dtypes;
     INFO("dtype ", vt::Name(d));
     CHECK(vt::cpu::BlockToFloat(d) != nullptr);
   }
   // A loop that found nothing would pass vacuously, which is the mute-switch
-  // shape this repository names. The build carries 18 block encodings.
-  CHECK(block_dtypes == 18);
+  // shape this repository names. The build carries 19 block encodings (IQ3_S
+  // joined with QUANT-IQ3S, #2510).
+  CHECK(block_dtypes == 19);
   MESSAGE("block dtypes with a CPU decoder: " << block_dtypes);
 }
 

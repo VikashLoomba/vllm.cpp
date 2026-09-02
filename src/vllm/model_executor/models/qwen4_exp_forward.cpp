@@ -102,7 +102,7 @@ HfConfig Qwen4ExpGdnHfConfig(const Qwen4ExpParams& p, const HfConfig& source) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-GdnLayerWeights Qwen4ExpGdnBlockWeights(const Qwen4ExpGdnWeights& g,
+GdnLayerWeights Qwen4ExpGdnBlockWeights(Qwen4ExpGdnWeights& g,
                                         const Qwen4ExpParams& p) {
   const int64_t H = p.hidden_size;
   const int64_t num_v = p.linear_num_value_heads;
@@ -125,16 +125,28 @@ GdnLayerWeights Qwen4ExpGdnBlockWeights(const Qwen4ExpGdnWeights& g,
   CheckOwned(g.norm_weight, "gdn.norm_weight", {p.linear_value_head_dim});
   CheckOwned(g.out_proj, "gdn.out_proj", {H, value_dim});
 
+  // ZERO-COPY VIEWS, NOT ASSIGNMENT (issue #2476,
+  // `.agents/specs/gdn-qkvz-operand-lifetime.md`). This block used to spell the
+  // pass-through as `w.in_proj_qkv = g.in_proj_qkv;`, and the comment above the
+  // declaration in the header already said what that was supposed to mean:
+  // "nothing is ... reallocated here". `OwnedTensor`'s implicit copy DEEP-COPIES
+  // an owned buffer, so the assignment reallocated ~115 MiB of Gated DeltaNet
+  // weights per linear layer per step — and `ResidentWeight`'s host-alias arm
+  // then handed cuBLASLt a pointer INTO that per-step copy, which this
+  // function's caller destroys at the end of the layer while the GEMM is still
+  // queued. `compute-sanitizer` on `thor:gpu0` reported that as `Warp illegal
+  // address` in `nvjet_sm110_tst_512x8_64x3_2x1_v_bz_TNT` with every declared
+  // extent correct. The view is what makes the operand belong to the model.
   GdnLayerWeights w;
-  w.in_proj_qkv = g.in_proj_qkv;
-  w.in_proj_z = g.in_proj_z;
-  w.in_proj_b = g.in_proj_b;
-  w.in_proj_a = g.in_proj_a;
-  w.conv1d_weight = g.conv1d;
-  w.a_log = g.a_log;
-  w.dt_bias = g.dt_bias;
-  w.norm_weight = g.norm_weight;
-  w.out_proj = g.out_proj;
+  w.in_proj_qkv = BorrowWholeOwnedTensor(g.in_proj_qkv);
+  w.in_proj_z = BorrowWholeOwnedTensor(g.in_proj_z);
+  w.in_proj_b = BorrowWholeOwnedTensor(g.in_proj_b);
+  w.in_proj_a = BorrowWholeOwnedTensor(g.in_proj_a);
+  w.conv1d_weight = BorrowWholeOwnedTensor(g.conv1d);
+  w.a_log = BorrowWholeOwnedTensor(g.a_log);
+  w.dt_bias = BorrowWholeOwnedTensor(g.dt_bias);
+  w.norm_weight = BorrowWholeOwnedTensor(g.norm_weight);
+  w.out_proj = BorrowWholeOwnedTensor(g.out_proj);
   // `in_proj_ba` and `in_proj_qkvz` are left EMPTY — see the header. That is
   // what keeps the split fields above live and it is exactly what qwen3_5's own
   // GGUF loader does.
@@ -436,9 +448,18 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
     Tensor block_out;
     std::shared_ptr<void> block_store;
     if (linear) {
-      const GdnLayerWeights gw = Qwen4ExpGdnBlockWeights(lw.gdn, p);
+      // BUILT ONCE AND HELD BY THE MODEL (issue #2476). A `GdnLayerWeights`
+      // built here per step is a set of handles this scope OWNS, and
+      // `ResidentWeight` writes its residency memo — the device copy, and the
+      // host-alias decision that hands a kernel `bytes.data()` — onto the
+      // handle it is given. So a per-step adapter both re-established residency
+      // every step and destroyed the operand at the closing brace below, with
+      // the block's GEMMs still queued. `lw.gdn_block` outlives every step,
+      // holds no bytes of its own, and is the memo.
+      if (!lw.gdn_block.has_value())
+        lw.gdn_block.emplace(Qwen4ExpGdnBlockWeights(lw.gdn, p));
       const GdnBlockOutput o = RunGdnBlockPaged(
-          d.q, gw, gdn_config, mixed.t(), gdn_step, gdn_meta,
+          d.q, *lw.gdn_block, gdn_config, mixed.t(), gdn_step, gdn_meta,
           caches.gdn[static_cast<size_t>(gdn_i)], T);
       block_out = o.tensor;
       block_store = o.storage;
@@ -504,6 +525,15 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
       // `ResidentWeight::d_dev` and re-uploads the tower on a device arm — and
       // it is a SPEED ceiling this wave inherits rather than a wrong answer;
       // the spec's `## Owed` carries the hoist.
+      //
+      // "RATHER THAN A WRONG ANSWER" HOLDS HERE ONLY BECAUSE THE ADAPTER
+      // BORROWS. `Qwen4ExpMoeBlockWeights` passes the towers through
+      // `BorrowWhole`, so the buffer a queued kernel reads belongs to the model
+      // and the per-step rebuild costs residency work and nothing else. The GDN
+      // adapter next door spelled the same pass-through as assignment, which
+      // deep-copies, and there the per-step rebuild was a freed operand
+      // underneath a queued GEMM (issue #2476). Whoever hoists this must not
+      // read the sentence above as a general licence.
       // Built OUTSIDE the placed body on purpose: `Qwen4ExpMoeBlockWeights`
       // takes a non-const reference and mutates it via `OwnedBytes::KeepAlive()`,
       // so it is not a pure function of the layer and must not be re-evaluated

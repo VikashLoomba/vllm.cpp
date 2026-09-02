@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -26,6 +27,7 @@
 
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
+#include "vt/rocm/rocm_f16_codec.h"
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
 #include "vt/cpu/cpu_quant_blocks.h"
@@ -46,54 +48,12 @@ inline ActDT ActDtOf(DType dt) {
   return dt == DType::kF32 ? ActDT::kF32 : dt == DType::kF16 ? ActDT::kF16 : ActDT::kBF16;
 }
 
-// ---- device numeric helpers (bit-exact ports from cuda_quant_dot.cu) ----
-__device__ inline float DF16ToF32(uint16_t h) {
-  uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
-  uint32_t exp = (h >> 10) & 0x1F;
-  uint32_t mant = h & 0x3FF;
-  if (exp == 0x1F) return __int_as_float(sign | 0x7F800000 | (mant << 13));
-  if (exp == 0) {
-    if (mant == 0) return __int_as_float(sign);
-    int shift = 0;
-    while ((mant & 0x400) == 0) { mant <<= 1; ++shift; }
-    mant &= 0x3FF;
-    return __int_as_float(sign | ((113 - shift) << 23) | (mant << 13));
-  }
-  return __int_as_float(sign | ((exp + 112) << 23) | (mant << 13));
-}
-__device__ inline float DBF16ToF32(uint16_t b) {
-  return __int_as_float(static_cast<uint32_t>(b) << 16);
-}
-__device__ inline uint16_t DF32ToBF16(float f) {
-  uint32_t u = __float_as_int(f);
-  if ((u & 0x7F800000) == 0x7F800000 && (u & 0x7FFFFF))
-    return static_cast<uint16_t>((u >> 16) | 0x0040);
-  uint32_t rounding = 0x7FFF + ((u >> 16) & 1);
-  return static_cast<uint16_t>((u + rounding) >> 16);
-}
-__device__ inline uint16_t DF32ToF16(float f) {
-  uint32_t u = __float_as_uint(f);
-  uint16_t sign = static_cast<uint16_t>((u >> 16) & 0x8000);
-  int32_t exp = static_cast<int32_t>((u >> 23) & 0xFF) - 127 + 15;
-  uint32_t mant = u & 0x7FFFFF;
-  if (((u >> 23) & 0xFF) == 0xFF)
-    return static_cast<uint16_t>(sign | 0x7C00 | (mant ? 0x200 | (mant >> 13) : 0));
-  if (exp >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00);
-  if (exp <= 0) {
-    if (exp < -10) return sign;
-    mant |= 0x800000;
-    uint32_t shift = static_cast<uint32_t>(14 - exp);
-    uint32_t half = mant >> shift;
-    uint32_t rem = mant & ((1u << shift) - 1);
-    uint32_t mid = 1u << (shift - 1);
-    if (rem > mid || (rem == mid && (half & 1))) ++half;
-    return static_cast<uint16_t>(sign | half);
-  }
-  uint32_t half = static_cast<uint32_t>(exp << 10) | (mant >> 13);
-  uint32_t rem = mant & 0x1FFF;
-  if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;
-  return static_cast<uint16_t>(sign | half);
-}
+// ---- device numeric helpers ----
+// The four half/bfloat16 conversions moved to `vt/rocm/rocm_f16_codec.h`
+// (included above) when BACKEND-ROCM-EXL3 needed the same two of them for
+// the trellis decode. They are unchanged, and they are still the bit-exact
+// transcriptions of `vt::F16ToF32` / `vt::F32ToF16` rather than the hardware
+// conversion intrinsics; a second copy is what moving them avoided.
 __device__ inline int DNearestInt(float fval) {
   float val = fval + 12582912.0f;
   int i = __float_as_int(val);
@@ -426,7 +386,20 @@ __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ 
   float partial = 0.0f;
   for (int64_t sb = lane; sb < nsb; sb += 32) {
     const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
-    if constexpr (Fmt == 2) partial += DotQ6K(static_cast<const BlockQ6_K*>(w_sb), a_row + sb);
+    if constexpr (Fmt == 3) {
+      // Fmt 3 IS Fmt 2 (Q6_K) with a different PRIVATE-MEMORY footprint, and
+      // nothing else. `DotQ6K` materialises the whole superblock into an
+      // `int8_t aux8[256]` per thread, which the compiler places in SCRATCH;
+      // `DotQ6KIsumRange` reconstructs 32 weights at a time into `int8_t
+      // aux8[32]`, which fits in registers. The arithmetic is the same integer
+      // accumulator times the same one f32 scale product, which is the
+      // bit-equality this file's `DotQ6KIsumRange` note already argues and
+      // which tests/vt/test_backend_cross_device.cpp already asserts between
+      // the cooperative and single-warp arms.
+      const BlockQ6_K* xb = static_cast<const BlockQ6_K*>(w_sb);
+      const BlockQ8_K* yb = a_row + sb;
+      partial += (DF16ToF32(xb->d) * yb->d) * DotQ6KIsumRange(xb, yb, 0, kSubBlocks);
+    } else if constexpr (Fmt == 2) partial += DotQ6K(static_cast<const BlockQ6_K*>(w_sb), a_row + sb);
     else if constexpr (Fmt == 1) partial += DotQ5K(static_cast<const BlockQ5_K*>(w_sb), a_row + sb);
     else partial += DotQ4K(static_cast<const BlockQ4_K*>(w_sb), a_row + sb);
   }
@@ -600,6 +573,29 @@ void* EnsureQuantScratch(size_t need, hipStream_t s) {
 // one by construction, so no output comparison can witness the dispatch).
 std::atomic<uint64_t> g_kq_coop_dispatches{0};
 
+// VT_ROCM_Q6K_SMALL_PRIVATE=1 — the A/B arm for
+// [#2511](https://github.com/mudler/vllm.cpp/issues/2511). Every failing leg on
+// `gfx1151` ended inside `KQuantGemmK<OutT, 2>`, the Q6_K arm, with all three of
+// its pointer arguments EXACTLY the size the launch needs (measured from
+// `AMD_LOG_LEVEL=4`: weight `obj` == n * w_row_bytes to the byte, act `obj` ==
+// m * nsb * sizeof(BlockQ8_K) to the byte) and every index provably inside them.
+// The one thing that arm has and no other kernel on the path has is a 256-byte
+// per-thread private array in `DotQ6K`, which lands in scratch. This selects the
+// register-resident body instead, so a leg run with it on and a leg run with it
+// off differ in private-memory footprint and in NOTHING ELSE.
+//
+// Default OFF: this is a diagnostic A/B until a leg count says which arm is
+// right, and the range body measured 1.73x slower on the n=4096 k=12288 shape
+// (see the `KQuantGemmKCoopQ6K` note above), so flipping the default is a
+// separate decision with its own evidence.
+bool Q6KSmallPrivateEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ROCM_Q6K_SMALL_PRIVATE");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
 }  // namespace
 
 // Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
@@ -681,7 +677,8 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
             o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
         return;
       }
-      if (fmt == 2) KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+      if (fmt == 2 && Q6KSmallPrivateEnabled()) KQuantGemmK<OutT, 3><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+      else if (fmt == 2) KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
       else if (fmt == 1) KQuantGemmK<OutT, 1><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
       else KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
     };
@@ -689,7 +686,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     Check(hipGetLastError(), "K-quant gemm");
     return;
   }
-  throw std::runtime_error("vt rocm: matmul_bt_quant: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/MXFP4 -- the loader pre-filters to the ported set, so reaching here is a bug)");
+  throw std::runtime_error("vt rocm: matmul_bt_quant: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ3_S/IQ2_S/MXFP4 -- the loader pre-filters to the ported set, so reaching here is a bug)");
 }
 
 

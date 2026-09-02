@@ -691,16 +691,39 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   DBuf qgate(d, hidden.dtype, {T, Hq * 2 * Dh});
   vt::MatmulBT(d.q, qgate.t(), hidden,
                dense_attn::ResidentWeight(d, w.q_proj, {Hq * 2 * Dh, H}));
-  DBuf q_f32(d, DType::kF32, {T, Hq, Dh});
+  //
+  // THE QUERY HALF IS SPLIT AT THE MODEL DTYPE, NOT WIDENED (#2488). vLLM reaches
+  // this point through `torch.chunk` (qwen3_next.py:430) and hands `q` to `q_norm`
+  // unwidened (:437), so `q` carries `model_config.dtype` — bf16 for this
+  // architecture — from the GEMM to the norm.
+  //
+  // An earlier comment here justified an f32 `q` as upstream's `_norm(x.float())`
+  // then `.type_as(x)`. That was RIGHT about the rounding count and WRONG about
+  // what it licenses: upstream's `.float()` is a promotion inside the norm kernel's
+  // registers (ple_layer.py:70 then :80 `.to(input_dtype)`), not a materialised
+  // `[T, Hq, Dh]` allocation. The rounding count is one either way, because `qgate`
+  // is ALREADY at `hidden.dtype` — so widening each element to f32 and narrowing it
+  // back is the identity, and all it buys is `T*Hq*Dh*4` bytes where upstream moves
+  // half that. `AGENTS.md` names this exactly: a token gate cannot see a dtype that
+  // is too wide, so the gate on this line reads the dtype and the byte count.
+  //
+  // It is also what made #2477 a wall. An f32 `q` beside the bf16 gamma the loader
+  // produces was the pairing the CUDA RmsNorm kernel refused; #2493 taught the
+  // kernel that pairing and said it was treating a symptom. This is the cause.
+  //
+  // The GATE half stays f32: `vt::SigmoidGateBf16` takes an f32 gate on each of
+  // its four backends. #2488 stays open for it.
+  DBuf q_split(d, hidden.dtype, {T, Hq, Dh});
   DBuf gate(d, DType::kF32, {T, Hq, Dh});
-  vt::AttnGateSplit(d.q, q_f32.t(), gate.t(), qgate.t());
+  vt::AttnGateSplit(d.q, q_split.t(), gate.t(), qgate.t());
 
-  // q_norm reads the f32 split and stores the block dtype, which is upstream's
-  // `_norm(x.float()) * (1 + w)` followed by `.type_as(x)`: one rounding, at the
-  // store, exactly where upstream has one.
+  // q_norm reads the split and stores the block dtype, which is upstream's
+  // `_norm(x.float()) * (1 + w)` followed by `.to(input_dtype)`: one rounding, at
+  // the store, exactly where upstream has one. Both operands are now the block
+  // dtype, which is the pairing every backend's RmsNorm already served.
   DBuf q(d, hidden.dtype, {T, Hq, Dh});
   {
-    Tensor src = Reshape(q_f32.t(), {T * Hq, Dh});
+    Tensor src = Reshape(q_split.t(), {T * Hq, Dh});
     Tensor dst = Reshape(q.t(), {T * Hq, Dh});
     vt::RmsNorm(d.q, dst, src, dense_attn::ResidentWeight(d, w.q_norm, {Dh}),
                 vt::RmsNormArgs{eps, /*gemma=*/true});
@@ -787,9 +810,11 @@ Qwen4ExpQsaBlockOutput QsaBlockCore(Dev d, const Qwen4ExpQsaWeights& w,
   }
 
   // `attn_output * torch.sigmoid(gate)` then `o_proj` (:838-840). The gate is
-  // read at f32 because the sigmoid's input must not be rounded, which is the
-  // contract `vt::SigmoidGateBf16` states and the reason `AttnGateSplit` emits
-  // f32 in the first place.
+  // read at f32 because that is the operand `vt::SigmoidGateBf16` states on each
+  // of its four backends. It is NOT because this value needs the width: `qgate` is
+  // `hidden.dtype`, so the f32 gate holds bf16 values in f32 storage, exactly as
+  // the query did before #2488's first half. Narrowing it means widening that op
+  // on four backends for zero rounding change, which is why #2488 stays open.
   DBuf gated(d, DType::kBF16, {T, Hq * Dh});
   vt::SigmoidGateBf16(d.q, gated.t(), Reshape(attn.t(), {T, Hq * Dh}),
                       Reshape(gate.t(), {T, Hq * Dh}));

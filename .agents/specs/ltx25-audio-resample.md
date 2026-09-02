@@ -63,9 +63,11 @@ Out:
 
 `Ltx2WaveformToLogMel` refuses any waveform whose rate is not
 `config.target_sample_rate`
-(`src/vllm/model_executor/models/ltx2_audio_vae.cpp:1051-1060`), and
-`Ltx2DecodeAudioWav` refuses the same thing one hop earlier so the message can
-name the file (`src/vllm/model_executor/models/ltx2_audio_input.cpp:96-105`).
+(`src/vllm/model_executor/models/ltx2_audio_vae.cpp:1051-1060` at this row's base
+`6643b2bbf`; the refusal is gone at head, so the anchor names the tree it
+describes), and `Ltx2DecodeAudioWav` refuses the same thing one hop earlier so
+the message can name the file
+(`src/vllm/model_executor/models/ltx2_audio_input.cpp:96-105`, same base).
 Between them, **every** audio input at a rate other than the checkpoint's is
 turned away, so `a2vid_two_stage` only accepts a take the user resampled with
 some other tool first.
@@ -86,9 +88,22 @@ So what is missing is the **arbitrary rational ratio**, not the window. Sizing
 A19 at M was right; the reason written beside it was wrong, and this row corrects
 the reason as well as the code.
 
-The nine sites: `ltx2_audio_input.cpp:101`, `ltx2_audio_vae.cpp:1057`,
-`ltx2_audio_vae_encoder.h:173`, `ltx2_video.h:315`, `ltx2_audio_input.h:124`,
-`test_ltx2_video.cpp:7518`, and `ltx25-a2v-audio-input.md:155` and `:463`.
+The nine sites, read at this row's base `6643b2bbf` because the repair moves
+every one of them: `src/vllm/model_executor/models/ltx2_audio_input.cpp:101`,
+`src/vllm/model_executor/models/ltx2_audio_vae.cpp:1057`,
+`include/vllm/model_executor/models/ltx2_audio_vae_encoder.h:173`,
+`include/vllm/multimodal/ltx2_video.h:315`,
+`include/vllm/model_executor/models/ltx2_audio_input.h:124`,
+`tests/vllm/multimodal/test_ltx2_video.cpp:7518`,
+`.agents/specs/ltx25-a2v-audio-input.md:155` and `:463`, and
+**`examples/ltx2_gen/main.cpp:179`**.
+
+That last entry is the row's own record defect and not a tenth discovery. This
+paragraph said "nine" and listed **eight** until 2026-09-02; the repair covered
+the eight it listed, and the ninth shipped unrepaired into a `--help` string. The
+list is now enumerated by
+`git grep -inE "polyphase kaiser|kaiser resampl" 6643b2bbf -- .`, which returns
+exactly these nine, rather than transcribed.
 
 ---
 
@@ -373,7 +388,7 @@ tokenizer and HuggingFace-org byte matches.
 
 | | Before | After |
 |---|---|---|
-| `test_ltx2_vae -tc='*waveform_to_mel*'` | THREW the rate refusal at `ltx2_audio_vae.cpp:1053` | 48/48 cases, 3245/3245 assertions |
+| `test_ltx2_vae -tc='*waveform_to_mel*'` | THREW the rate refusal at `ltx2_audio_vae.cpp:1053` (at `6643b2bbf`) | 48/48 cases, 3245/3245 assertions |
 | `test_ltx2_video -tc='*RESAMPLED*'` | THREW `'high.wav' is sampled at 44100 Hz ...` | 110/110 cases, 4876/4876 assertions |
 | `test_ltx2_vae -tc='*resampl*'`, section 8f | 50/54 with the EXACT INTEGER CEIL in place: `CeilAt` 65560 vs 65559 and its tail 0.256834 out, `CeilAlt` 65720 vs 65719 and its tail 0.358731 out | 54/54 |
 

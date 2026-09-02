@@ -1401,6 +1401,10 @@ target_include_directories(test_glm4_moe_lite_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# #2534. The GGUF keep-quant lm_head must emit logits with f32 RESOLUTION, which
+# is the property the Q4_K_M token gate is decided by and which no token gate we
+# own can see. Public headers only, so no extra include directory.
+vllm_cpp_add_test(test_qwen35_gguf_logits_f32 vllm/models/test_qwen35_gguf_logits_f32.cpp)
 # #2534. `detail::ActDType` caches its getenv in a function-local static, so one
 # process observes exactly ONE value of VT_ACT_F32 and a single run cannot tell a
 # resolver that READS the lever from one hardwired to its default answer. Re-run

@@ -219,6 +219,53 @@ additionally requires porting `arch/arm/repack.cpp`'s `ggml_gemv_q4_K_8x8_q8_K`,
 which is the `## Owed` item and is architecture-specific by construction -- it
 would not transfer to the gfx1151 arm the standing goal names.
 
+## The red-before, reproduced on this branch
+
+rc job `68d8899a-307e-46d3-bd2b-c021adc27ead`, `thor:gpu0`, worker
+`rc-worker-n8smh`, log `out/ours-rc-worker-n8smh-20260902T005602Z/`. One binary
+built CPU-only from this branch, run at its SHIPPED defaults against the recorded
+`b10451` ids:
+
+```text
+TOKENIZER_DIVERGENCES=0/6
+GENERATION_DIVERGENCES=5/6
+TOKEN_GATE=FAIL
+```
+
+Prompt for prompt, index for index, token for token, this is the 2026-08-23
+result: first differing index 7 / 34 / 20 / - / 14 / 32, prompt 3 token-exact
+48 of 48, and the same id pairs (9338 vs 9564, 198 vs 3095, 13 vs 539, 4593 vs
+22486, 15 vs 16). The base is ten days of `main` newer than `ff8f728071`, so
+nothing in between moved this arm. That is the red-before.
+
+## Two defects the second test registration caught, and what they teach
+
+Arm B (`VT_ACT_F32=1`) did NOT run: it aborted at 25.7 s. Both causes were
+already visible in the focused unit gate, which the default arm passed 33 of 33
+and 780 of 780 through both of them -- which is precisely why the second
+registration exists.
+
+1. **The resolver was not total.** It asked
+   `GetPlatform(dev_type).is_cpu()`, and the platform registry holds only the
+   platforms a binary linked, so asking it about an unregistered type THROWS
+   (`no platform registered for device type 1`, `platform.cpp:74`). A dtype
+   resolver is asked what a device type WOULD resolve to, including from a
+   CPU-only test binary, so it must answer rather than abort. It now compares the
+   enum.
+
+2. **Not every `DType::kBF16` literal is the model dtype.** Some are an OP's
+   contract. `vt::SigmoidGateBf16` requires a bf16 output (`ops.cpp:5105`), and
+   routing the trunk dtype into it aborted 9 cases of the 27B dense paged forward
+   with `sigmoid_gate_bf16: out must be bf16`. The mechanical rewrite conflated
+   the two categories. An audit of the other 28 sites against their consumers
+   found no second instance: `SiluAndMul`, `MoeSiluMul` and `RmsNormGated` all
+   take `IsOutFloat`, which admits f32.
+
+Neither was reachable by reading. Both were found by running the lever, and the
+default arm stayed green through both -- the exact shape of defect this row
+warned about in `## Tests`.
+
+
 ## Scope
 
 1. Measure whether the oracle's own greedy decode is stable across its own

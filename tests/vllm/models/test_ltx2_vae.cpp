@@ -2817,6 +2817,100 @@ TEST_CASE("ltx2 vae: the slaney mel filterbank matches torchaudio") {
   }
 }
 
+TEST_CASE("ltx2 vae: resample_audio matches upstream at every ratio it can take") {
+  // Row LTX25-AUDIO-RESAMPLE (#2583). Generator section 8d runs upstream's OWN
+  // `AudioProcessor.resample_audio` (ops.py:36-42) at four ratios; this
+  // reproduces each from the same PRNG input.
+  //
+  // TOLERANCE. 2.5e-07 is not a hedge, it is twice the MEASURED floor. Setting
+  // it to 0.0 on this tree reds three of the four arms at 5.96e-08 (Up), 5.96e-08
+  // (Down) and 1.19e-07 (Wide); Same passes at zero because it is a copy. The
+  // port mirrors torchaudio's float32 kernel arithmetic operation for operation,
+  // so the only residual is the difference between two libm `sin`/`cos` at the
+  // same f32 argument plus the convolution's reduction order. Building the filter
+  // in `double` instead would land 1.03e-05 out — eighty times this bound — which
+  // is why a wider dtype FAILS this gate rather than passing it more comfortably.
+  struct Arm {
+    const char* tag;
+    const char* input;
+    int64_t orig_rate;
+    int64_t new_rate;
+    int64_t in_samples;
+    int64_t out_samples;
+    const float* golden;
+    size_t golden_size;
+  };
+  constexpr double kResampleTol = 2.5e-7;
+  const int64_t channels = vllm_test::kLtx2ResampleChannels;
+  const Arm arms[] = {
+      {"Up (o = 1, the BWE ratio)", "ltx2.resample.Up", vllm_test::kLtx2ResampleUpOrigRate,
+       vllm_test::kLtx2ResampleUpNewRate, vllm_test::kLtx2ResampleUpInSamples,
+       vllm_test::kLtx2ResampleUpOutSamples, vllm_test::kLtx2ResampleUpGolden,
+       std::size(vllm_test::kLtx2ResampleUpGolden)},
+      {"Down (n = 1)", "ltx2.resample.Down", vllm_test::kLtx2ResampleDownOrigRate,
+       vllm_test::kLtx2ResampleDownNewRate, vllm_test::kLtx2ResampleDownInSamples,
+       vllm_test::kLtx2ResampleDownOutSamples, vllm_test::kLtx2ResampleDownGolden,
+       std::size(vllm_test::kLtx2ResampleDownGolden)},
+      {"Wide (o = 441, width 17)", "ltx2.resample.Wide", vllm_test::kLtx2ResampleWideOrigRate,
+       vllm_test::kLtx2ResampleWideNewRate, vllm_test::kLtx2ResampleWideInSamples,
+       vllm_test::kLtx2ResampleWideOutSamples, vllm_test::kLtx2ResampleWideGolden,
+       std::size(vllm_test::kLtx2ResampleWideGolden)},
+      {"Same (the early return)", "ltx2.resample.Same", vllm_test::kLtx2ResampleSameOrigRate,
+       vllm_test::kLtx2ResampleSameNewRate, vllm_test::kLtx2ResampleSameInSamples,
+       vllm_test::kLtx2ResampleSameOutSamples, vllm_test::kLtx2ResampleSameGolden,
+       std::size(vllm_test::kLtx2ResampleSameGolden)},
+  };
+
+  for (const Arm& arm : arms) {
+    INFO("arm: " << arm.tag);  // NOT CAPTURE: doctest stringifies a `const char*` as a bool
+    const std::vector<float> in = Ltx2Input(arm.input, channels * arm.in_samples, 0.5);
+    int64_t produced = 0;
+    const std::vector<float> got = vllm::Ltx2ResampleWaveform(
+        in, channels, arm.in_samples, arm.orig_rate, arm.new_rate, &produced);
+    // `ceil(new * length / orig)` (functional.py:1427). Asserted before the
+    // values because a resampler that produced the right SAMPLES at the wrong
+    // LENGTH would be compared against a shifted golden.
+    CHECK(produced == arm.out_samples);
+    REQUIRE(got.size() == arm.golden_size);
+    const double err = MaxAbsDiff(got, arm.golden, arm.golden_size);
+    INFO("resample max|diff| = " << err);
+    CHECK(err <= kResampleTol);
+    // A LOWER bound as well. An all-zero output, or one that dropped every
+    // channel but the first, matches nothing here but would satisfy a
+    // tolerance against a golden regenerated from the same defect.
+    double absmax = 0.0;
+    for (float v : got) absmax = std::max(absmax, std::abs(static_cast<double>(v)));
+    CHECK(absmax > 0.0);
+    double second_channel_absmax = 0.0;
+    for (int64_t i = produced; i < 2 * produced; ++i) {
+      second_channel_absmax =
+          std::max(second_channel_absmax, std::abs(static_cast<double>(got[static_cast<size_t>(i)])));
+    }
+    CHECK(second_channel_absmax > 0.0);
+  }
+
+  // The equal-rate arm returns the INPUT, byte for byte. Upstream returns the
+  // same `Audio` object (ops.py:38-39) and never enters the filter; a port that
+  // ran a unit-ratio filter anyway would be wrong by its passband ripple, which
+  // is under the tolerance above and would pass every check in the loop.
+  const std::vector<float> same_in =
+      Ltx2Input("ltx2.resample.Same", channels * vllm_test::kLtx2ResampleSameInSamples, 0.5);
+  const std::vector<float> same_out = vllm::Ltx2ResampleWaveform(
+      same_in, channels, vllm_test::kLtx2ResampleSameInSamples,
+      vllm_test::kLtx2ResampleSameOrigRate, vllm_test::kLtx2ResampleSameNewRate, nullptr);
+  CHECK(same_out == same_in);
+
+  // Upstream's own refusal, at the same boundary (functional.py:1470-1471).
+  bool threw = false;
+  try {
+    vllm::Ltx2ResampleWaveform(same_in, channels, vllm_test::kLtx2ResampleSameInSamples, 16000, 0,
+                               nullptr);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  CHECK(threw);
+}
+
 TEST_CASE("ltx2 vae: waveform_to_mel matches upstream AudioProcessor") {
   vllm::Ltx2AudioProcessorConfig cfg;
   cfg.target_sample_rate = vllm_test::kLtx2MelRate;
@@ -2838,21 +2932,37 @@ TEST_CASE("ltx2 vae: waveform_to_mel matches upstream AudioProcessor") {
   INFO("waveform_to_mel max|diff| = " << err);
   CHECK(err <= kLtx2GoldenTol);
 
-  // A rate that does not match is REFUSED, because upstream would RESAMPLE and
-  // this project does not carry that resampler. Treating the samples as if they
-  // were already at the target rate conditions on audio that is pitched wrong.
-  bool threw = false;
-  std::string message;
-  try {
-    vllm::Ltx2WaveformToLogMel(cfg, wave, channels, samples, 44100, nullptr);
-  } catch (const std::exception& error) {
-    threw = true;
-    message = error.what();
-  }
-  REQUIRE(threw);
-  INFO("refusal message: " << message);
-  CHECK(message.find("resample") != std::string::npos);
-  CHECK(message.find("44100") != std::string::npos);
+  // A rate that does NOT match is RESAMPLED, which is what upstream does
+  // (`waveform_to_mel` calls `resample_audio` first, ops.py:49) and what this
+  // project refused to do until row LTX25-AUDIO-RESAMPLE (#2583).
+  //
+  // Section 8e's golden is the whole claim: the source is 600 samples at 44100,
+  // the processor targets 16000, and the mel that comes back is over the
+  // RESAMPLED 218 samples. A build that resampled after the transform, or that
+  // never resampled at all, produces a different frame count before it produces
+  // a different value, so the count is asserted first.
+  int64_t resampled_frames = 0;
+  const int64_t source_samples = vllm_test::kLtx2MelSourceSamples;
+  const std::vector<float> source =
+      Ltx2Input("ltx2.mel.resampled.input", channels * source_samples, 0.5);
+  const std::vector<float> resampled_mel = vllm::Ltx2WaveformToLogMel(
+      cfg, source, channels, source_samples, vllm_test::kLtx2MelSourceRate, &resampled_frames);
+  CHECK(resampled_frames == vllm_test::kLtx2MelResampledFrames);
+  REQUIRE(static_cast<int64_t>(resampled_mel.size()) ==
+          static_cast<int64_t>(std::size(vllm_test::kLtx2MelResampledGolden)));
+  const double resampled_err = MaxAbsDiff(resampled_mel, vllm_test::kLtx2MelResampledGolden,
+                                          std::size(vllm_test::kLtx2MelResampledGolden));
+  INFO("resampled waveform_to_mel max|diff| = " << resampled_err);
+  CHECK(resampled_err <= kLtx2GoldenTol);
+
+  // And it is NOT the mel of the same samples read as if they were already at
+  // the target rate — the exact wrong answer the old refusal existed to
+  // prevent, and the one a tolerance against the golden alone cannot see if the
+  // golden were ever regenerated from the wrong side.
+  const std::vector<float> misread =
+      vllm::Ltx2WaveformToLogMel(cfg, source, channels, source_samples,
+                                 cfg.target_sample_rate, nullptr);
+  CHECK(misread.size() != resampled_mel.size());
 }
 
 TEST_CASE("ltx2 vae: SILENCE saturates the mel log clamp, and the clamp is pinned") {

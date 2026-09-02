@@ -258,7 +258,78 @@ None. A19 depends on nothing in §8 of the plan; A3 and A18 depend on it.
 
 ## Now
 
-`ACTIVE`. Implementation in flight on `row/LTX25-AUDIO-RESAMPLE`, issue #2583.
+`DONE` pending review. Landed on `row/LTX25-AUDIO-RESAMPLE`, issue #2583.
+
+---
+
+## Outcome
+
+### What was measured, and what it decided
+
+**The dtype, which was the one decision this port could have got quietly wrong.**
+Three filters were built and compared against the pinned oracle's own
+`AudioProcessor.resample_audio` output at four rate pairs:
+
+| Filter built in | max abs diff vs the oracle |
+|---|---|
+| `double`, narrowed to `float` | **1.03e-05** |
+| torchaudio's own f64-internal path (`dtype=None`) | 4.71e-06 |
+| `float`, mirroring `dtype=waveform.dtype` | **1.79e-07** |
+
+The `double` filter is *more accurate than upstream* and therefore fifty-seven
+times further from it. It would have passed a gate written around it and read as
+a careful implementation. §4 states the chain that fixes the answer at f32, and
+the gate's 2.5e-07 is set so that a widening fails it.
+
+**The tolerance is twice the measured floor, not a hedge.** Setting
+`kResampleTol` to `0.0` reds three of the four arms, at 5.96e-08 (Up), 5.96e-08
+(Down) and 1.19e-07 (Wide). `Same` passes at zero, because it is a copy.
+
+**`audio_latent_absmax` cannot gate this, and that is a finding rather than a
+gap.** The obvious video-level claim — "the 44.1 kHz take must land nearer the
+24 kHz one than the mis-read take does" — was written, run, and **failed**: the
+three takes read 1.07194, 1.07293 and 1.07208, a 0.1% spread over three
+genuinely different waveforms, because the trace's absmax is dominated by the
+encoder's per-channel statistics. The assertion was removed rather than inverted
+or loosened, and the reason is recorded where the assertion was.
+
+### Red before, green after
+
+| | Before | After |
+|---|---|---|
+| `test_ltx2_vae -tc='*waveform_to_mel*'` | THREW the rate refusal at `ltx2_audio_vae.cpp:1053` | 48/48 cases, 3217/3217 assertions |
+| `test_ltx2_video -tc='*RESAMPLED*'` | THREW `'high.wav' is sampled at 44100 Hz ...` | 110/110 cases, 4870/4870 assertions |
+
+Both reds are the refusal itself, which is what the row exists to delete.
+
+### The reachability mutation, and what it proved
+
+Deleting the `Ltx2ResampleWaveform` call inside `Ltx2WaveformToLogMel` and
+rebuilding:
+
+* the video-level case reds on `high_trace.audio_latent_digest !=
+  misread_trace.audio_latent_digest` — the two takes carry **byte-identical PCM**
+  and differ only in the header's rate field, so they produce the same digest
+  (`18285287296143238670`) exactly when nothing read the rate;
+* the `waveform_to_mel` case reds on the frame count first (38 vs 14) and the mel
+  length second (608 vs 224);
+* **the section-8d unit case still PASSES.** That is the point of the mutation:
+  `Ltx2ResampleWaveform` works whether or not anything calls it, and a test that
+  constructs it by hand measures the class. The tree was restored byte-for-byte
+  (sha256 `88055b01e9c2bf0bb29d826b2c61dc4c8439a1d8ae6d779a46969b50b0c0212b`) and
+  both suites re-run green.
+
+### Rejected
+
+* **A `double` accumulator for the kernel** — §4, measured above.
+* **Porting `sinc_interp_kaiser`** — unreached from `ops.py:40`; it would be a
+  branch nothing can enter.
+* **Keeping `want_sample_rate` on `Ltx2DecodeAudioWav`** — upstream's decoder has
+  no target rate. The parameter existed only to raise, so it went with the raise.
+* **Guarding the resample at the call site** (`if (rate != target)`) rather than
+  inside `Ltx2ResampleWaveform` — it would have moved upstream's own early return
+  (`ops.py:38-39`) off the production path, leaving that arm reachable only from
+  a test.
 
 ---
 

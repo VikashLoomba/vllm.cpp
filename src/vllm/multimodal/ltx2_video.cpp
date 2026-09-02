@@ -3060,10 +3060,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
            "; it is a duration in seconds and must be positive");
     }
 
+    // No target rate: the decode runs at the FILE's rate and the mel front-end
+    // resamples (ops.py:44-49). See `Ltx2DecodeAudioWav`'s header.
     a2v_source = Ltx2DecodeAudioWav(
         ReadFileBytes(kLtx2AudioPathExtra, a2v_audio_path), a2v_audio_path,
-        im.audio_encoder_cfg.encoder.in_channels,
-        im.audio_encoder_cfg.processor.target_sample_rate, start_time, max_duration);
+        im.audio_encoder_cfg.encoder.in_channels, start_time, max_duration);
 
     const Ltx2AudioSpectrogram encoded = Ltx2EncodeAudioToLatent(
         im.audio_encoder_cfg.encoder, im.audio_encoder_cfg.processor, im.audio_encoder_weights,

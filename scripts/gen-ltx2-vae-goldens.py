@@ -17,7 +17,8 @@ Upstream sources (Lightricks/LTX-2, packages/ltx-core/src/ltx_core/):
   model/video_vae/conv_video_decoder.py -> section 5 (Conv video decoder)
   model/video_vae/video_vae.py          -> section 6 (VideoEncoder)
   model/audio_vae/audio_vae.py          -> section 7 (AudioEncoder)
-  model/audio_vae/ops.py                -> section 8 (AudioProcessor mel front-end)
+  model/audio_vae/ops.py                -> section 8 (AudioProcessor mel front-end,
+                                           and 8d/8e its RESAMPLER)
   conditioning/types/*.py               -> section 9 (the conditioning items)
 
 Usage:
@@ -1007,6 +1008,36 @@ AUDIO_GROUP_ENC = {**AUDIO_ENC, "ch": 32, "z_channels": 16}
 MEL = dict(target_sample_rate=16000, mel_bins=8, mel_hop_length=16, n_fft=64)
 MEL_SAMPLES = 200
 
+# Section 8d — `AudioProcessor.resample_audio` (ops.py:36-42). Four rate pairs,
+# each chosen for an ARM rather than for coverage arithmetic:
+#
+#   (Up)    16000 -> 48000, gcd 16000 => o = 1. The degenerate ratio the tree
+#           already ports for the vocoder's BWE stage, so a port that only
+#           handles this one still passes here and fails the next two.
+#   (Down)  48000 -> 16000, o = 3, n = 1. `width` is 19 and the kernel has ONE
+#           phase row, which is the transpose of the arm above.
+#   (Wide)  44100 -> 16000, gcd 100 => o = 441, n = 160, `width` 17. The widest
+#           kernel and the only pair here whose `t == 0` tap is not at an obvious
+#           index. This is also the pair a real 44.1 kHz take hits.
+#   (Same)  16000 -> 16000. `resample` returns the INPUT (functional.py:1473),
+#           and `resample_audio` returns before it is even called (ops.py:38-39).
+#           A port that filtered anyway would be wrong by the filter's own
+#           passband ripple — small enough to pass a loose tolerance.
+RESAMPLE_CASES = (
+    ("Up", 16000, 48000, 64),
+    ("Down", 48000, 16000, 192),
+    ("Wide", 44100, 16000, 600),
+    ("Same", 16000, 16000, 64),
+)
+RESAMPLE_CHANNELS = 2
+
+# Section 8e — `waveform_to_mel` at a rate the processor does NOT target, which
+# is the production shape: `resample_audio` runs first and the mel transform then
+# sees the RESAMPLED length (ops.py:44-49). 600 samples at 44100 resample to 218
+# at 16000, comfortably past the `n_fft // 2` reflect-pad floor.
+MEL_SOURCE_RATE = 44100
+MEL_SOURCE_SAMPLES = 600
+
 
 def section_video_encoder(out) -> None:
     import torch
@@ -1318,6 +1349,59 @@ def section_audio_mel(out) -> None:
     emit_scalar(out, "kLtx2MelQuietFrames", quiet.shape[2])
     out.write("\n")
     emit_f32(out, "kLtx2MelQuietGolden", quiet.numpy())
+
+    # --- 8d: resample_audio on its own, at four ratios (ops.py:36-42) ---
+    #
+    # Run through `AudioProcessor.resample_audio` rather than through
+    # `torchaudio.functional.resample` directly, so the goldens carry upstream's
+    # OWN call — its argument order, its equal-rate early return, and its
+    # `.to(dtype=waveform.dtype)` — and not this generator's reading of it.
+    out.write("// --- section 8d: AudioProcessor.resample_audio (ops.py:36-42) ---\n")
+    emit_scalar(out, "kLtx2ResampleChannels", RESAMPLE_CHANNELS)
+    for tag, orig, target, length in RESAMPLE_CASES:
+        wave = make_input(
+            f"ltx2.resample.{tag}", (1, RESAMPLE_CHANNELS, length), 0.5
+        )
+        proc = AudioProcessor(
+            target_sample_rate=target,
+            mel_bins=MEL["mel_bins"],
+            mel_hop_length=MEL["mel_hop_length"],
+            n_fft=MEL["n_fft"],
+        )
+        got = proc.resample_audio(Audio(waveform=wave, sampling_rate=orig))
+        assert got.sampling_rate == target
+        assert got.waveform.dtype == torch.float32, (
+            "upstream resamples in the WAVEFORM's dtype; a golden emitted from "
+            "anything but float32 would gate the wrong arithmetic"
+        )
+        if orig == target:
+            assert got.waveform.data_ptr() == wave.data_ptr(), (
+                "ops.py:38-39 returns the SAME Audio when the rates match; a "
+                "golden that went through the filter would not gate that branch"
+            )
+        assert float(got.waveform.abs().max()) > 0.0, "an all-zero golden gates nothing"
+        emit_scalar(out, f"kLtx2Resample{tag}OrigRate", orig)
+        emit_scalar(out, f"kLtx2Resample{tag}NewRate", target)
+        emit_scalar(out, f"kLtx2Resample{tag}InSamples", length)
+        emit_scalar(out, f"kLtx2Resample{tag}OutSamples", got.waveform.shape[-1])
+        emit_f32(out, f"kLtx2Resample{tag}Golden", got.waveform.numpy())
+
+    # --- 8e: waveform_to_mel THROUGH the resampler, the production shape ---
+    #
+    # 8d proves the filter; this proves the CALL. `waveform_to_mel` resamples
+    # first (ops.py:49) and the mel transform then runs on the resampled length,
+    # so a port that resampled AFTER the transform, or that padded before it,
+    # matches 8d exactly and fails here.
+    source = make_input("ltx2.mel.resampled.input", (1, 2, MEL_SOURCE_SAMPLES), 0.5)
+    resampled_mel = processor.waveform_to_mel(
+        Audio(waveform=source, sampling_rate=MEL_SOURCE_RATE)
+    )
+    out.write("// --- section 8e: waveform_to_mel at a NON-target rate (ops.py:44-55) ---\n")
+    emit_scalar(out, "kLtx2MelSourceRate", MEL_SOURCE_RATE)
+    emit_scalar(out, "kLtx2MelSourceSamples", MEL_SOURCE_SAMPLES)
+    emit_scalar(out, "kLtx2MelResampledFrames", resampled_mel.shape[2])
+    out.write("\n")
+    emit_f32(out, "kLtx2MelResampledGolden", resampled_mel.numpy())
 
 
 # ---------------------------------------------------------------------------

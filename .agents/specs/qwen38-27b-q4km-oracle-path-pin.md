@@ -204,3 +204,44 @@ and margin.
   arm that agrees with us.
 - A `PASS` obtained by choosing the denominator after the fact is not reportable
   under any circumstance.
+
+## Result, 2026-09-02
+
+rc job `8480a30e-0d6d-44a7-b1b4-00e9d36c888d`, `thor:gpu0`, worker
+`rc-worker-n8smh`. Evidence:
+[`docs/bench-evidence/qwen38-27b-q4km-oracle-path-pin-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-oracle-path-pin-20260902.md).
+All six controls green, including the instrument self-test and
+`F0_IDENTITY=EXACT`.
+
+**All three surviving steps landed on `C2`.** The oracle emits vllm.cpp's own
+token at `p1/34` (`norepack_tf`, `norepack_ub1_tf`), at `p2/20`
+(`norepack_ub1_tf`) and at `p4/14` (`ub1_tf`), on the identical artifact,
+prompts, token count and sampling. Per `## Pre-registered conclusions` those
+steps are AMBIGUOUS, they are not converted into passes, and the row returns
+**NEEDS_DECISION**.
+
+**`TOKEN_GATE=FAIL`, 3 of 6, under the denominator rule fixed at `8e499f68b`** --
+the outcome that rule was pre-registered to produce whatever the arms showed.
+
+**And the ambiguity does not become a pass under any other pinned path.** Of the
+ten paths measured, the best agrees with us at 3 of the 5 comparable near-tie
+steps, and the three that reach 3 of 5 fail on different pairs, so no single
+supported configuration is one this arm is token-exact against. Repinning to any
+of them moves divergences rather than removing them.
+
+**The thread-count control held.** `t1`, `t4` and `t13` are byte-identical to
+the 14-thread denominator across all 288 steps, as `## The levers` predicted from
+`repack.cpp:4317-4372` before the run. `ub4` is byte-identical too; `ub1` is not.
+
+**One fact the earlier records did not carry:** the denominator's resolved
+attention kernel is flash attention ENABLED. `faon_tf` is byte-identical to the
+`AUTO` default over all 288 steps and `faoff_tf` is not, so `AUTO` resolves to
+`ENABLED` on this host, and the 2026-08-23 gate ran that way.
+
+### Deviation from `## Gates`
+
+The worker container has lost `github.com` egress, so the pinned source is staged
+and its tree hash is RECOMPUTED on the worker with `git write-tree` against
+commit `10bf611e`'s own tree object `870465888f30ef3cc98279f6bfa5e41a17d17477`,
+before and after the build. That is a stronger assertion than the fetch it
+replaces, which only checked that a checkout claimed a name.

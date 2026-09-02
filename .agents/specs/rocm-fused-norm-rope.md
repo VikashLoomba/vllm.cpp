@@ -5,7 +5,7 @@ Issue: [#2564](https://github.com/mudler/vllm.cpp/issues/2564)
 
 ## Now
 
-`ACTIVE`. Base `4fe3852b119e40cda05c0fbcf64d3e2a4796ada2`.
+`ACTIVE`, measured. Base `4fe3852b119e40cda05c0fbcf64d3e2a4796ada2`.
 
 ## Scope
 
@@ -156,7 +156,73 @@ inspection.
 
 ## Evidence
 
-Recorded in `## Outcome` when the row reaches `DONE`.
+All on `strix:gpu0` (`gfx1151`, Radeon 8060S, ROCm `7.2.53211-97f5574fe2`),
+under `rc` leases, from tree `b413e323be50822dcbecb30bd61dc90333a416b5`. The
+tarball's sha256 was read on both the host and the worker and the two agree
+(`cf3841a4983b54b8b972ef06ba43f84034477a60358b984ad6a189ba4bf8210b`).
+
+**Build.** `ninja rc=0`. `[555/577] Building HIP object
+CMakeFiles/vllm.dir/src/vt/rocm/rocm_mla_fused_norm_rope.hip.o` -- the first
+compile this TU has ever had.
+
+**Gate 1, the focused numeric case** (job `6b35b8d3`): `1 test case | 1 passed |
+0 failed`, `20 assertions | 20 passed | 0 failed`.
+
+*The assertion count is the discriminator, not a grep of the trace.* `CAPTURE`
+prints only on failure, so grepping the passing run for `ROCM` returns 0 and
+proves nothing -- that instrument was useless and is recorded as such. The same
+binary's case on a CPU-only build with no accelerator registered runs **2**
+assertions. 20 vs 2 is the ROCm arm executing: five `Upload` REQUIREs, two
+`CHECK`s and two REQUIREs inside `Nmse`, per rope style.
+
+**Gate 2, GLM-5.3 e2e through the production entry point** (job `6b35b8d3`):
+`VT_CPU_MOE=1 VT_OP_PROVIDER_STATS=1 vllm-cli --model <derived shard 1>
+--device auto --prompt "The capital of France is" --max-tokens 4
+--temperature 0`, `LEG rc=0`,
+`prompt_tokens=5 completion_tokens=4 finish_reason=length`, stdout:
+
+```text
+ Paris, which is
+```
+
+`op=114 device=5 selected=vt-native` -- op 114 is `kFusedNormRope`, device 5 is
+`kROCM`. The mapping is cross-checked three ways against the run's own named
+lines: 29/`ConcatAndCacheMla`, 99/`ConcatMlaNopeRope`, 33/`MlaPrefillAttention`.
+
+**Five distinct ops served from the portable reference tier** in that run:
+`ConcatAndCacheMla`, `ConcatMlaNopeRope`, `MlaPrefillAttention`,
+`BatchedMatmul`, `MlaDecodeAttention`. `kFusedNormRope` is not among them.
+**No speed number is admissible and none is offered** (`docs/ROCM.md`).
+
+**Gate 3, the mutation ladder** (job `8b508c69`), each rebuilt and each restored
+before the next:
+
+| Mutation | Build | Result |
+|---|---|---|
+| M1: delete the `RegisterOp(kFusedNormRope, kROCM)` line | rc=0 | `LEG rc=1`, the #2564 throw reproduced verbatim. KILLED |
+| M2: drop the sin term from the rope half | rc=0 | `GATE1 rc=1`, `1 case failed`, `20 assertions | 18 passed | 2 failed`. KILLED |
+| restored control | rc=0 | `pre.sha == post.sha` byte-for-byte on both files; `GATE1 rc=0`, 1 case / 20 assertions |
+
+M1 is simultaneously the RED and the reachability proof. The mutated tree is
+behaviourally the base tree at the branch this change repairs, and deleting the
+production call site reds the production gate -- which is what
+`.agents/reachability.md` asks for and what a by-hand construction cannot show.
+Its throw also reads back the corrected message: *"The fused path was not taken
+because this backend (rocm) registers NO NATIVE vt::FusedNormRope kernel, and
+vt::OpRegistered is a native-only probe that cannot see the portable reference
+tier"*.
+
+**Full cross-device suite:** `29 test cases | 28 passed | 1 failed`,
+`80296 assertions | 80295 passed | 1 failed`. The one failure is
+`MoeSiluMul matches the CPU oracle`'s bit-exact bf16 `CHECK(got == ref_b)`,
+which is the standing red #1954 already tracks on `gfx1200`, now recorded on
+`gfx1151` too. This change adds one TU and one registration and touches no MoE
+path. It is **not** measured at the base commit on this board, so "pre-existing"
+is argued from the absence of code-path overlap rather than from an A/B.
+
+**Host-side control:** on a CPU-only build of the same tree,
+`test_mla_attention_block` runs 21 cases / 2,282,067 assertions green, and the
+whole cross-device suite runs 28 cases / 13 assertions green.
 
 ## Stop conditions
 

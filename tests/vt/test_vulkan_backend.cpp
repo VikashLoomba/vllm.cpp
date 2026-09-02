@@ -509,8 +509,8 @@ TEST_CASE("Vulkan platform is registered and reports unified/no-pool residency")
   }
   // MLA stays EMPTY, and that is a capability statement rather than a stub:
   // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla — and
-  // kConcatAndCacheDsMla, the fp8_ds_mla byte-page store (KV-DSV4-MULTICACHE W8,
-  // #2455) — have no Vulkan kernel, so naming a backend
+  // kConcatAndCacheDsMla / kDequantAndGatherDsMla, the fp8_ds_mla byte-page pair
+  // (KV-DSV4-MULTICACHE W8, #2455) — have no Vulkan kernel, so naming a backend
   // here would route an MLA model into one that cannot serve it. Selection must
   // fail loudly instead.
   {

@@ -1,8 +1,10 @@
-// vt::ConcatAndCacheDsMla unit tests — `KV-DSV4-MULTICACHE` W8 slice 2 (#2455).
+// vt::ConcatAndCacheDsMla / vt::DequantAndGatherDsMla unit tests —
+// `KV-DSV4-MULTICACHE` W8 slices 2 and 3 ([#2455]).
 //
-// Kernel under port, at the parity pin `5559679229` in
+// Kernels under port, at the parity pin `5559679229` in
 // `vllm/models/deepseek_v4/common/ops/cache_utils.py`:
 //   `quantize_and_insert_k_kernel`      `:36-159`  (host wrapper `:162-227`)
+//   `_dequantize_and_gather_k_kernel`   `:228-341` (host wrapper `:339-389`)
 //
 // GOLDEN STRATEGY, and why it is not a tolerance. This is INTEGER PACKING: every
 // byte the store writes is either an e4m3 code, a UE8M0 exponent byte, half a
@@ -21,9 +23,6 @@
 // ALL HOST-SIDE AND UNCONDITIONAL. There is no `HasCuda()` early return, so a
 // no-GPU run reports a real assertion count for every claim here rather than a
 // skip wearing a pass.
-//
-// The READ (`vt::DequantAndGatherDsMla`) is W8 slice 3 and lands next; its cases
-// join this file.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -36,6 +35,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
+using vllm::deepseek_v4::Fp8DsMlaDecodeToken;
 using vllm::deepseek_v4::Fp8DsMlaEncodeToken;
 using vllm::deepseek_v4::Fp8DsMlaLayout;
 using vllm::deepseek_v4::Fp8DsMlaPageLayout;
@@ -313,6 +313,173 @@ TEST_CASE("ds_mla store: the token count comes from slot_mapping, not from k") {
               static_cast<int>(kPoison));
 }
 
+TEST_CASE("ds_mla gather: store then read round-trips BIT-EXACTLY") {
+  const Fp8DsMlaLayout L = TokenLayout();
+  // Two requests whose sequences cross a block boundary, on a NON-identity block
+  // table: request 0 uses physical blocks {3, 1} and request 1 {0, 2}. An
+  // identity table would pass with the block-table lookup dropped entirely.
+  GuardedPage p = MakePage(/*num_blocks=*/4);
+  Tensor cache = p.View();
+
+  const int64_t seq = 70;  // > 64, so each request spans two blocks
+  const std::vector<std::vector<int32_t>> table = {{3, 1}, {0, 2}};
+  const int64_t num_reqs = 2;
+
+  std::vector<std::vector<float>> heads;   // [req][pos] latent
+  std::vector<std::vector<float>> rows;    // flattened k rows, in store order
+  std::vector<int64_t> slots;
+  for (int64_t b = 0; b < num_reqs; ++b) {
+    for (int64_t pos = 0; pos < seq; ++pos) {
+      std::vector<float> h = MakeLatent(b * 131 + pos + 1, L);
+      heads.push_back(h);
+      rows.push_back(h);
+      const int64_t phys = table[static_cast<size_t>(b)][static_cast<size_t>(pos / kStorageBlock)];
+      slots.push_back(phys * kStorageBlock + pos % kStorageBlock);
+    }
+  }
+  std::vector<float> kbuf;
+  Tensor k = MakeK(&kbuf, rows);
+  Tensor slot_t = Contig(slots.data(), DType::kI64, {static_cast<int64_t>(slots.size())});
+
+  Queue q = Q();
+  vt::ConcatAndCacheDsMla(q, k, cache, slot_t, kStorageBlock);
+  RequireGuardIntact(p);
+
+  std::vector<int32_t> flat_table;
+  for (const auto& r : table) flat_table.insert(flat_table.end(), r.begin(), r.end());
+  Tensor bt = Contig(flat_table.data(), DType::kI32, {num_reqs, 2});
+  std::vector<int32_t> seq_lens = {static_cast<int32_t>(seq), static_cast<int32_t>(seq)};
+  Tensor sl = Contig(seq_lens.data(), DType::kI32, {num_reqs});
+
+  const int64_t max_tokens = seq + 8;
+
+  SUBCASE("gather_lens == nullptr gathers the WHOLE sequence") {
+    // Upstream's `gather_lens_ptr is None` arm (`cache_utils.py:257-262`).
+    std::vector<float> out(static_cast<size_t>(num_reqs * max_tokens * 512), -1.0f);
+    Tensor o = Contig(out.data(), DType::kF32, {num_reqs, max_tokens, 512});
+    vt::DequantAndGatherDsMlaArgs args;
+    args.block_size = kStorageBlock;
+    args.offset = 0;
+    vt::DequantAndGatherDsMla(q, o, cache, sl, nullptr, bt, args);
+
+    for (int64_t b = 0; b < num_reqs; ++b) {
+      for (int64_t pos = 0; pos < seq; ++pos) {
+        CAPTURE(b);
+        CAPTURE(pos);
+        // EQUAL, not close. Both sides are an e4m3 table lookup times an integer
+        // exp2, so a tolerance here would accept a scale region read one byte off
+        // that happened to land on a neighbouring exponent.
+        const std::vector<float> want = Fp8DsMlaDecodeToken(
+            Fp8DsMlaEncodeToken(heads[static_cast<size_t>(b * seq + pos)], L), L);
+        const float* got = out.data() + (b * max_tokens + pos) * 512;
+        for (int64_t d = 0; d < 512; ++d) REQUIRE(got[d] == want[static_cast<size_t>(d)]);
+      }
+    }
+    // Columns past the gathered length are untouched.
+    for (int64_t b = 0; b < num_reqs; ++b)
+      for (int64_t pos = seq; pos < max_tokens; ++pos)
+        REQUIRE(out[static_cast<size_t>((b * max_tokens + pos) * 512)] == -1.0f);
+  }
+
+  SUBCASE("gather_lens + offset gather the TAIL into a shifted column") {
+    // `start_pos = seq_len - gather_len` (`:264`) and the output column
+    // `offset + i` (`:295-296`). A kernel that ignored `start_pos` would gather
+    // the sequence HEAD and still fill every column it was asked to.
+    const int64_t glen = 5;
+    const int64_t col_off = 3;
+    std::vector<int32_t> gl = {static_cast<int32_t>(glen), static_cast<int32_t>(glen)};
+    Tensor glt = Contig(gl.data(), DType::kI32, {num_reqs});
+    std::vector<float> out(static_cast<size_t>(num_reqs * max_tokens * 512), -1.0f);
+    Tensor o = Contig(out.data(), DType::kF32, {num_reqs, max_tokens, 512});
+    vt::DequantAndGatherDsMlaArgs args;
+    args.block_size = kStorageBlock;
+    args.offset = col_off;
+    vt::DequantAndGatherDsMla(q, o, cache, sl, &glt, bt, args);
+
+    for (int64_t b = 0; b < num_reqs; ++b) {
+      for (int64_t i = 0; i < glen; ++i) {
+        const int64_t pos = seq - glen + i;
+        CAPTURE(b);
+        CAPTURE(pos);
+        const std::vector<float> want = Fp8DsMlaDecodeToken(
+            Fp8DsMlaEncodeToken(heads[static_cast<size_t>(b * seq + pos)], L), L);
+        const float* got = out.data() + (b * max_tokens + col_off + i) * 512;
+        for (int64_t d = 0; d < 512; ++d) REQUIRE(got[d] == want[static_cast<size_t>(d)]);
+      }
+      // The columns BEFORE `offset` are untouched: `offset` is a write position,
+      // not a source position.
+      for (int64_t c = 0; c < col_off; ++c)
+        REQUIRE(out[static_cast<size_t>((b * max_tokens + c) * 512)] == -1.0f);
+    }
+  }
+
+  SUBCASE("a bf16 out is upstream's own store, bit for bit") {
+    // Upstream's `out` is bf16 (`:328`, `:337`). The f32 arm above is the
+    // annotated widening — the same value BEFORE this rounding.
+    std::vector<uint16_t> out(static_cast<size_t>(num_reqs * max_tokens * 512), 0);
+    Tensor o = Contig(out.data(), DType::kBF16, {num_reqs, max_tokens, 512});
+    vt::DequantAndGatherDsMlaArgs args;
+    args.block_size = kStorageBlock;
+    vt::DequantAndGatherDsMla(q, o, cache, sl, nullptr, bt, args);
+    for (int64_t b = 0; b < num_reqs; ++b) {
+      for (int64_t pos = 0; pos < seq; pos += 17) {
+        const std::vector<float> want = Fp8DsMlaDecodeToken(
+            Fp8DsMlaEncodeToken(heads[static_cast<size_t>(b * seq + pos)], L), L);
+        const uint16_t* got = out.data() + (b * max_tokens + pos) * 512;
+        for (int64_t d = 0; d < 512; ++d)
+          REQUIRE(got[d] == vt::F32ToBF16(want[static_cast<size_t>(d)]));
+      }
+    }
+  }
+}
+
+TEST_CASE("ds_mla gather: the 8th scale byte is written and NEVER read") {
+  // The asymmetry is upstream's: the store writes `scale_dim == 8`
+  // (`cache_utils.py:148-149`), the gather consumes `n_quant_blocks == 7`
+  // (`:385`). Corrupting the pad byte after the store must change NOTHING the
+  // read produces. A read that consumed 8 blocks would fail here, and would also
+  // be reading past the seven exponents the encoder actually produced.
+  const Fp8DsMlaLayout L = TokenLayout();
+  GuardedPage p = MakePage(/*num_blocks=*/1);
+  Tensor cache = p.View();
+
+  std::vector<std::vector<float>> rows;
+  std::vector<int64_t> slots;
+  for (int64_t pos = 0; pos < 4; ++pos) {
+    rows.push_back(MakeLatent(pos + 21, L));
+    slots.push_back(pos);
+  }
+  std::vector<float> kbuf;
+  Tensor k = MakeK(&kbuf, rows);
+  Tensor slot_t = Contig(slots.data(), DType::kI64, {4});
+  Queue q = Q();
+  vt::ConcatAndCacheDsMla(q, k, cache, slot_t, kStorageBlock);
+
+  std::vector<int32_t> bt_v = {0};
+  Tensor bt = Contig(bt_v.data(), DType::kI32, {1, 1});
+  std::vector<int32_t> sl_v = {4};
+  Tensor sl = Contig(sl_v.data(), DType::kI32, {1});
+  vt::DequantAndGatherDsMlaArgs args;
+  args.block_size = kStorageBlock;
+
+  std::vector<float> before(static_cast<size_t>(4 * 512), 0.0f);
+  Tensor ob = Contig(before.data(), DType::kF32, {1, 4, 512});
+  vt::DequantAndGatherDsMla(q, ob, cache, sl, nullptr, bt, args);
+
+  // Scribble on every token's pad byte only.
+  for (int64_t pos = 0; pos < 4; ++pos) {
+    uint8_t* sc = const_cast<uint8_t*>(p.Block(0)) + p.page.scale_region_offset +
+                  pos * vt::kFp8DsMlaScaleDim;
+    REQUIRE(static_cast<int>(sc[7]) == 0);
+    sc[7] = 0xFF;
+  }
+
+  std::vector<float> after(static_cast<size_t>(4 * 512), 0.0f);
+  Tensor oa = Contig(after.data(), DType::kF32, {1, 4, 512});
+  vt::DequantAndGatherDsMla(q, oa, cache, sl, nullptr, bt, args);
+  for (size_t i = 0; i < before.size(); ++i) REQUIRE(before[i] == after[i]);
+}
+
 TEST_CASE("ds_mla: the byte page is REFUSED anything it cannot be") {
   const Fp8DsMlaLayout L = TokenLayout();
   GuardedPage p = MakePage(/*num_blocks=*/2);
@@ -354,5 +521,31 @@ TEST_CASE("ds_mla: the byte page is REFUSED anything it cannot be") {
     Tensor kvc = Contig(kbuf.data(), DType::kF32, {1, 448});
     Tensor kpe = Contig(kbuf.data(), DType::kF32, {1, 64});
     CHECK_THROWS_AS(vt::ConcatAndCacheMla(q, kvc, kpe, cache, slot_t), std::runtime_error);
+  }
+  {  // The gather's out must be the 512-wide latent scratch.
+    std::vector<float> out(static_cast<size_t>(4 * 576), 0.0f);
+    Tensor bad = Contig(out.data(), DType::kF32, {1, 4, 576});
+    Tensor cache = p.View();
+    std::vector<int32_t> bt_v = {0};
+    Tensor bt = Contig(bt_v.data(), DType::kI32, {1, 1});
+    std::vector<int32_t> sl_v = {4};
+    Tensor sl = Contig(sl_v.data(), DType::kI32, {1});
+    vt::DequantAndGatherDsMlaArgs args;
+    args.block_size = kStorageBlock;
+    CHECK_THROWS_AS(vt::DequantAndGatherDsMla(q, bad, cache, sl, nullptr, bt, args),
+                    std::runtime_error);
+  }
+  {  // A sequence longer than its block table is a caller bug, not a wrap.
+    std::vector<float> out(static_cast<size_t>(200 * 512), 0.0f);
+    Tensor o = Contig(out.data(), DType::kF32, {1, 200, 512});
+    Tensor cache = p.View();
+    std::vector<int32_t> bt_v = {0};
+    Tensor bt = Contig(bt_v.data(), DType::kI32, {1, 1});
+    std::vector<int32_t> sl_v = {130};
+    Tensor sl = Contig(sl_v.data(), DType::kI32, {1});
+    vt::DequantAndGatherDsMlaArgs args;
+    args.block_size = kStorageBlock;
+    CHECK_THROWS_AS(vt::DequantAndGatherDsMla(q, o, cache, sl, nullptr, bt, args),
+                    std::runtime_error);
   }
 }

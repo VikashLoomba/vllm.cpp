@@ -88,8 +88,9 @@ class VulkanPlatform final : public Platform {
   //
   // MLA still returns EMPTY, and that is not a stub: MLA needs
   // kMlaDecodeAttention / kMlaPrefillAttention / kConcatAndCacheMla — and, for
-  // DeepSeek-V4's fp8_ds_mla byte page, kConcatAndCacheDsMla
-  // (KV-DSV4-MULTICACHE W8, #2455) — none of which has a Vulkan kernel. Answering FLASH_ATTN there would route an MLA model into a
+  // DeepSeek-V4's fp8_ds_mla byte page, kConcatAndCacheDsMla /
+  // kDequantAndGatherDsMla (KV-DSV4-MULTICACHE W8, #2455) — none of which has a
+  // Vulkan kernel. Answering FLASH_ATTN there would route an MLA model into a
   // backend that cannot serve it.
   std::vector<std::string> get_attn_backend_priority(
       const AttnSelectorConfig& cfg) const override {

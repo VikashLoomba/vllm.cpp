@@ -127,6 +127,7 @@ enum class OpId : uint8_t {
   // `quantize_and_insert_k_kernel` (`:36-159`) and
   // `_dequantize_and_gather_k_kernel` (`:228-341`).
   kConcatAndCacheDsMla,
+  kDequantAndGatherDsMla,
   kMlaDecodeAttention,
   kMlaPrefillAttention,
   // The DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699). The
@@ -2492,6 +2493,18 @@ inline constexpr int64_t kFp8DsMlaTokenDataSize =
 inline constexpr int64_t kFp8DsMlaTokenBytes =
     kFp8DsMlaTokenDataSize + kFp8DsMlaScaleDim;
 
+// The fp8_ds_mla paged K-cache READ (W8 slice 3). Mirrors the two non-tensor
+// arguments of `dequantize_and_gather_k_cache_triton` (`cache_utils.py:339-389`).
+struct DequantAndGatherDsMlaArgs {
+  // `cache_block_size` (`:379`): STORAGE rows per block, i.e. the spec's
+  // `storage_block_size()` = `block_size / compress_ratio`. It is an argument
+  // and not a shape because the page is rank-2 bytes.
+  int64_t block_size = 0;
+  // `offset` (`:369`): the first output COLUMN this gather writes, so a caller
+  // can concatenate several gathers into one scratch row.
+  int64_t offset = 0;
+};
+
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 // fp8 KV-cache store (KV-FP8 W1). k_cache/v_cache are 1-byte fp8 (DType::kI8);
@@ -2510,6 +2523,12 @@ using ConcatAndCacheMlaFn =
 // per block, which a rank-2 page cannot carry in its own shape.
 using ConcatAndCacheDsMlaFn =
     void (*)(Queue&, const Tensor&, Tensor&, const Tensor&, int64_t);
+using DequantAndGatherDsMlaFn = void (*)(Queue&, Tensor& /*out*/,
+                                         const Tensor& /*kv_cache*/,
+                                         const Tensor& /*seq_lens*/,
+                                         const Tensor* /*gather_lens*/,
+                                         const Tensor& /*block_table*/,
+                                         const DequantAndGatherDsMlaArgs&);
 using MlaDecodeAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
                                       const Tensor&, const Tensor&,
                                       const MlaDecodeAttentionArgs&);
@@ -4936,6 +4955,45 @@ void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor&
 // padding (`:63`).
 void ConcatAndCacheDsMla(Queue& q, const Tensor& k, Tensor& kv_cache,
                          const Tensor& slot_mapping, int64_t block_size);
+
+// READ — `dequantize_and_gather_k_cache_triton` /
+// `_dequantize_and_gather_k_kernel` (`cache_utils.py:228-341` kernel,
+// `:339-389` host wrapper).
+//
+// A GATHER into a float scratch, not a fused fp8 attention. Upstream splits the
+// same way: its prefill dequant-gathers (`nvidia/flashmla.py:296`) while its
+// decode hands the packed page to a vendor kernel (`:219-226`) we do not have.
+// The scratch costs `seq_len * 512 * sizeof(out dtype)` per layer per step,
+// which is why the native fp8 decode is a later wave.
+//
+//   out          [num_reqs, max_num_tokens, 512] f32 or bf16
+//   kv_cache     [num_blocks, block_bytes] DType::kI8
+//   seq_lens     [num_reqs] i32
+//   gather_lens  [num_reqs] i32 or nullptr. nullptr is upstream's
+//                `gather_lens_ptr is None` arm: gather the WHOLE sequence
+//                (`:257-262`).
+//   block_table  [num_reqs, max_blocks_per_seq] i32
+//
+// For request b it walks `pos` in `[seq_len - gather_len, seq_len)` and writes
+// row `offset + i` of `out[b]` (`:263-296`).
+//
+// THE ASYMMETRY, and it is upstream's: the store writes `scale_dim == 8` scale
+// bytes and this read consumes `n_quant_blocks == 7` (`:385`). The 8th byte is
+// written and never read. Do not "tidy" the store's pad byte away — upstream
+// stores it explicitly so the page holds 0 there rather than whatever it held
+// before, and a later native-fp8 kernel reading 8 blocks would then read stale
+// bytes instead of a zero.
+//
+// DTYPE. Upstream's `out` is bf16 (`:328`, `:337`) and a bf16 `out` here is
+// bit-identical to it. An f32 `out` stores the dequantized value BEFORE that
+// final bf16 rounding — annotated per AGENTS.md rather than left to be found:
+// it is not a widened model buffer but a scratch whose dtype must equal the
+// query dtype that `vt::MlaDecodeAttention` will consume it with, and our CPU
+// MLA decode runs at f32.
+void DequantAndGatherDsMla(Queue& q, Tensor& out, const Tensor& kv_cache,
+                           const Tensor& seq_lens, const Tensor* gather_lens,
+                           const Tensor& block_table,
+                           const DequantAndGatherDsMlaArgs& args);
 
 // --- MLA decode attention (MLA campaign W4) ---------------------------------
 // The MQA decode half of Multi-head Latent Attention: every one of the Hq query

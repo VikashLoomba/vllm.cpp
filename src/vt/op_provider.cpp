@@ -340,6 +340,8 @@ const char* OpNameImpl(OpId op) {
       return "ConcatAndCacheMla";
     case OpId::kConcatAndCacheDsMla:
       return "ConcatAndCacheDsMla";
+    case OpId::kDequantAndGatherDsMla:
+      return "DequantAndGatherDsMla";
     case OpId::kMlaDecodeAttention:
       return "MlaDecodeAttention";
     case OpId::kMlaPrefillAttention:

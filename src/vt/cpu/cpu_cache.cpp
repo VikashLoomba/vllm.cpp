@@ -253,6 +253,61 @@ void ConcatAndCacheDsMlaKernel(Queue&, const Tensor& k, Tensor& kv_cache,
   }
 }
 
+// `_dequantize_and_gather_k_kernel` (`cache_utils.py:228-341`), the (batch,
+// worker) grid collapsed to one serial walk per request.
+void DequantAndGatherDsMlaKernel(Queue&, Tensor& out, const Tensor& kv_cache,
+                                 const Tensor& seq_lens, const Tensor* gather_lens,
+                                 const Tensor& block_table,
+                                 const DequantAndGatherDsMlaArgs& args) {
+  const vllm::deepseek_v4::Fp8DsMlaLayout& L = DsMlaTokenLayout();
+  const vllm::deepseek_v4::Fp8DsMlaPageLayout page =
+      vllm::deepseek_v4::MakeFp8DsMlaPageLayout(L, args.block_size);
+  const int64_t num_reqs = out.shape[0];
+  const int64_t max_blocks_per_seq = block_table.shape[1];
+  const int64_t block_stride = kv_cache.stride[0];  // `:388`
+  const auto* base = kv_cache.Ptr<uint8_t>();
+  const int32_t* lens = seq_lens.Ptr<int32_t>();
+  const int32_t* glens = gather_lens != nullptr ? gather_lens->Ptr<int32_t>() : nullptr;
+  const int32_t* table = block_table.Ptr<int32_t>();
+
+  for (int64_t b = 0; b < num_reqs; ++b) {
+    const int64_t seq_len = lens[b];
+    // `gather_lens_ptr is None` gathers the whole sequence (`:257-262`).
+    const int64_t gather_len = glens != nullptr ? glens[b] : seq_len;
+    const int64_t start_pos = seq_len - gather_len;  // `:264`
+    VT_CHECK(gather_len >= 0 && start_pos >= 0,
+             "dequant_and_gather_ds_mla: gather_len must be in [0, seq_len]");
+    VT_CHECK(args.offset + gather_len <= out.shape[1],
+             "dequant_and_gather_ds_mla: offset + gather_len overruns out");
+    for (int64_t i = 0; i < gather_len; ++i) {
+      const int64_t pos = start_pos + i;                        // `:268`
+      const int64_t block_in_seq = pos / args.block_size;       // `:271`
+      const int64_t pos_in_block = pos % args.block_size;       // `:272`
+      VT_CHECK(block_in_seq < max_blocks_per_seq,
+               "dequant_and_gather_ds_mla: seq_len exceeds the block table");
+      // `block_table_ptr + batch_idx * max_blocks_per_seq` (`:275-276`).
+      const int64_t physical_block = table[b * block_table.stride[0] + block_in_seq];
+      VT_CHECK(physical_block >= 0 && physical_block < kv_cache.shape[0],
+               "dequant_and_gather_ds_mla: block table entry out of range");
+      // The read consumes n_quant_blocks = 7 (`:385`), one FEWER than the store
+      // writes; `Fp8DsMlaLoadToken` drops the pad byte exactly as the gather does.
+      const std::vector<float> latent = vllm::deepseek_v4::Fp8DsMlaDecodeToken(
+          vllm::deepseek_v4::Fp8DsMlaLoadToken(base + physical_block * block_stride,
+                                               page, pos_in_block),
+          L);
+      // `out_ptr + batch_idx*out_stride0 + (offset + i)*out_stride1` (`:295-296`).
+      const int64_t row = b * out.stride[0] + (args.offset + i) * out.stride[1];
+      if (out.dtype == DType::kF32) {
+        std::memcpy(out.Ptr<float>() + row, latent.data(),
+                    latent.size() * sizeof(float));
+      } else {
+        uint16_t* dst = out.Ptr<uint16_t>() + row;
+        for (size_t d = 0; d < latent.size(); ++d) dst[d] = F32ToBF16(latent[d]);
+      }
+    }
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kCPU,
@@ -266,6 +321,9 @@ struct Registrar {
     RegisterOp(OpId::kConcatAndCacheDsMla, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<ConcatAndCacheDsMlaFn>(&ConcatAndCacheDsMlaKernel)));
+    RegisterOp(OpId::kDequantAndGatherDsMla, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<DequantAndGatherDsMlaFn>(&DequantAndGatherDsMlaKernel)));
   }
 } registrar;
 

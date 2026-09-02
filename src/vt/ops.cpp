@@ -4158,6 +4158,61 @@ void ConcatAndCacheDsMla(Queue& q, const Tensor& k, Tensor& kv_cache,
                                                         block_size);
 }
 
+void DequantAndGatherDsMla(Queue& q, Tensor& out, const Tensor& kv_cache,
+                           const Tensor& seq_lens, const Tensor* gather_lens,
+                           const Tensor& block_table,
+                           const DequantAndGatherDsMlaArgs& args) {
+  VT_CHECK(out.rank == 3 && out.shape[2] == kFp8DsMlaInputDim,
+           "dequant_and_gather_ds_mla: out must be rank-3 "
+           "[num_reqs, max_num_tokens, 512]");
+  // Upstream stores bf16 (`cache_utils.py:328`, `:337`). f32 is the annotated
+  // widening: the scratch dtype must equal the query dtype the following
+  // vt::MlaDecodeAttention runs at, and our CPU MLA decode runs at f32.
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "dequant_and_gather_ds_mla: out must be f32 or bf16 (bf16 mirrors "
+           "upstream exactly; f32 is the scratch dtype our CPU MLA decode consumes)");
+  VT_CHECK(kv_cache.rank == 2 && kv_cache.dtype == DType::kI8,
+           "dequant_and_gather_ds_mla: kv_cache must be rank-2 "
+           "[num_blocks, block_bytes] DType::kI8 — the REGION-SPLIT byte page");
+  VT_CHECK(seq_lens.rank == 1 && seq_lens.dtype == DType::kI32,
+           "dequant_and_gather_ds_mla: seq_lens must be rank-1 [num_reqs] i32");
+  VT_CHECK(block_table.rank == 2 && block_table.dtype == DType::kI32,
+           "dequant_and_gather_ds_mla: block_table must be rank-2 "
+           "[num_reqs, max_blocks_per_seq] i32");
+  const int64_t num_reqs = out.shape[0];
+  VT_CHECK(num_reqs > 0, "dequant_and_gather_ds_mla: num_reqs must be > 0");
+  VT_CHECK(seq_lens.shape[0] == num_reqs && block_table.shape[0] == num_reqs,
+           "dequant_and_gather_ds_mla: seq_lens/block_table must have num_reqs rows");
+  // nullptr is upstream's `gather_lens_ptr is None` arm — gather the WHOLE
+  // sequence (`:257-262`) — and NOT an error.
+  if (gather_lens != nullptr) {
+    VT_CHECK(gather_lens->rank == 1 && gather_lens->dtype == DType::kI32 &&
+                 gather_lens->shape[0] == num_reqs,
+             "dequant_and_gather_ds_mla: gather_lens must be rank-1 [num_reqs] i32");
+    VT_CHECK(gather_lens->IsContiguous() && gather_lens->device == q.device,
+             "dequant_and_gather_ds_mla: gather_lens must be contiguous and on the "
+             "queue's device");
+  }
+  VT_CHECK(args.block_size > 0,
+           "dequant_and_gather_ds_mla: args.block_size must be > 0 (the STORAGE "
+           "block size, block_size / compress_ratio)");
+  VT_CHECK(args.offset >= 0 && args.offset < out.shape[1],
+           "dequant_and_gather_ds_mla: args.offset must index a column of out");
+  VT_CHECK(kv_cache.shape[1] >= args.block_size * kFp8DsMlaTokenBytes,
+           "dequant_and_gather_ds_mla: kv_cache row must hold block_size * 584 bytes");
+  VT_CHECK(out.stride[2] == 1 && kv_cache.stride[1] == 1 && block_table.stride[1] == 1 &&
+               seq_lens.IsContiguous(),
+           "dequant_and_gather_ds_mla: out/kv_cache/block_table innermost stride must "
+           "be 1 and seq_lens contiguous");
+  VT_CHECK(out.device == q.device && kv_cache.device == q.device &&
+               seq_lens.device == q.device && block_table.device == q.device,
+           "dequant_and_gather_ds_mla: device mismatch "
+           "(out/kv_cache/seq_lens/block_table/queue)");
+  reinterpret_cast<DequantAndGatherDsMlaFn>(
+      GetOp(OpId::kDequantAndGatherDsMla, q.device.type))(q, out, kv_cache, seq_lens,
+                                                          gather_lens, block_table, args);
+}
+
 void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
                         const Tensor& kv_cache, const Tensor& block_table,
                         const Tensor& seq_lens, const MlaDecodeAttentionArgs& args) {

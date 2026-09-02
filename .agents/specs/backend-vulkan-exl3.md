@@ -311,6 +311,135 @@ is a skip wearing a pass and this family has paid for that once already.
   because the correctness claim does not need one and a throughput claim was
   not offered.
 
+## Evidence
+
+Dev box, `llvmpipe` (`mesa-vulkan-drivers`, `/usr/share/vulkan/icd.d/lvp_icd.json`),
+no GPU and no `rc` lease. Build: `cmake -S . -B build -G Ninja
+-DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_VULKAN=ON -DVLLM_CPP_CUDA=OFF`,
+GCC 13.3.0, `-Werror` clean.
+
+**The focused gate.**
+
+```text
+$ ctest --test-dir build -R '^test_exl3_vulkan$' --output-on-failure
+1/1 Test #504: test_exl3_vulkan ................. Passed 0.47 sec
+100% tests passed, 0 tests failed out of 1
+
+[doctest] test cases:  8 |  8 passed | 0 failed | 0 skipped
+[doctest] assertions: 47 | 47 passed | 0 failed |
+```
+
+BYTE-EXACT ON THE FIRST DEVICE RUN, `first differing byte = -1` on every arm:
+
+| bits, cb | m | C | what it is | first differing byte |
+|---|---|---|---|---|
+| 3, 0 | 1 | f16 | a stock exl3 body at the shape a decode step has | -1 |
+| 3, 0 | 20 | f16 | three row-blocks, the last one PARTIAL | -1 |
+| 6, 0 | 3 | f16 | a stock exl3 lm_head | -1 |
+| 3, 1 | 3 | f16 | the SparkInfer DeepSeek-V4 marker | -1 |
+| 3, 1 | 3 | f32 | the same, into upstream's `c_fp32` arm | -1 |
+| 4, 2 | 3 | f16 | the Qwen3.8-27B mul1 body, 270 of its 272 tensors | -1 |
+| 5, 2 | 3 | f16 | its 5-bit tensor, and all 36 of the draft | -1 |
+| 6, 2 | 3 | f16 | its mul1 lm_head | -1 |
+
+**BEFORE and AFTER, the same probe and the same shape** (`k = n = 2048`, 3-bit,
+codebook 0, `m = 1`), under `VT_OP_PROVIDER_STATS=1`:
+
+| | provider for `CastF16` / `Exl3Gemm` on `device=vulkan` | reference-tier delta |
+|---|---|---|
+| before | `vt-cpu-ref priority=-1000`, twice | **2** |
+| after | `vt-native priority=0`, twice | **0** |
+
+and the AFTER run is byte-identical to the CPU arm at that 2048x2048 shape too
+(`first differing f16 word: -1`), which is 64x the elements the suite's own cases
+cover.
+
+**The wider suites that this change can move**, all green:
+`test_exl3_vulkan`, `test_vulkan_backend` (35 cases / 2140 assertions),
+`test_backend_cross_device`, `test_exl3_gemm`, `test_exl3_gemv`, `test_exl3_moe`,
+`test_exl3_dequant`, `test_exl3_rocm`, `test_cast_f16` — 9/9.
+
+**SPIR-V regeneration.** `gen-vulkan-spirv.py --check` printed
+`committed SPIR-V is up to date` on the UNMODIFIED tree under the pinned glslang
+16.5.0 BEFORE anything was added, so the regeneration's diff is +948 / -0 and
+every pre-existing module is byte-identical. `--check` is green again after.
+
+### Mutations
+
+Each restored byte-for-byte (sha256 verified), each rebuilt with the test
+binary's mtime asserted to have MOVED, and a build failure treated as NOT a
+result. Baseline is 8 cases / 47 assertions, all passing.
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `kCastF16` `RegisterOp` deleted | **RED** 7/1 cases, 44 assertions, 1 failed |
+| M2 | `kExl3Gemm` `RegisterOp` deleted | **RED** 7/1 cases, 14 assertions, 1 failed |
+| M3 | codebook-0 multiplier `89226354u` -> `...5u` | **RED** 4/4 cases, 8 failed |
+| M4 | tail-biting wrap `i1 % words32` -> `i1` | **RED** 3/5 cases, 16 failed |
+| M5 | Hadamard level-2 butterfly `s0 - s1` -> `s1 - s0` | **RED** 3/5 cases, 16 failed |
+| M6 | `precise` removed from the GEMM accumulator | **GREEN — see below** |
+| M7 | the host's `if (xv == 0.0) continue` removed | **GREEN — see below** |
+| M8 | the step-1 PRODUCTION CALL SITE deleted | **RED** 3/5 cases, 16 failed |
+
+M1 and M2 red through the REGISTRATION case only; with the op unregistered the
+byte cases skip honestly, which is correct — the op cannot run at all — and is
+why those cases exist separately.
+
+**M6 and M7 are honest negatives and are reported as such rather than dropped.**
+
+- **M6.** Removing `precise` does not move a byte on `llvmpipe`, because
+  `llvmpipe` does not contract the multiply-add. The qualifier is therefore
+  DEFENSIVE against a driver that does, and this gate CANNOT demonstrate its
+  necessity. It stays, because the host build sets `-ffp-contract=off` for the
+  identical reason and a driver that contracts would break the byte claim on
+  hardware this row cannot reach. Nobody should read the byte gate as proof that
+  the arm is contraction-safe on a real GPU.
+- **M7.** Removing the zero guard does not move a byte either, and the reason is
+  analytic rather than lucky: the guard only matters when `acc` is already `-0.0`
+  and a `+0.0` product is added, `acc` starts at `+0.0`, and f32 addition yields
+  `-0.0` only from `(-0.0) + (-0.0)`. The fixture's `a_had` contains no exact
+  zeros, so the discriminating value never occurs. The guard is kept because it is
+  what the host does, not because this suite proves it.
+
 ## Outcome
 
-Recorded on completion; see §Evidence.
+**What was measured.** #2530's first slice, which asked whether EXL3 runs on a
+Vulkan queue at all. It does, entirely on the host, at exactly two reference-tier
+ops — the same two #2433 found on ROCm. After this row, zero.
+
+**What was rejected, and why.**
+
+- *Porting `cuda_exl3.cu`.* Rejected on geometry before instruction support:
+  90 KiB of shared memory against a 16 KiB Vulkan guarantee. `mma.sync`,
+  `ldmatrix`, `cp.async` and the grid-wide barrier are three further independent
+  blockers and none of them had to be reached.
+- *Decoding to an f32 weight buffer and reusing the existing `kMatmulBT`
+  pipeline*, which is what #2530 proposed for this slice. Rejected for two
+  reasons. It materialises the full `[k, n]` f32 weight — 32 MiB for one real
+  projection — which is the exact thing the CPU reference refuses to do and the
+  reason EXL3 exists. And `vt_matmul`'s accumulation order is its own, so the
+  gate would have had to be a tolerance. Decoding inside the GEMM keeps the
+  host's loop nest and buys byte equality instead, at no extra complexity: the
+  shader is shorter than the two it would have replaced.
+- *A 256-invocation workgroup*, which the ROCm arm uses. Rejected because 128 is
+  the Vulkan-GUARANTEED `maxComputeWorkGroupInvocations`; 256 would need a device
+  probe and a second module for the fallback, to buy speed this row does not
+  claim.
+- *Registering `kExl3HadR128`.* The shader exists and the registration is one
+  line, but no dense forward path calls the op. Left owed, and the suite asserts
+  the absence so it reads as a decision.
+
+**Why each default has its value.**
+
+- `kExl3InvSqrt128 = 0.088388347648f` is upstream's literal (`hadamard.cu:107`),
+  never a recomputed `1/sqrt(128)`, because the two can differ in the last f32
+  bit and that bit is the byte gate.
+- The workgroup count for the Hadamard is capped at 65535, the Vulkan-guaranteed
+  `maxComputeWorkGroupCount[0]`. It is a performance choice only, because the
+  shader carries a grid-stride loop.
+- The `raw` scratch is grow-only and process-wide, and the batch is FLUSHED
+  before a grow frees the previous buffer: dispatches are batched, so the old
+  buffer may still be bound by work that has not executed.
+- Each GEMM operand is bound through the ONE view it uses. Declaring an unused
+  second view would let glslang strip it, and the generator reports that as a
+  binding HOLE — a loud failure, but an avoidable one.

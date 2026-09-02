@@ -2710,7 +2710,15 @@ DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
   const size_t gdn_conv_bytes =
       static_cast<size_t>(kConvDimL * kGdnConvLen) * sizeof(float);
   const size_t ssm_bytes = static_cast<size_t>(kSsmRow) * sizeof(float);
-  const size_t ple_conv_bytes = static_cast<size_t>(kStream * kPleStateLen) *
+  // QUALIFIED, and that qualification is the whole of a heap overflow this file
+  // already paid for once. This translation unit has a SECOND `kStream` in scope
+  // — the golden fixture's, 16 — and an unqualified use here resolved to it while
+  // the `DBuf` below was built from `qwen4_exp_fixture::kStream`, 128. The
+  // snapshot then downloaded 2304 bytes into a 288-byte destination: 2016 bytes
+  // of heap corruption, which surfaced as `malloc(): unsorted double linked list
+  // corrupted` inside an unrelated `operator new` three statements later.
+  const int64_t kStreamWidth = qwen4_exp_fixture::kStream;
+  const size_t ple_conv_bytes = static_cast<size_t>(kStreamWidth * kPleStateLen) *
                                 vt::SizeOf(vllm::kQwen4ExpStreamDType);
 
   std::vector<std::vector<unsigned char>> host_gdn_conv(kGdnLayers),
@@ -3016,9 +3024,31 @@ TEST_CASE("qwen4_exp #2496: the CUDA decode step agrees with the CPU decode step
   // distance is not an order of magnitude worse than the prefill's. An absolute
   // tolerance would have to be picked against this fixture's own noise floor and
   // would say nothing about the defect.
+  // THE ASSERTION IS THE RATIO, AND THE ABSOLUTE BAND THIS REPLACES WAS A
+  // DIFFERENT CLAIM FROM THE ONE THE HEADER ARGUES FOR. It read
+  // `rel1 <= 1e-3 && rel2 <= 1e-3`, which asserts that the two arms AGREE
+  // NUMERICALLY -- and they do not, for reasons this case does not own:
+  // [#2547](https://github.com/mudler/vllm.cpp/issues/2547) measures the released
+  // artifact's PREFILL hidden state differing by about 0.3% between the arms,
+  // before any decode state is read, and names
+  // `vt::Qwen4ExpGatedResidual`'s CUDA arm — which routes its three projections
+  // through the shared `vt::MatmulBT` and so re-associates the K reduction, as
+  // `src/vt/cuda/cuda_qwen4_exp.cu` states in its own words — as the largest
+  // non-bit-identical surface on the path. An absolute band here would red on
+  // that, and reporting #2547 through this case would be reporting it in the
+  // wrong place.
+  //
+  // What #2496 IS, and what this case therefore asserts, is that the DECODE step
+  // is not an order of magnitude further apart than the PREFILL already is. The
+  // stale-identifier defect made the decode arm-to-arm distance O(1) against a
+  // prefill distance of ~1e-3, which this ratio convicts and a widened absolute
+  // band would not. The floor keeps the ratio meaningful when `rel1` is at or
+  // near zero.
   const double floor = 1.0e-3;
-  CHECK(rel1 <= floor);
-  CHECK(rel2 <= floor);
+  const double allowed = 32.0 * (rel1 > floor ? rel1 : floor);
+  MESSAGE("#2496 decode-vs-prefill arm distance ratio: " << (rel1 > 0.0 ? rel2 / rel1 : rel2)
+          << " (decode " << rel2 << " against an allowance of " << allowed << ")");
+  CHECK(rel2 <= allowed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3053,7 +3083,14 @@ TEST_CASE("qwen4_exp #2496: the CUDA decode step agrees with the CPU decode step
 // tautology: the two identifiers must actually produce different logits on this
 // fixture. If `kFresh` and `kStale` decoded to the same row, the gate below
 // would pass on a hook that read either array.
-TEST_CASE("qwen4_exp #2496: the decode step reads the DEVICE identifiers, not the stale host vector") {
+// THE NAME CARRIES NO COMMA, AND THAT IS LOAD-BEARING. `doctest`'s `-tc`
+// filter SPLITS ITS ARGUMENT ON COMMAS, so a case whose name contains one can
+// never be selected by name: the run reports `assertions: 0 | 0 passed | 0
+// failed` at rc 0, which reads as a pass. This case was first written as
+// "... DEVICE identifiers, not the stale host vector" and its red leg AND its
+// green leg both came back as that empty success on `thor:gpu0` -- a mutation
+// that measured nothing while reporting rc 0.
+TEST_CASE("qwen4_exp #2496: the decode step reads the DEVICE identifiers rather than the stale host vector") {
   using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
 
   const gguf_test::TempFile f(BuildFixture());

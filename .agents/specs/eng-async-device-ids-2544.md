@@ -269,9 +269,64 @@ and the FA2 refusal is thrown at call time from `:180`.
 
 ## Evidence
 
-Recorded in `## Outcome` when the row reaches DONE, with the red counts, the
-green counts, every mutation's rebuild result and restore sha256, and the
-hexdumps.
+### Red, then green — BOTH counts on each line
+
+`N failed / 0 assertions failed` means the cases THREW, so both lines are read.
+
+RED is this tree with the three registries reverted to `origin/main`
+(`git show origin/main:<path> > <path>`) and the tests unchanged, rebuilt:
+
+| suite | test cases | assertions |
+|---|---|---|
+| `test_glm5_next_forward` | 32 \| 30 passed \| **2 failed** | 5943 \| 5941 passed \| **2 failed** |
+| `test_deepseek_v4_exl3_loader` | 22 \| 21 passed \| **1 failed** | 613 \| 612 passed \| **1 failed** |
+
+The failures are the identifiers and not a throw. `glm5_next`: *102 of 128 logits
+differ, so this forward embedded the STALE host ids*. `deepseek_v4`: *32 of 32*.
+The `glm5_next` second failure is the shape-disagreement refusal, which the base
+tree answers with the model's own "the step carries no tokens" instead.
+
+GREEN, after restoring the three registries and rebuilding:
+
+| suite | test cases | assertions | control moved | mirror vs reference |
+|---|---|---|---|---|
+| `test_glm5_next_forward` | 32 \| **32 passed** \| 0 failed | 5943 \| **5943 passed** \| 0 failed | 102 floats | **0 of 128** |
+| `test_deepseek_v4_exl3_loader` | 22 \| **22 passed** \| 0 failed | 613 \| **613 passed** \| 0 failed | 32 floats | **0 of 32** |
+
+The control still moves in both, so the gate is not passing because the fixture
+cannot see an identifier at all.
+
+### Mutations
+
+Each is applied to PRODUCT code, **REBUILT**, run, then restored and verified by
+`sha256sum` against a pre-mutation copy. A mutation the compiler rejects and one
+the binary never contained both read as a pass, so the rebuild result is recorded
+beside every row. All five rebuilt at `rc=0` and all three files restored
+byte-identical after every one.
+
+| # | mutation | rebuild | `test_glm5_next_forward` | `test_deepseek_v4_exl3_loader` | what it proves |
+|---|---|---|---|---|---|
+| M1 | delete the `ResolveHostTokenIds` call in `glm5_next_registry.cpp` | rc=0 | **2 failed** / 2 assertions | 22/22, 613/613 | the `glm5_next` call site is REACHED through `ModelRegistry::Forward` and is load-bearing; and it is not what `deepseek_v4` depends on |
+| M2 | delete the call in `deepseek_v4_registry.cpp` (all four arms) | rc=0 | 32/32, 5943/5943 | **1 failed** / 1 assertion | the same for `deepseek_v4`, and the two call sites are independent |
+| M3 | delete `backend.Synchronize(input.queue)` from the seam | rc=0 | 32/32 | 22/22 | **UNMOVED, and expected to be.** `vt::Backend::Copy` on the CPU backend is a plain `memcpy` with nothing to await, so this harness structurally cannot see the await. Recorded as a measurement, not read as unreachability. The DEVICE half is `## Owed` O5. |
+| M4 | make the seam body always return `input.token_ids`, call sites intact | rc=0 | **2 failed** | **1 failed** | the WORK is in the seam, not in the call sites; a call site that reached a no-op would pass M1 and M2 and fail here |
+| M5 | replace the shape-disagreement `VT_CHECK` with a silent no-op return | rc=0 | **1 failed** | 22/22 | the refusal is live and named, rather than a comment |
+
+### Reachability
+
+M1 and M2 are the reachability mutations `.agents/reachability.md` asks for:
+each deletes the PRODUCTION call site in the registry forward and each reds a
+gate that enters through `ModelRegistry::Forward`. No case in either suite
+constructs the model or the input by hand.
+
+`laguna_registry.cpp` has NO such mutation, and that is the finding rather than
+an omission — see `## Risks/decisions` D5 and
+[#2618](https://github.com/mudler/vllm.cpp/issues/2618).
+
+### Hardware
+
+PENDING. The default-arm legs are staged at `/workspace/devids2544/job.sh` and
+queued on `dgx:gpu0`. Nothing is claimed for them until they run.
 
 ## Owed
 

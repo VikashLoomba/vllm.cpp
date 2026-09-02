@@ -4,6 +4,19 @@ Issue: [#2526](https://github.com/mudler/vllm.cpp/issues/2526).
 Owner row: `LTX25-COMPLETION-SCOPE`.
 Base: `origin/main` at `63889449c`. Upstream oracle: Lightricks `LTX-2` at `fd4ded7f`.
 
+**Every count and every anchor in this document was re-derived from the tree
+at `781ea5487` after a fresh review returned NOT PASS.** The review's diagnosis
+is recorded here because it shapes what a later reader should distrust: the
+method held wherever this row read UPSTREAM and failed wherever it read OUR OWN
+TREE. Two of its wrong anchors had been inherited from `ltx-2-5.md` rather than
+re-derived, in the section whose own thesis is that a record was propagated
+rather than read. Two class-A entries described work that had already shipped,
+one described something upstream never built, and one pointed at a refusal for a
+different capability entirely. Nothing about this tree is quoted from another
+document below, and **every count is now produced by a command in `## Gates`
+that prints its own denominator** — a number this row cannot re-derive on demand
+has been withdrawn rather than restated.
+
 ## Scope
 
 **In:** an enumeration of what stands between `63889449c` and a complete LTX-2.5
@@ -18,8 +31,10 @@ no tree beside it cannot be reconciled. Rerun the commands in `## Gates`.
 
 ## 1. The distinction this row exists to draw
 
-A grep over the LTX-2.5 sources returns 375 `Fail()` sites. They are not one
-population. Three kinds share the text:
+A grep over the LTX-2.5 sources returns 375 `Fail()` sites — `ltx2*.cpp` and
+`ltx2*.h` under `src/vllm/model_executor/models`, `src/vllm/multimodal`,
+`include/vllm/model_executor/models` and `include/vllm/multimodal`, the file set
+`## Gates` names. They are not one population. Three kinds share the text:
 
 1. **Input validation.** `"Video width and height must be multiples of 32"`,
    `"the checkpoint is missing '...'"`. The overwhelming majority. Not debt.
@@ -33,14 +48,49 @@ Kinds 2 and 3 are textually identical. `git grep "not ported"` returns both and
 distinguishes neither. This row separates them by reading the upstream side of
 each at `fd4ded7f` and asking one question: **does upstream construct this?**
 
+**`Fail()` is not the whole refusal surface, and this row's first draft assumed
+it was.** The same file set carries **61 `Refuse(`, 270 `VT_CHECK(` and 53
+`Require(`** at `781ea5487`, and **five of this document's own anchors live in
+the three excluded populations**: A7 (`ltx2_video_vae.cpp:1355`), E1
+(`ltx2_device.cpp:1337`) and `ltx2_dit.cpp:766` are `VT_CHECK`; A8 reaches
+`Refuse(` through `Ltx2RefuseUnportedPipelineFeature`; A9
+(`ltx2_upsampler.cpp:467`) is `Require`. The 375 is therefore a lower bound on
+the refusal surface and never a denominator. `## Gates` prints all four.
+
+**The consequence was not cosmetic: the first pass enumerated only the refusals
+it already knew about.** Sweeping all four populations, case-insensitively, found
+nine capability gaps in no class at all. §A.5 carries the sweep and `## Gates`
+carries the command.
+
+**The upstream-construction test is necessary, not sufficient, and one recorded
+gap fails it.** It separates a mirror from a gap. It does not separate a gap from
+a place where OUR host path has a capability and OUR device path refuses it —
+the prompt K/V cache, which upstream never builds either. Rather than smuggle
+that through the test or drop it for failing, it gets **class E** (§A.6), so the
+test stays exactly as strong as it reads.
+
 ## 2. The classes
 
 | Class | Meaning | Count |
 |---|---|---:|
-| **A** | Genuine capability gap: upstream implements it, we refuse or lack it | **14** |
+| **A** | Genuine capability gap: upstream implements it, we refuse or lack it | **20** |
 | **B** | Correct mirror: we refuse because upstream refuses or never constructs it | **4** |
 | **C** | Externally blocked: unfinishable here at any effort | **0** |
-| **D** | Measurement and records debt: no engine change | **10 clusters** |
+| **D** | Measurement and records debt: no engine change | **12 clusters** |
+| **E** | Internal consistency gap: OUR host path has it, OUR device path refuses it | **1** |
+
+**Class A grew from fourteen to twenty, and that is the honest direction.** Two
+entries left it because the arms had SHIPPED before this row's own base — found
+by opening the tree the first pass cited without reading (§A.4). One left for
+the new class E, because it fails class A's own test (§A.6). Nine entered, all
+of them from a closed refusal sweep the first pass never ran (§A.5). §"Risks" said
+class A was a lower bound. It was, and the reason is worth keeping: the first
+pass enumerated the refusals it already knew about instead of sweeping for them.
+
+**Class E exists because the alternative was worse.** Class A's test is "does
+upstream construct this?", and one recorded gap fails it while remaining a real
+capability a user can feel. Smuggling it through the test would corrupt the test;
+dropping it would lose the gap. It gets its own class, of one.
 
 **Class C is EMPTY, and that is this row's largest single finding.** All three
 recorded members were verified against `fd4ded7f` rather than inherited, and all
@@ -51,24 +101,53 @@ three are falsified. §5 carries the evidence.
 Classes A-D are the CAPABILITY view: what a user cannot get. The campaign also
 carries an internal debt list, and it is larger than any prior count.
 
-**299 open owed items across 50 specs** at `63889449c`, read by opening every
-file rather than by one grep:
+**352 items under an owed heading, in 57 owed sections across 49 of the 53
+specs in the population**, at `781ea5487`. The number is worth nothing without
+the rule that produced it, so the rule IS a command — the self-contained
+`python3` block in `## Gates` prints every figure in this section — and this is
+what it means, exactly:
 
-| Kind | Count | Meaning |
-|---|---:|---|
-| ENGINE | **192** | needs code -- engine, kernel, test, gate or harness |
-| MEASURE | **83** | needs a run, lease or evidence capture; no code |
-| RECORD | **24** | needs a document edit only |
+* **Population:** `.agents/specs/ltx25-*.md` plus `.agents/specs/ltx-2-5.md`,
+  minus this file.
+* **Section:** any ATX heading, at any level, whose text -- after stripping an
+  optional leading `N.` or `N.M.` numbering -- begins with `Owed` or with
+  `What is/stays [still] owed`. The section runs to the next heading of ANY
+  level.
+* **Item:** a bullet at column zero, or a table data row (a `|` line that is
+  neither a `|---|` separator nor immediately followed by one).
 
-Four `ltx25-*` specs carry no Owed section at all, and one
-(`ltx25-dit-attn-arm-parse.md`) carries an empty one. The heaviest are
-`ltx25-device-residency` (40), `ltx25-decode-speed` (24),
-`ltx25-t2a-one-stage` (15) and `ltx25-phase-instrument` (15).
+**The rule is load-bearing, and the evidence is that four rules give four
+answers.** This section first published **299**. The fresh reviewer's rule gave
+**362**, a second rule of the reviewer's gave **350**, a repair pass gave
+**368**, and the rule stated above gives **352**. None reproduces another, and
+none is wrong — they differ on whether a nested bullet counts, on which heading
+wordings open a section, and on where a section ends. **A count over prose is a
+property of its rule, so the rule ships with the number or the number does not
+ship.** That is why 299 is withdrawn rather than corrected: nobody can say what
+it counted.
 
-**These 299 are not 299 rows.** Many are one bullet of a wave, several are
-duplicates across specs, and **five are contradicted by another spec in the same
-set** -- they are record corrections wearing the shape of work. §6 D8 carries
-them.
+**Three things this number is not.** It is not "open" items: the rule cannot
+read whether an item was since discharged, and nothing in the tree marks that
+mechanically. It is not 352 rows: many are one bullet of a wave and several are
+duplicated across specs. And it is not a measure of remaining work, because §4
+is the capability view and this is the internal-debt view.
+
+The heaviest specs are `ltx25-device-residency` (51, over four owed sections),
+`ltx25-decode-speed` (25), `ltx25-dit-attn-flash` (18), `ltx25-phase-instrument`
+(15), `ltx25-t2a-one-stage` (15) and `ltx25-vae-device-residency` (13). Four
+`ltx25-*` specs carry no owed heading at all.
+
+**The ENGINE / MEASURE / RECORD split this section published is withdrawn, and
+nobody can re-derive it.** It read 192 / 83 / 24. **No literal marker for those
+kinds exists in the population**: `[ENGINE]`, `ENGINE:` and `kind=ENGINE` return
+0, and the bare words return a handful of hits, every one of them ordinary prose
+or the roadmap matrix's own unrelated category counter. A split of 299 items
+into three kinds was therefore a judgement made once, by one reader, and
+recorded as a measurement. It is exactly the drift-lock this repository already
+names, and the number was quoted onward before anybody tried to reproduce it.
+What survives is the question, and it is returned as a decision rather than
+answered: **nothing in this tree records what kind of work an owed item is**, so
+no gate and no plan can schedule this backlog without a human reading all 352.
 
 ### 2.2 A gate defect found while counting, and it under-reports this backlog
 
@@ -81,17 +160,40 @@ if "\n## Owed" not in text:
 body = text.split("\n## Owed", 1)[1].split("\n## ", 1)[0]
 ```
 
-1. **A numbered heading is skipped entirely.** `## 7. Owed` does not contain the
-   substring `\n## Owed`, so the file `continue`s. Four LTX specs are invisible
-   to the gate for this reason: `ltx25-token-append.md` (`## 8. Owed`),
-   `ltx25-decode-threads.md` (`## 7. Owed`), `ltx25-decode-dtype.md`
-   (`## 7. Owed`) and `ltx25-text-proj-dtype.md` (`## 6. Owed`).
-2. **Only the FIRST section is read, and it stops at the next `\n## `.** A
-   `###`-level owed section, or a second `## Owed`, is never seen. Five more LTX
-   specs are affected, `ltx25-device-residency.md` and
-   `ltx25-phase-instrument.md` among them.
+1. **The gate recognises one literal heading and nothing else** (line 2012).
+   `if "\n## Owed" not in text: continue` skips the whole file, so a numbered
+   heading and a differently-worded one are both invisible. **Five LTX specs**
+   are wholly invisible for this reason at `781ea5487`: `ltx25-token-append.md`
+   (`## 8. Owed`), `ltx25-decode-threads.md` (`## 7. Owed`),
+   `ltx25-decode-dtype.md` (`## 7. Owed`), `ltx25-text-proj-dtype.md`
+   (`## 6. Owed`) and `ltx25-tiled-decode.md` (`### What is owed`, with no
+   `## Owed` anywhere). The fifth was missed by this row's first pass because it
+   looked for numbered headings and not for other wordings — the same shape of
+   error as the defect it was reporting.
+2. **Only the FIRST section is read, and it stops at the next `\n## `** (line
+   2014). **The mechanism this section published was wrong, and the file it
+   blamed is not a victim.** It said a `###`-level owed section is truncated
+   away. `'\n## '` is NOT a substring of `'\n### '` — the third `#` sits where
+   the space must be — so a `###` owed section survives, and is truncated only
+   when a `## ` heading of some other name intervenes first.
+   `ltx25-phase-instrument.md`'s `### Owed out of the fresh review` is INSIDE
+   the gate's body: the gate reads all 15 of its items, and naming it here was a
+   false accusation against a spec. The real victims of this second defect are
+   **three**: `ltx25-device-residency.md` (three later owed sections lost),
+   `ltx25-res2s-loop.md` (two lost) and `ltx25-text-cond-device.md` (one lost),
+   plus `ltx25-anchor-repair.md`, which carries a `## Owed` the gate reads and a
+   later `What stays owed` section it does not.
 
-**Roughly 74 of the 299 open items sit under headings this gate cannot see.**
+**57 of the 352 items sit under headings this gate cannot see** — not "roughly
+74 of 299". **But item count is the wrong unit, and D10 measured a quantity the
+function does not compute.** `owed_issues()` returns `set[str]` of ISSUE
+NUMBERS; it never counts items at all. Measured in its own unit: **166 distinct
+issue numbers appear under an owed heading, `owed_issues()` collects 159, and it
+misses 7.** The blindness is real and far smaller than advertised, because most
+invisible items cite an issue that some visible section cites too. Both units
+are printed by the same command in `## Gates`, and the issue unit is the one a
+repair should gate on, because it is the unit the function has.
+
 `ltx25-decode-threads.md:292` says this about itself, so it was known and never
 filed. AGENTS.md is explicit that this class of thing is the checker's defect,
 not the specs': the obligation is real and the gate silently does not enforce
@@ -101,15 +203,15 @@ needs its own spec and a red-first test.
 ## 3. Class B — the correct mirrors, recorded so nobody reopens them
 
 These are NOT work. Each is already carried in
-`Ltx2UnportedPipelineFeature` (`include/vllm/model_executor/models/ltx2_pipeline.h:1227-1264`)
+`Ltx2UnportedPipelineFeature` (`include/vllm/model_executor/models/ltx2_pipeline.h:1226-1261`, four enumerators)
 or in the campaign's `Out` list, with its upstream anchor.
 
 | Item | Local anchor | Why it is a mirror, not a gap |
 |---|---|---|
-| `kBetaScheduler` | `ltx2_pipeline.h:1236-1242`, refusal `ltx2_pipeline.cpp:2226` | Upstream CONSTRUCTS IT NOWHERE. All seven `ltx-pipelines` entry points hard-code `LTX2Scheduler()`; vLLM-Omni has zero hits for the name. Mirroring that means no scheduler-kind field here either, so nothing reaches the refusal |
-| `kInt8ConvRot` | `ltx2_pipeline.h:1243-1248`, refusal `ltx2_pipeline.cpp:2243` | Not an LTX-2 arm at all. `quantization_factory.py:22-26` is a `str` enum with `assert_never` at `:50` and four members, none int8. `convrot`/`quarot`/`spinquant` are 0 hits upstream |
-| `kMultiGpuParallelism` | `ltx2_pipeline.h:1249-1264`, refusal `ltx2_pipeline.cpp:2266` | Four upstream forms, none of them CFG batching. Upstream's own `docs/multigpu/gemma.md:103-104` records that the DISTILLED pipeline this port runs takes no negative prompt and so "runs without CFG" |
-| `kMultishot` (retired) | removed; provenance `ltx2_pipeline.h:1200-1223`, `ltx25-retire-dead-arms.md` §1.1a | FABRICATED. No such upstream entry point, symbol or string. Upstream's own shipped enhancer prompts instruct "Single continuous take -- no hard cuts". A defect in our record, not a gap in our port |
+| `kBetaScheduler` | `ltx2_pipeline.h:1233-1238`, refusal `ltx2_pipeline.cpp:2226` | Upstream CONSTRUCTS IT NOWHERE. All seven `ltx-pipelines` entry points hard-code `LTX2Scheduler()`; vLLM-Omni has zero hits for the name. Mirroring that means no scheduler-kind field here either, so nothing reaches the refusal |
+| `kInt8ConvRot` | `ltx2_pipeline.h:1239-1244`, refusal `ltx2_pipeline.cpp:2243` | Not an LTX-2 arm at all. `quantization_factory.py:22-26` is a `str` enum with `assert_never` at `:50` and four members, none int8. `convrot`/`quarot`/`spinquant` are 0 hits upstream |
+| `kMultiGpuParallelism` | `ltx2_pipeline.h:1245-1260`, refusal `ltx2_pipeline.cpp:2266` | Four upstream forms, none of them CFG batching. Upstream's own `docs/multigpu/gemma.md:103-104` records that the DISTILLED pipeline this port runs takes no negative prompt and so "runs without CFG" |
+| `kMultishot` (retired) | removed; provenance `ltx2_pipeline.h:1200-1221`, `ltx25-retire-dead-arms.md` §1.1 | FABRICATED. No such upstream entry point, symbol or string. Upstream's own shipped enhancer prompts instruct "Single continuous take -- no hard cuts". A defect in our record, not a gap in our port |
 
 **Do not re-file these.** Each has been re-derived at least twice, and
 `kMultishot` cost three review rounds to retire.
@@ -150,9 +252,12 @@ against the mechanism and neither has landed:
   arms' goldens.
 
 So the mechanism is a live hypothesis, not a known quantity, and **n = 1 under
-every adherence number** -- the confirm harness deletes renders 2 and 3
-(`scripts/ltx25-render-confirm.sh:471,551`). A reading that moves by 0.74
-between runs would make the verdict a coin toss, and nothing excludes that.
+every adherence number**. The precise mechanism, which this section overstated
+until review: the harness JUDGES render 1 alone (`ltx25-render-confirm.sh:471`,
+`if [ "$i" = 1 ]`) and deletes only the PPM FRAMES of renders 2 and 3 (`:551`),
+keeping each `phase-log-$i.json` (`:469`) — which is why the SPEED axis is n = 3
+and the adherence axis is n = 1. A reading that moves by 0.74 between runs would
+make the verdict a coin toss, and nothing excludes that.
 
 **A2's shape is already measured**, by `LTX25-DEVICE-ARM-SURVEY` (landed). Two
 leaves are 54.03% of the wall and both are host-pinned:
@@ -171,21 +276,40 @@ arm was measured and deliberately NOT taken; it needs its own row and issue.
 
 | # | Gap | Local anchor | Upstream anchor | Reached? | Size |
 |---|---|---|---|---|---|
-| **A3** | `DubItPipeline` | refusal `ltx2_video.cpp:2753-2766` | `dubit.py` | refusal is reached | **M** |
-| **A4** | `HDRICLoraPipeline` | no refusal; cited `ltx2_lora.cpp:246` | `hdr_ic_lora.py:229` | no | **M-L** |
-| **A5** | `TI2VidTwoStagesHQPipeline` | `ltx2_pipeline.cpp:1408` | `ti2vid_two_stages_hq.py:59` | no | **M** |
-| **A6** | DFR's temporal refinement rounds loop | refusal `ltx2_video.cpp:2022-2027` | `dfr_pipeline.py:235-245,402-407` | refusal is reached | **M**, weights unpublished |
-| **A7** | DiffVAE / `NADiffusionDecoder` | refusal `ltx2_video_vae.cpp:1355-1359` | `video_vae.py` | yes, refused by name | **L -- needs a neighborhood-attention kernel** |
+| **A3** | `DubItPipeline` | **no refusal anywhere**; one comment, `ltx2_pipeline.h:837` | `dubit.py` | **no** | **M** |
+| **A4** | `HDRICLoraPipeline` | no refusal; cited `ltx2_lora.cpp:255` | `hdr_ic_lora.py:217` | no | **M-L** |
+| **A7** | DiffVAE / `NADiffusionDecoder` | `ltx2_video_vae.cpp:1355-1359` and `ltx2_video_vae_tiled.cpp:393-397`, both `VT_CHECK` | `diffusion_video_decoder.py:62` | yes, refused by name | **L — needs a neighborhood-attention kernel** |
 | **A8** | `kSpatiotemporalUpsampler` (both flags set) | refusal `ltx2_upsampler.cpp:465` | `model/upsampler/model.py:55-59` | **yes, the one REACHABLE unported-feature refusal** | **S** |
-| **A9** | Upsampler `dims == 2` arm | refusal `ltx2_upsampler.cpp:469` | `model/upsampler/model.py:85-100` | yes | **S** |
-| **A10** | Multi-keyframe request surface | ABI has two scalar slots, `include/vllm.h:934-935` | repeatable `--image PATH FRAME_IDX STRENGTH`, `utils/args.py:805-817` | ABI ceiling | **M, ABI-additive** |
-| **A11** | Image conditioning at CRF != 0 (H.264 round trip) | refusal `ltx2_image_preprocess.cpp:104-117` | `media_io/decode.py:430-434` | yes | **M -- needs a vendored codec** |
-| **A12** | Prompt K/V cache on the DEVICE forward | refusal `ltx2_device.cpp:1337` | `transformer.py:441-443` | yes | **M** |
+| **A9** | Upsampler `dims == 2` arm | refusal `ltx2_upsampler.cpp:467-472` (a `Require`) | `model/upsampler/model.py:85-100` | yes | **S** |
+| **A10** | Multi-keyframe request surface | ABI has two scalar slots, `include/vllm.h:1080-1081` | repeatable `--image PATH FRAME_IDX STRENGTH`, `utils/args.py:805-817` | ABI ceiling | **M, ABI-additive** |
+| **A11** | Image conditioning at CRF != 0 (H.264 round trip) | refusal `ltx2_image_preprocess.cpp:104-118` | `media_io/decode.py:430-434` | yes | **M — needs a vendored codec** |
 | **A13** | Pre-2.3 flat vocoder arm | refusal `ltx2_loader.cpp:1757-1762` | `audio_vae/model_configurator.py:53-56` | yes | **S**, and arguably B |
 | **A14** | Batched perturbation blend at batch > 1 | `ltx2.h:469`, `ltx2_device.cpp:320` | `attention.py:571-573` | degenerate at batch 1 | **S**, no consumer today |
+| **A15** | `ICLoraPipeline` — reference-IMAGE and reference-VIDEO conditioning | refusal `ltx2_video.cpp:2708-2751` | `ic_lora.py:60` | yes | **M-L**, owed at `ltx25-ic-lora.md:356` ([#975](https://github.com/mudler/vllm.cpp/issues/975)) |
+| **A16** | `conditioning_attention_strength < 1.0` and its attention mask | `Ltx2LatentState` carries no mask field; named at `ltx2_video.cpp:2740-2745` | `iclora_utils.py:151-160`, `mask_utils.py:170-243` | the default arm never builds a mask, so no | **M**, owed at `ltx25-ic-lora.md:357` ([#932](https://github.com/mudler/vllm.cpp/issues/932)) |
+| **A17** | N-adapter LoRA fusion | refusal `ltx2_lora.cpp:252-257` | `fuse_loras.py:115`, `ic_lora.py` takes a list | yes | **M**, owed at `ltx25-ic-lora.md:358` ([#932](https://github.com/mudler/vllm.cpp/issues/932)) |
+| **A18** | Reference-AUDIO conditioning delivery | refusal `ltx2_video.cpp:2754-2766` | `reference_audio_cond.py:34-65`, `utils/helpers.py:264-269` | yes | **M** — the op is ported and undriven |
+| **A19** | Arbitrary-ratio audio resampling | refusal `ltx2_audio_vae.cpp:1051-1060` (a `VT_CHECK`) | `audio_vae/ops.py:36-42` | yes | **M** — gates every non-48 kHz input, so it gates A3 and `a2vid_two_stage` |
+| **A20** | `LTXModelType.VideoOnly` / `AudioOnly` weight contracts | refusal `ltx2_device.cpp:1333-1335` (a `VT_CHECK`) | a different parameter set upstream builds | yes | **M** |
+| **A21** | Text-to-audio on the ACCELERATOR | refusal `ltx2_video.cpp:5844-5847` | `t2a_one_stage.py:167` | **yes — a shipped, ABI-reachable arm that cannot use the GPU** | **M**, owed by [#1005](https://github.com/mudler/vllm.cpp/issues/1005) |
+| **A22** | **Quantized COMPUTE.** Every encoding dequantizes to bf16 at load | §A.3; `ltx2_loader.cpp:469-546` | `quantization_factory.py:22-26` (four policies), `NVFP4Linear`, `fp8_scaled_mm`, `ltx-kernels/csrc/nvfp4/quantize.cu` | the load path is reached; no compute arm exists | **L** |
+| **A23** | The prompt enhancer | declared out with NO citation, `ltx25-res2s-loop.md:271` | shipped upstream and reached from ten files, every pipeline among them | not built | **M**, and its exclusion is unratified |
 
-**A8 is the single cheapest real gap and the only reachable unported-feature
-refusal in the enum.** It is the natural first bite.
+**A3's anchor was wrong and its "reached" answer was wrong with it.** The cited
+`ltx2_video.cpp:2753-2766` is the reference-AUDIO refusal, now A18. There is no
+DubIt refusal anywhere in `src/` or `include/`: the only statement about it is
+the comment at `ltx2_pipeline.h:837`, "`DubItPipeline`, which this tree does not
+ship". A3 is therefore like A4 — a pipeline nothing refuses by name, so a user
+asking for it gets the generic `(kind, version)` refusal at
+`ltx2_pipeline.cpp:2197` and no word about what is missing.
+
+**A5, A6 and A12 were in this table and are gone.** §A.4 records the two that
+had already SHIPPED and §A.6 the one that moved to class E, because deleting a
+wrong row without saying so is how the next survey re-files it. §A.5 records the
+sweep that found A15 through A23.
+
+**A8 is still the single cheapest real gap and the only reachable
+unported-feature refusal in the enum.** It is the natural first bite.
 
 ### A.3 The quantized arms — stated explicitly, as the contract requires
 
@@ -195,16 +319,23 @@ The loader reads four encodings -- BF16, F32, F8_E4M3 with an F32 scale, and U8
 NVFP4 in two producer dialects -- and **every one of them dequantizes to bf16
 during load** (`ltx2_loader.cpp:469-546`). The plan's own
 `Ltx2DitQuant` field is written at `ltx2_loader.cpp:421,423,463` and **read by
-no consumer anywhere**: the symbol occurs only in `ltx2_loader.cpp` and its own
-header, against a positive control (`Ltx2LoadDitFromSafetensors` occurs in six
-files across `src/` and `include/`). The loader says so itself at `:437-438` --
-"no consumer branches on `quant`".
+no PRODUCT consumer**. The qualifier is load-bearing and this section said
+"anywhere" until review: repo-wide the symbol occurs in six files, and three of
+them are `tests/vllm/models/test_ltx2_loader.cpp` (29), `tests/vllm/multimodal/
+test_ltx2_video.cpp` (5), `tests/vllm/models/test_ltx2_device.cpp` (2) and
+`scripts/probe_ltx2_dit_load.cpp` (3). Under `src/` and `include/` it occurs
+only in `ltx2_loader.cpp` (5) and its own header (3), against a positive control
+(`Ltx2LoadDitFromSafetensors` occurs in six files across `src/` and `include/`).
+Tests reading a field is not a product path branching on it, which is the claim
+that matters -- and the loader says so itself at `:439`, "no consumer branches on
+`quant`".
 
 The consequence is worth stating plainly: **the quantized checkpoints buy
 download and disk size, not VRAM and not speed.** Resident footprint is bf16 on
-device (`ltx2_video.cpp:1068`) or f32 on CPU (`:1082`). The shipped first-party
+device (`ltx2_video.cpp:1068`) or f32 on CPU (`dit_options.widen_to_f32 =
+!im.on_device`, `:1084`). The shipped first-party
 NVFP4 DiT also carries 1176 `.input_scale` tensors -- it is a W4A4 file -- and
-`IsScaleSidecar` (`ltx2_loader.cpp:361`) swallows every one of them, so the
+`IsScaleSidecar` (`ltx2_loader.cpp:360`, applied at `:396`) swallows every one of them, so the
 activation half of that checkpoint's scheme is silently discarded.
 
 The VAEs, upsampler and duration head are f32 only, and a quantized checkpoint
@@ -214,6 +345,16 @@ as does the CPU reference DiT (`ltx2_dit.cpp:766`). The device DiT is the one
 production path with a real narrow arm: `stream_dtype` defaults to `kBF16` and
 accepts exactly `{kBF16, kF32}` (`ltx2_device.h:97-109`).
 
+**Quantized compute is a class-A gap and this section gave it no number.** It is
+**A22** in the table above and it is in the §8 sequence, because a capability
+nobody numbered is a capability nobody schedules. Upstream ships four inference
+policies (`quantization_factory.py:22-26`), an `NVFP4Linear` that reaches a
+cuBLASLt GEMM, an `fp8_scaled_mm`, and its own quantize kernel
+(`ltx-kernels/csrc/nvfp4/quantize.cu`). **In this row's favour: it does not
+inflate A2.** `ltx2_oracle_manifest.json` records that the 93.8 s denominator
+ran the bf16 arm, so the 3.230x is a bf16-to-bf16 ratio, and closing A22 would
+move our side of it rather than correct it.
+
 **GGUF k-quants: there is no path, no scaffold, no refusal string and no matrix
 row.** Established across six independent spellings and search axes, with
 positive controls -- `minimax_music3_quant.cpp` and `qwen3_dflash_gguf.cpp`
@@ -222,18 +363,123 @@ returns 0 against 28 `nvfp4|fp8` hits in the same file.
 
 **This collides with a standing rule and the collision needs a decision.**
 AGENTS.md: "GGUF k-quants are a standing requirement. They are not a choice for
-each model." Four LTX specs have taken a "not applicable" exemption on the
+each model." Five LTX specs have taken a "not applicable" exemption on the
 ground that upstream ships no GGUF arm for any LTX-2 component
 (`quantization_factory.py:23-26` with `assert_never` at `:50`) and llama.cpp does
 not carry this architecture, so there is no behaviour to mirror and no
-quant-matched comparison to serve. **The tree is not self-consistent about it:**
-`ltx25-generated-keyframes.md:387` calls the campaign-level GGUF arm "owed for
-LTX-2.5 as a whole under #644" where `ltx25-t2a-one-stage.md:568`,
-`ltx25-a2v-audio-input.md:422`, `ltx25-a2vid-recipe.md:400` and
-`ltx25-dfr-pipeline.md:370` call it not applicable. **No ratification record
-exists for the exemption.** This row does not resolve it -- an exemption to a
+quant-matched comparison to serve.
+
+**The "contradiction" this section reported is not one, and the correction
+matters because it was the only evidence offered for the decision.** Read at
+`781ea5487`: `ltx25-t2a-one-stage.md:568`, `ltx25-a2v-audio-input.md:422` and
+`ltx25-a2vid-recipe.md:400` say "not applicable" flat.
+`ltx25-generated-keyframes.md:387` says "not applicable to this key; owed for
+LTX-2.5 as a whole under #644" and `ltx25-dfr-pipeline.md:370` says "not
+applicable to this family ... Owed for LTX-2.5 as a whole under #644 only if
+such a checkpoint appears". **Those two give the same two-level answer as each
+other**, so the population is three flat readings and two that scope the
+exemption to their own row while leaving the campaign question open. They do not
+contradict; three are silent where two are explicit.
+
+**What survives is the finding this row also made: no ratification record exists
+for the campaign-level exemption.** Five specs assert it and no arbitrating
+record was found in the tree. This row does not resolve it -- an exemption to a
 standing requirement is a developer decision -- and returns it under
-`## The decision this row returns`.
+`## Owed`.
+
+### A.4 What LEFT class A, and how the first pass got it wrong
+
+Both entries below were removed because **the arm already shipped**, and in each
+case the first pass reached its "no" by reading a line number carried over from
+another record instead of opening the file. This is the row's own diagnosis
+applied to the row.
+
+**A5 — `TI2VidTwoStagesHQPipeline`. Shipped 15 days before this spec's base.**
+It was cited at `ltx2_pipeline.cpp:1408` with *"Reached? no"*. That line is the
+FIRST LINE OF THE HEADER COMMENT of `Res2sTwoStageRecipe`, which begins at
+`:1454` and is dispatched at `:2112` as `res2s_two_stage` on version 2.5. It
+landed in `4d7748646` (row `LTX25-RES2S-LOOP`, [#921](https://github.com/mudler/vllm.cpp/issues/921)),
+an ancestor of this head. `docs/FEATURES.md:194` ships it with its gate — *"video
+latents BIT-EXACT on 3 of 5 fixtures, 1 ulp on 2. 20 mutations, 18 DETECTED"* —
+and `docs/models/ltx-2-5.md:114` passes `--pipeline-kind res2s_two_stage` inside
+the very command block this spec's own D9 files a defect against. **The residual
+is not a pipeline:** it is one out-of-scope ingredient, the per-stage distilled
+LoRA strength, named at `ltx2_pipeline.cpp:1434`. It is owed below rather than
+carried as a capability gap.
+
+**A6 — DFR's temporal x2/x4 rounds loop. SERVED, 12 days before this base.** It was cited as a refusal at
+`ltx2_video.cpp:2022-2027`. Those lines are audio guidance-extras assignments —
+`audio->cfg_scale`, `audio->stg_scale` and their neighbours — and no refusal is
+anywhere near them. The file says the opposite of the claim at `:2265`:
+`// ── DFR's temporal x2/x4 rounds — SERVED (row LTX25-DFR-ROUNDS, #986) ──`. The
+loop runs at `:5020` under `if (requested_temporal_rounds > 0)` at `:4982`, with
+upstream's three refusals mirrored at `:2280-2317`. It landed in `d995c52f0`
+([#986](https://github.com/mudler/vllm.cpp/issues/986)), also an ancestor of this
+head.
+
+**Both citations were plausible and neither was opened.** A line number in a
+348-KB file is not evidence; the line is. Every anchor in this document has since
+been re-resolved against `781ea5487`, and `## Gates` re-resolves the load-bearing
+ones by content rather than by number.
+
+### A.5 The sweep that closed the population, and the nine it found
+
+§1's `Fail()` population was partial, and the first pass enumerated the refusals
+it already knew about rather than sweeping for them. The sweep below is stated so
+that a later reader can rerun it and get a population rather than a sample. It is
+in `## Gates`.
+
+Over the 52-file LTX source set, case-INSENSITIVELY (the first pass's regex was
+case-sensitive and missed every `NOT ported`), for
+`not ported|not implemented|not served|unported`: **98 lines**. Stripping the
+scaffolding — the `allow_unported_modules` option, `UnportedFamilies`,
+`RefuseUnported`, the enum and its dispatch, and the several "WHAT IS *NOT* THE
+REASON" paragraphs that exist to record a claim that became false — leaves **21
+capability sites**. Eleven were already classed. **Nine were in no class at all**,
+and are now A15 through A23. The tenth unclassed site is a records defect, not a
+gap, and is D11.
+
+Three of the nine deserve their reason stated, because they are the ones a survey
+is most likely to miss again:
+
+* **A15/A16/A17 are one owed table this row walked past.** `ltx25-ic-lora.md`
+  lists all three under its own `## Owed` at `:356-358`, with their issues. This
+  spec touched the first only as an unnumbered sub-cost of A3, and never named
+  the other two. An owed table in another spec is exactly where a completion
+  survey has to look, and looking there was this survey's whole method.
+* **A19 gates two entries above it.** Refusing every sampling rate but the audio
+  VAE's own means any real audio input has to arrive pre-resampled, which is what
+  A3 (DubIt) and the shipped `a2vid_two_stage` arm both need. A gap that gates
+  other gaps belongs in the sequence before them.
+* **A21 is a shipped arm that cannot use the accelerator.** `t2a_one_stage` is
+  ABI-reachable and documented, and `Ltx2DitForwardDevice` dereferences `*video`
+  unconditionally, so the device path refuses it by name. It bears directly on
+  A2: a wall-clock survey that never ran this arm on the GPU has not measured it.
+
+### A.6 Class E — the one gap that fails class A's own test
+
+**A12, the prompt K/V cache on the device forward, was misfiled and is now E1.**
+
+Class A's test is "does upstream construct this?" Upstream does not. Read at
+`fd4ded7f`, `transformer.py:437-440` is a COMMENT observing that with
+`use_prompt_adaln_single=False` the K/V modulation is "timestep-independent and
+cacheable across denoising/AR steps"; `:441-443` then compute `kv_modulation`
+unconditionally. No cache is built. `kv_cache`, `prompt_kv`, `cached_kv`,
+`text_kv` and `PromptCache` return **zero files** across `ltx-core` and
+`ltx-pipelines`, against a positive control of 66 files matching `attention` in
+`ltx-core` alone. The only `kv_cache` upstream is an unrelated VAE
+neighborhood-attention slab cache in `ltx-kernels/vae/block_fna_dsl.py`.
+
+| # | Gap | Local anchor | Upstream | Reached? | Size |
+|---|---|---|---|---|---|
+| **E1** | Prompt K/V cache on the DEVICE forward, which the HOST forward has | refusal `ltx2_device.cpp:1336-1340` (a `VT_CHECK`); host path `Ltx2DitForward` | **none — upstream builds no such cache** | yes | **M** |
+
+**It is still a real gap, and that is why it is recorded rather than dropped.**
+`Ltx2DitForward` caches on the host and `Ltx2DitForwardDevice` refuses a cache by
+name, so the same request costs more on the accelerator than off it. A user can
+feel that. What it is NOT is an upstream-parity gap, and calling it one would have
+put a local optimisation into a list whose whole claim is "upstream implements
+this and we do not".
 
 ## 5. Class C is empty — the three blockers, verified rather than inherited
 
@@ -277,9 +523,15 @@ The blocker cited `ltx25-retire-dead-arms.md:167` as a scope decision excluding
 colour science. **That line is a cell in a three-column table whose header is
 "Is it a generation mode?"**, answering that question about the `scene-linear`
 hit with "no -- colour science". It disposes of `kMultishot`, not of HDR. The
-campaign's own `Out` list (`ltx-2-5.md:288-292`) names DiffVAE, the temporal
-upsampler, LoRA fusion, multishot, `int8-convrot` and multi-GPU. **HDR is not in
-it.** The same misreading has propagated to `ltx25-retake.md:212` and `:499`.
+campaign's own `Out` list (`ltx-2-5.md:290-292`) names DiffVAE, the temporal
+upsampler, LoRA fusion, multishot, `int8-convrot` and multi-GPU, and **the HDR
+pipeline is not among them**. It IS named two lines later: `ltx-2-5.md:294-296`
+lists `HDRICLoraPipeline` among four upstream pipelines that are out, "recorded
+as owed, not silently dropped", with an issue. So the precise claim is the
+narrow one — **no scope decision excludes HDR COLOUR SCIENCE**, and the cited
+cell is not one — and this section overstated it as "HDR is not in it" until
+review. The misreading itself has propagated to `ltx25-retake.md:212` and
+`:499`.
 
 The colour science actually needed is bounded: an inverse LogC3 (`hdr.py:60-65`,
 six lines), optionally an inverse ACEScct (`:75-79`, five lines), and a primaries
@@ -300,20 +552,23 @@ oracle denominator that is n = 1.
 
 ## 6. Class D — measurement and records debt
 
-No engine change. Nine clusters.
+No engine change. **Twelve clusters**, D1 through D12; the count and the list
+disagreed until review, which is the same defect the clusters are about.
 
 | # | Debt | Anchor | Size |
 |---|---|---|---|
 | **D1** | **n = 1 under every adherence and speed number.** The oracle denominator has no spread of its own; ours is measured at 8.03% | `ltx25-render-confirm.md`, `ltx25-prompt-adherence.md` | lease time |
-| **D2** | `ltx25-render-confirm.sh` does not pass `--adherence-model`, so the next lease re-takes the blockiness verdict and not the adherence one | `scripts/ltx25-render-confirm.sh:477` | S |
+| **D2** | `ltx25-render-confirm.sh` never passes `--adherence-model`, so the next lease re-takes the PPM/blockiness verdict (`:477-480`) and not the adherence one. Evidence is an absence with a control: 0 hits for `adherence` in the harness against 4 for `--reference`, while `ltx25-render-compare.py:79` documents the flag | `scripts/ltx25-render-confirm.sh`, `scripts/ltx25-render-compare.py:79` | S |
 | **D3** | **The quantization matrix carries ZERO LTX rows** (control: 28 `nvfp4|fp8` hits for other models in the same file) | `.agents/quantization-matrix.md` | S |
 | **D4** | **Four checkpoints have no `docs/USAGE.md` row**: the spatial x2 upsampler, the temporal x2 upsampler, the IC-LoRA, and DFR's `keyframe_slot_sft` base. `grep -ci 'upsampl\|upscal' docs/USAGE.md` = **0** against an `ltx` control of 16. The spatial upsampler is REQUIRED by the DEFAULT `distilled_two_stage` recipe, so a reader cannot feed the default arm | `docs/USAGE.md:608-630` | S |
 | **D5** | Two rows carry no digest where the file's own local standard asks for one on every LTX row | `docs/USAGE.md:623,625` vs `:598-607` | S |
 | **D6** | `docs/USAGE.md` names no pipeline-arm refusals -- not `dmd2`'s unreachability on 2.5, not the per-kind version refusals, not the unported-feature refusals | `docs/USAGE.md` | S |
 | **D7** | **The campaign `Out` list is stale in five of its entries.** The temporal upsampler, LoRA fusion, multishot, `KeyframeInterpolation` and `TI2VidTwoStages` have all landed or been retired | `ltx-2-5.md:288-296` | S |
-| **D8** | **Three stale blocker bullets** assert what §5 falsifies, plus two propagated copies | `ltx-2-5.md:962-991`, `ltx25-retake.md:212,499` | S |
+| **D8** | **Three stale blocker bullets** assert what §5 falsifies, plus two propagated copies. They also carry the two wrong anchors this spec inherited (`hdr_ic_lora.py:229` at `:986`, `ltx2_lora.cpp:246` at `:987`; true values 217 and 255) and a third, the reference-audio refusal cited at `ltx2_video.cpp:1991-2004` when it is at `:2754-2766` | `ltx-2-5.md:973-996` (**not** `:962-991`, which is an unrelated #1458 paragraph), `ltx25-retake.md:212,499` | S |
 | **D9** | The copy-pasteable render command omits `--checkpoint-class` and refuses as written | `docs/models/ltx-2-5.md:105-118` | S |
-| **D10** | **The owed-backlog gate is blind to ~74 of the 299 open items** -- a numbered `## N. Owed` heading is skipped entirely, and only the first section is read. §2.2 | `scripts/check-agent-record.py:2002-2017` | S, needs a red-first test |
+| **D10** | **The owed-backlog gate misses 7 of the 166 issue numbers under an owed heading** — a numbered or differently-worded heading is skipped entirely (`:2012`), and only the first section is read (`:2014`). Measured in the gate's OWN unit: `owed_issues()` returns `set[str]` of issue numbers and never counts items, so this row's earlier "~74 of 299 items" measured a quantity the function does not compute. §2.2 | `scripts/check-agent-record.py:2002-2017` | S, needs a red-first test |
+| **D11** | **A refusal message states as unported something this tree ports.** `ltx2.cpp:885` says the cross-attention perturbations "exist upstream (SKIP_A2V_CROSS_ATTN, SKIP_V2A_CROSS_ATTN) and are NOT ported"; they are ported on both arms (`Ltx2PerturbationType::kSkipA2vCrossAttn`, `ltx2_pipeline.h:397`) and `docs/FEATURES.md:197` ships them. The refusal is still correct — a perturbed pass carrying a cross flag should refuse — but its stated reason is false | `src/vllm/model_executor/models/ltx2.cpp:885` | S |
+| **D12** | **The campaign carries no ratification of the GGUF k-quant exemption**, which five specs assert independently. §A.3. This is records debt only in that no record arbitrates; the decision itself is the developer's | five `ltx25-*.md` specs; no arbitrating record found | decision |
 
 ## 7. Reachability — what a production path can actually reach
 
@@ -325,12 +580,20 @@ comments; spellings tried: `ltx`, `LTX2`, `ltx_2`, `ltx-2`, `ltx25`, `ltx2p5`,
 at `ltx2_video.cpp:5926`, family string `"ltx-2.5"`
 (`include/vllm/multimodal/ltx2_video.h:131`).
 
-Ten `(kind, version)` recipe rows are accepted by
-`ResolveLtx2PipelineRecipe` (`ltx2_pipeline.cpp:2085-2201`); everything else
-falls through to one refusal at `:2197`. The server registers `/v1/videos` only
+**Ten pipeline KINDS and 28 accepted `(kind, version)` PAIRS** are resolved by
+`ResolveLtx2PipelineRecipe` (declared `ltx2_pipeline.cpp:2082`, dispatch
+`:2087-2196`); everything else falls through to one refusal at `:2197-2201`.
+This section said "ten `(kind, version)` recipe rows" until review, conflating
+the two counts: `one_stage`, `a2vid_two_stage`, `ti2vid_two_stage`,
+`keyframe_interpolation` and `t2a_one_stage` each accept four versions, while
+`dfr` and `res2s_two_stage` accept 2.5 alone. `## Gates` counts both. The server registers `/v1/videos` only
 when `--video-dit` is non-empty, so **LTX-2.5 is not reachable on the server's
 own default configuration** -- and with video enabled the default arm is
 `distilled_two_stage`/`2.5` alone.
+
+**A third arm is ABI-reachable and ACCELERATOR-unreachable:** `t2a_one_stage`
+refuses the device forward by name (A21, `ltx2_video.cpp:5844-5847`), so the one
+audio-only guided arm runs host-side whatever the caller asks for.
 
 **Two arms are ABI-reachable and server-UNREACHABLE**, because
 `VideoGenParamsFromRequest` (`video_engine.cpp:349-383`) forwards no
@@ -351,56 +614,109 @@ taken on a failing tree measures the wrong thing.
 
 | Order | Work | Depends on | Size |
 |---|---|---|---|
-| **1** | **A1 -- close the adherence gap.** Land the sigma-shift repair, then re-score | #2520, #2525, `LTX25-SIGMA-SHIFT-MIRROR` in flight | M-L, mechanism unconfirmed |
-| **2** | **D1/D2 -- get n > 1** on both axes and wire the harness to score adherence in-lease | lease | S + lease time |
-| **3** | **A2a -- the text tower queue swap**, 27.18% of the wall, the cheapest shape in the ranking | 1, 2 | M |
-| **4** | **A2b -- the connector port**, 26.85%, a ~386-line port | 3 (so the two are measured apart) | L |
-| **5** | **A8, A9** -- the two upsampler refusals, the cheapest real gaps | none | S each |
-| **6** | **A3, A5** -- DubIt and TI2VidTwoStagesHQ, both ordinary recipe rows | 1 | M each |
-| **7** | **A10 + the server extras ceiling** -- make the shipped arms askable | ABI-additive | M |
-| **8** | **A12, A14, A13** -- device prompt-KV cache, batched blend, flat vocoder | 4 | S-M each |
-| **9** | **A4** -- HDRICLora, pipeline plus an HDR frame writer | 1 | M-L |
-| **10** | **A6** -- DFR rounds loop | weights unpublished (#1137) | M, externally paced |
-| **11** | **A11** -- CRF round trip, needs a vendored codec | codec decision | M |
-| **12** | **A7 -- DiffVAE.** A new neighborhood-attention kernel. The largest single item and the last, because nothing depends on it | none | **L** |
-| **13** | **D3-D10** -- the records sweep, ridden along on the changes that invalidate each | each item's own change | S |
+| **1** | **A1 — close the adherence gap.** Land the sigma-shift repair, then re-score | #2520, #2525, `LTX25-SIGMA-SHIFT-MIRROR` in flight | M-L, mechanism unconfirmed |
+| **2** | **D1/D2 — get n > 1** on both axes and wire the harness to score adherence in-lease | lease | S + lease time |
+| **3** | **A2a — the text tower queue swap**, 27.18% of the wall, the cheapest shape in the ranking | 1, 2 | M |
+| **4** | **A2b — the connector port**, 26.85%, a ~386-line port | 3 (so the two are measured apart) | L |
+| **5** | **A8, A9** — the two upsampler refusals, the cheapest real gaps | none | S each |
+| **6** | **A19 — arbitrary-ratio audio resampling.** Before A3 and A18, because it gates both | none | M |
+| **7** | **A15, A16, A17 — the IC-LoRA family**, one owed table with its issues already filed | A16 needs a mask field on `Ltx2LatentState` | M-L total |
+| **8** | **A3 — DubIt**, plus a refusal that names it instead of the generic one | 1, 6, 7 (it needs an IC-LoRA) | M |
+| **9** | **A18 — reference-audio delivery.** The op is ported and undriven | 6 | M |
+| **10** | **A21 — text-to-audio on the accelerator.** A shipped arm that cannot use the GPU, and A2 cannot measure it until it can | 4 | M |
+| **11** | **A10 + the server extras ceiling** — make the shipped arms askable | ABI-additive | M |
+| **12** | **E1, A14, A13, A20** — device prompt-KV cache, batched blend, flat vocoder, the one-modality weight contracts | 4 | S-M each |
+| **13** | **A4** — HDRICLora, pipeline plus an HDR frame writer | 1 | M-L |
+| **14** | **A11** — CRF round trip, needs a vendored codec | codec decision | M |
+| **15** | **A22 — quantized compute.** The one item that changes the resident footprint and the only one that could move A2 by more than the two host leaves | 4, and a ratified quant plan | **L** |
+| **16** | **A7 — DiffVAE.** A new neighborhood-attention kernel. The largest single item and the last, because nothing depends on it | none | **L** |
+| **17** | **D3-D12** — the records sweep, ridden along on the changes that invalidate each | each item's own change | S |
+
+**A23 (the prompt enhancer) is deliberately absent from this sequence.** It is
+in class A because upstream ships it and we do not, but its exclusion was
+declared without a citation and has never been ratified. Scheduling it would
+answer a question that belongs to the developer; it is returned under `## Owed`
+instead. The same reasoning applies to D12.
 
 ## 9. The number
 
-**Fourteen class-A rows, of which two are the gate and one is a new kernel; ten
-records clusters; a 299-item internal owed backlog of which 192 need code; and a
-correctness verdict that is currently FAILING.**
+**Twenty class-A rows, of which two are the gate, three are L, and nine were
+missed by the first pass; one class-E row; four correct mirrors; zero external
+blockers; twelve records clusters; a 352-item internal owed backlog under a
+stated rule; and a correctness verdict that is currently FAILING.**
 
-Sized against this campaign's own delivery rate -- 145 LTX commits and roughly
-30 landed rows in the 15 days since 2026-08-17 -- and taking the M rows at one
-row each, the L rows at two to four:
+**The row count, derived.** Class A sizes read off §4: 4 rows at S (A8, A9, A13,
+A14), 10 at M (A3, A10, A11, A16, A17, A18, A19, A20, A21, A23), 3 at M-L (A1,
+A4, A15) and 3 at L (A2, A7, A22), plus E1 at M. Taking S and M at one row each,
+M-L at one to two, and L at two to four, and adding one to two for the records
+work that does not ride another change (D10 needs its own spec and a red-first
+test; D12 is a decision, not a row):
 
-> **Roughly 22 to 30 rows of work, which is six to ten weeks at the campaign's
-> observed cadence, and it is NOT bounded above** -- because A1's mechanism is
-> unconfirmed and A2's 3.230x has no floor anybody has demonstrated.
+> **25 to 35 rows.** It is a floor, not a range with a ceiling.
 
-**Three things make that a floor and not an estimate.**
+**No duration follows from it, and this row withdraws the one it published.**
+§9 previously said "six to ten weeks at the campaign's observed cadence" beside
+its only cadence figure, "roughly 30 landed rows in 15 days". Those two
+statements contradict each other by about a factor of four: 30 rows in 15 days
+applied to 22-30 rows is 11 to 15 days, not 42 to 70. The arithmetic was never
+shown, so nobody could see the contradiction, and the range had already been
+quoted onward.
+
+The cadence itself is measurable and is measured here, with its command in
+`## Gates`: **43 distinct LTX row IDs appear in the conventional-commit scopes
+of the 155 LTX-matching non-merge commits reachable from this head since
+2026-08-17**, over 16 calendar days. That is the raw fact. **Multiplying it by
+the row count would be wrong, and the reasons are structural rather than
+cautious:**
+
+1. **The two populations differ in kind.** The observed 43 are weighted toward
+   S rows, spec edits and record repairs. Of the 20 rows remaining, **four are
+   S** and three are L. A rate measured on one distribution does not transfer to
+   the other.
+2. **A1 has no duration because it has no mechanism.** #2525 falsified the
+   leading hypothesis and withdrew a second; #2520 has a live one. An open
+   research question is not a row with a length.
+3. **Several rows are lease-bound, and a lease is a queue rather than a rate.**
+   D1, D2 and every re-score wait on GPU availability, which no commit cadence
+   measures.
+4. **"Row" is not a constant unit.** Some of the observed 43 are one-line record
+   repairs and some are whole ports.
+
+**So the schedule is returned as a decision, not answered.** `## Owed` carries
+it. A number this row cannot derive from a stated, runnable rule does not belong
+in a document whose entire subject is numbers that were propagated rather than
+derived.
+
+**Three things make the row count a floor and not an estimate.**
 
 1. **A1 has no mechanism.** #2525 falsified the leading hypothesis and withdrew
    a second. #2520 has a live one. If the sigma anchor is not the cause, A1 is
    an open research question and no schedule survives it.
 2. **A2 has no ceiling, and AGENTS.md forbids declaring one.** Moving the two
    host-pinned leaves recovers at most 54% of the wall; 3.230x does not become
-   1.0x by arithmetic. What is left after them is unmeasured.
+   1.0x by arithmetic. What is left after them is unmeasured, and A22 —
+   quantized compute — is the only enumerated item that could move it further.
 3. **n = 1 under both.** Neither the adherence FAIL nor the 3.230x has a
    demonstrated spread on the oracle side. D1 could move either verdict.
 
+**And a fourth, which this review established:** class A grew by six the first
+time anybody ran a closed sweep over the refusal surface. §"Risks" called class
+A a lower bound as a caveat; it is now a measurement.
+
 **An honest summary in one line:** LTX-2.5 is a broad, deeply documented port
 whose arms are nearly all present and whose *correctness gate is failing with no
-owner and no mechanism*. The remaining arm work is ordinary and sequenceable. The
-gate work is not, and it is what "complete" waits on.
+owner and no mechanism*. The remaining arm work is ordinary and sequenceable.
+The gate work is not, and it is what "complete" waits on.
 
 ## 10. What this row could not determine
 
 Named rather than filled in.
 
-* **Whether the GGUF exemption was ever ratified.** Two readings live in the
-  tree and no arbitrating record was found.
+* **Whether the GGUF exemption was ever ratified.** Five specs assert it
+  independently — three flatly, two scoped to their own row — and no arbitrating
+  record was found. The "contradiction" this row first reported between them was
+  not one; §A.3 records the correction. What is genuinely absent is the
+  ratification.
 * **Issue state for most of the campaign.** `gh` is scattered-blind at this
   account: #435, #644, #1093, #1094, #1095, #1096, #1854 and #2295 all return
   "Could not resolve" while #2513, #2514, #2520 and #2521 resolve normally, and
@@ -411,7 +727,11 @@ Named rather than filled in.
 * **Whether A1 and A2 interact.** The sigma-shift repair re-samples six arms'
   goldens; nobody has measured what it does to the wall.
 * **The two disagreeing bf16 footprint figures** in one header
-  (`ltx2_loader.h:463` "~21 GB" against `:503` "~39 GB"). Not reconciled here.
+  (`ltx2_loader.h:463` "~21 GB bf16 for the shipped FP8 DiT" against `:504`
+  "~39 GB bf16"). A real inconsistency; not reconciled here.
+* **How long the remaining 25 to 35 rows take.** §9 derives the count and
+  refuses the duration. Nothing in this tree measures a rate that transfers to
+  the remaining population.
 
 ## Risks
 
@@ -419,22 +739,66 @@ Named rather than filled in.
   `## Gates` re-derives them. A reader at a later SHA reruns them first.
 * **Sizes are shapes, not estimates.** They are read off the code and the
   measured phase table. None is a schedule commitment.
-* **Class A could grow.** It is a lower bound: it enumerates what the tree and
-  the pinned upstream disclose. An arm upstream implements that nobody has
-  looked for is not in it.
+* **Class A could grow, and on review it did — from fourteen to twenty.** It is
+  a lower bound, not a caveat: the nine additions came from the first CLOSED
+  sweep over the refusal surface, and the population that sweep covers is itself
+  defined by four grep patterns over 52 files. An arm upstream implements that
+  no pattern in `## Gates` matches is still not in it.
+* **Every count here is a property of the rule that produced it.** §2.1's item
+  count reads 299, 350, 352, 362 or 368 under five different rules over the same
+  tree. Cite the rule with the number, or cite neither.
 
 ## Gates
 
-Re-derive at any SHA; each prints its own denominator.
+Re-derive at any SHA; each prints its own denominator. `$LTX` is the 52-file LTX
+source set every count in §1, §A.5 and §7 is taken over.
 
 ```sh
+# The file set itself, named once so no count is taken over a different one
+LTX=$(git ls-files | grep -E '(^src/vllm/(model_executor/models|multimodal)/ltx2.*\.(cpp|h)$)|(^include/vllm/(model_executor/models|multimodal)/ltx2.*\.h$)')
+echo "$LTX" | wc -l                                   # 52
+
+# 1: the refusal surface is FOUR populations, not one. Fail() is a lower bound
+for p in 'Fail(' 'Refuse(' 'VT_CHECK(' 'Require('; do
+  printf '%-11s %s\n' "$p" "$(echo "$LTX" | xargs grep -oF "$p" | wc -l)"
+done                                                  # 375 / 61 / 270 / 53
+
+# A.5: the CLOSED sweep. Case-INSENSITIVE -- the first pass's regex was not,
+# and so missed every `NOT ported`. 98 lines, of which 21 are capability sites
+echo "$LTX" | xargs grep -niE 'not ported|not implemented|not served|unported' | wc -l
+
+# A.4: the two arms that had already shipped, proved by content not by number
+grep -n 'Res2sTwoStageRecipe\|res2s_two_stage' src/vllm/model_executor/models/ltx2_pipeline.cpp
+grep -n "DFR's temporal x2/x4 rounds" src/vllm/multimodal/ltx2_video.cpp
+git merge-base --is-ancestor 4d7748646 HEAD && echo 'A5 shipped in 4d7748646'
+git merge-base --is-ancestor d995c52f0 HEAD && echo 'A6 shipped in d995c52f0'
+
+# A.6: upstream builds no prompt K/V cache, with a positive control
+( cd ~/_git/LTX-2 || exit
+  for p in kv_cache prompt_kv cached_kv text_kv PromptCache; do
+    printf '%-11s %s files\n' "$p" \
+      "$(git grep -l "$p" fd4ded7f -- packages/ltx-core packages/ltx-pipelines | wc -l)"
+  done                                                # 0 each
+  git grep -l attention fd4ded7f -- packages/ltx-core | wc -l )   # 66 -- the control
+
 # Class B registry, and that it still carries exactly these members
 sed -n '/^enum class Ltx2UnportedPipelineFeature/,/^};/p' \
   include/vllm/model_executor/models/ltx2_pipeline.h
 
-# The quantized-compute claim: the enum never leaves the loader (control alongside)
-grep -rn 'Ltx2DitQuant' src/ include/ examples/ | sed 's/:.*//' | sort | uniq -c
-grep -rln 'Ltx2LoadDitFromSafetensors' src/ include/ examples/
+# A.3: the quantized-compute claim. No PRODUCT consumer; tests are not one
+grep -rn 'Ltx2DitQuant' src/ include/ tests/ scripts/ | sed 's/:.*//' | sort | uniq -c
+grep -rln 'Ltx2LoadDitFromSafetensors' src/ include/ examples/ | wc -l   # control: 6
+
+# 7: TEN kinds and TWENTY-EIGHT accepted (kind, version) pairs -- not one number
+R='/^Ltx2PipelineRecipe ResolveLtx2PipelineRecipe/,/^}/'
+awk "$R" src/vllm/model_executor/models/ltx2_pipeline.cpp \
+  | grep -oE 'pipeline_kind == "[a-z0-9_]+"' | sort -u | wc -l          # 10
+awk "$R" src/vllm/model_executor/models/ltx2_pipeline.cpp \
+  | grep -oE 'model_version == "[0-9.]+"' | wc -l                       # 28
+
+# 9: the cadence, as a raw fact. It is NOT multiplied by the row count -- see §9
+git log --no-merges --format=%s --since=2026-08-17 HEAD \
+  | sed -nE 's/^[a-z]+\(([A-Z0-9][A-Z0-9-]*)\).*/\1/p' | grep -i LTX | sort -u | wc -l
 
 # D3: LTX rows in the quantization matrix, against a positive control
 grep -ci 'ltx' .agents/quantization-matrix.md
@@ -443,6 +807,15 @@ grep -ci 'nvfp4\|fp8' .agents/quantization-matrix.md
 # D4: the missing upsampler checkpoint rows, against a positive control
 grep -ci 'upsampl\|upscal' docs/USAGE.md
 grep -ci 'ltx' docs/USAGE.md
+
+# D2: the harness never scores adherence. An ABSENCE, so with a control
+grep -c adherence scripts/ltx25-render-confirm.sh       # 0
+grep -c -- --reference scripts/ltx25-render-confirm.sh  # 4 -- the control
+grep -n -- '--adherence-model' scripts/ltx25-render-compare.py | head -1
+
+# D11: a refusal message calls ported perturbations unported
+sed -n '885p' src/vllm/model_executor/models/ltx2.cpp
+grep -n 'kSkipA2vCrossAttn' include/vllm/model_executor/models/ltx2_pipeline.h
 
 # 5.1: TI2VidTwoStages landed
 git log --oneline --grep='TI2VID-RECIPE'
@@ -454,7 +827,51 @@ grep -n '^void Ltx2ConditionVideoByReference\|^void Ltx2ConditionAudioByReferenc
 
 # Reachability: the family registration and the recipe dispatch
 grep -n 'REGISTER_VLLM_VIDEO_FAMILY' src/vllm/multimodal/ltx2_video.cpp
-sed -n '2085,2201p' src/vllm/model_executor/models/ltx2_pipeline.cpp
+sed -n '2087,2201p' src/vllm/model_executor/models/ltx2_pipeline.cpp
+```
+
+**§2.1 and §2.2's every figure, from the rule that defines them.** This block IS
+the rule: there is no other definition of the count anywhere in the tree, and a
+figure this block does not print is not published. Save it and run it.
+
+```python
+import glob, re, os
+SELF = ".agents/specs/ltx25-completion-scope.md"
+HEAD = re.compile(r'^(#{1,6})\s+(.*)$')           # ATX heading, any level
+NUM  = re.compile(r'^\d+(\.\d+)*\.?\s+')          # optional "N." / "N.M." numbering
+OWED = re.compile(r'^(owed\b|what\s+(is|stays)\s+(still\s+)?owed)', re.I)
+SEP  = re.compile(r'^\|[\s:|-]*\|?\s*$')          # a |---|---| table separator
+ISSUE = re.compile(r'#(\d{2,6})')
+files = [f for f in sorted(set(glob.glob(".agents/specs/ltx25-*.md")) | {".agents/specs/ltx-2-5.md"})
+         if os.path.normpath(f) != os.path.normpath(SELF)]
+tot = secs = blind = 0; agg = {}; specs = set(); issues = set(); seen = set()
+for f in files:
+    lines = open(f, encoding='utf-8').read().split("\n"); txt = "\n".join(lines)
+    # exactly what scripts/check-agent-record.py:2012-2014 reads, and no more
+    gate = txt.split("\n## Owed", 1)[1].split("\n## ", 1)[0] if "\n## Owed" in txt else ""
+    seen |= set(ISSUE.findall(gate))
+    i = 0
+    while i < len(lines):
+        m = HEAD.match(lines[i])
+        if not m: i += 1; continue
+        title = NUM.sub("", m.group(2).strip().strip('`*_ ')).strip()
+        if not OWED.match(title): i += 1; continue
+        secs += 1; specs.add(f); j = i + 1; body = []
+        while j < len(lines) and not HEAD.match(lines[j]): body.append(lines[j]); j += 1
+        n = 0
+        for k, l in enumerate(body):        # item = column-0 bullet, or table DATA row
+            if re.match(r'^[*-]\s+\S', l): n += 1
+            elif l.startswith('|') and not SEP.match(l):
+                if not SEP.match(body[k + 1] if k + 1 < len(body) else ""): n += 1
+        seg = "\n".join(body); issues |= set(ISSUE.findall(seg))
+        if seg.strip() and seg.strip() not in gate: blind += n
+        tot += n; agg[f] = agg.get(f, 0) + n; i = j
+print(f"population={len(files)} specs_with_an_owed_section={len(specs)} "
+      f"sections={secs} items={tot}")                            # 53 / 49 / 57 / 352
+print(f"items_invisible_to_the_gate={blind}")                    # 57
+print(f"issues_under_an_owed_heading={len(issues)} "
+      f"gate_collects={len(issues & seen)} gate_MISSES={len(issues - seen)}")  # 166 / 159 / 7
+print("heaviest:", [(os.path.basename(f), n) for f, n in sorted(agg.items(), key=lambda x: -x[1])[:6]])
 ```
 
 ## Stop conditions
@@ -466,24 +883,43 @@ sed -n '2085,2201p' src/vllm/model_executor/models/ltx2_pipeline.cpp
 ## Owed
 
 * **A ratification, or a refusal, of the GGUF exemption for LTX-2.5.** Owner:
-  the developer, through #2526. Four specs assert "not applicable" and one
-  asserts "owed"; no record arbitrates. §4.3.
+  the developer, through #2526. Five specs assert "not applicable" and no record
+  arbitrates. §A.3, D12.
+* **A ratification, or a refusal, of the PROMPT-ENHANCER exclusion.** A23. It is
+  declared out of scope for every LTX row at `ltx25-res2s-loop.md:271` with no
+  citation and no arbitrating record, which is the same unratified-exclusion
+  shape §5.3 exists to attack. Owner: the developer, through #2526.
+* **A decision on what to fund, and over what period.** §9 derives 25 to 35 rows
+  and REFUSES a duration, because the measured cadence was taken on a population
+  that differs in kind from the remaining one and because A1 has no mechanism.
+  This row will not convert a row count into weeks. Owner: the developer.
 * **An owner for A1**, the adherence repair. `ltx25-prompt-adherence.md` states
   that no row exists. This spec does not create one, because the mechanism is
   still in flight on #2520.
-* **The class-D records sweep, D3 through D10.** Each rides the change that
+* **A row and an issue for the per-stage distilled-LoRA strength**, the one
+  residual of the removed A5. It is named out of scope at
+  `ltx2_pipeline.cpp:1434` and owned by no row. §A.4.
+* **A repair of `scripts/check-agent-record.py`'s owed reader**, D10, with a
+  red-first test. It needs its own spec, because it changes checker semantics.
+* **The class-D records sweep, D3 through D12.** Each rides the change that
   invalidates it, per AGENTS.md "a record edit rides in the pull request whose
-  change made the record stale" -- except D7 and D8, which are stale TODAY and
-  which this row's own landing does not repair. Owner: this row, owed.
+  change made the record stale" -- except D7, D8 and D11, which are stale TODAY
+  and which this row's own landing does not repair. Owner: this row, owed.
 * **A second scored render.** D1. Owner: `LTX25-PROMPT-ADHERENCE`.
 
 ## Now
 
 `LTX25-COMPLETION-SCOPE` is `DONE` as a survey and returns `NEEDS_DECISION` on
-what to fund. The inventory is §3 through §6, the sequence is §8, the number is
-§9, and what could not be determined is §10.
+what to fund, on the two unratified exclusions, and on the schedule. The
+inventory is §3 through §6, the sequence is §8, the count is §9, and what could
+not be determined is §10. **Every number is produced by a command in `## Gates`;
+the ones that were not have been withdrawn.**
 
-The finding a reader should carry away first: **class C is empty.** Nothing in
+Two findings a reader should carry away. **Class C is empty:** nothing in
 LTX-2.5 is externally blocked on the engine side, and the three arms recorded as
-unreachable are ordinary work -- one of them already landed. The thing that
-actually blocks "complete" is a failing correctness gate with no owner.
+unreachable are ordinary work — one of them already landed. And **the survey's
+own method was weakest where it read this tree**: two class-A entries described
+arms that had shipped, one described a cache upstream never builds, one pointed
+at a refusal for a different capability, and a closed sweep over the refusal
+surface found nine gaps in no class at all. What actually blocks "complete" is
+still a failing correctness gate with no owner and no mechanism.

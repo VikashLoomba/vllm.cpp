@@ -70,6 +70,15 @@ An environment variable that quietly did not take would have left the CPU leg on
 the board and produced two tiers agreeing perfectly, which is the shape of an
 instrument pointed at the wrong thing.
 
+**One honest wrinkle in the harness, recorded rather than smoothed.** Neither
+job's final `JOB_VERDICT` line reached the share: the log-sync loop is killed by
+the `EXIT` trap before the last copy, so both logs end a few lines short. Nothing
+here rests on a job's own verdict line. Every assertion this document cites is a
+line the log carries explicitly — the op-selection counts, the manifest row
+counts, the identity controls, the alignment controls — and each of them is a
+`fail()` in the job, so a run that reached the artifacts below cannot have
+violated one. All nine profile tarballs and all six logit tarballs are present.
+
 ## The controls
 
 | control | result |

@@ -184,6 +184,33 @@ bool GgufQuantComputeAvailable(vt::DeviceType dev);
 // the default follows it with no edit here.
 bool GgufNvfp4ComputeAvailable(vt::DeviceType dev);
 
+// Whether the CIQ G7 i8mm repack-at-load applies to THIS load (#2406).
+//
+// `vt::cpu::QuantRepackActive()` is a pure HOST-ISA probe: it answers whether
+// this CPU has i8mm and whether `VT_CPU_QUANT_REPACK` left it on. It has no
+// device term, and for a while neither did the policy line that read it — so on
+// an aarch64 i8mm host that also has a GPU (dgx GB10 and Jetson Thor are both
+// fleet devices), a `--device cuda` load of a Q8_0 GGUF repacked the weight into
+// the ARM `block_q8_0x4` interleave and staged those bytes to a card whose quant
+// kernels read plain `block_q8_0`. Nothing on the CUDA side reads
+// `Tensor::repacked`. That is silent wrong tokens where the runtime tripwire in
+// `qwen3_5.cpp` does not fire first, and a refusal by name where it does.
+//
+// The device term is the same one `elem_kn_repack` has always carried, for the
+// identical reason its comment gives: only the CPU `MatmulBTKernel` understands
+// a repacked buffer, and a staged device would upload it and misread it.
+//
+// `host_repack_active` IS A PARAMETER, not a call inside this function, and that
+// is what makes the rule testable. `QuantRepackActive()` compiles to a literal
+// `false` on every non-aarch64 target (src/vt/cpu/cpu_quant_repack_arm.cpp), so
+// an assertion that reached this decision only through `FromEnv` would pass on
+// x86 CI whether the device term existed or not — a mute switch, not a gate.
+// This is the same move `RouteGgufTensor` above made for `dev`: a decision that
+// takes its inputs can be checked from a host that is not the one it decides
+// for.
+bool QuantRepackForDevice(bool keep_quant, bool cpu_ref,
+                          bool host_repack_active, vt::DeviceType dev);
+
 // Loader-wide residency policy.
 struct GgufLoadPolicy {
   // Master switch for keep-quant residency. The STRUCT default stays false so
@@ -287,7 +314,9 @@ struct GgufLoadPolicy {
   // and the gemm folds the scale in the same order with a non-fused MAC, so it
   // is BIT-IDENTICAL to the non-repacked path. Rides keep_quant AND
   // vt::cpu::QuantRepackActive() (i8mm present, not disabled by
-  // VT_CPU_QUANT_REPACK=0), and is forced off by cpu_ref. Because the transform
+  // VT_CPU_QUANT_REPACK=0) AND the resolved device being kCPU (#2406 — the
+  // interleave has no reader off the CPU quant GEMM), and is forced off by
+  // cpu_ref. Because the transform
   // mutates the buffer it selects the COPY residency for the tensors it touches
   // (an mmap borrow is read-only); every other tensor keeps its chosen
   // residency. VT_CPU_QUANT_REPACK=0 is the same-binary A/B opt-out (it also
@@ -315,17 +344,20 @@ struct GgufLoadPolicy {
   // answers `kCPU` even on a CUDA-capable process. Nothing in the residency
   // path reads `vllm::platforms::CurrentPlatform()` any more.
   //
-  // NOT "every device-dependent decision reads this field". An earlier draft of
-  // this comment said that and it was false. `quant_repack` below is set from
-  // `vt::cpu::QuantRepackActive()`, a pure HOST-ISA probe with no device term
-  // at all, so on an aarch64 i8mm CUDA box a `--device cuda` load still
-  // ARM-repacks its Q8_0 weights into `block_q8_0x4` and stages them to the
-  // card, and `cuda_quant_dot.cu` contains no reader for the `repacked` marker.
-  // Its sibling `elem_kn_repack` IS gated `dev == kCPU` for exactly this
-  // reason. That gap is pre-existing and this row does not widen it, but a
-  // sentence that asserts it away is worse than the gap: it tells the next
-  // reader not to look. Tracked as its own issue and listed under `## Owed` in
-  // `.agents/specs/gguf-residency-resolved-device.md` (issue #2406).
+  // EVERY device-dependent decision in this struct now reads this field, and
+  // that sentence is only safe to write because the last exception was closed.
+  // An earlier draft asserted it while `quant_repack` was still set from
+  // `vt::cpu::QuantRepackActive()` alone — a pure HOST-ISA probe with no device
+  // term — so on an aarch64 i8mm CUDA box a `--device cuda` load ARM-repacked
+  // its Q8_0 weights into `block_q8_0x4` and staged them to a card whose
+  // `cuda_quant_dot.cu` has no reader for the `repacked` marker. That was
+  // issue #2406, and it is fixed at `QuantRepackForDevice` above, which takes
+  // `dev` exactly as its sibling `elem_kn_repack` always did.
+  //
+  // The claim is checkable rather than asserted: a `dev` that reaches no flag
+  // would leave `QuantRepackForDevice`'s CUDA row of
+  // `tests/vllm/test_gguf_keep_quant.cpp`'s truth table green on a `kCPU`
+  // answer, which it is not.
   //
   // The STRUCT default is `kCPU` for the same reason `keep_quant` defaults
   // false: a default-constructed policy is the historical all-expand load, and

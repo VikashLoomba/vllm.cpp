@@ -324,7 +324,15 @@ TEST_CASE(
   }
 
   std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
-  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, 1, T, kKvHeads, kHeadDim},
+  // RANK 4, NOT 5 (#2435). The paged K/V page is logically
+  // `[2, num_blocks, block_size, num_kv_heads, head_size]`, and `vt::Tensor`
+  // holds four dimensions (`vt::kMaxRank`). Folding the leading K/V axis into
+  // the block axis keeps the same bytes, the same element count and the same
+  // `data` pointer -- which is all this fixture takes from the buffer, because
+  // `PagedKvCache` carries the five extents as separate scalars. The rank-5
+  // spelling wrote past `Tensor::shape` and `Tensor::stride` and set
+  // `Tensor::repacked` as a side effect; `dense_attn::MakeTensor` now refuses it.
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, T, kKvHeads, kHeadDim},
                               kv.data());
   std::vector<vllm::PagedKvCache> attn_kv(1);
   attn_kv[0].data = kv_b.t().data;

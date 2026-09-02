@@ -492,8 +492,16 @@ TEST_CASE(
   std::vector<int32_t> bt{0};
   std::vector<int64_t> slots(static_cast<size_t>(T));
   for (int64_t t = 0; t < T; ++t) slots[static_cast<size_t>(t)] = t;
+  // RANK 4, NOT 5 (#2435). The paged K/V page is logically
+  // `[2, num_blocks, block_size, num_kv_heads, head_size]`, and `vt::Tensor`
+  // holds four dimensions (`vt::kMaxRank`). Folding the leading K/V axis into
+  // the block axis keeps the same bytes, the same element count and the same
+  // `data` pointer -- which is all this fixture takes from the buffer, because
+  // `PagedKvCache` carries the five extents as separate scalars. The rank-5
+  // spelling wrote past `Tensor::shape` and `Tensor::stride` and set
+  // `Tensor::repacked` as a side effect; `dense_attn::MakeTensor` now refuses it.
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, 1, T, p.num_key_value_heads, p.head_dim},
+                              {2, T, p.num_key_value_heads, p.head_dim},
                               kv.data());
   // W5i: the indexer side cache is PAGED, `[num_pages, block_size, D]`. One page
   // of `T` rows here, matching the single-page K/V beside it.
@@ -683,7 +691,7 @@ TEST_CASE(
   std::vector<uint16_t> kv(
       static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+                              {2, T, kKvHeads, kHeadDim}, kv.data());
   std::vector<vllm::PagedKvCache> attn_kv(1);
   attn_kv[0].data = kv_b.t().data;
   attn_kv[0].dtype = DType::kBF16;
@@ -826,7 +834,7 @@ TEST_CASE(
   std::vector<uint16_t> kv2(
       static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv2_b(d, DType::kBF16,
-                               {2, 1, T, kKvHeads, kHeadDim}, kv2.data());
+                               {2, T, kKvHeads, kHeadDim}, kv2.data());
   std::vector<vllm::PagedKvCache> attn_kv2(1);
   attn_kv2[0] = attn_kv[0];
   attn_kv2[0].data = kv2_b.t().data;
@@ -1114,7 +1122,7 @@ TEST_CASE(
     std::vector<uint16_t> kv(
         static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
     vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                                {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+                                {2 * kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
     // GROUP 2: the fused MLA page, [num_blocks, block_size, indexer_head_dim],
     // POISONED so an unwritten row is distinguishable from a written zero.
     std::vector<uint16_t> idx(static_cast<size_t>(kIdxRows * kIdxHeadDim), kPoison);
@@ -1482,7 +1490,7 @@ TEST_CASE(
     std::vector<uint16_t> kv(
         static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
     vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                                {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+                                {2 * kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
     std::vector<uint16_t> idx(
         static_cast<size_t>(kBlocks2 * kPage * kIdxHeadDim), 0);
     vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
@@ -1719,7 +1727,7 @@ TEST_CASE("qwen4_exp: a SECOND step decodes on the engine's own persistent cache
   std::vector<uint16_t> kv(
       static_cast<size_t>(2 * kBlocks0 * kPage * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
+                              {2 * kBlocks0, kPage, kKvHeads, kHeadDim}, kv.data());
   constexpr uint16_t kPoison = 0x3F80;
   std::vector<uint16_t> idx(static_cast<size_t>(kIdxRows * kIdxHeadDim), kPoison);
   vllm::dense_attn::DBuf idx_b(d, DType::kBF16, {kBlocks2, kPage, kIdxHeadDim},
@@ -2036,7 +2044,7 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward runs a Q8_0 hyper-connection mix we
 
   std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+                              {2, T, kKvHeads, kHeadDim}, kv.data());
   std::vector<vllm::PagedKvCache> attn_kv(1);
   attn_kv[0].data = kv_b.t().data;
   attn_kv[0].dtype = DType::kBF16;
@@ -2129,7 +2137,7 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward runs a Q8_0 hyper-connection mix we
   }
   std::vector<uint16_t> kv2(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv2_b(d, DType::kBF16,
-                               {2, 1, T, kKvHeads, kHeadDim}, kv2.data());
+                               {2, T, kKvHeads, kHeadDim}, kv2.data());
   std::vector<vllm::PagedKvCache> attn_kv2(1);
   attn_kv2[0] = attn_kv[0];
   attn_kv2[0].data = kv2_b.t().data;
@@ -2293,7 +2301,7 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward on a CUDA queue gets past the QSA b
 
   std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
   vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
-                              {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+                              {2, T, kKvHeads, kHeadDim}, kv.data());
   std::vector<vllm::PagedKvCache> attn_kv(1);
   attn_kv[0].data = kv_b.t().data;
   attn_kv[0].dtype = DType::kBF16;
@@ -2544,7 +2552,7 @@ TEST_CASE(
   }
 
   std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
-  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, 1, T, kKvHeads, kHeadDim},
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, T, kKvHeads, kHeadDim},
                               kv.data());
   std::vector<vllm::PagedKvCache> attn_kv(1);
   attn_kv[0].data = kv_b.t().data;

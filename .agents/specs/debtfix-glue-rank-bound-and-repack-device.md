@@ -209,7 +209,12 @@ plus the ordinary CPU suite, and `scripts/agent-preflight.sh --staged`.
 ## Evidence
 
 Host: this development box, x86-64, `g++ 13.3.0`, Debug + `-fsanitize=address,undefined`
-with the lane's own `-fno-sanitize-recover=all`. Base `origin/main` `63889449c`.
+with the lane's own `-fno-sanitize-recover=all`. Base `origin/main` `63889449c`;
+every table below was RE-MEASURED on the merged head after `origin/main` moved
+twenty commits (QUANT-IQ3S edits two of the binaries these tables name, so the
+numbers were re-taken rather than carried across: `test_gguf_keep_quant`
+9987 -> 10311 and `test_glm5_next_bridge` 32562 -> 32563 assertions, both still
+`rc=0` with zero findings).
 
 ### #2435 — red, then green
 
@@ -310,6 +315,11 @@ The static scan for rank-5 shapes reads brace literals; a shape built into a
 |---|---|---|---|---|
 | `test_device_pool` | 0 | 0 | 0 | 42 / 42 |
 | `test_glm5_next_moe` | 0 | 0 | 0 | 12731 / 12731 |
+| `test_gguf_keep_quant` | 0 | 0 | 0 | 10311 / 10311 |
+| `test_glm5_next_bridge` | 0 | 0 | 0 | 32563 / 32563 |
+| `test_resident_weight_host_addressable` | 0 | 0 | 0 | 85 / 85 |
+| `test_qwen4_exp_inject_residency` | 0 | 0 | 0 | 8 / 8 |
+| `test_qwen4_exp_matmul_bt_dtype` | 0 | 0 | 0 | 2 / 2 |
 | `test_kv_cache_fp8_wiring` | 0 | 0 | 0 | 487 / 487 |
 | `test_load_direct_upload` | 0 | 0 | 0 | 203 / 203 |
 | `test_qwen3_5_gdn_spec_routing` | 0 | 0 | 0 | 82 / 82 |

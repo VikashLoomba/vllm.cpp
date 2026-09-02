@@ -5090,8 +5090,21 @@ void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgat
            "attn_gate_split: gate_out must match q_out [T,Hq,Dh]");
   VT_CHECK(qgate.shape[0] == t && qgate.shape[1] == hq * 2 * dh,
            "attn_gate_split: qgate must be [T, Hq*2*Dh]");
-  VT_CHECK(q_out.dtype == DType::kF32 && gate_out.dtype == DType::kF32,
-           "attn_gate_split: q_out/gate_out must be f32");
+  // q_out is f32 OR bf16. bf16 is what vLLM's `torch.chunk` produces for a
+  // checkpoint whose model dtype is bf16 (qwen4_exp: qwen3_next.py:430 then :437
+  // hands `q` to q_norm unwidened), and an f32 destination there would move twice
+  // the bytes to hold values a bf16 qgate already rounded. f32 is Qwen3.5's, whose
+  // qk-norm/RoPE chain reads f32.
+  //
+  // gate_out is f32 and only f32: `vt::SigmoidGateBf16` — the only consumer of
+  // this operand — states an f32 gate on each of its four backends. Narrowing it
+  // is #2488's remaining half and is NOT admitted here, because a refusal that
+  // widened ahead of its consumer would move the failure from this call to a
+  // deeper one.
+  VT_CHECK(q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16,
+           "attn_gate_split: q_out must be f32 or bf16");
+  VT_CHECK(gate_out.dtype == DType::kF32,
+           "attn_gate_split: gate_out must be f32 (vt::SigmoidGateBf16 takes an f32 gate)");
   VT_CHECK(qgate.dtype == DType::kF32 || qgate.dtype == DType::kBF16,
            "attn_gate_split: qgate must be f32 or bf16 (bf16 = VT_BF16_GEMM_OUT q_proj)");
   VT_CHECK(q_out.IsContiguous() && gate_out.IsContiguous() && qgate.IsContiguous(),

@@ -3142,3 +3142,191 @@ TEST_CASE("qwen4_exp #2496: the decode step reads the DEVICE identifiers rather 
   CHECK(spliced.ngram2[kPleRank].back() == static_cast<int64_t>(kFresh));
   CHECK(stale.ngram2[kPleRank].back() == static_cast<int64_t>(kStale));
 }
+
+// ─── THE QSA QUERY BUFFER'S WIDTH, AT THE PRODUCTION ENTRY POINT (#2488) ─────
+// vLLM keeps the query at `model_config.dtype` from the fused q/gate GEMM to
+// `q_norm`: `torch.chunk` takes two views and does not widen
+// (`vllm/model_executor/models/qwen3_next.py:430`), and the norm's `.float()`
+// lives inside its own kernel (`vllm/models/qwen4_exp/nvidia/ple_layer.py:70`
+// then `:80` `.to(input_dtype)`). Both citations are FORWARD REFERENCES to vLLM
+// `origin/main` `cdefd9d499`, 1566 commits past this row's pin, which has no
+// `qwen4_exp` at all.
+//
+// WHY THIS CANNOT BE A VALUE TEST. `AGENTS.md`: "A token gate cannot detect a
+// dtype that is too wide. The tokens still match, and the goldens still pass,
+// although the path moves twice the bytes." Every other case in this file reads
+// logits, and not one of them could see an f32 `q`. So this case reads the
+// DTYPE and the BYTE COUNT of the buffer the block actually allocates.
+//
+// HOW IT SEES A BUFFER INSIDE `QsaBlockCore`. A pass-through provider is
+// installed for `kAttnGateSplit` on kCPU above the `vt-native` priority. It
+// records `q_out` and forwards to the native kernel, captured BEFORE the
+// registration so the forward cannot recurse into the spy. Nothing else changes:
+// the same kernel runs on the same tensors, so this instrument cannot alter the
+// result it is measuring.
+//
+// WHY IT IS A REACHABILITY GATE AND NOT A CLASS TEST. It enters through
+// `vllm::ModelRegistry::Forward`, and the count it asserts is a COUNTED PROPERTY:
+// deleting the `RunQwen4ExpQsaBlockPaged` call in `qwen4_exp_forward.cpp` takes
+// `calls` from 1 to 0 and reds this case. A test that constructed the block by
+// hand would stay green through that deletion.
+namespace qsa_q_width {
+
+struct Record {
+  int calls = 0;
+  bool every_q_is_bf16 = true;
+  int64_t last_bytes = -1;
+  int64_t last_numel = -1;
+};
+
+Record& Rec() {
+  static Record r;
+  return r;
+}
+
+vt::AttnGateSplitFn& Native() {
+  static vt::AttnGateSplitFn f = nullptr;
+  return f;
+}
+
+void SpySplit(vt::Queue& q, vt::Tensor& q_out, vt::Tensor& gate_out, const vt::Tensor& qgate) {
+  Record& r = Rec();
+  ++r.calls;
+  r.every_q_is_bf16 = r.every_q_is_bf16 && q_out.dtype == DType::kBF16;
+  r.last_numel = q_out.Numel();
+  r.last_bytes = q_out.Numel() * static_cast<int64_t>(vt::SizeOf(q_out.dtype));
+  Native()(q, q_out, gate_out, qgate);
+}
+
+// Idempotent: doctest may enter this file's cases in any order, and a second
+// registration under the same name is dropped by `RegisterOpProvider` anyway.
+void InstallOnce() {
+  static bool installed = false;
+  if (installed) return;
+  Native() = reinterpret_cast<vt::AttnGateSplitFn>(
+      vt::GetOp(vt::OpId::kAttnGateSplit, vt::DeviceType::kCPU));
+  vt::OpProvider p;
+  p.name = "qsa-q-width-spy";
+  p.priority = 1;  // above kNativeProviderName's 0, so Choose() takes it
+  p.supports = nullptr;
+  p.fn = reinterpret_cast<void*>(static_cast<vt::AttnGateSplitFn>(&SpySplit));
+  vt::RegisterOpProvider(vt::OpId::kAttnGateSplit, vt::DeviceType::kCPU, p);
+  installed = true;
+}
+
+}  // namespace qsa_q_width
+
+TEST_CASE("qwen4_exp: ModelRegistry::Forward splits the QSA query at the MODEL dtype") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  // THE INSTRUMENT'S OWN PRECONDITION, before anything it measures. A null
+  // native pointer would make the spy forward into nothing.
+  qsa_q_width::InstallOnce();
+  REQUIRE(qsa_q_width::Native() != nullptr);
+  qsa_q_width::Rec() = qsa_q_width::Record{};
+  REQUIRE(qsa_q_width::Rec().calls == 0);
+
+  const gguf_test::TempFile f(BuildFixture(FixtureOpts{}));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] = static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv = vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(d, DType::kF32,
+                       std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+                       ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32, std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos, am, gm, attn_kv, gdn, config, q, logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  vllm::ForwardLogits fl;
+  REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  REQUIRE(fl.rows == 1);
+
+  // 1. THE INSTRUMENT RAN. Without this the three assertions below are vacuous
+  //    on a forward that never reached the QSA layer, and a `[SKIP]` would wear
+  //    a PASS. This is also the count the reachability mutation drives to zero.
+  const qsa_q_width::Record r = qsa_q_width::Rec();
+  INFO("kAttnGateSplit calls seen through ModelRegistry::Forward: ", r.calls);
+  REQUIRE(r.calls > 0);
+
+  // 2. THE SHAPE the block asked for is the model's query, not something else.
+  CHECK(r.last_numel == T * kQHeads * kHeadDim);
+
+  // 3. THE DTYPE and 4. THE BYTES. `T*kQHeads*kHeadDim*2` = 128 here. Before
+  //    #2488 this buffer was `DType::kF32` and this number was 256 — the same
+  //    tokens, twice the traffic, which is the whole reason the assertion is on
+  //    the width and not on the output.
+  CHECK(r.every_q_is_bf16);
+  CHECK(r.last_bytes == T * kQHeads * kHeadDim * 2);
+}

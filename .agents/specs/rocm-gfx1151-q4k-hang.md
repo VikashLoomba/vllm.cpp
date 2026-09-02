@@ -669,6 +669,59 @@ while `uaf` faults says the DMA engine is the executor, not the author.
 PHASE B is the model-level counterpart, `VT_ADOPT_DEVICE_BYTES=0` against an
 unset baseline, alternating with the within-round order rotating.
 
+## W6 RESULT: W5 is REFUTED, from both sides
+
+rc job `1fabe3c2-d44f-4667-8291-b97d21782f8e`, boot
+`a5bc8128-f6ad-4767-8614-6923f88032e1`, log
+`/mnt/nas_share/rc/rocm-strix-shape/evidence4/uaf.log`.
+
+**PHASE A, the loader shape standalone, four arms interleaved over six rounds:**
+
+| arm | what it varies | legs | failures |
+|---|---|---|---|
+| `uaf` | `madvise(MADV_DONTNEED)` + `free()` right after the async copy | 6 | **0** |
+| `sync` | `hipStreamSynchronize`, THEN release | 6 | **0** |
+| `nofree` | never release | 6 | **0** |
+| `uafnosdma` | `uaf` under `HSA_ENABLE_SDMA=0` | 6 | **0** |
+
+24 legs, 145 uploads each at the measured sizes (96 x 62,914,560 B, 48 x
+104,857,600 B, 1 x 2,542,796,800 B) from `std::vector` blocks glibc serves by
+`mmap`, with the production Q6_K GEMM launched after every upload. Nothing
+faulted. The release that W5 named does not fault on its own.
+
+**PHASE B, the model-level A/B, alternating with the order rotating:**
+
+| arm | legs | failures |
+|---|---|---|
+| `base` | 6 | 1 |
+| `adopt0` (`VT_ADOPT_DEVICE_BYTES=0`) | 6 | **4** |
+
+Turning the adoption off did not fix the fault; the arm without it failed MORE.
+That is the same shape as W2, where the arm that removed the suspected mechanism
+also failed more, and the reading is the same: the mechanism is not the cause.
+
+**So W5 is refuted.** `ResidentWeight`'s unwaited `hipMemcpyAsync` followed by
+`AdoptDeviceBytesAsHost` is not the cause of #2511, measured standalone and
+measured in the model. The section above stays in this spec because the next
+reader will otherwise re-derive it: it is a genuine ordering smell, it is
+reachable, and it is not this bug.
+
+**Read PHASE A with its limit.** A clean `uaf` arm proves that the release is
+harmless OR that the copy never raced, and this probe does not separate those:
+it never measured whether `hipMemcpyAsync` from PAGEABLE host memory is
+asynchronous on this runtime. HIP is permitted to make that copy synchronous,
+and if it is, then no call site in this tree that hands `Copy` a pageable source
+can race at all, and the whole family is refuted rather than just this member.
+Timing does not settle it here, because every arm ends on the same
+`hipDeviceSynchronize` and all four measured 8-10 s. That measurement is one
+`std::chrono` bracket around a single 2.4 GiB `hipMemcpyAsync` call and it is
+worth taking on the next lease.
+
+**Note also that `base` failed only 1 of 6 in this job**, against 4 of 5 in W4
+and 5 of 6 in W3, on the same binary and the same boot. The rate is not stable
+between jobs. Every arm ratio in this spec has to be read against that, and it
+is a second reason no arm may be called a fix from one job.
+
 ## Next hypotheses, in the order they are worth testing
 
 The kernel is exonerated at its own geometry, so the remaining surface is what

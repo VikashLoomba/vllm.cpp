@@ -2555,6 +2555,12 @@ vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
 # only under VLLM_CPP_HIP -- its cases skip when no ROCm backend is registered,
 # and a suite that only a HIP build compiles is a suite CI never reads.
 vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
+# BACKEND-VULKAN-EXL3 (#2530): the Vulkan arms of the same two ops. Built in
+# EVERY configuration for the same reason as the ROCm sibling above -- its cases
+# skip when no Vulkan backend is registered. UNLIKE that sibling this suite needs
+# NO GPU and NO lease to say something: llvmpipe is a conformant Vulkan 1.1
+# device, so the `build-test-vulkan` CI leg runs the byte gate for real.
+vllm_cpp_add_test(test_exl3_vulkan vt/test_exl3_vulkan.cpp)
 
 # QUANT-EXL3 W1a (#2181). Placed after the MODEL-DSV4-EXL3 kernel suites above
 # rather than among them: these two gate the SCHEME on the shared linear seam,

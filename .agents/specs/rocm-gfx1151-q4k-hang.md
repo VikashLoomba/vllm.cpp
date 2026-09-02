@@ -163,6 +163,44 @@ reader will otherwise re-derive them.
 
 ## Owed
 
+Found by a fresh audit during this row, read in the source rather than relayed,
+and NOT the cause of #2511. Each needs an issue and an owner; none is fixed
+here, because a fix built on this row's flow would ride an unrelated diff.
+
+- **`ResidentWeightF32` frees an async copy's source on the next line.**
+  `src/vllm/model_executor/models/qwen3_5.cpp:1226-1246` and the byte-identical
+  `include/vllm/model_executor/models/dense_attn_block.h:342-360`:
+  `std::vector<float> f = WeightF32(w); … d.b.Copy(d.q, p, f.data(), nb);` and
+  then `f` is destroyed at the closing brace with no `Synchronize`. W7 measured
+  that `Backend::Copy` completes inside the call on THIS board, so it is latent
+  here; on a discrete ROCm card, where the copy is a real DMA, it is live.
+- **`EnsureQuantScratch`'s lock protects the map and not the entry.**
+  `src/vt/rocm/rocm_grouped_gemm.hip:594-608`: `ScratchFor` returns a reference
+  after its `lock_guard` is destroyed, and the read-modify-write of `sc.buf` /
+  `sc.bytes` happens unlocked. Safe at one engine thread, which is what this
+  workload has, and stated nowhere. The same function keys a `static
+  std::unordered_map` on `hipStream_t`, a handle the runtime recycles after
+  `hipStreamDestroy` (`rocm_backend.hip:219-223`), so a recycled value maps to a
+  `hipMallocAsync` block ordered on a stream that no longer exists.
+- **`LtWorkspace` grows by freeing with work possibly in flight.**
+  `src/vt/rocm/rocm_matmul_hipblaslt.hip:298-309`: one `thread_local` workspace
+  serves every hipBLASLt shape, and a grow does `hipFree(ws)` then
+  `hipMalloc(&ws, need)` with no ordering against a previously enqueued
+  `hipblasLtMatmul` that may still be writing it. Not reached on this workload —
+  the dense Q4_K projections go to `rocm_grouped_gemm.hip` — and its absence is
+  checkable for free, because `MatmulBTLt` prints `hipBLASLt COL ok M=…` on
+  every first-seen shape.
+- **Unsynchronised pointer-table uploads on the ROCm fp8 MoE path.**
+  `src/vt/rocm/rocm_fp8_channel_gemv.hip:509-524`: five `hipMemcpyAsync` calls
+  from caller arrays into `thread_local` device tables that a kernel then
+  dereferences AS POINTERS, with no sync and no pinned staging. The identical
+  shape sits in `src/vt/rocm/rocm_matmul_hipblaslt.hip:653-676`
+  (`MatmulBTPointerBatchKernelRocm`), which has no caller anywhere in the tree
+  and is therefore dead code one call site away from being real. Neither is
+  reachable on a dense model with no routed-expert layers.
+
+Filed earlier in this row:
+
 - [#2522](https://github.com/mudler/vllm.cpp/issues/2522) — `GdnStateGatherK` /
   `GdnStateScatterK` index the GDN state cache at an unbounded `state_idx[row]`
   and are never passed the slot count, while the sibling `GdnScanK` in the same
@@ -859,6 +897,71 @@ in the GPU's tables is a hard violation, reported at whatever address the walk
 produced, against whatever kernel was resident. That is the class W8 measures,
 and it is the reason `HSA_ENABLE_SDMA=0` is interesting: SDMA is what moves
 managed pages on an HMM board.
+
+## W8 RESULT: lazy residency is NOT the trigger either
+
+rc job `d535e65c-33a6-40a0-918e-0e21b82a6df2`, log
+`/mnt/nas_share/rc/rocm-strix-shape/evidence6/w8.log`. Four arms, eight rounds,
+interleaved with the order rotating, 250 alloc-copy-consume iterations a leg:
+
+| arm | weight allocation | legs | failures |
+|---|---|---|---|
+| `fresh` | allocate, copy and consume in the same breath | 8 | **0** |
+| `pre` | everything allocated and copied before the first dispatch | 8 | **0** |
+| `freshsync` | `fresh` + `hipStreamSynchronize` after the alloc | 8 | **0** |
+| `freshnosdma` | `fresh` under `HSA_ENABLE_SDMA=0` | 8 | **1** (GPUHANG) |
+
+Consuming a managed buffer that came into existence a moment earlier does not
+reproduce the fault, and staging everything first does not prevent anything,
+because there was nothing to prevent. Lazy residency is the pattern the model
+runs, and it is not sufficient.
+
+**One thing here IS new: that GPUHANG is the FIRST standalone fault this row has
+seen.** Across W3 (30 legs), W6 (24) and W8 (32) — 86 standalone legs — exactly
+one faulted, against a model rate that has run between 17% and 83%. So the
+probes are not incapable of faulting; they reproduce the conditions weakly. Read
+the arm it landed in with care: it landed in `freshnosdma`, the arm that should
+be safest, at n=8. That reads as the box's floor, not as an arm effect, and it
+is recorded rather than interpreted.
+
+## What is left, after everything this row has eliminated
+
+The eliminations are worth reading together, because they converge:
+
+- the kernel, at its own launch geometry (9,000 launches, no fault);
+- the Q6_K FORMAT, and with it the private-memory arm (the site is `Fmt == 0` on
+  one faulting leg);
+- every "we released the copy source" candidate, by construction, because
+  `Backend::Copy` completes inside the call on this board;
+- `AdoptDeviceBytesAsHost`, measured twice and a no-op for a GGUF borrow anyway;
+- `ResidentWeight`'s mmap-alias branch, by an attribute the board reports;
+- lazy residency itself, measured four ways.
+
+What survives is the one thing every arm has in common and no probe has managed
+to stress hard enough. **`gfx1151` cannot take a recoverable page fault
+(`PageableMemoryAccess = 0`), and this tree puts about 25 GiB of migratable
+`hipMallocManaged` memory on it, touched from both sides, while a queue is
+live.** `HSA_ENABLE_SDMA=0` is the only arm that has moved the rate, and on an
+HMM board SDMA is what moves managed pages. Every fault address is
+page-aligned, four of five are outside any user address space, and none lies in
+any allocation the process ever made — which is what a walk over a mapping that
+is being changed underneath it produces, and is not what an out-of-bounds index
+produces.
+
+**The next A/B is one predicate wide and it is in this tree.**
+`UseManagedAlloc` (`src/vt/rocm/rocm_backend.hip:142`) is what routes every
+`Backend::Alloc` to `hipMallocManaged` instead of `hipMalloc`, and it is a pure
+function of three attributes with no env knob. Put it behind one, default ON so
+no shipped behaviour changes, and run it interleaved against the baseline the
+way this row has run every other arm. If plain `hipMalloc` removes the fault,
+the cause is managed memory on a part that cannot fault and recover, the repair
+is in this tree — do not take the managed branch on a device reporting
+`PageableMemoryAccess = 0` — and #2511 closes with a fix rather than with the
+SDMA workaround. If it does not, the remaining surface is the driver, and the
+row ends with the report its `## Stop conditions` already provides for.
+
+That needs a rebuild of one translation unit, which `q6k.sh` already showed how
+to do inside a lease, so it is a dispatch and not a research question.
 
 ## Next hypotheses, in the order they are worth testing
 

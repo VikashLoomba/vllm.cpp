@@ -268,15 +268,67 @@ need it. #2515 records why that deletes a correct refusal.
 - **The ROCm MLA/DSA arm**, eight ops (`.agents/specs/rocm-glm53-dsa.md`).
   Every one of them runs on the reference tier in this row's result, which is
   why no speed number is quoted.
-- **`--fit`'s resolver is not residency-aware.** It sizes a placement from
-  bytes alone, so on a device whose keep-quant set does not cover the file's
-  expert encodings it can resolve a placement that leaves towers unplaced —
-  and those towers then expand and refuse. On this board the operator has to
-  say `cpu_moe`. Needs its own issue before anyone changes the resolver.
+- **`--fit`'s resolver is not residency-aware**, filed as
+  [#2565](https://github.com/mudler/vllm.cpp/issues/2565) and CONFIRMED on
+  hardware: with no placement configured it places the trailing 56 of 78, the
+  fit check then passes (this row's own repair), and the load refuses on
+  `blk.3`, one of the 22 it left on the device. On this board the operator has
+  to say `cpu_moe`.
+- **The MLA `fused_nr` availability probe**,
+  [#2564](https://github.com/mudler/vllm.cpp/issues/2564) — the blocker that
+  now stands between this checkpoint and a token on `gfx1151`. Owner
+  `BACKEND-ROCM`.
 - **`quant_repack` for a placed tower** (W5).
 - **The device budget** (#2518) and **the host-slot lane** (#2515), both
   untouched and both re-measured here.
 
 ## Now
 
-`ACTIVE`.
+`ACTIVE` — implemented, gated, and measured on `strix:gpu0`; open as #2562 for a
+fresh review. The row's own scope is complete and the model's remaining blocker
+is named and filed (#2564), not left to be discovered.
+
+## Outcome
+
+**What was measured, on the real artifact.** Both predicates this row names are
+real, and they are SEQUENTIAL rather than alternative: on the base build with
+`VT_CPU_MOE=1` the fit check refuses quoting the un-reduced 216433205760 B with
+all 78 layers already placed (#2517), and with that refusal suppressed the load
+gets one stage further and refuses on
+`blk.3.ffn_gate_exps.weight routed to an EXPAND residency` (#2516). With both
+fixed, the same command LOADS: 1809 tensors, `[vt load] weights 1372.153 s`,
+`gguf prefault spans=589 paged_in=11.620 GiB in 1037.930 s (11.5 MiB/s)`, the
+engine auto-fits `max_model_len` from 1048576 to 8192 against 256 blocks of 32
+tokens, and the scheduler starts. **All 228 routed-expert towers stayed
+compressed**, which is not an inference: `LoadStackedExperts` throws by name on
+any tower that expands, so a load that completes is the proof.
+
+**NO TOKEN CAME OUT, and none is claimed.** The first forward throws inside the
+MLA block. `fused_nr` (`mla_attention.cpp:550-551`) has a
+`vt::OpRegistered(kFusedNormRope, ...)` term, ROCm registers no
+`kFusedNormRope`, and `OpRegistered` is deliberately a native-only probe that
+cannot see the reference tier — so the split A-projection path is taken and
+refuses this checkpoint's block-quantized `kv_a_proj_with_mqa`. The comment at
+`:628-631` states that path is reachable "only with VT_MLA_FUSED_NORM_ROPE=0";
+this run had it unset and is the counterexample. Filed as
+[#2564](https://github.com/mudler/vllm.cpp/issues/2564). That is exactly this
+spec's W6 stop condition, and the row stops there rather than widening into the
+MLA arm.
+
+**What was rejected, with the reason measured rather than assumed.** Repairing
+the host-slot lane: `pageableMemoryAccess = 0` was read off this board, so
+`HostMemoryIsDeviceAddressable` is false and the lane cannot serve here at all
+(#2515 confirmed). Porting ROCm i-quant `vec_dot` (#1940): a placed tower is
+executed by the CPU, and an UNPLACED tower on this board cannot be executed at
+all because `GlmResidentExpertSlice` refuses a non-host-addressable device before
+any kernel is asked for — so those kernels would not have produced a token here.
+Correcting the device budget (#2518): the credited footprint is 11.620 GiB paged
+in against a 58.000 GiB managed ceiling and a 64.00 GiB reported pool, so the
+6.00 GiB of optimism between them cannot decide this load in either direction.
+
+**One measurement about the instrument, not the code.** `vllm-cli`'s sha256 is
+BYTE-IDENTICAL across the base and patched builds
+(`ac37fb6d11ba3c1ae7d3d931777ac32ef6fe6bee00231ba18470330740192529`) while
+`libvllm.so.0.0.3` moves — it is a thin ABI client and nothing in it changed. A
+binary-identity guard that digests only the executable reports two different
+builds as one, and this row measured that rather than inheriting it.

@@ -1933,7 +1933,7 @@ TEST_CASE("FusedNormRope matches the CPU oracle within NMSE <= 5e-4, both styles
   // block, so the strided reduction loop's tail is exercised rather than
   // divided away.
   constexpr int64_t kTokens = 13, kOff = 130, kRot = 16, kMaxPos = 64;
-  constexpr double kEps = 1e-6;
+  constexpr float kEps = 1e-6f;
 
   const std::vector<float> x0 = RandomVec(kTokens * (kOff + kRot), 9101);
   const std::vector<float> w0 = RandomVec(kOff, 9102, -1.0f, 1.0f);

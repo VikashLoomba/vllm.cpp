@@ -5415,7 +5415,14 @@ void MulColVecF32(Queue& q, Tensor& x, const Tensor& col);
 // gate_out are [T,Hq,Dh]. For t in [0,T), hq in [0,Hq):
 //   q_out[t,hq,:]    = qgate row t at offset (hq*2*Dh)      .. +Dh
 //   gate_out[t,hq,:] = qgate row t at offset (hq*2*Dh + Dh) .. +2*Dh
-// T/Hq/Dh are inferred from q_out's shape. All f32.
+// T/Hq/Dh are inferred from q_out's shape.
+//
+// DTYPES. `qgate` is f32 or bf16 (bf16 = a VT_BF16_GEMM_OUT q_proj). `q_out` is
+// f32 or bf16: the split is a pure copy, so a bf16 `q_out` over a bf16 `qgate` is
+// the IDENTITY on every element and costs half the bytes of an f32 one. That is
+// the width vLLM carries — `torch.chunk` does not widen (qwen3_next.py:430) and
+// `q_norm` promotes inside its own kernel, not into an allocation. `gate_out` is
+// f32 on every arm, because `vt::SigmoidGateBf16` takes an f32 gate.
 void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate);
 
 // out[i] = F32ToBF16(attn[i] * sigmoid(gate[i])), sigmoid(x)=1/(1+exp(-x)); out

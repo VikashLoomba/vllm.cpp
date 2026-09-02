@@ -30,6 +30,7 @@
 #include "vt/device.h"  // kNumDeviceTypes
 #include "vt/dtype.h"   // VT_CHECK
 #include "vt/ops.h"
+#include "vt/tensor.h"  // vt::kMaxRank
 
 namespace vllm {
 namespace dense_attn {
@@ -44,8 +45,42 @@ struct Dev {
   Queue& q;
 };
 
+// The one rank bound, in one place, because it has TWO callers that must not
+// disagree: `MakeTensor` below, and `DBuf`'s constructor, which has to refuse
+// BEFORE it draws a pool block (see the comment there).
+inline void CheckRank(size_t rank) {
+  VT_CHECK(rank <= static_cast<size_t>(vt::kMaxRank),
+           "dense_attn: rank exceeds vt::Tensor's kMaxRank (4); vt::Tensor "
+           "stores shape and stride in fixed int64_t[4] arrays and a wider rank "
+           "writes past both");
+}
+
+// THE RANK BOUND (#2435) is `CheckRank` above, and it is the same one
+// `vt::Tensor::Contiguous` (src/vt/tensor.cpp:19-20) has always carried.
+// `vt::Tensor` fixes `kMaxRank = 4` and stores `int64_t shape[4]` and
+// `int64_t stride[4]` (include/vt/tensor.h:12); the loop below indexes both by
+// `i` up to `shape.size() - 1`, so a rank-5 shape wrote eight bytes past the
+// end of each.
+//
+// IT IS NOT A HARMLESS OVERRUN AND IT IS NOT A CRASH, which is why no value
+// gate could see it. `shape[4]` lands on `stride[0]`, which the `i == 0`
+// iteration then rewrites correctly, so the shape damage heals itself.
+// `stride[4]` lands on the three STORAGE MARKERS, and the first iteration
+// writes `acc == 1` there — setting `Tensor::repacked` on a tensor nothing ever
+// repacked. That marker is what `kMatmulBTQuant` reads to choose the i8mm
+// interleaved gemm over the plain one, so the damage is a wrong kernel choice
+// waiting for a weight, not a fault. `test_qwen4_exp_layer_loop` reported the
+// oracle match and aborted under `-fno-sanitize-recover=all` before a single
+// assertion ran; that abort is what has reddened `sanitize-cpu
+// (address,undefined)` on every open pull request.
+//
+// This throws rather than truncating. A silently truncated rank is the same
+// class of defect one level quieter: the buffer would still be sized from the
+// full product, and every consumer would read a tensor whose shape does not
+// describe its bytes.
 inline Tensor MakeTensor(void* data, DType dt, vt::Device dev,
                          const std::vector<int64_t>& shape) {
+  CheckRank(shape.size());
   Tensor t;
   t.data = data;
   t.dtype = dt;
@@ -139,6 +174,13 @@ class DBuf {
   DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
        const void* host = nullptr)
       : b_(&d.b) {
+    // THE RANK BOUND FIRST, ahead of the pool block (#2435). `MakeTensor` at
+    // the bottom of this body is the writer that refuses, and by then
+    // `pool_->Get` has already handed out an allocation. A constructor that
+    // throws never runs its own destructor, so the block would be stranded —
+    // the refusal would trade an out-of-bounds write for a leak. Checking here
+    // costs one comparison on a path that is about to allocate anyway.
+    CheckRank(shape.size());
     int64_t numel = 1;
     for (int64_t s : shape) numel *= s;
     bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);

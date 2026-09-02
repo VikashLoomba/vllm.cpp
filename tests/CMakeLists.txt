@@ -1401,6 +1401,38 @@ target_include_directories(test_glm4_moe_lite_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# #2534. `detail::ActDType` caches its getenv in a function-local static, so one
+# process observes exactly ONE value of VT_ACT_F32 and a single run cannot tell a
+# resolver that READS the lever from one hardwired to its default answer. Re-run
+# the SAME binary with the lever ON, the shape `test_qwen35_paged_forward_gdn_out_f32`
+# and `_glue_fuse_off` above already use.
+#
+# SCOPED, deliberately, and this entry is NOT the whole binary. `VT_ACT_F32=1` is
+# REFUSED at the resolver (the f32 conversion is incomplete; see qwen3_5.cpp and
+# the row spec), so the nine cases that CONSTRUCT a qwen35 model legitimately
+# cannot run under the lever -- they would hit the refusal as an unexpected
+# `THREW exception` and red this entry for doing exactly what it was told to do.
+# What this entry has to prove is narrower: that the resolver READS the lever.
+# The two `qwen27 activation*` cases are the ones that assert that, and neither
+# builds a model.
+#
+# The filter is `qwen27 activation*` and NOT a full name because doctest's
+# `--test-case` splits its argument on COMMAS: a name containing one silently
+# matches nothing, the binary exits 0 having run zero cases, and the entry passes
+# while testing nothing. Both target names are comma-free today and the wildcard
+# keeps that true if either is reworded.
+#
+# The two properties below are what stop a mute pass. FAIL_REGULAR_EXPRESSION
+# takes precedence in ctest, so a run that matched no case -- `assertions: 0` --
+# FAILS instead of reporting success, which is the `zero assertions is a skip
+# wearing a pass` trap this repository has already been bitten by. The PASS regex
+# then requires doctest's own verdict rather than trusting the exit status.
+add_test(NAME test_qwen27_paged_forward_act_f32
+  COMMAND test_qwen27_paged_forward "--test-case=qwen27 activation*")
+set_tests_properties(test_qwen27_paged_forward_act_f32 PROPERTIES
+  ENVIRONMENT "VT_ACT_F32=1"
+  FAIL_REGULAR_EXPRESSION "assertions:[ ]*0[ |]"
+  PASS_REGULAR_EXPRESSION "Status: SUCCESS!")
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
 vllm_cpp_add_test(test_pretokenizer vllm/test_pretokenizer.cpp)
 # Metaspace split=true + Metaspace decoder (Parakeet tokenizer shape) —
@@ -2875,6 +2907,8 @@ vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
 vllm_cpp_add_test(test_ops_moe_nongated_relu2 vt/test_ops_moe_nongated_relu2.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm_weight_dtype vt/test_ops_rmsnorm_weight_dtype.cpp)
+vllm_cpp_add_test(test_ops_rmsnorm_quant_fp8_weight_dtype
+                  vt/test_ops_rmsnorm_quant_fp8_weight_dtype.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_ops_layernorm vt/test_ops_layernorm.cpp)
 vllm_cpp_add_test(test_fused_chain_additivity vt/test_fused_chain_additivity.cpp)

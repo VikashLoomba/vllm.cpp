@@ -188,6 +188,72 @@ vt::DType detail::GdnOutDType() {
   return bf16 ? vt::DType::kBF16 : vt::DType::kF32;
 }
 
+// --- The model's ONE resolved activation dtype (#2534) -----------------------
+//
+// vLLM resolves one model dtype and every layer inherits it; this is that value
+// for the qwen35 trunk. It answers BF16 everywhere by default, which is what the
+// device tiers measured and ship, and it answers F32 on the CPU tier -- and only
+// there -- when `VT_ACT_F32=1`.
+//
+// WHY THE CPU TIER CAN HAVE A DIFFERENT ANSWER AT ALL. On a device tier the BF16
+// activation is the format the GEMM consumes, so the narrow store is what the
+// hardware wants. On the CPU tier nothing consumes it: `LoadActF32`
+// (cpu_quant_gemm.cpp:41) widens every activation element straight back to f32
+// before the row is quantized, and `WidenRowToF32` (cpu_ops.cpp:577) does the
+// same inside RMSNorm. There the narrow store buys memory traffic and costs up
+// to 2^-9 = 1.95e-3 relative per store -- twice per layer on the residual alone,
+// which is added in f32, rounded, and then RE-READ (cpu_ops.cpp:576-583).
+//
+// WHY IT EXISTS. The Q4_K_M arm's declared oracle is llama.cpp b10451, whose CPU
+// graph is f32 with an f16 KV cache (llama-context.cpp:3538-3539), so the token
+// gate has been comparing two engines at different precisions. That difference
+// is about two hundred times ggml's own arch-versus-generic k-quant spread,
+// measured at the pin at 1.4e-05 to 9.8e-05 rms relative. This is the
+// same-binary A/B that separates the two. See
+// .agents/specs/qwen38-27b-q4km-token-exactness.md and issue #2534.
+//
+// Default OFF, so no shipped default and no recorded device measurement moves
+// until that A/B exists. The polarity is opt-IN, unlike `VT_GDN_OUT_BF16`: a
+// leading '1' is the only thing that turns it on.
+bool detail::ActF32FlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] == '1';
+}
+
+vt::DType detail::ActDType(vt::DeviceType dev_type) {
+  static const bool f32 = detail::ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
+  if (!f32) return vt::DType::kBF16;
+  // `VT_ACT_F32=1` is REFUSED, and refusing is the point. The f32 conversion is
+  // INCOMPLETE, so honouring the flag does not produce an f32 engine: it
+  // produces a broken one. Measured on thor:gpu0, rc job 18fc60f0 -- the default
+  // arm stays 33/33 and 780/780 while the f32 arm fails 9 cases and 293
+  // assertions, all of them CROSS-PATH consistency assertions (the indexed
+  // versus fallback GDN pools, the tap versus plain routes, one
+  // CHECK(2.69807 < 0.001)), plus a SIGABRT in the NVFP4 lm_head case. Paired
+  // paths required to agree bitwise no longer do, because one side is retyped
+  // and its reference is not.
+  //
+  // AGENTS.md: refuse an unimplemented arm with a message that NAMES the missing
+  // part, and never leave the missing path to be discovered later. A SIGABRT in
+  // the ninth test case is exactly "discovered later", so the flag aborts here,
+  // once, by name, before any buffer is allocated.
+  //
+  // The resolver itself stays, and it is not dead: every qwen35 activation
+  // buffer reads its answer on every forward, which is the one-model-dtype shape
+  // vLLM resolves and every layer inherits. What is missing is only the f32
+  // ANSWER, and this names what that would take.
+  VT_CHECK(false,
+           "VT_ACT_F32=1 is REFUSED: the qwen35 f32 activation conversion is "
+           "incomplete and would run a numerically inconsistent engine. Missing: "
+           "retype every PAIRED path together (the indexed and fallback GDN "
+           "pools, the tap and plain routes) so the cross-path equality gates "
+           "still hold, and resolve the two bf16 dtype CONTRACTS the trunk feeds "
+           "-- vt::SigmoidGateBf16 (ops.cpp:5105) and the NVFP4 lm_head. Owed in "
+           ".agents/specs/qwen38-27b-q4km-token-exactness.md; issue #2534. Unset "
+           "VT_ACT_F32 to run the shipped bf16 path.");
+  (void)dev_type;
+  return vt::DType::kBF16;  // unreachable; VT_CHECK(false) always throws
+}
+
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
   return e.runtime_enabled && e.cuda && e.has_packed_qkvz && e.uniform_dtype;
 }
@@ -1095,14 +1161,25 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   // interleave, and it was missing until now (issue #1320). The CUDA
   // quant dot reads `block_q8_0`; `VT_CPU_QUANT_REPACK` rewrites the buffer to
   // `block_q8_0x4` at load and only the CPU MatmulBTKernel understands that.
-  // Unlike `elem_kn_repack`, whose policy IS gated on the CPU platform
-  // (gguf_keep_quant.cpp), `quant_repack` rides `QuantRepackActive()` alone —
-  // a HOST-CPU i8mm probe — so an aarch64 box doing `--device cuda` can repack a
-  // Q8_0 weight and then upload it verbatim to a kernel that misreads it. That is
-  // silent wrong tokens, not a crash. Measured harmless on the target checkpoint
-  // (one Q8_0 tensor, 0.01% of parameters, and the instrumented load recorded
-  // `quant_repack = 0`), which is why it is a tripwire here rather than a
-  // campaign; `VT_CPU_QUANT_REPACK=0` is the operator's way past it.
+  // THE POLICY NOW AGREES WITH THIS GUARD (#2406). `quant_repack` used to ride
+  // `QuantRepackActive()` alone — a HOST-CPU i8mm probe with no device term —
+  // so an aarch64 box doing `--device cuda` repacked a Q8_0 weight and uploaded
+  // it verbatim to a kernel that misreads it. `GgufLoadPolicy::FromEnv` now
+  // resolves it through `QuantRepackForDevice(..., dev)`, gated `dev == kCPU`
+  // exactly as its sibling `elem_kn_repack` always was.
+  //
+  // TWO CORRECTIONS TO WHAT THIS COMMENT USED TO SAY. It called the gap
+  // "measured harmless on the target checkpoint (one Q8_0 tensor, 0.01% of
+  // parameters, and the instrumented load recorded `quant_repack = 0`)". The
+  // released `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S stores **194** Q8_0
+  // hyper-connection mix weights (docs/USAGE.md), so the population was never
+  // one tensor; and a repacked `block_q8_0x4` weight DID reach device residency
+  // and refuse here by name on `thor:gpu0`, so the reading of `quant_repack = 0`
+  // did not generalise past the run that took it. The guard stays as belt to
+  // the policy's braces — a runtime refusal is what catches a future caller that
+  // builds a policy by hand — but it is no longer the only thing standing
+  // between an i8mm host and a device upload. `VT_CPU_QUANT_REPACK=0` remains
+  // the operator's same-binary way past the transform entirely.
   VT_CHECK(!w.repacked,
            "qwen3_5: an i8mm-repacked (block_q8_0x4) weight reached device "
            "residency; VT_CPU_QUANT_REPACK is a CPU-only load transform and the "
@@ -1619,6 +1696,14 @@ std::vector<uint16_t> MatmulNvfp4Bf16(Dev d, const std::vector<uint16_t>& x, int
 // Linear [N,K], LoadBf16RawNK) -> vt::MatmulBT, the cuBLASLt TN fast path;
 // nk=false (loader-transposed [K,N]) -> row-major vt::Matmul, unchanged.
 
+// --- The model's ONE resolved activation dtype (#2534) -----------------------
+//
+// The RESOLVER lives in `detail::` (qwen3_5_internal.h) beside `GdnOutDType`
+// and for the same reason: a gate that only reads the parser proves nothing
+// about what the model calls, and this lever is the denominator of the arm's
+// same-binary A/B. This file keeps only the `Dev` adapter.
+DType ActDType(Dev d) { return detail::ActDType(d.q.device.type); }
+
 DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
   const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
@@ -1633,7 +1718,7 @@ DBuf MatmulF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
 DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
   const int64_t M = x.shape[0], N = w.nk ? w.shape[0] : w.shape[1];
   Tensor dw = ResidentWeight(d, w);
-  DBuf dout(d, DType::kBF16, {M, N});
+  DBuf dout(d, ActDType(d), {M, N});
   if (w.nk)
     vt::MatmulBT(d.q, dout.t(), x, dw);
   else
@@ -2483,6 +2568,14 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
                                  direct_scale ? &as.t() : nullptr);
   }
 #endif
+  // BF16 here is `vt::SigmoidGateBf16`'s own contract ("out must be bf16",
+  // ops.cpp:5105), NOT the trunk's activation dtype, so it does NOT follow
+  // `ActDType`. Every other consumer this row retyped takes `IsOutFloat`, which
+  // admits f32; this one does not, and routing an f32 buffer into it aborted 9
+  // cases of test_qwen27_paged_forward under VT_ACT_F32=1. Widening the trunk
+  // therefore leaves ONE bf16 rounding on the gated-attention output, which the
+  // spec records as owed: closing it needs an f32-capable gate kernel, not a
+  // dtype change here.
   DBuf gated(d, DType::kBF16, {T, K});
   vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
   // MODEL-QWEN35-EXL3 (#2495 item 3): o_proj is a single projection in every
@@ -3001,7 +3094,7 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
         vt::MoeMarlinArgs{ac.block, 1, static_cast<int>(M), static_cast<int>(2 * N),
                           static_cast<int>(K), false});
   }
-  DBuf act(d, DType::kBF16, {M, N});
+  DBuf act(d, ActDType(d), {M, N});
   vt::SiluAndMul(d.q, act.t(), gu.t());
   return act;
 }
@@ -3522,11 +3615,27 @@ using detail::GdnOutDType;
 // f32 variance/normalize accumulation regardless — only the residual load/store
 // dtype changes) and halves that traffic. A/B: VT_BF16_RESIDUAL=0 restores the f32
 // residual in the same binary.
-DType ResidualDType() {
+// DISPOSITION, measured 2026-09-02 (#2534), so nobody re-runs this experiment:
+// the bf16 default STAYS, and the `VT_BF16_RESIDUAL=0` rollback was tried
+// against the Qwen3.8-27B Q4_K_M token gate and DID NOT HELP. Same binary, same
+// artifact and recipe, one lever: the divergence rate held at 5 of 6 and two
+// prompts diverged EARLIER (first difference 34 -> 21 and 20 -> 4), so the
+// agreeing-prefix total fell from 155 tokens to 126. The lever is live -- the
+// outputs changed -- it simply does not buy correctness on this arm. So this
+// knob remains what its comment above says it is: a MEMORY-TRAFFIC choice that
+// mirrors vLLM's bf16 residual, plus a diagnostic A/B. It is not a correctness
+// lever and must not be reached for as one.
+//
+// #2534 also wired the trunk in: when `ActDType` resolves f32 the residual
+// inherits it, because a residual narrower than the stream it accumulates is the
+// same lost mantissa twice per layer. That arm is currently REFUSED at the
+// resolver (see ActDType), so this term is bf16-unless-`VT_BF16_RESIDUAL=0`.
+DType ResidualDType(Dev d) {
   static const bool bf16 = [] {
     const char* e = std::getenv("VT_BF16_RESIDUAL");
     return e == nullptr || e[0] != '0';
   }();
+  if (ActDType(d) == DType::kF32) return DType::kF32;
   return bf16 ? DType::kBF16 : DType::kF32;
 }
 
@@ -4318,7 +4427,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -4795,7 +4904,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -5285,7 +5394,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
-  DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
+  DBuf gated_bf16(d, ActDType(d), {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
@@ -5371,9 +5480,15 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dqn2d = Reshape(dq3.t(), {T * Hq, Dh});
     vt::RmsNorm(d.q, dqn2d, Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
-    // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
-    // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
-    // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32.
+    // `RmsNorm` NO LONGER requires `w.dtype == x.dtype`; #2477/#2493 gave the CUDA
+    // kernel its own `Tw`, and #2492 did the same for the ROCm and fp8 twins. This
+    // selection is therefore a WORK-AROUND FOR A CONSTRAINT THAT NO LONGER EXISTS,
+    // and it is left in place rather than removed because it is behaviourally
+    // neutral (the f32 upcast of a bf16 on-disk gamma is exact, so both arms feed
+    // the kernel the same values) and removing it changes a shipped model's code
+    // for no measured gain. When kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use
+    // the raw bf16 on-disk k_norm; otherwise (fp8/35B or toggle off) keep the f32
+    // upcast. bf16 kf · bf16 dkw -> f32.
     Tensor dkw = (kf.dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
                                            : ResidentWeightF32(d, w.k_norm, {Dh});
     Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});
@@ -6931,7 +7046,7 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
   const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
 
@@ -6940,7 +7055,7 @@ void RunLayer(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& cfg,
                   : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T, h_fp8);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
   // ENG-HYBRID-PLACEMENT W3d: through the shared seam. Inert by construction when
@@ -7003,7 +7118,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                                w.down_proj_fp4.input_global_scale_inv,
                                scale_layout);
       } else {
-        DBuf act(d, DType::kBF16, {T, I});
+        DBuf act(d, ActDType(d), {T, I});
         vt::SiluAndMul(d.q, act.t(), gate_up.t());
         vt::ScaledFp4Quant(d.q, ap.t(), as.t(), act.t(),
                            w.down_proj_fp4.input_global_scale_inv,
@@ -7013,7 +7128,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                                    DType::kBF16,
                                    direct_scale ? &as.t() : nullptr);
     }
-    DBuf act(d, DType::kBF16, {T, I});
+    DBuf act(d, ActDType(d), {T, I});
     vt::SiluAndMul(d.q, act.t(), gate_up.t());
     return MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4);
   }
@@ -7033,7 +7148,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     // Qwen3.5's MergedColumnParallelLinear: one raw-NK [2I,H] projection,
     // followed by SiluAndMul and the raw-NK down projection.
     DBuf gate_up = MatmulBf16D(d, dh, w.gate_up_proj);
-    DBuf act(d, DType::kBF16, {T, I});
+    DBuf act(d, ActDType(d), {T, I});
     vt::SiluAndMul(d.q, act.t(), gate_up.t());
     return MatmulBf16D(d, act.t(), w.down_proj);
   }
@@ -7151,7 +7266,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
         d, ap.t(), as.t(), w.down_proj_fp4, DType::kBF16,
         direct_scale ? &as.t() : nullptr);
   }
-  DBuf act(d, DType::kBF16, {T, I});
+  DBuf act(d, ActDType(d), {T, I});
   vt::MoeSiluMul(d.q, act.t(), gate.t(), up.t());  // silu(gate)*up -> bf16
   return fp4 ? MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4)
              : MatmulBf16D(d, act.t(), w.down_proj);  // [T,H] bf16
@@ -7168,7 +7283,7 @@ void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
 
   DBuf attn = layer.is_linear_attention
@@ -7176,7 +7291,7 @@ void RunDenseLayer(Dev d, const Qwen3_5DenseLayerWeights& layer,
                   : FullAttnBlock(d, layer.attn, cfg, dhn.t(), positions, T);
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
 
   hidden = DenseMlpBlock(d, layer.mlp, cfg, dh2.t(), T);
@@ -7195,7 +7310,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
   const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
 
@@ -7210,7 +7325,7 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   }();
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   // KERNEL-FUSION-FRAMEWORK W0 — the first production adoption of the declared
   // fusion seam. post_attention_layernorm is a plain add+residual+gemma-RMSNorm
   // (res += attn; dh2 = norm(res)), the exact chain kFusedAddRmsNorm transcribes.
@@ -7270,7 +7385,7 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   };
 
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
-  DBuf dhn(d, DType::kBF16, {T, H});
+  DBuf dhn(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
   if (std::getenv("VT_DUMP_ACT_SUB") != nullptr)
     std::fprintf(stderr, "[TT-DUMP] post_input_norm ptr=%p rows=%lld\n",
@@ -7319,7 +7434,7 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
     if (f2 != nullptr) { std::fwrite(raw2.data(), 1, raw2.size(), f2); std::fclose(f2); }
   }
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
-  DBuf dh2(d, DType::kBF16, {T, H});
+  DBuf dh2(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
   DumpStage("post_attn_norm", dh2);
 
@@ -7893,11 +8008,11 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Working copy of the embedded hidden (device->device; captured). RunLayerPaged
   // reassigns `hidden` per layer, so this must NOT alias the persistent buffer.
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
            static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   // Upload the per-step inputs ONCE (positions + full-attn metadata + GDN decode
@@ -7974,7 +8089,7 @@ for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // Hidden-state tap (SPEC-MTP I5c): the full [T,H] post-final-norm hidden the
@@ -8032,7 +8147,7 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const Tensor* aux_out = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                        gdn_state, weights, config, logits_indices, hidden_tap,
@@ -8417,10 +8532,10 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   Tensor dtab =
       Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
@@ -8429,7 +8544,7 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   // Final norm is GemmaRMSNorm too (weight applied as 1+w).
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
@@ -8464,10 +8579,10 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   Tensor dtab =
       Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   DBuf dids(d, DType::kI32, {T}, token_ids.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
@@ -8476,7 +8591,7 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // lm_head (the one host Download): PACKED NVFP4 (PERF-27B-LMHEAD-FP4) when the
@@ -8562,7 +8677,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
   // RMSNorms + cat + fc (extracted into MtpHeadHidden, shared with ForwardPaged).
   DBuf hidden = MtpHeadHidden(device, *weights_, *config_, *embed_tokens_,
                               input_ids, target_hidden_states, tokens);
-  DBuf residual(device, ResidualDType(), {tokens, hidden_size});
+  DBuf residual(device, ResidualDType(device), {tokens, hidden_size});
   residual.Zero(device);
   const size_t layer_index =
       static_cast<size_t>(spec_step_idx % num_layers);
@@ -8616,7 +8731,7 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   // paged (writes/reads the draft KV layer via slot_mapping/block_table).
   DBuf hidden = MtpHeadHidden(device, *weights_, *config_, *embed_tokens_,
                               input_ids, target_hidden_states, tokens);
-  DBuf residual(device, ResidualDType(), {tokens, hidden_size});
+  DBuf residual(device, ResidualDType(device), {tokens, hidden_size});
   residual.Zero(device);
 
   // Per-step device inputs for the single full-attention layer (no GDN state) +
@@ -8800,11 +8915,11 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Working copy of the embedded hidden (device->device; captured). RunDenseLayer
   // Paged reassigns `hidden` per layer, so this must NOT alias the persistent buf.
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   d.b.Copy(d.q, hidden.ptr(), hidden_in.data,
            static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
 
-  DBuf res(d, ResidualDType(), {T, H});
+  DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
   // Per-step inputs uploaded ONCE (see StepDevInputs) — no per-layer re-upload.
@@ -8885,7 +9000,7 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
+  DBuf dnorm(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // Hidden-state tap (SPEC-MTP I5c): the full [T,H] post-final-norm hidden the MTP
@@ -8935,7 +9050,7 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                             gdn_state, weights, config, logits_indices, hidden_tap,
@@ -9565,7 +9680,7 @@ std::vector<float> Qwen3_5ReplayLayer(const Qwen3_5MoeLayerWeights& layer,
   // Seed the fused stream with the combined residual input: res = hidden_in,
   // hidden delta = 0. The layer's input_layernorm then normalizes hidden_in.
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   hidden.Zero(d);
   // `Qwen3_5ReplayLayer` replays ONE layer in isolation and is not told which,
   // so it cannot consult a per-layer placement. Passing -1 makes the plan answer
@@ -9600,7 +9715,7 @@ std::vector<float> Qwen3_5ReplayDenseLayer(
   // input is the combined stream, so seed it as `res` and start the bf16 delta
   // at zero before running the real dense attention + SwiGLU layer.
   DBuf res(d, DType::kF32, {T, H}, hidden_in.data());
-  DBuf hidden(d, DType::kBF16, {T, H});
+  DBuf hidden(d, ActDType(d), {T, H});
   hidden.Zero(d);
   RunDenseLayer(d, layer, config, hidden, res, positions, T);
 

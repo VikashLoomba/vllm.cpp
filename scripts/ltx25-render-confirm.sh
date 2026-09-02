@@ -548,7 +548,27 @@ PY
   fi
   # The frames are 4.4 MB a render and only render 1 is judged; keep its frames
   # so a later reader can still check that something was drawn.
-  [ "$i" = 1 ] || rm -f "$D"/frame_*.ppm
+  #
+  # KEEP_FRAMES=1 RETAINS EVERY RENDER'S FRAMES, and it exists because this
+  # deletion is why the row's headline reading has no error bar (#2514).
+  # `.agents/specs/ltx25-prompt-adherence.md` `## Owed` records it exactly:
+  # only render 1 survives, so the S1 adherence margin of -0.7368 is n = 1, and
+  # "a reading that moves by 0.74 between runs would make the S1 verdict a coin
+  # toss rather than a finding". That bullet also names the two ways to close
+  # it -- score inside the loop, or retain past it -- and says the choice was
+  # not made. This is the SECOND one, because it is the one that does not touch
+  # the verdict: the `if [ "$i" = 1 ]` compare block above is untouched, so the
+  # gate this harness enforces is byte-for-byte the gate it enforced before,
+  # and the extra frames are evidence a later CPU pass can score. The cost is
+  # the 4.4 MB a render that the deletion was written to save, which is why it
+  # is a knob and not the default.
+  if [ "${KEEP_FRAMES:-0}" = 1 ]; then
+    NKEPT=$(ls "$D"/frame_*.ppm 2>/dev/null | wc -l)
+    echo "render_${i}_frames_retained=$NKEPT" >> "$OUT/PROVENANCE"
+    say "  KEEP_FRAMES=1: retained $NKEPT frames of render $i for a later scoring pass"
+  else
+    [ "$i" = 1 ] || rm -f "$D"/frame_*.ppm
+  fi
 done
 
 say "=== [I] the decomposition, over $N runs ==="

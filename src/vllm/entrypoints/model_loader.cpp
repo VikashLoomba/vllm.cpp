@@ -2757,7 +2757,52 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
           GgufLoadPolicy::FromEnv(target.device_type());
       static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
       StreamedExpertLane lane;
-      if (target.needs_weight_staging() &&
+      // BACKEND-ROCM-LANE-GUARD (#2507): `allocates_bounded_device_memory()`,
+      // for the SAME reason the refusal below reads it, and this guard has to
+      // read the same one BECAUSE the lane is that refusal's own exemption.
+      // Towers the lane serves leave the bound and the arena enters it; keying
+      // the two halves of one sum on two predicates lets them disagree, and on
+      // ROCm they deliberately do. `needs_weight_staging()` is false there and
+      // `allocates_bounded_device_memory()` is true, so the load drew the one
+      // combination that loses: the refusal fired and the exemption did not,
+      // and GLM-5.3's `UD-IQ1_S` was charged all 187.3125 GiB of the towers it
+      // declares it streams. On CUDA both are true, which is why the same
+      // checkpoint has been generating on a GB10 throughout.
+      //
+      // THE TWO QUESTIONS THIS GUARD ASKS, and neither is answered by
+      // `needs_weight_staging()`:
+      //
+      //   Is a fit computation running at all? `CheckDeviceWeightFit` returns
+      //   before computing anything when its gating argument is false, so a
+      //   lane built for such a load is pure side effect — `Reserve` fixes the
+      //   slot store's geometry for the process and `ResolveExpertStreamRequested`
+      //   latches its streaming answer, and neither belongs on a load whose fit
+      //   check is inert. Only the predicate the fit check is KEYED on can
+      //   answer this, which is what makes the choice forced rather than
+      //   selected.
+      //
+      //   Will the lane actually serve? That is the SECOND term, unchanged, and
+      //   it is unchanged because it was already right: `ExpertSlice`
+      //   (`expert_stream_seam.cpp`) admits the lane at RUNTIME on
+      //   `cpu || host_memory_is_device_addressable()`, with no staging term.
+      //   The load-time guard and the runtime seam now read the same predicate,
+      //   which is the property that stops the bound and the forward
+      //   disagreeing about who serves a tower.
+      //
+      // `needs_weight_staging()` answers a THIRD question that is not asked
+      // here: should the fully-optimized device-resident forward run — the
+      // indexed GDN state I/O, the merged/packed GDN projections, the fp8/bf16
+      // GDN resident prep. It stood in for the first question only because
+      // before #1934 there was no separate predicate for it to stand on. That
+      // row built one and moved the refusal onto it; this one moves the
+      // exemption. NO platform's answer to either predicate changes here.
+      //
+      // NOT a `||`. That would admit ROCm as well and would be wrong: it
+      // re-admits a platform that stages but reports no bounded pool, for which
+      // the fit check computes nothing and the lane is again pure side effect.
+      // `test_gguf_device_fit_reach` pins the plain predicate in both
+      // directions.
+      if (target.allocates_bounded_device_memory() &&
           target.host_memory_is_device_addressable() &&
           gguf_arch.factory != nullptr &&
           gguf_arch.factory->streams_routed_experts &&
@@ -2830,8 +2875,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // guarantee ("anything else is kExpandBf16") makes this condition an
       // EXACT description of every tensor's residency, not a guess — see the
       // header on `GgufStagedWeightFootprint`. `cpu_ref` needs no term of its
-      // own: it is a CPU-only oracle switch, and `needs_weight_staging` above
-      // already excludes every load it could apply to.
+      // own: it is a CPU-only oracle switch, and `allocates_bounded_device_memory`
+      // — the predicate BOTH the lane guard above and the refusal below now read
+      // (#2507) — already excludes every load it could apply to, because it
+      // delegates to `needs_weight_staging()` on CPU and that is false there.
+      // The exclusion this sentence names is unchanged; only the predicate that
+      // provides it moved.
       const bool policy_forces_full_expand =
           GgufPolicyForcesFullExpand(gguf_load_policy);
       // BACKEND-ROCM (#1934): `allocates_bounded_device_memory()`, not

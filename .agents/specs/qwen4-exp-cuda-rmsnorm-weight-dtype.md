@@ -284,11 +284,16 @@ A further wall after #2477 clears is a reportable result, not a failure.
 - [#2488](https://github.com/mudler/vllm.cpp/issues/2488) — **the actual cause.**
   `qsa_block.cpp:694-696` widens `q` and the output gate to f32 where vLLM keeps
   the bf16 model dtype. Blocked on `AttnGateSplit`'s shared f32 signature.
-- [#2503](https://github.com/mudler/vllm.cpp/issues/2503) — the kF16 divergence
-  and the newly-admitted pairing's blast radius.
-- [#2492](https://github.com/mudler/vllm.cpp/issues/2492) — two unreached twins
-  of the same weld: `rocm_rmsnorm.hip:105-177` (no ROCm device in the fleet) and
-  `cuda_ops.cu:578` `RmsNormQuantFp8KernelCuda` (latent).
+- ~~[#2503](https://github.com/mudler/vllm.cpp/issues/2503)~~ and
+  ~~[#2492](https://github.com/mudler/vllm.cpp/issues/2492)~~ — CLOSED by wave
+  RMSTWINS, [`rmsnorm-gamma-dtype-twins.md`](rmsnorm-gamma-dtype-twins.md). Both
+  twins now take their own `Tw`; kF16 is served rather than recorded; and the
+  blast radius #2503 asserted was MEASURED AND REFUTED — none of the five
+  architectures it named has a GGUF arm at all. That wave's own `## Owed` carries
+  what it did not close: [#2542](https://github.com/mudler/vllm.cpp/issues/2542)
+  (the kF16 ACTIVATION, the same class one operand over) and
+  [#2543](https://github.com/mudler/vllm.cpp/issues/2543) (`RmsNormPlusAddRocm`,
+  a third instance of the weld in the same uncompilable file).
 - [#2476](https://github.com/mudler/vllm.cpp/issues/2476), localised, still
   blocking the gate.
 - [#2496](https://github.com/mudler/vllm.cpp/issues/2496), the token divergence —

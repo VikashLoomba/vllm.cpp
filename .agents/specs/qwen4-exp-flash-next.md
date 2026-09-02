@@ -8304,6 +8304,108 @@ No speed number: every arm is n=1 on a shared box. UD-IQ1_S only, one sequence,
 attributes to the `step == nullptr` branch of `BuildCompletionLogProbs`; nothing
 here reads them.
 
+## Wave MOEDIV — is the MoE prefill divergence a SELECTION FLIP? (#2552)
+
+### The question, and why the existing instrument cannot answer it
+
+Wave PREFILLDIV ([#2547](https://github.com/mudler/vllm.cpp/issues/2547),
+[#2554](https://github.com/mudler/vllm.cpp/pull/2554)) isolated TWO sources of
+CPU/CUDA prefill divergence at decoder layer 0, the only layer whose input is
+bit-identical on both CUDA arms. The first is the chunked Gated DeltaNet
+prefill, and it is not a defect: it mirrors vLLM's vendored Flash-Linear-Attention
+precision map at all five anchors. The second is the MoE block, which turns a
+`2.1e-05` input difference into a `7.269e-05` output difference and which
+`VT_GDN_CHUNKED=0` moves by only 1.7x, against 332x on the Gated DeltaNet tap.
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) owns that second source.
+
+`VT_Q4EXP_LAYER_FP` taps VALUES. **A value tap cannot separate an
+expert-selection flip from re-association inside the expert GEMM**, because a
+discrete selection has bimodal error and not a tolerance: one token's top-k set
+either changes, and that token's MoE output changes by an O(1) amount, or it
+does not change at all and the residue is rounding. Averaging both into one
+`rel(sum|x|)` destroys exactly the bit that decides which of the two happened.
+
+### What this wave lands
+
+`VT_MOE_SEL_FP=<calls>` — a **selected-expert-id tap** on the reference arm of
+the shared sparse-MoE block (`MoeBlock`, `qwen3_5.cpp`), which is the arm
+`RunQwen4ExpMoeBlock` reaches on a stacked keep-quant checkpoint. For the first
+`<calls>` block invocations of the process it prints, per token:
+
+* the selected expert ids **SORTED**, because the assertion between two arms is
+  SET equality and the selection ORDER is not part of it (`vt::MoeCombine` sums
+  over the k slots and is order-invariant given the weights);
+* `lo`, the smallest selected router logit, and `hi`, the largest rejected one,
+  each with its raw bf16 bit pattern;
+* `margin = lo - hi` in **LOGIT** space rather than probability space, because
+  the softmax denominator is itself a device-order f32 reduction and differs
+  between the arms, while the bf16 logits are the values the selection is
+  actually a function of;
+* `ulps`, the number of representable **bf16** steps between `hi` and `lo`
+  under the sign-magnitude total order. `ulps=0` means the two logits are the
+  SAME bf16 value and the boundary was decided by the lowest-index tie-break —
+  a knife edge that one ulp of re-association anywhere upstream will flip.
+  `ulps` is the honest margin for a bimodal error: a probability difference
+  reads as "small" for a gap of one representable step and for a gap of fifty.
+
+and, per call, one digest line carrying `sel` (an FNV-1a hash over every token's
+sorted id list, so **selection-set equality between two arms is one string
+comparison per layer**), the minimum `ulps` over the call's tokens, and four
+`sum|x|` axes that decompose the block's own output: `x` (the block input),
+`logit` (the router logits), `exp` (the assembled per-slot expert outputs before
+the combine) and `shr` (the shared expert). With the selection sets equal, those
+four say WHICH of the block's GEMMs carries the residue; with them unequal, the
+per-token lines say which token flipped and how near the tie was.
+
+### The counted property
+
+`lines=` on every digest line is the running total of value lines the tap has
+printed. **An instrument that never ran and two arms whose taps agreed look the
+same in a diff**, and this row has already paid for that twice (a job that
+searched `$BLD/vllm-server` while ninja links `examples/vllm-server`, and a
+doctest case whose name contained a comma so `-tc` split it). The measuring job
+asserts `lines == calls * T` and refuses to report a comparison otherwise.
+
+### Scope, and what this wave does NOT do
+
+It is a diagnostic tap and one measurement. It changes no math on any arm: the
+tap reads host buffers the reference path had already downloaded (`h`, `logits`,
+`ids`, `expert_out`) plus one guarded download of the shared-expert output, and
+it is inert with the environment variable unset. It lands on the reference arm
+only. The three fused CUDA arms (`MoeBlockFusedCuda`, `MoeBlockFusedMarlinCuda`,
+`MoeBlockBf16Cuda`) keep their ids on device and are NOT tapped, which is
+recorded rather than hidden: no `qwen4_exp` checkpoint reaches them, and adding
+a device readback to a capturable path to instrument a model that cannot enter
+it would be dead code by construction.
+
+### Gates
+
+* `ctest -R test_qwen4_exp_moe` at rc 0, with the tap's ids and `ulps` gated
+  against `MoeReference`, the suite's independent double-precision oracle
+  reimplementation, on both the bf16 and the keep-quant arm.
+* The reachability mutation deletes the tap's production call site inside
+  `MoeBlock` and the tap case must RED.
+* `scripts/agent-preflight.sh --fail-on-skip` at rc 0.
+
+### Evidence required
+
+One `rc` lease on `thor:gpu0`, one binary, the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact (shard 1 sha256
+`88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd`), the same
+prompt and server flags PREFILLDIV used, and three arms: `--device cpu` as the
+control, `--device cuda`, and `--device cuda` with `VT_GDN_CHUNKED=0` so the
+MoE residue is read with the first source removed. The result is the per-layer
+`sel` hash comparison plus the `ulps` distribution.
+
+### Stop conditions
+
+Stop and report `PENDING` if the artifact cannot be staged; do not substitute
+another checkpoint. Stop if the answer is that the CUDA arm mirrors vLLM and our
+CPU arm is the outlier, exactly as PREFILLDIV concluded for the Gated DeltaNet:
+say so with the upstream anchors and close #2552 as answered rather than fixed.
+**Do not force a fix.** Changing a CUDA arm to agree with our CPU arm, when the
+CUDA arm is the one that mirrors the oracle, moves this model AWAY from vLLM.
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**

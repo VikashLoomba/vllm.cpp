@@ -8952,10 +8952,23 @@ ever fails to produce a tie, so a case that measured nothing cannot read green.
 
 ### Gates
 
+This tree builds ONE binary per suite; there is no `vt_tests` aggregate and no
+`vt_ops` ctest label, so the two commands an earlier draft of this section
+carried would have run nothing at all. These are the ones that run:
+
 ```sh
-ctest --test-dir build -R 'vt_ops' --output-on-failure
-build/tests/vt_tests -ts='*moe*'
+cmake --build build --target test_moe_router_tie_stability test_ops_moe \
+                              test_ops_moe_grouped test_moe_router_warp_map -j 6
+for t in test_moe_router_tie_stability test_ops_moe test_ops_moe_grouped \
+         test_moe_router_warp_map; do ./build/tests/$t; echo "$t rc=$?"; done
 ```
+
+**Read the ASSERTION COUNT beside every rc, never the rc alone.** On a CPU-only
+build the three device cases print `no CUDA backend registered; skipping` and
+return, so `test_moe_router_tie_stability` reads `488 | 488 passed | 0 failed`
+at rc 0 instead of the 4652 a device run gives. Both are rc 0. §Outcome records
+a lease where that difference was the ONLY thing separating a real green from a
+mutant that never ran.
 
 ### Evidence required
 

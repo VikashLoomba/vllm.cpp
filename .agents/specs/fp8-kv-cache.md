@@ -836,9 +836,38 @@ The cases are a polarity pair plus the refusal:
 | G3 | `--kv-cache-dtype nvfp4` | non-zero exit, and the message names `nvfp4` and comes from `ParseCacheDType` |
 | G4 | `--kv-cache-dtype fp8_e5m2` | non-zero exit — the name PARSES but no attention block writes it, and the bench must not present that as a measurable arm |
 
+| G5 | `--model <dir with only hf_quant_config.json>`, with and without the flag | the `--model` arm: the loader's "the checkpoint declares kv_cache_quant_algo" line is PRESENT with no flag and ABSENT with one |
+
 G2 is what makes G1 mean anything. A resolved line hard-coded to `fp8`, or a
 pass-through deleted so the flag is parsed and dropped, is caught by exactly one
 of the two.
+
+**G5 exists because G1-G4 measured only half the change.** G1-G4 drive the
+SYNTHETIC engine, whose `EngineParams` go to a direct `LoadedEngine`
+constructor. Deleting the pass-through on the OTHER branch -- the `--model`
+one, which is the arm every published number is actually measured on -- left
+all of them green (mutation M6, MEASURED as a survivor before G5 existed and
+red after it). G5 closes it without a checkpoint by the same route
+`tests/vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp` uses: a directory
+carrying only `hf_quant_config.json` makes `FromModelDir` print the line naming
+the checkpoint as the decider and then fail on the absent weights, and an
+explicit flag suppresses that line because the checkpoint is never consulted
+(`torch_utils.py:380-381`). A dropped flag would leave "auto" in the resolver
+and the line would appear in both cases.
+
+### Measured
+
+`tests/examples/test_bench_kv_cache_dtype.cpp` 9/9 cases, 47/47 assertions,
+exit 0, CPU Release `-Werror`, on `47f4ca636`. RED-FIRST: built against the
+pre-change `examples/bench/` it is 7/7 cases FAILED, 13/31 assertions failed.
+Sibling `test_bench` 11/11, 80/80 unchanged. Six mutations, each one restored
+byte-for-byte: M1 the synthetic pass-through, M2 the `ParseArgs` arm, M3 a
+hard-coded resolved line, M4 the `ParseCacheDType` refusal, M5 both report
+lines, M6 the `--model` pass-through -- all RED after G5.
+
+No fp8 KV run on a device. This change makes the arm SELECTABLE and makes the
+report state it; whether an fp8 KV bench run produces correct output on a real
+checkpoint is `## W4`'s gate and still needs a GPU.
 
 ### Not in scope
 

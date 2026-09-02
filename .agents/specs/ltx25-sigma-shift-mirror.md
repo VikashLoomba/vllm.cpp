@@ -211,6 +211,19 @@ box and other agents compile concurrently.
   The visual consequence of the flip at the LTX25-PROMPT-ADHERENCE geometry is
   NOT measured by this row and is not claimed.
 - Whether the adherence score moves. See below.
+- **Only `one_stage` is gated through a production entry point.** The new
+  `Ltx2VideoEngine::Generate` case renders through the engine and reads the
+  anchor the phase loop actually used. `t2a_one_stage`, `a2vid_two_stage` stage 1
+  and `dmd2` are covered by the recipe-struct arm table alone, so what is
+  asserted for them is that the recipe carries the right value, not that a render
+  reads it. MEASURED rather than assumed: reverting the `dmd2` arm reds 2
+  assertions in `test_ltx2_pipeline` and ZERO in `test_ltx2_video`. This is
+  accepted because the field is read in exactly one place
+  (`src/vllm/multimodal/ltx2_video.cpp:4229-4231`, inside the
+  `if (sigmas.empty())` branch opened at `:4193`) and the `one_stage` case proves that place is reached; the arm table is
+  then a statement about which recipes route there, not a second seam. A change
+  that gave any of these three arms its own read of the field would need its own
+  production-entry case.
 
 ## Why this is not gated on the adherence number
 
@@ -291,6 +304,9 @@ does not move, because it never derives a schedule.
 |---|---|---|
 | M1 | delete `stage1.schedule_tokens = kTargetLatent` from `Res2sTwoStageRecipe`, so it inherits the NEW default | RED: 3 cases in `test_ltx2_pipeline`, 3 in `test_ltx2_video` |
 | M2 | revert the `dmd2` arm alone to `kTargetLatent` | RED: exactly 2 assertions, both in the new anchor-table case |
+| M3 | clear `phases[0].sigmas` in `DfrRecipe`, i.e. give DFR's base stage a derived schedule | RED: 1 assertion, `logged: kind = dfr` |
+| M4 | delete the `ti2vid_two_stage` / `"2.3"` key from the resolver | RED: case THREW the refusal, `logged: kind = ti2vid_two_stage  version = 2.3` |
+| M5 | revert `KeyframeInterpolationRecipe` stage 1 to `kTargetLatent` | RED: 4 assertions, one per version key, two of them rows this repair added |
 
 M1 is the one that matters for the default flip: it proves the `res2s` line is
 load-bearing and that sweeping that arm silently is detected rather than
@@ -299,6 +315,32 @@ was reached by no previous assertion at all, in either suite.
 
 Restores were verified with `sha256sum -c`, not by inspection. Both suites
 returned to 61/3545 and 109/4860 after each.
+
+### Review repair
+
+M3 to M5 above are the repair round's own red-first evidence, and each was
+restored with `sha256sum -c` before the next. After it the suites read 61/3559
+and 109/4860: exactly the +14 assertions the five added rows contribute
+(4 arm rows x 3, plus the `dfr` guard row x 2), which is how this records that
+the rows RAN rather than compiled.
+
+Two closure defects the review found, both in the arm-table case and neither in
+the shipped path:
+
+- The non-deriving guard ran over `{"distilled_two_stage", "retake"}` and omitted
+  `dfr`, the one remaining kind that CAN derive — `DfrRecipe` is
+  `DistilledTwoStageRecipe` with renamed phases. It could not derive today, so
+  this was closure rather than a live defect, but the case's stated virtue is a
+  closed population.
+- The table named `ti2vid_two_stage` and `keyframe_interpolation` at two version
+  keys each where the resolver keys four.
+
+A third fell out of M3: `INFO("kind = " << kind)` on a `const char*` printed
+`kind = 1`, because doctest has no `toString` for a character pointer and decays
+it to `bool`. Measured on the first run of M3, repaired with `std::string(...)`
+in this case's three loops, and M3 and M4 above are the proof that the repaired
+message names the member that tripped. The same shape survives in two other
+cases in this file and is not this row's to fix.
 
 
 ## Stop conditions

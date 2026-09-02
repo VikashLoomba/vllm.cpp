@@ -4040,11 +4040,24 @@ TEST_CASE("ltx2 recipes: the sigma-shift anchor table, every arm that derives a 
        "a2vid_two_stage.py:226"},
       {"a2vid_two_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
        "a2vid_two_stage.py:226"},
+      // ALL FOUR version keys, not the two this table first listed. The resolver
+      // keys `ti2vid_two_stage` and `keyframe_interpolation` at 2, 2.3, 2.4 and
+      // 2.5 alike (`ltx2_pipeline.cpp` resolver, the two `else if` arms that say
+      // "All four generations"), so naming two of four left half the shipped
+      // population of these kinds unasserted.
       {"ti2vid_two_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"ti2vid_two_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"ti2vid_two_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
        "ti2vid_two_stages.py:244"},
       {"ti2vid_two_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
        "ti2vid_two_stages.py:244"},
       {"keyframe_interpolation", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"keyframe_interpolation", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"keyframe_interpolation", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
        "keyframe_interpolation.py:200"},
       {"keyframe_interpolation", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
        "keyframe_interpolation.py:200"},
@@ -4059,8 +4072,13 @@ TEST_CASE("ltx2 recipes: the sigma-shift anchor table, every arm that derives a 
 
   size_t target_latent_rows = 0;
   for (const Arm& arm : derived) {
-    INFO("kind = " << arm.kind << "  version = " << arm.version << "  upstream = "
-                   << arm.upstream);
+    // `std::string`, not the bare `const char*`. doctest has no `toString` for a
+    // character pointer, so `<<` decays it to `bool` and every row of this table
+    // logs `kind = 1` — measured, on the mutation that added the `dfr` row
+    // below. A closed population whose failure cannot name the member that
+    // tripped is a list, not a diagnostic.
+    INFO("kind = " << std::string(arm.kind) << "  version = " << std::string(arm.version)
+                   << "  upstream = " << std::string(arm.upstream));
     const vllm::Ltx2PipelineRecipe recipe =
         vllm::ResolveLtx2PipelineRecipe(arm.kind, arm.version);
     REQUIRE(recipe.phases.size() > arm.phase);
@@ -4087,8 +4105,17 @@ TEST_CASE("ltx2 recipes: the sigma-shift anchor table, every arm that derives a 
   // predicted the flip would re-sample it, and it does not, because
   // `RetakeRecipe` pins `DISTILLED_SIGMAS` and so takes upstream's distilled
   // branch of `retake.py:287` rather than the derived one.
-  for (const char* kind : {"distilled_two_stage", "retake"}) {
-    INFO("kind = " << kind);
+  //
+  // `dfr` is here for the SAME reason and it is the closure this list was
+  // missing: it is a live shipped kind (resolver, `pipeline_kind == "dfr"`, 2.5
+  // only) that CAN derive, because `DfrRecipe` is `DistilledTwoStageRecipe` with
+  // renamed phases. It cannot today, because that recipe's phases carry frozen
+  // sigmas — which is exactly the fact this loop asserts rather than assumes.
+  // Without the row, a later change that gave DFR's base stage a derived
+  // schedule would move a shipped arm with nothing naming it, which is the
+  // failure the anchor table above exists to prevent.
+  for (const char* kind : {"distilled_two_stage", "retake", "dfr"}) {
+    INFO("kind = " << std::string(kind));
     const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe(kind, "2.5");
     REQUIRE_FALSE(recipe.phases.empty());
     CHECK_MESSAGE(!recipe.phases[0].sigmas.empty(),
@@ -4099,7 +4126,7 @@ TEST_CASE("ltx2 recipes: the sigma-shift anchor table, every arm that derives a 
   // above only ever names phase 0.
   for (const char* kind : {"a2vid_two_stage", "ti2vid_two_stage", "keyframe_interpolation",
                            "res2s_two_stage"}) {
-    INFO("kind = " << kind);
+    INFO("kind = " << std::string(kind));
     const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe(kind, "2.5");
     REQUIRE(recipe.phases.size() == 2u);
     CHECK_MESSAGE(!recipe.phases[1].sigmas.empty(),

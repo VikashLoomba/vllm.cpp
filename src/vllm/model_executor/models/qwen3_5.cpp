@@ -3218,6 +3218,39 @@ DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights)
   if (!weights.lm_head_fp4.Empty())
     return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
   const OwnedTensor& lm_head = DenseLmHead(weights);
+  // #2534: a GGUF KEEP-QUANT head takes the f32-output GEMM, joining the EXL3
+  // and NVFP4 heads above rather than the bf16 helper below.
+  //
+  // It used to take the bf16 helper, and only because `nk` is a LAYOUT flag:
+  // `qwen3_5_gguf_weights.cpp::OwnGgufQuantBlocks` sets it true because "GGUF
+  // disk order [out, in] IS the MatmulBT [N, K] orientation", which says nothing
+  // about numerics. It therefore inherited a rule authored for the TIED BF16
+  // torch-Linear head the helper's own comment names. Measured cost of that
+  // inheritance: 288 of 288 of the Q4_K_M arm's top-1 logits landed exactly on
+  // the bf16 grid, whose ULP is 0.125 at the magnitude 16-32 these logits carry,
+  // while the six near-ties the llama.cpp token gate convicts us on are gaps of
+  // 0.027 to 0.178 -- five of six below our own resolution, and six steps EXACT
+  // TIES (#2534, docs/bench-evidence/qwen38-27b-q4km-logit-delta-20260902.md).
+  //
+  // This DIVERGES from vLLM's default, deliberately, and the divergence is
+  // argued in .agents/specs/qwen38-27b-q4km-logits-f32.md rather than assumed.
+  // Upstream keeps the head in the model dtype (`logits_processor.py:99-136`
+  // `_apply_head`; `config/model.py:2187-2208` `_get_head_dtype` defaults a
+  // GENERATION model to the model dtype) and widens afterwards in the sampler
+  // (`v1/sample/sampler.py:96`), exactly as `MatmulBf16LogitsF32D` does. But
+  // vLLM has no in-tree GGUF reader at the pin, so it resolves no model dtype
+  // for this checkpoint at all (#979); and where upstream DOES select an f32
+  // head it accumulates straight into f32 rather than casting operands
+  // (`logits_processor.py:127-131`, `torch.mm(..., out_dtype=...)`), which is
+  // what this arm now does -- the keep-quant kernels already accumulate in f32
+  // and only round at the store, so no weight copy and no cast pass is added.
+  // Upstream's refusal of an f32 head on a QUANTIZED head
+  // (`logits_processor.py:111-115`) guards its `.to(f32)` weight-cast fallback,
+  // a mechanism we do not use.
+  //
+  // Elementwise bf16/f16 heads are untouched below, so no safetensors default
+  // and no recorded device measurement on those arms moves.
+  if (vt::IsBlockQuant(lm_head.dtype)) return MatmulF32D(d, x, lm_head);
   return lm_head.nk ? MatmulBf16LogitsF32D(d, x, lm_head)
                     : MatmulF32D(d, x, lm_head);
 }
@@ -6925,6 +6958,163 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   return dout;
 }
 
+// ─── VT_MOE_SEL_FP — the SELECTED-EXPERT-ID tap (MOEDIV, #2552) ──────────────
+//
+// `VT_Q4EXP_LAYER_FP` (#2547) taps VALUES, and a value tap cannot separate an
+// expert-selection FLIP from re-association inside the expert GEMM. A discrete
+// selection has BIMODAL error and not a tolerance: a token's top-k set either
+// changes — and that token's MoE output moves by an O(1) amount — or it does not
+// change at all and the residue is rounding. One `rel(sum|x|)` averages the two
+// together and destroys exactly the bit that says which happened.
+//
+// So this prints the SELECTION. Per token: the selected ids SORTED, because the
+// assertion between two arms is SET equality and the selection ORDER is not part
+// of it (`vt::MoeCombine` sums over the k slots and is order-invariant given the
+// weights). Per call: `sel`, an FNV-1a hash over every token's sorted list, so
+// comparing two arms' selections at one layer is ONE string comparison.
+//
+// THE MARGIN IS IN LOGIT SPACE AND ITS UNIT IS bf16 ULPS. Probability space is
+// the wrong space: the softmax denominator is a device-order f32 reduction and
+// differs between the arms, while the bf16 logits are what the selection is
+// actually a function of. And a probability difference reads as "small" for a
+// gap of one representable step and for a gap of fifty. `ulps` is the number of
+// representable bf16 values between the largest REJECTED logit and the smallest
+// SELECTED one under the sign-magnitude total order; `ulps == 0` means the two
+// are the SAME bf16 value and the boundary was decided by the lowest-index
+// tie-break, which one ulp of re-association anywhere upstream will flip.
+//
+// `lines=` IS THE COUNTED PROPERTY. An instrument that never ran and two arms
+// whose taps agreed look identical in a diff. The measuring job asserts
+// `lines == calls * T` and refuses to report a comparison otherwise.
+//
+// IT IS ON THE REFERENCE ARM ONLY, which is the arm a stacked keep-quant
+// checkpoint takes and the only arm any `qwen4_exp` checkpoint reaches. The
+// three fused CUDA arms keep their ids on device; adding a readback to a
+// capturable path, to instrument a model that cannot enter it, would be dead
+// code by construction. See the spec's "Wave MOEDIV" section.
+int64_t MoeSelFpCalls() {
+  static const int64_t n = [] {
+    const char* e = std::getenv("VT_MOE_SEL_FP");
+    if (e == nullptr || e[0] == '\0') return static_cast<int64_t>(0);
+    const long long parsed = std::atoll(e);
+    return parsed > 0 ? static_cast<int64_t>(parsed) : static_cast<int64_t>(0);
+  }();
+  return n;
+}
+int64_t& MoeSelFpCall() {
+  static int64_t call = 0;
+  return call;
+}
+int64_t& MoeSelFpLines() {
+  static int64_t lines = 0;
+  return lines;
+}
+
+// bf16 under the sign-magnitude TOTAL ORDER, as a signed key. Monotone in the
+// value it encodes, so the difference of two keys counts representable steps.
+// -0 and +0 both map to 0, which is what makes an exact tie read `ulps=0`.
+int32_t Bf16Ordered(uint16_t b) {
+  return (b & 0x8000u) != 0 ? -static_cast<int32_t>(b & 0x7fffu)
+                            : static_cast<int32_t>(b & 0x7fffu);
+}
+
+double SumAbsBf16(const std::vector<uint16_t>& v) {
+  double s = 0.0;
+  for (uint16_t b : v) {
+    const float f = vt::BF16ToF32(b);
+    if (std::isfinite(f)) s += std::fabs(static_cast<double>(f));
+  }
+  return s;
+}
+
+// One tapped MoE block invocation. Every buffer here is one the reference path
+// had ALREADY downloaded, so the tap moves no extra bytes off the device except
+// the one guarded shared-expert read its caller passes in.
+void MoeSelFp(int dev_type, int64_t T, int64_t E, int64_t top_k,
+              const std::vector<uint16_t>& h, const std::vector<uint16_t>& logits,
+              const std::vector<int32_t>& ids,
+              const std::vector<uint16_t>& expert_out,
+              const std::vector<uint16_t>* shared) {
+  const int64_t call = MoeSelFpCall();
+  if (call >= MoeSelFpCalls()) return;
+  uint64_t sel = 1469598103934665603ull;  // FNV-1a offset basis
+  int64_t min_ulps = -1;
+  int64_t min_tok = -1;
+  std::vector<int32_t> sorted(static_cast<size_t>(top_k));
+  std::vector<char> picked(static_cast<size_t>(E));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t j = 0; j < top_k; ++j)
+      sorted[static_cast<size_t>(j)] = ids[static_cast<size_t>(t * top_k + j)];
+    std::sort(sorted.begin(), sorted.end());
+    std::string idstr;
+    for (int64_t j = 0; j < top_k; ++j) {
+      if (j != 0) idstr += ",";
+      idstr += std::to_string(sorted[static_cast<size_t>(j)]);
+      // The hash is over the SORTED list, so it is a set identity and not a
+      // selection-order identity.
+      const uint32_t v = static_cast<uint32_t>(sorted[static_cast<size_t>(j)]);
+      for (int b = 0; b < 4; ++b) {
+        sel ^= static_cast<uint64_t>((v >> (8 * b)) & 0xffu);
+        sel *= 1099511628211ull;
+      }
+    }
+    // The boundary: the smallest SELECTED logit against the largest REJECTED
+    // one, read from the bf16 the router GEMM actually stored.
+    for (int64_t e = 0; e < E; ++e) picked[static_cast<size_t>(e)] = 0;
+    for (int64_t j = 0; j < top_k; ++j)
+      picked[static_cast<size_t>(sorted[static_cast<size_t>(j)])] = 1;
+    int64_t lo_e = -1, hi_e = -1;
+    for (int64_t e = 0; e < E; ++e) {
+      const uint16_t b = logits[static_cast<size_t>(t * E + e)];
+      if (picked[static_cast<size_t>(e)] != 0) {
+        if (lo_e < 0 || Bf16Ordered(b) < Bf16Ordered(logits[static_cast<size_t>(t * E + lo_e)]))
+          lo_e = e;
+      } else {
+        if (hi_e < 0 || Bf16Ordered(b) > Bf16Ordered(logits[static_cast<size_t>(t * E + hi_e)]))
+          hi_e = e;
+      }
+    }
+    const uint16_t lo_b = lo_e >= 0 ? logits[static_cast<size_t>(t * E + lo_e)] : 0;
+    const uint16_t hi_b = hi_e >= 0 ? logits[static_cast<size_t>(t * E + hi_e)] : 0;
+    // top_k == E leaves nothing rejected; the boundary is then undefined and is
+    // reported as such rather than as a zero margin.
+    const int64_t ulps = hi_e >= 0 && lo_e >= 0
+                             ? static_cast<int64_t>(Bf16Ordered(lo_b)) -
+                                   static_cast<int64_t>(Bf16Ordered(hi_b))
+                             : -1;
+    if (ulps >= 0 && (min_ulps < 0 || ulps < min_ulps)) {
+      min_ulps = ulps;
+      min_tok = t;
+    }
+    ++MoeSelFpLines();
+    std::fprintf(stderr,
+                 "moesel call=%lld dev=%d tok=%lld ids=%s lo_e=%lld lo=%.9g "
+                 "lo_raw=0x%04x hi_e=%lld hi=%.9g hi_raw=0x%04x margin=%.9g "
+                 "ulps=%lld\n",
+                 static_cast<long long>(call), dev_type, static_cast<long long>(t),
+                 idstr.c_str(), static_cast<long long>(lo_e),
+                 static_cast<double>(vt::BF16ToF32(lo_b)), static_cast<unsigned>(lo_b),
+                 static_cast<long long>(hi_e), static_cast<double>(vt::BF16ToF32(hi_b)),
+                 static_cast<unsigned>(hi_b),
+                 static_cast<double>(vt::BF16ToF32(lo_b)) -
+                     static_cast<double>(vt::BF16ToF32(hi_b)),
+                 static_cast<long long>(ulps));
+  }
+  // The digest. `x`/`logit`/`exp`/`shr` decompose the block's own output, so
+  // with the selection sets equal these four say WHICH GEMM carries the residue.
+  std::fprintf(stderr,
+               "moesel call=%lld dev=%d T=%lld E=%lld k=%lld sel=%016llx "
+               "minulps=%lld mintok=%lld x=%.9g logit=%.9g exp=%.9g shr=%.9g "
+               "lines=%lld END\n",
+               static_cast<long long>(call), dev_type, static_cast<long long>(T),
+               static_cast<long long>(E), static_cast<long long>(top_k),
+               static_cast<unsigned long long>(sel), static_cast<long long>(min_ulps),
+               static_cast<long long>(min_tok), SumAbsBf16(h), SumAbsBf16(logits),
+               SumAbsBf16(expert_out), shared != nullptr ? SumAbsBf16(*shared) : 0.0,
+               static_cast<long long>(MoeSelFpLines()));
+  ++MoeSelFpCall();
+}
+
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
               const Tensor& dh, int64_t T) {
   const int64_t H = cfg.hidden_size;
@@ -7049,6 +7239,19 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   const bool has_shared = cfg.shared_expert_intermediate_size > 0;
   std::optional<DBuf> shared;
   if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, fp4));
+
+  // MOEDIV (#2552): the selected-expert-id tap. Inert unless VT_MOE_SEL_FP is
+  // set; the outer guard is what keeps the shared-expert readback off the
+  // default path. Everything else it reads was already downloaded above.
+  if (MoeSelFpCalls() > 0) {
+    std::vector<uint16_t> shr;
+    if (has_shared) {
+      shr.resize(static_cast<size_t>(T) * H);
+      shared->Download(d, shr.data());
+    }
+    MoeSelFp(static_cast<int>(dh.device.type), T, E, top_k, h, logits, ids,
+             expert_out, has_shared ? &shr : nullptr);
+  }
 
   // Combine (moe-semantics.md §6): out = shared + sum_j w_j * expert_out_j.
   DBuf deo(d, DType::kBF16, {T, top_k, H}, expert_out.data());
@@ -7573,6 +7776,15 @@ DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
     device.b.Copy(device.q, cat + target_offset, embed + source_offset, row_bytes);
     device.b.Copy(device.q, cat + target_offset + row_bytes, target + source_offset,
                   row_bytes);
+  }
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): the fc-cat projection through the ONE
+  // EXL3 linear seam when the checkpoint quantized it, bf16 out because that is
+  // what `MatmulBf16D` returns and what the decoder layer below consumes. There
+  // is no second matmul: `dense_exl3::Linear` forwards to
+  // `layers::Exl3LinearMethod`, which calls `dense_attn::Exl3MatmulD`.
+  if (weights.IsExl3()) {
+    return dense_exl3::Linear(device, concatenated.t(), weights.fc,
+                              weights.fc_exl3, DType::kBF16);
   }
   return MatmulBf16D(device, concatenated.t(), weights.fc);
 }
@@ -8696,7 +8908,12 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       lm_head_(&DenseLmHead(target)),
       // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must see
       // the packed one too. Empty on every BF16/FP8/tied dense target.
-      lm_head_fp4_(&target.lm_head_fp4) {
+      lm_head_fp4_(&target.lm_head_fp4),
+      // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): and the TRELLIS one, for the same
+      // reason. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships no `lm_head.weight` at
+      // all, so on that target `DenseLmHead(target)` above is EMPTY and this is
+      // the only head there is. Empty on every other dense target.
+      lm_head_exl3_(&target.lm_head_exl3) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -8708,7 +8925,12 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       config_(&config),
       embed_tokens_(&target.embed_tokens),
       lm_head_(&target.lm_head),
-      lm_head_fp4_(&target.lm_head_fp4) {
+      lm_head_fp4_(&target.lm_head_fp4),
+      // `Qwen3_5MoeWeights` has NO EXL3 head owner, so there is nothing to point
+      // at. Said out loud rather than left to a default, and rather than adding a
+      // field to the MoE container that no loader fills: no EXL3 MoE checkpoint
+      // is in scope (.agents/specs/model-qwen35-exl3-head.md `## Owed`).
+      lm_head_exl3_(nullptr) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kMoe,
            "qwen3_5 MTP: MoE target requires MoE MTP weights");
 }
@@ -8735,10 +8957,18 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                target_hidden_states.device == queue.device,
            "qwen3_5 MTP forward: target hidden states must be contiguous "
            "bf16 [T,H] on the queue device");
-  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
-               weights_->fc.shape[0] == hidden_size &&
-               weights_->fc.shape[1] == 2 * hidden_size,
-           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): ONE precondition, two containers.
+  // The trellis stores [K=2H, N=H] where the torch Linear stores [N=H, K=2H],
+  // so the same projection is asserted through the orientation its own owner
+  // uses. `IsExl3()` is the loader's answer, not a second derivation.
+  VT_CHECK(weights_->IsExl3()
+               ? (weights_->fc_exl3.InFeatures() == 2 * hidden_size &&
+                  weights_->fc_exl3.OutFeatures() == hidden_size)
+               : (weights_->fc.rank == 2 && weights_->fc.nk &&
+                  weights_->fc.shape[0] == hidden_size &&
+                  weights_->fc.shape[1] == 2 * hidden_size),
+           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H] or an EXL3 trellis "
+           "[K=2H, N=H]");
 
   (void)vocab_size;
   // ONE decode step. A DRAFT forward is a complete forward with its own working
@@ -8798,10 +9028,18 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
                target_hidden_states.device == queue.device,
            "qwen3_5 MTP paged forward: target hidden states must be contiguous "
            "bf16 [T,H] on the queue device");
-  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
-               weights_->fc.shape[0] == hidden_size &&
-               weights_->fc.shape[1] == 2 * hidden_size,
-           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H]");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): ONE precondition, two containers.
+  // The trellis stores [K=2H, N=H] where the torch Linear stores [N=H, K=2H],
+  // so the same projection is asserted through the orientation its own owner
+  // uses. `IsExl3()` is the loader's answer, not a second derivation.
+  VT_CHECK(weights_->IsExl3()
+               ? (weights_->fc_exl3.InFeatures() == 2 * hidden_size &&
+                  weights_->fc_exl3.OutFeatures() == hidden_size)
+               : (weights_->fc.rank == 2 && weights_->fc.nk &&
+                  weights_->fc.shape[0] == hidden_size &&
+                  weights_->fc.shape[1] == 2 * hidden_size),
+           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H] or an EXL3 trellis "
+           "[K=2H, N=H]");
   VT_CHECK(attn_meta.num_actual_tokens == tokens,
            "qwen3_5 MTP paged forward: attn metadata token count must equal T");
   VT_CHECK(draft_kv.num_kv_heads == config_->num_key_value_heads &&
@@ -8891,9 +9129,20 @@ ForwardLogits Qwen3_5MTPModel::ComputeLogits(
            "qwen3_5 MTP logits: hidden states must be contiguous bf16 [T,H] "
            "on the queue device");
   Dev device{vt::GetBackend(queue.device.type), queue};
-  DBuf logits = (lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
-                    ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
-                    : MatmulF32D(device, hidden_states, *lm_head_);
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5). The arms are ordered
+  // `exl3 -> fp4 -> bf16`, which is `DenseLogitsF32D`'s order and
+  // `DflashLogitsF32D`'s, so the three readers of ONE target head cannot
+  // disagree about precedence. The trellis head is COMPUTED WITH, never widened:
+  // a dequantized copy of the real 248320x5120 head is 2.543 GB, and upstream
+  // reaches the packed path without a branch because `_apply_head` calls
+  // `lm_head.quant_method.apply` (logits_processor.py:132-142).
+  DBuf logits =
+      (lm_head_exl3_ != nullptr && !lm_head_exl3_->Empty())
+          ? dense_exl3::Linear(device, hidden_states, *lm_head_, *lm_head_exl3_,
+                               DType::kF32)
+          : ((lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
+                 ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
+                 : MatmulF32D(device, hidden_states, *lm_head_));
   return WrapDeviceLogits(device, std::move(logits), config_->vocab_size);
 }
 

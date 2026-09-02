@@ -9,8 +9,8 @@ this defect makes provisional).
 
 ## Now
 
-`ACTIVE` — **the cause is named and measured. The repair is a product decision
-this row does not get to make alone.**
+`ACTIVE` — **the cause is named and measured, the decision has been taken, and
+the repair is implemented and awaiting its own board measurement.**
 
 **`hipMallocManaged` on a part that cannot take a recoverable page fault is the
 cause of #2511.** rc job `6dced9e1-3c74-4363-bd9e-2a0dd8789cc9`, one build, one
@@ -27,9 +27,17 @@ Nothing else differed. The knob gates the allocator and only the allocator;
 `UnifiedMemory()` and `DeviceMemoryIsHostAddressable()` are byte-identical
 across the two columns and cannot explain the split.
 
-**No fix has landed.** `VT_ROCM_MANAGED_ALLOC` defaults ON, so every shipped
-configuration still takes the faulting branch. What to do about that is
-`## The decision this row cannot make alone`.
+**The repair is written, measured on the board, and awaiting its merge.** It
+lives on `row/BACKEND-ROCM-MANAGED-ALLOC-FIX`, and on one binary and one boot
+the shipped default now takes **0 failures in 10 legs** where the pre-fix
+configuration takes **9 in 10** (`## W11 RESULT`). The maintainer took the decision
+`## The decision this row cannot make alone` was written for, and chose shape
+1: `UseManagedAlloc` is narrowed by `pageable_memory_access`, so a part that
+cannot fault and recover never gets a migratable allocation. The
+capability answers follow the allocator, which withdraws the CPU reference tier
+on this class of board; an op that loses its fallback refuses by name and now
+says why. Design, the reason shape 1 beat shapes 2 and 3, and the measured
+consequence are in `## W11: the repair, and the shape chosen for it`.
 
 ## Scope
 
@@ -1147,6 +1155,229 @@ measurement:
 Issue [#41](https://github.com/mudler/vllm.cpp/issues/41) F6 ratified approach
 (b) with the maintainer, so narrowing it is that decision being revisited, and
 the person who took it should take it again with this measurement in hand.
+
+## W11: the repair, and the shape chosen for it
+
+Issue [#2511](https://github.com/mudler/vllm.cpp/issues/2511). The maintainer
+has taken the decision `## The decision this row cannot make alone` was written
+for, and it is **shape 1: narrow `UseManagedAlloc` by `pageable_memory_access`,
+and let the capability answers follow the allocator.** This section records the
+design, why shape 1 and not shape 2 or 3, what the reference tier loses, and
+what refuses in its place.
+
+### The predicate, and why the narrowing collapses `unified_memory_`
+
+Before this change:
+
+```text
+managed_capable = integrated && managed_memory && concurrent_managed_access
+managed_alloc   = managed_capable && knob_on
+unified_memory  = managed_capable || (pageable_memory_access && integrated)
+```
+
+After:
+
+```text
+managed_capable = integrated && managed_memory && concurrent_managed_access
+managed_alloc   = managed_capable && (override ? override : pageable_memory_access)
+unified_memory  = managed_alloc  || (pageable_memory_access && integrated)
+```
+
+The second line is the whole fix, and the third line is its consequence stated
+rather than hidden. With `pageable_memory_access` inside the managed predicate,
+`managed_alloc` now IMPLIES `(pageable_memory_access && integrated)`, so under
+the default the unified claim collapses to exactly the W0 CUDA-shaped
+conjunction that `cuda_backend.cu:295-303` computes. **The managed branch no
+longer widens the unified claim at all.** That is the honest polarity: approach
+(b) existed to make host addressability an API guarantee on a part where the
+attribute conjunction read false, and this row measured that the same API
+guarantee is what breaks the part. A guarantee that faults is not a guarantee.
+
+`unified_memory` is deliberately written over `managed_alloc` rather than over
+`managed_capable`, because that is the sentence the capability actually makes:
+every block `Backend::Alloc` hands out is host-addressable, by the
+`hipMallocManaged` contract on one branch and by the `PageableMemoryAccess`
+attribute on the other. Reading it off a capability the allocator did not take
+is how the two could ever disagree.
+
+### Why shape 1, and not the other two
+
+**Shape 2 (plain `hipMalloc`, keep `unified_memory_` true) is what the 21 clean
+legs actually ran, and it is still rejected.** It rests on
+`rocm_backend.hip`'s own recorded observation that host dereference of
+`hipMalloc` memory demonstrably works on `gfx1151` — and the same comment says
+approach (b) exists precisely because this project "refuses to gate memory
+safety on" that architectural accident. Nothing in W9 or W10 measured host
+dereference of a plain `hipMalloc` block; both arms reported
+`reference_tier_hits = 0`, so no leg on this row ever exercised the property
+shape 2 would have to assert. Shipping it would assert an unmeasured
+memory-safety claim on the strength of legs that never tested it, which is the
+#844 / #1435 failure with the sign flipped. If someone later measures host
+dereference of `hipMalloc` memory on this class of part, shape 2 becomes
+available on evidence; today it is available only on inference.
+
+**Shape 3 (keep the default, ship the knob) is what landed in W9 and is not a
+fix.** Every shipped configuration still takes the faulting branch, and a knob
+nobody sets does not stop a GPU reset.
+
+**Shape 1 costs the CPU reference tier on this class of board, and that cost is
+paid deliberately.** It is the only shape whose safety claim is the same one the
+attributes report.
+
+### What the reference tier loses, and what refuses instead
+
+On `gfx1151` (and any XNACK-less integrated part: `PageableMemoryAccess = 0`
+with `ManagedMemory = 1`), `UnifiedMemory()` and
+`DeviceMemoryIsHostAddressable()` both become **false**. The portable CPU
+reference tier is therefore not eligible (`op_provider.cpp`
+`ReferenceTierEligible`), and an op with no native ROCm kernel no longer falls
+back — it refuses.
+
+Three consequences, each checked rather than assumed:
+
+1. **The refusal is by name, and now says WHY.** `GetOp` already refuses with
+   the op name, the device, and the failed precondition
+   (`ReferenceTierRefusalReason`). What it could not say is why THIS backend
+   answers the precondition false, which on this board is a deliberate
+   narrowing rather than a discrete card's ordinary state. `Backend` therefore
+   gains one optional virtual, `HostAddressabilityNote()`, defaulting to
+   `nullptr`; `RocmBackend` returns a sentence naming `PageableMemoryAccess = 0`,
+   issue #2511, and `VT_ROCM_MANAGED_ALLOC=1` as the documented way back. The
+   refusal path appends it. A reader who hits the refusal learns the cause at
+   the point of failure instead of in a spec.
+2. **The other two consumers of the narrow predicate degrade, they do not
+   break.** `apply_logits_processors` (`v1/sample/logits_processor/builtin.cpp`)
+   stages the logits down and copies them back instead of wrapping them in
+   place — one bounce per request that registers a processor, exactly what the
+   CPU device already pays. `ResidentWeight`'s device-byte adoption
+   (`qwen3_5_weights.cpp`) declines to adopt and leaves the mmap borrow as a
+   valid re-faultable view, which its own comment already specifies as the
+   not-host-addressable path. Neither needs a refusal.
+3. **`is_integrated_gpu()` on ROCm answers `UnifiedMemory()` and so flips
+   false.** Its one consumer that could change behaviour is the runner's async
+   device mirror, whose predicate is
+   `!UnifiedMemory() || is_integrated_gpu()` — true before (unified and
+   integrated) and true after (not unified). No move.
+
+The measured basis for paying this cost: **both W9 arms and every W10 arm
+reported `reference_tier_hits = 0`**, including twelve gate-sized legs in #2546.
+The Q4_K path this row runs is served entirely by native ROCm kernels, so
+withdrawing the tier withdraws something nothing on this workload used. That is
+a measurement about THIS workload and is stated as one; a model reaching an
+unregistered op on this board now gets a refusal where it previously got a slow
+answer, and that is the visible debt this shape buys.
+
+### The knob keeps its name and gains a third state
+
+`VT_ROCM_MANAGED_ALLOC` becomes tri-state, because a two-state knob cannot
+express the red-before arm any more once the default moves:
+
+| value | effect |
+|---|---|
+| unset | the narrowed default: managed allocation only where `PageableMemoryAccess` is 1 |
+| `0` | never take the managed branch, on any device |
+| `1` | take it wherever the managed ATTRIBUTES allow, ignoring `PageableMemoryAccess` — the pre-fix behaviour, byte-for-byte |
+
+`=1` cannot conjure a capability: `managed_capable` still gates it, so a
+discrete card stays on `hipMalloc` and the branch stays provably dead there.
+`=1` restores `unified_memory` too, because a faithful red-before arm has to be
+the whole pre-fix configuration and not half of it. That is what makes the
+green-after measurement a single-binary, single-boot, interleaved A/B rather
+than two builds.
+
+### Where the decision lives, and how it is tested without a board
+
+The decision moves OUT of the `.hip` anonymous namespace and into
+`include/vt/rocm/rocm_arch.h` as `vt::rocm::ResolveMemoryPolicy`, a pure
+function of the four probed attributes and the override. That is the precedent
+this file already sets: `CapabilityFromGcnArch` was lifted there for exactly
+this reason — "the one piece with a DECISION in it ... IS compiled and
+unit-tested on a CPU-only box". `RocmBackend`'s registrar becomes a caller.
+
+`tests/vt/test_rocm_arch.cpp` gains the policy table, which runs in ordinary
+preflight with no AMD hardware: the gfx1151 row, the gfx1103 row, a discrete
+row, an NVIDIA-shaped integrated row (`pageable = 1`), and all three override
+states on each. `tests/vt/test_reference_tier.cpp` gains the refusal-note case
+against a fake backend on `kXPU`. `tests/vt/test_rocm_backend.cpp`'s
+board-gated "approach (b)" case is rewritten to assert the NEW coupling, since
+the old one asserts the behaviour this change removes.
+
+`tests/vt/test_backend_cross_device.cpp`'s production-geometry Q6_K launch gate
+is untouched and stays: this change does not move the kernel it exercises, and
+the class of regression it was added for is still real.
+
+## W11 RESULT: the fix is measured on the board, 0 failures in 10 against 9 in 10
+
+rc job `f367d340-0160-4530-b6d5-44ad87c7085d` on `strix:gpu0`, worker
+`rc-worker-lcjhd`, boot `a5bc8128-f6ad-4767-8614-6923f88032e1`. **One build, one
+boot, one binary**, `libvllm.so` sha256
+`ff91d735c03230126da83e060c3ba539703b33d368c406918f84545cb71b8f63`, built from
+this branch at `ee4b256f8`. Arms alternate and the within-round order rotates,
+because the board GPU-resets after each failure and a blocked design charges the
+reset to whichever arm follows it.
+
+| arm | allocator and claim | `--max-tokens 288` | `--max-tokens 64 --repeat 4` | pooled |
+|---|---|---|---|---|
+| `fixed` (shipped default) | `hipMalloc`, no host-addressability claim | **0 / 6** | **0 / 4** | **0 failures in 10** |
+| `prefix` (`VT_ROCM_MANAGED_ALLOC=1`) | `hipMallocManaged`, unified true -- the pre-fix configuration | 6 / 6 | 3 / 4 | **9 failures in 10** |
+
+Signatures on the failing arm: 8 `GPU Hang` and 1 `Memory access fault`, the two
+symptoms this row has recorded as one defect from the start. Every `fixed` leg
+produced its full text -- **1136 characters** at gate size and **257** at the
+`#2511` shape, the same two lengths Gate 2 recorded for its clean `nomanaged`
+legs.
+
+**The one `prefix` leg that passed is the point, not an embarrassment.** The
+pre-fix rate was never 100%: Gate 2 measured 3 failures in 5 at exactly this
+`64x4` shape, and the pooled pre-fix figure is 17 in 21. A red-before arm that
+failed every single leg would be a *different* defect from the intermittent one
+this row spent nine waves characterising. 9 in 10 is that rate, reproduced.
+
+### What this measurement adds that Gate 2 could not
+
+Gate 2 moved the ALLOCATOR with a knob while `unified` kept its unknobbed value,
+which is what made it a clean measurement of the cause. This run moves the
+SHIPPED DEFAULT, so `UnifiedMemory()` and `DeviceMemoryIsHostAddressable()` are
+false on the `fixed` arm and true on the `prefix` arm. That is the configuration
+change the repair actually makes, and it is the one nothing had run before.
+
+**The reference-tier consequence is measured, not predicted: all 20 legs report
+`reftier_lines = 0`.** The count greps `reference[- ]tier`, both spellings,
+because the two sites spell it differently -- the tier's own banner is
+`[vt reference-tier] op=... has NO native kernel` and the refusal text says "the
+portable CPU reference tier". A grep for one of them would have read 0 over the
+other and produced exactly the answer this arm predicts, which is an instrument
+whose failure looks like its result. No leg on either arm hit `no kernel for op`
+either, which the classifier separates from a board fault for the same reason.
+So on this workload the withdrawn tier withdraws nothing that was being used.
+
+### Instrument notes, because two of them nearly cost a lease
+
+**The artifact staging died on the share and the retry is now part of the job.**
+Run `821aa8bb` aborted seven seconds in with
+`cp: error reading ...: Resource temporarily unavailable` -- a transient CIFS
+read on a 17 GB file, not a missing artifact. A one-shot `cp` turns that into a
+lost lease. PHASE 0 now reuses a verified worker-local copy, then hard-links the
+sibling job's staged copy (same `/tmp`, so the same inode #2511's own legs read,
+which is identity rather than an agreeing hash), and only then reads the share,
+three times. The rerun linked the sibling copy and verified its sha256 in
+seconds.
+
+**The tally is computed over deduplicated lines and scans every field.** The log
+prints each leg twice, once live and once in the summary, so `grep -c` over the
+finished file reads 40 for 20 legs; `sort -u` is what makes it a count of legs.
+`class=OK` is matched anywhere on the line and never by field index, which is the
+defect that made `confirm.sh`'s own summary report every arm failing every leg.
+Both were verified independently of the job's own summary block.
+
+**One narration line in this job is wrong and is worth correcting rather than
+repeating.** `LEGCOUNT` prints `raw_lines=20 unique_legs=20` and then says "raw
+should be about 2x unique", because it runs BEFORE the summary reprints the
+legs. The relation it describes is real -- the finished log reads raw 40, unique
+20 -- but the line measures a moment at which it cannot yet hold. Both readings
+agree that there were 20 legs, which is what the tally rests on.
+
+Raw log and per-leg stdout/stderr: `/mnt/nas_share/rc/rocm-strix-managed/out/`.
 
 ## Gate 2 is still owed, and the first attempt at it failed on its own instrument
 

@@ -1401,6 +1401,10 @@ target_include_directories(test_glm4_moe_lite_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# #2534. The GGUF keep-quant lm_head must emit logits with f32 RESOLUTION, which
+# is the property the Q4_K_M token gate is decided by and which no token gate we
+# own can see. Public headers only, so no extra include directory.
+vllm_cpp_add_test(test_qwen35_gguf_logits_f32 vllm/models/test_qwen35_gguf_logits_f32.cpp)
 # #2534. `detail::ActDType` caches its getenv in a function-local static, so one
 # process observes exactly ONE value of VT_ACT_F32 and a single run cannot tell a
 # resolver that READS the lever from one hardwired to its default answer. Re-run
@@ -1992,6 +1996,12 @@ vllm_cpp_add_test(test_dflash2_runner_reach
 # W10 (#1857): the spec-as-decode classification case reads the graph-dispatch
 # counters, whose header lives in the src tree (same need as test_mtp_depth).
 target_include_directories(test_dflash2_runner_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MODEL-DFLASH2-EXL3 (#2495 item 7): the same engine entry, with an EXL3 draft.
+# Its OWN binary because the draft store is a function-local static per arm and
+# the target it needs is wider than every other case in the shared fixture.
+vllm_cpp_add_test(test_dflash2_exl3_reach
+  vllm/v1/spec_decode/test_dflash2_exl3_reach.cpp)
+target_include_directories(test_dflash2_exl3_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DFLASH2 W9 (#1849): the VT_SPEC_TRACE=2 device-segment trace of the
 # DFlash2 draft phase. Its OWN binary because the trace level is latched by a
 # function-local static on the first propose, so one process observes one level
@@ -2624,6 +2634,10 @@ vllm_cpp_add_test(test_llama_exl3_forward vllm/models/test_llama_exl3_forward.cp
 # MODEL-QWEN35-EXL3 (#2495 items 3 and 5): the EXL3 arm of the DENSE Qwen3.5
 # loader and forward, gated through LoadQwen3_5Dense and ModelRegistry::Forward.
 vllm_cpp_add_test(test_qwen35_exl3 vllm/models/test_qwen35_exl3.cpp)
+# MODEL-DFLASH2-EXL3 (#2495 item 7): the EXL3 arm of the DFlash2 DRAFT loader
+# and forward, gated through LoadQwen3DFlash over a real safetensors file and
+# then through Qwen3DFlashModel::ForwardBlockLogits.
+vllm_cpp_add_test(test_qwen3_dflash2_exl3 vllm/models/test_qwen3_dflash2_exl3.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
@@ -3659,6 +3673,21 @@ target_include_directories(test_qwen4_exp_forward PRIVATE ${CMAKE_SOURCE_DIR}/sr
 # the src/ grant.
 vllm_cpp_add_test(test_qwen4_exp_moe vllm/models/test_qwen4_exp_moe.cpp)
 target_include_directories(test_qwen4_exp_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MOEDIV (#2552): the selected-expert-id tap. `MoeSelFpCalls()` is another
+# read-once static, so the default run above can only ever observe the switch
+# UNSET -- where the tap case asserts the tap is INERT. Re-run the SAME binary
+# with it set: that is the arm which gates the printed ids, the bf16-ulp margin
+# and the set-equality hash against `MoeReference`.
+#
+# DELIBERATELY UNFILTERED. A `-tc=` pattern that matches nothing exits 0 having
+# run nothing, and doctest reports that as `assertions: 0 ... SUCCESS!` -- a
+# skip wearing a pass, which this row has already paid for. Running the whole
+# binary cannot fail that way, and it buys a second property for free: every
+# value case in the suite re-runs with the tap ON, so a tap that perturbed the
+# block's own output would red them.
+add_test(NAME test_qwen4_exp_moe_sel_fp COMMAND test_qwen4_exp_moe)
+set_tests_properties(test_qwen4_exp_moe_sel_fp PROPERTIES
+  ENVIRONMENT "VT_MOE_SEL_FP=4096")
 
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit

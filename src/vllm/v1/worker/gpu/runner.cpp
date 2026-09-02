@@ -3346,11 +3346,40 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     const char* e = std::getenv("VT_DUMP_LOGITS");
     return (e != nullptr && e[0] != '\0') ? e : nullptr;
   }();
-  if (kDumpLogitsDir != nullptr && logits.rank == 2 && logits.shape[0] > 0) {
-    const int64_t rows = logits.shape[0];
-    const int64_t vocab = logits.shape[1];
+  if (kDumpLogitsDir != nullptr) {
+    // NO SILENT SKIP. The first version of this guard folded `rank == 2 &&
+    // shape[0] > 0` into the `if`, so an unexpected shape wrote nothing, raised
+    // nothing, and left an empty dump directory that read exactly like "the
+    // instrument is off". That cost a 40-minute lease on 2026-09-02: the run
+    // completed, both engines exited 0, and the alignment control reported six
+    // MISSING sidecars with no way to tell which condition had failed. An
+    // instrument states why it did not fire.
+    VT_CHECK(logits.rank == 2,
+             "VT_DUMP_LOGITS: the sample logits are not rank 2");
     VT_CHECK(logits.dtype == vt::DType::kF32,
              "VT_DUMP_LOGITS: the sample logits are not f32");
+    const int64_t rows = logits.shape[0];
+    const int64_t vocab = logits.shape[1];
+    // Printed ONCE, so the log says what the instrument saw rather than leaving
+    // an empty directory to be interpreted.
+    static bool announced = false;
+    if (!announced) {
+      announced = true;
+      std::fprintf(stderr,
+                   "vt-dump-logits: dir=%s rows=%lld vocab=%lld req_ids=%zu "
+                   "discard=%zu\n",
+                   kDumpLogitsDir, static_cast<long long>(rows),
+                   static_cast<long long>(vocab), exec_state_.req_ids.size(),
+                   exec_state_.discard.size());
+      for (size_t k = 0; k < exec_state_.req_ids.size() && k < 8; ++k) {
+        std::fprintf(stderr, "vt-dump-logits: req_ids[%zu]=\"%s\"\n", k,
+                     exec_state_.req_ids[k].c_str());
+      }
+    }
+    VT_CHECK(rows > 0, "VT_DUMP_LOGITS: no sample rows");
+    VT_CHECK(!exec_state_.req_ids.empty(),
+             "VT_DUMP_LOGITS: exec_state_.req_ids is EMPTY at the sample point, "
+             "so no row can be keyed by request");
 
     // Same staging the reviewed logits-processor path uses
     // (sample/logits_processor/builtin.cpp): a backend that answers the NARROW

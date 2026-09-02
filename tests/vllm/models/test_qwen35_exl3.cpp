@@ -1,5 +1,6 @@
-// MODEL-QWEN35-EXL3 — the EXL3 (exllamav3 trellis) arm of the DENSE Qwen3.5
-// text model, #2495 items 3 and 5.
+// MODEL-QWEN35-EXL3 / MODEL-QWEN35-GDN-EXL3 — the EXL3 (exllamav3 trellis) arm
+// of the Qwen3.5 text model: the DENSE half (#2495 items 3 and 5) and the GDN
+// linear-attention tower (#2495 item 4).
 //
 // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` declares
 // `architectures: ["Qwen3_5ForConditionalGeneration"]`, which this tree already
@@ -27,16 +28,23 @@
 //       prove the class works and never that anything reaches it
 //       (`.agents/reachability.md`).
 //
-//   G3  Does the GDN half REFUSE BY NAME? 48 of the real model's 64 layers are
-//       `linear_attention` and NOTHING in `ProjectGdnQkvz`/`ProjectGdnBA`/
-//       `ProjectGdnOut` consumes an `Exl3Weight`. That arm is #2495 item 4.
-//       Half-loading is the failure this prevents, and a refusal is a gateable
-//       behaviour where "tensor not found" is not.
+//   G3  Does the GDN half LOAD AND FORWARD? 48 of the real model's 64 layers
+//       are `linear_attention`, so this half is most of the checkpoint. This
+//       case REPLACES a refusal: until #2495 item 4 the three GDN projections
+//       were refused by name because nothing in `ProjectGdnQkvz`/`ProjectGdnOut`
+//       consumed an `Exl3Weight`, and refusing beat half-loading. The case
+//       enters at `ModelRegistry::Forward` for the reason G2 does.
 //
-//   G4  Are the bf16, per-tensor FP8 and NVFP4 arms UNCHANGED? A fourth rung in
-//       a presence-based resolver is exactly where an existing arm gets
-//       mis-selected, and a mis-selection is silent: every one of these
-//       checkpoints still loads and still produces plausible numbers.
+//   G3b Does the ARTIFACT'S PATTERN load? The published checkpoint is 64 layers
+//       of three `linear_attention` then one `full_attention`. A loader that
+//       keyed the arm off the layer INDEX rather than off the tensors still
+//       passes at 1/1, so the ratio is exercised directly.
+//
+//   G4  Are the bf16, per-tensor FP8 and NVFP4 arms UNCHANGED, in the dense
+//       towers AND in the GDN one? A fourth rung in a presence-based resolver is
+//       exactly where an existing arm gets mis-selected, and a mis-selection is
+//       silent: every one of these checkpoints still loads and still produces
+//       plausible numbers.
 //
 // No checkpoint download, no GPU, no snapshot. The fixture is a complete but
 // tiny `Qwen3_5ForConditionalGeneration` dense checkpoint written to a temp
@@ -304,22 +312,42 @@ class TempCheckpoint {
 // than a bf16 one: `num_key_value_heads * head_dim` is a projection width and
 // cannot be the usual small GQA number, and the vocabulary is a projection
 // width too because the head is quantized.
-HfConfig DenseConfig(bool with_exl3_quant_config) {
+// The artifact's own `layer_types`: three `linear_attention` then one
+// `full_attention`, 64 entries. Indices 0,1,2 are linear and 3 is full, which is
+// `i % 4 == 3` — read from `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`'s `config.json`.
+std::vector<std::string> Ratio3To1LayerTypes(int layers) {
+  std::vector<std::string> t;
+  t.reserve(static_cast<size_t>(layers));
+  for (int i = 0; i < layers; ++i)
+    t.emplace_back(i % 4 == 3 ? "full_attention" : "linear_attention");
+  return t;
+}
+
+HfConfig DenseConfig(bool with_exl3_quant_config,
+                     const std::vector<std::string>& layer_types = {
+                         "linear_attention", "full_attention"}) {
   HfConfig c;
   c.model_type = "qwen3_5_text";
   c.architectures = {kArch};
   c.hidden_size = 128;
-  c.num_hidden_layers = 2;
+  c.num_hidden_layers = static_cast<int>(layer_types.size());
   c.vocab_size = 128;          // lm_head's N
   c.num_attention_heads = 2;   // q_proj N = 2*Hq*Dh = 256 (output gate doubled)
   c.num_key_value_heads = 2;   // k/v_proj N = Hkv*Dh = 128
   c.head_dim = 64;             // o_proj K = Hq*Dh = 128
-  c.layer_types = {"linear_attention", "full_attention"};
+  c.layer_types = layer_types;
   c.intermediate_size = 128;
   c.num_experts = 0;
   c.linear_num_key_heads = 1;
   c.linear_num_value_heads = 2;
-  c.linear_key_head_dim = 32;    // conv_dim == 192
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): 64, not the 32 this fixture carried
+  // while the GDN tower could only be refused. `conv_dim = 2*Hk*Dk + Hv*Dv` is
+  // an EXL3 projection WIDTH once the tower is quantized, and every EXL3 K and
+  // N must be a multiple of 128 because each side carries a blockwise
+  // Hadamard-128 (`exl3_lib/quantize.py:15`; `src/vt/exl3_policy.cpp:150`
+  // declines anything else). At 32 the width was 192 and could not be an EXL3
+  // projection at all. At 64 it is 256, and `value_dim` stays 128.
+  c.linear_key_head_dim = 64;    // conv_dim == 256
   c.linear_value_head_dim = 64;  // value_dim == 128
   c.linear_conv_kernel_dim = 4;
   c.rope_theta = 10000.0;
@@ -362,7 +390,9 @@ struct Geometry {
   int64_t inter = 128;
   int64_t head_dim = 64;
   int64_t attn_out_k = 128;  // Hq * Dh
-  int64_t conv_dim = 192;
+  // 2*Hk*Dk + Hv*Dv = 2*1*64 + 2*64. A multiple of 128 so the GDN tower can be
+  // an EXL3 projection; see `DenseConfig`.
+  int64_t conv_dim = 256;
   int64_t value_dim = 128;
   int64_t num_v_heads = 2;
   int64_t v_head_dim = 64;
@@ -398,48 +428,92 @@ void AppendProjection(std::vector<FixtureTensor>& out, const std::string& proj,
   out.push_back({proj + ".weight_scale_2", "F32", {}, Bytes32F({0.5F})});
 }
 
-// The GDN tower. `exl3_gdn` writes it as EXL3, which is what
-// `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships and what this row REFUSES; every
-// other case writes it BF16, which is the shape whose dense half loads.
+// How the GDN linear-attention tower is written. THREE forms, not two —
+// MODEL-QWEN35-GDN-EXL3 (#2495 item 4).
+enum class GdnArm {
+  // Independent random BF16. What every non-EXL3 case wants: a tower that is
+  // simply not quantized, so a case about the dense arms is not also a case
+  // about this one.
+  kPlainBf16,
+  // `.trellis` + `.suh` + `.svh` + `.mul1`, which is what
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships on all 48 of its
+  // `linear_attention` layers.
+  kExl3,
+  // The SAME trellis bytes as `kExl3`, decoded into BF16 `.weight` tensors.
+  // This is the comparison twin: it makes the forward check an EQUIVALENCE
+  // between two readings of one set of bytes rather than a tolerance between
+  // two different models.
+  kDecodedBf16,
+};
+
+// `f16_remainder` is the artifact's own asymmetry and NOT a free choice.
+// `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` stores `in_proj_a` and `in_proj_b` at
+// **F16**, while storing `conv1d`, `norm`, `A_log` and `dt_bias` beside them at
+// **BF16** — read from its safetensors headers by range request. exllamav3
+// keeps the unquantized LINEAR remainder at fp16 because it runs the linear in
+// fp16, and leaves the rest alone. `LoadMergedBf16RawNK` refused F16 by name,
+// so without this the tower is blocked a second time on a tensor nothing
+// quantized. Writing these BF16 here would leave that path unreached.
+//
+// The decoded twin writes `F32ToBF16(F16ToF32(v))` of the SAME values
+// (`RemainderBytes`'s `as_f16=false` arm), so after loading the two checkpoints
+// hold bit-identical `in_proj_ba` and the forward comparison is measuring the
+// three projections and nothing else.
 void AppendGdnLayer(std::vector<FixtureTensor>& out, const std::string& base,
-                    const Geometry& g, bool exl3_gdn, bool f16_remainder) {
+                    const Geometry& g, GdnArm arm, bool f16_remainder,
+                    uint32_t seed = 4000) {
   const std::string la = base + "linear_attn.";
-  if (exl3_gdn) {
-    AppendExl3(out, la + "in_proj_qkv", MakeProj(g.hidden, g.conv_dim, 4001));
-    AppendExl3(out, la + "in_proj_z", MakeProj(g.hidden, g.value_dim, 4002));
-    AppendExl3(out, la + "out_proj", MakeProj(g.value_dim, g.hidden, 4003));
+  const Exl3Proj qkv = MakeProj(g.hidden, g.conv_dim, seed + 1);
+  const Exl3Proj z = MakeProj(g.hidden, g.value_dim, seed + 2);
+  const Exl3Proj o = MakeProj(g.value_dim, g.hidden, seed + 3);
+  if (arm == GdnArm::kExl3) {
+    AppendExl3(out, la + "in_proj_qkv", qkv);
+    AppendExl3(out, la + "in_proj_z", z);
+    AppendExl3(out, la + "out_proj", o);
+  } else if (arm == GdnArm::kDecodedBf16) {
+    AppendDecodedBf16(out, la + "in_proj_qkv", qkv);
+    AppendDecodedBf16(out, la + "in_proj_z", z);
+    AppendDecodedBf16(out, la + "out_proj", o);
   } else {
-    // The GDN tower stays BF16 in EVERY arm of this fixture, including the EXL3
-    // one. That is the point of items 3 and 5 being separable from item 4: the
-    // dense half of a checkpoint can be quantized while this tower is not, and
-    // when it IS quantized the loader must say so rather than half-load.
     out.push_back({la + "in_proj_qkv.weight", "BF16", {g.conv_dim, g.hidden},
-                   RemainderBytes({g.conv_dim, g.hidden}, 4001, 0.1F, false)});
+                   RemainderBytes({g.conv_dim, g.hidden}, seed + 1, 0.1F, false)});
     out.push_back({la + "in_proj_z.weight", "BF16", {g.value_dim, g.hidden},
-                   RemainderBytes({g.value_dim, g.hidden}, 4002, 0.1F, false)});
+                   RemainderBytes({g.value_dim, g.hidden}, seed + 2, 0.1F, false)});
     out.push_back({la + "out_proj.weight", "BF16", {g.hidden, g.value_dim},
-                   RemainderBytes({g.hidden, g.value_dim}, 4003, 0.1F, false)});
+                   RemainderBytes({g.hidden, g.value_dim}, seed + 3, 0.1F, false)});
   }
-  (void)f16_remainder;
-  out.push_back({la + "in_proj_b.weight", "BF16", {g.num_v_heads, g.hidden},
-                 RemainderBytes({g.num_v_heads, g.hidden}, 4004, 0.1F, false)});
-  out.push_back({la + "in_proj_a.weight", "BF16", {g.num_v_heads, g.hidden},
-                 RemainderBytes({g.num_v_heads, g.hidden}, 4005, 0.1F, false)});
+  // KEYED ON THE GDN ARM, not on the dense one. F16 `in_proj_a`/`in_proj_b` is
+  // what accompanies a QUANTIZED tower in the artifact; a checkpoint whose
+  // dense half is EXL3 while this tower is plain bf16 stores them BF16 like
+  // every other bf16 tower, and the loader's non-EXL3 rung refuses F16 there by
+  // name. The decoded twin also writes BF16, and `RemainderBytes` derives it
+  // from the SAME fp16 values, so the two hold bit-identical `in_proj_ba` after
+  // loading.
+  const bool ba_f16 = f16_remainder && arm == GdnArm::kExl3;
+  const char* ba_dt = ba_f16 ? "F16" : "BF16";
+  out.push_back({la + "in_proj_b.weight", ba_dt, {g.num_v_heads, g.hidden},
+                 RemainderBytes({g.num_v_heads, g.hidden}, seed + 4, 0.1F,
+                                ba_f16)});
+  out.push_back({la + "in_proj_a.weight", ba_dt, {g.num_v_heads, g.hidden},
+                 RemainderBytes({g.num_v_heads, g.hidden}, seed + 5, 0.1F,
+                                ba_f16)});
   out.push_back({la + "conv1d.weight", "BF16", {g.conv_dim, 1, g.conv_k},
-                 RemainderBytes({g.conv_dim, 1, g.conv_k}, 4006, 0.1F, false)});
+                 RemainderBytes({g.conv_dim, 1, g.conv_k}, seed + 6, 0.1F, false)});
   out.push_back({la + "A_log", "BF16", {g.num_v_heads},
-                 RemainderBytes({g.num_v_heads}, 4007, 0.5F, false)});
+                 RemainderBytes({g.num_v_heads}, seed + 7, 0.5F, false)});
   out.push_back({la + "dt_bias", "BF16", {g.num_v_heads},
-                 RemainderBytes({g.num_v_heads}, 4008, 0.5F, false)});
+                 RemainderBytes({g.num_v_heads}, seed + 8, 0.5F, false)});
   out.push_back({la + "norm.weight", "BF16", {g.v_head_dim},
-                 RemainderBytes({g.v_head_dim}, 4009, 0.5F, false)});
+                 RemainderBytes({g.v_head_dim}, seed + 9, 0.5F, false)});
 }
 
 // The whole checkpoint. Layer 0 is `linear_attention`, layer 1 is
 // `full_attention`, and BOTH carry a dense MLP -- the same split the real model
 // has, at 48/16 instead of 1/1.
-std::vector<FixtureTensor> DenseCheckpoint(Arm arm, const Geometry& g = {},
-                                           bool exl3_gdn = false) {
+std::vector<FixtureTensor> DenseCheckpoint(
+    Arm arm, const Geometry& g = {}, GdnArm gdn = GdnArm::kPlainBf16,
+    const std::vector<std::string>& layer_types = {"linear_attention",
+                                                   "full_attention"}) {
   // `f16` is a property of the checkpoint FAMILY, not of a single tensor: an
   // EXL3 artifact stores its whole unquantized remainder at F16.
   const bool f16 = (arm == Arm::kExl3);
@@ -450,15 +524,15 @@ std::vector<FixtureTensor> DenseCheckpoint(Arm arm, const Geometry& g = {},
   t.push_back({"model.norm.weight", rdt, {g.hidden},
                RemainderBytes({g.hidden}, 12, 0.5F, f16)});
 
-  for (int layer = 0; layer < 2; ++layer) {
+  for (int layer = 0; layer < static_cast<int>(layer_types.size()); ++layer) {
     const std::string base = "model.layers." + std::to_string(layer) + ".";
     const uint32_t seed = 1000 + static_cast<uint32_t>(layer) * 500;
     t.push_back({base + "input_layernorm.weight", rdt, {g.hidden},
                  RemainderBytes({g.hidden}, seed + 1, 0.5F, f16)});
     t.push_back({base + "post_attention_layernorm.weight", rdt, {g.hidden},
                  RemainderBytes({g.hidden}, seed + 2, 0.5F, f16)});
-    if (layer == 0) {
-      AppendGdnLayer(t, base, g, exl3_gdn, f16);
+    if (layer_types[static_cast<size_t>(layer)] == "linear_attention") {
+      AppendGdnLayer(t, base, g, gdn, f16, 4000 + static_cast<uint32_t>(layer) * 20);
     } else {
       const std::string sa = base + "self_attn.";
       AppendProjection(t, sa + "q_proj", g.q_n, g.hidden, arm, seed + 10);
@@ -535,16 +609,26 @@ struct CachePool {
   std::vector<PagedKvCache> attn_kv;
   std::vector<GdnStateCache> gdn_state;
 
-  CachePool(const HfConfig& c, const Geometry& g, int64_t nb, int64_t bs) {
-    ssm_buf.emplace_back(
-        static_cast<size_t>(nb * g.num_v_heads * g.v_head_dim *
-                            c.linear_key_head_dim),
-        0.0F);
-    conv_buf.emplace_back(
-        static_cast<size_t>(nb * g.conv_dim * (g.conv_k - 1)), 0.0F);
-    attn_buf.emplace_back(
-        static_cast<size_t>(nb * 2 * bs * c.num_key_value_heads * c.head_dim),
-        0.0F);
+  // ONE cache per layer of each kind. The 3:1 fixture has six `linear_attention`
+  // layers and two `full_attention` ones, and a pool sized for the 1/1 fixture
+  // would index past its own storage on the seventh.
+  CachePool(const HfConfig& c, const Geometry& g, int64_t nb, int64_t bs,
+            int n_gdn = 1, int n_attn = 1) {
+    // Every buffer is emplaced BEFORE any `.data()` is taken below: a later
+    // emplace reallocates the outer vector and would dangle the pointers.
+    for (int i = 0; i < n_gdn; ++i) {
+      ssm_buf.emplace_back(
+          static_cast<size_t>(nb * g.num_v_heads * g.v_head_dim *
+                              c.linear_key_head_dim),
+          0.0F);
+      conv_buf.emplace_back(
+          static_cast<size_t>(nb * g.conv_dim * (g.conv_k - 1)), 0.0F);
+    }
+    for (int i = 0; i < n_attn; ++i) {
+      attn_buf.emplace_back(
+          static_cast<size_t>(nb * 2 * bs * c.num_key_value_heads * c.head_dim),
+          0.0F);
+    }
     const vt::Device cpu{vt::DeviceType::kCPU, 0};
     for (auto& b : attn_buf) {
       PagedKvCache kv;
@@ -616,7 +700,10 @@ std::vector<float> RegistryForward(const HfConfig& c, const Geometry& g,
   const std::vector<int32_t> ids = {5, 9, 2, 17};
   const std::vector<int32_t> pos = {0, 1, 2, 3};
   const std::vector<int32_t> logits_indices;
-  CachePool pool(c, g, /*nb=*/4, /*bs=*/8);
+  int n_gdn = 0, n_attn = 0;
+  for (const std::string& lt : c.layer_types)
+    (lt == "linear_attention" ? n_gdn : n_attn) += 1;
+  CachePool pool(c, g, /*nb=*/4, /*bs=*/8, n_gdn, n_attn);
   const CommonAttentionMetadata am = PrefillAttnMeta(T, 8);
   const GDNAttentionMetadata gm = PrefillGdnMeta(T);
   vt::Queue q = Cpu();
@@ -704,10 +791,17 @@ TEST_CASE("qwen3_5 exl3: an EXL3 dense checkpoint LOADS, with the codebook and t
   CHECK(w.layers[1].mlp.gate_proj_exl3.trellis.dtype == DType::kI8);
 
   // The GDN tower loaded BF16 beside it: the dense half being quantized does
-  // not disturb the half that is not.
+  // not disturb the half that is not. This fixture writes an UNQUANTIZED GDN
+  // tower, so the trellis fields must stay empty even though the checkpoint is
+  // an EXL3 one -- the arm is resolved per projection from the tensors, never
+  // from the checkpoint family.
   CHECK(w.layers[0].is_linear_attention);
   CHECK_FALSE(w.layers[0].gdn.in_proj_qkvz.Empty());
   CHECK_FALSE(w.layers[0].gdn.out_proj.Empty());
+  CHECK_FALSE(w.layers[0].gdn.IsExl3());
+  CHECK(w.layers[0].gdn.in_proj_qkv_exl3.Empty());
+  CHECK(w.layers[0].gdn.in_proj_z_exl3.Empty());
+  CHECK(w.layers[0].gdn.out_proj_exl3.Empty());
 
   // And the direct-device staging path must not claim this model.
   CHECK_FALSE(vllm::IsPlainBf16Qwen3_5Dense(w));
@@ -755,35 +849,213 @@ TEST_CASE("qwen3_5 exl3: ModelRegistry::Forward REACHES the arm and agrees with 
 }
 
 // G3 -------------------------------------------------------------------------
-TEST_CASE("qwen3_5 exl3: an EXL3 GDN tower REFUSES BY NAME rather than half-loading") {
+TEST_CASE("qwen3_5 exl3: an EXL3 GDN tower LOADS, and ModelRegistry::Forward REACHES it") {
+  // THE CASE THIS ROW EXISTS FOR, and it replaces a refusal. Until #2495 item 4
+  // the three GDN projections were refused by name, because nothing in
+  // `ProjectGdnQkvz`/`ProjectGdnOut` consumed an `Exl3Weight` and the
+  // alternative was half-loading. 48 of the real model's 64 layers are
+  // `linear_attention`, so the refusal was the whole checkpoint.
   const Geometry g;
+  const HfConfig c = DenseConfig(/*with_exl3_quant_config=*/true);
+  const TempCheckpoint ckpt(DenseCheckpoint(Arm::kExl3, g, GdnArm::kExl3));
+
+  const Qwen3_5DenseWeights w = LoadDense(ckpt, c);
+  REQUIRE(w.layers.size() == 2);
+  REQUIRE(w.layers[0].is_linear_attention);
+  const vllm::GdnLayerWeights& gdn = w.layers[0].gdn;
+  REQUIRE(gdn.IsExl3());
+
+  // The codebook is the half a shape check cannot see: the wrong multiplier
+  // decodes to the correct RMS and uncorrelated values.
+  const Exl3Weight* projs[3] = {&gdn.in_proj_qkv_exl3, &gdn.in_proj_z_exl3,
+                                &gdn.out_proj_exl3};
+  for (const Exl3Weight* e : projs) {
+    CHECK(e->codebook == kCodebook);
+    CHECK(e->Bits() == kBits);
+  }
+  // THE ARTIFACT'S OWN GEOMETRY, not the bf16 convention. The checkpoint ships
+  // `in_proj_qkv` and `in_proj_z` SEPARATELY, so their N are conv_dim and
+  // value_dim rather than one merged conv_dim+value_dim owner.
+  CHECK(gdn.in_proj_qkv_exl3.InFeatures() == g.hidden);
+  CHECK(gdn.in_proj_qkv_exl3.OutFeatures() == g.conv_dim);
+  CHECK(gdn.in_proj_z_exl3.InFeatures() == g.hidden);
+  CHECK(gdn.in_proj_z_exl3.OutFeatures() == g.value_dim);
+  CHECK(gdn.out_proj_exl3.InFeatures() == g.value_dim);
+  CHECK(gdn.out_proj_exl3.OutFeatures() == g.hidden);
+
+  // EXACTLY ONE representation. Without this the case passes for a loader that
+  // filled the trellis fields AND dequantized into the bf16 ones, which is
+  // numerically better and therefore invisible to every value check below.
+  CHECK(gdn.in_proj_qkvz.Empty());
+  CHECK(gdn.in_proj_qkv.Empty());
+  CHECK(gdn.in_proj_z.Empty());
+  CHECK(gdn.out_proj.Empty());
+  CHECK(gdn.in_proj_qkv_fp8.Empty());
+  CHECK(gdn.in_proj_z_fp8.Empty());
+  CHECK(gdn.out_proj_fp8.Empty());
+  CHECK(gdn.out_proj_fp4.Empty());
+  CHECK(gdn.in_proj_qkv_fp8_block.Empty());
+  CHECK(gdn.out_proj_fp8_block.Empty());
+
+  // The trellis is still trellis BYTES. A silent dequant-at-load would be
+  // numerically better and invisible above; only the byte count sees it.
+  CHECK(gdn.in_proj_qkv_exl3.trellis.dtype == DType::kI8);
+  CHECK(gdn.in_proj_qkv_exl3.trellis.bytes.size() ==
+        static_cast<size_t>(g.hidden / 16) *
+            static_cast<size_t>(g.conv_dim / 16) * 32 * kBits);
+
+  // The tensors NOTHING quantizes still loaded beside the trellis. `in_proj_ba`
+  // is the one that mattered: the artifact stores `in_proj_a`/`in_proj_b` at
+  // F16, which `LoadMergedBf16RawNK` refused by name.
+  CHECK_FALSE(gdn.in_proj_ba.Empty());
+  CHECK(gdn.in_proj_ba.nk);
+  CHECK(gdn.in_proj_ba.shape[0] == 2 * g.num_v_heads);
+  CHECK(gdn.in_proj_ba.shape[1] == g.hidden);
+  CHECK_FALSE(gdn.conv1d_weight.Empty());
+  CHECK_FALSE(gdn.a_log.Empty());
+  CHECK_FALSE(gdn.dt_bias.Empty());
+  CHECK_FALSE(gdn.norm_weight.Empty());
+
+  // The registry seam accepts it, which is the entry a user arrives through.
+  CHECK(RegistryLoadFailure(ckpt, c).empty());
+
+  // The DIRECT-DEVICE staging path must not claim this model. That path stages
+  // `OwnedTensor` members only, so it would walk past the trellis, `suh` and
+  // `svh` and leave the tower unstaged -- silently, because every shape check
+  // still passes and the bf16 fields it does stage are empty.
+  CHECK_FALSE(vllm::IsPlainBf16Qwen3_5Dense(w));
+
+  // THE PRODUCTION ENTRY POINT, over the weights the LOADER produced. Deleting
+  // an EXL3 call site in `ProjectGdnQkvz` or `ProjectGdnOut` does not merely
+  // move these numbers: the arm falls through to a bf16 field an EXL3 load
+  // leaves EMPTY and `dense_attn::ResidentWeight` refuses it by name, so the
+  // case reds either way. A unit test that built a `GdnLayerWeights` by hand
+  // would prove the struct holds an `Exl3Weight` and never that anything
+  // reaches it (`.agents/reachability.md`).
+  const HfConfig c_plain = DenseConfig(/*with_exl3_quant_config=*/false);
+  const TempCheckpoint twin(
+      DenseCheckpoint(Arm::kBf16, g, GdnArm::kDecodedBf16));
+  const Qwen3_5DenseWeights wt = LoadDense(twin, c_plain);
+  REQUIRE_FALSE(wt.layers[0].gdn.IsExl3());
+  REQUIRE_FALSE(wt.layers[0].gdn.in_proj_qkvz.Empty());
+
+  const std::vector<float> le = RegistryForward(c, g, w);
+  const std::vector<float> lb = RegistryForward(c_plain, g, wt);
+  REQUIRE(le.size() == lb.size());
+  REQUIRE(!le.empty());
+  for (const float x : le) REQUIRE(std::isfinite(x));
+  for (const float x : lb) REQUIRE(std::isfinite(x));
+
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < le.size(); ++i) {
+    const double d = static_cast<double>(le[i]) - lb[i];
+    num += d * d;
+    den += static_cast<double>(lb[i]) * lb[i];
+  }
+  // NOT VACUOUS: a forward returning zeros satisfies any relative bound whose
+  // reference is also zero. Asserted BEFORE the ratio is formed.
+  REQUIRE(den > 0.0);
+  const double rel = std::sqrt(num / den);
+  MESSAGE("exl3 GDN forward vs decoded-bf16 twin: rel_rms = ", rel);
+  // A BOUND, not an equality: the two arms are the same weights through
+  // different kernels. EXL3 rides the Hadamards on the activations while the
+  // twin has them baked in, and the twin rounds the decode to bf16. The GDN
+  // recurrence then carries that difference through a scan, so this is looser
+  // than the dense arms' bound in G2 and deliberately so.
+  CHECK(rel <= 1.0e-1);
+}
+
+// G3b ------------------------------------------------------------------------
+TEST_CASE("qwen3_5 exl3: the artifact's 3:1 layer_types pattern loads and forwards") {
+  // The 1/1 fixture proves the ARM. It does not prove the PATTERN, and the
+  // pattern is where a per-layer resolver goes wrong: `Mia-AiLab/Qwen3.8-27B-
+  // EXL3-3.5bpw` is 64 layers of three `linear_attention` then one
+  // `full_attention`, so a loader that keyed the arm off the layer INDEX rather
+  // than off the tensors would still pass at 1/1.
+  const Geometry g;
+  const std::vector<std::string> types = Ratio3To1LayerTypes(8);
+  REQUIRE(types.size() == 8);
+  CHECK(types[0] == "linear_attention");
+  CHECK(types[2] == "linear_attention");
+  CHECK(types[3] == "full_attention");
+  CHECK(types[7] == "full_attention");
+
+  const HfConfig c = DenseConfig(/*with_exl3_quant_config=*/true, types);
   const TempCheckpoint ckpt(
-      DenseCheckpoint(Arm::kExl3, g, /*exl3_gdn=*/true));
+      DenseCheckpoint(Arm::kExl3, g, GdnArm::kExl3, types));
+
+  const Qwen3_5DenseWeights w = LoadDense(ckpt, c);
+  REQUIRE(w.layers.size() == 8);
+  int gdn_exl3 = 0, attn_exl3 = 0;
+  for (size_t i = 0; i < w.layers.size(); ++i) {
+    if (types[i] == "linear_attention") {
+      REQUIRE(w.layers[i].is_linear_attention);
+      CHECK(w.layers[i].gdn.IsExl3());
+      CHECK(w.layers[i].gdn.in_proj_qkv_exl3.codebook == kCodebook);
+      gdn_exl3 += 1;
+    } else {
+      REQUIRE_FALSE(w.layers[i].is_linear_attention);
+      CHECK(w.layers[i].attn.IsExl3());
+      attn_exl3 += 1;
+    }
+    CHECK(w.layers[i].mlp.IsExl3());
+  }
+  // The 3:1 ratio itself, so a fixture that silently became all-GDN or
+  // all-attention cannot read as a pass.
+  CHECK(gdn_exl3 == 6);
+  CHECK(attn_exl3 == 2);
+
+  CHECK(RegistryLoadFailure(ckpt, c).empty());
+  const std::vector<float> logits = RegistryForward(c, g, w);
+  REQUIRE(!logits.empty());
+  for (const float x : logits) REQUIRE(std::isfinite(x));
+  // NOT VACUOUS: an all-zero forward is finite too.
+  double energy = 0.0;
+  for (const float x : logits) energy += static_cast<double>(x) * x;
+  CHECK(energy > 0.0);
+}
+
+// G3c ------------------------------------------------------------------------
+TEST_CASE("qwen3_5 exl3: an EXL3 GDN tower whose geometry disagrees is REFUSED by name") {
+  // The rung asserts its own geometry rather than trusting it, and this case is
+  // what stops that assertion being decoration. A trellis is self-consistent at
+  // more than one reading of its own shape -- the bytes are there either way and
+  // only the values come out wrong -- so a projection whose width disagrees with
+  // the rest of the layer is invisible to every check that reads the trellis
+  // alone. `conv1d.weight`'s channel count is the checkpoint's OWN statement of
+  // `conv_dim`, so the two are compared against each other and not against the
+  // config.
+  const Geometry g;
   const HfConfig c = DenseConfig(/*with_exl3_quant_config=*/true);
 
+  std::vector<FixtureTensor> tensors =
+      DenseCheckpoint(Arm::kExl3, g, GdnArm::kExl3);
+  // Widen conv1d ALONE, leaving `in_proj_qkv.trellis` at conv_dim. Nothing else
+  // in the checkpoint moves.
+  const std::string conv = "model.layers.0.linear_attn.conv1d.weight";
+  bool patched = false;
+  for (FixtureTensor& t : tensors) {
+    if (t.name != conv) continue;
+    t.shape = {g.conv_dim + 128, 1, g.conv_k};
+    t.bytes = RemainderBytes(t.shape, 77, 0.1F, false);
+    patched = true;
+  }
+  // The fixture must actually carry the tensor this case patches; a renamed
+  // tensor would otherwise make the case pass by testing nothing.
+  REQUIRE(patched);
+
+  const TempCheckpoint ckpt(tensors);
   const std::string message = LoadFailure(ckpt, c);
   REQUIRE_FALSE(message.empty());
-  // The projection, so the reader knows this is a real stored weight and not a
-  // config guess; the row and the issue, so the refusal names its owner.
-  CHECK(Names(message, "in_proj_qkv"));
-  CHECK(Names(message, "EXL3"));
-  CHECK(Names(message, "2495"));
-  CHECK(Names(message, "item 4"));
-  // NOT the accident this replaces. Before the refusal the loader fell through
-  // to `get(la + "in_proj_qkv.weight")` and died on "tensor not found", a
-  // sentence about a checkpoint that is complete.
+  CHECK(Names(message, "conv_dim"));
+  CHECK(Names(message, "linear_attn"));
+  // NOT a missing-tensor accident: every tensor is present and only one width
+  // disagrees.
   CHECK_FALSE(Names(message, "tensor not found"));
 
-  // Through the registry seam as well, which is where a user meets it.
-  const std::string routed = RegistryLoadFailure(ckpt, c);
-  REQUIRE_FALSE(routed.empty());
-  CHECK(Names(routed, "in_proj_qkv"));
-  CHECK(Names(routed, "2495"));
-
-  // AND IT IS NOT UNCONDITIONAL. The same dense arm with a BF16 GDN tower
-  // loads, so this case measures the GDN projections rather than the presence
-  // of any EXL3 weight at all.
-  const TempCheckpoint ok(DenseCheckpoint(Arm::kExl3, g, /*exl3_gdn=*/false));
+  // AND IT IS NOT UNCONDITIONAL: the same fixture unpatched loads, so the case
+  // measures the geometry check rather than the presence of an EXL3 GDN tower.
+  const TempCheckpoint ok(DenseCheckpoint(Arm::kExl3, g, GdnArm::kExl3));
   CHECK(LoadFailure(ok, c).empty());
 }
 
@@ -841,5 +1113,57 @@ TEST_CASE("qwen3_5 exl3: the bf16, per-tensor FP8 and NVFP4 arms are UNCHANGED")
     CHECK(a.q_proj_fp8.Empty());
     CHECK_FALSE(w.layers[1].mlp.gate_proj_fp4.Empty());
     CHECK_FALSE(vllm::IsPlainBf16Qwen3_5Dense(w));
+  }
+
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4). THE GDN TOWER, asserted for the same
+  // reason the dense arms are: a fourth rung in a presence-based resolver is
+  // exactly where an existing arm gets mis-selected, and a mis-selection here is
+  // silent -- every one of these checkpoints still loads and still produces
+  // plausible numbers. Each case names the field the tower MUST land in and
+  // checks the trellis fields are empty.
+  SUBCASE("the bf16 GDN tower stays bf16") {
+    const TempCheckpoint ckpt(DenseCheckpoint(Arm::kBf16, g));
+    const Qwen3_5DenseWeights w = LoadDense(ckpt, c);
+    const vllm::GdnLayerWeights& gdn = w.layers[0].gdn;
+    CHECK_FALSE(gdn.IsExl3());
+    CHECK(gdn.in_proj_qkv_exl3.Empty());
+    CHECK(gdn.in_proj_z_exl3.Empty());
+    CHECK(gdn.out_proj_exl3.Empty());
+    // The MERGED bf16 owner, which is the shape vLLM's single in_proj_qkvz GEMM
+    // needs and the one the EXL3 arm deliberately does not build.
+    CHECK_FALSE(gdn.in_proj_qkvz.Empty());
+    CHECK(gdn.in_proj_qkvz.nk);
+    CHECK(gdn.in_proj_qkvz.shape[0] == g.conv_dim + g.value_dim);
+    CHECK_FALSE(gdn.out_proj.Empty());
+    CHECK_FALSE(gdn.in_proj_ba.Empty());
+  }
+
+  SUBCASE("an EXL3 GDN tower alone is not a plain bf16 model") {
+    // THE TERM THE OTHER CASES CANNOT ISOLATE. `IsPlainBf16Qwen3_5Dense`
+    // returns false for the published artifact because its MLP is EXL3, so a
+    // missing GDN term is invisible on every checkpoint that quantizes both
+    // halves. This checkpoint quantizes ONLY the GDN tower, so the GDN term is
+    // the single thing that can answer.
+    const TempCheckpoint ckpt(DenseCheckpoint(Arm::kBf16, g, GdnArm::kExl3));
+    const Qwen3_5DenseWeights w = LoadDense(ckpt, c);
+    REQUIRE(w.layers[0].gdn.IsExl3());
+    REQUIRE_FALSE(w.layers[1].mlp.IsExl3());
+    REQUIRE_FALSE(w.layers[1].attn.IsExl3());
+    REQUIRE(w.lm_head_exl3.Empty());
+    CHECK_FALSE(vllm::IsPlainBf16Qwen3_5Dense(w));
+  }
+
+  SUBCASE("an EXL3 dense half does not quantize an unquantized GDN tower") {
+    // The separability item 3 was built on, asserted from the other side: an
+    // EXL3 CHECKPOINT whose GDN tower ships bf16 must still load that tower
+    // bf16. A resolver that keyed the arm off the checkpoint family rather than
+    // off the tensors would fail here and nowhere else.
+    const HfConfig ce = DenseConfig(/*with_exl3_quant_config=*/true);
+    const TempCheckpoint ckpt(
+        DenseCheckpoint(Arm::kExl3, g, GdnArm::kPlainBf16));
+    const Qwen3_5DenseWeights w = LoadDense(ckpt, ce);
+    CHECK(w.layers[1].attn.IsExl3());
+    CHECK_FALSE(w.layers[0].gdn.IsExl3());
+    CHECK_FALSE(w.layers[0].gdn.in_proj_qkvz.Empty());
   }
 }

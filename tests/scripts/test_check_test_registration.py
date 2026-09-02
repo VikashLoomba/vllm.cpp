@@ -50,6 +50,9 @@ PASSING_CI = """jobs:
       - name: The SGLang lease identity gate detects a tree that is not the pin
         run: |
           python3 tests/scripts/test_sglang_lease_identity.py
+      - name: The committed LTX-2 oracle goldens still hash to what records them
+        run: |
+          python3 tests/scripts/test_ltx2_oracle_goldens.py
 """
 
 PASSING_PREFLIGHT = """CHECKERS=(
@@ -58,6 +61,7 @@ PASSING_PREFLIGHT = """CHECKERS=(
 SUITES=(
   test_check_test_registration
   test_sglang_lease_identity
+  test_ltx2_oracle_goldens
 )
 for checker in "${CHECKERS[@]}"; do
   python3 "scripts/$checker.py"

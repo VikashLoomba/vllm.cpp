@@ -315,6 +315,100 @@ and to every arm in it, not to this one arm.
 - **ROCm and Vulkan.** Both transcribe the portable CPU reference and decode
   every width already, so the CUDA instantiation list does not bound them.
 
+### Slice F evidence — dgx:gpu0, 2026-09-02
+
+Inside `rc` lease `7503b585-85d4-43ea-8eb8-6f1e7173af73` on `dgx:gpu0`. No
+`ssh`, and the job was submitted with `setsid nohup` so a dying client could not
+cancel it from the queue. It queued for about 3h50m at depth 3 and ran 31m.
+
+- **Device**: NVIDIA GB10, compute capability 12.1, driver `580.173.02`.
+- **Toolchain**: `nvcc` 13.0, apt-installed per run; `-DVLLM_CPP_CUDA_ARCHITECTURES=121a`,
+  `-DVLLM_CPP_BUILD_TESTS=ON`, `-DVLLM_CPP_CUTLASS_FETCH=ON`, Ninja, `-j 4`,
+  ccache, built in `/tmp`.
+- **Tree**: `row/QUANT-EXL3-MUL1-BITS3` `da8d1f420`, staged as a `git archive`
+  tarball and pinned inside the job by its sha256
+  (`3ddf3514c0848966cad139b02ae17aa67a7fd035255a2479bf5bbd08b0b99fcf`), so the
+  job cannot silently build a different tree.
+  `src/vt/cuda/cuda_exl3.cu` sha256 `ad532b34cb34f802832060e89da3dc3cba1f5486bc1522b9b9bf5799a6734872`.
+
+**The gate.** `test_exl3_gemm`, whole binary, no `-tc` filter: `rc=0`, 14 of 14
+cases, 215 assertions. The device arm RAN rather than skipping, which is the
+thing a skip would have hidden inside a green summary line — the CPU-only run of
+the same binary reports 202 assertions, and the 13 extra are the device ones.
+
+| arm | device vs CPU, relative RMS | bound |
+|---|---:|---:|
+| (3, 0) | 3.02751e-07 | 1.0e-3 |
+| (6, 0) | 3.06153e-07 | 1.0e-3 |
+| **(3, 2) — new** | **3.02544e-07** | 1.0e-3 |
+| (4, 2) | 3.06479e-07 | 1.0e-3 |
+| (5, 2) | 2.99241e-07 | 1.0e-3 |
+| (6, 2) | 2.98355e-07 | 1.0e-3 |
+
+The new arm sits inside the band the five already-gated arms occupy
+(2.98e-07 to 3.06e-07), about 3300x under the bound. That is the signature of a
+decode that is exact on both sides with only the reduction order differing,
+which is what the tier was chosen to measure.
+
+**The cost of the added arm.** One TU, `cuda_exl3.cu`, recompiled with
+`CCACHE_DISABLE=1` so the number is a compile and not a cache lookup, on the
+same box in the same job:
+
+| variant | compile | object |
+|---|---:|---:|
+| with `(3, 2)` | 57.837 s | 9,424,816 B |
+| without `(3, 2)` | 51.577 s | 8,276,544 B |
+| with `(3, 2)`, restored, repeat | 57.055 s | 9,424,816 B |
+
+**+1,148,272 bytes (+13.9%) and about +6 s (+11%)**, for ONE architecture. The
+repeat gives the only spread available (1.4% between the two "with" runs), so
+the compile-time figure is n=2 against n=1 and should be read as "about 11%",
+not as 12.1%. The object figure is exact and repeatable. The fat build compiles
+this TU for ten architectures, which is the multiplier that makes the per-K
+split in `## Owed` worth more than it was at six arms.
+
+**Mutations.** Each row rebuilt from the same build directory, and each asserts
+four things rather than only the verdict: the file's sha256 CHANGED, it
+compiled, the test binary's mtime MOVED, and the tree restored byte-for-byte.
+
+| # | mutation | sha256 changed | built | mtime moved | gate | how it failed |
+|---|---|---|---|---|---|---|
+| M1 | drop `bits == 3` from the cb 2 clause of `Exl3ArmInstantiated` | yes | rc 0 | yes | **RED** | the by-name refusal, at the `vt::Exl3Gemm` entry |
+| M2 | `GemmKernelForArm<3, 2>` → `<3, 1>` in `GemmKernelForShape` | yes | rc 0 | yes | **RED** | `CHECK(1.70865 <= 0.001)`, `arm.bits := 3`, `arm.codebook := 2` |
+| M3 | DELETE the `(3, 2)` line from `GemmKernelForShape` | yes | rc 0 | yes | **RED** | `exl3_gemm shape 2 has no instantiation` |
+
+M1 is also the RED-BEFORE: for the guarantee under test it is exactly the tree
+as it stood before this change, and it fails for the intended reason.
+
+M2 is the one worth reading twice. **The device produced 1.70865, and the CPU
+prediction recorded above this section, taken before the lease and on different
+hardware, was 1.70865.** Six significant figures. Two things follow: the
+mutation certainly applied, and the device kernel certainly reads its `CB`
+template parameter rather than deriving the codebook some other way.
+
+M3 is the REACHABILITY row. Deleting the production call site in the shape table
+while leaving the predicate alone makes the dispatch return `nullptr` and throw,
+so the gate is entering the new arm through `vt::Exl3Gemm` and the shape table,
+not by naming a kernel.
+
+**One leg of that job is VOID, and it is an instrument defect rather than a
+result.** The job's last phase restored `cuda_exl3.cu` from the tarball, rebuilt,
+and re-ran the gate as a "the tree is back and still green" check. It reported
+RED. It is void because `tar -x` restores the ARCHIVE's mtime, which is older
+than the mutated file, so Ninja saw nothing to do and the binary was never
+relinked: `gate-final.log` is BYTE-IDENTICAL to `gate-mut-M3-callsite.log`, and
+the phase re-ran M3's mutant. The clean-tree green is phase E's, which built
+from the pristine tarball before any mutation touched it, and the restore itself
+is verified by sha256 on content. A job that mutates and restores must `touch`
+the file after restoring; this one did not. This is the mtime-restore skip that
+this repository has already recorded once; a mutation harness that restores from
+an archive re-acquires it every time, so it belongs in the harness rather than
+in a reader's memory.
+
+That phase also demonstrated the trap it was written against: it reported
+`assertions: 207 | 207 passed | 0 failed` beside `Status: FAILURE!`, because the
+case THREW rather than failing a `CHECK`. The exit code is what caught it.
+
 ### The gate, and why this tier
 
 `tests/vt/test_exl3_gemm.cpp`'s "the widened (bits, codebook) arms agree with
@@ -372,8 +466,19 @@ green is not a device result and is never reported as one.
 - **The shape table is gated at ONE of its four shapes, for every arm.** See
   "What the gate does NOT reach" above. `force_shape_idx` already exists, so
   this is a test loop rather than a port, and it is owed by the table.
-- **Slice F is UNVERIFIED ON A DEVICE until a CUDA build runs it**, on the same
-  terms as slice C: a CPU preflight never compiles `cuda_exl3.cu`.
+- **Slice F's arm is VERIFIED on `dgx:gpu0`** (see its evidence section), which
+  also closes slice C's device debt for cb 2 at four widths. What is still
+  unverified is any REAL tensor of the artifact: the gate is synthetic
+  fixtures, and no shape, `k`, `n` or trellis from the 137 modules was fed to
+  it.
+- **The arm labels in the device arms table never print**
+  ([#2587](https://github.com/mudler/vllm.cpp/issues/2587)). `MESSAGE`
+  stringifies a `const char*` as a bool, so every row logs `(1)` where its
+  description should be, in the CUDA, ROCm and Vulkan arm tables alike.
+  Cosmetic, pre-existing, and NOT fixed in this flow because
+  `tests/vt/test_exl3_gemm.cpp` is one of the two translation units the lease
+  evidence was measured on and editing it would put the evidence and the head
+  out of step for no correctness gain.
 - **Slice F adds a seventh pair to a table this spec argued should stay at
   six.** The argument stands and the reason it is overridden is that the seventh
   pair is not a new artifact's width, it is the SAME artifact's width that the

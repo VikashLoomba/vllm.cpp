@@ -1,0 +1,605 @@
+# Chunked GDN prefill on every backend, with the sequential arm behind a flag — `KERNEL-GDN-CHUNKED-MIRROR`
+
+Issue [#2612](https://github.com/mudler/vllm.cpp/issues/2612). Intended row
+`KERNEL-GDN-CHUNKED-MIRROR` — **not yet in [kernel-matrix.md](../kernel-matrix.md)**.
+The spec comes first (AGENTS.md: a row cannot become `READY` or `ACTIVE` without
+a committed spec), and this one is a `SPIKE`, so the matrix row and the
+`check-agent-record.py:402` count bump `58 -> 59` are owed by the change that
+moves it to `READY`, not by this one. Until then #2612 is owned by this file's
+`## Owed`, which is the alternative AGENTS.md names. vLLM parity pin
+`5559679229bc961848b121ccdeaa8fa5d79bec98`
+([upstream-sync.md](../upstream-sync.md)). Every upstream anchor below was read
+at that revision, in the vendored tree
+`vllm/third_party/flash_linear_attention/ops/`.
+
+Measurement:
+[`docs/bench-evidence/gdn-chunked-decomposition-20260902.md`](../../docs/bench-evidence/gdn-chunked-decomposition-20260902.md)
+(wave GDNDECOMP) and
+[`docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md`](../../docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md)
+(wave PREFILLDIV).
+
+## Scope
+
+vLLM runs the chunked WY decomposition for **all** GDN prefill, on every path.
+`QwenGatedDeltaNetAttention._forward_core` has no sequential branch
+(`qwen_gdn_linear_attn.py:1424-1450`), and `forward_native` (`:266-294`) is the
+same Triton chunk kernel rather than a torch fallback. The sequential kernel our
+CPU arm ports, `fused_recurrent_gated_delta_rule`, is not referenced by that
+layer at all; its only callers are `olmo_gdn_linear_attn.py:430,473`, both
+decode.
+
+`vt::GdnPrefill` runs the chunked algorithm on CUDA
+(`src/vt/cuda/cuda_gdn.cu:6117 GdnPrefillChunkedCuda`, default on) and on
+Tenstorrent. It runs the exact sequential recurrence on **CPU**
+(`src/vt/cpu/cpu_ops.cpp:1862 GdnPrefillKernel` -> `:1811 GdnHeadTokenStep`),
+**ROCm** and **Vulkan**. Those three arms do not mirror vLLM, no record says so,
+and `porting-inventory.md` §9 carries no entry for it.
+
+**The developer has decided: default to mirroring vLLM, and put the algorithm
+choice behind a flag.**
+
+**In scope.** A chunked GDN prefill for the CPU, ROCm and Vulkan arms, with
+upstream's dtype placement; the flag that selects it, on every backend; the
+retention of the sequential recurrence as one tracked exception; the goldens and
+gates that change meaning when the default moves; and the records that today
+state the old arrangement.
+
+**Out of scope, each named again under `## Owed`.** GDN *decode*, which upstream
+does run sequentially and where our arms already mirror it. The `qwen4_exp` MoE
+residue of `7.269e-05`/layer that PREFILLDIV §3 isolated and did not diagnose.
+Speed: this row's default flip is a correctness move and carries no throughput
+claim; the chunk-parallel form exists upstream for speed, but establishing that
+on a CPU arm is a separate row.
+
+**What this spec does NOT promise: token agreement.** PREFILLDIV measured
+`VT_GDN_CHUNKED=0` on CUDA cutting prefill divergence 332x while agreeing on
+*fewer* token ids (3 of 8 against 5 of 8). Agreement between two of our arms is
+an argmax over near-ties and is not a monotone function of the distance between
+them. No gate in this spec is a CPU-vs-CUDA token gate, and no reviewer should
+accept one as evidence that this row succeeded.
+
+## The measurement that decides the design
+
+Full method and validation in the evidence file. The three numbers that bind
+this spec:
+
+| quantity | value |
+|---|---|
+| vLLM's chunked kernel, distance from the exact recurrence | `2.286426e-04` out, `2.248661e-03` state |
+| of which the **chunked reassociation** | `2.428613e-17` out, `1.110223e-16` state |
+| of which the **bf16 intermediates** | the entire remainder |
+
+The chunked WY decomposition is an algebraic identity and behaves like one:
+evaluated in `float64` it reproduces the sequential recurrence to `2.4e-17`.
+Carried at f32 it costs `3.86e-08`, 3.4x our sequential arm's `1.15e-08` and
+four orders below the bf16 term. A numpy replica given nothing but upstream's
+bf16 placement reproduces the real kernel's distance from exact to seven
+significant figures.
+
+**Consequence, and it is the whole design.** At the production output dtype
+(bf16, 8192 elements of the golden):
+
+| arm | bf16 output elements differing from vLLM's kernel |
+|---|---|
+| chunked with upstream's bf16 placement | **62 / 8192** |
+| chunked with f32 intermediates | **4157 / 8192** |
+| our sequential arm today | **4157 / 8192** |
+
+An f32-intermediate chunked port differs from our own sequential arm in **2 of
+8192** elements. It is not a third answer. **It is our current answer wearing
+vLLM's algorithm** — the mirror claim would be unearned and any gate resting on
+it would be a tautology.
+
+## Design
+
+### D0. The default is chunked FOR BF16 AND SEQUENTIAL FOR F32, because that is upstream
+
+`chunk.py:213-215` asserts `q.dtype != torch.float32`. **vLLM cannot run its
+chunked prefill on f32 inputs and does not have a chunked f32 path to mirror.**
+Given f32, mirroring vLLM means running the sequential recurrence, because that
+is the only gated delta rule upstream will execute at that dtype.
+
+The tree already knows this in two places. `test_op_parity.cpp:590-595` forces
+`VT_GDN_CHUNKED=0` for f32 goldens on CUDA, with the reason in a comment. And
+the three f32 goldens are dumped from
+`fla/ops/fused_recurrent.py::fused_recurrent_gated_delta_rule` — the SEQUENTIAL
+kernel — at `atol = rtol = 1e-05`, precisely because the chunked wrapper refused
+to produce them. Only `gdn_prefill_bf16_realdims` is a chunked dump.
+
+**So the default predicate is `chunked = (q.dtype != f32) && VT_GDN_CHUNKED != 0`,
+on every backend.** This is not a concession to the goldens; it is the mirror.
+An implementer who reads "chunked by default" as "chunked always" will make the
+three f32 goldens fail by one to two orders of magnitude — `1e-05` against a
+recorded chunk-vs-sequential gap of `2.44e-04` — and the correct repair is not to
+loosen them. It is `## Stop conditions` item 3.
+
+**The alternative was considered and rejected.** Upstream does not *fall back*
+on f32, it *asserts*, and AGENTS.md asks an unimplemented arm to refuse with a
+message naming the missing part. Refusing f32 by name would be the closer
+mirror of the assertion — and it would break three committed goldens and every
+f32 GDN op test in the tree for a dtype our own engine never puts on the model
+path (`state` is f32, but `q`/`k`/`v` reach `GdnPrefill` in the model dtype).
+Routing f32 to the sequential recurrence keeps that coverage alive and computes
+the same recurrence upstream's own f32 kernel computes. Tenstorrent, which has
+no sequential arm at all, is the one backend that must refuse rather than route
+(D3).
+
+A consequence worth stating: the f32 chunked arm is then **not covered by any
+upstream test**, because upstream has no f32 chunked case to port. Whatever f32
+coverage we ship there is ours and must be recorded as an adaptation, never as a
+port.
+
+### D1. The chunked CPU kernel mirrors upstream's dtype placement
+
+Structure follows `chunk.py:37-82` and the CUDA arm's decomposition
+(`cuda_gdn.cu:3243-3460`), which is already stage-for-stage aligned with the FLA
+sub-ops. Per chunk of `BT = FLA_CHUNK_SIZE = 64` (`utils.py:31`, matching
+`cuda_gdn.cu:169 kChunk`):
+
+```
+G      = inclusive cumsum of g within the chunk               f32   cumsum.py:160-280
+A[i,j] = beta_i (k_i . k_j) exp(G_i-G_j),  j<i                f32   chunk_scaled_dot_kkt.py:86-116,161
+Ai     = (I + A)^-1                       f32 solve, STORED   BF16  solve_tril.py:227-505 + chunk.py:50
+u      = Ai @ bf16(beta v)                f32 acc,  STORED    BF16  wy_fast.py:92-94
+w      = Ai @ bf16(beta exp(G) k)         f32 acc,  STORED    BF16  wy_fast.py:114-116
+h_c    = the chunk-start state                        STORED  BF16  chunk_delta_h.py:352
+v_new  = u - w @ bf16(H)^T                f32 acc,  STORED    BF16  chunk_delta_h.py:178,206,357
+H      = H exp(G_last) + k^T bf16(v_new exp(G_last-G))  H in  F32   chunk_delta_h.py:208-302
+o      = exp(G)(q.h_c)*scale + (bf16(A_o) @ v_new)*scale STORED BF16 chunk_o.py:111-138
+final_state                                                    F32  chunk_delta_h.py:353-355
+```
+
+**Two rounding sites the existing record does not name, and both are load
+bearing.** The two `*scale` factors above are written separately on purpose:
+`chunk_o.py:137` is `b_o * scale + tl.dot(...) * scale`, not
+`(b_o + tl.dot(...)) * scale`, and the two are not the same in f32.
+
+`chunk_delta_h.py:178` casts the f32 register state down to bf16 *as
+an operand* of `w @ h^T` — the state is f32 and the product that reads it is
+not. `chunk.py:50` passes `output_dtype=k.dtype` to `solve_tril`, so the
+triangular inverse is stored bf16 even though `A` itself is f32. Neither appears
+in the dtype table of `qwen4exp-cuda-prefill-divergence-20260902.md` §4. Per-site
+ablation (evidence §3) shows no single site is the mechanism: removing any one
+leaves the gap intact, and each alone is worth `1e-6` to `2e-4`.
+
+**`A` and `final_state` stay f32.** That is upstream, not a concession
+(`chunk.py:47`, `chunk_delta_h.py:353-355`).
+
+**The `K K^T` dot is ieee f32, not TF32.** `chunk_scaled_dot_kkt.py:103` keeps
+the promoted f32 operand on non-RDNA. A TF32 variant was measured and lands
+*further* from the real kernel (`1.2207e-04` against `6.1035e-05`), which is the
+evidence that the ieee path is the one that runs.
+
+### D2. `A^-1` by forward substitution, and why that is still a mirror
+
+Upstream inverts `(I+A)` blockwise: four 16x16 unit-triangular inverses by
+in-register substitution, then six off-diagonal blocks by `tl.dot` chains
+(`solve_tril.py:356-394`). Our CUDA arm instead fuses the solve into the two WY
+columns by forward substitution (`cuda_gdn.cu:3322-3348`), which is the same
+linear algebra with a different association and no materialised inverse.
+
+**The CPU arm may take either shape, but it must round where upstream rounds.**
+Forward substitution has no `A^-1` to store, so the `chunk.py:50` bf16 site has
+no home in it. A port that fuses the solve therefore skips a rounding site that
+the oracle performs. Ablation puts that one site alone at `2.6174e-06` on `out`
+— small, and it is the only site of the nine that a fused solve structurally
+cannot reproduce. **Decision: materialise `A^-1`, round it to bf16, then apply
+it.** The cost is one `[64,64]` per chunk-head. Fusing it is an optimisation this
+row does not take, and if a later row takes it, it takes it with this number
+named.
+
+### D3. The flag: `VT_GDN_CHUNKED`, extended, not duplicated
+
+`VT_GDN_CHUNKED` exists today, CUDA-only, read once at
+`src/vt/cuda/cuda_gdn.cu:3269` by a bespoke `ChunkedPrefillEnabled()`, and
+consumed as the first term of a six-term conjunction at `:6218`. It is on the
+kernel-internal allowlist (`scripts/env-doc-allowlist.txt:71`) and deliberately
+absent from `docs/ENVIRONMENT.md`.
+
+**The CPU, ROCm and Vulkan arms join that same flag. They do not get their own.**
+One name, one meaning: *select the sequential recurrence instead of vLLM's
+chunked decomposition*. Two flags for one semantic choice is how a `--device cpu`
+run and a `--device cuda` run end up on different algorithms because only one of
+them was set, which is the exact confusion this row exists to remove.
+
+Mechanically: lift `ChunkedPrefillEnabled()` out of `cuda_gdn.cu` into the shared
+op layer beside the other `vt::` env readers, so every backend's `GdnPrefill`
+entry point reads the same predicate. The existing bespoke parse
+(`e == nullptr || e[0] != '0'`) is kept verbatim rather than rewritten to
+`EnvOnOr`, because changing the accepted spellings of a flag whose off-value is
+recorded in four evidence files and six spec lines is a semantic change wearing a
+cleanup.
+
+**Tenstorrent has no sequential arm and no flag.** Its prefill
+(`src/vt/tenstorrent/tenstorrent_ops.cpp:4262`) delegates unconditionally to
+`ttnn::transformer::chunk_gated_delta_rule`. It joins the predicate for the f32
+half of D0 — an f32 request must not silently reach a bf16-only chunked op — and
+it either gains a sequential fallback or refuses f32 by name. Refusing by name
+is acceptable and is the pattern AGENTS.md asks for; refusing silently is not.
+Metal has no GDN kernel at all (`src/vt/metal/metal_ops.mm:29`) and is out of
+scope.
+
+**`VT_GDN_CHUNKED` gains a row in `docs/ENVIRONMENT.md`.** Today it is on the
+kernel-internal allowlist (`scripts/env-doc-allowlist.txt:71`) and absent from
+the documented surface, which is correct for a CUDA-only bisect knob. After this
+row it selects, on every device, which of two documented algorithms the engine
+runs, which is exactly the "supported operational lever" the ENVIRONMENT.md
+preamble carves out. Its sibling `VT_GDN_OUT_BF16` is already documented there
+(`docs/ENVIRONMENT.md:228`) for the same reason. Add it to the
+`## Rollback and bisect switches` table, whose stated semantics ("default-on
+fast paths, each with an off switch") it now matches.
+
+**The flag stays out of `include/vllm.h`.** This is the one place the spec
+declines an obvious extension, and the reason is that the ABI has no
+algorithm-choice surface at all: `vllm_model_params` (`include/vllm.h:377-683`)
+selects device, offload backend and scheduler policy, and stops. There is no
+kernel key, no numerics key, no precedent to follow. AGENTS.md requires every
+shipped *capability* to be reachable through the ABI; the shipped capability here
+is **GDN prefill that mirrors vLLM**, and after this row that is what
+`vllm_engine_load` gives you on every device, with no key to set. The flag
+selects a *deliberately non-mirroring* arm. Exposing it in the ABI would make the
+non-mirror a supported product surface, which is the opposite of what D4
+records it as.
+
+If a later row needs it in the ABI, the precedent to copy is
+`enable_jump_forward` (`include/vllm.h:553-568`): a tri-state `int32_t` whose 0
+is the byte-identical default and over which the env var still wins. That row
+would owe a reason this row does not have.
+
+### D4. The tracked exception
+
+AGENTS.md: *"Extend a shared seam when it cannot represent the upstream
+behavior. Otherwise, record one exact tracked exception. Never write a parallel
+path by hand."*
+
+The sequential recurrence is retained as **one** tracked exception, recorded as a
+new entry in `porting-inventory.md` §9, with this reason:
+
+> The gated delta rule's sequential form is not an alternative implementation of
+> vLLM's prefill. It is the recurrence vLLM's prefill is a reassociation of, and
+> it is measurably nearer to it: `1.15e-08` from the exact answer against
+> `2.29e-04`. It is retained for two jobs no mirror can do. It is the reference
+> an implementation error in the chunked arm is caught by, because a chunked arm
+> cannot check itself against another chunked arm. And it is the only gated delta
+> rule upstream itself will run on f32 inputs (`chunk.py:213-215`), so on that
+> dtype it IS the mirror. It is off by default wherever upstream's own kernel
+> would run, and it is not an ABI surface.
+
+It is one exception, not four: the same predicate, the same kernel family, the
+same reason on every backend. It is **not** licence for the arms to drift — the
+sequential arm must stay bit-identical across CPU, ROCm and Vulkan, which is
+today's cross-device gate and stays as-is under the flag.
+
+## Blast radius, enumerated
+
+### The control token sequence
+
+`11751 13 15767 411 2029 11 1092 369` is the CPU arm's output for
+`The capital of France is` on the released `Qwen3.8-Flash-Next-GGUF` UD-IQ1_S.
+**Flipping the CPU default to chunked changes it.** It appears in 11 tracked
+files on `origin/main` in that exact spelling — twelve once this spec lands,
+which is why the count below is stated against the base and re-derivable with
+`git grep -l "11751 13 15767 411 2029 11 1092 369"`:
+
+| file | line(s) | role |
+|---|---|---|
+| `src/vllm/model_executor/models/qwen4_exp_registry.cpp` | 212 | product code (comment) |
+| `docs/USAGE.md` | 670 | doc, checkpoint registry |
+| `docs/bench-evidence/qwen4exp-cuda-decode-identifiers-20260902.md` | 27 | evidence |
+| `docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md` | 60 | evidence |
+| `docs/bench-evidence/qwen4exp-moe-selection-20260902.md` | 229 | evidence |
+| `docs/bench-evidence/qwen4exp-moe-selection-20260902/results.txt` | 17, 30, 42 | evidence |
+| `.agents/specs/debtfix-glue-rank-bound-and-repack-device.md` | 123, 346 | spec |
+| `.agents/specs/qwen4-exp-cuda-decode-ngram-history-sync.md` | 19, 198 | spec |
+| `.agents/specs/qwen4-exp-cuda-rmsnorm-weight-dtype.md` | 221 | spec |
+| `.agents/specs/qwen4-exp-flash-next.md` | 8406, 8461, 8535, 8689, 9160 | spec |
+| `.agents/specs/qwen4-exp-qsa-q-bf16.md` | 123 | spec |
+
+**Three more carry it in a different spelling and a `git grep` of the
+space-separated form misses them.** `tests/vllm/models/test_qwen4_exp_layer_loop.cpp:2595-2596`
+wraps it across two comment lines; `.agents/specs/qwen4-exp-flash-next.md:4376`
+also spells it comma-separated; and `docs/FEATURES.md:128` plus
+`docs/bench-evidence/qwen4exp-released-checkpoint-tokens-20260831.md:12,123`
+carry only the decoded text `" Paris. Given this fact, what is"`. **Fourteen
+tracked files, not eleven.** An implementer who greps one spelling will leave
+three behind.
+
+`.agents/specs/qwen4-exp-qsa-q-bf16.md:123` states the sequence "must not move".
+That line is a gate on a *different* row's change and this row invalidates its
+premise. Reconcile it in the same flow; do not silently break it.
+
+An evidence file records what was measured on the tree it names. **Do not rewrite
+history.** The evidence files and the specs' historical passages keep their
+numbers; what changes is any line that presents the sequence as the *current*
+expectation.
+
+### `docs/USAGE.md:670` — CORRECTED IN THIS FLOW
+
+It read: **"`--device cpu` is the arm to use when the exact ids matter."**
+
+On the mirror criterion that is backwards, and it was the single canonical
+statement of the claim (no other doc makes it). This spec's own commit replaces
+it with a presently-true form — the CPU arm is the more *accurate* one and the
+less *faithful* one:
+
+> The two arms differ because the CPU arm runs an exact sequential recurrence and
+> the CUDA arm runs vLLM's chunked prefill decomposition. The CPU arm is the
+> *more accurate* of the two and the *less faithful*: it is `1.15e-08` from the
+> exact recurrence where vLLM's own kernel is `2.29e-04`, so the ids it emits are
+> the ids of an answer vLLM does not compute. `--device cuda` is the arm that
+> mirrors vLLM.
+
+**Sequencing.** That correction is true of the tree as it stands and does not
+depend on the default flip, which is why it lands here rather than waiting. The
+*further* rewrite — dropping the CPU/CUDA distinction once both arms are chunked,
+and re-deriving the ids the cell records — lands with the implementation, and the
+row is not `DONE` until the cell stops promising an arm that no longer exists.
+
+### What goes red, enumerated
+
+Every item below was located by reading the tree, not predicted. An implementer
+who is surprised by one of these has found something this list missed; say so.
+
+**Fails outright, on a chunked CPU arm.**
+
+| site | assertion | why it breaks |
+|---|---|---|
+| `tests/parity/test_op_parity.cpp:590-600` x `gdn_prefill_f32_small`, `_noinit`, `_realdims` | `atol = rtol = 1e-05` against a SEQUENTIAL upstream dump | the `ScopedEnv("VT_GDN_CHUNKED","0")` at `:595` is read only by CUDA (`cuda_gdn.cu:3269`), so it becomes a no-op on CPU. **D0 is the fix. Do not loosen these.** |
+| `tests/vt/test_ops_gdn.cpp:111` | hand-computed 3-token table at `doctest::Approx(...).epsilon(1e-6)` | the values were derived from the sequential pseudocode in f64 |
+| `tests/vt/test_ops_gdn.cpp:3452,3466` | CUDA-vs-CPU at `1e-5f/1e-5f` (`kCudaCombos[0]`, `:796`) | `RunGdnCudaCase` pins only the CUDA leg sequential (`:1795-1798`); the pair de-pins |
+| `tests/vt/test_ops_kda_recurrence.cpp:144` | `CHECK(out_diff == 0); CHECK(st_diff == 0);` — KDA reduces to `vt::GdnPrefill` **bit for bit** on CPU | KDA is not chunked. Either KDA moves in lockstep or this reduction is stated as holding only on the sequential arm. **Decide it in the spec, not in the test.** |
+| `tests/vt/test_cpu_threadpool.cpp:459` (corpus at `:348`, `:375`) | byte-identical output at `n_threads` 1 / 3 / 20, `GdnPrefill` in the corpus | today's kernel is byte-identical by construction (disjoint `(sequence, head)` work, no shared reduction, `cpu_ops.cpp:1878-1880`). A chunked arm must keep that property, which constrains how chunks are parallelised. |
+
+**At risk, and each needs a measurement rather than a guess.**
+
+| gate | bar | note |
+|---|---|---|
+| `tests/vt/test_backend_cross_device.cpp:1676` | `Nmse <= kNmseTol` with `kNmseTol = 5e-4` (`:58`) | **This one case is the ROCm, Vulkan, Tenstorrent and CUDA gate at once**: it loops `RegisteredDevices()` at `:1714` against the CPU reference at `:1699-1711`. ROCm's kernel header names it as its contract (`src/vt/rocm/rocm_gdn_scan.hip:14-16`). While CPU is chunked and ROCm/Vulkan are not, this compares two different algorithms whose recorded gap is `2.44e-04` max-abs. |
+| `tests/vt/test_vulkan_backend.cpp:2601` (`:2692`, `:2696`, `:2747`) | `kGdnNmseTol = 5e-4` (`:1961`) | same shape; plus `:2703-2704` `memcmp`-asserts that an EMPTY sequence's state block is untouched, which a chunked arm must also honour |
+| `tests/vt/test_vulkan_backend.cpp:2890` | `memcmp == 0` on the wide-`Dk` decline path (`:2967`) | Vulkan declines to the CPU provider, so this compares the new CPU kernel to itself. It stays green — and it therefore proves nothing about the change, which is the trap. |
+| `tests/vt/test_tenstorrent_backend.cpp:1965` | `tol_o` 0.05/0.08, `tol_s` 0.05 (`:2068-2076`) | Tenstorrent is ALREADY chunked, so this should get *better*. Its recorded state margin is `1.44e-2` against 0.05 — 3.10x headroom (`.agents/specs/tenstorrent-gdn.md:263-264`) — and that table is re-based by any move of the CPU reference. |
+
+**The trap in every row of the second table.** Once two arms both run the chunked
+algorithm they will agree with each other far more tightly than either agrees
+with today's baseline. **A green cross-device gate after the flip is not evidence
+that either arm is right.** The re-baseline is against the **oracle**, not against
+the CPU arm: `tests/parity/goldens/gdn_prefill_bf16_realdims/` is a dump of the
+real Triton chunk kernel and is the only artifact in this tree that can say
+whether a chunked port is correct. It is currently satisfied by the sequential
+C++ at a tolerance loosened to `5e-3` in M0.7 *because of* the `2.29e-04` gap its
+own manifest note records. **A chunked CPU arm must pass it far tighter, and
+that tightening is this row's primary gate.**
+
+### Harnesses and evidence whose premise moves
+
+- `scripts/tier-hidden-delta.py` — the ROCm-tier-vs-CPU-tier activation bisector
+  (#2590) carries no numeric bar by design, but its whole premise is that the
+  CPU tier is the reference. Every recorded profile is re-based.
+- `docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md`,
+  `docs/bench-evidence/qwen4exp-moe-selection-20260902.md` (`:77`, `:119`,
+  `:228`) and `.agents/specs/qwen4-exp-flash-next.md:4079,8671-8831` all rest on
+  "the CPU arm runs an exact sequential recurrence". They keep their numbers —
+  an evidence file records what was measured on the tree it names — but any
+  passage presenting that as the CURRENT arrangement is reconciled.
+
+### The production path this lands on
+
+`vt::GdnPrefill` on `kCPU` is reached on the default, unflagged path of two
+model trunks, at every linear-attention layer of every prefill step:
+`runner.cpp:2814` -> `model_registry.cpp:492` -> (`qwen3_5_moe.cpp:109,210` or
+`qwen4_exp_registry.cpp:295,956` -> `qwen4_exp_forward.cpp:589` ->
+`qwen3_5.cpp:8116`) -> `qwen3_5.cpp:5103 GdnBlockPaged` -> `:5484`/`:5493` ->
+`vt/ops.cpp:2190,2196` -> `cpu_ops.cpp:4036` -> `:1862`. The only branches are
+`layer.is_linear_attention` and `np > 0`. That is the call site G6 deletes.
+
+**Two dtypes on that path, and neither is what an op test uses.** `out` is
+**bf16** by default — `GdnOutDType()` (`qwen3_5.cpp:193-197`) reads
+`VT_GDN_OUT_BF16`, unset means on, and there is no device term, so CPU gets bf16
+exactly as CUDA does. `state` is **f32** unconditionally: the persistent cache is
+gathered into an f32 working buffer before the call (`qwen3_5.cpp:5451-5455`).
+The chunked CPU arm must therefore accept a bf16 `out` store and an f32 state,
+and any CPU-vs-CPU A/B must fix `VT_GDN_OUT_BF16` rather than inherit it.
+
+## Tests — red first
+
+Each test below fails on `origin/main` for the reason it names, and the
+implementer captures that red before writing the kernel.
+
+1. **T1, the tolerance the sequential arm cannot meet.** `test_op_parity.cpp`
+   runs `gdn_prefill_bf16_realdims` at `atol = rtol = 5e-3`, loosened in M0.7
+   precisely to admit the sequential arm. Add a second, *tight* case over the
+   same golden that the chunked CPU arm must pass. The bar is derived from the
+   evidence, not chosen: the bf16-placement replica lands `6.1035e-05` from the
+   real kernel and 62 of 8192 bf16 output elements differ. **Bar:
+   `max|d| <= 1.5e-04` on `out` and `<= 1.5e-03` on `state`**, which the
+   f32-intermediate arm (`2.4414e-04` / `2.2486e-03`) and today's sequential arm
+   (`2.2865e-04` / `2.2487e-03`) both fail and a bf16-faithful port passes with
+   margin. RED-BEFORE: fails on `main` at `2.2865e-04`.
+
+2. **T2, the dtype gate a token gate cannot see.** Assert the *memory format* of
+   the chunked CPU scratch: `u`, `w`, `v_new`, the per-chunk `h` snapshot and
+   `A^-1` are bf16 buffers; `A`, the running state and `final_state` are f32.
+   AGENTS.md: a token gate cannot detect a dtype that is too wide, and evidence
+   §4 is the proof that the wide version passes every value gate the sequential
+   arm passes. RED-BEFORE: no such buffers exist.
+
+3. **T3, the dtype predicate of D0 routes.** An f32 request must take the
+   sequential arm and a bf16 request the chunked one, on the same binary, with
+   `VT_GDN_CHUNKED` unset. Assert it by observing the two arms' outputs differ
+   for bf16 and are bit-identical to today's for f32. RED-BEFORE: no predicate.
+
+4. **T4, the flag routes, in both directions.** `VT_GDN_CHUNKED=0` and `=1` in
+   one process over the same bf16 inputs must produce *different* outputs on
+   every backend that has both arms, and the `=0` output must be bit-identical
+   to today's sequential output. Assert both: a flag that is read and ignored,
+   and a flag whose two arms coincide, each reads as a pass otherwise. Mirror
+   `tests/vt/test_ops_gdn.cpp:1982-1983`, which already does this for CUDA.
+   RED-BEFORE: on CPU both settings give one answer.
+
+5. **T5, the chunk boundary.** `T = 5` (one partial chunk — the real prompt
+   length PREFILLDIV measured), `T = 64` (exactly one chunk), `T = 65`,
+   `T = 129`, and a varlen batch mixing them with an EMPTY sequence. Evidence §3
+   shows the state-path rounding sites do not reach `out` at all in a
+   single-chunk run, so a suite that only exercises `T <= 64` cannot see half the
+   kernel. The empty-sequence case is not optional:
+   `tests/vt/test_vulkan_backend.cpp:2703-2704` already `memcmp`-asserts that
+   block untouched.
+
+6. **T6, byte-identity across threads survives.** Extend
+   `tests/vt/test_cpu_threadpool.cpp:459`'s corpus to the chunked arm at
+   `n_threads` 1 / 3 / 20. Today's kernel is byte-identical by construction
+   (`cpu_ops.cpp:1878-1880`); a chunked arm must be too, which constrains how
+   chunks may be parallelised. RED-BEFORE: run the new arm under the existing
+   harness before the parallelisation is settled.
+
+7. **T7, the KDA reduction.** `tests/vt/test_ops_kda_recurrence.cpp:144` asserts
+   `vt::KdaGatedDeltaRule` reduces to `vt::GdnPrefill` **bit for bit** on CPU
+   (`out_diff == 0`, `st_diff == 0`). KDA is not chunked. **Decide this in the
+   spec, not in the test**: either KDA moves in lockstep, or the reduction is
+   restated as holding on the sequential arm and the test pins
+   `VT_GDN_CHUNKED=0`. Restating it is the smaller change and is what this spec
+   recommends, because the KDA row's claim is about the *recurrence*, not about
+   which evaluation order our GDN default happens to take. Whichever is chosen,
+   the test says which, in a comment, with this row's ID.
+
+8. **T8, upstream's own tests.** Port the FLA chunked-path cases with their
+   parameters, tolerances and the pin anchor, per AGENTS.md. Constraint, and it
+   must be recorded rather than papered over: `chunk.py:213-215` means upstream
+   has **no f32 chunked case to port**, so whatever f32 chunked coverage exists
+   is ours. Record it as an adaptation, never as a port.
+
+**Two doctest traps this suite must avoid.** `assertions: 0 ... SUCCESS!` at
+rc 0 is a skip wearing a pass — assert a counted property in every case. And
+`-tc` splits a filter on commas, so no case name added here may contain one
+(#2605).
+
+## Gates
+
+The operator reruns each of these itself; an implementer or reviewer report is
+an input, never a result.
+
+| gate | what | bar |
+|---|---|---|
+| G1 tight golden | T1, `gdn_prefill_bf16_realdims`, CPU arm | `max\|d\| <= 1.5e-04` out, `<= 1.5e-03` state |
+| G2 f32 goldens UNMOVED | `gdn_prefill_f32_small`, `_noinit`, `_realdims` | still green at their committed `atol = rtol = 1e-05`, with the tolerances **byte-unchanged**. This is the gate that catches a mis-read of D0. |
+| G3 dtype format | T2 | every buffer has the dtype D1 names |
+| G4 routing | T3, T4 | dtype predicate and flag both reach both arms; `=0` bit-identical to today |
+| G5 breadth | T5, T6, T8 | green on every listed `T`, on varlen with an empty sequence, and at 1/3/20 threads |
+| G6 KDA | T7 | the reduction claim is true as written, and the test states which arm it holds on |
+| G7 cross-device re-baseline | `tests/vt/test_backend_cross_device.cpp:1676`, `tests/vt/test_vulkan_backend.cpp:2601`, `tests/vt/test_tenstorrent_backend.cpp:1965` | each bar re-derived **against the golden**, never against the CPU arm, and each restated with the arm and tree it was measured on |
+| G8 reachability | delete `qwen3_5.cpp:5484`/`:5493` in a scratch copy, rerun G1-G6 | at least one gate goes red; restore the tree byte-for-byte |
+| G9 full | `scripts/agent-preflight.sh` | grep for `gate(s) failed` and `NOT a green`; never trust the exit code |
+
+**G7 is the gate most likely to be reported green while meaning nothing**, for
+the reason stated under `## Blast radius`. State for each backend which arm
+produced the baseline and on what tree. An evidence table that does not name its
+tree is not evidence.
+
+## Risks
+
+**R1. The implementer ships f32 intermediates.** The likeliest failure, because
+f32 is the obvious CPU choice and every existing value gate passes with it. It
+is caught by G1 and G3 and by nothing else in the tree. This is a
+`## Stop conditions` item, not merely a risk.
+
+**R2. The implementer reads "chunked by default" as "chunked always."** The
+second likeliest, and it fails three committed goldens by one to two orders of
+magnitude. D0 and G2 exist for it.
+
+**R3. bf16 on CPU costs a rounding pass at nine sites.** Our CPU arm has no bf16
+arithmetic; the sites are round-to-bf16-then-widen, not bf16 math. That is what
+upstream does too (Triton accumulates f32 and stores bf16), so it is a mirror.
+No speed claim is made and none is owed; if the cost is material it is a
+separate row's problem.
+
+**R4. Chunk parallelism breaks thread byte-identity.** Today's kernel is
+byte-identical across thread counts because `(sequence, head)` work is disjoint
+with no shared reduction. The cross-chunk state recurrence is sequential and must
+stay so; the intra-chunk work may be parallelised only in a fixed order. T6/G5.
+
+**R5. `A^-1` conditioning.** `(I+A)` is unit lower triangular with `|A| < 0.11`
+and `cond = 1.13` on the golden; a dense inverse is safe there and not in
+general. Assert unit-diagonal forward substitution rather than a general solver,
+and add a case with `beta -> 1` and near-parallel `k`.
+
+**R6. The re-baselined cross-device gates go green for the wrong reason.**
+Covered by the G7 note.
+
+**R7. The row lands and the tree still says the old thing.** Fourteen files carry
+the control sequence, one doc cell states the inverted claim, four records
+describe an arrangement that stopped being true when M2.3 landed CUDA-only, and
+three evidence documents rest on "the CPU arm runs an exact sequential
+recurrence". Every one is listed above or under `## Records owed`; none is
+discovered later.
+
+**R8. Someone reads a token count as the result.** Named in `## Scope` and
+restated here, because PREFILLDIV already measured that the more accurate arm
+agrees on *fewer* ids.
+
+## Records owed
+
+Each rides in the pull request whose change makes it stale, per AGENTS.md.
+
+| record | today | owed |
+|---|---|---|
+| `.agents/porting-inventory.md:124` | Tier `T0 🚧 ead59d6 (correctness-grade sequential; chunked perf kernel M2.3)` | M2.3 landed chunked on **CUDA only**. **Corrected in this flow** — the record is already stale on `main`. |
+| `docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md:110-111` | calls `5559679229` "a FORWARD REFERENCE beyond this row's pin"; its §4 dtype table omits two bf16 sites | **It IS the pin.** Both **corrected in this flow**. |
+| `docs/USAGE.md:670` | "`--device cpu` is the arm to use when the exact ids matter" | Inverted on the mirror criterion. **First half corrected in this flow**; the full rewrite, dropping the CPU/CUDA distinction, lands with the implementation. |
+| `.agents/porting-inventory.md` §9 | no entry | The tracked exception of D4, as a numbered list item in the section's prose format (it is NOT a table; and its numbering is already non-monotonic and must not be "fixed"). Lands with the implementation. |
+| `.agents/specs/gdn-semantics.md` §7 | calls the chunked path the "chunked oracle" and the sequential kernel "what the M0.7 C++ implements directly" | The second half is what changes. Restate which arm runs which algorithm, and add D1's dtype placement — §7 carries none today. Lands with the implementation. |
+| `docs/ENVIRONMENT.md` `## Rollback and bisect switches` | `VT_GDN_CHUNKED` absent; allowlisted as kernel-internal at `scripts/env-doc-allowlist.txt:71` | It becomes a cross-backend documented lever. Add the row; its sibling `VT_GDN_OUT_BF16` is already there (`:228`) for the same reason. Lands with the implementation. |
+| `.agents/kernel-matrix.md` + `scripts/check-agent-record.py:402` | no `KERNEL-GDN-CHUNKED-MIRROR` row; `KERNEL` count `58` | The row and the `58 -> 59` bump, owed by the change that moves this spec to `READY`. |
+| `.agents/specs/tenstorrent-gdn.md:263-264` | tolerance table measured against a sequential CPU reference | Re-based by G7. |
+| `.agents/specs/qwen4-exp-qsa-q-bf16.md:123` | "must not move" on the control sequence | Reconcile with the implementation. |
+| `docs/FEATURES.md:128` | carries the control sequence in decoded form | Touch only if the flip changes a user-visible arm. |
+
+## Owed
+
+- [#2612](https://github.com/mudler/vllm.cpp/issues/2612) — the finding this row
+  was created from. This spec is its owner; the pull request body says so.
+- **GDN decode on the non-CUDA arms.** Out of scope above. vLLM does run decode
+  sequentially, so the arms already mirror it, but nobody has measured that claim
+  the way prefill has now been measured. No issue yet; file one before this row
+  reaches `DONE`.
+- **The f32 chunked arm has no upstream test**, because `chunk.py:213-215`
+  refuses f32. Whatever coverage exists there is ours and unmirrored. Owed as a
+  named coverage gap, not as coverage.
+- **The `qwen4_exp` MoE prefill residue**, `7.269e-05` per layer with the GDN
+  source removed (PREFILLDIV §3). A second, independent divergence source, named
+  and undiagnosed. Not this row.
+- **The `6.1e-05` the replica does not model.** The bound on how much of vLLM's
+  output a bf16-faithful C++ port could still miss for reasons that are not dtype
+  placement: Triton tile reduction order, the blocked `solve_tril` merge,
+  `tl.dot` operand precision. If G1 fails at the tight bar for a port that passes
+  G3, this is the first hypothesis and it needs its own row.
+
+## Stop conditions
+
+Stop and return `NEEDS_DECISION` rather than proceeding, if:
+
+1. **The chunked arm is written with f32 intermediates.** Evidence §4: that arm
+   is our current sequential output to within 2 of 8192 bf16 elements. It would
+   land a mirror claim that is false and a gate that cannot detect it. This is
+   the failure this spec exists to prevent.
+2. **G1's tight bar is not met by a port that passes G3.** Do not loosen G1. The
+   bar came from a measurement; moving it to admit the implementation is making a
+   red gate green by widening its scope.
+3. **The three f32 goldens are made green by editing their tolerances.** They are
+   dumps of upstream's own sequential kernel at `1e-05`. If they are red, D0 was
+   not implemented. Loosening them would delete the only evidence that the dtype
+   predicate exists.
+4. **A cross-device gate can only be made green by re-baselining it against the
+   new CPU arm rather than against the golden.** That is a circular gate.
+5. **The work needs a second flag.** D3 says one name. If the choice cannot be
+   expressed with one predicate, the seam is wrong and the design needs
+   revisiting, not a second env var.
+6. **The KDA bit-identity reduction is made green by weakening its assertion from
+   `== 0` to a tolerance.** T7 offers two honest resolutions and that is not one
+   of them.
+7. **A token-exactness claim appears anywhere in the change.** Scope says this
+   row does not promise it.
+
+## Now
+
+`SPIKE`. This spec and its evidence are the spike. No kernel has been written.
+The next fresh implementer starts from `## Design` and `## Tests`.

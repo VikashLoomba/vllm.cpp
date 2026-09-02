@@ -4069,6 +4069,30 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+### PREFILLDIV: the MoE second source, and the instrument it needs (#2552)
+
+Wave PREFILLDIV isolated TWO sources of CPU/CUDA prefill divergence at decoder
+layer 0, the only layer whose input is bit-identical on both CUDA arms. The
+first is the chunked Gated DeltaNet prefill and it is NOT a defect: it mirrors
+vLLM's own Flash-Linear-Attention precision map at every anchor (evidence file
+§4). The second is the MoE block, which turns a `2.1e-05` input difference into
+a `7.269e-05` output difference and which `VT_GDN_CHUNKED=0` barely moves
+(1.7x, against 332x on the Gated DeltaNet tap).
+
+**It lands NOT DIAGNOSED and it is owed.** `VT_Q4EXP_LAYER_FP` taps values, and
+a value tap cannot separate an expert-selection flip from re-association in
+`vt::MatmulBTQuantGrouped`. The instrument that can is a tap on the SELECTED
+EXPERT IDS per token per layer, asserting set equality and printing the margin
+between the last selected and the first rejected logit — a discrete selection
+has bimodal error, not a tolerance.
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) owns it.
+
+**Also owed by this wave, and smaller.** The `q4fp` line is a `sum|x|`
+aggregate. It is coarse enough that it read `0.000e+00` for
+`vt::Qwen4ExpGatedResidual`, which is the correct answer at this operand
+distribution and is not a proof of bit-identity element by element. A tap that
+needs to claim bit-identity should compare bytes, not an aggregate.
+
 - **THE `device_token_ids` CONTRACT IS ADVISORY, AND FIVE MORE ARCHITECTURES
   IGNORE IT ([#2544](https://github.com/mudler/vllm.cpp/issues/2544)).** DECODEDIV
   fixed `qwen4_exp`'s half of this and did not fix the general one. The runner
@@ -8460,6 +8484,199 @@ per-layer tap on the real artifact); the divergence is in a `vt::` op with an
 existing CPU-vs-CUDA gate that the defect passes (the gate's coverage is the
 defect, and widening it is its own change); or `thor:gpu0` is out of the pool,
 in which case the sm_110 axis is UNMEASURED and says so.
+
+## Wave PREFILLDIV — the CUDA prefill diverges from the CPU prefill (#2547)
+
+### What this wave is for
+
+[#2496](https://github.com/mudler/vllm.cpp/issues/2496) is fixed -- its fix
+LANDED as [#2550](https://github.com/mudler/vllm.cpp/pull/2550) at `bb78d1ee8`,
+so this wave's measurement tree is now the composition `main` carries -- and the
+CUDA arm is fluent. It is not token-exact:
+
+| arm | token ids |
+|---|---|
+| `--device cpu` | `11751 13 15767 411 2029 11 1092 369` |
+| `--device cuda` | `11751 13 15767 411 1928 11 628 567` |
+
+Five of eight agree and the first disagreement is at token 4.
+[#2547](https://github.com/mudler/vllm.cpp/issues/2547) measured that the
+difference is NOT carried decode state: the PLE n-gram history rolls identically
+on both arms, and the model's own output at **step 0** already differs —
+`sumabs 28054.1` on CPU against `27964.7` on CUDA over `n=12800`, about 0.3%.
+The divergence is therefore in the PREFILL, before any decode state is read.
+
+**"Prefill is right" was never measured.** It rested on token 0 agreeing, and
+` Paris` after `The capital of France is` is not a near-tie, so a single argmax
+survived a divergence that was already there. This wave replaces the argmax with
+a per-tap fingerprint.
+
+### Scope
+
+IN: a per-layer, per-tap CPU-vs-CUDA fingerprint of the `qwen4_exp` forward; the
+one arithmetic divergence it names; the fix for that divergence; the
+red-then-green transcript through `ModelRegistry::Forward`.
+
+OUT: speed of any arm, `num_reqs > 1`, the positional arm's second step, and
+every `## Owed` entry this row already carries. A second divergence the
+instrument finds AFTER the first one is fixed belongs to a following wave and to
+its own issue.
+
+### Design — the instrument, and why the layer axis is the one that was missing
+
+`VT_Q4EXP_STATE_FP` (#2496) prints the layer loop's OUTPUT once per step. It has
+no LAYER axis, so it can say that the two arms disagree and not where. This wave
+adds `VT_Q4EXP_LAYER_FP=<steps>`, which prints one line per tap per layer for the
+first `<steps>` forward calls:
+
+```
+q4fp step=0 L07 tag=blk        dtype=bf16 dev=1 n=12800 nonfinite=0 maxabs=... sumabs=... v=...
+```
+
+The taps are placed so that a difference can be attributed to ONE op:
+`emb`, `wide`, then per layer `in`, `ple`, `ahc.mixed`, `ahc.inj`, `blk`, `s1`,
+`mhc.mixed`, `mhc.inj`, `moe`, `s2`, and finally `out`. `layer_types` puts a GDN
+layer at 0, the PLE layer at 2 and the first QSA layer at 3, so the first tap
+that leaves its own arm-vs-arm band names the op:
+
+| first divergent tag | implicates |
+|---|---|
+| `emb` / `wide` | the embedding gather or the widen |
+| `L00 ahc.mixed` | `vt::Qwen4ExpGatedResidual` — the mixer |
+| `L00 blk` | `RunGdnBlockPaged` |
+| `L02 ple` | `RunQwen4ExpPleBlock` |
+| `L03 blk` | `RunQwen4ExpQsaBlockPaged` |
+| any `moe` | `RunQwen4ExpMoeBlock` |
+
+**IT PRINTS THE DTYPE, and that is not decoration.** A token gate cannot see a
+dtype and a value gate cannot see a lifetime; both failures are on this row's
+record already (#2493, #2476). A tap that reported values alone would pass a
+buffer that is f32 on one arm and bf16 on the other while moving twice the bytes.
+
+**IT COUNTS ITS OWN TAPS.** The last line of a fingerprinted step is
+`q4fp step=<s> taps=<n>`, so a run that measured nothing is distinguishable from
+a run whose taps agreed. A grep that matches nothing is not evidence of absence,
+and this row has already paid for an instrument that never ran: the
+`q4exp-gdngemm` job looked for `$BLD/vllm-server` while ninja links
+`$BLD/examples/vllm-server`, and it measured nothing at rc 0.
+
+**IT SYNCHRONISES, and that is stated rather than hidden.** Each tap copies the
+tensor to the host and drains the queue, so this instrument CANNOT see a race.
+It is admissible here only because #2547 measured the divergence as bit-stable
+across builds, trees and `CUDA_LAUNCH_BLOCKING`, which is a deterministic
+arithmetic difference and not a race. A NEW symptom that appears only without the
+instrument is a race and belongs to a different method.
+
+### Risks
+
+- **The two arms disagree everywhere at some magnitude.** Every kernel on this
+  path is a separate CPU and CUDA implementation, so no tap is bit-identical and
+  "the first tap that differs" is not by itself the answer. The reading is the
+  first tap where the relative difference JUMPS by orders of magnitude over the
+  taps before it.
+- **A tolerance that passes its own suite can still be too loose.**
+  `test_qwen4_exp_cuda` is green at 351/351; that bounds each op against its own
+  band, not the composition against the CPU arm.
+- **The instrument perturbs the schedule.** See above: admissible only because
+  the symptom is bit-stable.
+
+### Gates
+
+```sh
+ctest --test-dir "$BLD" -R 'qwen4_exp' --output-on-failure
+```
+
+plus, on `thor:gpu0` (`sm_110`), the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact through
+`examples/vllm-server` on one binary, both arms, greedy, `max_tokens=8`, prompt
+`The capital of France is`, reporting both token id sequences verbatim.
+
+### Evidence required
+
+1. The fingerprint tables from both arms, and the first tap whose relative
+   difference jumps.
+2. The upstream `file:line` and revision for the arithmetic the fix restores.
+3. Red-then-green on a test that enters through `ModelRegistry::Forward` on a
+   `--device cuda` queue.
+4. A reachability mutation that deletes the production call site and reds.
+5. Both token id sequences, and an explicit statement of which ids agree.
+6. Every build and gate rc read literally, never derived from a pipe.
+
+### Stop conditions
+
+Stop and report if the instrument shows the first jump inside an op whose repair
+moves a shared seam's contract; that needs its own spec and its own issue. Stop
+if the released artifact cannot be staged, and report `PENDING` rather than
+substituting another checkpoint.
+
+### Outcome
+
+**MEASURED, AND IT FALSIFIES THIS WAVE'S OWN PREMISE.** Full result in
+[the evidence file](../../docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md);
+`thor:gpu0`, `sm_110`, one binary
+`c3b355deb75efb0071fe6ec21d5067f5e2520722c672487fd67939c363e1ee58`, three arms,
+437 taps per step on every one of them.
+
+**The first tensor that differs is decoder layer 0's Gated DeltaNet block
+output**, `rel(sum|x|) = 3.525e-04`, produced from an input that is BIT-IDENTICAL
+on both arms — `emb`, `wide`, `L00 in`, `L00 ahc.mix` and `L00 ahc.inj` all read
+`0.000e+00`.
+
+**That clears the only named candidate by measurement.** #2547 named
+`vt::Qwen4ExpGatedResidual`'s CUDA arm as the largest non-bit-identical surface
+on the path, on the strength of the source's own admission that its device GEMM
+re-associates the K reduction. On the released weights at the model's real width
+it is bit-identical to its CPU sibling at both hyper-connection sites of layer 0.
+The re-association is absorbed by the bf16 store. Reading a source comment is not
+a measurement, and this is the second time on this row that a candidate named
+that way did not survive one.
+
+**The mechanism is the chunked prefill decomposition, and the proof is a
+same-binary A/B.** `VT_GDN_CHUNKED=0` routes the CUDA arm to `GdnScanCuda`, the
+same sequential recurrence the CPU arm runs, and `L00 blk` falls to `1.062e-06`
+— **332x**. Layer 0 is the only layer that can carry this proof, because it is
+the only one whose input is bit-identical on both CUDA arms; every later `blk`
+measures propagation.
+
+**AND IT IS NOT A DEFECT.** vLLM's vendored Flash-Linear-Attention kernel keeps
+`h`, `u`, `w` and `v_new` in bf16 with fp32 accumulation, `A` in fp32 for the
+triangular solve, and `final_state` in fp32 — and our chunked port matches all
+five, anchor by anchor (evidence §4, vLLM `5559679229`, a forward reference).
+The CUDA arm mirrors the oracle. **The CPU arm's exact sequential f32 recurrence
+is the arm that does not**, and it is more accurate than vLLM rather than more
+correct. Moving CUDA onto the CPU arm would move it away from vLLM.
+
+**The GPU does not emit the control sequence, and the honest count is:**
+
+| arm | ids | agrees |
+|---|---|---|
+| `--device cpu` | `11751 13 15767 411 2029 11 1092 369` | the control |
+| `--device cuda` | `11751 13 15767 411 1928 11 628 567` | 5 of 8 |
+| `--device cuda`, `VT_GDN_CHUNKED=0` | `11751 13 15767 264 1103 314 5656 321` | 3 of 8 |
+
+**The sequential arm is 2.8x closer on the hidden state and agrees on FEWER
+ids** (`out` rel `1.130e-03` against `3.189e-03`). Token agreement between our
+two arms is not monotone in the distance between them, because the decode is an
+argmax over near-ties. A CPU-vs-CUDA token-exactness gate is therefore not well
+posed for this architecture at this precision, and this wave does not propose
+one.
+
+**What is still open is the SECOND source.** Layer 0 separates it: with the GDN
+contribution removed, `L00 moe` still differs by `7.269e-05` from an input
+differing by `2.1e-05`, and `L00 s.mlp` barely moves (`7.160e-05` ->
+`6.815e-05`). The MoE block is the only remaining candidate for an actual defect
+on this path. It is named here and NOT diagnosed; the discriminating instrument
+it needs is a tap on the router's SELECTED EXPERT IDS asserting set equality and
+printing the margin, because a bf16 router logit over this model's expert count
+can flip a discrete selection and a flip is a large local change rather than a
+rounding one -- and a value-only tap can never tell that from re-association in
+the grouped keep-quant GEMM.
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) owns it.
+
+**What landed.** The instrument and its gate, and nothing else. There is no
+product-behaviour change in this wave, because the measurement says there is no
+defect at the first divergence to change.
+
 
 ## Wave MOEDIV — is the MoE prefill divergence a SELECTION FLIP? (#2552)
 

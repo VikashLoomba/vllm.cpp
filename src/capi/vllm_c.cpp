@@ -538,6 +538,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.limit_mm_per_prompt = nullptr;  // NULL => no limits configured (ABI v19).
   p.offload_config = nullptr;       // NULL => no weight offload (ABI v21).
   p.mmproj_path = nullptr;          // NULL => no clip projector (ABI v22).
+  p.kv_cache_dtype = nullptr;       // NULL => auto (ABI v24).
   return p;
 }
 
@@ -679,6 +680,11 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
       // tokenizer, so a wrong projector costs a message rather than a 17 GB map.
       if (params->mmproj_path != nullptr && params->mmproj_path[0] != '\0') {
         ep.mmproj_path = params->mmproj_path;
+      }
+      // ABI v24: KV-cache storage dtype. NULL/empty => "auto" (the default),
+      // resolved against the checkpoint inside FromModelDir.
+      if (params->kv_cache_dtype != nullptr && params->kv_cache_dtype[0] != '\0') {
+        ep.kv_cache_dtype = params->kv_cache_dtype;
       }
       if (params->limit_mm_per_prompt != nullptr &&
           params->limit_mm_per_prompt[0] != '\0') {

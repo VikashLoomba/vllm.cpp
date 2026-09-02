@@ -124,6 +124,11 @@ bool detail::ShouldUsePackedGdnDecode(
 // the BF16 one, so predicting the FP8 dtype there would be wrong.
 vt::DType detail::GdnProjectedMixedQkvDType(const GdnMixedQkvDTypeInputs& in) {
   if (in.has_bf16_qkvz_owner) return in.in_dtype;
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): the trellis arm emits `indt` for
+  // `mixed_qkv`, which is what `ProjectGdnQkvz`'s EXL3 rung allocates. Placed
+  // in ProjectGdnQkvz's own branch order, ahead of the fp8 terms, so the two
+  // orders read the same way down the page.
+  if (in.has_exl3_qkv_owner) return in.in_dtype;
   // PERF-GDN-PACKED-BRIDGE (#365): only the MERGED fp8 arm can carry the
   // narrowed epilogue dtype; the split arm hardcodes F32 (ProjectGdnQkvz).
   if (in.has_fp8_qkv_owner)
@@ -4061,6 +4066,48 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
                              int64_t conv_dim, int64_t value_dim, DType indt,
                              DType outdt, const Tensor* h_fp8) {
   GdnQkvzOutput out;
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4). FIRST and EXCLUSIVE, mirroring the
+  // loader rung: an EXL3 load populates NO other in-projection field, so every
+  // branch below would fall through to an empty owner and refuse by name.
+  //
+  // TWO GEMMs, because the artifact ships two independently quantized
+  // trellises (see `GdnLayerWeights::in_proj_qkv_exl3`). This is not a
+  // regression against vLLM's single merged `in_proj_qkvz` GEMM: there is no
+  // merged trellis operand to issue, and the split native-FP8 arm the 35B runs
+  // already takes this same shape when the merged owner is empty.
+  //
+  // `indt` for mixed and `outdt` for z are the dtypes the SPLIT BF16 arm below
+  // emits, so `VT_GDN_IN_BF16`'s and `VT_GDN_OUT_BF16`'s documented rollbacks
+  // stay honest on this arm too. `dense_exl3::Linear` forwards to
+  // `layers::MakeLinearMethod` -> `Exl3LinearMethod` -> the ONE
+  // `dense_attn::Exl3MatmulD`; no second EXL3 matmul exists.
+  if (!w.in_proj_qkv_exl3.Empty()) {
+    VT_CHECK(w.in_proj_qkv_exl3.OutFeatures() == conv_dim &&
+                 w.in_proj_z_exl3.OutFeatures() == value_dim &&
+                 w.in_proj_qkv_exl3.InFeatures() == h.shape[1],
+             "qwen3_5 EXL3 GDN qkvz: the trellis geometry and the layer's "
+             "conv_dim/value_dim disagree");
+    out.mixed_owner.emplace(
+        dense_exl3::Linear(d, h, w.in_proj_qkv, w.in_proj_qkv_exl3, indt));
+    out.z_owner.emplace(
+        dense_exl3::Linear(d, h, w.in_proj_z, w.in_proj_z_exl3, outdt));
+    // The same anti-drift guard the merged fp8 arm carries, read off the
+    // ALLOCATED buffer rather than off a literal, so it fails whichever side
+    // moves. The packed-decode eligibility runs before this function and must
+    // have predicted exactly this dtype.
+    VT_CHECK(out.mixed_owner->t().dtype ==
+                 detail::GdnProjectedMixedQkvDType(
+                     detail::GdnMixedQkvDTypeInputs{
+                         !w.in_proj_qkvz.Empty(), !w.in_proj_qkv_fp8.Empty(),
+                         /*fp8_merged_arm=*/false, indt,
+                         GdnFp8MergedInProjDType(indt, outdt),
+                         /*has_exl3_qkv_owner=*/true}),
+             "qwen3_5 EXL3 GDN qkvz: the allocated mixed_qkv dtype and the "
+             "packed-decode prediction disagree (GdnProjectedMixedQkvDType)");
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
   if (!w.in_proj_qkvz.Empty()) {
     VT_CHECK(w.in_proj_qkvz.nk && w.in_proj_qkvz.rank == 2 &&
                  w.in_proj_qkvz.shape[0] == conv_dim + value_dim &&
@@ -4442,6 +4489,18 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
+  // every other arm here is exclusive. An EXL3 load populates none of the
+  // fields below, so each would fall through to an empty owner and refuse by
+  // name. bf16 out, as every other arm of this out_proj returns.
+  //
+  // The gated-RMSNorm above already wrote `gated_bf16`, so the fp8 fusion
+  // branch earlier in this function cannot have fired: it requires
+  // `out_proj_fp8`, which an EXL3 load leaves empty.
+  if (!w.out_proj_exl3.Empty()) {
+    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+                              DType::kBF16);
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
   if (!w.out_proj_fp8_block.Empty()) {
@@ -4917,6 +4976,18 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
+  // every other arm here is exclusive. An EXL3 load populates none of the
+  // fields below, so each would fall through to an empty owner and refuse by
+  // name. bf16 out, as every other arm of this out_proj returns.
+  //
+  // The gated-RMSNorm above already wrote `gated_bf16`, so the fp8 fusion
+  // branch earlier in this function cannot have fired: it requires
+  // `out_proj_fp8`, which an EXL3 load leaves empty.
+  if (!w.out_proj_exl3.Empty()) {
+    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+                              DType::kBF16);
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
   if (!w.out_proj_fp8_block.Empty()) {
@@ -5005,7 +5076,9 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
       detail::GdnMixedQkvDTypeInputs{!w.in_proj_qkvz.Empty(),
                                      !w.in_proj_qkv_fp8.Empty(),
                                      gdn_fp8_merged_arm, indt,
-                                     GdnFp8MergedInProjDType(indt, outdt)});
+                                     GdnFp8MergedInProjDType(indt, outdt),
+                                     // MODEL-QWEN35-GDN-EXL3 (#2495 item 4).
+                                     !w.in_proj_qkv_exl3.Empty()});
   const bool packed_decode = detail::ShouldUsePackedGdnDecode(
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
@@ -5411,6 +5484,18 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
+  // every other arm here is exclusive. An EXL3 load populates none of the
+  // fields below, so each would fall through to an empty owner and refuse by
+  // name. bf16 out, as every other arm of this out_proj returns.
+  //
+  // The gated-RMSNorm above already wrote `gated_bf16`, so the fp8 fusion
+  // branch earlier in this function cannot have fired: it requires
+  // `out_proj_fp8`, which an EXL3 load leaves empty.
+  if (!w.out_proj_exl3.Empty()) {
+    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+                              DType::kBF16);
+  }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
   if (!w.out_proj_fp8_block.Empty()) {

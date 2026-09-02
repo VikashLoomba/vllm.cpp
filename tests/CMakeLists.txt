@@ -1775,6 +1775,12 @@ vllm_cpp_add_test(test_cli_offload_config
 if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_cli_offload_config
     PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+vllm_cpp_add_test(test_cli_kv_cache_dtype
+  vllm/entrypoints/test_cli_kv_cache_dtype.cpp)
+if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
+  target_compile_definitions(test_cli_kv_cache_dtype
+    PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+endif()
 endif()
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
@@ -1893,6 +1899,46 @@ set_tests_properties(test_engine_scratch_steady_state PROPERTIES
 vllm_cpp_add_test(test_runner vllm/v1/worker/test_runner.cpp)
 # test_runner uses detail::ValidateGdnStateIndices from the internal header.
 target_include_directories(test_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# #2534. VT_DUMP_LOGITS is read ONCE at static init, so one process observes one
+# value and the default run can only ever exercise the INERT arm. Re-run the SAME
+# binary with the instrument pointed at a per-run scratch directory, the shape
+# `test_qwen35_paged_forward_gdn_out_f32` and `_glue_fuse_off` already use.
+#
+# SCOPED to the one case, because the instrument writes files keyed by request id
+# and the other cases in this binary reuse those ids -- an unscoped run would
+# append several requests' rows into one file and make the size assertion
+# meaningless. `--test-case` is safe here only because the name is COMMA-FREE:
+# doctest splits that filter on commas, and a name containing one would match
+# nothing, exit 0, and pass while testing zero cases.
+#
+# The two properties are what stop that mute pass. FAIL_REGULAR_EXPRESSION takes
+# precedence in ctest, so a run that matched no case (`assertions: 0`) FAILS
+# rather than reporting success; PASS_REGULAR_EXPRESSION then requires doctest's
+# own verdict instead of trusting the exit status.
+add_test(NAME test_runner_logit_dump
+  COMMAND ${CMAKE_COMMAND}
+    -E env VT_DUMP_LOGITS=${CMAKE_CURRENT_BINARY_DIR}/logit_dump_scratch
+    $<TARGET_FILE:test_runner> "--test-case=runner: the logit dump*")
+set_tests_properties(test_runner_logit_dump PROPERTIES
+  FAIL_REGULAR_EXPRESSION "assertions:[ ]*0[ |]"
+  PASS_REGULAR_EXPRESSION "Status: SUCCESS!")
+# The scratch directory must EXIST and be EMPTY before that entry runs, or a
+# stale .f32 from a previous run would be appended to and the size assertion
+# would pass on the wrong bytes.
+add_test(NAME test_runner_logit_dump_scratch_reset
+  COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_CURRENT_BINARY_DIR}/logit_dump_scratch)
+set_tests_properties(test_runner_logit_dump_scratch_reset PROPERTIES
+  FIXTURES_SETUP logit_dump_scratch)
+# ...and RECREATE it. The instrument deliberately does not mkdir -- it refuses by
+# name instead -- so without this the entry would red on a missing directory
+# rather than on anything it is meant to measure.
+add_test(NAME test_runner_logit_dump_scratch_make
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/logit_dump_scratch)
+set_tests_properties(test_runner_logit_dump_scratch_make PROPERTIES
+  FIXTURES_SETUP logit_dump_scratch
+  DEPENDS test_runner_logit_dump_scratch_reset)
+set_tests_properties(test_runner_logit_dump PROPERTIES
+  FIXTURES_REQUIRED logit_dump_scratch)
 vllm_cpp_add_test(test_common_attn_metadata vllm/v1/attention/test_common_attn_metadata.cpp)
 vllm_cpp_add_test(test_attn_backend_registry vllm/v1/attention/test_attn_backend_registry.cpp)
 vllm_cpp_add_test(test_attn_validate_configuration
@@ -2555,6 +2601,12 @@ vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
 # only under VLLM_CPP_HIP -- its cases skip when no ROCm backend is registered,
 # and a suite that only a HIP build compiles is a suite CI never reads.
 vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
+# BACKEND-VULKAN-EXL3 (#2530): the Vulkan arms of the same two ops. Built in
+# EVERY configuration for the same reason as the ROCm sibling above -- its cases
+# skip when no Vulkan backend is registered. UNLIKE that sibling this suite needs
+# NO GPU and NO lease to say something: llvmpipe is a conformant Vulkan 1.1
+# device, so the `build-test-vulkan` CI leg runs the byte gate for real.
+vllm_cpp_add_test(test_exl3_vulkan vt/test_exl3_vulkan.cpp)
 
 # QUANT-EXL3 W1a (#2181). Placed after the MODEL-DSV4-EXL3 kernel suites above
 # rather than among them: these two gate the SCHEME on the shared linear seam,
@@ -2989,6 +3041,10 @@ vllm_cpp_add_test(test_ops_fp8_kv_cache vt/test_ops_fp8_kv_cache.cpp)
 vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 # MLA campaign W3: the compressed-latent cache write + the grouped-topk router.
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
+# KV-DSV4-MULTICACHE W8 slices 2 and 3 (#2455): the fp8_ds_mla STORE and READ
+# over DeepSeek-V4's REGION-SPLIT rank-2 byte page, which no rank-3 cache op can
+# express. Byte-exact against a poison-filled block, all host-side.
+vllm_cpp_add_test(test_ops_ds_mla_cache vt/test_ops_ds_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
 vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
 # dots3-note W4b-3c (#699): the DSA "Lightning Indexer" selection pair, gated

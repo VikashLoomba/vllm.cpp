@@ -375,6 +375,13 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
   // name would drop a cache. All three produce plausible tokens.
   const int64_t L = 3, HD = 32;
   const vt::Device dev{vt::DeviceType::kCPU, 0};
+  // MODEL-DSV4-PAGED-ENTRY (#2447): the GGUF paged arm's three answers, spelled
+  // out. That arm forces every layer dense and carries no compressor state, so
+  // its compressor refusal is UNCHANGED by the narrowing this row makes -- which
+  // is what the cases below still measure.
+  constexpr bool kDsaDense = true;
+  constexpr bool kNoCompressorState = false;
+  constexpr int64_t kOneToken = 1;
   std::vector<std::vector<float>> storage;
   const auto caches = FakeCaches(static_cast<size_t>(L), HD, &storage);
   FakeIndex fx;
@@ -385,7 +392,9 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
 
   // THE SERVED SHAPE: one request, every layer SWA-only, every name resolving.
   std::vector<vt::Tensor> pages;
-  CHECK(vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 1, dev, &pages).empty());
+  CHECK(vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 1, dev, &pages,
+                                        kDsaDense, kNoCompressorState, kOneToken)
+            .empty());
   REQUIRE(pages.size() == static_cast<size_t>(L));
   for (const auto& t : pages) {
     CHECK(t.rank == 3);
@@ -396,7 +405,8 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
   // 1. A BATCH refuses -- one `kv_base` cannot serve several context lengths.
   pages.clear();
   const std::string batched =
-      vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 2, dev, &pages);
+      vllm::ResolveDeepseekV4SwaPages(params, mk, caches, 2, dev, &pages,
+                                      kDsaDense, kNoCompressorState, kOneToken);
   CHECK(batched.find("one request per step only") != std::string::npos);
   CHECK(pages.empty());
 
@@ -404,7 +414,8 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
   auto with_comp = params;
   with_comp.compress_ratios[1] = 128;
   const std::string comp =
-      vllm::ResolveDeepseekV4SwaPages(with_comp, mk, caches, 1, dev, &pages);
+      vllm::ResolveDeepseekV4SwaPages(with_comp, mk, caches, 1, dev, &pages,
+                                      kDsaDense, kNoCompressorState, kOneToken);
   CHECK(comp.find("has a compressor") != std::string::npos);
   CHECK(comp.find("#2286") != std::string::npos);
 
@@ -414,15 +425,112 @@ TEST_CASE("W5: the SWA page resolver accepts a served shape and REFUSES every ot
   missing.names[1] = "model.layers.1.attn.some_other_cache";
   const auto mk_missing = missing.Index();
   const std::string unresolved =
-      vllm::ResolveDeepseekV4SwaPages(params, mk_missing, caches, 1, dev, &pages);
+      vllm::ResolveDeepseekV4SwaPages(params, mk_missing, caches, 1, dev, &pages,
+                                      kDsaDense, kNoCompressorState, kOneToken);
   CHECK(unresolved.find("no published cache named") != std::string::npos);
 
   // 4. A WRONG head_size refuses -- the cache would be read at the wrong width.
   auto wrong = caches;
   wrong[2].head_size = HD / 2;
   const std::string bad_width =
-      vllm::ResolveDeepseekV4SwaPages(params, mk, wrong, 1, dev, &pages);
+      vllm::ResolveDeepseekV4SwaPages(params, mk, wrong, 1, dev, &pages, kDsaDense,
+                                      kNoCompressorState, kOneToken);
   CHECK(bad_width.find("head_size") != std::string::npos);
+}
+
+TEST_CASE("PAGED-ENTRY: the resolver's compressor clause IS the composition's (#2447)") {
+  // `MODEL-DSV4-PAGED-ENTRY` (#2447). The refusal above was written when NOTHING
+  // composed a compressor layer. `deepseek_v4.cpp`'s `AttentionBlock` has
+  // admitted `compress_ratio` 4 and 128 with carried state since
+  // MODEL-DSV4-DSA-COMPOSE, so the two derivations disagreed -- and they
+  // disagreed over 41 of the real artifact's 43 layers, i.e. precisely the set
+  // the EXL3 paged arm exists to serve.
+  //
+  // The narrowing is not a second copy of the composition's clauses: both sides
+  // now CALL `DeepseekV4PagedArmComposesCompressor`. This case drives that one
+  // expression through every answer it has.
+  const int64_t L = 3, HD = 32;
+  const vt::Device dev{vt::DeviceType::kCPU, 0};
+  std::vector<std::vector<float>> storage;
+  const auto caches = FakeCaches(static_cast<size_t>(L), HD, &storage);
+  FakeIndex fx;
+  for (int64_t l = 0; l < L; ++l)
+    fx.names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  const auto mk = fx.Index();
+
+  auto with_ratio = [&](int64_t ratio) {
+    auto p = SwaOnlyParams(L, HD);
+    p.compress_ratios[1] = ratio;
+    return p;
+  };
+  std::vector<vt::Tensor> pages;
+
+  // THE PREDICATE ITSELF, at every answer. This is the expression `AttentionBlock`
+  // reads as `comp_arm`, so these four lines pin the composition's rule too.
+  const auto p128 = with_ratio(128);
+  CHECK(vllm::DeepseekV4PagedArmComposesCompressor(p128, 1, /*dsa_dense=*/false,
+                                                   /*have_state=*/true));
+  CHECK_FALSE(vllm::DeepseekV4PagedArmComposesCompressor(p128, 1, false, false));
+  CHECK_FALSE(vllm::DeepseekV4PagedArmComposesCompressor(p128, 1, true, true));
+  CHECK_FALSE(vllm::DeepseekV4PagedArmComposesCompressor(p128, 0, false, true));
+
+  // 1. A `compress_ratio == 128` layer with state on a non-dense arm is ADMITTED.
+  //    Before this row it refused, which is the whole defect.
+  pages.clear();
+  CHECK(vllm::ResolveDeepseekV4SwaPages(p128, mk, caches, 1, dev, &pages,
+                                        /*dsa_dense=*/false,
+                                        /*have_compressor_state=*/true,
+                                        /*num_tokens=*/1)
+            .empty());
+  CHECK(pages.size() == static_cast<size_t>(L));
+
+  // 2. `compress_ratio == 4` too -- the indexer family the composition admits.
+  pages.clear();
+  CHECK(vllm::ResolveDeepseekV4SwaPages(with_ratio(4), mk, caches, 1, dev, &pages,
+                                        false, true, 1)
+            .empty());
+
+  // 3. A ratio the composition does NOT compose still refuses. A narrowing that
+  //    went one clause too far would pass this by admitting everything.
+  pages.clear();
+  const std::string odd = vllm::ResolveDeepseekV4SwaPages(
+      with_ratio(7), mk, caches, 1, dev, &pages, false, true, 1);
+  CHECK(odd.find("has a compressor") != std::string::npos);
+  CHECK(odd.find("#2447") != std::string::npos);
+
+  // 4. WITHOUT carried state the same admitted layer refuses. Adding the arm
+  //    must not make the absence of its state silent.
+  pages.clear();
+  CHECK_FALSE(vllm::ResolveDeepseekV4SwaPages(p128, mk, caches, 1, dev, &pages,
+                                              false, /*have_state=*/false, 1)
+                  .empty());
+
+  // 5. DECODE ONLY on the composed arm: `MergeWindowAndCompressed` reshapes the
+  //    LSE buffers rather than transposing them.
+  pages.clear();
+  const std::string prefill = vllm::ResolveDeepseekV4SwaPages(
+      p128, mk, caches, 1, dev, &pages, false, true, /*num_tokens=*/4);
+  CHECK(prefill.find("DECODE") != std::string::npos);
+  // ... and the DENSE arm is untouched by it: a T > 1 prefill over SWA-only
+  // layers is exactly what `DeepseekV4ForwardGgufPaged` serves today.
+  pages.clear();
+  CHECK(vllm::ResolveDeepseekV4SwaPages(SwaOnlyParams(L, HD), mk, caches, 1, dev,
+                                        &pages, /*dsa_dense=*/true,
+                                        /*have_compressor_state=*/false,
+                                        /*num_tokens=*/4)
+            .empty());
+
+  // 6. A PACKED page refuses by name. The runner publishes the SWA pages at
+  //    `kI8` / `fp8_ds_mla`, and `vt::ConcatAndCacheMla` takes a float cache
+  //    only -- so without this the route aborts inside a kernel with a message
+  //    naming neither the topology nor the row that owes the store.
+  auto packed = caches;
+  packed[1].dtype = vt::DType::kI8;
+  pages.clear();
+  const std::string i8 = vllm::ResolveDeepseekV4SwaPages(
+      p128, mk, packed, 1, dev, &pages, false, true, 1);
+  CHECK(i8.find("PACKED page") != std::string::npos);
+  CHECK(i8.find("KV-DSV4-MULTICACHE W8") != std::string::npos);
 }
 
 TEST_CASE("W1: two LSE-merged passes equal one pass over the union — sink in EXACTLY one") {

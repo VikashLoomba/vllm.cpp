@@ -104,12 +104,15 @@ survive contact with the loaders.
 
 ## Risks
 
-* **The ROCm edit cannot be compiled anywhere.** No ROCm device is in the `rc`
-  fleet, no ROCm toolchain is on this host, and `.github/workflows/` has no lane
-  that invokes `hipcc`. The file's own header already says **UNBUILT**. This
-  change lands ungated and uncompiled, and that is stated in the commit body.
-  It is a mechanical mirror of an edit that CI does compile on the CUDA side,
-  which is the most that can be said for it.
+* ~~**The ROCm edit cannot be compiled anywhere.**~~ **RETIRED, and it was the
+  risk this wave paid to remove.** It was written when the only AMD device
+  reachable was busy, and it said this change would land uncompiled. It did not:
+  `hipcc` 7.2.4 built the TU clean for `gfx1151` on `strix:gpu0` with zero
+  warnings, negative control detected, at the exact bytes that are landing (see
+  `## Evidence`). What SURVIVES the retirement is the structural half: no lane in
+  `.github/workflows/` invokes `hipcc`, `VLLM_CPP_HIP` defaults to `AUTO` = OFF
+  (`CMakeLists.txt:124`), so the compile is a DATED REPORT on one revision and not
+  a standing gate. The next edit to this file starts from where this one did.
 * **The CUDA edits are compiled by `cuda-fat-build` and executed by nothing.**
   There is no CI lane that runs GPU tests, so every CUDA case in this suite is
   `[SKIP]` in practice.
@@ -268,11 +271,16 @@ MUT-3's negative half is the informative one. It shows the two suites reach the
 gamma through different code, and that the f16 equality is not riding on the
 other assertions.
 
-**No mutation could be run against either device arm.** There is no `nvcc` and no
-`hipcc` on this host and no CUDA or HIP header anywhere on it (`find / -maxdepth 4
--name cuda_bf16.h` returns nothing), so the CUDA and ROCm edits were verified by
-reading, by a brace/paren/bracket balance check on both files, and -- for the CUDA
-file only -- by `cuda-fat-build` in CI. That is stated rather than papered over.
+**No mutation could be run against either device arm ON THIS HOST.** There is no
+`nvcc` and no `hipcc` here and no CUDA or HIP header anywhere on it (`find /
+-maxdepth 4 -name cuda_bf16.h` returns nothing). The ROCm arm was subsequently
+COMPILED on a leased `strix:gpu0`, and that job carried its own negative control
+-- breaking the `case DType::kF16` arm and requiring `hipcc` to reject it, which
+it did (`NEGCTL_NINJA_RC=1`). So the ROCm edit is no longer resting on the
+brace/paren/bracket balance check that was the only instrument available when
+this paragraph was first written; that check remains what it was, which is not a
+compiler. The CUDA edit is compiled by `cuda-fat-build` in CI and by nothing
+here, and neither device arm has been RUN.
 
 **The reachability mutation the protocol asks for was NOT run, and cannot be for
 this change.** Deleting `qwen3_5.cpp:6869` in a scratch copy would not move either
@@ -289,7 +297,7 @@ and the kF16 arm is reached by nothing, which is declared above.
 | `tests/vt/test_ops_rmsnorm_weight_dtype.cpp` | this host, `cmake --build build -j 2` | this host, `ctest` |
 | `tests/vt/test_ops_rmsnorm_quant_fp8_weight_dtype.cpp` | this host | this host |
 | `src/vt/cuda/cuda_ops.cu` | `cuda-fat-build` in CI ONLY -- there is no `nvcc` on this host | nothing; no CI lane runs GPU tests |
-| `src/vt/rocm/rocm_rmsnorm.hip` | `strix:gpu0` under an `rc` lease -- see below. NOT by this host and NOT by CI: there is no `hipcc` and no HIP header here, and `grep -rlE 'hipcc\|ROCM\|rocm' .github/workflows/` returns nothing | nothing |
+| `src/vt/rocm/rocm_rmsnorm.hip` | **`hipcc` 7.2.4 for gfx1151 on `strix:gpu0`, clean, 0 warnings** -- see below. NOT by this host and NOT by CI: there is no `hipcc` and no HIP header here, and `grep -rlE 'hipcc\|ROCM\|rocm' .github/workflows/` returns nothing | nothing |
 
 ### The ROCm compile, and why it is a lease rather than a lane
 
@@ -324,15 +332,44 @@ anything unless it can first prove three things:
 §build-cache measurement recorded the alternative -- a ccache dir on the CIFS
 `/workspace` -- producing 278 lock failures with `ccache -s -v` never returning.
 
-**Result: PENDING at the time of writing.** The job is queued at position #2 on
-`strix:gpu0` as `d99a30fa-3336-4b90-bc9e-877717c9b54e`, behind an end-to-end
-`rocm-exl3` run and a `rocm-strix-shape` job. It was submitted under `setsid
-nohup` with `ppid == 1` verified and without `--as`, so it survives this session
-and remains killable by its submitter: **it will run and record its verdict
-whether or not this branch has merged by then.** Collect it with
-`rc logs d99a30fa-3336-4b90-bc9e-877717c9b54e` or from
-`/workspace/rmstwins-rocm/out/run.log`, which ends in one of
-`RESULT COMPILE=PASS`, `=FAIL`, `=INCONCLUSIVE` or `=ABORTED`.
+**Result: `COMPILE=PASS`.** `rc` job `d99a30fa-3336-4b90-bc9e-877717c9b54e`
+on `strix:gpu0`, 2026-09-02T02:02:55Z, 1m56s wall:
+
+```
+gfx_enumerated: gfx1151          rocm_version: 7.2.4
+template <typename Tin, typename Tw, typename Tout, typename Tres>  1 (want 1)
+const Tw* w (the decoupled gamma pointer)                           1 (want 1)
+DispatchRmsNormWeight (defn + 2 call sites + comment)               4 (want 4)
+__half (the new gamma element type)                                 2 (want 2)
+the REMOVED weld 'weight dtype must match x'                        0 (want 0)
+CMAKE_RC=0     -- ROCm backend: ENABLED for arch(es) [gfx1151]
+OBJ=CMakeFiles/vllm.dir/src/vt/rocm/rocm_rmsnorm.hip.o
+pre-build: object absent, as required
+NINJA_RC=0
+typo_applied_count=1 (want 1)
+NEGCTL_NINJA_RC=1 (want NON-ZERO)      restored byte-for-byte: yes
+RESULT NEGCTL=DETECTED
+RESULT COMPILE=PASS  file=src/vt/rocm/rocm_rmsnorm.hip arch=gfx1151
+RESULT HEAD_SHA=2d1fdc19bd60cffec64fd2e66eb8abb5b5c1e1c5
+RESULT WARNINGS=0
+```
+
+**The negative control is what makes the `NINJA_RC=0` mean anything.** A green
+`ninja` can mean "nothing to do". Breaking the `case DType::kF16` arm made the
+rebuild FAIL, so `hipcc` demonstrably compiled this file's new code rather than
+skipping it or serving a cache hit.
+
+**The verdict is attached to a revision, and that revision is still current.**
+The job compiled tree `2d1fdc19b`; this branch has since taken two merges from
+`origin/main`. `git diff 2d1fdc19b HEAD -- src/vt/rocm/rocm_rmsnorm.hip` is
+EMPTY and the file's sha256 is `164392b422f93f65...` at both, so the report
+covers the bytes that are landing. If this file changes again the report does
+not follow it -- a leased compile is a dated report, not a standing gate.
+
+**What it does NOT say.** No kernel in that file has been RUN on an AMD device;
+this is a compile, and the row's `## Owed` still carries the absence of any lane
+that compiles `src/vt/rocm/` at all. It also says nothing about the other twenty
+`.hip` TUs, which this job did not build.
 
 A `FAIL` is a defect found before landing and is the whole point of paying for
 the lease. It would be owned by this row and repaired on top, not hidden.
@@ -340,9 +377,11 @@ the lease. It would be owned by this row and repaired on top, not hidden.
 
 ## Stop conditions
 
-A ROCm compile failure found later by someone with an AMD box is a reportable
-result of this wave, not a defect discovered outside it. The edit is recorded
-here as uncompiled precisely so that it is attributable.
+This condition was DISCHARGED rather than left standing: the compile was taken
+on `strix:gpu0` before landing, so a ROCm compile failure is no longer something
+for a later reader with an AMD box to find. A RUNTIME failure still is, because
+nothing in this wave executed a ROCm kernel, and that remains attributable to
+this wave by the same reasoning.
 
 ## Owed
 
@@ -361,7 +400,14 @@ here as uncompiled precisely so that it is attributable.
   every additional blind ROCm line is unverifiable surface.
 - #2488, #2476, #2496 stay with the parent spec.
 - A CI lane that executes GPU tests, and a ROCm lane that merely COMPILES
-  `src/vt/rocm/`. Until the second exists, this file is edited by reading.
+  `src/vt/rocm/`. The second is the one this wave felt: it had to buy a device
+  lease to learn whether one translation unit compiles, and that answer does not
+  survive the next edit to this file. BACKEND-ROCM-EXL3 paid for the same thing
+  independently on the same day (`2e200e2c6`, job `d218dc2d`, a full HIP
+  `cmake`/`build`/`ctest` at `9dcc34cc3`) and wrote up the identical lesson --
+  "I should have queued that before pushing, not after". Two waves buying the
+  same missing lane in one day is the argument for building it. A compile-only
+  ROCm lane costs a container and retires the whole "verified by reading" class.
 
 ## Now
 

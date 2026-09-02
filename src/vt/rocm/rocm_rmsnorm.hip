@@ -1,7 +1,28 @@
 // ROCm RmsNorm — the ONE op the W0 skeleton registers (BACKEND-ROCM, W0).
 //
-// **UNBUILT.** Never compiled: no AMD GPU on the authoring machine. See the
-// header of rocm_backend.hip.
+// BUILD STATE, kept honest per issue #41, in the shape rocm_backend.hip uses.
+// **THIS TU COMPILES.** `hipcc` (ROCm 7.2.4) built it clean for `gfx1151` with
+// ZERO warnings on `strix:gpu0`, under `rc` job
+// `d99a30fa-3336-4b90-bc9e-877717c9b54e`, from tree
+// `2d1fdc19bd60cffec64fd2e66eb8abb5b5c1e1c5` -- the revision that gave this file
+// its independent gamma type `Tw` (#2492).
+//
+// This line used to read "**UNBUILT.** Never compiled: no AMD GPU on the
+// authoring machine", and that half is STILL TRUE of the authoring machine:
+// there is no `hipcc` and no HIP header there, and no lane in
+// `.github/workflows/` sets `VLLM_CPP_HIP`, which defaults to `AUTO` = OFF
+// (CMakeLists.txt:124). The compile came from a leased device, not from CI, so
+// this is a DATED REPORT ABOUT ONE REVISION and not a standing gate: if this
+// file changes again, the report does not follow it, and the next editor is in
+// the same position the previous one was.
+//
+// It is a COMPILE report and nothing more. No kernel in this file has been RUN
+// on an AMD device. What makes even the compile mean something is the negative
+// control the job ran: it broke the `case DType::kF16` arm, asserted the break
+// applied, and required `hipcc` to REJECT the rebuild -- because a green `ninja`
+// can otherwise mean "nothing to do". That, the five source guards, and the
+// absent-object precondition are recorded in
+// `.agents/specs/rmsnorm-gamma-dtype-twins.md`.
 //
 // PORTED FROM: src/vt/cuda/cuda_ops.cu:96-126 `RmsNormRowKernel` (one block per
 // row, shared-memory f32 tree reduction), whose own upstream counterpart is

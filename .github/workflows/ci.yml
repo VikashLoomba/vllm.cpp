@@ -548,6 +548,28 @@ jobs:
         # lease, no torch, no numpy, no checkpoint.
         run: |
           python3 tests/scripts/test_ltx2_latent_dump.py
+      - name: The committed LTX-2 oracle goldens still hash to what records them (#2553)
+        # Registered in TWO places, like the suites above: here and in
+        # `scripts/agent-preflight.sh`. It was in ONE of them. `SUITES` held it
+        # from the start and this file never did, so the digests that anchor the
+        # oracle evidence gated on a developer box and were green on the forge.
+        #
+        # #2520 made that expensive. The suite now also covers
+        # `tests/parity/goldens/ltx2_oracle_latent/` -- the Phase A latents a
+        # future cross-decode reads INSTEAD of taking a GPU lease, 68 KB whose
+        # whole value is that they are the bytes the leased run produced. Without
+        # this step a pull request could overwrite `video_latent_bfloat16.raw`,
+        # or rewrite `SHA256SUMS` to match a corrupted one, and merge green.
+        #
+        # Nothing here can skip: standard library only -- `hashlib`, `json`,
+        # `re`, `pathlib` -- over four committed files, no numpy, no build, no
+        # GPU, no lease, no checkpoint, no network, 0.02 s. The step needs no
+        # guard, and a guard is what would turn this absence into false coverage.
+        # The registration itself is pinned in `REQUIRED_SUITE_REGISTRATIONS`,
+        # so deleting this step reds `check-test-registration.py` rather than
+        # restoring the gap.
+        run: |
+          python3 tests/scripts/test_ltx2_oracle_goldens.py
       - name: Every LTX-2.5 A/B arm sets a knob value the dispatch parses (#1751)
         # The `VLLM_LTX2_DIT_FLASH_ATTN` values a harness exports and the values
         # `ltx2_device.cpp` matches are two literals in two languages, and nothing

@@ -15,6 +15,9 @@
 // takes the target loader's own routing decision for it.
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+// MODEL-DFLASH2-EXL3 (#2495 item 7): the SHARED EXL3 reader, the presence
+// predicate and the F16 remainder conversion. Nothing here re-derives them.
+#include "vllm/model_executor/models/dense_weight_loaders.h"
 
 #include <cstring>
 #include <functional>
@@ -56,6 +59,42 @@ OwnedTensor LoadBf16RawNK(const TensorResolver& get, const std::string& name) {
   VT_CHECK(out.rank == 2, "qwen3_dflash: expected a 2-D Linear weight for " + name);
   out.nk = true;
   return out;
+}
+
+// MODEL-DFLASH2-EXL3 (#2495 item 7): the same 2-D Linear read, admitting F16
+// when and only when the caller has already established that this draft is an
+// EXL3 draft.
+//
+// WHY THIS IS SCOPED AND NOT A WIDENING OF `LoadBf16Direct`. That function
+// refuses a non-BF16 dtype by name for every draft in the tree. Teaching it F16
+// outright would start loading checkpoints that refuse today, through a
+// conversion that DROPS THREE MANTISSA BITS (F16 keeps 10, BF16 keeps 7) -- a
+// change to other lanes' models made as a side effect of this one. That is the
+// polarity `dense_loaders::LoadF16AsBf16Direct` argues for at its own
+// declaration and the one `MODEL-QWEN35-GDN-EXL3` set for `in_proj_a`.
+//
+// WHICH TENSORS REACH IT, exactly two by name.
+// `Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw` stores
+// `candidate_selector.hidden_projection.weight` and both
+// `layers.N.{attention,mlp}_conv.kernel_projection.weight` at F16, because
+// exllamav3 keeps the unquantized LINEAR remainder at its own fp16 runtime
+// dtype -- while `base_kernel`, both selector codebooks and every norm beside
+// them stay BF16. Those are the only three names, and this refusal is only
+// visible at all once the trellis arm exists: before it the load died at
+// `fc.weight` first.
+//
+// The conversion is the right polarity rather than a compromise: the draft
+// config's own `dtype` is `bfloat16`, so bf16 is the MODEL dtype every layer
+// inherits (AGENTS.md "Inherit vLLM defaults").
+OwnedTensor LoadRawNKForScheme(const TensorResolver& get, bool exl3,
+                               const std::string& name) {
+  if (exl3 && get(name).dtype == "F16") {
+    OwnedTensor out = dense_loaders::LoadF16AsBf16Direct(get, name);
+    VT_CHECK(out.rank == 2, "qwen3_dflash: expected a 2-D Linear weight for " + name);
+    out.nk = true;
+    return out;
+  }
+  return LoadBf16RawNK(get, name);
 }
 
 // Load `name` if the checkpoint ships it, else return an EMPTY OwnedTensor. The
@@ -363,10 +402,25 @@ HfConfig MakeQwen3DFlashDraftConfig(const nlohmann::json& c) {
 }
 
 Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& config,
-                                   int64_t num_taps, int32_t mask_token_id) {
+                                   int64_t num_taps, int32_t mask_token_id,
+                                   const std::function<bool(const std::string&)>& has) {
   VT_CHECK(config.hidden_size > 0 && config.num_hidden_layers > 0,
            "qwen3_dflash: invalid config dims");
   VT_CHECK(num_taps > 0, "qwen3_dflash: num_taps (len(target_layer_ids)) must be > 0");
+
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): THE RUNG, asked once and on `fc`.
+  //
+  // `fc` is the one projection every DFlash draft carries, DFlash1 and DFlash2
+  // alike, so it is the only name that can classify the whole checkpoint before
+  // the config has said which generation this is. The test is upstream's own
+  // three-tensor `Linear.is_exl3_storage` (`exllamav3/modules/linear.py:385-389`)
+  // and not a `.trellis` probe, so a half-written module falls through to the
+  // bf16 reader and is refused there by name rather than read as EXL3.
+  //
+  // A caller that supplies no `has` -- the GGUF draft builder and the DSpark
+  // backbone -- gets `false` and the byte-unchanged bf16 path. Neither format
+  // can carry a trellis.
+  const bool exl3 = static_cast<bool>(has) && dense_loaders::IsExl3Projection(has, "fc");
 
   Qwen3DFlashWeights out;
   out.num_taps = num_taps;
@@ -491,7 +545,11 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
   // embed_tokens + lm_head are SHARED from the target (the draft ckpt omits them,
   // see TryLoadBf16); load if present, else leave empty for the caller to fill.
   out.embed_tokens = TryLoadBf16(get, "embed_tokens.weight", /*nk=*/false);
-  out.fc = LoadBf16RawNK(get, "fc.weight");
+  if (exl3) {
+    out.fc_exl3 = dense_loaders::LoadExl3(get, has, "fc");
+  } else {
+    out.fc = LoadBf16RawNK(get, "fc.weight");
+  }
   out.hidden_norm = LoadBf16Direct(get, "hidden_norm.weight");
   out.final_norm = LoadBf16Direct(get, "norm.weight");
   out.lm_head = TryLoadBf16(get, "lm_head.weight", /*nk=*/true);
@@ -505,14 +563,62 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
     Qwen3DFlashLayerWeights layer;
     layer.input_layernorm = LoadBf16Direct(get, base + "input_layernorm.weight");
     layer.post_attention_layernorm = LoadBf16Direct(get, base + "post_attention_layernorm.weight");
-    layer.qkv_proj = ConcatRawNK(
-        get, {attn + "q_proj.weight", attn + "k_proj.weight", attn + "v_proj.weight"}, "qkv");
-    layer.o_proj = LoadBf16RawNK(get, attn + "o_proj.weight");
+    // MODEL-DFLASH2-EXL3 (#2495 item 7): the EXL3 rung, first and exclusive.
+    //
+    // `ConcatRawNK` IS NOT WIDENED to reach it, and that is a property of the
+    // format rather than a scheduling choice. The merged `qkv_proj` and
+    // `gate_up_proj` owners below are output-row STACKS of two or three
+    // matrices. A trellis is [k/16, n/16, 32*bits], so joining on the output
+    // dimension INTERLEAVES per input tile -- a real transform, valid only when
+    // no had_r_128 block straddles two matrices, and deferred with its own gate
+    // by `specs/quant-exl3-shared.md` `## Owed`. So this arm reads six trellises
+    // where the bf16 arm reads two merged owners, and issues six GEMMs where it
+    // issues two. That is also what the artifact ships: six independently fitted
+    // trellises with six independently fitted `svh` vectors and no merged
+    // operand anywhere in the file.
+    if (exl3) {
+      layer.q_proj_exl3 = dense_loaders::LoadExl3(get, has, attn + "q_proj");
+      layer.k_proj_exl3 = dense_loaders::LoadExl3(get, has, attn + "k_proj");
+      layer.v_proj_exl3 = dense_loaders::LoadExl3(get, has, attn + "v_proj");
+      layer.o_proj_exl3 = dense_loaders::LoadExl3(get, has, attn + "o_proj");
+      layer.gate_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "gate_proj");
+      layer.up_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "up_proj");
+      layer.down_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "down_proj");
+      // GEOMETRY, asserted rather than assumed. The bf16 arm gets its equivalent
+      // for free: `ConcatRawNK` agrees the shards' K and the fc check below reads
+      // the merged shape. This arm has no such incidental check, and `suh`/`svh`
+      // are the only things that distinguish a transposed trellis from a correct
+      // one -- a projection loaded the wrong way round runs and returns a
+      // confidently wrong answer.
+      const int64_t H = config.hidden_size;
+      const int64_t qdim = config.num_attention_heads * config.head_dim;
+      const int64_t kvdim = config.num_key_value_heads * config.head_dim;
+      const int64_t I = config.intermediate_size;
+      const auto want = [&](const char* what, const Exl3Weight& w, int64_t k, int64_t n) {
+        VT_CHECK(w.InFeatures() == k && w.OutFeatures() == n,
+                 std::string("qwen3_dflash: ") + base + what + " is [k=" +
+                     std::to_string(w.InFeatures()) + ", n=" + std::to_string(w.OutFeatures()) +
+                     "], expected [k=" + std::to_string(k) + ", n=" + std::to_string(n) + "]");
+      };
+      want("self_attn.q_proj", layer.q_proj_exl3, H, qdim);
+      want("self_attn.k_proj", layer.k_proj_exl3, H, kvdim);
+      want("self_attn.v_proj", layer.v_proj_exl3, H, kvdim);
+      want("self_attn.o_proj", layer.o_proj_exl3, qdim, H);
+      want("mlp.gate_proj", layer.gate_proj_exl3, H, I);
+      want("mlp.up_proj", layer.up_proj_exl3, H, I);
+      want("mlp.down_proj", layer.down_proj_exl3, I, H);
+    } else {
+      layer.qkv_proj = ConcatRawNK(
+          get, {attn + "q_proj.weight", attn + "k_proj.weight", attn + "v_proj.weight"}, "qkv");
+      layer.o_proj = LoadBf16RawNK(get, attn + "o_proj.weight");
+      layer.gate_up_proj =
+          ConcatRawNK(get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"}, "gate_up");
+      layer.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
+    }
+    // The two per-head norms are BF16 on BOTH arms: the repack quantizes and
+    // re-dtypes LINEARS and leaves every norm at the model dtype.
     layer.q_norm = LoadBf16Direct(get, attn + "q_norm.weight");
     layer.k_norm = LoadBf16Direct(get, attn + "k_norm.weight");
-    layer.gate_up_proj =
-        ConcatRawNK(get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"}, "gate_up");
-    layer.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
     layer.attn_mode = modes[static_cast<size_t>(i)];
     // SPEC-DFLASH2 W2 (#1314): the two grouped convolutions, under the exact
     // names the published checkpoint stores them under. Loaded only for a DFlash2
@@ -524,7 +630,12 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
         const std::string cp = base + which;
         Qwen3DFlashConvWeights conv;
         conv.base_kernel = LoadBf16Direct(get, cp + "base_kernel");
-        conv.kernel_projection = LoadBf16RawNK(get, cp + "kernel_projection.weight");
+        // MODEL-DFLASH2-EXL3 (#2495 item 7): F16 here and BF16 one line up, on
+        // the SAME checkpoint. The repack re-dtyped the LINEAR and left the
+        // kernel alone, so this is one of exactly three names that reach the
+        // scheme-aware read.
+        conv.kernel_projection =
+            LoadRawNKForScheme(get, exl3, cp + "kernel_projection.weight");
         // SHAPES, asserted rather than assumed. `base_kernel` is
         // [SIDES=2, taps, H] -- dim 0 is prepare/finish and NOT a tap, and on the
         // published 27B draft both are 2, so nothing but this check separates a
@@ -557,8 +668,11 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
   if (out.IsDflash2()) {
     Dflash2SelectorWeights& sel = out.candidate_selector;
     const int64_t rank = sel.rank;
+    // MODEL-DFLASH2-EXL3 (#2495 item 7): F16 on an EXL3 draft, while the two
+    // codebooks below stay BF16. The selector is NOT quantized -- the model card
+    // says it is, and the checkpoint's own `tensor_storage` does not list it.
     sel.hidden_projection =
-        LoadBf16RawNK(get, "candidate_selector.hidden_projection.weight");
+        LoadRawNKForScheme(get, exl3, "candidate_selector.hidden_projection.weight");
     sel.predecessor_codebook = LoadBf16Direct(get, "candidate_selector.predecessor_codebook");
     sel.successor_codebook = LoadBf16Direct(get, "candidate_selector.successor_codebook");
     // SHAPES, asserted rather than assumed. `hidden_projection` is a
@@ -575,10 +689,24 @@ Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& co
                "[vocab, rank]");
   }
 
-  // fc input width validation: [H, H*num_taps].
-  VT_CHECK(out.fc.shape[0] == config.hidden_size &&
-               out.fc.shape[1] == config.hidden_size * num_taps,
-           "qwen3_dflash: fc.weight must be [H, H*num_taps]");
+  // fc input width validation: [H, H*num_taps]. The trellis carries the same
+  // two numbers in the opposite order, because `Exl3Weight` is [k=in, n=out]
+  // while an `OwnedTensor` raw-NK owner is [N=out, K=in].
+  if (exl3) {
+    VT_CHECK(out.fc_exl3.InFeatures() == config.hidden_size * num_taps &&
+                 out.fc_exl3.OutFeatures() == config.hidden_size,
+             "qwen3_dflash: fc trellis must be [k=H*num_taps, n=H]");
+    // MODEL-DFLASH2-EXL3: `IsExl3()` reads ONE field, and what makes reading one
+    // field safe is the control flow above rather than a check here. The
+    // per-layer rung is UNCONDITIONAL on the arm: once `fc` classifies the
+    // checkpoint, all seven `LoadExl3` calls run, and a layer missing a trellis
+    // throws `tensor not found` at load. A `VT_CHECK` restating that would be
+    // unreachable, because reaching it means all seven already succeeded.
+  } else {
+    VT_CHECK(out.fc.shape[0] == config.hidden_size &&
+                 out.fc.shape[1] == config.hidden_size * num_taps,
+             "qwen3_dflash: fc.weight must be [H, H*num_taps]");
+  }
   return out;
 }
 
@@ -600,7 +728,15 @@ Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
     VT_CHECK(it != where.end(), "qwen3_dflash: tensor not found: " + name);
     return it->second->Get(key);
   };
-  return LoadQwen3DFlash(get, config, num_taps, mask_token_id);
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): the presence predicate, with the SAME
+  // `model.`-prefixed fallback the resolver above applies. Two lookups that
+  // disagree about whether a tensor exists is how a checkpoint gets classified
+  // one way and read the other.
+  const std::function<bool(const std::string&)> has =
+      [&where](const std::string& name) {
+        return where.count(name) != 0 || where.count("model." + name) != 0;
+      };
+  return LoadQwen3DFlash(get, config, num_taps, mask_token_id, has);
 }
 
 void LoadDflashSharedLmHead(const std::vector<SafetensorsFile>& shards,

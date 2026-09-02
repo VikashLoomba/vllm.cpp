@@ -3218,6 +3218,39 @@ DBuf DenseLogitsF32D(Dev d, const Tensor& x, const Qwen3_5DenseWeights& weights)
   if (!weights.lm_head_fp4.Empty())
     return MatmulNvfp4F32D(d, x, weights.lm_head_fp4);
   const OwnedTensor& lm_head = DenseLmHead(weights);
+  // #2534: a GGUF KEEP-QUANT head takes the f32-output GEMM, joining the EXL3
+  // and NVFP4 heads above rather than the bf16 helper below.
+  //
+  // It used to take the bf16 helper, and only because `nk` is a LAYOUT flag:
+  // `qwen3_5_gguf_weights.cpp::OwnGgufQuantBlocks` sets it true because "GGUF
+  // disk order [out, in] IS the MatmulBT [N, K] orientation", which says nothing
+  // about numerics. It therefore inherited a rule authored for the TIED BF16
+  // torch-Linear head the helper's own comment names. Measured cost of that
+  // inheritance: 288 of 288 of the Q4_K_M arm's top-1 logits landed exactly on
+  // the bf16 grid, whose ULP is 0.125 at the magnitude 16-32 these logits carry,
+  // while the six near-ties the llama.cpp token gate convicts us on are gaps of
+  // 0.027 to 0.178 -- five of six below our own resolution, and six steps EXACT
+  // TIES (#2534, docs/bench-evidence/qwen38-27b-q4km-logit-delta-20260902.md).
+  //
+  // This DIVERGES from vLLM's default, deliberately, and the divergence is
+  // argued in .agents/specs/qwen38-27b-q4km-logits-f32.md rather than assumed.
+  // Upstream keeps the head in the model dtype (`logits_processor.py:99-136`
+  // `_apply_head`; `config/model.py:2187-2208` `_get_head_dtype` defaults a
+  // GENERATION model to the model dtype) and widens afterwards in the sampler
+  // (`v1/sample/sampler.py:96`), exactly as `MatmulBf16LogitsF32D` does. But
+  // vLLM has no in-tree GGUF reader at the pin, so it resolves no model dtype
+  // for this checkpoint at all (#979); and where upstream DOES select an f32
+  // head it accumulates straight into f32 rather than casting operands
+  // (`logits_processor.py:127-131`, `torch.mm(..., out_dtype=...)`), which is
+  // what this arm now does -- the keep-quant kernels already accumulate in f32
+  // and only round at the store, so no weight copy and no cast pass is added.
+  // Upstream's refusal of an f32 head on a QUANTIZED head
+  // (`logits_processor.py:111-115`) guards its `.to(f32)` weight-cast fallback,
+  // a mechanism we do not use.
+  //
+  // Elementwise bf16/f16 heads are untouched below, so no safetensors default
+  // and no recorded device measurement on those arms moves.
+  if (vt::IsBlockQuant(lm_head.dtype)) return MatmulF32D(d, x, lm_head);
   return lm_head.nk ? MatmulBf16LogitsF32D(d, x, lm_head)
                     : MatmulF32D(d, x, lm_head);
 }

@@ -20,6 +20,11 @@
 #include <vector>
 
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
+// MODEL-DFLASH2-EXL3 (#2495 item 7): the EXL3 arms of the same two seams. This
+// file already includes `dense_attn_block.h` and says `using namespace
+// dense_attn`, so it has none of the ADL collision that made `qwen3_5.cpp`
+// reach the scheme through a translation-unit boundary (`dense_exl3_linear.h`).
+#include "vllm/model_executor/layers/quantization/exl3.h"  // MakeLinearMethod / MakeMlpGateUpMethod
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // #1628: the shared NVFP4 W4A16 logits GEMM
 #include "vllm/model_executor/models/dense_exl3_linear.h"  // #2495 item 6: the ONE EXL3 linear seam
@@ -240,6 +245,61 @@ struct ContextKVDev {
   int64_t num_ctx = 0;
 };
 
+// MODEL-DFLASH2-EXL3 (#2495 item 7): the draft's q/k/v projections, for all
+// three inline layer bodies.
+//
+// WHY ONE FUNCTION AND NOT A BRANCH REPEATED THREE TIMES. The three bodies each
+// carried their own copy of the merged-versus-sliced bf16 choice, and #2202
+// records what that cost: the merged seam landed in the cold body and the two
+// hot ones kept re-reading the activation three times for a year. A third arm
+// copied into all three is the same defect waiting. The bf16 arms below are the
+// ones those bodies already ran, moved rather than rewritten -- same ops, same
+// order, same `MergedQkvEnabled()` question.
+//
+// THE EXL3 ARM CANNOT BE MERGED, and `MergedQkvEnabled()` is therefore not
+// asked on it. There is no merged trellis operand to read: joining two
+// trellises on the output dimension interleaves per input tile, which is a real
+// transform (`quantization/exl3.h`), and the artifact ships three separately
+// fitted tensors with three separately fitted `svh` vectors.
+//
+// `layer.qkv_proj` is handed to all three factory calls as the unquantized
+// fallback and is EMPTY on this arm. It is never dereferenced, because
+// `MakeLinearMethod` binds the trellis method whenever the trellis is
+// non-empty, and the loader reads all seven per-layer trellises unconditionally
+// once `fc` classified the checkpoint -- so `IsExl3()` true means all three of
+// these are populated, and a checkpoint that quantized only `fc` threw at load.
+void ProjectDflashQkv(Dev d, const Qwen3DFlashWeights& weights,
+                      const Qwen3DFlashLayerWeights& layer, const Tensor& x,
+                      int64_t qdim, int64_t kdim, DBuf* q, DBuf* k, DBuf* v) {
+  const int64_t T = x.shape[0];
+  if (weights.IsExl3()) {
+    *q = layers::MakeLinearMethod(layer.qkv_proj, layer.q_proj_exl3)
+             ->Apply(d, x, DType::kBF16);
+    *k = layers::MakeLinearMethod(layer.qkv_proj, layer.k_proj_exl3)
+             ->Apply(d, x, DType::kBF16);
+    *v = layers::MakeLinearMethod(layer.qkv_proj, layer.v_proj_exl3)
+             ->Apply(d, x, DType::kBF16);
+    return;
+  }
+  *q = DBuf(d, DType::kBF16, {T, qdim});
+  *k = DBuf(d, DType::kBF16, {T, kdim});
+  *v = DBuf(d, DType::kBF16, {T, kdim});
+  // Merged QKVParallelLinear: D1 folds the shared-input q/k/v GEMMs to ONE
+  // MatmulBT over the merged owner + a contiguous QkvSplit (MergedQkvEnabled(),
+  // VT_QWEN3_QKV_MERGE default ON; =0 = byte-identical 3-shard). RoPE handling
+  // is UNCHANGED at every call site -- still RopeNeox, no RopeFromCache swap.
+  Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
+  if (MergedQkvEnabled()) {
+    DBuf qkv(d, DType::kBF16, {T, qdim + 2 * kdim});
+    vt::MatmulBT(d.q, qkv.t(), x, wqkv);
+    vt::QkvSplit(d.q, q->t(), k->t(), v->t(), qkv.t());
+  } else {
+    vt::MatmulBT(d.q, q->t(), x, wqkv.Slice(0, 0, qdim));
+    vt::MatmulBT(d.q, k->t(), x, wqkv.Slice(0, qdim, qdim + kdim));
+    vt::MatmulBT(d.q, v->t(), x, wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
+  }
+}
+
 // SPEC-DFLASH2 W8 (#1838): the projection core over a DEVICE bf16 features
 // tensor. The f32-host entry below is a marshaling shell over this — the cast
 // it runs (f32 -> bf16) recovers exactly the bf16 bits the runner's aux tap
@@ -267,13 +327,23 @@ ContextKVDev PrecomputeContextKVDeviceBf16(Dev d, const Tensor& ctxb_bf16,
 
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3DFlashLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
-    Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
-    Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
-    Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
-    DBuf k(d, DType::kBF16, {C, kdim});
-    DBuf v(d, DType::kBF16, {C, kdim});
-    vt::MatmulBT(d.q, k.t(), normed.t(), wk);
-    vt::MatmulBT(d.q, v.t(), normed.t(), wv);
+    DBuf k, v;
+    if (weights.IsExl3()) {
+      // MODEL-DFLASH2-EXL3 (#2495 item 7): the EXL3 draft has no merged qkv
+      // owner to slice, so k and v are their own trellises and their own GEMMs.
+      k = layers::MakeLinearMethod(layer.qkv_proj, layer.k_proj_exl3)
+              ->Apply(d, normed.t(), DType::kBF16);
+      v = layers::MakeLinearMethod(layer.qkv_proj, layer.v_proj_exl3)
+              ->Apply(d, normed.t(), DType::kBF16);
+    } else {
+      Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
+      Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
+      Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
+      k = DBuf(d, DType::kBF16, {C, kdim});
+      v = DBuf(d, DType::kBF16, {C, kdim});
+      vt::MatmulBT(d.q, k.t(), normed.t(), wk);
+      vt::MatmulBT(d.q, v.t(), normed.t(), wv);
+    }
     // K-norm over head_dim, then NeoX RoPE on K at the context positions (V raw).
     Tensor k2 = Reshape(k.t(), {C * Hkv, Dh});
     Tensor wkn = ResidentWeight(d, layer.k_norm, {Dh});
@@ -418,9 +488,14 @@ Qwen3DFlashModel::DflashCombinedDevice Qwen3DFlashModel::CombineAuxFeaturesDevic
   VT_CHECK(aux_bf16.rank == 2 && aux_bf16.shape[1] == Fin,
            "qwen3_dflash fc (device): aux must be [T, H*num_taps]");
   const int64_t T = aux_bf16.shape[0];
-  Tensor wfc = ResidentWeight(d, weights.fc);  // [H, H*num_taps] nk
-  DBuf comb(d, DType::kBF16, {T, H});
-  vt::MatmulBT(d.q, comb.t(), aux_bf16, wfc);
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): ONE call site, both arms. The factory
+  // binds `UnquantizedLinearMethod` when the trellis is empty, and its `Apply`
+  // is exactly the `ResidentWeight` + `DBuf` + `vt::MatmulBT` sequence this line
+  // replaces -- byte-for-byte the same three ops on a bf16 draft.
+  DBuf comb = layers::MakeLinearMethod(weights.fc, weights.fc_exl3)
+                  ->Apply(d, aux_bf16, DType::kBF16);
+  VT_CHECK(comb.t().shape[0] == T && comb.t().shape[1] == H,
+           "qwen3_dflash fc (device): the combine must produce [T, H]");
   DflashCombinedDevice out;
   out.tensor = comb.t();
   out.keep = comb.ReleaseShared();
@@ -527,26 +602,8 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     // Reuse the block helper but feed the real positions to RoPE.
     DBuf attn = [&]() -> DBuf {
       const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
-      DBuf q(d, DType::kBF16, {T, qdim});
-      DBuf k(d, DType::kBF16, {T, kdim});
-      DBuf v(d, DType::kBF16, {T, kdim});
-      // Merged QKVParallelLinear: D1 folds the shared-input q/k/v GEMMs to ONE
-      // MatmulBT over the merged owner + a contiguous QkvSplit (MergedQkvEnabled(),
-      // VT_QWEN3_QKV_MERGE default ON; =0 = byte-identical 3-shard). RoPE handling
-      // is UNCHANGED (still RopeNeox below — no RopeFromCache swap).
-      Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
-      if (MergedQkvEnabled()) {
-        DBuf qkv(d, DType::kBF16, {T, qdim + 2 * kdim});
-        vt::MatmulBT(d.q, qkv.t(), dhn.t(), wqkv);
-        vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
-      } else {
-        Tensor wq = wqkv.Slice(0, 0, qdim);
-        Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
-        Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
-        vt::MatmulBT(d.q, q.t(), dhn.t(), wq);
-        vt::MatmulBT(d.q, k.t(), dhn.t(), wk);
-        vt::MatmulBT(d.q, v.t(), dhn.t(), wv);
-      }
+      DBuf q, k, v;
+      ProjectDflashQkv(d, weights, layer, dhn.t(), qdim, kdim, &q, &k, &v);
       Tensor q2 = Reshape(q.t(), {T * Hq, Dh});
       Tensor k2 = Reshape(k.t(), {T * Hkv, Dh});
       Tensor q3 = Reshape(q.t(), {T, Hq, Dh});
@@ -566,10 +623,11 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
       pa.num_reqs = static_cast<int>(cu.size()) - 1;
       vt::DFlashBlockAttention(d.q, a.t(), q3, k3, v3, pa);
       Tensor o_in = Reshape(a.t(), {T, Hq * Dh});
-      Tensor wo = ResidentWeight(d, layer.o_proj);
-      DBuf o(d, DType::kBF16, {T, H});
-      vt::MatmulBT(d.q, o.t(), o_in, wo);
-      return o;
+      // MODEL-DFLASH2-EXL3 (#2495 item 7): ONE call site, both arms. On a bf16
+      // draft `MakeLinearMethod` binds `UnquantizedLinearMethod`, whose `Apply`
+      // IS the ResidentWeight + DBuf + MatmulBT triple this replaces.
+      return layers::MakeLinearMethod(layer.o_proj, layer.o_proj_exl3)
+          ->Apply(d, o_in, DType::kBF16);
     }();
 
     // SPEC-DFLASH2 W2: attention_conv.finish, over the sublayer OUTPUT with the
@@ -594,11 +652,14 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
     DBuf mlp_coef(d, DType::kBF16, {0});
     if (weights.IsDflash2())
       mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
-    DBuf act =
-        layers::UnquantizedMlpGateUpMethod(&layer.gate_up_proj, I).Apply(d, dh2.t());
-    Tensor wdn = ResidentWeight(d, layer.down_proj);
-    DBuf down(d, DType::kBF16, {T, H});
-    vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    // MODEL-DFLASH2-EXL3 (#2495 item 7): the SAME seam, now selected by the
+    // factory rather than hard-bound. On a bf16 draft it binds the identical
+    // `UnquantizedMlpGateUpMethod` and nothing about the ops moves.
+    DBuf act = layers::MakeMlpGateUpMethod(layer.gate_up_proj, layer.gate_proj_exl3,
+                                           layer.up_proj_exl3, I)
+                   ->Apply(d, dh2.t());
+    DBuf down = layers::MakeLinearMethod(layer.down_proj, layer.down_proj_exl3)
+                    ->Apply(d, act.t(), DType::kBF16);
     if (weights.IsDflash2())
       DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     if (per_layer_out != nullptr) {
@@ -851,25 +912,13 @@ static std::vector<float> ForwardWithCtxKVDev(
 
     // Block q/k/v: same per-layer path as the context-free forward.
     const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
-    DBuf q(d, DType::kBF16, {Tq, qdim});
-    DBuf k(d, DType::kBF16, {Tq, kdim});
-    DBuf v(d, DType::kBF16, {Tq, kdim});
-    // #2202: the MERGED QKV seam, which this body bypassed. `ForwardBlockLogits`
-    // took the fold in `d21c442dc` and the two hot bodies did not, so the path
-    // production actually runs at c>1 kept re-reading the activation three times
-    // and issuing three GEMMs where one does. `MergedQkvEnabled()` selects the
-    // same way it does in the cold body, and the sliced arm below is what it
-    // falls back to, so both arms stay reachable and comparable.
-    Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
-    if (MergedQkvEnabled()) {
-      DBuf qkv(d, DType::kBF16, {q.t().shape[0], qdim + 2 * kdim});
-      vt::MatmulBT(d.q, qkv.t(), dhn.t(), wqkv);
-      vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
-    } else {
-      vt::MatmulBT(d.q, q.t(), dhn.t(), wqkv.Slice(0, 0, qdim));
-      vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
-      vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
-    }
+    DBuf q, k, v;
+    // #2202 put the MERGED QKV seam in this body, which had bypassed it: the
+    // path production actually runs at c>1 kept re-reading the activation three
+    // times and issuing three GEMMs where one does. MODEL-DFLASH2-EXL3 (#2495
+    // item 7) then moved the whole choice into `ProjectDflashQkv`, so the three
+    // bodies cannot drift apart again the way they did for a year.
+    ProjectDflashQkv(d, weights, layer, dhn.t(), qdim, kdim, &q, &k, &v);
     ops.Lap(ops.qkv);
     Tensor q2 = Reshape(q.t(), {Tq * Hq, Dh});
     Tensor k2 = Reshape(k.t(), {Tq * Hkv, Dh});
@@ -930,10 +979,15 @@ static std::vector<float> ForwardWithCtxKVDev(
     detail::NoteDflashCombinedAttn(q3.shape[0], kcb3.shape[0]);
     ops.Lap(ops.ctx_scatter);
     vt::DFlashBlockAttention(d.q, a3, q3, kcb3, vcb3, pa);
-    Tensor wo = ResidentWeight(d, layer.o_proj);
-    DBuf attn(d, DType::kBF16, {Tq, H});
     ops.Lap(ops.attn);
-    vt::MatmulBT(d.q, attn.t(), a.t(), wo);
+    // MODEL-DFLASH2-EXL3 (#2495 item 7): the o_proj phase boundary MOVED by one
+    // op. The weight's residency call used to be charged to `attn` because it
+    // sat above this lap; `Apply` owns it now, so it is charged to `o_proj`.
+    // That is the more honest attribution and it is recorded rather than
+    // silent, because a phase table nobody warned is a phase table somebody
+    // will read as a regression.
+    DBuf attn = layers::MakeLinearMethod(layer.o_proj, layer.o_proj_exl3)
+                    ->Apply(d, a.t(), DType::kBF16);
     ops.Lap(ops.o_proj);
 
     // SPEC-DFLASH2 W2 (#1314): attention_conv.finish. Its prepare ran above, on
@@ -952,16 +1006,16 @@ static std::vector<float> ForwardWithCtxKVDev(
     DBuf mlp_coef(d, DType::kBF16, {0});
     if (weights.IsDflash2())
       mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
-    // #2202: the SHARED bf16 gate-up MLP seam, which this body bypassed. The
-    // Tier-A1 fold (`18ed6f038`) took `ForwardBlockLogits` and left both hot
-    // bodies on the hand-roll, so the path production runs never inherited the
-    // seam. `Apply` is byte-for-byte the same op sequence — one gate-up GEMM
-    // then `SiluAndMul` — so this changes no arithmetic; what it changes is that
-    // a quantized gate-up arm can now reach these bodies at all.
-    DBuf act = layers::UnquantizedMlpGateUpMethod(&layer.gate_up_proj, I).Apply(d, dh2.t());
-    Tensor wdn = ResidentWeight(d, layer.down_proj);
-    DBuf down(d, DType::kBF16, {Tq, H});
-    vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    // #2202 put the SHARED gate-up MLP seam in this body: the Tier-A1 fold
+    // (`18ed6f038`) took `ForwardBlockLogits` and left both hot bodies on the
+    // hand-roll. Its closing sentence said the point was that "a quantized
+    // gate-up arm can now reach these bodies at all"; MODEL-DFLASH2-EXL3
+    // (#2495 item 7) is the arm that does, and the factory is what selects it.
+    DBuf act = layers::MakeMlpGateUpMethod(layer.gate_up_proj, layer.gate_proj_exl3,
+                                           layer.up_proj_exl3, I)
+                   ->Apply(d, dh2.t());
+    DBuf down = layers::MakeLinearMethod(layer.down_proj, layer.down_proj_exl3)
+                    ->Apply(d, act.t(), DType::kBF16);
     if (weights.IsDflash2())
       DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     ops.Lap(ops.mlp);
@@ -1579,25 +1633,13 @@ static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hi
       attn_coef = DflashConvPrepare(d, layer.attention_conv, weights, config, &dhn);
 
     const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
-    DBuf q(d, DType::kBF16, {Tq, qdim});
-    DBuf k(d, DType::kBF16, {Tq, kdim});
-    DBuf v(d, DType::kBF16, {Tq, kdim});
-    // #2202: the MERGED QKV seam, which this body bypassed. `ForwardBlockLogits`
-    // took the fold in `d21c442dc` and the two hot bodies did not, so the path
-    // production actually runs at c>1 kept re-reading the activation three times
-    // and issuing three GEMMs where one does. `MergedQkvEnabled()` selects the
-    // same way it does in the cold body, and the sliced arm below is what it
-    // falls back to, so both arms stay reachable and comparable.
-    Tensor wqkv = ResidentWeight(d, layer.qkv_proj);
-    if (MergedQkvEnabled()) {
-      DBuf qkv(d, DType::kBF16, {q.t().shape[0], qdim + 2 * kdim});
-      vt::MatmulBT(d.q, qkv.t(), dhn.t(), wqkv);
-      vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
-    } else {
-      vt::MatmulBT(d.q, q.t(), dhn.t(), wqkv.Slice(0, 0, qdim));
-      vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
-      vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
-    }
+    DBuf q, k, v;
+    // #2202 put the MERGED QKV seam in this body, which had bypassed it: the
+    // path production actually runs at c>1 kept re-reading the activation three
+    // times and issuing three GEMMs where one does. MODEL-DFLASH2-EXL3 (#2495
+    // item 7) then moved the whole choice into `ProjectDflashQkv`, so the three
+    // bodies cannot drift apart again the way they did for a year.
+    ProjectDflashQkv(d, weights, layer, dhn.t(), qdim, kdim, &q, &k, &v);
     Tensor q2 = Reshape(q.t(), {Tq * Hq, Dh});
     Tensor k2 = Reshape(k.t(), {Tq * Hkv, Dh});
     Tensor q3 = Reshape(q.t(), {Tq, Hq, Dh});
@@ -1655,9 +1697,8 @@ static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hi
                                     store.seq_lens->t(), store.block_table->t(), pa);
     }
     Tensor a = Reshape(a3.t(), {Tq, Hq * Dh});
-    Tensor wo = ResidentWeight(d, layer.o_proj);
-    DBuf attn(d, DType::kBF16, {Tq, H});
-    vt::MatmulBT(d.q, attn.t(), a, wo);
+    DBuf attn = layers::MakeLinearMethod(layer.o_proj, layer.o_proj_exl3)
+                    ->Apply(d, a, DType::kBF16);
 
     // SPEC-DFLASH2 W2: attention_conv.finish.
     if (weights.IsDflash2())
@@ -1673,16 +1714,16 @@ static DBuf ForwardPagedBody(Dev d, DflashDeviceKVStore& store, const Tensor& hi
     DBuf mlp_coef(d, DType::kBF16, {0});
     if (weights.IsDflash2())
       mlp_coef = DflashConvPrepare(d, layer.mlp_conv, weights, config, &dh2);
-    // #2202: the SHARED bf16 gate-up MLP seam, which this body bypassed. The
-    // Tier-A1 fold (`18ed6f038`) took `ForwardBlockLogits` and left both hot
-    // bodies on the hand-roll, so the path production runs never inherited the
-    // seam. `Apply` is byte-for-byte the same op sequence — one gate-up GEMM
-    // then `SiluAndMul` — so this changes no arithmetic; what it changes is that
-    // a quantized gate-up arm can now reach these bodies at all.
-    DBuf act = layers::UnquantizedMlpGateUpMethod(&layer.gate_up_proj, I).Apply(d, dh2.t());
-    Tensor wdn = ResidentWeight(d, layer.down_proj);
-    DBuf down(d, DType::kBF16, {Tq, H});
-    vt::MatmulBT(d.q, down.t(), act.t(), wdn);
+    // #2202 put the SHARED gate-up MLP seam in this body: the Tier-A1 fold
+    // (`18ed6f038`) took `ForwardBlockLogits` and left both hot bodies on the
+    // hand-roll. Its closing sentence said the point was that "a quantized
+    // gate-up arm can now reach these bodies at all"; MODEL-DFLASH2-EXL3
+    // (#2495 item 7) is the arm that does, and the factory is what selects it.
+    DBuf act = layers::MakeMlpGateUpMethod(layer.gate_up_proj, layer.gate_proj_exl3,
+                                           layer.up_proj_exl3, I)
+                   ->Apply(d, dh2.t());
+    DBuf down = layers::MakeLinearMethod(layer.down_proj, layer.down_proj_exl3)
+                    ->Apply(d, act.t(), DType::kBF16);
     if (weights.IsDflash2())
       DflashConvFinish(d, layer.mlp_conv, weights, config, &down, mlp_coef);
     keep.push_back(std::move(down));

@@ -3517,3 +3517,81 @@ the gap above stays exactly as written and is owned by
 [#2596](https://github.com/mudler/vllm.cpp/issues/2596): the reuse counters stay
 unmeasured, and #2544's candidacy for this model stays unresolved. It is not
 inferrable from the one-token run, and this section does not infer it.
+
+### 3.12 The candidacy is CONVICTED on CPU, and the repair is two lines
+
+**Status: measured and fixed here. The `dgx:gpu0` legs of §3.11 are still
+QUEUED and are still owed**, because what they answer is not what this section
+answers. Issue [#2596](https://github.com/mudler/vllm.cpp/issues/2596).
+
+**What was measured.** A new case in `test_glm_moe_dsa_forward.cpp` drives four
+pure-decode steps through `ModelRegistry::Forward` — the production entry point,
+not a hand-built type — on the tiny fixture, as the A/B/C triple
+`test_moe_async_device_ids.cpp` established for the same contract:
+
+| run | host ids | mirror | expected |
+|---|---|---|---|
+| A | true | none | the reference |
+| B | zeros | none | must DIFFER from A |
+| C | zeros | carries A's | must EQUAL A |
+
+B is the control. Without it a forward that ignored its identifiers entirely
+would satisfy C, and so would a gate whose two runs shared a buffer.
+
+**RED, at `d0f7fd2c6` plus the test alone:**
+
+```text
+CHECK( differing == 0 ) is NOT correct!  values: CHECK( 128 == 0 )
+[doctest] test cases:  1 |  0 passed | 1 failed | 7 skipped
+[doctest] assertions: 81 | 80 passed | 1 failed |
+```
+
+**Both counts are quoted because only the pair separates a failed assertion from
+a thrown case.** 80 of 81 assertions passed, so run B's control fired correctly
+and the case FAILED rather than threw: all 128 logits (4 steps x 32 vocab)
+differ. `glm_moe_dsa` did not read `device_token_ids` at all.
+
+**The repair is two lines and neither is new.** The registry publishes the field
+for the duration of the forward (`detail::DeviceTokenIdsScope`, exactly as
+`qwen3_moe_registry.cpp:100` does), and the embed consumes it
+(`detail::ApplyDeviceTokenIds`, exactly as `deepseek_v2.cpp:586` does). Both
+helpers already exist in `qwen3_5_internal.h` beside the publisher, because
+#1305 put them there to stop a fifth hand-rolled copy. Nothing here is a new
+mechanism; this registration simply never joined the nine that consume it.
+
+**GREEN, whole suite:** `8 | 8 passed | 0 failed`, `assertions: 5339 | 5339
+passed | 0 failed`, `0 differing`. Seven adjacent suites are green on the same
+build: `test_glm_moe_dsa_{config,gguf_load,gguf_census,schedule}`,
+`test_moe_async_device_ids`, `test_expert_stream_{wiring,steps}` — 60 cases and
+11,319 assertions in total, none failing.
+
+**Three mutations, each REBUILT and each restored byte-for-byte.** A mutation
+that does not rebuild reads as a passing test, so the build rc is recorded
+beside the verdict and each mutant binary's sha256 differs from the green one's
+`f367624476c5b584961c3d1d00c41d03220df85be9256828aa6ad74f704450c6`:
+
+| mutation | build rc | result |
+|---|---|---|
+| delete the CONSUMER (`ApplyDeviceTokenIds`) | 0 | RED, `CHECK( 128 == 0 )` |
+| delete the PUBLISHER (`DeviceTokenIdsScope`) | 0 | RED, `CHECK( 128 == 0 )` |
+| neuter the CONTROL (run B stops staling the host ids) | 0 | RED, `CHECK( 0 > 0 )` on every step |
+
+The first two are the reachability proof `## Nothing lands dead` asks for:
+deleting either production call site reds the gate, so the case measures a
+capability and not a class. The third proves the control is not vacuous — it is
+the arm that stops a forward which ignores identifiers entirely from passing.
+All three source files restored to their pristine sha256, verified by `diff`
+against the hashes taken before the first mutation.
+
+**WHAT THIS DOES NOT SETTLE, and why §3.11's legs still owe their run.** This is
+a CPU gate on a 1/1000th-scale fixture. It proves the CONTRACT was unmet and is
+now met. It does not show the symptom on the published 201.83 GiB checkpoint, it
+does not exercise the slot cache at the real model's working-set size, and it
+says nothing about the reuse counters §3.11 exists to measure. The staged
+runner deliberately builds from **base `main` without this repair**, so its leg
+C still carries the defect and its leg E is still the discriminator: that pair
+is what convicts on the real artifact, as it did for the sibling model. A CPU
+fixture agreeing with a two-line fix is not a 753.33B model generating text.
+
+**No rate is claimed here either.** Nothing in this section is a performance
+measurement, and the row still has no vLLM denominator at any revision.

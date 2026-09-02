@@ -1919,6 +1919,108 @@ TEST_CASE("RmsNormGated and SigmoidGate match the CPU oracle") {
 }
 
 
+TEST_CASE("FusedNormRope matches the CPU oracle within NMSE <= 5e-4, both styles") {
+  // The Tier-A2+A5 MLA norm-rope fold (ROCM-FUSED-NORM-ROPE, #2564). It is the
+  // ONE op in this harness whose ABSENCE on a backend is a refusal rather than
+  // a slowdown: `mla_attention.cpp` branches on
+  // `vt::OpRegistered(kFusedNormRope, device)` BEFORE calling it, and the
+  // fallback that branch selects row-slices a weight that a keep-quant MLA
+  // checkpoint stores block-quantized. So a device that skips this case cannot
+  // serve GLM-5.3 at all, and a SKIP here is a gap, not a pass.
+  //
+  // Geometry is DeepSeek/GLM-shaped but small: off = kv_lora_rank, rot =
+  // qk_rope_head_dim. `off` is deliberately NOT a multiple of the 256-wide
+  // block, so the strided reduction loop's tail is exercised rather than
+  // divided away.
+  constexpr int64_t kTokens = 13, kOff = 130, kRot = 16, kMaxPos = 64;
+  constexpr double kEps = 1e-6;
+
+  const std::vector<float> x0 = RandomVec(kTokens * (kOff + kRot), 9101);
+  const std::vector<float> w0 = RandomVec(kOff, 9102, -1.0f, 1.0f);
+  const std::vector<float> cache = RandomVec(kMaxPos * kRot, 9103, -1.0f, 1.0f);
+  // Positions are NOT 0..n-1: a kernel reading the token index instead of the
+  // position passes on the identity mapping and fails here.
+  std::vector<int32_t> pos(kTokens);
+  for (int64_t i = 0; i < kTokens; ++i) {
+    pos[static_cast<size_t>(i)] = int32_t((i * 5 + 2) % kMaxPos);
+  }
+
+  // NeoX rotates (pair, pair+half); GPT-J style rotates (2*pair, 2*pair+1).
+  // DeepSeek-V2/V3 and GLM-5.3 use the GPT-J form, so `false` is the arm this
+  // model actually runs and `true` is the one a hardcoded kernel would break.
+  for (bool neox : {true, false}) {
+    CAPTURE(neox);
+    vt::RmsNormArgs na;
+    na.eps = kEps;
+    na.gemma = false;  // DeepSeek/GLM: plain RMSNorm, not (1 + w)
+    vt::RopeArgs ra;
+    ra.rotary_dim = kRot;
+    ra.is_neox_style = neox;
+
+    std::vector<float> ref_lat(kTokens * kOff), ref_pe(kTokens * kRot);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cx = x0, cw = w0, cc = cache;
+      std::vector<int32_t> cpos = pos;
+      Tensor tl = Tensor::Contiguous(ref_lat.data(), DType::kF32, cd, {kTokens, kOff});
+      Tensor tp = Tensor::Contiguous(ref_pe.data(), DType::kF32, cd, {kTokens, kRot});
+      Tensor tx = Tensor::Contiguous(cx.data(), DType::kF32, cd, {kTokens, kOff + kRot});
+      Tensor tw = Tensor::Contiguous(cw.data(), DType::kF32, cd, {kOff});
+      Tensor tpos = Tensor::Contiguous(cpos.data(), DType::kI32, cd, {kTokens});
+      Tensor tc = Tensor::Contiguous(cc.data(), DType::kF32, cd, {kMaxPos, kRot});
+      vt::FusedNormRope(cq, tl, tp, tx, tw, tpos, tc, na, ra);
+      cpu.DestroyQueue(cq);
+    }
+
+    // The CPU oracle is itself the composite {RmsNorm ; RopeFromCache}, so an
+    // all-zero reference would make the NMSE ratio vacuous. Assert it is not.
+    double mag = 0.0;
+    for (float v : ref_lat) mag += std::fabs(static_cast<double>(v));
+    for (float v : ref_pe) mag += std::fabs(static_cast<double>(v));
+    REQUIRE(mag > 1.0);
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kFusedNormRope, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+
+      DevBuf dx(dev, q, kTokens * (kOff + kRot)), dw(dev, q, kOff),
+          dc(dev, q, kMaxPos * kRot), dlat(dev, q, kTokens * kOff),
+          dpe(dev, q, kTokens * kRot);
+      dx.Upload(x0);
+      dw.Upload(w0);
+      dc.Upload(cache);
+      // pe_out is written only for an IN-RANGE position, so pre-seed both
+      // outputs with a value the kernel must overwrite. Zeros would let a
+      // kernel that wrote nothing pass wherever the oracle happened to be small.
+      dlat.Upload(std::vector<float>(kTokens * kOff, -7.5f));
+      dpe.Upload(std::vector<float>(kTokens * kRot, -7.5f));
+      void* dpos = dev.Alloc(kTokens * sizeof(int32_t));
+      dev.Copy(q, dpos, pos.data(), kTokens * sizeof(int32_t));
+      dev.Synchronize(q);
+
+      Tensor tl = Tensor::Contiguous(dlat.ptr(), DType::kF32, d, {kTokens, kOff});
+      Tensor tp = Tensor::Contiguous(dpe.ptr(), DType::kF32, d, {kTokens, kRot});
+      Tensor tx = Tensor::Contiguous(dx.ptr(), DType::kF32, d, {kTokens, kOff + kRot});
+      Tensor tw = Tensor::Contiguous(dw.ptr(), DType::kF32, d, {kOff});
+      Tensor tpos = Tensor::Contiguous(dpos, DType::kI32, d, {kTokens});
+      Tensor tc = Tensor::Contiguous(dc.ptr(), DType::kF32, d, {kMaxPos, kRot});
+      vt::FusedNormRope(q, tl, tp, tx, tw, tpos, tc, na, ra);
+      dev.Synchronize(q);
+
+      CHECK(Nmse(ref_lat, dlat.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_pe, dpe.Download()) <= kNmseTol);
+
+      dev.Free(dpos);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
 TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
   // Fused full-attention preamble: split q|gate + (gemma) qk-RMSNorm(Dh) +
   // partial NeoX RoPE-from-cache + gate passthrough. Padded qgate/kf token

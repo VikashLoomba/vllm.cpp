@@ -482,3 +482,9 @@ run.
 - #2590 stays open on `p1/45` and `p3/45`, now with a cause and no fix: they are
   near-ties decided by an irreducible bf16 accumulation, and closing them would
   mean changing what the residual stream is stored in.
+- **What the row does NOT establish, said because the next reader will want it.**
+  This measures our two tiers against EACH OTHER. It says nothing about which of
+  them is closer to the oracle at a contested step, and it must not be quoted for
+  that: the oracle is not in any comparison here, and its own greedy decode is
+  not deterministic across its kernel paths. The declared token gate is against
+  llama.cpp and is unchanged.

@@ -275,12 +275,14 @@ take the tiers to token-exactness with each other — and it was already measure
 against the ORACLE on the CPU tier, where it did not move the divergence rate and
 made two prompts worse. Nothing here reopens it.
 
-**That size of disagreement decides any near-tie under roughly half a nat.**
-Prompt 4 is the control that makes this concrete: it carries the same 2.7%
-divergence and its two tiers emit **identical tokens at all 48 steps**. The
-divergence produces a different token only where the model's own top-1/top-2
-margin is smaller than the perturbation, which is exactly the population
-#2590 measures — every contested step has an oracle gap below 0.20.
+**That size of disagreement puts every step whose margin is under about 0.35 at
+risk**, which is the measured `max_abs` logit delta and not a round number
+chosen for the sentence. It does not decide them all: 15 of the 17 at-risk steps
+across the three prompts kept their token, because the delta lands on 248320
+logits and only sometimes on the two being compared. Prompt 4 is the control that
+makes this concrete — the same 2.7% hidden-state divergence, nine at-risk steps,
+and **identical tokens at all 48**. The contested population is exactly this one:
+every step either tier is convicted at has an oracle gap below 0.20.
 
 **So token-exactness BETWEEN our tiers is not available at bf16, and it was never
 a property this arm had.** It is a different and weaker claim than token-exactness

@@ -2098,23 +2098,30 @@ config parse and upstream's disagree about the layer partition (that would be a
   [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
 
 
-- **W8 slice 1, the host fp8_ds_mla PAGE PACKER, has landed UNREACHED**
+- **W8 slices 1, 2 and 3 have landed UNREACHED**
   ([#2455](https://github.com/mudler/vllm.cpp/issues/2455)).
-  `Fp8DsMlaPageLayout` / `MakeFp8DsMlaPageLayout` / `Fp8DsMlaStoreToken` /
-  `Fp8DsMlaLoadToken` are in `deepseek_v4_compressor.{h,cpp}` beside the existing
-  encode/decode pair, gated byte-exactly against a poison-filled block, and
-  **nothing calls them**: no op, no dispatch entry, no model edit, no header
-  publishes them. That is deliberate. They are the single host reference that
-  W8 slices 2 (`kConcatAndCacheDsMla` over a rank-2 byte page), 3 (the dequant
-  gather) and 5 (the CUDA kernels) are each a port of, so the layout is written
-  and gated once rather than three times, and a slice that landed the op first
-  would have had no reference to be byte-compared against.
+  Slice 1 is the host packer -- `Fp8DsMlaPageLayout` / `MakeFp8DsMlaPageLayout` /
+  `Fp8DsMlaStoreToken` / `Fp8DsMlaLoadToken` in `deepseek_v4_compressor.{h,cpp}`,
+  beside the existing encode/decode pair. Slices 2 and 3 are the two ops built on
+  it: `vt::ConcatAndCacheDsMla` (`OpId::kConcatAndCacheDsMla`) and
+  `vt::DequantAndGatherDsMla` (`OpId::kDequantAndGatherDsMla`), CPU arms in
+  `src/vt/cpu/cpu_cache.cpp`, gated byte-exactly against a poison-filled block in
+  `tests/vt/test_ops_ds_mla_cache.cpp`.
 
-  What is owed is the wiring, and it is `### W8 design` slices 2 through 4 in
-  this document: the op, the read, and the model bridge that picks the packed
-  store when the bound page is `kI8`/fp8_ds_mla. Until slice 4 lands,
-  `ApplyCacheDType` still refuses every `MLAAttentionSpec` on the default path
-  and the real artifact still dies there. Owned by this row, tracked under
+  **Nothing calls either op.** No model edit, no registry, no `include/vllm.h`
+  entry. That is deliberate rather than forgotten: the packer is the single host
+  reference the CUDA kernels of slice 5 are the other port of, so the layout is
+  written and gated once rather than three times, and the ops are the seam slice 4
+  routes onto. A slice that landed the model bridge first would have had nothing
+  byte-comparable to route TO.
+
+  What is owed is the wiring, and it is `### W8 design` slices 4 through 6 in
+  this document: the model bridge in `deepseek_v4.cpp` /
+  `ResolveDeepseekV4SwaPages` that picks the packed store when the bound page is
+  `kI8`/fp8_ds_mla, the CUDA arms, and only then the `ApplyCacheDType` resolution
+  question. Until slice 4 lands, `ApplyCacheDType` still refuses every
+  `MLAAttentionSpec` on the default path and the real artifact still dies there.
+  Owned by this row, tracked under
   [#2455](https://github.com/mudler/vllm.cpp/issues/2455).
 
 ## Evidence

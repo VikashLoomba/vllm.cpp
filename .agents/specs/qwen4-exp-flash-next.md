@@ -8406,6 +8406,67 @@ say so with the upstream anchors and close #2552 as answered rather than fixed.
 **Do not force a fix.** Changing a CUDA arm to agree with our CPU arm, when the
 CUDA arm is the one that mirrors the oracle, moves this model AWAY from vLLM.
 
+### Outcome
+
+**MEASURED. The selections DIFFER, and it is NOT a defect.** Full result in
+[the evidence file](../../docs/bench-evidence/qwen4exp-moe-selection-20260902.md);
+`thor:gpu0` `sm_110`, job `a5bf074b-0f1a-490d-ab51-5d561857ef9e`, one binary
+`b3d5d97c86ffa75f6de9e70e7a036f495962c39c8d76d8ed182b9a44c83beacf`, three arms,
+the released UD-IQ1_S artifact verified inside the lease.
+
+**The number that answers the row.** At `E = 512` and `top_k = 10` the router's
+top-k boundary is an **EXACT bf16 tie at 79 of 240 prefill token-slots (32.9%)**
+on the CPU control, and inside one representable bf16 step at 55.8%. At a tie
+the selection carries no information: the lowest-index tie-break decides it. The
+flip rate IS the tie rate — 75 of 240 slots flip on the `VT_GDN_CHUNKED=0` arm
+(31.3%), 78 on the production arm.
+
+**#2552's own headline number is NOT a flip, and this is the half the issue got
+wrong.** At layer 0 with the Gated DeltaNet source removed — the arm its table
+was taken on — both arms select the same experts for all five tokens. The
+`7.269e-05` residue decomposes onto the expert GEMM: `x` 2.139e-05, `logit`
+2.378e-05 (the router GEMM does not amplify), `exp` **1.421e-04** (6.6x), `shr`
+4.310e-05. The keep-quant grouped GEMM is the amplifier, and
+`cuda_quant_dot.cu:2158-2170` already says what it is — the integer core is
+bit-identical and only the per-block float scale sum is reassociated, which
+llama.cpp's own CPU/CUDA split does too.
+
+**Why it is not a defect.** vLLM routes this model on bf16 logits at 512 experts
+as well: `Qwen4ExpSparseMoeBlock` inherits Qwen3Next's plain `ReplicatedLinear`
+gate with no `params_dtype`, `moe_runner.py:897-902` runs it as a plain
+`F.linear`, and the f32 widening happens inside `topk_softmax` — exactly our
+polarity, our widening point and our lowest-index tie-break. Upstream sits on
+the same knife edge. Read at `cdefd9d499`, a FORWARD REFERENCE 1566 commits past
+the pin, which carries no `qwen4_exp` at all. **This is a source read, not a
+measurement: no vLLM process was run on this checkpoint.**
+
+**One thing to WATCH rather than fix.** vLLM owns a fp32-capable router gate,
+`GateLinear` (`gate_linear.py:18-33`), a `PluggableLayer` with three of five
+tiers emitting fp32 logits. Qwen3Next does not opt in, so it is unreachable for
+this architecture today. If upstream ever flips `qwen4_exp` onto it we mirror
+that; widening ours first would move this model AWAY from the oracle, which is
+what the stop condition above forbids.
+
+**The gate question, settled with a mechanism.** PREFILLDIV observed that token
+agreement is not monotone in numerical distance and proposed no CPU-vs-CUDA
+token gate. This says WHY: a third of the routing decisions carry zero margin,
+so the emitted sequence is a function of tie-break order rather than of
+accuracy. **No CPU-vs-CUDA token-exactness gate is well posed for `qwen4_exp`.**
+The selection-set agreement rate and the tie-rate histogram ARE well posed and
+are now measurable; a gate against vLLM stays the right target and stays OWED,
+because vLLM's GGUF support is an out-of-tree plugin and every safetensors arm
+of this model exceeds the largest fleet box.
+
+**What this run could NOT prove, and one thing it found by accident.** The
+decode half is VOID: on `origin/main` `a99b9c69a` the CUDA arm answers
+`11751 271 271 271 271 271 0 0`, not the fluent sequence PREFILLDIV recorded,
+because that wave measured a tree carrying
+[#2550](https://github.com/mudler/vllm.cpp/pull/2550)'s decode fix and #2550 has
+not landed. From step 1 the two arms run different token sequences, so the
+comparator's 336-of-336 decode flip count is a different-input artifact and is
+published only to say so. Step 0 is the only comparable phase until #2550
+merges.
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**

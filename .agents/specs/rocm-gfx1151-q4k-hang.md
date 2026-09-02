@@ -30,8 +30,9 @@ across the two columns and cannot explain the split.
 **The repair is written and the default moves with it.** It is not on `main`
 yet: it lives on `row/BACKEND-ROCM-MANAGED-ALLOC-FIX` and owes the board
 measurement recorded under `## W11 RESULT`. The maintainer took the decision
-`## The decision this row cannot make alone` was written for, and chose shape 1: `UseManagedAlloc` is narrowed by `pageable_memory_access`, so a
-part that cannot fault and recover never gets a migratable allocation. The
+`## The decision this row cannot make alone` was written for, and chose shape
+1: `UseManagedAlloc` is narrowed by `pageable_memory_access`, so a part that
+cannot fault and recover never gets a migratable allocation. The
 capability answers follow the allocator, which withdraws the CPU reference tier
 on this class of board; an op that loses its fallback refuses by name and now
 says why. Design, the reason shape 1 beat shapes 2 and 3, and the measured

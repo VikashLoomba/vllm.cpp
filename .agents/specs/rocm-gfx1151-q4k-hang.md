@@ -1126,6 +1126,35 @@ Issue [#41](https://github.com/mudler/vllm.cpp/issues/41) F6 ratified approach
 (b) with the maintainer, so narrowing it is that decision being revisited, and
 the person who took it should take it again with this measurement in hand.
 
+## Gate 2 is still owed, and the first attempt at it failed on its own instrument
+
+rc job `cb3ccb8e-f655-429d-ac14-8951ceef0c4c` was to run the `#2511` shape
+(`--max-tokens 64 --repeat 4`) and a gate-sized `--max-tokens 288` on both arms.
+It aborted in PHASE 0 with `knob STILL absent after a rc=0 rebuild`, on a run
+whose source it had visibly patched and whose rebuild returned 0.
+
+**That is the guard working, and the guard was wrong.** Its check was
+`strings -a "$SO" | grep VT_ROCM_MANAGED_ALLOC`, and `strings` is binutils,
+which this container does not guarantee. A missing `strings` prints nothing, the
+grep fails, and the check reports ABSENT identically before and after a
+perfectly good rebuild — an instrument whose failure looks exactly like a result.
+The check failed SAFE, which is the direction that costs a lease slot instead of
+producing a wrong answer: without it the job would have run
+`VT_ROCM_MANAGED_ALLOC=0` against an unpatched library, where the name is unread
+and both arms are the shipped path, and reported two identical arms as an A/B.
+
+W9's own legs are the independent evidence that the library was fine: the knob
+demonstrably changed behaviour there, 10 of 12 against 0 of 12, which a library
+without it cannot do.
+
+The rerun (`5eb06e95-f1f4-4856-8071-560c1afab9a6`, results in
+`/mnt/nas_share/rc/rocm-strix-shape/evidence8/confirm.log`) checks the binary
+with `grep -a`, which reads it directly and needs no binutils, checks the SOURCE
+separately so "the patch did not apply" cannot be confused with "the build did
+not take it", and compares the library sha across the rebuild so "changed
+nothing" cannot be confused with "cannot see". It also reports whether `strings`
+exists, so the diagnosis is in the log rather than in this paragraph.
+
 ## What the gates now say
 
 `## Gates` item 1 asked for N consecutive clean legs where the pre-fix rate

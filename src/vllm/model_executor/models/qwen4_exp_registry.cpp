@@ -384,11 +384,14 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   // so the prefill is right and every decode step feeds the model token id 0.
   // The reported ids stay plausible because they are the argmax of each step's
   // logits; what is wrong is the FEEDBACK, which is why a token gate on the
-  // prompt's first token could not see it. Nine other registries already consume
-  // this field (`qwen3_moe_registry.cpp`, `deepseek_v2_registry.cpp`,
-  // `nemotron_h_device.cpp`, `kimi_linear_device.cpp`, …) under issue #1305,
-  // which is the same defect on Qwen3-MoE; this architecture was simply never
-  // wired to it.
+  // prompt's first token could not see it. TWELVE other translation units already
+  // consume this field — `grep -rl 'input\.device_token_ids\|in\.device_token_ids'
+  // src/vllm/model_executor/models/` names them, `qwen3_moe_registry.cpp`,
+  // `deepseek_v2_registry.cpp`, `nemotron_h_device.cpp` and
+  // `kimi_linear_device.cpp` among them — under issue #1305, which is the same
+  // defect on Qwen3-MoE. This architecture was simply never wired to it. The
+  // count is COUNTED rather than remembered: an earlier draft of this comment
+  // said "nine", which is the shape a number quoted often acquires.
   //
   // IT IS MATERIALISED ON THE HOST RATHER THAN SPLICED OVER A DEVICE BUFFER, and
   // that is forced rather than chosen. `detail::ApplyDeviceTokenIds` patches an

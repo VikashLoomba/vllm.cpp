@@ -722,17 +722,18 @@ inline Exl3Weight LoadExl3(const TensorResolver& get,
   VT_CHECK(!(has_mcg && has_mul1),
            "dense loader: " + proj + " carries BOTH an mcg and a mul1 marker, which "
            "selects two codebooks at once (QUANT-EXL3, #2181)");
-  VT_CHECK(!has_mul1,
-           "dense loader: " + proj +
-               " selects exllamav3's `mul1` codebook (cb 2), upstream's dp4a "
-               "byte-sum variant, which this tree does not implement "
-               "(QUANT-EXL3, #2181). It is REFUSED rather than decoded as another "
-               "codebook, because the wrong multiplier yields a correctly "
-               "distributed and completely wrong weight.");
   if (has_mcg) {
     const StTensor& mcg = get(proj + ".mcg");
     VT_CHECK(mcg.dtype == "I32",
              "dense loader: expected I32 mcg marker for " + proj + ", got " + mcg.dtype);
+  }
+  if (has_mul1) {
+    // `quantize.py:1421-1424` writes it as
+    // `torch.tensor(0x83DCD12D, uint32).view(torch.int)` -- one I32 holding the
+    // codebook's own multiplier -- exactly as it writes `mcg`.
+    const StTensor& mul1 = get(proj + ".mul1");
+    VT_CHECK(mul1.dtype == "I32",
+             "dense loader: expected I32 mul1 marker for " + proj + ", got " + mul1.dtype);
   }
   VT_CHECK(!has(proj + ".had"),
            "dense loader: " + proj +
@@ -745,7 +746,18 @@ inline Exl3Weight LoadExl3(const TensorResolver& get,
            "dense loader: " + proj +
                " carries packed `su`/`sv` sign vectors, which this reader does not "
                "unpack (QUANT-EXL3, #2181)");
-  r.codebook = has_mcg ? 1 : 0;
+  // The three-way form of the SAME presence rule. `LinearEXL3` sets `self.mcg`
+  // and `self.mul1` from two independent tensor lookups and passes both booleans
+  // to `ext.reconstruct` (`exl3.py:74-77,197,223`); with both false the codebook
+  // is 0. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` marks every quantized linear
+  // `mul1` and is cb 2 (QUANT-EXL3-MUL1, #2495).
+  //
+  // A `mul1` marker was REFUSED here until cb 2 was ported, and the refusal was
+  // right for as long as it stood: the wrong multiplier yields a correctly
+  // distributed and completely wrong weight, which no shape check can see.
+  // Lifting it is safe now only because `Exl3DecodeCodeword(cw, 2)` implements
+  // upstream's byte-sum decode and is gated against hand-computed values.
+  r.codebook = has_mul1 ? 2 : (has_mcg ? 1 : 0);
 
   // ENG-LOAD-DIRECT-UPLOAD (#150): all three are taken VERBATIM into a
   // same-size destination, so all three qualify for the borrow path. The

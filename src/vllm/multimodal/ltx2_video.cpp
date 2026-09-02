@@ -4214,9 +4214,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // takes an OPTIONAL latent, and upstream selects between the target grid
       // and the fixed `default_number_of_tokens` = 4096 by passing one or not
       // (schedulers.py:32). Six of upstream's seven call sites pass none;
-      // `ti2vid_two_stages_hq.py:267` is the one that does. See
-      // `Ltx2PhaseScheduleTokens`, whose default is this engine's long-standing
-      // `target_tokens` and whose divergence from upstream's majority is #1150.
+      // `ti2vid_two_stages_hq.py:267` is the one that does, and vLLM-Omni cannot
+      // express the exception at all (`ltx2_denoise.py:188`). See
+      // `Ltx2PhaseScheduleTokens`. Every recipe that reaches this line names its
+      // own value, so the `target_tokens` branch below is now taken by exactly
+      // one arm — `res2s_two_stage` — rather than by all of them (#2521).
       //
       // Resolved to a CONCRETE count rather than passing 0 for "take the
       // default". `Ltx2SigmaSchedule` treats the two identically

@@ -23,7 +23,9 @@ recorded rather than one.
    while `vt::Tensor` fixes `kMaxRank = 4`. Any rank-5 shape writes past both
    fixed arrays. Give the write site the bound its sibling
    `vt::Tensor::Contiguous` (`src/vt/tensor.cpp:19-20`) has carried all along,
-   and repair every caller the bound then refuses.
+   repair every caller the bound then refuses, and free the four allocations
+   `test_glm_moe_dsa_schedule` leaks — the second half of the issue, which an
+   earlier pass of this spec wrongly concluded did not exist (`## Evidence`).
 2. **#2406** — `GgufLoadPolicy::FromEnv`
    (`src/vllm/model_executor/model_loader/gguf_keep_quant.cpp`) resolves
    `quant_repack` from a pure host-ISA probe with no device term, so an aarch64
@@ -199,7 +201,7 @@ comparison stays apples-to-apples on an i8mm host.
 ```sh
 cmake -S . -B build-san -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF \
       -DVLLM_CPP_SANITIZE='address,undefined'
-cmake --build build-san -j 2
+cmake --build build-san -j 2  # -j 6 when the box is idle
 UBSAN_OPTIONS=print_stacktrace=1 ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 \
   VT_POOL_BYPASS=1 ctest --test-dir build-san --output-on-failure
 ```
@@ -256,29 +258,70 @@ test_resident_weight_host_addressable rc=0 ubsan=0 leaks=0 assertions:  85 |  85
 The counted property is `grep -c "runtime error"`: **1 → 0**, and the process
 exit code `1 → 0`.
 
-### The "384 byte leak" is the DevicePool cache, not a leak
+### The "384 byte leak" IS a leak, and this spec said it was not
 
-#2435's second half asks for "the 4-allocation leak in the same path". There
-isn't one. Under the `sanitize-cpu` lane's own environment
-(`VT_POOL_BYPASS: "1"`, set by `.github/workflows/ci.yml`) LeakSanitizer reports
-**nothing** on any of the seven binaries above. Drop that one variable and the
-same binary reports `53696 byte(s) leaked in 114 allocation(s)`, and every stack
-is the same four frames:
+**This section previously concluded that #2435's second half did not exist. That
+conclusion was wrong, and CI refuted it.** It is kept as a correction rather than
+edited away, because the reasoning that produced it is the reusable part.
+
+What the earlier pass measured is true and was not enough. Under the lane's own
+`VT_POOL_BYPASS=1`, LeakSanitizer reports nothing on any of the fifteen binaries
+that construct a `DBuf`; drop that variable and the same binaries report
+`53696 byte(s) leaked in 114 allocation(s)`, every stack `DevicePool::Get`. That
+is genuinely the pool's deliberate retention. **The error was the inference**:
+the figure matched nothing, so the pass concluded the reported 384 bytes were the
+same artefact seen on a smaller tree — a number explained by a mechanism that
+produces a different number. The sweep it rested on was scoped to the fifteen
+`dense_device_glue.h` includers, and the leaking binary is not one of them.
+
+`sanitize-cpu (address,undefined)` on this branch's own head ran all 701 tests
+and named it:
 
 ```
-#1 AllocAligned64            src/vt/cpu/cpu_backend.cpp:20
-#2 Alloc                     src/vt/cpu/cpu_backend.cpp:42
-#3 vllm::DevicePool::Get(vt::Backend&, unsigned long)
-#4 vllm::dense_attn::DBuf::DBuf(...)
+687/701 Test #687: test_glm_moe_dsa_schedule ...***Failed
+[doctest] test cases:  12 |  12 passed | 0 failed | 0 skipped
+[doctest] assertions: 533 | 533 passed | 0 failed |
+[doctest] Status: SUCCESS!
+==39368==ERROR: LeakSanitizer: detected memory leaks
+Direct leak of 128 byte(s) ... #3 operator() tests/vllm/models/test_glm_moe_dsa_schedule.cpp:680
+Direct leak of 128 byte(s) ... #3 operator() tests/vllm/models/test_glm_moe_dsa_schedule.cpp:680
+Direct leak of  64 byte(s) ... #3 operator() tests/vllm/models/test_glm_moe_dsa_schedule.cpp:680
+Direct leak of  64 byte(s) ... #3 operator() tests/vllm/models/test_glm_moe_dsa_schedule.cpp:680
+SUMMARY: AddressSanitizer: 384 byte(s) leaked in 4 allocation(s).
 ```
 
-That is the production pool deliberately retaining its scratch blocks, which is
-exactly what the CI job's own comment says the variable exists to switch off:
-"the production DevicePool deliberately retains scratch blocks. Its detector lane
-uses exact allocations and real frees so ASan can distinguish that cache from a
-leak." The issue's 384 bytes were measured without it. **No pool change is made
-here**, and none is owed: retention is the design, and the lane already has the
-switch.
+128 + 128 + 64 + 64 = **384 bytes in 4 allocations**, #2435's figure exactly,
+under `VT_POOL_BYPASS=1`, with the pool not involved at all: the allocations go
+straight to `Backend::Alloc`.
+
+**The cause.** `TEST_CASE("The router gate GEMM at f32 reproduces the exact
+products a bf16 store loses")` declares `std::vector<void*> owned;` and pushes
+every allocation into it — it was written to free them — and never does. The same
+file's `Harness` collects into `owned_` and frees from `~Harness`; this case
+duplicated the vector and dropped the destructor.
+
+**The fix is RAII, not a trailing loop.** `RequireFinite` and the `REQUIRE`s in
+that body throw, and doctest unwinds, so a free loop at the end of the case is
+skipped on exactly the runs where a leak matters least to nobody. A scope-exit
+guard frees on both paths, matching `~Harness` twenty lines above it.
+
+**Red, then green, measured locally on this head:**
+
+```
+with the guard      rc=0  533 | 533 passed  Status: SUCCESS!   no LeakSanitizer line
+M6 (guard removed)  rc=1  533 | 533 passed  Status: SUCCESS!   384 byte(s) in 4 allocations
+restored            rc=0  533 | 533 passed  Status: SUCCESS!   no LeakSanitizer line
+```
+
+The counted property is the SUMMARY line: 384 -> 0 bytes, 4 -> 0 allocations, and
+the process exit code 1 -> 0.
+
+**Why the shape of this defect is worth keeping.** It is the same shape as #2435
+itself, one level quieter: `Status: SUCCESS!` over 533 passing assertions and a
+nonzero exit. `#2435` described precisely that combination and this spec read it
+as a description of `test_qwen4_exp_layer_loop`, which under
+`-fno-sanitize-recover=all` cannot produce it. **The issue was reporting two
+binaries, not one**, and the assertion count it quoted belonged to the other one.
 
 ### #2406 — red, then green
 
@@ -375,6 +418,7 @@ ran against a red baseline, and every build returned rc 0 before its run.
 | M3 | make `CheckRank` throw unconditionally | `test_qwen4_exp_layer_loop`, rc 0 | rc **1**: `ModelRegistry::Forward reaches it on a loaded qwen4exp GGUF` THREW the bound's own message |
 | M4 | revert the `FromEnv` wire to the old inline expression | `test_gguf_keep_quant`, rc 0 | rc **0**, 9987/9987 — **SURVIVED**, see below |
 | M5 | drop `&& dev == kCPU` from `QuantRepackForDevice` | `test_gguf_keep_quant`, rc 0 | rc **1**: the `kCUDA`, `kROCM` and `kXPU` rows read `true == false`, 7/10 assertions pass |
+| M6 | never instantiate the scope guard in `test_glm_moe_dsa_schedule` | that target, rc 0 | rc **1**: `SUMMARY: AddressSanitizer: 384 byte(s) leaked in 4 allocation(s)` over `533 passed` and `Status: SUCCESS!` — CI's exact red, reproduced locally |
 
 **M3 is the reachability evidence.** The guard is not reached only by the case
 written for it: a production entry point, `ModelRegistry::Forward`, allocates
@@ -386,6 +430,17 @@ because `vt::cpu::QuantRepackActive()` is a compile-time `false` here and makes
 `quant_repack` false under either wiring. M5 shows the RULE is gated; the WIRE
 is gated only on an aarch64 i8mm host, where the case's `VT_GGUF_KEEP_QUANT=1`
 arm becomes discriminating. This is stated in the case's own comment.
+
+**AND NO PRE-MERGE CI LANE GATES THE WIRE EITHER.** `build-test-cpu-arm64` is the
+only aarch64 job that runs on a pull request, and it builds exactly four targets
+— `test_cpu_isa_arm`, `test_ops_matmul_elem`, `test_ops_quant_dot`,
+`test_ops_quant_repack` — and runs no `ctest` at all, so it never reaches
+`GgufLoadPolicy::FromEnv`. `build-test-cpu-arm64-full` does build the suite, and
+its `if:` is `github.event_name == 'schedule' || github.event_name ==
+'workflow_dispatch'`, so it reads `skipping` on every pull request and first
+executes one scheduled cycle AFTER a merge. A green `build-test-cpu-arm64` on
+this branch therefore says nothing about #2406, and an earlier draft of this
+record inferred from the runner's architecture that it did.
 
 What stands behind the ungated wire is the pair of runtime tripwires that
 already existed — `qwen3_5.cpp`'s `VT_CHECK(!w.repacked)` at device staging and
@@ -412,8 +467,6 @@ a bounds question, and it is a different row.
 ## Owed
 
 * Raising `vt::kMaxRank`, if a production path ever needs rank 5.
-* Nothing for the "384-byte leak" half of #2435: it is the DevicePool's
-  deliberate retention read without `VT_POOL_BYPASS=1`. See `## Evidence`.
 * Dequantizing the `qwen4_exp` hyper-connection weights at load
   (`MODEL-MM-QWEN4-EXP`), with the residency and token evidence that needs.
 * The aarch64 CUDA measurement of the repack trade that #2406 asks for.

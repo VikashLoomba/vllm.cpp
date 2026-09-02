@@ -999,6 +999,50 @@ row ends with the report its `## Stop conditions` already provides for.
 That needs a rebuild of one translation unit, which `q6k.sh` already showed how
 to do inside a lease, so it is a dispatch and not a research question.
 
+## W9: the allocator A/B, and the gate result that raised its stakes
+
+**The ROCm token gate reported `TOKEN_GATE=NOT_MEASURABLE`: 12 of 12 legs
+faulted, both arms, zero harness errors, zero clean legs**, each leg about six
+prefills plus 288 decode steps against this row's single-prefill repro, with
+`HSA_ENABLE_SDMA=0` set throughout and `reference_tier_hits=0`. Two things
+follow and both sharpen what is written above.
+
+The failure COMPOUNDS with workload size rather than averaging out. The
+single-prefill rate is 9 in 10; at gate size it is 12 in 12, and the board
+cannot complete a Q4_K run of any useful length. And `HSA_ENABLE_SDMA=0`, which
+halved the rate on one prefill, does nothing at all here. Describe that flag as a
+partial mitigation of a small workload, never as a workaround.
+
+`VT_ROCM_MANAGED_ALLOC` is the arm this row named, and it is now the only thing
+between this project and any ROCm result on this board. rc job
+`6dced9e1-3c74-4363-bd9e-2a0dd8789cc9`, results in
+`/mnt/nas_share/rc/rocm-strix-shape/evidence7/managed.log`.
+
+| arm | env | allocator |
+|---|---|---|
+| `managed` | unset | `hipMallocManaged` — shipped behaviour |
+| `nomanaged` | `VT_ROCM_MANAGED_ALLOC=0` | plain `hipMalloc` |
+
+**The knob gates the ALLOCATOR ONLY.** `unified` in the registrar keeps reading
+the unknobbed capability answer, so `UnifiedMemory()`,
+`DeviceMemoryIsHostAddressable()` and everything they gate are byte-identical on
+both arms. An arm that moved those too would confound the allocator with the
+memory model, and this row has already paid once for an A/B that changed more
+than it named.
+
+Twelve rounds, alternating, with the within-round order rotating, because
+failures cluster in a job's early legs. One build serves both arms since the
+knob is read at runtime, which removes the control-contamination trap W2 paid
+for; what replaces it is the rebuild check, and it hashes `libvllm.so` and not
+the 26 KB `vllm-cli` thin client (`lib_before 41bb4052…`, `lib_after 7604aca8…`).
+
+Clean under `nomanaged` means the defect is ours, the repair is to not take the
+managed branch on a device reporting `PageableMemoryAccess = 0`, and #2511
+closes with a fix. Still faulting means the driver, and this row ends with the
+report its `## Stop conditions` already provide for. No fix lands on a short arm:
+at a baseline of 9 in 10, twelve clean legs is decisive and five is the mistake
+this row already made with `HSA_ENABLE_SDMA=0`.
+
 ## Next hypotheses, in the order they are worth testing
 
 The kernel is exonerated at its own geometry, so the remaining surface is what

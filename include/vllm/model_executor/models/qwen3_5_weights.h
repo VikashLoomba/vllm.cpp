@@ -537,7 +537,7 @@ struct Exl3Weight {
   // `Exl3Weight`, which is the same shape as reading marker ABSENCE as MCG.
   // -1 is not a codebook, so anything that forgets to set it refuses at
   // `Exl3DecodeCodeword` by name instead of decoding to plausible garbage.
-  int codebook = -1;  // 0 == 3INST, 1 == MCG; SET IT EXPLICITLY
+  int codebook = -1;  // 0 == 3INST, 1 == MCG, 2 == mul1; SET IT EXPLICITLY
 
   bool Empty() const { return trellis.Empty(); }
 

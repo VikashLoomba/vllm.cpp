@@ -236,6 +236,19 @@ this row.
   of work #2540 and #2558 describe, and each wants its own model suite green
   beside it. Filed rather than swept, and named here so the debt is visible.
 
+* [#2597](https://github.com/mudler/vllm.cpp/issues/2597). Making the trellis a
+  byte cursor widened five weight-side operands from `const uint16_t*` to
+  `const void*` (`Exl3TileCodeword`, `Exl3DecodeTile`, `Exl3ReconstructInner`,
+  `Exl3DequantLinear`, and the file-local `MoeGemm`; `HadRowBlock`'s `pre` and
+  `post` went with them). `const void*` accepts any pointer without a
+  diagnostic, so a future caller that passes the wrong array, or forgets the
+  factor of two the pointer type used to supply, compiles and decodes garbage.
+  No caller is wrong today and the suites are green, so this is a latent hazard
+  and not a defect. The repair is a one-member wrapper whose own alignment is 1,
+  never a re-typed `const uint16_t*`, and it crosses the public ABI in
+  `include/vt/ops.h`, so it wants its own row and spec rather than riding here.
+  Raised by the fresh review of #2581 as its non-blocking finding 2.
+
 ## Now
 
 `ACTIVE`.

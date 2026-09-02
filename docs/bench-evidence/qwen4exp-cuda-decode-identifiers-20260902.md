@@ -70,3 +70,42 @@ argmax.
 
 Op-level arm-against-arm gates on the same binary: `test_qwen4_exp_cuda`
 351/351, `test_qwen4_exp_cuda_reductions` 160/160.
+
+## The gate, red then green, in both places
+
+The gate runs on a CPU QUEUE, because the defect is not arithmetic and not a
+device kernel: it is which array the hook reads. It was driven red-then-green
+twice — once on a local CPU-only build and once on `thor:gpu0` inside the lease,
+at `1fa9293f106de23a3bf3aff9e2010932a07dbe1e` — with the fix made inert by
+`if (false && input.device_token_ids != nullptr)` and restored byte-for-byte.
+
+| leg | local, CPU-only build | `thor:gpu0`, sm_110 CUDA build |
+|---|---|---|
+| green | rc 0, 64 assertions, 0 failed | rc 0, 64 assertions, 0 failed |
+| mutation applied | 1 site | 1 site |
+| mutation rebuild | rc 0 | rc 0, 1 object |
+| **RED** | **rc 1**, `spliced != fresh`, `spliced == stale` byte for byte, history carries the stale id | **rc 1**, 64 assertions, **61 passed / 3 failed** |
+| restored | `git diff` empty | sha256 == before: YES |
+| green after restore | rc 0, suite 11 cases / 405 assertions | rc 0, 64 assertions |
+
+**A mutation whose build fails reads as a passing test, and a case whose name
+carries a comma reads as one too.** Both were paid for here. The first attempt at
+this gate was named "… DEVICE identifiers, not the stale host vector"; `doctest`'s
+`-tc` filter splits its argument on commas, so both legs returned
+`assertions: 0 | 0 passed | 0 failed` at rc 0 and measured nothing. The rebuild
+rc and the mutation's site count are therefore read rather than assumed, and the
+assertion count is read beside them.
+
+Whole suites at the same head on `thor:gpu0`, every rc read from the job's own
+stdout:
+
+| suite | rc | assertions |
+|---|---|---|
+| `test_qwen4_exp_layer_loop` | 0 | 523 / 523 |
+| `test_qwen4_exp_cuda` | 0 | 351 / 351 |
+| `test_qwen4_exp_cuda_reductions` | 0 | 160 / 160 |
+
+`test_qwen4_exp_layer_loop` was rc **134** on the previous run of this wave, with
+`365 | 365 passed | 0 failed` printed beside it — every assertion that RAN passed
+and the binary still aborted, on a heap overflow in this wave's own test helper.
+An assertion count is not an exit status.

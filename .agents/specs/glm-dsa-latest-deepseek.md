@@ -3595,3 +3595,94 @@ fixture agreeing with a two-line fix is not a 753.33B model generating text.
 
 **No rate is claimed here either.** Nothing in this section is a performance
 measurement, and the row still has no vLLM denominator at any revision.
+
+### 3.13 The legs ran: four tokens, the lane reused slots, and the read-key CONVICTED
+
+**Status: measured.** `dgx:gpu0` (`NVIDIA GB10`, `sm_121a`, CUDA arch `121a`,
+FA2 manifest `[121a]`), one `rc` lease, job
+`c7f4c7ea-73d1-4c00-82af-61aae5617979`, worker `rc-worker-4b8lj`, base
+`5649e07d2`, both legs from ONE binary, 2026-09-02.
+Issue [#2596](https://github.com/mudler/vllm.cpp/issues/2596).
+
+**THE GENERATED TEXT, verbatim, from the real 201.83 GiB artifact.**
+
+| leg | env | rc | wall | stdout | bytes |
+|---|---|---|---|---|---|
+| C | default | 0 | 1059 s | ` Paris The Paris Paris` | `20 50 61 72 69 73 20 54 68 65 20 50 61 72 69 73 20 50 61 72 69 73 0a` |
+| E | `VT_ASYNC_DEVICE_MIRROR=0` | 0 | 1061 s | ` Paris, which is` | `20 50 61 72 69 73 2c 20 77 68 69 63 68 20 69 73 0a` |
+
+**The read-key §3.11 registered BEFORE the run is resolved, and it CONVICTS.**
+The bytes differ on one variable, and that variable is not the streaming lane.
+`glm_moe_dsa` read `token_ids` and ignored `device_token_ids`, so every decode
+step after the first was generated from token id 0. Leg C's ` Paris The Paris
+Paris` is that symptom; leg E's ` Paris, which is` is the same model, same
+binary, same artifact, with the mirror off. **This is the behavioural half of
+§3.12's CPU conviction, on the published checkpoint**, and it is the same
+isolation that convicted `Glm5NextForConditionalGeneration` under #2544.
+
+**THE LANE WAS ON IN BOTH LEGS, AND FOR THE FIRST TIME IT REUSED SLOTS.**
+
+```text
+                    [expert-stream] ON slots=8192 slot_bytes=6684672 resident=51.00 GiB
+leg C  steps=1 hits=0    misses=6393 evictions=0   fills=6393 bytes=22026289152 exhausted=0
+       steps=2 hits=789  misses=7404 evictions=0   fills=7404 bytes=25511657472 exhausted=0
+       steps=3 hits=1791 misses=8202 evictions=10  fills=8202 bytes=28255223808 exhausted=0
+       steps=4 hits=3156 misses=8637 evictions=445 fills=8637 bytes=29729193984 exhausted=0
+leg E  steps=4 hits=2688 misses=9105 evictions=913 fills=9105 bytes=31334006784 exhausted=0
+```
+
+`steps=4` and `exhausted=0` are the two `docs/ENVIRONMENT.md` names as the test
+of a live lane, and both hold in both legs. **`hits` moved 0 -> 789 -> 1791 ->
+3156**, which is the slot reuse §3.10's one-token run could not measure and
+§3.11 was written to obtain: at 8192 slots the working set fits, nothing is
+refused to the mmap, and eviction begins only at step 3. 29.73 GB moved through
+a 51.00 GiB arena in leg C against 187.312 GiB of towers.
+
+**Peak resident: 76,092,816 kB = 72.57 GiB (leg C) and 76,442,608 kB = 72.90 GiB
+(leg E), against the pool's 119.631 GiB.** `nvidia-smi memory.used` reads 0 MiB
+on this part and is not a residency figure here; `VmHWM` tracks page-cache
+pressure while the towers are mmap-resident and is not one either (O9).
+
+**Reference-tier hits: `exhausted=0` on every line of both legs.** No slice fell
+back to reading the tower in place, which is the §3.10 run's `exhausted=2303`
+resolved by the larger budget.
+
+#### THIS WAS ALSO A PLACEMENT RUN, AND THAT IS NOT WHAT THE ROW ASKED FOR
+
+`VT_CPU_MOE` was unset and the runner asserts that rather than claiming it.
+The engine placed experts anyway, on its own `--fit`, in BOTH legs:
+
+```text
+engine: device placement INSTALLED: 33 layers run their routed experts on cpu,
+        the rest on cuda (resolved against 78 layers, origin fit)
+engine: device placement: --fit placed 33 layer(s) (89288343552 B) to bring a
+        216433205760 B footprint under a 128452960256 B budget
+```
+
+**So these numbers are a HYBRID and must be read as one.** The streaming lane is
+genuinely live — the banner, `steps=4`, the climbing `hits` and `exhausted=0`
+are its own counters, and 83.14 GiB of expert bytes moved through slots that no
+placement performs. But 33 of 78 layers ran their routed experts on the HOST
+CPU, so this is not the pure streamed configuration, and no line above may be
+quoted as one. The pure arm needs the fit suppressed, and it has not run.
+
+**#2568 is live on exactly this shape.** `quant_repack` is a per-load flag read
+off the ENGINE device, so on this aarch64 CUDA engine the 33 host-executed
+layers loaded WITHOUT the i8mm repack. That is throughput, not correctness, and
+it is another reason no rate below is publishable.
+
+**NO RATE IS CLAIMED, and `tok_s=0.005` in the logs is not one.** Leg C's tokens
+are wrong, so its timing measures a defect. Leg E's are coherent but it has no
+vLLM denominator at any revision, it ran the hybrid placement above, it is n=1,
+and its reads came off CIFS. `## Gates` binds: correctness first.
+
+#### What is still owed
+
+1. **The repair has not been driven on the artifact.** §3.12's fix landed after
+   the tarball this lease built, deliberately, so leg C carried the defect and
+   the pair stayed a discriminator. What is owed is one leg on a FIXED binary
+   proving the DEFAULT arm now emits leg E's bytes without the env var.
+2. **The pure streaming arm**, with the `--fit` placement suppressed, so the
+   lane's numbers are not entangled with 33 host layers.
+3. **A second slot budget**, since 8192 never exhausted and 4096 exhausted on a
+   third of its misses at one token: the floor between them is unmeasured.

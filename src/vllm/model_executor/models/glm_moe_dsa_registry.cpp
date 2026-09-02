@@ -31,6 +31,7 @@
 
 #include "vllm/model_executor/models/glm_moe_dsa.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIdsScope
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
@@ -97,6 +98,15 @@ ForwardLogits ForwardGlmMoeDsaForCausalLM(LoadedModel& model,
                                           const ModelForwardInput& input) {
   auto& m = ModelAs<GlmMoeDsaLoadedModel>(model, "GlmMoeDsaForCausalLM");
   const GlmMoeDsaWeights& weights = m.weights();
+  // #2596 — PUBLISH the async runner's device-resident input ids for the
+  // duration of THIS forward, which is what `ForwardBody`'s embed then takes.
+  // #2544 named this registration as one of five that never read the field; it
+  // filed that on a grep and called each entry a candidate rather than a
+  // conviction, and this is the repair for the one this row owns. RAII-scoped so
+  // it cannot outlive the call, and null on every non-async-CUDA path, which
+  // makes this byte-identical wherever the mirror is off.
+  const detail::DeviceTokenIdsScope device_ids_scope(
+      input.device_token_ids, static_cast<int64_t>(input.token_ids.size()));
   if (input.gather_logits) {
     return GlmMoeDsaModel::ForwardDevice(input.token_ids, input.positions,
                                          input.attn_meta, input.attn_kv, weights,

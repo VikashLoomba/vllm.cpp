@@ -50,6 +50,7 @@
 
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/unaligned.h"
 
 namespace vt {
 namespace {
@@ -60,9 +61,22 @@ constexpr int kHadDim = 128;
 
 // The tile's uint32 view (exl3_dq.cuh:25-26 `ptr[...]`), assembled by hand so
 // the trellis may sit at any alignment inside a safetensors mmap.
-inline uint32_t TileWord32(const uint16_t* tile, int index) {
-  return static_cast<uint32_t>(tile[2 * index]) |
-         (static_cast<uint32_t>(tile[2 * index + 1]) << 16);
+//
+// THE COMMENT ABOVE WAS THE CONTRACT AND THE CODE DID NOT KEEP IT. Assembling
+// the uint32 from two halves removes the 4-byte requirement and leaves the
+// 2-byte one, and `tile[2 * index]` still indexes a `const uint16_t*`. A
+// safetensors payload starts at `8 + <JSON header length>`
+// (`safetensors_reader.cpp:78`), a header length is arbitrary, and
+// `vt::Exl3Gemm` types the trellis as kI8 — opaque BYTES, alignment
+// requirement 1 — so an odd base is not an exotic case here but the expected
+// one. `-fsanitize=alignment` aborted `test_qwen35_exl3` on it (#2558). The
+// cursor is therefore a byte cursor and both halves come through
+// `vt::LoadUnaligned`, which at `-O2` is the same load the raw index compiled
+// to. See `.agents/specs/unaligned-safetensors-consumers.md`.
+inline uint32_t TileWord32(const void* tile, int index) {
+  const auto* bytes = static_cast<const unsigned char*>(tile) + index * 4;
+  return static_cast<uint32_t>(LoadUnaligned<uint16_t>(bytes)) |
+         (static_cast<uint32_t>(LoadUnaligned<uint16_t>(bytes + 2)) << 16);
 }
 
 inline float RoundHalf(float v) { return F16ToF32(F32ToF16(v)); }
@@ -89,7 +103,7 @@ void Fwht128(float* base, int64_t stride, int64_t lanes) {
 
 }  // namespace
 
-uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t) {
+uint16_t Exl3TileCodeword(const void* tile, int bits, int t) {
   // exl3_dq.cuh:18-29, verbatim. `+ 256*bits` is upstream's way of keeping the
   // tail-biting wrap non-negative; the `% (bits*256/32)` on the word index is
   // the wrap itself.
@@ -179,7 +193,7 @@ int Exl3TileRowMajorIndex(int t) {
   return r * 16 + c;
 }
 
-void Exl3DecodeTile(const uint16_t* tile, int bits, int codebook, float* out256) {
+void Exl3DecodeTile(const void* tile, int bits, int codebook, float* out256) {
   VT_CHECK(bits >= 1 && bits <= 8,
            "exl3: bits must be in [1, 8]; got " + std::to_string(bits));
   for (int t = 0; t < 256; ++t) {
@@ -188,7 +202,7 @@ void Exl3DecodeTile(const uint16_t* tile, int bits, int codebook, float* out256)
   }
 }
 
-void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits, int codebook,
+void Exl3ReconstructInner(const void* trellis, int64_t k, int64_t n, int bits, int codebook,
                           float* out) {
   VT_CHECK(bits >= 1 && bits <= 8,
            "exl3: bits must be in [1, 8]; got " + std::to_string(bits));
@@ -197,11 +211,14 @@ void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bit
            "tile is 16x16); got k=" + std::to_string(k) + " n=" + std::to_string(n));
   const int64_t tiles_k = k / 16;
   const int64_t tiles_n = n / 16;
-  const int64_t tile_words = 16 * bits;
+  // BYTES, not words: `16 * bits` counts int16 words, so the cursor carries the
+  // `sizeof(uint16_t)` the `const uint16_t*` used to supply (#2558).
+  const int64_t tile_bytes = 16 * static_cast<int64_t>(bits) * static_cast<int64_t>(sizeof(uint16_t));
+  const auto* tw = static_cast<const unsigned char*>(trellis);
   float tile_out[256];
   for (int64_t i = 0; i < tiles_k; ++i) {
     for (int64_t j = 0; j < tiles_n; ++j) {
-      Exl3DecodeTile(trellis + (i * tiles_n + j) * tile_words, bits, codebook, tile_out);
+      Exl3DecodeTile(tw + (i * tiles_n + j) * tile_bytes, bits, codebook, tile_out);
       for (int r = 0; r < 16; ++r) {
         std::memcpy(out + (i * 16 + r) * n + j * 16, tile_out + r * 16,
                     16 * sizeof(float));
@@ -210,8 +227,8 @@ void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bit
   }
 }
 
-void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
-                       const uint16_t* svh, int64_t k, int64_t n, int bits, int codebook,
+void Exl3DequantLinear(const void* trellis, const void* suh,
+                       const void* svh, int64_t k, int64_t n, int bits, int codebook,
                        float* out) {
   VT_CHECK(k % kHadDim == 0 && n % kHadDim == 0,
            "exl3: both features must be multiples of 128 (each side was "
@@ -257,7 +274,7 @@ void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
 
   // w *= suh[:, None] (exl3.py:233) — an fp16 multiply.
   for (int64_t i = 0; i < k; ++i) {
-    const float s = F16ToF32(suh[i]);
+    const float s = F16ToF32(LoadUnaligned<uint16_t>(static_cast<const unsigned char*>(suh) + i * 2));
     float* row = out + i * n;
     for (int64_t j = 0; j < n; ++j) row[j] = RoundHalf(row[j] * s);
   }
@@ -277,7 +294,9 @@ void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
   // w *= svh[None, :] (exl3.py:235).
   for (int64_t i = 0; i < k; ++i) {
     float* row = out + i * n;
-    for (int64_t j = 0; j < n; ++j) row[j] = RoundHalf(row[j] * F16ToF32(svh[j]));
+    for (int64_t j = 0; j < n; ++j)
+      row[j] = RoundHalf(
+          row[j] * F16ToF32(LoadUnaligned<uint16_t>(static_cast<const unsigned char*>(svh) + j * 2)));
   }
 }
 

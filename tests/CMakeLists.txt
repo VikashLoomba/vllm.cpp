@@ -1239,6 +1239,24 @@ target_compile_definitions(test_dots3_note_attn PRIVATE
 # Same model-private-header arrangement as the scaffold gate above.
 target_include_directories(test_dots3_note_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# dots3-note W6a (#2512, spec §4.11): the DENSE VISION TOWER against an
+# INDEPENDENT double-precision reference written from vLLM `nvidia/vision.py` +
+# `nvidia/vision_attention.py` at `9035151d6`, plus the config traps, the
+# refuse-by-name table, the 235-tensor enumeration and the image processor.
+#
+# A CONSISTENCY gate and not a correctness one, and the file says so in its own
+# header: spec §6.4 option B records that NO oracle for this model runs on any
+# hardware this project owns, so nothing here is compared against vLLM and no
+# performance number is claimable. CPU-only, no checkpoint download, no GPU.
+vllm_cpp_add_test(test_dots3_note_vision vllm/models/test_dots3_note_vision.cpp)
+target_compile_definitions(test_dots3_note_vision PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+# Same model-private-header arrangement as the two gates above: dots3_note.h and
+# dots3_note_vision.h live under src/, because W1 ships nothing on the public ABI
+# and include/vllm/ is a USER_USAGE_PREFIXES surface (#515).
+target_include_directories(test_dots3_note_vision PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 # Nemotron-H (NemotronHForCausalLM) W3 STRUCTURAL gate (#517,
 # .agents/specs/nemotron-h-model.md §4 W3): registry-resolve + config descent off
 # the REAL released config.json (52-entry layers_block_type schedule, the legacy
@@ -1437,6 +1455,35 @@ set_tests_properties(test_qwen27_paged_forward_act_f32 PROPERTIES
   ENVIRONMENT "VT_ACT_F32=1"
   FAIL_REGULAR_EXPRESSION "assertions:[ ]*0[ |]"
   PASS_REGULAR_EXPRESSION "Status: SUCCESS!")
+# #2590. THE REACHABILITY GATE for the activation dump, and it is a gate rather
+# than an observation because the hermetic writer suite
+# (`test_act_dump`) drives the writer DIRECTLY and therefore proves the class
+# works, never that anything reaches it -- the exact shape `AGENTS.md` "Nothing
+# lands dead" names.
+#
+# This entry runs the SAME paged-forward binary with the dump pointed at a real
+# directory, so the dump is exercised through `DenseForwardLayers`, the
+# production dense forward. It passes only on a line the instrument prints when
+# it has actually written a RESIDUAL-STREAM blob: `stream_blobs=` followed by a
+# non-zero count. Deleting the `ActDumpStream` call site therefore reds THIS
+# entry while leaving the plain binary green, which is what makes it measure a
+# capability.
+#
+# `blobs_this_step` would NOT do, and a mutation proved it rather than an
+# argument: the GDN stage probes fire off the same environment variable, so the
+# total stayed non-zero with both stream call sites deleted and a gate keyed on
+# it reported success over a forward that dumped no hidden state at all.
+#
+# The directory is created at CONFIGURE time on purpose. The writer refuses a
+# missing directory by design (#2590), so a `mkdir` folded into the test command
+# would be testing the shell rather than the instrument.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/act_dump_2590)
+add_test(NAME test_qwen27_paged_forward_act_dump
+  COMMAND test_qwen27_paged_forward)
+set_tests_properties(test_qwen27_paged_forward_act_dump PROPERTIES
+  ENVIRONMENT "VT_DUMP_ACT=${CMAKE_CURRENT_BINARY_DIR}/act_dump_2590"
+  FAIL_REGULAR_EXPRESSION "assertions:[ ]*0[ |];Status: FAILURE"
+  PASS_REGULAR_EXPRESSION "stream_blobs=[1-9]")
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
 vllm_cpp_add_test(test_pretokenizer vllm/test_pretokenizer.cpp)
 # Metaspace split=true + Metaspace decoder (Parakeet tokenizer shape) —
@@ -1757,6 +1804,10 @@ vllm_cpp_add_test(test_placement_dump_dtype
   vllm/model_executor/test_placement_dump_dtype.cpp)
 target_include_directories(test_placement_dump_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+vllm_cpp_add_test(test_act_dump
+  vllm/model_executor/test_act_dump.cpp)
+target_include_directories(test_act_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_moe_fit_resolver
   vllm/model_executor/test_moe_fit_resolver.cpp)
 target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1779,12 +1830,12 @@ vllm_cpp_add_test(test_cli_offload_config
 if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_cli_offload_config
     PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+endif()
 vllm_cpp_add_test(test_cli_kv_cache_dtype
   vllm/entrypoints/test_cli_kv_cache_dtype.cpp)
 if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_cli_kv_cache_dtype
     PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
-endif()
 endif()
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
@@ -2268,6 +2319,20 @@ if(VLLM_CPP_SERVER)
   # fixture (one whose added tokens are the vision markers).
   vllm_cpp_add_test(test_openai_api_server_mm_forward
     vllm/entrypoints/openai/test_api_server_mm_forward.cpp)
+  # dots3-note W6a (#2512): the SERVED image request for the SECOND multimodal
+  # architecture, end to end through the same production chain. Its own target
+  # for the same reason the Qwen3-VL one has one: a different model (a registry
+  # LoadedModel carrying a dots3-note DENSE vision tower, loaded from a
+  # synthetic on-disk checkpoint) and a different tokenizer fixture (one whose
+  # added tokens are dots3-note's own image markers).
+  vllm_cpp_add_test(test_openai_api_server_dots3_mm_forward
+    vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp)
+  target_compile_definitions(test_openai_api_server_dots3_mm_forward PRIVATE
+    DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+  # The tiny-checkpoint fixture header lives beside the model gates, and
+  # dots3_note.h is a MODEL-PRIVATE header under src/ (#515).
+  target_include_directories(test_openai_api_server_dots3_mm_forward PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
   # #1982: WHEN the first chat SSE frame reaches the client. Its own target so
   # the gated-runner fixture cannot perturb the keepalive suite's timings, and
   # inside this guard because it drives the production ApiServer dispatch,
@@ -2961,6 +3026,13 @@ vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 # (spec moe-router-topk-single-warp.md §9, #378). Same include pattern as
 # test_moe_router_warp_map above, which executes that pin without a GPU.
 target_include_directories(test_ops_moe_grouped PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Wave TIEBREAK (#2586): whether the CUDA top-k REALISES the lowest-index
+# tie-break it declares, at E=512 k=10 -- the geometry qwen4_exp routes, which
+# MoeRouterWarpValuesPerThread excludes from the warp kernel and which no other
+# case executes. Reaches the same src/ selector header through the shared pin
+# tests/vt/moe_router_warp_env.h, so it needs the same src/ include path.
+vllm_cpp_add_test(test_moe_router_tie_stability vt/test_moe_router_tie_stability.cpp)
+target_include_directories(test_moe_router_tie_stability PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)

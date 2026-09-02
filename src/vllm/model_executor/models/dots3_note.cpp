@@ -585,8 +585,16 @@ const std::vector<Dots3NoteDeferredTower>& Dots3NoteDeferredTowers() {
   // revision 1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b: each tower ships whole
   // in one standalone file rather than across the 131 numbered language shards.
   static const std::vector<Dots3NoteDeferredTower> kTowers{
-      {"vision_encoder.", "model-vision.safetensors", "W6",
-       "the MoE ViT vision tower (nvidia/vision.py, nvidia/vision_moe.py)"},
+      // W6a LANDED the DENSE half of this tower (#2512), so what is DEFERRED
+      // here is the PYRAMID half and the brick moved with it: `W6` -> `W6b`.
+      // The prefix did not move, and neither did the count. This row fires only
+      // when `Dots3NoteVisionRefusal` refused the tower — which for the
+      // RELEASED checkpoint it does, at block 25 — and in that case all 2195
+      // `vision_encoder.*` names land here exactly as they did before, because
+      // a tower that is not loaded is not partly loaded.
+      {"vision_encoder.", "model-vision.safetensors", "W6b",
+       "the PYRAMID MoE half of the ViT vision tower (nvidia/vision.py's "
+       "MoESwiGLUFFN, nvidia/vision_moe.py); W6a ships the DENSE blocks"},
       {"audio_encoder.", "model-audio.safetensors", "W7",
        "the `dots` Whisper-variant audio tower (nvidia/audio_encoder.py)"},
   };
@@ -742,6 +750,25 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
   if (Dots3NoteDeviceRefusal(w.params).empty()) {
     w.device = MaterializeDots3NoteDevice(shards, w.params);
     w.materialized = w.device.present;
+  }
+
+  // W6a (#2512): the VISION tower, on the same polarity and for the same
+  // reason. `Dots3NoteVisionRefusal` is empty only for a tower whose every
+  // block is DENSE and whose adapter is `patch_merger`; for the RELEASED
+  // `dots-studio/dots3-note-prev` it is NOT, because 17 of its 42 vision blocks
+  // are pyramid MoE, so nothing below runs and its 2195 `vision_encoder.*`
+  // tensors stay in the accounting's `vision` deferral bucket exactly as they
+  // did before this brick. Every W2 count assertion is therefore unchanged.
+  //
+  // THE MESSAGE IS KEPT, not just the boolean. The encoder hook reports it
+  // verbatim, so an operator who sends an image to a checkpoint whose tower is
+  // owed is told WHICH block is routed and WHICH brick owes it, rather than
+  // that a tower is missing.
+  w.vision_params = ParseDots3NoteVisionParams(config);
+  w.vision_refusal = Dots3NoteVisionRefusal(w.vision_params, w.params.quant_method,
+                                            w.params.weight_block_size);
+  if (w.vision_refusal.empty()) {
+    w.vision = MaterializeDots3NoteVision(shards, w.vision_params);
   }
   return w;
 }

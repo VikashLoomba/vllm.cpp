@@ -1194,7 +1194,7 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
 // TWO KINDS live here, and conflating them overstated what this port refuses:
 //
 //   REACHABLE REFUSAL — a product path constructs the condition and throws, so a
-//   caller CAN trip it. `kSpatiotemporalUpsampler` (ltx2_upsampler.cpp:465) is
+//   caller CAN trip it. `kSpatiotemporalUpsampler` (ltx2_upsampler.cpp:497) is
 //   the ONE. `ltx2_video.cpp` reaches it through `Ltx2UpsampleVideoLatent` when a
 //   phase asks for the spatial-upsample transform. The TEMPORAL-ONLY x2
 //   upsampler is NOT among them: it is ported (`2e9d95e74`, spec

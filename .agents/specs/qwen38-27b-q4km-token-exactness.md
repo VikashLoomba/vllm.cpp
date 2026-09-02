@@ -418,7 +418,11 @@ Unchanged from
 
 **The near-tie band is not available and is not reached for.** It is admitted
 only where the oracle's greedy decode is non-deterministic; this oracle
-reproduced #857 byte for byte from a different build.
+reproduced #857 byte for byte from a different build. The ratified near-tie
+DISTRIBUTIONAL gate was scored against this arm anyway, so that the refusal above
+rests on a measurement rather than only on a precondition;
+[`qwen38-27b-q4km-neartie-band-adjudication.md`](qwen38-27b-q4km-neartie-band-adjudication.md)
+carries the rule and the result.
 
 ## Evidence required
 

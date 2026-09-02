@@ -1688,6 +1688,22 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
            "width untouched), so a checkpoint that also doubles the spatial axes would return "
            "a latent no tile range can index.");
     }
+    // THE THIRD SIBLING, and it belongs beside the other two rather than in the
+    // rounds loop. `Ltx2LatentUpsample` refuses dims=2 with temporal_upsample —
+    // it is a contradiction upstream cannot run — but that refusal fires at the
+    // first round, which is reached only after two full denoise stages. This
+    // block exists so a caller who supplied the wrong file learns at LOAD, which
+    // is the reason its own comment above gives, and it checked both flags here
+    // without checking `dims`, so this one checkpoint cleared both siblings and
+    // failed minutes in anyway.
+    if (im.temporal_upsampler_cfg.dims == 2) {
+      Fail("the checkpoint at '" + std::string(kLtx2TemporalUpsamplerPathExtra) +
+           "' declares dims=2 with temporal_upsample=true, which upstream cannot run: "
+           "model/upsampler/model.py:68-71 builds the temporal upsampler as a Conv3d, and the "
+           "dims=2 forward (:85-100) folds the frame axis into the batch before reaching it, so "
+           "it is handed a 4-D tensor. The frame axis is gone by then, which is why no 2-D arm "
+           "can upsample it.");
+    }
     im.temporal_upsampler_weights = Ltx2LoadVaeWeights(f);
     im.has_temporal_upsampler = true;
   }
@@ -3636,7 +3652,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // supplied a genuine SPATIOTEMPORAL checkpoint that they had handed over the
       // temporal one — wrong on both counts, and pointing them at the arm they
       // already had. It also shadowed the ledger refusal at
-      // `ltx2_upsampler.cpp:465`, which names the spatiotemporal arm and was
+      // `ltx2_upsampler.cpp:497`, which names the spatiotemporal arm and was
       // therefore unreachable from any request. Narrowed here so a both-flags
       // config falls THROUGH to that refusal. Gated by test_ltx2_video's
       // "a SPATIOTEMPORAL upsampler checkpoint is refused as SPATIOTEMPORAL".

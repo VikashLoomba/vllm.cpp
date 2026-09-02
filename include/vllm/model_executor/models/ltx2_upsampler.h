@@ -19,19 +19,28 @@
 //   Ltx2RationalForScale        <-  spatial_rational_resampler.py:10-14
 //   Ltx2UpsampleVideoLatent     <-  model.py:129-143 (upsample_video)
 //
-// ─── WHAT THE TEMPORAL ARM IS REACHABLE FROM ─────────────────────────────────
-// NOTHING, today, and that is stated here rather than only in the spec because a
-// header is what the next reader opens. It is ported and gated against executed
-// upstream at reduced dimensions, and `Ltx2ParseUpsamplerConfig`
-// (ltx2_loader.cpp:1431-1444) reads `temporal_upsample` off a checkpoint. But the
-// engine's ONE upsampler call site is the `kSpatialUpsample` phase input
-// transform (multimodal/ltx2_video.cpp:1408-1466), which shape-checks the result
-// against a SPATIALLY doubled latent and fails otherwise; and upstream's only
-// consumer is `DFRPipeline`'s rounds loop (ltx-pipelines/dfr_pipeline.py:235-245,
-// 402-407), which is not ported. The shipped temporal checkpoint
+// ─── WHAT EACH ARM IS REACHABLE FROM ─────────────────────────────────────────
+// Stated here rather than only in the spec because a header is what the next
+// reader opens. `Ltx2UpsampleVideoLatent` has THREE product call sites, all in
+// multimodal/ltx2_video.cpp, and each one pins the frame axis:
+//
+//   :3521  the video latent, the `kSpatialUpsample` phase input transform.
+//          Requires `up.frames == vshape.frames` at :3525-3531.
+//   :3548  the generated keyframe slots, which take the SAME spatial upsampler
+//          (dfr_pipeline.py:348). Requires `slot_positions.size()` at :3552-3563.
+//   :5058  DFR's temporal-refinement rounds, the TEMPORAL arm. Reached through
+//          the `temporal_upsample_rounds` load extra, and instrumented by
+//          `trace.temporal_upsample_calls` (multimodal/ltx2_video.h:741).
+//
+// This paragraph said "NOTHING, today" of the temporal arm and "the engine's ONE
+// upsampler call site" of the spatial one. Both were false by the time they were
+// read: site :5058 drives the temporal arm and is not a phase input transform at
+// all. Corrected under issue #2580; the count is what the dims=2 port's
+// reachability argument rests on, so it is derived here rather than remembered.
+// The shipped temporal checkpoint
 // (`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors`,
-// ltx-pipelines/docs/pipelines.md:176) is not on the NAS either, so no
-// real-weight result exists.
+// ltx-pipelines/docs/pipelines.md:176) is not on the NAS, so no real-weight
+// result exists for that arm.
 //
 // ─── WHAT SEPARATES THIS FROM THE VAE'S CONVOLUTIONS ─────────────────────────
 // These are plain `torch.nn.Conv3d`/`Conv2d` with `padding=1` — ZERO padding on
@@ -55,13 +64,46 @@
 //  * The temporal arm DROPS THE FIRST FRAME after the shuffle (model.py:109-113),
 //    so `f` frames in produce `2f - 1` out and not `2f`.
 //
+// ─── THE dims=2 ARM (model.py:47, :85-100) ───────────────────────────────────
+// PORTED. `conv = torch.nn.Conv2d if dims == 2 else torch.nn.Conv3d` (:47)
+// reaches four parameter groups — `initial_conv`, both ResBlock stacks and
+// `final_conv` — so each is a 4-D kernel where the 3-D arms build a 5-D one. The
+// `upsampler` branch (:55-72) never reads `dims` and keeps its rank.
+//
+// The forward folds the frame axis into the BATCH (:86) and unfolds at :100,
+// which has one consequence a shape check cannot see: GroupNorm normalises PER
+// FRAME. This port reproduces the fold by running one frame at a time, so the
+// existing reduction over `frames * height * width` gives the per-frame
+// statistic without a second normaliser. Gated by "reproduces upstream on the
+// dims=2 arm" (test_ltx2_pipeline) against the executed module, and reached
+// end-to-end by "a dims=2 upsampler checkpoint RENDERS" (test_ltx2_video).
+//
+// Any `dims` that is not 2 builds Conv3d, which is upstream's own `else` at :47
+// and is mirrored rather than narrowed to a refusal upstream does not raise.
+//
 // ─── NOT PORTED, refused by name ─────────────────────────────────────────────
 //  * `spatial_upsample AND temporal_upsample` (model.py:55-59) — a DIFFERENT
 //    operator from the temporal-only arm: `Conv3d(mid, 8*mid)` + PixelShuffleND(3).
-//    Asking for it throws.
-//  * `dims == 2` (model.py:85-100) — a checkpoint that sets it wants Conv2d
-//    everywhere, i.e. no temporal convolution at all. LTX-2.5's upsampler is
-//    dims=3; the 2-D arm is refused rather than approximated by the 3-D one.
+//    Asking for it throws. Its operator is small; what keeps it out is that it
+//    returns `[c, 2f-1, 2h, 2w]` and BOTH spatial call sites above require the
+//    frame count back unchanged. Owed, with the measurement, in
+//    .agents/specs/ltx25-upsampler-arms.md.
+//  * `dims == 2` WITH `temporal_upsample` — not an arm but a contradiction:
+//    upstream builds that upsampler as a Conv3d (:68-71) and the 2-D forward
+//    hands it a 4-D tensor. It raises on the CHANNEL COUNT and not on the rank:
+//    `Conv3d` reads a 4-D input as an unbatched 5-D one, so at 3 frames against
+//    `mid_channels` 32 it reports "to have 32 channels, but got 3". At
+//    `frames == mid_channels` the conv passes and `PixelShuffleND(1)` fails
+//    instead. Two mechanisms, one contradiction — refused by name once.
+//  * `dims == 2` WITH `rational_resampler` — the sibling, and the dangerous one:
+//    every operator in that branch is per-frame, so this port would compute a
+//    finite, plausible latent no shape check could fault. Upstream raises
+//    `not enough values to unpack (expected 5, got 4)` at
+//    spatial_rational_resampler.py:41. Refused by name.
+//
+//    Both are EXECUTED against the real module by
+//    scripts/gen-ltx2-pipeline-goldens.py, which asserts each raises and what it
+//    says, so neither refusal can drift into one upstream would serve.
 //
 // ─── DTYPE ───────────────────────────────────────────────────────────────────
 // f32, because this is the CPU REFERENCE arm and the gate compares the ALGORITHM

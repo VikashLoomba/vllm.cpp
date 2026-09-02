@@ -166,6 +166,59 @@ repack state and batch size -- and not only its revision. Adding that pin is a
 tightening of the gate's definition, not a widening of its tolerance; the
 tolerance stays exact.
 
+## All six contested gaps lie INSIDE the oracle's own noise floor
+
+Same job. `R1` (repack on) and `R3` (repack off) walked the IDENTICAL token
+sequence -- `R3` was teacher-forced along `R1`'s own ids -- so the full logit
+vectors are comparable at every step rather than describing diverged contexts.
+71,516,160 logits compared elementwise by `cmp_logits.c`.
+
+The repack is a byte PERMUTATION of the same quantized values
+(`make_block_q4_Kx8`, `repack.cpp:2836-2870`: it copies the eight deltas and
+mins and interleaves the quants), so the dequantized weights are identical on
+both sides and the ONLY thing that differs is the order and granularity of the
+fp32 arithmetic.
+
+```text
+GLOBAL max_abs=1.365718e+00 rms=7.886647e-02 n=71516160 argmax_flips=1
+```
+
+| per step, over 288 steps | min | median | max |
+|---|---:|---:|---:|
+| max abs logit delta | **0.2020** | 0.3790 | 1.3657 |
+| rms logit delta | 0.0412 | 0.0729 | 0.1856 |
+
+The six gaps the 2026-08-23 gate convicted us on were 0.027185, 0.058050,
+0.085434, 0.115482, 0.124247 and 0.178236. **Every one of them is smaller than
+the MINIMUM per-step perturbation the oracle inflicts on itself**, and five of
+the six are below its MEDIAN rms. There is no outlier artefact: the minimum over
+all 288 steps already exceeds the largest contested gap.
+
+### What this settles, and what it does not
+
+**Settled: a decision at these margins is not a property of llama.cpp.** It is a
+property of which of ggml's four Q4_K rounding schedules executed. The oracle
+cannot resolve a 0.03-to-0.18-logit distinction, because it disagrees with itself
+by more. A gate that demands 6-of-6 agreement at that scale is asking for
+bit-reproduction of one specific aarch64 repacked gemv, not for arithmetic
+quality, and `b10451` scores 5 of 6 against itself when asked.
+
+**Not settled, and still ours: the RATE.** A perturbation of this exact size
+flips 1 of 6 prompts. Ours flips 5 of 6. If our error were the same size as the
+oracle's own, we would flip at about its rate. We do not, so we carry an
+ADDITIONAL term that is materially larger, and that term is ours to remove. This
+is the quantitative case for Term A rather than an assertion of it: bf16 is
+1.95e-3 relative per store against the kernel term's 1e-05, applied roughly eight
+times per layer across 64 layers, plus a recurrent GDN state re-rounded every
+token and a bf16 KV cache against the oracle's f16.
+
+So the target this row can honestly aim at is **the noise floor, not zero**:
+remove Term A and the arm should approach 1 of 6, which is where an engine that
+does not bit-reproduce the oracle's kernel schedule sits. Reaching 0 of 6
+additionally requires porting `arch/arm/repack.cpp`'s `ggml_gemv_q4_K_8x8_q8_K`,
+which is the `## Owed` item and is architecture-specific by construction -- it
+would not transfer to the gfx1151 arm the standing goal names.
+
 ## Scope
 
 1. Measure whether the oracle's own greedy decode is stable across its own

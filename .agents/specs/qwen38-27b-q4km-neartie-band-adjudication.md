@@ -237,15 +237,180 @@ sessions that took the 2026-09-02 measurements.
 This spec does not overturn any of them. It scores the ratified gate because the
 brief asked what that gate says, and §5 reports what it says.
 
-## 5. The score is not in this commit
+## 5. The score
 
-Sections 5 and 6 are added by the NEXT commit on this branch, so that Git order
-records the rule as fixed before the document read a number back. §3 states what
-that ordering does and does not prove. Sections 9, 12 and 15 name §5 and §6
-already; they describe the finished document, and this commit is the half that
-must exist first.
+Read under the rule of §3, on data already committed. No new job ran, and none
+could change the verdict: the ratified gate's inputs are the oracle's
+teacher-forced rank and gap at every step, and both are recorded.
 
-## 6. Limb 2 and the bigger-model strict limb
+Per §8 this establishes what the gate says, not that the gate applies here.
+
+### 5.1 What the committed evidence supplies
+
+The gate needs, per position, the gap between the oracle's teacher-forced argmax
+logprob and our token's logprob. The evidence documents record the rank of our
+token at every step and the gap at every step where that rank is 2. Rank 1 means
+our token IS the argmax, so the gap is 0 and the position does not increment
+`n_divergent`. Every rank-2 step has a strictly positive recorded gap and
+increments it.
+
+### 5.2 CPU tier, aarch64, stock default path
+
+Source:
+[`../../docs/bench-evidence/qwen38-27b-q4km-oracle-self-consistency-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-oracle-self-consistency-20260902.md)
+R4, teacher-forced along the 2026-08-23 ids. Denominator: stock default,
+`use_extra_bufts` 1, `n_ubatch` 512, flash attention resolved `ENABLED`,
+`n_threads` 14, aarch64, `rc` job `deb6322d-bd06-4dd1-a5ac-2dec9987fbe1` on
+`thor:gpu0`.
+
+288 steps. Our token at rank 1 on 282, rank 2 on 6, nothing worse anywhere.
+
+| step | our token | oracle argmax | gap, nats | is our token the argmax | counts into |
+|---|---:|---:|---:|---|---|
+| p0/7 | 9338 | 9564 | 0.058050 | no | `n_divergent` |
+| p1/34 | 198 | 3095 | 0.085434 | no | `n_divergent` |
+| p1/35 | - | - | 0.124247 | no | `n_divergent` |
+| p2/20 | 13 | 539 | 0.178236 | no | `n_divergent` |
+| p4/14 | 4593 | 22486 | 0.115482 | no | `n_divergent` |
+| p5/32 | 15 | 16 | 0.027185 | no | `n_divergent` |
+| the other 282 steps | ours is the argmax | same | 0.000000 | yes | nothing |
+
+```text
+n_divergent          = 6      (required: 0)
+over_band_failures   = 0      (required: 0)
+worst_gap_nats       = 0.178236   (required: <= 0.5)
+result               = PASS       (band-only field; required: PASS)
+```
+
+**`DIST_GATE=FAIL` on the binding limb.** Three conjuncts of four hold. The one
+that decides does not. This is the pre-registered outcome **O2**.
+
+**This table describes the arm BEFORE #2534.** The 2026-08-23 ids are the 5 of 6
+result; after #2534 the CPU tier diverges at 3 of 6, at `p1/34`, `p2/20` and
+`p4/14`, a strict subset of the six rows above. No teacher-forced rank array for
+the post-#2534 ids is committed, so this document does not state one. The
+post-#2534 `n_divergent` at the adjudicated steps is the same three positive
+gaps, and this is an inference with a reason rather than a measurement: a first
+divergence at step k means every step before k matched the oracle, so the
+teacher-forced prefix at those three steps did not move and the gap at each is
+the same number. `n_divergent` after #2534 is therefore at least 3, and 3 is not
+0. The verdict does not change.
+
+### 5.3 ROCm tier, gfx1151, HIP oracle
+
+Source:
+[`../../docs/bench-evidence/qwen38-27b-q4km-rocm-gfx1151-token-gate-v2-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-rocm-gfx1151-token-gate-v2-20260902.md).
+Denominator recorded there: `ORACLE_N_GPU_LAYERS` 99, `ORACLE_USE_EXTRA_BUFTS` 1,
+the x86-64 AVX512 `system_info` line, `rc` job
+`85e4091e-1042-4225-9a92-6797449fddf9` on `strix:gpu0`.
+
+288 steps. Our token at rank 1 on 285, rank 2 on 3, nothing worse anywhere.
+
+| step | our token | oracle argmax | gap, nats | is our token the argmax |
+|---|---:|---:|---:|---|
+| p1/45 | 303 | 1521 | 0.131054 | no |
+| p3/45 | 25 | 393 | 0.006284 | no |
+| p5/32 | 16 | 15 | 0.053452 | no |
+| the other 285 steps | ours is the argmax | same | 0.000000 | yes |
+
+```text
+n_divergent          = 3      (required: 0)
+over_band_failures   = 0      (required: 0)
+worst_gap_nats       = 0.131054   (required: <= 0.5)
+result               = PASS       (band-only field; required: PASS)
+```
+
+**`DIST_GATE=FAIL` on the binding limb.** Outcome **O2** again.
+
+The two tiers fail on disjoint steps, which is outcome **O6**: the results are
+reported per tier and neither is the arm's result.
+
+### 5.4 Limb 2, the strict prefix
+
+The ratified limb requires the prefix to be token-exact "up to the first genuine
+bf16 exact tie". The Voxtral precedent's prefix ends at a position where the two
+logprobs are bit-identical, `gap 0.000`.
+
+Not one of this arm's first divergences is an exact tie. The smallest is
+`0.006284` nats and the largest is `0.178236`, all strictly positive, so at every
+one of them the oracle's logits DO separate our token from its argmax and prefer
+the other one.
+
+**`LIMB2=FAIL`.** The prefixes are long -- 48 of 48 on three prompts per tier,
+and 14 to 45 on the others -- but length is not the criterion. The criterion is
+where the prefix ends, and it ends at a separated position on every divergent
+prompt.
+
+### 5.5 The bigger-model strict limb
+
+`LIMB_BIGGER=NO_VEHICLE`, for the four disqualifications in §7.
+
+### 5.6 The counts the brief asked for, both readings
+
+| reading | CPU tier | ROCm tier | is this the gate's conjunct |
+|---|---:|---:|---|
+| our token is not the oracle's teacher-forced argmax (`n_divergent`) | **6** of 288 | **3** of 288 | **yes** |
+| our token is absent from the oracle's top-K | 0 of 288 | 0 of 288 | no |
+
+The second row is zero and it is uninformative. Our token is never worse than
+rank 2 anywhere, so a top-K membership test has no discriminating population on
+this arm and would return zero for a correct engine and for this one alike.
+
+**A third reading exists and it is the trap.** Take the "observed set" to be the
+tokens the oracle's supported CONFIGURATIONS emit -- the option B the path-pin
+evidence declined. The path-pin table gives per-path agreement at the 5
+comparable near-tie steps: `ub1_tf` agrees at `p0/7`, `p4/14` and `p5/32`;
+`norepack_ub1_tf` at `p1/34`, `p2/20` and `p5/32`; `norepack_tf` at `p0/7`,
+`p1/34` and `p5/32`. The union over those three covers all five steps, so the
+count of non-members is 0. No single path reaches better than 3 of 5, against the
+5 of 5 a token-exact path would need. Membership appears only because the
+denominator was widened until our token entered it. That is outcome **O5**: not
+scoreable, and not a pass.
+
+### 5.7 The verdict
+
+```text
+DIST_GATE       = FAIL   (n_divergent = 6 CPU / 3 ROCm; required 0)
+  result             PASS   ok
+  over_band_failures 0      ok
+  worst_gap_nats     0.178236 CPU / 0.131054 ROCm   ok
+  n_divergent        6 CPU / 3 ROCm                 FAILS
+LIMB2_STRICT_PREFIX = FAIL   (no first divergence is an exact tie)
+LIMB_BIGGER         = NO_VEHICLE
+TOKEN_GATE          = FAIL   (unchanged)
+```
+
+**The ratified distributional gate does not rescue this arm.** It agrees with the
+declared token gate, and it does so on a stricter reading of the same data.
+
+## 6. Why the band alone would have said the opposite
+
+The band conjunct passes on both tiers: worst gap 0.178236 and 0.131054 against
+0.500, and zero over-band positions. An instrument that reported only the band
+would have returned PASS on an arm the ratified gate fails, and that is the whole
+reason §12.2 carries `n_divergent == 0` as a separate conjunct.
+
+Two independent measurements in the tree say the band is the wrong instrument
+here, and they were both taken before this spec.
+
+**The rate.** The oracle pin records it: "Being inside the oracle's noise band per
+divergence is not the same as being at its noise floor by rate." The oracle's own
+perturbation flips 1 of 6 prompts. This arm flips 3 of 6 after #2534 and flipped
+5 of 6 before it.
+
+**An oracle-free control.** The ROCm token gate resolved each contested step to
+what all four sides emit. At `p1/45`, `p3/45` and `p4/14` our own ROCm and CPU
+tiers emit different tokens from an identical prefix on an identical artifact,
+with no oracle in the comparison. The ROCm evidence calls it "a ROCm-local
+numerics term" and "the first measurement of it". The convicted tier's gap at
+those steps is 0.131054, 0.006284 and 0.115482 nats, all deep inside the band. So
+the band would pass a defect this tree has already measured, while
+`n_divergent == 0` catches it.
+
+That is also the answer to §2.5's kernel-independence clause read the other way:
+our two tiers do not agree, so no single verdict is kernel-independent here.
+
+## 7. Limb 2 and the bigger-model strict limb
 
 The 2026-07-20 methodology that introduced the near-tie doctrine carries a
 further requirement, recorded in the developer's ratification note as item 3:
@@ -300,7 +465,7 @@ no vLLM oracle for a GGUF target" and applies its band to a CPU-against-GPU delt
 inside our own engine, and `tests/vllm/models/test_deepseek_v4_gguf_load.cpp`
 compares our keep-quant forward against our own dequantizing build.
 
-## 7. Ratification is the maintainer's, not this spec's
+## 8. Ratification is the maintainer's, not this spec's
 
 Whether the ratified distributional gate may be applied to this arm at all is a
 product decision. The path-pin evidence already escalated it under #2534 and
@@ -310,12 +475,12 @@ recorded that it "is not the implementer's to take".
 gate applies here.** Nothing in §5 may be quoted as a ratified result for this
 arm, in either direction, without that decision.
 
-## 8. Design
+## 9. Design
 
 No code. §3 is the part with future value: the rule is fixed, so a later
 ratification does not get to choose a rule after seeing a number.
 
-## 9. Risks
+## 10. Risks
 
 - **§5 gets quoted without its conjunct structure.** A band figure read alone
   reverses the verdict. §3.3 O2 exists for this, and §5 states the four conjuncts
@@ -323,39 +488,39 @@ ratification does not get to choose a rule after seeing a number.
 - **The two counts of §3.4 get conflated.** They differ, and only one is the
   gate's.
 
-## 10. Tests
+## 11. Tests
 
 None. No product code changed and no gate changed. Every figure in §5 names the
 committed document it came from.
 
-## 11. Gates
+## 12. Gates
 
 `TOKEN_GATE` is unchanged and stays `FAIL`. This spec adds no gate and relaxes
 none.
 
-## 12. Evidence
+## 13. Evidence
 
 The gate's terms are quoted from `multimodal-speed.md` §12.2,
 `scripts/mm/a3_voxtral_neartie_gate.py` and
 `tests/vllm/multimodal/test_voxtral_e2e.cpp`. Every figure in §5 is transcribed
 from a committed evidence document named beside it.
 
-## 13. Stop conditions
+## 14. Stop conditions
 
 - Do not widen, weaken or delete the declared token gate.
 - Do not report a band result as the distributional gate's verdict.
 - Do not add a second configuration to the denominator.
 
-## 14. Now
+## 15. Now
 
 `QUANT-QWEN38-27B-GGUF-ARM` does not change lifecycle state. `TOKEN_GATE` stays
 `FAIL`.
 
-## 15. Owed
+## 16. Owed
 
 - The ratification decision under
   [#2534](https://github.com/mudler/vllm.cpp/issues/2534). §5 adds an input to it.
-- The unpinned oracle behind the APEX GGUF gate, found by §6's search.
+- The unpinned oracle behind the APEX GGUF gate, found by §7's search.
   `AGENTS.md` requires every oracle to be pinned and that one names a
   developer-local fork branch with no recorded commit. Reported here rather than
   fixed, because it belongs to the rows that gate on it.

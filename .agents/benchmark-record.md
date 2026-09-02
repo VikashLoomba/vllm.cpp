@@ -29352,3 +29352,48 @@ Not retested here: the captured opt-in arm (multi-request capture hang,
 [#1625](https://github.com/mudler/vllm.cpp/issues/1625)) and TT async
 readback ([#1627](https://github.com/mudler/vllm.cpp/issues/1627)), both
 unchanged.
+
+## TT CAPTURED DECODE TOKEN-CLEAN AT THREE SIZES: after the #2461 slab repair and the #2469 stale-cur_pos repair, captured replay beats both eager arms everywhere measured — 0.6B 27.47, 4B 13.84, Mistral-7B 14.23 tok/s, and the Mistral-7B capture legs are token-identical to eager (2026-09-01, `row/BACKEND-TENSTORRENT-HOST-FREE-FORWARD` @ `081efabc7`, P150, [#2566](https://github.com/mudler/vllm.cpp/issues/2566))
+
+The R5-era captured-arm ratios (27.1 tok/s and the 2026-09-01 machinery
+figures) predate the two correctness repairs, so they measured the replay
+machinery on corrupted capture-leg output. This entry records the
+token-clean re-measurement at three model sizes on one binary at the
+repaired head, one `$HOME/gpu.lock` hold per batch, `tt-smi -r 0` first,
+order-alternated triples, `--repeat 5` with run 1 discarded per leg, warm
+medians, fresh process per leg.
+
+| model | default (host-free eager) | opt-out (`VT_TT_HOST_FREE_DECODE=0`) | captured (`VT_TT_DECODE_CAPTURE=1`) | captured vs default | captured vs opt-out |
+|---|---|---|---|---|---|
+| Qwen3-0.6B (`hf-gate3.sh`, 3 triples) | 12.90 | 17.80 | **27.47** | 2.13x | 1.54x |
+| Qwen3-4B (`hf-abc4b.sh`, 2 triples) | 9.25 | 8.89 | **13.84** | 1.50x | 1.56x |
+| Mistral-7B-v0.3 (`hf-mist-abc.sh`, 2 triples, `--max-tokens 64`) | 11.51 | 5.93 | **14.23** | 1.24x | 2.40x |
+
+Every leg: replays 474 (0.6B/4B) / 314 (Mistral), 0 fatals, rc 0. The
+capture legs are coherent at all three sizes; at Mistral-7B the capture
+arm's output text is TOKEN-IDENTICAL to the default arm's in both triples
+(`grep -E '^The robot'` diff over the leg outputs), and the A-vs-B text
+divergence is the known eager-kernel near-tie situation, adjudicated
+elsewhere by the row's ≤0.5-nat band.
+
+What this decides: captured replay's superiority over both eager arms is a
+capability verdict at every measured size, not only a machinery
+measurement — the CORRECTNESS CAVEAT on the R5-era and machinery-only
+figures is superseded. What it does not decide: the capture-default flip
+(#1625's captured multi-request hang and the #2469-residual near-tie cell
+still gate it, both recorded in the row spec's `## Owed`), and the
+default-vs-opt-out inversion mechanism, which the successful-path
+attribution narrows but does not close.
+
+### Reproduce
+
+```sh
+# 0.6B (3 triples): $HOME/hf-gate3.sh
+# 4B (2 triples):   $HOME/hf-abc4b.sh
+# Mistral (2 triples): $HOME/hf-mist-abc.sh
+# each: flock $HOME/gpu.lock inside; tt-smi -r 0 first;
+# VT_TT_DECODE_CAPTURE=1 / unset / VT_TT_HOST_FREE_DECODE=0 arms;
+# --max-tokens 80 (0.6B/4B) / 64 (Mistral); --repeat 5, discard run 1
+# model snapshots under $HOME/.cache/huggingface/hub (Qwen3-0.6B,
+# Qwen3-4B, Mistral-7B-v0.3); raw leg logs hf-{mist,}t{1,2}{A,B,C}.{out,err}
+```

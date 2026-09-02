@@ -19,7 +19,7 @@
 #include "vt/fp8_kv.h"
 #include "vt/rocm/rocm_arch.h"
 
-#include <array>
+#include <atomic>
 #include <cstdlib>
 #include <mutex>
 #include <vector>
@@ -1405,16 +1405,18 @@ __global__ void PagedAttnPrefillWmmaWave(__hip_bfloat16* out, const __hip_bfloat
 //   K/V streamed in BN tiles into smem once per tile; online softmax in regs.
 //   No score matrix, no multi-wave mma. Grid=(ceil(total_q/BM), num_kv_heads[, z]).
 //   blockIdx.z tiles large GQA groups (global qg=8 → z=4 with QG=2).
-template <int QG, int EPL, int BM, int BN>
-__global__ void PagedAttnPrefillSharedK(__hip_bfloat16* out, const __hip_bfloat16* query,
-                                        const __hip_bfloat16* k_cache, const __hip_bfloat16* v_cache,
+template <int QG, int EPL, int BM, int BN, typename TKV = __hip_bfloat16,
+          typename TQ = __hip_bfloat16, typename TO = __hip_bfloat16>
+__global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
+                                        const TKV* k_cache, const TKV* v_cache,
                                         const int32_t* block_table, const int32_t* seq_lens,
                                         const int32_t* query_start_loc, int64_t num_reqs, int64_t hq,
                                         int64_t num_kv_heads, int64_t d, int64_t block_size,
                                         int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
                                         int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
                                         float scale, float softcap, bool causal, int window_left,
-                                        int window_right) {
+                                        int window_right, float k_scale = 1.0f,
+                                        float v_scale = 1.0f) {
   static_assert(BM >= 1 && BM <= 32, "BM warps");
   static_assert(BN <= 64, "BN smem/regs");
   constexpr int kEpl = EPL;
@@ -1485,8 +1487,12 @@ __global__ void PagedAttnPrefillSharedK(__hip_bfloat16* out, const __hip_bfloat1
     }
     if (jmax > seqlen - 1) jmax = seqlen - 1;
 #pragma unroll
-    for (int hh = 0; hh < QG; ++hh)
-      LoadRowEplBf16<kEpl>(query, (t * hq + (h0 + hh)) * d, lane, q_reg[hh]);
+    for (int hh = 0; hh < QG; ++hh) {
+      if constexpr (std::is_same_v<TQ, __hip_bfloat16>)
+        LoadRowEplBf16<kEpl>(query, (t * hq + (h0 + hh)) * d, lane, q_reg[hh]);
+      else
+        LoadRowEplF32<kEpl>(query, (t * hq + (h0 + hh)) * d, lane, q_reg[hh]);
+    }
   }
 
   __shared__ int64_t s_jmin, s_jmax;
@@ -1523,28 +1529,68 @@ __global__ void PagedAttnPrefillSharedK(__hip_bfloat16* out, const __hip_bfloat1
       s_off[kk] = j % block_size;
     }
     __syncthreads();
-    // Prefetch K and V tiles together (vectorized uint4 = 8 bf16 when d%8==0).
-    if ((static_cast<int>(d) & 7) == 0) {
-      const int d8 = static_cast<int>(d) >> 3;
-      const int nvec = n_k * d8;
-      for (int e = tid; e < nvec; e += bdx) {
-        const int kk = e / d8;
-        const int v = e - kk * d8;
-        const int dd = v << 3;
-        const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
-        const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
-        const size_t dst = (static_cast<size_t>(kk) * static_cast<size_t>(d) + dd) >> 3;
-        reinterpret_cast<uint4*>(k_sm)[dst] = *reinterpret_cast<const uint4*>(k_cache + bo);
-        reinterpret_cast<uint4*>(v_sm)[dst] = *reinterpret_cast<const uint4*>(v_cache + vo);
+    // Prefetch K and V tiles together. For bf16, vectorized uint4 = 8 bf16
+    // when d%8==0. For fp8 (uint8_t), dequantize each byte to bf16 with
+    // F8E4M3ToF32Dev * scale, then store to the same bf16 smem tile.
+    if constexpr (std::is_same_v<TKV, __hip_bfloat16>) {
+      if ((static_cast<int>(d) & 7) == 0) {
+        const int d8 = static_cast<int>(d) >> 3;
+        const int nvec = n_k * d8;
+        for (int e = tid; e < nvec; e += bdx) {
+          const int kk = e / d8;
+          const int v = e - kk * d8;
+          const int dd = v << 3;
+          const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
+          const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+          const size_t dst = (static_cast<size_t>(kk) * static_cast<size_t>(d) + dd) >> 3;
+          reinterpret_cast<uint4*>(k_sm)[dst] = *reinterpret_cast<const uint4*>(k_cache + bo);
+          reinterpret_cast<uint4*>(v_sm)[dst] = *reinterpret_cast<const uint4*>(v_cache + vo);
+        }
+      } else {
+        for (int e = tid; e < n_k * static_cast<int>(d); e += bdx) {
+          const int kk = e / static_cast<int>(d);
+          const int dd = e - kk * static_cast<int>(d);
+          const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
+          const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+          k_sm[static_cast<size_t>(kk) * d + dd] = k_cache[bo];
+          v_sm[static_cast<size_t>(kk) * d + dd] = v_cache[vo];
+        }
       }
     } else {
-      for (int e = tid; e < n_k * static_cast<int>(d); e += bdx) {
-        const int kk = e / static_cast<int>(d);
-        const int dd = e - kk * static_cast<int>(d);
-        const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
-        const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
-        k_sm[static_cast<size_t>(kk) * d + dd] = k_cache[bo];
-        v_sm[static_cast<size_t>(kk) * d + dd] = v_cache[vo];
+      // fp8: load uint8_t, dequant to bf16 with scale, store to smem.
+      // Vectorized uint4 load = 16 fp8 elements per thread.
+      if ((static_cast<int>(d) & 15) == 0) {
+        const int d16 = static_cast<int>(d) >> 4;
+        const int nvec = n_k * d16;
+        for (int e = tid; e < nvec; e += bdx) {
+          const int kk = e / d16;
+          const int v = e - kk * d16;
+          const int dd = v << 4;
+          const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
+          const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+          const uint4 kw = *reinterpret_cast<const uint4*>(k_cache + bo);
+          const uint4 vw = *reinterpret_cast<const uint4*>(v_cache + vo);
+          const uint8_t* kb = reinterpret_cast<const uint8_t*>(&kw);
+          const uint8_t* vb = reinterpret_cast<const uint8_t*>(&vw);
+          __hip_bfloat16* kdst = k_sm + static_cast<size_t>(kk) * d + dd;
+          __hip_bfloat16* vdst = v_sm + static_cast<size_t>(kk) * d + dd;
+  #pragma unroll
+          for (int i = 0; i < 16; ++i) {
+            kdst[i] = __float2bfloat16(F8E4M3ToF32Dev(kb[i]) * k_scale);
+            vdst[i] = __float2bfloat16(F8E4M3ToF32Dev(vb[i]) * v_scale);
+          }
+        }
+      } else {
+        for (int e = tid; e < n_k * static_cast<int>(d); e += bdx) {
+          const int kk = e / static_cast<int>(d);
+          const int dd = e - kk * static_cast<int>(d);
+          const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
+          const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+          k_sm[static_cast<size_t>(kk) * d + dd] =
+              __float2bfloat16(F8E4M3ToF32Dev(k_cache[bo]) * k_scale);
+          v_sm[static_cast<size_t>(kk) * d + dd] =
+              __float2bfloat16(F8E4M3ToF32Dev(v_cache[vo]) * v_scale);
+        }
       }
     }
     __syncthreads();
@@ -1588,7 +1634,10 @@ __global__ void PagedAttnPrefillSharedK(__hip_bfloat16* out, const __hip_bfloat1
       float acc[kEpl];
 #pragma unroll
       for (int i = 0; i < kEpl; ++i) acc[i] = o_reg[hh][i] * inv;
-      StoreRowEplBf16<kEpl>(out, (t * hq + (h0 + hh)) * d, lane, acc);
+      if constexpr (std::is_same_v<TO, __hip_bfloat16>)
+        StoreRowEplBf16<kEpl>(out, (t * hq + (h0 + hh)) * d, lane, acc);
+      else
+        StoreRowEplF32<kEpl>(out, (t * hq + (h0 + hh)) * d, lane, acc);
     }
   }
 }
@@ -1928,6 +1977,16 @@ __global__ void PagedAttnPrefillSharedKWmma(__hip_bfloat16* out, const __hip_bfl
 }
 
 }  // namespace
+
+// Test-visible dispatch counter: incremented each time the fp8 SharedK prefill
+// fast path fires. Lets test_rocm_fp8_kv_cache G7 prove the dispatch was
+// reached, not just that the output is correct — both SharedK and the
+// PagedAttnOnline fallback use online softmax, so output comparison alone
+// cannot distinguish them.
+std::atomic<int>& Fp8PrefillSharedKDispatchCount() {
+  static std::atomic<int> count{0};
+  return count;
+}
 
 void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
                               const Tensor& v_cache, const Tensor& block_table,
@@ -2308,6 +2367,46 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
         window_right, args.k_scale, args.v_scale);
   };
 
+  // fp8 KV-cache prefill fast path: SharedK kernel with fp8 dequant at load
+  // time. Handles f32-query + fp8-KV (Qwen3.5-4B: hq=16, kv=4, QG=4, d=256).
+  // QG=2 kernel tiles QG=4 via z=2. Replaces PagedAttnOnline O(n²) walk.
+  const bool fp8_prefill_fast =
+      args.kv_cache_dtype != Fp8KVCacheDataType::kAuto &&
+      k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8 &&
+      query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
+      d == 256 && total_q >= 64 && num_reqs == 1;
+  if (fp8_prefill_fast) {
+    const int64_t qg = hq / num_kv_heads;
+    if (qg == 2 || qg == 4 || qg == 8) {
+      static const bool prefill_sharedk = [] {
+        const char* e = std::getenv("VT_ATTN_PREFILL_FLASH_SHAREDK");
+        if (!e) return true;
+        return e[0] != '0';
+      }();
+      if (prefill_sharedk) {
+        Fp8PrefillSharedKDispatchCount().fetch_add(1, std::memory_order_relaxed);
+        constexpr int QG = 2;
+        constexpr int EPL = 8;   // d=256
+        constexpr int BM = 32, BN = 32;  // K+V 32KB LDS — matches bf16 d=256 path
+        const unsigned z_groups = static_cast<unsigned>(qg / QG);
+        const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
+        dim3 grid(tiles, static_cast<unsigned>(num_kv_heads), z_groups);
+        dim3 block(static_cast<unsigned>(BM * 32));
+        const size_t smem = sizeof(__hip_bfloat16) * 2u * BN * d;
+        PagedAttnPrefillSharedK<QG, EPL, BM, BN, uint8_t, float, float>
+            <<<grid, block, smem, st>>>(
+                out.Ptr<float>(), query.Ptr<float>(),
+                k_cache.Ptr<uint8_t>(), v_cache.Ptr<uint8_t>(),
+                block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d,
+                block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk,
+                vc_pg, vc_hd, args.scale, args.logits_soft_cap, args.causal,
+                window_left, window_right, args.k_scale, args.v_scale);
+        Check(hipGetLastError(), "paged_attention fp8 prefill_sharedk launch");
+        return;
+      }
+    }
+  }
   // fp8 KV-cache read: cache pages are uint8_t (DType::kI8), dequantized
   // inside LoadKv. Only the correctness-grade PagedAttnOnline kernel serves
   // fp8 — the decode-opt bf16 path stages __hip_bfloat16 fragments and a

@@ -1779,12 +1779,12 @@ vllm_cpp_add_test(test_cli_offload_config
 if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_cli_offload_config
     PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+endif()
 vllm_cpp_add_test(test_cli_kv_cache_dtype
   vllm/entrypoints/test_cli_kv_cache_dtype.cpp)
 if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_cli_kv_cache_dtype
     PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
-endif()
 endif()
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
@@ -3673,6 +3673,21 @@ target_include_directories(test_qwen4_exp_forward PRIVATE ${CMAKE_SOURCE_DIR}/sr
 # the src/ grant.
 vllm_cpp_add_test(test_qwen4_exp_moe vllm/models/test_qwen4_exp_moe.cpp)
 target_include_directories(test_qwen4_exp_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MOEDIV (#2552): the selected-expert-id tap. `MoeSelFpCalls()` is another
+# read-once static, so the default run above can only ever observe the switch
+# UNSET -- where the tap case asserts the tap is INERT. Re-run the SAME binary
+# with it set: that is the arm which gates the printed ids, the bf16-ulp margin
+# and the set-equality hash against `MoeReference`.
+#
+# DELIBERATELY UNFILTERED. A `-tc=` pattern that matches nothing exits 0 having
+# run nothing, and doctest reports that as `assertions: 0 ... SUCCESS!` -- a
+# skip wearing a pass, which this row has already paid for. Running the whole
+# binary cannot fail that way, and it buys a second property for free: every
+# value case in the suite re-runs with the tap ON, so a tap that perturbed the
+# block's own output would red them.
+add_test(NAME test_qwen4_exp_moe_sel_fp COMMAND test_qwen4_exp_moe)
+set_tests_properties(test_qwen4_exp_moe_sel_fp PROPERTIES
+  ENVIRONMENT "VT_MOE_SEL_FP=4096")
 
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit

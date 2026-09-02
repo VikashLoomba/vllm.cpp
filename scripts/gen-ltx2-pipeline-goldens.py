@@ -1168,6 +1168,120 @@ def section_upsampler(out) -> None:
     emit_manifest(out, "kLtx2UpsTemporalParam", tmanifest)
     emit_f32(out, "kLtx2UpsTemporalGolden", tresult.numpy())
 
+    # ---- the dims=2 arm (model.py:47, 85-100) -----------------------------
+    #
+    # `conv = torch.nn.Conv2d if dims == 2 else torch.nn.Conv3d` (:47) reaches
+    # FOUR parameter groups — `initial_conv` (:49), both ResBlock stacks (:53,
+    # :76-78, via res_block.py:21) and `final_conv` (:80) — so every one of them
+    # is a 4-D kernel here where the dims=3 arms above build a 5-D one. The
+    # manifest is what gates that on the C++ side; a port that reused the 3-D
+    # enumeration fills different values and fails on the golden as well.
+    #
+    # The forward folds the frame axis into the BATCH (`rearrange(latent,
+    # "b c f h w -> (b f) c h w"`, :86) and unfolds at :100. That fold is not
+    # cosmetic: it makes every frame its own GroupNorm sample, so the statistics
+    # run over (channels_per_group, H, W) rather than over the whole clip. With
+    # `_UPS_MID = 32` and GroupNorm(32, ...) there is ONE channel per group, so
+    # the per-frame and per-clip statistics genuinely differ and this golden
+    # separates them. A port that kept the 3-D reduction returns a correctly
+    # shaped, finite, plausible latent that is wrong in every element.
+    #
+    # `_UPS_TEMPORAL_F = 3` frames, so the frame axis differs from H (4) and W
+    # (6) and a fold that lost or transposed it cannot pass by coincidence.
+    emit_scalar(out, "kLtx2UpsDims2Frames", _UPS_TEMPORAL_F)
+    d2count = _UPS_IN * _UPS_TEMPORAL_F * _UPS_H * _UPS_W
+    d2latent = torch.from_numpy(make("ltx2.ups.dims2.latent", d2count, 1.0)).reshape(
+        1, _UPS_IN, _UPS_TEMPORAL_F, _UPS_H, _UPS_W
+    )
+    emit_f32(out, "kLtx2UpsDims2Latent", d2latent.numpy())
+
+    dims2 = LatentUpsampler(
+        in_channels=_UPS_IN,
+        mid_channels=_UPS_MID,
+        num_blocks_per_stage=_UPS_BLOCKS,
+        dims=2,
+        spatial_upsample=True,
+        temporal_upsample=False,
+        spatial_scale=2.0,
+        rational_resampler=False,
+    )
+    dims2.eval()
+    d2manifest = fill_module(dims2, "ltx2.ups.Dims2.")
+    d2result = dims2(d2latent)
+    emit_i64(out, "kLtx2UpsDims2OutShape", list(d2result.shape))
+    emit_manifest(out, "kLtx2UpsDims2Param", d2manifest)
+    emit_f32(out, "kLtx2UpsDims2Golden", d2result.numpy())
+
+    # THE TWO CONTRADICTIONS the dims=2 arm cannot reach, asserted against the
+    # EXECUTED module and deliberately emitting nothing. These are FAILURE cases,
+    # so what the two `Require`s in ltx2_upsampler.cpp are gated by is the
+    # exception upstream raises, not a value — and running them here is what stops
+    # either refusal from drifting into one upstream would happily serve, which is
+    # the polarity AGENTS.md names as this port inventing a refusal.
+    #
+    # Both are the same event: the dims=2 forward folds the frame axis into the
+    # batch (model.py:86) and hands `self.upsampler` a 4-D tensor at :94, while
+    # both of these modules were built for a 5-D one. The MESSAGES are asserted
+    # because they differ, and because the obvious reading of the temporal one is
+    # wrong — torch does not raise on the rank there. `Conv3d` accepts a 4-D input
+    # as an UNBATCHED 5-D one, so `(b f, c, h, w)` is read as `(C, D, H, W)` and
+    # the CHANNEL count is what fails. With `_UPS_MID = 32` and 3 frames those two
+    # differ, which is the only reason the check fires at all.
+    for tag, flags, want in (
+        (
+            "temporal",
+            dict(spatial_upsample=False, temporal_upsample=True, rational_resampler=False),
+            "channels, but got",
+        ),
+        (
+            "rational",
+            dict(spatial_upsample=True, temporal_upsample=False, rational_resampler=True),
+            "not enough values to unpack",
+        ),
+        # THE CELL WHERE BOTH CONTRADICTIONS ARE SET, and the reason the C++ side
+        # checks them in the order it does. `__init__` is an if/elif chain: with
+        # `spatial_upsample` False, `elif temporal_upsample` (model.py:68) builds
+        # the Conv3d and NEVER reads `rational_resampler`, so this config owns no
+        # SpatialRationalResampler and cannot fail by its unpack. It fails by the
+        # temporal mechanism, and this case is what says so with the module rather
+        # than with reasoning about it. `ltx2_upsampler.cpp` therefore checks the
+        # temporal contradiction FIRST; swapping the two gives this cell an
+        # explanation naming a module upstream did not construct.
+        #
+        # Measured, not asserted: replacing the expected substring below with the
+        # rational one makes the generator raise and quote what upstream really
+        # said -- "expected input[1, 3, 32, 4, 6] to have 32 channels, but got 3".
+        (
+            "temporal-and-rational",
+            dict(spatial_upsample=False, temporal_upsample=True, rational_resampler=True),
+            "channels, but got",
+        ),
+    ):
+        contradiction = LatentUpsampler(
+            in_channels=_UPS_IN,
+            mid_channels=_UPS_MID,
+            num_blocks_per_stage=_UPS_BLOCKS,
+            dims=2,
+            spatial_scale=2.0,
+            **flags,
+        )
+        contradiction.eval()
+        fill_module(contradiction, f"ltx2.ups.Dims2{tag}.")
+        try:
+            contradiction(d2latent)
+        except Exception as exc:  # noqa: BLE001 — the raise IS the assertion
+            if want not in str(exc):
+                raise AssertionError(
+                    f"dims=2 + {tag} raised {str(exc)!r}, which does not carry {want!r}. "
+                    "ltx2_upsampler.cpp names that mechanism in its refusal, so either "
+                    "the pin moved or the comment is wrong"
+                ) from exc
+        else:
+            raise AssertionError(
+                f"dims=2 + {tag} RAN on upstream at this pin. ltx2_upsampler.cpp refuses "
+                "it, and a refusal upstream does not raise is this port's invention"
+            )
+
     # The spatial+temporal arm stays REFUSED (model.py:55-59: `8 * mid_channels`
     # and `PixelShuffleND(3)`, a different operator). Its parameter shape is
     # emitted anyway so the C++ refusal is gated against what upstream would

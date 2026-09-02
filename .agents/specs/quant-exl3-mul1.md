@@ -1,7 +1,9 @@
 # QUANT-EXL3-MUL1 — the `mul1` codebook and the bit widths a 3.5bpw EXL3 artifact actually ships
 
 Row: `QUANT-EXL3-MUL1`
-Issues: [#2495](https://github.com/mudler/vllm.cpp/issues/2495) (primary)
+Issues: [#2495](https://github.com/mudler/vllm.cpp/issues/2495) (primary),
+[#2574](https://github.com/mudler/vllm.cpp/issues/2574) (slice F, the recount
+and the `(3, 2)` arm)
 Base SHA: `11fed3ba5`
 Parent row: [`QUANT-EXL3`](quant-exl3-shared.md)
 Matrix: [`.agents/quantization-matrix.md`](../quantization-matrix.md)
@@ -16,7 +18,9 @@ supplies the trellis format and its kernels only.
 
 `ACTIVE`. Slices A and B have landed: the host decoder implements codebook 2 and
 the loader accepts a `mul1` marker. Slices C, D and E are described below with
-what each one still owes.
+what each one still owes. **Slice F is the recount** (#2574): slice D was
+specified against a tensor census that omitted 137 modules, so `(3, 2)` was
+never instantiated and the checkpoint could not run on CUDA at all.
 
 ## The gap
 
@@ -26,9 +30,11 @@ independent by-name refusals stand in the way:
 1. **The `mul1` codebook (cb 2).** Every quantized linear in that checkpoint
    ships a `.mul1` marker. `dense_weight_loaders.h` refused it by name and
    `cuda_exl3.cu`'s `decode_3inst_2` `static_assert`ed it out.
-2. **Bit widths 4 and 5.** 270 of the checkpoint's quantized tensors are 4 bpw,
-   one is 5 and one is 6. The device arm instantiated `(3,0)`, `(3,1)` and
-   `(6,0)` only.
+2. **Bit widths 3, 4 and 5, at codebook 2.** The device arm instantiated
+   `(3,0)`, `(3,1)` and `(6,0)` only. The census slice D worked from --- "270
+   tensors at 4 bpw, one at 5, one at 6" --- was an UNDERCOUNT, and the
+   corrected one is in slice F below: **409** trellis modules, **137** of them
+   at bits 3.
 
 Neither refusal was wrong. Decoding cb 2 as cb 0 or cb 1 is the failure this
 family's records already document at length: the wrong multiplier yields a
@@ -73,9 +79,9 @@ Three facts make that port exact rather than approximate, and each is asserted:
 ## Scope
 
 IN: the codebook-2 decode on the host and on the device; the loader's resolution
-of a `mul1` marker; the `(bits, codebook)` arms `(4,2)`, `(5,2)` and `(6,2)` on
-the device; the `dq_dispatch` routes for widths 4 and 5; and the records those
-changes make stale.
+of a `mul1` marker; the `(bits, codebook)` arms `(3,2)`, `(4,2)`, `(5,2)` and
+`(6,2)` on the device; the `dq_dispatch` routes for widths 4 and 5; and the
+records those changes make stale.
 
 OUT: the `m <= 8` GEMV, which stays specialized to `bits == 3`; the fused MoE
 mgemm, which stays `(3, 1)`; every codebook-0 and codebook-1 decode path, which
@@ -153,6 +159,9 @@ gate does not depend on any implementation of it.
   `GemmKernelForShape` and the refusal message.
 - **E — the GEMV.** Decide, and record the decision with upstream's own
   envelope rather than an assumption.
+- **F — the recount, and `(3, 2)`.** Re-derive the census from the LOCAL
+  artifact, instantiate the width the census adds, and correct every place the
+  old number was written down.
 
 ## Risks/decisions
 
@@ -167,9 +176,12 @@ gate does not depend on any implementation of it.
   codebook; the device launcher validates the `(bits, codebook)` PAIR. Both are
   asserted, in both directions, so a future widening of one cannot be mistaken
   for the other.
-- **Six arms, not sixteen.** Upstream's dense table is affordable because it
-  splits per `(K, cb)` into one TU each; this tree has one TU in a fat build
-  over ten architectures. Widening past six should carry that split.
+- **Seven arms, not twenty-four.** Upstream's dense table is affordable because
+  it splits per `(K, cb)` into one TU each; this tree has one TU in a fat build
+  over ten architectures. This line said SIX and said the seventh pair should
+  carry the split; slice F added a seventh that does not, because it is not a
+  new artifact's width but the same artifact's, missed by the census. Widening
+  for a NEW artifact still carries the split.
 
 ## Slices
 
@@ -184,6 +196,233 @@ gate does not depend on any implementation of it.
 - **D — bit widths 4 and 5.** `Exl3ArmInstantiated`, `GemmKernelForShape` and
   `dq_dispatch`.
 - **E — the GEMV.** `exl3_gemv_kernel` is specialized to `bits == 3`.
+- **F — the recount, and `(3, 2)`.** `Exl3ArmInstantiated`,
+  `GemmKernelForShape` and the refusal message again, plus the corrected census
+  in `docs/FEATURES.md` and in this spec. See the section below.
+
+## Slice F — the recount, and the `(3, 2)` arm (#2574)
+
+### The census, re-derived
+
+Slice D was specified against "270 of the checkpoint's quantized tensors are
+4 bpw, one is 5 and one is 6". That count is 272. The artifact has **409**
+trellis modules.
+
+Re-derived from the LOCAL artifact rather than from range requests over the
+HuggingFace API, because a range-read census is what produced the undercount:
+`/mnt/nas_share/models/Qwen3.8-27B-EXL3/target-3.5bpw`, revision
+`19441ac874c4018295da848e250f23511361cda4`, both `model-0000N-of-00002.safetensors`
+shards complete (each shard's largest declared `data_offsets` end equals its
+file size). A module is a trellis module when it owns a `.trellis`; its width is
+`shape[-1] / 16` (`[k/16, n/16, 16*bits]` on disk as `I16`), and its codebook is
+2 when it owns a `.mul1`, 1 for `.mcg`, 0 for neither.
+
+```
+2426 tensors, 409 trellis modules, 409 carrying mul1, 0 carrying mcg
+bits histogram: {3: 137, 4: 270, 5: 1, 6: 1}
+```
+
+The 137 at bits 3 are **entirely** the language model's MLP, and there is not
+one of them anywhere else in the artifact:
+
+| module | bits 3 | bits 4 |
+|---|---:|---:|
+| `model.language_model.layers.<N>.mlp.gate_proj` | 46 | 18 |
+| `model.language_model.layers.<N>.mlp.up_proj` | 46 | 18 |
+| `model.language_model.layers.<N>.mlp.down_proj` | 45 | 19 |
+
+That is the per-layer mixed-precision split which averages to 3.5 bpw: 64
+language-model layers, each MLP projection quantized at 3 or at 4 bits. The
+remaining bits-4 population is the GDN tower (144: `linear_attn.in_proj_qkv`,
+`in_proj_z`, `out_proj` over 48 layers), the 16 dense-attention layers (63
+projections), and the 8-module `mtp` head. `layers.63.self_attn.o_proj` is the
+lone bits-5 module and `lm_head` the lone bits-6 one.
+
+### What this changes
+
+`(3, 2)` was absent from `Exl3ArmInstantiated`, so **every one of those 137
+projections refused by name** and the checkpoint could not execute a single
+decoder layer on a CUDA device. The three instantiations slice D added were
+correct and stay; this is the fourth pair the same artifact needs, missed
+because the census under-reported it.
+
+It is an INSTANTIATION and not a port. `decode_3inst_2<2>` and
+`decode_mul1_product_2` are slice C's, already compiled and already gated at
+widths 4, 5 and 6; `dq_dispatch` already routes `bits == 3` through `dq8`,
+because `(3, 0)` and `(3, 1)` have used that route since QUANT-EXL3 W3. No new
+decode is written here, and none may be: a second decode for the same codebook
+is the way two ports of one mistake agree with each other.
+
+### The confusable pair
+
+`(3, 1)` and `(3, 2)` are now BOTH instantiated at the same width, and they are
+the pair a threading mistake would silently swap: same `bits`, adjacent `cb`,
+same `dq8` route, same tile shapes. A wrong thread does not fail to compile and
+does not change any shape --- it decodes with `mcg`'s multiplier and yields a
+weight with the right distribution and no correlation to the true one, which is
+the failure mode this row's `## Risks/decisions` already names. The mutation
+table therefore carries that exact swap, and the device case must red on it.
+
+### The mutation margin, measured before the device run
+
+`(3, 1)`-for-`(3, 2)` is only a useful mutation if the two decodes disagree by
+much more than the bound. That is a property of the CODEBOOKS and not of the
+device, so it is measurable on the CPU arm alone, and it was measured before
+the lease came:
+
+| bits | cb 1 vs cb 2, relative RMS | against the 1.0e-3 bound |
+|---|---:|---:|
+| 3 | 1.70865 | 1709x |
+| 4 | 1.52897 | 1529x |
+
+Same fixture, same seeds and same shapes the device case uses
+(`MakeFixture(256, 256, bits, 0x1D0C0DE + bits)`, m = 4), both arms run through
+`vt::Exl3Gemm` on a CPU queue, scratch program, not committed. A relative RMS
+above 1 is the SATURATED error of two uncorrelated results, which is the
+"right distribution, no correlation" this row's `## Risks/decisions` describes,
+and it is what makes the M2 row below a bimodal mutation rather than a
+tolerance nudge. If the device ever reports an M2 number NEAR 1.0e-3 rather
+than near 1.7, the mutation did not apply and the row is not evidence.
+
+### What the gate does NOT reach: three of the four shapes
+
+Each arm is FOUR kernel instantiations, one per entry of the shape table
+(`GemmKernelForArm`: `(16,16,128)`, `(16,32,128)`, `(16,32,256)`,
+`(16,16,512)`), and `Exl3SelectGemmShape` picks one at runtime from `cc`, `k`
+and `n`. The device case runs `m = 4, k = 256, n = 256`. On a Blackwell-class
+`cc` with `K = 3` that path is `mod_256 && size_n <= 4096` and `size_k` is not
+`> 8192`, so it returns **shape 2** and shape 2 alone launches. Shape 4 could
+not be reached from that call at all: it tiles `n` by 512 and
+`Exl3GemmShapeCompat` refuses `n = 256`.
+
+So the gate proves the ARM is reachable and decodes correctly, not that all four
+of its shapes do. This is the pre-existing coverage of that table --- it is the
+same for `(3, 0)`, `(6, 0)`, `(4, 2)`, `(5, 2)` and `(6, 2)` --- so slice F
+neither improves nor worsens it, and it is recorded here rather than left to be
+discovered. Closing it is a loop over `force_shape_idx` gated by
+`Exl3GemmShapeCompat`, with a second `n` for shape 4; it belongs to the table
+and to every arm in it, not to this one arm.
+
+### Not in scope
+
+- **The `m <= 8` GEMV** (#2570). `exl3_gemv_kernel` carries
+  `static_assert(bits == 3, ...)` and `LSTRIDE` is hardcoded to 24 there; its
+  `(3, 2)` and `(4, 2)` arms are a separate and larger job, and
+  `Exl3GemvArmInstantiated` stays `bits == 3 && cb == 1`. Upstream's `SEL_GRID`
+  does list `(3, 2)`, so this is owed rather than refused as impossible.
+- **The loaders, the DFlash2 draft, and the `lm_head`/`mtp` heads.** Other rows
+  own those files.
+- **ROCm and Vulkan.** Both transcribe the portable CPU reference and decode
+  every width already, so the CUDA instantiation list does not bound them.
+
+### Slice F evidence — dgx:gpu0, 2026-09-02
+
+Inside `rc` lease `7503b585-85d4-43ea-8eb8-6f1e7173af73` on `dgx:gpu0`. No
+`ssh`, and the job was submitted with `setsid nohup` so a dying client could not
+cancel it from the queue. It queued for about 3h50m at depth 3 and ran 31m.
+
+- **Device**: NVIDIA GB10, compute capability 12.1, driver `580.173.02`.
+- **Toolchain**: `nvcc` 13.0, apt-installed per run; `-DVLLM_CPP_CUDA_ARCHITECTURES=121a`,
+  `-DVLLM_CPP_BUILD_TESTS=ON`, `-DVLLM_CPP_CUTLASS_FETCH=ON`, Ninja, `-j 4`,
+  ccache, built in `/tmp`.
+- **Tree**: `row/QUANT-EXL3-MUL1-BITS3` `da8d1f420`, staged as a `git archive`
+  tarball and pinned inside the job by its sha256
+  (`3ddf3514c0848966cad139b02ae17aa67a7fd035255a2479bf5bbd08b0b99fcf`), so the
+  job cannot silently build a different tree.
+  `src/vt/cuda/cuda_exl3.cu` sha256 `ad532b34cb34f802832060e89da3dc3cba1f5486bc1522b9b9bf5799a6734872`.
+
+**The gate.** `test_exl3_gemm`, whole binary, no `-tc` filter: `rc=0`, 14 of 14
+cases, 215 assertions. The device arm RAN rather than skipping, which is the
+thing a skip would have hidden inside a green summary line — the CPU-only run of
+the same binary reports 202 assertions, and the 13 extra are the device ones.
+
+| arm | device vs CPU, relative RMS | bound |
+|---|---:|---:|
+| (3, 0) | 3.02751e-07 | 1.0e-3 |
+| (6, 0) | 3.06153e-07 | 1.0e-3 |
+| **(3, 2) — new** | **3.02544e-07** | 1.0e-3 |
+| (4, 2) | 3.06479e-07 | 1.0e-3 |
+| (5, 2) | 2.99241e-07 | 1.0e-3 |
+| (6, 2) | 2.98355e-07 | 1.0e-3 |
+
+The new arm sits inside the band the five already-gated arms occupy
+(2.98e-07 to 3.06e-07), about 3300x under the bound. That is the signature of a
+decode that is exact on both sides with only the reduction order differing,
+which is what the tier was chosen to measure.
+
+**The cost of the added arm.** One TU, `cuda_exl3.cu`, recompiled with
+`CCACHE_DISABLE=1` so the number is a compile and not a cache lookup, on the
+same box in the same job:
+
+| variant | compile | object |
+|---|---:|---:|
+| with `(3, 2)` | 57.837 s | 9,424,816 B |
+| without `(3, 2)` | 51.577 s | 8,276,544 B |
+| with `(3, 2)`, restored, repeat | 57.055 s | 9,424,816 B |
+
+**+1,148,272 bytes (+13.9%) and about +6 s (+11%)**, for ONE architecture. The
+repeat gives the only spread available (1.4% between the two "with" runs), so
+the compile-time figure is n=2 against n=1 and should be read as "about 11%",
+not as 12.1%. The object figure is exact and repeatable. The fat build compiles
+this TU for ten architectures, which is the multiplier that makes the per-K
+split in `## Owed` worth more than it was at six arms.
+
+**Mutations.** Each row rebuilt from the same build directory, and each asserts
+four things rather than only the verdict: the file's sha256 CHANGED, it
+compiled, the test binary's mtime MOVED, and the tree restored byte-for-byte.
+
+| # | mutation | sha256 changed | built | mtime moved | gate | how it failed |
+|---|---|---|---|---|---|---|
+| M1 | drop `bits == 3` from the cb 2 clause of `Exl3ArmInstantiated` | yes | rc 0 | yes | **RED** | the by-name refusal, at the `vt::Exl3Gemm` entry |
+| M2 | `GemmKernelForArm<3, 2>` → `<3, 1>` in `GemmKernelForShape` | yes | rc 0 | yes | **RED** | `CHECK(1.70865 <= 0.001)`, `arm.bits := 3`, `arm.codebook := 2` |
+| M3 | DELETE the `(3, 2)` line from `GemmKernelForShape` | yes | rc 0 | yes | **RED** | `exl3_gemm shape 2 has no instantiation` |
+
+M1 is also the RED-BEFORE: for the guarantee under test it is exactly the tree
+as it stood before this change, and it fails for the intended reason.
+
+M2 is the one worth reading twice. **The device produced 1.70865, and the CPU
+prediction recorded above this section, taken before the lease and on different
+hardware, was 1.70865.** Six significant figures. Two things follow: the
+mutation certainly applied, and the device kernel certainly reads its `CB`
+template parameter rather than deriving the codebook some other way.
+
+M3 is the REACHABILITY row. Deleting the production call site in the shape table
+while leaving the predicate alone makes the dispatch return `nullptr` and throw,
+so the gate is entering the new arm through `vt::Exl3Gemm` and the shape table,
+not by naming a kernel.
+
+**One leg of that job is VOID, and it is an instrument defect rather than a
+result.** The job's last phase restored `cuda_exl3.cu` from the tarball, rebuilt,
+and re-ran the gate as a "the tree is back and still green" check. It reported
+RED. It is void because `tar -x` restores the ARCHIVE's mtime, which is older
+than the mutated file, so Ninja saw nothing to do and the binary was never
+relinked: `gate-final.log` is BYTE-IDENTICAL to `gate-mut-M3-callsite.log`, and
+the phase re-ran M3's mutant. The clean-tree green is phase E's, which built
+from the pristine tarball before any mutation touched it, and the restore itself
+is verified by sha256 on content. A job that mutates and restores must `touch`
+the file after restoring; this one did not. This is the mtime-restore skip that
+this repository has already recorded once; a mutation harness that restores from
+an archive re-acquires it every time, so it belongs in the harness rather than
+in a reader's memory.
+
+That phase also demonstrated the trap it was written against: it reported
+`assertions: 207 | 207 passed | 0 failed` beside `Status: FAILURE!`, because the
+case THREW rather than failing a `CHECK`. The exit code is what caught it.
+
+### The gate, and why this tier
+
+`tests/vt/test_exl3_gemm.cpp`'s "the widened (bits, codebook) arms agree with
+the CPU arm" case gains one row. The reference is the CPU arm, which decodes
+every width and every codebook and is itself tied to real exllamav3 data by
+`test_exl3_real_decode`; the bound is `rel_rms <= 1.0e-3`, which is the SAME
+tier `(4, 2)`, `(5, 2)` and `(6, 2)` use and the same one the `(3, 1)` f64 case
+states. It is the right tier because the quantity being bounded is the same one:
+the tensor-core reduction order. The decode is exact on both sides, so a
+disagreement larger than that bound is a decode disagreement, not rounding.
+
+A device that is absent SKIPS this case, and a skip that asserts nothing reports
+`assertions: 0`, which reads as a pass. The case already asserts its own
+precondition on the skip path, and this row does not weaken that.
 
 ## Tests
 
@@ -197,6 +436,9 @@ gate does not depend on any implementation of it.
   both-markers refusal.
 - `tests/vt/test_exl3_gemm.cpp` — the device cb 2 cross-check against the host
   decoder, and the new `(bits, cb)` arms.
+- `tests/vt/test_exl3_gemm.cpp` — slice F adds the `(3, 2)` row to that same
+  device arms table. It is one row and not a new case, because the question is
+  identical to the one the table already asks of the other cb 2 widths.
 
 ## Gates
 
@@ -221,6 +463,28 @@ green is not a device result and is never reported as one.
   compiled for every architecture in the fat build. Upstream's own answer is a
   per-K compilation-unit split (`comp_units/exl3_comp_unit_K_cbX.cu`, 24 TUs of
   16 instantiations each); this tree has one TU.
+- **The shape table is gated at ONE of its four shapes, for every arm.** See
+  "What the gate does NOT reach" above. `force_shape_idx` already exists, so
+  this is a test loop rather than a port, and it is owed by the table.
+- **Slice F's arm is VERIFIED on `dgx:gpu0`** (see its evidence section), which
+  also closes slice C's device debt for cb 2 at four widths. What is still
+  unverified is any REAL tensor of the artifact: the gate is synthetic
+  fixtures, and no shape, `k`, `n` or trellis from the 137 modules was fed to
+  it.
+- **The arm labels in the device arms table never print**
+  ([#2587](https://github.com/mudler/vllm.cpp/issues/2587)). `MESSAGE`
+  stringifies a `const char*` as a bool, so every row logs `(1)` where its
+  description should be, in the CUDA, ROCm and Vulkan arm tables alike.
+  Cosmetic, pre-existing, and NOT fixed in this flow because
+  `tests/vt/test_exl3_gemm.cpp` is one of the two translation units the lease
+  evidence was measured on and editing it would put the evidence and the head
+  out of step for no correctness gain.
+- **Slice F adds a seventh pair to a table this spec argued should stay at
+  six.** The argument stands and the reason it is overridden is that the seventh
+  pair is not a new artifact's width, it is the SAME artifact's width that the
+  census missed --- six was never the right number for #2495, seven was. The
+  per-K translation-unit split upstream uses is now more owed, not less, and the
+  compile-cost measurement is recorded with this slice's evidence.
 - **Slice E: the GEMV has no arm for these widths.** Upstream's own envelope
   refuses `K < 2 || K > 4` (`exl3_gemv.cu:107-121`) and its instantiation list
   is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)` — so **bits 5 and 6 have no
@@ -246,3 +510,6 @@ green is not a device result and is never reported as one.
 - The fat build stops fitting or a shape's `static_assert` on shared memory
   fires → record the number and propose which pairs are essential, rather than
   raising a limit.
+- `(3, 2)` and `(3, 1)` agree on the device case → the case is not
+  discriminating, because those two codebooks must produce different numbers at
+  the same width. Stop and fix the fixture before reading the tolerance.

@@ -66,6 +66,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"
+#include "vt/unaligned.h"
 #ifdef VT_MARLIN_NVFP4
 #include "vt/cuda/marlin_repack.h"
 #endif
@@ -1024,11 +1025,23 @@ float Silu(float x) { return x / (1.0F + std::exp(-x)); }
 // conv kernels require the weight dtype to match the activation dtype; where
 // activations are f32 (GDN conv/gated-norm, attention qk-norm, final-norm
 // replay), the bf16 weight must be presented as f32.
+//
+// `w.bytes` MAY BE A BORROWED MAPPING AT AN ODD ADDRESS, so the bytes are read
+// through `vt::LoadUnaligned` off a byte cursor rather than a `const uint16_t*`.
+// A safetensors payload starts at `8 + <JSON header length>`
+// (`safetensors_reader.cpp:78`), a header length is arbitrary, and
+// `BorrowStTensorBytes` hands those bytes over verbatim. This site aborted
+// `test_qwen35_exl3` under `-fsanitize=alignment`, reached from
+// `ModelRegistry::Forward` through `FullAttnBlockPaged`, and it was hidden
+// behind the EXL3 finding because that lane stops at the first report (#2578,
+// the sixth recurrence of the class in
+// `.agents/specs/unaligned-safetensors-consumers.md`).
 std::vector<float> WeightF32(const OwnedTensor& w) {
-  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
+  const auto* src = w.bytes.data();
   const int64_t n = w.Numel();
   std::vector<float> out(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
+  for (int64_t i = 0; i < n; ++i)
+    out[static_cast<size_t>(i)] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
   return out;
 }
 
@@ -6958,6 +6971,163 @@ DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   return dout;
 }
 
+// ─── VT_MOE_SEL_FP — the SELECTED-EXPERT-ID tap (MOEDIV, #2552) ──────────────
+//
+// `VT_Q4EXP_LAYER_FP` (#2547) taps VALUES, and a value tap cannot separate an
+// expert-selection FLIP from re-association inside the expert GEMM. A discrete
+// selection has BIMODAL error and not a tolerance: a token's top-k set either
+// changes — and that token's MoE output moves by an O(1) amount — or it does not
+// change at all and the residue is rounding. One `rel(sum|x|)` averages the two
+// together and destroys exactly the bit that says which happened.
+//
+// So this prints the SELECTION. Per token: the selected ids SORTED, because the
+// assertion between two arms is SET equality and the selection ORDER is not part
+// of it (`vt::MoeCombine` sums over the k slots and is order-invariant given the
+// weights). Per call: `sel`, an FNV-1a hash over every token's sorted list, so
+// comparing two arms' selections at one layer is ONE string comparison.
+//
+// THE MARGIN IS IN LOGIT SPACE AND ITS UNIT IS bf16 ULPS. Probability space is
+// the wrong space: the softmax denominator is a device-order f32 reduction and
+// differs between the arms, while the bf16 logits are what the selection is
+// actually a function of. And a probability difference reads as "small" for a
+// gap of one representable step and for a gap of fifty. `ulps` is the number of
+// representable bf16 values between the largest REJECTED logit and the smallest
+// SELECTED one under the sign-magnitude total order; `ulps == 0` means the two
+// are the SAME bf16 value and the boundary was decided by the lowest-index
+// tie-break, which one ulp of re-association anywhere upstream will flip.
+//
+// `lines=` IS THE COUNTED PROPERTY. An instrument that never ran and two arms
+// whose taps agreed look identical in a diff. The measuring job asserts
+// `lines == calls * T` and refuses to report a comparison otherwise.
+//
+// IT IS ON THE REFERENCE ARM ONLY, which is the arm a stacked keep-quant
+// checkpoint takes and the only arm any `qwen4_exp` checkpoint reaches. The
+// three fused CUDA arms keep their ids on device; adding a readback to a
+// capturable path, to instrument a model that cannot enter it, would be dead
+// code by construction. See the spec's "Wave MOEDIV" section.
+int64_t MoeSelFpCalls() {
+  static const int64_t n = [] {
+    const char* e = std::getenv("VT_MOE_SEL_FP");
+    if (e == nullptr || e[0] == '\0') return static_cast<int64_t>(0);
+    const long long parsed = std::atoll(e);
+    return parsed > 0 ? static_cast<int64_t>(parsed) : static_cast<int64_t>(0);
+  }();
+  return n;
+}
+int64_t& MoeSelFpCall() {
+  static int64_t call = 0;
+  return call;
+}
+int64_t& MoeSelFpLines() {
+  static int64_t lines = 0;
+  return lines;
+}
+
+// bf16 under the sign-magnitude TOTAL ORDER, as a signed key. Monotone in the
+// value it encodes, so the difference of two keys counts representable steps.
+// -0 and +0 both map to 0, which is what makes an exact tie read `ulps=0`.
+int32_t Bf16Ordered(uint16_t b) {
+  return (b & 0x8000u) != 0 ? -static_cast<int32_t>(b & 0x7fffu)
+                            : static_cast<int32_t>(b & 0x7fffu);
+}
+
+double SumAbsBf16(const std::vector<uint16_t>& v) {
+  double s = 0.0;
+  for (uint16_t b : v) {
+    const float f = vt::BF16ToF32(b);
+    if (std::isfinite(f)) s += std::fabs(static_cast<double>(f));
+  }
+  return s;
+}
+
+// One tapped MoE block invocation. Every buffer here is one the reference path
+// had ALREADY downloaded, so the tap moves no extra bytes off the device except
+// the one guarded shared-expert read its caller passes in.
+void MoeSelFp(int dev_type, int64_t T, int64_t E, int64_t top_k,
+              const std::vector<uint16_t>& h, const std::vector<uint16_t>& logits,
+              const std::vector<int32_t>& ids,
+              const std::vector<uint16_t>& expert_out,
+              const std::vector<uint16_t>* shared) {
+  const int64_t call = MoeSelFpCall();
+  if (call >= MoeSelFpCalls()) return;
+  uint64_t sel = 1469598103934665603ull;  // FNV-1a offset basis
+  int64_t min_ulps = -1;
+  int64_t min_tok = -1;
+  std::vector<int32_t> sorted(static_cast<size_t>(top_k));
+  std::vector<char> picked(static_cast<size_t>(E));
+  for (int64_t t = 0; t < T; ++t) {
+    for (int64_t j = 0; j < top_k; ++j)
+      sorted[static_cast<size_t>(j)] = ids[static_cast<size_t>(t * top_k + j)];
+    std::sort(sorted.begin(), sorted.end());
+    std::string idstr;
+    for (int64_t j = 0; j < top_k; ++j) {
+      if (j != 0) idstr += ",";
+      idstr += std::to_string(sorted[static_cast<size_t>(j)]);
+      // The hash is over the SORTED list, so it is a set identity and not a
+      // selection-order identity.
+      const uint32_t v = static_cast<uint32_t>(sorted[static_cast<size_t>(j)]);
+      for (int b = 0; b < 4; ++b) {
+        sel ^= static_cast<uint64_t>((v >> (8 * b)) & 0xffu);
+        sel *= 1099511628211ull;
+      }
+    }
+    // The boundary: the smallest SELECTED logit against the largest REJECTED
+    // one, read from the bf16 the router GEMM actually stored.
+    for (int64_t e = 0; e < E; ++e) picked[static_cast<size_t>(e)] = 0;
+    for (int64_t j = 0; j < top_k; ++j)
+      picked[static_cast<size_t>(sorted[static_cast<size_t>(j)])] = 1;
+    int64_t lo_e = -1, hi_e = -1;
+    for (int64_t e = 0; e < E; ++e) {
+      const uint16_t b = logits[static_cast<size_t>(t * E + e)];
+      if (picked[static_cast<size_t>(e)] != 0) {
+        if (lo_e < 0 || Bf16Ordered(b) < Bf16Ordered(logits[static_cast<size_t>(t * E + lo_e)]))
+          lo_e = e;
+      } else {
+        if (hi_e < 0 || Bf16Ordered(b) > Bf16Ordered(logits[static_cast<size_t>(t * E + hi_e)]))
+          hi_e = e;
+      }
+    }
+    const uint16_t lo_b = lo_e >= 0 ? logits[static_cast<size_t>(t * E + lo_e)] : 0;
+    const uint16_t hi_b = hi_e >= 0 ? logits[static_cast<size_t>(t * E + hi_e)] : 0;
+    // top_k == E leaves nothing rejected; the boundary is then undefined and is
+    // reported as such rather than as a zero margin.
+    const int64_t ulps = hi_e >= 0 && lo_e >= 0
+                             ? static_cast<int64_t>(Bf16Ordered(lo_b)) -
+                                   static_cast<int64_t>(Bf16Ordered(hi_b))
+                             : -1;
+    if (ulps >= 0 && (min_ulps < 0 || ulps < min_ulps)) {
+      min_ulps = ulps;
+      min_tok = t;
+    }
+    ++MoeSelFpLines();
+    std::fprintf(stderr,
+                 "moesel call=%lld dev=%d tok=%lld ids=%s lo_e=%lld lo=%.9g "
+                 "lo_raw=0x%04x hi_e=%lld hi=%.9g hi_raw=0x%04x margin=%.9g "
+                 "ulps=%lld\n",
+                 static_cast<long long>(call), dev_type, static_cast<long long>(t),
+                 idstr.c_str(), static_cast<long long>(lo_e),
+                 static_cast<double>(vt::BF16ToF32(lo_b)), static_cast<unsigned>(lo_b),
+                 static_cast<long long>(hi_e), static_cast<double>(vt::BF16ToF32(hi_b)),
+                 static_cast<unsigned>(hi_b),
+                 static_cast<double>(vt::BF16ToF32(lo_b)) -
+                     static_cast<double>(vt::BF16ToF32(hi_b)),
+                 static_cast<long long>(ulps));
+  }
+  // The digest. `x`/`logit`/`exp`/`shr` decompose the block's own output, so
+  // with the selection sets equal these four say WHICH GEMM carries the residue.
+  std::fprintf(stderr,
+               "moesel call=%lld dev=%d T=%lld E=%lld k=%lld sel=%016llx "
+               "minulps=%lld mintok=%lld x=%.9g logit=%.9g exp=%.9g shr=%.9g "
+               "lines=%lld END\n",
+               static_cast<long long>(call), dev_type, static_cast<long long>(T),
+               static_cast<long long>(E), static_cast<long long>(top_k),
+               static_cast<unsigned long long>(sel), static_cast<long long>(min_ulps),
+               static_cast<long long>(min_tok), SumAbsBf16(h), SumAbsBf16(logits),
+               SumAbsBf16(expert_out), shared != nullptr ? SumAbsBf16(*shared) : 0.0,
+               static_cast<long long>(MoeSelFpLines()));
+  ++MoeSelFpCall();
+}
+
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
               const Tensor& dh, int64_t T) {
   const int64_t H = cfg.hidden_size;
@@ -7082,6 +7252,19 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   const bool has_shared = cfg.shared_expert_intermediate_size > 0;
   std::optional<DBuf> shared;
   if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, fp4));
+
+  // MOEDIV (#2552): the selected-expert-id tap. Inert unless VT_MOE_SEL_FP is
+  // set; the outer guard is what keeps the shared-expert readback off the
+  // default path. Everything else it reads was already downloaded above.
+  if (MoeSelFpCalls() > 0) {
+    std::vector<uint16_t> shr;
+    if (has_shared) {
+      shr.resize(static_cast<size_t>(T) * H);
+      shared->Download(d, shr.data());
+    }
+    MoeSelFp(static_cast<int>(dh.device.type), T, E, top_k, h, logits, ids,
+             expert_out, has_shared ? &shr : nullptr);
+  }
 
   // Combine (moe-semantics.md §6): out = shared + sum_j w_j * expert_out_j.
   DBuf deo(d, DType::kBF16, {T, top_k, H}, expert_out.data());
@@ -10349,6 +10532,10 @@ struct Qwen3_5DecodeGraph::Impl {
         // `Backend::DestroyGraph`. That routing is what lets
         // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
         // editing this driver (spec `## Risks/decisions` D4).
+        // #2274: the graph dies with this slot, so its baked scratch stops being
+        // baked. Give the pinned blocks back before the pool outlives us.
+        Pool(b).UnpinForGraph(b, s.pinned);
+        s.pinned.clear();
         if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
       }
   }
@@ -10388,6 +10575,13 @@ struct Qwen3_5DecodeGraph::Impl {
     // than per pool because two shapes interleave through one pool and the pool's
     // own last-step state would answer for whichever step ran most recently.
     DevicePool::StepDemand demand;
+    // #2274: the pool blocks this slot's CAPTURE baked, held OUT of the free
+    // list for as long as the graph that baked them lives. Taken right after the
+    // capture succeeds and given back at every site that drops the graph. The
+    // counterpart to the `PreGrowForCapture` above: pre-grow guarantees the
+    // blocks exist before the capture, this keeps them from being handed to
+    // anyone else after it.
+    std::vector<std::pair<size_t, void*>> pinned;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -10604,6 +10798,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     // next capture open a scope on it (the scope refuses a container that
     // already holds one).
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     s.aux.reset();
     s.aux_taps = aux_taps;
@@ -10655,6 +10851,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   s.fa_cols = cols;
   if (cols_changed && s.graph.captured()) {
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
     // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
@@ -10834,6 +11032,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       if (s.graph.capture_failed()) {
         const std::exception_ptr err = s.graph.capture_error();
         s.graph.Reset();  // clear the failure with the graph it described
+        Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+        s.pinned.clear();
         // The runtime's OWN diagnosis where the seam holds it. It is empty only
         // on the arm where an exception was already propagating THROUGH the
         // scope, which cannot reach this line; the refusal below makes that
@@ -10853,6 +11053,30 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       }
       return drained;
     }
+    // #2274 THE FIX. The capture succeeded, so from here the graph's replays
+    // write through the device pointers it just baked. `ForwardLayers` has
+    // already RETURNED its working scratch to the pool's free list, and the
+    // comment at `PreGrowForCapture` above argues that is safe because the two
+    // graphs "replay sequentially on one stream". That argument covers the two
+    // GRAPHS. It does not cover a THIRD party: a DFlash2 draft store created
+    // later takes a pool block for its block table, is handed one of these
+    // blocks, and the next replay writes f32 activations over the table -- which
+    // is why a live block table reads `bt[0] = 1060730955` (0.727f) and
+    // `vt::PagedAttention` indexes page 1.06e9 in a 513-page pool.
+    //
+    // So take the capture's demand back OUT of the free list. `PreGrowForCapture`
+    // guaranteed `s.demand` free blocks per class BEFORE the capture and nothing
+    // else allocated in between, so the free list is LIFO-ordered with exactly
+    // those blocks on top; this pops the same count off the same end.
+    //
+    // BEFORE the `s.logits` assignment below, and the order is load-bearing on
+    // the RE-capture path (a column-count change resets this slot's graph, which
+    // is what a new draft store's wider block table causes). That assignment
+    // destroys the previous `s.logits` and frees ITS block to the same free list,
+    // where it would be popped first and leave one of the graph's own blocks
+    // reachable. Freeing the old logits is correct -- the graph it belonged to
+    // was Reset -- it just must not happen while we are counting.
+    if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
     s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     s.graph.Replay(impl_->queue);
@@ -10931,6 +11155,10 @@ struct Qwen3_5DenseDecodeGraph::Impl {
         // `Backend::DestroyGraph`. That routing is what lets
         // ENG-CUDAGRAPH-DEDUP (#1162) interpose at the backend later without
         // editing this driver (spec `## Risks/decisions` D4).
+        // #2274: the graph dies with this slot, so its baked scratch stops being
+        // baked. Give the pinned blocks back before the pool outlives us.
+        Pool(b).UnpinForGraph(b, s.pinned);
+        s.pinned.clear();
         if (s.reuse_event.handle != nullptr) b.DestroyEvent(s.reuse_event);
       }
   }
@@ -10966,6 +11194,13 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     // than per pool because two shapes interleave through one pool and the pool's
     // own last-step state would answer for whichever step ran most recently.
     DevicePool::StepDemand demand;
+    // #2274: the pool blocks this slot's CAPTURE baked, held OUT of the free
+    // list for as long as the graph that baked them lives. Taken right after the
+    // capture succeeds and given back at every site that drops the graph. The
+    // counterpart to the `PreGrowForCapture` above: pre-grow guarantees the
+    // blocks exist before the capture, this keeps them from being handed to
+    // anyone else after it.
+    std::vector<std::pair<size_t, void*>> pinned;
     // VT_ASYNC_EXECUTOR (Option A) input-staged event: recorded on the main queue
     // right AFTER StageStepInputs enqueues the async H2D (NOT after the replay), and
     // host-waited before this slot's next Refresh — so the wait costs only the tiny
@@ -11179,6 +11414,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // next capture open a scope on it (the scope refuses a container that
     // already holds one).
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     s.aux.reset();
     s.aux_taps = aux_taps;
@@ -11229,6 +11466,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   s.fa_cols = cols;
   if (cols_changed && s.graph.captured()) {
     s.graph.Reset();
+    Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+    s.pinned.clear();
     s.warm = false;
     // UNBIND BEFORE THE DESTINATION DIES. `s.pin`'s cells name device pointers
     // that `s.dev` owns, so dropping `s.dev` first leaves them naming freed
@@ -11416,6 +11655,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       if (s.graph.capture_failed()) {
         const std::exception_ptr err = s.graph.capture_error();
         s.graph.Reset();  // clear the failure with the graph it described
+        Pool(b).UnpinForGraph(b, s.pinned);  // #2274: no graph, nothing baked
+        s.pinned.clear();
         // The runtime's OWN diagnosis where the seam holds it. It is empty only
         // on the arm where an exception was already propagating THROUGH the
         // scope, which cannot reach this line; the refusal below makes that
@@ -11435,6 +11676,30 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       }
       return drained;
     }
+    // #2274 THE FIX. The capture succeeded, so from here the graph's replays
+    // write through the device pointers it just baked. `ForwardLayers` has
+    // already RETURNED its working scratch to the pool's free list, and the
+    // comment at `PreGrowForCapture` above argues that is safe because the two
+    // graphs "replay sequentially on one stream". That argument covers the two
+    // GRAPHS. It does not cover a THIRD party: a DFlash2 draft store created
+    // later takes a pool block for its block table, is handed one of these
+    // blocks, and the next replay writes f32 activations over the table -- which
+    // is why a live block table reads `bt[0] = 1060730955` (0.727f) and
+    // `vt::PagedAttention` indexes page 1.06e9 in a 513-page pool.
+    //
+    // So take the capture's demand back OUT of the free list. `PreGrowForCapture`
+    // guaranteed `s.demand` free blocks per class BEFORE the capture and nothing
+    // else allocated in between, so the free list is LIFO-ordered with exactly
+    // those blocks on top; this pops the same count off the same end.
+    //
+    // BEFORE the `s.logits` assignment below, and the order is load-bearing on
+    // the RE-capture path (a column-count change resets this slot's graph, which
+    // is what a new draft store's wider block table causes). That assignment
+    // destroys the previous `s.logits` and frees ITS block to the same free list,
+    // where it would be popped first and leave one of the graph's own blocks
+    // reachable. Freeing the old logits is correct -- the graph it belonged to
+    // was Reset -- it just must not happen while we are counting.
+    if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
     s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)

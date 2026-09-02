@@ -740,7 +740,7 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
   // checkpoint as well as a temporal-only one, so a genuine SPATIOTEMPORAL
   // checkpoint was told it is the temporal x2 upsampler and pointed at the spatial
   // one. Wrong on both counts: it is neither, it is the third arm, and the ledger
-  // refusal that names it (`ltx2_upsampler.cpp:465`) sat behind a guard that could
+  // refusal that names it (`ltx2_upsampler.cpp:497`) sat behind a guard that could
   // not be reached from a request.
   //
   // The defect is an IMPLICATION between two guards over one variable, which no
@@ -778,6 +778,40 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
       // is touched, which is what the ledger arm promises.
       CHECK(msg.find("the upsampled latent is") == std::string::npos);
     }
+  }
+  // THE REACHABILITY CASE FOR THE dims=2 ARM, and the reason it asserts a
+  // COMPLETED RENDER rather than a changed message. `dims` is read off the
+  // checkpoint's own config (`Ltx2ParseUpsamplerConfig`, mirroring
+  // model_configurator.py:17), so a 2-D upsampler is an ordinary input that a
+  // caller supplies through the `upsampler_path` load extra — the same entry
+  // point the three subcases above use, on its default configuration.
+  //
+  // It is CONSUMABLE and not merely computed, which is what separates this arm
+  // from the spatiotemporal one that stays refused. The fold at model.py:86/:100
+  // returns the frame count unchanged and PixelShuffleND(2) doubles H and W, so
+  // the result is exactly the `[c, f, 2h, 2w]` the phase requires at
+  // ltx2_video.cpp:3525-3531. A port that got the fold wrong would still satisfy
+  // that check, which is why the VALUE gate lives in test_ltx2_pipeline and this
+  // case is about reach.
+  //
+  // The fixture writes 4-D kernels here without being told to: it enumerates
+  // through `EnumerateLtx2UpsamplerTensors(cfg)`, so the rank follows `dims` on
+  // both sides and a 5-D enumeration would fail to load rather than mis-render.
+  SUBCASE("a dims=2 upsampler checkpoint RENDERS, at the full requested size") {
+    vllm::Ltx2UpsamplerConfig dims2 =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    dims2.dims = 2;
+    const std::string path = ws.root + "/dims2_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(dims2, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    const vllm::multimodal::VideoResult result =
+        engine->Generate(FixtureGen(ws.root + "/dims2_ups"));
+    CHECK(result.width == 64);
+    CHECK(result.height == 64);
   }
   SUBCASE("with one, the render lands at the FULL requested size") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
@@ -2777,6 +2811,48 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     CHECK(trace.round_merged_slot_tiles[0] == 0);
     CHECK(trace.round_merged_slot_tiles[1] == 0);
     CHECK(trace.round_merged_slot_tiles[2] == 1);
+  }
+
+  SUBCASE("a dims=2 TEMPORAL upsampler checkpoint is refused AT LOAD, not minutes in") {
+    // THE PLACEMENT IS THE POINT. `dims=2` with `temporal_upsample` is a
+    // contradiction upstream cannot run, and `Ltx2LatentUpsample` refuses it —
+    // but that refusal fires inside the rounds loop (ltx2_video.cpp:5058), which
+    // is reached only after two full denoise stages. The load block that owns
+    // `temporal_upsampler_path` exists precisely so a caller who supplied the
+    // wrong file learns at load rather than several minutes in, and it says so
+    // in its own comment. It checked `temporal_upsample` and `spatial_upsample`
+    // there and did not check `dims`, so this one checkpoint cleared both
+    // siblings and failed downstream anyway.
+    //
+    // Asserted at `LoadVideoEngine`, not at `Generate`: a case that only checks
+    // the message would stay green with the guard back in the rounds loop, which
+    // is the exact defect.
+    vllm::Ltx2UpsamplerConfig temporal_two_d =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    temporal_two_d.spatial_upsample = false;
+    temporal_two_d.temporal_upsample = true;
+    temporal_two_d.dims = 2;
+    const std::string two_d_path = ws.root + "/dfr_temporal_dims2.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(temporal_two_d, two_d_path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    SupplyRequiredAdapter(&mp, "dfr", ws.root + "/dfr_dims2_lora.safetensors");
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    mp.extras[vllm::multimodal::kLtx2TemporalUpsamplerPathExtra] = two_d_path;
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL_CHECK("a dims=2 temporal upsampler must be refused at LOAD, beside its two siblings");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("dims=2") != std::string::npos);
+      CHECK(msg.find(std::string(vllm::multimodal::kLtx2TemporalUpsamplerPathExtra)) !=
+            std::string::npos);
+      // The upstream site that makes it a contradiction rather than a taste.
+      CHECK(msg.find("model.py:68-71") != std::string::npos);
+    }
   }
 
   SUBCASE("rounds without a temporal upsampler are refused, not silently skipped") {

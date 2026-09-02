@@ -9026,6 +9026,14 @@ DETERMINISTIC -- all 279 repeat and 2313 batch comparisons passed with the wrong
 tie-break in place. Repeatability is necessary and never sufficient, and a wave
 that had measured only determinism would have called that mutant clean.
 
+**Re-measured at the merged head.** The numbers above were taken at
+`64617b150`; the merge with `origin/main` then touched `src/vt/cuda/cuda_exl3.cu`,
+which this binary links. A second `thor:gpu0` lease at `d52bc830f` (job
+`186b67e9-4e48-43fb-9424-65735964083c`, `BUILD rc=0 objects=586`) reproduces
+every one of them: 4652/0 baseline, 4652/104 mutant, 4652/0 restored, 1907/1906/1
+and 33451/0 unmoved on the standing suites, and the same 12/12/12/12 with zero at
+E = 256. Only `631da56c4` lands after that run and it edits this file alone.
+
 Full record:
 [`docs/bench-evidence/qwen4exp-moe-tiebreak-stability-20260902.md`](../../docs/bench-evidence/qwen4exp-moe-tiebreak-stability-20260902.md).
 

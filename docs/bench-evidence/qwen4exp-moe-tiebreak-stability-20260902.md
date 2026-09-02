@@ -228,3 +228,36 @@ thing that distinguishes it from Thor's real result is the COUNT: 488 against
 `orin:gpu0` therefore corroborates the CPU arm on aarch64 and the `sm_87`
 compile, and contributes nothing to §4. Every device number in this document
 comes from `thor:gpu0`.
+
+## 9. Re-measured at the MERGED head, because a merge has falsified prose here before
+
+§1-§6 were measured at `64617b150`. That head was then merged with 16 commits of
+`origin/main`, and one of them touched a file this binary links:
+`src/vt/cuda/cuda_exl3.cu` (the EXL3 (3, 2) GEMM instantiation). Nothing in the
+merge touched the router, the test, or `tests/CMakeLists.txt` -- but "nothing
+relevant changed" is a claim, and the counts in this document are the thing at
+risk, so they were taken again rather than argued for.
+
+**Second lease, merged head `d52bc830fef80735e139819f68897e105fbc0579`:**
+`thor:gpu0`, job `186b67e9-4e48-43fb-9424-65735964083c`, pod `rc-worker-n8smh`,
+NVIDIA Thor, driver 595.78, cc 11.0, nvcc `cuda_13.0.r13.0`, `sm_110`.
+`CMAKE rc=0`, `BUILD rc=0 objects=586`, 41 `*.cu.o`, `libcudart.so.13` resolved.
+
+| measurement | at `64617b150` | at `d52bc830f` |
+|---|---|---|
+| `test_moe_router_tie_stability` baseline | 4652 / 0 failed / rc 0 | **4652 / 0 failed / rc 0** |
+| same, under the mutation | 4652 / **104** failed / rc 1 | 4652 / **104** failed / rc 1 |
+| same, restored | 4652 / 0 failed / rc 0 | 4652 / 0 failed / rc 0 |
+| `test_ops_moe_grouped` base / mutant | 1907 / 1906 / 1 failed, both | 1907 / 1906 / 1 failed, both |
+| `test_ops_moe` base / mutant | 33451 / 0 failed, both | 33451 / 0 failed, both |
+| mutant failures at E = 512, patterns 3 / 5 | 12 / 12 | 12 / 12 |
+| mutant failures at E = 1024, patterns 3 / 5 | 12 / 12 | 12 / 12 |
+| mutant failures at **E = 256** | **0** | **0** |
+
+Every number reproduces. The two structural claims were re-read at the merged
+head as well: `tests/vt/test_ops_moe_grouped.cpp:637` still sweeps
+`{32, 64, 128, 256}`, and `moe_router_warp.h:98` still returns 0 for E = 512.
+
+One commit lands after this run, `631da56c4`, and it changes exactly one file --
+`.agents/specs/qwen4-exp-flash-next.md`, repairing that section's Gates commands
+-- so the binary these numbers came from is the binary the branch ships.

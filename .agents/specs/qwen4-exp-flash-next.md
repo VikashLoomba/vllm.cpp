@@ -4069,6 +4069,39 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+- **THE `device_token_ids` CONTRACT IS ADVISORY, AND FIVE MORE ARCHITECTURES
+  IGNORE IT ([#2544](https://github.com/mudler/vllm.cpp/issues/2544)).** DECODEDIV
+  fixed `qwen4_exp`'s half of this and did not fix the general one. The runner
+  assigns `forward_input.device_token_ids` unconditionally whenever the async
+  mirror is engaged — which is the default on CUDA — while the field's own comment
+  still claims "a model that ignores it is simply never given one". A forward that
+  ignores it embeds a host array the runner never wrote for a decode row, and
+  `token_ids_cpu` is zero-initialised, so the model generates from token id 0 for
+  ever. That is [#1305](https://github.com/mudler/vllm.cpp/issues/1305) and #2496,
+  twice, and `grep -rl 'device_token_ids\|DeviceTokenIds'` finds no translation
+  unit for `DeepseekV4ForCausalLM`, `Glm5NextForConditionalGeneration`,
+  `glm_moe_dsa`, `Laguna` or `KimiK3`. Each is a CANDIDATE and not a conviction —
+  the issue is filed on a grep and says so — and convicting one needs the same
+  measurement, which needs its checkpoint and its GPU time. The item this row
+  really owes is not five ports: it is making the contract ENFORCEABLE, so a
+  forward that ignores a live `device_token_ids` is refused by name instead of
+  silently decoding from the previous step's identifiers. `VT_ASYNC_RUNNER=0` is
+  the same-binary rollback meanwhile.
+
+- **THE N-GRAM HASH IS A HOST COMPUTATION, AND THAT IS WHAT COSTS A DRAIN PER
+  STEP (#2496).** `ForwardQwen4ExpForConditionalGeneration` now materialises the
+  device identifiers on the host, because `RunQwen4ExpPleBlock` hashes the raw ids
+  in host int64 arithmetic (`qwen4_exp::BuildNGramIds`, the port of transformers
+  5.16.0 `_splitmix64`, :979-983) and advances the n-gram context the next step
+  reads. `detail::ApplyDeviceTokenIds` would repair the embed alone and leave the
+  hash reading zeros, so the copy plus drain is forced rather than chosen. It is
+  the synchronise ENG-ASYNC-SCHED W4 removed, paid once per step on this
+  architecture. Upstream does not pay it: `vllm/models/qwen4_exp/nvidia/ple_layer.py`
+  computes the ids in a device custom op, `torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids`,
+  over a device `ngram_context` (read at `191cecd51e`, a FORWARD reference past
+  this row's pin at `5559679229`). Porting that op is what buys the drain back,
+  and it is a wave, not a line.
+
 - **WHAT THE 2026-08-31 vLLM LANDING OWES THIS ROW (Q4RECONCILE, #2489).** The
   oracle reconciliation is done and the divergences are classified in
   `### Component-by-component reconciliation`. What it did not do is act on any of
@@ -8368,6 +8401,57 @@ lease. The wave's acceptance gate is the released artifact through
 `examples/server`: **the GPU must emit `11751 13 15767 411 2029 11 1092 369`**.
 Nothing short of that token sequence is a fix, and a green hermetic case is not a
 substitute for it.
+
+### Outcome — the first tensor that diverged, and what it named
+
+**The instrument answered on the first run, and it named a tensor rather than a
+layer.** `VT_Q4EXP_STATE_FP=1` on `thor:gpu0`, the released UD-IQ1_S artifact,
+`--device cuda` against `--device cpu`, one prompt, greedy, `max_tokens=8`. Every
+persistent state agrees after the prefill. The FIRST divergence is at **step 1,
+the first decode, in the PLE n-gram history**, and it is exact:
+
+| step | `--device cpu` | `--device cuda` |
+|---|---|---|
+| 0 (prefill, T=5) | `[9338, 369]` | `[9338, 369]` |
+| 1 | `[369, 11751]` | `[369, 0]` |
+| 2 | `[11751, 13]` | `[0, 0]` |
+| 3-7 | rolls the sampled ids | `[0, 0]` |
+
+The history is int64 TOKEN IDS, so this cannot be a rounding difference and needs
+no tolerance to read. The FIFO rolled correctly on both arms — `369` moved from
+slot 1 to slot 0 — and what the device arm PUSHED was `0` where the host arm
+pushed the token that had just been sampled.
+
+**So the defect was never in a state at all.** The history is advanced from
+`input_ids`, so a zero pushed means the forward was HANDED token id 0. The cause
+is `ModelForwardInput::device_token_ids`: the asynchronous runner's combine
+splices each decode row's sampled token into a DEVICE buffer on the main queue
+and deliberately leaves the host `token_ids` stale, and this hook read the host
+vector. `token_ids_cpu` is zero-initialised, so every decode row embedded and
+hashed id 0. Nine registries already consume that field under
+[#1305](https://github.com/mudler/vllm.cpp/issues/1305), which is the same defect
+on Qwen3-MoE.
+
+**That explains every constraint the issue had accumulated**, which is the test a
+cause has to pass: token 0 is right because a prefill row is not a decode row;
+the decode is wrong from the first step because every decode row is; it is
+bit-stable across builds and trees because zero is a constant, not a race; and
+`CUDA_LAUNCH_BLOCKING=1` cannot move it because nothing here is a launch order.
+It also explains why the REPORTED ids stayed plausible — they are the argmax of
+each step's logits, and what was broken is the FEEDBACK, not the sampler.
+
+**AND IT CORRECTS THIS SPEC'S OWN FRAMING.** The scope above enumerates three
+write-at-prefill / read-at-decode states and calls that list what makes the wave
+finite. The list was right and the conclusion drawn from it was not: the
+divergence was in one of those three, and the CAUSE was upstream of all of them,
+in an input the forward is handed. An enumeration of state can locate a symptom;
+it cannot bound where the symptom comes from.
+
+**What the hermetic case could not have found.** It passes `device_token_ids ==
+nullptr` on both arms, because a test builds `ModelForwardInput` by hand. It was
+still the right first instrument — it costs no GPU and it would have convicted any
+of the three states — but the defect lives in a field only the runner sets, which
+is why the released-artifact fingerprint is the arm that answered.
 
 **Stop conditions.** Stop and report rather than widen scope if: the hermetic
 comparison is green AND the released-artifact run still diverges (the fixture

@@ -25,7 +25,7 @@
 # renders, and `scripts/ltx25-render-confirm.sh` already takes them with a
 # verified binary, a staged checkpoint set and a phase table. This change gives
 # that harness `KEEP_FRAMES=1` so renders 2 and 3 keep their frames instead of
-# being deleted at its `:551`. Run it as its own job: two jobs of under an hour
+# being deleted at its `:570`. Run it as its own job: two jobs of under an hour
 # survive an hourly crash where one job of two hours does not.
 #
 # Exit codes:

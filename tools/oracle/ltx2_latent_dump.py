@@ -24,7 +24,7 @@ only delta from upstream's own command line is the substitution its own
     pipeline.stage = RecordingDiffusionStage(pipeline.stage)
 
 `ti2vid_one_stage.main()` builds its pipeline in a local
-(`ti2vid_one_stage.py:252`), so the substitution is installed by wrapping the
+(`ti2vid_one_stage.py:254`), so the substitution is installed by wrapping the
 CLASS's `__init__` rather than by rewriting `main()`. Upstream's `main()` then
 runs verbatim, with upstream's own argv, which is what makes the dumped latent
 the oracle's rather than a re-implementation's.
@@ -206,9 +206,13 @@ def environment_record(torch_module) -> dict:
     distinguishable from a field that read as absent.
 
     The key names mirror the block `ltx2_oracle.py:276-290` writes inline, so the
-    two manifests compare field by field, and this is a superset: it adds the
-    CUDA runtime and driver versions, which are what a "did torch move?" question
-    actually needs. It is not shared code with that block on purpose. Extracting
+    two manifests compare field by field, and this is a superset: every one of
+    that block's six keys appears here spelled and shaped the same way, including
+    `capability` as a list of ints rather than a dotted string, and it adds
+    `cuda_available`, the CUDA runtime version and the driver version, which are
+    what a "did torch move?" question actually needs.
+
+    It is not shared code with that block on purpose. Extracting
     it would change the shape of the REFERENCE render's manifest, whose digest is
     committed in `tests/parity/goldens/ltx2_oracle/SHA256SUMS` and which every
     other LTX-2 row compares against; that is a larger blast radius than a
@@ -234,8 +238,12 @@ def environment_record(torch_module) -> dict:
         "torch_cuda": probe(lambda: torch_module.version.cuda),
         "cuda_available": available,
         "gpu": probe(lambda: cuda.get_device_name(0)) if available else None,
-        "gpu_capability": probe(
-            lambda: ".".join(str(v) for v in cuda.get_device_capability(0))
+        # `capability`, a list of ints, because that is the key and the shape
+        # `ltx2_oracle.py:287-288` writes. A dotted "12.1" read better and made
+        # the two manifests disagree on the one field a field-by-field diff
+        # would then report as absent from one side and extra on the other.
+        "capability": probe(
+            lambda: list(cuda.get_device_capability(0))
         ) if available else None,
         "cuda_driver": probe(lambda: torch_module._C._cuda_getDriverVersion()),
     }

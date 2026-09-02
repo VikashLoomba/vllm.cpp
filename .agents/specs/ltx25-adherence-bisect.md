@@ -225,14 +225,35 @@ score is the tuning this row forbids itself.
    their words if the driver acts on them, and a static check that the functions
    are CALLED cannot see that. `tests/scripts/test_ltx2_latent_dump.py` drives
    `main()` end to end with the torch, upstream, GPU and checkpoint seams stubbed
-   and asserts rc 64 on a decode missing a committed frame and rc 62 on a short
-   write. Deleting either guard reds it; deleting neither is visible to an AST
-   walk.
+   and asserts rc 64 on a decode missing a committed frame, rc 62 on a short
+   write, and rc 61 when the recording hook never fired. Deleting any one guard
+   reds it; deleting none is visible to an AST walk.
+
+   The rc 61 leg was added last and is the one worth naming, because it is the
+   half of test 2 -- `len(stage.video_states) > 0` -- that had no executing
+   check. Every other leg's fake stage supplied a video state, so the branch was
+   never entered and `return 61` was documented and unexecuted; deleting it left
+   the suite fully green. The fake now takes its states as an argument, and the
+   empty case is driven. With the guard removed, `states[-1]` raises rather than
+   returning, so that leg catches and reports instead of letting a traceback out
+   of the suite: a red that names a Python line is a worse red than one that
+   names the guarantee that moved.
+6. **The committed Phase A artefacts are digest-checked, not merely stored.**
+   `tests/parity/goldens/ltx2_oracle_latent/SHA256SUMS` had no consumer when it
+   landed, which made it a comment. `tests/scripts/test_ltx2_oracle_goldens.py`,
+   which already does this for the sibling `ltx2_oracle/` directory, now covers
+   this one too rather than a parallel suite existing beside it. Every artefact
+   must have a row, every row an artefact, and the bytes must agree with both --
+   and, because a digest file beside its own artefacts can always be edited to
+   match, each `.raw` is cross-checked against the sha256 the manifest records
+   the RUN computing on the worker before anything was copied out.
 
 ## Gates
 
 - `scripts/agent-preflight.sh` at rc 0 before the commit.
 - The oracle-frame digest check of test 1, which is the run's own admissibility.
+- `python3 tests/scripts/test_ltx2_oracle_goldens.py`, which is where test 6
+  runs and which the preflight SUITES list already carries.
 
 ## Evidence
 
@@ -508,15 +529,16 @@ container moved too: 225,174 bytes against the committed 225,151.
 (`blocks.py:1124-1143`). What is left is a nondeterministic audio VAE or vocoder
 kernel, a different torch, or **a different audio latent** -- and the audio
 latent comes from the very stage `RecordingDiffusionStage` wraps
-(`ltx2_latent_dump.py:402` reads `stage.audio_states`, the file's only hit for it). The third case would be a
+(`ltx2_latent_dump.py:410` reads `stage.audio_states`, the file's only hit for it). The third case would be a
 finding about the probe, so this is not the same statement as "the audio half is
 simply not bit-exact".
 
 Phase A recorded no environment, which is why the attribution cannot be made from
 what was captured: the reference render's own
 `tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json` records
-`torch 2.13.0+cu130` on an `NVIDIA GB10`, and `phase-a-rc-job-log.txt:50` records the
-same pair for this run, so a torch mismatch is not the answer -- but the driver
+`torch 2.13.0+cu130` on an `NVIDIA GB10`, and this run's own job log records the
+same pair across two lines rather than one -- `phase-a-rc-job-log.txt:51` the
+torch, `:29` the GB10 -- so a torch mismatch is not the answer, but the driver
 and the CUDA driver version were never written down and the comparison stops
 there. `tools/oracle/ltx2_latent_dump.py` now writes an `environment` block into
 its manifest so a future run does not repeat the omission.

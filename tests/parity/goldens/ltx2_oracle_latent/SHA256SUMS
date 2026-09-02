@@ -27,9 +27,10 @@
 # about the probe. Phase A recorded no environment, so the one variable that
 # separates "a different torch moved the audio" from "the probe moved it" was not
 # captured; the reference render's own manifest records torch 2.13.0+cu130 on an
-# NVIDIA GB10 and phase-a-rc-job-log.txt:50 records the same pair for this run, which
-# narrows it but does not close it. tools/oracle/ltx2_latent_dump.py now writes an
-# environment block so a future run does not repeat the omission.
+# NVIDIA GB10, and this run's job log records the same pair across two lines --
+# phase-a-rc-job-log.txt:51 the torch, :29 the GB10 -- which narrows it but does
+# not close it. tools/oracle/ltx2_latent_dump.py now writes an environment block
+# so a future run does not repeat the omission.
 # audio_latent_bfloat16.raw is therefore recorded WITHOUT a reproducibility claim
 # and its row below is marked. Nothing in this row's verdict rests on it.
 #

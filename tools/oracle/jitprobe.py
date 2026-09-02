@@ -4,7 +4,10 @@
 Attempt 5 died 20 s into the render inside triton's runtime, which JIT-builds a
 CPython extension (`cuda_utils`) and calls
 
-    subprocess.check_call(cc_cmd, stdout=subprocess.DEVNULL)   # build.py:48
+    subprocess.check_call(cc_cmd, stdout=subprocess.DEVNULL)
+    # triton/runtime/build.py:48, in the triton the WORKER installed (3.7.1);
+    # the line is quoted above rather than only cited, because that path is an
+    # installed package and not a pinned tree, so nothing here can resolve it.
 
 with no `stderr=` argument at all. `check_call` raises CalledProcessError
 carrying only the argv, so gcc's diagnostic went to the process's stderr in a
@@ -16,7 +19,9 @@ Exercised afterwards, in the order the render meets them:
   1. the driver init that failed (`driver.active`, which builds `cuda_utils`),
   2. the exact dispatch the render hit -- a [B,D,1] @ [B,1,S] matmul, which
      torch._native routes to `bmm_outer_product`'s triton impl, from
-     transformers/models/gemma4_unified/modeling_gemma4_unified.py:278,
+     `modeling_gemma4_unified.py` in the transformers the WORKER installed --
+     a version Phase A never recorded, so the line number that dispatch sat on
+     is not resolvable against any pin and is deliberately not written here,
   3. an ordinary triton kernel, so a failure that is ptxas rather than gcc is
      distinguishable from one that is not.
 

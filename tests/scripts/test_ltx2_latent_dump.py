@@ -262,15 +262,23 @@ print("=== main() END TO END: the controls' verdicts reach the EXIT CODE ===")
 
 
 class _FakeStage:
-    """Stands in for `RecordingDiffusionStage` after a render."""
+    """Stands in for `RecordingDiffusionStage` after a render.
 
-    def __init__(self) -> None:
-        self.video_states = [types.SimpleNamespace(latent=object())]
+    `video_states` is a constructor argument and not a fixed one because the
+    HOOK-NEVER-FIRED path is reachable only with an empty one. A fake that
+    always supplies a state cannot enter it, so `return 61` sat documented and
+    unexecuted while the suite read fully green.
+    """
+
+    def __init__(self, video_states: list | None = None) -> None:
+        self.video_states = ([types.SimpleNamespace(latent=object())]
+                             if video_states is None else video_states)
         self.audio_states: list = []
 
 
 def drive_main(tmp: Path, *, expectation: dict[str, str], decoded: dict[str, bytes],
-               latent_written: int, latent_expected: int) -> tuple[int, str]:
+               latent_written: int, latent_expected: int,
+               video_states: list | None = None) -> tuple[int, str]:
     """Run the driver's own `main()` end to end and return `(rc, stdout)`.
 
     Every seam that needs a GPU, torch, the upstream checkout or a 42 GB
@@ -308,7 +316,7 @@ def drive_main(tmp: Path, *, expectation: dict[str, str], decoded: dict[str, byt
     sys.modules["ltx_pipelines.ti2vid_one_stage"] = one_stage
     mod.assert_identity = lambda source: {"revision": "0" * 40, "worktree_dirty": False}
     mod.install_recorder = lambda module: {
-        "pipeline": types.SimpleNamespace(stage=_FakeStage())}
+        "pipeline": types.SimpleNamespace(stage=_FakeStage(video_states))}
     mod.write_latent = lambda tensor, out_dir, stem: latent_record(latent_written, latent_expected)
     mod.decode = fake_decode
     mod.COMMITTED_SUMS = sums
@@ -370,6 +378,29 @@ with tempfile.TemporaryDirectory(prefix="ltx2-latent-dump-main-") as tmp:
     check("DECODE (the control" not in log,
           "and the run stops at the latent report rather than reaching the decode")
 
+    # M6: with `if not states: return 61` deleted, `states[-1]` raises
+    # IndexError and the process exits 1 -- a code this module documents
+    # nowhere, on a path that is a finding about the INSTRUMENT rather than a
+    # result about the render. Every other leg here hands the fake a video
+    # state, so nothing entered this branch and rc 61 was documented and never
+    # executed.
+    # The guard's absence raises rather than returning, so the call is caught:
+    # a traceback out of the suite IS a red, but it names a Python line instead
+    # of the guarantee that moved, and the next reader has to work out which.
+    try:
+        rc, log = drive_main(tmp / "nostates", expectation=expectation,
+                             decoded=blobs, latent_written=64, latent_expected=64,
+                             video_states=[])
+    except Exception as exc:  # noqa: BLE001 - the missing guard IS the defect
+        rc, log = -1, ""
+        check(False, f"main() must REPORT an empty recording, not raise "
+                     f"({type(exc).__name__}: {exc})")
+    check(rc == 61, f"a render whose recording hook never fired exits 61 (got {rc})")
+    check("RECORDED STATES: 0" in log,
+          "and the driver reports the zero it saw rather than inferring it")
+    check("LATENT DUMP" not in log,
+          "and it stops before dumping, because there is nothing to dump")
+
 print("=== the environment recorder describes, and never raises ===")
 fake_torch = types.SimpleNamespace(
     __version__="2.13.0+cu130",
@@ -384,8 +415,31 @@ fake_torch = types.SimpleNamespace(
 rec = mod.environment_record(fake_torch)
 check(rec["torch"] == "2.13.0+cu130", "the torch version is recorded")
 check(rec["gpu"] == "NVIDIA GB10", "the GPU name is recorded")
-check(rec["gpu_capability"] == "12.1", "the GPU capability is recorded")
+check(rec.get("capability") == [12, 1],
+      "the GPU capability is recorded under the reference manifest's own key "
+      "and in its own list-of-ints shape")
 check(rec["cuda_driver"] == 13000, "the CUDA driver version is recorded")
+
+# The docstring claims the key names mirror the reference manifest's own
+# environment block field by field. That claim was FALSE on one field for a
+# whole review round -- `gpu_capability`/"12.1" against `capability`/[12, 1] --
+# because nothing read the reference. This reads it. A rename or a reshape on
+# either side reds here, which is what makes the claim a gate and not prose.
+reference_environment = json.loads(
+    (ROOT / "tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json").read_text()
+)["environment"]
+check(len(reference_environment) >= 6,
+      "the reference manifest's environment block is the one with fields in it "
+      f"(read {len(reference_environment)} keys)")
+absent = sorted(k for k in reference_environment if k not in rec)
+check(not absent,
+      "every reference-manifest environment key is mirrored here"
+      + (f" (absent: {absent})" if absent else ""))
+reshaped = sorted(k for k in reference_environment
+                  if k in rec and type(rec[k]) is not type(reference_environment[k]))
+check(not reshaped,
+      "and each mirrored key carries the reference's own type"
+      + (f" (reshaped: {reshaped})" if reshaped else ""))
 
 
 class _Hostile:

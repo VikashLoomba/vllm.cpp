@@ -530,6 +530,13 @@ class ArmValidity(unittest.TestCase):
         # Two copies of a refusal rule drift, and the copy that drifts is the
         # one nothing calls on the failing path. S0 must raise on exactly the
         # discriminations this returns invalid for, and on no others.
+        #
+        # This case asserts CONSISTENCY, not refusal: it compares the two sides
+        # to each other, so a predicate disarmed to always-permissive moves both
+        # sides together and this stays green. The absolute gate -- that S0
+        # refuses a scorer a decoy outranks, whatever the other side does -- is
+        # `tests/scripts/test_ltx25_prompt_adherence.py::Precondition`, which is
+        # the case that reds under that mutation.
         cases = [(30.0, [30.5, 29.0]), (7.0, [7.0, 7.0]), (31.0, [20.0, 12.0]),
                  (31.0, [30.999999, 1.0]), (0.0, [-1.0])]
         for t, ds in cases:
@@ -753,8 +760,14 @@ class TheCommittedGoldenIsREAD(unittest.TestCase):
     These cases are the consumer. Each figure below is quoted in
     `.agents/specs/ltx25-adherence-detail-loss.md`, `ltx25-oracle-absolute.md`,
     `ltx25-prompt-adherence.md` or `docs/USAGE.md`, and each is asserted against
-    the committed JSON. Editing either side alone reds the suite, which is the
-    only mechanism that makes "recomputable rather than trusted" true.
+    the committed JSON.
+
+    What that binds is the GOLDEN against the constant written here: editing
+    either of those two alone reds the suite. It does not bind the prose --
+    editing a figure in a spec and nothing else reds nothing, because no case
+    parses the Markdown. The constants below were hand-verified against the
+    quoted prose when they were written, and moving a published figure means
+    moving the spec and the constant in the same change.
     """
 
     GOLDEN = os.path.join(ROOT, "tests", "parity", "goldens",
@@ -868,6 +881,33 @@ class TheCommittedGoldenIsREAD(unittest.TestCase):
         self.assertEqual(t["frames_clearing_bound"], 9)
         self.near(self.g["tone"]["fit_ours_to_reference"]["gain"], 0.99144, 5)
         self.near(self.g["tone"]["fit_ours_to_reference"]["gamma"], 1.04654, 5)
+
+    def test_the_unsharp_arm_is_VALID_and_is_the_fifth_leg(self):
+        # The spec framed this arm's +0.4542 against the WITHDRAWN +1.9131 and
+        # called it "a quarter of what the blur buys", under "only one of them
+        # helps". Both halves divide by, or compare against, a disqualified
+        # number, and the polarity is inverted: this is the arm of that pair
+        # that holds its precondition. Read against the GAP it is a leg of the
+        # falsification, so its figures are pinned here.
+        d = self.g["sharpen_diagnostic"]
+        self.assertEqual(d["argmax_label"], "true")
+        self.assertTrue(d["scorer_valid"]["valid"])
+        self.near(d["margin_to_best_decoy"], 0.6547, 4)
+        self.assertEqual(d["per_frame_true_wins"], 19)
+        self.near(d["delta_vs_ours"], 0.4542, 4)
+        self.near(d["sharpness"], 19.0357, 4)
+        gap = self.g["blur_ablation"]["observed_gap"]
+        self.near(d["delta_vs_ours"] / gap, 0.166, 3)
+        self.assertLess(d["delta_vs_ours"] / gap, 0.2,
+                        "sharpening recovers a SIXTH of the gap; if this rose, "
+                        "the prose that calls the hypothesis refuted is stale")
+        # and it sharpens 69% past the reference's own sharpness while doing so
+        ref_sharp = self.g["blur_ablation"]["reference_sharpness"]
+        self.near(d["sharpness"] / ref_sharp - 1.0, 0.688, 3)
+        # the arm the spec preferred is the INVALID one, from sigma 0.50 up
+        arms = self.g["arm_validity"]["arms"]
+        self.assertTrue(arms["ours_unsharp_1.0"]["valid"])
+        self.assertFalse(arms["ours_blur_sigma_1.00"]["valid"])
 
     def test_the_sharpest_five_and_the_best_scoring_five_share_no_member(self):
         # FFT-free and reproducible from the per-frame table, which is why the

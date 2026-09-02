@@ -365,12 +365,14 @@ its sharpness is **a fifth** of ours -- a visibly destroyed frame -- costs
 is also non-monotonic (0.70 costs more than 1.00), which says a small detail
 difference sits inside this instrument's own noise on this axis.
 
-**THIS IS THE DECISIVE ROW, and it is the only intervention in this section that
-holds its own precondition.** Every sigma above ranks the true prompt FIRST, with
-a positive margin, on 25 of 25 frames down to sigma 1.5 and 23 of 25 at 2.0. It
-survives because the reference starts with 1.8068 of separation against our
-0.3370, so there is room to destroy the picture before the scorer stops
-measuring. The table below has no such room, and it ran out.
+**THIS IS THE DECISIVE ROW, and it is the only SUBTRACTIVE intervention in this
+section that holds its own precondition.** Every sigma above ranks the true
+prompt FIRST, with a positive margin, on 25 of 25 frames down to sigma 1.5 and 23
+of 25 at 2.0. It survives because the reference starts with 1.8068 of separation
+against our 0.3370, so there is room to destroy the picture before the scorer
+stops measuring. The table below has no such room, and it ran out. The ADDITIVE
+intervention, the unsharp arm further down, holds its precondition too, which an
+earlier version of this sentence denied by saying "only".
 
 **Removing OUR excess fine-scale energy RAISES our score, sharply.**
 
@@ -416,12 +418,28 @@ points and gains us 1.91, and it moves us from 6 frames clearing the bound to
 smoothing it further.** The hypothesis predicted the opposite sign, and 70% of
 the 2.73 shortfall is recovered by throwing our fine-scale energy away.
 
-The symmetric diagnostic agrees. An unsharp mask at sigma 1.0, amount 1.0 raises
-our sharpness from 10.6374 to **19.0357** -- 69% above the reference's own
-11.2740 -- and buys only **+0.4542** CLIP, a quarter of what the blur buys.
-**That arm is a DIAGNOSTIC and is not proposed as a repair**; it is here because
-adding detail and removing it had to be tried in the same run, and only one of
-them helps.
+The symmetric diagnostic is the FIFTH LEG of the falsification, and it is the
+arm of this pair that holds its own precondition. An unsharp mask at sigma 1.0,
+amount 1.0 raises our sharpness from 10.6374 to **19.0357** -- 69% above the
+reference's own 11.2740 -- and buys **+0.4542** CLIP.
+
+**[WITHDRAWN: "a quarter of what the blur buys", and "only one of them helps".**
+Both clauses compared this arm against the `+1.9131` the table above withdraws,
+so the ratio divides by a disqualified number and the polarity is inverted. The
+only readable blur row is sigma 0.30 at **-0.0029**, which is no denominator at
+all, and it is the BLUR arm that fails from sigma 0.50 up.
+`arm_validity.arms["ours_unsharp_1.0"]` records argmax `true`, margin **+0.6547**
+and **19 of 25** per-frame wins, so the sharpened arm is the one the scorer can
+still read.]**
+
+Read against its own committed validity, the arm says more than the withdrawn
+clause did. Sharpening our frames **69% past the reference's own sharpness**
+recovers **0.4542 of the 2.7305 gap -- 16.6%**. Adding fine-scale energy far
+beyond what the oracle itself carries leaves five sixths of the shortfall in
+place, on an arm that separates better than our unblurred render does. **That arm
+is a DIAGNOSTIC and is not proposed as a repair**; it is here because adding
+detail and removing it had to be tried in the same run, and the readable half of
+that pair is the one that adds it.
 
 ### TONE IS NOT THE EXPLANATION EITHER, and it was tested first
 
@@ -561,6 +579,12 @@ sign** for the high band. Both readings were wrong, and chasing the disagreement
 found a defect that changes two of this row's published claims. The reviewer's
 figures reproduce on this row's own code to six digits, so nothing below is a
 dispute about arithmetic.
+
+**n is 1 on our side here too.** `scripts/ltx25-render-confirm.sh` deletes
+renders 2 and 3, so every corrected figure in this section is a statement about
+one render of ours, exactly as `## Risks` says of the original ones. Two other
+specs route readers straight to this section, so the caveat is stated here
+rather than left to be found in `## Risks` or in `## CORRECTION 2`.
 
 ### What the defect is
 
@@ -767,14 +791,15 @@ the JSON is a ledger of all fourteen arms. `test_S0_AND_the_arm_check_are_the_SA
 pins the two together, because two copies of a refusal rule drift and the copy
 that drifts is the one nothing calls on the failing path.
 
-### The falsification STANDS, on four legs, none of them withdrawn
+### The falsification STANDS, on five legs, none of them withdrawn
 
 The hypothesis was that our render is smoother than upstream's and that the lost
 fine detail costs it the fox-against-wolf margin. It is still refuted.
 
-1. **The reference blur sweep, which is the strongest leg and the only surviving
-   intervention.** Every row holds its precondition: argmax `true`, a positive
-   margin, 25 of 25 frames down to sigma 1.5 and 23 of 25 at sigma 2.0. Blurring
+1. **The reference blur sweep, which is the strongest leg and the only
+   surviving SUBTRACTIVE intervention.** Every row holds its precondition:
+   argmax `true`, a positive margin, 25 of 25 frames down to sigma 1.5 and 23
+   of 25 at sigma 2.0. Blurring
    upstream's frames until their sharpness is **a fifth** of ours -- a visibly
    destroyed picture -- costs **1.9687** CLIP points against an observed gap of
    **2.7305**, and blurring them only to our own sharpness costs **0.1192**, or
@@ -789,6 +814,13 @@ fine detail costs it the fox-against-wolf margin. It is still refuted.
    identity, and correcting them takes 6 frames to 9 rather than to 25.
 4. **The temporal split, ours -0.3351 against the reference's +0.6987**, also
    FFT-free. Upstream's render improves along the clip and ours decays.
+5. **The unsharp arm, at +0.4542 on an arm that holds its precondition** --
+   argmax `true`, margin +0.6547, 19 of 25 frames. Sharpening our frames 69%
+   past the reference's own sharpness recovers 16.6% of the 2.7305 gap. It was
+   framed against the withdrawn `+1.9131` and so read as the weak half of a
+   pair; read against the gap it is the symmetric intervention, and it points
+   the same way as leg 1. Adding detail does not close the gap, and removing it
+   does not either.
 
 ### What this row does NOT lean on any more
 
@@ -826,7 +858,7 @@ sentence. It is restated here so it covers them.
 `[ "$i" = 1 ] || rm -f "$D"/frame_*.ppm` in `scripts/ltx25-render-confirm.sh`
 deletes renders 2 and 3, so the run-to-run spread of our own render does not
 exist in pixels and the S1 verdict itself could still move. The falsification
-does not depend on the gap's exact size: legs 1 to 4 are interventions and
+does not depend on the gap's exact size: legs 1 to 5 are interventions and
 orderings applied to the same 25 frames.
 
 The instrument also sees a 224x224 centre crop of a 320x192 frame, so it never
@@ -857,8 +889,12 @@ in `## CORRECTION` and retracted in place in `## Outcome`.
 What this row leaves, on **n = 1 for our render**:
 
 - a **refuted** smoothness hypothesis, resting on the reference blur sweep, the
-  empty sharpest-versus-best-scoring overlap, tone at +0.1846 and the temporal
-  split -- four legs, none of which depends on a withdrawn figure;
+  empty sharpest-versus-best-scoring overlap, tone at +0.1846, the temporal
+  split and the unsharp arm at **+0.4542** -- five legs, none of which depends
+  on a withdrawn figure. The unsharp arm was framed against the withdrawn
+  `+1.9131` and so read as the weak half of a pair; it holds its own
+  precondition and recovers 16.6% of the gap while sharpening 69% past the
+  reference, which is a leg rather than a footnote;
 - **no measured absolute mid-band deficit**: the mid band is **1.0373x**, equal;
   the deficit is a **share**, **-9.30%** border-free;
 - a **1.4031x absolute high-band excess** whose stage is unidentified;

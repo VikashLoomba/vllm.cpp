@@ -477,8 +477,11 @@ run.
 - [#2608](https://github.com/mudler/vllm.cpp/issues/2608): the aarch64-vs-x86-64
   CPU-tier divergence at p4/14, against `QUANT-QWEN38-27B-GGUF-ARM`. The
   instrument this row built runs on two CPU arms with no GPU on either side.
-- The GDN prefill conv branch asymmetry between the tiers. Measured, not
-  explained, and not the cause of anything here.
+- [#2610](https://github.com/mudler/vllm.cpp/issues/2610): the GDN prefill conv
+  branch asymmetry between the tiers — ROCm takes the indexed
+  `GdnStateGather` arm, the CPU tier the `GatherStateF32` fallback, and only
+  ROCm emits the `gdn_core` probe. Measured, not explained, and not the cause of
+  anything here.
 - #2590 stays open on `p1/45` and `p3/45`, now with a cause and no fix: they are
   near-ties decided by an irreducible bf16 accumulation, and closing them would
   mean changing what the residual stream is stored in.

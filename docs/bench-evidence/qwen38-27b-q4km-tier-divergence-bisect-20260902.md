@@ -255,8 +255,10 @@ exactly, 3120 on each side.
 
 This is visible only because the comparator refuses a key-set mismatch by
 default. It is not the cause of anything measured here — the GDN family carries
-16 to 26% of a variance that is already at the bf16 floor — but it is a genuine
-difference in which code the two tiers run, and it belongs in the record.
+16 to 26% of a variance that is already at the bf16 floor, and the GDN layers
+CONTRACT the difference they are handed — but it is a genuine difference in which
+code the two tiers run, and
+[#2610](https://github.com/mudler/vllm.cpp/issues/2610) owns it.
 
 ## What this means, stated plainly
 

@@ -230,9 +230,16 @@ control's `11751 13 15767 411 2029 11 1092 369`, so from step 1 the two arms are
 running different token sequences and a 100% flip rate is a different-INPUT
 artifact rather than a numerics result.
 
-**That degeneracy is itself a finding.** PREFILLDIV recorded a fluent CUDA arm
-(`11751 13 15767 411 1928 11 628 567`) — but it measured a tree that had
+**That degeneracy is itself a finding, and it has a shelf life.** PREFILLDIV
+recorded a fluent CUDA arm (`11751 13 15767 411 1928 11 628 567`) — but it
+measured a tree that had
 [#2550](https://github.com/mudler/vllm.cpp/pull/2550)'s decode fix merged in.
-**On `origin/main` at `a99b9c69a`, `--device cuda` does NOT reproduce that**; the
-fluency depends on a pull request that has not landed. Only step 0 is comparable
-until it does.
+**On `origin/main` at `a99b9c69a`, which is what this run measured, `--device
+cuda` does NOT reproduce that**; the fluency depended on a pull request that had
+not landed. **#2550 landed at `bb78d1ee8` while this file was being written**,
+so the branch carrying this evidence merges it and the sentence above is a
+statement about the measured tree, not about `main` today. Nothing here is
+re-derived on the post-#2550 tree: the prefill result does not depend on it (step
+0 consumes the prompt, not a sampled token), and a decode-phase selection
+comparison is now well posed and is left as the cheap next measurement rather
+than claimed.

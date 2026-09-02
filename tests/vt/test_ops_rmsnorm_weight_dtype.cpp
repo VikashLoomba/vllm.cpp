@@ -24,6 +24,13 @@
 // running this file against a pre-fix binary. The transition is therefore
 // evidence that the pairing is now accepted, and not evidence about which
 // pairing was at fault; case 1 exists to pin the one production actually uses.
+//
+// WAVE RMSTWINS (#2503) changed case 3's polarity and corrected case 2's
+// reachability claim. Case 3 pinned a CUDA REFUSAL of a kF16 gamma; the CUDA
+// dispatcher now serves kF16 and the case pins agreement. Case 2's claim that
+// glm4/gemma*/deepseek_v2 GGUF arms present an F32 gamma was measured and is
+// FALSE -- see the comment above `RunBf16ActF32W`. Every CUDA case here is
+// `[SKIP]` on a host without a device, and no CI lane executes GPU tests.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -72,7 +79,7 @@ float Bf16ToF32(uint16_t v) {
 
 constexpr int64_t kRows = 5;    // the CPU control's prompt_tokens
 constexpr int64_t kProdH = 256; // qwen4_exp head_dim: attn_q_norm.weight is [256]
-constexpr int64_t kIdxH = 128;  // indexer head_dim, for the bf16/f32 blast-radius case
+constexpr int64_t kIdxH = 128;  // indexer head_dim; the shape cases 2 and 3 borrow
 
 // Widen both operands to f32, multiply, round once at the store. This is
 // GemmaRMSNorm's own order and is recomputed here rather than taken from the op,
@@ -141,9 +148,23 @@ std::vector<uint16_t> RunF32ActBf16W(Device dev, const std::vector<float>& x,
   return out;
 }
 
-// ─── CASE 2 SHAPE: bf16 activation, f32 gamma. NOT reached by qwen4_exp, but
-// newly ADMITTED by this change and reachable from the GGUF arms of glm4,
-// gemma/gemma2/gemma3 and deepseek_v2 whose gammas stay F32 (#2503).
+// ─── CASE 2 SHAPE: bf16 activation, f32 gamma. Newly ADMITTED by #2477, and
+// reached by NOTHING. The claim that stood here -- that the GGUF arms of glm4,
+// gemma/gemma2/gemma3 and deepseek_v2 keep an F32 gamma -- was #2503's and it is
+// FALSE in both halves. Those five architectures have no GGUF arm at all: each
+// refuses `source.kind != kSafetensors` by name at its registry door
+// (`gemma_registry.cpp:48-51`, `gemma2_registry.cpp:49-52`,
+// `gemma3_registry.cpp:50-53`, `glm4_registry.cpp:50-53`,
+// `deepseek_v2_registry.cpp:68-71`), and their safetensors loaders take every
+// gamma through `dense_loaders::LoadBf16Direct`, which is `kBF16` unconditionally
+// (`dense_weight_loaders.h:355-374`).
+//
+// The f32 gammas this tree DOES build -- kimi-linear (`kimi_linear.h:179,:254`,
+// f32 `std::vector`), Laguna (`laguna.cpp:2568`), the MiniMax-H3 encoder
+// (`minimax_h3_encoder_sharded.cpp:228`) and Qwen3.5's q-norm
+// (`qwen3_5.cpp:5329`) -- all pair the f32 gamma with an f32 ACTIVATION, so they
+// satisfied the old equality check too. This pairing is therefore kept as the
+// contract `vt::RmsNorm` promises and the CPU arm serves, NOT as a model's.
 std::vector<uint16_t> RunBf16ActF32W(Device dev, const std::vector<uint16_t>& x,
                                      const std::vector<float>& w, int64_t h) {
   std::vector<uint16_t> out(static_cast<size_t>(kRows * h), 0);
@@ -165,6 +186,51 @@ std::vector<uint16_t> RunBf16ActF32W(Device dev, const std::vector<uint16_t>& x,
   b.Copy(q, wd, w.data(), w.size() * sizeof(float));
   Tensor tx = Tensor::Contiguous(xd, DType::kBF16, dev, {kRows, h});
   Tensor tw = Tensor::Contiguous(wd, DType::kF32, dev, {h});
+  Tensor to = Tensor::Contiguous(od, DType::kBF16, dev, {kRows, h});
+  vt::RmsNorm(q, to, tx, tw, args);
+  b.Copy(q, out.data(), od, out.size() * sizeof(uint16_t));
+  b.Synchronize(q);
+  b.Free(xd); b.Free(wd); b.Free(od); b.DestroyQueue(q);
+  return out;
+}
+
+// Gamma values that are EXACTLY representable in f32, binary16 and bfloat16 at
+// once: every one is k/64 with |k| <= 8, so it has at most four significant bits
+// and an exponent well inside binary16's range. bfloat16 is the binding
+// constraint (8 significant bits), and binary16's range is the other one. This is
+// what makes the three-dtype comparison in case 3 an EQUALITY rather than a
+// tolerance.
+std::vector<float> ExactW(int64_t n) {
+  std::vector<float> v(static_cast<size_t>(n));
+  for (int64_t j = 0; j < n; ++j)
+    v[static_cast<size_t>(j)] = static_cast<float>((j % 17) - 8) / 64.0f;
+  return v;
+}
+
+// ─── CASE 3 SHAPE: bf16 activation, 16-bit gamma of the CALLER'S dtype tag.
+// One function for both kF16 and kBF16 so the two arms cannot differ in anything
+// but the tag, which is the only variable case 3 is about.
+std::vector<uint16_t> RunBf16ActW16(Device dev, const std::vector<uint16_t>& x,
+                                    const std::vector<uint16_t>& w, DType wdt, int64_t h) {
+  std::vector<uint16_t> out(static_cast<size_t>(kRows * h), 0);
+  const RmsNormArgs args{1e-6f, /*gemma=*/true};
+  if (dev.type == DeviceType::kCPU) {
+    Queue q{dev, nullptr};
+    Tensor tx = Tensor::Contiguous(const_cast<uint16_t*>(x.data()), DType::kBF16, dev, {kRows, h});
+    Tensor tw = Tensor::Contiguous(const_cast<uint16_t*>(w.data()), wdt, dev, {h});
+    Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, dev, {kRows, h});
+    vt::RmsNorm(q, to, tx, tw, args);
+    return out;
+  }
+  vt::Backend& b = vt::GetBackend(dev.type);
+  Queue q = b.CreateQueue();
+  void* xd = b.Alloc(x.size() * sizeof(uint16_t));
+  void* wd = b.Alloc(w.size() * sizeof(uint16_t));
+  void* od = b.Alloc(out.size() * sizeof(uint16_t));
+  b.Copy(q, xd, x.data(), x.size() * sizeof(uint16_t));
+  b.Copy(q, wd, w.data(), w.size() * sizeof(uint16_t));
+  Tensor tx = Tensor::Contiguous(xd, DType::kBF16, dev, {kRows, h});
+  Tensor tw = Tensor::Contiguous(wd, wdt, dev, {h});
   Tensor to = Tensor::Contiguous(od, DType::kBF16, dev, {kRows, h});
   vt::RmsNorm(q, to, tx, tw, args);
   b.Copy(q, out.data(), od, out.size() * sizeof(uint16_t));
@@ -255,54 +321,91 @@ TEST_CASE("rmsnorm: CUDA runs the bf16-activation/f32-gamma pairing") {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CASE 3. The KNOWN DIVERGENCE this dispatcher carries (#2503).
+// CASE 3. The divergence #2503 named, now CLOSED by serving kF16 (wave RMSTWINS).
 //
+// THIS CASE CHANGED POLARITY. #2493 pinned it as a CUDA REFUSAL:
+// `CHECK_THROWS_WITH(..., doctest::Contains("unsupported weight dtype"))`, because
 // `vt::RmsNorm` admits `IsFloat(weight.dtype)` (`ops.cpp:1030`, `:24`), which
-// includes kF16, and the CPU kernel widens a kF16 gamma like any other
-// (`cpu_ops.cpp:554-557`). The CUDA dispatcher refuses it. That refusal is NOT
-// new -- before #2477 the equality check refused it too, because `x` is only ever
-// dispatched as f32 or bf16 -- but it is a device arm refusing a dtype its CPU
-// sibling accepts, which `cuda_qwen4_exp.cu:60-62` says must be recorded.
+// includes kF16, the CPU kernel widened a kF16 gamma like any other
+// (`cpu_ops.cpp:554-557`), and the CUDA dispatcher refused it --- a device arm
+// refusing a dtype its CPU sibling accepts, which `cuda_qwen4_exp.cu:60-62` says
+// must be recorded. `cuda_ops.cu` now dispatches `case DType::kF16` to
+// `LaunchRmsNorm<Tin, __half>`, so the case pins AGREEMENT instead.
 //
-// It is pinned here so the `default:` arm cannot be quietly turned into a
-// fall-through: doing that would read a kF16 gamma through `const float*`, and
-// without this case every test would stay green.
-TEST_CASE("rmsnorm: a kF16 gamma is admitted by the seam, taken by CPU, refused by CUDA") {
+// NO PRODUCTION LOADER BUILDS A kF16 GAMMA, and the wave that added the arm
+// measured that rather than assuming it: every rank-1 norm weight in this tree is
+// kF32 or kBF16, and `nemotron_h_weights.cpp:1044-1050` --- the one config-driven
+// dtype channel that could produce one --- refuses `"float16"`/`"half"` by name.
+// The arm is served because the SEAM promises it, the CPU arm keeps that promise,
+// `CudaPlatform::supported_dtypes` lists kF16 (`platforms/cuda.cpp:111-113`), and
+// vLLM upcasts any float gamma (`self.weight.float()`,
+// `vllm/models/qwen4_exp/nvidia/ple_layer.py:80`, vLLM origin/main cdefd9d499 ---
+// a forward reference, off this project's pin 5559679229, see #2502).
+//
+// THE INVARIANT IS EQUALITY, NOT A TOLERANCE. The three gammas below hold
+// BIT-IDENTICAL values --- every element is k/64 with |k| <= 8, exactly
+// representable in f32, binary16 and bfloat16 alike --- so all three runs must
+// produce byte-identical output. A tolerance would have passed a build that read
+// the f16 gamma through a `const float*`: that reads 2H bytes out of an H*2-byte
+// buffer, and the first half of the garbage is small denormals near zero, which a
+// 1%-relative bar absorbs. Equality does not absorb it.
+TEST_CASE("rmsnorm: the gamma dtype does not change the answer (f32/f16/bf16)") {
   const std::vector<float> xf = SpreadX(kRows * kIdxH);
   std::vector<uint16_t> xb(xf.size());
   for (size_t i = 0; i < xf.size(); ++i) xb[i] = F32ToBf16(xf[i]);
-  std::vector<uint16_t> w16(static_cast<size_t>(kIdxH), 0x3400);  // 0.25 in binary16
-  std::vector<uint16_t> out(static_cast<size_t>(kRows * kIdxH), 0);
-  const RmsNormArgs args{1e-6f, /*gemma=*/true};
 
-  Queue qc{Cpu(), nullptr};
-  Tensor cx = Tensor::Contiguous(xb.data(), DType::kBF16, Cpu(), {kRows, kIdxH});
-  Tensor cw = Tensor::Contiguous(w16.data(), DType::kF16, Cpu(), {kIdxH});
-  Tensor co = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {kRows, kIdxH});
-  CHECK_NOTHROW(vt::RmsNorm(qc, co, cx, cw, args));
+  const std::vector<float> w32 = ExactW(kIdxH);
+  std::vector<uint16_t> w16(static_cast<size_t>(kIdxH)), wbf(static_cast<size_t>(kIdxH));
+  for (int64_t j = 0; j < kIdxH; ++j) {
+    const size_t u = static_cast<size_t>(j);
+    w16[u] = vt::F32ToF16(w32[u]);
+    wbf[u] = F32ToBf16(w32[u]);
+    // The premise of the equality bar: all three encodings hold the SAME value.
+    REQUIRE(vt::F16ToF32(w16[u]) == w32[u]);
+    REQUIRE(Bf16ToF32(wbf[u]) == w32[u]);
+  }
 
+  const std::vector<uint16_t> from_f32 = RunBf16ActF32W(Cpu(), xb, w32, kIdxH);
+  const std::vector<uint16_t> from_f16 = RunBf16ActW16(Cpu(), xb, w16, DType::kF16, kIdxH);
+  const std::vector<uint16_t> from_bf16 = RunBf16ActW16(Cpu(), xb, wbf, DType::kBF16, kIdxH);
+
+  // Against an independent reference first, so the three-way equality below cannot
+  // be satisfied by three identically wrong runs.
+  std::vector<float> xr(xf.size());
+  for (size_t i = 0; i < xf.size(); ++i) xr[i] = Bf16ToF32(xb[i]);
+  CHECK(BadCount(from_f32, Reference(xr, w32, kRows, kIdxH, 1e-6f)) == 0);
+
+  CHECK(from_f16 == from_f32);
+  CHECK(from_bf16 == from_f32);
+
+  // The gamma must be LOAD-BEARING through the f16 arm specifically, or the
+  // equality above would also hold for a kernel that ignored `w` entirely.
+  std::vector<uint16_t> bumped = w16;
+  bumped[7] = vt::F32ToF16(w32[7] + 4.0f);
+  CHECK(RunBf16ActW16(Cpu(), xb, bumped, DType::kF16, kIdxH)[7] != from_f16[7]);
+}
+
+TEST_CASE("rmsnorm: CUDA serves a kF16 gamma and agrees with CPU byte-for-byte") {
   if (!HasCuda()) {
-    std::printf("[SKIP] no CUDA backend: kF16-gamma refusal NOT exercised on device\n");
+    std::printf("[SKIP] no CUDA backend: kF16-gamma device arm NOT exercised\n");
     return;
   }
+  const std::vector<float> xf = SpreadX(kRows * kIdxH);
+  std::vector<uint16_t> xb(xf.size());
+  for (size_t i = 0; i < xf.size(); ++i) xb[i] = F32ToBf16(xf[i]);
+  const std::vector<float> w32 = ExactW(kIdxH);
+  std::vector<uint16_t> w16(static_cast<size_t>(kIdxH));
+  for (int64_t j = 0; j < kIdxH; ++j)
+    w16[static_cast<size_t>(j)] = vt::F32ToF16(w32[static_cast<size_t>(j)]);
+
   const Device gpu{DeviceType::kCUDA, 0};
-  vt::Backend& b = vt::GetBackend(gpu.type);
-  Queue q = b.CreateQueue();
-  void* xd = b.Alloc(xb.size() * sizeof(uint16_t));
-  void* wd = b.Alloc(w16.size() * sizeof(uint16_t));
-  void* od = b.Alloc(out.size() * sizeof(uint16_t));
-  b.Copy(q, xd, xb.data(), xb.size() * sizeof(uint16_t));
-  b.Copy(q, wd, w16.data(), w16.size() * sizeof(uint16_t));
-  Tensor gx = Tensor::Contiguous(xd, DType::kBF16, gpu, {kRows, kIdxH});
-  Tensor gw = Tensor::Contiguous(wd, DType::kF16, gpu, {kIdxH});
-  Tensor go = Tensor::Contiguous(od, DType::kBF16, gpu, {kRows, kIdxH});
-  // CHECK_THROWS would accept ANY exception, including one from an unrelated
-  // allocation failure -- and worse for this case's purpose: if a fall-through
-  // mutation's 256-byte over-read happened to fault, `Check(cudaGetLastError(), ...)`
-  // would throw and a bare CHECK_THROWS would PASS on the mutated build, reading as
-  // "mutation detected" when it was not. Assert the dispatcher's own message, so the
-  // case is true by construction rather than by allocator luck.
-  CHECK_THROWS_WITH(vt::RmsNorm(q, go, gx, gw, args),
-                    doctest::Contains("unsupported weight dtype"));
-  b.Free(xd); b.Free(wd); b.Free(od); b.DestroyQueue(q);
+  // Byte equality, not a tolerance: the f32 and f16 gammas hold the same values,
+  // so the CUDA f16 arm must produce what the CUDA f32 arm produces. A
+  // fall-through that sent kF16 to `LaunchRmsNorm<Tin, float>` would read the
+  // [128] half buffer as 128 floats and fail here rather than being absorbed.
+  CHECK(RunBf16ActW16(gpu, xb, w16, DType::kF16, kIdxH) ==
+        RunBf16ActF32W(gpu, xb, w32, kIdxH));
+  // And against the host, which is the divergence #2503 was about.
+  CHECK(RunBf16ActW16(gpu, xb, w16, DType::kF16, kIdxH) ==
+        RunBf16ActW16(Cpu(), xb, w16, DType::kF16, kIdxH));
 }

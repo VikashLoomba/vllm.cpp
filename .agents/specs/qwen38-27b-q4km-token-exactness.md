@@ -79,11 +79,29 @@ takes the repacked one:
 The integer inner product is exact in all four; only the `int32 -> float`
 conversion granularity and the order of the `d`/`dmin` multiplies differ.
 
-**Measured on this dev box (x86-64, AVX-512), 2000 random rows per shape:**
-`ggml_vec_dot_*_q8_K` against its own `_generic`, both at `b10451`, gives
-`max_abs_delta` `1.2e-06` to `5.4e-06` and `rms_rel` `1.4e-05` to `9.8e-05`
-across `K` in {2048, 5120, 12288} for Q4_K, Q5_K and Q6_K. Harness and figures
-in `## Evidence`.
+**Measured, on this dev box (x86-64 AVX-512, Ryzen 9 9950X3D), against OUR OWN
+compiled kernels rather than by reading source.** The harness links
+`src/vt/cpu/cpu_quant_dot.cpp` and `cpu_quant_act.cpp` -- compiled with the
+project's own `-ffp-contract=off` polarity -- against `libggml` built at
+`b10451`, and asks three answers for the same bytes: ours, ggml's `_generic`,
+and ggml's dispatched arch kernel. 2000 random rows per shape, `K` in
+{2048, 5120, 12288}:
+
+| quantity | result |
+|---|---|
+| our `QuantizeRowQ8_K` vs `quantize_row_q8_K_ref` | **byte-identical**, 0 of 18,000 rows, 0 of 4.6 M quants |
+| our `VecDotQ6_KQ8_K` vs `ggml_vec_dot_q6_K_q8_K_generic` | **bit-identical**, 0 of 6000 rows |
+| our `VecDotQ4_K/Q5_K` vs their `_generic` | differ on 80-89% of rows, by `max_abs` 1.1e-06 to 4.3e-06, `rms_rel` 5.5e-06 to 1.1e-04 |
+| ggml arch vs ggml `_generic` | differ by `max_abs` 7.2e-07 to 5.4e-06, `rms_rel` 1.4e-05 to 9.8e-05 |
+
+Two things follow. **The `QuantizeQ8KK` hypothesis the issue lists is refuted on
+this path**: the activation encoder reproduces the reference byte for byte. And
+our Q4_K/Q5_K last-ULP disagreement with the body we port is the SAME SIZE as
+ggml's disagreement with itself, so it is a rounding schedule and not a port
+defect -- Q6_K, whose generic body is the same shape MINUS the
+`sumf -= dmin * sumi` term, is bit-identical, which locates the disagreement at
+that one expression and at the `-O3 -ffp-contract=fast` versus
+`-O2 -ffp-contract=off` difference between ggml's build and ours.
 
 **So term A is about two hundred times term B.** `2e-3` per bf16 store, applied
 twice per layer to the residual plus once per projection over 64 layers and
@@ -160,6 +178,12 @@ reproduced #857 byte for byte from a different build.
 ## Evidence required
 
 - The rc job ids, the device, and the raw log paths.
+- The kernel-level figures above, with the exact build recipe. Harness:
+  `ourdot.cpp`, linking this tree's `cpu_quant_dot.cpp` + `cpu_quant_act.cpp`
+  objects against `libggml-cpu.a`/`libggml-base.a`/`libggml.a` from a
+  `GGML_NATIVE=ON` `b10451` build. It is deliberately NOT committed: this
+  project ships without a ggml dependency, and a test that needs one is a
+  dependency by another name.
 - The oracle-against-itself result (repack on versus repack off).
 - The final-logit delta distribution between two oracle configurations, measured
   by teacher-forcing one along the other's token sequence.

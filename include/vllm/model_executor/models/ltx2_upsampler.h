@@ -90,7 +90,20 @@
 //    .agents/specs/ltx25-upsampler-arms.md.
 //  * `dims == 2` WITH `temporal_upsample` — not an arm but a contradiction:
 //    upstream builds that upsampler as a Conv3d (:68-71) and the 2-D forward
-//    hands it a 4-D tensor, so torch raises. Refused by name instead.
+//    hands it a 4-D tensor. It raises on the CHANNEL COUNT and not on the rank:
+//    `Conv3d` reads a 4-D input as an unbatched 5-D one, so at 3 frames against
+//    `mid_channels` 32 it reports "to have 32 channels, but got 3". At
+//    `frames == mid_channels` the conv passes and `PixelShuffleND(1)` fails
+//    instead. Two mechanisms, one contradiction — refused by name once.
+//  * `dims == 2` WITH `rational_resampler` — the sibling, and the dangerous one:
+//    every operator in that branch is per-frame, so this port would compute a
+//    finite, plausible latent no shape check could fault. Upstream raises
+//    `not enough values to unpack (expected 5, got 4)` at
+//    spatial_rational_resampler.py:41. Refused by name.
+//
+//    Both are EXECUTED against the real module by
+//    scripts/gen-ltx2-pipeline-goldens.py, which asserts each raises and what it
+//    says, so neither refusal can drift into one upstream would serve.
 //
 // ─── DTYPE ───────────────────────────────────────────────────────────────────
 // f32, because this is the CPU REFERENCE arm and the gate compares the ALGORITHM

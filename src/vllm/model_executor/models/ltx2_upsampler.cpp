@@ -129,6 +129,15 @@ Volume Conv2dPad1PerFrame(const Volume& in, int64_t out_channels,
   out.data.assign(static_cast<size_t>(out.elems()), 0.0f);
   Require(weight.size() == static_cast<size_t>(out_channels * in.channels * k * k),
           "ltx2 upsampler: conv2d weight has the wrong element count");
+  // The bias half of the contract, which `Conv3dPad1` above has always had and
+  // this helper did not. Indexing `bias[oc]` unchecked reads past the end of a
+  // std::vector when a checkpoint carries a correct kernel and a short bias --
+  // UB and silent garbage, where the identical 3-D defect gets a named refusal.
+  // Nothing upstream of here validates it: `Ltx2LoadVaeWeights` loads by NAME and
+  // checks no shape. The dims=2 arm routes four parameter groups through this
+  // helper, so it is the path that made the gap reachable.
+  Require(bias.size() == static_cast<size_t>(out_channels),
+          "ltx2 upsampler: conv2d bias has the wrong element count");
 
   for (int64_t oc = 0; oc < out_channels; ++oc) {
     for (int64_t f = 0; f < out.frames; ++f) {
@@ -493,9 +502,37 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
   const bool two_d = config.dims == 2;
   // The one combination upstream cannot run. `dims=2` takes the forward at :85,
   // which hands `self.upsampler` a 4-D tensor, while `temporal_upsample` built
-  // that module as a Conv3d (:57 for both flags, :70 for temporal alone). Torch
-  // raises on the rank; this names the contradiction instead, which is the same
-  // event with a message a caller can act on.
+  // that module as a Conv3d (:57 for both flags, :70 for temporal alone).
+  //
+  // WHAT ACTUALLY FIRES UPSTREAM IS NOT THE RANK, and this comment said it was.
+  // `Conv3d` accepts a 4-D input as an UNBATCHED 5-D one, so the folded
+  // `(b*f, c, h, w)` is read as `(C, D, H, W)` and the CHANNEL count is what
+  // disagrees. Measured at the pin with `_UPS_MID = 32` and 3 frames:
+  //   RuntimeError: Given groups=1, weight of size [64, 32, 3, 3, 3], expected
+  //   input[1, 3, 32, 4, 6] to have 32 channels, but got 3 channels instead
+  // The conclusion survives the correction and the reasoning does not: at
+  // `frames == mid_channels` that Conv3d would PASS, and `PixelShuffleND(1)`'s
+  // einops pattern (pixel_shuffle.py:47-52) is what fails instead. So upstream
+  // refuses the configuration by two different mechanisms depending on a shape
+  // coincidence, which is exactly why this refuses it by NAME once and up front.
+  // `scripts/gen-ltx2-pipeline-goldens.py` runs both contradictions through the
+  // real module and asserts the message, so a pin that changed either mechanism
+  // fails the generator rather than leaving this paragraph wrong again.
+  // The SIBLING contradiction, and it fails differently from the temporal one:
+  // every operator inside the rational branch is already per-frame, so a folded
+  // one-frame volume satisfies all of them and this config computes a complete,
+  // finite, plausible latent. Upstream cannot: `SpatialRationalResampler.forward`
+  // opens with `b, _, f, _, _ = x.shape`
+  // (model/upsampler/spatial_rational_resampler.py:41) and the dims=2 forward
+  // reaches it at model.py:94 having already folded the frame axis away at :86,
+  // so torch raises `not enough values to unpack (expected 5, got 4)`. No shape
+  // check here can see this one, which is why it has to be a refusal.
+  Require(!(two_d && config.rational_resampler),
+          "ltx2 upsampler: dims=2 with rational_resampler=true is not a configuration upstream "
+          "can run. SpatialRationalResampler.forward unpacks five dimensions at "
+          "model/upsampler/spatial_rational_resampler.py:41, and the dims=2 forward "
+          "(model/upsampler/model.py:85-100) folds the frame axis into the batch at :86 before "
+          "reaching it at :94, so it is handed a 4-D tensor and raises.");
   Require(!(two_d && config.temporal_upsample),
           "ltx2 upsampler: dims=2 with temporal_upsample=true is not a configuration upstream "
           "can run. model/upsampler/model.py:68-71 builds the temporal upsampler as a Conv3d, "

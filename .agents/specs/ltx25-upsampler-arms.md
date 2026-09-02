@@ -260,6 +260,22 @@ end-to-end render.
 Mutation B is the one worth keeping in mind: it is the shape of defect this file's
 header warns about twice, and it passes an end-to-end render.
 
+### A sibling defect this row did NOT fix, and why
+
+`src/vllm/multimodal/ltx2_video.cpp:3484-3486` tells a caller who supplies the
+temporal-only checkpoint that "no phase of any recipe this engine serves
+consumes it, because its only upstream consumer is DFRPipeline's rounds loop,
+which is not ported". DFR **is** ported and drives that arm at `:5042`. It is
+the same false statement this row corrected in `ltx2_upsampler.h` under
+[#2580](https://github.com/mudler/vllm.cpp/issues/2580), one file over, and it
+is user-facing where the header's was not.
+
+It is already tracked as **D11b** in
+`.agents/specs/ltx25-completion-scope.md` §6.1, so it is recorded here rather
+than re-filed — intake without an exit is what that document says produced 701
+open issues. Left to its owner because repairing a user-facing refusal is its
+own red-first change, not a comment fix ridden along on this one.
+
 ### What was NOT done
 
 No `dims=2` checkpoint exists on the NAS, so this arm is gated against the
@@ -270,7 +286,27 @@ checkpoint row: there is no artifact to pin.
 ## Owed
 
 - **A8, the spatiotemporal upsampler arm** (`model/upsampler/model.py:55-59`,
-  refused at `src/vllm/model_executor/models/ltx2_upsampler.cpp:465`). Returned
-  as a decision, not a port: §5 has the measurement. Owner: this row. Tracked by
-  [#2577](https://github.com/mudler/vllm.cpp/issues/2577), which carries the
-  same reasoning in its body.
+  refused through `Ltx2RefuseUnportedPipelineFeature(kSpatiotemporalUpsampler)`).
+  Returned as a decision, not a port: §5 has the measurement. Tracked by
+  [#2584](https://github.com/mudler/vllm.cpp/issues/2584), which carries the
+  derivation and the three answers a decision has to choose between.
+
+  **It has its own issue for a reason.** It was first recorded against
+  [#2577](https://github.com/mudler/vllm.cpp/issues/2577), the issue this row
+  CLOSES, so the owed item would have pointed at a closed issue the moment the
+  work landed. `scripts/check-agent-record.py` cannot catch that, because this
+  `## Owed` entry satisfies the gate on its own -- which is precisely why the
+  entry has to name a live issue rather than lean on the gate.
+
+### The scope document contradicts §5, and this is the record of it
+
+`.agents/specs/ltx25-completion-scope.md:371` calls A8 "the single cheapest real
+gap and the only reachable unported-feature refusal", and its §8 sizes it S
+beside A9. §5 above falsifies the sizing: the operator is cheap and the landing
+is not, because the second consumer at `ltx2_video.cpp:3532` was not counted.
+
+That document is operator-owned and a shared-file lock under AGENTS.md
+§Records, so it is **not edited from this row**. The contradiction is recorded
+here and in [#2584](https://github.com/mudler/vllm.cpp/issues/2584) instead, for
+the operator to reconcile at their own cadence. Anyone reading the sequence
+should treat order 6's "S each" as holding for A9 alone.

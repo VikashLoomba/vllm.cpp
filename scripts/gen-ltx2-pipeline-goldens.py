@@ -1212,6 +1212,58 @@ def section_upsampler(out) -> None:
     emit_manifest(out, "kLtx2UpsDims2Param", d2manifest)
     emit_f32(out, "kLtx2UpsDims2Golden", d2result.numpy())
 
+    # THE TWO CONTRADICTIONS the dims=2 arm cannot reach, asserted against the
+    # EXECUTED module and deliberately emitting nothing. These are FAILURE cases,
+    # so what the two `Require`s in ltx2_upsampler.cpp are gated by is the
+    # exception upstream raises, not a value — and running them here is what stops
+    # either refusal from drifting into one upstream would happily serve, which is
+    # the polarity AGENTS.md names as this port inventing a refusal.
+    #
+    # Both are the same event: the dims=2 forward folds the frame axis into the
+    # batch (model.py:86) and hands `self.upsampler` a 4-D tensor at :94, while
+    # both of these modules were built for a 5-D one. The MESSAGES are asserted
+    # because they differ, and because the obvious reading of the temporal one is
+    # wrong — torch does not raise on the rank there. `Conv3d` accepts a 4-D input
+    # as an UNBATCHED 5-D one, so `(b f, c, h, w)` is read as `(C, D, H, W)` and
+    # the CHANNEL count is what fails. With `_UPS_MID = 32` and 3 frames those two
+    # differ, which is the only reason the check fires at all.
+    for tag, flags, want in (
+        (
+            "temporal",
+            dict(spatial_upsample=False, temporal_upsample=True, rational_resampler=False),
+            "channels, but got",
+        ),
+        (
+            "rational",
+            dict(spatial_upsample=True, temporal_upsample=False, rational_resampler=True),
+            "not enough values to unpack",
+        ),
+    ):
+        contradiction = LatentUpsampler(
+            in_channels=_UPS_IN,
+            mid_channels=_UPS_MID,
+            num_blocks_per_stage=_UPS_BLOCKS,
+            dims=2,
+            spatial_scale=2.0,
+            **flags,
+        )
+        contradiction.eval()
+        fill_module(contradiction, f"ltx2.ups.Dims2{tag}.")
+        try:
+            contradiction(d2latent)
+        except Exception as exc:  # noqa: BLE001 — the raise IS the assertion
+            if want not in str(exc):
+                raise AssertionError(
+                    f"dims=2 + {tag} raised {str(exc)!r}, which does not carry {want!r}. "
+                    "ltx2_upsampler.cpp names that mechanism in its refusal, so either "
+                    "the pin moved or the comment is wrong"
+                ) from exc
+        else:
+            raise AssertionError(
+                f"dims=2 + {tag} RAN on upstream at this pin. ltx2_upsampler.cpp refuses "
+                "it, and a refusal upstream does not raise is this port's invention"
+            )
+
     # The spatial+temporal arm stays REFUSED (model.py:55-59: `8 * mid_channels`
     # and `PixelShuffleND(3)`, a different operator). Its parameter shape is
     # emitted anyway so the C++ refusal is gated against what upstream would

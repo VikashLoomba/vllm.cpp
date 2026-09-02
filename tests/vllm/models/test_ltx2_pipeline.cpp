@@ -2253,6 +2253,50 @@ TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   // served, and only this contradiction refused.
   CHECK(two_d_message.find("is not ported") == std::string::npos);
 
+  // THE SIBLING OF THE GUARD ABOVE, and the one this row first shipped without.
+  // `dims=2` with the RATIONAL resampler is upstream's OTHER 2-D contradiction:
+  // `SpatialRationalResampler.forward` opens with `b, _, f, _, _ = x.shape`
+  // (model/upsampler/spatial_rational_resampler.py:41), and the dims=2 forward
+  // reaches it at model.py:94 having ALREADY folded the frame axis into the
+  // batch at :86. Upstream raises
+  // `ValueError: not enough values to unpack (expected 5, got 4)` — the same
+  // mechanism as the temporal case, one line further in.
+  //
+  // Driven with its OWN correctly enumerated weights, because that is the whole
+  // point: every operator inside the rational branch is already per-frame, so a
+  // one-frame volume satisfies all of them and this config computes a complete,
+  // finite, plausible latent that upstream cannot produce. No shape check
+  // anywhere can see it. Only a refusal can.
+  vllm::Ltx2UpsamplerConfig rational_two_d = ReducedUpsamplerConfig(true, 2.0, "ltx2.ups.r2.");
+  rational_two_d.dims = 2;
+  const ParamBag rational_bag = BuildUpsamplerParams(rational_two_d);
+  const std::string rational_two_d_message = RefusalMessage(
+      [&] { (void)vllm::Ltx2LatentUpsample(rational_two_d, rational_bag.weights, latent); });
+  INFO("arm = rational dims=2 refusal = ", rational_two_d_message);
+  CHECK(Mentions(rational_two_d_message, "dims=2 with rational_resampler=true"));
+  CHECK(Mentions(rational_two_d_message, "spatial_rational_resampler.py:41"));
+
+  // THE CONV2D BIAS CONTRACT, which the 3-D helper has had since #644
+  // (`Conv3dPad1`, ltx2_upsampler.cpp:82) and the 2-D one did not. Before this
+  // repair `Conv2dPad1PerFrame` checked only the weight, so a dims=2 checkpoint
+  // carrying a correct kernel and a bias one element short read past the end of
+  // a std::vector — UB and silent garbage — where the identical dims=3 defect
+  // gets a named refusal. Nothing upstream of the helper validates it:
+  // `Ltx2LoadVaeWeights` (ltx2_video.cpp:1490) loads by NAME and checks no shape.
+  //
+  // `initial_conv` is the first of the four groups the dims=2 arm routes through
+  // this helper, so it is the earliest place the read would happen.
+  vllm::Ltx2UpsamplerConfig short_bias_cfg = ReducedUpsamplerConfig(false, 2.0, "ltx2.ups.b2.");
+  short_bias_cfg.dims = 2;
+  ParamBag short_bias = BuildUpsamplerParams(short_bias_cfg);
+  std::vector<float>& initial_bias = short_bias.weights.tensors["ltx2.ups.b2.initial_conv.bias"];
+  REQUIRE(initial_bias.size() == static_cast<size_t>(vllm_test::kLtx2UpsMidChannels));
+  initial_bias.pop_back();
+  const std::string short_bias_message = RefusalMessage(
+      [&] { (void)vllm::Ltx2LatentUpsample(short_bias_cfg, short_bias.weights, latent); });
+  INFO("short conv2d bias refusal = ", short_bias_message);
+  CHECK(Mentions(short_bias_message, "conv2d bias has the wrong element count"));
+
   // Upstream's own ValueError when neither flag is set (model.py:73-74).
   vllm::Ltx2UpsamplerConfig neither = ReducedUpsamplerConfig(false, 2.0, "");
   neither.spatial_upsample = false;

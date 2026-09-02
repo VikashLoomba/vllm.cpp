@@ -2813,6 +2813,48 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
     CHECK(trace.round_merged_slot_tiles[2] == 1);
   }
 
+  SUBCASE("a dims=2 TEMPORAL upsampler checkpoint is refused AT LOAD, not minutes in") {
+    // THE PLACEMENT IS THE POINT. `dims=2` with `temporal_upsample` is a
+    // contradiction upstream cannot run, and `Ltx2LatentUpsample` refuses it —
+    // but that refusal fires inside the rounds loop (ltx2_video.cpp:5042), which
+    // is reached only after two full denoise stages. The load block that owns
+    // `temporal_upsampler_path` exists precisely so a caller who supplied the
+    // wrong file learns at load rather than several minutes in, and it says so
+    // in its own comment. It checked `temporal_upsample` and `spatial_upsample`
+    // there and did not check `dims`, so this one checkpoint cleared both
+    // siblings and failed downstream anyway.
+    //
+    // Asserted at `LoadVideoEngine`, not at `Generate`: a case that only checks
+    // the message would stay green with the guard back in the rounds loop, which
+    // is the exact defect.
+    vllm::Ltx2UpsamplerConfig temporal_two_d =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    temporal_two_d.spatial_upsample = false;
+    temporal_two_d.temporal_upsample = true;
+    temporal_two_d.dims = 2;
+    const std::string two_d_path = ws.root + "/dfr_temporal_dims2.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(temporal_two_d, two_d_path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("dfr");
+    SupplyRequiredAdapter(&mp, "dfr", ws.root + "/dfr_dims2_lora.safetensors");
+    mp.extras["upsampler_path"] = ws.paths.upsampler;
+    mp.extras[vllm::multimodal::kLtx2TemporalUpsamplerPathExtra] = two_d_path;
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      FAIL_CHECK("a dims=2 temporal upsampler must be refused at LOAD, beside its two siblings");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("dims=2") != std::string::npos);
+      CHECK(msg.find(std::string(vllm::multimodal::kLtx2TemporalUpsamplerPathExtra)) !=
+            std::string::npos);
+      // The upstream site that makes it a contradiction rather than a taste.
+      CHECK(msg.find("model.py:68-71") != std::string::npos);
+    }
+  }
+
   SUBCASE("rounds without a temporal upsampler are refused, not silently skipped") {
     // Upstream's second refusal, raised at the top of `__call__` beside the
     // malformed-value one (dfr_pipeline.py:286-287). Refused rather than run at

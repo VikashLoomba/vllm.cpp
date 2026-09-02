@@ -2518,6 +2518,11 @@ vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
 # activation choice that mirrors vLLM rather than the kernel oracle.
 vllm_cpp_add_test(test_exl3_gemv vt/test_exl3_gemv.cpp)
 vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
+# BACKEND-ROCM-EXL3 (#2433): the ROCm arms of the exactly two ops an EXL3
+# checkpoint ran on the CPU reference tier. Built in EVERY configuration and not
+# only under VLLM_CPP_HIP -- its cases skip when no ROCm backend is registered,
+# and a suite that only a HIP build compiles is a suite CI never reads.
+vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
 
 # QUANT-EXL3 W1a (#2181). Placed after the MODEL-DSV4-EXL3 kernel suites above
 # rather than among them: these two gate the SCHEME on the shared linear seam,

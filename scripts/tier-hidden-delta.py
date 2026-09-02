@@ -177,7 +177,7 @@ def main() -> int:
     print(f"delta is A minus B; rel_l2 is ||A-B|| / ||B||, so B ({args.label_b}) "
           f"is the denominator")
     print(f"full-attention interval = {args.full_attention_interval} "
-          f"(layer l is full-attn when (l+1) %% interval == 0)")
+          f"(layer l is full-attn when (l+1) mod interval == 0)")
 
     if (only_a or only_b) and not args.allow_drops:
         die(

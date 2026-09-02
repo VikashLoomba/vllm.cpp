@@ -520,6 +520,12 @@ jobs:
           # because this lane has no 598 MB checkpoint and a case that cannot
           # run must say so rather than pass.
           python3 tests/scripts/test_ltx25_prompt_adherence.py
+          # The diagnosis that decided whether the render's smoothness CAUSES
+          # that adherence gap (#2513). Its answer is NEGATIVE, and a negative
+          # answer is what a broken instrument returns for free, so the suite
+          # feeds each part a signal with a closed-form answer. numpy only: no
+          # checkpoint, no frames, no GPU, so nothing here can skip silently.
+          python3 tests/scripts/test_ltx25_adherence_detail_loss.py
           # Same numpy-only lane, same reason (#2011): the GLM-5.3-Flash
           # GGUF converter avoids gguf-py on purpose -- upstream has no
           # `glm5_next`, and `gguf.quants.Q2_K` has a dequantizer and NO

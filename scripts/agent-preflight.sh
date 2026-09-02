@@ -461,6 +461,24 @@ else
     "numpy is not importable here, and the tool this suite exercises needs it." \
     "CI installs python3-numpy and runs the same suite."
 fi
+# THE DIAGNOSIS THAT DECIDED WHETHER THE SMOOTHNESS CAUSES THE ADHERENCE GAP
+# (`LTX25-ADHERENCE-DETAIL-LOSS`, #2513). The row published a NEGATIVE result --
+# the spectrum says our render is not smoother, the within-render correlation
+# points the wrong way, and blurring the reference does not reproduce the gap --
+# and a negative result is the shape a BROKEN instrument produces for free. So
+# every case feeds a part of that instrument a signal whose answer is known in
+# closed form, and several assert it moves in the direction the falsified
+# hypothesis would have needed. Two of them were red on arrival and found real
+# defects: an empty radial bin read as "below unity" and pushed the crossover
+# upward, and a colour fixture measured luma's channel mixing rather than the
+# gamma fit. numpy only -- no checkpoint, no frames, no network, no GPU.
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_ltx25_adherence_detail_loss" python3 tests/scripts/test_ltx25_adherence_detail_loss.py
+else
+  skip "test_ltx25_adherence_detail_loss" \
+    "numpy is not importable here, and every case computes over arrays." \
+    "CI installs python3-numpy and runs the same suite."
+fi
 # THE GLM-5.3-Flash GGUF CONVERTER (#2011). Same shape and the same one
 # dependency: `scripts/convert-glm5-next-gguf.py` deliberately does not use
 # gguf-py -- upstream has no `glm5_next` and, decisively, `gguf.quants.Q2_K`

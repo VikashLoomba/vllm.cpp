@@ -840,3 +840,50 @@ frames, so nothing here measures how far the reading moves between runs.
 `## Outcome` declared its blockiness ceiling was blind to, and consistency is
 all it is.** No measurement here connects the two, the ablation that would is
 not specified, and this row does not own it.
+
+**UPDATE, 2026-09-01, and this one CORRECTS a claim above rather than extending
+it.** The sentence "**our render is somewhat SMOOTHER than upstream's**" is
+FALSE, and `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) measured it. The two REPORTED
+statistics that motivated it are unchanged and were read correctly; the
+inference drawn from them was not, and no spectrum had ever been taken.
+
+Measured border-free -- Welch over interior 64-pixel tiles, which is the only
+estimator here that the frame's own wrap step cannot reach -- our render carries
+**1.4031x the reference's ABSOLUTE high-band power** (>= 0.20 cycles per pixel)
+at **1.0373x its mid-band power**, so the fine-scale end is up by 40% while the
+mid band is equal. `sharpness_mean` is a mean absolute gradient and therefore
+reads the mid band, which is why it fell while the high band rose. There is no
+high-frequency rolloff, and "smoother" describes a rolloff.
+
+**An earlier version of this paragraph said "77.79% MORE" and cited a crossover
+that does not exist. Both came from a Hann-windowed whole-frame spectrum and are
+WITHDRAWN.** A window removes the wrap step but tapers half the frame's area
+away; without one, the step's `1/f^2` leak inflates the low bins instead. The two
+renders do not carry the same step -- our wrap jump is 73.39 against 49.48 -- so
+the error does not cancel in a ratio, and the same comparison read -25.25% raw
+and +77.51% windowed. `ltx25-adherence-detail-loss.md` `## CORRECTION` carries the
+derivation and the four-convention table.
+
+The intervention settles the direction that the statistics alone could not, and
+it is the one applied to the REFERENCE's frames. Blurring upstream's own render
+until its sharpness is **a fifth** of ours -- a visibly destroyed picture -- costs
+it **1.9687** CLIP points against an observed gap of **2.7305**, and it still
+ranks the true prompt first on 23 of 25 frames. Blurring it merely to our own
+sharpness costs **0.1192**, which is 4.4% of the gap. No achievable amount of
+smoothing reproduces our shortfall, so detail loss is not sufficient to produce
+it.
+
+**An earlier version of this paragraph said "blurring our own frames at sigma
+1.0 RAISES their CLIP score by +1.9131", and that figure is WITHDRAWN.** On our
+frames a decoy outranks the true prompt from sigma 0.50 upward, so those arms
+score no adherence at all; the only row of that sweep the scorer can still read
+moves our score by **-0.0029**. `ltx25-adherence-detail-loss.md`
+`## CORRECTION 2` carries the derivation. The conclusion this paragraph supports
+is unchanged, because the reference sweep above carries it on its own.
+
+The blockiness ceiling this row landed is untouched and its verdict stands. What
+changes is the sentence a reader was left with about WHY: the gate is blind to a
+smoothness difference by construction, and on these two renders there is no
+smoothness difference for it to be blind to. The numbers are in
+[`ltx25-adherence-detail-loss.md`](ltx25-adherence-detail-loss.md) `## Outcome`
+and the full JSON is at `tests/parity/goldens/ltx25_detail_loss/detail-loss.json`.

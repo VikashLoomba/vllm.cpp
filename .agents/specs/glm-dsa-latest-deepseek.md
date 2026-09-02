@@ -3434,3 +3434,86 @@ invented.
 
 **Next action:** W1 and W2, both CPU, both independent. W1 belongs to
 `QUANT-GGUF-IQ4_XS` and unlocks two arms at once. W4 is now unblocked on W3.
+
+### 3.11 The second decode step, and the read-key registered before it runs
+
+**Status: the legs are QUEUED on `dgx:gpu0` and nothing below is a result.**
+Issue [#2596](https://github.com/mudler/vllm.cpp/issues/2596). This section is
+written before the measurement on purpose, so that what it predicts cannot be
+fitted to what it later reports.
+
+**The gap §3.10 leaves open, stated as the counter that says it.** §3.10's
+landed run is `--max-tokens 1`, and its token comes out of prefill. Its own
+final line is `steps=1 hits=0 misses=6399 evictions=0 fills=4096
+exhausted=2303`. `hits=0` and `evictions=0` are not measurements of slot reuse;
+they are the absence of any. The lane was filled and never read, because nothing
+asked it for a second step. **No second decode step has ever run on this model,
+on this box or any other**, so the slot cache — the whole mechanism this row
+depends on — is exercised here at its weakest possible point.
+
+**Why the first multi-token run is also a correctness question.**
+[#2544](https://github.com/mudler/vllm.cpp/issues/2544) names `glm_moe_dsa`
+among five architectures that never read
+`ModelForwardInput::device_token_ids`, and it is explicit that its list is filed
+on a `grep` and that each entry is "a candidate, not a conviction". Two facts
+make the candidate reachable on precisely the box this row is gated on, and both
+are read off the tree at `5649e07d2`:
+
+1. No `glm_moe_dsa` translation unit mentions `device_token_ids`.
+   `ForwardGlmMoeDsaForCausalLM` (`glm_moe_dsa_registry.cpp:96-107`) passes
+   `input.token_ids` through with no `detail::DeviceTokenIdsScope`, where
+   `qwen3_moe_registry.cpp:100` takes one.
+2. `GPUModelRunner::async_device_mirror()` (`runner.cpp:4577-4601`) engages on
+   **integrated OR discrete** CUDA, and its own comment names the integrated arm
+   "GB10, UnifiedMemory AND is_integrated_gpu" as DEFAULT ON. `dgx:gpu0` is a
+   GB10, so the mirror is live and the host `token_ids` a decode row reads is
+   the stale one.
+
+**The read-key.** Two legs, one variable, the same binary and the same artifact,
+with expert streaming ON in BOTH (`VT_MOE_EXPERT_STREAM=1`,
+`VT_MOE_EXPERT_STREAM_SLOTS=8192`), `--device cuda`, prompt
+`The capital of France is`, `--max-tokens 4`, `--temperature 0`:
+
+| leg | env |
+|---|---|
+| C | default |
+| E | `VT_ASYNC_DEVICE_MIRROR=0` |
+
+- **C and E differ ⇒ CONVICTION.** `glm_moe_dsa` embeds the stale host
+  identifiers, so every decode step after the first generates from token id 0.
+  This is the same isolation that convicted
+  `Glm5NextForConditionalGeneration` (#2544's comment, `dgx:gpu0`, 2026-09-01),
+  and leg E is then the only arm whose text may be quoted.
+- **C and E agree ⇒ FALSIFICATION.** #2544's grep-based candidacy is wrong about
+  this model, and that is recorded as such rather than left as a suspicion.
+
+**Neither outcome says anything about expert streaming**, which is ON in both
+legs. Whichever leg emits text, that text is streamed text. The variable moved
+is the async device mirror and nothing else.
+
+**The recipe is the script that runs, not a description of one.**
+[`.agents/scripts/glm53-dsa-second-step.sh`](../scripts/glm53-dsa-second-step.sh)
+is byte-identical to the file the lease executes (sha256
+`b811f4b54c43e830f2990e93e6fde45905e888f17b25c87add6ee4174a18038f`), and it
+carries the read-key above in its own header so the prediction travels with
+the numbers. Every verdict it prints is an expression over bytes it reads
+back off disk; no conclusion string in it is a constant. That is deliberate:
+a job on this box has reported `3 runs all rc=0` over its own captured
+`rc=1`, from a label that never read its input.
+
+**Bytes are compared as bytes.** The sibling's divergence was ` Paris.` against
+` Paris Paris`, which agrees for five characters; a `diff` of rendered text is
+not the instrument, and the runner records `od -An -tx1` of each leg's stdout.
+
+**What the run may NOT produce.** A rate. This row has no vLLM denominator at
+any revision, and `## Gates` binds: correctness first, and a decode whose
+identifiers are in question is not a correctness result. If the legs diverge, no
+tok/s from either arm is admissible.
+
+**Owed if the lease does not free.** `dgx:gpu0` is the only GB10 the project can
+reach, and it is the only part where `host_memory_is_device_addressable()`
+answers true for this artifact's 187.312 GiB of towers. If the legs do not run,
+the gap above stays exactly as written and is owned by
+[#2596](https://github.com/mudler/vllm.cpp/issues/2596): the reuse counters stay
+unmeasured, and #2544's candidacy for this model stays unresolved. It is not
+inferrable from the one-token run, and this section does not infer it.

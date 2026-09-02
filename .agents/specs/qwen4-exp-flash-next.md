@@ -8970,6 +8970,52 @@ it leaves MOEDIV's conclusion standing. Do NOT widen the router's dtype, and do
 NOT change the tie-break polarity, to make any arm agree — either move is a
 divergence from the oracle.
 
+### Outcome -- the hypothesis is FALSE and the coverage gap was REAL
+
+**H is false. The CUDA top-k realises the lowest-index tie-break it declares.**
+Measured on `thor:gpu0` at tree `64617b150`, job
+`5f50e5f7-c730-463f-93cc-3293835ed007`, pod `rc-worker-n8smh`, `NVIDIA Thor`,
+driver 595.78, cc 11.0, nvcc `cuda_13.0.r13.0`, `sm_110`. `CMAKE rc=0`,
+`BUILD rc=0 objects=586`, 41 `*.cu.o`, `libcudart.so.13` and `libcublasLt.so.13`
+in the test binary's own `ldd`.
+
+`test_moe_router_tie_stability`: **4 cases, 4652 assertions, 0 failed, rc = 0.**
+Closed-form selection, serial-oracle agreement, 279 repeat comparisons and 2313
+batch-position comparisons, at E in {256, 512, 1024}, k in {8, 10}, f32 and bf16,
+`VT_MOE_ROUTER_WARP` pinned both ways with the pinned state `REQUIRE`d.
+
+So MOEDIV's reading stands. The `qwen4_exp` CPU-vs-CUDA expert flips are
+tie-break order under a perturbed input, not an unstable tie-break, and the
+session goal's remaining three disagreeing token ids stay attributed to
+arithmetic. **No fix was made, because none was needed, and the three ids do not
+move.**
+
+**The coverage gap this wave named was real, and the mutation quantifies it.**
+Flipping the block kernel's per-thread strided scan to highest-index-wins
+(`cuda_moe.cu`, ONE site, asserted `n == 1`, `MUT BUILD rc=0 objects=1`) is
+caught by 104 of the new file's assertions and by **ZERO assertions of the
+standing sweep**: `test_ops_moe_grouped` read `1907 | 1906 passed | 1 failed`
+before AND after, that one failure being the pre-existing #962 Marlin NVFP4
+block-size disagreement on this arch, and `test_ops_moe` read `33451 | 33451`
+both times. Restoring returned 4652/4652.
+
+| geometry | pattern | `par == r.expect` failures under the mutation |
+|---|---|---|
+| E = 512 | 3, 5 | 12, 12 |
+| E = 1024 | 3, 5 | 12, 12 |
+| **E = 256** | any | **0** |
+
+Zero at E = 256 is the whole finding: the compare the mutation breaks does not
+exist below `E > kBlock`, which is why a sweep that stops at 256 is blind to it.
+
+**One negative result worth keeping.** The mutant stayed perfectly
+DETERMINISTIC -- all 279 repeat and 2313 batch comparisons passed with the wrong
+tie-break in place. Repeatability is necessary and never sufficient, and a wave
+that had measured only determinism would have called that mutant clean.
+
+Full record:
+[`docs/bench-evidence/qwen4exp-moe-tiebreak-stability-20260902.md`](../../docs/bench-evidence/qwen4exp-moe-tiebreak-stability-20260902.md).
+
 
 ## Now
 

@@ -70,18 +70,28 @@ Do not use a run with CPU fallbacks as a performance result.
 | Device enum | [`include/vt/device.h`](../include/vt/device.h) | Compiled and routed through the shared device switch |
 | Architecture mapping | [`include/vt/rocm/rocm_arch.h`](../include/vt/rocm/rocm_arch.h) | Unit-tested gfx name mapping |
 | Runtime backend | [`src/vt/rocm/rocm_backend.hip`](../src/vt/rocm/rocm_backend.hip) | Runs on five gfx architectures; managed allocation still needs an integrated-board rerun |
-| Operation table | [`src/vt/rocm/rocm_ops.hip`](../src/vt/rocm/rocm_ops.hip) | 44 distinct registered `OpId` values at the recorded count |
+| Operation table | [`src/vt/rocm/rocm_ops.hip`](../src/vt/rocm/rocm_ops.hip) | One `Registrar` that names every `OpId` this backend serves natively. Recount it with the command below rather than quoting a number from here |
 | Kernels | [`src/vt/rocm/`](../src/vt/rocm/) | Dense, GDN, attention, sampling, and the contributor-tested Gemma 4 FP8 MoE path |
 | Platform | [`src/vllm/platforms/rocm.cpp`](../src/vllm/platforms/rocm.cpp) | Runtime-verified on five gfx architectures |
 | Attention | [`src/vt/rocm/rocm_paged_attn.hip`](../src/vt/rocm/rocm_paged_attn.hip) | Native paged attention and the SharedK WMMA prefill path |
 | Build | [`CMakeLists.txt`](../CMakeLists.txt) | `VLLM_CPP_HIP` configuration and build verified on five architectures |
 | Tests | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | Runtime cases pass; managed-allocation cases remain pending |
 
-Recount registered operations before you quote the total:
+Recount registered operations before you quote the total. The scan must not
+depend on where the argument list wraps: several calls in `rocm_ops.hip` break
+the line after `RegisterOp(`, and a line-based `grep` never sees `RegisterOp(`
+and `OpId::` together on those (#2573). Read the whole file and match across
+newlines:
 
 ```sh
-grep -rho 'RegisterOp(OpId::[A-Za-z0-9_]*' src/vt/<backend>/ | sort -u | wc -l
+grep -rhoz 'RegisterOp([[:space:]]*OpId::[A-Za-z0-9_]*[[:space:]]*,[[:space:]]*DeviceType::kROCM' \
+    src/vt/rocm/ | tr '\0' '\n' | grep -o 'OpId::[A-Za-z0-9_]*' | sort -u | wc -l
 ```
+
+Substitute the `DeviceType::` value for another backend. Naming the device in the
+pattern is what keeps the count answering the question a reader asked -- the
+previous command counted every `RegisterOp(OpId::` line in the directory
+regardless of which device it registered for.
 
 ## Hardware notes
 

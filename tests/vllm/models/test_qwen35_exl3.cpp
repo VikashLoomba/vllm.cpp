@@ -335,7 +335,7 @@ HfConfig DenseConfig(bool with_exl3_quant_config,
   c.num_attention_heads = 2;   // q_proj N = 2*Hq*Dh = 256 (output gate doubled)
   c.num_key_value_heads = 2;   // k/v_proj N = Hkv*Dh = 128
   c.head_dim = 64;             // o_proj K = Hq*Dh = 128
-  c.layer_types = {"linear_attention", "full_attention"};
+  c.layer_types = layer_types;
   c.intermediate_size = 128;
   c.num_experts = 0;
   c.linear_num_key_heads = 1;
@@ -482,13 +482,21 @@ void AppendGdnLayer(std::vector<FixtureTensor>& out, const std::string& base,
     out.push_back({la + "out_proj.weight", "BF16", {g.hidden, g.value_dim},
                    RemainderBytes({g.hidden, g.value_dim}, seed + 3, 0.1F, false)});
   }
-  const char* ba_dt = f16_remainder ? "F16" : "BF16";
+  // KEYED ON THE GDN ARM, not on the dense one. F16 `in_proj_a`/`in_proj_b` is
+  // what accompanies a QUANTIZED tower in the artifact; a checkpoint whose
+  // dense half is EXL3 while this tower is plain bf16 stores them BF16 like
+  // every other bf16 tower, and the loader's non-EXL3 rung refuses F16 there by
+  // name. The decoded twin also writes BF16, and `RemainderBytes` derives it
+  // from the SAME fp16 values, so the two hold bit-identical `in_proj_ba` after
+  // loading.
+  const bool ba_f16 = f16_remainder && arm == GdnArm::kExl3;
+  const char* ba_dt = ba_f16 ? "F16" : "BF16";
   out.push_back({la + "in_proj_b.weight", ba_dt, {g.num_v_heads, g.hidden},
                  RemainderBytes({g.num_v_heads, g.hidden}, seed + 4, 0.1F,
-                                f16_remainder)});
+                                ba_f16)});
   out.push_back({la + "in_proj_a.weight", ba_dt, {g.num_v_heads, g.hidden},
                  RemainderBytes({g.num_v_heads, g.hidden}, seed + 5, 0.1F,
-                                f16_remainder)});
+                                ba_f16)});
   out.push_back({la + "conv1d.weight", "BF16", {g.conv_dim, 1, g.conv_k},
                  RemainderBytes({g.conv_dim, 1, g.conv_k}, seed + 6, 0.1F, false)});
   out.push_back({la + "A_log", "BF16", {g.num_v_heads},
@@ -1005,6 +1013,50 @@ TEST_CASE("qwen3_5 exl3: the artifact's 3:1 layer_types pattern loads and forwar
   double energy = 0.0;
   for (const float x : logits) energy += static_cast<double>(x) * x;
   CHECK(energy > 0.0);
+}
+
+// G3c ------------------------------------------------------------------------
+TEST_CASE("qwen3_5 exl3: an EXL3 GDN tower whose geometry disagrees is REFUSED by name") {
+  // The rung asserts its own geometry rather than trusting it, and this case is
+  // what stops that assertion being decoration. A trellis is self-consistent at
+  // more than one reading of its own shape -- the bytes are there either way and
+  // only the values come out wrong -- so a projection whose width disagrees with
+  // the rest of the layer is invisible to every check that reads the trellis
+  // alone. `conv1d.weight`'s channel count is the checkpoint's OWN statement of
+  // `conv_dim`, so the two are compared against each other and not against the
+  // config.
+  const Geometry g;
+  const HfConfig c = DenseConfig(/*with_exl3_quant_config=*/true);
+
+  std::vector<FixtureTensor> tensors =
+      DenseCheckpoint(Arm::kExl3, g, GdnArm::kExl3);
+  // Widen conv1d ALONE, leaving `in_proj_qkv.trellis` at conv_dim. Nothing else
+  // in the checkpoint moves.
+  const std::string conv = "model.layers.0.linear_attn.conv1d.weight";
+  bool patched = false;
+  for (FixtureTensor& t : tensors) {
+    if (t.name != conv) continue;
+    t.shape = {g.conv_dim + 128, 1, g.conv_k};
+    t.bytes = RemainderBytes(t.shape, 77, 0.1F, false);
+    patched = true;
+  }
+  // The fixture must actually carry the tensor this case patches; a renamed
+  // tensor would otherwise make the case pass by testing nothing.
+  REQUIRE(patched);
+
+  const TempCheckpoint ckpt(tensors);
+  const std::string message = LoadFailure(ckpt, c);
+  REQUIRE_FALSE(message.empty());
+  CHECK(Names(message, "conv_dim"));
+  CHECK(Names(message, "linear_attn"));
+  // NOT a missing-tensor accident: every tensor is present and only one width
+  // disagrees.
+  CHECK_FALSE(Names(message, "tensor not found"));
+
+  // AND IT IS NOT UNCONDITIONAL: the same fixture unpatched loads, so the case
+  // measures the geometry check rather than the presence of an EXL3 GDN tower.
+  const TempCheckpoint ok(DenseCheckpoint(Arm::kExl3, g, GdnArm::kExl3));
+  CHECK(LoadFailure(ok, c).empty());
 }
 
 // G4 -------------------------------------------------------------------------

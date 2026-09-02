@@ -148,6 +148,127 @@ verdict per shape.
 fused MoE arm, `kExl3HadR` on ROCm, the four-shape coverage of the regular
 kernel's shape table. Each is under `## Owed` with its reason.
 
+## Upstream chain
+
+vLLM implements no EXL3 at the parity pin, so the chain below is the secondary
+oracle's, read at `2398c05635fbbad01a0a51dce63c85c6c8a8450e` and cited by
+`file:line` as `.agents/porting.md` requires.
+
+| Upstream path | What it defines | Where it lands here |
+|---|---|---|
+| `exllamav3_ext/quant/exl3_gemv.cu:29-42` | the `EXL3_GEMV` and `EXL3_GEMV_SMEM` knobs | `Exl3GemvParseMode` / `Exl3GemvParseSmemMode`, `src/vt/exl3_policy.cpp` |
+| `exllamav3_ext/quant/exl3_gemv.cu:46-72` | `exl3_gemv_cfg`, the narrow/wide/decline envelope | `Exl3GemvSelectConfig`, `src/vt/exl3_policy.cpp:154-179`, verbatim |
+| `exllamav3_ext/quant/exl3_gemv.cu:83-86` | `SEL_GRID`, the instantiated `(bits, cb)` arms | `Exl3GemvArmInstantiated` / `GemvKernel`, `src/vt/cuda/cuda_exl3.cu` |
+| `exllamav3_ext/quant/exl3_gemv.cu:108-114` | the hard eligibility tests, in upstream's order | `Exl3GemvHardEligible`, `src/vt/exl3_policy.cpp:141-152` |
+| `exllamav3_ext/quant/exl3_gemv.cu:171-241` | the direct entry point that ERRORS on an ineligible call | `Exl3GemmArgs::force_gemv`, used by the device gate |
+| `exllamav3_ext/quant/exl3_gemv_kernel.cuh:31` | `EXL3_GEMV_MAX_M` | `vt::kExl3GemvMaxM` / `kExl3GemvMaxMDev`, asserted equal |
+| `exllamav3_ext/quant/exl3_gemv_kernel.cuh:37-52` | the fp16-accumulate `mma.m16n8k16` fragment | `ptx_mma_ab_h`, `src/vt/cuda/cuda_exl3.cu` |
+| `exllamav3_ext/quant/exl3_gemv_kernel.cuh:120-134` | the register-form `dq8` with per-lane funnel alignment | `dq8_regs_3bits<cb>` |
+| `exllamav3_ext/quant/exl3_gemv_kernel.cuh:138-402` | the kernel, both configs, both m-modes | `exl3_gemv_kernel`, narrowed to `bits == 3` |
+| `exllamav3_ext/quant/codebook.cuh:56-90` | `decode_3inst<cb>` for all three codebooks | `decode_3inst_2<cb>`, landed by `QUANT-EXL3-MUL1` slice A |
+| `exllamav3_ext/quant/exl3_gemm.cu:220-236` | a DECLINED GEMV falls through to the shape table | `Exl3GemmKernelCuda`'s `TryGemv` call site |
+
+The chain that EXECUTES on a decode step is: the model's linear method reaches
+`vt::Exl3Gemm` through `ModelRegistry::Forward`; the CUDA arm calls
+`Exl3GemvTryLaunch`; that reads the arm predicate, then `Exl3GemvHardEligible`,
+then the env mode, then an occupancy query, then `Exl3GemvSelectConfig`; a
+non-negative config launches `exl3_gemv_kernel` cooperatively and a `-1` falls
+through to `exl3_gemm_kernel`. Every one of those is a place the arm can be lost,
+which is why the measurement observes the kernel rather than inferring it.
+
+## Our baseline
+
+Measured on `dgx:gpu0` (GB10, `sm_121a`, driver 580.173.02) under an `rc` lease,
+prompt `The capital of France is`, 64 tokens, greedy, `--repeat 5` with run 1
+discarded as cold, `VT_DFLASH_PAGED=0` (#2274):
+
+| arm | decode tok/s | spread |
+|---|---|---|
+| target only | 16.670 – 16.796 | 0.75%, two interleaved legs |
+| target + DFlash2 draft, k = 7 | 48.446 – 49.079 | two interleaved legs |
+
+Reproduced by this row's own job before anything is compared, on the same
+binary, because a sequential A/B on this box measures drift as much as it
+measures a change: one unchanged binary has read 36.82 and 78.86 tok/s in a
+single session here.
+
+The GEMV's own baseline is that it NEVER RUNS on this checkpoint. Every one of
+its 409 trellis modules is codebook 2, and the arm predicate admitted only
+`(3, 1)`.
+
+## Port map
+
+| Item | Upstream | Here | Status |
+|---|---|---|---|
+| `(3, 1)` GEMV arm | `SEL_GRID(3, 1, *)` | `GemvKernelForArm<3, 1>` | landed, `MODEL-DSV4-EXL3` W2c |
+| `(3, 2)` GEMV arm | `SEL_GRID(3, 2, false)` | `GemvKernelForArm<3, 2>` | **this row, slice A** |
+| `(4, 2)` GEMV arm | `SEL_GRID(4, 2, false)` | — | OWED, kernel port |
+| `(4, 0)`, `(4, 1)` | `SEL_GRID(4, 0/1, false)` | — | OWED with `(4, 2)`; same kernel work |
+| `(2, 1)`, `(2, 2)` | `SEL_GRID(2, *, *)` | — | no 2-bit artifact has reached this tree |
+| `(3, 1)`, `(3, 2)` smem-staged | `SEL_GRID(3, *, true)` | `SMEM_STAGE` template arm, both instantiated | landed |
+| the envelope | `exl3_gemv_cfg` | `Exl3GemvSelectConfig` | landed, verbatim, per-K so `(3, 2)` inherits `(3, 1)`'s |
+| the hard tests | `exl3_gemv.cu:110-114` | `Exl3GemvHardEligible` | landed, upstream's order |
+
+## Tests to port
+
+Upstream ships no C++ unit test for `exl3_gemv`; it exercises the path from
+Python through `exl3_gemv` and `exl3_gemm` with `EXL3_GEMV` set, and its
+correctness reference is the same linear evaluated by the regular kernel. The
+adaptation is recorded rather than hidden: the envelope is extracted as a pure
+function and gated directly, which upstream cannot do because its copy is
+`static` inside the `.cu`, and the kernel is gated against this tree's CPU arm,
+which `test_exl3_gemm` already gates against an f64 chain built from
+DEFINITIONS. That keeps ONE reference for both device arms instead of two that
+must agree.
+
+What is preserved from upstream: `EXL3_GEMV_MAX_M`, the mode values and their
+`atoi` parsing including the unset defaults, every branch of the envelope, the
+`K != 4 && cb == 0` refusal, the 128-alignment tests, and the `force` semantics
+of the direct entry point.
+
+## Dependencies
+
+- `QUANT-EXL3` (#2181) — the format, the CPU reference, `had_r_128`, and the
+  tier-3c bound this row inherits rather than restates.
+- `QUANT-EXL3-MUL1` (#2495) — `decode_3inst_2<2>` and `decode_mul1_product_2`.
+  Without codebook 2 in the shared decoder there is no `(3, 2)` arm to
+  instantiate; this row adds no decode of its own.
+- `.agents/oracles/exllamav3.md` — the pin. Advancing it re-opens every
+  `file:line` above.
+- An `rc` lease on `dgx:gpu0` for anything device-shaped. There is no local CUDA
+  toolchain, so every device claim in this row is PENDING until the lease runs.
+- #2274 (`VT_DFLASH_PAGED`) — the workaround the baseline carries, applied to
+  every leg alike so it cancels in the ratio.
+
+## Risks/decisions
+
+- **D1. The A/B is env-driven on ONE binary, not two binaries.** Decided,
+  because on this checkpoint `VT_EXL3_GEMV=0` and the pre-change binary take the
+  same code path: the old predicate admitted only `(3, 1)` and the artifact has
+  zero `(3, 1)` tensors. That removes binary drift from the comparison. The
+  equivalence is not assumed — a mutation that takes `(3, 2)` back out of the
+  predicate rebuilds the pre-change product behaviour and is measured.
+- **D2. Three legs, not two.** `VT_EXL3_GEMV=2` is upstream's testing mode and
+  is carried as a DIAGNOSTIC so an envelope decline stays distinguishable from a
+  null effect. It is never reported as a production number. R: quoting it as one
+  would be the 8%-from-nothing failure again.
+- **D3. The tier is 3c and it is inherited.** R: a `(3, 2)` arm that misses
+  `6.0e-3` is wrong; widening the bound to admit it would delete the only check
+  that can see a mis-threaded codebook.
+- **R1. The envelope may decline every bits-3 shape on GB10.** Then the arm is
+  correct, upstream-faithful and worth nothing on this device, and the next
+  hypothesis is the narrow config's occupancy. Recorded in `## Owed` as the
+  outcome it would be, not as a failure of the row.
+- **R2. The fat build compiles one more kernel set.** `(3, 2)` is 16 more
+  kernels in a translation unit the fat build compiles for ten architectures.
+  Upstream answers this with a per-`K` compilation-unit split
+  (`comp_units/exl3_comp_unit_K_cbX.cu`); this tree has one unit and the split
+  stays owed by `QUANT-EXL3-MUL1`, which argued it first.
+- **R3. Measuring on a box that crashes.** `dgx:gpu0` has crashed roughly hourly
+  under long ladders. The job prints results incrementally and orders the A/B
+  ahead of the mutations, so a crash costs the cheapest evidence rather than the
+  most expensive.
+
 ## Why `(3, 2)` is an instantiation and `(4, 2)` is a port
 
 `exl3_gemv_kernel` in `src/vt/cuda/cuda_exl3.cu` is already

@@ -1,7 +1,9 @@
 # QUANT-EXL3-MUL1 — the `mul1` codebook and the bit widths a 3.5bpw EXL3 artifact actually ships
 
 Row: `QUANT-EXL3-MUL1`
-Issues: [#2495](https://github.com/mudler/vllm.cpp/issues/2495) (primary)
+Issues: [#2495](https://github.com/mudler/vllm.cpp/issues/2495) (primary),
+[#2574](https://github.com/mudler/vllm.cpp/issues/2574) (slice F, the recount
+and the `(3, 2)` arm)
 Base SHA: `11fed3ba5`
 Parent row: [`QUANT-EXL3`](quant-exl3-shared.md)
 Matrix: [`.agents/quantization-matrix.md`](../quantization-matrix.md)
@@ -16,7 +18,9 @@ supplies the trellis format and its kernels only.
 
 `ACTIVE`. Slices A and B have landed: the host decoder implements codebook 2 and
 the loader accepts a `mul1` marker. Slices C, D and E are described below with
-what each one still owes.
+what each one still owes. **Slice F is the recount** (#2574): slice D was
+specified against a tensor census that omitted 137 modules, so `(3, 2)` was
+never instantiated and the checkpoint could not run on CUDA at all.
 
 ## The gap
 
@@ -26,9 +30,11 @@ independent by-name refusals stand in the way:
 1. **The `mul1` codebook (cb 2).** Every quantized linear in that checkpoint
    ships a `.mul1` marker. `dense_weight_loaders.h` refused it by name and
    `cuda_exl3.cu`'s `decode_3inst_2` `static_assert`ed it out.
-2. **Bit widths 4 and 5.** 270 of the checkpoint's quantized tensors are 4 bpw,
-   one is 5 and one is 6. The device arm instantiated `(3,0)`, `(3,1)` and
-   `(6,0)` only.
+2. **Bit widths 3, 4 and 5, at codebook 2.** The device arm instantiated
+   `(3,0)`, `(3,1)` and `(6,0)` only. The census slice D worked from --- "270
+   tensors at 4 bpw, one at 5, one at 6" --- was an UNDERCOUNT, and the
+   corrected one is in slice F below: **409** trellis modules, **137** of them
+   at bits 3.
 
 Neither refusal was wrong. Decoding cb 2 as cb 0 or cb 1 is the failure this
 family's records already document at length: the wrong multiplier yields a
@@ -153,6 +159,9 @@ gate does not depend on any implementation of it.
   `GemmKernelForShape` and the refusal message.
 - **E — the GEMV.** Decide, and record the decision with upstream's own
   envelope rather than an assumption.
+- **F — the recount, and `(3, 2)`.** Re-derive the census from the LOCAL
+  artifact, instantiate the width the census adds, and correct every place the
+  old number was written down.
 
 ## Risks/decisions
 
@@ -184,6 +193,99 @@ gate does not depend on any implementation of it.
 - **D — bit widths 4 and 5.** `Exl3ArmInstantiated`, `GemmKernelForShape` and
   `dq_dispatch`.
 - **E — the GEMV.** `exl3_gemv_kernel` is specialized to `bits == 3`.
+- **F — the recount, and `(3, 2)`.** `Exl3ArmInstantiated`,
+  `GemmKernelForShape` and the refusal message again, plus the corrected census
+  in `docs/FEATURES.md` and in this spec. See the section below.
+
+## Slice F — the recount, and the `(3, 2)` arm (#2574)
+
+### The census, re-derived
+
+Slice D was specified against "270 of the checkpoint's quantized tensors are
+4 bpw, one is 5 and one is 6". That count is 272. The artifact has **409**
+trellis modules.
+
+Re-derived from the LOCAL artifact rather than from range requests over the
+HuggingFace API, because a range-read census is what produced the undercount:
+`/mnt/nas_share/models/Qwen3.8-27B-EXL3/target-3.5bpw`, revision
+`19441ac874c4018295da848e250f23511361cda4`, both `model-0000N-of-00002.safetensors`
+shards complete (each shard's largest declared `data_offsets` end equals its
+file size). A module is a trellis module when it owns a `.trellis`; its width is
+`shape[-1] / 16` (`[k/16, n/16, 16*bits]` on disk as `I16`), and its codebook is
+2 when it owns a `.mul1`, 1 for `.mcg`, 0 for neither.
+
+```
+2426 tensors, 409 trellis modules, 409 carrying mul1, 0 carrying mcg
+bits histogram: {3: 137, 4: 270, 5: 1, 6: 1}
+```
+
+The 137 at bits 3 are **entirely** the language model's MLP, and there is not
+one of them anywhere else in the artifact:
+
+| module | bits 3 | bits 4 |
+|---|---:|---:|
+| `model.language_model.layers.<N>.mlp.gate_proj` | 46 | 18 |
+| `model.language_model.layers.<N>.mlp.up_proj` | 46 | 18 |
+| `model.language_model.layers.<N>.mlp.down_proj` | 45 | 19 |
+
+That is the per-layer mixed-precision split which averages to 3.5 bpw: 64
+language-model layers, each MLP projection quantized at 3 or at 4 bits. The
+remaining bits-4 population is the GDN tower (144: `linear_attn.in_proj_qkv`,
+`in_proj_z`, `out_proj` over 48 layers), the 16 dense-attention layers (63
+projections), and the 8-module `mtp` head. `layers.63.self_attn.o_proj` is the
+lone bits-5 module and `lm_head` the lone bits-6 one.
+
+### What this changes
+
+`(3, 2)` was absent from `Exl3ArmInstantiated`, so **every one of those 137
+projections refused by name** and the checkpoint could not execute a single
+decoder layer on a CUDA device. The three instantiations slice D added were
+correct and stay; this is the fourth pair the same artifact needs, missed
+because the census under-reported it.
+
+It is an INSTANTIATION and not a port. `decode_3inst_2<2>` and
+`decode_mul1_product_2` are slice C's, already compiled and already gated at
+widths 4, 5 and 6; `dq_dispatch` already routes `bits == 3` through `dq8`,
+because `(3, 0)` and `(3, 1)` have used that route since QUANT-EXL3 W3. No new
+decode is written here, and none may be: a second decode for the same codebook
+is the way two ports of one mistake agree with each other.
+
+### The confusable pair
+
+`(3, 1)` and `(3, 2)` are now BOTH instantiated at the same width, and they are
+the pair a threading mistake would silently swap: same `bits`, adjacent `cb`,
+same `dq8` route, same tile shapes. A wrong thread does not fail to compile and
+does not change any shape --- it decodes with `mcg`'s multiplier and yields a
+weight with the right distribution and no correlation to the true one, which is
+the failure mode this row's `## Risks/decisions` already names. The mutation
+table therefore carries that exact swap, and the device case must red on it.
+
+### Not in scope
+
+- **The `m <= 8` GEMV** (#2570). `exl3_gemv_kernel` carries
+  `static_assert(bits == 3, ...)` and `LSTRIDE` is hardcoded to 24 there; its
+  `(3, 2)` and `(4, 2)` arms are a separate and larger job, and
+  `Exl3GemvArmInstantiated` stays `bits == 3 && cb == 1`. Upstream's `SEL_GRID`
+  does list `(3, 2)`, so this is owed rather than refused as impossible.
+- **The loaders, the DFlash2 draft, and the `lm_head`/`mtp` heads.** Other rows
+  own those files.
+- **ROCm and Vulkan.** Both transcribe the portable CPU reference and decode
+  every width already, so the CUDA instantiation list does not bound them.
+
+### The gate, and why this tier
+
+`tests/vt/test_exl3_gemm.cpp`'s "the widened (bits, codebook) arms agree with
+the CPU arm" case gains one row. The reference is the CPU arm, which decodes
+every width and every codebook and is itself tied to real exllamav3 data by
+`test_exl3_real_decode`; the bound is `rel_rms <= 1.0e-3`, which is the SAME
+tier `(4, 2)`, `(5, 2)` and `(6, 2)` use and the same one the `(3, 1)` f64 case
+states. It is the right tier because the quantity being bounded is the same one:
+the tensor-core reduction order. The decode is exact on both sides, so a
+disagreement larger than that bound is a decode disagreement, not rounding.
+
+A device that is absent SKIPS this case, and a skip that asserts nothing reports
+`assertions: 0`, which reads as a pass. The case already asserts its own
+precondition on the skip path, and this row does not weaken that.
 
 ## Tests
 
@@ -197,6 +299,9 @@ gate does not depend on any implementation of it.
   both-markers refusal.
 - `tests/vt/test_exl3_gemm.cpp` — the device cb 2 cross-check against the host
   decoder, and the new `(bits, cb)` arms.
+- `tests/vt/test_exl3_gemm.cpp` — slice F adds the `(3, 2)` row to that same
+  device arms table. It is one row and not a new case, because the question is
+  identical to the one the table already asks of the other cb 2 widths.
 
 ## Gates
 
@@ -221,6 +326,14 @@ green is not a device result and is never reported as one.
   compiled for every architecture in the fat build. Upstream's own answer is a
   per-K compilation-unit split (`comp_units/exl3_comp_unit_K_cbX.cu`, 24 TUs of
   16 instantiations each); this tree has one TU.
+- **Slice F is UNVERIFIED ON A DEVICE until a CUDA build runs it**, on the same
+  terms as slice C: a CPU preflight never compiles `cuda_exl3.cu`.
+- **Slice F adds a seventh pair to a table this spec argued should stay at
+  six.** The argument stands and the reason it is overridden is that the seventh
+  pair is not a new artifact's width, it is the SAME artifact's width that the
+  census missed --- six was never the right number for #2495, seven was. The
+  per-K translation-unit split upstream uses is now more owed, not less, and the
+  compile-cost measurement is recorded with this slice's evidence.
 - **Slice E: the GEMV has no arm for these widths.** Upstream's own envelope
   refuses `K < 2 || K > 4` (`exl3_gemv.cu:107-121`) and its instantiation list
   is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)` — so **bits 5 and 6 have no
@@ -246,3 +359,6 @@ green is not a device result and is never reported as one.
 - The fat build stops fitting or a shape's `static_assert` on shared memory
   fires → record the number and propose which pairs are essential, rather than
   raising a limit.
+- `(3, 2)` and `(3, 1)` agree on the device case → the case is not
+  discriminating, because those two codebooks must produce different numbers at
+  the same width. Stop and fix the fixture before reading the tolerance.

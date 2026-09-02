@@ -2668,11 +2668,16 @@ size_t DecodeDivBytesDiffer(const std::vector<unsigned char>& a,
   return n;
 }
 
+// `device_next_id`, when non-null, is what the runner's asynchronous combine
+// spliced into the DEVICE identifier buffer for the decode row, while `next_id`
+// stays the STALE host value that combine deliberately never wrote back. Null on
+// the plain two-arm comparison, where both arms read the host vector.
 DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
                                      const vllm::HfConfig& config,
                                      vt::DeviceType dev_type,
                                      const std::vector<int32_t>& prompt,
-                                     int32_t next_id) {
+                                     int32_t next_id,
+                                     const int32_t* device_next_id = nullptr) {
   using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
 
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g, dev_type);
@@ -2806,6 +2811,11 @@ DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
                                 t % kPage);
   };
 
+  // The device identifier buffer this step publishes, or null. Declared out here
+  // so it outlives the `run` call that hands its address to the forward.
+  vllm::dense_attn::DBuf dev_ids_buf;
+  const int32_t* dev_ids_ptr = nullptr;
+
   const auto run = [&](const std::vector<int32_t>& tok_ids, int64_t past_len) {
     const auto T = static_cast<int64_t>(tok_ids.size());
     std::vector<int32_t> pos(static_cast<size_t>(T));
@@ -2851,6 +2861,7 @@ DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
     in.num_reqs = 1;
     in.gdn_state_slots = 1;
     in.multi_kv = &mk;
+    in.device_token_ids = dev_ids_ptr;
 
     vllm::ForwardLogits fl;
     REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
@@ -2895,6 +2906,14 @@ DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
 
   r.logits1 = run(prompt, /*past_len=*/0);
   snapshot(r.gdn_conv, r.ssm, r.ple_conv, r.ngram, r.kv, r.idx);
+  // PUBLISHED ONLY FOR THE DECODE ROW, which is the only row the runner's
+  // combine ever patches. The prefill above ran with a null pointer, so it is
+  // byte-identical to the plain arm.
+  std::vector<int32_t> dev_ids{device_next_id != nullptr ? *device_next_id : next_id};
+  if (device_next_id != nullptr) {
+    dev_ids_buf = vllm::dense_attn::DBuf(d, DType::kI32, {1}, dev_ids.data());
+    dev_ids_ptr = static_cast<const int32_t*>(dev_ids_buf.ptr());
+  }
   r.logits2 = run(std::vector<int32_t>{next_id}, /*past_len=*/T1);
   snapshot(r.gdn_conv2, r.ssm2, r.ple_conv2, r.ngram2, r.kv2, r.idx2);
   return r;
@@ -3000,4 +3019,89 @@ TEST_CASE("qwen4_exp #2496: the CUDA decode step agrees with the CPU decode step
   const double floor = 1.0e-3;
   CHECK(rel1 <= floor);
   CHECK(rel2 <= floor);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #2496 — THE FORWARD RUNS ON THE DEVICE IDENTIFIERS, NOT THE STALE HOST VECTOR.
+//
+// `ModelForwardInput::device_token_ids` states its own contract: "the input ids
+// for this step are ALREADY on the device; the host vector is stale for decode
+// rows". The asynchronous runner's combine splices each decode row's sampled
+// token into that DEVICE buffer on the main queue and never writes it back,
+// because materialising it on the host is the synchronise that path exists to
+// remove. Nine registries consume the field under [#1305]; this architecture did
+// not, so on `--device cuda` — where the mirror is the default — every decode
+// row embedded, and hashed into the PLE n-gram context, whatever the host array
+// happened to hold. For a row the host never wrote that is ZERO.
+//
+// MEASURED, before the fix, on `thor:gpu0` over the released
+// `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact with `VT_Q4EXP_STATE_FP=1`,
+// the n-gram history after each step:
+//
+//     --device cpu    [9338, 369] -> [369, 11751] -> [11751, 13] -> [13, 15767] …
+//     --device cuda   [9338, 369] -> [369,     0] -> [    0,  0] -> [ 0,     0] …
+//
+// The prefill agrees; from the first decode the model is fed token id 0 for ever.
+//
+// ─── WHY THIS CASE RUNS ON A CPU QUEUE AND STILL CONVICTS ───────────────────
+// The defect is not arithmetic and not a device kernel: it is WHICH ARRAY the
+// hook reads. So the case publishes a device identifier buffer that DISAGREES
+// with the host vector and asks which one the answer came from — a question a
+// CPU queue answers exactly, and one no GPU is needed to ask.
+//
+// THE PRECONDITION IS ASSERTED FIRST, and it is what stops this being a
+// tautology: the two identifiers must actually produce different logits on this
+// fixture. If `kFresh` and `kStale` decoded to the same row, the gate below
+// would pass on a hook that read either array.
+TEST_CASE("qwen4_exp #2496: the decode step reads the DEVICE identifiers, not the stale host vector") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+
+  const std::vector<int32_t> prompt{5, 9, 13, static_cast<int32_t>(kEosTokenId), 7, 2};
+  // What the runner sampled and spliced into the device buffer.
+  const int32_t kFresh = 11;
+  // What a host row the combine never wrote holds. ZERO IS THE REAL VALUE, not a
+  // stand-in: `token_ids_cpu` is zero-initialised and the mirror arm never writes
+  // a decode row, which is why the released artifact hashed id 0 every step.
+  const int32_t kStale = 0;
+  REQUIRE(kFresh < static_cast<int32_t>(kVocab));
+
+  // THE PLE LAYER'S RANK AMONG THE LINEAR LAYERS, which is the index the arm
+  // helper snapshots under — never the decoder layer index.
+  constexpr size_t kPleRank = 1;
+
+  const DecodeDivArm fresh =
+      RunQwen4ExpDecodeDivArm(g, config, vt::DeviceType::kCPU, prompt, kFresh);
+  const DecodeDivArm stale =
+      RunQwen4ExpDecodeDivArm(g, config, vt::DeviceType::kCPU, prompt, kStale);
+  const DecodeDivArm spliced = RunQwen4ExpDecodeDivArm(
+      g, config, vt::DeviceType::kCPU, prompt, kStale, &kFresh);
+
+  REQUIRE(fresh.logits2.size() == stale.logits2.size());
+  REQUIRE(fresh.logits2.size() == spliced.logits2.size());
+  const size_t bytes = fresh.logits2.size() * sizeof(float);
+  for (float v : fresh.logits2) REQUIRE(std::isfinite(v));
+  for (float v : spliced.logits2) REQUIRE(std::isfinite(v));
+
+  // THE PRECONDITION. Two different identifiers must decode to two different
+  // rows, or nothing below is being measured.
+  REQUIRE(std::memcmp(fresh.logits2.data(), stale.logits2.data(), bytes) != 0);
+
+  // THE GATE. The published DEVICE identifier decides the answer, BIT FOR BIT:
+  // one queue, one order, one arithmetic, so the only thing that can differ is
+  // which array was read.
+  CHECK(std::memcmp(spliced.logits2.data(), fresh.logits2.data(), bytes) == 0);
+  CHECK(std::memcmp(spliced.logits2.data(), stale.logits2.data(), bytes) != 0);
+
+  // AND THE N-GRAM HISTORY CARRIES IT TOO, which the logits alone do not prove:
+  // the history is what the NEXT step reads, and it is int64 token ids, so its
+  // disagreement can never be a rounding difference. This is the observable the
+  // released-artifact measurement above was taken on.
+  REQUIRE(spliced.ngram2.size() > kPleRank);
+  REQUIRE(!spliced.ngram2[kPleRank].empty());
+  CHECK(spliced.ngram2[kPleRank].back() == static_cast<int64_t>(kFresh));
+  CHECK(stale.ngram2[kPleRank].back() == static_cast<int64_t>(kStale));
 }

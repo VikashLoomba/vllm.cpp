@@ -363,6 +363,64 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   const auto T = static_cast<int64_t>(input.token_ids.size());
   VT_CHECK(T > 0,
            "Qwen4ExpForConditionalGeneration: the step carries no tokens");
+
+  // ─── THE IDENTIFIERS THIS STEP ACTUALLY RUNS ON (#2496) ───────────────────
+  //
+  // `ModelForwardInput::device_token_ids` says, in its own words, "the input ids
+  // for this step are ALREADY on the device; the host vector is stale for decode
+  // rows". The asynchronous runner's combine splices each decode row's sampled
+  // token into that DEVICE buffer on the main queue and deliberately never
+  // writes it back to `token_ids`, because materialising it on the host is the
+  // synchronise that path exists to remove
+  // (`src/vllm/v1/worker/gpu/runner.cpp`, the mirror arm).
+  //
+  // THIS HOOK READ THE STALE VECTOR, AND THAT IS #2496. On `--device cuda` the
+  // mirror is the default, so every decode row embedded — and hashed into the
+  // PLE n-gram context — whatever `token_ids_cpu` happened to hold, which for a
+  // row the host never wrote is ZERO. Measured on `thor:gpu0` over the released
+  // `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact with `VT_Q4EXP_STATE_FP=1`:
+  // the n-gram history rolls `[9338, 369] -> [369, 11751] -> [11751, 13] -> …` on
+  // `--device cpu` and `[9338, 369] -> [369, 0] -> [0, 0] -> …` on `--device cuda`,
+  // so the prefill is right and every decode step feeds the model token id 0.
+  // The reported ids stay plausible because they are the argmax of each step's
+  // logits; what is wrong is the FEEDBACK, which is why a token gate on the
+  // prompt's first token could not see it. Nine other registries already consume
+  // this field (`qwen3_moe_registry.cpp`, `deepseek_v2_registry.cpp`,
+  // `nemotron_h_device.cpp`, `kimi_linear_device.cpp`, …) under issue #1305,
+  // which is the same defect on Qwen3-MoE; this architecture was simply never
+  // wired to it.
+  //
+  // IT IS MATERIALISED ON THE HOST RATHER THAN SPLICED OVER A DEVICE BUFFER, and
+  // that is forced rather than chosen. `detail::ApplyDeviceTokenIds` patches an
+  // embed's device identifier buffer, which is enough for a model whose only
+  // reader is the embed. This one has a second: `RunQwen4ExpPleBlock` hashes the
+  // raw ids in HOST int64 arithmetic (`qwen4_exp::BuildNGramIds`, the port of
+  // transformers 5.16.0 `_splitmix64`, :979-983), and the n-gram context it
+  // advances is what the next step reads. A device splice would fix the embed and
+  // leave the hash reading zeros.
+  //
+  // THE COPY IS ENQUEUED ON THIS STEP'S QUEUE, so it is ORDERED AFTER the
+  // runner's combine rather than racing it, and the drain is the read's other
+  // half — the same stage-then-synchronise shape `qwen4_exp_qsa_block.cpp`
+  // establishes for its three host reads. One drain per step is the cost, and it
+  // is the synchronise W4 removed; the way to get it back is a device-side n-gram
+  // hash, which is what upstream does (`torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids`,
+  // `vllm/models/qwen4_exp/nvidia/ple_layer.py` @ 191cecd51e, a FORWARD reference
+  // past this row's pin). The spec's `## Owed` carries it.
+  //
+  // NULL ON EVERY OTHER PATH, so `--device cpu` and any synchronous arm read the
+  // host vector exactly as before and are byte-identical.
+  std::vector<int32_t> resolved_token_ids;
+  const std::vector<int32_t>* step_token_ids = &input.token_ids;
+  if (input.device_token_ids != nullptr) {
+    resolved_token_ids.assign(input.token_ids.size(), 0);
+    vt::Backend& tok_backend = vt::GetBackend(input.queue.device.type);
+    tok_backend.Copy(input.queue, resolved_token_ids.data(),
+                     input.device_token_ids,
+                     resolved_token_ids.size() * sizeof(int32_t));
+    tok_backend.Synchronize(input.queue);
+    step_token_ids = &resolved_token_ids;
+  }
   VT_CHECK(input.attn_meta.seq_lens.size() == 1,
            "Qwen4ExpForConditionalGeneration: one sequence per call, so "
            "attn_meta.seq_lens must hold exactly one entry");
@@ -893,7 +951,7 @@ ForwardLogits ForwardQwen4ExpForConditionalGeneration(
   }
 
   const Qwen4ExpTextModelOutput hidden = Qwen4ExpTextModelForward(
-      d, w, input.config, input.token_ids, input.positions, input.attn_meta,
+      d, w, input.config, *step_token_ids, input.positions, input.attn_meta,
       input.gdn_meta, caches, past_len);
 
   // DECODEDIV (#2496): the per-step state fingerprint, default OFF. See

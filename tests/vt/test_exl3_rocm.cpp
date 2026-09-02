@@ -296,8 +296,10 @@ TEST_CASE("exl3 rocm: exl3_gemm is BYTE-identical to the CPU arm on every codebo
     const std::vector<uint8_t> host = CpuGemm(f, a_h, arm.m, arm.codebook, arm.c_f32);
     const std::vector<uint8_t> dev = RocmGemm(f, a_h, arm.m, arm.codebook, arm.c_f32, false);
     const int diff = FirstDiff(host, dev);
-    MESSAGE("bits ", arm.bits, " cb ", arm.codebook, " m ", arm.m, " (", arm.what,
-            "): first differing byte = ", diff);
+    // std::string, not the bare `const char*`: doctest stringifies a char* as a
+    // BOOL and would print "1" where the arm's description belongs.
+    MESSAGE("bits ", arm.bits, " cb ", arm.codebook, " m ", arm.m, " (",
+            std::string(arm.what), "): first differing byte = ", diff);
     // -1 means "no differing byte". INTEGER equality over the stored bits, not a
     // tolerance: see the head of this file for why this arm can claim it.
     CHECK(diff == -1);

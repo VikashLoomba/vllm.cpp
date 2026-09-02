@@ -2680,7 +2680,6 @@ DecodeDivArm RunQwen4ExpDecodeDivArm(const vllm::GgufFile& g,
 
   constexpr int64_t kQsaLayer = 3;
   constexpr int64_t kGdnLayers = 3;
-  constexpr int64_t kPleIdx = 1;  // ple_layer_ids = [2], one-based
   constexpr int64_t kPage = 4;
   constexpr int64_t kCols = 3;
   constexpr int64_t kBlocks0 = 4;

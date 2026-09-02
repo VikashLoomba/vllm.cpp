@@ -551,35 +551,82 @@ bool IsFp8BlockProjection(const TensorExists& has, const std::string& proj,
   return true;
 }
 
+// MODEL-QWEN35-GDN-EXL3 (#2495 item 4): the GDN tensors that NO arm quantizes,
+// loaded once for every arm rather than copied into each. `in_proj_ba`,
+// `conv1d`, `A_log`, `dt_bias` and `norm.weight` are stored the same way on a
+// bf16, an FP8, an NVFP4 and an EXL3 checkpoint, and a second copy of this
+// sequence beside the trellis rung is where the two arms drift.
+//
+// `allow_f16` is the ONE difference between the arms, and it is the EXL3
+// artifact's own: `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` stores `in_proj_a` and
+// `in_proj_b` at F16 while storing every other tensor here at BF16.
+void LoadGdnSmallTensors(const TensorResolver& get, const std::string& la,
+                         bool allow_f16, GdnLayerWeights& g) {
+  // QUALIFIED: `qwen3_5_dense.h` declares a two-argument `vllm::`
+  // LoadMergedBf16RawNK forwarder for the focused loader contract, and
+  // unqualified lookup finds that one first.
+  g.in_proj_ba = dense_loaders::LoadMergedBf16RawNK(
+      get, {la + "in_proj_b.weight", la + "in_proj_a.weight"},
+      /*tp=*/nullptr, allow_f16);
+  // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
+  const StTensor& conv = get(la + "conv1d.weight");
+  VT_CHECK(conv.shape.size() == 3 && conv.shape[1] == 1,
+           "qwen3_5 dense: unexpected conv1d shape");
+  g.conv1d_weight =
+      LoadBf16Direct(get, la + "conv1d.weight", {conv.shape[0], conv.shape[2]});
+  g.a_log = LoadToF32(get, la + "A_log");
+  g.dt_bias = LoadToF32(get, la + "dt_bias");
+  g.norm_weight = LoadModelBf16Direct(get, la + "norm.weight");
+}
+
 GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
                              const std::string& base,
                              const Fp8BlockQuantConfig& block) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
-  // MODEL-QWEN35-EXL3 (#2495 item 3) -- THE REFUSAL, and it is the honest half
-  // of this row rather than a gap in it.
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4). FIRST and EXCLUSIVE, for the reason
+  // `LoadAttnDense`'s EXL3 rung is: an EXL3 projection ships NO `.weight` at
+  // all, so every probe below -- `IsNvfp4Projection`, the
+  // `get(name + ".weight").dtype` read, the block-FP8 cross-check -- would
+  // either mis-route it or die asking for a tensor the checkpoint correctly
+  // does not ship. Selection is by upstream's own storage predicate
+  // (`Linear.is_exl3_storage`, `modules/linear.py:385-389`) rather than by a
+  // config flag, so a checkpoint that quantizes only some layers loads each one
+  // the way it is actually stored.
   //
-  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` quantizes the GDN linear-attention
-  // tower too, and 48 of this model's 64 layers are `linear_attention`. NOTHING
-  // in the GDN forward consumes an `Exl3Weight`: `ProjectGdnQkvz`,
-  // `ProjectGdnBA` and `ProjectGdnOut` know bf16, per-tensor FP8, block FP8 and
-  // NVFP4 and no trellis. Wiring that arm is #2495 item 4 and it carries its own
-  // dispatch, because the GDN in-projections are MERGED owners (`in_proj_qkvz`,
-  // `in_proj_ba`) and a trellis merge on the output dim is a real transform.
+  // THIS REPLACES A REFUSAL. Until this rung existed the three projections were
+  // refused by name, which was the honest behaviour then: the alternative was
+  // falling through to `get(la + "in_proj_qkv.weight")` and dying on "tensor
+  // not found", a sentence about a checkpoint that is complete.
   //
-  // The alternative to refusing is HALF-LOADING: this function would fall
-  // through to `get(la + "in_proj_qkv.weight")` and die on "tensor not found",
-  // a sentence about a checkpoint that is complete. Refusing by name is a
-  // gateable behaviour; the "missing tensor" is not.
-  for (const char* proj : {"in_proj_qkv", "in_proj_z", "out_proj"}) {
-    VT_CHECK(!dense_loaders::IsExl3Projection(has, la + proj),
-             "qwen3_5 dense: " + la + proj +
-                 " is stored EXL3 (trellis/suh/svh), and the GDN "
-                 "linear-attention tower has NO EXL3 arm -- nothing in "
-                 "ProjectGdnQkvz/ProjectGdnBA/ProjectGdnOut consumes an "
-                 "Exl3Weight. The dense half of this checkpoint (self_attn, "
-                 "mlp, lm_head) loads; the GDN half is #2495 item 4 and is "
-                 "owed. Refusing rather than half-loading.");
+  // THREE projections and no merged qkvz owner, because that is what the
+  // artifact ships. See `GdnLayerWeights::in_proj_qkv_exl3` for why the trellis
+  // pair cannot be N-concatenated the way the bf16 pair is.
+  if (dense_loaders::IsExl3Projection(has, la + "in_proj_qkv")) {
+    g.in_proj_qkv_exl3 = dense_loaders::LoadExl3(get, has, la + "in_proj_qkv");
+    g.in_proj_z_exl3 = dense_loaders::LoadExl3(get, has, la + "in_proj_z");
+    g.out_proj_exl3 = dense_loaders::LoadExl3(get, has, la + "out_proj");
+    // GEOMETRY, CHECKED rather than trusted. A trellis is self-consistent at
+    // more than one reading of its own shape, so a transposed or mismatched
+    // projection is invisible until the numbers are wrong. `conv1d.weight`'s
+    // leading dim is the checkpoint's own statement of `conv_dim`, and
+    // `out_proj`'s K is its statement of `value_dim`; both are read from the
+    // artifact rather than from the config, so a config that disagrees with the
+    // tensors fails here instead of silently picking one of them.
+    const int64_t hidden = g.in_proj_qkv_exl3.InFeatures();
+    VT_CHECK(g.in_proj_z_exl3.InFeatures() == hidden &&
+                 g.out_proj_exl3.OutFeatures() == hidden,
+             "qwen3_5 dense: EXL3 GDN projections disagree about the hidden "
+             "size at " + la);
+    VT_CHECK(g.out_proj_exl3.InFeatures() == g.in_proj_z_exl3.OutFeatures(),
+             "qwen3_5 dense: EXL3 GDN out_proj K and in_proj_z N disagree "
+             "about value_dim at " + la);
+    VT_CHECK(get(la + "conv1d.weight").shape[0] ==
+                 g.in_proj_qkv_exl3.OutFeatures(),
+             "qwen3_5 dense: EXL3 GDN in_proj_qkv N and conv1d's channel count "
+             "disagree about conv_dim at " + la);
+    LoadGdnSmallTensors(get, la, /*allow_f16=*/true, g);
+    return g;
   }
   // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6). Kept raw [N,K]
   // (nk=true -> vt::MatmulBT TN fast path). Mirror vLLM's TWO physical
@@ -609,8 +656,6 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
     g.in_proj_qkvz = LoadMergedBf16RawNK(
         get, {la + "in_proj_qkv.weight", la + "in_proj_z.weight"});
   }
-  g.in_proj_ba = LoadMergedBf16RawNK(
-      get, {la + "in_proj_b.weight", la + "in_proj_a.weight"});
   // NVFP4 checkpoints use compressed tensors; ordinary checkpoints use raw
   // torch-Linear BF16 [N,K].
   if (IsNvfp4Projection(has, la + "out_proj")) {
@@ -628,15 +673,7 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
   } else {
     g.out_proj = LoadBf16RawNK(get, la + "out_proj.weight");
   }
-  // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
-  const StTensor& conv = get(la + "conv1d.weight");
-  VT_CHECK(conv.shape.size() == 3 && conv.shape[1] == 1,
-           "qwen3_5 dense: unexpected conv1d shape");
-  g.conv1d_weight =
-      LoadBf16Direct(get, la + "conv1d.weight", {conv.shape[0], conv.shape[2]});
-  g.a_log = LoadToF32(get, la + "A_log");
-  g.dt_bias = LoadToF32(get, la + "dt_bias");
-  g.norm_weight = LoadModelBf16Direct(get, la + "norm.weight");
+  LoadGdnSmallTensors(get, la, /*allow_f16=*/false, g);
   return g;
 }
 

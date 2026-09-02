@@ -809,6 +809,37 @@ struct GdnLayerWeights {
   // the GEMM scalar instead). Empty on every non-fp8 owner.
   mutable std::shared_ptr<void> d_qkvz_fp8_packed;
   mutable std::shared_ptr<void> d_qkvz_fp8_alpha;
+
+  // MODEL-QWEN35-GDN-EXL3 (#2495 item 4) — the EXL3 (exllamav3 trellis) arm of
+  // this tower, and it is THREE projections rather than the merged qkvz owner
+  // above.
+  //
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships `in_proj_qkv` and `in_proj_z` as
+  // two INDEPENDENTLY quantized trellises: `in_proj_qkv.svh [10240]` and
+  // `in_proj_z.svh [6144]`, each fitted at quantization time against its own
+  // projection. The bf16 loader N-concatenates the two `.weight` shards because
+  // concatenating bf16 rows is a byte copy. A trellis is a 16x16-tiled
+  // bitstream whose two Hadamard sign vectors are per projection, so the same
+  // concatenation is defined only when both shards share `suh` bit-for-bit, and
+  // nothing in the calibration gives a reason to expect that. There is no
+  // merged-trellis operand in this tree either (`quant-exl3-shared.md` records
+  // "no merged EXL3 QKV or gate_up" as owed).
+  //
+  // So the arm MIRRORS THE ARTIFACT and issues two in-projection GEMMs. That is
+  // the shape `ProjectGdnQkvz` already has a precedent for: the split native-FP8
+  // arm the 35B runs takes exactly this path when the merged owner is empty.
+  //
+  // Exactly one representation is ever populated. When these are filled, the
+  // bf16 `in_proj_qkvz`/`out_proj` and every FP8 and NVFP4 field above are empty.
+  Exl3Weight in_proj_qkv_exl3;  // [K=H,         N=conv_dim]
+  Exl3Weight in_proj_z_exl3;    // [K=H,         N=value_dim]
+  Exl3Weight out_proj_exl3;     // [K=value_dim, N=H]
+
+  // ONE truth for the arm, keyed on the first projection alone, exactly as
+  // `FullAttnLayerWeights::IsExl3` keys on `q_proj_exl3`. A predicate that
+  // OR-ed the three would report a half-populated container as an arm, which is
+  // the state no loader may produce and no consumer may accept.
+  bool IsExl3() const { return !in_proj_qkv_exl3.Empty(); }
 };
 
 // Full (dense causal) attention layer weights.

@@ -51,6 +51,15 @@ vllm-bench               = 2a386db06b0df29a378fc67e928615a2856892e998461cbe547c4
 ONE_LIBRARY_BOTH_TIERS   = 3b752d296144dda7b00779f25cfe95f9dfe131fdbf523e5e4e923948783ea7aa
 ```
 
+**The branch head is not the measured object, and the difference is proven inert
+rather than argued.** The two jobs built `007012e49`; the branch carries three
+later commits, two of which touch product code — `act_dump.h` and `qwen3_5.cpp`,
+for the split stream counter, the two `EndStep` floors and bringing the MoE arm
+onto the same writer. None of that can change what the DENSE dump writes, and the
+check is executable: `test_qwen27_paged_forward` run with `VT_DUMP_ACT` at both
+objects produces **659 files that are byte-for-byte identical**, manifest
+included. Every figure below is therefore what the current tree would produce.
+
 **One library serves both tiers, and that is the point.** `vllm-bench` never sets
 `EngineParams::device`, so it resolves `Device::kAuto` through the platform
 registry, and `RocmPlatform` registers only when `hipGetDeviceCount() > 0`.

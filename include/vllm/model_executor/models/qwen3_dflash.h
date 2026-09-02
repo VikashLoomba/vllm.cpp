@@ -42,6 +42,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -164,6 +165,25 @@ struct Qwen3DFlashLayerWeights {
   // DFlash1 draft, and the forward then runs byte-for-byte as before.
   Qwen3DFlashConvWeights attention_conv;
   Qwen3DFlashConvWeights mlp_conv;
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): the SEVEN per-layer trellises of an EXL3
+  // draft. All EMPTY on a bf16 or GGUF draft, which is what leaves every
+  // `MakeLinearMethod` / `MakeMlpGateUpMethod` call in the three forward bodies
+  // bound to the unquantized method it was bound to before.
+  //
+  // SEVEN AND NOT FIVE, because a trellis does not row-stack. `qkv_proj` and
+  // `gate_up_proj` above are MERGED owners built by concatenating output rows;
+  // joining two trellises on the output dim INTERLEAVES per input tile and is a
+  // real transform, deferred by `specs/quant-exl3-shared.md` `## Owed`. The
+  // artifact agrees: `Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw` ships six
+  // independently fitted trellises per layer with six independently fitted
+  // `svh` vectors and no merged operand anywhere in the file.
+  Exl3Weight q_proj_exl3;     // [K=H, N=Hq*Dh]
+  Exl3Weight k_proj_exl3;     // [K=H, N=Hkv*Dh]
+  Exl3Weight v_proj_exl3;     // [K=H, N=Hkv*Dh]
+  Exl3Weight o_proj_exl3;     // [K=Hq*Dh, N=H]
+  Exl3Weight gate_proj_exl3;  // [K=H, N=I]
+  Exl3Weight up_proj_exl3;    // [K=H, N=I]
+  Exl3Weight down_proj_exl3;  // [K=I, N=H]
 };
 
 // Whole DFlash draft weights. The draft owns the fc aux-combine, the
@@ -210,6 +230,10 @@ struct Qwen3DFlashWeights {
     return shared_embed_tokens != nullptr ? *shared_embed_tokens : embed_tokens;
   }
   OwnedTensor fc;            // bf16 raw-NK [H, H*num_taps], nk (combine_hidden_states)
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): the aux-combine trellis, and the ONE
+  // field that says whether this draft is an EXL3 draft at all. Empty on every
+  // bf16 and GGUF draft.
+  Exl3Weight fc_exl3;        // [K=H*num_taps, N=H]
   OwnedTensor hidden_norm;   // bf16 [H] (normed before context-KV proj, D3)
   OwnedTensor final_norm;    // bf16 [H] (model.norm)
   OwnedTensor lm_head;       // bf16 raw-NK [draft_vocab, H], nk
@@ -265,6 +289,21 @@ struct Qwen3DFlashWeights {
   // carried the conv and no selector is not a shape this port knows how to run.
   Dflash2SelectorWeights candidate_selector;
   bool IsDflash2() const { return conv_taps > 0; }
+  // MODEL-DFLASH2-EXL3 (#2495 item 7): THE arm discriminator, and there is only
+  // ONE of it. Every projection in all three forward bodies asks this same
+  // question, exactly as they all ask `IsDflash2()`.
+  //
+  // KEYED ON `fc_exl3` ALONE, and that is the point rather than a convenience.
+  // A per-field probe -- "is THIS projection's trellis populated?" -- lets a
+  // half-populated container read as EXL3 at one call site and as bf16 at the
+  // next, which loads, runs, and drafts from a model that is neither. On a
+  // lossless verify that is invisible: the emitted tokens stay the target's and
+  // only acceptance falls. The loader closes the other half of the door by
+  // CONTROL FLOW rather than by a second check: once `fc` classifies the
+  // checkpoint the per-layer rung is unconditional, so a layer missing a
+  // trellis throws `tensor not found` at load. `IsExl3()` true therefore
+  // implies every forward site has one to read.
+  bool IsExl3() const { return !fc_exl3.Empty(); }
 };
 
 // Load the z-lab DFlash draft checkpoint. The on-disk names follow vLLM's
@@ -277,8 +316,20 @@ struct Qwen3DFlashWeights {
 // and gate/up into one gate_up_proj (the vLLM stacked mapping). All draft tensors
 // are BF16. `num_taps`/`mask_token_id`/`draft_vocab_size` come from the resolved
 // draft config.
+//
+// MODEL-DFLASH2-EXL3 (#2495 item 7): `has` is the tensor-PRESENCE predicate the
+// EXL3 rung needs, because upstream's own `Linear.is_exl3_storage` asks for
+// `{key}.trellis` TOGETHER WITH `{key}.suh` and `{key}.svh`
+// (`exllamav3/modules/linear.py:385-389`) and `TensorResolver` can only throw.
+// An EMPTY `has` -- the default -- answers "this container holds no EXL3
+// module", which is what keeps the GGUF draft and the DSpark backbone
+// byte-unchanged: neither format can carry a trellis, and neither should grow a
+// probe for one. The shards overload below builds `has` with the SAME
+// `model.`-prefixed fallback its resolver uses, so the two cannot disagree
+// about whether a tensor exists.
 Qwen3DFlashWeights LoadQwen3DFlash(const TensorResolver& get, const HfConfig& config,
-                                   int64_t num_taps, int32_t mask_token_id);
+                                   int64_t num_taps, int32_t mask_token_id,
+                                   const std::function<bool(const std::string&)>& has = {});
 Qwen3DFlashWeights LoadQwen3DFlash(const std::vector<SafetensorsFile>& shards,
                                    const HfConfig& config, int64_t num_taps,
                                    int32_t mask_token_id);

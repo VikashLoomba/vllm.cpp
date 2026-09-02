@@ -239,7 +239,7 @@ every existing binary that includes the fixture is byte-unchanged.
 
 ```sh
 cmake --build build --target test_qwen3_dflash2_exl3 test_dflash2_exl3_reach -j 4
-ctest --test-dir build -R "^(qwen3_dflash2_exl3|dflash2_exl3_reach)$" --output-on-failure
+ctest --test-dir build -R "^test_(qwen3_dflash2_exl3|dflash2_exl3_reach)$" --output-on-failure
 ctest --test-dir build -R 'dflash' --output-on-failure
 ctest --test-dir build -R 'exl3' --output-on-failure
 scripts/agent-preflight.sh --staged
@@ -254,17 +254,99 @@ Reachability is proved by MUTATION, not by reading. The table is in
 
 ## Evidence
 
-Filled by the implementation commits. Each mutation row must assert that the
-mutation CHANGED the file (sha256), that it COMPILED, that the test binary's
-mtime MOVED, and that the tree was restored byte-for-byte. A mutation failing
-any of those is reported INVALID and never as a pass.
+Measured 2026-09-02 on the session host, CPU-only Release build
+(`-DVLLM_CPP_CUDA` off, g++ 13.3.0), `HEAD` of `row/MODEL-DFLASH2-EXL3`. The
+build tree is `/dev/shm/dflash2exl3-build`, configured fresh against this
+worktree: the session host's root filesystem reached 709 MB free while another
+agent held a 52 GB build, and `/dev/shm` is where this box's other sessions
+build for the same reason. No file outside this worktree was written or removed.
 
-At minimum: the `fc` EXL3 call site; one attention projection call site; the MLP
-seam swap; the F16 admission (which must RED — a BF16-only reader has to refuse
-this artifact); and the `IsExl3()` predicate.
+### The focused gate
+
+```
+ctest -R '^test_(qwen3_dflash2_exl3|dflash2_exl3_reach)$' --output-on-failure
+  test_dflash2_exl3_reach .......... Passed  8.04 sec
+  test_qwen3_dflash2_exl3 .......... Passed  0.07 sec
+  100% tests passed, 0 tests failed out of 2      exit 0
+```
+
+Assertion counts read off the binaries, because a ctest `Passed` cannot separate
+a suite from a skip: `test_qwen3_dflash2_exl3` reports **5 cases, 284 assertions,
+284 passed, 0 failed**; `test_dflash2_exl3_reach` reports **3 cases, 113
+assertions, 113 passed, 0 failed**.
+
+`rel_rms` of the EXL3 forward against its decoded bf16 twin is **0.0394077** on
+the context-free block body and **0.0394077** on the context-aware one, against a
+declared bound of 0.06. The two agree to every printed digit, which is what an
+empty context should produce.
+
+The whole `dflash|exl3` neighbourhood is **46/46 passed, exit 0** (38.3 s), so
+the bf16 DFlash1, DFlash2, GGUF, DSpark and DeepSeek-V4 lanes are unmoved.
+
+### The published checkpoint LOADS
+
+`VLLM_CPP_DFLASH2_EXL3_DRAFT_DIR=/mnt/nas_share/models/Qwen3.8-27B-EXL3/draft-dflash2-5.0bpw`
+runs the guarded case against the real artifact:
+**1 case, 126 assertions, 126 passed, 0 failed, exit 0**. That is
+`Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw` @ `4f0436269bca761b071f05319e8e04a87cc633f9`,
+`model.safetensors`, 1 470 916 078 B, sha256
+`6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56`, computed
+locally from the downloaded file. All 36 modules came back at bits 5 and
+codebook 2, at the geometry `config.json` declares, with the F16 remainder
+converted and `embed_tokens`/`lm_head` absent as the published draft ships them.
+
+**It has not GENERATED.** Loading is not running: see `## Owed`.
+
+### Mutations
+
+Each row asserts that the mutation CHANGED the file (sha256 before and after),
+that it COMPILED (`cmake --build` rc 0), that BOTH test binaries' mtimes MOVED,
+and that the tree restored BYTE-FOR-BYTE (sha256 equal to the pre-mutation
+value). Every row below satisfied all four; a row that had not would be reported
+INVALID and never as a pass. The harness is a scratch script, not committed:
+`.git/info/exclude` already lists the name. It refuses to print a verdict when
+any of the four checks fails, and it restores the file in every exit path,
+including the ones that report INVALID -- which is the failure mode a mutation
+pass leaves behind when it does not.
+
+| # | mutation | `models` suite | `reach` suite |
+|---|---|---|---|
+| M1 | neuter the `ProjectDflashQkv` EXL3 arm (`&& false`) | **RED** (rc 8, thrown) | **RED** (3 failed) |
+| M2 | revert the `fc` combine to the raw bf16 `ResidentWeight` + `MatmulBT` | green | **RED** (3 failed) |
+| M3 | hard-bind the cold body's MLP to `UnquantizedMlpGateUpMethod` | **RED** (rc 8, thrown) | green |
+| M4 | drop the F16 admission from `LoadRawNKForScheme` | **RED** (rc 8, thrown) | green |
+| M5 | `IsExl3()` returns `false` | **RED** (2 failed) | **RED** (4 failed) |
+| M6 | swap the `k` and `v` trellises inside `ProjectDflashQkv` | **RED** (2 failed) | green |
+| M7 | revert the o_proj seam in the PAGED hot body | green | **RED** (3 failed) |
+| M8 | resolve a `mul1` marker to codebook 1 instead of 2 | **RED** (17 failed) | **RED** (15 failed) |
+
+**The two suites answer different questions, and the greens above are the
+evidence for that rather than a gap.** M2 and M7 are RED only in `reach`: the
+`fc` combine and the paged body are reached by the runner and by nothing the
+block-forward suite calls, which is precisely why the engine binary exists. M3,
+M4 and M6 are RED only in `models`: the cold body's MLP, the F16 dtype rule and
+a decode that is wrong rather than absent are all invisible to a gate that only
+asks whether generation completed.
+
+M7 is the reachability mutation `.agents/reachability.md` asks for, and it
+lands on the body the decode path actually runs. M1, M3 and M4 fail as THROWN
+cases rather than as failed assertions — doctest's `assertions:` line stays at
+"0 failed" while the process exits 8 — which is why every row above is read off
+the exit code and not off that line.
 
 ## Owed
 
+- **The published draft LOADS and has not GENERATED.** No engine has been run
+  with it, on any device, and no acceptance or throughput number is claimed. It
+  needs a target this engine can pair it with, which is the next item.
+- **The `--speculative-config` chain is verified in two pieces, not one.**
+  `LoadedEngine::FromModelDir` opens the draft only after the target's shards
+  are mapped (`maybe_load_dflash`), so a case driven from the command line needs
+  a complete on-disk target checkpoint that nothing in this tree builds. The
+  gate enters at `LoadQwen3DFlash(shards, ...)` over a real file — the call
+  `LoadDflashDraft` makes — and separately at the `LoadedEngine` in-memory seam
+  every DFlash2 runner gate uses. The one unexercised hop is `LoadDflashDraft`
+  itself, which is existing production code every bf16 draft already reaches.
 - **No device run and no benchmark.** Every gate is CPU-only. #2495's headline
   (47.5 tok/s on GB10) is items 8-10 and none of them is touched here.
 - **The target half.** #2495 items 5 and 6 — the EXL3 `lm_head` at bits 6, the

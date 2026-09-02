@@ -1992,6 +1992,12 @@ vllm_cpp_add_test(test_dflash2_runner_reach
 # W10 (#1857): the spec-as-decode classification case reads the graph-dispatch
 # counters, whose header lives in the src tree (same need as test_mtp_depth).
 target_include_directories(test_dflash2_runner_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# MODEL-DFLASH2-EXL3 (#2495 item 7): the same engine entry, with an EXL3 draft.
+# Its OWN binary because the draft store is a function-local static per arm and
+# the target it needs is wider than every other case in the shared fixture.
+vllm_cpp_add_test(test_dflash2_exl3_reach
+  vllm/v1/spec_decode/test_dflash2_exl3_reach.cpp)
+target_include_directories(test_dflash2_exl3_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SPEC-DFLASH2 W9 (#1849): the VT_SPEC_TRACE=2 device-segment trace of the
 # DFlash2 draft phase. Its OWN binary because the trace level is latched by a
 # function-local static on the first propose, so one process observes one level
@@ -2624,6 +2630,10 @@ vllm_cpp_add_test(test_llama_exl3_forward vllm/models/test_llama_exl3_forward.cp
 # MODEL-QWEN35-EXL3 (#2495 items 3 and 5): the EXL3 arm of the DENSE Qwen3.5
 # loader and forward, gated through LoadQwen3_5Dense and ModelRegistry::Forward.
 vllm_cpp_add_test(test_qwen35_exl3 vllm/models/test_qwen35_exl3.cpp)
+# MODEL-DFLASH2-EXL3 (#2495 item 7): the EXL3 arm of the DFlash2 DRAFT loader
+# and forward, gated through LoadQwen3DFlash over a real safetensors file and
+# then through Qwen3DFlashModel::ForwardBlockLogits.
+vllm_cpp_add_test(test_qwen3_dflash2_exl3 vllm/models/test_qwen3_dflash2_exl3.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM

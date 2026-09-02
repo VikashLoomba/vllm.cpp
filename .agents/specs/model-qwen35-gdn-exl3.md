@@ -180,23 +180,23 @@ because the behaviour it pinned is the behaviour this row changes.
 
 - **G3 (rewritten)** an EXL3 GDN tower LOADS: codebook 2, 4 bits, the right
   `in/out_features` on all three projections, EXACTLY ONE representation
-  populated (the bf16 `in_proj_qkvz` / `out_proj` and every FP8 and NVFP4 field
-  empty), the trellis still trellis BYTES, and the small tensors present beside
-  it. Then `ModelRegistry::Forward` over the LOADED weights, compared against the
-  same trellis bytes decoded into the bf16 fields.
-- **G3b** the 3:1 `layer_types` pattern of the real model — 8 layers,
-  6 `linear_attention` + 2 `full_attention` — loads and forwards, so the case
-  measures the pattern the artifact actually declares and not a 1/1 toy.
-- **G4** unchanged in intent and EXTENDED: the bf16, per-tensor FP8 and NVFP4
-  GDN arms must still land in their own fields with the EXL3 ones empty.
-
-The fixture's `linear_key_head_dim` moves from 32 to 64, which moves `conv_dim`
-from 192 to 256. Not cosmetic and not a tolerance change: **every EXL3
-projection's K and N must be a multiple of 128**, because each side carries a
-blockwise Hadamard-128 (`exl3_lib/quantize.py:15`, and `src/vt/exl3_policy.cpp:150`
-declines anything else). A `conv_dim` of 192 cannot be an EXL3 width at all. The
-geometry stays SHARED across all four arms, which is what makes a mis-selection
-the only difference a case can be reading.
+  populated (the bf16 `in_proj_qkvz`/`out_proj` and every FP8 and NVFP4 field
+  empty), the trellis still trellis BYTES, the small tensors present beside it,
+  and `IsPlainBf16Qwen3_5Dense` false. Then `ModelRegistry::Forward` over the
+  LOADED weights, compared against the same trellis bytes decoded into the bf16
+  fields.
+- **G3b** the artifact's 3:1 `layer_types` pattern over 8 layers — six
+  `linear_attention` and two `full_attention` — loads and forwards, so the case
+  measures the pattern the artifact declares and not a 1/1 toy.
+- **G3c** an EXL3 GDN tower whose `conv1d` channel count disagrees with
+  `in_proj_qkv`'s N is REFUSED BY NAME, and the unpatched fixture still loads.
+  Without this the loader's geometry guard is decoration.
+- **G4** unchanged in intent and EXTENDED with the GDN tower on both sides: the
+  bf16 arm still builds the merged `in_proj_qkvz` owner with the trellis fields
+  empty, an EXL3 dense half still leaves an unquantized GDN tower unquantized,
+  and an EXL3 GDN tower BESIDE A BF16 DENSE HALF is not a plain bf16 model.
+  That last shape is the only one that isolates the staging-predicate term,
+  because the published artifact quantizes both halves.
 
 ## Gates
 
@@ -208,13 +208,63 @@ ctest --test-dir build -R '^qwen35_gdn' --output-on-failure
 scripts/agent-preflight.sh --staged
 ```
 
-Reachability is proved by MUTATION, not by reading: deleting the production
-call site in `ProjectGdnQkvz` or `ProjectGdnOut` must red the gate, and the
-mutation table with real assertion counts is recorded in `## Outcome`.
+Reachability is proved by MUTATION, not by reading. The table is in
+`## Evidence`.
+
+## Evidence
+
+Measured 2026-09-02 on the session host, CPU-only Release build
+(`-DVLLM_CPP_CUDA` off), `HEAD` of `row/MODEL-QWEN35-GDN-EXL3`.
+
+`ctest --test-dir build -R '^test_qwen35_exl3$'` **PASSES**: 6 cases, **2763
+assertions, 2763 passed, 0 failed**. Not a skip; the binary exits 0 and doctest
+reports a non-zero assertion count. `rel_rms` against the decoded twin is
+`0.0133127` for the GDN arm and `0.00837246` for the dense arms.
+
+MUTATION TABLE. Each row asserts that the mutation CHANGED the file (sha256),
+that it COMPILED, that the test binary's mtime MOVED, and that the tree was
+restored byte-for-byte afterwards. A mutation that fails any of those is
+reported INVALID and never as a pass.
+
+| # | mutation | result | cases |
+|---|---|---|---|
+| M1 | delete the `ProjectGdnQkvz` EXL3 call site | **RED** | 4 passed / 2 failed |
+| M2 | delete the `ProjectGdnOut` EXL3 rung (all 3 tails) | **RED** | 4 passed / 2 failed |
+| M3 | mis-set the codebook, `mul1` (2) -> MCG (1) | **RED** | 2755/2763 assertions |
+| M4 | swap `suh` and `svh` on the GDN `out_proj` | **RED** | 2762/2763 assertions |
+| M5 | delete the `conv_dim` geometry refusal | **RED** | 2758/2759 assertions |
+| M6 | delete the `IsPlainBf16Qwen3_5Dense` GDN term | **RED** | 2762/2763 assertions |
+| M7 | drop `allow_f16` on the GDN small-tensor load | **RED** | 3 passed / 3 failed |
+
+M1 and M2 fail as thrown cases rather than as failed assertions, which is the
+reachability argument itself: with the call site gone the arm falls through to a
+bf16 field an EXL3 load leaves EMPTY, and `dense_attn::ResidentWeight` refuses
+it by name. Both restored files hash back to
+`ad981770c36a03f0...` (`qwen3_5.cpp`) and `8af73625f1a52bcf...`
+(`qwen3_5_dense_weights.cpp`), and the clean rebuild returns to 2763/2763.
+
+NEIGHBOURING GATES, to show the existing arms are undisturbed:
+`ctest -R 'exl3|qwen35|qwen27'` runs 29 and passes 28, with
+`test_qwen35_paged_engine` SKIPPED because it needs a checkpoint. Green include
+`test_exl3_native_loader`, `test_exl3_dequant`, `test_exl3_gemm`,
+`test_exl3_linear_method`, `test_llama_exl3_forward`,
+`test_deepseek_v4_exl3_{loader,forward}`, `test_qwen35_plain_weights`,
+`test_qwen35_paged_forward{,_gdn_out_f32}`, `test_qwen35_moe_gdn_ba_owner`,
+`test_qwen27_paged_forward{,_act_f32}` and `test_qwen27_dense_forward`. Five
+further ctest names report `Not Run` because their binaries were not built; none
+is a red.
+
+`scripts/agent-preflight.sh --staged`: every static checker green, commit
+trailers and style green, and `check-tree-compiles` green at 428/428
+translation units. One gate failed, `test_cpu_x86_llamacpp_floor`, and it is
+NOT this change: it is a Python self-test of the llama.cpp CPU floor harness's
+contention-discard logic, it reads none of the files this row touches, and it
+failed with `load=12.96 8.21 6.71` on a box that was simultaneously at 100%
+disk under several other builds.
 
 ## Owed
 
-- **No device run, and no benchmark.** Every case here is CPU. This row makes
+- **No device run, and no benchmark.** Every gate above is CPU-only. Every case here is CPU. This row makes
   the published checkpoint LOAD; #2495's headline (47.5 tok/s on GB10) needs the
   14.2 GB artifact downloaded and run and is items 8-10, none of which this row
   touches. Loading is not benchmarking and #2495 stays open.

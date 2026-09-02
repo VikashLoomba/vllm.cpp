@@ -471,14 +471,16 @@ a bounds question, and it is a different row.
 * Dequantizing the `qwen4_exp` hyper-connection weights at load
   (`MODEL-MM-QWEN4-EXP`), with the residency and token evidence that needs.
 * The aarch64 CUDA measurement of the repack trade that #2406 asks for.
-* **The misaligned bf16 gamma load**
-  ([#2540](https://github.com/mudler/vllm.cpp/issues/2540)). `WidenRowToF32`
-  reads an RMSNorm gamma at an odd address on `dots3_note` and `muse_glimmer`,
-  reached from `ModelRegistry::Forward` on both. Found by this wave's sweep,
-  filed rather than fixed: it is a different subsystem, the root cause is
-  wherever `ResidentWeight` produced an odd `bytes.data()`, and silencing it with
-  a `memcpy` in `WidenRowToF32` would fix the wrong end. It is the second
-  `sanitize-cpu` finding and it blocks that lane after this branch lands.
+* ~~**The misaligned bf16 gamma load**
+  ([#2540](https://github.com/mudler/vllm.cpp/issues/2540)).~~ NO LONGER OWED
+  HERE. `FIX-UNALIGNED-CONSUMERS-2540`
+  ([`unaligned-safetensors-consumers.md`](unaligned-safetensors-consumers.md))
+  claimed and fixed it on 2026-09-02, and the issue's own `Row:` line now names
+  that row. The guess recorded here — that the root cause was "wherever
+  `ResidentWeight` produced an odd `bytes.data()`" — was measured and is FALSE:
+  the producer is the safetensors payload base, which is `8 + <JSON header
+  length>` and therefore odd for roughly half of all files. Nothing produced a
+  defect; `WidenRowToF32` read bytes it was not entitled to assume were aligned.
 
 ## Now
 

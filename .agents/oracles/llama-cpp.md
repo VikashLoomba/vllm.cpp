@@ -96,11 +96,39 @@ aarch64 repacked gemv, the aarch64 NEON/SVE vec_dot, the portable `_generic`
 vec_dot, and the generic repacked gemv — and which one runs is decided by host
 architecture, `-mcpu` feature set, repack state and batch size.
 
+**Three stock levers move this oracle's greedy tokens, and one does not.**
+Measured 2026-09-02 on `thor:gpu0`, rc job
+`8480a30e-0d6d-44a7-b1b4-00e9d36c888d`, twelve runs of the stock oracle over one
+artifact and one recipe, ten of them teacher-forced along the stock default's own
+ids so every arm's argmax describes the identical preceding context. Evidence:
+[`../../docs/bench-evidence/qwen38-27b-q4km-oracle-path-pin-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-oracle-path-pin-20260902.md).
+
+| lever | stock flag | moves the tokens? |
+|---|---|---|
+| `use_extra_bufts` | `-nr/--no-repack` | yes, 1 of 6 prompts |
+| `n_ubatch = 1` | `-ub/--ubatch-size` | yes, 1 of 6 prompts; `-ub 4` moves nothing at these prompt lengths |
+| flash attention off | `-fa/--flash-attn` | yes, 2 of 6 prompts |
+| `n_threads` | `-t/--threads` | **no**: 1, 4 and 13 threads are byte-identical to 14 over all 288 steps |
+
+`n_ubatch` matters because `forward_mul_mat_one_chunk` calls `gemm` only when
+`nrows > 3` and `gemv` for the tail (`ggml/src/ggml-cpu/repack.cpp:4240`), so an
+ubatch of 1 sends every prefill row through the GEMV body, and the prefill writes
+the KV cache every later step reads. `n_threads` does not, because
+`repack.cpp:4317-4372` lets a chunk boundary select WHICH rows a thread computes
+while each row's dot product completes inside one kernel call over the full
+`ne00`.
+
+**`flash_attn_type` defaults to `AUTO`, and on this host `AUTO` resolves to
+`ENABLED`** -- the explicit `enabled` arm is byte-identical to the default over
+all 288 steps and the `disabled` arm is not. A record that names the revision and
+the repack state but not the attention kernel is still under-specified.
+
 **What this obliges of any token gate against this oracle on the CPU tier.**
-Record the executed path, not just the pin: either pass `-nr/--no-repack`
-explicitly, or assert and record `use_extra_bufts` (and the `system_info`
-capability line) in the run record, alongside the host architecture and the
-feature set the binary was compiled for. A gate that pins only the revision is
+Record the executed path, not just the pin: assert and record
+`use_extra_bufts`, `n_ubatch`, and the RESOLVED flash-attention type (not the
+`AUTO` request), together with the `system_info` capability line, the host
+architecture, the feature set the binary was compiled for, and the thread count
+-- the last for completeness, since it is measured not to matter here. A gate that pins only the revision is
 under-specified, and a 6-of-6 token-exactness demand at a sub-0.2-logit margin is
 asking for bit-reproduction of one specific kernel rather than for arithmetic
 quality — `b10451` scores 5 of 6 against itself when asked.

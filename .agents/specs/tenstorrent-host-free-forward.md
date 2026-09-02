@@ -879,3 +879,25 @@ fixed at its three consumed surfaces.
   band adjudication (max gap 0.375 nats), not a strict-token failure; the
   cross-request replay of the previous prompt's tokens — the actual #2469
   defect — is gone.
+- **Token-clean at Qwen3-4B ([#2566](https://github.com/mudler/vllm.cpp/issues/2566);
+  `hf-abc4b.sh`, 2026-09-01, 2 order-alternated triples at the repaired
+  head `081efabc7`, same recipe: `--repeat 5`, discard run 1, warm
+  medians): default 9.25 / opt-out 8.89 / CAPTURED 13.84 tok/s — 1.50x the
+  default, 1.56x the opt-out; replays=474 and 0 fatals on every leg, and
+  the capture legs are coherent and deterministic (the pre-repair 4B
+  capture legs were the #2461 cold-step gibberish). The CORRECTNESS CAVEAT
+  on the earlier 13.90 machinery-only figure is superseded by this
+  re-measurement; captured replay dominates both eager arms at 0.6B and 4B
+  on token-clean evidence.
+- **Token-clean at Mistral-7B-v0.3 ([#2566](https://github.com/mudler/vllm.cpp/issues/2566);
+  `hf-mist-abc.sh`, 2026-09-01, 2 order-alternated triples at
+  `081efabc7`, `--max-tokens 64 --repeat 5`, `tt-smi -r 0` first, warm
+  medians): default 11.51 / opt-out 5.93 / CAPTURED 14.23 tok/s — 1.24x
+  the default, 2.40x the opt-out; 314 replays, 0 fatals, rc 0 on both
+  triples, and the capture arm's output is TOKEN-IDENTICAL to the default
+  arm's in both triples (the A-vs-B text divergence is the known
+  eager-kernel near-tie situation). This is the model with the sharpest
+  default-vs-opt-out inversion (the default wins ~1.95x), and the captured
+  arm beats both — captured replay's superiority over eager now holds at
+  all three measured sizes on token-clean legs. The per-model record entry
+  is in `.agents/benchmark-record.md`.

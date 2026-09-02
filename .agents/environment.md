@@ -111,6 +111,21 @@ history and take the toolchain from
   the same day the worker ran as `uid=0(root)` with `/usr/bin/gcc`,
   `/usr/bin/python3` and a working `apt-get`
   ([#1146](https://github.com/mudler/vllm.cpp/issues/1146)).
+- **A leased worker's `github.com` egress is not guaranteed, and its absence
+  reads as an authentication failure rather than as a network one.** On
+  2026-09-02 a `thor:gpu0` job that had fetched llama.cpp from `ggml-org` earlier
+  the same day failed at `git fetch` with `could not read Username for
+  'https://github.com'` followed by `fatal: expected flush after ref listing`
+  (rc job `019596fd-5e88-4d0d-aa93-2749ab618524`). Nothing about that message
+  says "no route"; a reader chasing credentials would look in the wrong place.
+  **A job that needs pinned upstream source should stage it rather than fetch
+  it**, and staging costs no rigour if the tree is verified rather than named:
+  `git archive <PIN>` on the dev box, then `git init && git add -A --force &&
+  git write-tree` on the worker, asserted equal to `<PIN>^{tree}`. That rehashes
+  every blob from the bytes that get compiled, which is a stronger statement than
+  `git rev-parse HEAD` plus an empty porcelain
+  ([#2534](https://github.com/mudler/vllm.cpp/issues/2534),
+  `docs/bench-evidence/qwen38-27b-q4km-oracle-path-pin-20260902.md`).
 - **The host filesystem is not visible.** `/home/mudler` does not exist inside
   the worker.
 - `/workspace` is the house NAS, measured as `//192.168.68.102/Data 7.3T total,

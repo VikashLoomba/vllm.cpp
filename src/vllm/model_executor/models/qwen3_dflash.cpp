@@ -22,6 +22,7 @@
 #include "vllm/model_executor/layers/linear.h"             // UnquantizedMlpGateUpMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight/Reshape/MakeRopeArgs
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // #1628: the shared NVFP4 W4A16 logits GEMM
+#include "vllm/model_executor/models/dense_exl3_linear.h"  // #2495 item 6: the ONE EXL3 linear seam
 #include "vllm/model_executor/models/qwen3_dflash_internal.h"  // W11 (#1890): the block-attn route
 #include "vllm/platforms/interface.h"                     // platforms::GetPlatform (static-graph gate)
 #include "vt/backend.h"
@@ -86,6 +87,16 @@ constexpr int64_t kPadSlotId = -1;  // vLLM PAD_SLOT_ID (attention/backends/util
 // mirrors - is gone from the merged version entirely.
 DBuf DflashLogitsF32D(Dev d, const Tensor& x, const Qwen3DFlashWeights& weights,
                       int64_t vocab, int64_t hidden_size) {
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 6): a TRELLIS target head, computed with
+  // packed, through the one EXL3 linear seam. FIRST, so every logits site in
+  // this tree orders its arms `exl3 -> fp4 -> bf16` and three readers of one
+  // head cannot disagree about precedence (`DenseLogitsF32D`, qwen3_5.cpp;
+  // `Qwen3_5MTPModel::ComputeLogits`). f32 out: the trellis GEMM writes f32
+  // directly, so nothing is widened on the way to the selector.
+  if (!weights.lm_head_exl3.Empty()) {
+    return dense_exl3::Linear(d, x, weights.lm_head, weights.lm_head_exl3,
+                              DType::kF32);
+  }
   if (!weights.lm_head_fp4.Empty()) {
     // The W4A16 dispatcher refuses a true-W4A4 weight itself; this says WHY in
     // this lane's terms, because falling into the fp4-activation GEMM the target

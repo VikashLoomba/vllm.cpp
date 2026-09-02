@@ -568,10 +568,22 @@ class SharedHeadSource {
   // head exactly as it did before that row. The DSpark caller passes it and says
   // why; the GGUF arm never sets it, because a GGUF target's `output.weight` is
   // dequantized on the way in and is the case D12 refuses.
+  //
+  // `head_exl3` is the MODEL-QWEN35-EXL3-HEAD (#2495 item 6) owner and is
+  // REQUIRED for the third time and the third reason that is the SAME reason:
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships `lm_head.{trellis,suh,svh,mul1}`
+  // and no `lm_head.weight` at all, so a lane that quietly declined the trellis
+  // would report a complete head as absent. `nullptr` means "this lane cannot
+  // compute with a trellis head" and the read then refuses BY NAME. The DSpark
+  // caller passes it and says why; the GGUF arm never sets it, because a GGUF
+  // target's `output.weight` is dequantized on the way in — the same sentence
+  // that already applies to `head_fp4`, and for the same reason.
   void LoadInto(vllm::OwnedTensor* embed, vllm::OwnedTensor* head,
-                bool* head_was_quantized, vllm::Nvfp4Weight* head_fp4) const {
+                bool* head_was_quantized, vllm::Nvfp4Weight* head_fp4,
+                vllm::Exl3Weight* head_exl3) const {
     if (head_was_quantized != nullptr) *head_was_quantized = false;
     if (head_fp4 != nullptr) *head_fp4 = vllm::Nvfp4Weight{};
+    if (head_exl3 != nullptr) *head_exl3 = vllm::Exl3Weight{};
     if (gguf_ != nullptr) {
       vllm::LoadGgufSharedEmbedAndHeadBf16(*gguf_, embed, head, head_was_quantized);
     } else {
@@ -580,9 +592,17 @@ class SharedHeadSource {
       // this replaces was a ~2.54 GB anonymous buffer.
       *embed = vllm::LoadDflashSharedEmbedBf16(
           *shards_, "model.language_model.embed_tokens.weight");
-      vllm::LoadDflashSharedLmHead(*shards_, head, head_fp4);
+      vllm::LoadDflashSharedLmHead(*shards_, head, head_fp4, head_exl3);
     }
-    if (embed->Empty() || (head->Empty() && (head_fp4 == nullptr || head_fp4->Empty()))) {
+    // The head half of this check is now a belt to `LoadDflashSharedLmHead`'s
+    // own braces (#2569): that function used to fall off the end of its bf16
+    // loop and return silently with every owner empty, which made THIS line the
+    // only refusal — and it names bf16 tensors, which is the wrong sentence for
+    // a target whose head is present and simply not dense. It throws by name
+    // itself now. This stays because the GGUF arm reaches it too.
+    if (embed->Empty() ||
+        (head->Empty() && (head_fp4 == nullptr || head_fp4->Empty()) &&
+         (head_exl3 == nullptr || head_exl3->Empty()))) {
       throw std::runtime_error(
           "dflash: the target's bf16 embed_tokens + lm_head (which the draft "
           "SHARES) were not found in " +
@@ -963,16 +983,17 @@ std::unique_ptr<DflashDraft> LoadDsparkDraft(const vllm::SpeculativeConfig& spec
       draft->dspark->backbone.lm_head.Empty()) {
     vllm::OwnedTensor shared_embed;
     vllm::OwnedTensor shared_lm_head;
-    // Both nullptr, and NEITHER a default. The DSpark lane has no DFlash2
+    // ALL THREE nullptr, and NONE a default. The DSpark lane has no DFlash2
     // selector, so no guard reads a dequantized-head flag here; and its backbone
-    // holds ONE bf16 `lm_head` owner, so there is nowhere to put a packed head.
-    // A quantized target head therefore still refuses at
-    // `LoadDflashSharedLmHead`, by name and at startup. Both are NAMED rather
-    // than omitted so neither can be deleted at the DFlash call site without a
-    // build failure. Owed: .agents/specs/dflash2-spec-decode.md `## Owed` O26,
-    // issue #1628.
+    // holds ONE bf16 `lm_head` owner, so there is nowhere to put a packed head
+    // of EITHER kind — NVFP4 or EXL3 trellis. A quantized target head therefore
+    // still refuses at `LoadDflashSharedLmHead`, by name and at startup. All
+    // three are NAMED rather than omitted so none can be deleted at the DFlash
+    // call site without a build failure. Owed:
+    // .agents/specs/dflash2-spec-decode.md `## Owed` O26, issue #1628; the
+    // trellis owner is owed by .agents/specs/model-qwen35-exl3-head.md, #2495.
     shared.LoadInto(&shared_embed, &shared_lm_head, /*head_was_quantized=*/nullptr,
-                    /*head_fp4=*/nullptr);
+                    /*head_fp4=*/nullptr, /*head_exl3=*/nullptr);
     if (draft->dspark->backbone.embed_tokens.Empty()) {
       draft->dspark->backbone.embed_tokens = std::move(shared_embed);
     }
@@ -1051,10 +1072,18 @@ std::unique_ptr<DflashDraft> LoadDflashDraft(
   // different, and the dtype cannot tell them apart.
   shared.LoadInto(&draft->weights.embed_tokens, &draft->weights.lm_head,
                   &draft->weights.lm_head_dequantized,
-                  &draft->weights.lm_head_fp4);
-  draft->weights.draft_vocab_size = draft->weights.lm_head_fp4.Empty()
-                                        ? draft->weights.lm_head.shape[0]
-                                        : draft->weights.lm_head_fp4.n;
+                  &draft->weights.lm_head_fp4, &draft->weights.lm_head_exl3);
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 6): the vocab comes from whichever of the
+  // THREE owners the read filled, and never from a declared number. The trellis
+  // arm reports it as `OutFeatures()` — the trellis geometry, `n/16` output
+  // tiles of 16 — which is the same rule `Exl3Weight` applies to `bits`: the
+  // tensor is the authority and the config scalar is not.
+  draft->weights.draft_vocab_size =
+      !draft->weights.lm_head_exl3.Empty()
+          ? draft->weights.lm_head_exl3.OutFeatures()
+          : (draft->weights.lm_head_fp4.Empty()
+                 ? draft->weights.lm_head.shape[0]
+                 : draft->weights.lm_head_fp4.n);
   // A DFLASH GGUF draft carries NO vocab KV and no embedding tensor (it SHARES
   // the target's), so MakeDflashGgufConfig leaves vocab_size 0 - right for the
   // config, fatal for the forward: the draft sizes its embedding lookup as

@@ -7574,6 +7574,15 @@ DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
     device.b.Copy(device.q, cat + target_offset + row_bytes, target + source_offset,
                   row_bytes);
   }
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): the fc-cat projection through the ONE
+  // EXL3 linear seam when the checkpoint quantized it, bf16 out because that is
+  // what `MatmulBf16D` returns and what the decoder layer below consumes. There
+  // is no second matmul: `dense_exl3::Linear` forwards to
+  // `layers::Exl3LinearMethod`, which calls `dense_attn::Exl3MatmulD`.
+  if (weights.IsExl3()) {
+    return dense_exl3::Linear(device, concatenated.t(), weights.fc,
+                              weights.fc_exl3, DType::kBF16);
+  }
   return MatmulBf16D(device, concatenated.t(), weights.fc);
 }
 
@@ -8696,7 +8705,12 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       lm_head_(&DenseLmHead(target)),
       // PERF-27B-LMHEAD-FP4: the drafter shares the TARGET's head, so it must see
       // the packed one too. Empty on every BF16/FP8/tied dense target.
-      lm_head_fp4_(&target.lm_head_fp4) {
+      lm_head_fp4_(&target.lm_head_fp4),
+      // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): and the TRELLIS one, for the same
+      // reason. `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships no `lm_head.weight` at
+      // all, so on that target `DenseLmHead(target)` above is EMPTY and this is
+      // the only head there is. Empty on every other dense target.
+      lm_head_exl3_(&target.lm_head_exl3) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -8708,7 +8722,12 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
       config_(&config),
       embed_tokens_(&target.embed_tokens),
       lm_head_(&target.lm_head),
-      lm_head_fp4_(&target.lm_head_fp4) {
+      lm_head_fp4_(&target.lm_head_fp4),
+      // `Qwen3_5MoeWeights` has NO EXL3 head owner, so there is nothing to point
+      // at. Said out loud rather than left to a default, and rather than adding a
+      // field to the MoE container that no loader fills: no EXL3 MoE checkpoint
+      // is in scope (.agents/specs/model-qwen35-exl3-head.md `## Owed`).
+      lm_head_exl3_(nullptr) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kMoe,
            "qwen3_5 MTP: MoE target requires MoE MTP weights");
 }
@@ -8735,10 +8754,18 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::Forward(
                target_hidden_states.device == queue.device,
            "qwen3_5 MTP forward: target hidden states must be contiguous "
            "bf16 [T,H] on the queue device");
-  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
-               weights_->fc.shape[0] == hidden_size &&
-               weights_->fc.shape[1] == 2 * hidden_size,
-           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H]");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): ONE precondition, two containers.
+  // The trellis stores [K=2H, N=H] where the torch Linear stores [N=H, K=2H],
+  // so the same projection is asserted through the orientation its own owner
+  // uses. `IsExl3()` is the loader's answer, not a second derivation.
+  VT_CHECK(weights_->IsExl3()
+               ? (weights_->fc_exl3.InFeatures() == 2 * hidden_size &&
+                  weights_->fc_exl3.OutFeatures() == hidden_size)
+               : (weights_->fc.rank == 2 && weights_->fc.nk &&
+                  weights_->fc.shape[0] == hidden_size &&
+                  weights_->fc.shape[1] == 2 * hidden_size),
+           "qwen3_5 MTP forward: fc must be raw bf16 [H,2H] or an EXL3 trellis "
+           "[K=2H, N=H]");
 
   (void)vocab_size;
   // ONE decode step. A DRAFT forward is a complete forward with its own working
@@ -8798,10 +8825,18 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
                target_hidden_states.device == queue.device,
            "qwen3_5 MTP paged forward: target hidden states must be contiguous "
            "bf16 [T,H] on the queue device");
-  VT_CHECK(weights_->fc.rank == 2 && weights_->fc.nk &&
-               weights_->fc.shape[0] == hidden_size &&
-               weights_->fc.shape[1] == 2 * hidden_size,
-           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H]");
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5): ONE precondition, two containers.
+  // The trellis stores [K=2H, N=H] where the torch Linear stores [N=H, K=2H],
+  // so the same projection is asserted through the orientation its own owner
+  // uses. `IsExl3()` is the loader's answer, not a second derivation.
+  VT_CHECK(weights_->IsExl3()
+               ? (weights_->fc_exl3.InFeatures() == 2 * hidden_size &&
+                  weights_->fc_exl3.OutFeatures() == hidden_size)
+               : (weights_->fc.rank == 2 && weights_->fc.nk &&
+                  weights_->fc.shape[0] == hidden_size &&
+                  weights_->fc.shape[1] == 2 * hidden_size),
+           "qwen3_5 MTP paged forward: fc must be raw bf16 [H,2H] or an EXL3 trellis "
+           "[K=2H, N=H]");
   VT_CHECK(attn_meta.num_actual_tokens == tokens,
            "qwen3_5 MTP paged forward: attn metadata token count must equal T");
   VT_CHECK(draft_kv.num_kv_heads == config_->num_key_value_heads &&
@@ -8891,9 +8926,20 @@ ForwardLogits Qwen3_5MTPModel::ComputeLogits(
            "qwen3_5 MTP logits: hidden states must be contiguous bf16 [T,H] "
            "on the queue device");
   Dev device{vt::GetBackend(queue.device.type), queue};
-  DBuf logits = (lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
-                    ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
-                    : MatmulF32D(device, hidden_states, *lm_head_);
+  // MODEL-QWEN35-EXL3-HEAD (#2495 item 5). The arms are ordered
+  // `exl3 -> fp4 -> bf16`, which is `DenseLogitsF32D`'s order and
+  // `DflashLogitsF32D`'s, so the three readers of ONE target head cannot
+  // disagree about precedence. The trellis head is COMPUTED WITH, never widened:
+  // a dequantized copy of the real 248320x5120 head is 2.543 GB, and upstream
+  // reaches the packed path without a branch because `_apply_head` calls
+  // `lm_head.quant_method.apply` (logits_processor.py:132-142).
+  DBuf logits =
+      (lm_head_exl3_ != nullptr && !lm_head_exl3_->Empty())
+          ? dense_exl3::Linear(device, hidden_states, *lm_head_, *lm_head_exl3_,
+                               DType::kF32)
+          : ((lm_head_fp4_ != nullptr && !lm_head_fp4_->Empty())
+                 ? MatmulNvfp4F32D(device, hidden_states, *lm_head_fp4_)
+                 : MatmulF32D(device, hidden_states, *lm_head_));
   return WrapDeviceLogits(device, std::move(logits), config_->vocab_size);
 }
 

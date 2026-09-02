@@ -281,9 +281,20 @@ heterogeneous-KV model such as Gemma-4, where each layer carries its own
 attention spec, that means you see a doubled block count in the startup line and
 then a named refusal at the first forward — not a served run.
 
-**Not on the C ABI yet.** `vllm_model_params` carries no `kv_cache_dtype` field,
-so a C-ABI caller reaches the fp8 cache only through a checkpoint that declares
-it. Tracked by [#1593](https://github.com/mudler/vllm.cpp/issues/1593).
+**Through the C ABI (v24).** `vllm_model_params.kv_cache_dtype` (ABI v24,
+fork issue #7) carries the same string the server flag takes. NULL or `"auto"`
+is the default and uses the model dtype — byte-identical to before the field
+existed. `"fp8"` or `"fp8_e4m3"` stores 1-byte fp8-e4m3 K/V:
+
+```c
+vllm_model_params mp = vllm_model_params_default();
+mp.model_path = "/path/to/model";
+mp.kv_cache_dtype = "fp8";
+vllm_engine *engine = NULL;
+vllm_engine_load(&mp, &engine);
+```
+
+`vllm-cli` takes the same `--kv-cache-dtype` flag the server takes.
 
 ## Draft with a second checkpoint
 

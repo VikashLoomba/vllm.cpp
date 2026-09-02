@@ -348,6 +348,7 @@ Setting it does nothing, and the row is gone rather than caveated
 | `VT_GEMMA4_LAYER_TRACE` | off | `=1` layer GPU-synced phase timers; `=2` per-layer heartbeats |
 | `VLLM_CPP_HTTP_FIXED_POOL` | `1` (fixed) | `=0` reverts the HTTP worker pool to the legacy dynamic mode. Production uses the capacity-derived fixed pool; the opt-out exists for same-binary A/B attribution |
 | `VT_ROCM_ATTN_CPU_REF` | unset | `=1` routes ROCm paged attention through the CPU reference kernel instead of the HIP kernel — a correctness A/B for the ROCm attention bring-up |
+| `VT_ATTN_DECODE_GQA4` | off | `=1` routes f32-query decode through `PagedAttnDecodeGqaF32Q` (QG=4 fused q-heads per KV group, warp-strided walk) for bf16 or fp8-e4m3 KV at d=128/256, hq=16, kv=4; the default falls to the `PagedAttnOnline` reference. The arm's reduction order differs from the reference's, so greedy anchors can move at exact ties — opt-in until near-tie adjudication lands |
 | `VT_DEBUG_SAMPLED` | unset | `=1` prints the per-step sampled token id(s) to stderr (sampling-loop debug). Read-only; does not change output. Read once per token, so it does not stall the hot loop |
 
 ## Kernel-internal knobs (deferred)

@@ -551,6 +551,53 @@ the case where the release is a `munmap` rather than a free-list return. A 2.4
 GiB `hipMemcpyAsync` does not complete in the microseconds before the
 `madvise` on the next line.
 
+**Every large weight upload on this path sources from the HEAP, and a third of
+them from an `mmap`ed heap chunk.** Measured over the 402 copies larger than
+1 MB in the W4 trace of a completed leg (`evidence2/log-r3.trace.gz`):
+
+| quantity | value |
+|---|---|
+| bytes copied host to device | 24.19 GiB |
+| span the sources occupy | 28.35 GiB, wider than the 15.9 GiB file |
+| sources at a page boundary exactly (a raw file mapping) | **0 of 402** |
+| sources at page boundary + `0x10` (a glibc `mmap`ed malloc chunk's payload) | **145 of 402** |
+
+145 sources at exactly `+0x10` is not chance (1 in 4096 would give about 0.1),
+and a chunk glibc served by `mmap` is a chunk `free()` returns by `munmap` — a
+real hole, not a free-list entry.
+
+Split by tensor size, the two populations separate cleanly, and they separate
+exactly the way the source says they should:
+
+| copy size | copies | sources at page + `0x10` | reads as |
+|---|---|---|---|
+| 50,135,040 (Q4_K row block) | 160 | 0 | BORROWED from the GGUF mapping |
+| 73,113,600 (the Q6_K tensor that faults) | 32 | 0 | BORROWED |
+| 17,694,720 / 35,389,440 / 4,300,800 / 2,949,120 | 64 | 0 | BORROWED |
+| **62,914,560** | **96** | **96** | OWNED, `mmap`ed chunk |
+| **104,857,600** | **48** | **48** | OWNED, `mmap`ed chunk |
+| **2,542,796,800** | **1** | **1** | OWNED, `mmap`ed chunk |
+
+That is the code's own split, measured: the keep-quant tensors borrow the
+mapping and take `AdoptDeviceBytesAsHost`'s `w.bytes.borrowed()` early return,
+and the bf16 expansions are owned and do not. **145 uploads totalling 12.7 GiB
+per run take the branch that madvises and unmaps its own copy source**, and they
+take it lazily, inside the forward.
+
+The largest is unambiguous, and its two log lines sit next to each other:
+
+```text
+hipMallocManaged ( …, 2542796800, 1 )   ->  ptr=0x7640a4700000
+hipMemcpyAsync ( 0x7640a4700000, 0x76440051f010, 2542796800, hipMemcpyDefault, … )
+```
+
+2.37 GiB enqueued from a heap block at page + `0x10`, with the host returning
+immediately. It is allocation 114 of 1018 on a completed leg, and the other
+billion-byte upload is allocation 1015 of 1018 — first and last use of the
+embedding and the LM head, which is exactly the signature of residency happening
+lazily inside the forward rather than at load. The faulting legs died at
+allocation 423 and 590, in between.
+
 **What does not yet fit, stated rather than glossed:** W4's fault addresses are
 in no allocation at all, where a released copy source would fault at a real host
 VA. Either the reported address is not the source VA, or W5 is not the whole

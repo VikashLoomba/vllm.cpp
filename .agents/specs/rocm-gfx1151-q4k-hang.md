@@ -242,13 +242,35 @@ evidence for `Fmt == 3` is the rc job's own rebuild on `strix:gpu0`, which is wh
 byte-identical to the original -- a leg run after a build that silently did
 nothing would read as a result and be none.
 
-One earlier preflight run reported `test_cpu_x86_llamacpp_floor` FAILED at
-`test_a_contended_leg_is_discarded_and_never_summarised`. It passes standalone
-(10 tests, `OK`) and passes in the next full preflight. The box load was 21-31
-from other agents' builds at the failing run and 12.7 at the passing one, which
-is the already-recorded load flakiness of that harness test. It is not reachable
-from this diff, which touches one ROCm `.hip` file, one allowlist line and this
-spec.
+`test_cpu_x86_llamacpp_floor` has now reddened this row's preflight TWICE, at
+two different test methods, and both times it was the box and not the diff. It
+is recorded with the evidence rather than waved away, because "known flaky" is
+the sentence under which a real red gets shipped.
+
+The second instance, on the commit that carries `## W10`, is the clearer one
+because the harness says so itself:
+
+```text
+FAIL: test_runs_to_completion_and_creates_its_own_output_dir
+AssertionError: 4 != 0 : waiting for quiet: 15s busy=128% builders=0 load=10.24
+NO_QUIET_WINDOW after 30s (busy=115% builders=0 load=12.41 9.11 8.41)
+```
+
+That is the harness's own wait-for-quiet loop giving up on a box under other
+agents' load. Four checks, not one assertion:
+
+| check | result |
+|---|---|
+| the failure text names the cause | `NO_QUIET_WINDOW`, `load=12.41` |
+| standalone at load 4.8 | 10 tests, `OK`, exit 0 |
+| the FULL staged preflight rerun at load 4.3 | `ok test_cpu_x86_llamacpp_floor`, **0 gates failed**, `rc=0` |
+| reachable from the diff? | the commit touches ONE file, this markdown spec |
+
+The first instance was `test_a_contended_leg_is_discarded_and_never_summarised`
+at box load 21-31, passing standalone and in the next full preflight at 12.7.
+
+So the standing gate state for this row is: **no gate FAILED**, five SKIPS with
+the causes tabled above, and `NOT a green preflight` for those SKIPS alone.
 
 ## The A/B arm computes the same number, checked rather than asserted
 

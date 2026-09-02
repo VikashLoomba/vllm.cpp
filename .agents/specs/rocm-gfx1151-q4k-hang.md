@@ -9,21 +9,23 @@ this defect makes provisional).
 
 ## Now
 
-`ACTIVE` — the site is measured, the mechanism is not.
+`ACTIVE` — the site is measured, the kernel at that site is now EXONERATED at
+the production launch geometry, and the cause is still not named.
 
-**Measured:** the failure rate, that one prefill forward reproduces it, that both
-symptoms are one defect, and that every failing leg dies inside
-`KQuantGemmK<OutT, 2>` with its three pointer arguments exactly sized. That is a
-kernel, and it is enough to stop anyone else re-deriving the eight candidates in
-`## Refuted`.
+**Measured:** the failure rate; that one prefill forward reproduces it; that both
+symptoms are one defect; that every failing leg dies inside
+`KQuantGemmK<OutT, 2>` with its three pointer arguments exactly sized; that
+`DotQ6K`'s private array is NOT the mechanism; and — new, W3 — that the same
+kernel launched at the same geometry, with no model, no loader and no scheduler,
+does not fault in 9,000 consecutive launches on a board that failed 5 of 6 model
+legs in the SAME lease.
 
-**Not measured:** WHY that kernel faults. `DotQ6K`'s 256-byte per-thread private
-array is the leading hypothesis because it is the one property this arm has and
-nothing else on the path has. It is a hypothesis. The two jobs in
-`## Queued measurements` decide it, and either one can refute it.
+**Not measured:** WHY the step faults. The search has moved off the kernel and
+onto what reaches the kernel. `## The standalone shaped launch` states what W3
+ruled out and what it leaves.
 
-**No fix is claimed.** The `Fmt == 3` arm this row adds defaults OFF and changes
-no byte any configuration serves; it exists to be measured against, not to ship.
+**No fix is claimed.** The `Fmt == 3` arm this row added defaults OFF, and W2
+measured that it fixes nothing; it stays OFF.
 
 ## Scope
 
@@ -248,6 +250,149 @@ the `## Acceptance` line in the issue asks for a test that "runs the arm enough
 times to see a 1-in-3 failure", and a test at `N = 8` would not see it however
 many times it ran.
 
+## The private-memory mechanism is REFUTED, and the owed number is now read
+
+rc job `3415e7c5-2ad8-4a09-b97f-173d15e5edd4`, boot
+`a5bc8128-f6ad-4767-8614-6923f88032e1`, minimal shape, three arms interleaved:
+
+| arm | `DotQ6K` private scratch | failures |
+|---|---|---|
+| `newon` (`Fmt == 3`, register-resident) | 32 B intended | **6 of 6** |
+| `newoff` (`Fmt == 2`, unpatched body) | 256 B | **3 of 5** |
+| `orig` | 256 B | no data — the control lib dir lacked the client's other `.so`s, `rc=127` on all five |
+
+Shrinking the per-thread private array did not fix the fault; the arm that
+shrank it failed every leg it ran. `VT_ROCM_Q6K_SMALL_PRIVATE` stays default OFF
+on evidence rather than on caution.
+
+**Why n mattered.** At round 2 the tally read `newoff` 0 of 2 against `newon`
+2 of 2 — a clean-looking confirmation of the OPPOSITE conclusion. `newoff`'s
+first failure did not arrive until round 3. Two legs per arm is an anecdote at
+this failure rate.
+
+**The `private_segment_fixed_size` this spec listed as owed is now read**, and it
+cost no GPU compute and no `roc-obj`: `hipFuncGetAttributes` reads
+`localSizeBytes` straight out of the loaded code object. On `gfx1151`, ROCm
+7.2.4, `/opt/rocm/lib/llvm/bin/clang++ -x hip -O2 --offload-arch=gfx1151`:
+
+| instantiation | private segment | registers |
+|---|---|---|
+| `KQuantGemmK<unsigned short, 2>` | **272 B** | 95 |
+| `KQuantGemmK<unsigned short, 3>` | **0 B** | 82 |
+
+So the A/B did change the thing it claimed to change — 272 bytes of scratch per
+thread against none at all — and changing it changed nothing about the fault.
+That is the strongest form the refutation can take. Stated limit: these are the
+probe translation unit's numbers at `-O2`, not the tree's full build's, so they
+characterise the substitution rather than pin the shipped binary.
+
+## The standalone shaped launch: the kernel is where it LANDS, not where it is MADE
+
+rc job `3c8e7ea6-f7be-4f8d-8a7a-f4724a130174`, boot
+`a5bc8128-f6ad-4767-8614-6923f88032e1`, log
+`/mnt/nas_share/rc/rocm-strix-shape/evidence/shape.log`.
+
+The in-tree gate runs `KQuantGemmK` at `M=3, N=8, K=512` — `nsb = 2`, six
+blocks. The launch that dies runs `m=5, n=5120, nsb=68` — grid `{6400,1,1}`,
+block `{32,4,1}`, weight `obj` 73,113,600 B, and a **bf16** output, which is a
+different template instantiation from the f32 one the gate exercises. So the
+gate had tested the kernel's arithmetic and had never tested its launch.
+
+`/mnt/nas_share/rc/rocm-strix-shape/probe.hip` closes that gap outside the tree:
+`gen.sh` sed-extracts the device bodies VERBATIM from
+`src/vt/rocm/rocm_grouped_gemm.hip` (anchored by `grep`, and the anchors are
+asserted unique) into a standalone program with no model, no loader and no
+scheduler. Five arms, interleaved over six rounds, 300 launches a leg:
+
+| arm | what it varies | legs | failures |
+|---|---|---|---|
+| `q6k_managed` | production allocator (`hipMallocManaged`) | 6 | **0** |
+| `q6k_devmem` | plain `hipMalloc` weights | 6 | **0** |
+| `q4k_managed` | same `m/n/nsb`, Q4_K body | 6 | **0** |
+| `q6k_ballast` | `q6k_managed` + a 16 GiB managed ballast | 6 | **0** |
+| `small` | the in-tree gate's `M=3,N=8,K=512` | 6 | **0** |
+
+30 legs, 9,000 launches, `drift=0` on every one (each leg also byte-compares
+every iteration's output against its first, so a launch that read state it did
+not own would show even without a fault).
+
+**The board was in its failing state during the same job.** PHASE 3 of that same
+lease ran the model repro and it failed **5 of 6** legs
+(`MLEG sdmaoff-r1 GPUHANG`, `sdmaon-r1 MEMFAULT`, `sdmaoff-r2 OK`,
+`sdmaon-r2 GPUHANG`, `sdmaoff-r3 MEMFAULT`, `sdmaon-r3 MEMFAULT`). So the clean
+probe is not a healthy-board artefact; it is a contrast measured inside one boot.
+
+What this rules out, at the production geometry: the grid size, the block shape,
+the superblock count, the bf16 instantiation, the weight extent, the Q6_K format
+itself, the allocator branch, and the total managed footprint — each of them in
+isolation. What it leaves is everything the step does that the probe does not:
+the loader, the other ~600 dispatches of a forward pass, the host-side traffic
+between them, and whatever they leave behind in queue, descriptor or allocator
+state.
+
+## Also refuted, W3
+
+- **`HSA_ENABLE_SDMA=0`.** 2 of 3 legs still failed, against 3 of 3 with SDMA on.
+  Not a fix, and not distinguishable from the baseline at n=3.
+- **The Q6_K tensor SHAPES rather than the format.** `q4k_managed` runs the same
+  `m`, `n` and `nsb` through the Q4_K body and is equally clean, and `q6k_*` at
+  the Q6_K shape is clean too, so neither the shape nor the format reproduces it
+  standalone.
+- **The managed-memory FOOTPRINT alone.** A 16 GiB `hipMallocManaged` ballast,
+  device-memset so its pages are real, changes nothing.
+
+## What the fault ADDRESS is, and why nobody had read it
+
+The `AMD_LOG_LEVEL=4` legs kept only their last 400 KB
+(`evidence/p4-log-*.err.tail`), which is about 0.5 s of trace. Run through
+`/mnt/nas_share/rc/rocm-strix-shape/mapfault.py`, which rebuilds the allocation
+table out of the log's own `hipMallocManaged` / `ihipMallocManaged ptr=` /
+`Returned hipSuccess : 0x…` triples:
+
+| leg | fault address | in that window |
+|---|---|---|
+| `p4-log-1` | `0x7383103b5000` | in no recorded allocation, but only **28 MB** past the highest allocation the window records (`0x73830e756000`) |
+| `p4-log-3` | `0xbc623c10b000` | **74 TB** from every allocation in the window |
+
+The framing "21 GiB from the output" is true and misleading: the process's
+managed allocations span 27 to 46 GiB of virtual address space in these windows
+alone, so 21 GiB from one argument is ordinary. `0x7383103b5000` sits at the TOP
+of that span and is a plausible address for an allocation made earlier in the
+load, which the 400 KB window cannot see. `0xbc623c10b000` is not.
+
+Two different fault addresses with two different characters is itself a finding:
+they are unlikely to be one wild index.
+
+The full trace is what settles it, and it is cheap — filtering
+`AMD_LOG_LEVEL=4` live down to allocation, free, copy, dispatch and fault lines
+keeps the file to a few MB. rc job `66658d40-1481-4ff7-841c-252e5744c3a5`
+(`fault.sh`) does that on four legs and maps each fault address against the
+whole table, and then runs an env-knob matrix (`base`, `HSA_ENABLE_SDMA=0`,
+`GPU_MAX_HW_QUEUES=1`, `AMD_DIRECT_DISPATCH=0`,
+`HSA_ENABLE_SCRATCH_RECLAIM=0`) five rounds interleaved. Results land in
+`/mnt/nas_share/rc/rocm-strix-shape/evidence2/fault.log`.
+
+Recorded so the run is readable: that job's `vllm-cli` is sha256 `a703b83d…`,
+the binary this issue reports, but its `libvllm.so` is `41bb4052…`, the library
+W2's A/B rebuilt. With `VT_ROCM_Q6K_SMALL_PRIVATE` unset that library takes the
+`Fmt == 2` path, so it is W2's `newoff` arm, which failed 3 of 5 — it reproduces,
+and it is not the byte-identical `#2511` library.
+
+## The regression test this row lands
+
+`tests/vt/test_backend_cross_device.cpp`, "keep-quant Q6_K GEMM runs at the
+production launch geometry": `M=5, N=5120, K=17408` through `vt::MatmulBTQuant`
+with a **bf16** output, repeated (default 8 launches, `VT_TEST_Q6K_LAUNCHES`
+raises it for a soak). It checks the first launch against the CPU oracle on a
+64-column slice of the same weight buffer — exact, not sampled, because output
+column `j` reads only weight row `j` — and byte-compares every later launch
+against the first. It skips the CPU device arm on purpose: a full-width CPU pass
+is 445M scalar MACs per CI run to compare the reference with itself.
+
+It is a launch gate, not a second arithmetic gate. On the evidence above it is
+expected to pass on `gfx1151`; what it stops is the class of regression the old
+`N=8` case could not see.
+
 ## Stop conditions
 
 - A cause that is in the AMD driver or firmware rather than in this tree ends the
@@ -257,21 +402,199 @@ many times it ran.
 
 ## Queued measurements
 
-Both are staged and queued behind another agent's lease on `strix:gpu0`. Their
-results land on the share whether or not anyone is watching.
-
 | rc job | script | what it decides | lands in |
 |---|---|---|---|
-| `2e569341-0e46-4b4f-9744-c65c15467554` | `q6k.sh` | the private-memory A/B: `orig` / `newoff` / `newon`, interleaved, 6 rounds | `/mnt/nas_share/rc/rocm-strix-hang/evidence3/q6k.log` |
-| `0e388979-2077-4baa-a484-f836096fbd0e` | `codeobj.sh` | `private_segment_fixed_size` per `KQuantGemmK` instantiation, read out of the gfx1151 code object | `/mnt/nas_share/rc/rocm-strix-hang/evidence4/codeobj.log` |
+| `66658d40-1481-4ff7-841c-252e5744c3a5` | `fault.sh` | what the fault ADDRESS is, mapped against the whole allocation table, plus the env-knob matrix | `/mnt/nas_share/rc/rocm-strix-shape/evidence2/fault.log` |
 
-The second is the one that can REFUTE the hypothesis without a GPU-side leg: if
-`Fmt == 2` and `Fmt == 3` carry the same private segment, then the A/B changes
-nothing it claims to change and a green `newon` would mean something else.
-Reading it costs a minute and no GPU compute, which is why it is queued rather
-than deferred.
+Both of the jobs this section used to list have run and are reported above:
+`q6k.sh` under `## The private-memory mechanism is REFUTED`, and `codeobj.sh`'s
+question is answered there too, by `hipFuncGetAttributes` rather than by
+`roc-obj`, so the code-object route is no longer owed.
+
+## W4: three fault addresses, and none of them is in any allocation
+
+rc job `66658d40-1481-4ff7-841c-252e5744c3a5`, `fault.sh`, log
+`/mnt/nas_share/rc/rocm-strix-shape/evidence2/fault.log`. Four legs under
+`AMD_LOG_LEVEL=4` + `AMD_SERIALIZE_KERNEL=3`, with the trace filtered LIVE down
+to allocation, free, copy, dispatch and fault lines so the whole run fits in a
+few MB instead of gigabytes. `mapfault.py` then rebuilds the allocation table
+from the log's own `hipMallocManaged (…, size)` / `ihipMallocManaged ptr=` /
+`Returned hipSuccess : 0x…` triples and locates each fault address in it.
+
+| leg | class | live allocations at the end | live bytes | fault address | in an allocation? |
+|---|---|---|---|---|---|
+| `log-r1` | MEMFAULT | 423 | 9.44 GiB | `0xed0000fe0000` | **no** — 113 TB from the nearest |
+| `log-r2` | GPUHANG | 590 | 13.50 GiB | (no address; hang) | — |
+| `log-r3` | OK | 55 (966 freed) | 0.04 GiB | — | — |
+| `log-r4` | OK | 55 (966 freed) | 0.04 GiB | — | — |
+
+Two facts fall out, and both are new.
+
+**The fault addresses are WILD, not a buffer that lost its pages.** Across three
+recorded faults they are `0x7383103b5000` (W1), `0xbc623c10b000` (W1) and
+`0xed0000fe0000` (W4). The last two are 74 TB and 113 TB from every HIP
+allocation the process ever made. The idea that the GPU is touching a real
+managed weight whose pages went away does not survive this: it would fault
+INSIDE an allocation. Three different addresses with three different characters
+also argues against one fixed bad index.
+
+**The fault happens while the model is still becoming resident.** A completed
+leg makes 1,021 allocations; the faulting legs died at 423 and 590 of them, with
+9.4 and 13.5 GiB live. `RocmPlatform::needs_weight_staging()` is false, so
+weights become device-resident LAZILY at first use — inside the prefill — which
+puts `Alloc` + an async `Copy` + a page release in between the very kernel
+launches that fault. That is where W5 looks.
+
+`dmesg` on the faulting leg adds `amdgpu: sq_intr: error, detail 0x00000000,
+type 2, priv 1, wave_id …` before the reset. That is a shader-unit memory
+violation raised by a WAVE, not only a VM fault seen by the hub, which is worth
+recording because it constrains the mechanism.
+
+## The env-knob matrix, and the one knob that moved the rate
+
+Same job `66658d40`, PHASE B: five knobs, five legs each, interleaved with the
+within-round order rotating, minimal shape, no rebuild.
+
+| arm | env | legs | failures |
+|---|---|---|---|
+| `base` | — | 5 | 4 |
+| `hwq1` | `GPU_MAX_HW_QUEUES=1` | 5 | 3 |
+| `nodirect` | `AMD_DIRECT_DISPATCH=0` | 5 | 3 |
+| `noreclaim` | `HSA_ENABLE_SCRATCH_RECLAIM=0` | 5 | 2 |
+| **`sdma0`** | **`HSA_ENABLE_SDMA=0`** | **5** | **0** |
+
+`HSA_ENABLE_SDMA=0` is the only arm that took no failure, and it is the arm that
+turns OFF the engine that reads the HOST SOURCE of an `hipMemcpyAsync` directly.
+With SDMA disabled the runtime stages a pageable H2D copy instead, so releasing
+the source afterwards stops being an exposure. That is the mechanism W5 names,
+approached from the other side.
+
+**Do not read this as proven, and here is the exact reason.** The W3 job's
+PHASE 3 ran the same knob against the same binary and got `sdmaoff` **2 of 3**
+against `sdmaon` 3 of 3. Pooled over both jobs the knob reads 2 failures in 8
+against 7 in 8 for the unset arm — suggestive (Fisher p ~ 0.04) and not a
+result. Two jobs disagreeing at n=3 and n=5 is precisely the shape W2 already
+paid for once. The knob is a strong steer for the next A/B, not a fix, and
+`scratch reclaim`, `hw queues` and `direct dispatch` all moved the rate a
+little, which is what schedule noise looks like.
+
+**The fault addresses now number five, and four of them are impossible.**
+`0x7383103b5000`, `0xbc623c10b000`, `0xed0000fe0000`, `0xf9f0dfef3000`,
+`0xf6037c75f000`. Every one but the first is above `0x0000_7fff_ffff_ffff`, the
+top of a 4-level-paging Linux user address space, and each is page-aligned.
+Five faults at five different addresses, four of them outside any addressable
+user range, is a wild pointer or a torn-down mapping, not one bad index.
+
+## A confound every future A/B on this box has to carry: failures cluster in a job's EARLY model legs
+
+Tabulated over the model legs of the two W3/W4 jobs, in the order they ran:
+
+| job | model legs, in order | failures at ordinal |
+|---|---|---|
+| `3c8e7ea6` PHASE 3 | F F O F F F | 1, 2, 4, 5, 6 |
+| `66658d40` PHASE A + B | F F O O · F O O F O O O … | 1, 2, 5, 8 |
+
+Both jobs fail their FIRST TWO model legs and then get progressively cleaner.
+This is not something any single-arm design can see, and an A/B that runs arm A's
+legs before arm B's would charge the whole effect to arm A. It is why `q6k.sh`,
+`shape.sh` and `adopt.sh` all interleave, and why `adopt.sh` additionally SWAPS
+the within-round order on alternate rounds.
+
+Do not read this as a cause. It is a schedule effect with at least three
+candidate sources — the GGUF's page-cache warmth, the state the board is left in
+by a `GPU reset(9)`, and clock or power state — and separating them is its own
+measurement. It is recorded here so that nobody reads a late-running arm's clean
+legs as a fix.
+
+## W5: the candidate the audit found — an async copy whose source is released underneath it
+
+**Not yet measured. The A/B is queued (rc `ea99c89a-d170-4322-93cb-e9bde698be7c`,
+`adopt.sh`), and this section says candidate, not cause.**
+
+`RocmBackend::Copy` (`src/vt/rocm/rocm_backend.hip:211-213`) is a bare
+`hipMemcpyAsync` with no synchronisation and no event. Two weight-staging call
+sites hand it a source and then release that source without waiting:
+
+- `src/vllm/model_executor/models/qwen3_5.cpp:1188-1202` and the SHARED
+  `include/vllm/model_executor/models/dense_attn_block.h:253-268`:
+  `Alloc` → `Copy(d.q, p, w.bytes.data(), nb)` → `AdoptDeviceBytesAsHost(d.b, w)`.
+  For an OWNED buffer that function
+  (`src/vllm/model_executor/models/qwen3_5_weights.cpp:424-461`) runs
+  `::madvise(…, MADV_DONTNEED)` over the interior pages of the copy SOURCE and
+  then move-assigns `self.bytes`, destroying the vector — `free()`, and `munmap`
+  for anything over glibc's mmap threshold.
+- `src/vllm/model_executor/models/qwen3_5.cpp:1237-1243` and
+  `include/vllm/model_executor/models/dense_attn_block.h:342-360`
+  (`ResidentWeightF32`): the source is a function-local `std::vector<float>`
+  that is destroyed at the closing brace, with no `Synchronize` between.
+
+Why this is a ROCm-shaped defect rather than a general one: the adoption branch
+is gated on `Backend::DeviceMemoryIsHostAddressable()`, which is TRUE on
+`gfx1151` and FALSE on CUDA (`src/vt/cuda/cuda_backend.cu` pins CUDA to the
+`false` default), so the CUDA lane never takes it.
+
+Why it would look like this defect: `MADV_DONTNEED` on a private page tears the
+PTE down immediately, so an in-flight DMA reading it hits a page that is not
+present; the fault has nothing to do with the arguments of whatever kernel
+happens to be resident, and the biggest, longest kernel on the path
+(`KQuantGemmK<u16,2>`, 6400 blocks, 2.9 ms in the trace) is the most likely one
+to be resident; it is intermittent because it is a race with the copy engine;
+and `AMD_SERIALIZE_KERNEL=3` does not touch it, because that serialises KERNELS
+and not copies.
+
+**The owned branch is reachable, and it is not small.** The W4 trace of a
+COMPLETED leg records 1,018 `hipMallocManaged` calls totalling 24.9 GiB, and two
+of them are 2,542,796,800 B and 1,042,944,000 B. Allocations that size are the
+bf16 expansions, not the borrowed keep-quant tensors, so they are exactly the
+buffers whose host source is an owned block far above glibc's mmap threshold —
+the case where the release is a `munmap` rather than a free-list return. A 2.4
+GiB `hipMemcpyAsync` does not complete in the microseconds before the
+`madvise` on the next line.
+
+**What does not yet fit, stated rather than glossed:** W4's fault addresses are
+in no allocation at all, where a released copy source would fault at a real host
+VA. Either the reported address is not the source VA, or W5 is not the whole
+story. The A/B decides it without a rebuild: `VT_ADOPT_DEVICE_BYTES=0`
+(`qwen3_5_weights.cpp:405-408, :431-433`) turns the adoption off on the binary
+this issue reports, nine legs an arm, alternating. Nine clean `adopt0` legs
+against a baseline that fails ~5 of 6 would be decisive; anything less is not,
+and W2 is the standing reminder of why two legs an arm is an anecdote here.
+
+Note that `VT_ADOPT_DEVICE_BYTES=0` deliberately does NOT disable
+`ReleaseDirectUploadSource` (`qwen3_5_weights.cpp:399-401`), so the A/B covers
+the OWNED-buffer branch only. For a GGUF the keep-quant weights are BORROWED
+from the mapping and take the early return at `:429`, so what the knob actually
+moves is the owned bf16 expansions — the norms, and `token_embd` / `output` if
+either resolves to `kExpandBf16`.
+
+## Next hypotheses, in the order they are worth testing
+
+The kernel is exonerated at its own geometry, so the remaining surface is what
+the step does around it. Ranked by what would discriminate most per lease-minute:
+
+1. **Map the fault address against the FULL allocation table** (running). If
+   `0x7383103b5000` lands inside a real managed allocation, this is a buffer
+   losing its pages, not a wild index, and the next question is which buffer.
+   If it lands in none, it is a wild address and the question is whose.
+2. **An async copy outliving its host source.** `RocmBackend::Copy`
+   (`src/vt/rocm/rocm_backend.hip`) is a bare `hipMemcpyAsync` with no
+   synchronization, and the log shows the loader driving 73 MB copies from
+   pageable host addresses. Every call site that passes a stack address, a local
+   `std::vector::data()`, or a buffer it reuses on the next iteration is a
+   candidate, because the copy engine is NOT what `AMD_SERIALIZE_KERNEL=3`
+   serializes. This needs a call-site audit and then a red-before, not another
+   leg.
+3. **Bisect the step.** The probe runs one dispatch; the step runs hundreds. A
+   probe that replays the step's dispatch SEQUENCE, or a run with parts of the
+   model's forward disabled, separates "some earlier kernel" from "the host
+   traffic between them".
 
 ## Evidence
 
-Raw logs under `/mnt/nas_share/rc/rocm-strix-hang/evidence`, and the earlier
-`#2497` legs under `/mnt/nas_share/rc/rocm-strix-q4k/evidence`.
+Raw logs under `/mnt/nas_share/rc/rocm-strix-hang/evidence` (W1),
+`.../evidence3` (W2's A/B), the earlier `#2497` legs under
+`/mnt/nas_share/rc/rocm-strix-q4k/evidence`, and W3 under
+`/mnt/nas_share/rc/rocm-strix-shape/`, which also holds the probe itself
+(`probe.hip`), its generator (`gen.sh` + `prologue.inc` + `epilogue.inc`,
+which regenerate it from a checkout so the extraction is reproducible), the
+runner (`shape.sh`), the fault-address mapper (`mapfault.py`) and `fault.sh`.

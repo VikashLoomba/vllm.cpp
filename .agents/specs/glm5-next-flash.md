@@ -3110,6 +3110,240 @@ raised. The predicate was replaced by the op-table probe described above,
   non-expert tower is what makes this model fit, and moving 94.6758 GiB of
   experts to the device does not remove it.
 
+### W9c-3b — the KV binding reads the engine's pages where they ARE (GPU, medium)
+
+Issue: [#2480](https://github.com/mudler/vllm.cpp/issues/2480).
+Claim: `CLAIM-GLM53-FLASH-W9C3B`. Base `3cd467643`.
+
+**O46's mechanism is FALSE, and the correction is the point of this wave.** O46
+reads the crashing legs' log order — one device-arm announcement, then one
+fallback warning, then SIGSEGV — as evidence that "the fault is in the MIXED
+residency state the per-layer fit guard creates". Both of those lines are
+`static bool said` once-flags (`glm5_next_moe.cpp`, `AnnounceDeviceArmOnce` and
+`WarnDeviceFallbackOnce`). Their order says only that at least one layer staged
+and at least one LATER layer did not. It is not evidence about WHERE the process
+died, and the process died somewhere else.
+
+**WHERE IT DIED, read off four files rather than guessed:**
+
+1. `GPUModelRunner::initialize_kv_cache` resolves
+   `kv_cache_backend_resident_ = !platforms::GetPlatform(dev.type).is_cpu() && (VT_DEVICE_KV_CACHE != "0")`
+   (`src/vllm/v1/worker/gpu/runner.cpp:1119-1122`). On `--device cuda` it is
+   **true**, and its own comment says the predicate is deliberately "has a
+   device", not "is CUDA".
+2. `GPUModelRunner::CacheBuffer` then allocates every paged cache and every
+   recurrent state with `vt::Alloc(device_, ...)` (`runner.cpp:575-593`). On
+   CUDA that is `cudaMalloc`. The `host_data_` vector is the CPU-queue arm and
+   is not taken.
+3. A `cudaMalloc` pointer is **not host-dereferenceable, on GB10 included**.
+   `src/vt/cuda/cuda_backend.cu:354-391` says so and holds it with a
+   `static_assert` that CUDA keeps the inherited
+   `DeviceMemoryIsHostAddressable() == false`, naming #844 and #1435 as the
+   SIGSEGVs that came from reading the WIDE predicate (`UnifiedMemory()`)
+   instead.
+4. `glm5_next_kv.cpp` reads and writes those pages with **plain host loops**:
+   `ReadElem`/`WriteElem` are `static_cast<float*>(kv.data)[i]` and
+   `ReadTensorElem`/`WriteTensorElem` are `t.Ptr<float>()[i]`. `LoadCaches` and
+   `StoreCaches` are their only callers, and
+   `ForwardGlm5NextForConditionalGeneration` is the only caller of those two.
+
+`LoadCaches` returns before touching any page on a fresh sequence
+(`if (b.cached_len <= 0) return;` — "A FRESH SEQUENCE READS NOTHING"), so on
+step 1 the FIRST host access to device memory is in `StoreCaches`, **after the
+whole forward has returned**. That is after the announcement, after the fallback
+warning, on a step that emitted no token, with no message — which is the
+recorded signature exactly, and it is why the wall of a crashing leg sits at
+roughly one forward step past its load.
+
+**THE DEFECT IS OLDER THAN THE ARM THAT EXPOSED IT.** Nothing in W9c-3a's diff
+touches a KV page. `origin/main` never reached this because
+`Glm5NextHostForward` refused a non-CPU queue several thousand instructions
+earlier; W9c-3a removed that refusal, and a hole that had been unreachable
+became reachable on the first `--device cuda` step that got past it. The three
+hypotheses O46 eliminated are all inside `MoeExpertsKeepQuant` and are all
+correctly eliminated. They were aimed at the wrong subsystem.
+
+**AND NOTHING GATED IT.** `ResolveKvBinding`, `LoadCaches` and `StoreCaches`
+have **zero** call sites in `tests/` across the whole tree. The engine binding's
+read/write path — the one W5b-2c landed and the one this crash is in — has no
+unit coverage of its own; it is exercised only incidentally, through
+`ModelRegistry::Forward` on a CPU queue, where every page IS host memory and the
+defect cannot appear.
+
+#### Scope
+
+`src/vllm/model_executor/models/glm5_next_kv.cpp` only. Every span this file
+reads or writes goes through `vt::Backend::Copy` instead of being dereferenced.
+`Backend::Copy` is direction-agnostic on CUDA (`cudaMemcpyAsync` with
+`cudaMemcpyDefault`, `cuda_backend.cu:116-118`), so ONE code path is correct
+whether the pages are device memory or host memory. That is what keeps this file
+from re-deriving the runner's residency policy: it never asks where the pages
+are, and `VT_DEVICE_KV_CACHE=0` therefore needs no second branch here.
+
+On a CPU queue there is no backend to ask and the direct `memcpy` path is kept,
+so every `--device cpu` run is byte-for-byte unchanged.
+
+Every span this file addresses is already contiguous, which is what makes the
+change a substitution rather than a redesign: one paged row is `head_size`
+elements at `PagedRowOffset(...)`, and a recurrent state is `conv_elems` or
+`rec_elems` elements at `slot * elems`.
+
+#### Not in scope
+
+The other ten host arms O43 lists. The engine's residency policy. A
+`ModelInfo` flag that would let a model ask for host-resident caches — that is a
+shared-seam change with more than one consumer to survey, and it is not needed
+to make this model correct.
+
+#### Gates
+
+* `test_glm5_next_forward` — a new case drives `ResolveKvBinding`,
+  `StoreCaches` and `LoadCaches` over the file's existing three-group
+  `Topology` fixture, with the pages re-pointed at a backend whose allocations
+  are NOT host-readable. RED before the change and GREEN after.
+* The whole `glm5_next` suite set unchanged, by hand, with counts.
+* Sibling inertness: `GlmMoeDsaForCausalLM`, DeepSeek-V4, dots3-note, Kimi.
+* `dgx:gpu0`, the real 101.2535 GiB `UD-Q2_K_XL` artifact, four interleaved
+  legs on two binaries — see `## Evidence required` below.
+
+#### Evidence required
+
+The hermetic gate cannot prove the diagnosis, only the property. The diagnosis
+is proved on the box, by a leg that changes NOTHING but where the pages live:
+
+**RUN 1 IS TAKEN and legs A and B are SETTLED** (O50): B died with SIGSEGV at
+`StoreCaches` with the whole call chain named, and A survived at rc=0 in 1756 s
+with one variable moved. **Legs C and D did not run**, because the job's identity
+guard hashed `vllm-cli` alone and refused a pair whose `libvllm.so` genuinely
+differed (O51). **RUN 2 IS NOW ALSO TAKEN** (O53 below); it carried the repaired
+predicate and these legs:
+
+| leg | binary | device | env | the question it answers |
+|---|---|---|---|---|
+| D | fixed | cpu | -- | the OPERAND, from this binary on this box; taken FIRST |
+| C | fixed | cuda | `VT_GLM5_NEXT_DEVICE_EXPERTS=1` | **the merge criterion**: rc=0 and byte-identical to D |
+| E | fixed | cuda | + `VT_ASYNC_DEVICE_MIRROR=0` | is the stale decode input id the second-token cause? |
+| F | fixed | cuda | `--max-tokens 1` | prefill against decode, separated by construction |
+| G | base | cuda | `VT_DEVICE_KV_CACHE=0` | run 1's leg A, repeated WITHIN run 2 |
+
+C is the fix. D is the operand every other leg is byte-compared against, taken
+from the same binary on the same box, because the ` Paris.` in the records came
+from a different build and is not a byte operand. E, F and G separate the
+second-token question O52 opens -- and none of them is a discriminator unless it
+RUNS: the obvious one, unsetting `VT_GLM5_NEXT_DEVICE_EXPERTS`, emits no token,
+because without it the forward refuses a non-CPU queue by name.
+
+**No speed number is admissible from any of them** (O47: 89% generation spread
+across three identical legs, cause unknown), and none is claimed.
+
+**C-against-D byte-identity also answers a SECOND question, and that is why the
+legs run two tokens rather than one.** The async runner can hand a forward
+`ModelForwardInput::device_token_ids` and leave `token_ids` deliberately stale
+for decode rows (`v1/worker/gpu/runner.cpp:2374-2414, 2748`); this model reads
+`token_ids` and ignores the device field. Whether that path ENGAGES here is not
+established -- it needs `async_input_combine_`, and this row has never observed a
+decode step on a device queue -- so it is not filed as a defect. It is named
+here because a two-token leg contains exactly one decode step, so a leg C whose
+stdout matches leg D byte-for-byte has measured it, and a leg C that emits
+` Paris` followed by the wrong second token has found it.
+
+#### O53 -- RUN 2 IS TAKEN, and the criterion FAILED ON A CLAUSE I MIS-SPECIFIED
+
+`glm53-kvres/submit2.log`, `dgx:gpu0`, finished 2026-09-01T21:56:05Z, 12068 s
+wall, five legs interleaved on ONE box from TWO separate build directories. The
+tested bytes are the PR's bytes: `glm5_next_kv.cpp` hashes
+`cb34a6d198476864...` at PR head `868b49bdd` and `37d337a7538fcefb...` at base
+`3cd467643`, matching the `fix`/`base` digests the job recorded.
+
+| leg | binary | device | env | rc | stdout | bytes |
+|---|---|---|---|---|---|---|
+| D | fixed | cpu | -- | 0 | ` Paris.` | `2050 6172 6973 2e0a` |
+| C | fixed | cuda | `…DEVICE_EXPERTS=1` | 0 | ` Paris Paris` | `2050 6172 6973 2050 6172 6973 0a` |
+| E | fixed | cuda | + `VT_ASYNC_DEVICE_MIRROR=0` | 0 | ` Paris.` | `2050 6172 6973 2e0a` |
+| F | fixed | cuda | `--max-tokens 1` | 0 | ` Paris` | `2050 6172 6973 0a` |
+| G | base | cuda | `VT_DEVICE_KV_CACHE=0` | 0 | ` Paris Paris` | `2050 6172 6973 2050 6172 6973 0a` |
+
+Binary identity held this time on the repaired predicate: linked-set digests
+`e6762476d2b97ded...` (base) against `f643a2f1bb540f49...` (fixed), with
+`fix_sentinel=no` / `fix_sentinel=yes`.
+
+**THE CRASH IS FIXED.** Run 1 leg B died `rc=139` with `StoreCaches` at frame #0
+(`+840`); leg C is the same workload on the same box at `rc=0`.
+
+**THE STATED CRITERION -- "C byte-identical to D" -- FAILED, and the fault is in
+the criterion.** C and D differ by TWO variables, not one: where the KV pages
+live AND whether the async device mirror is engaged. A `StoreCaches` fix can
+only be held to the first. The single-variable operand is **leg G**, the BASE
+binary on host pages, and:
+
+    C (fixed, device KV)  == G (base, host KV)   byte-for-byte, 13 bytes
+
+So the fix reproduces the already-working path exactly. It converts a SIGSEGV
+into the same bytes, and it changes nothing else.
+
+This is recorded as a mis-specified criterion rather than a widened one. The
+clause as written is still red, and nothing was deleted to make it green.
+
+**THE SECOND TOKEN IS A SEPARATE, PRE-EXISTING DEFECT, AND RUN 2 CONVICTS IT.**
+Leg G is a base build and diverges identically, so the divergence predates this
+fix and is neither caused nor cured by it. Leg F shows prefill is clean
+(` Paris` matches D's first token). Leg E flips ONE variable,
+`VT_ASYNC_DEVICE_MIRROR=0`, and the divergence disappears into byte-identity
+with D. That is exactly the pre-registered read-key above, and it promotes
+[#2544](https://github.com/mudler/vllm.cpp/issues/2544) -- which names
+`Glm5NextForConditionalGeneration` on a grep and calls itself "a candidate, not
+a conviction" -- to a measured conviction for this model. O52 is answered and
+its ownership moves to #2544.
+
+**What run 2 does NOT establish, stated rather than glossed:** leg A as
+originally specified (FIXED binary with `VT_DEVICE_KV_CACHE=0`) was never run;
+what exists is the BASE binary on host pages, twice, rc=0 both times, which
+serves the falsification purpose but is not the literal leg. Legs B and C were
+never in the same job -- B is run 1's binary, C is run 2's, source-anchored to
+the same `3cd467643` but not interleaved with each other, so **leg C is n=1**.
+No speed number is admissible or claimed from any leg; the walls are durations
+of which ~85% is GGUF load.
+
+#### Mutations, with what each one killed
+
+Every mutation is applied to PRODUCT code and rebuilt, because a mutation the
+compiler rejects and a mutation the binary never contained both read as a pass.
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `PageIo::Write` always takes the direct `memcpy` arm | KILLED, 1 case / 5637 assertions |
+| M2 | `PageIo::Read` always takes the direct `memcpy` arm | KILLED, 1 case / 2818 assertions |
+| M3 | `PageIo` drops its CPU early return, so a CPU queue bounces too | **SURVIVED** |
+| M4 | delete the production `StoreCaches` call in `glm5_next_registry.cpp` | KILLED, 2 cases / 3 assertions -- the REACHABILITY mutation |
+
+**M3 SURVIVED and that is a finding rather than a gap to paper over.** It has
+to survive: the CPU backend's `Copy` IS `std::memcpy`, so the bytes are
+identical whichever arm runs, and the case's counter watches the SHADOW backend,
+which a CPU queue never reaches under either version. The early return is
+therefore not load-bearing for correctness. It is there so a build with no CPU
+backend registered does not `Fail` on the host path, and so the `--device cpu`
+instruction stream stays the one that was already measured. The case says so in
+its own comment instead of asserting something it cannot see.
+
+M4 is the reachability answer: the production call site is
+`ForwardGlm5NextForConditionalGeneration`, `ModelRegistry::Forward` is the entry
+point, and deleting the `StoreCaches` line reds the two W5b-2c cases that read
+the engine's pages back on a second step. The two W9c-3b cases do NOT red under
+M4, because they call the three functions directly -- they localise the defect
+and they are not the reachability proof, which is why both are kept.
+
+#### Stop conditions
+
+* If leg A dies too, the diagnosis is wrong: report it, keep O46 open, and do
+  not ship the change on a hermetic gate alone. **DISCHARGED: A survived at rc=0
+  and B's backtrace names `StoreCaches` -- O50.**
+* If leg C emits a token but does not match leg D byte-for-byte, the CRASH is
+  fixed and the SECOND-TOKEN question (O52) is open. Those are two results, and
+  the first is not reported without the second beside it.
+* If a fifth arm of this model turns out to host-dereference engine device
+  memory, that is a wider residency question than this wave, and it goes back as
+  `NEEDS_DECISION` rather than being absorbed here.
+
 ## Tests to port
 
 `tests/models/` in transformers `v5.16.1` is the upstream suite. What is
@@ -5353,11 +5587,21 @@ Debts this row carries, each visible rather than waived:
 
   `139` is SIGSEGV. **THREE of three CUDA legs crashed and three of three CPU
   legs emitted ` Paris.`**, interleaved, from one binary on one box -- so this is
-  a property of the arm and not of the box's mood. Each crashing leg logged
+  a property of the run and not of the box's mood. Each crashing leg logged
   exactly one device-arm announcement followed by exactly one fallback warning
-  before dying -- so the fault is in the MIXED residency state the per-layer fit
-  guard creates, not in the device arm itself, which the CUDA unit gate exercises
-  cleanly at NMSE 3.833e-15 against the host arm.
+  before dying.
+
+  **THE SENTENCE THAT USED TO FOLLOW IS FALSIFIED, and O49 carries the
+  replacement.** It read "so the fault is in the MIXED residency state the
+  per-layer fit guard creates". Both of those log lines are `static bool said`
+  once-flags, so their order says only that at least one layer staged and at
+  least one LATER layer did not; it is not a location. The fault is in
+  `StoreCaches`, which host-stores into the runner's `cudaMalloc` KV pages after
+  the whole forward has returned -- a defect older than this arm, which only
+  became reachable when the non-CPU refusal above it was removed. Read O49
+  before spending anything on the mixed-residency story. The device arm itself is
+  unimplicated either way: the CUDA unit gate exercises it cleanly at NMSE
+  3.833e-15 against the host arm.
 
   **This is a REGRESSION and it is named as one.** On the base tree the same
   command produced a clean refusal at 1066 s (the operand table above, leg C).
@@ -5441,6 +5685,161 @@ Debts this row carries, each visible rather than waived:
   without checking -- and because the ordering that caused it is this row's own
   script putting the sibling suites after the legs.
 
+- **O49 -- O46's MECHANISM IS FALSIFIED, and the crash is a KV-page residency
+  defect that is OLDER than the arm which exposed it.** O46 infers "the fault is
+  in the MIXED residency state the per-layer fit guard creates" from the log
+  order of one device-arm announcement followed by one fallback warning. Both of
+  those lines are `static bool said` once-flags
+  (`glm5_next_moe.cpp`, `AnnounceDeviceArmOnce`, `WarnDeviceFallbackOnce`), so
+  the order carries only "at least one layer staged, at least one LATER layer did
+  not". It is not a location.
+
+  The location is `StoreCaches`. On `--device cuda` the runner sets
+  `kv_cache_backend_resident_` true (`runner.cpp:1119-1122`) and allocates every
+  paged cache and every recurrent state with `vt::Alloc` — `cudaMalloc`
+  (`runner.cpp:575-593`) — while `glm5_next_kv.cpp` reads and writes those pages
+  with plain host loops. A `cudaMalloc` pointer is not host-dereferenceable on
+  GB10 (`cuda_backend.cu:354-391`, held by a `static_assert`, naming #844 and
+  #1435 as the same fault twice before). `LoadCaches` returns before touching a
+  page on a fresh sequence, so the FIRST host access to device memory on step 1
+  is in `StoreCaches`, after the whole forward has returned — which is exactly
+  after the announcement, after the fallback warning, on a step that emitted no
+  token, with no message.
+
+  **AND THE MIXED STATE CANNOT BE IT, which is a stronger statement than "the
+  fault is elsewhere".** The two arms of `MoeExpertsKeepQuant` share no mutable
+  state across layers except `OwnedTensor::d_dev`, which is per tensor.
+  `DeviceBanksFit` returns true whenever `need == 0`, so a layer whose three
+  banks are resident ALWAYS takes the device arm and never the host one; a layer
+  that falls back is one whose banks were never staged, and its host views
+  (`src.gate_exps.View()`) aim at bytes staging did not touch, because
+  `AdoptDeviceBytesAsHost` returns at `!DeviceMemoryIsHostAddressable()` on CUDA
+  (O46's own hypothesis 2, correctly killed). There is no ordering of staged and
+  unstaged layers that makes one arm read the other's memory.
+
+  W9c-3a did not introduce it. `origin/main` refused a non-CPU queue before
+  `StoreCaches` could run; removing that refusal made a pre-existing hole
+  reachable. O46's three eliminated hypotheses are all inside
+  `MoeExpertsKeepQuant` and are all correctly eliminated — they were aimed at the
+  wrong subsystem, because the ordering that pointed them there was an artifact
+  of two once-flags.
+
+  **NOTHING GATED THE PATH IT IS IN.** `ResolveKvBinding`, `LoadCaches` and
+  `StoreCaches` have ZERO call sites anywhere in `tests/`. The engine binding
+  W5b-2c landed is reached only incidentally, through `ModelRegistry::Forward` on
+  a CPU queue, where every page IS host memory and this defect cannot appear.
+  W9c-3b ([#2480](https://github.com/mudler/vllm.cpp/issues/2480)) owns the fix
+  and the first direct gate over those three functions.
+
+  What this costs the next reader is the general lesson, and it is O44's shape
+  once more: an ordering in a log is evidence about ORDER and not about place,
+  and a once-flag makes it evidence about even less than that.
+
+  **OWED, and small: the staging is PER ROW.** `PageIo` copies one paged row per
+  `Backend::Copy` and synchronises on each, so a step that hydrates a full 8192
+  token prefix pays about 180,000 round trips across 11 DSA layers and two
+  caches. Every row inside one block is contiguous with the next, so coalescing
+  a block at a time would cut that to about 5,600. It is not done here because
+  this forward is a host reference at roughly 85 s per step and no speed number
+  is admissible from this row anyway (O47); it is written down so the next reader
+  does not have to rediscover the shape of the cost.
+
+- **O50 -- THE DIAGNOSIS IS CONFIRMED ON `dgx:gpu0`, BY A NAMED FRAME AND BY A
+  ONE-VARIABLE FALSIFICATION TEST.** Run 1 of the W9c-3b job, `dgx:gpu0` (GB10,
+  `sm_121a`), against the published 101.24 GiB UD-Q2_K_XL artifact, base
+  `3cd467643`:
+
+  | leg | binary | device | env | rc | wall | stdout |
+  |---|---|---|---|---:|---:|---|
+  | B | base | cuda | default | **139** | -- | 0 bytes |
+  | A | base | cuda | `VT_DEVICE_KV_CACHE=0` | **0** | 1756 s | ` Paris Paris` |
+
+  Leg B's `gdb` backtrace names the frame O49 predicted, and it is the whole
+  chain rather than a symbol on its own:
+
+  ```text
+  Thread 4 "vllm-cli" received signal SIGSEGV, Segmentation fault.
+  #0  vllm::glm5_next::StoreCaches(...)
+  #1  vllm::(anonymous namespace)::ForwardGlm5NextForConditionalGeneration(...)
+  #2  vllm::ModelRegistry::Forward(...)
+  #3  vllm::v1::GPUModelRunner::execute_model(...)
+  ```
+
+  Leg A moved the engine's KV pages into host memory and changed nothing else --
+  same binary, same box, minutes later -- and it SURVIVED. A predicted frame and
+  a one-variable falsification that fails to falsify are two independent
+  confirmations, and O46's mixed-residency mechanism is retired rather than
+  merely doubted.
+
+- **O51 -- THE JOB'S OWN IDENTITY GUARD REFUSED A PAIR THAT WAS GENUINELY
+  DIFFERENT, and the reason is that it hashed the wrong artifact.** Run 1 built
+  base and fixed into ONE directory and compared `sha256sum vllm-cli` across the
+  two halves. They matched, the guard declared "the two halves are the SAME
+  BINARY" and refused to report legs C and D, so **the fix went unmeasured on
+  hardware**. The `.so` hashes the same script RECORDED show the halves were not
+  the same at all:
+
+  | artifact | base | fixed |
+  |---|---|---|
+  | `examples/vllm-cli` | `bbc55a61...` | `bbc55a61...` |
+  | `libvllm.so.0.0.3` | `bfd0a6e7...` | **`66412203...`** |
+
+  `vllm-cli` is a thin ABI client (AGENTS.md §"Shared seams": examples never
+  include internal headers), so this change cannot alter it and its hash is
+  identical BY CONSTRUCTION. The model code is in `libvllm.so`. **Separate build
+  directories do not fix this** -- `vllm-cli` would hash identically across them
+  too -- so the repair is the PREDICATE: digest the executable AND every `.so`
+  beside it, which is exactly the breadth the same script's identity SCAN
+  already used two blocks earlier. Run 2 does both, and adds a source-level
+  sentinel (a string present only in the patched file) checked in the linked
+  set, so "is this the fixed tree" is answered by content rather than by a build
+  artifact's timestamp.
+
+  The guard firing was correct behaviour and is kept. A gate that refuses to
+  report is the right failure mode; a gate that refuses for a reason that is not
+  the one it names is the defect.
+
+- **O52 -- LEG A EMITTED ` Paris Paris`, ITS FIRST TOKEN AGREES WITH THE CPU ARM
+  AND ITS SECOND DOES NOT, so PREFILL is clean and the DECODE step is not.**
+  `PARIS_A=NO` in the run-1 log is a string match against ` Paris.` and is an
+  artifact of that flag, not the finding. The finding is the divergence under it,
+  and it is recorded here rather than folded into a summary as noise.
+
+  **The discriminator that suggests itself does not work, and this is why.**
+  Running leg A's configuration with `VT_GLM5_NEXT_DEVICE_EXPERTS` unset does not
+  run the model with the expert arm off: `Glm5NextHostForward` refuses a non-CPU
+  queue BY NAME when the flag is unset, so the leg emits no token at all. An
+  engine-fatal refusal that prints nothing is indistinguishable at the file level
+  from the crash it would be mistaken for -- the "instrument whose failure looks
+  like a result" shape this row has already paid for.
+
+  **THE CANDIDATE WITH A MECHANISM, and it is one this spec already flagged as
+  unestablished.** `GPUModelRunner::async_device_mirror()` is DEFAULT ON for an
+  integrated CUDA GPU (`runner.cpp:4437-4459`; `AsyncDeviceMirrorEnvDefault` is
+  "on unless the value is `0`", and GB10 satisfies `is_integrated_gpu()`). On
+  that path the combine patches the DEVICE input ids and leaves the host
+  `token_ids` "deliberately stale for decode rows" -- the runner's own words
+  (`runner.cpp:2374-2414`, assigned at `:2748`). **This model references
+  `device_token_ids` ZERO times** in `glm5_next_registry.cpp` and
+  `glm5_next_forward.cpp`; it embeds `input.token_ids`. On a decode step that is
+  a stale id, so the model never sees the token it just emitted -- which is
+  precisely what re-emitting ` Paris` looks like, and precisely why prefill,
+  which has no decode row, is unaffected.
+
+  It is a candidate and not a conclusion. Run 2's leg E is `VT_ASYNC_DEVICE_MIRROR=0`,
+  the documented rollback: a second token of `.` implicates that path and
+  exonerates the routed-expert arm, and a second token of ` Paris` rules it out.
+  Leg F (`--max-tokens 1`) separates prefill from decode by construction, and
+  leg G repeats run 1's leg A inside run 2 so the comparison is within-job.
+
+  **A bimodal reading is required here.** The routed-expert arm's unit gate is
+  NMSE 3.833e-15, and the prefill argmax margin measured on `thor` was 1.279
+  (` Paris` 16.427 over ` one`). A perturbation far too small to move token 1
+  can still flip a near-tie at token 2, because an argmax is a discrete
+  selection and its error is bimodal, not proportional. So "token 1 matched"
+  does NOT by itself clear the arm, and whatever run 2 returns, the top-5 and
+  the MARGIN are what settle it rather than the token string.
+
 ## Now
 
 `ACTIVE`, 2026-09-01. **THE KERNEL THAT BLOCKED THIS MODEL'S DEVICE ARM LANDED
@@ -5459,11 +5858,14 @@ expiry.
 **AND THEN IT SEGFAULTED, so the arm is OPT-IN and defaults OFF.** Driven end to
 end on the 101.24 GiB artifact, ALL THREE `--device cuda` legs died with SIGSEGV
 (rc=139) emitting no token, against three CPU legs that all emitted ` Paris.`,
-interleaved on one binary -- once the expert banks stopped fitting
-and the arm fell back to the host mid-model. The base tree produced a clean
-refusal on the same command, so this was a REGRESSION and the default is
-restored byte-for-byte; O46 carries the four legs, the three hypotheses already
-eliminated, and the one that is untested. O47 records the other half of that
+interleaved on one binary. The base tree produced a clean refusal on the same
+command, so this was a REGRESSION and the default is restored byte-for-byte;
+O46 carries the four legs and the three hypotheses eliminated inside the MoE
+arm. **O46's own MECHANISM is falsified and O49 replaces it**: the process dies
+in `StoreCaches`, host-storing into the runner's `cudaMalloc` KV pages after the
+forward has already returned, which is a defect W9c-3a exposed rather than
+introduced. W9c-3b ([#2480](https://github.com/mudler/vllm.cpp/issues/2480))
+owns the fix and the four `dgx:gpu0` legs that decide it. O47 records the other half of that
 job: THREE identical cpu legs spread 69% on wall and 89% on generation, so NO
 speed number was available on any axis and none is claimed. The n=2 mechanism
 this row briefly asserted -- page-cache eviction moving generation -- was

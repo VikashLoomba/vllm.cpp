@@ -236,13 +236,35 @@ evidence for `Fmt == 3` is the rc job's own rebuild on `strix:gpu0`, which is wh
 byte-identical to the original -- a leg run after a build that silently did
 nothing would read as a result and be none.
 
-One earlier preflight run reported `test_cpu_x86_llamacpp_floor` FAILED at
-`test_a_contended_leg_is_discarded_and_never_summarised`. It passes standalone
-(10 tests, `OK`) and passes in the next full preflight. The box load was 21-31
-from other agents' builds at the failing run and 12.7 at the passing one, which
-is the already-recorded load flakiness of that harness test. It is not reachable
-from this diff, which touches one ROCm `.hip` file, one allowlist line and this
-spec.
+`test_cpu_x86_llamacpp_floor` has now reddened this row's preflight TWICE, at
+two different test methods, and both times it was the box and not the diff. It
+is recorded with the evidence rather than waved away, because "known flaky" is
+the sentence under which a real red gets shipped.
+
+The second instance, on the commit that carries `## W10`, is the clearer one
+because the harness says so itself:
+
+```text
+FAIL: test_runs_to_completion_and_creates_its_own_output_dir
+AssertionError: 4 != 0 : waiting for quiet: 15s busy=128% builders=0 load=10.24
+NO_QUIET_WINDOW after 30s (busy=115% builders=0 load=12.41 9.11 8.41)
+```
+
+That is the harness's own wait-for-quiet loop giving up on a box under other
+agents' load. Four checks, not one assertion:
+
+| check | result |
+|---|---|
+| the failure text names the cause | `NO_QUIET_WINDOW`, `load=12.41` |
+| standalone at load 4.8 | 10 tests, `OK`, exit 0 |
+| the FULL staged preflight rerun at load 4.3 | `ok test_cpu_x86_llamacpp_floor`, **0 gates failed**, `rc=0` |
+| reachable from the diff? | the commit touches ONE file, this markdown spec |
+
+The first instance was `test_a_contended_leg_is_discarded_and_never_summarised`
+at box load 21-31, passing standalone and in the next full preflight at 12.7.
+
+So the standing gate state for this row is: **no gate FAILED**, five SKIPS with
+the causes tabled above, and `NOT a green preflight` for those SKIPS alone.
 
 ## The A/B arm computes the same number, checked rather than asserted
 
@@ -1134,10 +1156,21 @@ It aborted in PHASE 0 with `knob STILL absent after a rc=0 rebuild`, on a run
 whose source it had visibly patched and whose rebuild returned 0.
 
 **That is the guard working, and the guard was wrong.** Its check was
-`strings -a "$SO" | grep VT_ROCM_MANAGED_ALLOC`, and `strings` is binutils,
-which this container does not guarantee. A missing `strings` prints nothing, the
-grep fails, and the check reports ABSENT identically before and after a
-perfectly good rebuild — an instrument whose failure looks exactly like a result.
+`strings -a "$SO" | grep VT_ROCM_MANAGED_ALLOC`.
+
+**The first diagnosis written here was also wrong, and correcting it is the
+point.** It said `strings` was missing from the container. The rerun prints
+`strings in image: /usr/bin/strings`, so it is not. What is actually wrong is
+WHICH SIDE the check ran on: `strings -a "$SO"` executes on the leased WORKER
+HOST, outside `podman`, while every probe of the toolchain in these scripts runs
+INSIDE the image. Those are different filesystems, and the host is the one
+without binutils. The rerun's own `strings in image` line measures the side that
+was never in question — a second instrument error, surfaced only because the
+same log also carried a `grep -a` check that answered correctly.
+
+Either way a missing `strings` prints nothing, the grep fails, and the check
+reports ABSENT identically before and after a perfectly good rebuild — an
+instrument whose failure looks exactly like a result.
 The check failed SAFE, which is the direction that costs a lease slot instead of
 producing a wrong answer: without it the job would have run
 `VT_ROCM_MANAGED_ALLOC=0` against an unpatched library, where the name is unread
@@ -1155,6 +1188,64 @@ not take it", and compares the library sha across the rebuild so "changed
 nothing" cannot be confused with "cannot see". It also reports whether `strings`
 exists, so the diagnosis is in the log rather than in this paragraph.
 
+## W10: Gate 2 and gate-sized work, both clean on the fix arm
+
+rc job `5eb06e95-f1f4-4856-8071-560c1afab9a6`, log
+`/mnt/nas_share/rc/rocm-strix-shape/evidence8/confirm.log`, on the SAME library
+W9 measured (`7604aca8…`, knob verified present by `grep -a` before any leg
+ran), arms alternating with the within-round order rotating:
+
+| phase | shape | arm | legs | failures |
+|---|---|---|---|---|
+| A (Gate 2) | `--max-tokens 64 --repeat 4` | `managed` | 5 | **3** |
+| A (Gate 2) | `--max-tokens 64 --repeat 4` | `nomanaged` | 5 | **0** |
+| B (gate size) | `--max-tokens 288` | `managed` | 4 | **4** |
+| B (gate size) | `--max-tokens 288` | `nomanaged` | 4 | **0** |
+
+Every clean leg produced its full text, not a truncated one: 257 characters at
+`64 x 4` and 1,136 at 288 tokens, all reading
+`" Paris.The capital of Germany is Berlin."`. **`managed` did not complete a
+single gate-sized leg.** That is the same board and the same binary that
+reported `TOKEN_GATE=NOT_MEASURABLE` at 12 of 12, and it is why that gate could
+not be measured.
+
+Pooled over W9 and W10, one binary, three shapes:
+
+```text
+managed     17 failures / 21 legs
+nomanaged    0 failures / 21 legs
+```
+
+`nomanaged` is also faster wherever a comparison exists: 77-89 s against 94 and
+132 s for `managed`'s two survivors at `64 x 4`, and 84-95 s at 288 tokens where
+`managed` never finished. Suggestive, not measured, and #2497 owns the axis.
+
+## The summary line of that job is WRONG, and the per-leg lines are the record
+
+`confirm.log`'s own `===== SUMMARY =====` reads:
+
+```text
+A-managed legs=5 failures=5    A-nomanaged legs=5 failures=5
+B-managed legs=4 failures=4    B-nomanaged legs=4 failures=4
+```
+
+Every arm, every leg, a failure — including the twelve legs whose own lines say
+`rc=0 class=OK` and carry 257 or 1,136 characters of correct output. The tally
+tested `$5 != "class=OK"`, and this script's `MLEG` format added `ntok=` and
+`rep=`, which pushed `class=` from field 5 to field 6. So the test compared
+`rc=0` against `class=OK`, never matched, and charged every leg as a failure.
+
+**Read the consequence, because it is the sharpest instrument lesson on this
+row.** A reader who trusted the summary would have concluded that
+`VT_ROCM_MANAGED_ALLOC=0` changes nothing and that W9's 0 of 12 was a fluke —
+the exact opposite of what the legs say, arrived at with no error message and no
+red. It failed toward the null result, which is the direction that looks like
+diligence.
+
+The numbers in this spec are recomputed from the per-leg lines with a match that
+scans every field for `class=OK` rather than indexing one, and `confirm.sh` on
+the share now carries that form so a rerun cannot repeat it.
+
 ## What the gates now say
 
 `## Gates` item 1 asked for N consecutive clean legs where the pre-fix rate
@@ -1164,11 +1255,15 @@ named cause that the repair turns green, and the `managed` arm IS that
 red-before, on the same binary, in the same job, interleaved with its green.
 Both are satisfied for the knob.
 
-Item 2 is NOT satisfied and must not be reported as such: the `#2511` shape
-(`--max-tokens 64 --repeat 4`) has not been run under `VT_ROCM_MANAGED_ALLOC=0`,
-and neither has the ROCm token gate that came back `NOT_MEASURABLE` at 12 of 12.
-Those two runs are what turn this from a named cause into a closed issue, and
-they are the next dispatch.
+Item 2 is now satisfied too: W10 ran the `#2511` shape
+(`--max-tokens 64 --repeat 4`) five times an arm and a gate-sized
+`--max-tokens 288` four times an arm, and `nomanaged` took no failure in either
+while `managed` failed 3 of 5 and 4 of 4.
+
+What is still owed is not a gate but a decision and a rerun by its owner: the
+ROCm token gate itself has not been re-run under the knob, and it is another
+agent's harness. This row has shown the board completes work of that size on the
+fix arm; whether the gate then MEASURES is that harness's answer to give.
 
 ## Next hypotheses, in the order they are worth testing
 

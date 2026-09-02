@@ -1301,6 +1301,16 @@ TEST_CASE("W3: the cr == 4 arm is REACHED, and its INDEXER state accumulates (#2
 //       the state is constructed per call rather than persisted on the model.
 //
 // Two production defects, one assertion each.
+namespace {
+// One count, not one assertion per element.
+int64_t NonFinite(const std::vector<float>& v) {
+  int64_t n = 0;
+  for (const float x : v)
+    if (!std::isfinite(x)) ++n;
+  return n;
+}
+}  // namespace
+
 TEST_CASE("PAGED-ENTRY: ModelRegistry::Forward REACHES the EXL3 paged arm (#2447)") {
   dsv4_exl3_fixture::FixtureOptions opt;
   opt.layers = 2;
@@ -1378,7 +1388,10 @@ TEST_CASE("PAGED-ENTRY: ModelRegistry::Forward REACHES the EXL3 paged arm (#2447
   CHECK(s1.rows == 1);
   CHECK(s1.vocab == params.vocab_size);
   REQUIRE(s1.host.size() == static_cast<size_t>(params.vocab_size));
-  for (const float v : s1.host) REQUIRE(std::isfinite(v));
+  // AGGREGATED, never one assertion per vocabulary entry: a per-entry loop
+  // buries the assertion COUNT, and a changed count is itself the signal a
+  // mutation is read by.
+  CHECK(NonFinite(s1.host) == 0);
 
   // (A) THE PAGE WAS WRITTEN, on the compressor layer. Aggregated rather than one
   // assertion per element: a changed assertion COUNT is itself the signal a
@@ -1386,10 +1399,10 @@ TEST_CASE("PAGED-ENTRY: ModelRegistry::Forward REACHES the EXL3 paged arm (#2447
   int64_t nonzero_l1 = 0;
   double sum_l1 = 0.0;
   for (const float v : storage[1]) {
-    REQUIRE(std::isfinite(v));
     if (v != 0.0f) ++nonzero_l1;
     sum_l1 += std::abs(static_cast<double>(v));
   }
+  CHECK(NonFinite(storage[1]) == 0);
   MESSAGE("compressor-layer page: " << nonzero_l1 << " non-zero of "
                                     << storage[1].size() << ", L1 " << sum_l1);
   CHECK(nonzero_l1 > 0);
@@ -1408,7 +1421,7 @@ TEST_CASE("PAGED-ENTRY: ModelRegistry::Forward REACHES the EXL3 paged arm (#2447
                                       /*nreqs=*/1);
   CHECK(s2.rows == 1);
   REQUIRE(s2.host.size() == static_cast<size_t>(params.vocab_size));
-  for (const float v : s2.host) REQUIRE(std::isfinite(v));
+  CHECK(NonFinite(s2.host) == 0);
   // And the second token's row landed in slot 1, so the two steps did not write
   // the same slot.
   int64_t nonzero_slot1 = 0;

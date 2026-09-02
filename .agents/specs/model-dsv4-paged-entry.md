@@ -12,10 +12,10 @@ one row is not a second row.
 
 ## Now
 
-`ACTIVE` — the route, the shared predicate and the reachability gate land in
-this wave. The route is proven on **f32 pages only**. The published topology's
-`kI8` / `fp8_ds_mla` SWA pages stay refused by name until `KV-DSV4-MULTICACHE`
-W8 lands the packed 584-byte store; see `## Owed`.
+`ACTIVE` — the route, the shared predicate and the reachability gate LANDED and
+are green; see `## Evidence`. The route is proven on **f32 pages only**. The
+published topology's `kI8` / `fp8_ds_mla` SWA pages stay refused by name until
+`KV-DSV4-MULTICACHE` W8 lands the packed 584-byte store; see `## Owed`.
 
 ## The defect
 
@@ -52,8 +52,19 @@ is finite, correctly shaped, and computed over the wrong key set.
 This is a code-reading conclusion over the complete chain, not a measurement:
 nobody has run an engine on this path, because #2455 stops the artifact loading
 first. The reachability gate below runs the same chain at synthetic geometry and
-shows the page storage staying all-zero when the route is absent, which is the
-observable form of the same claim.
+shows the page storage staying all-zero when the route binds no pages, which is
+the observable form of the same claim.
+
+**One qualification the gate MEASURED, and it narrows the severity.** On a
+CPU-only build `DeepseekV4Model::ForwardDevice` refuses first, on
+`VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending)`. So on THAT
+build the pre-fix behaviour was a loud refusal, not a silent wrong answer: the
+mutation that deletes this row's branch reds by that refusal and never reaches
+the page assertion (`## Evidence`, M1). The silent case is a CUDA-build
+property, where `V4DeviceKernelsAvailable()` is true, `ForwardDevice` runs, and
+nothing writes or reads a page. That build is exactly the one an engine runs on,
+so the severity stands — but it is not observable on the gate host, and saying
+otherwise would be claiming a measurement nobody took.
 
 ## Scope
 
@@ -236,9 +247,86 @@ passing test:
 
 | mutation | must red |
 |---|---|
-| delete the new registry branch | assertion 1 (pages stay zero) |
+| delete the new registry branch | the route is gone |
+| the branch is PRESENT but binds no pages | assertion 1 (pages stay zero) |
 | construct the compressor state per call | assertion 2 (step 2 throws) |
 | widen the route predicate to admit `num_reqs > 1` | assertion 3 |
+
+The second row exists because the first cannot reach assertion 1 on a CPU-only
+build: deleting the branch drops the step into `ForwardDevice`, which refuses on
+`kDevicePending` before any page is touched. `M1b` keeps the branch and routes
+it to the STATELESS EXL3 forward instead — the same defect shape, reachable on
+this build — so assertion 1 is the only thing that can catch it.
+
+## Evidence
+
+### 2026-09-02, CPU-only build, `RelWithDebInfo`, head `3e2d8e42b`
+
+Host `x86_64` Linux 6.8, no `nvcc`, no GPU. Build tree
+`/home/mudler/_git/vllm.cpp/.wt/dsv4-paged/build`, configured
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVLLM_CPP_CUDA=OFF
+```
+
+**Green.** `ctest -R 'test_deepseek_v4_(exl3_loader|paged_equiv|gguf_load)'`:
+
+```
+1/3 Test #177: test_deepseek_v4_gguf_load .......   Passed    0.17 sec
+2/3 Test #181: test_deepseek_v4_exl3_loader .....   Passed    0.86 sec
+3/3 Test #295: test_deepseek_v4_paged_equiv .....   Passed    0.03 sec
+100% tests passed, 0 tests failed out of 3
+```
+
+The reachability case alone, `--test-case='PAGED-ENTRY*' -s`: **18 assertions,
+18 passed**, and the two observables read
+
+```
+compressor-layer page: 512 non-zero of 16384, L1 420.02
+CHECK( nonzero_l1 > 0 )      values: CHECK( 512 >  0 )
+CHECK( nonzero_beyond == 0 ) values: CHECK( 0 == 0 )
+CHECK( nonzero_slot1 > 0 )   values: CHECK( 512 >  0 )
+CHECK_THROWS( step( 3, 2, 2, 2) ) threw as expected!
+```
+
+512 is `head_dim`, i.e. EXACTLY one cache row after step 1 and one more after
+step 2 — not "the page is dirty".
+
+`REQUIRE( in.gather_logits )` reads `true` on every step, so the case drives the
+default the runner sets, which is the whole point.
+
+**Mutations.** Harness rebuilds after each edit, asserts the binary mtime MOVED
+(a mutation that fails to compile reads as a passing test), runs both suites,
+restores with `git checkout --` and asserts the five touched files hash back to
+the same sha256. Baseline and final rebuild both green.
+
+| mutation | mtime moved | result |
+|---|---|---|
+| M1 delete the new registry branch | both | `exl3_loader` rc=1, 21 cases / 20 passed, THREW `DeepseekV4 DEVICE forward (W7-device) not implemented` at `deepseek_v4.cpp:4001` |
+| M1b branch present, binds no pages | both | `exl3_loader` rc=1, **602 assertions / 2 failed**: `CHECK( nonzero_l1 > 0 )` reads `CHECK( 0 > 0 )`, and `CHECK( nonzero_slot1 > 0 )` reads `CHECK( 0 > 0 )` |
+| M2 construct the compressor state per call | both | `exl3_loader` rc=1, THREW `the carried state has seen 0 tokens but this step resumes at kv_base 1` at `deepseek_v4_dsa.cpp:417` — AFTER step 1 wrote its 512 page values, so step 1 passed and only the persistence failed |
+| M3 widen the route predicate to `num_reqs < 1` | both | `exl3_loader` rc=1 (`CHECK_THROWS( step(3,2,2,2) ) did NOT throw at all!`) AND `paged_equiv` rc=1, 170646 assertions / 2 failed |
+
+Every mutation printed `restored: sha256 identical`.
+
+**M1 is the one that did not land where it was aimed**, and the reason is in
+`## The defect` above: on a CPU-only build the deleted route falls into
+`ForwardDevice`, which refuses on `kDevicePending` before touching a page. That
+makes M1 a proof that the branch is REACHED, not a proof that assertion 1 is
+load-bearing. M1b supplies the second proof. Both are recorded; neither is
+presented as the other.
+
+**What this evidence does NOT cover.**
+
+- The published `kI8` topology. It is refused by name, and `KV-DSV4-MULTICACHE`
+  W8 owns the store. Nothing here ran on a packed page.
+- The device-resident return. `WrapV4DeviceLogits` and `HostLogits` are the same
+  value on a CPU queue, so this host cannot separate them. The reason for
+  choosing the former is static: `check-runner-routing-consistency.py` keeps
+  `deepseek_v4` classified DEVICE across the delegate hop, so a `HostLogits`
+  return would be a false green rather than a red.
+- Any token-exactness claim against the oracle. Weight-blocked by #2455.
+- Any GPU, any real checkpoint, any throughput number.
 
 ## Owed
 

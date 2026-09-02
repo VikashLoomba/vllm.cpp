@@ -277,7 +277,7 @@ TEST_CASE("exl3 rocm: exl3_gemm is BYTE-identical to the CPU arm on every codebo
       {6, 0, 3, false, "a stock exl3 lm_head"},
       {3, 1, 3, false, "the SparkInfer DeepSeek-V4 marker"},
       {3, 1, 3, true, "the same, into upstream's c_fp32 arm"},
-      {4, 2, 3, false, "the Qwen3.8-27B mul1 body, 270 of its 272 tensors"},
+      {4, 2, 3, false, "the Qwen3.8-27B mul1 GDN tower and attention, 270 of its 409"},
       {5, 2, 3, false, "its 5-bit tensor, and all 36 of the draft"},
       {6, 2, 3, false, "its mul1 lm_head"},
   };

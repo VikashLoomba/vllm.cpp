@@ -607,8 +607,9 @@ TEST_CASE("exl3 device: the widened (bits, codebook) arms agree with the CPU arm
     int codebook;
     const char* what;
   };
-  // (3, 1) is covered by the case above; these are the two W3 added and the
-  // three QUANT-EXL3-MUL1 added for `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` (#2495).
+  // (3, 1) is covered by the case above; these are the two W3 added, the three
+  // QUANT-EXL3-MUL1 added for `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` (#2495), and
+  // the fourth mul1 width its slice F added (#2574).
   //
   // The cb 2 rows are the ones that carry a NEW DECODE and not only a new width:
   // `decode_mul1_product_2` sums the four bytes of the product instead of adding
@@ -616,9 +617,20 @@ TEST_CASE("exl3 device: the widened (bits, codebook) arms agree with the CPU arm
   // that decode. The host side of it is gated against hand-computed upstream
   // values in `tests/vt/test_exl3_dequant.cpp`, which is what keeps this
   // cross-check from being two ports of the same mistake.
+  //
+  // (3, 2) IS THE ROW THAT MATTERS MOST HERE AND IT IS ALSO THE MOST FRAGILE.
+  // It is the artifact's single largest width population -- 137 of its 409
+  // trellis modules, every MLP projection of the layers quantized at the low end
+  // of its 3.5 bpw average -- and it was missing because the census slice D
+  // worked from said 272 modules where the artifact has 409. It is also now the
+  // NEIGHBOUR of (3, 1): same width, adjacent codebook, same `dq8` route, same
+  // tile shapes. A `cb` threaded wrongly between those two compiles, launches,
+  // and returns the right shape; only a numeric comparison against an
+  // independent decoder sees it, which is what this loop is.
   const Arm arms[] = {{3, 0, "a stock exl3 body"},
                       {6, 0, "a stock exl3 lm_head"},
-                      {4, 2, "the Qwen3.8-27B mul1 body, 270 of its 272 tensors"},
+                      {3, 2, "the Qwen3.8-27B mul1 MLP, 137 of its 409 trellis modules"},
+                      {4, 2, "the Qwen3.8-27B mul1 GDN tower and attention, 270 more"},
                       {5, 2, "the Qwen3.8-27B mul1 5-bit tensor, and all 36 of its draft"},
                       {6, 2, "the Qwen3.8-27B mul1 lm_head"}};
 

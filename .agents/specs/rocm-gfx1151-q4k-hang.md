@@ -9,23 +9,27 @@ this defect makes provisional).
 
 ## Now
 
-`ACTIVE` — the site is measured, the kernel at that site is now EXONERATED at
-the production launch geometry, and the cause is still not named.
+`ACTIVE` — **the cause is named and measured. The repair is a product decision
+this row does not get to make alone.**
 
-**Measured:** the failure rate; that one prefill forward reproduces it; that both
-symptoms are one defect; that every failing leg dies inside
-`KQuantGemmK<OutT, 2>` with its three pointer arguments exactly sized; that
-`DotQ6K`'s private array is NOT the mechanism; and — new, W3 — that the same
-kernel launched at the same geometry, with no model, no loader and no scheduler,
-does not fault in 9,000 consecutive launches on a board that failed 5 of 6 model
-legs in the SAME lease.
+**`hipMallocManaged` on a part that cannot take a recoverable page fault is the
+cause of #2511.** rc job `6dced9e1-3c74-4363-bd9e-2a0dd8789cc9`, one build, one
+boot, knob read at runtime, twelve rounds alternating with the within-round
+order rotating:
 
-**Not measured:** WHY the step faults. The search has moved off the kernel and
-onto what reaches the kernel. `## The standalone shaped launch` states what W3
-ruled out and what it leaves.
+| arm | allocator | legs | failures |
+|---|---|---|---|
+| `managed` (unset) | `hipMallocManaged` | 12 | **10** |
+| `nomanaged` (`VT_ROCM_MANAGED_ALLOC=0`) | `hipMalloc` | 12 | **0** |
 
-**No fix is claimed.** The `Fmt == 3` arm this row added defaults OFF, and W2
-measured that it fixes nothing; it stays OFF.
+Nothing else differed. The knob gates the allocator and only the allocator;
+`unified` keeps the unknobbed capability answer on both arms, so
+`UnifiedMemory()` and `DeviceMemoryIsHostAddressable()` are byte-identical
+across the two columns and cannot explain the split.
+
+**No fix has landed.** `VT_ROCM_MANAGED_ALLOC` defaults ON, so every shipped
+configuration still takes the faulting branch. What to do about that is
+`## The decision this row cannot make alone`.
 
 ## Scope
 
@@ -1042,6 +1046,100 @@ closes with a fix. Still faulting means the driver, and this row ends with the
 report its `## Stop conditions` already provide for. No fix lands on a short arm:
 at a baseline of 9 in 10, twelve clean legs is decisive and five is the mistake
 this row already made with `HSA_ENABLE_SDMA=0`.
+
+## W9 RESULT: the allocator is the cause
+
+Log `/mnt/nas_share/rc/rocm-strix-shape/evidence7/managed.log`. Every leg is the
+minimal repro, `--max-tokens 1 --repeat 1`, on `libvllm.so` `7604aca8…` rebuilt
+from `11fed3ba5` plus the one patched translation unit (`lib_before 41bb4052…`,
+so the rebuild demonstrably took the change).
+
+```text
+managed    legs=12 failures=10      nomanaged  legs=12 failures=0
+```
+
+The two clean `managed` legs are r1 and r6; every other one is a `GPU Hang` or a
+`Memory access fault`. All twelve `nomanaged` legs printed ` Paris`.
+
+At the measured baseline of 10 in 12, twelve consecutive clean legs on the other
+arm has probability about 1 in 10^9 under the null. This row's own history is
+why that sentence is worth writing rather than assuming: the private-memory A/B
+read as a clean confirmation of the OPPOSITE conclusion at n=2, and
+`HSA_ENABLE_SDMA=0` read 0 in 5 and then 4 in 10. Twelve interleaved rounds with
+a rotating order is what it takes here, and this is the first arm on this row to
+clear that bar.
+
+**Why it fits everything already measured.** `gfx1151` reports
+`PageableMemoryAccess = 0` and `PageableMemoryAccessUsesHostPageTables = 0`, so
+the GPU cannot take a recoverable page fault, and `UseManagedAlloc` was putting
+about 25 GiB of MIGRATABLE memory on it, with 249 of 570 dispatches reading a
+virtual address created a millisecond earlier. A managed page that migrates out
+from under a live queue is unmapped, the access is a hard violation, and the
+address the walk reports has nothing to do with the arguments of whatever kernel
+was resident. That is every recorded symptom: byte-exact arguments; eight
+page-aligned fault addresses, four of them outside any user address space and
+none inside any allocation the process made; `AMD_SERIALIZE_KERNEL=3` not
+helping, because the migration is not kernel-vs-kernel; and the site landing on
+whichever `KQuantGemmK` happened to be running, in Q4_K on one leg and Q6_K on
+another.
+
+It also explains every clean standalone probe. W3, W6 and W8 allocated managed
+memory and read it, but none of them built and held a 25 GiB working set on a
+device with 128 GiB shared while touching it from both sides — none of them
+created the memory pressure that makes the driver migrate anything. One leg in
+86 faulted, and that is the floor this mechanism predicts.
+
+**A second, unlooked-for signal points the same way.** `nomanaged` legs ran 28
+to 39 seconds; `managed` legs ran 40 to 71, and its two SURVIVING legs took 42
+and 44. Plain `hipMalloc` is both correct and about a quarter faster on this
+workload. Stated as suggestive, not measured: two passing legs is not a
+throughput result, and #2497 is the axis that owns it.
+
+## The decision this row cannot make alone
+
+Making `UseManagedAlloc` false on this board is one predicate, and it is not
+only an allocator change.
+
+`unified_memory_` is `managed_alloc || (pageable_memory_access && integrated)`
+(`src/vt/rocm/rocm_backend.hip:446-447`). With `pageable_memory_access = 0`,
+dropping the managed branch also makes `UnifiedMemory()` and
+`DeviceMemoryIsHostAddressable()` false, and those are what the CPU reference
+tier's eligibility rests on. **The A/B above deliberately did NOT move them**,
+so it says nothing about that consequence, and this workload reports
+`reference_tier_hits = 0`, so nothing exercised it either.
+
+Three shapes exist and the choice between them is a product decision, not a
+measurement:
+
+1. **Narrow `UseManagedAlloc` by `pageable_memory_access`.** Correct by this
+   row's evidence, and it withdraws `UnifiedMemory()` on every XNACK-less
+   integrated part, taking the reference tier with it.
+2. **Plain `hipMalloc` while keeping `unified_memory_` true.** Exactly what the
+   twelve clean legs ran. `rocm_backend.hip:127` records that host dereference
+   of `hipMalloc` memory demonstrably works on `gfx1151` — but the same comment
+   says approach (b) exists precisely because this project "refuses to gate
+   memory safety on" that architectural accident, so this trades an API
+   guarantee for a measured one.
+3. **Keep the default and ship the knob**, which is what has landed.
+
+Issue [#41](https://github.com/mudler/vllm.cpp/issues/41) F6 ratified approach
+(b) with the maintainer, so narrowing it is that decision being revisited, and
+the person who took it should take it again with this measurement in hand.
+
+## What the gates now say
+
+`## Gates` item 1 asked for N consecutive clean legs where the pre-fix rate
+would have shown a failure with probability >= 0.99; at 10 in 12 that is N = 3,
+and `nomanaged` ran twelve. Item 3 asked for a red-before reproduction of the
+named cause that the repair turns green, and the `managed` arm IS that
+red-before, on the same binary, in the same job, interleaved with its green.
+Both are satisfied for the knob.
+
+Item 2 is NOT satisfied and must not be reported as such: the `#2511` shape
+(`--max-tokens 64 --repeat 4`) has not been run under `VT_ROCM_MANAGED_ALLOC=0`,
+and neither has the ROCm token gate that came back `NOT_MEASURABLE` at 12 of 12.
+Those two runs are what turn this from a named cause into a closed issue, and
+they are the next dispatch.
 
 ## Next hypotheses, in the order they are worth testing
 

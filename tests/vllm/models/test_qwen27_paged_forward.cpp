@@ -726,27 +726,44 @@ TEST_CASE("qwen27 activation-dtype flag is opt-in on a leading 1 only") {
 // The RESOLVER, asked against the environment this process actually has.
 // `ActDType` caches its getenv in a function-local static, so one process
 // observes exactly one value; the second registration of this binary under
-// `VT_ACT_F32=1` (tests/CMakeLists.txt) is what executes the other arm, and
-// without it the f32 arm an operator is told to run would be ungated.
+// `VT_ACT_F32=1` (tests/CMakeLists.txt) is what executes the other arm.
 //
-// Two things are asserted and BOTH are load-bearing. The CPU answer must follow
-// the lever, which is what a hardwired resolver fails. The CUDA answer must NOT,
-// which is what a resolver that ignores the device type fails — every recorded
-// device measurement was taken at BF16 and this change must not move one.
-TEST_CASE("qwen27 activation dtype follows the lever on CPU and never off it") {
+// The f32 ARM IS REFUSED, and this case holds the refusal to its contract.
+// Honouring the flag does not produce an f32 engine, it produces a numerically
+// inconsistent one: rc job 18fc60f0 measured 9 failed cases and 293 failed
+// assertions, all of them cross-PATH consistency assertions, plus a SIGABRT in
+// the NVFP4 lm_head case. AGENTS.md requires an unimplemented arm to refuse with
+// a message that NAMES the missing part rather than be discovered later, so this
+// asserts the refusal AND its message -- a bare throw that said nothing would
+// satisfy a test that only checked that it threw.
+//
+// The default arm is the shipped path and must be BF16 on EVERY device type. A
+// resolver that ignored the device type, or that quietly answered f32 anywhere,
+// reds this case, and every recorded device measurement was taken at BF16.
+TEST_CASE("qwen27 activation dtype is bf16 by default and REFUSES the f32 arm") {
   using vllm::detail::ActDType;
   using vllm::detail::ActF32FlagIsOn;
 
   const bool on = ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
   INFO("VT_ACT_F32 as this process reads it: on=" << on);
 
-  CHECK(ActDType(vt::DeviceType::kCPU) ==
-        (on ? vt::DType::kF32 : vt::DType::kBF16));
-
-  // Every non-CPU tier keeps BF16 under BOTH settings of the lever.
-  CHECK(ActDType(vt::DeviceType::kCUDA) == vt::DType::kBF16);
-  CHECK(ActDType(vt::DeviceType::kROCM) == vt::DType::kBF16);
-  CHECK(ActDType(vt::DeviceType::kMETAL) == vt::DType::kBF16);
+  const vt::DeviceType kEvery[] = {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                                   vt::DeviceType::kROCM,
+                                   vt::DeviceType::kMETAL};
+  for (vt::DeviceType dt : kEvery) {
+    CAPTURE(static_cast<int>(dt));
+    if (on) {
+      CHECK_THROWS_WITH_AS(ActDType(dt),
+                           doctest::Contains("VT_ACT_F32=1 is REFUSED"),
+                           std::runtime_error);
+      CHECK_THROWS_WITH_AS(ActDType(dt), doctest::Contains("incomplete"),
+                           std::runtime_error);
+      CHECK_THROWS_WITH_AS(ActDType(dt), doctest::Contains("#2534"),
+                           std::runtime_error);
+    } else {
+      CHECK(ActDType(dt) == vt::DType::kBF16);
+    }
+  }
 }
 
 // GDN-MOE-BF16-OUT (#1168), Edit 2. The eligibility carries NO model-shape term:

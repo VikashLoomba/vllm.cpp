@@ -221,14 +221,36 @@ bool detail::ActF32FlagIsOn(const char* env_value) {
 vt::DType detail::ActDType(vt::DeviceType dev_type) {
   static const bool f32 = detail::ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
   if (!f32) return vt::DType::kBF16;
-  // Compare the ENUM, not `GetPlatform(dev_type).is_cpu()`. The platform
-  // registry holds only the platforms a given binary linked, and asking it about
-  // an unregistered type THROWS ("no platform registered for device type 1",
-  // platform.cpp:74). A dtype resolver has to be total: it is asked what a device
-  // type WOULD resolve to, including by a gate running in a CPU-only binary, and
-  // it must answer rather than abort. Measured: the CUDA/ROCM/METAL assertions in
-  // test_qwen27_paged_forward threw exactly that under VT_ACT_F32=1.
-  return dev_type == vt::DeviceType::kCPU ? vt::DType::kF32 : vt::DType::kBF16;
+  // `VT_ACT_F32=1` is REFUSED, and refusing is the point. The f32 conversion is
+  // INCOMPLETE, so honouring the flag does not produce an f32 engine: it
+  // produces a broken one. Measured on thor:gpu0, rc job 18fc60f0 -- the default
+  // arm stays 33/33 and 780/780 while the f32 arm fails 9 cases and 293
+  // assertions, all of them CROSS-PATH consistency assertions (the indexed
+  // versus fallback GDN pools, the tap versus plain routes, one
+  // CHECK(2.69807 < 0.001)), plus a SIGABRT in the NVFP4 lm_head case. Paired
+  // paths required to agree bitwise no longer do, because one side is retyped
+  // and its reference is not.
+  //
+  // AGENTS.md: refuse an unimplemented arm with a message that NAMES the missing
+  // part, and never leave the missing path to be discovered later. A SIGABRT in
+  // the ninth test case is exactly "discovered later", so the flag aborts here,
+  // once, by name, before any buffer is allocated.
+  //
+  // The resolver itself stays, and it is not dead: every qwen35 activation
+  // buffer reads its answer on every forward, which is the one-model-dtype shape
+  // vLLM resolves and every layer inherits. What is missing is only the f32
+  // ANSWER, and this names what that would take.
+  VT_CHECK(false,
+           "VT_ACT_F32=1 is REFUSED: the qwen35 f32 activation conversion is "
+           "incomplete and would run a numerically inconsistent engine. Missing: "
+           "retype every PAIRED path together (the indexed and fallback GDN "
+           "pools, the tap and plain routes) so the cross-path equality gates "
+           "still hold, and resolve the two bf16 dtype CONTRACTS the trunk feeds "
+           "-- vt::SigmoidGateBf16 (ops.cpp:5105) and the NVFP4 lm_head. Owed in "
+           ".agents/specs/qwen38-27b-q4km-token-exactness.md; issue #2534. Unset "
+           "VT_ACT_F32 to run the shipped bf16 path.");
+  (void)dev_type;
+  return vt::DType::kBF16;  // unreachable; VT_CHECK(false) always throws
 }
 
 bool detail::ShouldUseMergedGdnQkvz(const GdnMergedQkvzEligibility& e) {
@@ -3540,9 +3562,21 @@ using detail::GdnOutDType;
 // f32 variance/normalize accumulation regardless — only the residual load/store
 // dtype changes) and halves that traffic. A/B: VT_BF16_RESIDUAL=0 restores the f32
 // residual in the same binary.
-// #2534 added the second term: when the trunk resolves f32 (the CPU tier under
-// `VT_ACT_F32=1`) the residual inherits it, because a residual narrower than the
-// stream it accumulates is the same lost mantissa twice per layer.
+// DISPOSITION, measured 2026-09-02 (#2534), so nobody re-runs this experiment:
+// the bf16 default STAYS, and the `VT_BF16_RESIDUAL=0` rollback was tried
+// against the Qwen3.8-27B Q4_K_M token gate and DID NOT HELP. Same binary, same
+// artifact and recipe, one lever: the divergence rate held at 5 of 6 and two
+// prompts diverged EARLIER (first difference 34 -> 21 and 20 -> 4), so the
+// agreeing-prefix total fell from 155 tokens to 126. The lever is live -- the
+// outputs changed -- it simply does not buy correctness on this arm. So this
+// knob remains what its comment above says it is: a MEMORY-TRAFFIC choice that
+// mirrors vLLM's bf16 residual, plus a diagnostic A/B. It is not a correctness
+// lever and must not be reached for as one.
+//
+// #2534 also wired the trunk in: when `ActDType` resolves f32 the residual
+// inherits it, because a residual narrower than the stream it accumulates is the
+// same lost mantissa twice per layer. That arm is currently REFUSED at the
+// resolver (see ActDType), so this term is bf16-unless-`VT_BF16_RESIDUAL=0`.
 DType ResidualDType(Dev d) {
   static const bool bf16 = [] {
     const char* e = std::getenv("VT_BF16_RESIDUAL");

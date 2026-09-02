@@ -203,6 +203,13 @@ by more. A gate that demands 6-of-6 agreement at that scale is asking for
 bit-reproduction of one specific aarch64 repacked gemv, not for arithmetic
 quality, and `b10451` scores 5 of 6 against itself when asked.
 
+**`VT_BF16_RESIDUAL` disposition (measured, so nobody re-runs it).** The bf16
+default STAYS. It is a memory-traffic choice that mirrors vLLM's bf16 residual,
+plus a diagnostic A/B, and it is **not** a correctness lever: the `=0` rollback
+was run against this gate and did not help (5 of 6 either way, two prompts
+worse). That disposition is recorded at the knob's own definition in
+`qwen3_5.cpp` as well as here, because the next reader reaches the code first.
+
 **Not settled, and still ours: the RATE.** A perturbation of this exact size
 flips 1 of 6 prompts. Ours flips 5 of 6. If our error were the same size as the
 oracle's own, we would flip at about its rate. We do not, so we carry an
@@ -478,6 +485,14 @@ reproduced #857 byte for byte from a different build.
   not caused by this row's change; it is found by it, and it is filed as
   [#2548](https://github.com/mudler/vllm.cpp/issues/2548). The focused unit suite
   is 33 of 33 green under that lever, so the knob reads as gated and is not.
+- `VT_ACT_F32=1` is **REFUSED at the resolver**, not honoured. Honouring it does
+  not give an f32 engine, it gives a numerically inconsistent one, and a SIGABRT
+  in the ninth test case is exactly the "discovered later" `AGENTS.md` forbids.
+  The refusal names the missing work -- retype every PAIRED path together so the
+  cross-path equality gates still hold, and resolve the two bf16 dtype contracts
+  the trunk feeds (`vt::SigmoidGateBf16`, the NVFP4 lm_head) -- and cites this
+  spec and #2534. The test asserts the refusal AND its message on every device
+  type, so a bare throw that said nothing would not pass.
 - `VT_ACT_F32` is an instrument, not a default. Whether the CPU tier SHIPS f32 is
   a product default and is decided by the A/B this row runs, not by the commit
   that added the resolver.

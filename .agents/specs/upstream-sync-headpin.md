@@ -67,11 +67,9 @@ that each step ran rather than inferring it from the next step's result:
 > never two devices and never two at once. The first asked `pip` for
 > `requirements/build.txt`, which does not exist because `requirements/build` is
 > a directory, so it lost its whole build-and-import half and a second job was
-> needed to repair the instrument. Both scripts are committed as
-> [`../scripts/headpin-e126687-job-a.sh`](../scripts/headpin-e126687-job-a.sh)
-> and [`../scripts/headpin-e126687-job-b.sh`](../scripts/headpin-e126687-job-b.sh).
-> See [`../sync/2026-09-02-e126687.md`](../sync/2026-09-02-e126687.md) §5.3 and
-> C6. The stop condition in §5 was about not spending a lease on upstream
+> needed to repair the instrument. Neither script is committed; see
+> [`../sync/2026-09-02-e126687.md`](../sync/2026-09-02-e126687.md) §5.3, C6 and
+> C10, the last of which records why the attempt to commit them was reverted. The stop condition in §5 was about not spending a lease on upstream
 > `main`, and that held: no lease measured `main`.
 
 - Every leg captures `$?` into its own named variable on the line after the
@@ -149,3 +147,9 @@ as a pass.
   plus everything between `db92053e97` and this target (#2593).
 - Whether upstream `main` installs under the same repair (#2593). Deliberately
   unmeasured; see §5.
+- `scripts/check-pr-size.py` cannot classify `.agents/scripts/**`, so the two
+  job scripts this wave ran could not be committed beside the three already
+  tracked there ([#2607](https://github.com/mudler/vllm.cpp/issues/2607)). Until
+  that lands, this wave's A/B control is recorded as a verbatim `diff` rather
+  than as two readable files, which the sync report's C10 states as a
+  limitation.

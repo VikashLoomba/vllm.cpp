@@ -17,7 +17,11 @@ configuration.**
 with `row/QWEN4EXP-DECODEDIV-2496`
 ([#2550](https://github.com/mudler/vllm.cpp/pull/2550)), so ONE binary carries
 both #2550's decode fix and this wave's layer fingerprint. Source tarball sha256
-`964f1170c05eac983bfa4344a76d6b45fc74b100b2efd97f7fdf5e2db64f7a27`.
+`964f1170c05eac983bfa4344a76d6b45fc74b100b2efd97f7fdf5e2db64f7a27`. That merge
+is not a landing shape and is not on any row branch, so it is pushed as
+`measure/q4exp-prefilldiv-20260902` for the sole purpose of keeping the sha
+above resolvable: an evidence file whose tree cannot be checked out is a
+citation, not evidence.
 
 **Host.** `thor:gpu0` under an `rc` lease, job
 `814d530c-e742-4706-8ba3-85f39ccb7c31`, pod `rc-worker-n8smh`, aarch64, NVIDIA

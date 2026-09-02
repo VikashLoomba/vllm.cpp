@@ -68,9 +68,25 @@ instead of choosing an arm silently.
 ## Understand fallback behavior
 
 An integrated GPU can use the CPU reference tier when the backend reports
-unified memory. On managed-capable integrated devices, the backend uses
-`hipMallocManaged` and reports `UnifiedMemory() == true`. A missing native
-operation then runs through its CPU implementation.
+unified memory. A missing native operation then runs through its CPU
+implementation.
+
+The backend reports unified memory when it allocates with `hipMallocManaged`,
+or when the device reports `Integrated` and `PageableMemoryAccess` together. It
+allocates with `hipMallocManaged` only on a managed-capable integrated device
+that also reports `PageableMemoryAccess = 1`. A device that reports
+`PageableMemoryAccess = 0` cannot take a recoverable page fault, so a migratable
+allocation on it faults the GPU under load
+([#2511](https://github.com/mudler/vllm.cpp/issues/2511) measured 17 faults in
+21 runs, against 0 in 21 with plain `hipMalloc`).
+
+**Strix Halo (gfx1151) and Radeon 780M (gfx1103) report
+`PageableMemoryAccess = 0`, so they get plain `hipMalloc` and no reference
+tier.** They run a model when ROCm registers every operation the model needs,
+the same rule a discrete card follows. `GetOp` reports an error for a missing
+operation, and on these boards that error also names the attribute, the issue,
+and `VT_ROCM_MANAGED_ALLOC=1`, which restores the previous managed behaviour at
+that risk. See [`ENVIRONMENT.md`](ENVIRONMENT.md) for the knob.
 
 A discrete GPU cannot use the reference tier. The model runs only when ROCm
 registers every operation that the model needs. `GetOp` reports an error for a
@@ -84,14 +100,14 @@ Do not use a run with CPU fallbacks as a performance result.
 | Seam | File | Current state |
 |---|---|---|
 | Device enum | [`include/vt/device.h`](../include/vt/device.h) | Compiled and routed through the shared device switch |
-| Architecture mapping | [`include/vt/rocm/rocm_arch.h`](../include/vt/rocm/rocm_arch.h) | Unit-tested gfx name mapping |
-| Runtime backend | [`src/vt/rocm/rocm_backend.hip`](../src/vt/rocm/rocm_backend.hip) | Runs on five gfx architectures; managed allocation still needs an integrated-board rerun |
+| Architecture mapping | [`include/vt/rocm/rocm_arch.h`](../include/vt/rocm/rocm_arch.h) | Unit-tested gfx name mapping, and the unit-tested allocator/host-addressability policy table |
+| Runtime backend | [`src/vt/rocm/rocm_backend.hip`](../src/vt/rocm/rocm_backend.hip) | Runs on five gfx architectures; managed allocation is measured on gfx1151 and narrowed to devices that can take a recoverable page fault (#2511) |
 | Operation table | [`src/vt/rocm/rocm_ops.hip`](../src/vt/rocm/rocm_ops.hip) | One `Registrar` that names every `OpId` this backend serves natively. Recount it with the command below rather than quoting a number from here |
 | Kernels | [`src/vt/rocm/`](../src/vt/rocm/) | Dense, GDN, attention, sampling, and the contributor-tested Gemma 4 FP8 MoE path |
 | Platform | [`src/vllm/platforms/rocm.cpp`](../src/vllm/platforms/rocm.cpp) | Runtime-verified on five gfx architectures |
 | Attention | [`src/vt/rocm/rocm_paged_attn.hip`](../src/vt/rocm/rocm_paged_attn.hip) | Native paged attention and the SharedK WMMA prefill path |
 | Build | [`CMakeLists.txt`](../CMakeLists.txt) | `VLLM_CPP_HIP` configuration and build verified on five architectures |
-| Tests | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | Runtime cases pass; managed-allocation cases remain pending |
+| Tests | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | Runtime cases pass; the allocation-path case asserts the #2511 coupling on the board it runs on |
 
 Recount registered operations before you quote the total. The scan must not
 depend on where the argument list wraps: several calls in `rocm_ops.hip` break
@@ -113,8 +129,8 @@ regardless of which device it registered for.
 
 | Hardware | Architecture | Memory | Current path |
 |---|---|---|---|
-| Strix Halo | gfx1151 | Unified | Verify managed allocation, then run a small dense model through the reference tier |
-| Radeon 780M | gfx1103 | Shared | Use the same reference-tier path with a smaller model |
+| Strix Halo | gfx1151 | Unified, `PageableMemoryAccess = 0` | Plain `hipMalloc`, no reference tier: run a model whose every operation ROCm registers natively (#2511) |
+| Radeon 780M | gfx1103 | Shared, `PageableMemoryAccess = 0` | Same path as Strix Halo, with a smaller model |
 | Radeon 7900 XTX | gfx1100 | Discrete | Native kernels are required; this class can also host the vLLM ROCm oracle |
 | Radeon R9700 | gfx1201 | Discrete | Contributor-tested Gemma 4 FP8 MoE and SharedK WMMA path |
 | Radeon RX 9060 XT | gfx1200 | Discrete | Gemma 3 1B IT oracle parity; Qwen3 0.6B has a recorded near tie |

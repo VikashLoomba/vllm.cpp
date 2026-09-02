@@ -282,6 +282,16 @@ is a skip wearing a pass and this family has paid for that once already.
 - `kExl3HadR128` registered on Vulkan. The shader exists in this row and the
   wiring is one line; it waits for a caller so nothing lands unreached.
 - The real-checkpoint arm of #2530's slice 1 — see below.
+- A refusal for a PACKED STRIDED input to the Vulkan cast family. `vt::CastF16`
+  and `vt::CastBf16` both tolerate an input whose rows are dense while the row
+  stride spans a parent tensor (the merged-QKV view), and `CastKernel` indexes
+  FLAT from one byte offset, so it would read such an input as contiguous. This
+  is PRE-EXISTING for `kCastBf16` and `kCastF32`, which have been registered on
+  this backend since the W0 skeleton, and V1 inherits it rather than introducing
+  it. It is not widened here and it is not narrowed here: adding a refusal to the
+  one shared kernel would change all three ops' behaviour, which is a different
+  row's decision. `src/vt/ops.cpp` records that the merge is CUDA-only, so no
+  caller reaches it today.
 - A performance number. This row offers none and none is owed by it: the
   reference tier it removes made "slow" the wrong axis, and
   `.agents/benchmarking.md`'s conditions were not met on this box.

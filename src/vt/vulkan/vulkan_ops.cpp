@@ -1621,6 +1621,23 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastKernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastKernel)));
+    // BACKEND-VULKAN-EXL3 V1 (#2530). The THIRD sibling, and the same kernel: the
+    // dtype pair is a specialization constant, `DtypeCode` already maps
+    // DType::kF16 to VT_DT_F16, and vt_common.glsl's f16 codec is an integer
+    // transcription of src/vt/dtype.cpp -- so this registration adds a shader
+    // variant, not a shader. It was missing while its two siblings were present,
+    // which is why an EXL3 checkpoint's f16 activation cast was one of the two
+    // ops S1 measured falling to the portable CPU tier on a Vulkan queue.
+    //
+    // THE SHARED LIMITATION IS NAMED RATHER THAN INHERITED IN SILENCE. `vt::CastF16`
+    // and `vt::CastBf16` both TOLERATE a packed strided input (the merged-QKV view)
+    // whose rows are dense while the row stride spans a parent tensor, and
+    // `CastKernel` above indexes FLAT from one byte offset, so it would read such an
+    // input as contiguous. That is pre-existing for the two siblings and is not
+    // widened here; src/vt/ops.cpp says the merge is CUDA-only, and
+    // .agents/specs/backend-vulkan-exl3.md `## Owed` carries it.
+    RegisterOp(OpId::kCastF16, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<CastF16Fn>(&CastKernel)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<LayerNormFn>(&LayerNormKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kVULKAN,

@@ -115,6 +115,13 @@ void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
 void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
                         const Tensor& suh, const Tensor& svh, Tensor& a_had,
                         const Exl3GemmArgs& args);
+// ROCM-FUSED-NORM-ROPE (rocm_mla_fused_norm_rope.hip, #2564): the MLA
+// norm-rope fold. Registering it is what makes `mla_attention.cpp`'s `fused_nr`
+// predicate true on this backend, and that predicate -- not the op call -- is
+// what a keep-quant MLA checkpoint depends on.
+void FusedNormRopeKernelRocm(Queue& q, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
+                             const Tensor& w, const Tensor& positions, const Tensor& cache,
+                             const RmsNormArgs& norm_args, const RopeArgs& rope_args);
 void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
                                   const Tensor& qgate, const Tensor& kf,
                                   const Tensor& q_norm, const Tensor& k_norm,
@@ -252,6 +259,9 @@ struct Registrar {
                    static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16KernelRocm)));
     RegisterOp(OpId::kExl3Gemm, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<Exl3GemmFn>(&Exl3GemmKernelRocm)));
+    RegisterOp(
+        OpId::kFusedNormRope, DeviceType::kROCM,
+        reinterpret_cast<void*>(static_cast<FusedNormRopeFn>(&FusedNormRopeKernelRocm)));
     RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelRocm)));

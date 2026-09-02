@@ -328,6 +328,12 @@ bool Ltx2FuseLoraIntoTensor(const std::vector<Ltx2LoraAdapter>& adapters,
       // form's is bf16 — the same `vt::Matmul` seam, whose contract already
       // admits "out f32 or bf16, f32 accumulation" (`vt/ops.h`), and not a
       // widening of the landed first-form arm.
+      //
+      // IT COSTS ONE TRANSIENT f32 BUFFER of the target's shape, live only
+      // while this adapter folds in and only on a tensor a previous adapter
+      // already touched. `ltx2_loader.h`'s "one host buffer live at a time"
+      // invariant is about the DEVICE copy and is unaffected; the peak here is
+      // the bf16 aggregator plus this, freed before the next target.
       if (pair->rank > 0 && !agg.empty()) {
         std::vector<float> prod(agg.size(), 0.0F);
         vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};

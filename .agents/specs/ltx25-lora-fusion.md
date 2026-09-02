@@ -34,6 +34,12 @@ written.
 | "ic_lora.py does accept a list" | `ic_lora.py:75` `loras: list[LoraPathStrengthAndSDOps]` | TRUE |
 | "Upstream aggregates them with a SECOND rounding pattern (addmm_ with alpha, fuse_loras.py:115)" | `:115` `aggregated.addmm_(product.b, product.a, alpha=product.strength)` against `:113` `torch.matmul(product.b * product.strength, product.a).to(dtype=dtype)` | TRUE |
 
+Every row of that table was read AGAIN, at the pin, by the second implementer
+after a session limit ended the first one's run, because a table asserting
+"TRUE" is exactly the kind of inherited claim this campaign has found wrong. It
+holds. What did NOT hold on re-reading is §5's claim about the phase scope; that
+section carries the correction.
+
 So the refusal was an honest statement of a real gap, and this row closes the
 gap rather than correcting a false claim. What it did NOT say, and what makes
 the gap bigger than "one pipeline entry point wants a list", is in §2.
@@ -263,15 +269,19 @@ failure wearing a test failure's clothes.
 
 `ResolveLoraSpecs`'s loop changed to `for (int64_t index = 1; index <= 1;
 ++index)` — the `index > 1` arm deleted, which is the production call site for
-everything this row adds. Build exit 0.
+everything this row adds. Re-run at the FINAL head, after the merge with
+`origin/main`, because a mutation proved at a parent commit proves nothing about
+what lands. Build exit 0.
 
 - `test_ltx2_lora`: **17/17, 157 assertions, SUCCESS** — unchanged. A unit suite
   that builds three `Ltx2LoraAdapter`s by hand cannot see that no user can ask
   for three.
-- `test_ltx2_video`: **RED**, "a SECOND IC-LoRA supplied through `lora_path_2`
-  reaches the PIXELS" at `CHECK(differing > 0)`, plus two subcases of the
-  indexed-refusal case. Entry point `LoadVideoEngine` -> `Generate`, no internal
-  header.
+- `test_ltx2_video`: **RED** in three cases — "a SECOND IC-LoRA supplied through
+  `lora_path_2` reaches the PIXELS" at `CHECK(differing > 0)`, two subcases of
+  the indexed-refusal case, and "a SECOND adapter refuses, because stage 1
+  cannot hold a SUBSET" at `REQUIRE_FALSE(message.empty())`, since a load that
+  parses one adapter never reaches §5's guard. Entry point `LoadVideoEngine` ->
+  `Generate`, no internal header.
 
 That difference is the claim. The tree was restored byte-for-byte after each
 mutation (`sha256sum` on both files, before and after).
@@ -299,8 +309,9 @@ mutation (`sha256sum` on both files, before and after).
 ### 8.6 The focused gate
 
 `test_ltx2_lora` 17/17 (157 assertions), `test_ltx2_loader` 41/41 (64246),
-`test_ltx2_video` 112/112 (4925), all exit 0. The video suite includes the two
-record cases this change invalidated and repaired:
+`test_ltx2_video` 112/112 (4931), all exit 0, on the head merged with
+`origin/main`. The video suite includes the two record cases this change
+invalidated and repaired:
 
 - **"every accepted load extra is READ by something"** counted 18 names against
   an inventory of 16. The indexed family is now in `served` with its reader
@@ -312,9 +323,10 @@ record cases this change invalidated and repaired:
   and that gate defines a key's reader as the first mention after the array. The
   refusal and the indexed listing moved ABOVE the array (`RefuseLoraIndexOne`,
   `LoraIndexedListing`) so the gate keeps its meaning, and the anchors were then
-  re-derived from the gate's own printed replacement rather than by arithmetic.
-  They moved to 572/574 because the read itself moved into `ResolveLoraSpecs`,
-  which is a real reader.
+  re-derived from the gate's own printed replacement rather than by arithmetic,
+  TWICE: once before the merge with `origin/main` and again after it moved five
+  of them. Two anchors are now 572/574 because the read itself moved into
+  `ResolveLoraSpecs`, which is a real reader.
 
 `scripts/agent-preflight.sh` exits 0 with every checker `ok` and two SKIPs that
 need `--compile-commands`, which preflight does not supply.

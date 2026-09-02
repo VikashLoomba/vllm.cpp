@@ -2419,6 +2419,137 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
   }
 }
 
+// Issue #2511: the keep-quant Q6_K arm at the launch geometry PRODUCTION uses.
+//
+// The gate above runs kMatmulBTQuant at M=3, N=8, K=512 -- nsb = 2 and a grid
+// of ceil(3*8/4) = 6 blocks. Every failing leg on `strix:gpu0` (gfx1151, ROCm
+// 7.2.4) died inside `KQuantGemmK<unsigned short, 2>` launched at m = 5,
+// n = 5120, nsb = 68: 6400 blocks and 34x the superblocks, with a bf16 output
+// (`OutT == uint16_t`), which is a DIFFERENT template instantiation from the f32
+// one the case above exercises. That gate therefore tests the kernel's
+// ARITHMETIC and has never tested its LAUNCH, which is why a green ROCm suite
+// coexisted with a board that page-faults on one prefill forward pass.
+//
+// This case closes exactly that gap. It is deliberately NOT a second arithmetic
+// check: the oracle runs on a 64-column SLICE of the same weight buffer (output
+// column j reads only weight row j, so the slice is exact, not an
+// approximation), and the launch itself runs at the full production width,
+// repeatedly, because the defect it guards is intermittent.
+TEST_CASE("keep-quant Q6_K GEMM runs at the production launch geometry") {
+  // m/n/nsb read off the AMD_LOG_LEVEL=4 dump in #2511: grid {6400,1,1},
+  // block {32,4,1}, nsb = 68, w_row_bytes = 14280, weight obj = 73,113,600 B.
+  constexpr int64_t M = 5, N = 5120, K = 17408;
+  constexpr int64_t kRefCols = 64;
+  constexpr int64_t kBlockBytes = 210;  // sizeof(BlockQ6_K)
+  constexpr int kDOff = 208;            // the superblock scale's byte offset
+  // The fault is intermittent (6 of 6 legs at one shape, 6 of 8 at another), so
+  // one launch is not a measurement. VT_TEST_Q6K_LAUNCHES raises it for a
+  // deliberate soak without editing this file.
+  const int64_t launches = [] {
+    const char* e = std::getenv("VT_TEST_Q6K_LAUNCHES");
+    const long v = e != nullptr ? std::strtol(e, nullptr, 10) : 0;
+    return v > 0 ? static_cast<int64_t>(v) : static_cast<int64_t>(8);
+  }();
+  CAPTURE(launches);
+
+  const int64_t blocks_per_row = K / 256;
+  const size_t row_bytes = static_cast<size_t>(blocks_per_row) * kBlockBytes;
+  const size_t wn = static_cast<size_t>(N) * row_bytes;
+  REQUIRE(blocks_per_row == 68);
+  REQUIRE(row_bytes == 14280u);
+  REQUIRE(wn == 73113600u);
+
+  std::mt19937 rng(2511);
+  std::vector<uint8_t> wt(wn);
+  for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (int64_t r = 0; r < N; ++r)
+    for (int64_t bIdx = 0; bIdx < blocks_per_row; ++bIdx) {
+      uint8_t* blk = wt.data() + r * row_bytes + bIdx * kBlockBytes;
+      const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+      const uint16_t h = vt::F32ToF16(0.0125f * jitter);
+      std::memcpy(blk + kDOff, &h, 2);
+    }
+
+  const size_t an = static_cast<size_t>(M) * K;
+  const std::vector<float> act = RandomVec(an, 2512, -0.5f, 0.5f);
+
+  // Oracle on the first kRefCols columns only. Output column j depends solely on
+  // weight row j, so this is the exact answer for those columns rather than a
+  // sampled one -- and it costs 1/80th of the full-width CPU reference.
+  std::vector<float> ref(static_cast<size_t>(M) * kRefCols, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ca = act;
+    std::vector<uint8_t> cw(wt.begin(), wt.begin() + static_cast<size_t>(kRefCols) * row_bytes);
+    Tensor tout = T2(ref.data(), cd, M, kRefCols);
+    Tensor tact = T2(ca.data(), cd, M, K);
+    Tensor twt = Tensor::Contiguous(cw.data(), vt::DType::kQ6_K, cd, {kRefCols, K});
+    vt::MatmulBTQuant(cq, tout, tact, twt);
+    cpu.DestroyQueue(cq);
+  }
+
+  const bool any_rocm = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (any_rocm) {
+    REQUIRE_MESSAGE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM),
+                    "kMatmulBTQuant must be registered on ROCm");
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    // The CPU arm is skipped on purpose: comparing the reference against itself
+    // proves nothing about a LAUNCH, and a full-width CPU pass is 445M scalar
+    // MACs on every CI run for that non-result.
+    if (dt == DeviceType::kCPU) continue;
+    if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf da(dev, q, an);
+    DevBufBytes dwt(dev, q, wn);
+    // bf16 out, because that is the OutT == uint16_t instantiation the model
+    // path launches and the one every #2511 leg died inside.
+    DevBufBytes dout(dev, q, static_cast<size_t>(M) * N * sizeof(uint16_t));
+    da.Upload(act);
+    dwt.Upload(wt.data());
+    Tensor tact = T2(da.ptr(), d, M, K);
+    Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kQ6_K, d, {N, K});
+    Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+
+    std::vector<uint16_t> got(static_cast<size_t>(M) * N, 0);
+    std::vector<uint16_t> firstrun;
+    for (int64_t it = 0; it < launches; ++it) {
+      CAPTURE(it);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      dev.Synchronize(q);
+      dout.Download(got.data());
+      if (it == 0) {
+        firstrun = got;
+        // A launch that wrote nothing would otherwise pass every check below.
+        int64_t nonzero = 0;
+        for (uint16_t v : got) nonzero += (v != 0) ? 1 : 0;
+        CHECK(nonzero > 0);
+        std::vector<float> gotf(static_cast<size_t>(M) * kRefCols, 0.0f);
+        for (int64_t i = 0; i < M; ++i)
+          for (int64_t j = 0; j < kRefCols; ++j)
+            gotf[i * kRefCols + j] = vt::BF16ToF32(got[i * N + j]);
+        CHECK(Nmse(ref, gotf) <= kNmseTol);
+      } else {
+        // Same inputs, same kernel: the bytes must repeat exactly. A drift here
+        // is the silent half of this defect -- a launch that did not fault but
+        // read state it did not own.
+        CHECK(std::memcmp(firstrun.data(), got.data(),
+                          got.size() * sizeof(uint16_t)) == 0);
+      }
+    }
+    dev.DestroyQueue(q);
+  }
+}
+
 #if defined(VLLM_CPP_HIP)
 // Declared here rather than included: the ROCm kernels have no public header,
 // and src/vt/rocm/rocm_ops.hip:65 already reaches MatmulBTQuantKernelRocm by a

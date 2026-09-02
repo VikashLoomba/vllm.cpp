@@ -76,22 +76,31 @@ else:
 
 The first is landed and gated. The second was NOT transcribed: three candidate
 models of `addmm_` on a bf16 aggregator were run against the pinned module
-itself, executed at `fd4ded7f` with `torch 2.11.0+cu130`:
+itself, executed at `fd4ded7f` with `torch 2.11.0+cu130`. The probe was RE-RUN
+independently after a session limit killed the first implementer, and this table
+is the re-run's numbers, not the inherited ones:
 
 | model | rule | matches upstream |
 |---|---|---|
-| **A** | `bf16( f32(agg) + strength * f32_accumulated(B @ A) )` | **YES** |
-| B | the product ROUNDED to bf16 before the strength is applied | no — differed on 3 of 20 elements |
-| C | `strength * product` rounded to bf16 before the add | no — differed on 2 of 20 elements |
+| **A** | `bf16( f32(agg) + strength * f32_accumulated(B @ A) )` | **YES** — 49 of 49 trials |
+| B | the product ROUNDED to bf16 before the strength is applied | no — failed 47 of 49 trials; 18 of 120 elements on this row's own fixture |
+| C | `strength * product` rounded to bf16 before the add | no — failed 45 of 49 trials; 21 of 120 elements on this row's own fixture |
 
-Model A held byte-for-byte over 40 randomized trials with 2 to 4 adapters and
-`M`, `K`, `N` drawn from 1 to 8, and over `K` in {16, 64, 256, 1024} at
-`M = N = 3`. **The distinguishing fact is that no bf16 rounding sits between the
-GEMM and the strength.** The first form rounds `B * strength` to bf16 BEFORE its
-matmul; the second applies `alpha` to an f32 accumulation and rounds ONCE, at
-the store. A port that reused the first form's pre-scaling for the second would
-be wrong in a way no tolerance-based gate would report, which is why B and C are
-recorded here with the element counts that separate them.
+The 49 trials are 40 randomized ones with 2 to 4 adapters and `M`, `K`, `N`
+drawn from 1 to 8, plus `K` in {16, 64, 256, 1024, 4096} at `M = N = 3` and `K`
+in {16, 64, 256, 1024} at `M = 6`, `N = 20`. `K` is the LoRA RANK here — `B` is
+`[out, rank]` and `A` is `[rank, in]` — so 4096 is already an order of magnitude
+past any published adapter, which is the reach a golden of rank 3 does not have
+on its own.
+
+**The distinguishing fact is that no bf16 rounding sits between the GEMM and the
+strength.** The first form rounds `B * strength` to bf16 BEFORE its matmul; the
+second applies `alpha` to an f32 accumulation and rounds ONCE, at the store. A
+port that reused the first form's pre-scaling for the second would be wrong in a
+way no tolerance-based gate would report, which is why B and C are recorded here
+with the element counts that separate them. Substituting model B into the fuser
+reds the golden at exactly 18 of 120, which is the probe's own number arriving
+from the other side.
 
 `vt::Matmul`'s contract already admits the shape this needs: "a/b float dtypes
 (f32/f16/bf16), out **f32** or bf16, f32 accumulation" (`vt/ops.h`). So the
@@ -113,6 +122,9 @@ added.
   `args.py:600-611`.
 - The header and comment statements that assert the cap: `ltx2_lora.h`,
   `ltx2_loader.h`, `ltx2_pipeline.h`, `ltx2_loader.cpp`, `ltx2_pipeline.cpp`.
+- The refusal §5 obliges: N > 1 adapters on a recipe with a `kNoAdapters`
+  phase, refused at load by name. Lifting the cap is what makes that arm
+  reachable, so refusing it is part of the same change and not a later sweep.
 - `docs/FEATURES.md`, one row.
 
 **Out.**
@@ -146,24 +158,44 @@ be ambiguous, are byte-compatible with every existing caller, and make a gap
 This is a transport decision and not a mirrored behaviour: upstream's transport
 is `argparse`, which this ABI is not.
 
-## 5. `Ltx2PhaseLoraScope` stays two-valued, and its stated reason changes
+## 5. `Ltx2PhaseLoraScope` stays two-valued, and the LOAD refuses what it cannot say
 
-`ltx2_pipeline.h` argues that `kAllAdapters` / `kNoAdapters` is the COMPLETE
+`ltx2_pipeline.h` argued that `kAllAdapters` / `kNoAdapters` is the COMPLETE
 space because "`Ltx2ResolveLoraReferenceFactors` refuses more than one adapter
 by name ... so the powerset of the load's adapters has exactly two members".
-**That argument dies with this row and the conclusion survives it.** Read at the
-pin, no upstream recipe scopes a PROPER SUBSET of its adapters to a phase:
+**That argument dies with this row and the conclusion does NOT survive it.**
 
-- `dfr_pipeline.py:212` gives `(*user, *distilled)` to the one stage both
-  phases share — all, on both.
-- `ic_lora.py:108` against `:119` — all on stage 1, none on stage 2.
-- `a2vid_two_stage.py:107` against `:114`, `ti2vid_two_stages.py:140` against
-  `:151`, `ti2vid_two_stages_hq.py:154` against `:165` — the same two states.
+The first draft of this spec claimed the conclusion survived, on the ground that
+no upstream recipe scopes a proper subset of its adapters to a phase. **Read at
+the pin, that is false, and the anchors it cited are the ones that falsify it:**
 
-What `ti2vid_two_stages_hq.py` varies per stage is the STRENGTH (0.25 at
-`:92-96`, 0.5 at `:97-101`), not the membership, and that is #1144. So the
-comment is rewritten onto the reason that is still true, rather than left
-asserting a cap that no longer exists.
+| recipe | stage 1 | stage 2 |
+|---|---|---|
+| `a2vid_two_stage.py` | `loras=tuple(loras)` (`:107`) | `(*tuple(loras), *tuple(distilled_lora))` (`:114`, taken `:116`) |
+| `ti2vid_two_stages.py` | `loras=tuple(loras)` (`:140`) | `(*tuple(loras), *distilled_lora)` (`:151`) |
+| `ic_lora.py` | `loras=tuple(loras)` (`:108`) | `loras=()` (`:119`) |
+| `dfr_pipeline.py` | `(*user, *distilled)` on the one stage both phases share (`:212`, `:217`) | — |
+
+The first two hand stage 1 the USER adapters and stage 2 those PLUS the
+distilled one. That is a proper subset. It stayed invisible only because the
+arity cap made `tuple(loras)` necessarily EMPTY: this engine's single
+`lora_path` extra IS the `distilled_lora` those recipes demand, so `kNoAdapters`
+on stage 1 was exact for a one-adapter load. **Lifting the cap makes the wrong
+arm expressible**, and this engine cannot run it — it holds one resident DiT,
+`Ltx2RebindDitLoras` takes a BOOLEAN, and no load extra says which of the N is
+the distilled one.
+
+**So the load refuses it by name** (`ltx2_video.cpp`, keyed on the phase scope
+and not on `requires_distilled_lora`, because the scope is the thing that cannot
+be represented). Three shipped recipes carry a `kNoAdapters` phase —
+`a2vid_two_stage`, `ti2vid_two_stage`, `keyframe_interpolation` — and on those a
+second adapter refuses. Every recipe whose phases all run fused, `dfr` included,
+takes N. The enum stays two-valued because a third value would name a state
+nothing could execute; the arm is listed under `## Owed` below.
+
+What `ti2vid_two_stages_hq.py:154` against `:165` varies per stage is the
+STRENGTH (0.25 at `:92-96`, 0.5 at `:97-101`), not the membership, and that is
+#1144.
 
 ## 6. Risks
 
@@ -192,16 +224,100 @@ cmake --build build --target test_ltx2_lora test_ltx2_video test_ltx2_loader -j 
 python3 scripts/agent-integration.py --base origin/main
 ```
 
-## 8. Evidence required
+## 8. Evidence
 
-- The three-model probe of §3 against the pinned module, with the element counts
-  that separate A from B and C.
-- Red-before on the N-adapter golden with the second form unimplemented.
-- **The reachability mutation**: delete the `lora_path_2` parse in
-  `ltx2_video.cpp` and confirm the new `test_ltx2_video` case REDs while every
-  `test_ltx2_lora` case stays green. That difference is the whole claim — a unit
-  suite that builds two `Ltx2LoraAdapter`s by hand measures the class.
-- What the goldens do NOT cover, stated.
+Measured on this row's branch, CPU only. `cmake -S . -B <build> -G Ninja
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF` (no `CMAKE_BUILD_TYPE`, so no
+`NDEBUG`), `-j 4`.
+
+### 8.1 The golden, re-derived
+
+`aggregate_lora_products` + `bf16_fuse_rule` imported from
+`/home/mudler/_git/LTX-2/packages/ltx-core/src` at `fd4ded7f` (clean tree),
+torch `2.11.0+cu130`, and run on the same bf16 inputs the case builds
+(`Spread` reimplemented as the same Numerical Recipes LCG). The 120 bit
+patterns it printed are byte-for-byte the `want` array in
+`test_ltx2_lora.cpp` — re-derived independently after the first implementer's
+session ended, not inherited.
+
+### 8.2 The three-model probe
+
+Re-run: 49 trials, model A matched on all 49, B failed 47 and C failed 45. §3
+carries the table. On this row's own fixture B differs from upstream on 18 of
+120 elements and C on 21 of 120; the plausible wrong port that reuses the FIRST
+product form for every adapter differs on 26 of 120, which is the number
+`test_ltx2_lora` asserts.
+
+### 8.3 Red-before, three of them
+
+| mutation | result |
+|---|---|
+| the fuser at its parent commit (both refusals in place) | `test_ltx2_lora` 15/17, the two new cases RED on "exactly ONE adapter" and on the `addmm_` refusal by name |
+| model B substituted into the second form (`alpha * bf16(prod[i])`) | `test_ltx2_lora` 16/17, the golden RED at `mismatched == 18`, which is §8.2's own separation count arriving from the other side |
+| the §5 guard disabled (`&& false`) | `test_ltx2_video` "a SECOND adapter refuses, because stage 1 cannot hold a SUBSET" RED at `REQUIRE_FALSE(message.empty())` — the load ACCEPTED two adapters on `a2vid_two_stage` and would have rendered |
+
+Every mutation build exited 0 before its suite ran, so no red above is a build
+failure wearing a test failure's clothes.
+
+### 8.4 The reachability mutation
+
+`ResolveLoraSpecs`'s loop changed to `for (int64_t index = 1; index <= 1;
+++index)` — the `index > 1` arm deleted, which is the production call site for
+everything this row adds. Build exit 0.
+
+- `test_ltx2_lora`: **17/17, 157 assertions, SUCCESS** — unchanged. A unit suite
+  that builds three `Ltx2LoraAdapter`s by hand cannot see that no user can ask
+  for three.
+- `test_ltx2_video`: **RED**, "a SECOND IC-LoRA supplied through `lora_path_2`
+  reaches the PIXELS" at `CHECK(differing > 0)`, plus two subcases of the
+  indexed-refusal case. Entry point `LoadVideoEngine` -> `Generate`, no internal
+  header.
+
+That difference is the claim. The tree was restored byte-for-byte after each
+mutation (`sha256sum` on both files, before and after).
+
+### 8.5 What the goldens do NOT cover
+
+- **Torch's GEMM reduction order at production shapes.** Model A is a strictly
+  sequential f32 accumulation along `K`, which is what `vt::Matmul`'s CPU kernel
+  does. Against the pinned module it is exact at every shape the golden and the
+  probe reach. At full DiT shapes it is not: `M=2048 K=64 N=2048` differs on 42
+  of 4194304 elements, `M=4096 K=128 N=1024` on 58 of 4194304, `M=1152 K=32
+  N=4608` on 32 of 5308416. **This is not something this row introduced.** The
+  landed and gated FIRST form has the same property on the same shapes — 25 and
+  51 of 4194304 on the first two — because it is torch's blocked bf16 GEMM
+  rounding differently from a sequential reduction, not a difference between the
+  two product forms. Stated here because a reader of the byte-equality claim
+  would otherwise read it as reaching further than it does.
+- **A tensor targeted by more than three adapters.** The golden has three; the
+  probe reaches four. Nothing gates 5+, and the loop is uniform past the first.
+- **The device arm.** The fusion is host-side by construction (§9), so no
+  golden here says anything about a fused weight after the device copy.
+- **Real adapter files.** `WriteAdapter` and `WriteFixtureLora` build the
+  safetensors; no published multi-adapter LTX-2.5 recipe was run.
+
+### 8.6 The focused gate
+
+`test_ltx2_lora` 17/17 (157 assertions), `test_ltx2_loader` 41/41 (64246),
+`test_ltx2_video` 112/112 (4925), all exit 0. The video suite includes the two
+record cases this change invalidated and repaired:
+
+- **"every accepted load extra is READ by something"** counted 18 names against
+  an inventory of 16. The indexed family is now in `served` with its reader
+  (`ResolveLoraSpecs`) named, which is what that gate's own failure message asks
+  for.
+- **"the recorded reader anchors are the ones in the source"** derived
+  `lora_path` and `lora_strength` to the SAME line, because the `..._1` by-name
+  refusal named both tokens between `kKnownLoadExtras[]` and the real readers,
+  and that gate defines a key's reader as the first mention after the array. The
+  refusal and the indexed listing moved ABOVE the array (`RefuseLoraIndexOne`,
+  `LoraIndexedListing`) so the gate keeps its meaning, and the anchors were then
+  re-derived from the gate's own printed replacement rather than by arithmetic.
+  They moved to 572/574 because the read itself moved into `ResolveLoraSpecs`,
+  which is a real reader.
+
+`scripts/agent-preflight.sh` exits 0 with every checker `ok` and two SKIPs that
+need `--compile-commands`, which preflight does not supply.
 
 ## 9. Stop conditions
 
@@ -211,8 +327,21 @@ python3 scripts/agent-integration.py --base origin/main
 - Do not use the GPU. This row is CPU-only by construction: the fusion runs on
   the host before the device copy.
 
+## Owed
+
+- **N adapters on a recipe with a `kNoAdapters` phase.** `a2vid_two_stage`,
+  `ti2vid_two_stage` and `keyframe_interpolation` need stage 1 to carry the USER
+  adapters and not the distilled one (`a2vid_two_stage.py:107` against `:114`),
+  which is a proper subset this engine cannot hold: one resident DiT,
+  `Ltx2RebindDitLoras` is a boolean, and no load extra says which adapter is the
+  distilled one. Refused by name at load (§5). Closing it needs a third
+  `Ltx2PhaseLoraScope` value, a per-phase adapter selection in
+  `Ltx2RebindDitLoras`, and a load extra that identifies the distilled adapter.
+
 ## Now
 
 `ACTIVE` — N-adapter fusion implemented, gated against the executed pinned
-module, and reachable through the `lora_path_N` load extras and repeated
-`ltx2_gen --lora`.
+module, and reachable through the `lora_path_<n>` load extras and repeated
+`ltx2_gen --lora`. The one arm lifting the cap made expressible and this engine
+cannot run — a second adapter on a recipe with a `kNoAdapters` phase — refuses by
+name and is listed under `## Owed`.

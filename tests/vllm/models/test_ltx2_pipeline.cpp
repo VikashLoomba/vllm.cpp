@@ -1299,7 +1299,7 @@ TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
   //
   // REACHABLE REFUSALS: a product path constructs the condition, so a caller can
   // trip this. ONE of the five is, not two. The engine reaches
-  // `ltx2_upsampler.cpp:465` through `Ltx2UpsampleVideoLatent`, which
+  // `ltx2_upsampler.cpp:497` through `Ltx2UpsampleVideoLatent`, which
   // `ltx2_video.cpp` calls when a phase asks for the spatial-upsample transform.
   //
   // `kBetaScheduler` USED TO BE LISTED HERE and is not reachable. Its call site
@@ -1432,8 +1432,8 @@ TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
 // enumerator that appears in `src/` proves only that the compiler can see it.
 // So the check is on the ENTRY FUNCTION of each arm's chain:
 //
-//   kSpatiotemporalUpsampler  `Ltx2LatentUpsample` (ltx2_upsampler.cpp:465)
-//                             <- `Ltx2UpsampleVideoLatent` (:566)
+//   kSpatiotemporalUpsampler  `Ltx2LatentUpsample` (ltx2_upsampler.cpp:497)
+//                             <- `Ltx2UpsampleVideoLatent` (:681)
 //                             <- `ltx2_video.cpp`, the phase that upsamples
 //   kBetaScheduler            `Ltx2Schedule` (ltx2_pipeline.cpp:199)
 //                             <- NOTHING
@@ -1573,7 +1573,7 @@ TEST_CASE("ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable")
   const std::string doc = buf.str();
   REQUIRE(doc.size() > 1000);
 
-  // The ONE arm with a product call site: `ltx2_upsampler.cpp:465` constructs the
+  // The ONE arm with a product call site: `ltx2_upsampler.cpp:497` constructs the
   // SPATIOTEMPORAL upsampler condition, and `ltx2_video.cpp` reaches it through
   // `Ltx2UpsampleVideoLatent`. Named by the word the doc uses for it, since that
   // is what a reader sees.
@@ -1950,6 +1950,39 @@ vllm::Ltx2LatentVolume TemporalUpsamplerLatent() {
   return latent;
 }
 
+
+// `dims=2` (model.py:47) — `conv = torch.nn.Conv2d if dims == 2 else Conv3d`,
+// which reaches `initial_conv`, both ResBlock stacks and `final_conv`. The
+// `upsampler` branch (:55-72) does NOT read `dims`, so the flags stay at the
+// shipped default and this arm differs from `PixelShuffle` above in kernel RANK
+// and in the GroupNorm reduction, nothing else.
+vllm::Ltx2UpsamplerConfig Dims2UpsamplerConfig(const std::string& prefix) {
+  vllm::Ltx2UpsamplerConfig config;
+  config.in_channels = vllm_test::kLtx2UpsInChannels;
+  config.mid_channels = vllm_test::kLtx2UpsMidChannels;
+  config.num_blocks_per_stage = vllm_test::kLtx2UpsBlocksPerStage;
+  config.dims = 2;
+  config.spatial_upsample = true;
+  config.temporal_upsample = false;
+  config.spatial_scale = 2.0;
+  config.rational_resampler = false;
+  config.prefix = prefix;
+  return config;
+}
+
+// 3 frames, so the folded axis differs from H (4) and W (6) and a fold that
+// dropped or transposed it cannot pass by coincidence.
+vllm::Ltx2LatentVolume Dims2UpsamplerLatent() {
+  vllm::Ltx2LatentVolume latent;
+  latent.batch = 1;
+  latent.channels = vllm_test::kLtx2UpsInChannels;
+  latent.frames = vllm_test::kLtx2UpsDims2Frames;
+  latent.height = vllm_test::kLtx2UpsHeight;
+  latent.width = vllm_test::kLtx2UpsWidth;
+  latent.data = Make("ltx2.ups.dims2.latent", latent.elems(), 1.0);
+  return latent;
+}
+
 }  // namespace
 
 TEST_CASE("ltx2 the constants the headers call pinned are actually pinned") {
@@ -1968,7 +2001,7 @@ TEST_CASE("ltx2 the constants the headers call pinned are actually pinned") {
   //     the argument does not make the default unreachable — the default IS the
   //     shipped width, which ltx2_upsampler.h has said all along. Only the
   //     Rational1p5 arm reaches it, because `BlurDownsample` runs on the
-  //     rational `den` (ltx2_upsampler.cpp:439) and 1.5 -> {3, 2} is the only
+  //     rational `den` (ltx2_upsampler.cpp:599) and 1.5 -> {3, 2} is the only
   //     one of the THREE ARMS with den != 1. (0.75 -> {3, 4} would reach it too
   //     and no arm covers it, so this is arm coverage, not a property of the
   //     supported-scale map.)
@@ -2106,6 +2139,78 @@ TEST_CASE("ltx2 the latent temporal upsampler reproduces upstream") {
   CHECK(vllm::kLtx2UpsamplerTemporalFactor == vllm_test::kLtx2UpsTemporalFactor);
 }
 
+TEST_CASE("ltx2 the latent upsampler reproduces upstream on the dims=2 arm") {
+  // model.py:47 picks Conv2d over Conv3d, and :85-100 folds the frame axis into
+  // the BATCH before running the whole stack and unfolding at :100. Two things
+  // follow and this case is aimed at exactly those two.
+  const vllm::Ltx2UpsamplerConfig config = Dims2UpsamplerConfig("ltx2.ups.Dims2.");
+  const ParamBag bag = BuildUpsamplerParams(config);
+
+  // THE PARAMETER CONTRACT FIRST, and it is the stronger half of this gate.
+  // Four groups are 4-D here where every dims=3 arm builds them 5-D:
+  // `initial_conv` is [mid, in, 3, 3] = 1728 against [mid, in, 3, 3, 3] = 5184,
+  // and each ResBlock conv is [mid, mid, 3, 3] = 9216 against 27648. A port that
+  // reused the 3-D enumeration dies HERE, before a single value is compared.
+  CheckManifest(bag, vllm_test::kLtx2UpsDims2ParamNames, vllm_test::kLtx2UpsDims2ParamCounts,
+                std::size(vllm_test::kLtx2UpsDims2ParamNames));
+  // `upsampler.0.weight` is the ONE conv that does not move: the upsampler
+  // branch never reads `dims`, so it is a Conv2d in the dims=3 spatial arm too.
+  CHECK(bag.weights.Get("ltx2.ups.Dims2.upsampler.0.weight").size() ==
+        static_cast<size_t>(4 * vllm_test::kLtx2UpsMidChannels * vllm_test::kLtx2UpsMidChannels *
+                            3 * 3));
+
+  const vllm::Ltx2LatentVolume latent = Dims2UpsamplerLatent();
+  const vllm::Ltx2LatentVolume got = vllm::Ltx2LatentUpsample(config, bag.weights, latent);
+  CHECK(got.batch == vllm_test::kLtx2UpsDims2OutShape[0]);
+  CHECK(got.channels == vllm_test::kLtx2UpsDims2OutShape[1]);
+  // THE FRAME COUNT COMES BACK UNCHANGED. This is the property that makes the
+  // arm consumable rather than merely computed: both spatial call sites in
+  // ltx2_video.cpp require it (`vshape.frames` at :3525-3531 and
+  // `slot_positions.size()` at :3552-3563).
+  CHECK(got.frames == vllm_test::kLtx2UpsDims2OutShape[2]);
+  CHECK(got.frames == latent.frames);
+  CHECK(got.height == vllm_test::kLtx2UpsDims2OutShape[3]);
+  CHECK(got.width == vllm_test::kLtx2UpsDims2OutShape[4]);
+
+  const double worst =
+      MaxAbsDiff(got.data, vllm_test::kLtx2UpsDims2Golden, std::size(vllm_test::kLtx2UpsDims2Golden));
+  INFO("LatentUpsampler arm = Dims2 max|diff| = ", worst);
+  CHECK(worst <= kRoundOff);
+
+  // THE GROUPNORM REDUCTION, isolated. `(b f)` makes every frame its own sample,
+  // so the statistics run over (channels_per_group, H, W) and NOT over the clip.
+  // With mid_channels = 32 and GroupNorm(32, ...) there is one channel per group,
+  // so the two reductions genuinely differ; running the dims=3 statistic here
+  // returns a correctly shaped, finite, plausible latent that is wrong in every
+  // element, which is why the value golden above — not a shape check — is what
+  // holds this down. Asserted as a PROPERTY too: a per-frame normaliser cannot
+  // make the arm's output depend on frames it was not shown, so upsampling the
+  // middle frame ALONE must reproduce that frame's slice of the full result.
+  vllm::Ltx2LatentVolume one = latent;
+  one.frames = 1;
+  const int64_t plane = latent.height * latent.width;
+  one.data.assign(static_cast<size_t>(latent.channels) * static_cast<size_t>(plane), 0.0f);
+  for (int64_t c = 0; c < latent.channels; ++c) {
+    for (int64_t i = 0; i < plane; ++i) {
+      one.data[static_cast<size_t>(c * plane + i)] =
+          latent.data[static_cast<size_t>((c * latent.frames + 1) * plane + i)];
+    }
+  }
+  const vllm::Ltx2LatentVolume got_one = vllm::Ltx2LatentUpsample(config, bag.weights, one);
+  REQUIRE(got_one.frames == 1);
+  const int64_t out_plane = got.height * got.width;
+  double worst_slice = 0.0;
+  for (int64_t c = 0; c < got.channels; ++c) {
+    for (int64_t i = 0; i < out_plane; ++i) {
+      const double a = got.data[static_cast<size_t>((c * got.frames + 1) * out_plane + i)];
+      const double b = got_one.data[static_cast<size_t>(c * out_plane + i)];
+      worst_slice = std::max(worst_slice, std::fabs(a - b));
+    }
+  }
+  INFO("dims=2 per-frame independence max|diff| = ", worst_slice);
+  CHECK(worst_slice <= kRoundOff);
+}
+
 TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   const vllm::Ltx2LatentVolume latent = ReducedUpsamplerLatent();
   const ParamBag bag = BuildUpsamplerParams(ReducedUpsamplerConfig(false, 2.0, "ltx2.ups.x."));
@@ -2131,16 +2236,95 @@ TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   CHECK(Mentions(spatiotemporal_message, "temporal"));
   CHECK(Mentions(spatiotemporal_message, "PixelShuffleND(3)"));
 
-  vllm::Ltx2UpsamplerConfig two_d = ReducedUpsamplerConfig(false, 2.0, "");
-  two_d.dims = 2;
-  CHECK(Mentions(refuse("dims=2", two_d), "dims"));
-
-  // dims=2 is refused for the TEMPORAL arm too, and it has to be checked
-  // separately: the two arms take different branches, so a `dims` guard placed
-  // inside the spatial branch would let a 2-D temporal config through.
+  // `dims=2` is NO LONGER refused — it is ported, and "reproduces upstream on
+  // the dims=2 arm" above gates it against the executed module. What survives
+  // here is the one 2-D combination upstream itself cannot run: the temporal
+  // upsampler is a Conv3d (model.py:68-71) and the dims=2 forward (:85-100)
+  // folds the frame axis into the batch before reaching it.
+  //
+  // NOT "torch raises on the rank", which is what this paragraph used to say and
+  // what `ltx2_upsampler.cpp` and `ltx2_upsampler.h` were corrected to stop
+  // saying. `Conv3d` accepts a 4-D input as an UNBATCHED 5-D one, so the folded
+  // `(b*f, c, h, w)` is read as `(C, D, H, W)` and the CHANNEL count is what
+  // disagrees; at `frames == mid_channels` that Conv3d would pass and
+  // `PixelShuffleND(1)`'s einops pattern fails instead. Two mechanisms behind
+  // one shape coincidence, which is why the port refuses the configuration by
+  // NAME rather than by either of them. `scripts/gen-ltx2-pipeline-goldens.py`
+  // runs both contradictions through the real module and asserts the message.
+  //
+  // Checked through the TEMPORAL config specifically, because the two arms take
+  // different branches and a guard placed inside one of them would let the other
+  // through.
   vllm::Ltx2UpsamplerConfig temporal_two_d = TemporalUpsamplerConfig("");
   temporal_two_d.dims = 2;
-  CHECK(Mentions(refuse("temporal dims=2", temporal_two_d), "dims"));
+  const std::string two_d_message = refuse("temporal dims=2", temporal_two_d);
+  CHECK(Mentions(two_d_message, "dims=2 with temporal_upsample=true"));
+  // NOT the retired "is not ported" refusal, which is the whole point of the
+  // change: a caller who supplies an ordinary 2-D spatial checkpoint must now be
+  // served, and only this contradiction refused.
+  CHECK(two_d_message.find("is not ported") == std::string::npos);
+
+  // THE EIGHTH CELL, where the two dims=2 contradictions are BOTH set and only
+  // one of them is upstream's. `__init__` is an if/elif chain: with
+  // `spatial_upsample` false, `elif temporal_upsample` (model.py:68) builds the
+  // Conv3d and never reads `rational_resampler`, so this config owns no
+  // SpatialRationalResampler at all. Refusing it while naming a module upstream
+  // did not construct sends the caller to the wrong flag.
+  //
+  // This asserts the MESSAGE, not the polarity, because the polarity cannot see
+  // the defect: the config is refused whichever `Require` fires first. Swapping
+  // the two back in `ltx2_upsampler.cpp` leaves every other case green and reds
+  // exactly these two lines.
+  vllm::Ltx2UpsamplerConfig temporal_and_rational = TemporalUpsamplerConfig("");
+  temporal_and_rational.dims = 2;
+  temporal_and_rational.rational_resampler = true;
+  const std::string both_message = refuse("temporal+rational dims=2", temporal_and_rational);
+  CHECK(Mentions(both_message, "dims=2 with temporal_upsample=true"));
+  CHECK(both_message.find("rational_resampler=true") == std::string::npos);
+
+  // THE SIBLING OF THE GUARD ABOVE, and the one this row first shipped without.
+  // `dims=2` with the RATIONAL resampler is upstream's OTHER 2-D contradiction:
+  // `SpatialRationalResampler.forward` opens with `b, _, f, _, _ = x.shape`
+  // (model/upsampler/spatial_rational_resampler.py:41), and the dims=2 forward
+  // reaches it at model.py:94 having ALREADY folded the frame axis into the
+  // batch at :86. Upstream raises
+  // `ValueError: not enough values to unpack (expected 5, got 4)` — the same
+  // mechanism as the temporal case, one line further in.
+  //
+  // Driven with its OWN correctly enumerated weights, because that is the whole
+  // point: every operator inside the rational branch is already per-frame, so a
+  // one-frame volume satisfies all of them and this config computes a complete,
+  // finite, plausible latent that upstream cannot produce. No shape check
+  // anywhere can see it. Only a refusal can.
+  vllm::Ltx2UpsamplerConfig rational_two_d = ReducedUpsamplerConfig(true, 2.0, "ltx2.ups.r2.");
+  rational_two_d.dims = 2;
+  const ParamBag rational_bag = BuildUpsamplerParams(rational_two_d);
+  const std::string rational_two_d_message = RefusalMessage(
+      [&] { (void)vllm::Ltx2LatentUpsample(rational_two_d, rational_bag.weights, latent); });
+  INFO("arm = rational dims=2 refusal = ", rational_two_d_message);
+  CHECK(Mentions(rational_two_d_message, "dims=2 with rational_resampler=true"));
+  CHECK(Mentions(rational_two_d_message, "spatial_rational_resampler.py:41"));
+
+  // THE CONV2D BIAS CONTRACT, which the 3-D helper has had since #644
+  // (`Conv3dPad1`, ltx2_upsampler.cpp:82) and the 2-D one did not. Before this
+  // repair `Conv2dPad1PerFrame` checked only the weight, so a dims=2 checkpoint
+  // carrying a correct kernel and a bias one element short read past the end of
+  // a std::vector — UB and silent garbage — where the identical dims=3 defect
+  // gets a named refusal. Nothing upstream of the helper validates it:
+  // `Ltx2LoadVaeWeights` (ltx2_video.cpp:1490) loads by NAME and checks no shape.
+  //
+  // `initial_conv` is the first of the four groups the dims=2 arm routes through
+  // this helper, so it is the earliest place the read would happen.
+  vllm::Ltx2UpsamplerConfig short_bias_cfg = ReducedUpsamplerConfig(false, 2.0, "ltx2.ups.b2.");
+  short_bias_cfg.dims = 2;
+  ParamBag short_bias = BuildUpsamplerParams(short_bias_cfg);
+  std::vector<float>& initial_bias = short_bias.weights.tensors["ltx2.ups.b2.initial_conv.bias"];
+  REQUIRE(initial_bias.size() == static_cast<size_t>(vllm_test::kLtx2UpsMidChannels));
+  initial_bias.pop_back();
+  const std::string short_bias_message = RefusalMessage(
+      [&] { (void)vllm::Ltx2LatentUpsample(short_bias_cfg, short_bias.weights, latent); });
+  INFO("short conv2d bias refusal = ", short_bias_message);
+  CHECK(Mentions(short_bias_message, "conv2d bias has the wrong element count"));
 
   // Upstream's own ValueError when neither flag is set (model.py:73-74).
   vllm::Ltx2UpsamplerConfig neither = ReducedUpsamplerConfig(false, 2.0, "");

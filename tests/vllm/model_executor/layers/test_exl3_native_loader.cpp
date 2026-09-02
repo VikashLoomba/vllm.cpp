@@ -129,9 +129,12 @@ TEST_CASE("exl3 native loader: a mul1 marker means codebook 2") {
   // codebook uses -- which is why the dtype check below mirrors mcg's.
   const vllm::Exl3Weight w = LoadExl3(s.Get(), s.Has(), "p");
   CHECK(w.codebook == 2);
-  // …and the width travels with it. 270 of the 272 quantized tensors of
+  // …and the width travels with it. 270 of the 409 trellis modules of
   // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` are FOUR-bit, which is a width no
-  // codebook-0 or codebook-1 artifact in this tree has used.
+  // codebook-0 or codebook-1 artifact in this tree has used. The count read
+  // 272 until #2574 re-derived it from the local safetensors headers; the 137
+  // modules that reading omitted are THREE-bit, and the CUDA arm for them was
+  // widened against the wrong number and left them refusing by name.
   CHECK(w.Bits() == 4);
   CHECK(w.InFeatures() == 128);
   CHECK(w.OutFeatures() == 128);

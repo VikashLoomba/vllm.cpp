@@ -469,8 +469,9 @@ TEST_CASE("glm5_next bridge: EVERY block dtype this build knows has a decoder") 
 TEST_CASE("glm5_next bridge: a REPACKED q8_0 buffer is refused rather than misread") {
   // THE DEFECT THIS PINS, and it was measured on the real checkpoint before it
   // was written. `GgufLoadPolicy::FromEnv` sets
-  // `quant_repack = keep_quant && !cpu_ref && vt::cpu::QuantRepackActive()`
-  // (`gguf_keep_quant.cpp`), and on an i8mm aarch64 box -- `dgx:gpu0`,
+  // `quant_repack = keep_quant && !cpu_ref && vt::cpu::QuantRepackActive() &&
+  // dev == kCPU` (`gguf_keep_quant.cpp`; the device term is #2406, and this
+  // row's loads are `--device cpu`), and on an i8mm aarch64 box -- `dgx:gpu0`,
   // `thor:gpu0`, `orin:gpu0`, which is EVERY box this row can run on --
   // `QuantRepackActive()` is true. `OwnGgufQuantBlocks` then permutes an
   // eligible q8_0 weight into the `block_q8_0x4` interleave and sets

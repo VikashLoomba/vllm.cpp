@@ -87,6 +87,16 @@ bool GgufNvfp4ComputeAvailable(vt::DeviceType dev) {
   return vt::OpRegistered(vt::OpId::kMatmulNvfp4, dev);
 }
 
+// #2406. See the header for why `host_repack_active` is a parameter and not a
+// call. The device term is the whole fix: everything else here is the
+// pre-existing expression, so on `dev == kCPU` this is character-for-character
+// the decision the loader made before, and a CPU load is unchanged.
+bool QuantRepackForDevice(bool keep_quant, bool cpu_ref,
+                          bool host_repack_active, vt::DeviceType dev) {
+  return keep_quant && !cpu_ref && host_repack_active &&
+         dev == vt::DeviceType::kCPU;
+}
+
 const char* Name(GgufTensorRole role) {
   switch (role) {
     case GgufTensorRole::kMatmulWeight: return "matmul_weight";
@@ -363,7 +373,15 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   // VT_CPU_REF=1 reproduces the historical load. No separate default env read:
   // QuantRepackActive() is the single source of the on/off decision, so the
   // loader and the kernel can never disagree about whether repack is live.
-  p.quant_repack = p.keep_quant && !p.cpu_ref && vt::cpu::QuantRepackActive();
+  //
+  // AND ON THE RESOLVED DEVICE (#2406), which it did not read until now. This
+  // was the ONE device-dependent flag in this function still deciding from a
+  // pure host probe, while its sibling `elem_kn_repack` eight lines below has
+  // always carried the same term for the same reason. `QuantRepackForDevice`
+  // holds the rule; see its header comment for why the ISA probe is passed in
+  // rather than called there.
+  p.quant_repack = QuantRepackForDevice(p.keep_quant, p.cpu_ref,
+                                        vt::cpu::QuantRepackActive(), dev);
   // KERNEL-GEMM-CPU-TILED lever 2, elementwise [N,K] -> [K,N] repack-at-load.
   // OPT-IN ONLY (default false) because the repacked bytes are transposed and
   // only the CPU MatmulBTKernel honours Tensor.elem_kn_repacked today; see the

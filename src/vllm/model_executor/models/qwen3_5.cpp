@@ -1161,14 +1161,25 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   // interleave, and it was missing until now (issue #1320). The CUDA
   // quant dot reads `block_q8_0`; `VT_CPU_QUANT_REPACK` rewrites the buffer to
   // `block_q8_0x4` at load and only the CPU MatmulBTKernel understands that.
-  // Unlike `elem_kn_repack`, whose policy IS gated on the CPU platform
-  // (gguf_keep_quant.cpp), `quant_repack` rides `QuantRepackActive()` alone —
-  // a HOST-CPU i8mm probe — so an aarch64 box doing `--device cuda` can repack a
-  // Q8_0 weight and then upload it verbatim to a kernel that misreads it. That is
-  // silent wrong tokens, not a crash. Measured harmless on the target checkpoint
-  // (one Q8_0 tensor, 0.01% of parameters, and the instrumented load recorded
-  // `quant_repack = 0`), which is why it is a tripwire here rather than a
-  // campaign; `VT_CPU_QUANT_REPACK=0` is the operator's way past it.
+  // THE POLICY NOW AGREES WITH THIS GUARD (#2406). `quant_repack` used to ride
+  // `QuantRepackActive()` alone — a HOST-CPU i8mm probe with no device term —
+  // so an aarch64 box doing `--device cuda` repacked a Q8_0 weight and uploaded
+  // it verbatim to a kernel that misreads it. `GgufLoadPolicy::FromEnv` now
+  // resolves it through `QuantRepackForDevice(..., dev)`, gated `dev == kCPU`
+  // exactly as its sibling `elem_kn_repack` always was.
+  //
+  // TWO CORRECTIONS TO WHAT THIS COMMENT USED TO SAY. It called the gap
+  // "measured harmless on the target checkpoint (one Q8_0 tensor, 0.01% of
+  // parameters, and the instrumented load recorded `quant_repack = 0`)". The
+  // released `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S stores **194** Q8_0
+  // hyper-connection mix weights (docs/USAGE.md), so the population was never
+  // one tensor; and a repacked `block_q8_0x4` weight DID reach device residency
+  // and refuse here by name on `thor:gpu0`, so the reading of `quant_repack = 0`
+  // did not generalise past the run that took it. The guard stays as belt to
+  // the policy's braces — a runtime refusal is what catches a future caller that
+  // builds a policy by hand — but it is no longer the only thing standing
+  // between an i8mm host and a device upload. `VT_CPU_QUANT_REPACK=0` remains
+  // the operator's same-binary way past the transform entirely.
   VT_CHECK(!w.repacked,
            "qwen3_5: an i8mm-repacked (block_q8_0x4) weight reached device "
            "residency; VT_CPU_QUANT_REPACK is a CPU-only load transform and the "
@@ -5469,9 +5480,15 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dqn2d = Reshape(dq3.t(), {T * Hq, Dh});
     vt::RmsNorm(d.q, dqn2d, Reshape(qf.t(), {T * Hq, Dh}), dqw, vt::RmsNormArgs{eps, true});
-    // k-norm weight dtype must equal kf's (RmsNorm requires w.dtype == x.dtype). When
-    // kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use the raw bf16 on-disk k_norm;
-    // otherwise (fp8/35B or toggle off) keep the f32 upcast. bf16 kf · bf16 dkw -> f32.
+    // `RmsNorm` NO LONGER requires `w.dtype == x.dtype`; #2477/#2493 gave the CUDA
+    // kernel its own `Tw`, and #2492 did the same for the ROCm and fp8 twins. This
+    // selection is therefore a WORK-AROUND FOR A CONSTRAINT THAT NO LONGER EXISTS,
+    // and it is left in place rather than removed because it is behaviourally
+    // neutral (the f32 upcast of a bf16 on-disk gamma is exact, so both arms feed
+    // the kernel the same values) and removing it changes a shipped model's code
+    // for no measured gain. When kf is bf16 (VT_BF16_GEMM_OUT on the fp4 path) use
+    // the raw bf16 on-disk k_norm; otherwise (fp8/35B or toggle off) keep the f32
+    // upcast. bf16 kf · bf16 dkw -> f32.
     Tensor dkw = (kf.dtype == DType::kBF16) ? ResidentWeight(d, w.k_norm, {Dh})
                                            : ResidentWeightF32(d, w.k_norm, {Dh});
     Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});

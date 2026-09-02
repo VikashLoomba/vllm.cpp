@@ -40,8 +40,9 @@
 //
 // ─── THE REPACK IS DECLINED, AND THE REASON IS NOT PERFORMANCE ───────────────
 // `GgufLoadPolicy::quant_repack` is `keep_quant && !cpu_ref &&
-// vt::cpu::QuantRepackActive()`, and `QuantRepackActive()` is TRUE on every
-// aarch64 i8mm box in this fleet — `dgx:gpu0` included. It permutes an eligible
+// vt::cpu::QuantRepackActive() && dev == kCPU` (the device term is #2406), and
+// `QuantRepackActive()` is TRUE on every aarch64 i8mm box in this fleet —
+// `dgx:gpu0` included. It permutes an eligible
 // Q8_0 weight into the `block_q8_0x4` interleave, KEEPING THE DTYPE AND THE
 // BYTE COUNT IDENTICAL. That is what makes it dangerous rather than merely
 // slow: every shape and type assertion in this tree passes on a repacked

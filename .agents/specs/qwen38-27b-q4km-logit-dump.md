@@ -212,6 +212,49 @@ predecessor left it: `FAIL`, 5 of 6, and no speed or memory axis is admissible.
 - Report an unstationary delta shape if it appears, even though no pre-registered
   branch predicts it.
 
+## Outcome
+
+**Branch 1 selected on the pre-registered statistic, and the pre-registration's
+conclusion for that branch is WRONG.** Measured `d72baf2c`, `thor:gpu0`: our
+per-step delta against the oracle is median `max_abs` 0.4165 against the band's
+0.3790 (**1.10x**) and median `rms` 0.07903 against 0.0729, so we are at the
+oracle's own kernel-schedule noise floor. Stationary at 1.07x growth, so the
+admitted fourth shape did not occur.
+
+Branch 1 said that means "no further precision term is worth chasing". That is
+false here, because the registered statistic measures the MAGNITUDE of our error
+while the gate is decided by the RESOLUTION of our logits. **288 of 288 of our
+top-1 logits lie exactly on the bf16 grid**, our smallest representable non-zero
+gap is 0.0625 rising to 0.125 at magnitude 16-32, and five of the six contested
+gaps (0.027 to 0.178) are at or below it. Six steps in 288 are EXACT ties in our
+arithmetic; the six argmax flips are exactly the six recorded rank-2 steps.
+
+The site is `qwen3_5.cpp:3205` routing to `MatmulBf16LogitsF32D` (`:1721`), which
+computes the `[M, vocab]` product in bf16 and widens with `vt::CastF32`. Widening
+cannot recover a discarded mantissa.
+
+Evidence:
+[`qwen38-27b-q4km-logit-delta-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-logit-delta-20260902.md).
+
+**Lesson for the pre-registration method, kept because it cost four dispatches.**
+Pre-registering the branches was right and stopped the conclusion being assembled
+after the fact. But every branch was framed on ONE statistic, and the cause lived
+in a property that statistic could not express. A pre-registration should name
+the statistic AND admit that a finding outside it may decide the row -- which is
+what the fourth shape did for time, and what nothing did for resolution.
+
+## Owed
+
+- Confirm which arm of `qwen3_5.cpp:3205` this checkpoint takes (is its GGUF
+  `lm_head` loaded `nk`). The bf16 grid is certain at 288 of 288; the routing
+  predicate is inferred from being the only matching site.
+- Whether an f32 logits head makes the arm PASS is not established. Two contested
+  gaps sit below the f32-vs-oracle agreement measured at those steps, so widening
+  is necessary and not obviously sufficient.
+- The heavy tail: our `max_abs` reaches 17.16 against the oracle's 1.3657, at
+  `p5/2`, `p5/11` and `p0/45`. Not temporal, flipped no argmax, unexplained.
+
 ## Now
 
-`ACTIVE`.
+`DONE` -- the instrument exists, is gated on both sampling paths, and produced
+the measurement this row was opened for.

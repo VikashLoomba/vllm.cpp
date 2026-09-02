@@ -743,7 +743,11 @@ TEST_CASE("exl3 device: the widened (bits, codebook) arms agree with the CPU arm
 // tolerance over a random-bit trellis could plausibly absorb and an equality
 // cannot. Each `REQUIRE` on a parity is the instrument's own precondition: a run
 // that quietly landed on an even address would exercise nothing and still pass.
-TEST_CASE("exl3 gemm: suh, svh and the trellis at ODD byte addresses decode the same") {
+// NO COMMA IN THE NAME. doctest splits `-tc=` on commas, so a case whose name
+// carries one can never be selected by it: the filter matches nothing and the
+// binary reports `assertions: 0` and `SUCCESS!` at rc 0, which is a SKIP
+// wearing a pass for anyone running a focused gate by name.
+TEST_CASE("exl3 gemm: the suh/svh scales and the trellis at ODD byte addresses decode the same") {
   vt::Queue q = CpuQueue();
   const int64_t m = 2, k = 256, n = 128;
   const Exl3Fixture f = MakeFixture(k, n, 3, 0x2545F491u);

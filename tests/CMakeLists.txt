@@ -1437,6 +1437,35 @@ set_tests_properties(test_qwen27_paged_forward_act_f32 PROPERTIES
   ENVIRONMENT "VT_ACT_F32=1"
   FAIL_REGULAR_EXPRESSION "assertions:[ ]*0[ |]"
   PASS_REGULAR_EXPRESSION "Status: SUCCESS!")
+# #2590. THE REACHABILITY GATE for the activation dump, and it is a gate rather
+# than an observation because the hermetic writer suite
+# (`test_act_dump`) drives the writer DIRECTLY and therefore proves the class
+# works, never that anything reaches it -- the exact shape `AGENTS.md` "Nothing
+# lands dead" names.
+#
+# This entry runs the SAME paged-forward binary with the dump pointed at a real
+# directory, so the dump is exercised through `DenseForwardLayers`, the
+# production dense forward. It passes only on a line the instrument prints when
+# it has actually written a RESIDUAL-STREAM blob: `stream_blobs=` followed by a
+# non-zero count. Deleting the `ActDumpStream` call site therefore reds THIS
+# entry while leaving the plain binary green, which is what makes it measure a
+# capability.
+#
+# `blobs_this_step` would NOT do, and a mutation proved it rather than an
+# argument: the GDN stage probes fire off the same environment variable, so the
+# total stayed non-zero with both stream call sites deleted and a gate keyed on
+# it reported success over a forward that dumped no hidden state at all.
+#
+# The directory is created at CONFIGURE time on purpose. The writer refuses a
+# missing directory by design (#2590), so a `mkdir` folded into the test command
+# would be testing the shell rather than the instrument.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/act_dump_2590)
+add_test(NAME test_qwen27_paged_forward_act_dump
+  COMMAND test_qwen27_paged_forward)
+set_tests_properties(test_qwen27_paged_forward_act_dump PROPERTIES
+  ENVIRONMENT "VT_DUMP_ACT=${CMAKE_CURRENT_BINARY_DIR}/act_dump_2590"
+  FAIL_REGULAR_EXPRESSION "assertions:[ ]*0[ |];Status: FAILURE"
+  PASS_REGULAR_EXPRESSION "stream_blobs=[1-9]")
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
 vllm_cpp_add_test(test_pretokenizer vllm/test_pretokenizer.cpp)
 # Metaspace split=true + Metaspace decoder (Parakeet tokenizer shape) —
@@ -1756,6 +1785,10 @@ target_include_directories(test_placement_reach PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_placement_dump_dtype
   vllm/model_executor/test_placement_dump_dtype.cpp)
 target_include_directories(test_placement_dump_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_act_dump
+  vllm/model_executor/test_act_dump.cpp)
+target_include_directories(test_act_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 vllm_cpp_add_test(test_moe_fit_resolver
   vllm/model_executor/test_moe_fit_resolver.cpp)
@@ -2961,6 +2994,13 @@ vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 # (spec moe-router-topk-single-warp.md §9, #378). Same include pattern as
 # test_moe_router_warp_map above, which executes that pin without a GPU.
 target_include_directories(test_ops_moe_grouped PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Wave TIEBREAK (#2586): whether the CUDA top-k REALISES the lowest-index
+# tie-break it declares, at E=512 k=10 -- the geometry qwen4_exp routes, which
+# MoeRouterWarpValuesPerThread excludes from the warp kernel and which no other
+# case executes. Reaches the same src/ selector header through the shared pin
+# tests/vt/moe_router_warp_env.h, so it needs the same src/ include path.
+vllm_cpp_add_test(test_moe_router_tie_stability vt/test_moe_router_tie_stability.cpp)
+target_include_directories(test_moe_router_tie_stability PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)

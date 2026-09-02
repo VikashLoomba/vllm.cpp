@@ -993,8 +993,13 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     // SELECTION -- the indexer chooses which closed rows to attend -- and the
     // indexer's own compressor produces the keys it selects over.
     const int64_t cr_arm = p.compress_ratio(layer);
-    const bool comp_arm = is_comp && be.compressor != nullptr &&
-                          (cr_arm == 128 || cr_arm == 4);
+    // MODEL-DSV4-PAGED-ENTRY (#2447): THE shared expression, not a local one.
+    // `ResolveDeepseekV4SwaPages` routes on this same call, so the route cannot
+    // admit a layer this block then refuses. It reduces to the expression that
+    // stood here -- `is_comp` is `p.has_compressor(layer) && !dsa_dense` -- and
+    // the reduction is the reason it can be shared rather than approximated.
+    const bool comp_arm = DeepseekV4PagedArmComposesCompressor(
+        p, layer, dsa_dense, /*have_compressor_state=*/be.compressor != nullptr);
     // At `cr == 4` the layer carries an indexer too, and the same arm composes
     // it: its own compressor produces the keys and its selection narrows the
     // merge. So the indexer is admitted exactly where the compressor is.
@@ -3587,12 +3592,24 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                             logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
 }
 
+// MODEL-DSV4-PAGED-ENTRY (#2447). See the header: this is the ONE derivation,
+// and `AttentionBlock` above reads it as its `comp_arm`.
+bool DeepseekV4PagedArmComposesCompressor(const DeepseekV4Params& params,
+                                          int64_t layer, bool dsa_dense,
+                                          bool have_compressor_state) {
+  const int64_t cr = params.compress_ratio(layer);
+  return params.has_compressor(layer) && !dsa_dense && have_compressor_state &&
+         (cr == 128 || cr == 4);
+}
+
 // KV-DSV4-MULTICACHE W5 (#2323). See the header for why this is pure.
 std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
                                       const MultiKvCacheIndex& multi_kv,
                                       const std::vector<PagedKvCache>& attn_kv,
                                       int num_reqs, vt::Device device,
-                                      std::vector<vt::Tensor>* out_pages) {
+                                      std::vector<vt::Tensor>* out_pages,
+                                      bool dsa_dense, bool have_compressor_state,
+                                      int64_t num_tokens) {
   // ONE REQUEST. The paged forward carries a single `kv_base` for the whole
   // step, so a batch at differing context lengths would silently attend the
   // wrong history for every request but one.
@@ -3601,17 +3618,39 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
            "differing context lengths needs a per-request kv_base "
            "(KV-DSV4-MULTICACHE W5, #2323)";
   }
-  // SWA-ONLY LAYERS. A layer with a compressor composes its window with selected
-  // compressed history; attending the raw prefix instead would produce entirely
-  // plausible tokens from the wrong key set.
+  // DECODE ONLY, on the composed arm. `MergeWindowAndCompressed` reshapes the
+  // two LSE buffers rather than transposing them, which is only legal when T or
+  // H is 1 (`deepseek_v4_dsa.cpp`). A prefill therefore refuses at real geometry
+  // anyway -- but inside the composition, with a message about LSE layouts.
+  // Refusing here names the row instead. Routing the prefill to the STATELESS
+  // path is not an escape: the compressor state would then never see the prompt
+  // and `CompressorLayerStep` fires `seen == kv_base` on the first decode step.
+  // MODEL-DSV4-PAGED-ENTRY (#2447), `## Owed`.
+  if (have_compressor_state && num_tokens != 1) {
+    return "deepseek-v4 paged forward: the composed compressor arm is DECODE "
+           "ONLY (this step carries " +
+           std::to_string(num_tokens) +
+           " tokens). Its window/compressed merge reshapes the two LSE buffers "
+           "instead of transposing them, so it needs one token per step. "
+           "Refusing rather than merging the wrong layout "
+           "(MODEL-DSV4-PAGED-ENTRY, #2447)";
+  }
+  // A COMPRESSOR LAYER composes its window with selected compressed history;
+  // attending the raw prefix instead would produce entirely plausible tokens
+  // from the wrong key set. So it is admitted only where the paged arm actually
+  // COMPOSES it, and that question is answered by the same expression
+  // `AttentionBlock` enforces -- never by a copy of its clauses.
   for (int64_t l = 0; l < params.num_hidden_layers; ++l) {
-    if (params.has_compressor(l)) {
+    if (params.has_compressor(l) &&
+        !DeepseekV4PagedArmComposesCompressor(params, l, dsa_dense,
+                                              have_compressor_state)) {
       return "deepseek-v4 paged forward: layer " + std::to_string(l) +
              " has a compressor (compress_ratio " +
              std::to_string(params.compress_ratio(l)) +
-             "), whose window-plus-compressed-history composition is unported. "
-             "Refusing rather than attending over the raw prefix "
-             "(MODEL-DSV4-DSA-COMPOSE, #2286)";
+             ") this arm does not compose, so it would attend the raw prefix. "
+             "The composed arm needs compress_ratio 4 or 128, carried "
+             "compressor state, and an arm whose layers are not forced dense "
+             "(MODEL-DSV4-DSA-COMPOSE, #2286; MODEL-DSV4-PAGED-ENTRY, #2447)";
     }
   }
   std::vector<vt::Tensor> pages(static_cast<size_t>(params.num_hidden_layers));
@@ -3629,6 +3668,24 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
       return "deepseek-v4 paged forward: the SWA cache for '" + name +
              "' has head_size " + std::to_string(c.head_size) + ", expected head_dim " +
              std::to_string(params.head_dim);
+    }
+    // A PACKED PAGE. `vt::ConcatAndCacheMla` refuses a non-float cache dtype by
+    // name, and `MakeDeepseekV4KVCache` publishes the SWA pages as `kI8` with
+    // `cache_dtype_str == "fp8_ds_mla"` -- upstream's own default
+    // (`attention.py:140`). The write would abort either way; refusing here says
+    // WHICH row owns the gap instead of surfacing a kernel precondition.
+    //
+    // The fix is the packed 584-byte store (`KV-DSV4-MULTICACHE` W8), NOT a
+    // wider guard in `ApplyCacheDType`: widening that would let a packed page be
+    // written as though it were float, which is the wrong-tokens shape this
+    // whole path exists to remove. MODEL-DSV4-PAGED-ENTRY (#2447), `## Owed`.
+    if (c.dtype != vt::DType::kF32 && c.dtype != vt::DType::kF16 &&
+        c.dtype != vt::DType::kBF16) {
+      return "deepseek-v4 paged forward: the SWA cache for '" + name +
+             "' is a PACKED page (vt::ConcatAndCacheMla takes a float cache "
+             "only, and this topology publishes fp8_ds_mla). The packed store "
+             "is owed to KV-DSV4-MULTICACHE W8 "
+             "(MODEL-DSV4-PAGED-ENTRY, #2447)";
     }
     pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
         c.data, c.dtype, device, {c.num_blocks, c.block_size, c.head_size});
@@ -3900,6 +3957,22 @@ static ForwardLogits WrapV4DeviceLogits(std::vector<float>&& flat, int64_t rows,
                                             queue.device, {rows, vocab});
   fl.device_storage = std::move(buf);  // shared_ptr<vector<float>> -> shared_ptr<void>
   return fl;
+}
+
+// MODEL-DSV4-PAGED-ENTRY (#2447): the EXL3 paged arm, returning the runner's
+// carrier. See the header for why the wrap happens here and not at the registry.
+ForwardLogits DeepseekV4ForwardExl3PagedLogits(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices,
+    DeepseekV4CompressorState* compressor) {
+  std::vector<float> flat =
+      DeepseekV4ForwardExl3Paged(weights, queue, paged_kv, kv_base, token_ids,
+                                 positions, logits_indices, compressor);
+  const int64_t vocab = weights.params.vocab_size;
+  const int64_t rows = vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;
+  return WrapV4DeviceLogits(std::move(flat), rows, vocab, queue);
 }
 
 // ── W7-DEVICE: the DEVICE forward. Runs the SAME composition as

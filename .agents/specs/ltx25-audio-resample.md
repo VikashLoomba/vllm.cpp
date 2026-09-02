@@ -374,7 +374,7 @@ tokenizer and HuggingFace-org byte matches.
 | | Before | After |
 |---|---|---|
 | `test_ltx2_vae -tc='*waveform_to_mel*'` | THREW the rate refusal at `ltx2_audio_vae.cpp:1053` | 48/48 cases, 3245/3245 assertions |
-| `test_ltx2_video -tc='*RESAMPLED*'` | THREW `'high.wav' is sampled at 44100 Hz ...` | 110/110 cases, 4870/4870 assertions |
+| `test_ltx2_video -tc='*RESAMPLED*'` | THREW `'high.wav' is sampled at 44100 Hz ...` | 110/110 cases, 4876/4876 assertions |
 | `test_ltx2_vae -tc='*resampl*'`, section 8f | 50/54 with the EXACT INTEGER CEIL in place: `CeilAt` 65560 vs 65559 and its tail 0.256834 out, `CeilAlt` 65720 vs 65719 and its tail 0.358731 out | 54/54 |
 
 The first two reds are the refusal itself, which is what the row exists to
@@ -401,6 +401,11 @@ rebuilding:
   `Ltx2ResampleWaveform` works whether or not anything calls it, and a test that
   constructs it by hand measures the class. The tree was restored byte-for-byte
   and both suites re-run green.
+
+That video count reads 4876 and not the 4870 this row measured before its last
+merge from `main`: `origin/main` added the `dims=2` upsampler cases to the same
+suite. Re-read after the merge rather than carried across it, because a merge
+falsifies a count without touching a line this row owns.
 
 The mutation was RE-RUN at the truncation-repair head, because the repair moves
 the very line the mutation deletes and a mutation proof does not survive an edit

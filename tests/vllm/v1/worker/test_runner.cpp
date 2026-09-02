@@ -3313,3 +3313,54 @@ TEST_CASE("runner: the logit dump agrees with the sampled ids and never perturbs
   CHECK(step == 1);
   CHECK(tok == static_cast<long long>(sampled));
 }
+
+// #2534, and the reason this case exists at all. The first version of the dump
+// was gated only through `sample_tokens`, and a case that called that method
+// DIRECTLY passed 13 of 13 while the instrument wrote nothing in the real
+// engine. `async_input_combine_` is assigned directly in the runner ctor from
+// `AsyncRunnerEnvDefault()`, and `AsyncRunnerFlagIsOn` answers TRUE when
+// VT_ASYNC_RUNNER is unset, so the PRODUCTION default samples in the
+// device-resident branch of `sample_tokens_async`. A gate that only drives
+// `sample_tokens` measures a class and not the capability.
+//
+// This drives the async branch explicitly and requires the dump to appear there
+// too. Deleting either `dump_step_logits` call site reds exactly one of the two
+// cases, which is what makes them independent rather than duplicates.
+TEST_CASE("runner: the logit dump fires on the ASYNC branch the default takes") {
+  const char* dump_dir = std::getenv("VT_DUMP_LOGITS");
+  if (dump_dir == nullptr) return;  // inert arm: covered by the case above.
+
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, 64);
+  runner.set_async_input_combine(true);  // the production default
+  REQUIRE(runner.async_input_combine());
+
+  NewRequestData d = MakeNewReq("A", {6, 7, 8}, {9}, /*num_computed=*/3,
+                                /*fa_blocks=*/{0, 1}, /*gdn_block=*/0, Greedy());
+  SchedulerOutput so = NewStep({d}, {{"A", 1}});
+  auto out_opt = runner.execute_model(so);
+  CHECK_FALSE(out_opt.has_value());
+
+  std::unique_ptr<vllm::v1::AsyncModelRunnerOutput> async_out =
+      runner.sample_tokens_async(std::nullopt);
+  REQUIRE(async_out != nullptr);
+  ModelRunnerOutput out = async_out->get_output();
+  REQUIRE(out.sampled_token_ids.size() == 1);
+  REQUIRE(out.sampled_token_ids[0].size() == 1);
+  const int32_t sampled = out.sampled_token_ids[0][0];
+
+  // The dump must exist for THIS request, one step of [1, vocab] f32.
+  std::ifstream bin(std::string(dump_dir) + "/ours_A.f32",
+                    std::ios::binary | std::ios::ate);
+  REQUIRE(bin.good());
+  CHECK(bin.tellg() == static_cast<std::streamsize>(
+                           sizeof(float) * static_cast<size_t>(c.vocab_size)));
+  bin.seekg(0);
+  std::vector<float> row(static_cast<size_t>(c.vocab_size));
+  bin.read(reinterpret_cast<char*>(row.data()),
+           static_cast<std::streamsize>(row.size() * sizeof(float)));
+  size_t best = 0;
+  for (size_t v = 1; v < row.size(); ++v) if (row[v] > row[best]) best = v;
+  CHECK(static_cast<int32_t>(best) == sampled);
+}

@@ -3297,27 +3297,21 @@ ModelRunnerOutput GPUModelRunner::pool_tokens() {
   return out;
 }
 
-ModelRunnerOutput GPUModelRunner::sample_tokens(
-    const std::optional<GrammarOutput>& grammar_output) {
-  ModelRunnerOutput out;
-  const int num_reqs = exec_state_.num_reqs;
-  if (num_reqs == 0) {
-    return out;  // 0-token flush step (nothing sampled).
-  }
-
-  // POOLING ROUTING (ARCH-ONE-SURFACE ROW 6), mirroring the model-level task
-  // split of gpu/model_runner.py:1586-1607: on a POOLING model the step's
-  // output is the POOLED DATA, never a sampled token. pooling_runner_ is set
-  // iff the registration declares is_pooling_model (ctor), so every text arch
-  // takes the sampler path below byte-identically.
-  if (pooling_runner_ != nullptr) {
-    return pool_tokens();
-  }
-
-  std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
-  vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
-
-  // --- #2534 INSTRUMENT: the final-logit dump -------------------------------
+// --- #2534 INSTRUMENT: the final-logit dump ---------------------------------
+//
+// ONE implementation, called from BOTH sampling paths. It has to be both,
+// because `async_input_combine_` is assigned DIRECTLY at the two ctor sites
+// below (`AsyncRunnerEnvDefault() && ...`) and `AsyncRunnerFlagIsOn` answers
+// TRUE when VT_ASYNC_RUNNER is unset -- so the production default is the
+// DEVICE-RESIDENT branch of `sample_tokens_async`, not `sample_tokens`.
+//
+// Instrumenting only `sample_tokens` cost a 40-minute lease on 2026-09-02: the
+// dump wrote nothing, and so did `VT_DEBUG_SAMPLED`, which sits a few lines
+// below it in the same function and predates this row. Two silent probes in a
+// function the engine never calls is what "wrong function" looks like. Grepping
+// the SETTER `set_async_input_combine` and finding no caller is what made it
+// look like the sync path; the field is not written through the setter.
+void GPUModelRunner::dump_step_logits(const vt::Tensor& logits) {
   //
   // `VT_DUMP_LOGITS=<dir>` appends this step's full logit row for every live
   // request to `<dir>/ours_<req_id>.f32`, and its argmax to
@@ -3439,6 +3433,29 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
       std::fclose(g);
     }
   }
+}
+
+ModelRunnerOutput GPUModelRunner::sample_tokens(
+    const std::optional<GrammarOutput>& grammar_output) {
+  ModelRunnerOutput out;
+  const int num_reqs = exec_state_.num_reqs;
+  if (num_reqs == 0) {
+    return out;  // 0-token flush step (nothing sampled).
+  }
+
+  // POOLING ROUTING (ARCH-ONE-SURFACE ROW 6), mirroring the model-level task
+  // split of gpu/model_runner.py:1586-1607: on a POOLING model the step's
+  // output is the POOLED DATA, never a sampled token. pooling_runner_ is set
+  // iff the registration declares is_pooling_model (ctor), so every text arch
+  // takes the sampler path below byte-identically.
+  if (pooling_runner_ != nullptr) {
+    return pool_tokens();
+  }
+
+  std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
+  vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+
+  dump_step_logits(logits);
 
   // SAMPLE-PROMPT-LOGPROBS (gpu_model_runner.py:3841-3845): score the prompt
   // rows off the SAME forward result. Done before sampling because sampling
@@ -4731,6 +4748,8 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
 
   std::vector<float> sampled_logits;
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+  // #2534: the SAME dump, on the branch the production default actually takes.
+  dump_step_logits(logits);
   // SAMPLE-PROMPT-LOGPROBS: same seam as the synchronous path. The prompt rows
   // are read off this step's forward result HERE, synchronously, because that
   // is where the logits still are — the async output only defers the sampled

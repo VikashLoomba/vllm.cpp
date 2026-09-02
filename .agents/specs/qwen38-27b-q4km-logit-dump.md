@@ -96,6 +96,72 @@ ACCUMULATES rather than being a fixed per-step offset, which none of the three
 branches above assumes, and it would redirect the bisect from "which layer" to
 "which step".
 
+## The first build of the instrument was in the wrong function
+
+rc jobs `c636b3c0` (the measurement, aborted) and `e1875966` (the diagnostic),
+`thor:gpu0`, worker `rc-worker-n8smh`, 2026-09-02.
+
+The measurement run completed, both engines exited 0, and the controls did
+exactly what they were written for:
+
+```text
+DUMP_PERTURBS=NO (ids byte-identical)     <- passed
+ALIGNMENT=BROKEN   checked=0  bad=6       <- 6 of 6 MISSING sidecar
+FATAL: alignment control failed
+```
+
+Those two results together are the signature of an instrument that did nothing:
+a dump that writes nothing perturbs nothing. **No delta was computed, and no
+pre-registered branch was selected.**
+
+The diagnostic settled which of the remaining causes it was, in one 45-second
+run on the warm tree:
+
+| probe | result |
+|---|---|
+| the dump's own breadcrumb | **no line at all** |
+| `VT_DEBUG_SAMPLED=1`, which predates this row and sits a few lines BELOW the dump in the SAME function | **0 hits** |
+| tokens produced | `[[11751,13,198,760]]`, correct |
+
+Two independent probes silent in `GPUModelRunner::sample_tokens` while sampling
+demonstrably happens is not a bounds bug. It is the wrong function, and the
+verdict does not rest on this row's own code.
+
+**Why it was the wrong function, and the reading error that hid it.**
+`async_input_combine_` is assigned DIRECTLY in the runner constructor
+(`runner.cpp:472` and `:537`) from `AsyncRunnerEnvDefault()`, and
+`AsyncRunnerFlagIsOn` answers TRUE when `VT_ASYNC_RUNNER` is unset
+(`async_runner_flag.h`). So the production default samples in the
+DEVICE-RESIDENT branch of `sample_tokens_async`, which has its own
+`assemble_sample_logits` at `runner.cpp:4733`. `sample_tokens` is the fallback,
+not the default.
+
+I had ruled this branch out and was wrong. I grepped the SETTER
+`set_async_input_combine`, found no caller, and concluded the flag stayed false.
+The field is not written through the setter. **A predicate is not ruled out by
+finding no caller of one way of setting it.**
+
+**The hermetic gate did not catch this, and that is its own finding.** The
+original case called `sample_tokens` DIRECTLY and passed 13 of 13 while the
+instrument wrote nothing in the real engine -- a gate measuring a class and not
+the capability, which is the exact shape `AGENTS.md` "Nothing lands dead" names.
+The dump is now ONE helper called from both sampling paths, and a second case
+drives the async branch explicitly with `set_async_input_combine(true)`, so
+deleting either call site reds exactly one case.
+
+## The cross-tier discriminator is gone
+
+The gfx1151 ROCm token gate returned `TOKEN_GATE=NOT_MEASURABLE`: 12 of 12 legs
+faulted on both arms, zero harness errors, zero clean legs,
+`reference_tier_hits=0`, native ROCm path engaged throughout. So the check this
+row offered -- if a shared term drives both tiers, ROCm should diverge at the
+same indices and ids as the CPU arm -- cannot be run until
+[#2511](https://github.com/mudler/vllm.cpp/issues/2511) is fixed.
+
+That removes the only fallback comparison and leaves this measurement as the one
+live path to the dominant term. It does not widen this row's scope, and the
+pre-registered branches are unchanged.
+
 ## Scope
 
 1. One env-gated final-logit dump, written where the logits actually live,

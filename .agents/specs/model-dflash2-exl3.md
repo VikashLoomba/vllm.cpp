@@ -286,10 +286,28 @@ empty context should produce.
 The whole `dflash|exl3` neighbourhood is **46/46 passed, exit 0**, so the bf16
 DFlash1, DFlash2, GGUF, DSpark and DeepSeek-V4 lanes are unmoved.
 
-`tests/tools` is **591 tests, OK**. A preflight run taken while the host's root
-filesystem was down to 709 MB reported that suite FAIL; it passes on every run
-since the space came back, which is the shape `.agents/` already records for an
-ENOSPC — a full disk makes a checker emit a refusal that is about the disk.
+`scripts/agent-preflight.sh` reports **0 gates failed** and **5 SKIPPED**
+(`check-arm-isa-build.py`, `check-cpu-isa-build.py`,
+`check-cuda-fat-gencode.py`, `check-pr-size.py`,
+`check-triton-aot-multiarch.py`), each because preflight supplies none of their
+required arguments — the same five that skip on an unmodified checkout of this
+tree. It still prints "NOT a green preflight", because a skipped gate reported
+nothing; that sentence is the verdict and the exit code is not.
+`check-pr-size.py` is CI-only and will run there. `tree-compiles` is 121 of 121
+translation units, `tools suites` 591 tests, and both trailer and commit-style
+suites pass.
+
+**THE `tools suites` FAILURE THIS ROW SAW WAS THE WORKAROUND, NOT THE TREE.**
+Two preflight runs reported that suite FAIL while it passed standalone, which
+looks exactly like a flake. It was neither. This row built in `/dev/shm` because
+the host's root filesystem was down to 709 MB, and it exported
+`TMPDIR=/dev/shm` to the preflight as well;
+`tests/tools/test_drop_file_cache.py::test_posix_fadvise_evicts_all_inventoried_resident_pages`
+then errors, because a tmpfs page IS the page cache and
+`posix_fadvise(DONTNEED)` cannot evict it. Reproduced on demand: the same
+command is `OK` with the ambient `TMPDIR` and `FAILED (errors=1)` with
+`TMPDIR=/dev/shm`, on an unmodified tree. Do not re-export `TMPDIR` into a
+preflight run.
 
 ### The published checkpoint LOADS
 

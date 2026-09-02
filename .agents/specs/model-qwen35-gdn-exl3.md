@@ -254,13 +254,27 @@ NEIGHBOURING GATES, to show the existing arms are undisturbed:
 further ctest names report `Not Run` because their binaries were not built; none
 is a red.
 
-`scripts/agent-preflight.sh --staged`: every static checker green, commit
-trailers and style green, and `check-tree-compiles` green at 428/428
-translation units. One gate failed, `test_cpu_x86_llamacpp_floor`, and it is
-NOT this change: it is a Python self-test of the llama.cpp CPU floor harness's
+`scripts/agent-preflight.sh --staged`, run twice, and READ BY ITS OUTPUT
+rather than by its exit code -- it exits 0 while printing "NOT a green
+preflight", so the exit status is not the verdict.
+
+Final run on `5de2e29b7`: **ZERO `gate(s) failed`**, `check-tree-compiles` green
+at 460/460 translation units, `commit-trailers` and `commit-style` green, every
+static checker green. It still prints **"NOT a green preflight"** because 5
+gates SKIPPED: `check-arm-isa-build.py`, `check-cpu-isa-build.py`,
+`check-cuda-fat-gencode.py`, `check-pr-size.py` and
+`check-triton-aot-multiarch.py`. Each needs arguments or a build flavour
+preflight does not supply, so each reported NOTHING about this tree. That is a
+gap in the evidence, not a pass. `check-pr-size.py` is the one worth naming: it
+is CI-only and this change is 944 insertions, so its verdict is genuinely
+unknown until CI runs it.
+
+The FIRST run additionally failed `test_cpu_x86_llamacpp_floor`. That is not
+this change: it is a Python self-test of the llama.cpp CPU floor harness's
 contention-discard logic, it reads none of the files this row touches, and it
-failed with `load=12.96 8.21 6.71` on a box that was simultaneously at 100%
-disk under several other builds.
+failed with `load=12.96 8.21 6.71` on a box simultaneously at 100% disk under
+several other builds. It passed on the second run once the load dropped, which
+is what settles it as environmental.
 
 ## Owed
 

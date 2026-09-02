@@ -154,10 +154,15 @@ one shape in this suite that runs `ltx2_video.cpp:3073-3094`.
 4. **Correctness, before any speed result is accepted**: `ltx25-render-compare.py`
    against `tests/parity/goldens/ltx2_oracle/`'s committed #1864 reference on the
    changed arm, PLUS a same-arm pixel comparison of arm B's frames against arm
-   A's. The blockiness gate is one-sided and our render is already smoother than
-   upstream's, so a PASS on it is necessary and not sufficient; the same-arm
-   comparison is the sharper instrument and for a bit-exact repair it should be
-   byte equality.
+   A's. The blockiness gate is one-sided, so a PASS on it is necessary and not
+   sufficient; the same-arm comparison is the sharper instrument and for a
+   bit-exact repair it should be byte equality. (This item used to justify that
+   with "our render is already smoother than upstream's". **That premise is
+   FALSE** -- `LTX25-ADHERENCE-DETAIL-LOSS` (#2513) measured the spectrum and our
+   render carries 1.4031x the reference's absolute high-band power at 1.0373x its
+   mid-band power, so there is no rolloff to call smoothness. The gate's
+   one-sidedness is reason enough on its own, and it is the reason that
+   survives.)
 5. `scripts/agent-preflight.sh`.
 
 ## Dependencies

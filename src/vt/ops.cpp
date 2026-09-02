@@ -54,6 +54,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kMXFP4:
     case DType::kIQ2_XS:
     case DType::kIQ4_XS:
+    case DType::kIQ3_S:
       break;
   }
   VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");
@@ -2567,9 +2568,9 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
   // `output_hc_{down,up}` — and the loader keeps their blocks, so demanding a
   // float here refused the released checkpoint at its first prefill.
   //
-  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM has
-  // never registered `qwen4_exp` and never loads a GGUF, so it has no opinion on
-  // a block-typed operand; llama.cpp merged the architecture on 2026-08-27
+  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM
+  // registered `qwen4_exp` on 2026-08-31 (#2489) but never loads a GGUF, so it
+  // has no opinion on a block-typed operand; llama.cpp merged it on 2026-08-27
   // (`6c84c7d5d`, PR #27742) and runs this exact file. It declares each of the
   // SIX projections `GGML_OP_MUL_MAT` (`src/llama-arch.cpp:759,760,761,763,764,765`
   // — down, up AND inject, on both the attention and the feed-forward side) and
@@ -5321,23 +5322,32 @@ void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const
               const Tensor& svh, Tensor& a_had, const Exl3GemmArgs& args) {
   VT_CHECK(args.bits >= 1 && args.bits <= 8,
            "exl3_gemm: bits must be in [1, 8]; got " + std::to_string(args.bits));
-  // Codebook 0 (the original QTIP 3INST) and 1 (MCG) are both implemented; cb 2
-  // (upstream's `mul1` dp4a byte-sum variant) is not and refuses by name.
+  // ALL THREE CODEBOOKS UPSTREAM DEFINES: 0 (the original QTIP 3INST), 1 (MCG)
+  // and 2 (`mul1`). `decode_3inst<cb>` (`codebook.cuh:56-90`) has arms for those
+  // three and falls off the end for any other value, so a fourth is not an arm
+  // this tree has yet to port -- it does not exist.
   //
-  // The narrowing to MCG here was WRONG rather than merely conservative, and it
-  // was written when the only checkpoint in view was the SparkInfer DeepSeek-V4
-  // artifact, which ships an `mcg` marker. `LinearEXL3` derives the codebook
-  // from tensor PRESENCE (`exl3.py:74-77`), so every stock `turboderp/*-exl3`
-  // artifact -- shipping neither `mcg` nor `mul1` -- is cb 0, and cb 0 is
-  // therefore the COMMON case rather than an exotic one.
+  // The earlier narrowing to MCG here was WRONG rather than merely conservative,
+  // and it was written when the only checkpoint in view was the SparkInfer
+  // DeepSeek-V4 artifact, which ships an `mcg` marker. `LinearEXL3` derives the
+  // codebook from tensor PRESENCE (`exl3.py:74-77`), so every stock
+  // `turboderp/*-exl3` artifact -- shipping neither `mcg` nor `mul1` -- is cb 0,
+  // and cb 0 is therefore the COMMON case rather than an exotic one.
   //
-  // The DEVICE arm still refuses anything but cb 1 at its own launcher
-  // (`cuda_exl3.cu`), because it instantiates `kInstantiatedCb = 1` only. That
-  // refusal is correct and stays; this one was hiding it behind a wrong reason.
-  VT_CHECK(args.codebook == 0 || args.codebook == 1,
-           "exl3_gemm: codebook must be 0 (3INST) or 1 (mcg); codebook " +
+  // Cb 2 joined it for the same reason one step later:
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships a `mul1` marker on every quantized
+  // linear, so refusing cb 2 here refused that checkpoint whole
+  // (QUANT-EXL3-MUL1, #2495).
+  //
+  // THIS IS THE SEAM CHECK, NOT THE ARM CHECK, and the difference matters. The
+  // host arm decodes every (bits, codebook) pair; the DEVICE arm instantiates a
+  // named few and refuses the rest at its own launcher (`cuda_exl3.cu`), which
+  // is where an uninstantiated pair is caught. Widening this one does not widen
+  // that one.
+  VT_CHECK(args.codebook >= 0 && args.codebook <= 2,
+           "exl3_gemm: codebook must be 0 (3INST), 1 (mcg) or 2 (mul1); codebook " +
                std::to_string(args.codebook) +
-               " is an upstream arm this tree has not ported (QUANT-EXL3, #2181)");
+               " is not an arm upstream defines at all (QUANT-EXL3-MUL1, #2495)");
   VT_CHECK(a.rank == 2 && c.rank == 2, "exl3_gemm: A and C must be rank-2");
   // `ldmatrix.sync.aligned.m8n8.x4.shared.b16` + `mma...f16.f16` read fp16
   // fragments (ptx.cuh:52-74,203-212), so A has no dtype freedom at all.

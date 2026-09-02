@@ -769,6 +769,10 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.cpp
   src/vllm/model_executor/models/qwen3_5_weights.cpp
   src/vllm/model_executor/models/qwen3_5_dense_weights.cpp
+  # MODEL-QWEN35-EXL3 (#2495): the EXL3 linear seam, in its own TU because
+  # qwen3_5.cpp cannot include dense_attn_block.h (ADL collision on
+  # ResidentWeight; see the header).
+  src/vllm/model_executor/models/dense_exl3_linear.cpp
   src/vllm/model_executor/models/qwen3_5_mtp.cpp
   src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp
   src/vllm/model_executor/models/qwen3_5.cpp
@@ -1710,6 +1714,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_moe_chain.hip
     src/vt/rocm/rocm_grouped_gemm.hip
+    src/vt/rocm/rocm_exl3.hip
     src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_gdn_state.hip
     src/vt/rocm/rocm_gdn_conv.hip
@@ -1733,6 +1738,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_moe_chain.hip
       src/vt/rocm/rocm_grouped_gemm.hip
+      src/vt/rocm/rocm_exl3.hip
       src/vt/rocm/rocm_sample.hip
       src/vt/rocm/rocm_gdn_state.hip
       src/vt/rocm/rocm_gdn_conv.hip

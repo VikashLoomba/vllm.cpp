@@ -2518,6 +2518,11 @@ vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
 # activation choice that mirrors vLLM rather than the kernel oracle.
 vllm_cpp_add_test(test_exl3_gemv vt/test_exl3_gemv.cpp)
 vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
+# BACKEND-ROCM-EXL3 (#2433): the ROCm arms of the exactly two ops an EXL3
+# checkpoint ran on the CPU reference tier. Built in EVERY configuration and not
+# only under VLLM_CPP_HIP -- its cases skip when no ROCm backend is registered,
+# and a suite that only a HIP build compiles is a suite CI never reads.
+vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
 
 # QUANT-EXL3 W1a (#2181). Placed after the MODEL-DSV4-EXL3 kernel suites above
 # rather than among them: these two gate the SCHEME on the shared linear seam,
@@ -2531,6 +2536,10 @@ vllm_cpp_add_test(test_exl3_real_decode vt/test_exl3_real_decode.cpp)
 # The EXL3 arm REACHED from the dense forward (#2181): the capability gate, not
 # a class gate.
 vllm_cpp_add_test(test_llama_exl3_forward vllm/models/test_llama_exl3_forward.cpp)
+
+# MODEL-QWEN35-EXL3 (#2495 items 3 and 5): the EXL3 arm of the DENSE Qwen3.5
+# loader and forward, gated through LoadQwen3_5Dense and ModelRegistry::Forward.
+vllm_cpp_add_test(test_qwen35_exl3 vllm/models/test_qwen35_exl3.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
@@ -2859,6 +2868,7 @@ vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)
 vllm_cpp_add_test(test_ops_moe_nongated_relu2 vt/test_ops_moe_nongated_relu2.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
+vllm_cpp_add_test(test_ops_rmsnorm_weight_dtype vt/test_ops_rmsnorm_weight_dtype.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_ops_layernorm vt/test_ops_layernorm.cpp)
 vllm_cpp_add_test(test_fused_chain_additivity vt/test_fused_chain_additivity.cpp)

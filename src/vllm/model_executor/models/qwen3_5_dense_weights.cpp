@@ -90,6 +90,25 @@ OwnedTensor LoadModelBf16Direct(
   return o;
 }
 
+// MODEL-QWEN35-EXL3 (#2495 item 3): the SAME model-dtype vector, read from a
+// checkpoint whose unquantized remainder is F16 rather than BF16/F32.
+//
+// The F16 arm is reached ONLY when the caller has already established that this
+// projection group is EXL3, and that scoping is deliberate. Teaching
+// `LoadModelBf16Direct` F16 outright would widen acceptance for every dense
+// model in the tree through a conversion that drops three mantissa bits, which
+// is the argument `dense_loaders::LoadF16AsBf16Direct` makes at its own
+// declaration. Inside an EXL3 load the conversion is the right polarity: the
+// config's `torch_dtype` is bfloat16, exllamav3 merely stores the remainder at
+// its own fp16 runtime dtype, and bf16 is the MODEL dtype every layer inherits.
+OwnedTensor LoadModelVectorForScheme(const TensorResolver& get, bool exl3,
+                                     const std::string& name,
+                                     const std::vector<int64_t>& shape = {}) {
+  if (exl3 && get(name).dtype == "F16")
+    return dense_loaders::LoadF16AsBf16Direct(get, name, shape);
+  return LoadModelBf16Direct(get, name, shape);
+}
+
 OwnedTensor LoadBf16RawNK(const TensorResolver& get,
                           const std::string& name) {
   OwnedTensor out = LoadBf16Direct(get, name);
@@ -537,6 +556,31 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
                              const Fp8BlockQuantConfig& block) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
+  // MODEL-QWEN35-EXL3 (#2495 item 3) -- THE REFUSAL, and it is the honest half
+  // of this row rather than a gap in it.
+  //
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` quantizes the GDN linear-attention
+  // tower too, and 48 of this model's 64 layers are `linear_attention`. NOTHING
+  // in the GDN forward consumes an `Exl3Weight`: `ProjectGdnQkvz`,
+  // `ProjectGdnBA` and `ProjectGdnOut` know bf16, per-tensor FP8, block FP8 and
+  // NVFP4 and no trellis. Wiring that arm is #2495 item 4 and it carries its own
+  // dispatch, because the GDN in-projections are MERGED owners (`in_proj_qkvz`,
+  // `in_proj_ba`) and a trellis merge on the output dim is a real transform.
+  //
+  // The alternative to refusing is HALF-LOADING: this function would fall
+  // through to `get(la + "in_proj_qkv.weight")` and die on "tensor not found",
+  // a sentence about a checkpoint that is complete. Refusing by name is a
+  // gateable behaviour; the "missing tensor" is not.
+  for (const char* proj : {"in_proj_qkv", "in_proj_z", "out_proj"}) {
+    VT_CHECK(!dense_loaders::IsExl3Projection(has, la + proj),
+             "qwen3_5 dense: " + la + proj +
+                 " is stored EXL3 (trellis/suh/svh), and the GDN "
+                 "linear-attention tower has NO EXL3 arm -- nothing in "
+                 "ProjectGdnQkvz/ProjectGdnBA/ProjectGdnOut consumes an "
+                 "Exl3Weight. The dense half of this checkpoint (self_attn, "
+                 "mlp, lm_head) loads; the GDN half is #2495 item 4 and is "
+                 "owed. Refusing rather than half-loading.");
+  }
   // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6). Kept raw [N,K]
   // (nk=true -> vt::MatmulBT TN fast path). Mirror vLLM's TWO physical
   // MergedColumnParallelLinear owners (qwen3_5.py:203-210 stacked mapping +
@@ -602,6 +646,26 @@ FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
                                    const Fp8BlockQuantConfig& block) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
+  // MODEL-QWEN35-EXL3 (#2495 item 3). FIRST and exclusive, and selected by
+  // upstream's own storage predicate rather than by a config flag, so a
+  // checkpoint that quantizes only some layers loads each one the way it is
+  // actually stored (`Linear.is_exl3_storage`, `modules/linear.py:385-389`).
+  // An EXL3 projection has NO `.weight` at all, so every probe below --
+  // `IsNvfp4Projection`, the `get(name + ".weight").dtype` read, the block
+  // cross-check -- would either mis-route it or die asking for a tensor the
+  // checkpoint correctly does not ship. Mirrors `LoadLlamaLayer`
+  // (`llama_weights.cpp:73-85`), which is the working exemplar.
+  if (dense_loaders::IsExl3Projection(has, sa + "q_proj")) {
+    a.q_proj_exl3 = dense_loaders::LoadExl3(get, has, sa + "q_proj");
+    a.k_proj_exl3 = dense_loaders::LoadExl3(get, has, sa + "k_proj");
+    a.v_proj_exl3 = dense_loaders::LoadExl3(get, has, sa + "v_proj");
+    a.o_proj_exl3 = dense_loaders::LoadExl3(get, has, sa + "o_proj");
+    // The per-head q/k RMSNorm weights are NOT quantized; they ship beside the
+    // trellis at the checkpoint's unquantized dtype.
+    a.q_norm = LoadModelVectorForScheme(get, /*exl3=*/true, sa + "q_norm.weight");
+    a.k_norm = LoadModelVectorForScheme(get, /*exl3=*/true, sa + "k_norm.weight");
+    return a;
+  }
   // Three forms, not two. `modelopt_mixed` checkpoints quantize this tower to
   // FP8 W8A8 while leaving the MLP NVFP4, and a projection that matches neither
   // the NVFP4 probe nor an FP8 dtype is genuinely BF16. Without the middle
@@ -649,6 +713,17 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
                              const Fp8BlockQuantConfig& block) {
   const std::string mlp = base + "mlp.";
   DenseMlpWeights m;
+  // MODEL-QWEN35-EXL3 (#2495 item 3). FIRST and exclusive, for the same reason
+  // the attention arm is: an EXL3 projection ships no `.weight`, so every probe
+  // below reads a tensor that is not there. gate and up stay SEPARATE and
+  // `layers::Exl3MlpGateUpMethod` consumes the pair on the shared
+  // `MlpGateUpMethodBase` seam.
+  if (dense_loaders::IsExl3Projection(has, mlp + "gate_proj")) {
+    m.gate_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "gate_proj");
+    m.up_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "up_proj");
+    m.down_proj_exl3 = dense_loaders::LoadExl3(get, has, mlp + "down_proj");
+    return m;
+  }
   if (IsNvfp4Projection(has, mlp + "gate_proj")) {
     m.gate_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "gate_proj");
     m.up_proj_fp4 = LoadNvfp4AnyNaming(get, has, mlp + "up_proj");
@@ -825,10 +900,18 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
   const std::string base =
       backbone_prefix + "layers." + std::to_string(layer_idx) + ".";
   Qwen3_5DenseLayerWeights layer;
+  // MODEL-QWEN35-EXL3 (#2495 item 3): the two decoder norms are unquantized and
+  // ship at the checkpoint's own remainder dtype, which is F16 on an EXL3
+  // artifact. The probe asks about the projections of THIS layer, because
+  // exllamav3 decides the scheme per Linear and a `linear_attention` layer has
+  // no `self_attn.q_proj` to ask about at all.
+  const bool exl3 =
+      dense_loaders::IsExl3Projection(has, base + "mlp.gate_proj") ||
+      dense_loaders::IsExl3Projection(has, base + "self_attn.q_proj");
   layer.input_layernorm =
-      LoadModelBf16Direct(get, base + "input_layernorm.weight");
-  layer.post_attention_layernorm =
-      LoadModelBf16Direct(get, base + "post_attention_layernorm.weight");
+      LoadModelVectorForScheme(get, exl3, base + "input_layernorm.weight");
+  layer.post_attention_layernorm = LoadModelVectorForScheme(
+      get, exl3, base + "post_attention_layernorm.weight");
   if (layer_type == "linear_attention") {
     layer.is_linear_attention = true;
     layer.gdn = LoadGdnDense(get, has, base, block);
@@ -999,11 +1082,38 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   }
 
   Qwen3_5DenseWeights w;
-  w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");
-  w.final_norm = LoadModelBf16Direct(get, backbone + "norm.weight");
+  // MODEL-QWEN35-EXL3 (#2495 items 3 and 5). ONE whole-checkpoint question, and
+  // it is asked of the TENSORS rather than of `quantization_config`: exllamav3
+  // records the scheme per Linear, and an artifact that quantizes only part of
+  // the model is a shape this loader must read correctly. Layer 0 of this
+  // family is `linear_attention` and has no `self_attn`, so the MLP is the
+  // probe that always exists.
+  const bool exl3_checkpoint =
+      dense_loaders::IsExl3Projection(has, backbone + "layers.0.mlp.gate_proj") ||
+      dense_loaders::IsExl3Projection(has,
+                                      backbone + "layers.0.self_attn.q_proj") ||
+      dense_loaders::IsExl3Projection(has, "lm_head");
+  w.embed_tokens =
+      (exl3_checkpoint &&
+       get(backbone + "embed_tokens.weight").dtype == "F16")
+          ? dense_loaders::LoadF16AsBf16Direct(
+                get, backbone + "embed_tokens.weight")
+          : LoadBf16Direct(get, backbone + "embed_tokens.weight");
+  w.final_norm =
+      LoadModelVectorForScheme(get, exl3_checkpoint, backbone + "norm.weight");
   // The 27B owns an explicit head; smaller Qwen3.5 checkpoints tie logits to
   // the embedding table and omit lm_head.weight.
-  if (DenseCheckpointHasLmHead(has, "lm_head")) {
+  if (dense_loaders::IsExl3Projection(has, "lm_head")) {
+    // MODEL-QWEN35-EXL3 (#2495 item 5), mirroring `llama_weights.cpp:152-161`.
+    // A REAL quantized head is preferred over a tied embedding table EVEN when
+    // the config declares `tie_word_embeddings: true`: the publisher quantized
+    // a separate head at its own width, so the head is what it intends to be
+    // used. That width comes from the tensor and never from a config scalar --
+    // `turboderp/Llama-3.2-1B-Instruct-exl3` @ 3.0bpw ships a SIX-bit head
+    // under a config that says 3.0, and no shape check can catch a reader that
+    // trusts the scalar.
+    w.lm_head_exl3 = dense_loaders::LoadExl3(get, has, "lm_head");
+  } else if (DenseCheckpointHasLmHead(has, "lm_head")) {
     LoadDenseLmHead(get, has, "lm_head", w.lm_head, w.lm_head_fp4);
   } else {
     w.tied_lm_head = true;
@@ -1072,7 +1182,14 @@ bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
   // A PACKED head (PERF-27B-LMHEAD-FP4) is not plain bf16: this staging path
   // only knows how to stage OwnedTensors.
   if (!weights.lm_head_fp4.Empty()) return false;
+  // MODEL-QWEN35-EXL3 (#2495 item 5): a trellis head is not plain bf16 either.
+  // This predicate gates the DIRECT-DEVICE staging path, which knows only how
+  // to stage `OwnedTensor`s; an EXL3 weight reaches the device through
+  // `dense_attn::ResidentWeight` on three separate members instead.
+  if (!weights.lm_head_exl3.Empty()) return false;
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    if (layer.mlp.IsExl3()) return false;
+    if (!layer.is_linear_attention && layer.attn.IsExl3()) return false;
     if (!layer.mlp.gate_proj_fp4.Empty() || !layer.mlp.up_proj_fp4.Empty() ||
         !layer.mlp.down_proj_fp4.Empty()) {
       return false;

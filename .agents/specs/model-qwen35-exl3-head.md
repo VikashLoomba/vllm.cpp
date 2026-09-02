@@ -349,7 +349,11 @@ test binary's mtime MOVED, and that the tree was restored byte-for-byte.
 
 ## Outcome
 
-Measured on the branch AFTER merging `origin/main` (34 commits), on a CPU queue,
+Measured on the branch AFTER merging `origin/main` TWICE -- 34 commits, then a
+further 35 -- with the second merge's `docs/FEATURES.md` conflict resolved by
+taking the target-branch cell whole and re-applying this row's one sentence. The
+numbers below were reproduced identically on both merged trees, and the ones
+quoted are from the second, whose `origin/main` is `6e9fb55c9`. CPU queue,
 `RelWithDebInfo`, `-j 2`. No GPU, no lease, no checkpoint run.
 
 ### Gate

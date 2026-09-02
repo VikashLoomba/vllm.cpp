@@ -340,7 +340,13 @@ TEST_CASE("test_mtp_load_model_unified: MoE fused stacks split per expert and sh
   CHECK(up0[0] == gate_up[static_cast<size_t>(intermediate * hidden)]);
 }
 
-TEST_CASE("test_mtp_load_model_unified: every mtp tensor is strictly BF16") {
+// MODEL-QWEN35-EXL3-HEAD (#2495 item 5) NARROWS this title and nothing else.
+// The assertion is unchanged and still fires: `mtp.fc.weight` is the BF16
+// arm's tensor, which an EXL3 checkpoint does not ship at all, so the trellis
+// rung is not selected and the strictness refusal is still the right answer
+// for the arm this case is about. "every mtp tensor" is simply no longer
+// true of every checkpoint.
+TEST_CASE("test_mtp_load_model_unified: every mtp tensor on the BF16 arm is strictly BF16") {
   const HfConfig config = MakeConfig(Qwen3_5MTPKind::kDense);
   TensorStore store;
   AddDenseMtp(store, config);

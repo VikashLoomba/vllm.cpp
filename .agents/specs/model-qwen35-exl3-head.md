@@ -2,7 +2,9 @@
 
 Row: `MODEL-QWEN35-EXL3-HEAD`
 Issues: [#2495](https://github.com/mudler/vllm.cpp/issues/2495) (item 5's
-remainder and item 6)
+remainder and item 6);
+[#2569](https://github.com/mudler/vllm.cpp/issues/2569) (fixed and closed by
+this row)
 Base SHA: `a2c7e1962` (`origin/main`)
 Parent rows: [`MODEL-QWEN35-GDN-EXL3`](model-qwen35-gdn-exl3.md) →
 [`MODEL-QWEN35-EXL3`](model-qwen35-exl3.md) →
@@ -19,7 +21,7 @@ record. Nothing here re-derives either half.
 
 ## Now
 
-`ACTIVE`. An EXL3 `Qwen3_5ForConditionalGeneration` checkpoint's `mtp.*` draft
+`DONE`. An EXL3 `Qwen3_5ForConditionalGeneration` checkpoint's `mtp.*` draft
 head loads and runs, and all three readers of the TARGET's trellis `lm_head`
 compute with it packed.
 
@@ -88,12 +90,16 @@ per-tensor bit allocation looks like and is why `bits` is read from the trellis
 and never from `bpw`.
 
 That count corrects #2495's item table, which said 272 quantized tensors. It
-also surfaces a blocker this row does not fix: `(bits 3, codebook 2)` is NOT
-instantiated on the CUDA GEMM (`cuda_exl3.cu:1981`), so 137 modules of this
-target refuse by name on a device. Filed as
-[#2575](https://github.com/mudler/vllm.cpp/issues/2575) and listed under
-`## Owed`. Nothing in THIS row is three-bit: `mtp.*` is uniformly four and the
-head is six, and all three of `(4,2)`, `(5,2)`, `(6,2)` are instantiated.
+also surfaces a blocker this row does not fix and does not own: `(bits 3,
+codebook 2)` is NOT instantiated on the CUDA GEMM (`cuda_exl3.cu:1981`), so 137
+modules of this target refuse by name on a device. That is
+[#2574](https://github.com/mudler/vllm.cpp/issues/2574), owned by
+`QUANT-EXL3-MUL1`; this row reached the same measurement independently and
+[#2575](https://github.com/mudler/vllm.cpp/issues/2575) was closed as its
+duplicate. **The model therefore still cannot run end to end on CUDA**, and
+nothing in this row changes that. Nothing in this row is three-bit either:
+`mtp.*` is uniformly four and the head is six, and `(4,2)`, `(5,2)` and `(6,2)`
+are all instantiated.
 
 | tensor | dtype | shape | reading |
 |---|---|---|---|
@@ -205,6 +211,25 @@ Every logits site orders its arms `exl3 → fp4 → bf16`, so the three readers 
 one head cannot disagree about precedence. `Qwen3_5MTPModel::ComputeLogits` and
 `DflashLogitsF32D` are brought onto that order.
 
+### D5b — #2569: the shared read REFUSES when no arm matches
+
+`LoadDflashSharedLmHead` had a bf16 arm and an NVFP4 arm and nothing else, and
+when neither matched it fell off the end of its loop and RETURNED, leaving every
+owner empty and saying nothing. Its own header comment claimed it "throws,
+naming the target shards, when the head is absent"; the throw was actually one
+layer up, in `SharedHeadSource::LoadInto`, and it names bf16 tensors.
+
+**This row is what makes that reachable rather than theoretical.** The benchmark
+target ships no `lm_head.weight` at all, so on the DSpark lane — which offers no
+packed owner of either kind — the read matches nothing, and before this row the
+user got "the target's bf16 embed_tokens + lm_head were not found", which names
+the wrong tensor and the wrong reason for a head that is present.
+
+The refusal moves to the function that made the routing decision, and it names
+the three arms it tried and which of them the calling lane declined to offer.
+`LoadInto`'s emptiness check stays: the GGUF arm reaches it too, and it now
+includes the trellis owner so a loaded EXL3 head is not read as an absence.
+
 ### D6 — the refusals stay exactly as loud
 
 `RefuseQuantizedDflash2LmHead` is NOT widened and NOT touched.
@@ -232,6 +257,9 @@ IN:
 4. `SharedHeadSource::LoadInto` and `LoadDflashSharedLmHead` gain a REQUIRED
    EXL3 owner; `Qwen3DFlashWeights::lm_head_exl3`; `DflashLogitsF32D` computes
    with it.
+5. #2569: `LoadDflashSharedLmHead` throws by name when NO arm matches, instead
+   of returning an empty head. Fixed in this flow because this row's arm is what
+   makes the silent case reachable, and closed by it.
 
 OUT:
 
@@ -311,12 +339,100 @@ test binary's mtime MOVED, and that the tree was restored byte-for-byte.
   enters scope. #2495.
 * #2495 item 7 (the DFlash2 draft's own EXL3 arm), without which the published
   draft cannot be paired with this target.
-* [#2575](https://github.com/mudler/vllm.cpp/issues/2575): `(bits 3,
+* [#2574](https://github.com/mudler/vllm.cpp/issues/2574): `(bits 3,
   codebook 2)` on the CUDA GEMM. 137 of the target's 409 quantized modules are
   three-bit `mul1`, and `Exl3ArmInstantiated` does not carry that pair, so the
   target refuses by name on a device the moment its dense MLP tower is reached.
-  Found while measuring this row's evidence; kernel instantiation, so it belongs
-  with `QUANT-EXL3-MUL1`'s gate and not here.
+  NOT this row's: it is owned by `QUANT-EXL3-MUL1`, which owns the codebook-2
+  instantiation list. Listed here because it is what stands between this row's
+  loaders and an end-to-end CUDA run of the artifact.
+
+## Outcome
+
+Measured on the branch AFTER merging `origin/main` (34 commits), on a CPU queue,
+`RelWithDebInfo`, `-j 2`. No GPU, no lease, no checkpoint run.
+
+### Gate
+
+| binary | exit code | cases | assertions |
+|---|---|---|---|
+| `test_qwen35_exl3` | **0** | 10 / 10 passed | 3836 |
+| `test_qwen3_dflash2_draft` | **0** | 44 / 44 passed | 1491 |
+| `test_mtp_speculator` | **0** | 13 / 13 passed, **2 skipped** | 171 |
+| `test_mtp_depth` | **0** | 10 / 10 passed | 123 |
+
+The two skips in `test_mtp_speculator` are `test_run_model_reuses_tensor_return_for_mtp`
+and `test_run_model_unpacks_tuple_return_for_mtp`, both carrying a literal
+`* doctest::skip(true)` since before this row. Nothing this row added is skipped.
+
+The exit code is quoted beside the counts on purpose: a doctest `assertions:`
+line stays GREEN on a thrown case, and every mutation below demonstrates exactly
+that — M1 reports `2808 | 2808 passed | 0 failed` while the binary exits 1.
+
+Equivalence against the decoded twin — the SAME trellis bytes read as a bf16
+`.weight` and run through the same forward:
+
+| case | rel_rms | bound |
+|---|---|---|
+| `mtp.*` EXL3 paged logits (item 5) | **0.0107** | 5.0e-2 |
+| DFlash shared trellis head (item 6) | **0.00164** | 5.0e-2 |
+
+### Mutations
+
+Each row asserts the mutated file's sha256 CHANGED, that it COMPILED
+(`BUILD_RC=0` — a build failure is not a red test), that the test binary's
+mtime MOVED, and that the tree was restored byte-for-byte afterwards.
+
+| # | mutation | sha | build | mtime | exit | cases |
+|---|---|---|---|---|---|---|
+| M1 | `ComputeLogits`'s trellis arm -> `false &&` | dc388ac→ff40a38 | 0 | moved | **1** | 9/10 |
+| M2 | `MtpHeadHidden`'s `fc` trellis arm -> `false &&` | dc388ac→4321f93 | 0 | moved | **1** | 9/10 |
+| M3 | `LoadDflashSharedLmHead`'s trellis rung -> `false &&` | 7a22f95→289a075 | 0 | moved | **1** | 9/10 |
+| M4 | `Qwen3_5MTPWeights::IsExl3()` -> `return false` | 2639fcc→9e3094f | 0 | moved | **1** | 9/10 |
+| M5 | the #2569 no-arm throw -> silent `return` | 7a22f95→1de8f50 | 0 | moved | **1** | 8/10 |
+| M6 | `DflashLogitsF32D`'s trellis arm -> `false &&` | eb27844→88238d5 | 0 | moved | **1** | 43/44 |
+
+M5 is #2569's RED-BEFORE: with the throw removed, both the DSpark-shape case and
+the no-arm-at-all case fail, which is the state the tree was in before this row.
+
+**What M1 and M2 prove, and what they do not.** Both red the same case with the
+same message, `vt: matmul: rank-2 tensors required` (`ops.cpp:118`) — an
+anonymous shape error, because each mutation drops the arm into a bf16 field an
+EXL3 load leaves EMPTY. They establish that each call site is load-bearing; they
+do NOT establish that the diagnostic is good, and the gate cannot tell the two
+sites apart. That is the same limit `model-qwen35-gdn-exl3.md` recorded for its
+own reachability mutation. M4 and M3 do produce named refusals
+(`qwen3_5 MTP: unexpected rank for mtp.fc.weight`, and #2569's own message).
+
+### Decisions, and why each default has its value
+
+* **PACKED, not dequantized** (D1). A mirror of upstream, not a choice: the head
+  is an `nn.Module` and `_apply_head` calls `lm_head.quant_method.apply`. The
+  sizes make it a bad choice independently — 2.543 GB dequantized against
+  0.953 GB packed at the real 248320x5120x6-bit — and #1849 added the
+  borrow-first seam precisely to stop a copy of this tensor.
+* **REQUIRED, not defaulted** (D2). Three owners now, three no-default pointer
+  parameters. The alternative has already shipped a silent-off arm here once.
+* **Probe per group, never `mtp_bits`** (D4). The artifact's own MLP tower is
+  mixed 3/4-bit per layer with one lone 5-bit attention projection, which is
+  what makes reading width from the trellis rather than from `bpw` load-bearing
+  rather than fastidious.
+* **`(3,2)` is NOT this row's** (#2574). Measured here, owned by
+  `QUANT-EXL3-MUL1`. The artifact still cannot run end to end on CUDA.
+
+### What was NOT verified
+
+* **The published checkpoint was never RUN.** Its 15.4 GB landed during this row
+  and both shards' headers were read in full, so every name, dtype, shape, width
+  and marker quoted here is measured. No forward over those weights executed, on
+  any device.
+* **No device run at all.** Every number above is a CPU queue over a synthetic
+  fixture whose head is FOUR bits where the artifact's is six.
+* **No speed, latency or memory number is claimed on any axis.**
+* The full all-targets build was NOT completed: it ran out of disk while linking
+  four unrelated `test_ltx2*` binaries. Zero compile errors were reported before
+  that point, so the change compiles tree-wide; the four link failures are
+  `No space left on device` and nothing else.
 
 ## Stop conditions
 

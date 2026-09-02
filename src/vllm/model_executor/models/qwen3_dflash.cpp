@@ -115,11 +115,13 @@ DBuf DflashLogitsF32D(Dev d, const Tensor& x, const Qwen3DFlashWeights& weights,
   // empty `lm_head` and SEGFAULT, which is a red the suite cannot explain. A
   // named refusal is the same red with the reason attached.
   VT_CHECK(!weights.lm_head.Empty(),
-           "dflash: the draft's SHARED lm_head is empty in BOTH owners. The draft "
-           "runs the TARGET's head, so the loader fills exactly one of "
-           "`lm_head` (raw-NK bf16) and `lm_head_fp4` (packed NVFP4) -- see "
-           "LoadDflashSharedLmHead (qwen3_dflash.h), issue #1628 "
-           "(https://github.com/mudler/vllm.cpp/issues/1628).");
+           "dflash: the draft's SHARED lm_head is empty in ALL THREE owners. The "
+           "draft runs the TARGET's head, so the loader fills exactly one of "
+           "`lm_head` (raw-NK bf16), `lm_head_fp4` (packed NVFP4) and "
+           "`lm_head_exl3` (packed EXL3 trellis) -- see LoadDflashSharedLmHead "
+           "(qwen3_dflash.h), issues #1628 "
+           "(https://github.com/mudler/vllm.cpp/issues/1628) and #2495 "
+           "(https://github.com/mudler/vllm.cpp/issues/2495).");
   Tensor lm = ResidentWeight(d, weights.lm_head, {vocab, hidden_size});
   DBuf logits(d, DType::kF32, {x.shape[0], vocab});
   vt::MatmulBT(d.q, logits.t(), x, lm);

@@ -119,6 +119,65 @@ that reached their own completion marker. Where two clean legs exist, their id
 sequences are compared to each other, because an arm that does not reproduce
 its own ids has no business being compared to anything else.
 
+## The tree this measures, stated as a bounded claim
+
+The binary under test is the one #2511 characterised: `libvllm.so` built from
+`11fed3ba56b8f823c07032416982a44a8c0967b5`, Release, `VLLM_CPP_HIP=ON`,
+`VLLM_CPP_HIP_ARCHITECTURES=gfx1151`. Scoring the gate on that artifact keeps
+the fault-rate evidence and the token verdict on one binary, which is worth
+more here than currency.
+
+That base is behind `origin/main`, and "behind" is not a useful thing to say.
+**Exactly six commits touch `src/vt/rocm/` or `include/vt/rocm/` across the
+gap**, and none of them changes the Q4_K decode path:
+
+```sh
+git log --oneline 11fed3ba5..origin/main -- src/vt/rocm/ include/vt/rocm/
+```
+
+| commit | what it is | why it cannot move this measurement |
+|---|---|---|
+| `f424b53fe` | `RocmBackend::FlushPending` | its only call site is guarded by `slot.ref_selected` (`src/vt/op_provider.cpp:707-711`), so it fires only when the portable reference tier is selected. Every #2511 leg reported zero reference-tier hits and this run asserts the same, so it never executes here |
+| `456f9cd6f` | the `Fmt == 3` Q6_K register-resident body | ours, `VT_ROCM_Q6K_SMALL_PRIVATE`, default OFF, and measured WORSE (6 of 6 failures against 4 of 6). It must stay off and this run does not set it |
+| `3fede4162`, `e38403663` | `IQ3_S` | a different ggml type; one line of `rocm_grouped_gemm.hip` each |
+| `1dc686479`, `9dcc34cc3` | EXL3 trellis on gfx1151 | a different quantization format |
+
+`1dc686479` is the only one that needed a check beyond its subject, because it
+moves four f16/bf16 device codec helpers out of `rocm_grouped_gemm.hip` into
+`include/vt/rocm/rocm_f16_codec.h`, and `DF16ToF32` decodes a Q4_K superblock
+scale. The move is comment-only for the code: the four function bodies hash
+`3f8da2d5ce1760bd1d72acdf147285576ec03aa4e409fdeb7c38b69b41a363b8` on **both**
+sides of the gap. Only added comments differ.
+
+So the Q4_K fault path and the Q4_K arithmetic are unchanged across the gap.
+The evidence states this list rather than a commit count, because a list is
+checkable and a count reads as unquantified staleness.
+
+## How a same-rate, different-index result is to be reported
+
+Fixed here, before the data, because it is exactly the finding a reader would
+want massaged afterwards.
+
+The CPU-tier work has measured that under perturbations which did **not** move
+the divergence rate, the first-diff INDEX moved readily: prompt 1 from 34 to
+21, prompt 2 from 20 to 4. The index is therefore not a stable signal. What is
+stable is the RATE and the SET of near-tie steps.
+
+Three outcomes and their honest labels:
+
+- **Same rate, same indices, same ids** — the strongest available evidence for
+  one shared term in the quant path.
+- **Same rate, different indices** — reported as exactly that, and NOT as
+  evidence of a ROCm-local cause. A moved index is what this class of
+  perturbation does. The margins decide, and the comparison of the near-tie
+  step SETS carries more than the first-diff column.
+- **Different rate** — a real difference in magnitude between the tiers, and
+  the first thing worth chasing.
+
+No result is to be forced onto the recorded `7 / 34 / 20 / - / 14 / 32`
+pattern. A same-rate, different-index answer reported plainly is a better
+result than a match argued into existence.
+
 ## Risks
 
 - **The board faults anyway.** Contradicts a 10-leg result and is important

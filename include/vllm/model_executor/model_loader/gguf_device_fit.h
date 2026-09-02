@@ -35,6 +35,7 @@
 #include <string_view>
 
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
+#include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 
 namespace vllm {
@@ -131,6 +132,15 @@ struct GgufStagedFootprint {
   // The arena term actually added (0 when the lane is off, and 0 when it is on
   // but nothing matched).
   size_t arena_bytes = 0;
+  // #2517. How many routed-expert tensors the installed hybrid PLACEMENT took
+  // out of the sum, and how many bytes they would otherwise have contributed.
+  // Both 0 with no plan, and 0 with a plan that places nothing.
+  //
+  // Reported rather than merely subtracted, for the same reason the streamed
+  // pair is: a figure that shrank by 137 GiB without saying which tensors left
+  // it is a number an operator cannot check.
+  size_t placed_tensor_count = 0;
+  size_t placed_bytes = 0;
 };
 
 // The per-expert SLICE size of a stacked expert tower, which is the slot size
@@ -254,10 +264,28 @@ inline bool GgufPolicyForcesFullExpand(const GgufLoadPolicy& policy) {
 // available on that device) where the min-based bound under-counted by
 // roughly 4x and the load reached an uncaught `hipMalloc: out of memory`
 // instead of this refusal.
+//
+// `placement` (#2517) is the resolved hybrid-placement plan, or null for no
+// plan. A routed-expert tensor whose layer the plan places away from the plan's
+// own engine device is moved into `placed_*` and leaves the bound, because a
+// layer whose MoE block only ever runs on the placement device is never staged
+// to the accelerator -- `RunMoePlaced` hands that device to the block and
+// `ResidentWeight` aliases host bytes on a CPU `Dev` rather than uploading them
+// (`moe_placement_seam.h`). NULL, or a plan that places nothing, reproduces the
+// pre-#2517 answer byte for byte, which is every load in this tree that
+// configured no placement.
+//
+// WHY THIS IS NOT OPTIONAL BOOKKEEPING. `InstallMoePlacementPlan` runs 220 lines
+// ABOVE the one `CheckDeviceWeightFit` call site (`model_loader.cpp:2672` and
+// `:2895`), and before this parameter existed the refusal quoted the UN-reduced
+// footprint on the line after the plan announced it had reduced it. On
+// `strix:gpu0` that contradiction was the whole distance between a placed
+// GLM-5.3 load and a forward.
 GgufStagedFootprint GgufStagedWeightFootprint(
     const GgufFile& gguf, size_t model_dtype_bytes = 2,
     const StreamedExpertLane& lane = {},
-    bool policy_forces_full_expand = false);
+    bool policy_forces_full_expand = false,
+    const MoePlacementPlan* placement = nullptr);
 
 // The budget to compare a footprint against, in bytes, or 0 for UNKNOWN.
 //
@@ -383,6 +411,7 @@ DeviceWeightFit CheckDeviceWeightFit(const GgufFile& gguf,
                                      size_t budget_bytes,
                                      size_t model_dtype_bytes = 2,
                                      const StreamedExpertLane& lane = {},
-                                     bool policy_forces_full_expand = false);
+                                     bool policy_forces_full_expand = false,
+                                     const MoePlacementPlan* placement = nullptr);
 
 }  // namespace vllm

@@ -2921,12 +2921,29 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // defaults) should run. Using the narrower predicate here is what makes
       // this refusal reachable on ROCm without moving any of the other one's
       // consumers; the row's spec records why that flag stays untouched.
+      // #2517: THE PLAN INSTALLED 220 LINES ABOVE, credited here.
+      //
+      // `InstallMoePlacementPlan` runs at the top of this branch, before any
+      // weight I/O, and announces what it placed. Until this argument existed
+      // the refusal on the very next line quoted the UN-reduced footprint: one
+      // load printed "56 layers run their routed experts on cpu ... to bring a
+      // 216433205760 B footprint under a 68719476736 B budget" and then refused
+      // needing 216433205760 B. Two lines of one load contradicting each other,
+      // and on `strix:gpu0` the contradiction was the whole distance between a
+      // placed GLM-5.3 load and a forward.
+      //
+      // The GLOBAL rather than a local, because `SetActiveMoePlacementPlan` is
+      // where the plan lives and the forward reads the same object; a copy taken
+      // here could be the one the seam never sees. It is installed
+      // unconditionally, including when nothing is placed, so this is never a
+      // stale plan from a previous load in the same process.
       const DeviceWeightFit fit = CheckDeviceWeightFit(
           gguf, vt::DeviceTypeName(target.device_type()),
           target.allocates_bounded_device_memory(),
           DeviceWeightBudgetBytes(
               target.residency_policy().device_memory_total_bytes),
-          /*model_dtype_bytes=*/2, lane, policy_forces_full_expand);
+          /*model_dtype_bytes=*/2, lane, policy_forces_full_expand,
+          &vllm::ActiveMoePlacementPlan());
       if (fit.refuse) throw std::runtime_error(fit.message);
     }
     // QUANT-QWEN38-27B-GGUF-ARM (#821): refuse a qwen3_5-family GGUF carrying

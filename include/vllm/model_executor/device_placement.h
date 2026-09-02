@@ -171,6 +171,19 @@ class MoePlacementPlan {
   // gets the inert answer rather than an exception on the decode path.
   vt::DeviceType DeviceForLayer(int64_t l) const;
 
+  // The device THIS ROUTED-EXPERT TENSOR's block runs on, keyed by the only
+  // thing a weight loader has: the name.
+  //
+  // WHY THE LOADER NEEDS THIS. `RunMoePlaced` hands the placed device to the
+  // forward, but the RESIDENCY of a routed-expert tower is decided far earlier,
+  // by `GgufLoadPolicy::Route`, and that decision is a question about the device
+  // that will EXECUTE the tower — whether it has a `vec_dot` for the encoding.
+  // Asking the engine device about a tower the plan has already sent elsewhere
+  // is how a checkpoint whose experts every placement device can execute is
+  // refused at load. A name with no `blk.<N>.` prefix, and a layer this plan was
+  // not resolved against, both answer the engine device.
+  vt::DeviceType DeviceForRoutedExpertTensor(const std::string& name) const;
+
   // True when at least one layer runs its experts somewhere other than the
   // engine device. The forward reads this to decide whether any of the placement
   // machinery runs at all, so an unplaced model pays nothing.
@@ -211,6 +224,12 @@ class MoePlacementPlan {
 // so a test asserts the same strings the resolver asks about rather than a copy
 // of them.
 std::vector<std::string> RoutedExpertTensorNames(int64_t layer);
+
+// The decoder-block index a llama.cpp GGUF tensor name carries (`blk.<N>.…`),
+// or -1 when it carries none. The inverse of `RoutedExpertTensorNames`' own
+// prefix, exposed so a caller resolves the layer with the same rule the plan was
+// built with instead of a private copy of it.
+int64_t GgufBlockIndexFromTensorName(const std::string& name);
 
 // ── The placement device's queue, and the active plan ────────────────────────
 

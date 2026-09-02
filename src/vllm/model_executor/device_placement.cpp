@@ -142,6 +142,46 @@ vt::DeviceType MoePlacementPlan::DeviceForLayer(int64_t l) const {
   return per_layer_[static_cast<size_t>(l)];
 }
 
+int64_t GgufBlockIndexFromTensorName(const std::string& name) {
+  // `blk.<N>.` is llama.cpp's GGUF spelling for a decoder block, and it is the
+  // ONLY key a loader has: `GgufTensorInfo` carries a name, never a layer.
+  // `RoutedExpertTensorNames` composes the same prefix and
+  // `LlmFfnExpsBlockRegex` matches it, so this is the inverse of two functions
+  // that already exist rather than a new naming convention.
+  //
+  // ANCHORED AT THE START, deliberately. `regex_search`'s unanchored semantics
+  // are right for an operator's `-ot` pattern and wrong here: a name that merely
+  // CONTAINS `blk.3.` is not a block-3 tensor, and answering as though it were
+  // would move a weight no plan claimed.
+  static constexpr char kPrefix[] = "blk.";
+  const size_t plen = sizeof(kPrefix) - 1;
+  if (name.size() <= plen || name.compare(0, plen, kPrefix) != 0) return -1;
+  size_t i = plen;
+  int64_t idx = 0;
+  bool any = false;
+  while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
+    // A count that cannot be a layer index is not a layer index. Refusing
+    // instead of wrapping keeps a malformed name out of `per_layer_`'s range
+    // rather than aliasing it onto a real layer.
+    if (idx > (INT64_MAX - 9) / 10) return -1;
+    idx = idx * 10 + (name[i] - '0');
+    any = true;
+    ++i;
+  }
+  if (!any || i >= name.size() || name[i] != '.') return -1;
+  return idx;
+}
+
+vt::DeviceType MoePlacementPlan::DeviceForRoutedExpertTensor(
+    const std::string& name) const {
+  const int64_t layer = GgufBlockIndexFromTensorName(name);
+  // A name carrying no block index belongs to no layer, so no placement claims
+  // it. The engine's own device is the inert answer, which is `DeviceForLayer`'s
+  // own out-of-range behaviour rather than a second convention.
+  if (layer < 0) return engine_device_;
+  return DeviceForLayer(layer);
+}
+
 std::string MoePlacementPlan::Describe() const {
   if (placed_ == 0) return "";
   std::string out = std::to_string(placed_);

@@ -1299,7 +1299,7 @@ TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
   //
   // REACHABLE REFUSALS: a product path constructs the condition, so a caller can
   // trip this. ONE of the five is, not two. The engine reaches
-  // `ltx2_upsampler.cpp:465` through `Ltx2UpsampleVideoLatent`, which
+  // `ltx2_upsampler.cpp:497` through `Ltx2UpsampleVideoLatent`, which
   // `ltx2_video.cpp` calls when a phase asks for the spatial-upsample transform.
   //
   // `kBetaScheduler` USED TO BE LISTED HERE and is not reachable. Its call site
@@ -1432,8 +1432,8 @@ TEST_CASE("ltx2 every out-of-scope feature is refused BY NAME") {
 // enumerator that appears in `src/` proves only that the compiler can see it.
 // So the check is on the ENTRY FUNCTION of each arm's chain:
 //
-//   kSpatiotemporalUpsampler  `Ltx2LatentUpsample` (ltx2_upsampler.cpp:465)
-//                             <- `Ltx2UpsampleVideoLatent` (:566)
+//   kSpatiotemporalUpsampler  `Ltx2LatentUpsample` (ltx2_upsampler.cpp:497)
+//                             <- `Ltx2UpsampleVideoLatent` (:681)
 //                             <- `ltx2_video.cpp`, the phase that upsamples
 //   kBetaScheduler            `Ltx2Schedule` (ltx2_pipeline.cpp:199)
 //                             <- NOTHING
@@ -1573,7 +1573,7 @@ TEST_CASE("ltx2 docs/FEATURES.md never calls a REACHABLE refusal unrequestable")
   const std::string doc = buf.str();
   REQUIRE(doc.size() > 1000);
 
-  // The ONE arm with a product call site: `ltx2_upsampler.cpp:465` constructs the
+  // The ONE arm with a product call site: `ltx2_upsampler.cpp:497` constructs the
   // SPATIOTEMPORAL upsampler condition, and `ltx2_video.cpp` reaches it through
   // `Ltx2UpsampleVideoLatent`. Named by the word the doc uses for it, since that
   // is what a reader sees.
@@ -2001,7 +2001,7 @@ TEST_CASE("ltx2 the constants the headers call pinned are actually pinned") {
   //     the argument does not make the default unreachable — the default IS the
   //     shipped width, which ltx2_upsampler.h has said all along. Only the
   //     Rational1p5 arm reaches it, because `BlurDownsample` runs on the
-  //     rational `den` (ltx2_upsampler.cpp:439) and 1.5 -> {3, 2} is the only
+  //     rational `den` (ltx2_upsampler.cpp:599) and 1.5 -> {3, 2} is the only
   //     one of the THREE ARMS with den != 1. (0.75 -> {3, 4} would reach it too
   //     and no arm covers it, so this is arm coverage, not a property of the
   //     supported-scale map.)
@@ -2165,8 +2165,8 @@ TEST_CASE("ltx2 the latent upsampler reproduces upstream on the dims=2 arm") {
   CHECK(got.channels == vllm_test::kLtx2UpsDims2OutShape[1]);
   // THE FRAME COUNT COMES BACK UNCHANGED. This is the property that makes the
   // arm consumable rather than merely computed: both spatial call sites in
-  // ltx2_video.cpp require it (`vshape.frames` at :3509-3516 and
-  // `slot_positions.size()` at :3536-3548).
+  // ltx2_video.cpp require it (`vshape.frames` at :3525-3531 and
+  // `slot_positions.size()` at :3552-3563).
   CHECK(got.frames == vllm_test::kLtx2UpsDims2OutShape[2]);
   CHECK(got.frames == latent.frames);
   CHECK(got.height == vllm_test::kLtx2UpsDims2OutShape[3]);
@@ -2240,10 +2240,21 @@ TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   // the dims=2 arm" above gates it against the executed module. What survives
   // here is the one 2-D combination upstream itself cannot run: the temporal
   // upsampler is a Conv3d (model.py:68-71) and the dims=2 forward (:85-100)
-  // folds the frame axis into the batch before reaching it, so torch raises on
-  // the rank. Checked through the TEMPORAL config specifically, because the two
-  // arms take different branches and a guard placed inside one of them would let
-  // the other through.
+  // folds the frame axis into the batch before reaching it.
+  //
+  // NOT "torch raises on the rank", which is what this paragraph used to say and
+  // what `ltx2_upsampler.cpp` and `ltx2_upsampler.h` were corrected to stop
+  // saying. `Conv3d` accepts a 4-D input as an UNBATCHED 5-D one, so the folded
+  // `(b*f, c, h, w)` is read as `(C, D, H, W)` and the CHANNEL count is what
+  // disagrees; at `frames == mid_channels` that Conv3d would pass and
+  // `PixelShuffleND(1)`'s einops pattern fails instead. Two mechanisms behind
+  // one shape coincidence, which is why the port refuses the configuration by
+  // NAME rather than by either of them. `scripts/gen-ltx2-pipeline-goldens.py`
+  // runs both contradictions through the real module and asserts the message.
+  //
+  // Checked through the TEMPORAL config specifically, because the two arms take
+  // different branches and a guard placed inside one of them would let the other
+  // through.
   vllm::Ltx2UpsamplerConfig temporal_two_d = TemporalUpsamplerConfig("");
   temporal_two_d.dims = 2;
   const std::string two_d_message = refuse("temporal dims=2", temporal_two_d);
@@ -2252,6 +2263,24 @@ TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   // change: a caller who supplies an ordinary 2-D spatial checkpoint must now be
   // served, and only this contradiction refused.
   CHECK(two_d_message.find("is not ported") == std::string::npos);
+
+  // THE EIGHTH CELL, where the two dims=2 contradictions are BOTH set and only
+  // one of them is upstream's. `__init__` is an if/elif chain: with
+  // `spatial_upsample` false, `elif temporal_upsample` (model.py:68) builds the
+  // Conv3d and never reads `rational_resampler`, so this config owns no
+  // SpatialRationalResampler at all. Refusing it while naming a module upstream
+  // did not construct sends the caller to the wrong flag.
+  //
+  // This asserts the MESSAGE, not the polarity, because the polarity cannot see
+  // the defect: the config is refused whichever `Require` fires first. Swapping
+  // the two back in `ltx2_upsampler.cpp` leaves every other case green and reds
+  // exactly these two lines.
+  vllm::Ltx2UpsamplerConfig temporal_and_rational = TemporalUpsamplerConfig("");
+  temporal_and_rational.dims = 2;
+  temporal_and_rational.rational_resampler = true;
+  const std::string both_message = refuse("temporal+rational dims=2", temporal_and_rational);
+  CHECK(Mentions(both_message, "dims=2 with temporal_upsample=true"));
+  CHECK(both_message.find("rational_resampler=true") == std::string::npos);
 
   // THE SIBLING OF THE GUARD ABOVE, and the one this row first shipped without.
   // `dims=2` with the RATIONAL resampler is upstream's OTHER 2-D contradiction:

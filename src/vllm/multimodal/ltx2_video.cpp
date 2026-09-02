@@ -3487,7 +3487,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // supplied a genuine SPATIOTEMPORAL checkpoint that they had handed over the
       // temporal one — wrong on both counts, and pointing them at the arm they
       // already had. It also shadowed the ledger refusal at
-      // `ltx2_upsampler.cpp:465`, which names the spatiotemporal arm and was
+      // `ltx2_upsampler.cpp:497`, which names the spatiotemporal arm and was
       // therefore unreachable from any request. Narrowed here so a both-flags
       // config falls THROUGH to that refusal. Gated by test_ltx2_video's
       // "a SPATIOTEMPORAL upsampler checkpoint is refused as SPATIOTEMPORAL".

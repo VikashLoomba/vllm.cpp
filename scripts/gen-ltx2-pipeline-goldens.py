@@ -1238,6 +1238,24 @@ def section_upsampler(out) -> None:
             dict(spatial_upsample=True, temporal_upsample=False, rational_resampler=True),
             "not enough values to unpack",
         ),
+        # THE CELL WHERE BOTH CONTRADICTIONS ARE SET, and the reason the C++ side
+        # checks them in the order it does. `__init__` is an if/elif chain: with
+        # `spatial_upsample` False, `elif temporal_upsample` (model.py:68) builds
+        # the Conv3d and NEVER reads `rational_resampler`, so this config owns no
+        # SpatialRationalResampler and cannot fail by its unpack. It fails by the
+        # temporal mechanism, and this case is what says so with the module rather
+        # than with reasoning about it. `ltx2_upsampler.cpp` therefore checks the
+        # temporal contradiction FIRST; swapping the two gives this cell an
+        # explanation naming a module upstream did not construct.
+        #
+        # Measured, not asserted: replacing the expected substring below with the
+        # rational one makes the generator raise and quote what upstream really
+        # said -- "expected input[1, 3, 32, 4, 6] to have 32 channels, but got 3".
+        (
+            "temporal-and-rational",
+            dict(spatial_upsample=False, temporal_upsample=True, rational_resampler=True),
+            "channels, but got",
+        ),
     ):
         contradiction = LatentUpsampler(
             in_channels=_UPS_IN,

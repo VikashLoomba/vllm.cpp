@@ -36,10 +36,13 @@ tree is not the pin.
 
 ## 1. The gap, on this tree
 
-`Ltx2LatentUpsample` refuses every non-3-D config:
+`Ltx2LatentUpsample` refuses every non-3-D config. The anchor below reads
+`6974557b0`, the base this spec was written against, because the row's own
+implementation DELETES those lines -- a §1 anchor is the only kind here that a
+successful row is supposed to falsify:
 
 ```
-src/vllm/model_executor/models/ltx2_upsampler.cpp:467-472
+src/vllm/model_executor/models/ltx2_upsampler.cpp:467-472 @ 6974557b0
   Require(config.dims == 3, "ltx2 upsampler: dims=... is not ported. ...");
 ```
 
@@ -79,12 +82,12 @@ if self.dims == 2:
 
 **Kernel rank.** Every convolution above is a 4-D `Conv2d` weight, where the
 `dims == 3` arm's identically-named tensor is 5-D. This is the same rank trap
-the temporal arm already documents at `ltx2_upsampler.cpp:421-424` for
+the temporal arm already documents at `ltx2_upsampler.cpp:453-456` for
 `upsampler.0.weight`, now applying to four more groups.
 
 **GroupNorm statistics.** `(b f)` makes every frame its own sample, so
 `GroupNorm(32, ...)` reduces over `(channels_per_group, H, W)`. Our `GroupNorm`
-reduces over `frames * height * width` (`ltx2_upsampler.cpp:166`), which is the
+reduces over `frames * height * width` (`ltx2_upsampler.cpp:178`), which is the
 `dims == 3` statistic. A port that reused it would produce a correctly shaped,
 finite, plausible latent that is wrong everywhere — the failure mode this file's
 header already names twice.
@@ -103,7 +106,7 @@ one-frame volume's `frames * height * width` **is** `height * width`.
 
 The convolutions become `Conv2dPad1PerFrame`, which already exists
 (`ltx2_upsampler.cpp:120`) and already takes a 4-D weight and already asserts
-its element count at `:132`. `ResBlockForward` gains a `dims` parameter and
+its element count at `:130-131`. `ResBlockForward` gains a `dims` parameter and
 selects between the two conv helpers, mirroring `res_block.py:21` rather than
 duplicating the block.
 
@@ -123,7 +126,7 @@ configuration, and its output is consumable rather than merely computed.
 Entry point: the `upsampler_path` load extra
 (`include/vllm/multimodal/ltx2_video.h`), read by `LoadVideoEngine` and applied
 by the second phase's input transform at
-`src/vllm/multimodal/ltx2_video.cpp:3521-3508`.
+`src/vllm/multimodal/ltx2_video.cpp:3521-3524`.
 
 Consumability is the part worth stating, because it is what separates A9 from
 A8. With the default flags a `dims=2` upsampler returns `[c, f, 2h, 2w]`:
@@ -163,14 +166,14 @@ when the temporal doubling is exactly undone by the mandatory drop.
 
 `vshape.frames` is `(frames - 1) / factors.time + 1` (`:3411`) and
 `factors.time` is the default-constructed 8
-(`ltx2_video.cpp:2853`, `ltx2_pipeline.h:460-462`), so `f == 1` needs
+(`ltx2_video.cpp:2871`, `ltx2_pipeline.h:460-462`), so `f == 1` needs
 `frames <= 8`. That is reachable — `num_frames` in 2..8 passes through verbatim
-at `:2853`, and the only lower bound anywhere on the path is `frames < 1` at
-`:2853` — but it is the one configuration in which the capability's whole point,
+at `:2852-2853`, and the only lower bound anywhere on the path is `frames < 1` at
+`:2869` — but it is the one configuration in which the capability's whole point,
 the doubled frame axis, is cancelled before anything can observe it.
 
 For every other clip, porting the operator would replace the named refusal at
-`ltx2_upsampler.cpp:465` with the generic shape complaint at `:3511`. The guard
+`ltx2_upsampler.cpp:497` with the generic shape complaint at `:3527`. The guard
 immediately above it (`ltx2_video.cpp:3473-3502`) exists to prevent precisely
 that substitution for the temporal-only arm, and its comment says so.
 
@@ -193,6 +196,16 @@ hiding.
 
 The refusal case in `test_ltx2_pipeline.cpp` ("the upsampler refuses the arms it
 does not implement") loses its two `dims` arms and keeps the rest.
+
+It also gains the EIGHTH CELL, where both 2-D contradictions are set at once.
+Only one of them is upstream's: `__init__` is an if/elif chain, so with
+`spatial_upsample` false `elif temporal_upsample` (`model.py:68`) builds the
+Conv3d and never reads `rational_resampler`. The generator drives that cell
+through the real module as a third contradiction and asserts the CHANNEL-count
+exception, so which refusal the port fires there is measured rather than
+reasoned. The C++ case asserts the MESSAGE and asserts the other flag is not
+named, because the polarity cannot see the defect: the cell is refused whichever
+`Require` runs first.
 
 ## 7. Risks
 
@@ -247,18 +260,25 @@ unmodified tree: six parameter-count mismatches (`5184 == 1728` for
 the red is a checkout away and is not carried here as a log file.
 
 After the change, on the restored tree: `test_ltx2_pipeline` 62/62 cases and
-3619 assertions green, `test_ltx2_video` 109/109 cases green including the new
-end-to-end render.
+3625 assertions green, `test_ltx2_video` 109/109 cases and 4866 assertions green
+including the new end-to-end render. The generator regenerates
+`ltx2_pipeline_goldens.inc` byte-identically with its third contradiction case
+added, because a contradiction case emits nothing.
 
-### Mutations — both RED, restored byte-for-byte
+### Mutations — four RED, each restored byte-for-byte
 
 | Mutation | Golden | End-to-end render | What it proves |
 |---|---|---|---|
 | **A**: `const bool two_d = false` | RED, `conv3d weight has the wrong element count` | **RED**, same throw at `test_ltx2_video.cpp:690` | The production path — `LoadVideoEngine` + `Generate` through the `upsampler_path` extra — really enters the new branch. This is the reachability proof, and it is a render that fails, not a unit test |
 | **B**: keep the 2-D convolutions, drop the per-frame fold | **RED**, `max|diff| = 0.679842`, and the per-frame independence property RED at `0.439442` | **GREEN** | The fold's only consequence is numerical. Every shape is identical, so no shape check anywhere can see it and the value golden is the sole gate. This is the claim the code comment makes, now measured |
+| **C**: the eighth cell's expected substring, `channels, but got` -> `not enough values to unpack` | n/a | n/a | **RED**: the generator raised and quoted what upstream really said -- `expected input[1, 3, 32, 4, 6] to have 32 channels, but got 3 channels instead`. The eighth cell fails by the TEMPORAL mechanism, measured against the module rather than argued from the if/elif chain |
+| **D**: swap the two `dims=2` `Require`s back, rational first | n/a | n/a | **RED at exactly two assertions**, `test_ltx2_pipeline.cpp:2282-2283`, 61/62 cases and 3623/3625. Nothing else moves, because the polarity is identical either way -- which is the whole reason the case reads the message. Restored byte-for-byte, sha256 verified |
 
 Mutation B is the one worth keeping in mind: it is the shape of defect this file's
 header warns about twice, and it passes an end-to-end render.
+
+Mutations C and D are the pair that gates the ORDER of the two refusals. C says
+what upstream does; D says the port would stop saying it if the order changed.
 
 ### A sibling defect this row did NOT fix, and why
 
@@ -278,15 +298,43 @@ own red-first change, not a comment fix ridden along on this one.
 
 ### The anchors this row cited went stale inside this row
 
-The load-time guard adds 16 lines near the top of `ltx2_video.cpp`, so every
-anchor below it moved by exactly 16 -- including the ones this spec, the header
-and two issues use to argue A8's case. `test_ltx2_video`'s recorded-reader-anchor
-gate caught its own list and nothing catches prose, so the prose anchors were
-re-derived by grepping for the statements themselves rather than by adding 16.
+The change moves lines on THREE axes, and the first pass at this section saw
+only one of them. The load-time guard adds 16 lines near the top of
+`ltx2_video.cpp`, so every anchor below it moved by 16. The port also takes
+`ltx2_upsampler.cpp` from 582 lines to 714 across nine separate hunks -- 723
+once the repair below swaps the two refusals -- so
+anchors into that file moved by an amount that depends on where they point --
+`:465` became `:497` and `:166` became `:178`, and no single offset produces
+both. That second axis is the one the first pass at this section missed
+entirely, and "moved by exactly 16" is why: an offset that holds for one file
+reads like a rule.
+`test_ltx2_video`'s recorded-reader-anchor gate caught its own list and nothing
+catches prose.
+
+Every anchor into those three files that appears in a file this change edits was
+re-derived by grepping for the statement, and each is listed with what was
+grepped for in the pull request body. That is the claim this section makes, and
+it is deliberately narrower than "every anchor in this branch's prose": the
+first pass asserted the wider claim, swept the spec, the header and the issues,
+and missed both test files and one half-updated range. The narrow claim is what
+was measured.
+
+What the narrow claim leaves out, stated rather than implied: 4 anchors to
+`ltx2_upsampler.cpp:465` and `:467` survive in `.agents/specs/`
+(`ltx25-completion-scope.md:75, :341, :342` and `ltx25-retire-dead-arms.md:433`),
+and dozens of anchors into `ltx2_video.cpp` past line 1525 survive across other
+rows' specs and `.agents/completed/`. Those are other rows' records of their own
+trees, and `ltx25-completion-scope.md` is an operator-owned shared file this row
+does not edit for the reason §"The scope document contradicts §5" already gives.
+Editing them from here would make this branch write a file every concurrent pull
+request writes, which AGENTS.md §Records names as the failure to avoid.
 
 Worth stating because the numbers were correct when written and wrong when
 pushed, with no edit in between: a line anchor is a claim about a file that a
-later hunk in the SAME change can falsify.
+later hunk in the SAME change -- or a merge that carries no hunk of its own --
+can falsify. The repair commit demonstrated it twice more: swapping the two
+`dims=2` refusals moved `BlurDownsample` from `:590` to `:599` inside this same
+section's edit, and that anchor had already been stale since #641.
 
 ### What was NOT done
 

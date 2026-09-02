@@ -518,6 +518,21 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
   // `scripts/gen-ltx2-pipeline-goldens.py` runs both contradictions through the
   // real module and asserts the message, so a pin that changed either mechanism
   // fails the generator rather than leaving this paragraph wrong again.
+  //
+  // ORDER IS PART OF THE MESSAGE. This `Require` comes BEFORE the rational one
+  // because upstream's `__init__` is an if/elif chain: `elif temporal_upsample`
+  // (model.py:68) builds the Conv3d and never consults `rational_resampler`, so
+  // a config with BOTH flags at dims=2 owns no SpatialRationalResampler and must
+  // not be told about one. Refuse/accept polarity is the same either way -- the
+  // eighth cell is refused whichever fires -- which is exactly why only reading
+  // the message catches a swap back.
+  Require(!(two_d && config.temporal_upsample),
+          "ltx2 upsampler: dims=2 with temporal_upsample=true is not a configuration upstream "
+          "can run. model/upsampler/model.py:68-71 builds the temporal upsampler as a Conv3d, "
+          "and the dims=2 forward (:85-100) folds the frame axis into the batch and so feeds "
+          "it a 4-D tensor. The frame axis is gone by then, which is why no 2-D arm can "
+          "upsample it.");
+
   // The SIBLING contradiction, and it fails differently from the temporal one:
   // every operator inside the rational branch is already per-frame, so a folded
   // one-frame volume satisfies all of them and this config computes a complete,
@@ -533,12 +548,6 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
           "model/upsampler/spatial_rational_resampler.py:41, and the dims=2 forward "
           "(model/upsampler/model.py:85-100) folds the frame axis into the batch at :86 before "
           "reaching it at :94, so it is handed a 4-D tensor and raises.");
-  Require(!(two_d && config.temporal_upsample),
-          "ltx2 upsampler: dims=2 with temporal_upsample=true is not a configuration upstream "
-          "can run. model/upsampler/model.py:68-71 builds the temporal upsampler as a Conv3d, "
-          "and the dims=2 forward (:85-100) folds the frame axis into the batch and so feeds "
-          "it a 4-D tensor. The frame axis is gone by then, which is why no 2-D arm can "
-          "upsample it.");
   Require(latent.channels == config.in_channels,
           "ltx2 upsampler: latent has " + std::to_string(latent.channels) +
               " channels, config declares " + std::to_string(config.in_channels));

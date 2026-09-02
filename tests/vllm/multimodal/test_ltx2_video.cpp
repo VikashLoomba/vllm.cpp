@@ -740,7 +740,7 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
   // checkpoint as well as a temporal-only one, so a genuine SPATIOTEMPORAL
   // checkpoint was told it is the temporal x2 upsampler and pointed at the spatial
   // one. Wrong on both counts: it is neither, it is the third arm, and the ledger
-  // refusal that names it (`ltx2_upsampler.cpp:465`) sat behind a guard that could
+  // refusal that names it (`ltx2_upsampler.cpp:497`) sat behind a guard that could
   // not be reached from a request.
   //
   // The defect is an IMPLICATION between two guards over one variable, which no
@@ -790,7 +790,7 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
   // from the spatiotemporal one that stays refused. The fold at model.py:86/:100
   // returns the frame count unchanged and PixelShuffleND(2) doubles H and W, so
   // the result is exactly the `[c, f, 2h, 2w]` the phase requires at
-  // ltx2_video.cpp:3509-3516. A port that got the fold wrong would still satisfy
+  // ltx2_video.cpp:3525-3531. A port that got the fold wrong would still satisfy
   // that check, which is why the VALUE gate lives in test_ltx2_pipeline and this
   // case is about reach.
   //
@@ -2816,7 +2816,7 @@ TEST_CASE("ltx2 video: DFR's temporal rounds DRIVE the temporal x2 latent upsamp
   SUBCASE("a dims=2 TEMPORAL upsampler checkpoint is refused AT LOAD, not minutes in") {
     // THE PLACEMENT IS THE POINT. `dims=2` with `temporal_upsample` is a
     // contradiction upstream cannot run, and `Ltx2LatentUpsample` refuses it —
-    // but that refusal fires inside the rounds loop (ltx2_video.cpp:5042), which
+    // but that refusal fires inside the rounds loop (ltx2_video.cpp:5058), which
     // is reached only after two full denoise stages. The load block that owns
     // `temporal_upsampler_path` exists precisely so a caller who supplied the
     // wrong file learns at load rather than several minutes in, and it says so

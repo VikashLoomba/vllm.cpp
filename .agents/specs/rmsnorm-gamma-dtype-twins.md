@@ -289,7 +289,53 @@ and the kF16 arm is reached by nothing, which is declared above.
 | `tests/vt/test_ops_rmsnorm_weight_dtype.cpp` | this host, `cmake --build build -j 2` | this host, `ctest` |
 | `tests/vt/test_ops_rmsnorm_quant_fp8_weight_dtype.cpp` | this host | this host |
 | `src/vt/cuda/cuda_ops.cu` | `cuda-fat-build` in CI ONLY -- there is no `nvcc` on this host | nothing; no CI lane runs GPU tests |
-| `src/vt/rocm/rocm_rmsnorm.hip` | NOTHING -- no ROCm toolchain here, no AMD device in the `rc` fleet, no `hipcc` lane in `.github/workflows/` | nothing |
+| `src/vt/rocm/rocm_rmsnorm.hip` | `strix:gpu0` under an `rc` lease -- see below. NOT by this host and NOT by CI: there is no `hipcc` and no HIP header here, and `grep -rlE 'hipcc\|ROCM\|rocm' .github/workflows/` returns nothing | nothing |
+
+### The ROCm compile, and why it is a lease rather than a lane
+
+`strix:gpu0` (`gpu_model=Radeon-8060S`, gfx1151, an RDNA3.5 APU) is the fleet's
+only AMD device, and a **compile-only** job there is the one check available for
+this file. It is not a CI substitute: `VLLM_CPP_HIP` defaults to `AUTO` = OFF
+(`CMakeLists.txt:124`) and no workflow sets it, so nothing in this repository
+will ever compile a `.hip` TU on its own.
+
+The job is `/workspace/rmstwins-rocm/run.sh`, staged with a `git archive` of
+this branch's exact head so the compile is of the tree under review rather than
+of a re-clone that could drift. It holds the lease for one `cmake` configure and
+ONE object file -- no model, no test, no GPU work -- and it refuses to report
+anything unless it can first prove three things:
+
+1. **It has the right tree.** Five counted guards on the extracted
+   `rocm_rmsnorm.hip` before `hipcc` is allowed to claim anything: the
+   4-parameter kernel template = 1, `const Tw* w` = 1, `DispatchRmsNormWeight`
+   = 4, `__half` = 2, and the REMOVED weld `weight dtype must match x` = **0**.
+   A compile of the wrong tree reads exactly like a compile of the right one.
+2. **The object did not already exist.** A pre-existing `.o` would read as a
+   pass, so its presence before the build is a hard abort.
+3. **`hipcc` actually compiled THIS file.** A green `ninja` can mean "nothing to
+   do". After the real compile the job breaks one line of the code this wave
+   added -- the `case DType::kF16: LaunchRmsNorm<Tin, __half>` arm -- asserts the
+   edit applied (count 1), and REQUIRES the rebuild to fail. If that still
+   succeeds the verdict is `INCONCLUSIVE`, not `PASS`. The file is then restored
+   and rebuilt clean.
+
+`CCACHE_DIR` stays on `/tmp` with the shared store reached through
+`CCACHE_REMOTE_STORAGE=file:/workspace/ccache-remote`, because this file's own
+§build-cache measurement recorded the alternative -- a ccache dir on the CIFS
+`/workspace` -- producing 278 lock failures with `ccache -s -v` never returning.
+
+**Result: PENDING at the time of writing.** The job is queued at position #2 on
+`strix:gpu0` as `d99a30fa-3336-4b90-bc9e-877717c9b54e`, behind an end-to-end
+`rocm-exl3` run and a `rocm-strix-shape` job. It was submitted under `setsid
+nohup` with `ppid == 1` verified and without `--as`, so it survives this session
+and remains killable by its submitter: **it will run and record its verdict
+whether or not this branch has merged by then.** Collect it with
+`rc logs d99a30fa-3336-4b90-bc9e-877717c9b54e` or from
+`/workspace/rmstwins-rocm/out/run.log`, which ends in one of
+`RESULT COMPILE=PASS`, `=FAIL`, `=INCONCLUSIVE` or `=ABORTED`.
+
+A `FAIL` is a defect found before landing and is the whole point of paying for
+the lease. It would be owned by this row and repaired on top, not hidden.
 
 
 ## Stop conditions

@@ -62,6 +62,18 @@ Out of scope:
 One job, one lease, one script whose sha256 the report names. The script asserts
 that each step ran rather than inferring it from the next step's result:
 
+> **The outcome falsified the first three words, and they stand as written
+> because they were the plan.** It took **two** lease jobs, both on `thor:gpu0`,
+> never two devices and never two at once. The first asked `pip` for
+> `requirements/build.txt`, which does not exist because `requirements/build` is
+> a directory, so it lost its whole build-and-import half and a second job was
+> needed to repair the instrument. Both scripts are committed as
+> [`../scripts/headpin-e126687-job-a.sh`](../scripts/headpin-e126687-job-a.sh)
+> and [`../scripts/headpin-e126687-job-b.sh`](../scripts/headpin-e126687-job-b.sh).
+> See [`../sync/2026-09-02-e126687.md`](../sync/2026-09-02-e126687.md) §5.3 and
+> C6. The stop condition in §5 was about not spending a lease on upstream
+> `main`, and that held: no lease measured `main`.
+
 - Every leg captures `$?` into its own named variable on the line after the
   command, never after a pipe, and the report prints the six variables verbatim.
 - `python3-dev` is installed **first**, because it is the hypothesis under test,

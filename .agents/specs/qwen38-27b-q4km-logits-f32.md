@@ -146,6 +146,8 @@ config knob, and every throughput number.
 - **Widening is necessary and NOT established as sufficient.** Two contested
   gaps (0.027185 and 0.058050) sit below the f32-versus-oracle agreement
   measured at those steps, so this row must not promise a PASS. It measures one.
+  MEASURED: necessary and insufficient. Those two gaps resolved; the three
+  larger ones did not. See `## Outcome`.
 - **A token gate cannot see a dtype that is too wide** (`AGENTS.md`). The
   divergence above is therefore argued in prose and in the code comment, because
   no gate we own can convict it.
@@ -180,15 +182,74 @@ config knob, and every throughput number.
 - If the operator judges vLLM's default binding on a path vLLM does not
   implement, the divergence above is one line to revert; that is a product call.
 
+## Outcome
+
+**Measured: 5 of 6 divergent prompts becomes 3 of 6, and `TOKEN_GATE` stays
+`FAIL`.** `rc` job `c0b3fc6d`, `thor:gpu0`, worker `rc-worker-n8smh`,
+2026-09-02, base `b2c7bf5cd` plus this row's two commits. Evidence:
+[`qwen38-27b-q4km-logits-f32-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-logits-f32-20260902.md).
+
+One tree built twice on one worker, differing only in this row's routing line, so
+the before-number is measured rather than cited. The BF16 arm reproduced
+2026-08-23 index for index and id for id (7 / 34 / 20 / - / 14 / 32), and the
+library hashes differ between arms so the rebuild demonstrably took.
+
+**The fix is ROUTING, not a dtype change to a helper.** No helper's arithmetic
+moved; `MatmulBf16LogitsF32D` is byte for byte what it was and still serves every
+elementwise head. **This checkpoint takes the `nk == true` arm**, confirmed by
+reading `OwnGgufQuantBlocks` rather than inferred, which closes the predecessor's
+first owed item.
+
+**The two gaps the predecessor explicitly refused to vouch for are the two that
+resolved.** It recorded that 0.027185 and 0.058050 sat below the f32-versus-oracle
+agreement at those steps, so widening was "necessary, not obviously sufficient".
+Prompts 5 and 0 -- exactly those two steps -- became token-exact, and no other
+prompt did. The caution was correctly stated in advance and the outcome fell the
+other way.
+
+**Widening is necessary and NOT sufficient, which is now measured rather than
+suspected.** The three surviving divergences carry the three largest
+FIRST-DIVERGENCE margins (0.085434, 0.115482, 0.178236) and both resolved steps
+carry the two smallest of all six (0.027185, 0.058050); the remaining recorded
+margin, 0.124247, is `p1/35`, inside an already-diverged prompt and therefore not
+scoreable. Each survivor is still lost at the same index to the same token, with
+the agreeing prefix unchanged. At 0.0625 resolution is no longer the
+binding constraint at these magnitudes, so a step lost by 0.085 to 0.178 is a
+step where our residual error exceeds the margin. **The remaining term is one of
+MAGNITUDE**, and that is where the next hypothesis belongs -- not in another
+dtype width.
+
+**What was rejected and why.** Mirroring vLLM's default exactly, i.e. leaving the
+head in the model dtype, was the alternative and is rejected on the grounds in
+"The divergence, argued rather than slipped in" above: vLLM resolves no model
+dtype for a GGUF checkpoint at the pin, the routing predicate `nk` is a layout
+flag rather than a numeric one, and three of the four arms of this one function
+already write f32. Implementing upstream's `head_dtype` knob instead was also
+rejected: it would put the shipped default back on the bf16 arm this row exists
+to remove, and upstream's own knob REFUSES a quantized head
+(`logits_processor.py:111-115`), so it cannot express this case at all.
+
 ## Owed
 
 - The **heavy tail** the predecessor recorded and this row does not explain: our
   `max_abs` reaches 17.1606 against the oracle's 1.3657 at `p5/2`, `p5/11` and
   `p0/45`. Not temporal, flipped no argmax, and no part of this change addresses
-  it. Tracked by [#2534](https://github.com/mudler/vllm.cpp/issues/2534).
+  it. It was NOT re-measured after the fix, so it is neither confirmed nor
+  cleared. Tracked by [#2534](https://github.com/mudler/vllm.cpp/issues/2534).
+- The **residual magnitude term** the outcome above localises: three steps lost
+  by 0.085 to 0.178 with resolution no longer binding. The remaining bf16
+  activation stores and the kernel schedule are the standing candidates, and the
+  per-layer hidden-state bisect against llama.cpp is the instrument nobody has
+  run. Tracked by [#2534](https://github.com/mudler/vllm.cpp/issues/2534).
+- The **ROCm score** for this change. The keep-quant GEMM already emits f32 on
+  all three tiers, so the routing is tier-neutral by construction, but only the
+  CPU tier is measured; the gfx1151 token gate returned `NOT_MEASURABLE`
+  ([#2511](https://github.com/mudler/vllm.cpp/issues/2511)).
 - The throughput axis of an f32 logits head. It is not owed to anyone yet: no
   speed axis on this arm becomes admissible until its token gate passes.
 
 ## Now
 
-`ACTIVE` -- the routing is written and the token gate re-run is the open item.
+`DONE` -- the routing landed, the token gate was re-run on `thor:gpu0`, and the
+result is recorded honestly as an improvement short of a pass. The arm's
+`TOKEN_GATE` stays `FAIL` and its owning row stays `PARTIAL`.

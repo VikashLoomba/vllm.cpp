@@ -414,7 +414,9 @@ reproduced #857 byte for byte from a different build.
   share one float dtype (auto cache path)` (`ops.cpp:3947`). The cache becomes
   f32 while the attention path still produces bf16 k and v. So the KV term cannot
   be isolated today, and a documented same-binary A/B knob does not run. This is
-  not caused by this row's change; it is found by it.
+  not caused by this row's change; it is found by it, and it is filed as
+  [#2548](https://github.com/mudler/vllm.cpp/issues/2548). The focused unit suite
+  is 33 of 33 green under that lever, so the knob reads as gated and is not.
 - `VT_ACT_F32` is an instrument, not a default. Whether the CPU tier SHIPS f32 is
   a product default and is decided by the A/B this row runs, not by the commit
   that added the resolver.

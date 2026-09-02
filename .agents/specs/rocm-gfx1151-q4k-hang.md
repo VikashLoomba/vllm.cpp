@@ -9,8 +9,8 @@ this defect makes provisional).
 
 ## Now
 
-`ACTIVE` — **the cause is named and measured. The repair is a product decision
-this row does not get to make alone.**
+`ACTIVE` — **the cause is named and measured, the decision has been taken, and
+the repair is implemented and awaiting its own board measurement.**
 
 **`hipMallocManaged` on a part that cannot take a recoverable page fault is the
 cause of #2511.** rc job `6dced9e1-3c74-4363-bd9e-2a0dd8789cc9`, one build, one
@@ -27,9 +27,10 @@ Nothing else differed. The knob gates the allocator and only the allocator;
 `UnifiedMemory()` and `DeviceMemoryIsHostAddressable()` are byte-identical
 across the two columns and cannot explain the split.
 
-**The repair has now landed and the default has moved.** The maintainer took
-the decision `## The decision this row cannot make alone` was written for, and
-chose shape 1: `UseManagedAlloc` is narrowed by `pageable_memory_access`, so a
+**The repair is written and the default moves with it.** It is not on `main`
+yet: it lives on `row/BACKEND-ROCM-MANAGED-ALLOC-FIX` and owes the board
+measurement recorded under `## W11 RESULT`. The maintainer took the decision
+`## The decision this row cannot make alone` was written for, and chose shape 1: `UseManagedAlloc` is narrowed by `pageable_memory_access`, so a
 part that cannot fault and recover never gets a migratable allocation. The
 capability answers follow the allocator, which withdraws the CPU reference tier
 on this class of board; an op that loses its fallback refuses by name and now

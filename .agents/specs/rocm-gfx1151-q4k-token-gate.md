@@ -77,7 +77,24 @@ This run records, for every oracle leg:
 - `n_gpu_layers`, so the HIP and CPU legs are distinguishable in the record;
 - the host architecture and the enumerated ggml devices;
 - the source identity of the pinned tree, as a content manifest hash rather
-  than a tarball hash, because gzip framing is not content.
+  than a tarball hash, because gzip framing is not content. The manifest is
+  computed under `LC_ALL=C`, and the run prints the collation beside the value.
+
+**That last clause is not tidiness, and it cost the first submission.** Run 1 of
+this job refused the staged llama.cpp tree at step 2: it computed
+`56c26d15...` against an expected `2e700801...` and stopped. The tree was
+correct and the INSTRUMENT was wrong. `sort` collates by locale; the devbox that
+derived the expected value ran `en_US.UTF-8` and the leased container ran `C`, so
+the two hosts ordered the same 3425 file names differently and hashed the same
+bytes to two different values. Re-derived under `LC_ALL=C`, `git archive` of the
+pin, the staged tarball and the worker's own tree all give `56c26d15...`.
+
+This is `verification.md` §"Make the instrument say what it is measuring" in its
+cheapest form. The failure was loud and fired before the lease was spent, which
+is the good case; the same defect pointed the other way would have PASSED a
+contaminated tree on a host whose locale happened to match. The manifest is now a
+property of the tree rather than of whoever ran it, and the run states the
+collation in its own output so a reader can see the wiring.
 
 Two oracle legs run, in one lease, from one build:
 

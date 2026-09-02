@@ -910,6 +910,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   // sample_tokens_async. `sampled_logits` is caller-owned scratch the returned
   // Tensor view may alias (host / VT_GPU_SAMPLE=0 paths); it must outlive the
   // sampler call. Requires exec_state_.num_reqs > 0.
+  // #2534: the final-logit dump (VT_DUMP_LOGITS). Called from BOTH sampling
+  // paths, because the production default takes the device-resident branch of
+  // sample_tokens_async and not sample_tokens.
+  void dump_step_logits(const vt::Tensor& logits);
+
   vt::Tensor assemble_sample_logits(
       const std::optional<GrammarOutput>& grammar_output,
       std::vector<float>& sampled_logits);

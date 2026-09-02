@@ -1943,26 +1943,55 @@ void Exl3HadR128KernelCuda(Queue& q, Tensor& out, const Tensor& in, const Exl3Ha
 //   (3, 1)  the SparkInfer DeepSeek-V4 artifact, which ships an `mcg` marker
 //   (6, 0)  the `lm_head` of those stock artifacts, which is SIX-bit over a
 //           3-bit body
-//   (4, 2)  270 of the 272 quantized tensors of
-//           `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` (QUANT-EXL3-MUL1, #2495)
+//   (3, 2)  137 of the 409 trellis modules of
+//           `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`, which are EVERY MLP
+//           projection of the layers quantized at the low end of its 3.5 bpw
+//           average (QUANT-EXL3-MUL1 slice F, #2574)
+//   (4, 2)  270 more of that artifact's modules: its whole GDN tower, its
+//           dense-attention projections, the other 55 MLP projections and its
+//           `mtp` head (QUANT-EXL3-MUL1, #2495)
 //   (5, 2)  one tensor of that checkpoint, and ALL 36 of its DFlash2 draft
 //   (6, 2)  its `lm_head`, the same 6-over-narrow-body shape the stock
 //           artifacts use, in the mul1 codebook
+//
+// (3, 2) IS THE PAIR THIS LIST HAD TO LEARN TWICE. The mul1 widths were first
+// instantiated against a census that read "270 tensors at 4 bpw, one at 5, one
+// at 6" -- 272 modules, when the artifact has 409. A count taken from the local
+// safetensors headers rather than by range request gives {3: 137, 4: 270,
+// 5: 1, 6: 1}, all 409 carrying `mul1` and none carrying `mcg`. The 137 the
+// first count missed refused BY NAME, one MLP projection at a time, so the
+// checkpoint could not execute a single decoder layer on a CUDA device while
+// its loader arms were complete. The lesson is in the census and not in the
+// table: widen this list from the artifact, never from a summary of it.
+//
+// AND (3, 1) IS NOW ITS NEIGHBOUR, which is the confusable pair. Both are three
+// bits wide, both take the same `dq8` route, both use the same tile shapes, and
+// nothing about a `cb` threaded wrongly between them fails to compile or
+// changes a shape: it decodes with the other codebook's multiplier and yields a
+// weight with the RIGHT DISTRIBUTION and no correlation to the true one. The
+// device case in `tests/vt/test_exl3_gemm.cpp` gates both pairs against the CPU
+// arm for exactly that reason.
 //
 // Three arms and not one, because the original single arm (3, 1) was the
 // EXCEPTION rather than the rule: `LinearEXL3` derives the codebook from tensor
 // PRESENCE (`exl3.py:74-77`), so an artifact with no marker is cb 0, and the
 // device arm refused every ordinary EXL3 checkpoint (QUANT-EXL3, #2181).
 //
-// SIX AND NOT SIXTEEN. Upstream's table is DENSE -- K in 1..8 by cb in 0..2,
-// 24 translation units of 16 instantiations each -- and it can be, because it
-// splits per (K, cb) into `comp_units/exl3_comp_unit_K_cbX.cu` and compiles for
-// one architecture at a time. This tree has ONE translation unit and the fat
-// build compiles it for ten architectures, so a dense table here would be 8x
-// the kernels of the arm set below in a single `.cu`. The three added pairs are
-// exactly the widths a real artifact ships and no more; the next artifact that
-// needs a seventh pair should carry the per-K split with it rather than keep
-// widening this list.
+// SEVEN AND NOT TWENTY-FOUR. Upstream's table is DENSE -- K in 1..8 by cb in
+// 0..2, 24 translation units of 16 instantiations each -- and it can be, because
+// it splits per (K, cb) into `comp_units/exl3_comp_unit_K_cbX.cu` and compiles
+// for one architecture at a time. This tree has ONE translation unit and the fat
+// build compiles it for ten architectures, so a dense table here would be more
+// than three times the kernels of the arm set below in a single `.cu`.
+//
+// THIS LINE SAID SIX, AND IT SAID THE NEXT PAIR SHOULD CARRY THE PER-K SPLIT
+// WITH IT. The seventh pair arrived and does not carry the split, and the reason
+// is not that the argument was wrong: (3, 2) is not a new artifact's width, it
+// is the SAME artifact's largest width population, missed by a census that read
+// 272 modules where there are 409. Six was never the right number for #2495;
+// seven was, and the split was owed at three pairs exactly as much as it is
+// owed at seven. What holds unchanged is the rule the split answers: a pair
+// that a NEW artifact needs carries the split with it, and this one is not that.
 //
 // THE WIDTHS ARE NOT FREE-FORM EITHER. `dq_dispatch` above routes 3 and 4
 // through `dq8` and 5 and 6 through two `dq4`s, because the eight-window span
@@ -1980,7 +2009,7 @@ void Exl3HadR128KernelCuda(Queue& q, Tensor& out, const Tensor& in, const Exl3Ha
 // is loud.
 constexpr bool Exl3ArmInstantiated(int bits, int cb) {
   return (bits == 3 && (cb == 0 || cb == 1)) || (bits == 6 && cb == 0) ||
-         ((bits == 4 || bits == 5 || bits == 6) && cb == 2);
+         ((bits == 3 || bits == 4 || bits == 5 || bits == 6) && cb == 2);
 }
 
 template <int BITS, int CB, bool c_fp32>
@@ -2008,6 +2037,7 @@ const void* GemmKernelForShape(int bits, int cb, int shape_idx) {
   if (bits == 3 && cb == 0) return GemmKernelForArm<3, 0, c_fp32>(shape_idx);
   if (bits == 3 && cb == 1) return GemmKernelForArm<3, 1, c_fp32>(shape_idx);
   if (bits == 6 && cb == 0) return GemmKernelForArm<6, 0, c_fp32>(shape_idx);
+  if (bits == 3 && cb == 2) return GemmKernelForArm<3, 2, c_fp32>(shape_idx);
   if (bits == 4 && cb == 2) return GemmKernelForArm<4, 2, c_fp32>(shape_idx);
   if (bits == 5 && cb == 2) return GemmKernelForArm<5, 2, c_fp32>(shape_idx);
   if (bits == 6 && cb == 2) return GemmKernelForArm<6, 2, c_fp32>(shape_idx);
@@ -2149,15 +2179,16 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   if (!Exl3ArmInstantiated(args.bits, args.codebook)) {
     throw std::runtime_error(
         "vt cuda exl3: exl3_gemm is instantiated for (bits, codebook) in "
-        "{(3, 0), (3, 1), (6, 0), (4, 2), (5, 2), (6, 2)} only; got bits " +
+        "{(3, 0), (3, 1), (6, 0), (3, 2), (4, 2), (5, 2), (6, 2)} only; got bits " +
         std::to_string(args.bits) + " codebook " + std::to_string(args.codebook) +
-        ". Those six are the body and head of the stock exl3 artifacts (cb 0), the "
-        "SparkInfer DeepSeek-V4 one (cb 1), and the mul1 widths of "
-        "Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw and its DFlash2 draft (cb 2). Upstream's own "
+        ". Those seven are the body and head of the stock exl3 artifacts (cb 0), the "
+        "SparkInfer DeepSeek-V4 one (cb 1), and the four mul1 widths of "
+        "Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw and its DFlash2 draft (cb 2): 137 modules at "
+        "3 bpw, 270 at 4, one at 5 and one at 6. Upstream's own "
         "table is dense over bits 1..8 by codebook 0..2 because it splits per (K, cb) "
         "into one translation unit each; widening this one further is that split, and "
-        "belongs with the artifact that needs it (QUANT-EXL3-MUL1, #2495). The CPU arm "
-        "decodes every width and serves them on a CPU queue meanwhile.");
+        "belongs with the artifact that needs it (QUANT-EXL3-MUL1, #2495, #2574). The "
+        "CPU arm decodes every width and serves them on a CPU queue meanwhile.");
   }
   // NOT const: cudaLaunchCooperativeKernel takes `void**`, so each argument has
   // to be a modifiable lvalue whose address can be taken as `void*`.

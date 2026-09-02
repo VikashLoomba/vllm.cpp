@@ -27,9 +27,10 @@ Nothing else differed. The knob gates the allocator and only the allocator;
 `UnifiedMemory()` and `DeviceMemoryIsHostAddressable()` are byte-identical
 across the two columns and cannot explain the split.
 
-**The repair is written and the default moves with it.** It is not on `main`
-yet: it lives on `row/BACKEND-ROCM-MANAGED-ALLOC-FIX` and owes the board
-measurement recorded under `## W11 RESULT`. The maintainer took the decision
+**The repair is written, measured on the board, and awaiting its merge.** It
+lives on `row/BACKEND-ROCM-MANAGED-ALLOC-FIX`, and on one binary and one boot
+the shipped default now takes **0 failures in 10 legs** where the pre-fix
+configuration takes **9 in 10** (`## W11 RESULT`). The maintainer took the decision
 `## The decision this row cannot make alone` was written for, and chose shape
 1: `UseManagedAlloc` is narrowed by `pageable_memory_access`, so a part that
 cannot fault and recover never gets a migratable allocation. The
@@ -1304,6 +1305,79 @@ the old one asserts the behaviour this change removes.
 `tests/vt/test_backend_cross_device.cpp`'s production-geometry Q6_K launch gate
 is untouched and stays: this change does not move the kernel it exercises, and
 the class of regression it was added for is still real.
+
+## W11 RESULT: the fix is measured on the board, 0 failures in 10 against 9 in 10
+
+rc job `f367d340-0160-4530-b6d5-44ad87c7085d` on `strix:gpu0`, worker
+`rc-worker-lcjhd`, boot `a5bc8128-f6ad-4767-8614-6923f88032e1`. **One build, one
+boot, one binary**, `libvllm.so` sha256
+`ff91d735c03230126da83e060c3ba539703b33d368c406918f84545cb71b8f63`, built from
+this branch at `ee4b256f8`. Arms alternate and the within-round order rotates,
+because the board GPU-resets after each failure and a blocked design charges the
+reset to whichever arm follows it.
+
+| arm | allocator and claim | `--max-tokens 288` | `--max-tokens 64 --repeat 4` | pooled |
+|---|---|---|---|---|
+| `fixed` (shipped default) | `hipMalloc`, no host-addressability claim | **0 / 6** | **0 / 4** | **0 failures in 10** |
+| `prefix` (`VT_ROCM_MANAGED_ALLOC=1`) | `hipMallocManaged`, unified true -- the pre-fix configuration | 6 / 6 | 3 / 4 | **9 failures in 10** |
+
+Signatures on the failing arm: 8 `GPU Hang` and 1 `Memory access fault`, the two
+symptoms this row has recorded as one defect from the start. Every `fixed` leg
+produced its full text -- **1136 characters** at gate size and **257** at the
+`#2511` shape, the same two lengths Gate 2 recorded for its clean `nomanaged`
+legs.
+
+**The one `prefix` leg that passed is the point, not an embarrassment.** The
+pre-fix rate was never 100%: Gate 2 measured 3 failures in 5 at exactly this
+`64x4` shape, and the pooled pre-fix figure is 17 in 21. A red-before arm that
+failed every single leg would be a *different* defect from the intermittent one
+this row spent nine waves characterising. 9 in 10 is that rate, reproduced.
+
+### What this measurement adds that Gate 2 could not
+
+Gate 2 moved the ALLOCATOR with a knob while `unified` kept its unknobbed value,
+which is what made it a clean measurement of the cause. This run moves the
+SHIPPED DEFAULT, so `UnifiedMemory()` and `DeviceMemoryIsHostAddressable()` are
+false on the `fixed` arm and true on the `prefix` arm. That is the configuration
+change the repair actually makes, and it is the one nothing had run before.
+
+**The reference-tier consequence is measured, not predicted: all 20 legs report
+`reftier_lines = 0`.** The count greps `reference[- ]tier`, both spellings,
+because the two sites spell it differently -- the tier's own banner is
+`[vt reference-tier] op=... has NO native kernel` and the refusal text says "the
+portable CPU reference tier". A grep for one of them would have read 0 over the
+other and produced exactly the answer this arm predicts, which is an instrument
+whose failure looks like its result. No leg on either arm hit `no kernel for op`
+either, which the classifier separates from a board fault for the same reason.
+So on this workload the withdrawn tier withdraws nothing that was being used.
+
+### Instrument notes, because two of them nearly cost a lease
+
+**The artifact staging died on the share and the retry is now part of the job.**
+Run `821aa8bb` aborted seven seconds in with
+`cp: error reading ...: Resource temporarily unavailable` -- a transient CIFS
+read on a 17 GB file, not a missing artifact. A one-shot `cp` turns that into a
+lost lease. PHASE 0 now reuses a verified worker-local copy, then hard-links the
+sibling job's staged copy (same `/tmp`, so the same inode #2511's own legs read,
+which is identity rather than an agreeing hash), and only then reads the share,
+three times. The rerun linked the sibling copy and verified its sha256 in
+seconds.
+
+**The tally is computed over deduplicated lines and scans every field.** The log
+prints each leg twice, once live and once in the summary, so `grep -c` over the
+finished file reads 40 for 20 legs; `sort -u` is what makes it a count of legs.
+`class=OK` is matched anywhere on the line and never by field index, which is the
+defect that made `confirm.sh`'s own summary report every arm failing every leg.
+Both were verified independently of the job's own summary block.
+
+**One narration line in this job is wrong and is worth correcting rather than
+repeating.** `LEGCOUNT` prints `raw_lines=20 unique_legs=20` and then says "raw
+should be about 2x unique", because it runs BEFORE the summary reprints the
+legs. The relation it describes is real -- the finished log reads raw 40, unique
+20 -- but the line measures a moment at which it cannot yet hold. Both readings
+agree that there were 20 legs, which is what the tally rests on.
+
+Raw log and per-leg stdout/stderr: `/mnt/nas_share/rc/rocm-strix-managed/out/`.
 
 ## Gate 2 is still owed, and the first attempt at it failed on its own instrument
 

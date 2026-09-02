@@ -3317,6 +3317,91 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
 
+  // --- #2534 INSTRUMENT: the final-logit dump -------------------------------
+  //
+  // `VT_DUMP_LOGITS=<dir>` appends this step's full logit row for every live
+  // request to `<dir>/ours_<req_id>.f32`, and its argmax to
+  // `<dir>/ours_<req_id>.ids.txt`. Off unless the variable is set, read ONCE at
+  // static init like `VT_DEBUG_SAMPLED` below -- never a per-step getenv in the
+  // sampling loop.
+  //
+  // WHY HERE, and not inside the sampler. The comment above says sampling
+  // mutates `logits` IN PLACE, so a dump taken after it would not be the vector
+  // argmax saw; and `Sampler` has no request identity at all (SamplingMetadata
+  // is keyed by dense index). This point is the last one that has BOTH the
+  // untouched vector and `exec_state_.req_ids`, and it is after
+  // `assemble_sample_logits` has applied the grammar bitmask, so it is the
+  // vector the greedy path selects from.
+  //
+  // WHY IT EXISTS: the arm's whole remaining question is how big OUR per-step
+  // logit delta against llama.cpp b10451 is, against the oracle's own measured
+  // 0.2020-to-1.3657 self-perturbation band. Four candidate causes have died on
+  // this row because nothing here could produce a logit vector. See
+  // .agents/specs/qwen38-27b-q4km-logit-dump.md.
+  //
+  // The file layout is deliberately the one `job/oracle_logits.cpp` already
+  // writes -- one file per sequence, steps concatenated, `n_steps * n_vocab`
+  // little-endian f32 -- so `cmp_logits.c` diffs the two sides unmodified.
+  static const char* const kDumpLogitsDir = [] {
+    const char* e = std::getenv("VT_DUMP_LOGITS");
+    return (e != nullptr && e[0] != '\0') ? e : nullptr;
+  }();
+  if (kDumpLogitsDir != nullptr && logits.rank == 2 && logits.shape[0] > 0) {
+    const int64_t rows = logits.shape[0];
+    const int64_t vocab = logits.shape[1];
+    VT_CHECK(logits.dtype == vt::DType::kF32,
+             "VT_DUMP_LOGITS: the sample logits are not f32");
+
+    // Same staging the reviewed logits-processor path uses
+    // (sample/logits_processor/builtin.cpp): a backend that answers the NARROW
+    // host-addressable predicate is wrapped in place, everything else -- CPU
+    // included -- copies down. Read-only here, so nothing is copied back.
+    vt::Backend& b = vt::GetBackend(queue_.device.type);
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(vocab);
+    std::vector<float> staging;
+    const float* host = nullptr;
+    if (b.DeviceMemoryIsHostAddressable()) {
+      host = static_cast<const float*>(logits.data);
+    } else {
+      staging.resize(total);
+      if (total != 0) b.Copy(queue_, staging.data(), logits.data, total * sizeof(float));
+      b.Synchronize(queue_);
+      host = staging.data();
+    }
+
+    for (int64_t i = 0; i < rows && i < static_cast<int64_t>(exec_state_.req_ids.size()); ++i) {
+      // A row still consuming prefill samples a token the scheduler throws
+      // away, so dumping it would put a step in the file that never appears in
+      // `--output-token-ids` and silently shift every later step.
+      if (i < static_cast<int64_t>(exec_state_.discard.size()) &&
+          exec_state_.discard[static_cast<size_t>(i)]) {
+        continue;
+      }
+      const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+      const float* row = host + static_cast<size_t>(i) * static_cast<size_t>(vocab);
+
+      const std::string base = std::string(kDumpLogitsDir) + "/ours_" + req_id;
+      if (std::FILE* f = std::fopen((base + ".f32").c_str(), "ab")) {
+        std::fwrite(row, sizeof(float), static_cast<size_t>(vocab), f);
+        std::fclose(f);
+      }
+      // The ALIGNMENT control the spec requires: this argmax must equal the id
+      // `--output-token-ids` records for the same step, or the two sides are not
+      // describing the same context and no delta computed from them means
+      // anything.
+      int64_t best = 0;
+      for (int64_t v = 1; v < vocab; ++v) {
+        if (row[v] > row[best]) best = v;
+      }
+      const int step = input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] -
+                       input_batch_.num_prompt_tokens[static_cast<size_t>(i)];
+      if (std::FILE* g = std::fopen((base + ".ids.txt").c_str(), "a")) {
+        std::fprintf(g, "%d %lld\n", step, static_cast<long long>(best));
+        std::fclose(g);
+      }
+    }
+  }
+
   // SAMPLE-PROMPT-LOGPROBS (gpu_model_runner.py:3841-3845): score the prompt
   // rows off the SAME forward result. Done before sampling because sampling
   // mutates `logits` in place; the prompt rows are outside that view, but

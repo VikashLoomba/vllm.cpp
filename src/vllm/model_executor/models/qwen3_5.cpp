@@ -66,6 +66,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"
+#include "vt/unaligned.h"
 #ifdef VT_MARLIN_NVFP4
 #include "vt/cuda/marlin_repack.h"
 #endif
@@ -1024,11 +1025,23 @@ float Silu(float x) { return x / (1.0F + std::exp(-x)); }
 // conv kernels require the weight dtype to match the activation dtype; where
 // activations are f32 (GDN conv/gated-norm, attention qk-norm, final-norm
 // replay), the bf16 weight must be presented as f32.
+//
+// `w.bytes` MAY BE A BORROWED MAPPING AT AN ODD ADDRESS, so the bytes are read
+// through `vt::LoadUnaligned` off a byte cursor rather than a `const uint16_t*`.
+// A safetensors payload starts at `8 + <JSON header length>`
+// (`safetensors_reader.cpp:78`), a header length is arbitrary, and
+// `BorrowStTensorBytes` hands those bytes over verbatim. This site aborted
+// `test_qwen35_exl3` under `-fsanitize=alignment`, reached from
+// `ModelRegistry::Forward` through `FullAttnBlockPaged`, and it was hidden
+// behind the EXL3 finding because that lane stops at the first report (#2578,
+// the sixth recurrence of the class in
+// `.agents/specs/unaligned-safetensors-consumers.md`).
 std::vector<float> WeightF32(const OwnedTensor& w) {
-  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
+  const auto* src = w.bytes.data();
   const int64_t n = w.Numel();
   std::vector<float> out(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) out[static_cast<size_t>(i)] = vt::BF16ToF32(src[i]);
+  for (int64_t i = 0; i < n; ++i)
+    out[static_cast<size_t>(i)] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
   return out;
 }
 

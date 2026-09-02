@@ -701,3 +701,87 @@ TEST_CASE("exl3 device: the widened (bits, codebook) arms agree with the CPU arm
   }
   cb_dev.DestroyQueue(dq);
 }
+
+// ─── The operands' BYTE ADDRESSES — #2558 ────────────────────────────────────
+//
+// `suh`, `svh` and the trellis are WEIGHTS, and the borrow path hands the kernel
+// the mapping's own bytes. A safetensors payload starts at
+// `8 + <JSON header length>` (`safetensors_reader.cpp:78`) and a header length is
+// arbitrary, so any of the three begins on an ODD byte in roughly half of all
+// checkpoints. The trellis is the sharpest case: `vt::Exl3Gemm` types it kI8 --
+// "opaque i8 BYTES" -- so its alignment requirement is 1 and an odd base is the
+// expected case rather than an exotic one.
+//
+// `HadRowBlock` (`cpu_exl3_kernels.cpp:130`) read `suh`/`svh` through a
+// `const uint16_t*` and `TileWord32` (`cpu_exl3_dequant.cpp:64`) read the trellis
+// the same way, and `-fsanitize=alignment` aborted `test_qwen35_exl3` on the
+// first of those, reached through `ModelRegistry::Forward`.
+//
+// THE FIX IS IN THE CONSUMER, NOT THE PRODUCER, and this case is what separates
+// the two. Refusing to borrow a misaligned tensor also takes the sanitizer green
+// -- and switches direct upload off for every tensor in half of all checkpoints,
+// because the parity of the payload base is a coin flip per FILE.
+// `tests/vllm/test_load_direct_upload.cpp` and
+// `tests/vllm/models/test_qwen3_5_dense_load_residency.cpp` hold that lever; this
+// case holds the correctness, and both must be green at once.
+//
+// The bar is BYTE EQUALITY against the same operands at even addresses. The
+// repair replaces word arithmetic with byte arithmetic over the trellis, and a
+// stride that lost its `sizeof(uint16_t)` decodes a different weight -- which a
+// tolerance over a random-bit trellis could plausibly absorb and an equality
+// cannot. Each `REQUIRE` on a parity is the instrument's own precondition: a run
+// that quietly landed on an even address would exercise nothing and still pass.
+TEST_CASE("exl3 gemm: suh, svh and the trellis at ODD byte addresses decode the same") {
+  vt::Queue q = CpuQueue();
+  const int64_t m = 2, k = 256, n = 128;
+  const Exl3Fixture f = MakeFixture(k, n, 3, 0x2545F491u);
+
+  Rng rng;
+  rng.s = 0x27220A95u;
+  std::vector<uint16_t> a_h(static_cast<size_t>(m * k));
+  for (auto& v : a_h) v = vt::F32ToF16(rng.next(1.0f));
+
+  // `off` bytes of lead-in before each of the three weight payloads. 0 is the
+  // aligned control; 1 is what a 171-byte header produces.
+  auto run = [&](size_t off) {
+    const size_t tb_bytes = f.trellis.size() * sizeof(uint16_t);
+    const size_t su_bytes = f.suh.size() * sizeof(uint16_t);
+    const size_t sv_bytes = f.svh.size() * sizeof(uint16_t);
+    std::vector<unsigned char> tb_raw(tb_bytes + off, 0), su_raw(su_bytes + off, 0),
+        sv_raw(sv_bytes + off, 0);
+    std::memcpy(tb_raw.data() + off, f.trellis.data(), tb_bytes);
+    std::memcpy(su_raw.data() + off, f.suh.data(), su_bytes);
+    std::memcpy(sv_raw.data() + off, f.svh.data(), sv_bytes);
+    void* tb_p = tb_raw.data() + off;
+    void* su_p = su_raw.data() + off;
+    void* sv_p = sv_raw.data() + off;
+    REQUIRE(reinterpret_cast<std::uintptr_t>(tb_p) % 2 == off % 2);
+    REQUIRE(reinterpret_cast<std::uintptr_t>(su_p) % 2 == off % 2);
+    REQUIRE(reinterpret_cast<std::uintptr_t>(sv_p) % 2 == off % 2);
+
+    std::vector<uint16_t> c_h(static_cast<size_t>(m * n), 0);
+    std::vector<uint16_t> a_had(static_cast<size_t>(m * k), 0);
+    vt::Tensor ta = vt::Tensor::Contiguous(a_h.data(), vt::DType::kF16, q.device, {m, k});
+    vt::Tensor tb = vt::Tensor::Contiguous(tb_p, vt::DType::kI8, q.device,
+                                           {k / 16, n / 16, 32 * f.bits});
+    vt::Tensor tsuh = vt::Tensor::Contiguous(su_p, vt::DType::kF16, q.device, {k});
+    vt::Tensor tsvh = vt::Tensor::Contiguous(sv_p, vt::DType::kF16, q.device, {n});
+    vt::Tensor tc = vt::Tensor::Contiguous(c_h.data(), vt::DType::kF16, q.device, {m, n});
+    vt::Tensor tah = vt::Tensor::Contiguous(a_had.data(), vt::DType::kF16, q.device, {m, k});
+    vt::Exl3GemmArgs args;
+    args.bits = f.bits;
+    args.codebook = 1;
+    vt::Exl3Gemm(q, tc, ta, tb, tsuh, tsvh, tah, args);
+    return c_h;
+  };
+
+  const std::vector<uint16_t> aligned = run(0);
+  // The control must have DECODED something. An all-zero output would satisfy the
+  // equality below without either arm reading a single trellis byte.
+  size_t nonzero = 0;
+  for (const uint16_t v : aligned)
+    if (v != 0) ++nonzero;
+  REQUIRE(nonzero > aligned.size() / 2);
+
+  CHECK(run(1) == aligned);
+}

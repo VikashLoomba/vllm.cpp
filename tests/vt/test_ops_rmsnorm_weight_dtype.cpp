@@ -409,3 +409,67 @@ TEST_CASE("rmsnorm: CUDA serves a kF16 gamma and agrees with CPU byte-for-byte")
   CHECK(RunBf16ActW16(gpu, xb, w16, DType::kF16, kIdxH) ==
         RunBf16ActW16(Cpu(), xb, w16, DType::kF16, kIdxH));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CASE 4. THE GAMMA'S BYTE ADDRESS. #2540.
+//
+// A safetensors payload starts at `8 + <JSON header length>`
+// (`safetensors_reader.cpp:78`) and a header length is arbitrary, so a bf16
+// gamma begins on an ODD byte in roughly half of all checkpoints.
+// `BorrowStTensorBytes` hands those bytes to the kernel verbatim -- that is what
+// direct upload IS -- and `WidenRowToF32` (`cpu_matmul_elem.cpp:577`) read them
+// through a `const uint16_t*`. `-fsanitize=alignment` aborted `test_dots3_note_attn`
+// and `test_muse_glimmer_text` on exactly this operand, reached through
+// `ModelRegistry::Forward` on both.
+//
+// TWO THINGS ARE GATED HERE AND THEY FAIL DIFFERENTLY.
+//
+//   * Under `sanitize-cpu (address,undefined)` the pre-fix binary ABORTS in this
+//     case with `load of misaligned address ... for type 'const uint16_t'`. That
+//     is the lane's red.
+//   * Without a sanitizer the pre-fix binary PASSES on x86, which is why this
+//     class survived three UBSan sweeps. The equality below is therefore aimed at
+//     the byte-cursor arithmetic the fix introduces: an element stride counted in
+//     words instead of bytes reads the wrong half of the buffer and lands here on
+//     any lane.
+//
+// The `REQUIRE` on the parity is not decoration. A case that quietly landed on an
+// EVEN address would exercise nothing and still report a pass, which is the
+// "instrument that never ran" trap.
+TEST_CASE("rmsnorm: a bf16 gamma at an ODD byte address is read as its bytes") {
+  const std::vector<float> x = SpreadX(kRows * kProdH);
+  const std::vector<float> wf = SpreadW(kProdH);
+  std::vector<uint16_t> wb(static_cast<size_t>(kProdH));
+  for (int64_t j = 0; j < kProdH; ++j)
+    wb[static_cast<size_t>(j)] = F32ToBf16(wf[static_cast<size_t>(j)]);
+
+  // The same gamma bytes, one byte into an over-allocated buffer.
+  std::vector<unsigned char> raw(wb.size() * sizeof(uint16_t) + 1, 0);
+  std::memcpy(raw.data() + 1, wb.data(), wb.size() * sizeof(uint16_t));
+  void* odd = raw.data() + 1;
+  REQUIRE(reinterpret_cast<std::uintptr_t>(odd) % 2 == 1);
+
+  std::vector<uint16_t> got(static_cast<size_t>(kRows * kProdH), 0);
+  Queue q{Cpu(), nullptr};
+  Tensor tx = Tensor::Contiguous(const_cast<float*>(x.data()), DType::kF32, Cpu(), {kRows, kProdH});
+  Tensor tw = Tensor::Contiguous(odd, DType::kBF16, Cpu(), {kProdH});
+  Tensor to = Tensor::Contiguous(got.data(), DType::kBF16, Cpu(), {kRows, kProdH});
+  vt::RmsNorm(q, to, tx, tw, RmsNormArgs{1e-6f, /*gemma=*/true});
+
+  // Byte equality against the SAME gamma at an even address. Not a tolerance: a
+  // stride defect moves whole elements, and a tolerance on a smooth gamma could
+  // absorb a neighbour's value.
+  const std::vector<uint16_t> aligned = RunF32ActBf16W(Cpu(), x, wb, kProdH);
+  CHECK(got == aligned);
+
+  // The odd gamma must be LOAD-BEARING, or the equality above would also hold for
+  // a kernel that read the aligned copy or ignored `w` entirely.
+  std::vector<unsigned char> bumped = raw;
+  const uint16_t hot = F32ToBf16(Bf16ToF32(wb[7]) + 4.0f);
+  std::memcpy(bumped.data() + 1 + 7 * sizeof(uint16_t), &hot, sizeof(hot));
+  std::vector<uint16_t> got2(static_cast<size_t>(kRows * kProdH), 0);
+  Tensor tw2 = Tensor::Contiguous(bumped.data() + 1, DType::kBF16, Cpu(), {kProdH});
+  Tensor to2 = Tensor::Contiguous(got2.data(), DType::kBF16, Cpu(), {kRows, kProdH});
+  vt::RmsNorm(q, to2, tx, tw2, RmsNormArgs{1e-6f, /*gemma=*/true});
+  CHECK(got2[7] != got[7]);
+}

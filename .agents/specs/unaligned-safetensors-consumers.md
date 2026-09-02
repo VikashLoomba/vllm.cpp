@@ -4,7 +4,8 @@ Identity: `FIX-UNALIGNED-CONSUMERS-2540`
 
 Issues: [#2540](https://github.com/mudler/vllm.cpp/issues/2540) (bf16 RMSNorm
 gamma), [#2558](https://github.com/mudler/vllm.cpp/issues/2558) (EXL3 `suh`,
-`svh` and trellis).
+`svh` and the trellis), [#2578](https://github.com/mudler/vllm.cpp/issues/2578)
+(`WeightF32`, found by this row's own green run).
 
 Class predecessors: [#301](https://github.com/mudler/vllm.cpp/issues/301), which
 left the `vt::LoadUnaligned` seam;
@@ -27,6 +28,16 @@ already use:
 | `vt::cpu::WidenRowToF32` | `src/vt/cpu/cpu_matmul_elem.cpp:577` | bf16 RMSNorm gamma (#2540) |
 | `HadRowBlock` / `HadRows` | `src/vt/cpu/cpu_exl3_kernels.cpp:130` | EXL3 `suh` / `svh` (#2558) |
 | `TileWord32` | `src/vt/cpu/cpu_exl3_dequant.cpp:64` | EXL3 trellis, kI8 read as `uint16_t` (#2558) |
+| `WeightF32` | `src/vllm/model_executor/models/qwen3_5.cpp:1028` | a bf16 attention weight widened for the f32 kernels (#2578) |
+
+**The fourth row was not in the dispatch, and it is not scope creep.**
+`-fno-sanitize-recover=all` stops the binary at the FIRST report, so each repair
+in this class reveals the next site rather than a clean run. Repairing the EXL3
+operands made `test_qwen35_exl3` abort one frame later, in `WeightF32`, reached
+from `ModelRegistry::Forward` through `FullAttnBlockPaged`. It is the same
+defect, the same idiom and the same test, so it is fixed in this flow with its
+own issue, as AGENTS.md's in-flow rule requires. The target state is not reached
+without it.
 
 The pointer chains that feed those three from a borrowed mapping move to byte
 arithmetic in the same change, because advancing a misaligned `uint16_t*` is
@@ -130,6 +141,14 @@ two halves with `vt::LoadUnaligned<uint16_t>`. `Exl3TileCodeword`,
 `const void*` for the trellis, and every walk over it advances a `const unsigned
 char*` by `tile_words * sizeof(uint16_t)` bytes.
 
+**`WeightF32`.** The same byte cursor plus `vt::LoadUnaligned<uint16_t>` over
+`w.bytes.data()`, which is already a `const uint8_t*` — the `reinterpret_cast`
+to `const uint16_t*` was the only thing making the load undefined. It has no
+unit case and gets none: it lives in an anonymous namespace in `qwen3_5.cpp` and
+nothing outside that file can name it. Its gate is `test_qwen35_exl3` under the
+sanitizer, which reaches it through `ModelRegistry::Forward`, and that is the
+stronger gate — a production entry point rather than a hand-constructed operand.
+
 **That `sizeof(uint16_t)` is the whole risk of this change**, exactly as it was
 for `CopyRawNK` in the class spec: the tile stride counts 16-bit WORDS and the
 new cursor counts BYTES. It is what the value gate below targets, and it is why
@@ -205,6 +224,17 @@ this row.
   the kernel cannot represent, and misalignment is no longer one.
 * Stop and report on ENOSPC or an OOM symptom rather than pressing on. The box
   has both histories.
+
+## Owed
+
+* [#2579](https://github.com/mudler/vllm.cpp/issues/2579). A grep at the base SHA
+  finds 20 further `reinterpret_cast<const uint16_t*>(<OwnedTensor>.bytes.data())`
+  across ten model files (`gemma4_moe.cpp` alone has 10). Whether any of them is
+  actually reached with an odd base is UNMEASURED, so the list is a population of
+  the SHAPE and not a list of findings; turning it into findings needs a run per
+  model rather than a grep. Fixing 20 sites across ten models is also not the unit
+  of work #2540 and #2558 describe, and each wants its own model suite green
+  beside it. Filed rather than swept, and named here so the debt is visible.
 
 ## Now
 

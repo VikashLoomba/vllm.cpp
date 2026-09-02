@@ -108,6 +108,64 @@ twice per layer to the residual plus once per projection over 64 layers and
 recurrently to the GDN state, against `1e-5` relative on a row dot. Term A is
 the hypothesis this row tests first.
 
+## The oracle disagrees with ITSELF on 1 of 6 prompts
+
+Measured 2026-09-02, `thor:gpu0`, rc job `deb6322d-bd06-4dd1-a5ac-2dec9987fbe1`,
+worker `rc-worker-n8smh`, log
+`/mnt/nas_share/rc/q4ktok-thor/out/rc-worker-n8smh-20260902T000824Z/`.
+
+Stock `llama-completion` at `b10451`, the recorded gate recipe, run twice over
+the identical artifact and prompts. The only difference is `use_extra_bufts`,
+which the stock `-nr/--no-repack` flag sets (`common/arg.cpp:2413-2416`): with it
+on, Q4_K weights are repacked to `block_q4_Kx8` and the gemv kernel runs; with it
+off, the plain `ggml_vec_dot_q4_K_q8_K` runs. Nothing else changes, and the
+pinned tree's porcelain was asserted empty before and after.
+
+**Controls first.** `R1_IDENTITY=EXACT`: the repack-on run reproduced the
+2026-08-23 recorded ids on 6 of 6 prompts, from a fresh build on a DIFFERENT
+worker, which re-confirms the oracle's determinism a third time and validates
+this harness against the gate it is being compared to. Both configurations
+re-emitted exactly the 15 `unused tensor blk.64.*` warnings. The lever is
+observed rather than assumed: the harness prints `USE_EXTRA_BUFTS 1` and `0`
+respectively, and llama.cpp's own `load time` falls from 651.47 ms to 302.30 ms
+when the repack work is skipped.
+
+**Result: `ORACLE_SELF_DIVERGENCES=1/6`.**
+
+```text
+ORACLE_SELF prompt=1 DIVERGE first_diff_index=34 repack_on=3095 repack_off=198
+```
+
+That step is one of the six the gate lost, and the recorded margin line for it is
+
+```text
+MARGIN 1 34  198 rank2 19.653543  top1 3095 19.738977  gap 0.085434  our="\n" top1=" When"
+```
+
+**Token 198 is what vllm.cpp produced there and was scored wrong for.** Given a
+different one of its own Q4_K kernels, the oracle produces our token at the exact
+step it convicted us on.
+
+Two conclusions, and they point in opposite directions.
+
+1. **Term B can flip a near-tie in this model.** That is now measured rather than
+   argued: a per-row-dot difference of order 1e-05 relative reaches the final
+   logits and crosses an 0.085-logit gap after 64 layers. No amplification
+   estimate is needed.
+2. **Term B does not explain the arm.** It accounts for ONE of the five divergent
+   prompts. Prompts 0, 2, 4 and 5 diverge with the oracle in full agreement with
+   itself, so four fifths of the failure needs a term substantially larger than
+   1e-05, which is what Term A is and what `## Scope` item 3 measures.
+
+**This does not excuse the arm and must not be read as doing so.** Four prompts
+remain ours. What it does establish is that the gate as declared is not
+satisfiable by any engine, llama.cpp included: `b10451` fails its own 6-of-6
+token gate under a stock runtime flag. So `TOKEN_GATE=PASS` requires the gate to
+pin the oracle's EXECUTED kernel path -- host architecture, `-mcpu` feature set,
+repack state and batch size -- and not only its revision. Adding that pin is a
+tightening of the gate's definition, not a widening of its tolerance; the
+tolerance stays exact.
+
 ## Scope
 
 1. Measure whether the oracle's own greedy decode is stable across its own

@@ -24,6 +24,8 @@
 // A device that has not registered a given op is SKIPPED rather than failed:
 // a partial backend is a supported, tested state (src/vt/ops.cpp:104-111).
 #include <doctest/doctest.h>
+#include <cstdio>
+#include <numeric>
 
 #include <cmath>
 #include <cstdint>
@@ -208,6 +210,109 @@ TEST_CASE("device Copy/Memset are BIT-EXACT against the host bytes") {
 // rounding gate is weakened. (Metal, whose MSL codec is a literal transcription
 // of vt::F32ToBF16 including its NaN branch, IS bit-exact here too — only CUDA
 // differs, which is itself worth knowing.)
+// A NORM WEIGHT MAY BE A DIFFERENT DTYPE FROM THE ACTIVATION, and the CPU kernel
+// has always allowed it: `RmsNormKernel` widens the weight through
+// `WidenRowToF32` and accepts f32/f16/bf16 for x, w, residual and out
+// INDEPENDENTLY. Every device must match that, because the CPU backend is this
+// project's correctness reference.
+//
+// IT DID NOT. `RmsNormKernelCuda` demanded `w.dtype == x.dtype` and refused
+// otherwise, so a model that ran on the CPU backend died on CUDA by name --
+// `vt: cuda rmsnorm: weight dtype must match x`. A gamma loaded bf16 by
+// `LoadNormBf16` beside an f32 activation is exactly that shape, and qwen4_exp
+// hits it. The existing cross-device rmsnorm case above cannot see this: it
+// passes an f32 weight with an f32 x, so the dtypes always agreed and the
+// narrower contract was invisible.
+//
+// A kernel narrower than its own oracle is the defect. This case pins the
+// contract rather than the kernel: it asks every registered device for the same
+// answer the CPU gives.
+TEST_CASE("rmsnorm accepts a bf16 weight beside an f32 activation, on every device") {
+  constexpr int64_t rows = 3, cols = 128;
+  const size_t n = static_cast<size_t>(rows) * cols;
+  const std::vector<float> x = RandomVec(n, 4242);
+  const std::vector<float> w_f32 = RandomVec(cols, 2424, -1.0f, 1.0f);
+
+  // The weight as it actually arrives from a GGUF norm: bf16 bits, and the f32
+  // values ROUNDED to bf16, so the CPU reference is computed from the same
+  // numbers the device sees rather than from the unrounded originals.
+  std::vector<uint16_t> w_bf16(cols);
+  std::vector<float> w_rounded(cols);
+  for (int64_t j = 0; j < cols; ++j) {
+    w_bf16[static_cast<size_t>(j)] = vt::F32ToBF16(w_f32[static_cast<size_t>(j)]);
+    w_rounded[static_cast<size_t>(j)] =
+        vt::BF16ToF32(w_bf16[static_cast<size_t>(j)]);
+  }
+
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> cx = x, ref(n);
+  {
+    Tensor tx = T2(cx.data(), cd, rows, cols);
+    Tensor tw = Tensor::Contiguous(w_bf16.data(), DType::kBF16, cd, {cols});
+    Tensor to = T2(ref.data(), cd, rows, cols);
+    vt::RmsNorm(cq, to, tx, tw, vt::RmsNormArgs{1e-6f, false}, nullptr);
+  }
+  cpu.DestroyQueue(cq);
+
+  // THE ORACLE HALF, AND IT RUNS EVERYWHERE. The device loop below is empty on a
+  // CPU-only build, so without these the case would report zero assertions and
+  // pass vacuously -- a skip wearing the face of a green test. These pin the
+  // contract the CUDA kernel violated: the CPU DOES accept a bf16 weight beside
+  // an f32 activation, and produces real numbers from it.
+  REQUIRE(ref.size() == n);
+  CHECK(std::isfinite(ref[0]));
+  CHECK(std::isfinite(ref[n - 1]));
+  const double sumsq = std::inner_product(ref.begin(), ref.end(), ref.begin(), 0.0);
+  CHECK(sumsq > 0.0);  // not an all-zero row, which any broken widening would give
+
+  // THE CASE ASSERTS ITS OWN PRECONDITION. On a CPU-only build the loop below is
+  // empty and this case legitimately proves only the oracle half; on a build with
+  // a device it MUST exercise every device that offers rmsnorm. Counting is what
+  // makes "it ran" evidence instead of inference -- an external assertion-count
+  // threshold is a guess about doctest's arithmetic, and mine was wrong.
+  int eligible = 0, exercised = 0;
+  for (DeviceType dt : RegisteredDevices())
+    if (dt != DeviceType::kCPU && OpAvailable(vt::OpId::kRmsNorm, dt)) ++eligible;
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt == DeviceType::kCPU) continue;
+    CAPTURE(DeviceName(dt));
+    if (!OpAvailable(vt::OpId::kRmsNorm, dt)) continue;
+    ++exercised;
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device dd = q.device;
+
+    DevBuf dx(dev, q, n);
+    dx.Upload(x);
+    DevBuf dout(dev, q, n);
+    // The weight is bf16, so it cannot ride `DevBuf` (f32-sized). Raw, and freed
+    // on every exit path below.
+    void* dw = dev.Alloc(static_cast<size_t>(cols) * sizeof(uint16_t));
+    dev.Copy(q, dw, w_bf16.data(), static_cast<size_t>(cols) * sizeof(uint16_t));
+
+    Tensor tx = T2(dx.ptr(), dd, rows, cols);
+    Tensor tw = Tensor::Contiguous(dw, DType::kBF16, dd, {cols});
+    Tensor to = T2(dout.ptr(), dd, rows, cols);
+    vt::RmsNorm(q, to, tx, tw, vt::RmsNormArgs{1e-6f, false}, nullptr);
+    dev.Synchronize(q);
+    const std::vector<float> got = dout.Download();
+    dev.Free(dw);
+    CHECK(Nmse(ref, got) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+
+  // Every eligible device was actually visited. Without this, a filter change, a
+  // missing registration or an early `continue` would leave the device half
+  // silently unrun and the case would still report PASS.
+  CHECK(exercised == eligible);
+  std::fprintf(stderr,
+               "[rmsnorm widened-weight] devices eligible=%d exercised=%d\n",
+               eligible, exercised);
+}
+
 TEST_CASE("bf16<->f32 casts are BIT-EXACT against the CPU codec") {
   constexpr int64_t kRows = 8, kCols = 64;
   constexpr size_t kN = kRows * kCols;

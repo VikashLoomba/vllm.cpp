@@ -35,7 +35,7 @@ field:
 |---|---|
 | `glm5_next_registry.cpp` | CONVICTED on hardware; wired |
 | `deepseek_v4_registry.cpp` | candidate; wired, gated on the fixture |
-| `laguna_registry.cpp` | candidate; wired, gated on the fixture |
+| `laguna_registry.cpp` | candidate; wired, NOT gated -- see D5 |
 | `kimi_k3_registry.cpp` | NOT AFFECTED; see `## Risks/decisions` D3 |
 
 OUT OF SCOPE — making the contract ENFORCEABLE (the "better" option #2544's own
@@ -166,10 +166,43 @@ identifiers reach the embed through `ModelRegistry::Forward`; it does not prove
 either model is ever handed a live `device_token_ids` in service. Recorded as
 O4 rather than claimed.
 
+**D5 — `laguna` is WIRED BUT NOT GATED, and the reason is a defect this row
+found rather than a gap in the harness.** `ForwardLagunaForCausalLM` routes only
+to `LagunaModel::ForwardDevice`, which calls `LagunaModel::Forward`
+(`laguna.cpp:1423`), the unit-gated **f32 reference**. That reference reads
+`lw.moe.experts_gate` / `experts_up` / `experts_down`. **No loader in this tree
+fills them.** `LoadLagunaForCausalLMWeights`
+(`laguna_weights.cpp:435-475`) always writes `experts_*_fp4` and sets
+`has_nvfp4_weights = true`, and the GGUF arm writes the keep-quant tower; the
+real forward for either is `LagunaForwardGguf`, which has **no registry caller
+at all**.
+
+Driving the tree's only forward-runnable Laguna checkpoint fixture
+(`tests/vllm/models/test_laguna_nvfp4_loader.cpp::BuildFiniteTensors`) through
+`ModelRegistry::Load` + `ModelRegistry::Forward` therefore SIGSEGVs inside
+`LagunaModel::Forward`, on `origin/main` at `3d045ba1b`, before this row's change
+and independent of it:
+
+```
+#0  __memcpy_avx512_unaligned_erms ()
+#1  vllm::LagunaModel::Forward(...)
+#2  vllm::LagunaModel::ForwardDevice(...)
+#3  vllm::(anonymous namespace)::ForwardLagunaForCausalLM(...)
+#4  vllm::ModelRegistry::Forward(...)
+```
+
+That is a separate defect with a separate shape — which arm the registration
+should select, what it should refuse, and what gates the selection — and it needs
+its own spec and red-first change. Filed as
+[#2618](https://github.com/mudler/vllm.cpp/issues/2618) and listed under O6. It is NOT repaired
+here, and the `ResolveHostTokenIds` call at `laguna_registry.cpp` is therefore
+correct by construction and unproved by test. Said plainly rather than smoothed:
+this row cannot gate Laguna until that defect is fixed.
+
 ## Tests
 
-`tests/vllm/models/test_host_token_ids.cpp`, entering through
-`ModelRegistry::Forward` for each wired registration, with the three-run A/B/C
+One case per gateable registration, each appended to that model's own existing
+suite and entering through `ModelRegistry::Forward`, with the three-run A/B/C
 recipe `tests/vllm/models/test_moe_async_device_ids.cpp` established for #1305:
 
 ```
@@ -201,7 +234,9 @@ and O5 records it as owed for `deepseek_v4` and `laguna`.
 
 ## Gates
 
-Focused: `ctest -R host_token_ids` plus the three models' existing suites.
+Focused: `test_glm5_next_forward` and `test_deepseek_v4_exl3_loader`, which is
+where the A/B/C cases live — each beside its own model's fixture, rather than in a
+new file that would have to duplicate three of them.
 
 Full: `scripts/agent-preflight.sh`.
 
@@ -254,6 +289,11 @@ hexdumps.
 * **O4** — `DeepseekV4ForCausalLM` and `LagunaForCausalLM` are wired and gated on
   a fixture, NOT convicted on hardware. Neither has a staged checkpoint in this
   flow. Owned by [#2544](https://github.com/mudler/vllm.cpp/issues/2544).
+* **O6** — `ForwardLagunaForCausalLM` routes every step to `LagunaModel::Forward`,
+  the f32 reference, whose `moe.experts_*` no loader in the tree fills; the real
+  forward `LagunaForwardGguf` has no registry caller. A registry step on the only
+  runnable checkpoint fixture SIGSEGVs. Tracked by
+  [#2618](https://github.com/mudler/vllm.cpp/issues/2618). See `## Risks/decisions` D5.
 * **O5** — the DEVICE half of the contract (the copy reads device memory; it is
   ordered on the main queue after the combine) is untested for these three on any
   device; only GLM-5.3-Flash gets a hardware leg here. Owned by

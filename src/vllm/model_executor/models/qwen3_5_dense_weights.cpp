@@ -1227,6 +1227,16 @@ bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
   for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
     if (layer.mlp.IsExl3()) return false;
     if (!layer.is_linear_attention && layer.attn.IsExl3()) return false;
+    // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): the GDN tower, for exactly the
+    // reason the two lines above exist. Without this term a checkpoint whose
+    // linear-attention tower is EXL3 while its dense half is bf16 reads as
+    // plain bf16, takes the direct-device staging path, and that path stages
+    // `OwnedTensor` members only -- it would walk past the trellis, `suh` and
+    // `svh` entirely and leave the tower unstaged. The published artifact
+    // quantizes both halves, so `mlp.IsExl3()` already answers for it; the arm
+    // is resolved PER PROJECTION from the tensors, so correctness here must not
+    // depend on which halves one artifact happens to quantize.
+    if (layer.is_linear_attention && layer.gdn.IsExl3()) return false;
     if (!layer.mlp.gate_proj_fp4.Empty() || !layer.mlp.up_proj_fp4.Empty() ||
         !layer.mlp.down_proj_fp4.Empty()) {
       return false;

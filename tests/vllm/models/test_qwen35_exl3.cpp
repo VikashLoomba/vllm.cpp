@@ -911,6 +911,12 @@ TEST_CASE("qwen3_5 exl3: an EXL3 GDN tower LOADS, and ModelRegistry::Forward REA
   // The registry seam accepts it, which is the entry a user arrives through.
   CHECK(RegistryLoadFailure(ckpt, c).empty());
 
+  // The DIRECT-DEVICE staging path must not claim this model. That path stages
+  // `OwnedTensor` members only, so it would walk past the trellis, `suh` and
+  // `svh` and leave the tower unstaged -- silently, because every shape check
+  // still passes and the bf16 fields it does stage are empty.
+  CHECK_FALSE(vllm::IsPlainBf16Qwen3_5Dense(w));
+
   // THE PRODUCTION ENTRY POINT, over the weights the LOADER produced. Deleting
   // an EXL3 call site in `ProjectGdnQkvz` or `ProjectGdnOut` does not merely
   // move these numbers: the arm falls through to a bf16 field an EXL3 load
@@ -1078,6 +1084,21 @@ TEST_CASE("qwen3_5 exl3: the bf16, per-tensor FP8 and NVFP4 arms are UNCHANGED")
     CHECK(gdn.in_proj_qkvz.shape[0] == g.conv_dim + g.value_dim);
     CHECK_FALSE(gdn.out_proj.Empty());
     CHECK_FALSE(gdn.in_proj_ba.Empty());
+  }
+
+  SUBCASE("an EXL3 GDN tower alone is not a plain bf16 model") {
+    // THE TERM THE OTHER CASES CANNOT ISOLATE. `IsPlainBf16Qwen3_5Dense`
+    // returns false for the published artifact because its MLP is EXL3, so a
+    // missing GDN term is invisible on every checkpoint that quantizes both
+    // halves. This checkpoint quantizes ONLY the GDN tower, so the GDN term is
+    // the single thing that can answer.
+    const TempCheckpoint ckpt(DenseCheckpoint(Arm::kBf16, g, GdnArm::kExl3));
+    const Qwen3_5DenseWeights w = LoadDense(ckpt, c);
+    REQUIRE(w.layers[0].gdn.IsExl3());
+    REQUIRE_FALSE(w.layers[1].mlp.IsExl3());
+    REQUIRE_FALSE(w.layers[1].attn.IsExl3());
+    REQUIRE(w.lm_head_exl3.Empty());
+    CHECK_FALSE(vllm::IsPlainBf16Qwen3_5Dense(w));
   }
 
   SUBCASE("an EXL3 dense half does not quantize an unquantized GDN tower") {

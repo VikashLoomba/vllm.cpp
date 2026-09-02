@@ -145,28 +145,52 @@ TEST_CASE("actdump: a manifest that cannot be appended REFUSES") {
                   std::runtime_error);
 }
 
-TEST_CASE("actdump: a step that wrote fewer blobs than were due REFUSES") {
+TEST_CASE("actdump: a step that wrote fewer STREAM blobs than were due REFUSES") {
   const std::string dir = MakeTempDir();
   const uint16_t payload[2] = {1, 2};
 
-  // Two blobs written, two due: accepted.
+  // Two stream blobs written, two due: accepted.
   vllm::actdump::g_blobs_step.store(0);
+  vllm::actdump::g_stream_blobs_step.store(0);
   vllm::actdump::WriteBlob("VT_DUMP_ACT", dir, 0, 0, "hidden",
                            vt::DType::kBF16, 1, 2, payload, sizeof(payload));
   vllm::actdump::WriteBlob("VT_DUMP_ACT", dir, 0, 0, "res", vt::DType::kBF16, 1,
                            2, payload, sizeof(payload));
-  CHECK_NOTHROW(vllm::actdump::EndStep(0, 2));
+  vllm::actdump::g_stream_blobs_step.fetch_add(2);
+  CHECK_NOTHROW(vllm::actdump::EndStep(0, 2, 1));
 
   // Two written, three due: refused. This is the guard that turns "the
   // instrument produced nothing" from a clean-looking profile into a failure.
-  CHECK_THROWS_AS(vllm::actdump::EndStep(0, 3), std::runtime_error);
+  CHECK_THROWS_AS(vllm::actdump::EndStep(0, 3, 1), std::runtime_error);
+
+  // THE CASE A TOTAL CANNOT SEE, and the reason the counter is split. Plenty of
+  // blobs were written this step -- the GDN stage probes fire off the same
+  // environment variable -- but NOT ONE of them is a residual-stream blob. A
+  // floor keyed on the total passes here; the reachability mutation that
+  // deleted the stream call sites produced exactly this state and a
+  // total-keyed gate reported success over it.
+  vllm::actdump::g_blobs_step.store(50);
+  vllm::actdump::g_stream_blobs_step.store(0);
+  CHECK_THROWS_AS(vllm::actdump::EndStep(0, 2, 1), std::runtime_error);
 
   // Nothing written at all is the case that actually happened on #2534.
   vllm::actdump::g_blobs_step.store(0);
-  CHECK_THROWS_AS(vllm::actdump::EndStep(0, 1), std::runtime_error);
+  vllm::actdump::g_stream_blobs_step.store(0);
+  CHECK_THROWS_AS(vllm::actdump::EndStep(0, 1, 1), std::runtime_error);
+
+  // The sub-stage knob alone on a path that HAS sub-stage probes: no stream blob
+  // is due, but a step that wrote nothing at all is still a refusal.
+  CHECK_THROWS_AS(vllm::actdump::EndStep(0, 0, 1), std::runtime_error);
+  vllm::actdump::g_blobs_step.store(7);
+  CHECK_NOTHROW(vllm::actdump::EndStep(0, 0, 1));
+
+  // ... and on a path that carries none, zero blobs is CORRECT and must not
+  // refuse. The MoE loop is that path.
+  vllm::actdump::g_blobs_step.store(0);
+  CHECK_NOTHROW(vllm::actdump::EndStep(0, 0, 0));
 
   // A step of -1 is the instrument switched OFF, and must stay silent.
-  CHECK_NOTHROW(vllm::actdump::EndStep(-1, 1000));
+  CHECK_NOTHROW(vllm::actdump::EndStep(-1, 1000, 1000));
 
   std::remove((dir + "/s0_l0_hidden.bin").c_str());
   std::remove((dir + "/s0_l0_res.bin").c_str());

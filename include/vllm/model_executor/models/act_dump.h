@@ -83,6 +83,14 @@ inline Where& Current() {
 inline std::atomic<int64_t> g_step{-1};
 inline std::atomic<int64_t> g_blobs{0};       // whole process
 inline std::atomic<int64_t> g_blobs_step{0};  // reset at each BeginStep
+// The RESIDUAL-STREAM blobs alone, counted apart from every other stage.
+//
+// A total is not enough, and a reachability mutation proved it: deleting the
+// stream call sites from the paged loop left the GDN stage probes writing, the
+// total stayed non-zero, and a gate keyed on the total passed over a forward
+// that no longer dumped a single hidden state. A count that cannot go to zero
+// when the thing it measures is removed measures nothing.
+inline std::atomic<int64_t> g_stream_blobs_step{0};
 
 // One line per process, before the first blob, naming what the instrument was
 // pointed at. A reader of the log can then audit the wiring without reading
@@ -174,6 +182,7 @@ inline int64_t BeginStep() {
   if (!Enabled()) return -1;
   const int64_t s = g_step.fetch_add(1, std::memory_order_relaxed) + 1;
   g_blobs_step.store(0, std::memory_order_relaxed);
+  g_stream_blobs_step.store(0, std::memory_order_relaxed);
   Current() = Where{s, -1};
   return s;
 }
@@ -181,20 +190,40 @@ inline int64_t BeginStep() {
 // Close a forward step, and say how many blobs it wrote. ZERO IS A REFUSAL, not
 // a silence: an enabled instrument that produced nothing for a whole forward has
 // failed, and the run must not continue and be read as a clean profile.
-inline void EndStep(int64_t step, int64_t expected_at_least) {
+//
+// TWO floors, because one of them cannot see the failure the other exists for.
+// `stream_due` counts residual-stream blobs alone; `any_due` counts every blob.
+// A reachability mutation that deleted both stream call sites left the GDN stage
+// probes writing, so the total stayed high while not one hidden state was
+// dumped — which a single total-keyed floor reports as success.
+inline void EndStep(int64_t step, int64_t stream_due, int64_t any_due) {
   if (step < 0) return;
   const int64_t n = g_blobs_step.load(std::memory_order_relaxed);
+  const int64_t sn = g_stream_blobs_step.load(std::memory_order_relaxed);
+  // `stream_blobs` is printed SEPARATELY from the total, and it is the number a
+  // gate keys on. The total includes the GDN stage probes, which fire off the
+  // same variable, so it stays non-zero even when the residual-stream dump is
+  // gone entirely.
   std::fprintf(stderr,
-               "[VT_DUMP_ACT] step=%lld blobs_this_step=%lld blobs_total=%lld\n",
-               static_cast<long long>(step), static_cast<long long>(n),
+               "[VT_DUMP_ACT] step=%lld stream_blobs=%lld blobs_this_step=%lld "
+               "blobs_total=%lld\n",
+               static_cast<long long>(step), static_cast<long long>(sn),
+               static_cast<long long>(n),
                static_cast<long long>(g_blobs.load(std::memory_order_relaxed)));
   std::fflush(stderr);
-  VT_CHECK(n >= expected_at_least,
-           "VT_DUMP_ACT/VT_DUMP_ACT_SUB: the instrument is ON and wrote " +
-               std::to_string(n) + " blobs where at least " +
-               std::to_string(expected_at_least) +
+  VT_CHECK(sn >= stream_due,
+           "VT_DUMP_ACT: the instrument is ON and wrote " + std::to_string(sn) +
+               " residual-stream blobs where " + std::to_string(stream_due) +
                " were due for this step. A dump that writes nothing looks "
                "exactly like a dump that is off, so this is a refusal");
+  // `any_due` is the caller's, because only the caller knows which dumps its own
+  // path carries: the MoE loop has no sub-stage probes, so a SUB-only run there
+  // legitimately writes nothing and a hardwired "> 0" would refuse a correct
+  // run. It is a separate floor from `stream_due` and not a weaker copy of it.
+  VT_CHECK(n >= any_due,
+           "VT_DUMP_ACT/VT_DUMP_ACT_SUB: the instrument is ON and wrote " +
+               std::to_string(n) + " blobs where at least " +
+               std::to_string(any_due) + " were due for this step");
 }
 
 }  // namespace actdump

@@ -1347,6 +1347,9 @@ void ActDumpStream(Dev d, int64_t step, int64_t layer, DBuf& hidden, DBuf& res,
   const actdump::LayerScope here(step, layer);
   ActDumpTensor(d, "VT_DUMP_ACT", dir, "hidden", hidden.t(), T, H);
   ActDumpTensor(d, "VT_DUMP_ACT", dir, "res", res.t(), T, H);
+  // Counted apart from every other stage: see `g_stream_blobs_step`. A gate
+  // keyed on the total cannot tell this call site from the GDN stage probes.
+  actdump::g_stream_blobs_step.fetch_add(2, std::memory_order_relaxed);
 }
 
 // Device-resident f32 upcast of a bf16 owned weight, uploaded ONCE. Matches the
@@ -7642,6 +7645,11 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
+  // ROCM-TIER-DIVERGENCE (#2590): carry (step, layer) to every dump nested in
+  // this layer's mixer, so the GDN stage probes stop keying on a counter of
+  // their own. Inert when no dump knob is set.
+  const actdump::LayerScope dump_here(actdump::Current().step, layer_index);
+
   DBuf dhn(d, ActDType(d), {T, H});
   std::optional<DBuf> dhn_fp8 = InputLayernormFp8(d, layer, cfg, hidden, res, dhn, T);
   const Tensor* h_fp8 = dhn_fp8 ? &dhn_fp8->t() : nullptr;
@@ -8389,22 +8397,21 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     MaybeBuildAttnCosSin(d, sdi, config, T, fp4_attn);
   }
 
-  int64_t fa_idx = 0, gdn_idx = 0;
-    if (std::getenv("VT_DUMP_ACT") != nullptr) {
-    for (int which = 0; which < 2; ++which) {
-      const Tensor& t = which == 0 ? hidden.t() : res.t();
-      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
-                               vt::SizeOf(t.dtype));
-      DBuf tmp(d, t.dtype, {T * H}, t.data);
-      d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
-      tmp.Download(d, raw.data());
-      const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/layer_-1_" +
-                               (which == 0 ? "hidden" : "res") + ".bin";
-      std::FILE* f = std::fopen(path.c_str(), "wb");
-      if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
-    }
+  // ROCM-TIER-DIVERGENCE (#2590): the MoE arm is keyed the same way as the dense
+  // one. It used to write ONE hand-rolled pre-layer snapshot with the silent
+  // `if (f != nullptr)` shape, no per-layer rows, and a name (`layer_-1_*`) that
+  // no step index could distinguish — so a second forward overwrote the first.
+  // It now shares the writer, the (step, layer) key and the manifest, and its
+  // nested GDN stage probes get a valid key from the same scope.
+  const int64_t dump_step = actdump::BeginStep();
+  if (dump_step >= 0) {
+    actdump::NarrateOnce(d.q.device.type, "Qwen3_5Model",
+                         config.num_hidden_layers, T, H);
   }
-for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+  ActDumpStream(d, dump_step, -1, hidden, res, T, H);
+
+  int64_t fa_idx = 0, gdn_idx = 0;
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5MoeLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
     const PagedKvCache* kv =
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
@@ -8415,7 +8422,15 @@ for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
+    ActDumpStream(d, dump_step, l, hidden, res, T, H);
   }
+  // The MoE loop carries no sub-stage probes, so a VT_DUMP_ACT_SUB-only run here
+  // legitimately writes nothing and `any_due` follows the stream knob.
+  actdump::EndStep(dump_step,
+                   actdump::StreamDir() == nullptr
+                       ? 0
+                       : 2 * (config.num_hidden_layers + 1),
+                   /*any_due=*/actdump::StreamDir() == nullptr ? 0 : 1);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
@@ -9378,10 +9393,14 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     // capture-graph paths must not set the env.
     ActDumpStream(d, dump_step, l, hidden, res, T, H);
   }
-  // At least the two stream halves per layer, when VT_DUMP_ACT is what is set.
-  actdump::EndStep(dump_step, actdump::StreamDir() == nullptr
-                                  ? 1
-                                  : 2 * (config.num_hidden_layers + 1));
+  // Two stream halves per layer, plus the pre-layer snapshot. Zero due when the
+  // stream knob is not the one that is set. This path also carries the
+  // sub-stage probes, so SOMETHING is always due here whichever knob it was.
+  actdump::EndStep(dump_step,
+                   actdump::StreamDir() == nullptr
+                       ? 0
+                       : 2 * (config.num_hidden_layers + 1),
+                   /*any_due=*/1);
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});

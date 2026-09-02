@@ -239,8 +239,10 @@ to prove the thing under test did not move.
 ### The tree this measures
 
 The binary is the one #2511 characterised, at `11fed3ba5`. **Six** commits touch
-`src/vt/rocm/` or `include/vt/rocm/` between it and `origin/main`, and none
-changes the Q4_K decode path: `f424b53fe` (`FlushPending`, whose only call site
+`src/vt/rocm/` or `include/vt/rocm/` between it and this document's branch base
+`c9366de65` — the count is stated against a named object because `origin/main`
+moved 88 commits while this ran, and a count against a moving ref is false by the
+time anyone reads it. None of the six changes the Q4_K decode path: `f424b53fe` (`FlushPending`, whose only call site
 is guarded by `slot.ref_selected` at `src/vt/op_provider.cpp:707-711` and never
 fires on a run with zero reference-tier hits), `456f9cd6f` (the `Fmt == 3` Q6_K
 body, `VT_ROCM_Q6K_SMALL_PRIVATE`, default OFF and measured worse), `3fede4162`
@@ -249,6 +251,15 @@ four f16/bf16 device codec helpers into a new header and `DF16ToF32` decodes a
 Q4_K superblock scale, so it was checked rather than assumed: the four function
 bodies hash `3f8da2d5ce1760bd1d72acdf147285576ec03aa4e409fdeb7c38b69b41a363b8` on
 both sides of the gap, and only comments differ.
+
+Three further ROCm commits landed on `origin/main` after this branch's base, the
+substantive one being `8bca27b26` (decouples the RmsNorm gamma dtype from the
+activation dtype and adds a `kF16` gamma path; its own body states the arithmetic
+is bit-identical for pairings that already worked, and ours is bf16 gamma with
+bf16 activations). **None can affect this measurement in either direction,
+because no leg produced token ids** — a numerics change cannot move a verdict that
+was never scored. A future scoring run on a rebuilt binary must account for it.
+The spec carries the full assessment.
 
 ## The oracle's executed kernel path, pinned
 

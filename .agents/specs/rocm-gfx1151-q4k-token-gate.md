@@ -204,12 +204,31 @@ the fault-rate evidence and the token verdict on one binary, which is worth
 more here than currency.
 
 That base is behind `origin/main`, and "behind" is not a useful thing to say.
-**Exactly six commits touch `src/vt/rocm/` or `include/vt/rocm/` across the
-gap**, and none of them changes the Q4_K decode path:
+The gap is enumerated instead — but **a count against a moving `origin/main` goes
+stale, so it is stated against a NAMED object**. Measured at this branch's base
+`c9366de65`, **exactly six commits** touch `src/vt/rocm/` or `include/vt/rocm/`,
+and none changes the Q4_K decode path:
 
 ```sh
-git log --oneline 11fed3ba5..origin/main -- src/vt/rocm/ include/vt/rocm/
+git log --oneline 11fed3ba5..c9366de65 -- src/vt/rocm/ include/vt/rocm/   # six
 ```
+
+**`origin/main` moved 88 commits while this row ran, and three more ROCm commits
+landed in that window**, which is exactly how a count committed as prose becomes
+false on merge. They are assessed rather than left to be discovered:
+
+| commit | assessment |
+|---|---|
+| `8bca27b26` | decouples the RmsNorm gamma dtype from the activation dtype on ROCm and adds a `kF16` gamma path. Its own body states that the arithmetic "is bit-identical for every pairing that already worked"; our path is a bf16 gamma with bf16 activations, a pairing that already worked, so it adds a capability rather than moving this arm's numerics |
+| `cd5e9d078` | a merge |
+| `fcd446b03` | a record change: the ROCm arm compiles |
+
+**None of the three can affect this measurement in either direction, for a reason
+that does not depend on reading them: no leg produced token ids.** A numerics
+change cannot move a verdict that was never scored. They are listed because a
+future scoring run on a rebuilt binary must account for `8bca27b26`, and because
+the six-commit claim above must be re-derived at whatever object this row
+eventually merges onto rather than trusted.
 
 | commit | what it is | why it cannot move this measurement |
 |---|---|---|

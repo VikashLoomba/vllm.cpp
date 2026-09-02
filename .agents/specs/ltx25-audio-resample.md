@@ -404,13 +404,43 @@ window shifted by one and closed with a zero, `max|diff| = 0.321509` against a
 `2.5e-07` tolerance. 32000 -> 16000 at 67108869 samples is the same arithmetic:
 `target_length` 33554436, columns 33554435.
 
-**Reachable from the default command line.** `ltx2_gen --audio-path <file>` ->
-`Ltx2VideoEngine::Generate` -> `Ltx2DecodeAudioWav` -> `Ltx2EncodeAudioToLatent`
--> `Ltx2WaveformToLogMel` -> `Ltx2ResampleWaveform`. `--audio-max-duration` is
-opt-in, so without it the whole file passes through, and the extra sample moves
-`frames = 1 + (samples + 2 * pad - n_fft) / hop` wherever it crosses a hop
-boundary. That is the conditioning shape — the consequence the truncation
-arithmetic exists to get right.
+**On the production path, at a length no default render reaches.** The chain is
+`ltx2_gen --audio-path <file>` -> `Ltx2VideoEngine::Generate` ->
+`Ltx2DecodeAudioWav` -> `Ltx2EncodeAudioToLatent` -> `Ltx2WaveformToLogMel` ->
+`Ltx2ResampleWaveform`, and the row's reachability mutation already proves that
+call site is reached. What the mutation cannot say is which INPUTS reach the
+clamp, and the answer is: long ones.
+
+The clamp fires only where the output crosses 2^25 with zero column slack.
+Scanned over the zero-slack residues of ten ratios, the smallest firing input is
+**2097.2 s — 35.0 min** — at 48000 -> 16000, 32000 -> 16000, 96000 -> 16000 and
+192000 -> 16000; 25.4 min at 44100 -> 22050; and 18.6 HOURS at 44100 -> 16000,
+whose `o = 441` puts the gap 0.36 below the next integer and so needs a far
+larger quotient before an f32 ulp can cross it. `Ltx2DecodeAudioWav` caps the
+read at `max_duration` (`ltx2_audio_input.cpp:136-139`), which the engine
+defaults to the clip's own duration, `frames / fps`
+(`ltx2_video.cpp:3063-3069`), so a render has to be over 35 minutes long, or
+carry an explicit `--audio-max-duration` at least that large, before any of this
+is reached.
+
+**An earlier draft of this section said `--audio-max-duration` is opt-in, and
+therefore that the whole file passes through without it. The premise is true and
+the conclusion is false**, which is why the error survived a `file:line` cite.
+`examples/ltx2_gen/main.cpp:512-515` does only forward `audio_max_duration` when
+the flag was given, so the flag IS opt-in at the command line. The default lives
+one layer down: `ltx2_video.cpp:3069` reads that extra with
+`static_cast<double>(frames) / fps` as its fallback, so an absent flag becomes
+the clip's own duration rather than no cap at all. The help text says so in as
+many words — "default: the clip's own duration",
+`examples/ltx2_gen/main.cpp:187-188`. Recorded rather than quietly corrected,
+because reading a default off the layer that FORWARDS a knob instead of the layer
+that RESOLVES it is a mistake that repeats, and because the false version made
+this repair read as a live user-facing bug, which it is not.
+
+What it is: a parity defect against upstream on a reached path. Where it does
+fire, the extra sample moves `frames = 1 + (samples + 2 * pad - n_fft) / hop`
+wherever it crosses a hop boundary, which is the conditioning shape — the
+consequence the truncation arithmetic exists to get right.
 
 **Why the 276060-pair sweep missed it.** That sweep compared the port's
 expression against **the formula**. It never called

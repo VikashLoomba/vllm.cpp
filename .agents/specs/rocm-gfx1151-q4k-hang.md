@@ -488,6 +488,43 @@ type 2, priv 1, wave_id …` before the reset. That is a shader-unit memory
 violation raised by a WAVE, not only a VM fault seen by the hub, which is worth
 recording because it constrains the mechanism.
 
+## `HSA_ENABLE_SDMA=0` IS NOT A FIX: 4 of 10, not 0 of 5
+
+**Read this before the matrix below, which is the five-leg result it corrects.**
+
+rc job `c56b596c-0f57-4d05-ab54-744fb5c70c17` PHASE B, log
+`/mnt/nas_share/rc/rocm-strix-shape/evidence5/sdma.log`. Twenty legs, two arms,
+alternating with the within-round order rotating, same binary, same boot:
+
+| arm | legs | failures |
+|---|---|---|
+| `base` | 10 | **9** |
+| `sdma0` (`HSA_ENABLE_SDMA=0`) | 10 | **4** |
+
+The knob HALVES the rate. It does not remove the fault. The earlier `0 of 5`
+was a five-leg fluke on an arm whose true rate is about 40%: at p = 0.4 a run of
+five clean legs has probability 0.08, which is unremarkable once you look at
+enough arms, and this row had five arms.
+
+Pooled over every leg of this knob in every job — W3's three `sdmaoff` legs,
+W4's five `sdma0` legs and W7's ten — it is **6 failures in 18** against **16 in
+21** for the unset arm. That is a real effect and it is not a fix.
+
+**So the workaround is not one.** Nothing may quote `HSA_ENABLE_SDMA=0` as
+making `gfx1151` safe: it leaves a two-in-five chance of a GPU reset on a single
+prefill, while costing an unmeasured amount of throughput by moving every copy
+off the DMA engine. It is a diagnostic signal about where the fault comes from,
+and that is all it is.
+
+**The new fault addresses matter too.** `base-r8` faulted at `0x763788005000`,
+`sdma0-r9` at `0x7b55ca9f3000` — both ordinary user addresses — and `sdma0-r6`
+at `0xf1eefdf000`, about 1 TB, also inside a user range. Earlier legs faulted at
+`0xbc623c10b000`, `0xed0000fe0000` and `0xf9f0dfef3000`, which are not. Eight
+faults now, at eight different page-aligned addresses, some plausible and some
+impossible, and none inside any allocation the process made. One systematic wild
+pointer does not produce that spread; a page-table walk over a mapping being
+changed underneath it does.
+
 ## The env-knob matrix, and the one knob that moved the rate
 
 Same job `66658d40`, PHASE B: five knobs, five legs each, interleaved with the
@@ -501,11 +538,10 @@ within-round order rotating, minimal shape, no rebuild.
 | `noreclaim` | `HSA_ENABLE_SCRATCH_RECLAIM=0` | 5 | 2 |
 | **`sdma0`** | **`HSA_ENABLE_SDMA=0`** | **5** | **0** |
 
-`HSA_ENABLE_SDMA=0` is the only arm that took no failure, and it is the arm that
-turns OFF the engine that reads the HOST SOURCE of an `hipMemcpyAsync` directly.
-With SDMA disabled the runtime stages a pageable H2D copy instead, so releasing
-the source afterwards stops being an exposure. That is the mechanism W5 names,
-approached from the other side.
+`HSA_ENABLE_SDMA=0` was the only arm that took no failure IN THIS MATRIX, and
+the section above shows what happened when it was given ten legs instead of
+five: 4 of 10. Read this table as the five-leg screen that pointed at the knob,
+never as its rate.
 
 **`HSA_ENABLE_SDMA=0` IS A WORKAROUND, NOT A FIX, AND IT IS NOT FREE.** It turns
 off the DMA engine, so every host-to-device copy falls back to a staged blit on

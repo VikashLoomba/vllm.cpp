@@ -235,6 +235,53 @@ rather than refused because the SEAM promises it (`ops.cpp:1030`, `:748`,
 (`cpu_ops.cpp:554-557`, `:1042`), `CudaPlatform::supported_dtypes` advertises it
 (`platforms/cuda.cpp:111-113`), and the oracle upcasts any float gamma.
 
+### The gate, read literally
+
+Green baseline first, because a mutation kill against a red baseline is void:
+
+```
+NINJA_RC=0
+test_ops_rmsnorm_weight_dtype            RC=0   6 cases / 263 assertions
+test_ops_rmsnorm_quant_fp8_weight_dtype  RC=0   2 cases / 195 assertions
+test_ops_rmsnorm                         RC=0  10 cases /  36 assertions
+ctest --test-dir build -R 'test_ops_rmsnorm' --output-on-failure   CTEST_RC=0, 4/4
+```
+
+The assertion counts are stated because `assertions: 0 ... SUCCESS!` at rc 0 is a
+skip wearing a pass. Both CUDA arms print `[SKIP]` on this host and no CI lane
+runs GPU tests, so those cases contribute nothing to those counts.
+
+### Mutations, with counted applied-ness
+
+Each mutation asserts the ORIGINAL anchor count goes 1 -> 0 and the mutant count
+0 -> 1 before anything is built, requires the rebuild's own rc to be 0 (a build
+failure reads as a passing test), and is restored with `cmp -s` returning 0 and
+an empty `git status` for the file.
+
+| # | Mutation | Applied-ness | Build | Result |
+|---|---|---|---|---|
+| MUT-1 | `cpu_ops.cpp` `RmsNormKernel`: `WidenRowToF32(w.dtype, ...)` -> `WidenRowToF32(x.dtype, ...)` -- literally re-welding the gamma to the activation, the defect this wave removes | 1->0 / 0->1 | rc 0 | **KILLED.** rc 1, 3 of 6 cases, 6 of 263 assertions, including `from_f16 == from_f32` and `from_bf16 == from_f32` |
+| MUT-2 | `cpu_ops.cpp` `RmsNormQuantFp8Kernel`: read the gamma through a copy of `w` whose `dtype` is forced to `x.dtype` -- the same re-weld on the fp8 twin | 1->0 / 0->1 | rc 0 | **KILLED.** rc 1, 1 of 2 cases, 3 of 195 assertions: both mixed-gamma equalities AND the load-bearing bump |
+| MUT-3 | `cpu_matmul_elem.cpp` `WidenRowToF32`: the `kF16` arm widens with `BF16ToF32` -- isolates the f16 path alone | 1->0 / 0->1 | rc 0 | **KILLED, discriminatingly.** rc 1 and exactly ONE assertion, `from_f16 == from_f32`. The fp8 suite stayed rc 0, correctly: its kernel reads the gamma through `LoadF32`, not `WidenRowToF32` |
+
+MUT-3's negative half is the informative one. It shows the two suites reach the
+gamma through different code, and that the f16 equality is not riding on the
+other assertions.
+
+**No mutation could be run against either device arm.** There is no `nvcc` and no
+`hipcc` on this host and no CUDA or HIP header anywhere on it (`find / -maxdepth 4
+-name cuda_bf16.h` returns nothing), so the CUDA and ROCm edits were verified by
+reading, by a brace/paren/bracket balance check on both files, and -- for the CUDA
+file only -- by `cuda-fat-build` in CI. That is stated rather than papered over.
+
+**The reachability mutation the protocol asks for was NOT run, and cannot be for
+this change.** Deleting `qwen3_5.cpp:6869` in a scratch copy would not move either
+suite, because both enter through the `vt::RmsNorm` / `vt::RmsNormQuantFp8` op
+seam rather than through `ModelRegistry::Forward`. What is true and checkable
+instead: the f32-gamma and bf16-gamma arms of both dispatchers ARE reached by
+production (`qwen4_exp_qsa_block.cpp:705` and `qwen3_5.cpp:6869` respectively),
+and the kF16 arm is reached by nothing, which is declared above.
+
 ### What was compiled, and where
 
 | Change | Compiled by | Executed by |

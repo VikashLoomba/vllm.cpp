@@ -260,6 +260,27 @@ weight with the right distribution and no correlation to the true one, which is
 the failure mode this row's `## Risks/decisions` already names. The mutation
 table therefore carries that exact swap, and the device case must red on it.
 
+### The mutation margin, measured before the device run
+
+`(3, 1)`-for-`(3, 2)` is only a useful mutation if the two decodes disagree by
+much more than the bound. That is a property of the CODEBOOKS and not of the
+device, so it is measurable on the CPU arm alone, and it was measured before
+the lease came:
+
+| bits | cb 1 vs cb 2, relative RMS | against the 1.0e-3 bound |
+|---|---:|---:|
+| 3 | 1.70865 | 1709x |
+| 4 | 1.52897 | 1529x |
+
+Same fixture, same seeds and same shapes the device case uses
+(`MakeFixture(256, 256, bits, 0x1D0C0DE + bits)`, m = 4), both arms run through
+`vt::Exl3Gemm` on a CPU queue, scratch program, not committed. A relative RMS
+above 1 is the SATURATED error of two uncorrelated results, which is the
+"right distribution, no correlation" this row's `## Risks/decisions` describes,
+and it is what makes the M2 row below a bimodal mutation rather than a
+tolerance nudge. If the device ever reports an M2 number NEAR 1.0e-3 rather
+than near 1.7, the mutation did not apply and the row is not evidence.
+
 ### Not in scope
 
 - **The `m <= 8` GEMV** (#2570). `exl3_gemv_kernel` carries

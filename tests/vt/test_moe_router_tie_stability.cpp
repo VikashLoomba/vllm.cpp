@@ -40,7 +40,7 @@
 //   :515-517  the per-thread scan, "only updated if > (not >=)"
 //   :707-708  case 512: LAUNCH_TOPK(512, ...) -- E=512 is a registered width
 //   :186,222,225  the fallback moeTopK's cub::ArgMax, same lowest-key contract
-//   :465      "With 0s, the argmax uses index tie-breaking to pick [0,1,...,k-1]"
+//   :465      "With 0s, the argmax uses index tie-breaking to pick [0,1,2,...,k-1]"
 //
 // So a failure here is a divergence from the oracle, and both arms being wrong
 // the same way cannot read green.
@@ -278,6 +278,23 @@ TEST_CASE("moe router CPU: an exact tie at the top-k boundary selects the lowest
 // vt::cuda::MoeRouterTopKSerialCuda is a CUDA-only symbol (a runtime HasCuda()
 // skip is not enough -- it is undefined at link time on a CPU build), and on a
 // runtime HasCuda() because a CUDA build still runs on hosts with no device.
+//
+// THAT RUNTIME SKIP IS PERMISSIVE, AND IT LETS A DEVICE-LESS CUDA BUILD READ
+// GREEN. The three cases below print a MESSAGE and return, so such a build
+// reports `4 cases | 488 assertions | 0 failed | rc 0` -- which this wave's
+// orin:gpu0 lease did, with a BROKEN tie-break compiled in. Three states have
+// to be told apart, and the CASE COUNT is half of what tells them apart:
+//
+//   CPU-only build (these cases #ifdef'd out) : 1 case  |  488 assertions
+//   CUDA build, no device (they skip)         : 4 cases |  488 assertions
+//   CUDA build with a device                  : 4 cases | 4652 assertions
+//
+// Read BOTH numbers; neither alone separates all three. The tree already has
+// the idiom that refuses instead of skipping --
+// tests/parity/test_qwen27n_fp8_tower_paged_engine.cpp:149 reads
+// VT_REQUIRE_27N_FP8_GATE and turns absence into a hard FAILURE -- and 13 other
+// test files share the permissive shape used here, so adopting it is a
+// tree-wide change rather than this file's repair. #2603 owns it.
 #ifdef VLLM_CPP_CUDA
 
 namespace {
@@ -391,6 +408,21 @@ TEST_CASE("CUDA moe router: an exact boundary tie selects the lowest tied indice
       }
     }
   };
+  // BOTH ARMS ARE THE SAME KERNEL ABOVE E = 256, AND THAT HALVES THE COVERAGE
+  // HERE. MoeRouterWarpValuesPerThread (moe_router_warp.h:96-98) returns 0 for
+  // every E outside {32,64,128,256}, and LaunchRouterWarp (cuda_moe.cu:564)
+  // returns false on vpt == 0 before it touches a tensor, so at E = 512 and
+  // E = 1024 -- including the geometry `qwen4_exp` actually routes -- the
+  // warp-on arm falls through to the SAME MoeRouterTopKKernel<Tin,false> the
+  // warp-off arm runs. Only E = 256 compares two structures.
+  //
+  // The counts below are honest: every assertion really executes. But 36 of the
+  // 72 rows at E > 256 are byte-identical repeats, so each real disagreement
+  // there is counted TWICE -- the mutation table's `12` per cell is
+  // 2 arms x 3 h x 2 dtypes, of which 6 are the second count of the same event.
+  // Read "both VT_MOE_ROUTER_WARP arms" as two structures only at E = 256.
+  // #2604 owns narrowing this; it is not fixed here because re-measuring it
+  // costs the GPU time every record in this wave cites.
   {
     vt_test::ScopedMoeRouterWarp pin("1");
     REQUIRE(vt_test::ScopedMoeRouterWarp::EffectiveFlag());

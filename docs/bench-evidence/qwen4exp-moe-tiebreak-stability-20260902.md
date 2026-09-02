@@ -77,6 +77,20 @@ Geometries `E in {256, 512, 1024}`, `k in {8, 10}`, `h in {0, 1, k-1}`, f32 and
 bf16 logits, `VT_MOE_ROUTER_WARP` pinned ON and OFF with the pinned state
 `REQUIRE`d.
 
+**The two `VT_MOE_ROUTER_WARP` arms are two structures only at E = 256.**
+`MoeRouterWarpValuesPerThread` (`moe_router_warp.h:96-98`) returns 0 for every E
+outside `{32,64,128,256}`, and `LaunchRouterWarp` (`cuda_moe.cu:564`) returns
+`false` on `vpt == 0` before it touches a tensor, so at E = 512 and E = 1024 --
+`qwen4_exp`'s own geometry included -- the warp-on arm falls through to the same
+`MoeRouterTopKKernel<Tin,false>` the warp-off arm runs. Every count in §4 and §6
+is honest, because every assertion really executed; but 36 of the 72 rows at
+E > 256 are byte-identical repeats, so §6's `12` per cell is
+`2 arms x 3 h x 2 dtypes` of which 6 are the second count of one disagreement,
+and COVERAGE above E = 256 is half what the doubled figures imply. Filed as
+[#2604](https://github.com/mudler/vllm.cpp/issues/2604) and listed under the
+spec's `## Owed`; not repaired here because re-narrowing the sweep would move
+every number this document records and needs the lease again.
+
 Indices are compared with `==` and the selection as an ordered vector. **There is
 no tolerance anywhere in the file**, because a discrete selection has bimodal
 error. The counted property is `tied_seen`: the number of rows whose boundary
@@ -179,6 +193,27 @@ Thread 28 owns experts 28 and 284, both tied. The correct kernel reports 28; the
 mutant reports 284, and expert 28 then never reaches the warp reduction at all.
 This compare does not exist at `E <= 256`.
 
+**The CPU half has its own red-first, and it is the one CI runs everywhere.**
+On the authoring host, CPU-only build at the branch head, flipping the CPU
+greedy argmax's strict `>` to `>=` at ONE site --
+`src/vt/cpu/cpu_ops.cpp:2985`, `if (p[static_cast<size_t>(idx)] > best_v)`,
+`grep -c` = 1 -- reds **every** selection assertion in the CPU case:
+
+| run | cases | assertions | passed | failed | rc |
+|---|---|---|---|---|---|
+| baseline | 1 | 488 | 488 | **0** | 0 |
+| mutant | 1 | 488 | 380 | **108** | 1 |
+| restored | 1 | 488 | 488 | **0** | 0 |
+
+All 108 failures are `CHECK( ids == r.expect )` and none is a counted-property
+assertion, so the mutant is caught by the SELECTION and the row builder is
+proved still to have built ties. 108 is the whole population and not a subset:
+`h < k` is `REQUIRE`d, so every one of the 54 rows selects at least one member
+of the tied set, and `>=` mis-selects on each of them in both dtypes --
+`54 x 2 = 108`. An earlier revision of #2595's pull-request body said 90; that
+was a stale draft figure from a five-pattern version of the file, and the
+shipped file has six patterns.
+
 **Note what the mutant did NOT break: determinism.** Its 279 repeat comparisons
 and 2313 batch comparisons all still passed. A wrong tie-break is perfectly
 repeatable. Determinism is a necessary condition for the correct answer, never a
@@ -221,9 +256,34 @@ returned. Its three runs read:
 488 is the CPU case alone. **The mutant read GREEN on this box** -- same
 assertion count, rc 0 -- with a broken tie-break compiled into the binary,
 because the arm that would have caught it never ran. That is the
-`assertions: 0 ... SUCCESS!` failure mode wearing a non-zero number, and the only
-thing that distinguishes it from Thor's real result is the COUNT: 488 against
-4652. Read the count, never the status line.
+`assertions: 0 ... SUCCESS!` failure mode wearing a non-zero number.
+
+**And the ASSERTION count alone does not separate the three states -- the CASE
+count is the other half.** An earlier revision of this document said the count
+was "the only thing" that distinguishes this box from Thor. It distinguishes
+this box from Thor; it does NOT distinguish this box from a CPU-only build,
+which reads 488 as well:
+
+| state | cases | assertions | rc |
+|---|---|---|---|
+| CPU-only build — the device cases are `#ifdef`'d out | **1** | 488 | 0 |
+| `orin:gpu0` — CUDA build, no device, cases skip and return | **4** | 488 | 0 |
+| `thor:gpu0` — CUDA build with a device | **4** | **4652** | 0 |
+
+The CPU-only row is measured on the authoring host at the branch head
+(`test cases: 1 | 1 passed`, `assertions: 488 | 488 passed`, rc 0); the middle
+row's case count follows from the three cases being compiled in and executing
+their skip `return`. Read both numbers, never the status line and never one
+number.
+
+**The permissive skip that makes the middle row possible is a tree-wide shape
+and is now owed.** `grep -rl 'no CUDA backend registered; skipping' tests/` finds
+14 files, 13 of them not this one, and the tree already carries the idiom that
+refuses instead: `tests/parity/test_qwen27n_fp8_tower_paged_engine.cpp:149`
+reads `VT_REQUIRE_27N_FP8_GATE` and turns absence into a hard FAILURE. Adopting
+it across those files is a row of its own, filed as
+[#2603](https://github.com/mudler/vllm.cpp/issues/2603) and listed under the
+spec's `## Owed`.
 
 `orin:gpu0` therefore corroborates the CPU arm on aarch64 and the `sm_87`
 compile, and contributes nothing to §4. Every device number in this document

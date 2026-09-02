@@ -6984,6 +6984,42 @@ and three things are still owed before a single cell of that table exists.
   or removing the guard and saying what replaces it. Owned by
   `MODEL-MM-QWEN4-EXP`; NO ISSUE NUMBER, GitHub writes are `403`.
 
+### TIEBREAK: two gaps the wave RECORDED rather than fixed (#2586)
+
+Wave TIEBREAK's fresh review found two properties of
+`tests/vt/test_moe_router_tie_stability.cpp` that are real and that this row
+owes. Neither is fixed in the wave's own pull request: the first is a tree-wide
+test idiom and the second needs GPU time to re-measure every count the wave's
+records cite, so folding either in would make a test-only change carry an
+unmeasured claim.
+
+- **A DEVICE-LESS CUDA BUILD READS GREEN
+  ([#2603](https://github.com/mudler/vllm.cpp/issues/2603)).** The three device
+  cases guard on `if (!HasCuda()) { MESSAGE(...); return; }`, so a CUDA build on
+  a host with no device reports **4 cases | 488 assertions | 0 failed | rc 0**
+  while measuring nothing on device. The wave's own `orin:gpu0` lease did exactly
+  that, green, with a broken tie-break in the binary (evidence §8). Three states
+  exist and the assertion count separates only two of them — CPU-only is
+  `1 | 488`, device-less CUDA is `4 | 488`, a real device run is `4 | 4652` — so
+  the Gates section now teaches the CASE count beside it. The tree already has
+  the refusing idiom at
+  `tests/parity/test_qwen27n_fp8_tower_paged_engine.cpp:149`
+  (`VT_REQUIRE_27N_FP8_GATE` turns absence into a FAILURE), and 13 other test
+  files share the permissive shape, so adopting it is a row of its own.
+
+- **HALF THE DEVICE SWEEP IS A DUPLICATE ABOVE E = 256
+  ([#2604](https://github.com/mudler/vllm.cpp/issues/2604)).** Case 1 runs its
+  sweep with `VT_MOE_ROUTER_WARP` pinned `"1"` and `"0"`, but
+  `MoeRouterWarpValuesPerThread` (`moe_router_warp.h:96-98`) returns 0 for every
+  E outside `{32,64,128,256}` and `LaunchRouterWarp` (`cuda_moe.cu:564`) returns
+  `false` on `vpt == 0` before touching a tensor, so at E = 512 and E = 1024 —
+  including the geometry `qwen4_exp` routes — both arms dispatch the SAME
+  `MoeRouterTopKKernel<Tin,false>`. The counts stay honest, because every
+  assertion really executes: 36 of the 72 rows at E > 256 are byte-identical
+  repeats, and the mutation table's `12` per cell is `2 arms x 3 h x 2 dtypes`,
+  of which 6 are the second count of one disagreement. COVERAGE at E > 256 is
+  half what the doubled numbers imply, and only E = 256 compares two structures.
+
 ## Mutation record — W5k (#2031)
 
 **THE ORACLE, AND HOW IT WAS PROVED TO BE THE ORACLE.** W5j stopped rather than
@@ -8963,12 +8999,22 @@ for t in test_moe_router_tie_stability test_ops_moe test_ops_moe_grouped \
          test_moe_router_warp_map; do ./build/tests/$t; echo "$t rc=$?"; done
 ```
 
-**Read the ASSERTION COUNT beside every rc, never the rc alone.** On a CPU-only
-build the three device cases print `no CUDA backend registered; skipping` and
-return, so `test_moe_router_tie_stability` reads `488 | 488 passed | 0 failed`
-at rc 0 instead of the 4652 a device run gives. Both are rc 0. §Outcome records
-a lease where that difference was the ONLY thing separating a real green from a
-mutant that never ran.
+**Read the CASE COUNT and the ASSERTION COUNT beside every rc, never the rc
+alone, and never the assertion count alone either.** There are THREE states and
+the assertion count separates only two of them:
+
+| state | cases | assertions | rc |
+|---|---|---|---|
+| CPU-only build — the device cases are `#ifdef`'d out | **1** | 488 | 0 |
+| CUDA build, no device — they run, print `no CUDA backend registered; skipping`, return | **4** | 488 | 0 |
+| CUDA build with a device | **4** | **4652** | 0 |
+
+All three are rc 0 and two of them read 488, so a Gates instruction that names
+only the assertion count cannot tell a CPU-only run from a device-less CUDA run.
+§Outcome records a lease where the middle row read GREEN with a broken tie-break
+compiled in. The permissive `HasCuda()` skip that makes the middle row possible
+is a tree-wide shape and is owed under `## Owed`
+([#2603](https://github.com/mudler/vllm.cpp/issues/2603)).
 
 ### Evidence required
 
@@ -9019,7 +9065,27 @@ both times. Restoring returned 4652/4652.
 | **E = 256** | any | **0** |
 
 Zero at E = 256 is the whole finding: the compare the mutation breaks does not
-exist below `E > kBlock`, which is why a sweep that stops at 256 is blind to it.
+exist below `E > kBlock`, so the standing sweep is blind to **that one defect
+class -- an inverted PER-THREAD STRIDED compare** -- and to nothing broader.
+
+**Say only that, because the fresh review measured the other two levels and they
+are NOT blind spots.** Inverting the warp `__shfl_down_sync` argmax
+(`cuda_moe.cu:169`) reds 372 assertions here and **313 of the standing sweep**;
+inverting the cross-warp pass (`:186`) reds 188 here and **199 of the standing
+sweep**. Only the per-thread scan reds 104 here and **0 there**. The sweep is
+therefore adequate for every reduction level that exists at `E <= 256` and
+misses exactly the one that does not, which is a narrower claim than "blind to
+it" and the only one the mutations support.
+
+**The CPU arm has its own red-first, measured on the authoring host.** CPU-only
+build at the branch head: baseline `1 case | 488 assertions | 0 failed | rc 0`;
+flipping the greedy argmax's strict `>` to `>=` at ONE site
+(`src/vt/cpu/cpu_ops.cpp:2985`, `grep -c` = 1) gives
+`1 case | 488 | 380 passed | 108 failed | rc 1`, all 108 of them
+`CHECK( ids == r.expect )` and none of them the counted property; restoring
+returns `488/488`. 108 is the whole selection population -- `h < k` is
+`REQUIRE`d, so each of the 54 rows selects at least one tied member, and `>=`
+mis-selects on every row in both dtypes.
 
 **One negative result worth keeping.** The mutant stayed perfectly
 DETERMINISTIC -- all 279 repeat and 2313 batch comparisons passed with the wrong

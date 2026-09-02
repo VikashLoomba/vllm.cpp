@@ -49,6 +49,22 @@ VT_OP_PROVIDER_STATS=1 ./build-hip/examples/vllm-cli \
 Run the same command with `--device cpu` to compare greedy tokens.
 `VT_OP_PROVIDER_STATS=1` reports native operations and CPU fallbacks.
 
+## Select Q8_K activation quantization
+
+`VT_ROCM_Q8K_BLOCK` selects the Q8_K activation quantizer used by ROCm dense
+and grouped keep-quant operations. When it is unset, a queue device that
+resolves to `gfx1100`, including a valid feature-suffix spelling, uses the
+cooperative arm. Unset uses the legacy arm on `gfx1200`, `gfx1201`, an unknown
+architecture, or architecture-resolution failure. This policy does not imply
+runtime validation on `gfx1200` or `gfx1201`.
+
+The parser is strict. Set `VT_ROCM_Q8K_BLOCK=0` for the permanent legacy A/B
+arm, or set `VT_ROCM_Q8K_BLOCK=1` to force the cooperative diagnostic arm
+regardless of architecture. Explicit `1` is diagnostic-only outside validated
+`gfx1100`; it does not make a correctness, performance, or default claim for
+another architecture. Any value other than `0` or `1` refuses the operation
+instead of choosing an arm silently.
+
 ## Understand fallback behavior
 
 An integrated GPU can use the CPU reference tier when the backend reports

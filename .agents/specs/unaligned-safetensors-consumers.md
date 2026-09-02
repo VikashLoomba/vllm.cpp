@@ -249,6 +249,28 @@ this row.
   `include/vt/ops.h`, so it wants its own row and spec rather than riding here.
   Raised by the fresh review of #2581 as its non-blocking finding 2.
 
+* [#2605](https://github.com/mudler/vllm.cpp/issues/2605). doctest splits `-tc=`
+  on commas, so a `TEST_CASE` name carrying one cannot be selected by it and a
+  focused run by name prints `assertions: 0` and `SUCCESS!` at rc 0. #2601 was
+  one instance and this row renames it; 1202 names tree-wide have the same
+  shape, four of them in the two files this row touched. The durable answer is a
+  checker that refuses the shape, diff-scoped or baselined so those 1202 do not
+  red ordinary work. That changes gate semantics and wants its own spec and a
+  red-before test, so it is filed rather than swept, and renaming the 1202 is
+  not asked for.
+
+* [#2606](https://github.com/mudler/vllm.cpp/issues/2606). `check-agent-record`'s
+  issue-ownership check reads an untracked snapshot, and its own docstring says
+  an absent snapshot is a SKIP that the caller must report and `--fail-on-skip`
+  must redden. Neither exists: `skips` is populated and never read, the flag is
+  not defined, and no workflow step runs `agent-issue-index.py --refresh`, so
+  `.github/workflows/ci.yml:187` always runs it with the input absent. Measured
+  on this row's own head: rc 1 with the snapshot present, rc 0 and no skip line
+  with the same tree and that one file moved away. A local operator gets the red
+  and CI gets the green, which is the wrong polarity for the surface that decides
+  whether work lands. Filed rather than fixed here, because a record gate's
+  semantics and a CI workflow are not a test rename.
+
 ## Now
 
 `ACTIVE`.

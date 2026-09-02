@@ -2994,6 +2994,13 @@ vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 # (spec moe-router-topk-single-warp.md §9, #378). Same include pattern as
 # test_moe_router_warp_map above, which executes that pin without a GPU.
 target_include_directories(test_ops_moe_grouped PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Wave TIEBREAK (#2586): whether the CUDA top-k REALISES the lowest-index
+# tie-break it declares, at E=512 k=10 -- the geometry qwen4_exp routes, which
+# MoeRouterWarpValuesPerThread excludes from the warp kernel and which no other
+# case executes. Reaches the same src/ selector header through the shared pin
+# tests/vt/moe_router_warp_env.h, so it needs the same src/ include path.
+vllm_cpp_add_test(test_moe_router_tie_stability vt/test_moe_router_tie_stability.cpp)
+target_include_directories(test_moe_router_tie_stability PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)

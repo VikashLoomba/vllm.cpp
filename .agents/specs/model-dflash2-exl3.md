@@ -255,7 +255,10 @@ Reachability is proved by MUTATION, not by reading. The table is in
 ## Evidence
 
 Measured 2026-09-02 on the session host, CPU-only Release build
-(`-DVLLM_CPP_CUDA` off, g++ 13.3.0), `HEAD` of `row/MODEL-DFLASH2-EXL3`. The
+(`-DVLLM_CPP_CUDA` off, g++ 13.3.0), on `row/MODEL-DFLASH2-EXL3` AFTER its merge
+of `origin/main` at `aedad724c` — every number below was taken again on the
+merged tree rather than carried across it, because a merge can falsify prose
+that was true of the branch alone. The
 build tree is `/dev/shm/dflash2exl3-build`, configured fresh against this
 worktree: the session host's root filesystem reached 709 MB free while another
 agent held a 52 GB build, and `/dev/shm` is where this box's other sessions
@@ -280,8 +283,13 @@ the context-free block body and **0.0394077** on the context-aware one, against 
 declared bound of 0.06. The two agree to every printed digit, which is what an
 empty context should produce.
 
-The whole `dflash|exl3` neighbourhood is **46/46 passed, exit 0** (38.3 s), so
-the bf16 DFlash1, DFlash2, GGUF, DSpark and DeepSeek-V4 lanes are unmoved.
+The whole `dflash|exl3` neighbourhood is **46/46 passed, exit 0**, so the bf16
+DFlash1, DFlash2, GGUF, DSpark and DeepSeek-V4 lanes are unmoved.
+
+`tests/tools` is **591 tests, OK**. A preflight run taken while the host's root
+filesystem was down to 709 MB reported that suite FAIL; it passes on every run
+since the space came back, which is the shape `.agents/` already records for an
+ENOSPC — a full disk makes a checker emit a refusal that is about the disk.
 
 ### The published checkpoint LOADS
 
@@ -320,6 +328,9 @@ pass leaves behind when it does not.
 | M7 | revert the o_proj seam in the PAGED hot body | green | **RED** (3 failed) |
 | M8 | resolve a `mul1` marker to codebook 1 instead of 2 | **RED** (17 failed) | **RED** (15 failed) |
 
+All eight were run twice — once on the branch and once after the `origin/main`
+merge — and reproduced with identical sha256 pairs and identical verdicts.
+
 **The two suites answer different questions, and the greens above are the
 evidence for that rather than a gap.** M2 and M7 are RED only in `reach`: the
 `fc` combine and the paged body are reached by the runner and by nothing the
@@ -349,10 +360,16 @@ the exit code and not off that line.
   itself, which is existing production code every bf16 draft already reaches.
 - **No device run and no benchmark.** Every gate is CPU-only. #2495's headline
   (47.5 tok/s on GB10) is items 8-10 and none of them is touched here.
-- **The target half.** #2495 items 5 and 6 — the EXL3 `lm_head` at bits 6, the
-  bits-4 `mtp.*` head and `SharedHeadSource::LoadInto` — are another row's. Until
-  they land, an EXL3 DRAFT can only be paired with a target whose head this tree
-  already reads.
+- **The target half, and it is TWO blockers rather than one.** #2495 items 5 and
+  6 — the EXL3 `lm_head` at bits 6, the bits-4 `mtp.*` head and
+  `SharedHeadSource::LoadInto` — are another row's. Separately, the target's
+  census was corrected on 2026-09-02 from 272 modules to **409**, of which 137
+  are bits 3, and `(3, 2)` is not instantiated on the CUDA GEMM
+  (`Exl3ArmInstantiated`), so those 137 projections refuse on a CUDA queue
+  ([#2574](https://github.com/mudler/vllm.cpp/issues/2574), also another row's).
+  This draft is bits 5, which IS instantiated, so neither blocker is inside this
+  row — but together they mean the published draft-plus-target pair cannot run on
+  CUDA today, and nothing here should be read as saying it can.
 - **No merged EXL3 QKV or gate_up operand**, inherited from
   `quant-exl3-shared.md`, with the artifact-side reason recorded above: the six
   shards do not share a fitted `suh`.

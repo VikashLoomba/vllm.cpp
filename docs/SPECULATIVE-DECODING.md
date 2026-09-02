@@ -325,7 +325,11 @@ target has been run with it and no throughput number is claimed. Its published
 partner target, `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`, stores an EXL3 `lm_head`
 that `SharedHeadSource::LoadInto` does not yet read — items 5 and 6 of the same
 issue — so today this draft has to be paired with a target whose head this
-engine already reads.
+engine already reads. That target also carries 137 modules at 3 bpw, and `(3, 2)`
+is not in the CUDA instantiation list, so the published pair cannot run on a CUDA
+queue at all ([#2574](https://github.com/mudler/vllm.cpp/issues/2574)). This
+draft's own 36 modules are bits 5, which is instantiated; it is the target half
+that refuses.
 
 A repo id alone is not a pin, because checkpoints get re-quantized in place
 under an unchanged name. The revisions above are what these results describe.

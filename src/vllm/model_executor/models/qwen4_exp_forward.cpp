@@ -78,28 +78,33 @@ void CheckOwned(const OwnedTensor& t, const char* name,
 // across trees and across `CUDA_LAUNCH_BLOCKING`, which is a deterministic
 // arithmetic difference. A symptom that appears only WITHOUT this instrument is
 // a race and belongs to a different method.
-int64_t LayerFpSteps() {
-  static const int64_t n = [] {
-    const char* e = std::getenv("VT_Q4EXP_LAYER_FP");
-    if (e == nullptr || e[0] == '\0') return static_cast<int64_t>(0);
-    const long long parsed = std::atoll(e);
-    return parsed > 0 ? static_cast<int64_t>(parsed) : static_cast<int64_t>(0);
-  }();
-  return n;
+// The instrument's whole mutable state, in one object so a test can put it back
+// (`detail::Qwen4ExpLayerFpResetForTest`). A `static const bool` read once at
+// first use would be cheaper by one branch and untestable: every case in a
+// doctest binary shares the process, so the budget would be spent by whichever
+// forward ran first and the case that sets the variable would measure nothing
+// and pass. The tree already carries this shape for the same reason --
+// `detail::ExpertStreamSetForceFallback` in qwen3_5.cpp.
+struct LayerFpState {
+  int64_t budget = 0;  // forward calls to fingerprint; 0 == the instrument is off
+  int64_t step = 0;    // the forward call this process is on
+  int64_t taps = 0;    // lines printed, the counted property
+};
+
+int64_t LayerFpBudgetFromEnv() {
+  const char* e = std::getenv("VT_Q4EXP_LAYER_FP");
+  if (e == nullptr || e[0] == '\0') return 0;
+  const long long parsed = std::atoll(e);
+  return parsed > 0 ? static_cast<int64_t>(parsed) : 0;
 }
 
-// The forward-call index this process is on, and the number of taps printed for
-// it. Both are process-wide because the instrument is: one server serves one
-// sequence per step on this architecture (`serves_one_sequence_per_step`), so a
-// per-call counter would be indistinguishable from this one and a shared one
-// makes the `taps=` line a total rather than a sample.
-int64_t& LayerFpStep() {
-  static int64_t step = 0;
-  return step;
-}
-int64_t& LayerFpTaps() {
-  static int64_t taps = 0;
-  return taps;
+LayerFpState& LayerFpS() {
+  static LayerFpState s = [] {
+    LayerFpState t;
+    t.budget = LayerFpBudgetFromEnv();
+    return t;
+  }();
+  return s;
 }
 
 // One tap. `il` is the decoder layer, or -1 for a tap outside the loop.
@@ -109,7 +114,8 @@ int64_t& LayerFpTaps() {
 // arm gets a private readback path the other does not have. `Synchronize` after
 // it is what makes the bytes the ones this tap names.
 void LayerFp(Dev d, int64_t il, const char* tag, const Tensor& t) {
-  if (LayerFpStep() >= LayerFpSteps()) return;
+  LayerFpState& s = LayerFpS();
+  if (s.step >= s.budget) return;
   VT_CHECK(t.IsContiguous(),
            "qwen4_exp forward: VT_Q4EXP_LAYER_FP taps a contiguous tensor");
   int64_t n = 1;
@@ -144,12 +150,12 @@ void LayerFp(Dev d, int64_t il, const char* tag, const Tensor& t) {
     sumabs += a;
     if (a > maxabs) maxabs = a;
   }
-  ++LayerFpTaps();
+  ++s.taps;
   std::fprintf(stderr,
                "q4fp step=%lld L%+03lld tag=%-10s dtype=%-4s dev=%d n=%lld "
                "nonfinite=%lld maxabs=%.9g sumabs=%.9g "
                "v=%.9g,%.9g,%.9g,%.9g\n",
-               static_cast<long long>(LayerFpStep()), static_cast<long long>(il), tag,
+               static_cast<long long>(s.step), static_cast<long long>(il), tag,
                vt::Name(t.dtype), static_cast<int>(t.device.type),
                static_cast<long long>(n), static_cast<long long>(nonfinite), maxabs, sumabs,
                static_cast<double>(head[0]), static_cast<double>(head[1]),
@@ -159,12 +165,12 @@ void LayerFp(Dev d, int64_t il, const char* tag, const Tensor& t) {
 // Closes a fingerprinted step. `taps=` is the counted property that says the
 // instrument RAN on the run being reported.
 void LayerFpEndStep() {
-  if (LayerFpStep() < LayerFpSteps()) {
+  LayerFpState& s = LayerFpS();
+  if (s.step < s.budget) {
     std::fprintf(stderr, "q4fp step=%lld taps=%lld END\n",
-                 static_cast<long long>(LayerFpStep()),
-                 static_cast<long long>(LayerFpTaps()));
+                 static_cast<long long>(s.step), static_cast<long long>(s.taps));
   }
-  ++LayerFpStep();
+  ++s.step;
 }
 
 }  // namespace
@@ -743,5 +749,18 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
   r.storage = out.ReleaseShared();
   return r;
 }
+
+namespace detail {
+
+void Qwen4ExpLayerFpResetForTest() {
+  LayerFpState& s = LayerFpS();
+  s.budget = LayerFpBudgetFromEnv();
+  s.step = 0;
+  s.taps = 0;
+}
+
+int64_t Qwen4ExpLayerFpTapsForTest() { return LayerFpS().taps; }
+
+}  // namespace detail
 
 }  // namespace vllm

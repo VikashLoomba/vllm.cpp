@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -2762,4 +2763,156 @@ TEST_CASE("qwen4_exp: ModelRegistry::Forward splits the QSA query at the MODEL d
   //    the width and not on the output.
   CHECK(r.every_q_is_bf16);
   CHECK(r.last_bytes == T * kQHeads * kHeadDim * 2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE LAYER FINGERPRINT (issue #2547, wave PREFILLDIV)
+//
+// #2547 measured that a CUDA prefill of this architecture disagrees with a CPU
+// prefill at step 0, by about 0.3% on `sum(|x|)` over the model's own output,
+// and could not say WHERE: `VT_Q4EXP_STATE_FP` prints that output once per step
+// and has no layer axis. `VT_Q4EXP_LAYER_FP` adds one, and this case is what
+// says the axis exists and is reached from the production entry point.
+//
+// WHAT IT ASSERTS IS A COUNT, not the presence of a string in a stream. The tap
+// total for this fixture is derivable and exact: 2 taps outside the loop
+// (`emb`, `wide`), 9 per decoder layer, 2 more on the one PLE layer, and 1 for
+// the model output. `kLayers` is 4 and `kPleLayer` is 1, so 2 + 4*9 + 2 + 1 =
+// 41. A count is the assertion that survives a redirect that did not happen and
+// a grep that matched nothing, both of which read as a pass.
+//
+// AND IT IS A REACHABILITY CASE. `ModelRegistry::Forward` is the production
+// entry point; nothing here constructs `Qwen4ExpTextModelForward` by hand. The
+// paired mutation is to delete any one `LayerFp(` call site in the forward: the
+// total drops below 41 and this case reds.
+TEST_CASE("qwen4_exp: VT_Q4EXP_LAYER_FP taps every layer of ModelRegistry::Forward") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] = static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv =
+        vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16,
+                              {2, 1, T, kKvHeads, kHeadDim}, kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos, am, gm, attn_kv, gdn, config, q,
+                             logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  // 2 outside the loop + 9 per layer + 2 on the one PLE layer + 1 output.
+  const int64_t kExpectedTaps = 2 + kLayers * 9 + 2 + 1;
+
+  // ─── OFF IS THE RED. The switch unset must print NOTHING, because an
+  // instrument that runs whether or not it was asked for is a permanent cost on
+  // every forward and its `taps=` line stops being evidence that this run set
+  // the variable.
+  ::unsetenv("VT_Q4EXP_LAYER_FP");
+  vllm::detail::Qwen4ExpLayerFpResetForTest();
+  {
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  }
+  CHECK(vllm::detail::Qwen4ExpLayerFpTapsForTest() == 0);
+
+  // ─── ON, budget 1. One forward's worth of taps and not two.
+  ::setenv("VT_Q4EXP_LAYER_FP", "1", 1);
+  vllm::detail::Qwen4ExpLayerFpResetForTest();
+  {
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  }
+  const int64_t after_one = vllm::detail::Qwen4ExpLayerFpTapsForTest();
+  INFO("taps after one forward: ", after_one, " expected ", kExpectedTaps);
+  CHECK(after_one == kExpectedTaps);
+
+  // THE BUDGET IS A BUDGET. A second forward under a budget of 1 adds nothing,
+  // which is what keeps a decode loop from printing 41 lines a step forever.
+  {
+    vllm::ForwardLogits fl;
+    REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  }
+  CHECK(vllm::detail::Qwen4ExpLayerFpTapsForTest() == after_one);
+
+  // Leave the process as this case found it: another case in this binary that
+  // runs a forward must not inherit an armed instrument.
+  ::unsetenv("VT_Q4EXP_LAYER_FP");
+  vllm::detail::Qwen4ExpLayerFpResetForTest();
+  CHECK(vllm::detail::Qwen4ExpLayerFpTapsForTest() == 0);
 }

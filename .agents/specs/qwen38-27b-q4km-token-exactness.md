@@ -265,6 +265,25 @@ Neither was reachable by reading. Both were found by running the lever, and the
 default arm stayed green through both -- the exact shape of defect this row
 warned about in `## Tests`.
 
+### Why there is no third instance, by construction rather than by inspection
+
+`ActDType` returns a non-BF16 answer for `DeviceType::kCPU` and for nothing else.
+So every op whose contract fixes bf16 and which is reachable ONLY on a device
+tier can never see an f32 operand from this lever, whatever a call-site scan
+says. `ops.cpp` has four such contracts, and three of them --
+`moe_grouped_gemm_bf16` (`act must be bf16`),
+`moe_grouped_gemm_bf16_gate_up_silu` and `moe_marlin`/`marlin_dense` (`a/c must
+be bf16`) -- have no CPU kernel at all and are reached through
+`MoeBlockBf16Cuda`/`MoeBlockFusedCuda`, which are CUDA-only by their own
+declaration. Their operands (`dact`, `ddown`) were never retyped either.
+
+`vt::SigmoidGateBf16` is the ONLY one of the four that is backend-generic
+(`cpu_ops.cpp:3728` supplies its CPU kernel), which is exactly why it is the one
+that fired, and it is now the one exception carrying its reason. This argument
+does not depend on having read every call site correctly; it depends only on the
+resolver's device predicate, which the second test registration pins in both
+directions.
+
 
 ## Scope
 

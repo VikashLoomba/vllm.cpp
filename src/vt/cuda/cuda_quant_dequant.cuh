@@ -462,6 +462,66 @@ struct DqIQ3_XXS {
   }
 };
 
+// block_iq3_s = { f16 d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4] }
+// DequantIQ3_S / :2607. NOT an IQ3_XXS variant: 512-entry table, a ninth index
+// bit spliced out of `qh` with an ASYMMETRIC shift pair, direct sign bytes, and
+// an ODD-integer sub-block scale `db = d * (1 + 2*ls)` shared by TWO sub-blocks.
+// Upstream walks the sub-blocks in PAIRS for that last reason and this codec
+// keeps that loop shape, so the two diff by eye.
+//
+// GATHER ONLY. There is deliberately no `WType::kIQ3_S` beside it: the GEMM arm
+// needs a CPU `vec_dot` first (`KeepQuantDType` gates on `HasQuantDotKernel`),
+// and the two halves have to land together or a CUDA IQ3_S GEMM takes
+// `IsCudaKeepQuantSupported`'s host fallback. See `.agents/specs/gguf-iq3s.md`.
+struct DqIQ3_S {
+  static constexpr int kBytes = 110;
+  static constexpr int kElems = 256;
+  template <typename Tout>
+  static __device__ void Decode(const uint8_t* blk, Tout* y) {
+    const float d = DqF16(blk);
+    const uint8_t* qs = blk + 2;
+    const uint8_t* qh = blk + 66;
+    const uint8_t* signs = blk + 74;
+    const uint8_t* scales = blk + 106;
+    int o = 0;
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+      const float db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf));
+      const float db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4));
+      for (int l = 0; l < 4; ++l) {
+        const uint32_t g1 = d_iq3s_grid[qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)];
+        const uint32_t g2 = d_iq3s_grid[qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)];
+        for (int j = 0; j < 4; ++j) {
+          const uint8_t b1 = static_cast<uint8_t>((g1 >> (8 * j)) & 0xFFu);
+          const uint8_t b2 = static_cast<uint8_t>((g2 >> (8 * j)) & 0xFFu);
+          DqStore<Tout>::Set(y, o + j + 0,
+                             db1 * b1 * ((signs[l] & d_kmask_iq2xs[j + 0]) ? -1.f : 1.f));
+          DqStore<Tout>::Set(y, o + j + 4,
+                             db1 * b2 * ((signs[l] & d_kmask_iq2xs[j + 4]) ? -1.f : 1.f));
+        }
+        o += 8;
+      }
+      qs += 8;
+      signs += 4;
+      for (int l = 0; l < 4; ++l) {
+        const uint32_t g1 = d_iq3s_grid[qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)];
+        const uint32_t g2 = d_iq3s_grid[qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)];
+        for (int j = 0; j < 4; ++j) {
+          const uint8_t b1 = static_cast<uint8_t>((g1 >> (8 * j)) & 0xFFu);
+          const uint8_t b2 = static_cast<uint8_t>((g2 >> (8 * j)) & 0xFFu);
+          DqStore<Tout>::Set(y, o + j + 0,
+                             db2 * b1 * ((signs[l] & d_kmask_iq2xs[j + 0]) ? -1.f : 1.f));
+          DqStore<Tout>::Set(y, o + j + 4,
+                             db2 * b2 * ((signs[l] & d_kmask_iq2xs[j + 4]) ? -1.f : 1.f));
+        }
+        o += 8;
+      }
+      qh += 2;
+      qs += 8;
+      signs += 4;
+    }
+  }
+};
+
 // block_iq2_xs = { f16 d; u16 qs[32]; u8 scales[8] } — DequantIQ2_XS / :2516
 struct DqIQ2_XS {
   static constexpr int kBytes = 74;

@@ -3,8 +3,8 @@
 // gemma4_registry.cpp seam exactly: a NEW translation unit with ONE
 // REGISTER_VLLM_MODEL line and ZERO edit to any shared array.
 //
-// UPSTREAM. `Qwen4ExpForConditionalGeneration` is registered by NO vLLM
-// revision. Read live 2026-08-26 at vLLM `origin/main` = `6a5e8f5979`: no
+// UPSTREAM. SUPERSEDED 2026-08-31 (#2489): vLLM registers this architecture at
+// `e126687a9a`, 595 commits BEYOND our pin. Read live 2026-08-26 at `6a5e8f5979`:
 // `qwen4*` path, no `registry.py` entry, and a repository-wide search for
 // `qwen4` returns zero results; `vllm-omni` likewise. That is absence from
 // vLLM `main` rather than staleness in our parity pin `555967922`, so this TU

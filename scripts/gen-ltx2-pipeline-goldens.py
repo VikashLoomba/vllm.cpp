@@ -1168,6 +1168,50 @@ def section_upsampler(out) -> None:
     emit_manifest(out, "kLtx2UpsTemporalParam", tmanifest)
     emit_f32(out, "kLtx2UpsTemporalGolden", tresult.numpy())
 
+    # ---- the dims=2 arm (model.py:47, 85-100) -----------------------------
+    #
+    # `conv = torch.nn.Conv2d if dims == 2 else torch.nn.Conv3d` (:47) reaches
+    # FOUR parameter groups — `initial_conv` (:49), both ResBlock stacks (:53,
+    # :76-78, via res_block.py:21) and `final_conv` (:80) — so every one of them
+    # is a 4-D kernel here where the dims=3 arms above build a 5-D one. The
+    # manifest is what gates that on the C++ side; a port that reused the 3-D
+    # enumeration fills different values and fails on the golden as well.
+    #
+    # The forward folds the frame axis into the BATCH (`rearrange(latent,
+    # "b c f h w -> (b f) c h w"`, :86) and unfolds at :100. That fold is not
+    # cosmetic: it makes every frame its own GroupNorm sample, so the statistics
+    # run over (channels_per_group, H, W) rather than over the whole clip. With
+    # `_UPS_MID = 32` and GroupNorm(32, ...) there is ONE channel per group, so
+    # the per-frame and per-clip statistics genuinely differ and this golden
+    # separates them. A port that kept the 3-D reduction returns a correctly
+    # shaped, finite, plausible latent that is wrong in every element.
+    #
+    # `_UPS_TEMPORAL_F = 3` frames, so the frame axis differs from H (4) and W
+    # (6) and a fold that lost or transposed it cannot pass by coincidence.
+    emit_scalar(out, "kLtx2UpsDims2Frames", _UPS_TEMPORAL_F)
+    d2count = _UPS_IN * _UPS_TEMPORAL_F * _UPS_H * _UPS_W
+    d2latent = torch.from_numpy(make("ltx2.ups.dims2.latent", d2count, 1.0)).reshape(
+        1, _UPS_IN, _UPS_TEMPORAL_F, _UPS_H, _UPS_W
+    )
+    emit_f32(out, "kLtx2UpsDims2Latent", d2latent.numpy())
+
+    dims2 = LatentUpsampler(
+        in_channels=_UPS_IN,
+        mid_channels=_UPS_MID,
+        num_blocks_per_stage=_UPS_BLOCKS,
+        dims=2,
+        spatial_upsample=True,
+        temporal_upsample=False,
+        spatial_scale=2.0,
+        rational_resampler=False,
+    )
+    dims2.eval()
+    d2manifest = fill_module(dims2, "ltx2.ups.Dims2.")
+    d2result = dims2(d2latent)
+    emit_i64(out, "kLtx2UpsDims2OutShape", list(d2result.shape))
+    emit_manifest(out, "kLtx2UpsDims2Param", d2manifest)
+    emit_f32(out, "kLtx2UpsDims2Golden", d2result.numpy())
+
     # The spatial+temporal arm stays REFUSED (model.py:55-59: `8 * mid_channels`
     # and `PixelShuffleND(3)`, a different operator). Its parameter shape is
     # emitted anyway so the C++ refusal is gated against what upstream would

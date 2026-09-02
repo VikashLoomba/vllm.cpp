@@ -216,7 +216,56 @@ scripts/agent-preflight.sh --staged
 
 ## Now
 
-`ACTIVE` — A9 implementing against issue #2577.
+`DONE` — A9 landed against issue #2577. A8 stays open under `## Owed`.
+
+## Outcome
+
+### What was built
+
+`dims == 2` is no longer refused. `EnumerateLtx2UpsamplerTensors` emits 4-D
+kernels for `initial_conv`, both ResBlock stacks and `final_conv` when the
+checkpoint sets it; `ResBlockForward` takes the rank as a parameter, mirroring
+`res_block.py:21`; and the forward runs one frame at a time, which is how
+`model.py:86`'s fold is reproduced rather than approximated.
+
+The stack itself became one lambda used by both ranks. Upstream's two forward
+branches run the identical module sequence and differ only in the fold around
+them, so a second copy here would have been the parallel path AGENTS.md forbids.
+
+`model.py:47`'s `else` is now mirrored as written: any `dims` that is not 2
+builds Conv3d. The old `Require(config.dims == 3, ...)` refused checkpoints
+upstream runs, which was a refusal this port invented.
+
+### Red before green
+
+The dims=2 golden was written first and failed for both intended reasons on the
+unmodified tree: six parameter-count mismatches (`5184 == 1728` for
+`initial_conv`, `27648 == 9216` for each ResBlock conv), then the forward threw
+`ltx2 upsampler: dims=2 is not ported`. Reproduce it by reverting
+`src/vllm/model_executor/models/ltx2_upsampler.cpp` to its parent and rerunning
+`test_ltx2_pipeline -tc='*dims=2 arm*'`; the goldens are already in the tree, so
+the red is a checkout away and is not carried here as a log file.
+
+After the change, on the restored tree: `test_ltx2_pipeline` 62/62 cases and
+3619 assertions green, `test_ltx2_video` 109/109 cases green including the new
+end-to-end render.
+
+### Mutations — both RED, restored byte-for-byte
+
+| Mutation | Golden | End-to-end render | What it proves |
+|---|---|---|---|
+| **A**: `const bool two_d = false` | RED, `conv3d weight has the wrong element count` | **RED**, same throw at `test_ltx2_video.cpp:690` | The production path — `LoadVideoEngine` + `Generate` through the `upsampler_path` extra — really enters the new branch. This is the reachability proof, and it is a render that fails, not a unit test |
+| **B**: keep the 2-D convolutions, drop the per-frame fold | **RED**, `max|diff| = 0.679842`, and the per-frame independence property RED at `0.439442` | **GREEN** | The fold's only consequence is numerical. Every shape is identical, so no shape check anywhere can see it and the value golden is the sole gate. This is the claim the code comment makes, now measured |
+
+Mutation B is the one worth keeping in mind: it is the shape of defect this file's
+header warns about twice, and it passes an end-to-end render.
+
+### What was NOT done
+
+No `dims=2` checkpoint exists on the NAS, so this arm is gated against the
+executed upstream module at reduced dimensions and has no real-weight result.
+That is stated rather than implied, and it is why `docs/USAGE.md` gains no
+checkpoint row: there is no artifact to pin.
 
 ## Owed
 

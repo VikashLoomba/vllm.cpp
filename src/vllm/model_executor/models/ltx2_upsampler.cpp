@@ -210,14 +210,22 @@ void Silu(std::vector<float>& x) {
 
 // ResBlock.forward (res_block.py:29-37). The residual is added BEFORE the
 // activation — `activation(x + residual)`, not `activation(x) + residual`.
-Volume ResBlockForward(const Ltx2VaeWeights& weights, const std::string& prefix,
+// `two_d` selects the same way `res_block.py:21` does. It is a parameter rather
+// than two functions because upstream expresses the difference as one
+// constructor choice over an otherwise identical block, and a second copy here
+// would be a second thing to keep in agreement for no gain.
+Volume ResBlockForward(const Ltx2VaeWeights& weights, const std::string& prefix, bool two_d,
                        const Volume& in) {
-  Volume x = Conv3dPad1(in, in.channels, weights.Get(prefix + "conv1.weight"),
-                        weights.Get(prefix + "conv1.bias"));
+  const auto conv = [&](const Volume& v, int64_t out_ch, const std::vector<float>& w,
+                        const std::vector<float>& b) {
+    return two_d ? Conv2dPad1PerFrame(v, out_ch, w, b) : Conv3dPad1(v, out_ch, w, b);
+  };
+  Volume x = conv(in, in.channels, weights.Get(prefix + "conv1.weight"),
+                  weights.Get(prefix + "conv1.bias"));
   GroupNorm(x, weights.Get(prefix + "norm1.weight"), weights.Get(prefix + "norm1.bias"));
   Silu(x.data);
-  Volume y = Conv3dPad1(x, in.channels, weights.Get(prefix + "conv2.weight"),
-                        weights.Get(prefix + "conv2.bias"));
+  Volume y = conv(x, in.channels, weights.Get(prefix + "conv2.weight"),
+                  weights.Get(prefix + "conv2.bias"));
   GroupNorm(y, weights.Get(prefix + "norm2.weight"), weights.Get(prefix + "norm2.bias"));
   for (size_t i = 0; i < y.data.size(); ++i) y.data[i] += in.data[i];
   Silu(y.data);
@@ -390,24 +398,39 @@ std::vector<float> Ltx2BlurKernel(int64_t kernel_size) {
 
 std::vector<Ltx2UpsamplerTensorSpec> EnumerateLtx2UpsamplerTensors(
     const Ltx2UpsamplerConfig& config) {
-  // `named_parameters()` order for LatentUpsampler(dims=3): initial_conv,
+  // `named_parameters()` order, the same for both ranks: initial_conv,
   // initial_norm, res_blocks, upsampler, post_upsample_res_blocks, final_conv.
   const std::string p = config.prefix;
   const int64_t in_c = config.in_channels;
   const int64_t mid = config.mid_channels;
   std::vector<Ltx2UpsamplerTensorSpec> specs;
 
-  specs.push_back({p + "initial_conv.weight", {mid, in_c, 3, 3, 3}});
+  // model.py:47 — `conv = torch.nn.Conv2d if dims == 2 else torch.nn.Conv3d`.
+  // That ONE line reaches four parameter groups: `initial_conv` (:49), both
+  // ResBlock stacks (:53 and :76-78, whose own conv is chosen the same way at
+  // res_block.py:21) and `final_conv` (:80). The `upsampler` branch (:55-72)
+  // never reads `dims`, so it is deliberately NOT built through this helper —
+  // its rank is decided by the two FLAGS instead, below.
+  //
+  // The `else` is upstream's and is mirrored as written: any `dims` that is not
+  // 2 builds Conv3d there, so 3 is the shipped value rather than the only legal
+  // one, and this port does not invent a refusal upstream does not raise.
+  const auto conv_w = [&](int64_t out_ch, int64_t in_ch) {
+    return config.dims == 2 ? std::vector<int64_t>{out_ch, in_ch, 3, 3}
+                            : std::vector<int64_t>{out_ch, in_ch, 3, 3, 3};
+  };
+
+  specs.push_back({p + "initial_conv.weight", conv_w(mid, in_c)});
   specs.push_back({p + "initial_conv.bias", {mid}});
   specs.push_back({p + "initial_norm.weight", {mid}});
   specs.push_back({p + "initial_norm.bias", {mid}});
 
   auto res_block = [&](const std::string& prefix) {
-    specs.push_back({prefix + "conv1.weight", {mid, mid, 3, 3, 3}});
+    specs.push_back({prefix + "conv1.weight", conv_w(mid, mid)});
     specs.push_back({prefix + "conv1.bias", {mid}});
     specs.push_back({prefix + "norm1.weight", {mid}});
     specs.push_back({prefix + "norm1.bias", {mid}});
-    specs.push_back({prefix + "conv2.weight", {mid, mid, 3, 3, 3}});
+    specs.push_back({prefix + "conv2.weight", conv_w(mid, mid)});
     specs.push_back({prefix + "conv2.bias", {mid}});
     specs.push_back({prefix + "norm2.weight", {mid}});
     specs.push_back({prefix + "norm2.bias", {mid}});
@@ -444,7 +467,7 @@ std::vector<Ltx2UpsamplerTensorSpec> EnumerateLtx2UpsamplerTensors(
   for (int64_t i = 0; i < config.num_blocks_per_stage; ++i) {
     res_block(p + "post_upsample_res_blocks." + std::to_string(i) + ".");
   }
-  specs.push_back({p + "final_conv.weight", {in_c, mid, 3, 3, 3}});
+  specs.push_back({p + "final_conv.weight", conv_w(in_c, mid)});
   specs.push_back({p + "final_conv.bias", {in_c}});
   return specs;
 }
@@ -464,12 +487,21 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
   if (config.temporal_upsample && config.spatial_upsample) {
     Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler);
   }
-  Require(config.dims == 3,
-          "ltx2 upsampler: dims=" + std::to_string(config.dims) +
-              " is not ported. The dims=2 arm (model/upsampler/model.py:85-100) builds Conv2d "
-              "everywhere, i.e. NO temporal convolution at all, so the 3-D path cannot serve "
-              "it. LTX-2.5's upsampler is dims=3. Owed and recorded in "
-              ".agents/specs/ltx-2-5.md phase L5.");
+  // model.py:47's `else` is mirrored as written: `dims == 2` is Conv2d and
+  // EVERYTHING else is Conv3d, so there is no refusal here — upstream raises
+  // none, and inventing one would refuse a checkpoint upstream runs.
+  const bool two_d = config.dims == 2;
+  // The one combination upstream cannot run. `dims=2` takes the forward at :85,
+  // which hands `self.upsampler` a 4-D tensor, while `temporal_upsample` built
+  // that module as a Conv3d (:57 for both flags, :70 for temporal alone). Torch
+  // raises on the rank; this names the contradiction instead, which is the same
+  // event with a message a caller can act on.
+  Require(!(two_d && config.temporal_upsample),
+          "ltx2 upsampler: dims=2 with temporal_upsample=true is not a configuration upstream "
+          "can run. model/upsampler/model.py:68-71 builds the temporal upsampler as a Conv3d, "
+          "and the dims=2 forward (:85-100) folds the frame axis into the batch and so feeds "
+          "it a 4-D tensor. The frame axis is gone by then, which is why no 2-D arm can "
+          "upsample it.");
   Require(latent.channels == config.in_channels,
           "ltx2 upsampler: latent has " + std::to_string(latent.channels) +
               " channels, config declares " + std::to_string(config.in_channels));
@@ -479,23 +511,25 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
   result.batch = latent.batch;
   result.channels = config.in_channels;
 
-  for (int64_t b = 0; b < latent.batch; ++b) {
-    Volume x;
-    x.channels = latent.channels;
-    x.frames = latent.frames;
-    x.height = latent.height;
-    x.width = latent.width;
-    const int64_t stride = latent.channels * latent.frames * latent.height * latent.width;
-    x.data.assign(latent.data.begin() + b * stride, latent.data.begin() + (b + 1) * stride);
+  // model.py:47 again, at the four call sites rather than at the shapes.
+  const auto conv = [&](const Volume& v, int64_t out_ch, const std::vector<float>& w,
+                        const std::vector<float>& b_) {
+    return two_d ? Conv2dPad1PerFrame(v, out_ch, w, b_) : Conv3dPad1(v, out_ch, w, b_);
+  };
 
-    // model.py:102-104.
-    x = Conv3dPad1(x, config.mid_channels, weights.Get(p + "initial_conv.weight"),
-                   weights.Get(p + "initial_conv.bias"));
+  // ONE stack for both ranks, because upstream's two forward branches
+  // (model.py:87-99 and :102-124) run the identical module sequence and differ
+  // only in the fold around them and in the rank of the four convolutions
+  // inside. Writing it twice would be the parallel path AGENTS.md forbids.
+  const auto run_stack = [&](Volume x) {
+    // model.py:87-89 / :102-104.
+    x = conv(x, config.mid_channels, weights.Get(p + "initial_conv.weight"),
+             weights.Get(p + "initial_conv.bias"));
     GroupNorm(x, weights.Get(p + "initial_norm.weight"), weights.Get(p + "initial_norm.bias"));
     Silu(x.data);
 
     for (int64_t i = 0; i < config.num_blocks_per_stage; ++i) {
-      x = ResBlockForward(weights, p + "res_blocks." + std::to_string(i) + ".", x);
+      x = ResBlockForward(weights, p + "res_blocks." + std::to_string(i) + ".", two_d, x);
     }
 
     if (config.temporal_upsample) {
@@ -503,6 +537,7 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
       // self.temporal_upsample` (:109) is tested BEFORE the resampler check
       // (:114). A full 3-D conv (not per-frame): the temporal arm's
       // `upsampler.0` is a Conv3d (model.py:70), unlike the spatial arm's Conv2d.
+      // Unreachable when `two_d`, which is refused above.
       x = Conv3dPad1(x, kLtx2UpsamplerTemporalFactor * config.mid_channels,
                      weights.Get(p + "upsampler.0.weight"), weights.Get(p + "upsampler.0.bias"));
       x = PixelShuffle1d(x, kLtx2UpsamplerTemporalFactor);
@@ -517,17 +552,77 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
       x = PixelShuffle2d(x, rational.num, rational.num);
       x = BlurDownsample(x, rational.den, kLtx2BlurKernelSize);
     } else {
-      // model.py:117-119 — per-frame Conv2d then PixelShuffleND(2).
+      // model.py:117-119 — per-frame Conv2d then PixelShuffleND(2). Already
+      // per-frame for BOTH ranks, because the `upsampler` branch never reads
+      // `dims`: at dims=2 the fold has already made the volume one frame, and
+      // the operator is the same either way.
       x = Conv2dPad1PerFrame(x, 4 * config.mid_channels, weights.Get(p + "upsampler.0.weight"),
                              weights.Get(p + "upsampler.0.bias"));
       x = PixelShuffle2d(x, 2, 2);
     }
 
     for (int64_t i = 0; i < config.num_blocks_per_stage; ++i) {
-      x = ResBlockForward(weights, p + "post_upsample_res_blocks." + std::to_string(i) + ".", x);
+      x = ResBlockForward(weights, p + "post_upsample_res_blocks." + std::to_string(i) + ".",
+                          two_d, x);
     }
-    x = Conv3dPad1(x, config.in_channels, weights.Get(p + "final_conv.weight"),
-                   weights.Get(p + "final_conv.bias"));
+    x = conv(x, config.in_channels, weights.Get(p + "final_conv.weight"),
+             weights.Get(p + "final_conv.bias"));
+    return x;
+  };
+
+  for (int64_t b = 0; b < latent.batch; ++b) {
+    Volume x;
+    x.channels = latent.channels;
+    x.frames = latent.frames;
+    x.height = latent.height;
+    x.width = latent.width;
+    const int64_t stride = latent.channels * latent.frames * latent.height * latent.width;
+    x.data.assign(latent.data.begin() + b * stride, latent.data.begin() + (b + 1) * stride);
+
+    if (two_d) {
+      // model.py:86 — `rearrange(latent, "b c f h w -> (b f) c h w")`, undone at
+      // :100. Running one frame at a time IS that fold: `(b f)` makes every
+      // frame its own sample, and GroupNorm here reduces over
+      // `frames * height * width`, so a ONE-frame volume hands it exactly the
+      // per-frame statistic upstream computes. Passing the whole clip to the
+      // 2-D convolutions instead would agree on every shape and be wrong in
+      // every element, which is why the dims=2 golden — not a shape check — is
+      // what holds this down.
+      const int64_t in_plane = x.height * x.width;
+      Volume folded;
+      for (int64_t f = 0; f < x.frames; ++f) {
+        Volume plane;
+        plane.channels = x.channels;
+        plane.frames = 1;
+        plane.height = x.height;
+        plane.width = x.width;
+        plane.data.assign(static_cast<size_t>(x.channels * in_plane), 0.0f);
+        for (int64_t c = 0; c < x.channels; ++c) {
+          for (int64_t i = 0; i < in_plane; ++i) {
+            plane.data[static_cast<size_t>(c * in_plane + i)] =
+                x.data[static_cast<size_t>((c * x.frames + f) * in_plane + i)];
+          }
+        }
+        plane = run_stack(plane);
+        if (f == 0) {
+          folded.channels = plane.channels;
+          folded.frames = x.frames;
+          folded.height = plane.height;
+          folded.width = plane.width;
+          folded.data.assign(static_cast<size_t>(folded.elems()), 0.0f);
+        }
+        const int64_t out_plane = plane.height * plane.width;
+        for (int64_t c = 0; c < plane.channels; ++c) {
+          for (int64_t i = 0; i < out_plane; ++i) {
+            folded.data[static_cast<size_t>((c * folded.frames + f) * out_plane + i)] =
+                plane.data[static_cast<size_t>(c * out_plane + i)];
+          }
+        }
+      }
+      x = folded;
+    } else {
+      x = run_stack(x);
+    }
 
     result.frames = x.frames;
     result.height = x.height;

@@ -779,6 +779,40 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
       CHECK(msg.find("the upsampled latent is") == std::string::npos);
     }
   }
+  // THE REACHABILITY CASE FOR THE dims=2 ARM, and the reason it asserts a
+  // COMPLETED RENDER rather than a changed message. `dims` is read off the
+  // checkpoint's own config (`Ltx2ParseUpsamplerConfig`, mirroring
+  // model_configurator.py:17), so a 2-D upsampler is an ordinary input that a
+  // caller supplies through the `upsampler_path` load extra — the same entry
+  // point the three subcases above use, on its default configuration.
+  //
+  // It is CONSUMABLE and not merely computed, which is what separates this arm
+  // from the spatiotemporal one that stays refused. The fold at model.py:86/:100
+  // returns the frame count unchanged and PixelShuffleND(2) doubles H and W, so
+  // the result is exactly the `[c, f, 2h, 2w]` the phase requires at
+  // ltx2_video.cpp:3509-3516. A port that got the fold wrong would still satisfy
+  // that check, which is why the VALUE gate lives in test_ltx2_pipeline and this
+  // case is about reach.
+  //
+  // The fixture writes 4-D kernels here without being told to: it enumerates
+  // through `EnumerateLtx2UpsamplerTensors(cfg)`, so the rank follows `dims` on
+  // both sides and a 5-D enumeration would fail to load rather than mis-render.
+  SUBCASE("a dims=2 upsampler checkpoint RENDERS, at the full requested size") {
+    vllm::Ltx2UpsamplerConfig dims2 =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    dims2.dims = 2;
+    const std::string path = ws.root + "/dims2_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(dims2, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    const vllm::multimodal::VideoResult result =
+        engine->Generate(FixtureGen(ws.root + "/dims2_ups"));
+    CHECK(result.width == 64);
+    CHECK(result.height == 64);
+  }
   SUBCASE("with one, the render lands at the FULL requested size") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras["upsampler_path"] = ws.paths.upsampler;

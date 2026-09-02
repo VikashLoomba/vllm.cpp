@@ -13,11 +13,39 @@ defect this measurement is compared against), and
 
 ## Now
 
-`ACTIVE` — the measurement is staged and has not yet run.
+`ACTIVE` — the measurement ran and returned `TOKEN_GATE=NOT_MEASURABLE`.
 
-This spec is committed before the job that produces the number, and it declares
-the verdict shape, the identity assertions and the stop conditions in advance,
-so that no threshold can move after the fact.
+**17 of 18 legs of this workload ended in a GPU reset, including 12 of 12 in a
+controlled two-arm run with zero harness errors.** No leg produced token ids, so
+there is no ROCm token verdict and no divergence to attribute. The stop condition
+this spec declared in advance is the one that fired, and it fired cleanly.
+
+Two results stand on their own:
+
+- **The board cannot complete a gate-sized Q4_K workload.** #2511 established a
+  fault on a single prefill; this establishes that the failure compounds over a
+  realistic run rather than averaging out. `HSA_ENABLE_SDMA=0` was set on every
+  leg and shows no measurable benefit at this workload size.
+- **The oracle disagrees with itself on 3 of these 6 prompts** across its own
+  kernel paths, and each disagreement lands on a step the 2026-08-23 CPU gate
+  convicted us at, emitting our token. That is a second, larger measurement of
+  the effect `.agents/oracles/llama-cpp.md` records at 1 of 6.
+
+Everything upstream of the legs is settled and reusable: artifact sha verified on
+the worker, a 3425-file source manifest under `LC_ALL=C`,
+`CHAIN_OF_CUSTODY=EXACT`, `blk.64` re-observed at 15 on the HIP path, both oracle
+kernel paths pinned and recorded, and the tokenizer exact on 6 of 6. The moment a
+reproducible pair of legs exists, this becomes a scoring job rather than a
+measurement job.
+
+Evidence:
+[`docs/bench-evidence/qwen38-27b-q4km-rocm-gfx1151-token-gate-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-rocm-gfx1151-token-gate-20260902.md).
+
+This spec was committed before the job that produced the number, and it declared
+the verdict shape, the identity assertions and the stop conditions in advance, so
+that no threshold could move after the fact. Two of them were tightened while the
+result was still unknown: the reporting rule for a same-rate/different-index
+outcome, and the refusal to score fewer than two agreeing clean legs.
 
 ## Scope
 
@@ -257,6 +285,15 @@ Raw logs on the share under `/mnt/nas_share/rc/rocm-tokgate-strix/`.
   the board yields a clean run.
 - **The clean legs disagree with each other**: report `TOKEN_GATE=NOT_MEASURABLE`.
   A non-deterministic arm cannot be scored for token-exactness.
+- **Fewer than two agreeing clean legs**: report `TOKEN_GATE=NOT_MEASURABLE`.
+  This is stricter than the clause above and it closes a case that clause cannot
+  see. Refusing legs that *disagree* does nothing when only one leg survives,
+  and a lone survivor is the least trustworthy evidence this board produces, not
+  the most: if the fault is memory corruption on the Q4_K path, a leg can
+  complete while having been handed wrong bytes, so survival is not independent
+  of correctness and selecting the completed leg selects on the variable the
+  gate measures. Two agreeing legs are the minimum, and even then the evidence
+  states that they were drawn from a population that mostly faulted.
 - The oracle's chain of custody is not `EXACT` or `PREFIX`: stop, the oracle
   side is not bound to the stock binary.
 - A reference-tier hit count above zero on our arm: stop, the leg did not
@@ -266,7 +303,14 @@ Raw logs on the share under `/mnt/nas_share/rc/rocm-tokgate-strix/`.
 
 ## Owed
 
-- The fix for whatever divergence this measures. If the ROCm divergences match
-  the CPU tier's indices and ids, #2534 owns it. If they do not, ROCm carries
-  its own term and that term gets its own issue, filed against this row.
+- **The ROCm token verdict itself.** It is unmeasured, not failing. It stays owed
+  by this row and by [#2546](https://github.com/mudler/vllm.cpp/issues/2546),
+  and it is blocked on #2511 rather than on anything in the numerics.
+- The fix for whatever divergence it eventually measures. If the ROCm
+  divergences match the CPU tier's indices and ids, #2534 owns it. If they do
+  not, ROCm carries its own term and that term gets its own issue against this
+  row.
 - #2497's quant-matched decode number stays blocked until this gate passes.
+- The degenerate `n_gpu_layers = 0` oracle leg is owed by
+  [#2557](https://github.com/mudler/vllm.cpp/issues/2557), which names the three
+  discriminating experiments. No conclusion here rests on it.

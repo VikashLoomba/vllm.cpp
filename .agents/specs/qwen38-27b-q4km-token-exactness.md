@@ -396,6 +396,25 @@ reproduced #857 byte for byte from a different build.
   which is a new op and not a dtype change. Every other consumer this row
   retyped takes `IsOutFloat` and admits f32; this is the only exception, and it
   was found by running, not by reading.
+- **`VT_ACT_F32`'s conversion is INCOMPLETE and must not be measured around.**
+  rc job `18fc60f0`, 2026-09-02: the default arm is 33 of 33 and 780 of 780, and
+  the f32 arm fails 9 cases with 293 assertions. The failures are cross-PATH
+  consistency assertions -- `MaxAbsDiff` between the indexed and fallback GDN
+  pools, `memcmp` between the tap and plain routes, `aux_col(k,t,h) == rb[...]`,
+  and one `CHECK( 2.69807 < 0.001 )` -- plus a SIGABRT in the NVFP4 lm_head case.
+  Those are paired paths required to agree bitwise, so one side is retyped and
+  its reference is not. A magnitude of 2.7 is not a rounding tail. Finishing the
+  conversion means retyping every paired path together and resolving the NVFP4
+  head's own dtype contract, which is more than this row scoped. Until then the
+  lever is a staged instrument that does not work, and the arm it was meant to
+  measure is measured through the pre-existing levers instead.
+- **`VT_KV_CACHE_F32=1` is broken on this model path, and it PREDATES this row.**
+  rc job `25cbca74`: the focused unit suite passes under it, and the real engine
+  dies in the first forward with `vt: reshape_and_cache: k/v/k_cache/v_cache must
+  share one float dtype (auto cache path)` (`ops.cpp:3947`). The cache becomes
+  f32 while the attention path still produces bf16 k and v. So the KV term cannot
+  be isolated today, and a documented same-binary A/B knob does not run. This is
+  not caused by this row's change; it is found by it.
 - `VT_ACT_F32` is an instrument, not a default. Whether the CPU tier SHIPS f32 is
   a product default and is decided by the A/B this row runs, not by the commit
   that added the resolver.

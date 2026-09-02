@@ -1710,6 +1710,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_moe_chain.hip
     src/vt/rocm/rocm_grouped_gemm.hip
+    src/vt/rocm/rocm_exl3.hip
     src/vt/rocm/rocm_sample.hip
     src/vt/rocm/rocm_gdn_state.hip
     src/vt/rocm/rocm_gdn_conv.hip
@@ -1733,6 +1734,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_moe_chain.hip
       src/vt/rocm/rocm_grouped_gemm.hip
+      src/vt/rocm/rocm_exl3.hip
       src/vt/rocm/rocm_sample.hip
       src/vt/rocm/rocm_gdn_state.hip
       src/vt/rocm/rocm_gdn_conv.hip

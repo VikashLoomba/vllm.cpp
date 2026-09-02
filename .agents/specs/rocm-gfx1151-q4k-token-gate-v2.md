@@ -21,7 +21,41 @@ concluded from the difference.
 
 ## Now
 
-`ACTIVE` — the measurement is declared and not yet run.
+`ACTIVE` — the measurement ran and returned `TOKEN_GATE=FAIL` at 3 of 6.
+
+**The board completed 6 legs of 6 with zero GPU resets**, on the shipped default
+with no environment knob set, against the predecessor's 17 faults in 18 legs of
+the same workload. All six legs are byte-identical. `27da7787e` is what changed,
+and this is the first token verdict this arm has ever had.
+
+The gate fails, and its three losses are **disjoint** from the post-#2534 CPU
+tier's three. Same rate, different prompts: ROCm loses 1, 3 and 5, the CPU tier
+loses 1, 2 and 4, and the one prompt in common is a different step (45 against
+34). Resolving all six contested steps to what all four sides emit splits them
+in half: three are the oracle disagreeing with itself across its own kernel
+paths, at exactly the three prompts the predecessor measured that on, and at
+those our two tiers emit the SAME token. The other three — p1/45, p3/45, p4/14 —
+are steps where our ROCm and CPU arms compute a different argmax over an
+identical prefix with no oracle in the comparison. That is a ROCm-local term,
+measured here for the first time, and
+[#2590](https://github.com/mudler/vllm.cpp/issues/2590) owns it.
+
+Every ROCm loss is a rank-2 near-tie: over 288 steps the oracle ranks our token
+1 on 285 and 2 on 3, nothing worse occurs, and our arm takes the top-1 on 16 of
+the 19 steps whose oracle gap is below 0.20 — including all three the CPU tier
+is convicted at.
+
+`ORACLE_REPRO=YES` on 6 of 6 prompts and `CHAIN_OF_CUSTODY=EXACT`, so the
+denominator did not move between the two attempts and the change in verdict is
+entirely on our side.
+
+Evidence:
+[`docs/bench-evidence/qwen38-27b-q4km-rocm-gfx1151-token-gate-v2-20260902.md`](../../docs/bench-evidence/qwen38-27b-q4km-rocm-gfx1151-token-gate-v2-20260902.md).
+
+This spec was committed before the job that produced the number, in commit
+`6a859c170`, and it declared the verdict shape, the identity assertions, the
+same-rate/different-index reporting rule and the stop conditions in advance, so
+that no threshold could move after the fact.
 
 ## Why this is newly possible
 
@@ -280,12 +314,16 @@ match argued into existence.
 
 ## Owed
 
-- The ROCm token verdict itself, until this run produces one.
-- The fix for whatever divergence it measures. If the ROCm divergences match the
-  CPU tier's post-#2534 indices and ids, #2534's residual term owns them. If
-  they do not, ROCm carries its own term and that term gets its own issue
-  against this row.
+- **The ROCm-local divergence term at p1/45, p3/45 and p4/14.** The divergences
+  did NOT match the CPU tier's, so ROCm carries a term of its own and it has its
+  own issue against this row:
+  [#2590](https://github.com/mudler/vllm.cpp/issues/2590). It is measured, not
+  fixed, and this row owns the fix.
+- #2534's residual magnitude term still owns the CPU tier's three steps. It does
+  not explain ROCm's.
 - #2497's quant-matched decode number stays blocked until this gate passes.
+  `AGENTS.md` §Gates admits no speed, latency or memory axis from this arm, and
+  none was produced or recorded here.
 - The degenerate `n_gpu_layers = 0` oracle leg stays owed by
-  [#2557](https://github.com/mudler/vllm.cpp/issues/2557). No conclusion here
-  rests on it.
+  [#2557](https://github.com/mudler/vllm.cpp/issues/2557). It was not run and no
+  conclusion here rests on it.

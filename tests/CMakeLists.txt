@@ -2536,6 +2536,10 @@ vllm_cpp_add_test(test_exl3_real_decode vt/test_exl3_real_decode.cpp)
 # The EXL3 arm REACHED from the dense forward (#2181): the capability gate, not
 # a class gate.
 vllm_cpp_add_test(test_llama_exl3_forward vllm/models/test_llama_exl3_forward.cpp)
+
+# MODEL-QWEN35-EXL3 (#2495 items 3 and 5): the EXL3 arm of the DENSE Qwen3.5
+# loader and forward, gated through LoadQwen3_5Dense and ModelRegistry::Forward.
+vllm_cpp_add_test(test_qwen35_exl3 vllm/models/test_qwen35_exl3.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM

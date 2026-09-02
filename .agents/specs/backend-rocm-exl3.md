@@ -61,7 +61,53 @@ Exactly two ops.
   (`src/vt/cpu/cpu_ops.cpp` `kCastF16` registrar) and CUDA
   (`src/vt/cuda/cuda_glue.cu` `CastF16KernelCuda`) while its two siblings
   `kCastBf16`/`kCastF32` have six backends each.
-  `.agents/specs/quant-exl3-shared.md` `## Owed` already records this gap in
+  `.agents/specs/quant-exl3-shared.md` `## Verified on the MERGED tree (2026-09-02) — including the one thing the landing did not check
+
+The row landed on the strength of a device run against the pre-merge tree. Every
+ROCm source was byte-identical to what landed, but **the merged tree had never
+been compiled under HIP**, and nothing on the dev box compiles `.hip`. That
+mattered for one specific coupling: `main`'s new Q6_K `Fmt == 3` arm in
+`rocm_grouped_gemm.hip` consumes `DF16ToF32` from the header this row moved it
+into. Job `d218dc2d` (`run4.sh`) on `strix:gpu0` closes it.
+
+At `9dcc34cc3`, gfx1151, ROCm 7.2.4, worker `rc-worker-lcjhd`, 784 s:
+
+```
+cmake rc=0    ARCH OK: ROCm backend: ENABLED for arch(es) [gfx1151]
+build1 rc=0   (the merged tree DOES compile under HIP)
+ctest rc=0    (the focused suite still passes on the device)
+```
+
+**And the BF16 control ran this time.** It hung the GPU on the previous job
+(`HW Exception ... reason :GPU Hang`), which is why #2433's fourth acceptance line
+went unmet. Here `bf16_ctrl8 rc=0`, `reference_tier_notices=0`.
+
+| leg, 8 tokens x 3 repeats | wall | ref-tier notices | tok/s |
+|---|---|---|---|
+| EXL3 BEFORE (both registrations `if (false)`) | 30,313 ms | **2** | 0.847, 0.827, 0.815 |
+| EXL3 AFTER (native arm) | 4,306 ms | **0** | 6.995, 8.734, 8.504 |
+| BF16 control | 3,240 ms | 0 | — |
+
+**~10.3x warm on the merged tree**, and the two arms produce byte-identical greedy
+text -- ` Paris. Paris is known for its famous` from both. The BEFORE leg is the
+reachability mutation: disabling the two `RegisterOp` lines restores both the
+fallback notices and the 0.83 tok/s.
+
+The bf16 denominator also reframes the result. Before this row EXL3 was ~9.4x
+slower than bf16 on this device; it is now within **1.33x** of it, which is the
+expected shape for a 3bpw trellis decode rather than a fallback.
+
+**#2433 is still `Refs`, not `Closes`, and the remaining line is narrow.** Its
+fourth criterion asks for warm throughput WITH AMD clock attribution. The
+throughput is here and the bf16 denominator is here; no `sclk` capture is, and
+`.agents/benchmarking.md` is explicit that a number is quotable only with the
+clock it was taken at. That capture is what the issue still owes.
+
+Unchanged: every number is a gfx1151 APU figure with unified memory and
+generalises to no discrete Radeon -- the case that is actually broken today, and
+that this fleet cannot test.
+
+## Owed` already records this gap in
   those words; this row discharges the ROCm quarter of it.
 - **R2 `kExl3Gemm` on ROCm**, transcribed from the portable CPU reference and
   **not** ported from `src/vt/cuda/cuda_exl3.cu`.

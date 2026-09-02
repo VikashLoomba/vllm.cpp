@@ -241,6 +241,22 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 BENCH_EVIDENCE_RUN = re.compile(
     r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu)\Z"
 )
+# #2609. The lease RECIPES: the exact script a `rc` job ran to produce a number
+# a spec then cites. Same class and same reasoning as BENCH_EVIDENCE_RUN's `.sh`
+# and `.cu` above -- verified, not assumed: nothing under CMakeLists.txt,
+# .github/, scripts/, src/ or include/ references `.agents/scripts/`, and the
+# only referents are spec files. Nothing builds them, nothing installs them, and
+# no entry point reaches them.
+#
+# This directory had NO class at all, and `classify_path` fails closed, so four
+# already-tracked files under it left
+# `test_every_tracked_and_current_change_path_is_classified` RED on `main` and
+# errored any change that touched one. It went unseen because check-pr-size.py
+# is CI-only -- `agent-preflight.sh` never runs it.
+AGENT_RUN_SCRIPT = re.compile(
+    r"\.agents/scripts/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?"
+    r"\.(?:sh|py|hip|cu)\Z"
+)
 STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
 STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
     r"\.agents/completed/state-migration-manifest-"
@@ -467,6 +483,7 @@ def classify_path(path: str) -> str:
         or SYNC_RECORD.fullmatch(path)
         or BENCH_EVIDENCE.fullmatch(path)
         or BENCH_EVIDENCE_RUN.fullmatch(path)
+        or AGENT_RUN_SCRIPT.fullmatch(path)
     ):
         return "evidence"
     if path in GOVERNANCE_SUPPORT_FILES:

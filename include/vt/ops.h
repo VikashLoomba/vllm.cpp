@@ -118,6 +118,16 @@ enum class OpId : uint8_t {
   kDflash2PathWalk,
   kReshapeAndCache,
   kConcatAndCacheMla,
+  // The fp8_ds_mla paged K cache (`KV-DSV4-MULTICACHE` W8, #2455). DeepSeek-V4's
+  // K cache is a REGION-SPLIT byte page and NOT a rank-3
+  // (num_blocks, block_size, width) tensor, so kConcatAndCacheMla — which
+  // requires exactly that rank — cannot express it and these are separate ops
+  // rather than a flag on it. Ported from
+  // `vllm/models/deepseek_v4/common/ops/cache_utils.py` @ `5559679229`:
+  // `quantize_and_insert_k_kernel` (`:36-159`) and
+  // `_dequantize_and_gather_k_kernel` (`:228-341`).
+  kConcatAndCacheDsMla,
+  kDequantAndGatherDsMla,
   kMlaDecodeAttention,
   kMlaPrefillAttention,
   // The DSA "Lightning Indexer" selection pair (dots3-note W4b-3c, #699). The
@@ -2462,6 +2472,39 @@ using Dflash2PathWalkFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&
                                    const Dflash2PathWalkArgs&);
 using TopKValuesIndicesFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
                                      const TopKValuesIndicesArgs&);
+// --- The fp8_ds_mla paged K-cache GEOMETRY (KV-DSV4-MULTICACHE W8, #2455) ----
+// Upstream's host wrapper `quantize_and_insert_k_cache` writes these four as
+// literals in its own body (`cache_utils.py:180-190` @ `5559679229`) and hands
+// them to the kernel as `tl.constexpr`s; its gather twin repeats them
+// (`:353-358`). They are named ONCE here because the op wrapper validates the
+// shapes they imply and the kernels build `Fp8DsMlaLayout` from them, and two
+// copies of 448 would be two things to keep in step.
+inline constexpr int64_t kFp8DsMlaNopeDim = 448;    // TOKEN_FP8_DIM   (`:180`)
+inline constexpr int64_t kFp8DsMlaRopeDim = 64;     // TOKEN_BF16_DIM  (`:181`)
+inline constexpr int64_t kFp8DsMlaScaleDim = 8;     // TOKEN_SCALE_DIM (`:182`), 7 real + 1 pad
+inline constexpr int64_t kFp8DsMlaQuantBlock = 64;  // QUANT_BLOCK_SIZE(`:183`)
+// `input_dim` 512 — the latent width upstream asserts on `k` (`:167-169`).
+inline constexpr int64_t kFp8DsMlaInputDim = kFp8DsMlaNopeDim + kFp8DsMlaRopeDim;
+// TOKEN_DATA_SIZE = 448 + 64*2 = 576 (`:190`): the rope half is stored bf16.
+inline constexpr int64_t kFp8DsMlaTokenDataSize =
+    kFp8DsMlaNopeDim + kFp8DsMlaRopeDim * 2;
+// 584 = 576 data + 8 scale, the per-token page cost
+// (`kv_cache_interface.py:401-403`, "448B NoPE + 128B RoPE + 8B fp8 scale").
+inline constexpr int64_t kFp8DsMlaTokenBytes =
+    kFp8DsMlaTokenDataSize + kFp8DsMlaScaleDim;
+
+// The fp8_ds_mla paged K-cache READ (W8 slice 3). Mirrors the two non-tensor
+// arguments of `dequantize_and_gather_k_cache_triton` (`cache_utils.py:339-389`).
+struct DequantAndGatherDsMlaArgs {
+  // `cache_block_size` (`:379`): STORAGE rows per block, i.e. the spec's
+  // `storage_block_size()` = `block_size / compress_ratio`. It is an argument
+  // and not a shape because the page is rank-2 bytes.
+  int64_t block_size = 0;
+  // `offset` (`:369`): the first output COLUMN this gather writes, so a caller
+  // can concatenate several gathers into one scratch row.
+  int64_t offset = 0;
+};
+
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
 // fp8 KV-cache store (KV-FP8 W1). k_cache/v_cache are 1-byte fp8 (DType::kI8);
@@ -2473,6 +2516,19 @@ using ReshapeAndCacheFp8Fn = void (*)(Queue&, const Tensor& /*k*/, const Tensor&
                                       float /*k_scale*/, float /*v_scale*/);
 using ConcatAndCacheMlaFn =
     void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, const Tensor&);
+// The fp8_ds_mla paged K-cache STORE (`KV-DSV4-MULTICACHE` W8 slice 2, #2455).
+// `k` is the compressed latent [num_tokens, 512], `kv_cache` the rank-2 byte
+// page [num_blocks, block_bytes] (DType::kI8), `slot_mapping` [num_slots] i64,
+// and the trailing int64 is upstream's `block_size` argument — the STORAGE rows
+// per block, which a rank-2 page cannot carry in its own shape.
+using ConcatAndCacheDsMlaFn =
+    void (*)(Queue&, const Tensor&, Tensor&, const Tensor&, int64_t);
+using DequantAndGatherDsMlaFn = void (*)(Queue&, Tensor& /*out*/,
+                                         const Tensor& /*kv_cache*/,
+                                         const Tensor& /*seq_lens*/,
+                                         const Tensor* /*gather_lens*/,
+                                         const Tensor& /*block_table*/,
+                                         const DequantAndGatherDsMlaArgs&);
 using MlaDecodeAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
                                       const Tensor&, const Tensor&,
                                       const MlaDecodeAttentionArgs&);
@@ -4855,6 +4911,89 @@ void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_ca
 // than silently mis-written.
 void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor& kv_cache,
                        const Tensor& slot_mapping);
+
+// --- The fp8_ds_mla paged K cache (KV-DSV4-MULTICACHE W8, #2455) ------------
+// DeepSeek-V4's K cache is NOT a rank-3 (num_blocks, block_size, width) tensor,
+// and that is the whole reason these are separate ops. Its block is
+// REGION-SPLIT (`cache_utils.py:59-66` @ `5559679229`, verbatim):
+//
+//     K Cache block layout (block_size=64 tokens):
+//     - [0, 64*576):              Token data, each token has 448 fp8 + 128 bf16
+//     - [64*576, 64*576 + 64*8):  Scales, each token has 8 uint8 scales
+//     - [64*576 + 64*8, block_stride): Padding
+//
+// A token's scale bytes live in a DIFFERENT region of the block from its data
+// bytes, so no (block, row, column) indexing reaches both. `vt::ConcatAndCacheMla`
+// requires `rank == 3` and keeps its "auto path only, fp8_ds_mla refused"
+// contract unchanged — that refusal is what stops an f32 write (2048 bytes at
+// head_dim 512, 3.5x the 584 the spec declares) landing in a byte page.
+//
+// STORE — `quantize_and_insert_k_cache` / `quantize_and_insert_k_kernel`
+// (`cache_utils.py:36-159` kernel, `:162-227` host wrapper).
+//
+//   k             [num_tokens, 512] float   the compressed latent: NoPE part in
+//                 columns [0, 448), the already-rotated RoPE part in [448, 512).
+//                 Upstream asserts bf16 (`:167-171`); we accept any float dtype
+//                 because the encoder's FIRST act is upstream's own fp32->bf16
+//                 round, so an f32 row and its bf16 rounding produce the SAME
+//                 bytes.
+//   kv_cache      [num_blocks, block_bytes] DType::kI8 — the byte page. Its
+//                 block stride comes from `kv_cache.stride[0]`, exactly as
+//                 upstream reads `k_cache.stride(0)` (`:189`).
+//   slot_mapping  [num_slots] i64. `slot < 0` writes NOTHING — not a zero row,
+//                 not a partial row (upstream `if slot_idx == -1: return`,
+//                 `:77-78`). Upstream takes the token count from
+//                 `slot_mapping.shape[0]` (`:186-188`), so trailing rows of `k`
+//                 are padding and are ignored.
+//   block_size    STORAGE rows per block (`cache_block_size`, `:216`). A scalar
+//                 rather than a shape because the page is rank-2 bytes.
+//
+// For token t with slot s: block = s / block_size, pos = s % block_size; the
+// data lands at `pos * 576` inside the block and the 8 scale bytes at
+// `block_size * 576 + pos * 8`, with the 8th EXPLICITLY zeroed (`:148-149`).
+// Nothing past `block_size * 584` is ever written: the tail is the alignment
+// padding (`:63`).
+void ConcatAndCacheDsMla(Queue& q, const Tensor& k, Tensor& kv_cache,
+                         const Tensor& slot_mapping, int64_t block_size);
+
+// READ — `dequantize_and_gather_k_cache_triton` /
+// `_dequantize_and_gather_k_kernel` (`cache_utils.py:228-341` kernel,
+// `:339-389` host wrapper).
+//
+// A GATHER into a float scratch, not a fused fp8 attention. Upstream splits the
+// same way: its prefill dequant-gathers (`nvidia/flashmla.py:296`) while its
+// decode hands the packed page to a vendor kernel (`:219-226`) we do not have.
+// The scratch costs `seq_len * 512 * sizeof(out dtype)` per layer per step,
+// which is why the native fp8 decode is a later wave.
+//
+//   out          [num_reqs, max_num_tokens, 512] f32 or bf16
+//   kv_cache     [num_blocks, block_bytes] DType::kI8
+//   seq_lens     [num_reqs] i32
+//   gather_lens  [num_reqs] i32 or nullptr. nullptr is upstream's
+//                `gather_lens_ptr is None` arm: gather the WHOLE sequence
+//                (`:257-262`).
+//   block_table  [num_reqs, max_blocks_per_seq] i32
+//
+// For request b it walks `pos` in `[seq_len - gather_len, seq_len)` and writes
+// row `offset + i` of `out[b]` (`:263-296`).
+//
+// THE ASYMMETRY, and it is upstream's: the store writes `scale_dim == 8` scale
+// bytes and this read consumes `n_quant_blocks == 7` (`:385`). The 8th byte is
+// written and never read. Do not "tidy" the store's pad byte away — upstream
+// stores it explicitly so the page holds 0 there rather than whatever it held
+// before, and a later native-fp8 kernel reading 8 blocks would then read stale
+// bytes instead of a zero.
+//
+// DTYPE. Upstream's `out` is bf16 (`:328`, `:337`) and a bf16 `out` here is
+// bit-identical to it. An f32 `out` stores the dequantized value BEFORE that
+// final bf16 rounding — annotated per AGENTS.md rather than left to be found:
+// it is not a widened model buffer but a scratch whose dtype must equal the
+// query dtype that `vt::MlaDecodeAttention` will consume it with, and our CPU
+// MLA decode runs at f32.
+void DequantAndGatherDsMla(Queue& q, Tensor& out, const Tensor& kv_cache,
+                           const Tensor& seq_lens, const Tensor* gather_lens,
+                           const Tensor& block_table,
+                           const DequantAndGatherDsMlaArgs& args);
 
 // --- MLA decode attention (MLA campaign W4) ---------------------------------
 // The MQA decode half of Multi-head Latent Attention: every one of the Hq query

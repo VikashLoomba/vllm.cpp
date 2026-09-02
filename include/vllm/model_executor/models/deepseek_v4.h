@@ -706,11 +706,50 @@ struct DeepseekV4KvCache {
 //
 // Returns an empty string on success and fills `out_pages`; otherwise returns
 // the refusal message and leaves `out_pages` untouched.
+//
+// MODEL-DSV4-PAGED-ENTRY (#2447): the compressor clause is no longer a second
+// derivation. It calls `DeepseekV4PagedArmComposesCompressor` below, which is
+// the SAME expression `AttentionBlock` enforces, so a route that admits a layer
+// and a composition that refuses it cannot exist.
 std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
                                       const MultiKvCacheIndex& multi_kv,
                                       const std::vector<PagedKvCache>& attn_kv,
                                       int num_reqs, vt::Device device,
-                                      std::vector<vt::Tensor>* out_pages);
+                                      std::vector<vt::Tensor>* out_pages,
+                                      // Whether the caller's arm forces dense MLA
+                                      // on every layer (the GGUF tower does). The
+                                      // two paged arms differ here and must keep
+                                      // differing: under `dsa_dense` a compressor
+                                      // layer would attend the RAW PREFIX, so it
+                                      // stays refused.
+                                      bool dsa_dense,
+                                      // Whether the caller will supply carried
+                                      // compressor state. Without it the composed
+                                      // arm cannot run and the layer refuses.
+                                      bool have_compressor_state,
+                                      // This step's token count. The composed arm
+                                      // is DECODE-ONLY (`MergeWindowAndCompressed`
+                                      // needs T == 1 or H == 1), so a prefill
+                                      // refuses by name here rather than inside
+                                      // the composition.
+                                      int64_t num_tokens);
+
+// MODEL-DSV4-PAGED-ENTRY (#2447). THE ONE derivation of "the paged arm composes
+// this layer's compressor rather than treating it as dense".
+//
+// `AttentionBlock` uses the return value as its `comp_arm`, and
+// `ResolveDeepseekV4SwaPages` routes on it. Sharing the expression is the point:
+// the refusal a layer meets and the rule a test drives are the same bytes. An
+// inline copy would be a second derivation, and a second derivation is what can
+// disagree with the one the test pins (`model_registry.cpp`, the same rule for
+// `MultiKvRefusalApplies`).
+//
+// FALSE under `dsa_dense` by construction. That arm runs every layer dense, so
+// it composes no compressor at all -- which is exactly why the resolver keeps
+// refusing a compressor layer there.
+bool DeepseekV4PagedArmComposesCompressor(const DeepseekV4Params& params,
+                                          int64_t layer, bool dsa_dense,
+                                          bool have_compressor_state);
 
 // KV-DSV4-MULTICACHE W5 (#2323): incremental decode over the RUNNER'S PAGES --
 // the paged counterpart of `DeepseekV4ForwardGgufCached`. `paged_kv` holds one
@@ -751,6 +790,23 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
     DeepseekV4CompressorState* compressor = nullptr);
+
+// MODEL-DSV4-PAGED-ENTRY (#2447): the same composition, returning the runner's
+// `ForwardLogits` instead of a flat host vector.
+//
+// It exists so the registered forward has ONE call to make. Returning
+// `HostLogits` from the registry instead would not red
+// `check-runner-routing-consistency.py` -- the delegate hop keeps `deepseek_v4`
+// classified DEVICE -- so the checker would keep asserting device logits while
+// the arm that runs downloads them. That is a false green, and routing the
+// return through `WrapV4DeviceLogits` here is what removes the chance to write
+// it.
+ForwardLogits DeepseekV4ForwardExl3PagedLogits(
+    const DeepseekV4Weights& weights, vt::Queue& queue,
+    std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const std::vector<int32_t>& logits_indices,
+    DeepseekV4CompressorState* compressor);
 
 std::vector<float> DeepseekV4ForwardGgufCached(
     const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,

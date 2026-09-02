@@ -28,8 +28,10 @@
 #include <doctest/doctest.h>
 
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,6 +41,9 @@
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/model_executor/models/qwen3_5.h"   // PagedKvCache, GdnStateCache
+#include "vllm/v1/attention/backend.h"             // CommonAttentionMetadata
+#include "vllm/v1/attention/backends/gdn_attn.h"   // GDNAttentionMetadata
 #include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
 #include "vt/dtype.h"
 
@@ -1271,4 +1276,162 @@ TEST_CASE("W3: the cr == 4 arm is REACHED, and its INDEXER state accumulates (#2
   // Layer 0 is dense: neither machine touched it.
   CHECK(cs.state_kv[0].empty());
   CHECK(cs.idx_state_kv[0].empty());
+}
+
+// ── MODEL-DSV4-PAGED-ENTRY (#2447) ─────────────────────────────────────────
+//
+// THE REACHABILITY GATE. `DeepseekV4ForwardExl3Paged` worked before this row and
+// had only test callers, so every case above it proves a class rather than a
+// capability. This one enters through `ModelRegistry::Forward` -- the production
+// entry point AGENTS.md §"Nothing lands dead" names -- and it leaves
+// `gather_logits` AT ITS DEFAULT, because that default is the defect: it is true
+// on every step the runner builds, so it selected `ForwardDevice`, which binds
+// neither `paged_kv` nor `compressor`.
+//
+// WHAT IT DOES NOT DO. `DeepseekV4LoadedModel` lives in an anonymous namespace,
+// so no downcast can read its compressor state, and it must not gain a public
+// accessor for the purpose -- that would weaken the claim to "the member
+// exists". The two reachable observables carry it instead:
+//
+//   (A) the page bytes for the compressor layer are non-zero after step 1. Only
+//       `vt::ConcatAndCacheMla` writes them and only the paged arm calls it, so
+//       this is red if the new registry branch is deleted.
+//   (B) step 2 SUCCEEDS at `kv_base == 1`. `CompressorLayerStep` refuses unless
+//       the carried state has seen exactly `kv_base` tokens, so this is red if
+//       the state is constructed per call rather than persisted on the model.
+//
+// Two production defects, one assertion each.
+namespace {
+// One count, not one assertion per element.
+int64_t NonFinite(const std::vector<float>& v) {
+  int64_t n = 0;
+  for (const float x : v)
+    if (!std::isfinite(x)) ++n;
+  return n;
+}
+}  // namespace
+
+TEST_CASE("PAGED-ENTRY: ModelRegistry::Forward REACHES the EXL3 paged arm (#2447)") {
+  dsv4_exl3_fixture::FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};  // layer 1 carries the compressor
+  opt.real_dsa_geometry = false;   // the collapsed width the host forward indexes
+  auto f = dsv4_exl3_fixture::BuildFixture(opt);
+
+  const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(f->shards);
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::ModelRegistry::Load(f->config, source);
+  REQUIRE(model != nullptr);
+
+  const vllm::DeepseekV4Params params = vllm::ParseDeepseekV4Params(f->config);
+  const int64_t nlayers = params.num_hidden_layers;
+  const int64_t hd = params.head_dim;
+  REQUIRE(nlayers == 2);
+  REQUIRE(params.has_compressor(1));
+
+  // The pages the runner publishes, under the names `MakeDeepseekV4KVCache`
+  // publishes them under -- resolved BY NAME, exactly as the adapter does it.
+  // f32 rather than the shipped `kI8`: `vt::ConcatAndCacheMla` takes a float
+  // cache only, so the packed arm is refused by name and is owed to
+  // `KV-DSV4-MULTICACHE` W8.
+  const int64_t nb = 4, bs = 8;
+  std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+  std::vector<vllm::PagedKvCache> attn_kv(static_cast<size_t>(nlayers));
+  std::vector<std::string> names;
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const size_t i = static_cast<size_t>(l);
+    storage[i].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+    attn_kv[i].data = storage[i].data();
+    attn_kv[i].dtype = vt::DType::kF32;
+    attn_kv[i].num_blocks = nb;
+    attn_kv[i].block_size = bs;
+    attn_kv[i].num_kv_heads = 1;
+    attn_kv[i].head_size = hd;
+    names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  }
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+
+  const auto step = [&](int32_t token, int32_t position, int computed, int nreqs) {
+    const std::vector<int32_t> tok{token};
+    const std::vector<int32_t> pos{position};
+    const std::vector<int32_t> li{0};
+    vllm::v1::CommonAttentionMetadata attn_meta{};
+    attn_meta.num_reqs = nreqs;
+    attn_meta.num_computed_tokens_cpu = {computed};
+    vllm::ModelForwardInput in{.token_ids = tok,
+                               .positions = pos,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = f->config,
+                               .queue = queue,
+                               .logits_indices = li,
+                               .num_reqs = nreqs};
+    // NOT in the aggregate initializer, exactly as the runner sets it.
+    in.multi_kv = &mk;
+    // `gather_logits` is DELIBERATELY LEFT AT ITS DEFAULT (true). A test that
+    // set it false would route through the branch no runner step takes and
+    // would prove nothing about the path that runs.
+    REQUIRE(in.gather_logits);
+    return vllm::ModelRegistry::Forward(*model, in);
+  };
+
+  // ── step 1: kv_base == 0 ────────────────────────────────────────────────
+  const vllm::ForwardLogits s1 = step(/*token=*/1, /*position=*/0, /*computed=*/0,
+                                      /*nreqs=*/1);
+  CHECK(s1.rows == 1);
+  CHECK(s1.vocab == params.vocab_size);
+  REQUIRE(s1.host.size() == static_cast<size_t>(params.vocab_size));
+  // AGGREGATED, never one assertion per vocabulary entry: a per-entry loop
+  // buries the assertion COUNT, and a changed count is itself the signal a
+  // mutation is read by.
+  CHECK(NonFinite(s1.host) == 0);
+
+  // (A) THE PAGE WAS WRITTEN, on the compressor layer. Aggregated rather than one
+  // assertion per element: a changed assertion COUNT is itself the signal a
+  // mutation is read by, and `nb * bs * hd` REQUIREs would swamp it.
+  int64_t nonzero_l1 = 0;
+  double sum_l1 = 0.0;
+  for (const float v : storage[1]) {
+    if (v != 0.0f) ++nonzero_l1;
+    sum_l1 += std::abs(static_cast<double>(v));
+  }
+  CHECK(NonFinite(storage[1]) == 0);
+  MESSAGE("compressor-layer page: " << nonzero_l1 << " non-zero of "
+                                    << storage[1].size() << ", L1 " << sum_l1);
+  CHECK(nonzero_l1 > 0);
+  // Exactly the FIRST slot's row, and nothing beyond it: `kv_base == 0` writes
+  // slot 0. A route that wrote the whole page would also pass "non-zero".
+  int64_t nonzero_beyond = 0;
+  for (size_t i = static_cast<size_t>(hd); i < storage[1].size(); ++i)
+    if (storage[1][i] != 0.0f) ++nonzero_beyond;
+  CHECK(nonzero_beyond == 0);
+
+  // ── step 2: kv_base == 1 ────────────────────────────────────────────────
+  // (B) THE STATE PERSISTED. `CompressorLayerStep` refuses unless the carried
+  // state has seen exactly `kv_base` tokens, so a state built per call has seen
+  // 0 here and this throws.
+  const vllm::ForwardLogits s2 = step(/*token=*/2, /*position=*/1, /*computed=*/1,
+                                      /*nreqs=*/1);
+  CHECK(s2.rows == 1);
+  REQUIRE(s2.host.size() == static_cast<size_t>(params.vocab_size));
+  CHECK(NonFinite(s2.host) == 0);
+  // And the second token's row landed in slot 1, so the two steps did not write
+  // the same slot.
+  int64_t nonzero_slot1 = 0;
+  for (int64_t d = 0; d < hd; ++d)
+    if (storage[1][static_cast<size_t>(hd + d)] != 0.0f) ++nonzero_slot1;
+  CHECK(nonzero_slot1 > 0);
+
+  // ── the route's own refusal, which is the RESOLVER'S and not a copy ─────
+  // One `kv_base` cannot serve two context lengths, and the compressor state has
+  // no request dimension -- two requests at EQUAL length would sail past
+  // `seen == kv_base` into a plausible answer over a mixed history.
+  CHECK_THROWS(step(/*token=*/3, /*position=*/2, /*computed=*/2, /*nreqs=*/2));
 }

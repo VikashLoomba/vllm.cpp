@@ -1380,7 +1380,7 @@ def section_conditioning(out) -> None:
         "the latent-index item must CHANGE the denoise mask or it gates nothing"
     )
     assert torch.equal(state_index.latent, base.latent), (
-        "upstream leaves the NOISY tensor untouched here (latent_cond.py:38-39); if that ever "
+        "upstream leaves the NOISY tensor untouched here (latent_cond.py:40-41); if that ever "
         "changes, the port's noising composition changes with it"
     )
     out.write("// --- section 9b: VideoConditionByLatentIndex (latent_cond.py:9-43) ---\n")

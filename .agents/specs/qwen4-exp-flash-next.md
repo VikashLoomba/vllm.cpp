@@ -82,86 +82,251 @@ record. They are settled here so a fresh implementer does not re-derive them.
 
 ## Oracles
 
-**vLLM implements nothing here.** Read live at `origin/main` = `6a5e8f5979`,
-2026-08-26: no `qwen4*` path, no registry entry, and a repository-wide GitHub search
-for `qwen4` returns zero results. `vllm-omni` likewise. This is absence from vLLM
-`main`, not staleness in our pin (`555967922`), so a pin advance does not reach it.
+**vLLM is this row's primary oracle from 2026-08-31.** `[Model] Support
+Qwen3.8-Flash-Next (#53896)` landed at `e126687a9a828d513c01a07cd69f025f27d63280`
+and added `vllm/models/qwen4_exp/`: a shared `common/`, a `config.py`, and two
+complete backends, `nvidia/` and `amd/`. The registry carries three entries,
+`Qwen4ExpForCausalLM` (`vllm/model_executor/models/registry.py:114`),
+`Qwen4ExpForConditionalGeneration` (`:580`) and `Qwen4ExpMTP` (`:670`). Every
+component this row lists except the vision tower now has a vLLM implementation
+whose behaviour, defaults and naming this port must mirror.
 
-**Developer direction, 2026-08-26: transformers is the oracle for the ALGORITHM,
-vLLM supplies the OPS.** Recorded verbatim because it is the axis the whole row
-hangs on: "use transformers as oracle for algorithmic side. but use ops from vllm so
-we account for optimized path."
+**It is 595 commits ahead of the parity pin, and it is NOT reachable from the
+pin.** `git merge-base --is-ancestor e126687a9a 555967922` exits 1, and so does the
+reverse test. Every anchor cited from `e126687a9a` in this spec is therefore a
+**forward reference to an unpinned upstream**, labelled as one at each use.
+Advancing the pin belongs to the sync wave and NOT to this row; an implementer who
+needs the ops at the pin still has none. Issue
+[#2489](https://github.com/mudler/vllm.cpp/issues/2489) owns the reconciliation.
 
-This is the correct reading of what each upstream is, and not a split of
-convenience. transformers [#48337](https://github.com/huggingface/transformers/pull/48337)
-(MERGED 2026-08-26, 5211 lines) is a semantics reference that says so in its own
-code: `Qwen4ExpTextQSAIndexer.forward` loops in Python over `(batch_idx, query_idx)`
-and carries the comment "we only allow eager and sdpa". Ported as written it yields
-a correct model at an indefensible speed. AGENTS.md's "Mirror vLLM" polarity
-continues to bind every primitive vLLM implements, even though vLLM has never
-assembled this particular model from them.
+### The 2026-08-26 direction, and why it is superseded
 
-Therefore: **every component resolves against exactly one oracle, named in the
-`## Design` table. An implementer who cannot name the oracle for the line they are
-writing has found a gap in this spec and returns `NEEDS_CONTEXT`.**
+**Recorded verbatim, and NOT deleted, because a record that quietly drops a
+superseded reading cannot be audited.** The direction was: "use transformers as
+oracle for algorithmic side. but use ops from vllm so we account for optimized
+path."
 
-SGLang [#36497](https://github.com/sgl-project/sglang/pull/36497) is OPEN and is not
-admissible while it stays open. Re-check it at each wave; if it merges it becomes a
-second op source under the `sglang` registry id, still ranked below vLLM.
+The premise it rested on was stated in this section and was true when it was
+written: **vLLM implemented nothing here.** Read live at `origin/main` =
+`6a5e8f5979` on 2026-08-26, there was no `qwen4*` path, no registry entry, and a
+repository-wide GitHub search for `qwen4` returned zero results. `vllm-omni`
+likewise. On that premise the split was the correct reading of what each upstream
+is, rather than a split of convenience: transformers
+[#48337](https://github.com/huggingface/transformers/pull/48337) is a semantics
+reference that says so in its own code, and its `Qwen4ExpTextQSAIndexer.forward`
+loops in Python over `(batch_idx, query_idx)` under the comment "we only allow
+eager and sdpa".
 
-### The transformers lane pin (ACCEPTED 2026-08-26)
+**The premise expired on 2026-08-31 and the direction expired with it.** AGENTS.md
+makes vLLM the primary reference and "the only reference wherever it implements the
+behavior", and requires a row to reconcile onto vLLM and record the change in the
+spec once vLLM implements the path. The lane exception in
+[`../oracles/transformers.md`](../oracles/transformers.md) also names its own
+expiry in its own words: it "expires the moment vLLM registers `qwen4_exp`, at
+which point the row reconciles onto vLLM and transformers demotes to the
+preprocessing role it holds everywhere else."
 
-`.agents/oracles/transformers.md` pins transformers to **5.14.1**, deliberately tied
-to what the pinned vLLM environment resolves, on the stated ground that an
-independent pin "would let the oracle environment hold two different `transformers`
-at once, which is the drift this registry exists to stop".
+**Nothing that was built under the direction is thereby wrong.** The reconciliation
+below checks each component against vLLM rather than assuming either agreement or
+divergence, and it found the two load-bearing algorithm calls the direction
+produced, the unweighted mean pool and the divide-after-the-head-sum block score,
+**confirmed** by vLLM's own kernels. What changes is the authority, not the answer,
+and the components where the authority now differs are named individually.
 
-**5.14.1 does not contain `Qwen4Exp`**, so this row cannot run its algorithmic
-oracle under the existing pin.
+### What each oracle is for, from 2026-09-01
 
-The exception argued here is narrow: the invariant guards against a vLLM environment
-and its transformers drifting apart, and for `qwen4_exp` there is no vLLM
-implementation to drift from. A lane-scoped second pin therefore cannot create the
-inconsistency the rule exists to prevent. It is recorded in the oracle file as a
-lane exception naming this row and this issue, and it expires the moment vLLM
-registers `qwen4_exp`, at which point the row reconciles onto vLLM and transformers
-demotes to the preprocessing role it holds everywhere else.
+| Oracle | Role now | Reach for it |
+|---|---|---|
+| `vllm` at `e126687a9a` (**unpinned**, forward reference) | **primary**: algorithm, ops, defaults, dtype policy, refusals, cache shapes, naming | every component of this model except the two below |
+| `transformers` `v5.16.0` (lane pin) | **secondary**, demoted from algorithm to what it is everywhere else: the processor, tokenizer and checkpoint-semantics reference | preprocessing, the checkpoint's own tensor names and layout, and any question vLLM's two backends leave open |
+| `llama-cpp-qwen4exp` (`ggml-org/llama.cpp` PR #27742) | unchanged | the GGUF conversion, its architecture string and its k-quant floor. vLLM reads safetensors and has no GGUF arm, so it cannot answer a GGUF question |
+| `Qwen/Qwen3.8-Flash-Next` | unchanged | config and weights |
 
-**Accepted by the developer on 2026-08-26**, having been put as an explicit
-accept-or-reject rather than passed as housekeeping, because it changes the
-semantics of a registry invariant.
+**The lane exception in `.agents/oracles/transformers.md` has fired its own expiry
+condition and is spent.** It does not need to be argued down; it needs to be
+recorded as expired, which is what this section does. The transformers pin itself
+stays where it is, because `transformers` remains a registry oracle for its normal
+role, and the lane pin is now the ordinary pin for that role on this row.
 
-**The lane pin is `transformers` 5.16.0, and it is a real release, not a branch
-SHA.** That was not the expected outcome and it is better than one. `Qwen4Exp`
-merged to `main` at 12:03:40Z on 2026-08-26 and `v5.16.0` was published at
-12:35:15Z, 32 minutes later. Bounded rather than assumed, by fetching the model
-source at each tag on 2026-08-26: `v5.16.0` returns HTTP 200 and `v5.15.0` returns
-HTTP 404, so 5.16.0 is the FIRST release containing the architecture, which is the
-tightest pin available. Its `auto_mappings.py` carries 5 `qwen4_exp` occurrences, so
-the registration landed with the model rather than trailing it.
+**One thing vLLM still does not supply, and it is the same thing as before.** vLLM
+loads safetensors. Every GGUF question this row has, the quantized arms included,
+is answered by `llama-cpp-qwen4exp` and by the checkpoint, and vLLM cannot rule on
+it. That boundary is where the dtype question in #2477 actually lives, and the
+reconciliation below says so precisely.
 
-The version string is **unmeasured**: it is the release that provably contains the
-model, not a `transformers.__version__` read off a running oracle. Resolving the
-runtime string is owed to the first wave that stands one up. Full record and the
-`oracle-pin-lane` block: [`../oracles/transformers.md`](../oracles/transformers.md).
+### Component-by-component reconciliation (Q4RECONCILE, 2026-09-01, #2489)
+
+Read at vLLM `e126687a9a`, `vllm/models/qwen4_exp/nvidia/` unless a path says
+otherwise. **Every vLLM anchor in this table is a forward reference to an
+unpinned upstream.** `amd/` is the same shape and is not the mirror source for
+this row; where the two could differ the NVIDIA path is authoritative.
+
+Each divergence carries one of three verdicts. **(a)** this tree is wrong.
+**(b)** a deliberate deviation that was argued against `transformers` or
+`llama.cpp` and must now be re-argued against vLLM. **(c)** a structural
+difference that does not change behaviour.
+
+| # | Component | vLLM `e126687a9a` | This tree | Verdict |
+|---|---|---|---|---|
+| 1 | Model dtype | refuses every dtype but bf16, three times: `nvidia/qsa.py:188`, `nvidia/qsa.py:70`, `nvidia/indexer_qsa.py:113` | resolves bf16 from the GGUF (`qwen4_exp_gguf_weights.cpp:206`) | agree |
+| 2 | RMSNorm weight dtype | the one model dtype. `GemmaRMSNorm.__init__` takes no dtype, so `nn.Parameter(torch.zeros(hidden_size))` gets `torch.get_default_dtype()`, which `model_loader/base_loader.py:53` pins to `model_config.dtype` for the whole construction; `default_weight_loader`'s `param.data.copy_(loaded_weight)` casts the checkpoint value into it | bf16 gammas: `LoadNormBf16` dequantizes and re-narrows (`qwen4_exp_weights.cpp:114-121`), used for all four QSA norms (`:409`, `:411`, `:423`, `:425`) | agree |
+| 3 | RMSNorm activation dtype | bf16. `qwen3_next.py:424-431` chunks the gate off the **bf16** GEMM output and hands `q` to `self.q_norm` unwidened; both operands are promoted to f32 inside the kernel (`GemmaRMSNorm.forward_native`, `nvidia/ops/hc.py:42`, `:48`) | **f32 at one site.** `qwen4_exp_qsa_block.cpp:694` allocates `q_f32` as `DType::kF32`, and `:705` hands it to `vt::RmsNorm` beside a bf16 gamma | **(a)**, and it is #2477 |
+| 4 | Grouped Gemma RMSNorm | `(1.0 + w.float())` over `group_size = hidden_size`, affine width `hc_count * hidden_size` (`common/hyperconnection.py:54-86`, `nvidia/model.py:263` and `:439` `hc_per_branch_norm=True`) | same polarity, same grouping, same `[10240]` width (`cuda_qwen4_exp.cu:290`, `ops.cpp:2536`) | agree |
+| 5 | HC mix arithmetic | norm, down, `silu(x / hc_count)`, up, sigmoid, gated mean over the **normed** streams (`nvidia/hyperconnection.py:127-150`, `nvidia/ops/hc.py:100`, `:155`) | identical, including the division inside the SiLU and the mean over `normed` (`cpu_qwen4_exp.cpp:248-268`, `cuda_qwen4_exp.cu:302`, `:332`) | agree |
+| 6 | HC down and inject GEMMs | **merged into one** `MergedColumnParallelLinear`, `[lora_rank, hc_count]` padded to a multiple of 16 rows, with a `WeightsMapper` that stacks the two checkpoint tensors (`nvidia/hyperconnection.py:98-110`, `nvidia/model.py:146-155`), and a decode plan keyed on that merged `(336, 10240)` shape (`nvidia/low_latency_gemm.py:72-79`) | three separate GEMMs, `hc_*_down` and `hc_*_inject` never stacked (`cuda_qwen4_exp.cu:414`, `:418`, `:428`) | **(b)** — upstream's merge is exactly the `vt::MergedGemmGroup` seam AGENTS.md mandates, and the padded 16-row shape is what its decode plan indexes |
+| 7 | HC combine formula | `2 * sigmoid(inject(x_normed) / hc_count)`, inject read from the **normalized** hyper input (`common/hyperconnection.py:234-238`) | same, and also from `normed` (`cpu_qwen4_exp.cpp:282-286`, `cuda_qwen4_exp.cu:428`, `:347`) | agree |
+| 8 | HC combine scheduling | **deferred** to the next mix boundary and **fused with that mix's RMSNorm** (`nvidia/hyperconnection.py:152-186` `combine_and_mix`, kernel `nvidia/ops/hc.py:267-331`); it is materialized early only where PLE adds into the stream (`nvidia/model.py:288-297`) | applied immediately, its own op, on the raw stream (`qwen4_exp_forward.cpp:466`, `:544`) | **(c)** for the arithmetic, **(b)** for the schedule: upstream reads the residual once instead of twice, and the fused kernel is the reason |
+| 9 | HC projection quantization | never quantized. All three linears pass `quant_config=None` **explicitly** and `params_dtype=torch.bfloat16` **hardcoded**, not `model_config.dtype` (`nvidia/hyperconnection.py:102`, `:113`, `:122`; `nvidia/model.py:260`, `:436`); the decode GEMM then demands `weight.dtype == torch.bfloat16` and packed row-major on both operands (`nvidia/low_latency_gemm.py:95-96`) | `hc_*_down` / `hc_*_up` route through `GgufLoadPolicy` and may keep Q8_0 blocks (`qwen4_exp_weights.cpp:134-141`, admitted by name at `ops.cpp:2564-2568`) | **(b)** — see #2406 below |
+| 10 | QSA block score | `sum_h relu(dot(k, q_h))` then `/ sqrt(index_head_dim)` **after** the head sum (`nvidia/ops/qsa.py:110-113`, divisor at `:628`) | the fold multiplies **before** the sum (`cpu_dsa_indexer.cpp:87`, `:103`, `:120`), with `n_head_scale = 1` and unit weights (`qwen4_exp_qsa_block.cpp:381-391`) | **(c)** — the reassociation W5b-4 already named, now confirmed against vLLM rather than transformers |
+| 11 | Compressor pool | unweighted mean, `accumulator / COMPRESS_RATIO` (`nvidia/ops/qsa.py:543`) | unweighted mean, `acc / CR` (`cpu_qwen4_exp_qsa.cpp:152`, `cuda_qwen4_exp_qsa.cu:256`) | agree, and this **confirms** the call this spec made from transformers against the closest-named CuteDSL kernel |
+| 12 | Compressor state | a per-request **ring of raw keys** sized `compress_ratio * cdiv(compress_ratio + num_speculative_tokens, compress_ratio)`, plus a **persistent compressed key cache**; a group spanning steps is closed out of the ring (`common/qsa_cache.py:763-783`, kernel `nvidia/ops/qsa.py:512-539`) | no ring. The raw prefix is cached in full and **every complete block is re-pooled on every step**, the pooled keys being per-call scratch (`qwen4_exp_qsa_block.cpp:287`, `:293`, `:305`) | **(b)** — a compute-for-memory trade upstream does not make, and it grows with context |
+| 13 | Indexer side caches | **two per QSA layer**: raw `CircularBufferSpec(block_size=capacity, 1, head_size, bf16)` (`common/qsa_cache.py:775`) and compressed `MLAAttentionSpec(..., tokens_per_state=compress_ratio)` (`:789-794`). Both dtypes are `torch.bfloat16` **hardcoded** at construction (`nvidia/indexer_qsa.py:154`, `:163`) and re-checked in `bind_kv_cache` (`common/qsa_cache.py:725`) | **one**: `MLAAttentionSpec(..., compress_ratio=1)` at `ResolveKvCacheDType()` (`qwen4_exp_registry.cpp:1089-1099`) | **(b)** for the count, which follows from #12; **(b)** for the dtype, because upstream does not let the KV dtype knob reach this cache |
+| 14 | With mRoPE, the raw side cache | widens to carry the exact three-axis int64 position beside each key, `rope_position_offset + 3*4` (`common/qsa_cache.py:733-752`) | no position tail; the pooled key is roped at the scalar `b * CR` (`cpu_qwen4_exp_qsa.cpp:183`) | **(c)** while the three mRoPE axes are forced equal (`qwen4_exp_forward.cpp:191-198`); **(a)** the moment the image or video path makes them differ |
+| 15 | Pooled-key RoPE position | the **first member's** position, `end_position - COMPRESS_RATIO + 1`, read from the position cache when mRoPE is on (`nvidia/ops/qsa.py:548`, `:556-582`) | `b * CR`, which is the same value at a boundary (`cpu_qwen4_exp_qsa.cpp:183`) | agree |
+| 16 | Top-k output shape | a fixed `[rows, token_topk + compress_ratio - 1]` int32 buffer, block ids expanded into it by `expand_qsa_block_indices_cuda` (`nvidia/ops/qsa.py:757`, `:800`), `block_topk = token_topk // compress_ratio` (`:766`) | no token buffer; block `b` becomes addresses `[b*CR, b*CR+CR)` inside the gather (`cpu_qwen4_exp_qsa.cpp:302`, `cuda_qwen4_exp_qsa.cu:463`). The fixed width exists only in the test-only host reference (`qwen4_exp_qsa.h:150`) | **(c)** |
+| 17 | Q/K/V projection | one fused `qkv_proj`, the output gate carried inside the doubled q half (`qwen3_next.py:392`, `:424-428`) | separate `attn_q` (at `qdim*2`), `attn_k`, `attn_v` matmuls (`qwen4_exp_qsa_block.cpp:692`, `:733`, `:741`); the doubled q half and the per-head split agree | **(c)** for the split, but the fusion is a `vt::MergedGemmGroup` question like #6 |
+| 18 | Output gate | `flat_output * torch.sigmoid(gate)` on the **bf16** gate, after attention and before `o_proj` (`nvidia/qsa.py:430-431`) | same place, but the gate is materialized f32 to keep the sigmoid argument unrounded (`qwen4_exp_qsa_block.cpp:695`, `:794`) | **(b)** — wider than upstream, and a token gate cannot see it |
+| 19 | PLE n-gram embedding | **IMPLEMENTED.** splitmix64 multipliers seeded per PLE layer, xor-mix of the shifted id planes, per-head vocabulary at the nth prime after `ngram_vocab_size_base`, offsets accumulated (`nvidia/ple_layer.py:151-436`, the splitmix64 hash at `:159-167`, the per-layer multipliers at `:210-226` and the id mix at `:422-436`) | same construction (`qwen4_exp_ple.cpp:112-117`, `:183-197`, `:236-303`) | **the Port map row flips**: this is no longer a component with no vLLM op |
+| 20 | PLE dilated depthwise conv | **IMPLEMENTED.** `nn.Conv1d(hc*H, hc*H, ple_conv_kernel_size, groups=hc*H, dilation=short_conv_dilation)` with `short_conv_dilation = ngram_size` and a short-conv state (`nvidia/ple_layer.py:589-599`, `nvidia/model.py:699`) | `vt::Qwen4ExpPleConv`, same kernel size and same `dilation = ngram_size` (`qwen4_exp_ple_block.cpp:271-272`, `:576-581`) | **the Port map row flips** |
+| 21 | PLE grouped norms | three `Qwen4ExpPLEGroupedNorm` over `hc*H` with `group_size = hidden_size`, key/query/conv (`nvidia/ple_layer.py:580-588`, class at `:50`) | three `vt::RmsNormGroup(gemma=true, group=H)` (`qwen4_exp_ple_block.cpp:488-539`) | agree |
+| 22 | MTP | **IMPLEMENTED.** `Qwen4ExpMTP` is registered (`registry.py:670`); the drafter reuses the backbone with PLE forced off, fuses via `residual_linear_shared`, and emits two hidden streams (`nvidia/mtp.py:1-14`, `:159-241`) | not implemented. `mtp_num_hidden_layers` is parsed (`qwen4_exp.cpp:549`) and never consumed; the registry states the head is deliberately unregistered (`qwen4_exp_registry.cpp:16-20`) | **owed**, and upstream now defines the target |
+| 23 | Decode GEMM | `QWEN4_EXP_GEMM_PLANS` selects a CuteDSL skinny GEMM by `(N, K)` and token count, sm103 and bf16 only (`nvidia/low_latency_gemm.py:26-79`, `:155-156`) | none for this model; the shared `vt::MatmulBT` seam, deliberately, rather than a private GEMV (`cuda_qwen4_exp.cu:219`) | **(c)** today; the plan table is a lever once a device exists |
+| 24 | Vision tower | `Qwen4ExpVisionConfig(Qwen3VLVisionConfig)`, reused unchanged (`config.py:23-26`) | the Qwen3.5-Moe tower, reused unchanged | agree, **not re-verified in this pass** |
+
+### What this pass could NOT determine
+
+Named rather than left silent, because a reconciliation that hides its gaps is
+worse than one that is smaller.
+
+- **Top-k tie and emission semantics.** Upstream calls
+  `torch.ops._C.cooperative_topk` / `persistent_topk` (`nvidia/ops/qsa.py:794-803`),
+  which are CUDA kernels outside the model directory. This tree's contract is
+  all-select-below-k, ties to the LOWER index, ASCENDING emission
+  (`cpu_dsa_indexer.cpp:145-176`). The two agree on `block_topk` and on the shape;
+  whether they agree on ties was NOT read, and it cannot be settled from
+  `vllm/models/qwen4_exp/` alone.
+- **The recurrent KV group.** The W5c argument for ONE uniform `MambaSpec` was
+  derived at the pin. `nvidia/model.py:748-800` now declares PLE and GDN state
+  through two separate `get_*_mamba_state_*_from_config` classmethods. Whether
+  that changes the one-group conclusion was NOT determined here and needs its own
+  read.
+- **The vision path.** Reused unchanged on both sides by inspection of the config
+  classes only. No forward was compared.
+- **`amd/` against `nvidia/`.** Not diffed. This row mirrors NVIDIA.
+- **Anything measured.** Nothing in this table was run. `gateable = no` still
+  holds, and a transcription of upstream is a reference, never a test.
+
+### The two live questions vLLM now answers
+
+**#2477, `vt: cuda rmsnorm: weight dtype must match x`. The mismatch is on the
+ACTIVATION side, not the weight side, and there is exactly one site.**
+
+vLLM's answer to "what dtype are the RMSNorm weight and the activation" is: **both
+are the one model dtype, bf16**, and the kernel promotes both to f32 internally.
+The weight is bf16 because `GemmaRMSNorm` declares no dtype and is built under
+`set_default_torch_dtype(model_config.dtype)` (`model_loader/base_loader.py:53`),
+and because `default_weight_loader` casts the checkpoint tensor into that
+parameter. The activation is bf16 because `qwen3_next.py:424-431` chunks the gate
+off the bf16 GEMM output and never widens `q`. vLLM has **no** f32 activation
+entering a norm anywhere on this architecture's NVIDIA path, and it refuses the
+model outright if `model_config.dtype` is not bf16.
+
+In this tree all four QSA gammas are bf16 (`LoadNormBf16`,
+`qwen4_exp_weights.cpp:409`, `:411`, `:423`, `:425`), and two of the three
+`vt::RmsNorm` sites are bf16 on both operands: `qwen4_exp_qsa_block.cpp:632`
+normalizes `q_index_raw`, allocated at `hidden.dtype` (`:592`), and `:736`
+normalizes `k_raw`, also `hidden.dtype` (`:733`). **The third is not.**
+`:694` allocates `DBuf q_f32(d, DType::kF32, ...)`, `:696` splits the query and the
+output gate into it, and `:705` hands that f32 tensor to `vt::RmsNorm` beside the
+bf16 `w.q_norm`. `RmsNormKernelCuda`'s `VT_CHECK(w.dtype == x.dtype)`
+(`cuda_ops.cu:463`) then fires.
+
+**`:705` is the UNCONDITIONAL one, and that is what makes it the site rather than
+a candidate.** Its `x` is a literal `DType::kF32` allocation, so it mismatches a
+bf16 gamma whatever the model dtype resolves to. The other two track
+`hidden.dtype` and agree with the gamma whenever that is bf16, which the GGUF
+path fixes at `qwen4_exp_gguf_weights.cpp:206`. It also sits in `QsaBlockCore`
+(`qwen4_exp_qsa_block.cpp:417`) outside any `if (paged)`, so both arms reach it,
+including the paged one that `qwen4_exp_forward.cpp:449` actually calls.
+
+**One ordering caveat, stated because the issue asks for the order.** `:632` runs
+BEFORE `:705` in every QSA layer. If `hidden.dtype` were ever not bf16, `:632`
+would fire first and `:705` would never be reached. So `:705` is the site under
+the dtype this tree resolves; it is not proof that no earlier site can fire under
+a different one. A per-op trace, which #2477 already owes, settles that and
+nothing here replaces it.
+
+**Why it is CUDA-only.** `RmsNormKernel` on the CPU widens `w` and `x` to f32
+independently and folds the gemma `+1` into the widened weight
+(`src/vt/cpu/cpu_ops.cpp:546-566`). It accepts the mixed pair, which is why the
+same model serves on `--device cpu` and refuses on `--device cuda`. The generic
+dispatcher agrees with the CPU arm: `ops.cpp:1030` asks only `IsFloat` of each
+operand. So the CUDA equality check is stricter than this tree's own contract as
+well as than vLLM's.
+
+**What the fix is not.** Widening the check is the one repair vLLM does not
+support, because upstream's norm input is bf16 and an f32 one is a model-path
+buffer that is too wide, which no token gate can see (AGENTS.md, "Inherit vLLM
+defaults"). The f32 `q_f32` and the f32 `gate` exist to keep the sigmoid argument
+unrounded, a deviation this spec records at row 18 and which now has to be argued
+against `nvidia/qsa.py:425-427` rather than against transformers.
+
+This is a finding, not a repair. The wave that owns #2477 owns the change.
+
+**#2406, device-blind `quant_repack` on the hyper-connection weights.**
+
+vLLM's HC projections are **never quantized and never anything but bf16**. All
+three linears pass `quant_config=None` explicitly, and `params_dtype` is the
+literal `torch.bfloat16` rather than `model_config.dtype`
+(`nvidia/hyperconnection.py:102`, `:113`, `:122`; the two config sites are
+`nvidia/model.py:260` and `:436`, and the MTP one is `nvidia/mtp.py:229`). The
+layout it then expects on device is stated by the decode GEMM's own predicate:
+packed row-major `[N, K]`, `x.dtype == torch.bfloat16` **and**
+`weight.dtype == torch.bfloat16` (`nvidia/low_latency_gemm.py:95-96`), and the
+plan it looks up is keyed on the merged `(336, 10240)` HC shape
+(`:72-79`). The specialization is installed only over an
+`UnquantizedLinearMethod` (`:164`), which `quant_config=None` guarantees.
+
+**What that does and does not settle.** vLLM loads safetensors and never meets a
+Q8_0 hyper-connection weight, so this is not a proof that a keep-quant HC arm is
+wrong. It is a positive statement that upstream's HC path is designed around an
+unquantized bf16 row-major operand, and it is the strongest statement available
+about intent. The GGUF question itself stays with `llama-cpp-qwen4exp`, which is
+the only oracle that reads this file at all, and the argument recorded at
+`ops.cpp:2564-2583` stands on that oracle. What changes is that its **opening
+premise is now false**: it says vLLM "has never registered `qwen4_exp`", and vLLM
+has.
+
+**The concrete lever this hands #2406.** Dequantizing `hc_*_down` and `hc_*_up` to
+bf16 at load would mirror vLLM exactly, and it would remove all 194 of the
+repack-hazard tensors from the issue's population in one step, because a bf16
+weight never enters `OwnGgufQuantBlocks` and so never carries an i8mm marker. That
+is a trade against memory and against llama.cpp's own choice to keep them typed,
+so it is a decision for #2406's owner and not a conclusion of this pass.
 
 ### Gateability
 
-`gateable = no` at the time of writing, and the reason is memory rather than
-software: see `## Hardware`. The oracle must demonstrably build **and run the
-model**, and no published artifact fits any fleet device. The first wave's real
-deliverable is the arm that makes an oracle run possible at all.
+`gateable = no` for the vLLM oracle on this row, and the reason is unchanged and is
+memory rather than software: see `## Hardware`. An oracle must demonstrably build
+**and run the model**, and no published artifact fits any fleet device. Registration
+is not gateability. `e126687a9a` gives this row an authoritative **source** to mirror
+today; it does not yet give it a denominator, and nothing in this section should be
+read as claiming one.
 
 ## Upstream chain
 
 | Source | Revision | Role |
 |---|---|---|
-| `huggingface/transformers` | **`v5.16.0`** (lane pin; first release containing `qwen4_exp`, landed by `#48337` merged 2026-08-26) | algorithm; `models/qwen4_exp/modular_qwen4_exp.py` is the authored delta, `modeling_qwen4_exp.py` the generated expansion |
-| `vllm-project/vllm` | `origin/main` `6a5e8f5979` (survey only; the parity pin stays `555967922`) | ops |
+| `huggingface/transformers` | `v5.16.0` (first release containing `qwen4_exp`, landed by `#48337` merged 2026-08-26) | **secondary since 2026-08-31**, demoted from algorithm to preprocessing and checkpoint semantics; `models/qwen4_exp/modular_qwen4_exp.py` is the authored delta, `modeling_qwen4_exp.py` the generated expansion |
+| `vllm-project/vllm` | **`e126687a9a`** (`[Model] Support Qwen3.8-Flash-Next (#53896)`, 2026-08-31; **NOT reachable from the parity pin `555967922`, and 595 commits ahead of it**, so every anchor into it is a forward reference to an unpinned upstream) | **primary**: algorithm, ops, defaults, dtype policy, refusals, cache shapes and naming, at `vllm/models/qwen4_exp/` with `nvidia/` and `amd/` backends |
 | `Qwen/Qwen3.8-Flash-Next` | HF `main`, read 2026-08-26 | config and weights |
 
 Read the **modular** file, not the generated one. It is 1186 lines against 2707 and
 it is the file that states what is inherited unchanged, which is most of the model.
+
+On the vLLM side read `nvidia/`, not `amd/`. The two are the same shape and this
+row's target is CUDA; where they differ the NVIDIA path is the one to mirror, and
+any component where they diverge is called out in the reconciliation above.
 
 ## Our baseline
 
@@ -206,14 +371,20 @@ of that. The port is the delta below.
 | Indexer side cache | `Cache.update_indexer` | `MLAAttentionSpec(num_kv_heads=1, head_size=128, tokens_per_state=4)` + `get_compressed_slot_mapping`, as-is; M3 supplies only the registration precedent | new KV spec |
 | Gated Residual | `Qwen4ExpTextGatedResidual` | `layers/mhc.py`, `kernels/mhc/*` (**different math**, same fused shape) | partial: `deepseek_v4_mhc.cpp` |
 | MoE 512 / top-10 + 1 shared / intermediate 640 | `Qwen4ExpTextSparseMoeBlock` | FusedMoE, grouped GEMM | HAVE, shape change only |
-| MTP, 1 layer, `hybrid: true` | config `mtp` | `qwen3_5_mtp.py` | HAVE, needs extension |
-| PLE dilated depthwise conv | `Qwen4ExpTextPLELayer._short_conv` | **NONE** | new, no vLLM op |
-| N-gram hashed embedding | `Qwen4ExpTextNGramEmbedding` | **NONE** | new, no vLLM op |
+| MTP, 1 layer, `hybrid: true` | config `mtp` | **`nvidia/mtp.py`**, `Qwen4ExpMTP` registered at `registry.py:670`, since 2026-08-31; `qwen3_5_mtp.py` is no longer the nearest form | NOT implemented for this model, `## Owed` |
+| PLE dilated depthwise conv | `Qwen4ExpTextPLELayer._short_conv` | **`nvidia/ple_layer.py:592-601`** since 2026-08-31: `nn.Conv1d(groups=hc*H, dilation=ngram_size)` plus a short-conv state. Was `NONE` | new when written; mirror the vLLM form now |
+| N-gram hashed embedding | `Qwen4ExpTextNGramEmbedding` | **`nvidia/ple_layer.py:240-436`** since 2026-08-31: splitmix64 multipliers, xor mix, per-head prime vocabulary. Was `NONE` | new when written; mirror the vLLM form now |
 | Vision tower | `Qwen4ExpVisionModel` = `Qwen3_5MoeVisionModel` | qwen3_5 vision | HAVE. `deepstack_visual_indexes: []`, so no deepstack |
 
-**Exactly two components have no vLLM op**, and they are the two where transformers
-is the sole source and we author the kernel ourselves. Everything else has an
-optimized vLLM form to mirror, and mirroring it is mandatory rather than optional.
+**That was true until 2026-08-31 and it is not true now.** The sentence this
+paragraph replaces read "exactly two components have no vLLM op", and the two it
+named were the PLE conv and the n-gram embedding. `e126687a9a` implements both.
+**No component of this model except the vision tower is now without a vLLM form**,
+so nothing here is authored from transformers alone any more, and the two rows the
+change touches are marked above. See `### Component-by-component reconciliation`
+for what each one does and where this tree agrees with it. Mirroring the vLLM form
+is mandatory rather than optional, and that obligation now reaches every row of
+this table.
 
 ### QSA maps to DeepSeek-V4's C4 indexer lane, NOT to MiniMax-M3
 
@@ -3898,6 +4069,104 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+### PREFILLDIV: the MoE second source, and the instrument it needs (#2552)
+
+Wave PREFILLDIV isolated TWO sources of CPU/CUDA prefill divergence at decoder
+layer 0, the only layer whose input is bit-identical on both CUDA arms. The
+first is the chunked Gated DeltaNet prefill and it is NOT a defect: it mirrors
+vLLM's own Flash-Linear-Attention precision map at every anchor (evidence file
+§4). The second is the MoE block, which turns a `2.1e-05` input difference into
+a `7.269e-05` output difference and which `VT_GDN_CHUNKED=0` barely moves
+(1.7x, against 332x on the Gated DeltaNet tap).
+
+**It lands NOT DIAGNOSED and it is owed.** `VT_Q4EXP_LAYER_FP` taps values, and
+a value tap cannot separate an expert-selection flip from re-association in
+`vt::MatmulBTQuantGrouped`. The instrument that can is a tap on the SELECTED
+EXPERT IDS per token per layer, asserting set equality and printing the margin
+between the last selected and the first rejected logit — a discrete selection
+has bimodal error, not a tolerance.
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) owns it.
+
+**Also owed by this wave, and smaller.** The `q4fp` line is a `sum|x|`
+aggregate. It is coarse enough that it read `0.000e+00` for
+`vt::Qwen4ExpGatedResidual`, which is the correct answer at this operand
+distribution and is not a proof of bit-identity element by element. A tap that
+needs to claim bit-identity should compare bytes, not an aggregate.
+
+- **THE `device_token_ids` CONTRACT IS ADVISORY, AND FIVE MORE ARCHITECTURES
+  IGNORE IT ([#2544](https://github.com/mudler/vllm.cpp/issues/2544)).** DECODEDIV
+  fixed `qwen4_exp`'s half of this and did not fix the general one. The runner
+  assigns `forward_input.device_token_ids` unconditionally whenever the async
+  mirror is engaged — which is the default on CUDA — while the field's own comment
+  still claims "a model that ignores it is simply never given one". A forward that
+  ignores it embeds a host array the runner never wrote for a decode row, and
+  `token_ids_cpu` is zero-initialised, so the model generates from token id 0 for
+  ever. That is [#1305](https://github.com/mudler/vllm.cpp/issues/1305) and #2496,
+  twice, and `grep -rl 'device_token_ids\|DeviceTokenIds'` finds no translation
+  unit for `DeepseekV4ForCausalLM`, `Glm5NextForConditionalGeneration`,
+  `glm_moe_dsa`, `Laguna` or `KimiK3`. Each is a CANDIDATE and not a conviction —
+  the issue is filed on a grep and says so — and convicting one needs the same
+  measurement, which needs its checkpoint and its GPU time. The item this row
+  really owes is not five ports: it is making the contract ENFORCEABLE, so a
+  forward that ignores a live `device_token_ids` is refused by name instead of
+  silently decoding from the previous step's identifiers. `VT_ASYNC_RUNNER=0` is
+  the same-binary rollback meanwhile.
+
+- **THE N-GRAM HASH IS A HOST COMPUTATION, AND THAT IS WHAT COSTS A DRAIN PER
+  STEP (#2496).** `ForwardQwen4ExpForConditionalGeneration` now materialises the
+  device identifiers on the host, because `RunQwen4ExpPleBlock` hashes the raw ids
+  in host int64 arithmetic (`qwen4_exp::BuildNGramIds`, the port of transformers
+  5.16.0 `_splitmix64`, :979-983) and advances the n-gram context the next step
+  reads. `detail::ApplyDeviceTokenIds` would repair the embed alone and leave the
+  hash reading zeros, so the copy plus drain is forced rather than chosen. It is
+  the synchronise ENG-ASYNC-SCHED W4 removed, paid once per step on this
+  architecture. Upstream does not pay it: `vllm/models/qwen4_exp/nvidia/ple_layer.py`
+  computes the ids in a device custom op, `torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids`,
+  over a device `ngram_context` (read at `191cecd51e`, a FORWARD reference past
+  this row's pin at `5559679229`). Porting that op is what buys the drain back,
+  and it is a wave, not a line.
+
+- **WHAT THE 2026-08-31 vLLM LANDING OWES THIS ROW (Q4RECONCILE, #2489).** The
+  oracle reconciliation is done and the divergences are classified in
+  `### Component-by-component reconciliation`. What it did not do is act on any of
+  them, and each item below needs its own wave, its own issue and its own gate.
+  They are listed so the next reader inherits a list rather than a rediscovery.
+
+  - **The f32 QSA query into `vt::RmsNorm` (verdict (a),
+    [#2477](https://github.com/mudler/vllm.cpp/issues/2477)).** Upstream's norm
+    input is bf16 and this tree's is f32 at exactly one site,
+    `qwen4_exp_qsa_block.cpp:705`. Owned by the wave on #2477.
+  - **The keep-quant hyper-connection arm (verdict (b),
+    [#2406](https://github.com/mudler/vllm.cpp/issues/2406)).** vLLM's HC
+    projections are unquantized bf16 by explicit construction. Owned by #2406.
+  - **The merged HC down-plus-inject GEMM (verdict (b)).** Upstream stacks them
+    into one padded `MergedColumnParallelLinear`; this tree runs three GEMMs. It
+    is a `vt::MergedGemmGroup` seam question and has NO issue yet.
+  - **The deferred, norm-fused HC combine (verdict (b)).** Upstream reads the
+    residual once; this tree reads it twice. NO issue yet.
+  - **The f32 QSA output gate (verdict (b)).** Upstream sigmoids a bf16 gate. It
+    rides with #2477 because it is the same buffer.
+  - **The single indexer side cache and the every-step re-pool (verdict (b)).**
+    Upstream keeps a raw ring plus a persistent compressed cache, both bf16 by
+    construction; this tree keeps one cache at `ResolveKvCacheDType()` and rebuilds
+    the pooled keys every step. NO issue yet, and the cost grows with context.
+  - **The mRoPE position tail on the raw side cache (verdict (c) today, (a) on
+    the image path).** Upstream stores the exact three-axis position beside each
+    raw key. This tree forces the three axes equal and ropes at `b * CR`, which is
+    correct only while they are equal. It becomes wrong the moment the image or
+    video path lands, and that path is already owed.
+  - **MTP.** `Qwen4ExpMTP` is registered upstream and implemented at
+    `nvidia/mtp.py`; this tree parses `mtp_num_hidden_layers` and consumes it
+    nowhere. Previously owed against `qwen3_5_mtp.py` as the nearest form; it is
+    now owed against a real upstream implementation of this model's own drafter.
+  - **The decode GEMM plan table.** `nvidia/low_latency_gemm.py` carries measured
+    skinny-GEMM configurations keyed on this model's shapes. It is a lever, not a
+    gap, and it cannot be evaluated until a device exists.
+  - **Three things this pass could not determine** and which are therefore still
+    open questions rather than agreements: the top-k tie semantics, the recurrent
+    KV group against upstream's two new state classmethods, and the vision path.
+    See `### What this pass could NOT determine`.
+
 - **WHAT #2396 CHANGES FOR THIS ROW, AND WHAT STILL BLOCKS A CUDA FORWARD AFTER
   IT. TRACED IN THE CODE, NOT PREDICTED FROM THE PULL REQUEST.** #2396 adds
   `kEmbeddingQuant`, gives `EmbeddingKernelCuda` a block-decoding arm and makes
@@ -3908,6 +4177,20 @@ All six mutations were re-run after this refactor.
   is no `kEmbeddingQuant` OpId". They appear in the PR body,
   `tests/vllm/models/test_qwen4_exp_cuda.cpp` (the SCOPE paragraph) and in this
   spec.
+
+  **OUTCOME, RECORDED BECAUSE THE PREDICTION WAS ONLY TWO-THIRDS RIGHT.** Both
+  merged within an hour: #2391 (`27aaf199a`) then #2396 (`f937e8063`). KGATHER's
+  author reconciled `docs/FEATURES.md` -- the row now reads "ALL SIX ... NOW HAVE
+  CUDA ARMS ... **THAT LEAVES THE GATHER, AND KGATHER LANDED IT**", one story
+  rather than two, and the contradiction this entry warned about did NOT survive
+  -- and repaired the SCOPE paragraph in `test_qwen4_exp_cuda.cpp`. **The spec
+  was the location that was missed**: three live claims in
+  `### The neighbouring suites, and the LOAD-TIME refusal that settles
+  reachability` survived on `main` stating a gap that KGATHER had closed, one of
+  them with a literal `grep -c` that had changed answer. Repaired above by the
+  wave that wrote them, tracked by
+  [#2443](https://github.com/mudler/vllm.cpp/issues/2443). Nothing is
+  outstanding.
 
   **THE MODEL STILL WILL NOT RUN A CUDA FORWARD, AND THE REASON MOVES FROM THE
   LOADER INTO THE QSA BLOCK.** `qwen4_exp_forward.cpp` builds its rope tables as
@@ -7933,7 +8216,33 @@ checkpoint, which the on-disk device-fit guard (issue #1123) cannot see. The
 CUDA gather arm is owed. Load this model with --device cpu.
 ```
 
-So on a CUDA build this architecture **does not load**, and the refusal is at
+**EVERYTHING FROM HERE TO THE END OF THIS SUBSECTION WAS TRUE WHEN W6-CUDA-B
+MEASURED IT AND IS FALSE ON `main` NOW.** KGATHER (#2396, `f937e8063`) landed
+after W6-CUDA-B (#2391, `27aaf199a`) and closed the gap this subsection is
+about. It is kept rather than deleted because the measurement below is what the
+gate actually observed on `thor:gpu0`, and a record that quietly loses its own
+superseded reading cannot be audited; the correction rides here instead.
+
+WHAT CHANGED, checked against `main` rather than against the pull request:
+`include/vt/ops.h` now has `kEmbeddingQuant` (`grep -c` is **2**, not 0),
+`gguf_keep_quant.cpp`'s `DeviceQuantGatherSupported` is now
+`return vt::OpRegistered(vt::OpId::kEmbeddingQuant, dev);` rather than
+`dev == kCPU`, and `EmbeddingKernelCuda` decodes a block-quantized table instead
+of refusing one -- its "unsupported table dtype" string still exists, but it no
+longer covers the block case, so citing it as the gather's blocker is
+misleading now even though the string is still greppable. **So a `qwen4exp`
+GGUF LOADS on a CUDA device today.**
+
+WHAT DID NOT CHANGE, and is the reason this row still claims no GPU run: the
+three host reads in `qwen4_exp_qsa_block.cpp` (`CheckRopeLayoutsAgree`,
+`IndexerRows`, `Qwen4ExpQsaIndex`) are still on `main`, and
+`IsCudaKeepQuantSupported` still excludes IQ4_NL and Q5_0, which the released
+UD-IQ1_S uses. Both are live waves' territory. **No token has come out of a GPU
+and none is claimed.**
+
+The superseded reading follows, as W6-CUDA-B recorded it:
+
+So on a CUDA build this architecture **did not load**, and the refusal was at
 LOAD time rather than at the first forward.
 
 **THE REFUSAL IS CONDITIONAL, AND THE SENTENCE ABOVE SAID "AT ALL" WHERE IT
@@ -7951,13 +8260,14 @@ M8's, and the two agree: M8 says nothing in production reaches these kernels;
 this says nothing in production can even construct the model that would. Both are
 measured.
 
-`DeviceQuantGatherSupported` returns `dev == vt::DeviceType::kCPU` and nothing
-else (`gguf_keep_quant.cpp`), `EmbeddingKernelCuda` refuses a table that is not
-f32/bf16 by name (`cuda_ops.cu`, "cuda embedding: unsupported table dtype
-(f32/bf16 only)"), and **there is no `kEmbeddingQuant` OpId at all** — `grep -c
-kEmbeddingQuant include/vt/ops.h` is 0. Three independent readings of one gap.
-Closing it is another wave's file territory; this wave does not touch it, and
-does not work around it.
+At the time of that run `DeviceQuantGatherSupported` returned
+`dev == vt::DeviceType::kCPU` and nothing else (`gguf_keep_quant.cpp`),
+`EmbeddingKernelCuda` refused a table that is not f32/bf16 by name, and there was
+no `kEmbeddingQuant` OpId at all — `grep -c kEmbeddingQuant include/vt/ops.h`
+was 0. Three independent readings of one gap. **All three are false on `main`
+now**; KGATHER closed that gap and the paragraph opening this subsection carries
+the current values. Closing it was another wave's file territory, and that wave
+closed it.
 
 ## Mutation record — W8CONFIRM (#2031, issue OWED)
 
@@ -8051,6 +8361,323 @@ No speed number: every arm is n=1 on a shared box. UD-IQ1_S only, one sequence,
 attributes to the `step == nullptr` branch of `BuildCompletionLogProbs`; nothing
 here reads them.
 
+## DECODEDIV (#2496) — the CUDA decode divergence, and the instrument that names it
+
+**Scope.** One defect: on `thor:gpu0`, over the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact through `examples/server`,
+greedy, `max_tokens=8`, the CUDA arm emits `11751 271 271 271 271 271 0 0` where
+the CPU control on the same tree and the same file emits
+`11751 13 15767 411 2029 11 1092 369`. Token 0 agrees. This wave finds the cause
+and fixes it. It changes no behaviour the CPU arm has today.
+
+**What the measurement already excludes,** each by measurement rather than by
+argument, and each recorded on [#2496](https://github.com/mudler/vllm.cpp/issues/2496):
+
+* the GDN adapter lifetime defect ([#2476](https://github.com/mudler/vllm.cpp/issues/2476),
+  fixed by [#2509](https://github.com/mudler/vllm.cpp/issues/2509)) — a freed
+  operand returns what the allocator left there, not the launch-blocking arm's
+  exact sequence;
+* timing, ordering and the whole async-copy class — the production and
+  `CUDA_LAUNCH_BLOCKING=1` sequences are byte-identical, and both are identical
+  to the original pre-fix measurement on a different tree;
+* the GDN QKVZ GEMM extents — every operand extent agrees with its allocation at
+  `T=5` and at `T=1`;
+* the f32 QSA query buffer ([#2488](https://github.com/mudler/vllm.cpp/issues/2488))
+  — no device branch and no prefill/decode fork, so it is present on the CORRECT
+  CPU run too;
+* the PLE n-gram history read ([#2504](https://github.com/mudler/vllm.cpp/issues/2504))
+  — a real defect, fixed and gated, and it moved the output not at all.
+
+**The shape that survives.** A correct token 0 with a bit-stable wrong decode is
+state that the second step carries, computed differently on the two arms. The
+list of such state is short and this spec can enumerate it, which is what makes
+the wave finite: within one step every buffer the forward writes is also read
+back by that same step EXCEPT three. The paged K/V and the indexer side cache are
+written and then read inside the prefill, so a defect in either is visible in
+token 0. The three that are written at prefill and first read at decode are
+
+1. the GDN conv ring and the GDN temporal state (`MambaSpec` states 0 and 1),
+2. the PLE conv ring (`MambaSpec` state 2),
+3. the PLE n-gram history (`MambaSpec` state 3).
+
+**Method — the instrument comes before the hypothesis.** A whole-output symptom
+cannot name a tensor, so the first artifact of this wave is a comparison, not a
+fix: `test_qwen4_exp_layer_loop.cpp`'s `#2496` case drives one prefill and one
+decode through `ModelRegistry::Forward` on a CPU queue and on a CUDA queue over
+one fixture and one pinned pair of token ids, and reports, in order, the prefill
+logits, every persistent buffer above, and the decode logits. The FIRST row that
+disagrees is the finding. The second step's token is a constant rather than the
+first step's argmax, because sampling per arm would feed the two arms different
+ids the moment the prefill logits differ at all.
+
+**What the instrument cannot see, stated before it is run.** `qwen4_exp_gguf_fixture.h`
+is a miniature whose layer-3 activations sit near 2^18, where one bf16 ULP is
+~1024; W5j measured 0 of 192 paged K/V words moving across two different prompts
+on it. A CPU/CUDA difference small enough to be absorbed by that store is
+invisible here, so a green result is NOT a claim that the device arm decodes
+correctly at released width. It is the statement that the difference is not one
+this fixture can hold, and the wave then escalates to the released artifact.
+
+**Gates.** The focused gate is the new case plus `test_qwen4_exp_layer_loop`,
+`test_qwen4_exp_cuda` and `test_qwen4_exp_cuda_reductions` on `thor:gpu0`
+(`sm_110`, the only device in the fleet at this capability), inside an `rc`
+lease. The wave's acceptance gate is the released artifact through
+`examples/server`: **the GPU must emit `11751 13 15767 411 2029 11 1092 369`**.
+Nothing short of that token sequence is a fix, and a green hermetic case is not a
+substitute for it.
+
+### Outcome — the first tensor that diverged, and what it named
+
+**The instrument answered on the first run, and it named a tensor rather than a
+layer.** `VT_Q4EXP_STATE_FP=1` on `thor:gpu0`, the released UD-IQ1_S artifact,
+`--device cuda` against `--device cpu`, one prompt, greedy, `max_tokens=8`. Every
+persistent state agrees after the prefill. The FIRST divergence is at **step 1,
+the first decode, in the PLE n-gram history**, and it is exact:
+
+| step | `--device cpu` | `--device cuda` |
+|---|---|---|
+| 0 (prefill, T=5) | `[9338, 369]` | `[9338, 369]` |
+| 1 | `[369, 11751]` | `[369, 0]` |
+| 2 | `[11751, 13]` | `[0, 0]` |
+| 3-7 | rolls the sampled ids | `[0, 0]` |
+
+The history is int64 TOKEN IDS, so this cannot be a rounding difference and needs
+no tolerance to read. The FIFO rolled correctly on both arms — `369` moved from
+slot 1 to slot 0 — and what the device arm PUSHED was `0` where the host arm
+pushed the token that had just been sampled.
+
+**So the defect was never in a state at all.** The history is advanced from
+`input_ids`, so a zero pushed means the forward was HANDED token id 0. The cause
+is `ModelForwardInput::device_token_ids`: the asynchronous runner's combine
+splices each decode row's sampled token into a DEVICE buffer on the main queue
+and deliberately leaves the host `token_ids` stale, and this hook read the host
+vector. `token_ids_cpu` is zero-initialised, so every decode row embedded and
+hashed id 0. TWELVE other translation units already consume that field under
+[#1305](https://github.com/mudler/vllm.cpp/issues/1305), which is the same defect
+on Qwen3-MoE.
+
+**That explains every constraint the issue had accumulated**, which is the test a
+cause has to pass: token 0 is right because a prefill row is not a decode row;
+the decode is wrong from the first step because every decode row is; it is
+bit-stable across builds and trees because zero is a constant, not a race; and
+`CUDA_LAUNCH_BLOCKING=1` cannot move it because nothing here is a launch order.
+It also explains why the REPORTED ids stayed plausible — they are the argmax of
+each step's logits, and what was broken is the FEEDBACK, not the sampler.
+
+**AND IT CORRECTS THIS SPEC'S OWN FRAMING.** The scope above enumerates three
+write-at-prefill / read-at-decode states and calls that list what makes the wave
+finite. The list was right and the conclusion drawn from it was not: the
+divergence was in one of those three, and the CAUSE was upstream of all of them,
+in an input the forward is handed. An enumeration of state can locate a symptom;
+it cannot bound where the symptom comes from.
+
+**What the hermetic case could not have found.** It passes `device_token_ids ==
+nullptr` on both arms, because a test builds `ModelForwardInput` by hand. It was
+still the right first instrument — it costs no GPU and it would have convicted any
+of the three states — but the defect lives in a field only the runner sets, which
+is why the released-artifact fingerprint is the arm that answered.
+
+**Stop conditions.** Stop and report rather than widen scope if: the hermetic
+comparison is green AND the released-artifact run still diverges (the fixture
+cannot hold the difference — report that as the finding and escalate to a
+per-layer tap on the real artifact); the divergence is in a `vt::` op with an
+existing CPU-vs-CUDA gate that the defect passes (the gate's coverage is the
+defect, and widening it is its own change); or `thor:gpu0` is out of the pool,
+in which case the sm_110 axis is UNMEASURED and says so.
+
+## Wave PREFILLDIV — the CUDA prefill diverges from the CPU prefill (#2547)
+
+### What this wave is for
+
+[#2496](https://github.com/mudler/vllm.cpp/issues/2496) is fixed -- its fix
+LANDED as [#2550](https://github.com/mudler/vllm.cpp/pull/2550) at `bb78d1ee8`,
+so this wave's measurement tree is now the composition `main` carries -- and the
+CUDA arm is fluent. It is not token-exact:
+
+| arm | token ids |
+|---|---|
+| `--device cpu` | `11751 13 15767 411 2029 11 1092 369` |
+| `--device cuda` | `11751 13 15767 411 1928 11 628 567` |
+
+Five of eight agree and the first disagreement is at token 4.
+[#2547](https://github.com/mudler/vllm.cpp/issues/2547) measured that the
+difference is NOT carried decode state: the PLE n-gram history rolls identically
+on both arms, and the model's own output at **step 0** already differs —
+`sumabs 28054.1` on CPU against `27964.7` on CUDA over `n=12800`, about 0.3%.
+The divergence is therefore in the PREFILL, before any decode state is read.
+
+**"Prefill is right" was never measured.** It rested on token 0 agreeing, and
+` Paris` after `The capital of France is` is not a near-tie, so a single argmax
+survived a divergence that was already there. This wave replaces the argmax with
+a per-tap fingerprint.
+
+### Scope
+
+IN: a per-layer, per-tap CPU-vs-CUDA fingerprint of the `qwen4_exp` forward; the
+one arithmetic divergence it names; the fix for that divergence; the
+red-then-green transcript through `ModelRegistry::Forward`.
+
+OUT: speed of any arm, `num_reqs > 1`, the positional arm's second step, and
+every `## Owed` entry this row already carries. A second divergence the
+instrument finds AFTER the first one is fixed belongs to a following wave and to
+its own issue.
+
+### Design — the instrument, and why the layer axis is the one that was missing
+
+`VT_Q4EXP_STATE_FP` (#2496) prints the layer loop's OUTPUT once per step. It has
+no LAYER axis, so it can say that the two arms disagree and not where. This wave
+adds `VT_Q4EXP_LAYER_FP=<steps>`, which prints one line per tap per layer for the
+first `<steps>` forward calls:
+
+```
+q4fp step=0 L07 tag=blk        dtype=bf16 dev=1 n=12800 nonfinite=0 maxabs=... sumabs=... v=...
+```
+
+The taps are placed so that a difference can be attributed to ONE op:
+`emb`, `wide`, then per layer `in`, `ple`, `ahc.mixed`, `ahc.inj`, `blk`, `s1`,
+`mhc.mixed`, `mhc.inj`, `moe`, `s2`, and finally `out`. `layer_types` puts a GDN
+layer at 0, the PLE layer at 2 and the first QSA layer at 3, so the first tap
+that leaves its own arm-vs-arm band names the op:
+
+| first divergent tag | implicates |
+|---|---|
+| `emb` / `wide` | the embedding gather or the widen |
+| `L00 ahc.mixed` | `vt::Qwen4ExpGatedResidual` — the mixer |
+| `L00 blk` | `RunGdnBlockPaged` |
+| `L02 ple` | `RunQwen4ExpPleBlock` |
+| `L03 blk` | `RunQwen4ExpQsaBlockPaged` |
+| any `moe` | `RunQwen4ExpMoeBlock` |
+
+**IT PRINTS THE DTYPE, and that is not decoration.** A token gate cannot see a
+dtype and a value gate cannot see a lifetime; both failures are on this row's
+record already (#2493, #2476). A tap that reported values alone would pass a
+buffer that is f32 on one arm and bf16 on the other while moving twice the bytes.
+
+**IT COUNTS ITS OWN TAPS.** The last line of a fingerprinted step is
+`q4fp step=<s> taps=<n>`, so a run that measured nothing is distinguishable from
+a run whose taps agreed. A grep that matches nothing is not evidence of absence,
+and this row has already paid for an instrument that never ran: the
+`q4exp-gdngemm` job looked for `$BLD/vllm-server` while ninja links
+`$BLD/examples/vllm-server`, and it measured nothing at rc 0.
+
+**IT SYNCHRONISES, and that is stated rather than hidden.** Each tap copies the
+tensor to the host and drains the queue, so this instrument CANNOT see a race.
+It is admissible here only because #2547 measured the divergence as bit-stable
+across builds, trees and `CUDA_LAUNCH_BLOCKING`, which is a deterministic
+arithmetic difference and not a race. A NEW symptom that appears only without the
+instrument is a race and belongs to a different method.
+
+### Risks
+
+- **The two arms disagree everywhere at some magnitude.** Every kernel on this
+  path is a separate CPU and CUDA implementation, so no tap is bit-identical and
+  "the first tap that differs" is not by itself the answer. The reading is the
+  first tap where the relative difference JUMPS by orders of magnitude over the
+  taps before it.
+- **A tolerance that passes its own suite can still be too loose.**
+  `test_qwen4_exp_cuda` is green at 351/351; that bounds each op against its own
+  band, not the composition against the CPU arm.
+- **The instrument perturbs the schedule.** See above: admissible only because
+  the symptom is bit-stable.
+
+### Gates
+
+```sh
+ctest --test-dir "$BLD" -R 'qwen4_exp' --output-on-failure
+```
+
+plus, on `thor:gpu0` (`sm_110`), the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact through
+`examples/vllm-server` on one binary, both arms, greedy, `max_tokens=8`, prompt
+`The capital of France is`, reporting both token id sequences verbatim.
+
+### Evidence required
+
+1. The fingerprint tables from both arms, and the first tap whose relative
+   difference jumps.
+2. The upstream `file:line` and revision for the arithmetic the fix restores.
+3. Red-then-green on a test that enters through `ModelRegistry::Forward` on a
+   `--device cuda` queue.
+4. A reachability mutation that deletes the production call site and reds.
+5. Both token id sequences, and an explicit statement of which ids agree.
+6. Every build and gate rc read literally, never derived from a pipe.
+
+### Stop conditions
+
+Stop and report if the instrument shows the first jump inside an op whose repair
+moves a shared seam's contract; that needs its own spec and its own issue. Stop
+if the released artifact cannot be staged, and report `PENDING` rather than
+substituting another checkpoint.
+
+### Outcome
+
+**MEASURED, AND IT FALSIFIES THIS WAVE'S OWN PREMISE.** Full result in
+[the evidence file](../../docs/bench-evidence/qwen4exp-cuda-prefill-divergence-20260902.md);
+`thor:gpu0`, `sm_110`, one binary
+`c3b355deb75efb0071fe6ec21d5067f5e2520722c672487fd67939c363e1ee58`, three arms,
+437 taps per step on every one of them.
+
+**The first tensor that differs is decoder layer 0's Gated DeltaNet block
+output**, `rel(sum|x|) = 3.525e-04`, produced from an input that is BIT-IDENTICAL
+on both arms — `emb`, `wide`, `L00 in`, `L00 ahc.mix` and `L00 ahc.inj` all read
+`0.000e+00`.
+
+**That clears the only named candidate by measurement.** #2547 named
+`vt::Qwen4ExpGatedResidual`'s CUDA arm as the largest non-bit-identical surface
+on the path, on the strength of the source's own admission that its device GEMM
+re-associates the K reduction. On the released weights at the model's real width
+it is bit-identical to its CPU sibling at both hyper-connection sites of layer 0.
+The re-association is absorbed by the bf16 store. Reading a source comment is not
+a measurement, and this is the second time on this row that a candidate named
+that way did not survive one.
+
+**The mechanism is the chunked prefill decomposition, and the proof is a
+same-binary A/B.** `VT_GDN_CHUNKED=0` routes the CUDA arm to `GdnScanCuda`, the
+same sequential recurrence the CPU arm runs, and `L00 blk` falls to `1.062e-06`
+— **332x**. Layer 0 is the only layer that can carry this proof, because it is
+the only one whose input is bit-identical on both CUDA arms; every later `blk`
+measures propagation.
+
+**AND IT IS NOT A DEFECT.** vLLM's vendored Flash-Linear-Attention kernel keeps
+`h`, `u`, `w` and `v_new` in bf16 with fp32 accumulation, `A` in fp32 for the
+triangular solve, and `final_state` in fp32 — and our chunked port matches all
+five, anchor by anchor (evidence §4, vLLM `5559679229`, a forward reference).
+The CUDA arm mirrors the oracle. **The CPU arm's exact sequential f32 recurrence
+is the arm that does not**, and it is more accurate than vLLM rather than more
+correct. Moving CUDA onto the CPU arm would move it away from vLLM.
+
+**The GPU does not emit the control sequence, and the honest count is:**
+
+| arm | ids | agrees |
+|---|---|---|
+| `--device cpu` | `11751 13 15767 411 2029 11 1092 369` | the control |
+| `--device cuda` | `11751 13 15767 411 1928 11 628 567` | 5 of 8 |
+| `--device cuda`, `VT_GDN_CHUNKED=0` | `11751 13 15767 264 1103 314 5656 321` | 3 of 8 |
+
+**The sequential arm is 2.8x closer on the hidden state and agrees on FEWER
+ids** (`out` rel `1.130e-03` against `3.189e-03`). Token agreement between our
+two arms is not monotone in the distance between them, because the decode is an
+argmax over near-ties. A CPU-vs-CUDA token-exactness gate is therefore not well
+posed for this architecture at this precision, and this wave does not propose
+one.
+
+**What is still open is the SECOND source.** Layer 0 separates it: with the GDN
+contribution removed, `L00 moe` still differs by `7.269e-05` from an input
+differing by `2.1e-05`, and `L00 s.mlp` barely moves (`7.160e-05` ->
+`6.815e-05`). The MoE block is the only remaining candidate for an actual defect
+on this path. It is named here and NOT diagnosed; the discriminating instrument
+it needs is a tap on the router's SELECTED EXPERT IDS asserting set equality and
+printing the margin, because a bf16 router logit over this model's expert count
+can flip a discrete selection and a flip is a large local change rather than a
+rounding one -- and a value-only tap can never tell that from re-association in
+the grouped keep-quant GEMM.
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) owns it.
+
+**What landed.** The instrument and its gate, and nothing else. There is no
+product-behaviour change in this wave, because the measurement says there is no
+defect at the first divergence to change.
+
+
 ## Now
 
 `ACTIVE`. **THE COUNT IS THE TABLE, AND THIS SENTENCE NO LONGER RESTATES IT.**
@@ -8104,6 +8731,7 @@ a row here, and every row says whether anything in production reaches it:
 | W6-CUDA | the first CUDA arms of this architecture: `vt::Qwen4ExpPleConv`, `vt::Qwen4ExpPleGate`, `vt::Qwen4ExpGatedResidualWriteBack` | **no, and VACUOUSLY so** — `ModelRegistry::Forward` is all-or-nothing and four ops plus `vt::RmsNormGroup` plus the block-decoding n-gram gather still have no CUDA arm, so no `qwen4_exp` step can reach a CUDA queue at all. The gate RAN on TWO architectures. `thor:gpu0` (`sm_110`, nvcc 13.0.88): 12 cases, 323 assertions, 322 passing, with the CPU arms matched BITWISE at 0 of 8772, 0 of 20480 and 0 across all 30 dtype combinations; 5 of 6 mutations red and M5 a compiler proof. The single failure was this suite's OWN oracle bound, which was re-derived and bitwise-backstopped. `dgx:gpu0` (`sm_121a`, GB10, nvcc 13.0.88) then ran the corrected suite green: 12 cases, 351 assertions, 351 passing, every rc READ rather than derived, and `cuobjdump` reporting `cuda_qwen4_exp_ple.cu.1.sm_121a.cubin` so the objects are genuinely built for that architecture. The two runs' mutation counts agree. Full result in the W6-CUDA section of `## Owed` | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W6-CUDA's own issue OWED |
 | W5-LOADIO | `VT_LOAD_STATS` reports on the GGUF branch, and `PrefaultBorrowedSpan` counts BYTES rather than only spans | **yes** — the timing and `ReportGgufLoadIo` sit on the `.gguf` branch of `LoadedEngine::FromModelDir`, the production loader entry point, so `VT_LOAD_STATS=1` on any GGUF model now prints `mmap+header`, `weights` and the prefault's bytes/seconds where it previously printed NOTHING. It deliberately does NOT call `ReportLoadBytes`, whose three counters are incremented on the safetensors path only and would print zeros for an artifact the load had just moved 67.56 GiB of. Gated by a new case in `test_gguf_keep_quant.cpp` asserting an EQUALITY over a double load, because `> 0` is satisfied by a counter wired to the span count, to a constant, or to the last span alone | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), its own issue OWED |
 | W5q | the RELEASED `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S artifact driven through `examples/server` on the COMPOSED W5p+LOAD-IO tree, staged to worker-local disk | **SERVES yes, USABLE TOKEN no** — the W5n refusal is gone: a 5-token prefill and eight decode steps run with `model_executed=1` each, nothing throws, and `POST /v1/completions` returns **HTTP 200** with 8 completion tokens where W5n got a 500. **Every one of those tokens is id 0**, which this checkpoint's own `tokenizer.ggml.tokens` gives as `!`, and the answer is BYTE-IDENTICAL for two prompts of different lengths. So the forward is degenerate and prompt-independent on the real weights. Load 61 s from local disk (against 4446 s from CIFS), `VmHWM` 73.935 GiB, gate 72 cases / 10,380 assertions / 0 failed / 0 skipped with the oracle golden unmoved at `0.00982457`. **The CAUSE is NOT identified**: `logprobs` was not requested, so nothing distinguishes NaN, zero and constant logits, and no per-op probe was run | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5q's own issue OWED |
+| DECODEDIV | the forward decodes on `ModelForwardInput::device_token_ids` instead of the host `token_ids` the asynchronous runner leaves stale for decode rows | **yes, and it FIXES the CUDA arm's output** — `ForwardQwen4ExpForConditionalGeneration` is the production hook, and on `thor:gpu0` over the released UD-IQ1_S artifact through `examples/server` with NO `CUDA_LAUNCH_BLOCKING` the `--device cuda` tokens go from `11751 271 271 271 271 271 0 0` to `11751 13 15767 411 1928 11 628 567`, against a CPU control of `11751 13 15767 411 2029 11 1092 369` re-taken on the same tree. The gate runs on a CPU QUEUE and still convicts, because the defect is which array the hook reads; the fix made inert reds it and a byte-for-byte restore greens it. **NOT token-exact** — the residual is measurable in the PREFILL hidden state at about 0.3% and is [#2547](https://github.com/mudler/vllm.cpp/issues/2547), not this | [#2496](https://github.com/mudler/vllm.cpp/issues/2496) |
 | W5r | the shared `dense_attn::ResidentWeight` stops dropping the load-time repack markers (`repacked`, `elem_kn_repacked`), and refuses to stage an `elem_kn_repacked` weight to a device | **yes, and W8CONFIRM PROVED IT IS THE FIX** (W5s asserted it; its `701606e51`-vs-`52f7ccbfc` comparison spans W5p too and cannot apportion) — `dense_attn_block.h:235-236` sits on the path `qwen4_exp_forward.cpp` takes for every hyper-connection mix weight, so on an aarch64 i8mm host the mixer stops reading `block_q8_0x4` bytes as flat `q8_0` across 48 layers x 2 sides plus the terminal mixer. W5r itself could neither run nor gate this: it was CPU-only on x86, where `vt::cpu::QuantRepackActive()` is false (`cpu_quant_repack_arm.cpp:275`) and the whole chain is inert, so its gate sets the flag BY HAND and asserts propagation. **W5s ran it on `thor`, where the chain is live** | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5r's own issue OWED |
 | W5s | the RELEASED UD-IQ1_S artifact re-driven on `origin/main` `52f7ccbfc` (W5p **and** W5r), four arms, one build, one staged copy | **SERVES yes, and the TOKENS ARE REAL** — `" Paris. Given this fact, what is"` and `" 100°C at sea level"` for two different prompts, eight distinct ids none of them 0, against W5q's eight consecutive id 0 on the same box and artifact. Reusing W7DIAG's read-only probe, the pre-W5r tree and this one agree numerically on `embed` and `after_widen` and diverge at exactly `stream.after_layer_0` (`nan=51200` -> `nan=0`); `LOGITS` was `zero=248320` with no maximum and is now `min -9.89818 max 15.7873`, argmax id 11751 = the `" Paris"` token. `VT_CPU_QUANT_REPACK=0` is byte-identical to the default, which is the correct outcome for a performance transform and the thing that was false before W5r. **NOT a token gate** (no oracle decoded these prompts; llama.cpp aborts in `build_delta_net_chunking`), no speed number, UD-IQ1_S only, one sequence. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W5s's own issue OWED |
 | W8CONFIRM | the SAME artifact on the SAME `52f7ccbfc` tarball, TWO binaries differing only in `dense_attn_block.h:235-236`, four arms in one lease | **CAUSE ISOLATED** — `X-ON` (fix reverted, repack ON) returns `"!!!!!!!!!!!!!!!!"` with `LOGITS zero=248320` and `after_layer_0 nan=51200`, while `X-OFF` (same binary, repack OFF) and both `M` arms return `" Paris. Given this fact, what is the capital of France?\n\n<think>\n"` bit-identically. Same binary either side of one environment variable, so the defect needs the repack chain ACTIVE and the markers DROPPED; W5p is in all four arms and cannot explain a difference between them. Four prompts across factual, narrative and code, all correct, one ending on the model's own EOS. Binaries `e18a38a6…` vs `cfdf47bd…`, mutation applied-proof `2 -> 0` fix lines. **NOT a token gate**, n=1, UD-IQ1_S only, `--device cpu` only. Lands NO product code | [#2031](https://github.com/mudler/vllm.cpp/issues/2031), W8CONFIRM's own issue OWED |

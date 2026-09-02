@@ -3556,17 +3556,21 @@ TEST_CASE("ltx2 ti2vid: the recipe is the PLAIN two-stage pipeline, not the HQ o
 
   // THE SCHEDULE ANCHOR, and the one field this arm could not be written with
   // before this row. That same `execute` call passes NO latent, so
-  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // `schedulers.py:32` resolves `tokens` to `default_number_of_tokens` = 4096
   // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
   // recipe below — is the ONE upstream site that passes `latent=empty_latent`,
   // and it is the control here precisely because it is the exception. Six other
-  // call sites side with this row; that the engine still derives from the
-  // target grid on three shipped arms is #1150.
+  // call sites side with this row, and #2521 moved the three shipped arms that
+  // still derived from the target grid onto the anchor as well.
   CHECK(s1.schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
   CHECK(res2s.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
-  // The default is today's behaviour, so nothing that predates this row moved.
-  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
-  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  // #2521 moved these two onto the anchor the other six call sites take.
+  // `ti2vid_one_stage.py:207` and `a2vid_two_stage.py:226` both pass no latent,
+  // and vLLM-Omni hard-codes the max anchor for the one-stage schedule
+  // (`ltx2_denoise.py:188`). `res2s` above stays the control BECAUSE it is
+  // upstream's exception, so this is still a 2-against-1 and not a constant.
+  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
 
   // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :266-267
   // sets none, so stage 1 starts from pure noise. #1013: at 0.0 the state stays
@@ -3821,17 +3825,19 @@ TEST_CASE("ltx2 keyframe: the recipe is the INTERPOLATION pipeline, not the plai
   CHECK_FALSE(distilled.phases[0].sigmas.empty());  // the control
 
   // THE SCHEDULE ANCHOR. That same `execute` call passes NO latent, so
-  // `schedulers.py:31` resolves `tokens` to `default_number_of_tokens` = 4096
+  // `schedulers.py:32` resolves `tokens` to `default_number_of_tokens` = 4096
   // rather than to the target grid. `ti2vid_two_stages_hq.py:267` — the res_2s
   // recipe — is the ONE upstream site that passes `latent=empty_latent`, and it
-  // is the control here precisely because it is the exception. That three other
-  // shipped arms still derive from the target grid is #1150, not this row.
+  // is the control here precisely because it is the exception. #2521 moved the
+  // three other shipped arms onto the anchor.
   CHECK(s1.schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
   CHECK(ti2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
   CHECK(res2s.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
-  // Nothing that predates this row moved.
-  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
-  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kTargetLatent);
+  // #2521: these two now take the anchor as well, and `res2s` above is still the
+  // one arm that does not — which is what keeps this a discrimination rather
+  // than a constant.
+  CHECK(one.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
+  CHECK(a2v.phases[0].schedule_tokens == vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault);
 
   // `ModalitySpec.noise_scale` defaults to 1.0 (utils/types.py:110) and :244-247
   // sets none, so stage 1 starts from pure noise. #1013: at 0.0 the state stays
@@ -3985,6 +3991,147 @@ TEST_CASE("ltx2 keyframe: the recipe is the INTERPOLATION pipeline, not the plai
   CHECK(ti2v.requires_distilled_lora);
   CHECK_FALSE(one.requires_distilled_lora);
   CHECK_FALSE(distilled.requires_distilled_lora);
+}
+
+TEST_CASE("ltx2 recipes: the sigma-shift anchor table, every arm that derives a schedule") {
+  // #2521. The arm-by-arm claim in one place, so that "which anchor does this
+  // arm take" is a table a reader can run rather than a property spread over
+  // eight recipe builders.
+  //
+  // THE POPULATION IS CLOSED, and that is the point of asserting it here. Only a
+  // phase whose `sigmas` are EMPTY reaches the anchor at all; a phase carrying
+  // frozen distilled sigmas never evaluates the field. So every row below is
+  // paired with that precondition, and the recipes that cannot reach it are
+  // asserted NOT to, rather than left unmentioned.
+  //
+  // Upstream's split is 6 no-latent against 1 latent
+  // (`git grep -n '\.execute(' fd4ded7f -- packages/ltx-pipelines/src/ltx_pipelines/`),
+  // and vLLM-Omni hard-codes the max anchor on both of its branches
+  // (`ltx2_denoise.py:188`, `:256-260` @ `a4ea67a2`).
+  struct Arm {
+    const char* kind;
+    const char* version;
+    size_t phase;
+    vllm::Ltx2PhaseScheduleTokens want;
+    const char* upstream;
+  };
+  const std::vector<Arm> derived = {
+      {"one_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_one_stage.py:207 / ltx2_denoise.py:188"},
+      {"one_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_one_stage.py:207 / ltx2_denoise.py:188"},
+      {"one_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_one_stage.py:207"},
+      {"one_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_one_stage.py:207"},
+      {"t2a_one_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "t2a_one_stage.py:141"},
+      {"t2a_one_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "t2a_one_stage.py:141"},
+      {"t2a_one_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "t2a_one_stage.py:141"},
+      {"t2a_one_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "t2a_one_stage.py:141"},
+      {"a2vid_two_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "a2vid_two_stage.py:226"},
+      {"a2vid_two_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "a2vid_two_stage.py:226"},
+      {"a2vid_two_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "a2vid_two_stage.py:226"},
+      {"a2vid_two_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "a2vid_two_stage.py:226"},
+      // ALL FOUR version keys, not the two this table first listed. The resolver
+      // keys `ti2vid_two_stage` and `keyframe_interpolation` at 2, 2.3, 2.4 and
+      // 2.5 alike (`ltx2_pipeline.cpp` resolver, the two `else if` arms that say
+      // "All four generations"), so naming two of four left half the shipped
+      // population of these kinds unasserted.
+      {"ti2vid_two_stage", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"ti2vid_two_stage", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"ti2vid_two_stage", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"ti2vid_two_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ti2vid_two_stages.py:244"},
+      {"keyframe_interpolation", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"keyframe_interpolation", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"keyframe_interpolation", "2.4", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"keyframe_interpolation", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "keyframe_interpolation.py:200"},
+      {"dmd2", "2", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ltx2_denoise.py:256-260, calculate_shift(max_image_seq_len, ...)"},
+      {"dmd2", "2.3", 0, vllm::Ltx2PhaseScheduleTokens::kSchedulerDefault,
+       "ltx2_denoise.py:256-260, calculate_shift(max_image_seq_len, ...)"},
+      // THE EXCEPTION, and the row that stops this table being a constant.
+      {"res2s_two_stage", "2.5", 0, vllm::Ltx2PhaseScheduleTokens::kTargetLatent,
+       "ti2vid_two_stages_hq.py:261-267, execute(latent=empty_latent)"},
+  };
+
+  size_t target_latent_rows = 0;
+  for (const Arm& arm : derived) {
+    // `std::string`, not the bare `const char*`. doctest has no `toString` for a
+    // character pointer, so `<<` decays it to `bool` and every row of this table
+    // logs `kind = 1` — measured, on the mutation that added the `dfr` row
+    // below. A closed population whose failure cannot name the member that
+    // tripped is a list, not a diagnostic.
+    INFO("kind = " << std::string(arm.kind) << "  version = " << std::string(arm.version)
+                   << "  upstream = " << std::string(arm.upstream));
+    const vllm::Ltx2PipelineRecipe recipe =
+        vllm::ResolveLtx2PipelineRecipe(arm.kind, arm.version);
+    REQUIRE(recipe.phases.size() > arm.phase);
+    const vllm::Ltx2PhaseRecipe& phase = recipe.phases[arm.phase];
+    // THE PRECONDITION, asserted rather than assumed: the anchor is consulted
+    // only where the schedule is derived. Were this phase to grow frozen sigmas,
+    // the row below would be pinning a field nothing reads.
+    REQUIRE_MESSAGE(phase.sigmas.empty(),
+                    "this arm no longer derives its schedule, so its anchor is unread and this "
+                    "row asserts nothing");
+    CHECK(phase.schedule_tokens == arm.want);
+    if (arm.want == vllm::Ltx2PhaseScheduleTokens::kTargetLatent) ++target_latent_rows;
+  }
+
+  // NOT A CONSTANT. A build that hard-coded either value would pass one half of
+  // the table and fail the other; this says the table discriminates at all.
+  CHECK_MESSAGE(target_latent_rows == 1u,
+                "the anchor table no longer contains exactly one `kTargetLatent` arm, so it is "
+                "either a constant or upstream's exception has moved");
+
+  // ── and the recipes that CANNOT reach the anchor, asserted as such ────────
+  //
+  // `retake` is the correction this row owed the record: the header comment
+  // predicted the flip would re-sample it, and it does not, because
+  // `RetakeRecipe` pins `DISTILLED_SIGMAS` and so takes upstream's distilled
+  // branch of `retake.py:287` rather than the derived one.
+  //
+  // `dfr` is here for the SAME reason and it is the closure this list was
+  // missing: it is a live shipped kind (resolver, `pipeline_kind == "dfr"`, 2.5
+  // only) that CAN derive, because `DfrRecipe` is `DistilledTwoStageRecipe` with
+  // renamed phases. It cannot today, because that recipe's phases carry frozen
+  // sigmas — which is exactly the fact this loop asserts rather than assumes.
+  // Without the row, a later change that gave DFR's base stage a derived
+  // schedule would move a shipped arm with nothing naming it, which is the
+  // failure the anchor table above exists to prevent.
+  for (const char* kind : {"distilled_two_stage", "retake", "dfr"}) {
+    INFO("kind = " << std::string(kind));
+    const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe(kind, "2.5");
+    REQUIRE_FALSE(recipe.phases.empty());
+    CHECK_MESSAGE(!recipe.phases[0].sigmas.empty(),
+                  "this recipe now derives its schedule, so it has joined the anchor table "
+                  "above and needs a row there");
+  }
+  // Every stage 2 of every two-stage arm is frozen too, which is why the table
+  // above only ever names phase 0.
+  for (const char* kind : {"a2vid_two_stage", "ti2vid_two_stage", "keyframe_interpolation",
+                           "res2s_two_stage"}) {
+    INFO("kind = " << std::string(kind));
+    const vllm::Ltx2PipelineRecipe recipe = vllm::ResolveLtx2PipelineRecipe(kind, "2.5");
+    REQUIRE(recipe.phases.size() == 2u);
+    CHECK_MESSAGE(!recipe.phases[1].sigmas.empty(),
+                  "a stage 2 now derives its schedule and needs its own anchor row");
+  }
 }
 
 TEST_CASE("ltx2 keyframe: all four generations resolve and nothing else does") {

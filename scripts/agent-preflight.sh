@@ -109,6 +109,10 @@ CHECKERS=(
   check-container-matrix
   check-container-workflow
   check-build-runtime-deps
+  # A lease script that keeps its ccache cache on the CIFS share reads as
+  # compliance and caches nothing: symlink(2) is EOPNOTSUPP there, so every
+  # lock fails and `ccache -s` shows zero of everything (#2473).
+  check-lease-ccache
   check-role-discipline
   claim-view
   check-readme-structure
@@ -145,6 +149,7 @@ SUITES=(
   test_check_container_matrix
   test_check_container_workflow
   test_check_build_runtime_deps
+  test_check_lease_ccache
   test_validate_container_image
   test_release_index
   test_release_metadata
@@ -193,6 +198,12 @@ SUITES=(
   test_ltx2_dit_attn_knob_arms
   test_ltx25_ab_memwatch
   test_ltx2_oracle_goldens
+  # The latent-dump driver's own controls (#2514). Nothing executed that file,
+  # so an incomplete rename (`raw_bf16` for `raw_native`) killed every control
+  # in it with an uncaught KeyError, and its frame check passed on ZERO decoded
+  # frames. Both were catchable with no GPU, no torch and no weights; neither
+  # was caught, and both reached a queued dgx lease.
+  test_ltx2_latent_dump
   test_tower_skip_rss_report
   # The other half of that harness: `run_arm`, its readiness poll and its
   # teardown, against a fake server on a scratch port (#1844). The reporter
@@ -454,6 +465,24 @@ if python3 -c 'import numpy' >/dev/null 2>&1; then
 else
   skip "test_ltx25_prompt_adherence" \
     "numpy is not importable here, and the tool this suite exercises needs it." \
+    "CI installs python3-numpy and runs the same suite."
+fi
+# THE DIAGNOSIS THAT DECIDED WHETHER THE SMOOTHNESS CAUSES THE ADHERENCE GAP
+# (`LTX25-ADHERENCE-DETAIL-LOSS`, #2513). The row published a NEGATIVE result --
+# the spectrum says our render is not smoother, the within-render correlation
+# points the wrong way, and blurring the reference does not reproduce the gap --
+# and a negative result is the shape a BROKEN instrument produces for free. So
+# every case feeds a part of that instrument a signal whose answer is known in
+# closed form, and several assert it moves in the direction the falsified
+# hypothesis would have needed. Two of them were red on arrival and found real
+# defects: an empty radial bin read as "below unity" and pushed the crossover
+# upward, and a colour fixture measured luma's channel mixing rather than the
+# gamma fit. numpy only -- no checkpoint, no frames, no network, no GPU.
+if python3 -c 'import numpy' >/dev/null 2>&1; then
+  run "test_ltx25_adherence_detail_loss" python3 tests/scripts/test_ltx25_adherence_detail_loss.py
+else
+  skip "test_ltx25_adherence_detail_loss" \
+    "numpy is not importable here, and every case computes over arrays." \
     "CI installs python3-numpy and runs the same suite."
 fi
 # THE GLM-5.3-Flash GGUF CONVERTER (#2011). Same shape and the same one

@@ -700,6 +700,76 @@ TEST_CASE("qwen27 GDN out dtype is bf16 by default and keys on no model shape") 
   CHECK(GdnOutBf16FlagIsOn(""));  // not a leading '0'.
 }
 
+// #2534. The qwen35 trunk's ONE resolved activation dtype. Two cases, because
+// the parser and the resolver are separable and severing them is silent: an
+// `ActDType` hardwired to BF16 keeps every default-environment gate green while
+// `VT_ACT_F32=1` stops doing anything, and that variable is the denominator of
+// the Q4_K_M arm's same-binary A/B, so a disconnected lever would invalidate the
+// measurement rather than merely lose coverage. That is the same failure
+// `test_qwen35_paged_forward_gdn_out_f32` exists for.
+//
+// The polarity is opt-IN and is the OPPOSITE of `GdnOutBf16FlagIsOn` above:
+// nothing but a leading '1' turns it on, because turning it on changes numerics
+// on a shipped path and the default has to stay the behaviour every recorded
+// device measurement was taken under.
+TEST_CASE("qwen27 activation-dtype flag is opt-in on a leading 1 only") {
+  using vllm::detail::ActF32FlagIsOn;
+
+  CHECK_FALSE(ActF32FlagIsOn(nullptr));  // unset IS the production default.
+  CHECK_FALSE(ActF32FlagIsOn("0"));
+  CHECK_FALSE(ActF32FlagIsOn(""));
+  CHECK_FALSE(ActF32FlagIsOn("true"));  // leading char decides, as elsewhere.
+  CHECK(ActF32FlagIsOn("1"));
+  CHECK(ActF32FlagIsOn("1x"));
+}
+
+// The RESOLVER, asked against the environment this process actually has.
+// `ActDType` caches its getenv in a function-local static, so one process
+// observes exactly one value; the second registration of this binary under
+// `VT_ACT_F32=1` (tests/CMakeLists.txt) is what executes the other arm. That
+// entry is SCOPED to `qwen27 activation*` on purpose: the lever is refused, so
+// every case that CONSTRUCTS a qwen35 model legitimately cannot run under it,
+// and dragging them in would red the entry for obeying the refusal. These two
+// cases build no model, which is why they are the ones that can carry it.
+//
+// The f32 ARM IS REFUSED, and this case holds the refusal to its contract.
+// Honouring the flag does not produce an f32 engine, it produces a numerically
+// inconsistent one: rc job 18fc60f0 measured 9 failed cases and 293 failed
+// assertions, all of them cross-PATH consistency assertions, plus a SIGABRT in
+// the NVFP4 lm_head case. AGENTS.md requires an unimplemented arm to refuse with
+// a message that NAMES the missing part rather than be discovered later, so this
+// asserts the refusal AND its message -- a bare throw that said nothing would
+// satisfy a test that only checked that it threw.
+//
+// The default arm is the shipped path and must be BF16 on EVERY device type. A
+// resolver that ignored the device type, or that quietly answered f32 anywhere,
+// reds this case, and every recorded device measurement was taken at BF16.
+TEST_CASE("qwen27 activation dtype is bf16 by default and REFUSES the f32 arm") {
+  using vllm::detail::ActDType;
+  using vllm::detail::ActF32FlagIsOn;
+
+  const bool on = ActF32FlagIsOn(std::getenv("VT_ACT_F32"));
+  INFO("VT_ACT_F32 as this process reads it: on=" << on);
+
+  const vt::DeviceType kEvery[] = {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                                   vt::DeviceType::kROCM,
+                                   vt::DeviceType::kMETAL};
+  for (vt::DeviceType dt : kEvery) {
+    CAPTURE(static_cast<int>(dt));
+    if (on) {
+      CHECK_THROWS_WITH_AS(ActDType(dt),
+                           doctest::Contains("VT_ACT_F32=1 is REFUSED"),
+                           std::runtime_error);
+      CHECK_THROWS_WITH_AS(ActDType(dt), doctest::Contains("incomplete"),
+                           std::runtime_error);
+      CHECK_THROWS_WITH_AS(ActDType(dt), doctest::Contains("#2534"),
+                           std::runtime_error);
+    } else {
+      CHECK(ActDType(dt) == vt::DType::kBF16);
+    }
+  }
+}
+
 // GDN-MOE-BF16-OUT (#1168), Edit 2. The eligibility carries NO model-shape term:
 // an eligibility whose every remaining term is true selects packed decode, and
 // nothing in it can say whether the checkpoint is dense or MoE.

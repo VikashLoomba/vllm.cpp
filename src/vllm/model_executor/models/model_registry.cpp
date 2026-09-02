@@ -221,10 +221,12 @@ ModelSource ModelSource::FromSafetensorsOwned(
   return source;
 }
 
-ModelSource ModelSource::FromGguf(const GgufFile& gguf) {
+ModelSource ModelSource::FromGguf(const GgufFile& gguf,
+                                  vt::DeviceType device) {
   ModelSource source;
   source.kind = Kind::kGguf;
   source.gguf = &gguf;
+  source.device = device;
   return source;
 }
 
@@ -649,6 +651,13 @@ v1::KVCacheConfig ModelRegistry::MakeKVCache(const LoadedModel& model,
                                               int block_size, int num_blocks) {
   return model.registration().factory->make_kv_cache(config, block_size,
                                                       num_blocks);
+}
+
+int ModelRegistry::ResolveKVBlockSize(const ModelRegistration& reg,
+                                      int requested) {
+  const int floor_bs = reg.factory->kv_block_size_floor;
+  if (floor_bs > 0 && requested < floor_bs) return floor_bs;
+  return requested;
 }
 
 bool ModelRegistry::IsDenseModel(const LoadedModel& model) {

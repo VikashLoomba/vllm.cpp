@@ -1636,6 +1636,21 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(
     const LoadedModel& model, const HfConfig& config, int block_size,
     int num_blocks, const std::optional<vllm::SpeculativeConfig>& spec) {
+  // The architecture may require a larger KV block than the engine's default.
+  // Upstream DERIVES that geometry from the model rather than taking it from an
+  // operator, so raising it here is the mirror; leaving it to a flag would make
+  // the model unreachable on its default configuration, and `vllm-cli` does not
+  // expose one at all.
+  const int resolved_bs =
+      ModelRegistry::ResolveKVBlockSize(model.registration(), block_size);
+  if (resolved_bs != block_size) {
+    std::fprintf(stderr,
+                 "[vllm] kv-cache: raising block_size %d -> %d, the floor this "
+                 "architecture derives (a compress_ratio page cannot be smaller "
+                 "than one token)\n",
+                 block_size, resolved_bs);
+    block_size = resolved_bs;
+  }
   vllm::v1::KVCacheConfig kv;
   if (spec.has_value()) {
     // Speculation is Qwen3.5/3.6-only at this pin (both gate checkpoints); build
@@ -2102,14 +2117,16 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // (num_blocks override > kv_cache_memory_bytes > util fallback) against the
       // model's own per-block byte geometry. FIRST, because max_model_len_ is
       // resolved against this pool.
-      kv_cfg_(MakeKVCacheResolved(
-          *model_, config_, params.block_size > 0 ? params.block_size : 32,
-          params, resolved_spec_config_)),
+      // Resolved ONCE, against the model's declared floor, before anything reads
+      // it. `ResolveKVBlockSize` is idempotent, so the funnel below re-resolving
+      // it is a guarantee for direct callers rather than a second policy.
+      block_size_(ModelRegistry::ResolveKVBlockSize(
+          model_->registration(), params.block_size > 0 ? params.block_size : 32)),
+      kv_cfg_(MakeKVCacheResolved(*model_, config_, block_size_, params,
+                                  resolved_spec_config_)),
       // The serving length, checked (pinned) or auto-fitted (unpinned) against
       // kv_cfg_. See ResolveMaxModelLen.
-      max_model_len_(ResolveMaxModelLen(
-          params, config_, kv_cfg_,
-          params.block_size > 0 ? params.block_size : 32)),
+      max_model_len_(ResolveMaxModelLen(params, config_, kv_cfg_, block_size_)),
       // The serving concurrency, clamped to the recurrent-state budget the KV
       // pool affords. See ResolveMaxNumSeqs (issue #1983).
       max_num_seqs_(ResolveMaxNumSeqs(
@@ -2187,7 +2204,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
           MakeSchedulerConfig(
               max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
-          kv_cfg_, params.block_size > 0 ? params.block_size : 32,
+          kv_cfg_, block_size_,
           /*enable_caching=*/prefix_caching_enabled_,
           &structured_output_manager_, resolved_spec_config_)),
       executor_(runner_),
@@ -2204,11 +2221,28 @@ LoadedEngine::LoadedEngine(HfConfig config,
       output_processor_(&tokenizer_),
       block_hasher_(prefix_caching_enabled_
                         ? vllm::v1::get_request_block_hasher(
-                              params.block_size > 0 ? params.block_size : 32,
-                              vllm::v1::sha256_cbor)
+                              block_size_, vllm::v1::sha256_cbor)
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+  // FOUR consumers page at `block_size_`: the KV config, the max-model-len fit,
+  // the scheduler's block table, and the prefix-cache hasher. Before the floor
+  // existed each spelled the same fallback expression and so could not disagree;
+  // with a floor they can, and the failure is silent -- a pool paged at 256 read
+  // through a block table striding 32 attends over the wrong tokens and returns
+  // plausible output. Assert what the disagreement would look like. Written as a
+  // property of the built config rather than a repetition of the assignment,
+  // because repeating the assignment would gate nothing.
+  for (const auto& group : kv_cfg_.kv_cache_groups) {
+    if (!group.kv_cache_spec) continue;
+    VT_CHECK(group.kv_cache_spec->block_size <= block_size_,
+             std::string("kv-cache: group pages ") +
+                 std::to_string(group.kv_cache_spec->block_size) +
+                 " tokens but the engine's block table strides " +
+                 std::to_string(block_size_) +
+                 ". A page wider than the stride is read as the wrong tokens, "
+                 "not as an error.");
+  }
   // issue #371: REFUSE an unservable recurrent-state budget instead of
   // allocating it. Speculation widens the Mamba/GDN state to k+1 snapshot slots
   // per sequence (runner.cpp:449-451), so a k=15 draft costs SIXTEEN times the
@@ -2607,13 +2641,35 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // are deterministic and match registry.py rather than being masked by a
     // later source-specific missing-tensor/tokenizer error.
     const ModelRegistration& gguf_arch = ModelRegistry::Resolve(config);
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE F2: resolved ONCE, here, and carried.
+    //
+    // `ResolveModelDeviceType` is NOT pure on `--device auto`: `ResolveAutoDevice`
+    // decides by ATTEMPTING `CreateQueue()` and answers `kCPU` when that throws.
+    // Between the fit check below and the `ModelSource` further down, this
+    // function opens the tokenizer and the mmproj vision tower, so host memory
+    // grows; `cudaStreamCreate` failing after exactly that growth is documented
+    // on this project's own target box (examples/laguna_gen/main.cpp:181).
+    //
+    // Two calls could therefore disagree WITHIN ONE LOAD: the fit check bounds a
+    // CUDA load, every registry then builds a CPU policy and keeps the n-gram
+    // table block-resident, and the runner's own resolution hands the forward a
+    // CUDA queue whose `EmbeddingKernelCuda` cannot decode blocks — the exact
+    // first-forward throw with the model fully resident that
+    // `DeviceQuantGatherSupported` exists to prevent. One resolution cannot
+    // disagree with itself.
+    //
+    // The MoE placement plan below was a THIRD call to the same function when
+    // #2314 landed under this row. It takes the carried value for the same
+    // reason the other two do: a placement plan installed for one device while
+    // the residency policy resolves another is the same class of defect this
+    // row exists to remove.
+    const vt::DeviceType gguf_device =
+        ResolveModelDeviceType(gguf_arch.architecture, params.device);
     // #2314: before ANY weight I/O, so a CPU-placed layer is never staged onto
     // the device first — `ResidentWeight` aliases host bytes on a CPU `Dev` and
     // uploads otherwise, so this ordering is what makes the placement free
     // rather than a round trip.
-    InstallMoePlacementPlan(
-        ResolveModelDeviceType(gguf_arch.architecture, params.device),
-        config.num_hidden_layers, &gguf);
+    InstallMoePlacementPlan(gguf_device, config.num_hidden_layers, &gguf);
     // Issue #1123: refuse a GGUF whose weights cannot be STAGED onto the target
     // device, here, before any weight I/O and before the tokenizer.
     //
@@ -2634,8 +2690,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // `gguf_device_fit.h`; it decides nothing on a platform that does not stage
     // weights (every CPU load) and nothing when no budget is known.
     {
-      const platforms::Platform& target = platforms::GetPlatform(
-          ResolveModelDeviceType(gguf_arch.architecture, params.device));
+      const platforms::Platform& target = platforms::GetPlatform(gguf_device);
       // ENG-EXPERT-STREAM-DEVICE W0d (issue #1124). The bound above sums the
       // WHOLE tensor table, so on `Qwen3.8-2.4T-A95B UD-Q1_0` it counts all
       // 335.62 GiB of `*_exps` and refuses before any forward exists to take the
@@ -2690,10 +2745,64 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // `CheckDeviceWeightFit` as well, so the two calls that ask this process's
       // residency policy about this file can never resolve two different
       // answers to the same `getenv` reads.
-      const GgufLoadPolicy gguf_load_policy = GgufLoadPolicy::FromEnv();
+      //
+      // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: from `target.device_type()`, which
+      // is `gguf_device` — the load's ONE resolution, the same value the fit
+      // check is bounded with and the same value the `ModelSource` carries. It used to be `FromEnv()`, which probed
+      // `platforms::CurrentPlatform()` — so on a CUDA-capable process an
+      // explicit `--device cpu` bounded a CPU load with the CUDA residency
+      // policy. That is #1136's finding one level down: the bound and the
+      // policy the bound describes must name the same device.
+      const GgufLoadPolicy gguf_load_policy =
+          GgufLoadPolicy::FromEnv(target.device_type());
       static constexpr std::string_view kStreamedExpertSuffix = "_exps.weight";
       StreamedExpertLane lane;
-      if (target.needs_weight_staging() &&
+      // BACKEND-ROCM-LANE-GUARD (#2507): `allocates_bounded_device_memory()`,
+      // for the SAME reason the refusal below reads it, and this guard has to
+      // read the same one BECAUSE the lane is that refusal's own exemption.
+      // Towers the lane serves leave the bound and the arena enters it; keying
+      // the two halves of one sum on two predicates lets them disagree, and on
+      // ROCm they deliberately do. `needs_weight_staging()` is false there and
+      // `allocates_bounded_device_memory()` is true, so the load drew the one
+      // combination that loses: the refusal fired and the exemption did not,
+      // and GLM-5.3's `UD-IQ1_S` was charged all 187.3125 GiB of the towers it
+      // declares it streams. On CUDA both are true, which is why the same
+      // checkpoint has been generating on a GB10 throughout.
+      //
+      // THE TWO QUESTIONS THIS GUARD ASKS, and neither is answered by
+      // `needs_weight_staging()`:
+      //
+      //   Is a fit computation running at all? `CheckDeviceWeightFit` returns
+      //   before computing anything when its gating argument is false, so a
+      //   lane built for such a load is pure side effect — `Reserve` fixes the
+      //   slot store's geometry for the process and `ResolveExpertStreamRequested`
+      //   latches its streaming answer, and neither belongs on a load whose fit
+      //   check is inert. Only the predicate the fit check is KEYED on can
+      //   answer this, which is what makes the choice forced rather than
+      //   selected.
+      //
+      //   Will the lane actually serve? That is the SECOND term, unchanged, and
+      //   it is unchanged because it was already right: `ExpertSlice`
+      //   (`expert_stream_seam.cpp`) admits the lane at RUNTIME on
+      //   `cpu || host_memory_is_device_addressable()`, with no staging term.
+      //   The load-time guard and the runtime seam now read the same predicate,
+      //   which is the property that stops the bound and the forward
+      //   disagreeing about who serves a tower.
+      //
+      // `needs_weight_staging()` answers a THIRD question that is not asked
+      // here: should the fully-optimized device-resident forward run — the
+      // indexed GDN state I/O, the merged/packed GDN projections, the fp8/bf16
+      // GDN resident prep. It stood in for the first question only because
+      // before #1934 there was no separate predicate for it to stand on. That
+      // row built one and moved the refusal onto it; this one moves the
+      // exemption. NO platform's answer to either predicate changes here.
+      //
+      // NOT a `||`. That would admit ROCm as well and would be wrong: it
+      // re-admits a platform that stages but reports no bounded pool, for which
+      // the fit check computes nothing and the lane is again pure side effect.
+      // `test_gguf_device_fit_reach` pins the plain predicate in both
+      // directions.
+      if (target.allocates_bounded_device_memory() &&
           target.host_memory_is_device_addressable() &&
           gguf_arch.factory != nullptr &&
           gguf_arch.factory->streams_routed_experts &&
@@ -2766,8 +2875,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       // guarantee ("anything else is kExpandBf16") makes this condition an
       // EXACT description of every tensor's residency, not a guess — see the
       // header on `GgufStagedWeightFootprint`. `cpu_ref` needs no term of its
-      // own: it is a CPU-only oracle switch, and `needs_weight_staging` above
-      // already excludes every load it could apply to.
+      // own: it is a CPU-only oracle switch, and `allocates_bounded_device_memory`
+      // — the predicate BOTH the lane guard above and the refusal below now read
+      // (#2507) — already excludes every load it could apply to, because it
+      // delegates to `needs_weight_staging()` on CPU and that is false there.
+      // The exclusion this sentence names is unchanged; only the predicate that
+      // provides it moved.
       const bool policy_forces_full_expand =
           GgufPolicyForcesFullExpand(gguf_load_policy);
       // BACKEND-ROCM (#1934): `allocates_bounded_device_memory()`, not
@@ -2901,7 +3014,13 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // assignment leaves the flag accepted and inert, which is exactly the
     // failure L2 recorded and L3 exists to close; test_tower_skip's reachability
     // case is the gate that catches it.
-    ModelSource gguf_source = ModelSource::FromGguf(gguf);
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the RESOLVED device travels with the
+    // source, so every GGUF registry hook builds its residency policy from what
+    // the engine chose rather than from `platforms::CurrentPlatform()`. The
+    // SAME VALUE the #1123 fit check above was bounded with — not a second call
+    // to the same function, which on `--device auto` can answer differently
+    // (see `gguf_device`).
+    ModelSource gguf_source = ModelSource::FromGguf(gguf, gguf_device);
     gguf_source.multimodal = &params.multimodal;
     const auto t_gguf_weights = std::chrono::steady_clock::now();
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
@@ -2917,7 +3036,10 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
                                       ? Qwen3_5MTPKind::kDense
                                       : Qwen3_5MTPKind::kMoe;
       model->AttachMtpDraftWeights(vllm::LoadQwen3_5MTPFromGguf(
-          gguf, config, kind, GgufLoadPolicy::FromEnv()));
+          gguf, config, kind,
+          // The SAME resolved device the target's own load used, taken off the
+          // source rather than resolved a second time.
+          GgufLoadPolicy::FromEnv(gguf_source.device)));
     }
     // SPEC-DFLASH-GGUF B3: the axis-B wiring. Structurally the same three lines
     // as the safetensors branch's maybe_load_dflash - ResolveSpecConfig re-runs

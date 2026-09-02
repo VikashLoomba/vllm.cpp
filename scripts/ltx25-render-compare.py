@@ -1566,6 +1566,45 @@ def discrimination(scores: np.ndarray, labels: list[str],
     }
 
 
+def adherence_arm_valid(disc: dict) -> dict:
+    """IS THIS ARM'S ADHERENCE NUMBER READABLE AT ALL? One predicate, every arm.
+
+    `scorer_precondition` below asks this of the ORACLE's own render and RAISES,
+    because a scorer that cannot rank upstream's own prompt first on upstream's
+    own frames is broken and nothing it says afterwards is a measurement. The
+    same two conditions decide whether a number is readable on ANY set of frames,
+    and an ablation arm is a set of frames: blur a render far enough and the
+    scorer stops ranking the true prompt first there too, at which point that
+    arm's CLIP mean has stopped measuring adherence and has become a number.
+
+    THIS EXISTS BECAUSE A ROW PUBLISHED SUCH A NUMBER AS ITS HEADLINE.
+    `LTX25-ADHERENCE-DETAIL-LOSS` reported `+1.9131` from a blurred arm on which
+    a decoy outranked the true prompt by 0.4036, while the check that would have
+    caught it ran once, on the unblurred reference. A precondition asked of one
+    arm is not a precondition of the run. So this returns a verdict rather than
+    raising, every scored arm records it, and a caller that wants the raise calls
+    `scorer_precondition`.
+
+    A ZERO margin fails it, and that case is the one worth naming: a scorer that
+    returns the same value for every prompt has an argmax, and numpy's is the
+    first index, which is the true prompt. It would clear a bare `argmax == true`
+    while measuring nothing. The margin must be strictly positive.
+    """
+    argmax, margin = disc["argmax_label"], float(disc["margin"])
+    if not disc["true_first"]:
+        return {"valid": False, "argmax_label": argmax, "margin": margin,
+                "reason": (f"the scorer ranks {argmax!r} above the true prompt "
+                           f"by {-margin:+.4f}, so this arm's CLIP mean is not a "
+                           f"reading of prompt adherence")}
+    if not (margin > 0.0):
+        return {"valid": False, "argmax_label": argmax, "margin": margin,
+                "reason": (f"the true prompt and the best decoy "
+                           f"{disc['best_decoy_label']!r} score identically "
+                           f"(margin {margin:+.6f}); a scorer with no separation "
+                           f"has an argmax and no information")}
+    return {"valid": True, "argmax_label": argmax, "margin": margin, "reason": ""}
+
+
 def scorer_precondition(ref_disc: dict) -> dict:
     """S0. The instrument must prove it can say no, on the ORACLE's own frames.
 
@@ -1577,20 +1616,21 @@ def scorer_precondition(ref_disc: dict) -> dict:
     no adherence number published at all. A FAIL would say our render is worse
     than a reference that was never established.
 
-    A ZERO margin fails it too, and that case is the one worth naming: a scorer
-    that returns the same value for every prompt has an argmax, and numpy's is the
-    first index, which is the true prompt. It would pass a bare `argmax == true`
-    while measuring nothing. The margin must be strictly positive.
+    THE PREDICATE IS `adherence_arm_valid` ABOVE, and it is shared rather than
+    restated. Two copies of a refusal rule drift, and the copy that drifts is the
+    one nothing calls on the failing path -- which is how an ablation sweep in
+    `ltx25-adherence-detail-loss.py` published four rows this rule forbids.
     """
-    if not ref_disc["true_first"]:
-        raise UnreadableInput(
-            f"S0 FAILED: on the #1864 REFERENCE render the scorer ranks "
-            f"{ref_disc['argmax_label']!r} above the prompt that render was "
-            f"actually made from, by {-ref_disc['margin']:+.4f}. The instrument "
-            f"cannot tell upstream's own good render of this prompt from a decoy, "
-            f"so it measures nothing here and no adherence number is published. "
-            f"This is a dead candidate and a finding, not a thing to loosen")
-    if not (ref_disc["margin"] > 0.0):
+    if not adherence_arm_valid(ref_disc)["valid"]:
+        if not ref_disc["true_first"]:
+            raise UnreadableInput(
+                f"S0 FAILED: on the #1864 REFERENCE render the scorer ranks "
+                f"{ref_disc['argmax_label']!r} above the prompt that render was "
+                f"actually made from, by {-ref_disc['margin']:+.4f}. The "
+                f"instrument cannot tell upstream's own good render of this "
+                f"prompt from a decoy, so it measures nothing here and no "
+                f"adherence number is published. This is a dead candidate and a "
+                f"finding, not a thing to loosen")
         raise UnreadableInput(
             f"S0 FAILED: on the #1864 REFERENCE render the true prompt and the "
             f"best decoy {ref_disc['best_decoy_label']!r} score identically "

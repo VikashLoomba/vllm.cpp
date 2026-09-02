@@ -96,7 +96,12 @@ struct ModelSource {
   static ModelSource FromSafetensorsOwned(
       std::shared_ptr<const std::vector<SafetensorsFile>> shards,
       vt::Queue* load_queue = nullptr);
-  static ModelSource FromGguf(const GgufFile& gguf);
+  // `device` is the device the ENGINE resolved for this load
+  // (`ResolveModelDeviceType`), and it has NO DEFAULT. Every GGUF weight
+  // loader reaches its residency policy through this value; the parameter is
+  // required so a new GGUF entry point cannot fall back to the accelerator
+  // probe by saying nothing. See `.agents/specs/gguf-residency-resolved-device.md`.
+  static ModelSource FromGguf(const GgufFile& gguf, vt::DeviceType device);
 
   Kind kind = Kind::kSafetensors;
   const std::vector<SafetensorsFile>* safetensors = nullptr;
@@ -125,6 +130,24 @@ struct ModelSource {
   // NULL means "no limits configured for this load": load everything, which is
   // byte-identical to pre-L3 and is what every non-engine caller gets.
   const MultiModalConfig* multimodal = nullptr;
+  // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the device the ENGINE RESOLVED for this
+  // load, which is what the GGUF residency policy must read.
+  //
+  // It is NOT `vllm::platforms::CurrentPlatform().device_type()`. That probe
+  // answers `kCUDA` on any process where the CUDA platform registered, while
+  // `LoadedEngine::ResolveExplicitDeviceType` returns `kCPU` for an explicit
+  // `--device cpu` "even on a CUDA-capable build/process". The two therefore
+  // disagreed by construction, and the GGUF registries — the only production
+  // loaders with no policy argument of their own — took the probe's answer.
+  // `--device cpu` on a CUDA box got the CUDA residency policy, and on
+  // `qwen4_exp` that is a refusal whose own remedy text is `--device cpu`.
+  //
+  // It belongs on `ModelSource` for the reason `load_queue` and `multimodal`
+  // do: this struct is already the per-load CONTEXT and not only the
+  // checkpoint. `FromGguf` REQUIRES it. The struct default below is only ever
+  // reached by a safetensors source, and no safetensors path reads it — the
+  // residency policy is GGUF-only.
+  vt::DeviceType device = vt::DeviceType::kCPU;
 };
 
 struct ModelFactory;
@@ -747,6 +770,19 @@ struct ModelFactory {
   // False`, and the runner then leaves `MmEmbedInputs::mrope_positions` empty
   // and the model reads the ordinary 1-D positions.
   ModelMropePromptFn mrope_prompt_positions = nullptr;
+  // The SMALLEST KV block size this architecture can be paged at, or 0 when it
+  // has no constraint. Upstream DERIVES this geometry rather than taking it from
+  // an operator: DeepSeek-V4 spells `[256 // compress_ratio, head_dim]`
+  // throughout (`sparse_swa.py:76-83`, `compressor.py:174-178`), so a
+  // `compress_ratio == 128` layer cannot be paged below 256 -- at the engine's
+  // default of 32, `block_size / compress_ratio` is 0 and the page holds no
+  // token.
+  //
+  // Declared here rather than left to a flag because `AGENTS.md` measures
+  // reachability on the DEFAULT configuration. A model that loads only when an
+  // operator happens to pass `--block-size 256` is not reachable by default, and
+  // `vllm-cli` does not expose that flag at all.
+  int kv_block_size_floor = 0;
   // Preserves the already-gated per-arch scheduler default. This is execution
   // policy, not an upstream _ModelInfo capability.
   bool is_dense_model = false;
@@ -970,6 +1006,15 @@ class ModelRegistry {
   static v1::KVCacheConfig MakeKVCache(const LoadedModel& model,
                                        const HfConfig& config, int block_size,
                                        int num_blocks);
+
+  // The block size the engine must page this architecture at, given what the
+  // caller asked for. Returns `requested` unchanged for an architecture that
+  // declares no floor. THE single resolution point: `LoadedEngine` calls this
+  // before `MakeKVCache`, and a gate calls it with `EngineParams{}.block_size`
+  // to prove the model's DEFAULT configuration reaches a buildable geometry
+  // (writing the arithmetic out a second time in a test would only transcribe
+  // it, and could not detect it changing here).
+  static int ResolveKVBlockSize(const ModelRegistration& reg, int requested);
   static bool IsDenseModel(const LoadedModel& model);
 
   // ── ENG-MM-INPUT-PIPELINE P2 (#2379): the multimodal model seam ──

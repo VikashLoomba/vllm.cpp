@@ -131,6 +131,15 @@ union half2_uint32 {
   __device__ half2_uint32(uint32_t val) : as_uint32(val) {}
 };
 
+// util.cuh:83-90. The 16-bit sibling, which only the mul1 codebook needs: cb 2
+// REINTERPRETS an integer sum as an fp16 bit pattern rather than arriving at a
+// half through arithmetic.
+union half_uint16 {
+  uint16_t as_uint16;
+  half as_half;
+  __device__ half_uint16(uint16_t val) : as_uint16(val) {}
+};
+
 // ── fragments and PTX (ptx.cuh) ──────────────────────────────────────────────
 
 template <typename T, int n>
@@ -266,29 +275,77 @@ __device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1) {
   return __hadd2(d0, d1);
 }
 
+// ── the mul1 codebook, cb == 2 (codebook.cuh:25-41,76-89) ────────────────────
+//
+// A DIFFERENT SHAPE, not a third multiplier. cb 0 and cb 1 mask, xor and sum
+// the two fp16 halves of the product; cb 2 sums the product's four UNSIGNED
+// BYTES into a fixed accumulator, reinterprets that sum as an fp16 bit pattern,
+// and maps it with a fused fp16 affine. So it cannot be reached by widening the
+// arm above, and getting it wrong is the quiet failure this family's records
+// document: a weight with the right distribution and no correlation to the true
+// one.
+//
+// `__dp4a(x, 0x01010101u, acc)` is `acc + b0 + b1 + b2 + b3` over the unsigned
+// bytes of `x`. Upstream notes it is bit-identical to the `vabsdiff4(x, 0, acc)`
+// it replaced, and native on Blackwell where vabsdiff4 is emulated.
+//
+// `acc == 0x6400` is load-bearing rather than arbitrary, and upstream's own
+// comment says so: fp16 has an ULP of exactly 1.0 across the whole
+// `[1024, 2048)` binade, and the byte sum cannot exceed `4 * 255 == 1020`, so
+// `0x6400 + sum` READ AS AN FP16 PATTERN is exactly the integer `1024 + sum`.
+//
+// The two constants are BIT PATTERNS, and the decimals in upstream's comments
+// are rounded: `0x1eee` is `887/131072 == 0.00676727294921875`, not "0.00677",
+// and `0xc931` is `-1329/128 == -10.3828125`, not "-10.39". W1a's host
+// `Exl3DecodeCodeword(cw, 2)` is the same arithmetic and the two are required to
+// agree bit for bit, which `tests/vt/test_exl3_gemm.cpp` gates.
+__device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1) {
+  const uint32_t acc = 0x6400u;
+  uint32_t sum0 = __dp4a(x0, 0x01010101u, acc);
+  uint32_t sum1 = __dp4a(x1, 0x01010101u, acc);
+  half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
+  half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
+  half_uint16 h0(static_cast<uint16_t>(sum0));
+  half_uint16 h1(static_cast<uint16_t>(sum1));
+  return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+}
+
 // `decode_3inst<cb>` (`codebook.cuh:56-90`), two codewords at a time.
 //
-// BOTH ARMS, because codebook 0 is the COMMON one and codebook 1 is the
-// exception. `LinearEXL3` derives the codebook from tensor PRESENCE
-// (`exl3.py:74-77`), so every stock `turboderp/*-exl3` artifact -- shipping no
-// `mcg` marker -- is cb 0, the original QTIP 3INST; the SparkInfer DeepSeek-V4
-// artifact ships a marker and is cb 1. Instantiating only cb 1 made the device
-// arm refuse every ordinary EXL3 checkpoint (QUANT-EXL3, #2181).
+// ALL THREE ARMS, because which one a checkpoint uses is decided by tensor
+// PRESENCE and no arm is the default in practice. `LinearEXL3` reads
+// `mcg_tensor is not None` and `mul1_tensor is not None` (`exl3.py:74-77`), so
+// every stock `turboderp/*-exl3` artifact -- shipping neither marker -- is cb 0,
+// the original QTIP 3INST; the SparkInfer DeepSeek-V4 artifact ships an `mcg`
+// marker and is cb 1; `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships a `mul1` marker
+// on every quantized linear and is cb 2 (#2495). Instantiating only cb 1 made
+// the device arm refuse every ordinary EXL3 checkpoint (QUANT-EXL3, #2181), and
+// omitting cb 2 refused that 27B one whole (QUANT-EXL3-MUL1, #2495).
 template <int cb>
 __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1) {
-  static_assert(cb == 0 || cb == 1,
-                "exl3: only codebooks 0 (3INST) and 1 (mcg) are instantiated; cb 2 is "
-                "upstream's dp4a byte-sum variant and needs its own port");
-  if constexpr (cb == 0) {
-    x0 *= 89226354u;
-    x0 += 64248484u;
-    x1 *= 89226354u;
-    x1 += 64248484u;
+  static_assert(cb == 0 || cb == 1 || cb == 2,
+                "exl3: upstream defines codebooks 0 (3INST), 1 (mcg) and 2 (mul1) and "
+                "nothing else -- `decode_3inst<cb>` (codebook.cuh:56-90) falls off the "
+                "end for any other value");
+  // `else` rather than an early return, so that no arm of the other codebook is
+  // even instantiated for cb 2 -- the two tails are different functions, not two
+  // multipliers into one.
+  if constexpr (cb == 2) {
+    x0 *= 0x83DCD12Du;
+    x1 *= 0x83DCD12Du;
+    return decode_mul1_product_2(x0, x1);
   } else {
-    x0 *= 0xCBAC1FEDu;
-    x1 *= 0xCBAC1FEDu;
+    if constexpr (cb == 0) {
+      x0 *= 89226354u;
+      x0 += 64248484u;
+      x1 *= 89226354u;
+      x1 += 64248484u;
+    } else {
+      x0 *= 0xCBAC1FEDu;
+      x1 *= 0xCBAC1FEDu;
+    }
+    return decode_mcg_product_2(x0, x1);
   }
-  return decode_mcg_product_2(x0, x1);
 }
 
 // ── the tail-biting window read (exl3_dq.cuh) ────────────────────────────────
@@ -362,20 +419,40 @@ __device__ __forceinline__ void dq4(const uint32_t* ptr, int t_offset, FragB& fr
   frag[1] = decode_3inst_2<cb>(w2, w3);
 }
 
-// exl3_dq.cuh:254-293, over the widths this tree instantiates. bits == 3 takes
-// dq8<3, cb, 4> and bits == 6 takes two dq4s, both of which are upstream's own
-// choice for those widths. Every other width is refused at the launcher, so the
-// refusal names the row and the missing instantiation rather than firing here.
+// exl3_dq.cuh:254-293, over the widths this tree instantiates. THE ROUTE PER
+// WIDTH IS UPSTREAM'S AND IS ARITHMETIC, NOT TASTE:
 //
-// bits == 6 is not an exotic case: the stock `turboderp/*-exl3` artifacts
+//   bits 3, 4  ->  dq8, which merges TWO uint32 words and peels eight 16-bit
+//                  windows out of them. The eight windows span `16 + bits*7`
+//                  bits, which is 37 at bits 3 and 44 at bits 4, and both stay
+//                  inside the 64-bit funnel at any start offset.
+//   bits 5, 6  ->  TWO dq4s. The same span is 51 bits at bits 5 and 58 at bits
+//                  6, and once the start shift is added the window crosses a
+//                  third uint32, so the two-word load no longer covers it.
+//                  Halving it gives `16 + bits*3`, which is 31 and 34, and both
+//                  fit. Upstream routes 5/6/8 this way for exactly that reason
+//                  (`exl3_dq.cuh:273-292`).
+//
+// `align` is how many consecutive windows share one funnel shift. Upstream
+// picks 4 for bits 3 (`:267`) and hand-writes an align-4 form for bits 4
+// (`dq8_aligned_4bits`, `:164`); the generic `dq8<bits, cb, 4>` here computes
+// the same eight windows, and the hand-written version differs only in using
+// immediate rather than register shifts.
+//
+// Every other width is refused at the launcher, so the refusal names the row and
+// the missing instantiation rather than firing here.
+//
+// None of these widths is exotic. The stock `turboderp/*-exl3` artifacts
 // quantize the BODY at 3 bits and the `lm_head` at 6, so a device arm without
-// it leaves 21% of the weights of a 1B model on a CPU queue.
+// bits 6 leaves 21% of the weights of a 1B model on a CPU queue; and
+// `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` is 270 tensors at bits 4, one at 5 and one
+// at 6 (#2495) -- a mixed-width artifact where NO single width would serve it.
 template <int bits, int cb>
 __device__ __forceinline__ void dq_dispatch(const uint32_t* ptr, int idx, FragB& frag0,
                                             FragB& frag1) {
-  static_assert(bits == 3 || bits == 6,
-                "exl3: only bits 3 and 6 are instantiated on the device arm");
-  if constexpr (bits == 3) {
+  static_assert(bits == 3 || bits == 4 || bits == 5 || bits == 6,
+                "exl3: only bits 3, 4, 5 and 6 are instantiated on the device arm");
+  if constexpr (bits == 3 || bits == 4) {
     dq8<bits, cb, 4>(ptr, idx, frag0, frag1);
   } else {
     dq4<bits, cb>(ptr, idx, frag0);
@@ -577,8 +654,14 @@ __global__ __launch_bounds__(32) void had_ff_r_128_kernel(const float* __restric
 
 // ── the pipelined tile loop (exl3_gemm_inner.cuh:22-733) ─────────────────────
 
+// SHMEM_OUT_HAD is upstream's `shmem_out_had` (exl3_gemm_inner.cuh:22). It
+// selects the epilogue: `true` stages the finished tile in shared memory and
+// applies the output Hadamard against `post_scale`; `false` stores the f32
+// accumulator straight to global memory as fp16. Only the caller knows whether
+// a `post_scale` exists, so the branch is a template parameter and not a
+// run-time test on the pointer.
 template <int bits, bool c_fp32, int cb, int TILESIZE_M, int TILESIZE_K, int TILESIZE_N,
-          int SH_STAGES, int FRAG_STAGES>
+          int SH_STAGES, int FRAG_STAGES, bool SHMEM_OUT_HAD>
 __device__ inline void exl3_gemm_kernel_inner(const half* __restrict__ A,
                                               const uint16_t* __restrict__ B,
                                               void* __restrict__ C, const int size_m,
@@ -995,9 +1078,20 @@ __device__ inline void exl3_gemm_kernel_inner(const half* __restrict__ A,
     bool last = lock_i + lock_d == tiles_k;
     if (!sub_k && !first) read_sum_gl();
     if (!sub_k && !last) write_sum_gl();
-    if (!sub_k && last) write_sum_tile_sh();
-    if (last) __syncthreads();
-    if (!sub_k && last) output_had_sh_gl();
+    // exl3_gemm_inner.cuh:610-623. The last block in the column stages the tile
+    // for the output Hadamard only when the caller supplied a `post_scale`.
+    // Without one it takes the same global store as the intermediate blocks,
+    // which rounds the f32 accumulator to fp16 through __floats2half2_rn.
+    if (!sub_k && last) {
+      if constexpr (SHMEM_OUT_HAD)
+        write_sum_tile_sh();
+      else
+        write_sum_gl();
+    }
+    if constexpr (SHMEM_OUT_HAD) {
+      if (last) __syncthreads();
+      if (!sub_k && last) output_had_sh_gl();
+    }
     barrier_release(lock, lock_d, last);
     clear_frag_c();
   };
@@ -1103,9 +1197,11 @@ __global__ __launch_bounds__(kBaseThreads* TILESIZE_K / 16) void exl3_gemm_kerne
   void* C_ = C;
 
   while (size_m_ > 0) {
+    // exl3_gemm_kernel.cuh:40 instantiates shmem_out_had = true here, and `svh`
+    // is the post_scale the output Hadamard reads.
     exl3_gemm_kernel_inner<bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES,
-                           FRAG_STAGES>(A_, B, C_, EXL3_MIN(size_m_, 16), size_k, size_n, locks,
-                                        svh);
+                           FRAG_STAGES, true>(A_, B, C_, EXL3_MIN(size_m_, 16), size_k, size_n,
+                                              locks, svh);
     A_ += 16 * size_k;
     if constexpr (c_fp32)
       C_ = static_cast<void*>(static_cast<float*>(C_) + 16 * size_n);
@@ -1677,8 +1773,10 @@ __global__ __launch_bounds__(kBaseThreads* kMoeTilesizeK / 16) void exl3_moe_ker
       (void)K;
       int size_m = token_count;
       while (size_m > 0) {
+        // exl3_moe_kernel.cuh:138 and :212 instantiate shmem_out_had = false in
+        // both MoE bands, which is what makes the NULL post_scale legal.
         exl3_gemm_kernel_inner<bits, false, cb, kMoeTilesizeM, kMoeTilesizeK, MOE_TILESIZE_N,
-                               kMoeShStages, kMoeFragStages>(
+                               kMoeShStages, kMoeFragStages, false>(
             in_addr, trellis, static_cast<void*>(out_addr), EXL3_MIN(size_m, 16), size_k, size_n,
             locks, nullptr);
         in_addr += 16 * size_k;
@@ -1845,17 +1943,32 @@ void Exl3HadR128KernelCuda(Queue& q, Tensor& out, const Tensor& in, const Exl3Ha
 //   (3, 1)  the SparkInfer DeepSeek-V4 artifact, which ships an `mcg` marker
 //   (6, 0)  the `lm_head` of those stock artifacts, which is SIX-bit over a
 //           3-bit body
+//   (4, 2)  270 of the 272 quantized tensors of
+//           `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` (QUANT-EXL3-MUL1, #2495)
+//   (5, 2)  one tensor of that checkpoint, and ALL 36 of its DFlash2 draft
+//   (6, 2)  its `lm_head`, the same 6-over-narrow-body shape the stock
+//           artifacts use, in the mul1 codebook
 //
-// Three arms and not one, because the previous single arm (3, 1) was the
+// Three arms and not one, because the original single arm (3, 1) was the
 // EXCEPTION rather than the rule: `LinearEXL3` derives the codebook from tensor
 // PRESENCE (`exl3.py:74-77`), so an artifact with no marker is cb 0, and the
 // device arm refused every ordinary EXL3 checkpoint (QUANT-EXL3, #2181).
 //
-// Three and not more, because each pair costs a full set of kernels in a
-// translation unit the fat build compiles for ten architectures. Widening
-// further is upstream's own per-K compilation-unit split
-// (`comp_units/exl3_comp_unit_K_cbX.cu`), and belongs with the first artifact
-// that needs it.
+// SIX AND NOT SIXTEEN. Upstream's table is DENSE -- K in 1..8 by cb in 0..2,
+// 24 translation units of 16 instantiations each -- and it can be, because it
+// splits per (K, cb) into `comp_units/exl3_comp_unit_K_cbX.cu` and compiles for
+// one architecture at a time. This tree has ONE translation unit and the fat
+// build compiles it for ten architectures, so a dense table here would be 8x
+// the kernels of the arm set below in a single `.cu`. The three added pairs are
+// exactly the widths a real artifact ships and no more; the next artifact that
+// needs a seventh pair should carry the per-K split with it rather than keep
+// widening this list.
+//
+// THE WIDTHS ARE NOT FREE-FORM EITHER. `dq_dispatch` above routes 3 and 4
+// through `dq8` and 5 and 6 through two `dq4`s, because the eight-window span
+// `16 + bits*7` leaves the 64-bit funnel once the start shift is added at bits
+// 5. A width this tree has no route for fails to COMPILE on that
+// `static_assert` rather than reading the trellis wrongly.
 //
 // THE WIDTH IS LOAD-BEARING ON SHARED MEMORY, and the guard is already there
 // rather than added here: every B stride in `exl3_gemm_kernel` is
@@ -1866,7 +1979,8 @@ void Exl3HadR128KernelCuda(Queue& q, Tensor& out, const Tensor& in, const Exl3Ha
 // mis-staging, which is why widening here is safe to attempt: the failure mode
 // is loud.
 constexpr bool Exl3ArmInstantiated(int bits, int cb) {
-  return (bits == 3 && (cb == 0 || cb == 1)) || (bits == 6 && cb == 0);
+  return (bits == 3 && (cb == 0 || cb == 1)) || (bits == 6 && cb == 0) ||
+         ((bits == 4 || bits == 5 || bits == 6) && cb == 2);
 }
 
 template <int BITS, int CB, bool c_fp32>
@@ -1894,6 +2008,9 @@ const void* GemmKernelForShape(int bits, int cb, int shape_idx) {
   if (bits == 3 && cb == 0) return GemmKernelForArm<3, 0, c_fp32>(shape_idx);
   if (bits == 3 && cb == 1) return GemmKernelForArm<3, 1, c_fp32>(shape_idx);
   if (bits == 6 && cb == 0) return GemmKernelForArm<6, 0, c_fp32>(shape_idx);
+  if (bits == 4 && cb == 2) return GemmKernelForArm<4, 2, c_fp32>(shape_idx);
+  if (bits == 5 && cb == 2) return GemmKernelForArm<5, 2, c_fp32>(shape_idx);
+  if (bits == 6 && cb == 2) return GemmKernelForArm<6, 2, c_fp32>(shape_idx);
   return nullptr;
 }
 
@@ -1944,6 +2061,25 @@ const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
 // SO A STOCK `turboderp/*-exl3` CHECKPOINT HAS NO GEMV FAST PATH, on this tree
 // or upstream's, and takes the regular shape table at `m == 1`. That is
 // upstream's behaviour, not a gap this row opened.
+//
+// THE SAME IS TRUE OF THE mul1 WIDTHS, AND FOR TWO DIFFERENT REASONS
+// (QUANT-EXL3-MUL1, #2495):
+//
+//   bits 5, 6, cb 2 -- upstream HAS NO GEMV EITHER. Its try-launch opens with
+//     `if (K < 2 || K > 4) return false;` (`exl3_gemv.cu:107-121`) and its
+//     `SEL_GRID` list is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)`. Falling
+//     to the regular shape table at these widths is upstream's arrangement.
+//   bits 4, cb 2 -- upstream DOES have it, and this tree does not. That is a
+//     KERNEL PORT rather than an instantiation, and the shape of the work is
+//     known: `LSTRIDE` is `bits == 3 ? 24 : 32` and `LOADS` is `WNT`
+//     (`exl3_gemv_kernel.cuh:150-153`), the extraction becomes a single
+//     `(lane + 31) & 31` shuffle into a `dq8_regs_4bits` this tree does not
+//     have (`:296-300`, `:87`), and the `exl3_gemv_cfg` envelope was measured
+//     for K in {2,3,4} so it needs no new arm. It is owed, not refused as
+//     impossible.
+//
+// The cost of declining is NOT measured here and is not asserted: it is the
+// `m <= 8` fast path only, and quantifying it needs the checkpoint on a device.
 //
 // A null here is a DECLINE, and `TryGemv` turns it into a fall-through rather
 // than a failure.
@@ -2013,13 +2149,15 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   if (!Exl3ArmInstantiated(args.bits, args.codebook)) {
     throw std::runtime_error(
         "vt cuda exl3: exl3_gemm is instantiated for (bits, codebook) in "
-        "{(3, 0), (3, 1), (6, 0)} only; got bits " +
+        "{(3, 0), (3, 1), (6, 0), (4, 2), (5, 2), (6, 2)} only; got bits " +
         std::to_string(args.bits) + " codebook " + std::to_string(args.codebook) +
-        ". Those three are the body and head of the stock exl3 artifacts (cb 0) and the "
-        "SparkInfer DeepSeek-V4 one (cb 1); widening further is upstream's per-K "
-        "compilation-unit split and belongs with the artifact that needs it "
-        "(QUANT-EXL3, #2181). The CPU arm decodes every width and serves them on a CPU "
-        "queue meanwhile.");
+        ". Those six are the body and head of the stock exl3 artifacts (cb 0), the "
+        "SparkInfer DeepSeek-V4 one (cb 1), and the mul1 widths of "
+        "Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw and its DFlash2 draft (cb 2). Upstream's own "
+        "table is dense over bits 1..8 by codebook 0..2 because it splits per (K, cb) "
+        "into one translation unit each; widening this one further is that split, and "
+        "belongs with the artifact that needs it (QUANT-EXL3-MUL1, #2495). The CPU arm "
+        "decodes every width and serves them on a CPU queue meanwhile.");
   }
   // NOT const: cudaLaunchCooperativeKernel takes `void**`, so each argument has
   // to be a modifiable lvalue whose address can be taken as `void*`.

@@ -39,6 +39,7 @@
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -82,8 +83,15 @@ std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
     if (source.gguf == nullptr) {
       throw std::runtime_error("deepseek-v4 GGUF model source is empty");
     }
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+    // the device the ENGINE resolved for this load, never from
+    // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+    // CUDA-capable process, and this hook is where the disagreement reached the
+    // loader.
+    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
     return std::make_unique<DeepseekV4LoadedModel>(
-        registration, LoadDeepseekV4FromGguf(*source.gguf, config));
+        registration,
+        LoadDeepseekV4FromGguf(*source.gguf, config, &gguf_policy));
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
@@ -138,6 +146,13 @@ const ModelFactory kDeepseekV4Factory{
     .prepare = &PrepareDeepseekV4ForCausalLM,
     .forward = &ForwardDeepseekV4ForCausalLM,
     .make_kv_cache = &MakeDeepseekV4KVCache,
+    // Upstream derives `[256 // compress_ratio, head_dim]` everywhere
+    // (`sparse_swa.py:76-83`, `compressor.py:174-178`), and a
+    // `compress_ratio == 128` layer cannot be paged below 256: at the engine's
+    // default of 32 the storage block would hold zero tokens and
+    // `MakeDeepseekV4KVCache` refuses. Declaring the floor is what makes this
+    // architecture load on its DEFAULT configuration.
+    .kv_block_size_floor = 256,
     .is_dense_model = false,
     // KV-DSV4-MULTICACHE W5 (#2323): this forward consumes a cache set keyed by
     // layer name. Declaring it is what stops `ModelRegistry::Forward` refusing

@@ -56,6 +56,7 @@ using vllm::GgufResidency;
 using vllm::GgufTensorRole;
 using vllm::KeepQuantDType;
 using vllm::OwnGgufQuantBlocks;
+using vllm::QuantRepackForDevice;
 using vllm::RouteGgufTensor;
 
 namespace {
@@ -64,7 +65,8 @@ namespace {
 constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8,
                    kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14,
                    kQ8_K = 15, kIQ2_XS = 17, kIQ4_NL = 20, kIQ2_S = 22,
-                   kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39, kQ1_0 = 41;
+                   kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39, kQ1_0 = 41,
+                   kIQ3_S = 21;
 
 // Every executable weight encoding, with a K that is a whole number of blocks.
 struct Encoding {
@@ -243,18 +245,19 @@ TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #
   // format that flipped to keep-quant would throw at FORWARD time with the
   // model fully resident. The loader must keep the pre-existing expand_bf16
   // residency for those formats instead.
-  const vt::DeviceType dev =
-      vllm::platforms::CurrentPlatform().device_type();
-  if (dev != vt::DeviceType::kROCM) {
-    MESSAGE("non-ROCm host (the device set is full there); the device-gated "
-            "arms are asserted on gfx1100");
-    return;
-  }
-  const std::vector<int64_t> shape = {4, 256};  // [out, in]: K = shape[1] = 256 elems, whole blocks
+  //
+  // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the device is now a PARAMETER, so these
+  // arms run everywhere. They used to read `CurrentPlatform()` and return early
+  // with a MESSAGE on any host that is not gfx1100 — which is every host this
+  // suite has ever run on, so the ROCm format set was asserted nowhere. The
+  // whole point of removing the probe is that a device's routing is checkable
+  // from a host that is not that device.
+  const std::vector<int64_t> shape = {4, 256};  // [out, in]: K = 256 elems, whole blocks
   const auto route = [&](uint32_t ty) {
     return RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/true,
                            /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
-                           GgufTensorRole::kMatmulWeight, ty, shape);
+                           GgufTensorRole::kMatmulWeight, ty, shape,
+                           vt::DeviceType::kROCM);
   };
   // The supported set keeps quant residency (ggml type ids per the constants
   // at the top of this file).
@@ -265,8 +268,80 @@ TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #
   CHECK(route(kQ6_K) == GgufResidency::kKeepQuant);
   CHECK(route(kQ2_K) == GgufResidency::kExpandBf16);  // owed, not silently kept
   // keep-f16 must be OFF on ROCm: MatmulBTKernelRocm accepts bf16/f32 only.
-  const GgufLoadPolicy pol = GgufLoadPolicy::FromEnv();
+  // Asked of a ROCm-resolved policy, not of this process's own.
+  const GgufLoadPolicy pol = GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM);
   CHECK(!pol.keep_f16);
+}
+
+TEST_CASE("quant_repack is decided WITH the resolved device (#2406)") {
+  // THE DEFECT. `quant_repack` selects the CIQ G7 load-time permutation of a
+  // Q8_0 weight into the ARM i8mm `block_q8_0x4` interleave. Only the CPU
+  // `MatmulBTKernel` reads that layout; `grep -c repacked
+  // src/vt/cuda/cuda_quant_dot.cu` is 0. The flag was resolved from
+  // `vt::cpu::QuantRepackActive()` alone — a pure HOST-ISA probe — so on an
+  // aarch64 i8mm host with a GPU (dgx GB10 and Jetson Thor, both fleet devices)
+  // a `--device cuda` load repacked the weight and staged it to the card. Its
+  // sibling `elem_kn_repack` has carried `dev == kCPU` for exactly this reason
+  // since it landed, and says so in its own comment.
+  //
+  // WHY THIS IS ASSERTED OVER A PREDICATE AND NOT OVER `FromEnv`.
+  // `QuantRepackActive()` compiles to a literal `false` on every non-aarch64
+  // target (`src/vt/cpu/cpu_quant_repack_arm.cpp`). An assertion that reached
+  // the decision only through `FromEnv` would therefore read `quant_repack ==
+  // false` on x86 CI whether the device term existed or not — a mute switch
+  // wearing a gate's clothes, and one that would have passed on every day this
+  // defect was live. Passing the ISA answer in is the same move
+  // `RouteGgufTensor` made for `dev`, for the same stated reason: a decision
+  // that takes its inputs is checkable from a host that is not the one it
+  // decides for.
+  //
+  // THE DISCRIMINATING PAIR is the first two rows. They differ in `dev` alone.
+  CHECK(QuantRepackForDevice(/*keep_quant=*/true, /*cpu_ref=*/false,
+                             /*host_repack_active=*/true,
+                             vt::DeviceType::kCPU) == true);
+  CHECK(QuantRepackForDevice(/*keep_quant=*/true, /*cpu_ref=*/false,
+                             /*host_repack_active=*/true,
+                             vt::DeviceType::kCUDA) == false);
+  // Every other accelerator answers the same way: the gate is "is this the CPU",
+  // not "is this CUDA". A `dev != kCUDA` spelling passes the row above and fails
+  // these two.
+  CHECK(QuantRepackForDevice(true, false, true, vt::DeviceType::kROCM) == false);
+  CHECK(QuantRepackForDevice(true, false, true, vt::DeviceType::kXPU) == false);
+
+  // The three pre-existing terms are unchanged, and each still vetoes alone.
+  CHECK(QuantRepackForDevice(/*keep_quant=*/false, false, true,
+                             vt::DeviceType::kCPU) == false);
+  CHECK(QuantRepackForDevice(true, /*cpu_ref=*/true, true,
+                             vt::DeviceType::kCPU) == false);
+  CHECK(QuantRepackForDevice(true, false, /*host_repack_active=*/false,
+                             vt::DeviceType::kCPU) == false);
+
+  // AND THE LOADER USES IT. The predicate above is the rule; this is the wire.
+  //
+  // THIS HALF IS VACUOUS ON x86 AND THAT IS SAID RATHER THAN HIDDEN.
+  // `QuantRepackActive()` is a compile-time `false` off aarch64, so no value of
+  // `dev` can make `FromEnv` answer `true` here and no x86 run can tell the
+  // wired predicate from the expression it replaced. `VT_GGUF_KEEP_QUANT=1`
+  // removes the OTHER two vetoes — without it `keep_quant` is already false for
+  // a device with no quant GEMM registered, and this would assert nothing on
+  // any host. With it, on an aarch64 i8mm box (dgx, thor, orin — every box
+  // where the defect was reachable) the old expression answers `true` and this
+  // case reds. The truth table above is what gates the rule everywhere else.
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
+  CHECK(!GgufLoadPolicy::FromEnv(vt::DeviceType::kCUDA).quant_repack);
+  CHECK(!GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM).quant_repack);
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
+  // On the CPU the flag is exactly what the host ISA says, which is the
+  // property that makes this a device gate and not a disablement. On an i8mm
+  // box this reads `true`, which is the same answer the loader gave before
+  // #2406 — the gate must not have turned the transform off where it works.
+  {
+    const GgufLoadPolicy cpu = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
+    CHECK(cpu.quant_repack ==
+          QuantRepackForDevice(cpu.keep_quant, cpu.cpu_ref,
+                               vt::cpu::QuantRepackActive(),
+                               vt::DeviceType::kCPU));
+  }
 }
 
 TEST_CASE("keep-quant residency refuses ragged K and out-of-span slices") {
@@ -284,7 +359,7 @@ TEST_CASE("keep-quant residency refuses ragged K and out-of-span slices") {
   // A ragged-K weight is not merely refused at residency: the POLICY routes it
   // to expansion, so the loader never reaches the throw.
   CHECK(RouteGgufTensor(true, false, false, false, GgufTensorRole::kMatmulWeight,
-                        kQ8_0, {n, 33}) == GgufResidency::kExpandBf16);
+                        kQ8_0, {n, 33}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
 }
 
 // ===========================================================================
@@ -435,10 +510,30 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // W6a added (#1989 review F8): a case that calls itself TOTAL and omits the
   // two newest encodings is total over yesterday's surface. IQ2_XS (17) joins
   // it for the same reason with LOADER-GGUF-IQ (#2240).
+  // IQ3_S (21) joins with QUANT-IQ3S (#2510), and it is the one entry here that
+  // is GATHER-capable and GEMM-incapable, so it is what keeps the two terms
+  // below from being the same predicate written twice.
   const uint32_t all_types[] = {kF32,   kF16,    kBF16,   kQ4_0,   kQ5_0,
                                 kQ8_0,  kQ3_K,   kQ4_K,   kQ5_K,   kQ6_K,
                                 kQ8_K,  kIQ2_XS, kIQ4_NL, kIQ2_S,  kIQ4_XS,
-                                kMXFP4};
+                                kMXFP4, kIQ3_S};
+
+  // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: ONE device, named here, and both the
+  // route and the expectation read it. It used to be
+  // `platforms::CurrentPlatform()` on the expectation side and an implicit
+  // probe inside `RouteGgufTensor` on the other, so this table's totals were
+  // host-dependent and the two sides could only agree by both probing. They are
+  // now the same value, and the counts below are the same on every host.
+  //
+  // F6: and it runs over EVERY device rather than one. With a single `kCPU` the
+  // three device terms below (`rocm`, `device_capable`, `gather_device_capable`)
+  // collapse to compile-time constants that still READ as device-derived, so
+  // the ROCm narrowing and the gather gate were asserted by nobody. The totals
+  // are already written per device, so the loop costs nothing and makes them
+  // mean it.
+  for (vt::DeviceType kRouteDev : {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                                   vt::DeviceType::kROCM}) {
+  CAPTURE(std::string(vt::DeviceTypeName(kRouteDev)));
 
   int kept = 0;
   int expanded = 0;
@@ -467,9 +562,7 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
             type == kQ4_K || type == kQ5_K || type == kQ6_K || type == kIQ2_S ||
             type == kMXFP4 || type == kIQ4_NL || type == kIQ2_XS ||
             type == kIQ4_XS;
-        const bool rocm =
-            vllm::platforms::CurrentPlatform().device_type() ==
-            vt::DeviceType::kROCM;
+        const bool rocm = kRouteDev == vt::DeviceType::kROCM;
         const bool device_capable =
             !rocm || type == kQ8_0 || type == kQ4_K || type == kQ5_K ||
             type == kQ6_K;
@@ -497,10 +590,24 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // actually registered. It cannot be hand-enumerated like `cpu_capable`
         // above, because whether the CUDA registrar is linked is a property of
         // the build and not of the encoding.
-        const bool gather_cpu_capable = cpu_capable || type == kQ8_K;
-        const bool gather_device_capable = vt::OpRegistered(
-            vt::OpId::kEmbeddingQuant,
-            vllm::platforms::CurrentPlatform().device_type());
+        // IQ3_S has a `to_float` and NO `vec_dot`, so it is gather-capable and
+        // GEMM-incapable — the surplus Q8_K used to hold alone. It is a FILE
+        // encoding, which Q8_K is not, so this is the term that decides whether
+        // 4 of an 866-tensor artifact's weights stay compressed on the gather
+        // while expanding on the GEMM (#2510).
+        const bool gather_cpu_capable =
+            cpu_capable || type == kQ8_K || type == kIQ3_S;
+        // THE MERGED FORM, which was in neither branch. #2396 made the gather
+        // build-dependent and asked the OP REGISTRY instead of hard-coding
+        // "CPU only" — correct, and this row keeps it. But it asked about
+        // `CurrentPlatform()`, the process's own accelerator, while the route
+        // below is taken for `kRouteDev`. Under this row's device loop those
+        // are different devices for two of the three legs, so the probe form
+        // would compare a CUDA-registry answer against a ROCm route. The
+        // registry question is right; the device it is asked ABOUT must be the
+        // one being routed.
+        const bool gather_device_capable =
+            vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev);
         bool expect_keep = false;
         if (block_capable) {
           if (role == GgufTensorRole::kMatmulWeight && shape.size() == 2) {
@@ -518,27 +625,29 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
                                            ? GgufResidency::kKeepQuant
                                            : GgufResidency::kExpandBf16;
 
-        const GgufResidency got =
-            RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
-                            /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role, type,
-                            shape);
-        CHECK(got == expected);
         // Counted from the ROUTING RESULT, not from `expect_keep`. Incrementing
         // from the test's own expectation made the totals below a restatement of
         // this loop's arithmetic, so `CHECK(kept == gemm_kept + gather_kept)`
         // could not fail for any behaviour of `RouteGgufTensor` -- it had never
         // fired. Counting `got` makes the totals an independent second reading
-        // of the same 576 routes.
+        // of the same routes. (Both branches found this independently.)
+        const GgufResidency got =
+            RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                            /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role, type,
+                            shape, kRouteDev);
+        CHECK(got == expected);
         (got == GgufResidency::kKeepQuant ? kept : expanded)++;
 
         // The master switch OFF expands everything, always.
         CHECK(RouteGgufTensor(/*keep_quant=*/false, /*keep_f16=*/false,
                               /*nvfp4_fp4=*/false, /*cpu_ref=*/false, role,
-                              type, shape) == GgufResidency::kExpandBf16);
+                              type, shape, kRouteDev) ==
+              GgufResidency::kExpandBf16);
         // The VT_CPU_REF oracle wins over keep-quant, always.
         CHECK(RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
                               /*nvfp4_fp4=*/false, /*cpu_ref=*/true, role,
-                              type, shape) == GgufResidency::kExpandBf16);
+                              type, shape, kRouteDev) ==
+              GgufResidency::kExpandBf16);
       }
     }
   }
@@ -561,15 +670,24 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   //
   // KGATHER made the gather term BUILD-DEPENDENT rather than CPU-only: CUDA
   // registers `kEmbeddingQuant` too, so a CUDA build with a device keeps those
-  // 13. This term said `host == kCPU ? 13 : 0` and would have red 13 assertions
-  // on exactly the configuration the flip enables -- the case is the reason a
-  // CUDA lane must run this suite.
-  const vt::DeviceType host = vllm::platforms::CurrentPlatform().device_type();
-  const int gemm_kept = host == vt::DeviceType::kROCM ? 8 : 24;
+  // 13. That term used to read `host == kCPU ? 13 : 0` and would have red 13
+  // assertions on exactly the configuration the flip enables.
+  //
+  // Asked about `kRouteDev`, not about the host. #2396 wrote `host` because at
+  // that point one device was routed and it was the process's own; under this
+  // row's device loop the two come apart, and asking the host would compare a
+  // CUDA-registry answer against a ROCm route on two legs out of three.
+  //
+  // QUANT-IQ3S (#2510) moves the GATHER term 13 -> 14 and leaves GEMM where it
+  // was, the same decode-only shape #2240 had. That asymmetry IS the row's
+  // per-tier result: IQ3_S stays compressed in a gather table and expands to
+  // bf16 in a GEMM, on every device.
+  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 8 : 24;
   const int gather_kept =
-      vt::OpRegistered(vt::OpId::kEmbeddingQuant, host) ? 13 : 0;
+      vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 14 : 0;
   CHECK(kept == gemm_kept + gather_kept);
-  CHECK(expanded == 16 * 36 - (gemm_kept + gather_kept));
+  CHECK(expanded == 17 * 36 - (gemm_kept + gather_kept));
+  }
 }
 
 TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
@@ -590,10 +708,11 @@ TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
          {GgufTensorRole::kTransformedWeight,
           GgufTensorRole::kConvWeight, GgufTensorRole::kVector}) {
       CAPTURE(vllm::Name(role));
-      CHECK(RouteGgufTensor(true, false, false, false, role, e.ggml_type, {8, e.k}) ==
+      CHECK(RouteGgufTensor(true, false, false, false, role, e.ggml_type,
+                            {8, e.k}, vt::DeviceType::kCPU) ==
             GgufResidency::kExpandBf16);
       CHECK(RouteGgufTensor(true, false, false, false, role, e.ggml_type,
-                            {2, 8, e.k}) == GgufResidency::kExpandBf16);
+                            {2, 8, e.k}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
     }
   }
 }
@@ -612,32 +731,32 @@ TEST_CASE("a quantized GATHER TABLE keeps its blocks, per encoding and per K") {
     CAPTURE(e.name);
     CHECK(RouteGgufTensor(true, false, false, false,
                           GgufTensorRole::kEmbeddingTable, e.ggml_type,
-                          {8, e.k}) == GgufResidency::kKeepQuant);
+                          {8, e.k}, vt::DeviceType::kCPU) == GgufResidency::kKeepQuant);
     // A RAGGED row cannot be decoded block-wise, so it expands. This is the
     // same `ggml_row_size` precondition the GEMM arm obeys, and it is why the
     // 160-wide table in the shipped file is IQ4_NL (32) and not a K-quant (256).
     CHECK(RouteGgufTensor(true, false, false, false,
                           GgufTensorRole::kEmbeddingTable, e.ggml_type,
-                          {8, e.k - 1}) == GgufResidency::kExpandBf16);
+                          {8, e.k - 1}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
     // Rank is still part of the role's contract: a table is 2-D.
     CHECK(RouteGgufTensor(true, false, false, false,
                           GgufTensorRole::kEmbeddingTable, e.ggml_type,
-                          {2, 8, e.k}) == GgufResidency::kExpandBf16);
+                          {2, 8, e.k}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
     // And the oracle switch still wins over everything.
     CHECK(RouteGgufTensor(true, false, false, true,
                           GgufTensorRole::kEmbeddingTable, e.ggml_type,
-                          {8, e.k}) == GgufResidency::kExpandBf16);
+                          {8, e.k}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   }
   // IQ4_NL at the SHIPPED shape: 160 is 5 whole 32-element blocks.
   CHECK(RouteGgufTensor(true, false, false, false,
                         GgufTensorRole::kEmbeddingTable, 20u,
-                        {320001536, 160}) == GgufResidency::kKeepQuant);
+                        {320001536, 160}, vt::DeviceType::kCPU) == GgufResidency::kKeepQuant);
   // The case that separates "the reader knows this id" from "this build can
   // gather it" is Q1_0 (41): tabulated by the READER, decodable by nobody here.
   // It must expand, or the table would be kept as bytes nothing can read.
   CHECK(RouteGgufTensor(true, false, false, false,
                         GgufTensorRole::kEmbeddingTable, 41u,
-                        {8, 128}) == GgufResidency::kExpandBf16);
+                        {8, 128}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   // IQ2_XS (17) and IQ4_XS (23) keep on BOTH arms as of QUANT-GGUF-IQ-VECDOT
   // (#2247). They kept on the gather arm from #2245, on a row decoder alone;
   // the GEMM arm additionally wanted a `vec_dot`, and now has one. This is the
@@ -648,19 +767,19 @@ TEST_CASE("a quantized GATHER TABLE keeps its blocks, per encoding and per K") {
     CAPTURE(id);
     CHECK(RouteGgufTensor(true, false, false, false,
                           GgufTensorRole::kEmbeddingTable, id,
-                          {8, 256}) == GgufResidency::kKeepQuant);
+                          {8, 256}, vt::DeviceType::kCPU) == GgufResidency::kKeepQuant);
     CHECK(RouteGgufTensor(true, false, false, false,
                           GgufTensorRole::kMatmulWeight, id,
-                          {8, 256}) == GgufResidency::kKeepQuant);
+                          {8, 256}, vt::DeviceType::kCPU) == GgufResidency::kKeepQuant);
     // The stacked-expert role is the one that actually carries them in the
     // artifact: all 82 IQ2_XS tensors are `blk.N.ffn_{gate,up}_exps.weight`.
     CHECK(RouteGgufTensor(true, false, false, false,
                           GgufTensorRole::kStackedExpertWeight, id,
-                          {4, 8, 256}) == GgufResidency::kKeepQuant);
+                          {4, 8, 256}, vt::DeviceType::kCPU) == GgufResidency::kKeepQuant);
     // A ragged K still expands: 256-element super-blocks admit no partial row.
     CHECK(RouteGgufTensor(true, false, false, false,
                           GgufTensorRole::kMatmulWeight, id,
-                          {8, 255}) == GgufResidency::kExpandBf16);
+                          {8, 255}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   }
 }
 
@@ -748,8 +867,12 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   // keep_f16 additionally requires an f16-capable MatmulBT on the running
   // device (review #523): the ROCm kernel accepts bf16/f32 only, so keep_f16
   // is OFF on ROCm regardless of expand_nk.
-  const bool f16_device_ok =
-      vllm::platforms::CurrentPlatform().device_type() != vt::DeviceType::kROCM;
+  // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: read off the device the policies below
+  // are BUILT FOR, not off the host. The two used to be the same read, which is
+  // why they could not disagree; now that the device is a parameter, an
+  // expectation that probed the host would contradict a policy resolved for
+  // another device.
+  const bool f16_device_ok = vt::DeviceType::kCPU != vt::DeviceType::kROCM;
   const auto keep_f16_expected = [&](const GgufLoadPolicy& q) {
     return q.expand_nk && f16_device_ok;
   };
@@ -760,9 +883,9 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     // the same rule on a CPU-only build (available -> ON) and on a CUDA build
     // (kMatmulBTQuant unregistered for kCUDA -> OFF, and the loader keeps
     // expanding to bf16 exactly as before).
-    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
-    CHECK(p.keep_quant == vllm::GgufQuantComputeAvailable());
-    CHECK(p.expand_nk == vllm::GgufQuantComputeAvailable());
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
+    CHECK(p.keep_quant == vllm::GgufQuantComputeAvailable(vt::DeviceType::kCPU));
+    CHECK(p.expand_nk == vllm::GgufQuantComputeAvailable(vt::DeviceType::kCPU));
     // L7 (2026-07-23): keep-f16 is now DEFAULT ON wherever expand_nk holds — the
     // repack-source release + load-time prefault removed L6's two objections
     // (RSS-neutral, prefill regression), so it buys 1.05 GiB of peak RSS with
@@ -780,38 +903,41 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     // becomes a live question for QUANT-GGUF-KEEPQ-LOADER. Should that happen,
     // THIS assertion is one of the things that has to change, so it is flagged
     // here rather than discovered when it goes red.
-    CHECK(p.keep_f16 == (vllm::GgufQuantComputeAvailable() && f16_device_ok));
+    CHECK(p.keep_f16 == (vllm::GgufQuantComputeAvailable(vt::DeviceType::kCPU) && f16_device_ok));
     CHECK_FALSE(p.cpu_ref);
   }
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
-  CHECK(GgufLoadPolicy::FromEnv().keep_quant);
-  CHECK(GgufLoadPolicy::FromEnv().expand_nk);
+  CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_quant);
+  CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).expand_nk);
   // L7: keep-f16 defaults to expand_nk (true here, keep-quant is env-forced ON).
   // NB compare to expand_nk, NOT GgufQuantComputeAvailable(): with keep-quant
   // env-forced, expand_nk holds even on a CUDA build where the quant GEMM is
   // unregistered (GgufQuantComputeAvailable() is false there).
-  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
+  CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16 ==
+        keep_f16_expected(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU)));
   // The opt-out must work after the default flip.
   ::setenv("VT_GGUF_KEEP_F16", "0", 1);
-  CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_f16);
+  CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16);
   ::unsetenv("VT_GGUF_KEEP_F16");
   // The OPT-OUT the spec promised must survive the default flip.
   for (const char* off : {"0", "false", "off", ""}) {
     ::setenv("VT_GGUF_KEEP_QUANT", off, 1);
     CAPTURE(off);
-    CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_quant);
-    CHECK_FALSE(GgufLoadPolicy::FromEnv().expand_nk);
-    CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_f16);
+    CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_quant);
+    CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).expand_nk);
+    CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16);
   }
   // VT_GGUF_KEEP_F16=1 opts IN, but ONLY where expand_nk holds (CPU, not oracle);
   // it is inert with keep-quant off (nothing to keep) or under VT_CPU_REF.
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   ::setenv("VT_GGUF_KEEP_F16", "1", 1);
-  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
+  CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16 ==
+        keep_f16_expected(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU)));
   for (const char* on : {"1", "true", "on"}) {
     ::setenv("VT_GGUF_KEEP_F16", on, 1);
     CAPTURE(on);
-    CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
+    CHECK(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU).keep_f16 ==
+        keep_f16_expected(GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU)));
   }
   ::unsetenv("VT_GGUF_KEEP_F16");
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
@@ -821,7 +947,7 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     // orientation and keep-f16 with it, so VT_CPU_REF=1 is the FULL historical
     // load.
     ::setenv("VT_GGUF_KEEP_F16", "1", 1);
-    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK(p.keep_quant);
     CHECK(p.cpu_ref);
     CHECK_FALSE(p.expand_nk);
@@ -839,14 +965,18 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
 // this CPU test binary the quantized GEMM IS registered, so the availability
 // probe must say so — otherwise the flip above would be vacuous.
 TEST_CASE("GgufQuantComputeAvailable tracks the kMatmulBTQuant registration") {
-  CHECK(vllm::GgufQuantComputeAvailable() ==
-        vt::OpRegistered(vt::OpId::kMatmulBTQuant,
-                         vllm::platforms::CurrentPlatform().device_type()));
-  if (vllm::platforms::CurrentPlatform().is_cpu()) {
-    // CPU-only build: the CPU kernel IS registered, so keep-quant is live and
-    // the default flip is not vacuous.
-    CHECK(vllm::GgufQuantComputeAvailable());
+  // Both sides name the SAME device, which is the point of the parameter: this
+  // used to read the process's platform on the right and the same probe,
+  // implicitly, on the left, so it could not fail.
+  for (vt::DeviceType d : {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                           vt::DeviceType::kROCM, vt::DeviceType::kMETAL}) {
+    CAPTURE(std::string(vt::DeviceTypeName(d)));
+    CHECK(vllm::GgufQuantComputeAvailable(d) ==
+          vt::OpRegistered(vt::OpId::kMatmulBTQuant, d));
   }
+  // The CPU kernel IS registered in this binary, so keep-quant is live for a
+  // CPU-resolved load and the default flip above is not vacuous.
+  CHECK(vllm::GgufQuantComputeAvailable(vt::DeviceType::kCPU));
 }
 
 // ===========================================================================
@@ -1307,7 +1437,7 @@ TEST_CASE("production default is keep-quant wherever the quant GEMM exists") {
   // that leaves it off would differ from the env load on the repacked weights
   // (this bit was invisible on x86 CI, where repack is off — L6 fix).
   GgufLoadPolicy expect;
-  expect.keep_quant = vllm::GgufQuantComputeAvailable();
+  expect.keep_quant = vllm::GgufQuantComputeAvailable(vt::DeviceType::kCPU);
   expect.expand_nk = expect.keep_quant;
   // L7: keep_f16 defaults ON with the quant path, so `expect` must mirror it or
   // the byte comparison diverges on any F16 verbatim weight in the fixture.
@@ -1315,7 +1445,12 @@ TEST_CASE("production default is keep-quant wherever the quant GEMM exists") {
   expect.mmap_residency = expect.keep_quant;
   expect.share_tied_head = expect.keep_quant;
   expect.gdn_expand_nk = expect.keep_quant;
-  expect.quant_repack = expect.keep_quant && vt::cpu::QuantRepackActive();
+  // #2406: the mirror carries the DEVICE term too, or an i8mm host would
+  // compare an env load (kCPU-resolved) against a policy that decided without
+  // one. `kCPU` is the device this whole case resolves for.
+  expect.quant_repack = vllm::QuantRepackForDevice(
+      expect.keep_quant, /*cpu_ref=*/false, vt::cpu::QuantRepackActive(),
+      vt::DeviceType::kCPU);
 
   const vllm::Qwen3_5DenseWeights from_env =
       vllm::LoadQwen3_5DenseFromGguf(g, c, /*policy=*/nullptr);
@@ -1690,7 +1825,7 @@ TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
   ::unsetenv("VT_GGUF_SHARE_TIED_HEAD");
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   {
-    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK(p.keep_quant);
     CHECK(p.expand_nk);
     CHECK(p.mmap_residency);   // defaults ON with keep-quant
@@ -1702,7 +1837,7 @@ TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
     CAPTURE(off);
     ::setenv("VT_GGUF_MMAP", off, 1);
     ::setenv("VT_GGUF_SHARE_TIED_HEAD", off, 1);
-    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK(p.keep_quant);
     CHECK_FALSE(p.mmap_residency);
     CHECK_FALSE(p.share_tied_head);
@@ -1713,7 +1848,7 @@ TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
   ::unsetenv("VT_GGUF_SHARE_TIED_HEAD");
   ::setenv("VT_GGUF_KEEP_QUANT", "0", 1);
   {
-    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK_FALSE(p.mmap_residency);
     CHECK_FALSE(p.share_tied_head);
   }
@@ -1723,7 +1858,7 @@ TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
   ::setenv("VT_GGUF_SHARE_TIED_HEAD", "1", 1);
   ::setenv("VT_CPU_REF", "1", 1);
   {
-    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
     CHECK(p.cpu_ref);
     CHECK_FALSE(p.expand_nk);
     CHECK_FALSE(p.mmap_residency);
@@ -1875,35 +2010,37 @@ TEST_CASE("keep-f16 routing: F16 matmul/expert/embed keep, others expand") {
   const uint32_t f16 = kF16;
   // The keep-eligible roles + right rank keep f16 ONLY when keep_f16 is on.
   CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kMatmulWeight,
-                        f16, {8, 64}) == GgufResidency::kKeepF16);
+                        f16, {8, 64}, vt::DeviceType::kCPU) == GgufResidency::kKeepF16);
   CHECK(RouteGgufTensor(false, true, false, false,
-                        GgufTensorRole::kStackedExpertWeight, f16, {2, 8, 64}) == GgufResidency::kKeepF16);
+                        GgufTensorRole::kStackedExpertWeight, f16,
+                        {2, 8, 64}, vt::DeviceType::kCPU) ==
+        GgufResidency::kKeepF16);
   // The embedding table keeps f16 too (a gather widens f16 like bf16); this is
   // what lets a tied token_embd/lm_head be ONE resident f16 vocab matrix.
   CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kEmbeddingTable,
-                        f16, {32, 64}) == GgufResidency::kKeepF16);
+                        f16, {32, 64}, vt::DeviceType::kCPU) == GgufResidency::kKeepF16);
   // Value/layout-rewritten, conv and vector roles NEVER keep, even f16.
   for (GgufTensorRole role :
        {GgufTensorRole::kTransformedWeight, GgufTensorRole::kConvWeight,
         GgufTensorRole::kVector}) {
     CAPTURE(vllm::Name(role));
-    CHECK(RouteGgufTensor(false, true, false, false, role, f16, {8, 64}) ==
+    CHECK(RouteGgufTensor(false, true, false, false, role, f16, {8, 64}, vt::DeviceType::kCPU) ==
           GgufResidency::kExpandBf16);
   }
   // Wrong rank never keeps.
   CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kMatmulWeight,
-                        f16, {64}) == GgufResidency::kExpandBf16);
+                        f16, {64}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   // keep_f16 OFF -> expand; VT_CPU_REF -> expand; a non-f16 type -> no keep-f16.
   CHECK(RouteGgufTensor(false, false, false, false, GgufTensorRole::kMatmulWeight,
-                        f16, {8, 64}) == GgufResidency::kExpandBf16);
+                        f16, {8, 64}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   CHECK(RouteGgufTensor(true, true, false, true, GgufTensorRole::kMatmulWeight, f16,
-                        {8, 64}) == GgufResidency::kExpandBf16);
+                        {8, 64}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kMatmulWeight,
-                        kQ8_0, {8, 64}) == GgufResidency::kExpandBf16);
+                        kQ8_0, {8, 64}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   // keep-quant WINS over keep-f16 when both are on and the encoding is a block
   // type (they are mutually exclusive by encoding, so this only asserts order).
   CHECK(RouteGgufTensor(true, true, false, false, GgufTensorRole::kMatmulWeight,
-                        kQ8_0, {8, 64}) == GgufResidency::kKeepQuant);
+                        kQ8_0, {8, 64}, vt::DeviceType::kCPU) == GgufResidency::kKeepQuant);
 }
 
 // `QUANT-GGUF-NVFP4` column C — the fp4 residency's routing contract.
@@ -1913,18 +2050,18 @@ TEST_CASE("nvfp4 routing: type 40 in a verbatim role gets the fp4 residency") {
   // number of 64-element NVFP4 blocks.
   CHECK(RouteGgufTensor(false, false, /*nvfp4_fp4=*/true, false,
                         GgufTensorRole::kMatmulWeight, nvfp4,
-                        {8, 128}) == GgufResidency::kNvfp4Fp4);
+                        {8, 128}, vt::DeviceType::kCPU) == GgufResidency::kNvfp4Fp4);
   CHECK(RouteGgufTensor(false, false, /*nvfp4_fp4=*/true, false,
                         GgufTensorRole::kStackedExpertWeight, nvfp4,
-                        {2, 8, 128}) == GgufResidency::kNvfp4Fp4);
+                        {2, 8, 128}, vt::DeviceType::kCPU) == GgufResidency::kNvfp4Fp4);
   // Independent of keep_quant / keep_f16: NVFP4 is neither a vt block dtype nor
   // F16, so those switches cannot produce (or suppress) this residency.
   CHECK(RouteGgufTensor(true, true, /*nvfp4_fp4=*/true, false,
                         GgufTensorRole::kMatmulWeight, nvfp4,
-                        {8, 128}) == GgufResidency::kNvfp4Fp4);
+                        {8, 128}, vt::DeviceType::kCPU) == GgufResidency::kNvfp4Fp4);
   CHECK(RouteGgufTensor(true, true, /*nvfp4_fp4=*/false, false,
                         GgufTensorRole::kMatmulWeight, nvfp4,
-                        {8, 128}) == GgufResidency::kExpandBf16);
+                        {8, 128}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
 
   // Roles whose value or layout is rewritten at load NEVER go fp4-resident —
   // this is what keeps the GDN V-head reorders and the (w-1) norm rewrite
@@ -1933,40 +2070,40 @@ TEST_CASE("nvfp4 routing: type 40 in a verbatim role gets the fp4 residency") {
        {GgufTensorRole::kTransformedWeight, GgufTensorRole::kEmbeddingTable,
         GgufTensorRole::kConvWeight, GgufTensorRole::kVector}) {
     CAPTURE(vllm::Name(role));
-    CHECK(RouteGgufTensor(false, false, true, false, role, nvfp4, {8, 128}) ==
+    CHECK(RouteGgufTensor(false, false, true, false, role, nvfp4, {8, 128}, vt::DeviceType::kCPU) ==
           GgufResidency::kExpandBf16);
     CHECK(RouteGgufTensor(false, false, true, false, role, nvfp4,
-                          {2, 8, 128}) == GgufResidency::kExpandBf16);
+                          {2, 8, 128}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   }
   // Wrong rank for the role never keeps.
   CHECK(RouteGgufTensor(false, false, true, false,
                         GgufTensorRole::kMatmulWeight, nvfp4,
-                        {128}) == GgufResidency::kExpandBf16);
+                        {128}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   CHECK(RouteGgufTensor(false, false, true, false,
                         GgufTensorRole::kStackedExpertWeight, nvfp4,
-                        {8, 128}) == GgufResidency::kExpandBf16);
+                        {8, 128}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   // A ragged K cannot be repacked block-wise, so it expands. 128 keeps, 96 (a
   // multiple of 16 and 32 but NOT of the 64-element ggml block) does not.
   CHECK(RouteGgufTensor(false, false, true, false,
                         GgufTensorRole::kMatmulWeight, nvfp4,
-                        {8, 96}) == GgufResidency::kExpandBf16);
+                        {8, 96}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   CHECK(RouteGgufTensor(false, false, true, false,
                         GgufTensorRole::kMatmulWeight, nvfp4,
-                        {8, 0}) == GgufResidency::kExpandBf16);
+                        {8, 0}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   // The VT_CPU_REF oracle wins over the fp4 residency, like every other one.
   CHECK(RouteGgufTensor(false, false, true, /*cpu_ref=*/true,
                         GgufTensorRole::kMatmulWeight, nvfp4,
-                        {8, 128}) == GgufResidency::kExpandBf16);
+                        {8, 128}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   // And the switch is NVFP4-specific: it does not divert any other encoding.
   for (const Encoding& e : kEncodings) {
     CAPTURE(e.name);
     CHECK(RouteGgufTensor(false, false, true, false,
                           GgufTensorRole::kMatmulWeight, e.ggml_type,
-                          {8, e.k}) == GgufResidency::kExpandBf16);
+                          {8, e.k}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   }
   CHECK(RouteGgufTensor(false, false, true, false,
                         GgufTensorRole::kMatmulWeight, kF16,
-                        {8, 128}) == GgufResidency::kExpandBf16);
+                        {8, 128}, vt::DeviceType::kCPU) == GgufResidency::kExpandBf16);
   CHECK(vllm::KeepNvfp4DType(40));
   CHECK_FALSE(vllm::KeepNvfp4DType(kQ8_0));
   CHECK_FALSE(vllm::KeepNvfp4DType(kF16));
@@ -2277,4 +2414,109 @@ TEST_CASE("tied F16 head SHARES one f16 vocab matrix (copy AND mmap)") {
       CHECK(std::memcmp(head.data(), want.data(), want.size()) == 0);
     }
   }
+}
+
+// ENG-GGUF-RESIDENCY-RESOLVED-DEVICE ------------------------------------------
+//
+// `RouteGgufTensor` and `GgufLoadPolicy::FromEnv` used to read the device from
+// `vllm::platforms::CurrentPlatform().device_type()`. That is the accelerator
+// PROBE, and it answers `kCUDA` on every process where `platforms/cuda.cpp`'s
+// `Registrar` saw a usable GPU — including a load the ENGINE resolved onto the
+// CPU queue, because `LoadedEngine::ResolveExplicitDeviceType` returns `kCPU`
+// for an explicit `--device cpu` "even on a CUDA-capable build/process".
+//
+// So the residency policy and the queue the forward runs on disagreed by
+// construction, on every GGUF model. The device is now a PARAMETER with no
+// default, which is what lets these cases run on a CPU-only host at all.
+TEST_CASE("gguf residency: the routed device is a parameter, and it decides") {
+  // The gather arm is the sharpest case: `DeviceQuantGatherSupported` answers
+  // the OP TABLE (`OpId::kEmbeddingQuant`, #2396), and Metal registers no
+  // gather in any build. Same tensor, same flags, same file bytes — two
+  // devices, two residencies. Metal rather than CUDA on purpose: CUDA's answer
+  // became build-dependent when #2396 landed, so naming it here would state a
+  // fact this case does not own and would go red on a CUDA lane alone.
+  const std::vector<int64_t> table = {320001536, 160};
+  CHECK(vllm::RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                              /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
+                              vllm::GgufTensorRole::kEmbeddingTable,
+                              /*ggml_type=*/8u, table,
+                              vt::DeviceType::kCPU) ==
+        vllm::GgufResidency::kKeepQuant);
+  // Metal, NOT CUDA, for the hard-coded contrast. This case owns one claim —
+  // the DEVICE PARAMETER decides — and it must not also freeze WHICH devices
+  // can gather, because #2396 is concurrently giving CUDA a block-decoding
+  // gather. A `kCUDA` literal here would go red on that landing for a reason
+  // this row has no opinion about, and worse, it would do so invisibly: these
+  // cases sit at the end of the file and merge cleanly with #2396, and on a
+  // CPU-only CI build the red would not appear at all. Metal has no gather arm
+  // in any build, so it stays a valid contrast across both.
+  CHECK(vllm::RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                              /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
+                              vllm::GgufTensorRole::kEmbeddingTable,
+                              /*ggml_type=*/8u, table,
+                              vt::DeviceType::kMETAL) ==
+        vllm::GgufResidency::kExpandBf16);
+
+  // Every device, with the expectation DERIVED from the gate rather than from a
+  // list written here. This is what keeps the claim ("the parameter decides")
+  // separable from the fact ("only the CPU gathers today"): when a backend
+  // gains a gather, this loop follows it and the case above still discriminates.
+  for (vt::DeviceType d : {vt::DeviceType::kCPU, vt::DeviceType::kCUDA,
+                           vt::DeviceType::kMETAL, vt::DeviceType::kVULKAN,
+                           vt::DeviceType::kROCM}) {
+    CAPTURE(std::string(vt::DeviceTypeName(d)));
+    const vllm::GgufResidency want = vllm::DeviceQuantGatherSupported(d)
+                                         ? vllm::GgufResidency::kKeepQuant
+                                         : vllm::GgufResidency::kExpandBf16;
+    CHECK(vllm::RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                                /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
+                                vllm::GgufTensorRole::kEmbeddingTable,
+                                /*ggml_type=*/8u, table, d) == want);
+  }
+
+  // The GEMM arm's device gate is per DTYPE, and ROCm's kernel set is narrower
+  // than the CPU's: Q4_0 (ggml type 2) has no ROCm keep-quant `vec_dot`.
+  const std::vector<int64_t> w = {8, 256};
+  CHECK(vllm::RouteGgufTensor(true, false, false, false,
+                              vllm::GgufTensorRole::kMatmulWeight,
+                              /*ggml_type=*/2u, w, vt::DeviceType::kCPU) ==
+        vllm::GgufResidency::kKeepQuant);
+  CHECK(vllm::RouteGgufTensor(true, false, false, false,
+                              vllm::GgufTensorRole::kMatmulWeight,
+                              /*ggml_type=*/2u, w, vt::DeviceType::kROCM) ==
+        vllm::GgufResidency::kExpandBf16);
+}
+
+TEST_CASE("gguf residency: the policy carries its device, and Route uses it") {
+  // `FromEnv` resolves four flags from the device. `keep_f16` is the one that
+  // is device-dependent WITHOUT depending on which ops this build registered,
+  // so it is the flag that reads the same on a CPU-only and on a CUDA build:
+  // `DeviceKeepF16Supported` is false for ROCm alone.
+  vllm::GgufLoadPolicy cpu = vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
+  vllm::GgufLoadPolicy rocm =
+      vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM);
+  CHECK(cpu.device == vt::DeviceType::kCPU);
+  CHECK(rocm.device == vt::DeviceType::kROCM);
+  CHECK_FALSE(rocm.keep_f16);
+  CHECK(cpu.keep_f16 == (cpu.expand_nk));
+
+  // And `Route` carries the policy's device down to the decision, rather than
+  // asking the platform a second question. Proven on the gather, whose answer
+  // differs between the two devices: a `Route` that ignored `device` would
+  // return the same residency for both policies on a CPU-only build.
+  vllm::GgufTensorInfo t;
+  t.name = "per_layer_token_embd.weight";
+  t.ggml_type = 8u;             // Q8_0 — a block encoding with a row decoder
+  t.shape = {320001536, 160};
+  vllm::GgufLoadPolicy keep_cpu = cpu;
+  keep_cpu.keep_quant = true;
+  // Metal for the same reason as the case above: this asserts that `Route`
+  // reads `policy.device`, not which devices gather.
+  vllm::GgufLoadPolicy keep_metal =
+      vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kMETAL);
+  keep_metal.keep_quant = true;
+  CHECK(keep_cpu.Route(t, vllm::GgufTensorRole::kEmbeddingTable) ==
+        vllm::GgufResidency::kKeepQuant);
+  CHECK(keep_metal.Route(t, vllm::GgufTensorRole::kEmbeddingTable) ==
+        vllm::GgufResidency::kExpandBf16);
 }

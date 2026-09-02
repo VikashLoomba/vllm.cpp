@@ -61,6 +61,7 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <string>
@@ -77,6 +78,8 @@
 #include "vllm/model_executor/models/qwen3_5.h"      // ForwardLogits, *KvCache
 #include "vllm/v1/attention/backend.h"               // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"     // GDNAttentionMetadata
+#include "vt/backend.h"  // W9c-3a: vt::TryGetBackend
+#include "vt/op_provider.h"  // W9c-3a: vt::OpRegistered
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
@@ -721,20 +724,118 @@ TEST_CASE("glm5_next forward: a TIED head reads the embedding table") {
 
 // ═══ (4) the narrow refusals ═══════════════════════════════════════════════
 
-TEST_CASE("glm5_next forward: a NON-CPU queue is refused BY NAME") {
-  // Every buffer on this path is a host `std::vector<float>` and
-  // `vt::MoeRouterTopK` dispatches on the queue's device, so a device queue
-  // here hands a kernel host pointers. That is a crash and not a fallback, and
-  // a refusal is what stands between the two.
+TEST_CASE("glm5_next forward W9c-3a: the queue is SPLIT, and a device that is "
+          "neither CPU nor CUDA is refused BY NAME") {
+  // W9c-3a replaced the blanket non-CPU refusal. The premise it stood on is
+  // unchanged and is now asserted one level down (`MoeExpertsKeepQuant`'s host
+  // arm refuses a non-CPU queue): nearly every buffer on this path is a host
+  // `std::vector<float>`, and the ops dispatch on the queue's device. What
+  // changed is that ONE arm can put its operands on a device, so the forward
+  // interposes a CPU queue for the rest instead of refusing the step.
+  //
+  // Two things must still be refused, and this case is both of them.
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
-  Step step({1, 2});
-  step.queue = vt::Queue{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
-  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
-                       doctest::Contains("non-CPU queue"), std::runtime_error);
-  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
-                       doctest::Contains("#2241"), std::runtime_error);
+
+  SUBCASE("a device with no provider for the two grouped ops") {
+    // kMETAL registers neither `kMoeGateUpSwiGLUGrouped` nor
+    // `kMatmulBTQuantGrouped`. Refusing here names this model, both ops and
+    // which of them is missing; letting it through would throw from inside an
+    // op about a device type, several frames from anything a reader could act
+    // on.
+    //
+    // The refusal asks the OP TABLE and names no device, which is what
+    // `scripts/check-device-leakage.py` requires of the device-agnostic layer
+    // and is why this case asserts on the provider words rather than on
+    // "--device cuda".
+    Step step({1, 2});
+    step.queue = vt::Queue{vt::Device{vt::DeviceType::kMETAL, 0}, nullptr};
+    REQUIRE_FALSE(vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped,
+                                   vt::DeviceType::kMETAL));
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("routed-expert keep-quant GEMM"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("provider: NO"), std::runtime_error);
+    CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                         doctest::Contains("#2464"), std::runtime_error);
+  }
+
+  SUBCASE("the device arm is OPT-IN, so the DEFAULT refuses a device queue") {
+    // W9c-3a's device split defaults OFF after both `--device cuda` legs on the
+    // real artifact died with SIGSEGV (spec O46). The default must therefore be
+    // a REFUSAL, byte-for-byte the behaviour of the tree before this wave --
+    // turning a clean error into a segfault is strictly worse for a user.
+    //
+    // This case only has something to assert where the op table admits the
+    // device, because the op-table refusal above is ordered first and wins.
+    // On a CPU-only build nothing registers the pair, so the guard under test
+    // is unreachable and the case says so rather than asserting a message it
+    // would get for the wrong reason.
+    const vt::DeviceType dev = vt::DeviceType::kCUDA;
+    const bool pair_here = vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, dev) &&
+                           vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, dev) &&
+                           vt::TryGetBackend(vt::Device{dev, 0}) != nullptr;
+    if (!pair_here) {
+      MESSAGE("no CUDA provider for the grouped pair: the OPT-IN guard is "
+              "unreachable on this build and is gated on dgx:gpu0 instead");
+    } else if (std::getenv("VT_GLM5_NEXT_DEVICE_EXPERTS") != nullptr) {
+      MESSAGE("VT_GLM5_NEXT_DEVICE_EXPERTS is set in this environment: the "
+              "default-off guard cannot be observed here");
+    } else {
+      Step step({1, 2});
+      step.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("OPT-IN"), std::runtime_error);
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("SIGSEGV"), std::runtime_error);
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("--device cpu"), std::runtime_error);
+    }
+  }
+
+  SUBCASE("the probe follows the OP TABLE and not a device name") {
+    // The discriminating half of the previous case. A refusal that hardcoded a
+    // device name would answer identically for kMETAL and differently for a
+    // device that DOES register the pair -- so the assertion is that the
+    // predicate and the op table agree, whatever this build registered.
+    //
+    // On a CPU-only build no non-CPU device registers the pair and every such
+    // queue is refused. On a CUDA build kCUDA registers both and the step
+    // proceeds, which is what the `dgx:gpu0` end-to-end leg measures and what
+    // this host lane cannot.
+    const vt::DeviceType dev = vt::DeviceType::kCUDA;
+    const bool pair_here = vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, dev) &&
+                           vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, dev) &&
+                           vt::TryGetBackend(vt::Device{dev, 0}) != nullptr;
+    Step step({1, 2});
+    step.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+    if (!pair_here) {
+      CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, step.Get()),
+                           doctest::Contains("routed-expert keep-quant GEMM"),
+                           std::runtime_error);
+    } else {
+      // The op-table refusal is correctly NOT taken here. The step is still
+      // refused, by the OPT-IN guard the subcase above covers, so this branch
+      // asserts only that whatever fires is NOT the op-table one -- caught by
+      // hand, because doctest::Contains has no negation.
+      Step s2({1, 2});
+      s2.queue = vt::Queue{vt::Device{dev, 0}, nullptr};
+      std::string what;
+      try {
+        vllm::ModelRegistry::Forward(*model, s2.Get());
+      } catch (const std::exception& e) {
+        what = e.what();
+      }
+      CHECK(what.find("cannot run the one primitive") == std::string::npos);
+    }
+  }
+
+  SUBCASE("a CPU queue is NOT refused, so the split is not a blanket") {
+    Step step({1, 2});
+    CHECK_NOTHROW(vllm::ModelRegistry::Forward(*model, step.Get()));
+  }
 }
 
 TEST_CASE("glm5_next forward: a MULTI-REQUEST step is refused BY NAME") {

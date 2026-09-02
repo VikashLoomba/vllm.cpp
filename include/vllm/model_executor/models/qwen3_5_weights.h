@@ -221,6 +221,26 @@ struct OwnedTensor {
 // behavior (house convention for a default-on residency change).
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 
+// The whole of `src` as a ZERO-COPY view: same bytes, shape, dtype, `nk` and
+// layout markers, with a keep-alive on `src`'s buffer.
+//
+// WHY THIS EXISTS RATHER THAN `OwnedTensor b = a;`. `OwnedTensor`'s implicit
+// copy DEEP-COPIES an owned `OwnedBytes`, and a per-step block adapter that
+// spells the pass-through as assignment therefore reallocates the weight on
+// every step. That is not only traffic. `ResidentWeight`'s host-alias arm hands
+// a device kernel `w.bytes.data()` directly, so the copy's buffer becomes the
+// GEMM's operand, and the copy dies at the end of the layer's scope while the
+// GEMM is still queued: `Warp illegal address` inside cuBLASLt, with every
+// declared extent correct (issue #2476, `.agents/specs/gdn-qkvz-operand-lifetime.md`).
+// The view keeps the operand owned by the model, which is the invariant.
+//
+// `src` is NON-CONST because `OwnedBytes::KeepAlive()` converts an owned buffer
+// into a shared read-only one in place. Nothing may write through `src` after
+// that, which is already true of every weight this serves: they are read-only
+// from the end of the load. `KeepAlive()` is taken BEFORE `data()`, so the view
+// can never depend on `std::vector`'s move preserving the heap address.
+OwnedTensor BorrowWholeOwnedTensor(OwnedTensor& src);
+
 // The alignment a HOST pointer must meet before a device kernel may be handed it
 // in place of the `Backend::Alloc` pointer it would otherwise have received.
 //
@@ -517,7 +537,7 @@ struct Exl3Weight {
   // `Exl3Weight`, which is the same shape as reading marker ABSENCE as MCG.
   // -1 is not a codebook, so anything that forgets to set it refuses at
   // `Exl3DecodeCodeword` by name instead of decoding to plausible garbage.
-  int codebook = -1;  // 0 == 3INST, 1 == MCG; SET IT EXPLICITLY
+  int codebook = -1;  // 0 == 3INST, 1 == MCG, 2 == mul1; SET IT EXPLICITLY
 
   bool Empty() const { return trellis.Empty(); }
 
@@ -865,6 +885,23 @@ struct FullAttnLayerWeights {
   // wherever the site exposes packed q/k/v views, because there is nothing to
   // trade off. Empty on every non-block owner.
   Fp8BlockMergedResident qkv_fp8_block_merged;
+
+  // QUANT-EXL3 (#2181) / MODEL-QWEN35-EXL3 (#2495 item 3): the exllamav3
+  // trellis arm of this tower. Q/K/V stay SEPARATE where the bf16, NVFP4 and
+  // block-FP8 arms above hold (or build) one merged owner: a trellis is
+  // `[k/16, n/16, 32*bits]`, so joining on the output dim interleaves per input
+  // tile rather than row-stacking, which is a real transform and owed its own
+  // gate (`## Owed` in `specs/quant-exl3-shared.md`). Exactly one of {bf16,
+  // fp4, per-tensor fp8, block fp8, exl3} is populated per layer.
+  Exl3Weight q_proj_exl3;  // [K=H,       N=2*Hq*Dh]
+  Exl3Weight k_proj_exl3;  // [K=H,       N=Hkv*Dh]
+  Exl3Weight v_proj_exl3;  // [K=H,       N=Hkv*Dh]
+  Exl3Weight o_proj_exl3;  // [K=Hq*Dh,   N=H]
+
+  // `q_proj_exl3` and not "any of the four": the loader fills all four together
+  // or none, and asking about the FIRST one keeps this predicate the same
+  // question the loader's own `IsExl3Projection(has, "...q_proj")` probe asked.
+  bool IsExl3() const { return !q_proj_exl3.Empty(); }
 };
 
 // Exact scalar processing for the three-shard CT NVFP4 QKVParallelLinear.

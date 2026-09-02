@@ -6431,20 +6431,49 @@ TEST_CASE("ltx2 video: a LAST-frame keyframe is APPENDED, and the sequence is tr
     auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
     REQUIRE(ltx2 != nullptr);
 
-    vllm::multimodal::VideoGenParams gen = request("one_stage_kf", kf_a_path);
-    gen.steps = 2;  // one_stage admits a step override; 50 would gate nothing extra
-    OneStageFixtureGuidance(&gen);
-    (void)engine->Generate(gen);
-    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    auto trace_for = [&](const std::string& tag, const std::string& keyframe) {
+      vllm::multimodal::VideoGenParams gen = request(tag, keyframe);
+      gen.steps = 2;  // one_stage admits a step override; 50 would gate nothing extra
+      OneStageFixtureGuidance(&gen);
+      (void)engine->Generate(gen);
+      return ltx2->last_conditioning();
+    };
+    const vllm::multimodal::Ltx2ConditioningTrace without = trace_for("one_stage_nokf", "");
+    const vllm::multimodal::Ltx2ConditioningTrace with = trace_for("one_stage_kf", kf_a_path);
 
-    // Both numbers are MEASURED, and the statement is the relation between them.
-    // Pinning either to a literal would pass on a build that read the grown
-    // count everywhere.
-    CHECK(trace.schedule_tokens > 0);
-    CHECK_MESSAGE(trace.video_tokens > trace.schedule_tokens,
-                  "the DiT ran over " << trace.video_tokens << " tokens and the schedule was "
-                                      << "built for " << trace.schedule_tokens
-                                      << "; equal means the append re-shifted the schedule");
+    // THE CLAIM, STATED DIRECTLY RATHER THAN THROUGH A PROXY (#2521).
+    //
+    // This subcase used to assert `video_tokens > schedule_tokens` on a single
+    // render. That inequality was never the claim; it was a SIDE EFFECT of the
+    // anchor happening to track the target grid, so it could only detect a
+    // re-shift while the engine sampled on `kTargetLatent`. Once `one_stage`
+    // moved to the 4096 anchor the inequality reversed — while the property it
+    // was standing in for became MORE true, not less.
+    //
+    // So the pair is measured instead: the same request rendered with and
+    // without a keyframe must build the SAME schedule. That detects a re-shift
+    // under either anchor, which the inequality could not, and it is the
+    // sentence the comment above has always been making.
+    CHECK(without.schedule_tokens > 0);
+    CHECK(with.schedule_tokens > 0);
+    CHECK_MESSAGE(with.schedule_tokens == without.schedule_tokens,
+                  "supplying a keyframe changed the schedule anchor from "
+                      << without.schedule_tokens << " to " << with.schedule_tokens
+                      << ", so the append re-shifted the whole trajectory");
+
+    // AND THE INSTRUMENT IS NOT BLIND: the append really did grow the sequence
+    // on the very renders compared above. Without this, a build where the
+    // keyframe never reached the forward would satisfy the equality trivially
+    // and this subcase would be measuring nothing.
+    CHECK_MESSAGE(with.video_tokens > without.video_tokens,
+                  "the keyframe render used " << with.video_tokens << " tokens against "
+                      << without.video_tokens << " without, so nothing was appended and the "
+                         "equality above is vacuous");
+
+    // The anchor `one_stage` actually took, named. `ti2vid_one_stage.py:207`
+    // passes no latent and vLLM-Omni hard-codes the max anchor
+    // (`ltx2_denoise.py:188`), so it is upstream's constant and not the grid.
+    CHECK(without.schedule_tokens == vllm::Ltx2SchedulerParams{}.default_number_of_tokens);
   }
 }
 
@@ -11262,7 +11291,7 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   // rather than on the recipe struct — the recipe case proves the field is SET,
   // and this one proves it is CONSUMED (#1013).
   //
-  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:32` is
   // `tokens = math.prod(latent.shape[2:]) if latent is not None else
   // default_number_of_tokens`, with `default_number_of_tokens` = MAX_SHIFT_ANCHOR
   // = 4096 (`:11`, `:29`). `ti2vid_two_stages.py:243-245` passes NO latent;
@@ -11419,6 +11448,179 @@ TEST_CASE("ltx2 ti2vid: stage 1's sigma shift takes the 4096 anchor, not the tar
   CHECK(vllm::Ltx2SigmaSchedule(rendered_steps, 0) == at_anchor);
 }
 
+TEST_CASE("ltx2 one_stage: stage 1's sigma shift takes the 4096 anchor, not the target grid") {
+  // ISSUE #2521, and the same 2x2 the `ti2vid` and `keyframe` cases above run,
+  // pointed at the arm that still fitted the shift on its own target grid.
+  //
+  // BOTH ORACLES SAY 4096, AND THEY SAY IT INDEPENDENTLY. vLLM-Omni — the
+  // PRIMARY, since it registers `ltx2` — puts the anchor in the expression and
+  // no token count anywhere near it: `sigma_shift = max_anchor * slope +
+  // (base_shift - slope * base_anchor)`, under the comment "Official LTX2
+  // one-stage intentionally uses the max sequence anchor, so the shift stays at
+  // max_shift" (ltx2_denoise.py:186-188 @ a4ea67a2). Lightricks selects by
+  // whether a latent is passed — `tokens = math.prod(latent.shape[2:]) if
+  // latent is not None else default_number_of_tokens` (schedulers.py:32, with
+  // `default_number_of_tokens = MAX_SHIFT_ANCHOR = 4096` at `:29`, `:11`) — and
+  // `ti2vid_one_stage.py:207` passes none.
+  //
+  // THROUGH THE PRODUCTION ENTRY POINT, not on the recipe struct. The recipe
+  // case in test_ltx2_pipeline.cpp proves the field is SET; this one proves it
+  // is CONSUMED, which is the half #1013 showed can be false on its own.
+  //
+  // A 2x2 OVER (recipe, geometry), because neither half is load-bearing alone.
+  // The equalities pass on a build that hard-codes 4096 for every arm; the
+  // inequalities pass on the tree this case was written against, where every
+  // derived arm read its target grid. Only the pair says the anchor is per-phase
+  // AND selected correctly. `res2s_two_stage` is the control precisely because
+  // it is upstream's ONE exception: `ti2vid_two_stages_hq.py:261-267` builds
+  // `empty_latent` from the stage-1 output shape and passes it, so its shift
+  // legitimately tracks the grid and must NOT move.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+
+  // Two geometries whose target grids differ. `one_stage` runs at
+  // `spatial_downscale = 1`, so `Ltx2AssertResolution`'s divisor is 32 here and
+  // 64 on the `res2s_two_stage` control; both sizes divide both.
+  const int64_t kSmall = 64;
+  const int64_t kLarge = 128;
+
+  // TWO NUMBERS OUT OF EACH RENDER. The trajectory assertions at the end
+  // recompute at the step count the RENDER used, read back out of it rather than
+  // restated as a literal down there — a literal would let someone lower
+  // `gen.steps` to 2 and leave every assertion green while making the trajectory
+  // claim vacuous.
+  struct Rendered {
+    int64_t schedule_tokens;
+    int64_t steps;
+  };
+
+  auto rendered_for = [&](const char* kind, int64_t size, const std::string& tag) -> Rendered {
+    vllm::multimodal::VideoModelParams mp = Ti2VidParams(ws.paths, lora);
+    mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = kind;
+    mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass(kind);
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    auto* ltx = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx != nullptr);
+    vllm::multimodal::VideoGenParams gen = Ti2VidGen(ws.root + "/" + tag, size);
+    // THREE STEPS, NOT THE FIXTURE'S TWO. `stretch` pins sigma[0] at 1.0 and the
+    // LAST non-zero sigma at `terminal` = 0.1 (schedulers.py:48-55), so a 2-step
+    // schedule is {1, 0.1, 0} for EVERY token count and the anchor cannot reach
+    // the trajectory at all. Three is the shortest schedule with an interior
+    // sigma for the shift to move. Lowering it is REFUSED rather than
+    // deprecated: the count comes back out of this lambda and the assertions at
+    // the end red by name on it.
+    gen.steps = 3;
+    // `Ti2VidGen` carries the STG override, which `one_stage` NEEDS — the
+    // reduced fixture DiT has two blocks and the params row names block 28, so
+    // without it the perturbed pass is refused by name. The HQ preset ships
+    // `stg_blocks = []` beside `stg_scale = 0.0` (constants.py:105, :113) and
+    // FIXES its stage-2 guidance, so giving it the same override is refused
+    // outright and the control has to take it back off.
+    if (std::string(kind) == "res2s_two_stage") {
+      gen.extras.erase(vllm::multimodal::kLtx2VideoStgBlocksExtra);
+      gen.extras.erase(vllm::multimodal::kLtx2AudioStgBlocksExtra);
+    }
+    (void)engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace t = ltx->last_conditioning();
+    REQUIRE(t.completed);
+    // Written only on the branch that CALLS `Ltx2SigmaSchedule`, so a phase
+    // carrying frozen sigmas leaves it 0.
+    REQUIRE(t.schedule_tokens > 0);
+    return Rendered{t.schedule_tokens, gen.steps};
+  };
+
+  const Rendered one_small_r = rendered_for("one_stage", kSmall, "one_small");
+  const Rendered one_large_r = rendered_for("one_stage", kLarge, "one_large");
+  const Rendered hq_small_r = rendered_for("res2s_two_stage", kSmall, "hq_small");
+  const Rendered hq_large_r = rendered_for("res2s_two_stage", kLarge, "hq_large");
+
+  const int64_t one_small = one_small_r.schedule_tokens;
+  const int64_t one_large = one_large_r.schedule_tokens;
+  const int64_t hq_small = hq_small_r.schedule_tokens;
+  const int64_t hq_large = hq_large_r.schedule_tokens;
+
+  // The step count the four renders ACTUALLY ran at, read back out of them. All
+  // four have to agree, or "the step count" is not one number and nothing below
+  // can be recomputed at it.
+  const int64_t rendered_steps = one_small_r.steps;
+  REQUIRE(one_large_r.steps == rendered_steps);
+  REQUIRE(hq_small_r.steps == rendered_steps);
+  REQUIRE(hq_large_r.steps == rendered_steps);
+
+  MESSAGE("one_stage: " << one_small << " / " << one_large << "   res2s: " << hq_small << " / "
+                        << hq_large);
+
+  // ── this arm's schedule is RESOLUTION-INDEPENDENT, at upstream's constant ──
+  const int64_t anchor = vllm::Ltx2SchedulerParams{}.default_number_of_tokens;
+  CHECK(anchor == 4096);  // schedulers.py:11 — pinned, not read back from the build
+  CHECK_MESSAGE(one_small == anchor,
+                "one_stage's sigma shift was fitted on " << one_small << " tokens, but upstream "
+                    "passes no latent (ti2vid_one_stage.py:207) and vLLM-Omni hard-codes the max "
+                    "anchor (ltx2_denoise.py:188), so both get " << anchor);
+  CHECK(one_large == anchor);
+
+  // ── and the HQ arm's is NOT, which is what stops the above being a constant ─
+  CHECK_MESSAGE(hq_small != hq_large,
+                "the res_2s arm reported the same anchor at two resolutions, so this fixture "
+                "cannot tell the two branches apart and the equalities above prove nothing");
+  CHECK(hq_small != anchor);
+  CHECK(hq_large != anchor);
+
+  // ── and the two anchors really do produce DIFFERENT sigmas ────────────────
+  //
+  // The strongest half: a claim about the trajectory rather than about the
+  // counter that reports it. `sigma_shift = tokens*mm + b` (schedulers.py:35-39),
+  // so two token counts give two schedules — unless the shift arithmetic has
+  // been flattened, in which case selecting the anchor would be inert and every
+  // assertion above would still pass.
+  const std::vector<float> at_anchor = vllm::Ltx2SigmaSchedule(rendered_steps, anchor);
+  const std::vector<float> at_target = vllm::Ltx2SigmaSchedule(rendered_steps, hq_small);
+  REQUIRE(at_anchor.size() == at_target.size());
+  CHECK_MESSAGE(at_anchor != at_target,
+                "the 4096 anchor and the target grid produce the SAME schedule on this fixture, "
+                "so nothing above measures which one was taken");
+
+  // AND THE RENDER'S STEP COUNT IS LOAD-BEARING. Two assertions, because they
+  // fail for different reasons: the first names the render's own count, so
+  // lowering `gen.steps` reds HERE rather than silently turning the comparison
+  // above into a value against itself; the second pins the degeneracy itself, so
+  // it reds if a scheduler change ever makes a 2-step schedule token-dependent.
+  CHECK_MESSAGE(rendered_steps > 2,
+                "the renders above ran at " << rendered_steps << " steps, and a schedule that "
+                "short is {1, 0.1, 0} for EVERY token count (schedulers.py:48-55), so the "
+                "trajectory comparison above compares a value with itself");
+  CHECK_MESSAGE(vllm::Ltx2SigmaSchedule(/*steps=*/2, anchor) ==
+                    vllm::Ltx2SigmaSchedule(/*steps=*/2, hq_small),
+                "a 2-step schedule now DOES depend on the token count, so the stretch no longer "
+                "pins both of its non-zero sigmas and the comment above is wrong");
+
+  // THE ORACLE'S OWN NUMBERS, at the geometry the adherence gate renders
+  // (320x192x25 -> a 4x6x10 one_stage grid, 240 tokens). Produced by running the
+  // PINNED `LTX2Scheduler.execute` at fd4ded7f both ways — not by transcribing
+  // this engine's output, which could not gate the function that produced it.
+  // The two sequences are what the flip is FOR: every interior sigma moves, and
+  // the target-grid arm leaves the high-noise regime early.
+  const std::vector<float> upstream_no_latent = {0.999999762F, 0.734179258F, 0.100000024F, 0.0F};
+  const std::vector<float> upstream_240 = {0.999999881F, 0.637402773F, 0.099999964F, 0.0F};
+  REQUIRE(upstream_no_latent != upstream_240);
+  const std::vector<float> ours_anchor = vllm::Ltx2SigmaSchedule(/*steps=*/3, anchor);
+  const std::vector<float> ours_240 = vllm::Ltx2SigmaSchedule(/*steps=*/3, /*tokens=*/240);
+  REQUIRE(ours_anchor.size() == upstream_no_latent.size());
+  for (size_t i = 0; i < ours_anchor.size(); ++i) {
+    INFO("i = " << i);
+    CHECK(ours_anchor[i] == doctest::Approx(upstream_no_latent[i]).epsilon(1e-6));
+    CHECK(ours_240[i] == doctest::Approx(upstream_240[i]).epsilon(1e-6));
+  }
+
+  // `Ltx2SigmaSchedule` reads 0 as "take the default", so the concrete 4096 the
+  // engine passes and the sentinel are the same schedule. Pinned because the
+  // engine deliberately passes the concrete value, so the trace reports an
+  // anchor rather than a sentinel.
+  CHECK(vllm::Ltx2SigmaSchedule(rendered_steps, 0) == at_anchor);
+}
+
 TEST_CASE("ltx2 ti2vid: the distilled-LoRA requirement refuses BY WHAT IS MISSING") {
   // `--distilled-lora` is `required=True` (utils/args.py:1140-1155) on the
   // parser ti2vid_two_stages.py:319 selects, and stage 2's three-sigma
@@ -11513,7 +11715,7 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
   // `image_conditionings_by_adding_guiding_latent` (helpers.py:343-367) from
   // `combined_image_conditionings` (:272-308): the second sends `frame_idx == 0`
   // to `VideoConditionByLatentIndex`, which REPLACES latent frame 0's clean
-  // tokens and never changes the token count (latent_cond.py:38-39); the first
+  // tokens and never changes the token count (latent_cond.py:40-41); the first
   // has NO branch and sends it to `VideoConditionByKeyframeIndex`, which APPENDS
   // a latent frame of tokens (keyframe_cond.py:79-82).
   //
@@ -11593,7 +11795,7 @@ TEST_CASE("ltx2 keyframe: the first frame is a KEYFRAME that APPENDS, not a late
   CHECK_MESSAGE(ti.video_tokens == bare.video_tokens,
                 "`combined_image_conditionings` sends frame 0 to "
                 "`VideoConditionByLatentIndex`, which replaces tokens that already exist "
-                "(latent_cond.py:38-39), so the count must not move — it went from "
+                "(latent_cond.py:40-41), so the count must not move — it went from "
                     << bare.video_tokens << " to " << ti.video_tokens);
   CHECK(kf_bare.video_tokens == bare.video_tokens);
 
@@ -11862,7 +12064,7 @@ TEST_CASE("ltx2 keyframe: the pipeline renders through vllm.h, guided on the UNA
 }
 
 TEST_CASE("ltx2 keyframe: stage 1's sigma shift takes the 4096 anchor, not the target grid") {
-  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:31` is
+  // `LTX2Scheduler.execute` takes an OPTIONAL latent and `schedulers.py:32` is
   // `tokens = math.prod(latent.shape[2:]) if latent is not None else
   // default_number_of_tokens`, with `default_number_of_tokens` = MAX_SHIFT_ANCHOR
   // = 4096 (`:11`, `:29`). `keyframe_interpolation.py:199-200` passes NO latent;

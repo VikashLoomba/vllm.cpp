@@ -3003,7 +3003,7 @@ TEST_CASE("ltx2 conditioning: an image REPLACES one latent frame, and leaves the
              std::size(vllm_test::kLtx2CondIndexMask), vllm_test::kLtx2CondIndexPositions,
              std::size(vllm_test::kLtx2CondIndexPositions), "video by latent index");
 
-  // The NOISY tensor is untouched (latent_cond.py:38-39). diffusers writes the
+  // The NOISY tensor is untouched (latent_cond.py:40-41). diffusers writes the
   // clean tokens into it as well and only agrees at noise_scale == 1
   // (pipeline_ltx2_condition.py:1002 vs :1229-1232); copying that here would be a
   // silent divergence at every other noise scale, which no shape can catch.

@@ -846,6 +846,11 @@ vllm_cpp_add_test(test_deepseek_v4_dspark_entry vllm/models/test_deepseek_v4_dsp
 # wave does not implement. See .agents/specs/model-dsv4-exl3.md.
 vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
 target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+vllm_cpp_add_test(test_deepseek_v4_exl3_device_residency
+                  vllm/models/test_deepseek_v4_exl3_device_residency.cpp)
+target_include_directories(test_deepseek_v4_exl3_device_residency
+                           PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_deepseek_v4_exl3_forward vllm/models/test_deepseek_v4_exl3_forward.cpp)
 # MODEL-DSV4-EXL3 W2d: the SAME suite under the rollback arm. The fused MoE flag
 # is read once per process, so the only way to gate both arms is to run the
@@ -864,6 +869,7 @@ target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # SKIP on a CPU-only build; on the DGX GB10 they are the RUNTIME evidence the
 # kernels match the references. NOT a real-checkpoint token gate (W8, multi-Spark).
 vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
+target_include_directories(test_cuda_deepseek_v4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
@@ -1045,9 +1051,23 @@ target_include_directories(test_qwen4_exp_layer_loop PRIVATE ${CMAKE_SOURCE_DIR}
 vllm_cpp_add_test(test_qwen4_exp_runner vllm/models/test_qwen4_exp_runner.cpp)
 target_include_directories(test_qwen4_exp_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+vllm_cpp_add_test(test_qwen4_exp_matmul_bt_dtype
+  vllm/models/test_qwen4_exp_matmul_bt_dtype.cpp)
+target_include_directories(test_qwen4_exp_matmul_bt_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_qwen4_exp_kv_cache vllm/models/test_qwen4_exp_kv_cache.cpp)
 target_compile_definitions(test_qwen4_exp_kv_cache PRIVATE
   QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
+
+# MODEL-MM-QWEN4-EXP (#2449): the hyper-connection INJECT weight's residency.
+# Its own target rather than another case in the layer loop, because the claim
+# is a DEVICE one and the case that carries it needs a CUDA queue: on the CPU
+# tier it reports UNMEASURED and the CPU case beside it is a regression guard
+# that cannot see the defect. `qwen4_exp_weights.h` is a MODEL-PRIVATE header
+# under src/, the same grant the layer-loop target takes.
+vllm_cpp_add_test(test_qwen4_exp_inject_residency
+  vllm/models/test_qwen4_exp_inject_residency.cpp)
+target_include_directories(test_qwen4_exp_inject_residency PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) W1 -- the config layer and
 # the two production entry points that reach it: `ModelRegistry::Resolve` and
@@ -1381,6 +1401,38 @@ target_include_directories(test_glm4_moe_lite_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# #2534. `detail::ActDType` caches its getenv in a function-local static, so one
+# process observes exactly ONE value of VT_ACT_F32 and a single run cannot tell a
+# resolver that READS the lever from one hardwired to its default answer. Re-run
+# the SAME binary with the lever ON, the shape `test_qwen35_paged_forward_gdn_out_f32`
+# and `_glue_fuse_off` above already use.
+#
+# SCOPED, deliberately, and this entry is NOT the whole binary. `VT_ACT_F32=1` is
+# REFUSED at the resolver (the f32 conversion is incomplete; see qwen3_5.cpp and
+# the row spec), so the nine cases that CONSTRUCT a qwen35 model legitimately
+# cannot run under the lever -- they would hit the refusal as an unexpected
+# `THREW exception` and red this entry for doing exactly what it was told to do.
+# What this entry has to prove is narrower: that the resolver READS the lever.
+# The two `qwen27 activation*` cases are the ones that assert that, and neither
+# builds a model.
+#
+# The filter is `qwen27 activation*` and NOT a full name because doctest's
+# `--test-case` splits its argument on COMMAS: a name containing one silently
+# matches nothing, the binary exits 0 having run zero cases, and the entry passes
+# while testing nothing. Both target names are comma-free today and the wildcard
+# keeps that true if either is reworded.
+#
+# The two properties below are what stop a mute pass. FAIL_REGULAR_EXPRESSION
+# takes precedence in ctest, so a run that matched no case -- `assertions: 0` --
+# FAILS instead of reporting success, which is the `zero assertions is a skip
+# wearing a pass` trap this repository has already been bitten by. The PASS regex
+# then requires doctest's own verdict rather than trusting the exit status.
+add_test(NAME test_qwen27_paged_forward_act_f32
+  COMMAND test_qwen27_paged_forward "--test-case=qwen27 activation*")
+set_tests_properties(test_qwen27_paged_forward_act_f32 PROPERTIES
+  ENVIRONMENT "VT_ACT_F32=1"
+  FAIL_REGULAR_EXPRESSION "assertions:[ ]*0[ |]"
+  PASS_REGULAR_EXPRESSION "Status: SUCCESS!")
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
 vllm_cpp_add_test(test_pretokenizer vllm/test_pretokenizer.cpp)
 # Metaspace split=true + Metaspace decoder (Parakeet tokenizer shape) —
@@ -1723,6 +1775,12 @@ vllm_cpp_add_test(test_cli_offload_config
 if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_cli_offload_config
     PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+vllm_cpp_add_test(test_cli_kv_cache_dtype
+  vllm/entrypoints/test_cli_kv_cache_dtype.cpp)
+if(TARGET vllm-cli OR VLLM_CPP_BUILD_EXAMPLES)
+  target_compile_definitions(test_cli_kv_cache_dtype
+    PRIVATE VLLM_CLI_BINARY="$<TARGET_FILE:vllm-cli>")
+endif()
 endif()
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
 vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
@@ -2498,6 +2556,17 @@ vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
 # activation choice that mirrors vLLM rather than the kernel oracle.
 vllm_cpp_add_test(test_exl3_gemv vt/test_exl3_gemv.cpp)
 vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
+# BACKEND-ROCM-EXL3 (#2433): the ROCm arms of the exactly two ops an EXL3
+# checkpoint ran on the CPU reference tier. Built in EVERY configuration and not
+# only under VLLM_CPP_HIP -- its cases skip when no ROCm backend is registered,
+# and a suite that only a HIP build compiles is a suite CI never reads.
+vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
+# BACKEND-VULKAN-EXL3 (#2530): the Vulkan arms of the same two ops. Built in
+# EVERY configuration for the same reason as the ROCm sibling above -- its cases
+# skip when no Vulkan backend is registered. UNLIKE that sibling this suite needs
+# NO GPU and NO lease to say something: llvmpipe is a conformant Vulkan 1.1
+# device, so the `build-test-vulkan` CI leg runs the byte gate for real.
+vllm_cpp_add_test(test_exl3_vulkan vt/test_exl3_vulkan.cpp)
 
 # QUANT-EXL3 W1a (#2181). Placed after the MODEL-DSV4-EXL3 kernel suites above
 # rather than among them: these two gate the SCHEME on the shared linear seam,
@@ -2511,6 +2580,10 @@ vllm_cpp_add_test(test_exl3_real_decode vt/test_exl3_real_decode.cpp)
 # The EXL3 arm REACHED from the dense forward (#2181): the capability gate, not
 # a class gate.
 vllm_cpp_add_test(test_llama_exl3_forward vllm/models/test_llama_exl3_forward.cpp)
+
+# MODEL-QWEN35-EXL3 (#2495 items 3 and 5): the EXL3 arm of the DENSE Qwen3.5
+# loader and forward, gated through LoadQwen3_5Dense and ModelRegistry::Forward.
+vllm_cpp_add_test(test_qwen35_exl3 vllm/models/test_qwen35_exl3.cpp)
 # QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
 # i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
 # and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
@@ -2839,6 +2912,9 @@ vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)
 vllm_cpp_add_test(test_ops_moe_nongated_relu2 vt/test_ops_moe_nongated_relu2.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
+vllm_cpp_add_test(test_ops_rmsnorm_weight_dtype vt/test_ops_rmsnorm_weight_dtype.cpp)
+vllm_cpp_add_test(test_ops_rmsnorm_quant_fp8_weight_dtype
+                  vt/test_ops_rmsnorm_quant_fp8_weight_dtype.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_ops_layernorm vt/test_ops_layernorm.cpp)
 vllm_cpp_add_test(test_fused_chain_additivity vt/test_fused_chain_additivity.cpp)
@@ -2925,6 +3001,10 @@ vllm_cpp_add_test(test_ops_fp8_kv_cache vt/test_ops_fp8_kv_cache.cpp)
 vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 # MLA campaign W3: the compressed-latent cache write + the grouped-topk router.
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
+# KV-DSV4-MULTICACHE W8 slices 2 and 3 (#2455): the fp8_ds_mla STORE and READ
+# over DeepSeek-V4's REGION-SPLIT rank-2 byte page, which no rank-3 cache op can
+# express. Byte-exact against a poison-filled block, all host-side.
+vllm_cpp_add_test(test_ops_ds_mla_cache vt/test_ops_ds_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
 vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
 # dots3-note W4b-3c (#699): the DSA "Lightning Indexer" selection pair, gated
@@ -3696,5 +3776,11 @@ target_include_directories(test_glm_moe_dsa_forward PRIVATE
 # and the comparison would pass on a forward that never touched the seam. The
 # suite asserts `StreamRequested()` and the lane's own fill counters, so a run
 # without this environment reds rather than quietly measuring nothing.
+#
+# The suite ALSO sets the variable from its own namespace-scope static (#2450),
+# because this property only exists when ctest launches the binary and an
+# implementer debugging one case runs the binary directly. Both are kept: the
+# static is what makes a direct run honest, and this line is what states the
+# lane's environment where a reader of the build looks for it.
 set_tests_properties(test_glm_moe_dsa_forward PROPERTIES
   ENVIRONMENT "VT_MOE_EXPERT_STREAM=1")

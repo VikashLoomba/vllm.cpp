@@ -54,6 +54,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kMXFP4:
     case DType::kIQ2_XS:
     case DType::kIQ4_XS:
+    case DType::kIQ3_S:
       break;
   }
   VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");
@@ -2567,9 +2568,9 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
   // `output_hc_{down,up}` — and the loader keeps their blocks, so demanding a
   // float here refused the released checkpoint at its first prefill.
   //
-  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM has
-  // never registered `qwen4_exp` and never loads a GGUF, so it has no opinion on
-  // a block-typed operand; llama.cpp merged the architecture on 2026-08-27
+  // THE POLICY IS llama.cpp'S, AND IT SPLITS THIS OP'S OPERANDS IN TWO. vLLM
+  // registered `qwen4_exp` on 2026-08-31 (#2489) but never loads a GGUF, so it
+  // has no opinion on a block-typed operand; llama.cpp merged it on 2026-08-27
   // (`6c84c7d5d`, PR #27742) and runs this exact file. It declares each of the
   // SIX projections `GGML_OP_MUL_MAT` (`src/llama-arch.cpp:759,760,761,763,764,765`
   // — down, up AND inject, on both the attention and the feed-forward side) and
@@ -4100,6 +4101,118 @@ void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor&
       q, kv_c, k_pe, kv_cache, slot_mapping);
 }
 
+void ConcatAndCacheDsMla(Queue& q, const Tensor& k, Tensor& kv_cache,
+                         const Tensor& slot_mapping, int64_t block_size) {
+  // Upstream: `assert k.dim() == 2 and k.shape[1] == 512` (cache_utils.py:167-169).
+  VT_CHECK(k.rank == 2 && k.shape[1] == kFp8DsMlaInputDim,
+           "concat_and_cache_ds_mla: k must be rank-2 [num_tokens, 512] — the "
+           "compressed latent, NoPE in [0, 448) and the rotated RoPE in [448, 512)");
+  // The page is RANK-2 BYTES. This is the difference from concat_and_cache_mla
+  // and it is not a formality: a token's scales live in a different REGION of
+  // the block from its data (cache_utils.py:59-66), so no (block, row, column)
+  // indexing reaches both and a rank-3 page cannot describe this cache.
+  VT_CHECK(kv_cache.rank == 2,
+           "concat_and_cache_ds_mla: kv_cache must be rank-2 "
+           "[num_blocks, block_bytes] — the fp8_ds_mla block is REGION-SPLIT "
+           "(cache_utils.py:59-66), so it is not a rank-3 page");
+  VT_CHECK(kv_cache.dtype == DType::kI8,
+           "concat_and_cache_ds_mla: kv_cache must be DType::kI8 (a BYTE page). A "
+           "float cache here would be the 3.5x overrun this op exists to stop: "
+           "2048 f32 bytes per token against the 584 the spec declares");
+  VT_CHECK(slot_mapping.rank == 1,
+           "concat_and_cache_ds_mla: slot_mapping must be rank-1 [num_slots]");
+  VT_CHECK(slot_mapping.dtype == DType::kI64,
+           "concat_and_cache_ds_mla: slot_mapping must be i64");
+  // Upstream asserts bf16 (`:170-171`). We accept any float dtype because the
+  // encoder's first act is upstream's own fp32 -> bf16 round
+  // (`:110-118`, "Load bf16 input"), so an f32 row and its bf16 rounding
+  // produce identical bytes; a non-float source has no such reading.
+  VT_CHECK(IsFloat(k.dtype),
+           "concat_and_cache_ds_mla: k must be a float dtype (upstream asserts "
+           "bf16; the encoder rounds to bf16 first, so f32/f16 agree bit for bit)");
+  VT_CHECK(block_size > 0,
+           "concat_and_cache_ds_mla: block_size must be > 0 (it is the STORAGE "
+           "block size, block_size / compress_ratio)");
+  // 584 bytes per token (kv_cache_interface.py:401-403). Everything past that is
+  // the block's alignment padding (`:63`) and no store may reach it, so the page
+  // must be at least the real size; a LARGER row is the padded page and is fine.
+  const int64_t real_block_bytes = block_size * kFp8DsMlaTokenBytes;
+  VT_CHECK(kv_cache.shape[1] >= real_block_bytes,
+           "concat_and_cache_ds_mla: kv_cache row must hold block_size * 584 bytes");
+  VT_CHECK(k.stride[1] == 1 && kv_cache.stride[1] == 1 && slot_mapping.IsContiguous(),
+           "concat_and_cache_ds_mla: k/kv_cache innermost stride must be 1 and "
+           "slot_mapping contiguous");
+  VT_CHECK(k.stride[0] >= kFp8DsMlaInputDim,
+           "concat_and_cache_ds_mla: k token rows must not overlap");
+  VT_CHECK(kv_cache.stride[0] >= kv_cache.shape[1],
+           "concat_and_cache_ds_mla: kv_cache blocks must not overlap");
+  // Upstream takes the token count from slot_mapping (`:186-188`): the tail of
+  // `k` is DP padding and is ignored.
+  VT_CHECK(k.shape[0] >= slot_mapping.shape[0],
+           "concat_and_cache_ds_mla: num_tokens must be >= slot_mapping length");
+  VT_CHECK(k.device == q.device && kv_cache.device == q.device &&
+               slot_mapping.device == q.device,
+           "concat_and_cache_ds_mla: device mismatch (k/kv_cache/slot_mapping/queue)");
+  reinterpret_cast<ConcatAndCacheDsMlaFn>(
+      GetOp(OpId::kConcatAndCacheDsMla, q.device.type))(q, k, kv_cache, slot_mapping,
+                                                        block_size);
+}
+
+void DequantAndGatherDsMla(Queue& q, Tensor& out, const Tensor& kv_cache,
+                           const Tensor& seq_lens, const Tensor* gather_lens,
+                           const Tensor& block_table,
+                           const DequantAndGatherDsMlaArgs& args) {
+  VT_CHECK(out.rank == 3 && out.shape[2] == kFp8DsMlaInputDim,
+           "dequant_and_gather_ds_mla: out must be rank-3 "
+           "[num_reqs, max_num_tokens, 512]");
+  // Upstream stores bf16 (`cache_utils.py:328`, `:337`). f32 is the annotated
+  // widening: the scratch dtype must equal the query dtype the following
+  // vt::MlaDecodeAttention runs at, and our CPU MLA decode runs at f32.
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "dequant_and_gather_ds_mla: out must be f32 or bf16 (bf16 mirrors "
+           "upstream exactly; f32 is the scratch dtype our CPU MLA decode consumes)");
+  VT_CHECK(kv_cache.rank == 2 && kv_cache.dtype == DType::kI8,
+           "dequant_and_gather_ds_mla: kv_cache must be rank-2 "
+           "[num_blocks, block_bytes] DType::kI8 — the REGION-SPLIT byte page");
+  VT_CHECK(seq_lens.rank == 1 && seq_lens.dtype == DType::kI32,
+           "dequant_and_gather_ds_mla: seq_lens must be rank-1 [num_reqs] i32");
+  VT_CHECK(block_table.rank == 2 && block_table.dtype == DType::kI32,
+           "dequant_and_gather_ds_mla: block_table must be rank-2 "
+           "[num_reqs, max_blocks_per_seq] i32");
+  const int64_t num_reqs = out.shape[0];
+  VT_CHECK(num_reqs > 0, "dequant_and_gather_ds_mla: num_reqs must be > 0");
+  VT_CHECK(seq_lens.shape[0] == num_reqs && block_table.shape[0] == num_reqs,
+           "dequant_and_gather_ds_mla: seq_lens/block_table must have num_reqs rows");
+  // nullptr is upstream's `gather_lens_ptr is None` arm — gather the WHOLE
+  // sequence (`:257-262`) — and NOT an error.
+  if (gather_lens != nullptr) {
+    VT_CHECK(gather_lens->rank == 1 && gather_lens->dtype == DType::kI32 &&
+                 gather_lens->shape[0] == num_reqs,
+             "dequant_and_gather_ds_mla: gather_lens must be rank-1 [num_reqs] i32");
+    VT_CHECK(gather_lens->IsContiguous() && gather_lens->device == q.device,
+             "dequant_and_gather_ds_mla: gather_lens must be contiguous and on the "
+             "queue's device");
+  }
+  VT_CHECK(args.block_size > 0,
+           "dequant_and_gather_ds_mla: args.block_size must be > 0 (the STORAGE "
+           "block size, block_size / compress_ratio)");
+  VT_CHECK(args.offset >= 0 && args.offset < out.shape[1],
+           "dequant_and_gather_ds_mla: args.offset must index a column of out");
+  VT_CHECK(kv_cache.shape[1] >= args.block_size * kFp8DsMlaTokenBytes,
+           "dequant_and_gather_ds_mla: kv_cache row must hold block_size * 584 bytes");
+  VT_CHECK(out.stride[2] == 1 && kv_cache.stride[1] == 1 && block_table.stride[1] == 1 &&
+               seq_lens.IsContiguous(),
+           "dequant_and_gather_ds_mla: out/kv_cache/block_table innermost stride must "
+           "be 1 and seq_lens contiguous");
+  VT_CHECK(out.device == q.device && kv_cache.device == q.device &&
+               seq_lens.device == q.device && block_table.device == q.device,
+           "dequant_and_gather_ds_mla: device mismatch "
+           "(out/kv_cache/seq_lens/block_table/queue)");
+  reinterpret_cast<DequantAndGatherDsMlaFn>(
+      GetOp(OpId::kDequantAndGatherDsMla, q.device.type))(q, out, kv_cache, seq_lens,
+                                                          gather_lens, block_table, args);
+}
+
 void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
                         const Tensor& kv_cache, const Tensor& block_table,
                         const Tensor& seq_lens, const MlaDecodeAttentionArgs& args) {
@@ -5089,8 +5202,21 @@ void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgat
            "attn_gate_split: gate_out must match q_out [T,Hq,Dh]");
   VT_CHECK(qgate.shape[0] == t && qgate.shape[1] == hq * 2 * dh,
            "attn_gate_split: qgate must be [T, Hq*2*Dh]");
-  VT_CHECK(q_out.dtype == DType::kF32 && gate_out.dtype == DType::kF32,
-           "attn_gate_split: q_out/gate_out must be f32");
+  // q_out is f32 OR bf16. bf16 is what vLLM's `torch.chunk` produces for a
+  // checkpoint whose model dtype is bf16 (qwen4_exp: qwen3_next.py:430 then :437
+  // hands `q` to q_norm unwidened), and an f32 destination there would move twice
+  // the bytes to hold values a bf16 qgate already rounded. f32 is Qwen3.5's, whose
+  // qk-norm/RoPE chain reads f32.
+  //
+  // gate_out is f32 and only f32: `vt::SigmoidGateBf16` — the only consumer of
+  // this operand — states an f32 gate on each of its four backends. Narrowing it
+  // is #2488's remaining half and is NOT admitted here, because a refusal that
+  // widened ahead of its consumer would move the failure from this call to a
+  // deeper one.
+  VT_CHECK(q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16,
+           "attn_gate_split: q_out must be f32 or bf16");
+  VT_CHECK(gate_out.dtype == DType::kF32,
+           "attn_gate_split: gate_out must be f32 (vt::SigmoidGateBf16 takes an f32 gate)");
   VT_CHECK(qgate.dtype == DType::kF32 || qgate.dtype == DType::kBF16,
            "attn_gate_split: qgate must be f32 or bf16 (bf16 = VT_BF16_GEMM_OUT q_proj)");
   VT_CHECK(q_out.IsContiguous() && gate_out.IsContiguous() && qgate.IsContiguous(),
@@ -5321,23 +5447,32 @@ void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const
               const Tensor& svh, Tensor& a_had, const Exl3GemmArgs& args) {
   VT_CHECK(args.bits >= 1 && args.bits <= 8,
            "exl3_gemm: bits must be in [1, 8]; got " + std::to_string(args.bits));
-  // Codebook 0 (the original QTIP 3INST) and 1 (MCG) are both implemented; cb 2
-  // (upstream's `mul1` dp4a byte-sum variant) is not and refuses by name.
+  // ALL THREE CODEBOOKS UPSTREAM DEFINES: 0 (the original QTIP 3INST), 1 (MCG)
+  // and 2 (`mul1`). `decode_3inst<cb>` (`codebook.cuh:56-90`) has arms for those
+  // three and falls off the end for any other value, so a fourth is not an arm
+  // this tree has yet to port -- it does not exist.
   //
-  // The narrowing to MCG here was WRONG rather than merely conservative, and it
-  // was written when the only checkpoint in view was the SparkInfer DeepSeek-V4
-  // artifact, which ships an `mcg` marker. `LinearEXL3` derives the codebook
-  // from tensor PRESENCE (`exl3.py:74-77`), so every stock `turboderp/*-exl3`
-  // artifact -- shipping neither `mcg` nor `mul1` -- is cb 0, and cb 0 is
-  // therefore the COMMON case rather than an exotic one.
+  // The earlier narrowing to MCG here was WRONG rather than merely conservative,
+  // and it was written when the only checkpoint in view was the SparkInfer
+  // DeepSeek-V4 artifact, which ships an `mcg` marker. `LinearEXL3` derives the
+  // codebook from tensor PRESENCE (`exl3.py:74-77`), so every stock
+  // `turboderp/*-exl3` artifact -- shipping neither `mcg` nor `mul1` -- is cb 0,
+  // and cb 0 is therefore the COMMON case rather than an exotic one.
   //
-  // The DEVICE arm still refuses anything but cb 1 at its own launcher
-  // (`cuda_exl3.cu`), because it instantiates `kInstantiatedCb = 1` only. That
-  // refusal is correct and stays; this one was hiding it behind a wrong reason.
-  VT_CHECK(args.codebook == 0 || args.codebook == 1,
-           "exl3_gemm: codebook must be 0 (3INST) or 1 (mcg); codebook " +
+  // Cb 2 joined it for the same reason one step later:
+  // `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` ships a `mul1` marker on every quantized
+  // linear, so refusing cb 2 here refused that checkpoint whole
+  // (QUANT-EXL3-MUL1, #2495).
+  //
+  // THIS IS THE SEAM CHECK, NOT THE ARM CHECK, and the difference matters. The
+  // host arm decodes every (bits, codebook) pair; the DEVICE arm instantiates a
+  // named few and refuses the rest at its own launcher (`cuda_exl3.cu`), which
+  // is where an uninstantiated pair is caught. Widening this one does not widen
+  // that one.
+  VT_CHECK(args.codebook >= 0 && args.codebook <= 2,
+           "exl3_gemm: codebook must be 0 (3INST), 1 (mcg) or 2 (mul1); codebook " +
                std::to_string(args.codebook) +
-               " is an upstream arm this tree has not ported (QUANT-EXL3, #2181)");
+               " is not an arm upstream defines at all (QUANT-EXL3-MUL1, #2495)");
   VT_CHECK(a.rank == 2 && c.rank == 2, "exl3_gemm: A and C must be rank-2");
   // `ldmatrix.sync.aligned.m8n8.x4.shared.b16` + `mma...f16.f16` read fp16
   // fragments (ptx.cuh:52-74,203-212), so A has no dtype freedom at all.

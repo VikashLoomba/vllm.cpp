@@ -29,8 +29,11 @@
 // ~119.63 GiB on GB10), so there is no downstream token gate that would catch a
 // forward returning plausible garbage, and O1 still says so. What replaces the
 // blanket refusal is a set of NARROW ones, each naming what is owed rather than
-// the whole capability: a non-CPU queue, a multi-request step, and the
-// safetensors load are each refused by name in place.
+// the whole capability: a multi-request step and the safetensors load are each
+// refused by name in place, and since W9c-3a (#2464) a CUDA queue is ADMITTED
+// -- for one arm, the routed-expert GEMM, with every other primitive still on a
+// CPU queue this forward interposes. A queue that is neither CPU nor CUDA is
+// still refused by name.
 #include "vllm/model_executor/models/model_registry.h"
 
 #include "vt/dtype.h"  // VT_CHECK
@@ -50,6 +53,7 @@
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"  // v1::ResolveKvCacheDType
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 
 namespace vllm {
 namespace {
@@ -105,8 +109,15 @@ std::unique_ptr<LoadedModel> LoadGlm5NextForConditionalGeneration(
           "carries no file. See .agents/specs/glm5-next-flash.md and issue "
           "#2242.");
     }
+    // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: the residency policy is built from
+    // the device the ENGINE resolved for this load, never from
+    // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
+    // CUDA-capable process, and this hook is where the disagreement reached the
+    // loader.
+    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
     return std::make_unique<Glm5NextLoadedModel>(
-        registration, LoadGlm5NextFromGguf(*source.gguf, config));
+        registration,
+        LoadGlm5NextFromGguf(*source.gguf, config, &gguf_policy));
   }
   (void)registration;
   (void)config;

@@ -2629,7 +2629,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // Row LTX25-TOKEN-APPEND (#930) opened the second branch. The refusal that
   // stood here named the token-append machinery, and that refusal was accurate:
   // a keyframe APPENDS (keyframe_cond.py:79-82) where an image at latent frame 0
-  // REPLACES (latent_cond.py:38-39), and this loop had no way to grow the
+  // REPLACES (latent_cond.py:40-41), and this loop had no way to grow the
   // sequence and trim it back. `Ltx2ExtendKeyframesMask` and
   // `Ltx2ClearConditioning` are the two halves it was missing.
   const bool wants_first_frame = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
@@ -3729,7 +3729,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // BEFORE THE NOISER AND AFTER THE STATE, which is upstream's order
     // (`create_noised_state`, helpers.py:428-445: initial state, THEN the
     // conditioning items, THEN the noiser) and is not interchangeable: the
-    // item writes ONLY `clean_latent` and `denoise_mask` (latent_cond.py:38-39)
+    // item writes ONLY `clean_latent` and `denoise_mask` (latent_cond.py:40-41)
     // and the noiser is what composes them into the noisy tensor
     // (components/noisers.py:31-34). Applying it afterwards leaves the
     // conditioned tokens pinned to NOISE, with an identical clean tensor and an
@@ -3885,7 +3885,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // Recomputed from `encoded`, not from `first`, so the two are independent
       // expressions. Both conditioning items write the SAME bytes — the
       // patchified conditioning volume — the replace arm at latent frame 0
-      // (latent_cond.py:38-39) and the append arm at the tail
+      // (latent_cond.py:40-41) and the append arm at the tail
       // (keyframe_cond.py:82) — so one expectation serves both, and a slice that
       // names any other window reds by value rather than by shape.
       Ltx2VideoLatentShape placed_shape = vshape;
@@ -3947,7 +3947,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         VT_CHECK(video.tokens == before_first_frame,
                  "ltx2 video: `combined_image_conditionings` sends frame 0 to "
                  "`VideoConditionByLatentIndex` (helpers.py:295-300), which REPLACES tokens that "
-                 "already exist (latent_cond.py:38-39), so the sequence length must not move");
+                 "already exist (latent_cond.py:40-41), so the sequence length must not move");
       }
     }
 
@@ -4213,10 +4213,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       // WHICH anchor, though, is the phase's to say. `LTX2Scheduler.execute`
       // takes an OPTIONAL latent, and upstream selects between the target grid
       // and the fixed `default_number_of_tokens` = 4096 by passing one or not
-      // (schedulers.py:31). Six of upstream's seven call sites pass none;
-      // `ti2vid_two_stages_hq.py:267` is the one that does. See
-      // `Ltx2PhaseScheduleTokens`, whose default is this engine's long-standing
-      // `target_tokens` and whose divergence from upstream's majority is #1150.
+      // (schedulers.py:32). Six of upstream's seven call sites pass none;
+      // `ti2vid_two_stages_hq.py:267` is the one that does, and vLLM-Omni cannot
+      // express the exception at all (`ltx2_denoise.py:188`). See
+      // `Ltx2PhaseScheduleTokens`. Every recipe that reaches this line names its
+      // own value, so the `target_tokens` branch below is now taken by exactly
+      // one arm — `res2s_two_stage` — rather than by all of them (#2521).
       //
       // Resolved to a CONCRETE count rather than passing 0 for "take the
       // default". `Ltx2SigmaSchedule` treats the two identically

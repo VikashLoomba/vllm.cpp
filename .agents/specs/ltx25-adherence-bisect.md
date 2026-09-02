@@ -91,7 +91,11 @@ answer the question. [`ltx25-oracle-absolute.md`](ltx25-oracle-absolute.md)
 **Phase B is a separate `rc` job, deliberately.** The n = 1 question needs three
 of OUR renders, and `ltx25-render-confirm.sh` already takes them with a verified
 binary, a staged checkpoint set and a phase table. It deleted renders 2 and 3's
-frames at its `:551`, which is the single line that made the reading n = 1.
+frames at its `:570`, which is the single line that made the reading n = 1
+-- `[ "$i" = 1 ] || rm -f "$D"/frame_*.ppm`, the only hit for that pattern in
+the file. It sat at `:551` at this row's base and `326f4970b` moved it 19 lines
+by inserting the comment above it, so the first version of this sentence cited a
+line its own commit had invalidated.
 `KEEP_FRAMES=1` retains them instead. **The `if [ "$i" = 1 ]` compare block is
 untouched**, so the gate that harness enforces is byte-for-byte the gate it
 enforced before, and the retained frames are evidence for a later CPU scoring
@@ -217,6 +221,13 @@ score is the tuning this row forbids itself.
    and is scored. `loadavg` and GPU SM clock are recorded beside each, because
    the existing 8.03% wall spread is what a three-times-busier box looks like
    and not evidence about pixels.
+5. **Each control's verdict reaches the EXIT CODE.** Tests 1 and 2 are only worth
+   their words if the driver acts on them, and a static check that the functions
+   are CALLED cannot see that. `tests/scripts/test_ltx2_latent_dump.py` drives
+   `main()` end to end with the torch, upstream, GPU and checkpoint seams stubbed
+   and asserts rc 64 on a decode missing a committed frame and rc 62 on a short
+   write. Deleting either guard reds it; deleting neither is visible to an AST
+   walk.
 
 ## Gates
 
@@ -225,10 +236,31 @@ score is the tuning this row forbids itself.
 
 ## Evidence
 
-Under `/workspace/ltx25-adherence-bisect/run/<RUN_ID>/`, copied off the worker's
-local disk as each phase completes: `PROVENANCE`, the oracle latent and its
-sha256, the recording run's frames and their digest comparison, the cross-decode
-frames, every retained render's frames, and one `compare-*.json` per scored arm.
+In the repository, which is where a claim has to be readable after a worker's
+share is reaped:
+
+- `tests/parity/goldens/ltx2_oracle_latent/` -- the two latents, the run's own
+  manifest, and `phase-a-rc-job-log.txt`, the `rc` log of job
+  `a24f9336-897f-4810-9851-13dade5acb52`. Every Phase A number in this spec is
+  read off that log rather than typed from memory, including the
+  `model_version=2.5.0` line the AGREE-row condition rests on.
+
+On the worker, under `/workspace/ltx25-adherence-bisect/run/<RUN_ID>/`, copied
+off its local disk as each phase completes: `PROVENANCE`, the oracle latent and
+its sha256, the recording run's frames and their digest comparison, the
+cross-decode frames, every retained render's frames, and one `compare-*.json`
+per scored arm. That share is CIFS and outside the repository, so it is a
+convenience and never the record.
+
+## Owed
+
+- **Attributing the audio divergence.** Phase A's `audio.wav` differs from the
+  committed reference on 94.2% of samples and the audio decoder takes no
+  generator, so the benign explanation is unavailable. It is a nondeterministic
+  audio kernel, an environment difference, or a different audio latent -- and the
+  third would be a finding about this row's probe. It needs a second Phase A run
+  under a recorded environment, which the driver now writes. No claim in this row
+  rests on the audio half in the meantime.
 
 ## Stop conditions
 
@@ -246,9 +278,13 @@ The cross-decode is still queued, but a static read of the two denoise loops at
 their pinned revisions already answers half the question, and it answers it in
 the direction the cross-decode was built to test.
 
-**Of everything the denoise loop resolves, exactly one thing differs: the sigma
-schedule's shift anchor.** Guidance, the negative prompt, the sampler and STG
-all AGREE, each checked to a `file:line` on both sides:
+**Of the seven denoise-loop parameters compared below, exactly one differs:
+the sigma schedule's shift anchor.** Guidance, the negative prompt, the sampler
+and STG all AGREE, each checked to a `file:line` on both sides. The claim is
+bounded by the table and does not reach past it: `noise_scale`, the step count,
+RoPE, the DiT forward, text encoding and the initial noise draw are NOT compared
+here, and `## Design` lists RoPE and the DiT forward among the latent-side
+candidates this row leaves open.
 
 | Parameter | Upstream | Ours | |
 |---|---|---|---|
@@ -256,9 +292,18 @@ all AGREE, each checked to a `file:line` on both sides:
 | `stg_blocks` (both modalities) | `[28]`, the 2.3 override the 2.5 key inherits (`constants.py:86`, `:124`, `:130-133`) | `{28}` (`ltx2_pipeline.cpp:969-970`, `:974-981`, `:1005-1014`) | AGREE |
 | audio guidance | 7.0 / 1.0 / 0.7 / 3.0 / 0 (`constants.py:61-65`) | same (`ltx2_pipeline.cpp:956-960`) | AGREE |
 | negative prompt | `DEFAULT_NEGATIVE_PROMPT` (`constants.py:186-199`) | `LightricksNegativePrompt()` (`ltx2_pipeline.cpp:1101-1107`) | AGREE, byte for byte, 1171 chars |
-| sampler | `euler_denoising_loop` + `EulerDiffusionStep`, deterministic, no per-step noise (`samplers.py:39-81`, `diffusion_steps.py:25-40`) | the first-order arm with `kEuler` (`ltx2_video.cpp:4732-4820`, `ltx2_pipeline.cpp:241-258`) | AGREE |
-| STG application | `SKIP_VIDEO_SELF_ATTN` + `SKIP_AUDIO_SELF_ATTN` on block 28 (`denoisers.py:111-119`) | `kSkipVideoSelfAttn` + `kSkipAudioSelfAttn` (`ltx2_denoisers.cpp:143-155`) | AGREE |
+| sampler | `euler_denoising_loop` + `EulerDiffusionStep`, deterministic, no per-step noise (`samplers.py:39-81`, `diffusion_steps.py:25-40`) | the first-order arm with `kEuler` (`ltx2_video.cpp:4731-4827`, `ltx2_pipeline.cpp:241-258`) | AGREE |
+| STG application | `SKIP_VIDEO_SELF_ATTN` + `SKIP_AUDIO_SELF_ATTN` on block 28 (`denoisers.py:111-119`) | `kSkipVideoSelfAttn` + `kSkipAudioSelfAttn` (`ltx2_denoisers.cpp:144-158`) | AGREE |
 | **sigma shift anchor** | **4096** | **240** | **DIFFER** |
+
+Two of those cites are not their file's only occurrence, which the AGREE claims
+survive but a reader re-resolving them should know: `video_guider.cfg_scale =
+3.0` appears at `ltx2_pipeline.cpp:950` and again at `:990`, and
+`audio_guider.cfg_scale = 7.0` at `:956` and `:996`. The second of each pair is
+inside `Ltx2Params23Hq()`, a lineage `one_stage` never reaches. The cites at
+`:969-970`, `:950-954` and `:956-960` are the ones on this render's path, and
+`kSchedulerDefault` really is assigned exactly twice in that file (`:1776`,
+`:1961`), which are also the only `schedule_tokens` assignments in it.
 
 Upstream's `LTX2Scheduler.execute` takes an OPTIONAL latent and
 `packages/ltx-core/src/ltx_core/components/schedulers.py:32` reads
@@ -267,7 +312,7 @@ default_number_of_tokens`. `ti2vid_one_stage.py:207` calls
 `self._scheduler.execute(steps=num_inference_steps)` and passes **no latent**,
 so upstream takes `MAX_SHIFT_ANCHOR = 4096` (`schedulers.py:11`, `:29`).
 
-Our `Ltx2SigmaSchedule` (`src/vllm/model_executor/models/ltx2_pipeline.cpp:105-146`)
+Our `Ltx2SigmaSchedule` (`src/vllm/model_executor/models/ltx2_pipeline.cpp:107-147`)
 mirrors that formula exactly -- same `max_shift` 2.05, `base_shift` 0.95,
 `stretch`, `terminal` 0.1, `power` 1. The formula is not the divergence. The
 ARGUMENT is. `src/vllm/multimodal/ltx2_video.cpp:4227-4231` passes
@@ -303,7 +348,7 @@ measures. That is a mechanism, and it points the right way.
 
 **This is not a new discovery about upstream; it is a new attribution.** The
 tree already carries the reading, in this row's own words, at
-`include/vllm/model_executor/models/ltx2_pipeline.h:660-707`: it enumerates
+`include/vllm/model_executor/models/ltx2_pipeline.h:659-706`: it enumerates
 upstream's seven `.execute()` call sites, records that six pass no latent, names
 `ti2vid_one_stage.py:207 -> our one_stage x4` in that list, calls the divergence
 "REAL rather than a rounding", and states that the default was left at today's
@@ -349,15 +394,84 @@ that range.
 `tests/parity/goldens/ltx2_oracle/SHA256SUMS` byte for byte** -- `matched = 25`
 of `committed_frames = 25`, no mismatch, no missing frame, no unlisted extra.
 Recomputed independently from the retained frames rather than read off the
-driver's own manifest. That single control establishes all three things it was
-built to establish: the oracle is reproducible at this request, installing
-upstream's own `RecordingDiffusionStage` perturbed nothing, and the in-process
-driver is equivalent to upstream's `main()`.
+driver's own manifest. That control establishes all three things it was built to
+establish **on the video path**: the oracle is reproducible on it at this
+request, installing upstream's own `RecordingDiffusionStage` perturbed nothing on
+it, and the in-process driver is equivalent to upstream's `main()` on it. It
+gates `frame_*.ppm` and nothing else, so it says nothing about the audio path,
+where the same run diverged -- see below, where that divergence is left OPEN and
+unattributed rather than folded into this control's verdict.
 
-The latents are therefore the reference render's own, and they are committed at
-`tests/parity/goldens/ltx2_oracle_latent/`: video `(1,128,4,6,10)` bf16, 61,440
-bytes; audio `(1,8,26,16)` bf16, 6,656 bytes. **The cross-decode now needs no
-lease at any point**, which is why 68 KB is worth committing.
+The job's own log is committed beside the latents as
+`tests/parity/goldens/ltx2_oracle_latent/phase-a-rc-job-log.txt`. Every number this
+section takes from the run can be read off it.
+
+The video latent is therefore the reference render's own, and both latents are
+committed at `tests/parity/goldens/ltx2_oracle_latent/`: video `(1,128,4,6,10)`
+bf16, 61,440 bytes; audio `(1,8,26,16)` bf16, 6,656 bytes. **The cross-decode
+now needs no lease at any point**, which is why 68 KB is worth committing -- and
+that claim needed the decode configuration recovered before it could be made.
+
+### The decode configuration was NOT recorded, and it is now recovered
+
+The committed manifest records the SAMPLING request -- prompt, geometry, steps,
+seed, offload, device. Upstream's decode seam takes three more inputs, at
+`ti2vid_one_stage.py:243`:
+
+    decoded_video = self.video_decoder(video_state.latent, tiling_config, generator=generator, dtype=vae_dtype)
+
+None of the three appeared in the manifest, this file, or the golden's preamble.
+That matters exactly as much as this row's own first finding: a cross-decode run
+against an unrecorded decode configuration cannot separate *our VAE is
+unfaithful* from *we decoded under different tiling, noise or dtype*, which is
+the instrument failure the naive latent diff was rejected for.
+
+All three are recovered **statically**, from the pinned checkout
+(`fd4ded7f`, a clean local clone at that revision) plus the video VAE
+checkpoint's own 57,464-byte safetensors metadata header. No GPU, no lease.
+
+| Decode input | What it is for THIS request | How it resolves |
+|---|---|---|
+| `vae_dtype` | `torch.bfloat16` | `main()` computes `vae_dtype_for_hdr(hdr, torch.bfloat16)` (`ti2vid_one_stage.py:264`). `--hdr` defaults to `None` (`args.py:41-45`), there is no EXR input, so `resolve_hdr_color_space` returns `None` (`color_config.py:82-92`) and `vae_dtype_for_hdr` returns its default (`:64-66`). `VideoDecoder.__call__` then does `latent.to(dtype=build_dtype)` (`blocks.py:1136-1137`), a no-op on a bf16 latent. |
+| `tiling_config` | `TileSizeConfig(frames=80/24, height=448/64, width=768/64)`, which is **one tile** on this latent grid | `AUTO_TILING` (`ti2vid_one_stage.py:148`, `:296`) resolves through `ensure_tiling_config` (`helpers.py:119-146`). The checkpoint's `config.vae._class_name` is `CausalVideoAutoencoder`, which IS `_CONV_VAE_CLASS_NAME` (`model_configurator.py:18`, `:26-33`), so `is_diffusion_video_vae` is false and `tiling_config_for_vae` takes the aspect-only conv branch (`helpers.py:89-97`) -- which never reads free VRAM, unlike the DiffVAE branch. Resolved by RUNNING those upstream functions against the real checkpoint, not by transcribing them; their splitters on the `(4, 6, 10)` latent grid return one interval on each of T, H and W. |
+| `generator` | the seed-42 `torch.Generator` from `:160`, **never consumed by this decode** | It is the same object `GaussianNoiser` uses, so at `:243` it is in whatever state the denoise loop left it -- not its seeded state, and not recoverable from the latent. It does not matter here, because every `torch.randn(..., generator=generator)` on the conv path is behind one of two flags that are both off. `timestep_conditioning` gates the decode-noise draw (`conv_video_decoder.py:287-298`, `memory_efficient_decode.py:562-567`) and this checkpoint sets it `false`. `inject_noise` gates the per-block draws (`resnet.py:115`, `:153`, `:171`; `memory_efficient_decode.py:327`, `:349`) and is built as `block_config.get("inject_noise", False)` (`conv_video_decoder.py:81`, `:92`, `:106`) from a nine-entry `decoder_blocks` list that carries no such key. |
+
+The tiling row is the only one that needed execution rather than reading, and
+this is the whole of it -- upstream's own functions, the real checkpoint, CPU,
+seconds:
+
+```python
+sys.path.insert(0, "<LTX2>/packages/ltx-core/src")
+sys.path.insert(0, "<LTX2>/packages/ltx-pipelines/src")   # stub `av`,
+                                                          # `OpenImageIO`,
+                                                          # `soundfile`: media
+                                                          # libs, no tiling math
+ensure_tiling_config(
+    AUTO_TILING,
+    scale_factors=tiling_scale_factors_for_vae(VAE),
+    vae_checkpoint_path=VAE,
+    video_shape=VideoPixelShape(batch=1, frames=25, height=192, width=320, fps=24.0),
+    device=torch.device("cpu"))
+# -> TileSizeConfig(frames=DimensionSizeConfig(tile_size=80, overlap=24),
+#                   height=DimensionSizeConfig(tile_size=448, overlap=64),
+#                   width=DimensionSizeConfig(tile_size=768, overlap=64))
+# .video_chunks_number(25) -> 1; .to_splitters(sf) on (4, 6, 10) -> one
+# DimensionInterval(start=0, end=N, left_ramp=0, right_ramp=0) per axis.
+```
+
+`VAE` is the `ltx-2.5-video-vae-conv-bf16.safetensors` this run staged, whose
+sha256 `685b06ee..97dfce8d` the oracle file already pins. `device` is CPU because
+the conv branch never reads it; only the DiffVAE branch would.
+
+The generator is the one that decided this. Had it been consumed, upstream's
+decode noise would depend on the state 8 denoise steps left the generator in,
+and 68 KB of latent could not reproduce it at any price short of replaying the
+whole loop. It is not, so the cross-decode's inputs are fully determined by the
+pin plus the checkpoint, and there is nothing run-varying left to have recorded.
+
+**This covers the VIDEO decoder only.** `AudioDecoder.__call__(self, latent)`
+(`blocks.py:1180`) takes no generator and no tiling config at all, so none of
+this explains the audio divergence below.
 
 ### The condition on every `AGREE` row is now settled, by this run
 
@@ -369,27 +483,53 @@ words:
 
     INFO:ltx_pipelines.utils.constants:Checkpoint declares model_version=2.5.0 (parsed as (2, 5, 0))
 
-So upstream took the 2.5 branch and the silent fallback did NOT fire. The
-`stg_blocks [28]` row and the 30-step row are unconditional for this render, and
-the sigma anchor stands as the one divergence. Our side reaches `[28]` the same
+So upstream took the 2.5 branch and the silent fallback did NOT fire, and the
+`stg_blocks [28]` row is unconditional for this render. There is no step-count
+row in the AGREE table and this sentence used to close one: the 30 is
+`Ltx2Params23()`'s default at `ltx2_pipeline.cpp:968`, and BOTH sides override it
+with `--num-inference-steps 8` for this render, so it is not a parameter the
+comparison rests on either way. Within the seven rows compared, the sigma anchor
+stands as the one divergence. Our side reaches `[28]` the same
 way: `Ltx2Params20()` sets `{29}` at `ltx2_pipeline.cpp:955` and `:961`, and
 `Ltx2Params23()` overrides both to `{28}` at `:969-970`, mirroring upstream's
 own base-plus-override shape.
 
-### The video half is bit-exact and the audio half is NOT
+### The video half is bit-exact, and the audio half is an OPEN observation
 
-Recorded because it bounds what this control covers. The re-run's `audio.wav`
-has the same header and sample count as the committed one and differs on
-**94.2%** of its samples, by at most **215 LSB** of int16 against a peak
-amplitude of 13010 (rms 36.4 LSB). The container moved too: 225,174 bytes
-against the committed 225,151.
+Recorded because it bounds what this control covers, and left open because
+nothing here attributes it. The re-run's `audio.wav` has the same header and
+sample count as the committed one and differs on **94.2%** of its samples, by at
+most **215 LSB** of int16 against a peak amplitude of 13010 (rms 36.4 LSB). The
+container moved too: 225,174 bytes against the committed 225,151.
+
+**"A different noise draw" is not available as the benign explanation here.**
+`AudioDecoder.__call__(self, latent) -> Audio` (`blocks.py:1180`) takes no
+`torch.Generator` and no tiling config, unlike `VideoDecoder.__call__`
+(`blocks.py:1124-1143`). What is left is a nondeterministic audio VAE or vocoder
+kernel, a different torch, or **a different audio latent** -- and the audio
+latent comes from the very stage `RecordingDiffusionStage` wraps
+(`ltx2_latent_dump.py:402` reads `stage.audio_states`, the file's only hit for it). The third case would be a
+finding about the probe, so this is not the same statement as "the audio half is
+simply not bit-exact".
+
+Phase A recorded no environment, which is why the attribution cannot be made from
+what was captured: the reference render's own
+`tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json` records
+`torch 2.13.0+cu130` on an `NVIDIA GB10`, and `phase-a-rc-job-log.txt:50` records the
+same pair for this run, so a torch mismatch is not the answer -- but the driver
+and the CUDA driver version were never written down and the comparison stops
+there. `tools/oracle/ltx2_latent_dump.py` now writes an `environment` block into
+its manifest so a future run does not repeat the omission.
 
 So the DiT plus video-VAE path reproduced exactly while the audio path did not.
 The frame control gates only `frame_*.ppm`, which is the half this row needs and
 the half it claims. `audio_latent_bfloat16.raw` is recorded WITHOUT a
-reproducibility claim, and nothing in this row's verdict rests on it.
+reproducibility claim, its row in the golden's `SHA256SUMS` is marked
+`NOT REPRODUCIBLE` so a reader who greps the digest line never misses it, and
+nothing in this row's verdict rests on it. **Owed:** attributing the audio
+divergence, which needs a second run under a recorded environment.
 
-### The instrument shipped two defects, and review caught them, not I
+### The instrument shipped three defects, and review caught them, not I
 
 Recorded because the spec's `## Tests` section claims these controls work, and
 for one commit they did not. `326f4970b` carried an incomplete rename -- a `sed`
@@ -406,15 +546,38 @@ caught: the local validation exercised `write_latent` in isolation and never
 drove `main()`. `962db2598` extracts both controls into callable functions,
 derives the expected frame set from `SHA256SUMS` instead of a literal 25, and
 fails on a missing frame, a wrong digest, an unlisted extra or an empty
-expectation. `tests/scripts/test_ltx2_latent_dump.py` covers all of it and
-asserts `main()` reaches both, and it is red against `326f4970b`. **The job above
-ran the REPAIRED driver**, which is why its control means anything.
+expectation. **The job above ran the REPAIRED driver**, which is why its control
+means anything.
+
+**A third defect, in that repair's own evidence.** It proved reachability by
+walking `main()`'s AST for a `Call` node, and the pull request body claimed that
+as "asserts `main()` reaches both controls". A `Call` node proves the call is
+written and cannot see whether the verdict it returns reaches the exit code.
+Deleting the `if not frame_check["ok"]: return 64` guard leaves the driver
+computing a correct `ok: False`, printing `CONTROL PASSED` and returning 0;
+deleting `if rc: return rc` after `report_latents` lets a short-written latent
+exit 0. Both mutations left the AST walk green -- defect 2 restored one layer up.
+`tests/scripts/test_ltx2_latent_dump.py` now drives `main()` end to end with the
+torch, upstream, GPU and checkpoint seams stubbed and asserts the EXIT CODES:
+64 on a decode missing a committed frame, 62 on a short write. Both mutations red
+against it, and so does dropping `bool(expected)` from `check_frames`'s `ok`.
+
+The red-before claim needs the same correction. The suite is red against
+`326f4970b`, but for a weaker reason than "it detects the defects": against that
+commit the two controls are not yet functions, so the suite exits at its own
+precondition and the D1/D2 legs never run. The evidence that it detects the
+defects is the mutation pair applied to the REPAIRED file, which is what the
+paragraph above records.
 
 ## Now
 
-`ACTIVE`. The static half is ANSWERED -- **LATENT**, mechanism named -- and Phase
-A has RUN and PASSED its control, so the oracle's own latent is committed and
-digest-verified in the tree.
+`ACTIVE`. A **LATENT-side divergence is proven statically** -- our final latent
+cannot be upstream's, and a mechanism is named -- and Phase A has RUN and PASSED
+its video-frame control, so the oracle's own latent is committed and
+digest-verified in the tree. That is not the same as answering the row's
+question: the VAE is not yet exonerated, and the schedule difference is not yet
+shown to CAUSE the 2.8559 points. Both remain as
+`### What this does and does not establish` states them.
 
 What remains needs no oracle lease at all:
 

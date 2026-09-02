@@ -27,17 +27,32 @@ set: every frame the committed `SHA256SUMS` names must be present and must
 agree. The expected count is derived from that file, never written here as a
 literal, because a transcription cannot gate the thing it transcribes.
 
+**Defect 3, an assertion that the controls are CALLED rather than OBEYED.** The
+first repair proved reachability by walking `main()`'s AST for a `Call` node.
+That sees the call and cannot see the verdict: delete `if rc: return rc` after
+`report_latents`, or the `if not frame_check["ok"]: return 64` after the frame
+control, and both `Call` nodes survive while the driver computes a correct
+`ok: False`, prints "CONTROL PASSED" and returns 0. That is defect 2 again, one
+layer up. So the AST walk is kept as a precondition and the evidence is an
+end-to-end `main()` drive with the GPU, torch, upstream and checkpoint seams
+stubbed: it asserts rc 64 on a decode missing a committed frame and rc 62 on a
+short-written latent. Both mutations red only against that drive.
+
 This suite needs no build, no GPU, no network, no torch and no checkpoint --
-which is the point. Both defects were catchable on a laptop.
+which is the point. All three defects were catchable on a laptop.
 """
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import importlib.util
+import io
+import json
 import re
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -203,11 +218,38 @@ with tempfile.TemporaryDirectory(prefix="ltx2-latent-dump-test-") as tmp:
     check(res["ok"] is False, "a decoded frame the committed file does not name does NOT pass")
 
     print("=== D2: an expectation with NO frame rows is not a pass either ===")
+    # Two cases, and only the SECOND one is vacuous. Here three frames DID
+    # appear under an expectation naming none of them, so each is an
+    # unlisted-frame mismatch and `ok` is false for that reason -- which is not
+    # the reason the leg is named for. Keeping it is still worth it, because it
+    # is the shape a wrong `--output-path` produces.
     res = mod.check_frames(good, {"upstream-render.mp4": "9" * 64}, len(blobs))
-    check(res["ok"] is False, "an expectation naming zero frames cannot pass vacuously")
+    check(res["ok"] is False,
+          "frames that appeared under a frame-less expectation are all unlisted mismatches")
+    check(len(res["mismatches"]) == len(blobs),
+          "each decoded frame is reported as one the committed file does not name")
     check(res["committed_frames"] == 0, "the empty frame expectation is reported as zero")
+    # THE VACUOUS CASE: nothing expected AND nothing observed. There is no
+    # mismatch to find, and `matched == 0 == len(expected)`. Every other term in
+    # `ok` is therefore satisfied, so `bool(expected)` is the only thing between
+    # this and a control that passes on zero evidence. Drop it and this leg is
+    # the only one in the suite that reds.
+    res = mod.check_frames(empty, {"upstream-render.mp4": "9" * 64}, 0)
+    check(res["ok"] is False,
+          "an empty expectation compared against an empty observation cannot pass vacuously")
+    check(res["mismatches"] == [],
+          "the vacuous case genuinely produces NO mismatch, which is why ok must reject it on its own")
+    check(res["matched"] == 0 and res["committed_frames"] == 0,
+          "matched == committed_frames == 0 in the vacuous case")
 
 print("=== both controls are REACHED from main(), not merely defined ===")
+# A `Call` node named in `main()` is a PRECONDITION, not the evidence. Walking
+# the AST proves the call is written; it cannot see whether the verdict that
+# call returns reaches the exit code. Deleting `if rc: return rc` after
+# `report_latents`, or `if not frame_check["ok"]: return 64` after the frame
+# control, leaves both Call nodes in place -- and leaves the driver computing a
+# correct `ok: False`, printing CONTROL PASSED and returning 0. That is defect 2
+# restored one layer up, so the real check is the end-to-end drive below.
 called = {
     node.func.id
     for node in ast.walk(functions["main"])
@@ -215,6 +257,153 @@ called = {
 }
 check("report_latents" in called, "main() calls report_latents")
 check("check_frames" in called, "main() calls check_frames")
+
+print("=== main() END TO END: the controls' verdicts reach the EXIT CODE ===")
+
+
+class _FakeStage:
+    """Stands in for `RecordingDiffusionStage` after a render."""
+
+    def __init__(self) -> None:
+        self.video_states = [types.SimpleNamespace(latent=object())]
+        self.audio_states: list = []
+
+
+def drive_main(tmp: Path, *, expectation: dict[str, str], decoded: dict[str, bytes],
+               latent_written: int, latent_expected: int) -> tuple[int, str]:
+    """Run the driver's own `main()` end to end and return `(rc, stdout)`.
+
+    Every seam that needs a GPU, torch, the upstream checkout or a 42 GB
+    checkpoint is replaced, and NOTHING between the two controls and `return`
+    is: `report_latents` and `check_frames` are the real functions, and the
+    control flow that turns their verdicts into an exit code is the real
+    control flow. That is the part an AST walk cannot reach.
+    """
+    tmp.mkdir(parents=True, exist_ok=True)
+    out = tmp / "out"
+    sums = tmp / "SHA256SUMS"
+    sums.write_text(
+        "# a synthetic expectation, so this needs no committed frame\n"
+        + "".join(f"{digest}  {name}\n" for name, digest in sorted(expectation.items()))
+    )
+
+    def fake_decode(video_path, frames_dir):
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        for name, blob in decoded.items():
+            (frames_dir / name).write_bytes(blob)
+        return len(decoded)
+
+    saved_modules = {k: sys.modules.get(k) for k in
+                     ("torch", "ltx_pipelines", "ltx_pipelines.ti2vid_one_stage")}
+    saved_argv = sys.argv
+    saved = {name: getattr(mod, name) for name in
+             ("assert_identity", "install_recorder", "write_latent", "decode", "COMMITTED_SUMS")}
+    pkg = types.ModuleType("ltx_pipelines")
+    pkg.__path__ = []
+    one_stage = types.ModuleType("ltx_pipelines.ti2vid_one_stage")
+    one_stage.main = lambda: None
+    pkg.ti2vid_one_stage = one_stage
+    sys.modules["torch"] = types.ModuleType("torch")
+    sys.modules["ltx_pipelines"] = pkg
+    sys.modules["ltx_pipelines.ti2vid_one_stage"] = one_stage
+    mod.assert_identity = lambda source: {"revision": "0" * 40, "worktree_dirty": False}
+    mod.install_recorder = lambda module: {
+        "pipeline": types.SimpleNamespace(stage=_FakeStage())}
+    mod.write_latent = lambda tensor, out_dir, stem: latent_record(latent_written, latent_expected)
+    mod.decode = fake_decode
+    mod.COMMITTED_SUMS = sums
+    sys.argv = ["ltx2_latent_dump", "--ltx2-source", str(tmp), "--checkpoints", str(tmp),
+                "--out", str(out)]
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            rc = mod.main()
+    finally:
+        sys.argv = saved_argv
+        for name, value in saved.items():
+            setattr(mod, name, value)
+        for key, value in saved_modules.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+    return rc, buffer.getvalue()
+
+
+with tempfile.TemporaryDirectory(prefix="ltx2-latent-dump-main-") as tmp:
+    tmp = Path(tmp)
+    blobs = {f"frame_{i:06d}.ppm": f"frame {i}".encode() for i in range(3)}
+    expectation = {name: sha256_bytes(blob) for name, blob in blobs.items()}
+    expectation["upstream-render.mp4"] = "9" * 64
+
+    rc, log = drive_main(tmp / "clean", expectation=expectation, decoded=blobs,
+                         latent_written=64, latent_expected=64)
+    check(rc == 0, f"a complete latent and a complete decode exit 0 (got {rc})")
+    check("CONTROL PASSED" in log, "and the driver says the control passed")
+    manifest = json.loads(
+        (tmp / "clean/out/ltx2_latent_dump_manifest.json").read_text())
+    check("environment" in manifest,
+          "main() writes an environment block into the manifest")
+    check(manifest["environment"]["python"] == sys.version.split()[0],
+          "and the environment block was really filled in, not left empty")
+
+    # M4: with `if not frame_check["ok"]: return 64` deleted, the driver still
+    # computes ok: False and still prints CONTROL PASSED. Only the exit code
+    # moves, so only an exit-code assertion sees it.
+    rc, log = drive_main(tmp / "missing", expectation=expectation,
+                         decoded=dict(list(blobs.items())[:2]),
+                         latent_written=64, latent_expected=64)
+    check(rc == 64, f"a decode MISSING a committed frame exits 64, not 0 (got {rc})")
+    check("CONTROL PASSED" not in log,
+          "and the driver does NOT report the control as passed")
+
+    rc, _ = drive_main(tmp / "wrongdigest", expectation=expectation,
+                       decoded={**blobs, "frame_000001.ppm": b"perturbed"},
+                       latent_written=64, latent_expected=64)
+    check(rc == 64, f"a decode whose digest DISAGREES exits 64 (got {rc})")
+
+    # M5: with `if rc: return rc` deleted after report_latents, a short-written
+    # latent runs on into a decode that agrees, and exits 0.
+    rc, log = drive_main(tmp / "shortwrite", expectation=expectation, decoded=blobs,
+                         latent_written=32, latent_expected=64)
+    check(rc == 62, f"a SHORT-WRITTEN latent exits 62 before any decode (got {rc})")
+    check("DECODE (the control" not in log,
+          "and the run stops at the latent report rather than reaching the decode")
+
+print("=== the environment recorder describes, and never raises ===")
+fake_torch = types.SimpleNamespace(
+    __version__="2.13.0+cu130",
+    version=types.SimpleNamespace(cuda="13.0"),
+    cuda=types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_name=lambda i: "NVIDIA GB10",
+        get_device_capability=lambda i: (12, 1),
+    ),
+    _C=types.SimpleNamespace(_cuda_getDriverVersion=lambda: 13000),
+)
+rec = mod.environment_record(fake_torch)
+check(rec["torch"] == "2.13.0+cu130", "the torch version is recorded")
+check(rec["gpu"] == "NVIDIA GB10", "the GPU name is recorded")
+check(rec["gpu_capability"] == "12.1", "the GPU capability is recorded")
+check(rec["cuda_driver"] == 13000, "the CUDA driver version is recorded")
+
+
+class _Hostile:
+    """Every attribute access raises. A driver that dies while describing its own
+    environment would destroy the render it just paid for."""
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"no {name}")
+
+
+try:
+    rec = mod.environment_record(_Hostile())
+    check(rec["torch"] is None and rec["gpu"] is None,
+          "an unreadable field is recorded as null rather than raising")
+    check(rec["python"] == sys.version.split()[0],
+          "and the fields that do not need torch are still filled in")
+except Exception as exc:  # noqa: BLE001 - raising here IS the defect
+    check(False, f"environment_record must not raise (raised {type(exc).__name__}: {exc})")
 
 if failures:
     print(f"FAILED ({len(failures)})")

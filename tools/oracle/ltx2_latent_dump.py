@@ -41,6 +41,12 @@ this driver is equivalent to upstream's `main()`. If they do not, the latent is
 NOT the reference's latent and this script says so rather than scoring it -- a
 probe that changed the run is a finding about the probe.
 
+RECORD THE ENVIRONMENT. `environment_record` writes torch, CUDA, driver and GPU
+into the manifest. Phase A recorded none of it, which is why its audio
+divergence from the committed reference is an unattributed observation rather
+than a finding: the one variable that would separate a different torch from a
+perturbing probe was not captured.
+
 ASSERT THE DUMP RAN. A counter that could not be written reads exactly like a
 counter that was never incremented, which has cost this campaign real time. So
 the recorded state list must be non-empty and the written file's length must
@@ -63,6 +69,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import platform
 import re
 import sys
 import time
@@ -180,6 +187,58 @@ def write_latent(tensor, out_dir: Path, stem: str) -> dict:
         },
     }
     return record
+
+
+def environment_record(torch_module) -> dict:
+    """What varied between two runs of this driver, captured rather than assumed.
+
+    The Phase A run recorded none of this, and that cost an attribution: its
+    `audio.wav` differed from the committed reference on 94.2% of samples and
+    nothing in the record could separate "a different torch moved the audio VAE"
+    from "the recording probe moved it". The reference render's own manifest
+    (`tests/parity/goldens/ltx2_oracle/ltx2_oracle_manifest.json`) records
+    `torch 2.13.0+cu130` on an `NVIDIA GB10`, so the comparison was always
+    available and simply was not written down.
+
+    Every field is best-effort and no probe here may raise: a driver that dies
+    while describing its own environment would destroy the render it just paid
+    for. A field that could not be read is recorded as `null`, which is
+    distinguishable from a field that read as absent.
+
+    The key names mirror the block `ltx2_oracle.py:276-290` writes inline, so the
+    two manifests compare field by field, and this is a superset: it adds the
+    CUDA runtime and driver versions, which are what a "did torch move?" question
+    actually needs. It is not shared code with that block on purpose. Extracting
+    it would change the shape of the REFERENCE render's manifest, whose digest is
+    committed in `tests/parity/goldens/ltx2_oracle/SHA256SUMS` and which every
+    other LTX-2 row compares against; that is a larger blast radius than a
+    ten-line probe is worth. If `ltx2_oracle.py` is ever re-run for another
+    reason, fold this function in then.
+    """
+    def probe(fn):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001 - an unreadable field is a null, not a crash
+            return None
+
+    # `getattr(..., None)` only swallows AttributeError, and a torch whose CUDA
+    # attribute raises anything else would take the manifest down with it, after
+    # the render is already paid for. Every read goes through `probe`.
+    cuda = probe(lambda: torch_module.cuda)
+    available = probe(lambda: bool(cuda.is_available()))
+    return {
+        "python": sys.version.split()[0],
+        "platform": probe(platform.platform),
+        "machine": probe(platform.machine),
+        "torch": probe(lambda: torch_module.__version__),
+        "torch_cuda": probe(lambda: torch_module.version.cuda),
+        "cuda_available": available,
+        "gpu": probe(lambda: cuda.get_device_name(0)) if available else None,
+        "gpu_capability": probe(
+            lambda: ".".join(str(v) for v in cuda.get_device_capability(0))
+        ) if available else None,
+        "cuda_driver": probe(lambda: torch_module._C._cuda_getDriverVersion()),
+    }
 
 
 def committed_frame_digests(committed: dict[str, str]) -> dict[str, str]:
@@ -374,6 +433,7 @@ def main() -> int:
                     "num_frames": NUM_FRAMES,
                     "num_inference_steps": args.num_inference_steps,
                     "seed": SEED, "offload": args.offload, "device": args.device},
+        "environment": environment_record(torch),
         "latents": latents,
         "frame_control": frame_check,
         "render_seconds": round(render_s, 1),

@@ -65,7 +65,8 @@ namespace {
 constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8,
                    kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14,
                    kQ8_K = 15, kIQ2_XS = 17, kIQ4_NL = 20, kIQ2_S = 22,
-                   kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39, kQ1_0 = 41;
+                   kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39, kQ1_0 = 41,
+                   kIQ3_S = 21;
 
 // Every executable weight encoding, with a K that is a whole number of blocks.
 struct Encoding {
@@ -509,10 +510,13 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // W6a added (#1989 review F8): a case that calls itself TOTAL and omits the
   // two newest encodings is total over yesterday's surface. IQ2_XS (17) joins
   // it for the same reason with LOADER-GGUF-IQ (#2240).
+  // IQ3_S (21) joins with QUANT-IQ3S (#2510), and it is the one entry here that
+  // is GATHER-capable and GEMM-incapable, so it is what keeps the two terms
+  // below from being the same predicate written twice.
   const uint32_t all_types[] = {kF32,   kF16,    kBF16,   kQ4_0,   kQ5_0,
                                 kQ8_0,  kQ3_K,   kQ4_K,   kQ5_K,   kQ6_K,
                                 kQ8_K,  kIQ2_XS, kIQ4_NL, kIQ2_S,  kIQ4_XS,
-                                kMXFP4};
+                                kMXFP4, kIQ3_S};
 
   // ENG-GGUF-RESIDENCY-RESOLVED-DEVICE: ONE device, named here, and both the
   // route and the expectation read it. It used to be
@@ -586,7 +590,13 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // actually registered. It cannot be hand-enumerated like `cpu_capable`
         // above, because whether the CUDA registrar is linked is a property of
         // the build and not of the encoding.
-        const bool gather_cpu_capable = cpu_capable || type == kQ8_K;
+        // IQ3_S has a `to_float` and NO `vec_dot`, so it is gather-capable and
+        // GEMM-incapable — the surplus Q8_K used to hold alone. It is a FILE
+        // encoding, which Q8_K is not, so this is the term that decides whether
+        // 4 of an 866-tensor artifact's weights stay compressed on the gather
+        // while expanding on the GEMM (#2510).
+        const bool gather_cpu_capable =
+            cpu_capable || type == kQ8_K || type == kIQ3_S;
         // THE MERGED FORM, which was in neither branch. #2396 made the gather
         // build-dependent and asked the OP REGISTRY instead of hard-coding
         // "CPU only" — correct, and this row keeps it. But it asked about
@@ -667,11 +677,16 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // that point one device was routed and it was the process's own; under this
   // row's device loop the two come apart, and asking the host would compare a
   // CUDA-registry answer against a ROCm route on two legs out of three.
+  //
+  // QUANT-IQ3S (#2510) moves the GATHER term 13 -> 14 and leaves GEMM where it
+  // was, the same decode-only shape #2240 had. That asymmetry IS the row's
+  // per-tier result: IQ3_S stays compressed in a gather table and expands to
+  // bf16 in a GEMM, on every device.
   const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 8 : 24;
   const int gather_kept =
-      vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 13 : 0;
+      vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 14 : 0;
   CHECK(kept == gemm_kept + gather_kept);
-  CHECK(expanded == 16 * 36 - (gemm_kept + gather_kept));
+  CHECK(expanded == 17 * 36 - (gemm_kept + gather_kept));
   }
 }
 

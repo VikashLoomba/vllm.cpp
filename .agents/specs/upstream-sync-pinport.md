@@ -164,6 +164,13 @@ discharged: it belongs to the wave that ports the queue.
   233 commits after `v0.28.1rc0`. No `vllm.__version__` was measured, so
   `gateable` stays `no` and that tag distance must NOT be transcribed into the
   `parity-pin` block.
+  **The job then finished and found a harder blocker (§9.2): `BUILD_RC=0` but
+  `IMPORT_RC=1`, because the target's runtime requirements do not install on
+  aarch64.** `2d7f42b4f3` vllm#52801 promoted `instanttensor` from a test
+  dependency to a runtime one without a platform marker, it ships no aarch64
+  wheel, and it fails to build from source. Every fleet device is aarch64, so
+  **advancing the pin would move the oracle to a revision this fleet cannot
+  install.** That is a stronger reason to hold the pin than the unported queue.
 - Step 6 re-measurement of any vLLM baseline at the target before comparison
   (#2524).
 - Tiering the 356 INVENTORY entries (#2524).

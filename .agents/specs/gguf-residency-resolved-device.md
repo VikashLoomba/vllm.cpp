@@ -224,14 +224,20 @@ re-run to 13/3087/rc 0.
   `ResolveExplicitDeviceType`, whose own suite
   (`tests/vllm/entrypoints/test_loaded_engine_dense.cpp`) pins the `kCPU` arm.
   An end-to-end `--device cpu` GGUF load on a fleet GPU box closes it.
-* **`quant_repack` has no device term** ([#2406](https://github.com/mudler/vllm.cpp/issues/2406)).
-  `vt::cpu::QuantRepackActive()` is a host-ISA probe, so an aarch64 i8mm CUDA
-  box on `--device cuda` ARM-repacks its Q8_0 weights and stages them to a card
-  whose kernel has no reader for the marker. Pre-existing and not widened here;
-  the sibling `elem_kn_repack` IS gated `dev == kCPU`. Untestable on this x86
-  CPU-only host, and the CUDA-falls-back-to-CPU-kernel path may make it a
-  performance trade rather than a pure fix, so it wants measuring before anyone
-  changes the line.
+* ~~**`quant_repack` has no device term**~~
+  ([#2406](https://github.com/mudler/vllm.cpp/issues/2406)). CLOSED by wave
+  DEBTFIX, `.agents/specs/debtfix-glue-rank-bound-and-repack-device.md`. The
+  flag now resolves through `QuantRepackForDevice(..., dev)`, gated
+  `dev == kCPU` exactly as its sibling `elem_kn_repack` always was, so every
+  device-dependent decision in `GgufLoadPolicy` reads the resolved device and
+  this row's headline claim is finally true without a caveat. Two things that
+  row asked for are answered there rather than here: the "untestable on x86"
+  objection is met by making the ISA answer a PARAMETER of the decision, which
+  is this row's own move for `dev`; and the "performance trade" objection is
+  settled the way `## Gates` settles it, with the cost named — an aarch64
+  `--device cuda` load that reaches the CUDA-to-CPU drain loses the i8mm
+  interleave. The aarch64 CUDA MEASUREMENT of that trade is still owed and is
+  recorded under that spec's `## Owed`.
 * **Six of eight registry hooks are ungated** (review F4). Pointing
   `laguna_registry`, `qwen3_5_moe`, `qwen3_5_dense`, `deepseek_v4_registry`,
   `glm_moe_dsa_registry` or `muse_glimmer_registry` at a wrong device is
@@ -288,7 +294,7 @@ numbers byte-for-byte before doing so. What it changed:
   `OpRegistered(kEmbeddingQuant, kRouteDev)` — #2396's question, this row's
   device.
 * **F5 — a sentence of this row's own was false**, and it named a real latent
-  bug. See `## Owed` and #2406.
+  bug. See `## Owed` and #2406, which wave DEBTFIX has since closed.
 * **F6 — `(expect_keep ? kept : expanded)++` counted the EXPECTATION**, so the
   totality table's two totals restated their own arithmetic and could never
   fire. Now counts the observed residency, and the table runs over three

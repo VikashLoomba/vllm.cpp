@@ -56,6 +56,7 @@ using vllm::GgufResidency;
 using vllm::GgufTensorRole;
 using vllm::KeepQuantDType;
 using vllm::OwnGgufQuantBlocks;
+using vllm::QuantRepackForDevice;
 using vllm::RouteGgufTensor;
 
 namespace {
@@ -270,6 +271,77 @@ TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #
   // Asked of a ROCm-resolved policy, not of this process's own.
   const GgufLoadPolicy pol = GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM);
   CHECK(!pol.keep_f16);
+}
+
+TEST_CASE("quant_repack is decided WITH the resolved device (#2406)") {
+  // THE DEFECT. `quant_repack` selects the CIQ G7 load-time permutation of a
+  // Q8_0 weight into the ARM i8mm `block_q8_0x4` interleave. Only the CPU
+  // `MatmulBTKernel` reads that layout; `grep -c repacked
+  // src/vt/cuda/cuda_quant_dot.cu` is 0. The flag was resolved from
+  // `vt::cpu::QuantRepackActive()` alone — a pure HOST-ISA probe — so on an
+  // aarch64 i8mm host with a GPU (dgx GB10 and Jetson Thor, both fleet devices)
+  // a `--device cuda` load repacked the weight and staged it to the card. Its
+  // sibling `elem_kn_repack` has carried `dev == kCPU` for exactly this reason
+  // since it landed, and says so in its own comment.
+  //
+  // WHY THIS IS ASSERTED OVER A PREDICATE AND NOT OVER `FromEnv`.
+  // `QuantRepackActive()` compiles to a literal `false` on every non-aarch64
+  // target (`src/vt/cpu/cpu_quant_repack_arm.cpp`). An assertion that reached
+  // the decision only through `FromEnv` would therefore read `quant_repack ==
+  // false` on x86 CI whether the device term existed or not — a mute switch
+  // wearing a gate's clothes, and one that would have passed on every day this
+  // defect was live. Passing the ISA answer in is the same move
+  // `RouteGgufTensor` made for `dev`, for the same stated reason: a decision
+  // that takes its inputs is checkable from a host that is not the one it
+  // decides for.
+  //
+  // THE DISCRIMINATING PAIR is the first two rows. They differ in `dev` alone.
+  CHECK(QuantRepackForDevice(/*keep_quant=*/true, /*cpu_ref=*/false,
+                             /*host_repack_active=*/true,
+                             vt::DeviceType::kCPU) == true);
+  CHECK(QuantRepackForDevice(/*keep_quant=*/true, /*cpu_ref=*/false,
+                             /*host_repack_active=*/true,
+                             vt::DeviceType::kCUDA) == false);
+  // Every other accelerator answers the same way: the gate is "is this the CPU",
+  // not "is this CUDA". A `dev != kCUDA` spelling passes the row above and fails
+  // these two.
+  CHECK(QuantRepackForDevice(true, false, true, vt::DeviceType::kROCM) == false);
+  CHECK(QuantRepackForDevice(true, false, true, vt::DeviceType::kXPU) == false);
+
+  // The three pre-existing terms are unchanged, and each still vetoes alone.
+  CHECK(QuantRepackForDevice(/*keep_quant=*/false, false, true,
+                             vt::DeviceType::kCPU) == false);
+  CHECK(QuantRepackForDevice(true, /*cpu_ref=*/true, true,
+                             vt::DeviceType::kCPU) == false);
+  CHECK(QuantRepackForDevice(true, false, /*host_repack_active=*/false,
+                             vt::DeviceType::kCPU) == false);
+
+  // AND THE LOADER USES IT. The predicate above is the rule; this is the wire.
+  //
+  // THIS HALF IS VACUOUS ON x86 AND THAT IS SAID RATHER THAN HIDDEN.
+  // `QuantRepackActive()` is a compile-time `false` off aarch64, so no value of
+  // `dev` can make `FromEnv` answer `true` here and no x86 run can tell the
+  // wired predicate from the expression it replaced. `VT_GGUF_KEEP_QUANT=1`
+  // removes the OTHER two vetoes — without it `keep_quant` is already false for
+  // a device with no quant GEMM registered, and this would assert nothing on
+  // any host. With it, on an aarch64 i8mm box (dgx, thor, orin — every box
+  // where the defect was reachable) the old expression answers `true` and this
+  // case reds. The truth table above is what gates the rule everywhere else.
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
+  CHECK(!GgufLoadPolicy::FromEnv(vt::DeviceType::kCUDA).quant_repack);
+  CHECK(!GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM).quant_repack);
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
+  // On the CPU the flag is exactly what the host ISA says, which is the
+  // property that makes this a device gate and not a disablement. On an i8mm
+  // box this reads `true`, which is the same answer the loader gave before
+  // #2406 — the gate must not have turned the transform off where it works.
+  {
+    const GgufLoadPolicy cpu = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
+    CHECK(cpu.quant_repack ==
+          QuantRepackForDevice(cpu.keep_quant, cpu.cpu_ref,
+                               vt::cpu::QuantRepackActive(),
+                               vt::DeviceType::kCPU));
+  }
 }
 
 TEST_CASE("keep-quant residency refuses ragged K and out-of-span slices") {
@@ -1373,7 +1445,12 @@ TEST_CASE("production default is keep-quant wherever the quant GEMM exists") {
   expect.mmap_residency = expect.keep_quant;
   expect.share_tied_head = expect.keep_quant;
   expect.gdn_expand_nk = expect.keep_quant;
-  expect.quant_repack = expect.keep_quant && vt::cpu::QuantRepackActive();
+  // #2406: the mirror carries the DEVICE term too, or an i8mm host would
+  // compare an env load (kCPU-resolved) against a policy that decided without
+  // one. `kCPU` is the device this whole case resolves for.
+  expect.quant_repack = vllm::QuantRepackForDevice(
+      expect.keep_quant, /*cpu_ref=*/false, vt::cpu::QuantRepackActive(),
+      vt::DeviceType::kCPU);
 
   const vllm::Qwen3_5DenseWeights from_env =
       vllm::LoadQwen3_5DenseFromGguf(g, c, /*policy=*/nullptr);

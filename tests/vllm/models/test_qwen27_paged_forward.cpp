@@ -726,7 +726,11 @@ TEST_CASE("qwen27 activation-dtype flag is opt-in on a leading 1 only") {
 // The RESOLVER, asked against the environment this process actually has.
 // `ActDType` caches its getenv in a function-local static, so one process
 // observes exactly one value; the second registration of this binary under
-// `VT_ACT_F32=1` (tests/CMakeLists.txt) is what executes the other arm.
+// `VT_ACT_F32=1` (tests/CMakeLists.txt) is what executes the other arm. That
+// entry is SCOPED to `qwen27 activation*` on purpose: the lever is refused, so
+// every case that CONSTRUCTS a qwen35 model legitimately cannot run under it,
+// and dragging them in would red the entry for obeying the refusal. These two
+// cases build no model, which is why they are the ones that can carry it.
 //
 // The f32 ARM IS REFUSED, and this case holds the refusal to its contract.
 // Honouring the flag does not produce an f32 engine, it produces a numerically

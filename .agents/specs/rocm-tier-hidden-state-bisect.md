@@ -145,19 +145,56 @@ This row adds no environment variable.
 ### 3.3 The dump must not change what it measures
 
 The dumps force a device synchronize per layer, so they are inert by default and
-must never be set on a graph-capturing run. Two controls, both of which fail the
-job rather than being reported:
+must never be set on a graph-capturing run.
+
+**The graph control this section first demanded is unnecessary, and reading the
+tree rather than assuming is what removed it.** The draft required the dumped
+ROCm leg to run `VLLM_CPP_CUDAGRAPH=0` and to be compared against a
+graph-captured leg, on the belief that ROCm decode is captured by default. It is
+not. `vt`'s ROCm backend can capture (`RocmBackend::SupportsGraphCapture()` is
+true, `src/vt/rocm/rocm_backend.hip:337`), but the driver's predicate is a
+conjunction, and its third term is
+`platforms::GetPlatform(...).support_static_graph_mode()`
+(`src/vllm/model_executor/models/qwen3_5_dense.cpp:179-181`). `RocmPlatform` does
+not override it and takes the base `false`
+(`include/vllm/platforms/interface.h:344`), which `src/vllm/platforms/rocm.cpp:91-97`
+states in its own words: engaging a real model's decode-graph path is a later
+work item. `CpuPlatform` leaves it false too. **Both tiers are eager already**,
+both enter the same `DenseForwardLayers`, and a knob would have changed nothing
+while implying it had.
+
+That leaves one control, which fails the job rather than being reported:
 
 - **Identity.** The generated ids with the dumps ON are byte-identical to the
   same run with them OFF, per tier. Without this the instrument could be
-  reporting its own perturbation.
-- **Eager.** The ROCm arm captures hipGraphs by default
-  (`RocmBackend::SupportsGraphCapture()` is true; `VLLM_CPP_CUDAGRAPH` gates it),
-  and the CPU arm cannot capture at all. The dumped ROCm leg therefore runs
-  `VLLM_CPP_CUDAGRAPH=0`, and its ids are compared against the ROCm leg with
-  graphs ON. **If those two differ, that is the finding and the row reports it
-  instead**: it would mean the divergence is a capture/replay effect and not a
-  kernel one, and no per-layer profile could be read until it was resolved.
+  reporting its own perturbation, and no reading of the profile would be worth
+  anything.
+
+### 3.4 Two candidates the artifact itself decides, before any GPU work
+
+Both are residency divergences between the tiers rather than arithmetic, and
+both are cheap to settle. They are recorded here because a candidate refuted for
+free is worth more than a candidate ranked by argument, and this campaign has
+already spent four dispatches on the latter.
+
+- **F16 weights expand on ROCm and are kept on the CPU tier.**
+  `DeviceKeepF16Supported` is `dev != kROCM`
+  (`src/vllm/model_executor/model_loader/gguf_keep_quant.cpp:154-156`), so an F16
+  file weight loses three mantissa bits on one tier and not the other.
+  **REFUTED for this artifact.** Its 866 tensors are 456 F32, 294 Q4_K, 67 Q6_K,
+  48 Q5_K and one Q8_0 (`blk.64.nextn.eh_proj`, the MTP head, which this arm does
+  not run). There is no ggml type 1 in the file, read from its own tensor table.
+  Every quantized type present is in ROCm's keep-quant set
+  (`DeviceKeepQuantSupported`, `:136-149`), so the two tiers keep identical
+  residency for every weight the forward touches.
+- **The vocabulary table does NOT keep identical residency.**
+  `DeviceQuantGatherSupported` asks whether `kEmbeddingQuant` is registered
+  (`gguf_keep_quant.cpp:194-196`); ROCm registers only the float-table
+  `kEmbedding`, so `token_embd.weight` — Q4_K in this file, 248320 x 5120 —
+  expands to bf16 on ROCm and stays Q4_K blocks on the CPU tier. **This is live**,
+  and it is the reason §3.2 adds the post-embedding snapshot the dense path never
+  had: without a `layer -1` row, "the two tiers embed the token differently" and
+  "layer 0 computes differently" are the same measurement.
 
 ## 4. The comparator
 
@@ -179,11 +216,25 @@ side declared, and a blob whose byte length disagrees with its manifest row.
 
 One `rc` lease on `strix:gpu0`, detached, never `ssh`.
 
-**One source tree, two builds.** The tier is selected at build time on this
-codebase, not at run time: the CPU tier is a `-DVLLM_CPP_HIP=OFF` build. Both
-binaries come from one clone of this branch at one revision, asserted by
-`git rev-parse` inside the job, so "the two tiers" cannot become "two trees".
-This is what makes the comparison oracle-free AND source-identical.
+**One source tree, ONE binary, two tiers.** The draft of this section said the
+CPU tier is a `-DVLLM_CPP_HIP=OFF` build and that the job therefore builds twice.
+It does not have to. `vllm-bench` never sets `EngineParams::device`, so it
+resolves `Device::kAuto` through the platform registry, and `RocmPlatform`
+registers at static init only when `vt::rocm::DeviceAvailable()` — that is,
+`hipGetDeviceCount(&n) == hipSuccess && n > 0`
+(`src/vllm/platforms/rocm.cpp:178-190`, `src/vt/rocm/rocm_backend.hip:542-545`).
+Removing the device from the container's view selects `kCPU` from **the same
+`libvllm.so`**. One build, one library hash printed once and used by both arms,
+and "the two tiers" cannot become "two trees" by construction rather than by
+assertion.
+
+**The tier is measured, not requested.** An environment variable that quietly
+did not take would leave the CPU leg running on the board and the comparison
+would read as two tiers agreeing perfectly — the exact shape of an instrument
+pointed at the wrong thing. So each leg asserts which kernels actually ran, from
+`VT_OP_PROVIDER_STATS=1`: the ROCm leg needs a non-zero `device=5` count and zero
+reference-tier hits, and the CPU leg needs a `device=5` count of **zero** and a
+non-zero `device=0` count. Either way round, the job fails rather than reports.
 
 **One host.** Both arms run on the same box, in the same lease, on the same
 boot, over the same artifact staged to worker-local `/tmp` and re-hashed there.
@@ -233,6 +284,13 @@ it, and all three are printed:
   run's HIP oracle measured them. The profile is therefore read together with the
   final logit delta at the same step, which `VT_DUMP_LOGITS` (#2534, already
   landed and reachable from both sampling paths) supplies on both arms.
+
+**A key-set mismatch is a finding, not a harness error.** The comparator joins on
+`(step, layer, stage)` and refuses when the two sides do not cover the same keys.
+That refusal has a meaning here beyond hygiene: the GDN block dumps different
+stage names on different branches, so two tiers that took structurally different
+routes through the mixer would not produce the same key set. Reported as what it
+is, and never worked around with `--allow-drops` before it is explained.
 
 **The GDN split is reported separately.** This model is a GDN hybrid: linear-
 attention layers and full-attention layers are different code, and the

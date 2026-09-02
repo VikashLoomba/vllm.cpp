@@ -25,6 +25,7 @@
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/AuxPool/ActivePool (shared)
 #include "vt/tenstorrent/tenstorrent_device.h"  // DebugDeviceReadbackF32 (TT-only debug seam)
 
+#include "vllm/model_executor/models/act_dump.h"  // ROCM-TIER-DIVERGENCE (#2590)
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/device_placement.h"
@@ -41,6 +42,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1314,6 +1316,38 @@ Tensor Qwen3_5EmbeddingTable(vt::Backend& backend, vt::Queue& queue,
 }
 
 namespace {
+
+// ROCM-TIER-DIVERGENCE (#2590): the device-side half of the activation dump.
+// The keying, the manifest and every refusal live in
+// `vllm/model_executor/models/act_dump.h`, apart from these two so that a test
+// can drive the writer with no backend at all. See that header for why the
+// three predecessor dumps could not answer this question.
+// Download a device tensor and write it. `rows`/`cols` are the logical [T,H] or
+// [T,N] view; the manifest carries them so the comparator never guesses.
+void ActDumpTensor(Dev d, const char* knob, const std::string& dir,
+                   const char* stage, const Tensor& t, int64_t rows, int64_t cols) {
+  const actdump::Where w = actdump::Current();
+  const int64_t n = rows * cols;
+  std::vector<uint8_t> raw(static_cast<size_t>(n) * vt::SizeOf(t.dtype));
+  DBuf tmp(d, t.dtype, {n});
+  d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
+  tmp.Download(d, raw.data());  // Copy + Synchronize
+  actdump::WriteBlob(knob, dir, w.step, w.layer, stage, t.dtype, rows, cols,
+                     raw.data(), raw.size());
+}
+
+
+// Both halves of the residual stream at one position. `layer` is -1 for the
+// post-embedding snapshot and the loop index otherwise. Inert unless
+// `VT_DUMP_ACT` names a directory.
+void ActDumpStream(Dev d, int64_t step, int64_t layer, DBuf& hidden, DBuf& res,
+                   int64_t T, int64_t H) {
+  const char* dir = actdump::StreamDir();
+  if (dir == nullptr || step < 0) return;
+  const actdump::LayerScope here(step, layer);
+  ActDumpTensor(d, "VT_DUMP_ACT", dir, "hidden", hidden.t(), T, H);
+  ActDumpTensor(d, "VT_DUMP_ACT", dir, "res", res.t(), T, H);
+}
 
 // Device-resident f32 upcast of a bf16 owned weight, uploaded ONCE. Matches the
 // CUDA norm/conv kernels' requirement that the weight dtype equal the (f32)
@@ -5048,22 +5082,19 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
              : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
 }
 
-// VT_DUMP_ACT stage probe (GDN): dump named intermediates per invocation so a
-// layer-level divergence can be pinned to one kernel. Debug-only; Download
-// syncs, never set on capture paths.
+// VT_DUMP_ACT stage probe (GDN): dump named intermediates so a layer-level
+// divergence can be pinned to one kernel. Debug-only; Download syncs, never set
+// on capture paths.
+//
+// ROCM-TIER-DIVERGENCE (#2590): keyed on (step, layer) through `actdump` instead
+// of on a process-global call counter. The counter named an invocation ordinal,
+// which is a different quantity on two runs whose forward-call counts differ by
+// one and cannot be joined across two tiers at all.
 void DumpGdnStage(Dev d, const char* stage, const Tensor& t) {
-  if (std::getenv("VT_DUMP_ACT") == nullptr) return;
-  static std::atomic<int> gdn_seq{0};
-  const int call = gdn_seq.fetch_add(1, std::memory_order_relaxed);
-  const int64_t n = t.Numel();
-  std::vector<uint8_t> raw(static_cast<size_t>(n) * vt::SizeOf(t.dtype));
-  DBuf tmp(d, t.dtype, {n}, t.data);
-  d.b.Copy(d.q, tmp.ptr(), t.data, raw.size());
-  tmp.Download(d, raw.data());
-  const std::string path = std::string(std::getenv("VT_DUMP_ACT")) + "/gdn" +
-                           std::to_string(call) + "_" + stage + ".bin";
-  std::FILE* f = std::fopen(path.c_str(), "wb");
-  if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+  const char* dir = actdump::StreamDir();
+  if (dir == nullptr) return;
+  ActDumpTensor(d, "VT_DUMP_ACT", dir, (std::string("gdn_") + stage).c_str(),
+                      t, 1, t.Numel());
 }
 
 DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
@@ -7664,46 +7695,43 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
                         const CommonAttentionMetadata& attn_meta,
                         const GDNAttentionMetadata& gdn_meta,
                         const PagedKvCache* attn_kv,
-                        const GdnStateCache* gdn_state, int64_t T) {
+                        const GdnStateCache* gdn_state, int64_t T,
+                        int64_t layer_index) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
-  // VT_DUMP_ACT layer index: the paged loop's per-layer counter (0-based), used
-  // by the sub-stage dump below. Declared per-process; only the dump reads it.
-  static thread_local int64_t dump_layer_idx = -1;
-  dump_layer_idx++;
-  const bool dump_sub = std::getenv("VT_DUMP_ACT_SUB") != nullptr;
+  // ROCM-TIER-DIVERGENCE (#2590): the sub-stage dump is keyed on (step, layer),
+  // taken from the caller the way the MoE sibling `RunLayerPaged` already takes
+  // `layer_index`. It used to be keyed on a `static thread_local` counter that
+  // was never reset, so a file name encoded an invocation ordinal rather than a
+  // position in the model, and one extra forward call on either side of a
+  // comparison silently shifted the whole join. The scope also carries the key
+  // to every dump NESTED inside the mixer, so the GDN stage probes no longer
+  // keep a counter of their own.
+  const actdump::LayerScope dump_here(actdump::Current().step, layer_index);
+  const char* dump_sub_dir = actdump::StageDir();
   auto DumpStage = [&](const char* stage, DBuf& buf) {
-    if (!dump_sub) return;
-    std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
-                             vt::SizeOf(buf.t().dtype));
-    buf.Download(d, raw.data());
-    const std::string path = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
-                             "/layer_" + std::to_string(dump_layer_idx) + "_" +
-                             stage + ".bin";
-    std::FILE* f = std::fopen(path.c_str(), "wb");
-    if (f != nullptr) { std::fwrite(raw.data(), 1, raw.size(), f); std::fclose(f); }
+    if (dump_sub_dir == nullptr) return;
+    ActDumpTensor(d, "VT_DUMP_ACT_SUB", dump_sub_dir, stage, buf.t(), T, H);
   };
 
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   DBuf dhn(d, ActDType(d), {T, H});
   vt::RmsNorm(d.q, dhn.t(), hidden.t(), dw_in, vt::RmsNormArgs{eps, true}, &res.t());
-  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr)
-    std::fprintf(stderr, "[TT-DUMP] post_input_norm ptr=%p rows=%lld\n",
-                 static_cast<const void*>(dhn.t().data), (long long)T);
   DumpStage("post_input_norm", dhn);
-  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
-    // Same-instant second read via the DIRECT pattern (no DBuf/pool): if
-    // these two disagree, the download patterns themselves diverge.
+  if (dump_sub_dir != nullptr) {
+    // Same-instant second read via the DIRECT pattern (no DBuf/pool): if these
+    // two disagree, the download patterns themselves diverge. Kept because it
+    // is the control that tells a download artefact from a kernel difference,
+    // and a cross-tier comparison needs that told apart before it can report a
+    // layer.
     std::vector<uint8_t> rawD(static_cast<size_t>(T) * static_cast<size_t>(H) *
                               vt::SizeOf(dhn.t().dtype));
     d.b.Synchronize(d.q);
     d.b.Copy(d.q, rawD.data(), dhn.t().data, rawD.size());
-    const std::string pd = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
-                           "/layer_" + std::to_string(dump_layer_idx) +
-                           "_post_input_norm_DIRECT.bin";
-    std::FILE* fd = std::fopen(pd.c_str(), "wb");
-    if (fd != nullptr) { std::fwrite(rawD.data(), 1, rawD.size(), fd); std::fclose(fd); }
+    actdump::WriteBlob("VT_DUMP_ACT_SUB", dump_sub_dir, actdump::Current().step,
+                       layer_index, "post_input_norm_DIRECT", dhn.t().dtype, T, H,
+                       rawD.data(), rawD.size());
   }
 
   DBuf attn = [&] {
@@ -7719,20 +7747,12 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
   }();
   DumpStage("block_out", attn);
 
-  if (std::getenv("VT_DUMP_ACT_SUB") != nullptr) {
-    // Triple-read probe: re-download the INPUT-NORM buffer after the mixer
-    // ran. If it differs from the pre-mixer dump, something between them
-    // writes it; if equal, the earlier disagreement is a download artifact.
-    std::vector<uint8_t> raw2(static_cast<size_t>(T) * static_cast<size_t>(H) *
-                              vt::SizeOf(dhn.t().dtype));
-    DBuf tmp2(d, dhn.t().dtype, {T * H}, dhn.t().data);
-    d.b.Copy(d.q, tmp2.ptr(), dhn.t().data, raw2.size());
-    tmp2.Download(d, raw2.data());
-    const std::string p2 = std::string(std::getenv("VT_DUMP_ACT_SUB")) +
-                           "/layer_" + std::to_string(dump_layer_idx) +
-                           "_post_input_norm_RECHECK.bin";
-    std::FILE* f2 = std::fopen(p2.c_str(), "wb");
-    if (f2 != nullptr) { std::fwrite(raw2.data(), 1, raw2.size(), f2); std::fclose(f2); }
+  if (dump_sub_dir != nullptr) {
+    // Triple-read probe: re-download the INPUT-NORM buffer after the mixer ran.
+    // If it differs from the pre-mixer dump, something between them writes it;
+    // if equal, the earlier disagreement is a download artifact.
+    ActDumpTensor(d, "VT_DUMP_ACT_SUB", dump_sub_dir,
+                        "post_input_norm_RECHECK", dhn.t(), T, H);
   }
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, ActDType(d), {T, H});
@@ -9083,7 +9103,8 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   if (weights_->kind == Qwen3_5MTPKind::kDense) {
     RunDenseLayerPaged(device, weights_->dense_layers[layer_index], *config_,
                        hidden, residual, sdi, attn_meta, gdn_meta_unused,
-                       &draft_kv, /*gdn_state=*/nullptr, tokens);
+                       &draft_kv, /*gdn_state=*/nullptr, tokens,
+                       static_cast<int64_t>(layer_index));
   } else {
     RunLayerPaged(device, weights_->moe_layers[layer_index], *config_, hidden,
                   residual, sdi, attn_meta, gdn_meta_unused, &draft_kv,
@@ -9313,6 +9334,23 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   // N paged decoder layers: full-attn layers read/write attn_kv[fa_idx], GDN
   // layers the persistent gdn_state[gdn_idx] (same layer-order indexing as the
   // 35B paged forward).
+  // ROCM-TIER-DIVERGENCE (#2590). One forward-call ordinal for every dump this
+  // step writes, so two runs are joined on a POSITION IN THE MODEL rather than
+  // on an invocation counter. -1, and every dump below inert, unless a knob is
+  // set.
+  const int64_t dump_step = actdump::BeginStep();
+  if (dump_step >= 0) {
+    actdump::NarrateOnce(d.q.device.type, "Qwen3_5DenseModel",
+                         config.num_hidden_layers, T, H);
+  }
+  // The POST-EMBEDDING snapshot, layer -1. The dense path never had one, so a
+  // cross-tier profile could not tell "the two tiers embed the token
+  // differently" from "layer 0 computes differently" -- and those two are a live
+  // pair here, because `token_embd` keeps its Q4_K blocks on the CPU tier and
+  // expands to bf16 on ROCm (gguf_keep_quant.cpp `DeviceQuantGatherSupported`).
+  // The MoE sibling has carried this snapshot since the Tenstorrent bisect.
+  ActDumpStream(d, dump_step, -1, hidden, res, T, H);
+
   int64_t fa_idx = 0, gdn_idx = 0;
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5DenseLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
@@ -9321,29 +9359,29 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
-                       gdn_meta, kv, gs, T);
+                       gdn_meta, kv, gs, T, l);
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
-    // VT_DUMP_ACT (issue #41, ROCm 0.8B forward-divergence fix spike W1): dump
-    // the residual stream after each layer as raw little-endian bf16 to
-    // $VT_DUMP_ACT/layer_<l>.bin (inert when unset; a debug hook, never the
-    // hot path — the Download forces a sync, so capture-graph paths must not
-    // set the env).
-    if (std::getenv("VT_DUMP_ACT") != nullptr) {
-      std::vector<uint8_t> raw(static_cast<size_t>(T) * static_cast<size_t>(H) *
-                               vt::SizeOf(hidden.t().dtype));
-      hidden.Download(d, raw.data());  // Copy + Synchronize
-      const char* dir = std::getenv("VT_DUMP_ACT");
-      const std::string path =
-          std::string(dir) + "/layer_" + std::to_string(l) + ".bin";
-      std::FILE* f = std::fopen(path.c_str(), "wb");
-      if (f != nullptr) {
-        std::fwrite(raw.data(), 1, raw.size(), f);
-        std::fclose(f);
-      }
-    }
+    // VT_DUMP_ACT (issue #41, ROCm 0.8B forward-divergence fix spike W1; keyed
+    // and completed for #2590): dump the residual stream after each layer.
+    //
+    // BOTH HALVES, because in this model neither one is the hidden state. The
+    // stream is carried as a pair -- `res` accumulates and `hidden` holds the
+    // layer's MLP delta -- and they are summed only at the final norm, which is
+    // also what `MaybeCaptureAuxTap` above computes. The predecessor hook wrote
+    // `hidden` alone and called it "the residual stream"; it was the MLP delta,
+    // and half a stream cannot be compared against another engine or another
+    // tier.
+    //
+    // A debug hook, never the hot path: the Download forces a sync, so
+    // capture-graph paths must not set the env.
+    ActDumpStream(d, dump_step, l, hidden, res, T, H);
   }
+  // At least the two stream halves per layer, when VT_DUMP_ACT is what is set.
+  actdump::EndStep(dump_step, actdump::StreamDir() == nullptr
+                                  ? 1
+                                  : 2 * (config.num_hidden_layers + 1));
 
   // Final RMSNorm over the fused stream (res += hidden; norm), then lm_head.
   Tensor dfn = ResidentWeight(d, weights.final_norm, {H});

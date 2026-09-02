@@ -1757,6 +1757,10 @@ vllm_cpp_add_test(test_placement_dump_dtype
   vllm/model_executor/test_placement_dump_dtype.cpp)
 target_include_directories(test_placement_dump_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+vllm_cpp_add_test(test_act_dump
+  vllm/model_executor/test_act_dump.cpp)
+target_include_directories(test_act_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_moe_fit_resolver
   vllm/model_executor/test_moe_fit_resolver.cpp)
 target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src)

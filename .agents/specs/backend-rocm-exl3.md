@@ -343,6 +343,25 @@ leg followed two EXL3 generations on the same device within seconds, so prior
 GPU state is not excluded. Recorded as an observation, owned by `BACKEND-ROCM`
 through #2511, not re-filed.
 
+## Reachability
+
+AGENTS.md "Nothing lands dead" asks whether a production entry point reaches
+this code at its own merge commit, and the answer here is not an argument, it is
+the measurement above.
+
+`examples/vllm-cli` is a thin client of `include/vllm.h`. It loaded the real
+EXL3 checkpoint through the loader and `ModelRegistry::Forward`, and
+`VT_OP_PROVIDER_STATS=1` reported every op `selected=vt-native` on `device=5`
+with **zero** reference-tier notices. No test constructs `Exl3GemmKernelRocm` by
+hand; the suite calls `vt::Exl3Gemm`, which resolves through the op table, and
+the model reaches the same entry.
+
+**The mutation a fresh reviewer would run has already been run, and it is the
+BEFORE arm.** Deleting the two production call sites -- the `RegisterOp` lines
+in `rocm_ops.hip` -- and rebuilding in the same lease did not leave the gate
+green: the reference-tier count went 0 -> 2 and throughput went 8.27 -> 0.83
+tok/s. A capability that is not reached cannot move those numbers.
+
 ## Outcome
 
 - **The donor decision was the whole design, and it held.** Transcribing the

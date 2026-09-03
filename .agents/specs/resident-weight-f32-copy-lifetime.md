@@ -168,17 +168,32 @@ Each rebuilt, each restored and the restoration verified by `sha256sum`.
 
 ## Owed
 
-- **`ResidentWeight`'s staging arm calls `AdoptDeviceBytesAsHost` immediately
-  after an asynchronous `Copy` out of `w.bytes`, and that call can release the
-  source.** `AdoptDeviceBytesAsHost` runs `ReleaseDirectUploadSource(w)` and then
-  reassigns `w.bytes`, and the header's own comment on that assignment records
-  that for the last adopted weight of a shard the reassignment `munmap`s the
-  mapping **synchronously**. That is the same source-lifetime question #2711
-  asks, on a different helper, and it is **out of scope here**: the mapping case
-  needs its own grounding (a `MADV_DONTNEED` on a re-faultable `PROT_READ`
-  mapping is not a free), and folding a second, unproven fix into this one would
-  be exactly the silent bundling `.agents/bugfixing.md` refuses. Recorded here so
-  the finding has an owner rather than being re-found.
+Nothing. The one adjacent question this change raised was grounded and closed
+rather than left as a suspicion, and it is recorded here so the next reader does
+not re-find it:
+
+**`ResidentWeight` calls `AdoptDeviceBytesAsHost` immediately after its own
+asynchronous `Copy` out of `w.bytes`, and that function can release the copy
+source.** It is the same shape of question #2711 asks, on a different helper,
+and it is **not** a live defect. Both halves were checked:
+
+- The half that can `munmap` synchronously (the `self.bytes = OwnedBytes::Borrow(...)`
+  reassignment, whose own comment records that it can drop a shard's last
+  mapping reference inside the assignment) is gated on
+  `backend.DeviceMemoryIsHostAddressable()`. Exactly one backend in this tree
+  answers that true — Vulkan, `src/vt/vulkan/vulkan_backend.cpp:135` — and
+  Vulkan's `Copy` is a synchronous `std::memcpy` (`:101-106`). Where `Copy` is
+  asynchronous the branch returns before reaching the reassignment.
+- The half that always runs, `ReleaseDirectUploadSource`, is
+  `ReleaseSourcePages`, which is a `madvise(MADV_DONTNEED)` over whole interior
+  pages of a clean `PROT_READ MAP_PRIVATE` file mapping
+  (`safetensors_reader.cpp:314-337`). Those pages re-fault from the file to
+  identical bytes, so a driver reading them later reads the same weight.
+
+This becomes real the day a backend that answers `DeviceMemoryIsHostAddressable()`
+true gains an asynchronous `Copy`. It has no issue because there is no defect to
+track, and filing one would put an unowned false positive into an intake that
+already carries six issues the tree had answered.
 
 ## Stop conditions
 

@@ -15,9 +15,11 @@ whose method this wave continues unchanged.
 
 ## Now
 
-**Done.** 40 of 40 re-derived: **11 ALREADY_SATISFIED, 10 REAL_GAP,
-19 NOT_APPLICABLE** (14 `surface-absent`, 5 `inert`). **30 of the 40 disagree with
-the recorded PORT-NOW disposition.** Eight issues carry the ten gaps
+**Done.** 40 of 40 re-derived: **11 ALREADY_SATISFIED, 11 REAL_GAP,
+18 NOT_APPLICABLE** (14 `surface-absent`, 4 `inert`). **29 of the 40 disagree with
+the recorded PORT-NOW disposition.** A fresh review of #2702 corrected one label
+(`[132]`, published as a false `NOT_APPLICABLE`; see the report's §6.10) and three
+citations. Nine issues carry the eleven gaps
 ([#2683](https://github.com/mudler/vllm.cpp/issues/2683),
 [#2684](https://github.com/mudler/vllm.cpp/issues/2684),
 [#2685](https://github.com/mudler/vllm.cpp/issues/2685) which covers two entries,
@@ -25,7 +27,8 @@ the recorded PORT-NOW disposition.** Eight issues carry the ten gaps
 [#2689](https://github.com/mudler/vllm.cpp/issues/2689),
 [#2693](https://github.com/mudler/vllm.cpp/issues/2693),
 [#2694](https://github.com/mudler/vllm.cpp/issues/2694),
-[#2696](https://github.com/mudler/vllm.cpp/issues/2696), and the pre-existing
+[#2696](https://github.com/mudler/vllm.cpp/issues/2696),
+[#2706](https://github.com/mudler/vllm.cpp/issues/2706), and the pre-existing
 [#2650](https://github.com/mudler/vllm.cpp/issues/2650) which already owns
 `608c12473f`); the five deferred entries and one un-owned pre-pin gap are carried
 on [#2700](https://github.com/mudler/vllm.cpp/issues/2700), and a pre-pin
@@ -213,6 +216,36 @@ not be determined.
   undetermined with the reason; nothing in this wave is executed.
 
 ## Owed
+
+**[#2700](https://github.com/mudler/vllm.cpp/issues/2700) carries `Row: -`**, so
+AGENTS.md requires a spec to list what it owns under `## Owed`. That is this
+list, and it is the obligation the `Row: -` line exists to carry —
+`check-agent-record.py` passes on the line either way, so the listing is the only
+thing that actually discharges it.
+
+**The deferred entries #2700 collects** — four whole entries plus one half, each deferred until its gate
+is ported, never before:
+
+- `[126]` `3e174bb73c` — gate: `index_share_for_mtp_iteration` plus a draft head
+  exposing `set_skip_topk` / `compact_topk_indices`
+  (`include/vllm/model_executor/models/glm_moe_dsa.h:132`, zero consumers).
+- `[132]`'s `mla_attention.py` half — gate: fp8 MLA prefill and DCP
+  (`include/vt/ops.h:5217-5219`,
+  `include/vllm/model_executor/layers/attention/mla_chunked_context.h:311-313`).
+  Its `cache_kernels.cu` half is **not** deferred; it is
+  [#2706](https://github.com/mudler/vllm.cpp/issues/2706).
+- `[134]` `ce07118669` — gate: `MambaSpec::mamba_cache_mode == "align"`
+  (`include/vllm/v1/kv_cache_interface.h:469`; all five production constructions
+  leave it `"none"`).
+- `[142]` `e3fe212eaf` — gate: a consumer for `KVCacheManager::take_new_block_ids`
+  (`include/vllm/v1/core/kv_cache_manager.h:232`).
+- `[147]` `f067737b2a` — gate: the `OffloadingConnector` worker half
+  (`src/vllm/v1/kv_offload/kv_connector.cpp:401-412` to
+  `src/vllm/entrypoints/model_loader.cpp:1176`, which throws on every device).
+
+**Also owed by #2700, and needing a row before it can be ported:** KV block
+zeroing, a pre-pin gap that queue entries `[142]`, `[155]` and PORTQ-3's `[90]`
+all point at. No row owns it today.
 
 - Porting the real gaps this wave finds, each on its own issue.
 - Entries **161-290** of the queue, owed by

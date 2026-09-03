@@ -55,6 +55,9 @@
 #include <string>
 #include <vector>
 
+#include "vt/dtype.h"
+
+
 namespace vllm {
 
 // ---------------------------------------------------------------------------
@@ -65,8 +68,35 @@ namespace vllm {
 struct Ltx2VaeWeights {
   std::map<std::string, std::vector<float>> tensors;
 
+  // ── THE BFLOAT16 ARM (A24 wave 2, row LTX25-A24-CONNECTOR-BF16, #2720) ──
+  //
+  // Upstream resolves ONE pipeline dtype and it is bfloat16
+  // (`distilled.py:109`), so a component this bag feeds is bf16 upstream unless
+  // something argues otherwise. EXACTLY ONE of the two maps is populated, and
+  // `dtype` says which: this is a STORAGE change and not a flag, because the
+  // widening it removes is the whole point. At the shipped connector widths the
+  // f32 arm materializes ~2.016 B parameters as about 8 GB out of about 4 GB of
+  // checkpoint bytes, per render.
+  //
+  // The audio and video VAEs populate `tensors` and nothing else, so they are
+  // byte-identical to before this field existed; the connector is the one
+  // consumer that can be asked for either.
+  std::map<std::string, std::vector<uint16_t>> bf16;
+  vt::DType dtype = vt::DType::kF32;
+
   const std::vector<float>& Get(const std::string& name) const;
+  // The bf16 arm's raw 16-bit words. Refuses by name on a bag that carries the
+  // f32 arm, rather than returning an empty vector a caller would read as a
+  // zero-length tensor.
+  const std::vector<uint16_t>& GetBf16(const std::string& name) const;
   bool Has(const std::string& name) const { return tensors.count(name) != 0; }
+  bool HasBf16(const std::string& name) const { return bf16.count(name) != 0; }
+  // Elements of one tensor, whichever arm holds it.
+  size_t Count(const std::string& name) const;
+  // Resident bytes of the whole bag. This is what the dtype gate MEASURES: the
+  // bf16 arm must be exactly half the f32 arm's on the same tensor set, taken on
+  // the same input so no number is quoted.
+  size_t Bytes() const;
 };
 
 // causality_axis.py:4-10. The axis whose padding is one-sided; `kHeight` is the

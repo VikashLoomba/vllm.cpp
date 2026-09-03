@@ -753,8 +753,16 @@ bool Ltx2CheckpointHasConnector(const SafetensorsFile& file, Ltx2ConnectorStream
 Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
                                              Ltx2ConnectorStream stream);
 
-// Materialize one connector family out of the DiT checkpoint, widened to f32 —
-// which is `Ltx2ConnectorForward`'s declared parity dtype.
+// Materialize one connector family out of the DiT checkpoint at `compute_dtype`.
+//
+// `kBF16` is what the render path asks for and it is upstream's own answer
+// (`distilled.py:109` resolves ONE pipeline dtype and hands it to `PromptEncoder`
+// at `:113`, which constructs this module). It keeps the checkpoint's own 16-bit
+// words instead of expanding them, which HALVES the figure below. `kF32` is the
+// parity arm the five upstream goldens cover and is kept as the reference the
+// bf16 arm is measured against. A checkpoint that stores F32 under a bf16 request
+// is narrowed once here, which is what `.to(dtype)` does to a module built from an
+// f32 state dict. Row LTX25-A24-CONNECTOR-BF16, issue #2720.
 //
 // IT IS NOT CHEAP AND THE CALLER MUST TREAT IT AS EXPENSIVE. 129 tensors is 8
 // blocks of four dim x dim projections plus a 4x-wide feed-forward, so at the
@@ -773,7 +781,8 @@ Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
 // file carrying 8 is refused by name here rather than binding the first two and
 // rendering.
 Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
-                                        const Ltx2ConnectorConfig& config);
+                                        const Ltx2ConnectorConfig& config,
+                                        vt::DType compute_dtype = vt::DType::kF32);
 
 // `__metadata__["model_version"]` ("2.5.0"), which is what
 // `detect_model_version` reads to pick a recipe (ltx-pipelines

@@ -314,7 +314,7 @@ Stated here before code, per risk 1:
 
 ## W5: the shape table's other three kernels ([#2749](https://github.com/mudler/vllm.cpp/issues/2749))
 
-`Exl3SelectGemmShape` (`src/vt/exl3_policy.cpp:66-110`) chooses one of four
+`Exl3SelectGemmShape` (`src/vt/exl3_policy.cpp:65-114`) chooses one of four
 kernel shapes, and `GemmKernelForArm` (`src/vt/cuda/cuda_exl3.cu:2022-2039`)
 instantiates all four for each of the seven `(bits, codebook)` arms. **One of
 the four has ever executed.** The committed device cases run `k 512 n 256` and

@@ -10,9 +10,15 @@ names this work as its first item.
 
 ## Now
 
-The pin does **not** advance in this wave and nothing here is a reason to move
-it. The active parity pin remains
-`5559679229bc961848b121ccdeaa8fa5d79bec98`.
+**Measured. `e126687a9a` builds from source and runs a model on `thor:gpu0`** —
+level 2 of §2.1, on vLLM's default backend, eager and compiled.
+`SRCBUILD_RC=0`, `EXT_PRESENT=True`, `RUN_RC=0`, `COMPILED_RC=0`. The
+`qwen4_exp` stretch leg did not run (`Q4EXP_RC=1`,
+[#2626](https://github.com/mudler/vllm.cpp/issues/2626)).
+Report: [`../sync/2026-09-03-e126687-runhalf.md`](../sync/2026-09-03-e126687-runhalf.md).
+
+The pin did **not** advance and nothing measured here is a reason to move it.
+The active parity pin remains `5559679229bc961848b121ccdeaa8fa5d79bec98`.
 
 ## 1. Scope
 
@@ -208,3 +214,47 @@ discharged here:
   ([#2607](https://github.com/mudler/vllm.cpp/issues/2607)), so this wave's job
   script is reproduced verbatim in its report rather than committed beside the
   two already tracked there.
+
+## Outcome
+
+**What was measured.** Six `rc` jobs on `thor:gpu0`, one at a time. The source
+build takes 94 minutes at `MAX_JOBS=4` for a single architecture and produces a
+198 MB wheel with seven compiled extensions. The run reproduced on two separate
+leases and matched `tests/parity/goldens/opt_greedy` on all 96 token ids, which
+the report records as informative rather than as a gate.
+
+**What was rejected, and why.**
+
+- **Setting `VLLM_FA_CMAKE_GPU_ARCHES=110-real`** to get native FlashAttention
+  SASS. Rejected before the build: a failed FA compile would have cost the whole
+  90-minute build for a question the wave does not owe, and the backend ladder
+  covered the risk at run time for the price of one extra minute. It turned out
+  to be unnecessary — the stock `FA2_ARCHS "8.0+PTX"` build ran on Thor — so the
+  cheap path also answered more than it promised.
+- **A CPU-target build** (`VLLM_TARGET_DEVICE=cpu`), which compiles ~71 files
+  instead of the CUDA set and would have reached a token in perhaps 20 minutes.
+  Rejected because the oracle's whole purpose is GPU parity, and a CPU run would
+  have answered a question nobody asked while leaving `gateable` exactly where it
+  was.
+- **Two hypotheses that measurement refuted**, both recorded rather than
+  quietly dropped: that job A's clone failure was a 401 over HTTP/2 addressable
+  with `git -c http.version=HTTP/1.1` (§3 of the report: it is a credential
+  fall-through on a container with no egress, and staging is the fix), and that
+  `qwen4_exp`'s cluster failure is specifically the 16-CTA arm (§6: the A/B did
+  not move `num_rows`, so it is inconclusive).
+
+**Why each default has its value.**
+
+- `gpu_memory_utilization=0.10`. Thor is unified memory, so the fraction
+  reserves host RAM, and this fleet's recorded failure is a host consumed after
+  `torch.compile` at both 0.75 and 0.30. 0.10 of 126 GB is far more than a 125M
+  model needs and far below any fraction that has taken a box down.
+- Watchdog floor 20,000 MB. Chosen to sit **outside** the guarded
+  configuration's operating point, which is the rule a tripped guard on this
+  fleet already cost a measurement to learn. It never fired.
+- `MAX_JOBS=4`. AGENTS.md's limit. Load held at ~8 on 14 CPUs and
+  `MemAvailable` never fell below 104 GB, so the box was never near the edge.
+- The tree staged as a git **bundle** rather than a tarball: `setuptools_scm`
+  needs git, and the bundle carries the tags, so `GIT_DESCRIBE` and the version
+  string are derived on the worker rather than transcribed. Both reproduced
+  #2594's independently measured values.

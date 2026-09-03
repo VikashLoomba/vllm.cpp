@@ -73,6 +73,12 @@ class WhisperAudioProcessor {
   WhisperAudioProcessor(AudioProcessorConfig cfg, std::vector<float> mel_filters);
 
   const AudioProcessorConfig& config() const { return cfg_; }
+  // The [num_freq_bins, n_mels] bank this processor multiplies with. Exposed
+  // by dots3-note W7a (#2703) so a gate can compare the SHARED
+  // `MelFilterBankSlaney` construction against the committed
+  // `voxtral_mel_filters_f32.bin` oracle through the object the front end
+  // actually uses, rather than against a second construction beside it.
+  const std::vector<float>& mel_filters() const { return mel_filters_; }
 
   // Compute the log-mel `input_features` [n_mels, n_frames] from a mono waveform
   // at `sample_rate`. If sample_rate != cfg.sampling_rate the (deferred) resample

@@ -600,8 +600,19 @@ const std::vector<Dots3NoteDeferredTower>& Dots3NoteDeferredTowers() {
        "MoE blocks, so a bf16 checkpoint LOADS it; what is still owed is the "
        "blockwise-FP8 arm (nvidia/vision.py's MoESwiGLUFFNFP8, "
        "nvidia/vision_moe.py), which is W9"},
+      // W7a (#2703) landed this tower, so a bf16 checkpoint LOADS it and
+      // `Dots3NoteAudioRefusal` returns "" for the released
+      // `dots-studio/dots3-note-prev`. The ROW STAYS for the same reason the
+      // vision one did after W6b: this table is what keeps `audio_encoder.*`
+      // from reading as LANGUAGE, and the count is unchanged either way. What
+      // remains owed under this brick are the arms W7a refuses BY NAME — the
+      // conv1d and latent stems, `use_causal`, `merge_factor != 1`, a
+      // LayerNorm tower and a learned positional embedding — none of which any
+      // published checkpoint selects.
       {"audio_encoder.", "model-audio.safetensors", "W7",
-       "the `dots` Whisper-variant audio tower (nvidia/audio_encoder.py)"},
+       "the `dots` Whisper-variant audio tower (nvidia/audio_encoder.py). W7a "
+       "landed it for the released bf16 checkpoint; what is still owed under "
+       "this brick are the unshipped `audio_config` arms it refuses by name"},
   };
   return kTowers;
 }
@@ -774,6 +785,27 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
                                             w.params.weight_block_size);
   if (w.vision_refusal.empty()) {
     w.vision = MaterializeDots3NoteVision(shards, w.vision_params);
+  }
+
+  // W7a (#2703): the AUDIO tower, on exactly the polarity above. For the
+  // RELEASED `dots-studio/dots3-note-prev` the refusal is EMPTY — all 430
+  // `audio_encoder.*` tensors are BF16 and every `audio_config` key it sets is
+  // an arm W7a computes — so this branch RUNS on it and the whole tower is
+  // materialized.
+  //
+  // THE ACCOUNTING IS UNCHANGED EITHER WAY, and the `audio_encoder.` entry
+  // stays in `Dots3NoteDeferredTowers()` above for the same reason the vision
+  // one did after W6b: that table is what keeps `audio_encoder.*` from reading
+  // as LANGUAGE, it buckets by PREFIX rather than by whether the tower loaded,
+  // and every W2 count assertion (35381 / 2195 / 430) still holds byte for
+  // byte. What the entry's `brick` field now means for a bf16 checkpoint is
+  // "the arms W7a still refuses", exactly as the vision entry's means "the
+  // blockwise-FP8 arm".
+  w.audio_params = ParseDots3NoteAudioParams(config);
+  w.audio_refusal = Dots3NoteAudioRefusal(w.audio_params, w.params.quant_method,
+                                          w.params.weight_block_size);
+  if (w.audio_refusal.empty()) {
+    w.audio = MaterializeDots3NoteAudio(shards, w.audio_params);
   }
   return w;
 }

@@ -325,20 +325,44 @@ quantized per token/group-128.
 
 ### 2.5 Audio
 
-`nvidia/audio_encoder.py` (745) — `RotaryEmbedding:47`,
+**RE-MEASURED at `9035151d6` by W7a.** Every anchor below was read again in
+`~/_git/vllm` at that SHA and eight of them had drifted. The drift is uniform
+`+9` and it starts at `DotsSpeechEncoder`: everything above that class was
+right, everything from it down was nine lines low, and the file length was nine
+lines long. The corrected values are the ones written here; the previous ones
+are kept in this sentence so a reader who finds them in an older commit can see
+that they were repaired rather than invented.
+
+`nvidia/audio_encoder.py` (**736**, was 745) — `RotaryEmbedding:47`,
 `WhisperPositionalEmbedding:184`, `WhisperAttention:196`,
-`WhisperEncoderLayer:310`, `DotsSpeechEncoder:437` with three stems
-(`_forward_conv2d_stem:573`, `_forward_conv1d_stem:594`,
-`_forward_latent_stem:607`) and `_temporal_mask:538`. `nvidia/audio.py` (305) is
-the vLLM-side wrapper.
+`WhisperEncoderLayer:310`, `DotsSpeechEncoder:`**`428`** (was 437) with three
+stems (`_forward_conv2d_stem:`**`564`** was 573, `_forward_conv1d_stem:`**`585`**
+was 594, `_forward_latent_stem:`**`598`** was 607) and
+`_temporal_mask:`**`529`** (was 538). `nvidia/audio.py` (305) is the vLLM-side
+wrapper.
+
+**`DotsSpeechEncoder` builds NO positional embedding under `use_rope`, at
+`audio_encoder.py:498-510`.** #2703 and §"What the two towers actually ship"
+below both cite `:507-519` for that, which is the same `+9` drift applied to a
+range; `498-510` is the measured one and `:508` is the
+`self.embed_positions = None` line itself.
 
 ### 2.6 Multimodal front end and MTP
 
-`nvidia/multimodal.py:65` `Dots3NoteForCausalLM(nn.Module, SupportsMultiModal,
-SupportsPP)` — `get_placeholder_str:81`, `_process_image_input:173`,
-`_process_audio_input:186`, `_process_video_input:202`, `embed_multimodal:255`,
-`get_mm_mapping:325`. `common/processor.py` (811) and `common/video.py` (497)
-carry the prompt-side expansion and frame sampling.
+`nvidia/multimodal.py:`**`49`** `Dots3NoteForCausalLM(nn.Module,
+SupportsMultiModal, SupportsPP)` — `get_placeholder_str:`**`65`**,
+`_process_image_input:`**`144`**, `_process_audio_input:`**`156`**,
+`_process_video_input:`**`172`**, `embed_multimodal:`**`225`**,
+`get_mm_mapping:`**`300`**. `common/processor.py` (811) and `common/video.py`
+(497) carry the prompt-side expansion and frame sampling.
+
+**RE-MEASURED at `9035151d6` by W7a, same as §2.5, and this paragraph's drift
+was NOT uniform** — it ran 16, 16, 29, 30, 30, 30 and 25 lines, which is the
+signature of anchors read in a different revision rather than of one insertion
+above them. The previous values were `:65`, `get_placeholder_str:81`,
+`_process_image_input:173`, `_process_audio_input:186`,
+`_process_video_input:202`, `embed_multimodal:255`, `get_mm_mapping:325`. The
+file is 304 lines at this SHA.
 `nvidia/mtp.py:31,88,141` — `Dots3NoteMultiTokenPredictorLayer`,
 `Dots3NoteMultiTokenPredictor(DeepseekV32MultiTokenPredictor)`,
 `Dots3NoteMTP(DeepseekV32MTP)` with `has_own_embed_tokens = True`,
@@ -694,7 +718,8 @@ tensor at twice the 5120 `encoder_ffn_dim`. The stem is
 
 **There is NO learned positional embedding in the audio tower**, and that is
 checkpoint and upstream agreeing rather than an absence to explain: at
-`nvidia/audio_encoder.py:507-519` `DotsSpeechEncoder` sets
+`nvidia/audio_encoder.py:498-510` (W7a re-measured; this said `:507-519`, the
+same `+9` drift §2.5 records) `DotsSpeechEncoder` sets
 `self.embed_positions = None` when `use_rope` is true, and the released
 `audio_config` sets it true. W7 must not go looking for one.
 
@@ -4083,14 +4108,25 @@ having no oracle to catch it.
 |---|---|---|
 | any block with `pyramid_num_routed[i] > 0` | **W6b** | `Dots3NoteVisionRefusal` |
 | `quantization_config.weight_block_size` on the vision tower | **W9** | `Dots3NoteVisionRefusal` |
-| `video` modality | **W7** | `EncodeMmDots3Note`, and the chat seam's `allowed_limits` |
-| `audio` modality | **W8** | same |
+| `audio` modality | **W7** — see the correction below | `EncodeMmDots3Note`, and the chat seam's `allowed_limits`. **LIFTED by W7a (§4.14)** for a 16 kHz mono PCM16 WAV at or under `chunk_seconds`; what remains refused is named in §4.14.5 |
+| `video` modality | **W8** — see the correction below | `EncodeMmDots3Note`, and the chat seam's `allowed_limits` |
 | `adapter_type == "pixel_shuffle_mlp"` | W6b | `ParseDots3NoteVisionParams` |
 | `post_norm == false` | W6b | `ParseDots3NoteVisionParams` |
 | `use_bias == true` | W6b | `ParseDots3NoteVisionParams` |
 | `temporal_patch_size != 1` | W7 (video) | `ParseDots3NoteVisionParams` |
 | `adapter_out_dim != config.hidden_size` | none — unservable | `Dots3NoteVisionRefusal` |
 | `adapter_merge_size != spatial_merge_size` | none — unservable | `Dots3NoteVisionRefusal` |
+
+**W7 IS AUDIO AND W8 IS VIDEO, and this table had them the other way round.**
+The loader has said so since W2 — `Dots3NoteDeferredTowers()` registers
+`audio_encoder.` against brick `"W7"` and describes it as "the `dots`
+Whisper-variant audio tower (nvidia/audio_encoder.py)" — and #2703 is titled
+"dots3-note W7: the audio tower". Two PRODUCTION refusal messages disagreed with
+both: `dots3_note_registry.cpp`'s encoder refusal read "VIDEO ... is W7; AUDIO
+... is W8", and `mm_chat_dots3note.cpp`'s limit comment read "Video is W7's and
+audio is W8's". W7a repairs all four surfaces — this table, the two messages and
+that comment — to the loader's polarity. Nothing about what is implemented
+changed; a user reading the refusal was being sent to the wrong brick.
 
 **The last two rows name no brick, and that is the point of them.** They are not
 capabilities owed to a later brick; they are configs no dots3-note tower can be
@@ -5178,6 +5214,605 @@ owns.
 
 ---
 
+### 4.14 W7a puts the AUDIO tower on a SERVED request, and refuses the rest by name
+
+**Issue: [#2703](https://github.com/mudler/vllm.cpp/issues/2703). Brick: W7a,
+the first slice of W7.** After this slice an OpenAI `input_audio` chat part
+travels the whole production chain — `ApiServer::handle_chat_completions` ->
+the dots3-note chat seam -> the mel front end -> `AsyncLLM` -> the scheduler's
+encoder admission -> `EncodeMmDots3NoteForCausalLM` -> the 32-layer `dots`
+speech encoder -> `EmbedMmDots3NoteForCausalLM`'s masked scatter -> the
+language forward — and the answer depends on the waveform. Before it, the same
+request died at the entrypoint with HTTP 400 "At most 0 audio(s) may be provided
+in one prompt.", because `Dots3NoteChatSupportedMmLimits()` declared only
+`{"image", 1}`.
+
+**#2703 IS THE OWNING ISSUE AND IT IS NOT VERBATIM CORRECT.** A scoping pass
+between filing and implementation corrected it in four places, and this section
+is the record of that rather than a silent divergence:
+
+| #2703 says | Measured | Where |
+|---|---|---|
+| `audio_encoder.py:507-519` for the absent positional embedding | `:498-510` | §2.5, re-measured at `9035151d6` |
+| `nvidia/audio_encoder.py` is 736 lines and the anchors in §2.5 stand | eight §2.5 anchors were `+9` | §2.5 |
+| the adapter is "`audio_adapter.proj.{0, 1, 3}`, 1280 to 5120" | `proj.0` is a **LayerNorm with weight AND bias** over 1280, and only `proj.1`/`proj.3` are Linears | the committed shard index |
+| "It must be ported from whatever upstream actually calls" | it is **already ported**: `audio_processor.cpp:91-199` is Whisper's `log_mel_spectrogram` verbatim in double precision, and `test_voxtral_e2e.cpp:157-178` already drives it at n_fft 400 / hop 160 / n_mels 128 / 16 kHz | §4.14.2 |
+
+#### 4.14.1 What was already built, and what was actually missing
+
+The audio chain was mostly present before this slice. Measured, unchanged by it,
+and named here so a reviewer does not look for edits that are not in the diff:
+the runner's `execute_mm_encoder` is modality-blind; the scheduler's encoder
+admission is modality-blind; `EmbedMmDots3NoteForCausalLM` is modality-blind and
+its scatter balances because the audio adapter's `whisper_adapter_out_dim` is
+5120, which IS `config.hidden_size`; `MultiModalFeatureSpec::audio_data`
+(`inputs.h:81`) already carries an `AudioKwargs`; `DecodeInputAudioPart`
+(`chat_mm.cpp:122-129`) already base64-decodes the part; `DecodeWavPcm16Mono`
+(`audio_processor.cpp:35-79`) already decodes PCM16 mono WAV; and
+`ExpandAudioPlaceholders` (`audio_processor.cpp:206-225`) already performs the
+expansion.
+
+Five things were missing or dead, and they are what W7a adds:
+
+1. `mm_chat_dots3note.cpp`'s supported-limit map declared `{"image", 1}` only,
+   so an `input_audio` request was refused at `ValidateChatMmLimits`.
+2. There was no dots3 audio processor: no slaney bank at [201, 128], no
+   `pad_or_trim` to 960000, no `ceil(samples / 1280)` token count, no marker-id
+   resolution.
+3. There was no audio tower.
+4. The loader deferred all 430 `audio_encoder.*` tensors
+   (`dots3_note.cpp:603-604`).
+5. `EncodeMmDots3NoteForCausalLM` refused `modality != "image"`
+   (`dots3_note_registry.cpp:188-193`).
+
+**`RouteAudioWav` (`chat_mm.cpp:131-160`) is left ALONE**, deliberately. It is
+DEAD in `src/` — nothing outside `tests/` calls it — but its test is the
+`ROAD-V1-MM` parse gate, and it hard-codes Whisper's fixed
+`max_source_positions` token count, which is the WRONG rule for dots3. Editing
+it would move another row's gate to serve this one. W7a writes
+`RouteDots3NoteAudioWav` beside `RouteDots3NoteImageRgb` instead, in the
+architecture's own TU, which is the same shape W6a chose over editing
+`RouteImageRgb`.
+
+#### 4.14.2 The mel front end was already ported, and it is gated against a REAL oracle
+
+`log_mel_spectrogram` (`audio.py:117-126` @ `9035151d6`) is Whisper's, verbatim:
+periodic Hann over `n_fft` 400, `torch.stft(center=True)` reflect padding, the
+last frame dropped by `stft[..., :-1]`, a POWER spectrogram, `filters @
+magnitudes`, `clamp(1e-10).log10()`, a GLOBAL-max `-8` floor and `(x + 4) / 4`.
+`WhisperAudioProcessor::ProcessWaveform`
+(`src/vllm/multimodal/audio_processor.cpp:91-199`) is that function, in double
+precision, and the only deltas dots3 needs are CONFIG: `chunk_length_s` 30 ->
+60, `n_mels` 80 -> 128, `max_source_positions` 1500 -> 6000. So W7a REUSES it
+rather than writing a second one, which is what "never write a parallel path by
+hand" asks for. 960000 samples / hop 160 = 6001 STFT frames, minus the dropped
+last one = 6000 = `chunk_seconds * 100`, which is the assert upstream itself
+makes at `audio.py:215`.
+
+**NO FFT IS ADDED.** Both in-tree front ends compute a direct DFT of the 201
+needed bins per frame and record that as a deviation
+(`audio_processor.cpp:8-11`, `parakeet_audio_processor.h:23-27`); the difference
+from `torch.stft` is float summation order. W7a claims no performance axis, so
+importing an FFT would be work no gate on this row could read.
+
+**THE FILTERBANK IS PROMOTED TO A SHARED SEAM, AND IT GETS THE ONE REAL ORACLE
+THIS ROW HAS.** The tree carried SIX mel implementations and no shared audio
+front-end seam. `ParakeetMelFilterBank`
+(`parakeet_audio_processor.cpp:65-106`) is already a faithful double-precision
+`mel_filter_bank(norm="slaney", mel_scale="slaney", min 0, max sr/2)` and is
+parameterised rather than Parakeet-specific, so W7a extracts it as
+`vllm::multimodal::MelFilterBankSlaney` in a new
+`include/vllm/multimodal/mel_filter_bank.h` and has BOTH callers use it. The
+Whisper/dots3 orientation is `[num_frequency_bins, num_mel_filters]` — upstream
+`mel_filter_bank`'s own — and `MelFilterBankSlaneyTransposed` returns Parakeet's
+`[num_mel_filters, num_frequency_bins]`. Transposition reorders `float`s and
+does not round, so Parakeet's two existing gated tolerances are byte-identical
+by construction rather than by tolerance.
+
+The oracle: `tests/vllm/multimodal/fixtures/voxtral_audio/
+voxtral_mel_filters_f32.bin` is COMMITTED, is exactly 102912 bytes = 201 x 128
+`float32`, and was dumped by `scripts/mm/a3_voxtral_oracle_capture.py:141-147`
+from `mistral_common.audio.mel_filter_bank(num_frequency_bins=201,
+num_mel_bins=128, min_frequency=0.0, max_frequency=8000.0,
+sampling_rate=16000)`. That is the same call `audio.py:98-106` makes for dots3.
+**Measured before a line of this slice was written: the double-precision
+construction reproduces all 25728 values BIT-FOR-BIT — max ULP difference 0,
+max absolute difference 0.0.** That settles HTK-versus-Slaney, the `norm`
+argument and the integer-divided-Nyquist detail (`np.linspace(0, sampling_rate
+// 2, num_frequency_bins)`) outright, and it is the only place on this row where
+a number is checked against something a third party produced rather than against
+a reference this repository also wrote.
+
+#### 4.14.3 The tower is a NEW FILE, mirroring `nvidia/audio_encoder.py`
+
+`src/vllm/model_executor/models/dots3_note_audio.{h,cpp}`, beside
+`dots3_note_vision.{h,cpp}` and for the same reason: upstream itself forks
+`modeling_whisper.py` into a separate file rather than parameterising Whisper.
+`WhisperAudioEncoderForward`
+(`include/vllm/model_executor/models/whisper_audio.h`) is READ and NOT extended
+— it carries the identical pre-norm block skeleton and the exact
+q/v/out-bias-and-NOT-k convention, and W7a routes through the same `vt` ops it
+does — but the deltas are structural, not parametric: RMSNorm instead of
+LayerNorm, a packed-SwiGLU MLP instead of GELU, partial RoPE instead of a fixed
+additive sinusoid, and a 3-layer Conv2d stem instead of two Conv1ds.
+
+**The 430 tensors, verified against the committed shard index rather than taken
+from prose.** All BF16; no FP8 anywhere, so W9 has nothing to say about this
+tower.
+
+| Count | Shape | Name |
+|---|---|---|
+| 1 | `[480, 1, 3, 3]` + `[480]` | `conv2d1.weight` / `.bias` |
+| 2 | `[480, 480, 3, 3]` + `[480]` | `conv2d2`, `conv2d3` |
+| 1 | `[1280, 7680]` | `conv_out.weight`, **no bias** |
+| 32 | `[1280]` | `layers.{L}.self_attn_layer_norm.weight` (RMSNorm, no bias) |
+| 32 | `[1280, 1280]` + `[1280]` | `layers.{L}.self_attn.q_proj` |
+| 32 | `[1280, 1280]` | `layers.{L}.self_attn.k_proj`, **no bias** |
+| 32 | `[1280, 1280]` + `[1280]` | `layers.{L}.self_attn.v_proj` |
+| 32 | `[1280, 1280]` + `[1280]` | `layers.{L}.self_attn.out_proj` |
+| 32 | `[1280]` | `layers.{L}.final_layer_norm.weight` |
+| 32 | `[10240, 1280]` + `[10240]` | `layers.{L}.fc1` — the PACKED SwiGLU pair |
+| 32 | `[1280, 5120]` + `[1280]` | `layers.{L}.fc2` |
+| 1 | `[1280]` | `layer_norm.weight` |
+| 1 | `[1280]` w + b | `audio_adapter.proj.0` — a **LayerNorm** |
+| 1 | `[5120, 1280]` + `[5120]` | `audio_adapter.proj.1` |
+| 1 | `[5120, 5120]` + `[5120]` | `audio_adapter.proj.3` |
+
+**No learned positional embedding**, as §2.5 records. Position enters as PARTIAL
+RoPE: `rotary_dim = int(head_dim * partial_rotary_factor)` rounded down to even
+= 32 out of head_dim 64, theta 10000, NeoX half-split
+(`audio_encoder.py:55-79`, `140-166`). `vt::RopeFromCache` supports exactly this
+through `RopeArgs::rotary_dim`, with the `[P, rotary_dim]` cos|sin cache it
+already consumes for the vision tower.
+
+**THE CONV2D STEM IS COMPOSED AS im2col + `vt::MatmulBT`, AND THAT IS ONE EXACT
+TRACKED EXCEPTION TO THE `kConv2d` SEAM.** `vt::Conv2d` exists, and it has
+exactly ONE provider: `src/vt/cpu/cpu_conv2d.cpp:111` is the sole
+`RegisterOp(OpId::kConv2d, ...)` in the tree. Routing the stem through it would
+build a capability that faults the moment anyone runs this model on a CUDA
+queue — which is every host that could serve it. `whisper_audio.h:33` already
+composes its Conv1d stem this way and says "no new CUDA kernel", so this is
+in-tree precedent rather than an invention. The missing CUDA provider is a real
+`vt` gap that outlives this row and it has its own issue, cited in the code
+beside the exception.
+
+**THE TEMPORAL MASK IS NOT OPTIONAL.** `_conv2d_stem_one_chunk`
+(`audio_encoder.py:535-562`) zeroes the padded tail at FOUR stages — before
+`conv2d1`, and after each of the three GELUs — with
+`valid_mel_lens = audio_sample_lens // 160` halved by `(n + 1) // 2` at each
+stride-2 layer (`:570-574`). It is load-bearing and a shape check cannot see it:
+the mel of a ZERO-padded tail is not zero, it is the `-8` floor pushed through
+`(x + 4) / 4`, a nonzero constant, and without the mask that constant leaks
+through the 3x3 receptive fields into the LAST VALID tokens. The chain also
+lands exactly: 16000 samples -> 100 valid mel frames -> 50 -> 25 -> 13, and
+`ceil(16000 / 1280)` is 13.
+
+#### 4.14.4 `MlpGateUpMethodBase` gets a BIAS arm, and that is the seam rule applied
+
+The released audio MLP is `fc1 [10240, 1280]` **with a `[10240]` bias**, then
+`swiglu` (`audio_encoder.py:42-44`: `x1, x2 = x.chunk(2, -1); silu(x1) * x2`,
+which is gate-then-up and therefore `vt::SiluAndMul`'s own order), then
+`fc2 [1280, 5120]` with a `[1280]` bias. `layers::MlpGateUpMethodBase`'s three
+existing members all return `silu(gate) * up` from WEIGHTS ALONE, so the seam as
+it stood could not express this MLP at all. AGENTS.md says to extend a shared
+seam exactly when it cannot represent the upstream behaviour, so W7a adds
+`layers::UnquantizedMlpGateUpBiasMethod`: the merged `[2I, H]` operand plus a
+`[2I]` bias, one `vt::MatmulBT`, one row-broadcast `vt::Add`
+(`ops.h:3486-3495`), one `vt::SiluAndMul`.
+
+**Every existing caller is byte-identical BY CONSTRUCTION, not by tolerance.**
+The three existing methods are not touched; the bias arm is a fourth derived
+class on the same base, which is precisely how
+`UnquantizedMlpGateUpSplitMethod` and `UnquantizedMlpGateUpGeluMethod` were
+added. The vision suites are re-run at their current counts to prove the
+no-bias path did not move.
+
+**THIS DOES NOT CLOSE [#2616](https://github.com/mudler/vllm.cpp/issues/2616),
+and saying so is the honest record.** #2616 is titled "dots3-note VISION tower:
+`use_bias=true` still refuses" and its own closing condition is three things:
+the seam arm, loading the vision `qkv`/`proj`/`fc` biases, and deleting the
+vision refusal, gated by a `use_bias` fixture served end to end. W7a lands the
+FIRST of the three, and it lands it REACHED — the audio checkpoint is what
+reaches it, which is exactly the "it would land unreached" objection #2616
+raises against doing the seam work on its own. The other two are still owed to
+the vision arm and no published checkpoint sets `use_bias`. Writing `Closes
+#2616` on this pull request would leave a record saying the vision tower accepts
+a config it still refuses by name.
+
+#### 4.14.5 What W7a refuses, BY NAME, and to which brick
+
+| Refused | Named brick | Where |
+|---|---|---|
+| audio longer than `chunk_seconds` (60 s = 960000 samples) | **W7b** | `Dots3NoteAudioProcessor`, reached from the chat seam's route |
+| any container but PCM16 mono RIFF/WAVE | **W7c** | the route, before decode |
+| any sampling rate but `audio_config.sampling_rate` (16000) | **W7c** | the route, before the front end |
+| `use_causal == true` | unshipped arm | `ParseDots3NoteAudioParams`, at INSTALL |
+| `use_conv1d_stem` (`use_conv2d_stem == false`) | unshipped arm | same |
+| `use_latent_input == true` | unshipped arm | same |
+| `merge_factor != 1` | unshipped arm | same |
+| `encoder_type != "dots"` | upstream refuses it too (`audio.py:255-256`) | same |
+| `use_rms_norm == false` | unshipped arm | same |
+| `use_rope == false` | unshipped arm (it would need `embed_positions`) | same |
+| a marker id that the tokenizer does not carry | none — unservable | the chat seam, at INSTALL |
+| `whisper_adapter_out_dim != config.hidden_size` | none — unservable | same |
+| more than ONE audio part | this seam's own ceiling | `ValidateChatMmLimits` |
+
+**THE CONFIG REFUSALS ARE AT INSTALL, NOT IN THE ENCODER, and that is a
+measurement rather than a taste.** `mm_chat_dots3note.cpp:232-240` records what
+happened when this row threw from inside `encode_mm`: it runs in the engine's
+busy loop, stopping `AsyncLLM` and turning every LATER request — TEXT ONES
+INCLUDED — into a 500. `Dots3NoteAudioRefusalFor(config)` is the install-time
+twin of `Dots3NoteVisionRefusalFor`, and the encoder keeps its own check as
+defence in depth on the same polarity. **The refusal predicate and the route
+predicate are THE SAME PREDICATE**, called from both places, because a refusal
+that is narrower than the route it guards is a silently wrong answer rather than
+an error.
+
+**Three upstream knobs are DEAD, not deferred, and the difference is worth
+writing down.** `conv_chunksize`, `conv_bucket_max_elements` and
+`conv_bucket_step` are read out of the config by `Dots3NoteAudioConfig`
+(`audio.py:47`, `:51-52`) and copied onto the `WhisperConfig`
+(`audio.py:160-165`), and then nothing in `audio_encoder.py` reads any of the
+three: `_forward_conv2d_stem` calls `_conv2d_stem_one_chunk` once, on the whole
+tensor. They are set-and-never-read at `9035151d6`. Recording them as DEAD says
+a later brick owes nothing; recording them as deferred would invent a debt.
+
+**`chunk_seconds` is the one refusal whose absence would be SILENTLY WRONG
+rather than merely incomplete.** Upstream's tower chunks a long waveform into
+60-second segments and sums `ceil(chunk_len / 1280)` PER SEGMENT
+(`audio.py:141-146`), while the prompt side computes one `ceil(total / 1280)`
+(`processor.py:771`). For a waveform at or under one chunk the two agree
+exactly, and W7a's `ceil(samples / 1280)` is therefore upstream's own number.
+Past one chunk they diverge, the placeholder span stops matching the tower's row
+count, and a masked scatter that does not balance splices audio features onto
+text rows. W7b owns the segmentation; until it lands, the refusal is what keeps
+the two sides equal.
+
+#### 4.14.6 The three marker ids come from the TOKENIZER, and the checkpoint was checked
+
+`processor.py:757-760` resolves `audio_start_id` / `audio_pad_id` /
+`audio_end_id` out of the TOKENIZER'S VOCAB by string, and
+`multimodal.py:82-89` reads `added_tokens.json` off the checkpoint directly. The
+strings are `audio_config`'s `audio_comp_start` / `audio_comp_span` /
+`audio_comp_end`, defaulting to `<|audio_comp_start|>` / `<|audio_comp_pad|>` /
+`<|audio_comp_end|>` (`audio.py:37-39`). W7a mirrors that: it resolves the three
+by string against the installed tokenizer's added tokens and REFUSES BY NAME
+when one does not resolve, rather than defaulting to an id.
+
+**The released checkpoint was checked, and it carries them.**
+`dots-studio/dots3-note-prev` at revision
+`1e1e7b0cd37a3a48a6c8d7fa55d5f9d14377006b`, file `added_tokens.json`
+(sha256 `1aa71a4e0dbab80a72fd925389fd6c9cc52d1cb9da5dee8282784c15c6fa789b`, 2795
+bytes, 85 entries), has `<|audio_comp_start|>` = **151718**,
+`<|audio_comp_end|>` = **151719**, `<|audio_comp_pad|>` = **151720**. Note the
+ORDER: start, end, pad. A port that assumed the three were consecutive in
+start/pad/end order would have produced a syntactically valid prompt with the
+pad and end ids swapped, and no shape check anywhere could see it. Resolving by
+string is what makes that impossible rather than merely unlikely.
+
+The marker the chat seam injects is `get_placeholder_str`'s audio branch
+(`multimodal.py:68-69`): `<|audio_comp_start|><|audio_comp_pad|><|audio_comp_end|>`,
+with the SINGLE pad in the middle expanded to N by `ExpandAudioPlaceholders`.
+
+#### 4.14.7 The gate is a CONSISTENCY gate, and it has TWO independent references
+
+§6.4 option B applies unchanged: this row has no oracle and will not get one, so
+correctness is argued by in-test double-precision references written from the
+upstream Python and sharing NO helper with the implementation. The row's
+convention is to PROVE that independence by enumerating every qualified name in
+the reference namespace (W6a 70, W6b 105, W6c 45 — all `std::`).
+
+**W7a splits the reference in two rather than writing one.** A single reference
+covering the DFT, the mel bank and a 32-layer tower with a four-stage temporal
+mask is too large for a reviewer to hold, and the two halves fail in unrelated
+ways: the front end's hazards are windowing, framing and normalisation, the
+tower's are ordering, masking and bias placement. So there is a FRONT-END
+reference and a TOWER reference, each with its own enumerated name list, and
+both counts are reported.
+
+The one place a real oracle exists — the filterbank against
+`voxtral_mel_filters_f32.bin` — is asserted to float32 rounding, and §4.14.2
+records that it came back bit-exact.
+
+#### 4.14.8 Reachability
+
+Production entry point: `ApiServer::handle_chat_completions` on the server's
+DEFAULT configuration. The smallest failing test enters through it with an
+`input_audio` part and goes RED at head with HTTP 400 "At most 0 audio(s) may be
+provided in one prompt."
+
+**The load-bearing case is the two-different-waveforms LOGPROB one**, for the
+reason `test_api_server_dots3_mm_forward.cpp:33-38` already records for images:
+status 200, `prompt_tokens` and `completion_tokens` ALL PASS on a tree where the
+tower is replaced by a correctly SHAPED constant. The logprobs of the first
+generated token do not.
+
+The mutations, each RED first, each restored byte-for-byte, each reported with
+the rebuilt binary's sha256 AND the doctest case counts — a changed sha alone
+proves a rebuild, not that the mutation reached the code:
+
+| # | Mutation | What it proves |
+|---|---|---|
+| A | delete the tower call in `encode_mm` | the encoder hook reaches the tower |
+| B | tower -> correctly-shaped constant | the gate reads VALUES, not shapes |
+| C | delete the temporal mask | §4.14.3's leak is measured, not argued |
+| D | give `k_proj` a bias | the q/v/out-and-NOT-k asymmetry is asserted |
+| E | delete the production loader materialisation call site | the weights come from the loader, not from the test |
+
+#### 4.14.9 Risks
+
+- **The temporal mask's four stages are easy to get to three.** Mutation C
+  deletes them; the gate reports the resulting error so the reader can see how
+  large the leak is rather than only that it exists.
+- **`fc1` is a PACKED pair and the halves are not interchangeable.** Gate-then-up
+  is `vt::SiluAndMul`'s order and `x.chunk(2, -1)`'s order, and swapping them
+  produces a correctly-shaped wrong answer. The tower reference computes the
+  swap explicitly and asserts the two differ.
+- **Partial RoPE rotates HALF of each head.** A port that rotated all 64 dims
+  would still produce [T, 1280]. The reference rotates 32 and asserts the
+  untouched tail is bit-equal to the input's tail.
+- **The mel front end is shared with Whisper/Voxtral.** Any change to
+  `WhisperAudioProcessor` now moves two models. The Voxtral suite is re-run and
+  its counts reported.
+
+#### 4.14.10 Stop conditions
+
+Stop and report `NEEDS_DECISION` if the bias arm cannot be added without
+changing an existing caller's behaviour, or if the released tokenizer turns out
+not to carry the three markers. Stop and report `NEEDS_CONTEXT` rather than
+guessing a value the config does not carry.
+
+#### 4.14.11 Evidence, measured on the merge commit
+
+Measured on the W7a branch after `origin/main` was merged in at `8853af6bf`,
+because a merge can falsify a claim made before it. Host: 20-core x86-64, CPU
+arm only (`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON
+-DCMAKE_BUILD_TYPE=Release`). Every number below was produced by the session
+that reports it; none is inherited.
+
+**The suites, by real target name.**
+
+| Target | Cases | Assertions |
+|---|---|---|
+| `test_dots3_note_audio` | 13 / 13 passed | 1980 / 1980 |
+| `test_openai_api_server_dots3_mm_forward` | 23 / 23 passed | 287 / 287 |
+| `test_dots3_note_vision` | 13 / 13 passed | 21343 / 21343 |
+| `test_dots3_note_scaffold` | 26 / 26 passed | 110835 / 110835 |
+| `test_dots3_note_attn` | 51 / 51 passed | 6888 / 6888 |
+| `test_parakeet_audio_processor` | 6 / 6 passed | 41054 / 41054 |
+| `test_parakeet_encoder` | 7 / 7 passed | 543 / 543 |
+| `test_parakeet_ctc_engine` | 2 / 2 passed | 12485 / 12485 |
+| `test_parakeet_transcription_fold` | 4 / 4 passed | 38 / 38 |
+| `test_parakeet_transducer` | 3 / 3 passed | 777 / 777 |
+
+`test_whisper_audio`, `test_gemma4_vision_tower` and `test_gemma4_audio_tower`
+each report **1 case and 0 assertions**, and `test_voxtral_e2e` exits **77**.
+Those are the tree's own environment-gated skips — they want
+`VLLM_WHISPER_ENC_WEIGHTS` and `VLLM_VOXTRAL_SAFETENSORS`, and the voxtral one
+prints "GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass". They are recorded
+as NOT RUN, not as green. §4.14.9's risk paragraph asked for the Voxtral suite's
+counts as the shared-front-end proof and this host cannot produce them: the
+shared bank's executable evidence is the bit-exact oracle case below, plus
+Parakeet's 41054.
+
+**The one real oracle.** `MelFilterBankSlaney(201, 128, 0.0, 8000.0, 16000)`
+against the committed `voxtral_mel_filters_f32.bin`: **0 of 25728 values differ,
+worst |delta| 0** — bit for bit. Measured beside it, and the reason "25728 agree"
+is not 25728 independent facts: the bank is **sparse, 394 of 25728 nonzero**.
+
+**D2 did not move Parakeet.** No Parakeet TEST file is in this change
+(`git diff origin/main...HEAD --stat` names only
+`src/vllm/multimodal/parakeet_audio_processor.cpp` on that side), so the 41054
+assertions are the same population as on `main` and they pass. The extraction
+moved every arithmetic line unchanged and rounds once, on the same
+`static_cast<float>`; `MelFilterBankSlaneyTransposed` only reorders floats
+already rounded.
+
+**D5 left every existing caller byte-identical, structurally.**
+`git diff origin/main...HEAD -- include/vllm/model_executor/layers/linear.h`
+is **68 insertions and 0 deletions**: `UnquantizedMlpGateUpBiasMethod` is a
+FOURTH derived class and not one existing line of the seam changed, so "no bias"
+is not a new branch. `linear.h` is the only file the seam change touches.
+
+**Both reference-independence counts, MEASURED.** The enumeration is computed
+from the test file's own bytes with comments and string literals stripped:
+
+| Reference | Distinct | Occurrences | Scopes |
+|---|---|---|---|
+| `ref_front` | 11 | 71 | `std` only |
+| `ref_tower` | 6 | 53 | `std` only |
+
+Neither reference reaches `vllm::`, `vt::` or the file under test. The counts
+the file first carried — 22 and 19 — were **wrong**, and the case that asserted
+them could not tell: it compared two hand-written constants with two literals.
+Eleven of `ref_front`'s listed names are unused in that namespace and two
+(`std::llround`, `std::int16_t`) appear nowhere in the file except in the list
+naming them. Repaired in the same change; the property the counts supported was
+true throughout.
+
+**The agreement measurements.** Front end vs `ref_front`: worst |delta|
+**7.22919e-08**. Tower vs `ref_tower`: rel-L2 **0.00770442**, output spanning
+**[-1.80469, 2.15625]** rather than a constant. The mask stages measured
+**50 -> 25 -> 13 -> 7** against a padded mel of 100 frames and a stem output of
+13, and the padded tail sits at **-0.660975, not at 0** — which is why §4.14.3's
+leak is real. At 1281 samples the span is **2** and the mask **1**, so the two
+numbers are not derivable from one another.
+
+**The five mutations.** Each applied to a clean tree (the source blob's hash is
+compared before and after, because a mutation that never applied reads as a
+passing test), rebuilt, run, then restored and re-verified by blob hash. A
+build failure was treated as a build failure and never as a red: mutation A's
+first form died on `-Werror=unused-variable` and was corrected before it could
+be counted. Binary sha256 is reported **with** case counts, because a changed
+sha proves a rebuild and not that the mutation reached the code.
+
+Baseline (both suites GREEN):
+`test_dots3_note_audio` sha256 `6f0eebce3aeca1de…`, 13/13, 1976/1976;
+`test_openai_api_server_dots3_mm_forward` sha256 `d3de4496830eac5c…`, 23/23,
+287/287.
+
+| # | Mutation | Audio suite | Served suite | Binary sha256 (audio / served) |
+|---|---|---|---|---|
+| A | delete the tower call in `encode_mm` | 13/13, 1976/1976 — GREEN | **22 passed, 1 failed**; 286/1 | `9ace2f3f51eff5fb…` / `bc7ad5e37e2fb621…` |
+| B | tower -> correctly-shaped constant | **8 passed, 5 failed**; 1970/6 | **22 passed, 1 failed**; 286/1 | `4d448c702b43aa66…` / `07728ad2a25d96f0…` |
+| C | delete the four temporal-mask stages | **10 passed, 3 failed**; 1972/4 | 23/23 — GREEN | `5be72bd7f6275098…` / `156b403295bebf33…` |
+| D | give `k_proj` q's bias | **12 passed, 1 failed**; 1975/1 | 23/23 — GREEN | `c84ce66473c1279d…` / `3dcbd601e1f0b79f…` |
+| E | delete the loader materialisation call site | 13/13, 1976/1976 — GREEN | **20 passed, 3 failed**; 275/4 | `455d91b72ab0078d…` / `dc76f6e09b8c5803…` |
+
+Read the GREEN cells, because they are the point. **A reddens only the SERVED
+suite, and inside it only the two-waveforms LOGPROB case** (`CHECK(worst >
+1e-4)`, `test_api_server_dots3_mm_forward.cpp:1313`): status, `prompt_tokens`
+and `completion_tokens` all still pass with the tower call deleted, exactly as
+§4.14.8 predicted. **E reddens only the SERVED suite**, on
+`REQUIRE(r.status == 200)` — a tower-only gate cannot see a deleted production
+call site, which is what "Nothing lands dead" asks. **C and D redden only the
+TOWER suite**: the served logprob case compares two waveforms, and two waveforms
+still differ when the mask is gone, so the served gate is honestly blind to
+them. No single suite detects all five.
+
+After restoration both binaries rebuilt to the **byte-identical baseline
+sha256** (`6f0eebce3aeca1de…`, `d3de4496830eac5c…`) and `git status` is clean.
+
+**The tokenizer markers were verified against the released checkpoint, not
+assumed.** `dots-studio/dots3-note-prev` `added_tokens.json` (sha256
+`1aa71a4e0dbab80a72fd925389fd6c9cc52d1cb9da5dee8282784c15c6fa789b`) and
+`tokenizer.json` (sha256
+`7f4e21a1d9fa472439f70201b4849977da5ec11e73df5a36552ab5ee99af554b`, 85 added
+tokens) both carry all three as SPECIAL added tokens:
+`<|audio_comp_start|>` **151718**, `<|audio_comp_end|>` **151719**,
+`<|audio_comp_pad|>` **151720**. Note the order: `pad == start + 2`, and
+`pad != start + 1`. A port that assumed start/pad/end consecutive would build a
+well-formed wrong prompt. The code resolves all three BY STRING from the
+tokenizer and refuses BY NAME when one does not resolve.
+
+**The released checkpoint's audio tensors, re-measured from the committed
+index.** 430 tensors under `audio_encoder.`, **all BF16 and not one F32**;
+`k_proj.bias` **absent** while `q_proj.bias`, `v_proj.bias` and `out_proj.bias`
+are present 32 times each; `fc1.bias [10240]` and `fc2.bias [1280]` 32 times
+each, which is the caller that makes D5's arm REACHED; `conv_out.bias` absent.
+
+**Upstream anchors re-read at `9035151d6`**, in `~/_git/vllm` at
+`vllm/models/dots3_note/nvidia/audio_encoder.py`: the file is **736 lines**
+(§2.5's `+9` correction holds); `fc1`/`fc2` at `:334-335` take torch's default
+`bias=True`; the conv2d stem is `:466-474`; `self.embed_positions = None` is
+`:508`; the four mask stages are `:544-561` and
+`valid_mel_lens = audio_sample_lens // hop_length` is `:570-574`;
+`_temporal_mask` at `:528-533` keeps `arange(T) < valid_lens`, which is what
+`MaskTime` zeroes from `valid` onward; and `k_proj` alone is `bias=False` at
+`:221`.
+
+#### 4.14.12 What the FRESH REVIEW measured, and the one hole it found
+
+The review returned PASS on the tower's arithmetic, on its refusals and on the
+oracle comparison, and it mutated each of them rather than reading them. What
+follows is what it came back with that the sections above did not already say.
+Only the first item is a defect. The rest are not, and they are written down
+anyway, because a number nobody records is a number the next reader has to
+derive again.
+
+**THE ENUMERATION INSTRUMENT HAD A `'` HOLE, AND IT IS NOW CLOSED.**
+`StripCommentsAndLiterals` treated EVERY `'` as a char-literal delimiter, so a
+C++14 digit separator opened a literal that was never there and the scan ran on
+to the next `'`, dropping the real code in between. Two separators bracketing a
+`vt::` call therefore hid that call from the enumeration, and §4.14.7's
+independence property read GREEN while being false. The stripper now takes a
+pp-number WHOLE. The number must START at a digit that does not continue an
+identifier, so `u8'a'` and `L'x'` are still char literals and are still
+stripped — which is why the fix is the pp-number rule and not the shorter
+"ignore a `'` after an alphanumeric": that shorter rule would leak the body of
+every prefixed char literal instead.
+
+Measured on this host, on ONE unfixed binary and ONE fixed binary, each row a
+source-text edit against an UNREBUILT binary. The injected reach is the same
+`vt::Scale(vllm::kMelFloor)` in all three reaching rows; only what brackets it
+changes.
+
+| # | Injected into `ref_front`, one line, at the same point | Unfixed `49cd8fb95403aff3…` | Fixed `8856bcf28d6e9070…` |
+|---|---|---|---|
+| M-A1 | the reach, bare | **RED**, 3 axes: `std,vllm,vt != std`, `13 != 11`, `73 != 71` | **RED**, the same 3 axes |
+| M-A2 | the same tokens inside a `//` COMMENT | GREEN, 11 / 71, `std` | GREEN, 11 / 71, `std` |
+| M-A3 | ONE separator: `16'000.0 * <reach>` | RED by COUNTS only, `8 != 11` and `50 != 71`; the scope set wrongly read `std` | **RED**, all 3 axes |
+| M-A4 | the reach BRACKETED: `16'000.0 * <reach> / 1'280.0` | **GREEN**, 11 / 71, `scopes=std`, with a LIVE `vt::` call inside the namespace — the hole | **RED**, all 3 axes |
+
+M-A3 loses names rather than gaining them because the phantom literal its lone
+`'` opens finds no closing `'` before the end of `ref_front`, so the scan drops
+the whole tail of the namespace. That is the same defect as M-A4 and it happens
+to be loud. M-A4 is the quiet form, and the quiet form is the one that matters:
+adding a real `vt::` reach moved NOTHING.
+
+Clean source on both binaries: `ref_front` 11 distinct / 71 occurrences,
+`ref_tower` 6 / 53, `std` only. The fix moves neither count.
+
+Every row above is a SOURCE-TEXT edit re-run against an UNREBUILT binary, which
+is the fact `DOTS3_AUDIO_TEST_SOURCE` (`tests/CMakeLists.txt:1268`) exists to
+make true: the instrument reads bytes at run time, so an edit reaches it without
+a compile, and the unchanged binary sha256 is what proves the reading rather
+than a compiled-in transcription. The hole was NOT live at the head that found
+it — the file carries no digit separator outside a comment, and M-A1 shows a
+naive reach is caught — but a later edit that wrote `16'000` and `1'280` into a
+reference with a helper call between them would have reopened it in silence, and
+on this row that property IS the correctness argument, because there is no
+oracle. The intermediate binary carrying the fix WITHOUT the standing
+assertions below, `8081852cbd8aecd4…`, produced the same four rows.
+
+**AND THE FIX HAS A STANDING GATE, not only a mutation.** A source mutation
+proves the hole once; it does not stop the next rewrite of the stripper from
+reopening it, and nothing on a clean tree can, because the whole point of the
+repair is that the counts do NOT move. So the enumeration case now calls
+`StripCommentsAndLiterals` directly on three strings, in four assertions: the
+bracketed reach
+`16'000.0 * vt::Scale(vllm::kOne) / 1'280.0`, whose two qualified names must
+SURVIVE; a prefixed `u8'v'`, whose body must NOT; and a `//` comment carrying
+both a `vt::` token and a separator, which must go whole. RED FIRST, with the
+assertions in place and the pp-number rule reverted: binary
+`f440d09b4dee9919…`, that case **0 passed / 1 failed, 18 of 20 assertions**,
+both `find` CHECKs red and the prefix and comment CHECKs green. GREEN after,
+binary `8856bcf28d6e9070…`: **13/13, 1980/1980**. The source was restored
+byte-for-byte between the two, and the restored tree rebuilt to the same
+`8856bcf28d6e9070…`. Those four assertions are why the suite reads 1980 at this
+head where §4.14.11's table records the 1976 it measured at ITS tree.
+
+**THE BUILD-FAILURE TRAP, IN ITS SHARPEST CONCRETE FORM.** §4.14.11 already
+records that mutation A's first form died on `-Werror`. The review produced the
+same failure with the consequence visible: its first form of mutation C died on
+`-Werror=unused-function`, and because the build failed, the binary still on
+disk was the one the previous mutation had left there — **byte-identical, sha256
+`87182e77c28535df…`** — and it reported **13/13 GREEN**. A reader who checked
+only the doctest line would have recorded "mutation C is not caught". Checking
+the ninja return code AND the binary sha256 is what separates NOT CAUGHT from
+NEVER BUILT, and this row has now been bitten by that distinction twice.
+
+**MEASURED HEADROOM ON THE TOWER BOUND, RECORDED AND NOT ACTED ON.** The tower
+case asserts `rel < 5e-2` (`test_dots3_note_audio.cpp:1132`) against a measured
+**0.00770442**, so the bound sits about **6.5x above the baseline**. A defect
+that moves the answer by less than that survives it, and a PARTIAL bias defect —
+bias applied to only the `up` half of the packed `fc1` pair, say — is plausibly
+inside that band. It is recorded as headroom rather than tightened, because
+tightening it without measuring what a tighter bound costs in false reds on a
+bf16 envelope would trade one unmeasured risk for another. The bound's own
+justification is unchanged: a 2-block tower and a 3-layer conv stem in bf16,
+plus the deliberate `vt::RmsNorm` rounding difference `dots3_note_audio.h`
+records.
+
+**ONE CAVEAT THE INSTRUMENT DOES NOT COVER, STATED PLAINLY.** `ref_tower` is fed
+`LoadedTower::mel_ref` (`test_dots3_note_audio.cpp:1083-1088`), which is a
+double-promoted copy of the IMPLEMENTATION'S mel and not a second computation of
+it. That is legitimate layering — the front end is separately gated against
+`ref_front` to **7.22919e-08**, so the tower case is deliberately measuring the
+tower and not the front end twice — but the enumeration proves a property of the
+two references' CODE and says nothing about the tower reference's INPUT. "Two
+independent references" is therefore true of what they compute, and not of what
+they are handed.
+
+**A SIXTH MUTATION, FROM THE REVIEWER, WORTH KEEPING BESIDE THE FIVE.** Deleting
+the `vt::Add` in `UnquantizedMlpGateUpBiasMethod::Apply` (`linear.h:215`) — the
+D5 arm still SELECTED and still named `bf16-gate-up-bias`, but behaving as
+no-bias — is CAUGHT: rel-L2 **0.0077 -> 0.0987** against the `5e-2` bound. It is
+a FOURTH tower-only defect the served suite cannot see, alongside C and D, and
+it is the mutation that proves the new seam arm's bias is applied rather than
+merely reachable.
+
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -5762,6 +6397,42 @@ change as the lifecycle move, not afterwards.
 
 Carried openly under option B (§6.4), not waived:
 
+- **W7b — audio longer than one `chunk_seconds`.** Upstream's tower splits a
+  waveform into `chunk_seconds`-long segments, mel-pads each to `chunk_samples`,
+  runs them as a BATCH through the varlen path and concatenates the per-segment
+  row slices (`audio.py:193-234` @ `9035151d6`); the prompt side counts
+  `ceil(total_samples / stride)` in one go (`processor.py:771`), while the tower
+  sums `ceil(chunk_len / stride)` per segment (`audio.py:141-146`). Those two
+  numbers AGREE for a waveform at or under one chunk and DIVERGE past it, and a
+  divergence there is a masked scatter that does not balance — audio rows
+  spliced onto text rows, which no shape check sees. W7a therefore refuses a
+  longer waveform BY NAME (§4.14.5) rather than serving the first 60 seconds or
+  computing the wrong span. Closing it is the segment loop plus a batched varlen
+  encoder pass, and it is invisible to every fixture shorter than a minute.
+  Owner: this row, W7b. Tracked in this section rather than as an issue, per
+  AGENTS.md's "an issue you do not fix in the same flow has to say who owns it".
+- **W7c — every audio container and sampling rate but PCM16 mono WAV at 16
+  kHz.** Upstream resamples in the data parser
+  (`MultiModalDataParser(target_sr=..., target_channels=1)`,
+  `processor.py:523-525`) and accepts whatever `librosa` can open. This port
+  decodes exactly one container — `DecodeWavPcm16Mono`
+  (`audio_processor.cpp:35-79`) — and REFUSES a rate that is not
+  `audio_config.sampling_rate`, because `WhisperAudioProcessor::ProcessWaveform`
+  has carried a "resample deferred" throw since the audio-track A1 row
+  (`audio_processor.cpp:94-101`) and a windowed-sinc resampler is a numerically
+  delicate port of its own, not a line of glue. The refusal is at the ROUTE and
+  names W7c, so an operator learns which brick owes it rather than reading A1's
+  message about a different model. Owner: this row, W7c.
+- **`vt::Conv2d` has no CUDA provider, and W7a's stem composition is the
+  exception that records it.** `src/vt/cpu/cpu_conv2d.cpp:111` is the only
+  `RegisterOp(OpId::kConv2d, ...)` in the tree, so the shared 2-D convolution
+  seam resolves no op on a CUDA queue. `dots3_note_audio.cpp` composes its three
+  stride-2 Conv2d stem layers as im2col + `vt::MatmulBT` instead — the same
+  composition `whisper_audio.h:33` already makes for its Conv1d stem, and for
+  the same stated reason — and carries ONE EXACT TRACKED EXCEPTION naming this
+  gap. The gap is a `vt` one and outlives this row. Issue
+  [#2709](https://github.com/mudler/vllm.cpp/issues/2709).
+
 - **The vision MoE's SOFTMAX router arm and its top-k-below-2 arm are refused.**
   `Dots3NoteVisionRefusal` turns away a `vision_config` whose
   `router_scoring_func` is not `"sigmoid"`, and one whose
@@ -5794,6 +6465,15 @@ Carried openly under option B (§6.4), not waived:
   declares it and the only such checkpoint would be a fixture written to reach
   it. The refusal names the keys, the seam and the issue, and a served request
   against such a checkpoint gets HTTP 400 with the text path still answering.
+  **W7a (§4.14.4) lifted the SECOND of those three reasons and only that one**:
+  `layers::UnquantizedMlpGateUpBiasMethod` now exists, and it landed REACHED
+  because the released AUDIO checkpoint's `fc1 [10240, 1280]` ships a `[10240]`
+  bias. The first and third reasons still stand for the VISION tower — nothing
+  published sets `use_bias`, so a vision arm would still land unreached — and
+  the refusal is unchanged. #2616 therefore stays OPEN, and W7a's pull request
+  deliberately does not carry a closing keyword for it. What remains is loading
+  the vision `qkv`/`proj`/`fc` biases and deleting the refusal, gated by a
+  `use_bias` fixture served end to end.
   Owner: this row. Issue
   [#2616](https://github.com/mudler/vllm.cpp/issues/2616).
 - **`resized_size`'s per-request DETAIL overrides are not wired.** Upstream's
@@ -6555,3 +7235,36 @@ checkpoint selects, and what it still refuses BY NAME — `use_bias = true`
 and the top-k-below-2 arm
 ([#2615](https://github.com/mudler/vllm.cpp/issues/2615)) — nothing published
 sets.
+
+**W7a — LANDED, and the server will now listen to a recording.**
+([#2703](https://github.com/mudler/vllm.cpp/issues/2703), evidence §4.14.) An
+OpenAI `input_audio` chat part now reaches the 32-layer `dots` speech encoder
+and produces audio rows in the prompt embeddings, through the same production
+chain W6a built for images: `ApiServer::handle_chat_completions` -> the
+architecture-dispatched chat seam -> `GPUModelRunner::execute_mm_encoder` ->
+`ModelRegistry::EmbedMm` -> `ModelRegistry::Forward`. Before it, the request
+died at the entrypoint with HTTP 400 "At most 0 audio(s) may be provided in one
+prompt.", because the seam's supported-limit map declared only `{"image", 1}`.
+
+**Three things landed with it that are not the tower.** The mel filterbank is
+now a SHARED seam, `vllm::multimodal::MelFilterBankSlaney`, extracted from
+Parakeet's and used by both callers — and it is gated against
+`voxtral_mel_filters_f32.bin`, a committed [201, 128] `float32` fixture that a
+third party produced, which it reproduces BIT-FOR-BIT. That is the only place on
+this row where a number is checked against something this repository did not
+also write. `layers::MlpGateUpMethodBase` gained a BIAS arm, reached by the
+audio `fc1 [10240, 1280]` + `[10240]`; §4.14.4 says why that does not close
+[#2616](https://github.com/mudler/vllm.cpp/issues/2616). And **W7 IS AUDIO, W8
+IS VIDEO** — the loader has said so since W2 and two production refusal messages
+said the opposite; all four surfaces now agree.
+
+**Say the other half in the same breath.** A waveform longer than
+`chunk_seconds` is REFUSED BY NAME to W7b, and any container or sampling rate
+but PCM16 mono WAV at 16 kHz is refused to W7c. Both are in `## Owed` with the
+reason. The gate is a CONSISTENCY gate (§6.4 option B): TWO independent in-test
+double-precision references, one for the front end and one for the tower,
+sharing no helper with the implementation. No performance number is claimed on
+any axis.
+
+**Next dispatchable: W7b/W7c for the rest of the audio front end, W8 for video
+and the MM ABI, or W9 for the quantized arms.**

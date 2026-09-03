@@ -65,6 +65,30 @@ struct AudioKwargs {
   int64_t n_mels = 0;
   int64_t n_frames = 0;
 
+  // ── ADDED BY dots3-note W7a (#2703), additively ────────────────────────────
+  //
+  // Two lengths a mel matrix cannot carry, both DEFAULTED to 0 so every
+  // existing producer and consumer is unchanged: Whisper's `RouteAudioWav`
+  // fills neither and reads neither, and the runner and scheduler never look
+  // inside this struct at all.
+  //
+  // `num_samples` is the waveform's OWN length BEFORE the front end padded it
+  // to a whole chunk. dots3-note's stem masks the padded tail to zero at four
+  // stages from `valid_mel_lens = num_samples // hop_length`
+  // (`nvidia/audio_encoder.py:570-574` @ `9035151d6`), and it MUST: the mel of a
+  // zero-padded tail is not zero, it is the `-8` global-max floor pushed
+  // through `(x + 4) / 4`, a nonzero constant that would otherwise leak through
+  // the 3x3 receptive fields into the last VALID tokens.
+  //
+  // `num_tokens` is the placeholder run length and the tower's output row
+  // count, `ceil(num_samples / token_stride)` (`common/processor.py:771`).
+  // It is NOT derivable from `num_samples // hop_length` halved three times:
+  // at 1281 samples that gives 1 and this gives 2, and the difference is a
+  // stem row the mask zeroed that the span still covers. Two numbers, carried
+  // separately, because upstream computes them separately.
+  int64_t num_samples = 0;
+  int64_t num_tokens = 0;
+
   bool empty() const { return n_frames == 0; }
 };
 

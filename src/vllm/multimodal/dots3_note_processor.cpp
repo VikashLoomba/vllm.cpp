@@ -18,6 +18,7 @@
 
 #include "vllm/multimodal/hasher.h"
 #include "vllm/multimodal/mel_filter_bank.h"
+#include "vllm/v1/engine/validation_error.h"
 #include "vllm/multimodal/pil_resize.h"
 #include "vt/dtype.h"
 
@@ -479,7 +480,11 @@ int64_t Dots3NoteAudioProcessor::NumAudioTokens(int64_t num_samples) const {
 AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
     const float* samples, int64_t num_samples, int sample_rate) const {
   if (sample_rate != cfg_.sampling_rate) {
-    throw std::runtime_error(
+    // `InputValidationError`, so the server answers HTTP 400: the RATE is a
+    // property of the request, and `ApiServer::handle_chat_completions` maps a
+    // bare `runtime_error` to 500. Upstream's own mapping is `ValueError` ->
+    // `BadRequestError` (serve/utils/error_response.py:62-65).
+    throw v1::InputValidationError(
         "dots3-note audio processor: the request carries audio at " +
         std::to_string(sample_rate) + " Hz and this checkpoint's "
         "`audio_config.sampling_rate` is " +
@@ -493,11 +498,11 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
         "§4.14.5 and issue #2703.");
   }
   if (num_samples <= 0) {
-    throw std::runtime_error(
+    throw v1::InputValidationError(
         "dots3-note audio processor: the request carries an empty waveform");
   }
   if (num_samples > cfg_.chunk_samples()) {
-    throw std::runtime_error(
+    throw v1::InputValidationError(
         "dots3-note audio processor: the request carries " +
         std::to_string(num_samples) + " samples (" +
         std::to_string(static_cast<double>(num_samples) / cfg_.sampling_rate) +

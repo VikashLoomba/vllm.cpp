@@ -50,6 +50,7 @@
 #include "vllm/multimodal/qwen3vl_processor.h"  // ExpandImagePlaceholders
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/engine/validation_error.h"  // a bad upload is a 400, not a 500
 
 namespace vllm::entrypoints::openai {
 
@@ -216,7 +217,15 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
     decoded = multimodal::DecodeWavPcm16Mono(audio.bytes.data(),
                                              audio.bytes.size());
   } catch (const std::exception& e) {
-    throw std::runtime_error(
+    // `InputValidationError`, NOT `std::runtime_error`. The container is a
+    // property of the REQUEST, so this is a client error and
+    // `ApiServer::handle_chat_completions` maps this type to HTTP 400
+    // ("BadRequestError") while a bare `runtime_error` falls through to the
+    // generic 500 arm. Upstream reaches the same place: `create_error_response`
+    // maps `ValueError` to `BadRequestError`
+    // (serve/utils/error_response.py:62-65). Reporting a malformed upload as a
+    // SERVER fault is what the 500 arm is for, and it is not this.
+    throw vllm::v1::InputValidationError(
         std::string("dots3-note audio chat seam: this request's audio is not a "
                     "PCM16 MONO RIFF/WAVE buffer (") + e.what() +
         "). Only that container is ported; every other one — including the "
@@ -311,7 +320,9 @@ MultiModalChatFn MakeDots3NoteChatFn(
     // `9035151d6`); this port does not have that machinery yet, and a mixed
     // request is owed to W8 with the rest of the front end.
     if (image_part != nullptr && audio_part != nullptr) {
-      throw std::runtime_error(
+      // A client error, so HTTP 400 rather than 500 — see the container
+      // refusal's note in `RouteDots3NoteAudioWav`.
+      throw vllm::v1::InputValidationError(
           "dots3-note multimodal chat seam: this request carries BOTH an image "
           "and an audio part. Each is served on its own (W6a-W6c and W7a); "
           "serving them together needs the single-pass placeholder expansion "

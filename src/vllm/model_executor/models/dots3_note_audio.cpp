@@ -199,6 +199,12 @@ std::string Dots3NoteAudioRefusal(
            "[ffn_dim, d_model] rather than [2 * ffn_dim, d_model] — so this is "
            "not a swap of one activation. The released checkpoint sets swiglu";
   }
+  if (a.use_latent_input) {
+    return "`use_latent_input` is true, which selects the LATENT stem "
+           "(`_forward_latent_stem`, audio_encoder.py:598-609 @ 9035151d6): a "
+           "GLU after conv1, stride 1, no downsampling at all, and a "
+           "`latent_dim` input width instead of the mel bins. Unshipped arm";
+  }
   if (!a.use_conv2d_stem) {
     return "`audio_config.use_conv2d_stem` is false, which selects the Conv1d "
            "stem (`_forward_conv1d_stem`, audio_encoder.py:585-596 @ "
@@ -207,12 +213,6 @@ std::string Dots3NoteAudioRefusal(
            "`conv2d1`/`conv2d2`/`conv2d3`/`conv_out`, and a token stride of 320 "
            "instead of 1280. No published checkpoint sets it; refused rather "
            "than served from the conv2d path. Unshipped arm";
-  }
-  if (a.use_latent_input) {
-    return "`use_latent_input` is true, which selects the LATENT stem "
-           "(`_forward_latent_stem`, audio_encoder.py:598-609 @ 9035151d6): a "
-           "GLU after conv1, stride 1, no downsampling at all, and a "
-           "`latent_dim` input width instead of the mel bins. Unshipped arm";
   }
   if (a.use_causal) {
     return "`audio_config.use_causal` is true. It changes THREE things at once "

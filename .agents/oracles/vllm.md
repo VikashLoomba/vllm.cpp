@@ -100,9 +100,12 @@ half [`../sync/2026-09-02-e126687.md`](../sync/2026-09-02-e126687.md)
    binding benchmark number in this tree was taken on GB10, and nothing here
    transfers to it.
 5. **Step 5 did not run.** The 290-entry PORT-NOW queue for
-   `5559679229..e126687a9a` is classified and reconciled but unworked, so 90
-   files whose `Ported from:` header names `55596792` now name a revision BELOW
-   the pin. Owed by [#2611](https://github.com/mudler/vllm.cpp/issues/2611).
+   `5559679229..e126687a9a` is classified and reconciled but unworked, so **at
+   least 177** files whose `Ported from:` header names `55596792` now name a
+   revision BELOW the pin. That is a FLOOR — the headers wrap, so no single
+   probe sees all of them; see
+   [`../sync/2026-09-03-e126687-advance.md`](../sync/2026-09-03-e126687-advance.md)
+   §5.3. Owed by [#2611](https://github.com/mudler/vllm.cpp/issues/2611).
 
 **Evidence for the limits above.**
 [#2626](https://github.com/mudler/vllm.cpp/issues/2626) is owned by
@@ -127,9 +130,28 @@ board. Where a device has been MEASURED to build and run a gate model, it is
 recorded here with the evidence; absence from this table means unmeasured, never
 unsupported. One row per measurement, appended by the change that made it.
 
-| device | arch | measured | builds | runs a gate model | evidence |
-|---|---|---|---|---|---|
-| `strix:gpu0` | `gfx1151` (RDNA 3.5, Radeon 8060S, ROCm 7.2.4) | 2026-09-03 | yes | yes — Qwen3.8-27B Q4_K_M GGUF, 6 prompts x 48 greedy tokens, reproducible | [`oracle-vllm-gfx1151-20260903.md`](../../docs/bench-evidence/oracle-vllm-gfx1151-20260903.md) |
+**AT THE CURRENT PIN THIS TABLE IS EMPTY, and that is the honest reading of it.**
+The one row below was measured at the PRIOR pin `5559679229`: its evidence file
+records `SETUPTOOLS_SCM_PRETEND_VERSION=0.26.0.dev0+g5559679229` at `:246`,
+`vllm.__version__ = 0.26.0.dev0+g5559679229` at `:249` and the same string in the
+engine banner at `:340`. It is kept, with its pin column added, because it is a
+real measurement of a real board and deleting it would destroy evidence — but it
+does not answer "does a gate model run at `e126687a9a`" on any device. Nothing in
+this file does. `thor:gpu0` is deliberately NOT added: the run that put the pin
+here served `facebook/opt-125m`, which is not a gate model, and adding it would
+make the table say the thing the pin advance did not buy.
+
+| device | arch | pin measured at | measured | builds | runs a gate model | evidence |
+|---|---|---|---|---|---|---|
+| `strix:gpu0` | `gfx1151` (RDNA 3.5, Radeon 8060S, ROCm 7.2.4) | **`5559679229`, the PRIOR pin** | 2026-09-03 | yes | yes — Qwen3.8-27B Q4_K_M GGUF, 6 prompts x 48 greedy tokens, reproducible | [`oracle-vllm-gfx1151-20260903.md`](../../docs/bench-evidence/oracle-vllm-gfx1151-20260903.md) |
+
+**A residual this table exists to hold, and does not yet close.** Every checker
+reads the `gateable` field, not the prose above it, and no field names the device
+or the model a `yes` was measured on. So `gateable = yes` is as strong as the
+best row here, and the best row here is at the prior pin. Whoever adds the first
+row at `e126687a9a` — the token gate on `dgx:gpu0`
+([#2794](https://github.com/mudler/vllm.cpp/issues/2794)) is the obvious
+candidate — closes that gap for one board and no more.
 
 **gfx1151 needs five packages a bare ROCm image does not carry**, and each of
 their absences presents as a device failure rather than as a provisioning gap:

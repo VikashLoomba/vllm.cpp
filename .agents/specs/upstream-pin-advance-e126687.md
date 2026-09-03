@@ -81,8 +81,9 @@ carries one circular assertion too many.
   and ruled not a blocker; see §3 for the state of that ruling. Porting an entry
   is product work and `.agents/upstream-sync.md` §Rules forbids mixing it into a
   sync cycle commit.
-- **Bumping the 90 per-file `Ported from: ... 55596792` headers** (measured; see
-  §5.3, and the "roughly 500" this replaced was a guess). They are
+- **Bumping the >= 177 per-file `Ported from: ... 55596792` headers** (a
+  measured FLOOR; see §5.3, which also records the two wrong figures that
+  preceded it). They are
   per-file pins and step 5 is what moves them. §5.3 records that they are now
   behind, which is the ledger note `.agents/upstream-sync.md` §Concepts requires.
 - **The #2649 product change.** It becomes landable at this merge and is not
@@ -271,9 +272,12 @@ statements and the record must not let the first read as the second.
 `.agents/upstream-sync.md` §Concepts allows a per-file pin to be temporarily
 ahead, and says it may never be behind "without a ledger note". Step 5 is what
 moves those headers and step 5 did not run. Measured over `include/`, `src/` and
-`tests/`: 556 files carry a `Ported from:` header, **90** of them name
-`55596792` and go behind with this advance, and **247** name `e24d1b24` and were
-ALREADY behind against the prior pin. **This section is that ledger note.** They are
+`tests/`: 556 files carry a `Ported from:` header, **at least 177** name
+`55596792` and go behind with this advance, and **at least 330** name `e24d1b24`
+and were ALREADY behind against the prior pin. Both are FLOORS, because the
+headers wrap and no single probe sees all of them; the sync report §5.3 carries
+the three probes, their blind spots, and the two wrong figures that preceded this
+one. **This section is that ledger note.** They are
 owed by the PORT-NOW queue's own issue,
 [#2611](https://github.com/mudler/vllm.cpp/issues/2611), and by the per-entry
 issues the PORTQ waves filed.
@@ -332,7 +336,8 @@ applies to any shallow clone.
 | Goldens drift at the new pin and nobody knows yet | #2794. §5.1 says no gate has run rather than implying one has |
 | The queue's discharge lives in an unmerged pull request | §3 names it and its state at the merge base |
 | Per-file headers now lag the pin | §5.3 is the ledger note the protocol asks for |
-| Somebody reads `gateable = yes` as "every row can be gated" | §5.2, and the same limit is written into `.agents/oracles/vllm.md` beside the block |
+| Somebody reads `gateable = yes` as "every row can be gated" | §5.2, and the same limit is written into `.agents/oracles/vllm.md` beside the block. The residual is real and is NOT closed: every checker reads the field, not the prose, and no field names the device or model the `yes` was measured on. The device-scoped table now says outright that it holds ZERO rows at this pin |
+| The two pin surfaces silently disagree at the next advance | Not mitigated. [#2829](https://github.com/mudler/vllm.cpp/issues/2829), filed by this wave with the mutation that proves three checkers stay green over a disagreement. They agree here, verified by hand |
 
 ## 8. Gates
 
@@ -354,9 +359,16 @@ consistency. Each is a command, not a description.
    is the population of symbol citations the advance falsified. **Measured**:
    15 stale before, 28 after; 15 newly stale, 2 repaired by the advance, and one
    apparent move that is this wave's own edit relocating a citation. Thirteen of
-   the fifteen are `.agents/model-matrix.md` rows for architectures vllm#53608
-   deleted, which is [#2819](https://github.com/mudler/vllm.cpp/issues/2819).
-   `../sync/2026-09-03-e126687-advance.md` §4.4.
+   the fifteen are `.agents/model-matrix.md` rows, and they are THREE different
+   things, not one: 8 genuine deprecations (vllm#53608), 4 migrations to the
+   Transformers fallback (`48d7132962`), and 1 relocation (`aeeb36b1f1`
+   vllm#50000). **Two of them reach models this project SHIPS** —
+   `KimiLinearForCausalLM`, relocated and still registered, and
+   `Olmo3ForCausalLM`, now routed to the generic fallback, which the anchor
+   checker cannot even see. The remaining two of the fifteen are
+   `moe-semantics.md:29` and `gdn-state-kv-budget.md:101`. All of it is
+   [#2819](https://github.com/mudler/vllm.cpp/issues/2819).
+   `../sync/2026-09-03-e126687-advance.md` §4.4 and §4.4a.
 4. `scripts/agent-preflight.sh --staged`, run ONCE on the frozen tree, with the
    `gate(s) failed` and `NOT a green` lines read rather than the exit status.
 
@@ -379,7 +391,7 @@ consistency. Each is a command, not a description.
   token-exact gate at the target, on `dgx:gpu0`, which also answers the OPT
   golden that was never re-validated at the old pin.
 - [#2611](https://github.com/mudler/vllm.cpp/issues/2611) — a reading on
-  `dgx:gpu0`, the 290-entry queue, and with it the 90 per-file headers §5.3
+  `dgx:gpu0`, the 290-entry queue, and with it the >= 177 per-file headers §5.3
   leaves behind the pin.
 - [#2626](https://github.com/mudler/vllm.cpp/issues/2626) — `qwen4_exp` does not
   run on this fleet at the pinned revision.
@@ -388,8 +400,17 @@ consistency. Each is a command, not a description.
   `include/vllm/config/speculative.h`.
 - [#1185](https://github.com/mudler/vllm.cpp/issues/1185) — the shallow-fetch
   version discrepancy, still open as a mechanism.
-- [#2819](https://github.com/mudler/vllm.cpp/issues/2819) — thirteen
-  `.agents/model-matrix.md` rows cite upstream model files vllm#53608 deleted
-  inside this range, and the pinned registry is unreconciled in both directions.
-  Filed by this wave, owned by no row yet, and listed here as AGENTS.md
-  §"Every change starts from an issue" requires.
+- [#2829](https://github.com/mudler/vllm.cpp/issues/2829) — the pin is
+  transcribed in `.agents/upstream-sync.md` and `.agents/oracles/vllm.md` and
+  nothing checks the two agree; three checkers stay green over a deliberate
+  disagreement. Pre-existing, made live by this advance, filed by this wave,
+  owned by no row yet.
+- [#2819](https://github.com/mudler/vllm.cpp/issues/2819) — fifteen citations go
+  stale at the new pin. Thirteen are `.agents/model-matrix.md` rows, split 8
+  deprecations / 4 Transformers-fallback migrations / 1 relocation, and **two of
+  them reach models this project ships** (`KimiLinearForCausalLM`,
+  `Olmo3ForCausalLM`), which makes those mirror obligations rather than matrix
+  cleanup. Two more are `moe-semantics.md:29` and `gdn-state-kv-budget.md:101`.
+  The pinned registry is unreconciled in both directions. Filed by this wave,
+  owned by no row yet, and listed here as AGENTS.md §"Every change starts from an
+  issue" requires.

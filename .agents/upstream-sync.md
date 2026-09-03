@@ -18,11 +18,15 @@ recorded zero real drift. This one ran no build, no lease, no GPU and no golden
 re-capture. Every committed golden in this tree was captured against `555967922`
 or earlier, and the declared token-exact gate at this pin is owed by
 [#2794](https://github.com/mudler/vllm.cpp/issues/2794). Step 5 did not run
-either, so **90** files whose `Ported from:` header names `55596792` are now
-BEHIND the pin (counted over `include/`, `src/` and `tests/`; 556 files carry
-such a header at all, and 247 of them still name `e24d1b24`, the pin before that
-one, so they were already behind and this advance neither causes nor fixes that).
-This paragraph is the ledger note §Concepts asks for, and the queue is
+either, so **at least 177** files whose `Ported from:` header names `55596792`
+are now BEHIND the pin, counted over `include/`, `src/` and `tests/`. **It is a
+FLOOR, not a count**, and the reason is in
+[`sync/2026-09-03-e126687-advance.md`](sync/2026-09-03-e126687-advance.md) §5.3:
+a header wraps, so no single probe sees all of them, and the figure is the union
+of three probes each with a different blind spot. 556 files carry such a header
+at all, and at least 330 still name `e24d1b24`, the pin before that one — they
+were already behind, and this advance neither causes nor fixes that. This
+paragraph is the ledger note §Concepts asks for, and the queue is
 [#2611](https://github.com/mudler/vllm.cpp/issues/2611).
 
 **Step 6 ran AFTER step 7, by developer ruling, and the ruling is recorded as

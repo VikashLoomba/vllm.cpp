@@ -15,8 +15,41 @@ whose method this wave continues.
 
 ## Now
 
-Placeholder until the reading closes. Filled with the counts, the disagreement
-count, and the issues before the pull request opens.
+**Done. All fifty reached; none left unclassified.** 50 of 50 re-derived:
+**4 ALREADY_SATISFIED, 10 REAL_GAP, 36 NOT_APPLICABLE** (32 `surface-absent`,
+4 `inert`). **40 of the 50 disagree with the recorded PORT-NOW disposition.**
+
+**The queue ends exactly at 290**, at `e126687a9a` — the sync target itself —
+with position 291 empty, re-derived at the merge commit and byte-identical to
+the pre-annotation derivation. With this tranche the queue is complete: 55 real
+gaps in 290 entries.
+
+Ten issues carry the ten gaps, all new:
+[#2724](https://github.com/mudler/vllm.cpp/issues/2724),
+[#2725](https://github.com/mudler/vllm.cpp/issues/2725),
+[#2727](https://github.com/mudler/vllm.cpp/issues/2727),
+[#2728](https://github.com/mudler/vllm.cpp/issues/2728),
+[#2729](https://github.com/mudler/vllm.cpp/issues/2729),
+[#2731](https://github.com/mudler/vllm.cpp/issues/2731),
+[#2733](https://github.com/mudler/vllm.cpp/issues/2733),
+[#2734](https://github.com/mudler/vllm.cpp/issues/2734),
+[#2735](https://github.com/mudler/vllm.cpp/issues/2735),
+[#2736](https://github.com/mudler/vllm.cpp/issues/2736). The four `inert`
+entries, two unreached surfaces and one flagged coordinator divergence are
+deferred under [#2737](https://github.com/mudler/vllm.cpp/issues/2737).
+
+**The pairing check found what a single tranche cannot see**: entries 229 and
+241 are byte-identical changes, the queue's only duplicate, with KV-layout stage
+6 clobbering the first between them; six further supersession pairs follow, two
+of them amendments no scan can detect.
+
+**One landed record is corrected in place** — `2026-09-03-portq5.md` §5.3 says
+stage 6 is outside the range and it is inside, at position 230 — and
+[#2695](https://github.com/mudler/vllm.cpp/issues/2695) is commented with the
+same correction. **Four citations in this wave's own reading were wrong**, found
+by a mechanical anchor resolve; none moved a label. **Two labels were changed
+from what the readers returned**, `inert` to `surface-absent`.
+Report: [`../sync/2026-09-03-portq7.md`](../sync/2026-09-03-portq7.md).
 
 **Nothing in this wave is executed.** No build, no test run, no GPU, no lease.
 

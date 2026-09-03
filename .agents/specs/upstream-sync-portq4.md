@@ -15,7 +15,30 @@ whose method this wave continues unchanged.
 
 ## Now
 
-**PENDING** until the forty labels are read. Filled at completion.
+**Done.** 40 of 40 re-derived: **11 ALREADY_SATISFIED, 10 REAL_GAP,
+19 NOT_APPLICABLE** (14 `surface-absent`, 5 `inert`). **30 of the 40 disagree with
+the recorded PORT-NOW disposition.** Eight issues carry the ten gaps
+([#2683](https://github.com/mudler/vllm.cpp/issues/2683),
+[#2684](https://github.com/mudler/vllm.cpp/issues/2684),
+[#2685](https://github.com/mudler/vllm.cpp/issues/2685) which covers two entries,
+[#2688](https://github.com/mudler/vllm.cpp/issues/2688),
+[#2689](https://github.com/mudler/vllm.cpp/issues/2689),
+[#2693](https://github.com/mudler/vllm.cpp/issues/2693),
+[#2694](https://github.com/mudler/vllm.cpp/issues/2694),
+[#2696](https://github.com/mudler/vllm.cpp/issues/2696), and the pre-existing
+[#2650](https://github.com/mudler/vllm.cpp/issues/2650) which already owns
+`608c12473f`); the five deferred entries and one un-owned pre-pin gap are carried
+on [#2700](https://github.com/mudler/vllm.cpp/issues/2700), and a pre-pin
+correctness hole found on the way is
+[#2697](https://github.com/mudler/vllm.cpp/issues/2697).
+Report: [`../sync/2026-09-03-portq4.md`](../sync/2026-09-03-portq4.md).
+
+**Nothing was executed.** No build, no test run, no GPU, no lease. An
+`ALREADY_SATISFIED` means the code implements the behaviour, not that a gate
+observed it.
+
+The pin did **not** advance and nothing read here is a reason to move it. The
+active parity pin remains `5559679229bc961848b121ccdeaa8fa5d79bec98`.
 
 ## 1. Scope
 

@@ -59,11 +59,15 @@ DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav_bytes, size_t num_bytes);
 //
 // A SIBLING RATHER THAN A WIDENING, so that `DecodeWavPcm16Mono`'s three
 // callers -- parakeet transcription, the ROAD-V1-MM parse path and the voxtral
-// e2e gate -- cannot move by a bit. Both share ONE chunk walk. The mean is
-// accumulated in int32 (exact; no overflow is representable) and rounded once,
-// which is BIT-IDENTICAL to upstream's float32 mean for every power-of-two
-// channel count, C = 1 and C = 2 included. See
-// `.agents/specs/dots3-note.md` 4.16.2. W7c-1, issue #2813.
+// e2e gate -- decode the same bytes to the same samples. Both share ONE chunk
+// walk, which moves two REFUSAL MESSAGES and no sample; `audio_processor.cpp`
+// names both. The mean is accumulated in int32 -- exact over the whole uint16
+// channel domain, and no overflow is representable -- and the answer is the
+// CORRECTLY-ROUNDED float of that exact mean. It is BIT-IDENTICAL to upstream's
+// float32 mean for every power-of-two channel count UP TO 512, C = 1 and C = 2
+// included; that bound is TIGHT, and past it the two may differ by half an ulp
+// with this arm the more accurate. See `.agents/specs/dots3-note.md` 4.16.2.
+// W7c-1, issue #2813.
 DecodedAudio DecodeWavPcm16MeanToMono(const uint8_t* wav_bytes, size_t num_bytes);
 
 // The subset of the whisper-small feature-extractor + config the audio path needs.

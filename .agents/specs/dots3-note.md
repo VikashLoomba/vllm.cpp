@@ -5236,7 +5236,7 @@ is the record of that rather than a silent divergence:
 | `audio_encoder.py:507-519` for the absent positional embedding | `:498-510` | §2.5, re-measured at `9035151d6` |
 | `nvidia/audio_encoder.py` is 736 lines and the anchors in §2.5 stand | eight §2.5 anchors were `+9` | §2.5 |
 | the adapter is "`audio_adapter.proj.{0, 1, 3}`, 1280 to 5120" | `proj.0` is a **LayerNorm with weight AND bias** over 1280, and only `proj.1`/`proj.3` are Linears | the committed shard index |
-| "It must be ported from whatever upstream actually calls" | it is **already ported**: `audio_processor.cpp:181-289` is Whisper's `log_mel_spectrogram` verbatim in double precision, and `test_voxtral_e2e.cpp:157-178` already drives it at n_fft 400 / hop 160 / n_mels 128 / 16 kHz | §4.14.2 |
+| "It must be ported from whatever upstream actually calls" | it is **already ported**: `audio_processor.cpp:211-319` is Whisper's `log_mel_spectrogram` verbatim in double precision, and `test_voxtral_e2e.cpp:157-178` already drives it at n_fft 400 / hop 160 / n_mels 128 / 16 kHz | §4.14.2 |
 
 #### 4.14.1 What was already built, and what was actually missing
 
@@ -5248,8 +5248,10 @@ its scatter balances because the audio adapter's `whisper_adapter_out_dim` is
 5120, which IS `config.hidden_size`; `MultiModalFeatureSpec::audio_data`
 (`inputs.h:81`) already carries an `AudioKwargs`; `DecodeInputAudioPart`
 (`chat_mm.cpp:122-129`) already base64-decodes the part; `DecodeWavPcm16Mono`
-(`audio_processor.cpp:103-151`) already decodes PCM16 mono WAV; and
-`ExpandAudioPlaceholders` (`audio_processor.cpp:296-315`) already performs the
+(`audio_processor.cpp:103-131`, over the shared chunk walk `ParseWavPcm16` at
+`:49-99` that W7c-1 factored out of its body) already decodes PCM16 mono WAV;
+and
+`ExpandAudioPlaceholders` (`audio_processor.cpp:326-345`) already performs the
 expansion.
 
 Five things were missing or dead, and they are what W7a adds:
@@ -5281,7 +5283,7 @@ periodic Hann over `n_fft` 400, `torch.stft(center=True)` reflect padding, the
 last frame dropped by `stft[..., :-1]`, a POWER spectrogram, `filters @
 magnitudes`, `clamp(1e-10).log10()`, a GLOBAL-max `-8` floor and `(x + 4) / 4`.
 `WhisperAudioProcessor::ProcessWaveform`
-(`src/vllm/multimodal/audio_processor.cpp:181-289`) is that function, in double
+(`src/vllm/multimodal/audio_processor.cpp:211-319`) is that function, in double
 precision, and the only deltas dots3 needs are CONFIG: `chunk_length_s` 30 ->
 60, `n_mels` 80 -> 128, `max_source_positions` 1500 -> 6000. So W7a REUSES it
 rather than writing a second one, which is what "never write a parallel path by
@@ -6180,40 +6182,97 @@ type is a decision that has to be stated.
 **It accumulates the raw `int16` channel samples in `int32`, divides once in
 `double`, and narrows once to `float`.**
 
-- The `int32` accumulator **cannot overflow**. `|s| <= 32768` and `channels` is
-  a `uint16` field of the `fmt ` chunk, so `|sum| <= 32768 * 65535 = 2147450880
+**The two claims below use different domains, and each one names its own.**
+The overflow claim is about the PARSER'S domain, `C <= 65535`, because
+`channels` is a `uint16` field of the `fmt ` chunk. The bit-identity claim is
+about `C <= 512`. An earlier draft of this section stated both in the same
+paragraph without saying so, which read as one claim over 65535 channels and was
+false above 512.
+
+- The `int32` accumulator **cannot overflow anywhere in the parser's domain**.
+  `|s| <= 32768` and `C <= 65535`, so `|acc| <= 32768 * 65535 = 2147450880
   < 2^31`. The sum is therefore EXACT for every WAV this parser can be handed,
-  which no `float32` accumulator can promise past 256 channels.
-- There is **exactly one rounding**, at the narrowing store. `acc / (32768 * C)`
-  is computed in `double` and assigned to `float` once; nothing is rounded to
-  `float` and then combined again, which is the double-rounding the issue warns
-  about.
-- **For every power-of-two channel count that rounding is not a rounding at
-  all, and the result is BIT-IDENTICAL to what upstream's `float32` mean
-  produces.** With `C = 2^k`, `acc` is an integer of magnitude at most
-  `2^(15+k)` and the divisor `32768 * C` is `2^(15+k)`, so the quotient is
-  `acc * 2^-(15+k)`: a value whose significand is `acc`, needing at most
-  `16 + k` bits against `float`'s 24. It is exact in `double` and exact in
-  `float`. Upstream's arm is exact for the same reason — each `s / 32768` is
-  exact in `float32`, every partial sum needs at most `16 + k` bits, and the
-  final divide by `2^k` only moves the exponent — so the two agree bit for bit.
+  which no `float32` accumulator can promise past **512** channels.
+- **The answer is the correctly-rounded `float` of the exact mean, for every
+  `C` in that domain — but there are TWO roundings, not one.** `acc` and
+  `32768 * C` are both exact in `double`, so the divide is correctly rounded to
+  `double`; the narrowing store then rounds a second time whenever that quotient
+  is not itself exact, which is every `C` that is not a power of two. Saying
+  "exactly one rounding" was imprecise about the MECHANISM. The CONSEQUENCE
+  survives, for two independent reasons: `double`'s 53 bits clear the
+  `2 * 24 + 2 = 50` that makes a division's double rounding innocuous, and an
+  exhaustive sweep of **all 1,300,542,267 `(C, acc)` pairs** for every
+  non-power-of-two `C` in `[2, 200]` — every accumulator value those channel
+  counts admit — finds **zero** anomalies against an 80-bit route. So the
+  shipped expression is the correctly-rounded `float`, and nothing is rounded to
+  `float` and then combined again.
+- **For a power-of-two channel count UP TO 512 that second rounding does not
+  happen either, and the result is BIT-IDENTICAL to what upstream's `float32`
+  mean produces, in whatever order `numpy` sums.** With `C = 2^k` the divisor
+  `32768 * C` is `2^(15+k)` and `|acc| <= 2^(15+k)`, so the quotient is
+  `acc * 2^-(15+k)`; every integer of magnitude at most `2^24` is exact in
+  `float32`, so this is exact exactly when `15 + k <= 24`, that is
+  **`k <= 9`, `C <= 512`**. Upstream's arm is exact under the same bound: each
+  `s / 32768` is exact, and every partial sum — in ANY grouping, so pairwise
+  summation included — is a multiple of `2^-15` whose numerator is bounded by
+  the same `2^24`, after which the divide by `2^k` only moves the exponent.
   This covers **C = 1**, which is why no mono waveform in this tree can move,
-  and **C = 2**, which is the case this slice exists to serve.
-- For a channel count that is NOT a power of two the two arms may differ by at
-  most one `float` ulp, and this port is the MORE accurate of the two, because
-  its sum is exact where `np.mean`'s is not. That is stated, not hidden. No
-  published dots3-note request shape reaches it: `C = 1` and `C = 2` are what a
-  WAV upload carries.
+  and **C = 2**, which is the case this slice exists to serve, and every channel
+  count a WAV container plausibly carries.
+- **The 512 bound is TIGHT, and it is the measured one rather than the
+  derivation's.** The derivation as first written — "a significand of at most
+  `16 + k` bits against `float`'s 24" — gives `k <= 8`, `C <= 256`. It is
+  conservative by one step: the only value that would need a 25th bit is
+  `+/- 2^(15+k)` itself, which is a power of two and therefore exact, so `k = 9`
+  holds too. It fails at `k = 10`: at `C = 1024` the sum reaches `2^25`, and an
+  odd `acc` above `2^24` is not a `float32` at all. **This section states
+  `C <= 512` and not `C <= 256`, because 512 is both provable and tight, and a
+  bound that is looser than the truth invites the same overstatement back.**
+- Past `C = 512`, or at a channel count that is not a power of two, the two arms
+  may differ and this port is the MORE accurate of the two, because its sum is
+  exact where `np.mean`'s is not. Measured (§4.16.7): worst
+  `|ours - long double|` is **0** at `C` in {1, 2, 4, 8, 64, 256, 512} and
+  **2.98e-08** — half an `ulp`, so still correctly rounded — at `C` in
+  {1024, 2048, 32768}. Agreement with a `float32` arm at `C = 1024` is 126/2000
+  for a sequential accumulator and 2000/2000 for `numpy`'s pairwise reduction;
+  at `C = 2048`, 78/2000 and 1636/2000; at `C = 32768`, 1439/2000 pairwise. No
+  published dots3-note request shape reaches any of it: `C = 1` and `C = 2` are
+  what a WAV upload carries.
+- **The intermediate type is now GATED and not only derived.**
+  `test_dots3_note_audio.cpp`'s *"at 1024 channels a float32 accumulator is
+  WRONG, and at 512 it is not"* runs the closed-form near-full-scale pattern
+  `32000 + ((c * 7 + f * 37) % 768)` at both counts. At 512 this decoder, the
+  long-double reference and an in-test `float32` accumulator agree to the bit;
+  at 1024 this decoder is still exact and the `float32` accumulator is
+  7.5e-06 away, about 126 `ulp`s. The case asserts BOTH halves, so it cannot
+  quietly stop discriminating. What it does NOT gate is `numpy`'s own pairwise
+  reduction, which survives at 1024 and needs `C = 4096` to separate; that stays
+  measured and unGATED, and a future gate would need a 4096-channel fixture and
+  a pairwise reference in the test.
 
 **W7c-1 moved four `audio_processor.cpp` line anchors, and re-pointed them in
 the same change.** The shared parser and the new sibling add lines above
 `WhisperAudioProcessor`, so §4.14's `:35-79` (the mono decoder), `:91-199` (the
 log-mel), `:206-225` (`ExpandAudioPlaceholders`) and `## Owed`'s `:94-101` (A1's
-"resample deferred" throw) all shifted. They now read `:103-151`, `:181-289`,
-`:296-315` and `:184-191`, together with the same anchor in
-`include/vllm/multimodal/dots3_note_processor.h`. The surrounding prose is
-unchanged, because only the line numbers moved. An anchor that a change
-falsifies is that change's to repair.
+"resample deferred" throw) all shifted. Three of the four moved together and now read `:211-319`, `:326-345` and
+`:214-221`, along with the same anchor in
+`include/vllm/multimodal/dots3_note_processor.h` and the pad/truncate anchor in
+`dots3_note_processor.cpp` (`:228-232`); for those the surrounding prose is
+unchanged, because only the line numbers moved. They shifted TWICE — +90 when
+W7c-1 inserted the shared walk and the sibling, and +30 again when this repair
+wave rewrote the sibling's comment — which is why the values here are the ones
+measured against the final file and not against the first insertion.
+
+**The mono decoder is the one that did not merely shift, and the first repair of
+it was wrong.** `:35-79` was 45 lines because the decoder carried its own chunk
+walk; W7c-1 SPLIT it, so there is no single successor range. It re-points to
+`:103-131` — the decoder — over the shared `ParseWavPcm16` at `:49-99`, and
+both are named wherever the old range was. The first re-point wrote `:103-151`,
+which is neither: at that commit `:151` sat 32 lines inside the mean sibling's
+comment block, and the range excluded the parsing the sentence was actually
+about. An anchor that a
+change falsifies is that change's to repair, and a repair that is not measured
+against the file is not a repair.
 
 **The mono entry point is not touched.** `DecodeWavPcm16Mono` keeps its own
 `static_cast<float>(s) / 32768.0f` loop verbatim, so `parakeet_transcription.cpp`,
@@ -6298,7 +6357,7 @@ says the work is a rate-conversion decision against a seam that exists, owed to
 W7c-2, rather than a port that has to be written from nothing.
 
 **One `librosa` mention in this file is left alone, deliberately.**
-`src/vllm/multimodal/audio_processor.cpp:185` says a genuine resample would be
+`src/vllm/multimodal/audio_processor.cpp:215` says a genuine resample would be
 "windowed sinc, à la librosa". That describes an ALGORITHM's style, not vLLM's
 executing chain, it belongs to the A1 Whisper/Voxtral row rather than this one,
 and it is not false. Editing another row's message to satisfy a sweep is how a
@@ -6389,6 +6448,35 @@ CLAIM rather than as a word: `#2814` absent, `PCM16 MONO` present,
 
 Every power of two is exact and 3 is not, which is exactly the shape §4.16.2
 predicts. 1.99e-08 is under a third of a float ulp near 1.0.
+
+**That table cannot see the bound, and a repair wave measured where it is.**
+Its signal shrinks as `C` grows, because a mean of random samples tends to zero
+while the exactness argument is about `|acc|` reaching `32768 * C`. Re-measured
+with the samples DRIVEN to near full scale, so `|acc|` runs at its own stated
+ceiling, over 2000 draws per channel count against a `long double` reference:
+
+| Channels | Worst \|ours - ref\| | == sequential `float32` | == `numpy` pairwise `float32` |
+|---|---|---|---|
+| 1, 2, 4, 8, 64, 256, 512 | **0** | 2000 / 2000 | 2000 / 2000 |
+| 1024 | 2.980e-08 | 126 / 2000 | 2000 / 2000 |
+| 2048 | 2.980e-08 | 78 / 2000 | 1636 / 2000 |
+| 32768 | 2.980e-08 | — | 1439 / 2000 |
+
+**So the bit-identity claim holds to `C = 512` and no further**, which is what
+§4.16.2 now states. 2.98e-08 is exactly half a `float` ulp at that magnitude, so
+this arm is still the correctly-rounded answer where the `float32` arms are not.
+The double-rounding sweep is separate and exhaustive rather than sampled: all
+**1,300,542,267** `(C, acc)` pairs for every non-power-of-two `C` in `[2, 200]`,
+**0** anomalies.
+
+**The intermediate type is GATED, and the gate was proved RED first.** The new
+`test_dots3_note_audio.cpp` case runs `32000 + ((c * 7 + f * 37) % 768)` at
+`C = 512` and `C = 1024`:
+
+| Channels | this decoder vs `long double` | in-test `float32` accumulator |
+|---|---|---|
+| 512 | exact, 4 / 4 frames | identical to this decoder, 4 / 4 |
+| 1024 | exact, 4 / 4 frames | differs on 4 / 4, worst error 7.51e-06 (~126 ulp) |
 
 **The served case's own numbers.** The stereo fixture's two channels differ
 from their mean in **7996 and 7996 of 8000** samples, so a port that picked one
@@ -7048,7 +7136,7 @@ Carried openly under option B (§6.4), not waived:
   mentions are comments (§4.16.4). This port REFUSES a rate that is not
   `audio_config.sampling_rate`, at the ROUTE, naming W7c-2 so an operator learns
   which brick owes it rather than reading the audio-track A1 row's "resample
-  deferred" message about a different model (`audio_processor.cpp:184-191`).
+  deferred" message about a different model (`audio_processor.cpp:214-221`).
   Rate conversion is still numerically delicate, but it is no longer a port from
   nothing: [#2583](https://github.com/mudler/vllm.cpp/issues/2583) landed
   `Ltx2ResampleWaveform`

@@ -109,8 +109,20 @@ DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav, size_t n) {
   const size_t num = raw.num_frames;
   out.samples.resize(num);
   // UNCHANGED, deliberately. `parakeet_transcription.cpp:123`,
-  // `chat_mm.cpp:137` and `test_voxtral_e2e.cpp:170` call this, and W7c-1 must
-  // not move any of them by a bit. The multi-channel arm is the sibling below.
+  // `chat_mm.cpp:137` and `test_voxtral_e2e.cpp:170` call this, and W7c-1 moves
+  // NO SAMPLE they decode: fuzzed differentially against the pre-W7c-1 decoder
+  // over 400000 randomized RIFF buffers, the accept/refuse decision, every
+  // decoded byte and the sampling rate are identical.
+  //
+  // TWO REFUSAL MESSAGES DID MOVE, on 63268 of those buffers, and this loop is
+  // not where they live -- the shared walk is. `bits != 16` is now tested
+  // BEFORE `channels != 1`, so "not mono" became "not 16-bit PCM" (33830
+  // buffers), and a zero channel count now has its own guard rather than
+  // falling into "not mono" (29438). Both name the real defect where the old
+  // string did not, and no test pinned the old ones -- but they ARE operator
+  // visible through `chat_mm.cpp:137` and `parakeet_transcription.cpp:123`, so
+  // "nothing moved" is false and this says what did. The multi-channel arm is
+  // the sibling below.
   for (size_t i = 0; i < num; ++i) {
     const int16_t s = static_cast<int16_t>(ReadLE(raw.frames + 2 * i, 2));
     out.samples[i] = static_cast<float>(s) / 32768.0f;
@@ -136,20 +148,38 @@ DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav, size_t n) {
 // interleaved int16 frames. It accumulates in INT32, divides once in DOUBLE and
 // narrows once to FLOAT:
 //
-//   * the int32 sum CANNOT OVERFLOW: |s| <= 32768 and `channels` is a uint16
-//     field, so |sum| <= 32768 * 65535 = 2147450880 < 2^31. It is EXACT, which
-//     no float32 accumulator can promise past 256 channels;
-//   * there is EXACTLY ONE rounding, at the narrowing store -- nothing is
-//     rounded to float and then combined again;
-//   * for a POWER-OF-TWO channel count that rounding is not one: with C = 2^k
-//     the quotient is `acc * 2^-(15+k)`, a significand of at most 16 + k bits
-//     against float's 24, so it is exact -- and upstream's float32 mean is
-//     exact for the same reason. The two therefore agree BIT FOR BIT at C = 1
-//     (so no mono waveform moves) and at C = 2 (the case this exists to serve).
-//     Past a power of two the two may differ by one float ulp and this arm is
-//     the more accurate of the pair, because its sum is exact where numpy's is
-//     not. Stated in `.agents/specs/dots3-note.md` 4.16.2, gated in
-//     `test_dots3_note_audio.cpp`.
+//   * the int32 sum CANNOT OVERFLOW anywhere in the PARSER'S OWN DOMAIN, which
+//     is C <= 65535 because `channels` is a uint16 field of the `fmt ` chunk:
+//     |s| <= 32768, so |acc| <= 32768 * 65535 = 2147450880 < 2^31. It is EXACT
+//     over that whole domain, which no float32 accumulator can promise past 512
+//     channels;
+//   * the ANSWER IS THE CORRECTLY-ROUNDED float of the exact mean, for every C
+//     in that same domain. `acc` and `32768 * C` are both exact in double, so
+//     the divide is correctly rounded to double. The narrowing store is a
+//     SECOND rounding whenever that quotient is not itself exact, so "exactly
+//     one rounding" would be wrong -- but double's 53 bits clear the 2*24 + 2
+//     = 50 that makes a division's double rounding innocuous, and an exhaustive
+//     sweep of all 1300542267 (C, acc) pairs for every non-power-of-two C in
+//     [2, 200] finds zero anomalies. The CONSEQUENCE holds; the mechanism is
+//     two roundings that cannot disagree with one;
+//   * for a POWER-OF-TWO channel count UP TO 512 the result is BIT-IDENTICAL to
+//     upstream's float32 mean, in whatever order numpy sums. With C = 2^k,
+//     |acc| <= 2^(15+k) <= 2^24, and every integer of magnitude at most 2^24 is
+//     exact in float32 -- so both arms hold the exact sum (every partial sum of
+//     upstream's is a multiple of 2^-15 under the same bound) and the divide by
+//     2^k only moves an exponent. THE BOUND IS TIGHT: at C = 1024 the sum
+//     reaches 2^25 and an odd `acc` above 2^24 is not a float32 at all. This
+//     covers C = 1 (so no mono waveform moves), C = 2 (the case this exists to
+//     serve), and every channel count a WAV container plausibly carries;
+//   * past C = 512, or at a channel count that is not a power of two, the two
+//     arms may differ and THIS one is the more accurate: it stays correctly
+//     rounded -- measured worst |ours - long double| of 2.98e-08, half an ulp,
+//     at C = 1024, 2048 and 32768 -- where numpy's float32 sum is not exact. A
+//     sequential float32 accumulator agrees with this arm on 126 of 2000
+//     near-full-scale draws at C = 1024. Stated in
+//     `.agents/specs/dots3-note.md` 4.16.2 and gated in
+//     `test_dots3_note_audio.cpp`, whose C = 512 / C = 1024 pair is what a
+//     float32 accumulator here fails.
 DecodedAudio DecodeWavPcm16MeanToMono(const uint8_t* wav, size_t n) {
   const RawWavPcm16 raw = ParseWavPcm16(wav, n, "DecodeWavPcm16MeanToMono");
 

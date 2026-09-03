@@ -253,7 +253,7 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
         ".agents/specs/dots3-note.md §4.16 and issue #2813.");
   }
 
-  // The front end refuses a wrong rate (W7c) BY NAME, and — since W7b (#2797)
+  // The front end refuses a wrong rate (W7c-2) BY NAME, and — since W7b (#2797)
   // lifted the `chunk_seconds` ceiling — a waveform past ONE chunk on a
   // checkpoint whose `chunk_samples` is not a whole number of `token_stride`s,
   // where upstream's own per-segment row sum and its prompt-side

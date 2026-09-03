@@ -592,7 +592,7 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
     // `pad_or_trim(audio_segment.flatten(), length=self.chunk_samples)` then
     // `log_mel_spectrogram(pad_audio)` (`audio.py:213-214`), PER SEGMENT.
     // `WhisperAudioProcessor::ProcessWaveform` performs the pad itself
-    // (audio_processor.cpp:108-112, `padding="max_length"` with truncation), so
+    // (audio_processor.cpp:228-232, `padding="max_length"` with truncation), so
     // this call IS that pair. The `-8` floor inside it is a GLOBAL max over the
     // segment it is handed, which is why the front end is driven once per
     // segment and not once over the whole waveform.

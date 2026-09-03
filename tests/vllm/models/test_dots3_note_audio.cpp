@@ -2148,11 +2148,98 @@ TEST_CASE("dots3-note W7c-1: the WAV decoder reduces channels by upstream's MEAN
               << want.size());
       // One float ulp near 1.0 is 6e-8; this is the mean of values in [-1, 1].
       CHECK(static_cast<double>(worst) < 6e-8);
-      // Spec 4.16.2: for a POWER-OF-TWO channel count the port's answer is the
-      // exact mean, with no rounding anywhere, because the divisor is a power
-      // of two and the int32 sum needs at most 16 + log2(C) bits.
+      // Spec 4.16.2: for a POWER-OF-TWO channel count UP TO 512 the port's
+      // answer is the exact mean, with no rounding anywhere, because the
+      // divisor is a power of two and |acc| <= 2^(15 + log2(C)) <= 2^24 is
+      // still an exact float32. The bound is TIGHT and the next case gates it.
       if (channels == 1 || channels == 2 || channels == 4 || channels == 8) {
         CHECK(exact == want.size());
+      }
+    }
+  }
+
+  SUBCASE("at 1024 channels a float32 accumulator is WRONG, and at 512 it is not") {
+    // WHY THIS CASE EXISTS. 4.16.2's intermediate-type argument was DERIVED and
+    // measured against a long-double reference, and NOT gated: a fresh review
+    // replaced the int32 accumulator plus single double divide with the float32
+    // accumulator that section argues against, and both suites stayed green. So
+    // nothing in the change could tell the shipped decoder from the one the
+    // spec rejects. This case is that discriminator, placed exactly at the
+    // bound the spec now states.
+    //
+    // The channel pattern is closed form and near full scale, so |acc| runs at
+    // the `32768 * C` ceiling the derivation reasons about. At C = 512 the
+    // exact sum is at most 2^24 and every arm agrees to the bit; at C = 1024 it
+    // reaches 2^25, a float32 accumulator's PARTIAL sums stop being exact, and
+    // it lands ~126 ulps away while this decoder stays exact.
+    const auto pattern = [](int channels, size_t frames) {
+      std::vector<int16_t> pcm(frames * static_cast<size_t>(channels));
+      for (size_t f = 0; f < frames; ++f)
+        for (int c = 0; c < channels; ++c)
+          pcm[f * static_cast<size_t>(channels) + static_cast<size_t>(c)] =
+              static_cast<int16_t>(32000 +
+                                   ((c * 7 + static_cast<int>(f) * 37) % 768));
+      return pcm;
+    };
+    // The rejected arm, written out: accumulate `s / 32768` in float32, divide
+    // by the channel count in float32. This is the mutation, kept in the test
+    // so the case cannot silently stop discriminating.
+    const auto f32_accumulator = [](const std::vector<int16_t>& pcm,
+                                    int channels) {
+      const size_t frames = pcm.size() / static_cast<size_t>(channels);
+      std::vector<float> out(frames);
+      for (size_t f = 0; f < frames; ++f) {
+        float acc = 0.0f;
+        for (int c = 0; c < channels; ++c)
+          acc += static_cast<float>(
+                     pcm[f * static_cast<size_t>(channels) +
+                         static_cast<size_t>(c)]) /
+                 32768.0f;
+        out[f] = acc / static_cast<float>(channels);
+      }
+      return out;
+    };
+
+    for (const int channels : {512, 1024}) {
+      const std::vector<int16_t> pcm = pattern(channels, 4);
+      const std::vector<uint8_t> wav =
+          dots3_tiny::FixtureWavFromPcm16(pcm, 16000, channels);
+      const vllm::multimodal::DecodedAudio got =
+          DecodeWavPcm16MeanToMono(wav.data(), wav.size());
+      const std::vector<long double> want = ref_mean(pcm, channels);
+      const std::vector<float> rejected = f32_accumulator(pcm, channels);
+      REQUIRE(got.samples.size() == 4);
+      REQUIRE(want.size() == 4);
+
+      size_t exact = 0, differs_from_f32 = 0;
+      double worst_f32_gap = 0.0;
+      for (size_t i = 0; i < want.size(); ++i) {
+        // Bit equality against the long-double reference, not a tolerance:
+        // both channel counts are inside "the answer is the exact mean".
+        if (static_cast<long double>(got.samples[i]) == want[i]) ++exact;
+        if (std::memcmp(&got.samples[i], &rejected[i], sizeof(float)) != 0)
+          ++differs_from_f32;
+        worst_f32_gap = std::max(
+            worst_f32_gap,
+            std::fabs(static_cast<double>(rejected[i]) -
+                      static_cast<double>(want[i])));
+      }
+      MESSAGE("channels=" << channels << ": exact on " << exact << "/"
+              << want.size() << ", differs from the float32 accumulator on "
+              << differs_from_f32 << "/" << want.size()
+              << ", that accumulator's worst error = " << worst_f32_gap);
+
+      // This decoder is EXACT at both counts. Under a float32 accumulator it is
+      // not, at 1024, which is what makes this the intermediate type's gate.
+      CHECK(exact == want.size());
+      if (channels == 512) {
+        // At the bound the two arms are indistinguishable, so the case is not
+        // measuring "float32 is always wrong" -- it is measuring WHERE.
+        CHECK(differs_from_f32 == 0);
+        CHECK(worst_f32_gap == 0.0);
+      } else {
+        CHECK(differs_from_f32 == want.size());
+        CHECK(worst_f32_gap > 1e-6);
       }
     }
   }

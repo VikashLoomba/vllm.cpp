@@ -355,9 +355,11 @@ class Dots3NoteAudioProcessor {
   // created that hazard by serving more than one rate. A file carrying N PCM16
   // samples at 16000 Hz and a file carrying the identical N samples at
   // 44100 Hz decode to identical float buffers and hash identically under it,
-  // while their features differ. Every caller that has a request rate in hand
-  // must use this overload; the two-argument one stays for the callers that
-  // are single-rate by construction.
+  // while their features differ. `mm_hash` is a cross-request encoder-cache key
+  // (`EncoderCacheManager::cached_`), so that is a hit that serves the wrong
+  // audio. Every caller that has a request rate in hand must use this overload;
+  // the two-argument one stays for the callers that are single-rate by
+  // construction.
   std::string HashAudio(const float* samples, int64_t num_samples,
                         int sample_rate) const;
 

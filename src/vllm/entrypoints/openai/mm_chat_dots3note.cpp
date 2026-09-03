@@ -296,10 +296,11 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
     // W7c-2 (#2828) PASSES THE REQUEST'S OWN RATE, and that is a correctness
     // requirement rather than a refinement. Two requests whose raw buffers are
     // identical and whose declared rates are not produce DIFFERENT features
-    // since W7c-2, so a key over the raw buffer alone would hand the second one
-    // the first one's encoding. The three-argument overload hashes the
-    // RESAMPLED waveform, which separates those two and also lets two requests
-    // that resample to the same audio share one entry.
+    // since W7c-2, and `mm_hash` is a CROSS-REQUEST encoder-cache key, so a key
+    // over the raw buffer alone would hand the second one the first one's
+    // encoding. The three-argument overload hashes the RESAMPLED waveform,
+    // which separates those two and also lets two requests that resample to the
+    // same audio share one entry.
     spec.mm_hash = proc.HashAudio(decoded.samples.data(),
                                   static_cast<int64_t>(decoded.samples.size()),
                                   decoded.sampling_rate);

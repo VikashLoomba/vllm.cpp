@@ -651,8 +651,17 @@ std::string Dots3NoteAudioProcessor::HashAudio(const float* samples,
   // moment two rates are served: a file carrying N PCM16 samples at 16000 Hz
   // and a file carrying THE IDENTICAL N SAMPLES at 44100 Hz decode to identical
   // float buffers, hash identically under the two-argument form, and must
-  // produce different features. The second request would silently receive the
-  // first's.
+  // produce different features. `mm_hash` is a CROSS-REQUEST key —
+  // `EncoderCacheManager::cached_` is keyed on it and `scheduler.cpp:511-590`
+  // reuses a hit — so the second request would be handed the first's
+  // embeddings.
+  //
+  // BE EXACT ABOUT WHAT THAT COSTS, because the two also differ in RESAMPLED
+  // LENGTH: a collision needs identical raw buffers, and identical buffers at
+  // different rates cannot resample to the same row count. So the observable
+  // failure is a wrong-length splice rather than a quiet substitution. Either
+  // way the key is wrong, and a key that is only accidentally caught downstream
+  // is not a key.
   //
   // The key is therefore the RESAMPLED waveform — the buffer the tower actually
   // consumes. That also makes two requests that resample to the same waveform

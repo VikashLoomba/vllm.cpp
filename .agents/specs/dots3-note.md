@@ -6706,8 +6706,16 @@ processor directly — which the front-end suite does — would still be refused
 rate was 16000 that key was unambiguous. It stops being unambiguous the moment
 two rates are served: a file carrying `N` PCM16 samples at 16000 Hz and a file
 carrying **the identical `N` samples** at 44100 Hz decode to identical `float`
-buffers, hash identically, and must produce DIFFERENT features. The second
-request would silently receive the first's.
+buffers, hash identically, and must produce DIFFERENT features. `mm_hash` is a
+CROSS-REQUEST key — `EncoderCacheManager::cached_` is keyed on it and
+`scheduler.cpp:511-590` reuses a hit — so the second request is handed the
+first's embeddings.
+
+**Be exact about what that costs, because the obvious phrasing overstates it.**
+A collision needs identical raw buffers, and identical buffers at different
+rates cannot resample to the same row count, so the observable failure is a
+wrong-length splice rather than a quiet substitution. The key is wrong either
+way, and a key that is only accidentally caught downstream is not a key.
 
 `Dots3NoteAudioProcessor::HashAudio` therefore gains a three-argument overload
 taking the request's `sample_rate`, which hashes the RESAMPLED waveform — the

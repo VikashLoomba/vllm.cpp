@@ -1871,14 +1871,52 @@ TEST_CASE("dots3-note W7c-2: a 44.1 kHz WAV is SERVED, at the RESAMPLED span") {
       logprobs_of(dots3_tiny::FixtureWavFromPcm16(off_pcm));
   const double gap_offline = worst_gap(lp44, lpoff);
 
-  // (d) ...and NOT a DIFFERENT clip's, which is what makes (c) load-bearing.
+  // (d) ...and NOT SILENCE'S. A resampler that returned zeros of the right
+  // length passes (a), (b) and (c) — (c) because the offline arm computes its
+  // reference with the SAME production code and would be zeroed too. The
+  // control has to come from outside the resampler, so it is a WAV of literal
+  // silence at the target rate, which never enters the resample path at all.
+  const double gap_silence = worst_gap(
+      lp44, logprobs_of(dots3_tiny::FixtureWavFromPcm16(
+                std::vector<int16_t>(
+                    static_cast<std::size_t>(dots3_tiny::kAudioSamples), 0))));
+
+  // (e) ...and NOT a DIFFERENT clip's, which is what makes (c) load-bearing.
   // Variant 1 is the two-tone beat, a genuinely different signal and not a
   // shifted copy, so a tower that ignored its input would fail here.
   const double gap_other =
       worst_gap(lp44, logprobs_of(dots3_tiny::FixtureAudioWav(1)));
+
+  // (f) AND IT LANDS ON THE SAME SIGNAL SAMPLED NATIVELY. The 44.1 kHz fixture
+  // is the SAME CONTINUOUS SIGNAL as the 16 kHz one, from the same closed form,
+  // so a correct resample recovers something very near the native recording.
+  //
+  // THIS IS THE ONE REFERENCE IN THIS CASE THE RESAMPLER DID NOT PRODUCE, which
+  // is what makes it worth gating: (c)'s offline arm runs the same production
+  // code and moves with it, while this clip is generated from the closed form
+  // and cannot. An aliasing decimation or a one-sample phase shift moves away
+  // from it, and the measurement says a correct one does not — 0.00705, which
+  // is CLOSER than (c)'s own 0.00957, because (c) pays a PCM16 quantization
+  // this does not. The bound is 5e-2, seven times the measured value, and it is
+  // loose on purpose: it also has to cover the clip edges, where the filter
+  // window runs off the end and nobody has derived how far the two may differ.
+  const double gap_native =
+      worst_gap(lp44, logprobs_of(dots3_tiny::FixtureAudioWav(0)));
   MESSAGE("44.1 kHz vs its own offline resample: " << gap_offline
-          << "; vs a DIFFERENT clip: " << gap_other);
+          << "; vs SILENCE: " << gap_silence
+          << "; vs a DIFFERENT clip: " << gap_other << "; ratio "
+          << (gap_offline > 0.0 ? gap_other / gap_offline : 0.0)
+          << "; vs the NATIVE 16 kHz clip (ungated): " << gap_native);
+  // MEASURED: 0.00957 against 0.260, a ratio of 27. The bound on (c) is what
+  // one PCM16 step through the offline container costs on this tiny
+  // random-weight model, and it is deliberately not tighter than that: the
+  // EXACT statement lives in the front-end suite, where the same comparison is
+  // made without a container and 0 of 1600 mel values differ. What this case
+  // establishes is that the SERVED chain reaches that, which no front-end test
+  // can say.
   CHECK(gap_offline < 5e-2);
-  CHECK(gap_other > 1e-2);
-  CHECK(gap_other > 100.0 * gap_offline);
+  CHECK(gap_native < 5e-2);
+  CHECK(gap_silence > 1e-1);
+  CHECK(gap_other > 1e-1);
+  CHECK(gap_other > 10.0 * gap_offline);
 }

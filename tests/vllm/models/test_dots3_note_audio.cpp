@@ -2799,7 +2799,7 @@ TEST_CASE("dots3-note W7c-2: the resampler reproduces scipy's `resample_poly`") 
       worst = std::max(worst, static_cast<double>(std::fabs(
                                   got[static_cast<std::size_t>(i)] - k.expected[i])));
     worst_all = std::max(worst_all, worst);
-    MESSAGE(k.name << ": " << k.orig_sr << " -> " << k.target_sr << " Hz, "
+    MESSAGE(std::string(k.name) << ": " << k.orig_sr << " -> " << k.target_sr << " Hz, "
                    << k.n_in << " in, " << got.size()
                    << " out, peak " << peak << ", worst |got - scipy| " << worst);
     // The tolerance is ~2x the measured float floor and is derived in spec
@@ -2822,7 +2822,7 @@ TEST_CASE("dots3-note W7c-2: the resampler reproduces scipy's `resample_poly`") 
     for (std::size_t i = 0; i < naive.size(); ++i)
       sep = std::max(sep, std::fabs(naive[i] - static_cast<double>(
                                                    k.expected[i])));
-    MESSAGE(k.name << ": nearest-sample decimation is " << sep
+    MESSAGE(std::string(k.name) << ": nearest-sample decimation is " << sep
                    << " from the golden, against the value tolerance");
     CHECK(sep > 1e-2);
 

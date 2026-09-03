@@ -21,7 +21,8 @@ owns the format and `QUANT-EXL3-MUL1` owns the `mul1` widths; both are
 correctness rows and both say so. #2570 named a throughput gap with no owner,
 and an unowned gap is one nobody reruns.
 
-Slice A (the `(3, 2)` GEMV instantiation) is described below. Everything else is
+Slice A (the `(3, 2)` GEMV instantiation) and slice B (the `(4, 2)` GEMV KERNEL
+PORT) are described below. Everything else is
 under `## Evidence
 
 ### Host arm, executed 2026-09-03 on `mudler-ubuntu-box`
@@ -418,9 +419,112 @@ device numeric case to gate both codebooks at tier 3c; measure the end-to-end
 decode effect on the real checkpoint on `dgx:gpu0`; record the envelope's actual
 verdict per shape.
 
-**Out of scope and owed, not silently dropped:** the `(4, 2)` kernel port, the
-fused MoE arm, `kExl3HadR` on ROCm, the four-shape coverage of the regular
-kernel's shape table. Each is under `## Owed` with its reason.
+**In scope, slice B:** PORT the GEMV kernel to `bits == 4` and instantiate
+`(bits = 4, cb = 2)` — 270 of the 409 trellis modules, the largest single
+population in the #2495 checkpoint and the item #2570 leads with; gate the new
+arm at tier 3c in BOTH configs of the envelope; make the eight bits-4 admission
+thresholds executable; measure the decode effect on `dgx:gpu0`.
+
+**Out of scope and owed, not silently dropped:** the 2 bpw GEMV arm, `(4, 0)`
+and `(4, 1)`, the fused MoE arm, `kExl3HadR` on ROCm, the four-shape coverage of
+the regular kernel's shape table. Each is under `## Owed` with its reason.
+
+## Slice B design — what a width costs that a codebook does not
+
+`cb` reaches exactly one call in the GEMV, the `dq8_regs_*bits<cb>` extractor,
+and nothing about the kernel's geometry depends on it. That is why slice A was
+one template argument. `bits` is a GEOMETRY argument and reaches four places,
+which is why slice B is a port. All four, with the upstream line that defines
+each:
+
+| What | Upstream | bits 3 | bits 4 |
+|---|---|---|---|
+| `LSTRIDE`, uint32 per warp load | `exl3_gemv_kernel.cuh:153` | 24 | 32 |
+| the global-load lane guard | `:226-232` | `lane < 24` | every lane |
+| the shared-stage store guard | `:265-273` | `lane < 24` | every lane |
+| the window extractor | `:87` / `:121` | `dq8_regs_3bits<cb>(tp[x_src_a], tp[x_src_b], x_s2, …)` | `dq8_regs_4bits<cb>(tp[(lane+31)&31], tp[lane], …)` |
+
+The guards and the extractor are the SAME fact seen twice. A 16x16 tile is
+`8 * bits` uint32, so it is 24 words at 3 bpw and 32 at 4. At 4 bpw that is
+exactly one word per lane and four nibble-aligned codewords inside each, so the
+window pair is always the lane's own word and its left neighbour. At 3 bpw the
+codeword boundaries do not align to the uint32 grid at all — the window start
+moves by 3 bits per codeword — so every lane computes its own word pair and
+funnel offset (`x_src_a`, `x_src_b`, `x_s2`, `:206-216`), and eight lanes of the
+warp carry nothing.
+
+`dq8_regs_4bits` is the register form of `dq8_aligned_4bits`
+(`exl3_dq.cuh:164-186`), and it needs two immediate-operand PTX forms this tree
+did not carry: `shf.r.wrap.b32` and `bfe.u32` with a literal field offset
+(`ptx.cuh:314-315`). They are macros upstream and macros here, because the
+operand is an ASSEMBLER IMMEDIATE and no runtime argument or template non-type
+argument can reach an `asm` string literal. Both are `#undef`d at the end of the
+arm so neither name escapes it.
+
+What is NOT ported, and why it is named rather than dropped:
+
+- **2 bpw.** A fourth geometry: `LOADS` halves to `WNT / 2` and ONE loaded word
+  carries two tiles, selected by a `(t & 1) << 4` lane base (`:152`,
+  `:302-310`). No 2-bit EXL3 artifact has reached this tree, so there is nothing
+  to gate it against, and an ungated third geometry in a translation unit the
+  fat build compiles for ten architectures is cost without a reader.
+- **`(4, 0)` and `(4, 1)`.** The kernel now COMPILES for them and
+  `Exl3GemvHardEligible` admits `(4, 0)` — upstream's `K != 4 && cb == 0`
+  refusal exempts exactly this width. They are still not instantiated, because
+  16 kernels each that no artifact in this tree can reach is precisely the
+  `(3, 0)` mistake recorded at `cuda_exl3.cu`'s GEMV arm-set comment, which
+  reached a published 8% number measured on a path neither arm could take.
+
+## THE WIDE CONFIG IS NOT THE ESCAPE, AND THE PREMISE THAT IT WAS IS FALSIFIED
+
+Slice A predicted, before its device job ran, that `narrow_coresident` has a
+thread-budget ceiling of `floor(max_threads_per_sm / 512) * sm_count` — measured
+at **60** on Thor — against the 544 and 160 this checkpoint's two bits-3 shapes
+need. It then named the wide config as the next hypothesis, on the reading that
+upstream admits it at large `n` for `K == 4` (`exl3_gemv.cu:69`).
+
+**Read at this checkpoint's actual shapes, that escape does not exist.** The
+wide-config band is `size_n >= 8192 && size_k <= 4096`, and the SMALLEST 4-bit
+`k` in the artifact is 5120. Every one of the eight bits-4 shapes fails
+`size_k <= 4096`, so on Blackwell at mode 1 the branch is dead for all 270
+modules, exactly as it is for the 137 bits-3 ones. `K == 4` does avoid the
+bits-3 early `return -1;`, so the door stays open one line longer; it leads
+nowhere here.
+
+What bits 4 actually buys is LOWER THRESHOLDS on the same narrow branch, because
+`size_n / 32` is the only term that moves and the 4-bit population is spread
+over six values of `n` rather than two:
+
+| `n` | `n / 32` | bits-4 modules | cumulative admitted |
+|---:|---:|---:|---:|
+| 1024 | 32 | 34 | 34 |
+| 5120 | 160 | 85 | 119 |
+| 6144 | 192 | 48 | 167 |
+| 10240 | 320 | 48 | 215 |
+| 12288 | 384 | 17 | 232 |
+| 17408 | 544 | 38 | 270 |
+
+Against the bits-3 side, where `n = 5120` (45 modules) needs 160 and
+`n = 17408` (92 modules) needs 544. So at a `narrow_coresident` of 160 — which
+`SM_COUNT=20, MAX_THREADS_PER_SM=1536` on Thor cannot reach and a 48-SM GB10 at
+3 or 4 blocks/SM can — the arm set reaches 119 bits-4 modules plus 45 bits-3
+ones, 164 of 409, where slice A alone reached 45. At 32 it reaches 34 and 0.
+
+**This is recorded as a correction, not as a design.** The prediction it
+replaces was written into this spec before the measurement and is left standing
+above; naming which half of it survived is the point of writing it down first.
+`tests/vt/test_exl3_gemv.cpp` asserts every row of the table above from both
+sides of its threshold, and asserts that the wide band is unreachable at
+`size_k == 4224` and reachable at `4096`, so the paragraph is a gate.
+
+**The occupancy ceiling therefore still binds, and it still binds hardest.**
+`narrow_coresident` is `blocks_per_sm * sm_count` with 512-thread blocks; the
+`(4, 2)` narrow kernel is a different kernel from the `(3, 2)` one and gets its
+own `cudaOccupancyMaxActiveBlocksPerMultiprocessor`, which can be lower than the
+thread-budget ceiling if it is register- or shared-memory-bound. Its shared
+footprint is the same 20 KB (`sh_red` 16 KB, `sh_stage` 4 KB when staged) and
+its prefetch ring is the same `PF * LOADS == 8` words, so no term predicts a
+drop — but that is a hypothesis, and only a launch on the device measures it.
 
 ## Upstream chain
 
@@ -476,9 +580,12 @@ its 409 trellis modules is codebook 2, and the arm predicate admitted only
 |---|---|---|---|
 | `(3, 1)` GEMV arm | `SEL_GRID(3, 1, *)` | `GemvKernelForArm<3, 1>` | landed, `MODEL-DSV4-EXL3` W2c |
 | `(3, 2)` GEMV arm | `SEL_GRID(3, 2, false)` | `GemvKernelForArm<3, 2>` | **this row, slice A** |
-| `(4, 2)` GEMV arm | `SEL_GRID(4, 2, false)` | — | OWED, kernel port |
-| `(4, 0)`, `(4, 1)` | `SEL_GRID(4, 0/1, false)` | — | OWED with `(4, 2)`; same kernel work |
-| `(2, 1)`, `(2, 2)` | `SEL_GRID(2, *, *)` | — | no 2-bit artifact has reached this tree |
+| `(4, 2)` GEMV arm | `SEL_GRID(4, 2, false)` | `GemvKernelForArm<4, 2>` | **this row, slice B** |
+| `dq8_regs_4bits<cb>` | `exl3_gemv_kernel.cuh:86-100` | `dq8_regs_4bits` in `cuda_exl3.cu` | **this row, slice B** |
+| `FSHF_IMM`, `BFE16_IMM` | `ptx.cuh:314-315` | `VT_EXL3_FSHF_IMM`, `VT_EXL3_BFE16_IMM`, scoped and `#undef`d | **this row, slice B** |
+| per-width `LSTRIDE` and lane guards | `:153`, `:226-232`, `:265-273` | `exl3_gemv_kernel` | **this row, slice B** |
+| `(4, 0)`, `(4, 1)` | `SEL_GRID(4, 0/1, false)` | the kernel COMPILES for them; not instantiated | OWED, and it is now one line each |
+| `(2, 1)`, `(2, 2)` | `SEL_GRID(2, *, *)` | — | OWED; a third geometry, and no 2-bit artifact has reached this tree |
 | `(3, 1)`, `(3, 2)` smem-staged | `SEL_GRID(3, *, true)` | `SMEM_STAGE` template arm, both instantiated | landed |
 | the envelope | `exl3_gemv_cfg` | `Exl3GemvSelectConfig` | landed, verbatim, per-K so `(3, 2)` inherits `(3, 1)`'s |
 | the hard tests | `exl3_gemv.cu:110-114` | `Exl3GemvHardEligible` | landed, upstream's order |
@@ -571,13 +678,20 @@ of `bits`, `CFG` and `MMODE`.
 So `(3, 2)` changes ONE template argument and ONE predicate. It covers 137 of
 the 409 modules.
 
-`(4, 2)` does not. `LSTRIDE` is the literal `24` with the comment
-`// uint32 per load, bits == 3`, and `TWORDS` is `8 * bits`, so at bits 3 the
-two are equal and one warp load covers one whole 16x16 tile. At bits 4
-`TWORDS == 32` and they are not equal; the prefetch ring depth `PF`, the fold
-cadence `FOLD` and the load count `LOADS` are all tuned around that equality,
-and no `dq8_regs_4bits` register extractor exists in this tree. That is a kernel
-port from `exl3_gemv_kernel.cuh`, and it is not attempted here.
+`(4, 2)` did not, and slice B did that port. **One sentence written here at
+slice A was WRONG and is corrected rather than quietly dropped**: it read
+"`TWORDS == 32` and they are not equal; the prefetch ring depth `PF`, the fold
+cadence `FOLD` and the load count `LOADS` are all tuned around that equality".
+`LSTRIDE` and `TWORDS` ARE equal at bits 4 as well — upstream's `LSTRIDE` is
+`bits == 3 ? 24 : 32` and `TWORDS` is `8 * bits`, which agree at 24 and at 32 —
+and `PF`, `FOLD` and `LOADS` do not depend on `bits` at all at these two widths
+(`exl3_gemv_kernel.cuh:145-153`). The kernel now carries
+`static_assert(LSTRIDE == TWORDS)` so the corrected claim is executable. What
+`bits` actually costs is in `## Slice B design` above: a per-width `LSTRIDE`,
+two lane guards that exist only because a bits-3 tile is 24 words, and a
+different window extractor. The 2 bpw arm IS the case the wrong sentence
+described — there `LOADS` halves and one word carries two tiles — and it stays
+unported.
 
 ## The envelope is ALREADY ported, and that matters
 
@@ -585,9 +699,14 @@ port from `exl3_gemv_kernel.cuh`, and it is not attempted here.
 verbatim, including the `K == 4` wide-config admission and the commented-out
 `cc != CC_AMPERE` guard that upstream disabled
 (`src/vt/exl3_policy.cpp:154-179`), and `tests/vt/test_exl3_gemv.cpp:101-122`
-gates its branches on any machine. Slice A adds no envelope change, because
-there is none to add: upstream's envelope is per-`K`, not per-`cb`, so `(3, 2)`
-inherits `(3, 1)`'s exactly.
+gates its branches on any machine. Neither slice adds an envelope change,
+because there is none to add: upstream's envelope is per-`K`, not per-`cb`, so
+`(3, 2)` inherits `(3, 1)`'s exactly and `(4, 2)` inherits `(4, 1)`'s and
+`(4, 0)`'s. Slice B ASSERTS that rather than assuming it — the case loops all
+eight bits-4 shapes at four occupancies each and requires `(4, 2)`, `(4, 1)` and
+`(4, 0)` to return the same config every time. If the envelope ever stops being
+per-`K`, this row's "no envelope change" claim fails there and not in a
+benchmark.
 
 ## The numeric tier is 3c, and it is NOT widened
 
@@ -595,8 +714,8 @@ The GEMV accumulates in `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` and
 folds to an f32 pair only every `FOLD` iterations, so an fp16 accumulator
 absorbs up to `FOLD * 16` k-elements. `QUANT-EXL3`'s `## W2cd design` W2c-3 sets
 its bound at tier 3c, relative RMS `6.0e-3`, rather than tier 3's `1.0e-3`. A
-new arm INHERITS that bound. If `(3, 2)` cannot meet `6.0e-3` the arm is wrong;
-the bound does not move.
+new arm INHERITS that bound. If `(3, 2)` or `(4, 2)` cannot meet `6.0e-3` the
+arm is wrong; the bound does not move.
 
 `(3, 1)` and `(3, 2)` are the confusable pair and the reason the device case
 gates both. Both are three bits wide, both take the same `dq8` route, both use
@@ -604,6 +723,18 @@ the same tile shapes. A `cb` threaded wrongly between them does not fail to
 compile and does not change a shape: it decodes with the other codebook's tail
 and yields a weight with the right DISTRIBUTION and no correlation to the true
 one. The mutation table below makes that failure red.
+
+**`(4, 2)`'s confusable partner is `(4, 1)`, and it is deliberately NOT
+compiled**, so slice A's cross-arm device check cannot be repeated for it — two
+device outputs need two instantiations. The check that replaces it compares the
+device output against the CPU decoder at the SIBLING codebook and requires the
+distance to be LARGE: `rel_sib > 100 * 6.0e-3`. Two decodes of the same bits
+under different codebooks are uncorrelated, so `rel_sib` is order 1 while `rel`
+is order `1e-4`; the constant sits two orders below the one and three above the
+other and is not tuned to a measurement. That form generalises to any arm,
+including one whose partner is not on the device, and it is applied to all four
+legs rather than to the new one alone. Slice A's direct `(3, 1)`-vs-`(3, 2)`
+device comparison is KEPT beside it, because it needs no host reference at all.
 
 ## Work breakdown
 
@@ -618,11 +749,36 @@ one. The mutation table below makes that failure red.
   prose.
 - **A4.** Measure on `dgx:gpu0` under an `rc` lease: the four legs above,
   interleaved, one binary per arm, `narrow_coresident` printed.
+- **B1.** Port `dq8_regs_4bits<cb>` and the two immediate PTX forms it needs.
+- **B2.** Generalise `exl3_gemv_kernel` to `bits == 4`: per-width `LSTRIDE`, the
+  two 24-lane guards narrowed to bits 3, the funnel constants made bits-3-only,
+  the extractor dispatched per width.
+- **B3.** Add `(4, 2)` to `Exl3GemvArmInstantiated` and `GemvKernel`, and repair
+  the comment block above them, which says `(4, 2)` is owed.
+- **B4.** Extend the device case to gate `(4, 2)` in BOTH configs, and give
+  every leg a sibling-codebook discrimination that does not need the confusable
+  arm to be compiled. RED first: before B3 the forced `(4, 2)` call throws by
+  name, and mutation M1 restores exactly that state.
+- **B5.** Make the eight bits-4 admission thresholds executable, both sides of
+  each, and assert the per-`K` envelope claim across `cb` 0, 1 and 2.
+- **B6.** Measure on `dgx:gpu0`: `(4, 2)` on, off, and at mode 2, interleaved on
+  one binary, with `nsys --cuda-graph-trace=node` confirming that
+  `exl3_gemv_kernel` RAN.
 
 ## Tests
 
 - `tests/vt/test_exl3_gemv.cpp` — the envelope cases (any machine) and the
   device tier-3c case (CUDA only, skips loudly and still asserts).
+- The device case covers `(3, 1)`, `(3, 2)`, `(4, 2)` narrow and `(4, 2)` wide.
+  The two configs are different compiled kernels with different `WK`, `WNT`,
+  `PF` and `FOLD`, and gating one would leave the other measured by nothing.
+  `force_gemv` drives the envelope at mode 2, whose whole rule is
+  `size_n <= 8192 ? 0 : 1`, so `n` selects the config: `n = 4096` is narrow and
+  `n = 8320` is wide.
+- `SMEM_STAGE` is a THIRD arm per config and is selected by `VT_EXL3_GEMV_SMEM`,
+  which `Exl3GemvSmemMode()` caches in a function-local static. It cannot be
+  flipped inside one process, so the lease job runs the same binary a second
+  time with `VT_EXL3_GEMV_SMEM=1` rather than leaving the staged path ungated.
 - The device case is FORCED through `Exl3GemmArgs::force_gemv`, mirroring
   upstream's direct entry point (`exl3_gemv.cu:171-241`). Forcing is what makes
   it a gate rather than a coin flip on an occupancy query: without it a device
@@ -648,16 +804,28 @@ A CPU-only green is not a device result and is never reported as one. A doctest
 
 ## Owed
 
-- **`(4, 2)`, the 270-module arm.** The largest single population in the
-  checkpoint, and the one #2570 leads with. It is a kernel port for the reason
-  under "Why `(3, 2)` is an instantiation" above, and it is not attempted in
-  this flow. Tracked by [#2570](https://github.com/mudler/vllm.cpp/issues/2570),
-  which stays OPEN for it.
-- **The envelope may decline `(3, 2)` at every shape this checkpoint has, on
-  GB10.** If it does, the instantiation is correct, upstream-faithful, and worth
-  zero end to end on this device — and the next traceable hypothesis is the
-  occupancy of the narrow config, which is the only device-supplied term in the
-  admission test. That is a measurement, not a ceiling.
+- **The 2 bpw GEMV arm.** `LOADS` halves to `WNT / 2` and one loaded word
+  carries TWO tiles (`exl3_gemv_kernel.cuh:152`, `:302-310`), so it is a third
+  geometry rather than another width of slice B's. No 2-bit EXL3 artifact has
+  reached this tree, so nothing would gate it. Named, not attempted.
+- **`(4, 0)` and `(4, 1)`.** After slice B the kernel compiles for them and the
+  hard tests admit `(4, 0)` — upstream's `K != 4 && cb == 0` refusal exempts
+  this width alone — so each is ONE line in `GemvKernel` and one term in the
+  predicate. They stay out because no artifact here carries a 4-bit tensor at
+  either codebook, and 16 unreachable kernels each in a translation unit the fat
+  build compiles for ten architectures is the `(3, 0)` mistake this row's own
+  comment block records. Owed with the artifact that needs them.
+- **The envelope may decline most of this checkpoint's shapes at mode 1 on
+  GB10, at BOTH widths.** Slice B's finding is that the wide config is not the
+  escape it was predicted to be: its band needs `size_k <= 4096` and this
+  artifact's smallest 4-bit `k` is 5120, so every one of the 409 modules rests
+  on the same `size_n / 32 <= narrow_coresident` test. What bits 4 changes is
+  the thresholds — 32, 160, 192, 320, 384, 544 across six values of `n`, against
+  the bits-3 shapes' 160 and 544. If the measurement then reads zero, the
+  instantiation is still correct and upstream-faithful and worth nothing on this
+  device, and the next traceable hypothesis is the occupancy of the narrow
+  config itself, which is the only device-supplied term in the admission test.
+  That is a measurement, not a ceiling.
 - **The fused MoE arm is `(3, 1)` only** (`kMoeBits`/`kMoeCb` in
   `cuda_exl3.cu`), and it is CUDA-only. The #2495 checkpoint is dense so nothing
   here reaches it, and it is named so the next MoE EXL3 artifact does not
@@ -689,8 +857,9 @@ A CPU-only green is not a device result and is never reported as one. A doctest
   width. Stop and fix the fixture before reading any tolerance.
 - The tier-3c bound fails → the arm is wrong. Never widen the bound.
 - The `(4, 2)` port needs a kernel structure that is not upstream's → return
-  `NEEDS_DECISION` rather than inventing one.
-- The lease never arrives → report `(3, 2)` as instantiated-and-ungated, and say
+  `NEEDS_DECISION` rather than inventing one. It did not: every line of slice B
+  has an upstream `file:line` in `## Slice B design`.
+- The lease never arrives → report the arm as instantiated-and-ungated, and say
   so. A queued job nobody could gate is a partial result, never a pass.
 - An A/B leg shows the GEMV arm never ran → the measurement is void, not a zero.
   Print the envelope's verdict before reading any tok/s.

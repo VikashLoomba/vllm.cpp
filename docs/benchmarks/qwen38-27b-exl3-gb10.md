@@ -118,14 +118,15 @@ than the whole throughput difference:
 Their box measures about 231 GB/s effective, so their target forward is at 97% of
 its bandwidth limit and this one is at 85%. **Byte-normalized the comparison
 reverses sign**, 0.872x. Treat that as an indication and not a verdict: EXL3's
-trellis decode does real work per byte, so 86% may be compute-bound rather than a
-scheduling loss, and the two numbers are on different formats and different
-engines. The measurement that settles it is our engine on their checkpoint, which
+trellis decode does real work per byte, so that 85% may be compute-bound rather
+than a scheduling loss, and the two numbers are on different formats, different
+engines and different harnesses. The measurement that settles it is our engine on their checkpoint, which
 is [`bench-qwen38-27b-nvfp4-matched`](../../.agents/specs/bench-qwen38-27b-nvfp4-matched.md).
 
-The reading that survives is the one this page already gives: the target forward
-is near the bus on both engines, and what is actually contested is the
-speculation multiplier.
+What follows from the table, and is not stated elsewhere on this page: the
+target forward is close to the bus on both engines, so it is not where either
+engine has room left. What is contested is the speculation multiplier, and the
+section below is where this page measures ours.
 
 ## The draft budget is a real lever, and our knee is not theirs
 

@@ -39,6 +39,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -50,6 +51,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dots3_note.h"
 #include "vllm/multimodal/dots3_note_processor.h"
+#include "vllm/multimodal/audio_processor.h"
 #include "vllm/multimodal/mel_filter_bank.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
@@ -823,8 +825,13 @@ TEST_CASE("dots3-note W7a+W7b: the front end REFUSES a wrong rate, and W7b MOVED
       msg = e.what();
     }
     CHECK(msg.find("22050") != std::string::npos);
-    CHECK(msg.find("W7c") != std::string::npos);
+    CHECK(msg.find("W7c-2") != std::string::npos);
     CHECK(msg.find("RESAMPLING IS NOT PORTED") != std::string::npos);
+    // W7c-1 (#2813) repaired the ORACLE claim in this message: libswresample
+    // through PyAV is what resamples upstream, and librosa is never imported
+    // anywhere under `vllm/` at `9035151d6` (spec 4.16.4).
+    CHECK(msg.find("with librosa") == std::string::npos);
+    CHECK(msg.find("libswresample") != std::string::npos);
   }
   SUBCASE("a clip over `chunk_seconds` no longer names W7b, because W7b LIFTED it") {
     // This subcase used to assert "SEGMENTATION IS NOT PORTED" and W7b. It is
@@ -2058,6 +2065,305 @@ TEST_CASE("dots3-note W7a: the tower claims ALL 430 of the RELEASED tower's tens
   }
   // And the released tower is ACCEPTED — the whole point of the brick.
   CHECK(vllm::Dots3NoteAudioRefusal(a, "", {}).empty());
+}
+
+// ── W7c-1 (#2813): the CHANNEL reduction, at the decoder ────────────────────
+//
+// Upstream reduces to mono with a plain mean over the channel axes, in two
+// independent places and on both of its decode backends:
+// `vllm/multimodal/media/audio.py:207-208` (soundfile arm) and `:168-169`
+// (PyAV arm) @ `9035151d6`, reached because `load_audio`'s `mono` default is
+// True (`:220`); and again on the parser side, where
+// `AudioSpec.target_channels` is 1 and `channel_reduction` is
+// `ChannelReduction.MEAN` (`vllm/multimodal/audio.py:69-70`, applied at
+// `:150-152`), which dots3-note selects at
+// `vllm/models/dots3_note/common/processor.py:523-525`.
+//
+// WHAT THIS CASE MEASURES THAT THE SERVED SUITE CANNOT. The served case proves
+// a stereo request reaches the model and gets the MEAN's answer. This one
+// drives channel counts no WAV upload sends — 3, 4, 8 — against a reference
+// computed in `long double` from the raw int16, and pins the two exactness
+// claims spec 4.16.2 makes about the intermediate type.
+TEST_CASE("dots3-note W7c-1: the WAV decoder reduces channels by upstream's MEAN") {
+  using vllm::multimodal::DecodeWavPcm16MeanToMono;
+  using vllm::multimodal::DecodeWavPcm16Mono;
+
+  // An independent reference: the mean in `long double`, from the raw int16.
+  // It shares nothing with `src/` — not the accumulator type, not the divisor
+  // order, not the parser.
+  const auto ref_mean = [](const std::vector<int16_t>& interleaved,
+                           int channels) {
+    const size_t frames = interleaved.size() / static_cast<size_t>(channels);
+    std::vector<long double> out(frames);
+    for (size_t f = 0; f < frames; ++f) {
+      long double acc = 0.0L;
+      for (int c = 0; c < channels; ++c)
+        acc += static_cast<long double>(
+                   interleaved[f * static_cast<size_t>(channels) +
+                               static_cast<size_t>(c)]) /
+               32768.0L;
+      out[f] = acc / static_cast<long double>(channels);
+    }
+    return out;
+  };
+
+  // A deterministic multi-channel signal: channel c is a different waveform,
+  // never a scaled copy, so a decoder that took ONE channel, or averaged the
+  // wrong axis, cannot land on the mean by accident.
+  const auto make = [](int channels, size_t frames) {
+    std::vector<int16_t> pcm(frames * static_cast<size_t>(channels));
+    for (size_t f = 0; f < frames; ++f) {
+      for (int c = 0; c < channels; ++c) {
+        const double t = static_cast<double>(f) / 16000.0;
+        const double v =
+            0.5 * std::sin(2.0 * 3.14159265358979323846 *
+                           (110.0 * (c + 1) + 37.0 * c) * t) +
+            0.2 * std::cos(2.0 * 3.14159265358979323846 * (900.0 + 313.0 * c) * t);
+        pcm[f * static_cast<size_t>(channels) + static_cast<size_t>(c)] =
+            static_cast<int16_t>(std::lround(v * 30000.0));
+      }
+    }
+    return pcm;
+  };
+
+  SUBCASE("the mean matches a long-double reference at 1, 2, 3, 4 and 8 channels") {
+    for (const int channels : {1, 2, 3, 4, 8}) {
+      const std::vector<int16_t> pcm = make(channels, 517);
+      const std::vector<uint8_t> wav =
+          dots3_tiny::FixtureWavFromPcm16(pcm, 16000, channels);
+      const vllm::multimodal::DecodedAudio got =
+          DecodeWavPcm16MeanToMono(wav.data(), wav.size());
+      const std::vector<long double> want = ref_mean(pcm, channels);
+      REQUIRE(got.sampling_rate == 16000);
+      REQUIRE(got.samples.size() == want.size());
+      long double worst = 0.0L;
+      size_t exact = 0;
+      for (size_t i = 0; i < want.size(); ++i) {
+        worst = std::max(worst, std::fabs(static_cast<long double>(
+                                              got.samples[i]) - want[i]));
+        if (static_cast<long double>(got.samples[i]) == want[i]) ++exact;
+      }
+      MESSAGE("channels=" << channels << ": worst |got-ref| = "
+              << static_cast<double>(worst) << ", exact on " << exact << "/"
+              << want.size());
+      // One float ulp near 1.0 is 6e-8; this is the mean of values in [-1, 1].
+      CHECK(static_cast<double>(worst) < 6e-8);
+      // Spec 4.16.2: for a POWER-OF-TWO channel count UP TO 512 the port's
+      // answer is the exact mean, with no rounding anywhere, because the
+      // divisor is a power of two and |acc| <= 2^(15 + log2(C)) <= 2^24 is
+      // still an exact float32. The bound is TIGHT and the next case gates it.
+      if (channels == 1 || channels == 2 || channels == 4 || channels == 8) {
+        CHECK(exact == want.size());
+      }
+    }
+  }
+
+  SUBCASE("at 1024 channels a float32 accumulator is WRONG, and at 512 it is not") {
+    // WHY THIS CASE EXISTS. 4.16.2's intermediate-type argument was DERIVED and
+    // measured against a long-double reference, and NOT gated: a fresh review
+    // replaced the int32 accumulator plus single double divide with the float32
+    // accumulator that section argues against, and both suites stayed green. So
+    // nothing in the change could tell the shipped decoder from the one the
+    // spec rejects. This case is that discriminator, placed exactly at the
+    // bound the spec now states.
+    //
+    // The channel pattern is closed form and near full scale, so |acc| runs at
+    // the `32768 * C` ceiling the derivation reasons about. At C = 512 the
+    // exact sum is at most 2^24 and every arm agrees to the bit; at C = 1024 it
+    // reaches 2^25, a float32 accumulator's PARTIAL sums stop being exact, and
+    // it lands ~126 ulps away while this decoder stays exact.
+    const auto pattern = [](int channels, size_t frames) {
+      std::vector<int16_t> pcm(frames * static_cast<size_t>(channels));
+      for (size_t f = 0; f < frames; ++f)
+        for (int c = 0; c < channels; ++c)
+          pcm[f * static_cast<size_t>(channels) + static_cast<size_t>(c)] =
+              static_cast<int16_t>(32000 +
+                                   ((c * 7 + static_cast<int>(f) * 37) % 768));
+      return pcm;
+    };
+    // The rejected arm, written out: accumulate `s / 32768` in float32, divide
+    // by the channel count in float32. This is the mutation, kept in the test
+    // so the case cannot silently stop discriminating.
+    const auto f32_accumulator = [](const std::vector<int16_t>& pcm,
+                                    int channels) {
+      const size_t frames = pcm.size() / static_cast<size_t>(channels);
+      std::vector<float> out(frames);
+      for (size_t f = 0; f < frames; ++f) {
+        float acc = 0.0f;
+        for (int c = 0; c < channels; ++c)
+          acc += static_cast<float>(
+                     pcm[f * static_cast<size_t>(channels) +
+                         static_cast<size_t>(c)]) /
+                 32768.0f;
+        out[f] = acc / static_cast<float>(channels);
+      }
+      return out;
+    };
+
+    for (const int channels : {512, 1024}) {
+      const std::vector<int16_t> pcm = pattern(channels, 4);
+      const std::vector<uint8_t> wav =
+          dots3_tiny::FixtureWavFromPcm16(pcm, 16000, channels);
+      const vllm::multimodal::DecodedAudio got =
+          DecodeWavPcm16MeanToMono(wav.data(), wav.size());
+      const std::vector<long double> want = ref_mean(pcm, channels);
+      const std::vector<float> rejected = f32_accumulator(pcm, channels);
+      REQUIRE(got.samples.size() == 4);
+      REQUIRE(want.size() == 4);
+
+      size_t exact = 0, differs_from_f32 = 0;
+      double worst_f32_gap = 0.0;
+      for (size_t i = 0; i < want.size(); ++i) {
+        // Bit equality against the long-double reference, not a tolerance:
+        // both channel counts are inside "the answer is the exact mean".
+        if (static_cast<long double>(got.samples[i]) == want[i]) ++exact;
+        if (std::memcmp(&got.samples[i], &rejected[i], sizeof(float)) != 0)
+          ++differs_from_f32;
+        worst_f32_gap = std::max(
+            worst_f32_gap,
+            std::fabs(static_cast<double>(rejected[i]) -
+                      static_cast<double>(want[i])));
+      }
+      MESSAGE("channels=" << channels << ": exact on " << exact << "/"
+              << want.size() << ", differs from the float32 accumulator on "
+              << differs_from_f32 << "/" << want.size()
+              << ", that accumulator's worst error = " << worst_f32_gap);
+
+      // This decoder is EXACT at both counts. Under a float32 accumulator it is
+      // not, at 1024, which is what makes this the intermediate type's gate.
+      CHECK(exact == want.size());
+      if (channels == 512) {
+        // At the bound the two arms are indistinguishable, so the case is not
+        // measuring "float32 is always wrong" -- it is measuring WHERE.
+        CHECK(differs_from_f32 == 0);
+        CHECK(worst_f32_gap == 0.0);
+      } else {
+        CHECK(differs_from_f32 == want.size());
+        CHECK(worst_f32_gap > 1e-6);
+      }
+    }
+  }
+
+  SUBCASE("a ONE-channel file decodes BIT for BIT the same through both entry points") {
+    // This is what lets `DecodeWavPcm16Mono` keep its own loop untouched:
+    // `parakeet_transcription.cpp`, `chat_mm.cpp` and `test_voxtral_e2e.cpp`
+    // call it, and none of them may move by a bit.
+    const std::vector<uint8_t> wav =
+        dots3_tiny::FixtureAudioWav(0, 16000, /*channels=*/1);
+    const vllm::multimodal::DecodedAudio a =
+        DecodeWavPcm16Mono(wav.data(), wav.size());
+    const vllm::multimodal::DecodedAudio b =
+        DecodeWavPcm16MeanToMono(wav.data(), wav.size());
+    REQUIRE(a.samples.size() == b.samples.size());
+    REQUIRE(!a.samples.empty());
+    size_t differ = 0;
+    for (size_t i = 0; i < a.samples.size(); ++i)
+      if (std::memcmp(&a.samples[i], &b.samples[i], sizeof(float)) != 0)
+        ++differ;
+    CHECK(differ == 0);
+  }
+
+  SUBCASE("a STEREO file whose channels are EQUAL decodes to that channel, bit for bit") {
+    // The cross-check between the two loops at C = 2: the mean branch's double
+    // arithmetic lands on exactly what the mono branch's float arithmetic does.
+    const std::vector<int16_t> m = dots3_tiny::FixtureAudioPcm16(0);
+    std::vector<int16_t> dup(m.size() * 2);
+    for (size_t i = 0; i < m.size(); ++i) {
+      dup[2 * i] = m[i];
+      dup[2 * i + 1] = m[i];
+    }
+    const std::vector<uint8_t> stereo =
+        dots3_tiny::FixtureWavFromPcm16(dup, 16000, 2);
+    const std::vector<uint8_t> mono = dots3_tiny::FixtureWavFromPcm16(m);
+    const vllm::multimodal::DecodedAudio a =
+        DecodeWavPcm16Mono(mono.data(), mono.size());
+    const vllm::multimodal::DecodedAudio b =
+        DecodeWavPcm16MeanToMono(stereo.data(), stereo.size());
+    REQUIRE(a.samples.size() == b.samples.size());
+    size_t differ = 0;
+    for (size_t i = 0; i < a.samples.size(); ++i)
+      if (std::memcmp(&a.samples[i], &b.samples[i], sizeof(float)) != 0)
+        ++differ;
+    CHECK(differ == 0);
+  }
+
+  SUBCASE("the FIXTURE stereo clip means back to variant 0, exactly") {
+    // The same construction the served case uses, checked at the decoder so a
+    // failure separates "the decoder is wrong" from "the seam does not call
+    // it".
+    const std::vector<uint8_t> wav = dots3_tiny::FixtureAudioWavStereo();
+    const vllm::multimodal::DecodedAudio got =
+        DecodeWavPcm16MeanToMono(wav.data(), wav.size());
+    const std::vector<int16_t> m = dots3_tiny::FixtureAudioPcm16(0);
+    REQUIRE(got.samples.size() == m.size());
+    size_t differ = 0;
+    for (size_t i = 0; i < m.size(); ++i) {
+      const float want = static_cast<float>(m[i]) / 32768.0f;
+      if (std::memcmp(&got.samples[i], &want, sizeof(float)) != 0) ++differ;
+    }
+    CHECK(differ == 0);
+  }
+
+  SUBCASE("a TRAILING PARTIAL FRAME is dropped, as libsndfile drops it") {
+    // Not a refusal: libsndfile reads whole frames and ignores a short tail, so
+    // refusing here would be STRICTER than the oracle. The mono path has always
+    // truncated (`data_len / 2`); this keeps the multi-channel path the same.
+    // `FixtureWavFromPcm16` writes the canonical 44-byte header, so the `data`
+    // size lives at offset 40 and the RIFF size at offset 4.
+    std::vector<uint8_t> wav =
+        dots3_tiny::FixtureWavFromPcm16(make(2, 10), 16000, 2);
+    REQUIRE(wav.size() == 44 + 40);  // 10 stereo frames = 20 int16
+    wav.push_back(0x11);             // one ORPHAN int16, half a frame
+    wav.push_back(0x22);
+    const auto put_u32 = [&wav](size_t at, uint32_t v) {
+      for (int i = 0; i < 4; ++i)
+        wav[at + static_cast<size_t>(i)] =
+            static_cast<uint8_t>((v >> (8 * i)) & 0xFF);
+    };
+    put_u32(40, 42);       // data bytes: 21 int16 = 10 frames + one orphan
+    put_u32(4, 36 + 42);   // RIFF size
+    const vllm::multimodal::DecodedAudio got =
+        DecodeWavPcm16MeanToMono(wav.data(), wav.size());
+    CHECK(got.samples.size() == 10);
+  }
+
+  SUBCASE("what is STILL refused, by name") {
+    const auto why = [](const std::vector<uint8_t>& w) {
+      std::string msg;
+      try {
+        DecodeWavPcm16MeanToMono(w.data(), w.size());
+      } catch (const std::exception& e) {
+        msg = e.what();
+      }
+      return msg;
+    };
+    // Non-16-bit PCM: W7c-2, alongside the rate arm.
+    std::vector<uint8_t> bits24 = dots3_tiny::FixtureAudioWav(0, 16000, 2);
+    bits24[34] = 24;
+    CHECK(why(bits24).find("16-bit") != std::string::npos);
+    // A non-PCM `fmt `.
+    std::vector<uint8_t> adpcm = dots3_tiny::FixtureAudioWav(0, 16000, 2);
+    adpcm[20] = 2;
+    CHECK(why(adpcm).find("not PCM") != std::string::npos);
+    // A zero channel count is malformed, not an arm.
+    std::vector<uint8_t> zeroch = dots3_tiny::FixtureAudioWav(0, 16000, 2);
+    zeroch[22] = 0;
+    zeroch[23] = 0;
+    CHECK(why(zeroch).find("channel count") != std::string::npos);
+    // Not a RIFF/WAVE buffer at all.
+    const std::vector<uint8_t> junk(64, 0x41);
+    CHECK(why(junk).find("RIFF/WAVE") != std::string::npos);
+    // ...and the MONO entry point still refuses a stereo file, so nothing that
+    // calls it silently changed meaning.
+    std::string mono_msg;
+    try {
+      const std::vector<uint8_t> st = dots3_tiny::FixtureAudioWavStereo();
+      DecodeWavPcm16Mono(st.data(), st.size());
+    } catch (const std::exception& e) {
+      mono_msg = e.what();
+    }
+    CHECK(mono_msg.find("not mono") != std::string::npos);
+  }
 }
 
 TEST_CASE("dots3-note W7a: every unported audio arm refuses BY NAME, with its brick") {

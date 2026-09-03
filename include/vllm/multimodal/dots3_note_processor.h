@@ -153,7 +153,7 @@ class Dots3NoteImageProcessor {
 // THE FRONT END IS NOT RE-WRITTEN HERE, and that is the point of this class.
 // `log_mel_spectrogram` (`audio.py:117-126`) is Whisper's verbatim, and
 // `WhisperAudioProcessor::ProcessWaveform`
-// (src/vllm/multimodal/audio_processor.cpp:91-199) already is that function in
+// (src/vllm/multimodal/audio_processor.cpp:211-319) already is that function in
 // double precision: reflect pad, dropped last frame, PERIODIC Hann, POWER
 // spectrogram, `clamp(1e-10)` + `log10`, GLOBAL-max `-8` floor, `(x+4)/4`. The
 // only dots3 deltas are CONFIG — `chunk_length_s` 30 -> 60, `n_mels` 80 -> 128 —

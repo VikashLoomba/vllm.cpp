@@ -714,6 +714,216 @@ TEST_CASE("exl3 device: the widened (bits, codebook) arms agree with the CPU arm
   cb_dev.DestroyQueue(dq);
 }
 
+// ─── the kernel SHAPE table, forced — QUANT-EXL3 W5 (#2749) ──────────────────
+//
+// `Exl3SelectGemmShape` picks one of four shapes and `GemmKernelForArm`
+// instantiates all four for each of the seven `(bits, codebook)` arms. Before
+// this case ONE of the four had ever executed: the device cases above run
+// `k 512 n 256` and `k 256 n 256`, which on a Blackwell-class `cc` take
+// `mod_256 && size_n <= 4096` with `size_k > 8192` false and return shape 2.
+// Shape 4 is not merely unselected at `n = 256`, it is REFUSED -- it tiles `n`
+// by 512 and `Exl3GemmShapeCompat` rejects that `n`. Twenty-one instantiations
+// compiled into the fat build for every architecture and shipped untested.
+//
+// NO PRODUCT CODE CHANGES. `Exl3GemmArgs::force_shape_idx` already exists and
+// `Exl3GemmKernelCuda` already honours it (`cuda_exl3.cu:2270`), mirroring
+// upstream's own `force_shape` parameter. What changes is that the gate stops
+// measuring one kernel four times.
+//
+// THE DISCRIMINATION PROBLEM, AND WHY THE OBVIOUS ANSWER IS UNAVAILABLE. A
+// forced shape and the selected shape compute the same product, so no
+// comparison against any reference can tell a honoured force from a dropped
+// one. The structural discriminator -- pick dimensions at which the SELECTED
+// shape would refuse -- does not exist here, and the reason is worth writing
+// down so nobody re-derives it: `vt::Exl3Gemm` runs `had_r_128` over `A[m, k]`
+// and over `C[m, n]`, and that transform refuses a row length that is not a
+// multiple of 128. So `k % 128 == 0` and `n % 128 == 0` hold on EVERY legal
+// call, which makes shape 1 (`k % 16`, `n % 128`) and shape 2 (`k % 32`,
+// `n % 128`) compatible with every legal call and makes the selector's answer
+// compatible in every branch it has.
+//
+// Two things settle it instead, and this case carries both.
+//
+//   1. THE REFUSAL PROVES THE FIELD IS READ. Forcing shape 4 at `n = 768`
+//      (`768 % 512 == 256`) must throw by name, because shape 4 is
+//      incompatible there. A launcher that dropped `force_shape_idx` would
+//      select shape 3 -- `768 % 256 == 0` -- and return numbers.
+//   2. BYTE INEQUALITY ACROSS SHAPES PROVES EACH KERNEL IS A DIFFERENT ONE.
+//      The four shapes decompose the same problem into different tile grids, so
+//      `Exl3GemmNumSms` gives them different block counts and the split-K
+//      reduction over `k` runs a different tree. At `k 256 n 512` the slice
+//      counts are 64, 32, 16 and 16, and shapes 3 and 4 reach their equal count
+//      by different routes -- 2 n-tiles of 8 k-tiles against 1 n-tile of 16 --
+//      so the per-output reduction chains differ in length. The output is taken
+//      in f32 exactly so an fp16 store cannot absorb that. Two shapes returning
+//      byte-identical output means the case is measuring one kernel twice,
+//      which is the failure the `(3,1)`/`(3,2)` check in `test_exl3_gemv.cpp`
+//      exists to catch; it is a stop condition, never an assertion to widen.
+//
+// NO COMMA IN THE NAME: doctest splits `-tc=` on commas (#2605).
+TEST_CASE("exl3 device: every shape in the kernel table is FORCED and agrees with the CPU arm") {
+  if (!HasCuda()) {
+    MESSAGE(
+        "SKIPPED, no CUDA device: QUANT-EXL3 W5's shape coverage is PENDING. Reproduce with: "
+        "rc run -d thor:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V");
+    // A skip that asserts NOTHING reports `assertions: 0`, which reads as a pass.
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3Gemm, vt::DeviceType::kCUDA));
+    return;
+  }
+  vt::Backend& cb_dev = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue dq = cb_dev.CreateQueue();
+  vt::Queue hq = CpuQueue();
+
+  // `n = 512` is the smallest `n` compatible with all four shapes at once:
+  // shape 4 tiles it by 512, shape 3 by 256, shapes 1 and 2 by 128. `k = 256`
+  // is a multiple of 128 (had_r_128) and of 32 (shapes 2 and 3).
+  const int64_t m = 4, k = 256, n = 512;
+  const int kBits = 3, kCb = 1;
+  const Exl3Fixture f = MakeFixture(k, n, kBits, 0x27D4EB2Fu);
+  Rng rng;
+  rng.s = 0x165667B1u;
+  std::vector<uint16_t> a_h(static_cast<size_t>(m * k));
+  for (auto& v : a_h) v = vt::F32ToF16(rng.next(1.0f));
+
+  vt::Exl3GemmArgs base;
+  base.bits = kBits;
+  base.codebook = kCb;
+
+  // The CPU arm is the reference, as in the widened-arms case above: it decodes
+  // every width and codebook and `test_exl3_real_decode` ties it to real
+  // exllamav3 output. It has no shape table, so it is the same reference for
+  // all four.
+  std::vector<uint16_t> a_had_h(a_h.size(), 0);
+  std::vector<float> c_host(static_cast<size_t>(m * n), 0.0f);
+  {
+    vt::Tensor ta = vt::Tensor::Contiguous(a_h.data(), vt::DType::kF16, hq.device, {m, k});
+    vt::Tensor tah = vt::Tensor::Contiguous(a_had_h.data(), vt::DType::kF16, hq.device, {m, k});
+    vt::Tensor tc = vt::Tensor::Contiguous(c_host.data(), vt::DType::kF32, hq.device, {m, n});
+    vt::Tensor tb = vt::Tensor::Contiguous(const_cast<uint16_t*>(f.trellis.data()),
+                                           vt::DType::kI8, hq.device,
+                                           {k / 16, n / 16, 32 * kBits});
+    vt::Tensor tsuh = vt::Tensor::Contiguous(const_cast<uint16_t*>(f.suh.data()),
+                                             vt::DType::kF16, hq.device, {k});
+    vt::Tensor tsvh = vt::Tensor::Contiguous(const_cast<uint16_t*>(f.svh.data()),
+                                             vt::DType::kF16, hq.device, {n});
+    vt::Exl3Gemm(hq, tc, ta, tb, tsuh, tsvh, tah, base);
+  }
+  double den = 0.0;
+  for (float v : c_host) den += static_cast<double>(v) * v;
+  REQUIRE(den > 0.0);  // a reference of zeros would admit anything
+
+  const size_t ab = a_h.size() * sizeof(uint16_t);
+  const size_t bb = f.trellis.size() * sizeof(uint16_t);
+  const size_t cbytes = static_cast<size_t>(m * n) * sizeof(float);
+  void* d_a = cb_dev.Alloc(ab);
+  void* d_ah = cb_dev.Alloc(ab);
+  void* d_b = cb_dev.Alloc(bb);
+  void* d_suh = cb_dev.Alloc(f.suh.size() * sizeof(uint16_t));
+  void* d_svh = cb_dev.Alloc(f.svh.size() * sizeof(uint16_t));
+  void* d_c = cb_dev.Alloc(cbytes);
+  cb_dev.Copy(dq, d_a, a_h.data(), ab);
+  cb_dev.Copy(dq, d_b, f.trellis.data(), bb);
+  cb_dev.Copy(dq, d_suh, f.suh.data(), f.suh.size() * sizeof(uint16_t));
+  cb_dev.Copy(dq, d_svh, f.svh.data(), f.svh.size() * sizeof(uint16_t));
+  vt::Tensor tda = vt::Tensor::Contiguous(d_a, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tdah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tdb = vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device,
+                                          {k / 16, n / 16, 32 * kBits});
+  vt::Tensor tdsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
+  vt::Tensor tdsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
+  vt::Tensor tdc = vt::Tensor::Contiguous(d_c, vt::DType::kF32, dq.device, {m, n});
+
+  // The loop bound is the TABLE's own count, not a literal 4: a fifth shape
+  // added to `kShapes` must arrive with a gate or fail here.
+  std::vector<std::vector<float>> per_shape;
+  for (int idx = 1; idx <= vt::Exl3GemmNumShapes(); ++idx) {
+    CAPTURE(idx);
+    // The instrument's own precondition. A shape incompatible with these
+    // dimensions would throw instead of running, and a case that never ran the
+    // kernel it names is a skip wearing a pass.
+    REQUIRE(vt::Exl3GemmShapeCompat(idx, static_cast<int>(k), static_cast<int>(n)));
+
+    std::vector<float> c_dev(static_cast<size_t>(m * n), 0.0f);
+    vt::Exl3GemmArgs args = base;
+    args.force_shape_idx = idx;
+    vt::Exl3Gemm(dq, tdc, tda, tdb, tdsuh, tdsvh, tdah, args);
+    cb_dev.Synchronize(dq);
+    cb_dev.Copy(dq, c_dev.data(), d_c, cbytes);
+    cb_dev.Synchronize(dq);
+
+    double num = 0.0;
+    for (size_t i = 0; i < c_dev.size(); ++i) {
+      const double d = static_cast<double>(c_dev[i]) - static_cast<double>(c_host[i]);
+      num += d * d;
+    }
+    const double rel = std::sqrt(num / den);
+    MESSAGE("forced shape ", idx, ": device vs CPU rel_rms = ", rel);
+    // The same bound the (3, 1) device case states. A new shape INHERITS it.
+    CHECK(rel <= 1.0e-3);
+    per_shape.push_back(c_dev);
+  }
+
+  // THE DISCRIMINATION CHECK (2 above). Byte comparison, not a tolerance: two
+  // runs of the SAME kernel on the same operands are bit-identical, so any
+  // difference at all is proof that a different kernel ran.
+  REQUIRE(per_shape.size() == static_cast<size_t>(vt::Exl3GemmNumShapes()));
+  for (size_t i = 0; i < per_shape.size(); ++i) {
+    for (size_t j = i + 1; j < per_shape.size(); ++j) {
+      CAPTURE(i + 1);
+      CAPTURE(j + 1);
+      size_t differing = 0;
+      for (size_t e = 0; e < per_shape[i].size(); ++e)
+        if (std::memcmp(&per_shape[i][e], &per_shape[j][e], sizeof(float)) != 0) ++differing;
+      MESSAGE("shapes ", i + 1, " and ", j + 1, " differ in ", differing, " of ",
+              per_shape[i].size(), " outputs");
+      CHECK(differing > 0);
+    }
+  }
+
+  for (void* p : {d_a, d_ah, d_b, d_suh, d_svh, d_c}) cb_dev.Free(p);
+
+  // THE REFUSAL (1 above). `n = 768` is a legal EXL3 output width -- a multiple
+  // of 128, so `had_r_128` accepts it -- and it is compatible with shapes 1, 2
+  // and 3 but NOT with shape 4. Forcing 4 there must refuse BY NAME. A launcher
+  // that ignored the field would select shape 3 and return numbers.
+  {
+    const int64_t rn = 768;
+    REQUIRE_FALSE(vt::Exl3GemmShapeCompat(4, static_cast<int>(k), static_cast<int>(rn)));
+    REQUIRE(vt::Exl3GemmShapeCompat(3, static_cast<int>(k), static_cast<int>(rn)));
+    const Exl3Fixture rf = MakeFixture(k, rn, kBits, 0x85EBCA6Bu);
+    void* r_a = cb_dev.Alloc(ab);
+    void* r_ah = cb_dev.Alloc(ab);
+    void* r_b = cb_dev.Alloc(rf.trellis.size() * sizeof(uint16_t));
+    void* r_suh = cb_dev.Alloc(rf.suh.size() * sizeof(uint16_t));
+    void* r_svh = cb_dev.Alloc(rf.svh.size() * sizeof(uint16_t));
+    void* r_c = cb_dev.Alloc(static_cast<size_t>(m * rn) * sizeof(float));
+    vt::Tensor ra = vt::Tensor::Contiguous(r_a, vt::DType::kF16, dq.device, {m, k});
+    vt::Tensor rah = vt::Tensor::Contiguous(r_ah, vt::DType::kF16, dq.device, {m, k});
+    vt::Tensor rb = vt::Tensor::Contiguous(r_b, vt::DType::kI8, dq.device,
+                                           {k / 16, rn / 16, 32 * kBits});
+    vt::Tensor rsuh = vt::Tensor::Contiguous(r_suh, vt::DType::kF16, dq.device, {k});
+    vt::Tensor rsvh = vt::Tensor::Contiguous(r_svh, vt::DType::kF16, dq.device, {rn});
+    vt::Tensor rc = vt::Tensor::Contiguous(r_c, vt::DType::kF32, dq.device, {m, rn});
+    vt::Exl3GemmArgs bad = base;
+    bad.force_shape_idx = 4;
+    std::string msg;
+    try {
+      vt::Exl3Gemm(dq, rc, ra, rb, rsuh, rsvh, rah, bad);
+      cb_dev.Synchronize(dq);
+    } catch (const std::runtime_error& e) {
+      msg = e.what();
+    }
+    MESSAGE("forced shape 4 at n=768 said: ", msg);
+    CHECK(msg.find("exl3_gemm") != std::string::npos);
+    CHECK(msg.find("no compatible") != std::string::npos);
+    CHECK(msg.find("selected shape 4") != std::string::npos);
+    for (void* p : {r_a, r_ah, r_b, r_suh, r_svh, r_c}) cb_dev.Free(p);
+  }
+
+  cb_dev.DestroyQueue(dq);
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
+}
+
 // ─── The operands' BYTE ADDRESSES — #2558 ────────────────────────────────────
 //
 // `suh`, `svh` and the trellis are WEIGHTS, and the borrow path hands the kernel

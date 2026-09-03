@@ -212,9 +212,15 @@ high. That is inside every other uncertainty here and is recorded, not corrected
 `3047871581bc55a0ab1a44006421bbe02698d5b8`, both asserted inside the job. Legs,
 in the order a crash truncates them least usefully:
 
+All four staged files were hashed on the download host and **all four match the
+publisher's LFS object hash**: `fbcdb5ba...`, `db6146a5...` and `d3cfb927...`
+for the target's three shards, `2228b9b2...` for the drafter. Shard 2 needed five
+disjoint HTTP ranges reassembled by hand after a single stream stalled, so its
+hash is the check that the reassembly is the file.
+
 | leg | question |
 |---|---|
-| B | sha256 of every shard, recomputed on the device against the download-host pin |
+| B | sha256 of every shard, recomputed **on the device** against those four |
 | E | does `RadixArk` load and decode coherently? The device answer nothing in this tree has ever taken for a Qwen3.8-27B NVFP4 artifact |
 | F | the verbatim failure of the NVFP4 DFlash2 drafter |
 | I | **the saturation question**, on the EXL3 pair alone, so a target that refuses does not cost it |

@@ -63,10 +63,19 @@ additionally owes these four:
 2. A **declared token-exact gate**. The run above is six prompts at 16 tokens
    and gates nothing; it agreed with `tests/parity/goldens/opt_greedy` exactly,
    which is informative and not a result.
-3. **Step 6 re-measurement** of every benchmark baselined against FlashInfer
-   0.6.15.post1, CUTLASS DSL 4.6.0, the `transformers` floor and the
-   `VLLM_ALLREDUCE_USE_FLASHINFER` default, all of which move under this
-   candidate.
+3. **Step 6 re-measurement.** Narrowed 2026-09-03 by
+   [`../sync/2026-09-03-e126687-step6.md`](../sync/2026-09-03-e126687-step6.md)
+   ([#2771](https://github.com/mudler/vllm.cpp/issues/2771)) from "four
+   denominators" to **FlashInfer 0.6.15.post1 to 0.6.18, on two gates**:
+   `vllm-online-serving`, where it is the NVFP4 GEMM under the denominator and
+   the CUTLASS source tree our own arm is compiled from, and
+   `speculative-decoding`, where it is the oracle's attention backend. CUTLASS
+   DSL, the `transformers` floor and the `VLLM_ALLREDUCE_USE_FLASHINFER` default
+   are **discharged** as reaching no committed gate, each with its scope limit
+   recorded there. **The re-measurement itself is still owed**; that report ran
+   no job, and §6 records that the committed harness refuses to run at a
+   FlashInfer other than the pinned one, which puts this obligation and the
+   `parity-pin` block edit in an order nothing states.
 4. A reading on **`dgx:gpu0`**. Only `thor:gpu0` was measured.
 
 **Evidence for the paragraph above.**

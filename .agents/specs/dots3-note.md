@@ -5236,7 +5236,7 @@ is the record of that rather than a silent divergence:
 | `audio_encoder.py:507-519` for the absent positional embedding | `:498-510` | §2.5, re-measured at `9035151d6` |
 | `nvidia/audio_encoder.py` is 736 lines and the anchors in §2.5 stand | eight §2.5 anchors were `+9` | §2.5 |
 | the adapter is "`audio_adapter.proj.{0, 1, 3}`, 1280 to 5120" | `proj.0` is a **LayerNorm with weight AND bias** over 1280, and only `proj.1`/`proj.3` are Linears | the committed shard index |
-| "It must be ported from whatever upstream actually calls" | it is **already ported**: `audio_processor.cpp:91-199` is Whisper's `log_mel_spectrogram` verbatim in double precision, and `test_voxtral_e2e.cpp:157-178` already drives it at n_fft 400 / hop 160 / n_mels 128 / 16 kHz | §4.14.2 |
+| "It must be ported from whatever upstream actually calls" | it is **already ported**: `audio_processor.cpp:181-289` is Whisper's `log_mel_spectrogram` verbatim in double precision, and `test_voxtral_e2e.cpp:157-178` already drives it at n_fft 400 / hop 160 / n_mels 128 / 16 kHz | §4.14.2 |
 
 #### 4.14.1 What was already built, and what was actually missing
 
@@ -5248,8 +5248,8 @@ its scatter balances because the audio adapter's `whisper_adapter_out_dim` is
 5120, which IS `config.hidden_size`; `MultiModalFeatureSpec::audio_data`
 (`inputs.h:81`) already carries an `AudioKwargs`; `DecodeInputAudioPart`
 (`chat_mm.cpp:122-129`) already base64-decodes the part; `DecodeWavPcm16Mono`
-(`audio_processor.cpp:35-79`) already decodes PCM16 mono WAV; and
-`ExpandAudioPlaceholders` (`audio_processor.cpp:206-225`) already performs the
+(`audio_processor.cpp:103-151`) already decodes PCM16 mono WAV; and
+`ExpandAudioPlaceholders` (`audio_processor.cpp:296-315`) already performs the
 expansion.
 
 Five things were missing or dead, and they are what W7a adds:
@@ -5281,7 +5281,7 @@ periodic Hann over `n_fft` 400, `torch.stft(center=True)` reflect padding, the
 last frame dropped by `stft[..., :-1]`, a POWER spectrogram, `filters @
 magnitudes`, `clamp(1e-10).log10()`, a GLOBAL-max `-8` floor and `(x + 4) / 4`.
 `WhisperAudioProcessor::ProcessWaveform`
-(`src/vllm/multimodal/audio_processor.cpp:91-199`) is that function, in double
+(`src/vllm/multimodal/audio_processor.cpp:181-289`) is that function, in double
 precision, and the only deltas dots3 needs are CONFIG: `chunk_length_s` 30 ->
 60, `n_mels` 80 -> 128, `max_source_positions` 1500 -> 6000. So W7a REUSES it
 rather than writing a second one, which is what "never write a parallel path by
@@ -6205,6 +6205,16 @@ type is a decision that has to be stated.
   published dots3-note request shape reaches it: `C = 1` and `C = 2` are what a
   WAV upload carries.
 
+**W7c-1 moved four `audio_processor.cpp` line anchors, and re-pointed them in
+the same change.** The shared parser and the new sibling add lines above
+`WhisperAudioProcessor`, so §4.14's `:35-79` (the mono decoder), `:91-199` (the
+log-mel), `:206-225` (`ExpandAudioPlaceholders`) and `## Owed`'s `:94-101` (A1's
+"resample deferred" throw) all shifted. They now read `:103-151`, `:181-289`,
+`:296-315` and `:184-191`, together with the same anchor in
+`include/vllm/multimodal/dots3_note_processor.h`. The surrounding prose is
+unchanged, because only the line numbers moved. An anchor that a change
+falsifies is that change's to repair.
+
 **The mono entry point is not touched.** `DecodeWavPcm16Mono` keeps its own
 `static_cast<float>(s) / 32768.0f` loop verbatim, so `parakeet_transcription.cpp`,
 `chat_mm.cpp` and `test_voxtral_e2e.cpp` cannot move by a bit — this slice adds
@@ -6288,7 +6298,7 @@ says the work is a rate-conversion decision against a seam that exists, owed to
 W7c-2, rather than a port that has to be written from nothing.
 
 **One `librosa` mention in this file is left alone, deliberately.**
-`src/vllm/multimodal/audio_processor.cpp:95` says a genuine resample would be
+`src/vllm/multimodal/audio_processor.cpp:185` says a genuine resample would be
 "windowed sinc, à la librosa". That describes an ALGORITHM's style, not vLLM's
 executing chain, it belongs to the A1 Whisper/Voxtral row rather than this one,
 and it is not false. Editing another row's message to satisfy a sweep is how a
@@ -7038,7 +7048,7 @@ Carried openly under option B (§6.4), not waived:
   mentions are comments (§4.16.4). This port REFUSES a rate that is not
   `audio_config.sampling_rate`, at the ROUTE, naming W7c-2 so an operator learns
   which brick owes it rather than reading the audio-track A1 row's "resample
-  deferred" message about a different model (`audio_processor.cpp:94-101`).
+  deferred" message about a different model (`audio_processor.cpp:184-191`).
   Rate conversion is still numerically delicate, but it is no longer a port from
   nothing: [#2583](https://github.com/mudler/vllm.cpp/issues/2583) landed
   `Ltx2ResampleWaveform`

@@ -4,14 +4,22 @@ Issue [#2740](https://github.com/mudler/vllm.cpp/issues/2740), row
 `BACKEND-GATE-ROCM-LLAMACPP`, spec
 [`oracle-vllm-gfx1151.md`](../../.agents/specs/oracle-vllm-gfx1151.md).
 
-**No speed, latency or memory figure appears anywhere below.** `AGENTS.md`
-§Gates admits a performance result from an arm only after that arm's declared
-token gate passes, and the Qwen3.8-27B Q4_K_M ROCm arm's gate reads `FAIL` at 3
-of 6 ([token-gate
+**No speed, latency or throughput figure is taken anywhere below, and no memory
+figure is compared.** `AGENTS.md` §Gates admits a performance result from an arm
+only after that arm's declared token gate passes, and the Qwen3.8-27B Q4_K_M
+ROCm arm's gate reads `FAIL` at 3 of 6 ([token-gate
 v2](qwen38-27b-q4km-rocm-gfx1151-token-gate-v2-20260902.md)).
 [#2497](https://github.com/mudler/vllm.cpp/issues/2497) has already had one
 measurement retracted for exactly this. This document changes no verdict of
 #2497 or [#2534](https://github.com/mudler/vllm.cpp/issues/2534).
+
+Memory figures do appear, and they are identity rather than performance: 16.08
+GiB of loaded weights, 64 GiB of board memory, the 53.8 GB bf16 checkpoint
+sitting beside the GGUF. They are here to prove which artifact was fed, and none
+of them measures this engine against another. The verbatim `rc` logs committed
+beside this file carry vLLM's own `tqdm` `est. speed ... toks/s` progress text
+on four lines of `job-phase3.txt`. Nothing here reads it, and a captured log is
+not edited to make a sentence true.
 
 ## Why this was asked at all
 
@@ -47,11 +55,20 @@ bb2ffe74-83e9-4fed-9a35-f9367fefe76b  phase 4   compiled x2 + the plugin object
 Five earlier jobs failed on absent packages and are named in the build section
 by id.
 
-`HSA_OVERRIDE_GFX_VERSION` is **not set in any job**, and every job asserts its
-own inherited environment is free of `HSA_*`, `ROCR_*`, `PYTORCH_*` and `HIP_*`
-before it starts. That knob makes the runtime lie about the device, which is the
-one thing an oracle measurement cannot survive. Every job printed
-`HSA_OVERRIDE_GFX_VERSION=UNSET` and `inherited_env NONE`.
+`HSA_OVERRIDE_GFX_VERSION` is **not set in any job**. That knob makes the
+runtime report a different device, which is the one thing an oracle measurement
+cannot survive. All four jobs printed `HSA_OVERRIDE_GFX_VERSION=UNSET`
+(`phase1b.sh:30`, `phase2.sh:31`, `phase3.sh:40`, `phase4.sh:38`), and both
+generating phases assert it again in-process, before they load anything, with a
+bare `assert os.environ.get("HSA_OVERRIDE_GFX_VERSION") is None`
+(`gen_rocm.py:61`), which is the strongest of the three forms because it stops
+the run rather than printing a line somebody has to read.
+
+Phases 1b and 3 additionally sweep the whole variable family and printed
+`inherited_env NONE` (`phase1b.sh:31`, `phase3.sh:41`). Phases 2 and 4 print the
+single variable only, so that family sweep covers two of the four jobs and not
+all four. The knob that decides the answer is covered everywhere; the wider
+family is not, and this file says which is which.
 
 ## The device, as three independent things report it
 

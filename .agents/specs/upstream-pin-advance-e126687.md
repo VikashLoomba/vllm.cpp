@@ -81,7 +81,8 @@ carries one circular assertion too many.
   and ruled not a blocker; see §3 for the state of that ruling. Porting an entry
   is product work and `.agents/upstream-sync.md` §Rules forbids mixing it into a
   sync cycle commit.
-- **Bumping the ~500 per-file `Ported from: ... @ 5559679229` headers.** They are
+- **Bumping the 90 per-file `Ported from: ... 55596792` headers** (measured; see
+  §5.3, and the "roughly 500" this replaced was a guess). They are
   per-file pins and step 5 is what moves them. §5.3 records that they are now
   behind, which is the ledger note `.agents/upstream-sync.md` §Concepts requires.
 - **The #2649 product change.** It becomes landable at this merge and is not
@@ -269,8 +270,10 @@ statements and the record must not let the first read as the second.
 
 `.agents/upstream-sync.md` §Concepts allows a per-file pin to be temporarily
 ahead, and says it may never be behind "without a ledger note". Step 5 is what
-moves those headers and step 5 did not run, so roughly 500 `Ported from: ... @
-5559679229` headers are now behind. **This section is that ledger note.** They are
+moves those headers and step 5 did not run. Measured over `include/`, `src/` and
+`tests/`: 556 files carry a `Ported from:` header, **90** of them name
+`55596792` and go behind with this advance, and **247** name `e24d1b24` and were
+ALREADY behind against the prior pin. **This section is that ledger note.** They are
 owed by the PORT-NOW queue's own issue,
 [#2611](https://github.com/mudler/vllm.cpp/issues/2611), and by the per-entry
 issues the PORTQ waves filed.
@@ -348,7 +351,12 @@ consistency. Each is a command, not a description.
 3. `python3 scripts/check-symbol-anchors.py --upstream-root <pinned vllm checkout>`
    — run BEFORE and AFTER the block edit, and both counts reported. This is not a
    CI gate and it is red on this tree at both pins; the RESULT is the delta, which
-   is the population of symbol citations the advance falsified.
+   is the population of symbol citations the advance falsified. **Measured**:
+   15 stale before, 28 after; 15 newly stale, 2 repaired by the advance, and one
+   apparent move that is this wave's own edit relocating a citation. Thirteen of
+   the fifteen are `.agents/model-matrix.md` rows for architectures vllm#53608
+   deleted, which is [#2819](https://github.com/mudler/vllm.cpp/issues/2819).
+   `../sync/2026-09-03-e126687-advance.md` §4.4.
 4. `scripts/agent-preflight.sh --staged`, run ONCE on the frozen tree, with the
    `gate(s) failed` and `NOT a green` lines read rather than the exit status.
 
@@ -371,7 +379,7 @@ consistency. Each is a command, not a description.
   token-exact gate at the target, on `dgx:gpu0`, which also answers the OPT
   golden that was never re-validated at the old pin.
 - [#2611](https://github.com/mudler/vllm.cpp/issues/2611) — a reading on
-  `dgx:gpu0`, the 290-entry queue, and with it the ~500 per-file headers §5.3
+  `dgx:gpu0`, the 290-entry queue, and with it the 90 per-file headers §5.3
   leaves behind the pin.
 - [#2626](https://github.com/mudler/vllm.cpp/issues/2626) — `qwen4_exp` does not
   run on this fleet at the pinned revision.
@@ -380,3 +388,8 @@ consistency. Each is a command, not a description.
   `include/vllm/config/speculative.h`.
 - [#1185](https://github.com/mudler/vllm.cpp/issues/1185) — the shallow-fetch
   version discrepancy, still open as a mechanism.
+- [#2819](https://github.com/mudler/vllm.cpp/issues/2819) — thirteen
+  `.agents/model-matrix.md` rows cite upstream model files vllm#53608 deleted
+  inside this range, and the pinned registry is unreconciled in both directions.
+  Filed by this wave, owned by no row yet, and listed here as AGENTS.md
+  §"Every change starts from an issue" requires.

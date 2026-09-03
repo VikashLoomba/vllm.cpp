@@ -11,8 +11,11 @@ the agent-facing parity inventory with upstream file references see
 **Legend.** ✅ supported and gated. ◐ partial, usable with named gaps. ☐ not yet.
 n/a means the feature does not apply to that engine's design.
 
-Reference versions: vLLM 0.26.0.dev0, SGLang v0.5.15, llama.cpp `b10451`,
-MLX-LM as of 2026-07. Competitor columns describe what those projects ship, and
+Reference versions: vLLM 0.28.1rc1.dev132 (`e126687a9a`, the parity pin since
+2026-09-03), SGLang v0.5.15, llama.cpp `b10451`, MLX-LM as of 2026-07. Rows
+describing what vLLM has were read at the PRIOR pin `555967922` unless they say
+otherwise; the 290-commit-range PORT-NOW queue for the advance is classified and
+unworked (#2611). Competitor columns describe what those projects ship, and
 are our reading of their documented behavior, not measurements.
 
 ## At a glance

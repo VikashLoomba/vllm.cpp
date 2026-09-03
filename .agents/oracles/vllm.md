@@ -16,21 +16,26 @@ id = vllm
 role = primary
 upstream = https://github.com/vllm-project/vllm
 scope = every behavior vLLM implements — defaults, modes, errors, edge cases, and both correctness and speed gates
-pin = 5559679229bc961848b121ccdeaa8fa5d79bec98
-pin_label = 0.26.0.dev0
-pinned_on = 2026-07-26
+pin = e126687a9a828d513c01a07cd69f025f27d63280
+pin_label = 0.28.1rc1.dev132
+pinned_on = 2026-09-03
 gateable = yes
-evidence = .agents/upstream-sync.md
+evidence = .agents/sync/2026-09-03-e126687-runhalf.md
 ```
 
-## The candidate `e126687a9a`, and what its run half established
+## What this pin establishes, and what it does NOT
 
-**The pin above does not move**, and nothing in this section is a reason to move
-it. This records one measured property of a candidate revision so that the next
-sync cycle does not re-measure it.
+**`gateable = yes` above says the oracle builds and runs. It does NOT say any
+gate in this tree has been run against it.** Those are different statements and
+this section keeps them apart, because the pin advanced
+([#2817](https://github.com/mudler/vllm.cpp/issues/2817)) on a developer ruling
+that put step 6 after step 7, so the advance carries obligations it has not
+discharged.
 
-`e126687a9a828d513c01a07cd69f025f27d63280` (2026-08-31, the revision that
-registers `Qwen4ExpForCausalLM`) **builds from source and runs a model** on
+### Established, and this is the whole of it
+
+`e126687a9a828d513c01a07cd69f025f27d63280` (2026-08-31, vllm#53896, the revision
+that registers `Qwen4ExpForCausalLM`) **builds from source and runs a model** on
 `thor:gpu0`. Measured 2026-09-03, aarch64, NVIDIA Thor, compute capability 11.0,
 driver 595.78:
 
@@ -42,75 +47,78 @@ RUN_RC=0        facebook/opt-125m, greedy, FLASH_ATTN/FA2, eager AND compiled
 ```
 
 Evidence: [`../sync/2026-09-03-e126687-runhalf.md`](../sync/2026-09-03-e126687-runhalf.md),
-issue [#2611](https://github.com/mudler/vllm.cpp/issues/2611).
+issue [#2611](https://github.com/mudler/vllm.cpp/issues/2611), and the install
+half [`../sync/2026-09-02-e126687.md`](../sync/2026-09-02-e126687.md)
+([#2593](https://github.com/mudler/vllm.cpp/issues/2593)).
 
-**What that is worth, and the limit is first because it is the larger fact.**
-`qwen4_exp` — the model this candidate is wanted for — **does not run on
-`thor:gpu0`** at this revision: its QSA indexer's `cooperative_topk` refuses to
-launch with a cluster misconfiguration
-([#2626](https://github.com/mudler/vllm.cpp/issues/2626)), and its published
-safetensors arms exceed the largest fleet box. So a pin here would carry a
-registered, importable, executable vLLM that still cannot serve
-`MODEL-MM-QWEN4-EXP`'s own model on this fleet. What was demonstrated is that
-**some** model builds and runs, on one device; whether AGENTS.md's "builds and
-runs the model" is satisfied by that, or requires the model in question, is a
-reading this record does not settle. It is **not** a pin advance and **not** a
-`gateable = yes` for this revision. Beyond the question above, a pin advance
-additionally owes these four:
+### NOT established, and the pin's movement makes none of it true
 
-1. The **290-entry PORT-NOW queue** for `5559679229..e126687a9a`, unworked
-   ([#2611](https://github.com/mudler/vllm.cpp/issues/2611)).
-2. A **declared token-exact gate**. The run above is six prompts at 16 tokens
-   and gates nothing; it agreed with `tests/parity/goldens/opt_greedy` exactly,
-   which is informative and not a result. Specified 2026-09-03 by
+1. **`qwen4_exp` does not run on this fleet at this revision.** The model this
+   pin was taken for: its QSA indexer's `cooperative_topk` refuses to launch with
+   a cluster misconfiguration
+   ([#2626](https://github.com/mudler/vllm.cpp/issues/2626), cause
+   unestablished), and its published safetensors arms exceed the largest fleet
+   box. So `MODEL-MM-QWEN4-EXP` has a registered, importable, executable vLLM
+   that still cannot serve its own model here. That is strictly better than the
+   prior pin, where the architecture was not registered at all, and it is not a
+   runnable oracle for the row.
+2. **No gate model, and no gate.** `facebook/opt-125m` at six prompts and sixteen
+   tokens is a smoke test that agreed with `tests/parity/goldens/opt_greedy`.
+   **Every committed golden in this tree was captured against `555967922` or
+   earlier and none has been re-validated here.** The declared token-exact gate
+   at this pin is specified by
    [`../specs/upstream-sync-headpin-tokengate.md`](../specs/upstream-sync-headpin-tokengate.md)
-   ([#2794](https://github.com/mudler/vllm.cpp/issues/2794)), which establishes
-   three things and closes none of them. **The token path is NOT subject to the
-   §3 harness refusal** — `scripts/opt-oracle-capture.py`,
-   `scripts/opt-dgx-gate.sh` and `tests/vllm/models/test_opt_paged_engine.cpp`
-   read no pin constant, so the gate can be captured at any revision that
-   imports. **The gate must be captured on `dgx:gpu0` (GB10, `sm_121a`)**, the
-   device the committed golden came from, against the bf16-materialized
-   checkpoint and with `--runs 5`, because K selects the STRICT bar; a Thor
-   capture moves the silicon and the rounding path alongside the revision, which
-   is what makes the run above informative rather than a gate. **And the OPT
-   golden was never re-validated at the ACTIVE pin either** — it was captured
-   once at `b8358a5b9` against vLLM 0.25.0, and the `5559679229` advance's W3b
-   table discharged it in a row for already-ratified near-tie-robust gates, a
-   class OPT's strict no-band gate is not in. The capture that answers this
-   obligation answers that one too.
-3. **Step 6 re-measurement.** Narrowed 2026-09-03 by
+   ([#2794](https://github.com/mudler/vllm.cpp/issues/2794)) and must be captured
+   on `dgx:gpu0` (GB10, `sm_121a`), the device the committed golden came from,
+   with `--runs 5`. The token path reads no pin constant, so it is NOT subject to
+   the harness refusal below and can be captured at any revision that imports.
+   That capture also answers the OPT golden that was never re-validated at the
+   PRIOR pin either.
+3. **Step 6 is owed POST-HOC**
+   ([#2818](https://github.com/mudler/vllm.cpp/issues/2818)). Narrowed by
    [`../sync/2026-09-03-e126687-step6.md`](../sync/2026-09-03-e126687-step6.md)
-   ([#2771](https://github.com/mudler/vllm.cpp/issues/2771)) from "four
-   denominators" to **FlashInfer 0.6.15.post1 to 0.6.18, on two gates**:
-   `vllm-online-serving` (three rows), where it is the NVFP4 GEMM under the
-   denominator and the CUTLASS source tree our own arm is compiled from, and
-   `speculative-decoding` (two rows), where it is the oracle's attention
-   backend. The `transformers` floor and the `VLLM_ALLREDUCE_USE_FLASHINFER`
-   default are **discharged** as reaching no committed gate, each with its scope
-   limit recorded there. **`nvidia-cutlass-dsl` is NOT discharged**: a fresh
-   review of [#2783](https://github.com/mudler/vllm.cpp/pull/2783) falsified the
-   first pass's claim by finding a warmup path gated on
-   `has_device_capability(90)` rather than on capability family 100, which
-   compiles CuteDSL at engine start on GB10. It cannot move the steady-state
-   math, but it can abort engine start and it sits inside the startup ratio
-   `docs/benchmarks/vllm-online-serving.md:73` publishes. **The re-measurement itself is still owed**; that report
-   ran no job, and §6 records that the committed harness **structurally refuses
-   to measure at any revision but the pinned one** — `online_gate.py:3529-3540`
-   checks the distribution and runtime versions and `:3542` the commit, all
-   before the FlashInfer gate at `:3552-3560`, and all read from the same
-   `parity-pin` block. So the block must move before ANY pin advance can be
-   measured through this harness, which puts this obligation and that edit in an
-   order nothing states.
-4. A reading on **`dgx:gpu0`**. Only `thor:gpu0` was measured.
+   ([#2771](https://github.com/mudler/vllm.cpp/issues/2771)) to **FlashInfer
+   `0.6.15.post1` to `0.6.18` on two gates**: `vllm-online-serving` (three
+   throughput rows plus the startup row), where FlashInfer is the NVFP4 GEMM
+   under the denominator and the CUTLASS source tree our own arm compiles
+   against, and `speculative-decoding` (two rows), where it is the oracle's
+   attention backend. **`nvidia-cutlass-dsl` `4.6.0` to `4.6.2` is NOT
+   discharged**: a fresh review of
+   [#2783](https://github.com/mudler/vllm.cpp/pull/2783) found a warmup path
+   gated on `has_device_capability(90)`, which is `>=` and admits `sm_121`, whose
+   `compile(...)` is unguarded — it cannot move the steady-state math, but it can
+   abort engine start and it sits inside the startup ratio
+   `docs/benchmarks/vllm-online-serving.md:73` publishes.
+   The `transformers` floor (`>= 5.5.3` to `>= 5.10.4`, resolved `5.14.1`, above
+   both) and the `VLLM_ALLREDUCE_USE_FLASHINFER` default flip (inert at
+   `tensor_parallel_size == 1`, which every committed gate runs) were discharged
+   at the PRIOR pin and **still hold at this one**, because neither argument
+   depends on which revision is pinned. **A red on the re-measurement requires
+   reverting this pin**, not holding it; that is part of the developer ruling and
+   is recorded in [`../upstream-sync.md`](../upstream-sync.md).
+4. **No reading on `dgx:gpu0`.** Only `thor:gpu0` was measured, on one day. Every
+   binding benchmark number in this tree was taken on GB10, and nothing here
+   transfers to it.
+5. **Step 5 did not run.** The 290-entry PORT-NOW queue for
+   `5559679229..e126687a9a` is classified and reconciled but unworked, so 90
+   files whose `Ported from:` header names `55596792` now name a revision BELOW
+   the pin. Owed by [#2611](https://github.com/mudler/vllm.cpp/issues/2611).
 
-**Evidence for the paragraph above.**
+**Evidence for the limits above.**
 [#2626](https://github.com/mudler/vllm.cpp/issues/2626) is owned by
 `MODEL-MM-QWEN4-EXP` and listed under `## Owed` in
 [`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md); the
 measurement and its explicit non-claims are in
 [`../sync/2026-09-03-e126687-runhalf.md`](../sync/2026-09-03-e126687-runhalf.md)
-§6.
+§6 and §7.
+
+### The prior pin, for anyone reading a number taken under it
+
+`5559679229bc961848b121ccdeaa8fa5d79bec98`, `0.26.0.dev0`, pinned 2026-07-26,
+FlashInfer `0.6.15.post1`, CUTLASS DSL `4.6.0`, transformers `5.14.1`. Every
+binding ratio published in `docs/benchmarks/` was measured against it. That
+advance re-captured goldens on its own oracle and recorded zero real drift; this
+one did not, which is the difference §"NOT established" item 2 is about.
 
 ## Device-scoped gateability
 

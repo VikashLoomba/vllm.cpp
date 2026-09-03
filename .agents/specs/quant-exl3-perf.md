@@ -22,7 +22,65 @@ correctness rows and both say so. #2570 named a throughput gap with no owner,
 and an unowned gap is one nobody reruns.
 
 Slice A (the `(3, 2)` GEMV instantiation) is described below. Everything else is
-under `## Owed`, itemised, with the reason it is not closed here.
+under `## Evidence
+
+### Host arm, executed 2026-09-03 on `mudler-ubuntu-box`
+
+CPU-only build (`RelWithDebInfo`, no CUDA toolchain on this host), built in
+`/dev/shm` because `/` had 8.2 GB free. `BUILD_RC=0` in 432 s;
+`ctest -R '^test_exl3_gemv$'` passed.
+
+```
+[doctest] test cases:  7 |  7 passed | 0 failed | 0 skipped
+[doctest] assertions: 69 | 69 passed | 0 failed |
+```
+
+The device tier-3c case SKIPPED, once, and is counted above because it still
+asserts on the way out (`CHECK_FALSE(OpRegistered(kExl3Gemm, kCUDA))`). A skip
+that asserts nothing reports `assertions: 0`, which reads as a pass; this one
+cannot. **So the tier-3c bound and the `(3,1)`-vs-`(3,2)` discrimination check
+are UNMEASURED here and are not claimed.** They need the lease.
+
+### Mutation table — host arm
+
+Each row asserts four things, because three of them have faked a pass in this
+tree before: the mutated file's `sha256` CHANGED, it COMPILED, the test binary's
+`mtime` MOVED, and the tree RESTORED byte-for-byte.
+
+| Mutation | file | sha256 | built | mtime moved | `TEST_RC` | verdict | restored |
+|---|---|---|---|---|---|---|---|
+| baseline | — | `db293772…` | — | — | 0 | 69/69 pass | — |
+| M3 narrow admission boundary `<=` → `<` | `src/vt/exl3_policy.cpp` | `bd89702425…` | OK | YES | 1 | **RED**, 6 failed | YES |
+| M4 `if (K == 3) return -1;` → `return 0;` | `src/vt/exl3_policy.cpp` | `f82c3ece4a…` | OK | YES | 1 | **RED**, 4 failed | YES |
+
+After restore: build `rc=0`, file `sha256` matches the baseline, gate `rc=0`, and
+the assertion counts are identical to the baseline line for line.
+
+The two mutations bracket the boundary FROM BOTH SIDES, which is what a discrete
+selection gate needs — its error is bimodal, not a tolerance. M3 reds the
+ADMITTED side and M4 reds the DECLINED side, and the specific cases that fire
+are this row's new ones:
+
+```
+M3  :169  Exl3GemvSelectConfig(bw, 1, 5120, 17408, 3, 2, 1, 544) == 0   -> got -1
+M3  :171  Exl3GemvSelectConfig(bw, 1, 17408, 5120, 3, 2, 1, 160) == 0   -> got -1
+M4  :168  Exl3GemvSelectConfig(bw, 1, 5120, 17408, 3, 2, 1, 543) == -1  -> got 0
+M4  :170  Exl3GemvSelectConfig(bw, 1, 17408, 5120, 3, 2, 1, 159) == -1  -> got 0
+```
+
+M3 also reds the `(4, 2)` threshold rows, which is the point of recording them
+before that arm exists: they are what the port will be measured against.
+
+### Device arm — PENDING
+
+Queued on `dgx:gpu0` behind other work. NOTHING device-shaped is claimed until
+it runs: not the tier-3c bound at either codebook, not the discrimination check,
+not `narrow_coresident`, and not one throughput number. The mutations that must
+run there are M1 (take `(3,2)` back out of the predicate, which reproduces the
+pre-change binary and is the control the one-binary A/B rests on) and M2 (thread
+`GemvKernelForArm<3, 1>` for `cb == 2`, the confusable pair).
+
+## Owed`, itemised, with the reason it is not closed here.
 
 **No throughput number is claimed by this row yet.** The arm is instantiated and
 its numeric gate and A/B are QUEUED on `dgx:gpu0` behind other work. Until that

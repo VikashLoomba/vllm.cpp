@@ -49,12 +49,22 @@
 //    stride is applied, so the output frame count is
 //    `(T + k_t - 1 - k_t) / stride + 1`.
 //
-// ─── DTYPE ───────────────────────────────────────────────────────────────────
-// f32 throughout, for exactly the reason ltx2_video_vae.cpp:20-44 gives for the
-// decoder: this is the CPU REFERENCE arm and upstream instead runs in the
-// CHECKPOINT's dtype. No gate here can catch a dtype that is merely too WIDE,
-// because the generator casts every upstream parameter to f32 and the oracle
-// therefore runs f32 too. The production arm is owed with the decoder's.
+// ─── DTYPE: f32, AND IT IS NO LONGER OWED "WITH THE DECODER'S" ──────────────
+// f32 throughout, where upstream runs the encoder in the CHECKPOINT's dtype --
+// it is `ImageConditioner`'s VideoEncoder and upstream constructs it with the one
+// pipeline dtype (distilled.py:120-122). No gate here can catch a dtype that is
+// merely too WIDE, because the generator casts every upstream parameter to f32
+// and the oracle therefore runs f32 too.
+//
+// THIS BLOCK USED TO SAY "the production arm is owed with the decoder's", AND
+// THAT SENTENCE IS NOW FALSE. A24 wave 3 (row LTX25-A24-VIDEO-VAE-BF16, issue
+// #2786) landed the DECODER's bf16 arm and deliberately did not land this one:
+// the encoder is a separate route with a separate weights bag, the render loads
+// it through its own `Ltx2LoadVaeWeights` call at the f32 default, and the two
+// halves share one kernel table whose `dtype` parameter lets them differ. The
+// encoder's bf16 arm is owed by NAME under `## Owed` in
+// .agents/specs/ltx25-a24-video-vae-bf16.md, with its own upstream anchors, and
+// not by a cross-reference to a row that has already shipped.
 #pragma once
 
 #include <cstdint>

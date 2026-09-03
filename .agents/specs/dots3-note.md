@@ -5448,7 +5448,7 @@ predicate are THE SAME PREDICATE**, called from both places, because a refusal
 that is narrower than the route it guards is a silently wrong answer rather than
 an error.
 
-**Two upstream knobs are DEAD, not deferred, and the difference is worth
+**Three upstream knobs are DEAD, not deferred, and the difference is worth
 writing down.** `conv_chunksize`, `conv_bucket_max_elements` and
 `conv_bucket_step` are read out of the config by `Dots3NoteAudioConfig`
 (`audio.py:47`, `:51-52`) and copied onto the `WhisperConfig`

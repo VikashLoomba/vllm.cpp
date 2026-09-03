@@ -419,6 +419,131 @@ python3 scripts/check-pr-size.py --base origin/main --head HEAD
 * A probe stops separating its hypotheses. Stop and rebuild the probe; do not
   emit a golden that cannot fail.
 
+## Outcome
+
+Everything below was measured on this branch. Where §4 predicted an answer and
+the branch measured a different one, the branch wins and the difference is named.
+
+### What §4 got right, and the one thing §7 got wrong
+
+Every fact in §4 held: the norm's f32 epsilon, split rope's fused second term,
+interleaved rope's three roundings, the RoPE tables' narrowing, the Linear's
+single rounding, MATH's exactness, the register select and the GELU.
+
+**§7 was wrong about the accumulator, and it was wrong in the direction that would
+have cost values.** It said the bf16 arm would accumulate the mean square in f32
+because upstream's `torch.mean` does. Measured against upstream at three widths,
+with a sequential f32 loop and with the f32 arm's existing f64 one:
+
+| width | sequential f32 sum | f64 sum | of |
+|---|---|---|---|
+| 24 | 0 | 0 | 96 000 |
+| 120 | 2 | 0 | 480 000 |
+| **3840** (shipped) | **11 000** | **24** | 15 360 000 |
+
+`torch.mean` is a BLOCKED f32 reduction, so it is far more accurate than a
+sequential f32 loop and is approximated much better by an exact f64 sum than by a
+same-width one. The f64 escape stays on both arms, and the header now says this
+was measured rather than inherited.
+
+### The kernel that is not a function of its input, one level up from wave 1
+
+`AttentionFunction.AUTOMATIC` resolves to
+`SDPA[FLASH_ATTENTION>EFFICIENT_ATTENTION>MATH>CUDNN_ATTENTION>OVERRIDEABLE]` and
+FLASH serves the call on this CPU. Eight hypotheses over {round scores, round
+probabilities, scale before/after the GEMM} were measured against it; the closest
+differs on 128 of 384 bf16 words and a fully-materializing bf16 chain on 195.
+`SDPBackend.MATH` is bit-equal to an f32-accumulated attention with no
+intermediate rounding — 0 of 384 against both an f32 and an f64 reference — so the
+goldens are emitted against MATH and the distance to the unpatched module is
+reported. The generator prints it per arm:
+
+```
+  bf16 connector Split:       MATH vs AUTOMATIC differs on 57/384 words, max|diff| 0.015625  (max|golden| 2.6875)
+  bf16 connector Interleaved: MATH vs AUTOMATIC differs on 38/384 words, max|diff| 0.00842285 (max|golden| 2.9375)
+  bf16 connector Float64:     MATH vs AUTOMATIC differs on 19/384 words, max|diff| 0.0078125  (max|golden| 2.26562)
+  bf16 connector NoRegisters: MATH vs AUTOMATIC differs on 12/384 words, max|diff| 0.0078125  (max|golden| 2.28125)
+  bf16 connector GatedNoBias: MATH vs AUTOMATIC differs on 61/384 words, max|diff| 0.0117188 (max|golden| 2.78125)
+```
+
+The f32 arm has the same problem and has always lived with it: at f32 the two
+backends differ by 4.77e-7 across the whole connector, under `kRoundOff`.
+
+### §6.3 planned a tolerance and the tree does not need one
+
+**The port is BIT-EXACT to the MATH oracle on all five arms — max|diff| 0.0.** The
+format-derived bound §6.3 planned is 0.0177 to 0.0229 on these arms, and keeping
+it would have been a mute switch rather than a safety margin. Measured, under that
+bound:
+
+* mis-rounding SPLIT rope reds **1 of the 4** split arms; under bit-exactness, 4 of 4;
+* leaving the RoPE tables at f32 moves 3 of 5 arms by LESS than the bound;
+* running the arithmetic at f32 with bf16 weights moves **all 5** by less than it.
+
+The bound is still computed and printed beside the measured difference so a reader
+can see how much room the format would have allowed. The gate is `worst == 0.0`
+plus `to_unpatched == kernel_gap`, which follows from bit-exactness and breaks if
+either side moves.
+
+### The dtype gate, which is the row
+
+Unit level, both directions on one fixture, five arms:
+
+```
+bf16 arm returns 0 of 384 values wider than bf16; the f32 arm, same config and
+same input, returns 384 of 384.
+```
+
+Engine level, on the render path, before and after:
+
+```
+RED  (f32 connector, the tree at 8e582a5f9 with the assertion flipped)
+  test_ltx2_video.cpp:7012: ERROR: CHECK( fox.trace.connector_video_not_bf16 == 0 )
+    values: CHECK( 16384 == 0 )
+    logged: tower output wider than bf16: video 0 of 16384, audio 0 of 8192
+            connector (f32, wave 2) wider than bf16: video 16384 of 16384, audio 8191 of 8192
+  [doctest] assertions: 67 | 65 passed | 2 failed |
+
+GREEN (this branch)
+  [doctest] test cases:  1 |  1 passed | 0 failed | 112 skipped
+  [doctest] assertions: 67 | 67 passed | 0 failed |
+```
+
+**The 65 assertions that never moved are the argument for A24.** The digests, the
+absmax, the prompt dependence, the frame bytes and the determinism check all
+passed while the conditioning the DiT cross-attends over was twice as wide as
+upstream's.
+
+### The five mutations, with their literal results
+
+The tree was restored with `git checkout --` after each and re-verified green.
+
+| mutation | result |
+|---|---|
+| **A. delete the production call site** — revert `ConnectorWeightSet::Ensure` to the f32 loader arm | `CHECK( 16384 == 0 )` and `CHECK( 8191 == 0 )`. `assertions: 67 \| 65 passed \| 2 failed`. Exactly the two dtype assertions; nothing else on the render path moved. This is the reachability proof. |
+| **B. round split rope like the interleaved arm** | reds Split, Float64, NoRegisters and GatedNoBias — all four split-rope arms — and leaves Interleaved green. `assertions: 409 \| 403 passed \| 6 failed`. |
+| **C. use `bf16(1e-6)` for the norm epsilon** | reds ONLY the epsilon probe, on 2 assertions: `worst == 0.0` and `to_rejected > 0.0`. `assertions: 722 \| 720 passed \| 2 failed`. All ten arm goldens, f32 and bf16, stay green — which is the claim that the arm goldens cannot hold the epsilon and the small-row probe can. |
+| **D. leave the RoPE tables at f32** | reds all five arms. `assertions: 722 \| 714 passed \| 8 failed`. Three of the five moved by less than the format bound, which is how this mutation proved the bound had to go. |
+| **E. bf16 weights, f32 arithmetic** | reds all five arms on the value golden AND on `narrow_wider == 0`, `assertions: 15 failed`. Under the ORIGINAL bound only `narrow_wider` would have fired. At the ENGINE level there is no golden at all, so the counter is the only instrument there — which is what A measured. |
+
+### Why `Ltx2TextConditioning` is still owed, measured rather than argued
+
+Wave 1 handed this row that container to narrow. Narrowing it turns wave 1's two
+strongest assertions into tautologies: `tower_video_not_bf16` is counted over that
+f32 buffer, and wave 1's unit gate asserts the bf16 round trip on the floats
+`Ltx2EncodePromptToConditioning` returns. A `std::vector<uint16_t>` satisfies both
+by construction. It buys about 12 MB at the shipped widths, against the ~4 GB the
+weights arm returns. It narrows when the DiT's `Ltx2ModalityInput` seam narrows
+and a replacement gate exists.
+
+### One record repaired in flight
+
+`ltx2_video.cpp`'s READER ANCHORS list went stale because this row's comments moved
+the lines under it, and `test_ltx2_video`'s own anchor gate caught it and printed
+the replacement. Recorded because it is the third time this file's line anchors
+have drifted inside one pull request, and because it is why §3 above cites a
+`grep -c` on a call string instead of a line number.
+
 ## Owed
 
 * **The other six A24 components**, none of which this row touches: the video VAE
@@ -436,5 +561,5 @@ python3 scripts/check-pr-size.py --base origin/main --head HEAD
 
 ## Now
 
-`ACTIVE`. The spec commit precedes the implementation commit, which is the commit
+`DONE`. The spec commit precedes the implementation commit, which is the commit
 order that proves it came first.

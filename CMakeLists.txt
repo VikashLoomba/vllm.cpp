@@ -813,6 +813,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_device.cpp
   src/vllm/model_executor/models/dots3_note_vision.cpp
+  src/vllm/model_executor/models/dots3_note_audio.cpp
   src/vllm/model_executor/models/dots3_note_registry.cpp
   src/vllm/model_executor/models/qwen4_exp_ple.cpp
   src/vllm/model_executor/models/qwen4_exp.cpp
@@ -1087,6 +1088,7 @@ add_library(vllm STATIC
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp
   src/vllm/multimodal/dots3_note_processor.cpp
+  src/vllm/multimodal/mel_filter_bank.cpp
   # Pillow's BICUBIC resampler, which is NOT torchvision's and NOT a four-tap
   # cubic (dots3-note W6c, #2537).
   src/vllm/multimodal/pil_resize.cpp

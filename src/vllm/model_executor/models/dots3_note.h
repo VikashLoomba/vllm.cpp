@@ -45,6 +45,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dots3_note_audio.h"
 #include "vllm/model_executor/models/dots3_note_vision.h"  // W6a: the DENSE ViT arm
 #include "vllm/model_executor/models/mla_attention.h"    // MlaBlockDims / the seam
 #include "vllm/model_executor/models/model_registry.h"
@@ -507,6 +508,17 @@ struct Dots3NoteWeights {
   Dots3NoteVisionParams vision_params;
   Dots3NoteVisionWeights vision;
   std::string vision_refusal;
+
+  // W7a (#2703) — the AUDIO tower, on exactly the same polarity and for the
+  // same reason. `audio.present` is TRUE only when the config HAS an
+  // `audio_config` AND `Dots3NoteAudioRefusal` accepted it, which for the
+  // RELEASED `dots-studio/dots3-note-prev` it DOES: all 430
+  // `audio_encoder.*` tensors are BF16 and every `audio_config` key it sets is
+  // an arm W7a computes. `audio_refusal` keeps the message for the encoder
+  // hook to report verbatim.
+  Dots3NoteAudioParams audio_params;
+  Dots3NoteAudioWeights audio;
+  std::string audio_refusal;
 };
 
 // Why the DEVICE forward cannot run `params`, or "" when it can. The message

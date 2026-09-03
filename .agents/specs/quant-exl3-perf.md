@@ -24,6 +24,11 @@ and an unowned gap is one nobody reruns.
 Slice A (the `(3, 2)` GEMV instantiation) is described below. Everything else is
 under `## Owed`, itemised, with the reason it is not closed here.
 
+**No throughput number is claimed by this row yet.** The arm is instantiated and
+its numeric gate and A/B are QUEUED on `dgx:gpu0` behind other work. Until that
+lease runs, every device claim here is PENDING and is reported as PENDING; a
+queued job nobody could gate is a partial result and never a pass.
+
 ## The gap, as #2570 states it
 
 Our `m <= 8` EXL3 GEMV instantiated exactly one arm, `(bits = 3, cb = 1)`.
@@ -136,6 +141,22 @@ So the measurement carries THREE legs, not two:
 
 `narrow_coresident` itself is printed from the device, so the table above stops
 being a prediction.
+
+**WHAT SEPARATES G0 FROM G1 WHEN THE ENVELOPE DECLINES, exactly.** Read
+`Exl3GemvTryLaunch` in order: `force_gemv == 0`, then the arm predicate, then
+`Exl3GemvHardEligible`, then the mode, then `GemvKernel`, then `GemvOccupancy`,
+then `Exl3GemvSelectConfig`. `VT_EXL3_GEMV=0` returns at the MODE test, which is
+before the occupancy query. So if the envelope declines at mode 1, the whole
+measured difference between G0 and G1 is one
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` per (device, kernel) pair,
+memoised in a static map. That is why `G1 == G0` would be the EXPECTED reading
+under a declining envelope rather than a surprise, and why G2 is needed to say
+anything about the kernel itself.
+
+The same order is what makes the pre-change binary and `VT_EXL3_GEMV=0`
+equivalent on this checkpoint: the old predicate returned false one test EARLIER
+than the mode test does, and neither reaches a device call. Both fall through to
+`exl3_gemm_kernel` with identical arguments.
 
 ## Scope
 

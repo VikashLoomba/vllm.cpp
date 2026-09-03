@@ -551,8 +551,8 @@ vt::DType MaterializeDitTensor(const SafetensorsFile& file, const DitPlan& plan,
 // happen" check — and `ltx2_lora.cpp` is about the adapter format.
 
 // Open every requested adapter against the contract this load will bind, and
-// resolve the reference factors, whose conflict and arity refusals fire here
-// rather than at first use (ic_lora.py:150-173 resolves them in __init__).
+// resolve the reference factors, whose conflict refusals fire here rather than
+// at first use (ic_lora.py:150-173 resolves them in __init__).
 std::vector<Ltx2LoraAdapter> OpenDitLoras(const Ltx2DitLoadOptions& options,
                                           const std::vector<Ltx2TensorSpec>& contract) {
   if (options.loras.empty()) return {};
@@ -566,8 +566,8 @@ std::vector<Ltx2LoraAdapter> OpenDitLoras(const Ltx2DitLoadOptions& options,
     out.push_back(Ltx2LoraAdapter::Open(spec, names));
   }
   // The caller resolves the reference factors immediately, and that call is what
-  // refuses more than one adapter and refuses conflicting metadata — before any
-  // tensor is materialized.
+  // refuses conflicting metadata across the adapters — before any tensor is
+  // materialized.
   return out;
 }
 

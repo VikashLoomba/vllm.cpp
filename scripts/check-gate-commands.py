@@ -463,6 +463,14 @@ def audit() -> list[dict]:
 # reachable on this fleet. The credit returns when the row reaches a gate-obliged
 # state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
+    # 2026-09-02: +QUANT-EXL3-PERF. GROWTH, and re-pinned in the same change that
+    # caused it. The row is new (#2570) and its spec's `## Gates` section names
+    # two `ctest` invocations and `scripts/agent-preflight.sh --staged`, each of
+    # which can fail: `test_exl3_gemv` carries the envelope cases, which are pure
+    # integer arithmetic and run anywhere, and the device tier-3c case, which is
+    # RED for codebook 2 on any tree where that arm is not instantiated. A row
+    # enters this population by what its Gates section can RUN, and these run.
+    "QUANT-EXL3-PERF",
     # 2026-09-01: +QUANT-EXL3-MUL1. GROWTH, and re-pinned in the same change
     # that caused it, as this ratchet requires. The row is new (#2495) and its
     # spec's `## Gates` section names four `ctest` invocations and

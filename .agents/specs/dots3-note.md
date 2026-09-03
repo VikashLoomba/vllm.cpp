@@ -4316,6 +4316,350 @@ stays as defence in depth, on the same polarity Qwen3-VL's carries ("reaching
 this point is a defect"). The gate asserts BOTH halves: 400 on the image, 200 on
 a text request sent after it.
 
+### 4.12 W6b computes the PYRAMID, and the released tower stops refusing
+
+W6a shipped the dense blocks and refused the rest by name; this brick lifts that
+refusal. The released `dots-studio/dots3-note-prev` carries 42 vision blocks of
+which **17 are pyramid MoE**, so before W6b no image request against the real
+checkpoint could be served at all. After it, `Dots3NoteVisionRefusal` returns ""
+for that config and `MaterializeDots3NoteVision` loads all **2195**
+`vision_encoder.*` tensors — W6a's 235 plus the 1960 the pyramid adds.
+
+Issue [#2613](https://github.com/mudler/vllm.cpp/issues/2613). Upstream is
+`vllm/models/dots3_note/nvidia/vision.py` read in `~/_git/vllm` at
+**`9035151d6`**; the local clone's identity was re-asserted with `git rev-parse`
+before a line was ported, and every anchor below names that SHA because
+`dots3_note` does not exist at our parity pin `5559679229` and upstream has
+already moved under this row.
+
+#### 4.12.1 The router is not the language tower's, and the spelling proves it
+
+| | vision (`MoESwiGLUFFN`) | language (`DeepseekV2MoE`) |
+|---|---|---|
+| router weight | `mlp.gate_weight` `[E_r, 1536]` BF16 | `mlp.gate.weight` |
+| router bias | `mlp.router_bias` `[E_r]` **F32** | `mlp.gate.e_score_correction_bias` `[256]` F32 |
+| experts | `mlp.experts.{e}.{fc1,fc2,fc3}` | `mlp.experts.{e}.{gate,up,down}_proj` |
+| grouping | none | `n_group`/`topk_group` (both 1 here) |
+| top-k | `min(int(capacity_factor), num_routed)` = 2 | `num_experts_per_tok` = 8 |
+| combine | SELF-NORMALIZING (`/ (aggregated_gate + 1e-9)`) | plain weighted sum + shared expert |
+
+Both spellings live in the SAME checkpoint, so conflating them is not a naming
+preference: `EnumerateDots3NoteVisionTensors` claiming `mlp.gate.weight` on a
+vision block would find no tensor and refuse the load for the wrong reason. The
+gate asserts the two apart by name rather than assuming they differ.
+
+The counts are the released index's own, read from the committed
+`tests/vllm/models/fixtures/dots3_note_prev/index_full.json`: 17 routed blocks
+carrying `4, 8, 12 ... 60, 64, 64` = **608** routed experts, `17 * 8 + 608 * 3 =
+1960`, and `235 + 1960 = 2195`.
+
+#### 4.12.2 The router IS `vt::MoeRouterTopK`, and that is a measurement
+
+Upstream's router, line by line at `9035151d6`:
+
+```
+:181  gate_logits = F.linear(x_flat.float(), self.gate_weight.float())
+:183  gating_prob = torch.sigmoid(gate_logits)                   # ELEMENTWISE
+:193  gating_with_bias = gating_prob + router_bias.to(f32)
+:194  _, topk_indices = torch.topk(gating_with_bias, k=topk, sorted=False)
+:196  routed_weights = gating_prob.gather(1, topk_indices)       # UNBIASED
+:197  if sigmoid and topk > 1: routed_weights /= (sum + 1e-9)
+:201  routed_weights = routed_weights * self.router_scale
+```
+
+`vt::MoeRouterTopK` with `num_expert_group = 1` is that function and not an
+approximation of it. Its grouped arm (`cpu_ops.cpp:2825-2942`, ported from
+`grouped_topk_router.py:110-160`) computes sigmoid scores elementwise, adds the
+bias to the SELECTION score only, reads the weight from the UNBIASED score,
+renormalizes by the selected sum and then applies `routed_scaling_factor`. At one
+group the group stage is definitionally inert — one group, `topk_group = 1`, the
+mask all-ones — which is the same reasoning §4.10 records for the language
+tower's `n_group == 1`.
+
+**0 is not a smaller 1.** Passing `num_expert_group = 0` selects the op's
+ungrouped path, which is SOFTMAX and ignores the bias entirely; the op wrapper
+refuses a bias there for exactly that reason. So the choice of 1 is load-bearing
+and is written with its reason beside it.
+
+**The one difference, named rather than smoothed over.** Upstream divides by
+`sum + 1e-9`; the shared op divides by `sum` under a `denom > 0` guard. That is
+1e-9 RELATIVE against a bf16 store of 3.9e-3. The in-test reference spells
+UPSTREAM'S version, so the difference is carried by the gate's tolerance and
+measured, not defined away.
+
+#### 4.12.3 The combine's denominator is a CONSTANT, and that is why two arms refuse
+
+Upstream's combine (`vision.py:203-218`) accumulates a per-token
+`aggregated_gate` and returns `aggregated_output / (aggregated_gate + 1e-9)`.
+After `:197-:201` the routed weights sum to `router_scale` for every token, so
+that denominator is a per-tower CONSTANT and `vt::MoeCombine`'s single-float
+`routed_scale` expresses it exactly as `1 / (router_scale + 1e-9)`.
+
+That identity holds only where upstream renormalized. On the two arms where it
+does not — `router_scoring_func == "softmax"`, and any block whose
+`min(int(capacity_factor), num_routed)` is below 2 — the denominator is genuinely
+per-token, and no op in `include/vt/ops.h` expresses a per-token scale on the
+combine (`MoeCombine`'s is one float; `MulColVecF32` broadcasts over COLUMNS).
+Serving them would mean either widening `vt::MoeCombine` — the op DeepSeek-V2's
+SACRED token-exact path routes through — or a device sync per routed block to
+renormalize a `[L, top_k]` f32 buffer on the host. Neither belongs in a brick
+that is adding a tower, and no published dots3-note checkpoint selects either
+arm: the released config and `DotsMoEVitConfig`'s own defaults are both sigmoid
+at capacity 2. **Both are refused BY NAME, listed under `## Owed`, and owned by
+[#2615](https://github.com/mudler/vllm.cpp/issues/2615).**
+
+#### 4.12.4 Where the shared seams carry it, and the one place W6a's choice is wrong
+
+Every routed expert's SwiGLU rides `layers::MlpGateUpMethodBase`, exactly as the
+dense blocks do — but through `UnquantizedMlpGateUpSplitMethod` rather than
+W6a's merged `UnquantizedMlpGateUpMethod`, and the reason is measured. Merging
+`fc1|fc3` needs a COPY out of the mmap, which on the released checkpoint is
+`608 experts x 2 x 2112 x 1536 x 2 B` = **7.9 GiB** of resident bytes bought for
+one fewer kernel launch. The split method exists in `linear.h` for precisely this
+case and says so in its own prose. The DENSE blocks keep the merged operand,
+where the same copy is 649 MiB across 25 blocks and was already paid by W6a.
+
+`vt::MoeRouterTopK` and `vt::MoeCombine` carry the router and the combine. The
+gather/scatter around the experts mirrors `dots3_note_device.cpp`'s reference MoE
+arm — the arm the CPU queue takes there too. What is NOT hoisted is that file's
+grouped-GEMM fast path: it reads a Matmul-B expert layout this tower does not
+have, and adding one would be a residency change on a brick with no performance
+claim.
+
+#### 4.12.5 The F32 is on the OUTPUT, not on the operands
+
+Upstream writes `.float()` on both sides of the router GEMM (`:181`). Both sides
+are bf16-VALUED — `x` is the bf16 `norm_2` output and `gate_weight` is BF16 on
+disk in the released index — and a bf16 x bf16 product is exact in f32. A
+bf16-operand GEMM with an f32 accumulator therefore IS
+`F.linear(x.float(), w.float())`, while widening the stored operand would double
+the resident bytes for no information at all. So the logits buffer is f32 and the
+operands are not, with the reason written beside it — `porting.md`'s
+memory-format rule applied in the direction it is usually not.
+
+`router_bias` is the exception that really is f32, and it is UPSTREAM'S choice:
+`register_buffer("router_bias", torch.zeros(num_routed, dtype=torch.float32))`
+(`vision.py:152-155`). Those 17 buffers are exactly the 17 F32 tensors the
+released vision tower carries against 2178 BF16 ones, and the census that says so
+is §4.4's. The loader asserts the dtype in BOTH directions — `RequireVisionShape`
+refuses a widened weight, `RequireF32VisionShape` refuses a narrowed bias — and
+the gate carries a case that writes the bias BF16 and reads the refusal, which is
+this row's W2 F1 fixture row pointed at the vision router.
+
+#### 4.12.6 The gate needs a shape the dense arm did not
+
+**Top-k selection is a DISCRETE choice, so its error is bimodal.** Either the
+same experts were chosen and the output error is the ordinary bf16 one, or a
+different expert was chosen and the output is a different function. There is
+nothing in between for a relative bound to measure, and a selection defect that
+happens not to flip on the fixture leaves a tolerance green while saying nothing.
+A tolerance alone on this path is a mute switch.
+
+So the gate does three things a tolerance cannot:
+
+1. **Selection-SET equality, per token**, against the reference's own
+   independent scan. A set rather than a sequence, because
+   `torch.topk(..., sorted=False)` leaves the ORDER unspecified upstream and the
+   combine is a sum.
+2. **The minimum decision MARGIN, printed** — the gap between the last selected
+   and the best rejected biased score, minimised over tokens — so the reader
+   knows how much room the assertion had. A margin at zero would mean the fixture
+   decides its routing by a tie and the agreement is luck.
+3. **The instrument's own precondition**, asserted: the fixture's 16 tokens must
+   touch at least 3 of the 4 routed experts. Without it, a router that ignored
+   its input and sent every token to the same pair would pass the set assertion.
+
+The reference (`namespace ref` in `tests/vllm/models/test_dots3_note_vision.cpp`)
+shares NO helper with the implementation: its own sigmoid, its own selection
+scan, its own per-expert SwiGLU, and the literal `aggregated_gate` division
+rather than the constant the implementation folds into `routed_scale`. Keeping
+the literal form is what makes the 1e-9 difference between them a measurement.
+
+**This is still a CONSISTENCY gate and it says so.** §6.4 records option B: the
+checkpoint is 298.67 GB fp8 / 576.89 GB bf16 against 119-122 GiB hosts, so vLLM
+cannot be run on it on any hardware this project owns and no denominator exists.
+Two implementations agreeing is not either of them being right, and **no
+performance number is claimable on any axis** while B holds.
+
+#### 4.12.7 The config arms W6a deferred: four lifted, one still refused
+
+| Arm | W6b | Why |
+|---|---|---|
+| `adapter_type = pixel_shuffle_mlp` | **LIFTED** | `PixelShuffleAdapter` (`vision.py:419-461`) is a real published adapter with its own state dict (`proj.0`/`proj.1`/`proj.3`) and its own token order. Implemented, and gated against a reference that spells the reshape/permute chain rather than the closed form the implementation gathers by |
+| `post_norm = false` | **LIFTED** | W6a's forward and enumerator already had the branch; only the refusal stood in front of it. `nn.Identity()` upstream (`vision.py:513-514`), one tensor fewer |
+| `use_qk_norm = false` | **LIFTED** | upstream builds no `q_norm`/`k_norm` module (`vision_attention.py:145-147`) and the checkpoint ships neither; two tensors fewer per block |
+| `is_causal = true` | **LIFTED** | `causal=self.is_causal` on the FLASH family (`vision_attention.py:265`, `:291`, `:302`), which is what the released `attn_implementation = flash_attention_3` selects |
+| `use_bias = true` | **STILL REFUSED**, [#2616](https://github.com/mudler/vllm.cpp/issues/2616) | see below |
+
+**`is_causal` needed a decision, and the record has to carry it.** The two EAGER
+attention classes store `self.is_causal` and never read it:
+`VisionAttention.forward` (`:172-204`) builds its mask from `cu_seqlens` alone and
+`VisionAttentionV2.forward` (`:210-239`) takes a plain full softmax per segment.
+So upstream silently ignores a true `is_causal` on an eager implementation and
+masks on a flash one. This port follows the FLASH arm, because that is what the
+released `vision_config` asks for. On the released config the flag is false and
+the two arms coincide, so the choice becomes visible only on a checkpoint that
+sets it — which is why it is written down here rather than left to be found.
+
+**`use_bias` is refused for three reasons and none of them is effort.** No
+published dots3-note checkpoint sets it (`DotsMoEVitConfig`'s own default is
+`False`, `vision.py:43`, and the released config agrees). The shared
+`layers::MlpGateUpMethodBase` seam has no bias operand, so lifting it means
+either extending the seam every model in the tree routes its MLP through, for a
+configuration none of them has, or writing the two GEMMs by hand beside it —
+which is the parallel path AGENTS.md forbids. And it would land UNREACHED: the
+only production entry point that could reach a `use_bias` arm is a checkpoint
+that declares it, and the only such checkpoint would be a fixture written to
+reach it. The refusal names the keys, the seam and the issue, and a served
+request against such a checkpoint gets HTTP 400 with the text path still
+answering afterwards.
+
+**One new refusal that is not a deferral.** `pixel_shuffle_mlp` at
+`adapter_merge_size != 2` is refused because `_pixel_shuffle` hard-codes
+`scale_factor=0.5` (`vision.py:401-416`, `:456`) while `merged_dim = in_dim *
+merge_size**2` (`:431`) sizes `proj.0` by the key — at anything but 2 the two
+widths disagree and upstream raises on the shape. Similarly, an ODD grid side
+under that adapter is refused in the forward: `_pixel_shuffle` duplicates the
+first row or column (`:402-405`), so it emits `ceil(h/2)*ceil(w/2)` rows while
+the prompt expands `prod(grid) // merge**2` placeholders
+(`multimodal.py:151-155`). Upstream's two halves disagree there and no such
+request is servable by either.
+
+#### 4.12.8 Reachability
+
+The production entry point is unchanged: `ApiServer::handle_chat_completions` on
+the server's default configuration. `test_openai_api_server_dots3_mm_forward`
+serves a checkpoint whose block 1 is a 4-expert pyramid block through the whole
+chain — chat seam, placeholder expansion, `AsyncLLM`, scheduler, encoder
+admission, `GPUModelRunner::execute_model`, `EncodeMmDots3NoteForCausalLM` ->
+`Dots3NoteVisionForward` -> `EmbedMmDots3NoteForCausalLM` -> `ForwardDevice`'s
+`inputs_embeds` arm — and asserts the TWO-DIFFERENT-IMAGES LOGPROB case, which
+is the only assertion of that file that survives a tower replaced by a correctly
+shaped constant.
+
+`test_dots3_note_vision` measures the arithmetic and would pass on a tree where
+nothing calls the tower, because it materializes the weights itself. That is the
+division AGENTS.md's "Nothing lands dead" asks for, and the M5 mutation below
+demonstrates it rather than asserting it.
+
+#### 4.12.9 Evidence, measured 2026-09-03
+
+Host: the developer's x86-64 Linux box, CPU queue, `-DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, `-j
+2`. No GPU lease was taken and **no number below is a performance number** —
+§6.4 option B holds, so none is claimable on any axis.
+
+**Oracle identity, asserted rather than assumed.** `git rev-parse` in
+`~/_git/vllm` reports the clone detached at
+`5559679229bc961848b121ccdeaa8fa5d79bec98`, this project's parity pin, and
+`ls vllm/models/dots3_note/nvidia/` fails there: **the pin contains no dots3-note
+at all.** Every anchor in §4.12 therefore names
+`9035151d6c9fb726181469f9e6aa9ccbf9a5dacb` — "[Model] Add native Dots3 NOTE
+multimodal support (#51255)" — read out of the same clone's object store with
+`git show 9035151d6:vllm/models/dots3_note/nvidia/vision.py`.
+
+| Suite | Result |
+|---|---|
+| `test_dots3_note_vision` | 12 cases, **20792 assertions**, 0 failed |
+| `test_openai_api_server_dots3_mm_forward` | 12 cases, **177 assertions**, 0 failed |
+| `test_dots3_note_scaffold` | 26 cases, **110835 assertions**, 0 failed |
+| `test_dots3_note_attn` | 51 cases, **6888 assertions**, 0 failed |
+| `scripts/agent-preflight.sh` | rc 0, 25 record gates ok |
+| `check-commit-style.py` / `check-commit-trailers.py`, `--range $(git merge-base origin/main HEAD)..HEAD` | rc 0 / rc 0 |
+
+W6a's suites were 8 cases / 4996 assertions and 9 cases / 68 assertions; the
+pyramid adds 4 tower cases and 3 served ones.
+
+**The reference is independent, and that was re-tested rather than inherited.**
+`namespace ref` was extracted and every qualified name inside it enumerated with
+comments and string literals stripped: **105 occurrences, all `std::`** —
+`array`, `cos`, `erf`, `exp`, `max`, `min`, `pow`, `sin`, `sort`, `sqrt`,
+`string`, `to_string`, `vector`. Not one `vllm::` and not one `vt::`. The single
+textual `vt::MoeCombine` in that span is inside a COMMENT explaining why the
+reference does the self-normalizing divide literally instead of folding it. The
+only non-`std` symbols it reaches are `dots3_tiny::TinySpec` and
+`dots3_tiny::TinyCheckpoint`, which are the FIXTURE that writes the checkpoint
+both sides read, not the implementation. So the agreement below is two
+implementations agreeing, which is what §6.4 option B buys and is not either of
+them being shown to match vLLM.
+
+**The consistency measurements**, as the suite prints them:
+
+| Arm | relative deviation | bound |
+|---|---|---|
+| dense tower (W6a, unchanged) | `max \|diff\| 0.0533141 / scale 6.31441` = **8.44e-3** | 0.02 |
+| **pyramid tower** | `max \|diff\| 0.0465721 / scale 5.96557` = **7.81e-3** | 0.02 |
+| `post_norm = false` | **6.95e-3** | 0.02 |
+| `use_qk_norm = false` | **1.35e-2** | 0.032 |
+| `is_causal = true` | **1.34e-2** | 0.032 |
+| `pixel_shuffle_mlp` | **1.01e-2** | 0.02 |
+
+The pyramid's 7.81e-3 is the same order as the dense arm's 8.44e-3, which is what
+one expects when the SELECTION agrees and the only difference left is bf16
+storage. A routed block is also a different function from a dense one on this
+fixture by `max |diff| 8.92188`, so that agreement is not an accident of a branch
+that did not matter.
+
+**The discrete assertion, and the margin it had.** Over 16 tokens the router
+touched **3 of 4** experts, so the instrument's own precondition holds: a router
+that ignored its input and sent every token to one pair could not pass. The
+minimum decision margin — the biased-score gap between the last SELECTED and the
+first REJECTED expert, minimised over tokens — is **4.0077e-3 at token 1**. The
+implementation's logits come from a bf16-operand GEMM with an f32 accumulator
+over a 16-wide reduction, so they sit within ~1e-3 relative of the reference's
+double ones; through a sigmoid, whose slope is at most 1/4, that is ~2.5e-4 of
+score. The margin is ~16x that. A small margin is the useful direction: it means
+the fixture sits near the decision boundary, so a selection defect has somewhere
+to show.
+
+**Mutations.** Each was applied, REBUILT, its two test binaries hashed against
+the green baseline, both suites run, then the file restored and `cmp` and
+`git diff --quiet` used to prove byte-for-byte identity. The green baselines are
+`ae5b65b3a2f09b22…` (tower) and `6c92af98ba637b62…` (served), and after the last
+restore both rebuilt binaries hashed back to EXACTLY those.
+
+**A changed sha is necessary and not sufficient; the CASE COUNT is the evidence.**
+This run proved it the hard way. The first attempt at M3 did not COMPILE —
+`-Werror=unused-but-set-variable` on the now-unused `rbias` — and the harness
+went on to run the M2 binaries again under an M3 label, reproducing M2's shas
+digit for digit and M2's red assertion for assertion. It read as a convincing
+M3. `BUILD_RC` is what caught it, and M3 below is the rerun that compiles.
+
+| # | Mutation | tower sha256 | served sha256 | Result |
+|---|---|---|---|---|
+| — | green baseline | `ae5b65b3a2f09b22…` | `6c92af98ba637b62…` | tower **12/12, 20792**; served **12/12, 177** |
+| M1 | the MoE branch DELETED in the forward, so a routed block falls back to dense (`if (bw.is_moe)` -> `if (false)`) | `2eea6d8c8f2eb978…` | `53591a25c3fd0704…` | **RED both** — tower 9/12, 3 cases THREW `resident weight: EMPTY tensor has no host bytes to alias`; served 9/12, three requests HTTP 500 |
+| M2 | every top-k id forced to expert 0 after the download, so the CAPTURE sees it too (a selection defect with valid shapes) | `6fb95c4efad45f2d…` | `27faf2419843aae8…` | **RED both** — tower 10/12, **23 assertions** failed, all at the SET assertion (`{0, 0} == {1, 2}`); served 11/12, the router-bias case |
+| M3 | `router_bias` dropped from the gating (`&rbias` -> `nullptr`) | `9a01cfee0dda7a6d…` | `1fc9609a68215c72…` | **RED both** — tower 10/12, **20 assertions** failed at the SET assertion; served 11/12, the router-bias case |
+| M4 | the routed FFN output replaced by a correctly-shaped constant (every expert skipped, `expert_out` left zero) | `d5099e4359067efa…` | `e1cf9900af34450f…` | **RED both** — tower 10/12, 5 tolerance assertions (relative 0.360, 0.429, 0.246, 0.351, 0.402 against 0.02/0.032); served 11/12 |
+| M5 | the production call site `w.vision = MaterializeDots3NoteVision(shards, w.vision_params)` DELETED (`dots3_note.cpp`) | `64ae5e1fdeeb5b4b…` | `72a60355fc2b5456…` | tower **12/12 GREEN**, served **RED 6/12**, four requests HTTP 500 |
+
+**M5 is the reachability measurement and it says two things.** The served suite
+loses half its cases when the materialization call site goes, so the pyramid is
+reached from `ApiServer::handle_chat_completions` on the default configuration
+rather than only from a test that builds the type by hand. And the tower suite
+stays fully green, so that suite measures ARITHMETIC and never reachability —
+which is the division `.agents/reachability.md` asks a change to demonstrate
+rather than assert.
+
+**WHAT THIS GATE CANNOT SEE**, extending §4.11.6 rather than restating it. W6a
+measured two limits that still hold unchanged: a uniform MULTIPLICATIVE error
+passes until about 1.5%, and swapping the exact-erf GELU for the tanh
+approximation is below the gate's resolution. W6b adds a third, and it is about
+the served side:
+
+- **The two-different-images LOGPROB case does NOT detect a router defect.** M2,
+  M3 and M4 are three different ways to break the routing, and all three left
+  that case GREEN. The reason is structural: block 0 is dense, so the pixels
+  still reach the answer through it, and two different images still produce two
+  different logprobs however wrong the routed block is. That case is the
+  load-bearing assertion for the TOWER being reached, and it is not an assertion
+  about the ROUTER. The served case that does catch all three is "the router
+  BIAS changes what the server answers", which compares two checkpoints
+  differing in `mlp.router_bias` and in nothing else — a premise the case
+  asserts by diffing all the fixture's tensors and requiring exactly one to
+  differ. It exists because of this measurement, not before it.
+
 ---
 
 ## 5. Gates
@@ -4809,13 +5153,23 @@ dispatchable in order, under the constraints that answer imposes.
   because the two towers agree on almost nothing below that outline (RMSNorm vs
   LayerNorm, no bias, qk-norm, a three-tensor SwiGLU, a patch-merger adapter, no
   DeepStack, no position-embedding table, no M-RoPE).
-- **W6b — the pyramid MoE ViT.** Blocks 25-41: `mlp.gate_weight` +
-  `mlp.router_bias`, sigmoid scoring, `capacity_factor`-derived top-k, and the
-  `moe_intermediate_size` experts. It OWES a SET-equality assertion on the top-k
-  plus the printed minimum decision margin; a tolerance alone cannot see a
-  bimodal selection flip. The RELEASED checkpoint has 17 such blocks, so its
-  vision tower still refuses BY NAME until this lands, which is W3's polarity
-  applied to the second tower rather than a new exception.
+- **W6b — the pyramid MoE ViT. LANDED** (evidence §4.12,
+  [#2613](https://github.com/mudler/vllm.cpp/issues/2613)). Blocks 25-41:
+  `mlp.gate_weight` + `mlp.router_bias`, sigmoid scoring, the
+  `capacity_factor`-derived top-2, and the 608 `moe_intermediate_size` experts,
+  routed through `vt::MoeRouterTopK` at one expert group, per-expert
+  `layers::UnquantizedMlpGateUpSplitMethod`, and `vt::MoeCombine` carrying the
+  self-normalizing divide as a constant `routed_scale`. The RELEASED checkpoint
+  no longer refuses: all 2195 `vision_encoder.*` tensors load and an image
+  request against it is served. It also lifted four of W6a's five deferred
+  config arms — `adapter_type = pixel_shuffle_mlp`, `post_norm = false`,
+  `use_qk_norm = false`, `is_causal = true` — and left `use_bias = true`
+  refused by name (§4.12.7,
+  [#2616](https://github.com/mudler/vllm.cpp/issues/2616)), together with the
+  softmax router and the top-k-below-2 arm
+  ([#2615](https://github.com/mudler/vllm.cpp/issues/2615)). The gate carries
+  the SET-equality assertion on the top-k plus the printed minimum decision
+  margin, because a tolerance alone cannot see a bimodal selection flip.
 - **W7 — audio tower.** The `dots` stem deltas over our Whisper encoder.
 - **W8 — MM front end + ABI.** Processor, video sampling, placeholder expansion,
   `<|audio_comp_*|>`, `include/vllm.h` surface, the example server as a thin
@@ -4880,6 +5234,40 @@ change as the lifecycle move, not afterwards.
 
 Carried openly under option B (§6.4), not waived:
 
+- **The vision MoE's SOFTMAX router arm and its top-k-below-2 arm are refused.**
+  `Dots3NoteVisionRefusal` turns away a `vision_config` whose
+  `router_scoring_func` is not `"sigmoid"`, and one whose
+  `min(int(capacity_factor), num_routed)` is below 2 on any routed block. Both
+  are arms upstream implements (`vision.py:185-186`, and the `topk > 1` guard at
+  `:197` @ `9035151d6`). The reason is §4.12.3's: on those arms upstream skips
+  the weight renormalization, which leaves the self-normalizing combine's
+  `aggregated_gate` denominator PER TOKEN, and no op in `include/vt/ops.h`
+  expresses a per-token scale on the combine — `vt::MoeCombine`'s `routed_scale`
+  is one float and `vt::MulColVecF32` broadcasts over columns. Closing it means
+  extending `vt::MoeCombine` with an optional `[T]` f32 divisor on both the CPU
+  and CUDA kernels, which is an edit to the op DeepSeek-V2's token-exact path
+  routes through, and then deleting the refusal in the same change. **Nothing
+  ships either arm**: the released `dots-studio/dots3-note-prev` and
+  `DotsMoEVitConfig`'s own defaults are both sigmoid at `capacity_factor` 2. The
+  in-test reference already spells upstream's literal `aggregated_gate`
+  division, so it will measure the new arm unchanged. Owner: this row. Issue
+  [#2615](https://github.com/mudler/vllm.cpp/issues/2615).
+- **`use_bias = true` is refused for the whole vision tower.** Upstream threads
+  `DotsMoEVitConfig.use_bias` (`vision.py:43` @ `9035151d6`) into the attention
+  `qkv`/`proj` (`vision_attention.py:143-144`), every dense block's `fc1`/`fc2`/
+  `fc3` (`vision.py:129-134`) and every routed EXPERT's (`vision.py:158-163`) —
+  1949 extra tensors on the released geometry. It is refused rather than
+  implemented for three reasons, none of them effort: nothing published sets the
+  key (upstream's default is `False` and the released config agrees); the shared
+  `layers::MlpGateUpMethodBase` seam has no bias operand, so lifting it means
+  either extending the seam every model in the tree routes its MLP through or
+  writing the two GEMMs by hand beside it; and it would land UNREACHED, since
+  the only production entry point that could reach the arm is a checkpoint that
+  declares it and the only such checkpoint would be a fixture written to reach
+  it. The refusal names the keys, the seam and the issue, and a served request
+  against such a checkpoint gets HTTP 400 with the text path still answering.
+  Owner: this row. Issue
+  [#2616](https://github.com/mudler/vllm.cpp/issues/2616).
 - **The image processor REFUSES instead of resizing, so no non-conformant image
   is servable.** `Dots3NoteImageProcessor::ProcessImage`
   (`src/vllm/multimodal/dots3_note_processor.cpp`) computes the resized size and

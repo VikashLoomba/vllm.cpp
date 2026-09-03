@@ -568,12 +568,14 @@ TEST_CASE("dots3-note W6b: two DIFFERENT images through a PYRAMID tower give two
 //     MEASURED, NOT ASSUMED, AND THE MEASUREMENT IS WHY THIS CASE EXISTS. The
 //     two-different-images case above is the only assertion in this file that
 //     survives a tower replaced by a correctly shaped constant — but it does
-//     NOT survive as a router gate, because a dense block still processes the
-//     pixels on the way. Three mutations recorded in spec §4.12.9 left it
-//     GREEN: routing every token to expert 0, dropping the router bias, and
-//     replacing the routed FFN output with a constant. All three are defects
-//     that change WHICH expert runs, and none of them changed what this server
-//     answered.
+//     NOT survive as a router gate. Three mutations recorded in spec §4.12.9
+//     left it GREEN: routing every token to expert 0, dropping the router bias,
+//     and replacing the routed FFN output with a constant. All three are
+//     defects that change WHICH expert runs, and none of them changed what this
+//     server answered, because two different images still give two different
+//     logprobs however wrong the routed block is. A fixture whose block 0 is
+//     ROUTED rather than dense does not rescue it either — that was built and
+//     run, and spec §4.12.9 has the result.
 //
 //     So the router needs its own served assertion, and this is its shape: two
 //     checkpoints that differ in `mlp.router_bias` AND IN NOTHING ELSE — every
@@ -589,12 +591,16 @@ TEST_CASE("dots3-note W6b: two DIFFERENT images through a PYRAMID tower give two
 //     written into multiplies every expert output by the OTHER selected
 //     expert's routing weight — a genuine routed-path arithmetic defect that
 //     leaves the selection SET intact — and it left this ENTIRE suite green,
-//     12/12, while reding the tower gate on tolerance alone.
+//     12/12 with 177 assertions, while reding the tower gate on tolerance alone
+//     at 2.3x to 15.6x its bound and firing ZERO set assertions.
 //
 //     So this file gates REACHABILITY and BIAS-DEPENDENCE of the routed block,
 //     and nothing about the arithmetic inside it. The tower gate
 //     (`test_dots3_note_vision`) is where routed arithmetic is caught, and spec
-//     §4.12.6 records why a served case cannot cheaply be made to catch it.
+//     §4.12.6 and §4.12.9 record why no cheap served case can be made to catch
+//     it: every served assertion available here is "two answers differ", and a
+//     deterministic arithmetic defect leaves both answers well-defined and
+//     distinct.
 // ---------------------------------------------------------------------------
 TEST_CASE("dots3-note W6b: the router BIAS changes what the server answers") {
   TinySpec biased;

@@ -4416,7 +4416,7 @@ sum to `router_scale`, at f32 to about 1e-7 — and that identity is a property
 expressions. So what survives is upstream's ~4e-3 relative requantization of a
 2-way mixture, mostly cancelled on upstream's own side, rather than a scale
 error on either. The reference keeps double throughout and models NEITHER
-rounding, which is why this sits inside the measured 7.81e-3 rather than beside
+rounding, which is why this sits inside the measured 1.01e-2 rather than beside
 it. Recorded here because a reader comparing
 `vision.py:200` with `VisionMoeFfn` will see the difference and is owed the
 reason; it is not owed a brick.
@@ -4499,9 +4499,24 @@ So the gate does three things a tolerance cannot:
    and the best rejected biased score, minimised over tokens — so the reader
    knows how much room the assertion had. A margin at zero would mean the fixture
    decides its routing by a tie and the agreement is luck.
-3. **The instrument's own precondition**, asserted: the fixture's 16 tokens must
-   touch at least 3 of the 4 routed experts. Without it, a router that ignored
-   its input and sent every token to the same pair would pass the set assertion.
+3. **The instrument's own precondition**, asserted on two axes: EVERY routed
+   expert must be selected by some token (a per-expert load floor, not a count
+   of distinct ids), and more than two of the `C(4,2) = 6` possible pairs must
+   occur. Without both, a router that ignored its input and sent every token to
+   the same pair would pass the set assertion — and the review that repaired
+   this section found the fixture doing very nearly that: 13 of 16 tokens on one
+   pair, expert 0 never selected, and the old `distinct >= 3` bound met with
+   zero slack. §4.12.9 carries the reseed and the before/after spread.
+
+**And a fourth thing it does NOT do, named here because the reader will
+otherwise assume the served suite covers it.** The three assertions above are
+about SELECTION. A routed-path defect that preserves the selection set — M6 in
+§4.12.9, which combines each expert's output with the OTHER selected expert's
+weight — is caught by this gate on TOLERANCE ALONE, and by the served suite not
+at all. §4.12.9 also records why no cheap served case can be made to catch it:
+every served assertion available here is "two answers differ", and a
+deterministic arithmetic defect leaves both answers well-defined and distinct.
+That was measured with an all-routed fixture, not assumed.
 
 The reference (`namespace ref` in `tests/vllm/models/test_dots3_note_vision.cpp`)
 shares NO helper with the implementation: its own sigmoid, its own selection
@@ -4594,7 +4609,7 @@ multimodal support (#51255)" — read out of the same clone's object store with
 
 | Suite | Result |
 |---|---|
-| `test_dots3_note_vision` | 12 cases, **20792 assertions**, 0 failed |
+| `test_dots3_note_vision` | 12 cases, **20798 assertions**, 0 failed |
 | `test_openai_api_server_dots3_mm_forward` | 12 cases, **177 assertions**, 0 failed |
 | `test_dots3_note_scaffold` | 26 cases, **110835 assertions**, 0 failed |
 | `test_dots3_note_attn` | 51 cases, **6888 assertions**, 0 failed |
@@ -4607,9 +4622,12 @@ pyramid adds 4 tower cases and 3 served ones.
 
 **The reference is independent, and that was re-tested rather than inherited.**
 `namespace ref` was extracted and every qualified name inside it enumerated with
-comments and string literals stripped: **105 occurrences, all `std::`** —
-`array`, `cos`, `erf`, `exp`, `max`, `min`, `pow`, `sin`, `sort`, `sqrt`,
-`string`, `to_string`, `vector`. Not one `vllm::` and not one `vt::`. The single
+comments and string literals stripped: **105 occurrences of 13 distinct
+`std::` names, and nothing else** — `array`, `cos`, `erf`, `exp`, `max`, `min`,
+`pow`, `sin`, `sort`, `sqrt`, `string`, `to_string`, `vector`. Thirteen is
+counted here rather than left to the reader, because the review that repaired
+this section found the count restated as 14 in the report that accompanied it.
+Not one `vllm::` and not one `vt::`. The single
 textual `vt::MoeCombine` in that span is inside a COMMENT explaining why the
 reference does the self-normalizing divide literally instead of folding it. The
 only non-`std` symbols it reaches are `dots3_tiny::TinySpec` and
@@ -4623,35 +4641,75 @@ them being shown to match vLLM.
 | Arm | relative deviation | bound |
 |---|---|---|
 | dense tower (W6a, unchanged) | `max \|diff\| 0.0533141 / scale 6.31441` = **8.44e-3** | 0.02 |
-| **pyramid tower** | `max \|diff\| 0.0465721 / scale 5.96557` = **7.81e-3** | 0.02 |
-| `post_norm = false` | **6.95e-3** | 0.02 |
-| `use_qk_norm = false` | **1.35e-2** | 0.032 |
-| `is_causal = true` | **1.34e-2** | 0.032 |
-| `pixel_shuffle_mlp` | **1.01e-2** | 0.02 |
+| **pyramid tower** | `max \|diff\| 0.0612129 / scale 6.04501` = **1.01e-2** | 0.02 |
+| `post_norm = false` | **6.59e-3** | 0.02 |
+| `use_qk_norm = false` | **8.36e-3** | 0.032 |
+| `is_causal = true` | **1.53e-2** | 0.032 |
+| `pixel_shuffle_mlp` | **1.31e-2** | 0.02 |
 
-The pyramid's 7.81e-3 is the same order as the dense arm's 8.44e-3, which is what
-one expects when the SELECTION agrees and the only difference left is bf16
-storage. A routed block is also a different function from a dense one on this
-fixture by `max |diff| 8.92188`, so that agreement is not an accident of a branch
-that did not matter.
+Every routed row moved when the review repair reseeded the router (below); the
+dense row did NOT, which is the check that the reseed touched the routed block
+and nothing else. The pyramid's 1.01e-2 is the same order as the dense arm's
+8.44e-3, which is what one expects when the SELECTION agrees and the only
+difference left is bf16 storage. A routed block is also a different function
+from a dense one on this fixture by `max |diff| 9.25`, so that agreement is not
+an accident of a branch that did not matter.
 
-**The discrete assertion, and the margin it had.** Over 16 tokens the router
-touched **3 of 4** experts, so the instrument's own precondition holds: a router
-that ignored its input and sent every token to one pair could not pass. The
-minimum decision margin — the biased-score gap between the last SELECTED and the
-first REJECTED expert, minimised over tokens — is **4.0077e-3 at token 1**. The
+**The discrete assertion, its population, and the margin it had — REPAIRED
+after review, and the repair is the interesting part.**
+
+As first landed this fixture was at the floor of its own precondition. Over 16
+tokens: 13 routed to `{1, 2}` and 3 to `{2, 3}`, so expert 2 sat in EVERY set,
+**expert 0 was never selected at all**, only 2 of the 6 possible pairs occurred,
+three tokens carried the whole discriminating population of the set assertion,
+and `distinct >= 3` passed against a spread of exactly 3 — zero slack. The gate
+still bit: M2 forces every id to `{0, 0}`, which differs from `{1, 2}` and
+`{2, 3}` alike, so all 16 set assertions had to fire and the recorded M2 run
+did. But that says only that the crudest selection defect is visible from
+anywhere; the strongest assertion in the file was standing on the weakest
+arrangement of the fixture, and expert 0 is the index an off-by-one lands on.
+
+`TinySpec::v_router_seed_nudge` was added for this and nothing else. It offsets
+the two seeds that draw `mlp.gate_weight` and `mlp.router_bias`, the shared
+`next()` stream still advances once per tensor, and every other tensor in the
+checkpoint is byte-identical — which the unmoved dense row in the table above
+confirms independently. The 64 offsets `0..63` were swept on the tower this
+fixture actually builds; **42 is the only one that reaches all four experts AND
+all six pairs**, and the search is reproducible from the fixture alone.
+
+| | as landed | at nudge 42 |
+|---|---|---|
+| experts selected | 3 of 4 (**expert 0 never**) | **4 of 4** |
+| per-expert load over 32 slots | 0 / 13 / 16 / 3 | **7 / 4 / 9 / 12** |
+| distinct selection SETS | 2 of the 6 pairs | **6 of the 6 pairs** |
+| minimum decision margin | 4.0077e-3 at token 1 | **1.25999e-2 at token 8** |
+| pyramid relative deviation | 7.81e-3 | 1.01e-2 |
+
+The precondition was strengthened with the fixture rather than after it: it now
+asserts a per-expert load FLOOR (every routed expert selected by some token) and
+a distinct-SET count above two, instead of counting distinct ids against a bound
+with no slack. The `CHECK_MESSAGE` that reports a set mismatch no longer indexes
+slots `[0]` and `[1]` by hand while `top_k == 2` is only a `CHECK`.
+
+**The margin got THREE TIMES LOOSER and that is a cost, not a win.** The
 implementation's logits come from a bf16-operand GEMM with an f32 accumulator
 over a 16-wide reduction, so they sit within ~1e-3 relative of the reference's
 double ones; through a sigmoid, whose slope is at most 1/4, that is ~2.5e-4 of
-score. The margin is ~16x that. A small margin is the useful direction: it means
-the fixture sits near the decision boundary, so a selection defect has somewhere
-to show.
+score. 1.26e-2 is ~50x that where 4.01e-3 was ~16x. A SMALL margin is the useful
+direction — it means the fixture sits near the decision boundary, so a selection
+defect has somewhere to show — and the trade was taken anyway, because the old
+margin was bought by routing 13 of 16 tokens to one pair and never exercising
+expert 0. A tight margin over a population that cannot discriminate is not a
+sharper instrument.
 
-**Mutations.** Each was applied, REBUILT, its two test binaries hashed against
-the green baseline, both suites run, then the file restored and `cmp` and
-`git diff --quiet` used to prove byte-for-byte identity. The green baselines are
-`ae5b65b3a2f09b22…` (tower) and `6c92af98ba637b62…` (served), and after the last
-restore both rebuilt binaries hashed back to EXACTLY those.
+**Mutations.** Each was applied, REBUILT with `BUILD_RC` read before anything
+else, its two test binaries hashed, both suites run, then the file restored and
+`git diff --quiet` used to prove byte-for-byte identity. **The whole table below
+was RE-RUN on 2026-09-03 after the fixture reseed above**, because a mutation
+table measured against a different fixture is a record of a tree that no longer
+exists. The green baselines are `78a0bb3bda3a1f96…` (tower) and
+`ebc83d5b15ab857a…` (served), and after the last restore both rebuilt binaries
+hashed back to EXACTLY those.
 
 **A changed sha is necessary and not sufficient; the CASE COUNT is the evidence.**
 This run proved it the hard way. The first attempt at M3 did not COMPILE —
@@ -4662,12 +4720,33 @@ M3. `BUILD_RC` is what caught it, and M3 below is the rerun that compiles.
 
 | # | Mutation | tower sha256 | served sha256 | Result |
 |---|---|---|---|---|
-| — | green baseline | `ae5b65b3a2f09b22…` | `6c92af98ba637b62…` | tower **12/12, 20792**; served **12/12, 177** |
-| M1 | the MoE branch DELETED in the forward, so a routed block falls back to dense (`if (bw.is_moe)` -> `if (false)`) | `2eea6d8c8f2eb978…` | `53591a25c3fd0704…` | **RED both** — tower 9/12, 3 cases THREW `resident weight: EMPTY tensor has no host bytes to alias`; served 9/12, three requests HTTP 500 |
-| M2 | every top-k id forced to expert 0 after the download, so the CAPTURE sees it too (a selection defect with valid shapes) | `6fb95c4efad45f2d…` | `27faf2419843aae8…` | **RED both** — tower 10/12, **23 assertions** failed, all at the SET assertion (`{0, 0} == {1, 2}`); served 11/12, the router-bias case |
-| M3 | `router_bias` dropped from the gating (`&rbias` -> `nullptr`) | `9a01cfee0dda7a6d…` | `1fc9609a68215c72…` | **RED both** — tower 10/12, **20 assertions** failed at the SET assertion; served 11/12, the router-bias case |
-| M4 | the routed FFN output replaced by a correctly-shaped constant (every expert skipped, `expert_out` left zero) | `d5099e4359067efa…` | `e1cf9900af34450f…` | **RED both** — tower 10/12, 5 tolerance assertions (relative 0.360, 0.429, 0.246, 0.351, 0.402 against 0.02/0.032); served 11/12 |
-| M5 | the production call site `w.vision = MaterializeDots3NoteVision(shards, w.vision_params)` DELETED (`dots3_note.cpp`) | `64ae5e1fdeeb5b4b…` | `72a60355fc2b5456…` | tower **12/12 GREEN**, served **RED 6/12**, four requests HTTP 500 |
+| — | green baseline | `78a0bb3bda3a1f96…` | `ebc83d5b15ab857a…` | tower **12/12, 20798**; served **12/12, 177** |
+| M1 | the MoE branch DELETED in the forward, so a routed block falls back to dense (`if (bw.is_moe)` -> `if (false)`) | `5d21d6ff21af1848…` | `571762a22c9b2079…` | **RED both** — tower 9/12, 3 cases THREW `resident weight: EMPTY tensor has no host bytes to alias`; served 9/12, 3 of 167 assertions |
+| M2 | every top-k id forced to expert 0 after the download, so the CAPTURE sees it too (a selection defect with valid shapes) | `ab5ac5a2544b00d4…` | `63ac10a5712517c6…` | **RED both** — tower 10/12, **27 assertions**, itemised below; served 11/12, the router-bias case |
+| M3 | `router_bias` dropped from the gating (`&rbias` -> `nullptr`, with `(void)rbias`) | `6a848ffc66ea0386…` | `b58330b88b6336f4…` | **RED both** — tower 10/12, **9 assertions**: 3 SET (tokens 2, 3, 8), `agreed == L`, and 5 tolerance (0.161, 0.155, 0.150, 0.0566, 0.180); served 11/12, the router-bias case |
+| M4 | the routed FFN output replaced by a correctly-shaped constant (every expert skipped, `expert_out` left zero) | `5c3cc4f0f82635fe…` | `bef9055aabbabb53…` | **RED both** — tower 10/12, 5 tolerance assertions (0.202, 0.267, 0.282, 0.500, 0.212 against 0.02/0.032), **zero SET**; served 11/12 |
+| M5 | the production call site `w.vision = MaterializeDots3NoteVision(shards, w.vision_params)` DELETED (`dots3_note.cpp`) | `347b35ebf166e2ae…` | `3de555b3fdbb819e…` | tower **12/12 GREEN, 20798**; served **RED 6/12**, 6 of 155 assertions |
+| **M6** | **the routed slot SWAPPED in the scatter** — `tj.first * k + tj.second` -> `tj.first * k + (k - 1 - tj.second)`, so every expert's output is combined with the OTHER selected expert's routing weight | `48389c5cb530a22a…` | `d0705c9b24329847…` | tower **RED 10/12, 5 assertions, ALL tolerance (0.283, 0.307, 0.301, 0.0748, 0.312), ZERO SET**; served **12/12 GREEN, 177 assertions** |
+
+**M2's 27, itemised**, because "a changed count" is not the evidence and the
+previous version of this row said "23 assertions … all at the SET assertion",
+which was wrong on both halves: 23 was the TOTAL, and the set assertions were
+16 of it — the remaining 7 being `agreed == L`, the old `distinct >= 3`, and 5
+tolerance reds. At nudge 42 the total is 27 and it decomposes as **16 SET**, 1
+`agreed == L`, 1
+`distinct.size() == num_routed`, **3 `load[e] >= 1`** — experts 1, 2 and 3 go
+unrouted when everything is forced to expert 0, which is the new precondition
+firing — 1 `distinct_sets.size() > 2`, and 5 tolerance.
+
+**M6 is the sharpest mutation anyone has run on this path, and it is the one the
+served suite cannot see.** It preserves the selection SET exactly — the routed
+ids, the reported spread (4 of 4 experts, loads 7/4/9/12, 6 of 6 pairs) and the
+reported margin (1.25999e-2 at token 8) are bit-identical to the green run — and
+it still multiplies every expert output by the wrong one of the two routing
+weights. That is a genuine routed-path arithmetic defect. The tower gate catches
+it on TOLERANCE ALONE — 0.283, 0.307 and 0.312 against a 0.02 bound, 0.301 and
+0.0748 against 0.032, so 2.3x to 15.6x — and by nothing else. The served suite
+does not catch it at all.
 
 **M5 is the reachability measurement and it says two things.** The served suite
 loses half its cases when the materialization call site goes, so the pyramid is
@@ -4685,15 +4764,49 @@ the served side:
 
 - **The two-different-images LOGPROB case does NOT detect a router defect.** M2,
   M3 and M4 are three different ways to break the routing, and all three left
-  that case GREEN. The reason is structural: block 0 is dense, so the pixels
-  still reach the answer through it, and two different images still produce two
-  different logprobs however wrong the routed block is. That case is the
-  load-bearing assertion for the TOWER being reached, and it is not an assertion
-  about the ROUTER. The served case that does catch all three is "the router
-  BIAS changes what the server answers", which compares two checkpoints
-  differing in `mlp.router_bias` and in nothing else — a premise the case
-  asserts by diffing all the fixture's tensors and requiring exactly one to
+  that case GREEN. The reason it survives them is that two different images
+  still produce two different logprobs however wrong the routed block is. That
+  case is the load-bearing assertion for the TOWER being reached, and it is not
+  an assertion about the ROUTER. The served case that does catch all three is
+  "the router BIAS changes what the server answers", which compares two
+  checkpoints differing in `mlp.router_bias` and in nothing else — a premise the
+  case asserts by diffing all the fixture's tensors and requiring exactly one to
   differ. It exists because of this measurement, not before it.
+
+- **NO served case detects a routed-ARITHMETIC defect that preserves the
+  selection set, and the whole served suite is green under one.** M6 is that
+  defect. The bias case catches M2, M3 and M4 because each of them changes WHICH
+  expert runs, so the two checkpoints stop disagreeing about the selection and
+  the two answers collapse together. M6 changes none of that: the selection is
+  identical, the bias still moves it, and the two answers still differ — they
+  are simply both wrong. `test_openai_api_server_dots3_mm_forward` reports
+  **12/12, 177 assertions, 0 failed** with M6 applied. So this file gates
+  REACHABILITY and BIAS-DEPENDENCE of the routed block and nothing about the
+  arithmetic inside it; `test_dots3_note_vision` is where routed arithmetic is
+  caught, and there it is caught by tolerance rather than by the discrete
+  assertion.
+
+- **COULD a served case gate routed arithmetic? Measured, and the answer is no
+  for every cheap shape of it.** The obvious candidate is a fixture whose block
+  0 is ROUTED rather than dense, so that no dense block stands between the
+  pixels and the answer. It was BUILT and RUN rather than argued: a temporary
+  served case at `v_pyramid = {4, 4}`, two different images compared on
+  logprobs, **passes with M6 applied** (its two logprobs both moved — ` `/`w`
+  became ` `/`<|img|>` — and they still differ from each other), and passes
+  without it. The dense block 0 was never the reason. The reason is the SHAPE of
+  the assertion: every cheap served assertion available here is "two answers
+  differ", and a deterministic arithmetic defect that leaves both answers
+  well-defined and distinct is invisible to a difference. What would catch M6 is
+  a served assertion on a VALUE, and there are only two sources for one. A
+  hard-coded golden logprob is a cross-platform constant with no oracle behind
+  it (§6.4 option B), whose tolerance would have to be tighter than the bf16
+  spread across the runners this repository builds on, which nothing here has
+  measured. Driving the in-test double reference through the whole chain —
+  tower, adapter, TEXT tower and sampler — and comparing the served logprob to
+  it would work, and it is a strictly larger duplicate of
+  `test_dots3_note_vision` plus a text-tower reference this row does not have.
+  Neither is a served case; both are the tower gate wearing a server. **The
+  division stands as it is, and it is now written down rather than implied.**
 
 ---
 

@@ -15,9 +15,21 @@ whose method this wave continues.
 
 ## Now
 
-**Done.** 40 of 40 re-derived: **3 ALREADY_SATISFIED, 10 REAL_GAP,
-27 NOT_APPLICABLE** (26 `surface-absent`, 1 `inert`). **30 of the 40 disagree
-with the recorded PORT-NOW disposition.** Ten issues carry the ten gaps: nine new
+**Done, and repaired after a fresh review returned NOT PASS.** 40 of 40
+re-derived: **2 ALREADY_SATISFIED, 11 REAL_GAP, 27 NOT_APPLICABLE**
+(26 `surface-absent`, 1 `inert`). **29 of the 40 disagree with the recorded
+PORT-NOW disposition.**
+
+The review falsified one label and two claims, all corrected in place in the
+report rather than quietly repaired: `[178]` was published ALREADY_SATISFIED and
+is a live HTTP 500 on `/tokenize` (§6.6, now [#2707](https://github.com/mudler/vllm.cpp/issues/2707));
+the stale-`sed` hazard was stated as an over-read to 343 and is an **under**-read
+to 314 that silently drops a SHA (§6.5); and the pull-request body's compressed
+"byte-identical across every path" was false, where 4 of 15 paths are identical
+and the exact claim is a line-level inverse (§5.2). The gate run this record had
+declared but never published is now §8b, including an incomplete-log misread.
+
+Eleven issues carry the eleven gaps: ten new
 ([#2686](https://github.com/mudler/vllm.cpp/issues/2686),
 [#2687](https://github.com/mudler/vllm.cpp/issues/2687),
 [#2690](https://github.com/mudler/vllm.cpp/issues/2690),
@@ -26,7 +38,8 @@ with the recorded PORT-NOW disposition.** Ten issues carry the ten gaps: nine ne
 [#2695](https://github.com/mudler/vllm.cpp/issues/2695),
 [#2698](https://github.com/mudler/vllm.cpp/issues/2698),
 [#2699](https://github.com/mudler/vllm.cpp/issues/2699),
-[#2701](https://github.com/mudler/vllm.cpp/issues/2701)) and the pre-existing
+[#2701](https://github.com/mudler/vllm.cpp/issues/2701),
+[#2707](https://github.com/mudler/vllm.cpp/issues/2707)) and the pre-existing
 [#2657](https://github.com/mudler/vllm.cpp/issues/2657) for `[162]`. The one
 `inert` entry is deferred under `.agents/feature-matrix.md:140`, which already
 owns its gate.

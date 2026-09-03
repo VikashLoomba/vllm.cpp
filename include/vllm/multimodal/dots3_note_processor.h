@@ -84,6 +84,13 @@ Dots3NoteProcessorConfig LoadDots3NoteProcessorConfig(
 // `9035151d6`) — the height/width both divisible by `factor` whose product lies
 // in `[min_pixels, max_pixels]`. Throws upstream's two refusals: a side under
 // `factor / 4`, and an aspect ratio over 200.
+//
+// This is the BODY of upstream's `resized_size` and not its whole signature.
+// The per-request `detail` string, the `image_details[detail]` override table
+// and the explicit `target_height` / `target_width` arguments
+// (`common/processor.py:97-119`) are request parsing, owed to W8 and tracked by
+// issue #2645; no released `preprocessor_config.json` carries the table and the
+// default `detail` resolves to the config pair this signature already takes.
 std::array<int64_t, 2> Dots3NoteResizedSize(int64_t height, int64_t width,
                                             int64_t factor, int64_t min_pixels,
                                             int64_t max_pixels);
@@ -101,10 +108,16 @@ class Dots3NoteImageProcessor {
 
   // Preprocess ONE RGB image (HWC uint8, height*width*3) into
   // `pixel_values [num_patches, channel*temporal*patch*patch]` +
-  // `image_grid_thw`. A genuine bicubic RESIZE is a NAMED residual, exactly as
-  // it is on the Qwen3-VL processor beside this one: an image whose dimensions
-  // `Dots3NoteResizedSize` would change is REFUSED with both sizes in the
-  // message rather than silently patchified at the wrong grid.
+  // `image_grid_thw`, resizing it to `Dots3NoteResizedSize` first with PIL's
+  // BICUBIC resampler (`PilResizeBicubicRgb`, W6c / #2537) exactly as
+  // `processor.py:174` @ `9035151d6` does. An image whose sides are already
+  // multiples of `factor` skips the resample, which is upstream's own short
+  // circuit and not a special case here.
+  //
+  // Still refuses, and these are upstream's own `ValueError`s rather than
+  // gaps: a side under `factor / 4`, an aspect ratio over 200, and a patch grid
+  // that does not group into whole `merge x merge` blocks under
+  // `pre_pixel_shuffle`.
   ImageKwargs ProcessImage(const uint8_t* rgb, int64_t height,
                            int64_t width) const;
 

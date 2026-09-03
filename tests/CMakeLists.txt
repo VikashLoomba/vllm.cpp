@@ -1787,6 +1787,11 @@ vllm_cpp_add_test(test_device_token_ids_refusal
 # declare the capability is refused instead of embedding token id 0.
 vllm_cpp_add_test(test_mm_embed_device_token_ids
   vllm/models/test_mm_embed_device_token_ids.cpp)
+# The dots3-note case loads the tiny on-disk checkpoint through the REAL loader,
+# for the same reason its own gates do: `Dots3NoteLoadedModel` lives in the
+# anonymous namespace of its registry translation unit and cannot be borrowed.
+target_compile_definitions(test_mm_embed_device_token_ids PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 

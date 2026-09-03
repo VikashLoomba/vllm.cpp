@@ -27,6 +27,8 @@
 #include <string>
 #include <vector>
 
+#include "dots3_note_tiny_fixture.h"  // the SECOND hook needs a real loaded model
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3.h"     // Qwen3DenseWeights, OwnedTensor
 #include "vllm/model_executor/models/qwen3_vl.h"  // Qwen3VLWeights, BorrowQwen3VLLoadedModel
@@ -364,4 +366,88 @@ TEST_CASE("the two embed_mm registrations declare the hook capability, and only 
   // — so a dots3-note batch of TEXT-ONLY requests takes the text arm and embeds
   // the stale host vector. It stays refused until #2732 ports that arm.
   CHECK_FALSE(d3.factory->consumes_device_token_ids);
+}
+
+// ---------------------------------------------------------------------------
+// 4. THE SECOND HOOK, on a REAL loaded model.
+//
+//    `EmbedMmDots3NoteForCausalLM` carries the same splice, and deleting it must
+//    turn a gate red too. Its weights cannot be borrowed the way Qwen3-VL's can
+//    -- `Dots3NoteLoadedModel` lives in the anonymous namespace of its registry
+//    translation unit -- so this case goes through the REAL loader over the tiny
+//    on-disk checkpoint, which is a stronger entry anyway.
+//
+//    THE ASSERTION NEEDS NO KNOWLEDGE OF THE EMBEDDING TABLE. It runs the hook
+//    three times on one model and compares the merged embeds byte-for-byte: the
+//    stale-host + live-device run must equal the run whose HOST vector already
+//    held the true identifiers, and must differ from the run that embedded the
+//    stale vector. The first equality is the guarantee; the second is what stops
+//    a degenerate table -- one whose rows happen to coincide -- from making the
+//    first true for the wrong reason.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct Dots3Loaded {
+  dots3_tiny::TinySpec spec;
+  dots3_tiny::TinyCheckpoint ckpt;
+  vllm::HfConfig config;
+  std::unique_ptr<vllm::LoadedModel> model;
+
+  Dots3Loaded()
+      : ckpt(DOTS3_NOTE_CKPT_FIXTURE_DIR, spec),
+        config(vllm::LoadHfConfig(ckpt.config_path())) {
+    const vllm::ModelRegistration& reg = vllm::ModelRegistry::Resolve(
+        std::vector<std::string>{"Dots3NoteForCausalLM"});
+    std::vector<vllm::SafetensorsFile> shards;
+    shards.push_back(vllm::SafetensorsFile::Open(ckpt.weights_path()));
+    const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(shards);
+    model = reg.factory->load_weights(reg, config, source);
+    vt::Queue q = Q();
+    vllm::ModelRegistry::Prepare(*model, config, q);
+  }
+};
+
+}  // namespace
+
+TEST_CASE("mm embed: the dots3-note hook resolves the same identifiers, on a really loaded model") {
+  Dots3Loaded d3;
+  vt::Queue q = Q();
+  vt::Backend& b = vt::GetBackend(q.device.type);
+  const DeviceIds device_ids(b, q, kDeviceIds, kTokens);
+
+  // The hook run once, over one step's channels. `mm_embeds` is empty and the
+  // mask all-false because a DECODE step of an image request covers no
+  // placeholder row -- which is the step this defect lives on.
+  const auto run = [&](std::vector<int32_t> host_ids, const int32_t* device,
+                       bool stale) {
+    const std::vector<vt::Tensor> mm_embeds;
+    const std::vector<char> mask(static_cast<size_t>(kTokens), 0);
+    const std::vector<int32_t> no_mrope;  // dots3-note declares no M-RoPE hook
+    vllm::MmEmbedInputs in;
+    in.token_ids = &host_ids;
+    in.mm_embeds = &mm_embeds;
+    in.is_mm_embed = &mask;
+    in.mrope_positions = &no_mrope;
+    in.device_token_ids = device;
+    in.host_token_ids_stale = stale;
+    const vllm::MmForwardBuffers out =
+        vllm::ModelRegistry::EmbedMm(*d3.model, d3.config, q, in);
+    REQUIRE(out.mm.inputs_embeds.data != nullptr);
+    return DownloadEmbeds(b, q, out.mm.inputs_embeds);
+  };
+
+  // The defective step: host row 2 reads 0, the combine wrote 9.
+  const std::vector<float> spliced = run({5, 6, 0}, device_ids.get(), true);
+  // What the same step WOULD have produced had the host vector been written
+  // back. This is the guarantee, and it needs no embedding-table constant.
+  const std::vector<float> truth = run({5, 6, 9}, nullptr, false);
+  // And what it produced before this row.
+  const std::vector<float> stale = run({5, 6, 0}, nullptr, false);
+
+  REQUIRE(spliced.size() == truth.size());
+  REQUIRE(stale.size() == truth.size());
+  CHECK(spliced == truth);
+  // THE CONTROL. Without it a table whose rows coincided would satisfy the line
+  // above while the hook ignored the channel entirely.
+  CHECK(spliced != stale);
 }

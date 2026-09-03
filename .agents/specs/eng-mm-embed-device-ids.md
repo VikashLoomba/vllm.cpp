@@ -274,6 +274,17 @@ RED-first, BOTH counts captured (cases AND assertions), because
    dots3-note sets the hook bit and NOT the forward bit. A test that asserts the
    asymmetry, because the asymmetry is the design.
 
+4. **The SECOND hook, on a really loaded model.** `EmbedMmDots3NoteForCausalLM`
+   carries the same splice and its deletion must red a gate too. Its weights
+   cannot be borrowed -- `Dots3NoteLoadedModel` lives in the anonymous namespace
+   of its registry translation unit -- so this case goes through the REAL loader
+   over the tiny on-disk checkpoint. The assertion needs no knowledge of the
+   embedding table: the hook runs three times on one model, and the
+   stale-host + live-device run must equal byte-for-byte the run whose host
+   vector already held the true identifiers, and must DIFFER from the run that
+   embedded the stale vector. The second comparison is the control that stops a
+   degenerate table from making the first true for the wrong reason.
+
 Reachability: every case enters through `ModelRegistry::EmbedMm`. A test that
 called `EmbedMmQwen3VL...` directly would measure a function, not the seam.
 
@@ -291,6 +302,106 @@ called `EmbedMmQwen3VL...` directly would measure a function, not the seam.
 * Mutation, REBUILDING each time, restored byte-for-byte under sha256. One
   mutation DELETES the production splice call and one DELETES the guard; both
   must turn a gate red.
+
+## Evidence
+
+Measured in `/home/mudler/_git/vllm.cpp/.wt/mm-embed-device-ids` on `f31364bbc`
+plus this branch, CPU, Release, `-j 3`, `nice -n 15` (several sessions build on
+this box concurrently). BOTH counts are recorded everywhere, because
+`N failed / 0 assertions failed` means the cases THREW and is a different result.
+
+### RED, before the splice, the guard and the bits existed
+
+The channel fields and the capability bit landed first so the suite COMPILES and
+fails on its assertions rather than on the compiler, which is a different result
+again.
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_mm_embed_device_token_ids` | 4 \| 1 passed \| **3 failed** | 76 \| 54 passed \| **22 failed** |
+
+The decode row read `0, 0.015625, 0.03125, ...` where the device buffer said
+row 9 -- table row **0**, exactly the value `token_ids_cpu` zero-initialisation
+leaves in the host vector. The null-channel control passed in the same run, which
+is what says the RED is the channel and not the fixture.
+
+### GREEN
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_mm_embed_device_token_ids` (new) | 5 / 5 passed | 83 / 83 passed |
+| `test_device_token_ids_refusal` (the shared predicate) | 3 / 3 passed | 16 / 16 passed |
+| `test_combine_row_predicate` | 6 / 6 passed | 13 / 13 passed |
+| `test_combine_tokens` | 7 / 7 passed | 14 / 14 passed |
+| `test_multi_kv_refusal` | 2 / 2 passed | 7 / 7 passed |
+| `test_model_registry` | 24 / 24 passed (1 skipped) | 993 / 993 passed |
+| `test_openai_api_server_mm_forward` (Qwen3-VL served image request) | 9 / 9 passed | 73 / 73 passed |
+| `test_openai_api_server_dots3_mm_forward` (dots3-note served image request) | 16 / 16 passed | 240 / 240 passed |
+| `test_dots3_note_scaffold` | 26 / 26 passed | 110835 / 110835 passed |
+| `test_moe_async_device_ids` (the text arm of the shared splice) | 6 / 6 passed | 191 / 191 passed |
+| `test_glm_moe_dsa_forward` | 8 / 8 passed | 5339 / 5339 passed |
+| `test_glm5_next_forward` | 32 / 32 passed | 5943 / 5943 passed |
+| `test_persistent_step_input` | 10 / 10 passed | 66 / 66 passed |
+| `test_qwen3_decode_graph_seam` | 4 / 4 passed | 231 / 231 passed |
+
+`scripts/agent-preflight.sh --staged`: 0 gates failed, `tree-compiles` ok
+(386 of 386 translation units, 142.9s), `commit-trailers` ok, `commit-style` ok.
+Five gates SKIPPED for environment reasons only -- `check-arm-isa-build.py`,
+`check-cpu-isa-build.py`, `check-cuda-fat-gencode.py`, `check-pr-size.py` (CI
+only, run by hand below) and `check-triton-aot-multiarch.py` (needs
+`--vendored-root`) -- so the run prints `NOT a green preflight` on the skips and
+on nothing else.
+
+The full 661-binary `ctest` was NOT run: it needs about 17.6 GB and this box had
+21-26 GB free with other sessions building concurrently. The suites above were
+selected as the ones this change reaches, and the omission is stated rather than
+implied.
+
+### The mutations
+
+Each was APPLIED (sha256 verified changed), REBUILT (a mutation that does not
+rebuild reads as a passing test), run, then restored and verified byte-for-byte
+by sha256. Every rebuild returned 0, so no verdict below is a compiler catching
+what a test should have.
+
+| # | mutation | rebuild rc | detected by | cases / assertions failed |
+|---|---|---|---|---|
+| M1 | DELETE the production splice call in `EmbedMmQwen3VLForConditionalGeneration` | 0 | `test_mm_embed_device_token_ids` | 1 / 16 |
+| M2 | DELETE the guard from `ModelRegistry::EmbedMm` (`if (false && ...)`) | 0 | same | 1 / 3 |
+| M3 | drop the `host_token_ids_stale` term (nullness-only, the wrong predicate) | 0 | same | 1 / 1 |
+| M4 | invert the claim term (`consumes` -> `!consumes`) | 0 | same | 2 / 4 |
+| M5 | the SHARED splice body copies ONE identifier instead of `ov.count` | 0 | `test_mm_embed_device_token_ids` **AND** `test_moe_async_device_ids` | 1 / 16 **and** 3 / 3 |
+| M6 | clear `embed_mm_consumes_device_token_ids` on the Qwen3-VL factory | 0 | `test_mm_embed_device_token_ids` | 2 / 1 |
+| M7 | clear `consumes_device_token_ids` on the Qwen3-VL factory | 0 | same | 1 / 1 |
+| M9 | DELETE the production splice call in `EmbedMmDots3NoteForCausalLM` | 0 | same | 1 / 2 |
+| M10 | clear `embed_mm_consumes_device_token_ids` on the dots3-note factory | 0 | same | 2 / 1 |
+
+M1 and M9 are the reachability mutations AGENTS.md `## Nothing lands dead` asks
+for: each deletes a production call site and a gate goes red, so the suite
+measures the capability and not a class.
+
+M5 firing in `test_moe_async_device_ids` as well as in the new suite is the
+evidence that the seam extension is REAL rather than nominal: the text arm and
+the multimodal arm are running the same expression, so breaking it breaks both.
+Had the text suite stayed green, the "one splice, two publishers" claim in
+`## Design` would have been false. `test_glm_moe_dsa_forward` stayed green under
+M5 and is recorded as not covering the copy extent.
+
+M6 and M10 report `2 cases / 1 assertion` because clearing a hook bit makes the
+guard fire inside the correctness case as well, which THROWS rather than failing
+an assertion. Both counts are given for exactly that reason.
+
+### The mutation that SURVIVED, and what it means
+
+| # | mutation | rebuild rc | detected by | result |
+|---|---|---|---|---|
+| M8 | DELETE the runner's `embed_inputs.device_token_ids` / `host_token_ids_stale` assignments | 0 | NOTHING | `test_mm_embed_device_token_ids` 5/5, `test_openai_api_server_mm_forward` 9/9, `test_openai_api_server_dots3_mm_forward` 16/16 -- all still GREEN |
+
+Predicted, not discovered: the mirror requires CUDA, `device_input_ids` is
+non-null only under `#ifdef VLLM_CPP_CUDA`, and every gate in this tree is CPU.
+No test executes those two lines, so deleting them reds nothing. This is `## Owed`
+O1 and it is the sibling row's O2 in the same shape. It is recorded here rather
+than left for a reader to infer from a table of successes.
 
 ## Stop conditions
 

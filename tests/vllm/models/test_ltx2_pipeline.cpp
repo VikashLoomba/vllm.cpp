@@ -133,7 +133,34 @@ struct ParamBag {
     names.push_back(name);
     weights.tensors[name] = std::move(values);
   }
+
+  // The SAME stream stored at the module's own dtype, which is what
+  // `param.data.copy_` does on a bf16 module upstream: it ROUNDS into the
+  // parameter rather than keeping the f32 value beside it. A bag that kept the
+  // f32 values here would be WIDER than upstream and its goldens would still be
+  // close — the polarity a value gate cannot catch. A24 wave 2, issue #2720.
+  void PutBf16(const std::string& name, const std::vector<int64_t>& shape) {
+    const std::vector<float> values = ParamValues(name, shape);
+    counts.push_back(static_cast<int64_t>(values.size()));
+    names.push_back(name);
+    std::vector<uint16_t> narrow(values.size());
+    for (size_t i = 0; i < values.size(); ++i) narrow[i] = vt::F32ToBF16(values[i]);
+    weights.bf16[name] = std::move(narrow);
+    weights.dtype = vt::DType::kBF16;
+  }
 };
+
+// How many of these values do NOT survive a bf16 round trip. This is the whole
+// A24 instrument: a digest detects CHANGE and an absmax detects COLLAPSE, and
+// both read identically whichever width produced the buffer. AGENTS.md names the
+// blind spot exactly -- "a token gate cannot detect a dtype that is too wide".
+int64_t CountWiderThanBf16(const std::vector<float>& v) {
+  int64_t n = 0;
+  for (const float x : v) {
+    if (vt::BF16ToF32(vt::F32ToBF16(x)) != x) ++n;
+  }
+  return n;
+}
 
 void CheckManifest(const ParamBag& bag, const char* const* want_names, const int64_t* want_counts,
                    size_t want_size) {
@@ -2556,6 +2583,374 @@ TEST_CASE("ltx2 the Embeddings1DConnector reproduces upstream on every arm") {
   LTX2_CONN_ARM(NoRegisters);
   LTX2_CONN_ARM(GatedNoBias);
 #undef LTX2_CONN_ARM
+}
+
+// ===========================================================================
+// Section 10b — the connector's BFLOAT16 arm (A24 wave 2, row
+// LTX25-A24-CONNECTOR-BF16, issue #2720)
+// ===========================================================================
+
+TEST_CASE("ltx2 the Embeddings1DConnector at BFLOAT16 reproduces upstream on every arm") {
+  const int64_t batch = vllm_test::kLtx2ConnBatch;
+  const int64_t seq = vllm_test::kLtx2ConnSeq;
+  const int64_t inner = vllm_test::kLtx2ConnInnerDim;
+
+  // The SAME input the f32 arm runs, narrowed. Upstream is handed a bf16 tensor,
+  // so this IS the input and not a rounding of it.
+  std::vector<float> hidden(std::begin(vllm_test::kLtx2ConnBf16Hidden),
+                            std::end(vllm_test::kLtx2ConnBf16Hidden));
+  REQUIRE(hidden.size() == static_cast<size_t>(batch * seq * inner));
+
+  std::vector<float> mask(static_cast<size_t>(batch * seq), 0.0f);
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) {
+        mask[static_cast<size_t>(b * seq + s)] = -std::numeric_limits<float>::max();
+      }
+    }
+  }
+
+  auto run = [&](const std::string& tag, bool interleaved, bool double_precision,
+                 int64_t registers, bool gated, bool ff_bias, const char* const* names,
+                 const int64_t* counts, size_t manifest_size, const float* golden,
+                 size_t golden_count, const float* unpatched, double kernel_gap) {
+    const vllm::Ltx2ConnectorConfig config = ReducedConnectorConfig(
+        std::string("ltx2.conn.") + tag + ".", interleaved, double_precision, registers, gated,
+        ff_bias);
+    ParamBag bag;
+    for (const vllm::Ltx2ConnectorTensorSpec& spec :
+         vllm::EnumerateLtx2ConnectorTensors(config)) {
+      bag.PutBf16(spec.name, spec.shape);
+    }
+    CheckManifest(bag, names, counts, manifest_size);
+    REQUIRE(bag.weights.dtype == vt::DType::kBF16);
+    REQUIRE(bag.weights.tensors.empty());
+
+    const vllm::Ltx2ConnectorOutput got =
+        vllm::Ltx2ConnectorForward(config, bag.weights, hidden.data(), mask.data(), batch, seq);
+
+    // BIT-EXACT, and no tolerance sits under this port's arithmetic. A
+    // format-derived bound was tried first -- two bf16 ulps, 2^-8 relative to the
+    // golden's own magnitude -- and it is 0.0177 to 0.0229 on these five arms
+    // while the port sits at 0.0. A bound with that much slack is a mute switch:
+    // it let a deliberate mis-rounding of SPLIT rope through on four of the five
+    // arms. It is still COMPUTED and REPORTED, so a reader can see how much room
+    // the format would have allowed, and it is not what the gate rests on.
+    double scale = 0.0;
+    for (size_t i = 0; i < golden_count; ++i) scale = std::max(scale, static_cast<double>(std::fabs(golden[i])));
+    const double bound = 2.0 * std::pow(2.0, -8.0) * scale;
+    const double worst = MaxAbsDiff(got.hidden_states, golden, golden_count);
+    INFO("bf16 Embeddings1DConnector arm = ", tag, " max|diff| = ", worst,
+         " (the format would have allowed ", bound, " at max|golden| ", scale, ")");
+    CHECK(worst == 0.0);
+
+    // AND THE DISTANCE TO THE KERNEL TORCH ACTUALLY PICKED IS EXACTLY THE TWO
+    // KERNELS' OWN. The oracle above is `SDPBackend.MATH`, which is bit-equal to
+    // an f32-accumulated attention; the FLASH kernel `AttentionFunction.AUTOMATIC`
+    // resolves to is reproducible by no formula, so holding a port to it would be
+    // fitting this machine's SIMD width instead of upstream's arithmetic. Because
+    // the port is bit-equal to MATH, its distance to the unpatched module must
+    // equal the distance the GENERATOR measured between the two kernels -- a
+    // statement that follows from the line above and would break if either the
+    // port or the goldens moved. It is a sharper claim than any inequality.
+    const double to_unpatched = MaxAbsDiff(got.hidden_states, unpatched, golden_count);
+    INFO("bf16 arm = ", tag, " distance to the UNPATCHED module = ", to_unpatched,
+         ", the two kernels' own distance measured by the generator = ", kernel_gap);
+    CHECK(to_unpatched == doctest::Approx(kernel_gap));
+    // Not vacuous: the two kernels really do disagree on this fixture, so
+    // "bit-exact to MATH" is a choice of oracle and not a coincidence.
+    CHECK(kernel_gap > 0.0);
+    CHECK(kernel_gap <= bound);
+
+    // ── THE DTYPE GATE, IN BOTH DIRECTIONS, ON ONE FIXTURE ────────────────
+    //
+    // (1) every value this arm returns survives a bf16 round trip. An f32 path
+    // cannot pass this. (2) the f32 arm, on the SAME config and the SAME input,
+    // fails it on most of the stream. A fixture whose numbers happened to land on
+    // bf16 grid points would pass (1) whatever arithmetic produced it and would
+    // FAIL (2), so the pair is what makes (1) mean something.
+    ParamBag f32_bag;
+    for (const vllm::Ltx2ConnectorTensorSpec& spec :
+         vllm::EnumerateLtx2ConnectorTensors(config)) {
+      f32_bag.Put(spec.name, spec.shape);
+    }
+    const vllm::Ltx2ConnectorOutput wide = vllm::Ltx2ConnectorForward(
+        config, f32_bag.weights, hidden.data(), mask.data(), batch, seq);
+    const int64_t narrow_wider = CountWiderThanBf16(got.hidden_states);
+    const int64_t f32_wider = CountWiderThanBf16(wide.hidden_states);
+    INFO("bf16 arm = ", tag, ": wider than bf16 -- bf16 arm ", narrow_wider, " of ",
+         got.hidden_states.size(), ", f32 arm ", f32_wider, " of ", wide.hidden_states.size());
+    CHECK(narrow_wider == 0);
+    // The floor is "most of the stream" and the real number is the WHOLE of it on
+    // every arm measured, so half leaves a factor of two of headroom. A floor
+    // below the real count is a mute switch.
+    CHECK(f32_wider > static_cast<int64_t>(wide.hidden_states.size()) / 2);
+
+    // The mask does NOT narrow. `torch.zeros_like(additive_attention_mask)`
+    // (:152) takes the CALLER's dtype, and the caller's mask is f32 on both arms
+    // — measured on the bf16 module, which reports `zeroed dtype: torch.float32`.
+    // Both arms must therefore agree on it exactly.
+    CHECK(MaxAbsDiff(got.mask, wide.mask.data(), wide.mask.size()) == 0.0);
+  };
+
+#define LTX2_CONN_BF16_ARM(TAG)                                                                \
+  run(#TAG, vllm_test::kLtx2Conn##TAG##Interleaved, vllm_test::kLtx2Conn##TAG##DoublePrecision, \
+      vllm_test::kLtx2Conn##TAG##Registers, vllm_test::kLtx2Conn##TAG##Gated,                   \
+      vllm_test::kLtx2Conn##TAG##FfBias, vllm_test::kLtx2ConnBf16##TAG##ParamNames,             \
+      vllm_test::kLtx2ConnBf16##TAG##ParamCounts,                                               \
+      std::size(vllm_test::kLtx2ConnBf16##TAG##ParamNames),                                     \
+      vllm_test::kLtx2ConnBf16##TAG##Golden,                                                    \
+      std::size(vllm_test::kLtx2ConnBf16##TAG##Golden),                                         \
+      vllm_test::kLtx2ConnBf16##TAG##UnpatchedGolden, vllm_test::kLtx2ConnBf16##TAG##KernelGap)
+  LTX2_CONN_BF16_ARM(Split);
+  LTX2_CONN_BF16_ARM(Interleaved);
+  LTX2_CONN_BF16_ARM(Float64);
+  LTX2_CONN_BF16_ARM(NoRegisters);
+  LTX2_CONN_BF16_ARM(GatedNoBias);
+#undef LTX2_CONN_BF16_ARM
+}
+
+TEST_CASE("ltx2 the connector's bf16 register table is the STORED word, not a re-rounding") {
+  // `learnable_registers` is a BFLOAT16 parameter at BOTH widths
+  // (embeddings_connector.py:135-137), so the two arms must place the SAME number
+  // — one by widening a stored word, the other by rounding an f32 copy. This is
+  // the one place the arms provably agree, and a divergence here says the f32
+  // arm's `RoundToBf16` and the bf16 arm's storage disagree about the value.
+  const int64_t batch = vllm_test::kLtx2ConnBatch;
+  const int64_t seq = vllm_test::kLtx2ConnSeq;
+  std::vector<float> hidden(std::begin(vllm_test::kLtx2ConnBf16Hidden),
+                            std::end(vllm_test::kLtx2ConnBf16Hidden));
+  std::vector<float> mask(static_cast<size_t>(batch * seq), 0.0f);
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) {
+        mask[static_cast<size_t>(b * seq + s)] = -std::numeric_limits<float>::max();
+      }
+    }
+  }
+  const vllm::Ltx2ConnectorConfig config = ReducedConnectorConfig(
+      "ltx2.conn.Split.", /*interleaved=*/false, /*double_precision=*/false,
+      vllm_test::kLtx2ConnSplitRegisters, /*gated=*/false, /*ff_bias=*/true);
+  ParamBag narrow_bag, wide_bag;
+  for (const vllm::Ltx2ConnectorTensorSpec& spec : vllm::EnumerateLtx2ConnectorTensors(config)) {
+    narrow_bag.PutBf16(spec.name, spec.shape);
+    wide_bag.Put(spec.name, spec.shape);
+  }
+  const vllm::Ltx2ConnectorOutput narrow = vllm::Ltx2ConnectorReplaceRegisters(
+      config, narrow_bag.weights, hidden.data(), mask.data(), batch, seq);
+  const vllm::Ltx2ConnectorOutput wide = vllm::Ltx2ConnectorReplaceRegisters(
+      config, wide_bag.weights, hidden.data(), mask.data(), batch, seq);
+
+  // THE STORED TABLE ITSELF, before anything selects from it. At bf16 upstream's
+  // `.to(hidden_states.dtype)` (:146) is an identity, so the parameter as stored
+  // IS the value the substitution places, and widening our stored word must
+  // reproduce it exactly. Only the `Split` arm emits this trio, because the other
+  // three register arms are already gated end to end by their forward goldens,
+  // which the substitution feeds.
+  const std::vector<uint16_t>& stored_bits =
+      narrow_bag.weights.GetBf16(config.prefix + "learnable_registers");
+  REQUIRE(stored_bits.size() == std::size(vllm_test::kLtx2ConnBf16SplitRegistersGolden));
+  std::vector<float> stored_table(stored_bits.size());
+  for (size_t i = 0; i < stored_bits.size(); ++i) stored_table[i] = vt::BF16ToF32(stored_bits[i]);
+  CHECK(MaxAbsDiff(stored_table, vllm_test::kLtx2ConnBf16SplitRegistersGolden,
+                   std::size(vllm_test::kLtx2ConnBf16SplitRegistersGolden)) == 0.0);
+
+  // Against UPSTREAM first, so this is a port check and not a self-consistency
+  // one. The substitution is a select between two bf16-valued streams, so it is
+  // exact on both arms and no tolerance belongs under it.
+  CHECK(MaxAbsDiff(narrow.hidden_states, vllm_test::kLtx2ConnBf16SplitReplacedGolden,
+                   std::size(vllm_test::kLtx2ConnBf16SplitReplacedGolden)) == 0.0);
+  CHECK(MaxAbsDiff(narrow.mask, vllm_test::kLtx2ConnBf16SplitZeroedMaskGolden,
+                   std::size(vllm_test::kLtx2ConnBf16SplitZeroedMaskGolden)) == 0.0);
+  // And then the two routes against each other, which is the claim above.
+  CHECK(MaxAbsDiff(narrow.hidden_states, wide.hidden_states.data(), wide.hidden_states.size()) ==
+        0.0);
+  // NOT VACUOUS: the fixture really does substitute. Row 0 keeps 5 of 8 rows, so
+  // 3 rows per batch element are registers, and a substitution that never fired
+  // would make the equality above a statement about the input.
+  int64_t substituted = 0;
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) ++substituted;
+    }
+  }
+  CHECK(substituted > 0);
+}
+
+TEST_CASE("ltx2 the connector's bf16 rms_norm takes the f32 epsilon, not the narrowed one") {
+  // THE ARM GOLDENS CANNOT HOLD THIS AND SAYING SO IS THE POINT. `1e-6` and
+  // `bf16(1e-6) = 9.98377799987793e-07` differ by 1.6e-9, which is eight orders
+  // below bf16's own resolution, so on rows of ordinary magnitude the two choices
+  // narrow to the same bits everywhere: measured 0 separating values of 49152 at
+  // row scale 2^-2 and above. A24 wave 1's epsilon gate turned out to be a
+  // transcription check on a constant that never reached the arithmetic; this one
+  // reaches it, and the generator refuses to emit the fixture if the two answers
+  // ever stop parting.
+  const int64_t rows = vllm_test::kLtx2ConnBf16EpsRows;
+  const int64_t width = vllm_test::kLtx2ConnBf16EpsWidth;
+  REQUIRE(std::size(vllm_test::kLtx2ConnBf16EpsInput) == static_cast<size_t>(rows * width));
+
+  std::vector<float> got(std::begin(vllm_test::kLtx2ConnBf16EpsInput),
+                         std::end(vllm_test::kLtx2ConnBf16EpsInput));
+  vllm::Ltx2ConnectorRmsNormRows(got.data(), rows, width, vt::DType::kBF16);
+
+  // Bit-exact against upstream. No tolerance sits under this: both sides are
+  // bf16 values and the reduction is over 24 terms.
+  const double worst = MaxAbsDiff(got, vllm_test::kLtx2ConnBf16EpsGolden,
+                                  std::size(vllm_test::kLtx2ConnBf16EpsGolden));
+  INFO("bf16 rms_norm epsilon probe: max|diff| = ", worst);
+  CHECK(worst == 0.0);
+
+  // THE PROBE SEPARATES, and it says by how much. `kLtx2ConnBf16EpsRejected` is
+  // the answer the bf16-narrowed scalar produces on the same rows; the generator
+  // measured how many values the two part on, and the suite asserts that the port
+  // landed on upstream's and NOT on that one. Without this pair the case above is
+  // a golden that both hypotheses satisfy.
+  INFO("separating values measured by the generator: ", vllm_test::kLtx2ConnBf16EpsSeparating,
+       " of ", rows * width);
+  REQUIRE(vllm_test::kLtx2ConnBf16EpsSeparating > 0);
+  const double to_rejected = MaxAbsDiff(got, vllm_test::kLtx2ConnBf16EpsRejected,
+                                        std::size(vllm_test::kLtx2ConnBf16EpsRejected));
+  CHECK(to_rejected > 0.0);
+
+  // And the whole result is bf16-valued, which the f32 arm on the same rows is
+  // not — the same both-directions pair the arm case uses.
+  std::vector<float> as_f32(std::begin(vllm_test::kLtx2ConnBf16EpsInput),
+                            std::end(vllm_test::kLtx2ConnBf16EpsInput));
+  vllm::Ltx2ConnectorRmsNormRows(as_f32.data(), rows, width, vt::DType::kF32);
+  INFO("wider than bf16: bf16 arm ", CountWiderThanBf16(got), ", f32 arm ",
+       CountWiderThanBf16(as_f32), " of ", got.size());
+  CHECK(CountWiderThanBf16(got) == 0);
+  CHECK(CountWiderThanBf16(as_f32) > static_cast<int64_t>(as_f32.size()) / 2);
+
+  // ── AND THE SAME PROBE ON THE WEIGHTED NORM, WHICH IS A DIFFERENT FUNCTION ──
+  //
+  // Everything above holds `Ltx2ConnectorRmsNormRows`, the connector's WEIGHTLESS
+  // residual norm. The q/k norms inside the attention are
+  // `torch.nn.RMSNorm(inner_dim, eps=norm_eps)` (attention.py:505-506); they run
+  // in the SAME forward on the SAME constant -- `Ltx2ConnectorForward` assigns
+  // `Ltx2AttentionArgs::norm_eps = kLtx2ConnectorRmsNormEps` -- and they reach it
+  // through `Ltx2RmsNormRows`, which had no probe of its own. Measured on this
+  // tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 left this binary at
+  // `4018 | 4018 passed` and `test_ltx2_video` at `4951 | 4951 passed`, while
+  // setting it to 1.0 reds 11 -- ten across all five connector arms plus this
+  // probe. So the site is live and reached, and the arm goldens cannot resolve
+  // it -- exactly the hole this case exists to close for the weightless form.
+  std::vector<float> gain(std::begin(vllm_test::kLtx2ConnBf16EpsGain),
+                          std::end(vllm_test::kLtx2ConnBf16EpsGain));
+  REQUIRE(gain.size() == static_cast<size_t>(width));
+  std::vector<float> weighted_in(std::begin(vllm_test::kLtx2ConnBf16EpsInput),
+                                 std::end(vllm_test::kLtx2ConnBf16EpsInput));
+  std::vector<float> weighted(weighted_in.size());
+  vllm::Ltx2RmsNormRows(weighted_in.data(), gain.data(), weighted.data(), rows, width,
+                        vllm::kLtx2ConnectorRmsNormEps, vt::DType::kBF16);
+  const double weighted_worst = MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedGolden,
+                                           std::size(vllm_test::kLtx2ConnBf16EpsWeightedGolden));
+  INFO("bf16 WEIGHTED rms_norm epsilon probe: max|diff| = ", weighted_worst);
+  CHECK(weighted_worst == 0.0);
+
+  // TWO rejected hypotheses, both emitted beside upstream's answer and both
+  // measured to separate on these rows. (a) the bf16-narrowed epsilon, the same
+  // alternative the weightless probe rejects. (b) rounding the normalized value
+  // into bf16 and THEN multiplying by the gain, instead of the single rounding
+  // `F.rms_norm` does. Spec section 4.1 recorded (b) as "not separable"; executed,
+  // it parts from upstream on 3166 of 12288 values here and on 12647 of 49152 at
+  // ordinary magnitude, so it gets a golden rather than a sentence.
+  INFO("weighted probe separations measured by the generator: eps ",
+       vllm_test::kLtx2ConnBf16EpsWeightedSeparating, ", round-then-multiply ",
+       vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMulSeparating, " of ", rows * width);
+  REQUIRE(vllm_test::kLtx2ConnBf16EpsWeightedSeparating > 0);
+  REQUIRE(vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMulSeparating > 0);
+  CHECK(MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedRejected,
+                   std::size(vllm_test::kLtx2ConnBf16EpsWeightedRejected)) > 0.0);
+  CHECK(MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMul,
+                   std::size(vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMul)) > 0.0);
+
+  // The same both-directions dtype pair the weightless half uses.
+  std::vector<float> weighted_f32(weighted_in.size());
+  vllm::Ltx2RmsNormRows(weighted_in.data(), gain.data(), weighted_f32.data(), rows, width,
+                        vllm::kLtx2ConnectorRmsNormEps, vt::DType::kF32);
+  INFO("weighted, wider than bf16: bf16 arm ", CountWiderThanBf16(weighted), ", f32 arm ",
+       CountWiderThanBf16(weighted_f32), " of ", weighted.size());
+  CHECK(CountWiderThanBf16(weighted) == 0);
+  CHECK(CountWiderThanBf16(weighted_f32) > static_cast<int64_t>(weighted_f32.size()) / 2);
+}
+
+TEST_CASE("ltx2 the bf16 connector narrows the CALLER's stream on BOTH branches") {
+  // WHAT THIS CATCHES, and why no other case here can. Upstream's connector is a
+  // bf16 module and is handed a bf16 TENSOR: `Embeddings1DConnector` is built
+  // inside `PromptEncoder` at the one pipeline dtype (distilled.py:109, :113) and
+  // the encoder hands it its own bf16 output. This port takes `const float*`, so
+  // the narrowing of the caller's stream is the port's own job, and it has to
+  // happen on every branch of the entry point.
+  //
+  // The register branch is the SHIPPED one -- the checkpoint declares 128
+  // registers (ltx2_loader.cpp) -- and the caller really does hand f32 in:
+  // `Ltx2VideoEngine::Load` and `GenerateAudioOnly` feed `RunConnectorFromFile`
+  // the output of `ReadF32File`, an arbitrary user file. The substitution
+  // replaces only the PADDED rows; the kept rows are copied verbatim, so a
+  // narrowing placed inside the no-register branch alone leaves the shipped path
+  // reading sub-bf16 detail upstream cannot have.
+  //
+  // EVERY OTHER bf16 CASE IN THIS FILE IS BLIND TO IT: their fixture is
+  // `hidden.to(bf16)` on both sides, so the input is already bf16-valued and a
+  // missing narrowing is an identity. This case perturbs the fixture by a QUARTER
+  // of a bf16 ulp -- x * (1 + 2^-10), against bf16's own 2^-8 -- and asserts the
+  // forward answers exactly as it does on the pre-narrowed stream. Measured
+  // before the repair: 0.015625 on the register arm, 0 on the no-register one.
+  const int64_t batch = vllm_test::kLtx2ConnBatch;
+  const int64_t seq = vllm_test::kLtx2ConnSeq;
+  const int64_t inner = vllm_test::kLtx2ConnInnerDim;
+
+  std::vector<float> perturbed(std::begin(vllm_test::kLtx2ConnBf16Hidden),
+                               std::end(vllm_test::kLtx2ConnBf16Hidden));
+  REQUIRE(perturbed.size() == static_cast<size_t>(batch * seq * inner));
+  for (float& v : perturbed) v *= 1.0f + std::ldexp(1.0f, -10);
+  std::vector<float> prenarrowed(perturbed.size());
+  for (size_t i = 0; i < perturbed.size(); ++i) {
+    prenarrowed[i] = vt::BF16ToF32(vt::F32ToBF16(perturbed[i]));
+  }
+  // NOT VACUOUS: the perturbed stream really does carry detail bf16 cannot hold,
+  // and the two inputs really are different numbers. Without this the equality
+  // below would hold for a forward that narrows nothing.
+  INFO("perturbed values wider than bf16: ", CountWiderThanBf16(perturbed), " of ",
+       perturbed.size());
+  REQUIRE(CountWiderThanBf16(perturbed) > static_cast<int64_t>(perturbed.size()) / 2);
+  REQUIRE(MaxAbsDiff(perturbed, prenarrowed.data(), prenarrowed.size()) > 0.0);
+
+  std::vector<float> mask(static_cast<size_t>(batch * seq), 0.0f);
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) {
+        mask[static_cast<size_t>(b * seq + s)] = -std::numeric_limits<float>::max();
+      }
+    }
+  }
+
+  auto both_ways = [&](const std::string& tag, int64_t registers) {
+    const vllm::Ltx2ConnectorConfig config = ReducedConnectorConfig(
+        std::string("ltx2.conn.") + tag + ".", /*interleaved=*/false,
+        /*double_precision=*/false, registers, /*gated=*/false, /*ff_bias=*/true);
+    ParamBag bag;
+    for (const vllm::Ltx2ConnectorTensorSpec& spec :
+         vllm::EnumerateLtx2ConnectorTensors(config)) {
+      bag.PutBf16(spec.name, spec.shape);
+    }
+    REQUIRE(bag.weights.dtype == vt::DType::kBF16);
+    const vllm::Ltx2ConnectorOutput raw = vllm::Ltx2ConnectorForward(
+        config, bag.weights, perturbed.data(), mask.data(), batch, seq);
+    const vllm::Ltx2ConnectorOutput narrowed = vllm::Ltx2ConnectorForward(
+        config, bag.weights, prenarrowed.data(), mask.data(), batch, seq);
+    const double worst =
+        MaxAbsDiff(raw.hidden_states, narrowed.hidden_states.data(), narrowed.hidden_states.size());
+    INFO("bf16 connector arm = ", tag, " (registers = ", registers,
+         "): max|diff| between the raw f32 caller stream and the pre-narrowed one = ", worst);
+    CHECK(worst == 0.0);
+  };
+  // The shipped shape first. `NoRegisters` is the branch that already narrowed,
+  // and it is here so the pair says WHICH branch moved when this reds.
+  both_ways("Split", vllm_test::kLtx2ConnSplitRegisters);
+  both_ways("NoRegisters", vllm_test::kLtx2ConnNoRegistersRegisters);
 }
 
 TEST_CASE("ltx2 the connector's learnable registers are stored BFLOAT16, and rounded") {

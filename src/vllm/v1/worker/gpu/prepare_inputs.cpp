@@ -11,6 +11,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "vt/dtype.h"  // VT_CHECK
+
 namespace vllm::v1 {
 
 // ─── update_states ──────────────────────────────────────────────────────────
@@ -347,7 +349,12 @@ std::vector<int32_t> combine_sampled_and_draft_tokens(
     // splice; the prompt token in input_token_ids stays.
     const int32_t seq_len = seq_lens[static_cast<size_t>(batch_idx)];
     const int32_t pf = prefill_len[static_cast<size_t>(req_state_idx)];
-    if (seq_len <= pf) {
+    // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): the condition that was written here
+    // inline now has a name, because the refusal in `ModelRegistry::Forward` has
+    // to apply the SAME rule and not a second derivation of it. The behaviour is
+    // unchanged, which `tests/vllm/v1/worker/test_combine_tokens.cpp` is the
+    // control for.
+    if (!CombineSplicesRow(seq_len, pf)) {
       continue;
     }
     // Write the last sampled token id at the decode position (query_end -
@@ -359,6 +366,38 @@ std::vector<int32_t> combine_sampled_and_draft_tokens(
     // Draft tokens (num_draft_tokens > 0) are deferred with SPEC-MTP.
   }
   return logits_indices;
+}
+
+// ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710). The OR over the batch of the row
+// predicate the combine applies, and nothing else: see the header for why this
+// may not become a per-request answer.
+//
+// It reads `prefill_len` through `idx_mapping` for the same reason the combine
+// does — after an abort or a finish reorders `req_states` against the dense
+// batch, batch row `i` is not req_state slot `i`, and indexing `prefill_len` by
+// the batch row would compare a row's sequence length against another request's
+// prefill. A short `seq_lens` or `prefill_len` cannot silently answer false: the
+// bounds are checked and a row the caller cannot substantiate is refused.
+bool AnyRowSplicedByCombine(const std::vector<int32_t>& seq_lens,
+                            const std::vector<int32_t>& prefill_len,
+                            const int32_t* idx_mapping, int num_reqs) {
+  VT_CHECK(num_reqs >= 0,
+           "AnyRowSplicedByCombine: negative num_reqs");
+  VT_CHECK(static_cast<size_t>(num_reqs) <= seq_lens.size(),
+           "AnyRowSplicedByCombine: num_reqs exceeds the seq_lens the caller "
+           "supplied, so a row's staleness cannot be decided");
+  for (int batch_idx = 0; batch_idx < num_reqs; ++batch_idx) {
+    const int req_state_idx =
+        idx_mapping != nullptr ? idx_mapping[batch_idx] : batch_idx;
+    VT_CHECK(req_state_idx >= 0 &&
+                 static_cast<size_t>(req_state_idx) < prefill_len.size(),
+             "AnyRowSplicedByCombine: idx_mapping points outside prefill_len");
+    if (CombineSplicesRow(seq_lens[static_cast<size_t>(batch_idx)],
+                          prefill_len[static_cast<size_t>(req_state_idx)])) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace vllm::v1

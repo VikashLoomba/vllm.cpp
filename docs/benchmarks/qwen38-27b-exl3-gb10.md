@@ -133,6 +133,157 @@ is`. A wrong codebook on this format yields a correctly distributed and entirely
 wrong weight, so coherent, factually correct continuation is meaningful evidence
 and not merely a smoke test.
 
+## Reproduce this run
+
+You need one NVIDIA GB10 board, CUDA 13.0, and 20 GB of free local disk. The
+whole run takes about 90 minutes. The build and the two measurement legs take
+most of that time.
+
+Read the [limitations](#limitations) before you quote any number from this
+procedure.
+
+### 1. Get the weights
+
+Download both checkpoints at the revisions this page pins. A repository name
+alone is not a pin, because a publisher can requantize a checkpoint in place.
+
+```sh
+hf download Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw \
+    --revision 19441ac874c4018295da848e250f23511361cda4 \
+    --local-dir ./target-3.5bpw
+
+hf download Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw \
+    --revision 4f0436269bca761b071f05319e8e04a87cc633f9 \
+    --local-dir ./draft-dflash2-5.0bpw
+```
+
+Compare the hashes against the values in [subject](#subject).
+
+```sh
+sha256sum ./target-3.5bpw/*.safetensors ./draft-dflash2-5.0bpw/*.safetensors
+```
+
+Copy both directories to local disk if you keep them on network storage. A
+model that you read over a network measures the network.
+
+### 2. Build
+
+```sh
+cmake -S . -B build -G Ninja \
+    -DVLLM_CPP_CUDA=ON \
+    -DVLLM_CPP_CUDA_ARCHITECTURES=121a \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j 4 --target vllm-cli vllm-bench
+```
+
+Set `-DVLLM_CPP_CUDA_ARCHITECTURES` to your own board. `121a` is GB10.
+
+### 3. Make sure the model generates
+
+Run this step before you measure anything. A wrong trellis codebook produces a
+weight with the right distribution and no relation to the true one. Every shape
+check still passes, and the model writes fluent nonsense. Coherent output is
+therefore evidence, not a formality.
+
+```sh
+build/examples/vllm-cli --model ./target-3.5bpw --device cuda \
+    --prompt 'The capital of France is' \
+    --max-tokens 16 --temperature 0 --seed 0
+```
+
+The model writes ` Paris. The capital of Germany is Berlin. The capital of Italy
+is` and exits 0. The command reports `finish_reason=length`. The prompt is a
+plain completion, so the model does not emit an end-of-sequence token inside 16
+tokens.
+
+### 4. Build the prompt set
+
+The benchmark reads the 164 HumanEval problems in the ShareGPT shape.
+
+```sh
+curl -L -O https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz
+gunzip HumanEval.jsonl.gz
+
+python3 -c 'import json
+rows = [json.loads(l) for l in open("HumanEval.jsonl")]
+json.dump([{"conversations": [{"from": "human", "value": r["prompt"]},
+                              {"from": "gpt", "value": ""}],
+            "id": r["task_id"]} for r in rows],
+          open("humaneval-sharegpt.json", "w"))'
+```
+
+The `HumanEval.jsonl` file has sha256
+`1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2`.
+
+### 5. Measure both arms
+
+`VT_DFLASH_PAGED=0` is required today. The paged draft route fails on the
+second run inside one process, which
+[#2274](https://github.com/mudler/vllm.cpp/issues/2274) tracks.
+
+Run the target alone first.
+
+```sh
+VT_DFLASH_PAGED=0 build/examples/vllm-bench --model ./target-3.5bpw \
+    --dataset-path humaneval-sharegpt.json --num-prompts 164 \
+    --output-len 128 --temperature 0.6 --seed 0 --concurrency 1
+```
+
+Then run the same binary with the draft.
+
+```sh
+VT_DFLASH_PAGED=0 build/examples/vllm-bench --model ./target-3.5bpw \
+    --dataset-path humaneval-sharegpt.json --num-prompts 164 \
+    --output-len 128 --temperature 0.6 --seed 0 --concurrency 1 \
+    --speculative-config '{"method": "dflash",
+                           "model": "./draft-dflash2-5.0bpw",
+                           "num_speculative_tokens": 7}'
+```
+
+Run the two legs again in the same order. One board can drift between legs, and
+an interleaved pair separates a drift from an effect.
+
+### 6. Read the result
+
+The report prints both counting conventions. This page quotes the first line.
+
+```text
+Mean per-stream decode rate (tok/s):       59.59
+Output (decode) token throughput (tok/s):  45.12
+Draft tokens proposed:                     30863
+Draft tokens accepted:                     17841
+Acceptance rate (accepted/proposed):       0.58
+```
+
+`Mean per-stream decode rate` is `1 / mean_tpot`, where `tpot` is
+`(latency - ttft) / (output_len - 1)`. It excludes the prefill.
+`Output (decode) token throughput` divides the same tokens by the whole run,
+so it includes the prefill.
+
+The acceptance counters come from the engine. Do not derive them from the
+throughput.
+
+### What to expect
+
+| Arm | Mean per-stream decode rate |
+|---|---|
+| Target only | 16.6 to 16.8 tok/s |
+| Target and draft, `num_speculative_tokens: 7` | 59.4 to 59.6 tok/s |
+
+A difference under 1% between your two target legs is drift, not a result.
+
+### Change the draft budget
+
+`num_speculative_tokens` is the strongest single lever in this recipe. The
+drafter declares `block_size: 8`, and that value does not cap the budget. The
+loader takes the budget from the flag and prints the block size it resolved.
+
+Raise the value to 12 and read the `block=` line in the startup output. It
+reports 13, which is the budget plus one.
+
+The [draft budget section](#the-draft-budget-is-a-real-lever-and-our-knee-is-not-theirs)
+above records what each budget produced here.
+
 ## Limitations
 
 **Three differences from the upstream README's 47.5 tok/s, and all three favour

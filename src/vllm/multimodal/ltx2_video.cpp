@@ -55,6 +55,7 @@
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — which accelerator, if any
 #include "vllm/tokenizer/tokenizer.h"
+#include "vt/dtype.h"
 
 namespace vllm::multimodal {
 namespace {
@@ -474,7 +475,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 572 574 1199 1295 1391 1407 1542 1546 1649 1727 1835 1877 1919 1921
+// 583 585 1210 1306 1402 1418 1553 1557 1660 1738 1856 1898 1940 1942
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -501,6 +502,16 @@ uint64_t DigestF32(const std::vector<float>& values) {
     h *= 1099511628211ULL;
   }
   return h;
+}
+
+// How many values could NOT have come out of a bf16 store. The dtype instrument
+// the digest and the absmax cannot be: both are computed over the same f32
+// container on either arm and are blind to the width that filled it.
+int64_t CountWiderThanBf16(const std::vector<float>& values) {
+  int64_t n = 0;
+  for (float v : values)
+    if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++n;
+  return n;
 }
 
 double AbsMax(const std::vector<float>& values) {
@@ -1786,7 +1797,17 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.feature_cfg = Ltx2SelectTextFeatureVariant(
         dit_config.contains("transformer") ? dit_config.at("transformer") : dit_config,
         te.gemma_hidden_size, te.gemma_num_hidden_layers);
-    im.caption_projections = Ltx2WidenTextProjectionsToF32(te);
+    // UPSTREAM'S OWN DTYPE, and the arm the whole tower runs in. `distilled.py:109`
+    // resolves one pipeline dtype, `torch.bfloat16`, and hands it to
+    // `PromptEncoder` at `:111-113`; every parameter under it inherits it. This
+    // call keeps the checkpoint's 16-bit values instead of doubling them, which is
+    // ~2.3 GB rather than ~4.6 GB for the two projections and halves every
+    // full-width activation buffer the extractor materializes. It is also what
+    // SELECTS the arm — `Ltx2EncodePromptToConditioning` reads the dtype off the
+    // weights rather than taking a parameter, exactly as upstream reads it off the
+    // module. Swapping this line back to `Ltx2WidenTextProjectionsToF32` puts the
+    // render on the f32 parity arm, which is the mutation the row's spec names.
+    im.caption_projections = Ltx2TextProjectionsAsBf16(te);
 
     // 5. THE TWO WIDTHS MUST BE THE DiT's. `Ltx2SelectTextFeatureVariant` reads
     //    them from the SAME transformer config the DiT's cross-attention
@@ -2686,6 +2707,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     prompt_video = encoded.conditioning.video;
     prompt_audio = encoded.conditioning.audio;
     context_tokens = encoded.seq;
+    // A24 wave 1: the TOWER's own output width, sampled HERE — before the
+    // connector, because the connector is wave 2 and still computes in f32. See
+    // `Ltx2ConditioningTrace::tower_video_not_bf16`.
+    im.trace.tower_video_not_bf16 = CountWiderThanBf16(prompt_video);
+    im.trace.tower_audio_not_bf16 = CountWiderThanBf16(prompt_audio);
+    im.trace.tower_video_values = static_cast<int64_t>(prompt_video.size());
+    im.trace.tower_audio_values = static_cast<int64_t>(prompt_audio.size());
 
     if (im.has_connector) {
       const std::vector<float>& mask = encoded.conditioning.additive_mask;
@@ -2711,6 +2739,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       connector_phase.Close();
       prompt_video = through.video;
       prompt_audio = through.audio;
+      // The f32 population the tower counters are measured against — see
+      // `Ltx2ConditioningTrace::connector_video_not_bf16`. Same fixture, same
+      // render, same buffers, one wave later.
+      im.trace.connector_video_not_bf16 = CountWiderThanBf16(prompt_video);
+      im.trace.connector_audio_not_bf16 = CountWiderThanBf16(prompt_audio);
+      im.trace.connector_video_values = static_cast<int64_t>(prompt_video.size());
+      im.trace.connector_audio_values = static_cast<int64_t>(prompt_audio.size());
     }
     video_context = prompt_video.data();
     audio_context = prompt_audio.data();

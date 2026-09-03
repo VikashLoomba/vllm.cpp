@@ -412,9 +412,15 @@ A CPU-only green is not a device result and is never reported as one. A doctest
 - **`kExl3HadR` on ROCm runs the portable CPU reference tier, not a native
   kernel.** It is correct and it is not fast, and no row owned that either.
 - **The regular kernel's shape table is gated at ONE of its four shapes.**
-  `Exl3SelectGemmShape` picks shape 2 at the tested dimensions and shape 4 is
-  unreachable at `n = 256`. `force_shape_idx` already exists, so this is a test
-  loop rather than a port.
+  Read at `src/vt/exl3_policy.cpp:98-110`, the Blackwell arm returns shape 2 at
+  the dimensions the suite tests (`k 2048, n 4096, bits 3`: `mod_256 &&
+  size_n <= 4096` with `size_k > 8192` false). Shape 4 needs
+  `mod_512 && size_n > 16384` and shape 1 needs `(K == 4 || K == 2) && !multi &&
+  size_k <= 2048`, so neither is reachable at those dimensions at all.
+  `force_shape_idx` already exists, so covering the other three is a test loop
+  rather than a port. Owed by `QUANT-EXL3-MUL1`, which owns that table; repeated
+  here because the GEMV falls THROUGH to it on every shape the envelope
+  declines, which on this checkpoint may be all of them.
 - **`bits` 5 and 6 have no GEMV upstream either** (`exl3_gemv.cu:110-111`
   refuses `K < 2 || K > 4`), so the one 5-bit tensor and the 6-bit `lm_head`
   falling to the regular kernel is upstream's behaviour and not a gap. Recorded

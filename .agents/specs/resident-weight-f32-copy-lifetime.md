@@ -1,0 +1,189 @@
+# `ResidentWeightF32` frees its copy source before the copy retires — #2711
+
+`ResidentWeightF32` builds an f32 upcast of a bf16 weight in a **function-local
+`std::vector<float>`**, hands that vector's `data()` to `Backend::Copy`, and lets
+the vector die at the closing brace. `Backend::Copy` is asynchronous on both
+device backends, so the driver may still be reading a buffer the allocator has
+already reclaimed.
+
+Issue: [#2711](https://github.com/mudler/vllm.cpp/issues/2711). Owning row:
+`ENG-EXPERT-STREAM-DEVICE` ([engine-matrix.md](../engine-matrix.md)), which is
+the row the issue names and the row whose W0f work created the current shape of
+these two helpers.
+
+## The defect, grounded
+
+| Where | What |
+|---|---|
+| `include/vllm/model_executor/models/dense_attn_block.h:342-360` | The wide copy. 49 translation units under `src/vllm/model_executor/models/` include this header. |
+| `src/vllm/model_executor/models/qwen3_5.cpp:1359-1379` | A private twin with the same body. The header flags its existence at `:222-223`; `qwen3_5.cpp` explains why it stays private at `:790`. |
+| `src/vt/cuda/cuda_backend.cu:116-118` | `cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, AsStream(q))` — `Copy` is genuinely asynchronous. |
+| `src/vt/rocm/rocm_backend.hip:269-271` | `hipMemcpyAsync` — likewise. |
+| `src/vllm/model_executor/models/glm5_next_kv.cpp:143-150` | The in-tree precedent. It synchronises on **every** span and names this exact hazard: a deferred wait "would hand the driver a pageable source that the next iteration has already overwritten." |
+
+The sibling `ResidentWeight` (`dense_attn_block.h:249-268`) issues the same
+asynchronous `Copy` and does **not** synchronise, and that is correct there: its
+source is `w.bytes`, an owned buffer or a file mapping that outlives the call.
+The asymmetry is the whole defect. `ResidentWeightF32`'s source is a temporary.
+
+`StageAndReleaseLoadedDense` (`qwen3_5_dense_weights.cpp:181-186`) already calls
+`Backend::Synchronize` once, after `PrepareBf16Resident` returns. That drain is
+**not** a repair: by the time it runs, every `std::vector<float>` the loop
+created has been destroyed. It is the deferred-wait shape the `glm5_next_kv.cpp`
+comment rejects, written out in full.
+
+## The design call, and what it costs
+
+Two repairs are available.
+
+1. **Synchronise before the source leaves scope.** Correct, and it adds one
+   stream drain per f32-upcast weight.
+2. **Keep the source alive until the copy retires.** With no completion callback
+   in `vt::Backend` and no polling of `Event`, "until it retires" degenerates to
+   "for the weight's lifetime" — a permanent host allocation the size of the
+   upcast, on every f32 weight, on every model.
+
+**Chosen: (1), synchronise.** The reasons, in order:
+
+- Option (2) permanently doubles the residency of exactly the weights this
+  subsystem spends its effort *not* holding twice. `AdoptDeviceBytesAsHost` and
+  `ReleaseResidentQwen3_5DenseHostWeights` exist to drop host mirrors after
+  upload; option (2) would reinstate one for every upcast weight and make the
+  #1299 memory work argue with itself.
+- The tree already answered this question once, in `glm5_next_kv.cpp:143-150`,
+  and answered it with a synchronise per span.
+- The population is bounded and small. `ResidentWeightF32` is memoised on
+  `OwnedTensor::d_dev_f32`, so the synchronise runs **once per distinct weight
+  per process**, not per token and not per forward. The f32 upcast serves the
+  per-head q/k norms, the GDN `conv1d_weight` and the GDN `norm_weight`:
+  `PrepareBf16Resident` (`qwen3_5.cpp:8706-8760`) passes exactly two of them per
+  layer, so the added drains are `2 * n_layers` for the whole process.
+
+**What is NOT claimed: the wall-clock cost was not measured.** No device
+measurement was taken for this change. This box is CPU-only, where `Copy` is a
+`memcpy` and `Synchronize` is the `vt::Backend` default no-op, so a timing run
+here would measure zero by construction and would be worthless. The choice is
+therefore conservative and argued rather than measured: it is bounded above by
+`2 * n_layers` drains of an otherwise-idle queue, each waiting on one small H2D
+transfer that the model must complete before its first use in any case, against
+a load that moves tens of GiB from disk. If that bound is ever found to matter,
+the follow-on is a batched variant that keeps the sources alive in a caller-owned
+vector and drains once — which is option (2) with a bounded lifetime, and needs
+every caller to participate. It is not taken here.
+
+## Design
+
+The two bodies are unified into **one** shared implementation rather than
+repaired twice, because #2711 is precisely the failure of having two.
+
+`dense_device_glue.h` gains `dense_attn::InstallResidentF32(Dev, const
+OwnedTensor&, std::vector<float>)`: the CPU alias arm, the device staging arm,
+and the new `Synchronize`. It is the right home and not a new one — that header
+already carries `Dev`, `DBuf` and `MakeTensor`, was created for exactly this
+"both sides need it and the include graph must not cycle" problem, and is
+already included by `dense_attn_block.h` and by `qwen3_5.cpp` (`:24`).
+
+Both `ResidentWeightF32` bodies become two lines: install if absent, then return
+the view. **This is a three-file change, not a 49-file refactor.** The signature,
+the namespace and the memoisation field are all unchanged, so no consumer of
+either helper is touched.
+
+## Tests
+
+`tests/vllm/model_executor/test_resident_weight_f32_copy_retires.cpp`, its own
+binary, for the same reason as its two siblings: it registers a fake backend and
+a fake platform in the process-global `kXPU` slot.
+
+The fake backend **defers**. `Copy` records `{dst, src, bytes}` and returns
+without moving anything; `Synchronize` performs the recorded `memcpy`s and clears
+the queue. `Alloc` poisons its block. That is the shape of the contract
+`cudaMemcpyAsync` actually offers, and it makes the defect deterministic instead
+of dependent on a driver's mood: with no `Synchronize` the destination still
+holds the poison when the function returns.
+
+Cases:
+
+1. **Through a production entry point.** `Qwen3_5DenseModel::PrepareBf16Resident`
+   is a real load-time hook (`qwen3_5_dense_weights.cpp:183` calls it) and it
+   passes `attn.q_norm` and `attn.k_norm` to the qwen3_5.cpp helper. After it
+   returns, `d_dev_f32` must hold the f32 upcast of the weight and must not be in
+   the backend's pending queue.
+2. **The header copy**, `dense_attn::ResidentWeightF32`, driven directly. Its own
+   production callers are `DenseAttnBlock` (`dense_attn_block.h:602-604`,
+   `:646-648`) on every attention layer of the 49 models that include the header,
+   and driving one of those needs full attention metadata and a KV cache. This
+   case therefore calls the inline helper directly and is labelled as doing so.
+   It shares one body with case 1 after this change, which is what makes case 1's
+   production evidence carry.
+3. **The CPU arm is unchanged**: still aliases, still allocates nothing,
+   still never synchronises.
+
+### What the gate proves, and what it does not
+
+It proves that `ResidentWeightF32` does not return while its copy is
+outstanding — that the source outlives the transfer under a backend that defers.
+
+It does **not** prove that a real CUDA or ROCm driver defers this particular
+transfer, and it cannot: on the CPU backend `Copy` is a `memcpy` and the race is
+not expressible. A device-observed reproduction would need a GPU lease and a
+driver that defers a small pageable H2D copy, which the issue itself records as
+usually staged eagerly. The gate is a **structural and ordering** gate over a
+simulated asynchronous backend, not an observation of the race.
+
+## Gates
+
+- `tests/vllm/model_executor/test_resident_weight_f32_copy_retires.cpp` red
+  before the change with both counts non-zero, green after.
+- `ctest --test-dir <build>` for the affected suites, then the full gate.
+- `scripts/agent-preflight.sh`, read by grepping for `gate(s) failed` and
+  `NOT a green` rather than by its exit code.
+- `python3 scripts/check-pr-size.py --base origin/main --head HEAD` by hand,
+  because that checker is CI-only.
+
+## Mutations
+
+Each rebuilt, each restored and the restoration verified by `sha256sum`.
+
+- **M1** — delete `d.b.Synchronize(d.q)` from `InstallResidentF32`. Cases 1 and 2
+  must fail. This is the defect itself.
+- **M2** — move the `Synchronize` after the `shared_ptr` install but still inside
+  the function. Must stay green: the source is still alive, and a gate that
+  reddens here would be pinning a line number rather than a guarantee.
+- **M3** — delete the `f32(attn.q_norm)` / `f32(attn.k_norm)` calls from
+  `PrepareBf16Resident`. Case 1 must fail. This is the reachability mutation:
+  it removes the production call site, not the fix.
+- **M4** — make the fake backend's `Copy` eager (perform the `memcpy`
+  immediately). Cases 1 and 2 must stay green **on the unfixed tree**, which is
+  the control: it shows the red in M1 comes from the deferral and not from the
+  fixture.
+
+## Risks
+
+- `dense_device_glue.h` is included by both consumers; a mistake there breaks 49
+  translation units at once. Mitigated by the body being moved verbatim with one
+  statement added.
+- The fake platform occupies the process-global `kXPU` slot. Mitigated by giving
+  the suite its own binary, as `test_resident_weight_host_addressable.cpp` and
+  `test_expert_stream_device_slot.cpp` already do for the same reason.
+
+## Owed
+
+- **`ResidentWeight`'s staging arm calls `AdoptDeviceBytesAsHost` immediately
+  after an asynchronous `Copy` out of `w.bytes`, and that call can release the
+  source.** `AdoptDeviceBytesAsHost` runs `ReleaseDirectUploadSource(w)` and then
+  reassigns `w.bytes`, and the header's own comment on that assignment records
+  that for the last adopted weight of a shard the reassignment `munmap`s the
+  mapping **synchronously**. That is the same source-lifetime question #2711
+  asks, on a different helper, and it is **out of scope here**: the mapping case
+  needs its own grounding (a `MADV_DONTNEED` on a re-faultable `PROT_READ`
+  mapping is not a free), and folding a second, unproven fix into this one would
+  be exactly the silent bundling `.agents/bugfixing.md` refuses. Recorded here so
+  the finding has an owner rather than being re-found.
+
+## Stop conditions
+
+- Stop and report `NEEDS_DECISION` if closing the header copy turns out to need
+  changes in more than the three files named above.
+- Stop and report if the red case cannot be made to fail for the stated reason —
+  a case that fails by throwing is a different result and is not the red this
+  change needs.

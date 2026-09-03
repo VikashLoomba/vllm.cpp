@@ -3264,10 +3264,11 @@ void KdaGatedDeltaRuleKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, cons
 
 bool ChunkedPrefillEnabled() {
   // A/B toggle: default ON. VT_GDN_CHUNKED=0 falls back to the sequential scan.
-  // Read each call (prefill is coarse-grained, so getenv cost is negligible and
-  // it lets the unit test drive both paths in one process).
-  const char* e = std::getenv("VT_GDN_CHUNKED");
-  return e == nullptr || e[0] != '0';
+  // KERNEL-GDN-CHUNKED-MIRROR D3 lifted the read itself into the shared op layer
+  // (vt::GdnChunkedPrefillEnabled, src/vt/ops.cpp) so that CPU, ROCm and Vulkan
+  // join THIS flag rather than each gaining their own; the bespoke parse moved
+  // verbatim and this stays as its CUDA-local name.
+  return GdnChunkedPrefillEnabled();
 }
 
 // Step A — chunk_local_cumsum (fla/ops/cumsum.py): inclusive prefix sum of g
@@ -6215,8 +6216,16 @@ void GdnPrefillKernelCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
   const DeviceCaps& gdn_caps = GetDeviceCaps();
   const bool arch_has_mma = gdn_caps.valid && gdn_caps.sm_major >= 8;
   const bool wmma_ok = q_in.dtype != DType::kBF16 || (dk % kWM == 0 && dv % kNB == 0);
-  if (ChunkedPrefillEnabled() && dk <= kChunkMaxDim && dv <= kChunkMaxDim && args.scale != 0.0f &&
-      wmma_ok && arch_has_mma) {
+  // KERNEL-GDN-CHUNKED-MIRROR D0. The first term now carries the dtype: CUDA
+  // used to take the chunked arm for f32 inputs, which is an algorithm vLLM
+  // refuses to run at that dtype on either of its implementations
+  // (chunk.py:213-215 asserts; csrc/cpu/sgl-kernels/fla.cpp:2205-2207 type-
+  // checks bf16). This is a BEHAVIOUR CHANGE on a shipped backend: an f32 CUDA
+  // GdnPrefill that ran chunked before this row runs the sequential scan after
+  // it. It is also what test_op_parity.cpp:594's ScopedEnv was compensating
+  // for; that belt is kept while these braces are new.
+  if (GdnUseChunkedPrefill(q_in.dtype) && dk <= kChunkMaxDim && dv <= kChunkMaxDim &&
+      args.scale != 0.0f && wmma_ok && arch_has_mma) {
     GdnPrefillChunkedCuda(q, out, q_in, k, v, g, beta, state, qsl, args);
     return;
   }

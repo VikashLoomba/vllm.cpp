@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 // CheckConvCommon asks the BACKEND whether it can address a compressed
@@ -2185,6 +2186,25 @@ void RmsNormGated(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
            "rmsnorm_gated: device mismatch (x/gate/weight/out/queue)");
   reinterpret_cast<RmsNormGatedFn>(GetOp(OpId::kRmsNormGated, q.device.type))(q, out, x, gate,
                                                                               weight, args);
+}
+
+// KERNEL-GDN-CHUNKED-MIRROR D3: the one flag, read in the shared op layer so
+// every backend's GdnPrefill answers the same question. Lifted verbatim from
+// cuda_gdn.cu's bespoke ChunkedPrefillEnabled(), which now delegates here.
+// Read on each call: prefill is coarse-grained, so the getenv cost is
+// negligible, and it lets one process drive both arms (T4).
+bool GdnChunkedPrefillEnabled() {
+  const char* e = std::getenv("VT_GDN_CHUNKED");
+  return e == nullptr || e[0] != '0';
+}
+
+// KERNEL-GDN-CHUNKED-MIRROR D0. `chunked = (dtype != f32) && VT_GDN_CHUNKED != 0`.
+// The dtype term is NOT a concession to this tree's three f32 goldens; it is the
+// mirror. Upstream has no f32 chunked path at all to mirror, on either of its
+// two implementations of the kernel, so f32 routes to the sequential recurrence
+// that upstream's own f32-capable kernel computes.
+bool GdnUseChunkedPrefill(DType q_dtype) {
+  return q_dtype != DType::kF32 && GdnChunkedPrefillEnabled();
 }
 
 void GdnPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,

@@ -712,6 +712,11 @@ Each rides in the pull request whose change makes it stale, per AGENTS.md.
 
 - [#2612](https://github.com/mudler/vllm.cpp/issues/2612) — the finding this row
   was created from. This spec is its owner; the pull request body says so.
+- [#2845](https://github.com/mudler/vllm.cpp/issues/2845) — the implementation.
+  **Closed by the CPU arm.** What remains after it is listed under `## Now`:
+  ROCm and Vulkan chunked arms, G7's bf16 cross-device re-baseline, a CUDA gate
+  run for D0's changed f32 default, and re-deriving the control token sequence.
+  This spec owns each of them.
 - **GDN decode on the non-CUDA arms.** Out of scope above. vLLM does run decode
   sequentially, so the arms already mirror it, but nobody has measured that claim
   the way prefill has now been measured. No issue yet; file one before this row
@@ -775,5 +780,75 @@ Stop and return `NEEDS_DECISION` rather than proceeding, if:
 
 ## Now
 
-`SPIKE`. This spec and its evidence are the spike. No kernel has been written.
-The next fresh implementer starts from `## Design` and `## Tests`.
+Implementation issue:
+[#2845](https://github.com/mudler/vllm.cpp/issues/2845).
+
+**`ACTIVE` (wave GDNCPUPORT, 2026-09-03). The CPU chunked arm is written, the
+flag is shared, the default is dtype-conditioned, and G1-G6 pass on CPU. The row
+is NOT `DONE`: three gates need hardware this wave did not have.**
+
+Landed:
+
+- **The chunked CPU kernel**, `GdnChunkedHeadPrefill` in `src/vt/cpu/cpu_ops.cpp`,
+  carrying upstream's bf16 intermediate placement site for site (D1). It lands
+  `6.103516e-05` on `out` and `5.059987e-04` on `state` against
+  `gdn_prefill_bf16_realdims`, reproducing the numpy replica's `chunk_up` arm to
+  the printed precision -- so **stop condition 1 does not fire**, and G1 passes
+  with 2.46x / 2.96x headroom. `A^-1` is materialised and rounded, per D2.
+- **One shared predicate on every backend**, `vt::GdnUseChunkedPrefill(dtype)`
+  over `vt::GdnChunkedPrefillEnabled()` (`src/vt/ops.cpp`). `cuda_gdn.cu`'s
+  bespoke reader delegates to it, and the bespoke `e[0] != '0'` parse moved
+  verbatim. One flag, not two (stop condition 5).
+- **D0's dtype term on CUDA as well as CPU**, so an f32 CUDA `GdnPrefill` that
+  ran chunked before this row runs the sequential scan after it. That is a
+  behaviour change on a shipped backend.
+- **T9's `ScopedEnv` conversion**: all eleven bare `setenv("VT_GDN_CHUNKED", ...)`
+  in `tests/vt/test_ops_gdn.cpp` are gone, and a case registered last asserts the
+  flag did not leak. Mutating one guard back to a bare `setenv` reds that case
+  in a whole-suite run **and passes it under `-tc`** -- which is the order
+  dependence R10 names, reproduced.
+- **The bf16 coverage R9 says the arm would otherwise land without**: T1 (the
+  tight golden bar, with the sequential arm's failure of it asserted in the same
+  case), T3/T4 (the predicate and the flag both route), T5/T8 (upstream's own
+  `PREFILL_SEQ_LENS`, `NUM_HEADS`, `CHUNK_HEAD_DIMS` and `atol=rtol=1e-2` ported
+  from `tests/kernels/mamba/cpu/test_cpu_gdn_ops.py`, plus its two-call split and
+  our empty-sequence case), T6 (a bf16 entry in the thread byte-identity corpus),
+  T7 (the KDA reduction restated onto the sequential arm with a bf16 arm
+  asserting the two differ).
+
+**What changed in the reference, and it is new since this spec was written.**
+vLLM now ships a **chunked CPU kernel in C++**, `chunk_gated_delta_rule_cpu`
+(`csrc/cpu/sgl-kernels/fla.cpp:2178`), reached from
+`vllm/model_executor/layers/mamba/ops/cpu/gdn_attention.py:247,629,705`. It
+confirms D0 (it type-checks bf16 only, `:2205-2207`) and confirms D1's dtype
+FAMILY on a CPU target. It differs from Triton in three secondary sites, and
+**following it instead of Triton would fail G1**: pre-scaling `q` into bf16
+alone moves `out` from `6.103516e-05` to `2.441406e-04` against a `1.5e-04` bar.
+The port follows Triton and records why; the measurement is in
+`.agents/specs/gdn-semantics.md` §7.
+
+Not done, and each is a gate rather than a nicety:
+
+- **ROCm and Vulkan have no chunked arm.** The shared predicate reaches them;
+  the kernel does not. They still run the sequential recurrence on every dtype.
+- **G7 is NOT established.** `tests/vt/test_backend_cross_device.cpp:1676` is
+  confirmed UNMOVED (all-f32, so D0 routes it sequential on every arm, and it is
+  green). The trap gate, `tests/vt/test_vulkan_backend.cpp:2723-2747`, is the
+  bf16 arm and needs a Vulkan device; this wave had none, and `test_vulkan_*` is
+  not even a build target here. Until it is measured, the CPU arm is chunked and
+  the Vulkan arm is sequential, which is the transition state the spec names as
+  green-for-the-wrong-reason in one direction.
+- **No CUDA gate was run.** D0 changed CUDA's f32 default and nothing on a GPU
+  has executed since. `tests/vt/test_ops_gdn.cpp:3452`'s CUDA-vs-CPU case is the
+  one the `ScopedEnv` conversion was supposed to unbreak, and it has not run.
+- **The control token sequence has not been re-derived.** It needs the 67.564 GiB
+  UD-IQ1_S artifact and a lease. Every line that presented it as a CURRENT
+  expectation is annotated rather than replaced (`docs/USAGE.md`,
+  `qwen4_exp_registry.cpp`, `qwen4-exp-qsa-q-bf16.md`), and `VT_GDN_CHUNKED=0`
+  is named as the way to reproduce it. The evidence files keep their numbers.
+- **T2/G3 is partial.** The two dtype properties a caller can observe are gated
+  (the output is bf16-representable on bf16 input; the state is f32 and not
+  bf16-rounded). The nine INTERIOR placement sites are gated only in aggregate,
+  by G1's bar, which separates the bf16 placement from an f32-intermediate one
+  by 4x. A per-buffer format assertion would need a testing hook the seam does
+  not have.

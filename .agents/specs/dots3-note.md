@@ -4977,7 +4977,95 @@ recorded with its exact version and treated as evidence, not as a result.
 
 #### 4.13.4 Evidence
 
-*(measured after implementation; see the commit that lands it)*
+Measured 2026-09-03 on the developer host, CPU build,
+`-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF
+-DCMAKE_BUILD_TYPE=Release`, base `origin/main` `e24805924`.
+
+**The clean tree.**
+
+| target | binary sha256 | cases | assertions |
+|---|---|---|---|
+| `test_dots3_note_vision` | `2f2b3798a663dcf9…` | 13 / 13 | 21242 / 21242 |
+| `test_openai_api_server_dots3_mm_forward` | `52ad05417f0d4a28…` | 15 / 15 | 216 / 216 |
+
+**The two reference arms.** Per-pixel MAXIMUM, in levels of 0-255, over 18 cases
+(six geometries by three images: a hard 0/255 checker, a wrapping ramp, and
+high-frequency noise):
+
+| arm | measured | bound |
+|---|---|---|
+| `impl` vs the FIXED-POINT reference | **0** levels | 0 (exact) |
+| `impl` vs the CONTINUOUS reference | **1.07588** levels | 2.0 |
+
+The continuous bound of 2 is derived rather than fitted: the horizontal pass
+rounds by at most half a level, the vertical pass carries that through weights
+whose absolute sum is at most 1.25, and then rounds again, so 1.125 is the
+ceiling and 1.07588 sits just under it.
+
+`ProcessImage` against the same reference, reconstructed back through the
+per-channel normalization and `pre_pixel_shuffle`'s transpose on a served 6x14
+image: **0** levels.
+
+**Reference independence.** Every qualified name inside `namespace
+ref_resample` (160 lines) enumerated: **2 distinct, 45 occurrences, both
+`std::`** — `std::size_t` (27) and `std::vector` (18). Zero non-`std::` names,
+which is the same test W6a's and W6b's references passed.
+
+**RED-before at the production entry point.** On the commit that landed the
+resampler without calling it, `test_openai_api_server_dots3_mm_forward` read
+`14 | 12 passed | 2 failed`, `192 | 190 passed | 2 failed`, both failures
+`REQUIRE(r.status == 200)` against the processor's own HTTP 500:
+
+```text
+what=Dots3NoteImageProcessor: image requires resize (14x6 -> 16x8); the bicubic
+resize path is not ported (W6a uses conformant images). Owed by W8 and tracked
+by issue #2537
+```
+
+**Mutations.** Each applied to the clean tree, rebuilt, run, and the tree
+restored to zero modified files. The binary sha is recorded beside the case
+counts because a changed sha alone does not prove the mutation reached the code.
+
+| # | mutation | vision sha256 | vision | server sha256 | server |
+|---|---|---|---|---|---|
+| — | *(clean)* | `2f2b3798a663dcf9…` | 13/13, 21242/21242 | `52ad05417f0d4a28…` | 15/15, 216/216 |
+| M1 | delete the `PilResizeBicubicRgb` call site | `24b9a394079b9193…` | **12/13, 1 failed** | `2a8abda482b261b4…` | **14/15, 4 failed** |
+| M2 | half-pixel centre (`(xx + 0.5) * scale` -> `xx * scale`) | `f76d0a1402f37141…` | **12/13, 145 failed** | `7e3f292234c90805…` | 15/15, 216/216 |
+| M3 | drop the support scaling (`filterscale = 1.0`) | `cf3cb76e3b1689ac…` | **12/13, 96 failed** | `137c160ea8bcb5df…` | 15/15, 216/216 |
+| M4 | skip the per-output weight normalization | `44e0d65bf2ae2a14…` | **11/13, 177 failed** | `0ed9b83f7c8742ee…` | 15/15, 216/216 |
+
+**M1 found a real hole and the repair is part of this brick.** On the first
+pass the served suite stayed at `14 | 14 passed`, `199 | 199 passed` with the
+call site disabled, which is exactly the failure
+[reachability.md](../reachability.md) names: both served cases were blind to it
+by construction, one asserting geometry that `Dots3NoteResizedSize` already
+owned and one asserting only that two different images differ. Case 2d serves
+the 6x14 image and then serves the 8x16 buffer the resampler produces from it —
+conformant, so it takes the identity path — and requires the two logprob vectors
+to be equal element for element. With it, M1 fails the served suite.
+
+**M2, M3 and M4 stay GREEN on the served suite, and that is correct rather than
+a gap.** Both legs of case 2d run the same resampler, so a defect inside it
+cancels. The served suite answers "was it called"; the reference gate answers
+"was it right". The test file says so in the same words, because a green served
+suite under three of the four mutations reads like coverage it does not have.
+
+**The local Pillow cross-check — EVIDENCE, not a gate.** Pillow is not in the
+oracle table and carries no pin here, so nothing measured against it can gate.
+It is still the library upstream itself calls, so the port was compared to it
+directly: a standalone harness linking `pil_resize.cpp` against
+`PIL.Image.Image.resize(..., Image.Resampling.BICUBIC)` from the Pillow
+**12.1.1** installed on this host, over **436 cases** — 36 hand-picked
+geometries by four image kinds, plus a 400-case fuzz over random extents in
+`[1, 120]` on both axes with random content. **436 of 436 agreed byte for byte;
+worst absolute difference 0 of 255.** Read that as "this port reads Resample.c
+correctly on this Pillow", never as a parity result: a different Pillow could in
+principle move, and the committed gate is the in-tree reference above.
+
+**What was NOT measured.** No GPU, and none is relevant — the resample is host
+CPU work upstream of the tower. No throughput number on any axis. And no
+comparison to vLLM, which §6.2 records as impossible on any host this project
+owns.
 
 ---
 

@@ -5562,6 +5562,145 @@ changing an existing caller's behaviour, or if the released tokenizer turns out
 not to carry the three markers. Stop and report `NEEDS_CONTEXT` rather than
 guessing a value the config does not carry.
 
+#### 4.14.11 Evidence, measured on the merge commit
+
+Measured on the W7a branch after `origin/main` was merged in at `8853af6bf`,
+because a merge can falsify a claim made before it. Host: 20-core x86-64, CPU
+arm only (`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON
+-DCMAKE_BUILD_TYPE=Release`). Every number below was produced by the session
+that reports it; none is inherited.
+
+**The suites, by real target name.**
+
+| Target | Cases | Assertions |
+|---|---|---|
+| `test_dots3_note_audio` | 13 / 13 passed | 1976 / 1976 |
+| `test_openai_api_server_dots3_mm_forward` | 23 / 23 passed | 287 / 287 |
+| `test_dots3_note_vision` | 13 / 13 passed | 21343 / 21343 |
+| `test_dots3_note_scaffold` | 26 / 26 passed | 110835 / 110835 |
+| `test_dots3_note_attn` | 51 / 51 passed | 6888 / 6888 |
+| `test_parakeet_audio_processor` | 6 / 6 passed | 41054 / 41054 |
+| `test_parakeet_encoder` | 7 / 7 passed | 543 / 543 |
+| `test_parakeet_ctc_engine` | 2 / 2 passed | 12485 / 12485 |
+| `test_parakeet_transcription_fold` | 4 / 4 passed | 38 / 38 |
+| `test_parakeet_transducer` | 3 / 3 passed | 777 / 777 |
+
+`test_whisper_audio`, `test_gemma4_vision_tower` and `test_gemma4_audio_tower`
+each report **1 case and 0 assertions**, and `test_voxtral_e2e` exits **77**.
+Those are the tree's own environment-gated skips — they want
+`VLLM_WHISPER_ENC_WEIGHTS` and `VLLM_VOXTRAL_SAFETENSORS`, and the voxtral one
+prints "GATE NOT RUN — SKIPPED (exit 77), this is NOT a pass". They are recorded
+as NOT RUN, not as green. §4.14.9's risk paragraph asked for the Voxtral suite's
+counts as the shared-front-end proof and this host cannot produce them: the
+shared bank's executable evidence is the bit-exact oracle case below, plus
+Parakeet's 41054.
+
+**The one real oracle.** `MelFilterBankSlaney(201, 128, 0.0, 8000.0, 16000)`
+against the committed `voxtral_mel_filters_f32.bin`: **0 of 25728 values differ,
+worst |delta| 0** — bit for bit. Measured beside it, and the reason "25728 agree"
+is not 25728 independent facts: the bank is **sparse, 394 of 25728 nonzero**.
+
+**D2 did not move Parakeet.** No Parakeet TEST file is in this change
+(`git diff origin/main...HEAD --stat` names only
+`src/vllm/multimodal/parakeet_audio_processor.cpp` on that side), so the 41054
+assertions are the same population as on `main` and they pass. The extraction
+moved every arithmetic line unchanged and rounds once, on the same
+`static_cast<float>`; `MelFilterBankSlaneyTransposed` only reorders floats
+already rounded.
+
+**D5 left every existing caller byte-identical, structurally.**
+`git diff origin/main...HEAD -- include/vllm/model_executor/layers/linear.h`
+is **68 insertions and 0 deletions**: `UnquantizedMlpGateUpBiasMethod` is a
+FOURTH derived class and not one existing line of the seam changed, so "no bias"
+is not a new branch. `linear.h` is the only file the seam change touches.
+
+**Both reference-independence counts, MEASURED.** The enumeration is computed
+from the test file's own bytes with comments and string literals stripped:
+
+| Reference | Distinct | Occurrences | Scopes |
+|---|---|---|---|
+| `ref_front` | 11 | 71 | `std` only |
+| `ref_tower` | 6 | 53 | `std` only |
+
+Neither reference reaches `vllm::`, `vt::` or the file under test. The counts
+the file first carried — 22 and 19 — were **wrong**, and the case that asserted
+them could not tell: it compared two hand-written constants with two literals.
+Eleven of `ref_front`'s listed names are unused in that namespace and two
+(`std::llround`, `std::int16_t`) appear nowhere in the file except in the list
+naming them. Repaired in the same change; the property the counts supported was
+true throughout.
+
+**The agreement measurements.** Front end vs `ref_front`: worst |delta|
+**7.22919e-08**. Tower vs `ref_tower`: rel-L2 **0.00770442**, output spanning
+**[-1.80469, 2.15625]** rather than a constant. The mask stages measured
+**50 -> 25 -> 13 -> 7** against a padded mel of 100 frames and a stem output of
+13, and the padded tail sits at **-0.660975, not at 0** — which is why §4.14.3's
+leak is real. At 1281 samples the span is **2** and the mask **1**, so the two
+numbers are not derivable from one another.
+
+**The five mutations.** Each applied to a clean tree (the source blob's hash is
+compared before and after, because a mutation that never applied reads as a
+passing test), rebuilt, run, then restored and re-verified by blob hash. A
+build failure was treated as a build failure and never as a red: mutation A's
+first form died on `-Werror=unused-variable` and was corrected before it could
+be counted. Binary sha256 is reported **with** case counts, because a changed
+sha proves a rebuild and not that the mutation reached the code.
+
+Baseline (both suites GREEN):
+`test_dots3_note_audio` sha256 `6f0eebce3aeca1de…`, 13/13, 1976/1976;
+`test_openai_api_server_dots3_mm_forward` sha256 `d3de4496830eac5c…`, 23/23,
+287/287.
+
+| # | Mutation | Audio suite | Served suite | Binary sha256 (audio / served) |
+|---|---|---|---|---|
+| A | delete the tower call in `encode_mm` | 13/13, 1976/1976 — GREEN | **22 passed, 1 failed**; 286/1 | `9ace2f3f51eff5fb…` / `bc7ad5e37e2fb621…` |
+| B | tower -> correctly-shaped constant | **8 passed, 5 failed**; 1970/6 | **22 passed, 1 failed**; 286/1 | `4d448c702b43aa66…` / `07728ad2a25d96f0…` |
+| C | delete the four temporal-mask stages | **10 passed, 3 failed**; 1972/4 | 23/23 — GREEN | `5be72bd7f6275098…` / `156b403295bebf33…` |
+| D | give `k_proj` q's bias | **12 passed, 1 failed**; 1975/1 | 23/23 — GREEN | `c84ce66473c1279d…` / `3dcbd601e1f0b79f…` |
+| E | delete the loader materialisation call site | 13/13, 1976/1976 — GREEN | **20 passed, 3 failed**; 275/4 | `455d91b72ab0078d…` / `dc76f6e09b8c5803…` |
+
+Read the GREEN cells, because they are the point. **A reddens only the SERVED
+suite, and inside it only the two-waveforms LOGPROB case** (`CHECK(worst >
+1e-4)`, `test_api_server_dots3_mm_forward.cpp:1313`): status, `prompt_tokens`
+and `completion_tokens` all still pass with the tower call deleted, exactly as
+§4.14.8 predicted. **E reddens only the SERVED suite**, on
+`REQUIRE(r.status == 200)` — a tower-only gate cannot see a deleted production
+call site, which is what "Nothing lands dead" asks. **C and D redden only the
+TOWER suite**: the served logprob case compares two waveforms, and two waveforms
+still differ when the mask is gone, so the served gate is honestly blind to
+them. No single suite detects all five.
+
+After restoration both binaries rebuilt to the **byte-identical baseline
+sha256** (`6f0eebce3aeca1de…`, `d3de4496830eac5c…`) and `git status` is clean.
+
+**The tokenizer markers were verified against the released checkpoint, not
+assumed.** `dots-studio/dots3-note-prev` `added_tokens.json` (sha256
+`1aa71a4e0dbab80a72fd925389fd6c9cc52d1cb9da5dee8282784c15c6fa789b`) and
+`tokenizer.json` (sha256
+`7f4e21a1d9fa472439f70201b4849977da5ec11e73df5a36552ab5ee99af554b`, 85 added
+tokens) both carry all three as SPECIAL added tokens:
+`<|audio_comp_start|>` **151718**, `<|audio_comp_end|>` **151719**,
+`<|audio_comp_pad|>` **151720**. Note the order: `pad == start + 2`, and
+`pad != start + 1`. A port that assumed start/pad/end consecutive would build a
+well-formed wrong prompt. The code resolves all three BY STRING from the
+tokenizer and refuses BY NAME when one does not resolve.
+
+**The released checkpoint's audio tensors, re-measured from the committed
+index.** 430 tensors under `audio_encoder.`, **all BF16 and not one F32**;
+`k_proj.bias` **absent** while `q_proj.bias`, `v_proj.bias` and `out_proj.bias`
+are present 32 times each; `fc1.bias [10240]` and `fc2.bias [1280]` 32 times
+each, which is the caller that makes D5's arm REACHED; `conv_out.bias` absent.
+
+**Upstream anchors re-read at `9035151d6`**, in `~/_git/vllm` at
+`vllm/models/dots3_note/nvidia/audio_encoder.py`: the file is **736 lines**
+(§2.5's `+9` correction holds); `fc1`/`fc2` at `:334-335` take torch's default
+`bias=True`; the conv2d stem is `:466-474`; `self.embed_positions = None` is
+`:508`; the four mask stages are `:544-561` and
+`valid_mel_lens = audio_sample_lens // hop_length` is `:570-574`;
+`_temporal_mask` at `:528-533` keeps `arange(T) < valid_lens`, which is what
+`MaskTime` zeroes from `valid` onward; and `k_proj` alone is `bias=False` at
+`:221`.
+
 
 ## 5. Gates
 

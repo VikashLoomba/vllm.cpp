@@ -98,8 +98,11 @@ manifest_of() { (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z \
                  | xargs -0 sha256sum | sha256sum | cut -d' ' -f1); }
 
 # THE DESIGN. Both arms' leg counts are declared here and handed to the fold.
-# They are never derived by counting log lines: the job log is tee'd and a grep
-# tally reads every leg twice.
+# They are never derived by counting log lines, and the reason is RE-EMISSION and
+# not `tee`, which writes each line once: a job log carries each leg's figure in
+# its own step line AND again inside the RESULT.json the job echoes back, so a
+# grep tally over it answers whatever the grep term happens to hit. On the
+# oracle-only run of 2026-09-02 that tally read 13 against six legs.
 ROUNDS=4
 REPEAT=4          # our arm loads once and runs REPEAT completions per leg
 REPS=3            # the oracle's own repetitions per leg
@@ -254,9 +257,11 @@ Two terms the reader must carry before dividing anything:
     recording or quoting ANY throughput, latency or memory figure for vllm.cpp,
     with no exception written, because this arm's declared token gate reads
     TOKEN_GATE=FAIL at 3 of 6 -- and "how much our loader holds" is a memory
-    figure for vllm.cpp however casually it is phrased. A "~290 MB" attributed
-    to our loader stood on this line and is gone. The warning is what a future
-    reader needs. The number is what this row may not give them.
+    figure for vllm.cpp however casually it is phrased. A residency figure
+    attributed to our loader stood on this line and is deleted, not restated
+    here: repeating it to explain its removal is still quoting it. The warning
+    is what a future reader needs. The number is what this row may not give
+    them, and it is recoverable from `git log -S` if the gate ever passes.
 CLOSING
 echo "JOB_VERDICT=$([ "$FOLD_RC" = 0 ] && echo OK || echo INCOMPLETE)"
 echo "=== PAIRED JOB DONE ==="

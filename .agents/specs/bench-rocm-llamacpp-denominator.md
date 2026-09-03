@@ -416,6 +416,16 @@ and a clean re-fold of the committed directory reproduces `RESULT.json` byte for
 byte. A count nobody can redo is the shape `.agents/benchmarking.md` warns
 about, where a number quoted often gets treated as measured.
 
+**The forbidden figure is deleted and not restated.** The staged script carried
+a residency figure attributed to our loader on the `blk.64` line. This spec
+forbids this row producing, recording or quoting ANY throughput, latency or
+memory figure for vllm.cpp, with no exception written, and "how much our loader
+holds" is one however casually it is phrased. The warning to a future reader
+stays; the number is gone from the script, from this spec and from the pull
+request body, because repeating it to explain its removal is still quoting it.
+`git log -S` recovers it when the token gate passes and the figure becomes
+admissible.
+
 **Evidence curation is now recorded.** `system-info-extract.txt` is a hand-made
 selection that no step of `job-as-run.sh` produces, and the `use_extra_bufts`
 and tensor-count arguments rest on it. The 348,370-byte source it derives from is

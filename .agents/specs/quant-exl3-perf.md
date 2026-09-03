@@ -25,6 +25,29 @@ Slice A (the `(3, 2)` GEMV instantiation) and slice B (the `(4, 2)` GEMV KERNEL
 PORT) are described below. Everything else is
 under `## Evidence
 
+**TWO FINDINGS CHANGE WHAT THIS ROW IS FOR, and they are stated here because
+they are what a reader needs before any of the detail below means anything.**
+Both are gated in `tests/vt/test_exl3_gemv.cpp` and derived in full under
+`## THE WIDE CONFIG IS NOT THE ESCAPE`.
+
+1. **The wide config is NOT the escape from the occupancy ceiling.** Slice A
+   predicted it would be, because upstream admits CFG 1 at large `n` for
+   `K == 4`. That band is `size_n >= 8192 && size_k <= 4096`, and the SMALLEST
+   4-bit `k` in this checkpoint is 5120. It is dead for all 270 bits-4 modules,
+   exactly as it is for the 137 bits-3 ones. **All 409 sit on the same
+   `size_n / 32 <= narrow_coresident` test**, which is an occupancy query.
+2. **What bits 4 buys is LOWER THRESHOLDS, not a second admitting branch.** Its
+   270 modules spread over SIX values of `n` where the bits-3 137 have two, so
+   the admission ladder is 32, 160, 192, 320, 384, 544 instead of 160 and 544.
+   At `narrow_coresident = 160` the arm set reaches **164 of 409** modules,
+   against 45 for slice A alone; at 32 it reaches 34, against 0.
+
+So the row's open question is no longer "does an arm exist for these tensors" --
+after slice B one exists for 407 of 409, the same 407 upstream takes. It is
+"does the envelope admit them on GB10", and that is one unmeasured occupancy
+number. `docs/benchmarks/qwen38-27b-exl3-gb10.md` carries the same distinction
+on `main` as of `f8efa5761`.
+
 ### SLICE A, host arm, executed 2026-09-03 on `mudler-ubuntu-box`
 
 CPU-only build (`RelWithDebInfo`, no CUDA toolchain on this host), built in
@@ -958,35 +981,6 @@ A CPU-only green is not a device result and is never reported as one. A doctest
 `assertions: 0` line is a skip wearing a pass; read the ctest exit code.
 
 ## Owed
-
-- **ONE RECORD EDIT THIS BRANCH COULD NOT MAKE, with its exact replacement
-  text.** `docs/benchmarks/qwen38-27b-exl3-gb10.md` exists on `origin/main` and
-  not on this branch's base, and its unmatched-axes list ends with a bullet that
-  slice B falsifies:
-
-  > [#2570]: our `m <= 8` EXL3 GEMV instantiates `(3,1)` only, and this
-  > checkpoint contains **zero** `(3,1)` tensors while upstream's GEMV takes 407
-  > of its 409. That is the named, still-unmeasured hypothesis for any gap that
-  > a matched workload reveals.
-
-  It was already half stale before slice B -- slice A added `(3,2)` -- and slice
-  B makes the whole sentence wrong: this tree now takes the same 407 of 409.
-  What it should say instead:
-
-  > [#2570]: our `m <= 8` EXL3 GEMV now instantiates `(3,1)`, `(3,2)` and
-  > `(4,2)`, which is 407 of this checkpoint's 409 trellis modules -- the same
-  > 407 upstream's GEMV takes. WHETHER IT IS TAKEN is the open question, not
-  > whether it exists: `Exl3GemvSelectConfig` admits every shape here only where
-  > `size_n / 32 <= narrow_coresident`, an occupancy query, and that has not
-  > been measured on GB10. Still the named hypothesis for any gap a matched
-  > workload reveals, and now with a specific thing to measure.
-
-  It is NOT edited here, and the reason is mechanical rather than a judgement:
-  this branch is 30 commits behind `origin/main`, both device leases are queued
-  against a pinned tree, and a merge would move the pin and force both jobs to
-  be re-staged and re-queued from the back. The edit rides the merge. It is
-  written out in full so that it cannot be lost between the two, and so that
-  whoever merges does not have to re-derive it.
 
 - **The 2 bpw GEMV arm.** `LOADS` halves to `WNT / 2` and one loaded word
   carries TWO tiles (`exl3_gemv_kernel.cuh:152`, `:302-310`), so it is a third

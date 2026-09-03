@@ -704,6 +704,16 @@ struct Ltx2ConditioningTrace {
   // able to express sub-bf16 detail this would collapse to zero too, and the test
   // that asserts it does not reds instead of muting.
   int64_t vae_latent_not_bf16 = 0, vae_latent_values = 0;
+  // FNV-1a over the raw f32 bytes of that same latent, and its max|x|. Same
+  // instrument, same limits, as the two conditioning digests above: it detects
+  // CHANGE and it does not pin VALUES. It exists because the pixels stopped being
+  // able to report a small change once the decode moved to upstream's bfloat16 --
+  // a PPM byte is 8-bit and the decode's mantissa is now 8-bit, so an effect
+  // worth a few thousandths of a percent of the clip rounds away twice. A test
+  // that has to prove something REACHED the decoder asks the decoder's input,
+  // which no pixel quantization touches.
+  uint64_t vae_latent_digest = 0;
+  double vae_latent_absmax = 0.0;
   // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
   //
   // Zero everywhere when the request carried no image. `image_tokens` is how

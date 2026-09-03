@@ -130,6 +130,7 @@ const ModelFactory kLagunaFactory{
     .make_kv_cache = &MakeLagunaKVCache,
     // MoE model: NOT the dense per-arch scheduler default.
     .is_dense_model = false,
+    .consumes_device_token_ids = true,
 };
 
 }  // namespace

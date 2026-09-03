@@ -530,6 +530,16 @@ skips with that refusal quoted.
 - On ROCm, mixture-of-experts models run the shared-expert gate and both
   expert-combine steps on device. Before these ops were registered the
   engine refused with `no kernel for op` on that path.
+- An architecture whose forward does not read the asynchronous runner's DEVICE
+  token identifiers is REFUSED on a step whose host identifiers are stale, with a
+  message naming the architecture and `consumes_device_token_ids`. Before this
+  refusal the same step ran and generated from token id 0 at `rc=0`, producing
+  fluent wrong output rather than an error. It fires only when the runner
+  actually spliced a sampled token into one of the step's rows, so prefill-only
+  work — including every pooling and embedding request — is unaffected.
+  `VT_ASYNC_DEVICE_MIRROR=0` is the same-binary rollback: it returns the host
+  combine, makes the host identifiers authoritative, and leaves the refusal
+  inert. See [Environment variables](ENVIRONMENT.md).
 - Some architectures cannot be paged at the default KV block size of 32, and the
   engine RAISES it for them rather than refusing. DeepSeek-V4-Flash needs 256,
   because a `compress_ratio`-128 layer stores `block_size / compress_ratio`

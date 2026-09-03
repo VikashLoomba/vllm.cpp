@@ -1779,6 +1779,8 @@ vllm_cpp_add_test(test_deepseek_v4_paged_equiv
   vllm/models/test_deepseek_v4_paged_equiv.cpp)
 vllm_cpp_add_test(test_multi_kv_refusal
   vllm/model_executor/test_multi_kv_refusal.cpp)
+vllm_cpp_add_test(test_device_token_ids_refusal
+  vllm/model_executor/test_device_token_ids_refusal.cpp)
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 
@@ -1926,6 +1928,7 @@ vllm_cpp_add_test(test_logits_processor_host_addressable
   vllm/v1/sample/test_logits_processor_host_addressable.cpp)
 vllm_cpp_add_test(test_prepare_inputs vllm/v1/worker/test_prepare_inputs.cpp)
 vllm_cpp_add_test(test_combine_tokens vllm/v1/worker/test_combine_tokens.cpp)
+vllm_cpp_add_test(test_combine_row_predicate vllm/v1/worker/test_combine_row_predicate.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 # ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state

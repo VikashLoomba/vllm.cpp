@@ -84,12 +84,32 @@ struct TinySpec {
   int64_t v_channels = 3;
   int64_t v_temporal = 1;
   double v_rms_eps = 1e-3;
-  // `pyramid_num_routed` written into the config. EMPTY means "no MoE at all";
-  // a case that wants the W6b refusal sets one entry positive.
+  // `pyramid_num_routed` written into the config. All-negative means "no MoE at
+  // all"; a case that wants a PYRAMID block sets one entry positive, and W6b
+  // computes it instead of refusing.
   std::vector<int64_t> v_pyramid{-1, -1};
+  // The routed expert width, `moe_intermediate_size` of the `vision_config`.
+  // Deliberately NOT `v_inter`: an expert whose width equalled the dense
+  // SwiGLU's would let a routed block read a dense block's operand and still
+  // pass every shape check.
+  int64_t v_moe_inter = 4;
+  // `capacity_factor`. `topk = min(int(capacity_factor), num_routed)`
+  // (vision.py:180 @ 9035151d6), so 2 selects TWO experts — the released value.
+  double v_capacity_factor = 2.0;
+  std::string v_router_scoring_func = "sigmoid";
+  double v_router_scale = 1.0;
+  // The AMPLITUDE of the generated `mlp.router_bias` values, and the ONLY
+  // reason it is settable. Two checkpoints that differ in this and in nothing
+  // else are the served gate's handle on the router: every other tensor is
+  // drawn from the same seed stream, so a difference in what the server answers
+  // can only have come through the routing decision.
+  double v_router_bias_amp = 0.4;
   std::string v_adapter_type = "patch_merger";
   bool v_pre_pixel_shuffle = true;
   bool v_post_norm = true;
+  bool v_use_qk_norm = true;
+  bool v_use_bias = false;
+  bool v_is_causal = false;
   // THE TWO ADAPTER KEYS A CONFORMANT CHECKPOINT TIES TO SOMETHING ELSE, and
   // the only reason either is settable. `adapter_out_dim` is the TEXT hidden
   // size because the encoder's rows are scattered into the prompt; and
@@ -257,7 +277,7 @@ inline nlohmann::json TinyConfigDoc(const std::string& fixture_dir,
     v["embed_dim"] = s.v_embed;
     v["hidden_size"] = s.hidden;
     v["intermediate_size"] = s.v_inter;
-    v["moe_intermediate_size"] = 4;
+    v["moe_intermediate_size"] = s.v_moe_inter;
     v["num_hidden_layers"] = s.v_layers;
     v["num_attention_heads"] = s.v_heads;
     v["num_channels"] = s.v_channels;
@@ -265,15 +285,15 @@ inline nlohmann::json TinyConfigDoc(const std::string& fixture_dir,
     v["spatial_merge_size"] = s.v_merge;
     v["temporal_patch_size"] = s.v_temporal;
     v["rms_norm_eps"] = s.v_rms_eps;
-    v["use_bias"] = false;
-    v["use_qk_norm"] = true;
-    v["is_causal"] = false;
+    v["use_bias"] = s.v_use_bias;
+    v["use_qk_norm"] = s.v_use_qk_norm;
+    v["is_causal"] = s.v_is_causal;
     v["post_norm"] = s.v_post_norm;
     v["pre_pixel_shuffle"] = s.v_pre_pixel_shuffle;
     v["pyramid_num_routed"] = s.v_pyramid;
-    v["capacity_factor"] = 2;
-    v["router_scoring_func"] = "sigmoid";
-    v["router_scale"] = 1.0;
+    v["capacity_factor"] = s.v_capacity_factor;
+    v["router_scoring_func"] = s.v_router_scoring_func;
+    v["router_scale"] = s.v_router_scale;
     v["adapter_type"] = s.v_adapter_type;
     v["adapter_in_dim"] = s.v_embed;
     v["adapter_out_dim"] = s.v_adapter_out();
@@ -381,20 +401,31 @@ inline std::vector<StOut> TinyEntries(const TinySpec& s, uint64_t seed = 7) {
     e.push_back({pre + "norm_2.weight", {E}, norm(E)});
     e.push_back({pre + "attn.qkv.weight", {3 * E, E}, proj(3 * E * E)});
     e.push_back({pre + "attn.proj.weight", {E, E}, proj(E * E)});
-    e.push_back({pre + "attn.q_norm.weight", {D}, norm(D)});
-    e.push_back({pre + "attn.k_norm.weight", {D}, norm(D)});
+    if (s.v_use_qk_norm) {
+      e.push_back({pre + "attn.q_norm.weight", {D}, norm(D)});
+      e.push_back({pre + "attn.k_norm.weight", {D}, norm(D)});
+    }
     if (moe) {
-      // Present so a REFUSAL case can load a checkpoint that really does carry
-      // a pyramid block, rather than one that merely says so in its config.
+      // The PYRAMID block's own state dict: `mlp.gate_weight` BF16 [ne, E] and
+      // `mlp.router_bias` **F32** [ne], which is the dtype upstream registers
+      // (vision.py:152-155 @ 9035151d6) and the one dtype in this fixture that
+      // is not BF16. Writing it BF16 here is what a re-typed-router mutation
+      // does, and the loader refuses it by name.
       const int64_t ne = s.v_pyramid[static_cast<size_t>(b)];
+      const int64_t mi = s.v_moe_inter;
       e.push_back({pre + "mlp.gate_weight", {ne, E}, proj(ne * E)});
-      e.push_back({pre + "mlp.router_bias", {ne}, Values(ne, next(), 0.1),
-                   "F32"});
+      // AMPLITUDE 0.4, not 0.1. The router bias shifts the SELECTION score
+      // against sigmoid probabilities that all sit in (0, 1) and mostly near
+      // 0.5, so a bias too small to reorder them would leave the fixture's
+      // selection identical to the unbiased one — and a gate on a tower whose
+      // bias does nothing cannot see a dropped bias.
+      e.push_back({pre + "mlp.router_bias", {ne},
+                   Values(ne, next(), s.v_router_bias_amp), "F32"});
       for (int64_t x = 0; x < ne; ++x) {
         const std::string ep = pre + "mlp.experts." + std::to_string(x) + ".";
-        e.push_back({ep + "fc1.weight", {4, E}, proj(4 * E)});
-        e.push_back({ep + "fc2.weight", {E, 4}, proj(E * 4)});
-        e.push_back({ep + "fc3.weight", {4, E}, proj(4 * E)});
+        e.push_back({ep + "fc1.weight", {mi, E}, proj(mi * E)});
+        e.push_back({ep + "fc2.weight", {E, mi}, proj(E * mi)});
+        e.push_back({ep + "fc3.weight", {mi, E}, proj(mi * E)});
       }
     } else {
       e.push_back({pre + "mlp.fc1.weight", {VI, E}, proj(VI * E)});
@@ -406,6 +437,19 @@ inline std::vector<StOut> TinyEntries(const TinySpec& s, uint64_t seed = 7) {
     e.push_back({vp + "post_trunk_norm.weight", {E}, norm(E)});
   }
   const int64_t M = s.v_merged_dim(), O = s.v_adapter_out();
+  // THE TWO ADAPTERS HAVE DIFFERENT STATE DICTS AND DIFFERENT SHAPES.
+  // `PatchMergerAdapter` is ln_q(in_dim) + mlp.0 [M,M] + mlp.2 [O,M]
+  // (vision.py:481-486 @ 9035151d6); `PixelShuffleAdapter` is proj.0(merged_dim)
+  // + proj.1 [O,M] + proj.3 [O,O] (vision.py:432-437).
+  if (s.v_adapter_type == "pixel_shuffle_mlp") {
+    e.push_back({vp + "adapter.proj.0.weight", {M}, norm(M)});
+    e.push_back({vp + "adapter.proj.0.bias", {M}, Values(M, next(), 0.1)});
+    e.push_back({vp + "adapter.proj.1.weight", {O, M}, proj(O * M)});
+    e.push_back({vp + "adapter.proj.1.bias", {O}, Values(O, next(), 0.1)});
+    e.push_back({vp + "adapter.proj.3.weight", {O, O}, proj(O * O)});
+    e.push_back({vp + "adapter.proj.3.bias", {O}, Values(O, next(), 0.1)});
+    return e;
+  }
   e.push_back({vp + "adapter.ln_q.weight", {E}, norm(E)});
   e.push_back({vp + "adapter.ln_q.bias", {E}, Values(E, next(), 0.1)});
   e.push_back({vp + "adapter.mlp.0.weight", {M, M}, proj(M * M)});

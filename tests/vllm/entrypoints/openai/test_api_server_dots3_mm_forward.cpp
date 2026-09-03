@@ -1,4 +1,5 @@
-// dots3-note W6a (#2512) — THE SERVED IMAGE REQUEST, end to end.
+// dots3-note W6a (#2512) and W6b (#2613) — THE SERVED IMAGE REQUEST, end to
+// end, over a DENSE tower and over a PYRAMID one.
 //
 // One OpenAI `image_url` chat request travels the whole production chain on a
 // CPU queue over the real serving stack:
@@ -10,7 +11,8 @@
 //     -> AsyncLLM::generate(MultiModalInputs) -> EngineCore
 //     -> Scheduler::schedule                  (encoder admission + budget)
 //     -> Executor -> GPUModelRunner::execute_model
-//        (the encoder step runs the DENSE VISION TOWER, the gather slices its
+//        (the encoder step runs the VISION TOWER — dense blocks and, since
+//         W6b, pyramid MoE blocks — the gather slices its
 //         rows, `EmbedMmDots3NoteForCausalLM` scatters them, `.mm` is set)
 //     -> ModelRegistry::Forward -> ForwardDots3NoteForCausalLM
 //     -> Dots3NoteModel::ForwardDevice, which reads `mm->inputs_embeds`
@@ -400,9 +402,10 @@ TEST_CASE("dots3-note W6a: a served image chat request reaches the model forward
   REQUIRE(h.install(kDots3Arch, /*is_multimodal_model=*/true, s.ckpt, log) ==
           oai::MultiModalChatInstall::kInstalled);
   INFO("install log: ", log.str());
-  // The install announced WHICH processor it built and from where, and it says
-  // out loud that the pyramid half is owed.
+  // The install announced WHICH processor it built and from where.
   CHECK(log.str().find("dots3-note processor") != std::string::npos);
+  // ...and no longer says the pyramid half is owed, because W6b landed it.
+  CHECK(log.str().find("is W6b") == std::string::npos);
 
   const ApiServer::DispatchResult r =
       h.server.handle_chat_completions(ChatBody(/*max_tokens=*/3, 0, false).dump());
@@ -487,33 +490,163 @@ TEST_CASE("dots3-note W6a: the same image twice is served twice, and the second 
 }
 
 // ---------------------------------------------------------------------------
-// 5. A CHECKPOINT WHOSE VISION TOWER IS OWED REFUSES BY NAME, and the message
-//    names the block and the brick.
+// 5. A CHECKPOINT WITH A PYRAMID VISION BLOCK IS **SERVED** (W6b, #2613).
 //
-//    THIS IS THE RELEASED CHECKPOINT'S CASE, at tiny scale: 17 of its 42 vision
-//    blocks are pyramid MoE, so its tower refuses at block 25. A port that
-//    served such a request would be serving a tower whose pyramid it silently
-//    skipped, on a row §6.4 records as having no oracle to catch it.
+//    THIS IS THE RELEASED CHECKPOINT'S CASE, at tiny scale, and it is the
+//    inverse of the one W6a landed here. 17 of the released tower's 42 blocks
+//    are pyramid MoE, so before this brick the install reported `kRefusing` and
+//    every image came back 400. Now the same checkpoint installs and answers.
 //
-//    The request still reaches the FORWARD path — the seam builds the features
-//    and the runner asks for the encoder — so this is the refusal firing where
-//    it can name what is missing, not the request being turned away earlier.
+//    THE LOAD-BEARING ASSERTION IS THE TWO-IMAGE LOGPROB ONE, and what it is
+//    load-bearing FOR was measured rather than assumed. It separates a tower
+//    that ran from a tower replaced by a correctly shaped constant: status 200,
+//    `prompt_tokens` and `completion_tokens` all pass on the second, and the
+//    logprobs of the first generated token do not, because they move for any
+//    change in the hidden state and the two images differ in every patch.
+//
+//    It does NOT separate a tower that ROUTED correctly from one that did not,
+//    because a dense block still processes the pixels on the way. Three of
+//    spec §4.12.9's mutations left this case green. Case 5c below is the one
+//    that covers the router, and it exists because those three measurements
+//    said this one could not.
 // ---------------------------------------------------------------------------
-TEST_CASE("dots3-note W6a: a checkpoint with a PYRAMID vision block refuses the image BY NAME") {
+TEST_CASE("dots3-note W6b: a checkpoint with a PYRAMID vision block is SERVED") {
   TinySpec spec;
-  spec.v_pyramid = {-1, 4};  // block 1 is routed: W6b's
+  spec.v_pyramid = {-1, 4};  // block 1 is routed
   Served s(spec);
   MmServerHarness h(s.config, *s.model, Fixture());
   std::ostringstream log;
-  // The chat FACTORY asks the tower's own refusal and throws, so the install
-  // reports kRefusing rather than wiring a seam that would take the engine down
-  // on the first image. That ordering is measured, not chosen: before the
-  // factory asked, the refusal fired inside the engine's busy loop, stopped
-  // `AsyncLLM`, and every LATER request — text ones included — came back 500.
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+  INFO("install log: ", log.str());
+  // The install no longer announces an owed pyramid, because nothing is owed.
+  CHECK(log.str().find("W6b") == std::string::npos);
+
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(ChatBody(3, 0, false).dump());
+  INFO("body: ", r.body);
+  REQUIRE(r.status == 200);
+  const json j = json::parse(r.body);
+  CHECK(j.at("object") == "chat.completion");
+  CHECK(j.at("usage").at("completion_tokens") == 3);
+  CHECK(j.at("usage").at("prompt_tokens") == 3 + dots3_tiny::kExpectedImageTokens);
+}
+
+TEST_CASE("dots3-note W6b: two DIFFERENT images through a PYRAMID tower give two different forwards") {
+  TinySpec spec;
+  spec.v_pyramid = {-1, 4};
+  Served s(spec);
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  const ApiServer::DispatchResult a =
+      h.server.handle_chat_completions(ChatBody(4, /*variant=*/0, true).dump());
+  const ApiServer::DispatchResult b =
+      h.server.handle_chat_completions(ChatBody(4, /*variant=*/1, true).dump());
+  INFO("a: ", a.body);
+  INFO("b: ", b.body);
+  REQUIRE(a.status == 200);
+  REQUIRE(b.status == 200);
+
+  const json ja = json::parse(a.body);
+  const json jb = json::parse(b.body);
+  const json& la = ja.at("choices").at(0).at("logprobs").at("content").at(0);
+  const json& lb = jb.at("choices").at(0).at("logprobs").at("content").at(0);
+  MESSAGE("pyramid image A logprob0 ", la.dump());
+  MESSAGE("pyramid image B logprob0 ", lb.dump());
+  // Same prompt, same weights, greedy sampling: the ONLY difference between the
+  // two forwards is the pixels, and they travel through a ROUTED block on the
+  // way. If the logprobs match, the pixels did not reach the forward.
+  CHECK(la != lb);
+}
+
+// ---------------------------------------------------------------------------
+// 5c. THE ROUTING DECISION REACHES THE SERVED ANSWER (W6b, #2613).
+//
+//     MEASURED, NOT ASSUMED, AND THE MEASUREMENT IS WHY THIS CASE EXISTS. The
+//     two-different-images case above is the only assertion in this file that
+//     survives a tower replaced by a correctly shaped constant — but it does
+//     NOT survive as a router gate, because a dense block still processes the
+//     pixels on the way. Three mutations recorded in spec §4.12.9 left it
+//     GREEN: routing every token to expert 0, dropping the router bias, and
+//     replacing the routed FFN output with a constant. All three are defects
+//     that change WHICH expert runs, and none of them changed what this server
+//     answered.
+//
+//     So the router needs its own served assertion, and this is its shape: two
+//     checkpoints that differ in `mlp.router_bias` AND IN NOTHING ELSE — every
+//     other tensor is drawn from the same seed stream — must produce different
+//     logprobs. A router that ignores its bias, ignores its input, or feeds a
+//     constant FFN gives the two identical answers and this case reds.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6b: the router BIAS changes what the server answers") {
+  TinySpec biased;
+  biased.v_pyramid = {-1, 4};
+  biased.v_router_bias_amp = 0.4;
+  TinySpec unbiased = biased;
+  // Amplitude zero makes every `router_bias` entry exactly 0.0 while still
+  // consuming the same value from the seed stream, so the two checkpoints
+  // differ in ONE tensor family and agree byte-for-byte everywhere else.
+  unbiased.v_router_bias_amp = 0.0;
+
+  // THE PREMISE, asserted rather than assumed: the checkpoints really do differ
+  // in exactly the router bias. Without this the case could be comparing two
+  // identical models and reporting a router that works.
+  const std::vector<dots3_tiny::StOut> a_ent = dots3_tiny::TinyEntries(biased);
+  const std::vector<dots3_tiny::StOut> b_ent = dots3_tiny::TinyEntries(unbiased);
+  REQUIRE(a_ent.size() == b_ent.size());
+  int differing = 0;
+  for (size_t i = 0; i < a_ent.size(); ++i) {
+    REQUIRE(a_ent[i].name == b_ent[i].name);
+    if (a_ent[i].values != b_ent[i].values) {
+      ++differing;
+      CHECK(a_ent[i].name == "vision_encoder.blocks.1.mlp.router_bias");
+    }
+  }
+  CHECK(differing == 1);
+
+  auto answer = [](const TinySpec& spec) {
+    Served s(spec);
+    MmServerHarness h(s.config, *s.model, Fixture());
+    std::ostringstream log;
+    REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+            oai::MultiModalChatInstall::kInstalled);
+    const ApiServer::DispatchResult r =
+        h.server.handle_chat_completions(ChatBody(4, 0, true).dump());
+    INFO("body: ", r.body);
+    REQUIRE(r.status == 200);
+    return json::parse(r.body)
+        .at("choices").at(0).at("logprobs").at("content").at(0);
+  };
+  const json la = answer(biased);
+  const json lb = answer(unbiased);
+  MESSAGE("biased router logprob0   ", la.dump());
+  MESSAGE("unbiased router logprob0 ", lb.dump());
+  CHECK(la != lb);
+}
+
+// ---------------------------------------------------------------------------
+// 5b. A CHECKPOINT WHOSE VISION TOWER IS STILL OWED REFUSES BY NAME, and the
+//     message names the key and the issue.
+//
+//     The shape W6a measured here has not gone away — it moved to the arm that
+//     is still owed. `use_bias` is a config the shared MLP seam cannot express
+//     (issue #2616), so the chat FACTORY refuses at install rather than letting
+//     the throw land in the engine's busy loop, where it would stop `AsyncLLM`
+//     and turn every LATER request — text ones included — into a 500.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6b: a checkpoint whose vision arm is OWED refuses the image BY NAME") {
+  TinySpec spec;
+  spec.v_use_bias = true;
+  Served s(spec);
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
   REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
           oai::MultiModalChatInstall::kRefusing);
   INFO("install log: ", log.str());
-  CHECK(log.str().find("W6b") != std::string::npos);
+  CHECK(log.str().find("use_bias") != std::string::npos);
 
   const ApiServer::DispatchResult r =
       h.server.handle_chat_completions(ChatBody(2, 0, false).dump());
@@ -523,8 +656,8 @@ TEST_CASE("dots3-note W6a: a checkpoint with a PYRAMID vision block refuses the 
   // fluent wrong answer. A 500 is the OTHER defect, and it is the one this
   // ordering removes: an engine that died takes the text path with it.
   CHECK(r.status == 400);
-  CHECK(r.body.find("W6b") != std::string::npos);
-  CHECK(r.body.find("MoE") != std::string::npos);
+  CHECK(r.body.find("use_bias") != std::string::npos);
+  CHECK(r.body.find("#2616") != std::string::npos);
   // ...and the TEXT path over the SAME server, AFTER the refused image request,
   // still answers. This is the assertion the engine-fatal shape could not pass.
   const json text = {{"model", "test-model"},
@@ -536,7 +669,7 @@ TEST_CASE("dots3-note W6a: a checkpoint with a PYRAMID vision block refuses the 
       h.server.handle_chat_completions(text.dump());
   INFO("text body: ", t.body);
   CHECK(t.status == 200);
-  CHECK(t.body.find("W6b") == std::string::npos);
+  CHECK(t.body.find("use_bias") == std::string::npos);
 }
 
 // ---------------------------------------------------------------------------

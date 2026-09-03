@@ -106,6 +106,52 @@ void RequireVisionShape(const OwnedTensor& t, const std::string& name,
                "defect a token gate cannot see (porting.md).");
 }
 
+// The SAME assertion pointed the other way, for the ONE family of vision
+// tensors upstream itself declares f32: `register_buffer("router_bias",
+// torch.zeros(num_routed, dtype=torch.float32))` (vision.py:152-155 @
+// 9035151d6). 17 of them against 2178 BF16 tensors in the released tower. A
+// NARROWED router bias is as invisible to a token gate as a widened weight, so
+// the load names the dtype in both directions instead of accepting the file's.
+void RequireF32VisionShape(const OwnedTensor& t, const std::string& name,
+                           const std::vector<int64_t>& want) {
+  std::vector<int64_t> got(t.shape, t.shape + t.rank);
+  VT_CHECK(got == want,
+           "dots3-note vision tower: '" + name + "' ships " + ShapeOf(got) +
+               ", the config implies " + ShapeOf(want));
+  VT_CHECK(t.dtype == DType::kF32,
+           "dots3-note vision tower: '" + name +
+               "' is not F32 after load. Upstream registers this buffer "
+               "`dtype=torch.float32` (vision.py:152-155 @ 9035151d6) and the "
+               "released checkpoint ships it F32; a narrower store changes "
+               "which experts the top-k selects and no token gate can see it "
+               "(porting.md).");
+}
+
+// The F32 `router_bias`, read as F32. `dense_loaders` has no F32 reader — every
+// helper there is a BF16 one — so this is the third file-local copy of the same
+// six lines (`dots3_note_device.cpp:266`, `deepseek_v2_weights.cpp:113`), each
+// anonymous-namespace in its own TU and so uncallable from here. What matters is
+// the PROPERTY, and it is identical: the on-disk dtype is CHECKED rather than
+// assumed, because a loader that assumed one dtype for the whole checkpoint
+// would read this tensor wrong and nothing downstream would notice.
+OwnedTensor LoadVisionF32Vector(const TensorResolver& get,
+                                const std::string& name) {
+  const StTensor& t = get(name);
+  VT_CHECK(t.dtype == "F32",
+           "dots3-note vision tower: expected F32 for " + name +
+               " but the checkpoint ships " + t.dtype +
+               " — `router_bias` is registered `dtype=torch.float32` upstream "
+               "(vision.py:152-155 @ 9035151d6) and is one of the 17 F32 "
+               "tensors in an otherwise all-BF16 tower");
+  VT_CHECK(t.shape.size() == 1,
+           "dots3-note vision tower: expected a 1-D tensor for " + name);
+  OwnedTensor o = dense_loaders::MakeOwned(DType::kF32, t.shape);
+  VT_CHECK(t.nbytes == o.bytes.size(),
+           "dots3-note vision tower: byte-size mismatch for " + name);
+  std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  return o;
+}
+
 }  // namespace
 
 Dots3NoteVisionParams ParseDots3NoteVisionParams(const HfConfig& config) {
@@ -212,52 +258,6 @@ std::string Dots3NoteVisionRefusal(
            "(`MoESwiGLUFFNFP8`, vision.py:222-297 @ 9035151d6, and "
            "nvidia/vision_moe.py's `note_vision_fused_moe_fp8`) is W9";
   }
-  const int64_t moe = v.num_moe_blocks();
-  if (moe > 0) {
-    int64_t first = -1;
-    for (int64_t i = 0; i < v.num_hidden_layers; ++i) {
-      if (v.is_moe_block(i)) { first = i; break; }
-    }
-    return "vision block " + std::to_string(first) + " is a PYRAMID MoE block (" +
-           std::to_string(v.pyramid_num_routed[static_cast<size_t>(first)]) +
-           " routed experts), and " + std::to_string(moe) + " of the tower's " +
-           std::to_string(v.num_hidden_layers) +
-           " blocks are. The MoE ViT — `mlp.gate_weight` + `mlp.router_bias`, "
-           "sigmoid scoring and the capacity-factor top-k (`MoESwiGLUFFN`, "
-           "vision.py:139-219 @ 9035151d6) — is W6b. W6a ships the DENSE arm "
-           "only, and refusing is what stops this port from serving a tower "
-           "whose pyramid it silently skipped on a row that has no oracle "
-           "(spec §6.4)";
-  }
-  if (v.adapter_type != "patch_merger") {
-    return "`adapter_type` is '" + v.adapter_type +
-           "'. W6a implements `patch_merger` (`PatchMergerAdapter`, "
-           "vision.py:441-472 @ 9035151d6), which is what the released "
-           "`dots-studio/dots3-note-prev` selects. `pixel_shuffle_mlp` is a "
-           "DIFFERENT token order from the same pixels and a DIFFERENT state "
-           "dict (`proj.0`/`proj.1`/`proj.3` against `ln_q`/`mlp.0`/`mlp.2`), "
-           "so it is refused rather than mapped onto this one. W6b";
-  }
-  if (!v.post_norm) {
-    return "`post_norm` is false, so upstream builds no `post_trunk_norm` "
-           "(vision.py:513-514 @ 9035151d6). Every published dots3-note tower "
-           "sets it true and W6a's arm assumes it. W6b";
-  }
-  if (v.use_bias) {
-    return "`use_bias` is true, so `attn.qkv`, `attn.proj` and every "
-           "`mlp.fc*` would carry a bias the released checkpoint does not ship "
-           "(vision.py:143-144 of vision_attention.py @ 9035151d6). W6b";
-  }
-  if (!v.use_qk_norm) {
-    return "`use_qk_norm` is false, so attention would run with no per-head "
-           "`q_norm`/`k_norm` (vision_attention.py:145-147 @ 9035151d6) while "
-           "the checkpoint ships both. W6b";
-  }
-  if (v.is_causal) {
-    return "`is_causal` is true. The dots3-note ViT attends bidirectionally "
-           "(vision_attention.py:118 @ 9035151d6) and W6a's attention call "
-           "passes `causal=false`. W6b";
-  }
   if (v.temporal_patch_size != 1) {
     return "`temporal_patch_size` is " + std::to_string(v.temporal_patch_size) +
            ", which is the VIDEO arm: `DotsPatchEmbed.forward` takes "
@@ -265,11 +265,68 @@ std::string Dots3NoteVisionRefusal(
            "and the multi-frame `cu_seqlens` builder is a different one "
            "(vision.py:613-624). Video is W7";
   }
+  if (v.use_bias) {
+    return "`use_bias` is true, so `attn.qkv`, `attn.proj` and every "
+           "`mlp.fc*` — of the dense blocks AND of every routed expert — would "
+           "carry a bias the released checkpoint does not ship "
+           "(vision_attention.py:143-144 and vision.py:129-134, :158-163 @ "
+           "9035151d6). The shared `layers::MlpGateUpMethodBase` seam has no "
+           "bias operand, so lifting this means extending that seam rather "
+           "than adding an arm here. Owed under "
+           "`.agents/specs/dots3-note.md` `## Owed`, issue #2616";
+  }
+  // ── THE PYRAMID ROUTER ARMS W6b DOES NOT SERVE ────────────────────────────
+  //
+  // These two exist because upstream's combine is SELF-NORMALIZING: it divides
+  // the routed sum by a per-token `aggregated_gate + 1e-9` (vision.py:207-218).
+  // On the sigmoid arm with `topk > 1` the weights were already renormalized to
+  // sum to `router_scale` (vision.py:182-184), so that denominator is a
+  // CONSTANT and folds exactly into `vt::MoeCombine`'s `routed_scale`. On the
+  // other arms it is per-token, and no shared op expresses a per-token scale on
+  // the combine. Refusing beats a host round-trip per routed block, and beats
+  // widening `vt::MoeCombine` — the op DeepSeek-V2's token-exact path uses — in
+  // a brick that is adding a tower.
+  if (v.num_moe_blocks() > 0 && v.router_scoring_func != "sigmoid") {
+    return "`router_scoring_func` is '" + v.router_scoring_func +
+           "'. W6b serves the SIGMOID arm (vision.py:182-183 @ 9035151d6), "
+           "which is what the released `dots-studio/dots3-note-prev` and "
+           "`DotsMoEVitConfig`'s own default both select. The softmax branch "
+           "(vision.py:185-186) leaves the combine's `aggregated_gate` "
+           "denominator per-token (vision.py:207-218), which `vt::MoeCombine`'s "
+           "single-float `routed_scale` cannot express. Owed under "
+           "`.agents/specs/dots3-note.md` `## Owed`, issue #2615";
+  }
+  for (int64_t i = 0; i < v.num_hidden_layers; ++i) {
+    if (!v.is_moe_block(i)) continue;
+    if (v.routed_top_k(i) >= 2) continue;
+    return "vision block " + std::to_string(i) + " routes to top-" +
+           std::to_string(v.routed_top_k(i)) + " of " +
+           std::to_string(v.pyramid_num_routed[static_cast<size_t>(i)]) +
+           " experts (`min(int(capacity_factor), num_routed)`, vision.py:180 @ "
+           "9035151d6). Below 2 upstream SKIPS the weight renormalization "
+           "(vision.py:182), which leaves the combine's `aggregated_gate` "
+           "denominator per-token (vision.py:207-218) and `vt::MoeCombine`'s "
+           "single-float `routed_scale` cannot express it. The released "
+           "checkpoint's `capacity_factor` is 2 and its smallest block routes "
+           "to 4 experts. Owed under `.agents/specs/dots3-note.md` `## Owed`, "
+           "issue #2615";
+  }
   if (v.adapter_in_dim != v.embed_dim) {
     return "`adapter_in_dim` " + std::to_string(v.adapter_in_dim) +
            " is not the tower's `embed_dim` " + std::to_string(v.embed_dim) +
-           ", so `ln_q` would normalize a width the trunk does not produce "
-           "(vision.py:466 @ 9035151d6). W6b";
+           ", so the adapter would normalize a width the trunk does not produce "
+           "(vision.py:481 for `patch_merger`, :433 for `pixel_shuffle_mlp`, @ "
+           "9035151d6)";
+  }
+  if (v.adapter_type == "pixel_shuffle_mlp" && v.adapter_merge_size != 2) {
+    return "`adapter_type` is 'pixel_shuffle_mlp' with `adapter_merge_size` " +
+           std::to_string(v.adapter_merge_size) +
+           ". `_pixel_shuffle` is HARD-CODED to `scale_factor=0.5` "
+           "(vision.py:401-416, :456 @ 9035151d6), so it folds 2x2 neighbours "
+           "whatever the key says, while `merged_dim = in_dim * merge_size**2` "
+           "(vision.py:431) sizes `proj.0` by the key. Anything but 2 makes the "
+           "LayerNorm's width and the shuffle's output width disagree, and "
+           "upstream would raise on the shape rather than compute";
   }
   // ── THE TWO THE ENCODER ASSERTS ON ─────────────────────────────────────────
   //
@@ -345,27 +402,58 @@ std::vector<Dots3NoteTensor> EnumerateDots3NoteVisionTensors(
   out.push_back({p + "patch_embed.proj.bias", "vision.patch_embed"});
   out.push_back({p + "patch_embed.norm.weight", "vision.patch_embed"});
   for (int64_t b = 0; b < v.num_hidden_layers; ++b) {
-    if (v.is_moe_block(b)) continue;  // W6b's
     const std::string pre = p + "blocks." + std::to_string(b) + ".";
     out.push_back({pre + "norm_1.weight", "vision.block.norm_1"});
     out.push_back({pre + "norm_2.weight", "vision.block.norm_2"});
     out.push_back({pre + "attn.qkv.weight", "vision.block.attn.qkv"});
     out.push_back({pre + "attn.proj.weight", "vision.block.attn.proj"});
-    out.push_back({pre + "attn.q_norm.weight", "vision.block.attn.q_norm"});
-    out.push_back({pre + "attn.k_norm.weight", "vision.block.attn.k_norm"});
-    out.push_back({pre + "mlp.fc1.weight", "vision.block.mlp.gate"});
-    out.push_back({pre + "mlp.fc2.weight", "vision.block.mlp.down"});
-    out.push_back({pre + "mlp.fc3.weight", "vision.block.mlp.up"});
+    // Only built when `use_qk_norm` (vision_attention.py:145-147 @ 9035151d6),
+    // so a tower that turns it off ships neither tensor and must not claim one.
+    if (v.use_qk_norm) {
+      out.push_back({pre + "attn.q_norm.weight", "vision.block.attn.q_norm"});
+      out.push_back({pre + "attn.k_norm.weight", "vision.block.attn.k_norm"});
+    }
+    if (v.is_moe_block(b)) {
+      // `MoESwiGLUFFN` (vision.py:139-168 @ 9035151d6). The router spelling is
+      // `mlp.gate_weight` + `mlp.router_bias` — NOT the language tower's
+      // `mlp.gate.weight` + `mlp.gate.e_score_correction_bias`.
+      const int64_t ne = v.pyramid_num_routed[static_cast<size_t>(b)];
+      out.push_back({pre + "mlp.gate_weight", "vision.block.moe.router"});
+      out.push_back({pre + "mlp.router_bias", "vision.block.moe.router_bias"});
+      for (int64_t e = 0; e < ne; ++e) {
+        const std::string ep = pre + "mlp.experts." + std::to_string(e) + ".";
+        out.push_back({ep + "fc1.weight", "vision.block.moe.expert.gate"});
+        out.push_back({ep + "fc2.weight", "vision.block.moe.expert.down"});
+        out.push_back({ep + "fc3.weight", "vision.block.moe.expert.up"});
+      }
+    } else {
+      out.push_back({pre + "mlp.fc1.weight", "vision.block.mlp.gate"});
+      out.push_back({pre + "mlp.fc2.weight", "vision.block.mlp.down"});
+      out.push_back({pre + "mlp.fc3.weight", "vision.block.mlp.up"});
+    }
   }
   if (v.post_norm) {
     out.push_back({p + "post_trunk_norm.weight", "vision.post_trunk_norm"});
   }
-  out.push_back({p + "adapter.ln_q.weight", "vision.adapter.ln_q"});
-  out.push_back({p + "adapter.ln_q.bias", "vision.adapter.ln_q"});
-  out.push_back({p + "adapter.mlp.0.weight", "vision.adapter.mlp.0"});
-  out.push_back({p + "adapter.mlp.0.bias", "vision.adapter.mlp.0"});
-  out.push_back({p + "adapter.mlp.2.weight", "vision.adapter.mlp.2"});
-  out.push_back({p + "adapter.mlp.2.bias", "vision.adapter.mlp.2"});
+  // THE TWO ADAPTERS HAVE DIFFERENT STATE DICTS, and claiming the wrong one
+  // refuses the load by name rather than reading a differently-shaped weight.
+  // `PatchMergerAdapter` is `ln_q` + `mlp.0` + `mlp.2` (vision.py:481-486);
+  // `PixelShuffleAdapter` is `proj.0` + `proj.1` + `proj.3` (vision.py:432-437).
+  if (v.adapter_type == "pixel_shuffle_mlp") {
+    out.push_back({p + "adapter.proj.0.weight", "vision.adapter.proj.0"});
+    out.push_back({p + "adapter.proj.0.bias", "vision.adapter.proj.0"});
+    out.push_back({p + "adapter.proj.1.weight", "vision.adapter.proj.1"});
+    out.push_back({p + "adapter.proj.1.bias", "vision.adapter.proj.1"});
+    out.push_back({p + "adapter.proj.3.weight", "vision.adapter.proj.3"});
+    out.push_back({p + "adapter.proj.3.bias", "vision.adapter.proj.3"});
+  } else {
+    out.push_back({p + "adapter.ln_q.weight", "vision.adapter.ln_q"});
+    out.push_back({p + "adapter.ln_q.bias", "vision.adapter.ln_q"});
+    out.push_back({p + "adapter.mlp.0.weight", "vision.adapter.mlp.0"});
+    out.push_back({p + "adapter.mlp.0.bias", "vision.adapter.mlp.0"});
+    out.push_back({p + "adapter.mlp.2.weight", "vision.adapter.mlp.2"});
+    out.push_back({p + "adapter.mlp.2.bias", "vision.adapter.mlp.2"});
+  }
   return out;
 }
 
@@ -413,13 +501,8 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
   w.patch_norm = LoadBf16Direct(get, p + "patch_embed.norm.weight");
   RequireVisionShape(w.patch_norm, p + "patch_embed.norm.weight", {E});
 
+  const int64_t Im = v.moe_intermediate_size;
   for (int64_t b = 0; b < v.num_hidden_layers; ++b) {
-    VT_CHECK(!v.is_moe_block(b),
-             "dots3-note vision tower: block " + std::to_string(b) +
-                 " is a pyramid MoE block and W6a does not load it. "
-                 "MaterializeDots3NoteVision was reached with a config "
-                 "Dots3NoteVisionRefusal should have refused; that is a caller "
-                 "defect, not a checkpoint one.");
     const std::string pre = p + "blocks." + std::to_string(b) + ".";
     Dots3NoteVisionBlockWeights bw;
     bw.norm_1 = LoadBf16Direct(get, pre + "norm_1.weight");
@@ -430,19 +513,54 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
     RequireVisionShape(bw.qkv, pre + "attn.qkv.weight", {3 * E, E});
     bw.proj = LoadBf16Direct(get, pre + "attn.proj.weight");
     RequireVisionShape(bw.proj, pre + "attn.proj.weight", {E, E});
-    bw.q_norm = LoadBf16Direct(get, pre + "attn.q_norm.weight");
-    RequireVisionShape(bw.q_norm, pre + "attn.q_norm.weight", {D});
-    bw.k_norm = LoadBf16Direct(get, pre + "attn.k_norm.weight");
-    RequireVisionShape(bw.k_norm, pre + "attn.k_norm.weight", {D});
-    // fc1 = the SwiGLU gate, fc3 = the up projection
-    // (`fc2(F.silu(fc1(x)) * fc3(x))`, vision.py:132-133). The merge is what
-    // routes this pair through `layers::MlpGateUpMethodBase` instead of a
-    // hand-written parallel path.
-    bw.gate_up = LoadMergedBf16RawNK(
-        get, {pre + "mlp.fc1.weight", pre + "mlp.fc3.weight"});
-    RequireVisionShape(bw.gate_up, pre + "mlp.{fc1,fc3}.weight", {2 * I, E});
-    bw.down = LoadBf16Direct(get, pre + "mlp.fc2.weight");
-    RequireVisionShape(bw.down, pre + "mlp.fc2.weight", {E, I});
+    if (v.use_qk_norm) {
+      bw.q_norm = LoadBf16Direct(get, pre + "attn.q_norm.weight");
+      RequireVisionShape(bw.q_norm, pre + "attn.q_norm.weight", {D});
+      bw.k_norm = LoadBf16Direct(get, pre + "attn.k_norm.weight");
+      RequireVisionShape(bw.k_norm, pre + "attn.k_norm.weight", {D});
+    }
+    bw.is_moe = v.is_moe_block(b);
+    if (bw.is_moe) {
+      // ── `MoESwiGLUFFN.__init__` (vision.py:142-168 @ 9035151d6) ───────────
+      Dots3NoteVisionMoeWeights& m = bw.moe;
+      m.num_routed = v.pyramid_num_routed[static_cast<size_t>(b)];
+      m.top_k = v.routed_top_k(b);
+      m.gate_weight = LoadBf16Direct(get, pre + "mlp.gate_weight");
+      RequireVisionShape(m.gate_weight, pre + "mlp.gate_weight",
+                         {m.num_routed, E});
+      m.router_bias = LoadVisionF32Vector(get, pre + "mlp.router_bias");
+      RequireF32VisionShape(m.router_bias, pre + "mlp.router_bias",
+                            {m.num_routed});
+      m.expert_gate.reserve(static_cast<size_t>(m.num_routed));
+      m.expert_up.reserve(static_cast<size_t>(m.num_routed));
+      m.expert_down.reserve(static_cast<size_t>(m.num_routed));
+      for (int64_t e = 0; e < m.num_routed; ++e) {
+        const std::string ep = pre + "mlp.experts." + std::to_string(e) + ".";
+        // SPLIT, not merged: see `Dots3NoteVisionMoeWeights`'s own note. These
+        // three BORROW the mapping (`LoadBf16Direct` returns a borrow when the
+        // bytes are already laid out as asked), so a routed block costs no
+        // resident copy at all.
+        OwnedTensor g = LoadBf16Direct(get, ep + "fc1.weight");
+        RequireVisionShape(g, ep + "fc1.weight", {Im, E});
+        OwnedTensor u = LoadBf16Direct(get, ep + "fc3.weight");
+        RequireVisionShape(u, ep + "fc3.weight", {Im, E});
+        OwnedTensor dn = LoadBf16Direct(get, ep + "fc2.weight");
+        RequireVisionShape(dn, ep + "fc2.weight", {E, Im});
+        m.expert_gate.push_back(std::move(g));
+        m.expert_up.push_back(std::move(u));
+        m.expert_down.push_back(std::move(dn));
+      }
+    } else {
+      // fc1 = the SwiGLU gate, fc3 = the up projection
+      // (`fc2(F.silu(fc1(x)) * fc3(x))`, vision.py:132-133). The merge is what
+      // routes this pair through `layers::MlpGateUpMethodBase` instead of a
+      // hand-written parallel path.
+      bw.gate_up = LoadMergedBf16RawNK(
+          get, {pre + "mlp.fc1.weight", pre + "mlp.fc3.weight"});
+      RequireVisionShape(bw.gate_up, pre + "mlp.{fc1,fc3}.weight", {2 * I, E});
+      bw.down = LoadBf16Direct(get, pre + "mlp.fc2.weight");
+      RequireVisionShape(bw.down, pre + "mlp.fc2.weight", {E, I});
+    }
     w.blocks.push_back(std::move(bw));
   }
 
@@ -451,20 +569,50 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
     RequireVisionShape(w.post_trunk_norm, p + "post_trunk_norm.weight", {E});
   }
   const int64_t M = v.merged_dim(), O = v.adapter_out_dim;
-  w.adapter_ln_w = LoadBf16Direct(get, p + "adapter.ln_q.weight");
-  RequireVisionShape(w.adapter_ln_w, p + "adapter.ln_q.weight",
-                     {v.adapter_in_dim});
-  w.adapter_ln_b = LoadBf16Direct(get, p + "adapter.ln_q.bias");
-  RequireVisionShape(w.adapter_ln_b, p + "adapter.ln_q.bias",
-                     {v.adapter_in_dim});
-  w.adapter_mlp0_w = LoadBf16Direct(get, p + "adapter.mlp.0.weight");
-  RequireVisionShape(w.adapter_mlp0_w, p + "adapter.mlp.0.weight", {M, M});
-  w.adapter_mlp0_b = LoadBf16Direct(get, p + "adapter.mlp.0.bias");
-  RequireVisionShape(w.adapter_mlp0_b, p + "adapter.mlp.0.bias", {M});
-  w.adapter_mlp2_w = LoadBf16Direct(get, p + "adapter.mlp.2.weight");
-  RequireVisionShape(w.adapter_mlp2_w, p + "adapter.mlp.2.weight", {O, M});
-  w.adapter_mlp2_b = LoadBf16Direct(get, p + "adapter.mlp.2.bias");
-  RequireVisionShape(w.adapter_mlp2_b, p + "adapter.mlp.2.bias", {O});
+  // THE TWO ADAPTERS ARE DIFFERENT MODULES, not one module under two names.
+  //
+  //                    | `patch_merger` (:464-496)   | `pixel_shuffle_mlp` (:419-461)
+  //   normalization    | ln_q  LayerNorm(in_dim,     | proj.0 LayerNorm(merged_dim,
+  //                    |       eps=1e-6) PER TOKEN,  |        eps=1e-5 torch default)
+  //                    |       BEFORE the merge      |        AFTER the shuffle
+  //   first Linear     | mlp.0 [M, M]                | proj.1 [out_dim, M]
+  //   second Linear    | mlp.2 [out_dim, M]          | proj.3 [out_dim, out_dim]
+  //   token order      | 4 CONSECUTIVE tokens (the   | a 2x2 NHWC pixel-shuffle of a
+  //                    | preprocessor grouped them)  | row-major grid
+  //
+  // So a checkpoint's `adapter_type` selects the shapes as well as the names,
+  // and reading one state dict into the other's slots would refuse on shape —
+  // which is what makes claiming the wrong family a load error rather than a
+  // silently different answer.
+  if (v.adapter_type == "pixel_shuffle_mlp") {
+    w.adapter_ln_w = LoadBf16Direct(get, p + "adapter.proj.0.weight");
+    RequireVisionShape(w.adapter_ln_w, p + "adapter.proj.0.weight", {M});
+    w.adapter_ln_b = LoadBf16Direct(get, p + "adapter.proj.0.bias");
+    RequireVisionShape(w.adapter_ln_b, p + "adapter.proj.0.bias", {M});
+    w.adapter_mlp0_w = LoadBf16Direct(get, p + "adapter.proj.1.weight");
+    RequireVisionShape(w.adapter_mlp0_w, p + "adapter.proj.1.weight", {O, M});
+    w.adapter_mlp0_b = LoadBf16Direct(get, p + "adapter.proj.1.bias");
+    RequireVisionShape(w.adapter_mlp0_b, p + "adapter.proj.1.bias", {O});
+    w.adapter_mlp2_w = LoadBf16Direct(get, p + "adapter.proj.3.weight");
+    RequireVisionShape(w.adapter_mlp2_w, p + "adapter.proj.3.weight", {O, O});
+    w.adapter_mlp2_b = LoadBf16Direct(get, p + "adapter.proj.3.bias");
+    RequireVisionShape(w.adapter_mlp2_b, p + "adapter.proj.3.bias", {O});
+  } else {
+    w.adapter_ln_w = LoadBf16Direct(get, p + "adapter.ln_q.weight");
+    RequireVisionShape(w.adapter_ln_w, p + "adapter.ln_q.weight",
+                       {v.adapter_in_dim});
+    w.adapter_ln_b = LoadBf16Direct(get, p + "adapter.ln_q.bias");
+    RequireVisionShape(w.adapter_ln_b, p + "adapter.ln_q.bias",
+                       {v.adapter_in_dim});
+    w.adapter_mlp0_w = LoadBf16Direct(get, p + "adapter.mlp.0.weight");
+    RequireVisionShape(w.adapter_mlp0_w, p + "adapter.mlp.0.weight", {M, M});
+    w.adapter_mlp0_b = LoadBf16Direct(get, p + "adapter.mlp.0.bias");
+    RequireVisionShape(w.adapter_mlp0_b, p + "adapter.mlp.0.bias", {M});
+    w.adapter_mlp2_w = LoadBf16Direct(get, p + "adapter.mlp.2.weight");
+    RequireVisionShape(w.adapter_mlp2_w, p + "adapter.mlp.2.weight", {O, M});
+    w.adapter_mlp2_b = LoadBf16Direct(get, p + "adapter.mlp.2.bias");
+    RequireVisionShape(w.adapter_mlp2_b, p + "adapter.mlp.2.bias", {O});
+  }
   w.present = true;
   return w;
 }
@@ -569,6 +717,165 @@ std::vector<float> DownloadF32(Dev d, DBuf& buf, int64_t n) {
   return out;
 }
 
+// ── the PYRAMID MoE FFN (W6b) ───────────────────────────────────────────────
+//
+// `MoESwiGLUFFN.forward` (vision.py:170-219 @ 9035151d6), one routed block.
+//
+// WHY THE SHARED ROUTER OP IS THE WHOLE ROUTER, and not a starting point.
+// Upstream's five router steps are, line by line:
+//
+//   :181  gate_logits  = F.linear(x.float(), gate_weight.float())
+//   :183  gating_prob  = sigmoid(gate_logits)                    [ELEMENTWISE]
+//   :193  biased       = gating_prob + router_bias.float()
+//   :194  topk over `biased`, `sorted=False`
+//   :196  routed_w     = gating_prob.gather(topk_indices)        [UNBIASED]
+//   :197-:200 sigmoid and topk>1  ->  routed_w /= (sum + 1e-9)
+//   :201  routed_w    *= router_scale
+//
+// `vt::MoeRouterTopK` with `num_expert_group == 1` IS that function: the group
+// stage is definitionally inert at one group (the mask is all-ones), the
+// scoring func is sigmoid, the bias shifts the SELECTION score only and the
+// weight is read from the UNBIASED score (`cpu_ops.cpp:2856-2930`, ported from
+// `grouped_topk_router.py:110-160`), the renormalize divides by the selected
+// sum, and `routed_scaling_factor` multiplies afterwards. The two differ ONLY
+// in the `1e-9` upstream adds to the renormalize denominator, which is 1e-9
+// RELATIVE against a bf16 store of 3.9e-3 — and the in-test reference spells
+// upstream's version, so the difference is MEASURED rather than defined away.
+//
+// A NOTE ON `num_expert_group`, because 0 is not the same kind of wrong. Passing
+// 0 selects the op's ungrouped path, which is SOFTMAX and ignores the bias
+// entirely; the wrapper refuses a bias there for exactly that reason. 1 is the
+// value that makes the grouped path inert, which is the same reasoning
+// `dots3_note_device.cpp`'s language MoE records for `n_group == 1`.
+//
+// AND WHY `routed_scale` CARRIES THE COMBINE'S DIVISION. Upstream's combine is
+// self-normalizing (:207-:218): it accumulates `aggregated_gate[t]` = the sum of
+// that token's routed weights and divides the routed sum by
+// `aggregated_gate + 1e-9`. After the renormalize at :197-:201 that sum is
+// `router_scale` for EVERY token, so the denominator is a per-tower CONSTANT and
+// `vt::MoeCombine`'s single `routed_scale` expresses it exactly. That identity
+// is why `Dots3NoteVisionRefusal` turns away the two arms where upstream does
+// NOT renormalize (issue #2615): there the denominator is genuinely per-token.
+DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
+                  const Dots3NoteVisionParams& v, const Tensor& x, int64_t L,
+                  int64_t E, int64_t block, Dots3NoteVisionCapture* cap) {
+  const int64_t ne = m.num_routed, k = m.top_k, Im = v.moe_intermediate_size;
+  const int64_t P = L * k;
+  VT_CHECK(k >= 2 && k <= ne,
+           "dots3-note vision tower: block " + std::to_string(block) +
+               " routes to top-" + std::to_string(k) + " of " +
+               std::to_string(ne) +
+               " experts. Dots3NoteVisionRefusal should have refused this "
+               "config; reaching here is a caller defect.");
+
+  // --- the router -----------------------------------------------------------
+  // THE F32 IS THE OUTPUT, NOT THE OPERANDS. Upstream writes `.float()` on both
+  // sides (:181), but both sides are bf16-VALUED — `x` is the bf16 `norm_2`
+  // output and `gate_weight` is bf16 on disk — and a bf16 x bf16 product is
+  // exact in f32. A bf16-operand GEMM with an f32 accumulator is therefore
+  // bit-for-bit `F.linear(x.float(), w.float())`, while widening the stored
+  // operand would double the resident bytes for no information at all. That is
+  // `porting.md`'s memory-format rule applied in the direction it is usually
+  // not: the annotation is here because the f32 IS deliberate, and it is
+  // deliberate on the LOGITS.
+  Tensor gw = ResidentWeight(d, m.gate_weight, {ne, E});
+  DBuf logits(d, DType::kF32, {L, ne});
+  vt::MatmulBT(d.q, logits.t(), x, gw);
+
+  vt::MoeRouterTopKArgs args{};
+  args.top_k = static_cast<int>(k);
+  // `sigmoid and topk > 1` (:197). Both halves are guaranteed by the refusal,
+  // and the expression is written out rather than hard-coded `true` so the
+  // predicate here and the predicate in the refusal are the same sentence.
+  args.renormalize = v.router_scoring_func == "sigmoid" && k > 1;
+  args.scoring_func = vt::MoeScoringFunc::kSigmoid;
+  args.num_expert_group = 1;
+  args.topk_group = 1;
+  args.routed_scaling_factor = static_cast<float>(v.router_scale);
+  DBuf tw(d, DType::kF32, {L, k});
+  DBuf tid(d, DType::kI32, {L, k});
+  Tensor rbias = ResidentWeight(d, m.router_bias, {ne});
+  vt::MoeRouterTopK(d.q, tw.t(), tid.t(), logits.t(), args, &rbias);
+
+  // --- the routed experts ---------------------------------------------------
+  // Gather the rows one expert selected, run its SwiGLU through the SHARED
+  // `layers::MlpGateUpMethodBase` seam, scatter the result back into the
+  // per-slot buffer `vt::MoeCombine` reduces. The gather/scatter shape mirrors
+  // `dots3_note_device.cpp`'s reference MoE arm, which is the arm the CPU queue
+  // takes there too; what is NOT copied from it is the merged-operand method,
+  // because these experts ship as two tensors and merging them would cost 7.9
+  // GiB on the released checkpoint (`Dots3NoteVisionMoeWeights`'s own note).
+  std::vector<int32_t> ids(static_cast<size_t>(P));
+  tid.Download(d, ids.data());
+  std::vector<std::vector<std::pair<int64_t, int64_t>>> lists(
+      static_cast<size_t>(ne));
+  for (int64_t t = 0; t < L; ++t) {
+    for (int64_t j = 0; j < k; ++j) {
+      const int32_t e = ids[static_cast<size_t>(t * k + j)];
+      VT_CHECK(e >= 0 && e < ne,
+               "dots3-note vision tower: the router selected expert " +
+                   std::to_string(e) + " of " + std::to_string(ne));
+      lists[static_cast<size_t>(e)].push_back({t, j});
+    }
+  }
+  DBuf expert_out(d, DType::kBF16, {L, k, E});
+  expert_out.Zero(d);
+  const size_t row_bytes = static_cast<size_t>(E) * vt::SizeOf(DType::kBF16);
+  for (int64_t e = 0; e < ne; ++e) {
+    const auto& list = lists[static_cast<size_t>(e)];
+    // `if selected_mask.sum() == 0: continue` (:191-192). An expert no token
+    // chose contributes nothing and is not run.
+    if (list.empty()) continue;
+    const int64_t n = static_cast<int64_t>(list.size());
+    DBuf xg(d, DType::kBF16, {n, E});
+    for (int64_t r = 0; r < n; ++r) {
+      d.b.Copy(d.q,
+               static_cast<char*>(xg.ptr()) + static_cast<size_t>(r) * row_bytes,
+               static_cast<const char*>(x.data) +
+                   static_cast<size_t>(list[static_cast<size_t>(r)].first) *
+                       row_bytes,
+               row_bytes);
+    }
+    DBuf act = layers::UnquantizedMlpGateUpSplitMethod(
+                   &m.expert_gate[static_cast<size_t>(e)],
+                   &m.expert_up[static_cast<size_t>(e)], Im)
+                   .Apply(d, xg.t());
+    DBuf o(d, DType::kBF16, {n, E});
+    vt::MatmulBT(d.q, o.t(), act.t(),
+                 ResidentWeight(d, m.expert_down[static_cast<size_t>(e)],
+                                {E, Im}));
+    for (int64_t r = 0; r < n; ++r) {
+      const auto& tj = list[static_cast<size_t>(r)];
+      d.b.Copy(d.q,
+               static_cast<char*>(expert_out.ptr()) +
+                   static_cast<size_t>(tj.first * k + tj.second) * row_bytes,
+               static_cast<const char*>(o.ptr()) +
+                   static_cast<size_t>(r) * row_bytes,
+               row_bytes);
+    }
+  }
+
+  // --- the self-normalizing combine (:207-:218) -----------------------------
+  const float eps = 1e-9f;
+  DBuf out(d, DType::kBF16, {L, E});
+  vt::MoeCombine(d.q, out.t(), expert_out.t(), tw.t(), /*shared=*/nullptr,
+                 1.0f / (static_cast<float>(v.router_scale) + eps));
+
+  if (cap != nullptr) {
+    Dots3NoteVisionMoeRoute route;
+    route.block = block;
+    route.num_routed = ne;
+    route.top_k = k;
+    route.logits.resize(static_cast<size_t>(L * ne));
+    logits.Download(d, route.logits.data());
+    route.weights.resize(static_cast<size_t>(P));
+    tw.Download(d, route.weights.data());
+    route.ids = ids;
+    cap->moe_routes.push_back(std::move(route));
+  }
+  return out;
+}
+
 }  // namespace
 
 std::vector<float> Dots3NoteVisionForward(
@@ -630,7 +937,22 @@ std::vector<float> Dots3NoteVisionForward(
   // Softmax scale: `1 / sqrt(head_dim)` (vision_attention.py:199, :233).
   const float scale =
       1.0f / std::sqrt(static_cast<float>(hd));
-  const vt::AttentionArgs aargs{scale, /*causal=*/false};
+  // `causal=self.is_causal` (vision_attention.py:265, :291, :302 @ 9035151d6),
+  // which is the FLASH family's forward — and `attn_implementation` is
+  // `flash_attention_3` on the released `vision_config`, so that is the arm the
+  // checkpoint selects.
+  //
+  // UPSTREAM IS INCONSISTENT HERE AND THE RECORD HAS TO SAY SO. The two EAGER
+  // classes store `self.is_causal` and never read it: `VisionAttention.forward`
+  // (:172-204) builds its mask from `cu_seqlens` alone and
+  // `VisionAttentionV2.forward` (:210-239) takes a plain full softmax per
+  // segment. So on an eager `attn_implementation` a true `is_causal` is
+  // silently ignored upstream, and on a flash one it masks. This port follows
+  // the FLASH arm because that is what the released config asks for; on the
+  // released config the flag is false and the two arms coincide, so the choice
+  // only becomes visible on a checkpoint that sets it. Recorded in
+  // `.agents/specs/dots3-note.md` §4.12 rather than left for the next reader.
+  const vt::AttentionArgs aargs{scale, /*causal=*/v.is_causal};
 
   DBuf n1(d, DType::kBF16, {L, E});
   DBuf qkv(d, DType::kBF16, {L, 3 * E});
@@ -657,7 +979,12 @@ std::vector<float> Dots3NoteVisionForward(
     // runs BEFORE the rope. Swapping the two is silent — same shapes, same
     // magnitudes, different numbers — and this row has no oracle downstream to
     // catch it, which is why the order has its own gate case.
-    {
+    //
+    // `if self.use_qk_norm:` (vision_attention.py:161-163). When it is off
+    // upstream builds no `q_norm`/`k_norm` module at all (:145-147), the
+    // checkpoint ships neither tensor, and the loader left both empty — so this
+    // is not "skip a multiply", it is the same branch upstream takes.
+    if (v.use_qk_norm) {
       Tensor qn = qb.t();
       qn.rank = 2; qn.shape[0] = L * nh; qn.shape[1] = hd;
       qn.stride[0] = hd; qn.stride[1] = 1;
@@ -692,15 +1019,22 @@ std::vector<float> Dots3NoteVisionForward(
 
     // `hidden + mlp(norm_2(hidden))` (vision.py:369).
     vt::RmsNorm(d.q, n2.t(), hidden.t(), ResidentWeight(d, bw.norm_2, {E}), rms);
-    {
+    if (bw.is_moe) {
+      // `MoEVisionBlock.__init__` picks the routed mlp on
+      // `pyramid_num_routed[layer] > 0` (vision.py:363-374 @ 9035151d6), and
+      // the residual around it is the same one the dense arm uses (:394).
+      DBuf routed = VisionMoeFfn(d, bw.moe, v, n2.t(), L, E,
+                                 static_cast<int64_t>(b), cap);
+      vt::Add(d.q, hidden.t(), hidden.t(), routed.t());
+    } else {
       // THE SHARED SEAM. `fc2(silu(fc1(x)) * fc3(x))` is a mergeable gate/up
       // pair, so it rides `layers::MlpGateUpMethodBase` rather than two
       // hand-written GEMMs (AGENTS.md, "Shared seams").
       DBuf act = layers::UnquantizedMlpGateUpMethod(&bw.gate_up, I).Apply(d, n2.t());
       Tensor wd = ResidentWeight(d, bw.down, {E, I});
       LinearBias(d, mlp_out, act.t(), wd, nullptr);
+      vt::Add(d.q, hidden.t(), hidden.t(), mlp_out.t());
     }
-    vt::Add(d.q, hidden.t(), hidden.t(), mlp_out.t());
     if (cap != nullptr && b == 0) cap->block0_out = DownloadF32(d, hidden, L * E);
   }
 
@@ -714,13 +1048,7 @@ std::vector<float> Dots3NoteVisionForward(
   }
   if (cap != nullptr) cap->trunk_out = DownloadF32(d, trunk, L * E);
 
-  // ── the patch_merger adapter (vision.py:441-490) ───────────────────────────
-  //
-  // `ln_q` normalizes over the PER-TOKEN dim with a HARD-CODED eps of 1e-6
-  // (vision.py:466) — NOT `rms_norm_eps`, and it is a LayerNorm with a bias,
-  // not an RMSNorm. Then `reshape(-1, merged_dim)` views every 4 consecutive
-  // 2x2-grouped tokens as one row: no permutation, because `pre_pixel_shuffle`
-  // put the tokens in that order already.
+  // ── the adapter (vision.py:398-496 @ 9035151d6) ────────────────────────────
   const int64_t merge_unit = v.adapter_merge_size * v.adapter_merge_size;
   VT_CHECK(L % merge_unit == 0,
            "dots3-note vision tower: " + std::to_string(L) +
@@ -730,7 +1058,90 @@ std::vector<float> Dots3NoteVisionForward(
                "merge size disagree.");
   const int64_t Nm = L / merge_unit;
   const int64_t M = v.merged_dim(), O = v.adapter_out_dim;
+  DBuf out(d, DType::kBF16, {Nm, O});
 
+  if (v.adapter_type == "pixel_shuffle_mlp") {
+    // `PixelShuffleAdapter.forward` (vision.py:439-461). The trunk rows are a
+    // ROW-MAJOR [gh, gw, E] grid; `_pixel_shuffle(scale_factor=0.5)`
+    // (vision.py:401-416) is
+    //   reshape(n, h, w/2, 2c) -> permute(0,2,1,3)
+    //   -> reshape(n, w/2, h/2, 4c) -> permute(0,2,1,3)
+    // which lands, for output row (i, j) over (gh/2, gw/2) row-major, the four
+    // trunk tokens (2i+a, 2j+b) concatenated in (a, b) row-major order. Then a
+    // LayerNorm over the MERGED width — not the per-token one `patch_merger`
+    // applies before its merge — and `Linear/GELU/Linear`.
+    const int64_t gh = grid_thw[1], gw = grid_thw[2];
+    // `_pixel_shuffle` PADS an odd side by duplicating its first row or column
+    // (vision.py:402-405). That changes the emitted row count from
+    // `gh*gw/4` to `ceil(gh/2)*ceil(gw/2)`, while the PROMPT side still expands
+    // `prod(grid) // spatial_merge_size**2` placeholders
+    // (multimodal.py:151-155) — so upstream's own two halves disagree on an odd
+    // grid and no such request can be served by either. Refusing here says so
+    // where the numbers are in hand, rather than letting the encoder's
+    // `rows == item.length` assert fire with nothing to say.
+    VT_CHECK(gh % 2 == 0 && gw % 2 == 0,
+             "dots3-note vision tower: the `pixel_shuffle_mlp` adapter was "
+             "given a " + std::to_string(gh) + "x" + std::to_string(gw) +
+                 " grid. `_pixel_shuffle` duplicates the first row or column of "
+                 "an ODD side (vision.py:402-405 @ 9035151d6), which makes it "
+                 "emit ceil(h/2)*ceil(w/2) rows while the prompt expands "
+                 "prod(grid)//merge**2 placeholders (multimodal.py:151-155). "
+                 "Upstream's two halves disagree there, so no odd grid is "
+                 "servable under this adapter.");
+    // The shuffle is a pure row PERMUTATION of the trunk once the four
+    // contributing tokens are written side by side, so it is done as a gather
+    // of whole rows on the device rather than as a new kernel.
+    DBuf shuffled(d, DType::kBF16, {Nm, M});
+    const size_t erow = static_cast<size_t>(E) * vt::SizeOf(DType::kBF16);
+    for (int64_t i = 0; i < gh / 2; ++i) {
+      for (int64_t j = 0; j < gw / 2; ++j) {
+        const int64_t dst_row = i * (gw / 2) + j;
+        for (int64_t a = 0; a < 2; ++a) {
+          for (int64_t b2 = 0; b2 < 2; ++b2) {
+            const int64_t src_row = (2 * i + a) * gw + (2 * j + b2);
+            const int64_t slot = a * 2 + b2;
+            d.b.Copy(d.q,
+                     static_cast<char*>(shuffled.ptr()) +
+                         static_cast<size_t>(dst_row) *
+                             static_cast<size_t>(M) *
+                             vt::SizeOf(DType::kBF16) +
+                         static_cast<size_t>(slot) * erow,
+                     static_cast<const char*>(trunk.ptr()) +
+                         static_cast<size_t>(src_row) * erow,
+                     erow);
+          }
+        }
+      }
+    }
+    // `nn.LayerNorm(merged_dim)` — torch's DEFAULT eps of 1e-5, not the 1e-6
+    // `PatchMergerAdapter` spells for `ln_q` (vision.py:433 against :481).
+    DBuf ln(d, DType::kBF16, {Nm, M});
+    {
+      Tensor lw = ResidentWeight(d, w.adapter_ln_w, {M});
+      Tensor lb = ResidentWeight(d, w.adapter_ln_b, {M});
+      vt::LayerNorm(d.q, ln.t(), shuffled.t(), &lw, &lb,
+                    vt::LayerNormArgs{1e-5f});
+    }
+    DBuf proj1(d, DType::kBF16, {Nm, O});
+    {
+      Tensor w1 = ResidentWeight(d, w.adapter_mlp0_w, {O, M});
+      Tensor b1 = ResidentWeight(d, w.adapter_mlp0_b, {O});
+      LinearBias(d, proj1, ln.t(), w1, &b1);
+    }
+    vt::GeluErf(d.q, proj1.t(), proj1.t());
+    Tensor w3 = ResidentWeight(d, w.adapter_mlp2_w, {O, O});
+    Tensor b3 = ResidentWeight(d, w.adapter_mlp2_b, {O});
+    LinearBias(d, out, proj1.t(), w3, &b3);
+    return DownloadF32(d, out, Nm * O);
+  }
+
+  // ── the patch_merger adapter (vision.py:464-496) ───────────────────────────
+  //
+  // `ln_q` normalizes over the PER-TOKEN dim with a HARD-CODED eps of 1e-6
+  // (vision.py:481) — NOT `rms_norm_eps`, and it is a LayerNorm with a bias,
+  // not an RMSNorm. Then `reshape(-1, merged_dim)` views every 4 consecutive
+  // 2x2-grouped tokens as one row: no permutation, because `pre_pixel_shuffle`
+  // put the tokens in that order already.
   DBuf lnq(d, DType::kBF16, {L, E});
   {
     Tensor lw = ResidentWeight(d, w.adapter_ln_w, {v.adapter_in_dim});
@@ -747,10 +1158,9 @@ std::vector<float> Dots3NoteVisionForward(
     LinearBias(d, fc1, xv, w0, &b0);
   }
   // `nn.GELU()` with no `approximate` argument is the EXACT erf gelu
-  // (vision.py:469). The tanh approximation is a different function and a
+  // (vision.py:484). The tanh approximation is a different function and a
   // silent one at this magnitude.
   vt::GeluErf(d.q, fc1.t(), fc1.t());
-  DBuf out(d, DType::kBF16, {Nm, O});
   {
     Tensor w2 = ResidentWeight(d, w.adapter_mlp2_w, {O, M});
     Tensor b2 = ResidentWeight(d, w.adapter_mlp2_b, {O});

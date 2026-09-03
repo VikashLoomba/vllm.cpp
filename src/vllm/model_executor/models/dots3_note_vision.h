@@ -1,4 +1,5 @@
-// dots3-note VISION tower — the DENSE arm (W6a, #2512).
+// dots3-note VISION tower — the DENSE arm (W6a, #2512) and the PYRAMID MoE arm
+// (W6b, #2613).
 //
 // Ported from vLLM read in the local clone `~/_git/vllm` at
 // **`9035151d6`**, the merge of vllm#51255 that added the architecture. That
@@ -32,13 +33,24 @@
 //     VisionAttentionV2           :207   -> vt::AttentionDenseFlash, causal=false
 //     apply_vision_attention_residual :436
 //
-// WHAT THIS FILE IS NOT. `nvidia/vision_moe.py` @ `9035151d6` (149 lines) and
-// `MoESwiGLUFFN` / `MoESwiGLUFFNFP8` (`vision.py:139`, `:222`) are the PYRAMID
-// arm. Nothing here reads them, and `Dots3NoteVisionRefusal` names W6b for any
-// block the config marks routed. The RELEASED `dots-studio/dots3-note-prev` has
-// 17 such blocks out of 42, so its vision tower still refuses BY NAME — which
-// is exactly what W3 did to the language tower for four bricks before W5 lifted
-// it, not a new exception. See `.agents/specs/dots3-note.md` §4.11.
+// THE PYRAMID ARM, ADDED BY W6b (#2613).
+//   vllm/models/dots3_note/nvidia/vision.py @ 9035151d6
+//     MoESwiGLUFFN               :139  -> Dots3NoteVisionMoeWeights + the MoE
+//                                         branch of Dots3NoteVisionForward
+//       __init__                 :142
+//       router_bias  (F32)       :152-155
+//       the expert list          :156-164
+//       gate_weight  (F32 init)  :165-168
+//       forward                  :170-219
+//       the sigmoid branch       :182-183
+//     PixelShuffleAdapter        :419  -> the `pixel_shuffle_mlp` adapter arm
+//       _pixel_shuffle           :401
+//
+// WHAT THIS FILE IS STILL NOT. `nvidia/vision_moe.py` @ `9035151d6` (149 lines)
+// and `MoESwiGLUFFNFP8` (`vision.py:222`) are the FP32-scale blockwise-FP8 arm
+// and are W9's, not W6b's; `Dots3NoteVisionRefusal` names W9 for a blockwise
+// checkpoint before it looks at anything else. See
+// `.agents/specs/dots3-note.md` §4.11 and §4.12.
 //
 // WHY IT SHARES NO CODE WITH `qwen3_vl_vision`. The two towers agree on the
 // block OUTLINE and on almost nothing below it: RMSNorm vs LayerNorm, no bias
@@ -96,7 +108,7 @@ struct Dots3NoteVisionParams {
   // `Dots3NoteVisionRefusal` to answer the same question the route asks.
   int64_t text_hidden_size = 0;
   int64_t intermediate_size = 4224;  // the DENSE SwiGLU width
-  int64_t moe_intermediate_size = 2112;  // W6b's; read only to report it
+  int64_t moe_intermediate_size = 2112;  // the PYRAMID expert width (W6b); read only to report it
   int64_t num_hidden_layers = 42;
   int64_t num_attention_heads = 24;
   int64_t num_channels = 3;
@@ -124,15 +136,15 @@ struct Dots3NoteVisionParams {
   // The per-block routed-expert counts (`vision.py:90`). `is_moe` is
   // `pyramid_num_routed[i] > 0` (`vision.py:346-350`), so the released
   // checkpoint's leading 25 entries of `-1` are DENSE and the trailing 17
-  // (4, 8, ... 60, 64, 64) are W6b's.
+  // (4, 8, ... 60, 64, 64) are the pyramid W6b computes.
   std::vector<int64_t> pyramid_num_routed;
-  double capacity_factor = 2.0;         // W6b's top-k; read only to report it
+  double capacity_factor = 2.0;
   std::string router_scoring_func = "sigmoid";
   double router_scale = 1.0;
 
-  // The adapter (`vision.py:441-472`). `patch_merger` is the arm the released
+  // The adapter (`vision.py:419-496`). `patch_merger` is the arm the released
   // checkpoint selects; `pixel_shuffle_mlp` is a DIFFERENT token order from the
-  // same pixels and is refused by name.
+  // same pixels AND a different state dict, and W6b implements it too.
   std::string adapter_type = "pixel_shuffle_mlp";
   int64_t adapter_in_dim = 1536;
   int64_t adapter_out_dim = 2048;
@@ -148,6 +160,16 @@ struct Dots3NoteVisionParams {
   // (`common/processor.py:216-218` @ `9035151d6`).
   int64_t patch_row() const {
     return num_channels * temporal_patch_size * patch_size * patch_size;
+  }
+  // `topk = min(int(self.capacity_factor), self.num_routed)`
+  // (`vision.py:180` @ `9035151d6`). The truncation to `int` is upstream's own,
+  // and it is why `capacity_factor` 2.0 selects TWO experts rather than a
+  // fraction of a capacity. Returns 0 for a dense block, which has no router.
+  int64_t routed_top_k(int64_t layer) const {
+    if (!is_moe_block(layer)) return 0;
+    const int64_t ne = pyramid_num_routed[static_cast<size_t>(layer)];
+    const int64_t cf = static_cast<int64_t>(capacity_factor);  // int(), :180
+    return cf < ne ? cf : ne;
   }
   bool is_moe_block(int64_t layer) const {
     return layer >= 0 &&
@@ -204,20 +226,75 @@ std::string Dots3NoteVisionRefusalFor(const HfConfig& config);
 // `router_bias` or an `e_score_correction_bias`, neither of which this arm
 // reads. Widening any of these would be invisible to a token gate and is what
 // `porting.md`'s memory-format rule is about.
+// One PYRAMID block's `mlp` (`MoESwiGLUFFN`, `vision.py:139-219` @ `9035151d6`).
+//
+// THE SPELLING IS NOT THE LANGUAGE TOWER'S, and conflating the two is the
+// obvious way to get this brick wrong. The vision router is `mlp.gate_weight` +
+// `mlp.router_bias` (`vision.py:152-168`); `Dots3NoteMoeWeights` in
+// `dots3_note.h` reads `mlp.gate.weight` + `mlp.gate.e_score_correction_bias`
+// (`deepseek_v2.py:313-318`). The two are different tensors with different
+// ranks in the same checkpoint.
+struct Dots3NoteVisionMoeWeights {
+  int64_t num_routed = 0;  // `pyramid_num_routed[layer]` (`vision.py:148`)
+  int64_t top_k = 0;       // `min(int(capacity_factor), num_routed)` (`:180`)
+
+  // THE ROUTER. `gate_weight` is BF16 on disk — upstream registers the
+  // parameter f32 (`vision.py:165-168`) and the published bf16 checkpoint
+  // stores it bf16, then `forward` re-widens it with `.float()` (`:181`). The
+  // OPERANDS therefore stay bf16 here and only the GEMM's OUTPUT is f32: a
+  // bf16 x bf16 product is exact in f32, so a bf16-operand GEMM with an f32
+  // accumulator IS `F.linear(x.float(), w.float())`, and widening the stored
+  // operand would double the resident bytes for no information at all
+  // (porting.md's memory-format rule, pointed the other way).
+  OwnedTensor gate_weight;  // [num_routed, E] BF16
+
+  // ...and this one really is F32, which is UPSTREAM'S OWN CHOICE:
+  // `register_buffer("router_bias", torch.zeros(num_routed,
+  // dtype=torch.float32))` (`vision.py:152-155`). These 17 buffers are exactly
+  // the 17 F32 tensors the released vision tower carries against 2178 BF16
+  // ones, measured in the committed shard index. A token gate cannot see a
+  // dtype that is too WIDE, so the load asserts this one by name in both
+  // directions rather than accepting whatever the file holds.
+  OwnedTensor router_bias;  // [num_routed] F32
+
+  // THE EXPERTS, as TWO operands rather than one merged [2Im, E].
+  // `layers::UnquantizedMlpGateUpSplitMethod` is the `MlpGateUpMethodBase`
+  // member for exactly this case, and its own prose says why: merging costs a
+  // COPY out of the mmap, and on the released checkpoint that copy is 608
+  // experts x 2 x 2112 x 1536 x 2 B = **7.9 GiB** of resident bytes bought for
+  // one fewer kernel launch. The DENSE blocks keep W6a's merged operand, where
+  // the same copy is 649 MiB across 25 blocks and the merge is already paid.
+  std::vector<OwnedTensor> expert_gate;  // num_routed x fc1 [Im, E]
+  std::vector<OwnedTensor> expert_up;    // num_routed x fc3 [Im, E]
+  std::vector<OwnedTensor> expert_down;  // num_routed x fc2 [E, Im]
+};
+
 struct Dots3NoteVisionBlockWeights {
   OwnedTensor norm_1;   // [E]
   OwnedTensor norm_2;   // [E]
   OwnedTensor qkv;      // [3E, E]   (NO bias: use_bias == false)
   OwnedTensor proj;     // [E, E]
+  // Empty when `use_qk_norm` is false: upstream then builds no `q_norm`/`k_norm`
+  // at all (`vision_attention.py:145-147` @ `9035151d6`) and the checkpoint
+  // ships neither.
   OwnedTensor q_norm;   // [head_dim]
   OwnedTensor k_norm;   // [head_dim]
+  // ── the DENSE arm's mlp (`DotsSwiGLUFFN`, `vision.py:129-137`) ────────────
   // fc1 (the SwiGLU gate) and fc3 (the up projection) MERGED into one [2I, E]
   // raw-NK operand, so the pair rides `layers::MlpGateUpMethodBase` rather than
   // a hand-written parallel path (AGENTS.md, "Shared seams"). The order is
   // gate-then-up because `vt::SiluAndMul` reads `silu(x[:, :I]) * x[:, I:]` and
   // upstream is `fc2(F.silu(fc1(x)) * fc3(x))` (`vision.py:132-133`).
+  // EMPTY on a routed block, where `moe` carries the mlp instead.
   OwnedTensor gate_up;  // [2I, E] = concat(fc1, fc3)
   OwnedTensor down;     // fc2 [E, I]
+
+  // ── the PYRAMID arm's mlp, when `is_moe` ─────────────────────────────────
+  // `MoEVisionBlock.__init__` picks one or the other on
+  // `pyramid_num_routed[layer_number] > 0` (`vision.py:363-374`), which is the
+  // same predicate `Dots3NoteVisionParams::is_moe_block` spells.
+  bool is_moe = false;
+  Dots3NoteVisionMoeWeights moe;
 };
 
 struct Dots3NoteVisionWeights {
@@ -225,23 +302,35 @@ struct Dots3NoteVisionWeights {
   OwnedTensor patch_proj_w;  // [E, C*tp*p*p]  (on disk [E, C, p, p])
   OwnedTensor patch_proj_b;  // [E]
   OwnedTensor patch_norm;    // [E]
-  std::vector<Dots3NoteVisionBlockWeights> blocks;  // the DENSE blocks, in order
+  // ALL 42 blocks, in order, dense and routed alike. W6a held only the dense
+  // ones because it refused a routed tower; W6b computes both, so the index
+  // into this vector IS the layer number and no re-mapping stands between the
+  // config's `pyramid_num_routed[i]` and the weights it describes.
+  std::vector<Dots3NoteVisionBlockWeights> blocks;
+  // Empty when `post_norm` is false: upstream builds `nn.Identity()` there
+  // (`vision.py:513-514` @ `9035151d6`) and the checkpoint ships no tensor.
   OwnedTensor post_trunk_norm;  // [E]
-  OwnedTensor adapter_ln_w;     // [in_dim]
-  OwnedTensor adapter_ln_b;     // [in_dim]
-  OwnedTensor adapter_mlp0_w;   // [merged_dim, merged_dim]
-  OwnedTensor adapter_mlp0_b;   // [merged_dim]
-  OwnedTensor adapter_mlp2_w;   // [out_dim, merged_dim]
-  OwnedTensor adapter_mlp2_b;   // [out_dim]
+  // The adapter, under EITHER spelling. `patch_merger` fills `ln_q` + `mlp.0` +
+  // `mlp.2`; `pixel_shuffle_mlp` fills `proj.0` + `proj.1` + `proj.3` into the
+  // same four slots, and the two disagree on more than the names — see
+  // `MaterializeDots3NoteVision` for the shape table.
+  OwnedTensor adapter_ln_w;     // ln_q [in_dim]      | proj.0 [merged_dim]
+  OwnedTensor adapter_ln_b;     // ln_q [in_dim]      | proj.0 [merged_dim]
+  OwnedTensor adapter_mlp0_w;   // mlp.0 [M, M]       | proj.1 [out_dim, M]
+  OwnedTensor adapter_mlp0_b;   // mlp.0 [M]          | proj.1 [out_dim]
+  OwnedTensor adapter_mlp2_w;   // mlp.2 [out_dim, M] | proj.3 [out_dim, out_dim]
+  OwnedTensor adapter_mlp2_b;   // mlp.2 [out_dim]    | proj.3 [out_dim]
 };
 
-// Every `vision_encoder.*` name the DENSE arm claims, with its named consumer.
-// Over the released checkpoint this is exactly 235 of the 2195 vision tensors;
-// the other 1960 belong to W6b and stay deferred.
+// Every `vision_encoder.*` name the tower claims, with its named consumer.
+// Over the released checkpoint this is all 2195 vision tensors: W6a's 235 dense
+// ones plus the 1960 the pyramid adds (17 blocks x 8 block tensors + 608 routed
+// experts x 3).
 std::vector<Dots3NoteTensor> EnumerateDots3NoteVisionTensors(
     const Dots3NoteVisionParams& v);
 
-// Read the DENSE tower out of `shards`. REFUSES BY NAME on the first tensor
+// Read the tower out of `shards`, dense and routed blocks alike. REFUSES BY
+// NAME on the first tensor
 // whose shape disagrees with the config. Only called when
 // `Dots3NoteVisionRefusal` is empty.
 Dots3NoteVisionWeights MaterializeDots3NoteVision(
@@ -258,6 +347,26 @@ std::vector<std::array<int64_t, 2>> Dots3NoteVisionPosIds(
 std::vector<float> Dots3NoteVisionRopeCache(
     const std::array<int64_t, 3>& grid_thw, const Dots3NoteVisionParams& v);
 
+// One routed block's ROUTING DECISION, captured for the gate.
+//
+// WHY THE GATE NEEDS THIS AND A TOLERANCE DOES NOT SUFFICE. Top-k expert
+// selection is a DISCRETE choice: its error is bimodal, not continuous. A
+// selection either flips or it does not, and when it does not, no output
+// tolerance is measuring it at all. A relative bound on the tower's output
+// therefore cannot see a selection defect that happens not to have flipped on
+// the fixture, and cannot report how close it came to flipping. The gate
+// asserts SET equality against the reference's own selection and prints the
+// minimum decision MARGIN — the gap between the last selected and the first
+// rejected biased score — so the reader knows how much room the assertion had.
+struct Dots3NoteVisionMoeRoute {
+  int64_t block = 0;
+  int64_t num_routed = 0;
+  int64_t top_k = 0;
+  std::vector<float> logits;    // [L, num_routed] f32, straight off the router GEMM
+  std::vector<int32_t> ids;     // [L, top_k] the SELECTED expert ids
+  std::vector<float> weights;   // [L, top_k] f32, post-renormalize, post-scale
+};
+
 // Optional intermediate capture, for the unit gate only. Production passes
 // nullptr and pays nothing.
 struct Dots3NoteVisionCapture {
@@ -265,6 +374,8 @@ struct Dots3NoteVisionCapture {
   std::vector<float> patch_embed_out; // [L, E]
   std::vector<float> block0_out;      // [L, E]
   std::vector<float> trunk_out;       // [L, E], after post_trunk_norm
+  // One entry per ROUTED block, in block order. Empty on an all-dense tower.
+  std::vector<Dots3NoteVisionMoeRoute> moe_routes;
 };
 
 // THE TOWER. `pixel_values_bf16` is [L, patch_row()] raw bf16 bits as the

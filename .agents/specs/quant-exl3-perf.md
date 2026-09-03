@@ -103,6 +103,7 @@ them would have produced identical output and two green tolerances.
 | baseline | — | OK | — | 0 | 76/76 pass, 0 skipped | — |
 | M1 `(3,2)` out of the predicate | `6c2dc9f5d5…` | OK | YES | 1 | **RED** | YES |
 | M2 `cb == 2` → `GemvKernelForArm<3, 1>` | `283d10a5a8…` | OK | YES | 1 | **RED**, 3 failed | YES |
+| after restore | matches baseline | OK | — | 0 | 76/76 pass, 0 failed | — |
 
 **M1 IS THE REPO'S OWN doctest TRAP, CAUGHT.** Its summary line reads
 `assertions: 71 | 71 passed | 0 failed` — a clean sweep — while `TEST_RC=1`,
@@ -139,6 +140,12 @@ diverge by more than the bound on the data at hand; the discrimination check
 fails whenever they agree, which is the actual invariant — `(3, 1)` and `(3, 2)`
 are different decodes of the same bits and must never produce the same numbers.
 On the real fixture they differ in 4095 of 4096 outputs.
+
+The job ends with `RESTORE build rc=0`, `cuda_exl3.cu matches baseline: YES`,
+and `GATE AFTER RESTORE rc=0` at `assertions: 76 | 76 passed | 0 failed` — the
+same counts as the pre-mutation baseline, line for line. So the two mutations
+left no damage, and the green that opens this section is the same green that
+closes it.
 
 ### THE OCCUPANCY TERM HAS A CEILING, AND IT IS BELOW WHAT THIS CHECKPOINT NEEDS
 

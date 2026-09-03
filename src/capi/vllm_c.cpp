@@ -822,6 +822,48 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
 
 VLLM_API void vllm_engine_free(vllm_engine* engine) { delete engine; }
 
+// ABI v25 (row `SPEC-DFLASH2`, issue #2832): the engine's own speculative
+// acceptance counters, read back. THIS FUNCTION COMPUTES NOTHING. All three
+// values are incremented in `GPUModelRunner`'s post-verify write-back and are
+// already read by `examples/bench/bench_core.h` through the internal
+// `LoadedEngine::runner()` seam; the DFlash2 speed gate drives `examples/cli`,
+// which is a pure client of `vllm.h`, so that seam is closed to it.
+//
+// `verify_steps` comes from `spec_drafts_proposed_by_depth()[0]` rather than
+// from a counter of its own, and that is the SAME already-computed value: the
+// runner increments index 0 exactly once for each request-step whose draft list
+// was non-empty, which is the definition of a verify step that carried drafts.
+// The vector is EMPTY on an engine that never speculated, and 0 is then the
+// true answer.
+VLLM_API vllm_status vllm_engine_spec_acceptance(const vllm_engine* engine,
+                                                 vllm_spec_acceptance* out) {
+  if (out == nullptr) {
+    SetError("vllm_engine_spec_acceptance: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->drafts_proposed = 0;
+  out->drafts_accepted = 0;
+  out->verify_steps = 0;
+  if (engine == nullptr) {
+    SetError("vllm_engine_spec_acceptance: engine is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (!RequireTextEngine(engine, "vllm_engine_spec_acceptance")) {
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    const vllm::v1::GPUModelRunner& runner = engine->loaded->runner();
+    out->drafts_proposed = runner.spec_drafts_proposed();
+    out->drafts_accepted = runner.spec_drafts_accepted();
+    const std::vector<int64_t>& by_depth = runner.spec_drafts_proposed_by_depth();
+    out->verify_steps = by_depth.empty() ? 0 : by_depth.front();
+    return VLLM_OK;
+  } catch (const std::exception& error) {
+    SetError(std::string("vllm_engine_spec_acceptance: ") + error.what());
+    return VLLM_ERR_RUNTIME;
+  }
+}
+
 VLLM_API vllm_status vllm_complete(vllm_engine* engine, const char* prompt,
                                    const vllm_sampling_params* params,
                                    vllm_completion* out) {

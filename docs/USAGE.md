@@ -591,6 +591,39 @@ if (vllm_complete(engine, "The capital of France is", &sampling, &output) == VLL
 vllm_engine_free(engine);
 ```
 
+`vllm_engine_spec_acceptance` (ABI v25) reads back the speculative-decoding
+counters the engine already keeps, so a client can say why a throughput number
+is what it is. The three counts are CUMULATIVE over the handle's life; subtract
+two reads to get a per-request or per-leg figure, which is what `vllm-cli` does
+per `--repeat` leg:
+
+```c
+vllm_spec_acceptance before, after;
+vllm_engine_spec_acceptance(engine, &before);
+vllm_complete(engine, "The capital of France is", &sampling, &output);
+vllm_engine_spec_acceptance(engine, &after);
+
+int64_t proposed = after.drafts_proposed - before.drafts_proposed;
+int64_t accepted = after.drafts_accepted - before.drafts_accepted;
+int64_t steps    = after.verify_steps    - before.verify_steps;
+```
+
+`drafts_accepted` EXCLUDES the bonus/replacement token a verify step always
+emits, which is vLLM's own convention for
+`vllm:spec_decode_num_accepted_tokens`. So `accepted / proposed` is the
+acceptance rate with the bonus token out of it, and
+`(accepted + steps) / steps` is the tokens emitted per verify step with the
+bonus token in it, which is what SGLang publishes as `accept_length`. Reporting
+one number under both names is a one-token-per-step error. All three read 0 on an
+engine that never speculated.
+
+`vllm-cli` prints the per-leg deltas on stderr, on their own line, beside the
+timing and leg-boundary lines it already prints:
+
+```text
+vllm-cli: run=2/5 spec_drafts_proposed=196 spec_drafts_accepted=90 spec_verify_steps=28
+```
+
 `vllm_chat` takes a whole OpenAI chat request as JSON, so it accepts
 `chat_template_kwargs` exactly as the server does, and it applies the same
 default: a key nobody sends is not a template variable at all, so a Qwen3.8

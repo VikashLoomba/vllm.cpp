@@ -126,8 +126,10 @@ sets `input_activations` `{dynamic: false, num_bits: 4, group_size: 16}`.
 
 Both whole-checkpoint refusal gates in the Qwen3.5 dense loader were run against
 the real `config.json` and the real 2194 shipped tensor names from
-`model.safetensors.index.json`, compiled against this tree at
-`3047871581bc55a0ab1a44006421bbe02698d5b8`:
+`model.safetensors.index.json`. The probe was compiled and run twice, at
+`3047871581bc55a0ab1a44006421bbe02698d5b8` and again at
+`309dfaa19a0265287a0879b5851ce07737d954ef` after this branch merged 32 commits
+of `origin/main`, and both runs answer identically:
 
 | gate | answer |
 |---|---|
@@ -208,9 +210,15 @@ high. That is inside every other uncertainty here and is recorded, not corrected
 ## 5. The job
 
 `/workspace/nvfp4-sota/job1.sh`, source tarball sha256
-`8e226bd8fd7f1e7778046d0b82f0553d64dfcf97bd999cf0c84b26fe1d184494` cut from
-`3047871581bc55a0ab1a44006421bbe02698d5b8`, both asserted inside the job. Legs,
-in the order a crash truncates them least usefully:
+`66f19bbeadc8467851ec22c15798ea8c7d5bca7288d13a20c778d069e15cdcd5` cut from
+`309dfaa19a0265287a0879b5851ce07737d954ef`, both asserted inside the job.
+
+That pin was moved once, deliberately. The branch was cut at
+`3047871581bc`, and `origin/main` gained 32 commits while the spec was written,
+three of them in `dense_attn_block.h`, `dense_device_glue.h` and `qwen3_5.cpp` —
+the decode path of this very model family. Measuring the older tree would have
+produced a number for a tree nobody runs. Legs, in the order a crash truncates
+them least usefully:
 
 All four staged files were hashed on the download host and **all four match the
 publisher's LFS object hash**: `fbcdb5ba...`, `db6146a5...` and `d3cfb927...`

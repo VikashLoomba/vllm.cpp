@@ -45,6 +45,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dots3_note_vision.h"  // W6a: the DENSE ViT arm
 #include "vllm/model_executor/models/mla_attention.h"    // MlaBlockDims / the seam
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"          // PagedKvCache, ForwardLogits
@@ -490,6 +491,22 @@ struct Dots3NoteWeights {
   Dots3NoteAccounting accounting;
   bool materialized = false;
   Dots3NoteDeviceWeights device;
+
+  // W6a (#2512) — the DENSE vision tower. `vision.present` is TRUE only when
+  // the config HAS a `vision_config` AND `Dots3NoteVisionRefusal` accepted it,
+  // which for the RELEASED `dots-studio/dots3-note-prev` it does NOT: 17 of its
+  // 42 vision blocks are pyramid MoE and belong to W6b. `vision_refusal` keeps
+  // that message so the encoder hook can report WHY rather than only that the
+  // tower is absent — a refusal a caller can only see as a missing pointer is
+  // one nobody can act on.
+  //
+  // The two are kept BESIDE the language tower rather than folded into
+  // `device`, because they have different lifetimes: a config can have a
+  // runnable language tower and a refused vision tower (that is the released
+  // checkpoint) and the reverse is a defect, not a state.
+  Dots3NoteVisionParams vision_params;
+  Dots3NoteVisionWeights vision;
+  std::string vision_refusal;
 };
 
 // Why the DEVICE forward cannot run `params`, or "" when it can. The message
@@ -594,12 +611,27 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
 // refuses the shape now, so this cannot come back unseen.
 class Dots3NoteModel {
  public:
+  // `mm` is `ModelForwardInput::mm` (W6a, #2512). When it carries
+  // `inputs_embeds` the forward SKIPS the embedding lookup and starts from
+  // those rows, which is upstream's `inputs_embeds is not None` arm
+  // (`deepseek_v2.py`'s `DeepseekV2Model.forward`, mirrored for dots3 at
+  // `nvidia/model.py`) and the ONLY way the vision rows the runner merged can
+  // reach the residual stream. NULL for every text step, so the text path is
+  // byte-identical.
+  //
+  // dots3-note is NOT an M-RoPE model — upstream's `Dots3NoteForCausalLM` is
+  // `SupportsMultiModal, SupportsPP` and not `SupportsMRoPE`
+  // (`nvidia/multimodal.py:49` @ `9035151d6`) — so `mm->positions3` is never
+  // read and `kDots3NoteFactory` leaves `mrope_prompt_positions` null. The
+  // runner then hands the ordinary 1-D `positions`, which is what this forward
+  // has always consumed.
   static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids,
       const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Dots3NoteWeights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices);
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+      const MultiModalForwardInput* mm = nullptr);
 };
 
 // The MLA KV topology. Both classes share ONE physical row of

@@ -241,6 +241,22 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 BENCH_EVIDENCE_RUN = re.compile(
     r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu)\Z"
 )
+# #2609. The lease RECIPES: the exact script a `rc` job ran to produce a number
+# a spec then cites. Same class and same reasoning as BENCH_EVIDENCE_RUN's `.sh`
+# and `.cu` above -- verified, not assumed: nothing under CMakeLists.txt,
+# .github/, scripts/, src/ or include/ references `.agents/scripts/`, and the
+# only referents are spec files. Nothing builds them, nothing installs them, and
+# no entry point reaches them.
+#
+# This directory had NO class at all, and `classify_path` fails closed, so four
+# already-tracked files under it left
+# `test_every_tracked_and_current_change_path_is_classified` RED on `main` and
+# errored any change that touched one. It went unseen because check-pr-size.py
+# is CI-only -- `agent-preflight.sh` never runs it.
+AGENT_RUN_SCRIPT = re.compile(
+    r"\.agents/scripts/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?"
+    r"\.(?:sh|py|hip|cu)\Z"
+)
 STATE_MIGRATION_MANIFEST = ".agents/completed/state-migration-manifest.csv"
 STATE_MIGRATION_MANIFEST_ARCHIVE = re.compile(
     r"\.agents/completed/state-migration-manifest-"
@@ -355,6 +371,13 @@ CREATION_MUTATIONS = {
     # clean-tree case, which asserts a checked count at or above the recorded
     # floor and so cannot be satisfied by silence.
     "scripts/check-symbol-anchors.py": DISABLED_CREATION_CHECKER,
+    # ROCM-HW-DP4A. Created in the same pull request, so there is no BASE
+    # version to mutate. Its suite imports the checker as a module and calls
+    # `check(root=...)`, which the disabled stub does not define, so all 6 cases
+    # in tests/scripts/test_check_rocm_dp4a_intrinsic.py error rather than a
+    # reduced subset passing. Verified against the stub: "Ran 6 tests" then
+    # "FAILED (errors=6)".
+    "scripts/check-rocm-dp4a-intrinsic.py": DISABLED_CREATION_CHECKER,
     # 2026-08-16: the CUDA arch-gate registration guard (#960). Created in the
     # same PR, so there is no BASE version to mutate; its own suite loads the
     # checker as a module and calls into it, so the disabled stub fails at import
@@ -467,6 +490,7 @@ def classify_path(path: str) -> str:
         or SYNC_RECORD.fullmatch(path)
         or BENCH_EVIDENCE.fullmatch(path)
         or BENCH_EVIDENCE_RUN.fullmatch(path)
+        or AGENT_RUN_SCRIPT.fullmatch(path)
     ):
         return "evidence"
     if path in GOVERNANCE_SUPPORT_FILES:

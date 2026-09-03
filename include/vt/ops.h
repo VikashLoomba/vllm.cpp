@@ -5657,7 +5657,16 @@ void SharedExpertGate(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl)
 // `tile` is the tile's 16*bits int16 words as stored. Mirrors `dq`
 // (`exl3_dq.cuh:15-31`): the window ENDS at weight t, so t's own `bits` bits sit
 // in the low positions and weights t-1, t-2 … wrap around the tile above them.
-uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t);
+//
+// WHY `const void*` AND NOT `const uint16_t*` HERE AND IN THE THREE BELOW. A
+// trellis is a borrowed safetensors payload typed kI8 (`vt::Exl3Gemm`: "the
+// trellis travels as opaque i8 BYTES"), so its base is 1-byte aligned and lands
+// on an odd address in roughly half of all checkpoints. Forming a
+// `const uint16_t*` over it is undefined and `-fsanitize=alignment` aborts on
+// the load (#2558); these decoders read it through `vt::LoadUnaligned` off a
+// byte cursor instead. Every caller still passes the int16 words as stored, and
+// a `uint16_t*` converts implicitly, so no call site changed.
+uint16_t Exl3TileCodeword(const void* tile, int bits, int t);
 
 // The MCG codebook (cb == 1), three instructions (`codebook.cuh:67-75`):
 // `x *= 0xCBAC1FED; x = (x & 0x8fff8fff) ^ 0x3b603b60;` then the two fp16
@@ -5700,12 +5709,12 @@ float Exl3DecodeCodeword(uint16_t codeword, int codebook);
 int Exl3TileRowMajorIndex(int t);
 
 // Decode one packed tile into 256 f32 values in ROW-MAJOR 16x16 order.
-void Exl3DecodeTile(const uint16_t* tile, int bits, int codebook, float* out256);
+void Exl3DecodeTile(const void* tile, int bits, int codebook, float* out256);
 
 // `LinearEXL3.get_inner_weight_tensor` (`exl3.py:222-225`): the pre-Hadamard
 // reconstruct. `out` is f32 [k, n] row-major and holds exact fp16 codebook
 // values. `k` and `n` must be multiples of 16.
-void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits, int codebook,
+void Exl3ReconstructInner(const void* trellis, int64_t k, int64_t n, int bits, int codebook,
                           float* out);
 
 // `LinearEXL3.get_weight_tensor` (`exl3.py:227-237`): the full dequantized
@@ -5720,8 +5729,8 @@ void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bit
 // performs after each transform (`quantize.py:342-346,351-355` `.to(x_dtype)`)
 // absorbs it for all but a fraction of entries, and MODEL-DSV4-EXL3 W2's device
 // parity gate is stated against THIS function, not against torch.
-void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
-                       const uint16_t* svh, int64_t k, int64_t n, int bits, int codebook,
+void Exl3DequantLinear(const void* trellis, const void* suh,
+                       const void* svh, int64_t k, int64_t n, int bits, int codebook,
                        float* out);
 
 // ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────

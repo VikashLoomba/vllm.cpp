@@ -6984,6 +6984,42 @@ and three things are still owed before a single cell of that table exists.
   or removing the guard and saying what replaces it. Owned by
   `MODEL-MM-QWEN4-EXP`; NO ISSUE NUMBER, GitHub writes are `403`.
 
+### TIEBREAK: two gaps the wave RECORDED rather than fixed (#2586)
+
+Wave TIEBREAK's fresh review found two properties of
+`tests/vt/test_moe_router_tie_stability.cpp` that are real and that this row
+owes. Neither is fixed in the wave's own pull request: the first is a tree-wide
+test idiom and the second needs GPU time to re-measure every count the wave's
+records cite, so folding either in would make a test-only change carry an
+unmeasured claim.
+
+- **A DEVICE-LESS CUDA BUILD READS GREEN
+  ([#2603](https://github.com/mudler/vllm.cpp/issues/2603)).** The three device
+  cases guard on `if (!HasCuda()) { MESSAGE(...); return; }`, so a CUDA build on
+  a host with no device reports **4 cases | 488 assertions | 0 failed | rc 0**
+  while measuring nothing on device. The wave's own `orin:gpu0` lease did exactly
+  that, green, with a broken tie-break in the binary (evidence §8). Three states
+  exist and the assertion count separates only two of them — CPU-only is
+  `1 | 488`, device-less CUDA is `4 | 488`, a real device run is `4 | 4652` — so
+  the Gates section now teaches the CASE count beside it. The tree already has
+  the refusing idiom at
+  `tests/parity/test_qwen27n_fp8_tower_paged_engine.cpp:149`
+  (`VT_REQUIRE_27N_FP8_GATE` turns absence into a FAILURE), and 13 other test
+  files share the permissive shape, so adopting it is a row of its own.
+
+- **HALF THE DEVICE SWEEP IS A DUPLICATE ABOVE E = 256
+  ([#2604](https://github.com/mudler/vllm.cpp/issues/2604)).** Case 1 runs its
+  sweep with `VT_MOE_ROUTER_WARP` pinned `"1"` and `"0"`, but
+  `MoeRouterWarpValuesPerThread` (`moe_router_warp.h:96-98`) returns 0 for every
+  E outside `{32,64,128,256}` and `LaunchRouterWarp` (`cuda_moe.cu:564`) returns
+  `false` on `vpt == 0` before touching a tensor, so at E = 512 and E = 1024 —
+  including the geometry `qwen4_exp` routes — both arms dispatch the SAME
+  `MoeRouterTopKKernel<Tin,false>`. The counts stay honest, because every
+  assertion really executes: 36 of the 72 rows at E > 256 are byte-identical
+  repeats, and the mutation table's `12` per cell is `2 arms x 3 h x 2 dtypes`,
+  of which 6 are the second count of one disagreement. COVERAGE at E > 256 is
+  half what the doubled numbers imply, and only E = 256 compares two structures.
+
 ## Mutation record — W5k (#2031)
 
 **THE ORACLE, AND HOW IT WAS PROVED TO BE THE ORACLE.** W5j stopped rather than
@@ -8844,6 +8880,229 @@ were taken BEFORE that merge and are not re-derived here. A decode-phase
 selection comparison is now well posed and is NOT claimed by this wave — the
 prefill result stands on its own, and re-running the tap on a post-#2550 tree is
 the cheap next measurement.
+
+## Wave TIEBREAK — is the CUDA top-k STABLE at an exact tie? (#2586)
+
+### Scope
+
+Wave MOEDIV (#2552) established that a third of this model's routing boundaries
+are exact bf16 ties and concluded, **by source read**, that the arms take the
+same lowest-index tie-break. This wave tests the part a source read cannot
+reach: whether the CUDA implementation REALISES that tie-break, on
+bit-identical input, deterministically.
+
+In scope: the `E = 512`, `k = 10` geometry `qwen4_exp` actually routes; the CUDA
+block kernel's parallel argmax; within-arm determinism; the CPU reference at the
+same geometry. Out of scope: the expert GEMM re-association MOEDIV §4 already
+attributed, the bf16-vs-f32 gate-width question MOEDIV §5 already answered
+against upstream, and any change to the router's arithmetic.
+
+### The hypothesis, stated so it can fail
+
+**H:** at an exact tie the CUDA parallel argmax can return an index other than
+the lowest tied index, because the answer depends on the reduction grouping
+(which thread holds which expert) rather than on the values alone.
+
+**H is false iff** the argmax reduction is a reduction over a TOTAL ORDER —
+value descending, then index ascending — applied identically at every level. It
+is true if any level compares values only, or compares indices with the wrong
+polarity, or lets a warp-uniformity or barrier defect leak a stale partial.
+
+### Why the standing gate cannot decide it
+
+`tests/vt/test_ops_moe_grouped.cpp` "CUDA moe_router_topk parallel == serial
+byte-for-byte (adversarial)" is a real gate — it compares against
+`vt::cuda::MoeRouterTopKSerialCuda`, byte-for-byte, under both
+`VT_MOE_ROUTER_WARP` arms. Two limits keep it away from this question:
+
+1. It sweeps `E in {32,64,128,256}` only.
+   `MoeRouterWarpValuesPerThread` (`src/vt/cuda/moe_router_warp.h`) returns 0 for
+   E = 512, so the geometry this model routes falls through to
+   `MoeRouterTopKKernel<Tin,false>` at 2 experts per thread — **a decomposition
+   no case in the tree has ever executed.**
+2. Its tie patterns are `(e / 4) % 5` and `e < 12 ? 3.0f : 0.0f`. Both keep the
+   tied set contiguous and low, so at `kBlock = 256` the tie lives inside warp 0
+   and the CROSS-WARP index comparison never sees a tie it has to break.
+
+### Design
+
+Three assertions, in the order that makes a failure interpretable.
+
+**(1) Closed-form expected selection.** Build a row where the answer is known
+without reference to either arm: `h < k` experts at strictly higher, distinct
+values; a tied set `S` of `m > k - h` experts all carrying the SAME bf16 bit
+pattern, scattered across all 256 threads and all 8 warps; every other expert
+strictly lower. The correct top-k is the `h` high experts in descending order
+followed by **the `k - h` LOWEST indices of `S`**. Assert index-exact equality
+against that. This gates the SEMANTICS and does not merely compare the arms, so
+it cannot pass by both arms being wrong the same way.
+
+**(2) Arm agreement, as SET equality with a printed margin.** A discrete
+selection has bimodal error; a float tolerance on it gates nothing. Compare
+sorted id vectors with `==`, and CAPTURE the tied-set size and the boundary
+value so a failure says which side moved.
+
+**(3) Determinism.** The same launch repeated `R` times must give byte-identical
+indices; and one row's selection must be identical whether it is run alone or as
+row `r` of a large batch, which changes the grid without changing the per-block
+work.
+
+Each of (1)-(3) runs on the CPU arm, on `vt::MoeRouterTopK`'s CUDA dispatch, and
+on `vt::cuda::MoeRouterTopKSerialCuda`, at E in {256, 512, 1024} and both
+`VT_MOE_ROUTER_WARP` arms, in f32 and bf16.
+
+### Upstream
+
+vLLM is the oracle and it DEFINES this tie-break rather than leaving it
+unspecified, in both of its kernels, at the parity pin `5559679229`:
+
+| anchor | what it says |
+|---|---|
+| `csrc/libtorch_stable/moe/topk_softmax_kernels.cu:536-537` | `topkGating`'s butterfly reduction: "We want lower indices to \"win\" in every thread so we break ties this way", `other_max == max && other_expert < expert` |
+| `csrc/libtorch_stable/moe/topk_softmax_kernels.cu:515-517` | its per-thread scan: "only updated if > (not >=)", so the lowest column wins inside a thread too |
+| `csrc/libtorch_stable/moe/topk_softmax_kernels.cu:707-708` | `case 512: LAUNCH_TOPK(512, ...)` — E = 512 IS a registered `topkGating` width upstream, so upstream runs its register-resident kernel at this model's geometry |
+| `csrc/libtorch_stable/moe/topk_softmax_kernels.cu:186,222,225` | the fallback `moeTopK` uses `cub::ArgMax`, whose contract is the same lowest-key-on-tie |
+| `csrc/libtorch_stable/moe/topk_softmax_kernels.cu:465` | "With 0s, the argmax uses index tie-breaking to pick [0,1,2,...,k-1]" — upstream states the resulting behaviour outright |
+
+So "lowest index wins" is upstream's specified behaviour, not an accident of its
+implementation, and assertion (1) above is a mirror of it rather than a local
+invention.
+
+### Risks
+
+- **The test passes by not running.** doctest reports `assertions: 0` at rc 0 as
+  a success, and a case name containing a comma is split by `-tc`. Mitigation:
+  no comma in any new case name; the counted-property assertion below.
+- **The CUDA arm cannot be compiled on the dev box** (no `nvcc`). Mitigation: the
+  CPU arm and the closed-form expectation run locally and in CI; the CUDA arms
+  run inside an `rc` lease and the evidence records the build rc.
+- **A green with the warp lever in the ambient state says nothing.** Mitigation:
+  reuse `vt_test::ScopedMoeRouterWarp` and `REQUIRE` the pinned state, as the
+  standing sweep already does.
+
+### Counted property
+
+Each new case CAPTUREs and CHECKs `tied_seen`, the number of rows whose boundary
+was an exact tie by construction. It is `T` by construction and 0 if the builder
+ever fails to produce a tie, so a case that measured nothing cannot read green.
+
+### Gates
+
+This tree builds ONE binary per suite; there is no `vt_tests` aggregate and no
+`vt_ops` ctest label, so the two commands an earlier draft of this section
+carried would have run nothing at all. These are the ones that run:
+
+```sh
+cmake --build build --target test_moe_router_tie_stability test_ops_moe \
+                              test_ops_moe_grouped test_moe_router_warp_map -j 6
+for t in test_moe_router_tie_stability test_ops_moe test_ops_moe_grouped \
+         test_moe_router_warp_map; do ./build/tests/$t; echo "$t rc=$?"; done
+```
+
+**Read the CASE COUNT and the ASSERTION COUNT beside every rc, never the rc
+alone, and never the assertion count alone either.** There are THREE states and
+the assertion count separates only two of them:
+
+| state | cases | assertions | rc |
+|---|---|---|---|
+| CPU-only build — the device cases are `#ifdef`'d out | **1** | 488 | 0 |
+| CUDA build, no device — they run, print `no CUDA backend registered; skipping`, return | **4** | 488 | 0 |
+| CUDA build with a device | **4** | **4652** | 0 |
+
+All three are rc 0 and two of them read 488, so a Gates instruction that names
+only the assertion count cannot tell a CPU-only run from a device-less CUDA run.
+§Outcome records a lease where the middle row read GREEN with a broken tie-break
+compiled in. The permissive `HasCuda()` skip that makes the middle row possible
+is a tree-wide shape and is owed under `## Owed`
+([#2603](https://github.com/mudler/vllm.cpp/issues/2603)).
+
+### Evidence required
+
+The doctest assertion counts for the new cases on both arms; the build rc and
+host for the CUDA run; and, if and only if a defect is found and fixed, the
+token sequence on the released UD-IQ1_S artifact before and after.
+
+### Stop conditions
+
+Stop and report if (1) and (3) are clean on device: that is a valid outcome and
+it leaves MOEDIV's conclusion standing. Do NOT widen the router's dtype, and do
+NOT change the tie-break polarity, to make any arm agree — either move is a
+divergence from the oracle.
+
+### Outcome -- the hypothesis is FALSE and the coverage gap was REAL
+
+**H is false. The CUDA top-k realises the lowest-index tie-break it declares.**
+Measured on `thor:gpu0` at tree `64617b150`, job
+`5f50e5f7-c730-463f-93cc-3293835ed007`, pod `rc-worker-n8smh`, `NVIDIA Thor`,
+driver 595.78, cc 11.0, nvcc `cuda_13.0.r13.0`, `sm_110`. `CMAKE rc=0`,
+`BUILD rc=0 objects=586`, 41 `*.cu.o`, `libcudart.so.13` and `libcublasLt.so.13`
+in the test binary's own `ldd`.
+
+`test_moe_router_tie_stability`: **4 cases, 4652 assertions, 0 failed, rc = 0.**
+Closed-form selection, serial-oracle agreement, 279 repeat comparisons and 2313
+batch-position comparisons, at E in {256, 512, 1024}, k in {8, 10}, f32 and bf16,
+`VT_MOE_ROUTER_WARP` pinned both ways with the pinned state `REQUIRE`d.
+
+So MOEDIV's reading stands. The `qwen4_exp` CPU-vs-CUDA expert flips are
+tie-break order under a perturbed input, not an unstable tie-break, and the
+session goal's remaining three disagreeing token ids stay attributed to
+arithmetic. **No fix was made, because none was needed, and the three ids do not
+move.**
+
+**The coverage gap this wave named was real, and the mutation quantifies it.**
+Flipping the block kernel's per-thread strided scan to highest-index-wins
+(`cuda_moe.cu`, ONE site, asserted `n == 1`, `MUT BUILD rc=0 objects=1`) is
+caught by 104 of the new file's assertions and by **ZERO assertions of the
+standing sweep**: `test_ops_moe_grouped` read `1907 | 1906 passed | 1 failed`
+before AND after, that one failure being the pre-existing #962 Marlin NVFP4
+block-size disagreement on this arch, and `test_ops_moe` read `33451 | 33451`
+both times. Restoring returned 4652/4652.
+
+| geometry | pattern | `par == r.expect` failures under the mutation |
+|---|---|---|
+| E = 512 | 3, 5 | 12, 12 |
+| E = 1024 | 3, 5 | 12, 12 |
+| **E = 256** | any | **0** |
+
+Zero at E = 256 is the whole finding: the compare the mutation breaks does not
+exist below `E > kBlock`, so the standing sweep is blind to **that one defect
+class -- an inverted PER-THREAD STRIDED compare** -- and to nothing broader.
+
+**Say only that, because the fresh review measured the other two levels and they
+are NOT blind spots.** Inverting the warp `__shfl_down_sync` argmax
+(`cuda_moe.cu:169`) reds 372 assertions here and **313 of the standing sweep**;
+inverting the cross-warp pass (`:186`) reds 188 here and **199 of the standing
+sweep**. Only the per-thread scan reds 104 here and **0 there**. The sweep is
+therefore adequate for every reduction level that exists at `E <= 256` and
+misses exactly the one that does not, which is a narrower claim than "blind to
+it" and the only one the mutations support.
+
+**The CPU arm has its own red-first, measured on the authoring host.** CPU-only
+build at the branch head: baseline `1 case | 488 assertions | 0 failed | rc 0`;
+flipping the greedy argmax's strict `>` to `>=` at ONE site
+(`src/vt/cpu/cpu_ops.cpp:2985`, `grep -c` = 1) gives
+`1 case | 488 | 380 passed | 108 failed | rc 1`, all 108 of them
+`CHECK( ids == r.expect )` and none of them the counted property; restoring
+returns `488/488`. 108 is the whole selection population -- `h < k` is
+`REQUIRE`d, so each of the 54 rows selects at least one tied member, and `>=`
+mis-selects on every row in both dtypes.
+
+**One negative result worth keeping.** The mutant stayed perfectly
+DETERMINISTIC -- all 279 repeat and 2313 batch comparisons passed with the wrong
+tie-break in place. Repeatability is necessary and never sufficient, and a wave
+that had measured only determinism would have called that mutant clean.
+
+**Re-measured at the merged head.** The numbers above were taken at
+`64617b150`; the merge with `origin/main` then touched `src/vt/cuda/cuda_exl3.cu`,
+which this binary links. A second `thor:gpu0` lease at `d52bc830f` (job
+`186b67e9-4e48-43fb-9424-65735964083c`, `BUILD rc=0 objects=586`) reproduces
+every one of them: 4652/0 baseline, 4652/104 mutant, 4652/0 restored, 1907/1906/1
+and 33451/0 unmoved on the standing suites, and the same 12/12/12/12 with zero at
+E = 256. Only `631da56c4` lands after that run and it edits this file alone.
+
+Full record:
+[`docs/bench-evidence/qwen4exp-moe-tiebreak-stability-20260902.md`](../../docs/bench-evidence/qwen4exp-moe-tiebreak-stability-20260902.md).
+
 
 ## Now
 

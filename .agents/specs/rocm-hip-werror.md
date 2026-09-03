@@ -119,3 +119,38 @@ because no other host here has a HIP toolchain.
 - CI cannot rerun this gate. No CI lane has a HIP toolchain, so the flag is
   enforced only where somebody builds the ROCm backend. The regression this
   leaves open is deletion of the genex, which nothing here detects.
+
+## Evidence
+
+`rc` job `c74c0cdf-804f-4666-a155-00fa0f59b963` on `strix:gpu0`, 2026-09-03,
+four arms, each a fresh configure into a fresh build directory, each asked to
+build the same 23 HIP objects with `ninja -k 0`. The arms were archived from
+commits whose messages were later reworded to repair an `Assisted-by` value; the
+trees are byte-identical (`da7b2417…` for RED, `38d96fce…` for GREEN), so the
+result binds to the commits on this branch.
+
+| Arm | Tree | `-Werror` on a HIP compile line | ninja rc | objects | distinct errors | Result |
+|---|---|---|---|---|---|---|
+| RED | flag added, nothing cleared | 1 | 1 | 14/23 | 15 | BUILD_FAILED |
+| GREEN | this branch | 1 | 0 | 23/23 | 0 | BUILD_OK |
+| MUT | this branch + a bare `hipError_t` | 1 | 1 | — | ≥1 | BUILD_FAILED |
+| CTRL | base tree + the SAME bare `hipError_t` | 0 | 0 | 23/23 | 0 | BUILD_OK |
+
+MUT and CTRL apply the identical one-line mutation to `rocm_backend.hip`. On this
+branch it reads `error: ignoring return value of type 'hipError_t' declared with
+'nodiscard' attribute [-Werror,-Wunused-value]`; on the base tree the same line
+reads `warning:` and the build goes green. That is #2713's claim mutated and
+rebuilt, with the control that shows the new flag is the detector rather than
+something else in the diff.
+
+**RED reports 15, not 19, and the four missing ones are not a discrepancy.** All
+four — `rocm_paged_attn.hip:30`, `:335`, `:448`, `:451` — are in the single
+translation unit that hard-fails on the `-Wlogical-op-parentheses` error at
+`:2301`, and all four are end-of-translation-unit diagnostics
+(`-Wunused-function`, `-Wunused-const-variable`) that clang never reaches once
+the frontend has errored. The GREEN arm is what shows all 19 were cleared: 23 of
+23 objects, zero errors and zero warnings.
+
+The job's "red classes" tally line printed nothing. Its regex expects `[-Wflag]`
+and the `-Werror` form is `[-Werror,-Wflag]`. The per-error list above it is
+complete and is the record; the tally is cosmetic and was not relied on.

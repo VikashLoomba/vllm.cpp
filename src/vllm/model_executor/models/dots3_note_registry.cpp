@@ -210,7 +210,7 @@ MmEncoderOutput EncodeMmDots3NoteForCausalLM(
            "Dots3NoteForCausalLM encoder: the vision adapter emits " +
                std::to_string(width) + "-wide rows but the text tower is " +
                std::to_string(config.hidden_size) +
-               " wide (`adapter_out_dim`, vision.py:461 @ 9035151d6)");
+               " wide (`adapter_out_dim`, vision.py:476, :485 @ 9035151d6)");
 
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   // THE TOWER. This call is the point of the brick: before it, nothing on this

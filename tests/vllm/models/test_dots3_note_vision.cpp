@@ -20,7 +20,7 @@
 // `9035151d6` and 494 at vLLM `main` `7a100bb61`.
 //
 // THE ONE FORMULA DIFFERENCE, and why the reference does not copy it. Upstream's
-// `RMSNorm.forward` (`vision.py:112-114`) casts the normalized value back to the
+// `RMSNorm.forward` (`vision.py:114-116`) casts the normalized value back to the
 // ACTIVATION dtype before multiplying by the weight; `vt::RmsNorm` keeps f32
 // through that multiply. At infinite precision the two are the same function,
 // so the reference — which is double throughout — is the algebra BOTH implement
@@ -132,7 +132,7 @@ std::vector<double> Linear(const std::vector<double>& x,
   return out;
 }
 
-// `RMSNorm.forward` (vision.py:107-124) and `_RMSNorm` (vision_attention.py:97-110),
+// `RMSNorm.forward` (vision.py:108-122) and `_RMSNorm` (vision_attention.py:97-110),
 // which are the same function: `x * rsqrt(mean(x^2) + eps) * weight`. The
 // intermediate `.type_as(x)` is a no-op in double (see the file header).
 std::vector<double> Rms(const std::vector<double>& x,
@@ -154,7 +154,7 @@ std::vector<double> Rms(const std::vector<double>& x,
   return out;
 }
 
-// `nn.LayerNorm` with weight and bias, the adapter's `ln_q` (vision.py:466).
+// `nn.LayerNorm` with weight and bias, the adapter's `ln_q` (vision.py:481).
 std::vector<double> LayerNorm(const std::vector<double>& x,
                               const std::vector<double>& w,
                               const std::vector<double>& b, int64_t rows,
@@ -181,7 +181,7 @@ std::vector<double> LayerNorm(const std::vector<double>& x,
   return out;
 }
 
-// `get_pos_ids_by_grid` (vision.py:566-603), written straight from the reshape /
+// `get_pos_ids_by_grid` (vision.py:565-599), written straight from the reshape /
 // permute / flatten upstream spells, rather than from the loop the
 // implementation collapsed it into.
 std::vector<std::array<int64_t, 2>> PosIds(int64_t t, int64_t h, int64_t w,
@@ -266,19 +266,24 @@ void ApplyRope(std::vector<double>* x,
   }
 }
 
-// `VisionAttentionV2.forward` (vision_attention.py:210-239) for ONE window:
-// bidirectional, scaled by 1/sqrt(head_dim), softmax in f32 (here, double).
+// `VisionAttentionV2.forward` (vision_attention.py:210-239) for ONE window,
+// scaled by 1/sqrt(head_dim), softmax in f32 (here, double). `causal` is the
+// FLASH family's `causal=self.is_causal` (vision_attention.py:265, :291, :302),
+// which is the arm the released `attn_implementation = flash_attention_3`
+// selects; the two eager classes store the flag and never read it, which is an
+// upstream inconsistency this reference records rather than smooths over.
 std::vector<double> Attention(const std::vector<double>& q,
                               const std::vector<double>& k,
                               const std::vector<double>& v, int64_t L,
-                              int64_t nh, int64_t hd) {
+                              int64_t nh, int64_t hd, bool causal) {
   std::vector<double> out(static_cast<size_t>(L * nh * hd), 0.0);
   const double scale = 1.0 / std::sqrt(static_cast<double>(hd));
   for (int64_t h = 0; h < nh; ++h) {
     for (int64_t i = 0; i < L; ++i) {
+      const int64_t last = causal ? i : L - 1;
       std::vector<double> sc(static_cast<size_t>(L));
       double mx = -1e300;
-      for (int64_t j = 0; j < L; ++j) {
+      for (int64_t j = 0; j <= last; ++j) {
         double acc = 0.0;
         for (int64_t d = 0; d < hd; ++d) {
           acc += q[static_cast<size_t>((i * nh + h) * hd + d)] *
@@ -288,11 +293,11 @@ std::vector<double> Attention(const std::vector<double>& q,
         mx = std::max(mx, sc[static_cast<size_t>(j)]);
       }
       double sum = 0.0;
-      for (int64_t j = 0; j < L; ++j) {
+      for (int64_t j = 0; j <= last; ++j) {
         sc[static_cast<size_t>(j)] = std::exp(sc[static_cast<size_t>(j)] - mx);
         sum += sc[static_cast<size_t>(j)];
       }
-      for (int64_t j = 0; j < L; ++j) {
+      for (int64_t j = 0; j <= last; ++j) {
         const double p = sc[static_cast<size_t>(j)] / sum;
         for (int64_t d = 0; d < hd; ++d) {
           out[static_cast<size_t>((i * nh + h) * hd + d)] +=
@@ -305,22 +310,212 @@ std::vector<double> Attention(const std::vector<double>& q,
 }
 
 double Silu(double x) { return x / (1.0 + std::exp(-x)); }
+double Sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+
+// What the gate needs to say about a DISCRETE decision, computed on the
+// reference's own side.
+struct MoeRouteRef {
+  int64_t block = 0;
+  int64_t num_routed = 0;
+  int64_t top_k = 0;
+  // [L * top_k], each token's selected ids in ASCENDING order — a SET, because
+  // `torch.topk(..., sorted=False)` leaves the order unspecified upstream and
+  // the combine is a sum, so order carries no information and comparing it
+  // would be comparing an artefact.
+  std::vector<int64_t> ids;
+  // min over tokens of (the k-th selected biased score) - (the best REJECTED
+  // biased score). How much room the set assertion had.
+  double min_margin = 1e300;
+  // ...and the token it happened at, so a report can point at one row.
+  int64_t min_margin_token = -1;
+};
+
+// `MoESwiGLUFFN.forward` (vision.py:170-218 @ 9035151d6), transcribed line by
+// line. It calls nothing the implementation calls: its own sigmoid, its own
+// selection scan, its own per-expert SwiGLU through `Linear` above, and its own
+// self-normalizing accumulation.
+//
+// ON TIE-BREAKING. Upstream is `torch.topk`, whose order among equal scores is
+// unspecified; this tree's house convention (`vt/ops.h`, the determinism
+// deviation note above `MoeRouterTopK`) is a greedy strict-`>` scan over
+// ascending index, so the LOWEST id wins an exact tie. The reference uses the
+// same rule, and that is a statement about a case upstream does not define
+// rather than the reference agreeing with the implementation about a case it
+// does: at double precision over random weights no two biased scores here are
+// equal, and the printed margin is what says so.
+std::vector<double> MoeFfn(const TinySpec& s, const TinyCheckpoint& ck,
+                           const std::string& pre, int64_t ne,
+                           const std::vector<double>& x, int64_t L, int64_t E,
+                           int64_t block, MoeRouteRef* route) {
+  const int64_t Im = s.v_moe_inter;
+  const double epsilon = 1e-9;
+  // `topk = min(int(self.capacity_factor), self.num_routed)` (:190)
+  const int64_t k = std::min<int64_t>(
+      static_cast<int64_t>(s.v_capacity_factor), ne);
+  // `gate_logits = F.linear(x_flat.float(), self.gate_weight.float())` (:180)
+  const std::vector<double> gl =
+      Linear(x, ck.value_of(pre + "mlp.gate_weight"), nullptr, L, E, ne);
+  const std::vector<double>& rb = ck.value_of(pre + "mlp.router_bias");
+
+  if (route != nullptr) {
+    route->block = block;
+    route->num_routed = ne;
+    route->top_k = k;
+    route->ids.assign(static_cast<size_t>(L * k), -1);
+  }
+
+  std::vector<double> agg_out(static_cast<size_t>(L * E), 0.0);
+  std::vector<double> agg_gate(static_cast<size_t>(L), 0.0);
+  for (int64_t t = 0; t < L; ++t) {
+    std::vector<double> gp(static_cast<size_t>(ne));
+    std::vector<double> gb(static_cast<size_t>(ne));
+    for (int64_t j = 0; j < ne; ++j) {
+      // `gating_prob = torch.sigmoid(gate_logits)` (:182-183) — ELEMENTWISE,
+      // not normalized across experts.
+      gp[static_cast<size_t>(j)] = Sigmoid(gl[static_cast<size_t>(t * ne + j)]);
+      // `gating_with_bias = gating_prob + router_bias.float()` (:192)
+      gb[static_cast<size_t>(j)] =
+          gp[static_cast<size_t>(j)] + rb[static_cast<size_t>(j)];
+    }
+    // `torch.topk(gating_with_bias, k=topk, sorted=False)` (:193)
+    std::vector<char> taken(static_cast<size_t>(ne), 0);
+    std::vector<int64_t> sel;
+    double last_selected = 1e300;
+    for (int64_t r = 0; r < k; ++r) {
+      int64_t best = -1;
+      double best_v = -1e300;
+      for (int64_t j = 0; j < ne; ++j) {
+        if (taken[static_cast<size_t>(j)]) continue;
+        if (best < 0 || gb[static_cast<size_t>(j)] > best_v) {
+          best_v = gb[static_cast<size_t>(j)];
+          best = j;
+        }
+      }
+      taken[static_cast<size_t>(best)] = 1;
+      sel.push_back(best);
+      last_selected = best_v;
+    }
+    if (route != nullptr) {
+      double best_rejected = -1e300;
+      for (int64_t j = 0; j < ne; ++j) {
+        if (taken[static_cast<size_t>(j)]) continue;
+        best_rejected = std::max(best_rejected, gb[static_cast<size_t>(j)]);
+      }
+      // ne == k has no rejected expert and therefore no margin to report.
+      if (best_rejected > -1e299) {
+        const double m = last_selected - best_rejected;
+        if (m < route->min_margin) {
+          route->min_margin = m;
+          route->min_margin_token = t;
+        }
+      }
+      std::vector<int64_t> asc = sel;
+      std::sort(asc.begin(), asc.end());
+      for (int64_t r = 0; r < k; ++r)
+        route->ids[static_cast<size_t>(t * k + r)] = asc[static_cast<size_t>(r)];
+    }
+    // `routed_weights = gating_prob.gather(1, topk_indices)` (:195) — the
+    // UNBIASED score weights, the biased one only selected.
+    std::vector<double> rw(static_cast<size_t>(k));
+    double wsum = 0.0;
+    for (int64_t r = 0; r < k; ++r) {
+      rw[static_cast<size_t>(r)] = gp[static_cast<size_t>(sel[static_cast<size_t>(r)])];
+      wsum += rw[static_cast<size_t>(r)];
+    }
+    // `if sigmoid and topk > 1: routed_weights /= (sum + epsilon)` (:196-199)
+    if (s.v_router_scoring_func == "sigmoid" && k > 1) {
+      for (int64_t r = 0; r < k; ++r) rw[static_cast<size_t>(r)] /= (wsum + epsilon);
+    }
+    // `routed_weights = routed_weights * self.router_scale` (:200)
+    for (int64_t r = 0; r < k; ++r) rw[static_cast<size_t>(r)] *= s.v_router_scale;
+
+    // `for expert_idx ...: aggregated_output[n] += expert(x[n]) * w;
+    //  aggregated_gate[n] += w` (:202-213)
+    for (int64_t r = 0; r < k; ++r) {
+      const std::string ep =
+          pre + "mlp.experts." + std::to_string(sel[static_cast<size_t>(r)]) + ".";
+      const std::vector<double> row(x.begin() + static_cast<ptrdiff_t>(t * E),
+                                    x.begin() + static_cast<ptrdiff_t>((t + 1) * E));
+      // `DotsSwiGLUFFN.forward`: `fc2(F.silu(fc1(x)) * fc3(x))` (:136)
+      const std::vector<double> g =
+          Linear(row, ck.value_of(ep + "fc1.weight"), nullptr, 1, E, Im);
+      const std::vector<double> u =
+          Linear(row, ck.value_of(ep + "fc3.weight"), nullptr, 1, E, Im);
+      std::vector<double> act(static_cast<size_t>(Im));
+      for (int64_t c = 0; c < Im; ++c)
+        act[static_cast<size_t>(c)] = Silu(g[static_cast<size_t>(c)]) *
+                                      u[static_cast<size_t>(c)];
+      const std::vector<double> o =
+          Linear(act, ck.value_of(ep + "fc2.weight"), nullptr, 1, Im, E);
+      for (int64_t c = 0; c < E; ++c)
+        agg_out[static_cast<size_t>(t * E + c)] +=
+            o[static_cast<size_t>(c)] * rw[static_cast<size_t>(r)];
+      agg_gate[static_cast<size_t>(t)] += rw[static_cast<size_t>(r)];
+    }
+  }
+  // `aggregated_output / (aggregated_gate.unsqueeze(-1) + epsilon)` (:215-217).
+  // THE SELF-NORMALIZING DIVIDE, spelled as upstream spells it — by the SUMMED
+  // gate rather than by the constant the implementation folds into
+  // `vt::MoeCombine`'s `routed_scale`. Keeping the literal form here is what
+  // makes the 1e-9 difference between the two a MEASUREMENT instead of a
+  // definition.
+  for (int64_t t = 0; t < L; ++t) {
+    const double den = agg_gate[static_cast<size_t>(t)] + epsilon;
+    for (int64_t c = 0; c < E; ++c) agg_out[static_cast<size_t>(t * E + c)] /= den;
+  }
+  return agg_out;
+}
+
+// `_pixel_shuffle(x, scale_factor=0.5)` (vision.py:401-416 @ 9035151d6) over a
+// row-major [gh, gw, E] grid with BOTH sides even, written from the reshape /
+// permute chain rather than from the closed form the implementation gathers by:
+//   reshape(n,h,w/2,2c) -> permute(0,2,1,3) -> reshape(n,w/2,h/2,4c)
+//   -> permute(0,2,1,3)
+std::vector<double> PixelShuffle(const std::vector<double>& x, int64_t gh,
+                                 int64_t gw, int64_t E) {
+  // step A: [h, w/2, 2E]
+  std::vector<double> a(static_cast<size_t>(gh * (gw / 2) * 2 * E));
+  for (int64_t i = 0; i < gh; ++i)
+    for (int64_t j = 0; j < gw / 2; ++j)
+      for (int64_t c = 0; c < 2 * E; ++c)
+        a[static_cast<size_t>((i * (gw / 2) + j) * 2 * E + c)] =
+            x[static_cast<size_t>((i * gw + 2 * j + c / E) * E + c % E)];
+  // step B: permute to [w/2, h, 2E]
+  std::vector<double> b(a.size());
+  for (int64_t i = 0; i < gh; ++i)
+    for (int64_t j = 0; j < gw / 2; ++j)
+      for (int64_t c = 0; c < 2 * E; ++c)
+        b[static_cast<size_t>((j * gh + i) * 2 * E + c)] =
+            a[static_cast<size_t>((i * (gw / 2) + j) * 2 * E + c)];
+  // step C: reshape to [w/2, h/2, 4E]
+  // step D: permute to [h/2, w/2, 4E]
+  std::vector<double> out(b.size());
+  for (int64_t j = 0; j < gw / 2; ++j)
+    for (int64_t i = 0; i < gh / 2; ++i)
+      for (int64_t c = 0; c < 4 * E; ++c)
+        out[static_cast<size_t>((i * (gw / 2) + j) * 4 * E + c)] =
+            b[static_cast<size_t>((j * gh + 2 * i + c / (2 * E)) * 2 * E +
+                                  c % (2 * E))];
+  return out;
+}
 // `nn.GELU()` with no `approximate=` is the EXACT erf gelu.
 double GeluErf(double x) {
   return 0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0)));
 }
 
-// `DotsMoEVitModel.forward` (vision.py:634-677), the all-DENSE path.
+// `DotsMoEVitModel.forward` (vision.py:631-677), over BOTH block kinds and
+// BOTH adapters. `routes`, when given, collects one entry per ROUTED block.
 std::vector<double> Tower(const TinySpec& s, const TinyCheckpoint& ck,
                           const std::vector<double>& pixels, int64_t t,
-                          int64_t gh, int64_t gw) {
+                          int64_t gh, int64_t gw,
+                          std::vector<MoeRouteRef>* routes = nullptr) {
   const int64_t E = s.v_embed, nh = s.v_heads, hd = s.v_head_dim();
   const int64_t L = t * gh * gw, P = s.v_patch_row(), VI = s.v_inter;
   const double eps = s.v_rms_eps;
   const std::string vp = "vision_encoder.";
 
   // patch_embed: the Conv2d over one non-overlapping patch IS a Linear over the
-  // flattened patch row, then RMSNorm (vision.py:317-331).
+  // flattened patch row, then RMSNorm (vision.py:336-345).
   std::vector<double> hidden =
       Linear(pixels, ck.value_of(vp + "patch_embed.proj.weight"),
              &ck.value_of(vp + "patch_embed.proj.bias"), L, P, E);
@@ -353,41 +548,73 @@ std::vector<double> Tower(const TinySpec& s, const TinyCheckpoint& ck,
     }
     // Q/K NORM FIRST, ROPE SECOND (vision_attention.py:161-165). The order is
     // silent when swapped: same shapes, same magnitudes, different numbers.
-    qh = Rms(qh, ck.value_of(pre + "attn.q_norm.weight"), L * nh, hd, eps);
-    kh = Rms(kh, ck.value_of(pre + "attn.k_norm.weight"), L * nh, hd, eps);
+    // `use_qk_norm` false builds no norm at all (:145-147).
+    if (s.v_use_qk_norm) {
+      qh = Rms(qh, ck.value_of(pre + "attn.q_norm.weight"), L * nh, hd, eps);
+      kh = Rms(kh, ck.value_of(pre + "attn.k_norm.weight"), L * nh, hd, eps);
+    }
     ApplyRope(&qh, pos, L, nh, hd);
     ApplyRope(&kh, pos, L, nh, hd);
-    const std::vector<double> ao = Attention(qh, kh, vh, L, nh, hd);
+    const std::vector<double> ao =
+        Attention(qh, kh, vh, L, nh, hd, s.v_is_causal);
     const std::vector<double> proj =
         Linear(ao, ck.value_of(pre + "attn.proj.weight"), nullptr, L, E, E);
     for (size_t i = 0; i < hidden.size(); ++i) hidden[i] += proj[i];
 
-    // hidden + mlp(norm_2(hidden)), `fc2(silu(fc1(x)) * fc3(x))`
+    // hidden + mlp(norm_2(hidden)) (vision.py:394)
     const std::vector<double> n2 =
         Rms(hidden, ck.value_of(pre + "norm_2.weight"), L, E, eps);
-    const std::vector<double> g =
-        Linear(n2, ck.value_of(pre + "mlp.fc1.weight"), nullptr, L, E, VI);
-    const std::vector<double> u =
-        Linear(n2, ck.value_of(pre + "mlp.fc3.weight"), nullptr, L, E, VI);
-    std::vector<double> act(g.size());
-    for (size_t i = 0; i < g.size(); ++i) act[i] = Silu(g[i]) * u[i];
-    const std::vector<double> down =
-        Linear(act, ck.value_of(pre + "mlp.fc2.weight"), nullptr, L, VI, E);
-    for (size_t i = 0; i < hidden.size(); ++i) hidden[i] += down[i];
+    const bool moe = b < static_cast<int64_t>(s.v_pyramid.size()) &&
+                     s.v_pyramid[static_cast<size_t>(b)] > 0;
+    if (moe) {
+      MoeRouteRef route;
+      const std::vector<double> routed =
+          MoeFfn(s, ck, pre, s.v_pyramid[static_cast<size_t>(b)], n2, L, E, b,
+                 routes != nullptr ? &route : nullptr);
+      if (routes != nullptr) routes->push_back(route);
+      for (size_t i = 0; i < hidden.size(); ++i) hidden[i] += routed[i];
+    } else {
+      // `fc2(silu(fc1(x)) * fc3(x))`
+      const std::vector<double> g =
+          Linear(n2, ck.value_of(pre + "mlp.fc1.weight"), nullptr, L, E, VI);
+      const std::vector<double> u =
+          Linear(n2, ck.value_of(pre + "mlp.fc3.weight"), nullptr, L, E, VI);
+      std::vector<double> act(g.size());
+      for (size_t i = 0; i < g.size(); ++i) act[i] = Silu(g[i]) * u[i];
+      const std::vector<double> down =
+          Linear(act, ck.value_of(pre + "mlp.fc2.weight"), nullptr, L, VI, E);
+      for (size_t i = 0; i < hidden.size(); ++i) hidden[i] += down[i];
+    }
   }
 
   if (s.v_post_norm) {
     hidden = Rms(hidden, ck.value_of(vp + "post_trunk_norm.weight"), L, E, eps);
   }
 
-  // `PatchMergerAdapter.forward` (vision.py:474-484): ln_q over the per-token
+  const int64_t M = s.v_merged_dim(), O = s.v_adapter_out();
+  const int64_t Nm = L * E / M;
+  if (s.v_adapter_type == "pixel_shuffle_mlp") {
+    // `PixelShuffleAdapter.forward` (vision.py:439-461): shuffle FIRST, then a
+    // LayerNorm over the MERGED width at torch's default eps of 1e-5, then
+    // `Linear(M, O) / GELU / Linear(O, O)` (:432-437).
+    const std::vector<double> sh = PixelShuffle(hidden, gh, gw, E);
+    const std::vector<double> ln =
+        LayerNorm(sh, ck.value_of(vp + "adapter.proj.0.weight"),
+                  ck.value_of(vp + "adapter.proj.0.bias"), Nm, M, 1e-5);
+    std::vector<double> p1 =
+        Linear(ln, ck.value_of(vp + "adapter.proj.1.weight"),
+               &ck.value_of(vp + "adapter.proj.1.bias"), Nm, M, O);
+    for (double& x : p1) x = GeluErf(x);
+    return Linear(p1, ck.value_of(vp + "adapter.proj.3.weight"),
+                  &ck.value_of(vp + "adapter.proj.3.bias"), Nm, O, O);
+  }
+
+  // `PatchMergerAdapter.forward` (vision.py:488-496): ln_q over the per-token
   // dim at a HARD-CODED eps of 1e-6, then `reshape(-1, merged_dim)`, then the
   // two-layer MLP with an exact-erf GELU between.
   const std::vector<double> lnq =
       LayerNorm(hidden, ck.value_of(vp + "adapter.ln_q.weight"),
                 ck.value_of(vp + "adapter.ln_q.bias"), L, E, 1e-6);
-  const int64_t M = s.v_merged_dim(), O = s.v_adapter_out();
-  const int64_t Nm = L * E / M;
   std::vector<double> f1 =
       Linear(lnq, ck.value_of(vp + "adapter.mlp.0.weight"),
              &ck.value_of(vp + "adapter.mlp.0.bias"), Nm, M, M);
@@ -435,6 +662,72 @@ double MaxAbs(const std::vector<double>& v) {
   return m;
 }
 
+// ONE tower run, both arms, off ONE fixture. Shared by every arithmetic case
+// below so that a new config arm is one struct field rather than a fourth copy
+// of the load / process / forward / reference sequence — four copies being how
+// two of them end up measuring different models.
+struct TowerRun {
+  std::unique_ptr<Bench> bench;
+  vllm::Dots3NoteVisionWeights weights;
+  Dots3NoteVisionParams params;
+  vllm::Dots3NoteVisionCapture capture;
+  std::vector<float> ours;
+  std::vector<double> want;
+  std::vector<ref::MoeRouteRef> ref_routes;
+  double rel = 0.0;
+  double max_abs = 0.0;
+  double scale = 0.0;
+};
+
+TowerRun RunTower(const TinySpec& spec, int image_variant = 0) {
+  TowerRun r;
+  r.bench = std::make_unique<Bench>(spec);
+  // The processor is the PRODUCTION one, so the patch rows the tower sees are
+  // the rows a served request would produce.
+  const vllm::multimodal::Dots3NoteProcessorConfig pcfg =
+      vllm::multimodal::LoadDots3NoteProcessorConfig(
+          r.bench->ckpt.dir() + "/preprocessor_config.json",
+          r.bench->ckpt.config_path(), "tiny-dots3");
+  const vllm::multimodal::Dots3NoteImageProcessor proc(pcfg);
+  const std::vector<uint8_t> rgb = dots3_tiny::FixtureImage(image_variant);
+  const vllm::multimodal::ImageKwargs kw = proc.ProcessImage(
+      rgb.data(), dots3_tiny::kImageSide, dots3_tiny::kImageSide);
+  REQUIRE(kw.image_grid_thw[0] == 1);
+  REQUIRE(kw.image_grid_thw[1] == 4);
+  REQUIRE(kw.image_grid_thw[2] == 4);
+
+  r.params = ParseDots3NoteVisionParams(r.bench->config);
+  const std::string why = Dots3NoteVisionRefusal(r.params, "", {});
+  REQUIRE_MESSAGE(why.empty(), "this fixture config refuses: " << why);
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(r.bench->ckpt.weights_path()));
+  r.weights = vllm::MaterializeDots3NoteVision(shards, r.params);
+  REQUIRE(r.weights.present);
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  r.ours = Dots3NoteVisionForward(kw.pixel_values_bf16, kw.image_grid_thw,
+                                  r.weights, r.params, backend, &r.capture);
+  r.want = ref::Tower(r.bench->spec, r.bench->ckpt,
+                      WidenBf16(kw.pixel_values_bf16), 1, 4, 4, &r.ref_routes);
+  REQUIRE(r.ours.size() == r.want.size());
+  for (size_t i = 0; i < r.ours.size(); ++i)
+    r.max_abs = std::max(r.max_abs,
+                         std::abs(static_cast<double>(r.ours[i]) - r.want[i]));
+  r.scale = MaxAbs(r.want);
+  r.rel = r.scale > 0.0 ? r.max_abs / r.scale : r.max_abs;
+  return r;
+}
+
+// A tiny tower whose SECOND block is a 4-expert pyramid block. One dense block
+// ahead of it so a routed block that read a dense block's operand would move
+// the answer, and 4 experts against top-2 so exactly half of them are rejected
+// on every token — the smallest geometry in which a selection can be wrong.
+TinySpec MoeSpec() {
+  TinySpec s;
+  s.v_pyramid = {-1, 4};
+  return s;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -462,12 +755,12 @@ TEST_CASE("dots3-note W6a: the RELEASED vision_config resolves to the measured g
 
   // THE TWO FLAGS #2512's PROSE CONFLATES, asserted apart. `adapter_type` is
   // `patch_merger`, which is upstream's name for the arm that SKIPS the
-  // pixel-shuffle permutation (vision.py:441-449 @ 9035151d6); the 2x2
+  // pixel-shuffle permutation (vision.py:465-471 @ 9035151d6, its docstring); the 2x2
   // regrouping did not disappear, `pre_pixel_shuffle` moved it into the
   // PREPROCESSOR and into the RoPE. The issue's own tensor inventory —
   // `adapter.{ln_q, mlp.0, mlp.2}` — is `PatchMergerAdapter`'s state dict and
   // agrees with this; `PixelShuffleAdapter` spells its parameters
-  // `proj.0`/`proj.1`/`proj.3` (vision.py:397-406). See spec §4.11.1.
+  // `proj.0`/`proj.1`/`proj.3` (vision.py:423, :432-437). See spec §4.11.1.
   CHECK(v.adapter_type == "patch_merger");
   CHECK(v.pre_pixel_shuffle);
   CHECK(v.adapter_in_dim == 1536);
@@ -476,7 +769,7 @@ TEST_CASE("dots3-note W6a: the RELEASED vision_config resolves to the measured g
   CHECK(v.merged_dim() == 6144);  // 4 x 1536
 
   // 25 dense + 17 MoE, counted from `pyramid_num_routed` rather than assumed:
-  // `is_moe` is `> 0` (vision.py:346-350), so the leading -1s are DENSE.
+  // `is_moe` is `> 0` (vision.py:363-366), so the leading -1s are DENSE.
   REQUIRE(v.pyramid_num_routed.size() == 42u);
   CHECK(v.num_dense_blocks() == 25);
   CHECK(v.num_moe_blocks() == 17);
@@ -492,49 +785,60 @@ TEST_CASE("dots3-note W6a: the RELEASED vision_config resolves to the measured g
 }
 
 // ---------------------------------------------------------------------------
-// 2. THE RELEASED CHECKPOINT STILL REFUSES, by name, and names W6b.
-//    This is the row's established pattern — W3 refused the LANGUAGE tower's
-//    MoE for four bricks before W5 lifted it — not a new exception.
+// 2. THE RELEASED CHECKPOINT NO LONGER REFUSES (W6b, #2613).
+//
+//    W6a returned a message here naming block 25 and W6b. This case is the
+//    inverse of that one and it is the headline of this brick: the released
+//    `vision_config` — 25 dense blocks, 17 pyramid blocks, 608 routed experts,
+//    sigmoid scoring, capacity factor 2 — is ACCEPTED, so its tower computes.
 // ---------------------------------------------------------------------------
-TEST_CASE("dots3-note W6a: the RELEASED vision tower REFUSES BY NAME, and names W6b") {
+TEST_CASE("dots3-note W6b: the RELEASED vision tower is ACCEPTED, pyramid and all") {
   const Dots3NoteVisionParams v = ParseDoc(ReleasedConfigDoc());
   const std::string why = Dots3NoteVisionRefusal(v, "", {});
   INFO("refusal: ", why);
-  REQUIRE_FALSE(why.empty());
-  CHECK(why.find("W6b") != std::string::npos);
-  CHECK(why.find("25") != std::string::npos);   // the FIRST routed block
-  CHECK(why.find("17") != std::string::npos);   // how many there are
-  CHECK(why.find("MoE") != std::string::npos);
-  // The message names what to build, not that something is missing.
-  CHECK(why.find("gate_weight") != std::string::npos);
-  CHECK(why.find("router_bias") != std::string::npos);
+  CHECK(why.empty());
+  // The PREMISE, asserted rather than assumed: it really is a pyramid tower.
+  // A config that had quietly become all-dense would also be accepted here and
+  // would say nothing at all about W6b.
+  REQUIRE(v.num_moe_blocks() == 17);
+  CHECK(v.routed_top_k(25) == 2);   // min(int(2.0), 4)
+  CHECK(v.routed_top_k(41) == 2);   // min(int(2.0), 64)
+  CHECK(v.routed_top_k(24) == 0);   // dense blocks have no router
+  CHECK(v.router_scoring_func == "sigmoid");
+  CHECK(v.router_scale == doctest::Approx(1.0));
+  CHECK(v.capacity_factor == doctest::Approx(2.0));
+  CHECK(v.moe_intermediate_size == 2112);
 }
 
-TEST_CASE("dots3-note W6a: every unported vision shape refuses BY NAME with its brick") {
+TEST_CASE("dots3-note W6b: every unported vision shape refuses BY NAME with its brick") {
   const nlohmann::json released = ReleasedConfigDoc();
 
-  SUBCASE("an all-DENSE tower is ACCEPTED — the premise of every case below") {
-    nlohmann::json d = released;
-    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
-    CHECK(Dots3NoteVisionRefusal(ParseDoc(d), "", {}).empty());
+  SUBCASE("the RELEASED config is accepted — the premise of every case below") {
+    CHECK(Dots3NoteVisionRefusal(ParseDoc(released), "", {}).empty());
   }
-  SUBCASE("the BLOCKWISE-FP8 arm is W9, and it outranks the MoE refusal") {
-    nlohmann::json d = released;
-    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
+  SUBCASE("the BLOCKWISE-FP8 arm is W9, and it outranks everything") {
     const std::string why =
-        Dots3NoteVisionRefusal(ParseDoc(d), "fp8", {128, 128});
+        Dots3NoteVisionRefusal(ParseDoc(released), "fp8", {128, 128});
     INFO(why);
     CHECK(why.find("W9") != std::string::npos);
     CHECK(why.find("weight_block_size") != std::string::npos);
   }
-  SUBCASE("`pixel_shuffle_mlp` is a DIFFERENT token order and is refused") {
+  SUBCASE("`pixel_shuffle_mlp` is now IMPLEMENTED and is accepted") {
     nlohmann::json d = released;
-    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
     d["vision_config"]["adapter_type"] = "pixel_shuffle_mlp";
     const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
     INFO(why);
-    CHECK(why.find("pixel_shuffle_mlp") != std::string::npos);
-    CHECK(why.find("patch_merger") != std::string::npos);
+    CHECK(why.empty());
+  }
+  SUBCASE("...but only at merge size 2, because `_pixel_shuffle` hard-codes it") {
+    nlohmann::json d = released;
+    d["vision_config"]["adapter_type"] = "pixel_shuffle_mlp";
+    d["vision_config"]["adapter_merge_size"] = 4;
+    d["vision_config"]["spatial_merge_size"] = 4;
+    const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
+    INFO(why);
+    CHECK_FALSE(why.empty());
+    CHECK(why.find("scale_factor=0.5") != std::string::npos);
   }
   SUBCASE("an UNKNOWN adapter refuses at PARSE, not at load") {
     nlohmann::json d = released;
@@ -543,22 +847,65 @@ TEST_CASE("dots3-note W6a: every unported vision shape refuses BY NAME with its 
   }
   SUBCASE("`temporal_patch_size != 1` is the VIDEO arm and names W7") {
     nlohmann::json d = released;
-    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
     d["vision_config"]["temporal_patch_size"] = 2;
     const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
     INFO(why);
     CHECK(why.find("W7") != std::string::npos);
   }
-  SUBCASE("`use_bias`, `use_qk_norm`, `is_causal` and `post_norm` each refuse") {
-    for (const char* key : {"use_bias", "use_qk_norm", "is_causal", "post_norm"}) {
+  // THE THREE ARMS W6a DEFERRED AND W6b LIFTS. Each was a refusal message on
+  // `main` at `3d045ba1b`; each is now a computed path, and the arithmetic
+  // cases below measure them against the reference.
+  SUBCASE("`post_norm`, `use_qk_norm` and `is_causal` are LIFTED, not refused") {
+    for (const char* key : {"post_norm", "use_qk_norm", "is_causal"}) {
       nlohmann::json d = released;
-      for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
       d["vision_config"][key] = !d["vision_config"][key].get<bool>();
       const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
-      INFO("key ", key, " -> ", why);
-      CHECK_MESSAGE(!why.empty(), "flipping " << key << " was accepted");
-      CHECK(why.find(key) != std::string::npos);
+      INFO("key ", key, " -> '", why, "'");
+      CHECK_MESSAGE(why.empty(), "flipping " << key << " still refuses: " << why);
     }
+  }
+  // ...AND THE ONE IT DOES NOT. `use_bias` is refused with its reason and its
+  // issue, because the shared `MlpGateUpMethodBase` seam has no bias operand
+  // and no published dots3-note checkpoint sets the key.
+  SUBCASE("`use_bias` still refuses, and names the issue that owns it") {
+    nlohmann::json d = released;
+    d["vision_config"]["use_bias"] = true;
+    const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
+    INFO(why);
+    CHECK_FALSE(why.empty());
+    CHECK(why.find("use_bias") != std::string::npos);
+    CHECK(why.find("MlpGateUpMethodBase") != std::string::npos);
+    CHECK(why.find("#2616") != std::string::npos);
+  }
+  // THE TWO ROUTER ARMS W6b DOES NOT SERVE, and why they are a pair: on both
+  // of them upstream skips the weight renormalization, which leaves the
+  // combine's `aggregated_gate` denominator per-token.
+  SUBCASE("a SOFTMAX router refuses, naming issue #2615") {
+    nlohmann::json d = released;
+    d["vision_config"]["router_scoring_func"] = "softmax";
+    const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
+    INFO(why);
+    CHECK_FALSE(why.empty());
+    CHECK(why.find("router_scoring_func") != std::string::npos);
+    CHECK(why.find("#2615") != std::string::npos);
+  }
+  SUBCASE("a top-k below 2 refuses, naming issue #2615") {
+    nlohmann::json d = released;
+    d["vision_config"]["capacity_factor"] = 1;
+    const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
+    INFO(why);
+    CHECK_FALSE(why.empty());
+    CHECK(why.find("top-1") != std::string::npos);
+    CHECK(why.find("#2615") != std::string::npos);
+  }
+  SUBCASE("...and an ALL-DENSE tower with the same capacity_factor does NOT") {
+    // The refusal is per ROUTED block, so a tower with no router is untouched
+    // by it. Without this case the top-k refusal could be a blanket one on
+    // `capacity_factor` and read the same.
+    nlohmann::json d = released;
+    d["vision_config"]["capacity_factor"] = 1;
+    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
+    CHECK(Dots3NoteVisionRefusal(ParseDoc(d), "", {}).empty());
   }
   // THE THREE CONDITIONS THE ENCODER ASSERTS ON, asked HERE too. Before the
   // fresh review of #2523 the refusal was a strict SUBSET of
@@ -568,7 +915,6 @@ TEST_CASE("dots3-note W6a: every unported vision shape refuses BY NAME with its 
   // The refusal predicate and the route predicate must be the SAME predicate.
   SUBCASE("`adapter_out_dim` that is not the TEXT hidden_size refuses") {
     nlohmann::json d = released;
-    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
     d["vision_config"]["adapter_out_dim"] = d["hidden_size"].get<int64_t>() + 8;
     const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
     INFO(why);
@@ -582,12 +928,10 @@ TEST_CASE("dots3-note W6a: every unported vision shape refuses BY NAME with its 
     // `vision_config.hidden_size` instead would accept the left case and refuse
     // the right one — both of them backwards.
     nlohmann::json d = released;
-    for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
     d["vision_config"]["hidden_size"] = d["hidden_size"].get<int64_t>() + 8;
     CHECK(Dots3NoteVisionRefusal(ParseDoc(d), "", {}).empty());
 
     nlohmann::json e2 = released;
-    for (auto& e : e2["vision_config"]["pyramid_num_routed"]) e = -1;
     e2["hidden_size"] = e2["hidden_size"].get<int64_t>() + 8;
     const std::string why = Dots3NoteVisionRefusal(ParseDoc(e2), "", {});
     INFO(why);
@@ -602,7 +946,6 @@ TEST_CASE("dots3-note W6a: every unported vision shape refuses BY NAME with its 
     // both, because both are the same disagreement between two keys.
     for (int64_t m : {int64_t{1}, int64_t{3}}) {
       nlohmann::json d = released;
-      for (auto& e : d["vision_config"]["pyramid_num_routed"]) e = -1;
       d["vision_config"]["adapter_merge_size"] = m;
       const std::string why = Dots3NoteVisionRefusal(ParseDoc(d), "", {});
       INFO("adapter_merge_size ", m, " -> ", why);
@@ -622,19 +965,29 @@ TEST_CASE("dots3-note W6a: every unported vision shape refuses BY NAME with its 
 }
 
 // ---------------------------------------------------------------------------
-// 3. THE 235 DENSE TENSORS, counted against the COMMITTED shard index.
-//    "Nothing was left over" is also true of a map that claimed the MoE blocks
-//    as dense, so the counts are asserted BY NUMBER and cross-checked against
-//    the released index's own names.
+// 3. ALL 2195 VISION TENSORS, counted against the COMMITTED shard index.
+//    W6a claimed 235 of them and left 1960 deferred; W6b claims the lot. The
+//    counts are asserted BY NUMBER and cross-checked against the released
+//    index's own arithmetic, because "nothing was left over" is also true of a
+//    map that claimed a pyramid block as dense.
 // ---------------------------------------------------------------------------
-TEST_CASE("dots3-note W6a: the DENSE arm claims 235 of the released tower's 2195 tensors") {
+TEST_CASE("dots3-note W6b: the tower claims ALL 2195 of the released tower's tensors") {
   const Dots3NoteVisionParams v = ParseDoc(ReleasedConfigDoc());
   const std::vector<vllm::Dots3NoteTensor> claimed =
       vllm::EnumerateDots3NoteVisionTensors(v);
-  CHECK(claimed.size() == 235u);
+  CHECK(claimed.size() == 2195u);
 
-  // 25 blocks x 9, plus 3 patch_embed, 1 post_trunk_norm, 6 adapter.
+  // 25 dense x 9 + 3 patch_embed + 1 post_trunk_norm + 6 adapter = W6a's 235.
   CHECK(25 * 9 + 3 + 1 + 6 == 235);
+  // ...and the pyramid's 1960: 17 blocks x 8 block tensors (norm_1, norm_2,
+  // qkv, proj, q_norm, k_norm, gate_weight, router_bias) + 608 routed experts
+  // x 3. That is #2613's own arithmetic and the released index's.
+  int64_t experts = 0;
+  for (int64_t i = 25; i < 42; ++i)
+    experts += v.pyramid_num_routed[static_cast<size_t>(i)];
+  CHECK(experts == 608);
+  CHECK(17 * 8 + experts * 3 == 1960);
+  CHECK(235 + 1960 == 2195);
 
   std::set<std::string> names;
   for (const vllm::Dots3NoteTensor& t : claimed) {
@@ -643,29 +996,74 @@ TEST_CASE("dots3-note W6a: the DENSE arm claims 235 of the released tower's 2195
     CHECK(t.name.rfind("vision_encoder.", 0) == 0);
   }
 
-  // NOT ONE MoE block's tensor is claimed. A map that walked all 42 blocks
-  // would claim 42 x 9 = 378 names, of which 153 do not exist on disk — and the
-  // load would then refuse for the wrong reason.
+  // THE ROUTER SPELLING, asserted by name. `mlp.gate_weight` +
+  // `mlp.router_bias` is the VISION router (vision.py:152-168 @ 9035151d6); the
+  // LANGUAGE tower's is `mlp.gate.weight` + `mlp.gate.e_score_correction_bias`
+  // (deepseek_v2.py:313-318). Claiming the language spelling here would find no
+  // tensor on disk and refuse the load for the wrong reason, so the two are
+  // asserted apart rather than assumed distinct.
   for (int64_t b = 25; b < 42; ++b) {
     const std::string pre = "vision_encoder.blocks." + std::to_string(b) + ".";
-    for (const std::string& n : names) {
-      CHECK_MESSAGE(n.rfind(pre, 0) != 0,
-                    "the DENSE arm claims " << n << ", which is a W6b block");
-    }
+    CHECK_MESSAGE(names.count(pre + "mlp.gate_weight") == 1,
+                  "block " << b << " is routed and its router is unclaimed");
+    CHECK_MESSAGE(names.count(pre + "mlp.router_bias") == 1,
+                  "block " << b << " is routed and its router bias is unclaimed");
+    CHECK(names.count(pre + "mlp.gate.weight") == 0);
+    CHECK(names.count(pre + "mlp.gate.e_score_correction_bias") == 0);
+    // ...and NOT the dense spelling, whose tensors do not exist on a routed
+    // block: 17 x 3 = 51 names that would refuse the load.
+    CHECK(names.count(pre + "mlp.fc1.weight") == 0);
+    CHECK(names.count(pre + "mlp.fc3.weight") == 0);
+    // The LAST expert of the block, so a loop that stopped one short shows.
+    const int64_t ne = v.pyramid_num_routed[static_cast<size_t>(b)];
+    CHECK(names.count(pre + "mlp.experts." + std::to_string(ne - 1) +
+                      ".fc2.weight") == 1);
+    CHECK(names.count(pre + "mlp.experts." + std::to_string(ne) +
+                      ".fc2.weight") == 0);
   }
-  // ...and every DENSE block IS claimed, so a leading-run bug that stopped
-  // early would show.
+  // ...and every DENSE block still carries the dense spelling and no router.
   for (int64_t b = 0; b < 25; ++b) {
     const std::string pre = "vision_encoder.blocks." + std::to_string(b) + ".";
-    CHECK_MESSAGE(names.count(pre + "attn.qkv.weight") == 1,
-                  "block " << b << " is dense and unclaimed");
     CHECK_MESSAGE(names.count(pre + "mlp.fc3.weight") == 1,
                   "block " << b << " is dense and its fc3 is unclaimed");
+    CHECK(names.count(pre + "mlp.gate_weight") == 0);
   }
   CHECK(names.count("vision_encoder.adapter.ln_q.bias") == 1);
   CHECK(names.count("vision_encoder.adapter.mlp.2.weight") == 1);
   CHECK(names.count("vision_encoder.post_trunk_norm.weight") == 1);
   CHECK(names.count("vision_encoder.patch_embed.proj.bias") == 1);
+
+  // THE CONFIG ARMS CHANGE WHAT IS CLAIMED, which is what makes them arms
+  // rather than flags nothing reads.
+  SUBCASE("`use_qk_norm` false drops two tensors PER BLOCK, all 42 of them") {
+    nlohmann::json d = ReleasedConfigDoc();
+    d["vision_config"]["use_qk_norm"] = false;
+    const std::vector<vllm::Dots3NoteTensor> c2 =
+        vllm::EnumerateDots3NoteVisionTensors(ParseDoc(d));
+    CHECK(c2.size() == 2195u - 2u * 42u);
+  }
+  SUBCASE("`post_norm` false drops exactly one") {
+    nlohmann::json d = ReleasedConfigDoc();
+    d["vision_config"]["post_norm"] = false;
+    const std::vector<vllm::Dots3NoteTensor> c2 =
+        vllm::EnumerateDots3NoteVisionTensors(ParseDoc(d));
+    CHECK(c2.size() == 2194u);
+  }
+  SUBCASE("`pixel_shuffle_mlp` claims proj.0/1/3 and NOT ln_q/mlp.0/mlp.2") {
+    nlohmann::json d = ReleasedConfigDoc();
+    d["vision_config"]["adapter_type"] = "pixel_shuffle_mlp";
+    std::set<std::string> n2;
+    for (const vllm::Dots3NoteTensor& t :
+         vllm::EnumerateDots3NoteVisionTensors(ParseDoc(d)))
+      n2.insert(t.name);
+    CHECK(n2.size() == 2195u);
+    CHECK(n2.count("vision_encoder.adapter.proj.0.weight") == 1);
+    CHECK(n2.count("vision_encoder.adapter.proj.1.bias") == 1);
+    CHECK(n2.count("vision_encoder.adapter.proj.3.weight") == 1);
+    CHECK(n2.count("vision_encoder.adapter.ln_q.weight") == 0);
+    CHECK(n2.count("vision_encoder.adapter.mlp.0.weight") == 0);
+    CHECK(n2.count("vision_encoder.adapter.mlp.2.weight") == 0);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -704,70 +1102,32 @@ TEST_CASE("dots3-note W6a: pre_pixel_shuffle regroups the RoPE positions, and NO
 // 5. THE TOWER, against the independent double-precision reference.
 //    THE CONSISTENCY GATE. It says two implementations agree; it does not say
 //    either matches vLLM, because vLLM cannot be run on this model here
-//    (spec §6.4 option B).
+//    (spec §6.4 option B). No performance number is claimable on any axis.
 // ---------------------------------------------------------------------------
 TEST_CASE("dots3-note W6a: the DENSE tower agrees with an INDEPENDENT double reference") {
-  Bench bench;
-  // The processor is the production one, so the patch rows the tower sees are
-  // the rows a served request would produce.
-  vllm::multimodal::Dots3NoteProcessorConfig pcfg =
-      vllm::multimodal::LoadDots3NoteProcessorConfig(
-          bench.ckpt.dir() + "/preprocessor_config.json",
-          bench.ckpt.config_path(), "tiny-dots3");
-  const vllm::multimodal::Dots3NoteImageProcessor proc(pcfg);
-  const std::vector<uint8_t> rgb = dots3_tiny::FixtureImage(0);
-  const vllm::multimodal::ImageKwargs kw =
-      proc.ProcessImage(rgb.data(), dots3_tiny::kImageSide,
-                        dots3_tiny::kImageSide);
-  REQUIRE(kw.image_grid_thw[0] == 1);
-  REQUIRE(kw.image_grid_thw[1] == 4);
-  REQUIRE(kw.image_grid_thw[2] == 4);
-  REQUIRE(kw.num_patches == 16);
-
-  const Dots3NoteVisionParams v = ParseDots3NoteVisionParams(bench.config);
-  REQUIRE(Dots3NoteVisionRefusal(v, "", {}).empty());
-  Dots3NoteVisionWeights vw = vllm::MaterializeDots3NoteVision(
-      [&] {
-        std::vector<vllm::SafetensorsFile> shards;
-        shards.push_back(
-            vllm::SafetensorsFile::Open(bench.ckpt.weights_path()));
-        return shards;
-      }(),
-      v);
-  REQUIRE(vw.present);
+  TowerRun r = RunTower(TinySpec{});
 
   // THE MEMORY FORMAT (porting.md). A widened store passes every shape check
   // and every token gate while moving twice the bytes, and this row's W2 F1
   // fixture row already proves a re-typed tensor fires.
-  CHECK(vw.patch_proj_w.dtype == vt::DType::kBF16);
-  CHECK(vw.adapter_mlp2_w.dtype == vt::DType::kBF16);
-  for (const auto& blk : vw.blocks) {
+  CHECK(r.weights.patch_proj_w.dtype == vt::DType::kBF16);
+  CHECK(r.weights.adapter_mlp2_w.dtype == vt::DType::kBF16);
+  for (const auto& blk : r.weights.blocks) {
     CHECK(blk.qkv.dtype == vt::DType::kBF16);
     CHECK(blk.gate_up.dtype == vt::DType::kBF16);
   }
   // The merge is real: [2I, E], gate then up.
-  REQUIRE(vw.blocks.size() == static_cast<size_t>(bench.spec.v_layers));
-  CHECK(vw.blocks[0].gate_up.shape[0] == 2 * bench.spec.v_inter);
-  CHECK(vw.blocks[0].gate_up.shape[1] == bench.spec.v_embed);
+  REQUIRE(r.weights.blocks.size() == static_cast<size_t>(r.bench->spec.v_layers));
+  CHECK(r.weights.blocks[0].gate_up.shape[0] == 2 * r.bench->spec.v_inter);
+  CHECK(r.weights.blocks[0].gate_up.shape[1] == r.bench->spec.v_embed);
+  // No routed block here, so nothing was captured — the premise of the case.
+  CHECK(r.capture.moe_routes.empty());
 
-  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
-  const std::vector<float> ours = Dots3NoteVisionForward(
-      kw.pixel_values_bf16, kw.image_grid_thw, vw, v, backend);
-
-  const std::vector<double> want =
-      ref::Tower(bench.spec, bench.ckpt, WidenBf16(kw.pixel_values_bf16), 1, 4, 4);
-  REQUIRE(ours.size() == want.size());
   // FOUR merger rows (16 patches / 2x2), each in the TEXT hidden space.
-  CHECK(ours.size() ==
-        static_cast<size_t>(dots3_tiny::kExpectedImageTokens * bench.spec.hidden));
-
-  double max_abs = 0.0;
-  for (size_t i = 0; i < ours.size(); ++i)
-    max_abs = std::max(max_abs, std::abs(static_cast<double>(ours[i]) - want[i]));
-  const double scale = MaxAbs(want);
-  const double rel = scale > 0.0 ? max_abs / scale : max_abs;
-  MESSAGE("tower vs double reference: max |diff| ", max_abs, " over a scale of ",
-          scale, " => relative ", rel);
+  CHECK(r.ours.size() == static_cast<size_t>(dots3_tiny::kExpectedImageTokens *
+                                             r.bench->spec.hidden));
+  MESSAGE("dense tower vs double reference: max |diff| ", r.max_abs,
+          " over a scale of ", r.scale, " => relative ", r.rel);
   // THE BOUND, and where it comes from. The implementation stores every
   // activation and every weight in bf16 (8 mantissa bits, ~3.9e-3 relative) and
   // runs two blocks plus a 64-wide adapter GEMM over it; the reference is
@@ -781,10 +1141,317 @@ TEST_CASE("dots3-note W6a: the DENSE tower agrees with an INDEPENDENT double ref
   // observation, wide enough that a different libm or a different GEMM
   // reduction order does not red it, and tight enough that the mutations
   // recorded in spec §4.11 all exceed it.
-  CHECK(rel < 0.02);
+  CHECK(r.rel < 0.02);
   // ...and the two are not trivially equal, which would mean one of them is
   // reading the other's answer.
-  CHECK(scale > 1e-3);
+  CHECK(r.scale > 1e-3);
+}
+
+// ---------------------------------------------------------------------------
+// 5b. THE PYRAMID TOWER (W6b, #2613), against the same reference — AND against
+//     a gate shape the dense arm did not need.
+//
+//     A TOLERANCE ALONE IS A MUTE SWITCH HERE. Top-k expert selection is a
+//     DISCRETE choice: the error it makes is bimodal, not continuous. Either
+//     the same experts were chosen and the output error is the ordinary bf16
+//     one, or a different expert was chosen and the output is a different
+//     function — and in between there is nothing for a relative bound to
+//     measure. Worse, a selection defect that happens NOT to flip on this
+//     fixture leaves the tolerance green while saying nothing at all. So the
+//     selection is asserted as a SET, per token, against the reference's own
+//     independent scan, and the minimum decision MARGIN is printed so the
+//     reader knows how much room that assertion had.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6b: the PYRAMID tower agrees with the reference, and its SELECTION does too") {
+  TowerRun r = RunTower(MoeSpec());
+
+  // ── the weights, and their MEMORY FORMAT ─────────────────────────────────
+  REQUIRE(r.weights.blocks.size() == 2u);
+  CHECK_FALSE(r.weights.blocks[0].is_moe);
+  REQUIRE(r.weights.blocks[1].is_moe);
+  const vllm::Dots3NoteVisionMoeWeights& m = r.weights.blocks[1].moe;
+  CHECK(m.num_routed == 4);
+  CHECK(m.top_k == 2);
+  REQUIRE(m.expert_gate.size() == 4u);
+  REQUIRE(m.expert_up.size() == 4u);
+  REQUIRE(m.expert_down.size() == 4u);
+  // The router weight is BF16 and the router BIAS is F32, which is upstream's
+  // own asymmetry (`vision.py:152-154` against `:165-168` @ 9035151d6) and the
+  // whole reason the released tower has 17 F32 tensors against 2178 BF16 ones.
+  // A token gate cannot see a dtype that is too wide OR too narrow; this row's
+  // W2 F1 fixture row proves a re-typed tensor fires.
+  CHECK(m.gate_weight.dtype == vt::DType::kBF16);
+  CHECK(m.router_bias.dtype == vt::DType::kF32);
+  CHECK(m.gate_weight.shape[0] == 4);
+  CHECK(m.gate_weight.shape[1] == r.bench->spec.v_embed);
+  CHECK(m.router_bias.shape[0] == 4);
+  for (size_t e = 0; e < 4u; ++e) {
+    CHECK(m.expert_gate[e].dtype == vt::DType::kBF16);
+    CHECK(m.expert_up[e].dtype == vt::DType::kBF16);
+    CHECK(m.expert_down[e].dtype == vt::DType::kBF16);
+    // SPLIT operands, [Im, E] each — not a merged [2Im, E]. The merge would
+    // cost 7.9 GiB of resident copy on the released checkpoint.
+    CHECK(m.expert_gate[e].shape[0] == r.bench->spec.v_moe_inter);
+    CHECK(m.expert_gate[e].shape[1] == r.bench->spec.v_embed);
+    CHECK(m.expert_down[e].shape[0] == r.bench->spec.v_embed);
+    CHECK(m.expert_down[e].shape[1] == r.bench->spec.v_moe_inter);
+  }
+
+  // ── THE DISCRETE ASSERTION ───────────────────────────────────────────────
+  REQUIRE(r.capture.moe_routes.size() == 1u);
+  REQUIRE(r.ref_routes.size() == 1u);
+  const vllm::Dots3NoteVisionMoeRoute& ours = r.capture.moe_routes[0];
+  const ref::MoeRouteRef& want = r.ref_routes[0];
+  CHECK(ours.block == 1);
+  CHECK(want.block == 1);
+  CHECK(ours.num_routed == want.num_routed);
+  CHECK(ours.top_k == want.top_k);
+  const int64_t L = 16, K = ours.top_k;
+  REQUIRE(ours.ids.size() == static_cast<size_t>(L * K));
+  REQUIRE(want.ids.size() == static_cast<size_t>(L * K));
+
+  // Formats a selection of ANY width. The old form indexed `[0]` and `[1]`
+  // directly while `top_k == 2` was only a `CHECK`, so a top-k that came back
+  // 1 would have read out of bounds inside the failure message of the
+  // assertion that was about to report it.
+  const auto join = [](const std::vector<int64_t>& v) {
+    std::string out = "{";
+    for (size_t i = 0; i < v.size(); ++i) {
+      if (i != 0) out += ", ";
+      out += std::to_string(v[i]);
+    }
+    return out + "}";
+  };
+  REQUIRE(K == 2);
+
+  int64_t agreed = 0;
+  std::set<int64_t> distinct;
+  std::set<std::vector<int64_t>> distinct_sets;
+  std::vector<int64_t> load(static_cast<size_t>(ours.num_routed), 0);
+  for (int64_t t = 0; t < L; ++t) {
+    std::vector<int64_t> mine;
+    for (int64_t j = 0; j < K; ++j)
+      mine.push_back(ours.ids[static_cast<size_t>(t * K + j)]);
+    std::sort(mine.begin(), mine.end());
+    std::vector<int64_t> theirs(
+        want.ids.begin() + static_cast<ptrdiff_t>(t * K),
+        want.ids.begin() + static_cast<ptrdiff_t>((t + 1) * K));
+    for (int64_t e : mine) {
+      distinct.insert(e);
+      load[static_cast<size_t>(e)]++;
+    }
+    distinct_sets.insert(mine);
+    // SET equality, per token. `torch.topk(..., sorted=False)` leaves the
+    // ORDER unspecified upstream and the combine is a sum, so the set is the
+    // decision and the order is an artefact.
+    CHECK_MESSAGE(mine == theirs, "token " << t << " selected " << join(mine)
+                                           << " against the reference's "
+                                           << join(theirs));
+    if (mine == theirs) ++agreed;
+  }
+  CHECK(agreed == L);
+
+  // THE INSTRUMENT'S OWN PRECONDITION, and it is asserted on the two axes that
+  // decide how much of the router the SET assertion above actually exercises.
+  //
+  // WHY IT IS NOT `distinct >= 3`, which is what this block used to say. On the
+  // fixture as first landed, 13 of 16 tokens routed to {1, 2} and the other 3
+  // to {2, 3}: expert 2 sat in EVERY set, **expert 0 was never selected at
+  // all**, and only three of the sixteen tokens could distinguish one set from
+  // another. `distinct >= 3` passed with ZERO slack against a spread of exactly
+  // 3, so the weakest assertion in the file guarded the strongest one. Expert 0
+  // is also the index an off-by-one lands on, so leaving it unrouted is the one
+  // omission that matters most.
+  //
+  // The fixture's `v_router_seed_nudge` was searched until both hold, and both
+  // are asserted rather than printed:
+  //
+  //   1. EVERY routed expert is selected by some token — a per-expert load
+  //      floor of 1, not a count of distinct ids with a margin of nothing.
+  //   2. More than two of the `C(4,2) = 6` possible pairs occur, so a router
+  //      that collapsed onto one or two pairs regardless of its input could not
+  //      reach this population.
+  //
+  // MEASURED 2026-09-03 at nudge 42: all 4 experts, per-expert loads
+  // 7/4/9/12 over 32 slots, and all SIX pairs present.
+  std::string loads;
+  for (size_t e = 0; e < load.size(); ++e)
+    loads += (e ? "/" : "") + std::to_string(load[e]);
+  MESSAGE("routed experts touched over ", L, " tokens: ", distinct.size(),
+          " of ", ours.num_routed, "; per-expert load ", loads,
+          "; distinct selection SETS ", distinct_sets.size(), " of the ",
+          ours.num_routed * (ours.num_routed - 1) / 2, " possible pairs");
+  CHECK(distinct.size() == static_cast<size_t>(ours.num_routed));
+  for (size_t e = 0; e < load.size(); ++e)
+    CHECK_MESSAGE(load[e] >= 1, "expert " << e << " was never selected");
+  CHECK(distinct_sets.size() > 2u);
+  // THE MARGIN, printed rather than assumed. This is how much room the set
+  // assertion had: the gap between the last SELECTED biased score and the best
+  // REJECTED one, minimised over tokens. A margin at zero would mean the
+  // fixture decides its routing by a tie and the agreement is luck.
+  MESSAGE("minimum decision margin over ", L, " tokens: ", want.min_margin,
+          " at token ", want.min_margin_token,
+          " (biased-score gap between the last selected and the first "
+          "rejected expert)");
+  CHECK(want.min_margin > 0.0);
+  // ...and above the drift the two routers can differ by. MEASURED 2026-09-03
+  // at nudge 42: 1.26e-2 at token 8. The implementation's logits come from a
+  // bf16-operand GEMM with an f32 accumulator over a 16-wide reduction, so they
+  // sit within ~1e-3 relative of the reference's double ones; through the
+  // sigmoid, whose slope is at most 1/4, that is ~2.5e-4 of score. The margin
+  // is ~50x that, which is the number that says the agreement above is a
+  // decision and not a coin toss.
+  //
+  // IT IS ALSO 3x THE 4.01e-3 THE FIXTURE USED TO REPORT, and that is a REAL
+  // cost paid for the coverage asserted above, not an improvement. A SMALL
+  // margin is the useful direction here: it means the fixture sits near the
+  // decision boundary, so a selection defect has somewhere to show. The trade
+  // was taken because the old fixture bought its 4.01e-3 by routing 13 of 16
+  // tokens to one pair and never selecting expert 0 at all — a tight margin on
+  // a population that could not discriminate. 1.26e-2 over all four experts and
+  // all six pairs is the better instrument, and the number is recorded here so
+  // the direction of the trade is visible rather than inferred.
+  CHECK(want.min_margin > 1e-3);
+
+  // ── the router weights, and the output ───────────────────────────────────
+  // The weights are f32 as the op contract requires, and they sum to
+  // `router_scale` per token, which is the renormalization at vision.py:196-200
+  // and the reason the self-normalizing combine's denominator is a CONSTANT.
+  REQUIRE(ours.weights.size() == static_cast<size_t>(L * K));
+  for (int64_t t = 0; t < L; ++t) {
+    double sum = 0.0;
+    for (int64_t j = 0; j < K; ++j)
+      sum += ours.weights[static_cast<size_t>(t * K + j)];
+    CHECK(sum == doctest::Approx(r.bench->spec.v_router_scale).epsilon(1e-5));
+  }
+
+  MESSAGE("pyramid tower vs double reference: max |diff| ", r.max_abs,
+          " over a scale of ", r.scale, " => relative ", r.rel);
+  // MEASURED 2026-09-03 at nudge 42: max |diff| 0.0612 over a scale of
+  // 6.045, i.e. 1.01e-2 relative — the same order as the dense tower's
+  // 8.44e-3, which is what one expects when the selection agrees and the only
+  // difference left is bf16 storage. The bound is the dense case's 0.02.
+  CHECK(r.rel < 0.02);
+  CHECK(r.scale > 1e-3);
+  CHECK(r.ours.size() == static_cast<size_t>(dots3_tiny::kExpectedImageTokens *
+                                             r.bench->spec.hidden));
+}
+
+// ---------------------------------------------------------------------------
+// 5c. A PYRAMID BLOCK IS NOT A DENSE BLOCK. The case above proves the routed
+//     arm agrees with the reference; this one proves the routed arm is a
+//     DIFFERENT FUNCTION from the dense one, so that agreement is not an
+//     accident of a tower where the branch did not matter.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6b: routing block 1 changes the tower's answer") {
+  TowerRun dense = RunTower(TinySpec{});
+  TowerRun moe = RunTower(MoeSpec());
+  REQUIRE(dense.ours.size() == moe.ours.size());
+  double d = 0.0;
+  for (size_t i = 0; i < dense.ours.size(); ++i)
+    d = std::max(d, std::abs(static_cast<double>(dense.ours[i]) -
+                             static_cast<double>(moe.ours[i])));
+  MESSAGE("dense block 1 against routed block 1: max |diff| ", d);
+  CHECK(d > 1e-2);
+}
+
+// ---------------------------------------------------------------------------
+// 5d. THE FOUR CONFIG ARMS W6a DEFERRED AND W6b LIFTED. Each one is run over
+//     the SAME reference, on a tower that also has a pyramid block, so an arm
+//     that only worked on a dense tower would show.
+//
+//     Each arm is also asserted to CHANGE the answer. An arm that computed the
+//     same numbers as the default would agree with a reference that read the
+//     same flag and prove nothing about either.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6b: post_norm, use_qk_norm, is_causal and pixel_shuffle_mlp all compute") {
+  const TowerRun base = RunTower(MoeSpec());
+
+  SUBCASE("`post_norm` false skips the trunk norm and ships no tensor for it") {
+    TinySpec s = MoeSpec();
+    s.v_post_norm = false;
+    TowerRun r = RunTower(s);
+    MESSAGE("post_norm=false vs reference: relative ", r.rel);
+    // MEASURED 2026-09-03 at nudge 42: 6.59e-3. The bound follows the same
+    // rule the dense case states — a measured multiple of the observation, not
+    // a round number — at 2.4x, which is 0.017; 0.02 is the nearest value the
+    // file already uses and is inside that.
+    CHECK(r.rel < 0.02);
+    CHECK(r.scale > 1e-3);
+    CHECK(r.weights.post_trunk_norm.bytes.empty());
+    double d = 0.0;
+    for (size_t i = 0; i < r.ours.size(); ++i)
+      d = std::max(d, std::abs(static_cast<double>(r.ours[i]) -
+                               static_cast<double>(base.ours[i])));
+    CHECK(d > 1e-2);
+  }
+  SUBCASE("`use_qk_norm` false drops the per-head norms and their tensors") {
+    TinySpec s = MoeSpec();
+    s.v_use_qk_norm = false;
+    TowerRun r = RunTower(s);
+    MESSAGE("use_qk_norm=false vs reference: relative ", r.rel);
+    // MEASURED 2026-09-03 at nudge 42: 8.36e-3, which is about the dense
+    // tower's own 8.4e-3. The 0.032 bound predates the fixture's router seed
+    // change, when this arm read 1.35e-2, and it is kept rather than tightened
+    // because the reason for the looser bound is unchanged: dropping the
+    // per-head norm removes the one stage that bounds |q| and |k|, so the
+    // attention logits grow and the softmax gets more sensitive to the bf16
+    // store underneath it. A single bound shared across towers with different
+    // conditioning would be the arbitrary choice, not this one.
+    CHECK(r.rel < 0.032);
+    CHECK(r.scale > 1e-3);
+    for (const auto& blk : r.weights.blocks) {
+      CHECK(blk.q_norm.bytes.empty());
+      CHECK(blk.k_norm.bytes.empty());
+    }
+    double d = 0.0;
+    for (size_t i = 0; i < r.ours.size(); ++i)
+      d = std::max(d, std::abs(static_cast<double>(r.ours[i]) -
+                               static_cast<double>(base.ours[i])));
+    CHECK(d > 1e-2);
+  }
+  SUBCASE("`is_causal` true masks the attention, the FLASH arm's own behaviour") {
+    TinySpec s = MoeSpec();
+    s.v_is_causal = true;
+    TowerRun r = RunTower(s);
+    MESSAGE("is_causal=true vs reference: relative ", r.rel);
+    // MEASURED 2026-09-03 at nudge 42: 1.53e-2, and again with a reason:
+    // under a causal mask token 0 attends to ONE key, so its output is that
+    // value verbatim and the early rows average far fewer terms — there is
+    // less error cancellation left in them than in a bidirectional row. 2.4x
+    // the observation, as above.
+    CHECK(r.rel < 0.032);
+    CHECK(r.scale > 1e-3);
+    double d = 0.0;
+    for (size_t i = 0; i < r.ours.size(); ++i)
+      d = std::max(d, std::abs(static_cast<double>(r.ours[i]) -
+                               static_cast<double>(base.ours[i])));
+    CHECK(d > 1e-2);
+  }
+  SUBCASE("`pixel_shuffle_mlp` is a DIFFERENT adapter, on a DIFFERENT state dict") {
+    TinySpec s = MoeSpec();
+    s.v_adapter_type = "pixel_shuffle_mlp";
+    // The shuffle assumes the trunk rows are a ROW-MAJOR grid, which is what
+    // the preprocessor emits when `pre_pixel_shuffle` is off — the two flags
+    // are independent switches and this arm is the one that needs the flat
+    // order (spec §4.11.1, §4.12).
+    s.v_pre_pixel_shuffle = false;
+    TowerRun r = RunTower(s);
+    MESSAGE("pixel_shuffle_mlp vs reference: relative ", r.rel);
+    // MEASURED 2026-09-03 at nudge 42: 1.31e-2.
+    CHECK(r.rel < 0.02);
+    CHECK(r.scale > 1e-3);
+    // The state dict really is the other one: `proj.1` is [O, M] where
+    // `patch_merger`'s `mlp.0` is [M, M].
+    CHECK(r.weights.adapter_ln_w.shape[0] == s.v_merged_dim());
+    CHECK(r.weights.adapter_mlp0_w.shape[0] == s.v_adapter_out());
+    CHECK(r.weights.adapter_mlp0_w.shape[1] == s.v_merged_dim());
+    CHECK(r.weights.adapter_mlp2_w.shape[0] == s.v_adapter_out());
+    CHECK(r.weights.adapter_mlp2_w.shape[1] == s.v_adapter_out());
+    // ...and it still emits the placeholder span's four rows.
+    CHECK(r.ours.size() ==
+          static_cast<size_t>(dots3_tiny::kExpectedImageTokens * s.hidden));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -877,26 +1544,22 @@ TEST_CASE("dots3-note W6a: the image processor mirrors upstream's own resize and
 }
 
 // ---------------------------------------------------------------------------
-// 7. THE LOADER refuses a MoE tower over a checkpoint that really ships one,
-//    and leaves the language tower loadable beside it. A checkpoint whose
-//    vision arm is owed must still load its text half — that is what makes the
-//    refusal a deferral rather than a load failure.
+// 7. THE LOADER BUILDS a MoE tower over a checkpoint that really ships one,
+//    through the REAL registry loader, and the multimodal registration is
+//    intact beside it. W6a's version of this case asserted the refusal; this
+//    is the same checkpoint with the refusal lifted.
 // ---------------------------------------------------------------------------
-TEST_CASE("dots3-note W6a: a PYRAMID vision block defers the tower and leaves the text tower loaded") {
-  TinySpec s;
-  s.v_pyramid = {-1, 4};  // block 1 is routed
-  Bench bench(s);
+TEST_CASE("dots3-note W6b: a PYRAMID vision block LOADS through the real registry") {
+  Bench bench(MoeSpec());
   REQUIRE(bench.model != nullptr);
 
   const Dots3NoteVisionParams v = ParseDots3NoteVisionParams(bench.config);
   const std::string why = Dots3NoteVisionRefusal(v, "", {});
-  INFO(why);
-  CHECK_FALSE(why.empty());
-  CHECK(why.find("W6b") != std::string::npos);
+  INFO("refusal: '", why, "'");
+  CHECK(why.empty());
+  REQUIRE(v.num_moe_blocks() == 1);
+  CHECK(v.routed_top_k(1) == 2);
 
-  // The LANGUAGE tower still materialized: the load did not fail, and the
-  // registration still resolves. A refusal that took the whole checkpoint down
-  // would make the released model unloadable, which it is not.
   const std::vector<std::string> arch{"Dots3NoteForCausalLM"};
   const vllm::ModelRegistration& reg = vllm::ModelRegistry::Resolve(arch);
   CHECK(reg.factory->encode_mm != nullptr);
@@ -904,4 +1567,49 @@ TEST_CASE("dots3-note W6a: a PYRAMID vision block defers the tower and leaves th
   CHECK(vllm::ModelRegistry::SupportsMmInputs(*bench.model));
   // ...and NOT an M-RoPE model.
   CHECK_FALSE(vllm::ModelRegistry::UsesMrope(*bench.model));
+}
+
+// ---------------------------------------------------------------------------
+// 8. THE LOAD REFUSES A RE-TYPED `router_bias` BY NAME (porting.md).
+//
+//    The 17 F32 router biases are the one place upstream itself asks for a
+//    dtype that is not the model's, and a narrowed one is invisible to every
+//    token gate: the shapes match, the tower computes, and the top-k quietly
+//    selects different experts. This case writes the tensor BF16 and asserts
+//    the loader says so, which is the F1 fixture row this row already carries
+//    for the language tower, pointed at the vision router.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6b: a BF16 router_bias is refused by name, not read") {
+  const TinySpec s = MoeSpec();
+  std::vector<dots3_tiny::StOut> entries = dots3_tiny::TinyEntries(s);
+  bool retyped = false;
+  for (dots3_tiny::StOut& e : entries) {
+    if (e.name == "vision_encoder.blocks.1.mlp.router_bias") {
+      REQUIRE(e.dtype == "F32");  // the premise
+      e.dtype = "BF16";
+      retyped = true;
+    }
+  }
+  REQUIRE(retyped);
+
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() /
+      ("dots3_retyped_bias_" + std::to_string(std::random_device{}()));
+  std::filesystem::create_directories(dir);
+  std::ofstream(dir / "config.json", std::ios::binary)
+      << dots3_tiny::TinyConfigDoc(FixtureDir(), s).dump();
+  dots3_tiny::WriteSafetensors(entries, (dir / "model.safetensors").string());
+
+  const HfConfig cfg = LoadHfConfig((dir / "config.json").string());
+  const Dots3NoteVisionParams v = ParseDots3NoteVisionParams(cfg);
+  REQUIRE(Dots3NoteVisionRefusal(v, "", {}).empty());
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(
+      vllm::SafetensorsFile::Open((dir / "model.safetensors").string()));
+  CHECK_THROWS_WITH_AS(
+      (void)vllm::MaterializeDots3NoteVision(shards, v),
+      doctest::Contains("router_bias"), std::runtime_error);
+
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
 }

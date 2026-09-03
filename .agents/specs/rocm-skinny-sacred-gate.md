@@ -156,10 +156,10 @@ actual defaults separately.
 | Construction | `EngineParams{}` | production `LLM` |
 | Model dtype | BF16 | BF16 |
 | Block size | 32 | runtime default, not an identity condition |
-| KV blocks or tokens | auto, fallback 256 blocks | profiled 1,085,870 GPU KV tokens |
-| Maximum sequences | 32 | 256 |
+| KV blocks or tokens | auto, fallback 256 blocks | profiled 1,085,870 GPU KV tokens at explicit `gpu_memory_utilization=0.80` |
+| Maximum sequences | 32 configured, 15 resolved | 256 |
 | Maximum batched tokens | 2,048 for the dense registration | 8,192 |
-| Maximum model length | auto-fitted to the local pool, at most 8,192 | 262,144 |
+| Maximum model length | 8,192 resolved | 262,144 |
 | Prefix caching | hybrid-model default off | off |
 | KV-cache dtype | not characterized in this issue | reported as `auto` |
 | Oracle execution mode | n/a | `enforce_eager=False`, `FULL_AND_PIECEWISE` |

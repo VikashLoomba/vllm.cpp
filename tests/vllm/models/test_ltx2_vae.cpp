@@ -1687,11 +1687,12 @@ TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely wr
     // kernel-level surprise three headers away.
     //
     // THIS GATES THE PREDICATE, NOT THE ENTRY-POINT CALL SITE, and the difference
-    // is measured rather than assumed. `RequireVaeDType` is called from three
+    // is MEASURED rather than assumed. `RequireVaeDType` is called from three
     // places with ONE message -- the decode entry (ltx2_video_vae.cpp:1465),
-    // `VaeStore::Alloc` (`:250`) and `VaeScratch` (`:546`) -- so deleting the
-    // entry-point call alone leaves this subcase GREEN: the store refuses the
-    // same bag with the same words a few lines later. That is the shape
+    // `VaeStore::Alloc` (`:250`) and `VaeScratch` (`:546`). Deleting the
+    // entry-point call alone compiles and leaves this whole case GREEN, 1 of 1
+    // and 3 of 3 assertions: the store refuses the same bag with the same words a
+    // few lines later. That is the shape
     // `RequirePooledDevice`'s own comment at `:167-175` names, "a guard with a
     // spare copy is a guard whose deletion no test can see", and here the spare
     // copies are deliberate: the entry call is a fail-fast that refuses BEFORE
@@ -1722,9 +1723,9 @@ TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely wr
     // builds, and registering one here reaches the dtype refusal with no GPU
     // anywhere in the loop.
     //
-    // Both arms measured, same binary:
-    //   registered   -> "only the CPU arm serves it"        (`:1473`)
-    //   not registered -> "for which no platform is registered" (`:177`)
+    // Both arms measured, same tree, one call apart:
+    //   registration called     -> "only the CPU arm serves it"          (`:1473`)
+    //   registration NOT called -> "for which no platform is registered" (`:177`)
     //
     // The bag can be the fixture's own: the refusal fires before the first
     // `wcache.Get` and before the first allocation, so no weight is read and

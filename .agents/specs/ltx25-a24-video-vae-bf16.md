@@ -983,6 +983,7 @@ recorded as ungateable:
 |---|---|
 | delete the bf16-on-a-non-CPU-queue refusal (`ltx2_video_vae.cpp:1473-1481`) | the mutation COMPILES (`BUILD_rc=0`, `libvllm.a` relinked) and reds the new subcase: `test_ltx2_vae -tc='*dtype refusals*'` goes 1/1 cases and 3/3 assertions GREEN to **1 of 1 case failed, 1 of 3 assertions red**, `CHECK_THROWS_WITH_AS ... threw a DIFFERENT exception!` -- the decode runs on past the deleted guard and dies downstream on a missing bf16 parameter. Restored byte-for-byte |
 | the SAME subcase with the fake-accelerator registration removed (control) | throws `":177"` "for which no platform is registered", not `":1473"` "only the CPU arm serves it" -- which is the whole content of the retired "cannot be gated on this build" claim, and it holds only in that control |
+| delete the ENTRY-POINT `RequireVaeDType` call alone (`ltx2_video_vae.cpp:1465`) | COMPILES and stays **GREEN**, 1 of 1 case and 3 of 3 assertions. `VaeStore::Alloc` (`:250`) refuses the same bag with the same message a few lines later, so the f16 subcase cannot see that call site's deletion. Recorded rather than repaired: forking the text would give one refusal three messages, which is what the single function exists to prevent, and the case now states that it gates the PREDICATE |
 
 ### One instrument lost its window and is repaired rather than deleted
 

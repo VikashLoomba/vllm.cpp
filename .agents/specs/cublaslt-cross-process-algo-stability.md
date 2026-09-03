@@ -112,12 +112,15 @@ The commands are exact. They are run **by the operator, under a lease**; this
 row's author has never held the device.
 
 ```sh
-# 1. one job, all phases, resumable
+# 1. one job, all phases, resumable. --tactic-set defaults to `full`, which is
+#    what the product ships (Fp4FullTacticsEnabled is on unless the value starts
+#    with '0'); this row's question does not depend on the arm, but the arm is
+#    recorded in every report so a reader never has to guess which one ran.
 bash scripts/dgx-gemm-tactic-draw-survey.sh \
      --evidence /workspace/gemm-draw-survey/<stamp> \
      --src /workspace/gemm-draw-survey/src.tar.gz \
      --model /workspace/ckpt/<nvfp4-checkpoint> \
-     --draws 8 --score-reps 2 --concurrency 2
+     --tactic-set full --draws 8 --score-reps 2 --concurrency 2
 
 # 2. the judgement, offline, on the evidence the job left behind
 python3 tools/bench/gemm_tactic_draw_survey.py reduce \
@@ -136,8 +139,9 @@ The verdict is the `issue_2750_draw_processes` block of `REPORT.json`:
 code before it prints any verdict when an instrument did not run: `70` for zero
 `[VT_GEMM_ALGO]` lines, `71` when lines exist but none has a bf16 input (so the
 run says nothing about this row), `76` when the processes saw different shapes,
-and `79` when they were not one binary. A run that logged nothing must never
-read as a run that found nothing wrong.
+`79` when they were not one binary, and `81` when one evidence root pooled both
+NVFP4 tactic-set arms. A run that logged nothing must never read as a run that
+found nothing wrong.
 
 **Coverage is stated, never generalised.** `keys_bf16_input` and `bf16_keys`
 name exactly which shapes were observed. Four shapes are four shapes.
@@ -169,6 +173,12 @@ name exactly which shapes were observed. Four shapes are four shapes.
   unquantized. The judge refuses a run with no bf16 key (`71`) rather than
   reporting on none, and a second arm on a bf16 checkpoint widens the key set if
   the first run's `keys_bf16_input` is thin.
+- **The NVFP4 tactic-set arm is a variable this row does not control and must
+  still record.** `VT_FP4_FULL_TACTICS` is default-ON and changes which CUTLASS
+  candidates run, not which cuBLASLt shapes are queried, so it should not move
+  this row's answer. "Should not" is a hypothesis: the arm is stamped on every
+  report, and if the `full` and `w1` roots disagree on cuBLASLt stability that
+  disagreement is a finding rather than a nuisance.
 - **A model load per process is the cost.** Every draw and every scoring leg is
   a fresh process and pays one load. That is not overhead to optimise away: a
   process that reused a load would not be a fresh selection, which is the whole

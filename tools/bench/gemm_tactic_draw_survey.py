@@ -13,13 +13,33 @@ for a feature:
   answer is "not stable" then every same-binary A/B on that lane carried an
   uncontrolled variable that shows up as spread rather than as an error.
 * #2751 (`KERNEL-GEMM-NVFP4-W4A4`) -- our NVFP4 tuner mirrors FlashInfer
-  0.6.13 exactly (3 warmups / 10 repeats / 5,000 us delay, minimum wins;
-  `src/vt/cuda/nvfp4_persistent_cache.h:25-27`). One draw per process, kept
-  whole. The draw distribution is known to be WIDE in identity (18--33 of 64
-  shared tactic IDs across paired runs). It has never been measured in SPEED.
+  0.6.13's timing recipe (3 warmups / 10 iterations / 5,000 us delay;
+  `src/vt/cuda/nvfp4_persistent_cache.h:25-27`). **Read the aggregation
+  carefully**: `TimeCandidate` at
+  `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:322-357` records ONE `cudaEvent`
+  pair spanning ALL TEN iterations and returns `elapsed_ms / kTimingIterations`.
+  That is a MEAN, and no per-iteration timing exists anywhere -- there is no
+  distribution in the tree to take a median or a minimum of. "Minimum wins"
+  describes the argmin ACROSS CANDIDATES at `:757-763`, never a min-of-10.
+  One draw per process, kept whole. The draw distribution is known to be WIDE
+  in identity (18--33 of 64 shared tactic IDs across paired runs). It has never
+  been measured in SPEED.
 * #2752 (`KERNEL-GEMM-NVFP4-W4A4`) -- which draw would we ship as a pinned GB10
   artifact. That is blocked on #2751's answer, because "which draw" is only
   arbitrary if the draws are performance-equivalent.
+
+TWO ARMS SELECT BY DIFFERENT RULES, SO A DRAW SPREAD MUST NAME ITS ARM
+----------------------------------------------------------------------
+`Fp4FullTacticsEnabled()` (`:189-195`) reads
+`value == nullptr || value[0] != '0'`, so `VT_FP4_FULL_TACTICS` is **default
+ON**: the shipped arm is 32 candidates chosen by pure argmin. The non-default
+`=0` arm is 4 candidates AND carries a variance damper (`:766-775`) -- a tactic
+displaces the fixed baseline only if it beats it by more than 1%, otherwise the
+baseline is kept.
+
+So the two arms answer different questions and their draw spreads are not
+comparable. This module refuses an evidence root that mixes them (exit `81`)
+rather than reporting a number that does not say which rule produced it.
 
 THE TWO INSTRUMENTS ALREADY EXIST. NEITHER IS BUILT HERE.
 ---------------------------------------------------------
@@ -34,6 +54,13 @@ THE TWO INSTRUMENTS ALREADY EXIST. NEITHER IS BUILT HERE.
   selected plan map, one line per plan. `VT_FP4_AUTOTUNE_CACHE_PATH` points a
   process at its own cache document and `VT_FP4_AUTOTUNE_CACHE_READONLY=1`
   freezes it, which is how N independent draws are collected and then replayed.
+* `VT_FP4_AUTOTUNE_VERBOSE=1` adds one `[VT_FP4_AUTOTUNE] ... -> id=%d %s
+  (%.1f us)` line per tuned key (`:776-789`). That microsecond figure is
+  `timings[chosen] * 1000`, i.e. the CHOSEN candidate's ten-iteration mean, and
+  it is the only timing number the tuner exposes. It is a DIAGNOSTIC here and
+  never a gate: it is a single mean with no spread, produced by the very
+  instrument whose noise is under suspicion, so ranking draws by it would be
+  selecting on the measurement in question.
 
 So this module adds no product code and changes no kernel. It runs the existing
 instruments, PARSES them, and refuses to report a verdict the evidence does not
@@ -103,6 +130,7 @@ EXIT_ALGO_KEYSET_DIFFERS = 76  # processes saw different cuBLASLt shapes: differ
 EXIT_CACHE_MISSING = 77        # a draw published no cache document
 EXIT_LEG_NOT_FROZEN = 78       # a scoring leg tuned instead of loading frozen
 EXIT_BINARY_DIFFERS = 79       # two legs are two binaries; only the draw may vary
+EXIT_ARM_MIXED = 81            # one evidence root holds both tactic-set arms
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +278,66 @@ def parse_fp4_lines(text: str) -> dict[str, Any]:
             except (KeyError, ValueError):
                 continue
     return {"prepared": prepared, "complete": complete, "selected": selected}
+
+
+AUTOTUNE_TAG = "[VT_FP4_AUTOTUNE]"
+
+# The selection line is a dedicated regex rather than `kv_tokens`, because it is
+# not a `k=v` line: `M=%d(bucket=%u)` fuses two fields into one token and
+# `-> id=%d %s (%.1f us)` puts the tactic name and the time outside the k=v
+# shape entirely. Unanchored, like every other pattern here.
+AUTOTUNE_RE = re.compile(
+    r"\[VT_FP4_AUTOTUNE\]\s+set=(?P<set>\S+)\s+M=(?P<m>-?\d+)\(bucket=(?P<bucket>\d+)\)"
+    r"\s+N=(?P<n>-?\d+)\s+K=(?P<k>-?\d+)\s+device=(?P<device>-?\d+)\s+sm=(?P<sm>\d+)"
+    r"\s+delay_us=(?P<delay>\d+)\s+->\s+id=(?P<id>-?\d+)\s+(?P<name>.+?)"
+    r"\s+\((?P<us>[0-9.]+)\s+us\)"
+)
+
+
+def parse_autotune_lines(text: str) -> dict[str, Any]:
+    """Every tactic SELECTION the tuner announced, keyed like the plan map.
+
+    The key is `bucket,N,K`, which is exactly what `[VT_FP4_CACHE] selected`
+    prints (it emits `plan.m_bucket` under the name `M`), so the two maps join
+    without a translation step.
+
+    `us` IS A SINGLE MEAN AND THE CALLER MUST NOT TREAT IT AS A SAMPLE.
+    `TimeCandidate` wraps all ten iterations in ONE `cudaEvent` pair and divides,
+    so the tuner never holds a per-iteration figure and none can be recovered
+    from this line. A median or a minimum over iterations is not a reduction
+    this harness -- or a future selector -- can switch to; it would first need
+    per-iteration events that do not exist.
+
+    The value recorded is `timings[chosen]`, not `timings[best]`. In the
+    non-default `VT_FP4_FULL_TACTICS=0` arm the damper can keep the baseline
+    even when another candidate timed faster, so `chosen` and `best` differ
+    there and this line reports the one that was installed.
+
+    A key announced twice means the single-flight tuner ran twice for it (a
+    lazy miss after the pre-serve warmup). The FIRST is kept and the repeat is
+    counted, because silently overwriting would hide the miss.
+    """
+
+    found: dict[str, dict[str, Any]] = {}
+    sets: set[str] = set()
+    repeats = 0
+    for line in text.splitlines():
+        match = AUTOTUNE_RE.search(line)
+        if match is None:
+            continue
+        sets.add(match.group("set"))
+        key = f"{match.group('bucket')},{match.group('n')},{match.group('k')}"
+        if key in found:
+            repeats += 1
+            continue
+        found[key] = {
+            "tactic_id": int(match.group("id")),
+            "name": match.group("name"),
+            "mean_us": float(match.group("us")),
+            "m": int(match.group("m")),
+        }
+        found[key]["set"] = match.group("set")
+    return {"selections": found, "sets": sorted(sets), "repeat_selections": repeats}
 
 
 _BENCH_FIELDS = {
@@ -424,6 +512,76 @@ def draw_identity(draws: Mapping[str, Mapping[str, int]]) -> dict[str, Any]:
         "keys_with_multiple_tactics": len(common) - len(unanimous),
         "max_distinct_tactics_on_one_key": max(per_key.values()) if per_key else 0,
         "pairs": pairs,
+    }
+
+
+def selection_time_spread(draws: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """DIAGNOSTIC ONLY: how far apart the draws' own selection-time means are.
+
+    `draws` maps a draw label to that draw's `parse_autotune_lines` selections.
+
+    **This is not a gate and must never become one.** Three reasons, and each
+    alone is sufficient:
+
+    1.  The number is ONE ten-iteration mean per key. `TimeCandidate` records a
+        single `cudaEvent` pair around the whole loop, so no per-iteration
+        sample exists and no spread, median or minimum is computable from it.
+    2.  It is produced by the instrument whose noise is the subject of the
+        investigation. Ranking draws by the tuner's own timing would settle the
+        question with the measurement under suspicion.
+    3.  It is measured on the tuner's synthetic warmup shapes, which is exactly
+        the workload the draw was taken on. Scoring a draw on the workload that
+        produced it is the shape #2751 and the benchmark protocol refuse.
+
+    What it IS good for: saying whether the draws' installed candidates even
+    claimed different times. Two draws that picked different tactic IDs at
+    near-identical selection-time means are the "performance-equivalent
+    selections differing only in reduction order" hypothesis made visible; a
+    large selection-time gap is a reason to look harder at the end-to-end
+    numbers, never a substitute for them.
+    """
+
+    labels = sorted(draws)
+    if len(labels) < 2:
+        return {"state": "INCOMPARABLE", "reason": "fewer than two draws"}
+
+    key_sets = {label: set(draws[label]) for label in labels}
+    common = set.intersection(*key_sets.values())
+    union = set.union(*key_sets.values())
+    if not common:
+        return {"state": "INCOMPARABLE", "reason": "no key was tuned in every draw"}
+
+    per_key: dict[str, dict[str, Any]] = {}
+    ratios: list[float] = []
+    for key in sorted(common):
+        means = [draws[label][key]["mean_us"] for label in labels]
+        ids = sorted({draws[label][key]["tactic_id"] for label in labels})
+        low, high = min(means), max(means)
+        ratio = high / low if low > 0 else None
+        if ratio is not None:
+            ratios.append(ratio)
+        per_key[key] = {
+            "min_us": low,
+            "max_us": high,
+            "max_over_min": ratio,
+            "distinct_tactic_ids": ids,
+        }
+
+    ratios.sort()
+    return {
+        "state": "DIAGNOSTIC",
+        "keys": len(common),
+        "keys_missing_from_some_draw": len(union - common),
+        "max_over_min_min": ratios[0] if ratios else None,
+        "max_over_min_median": ratios[len(ratios) // 2] if ratios else None,
+        "max_over_min_max": ratios[-1] if ratios else None,
+        "per_key": per_key,
+        "not_a_gate": (
+            "One ten-iteration MEAN per key, from a single cudaEvent pair; no "
+            "per-iteration sample exists in the tree. Measured by the tuner "
+            "under suspicion, on the tuner's own warmup shapes. Report it, "
+            "never rank draws by it."
+        ),
     }
 
 
@@ -610,7 +768,9 @@ def draw_command(
     ]
 
 
-def synthetic_draw_output(index: int, cfg: Mapping[str, Any]) -> tuple[str, str, int]:
+def synthetic_draw_output(
+    index: int, cfg: Mapping[str, Any], *, tactic_set: str = "full"
+) -> tuple[str, str, int]:
     """A device-free fixture with the EXACT byte shape of the two instruments.
 
     This exists so `--dry-run` walks the whole record / resume / precondition /
@@ -635,10 +795,16 @@ def synthetic_draw_output(index: int, cfg: Mapping[str, Any]) -> tuple[str, str,
             f"splitK=1 wsSize=4194304"
         )
     plans = []
+    tuned = []
     for bucket in (1, 8, 64, 512):
         for n, k in ((3072, 2048), (2048, 6144)):
             tactic = (bucket + n + index * 7) % 32
             plans.append(f"[VT_FP4_CACHE] selected M={bucket} N={n} K={k} tactic={tactic}")
+            tuned.append(
+                f"[VT_FP4_AUTOTUNE] set={tactic_set} M={bucket}(bucket={bucket}) "
+                f"N={n} K={k} device=0 sm=121 delay_us=5000 -> id={tactic} "
+                f"tactic_{tactic} ({120.0 + index * 0.3:.1f} us), workspace=4194304"
+            )
     prepared = (
         "[VT_FP4_CACHE] prepared mode=read-write native=/tmp/dry/autotune_configs.json "
         "flashinfer= loaded=0 (flashinfer=0 native=0) rejected=0 delay_us=5000 "
@@ -648,7 +814,7 @@ def synthetic_draw_output(index: int, cfg: Mapping[str, Any]) -> tuple[str, str,
         f"[VT_FP4_CACHE] complete mode=read-write loaded=0 tuned={len(plans)} "
         f"rejected=0 saved={len(plans)} selected={len(plans)} metadata=dryrunfingerprint"
     )
-    stderr = "\n".join(algo + [prepared, complete] + plans) + "\n"
+    stderr = "\n".join(algo + tuned + [prepared, complete] + plans) + "\n"
     stdout = (
         "\n============= vllm.cpp Benchmark Result =============\n"
         f"Successful requests:                       {cfg['num_prompts']}\n"
@@ -671,6 +837,7 @@ def run_draw(
     model: str,
     cfg: Mapping[str, Any],
     *,
+    tactic_set: str = "full",
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """One fresh process: its own cache path, its own stderr, its own evidence.
@@ -696,10 +863,17 @@ def run_draw(
     env["VT_FP4_AUTOTUNE_CACHE_PATH"] = str(cache)
     env["VT_FP4_AUTOTUNE_CACHE_READONLY"] = "0"
     env.pop("VT_FP4_FLASHINFER_CACHE_PATH", None)
+    # The arm is SET, never inherited. `Fp4FullTacticsEnabled` defaults ON, so
+    # an unset variable is the 32-candidate pure-argmin arm -- and a draw whose
+    # arm was decided by the operator's ambient environment is a draw nobody can
+    # attribute. `VT_FP4_AUTOTUNE_VERBOSE` is what emits the per-key selection
+    # line the diagnostic reads.
+    env["VT_FP4_FULL_TACTICS"] = "1" if tactic_set == "full" else "0"
+    env["VT_FP4_AUTOTUNE_VERBOSE"] = "1"
 
     command = draw_command(bench, model, cfg)
     if dry_run:
-        stdout, stderr, rc = synthetic_draw_output(index, cfg)
+        stdout, stderr, rc = synthetic_draw_output(index, cfg, tactic_set=tactic_set)
         cache.write_text(
             json.dumps({"_metadata": {"dry_run": True}, "plans": []}) + "\n",
             encoding="utf-8",
@@ -718,8 +892,10 @@ def run_draw(
         "cache_path": str(cache),
         "cache_sha256": sha256_file(cache) if cache.is_file() else None,
         "cache_bytes": cache.stat().st_size if cache.is_file() else 0,
+        "tactic_set": tactic_set,
         "algo": parse_algo_lines(stderr),
         "fp4": parse_fp4_lines(stderr),
+        "autotune": parse_autotune_lines(stderr),
         "bench": parse_bench_report(stdout + stderr),
         "binary_sha256": (
             "dry-run" if dry_run else (sha256_file(bench) if bench.is_file() else None)
@@ -846,6 +1022,17 @@ def check_draw_preconditions(records: Sequence[Mapping[str, Any]]) -> tuple[int,
             "would hide that"
         ]
 
+    arms = {r.get("tactic_set") for r in records}
+    if len(arms) > 1 or None in arms:
+        return EXIT_ARM_MIXED, [
+            "this evidence root holds more than one tactic-set arm "
+            f"({sorted(str(a) for a in arms)}). `VT_FP4_FULL_TACTICS` default-ON "
+            "selects 32 candidates by pure argmin and `=0` selects 4 candidates "
+            "through a >1% stickiness damper, so the two arms choose by "
+            "DIFFERENT RULES. A draw spread pooled across them names no rule and "
+            "cannot be interpreted; run one root per arm"
+        ]
+
     binaries = {r.get("binary_sha256") for r in records}
     if len(binaries) > 1 or None in binaries:
         return EXIT_BINARY_DIFFERS, [
@@ -877,6 +1064,18 @@ def check_frozen_leg(text: str, expected_plans: int) -> tuple[bool, str]:
     complete = fp4.get("complete")
     if not complete:
         return False, f"no {FP4_TAG} complete line: the persistent runtime did not run"
+    # A SECOND, INDEPENDENT WITNESS. `tuned=0` is the runtime's own count; this
+    # is the tuner's own voice. `VT_FP4_AUTOTUNE_VERBOSE=1` prints one line per
+    # tactic SELECTION, so a frozen replay must print none. The two can disagree
+    # -- a selection that happened outside the counted population would show
+    # here and nowhere else -- and a control with one witness is a control that
+    # cannot be cross-checked.
+    announced = parse_autotune_lines(text)["selections"]
+    if announced:
+        return False, (
+            f"the tuner announced {len(announced)} tactic selection(s) on a leg "
+            "that was supposed to replay a frozen map"
+        )
     try:
         tuned = int(complete.get("tuned", "-1"))
         loaded = int(complete.get("loaded", "-1"))
@@ -937,6 +1136,10 @@ def reduce_evidence(
     report: dict[str, Any] = {
         "evidence": str(evidence),
         "dry_run": any(r.get("dry_run") for r in records),
+        # The arm is a TOP-LEVEL field because a draw-spread number that does
+        # not say which selection rule produced it is not interpretable, and a
+        # report gets read out of the directory it was written in.
+        "tactic_set": sorted({r.get("tactic_set") for r in records if r.get("tactic_set")}),
         "draws_recorded": [r.get("label") for r in records],
         "preconditions": {
             "exit_code": code,
@@ -961,6 +1164,14 @@ def reduce_evidence(
     report["issue_2751_identity"] = draw_identity(
         {r["label"]: r["fp4"]["selected"] for r in records}
     )
+    report["issue_2751_selection_time"] = selection_time_spread(
+        {r["label"]: (r.get("autotune") or {}).get("selections", {}) for r in records}
+    )
+    repeats = sum(
+        (r.get("autotune") or {}).get("repeat_selections", 0) for r in records
+    )
+    if repeats:
+        report["issue_2751_selection_time"]["lazy_miss_repeat_selections"] = repeats
 
     per_draw = read_score_ledger(evidence / "score" / "legs.jsonl", metric)
     if per_draw:
@@ -1021,6 +1232,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     draw.add_argument("--concurrency", type=int, default=2)
     draw.add_argument("--seed", type=int, default=0)
     draw.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    draw.add_argument("--tactic-set", choices=("full", "w1"), default="full",
+                      help="'full' sets VT_FP4_FULL_TACTICS=1 (32 candidates, pure "
+                           "argmin; the shipped default) and 'w1' sets it to 0 "
+                           "(4 candidates behind the >1%% stickiness damper). The two "
+                           "select by different rules, so ONE ARM PER EVIDENCE ROOT")
     draw.add_argument("--dry-run", action="store_true",
                       help="walk the resume/record path with no subprocess and no device")
 
@@ -1047,12 +1263,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "seed": args.seed,
             "max_num_batched_tokens": args.max_num_batched_tokens,
         }
-        write_json(args.evidence / "draw-config.json", cfg)
+        write_json(
+            args.evidence / "draw-config.json",
+            dict(cfg, tactic_set=args.tactic_set),
+        )
         records: list[dict[str, Any]] = []
         for index in range(args.draws):
             record = run_draw(
                 index, args.evidence, args.bench, args.model, cfg,
-                dry_run=args.dry_run,
+                tactic_set=args.tactic_set, dry_run=args.dry_run,
             )
             records.append(record)
             keys = len([k for k in record.get("algo", {}) if not k.startswith("_")])

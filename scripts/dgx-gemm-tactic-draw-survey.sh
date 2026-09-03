@@ -46,6 +46,33 @@
 # returns a draw only when the draws are performance-EQUIVALENT, and then it
 # returns the first in draw order -- a rule fixed before any number existed.
 #
+# ONE TACTIC-SET ARM PER EVIDENCE ROOT, AND THE ARM IS SET RATHER THAN INHERITED
+# -----------------------------------------------------------------------------
+# `Fp4FullTacticsEnabled()` (`src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu:189-195`)
+# reads `value == nullptr || value[0] != '0'`, so `VT_FP4_FULL_TACTICS` is
+# DEFAULT ON. The shipped arm is 32 candidates chosen by pure argmin over
+# per-candidate means (`:757-763`). The non-default `=0` arm is 4 candidates AND
+# carries a variance damper (`:766-775`): a tactic displaces the fixed baseline
+# only if it beats it by more than 1%, otherwise the baseline is kept.
+#
+# The arms therefore SELECT BY DIFFERENT RULES and their draw spreads are not
+# one population. `--tactic-set full|w1` picks one, the Python half refuses a
+# root that mixes them (exit 81), and the scoring legs are given the SAME arm as
+# the draw they replay -- the tactic-set version is part of the cache metadata,
+# so a frozen map replayed under the other arm is rejected rather than used.
+#
+# THE TUNER'S OWN TIMING IS A DIAGNOSTIC, NOT AN AXIS
+# ---------------------------------------------------
+# `VT_FP4_AUTOTUNE_VERBOSE=1` prints `-> id=%d %s (%.1f us)` per tuned key
+# (`:776-789`). That figure is `timings[chosen] * 1000`: ONE mean over ten
+# iterations, because `TimeCandidate` (`:322-357`) wraps all ten in a SINGLE
+# `cudaEvent` pair and divides. No per-iteration sample exists in the tree, so
+# no median or minimum over iterations is computable and a robust-statistic
+# selector would have to ADD instrumentation rather than swap a reduction. This
+# harness records the number and refuses to rank draws by it: it is produced by
+# the instrument under suspicion, on the tuner's own warmup shapes, which is the
+# workload the draw was taken on.
+#
 # THE HOST DECIDES THE SHAPE OF THIS SCRIPT
 # -----------------------------------------
 # `dgx.casa` went down four times in one session (#545) and has crashed roughly
@@ -76,7 +103,8 @@
 #        --evidence /workspace/gemm-draw-survey/<stamp> \
 #        --src /workspace/gemm-draw-survey/src.tar.gz \
 #        --model /workspace/ckpt/<nvfp4-checkpoint> \
-#        [--draws 8] [--score-reps 2] [--concurrency 2] [--phase all]
+#        [--draws 8] [--score-reps 2] [--concurrency 2] [--phase all] \
+#        [--tactic-set full|w1]
 #
 # `--phase` is one of: all build draw score reduce. `--score-leg ARM` is the
 # INTERNAL re-entry the leg runner calls; do not pass it by hand.
@@ -114,6 +142,7 @@ OUTPUT_LEN=64
 SEED=0
 MAX_BATCHED=8192
 PHASE=all
+TACTIC_SET=full
 SCORE_LEG=""
 LOCAL_ROOT=/tmp/gtds
 
@@ -131,6 +160,7 @@ while [ $# -gt 0 ]; do
     --seed)          SEED=${2:?}; shift 2 ;;
     --max-num-batched-tokens) MAX_BATCHED=${2:?}; shift 2 ;;
     --phase)         PHASE=${2:?}; shift 2 ;;
+    --tactic-set)    TACTIC_SET=${2:?}; shift 2 ;;
     --score-leg)     SCORE_LEG=${2:?}; shift 2 ;;
     --local-root)    LOCAL_ROOT=${2:?}; shift 2 ;;
     -h|--help)       sed -n '2,95p' "$0"; exit 0 ;;
@@ -140,6 +170,11 @@ done
 
 [ -n "$EV_SHARE" ] || die "$E_USAGE" "--evidence is required"
 [ -n "$MODEL" ] || die "$E_USAGE" "--model is required; this harness NEVER defaults a checkpoint path"
+case "$TACTIC_SET" in full|w1) ;; *) die "$E_USAGE" "--tactic-set must be full or w1, not '$TACTIC_SET'" ;; esac
+# `full` is the SHIPPED default (Fp4FullTacticsEnabled is on unless the value
+# starts with '0'), so this mapping keeps the harness arm and the product arm
+# the same thing under one name.
+FULL_TACTICS=1; [ "$TACTIC_SET" = w1 ] && FULL_TACTICS=0
 
 # THE EVIDENCE LIVES TWICE, ON PURPOSE.
 # The engine publishes its cache document with mkstemp + fsync + atomic rename
@@ -211,6 +246,8 @@ if [ -n "$SCORE_LEG" ]; then
   VT_FP4_PERSISTENT_CACHE=1 \
   VT_FP4_AUTOTUNE_CACHE_PATH="$CACHE" \
   VT_FP4_AUTOTUNE_CACHE_READONLY=1 \
+  VT_FP4_FULL_TACTICS="$FULL_TACTICS" \
+  VT_FP4_AUTOTUNE_VERBOSE=1 \
   LD_LIBRARY_PATH="$BIN:${LD_LIBRARY_PATH:-}" \
     "$BIN/vllm-bench" --model "$MODEL" \
       --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
@@ -225,9 +262,15 @@ if [ -n "$SCORE_LEG" ]; then
   mirror_out
   [ "$RC" = 0 ] || { cat "$D/leg.status"; tail -30 "$D/leg.log"; exit "$RC"; }
 
-  # THE FROZEN CONTROL. Without it this phase is N more DRAWS wearing the label
-  # of a replay: a leg that re-tuned measured a plan map nobody recorded, and its
-  # number would be attributed to the arm it was asked about.
+  # THE FROZEN CONTROL, ON TWO WITNESSES. Without it this phase is N more DRAWS
+  # wearing the label of a replay: a leg that re-tuned measured a plan map nobody
+  # recorded, and its number would be attributed to the arm it was asked about.
+  # `check-frozen` requires the runtime's own `tuned=0` AND zero
+  # `[VT_FP4_AUTOTUNE]` selection lines, which is why the leg runs with
+  # `VT_FP4_AUTOTUNE_VERBOSE=1` even though a frozen leg should print none.
+  # The arm is passed through as well: the tactic-set version is part of the
+  # cache metadata, so a map drawn under one arm and replayed under the other is
+  # rejected by `ParseNativeCache` rather than silently used.
   python3 "$SRC/tools/bench/gemm_tactic_draw_survey.py" check-frozen \
       --log "$D/leg.log" --expected-plans "$PLANS" || exit "$E_LEG_NOT_FROZEN"
 
@@ -255,7 +298,7 @@ PROV="$EV_LOCAL/PROVENANCE"
   echo "harness_sha256=$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')"
   echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
   echo "model=$MODEL"
-  echo "draws=$DRAWS score_reps=$SCORE_REPS concurrency=$CONCURRENCY"
+  echo "draws=$DRAWS score_reps=$SCORE_REPS concurrency=$CONCURRENCY tactic_set=$TACTIC_SET"
   echo "num_prompts=$NUM_PROMPTS input_len=$INPUT_LEN output_len=$OUTPUT_LEN seed=$SEED"
   echo "max_num_batched_tokens=$MAX_BATCHED"
   nvidia-smi --query-gpu=name,driver_version,persistence_mode,clocks.max.sm --format=csv,noheader 2>/dev/null
@@ -424,7 +467,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = draw ]; then
     ( cd "$SRC" && python3 "$SURVEY" draw --evidence "$EV_LOCAL" --bench "$BIN/vllm-bench" \
         --model "$MODEL" --draws 1 --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
         --output-len "$OUTPUT_LEN" --concurrency "$CONCURRENCY" --seed "$SEED" \
-        --max-num-batched-tokens "$MAX_BATCHED" )
+        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" )
     P=$?
     mirror_out
     [ "$P" = 0 ] || die "$E_PREFLIGHT" "the preflight draw did not produce usable instrument output (survey exit $P); nothing after this point could be trusted"
@@ -436,7 +479,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = draw ]; then
     ( cd "$SRC" && python3 "$SURVEY" draw --evidence "$EV_LOCAL" --bench "$BIN/vllm-bench" \
         --model "$MODEL" --draws "$DRAWS" --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
         --output-len "$OUTPUT_LEN" --concurrency "$CONCURRENCY" --seed "$SEED" \
-        --max-num-batched-tokens "$MAX_BATCHED" )
+        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" )
     G=$?
     mirror_out
     [ "$G" = 0 ] || die "$G" "the draw phase refused its own evidence (see draw-preconditions.json)"
@@ -467,7 +510,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = score ]; then
       $ARMS --legs-per-arm "$SCORE_REPS" \
       --metric total_token_throughput \
       --metric-regex 'Total token throughput \(tok/s\):\s+([0-9.]+)' \
-      --command "bash $SELF --score-leg {arm} --evidence $EV_SHARE --src '' --model $MODEL --local-root $LOCAL_ROOT --num-prompts $NUM_PROMPTS --input-len $INPUT_LEN --output-len $OUTPUT_LEN --concurrency $CONCURRENCY --seed $SEED --max-num-batched-tokens $MAX_BATCHED" \
+      --command "bash $SELF --score-leg {arm} --evidence $EV_SHARE --src '' --model $MODEL --local-root $LOCAL_ROOT --num-prompts $NUM_PROMPTS --input-len $INPUT_LEN --output-len $OUTPUT_LEN --concurrency $CONCURRENCY --seed $SEED --max-num-batched-tokens $MAX_BATCHED --tactic-set $TACTIC_SET" \
       > "$EV_LOCAL/score/leg-runner.log" 2>&1 )
   S=$?
   tail -40 "$EV_LOCAL/score/leg-runner.log"

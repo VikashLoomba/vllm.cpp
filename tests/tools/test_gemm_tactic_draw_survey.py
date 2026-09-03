@@ -35,6 +35,7 @@ import unittest
 
 from tools.bench.gemm_tactic_draw_survey import (
     EXIT_ALGO_KEYSET_DIFFERS,
+    EXIT_ARM_MIXED,
     EXIT_ALGO_NO_BF16,
     EXIT_ALGO_SILENT,
     EXIT_BINARY_DIFFERS,
@@ -52,10 +53,12 @@ from tools.bench.gemm_tactic_draw_survey import (
     kv_tokens,
     main,
     parse_algo_lines,
+    parse_autotune_lines,
     parse_bench_report,
     read_draw_records,
     reduce_evidence,
     select_shipping_draw,
+    selection_time_spread,
     speed_spread,
 )
 
@@ -136,17 +139,30 @@ class BenchReportTest(unittest.TestCase):
         # latter as the set {[,:,s,p,a,c,e}, which contains no space, so the
         # pattern matches NOTHING and every leg silently records VOID.
         import re
+        import warnings
 
         line = "Total token throughput (tok/s):            1840.00"
-        self.assertIsNone(
-            re.search(r"Total token throughput \(tok/s\):[[:space:]]+([0-9.]+)", line)
-        )
+        with warnings.catch_warnings():
+            # Python itself warns "possible nested set" on the broken pattern.
+            # That warning IS the defect; catching it keeps the suite's output
+            # clean without hiding the assertion below it.
+            warnings.simplefilter("ignore", FutureWarning)
+            self.assertIsNone(
+                re.search(r"Total token throughput \(tok/s\):[[:space:]]+([0-9.]+)", line)
+            )
         self.assertIsNotNone(
             re.search(r"Total token throughput \(tok/s\):\s+([0-9.]+)", line)
         )
 
 
-def _draw_record(label: str, *, tactic_offset: int = 0, algo_id: str = "21") -> dict:
+def _draw_record(
+    label: str,
+    *,
+    tactic_offset: int = 0,
+    algo_id: str = "21",
+    tactic_set: str = "full",
+    mean_us: float = 120.0,
+) -> dict:
     algo = {}
     for n in (3072, 2048):
         key = f"cublasLt|m=1 n={n} k=2048|a=bf16 b=bf16 c=bf16|rowmajor-NN"
@@ -156,9 +172,20 @@ def _draw_record(label: str, *, tactic_offset: int = 0, algo_id: str = "21") -> 
             "algoId": algo_id, "tile": "15", "stages": "4", "splitK": "1",
         }
     selected = {f"8,{n},2048": (n + tactic_offset) % 32 for n in (3072, 2048)}
+    autotune = {
+        "selections": {
+            key: {"tactic_id": tactic, "name": f"tactic_{tactic}",
+                  "mean_us": mean_us, "m": 8, "set": tactic_set}
+            for key, tactic in selected.items()
+        },
+        "sets": [tactic_set],
+        "repeat_selections": 0,
+    }
     return {
         "label": label,
         "rc": 0,
+        "tactic_set": tactic_set,
+        "autotune": autotune,
         "algo": algo,
         "fp4": {
             "prepared": {"metadata": "fp1", "mode": "read-write"},
@@ -395,10 +422,129 @@ class FrozenLegTest(unittest.TestCase):
         ok, _ = check_frozen_leg(self.OK.replace("loaded=64", "loaded=60"), 64)
         self.assertFalse(ok)
 
+    def test_a_leg_that_announced_a_selection_is_refused(self) -> None:
+        # The SECOND witness. `tuned=0` is the runtime's count; this is the
+        # tuner's own voice, and a control with one witness cannot be
+        # cross-checked.
+        text = self.OK + (
+            "\n[VT_FP4_AUTOTUNE] set=full M=8(bucket=8) N=3072 K=2048 device=0 "
+            "sm=121 delay_us=5000 -> id=17 t (123.4 us), workspace=0"
+        )
+        ok, why = check_frozen_leg(text, 64)
+        self.assertFalse(ok)
+        self.assertIn("announced", why)
+
     def test_a_leg_with_no_complete_line_is_refused(self) -> None:
         ok, why = check_frozen_leg("nothing ran", 64)
         self.assertFalse(ok)
         self.assertIn("did not run", why)
+
+
+class AutotuneSelectionParseTest(unittest.TestCase):
+    """The tuner's own selection line, which is a DIAGNOSTIC and not an axis."""
+
+    LINE = (
+        "[VT_FP4_AUTOTUNE] set=full M=8(bucket=8) N=3072 K=2048 device=0 sm=121 "
+        "delay_us=5000 -> id=17 sm121a_bf16_128x128 (123.4 us), workspace=4194304"
+    )
+
+    def test_reads_the_bucket_keyed_selection(self) -> None:
+        parsed = parse_autotune_lines(self.LINE)
+        self.assertEqual(parsed["sets"], ["full"])
+        entry = parsed["selections"]["8,3072,2048"]
+        self.assertEqual(entry["tactic_id"], 17)
+        self.assertEqual(entry["mean_us"], 123.4)
+
+    def test_the_key_joins_the_selected_plan_map(self) -> None:
+        # `[VT_FP4_CACHE] selected` prints plan.m_bucket under the name `M`, so
+        # the two maps must key identically or the diagnostic joins nothing.
+        record = _draw_record("draw00")
+        self.assertEqual(
+            set(record["autotune"]["selections"]), set(record["fp4"]["selected"])
+        )
+
+    def test_a_tactic_name_with_spaces_is_read_whole(self) -> None:
+        line = self.LINE.replace("sm121a_bf16_128x128", "baseline tactic name")
+        entry = parse_autotune_lines(line)["selections"]["8,3072,2048"]
+        self.assertEqual(entry["name"], "baseline tactic name")
+        self.assertEqual(entry["mean_us"], 123.4)
+
+    def test_a_log_prefix_does_not_hide_the_line(self) -> None:
+        parsed = parse_autotune_lines("\x1b[0m2026-09-03Z pod | " + self.LINE)
+        self.assertEqual(len(parsed["selections"]), 1)
+
+    def test_a_repeated_key_is_counted_and_the_first_is_kept(self) -> None:
+        # A key tuned twice is a lazy miss after the pre-serve warmup. The two
+        # readings must DIFFER for this to discriminate: two identical lines
+        # cannot tell "keep the first" from "keep the last", which is a test
+        # that asserts nothing.
+        second = self.LINE.replace("id=17", "id=29").replace("123.4", "456.7")
+        parsed = parse_autotune_lines(self.LINE + "\n" + second)
+        self.assertEqual(parsed["repeat_selections"], 1)
+        self.assertEqual(len(parsed["selections"]), 1)
+        entry = parsed["selections"]["8,3072,2048"]
+        self.assertEqual(entry["tactic_id"], 17)
+        self.assertEqual(entry["mean_us"], 123.4)
+
+    def test_the_w1_arm_is_reported_under_its_own_name(self) -> None:
+        parsed = parse_autotune_lines(self.LINE.replace("set=full", "set=w1"))
+        self.assertEqual(parsed["sets"], ["w1"])
+
+
+class SelectionTimeDiagnosticTest(unittest.TestCase):
+    def draws(self, *means: float) -> dict:
+        return {
+            f"draw{i:02d}": _draw_record(f"draw{i:02d}", mean_us=mean)["autotune"]["selections"]
+            for i, mean in enumerate(means)
+        }
+
+    def test_it_reports_a_state_and_never_a_verdict(self) -> None:
+        # STRUCTURAL GUARD. `select_shipping_draw` reads `verdict`; this block
+        # deliberately has none, so a selection-time result cannot be handed to
+        # the shipping rule and be mistaken for an end-to-end one.
+        result = selection_time_spread(self.draws(120.0, 130.0))
+        self.assertNotIn("verdict", result)
+        self.assertEqual(result["state"], "DIAGNOSTIC")
+        self.assertIsNone(select_shipping_draw(result, ["draw00", "draw01"])["ship"])
+
+    def test_it_carries_the_reason_it_cannot_gate(self) -> None:
+        result = selection_time_spread(self.draws(120.0, 130.0))
+        self.assertIn("per-iteration", result["not_a_gate"])
+
+    def test_it_reports_the_per_key_ratio_and_the_distinct_ids(self) -> None:
+        result = selection_time_spread(self.draws(100.0, 110.0))
+        self.assertAlmostEqual(result["max_over_min_max"], 1.1)
+        self.assertEqual(result["keys"], 2)
+
+    def test_one_draw_is_incomparable(self) -> None:
+        self.assertEqual(selection_time_spread(self.draws(120.0))["state"], "INCOMPARABLE")
+
+
+class TacticSetArmTest(unittest.TestCase):
+    def test_one_root_may_not_hold_two_arms(self) -> None:
+        # The arms select by different rules: 32 candidates by pure argmin
+        # versus 4 behind a >1% stickiness damper. A pooled spread names no rule.
+        records = [
+            _draw_record("draw00", tactic_set="full"),
+            _draw_record("draw01", tactic_set="w1", tactic_offset=7),
+        ]
+        code, problems = check_draw_preconditions(records)
+        self.assertEqual(code, EXIT_ARM_MIXED)
+        self.assertIn("DIFFERENT RULES", problems[0])
+
+    def test_a_record_without_an_arm_is_refused(self) -> None:
+        # An unset VT_FP4_FULL_TACTICS is default-ON, so a draw whose arm was
+        # never recorded is a draw nobody can attribute afterwards.
+        records = [_draw_record("draw00"), _draw_record("draw01", tactic_offset=7)]
+        records[1].pop("tactic_set")
+        self.assertEqual(check_draw_preconditions(records)[0], EXIT_ARM_MIXED)
+
+    def test_a_single_arm_root_passes(self) -> None:
+        records = [
+            _draw_record("draw00", tactic_set="w1"),
+            _draw_record("draw01", tactic_set="w1", tactic_offset=7),
+        ]
+        self.assertEqual(check_draw_preconditions(records)[0], EXIT_OK)
 
 
 class DryRunEndToEndTest(unittest.TestCase):
@@ -434,6 +580,8 @@ class DryRunEndToEndTest(unittest.TestCase):
             # The fixture must never be mistakable for a measurement.
             self.assertTrue(report["dry_run"])
             self.assertEqual(report["issue_2750_draw_processes"]["verdict"], "STABLE")
+            self.assertEqual(report["tactic_set"], ["full"])
+            self.assertEqual(report["issue_2751_selection_time"]["state"], "DIAGNOSTIC")
             self.assertEqual(report["issue_2751_speed"]["verdict"], "NOT RUN")
             self.assertIsNone(report["issue_2752"]["ship"])
             self.assertEqual(report["clock_windows"]["state"], "ABSENT")

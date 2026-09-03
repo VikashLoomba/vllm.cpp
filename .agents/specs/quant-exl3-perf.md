@@ -158,6 +158,18 @@ equivalent on this checkpoint: the old predicate returned false one test EARLIER
 than the mode test does, and neither reaches a device call. Both fall through to
 `exl3_gemm_kernel` with identical arguments.
 
+## Which tree the device evidence is measured on
+
+The lease job is pinned to the source tarball `sha256
+c133a4cbba670dbef6c6daebf4c0e130824519f317af221eaff7ebb1e9e9c5dd`, which is
+commit `665167c4a` of `row/QUANT-EXL3-PERF`. Every compiled and tested path --
+`src/`, `include/`, `tests/vt/`, `cmake/`, `CMakeLists.txt` -- is byte-identical
+between that commit and this row's head; only `docs/USAGE.md` moved afterwards.
+
+Named here because an evidence table must say which tree produced it, and
+because the tarball sha is the only identifier the job can verify on the box:
+it aborts rather than build a tree it was not pinned to.
+
 ## Scope
 
 **In scope, slice A:** instantiate the GEMV at `(bits = 3, cb = 2)`; extend the

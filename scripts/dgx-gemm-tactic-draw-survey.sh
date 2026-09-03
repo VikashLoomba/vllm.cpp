@@ -99,6 +99,16 @@
 # run's resolved value, not a default.
 #
 # USAGE
+# Submitted as one `rc` job, never inlined into `rc run --` beyond the `bash`
+# call, because a detaching client kills the job:
+#
+#   rc run -d dgx:gpu0 --max-runtime 300m --idle-timeout 30m \
+#     -- bash /workspace/gemm-draw-survey/run.sh
+#
+# where `run.sh` is a two-line staged wrapper that unpacks the source into /tmp
+# and calls this file. The heartbeat below is what keeps `--idle-timeout` from
+# firing during the silent build and load phases.
+#
 #   bash scripts/dgx-gemm-tactic-draw-survey.sh \
 #        --evidence /workspace/gemm-draw-survey/<stamp> \
 #        --src /workspace/gemm-draw-survey/src.tar.gz \
@@ -288,6 +298,25 @@ if [ -n "$SCORE_LEG" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# THE HEARTBEAT, AND IT IS NOT OPTIONAL ON THIS FLEET.
+# `rc run --idle-timeout` is OUTPUT-based, and `--idle-timeout 0` selects the
+# DEVICE DEFAULT rather than disabling the kill, so the heartbeat is the remedy
+# and the flag is not (`scripts/rc-sglang-oracle-lease.sh:88-92`, which is where
+# this shape comes from). Every long phase of this driver is SILENT on stdout:
+# `cmake` and `ninja` write to log files, a model load prints nothing here, and
+# one draw is minutes of tuning. Without this loop the job is killed mid-build
+# and the lease buys nothing.
+#
+# Started only on the driver path. A scoring leg runs INSIDE this job, so a leg
+# that started its own would double the output and outlive the leg.
+( while true; do
+    sleep 60
+    echo "### hb +$(( $(date +%s) - T0 ))s tmp_free=$(df -Pm /tmp 2>/dev/null | awk 'NR==2{print $4}')M"
+  done ) &
+HB=$!
+cleanup_hb() { kill "$HB" 2>/dev/null; wait "$HB" 2>/dev/null; }
+trap cleanup_hb EXIT INT TERM
+
 mkdir -p "$EV_LOCAL" "$BIN"
 mirror_in
 mkdir -p "$PHASEDIR"

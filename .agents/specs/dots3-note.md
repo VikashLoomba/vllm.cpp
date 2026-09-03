@@ -5574,7 +5574,7 @@ that reports it; none is inherited.
 
 | Target | Cases | Assertions |
 |---|---|---|
-| `test_dots3_note_audio` | 13 / 13 passed | 1976 / 1976 |
+| `test_dots3_note_audio` | 13 / 13 passed | 1980 / 1980 |
 | `test_openai_api_server_dots3_mm_forward` | 23 / 23 passed | 287 / 287 |
 | `test_dots3_note_vision` | 13 / 13 passed | 21343 / 21343 |
 | `test_dots3_note_scaffold` | 26 / 26 passed | 110835 / 110835 |
@@ -5726,7 +5726,7 @@ source-text edit against an UNREBUILT binary. The injected reach is the same
 `vt::Scale(vllm::kMelFloor)` in all three reaching rows; only what brackets it
 changes.
 
-| # | Injected into `ref_front`, one line, at the same point | Unfixed `49cd8fb95403aff3…` | Fixed `8081852cbd8aecd4…` |
+| # | Injected into `ref_front`, one line, at the same point | Unfixed `49cd8fb95403aff3…` | Fixed `8856bcf28d6e9070…` |
 |---|---|---|---|
 | M-A1 | the reach, bare | **RED**, 3 axes: `std,vllm,vt != std`, `13 != 11`, `73 != 71` | **RED**, the same 3 axes |
 | M-A2 | the same tokens inside a `//` COMMENT | GREEN, 11 / 71, `std` | GREEN, 11 / 71, `std` |
@@ -5751,7 +5751,24 @@ it — the file carries no digit separator outside a comment, and M-A1 shows a
 naive reach is caught — but a later edit that wrote `16'000` and `1'280` into a
 reference with a helper call between them would have reopened it in silence, and
 on this row that property IS the correctness argument, because there is no
-oracle.
+oracle. The intermediate binary carrying the fix WITHOUT the standing
+assertions below, `8081852cbd8aecd4…`, produced the same four rows.
+
+**AND THE FIX HAS A STANDING GATE, not only a mutation.** A source mutation
+proves the hole once; it does not stop the next rewrite of the stripper from
+reopening it, and nothing on a clean tree can, because the whole point of the
+repair is that the counts do NOT move. So the enumeration case now calls
+`StripCommentsAndLiterals` directly on four strings: the bracketed reach
+`16'000.0 * vt::Scale(vllm::kOne) / 1'280.0`, whose two qualified names must
+SURVIVE; a prefixed `u8'v'`, whose body must NOT; and a `//` comment carrying
+both a `vt::` token and a separator, which must go whole. RED FIRST, with the
+assertions in place and the pp-number rule reverted: binary
+`f440d09b4dee9919…`, that case **0 passed / 1 failed, 18 of 20 assertions**,
+both `find` CHECKs red and the prefix and comment CHECKs green. GREEN after,
+binary `8856bcf28d6e9070…`: **13/13, 1980/1980**. The source was restored
+byte-for-byte between the two, and the restored tree rebuilt to the same
+`8856bcf28d6e9070…`. Those four assertions are why the suite reads 1980 at this
+head where §4.14.11's table records the 1976 it measured at ITS tree.
 
 **THE BUILD-FAILURE TRAP, IN ITS SHARPEST CONCRETE FORM.** §4.14.11 already
 records that mutation A's first form died on `-Werror`. The review produced the

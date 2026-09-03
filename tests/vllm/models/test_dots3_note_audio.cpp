@@ -603,6 +603,27 @@ TEST_CASE("dots3-note W7a: the two references share no helper with src/, by enum
   CHECK(front.occurrences == ref_front::kQualifiedNameOccurrences);
   CHECK(tower.distinct == ref_tower::kDistinctQualifiedNames);
   CHECK(tower.occurrences == ref_tower::kQualifiedNameOccurrences);
+
+  // AND THE STRIPPER ITSELF, because the property above is only as true as the
+  // scan that measures it. `StripCommentsAndLiterals` used to treat every `'`
+  // as a char-literal delimiter, so two C++14 digit separators bracketing a
+  // `vt::` call hid that call and this case read GREEN with a live reach
+  // inside a reference. Nothing above can see that: the clean file carries no
+  // separator, so the counts do not move either way. These four are the only
+  // standing gate on the pp-number rule.
+  const std::string bracketed =
+      "double g = 16'000.0 * vt::Scale(vllm::kOne) / 1'280.0;";
+  CHECK(StripCommentsAndLiterals(bracketed).find("vt::Scale") !=
+        std::string::npos);
+  CHECK(StripCommentsAndLiterals(bracketed).find("vllm::kOne") !=
+        std::string::npos);
+  // A PREFIXED char literal is still a literal, which is what the shorter
+  // "ignore a `'` whose previous character is alphanumeric" rule would break.
+  CHECK(StripCommentsAndLiterals("u8'v' L't' 'x'").find('v') ==
+        std::string::npos);
+  // And a comment is still removed whole, separator or not.
+  CHECK(StripCommentsAndLiterals("// vt::Scale 16'000\nint a = 1;")
+            .find("vt::") == std::string::npos);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

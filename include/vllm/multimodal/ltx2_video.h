@@ -661,6 +661,18 @@ struct Ltx2ConditioningTrace {
   // `.agents/specs/ltx25-a24-text-tower-bf16.md` under `## Owed`.
   int64_t tower_video_not_bf16 = 0, tower_audio_not_bf16 = 0;
   int64_t tower_video_values = 0, tower_audio_values = 0;
+  // AND THE SAME COUNT AFTER THE CONNECTOR, which is what stops the four above
+  // from being vacuous. "Zero values wider than bf16" is a property a stream can
+  // also have for uninteresting reasons — all zeros, all small integers, a
+  // fixture whose numbers happen to land on bf16 grid points — and a gate that
+  // reads zero for one of THOSE reasons measures nothing. The connector is A24's
+  // second wave and computes in f32 on the very buffers the tower just handed it,
+  // in the same render, so it is a LIVE f32 arm on this fixture; if the fixture
+  // ever stopped being able to express sub-bf16 detail these would collapse to
+  // zero too, and the test that asserts they do not reds instead of passing.
+  // Zero when the request carried no prompt, or when the model has no connector.
+  int64_t connector_video_not_bf16 = 0, connector_audio_not_bf16 = 0;
+  int64_t connector_video_values = 0, connector_audio_values = 0;
   // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
   //
   // Zero everywhere when the request carried no image. `image_tokens` is how

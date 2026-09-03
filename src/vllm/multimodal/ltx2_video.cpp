@@ -2739,6 +2739,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       connector_phase.Close();
       prompt_video = through.video;
       prompt_audio = through.audio;
+      // The f32 population the tower counters are measured against — see
+      // `Ltx2ConditioningTrace::connector_video_not_bf16`. Same fixture, same
+      // render, same buffers, one wave later.
+      im.trace.connector_video_not_bf16 = CountWiderThanBf16(prompt_video);
+      im.trace.connector_audio_not_bf16 = CountWiderThanBf16(prompt_audio);
+      im.trace.connector_video_values = static_cast<int64_t>(prompt_video.size());
+      im.trace.connector_audio_values = static_cast<int64_t>(prompt_audio.size());
     }
     video_context = prompt_video.data();
     audio_context = prompt_audio.data();

@@ -694,7 +694,11 @@ Ltx2TextFeatures Ltx2TextFeatureExtractorForward(const Ltx2TextHiddenStates& sta
 
   // The text tower is host-only by construction, so the projection's queue is the
   // CPU one, which is what every caller of `Ltx2EncodePromptToConditioning`
-  // already builds for the tower itself (ltx2_video.cpp:2085, :2799, :4479).
+  // already builds for the tower itself:
+  // `grep -c 'vt::Queue text_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};'
+  //  src/vllm/multimodal/ltx2_video.cpp` reports 3, one per call site. The three
+  // line numbers this comment used to carry (:2085, :2799, :4479) were stale by
+  // hundreds of lines, so it cites the string and its count instead.
   vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 
   Ltx2TextFeatures features;

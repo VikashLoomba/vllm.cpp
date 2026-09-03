@@ -673,9 +673,11 @@ class _StableRsqrt:
 
     So each bf16 golden below is emitted TWICE. The module's own output is the
     oracle and is compared loosely. This variant — upstream's SAME module, with
-    exactly one non-deterministic kernel replaced by the value its own vectorized
-    path computes — is what the port is held to BIT-EXACTLY, so nothing about our
-    arithmetic is left on a tolerance.
+    exactly one non-deterministic kernel replaced by the CORRECTLY ROUNDED value,
+    `bf16(1.0 / sqrt(f32(x)))` — is what the port is held to BIT-EXACTLY, so
+    nothing about our arithmetic is left on a tolerance. That is deliberately not
+    "the value the vectorized path computes": the two agree on all but 6 of the
+    32639 finite positive bf16 values, so the phrasings are not interchangeable.
 
     Nothing else is patched, and `torch.rsqrt` is restored on the way out.
     """
@@ -707,6 +709,28 @@ def build_bf16(builder):
     """
     fx = builder()
     return fx.to(torch.bfloat16)
+
+
+def _bf16_eps_separating_bits() -> list[int]:
+    """The bf16 inputs at which the V2 norm CAN see the epsilon's width.
+
+    A constant slice of `GEMMA_HIDDEN` copies of one bf16 value `x` has variance
+    `bf16(x*x)`, so the whole norm collapses to a function of `x` alone and the
+    domain is sweepable exhaustively. This returns the finite non-negative bf16
+    values at which `x * rsqrt(var + bf16(1e-6))` and `x * rsqrt(var + f32(1e-6))`
+    disagree in bits — the only inputs on which a port that fails to narrow the
+    epsilon is observably wrong. `rsqrt` here is the correctly rounded one, for
+    the reason `_StableRsqrt` gives.
+    """
+    bits = torch.arange(0, 0x7F80, dtype=torch.int32).to(torch.uint16)
+    x = bits.view(torch.bfloat16)
+    var = torch.mean((x * x).unsqueeze(1).expand(-1, GEMMA_HIDDEN), dim=1)
+    def normed(ve: torch.Tensor) -> torch.Tensor:
+        inv = (1.0 / torch.sqrt(ve.to(torch.float32))).to(torch.bfloat16)
+        return (x * inv).view(torch.uint16)
+    narrowed = normed(var + 1e-6)
+    f32_scalar = normed((var.to(torch.float32) + 1e-6).to(torch.bfloat16))
+    return [int(b) for b in bits[narrowed != f32_scalar].tolist()]
 
 
 def emit_bf16_arm(out) -> None:
@@ -822,6 +846,61 @@ def emit_bf16_arm(out) -> None:
         alt = torch.where(mask_right().bool().unsqueeze(-1), alt, torch.zeros_like(alt))
         emit_u16(out, f"kLtxTeBf16NormV2TinyVariance{label}", alt)
     del tiny_f
+
+    # AND THE PROBE THAT SEPARATES THE TWO EPSILON WIDTHS, which the tiny-variance
+    # input above does NOT. `2**-10` discriminates against a DROPPED epsilon and
+    # against a 100x one, and it reads the same under `bf16(1e-6)` and under the
+    # un-narrowed `1e-6` — so the arm's own constant could be widened to the f32
+    # literal and every case above would stay green. The port's obligation is to
+    # add the value upstream adds, and this is the input on which that is visible.
+    #
+    # MEASURED at the pin over the whole bf16 domain: exactly 140 of the 32640
+    # finite non-negative bf16 values, all inside [0x384a, 0x3b25], make
+    # `x * rsqrt(var + bf16(1e-6))` differ from `x * rsqrt(var + f32(1e-6))` for a
+    # constant-D slice. Forty of them go in below, one per (b, t, layer) slice, so
+    # every slice's variance is a separating one and the two hypotheses part on
+    # every unmasked output rather than on a lucky few.
+    #
+    # Each slice is CONSTANT over d, so upstream's two rsqrt paths see one value
+    # per slice and this case is held BIT-EXACT, exactly as the tiny-variance and
+    # zero-variance cases are.
+    eps_probe_bits = _bf16_eps_separating_bits()[: BATCH * SEQ * NUM_LAYERS]
+    if len(eps_probe_bits) < BATCH * SEQ * NUM_LAYERS:
+        raise SystemExit(
+            "fewer than B*T*L bf16 values now separate bf16(1e-6) from f32(1e-6) "
+            "in the V2 norm; the epsilon's width is no longer gateable by this "
+            "probe, so pick a new one rather than emitting a golden that cannot fail"
+        )
+    eps_probe = (
+        torch.tensor(eps_probe_bits, dtype=torch.uint16)
+        .view(torch.bfloat16)
+        .reshape(BATCH, SEQ, 1, NUM_LAYERS)
+        .expand(BATCH, SEQ, GEMMA_HIDDEN, NUM_LAYERS)
+        .contiguous()
+    )
+    eps_probe_out = norm_and_concat_per_token_rms(eps_probe, mask_right())
+    emit_u16(out, "kLtxTeBf16NormV2EpsProbeIn", eps_probe)
+    emit_u16(out, "kLtxTeBf16NormV2EpsProbe", eps_probe_out)
+    # THE REJECTED HYPOTHESIS on that same input: upstream's own body with the one
+    # change of adding the epsilon at f32 instead of letting torch narrow it.
+    # Emitted so the C++ side asserts the probe discriminates instead of assuming
+    # it does, and so a port that widens the constant reds against a MEASURED
+    # alternative rather than against an argument.
+    eps_var = torch.mean(eps_probe**2, dim=2, keepdim=True)
+    eps_rejected = eps_probe * torch.rsqrt(
+        (eps_var.to(torch.float32) + 1e-6).to(torch.bfloat16)
+    )
+    eps_rejected = eps_rejected.reshape(BATCH, SEQ, GEMMA_HIDDEN * NUM_LAYERS)
+    eps_rejected = torch.where(
+        mask_right().bool().unsqueeze(-1), eps_rejected, torch.zeros_like(eps_rejected)
+    )
+    if torch.equal(eps_probe_out.view(torch.uint16), eps_rejected.view(torch.uint16)):
+        raise SystemExit(
+            "the V2 epsilon probe no longer separates the bf16-narrowed epsilon "
+            "from the f32 one; pick new probe values rather than emitting a "
+            "golden that cannot fail"
+        )
+    emit_u16(out, "kLtxTeBf16NormV2EpsProbeF32Scalar", eps_rejected)
 
     # THE RESCALE, AND WHY IT IS PROBED ON A NON-TRIVIAL VECTOR.
     #

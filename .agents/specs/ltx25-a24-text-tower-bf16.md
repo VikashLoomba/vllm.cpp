@@ -62,7 +62,13 @@ It is reached twice:
 * `:409`, the first statement of `Ltx2TextFeatureExtractorForward` (`:404`);
 * `:546`, the first statement of `Ltx2TextEncoderConditioning` (`:541`), which
   `Ltx2EncodePromptToConditioning` calls at `:1196`, which `ltx2_video.cpp` calls
-  at `:2683`, `:3424` and `:5983`.
+  from **three** sites. CITED AS A STRING, NOT A LINE NUMBER: this row's own edits
+  moved these anchors twice inside one pull request before the citation was
+  changed, which is the third recorded drift of the same three numbers.
+  `grep -c '= Ltx2EncodePromptToConditioning(' src/vllm/multimodal/ltx2_video.cpp`
+  reports exactly 3, and that count is what §1's "reached from a production entry
+  point" rests on. (For a reader who wants them: `:2703`, `:3458` and `:6017` at
+  this row's landing head — a number that will be wrong again by the next merge.)
 
 That third row is a production entry point on the render path, not a test.
 
@@ -228,7 +234,153 @@ reference arm the goldens are measured against.
 the struct bf16 here would change a component this row excludes. So the tower
 computes in bf16 and materializes bf16 VALUES in an f32 container at the seam —
 which §6.4's assertion turns into the row's strongest gate rather than a soft
-spot — and the container is listed under `## Outcome
+spot — and the container is listed under `## Owed` against the connector wave.
+
+## 6. Tests
+
+### 6.1 RED FIRST, through a production entry point
+
+`Ltx2EncodePromptToConditioning` is the tower entry point the render calls, and
+the existing suite already reaches it with a fixture tower. The new cases enter
+there, with bf16 projections. Before the implementation they red on
+`RequireF32`'s own message.
+
+No case constructs the extractor by hand to prove the class works.
+
+### 6.2 The goldens come from upstream RUN IN BF16
+
+`scripts/gen-ltx2-text-goldens.py` already imports the oracle by path, asserts its
+identity, and executes it on CPU at reduced dimensions. It gains a bf16 section
+that runs the SAME `FeatureExtractorV1` / `FeatureExtractorV2` modules, cast with
+`.to(torch.bfloat16)`, on bf16 inputs — every parameter, tolerance and failure
+case of the f32 section preserved, one dtype changed. No GPU, no checkpoint.
+
+The section also emits the four §4 discriminators as goldens in their own right:
+the V1 norm's output dtype, the bf16-rounded epsilon, the bf16 rescale factor,
+and the bf16-squares variance.
+
+### 6.3 The value gate
+
+Bit-exactness is attempted first and used where it holds, because it is free and
+strictly stronger. Where the GEMM's K-reduction order prevents it, the bound is
+bf16 unit roundoff (`2^-8` relative) against the golden's own magnitude —
+derived from the format, not fitted to the result. Any case that needs the looser
+bound records its measured margin beside it.
+
+### 6.3b The epsilon's WIDTH, which the value goldens cannot see
+
+`kLtx2TextNormEpsBf16` is a claimed guarantee, and a golden built on an
+ordinary or a degenerate variance cannot hold it: at bf16 the epsilon is eight
+orders below the format's resolution, so on almost every input `var + bf16(eps)`
+and `var + f32(eps)` narrow to the same bits. The generator therefore sweeps the
+whole bf16 domain for the values at which they do NOT — 140 of 32640 at the pin,
+all inside `[0x384a, 0x3b25]` — lays one per `(b, t, layer)` slice, and emits
+upstream's answer beside the REJECTED f32-scalar one. It refuses to emit the
+probe at all if the two ever stop parting. The suite holds the port bit-exact to
+the first and asserts the second differs, in the same shape the rescale probe
+already uses.
+
+### 6.4 The DTYPE gate, which is the one that cannot be faked
+
+A token gate cannot see a dtype that is too wide, so the row is gated on the
+memory format directly:
+
+1. **The weights.** On one synthetic checkpoint, `Ltx2TextProjectionsAsBf16` and
+   `Ltx2WidenTextProjectionsToF32` are both materialized and their byte counts
+   compared: the bf16 arm must be EXACTLY half, and its f32 storage must be
+   empty. Measured on the same input, so no number is quoted.
+2. **The intermediates.** `sizeof(value_type) == 2` and the byte count of each
+   full-width buffer, against the f32 arm's on the same shapes.
+3. **The output, and this is the assertion an f32 path cannot pass.** Every float
+   `Ltx2EncodePromptToConditioning` returns under bf16 weights must satisfy
+   `BF16ToF32(F32ToBF16(v)) == v` — it must survive a bf16 round trip unchanged.
+   An f32 path fails this on essentially every value, which the same case asserts
+   in the other direction so the gate is proven to discriminate rather than
+   assumed to.
+
+(3) is what makes the goldens meaningful. A golden alone passes in both arms.
+
+### 6.5 The mutation a fresh reviewer applies
+
+* Delete `ltx2_video.cpp:1789`'s `Ltx2TextProjectionsAsBf16` call and restore the
+  widening call. The loader case must red.
+* Change the bf16 epsilon from `bf16(1e-6)` to `1e-6`. The V2 case "an input
+  on which the epsilon's own WIDTH is visible" must red. Its probe is the one
+  §4.3's value goldens are NOT: the tiny-variance and zero-variance inputs
+  discriminate against a dropped epsilon and a 100x one and read identically
+  under the two widths, and the transcription check on `kLtx2TextNormV2Eps`
+  compares one constant against another without reaching the arithmetic. Only
+  the 140 swept values on which the two narrowings part can red this.
+* Square in f32 instead of rounding to bf16 first. §4.2's golden must red.
+* Add the Linear's bias after the narrowing instead of before. §4.5 must red.
+* Delete the round-trip assertion in §6.4(3) and run the bf16 cases against the
+  f32 arm. The value goldens alone must NOT be enough to red it — that is the
+  measurement that proves (3) is load-bearing.
+
+## 7. Risks
+
+* **The Gemma tower still materializes f32 hidden states.**
+  `Gemma4Model::ForwardHiddenStates` returns `std::vector<std::vector<float>>`,
+  and `Ltx2TextHiddenStates` holds `const float*`. This row narrows them at the
+  stack, which is where upstream's own tensor is already bf16, so the arithmetic
+  mirrors. What it does NOT do is stop the tower from holding 49 f32 states. That
+  is `gemma4.*`, not `ltx2_text_encoder.*`, and it is owed.
+* **bf16 is lossy and this row makes the render less precise than it was.** That
+  is the point: upstream's answer is the bf16 one, and an f32 answer that is
+  "better" is a divergence. The f32 arm remains reachable and gated.
+* **A K = 188160 reduction in f32 accumulation.** Unchanged by this row — the
+  accumulator width is the same as the f32 arm's, only the operands narrow — but
+  it is the reason the bf16 GEMM keeps an f32 output tensor rather than
+  accumulating in bf16.
+
+## 8. Gates
+
+```sh
+# G1 — the refusal count, before and after. It NARROWS; it must not vanish.
+grep -n "compute_dtype must be" src/vllm/model_executor/models/ltx2_text_encoder.cpp
+
+# G2 — the render path selects the bf16 arm, and there is exactly one selector.
+grep -n "Ltx2TextProjectionsAsBf16\|Ltx2WidenTextProjectionsToF32" \
+  src/vllm/multimodal/ltx2_video.cpp
+
+# G3 — the goldens are upstream's, regenerated at the pin.
+python3 scripts/gen-ltx2-text-goldens.py --ltx2 ~/_git/LTX-2 \
+  --out tests/vllm/models/ltx2_text_goldens.inc && git diff --stat
+
+# G4 — the focused suite, both arms.
+ctest --test-dir build -R ltx2_text --output-on-failure
+
+# G5 — the full gate.
+scripts/agent-preflight.sh --staged
+python3 scripts/check-pr-size.py --base origin/main --head HEAD
+```
+
+## 9. Evidence
+
+1. The dtype probes of §4, run against `fd4ded7f` with torch 2.11.0+cu130 on
+   CPU. Recorded in `## Outcome` with their literal output.
+2. The regenerated `ltx2_text_goldens.inc`, whose header carries the upstream
+   revision the generator read from git.
+3. The measured byte counts of §6.4(1), printed by the case itself.
+
+## 10. A contradiction found in the parent scope document
+
+`.agents/specs/ltx25-completion-scope.md` §A.7 gives the render-path call sites
+of `Ltx2EncodePromptToConditioning` as `ltx2_video.cpp:2501`, `:3241` and `:5798`.
+The COUNT and the file are right and the row's conclusion is unaffected; the line
+numbers drifted after the scope document was written. That document is
+operator-owned, so this row records the drift here rather than editing it.
+
+And then this row drifted its own replacement, twice: it first wrote `:2683`,
+`:3424` and `:5983` — the SECOND line of each call, read at base `4d10c8acc` where
+the calls begin at `:2682`, `:3423` and `:5982` — and its own later commits moved
+them again, to `:2703`, `:3458` and `:6017`. Three drifts of the same three
+numbers inside one row is the argument, so §3 and the suite now cite the call
+STRING and its count instead, which no edit above them can move. This is the
+"recorded line anchors go stale" failure, and it is why §2 and §3 above were
+re-read at this head.
+
+## Outcome
 
 Everything below was measured on this branch, not predicted by §4.
 
@@ -259,17 +411,23 @@ to 10/80.
 
 ### A fifth fact, which changed the gate's shape
 
-**`torch.rsqrt` on bf16 is not a function of its input.** The same value gives
-`0x4065` in a length-1 tensor and `0x4066` in a length-1000 one, because the
-vectorized body and the scalar tail round differently. `0x4066` is the correctly
-rounded answer and is what this port computes.
+**`torch.rsqrt` on bf16 is not a function of its input**, and not marginally so.
+The same value gives `0x4065` in a length-1 tensor and `0x4066` in a length-1000
+one, because the vectorized body and the scalar tail round differently — and that
+is not one unlucky value: swept at the pin, **9027 of the 32639 finite positive
+bf16 values** read differently in a length-1 tensor than in the vectorized one.
+`0x4066` is the correctly rounded answer and is what this port computes.
 
 No implementation can be bit-equal to a kernel that is not bit-equal to itself,
 and chasing one would fit this machine's SIMD width rather than upstream's
 arithmetic. So each bf16 golden is emitted TWICE: once from the module, and once
-from the module with `torch.rsqrt` replaced by the value its own vectorized path
-computes. The port is held **bit-exact** to the second — no tolerance sits under
-this port's arithmetic — and its distance to the first is reported.
+from the module with `torch.rsqrt` replaced by the CORRECTLY ROUNDED value,
+`bf16(1.0 / sqrt(f32(x)))`. That is not the same statement as "the value its own
+vectorized path computes", which an earlier draft of this section made: the two
+agree on all but 6 of the 32639 values, and the six are exactly where the
+phrasing would have been wrong. The port is held **bit-exact** to the correctly
+rounded oracle — no tolerance sits under this port's arithmetic — and its
+distance to the unpatched module is reported.
 
 §6.3 planned "bit-exact where it holds, bf16 unit roundoff otherwise". What
 landed is better: bit-exact everywhere against a stable oracle, plus a reported
@@ -329,126 +487,6 @@ Measuring after it reports **16384 of 16384** wider than bf16 even on a bf16
 tower, because `Ltx2ConnectorForward` is A24 wave 2 and still computes in f32.
 That was measured, not assumed, and it is the sharpest available statement of
 what this row does and does not deliver.
-
-## Owed` against the connector wave.
-
-## 6. Tests
-
-### 6.1 RED FIRST, through a production entry point
-
-`Ltx2EncodePromptToConditioning` is the tower entry point the render calls, and
-the existing suite already reaches it with a fixture tower. The new cases enter
-there, with bf16 projections. Before the implementation they red on
-`RequireF32`'s own message.
-
-No case constructs the extractor by hand to prove the class works.
-
-### 6.2 The goldens come from upstream RUN IN BF16
-
-`scripts/gen-ltx2-text-goldens.py` already imports the oracle by path, asserts its
-identity, and executes it on CPU at reduced dimensions. It gains a bf16 section
-that runs the SAME `FeatureExtractorV1` / `FeatureExtractorV2` modules, cast with
-`.to(torch.bfloat16)`, on bf16 inputs — every parameter, tolerance and failure
-case of the f32 section preserved, one dtype changed. No GPU, no checkpoint.
-
-The section also emits the four §4 discriminators as goldens in their own right:
-the V1 norm's output dtype, the bf16-rounded epsilon, the bf16 rescale factor,
-and the bf16-squares variance.
-
-### 6.3 The value gate
-
-Bit-exactness is attempted first and used where it holds, because it is free and
-strictly stronger. Where the GEMM's K-reduction order prevents it, the bound is
-bf16 unit roundoff (`2^-8` relative) against the golden's own magnitude —
-derived from the format, not fitted to the result. Any case that needs the looser
-bound records its measured margin beside it.
-
-### 6.4 The DTYPE gate, which is the one that cannot be faked
-
-A token gate cannot see a dtype that is too wide, so the row is gated on the
-memory format directly:
-
-1. **The weights.** On one synthetic checkpoint, `Ltx2TextProjectionsAsBf16` and
-   `Ltx2WidenTextProjectionsToF32` are both materialized and their byte counts
-   compared: the bf16 arm must be EXACTLY half, and its f32 storage must be
-   empty. Measured on the same input, so no number is quoted.
-2. **The intermediates.** `sizeof(value_type) == 2` and the byte count of each
-   full-width buffer, against the f32 arm's on the same shapes.
-3. **The output, and this is the assertion an f32 path cannot pass.** Every float
-   `Ltx2EncodePromptToConditioning` returns under bf16 weights must satisfy
-   `BF16ToF32(F32ToBF16(v)) == v` — it must survive a bf16 round trip unchanged.
-   An f32 path fails this on essentially every value, which the same case asserts
-   in the other direction so the gate is proven to discriminate rather than
-   assumed to.
-
-(3) is what makes the goldens meaningful. A golden alone passes in both arms.
-
-### 6.5 The mutation a fresh reviewer applies
-
-* Delete `ltx2_video.cpp:1789`'s `Ltx2TextProjectionsAsBf16` call and restore the
-  widening call. The loader case must red.
-* Change the bf16 epsilon from `bf16(1e-6)` to `1e-6`. §4.3's golden must red.
-* Square in f32 instead of rounding to bf16 first. §4.2's golden must red.
-* Add the Linear's bias after the narrowing instead of before. §4.5 must red.
-* Delete the round-trip assertion in §6.4(3) and run the bf16 cases against the
-  f32 arm. The value goldens alone must NOT be enough to red it — that is the
-  measurement that proves (3) is load-bearing.
-
-## 7. Risks
-
-* **The Gemma tower still materializes f32 hidden states.**
-  `Gemma4Model::ForwardHiddenStates` returns `std::vector<std::vector<float>>`,
-  and `Ltx2TextHiddenStates` holds `const float*`. This row narrows them at the
-  stack, which is where upstream's own tensor is already bf16, so the arithmetic
-  mirrors. What it does NOT do is stop the tower from holding 49 f32 states. That
-  is `gemma4.*`, not `ltx2_text_encoder.*`, and it is owed.
-* **bf16 is lossy and this row makes the render less precise than it was.** That
-  is the point: upstream's answer is the bf16 one, and an f32 answer that is
-  "better" is a divergence. The f32 arm remains reachable and gated.
-* **A K = 188160 reduction in f32 accumulation.** Unchanged by this row — the
-  accumulator width is the same as the f32 arm's, only the operands narrow — but
-  it is the reason the bf16 GEMM keeps an f32 output tensor rather than
-  accumulating in bf16.
-
-## 8. Gates
-
-```sh
-# G1 — the refusal count, before and after. It NARROWS; it must not vanish.
-grep -n "compute_dtype must be" src/vllm/model_executor/models/ltx2_text_encoder.cpp
-
-# G2 — the render path selects the bf16 arm, and there is exactly one selector.
-grep -n "Ltx2TextProjectionsAsBf16\|Ltx2WidenTextProjectionsToF32" \
-  src/vllm/multimodal/ltx2_video.cpp
-
-# G3 — the goldens are upstream's, regenerated at the pin.
-python3 scripts/gen-ltx2-text-goldens.py --ltx2 ~/_git/LTX-2 \
-  --out tests/vllm/models/ltx2_text_goldens.inc && git diff --stat
-
-# G4 — the focused suite, both arms.
-ctest --test-dir build -R ltx2_text --output-on-failure
-
-# G5 — the full gate.
-scripts/agent-preflight.sh --staged
-python3 scripts/check-pr-size.py --base origin/main --head HEAD
-```
-
-## 9. Evidence
-
-1. The dtype probes of §4, run against `fd4ded7f` with torch 2.11.0+cu130 on
-   CPU. Recorded in `## Outcome` with their literal output.
-2. The regenerated `ltx2_text_goldens.inc`, whose header carries the upstream
-   revision the generator read from git.
-3. The measured byte counts of §6.4(1), printed by the case itself.
-
-## 10. A contradiction found in the parent scope document
-
-`.agents/specs/ltx25-completion-scope.md` §A.7 gives the render-path call sites
-of `Ltx2EncodePromptToConditioning` as `ltx2_video.cpp:2501`, `:3241` and `:5798`.
-At `4d10c8acc` they are `:2683`, `:3424` and `:5983`. The COUNT and the file are
-right and the row's conclusion is unaffected; the line numbers drifted after the
-scope document was written. That document is operator-owned, so this row records
-the drift here rather than editing it. This is the "recorded line anchors go
-stale" failure, and it is why §2 and §3 above were re-read at this head.
 
 ## Owed
 

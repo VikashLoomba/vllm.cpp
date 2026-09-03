@@ -6981,6 +6981,36 @@ TEST_CASE("ltx2 video: a typed PROMPT conditions the render") {
   CHECK(fox.trace.tower_audio_not_bf16 == 0);
   CHECK(whale.trace.tower_video_not_bf16 == 0);
   CHECK(whale.trace.tower_audio_not_bf16 == 0);
+
+  //    AND THE PREDICATE DISCRIMINATES ON THIS FIXTURE. "Not vacuous" above says
+  //    the buffer is non-empty and prompt-dependent; it does not say a stream of
+  //    THESE numbers computed at f32 width would have failed the predicate. A
+  //    fixture whose conditioning happened to land on bf16 grid points would read
+  //    zero here whatever arithmetic produced it, and this whole case would go
+  //    quietly green on an f32 tower — the same shape of hole A24 sat in.
+  //
+  //    The connector is the measurement. It is A24's SECOND wave, it computes in
+  //    f32, and it runs on the buffers the tower just handed it inside this same
+  //    render, so it is a live f32 arm on this fixture rather than an argument
+  //    about one. The unit-level gate asserts the mirror of this at
+  //    tests/vllm/models/test_ltx2_text_encoder.cpp's "the production entry point
+  //    computes in bf16".
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count. A floor
+  //    below the real number is a mute switch: the f32 arm reads 16384 of 16384
+  //    and 8192 of 8192 here, so half the stream leaves a factor of two of room
+  //    for fixture drift while still being unreachable by any accident that
+  //    matters. A regression that narrowed the connector to bf16 would take it to
+  //    zero, and a fixture that lost its sub-bf16 detail would take it there too;
+  //    either way this reds rather than muting the four checks above.
+  INFO("connector (f32, wave 2) wider than bf16: video "
+       << fox.trace.connector_video_not_bf16 << " of " << fox.trace.connector_video_values
+       << ", audio " << fox.trace.connector_audio_not_bf16 << " of "
+       << fox.trace.connector_audio_values);
+  REQUIRE(fox.trace.connector_video_values > 0);
+  REQUIRE(fox.trace.connector_audio_values > 0);
+  CHECK(fox.trace.connector_video_not_bf16 > fox.trace.connector_video_values / 2);
+  CHECK(fox.trace.connector_audio_not_bf16 > fox.trace.connector_audio_values / 2);
 }
 
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {

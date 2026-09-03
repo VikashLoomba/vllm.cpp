@@ -1594,16 +1594,65 @@ TEST_CASE("ltx2 text: the normalization EPSILONS are PINNED and load-bearing") {
   }
 }
 
-TEST_CASE("ltx2 text: a non-f32 compute dtype is REFUSED, never silently widened") {
+TEST_CASE("ltx2 text: BOTH entry points refuse a dtype the weights do not carry") {
+  // RENAMED, because the old name ("a non-f32 compute dtype is REFUSED") stopped
+  // being true when LTX25-A24-TEXT-TOWER-BF16 made bf16 a shipped arm. The two
+  // calls below still throw, but for a DIFFERENT reason than the name claimed:
+  // `V2Weights()` carries f32 storage, so it is the weights/arm mismatch that
+  // fires, not a refusal of bf16. A case whose name outlives its subject reads as
+  // coverage of something nobody is testing any more.
+  //
+  // It is kept rather than folded into "the arm refuses to disagree with the
+  // weights it was given", which covers the same refusal only through
+  // `Ltx2TextFeatureExtractorForward`. `Ltx2TextEncoderConditioning` is the
+  // SECOND entry point and reaches `RequireTextComputeDtype` on its own line;
+  // deleting this would leave that line untested.
   const std::vector<std::vector<float>> buffers = HiddenStateBuffers();
   const Ltx2TextHiddenStates states = MakeStates(buffers);
   const std::vector<int32_t> mask = MaskFrom(vllm_test::kLtxTeMaskLeft);
-  CHECK_THROWS_AS(vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(),
-                                                        V2Config(), vt::DType::kBF16),
-                  std::runtime_error);
-  CHECK_THROWS_AS(vllm::Ltx2TextEncoderConditioning(states, mask.data(), V2Weights(),
-                                                    V2Config(), vt::DType::kBF16),
-                  std::runtime_error);
+
+  // The message is checked, not just the throw, because the two refusals on this
+  // path are one `catch` apart and the mismatch one is what these calls hit.
+  auto refused_for = [](auto&& call, const char* needle) {
+    try {
+      call();
+    } catch (const std::runtime_error& e) {
+      const std::string what = e.what();
+      INFO("message: " << what);
+      CHECK(what.find(needle) != std::string::npos);
+      return;
+    }
+    FAIL("the call returned instead of refusing");
+  };
+
+  refused_for(
+      [&] {
+        vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(), V2Config(),
+                                              vt::DType::kBF16);
+      },
+      "the caption projections carry");
+  refused_for(
+      [&] {
+        vllm::Ltx2TextEncoderConditioning(states, mask.data(), V2Weights(), V2Config(),
+                                          vt::DType::kBF16);
+      },
+      "the caption projections carry");
+
+  // And the arm selector itself still refuses everything that is neither f32 nor
+  // bf16 BY NAME, at both entry points. This is the half the old name promised
+  // and the file had nowhere else for `Ltx2TextEncoderConditioning`.
+  refused_for(
+      [&] {
+        vllm::Ltx2TextFeatureExtractorForward(states, mask.data(), V2Weights(), V2Config(),
+                                              vt::DType::kF16);
+      },
+      "compute_dtype must be f32 or bf16");
+  refused_for(
+      [&] {
+        vllm::Ltx2TextEncoderConditioning(states, mask.data(), V2Weights(), V2Config(),
+                                          vt::DType::kF16);
+      },
+      "compute_dtype must be f32 or bf16");
 }
 
 TEST_CASE("ltx2 text: the tokenizer and HF sidecars come out of TENSORS, not files") {
@@ -3025,9 +3074,11 @@ int64_t Bf16UlpGap(uint16_t a, uint16_t b) {
 // arithmetic.
 //
 // So the generator emits every bf16 golden TWICE. The `*Stable` twin is
-// upstream's SAME module with that one kernel replaced by the value its own
-// vectorized path computes, and the port is held to it BIT-EXACTLY — no
-// tolerance sits under this port's arithmetic. The unpatched module's output is
+// upstream's SAME module with that one kernel replaced by the CORRECTLY ROUNDED
+// value, bf16(1/sqrt(f32(x))), and the port is held to it BIT-EXACTLY — no
+// tolerance sits under this port's arithmetic. That is not the same statement as
+// "the value the vectorized path computes": the two agree on all but 6 of the
+// 32639 finite positive bf16 values. The unpatched module's output is
 // the real oracle and is reported through `ReportBf16Gap`, so the distance to it
 // is visible rather than dropped.
 
@@ -3198,7 +3249,9 @@ TEST_CASE("ltx2 text bf16: the two normalizations are NOT the same dtype upstrea
       const std::vector<uint16_t> got =
           vllm::Ltx2NormAndConcatPerTokenRmsBf16(stacked.data(), mask.data(), B, T, D, L);
       // BIT-EXACT against upstream's own module with its one non-deterministic
-      // kernel replaced by the value that kernel's OWN vectorized path computes.
+      // kernel replaced by the CORRECTLY ROUNDED value, bf16(1/sqrt(f32(x))) —
+      // which agrees with that kernel's vectorized path on all but 6 of the 32639
+      // finite positive bf16 values, so the two are not the same oracle.
       // Nothing about this port's arithmetic rides on a tolerance.
       CheckBf16BitsRaw(side == 0 ? "bf16 V2 norm (left)" : "bf16 V2 norm (right)", got,
                        side == 0 ? vllm_test::kLtxTeBf16NormV2LeftStable
@@ -3347,6 +3400,44 @@ TEST_CASE("ltx2 text bf16: the epsilon and the rescale are the BF16-narrowed one
     CHECK(d0 > 0);
     CHECK(d1 > 0);
   }
+
+  SUBCASE("an input on which the epsilon's own WIDTH is visible") {
+    // THE CASE THAT GATES `kLtx2TextNormEpsBf16` ITSELF, and the one the two
+    // cases above do not. `2**-10` separates the epsilon from no epsilon and
+    // from a 100x one; it reads IDENTICALLY under `bf16(1e-6)` and under the
+    // un-narrowed `1e-6`, so the arm's constant could be widened to the f32
+    // literal and every other case here would stay green. The transcription
+    // check at the top of this TEST_CASE cannot close that either: it compares
+    // one constant against another and never reaches the arithmetic.
+    //
+    // The generator sweeps the whole bf16 domain for the values at which the two
+    // widths part after the norm's rsqrt and multiply — 140 of 32640 at the pin —
+    // and lays one per (b, t, layer) slice. It REFUSES to emit this probe if they
+    // ever stop parting, so the discrimination is measured on upstream and not
+    // asserted here.
+    const std::vector<uint16_t> stacked(
+        vllm_test::kLtxTeBf16NormV2EpsProbeIn,
+        vllm_test::kLtxTeBf16NormV2EpsProbeIn + n);
+    const std::vector<uint16_t> got =
+        vllm::Ltx2NormAndConcatPerTokenRmsBf16(stacked.data(), right.data(), B, T, D, L);
+    // Every slice is CONSTANT over d, so upstream's two rsqrt paths see one value
+    // per slice and this is held BIT-EXACT, like the two cases above.
+    CheckBf16BitsRaw("bf16 V2 norm, epsilon-width probe", got,
+                     vllm_test::kLtxTeBf16NormV2EpsProbe, n);
+
+    // AND THE PROBE DISCRIMINATES: upstream's answer differs from the rejected
+    // f32-scalar-epsilon hypothesis on this very input. Without this the two
+    // arrays could coincide and the bit check above would be a tautology — which
+    // is exactly what the tiny-variance input turned out to be for this question.
+    size_t separating = 0;
+    for (size_t i = 0; i < n; ++i)
+      if (vllm_test::kLtxTeBf16NormV2EpsProbe[i] !=
+          vllm_test::kLtxTeBf16NormV2EpsProbeF32Scalar[i])
+        ++separating;
+    MESSAGE("epsilon-width probe separates bf16(1e-6) from f32(1e-6) at "
+            << separating << " of " << n << " values");
+    CHECK(separating > 0);
+  }
 }
 
 TEST_CASE("ltx2 text bf16: torch's own rsqrt is not a function of its input") {
@@ -3370,7 +3461,9 @@ TEST_CASE("ltx2 text bf16: torch's own rsqrt is not a function of its input") {
   CHECK(vllm_test::kLtxTeBf16RsqrtSelfDisagree < vllm_test::kLtxTeBf16RsqrtEntries);
 
   // The port takes the CORRECTLY ROUNDED single rounding, which is the answer
-  // torch's own vectorized path gives. Held bit-exact against it, so our
+  // torch's own vectorized path gives on all but 6 of the 32639 finite positive
+  // bf16 values — near enough to call it that in passing, not near enough to be
+  // the same oracle. Held bit-exact against the correctly rounded one, so our
   // arithmetic is pinned even though the module's output is not reproducible.
   size_t bad = 0;
   int64_t worst = 0;
@@ -3586,10 +3679,13 @@ TEST_CASE("ltx2 text bf16: the MEMORY FORMAT, measured rather than declared") {
 
 TEST_CASE("ltx2 text bf16: the production entry point computes in bf16") {
   // THE ASSERTION AN F32 PATH CANNOT PASS, through the entry point the render
-  // path actually calls (`Ltx2EncodePromptToConditioning`, reached from
-  // ltx2_video.cpp at :2683, :3424 and :5983). Nothing here constructs the
-  // extractor by hand: a unit test on the class would prove the class works and
-  // never that anything reaches it.
+  // path actually calls: `Ltx2EncodePromptToConditioning`, which
+  // src/vllm/multimodal/ltx2_video.cpp calls from three sites --
+  // `grep -c '= Ltx2EncodePromptToConditioning(' src/vllm/multimodal/ltx2_video.cpp`
+  // reports 3. Cited as a string because the three line numbers this comment used
+  // to carry went stale twice inside this row's own pull request. Nothing here
+  // constructs the extractor by hand: a unit test on the class would prove the
+  // class works and never that anything reaches it.
   //
   // The arm is selected the way the render selects it — by the DTYPE THE WEIGHTS
   // CARRY, not by a parameter — so this case also gates the wiring.

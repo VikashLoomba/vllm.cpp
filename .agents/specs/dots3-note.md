@@ -5701,6 +5701,98 @@ each, which is the caller that makes D5's arm REACHED; `conv_out.bias` absent.
 `MaskTime` zeroes from `valid` onward; and `k_proj` alone is `bias=False` at
 `:221`.
 
+#### 4.14.12 What the FRESH REVIEW measured, and the one hole it found
+
+The review returned PASS on the tower's arithmetic, on its refusals and on the
+oracle comparison, and it mutated each of them rather than reading them. What
+follows is what it came back with that the sections above did not already say.
+Four of the five items are not defects. They are written down anyway, because a
+number nobody records is a number the next reader has to derive again.
+
+**THE ENUMERATION INSTRUMENT HAD A `'` HOLE, AND IT IS NOW CLOSED.**
+`StripCommentsAndLiterals` treated EVERY `'` as a char-literal delimiter, so a
+C++14 digit separator opened a literal that was never there and the scan ran on
+to the next `'`, dropping the real code in between. Two separators bracketing a
+`vt::` call therefore hid that call from the enumeration, and §4.14.7's
+independence property read GREEN while being false. The stripper now takes a
+pp-number WHOLE. The number must START at a digit that does not continue an
+identifier, so `u8'a'` and `L'x'` are still char literals and are still
+stripped — which is why the fix is the pp-number rule and not the shorter
+"ignore a `'` after an alphanumeric": that shorter rule would leak the body of
+every prefixed char literal instead.
+
+Measured on this host, on ONE unfixed binary and ONE fixed binary, each row a
+source-text edit against an UNREBUILT binary. The injected reach is the same
+`vt::Scale(vllm::kMelFloor)` in all three reaching rows; only what brackets it
+changes.
+
+| # | Injected into `ref_front`, one line, at the same point | Unfixed `49cd8fb95403aff3…` | Fixed `8081852cbd8aecd4…` |
+|---|---|---|---|
+| M-A1 | the reach, bare | **RED**, 3 axes: `std,vllm,vt != std`, `13 != 11`, `73 != 71` | **RED**, the same 3 axes |
+| M-A2 | the same tokens inside a `//` COMMENT | GREEN, 11 / 71, `std` | GREEN, 11 / 71, `std` |
+| M-A3 | ONE separator: `16'000.0 * <reach>` | RED by COUNTS only, `8 != 11` and `50 != 71`; the scope set wrongly read `std` | **RED**, all 3 axes |
+| M-A4 | the reach BRACKETED: `16'000.0 * <reach> / 1'280.0` | **GREEN**, 11 / 71, `scopes=std`, with a LIVE `vt::` call inside the namespace — the hole | **RED**, all 3 axes |
+
+M-A3 loses names rather than gaining them because the phantom literal its lone
+`'` opens finds no closing `'` before the end of `ref_front`, so the scan drops
+the whole tail of the namespace. That is the same defect as M-A4 and it happens
+to be loud. M-A4 is the quiet form, and the quiet form is the one that matters:
+adding a real `vt::` reach moved NOTHING.
+
+Clean source on both binaries: `ref_front` 11 distinct / 71 occurrences,
+`ref_tower` 6 / 53, `std` only. The fix moves neither count.
+
+Every row above is a SOURCE-TEXT edit re-run against an UNREBUILT binary, which
+is the fact `DOTS3_AUDIO_TEST_SOURCE` (`tests/CMakeLists.txt:1268`) exists to
+make true: the instrument reads bytes at run time, so an edit reaches it without
+a compile, and the unchanged binary sha256 is what proves the reading rather
+than a compiled-in transcription. The hole was NOT live at the head that found
+it — the file carries no digit separator outside a comment, and M-A1 shows a
+naive reach is caught — but a later edit that wrote `16'000` and `1'280` into a
+reference with a helper call between them would have reopened it in silence, and
+on this row that property IS the correctness argument, because there is no
+oracle.
+
+**THE BUILD-FAILURE TRAP, IN ITS SHARPEST CONCRETE FORM.** §4.14.11 already
+records that mutation A's first form died on `-Werror`. The review produced the
+same failure with the consequence visible: its first form of mutation C died on
+`-Werror=unused-function`, and because the build failed, the binary still on
+disk was the one the previous mutation had left there — **byte-identical, sha256
+`87182e77c28535df…`** — and it reported **13/13 GREEN**. A reader who checked
+only the doctest line would have recorded "mutation C is not caught". Checking
+the ninja return code AND the binary sha256 is what separates NOT CAUGHT from
+NEVER BUILT, and this row has now been bitten by that distinction twice.
+
+**MEASURED HEADROOM ON THE TOWER BOUND, RECORDED AND NOT ACTED ON.** The tower
+case asserts `rel < 5e-2` (`test_dots3_note_audio.cpp:1132`) against a measured
+**0.00770442**, so the bound sits about **6.5x above the baseline**. A defect
+that moves the answer by less than that survives it, and a PARTIAL bias defect —
+bias applied to only the `up` half of the packed `fc1` pair, say — is plausibly
+inside that band. It is recorded as headroom rather than tightened, because
+tightening it without measuring what a tighter bound costs in false reds on a
+bf16 envelope would trade one unmeasured risk for another. The bound's own
+justification is unchanged: a 2-block tower and a 3-layer conv stem in bf16,
+plus the deliberate `vt::RmsNorm` rounding difference `dots3_note_audio.h`
+records.
+
+**ONE CAVEAT THE INSTRUMENT DOES NOT COVER, STATED PLAINLY.** `ref_tower` is fed
+`LoadedTower::mel_ref` (`test_dots3_note_audio.cpp:1083-1088`), which is a
+double-promoted copy of the IMPLEMENTATION'S mel and not a second computation of
+it. That is legitimate layering — the front end is separately gated against
+`ref_front` to **7.22919e-08**, so the tower case is deliberately measuring the
+tower and not the front end twice — but the enumeration proves a property of the
+two references' CODE and says nothing about the tower reference's INPUT. "Two
+independent references" is therefore true of what they compute, and not of what
+they are handed.
+
+**A SIXTH MUTATION, FROM THE REVIEWER, WORTH KEEPING BESIDE THE FIVE.** Deleting
+the `vt::Add` in `UnquantizedMlpGateUpBiasMethod::Apply` (`linear.h:215`) — the
+D5 arm still SELECTED and still named `bf16-gate-up-bias`, but behaving as
+no-bias — is CAUGHT: rel-L2 **0.0077 -> 0.0987** against the `5e-2` bound. It is
+a FOURTH tower-only defect the served suite cannot see, alongside C and D, and
+it is the mutation that proves the new seam arm's bias is applied rather than
+merely reachable.
+
 
 ## 5. Gates
 

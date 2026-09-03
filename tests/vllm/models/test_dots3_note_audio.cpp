@@ -418,6 +418,11 @@ std::string Join(const std::set<std::string>& s) {
   return out;
 }
 
+bool IsIdentChar(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
 // Comments and literals out, everything else through unchanged.
 std::string StripCommentsAndLiterals(const std::string& code) {
   std::string out;
@@ -430,6 +435,31 @@ std::string StripCommentsAndLiterals(const std::string& code) {
     } else if (c == '/' && i + 1 < n && code[i + 1] == '*') {
       const size_t j = code.find("*/", i + 2);
       i = (j == std::string::npos) ? n : j + 2;
+    } else if (c >= '0' && c <= '9' && (i == 0 || !IsIdentChar(code[i - 1]))) {
+      // A pp-number, taken WHOLE. C++14 lets a numeric literal carry `'` digit
+      // separators (`16'000`), and treating that `'` as a char-literal
+      // delimiter makes the scan below run to the NEXT `'` and drop everything
+      // in between. That is a hole in THIS instrument and not a cosmetic one:
+      // two separators bracketing a `vt::` call would hide the call from the
+      // enumeration, and the independence property would read GREEN while being
+      // false. The token must START at a digit that does not continue an
+      // identifier, so `u8'a'` is still a char literal and is still stripped.
+      size_t j = i;
+      while (j < n) {
+        if (IsIdentChar(code[j]) || code[j] == '.') {
+          ++j;
+        } else if (code[j] == '\'' && j + 1 < n && IsIdentChar(code[j + 1])) {
+          j += 2;
+        } else if ((code[j] == '+' || code[j] == '-') && j > i &&
+                   (code[j - 1] == 'e' || code[j - 1] == 'E' ||
+                    code[j - 1] == 'p' || code[j - 1] == 'P')) {
+          ++j;
+        } else {
+          break;
+        }
+      }
+      out.append(code, i, j - i);
+      i = j;
     } else if (c == '"' || c == '\'') {
       size_t j = i + 1;
       while (j < n && code[j] != c) j += (code[j] == '\\') ? 2 : 1;
@@ -440,11 +470,6 @@ std::string StripCommentsAndLiterals(const std::string& code) {
     }
   }
   return out;
-}
-
-bool IsIdentChar(char c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-         (c >= '0' && c <= '9') || c == '_';
 }
 
 RefNames QualifiedNamesIn(const std::string& ns) {

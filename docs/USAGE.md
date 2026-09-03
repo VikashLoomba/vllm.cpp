@@ -296,6 +296,17 @@ vllm_engine_load(&mp, &engine);
 
 `vllm-cli` takes the same `--kv-cache-dtype` flag the server takes.
 
+`vllm-bench` takes it too, and its report header names the KV dtype it measured
+on -- both the value you asked for and the storage dtype the loader actually
+sized blocks from. Those two differ when the checkpoint declares
+`kv_cache_quant_algo` and you typed no flag, which is exactly the case where a
+published number would otherwise be unattributable:
+
+```text
+KV cache dtype (requested):                auto
+KV cache dtype (resolved storage):         fp8_e4m3 (1-byte pages)
+```
+
 ## Draft with a second checkpoint
 
 Speculative decoding runs a small draft model beside the target and verifies its

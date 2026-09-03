@@ -1285,6 +1285,14 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       // arm by name, the request surface refuses positive rounds without it, and
       // the rounds loop calls it once per round.
       vllm::multimodal::kLtx2TemporalUpsamplerPathExtra,
+      // Row LTX25-LORA-FUSION (#932): the INDEXED IC-LoRA family, upstream's
+      // repeatable `--lora` (utils/args.py:600-611). A pattern rather than a
+      // key, which is why it is spelled here exactly as the listing prints it —
+      // `kKnownLoadExtras[]` is an enumerated array and cannot hold an unbounded
+      // family. Its reader is `ResolveLoraSpecs`, which walks 1..N and builds one
+      // `Ltx2LoraSpec` per adapter, so both names are SERVED and not refused.
+      "lora_path_<n>",
+      "lora_strength_<n> (n >= 2)",
   };
   // The keys the family defines and does NOT serve. Growing this list is a
   // deliberate act; growing it silently is the defect #611 records.
@@ -7199,6 +7207,140 @@ TEST_CASE("ltx2 video: the IC-LoRA strength reaches the PIXELS, and 0 is a no-op
   CHECK(half != baseline);
 }
 
+TEST_CASE("ltx2 video: a SECOND IC-LoRA supplied through lora_path_2 reaches the PIXELS") {
+  // ROW LTX25-LORA-FUSION, issue #932. THE REACHABILITY CLAIM for N-adapter
+  // fusion, and it is a different claim from the one above: `test_ltx2_lora`
+  // builds two `Ltx2LoraAdapter`s by hand and proves the AGGREGATOR composes
+  // them, which says nothing about whether a user can ask for two.
+  //
+  // THE MUTATION. Delete the `index > 1` arm of `ResolveLoraSpecs` in
+  // ltx2_video.cpp — make its loop `for (int64_t index = 1; index <= 1; ++index)`
+  // — and the whole of `test_ltx2_lora` stays green, the one-adapter cases above
+  // stay green, and this case REDs. That difference is the whole point
+  // (.agents/reachability.md).
+  Workspace ws;
+
+  // Two adapters on the SAME target, which is the composing case: `to_q` gets a
+  // delta from each, so the second one takes upstream's `addmm_` form
+  // (`fuse_loras.py:115`). Different scales so neither can stand in for the
+  // other.
+  const std::string first =
+      WriteFixtureLora(ws.root + "/ic1.safetensors", kFixtureLoraTarget, 1.0F);
+  const std::string second =
+      WriteFixtureLora(ws.root + "/ic2.safetensors", kFixtureLoraTarget, 0.5F);
+
+  const auto render = [&](bool with_second, const char* out) {
+    vllm::multimodal::VideoModelParams mp = ConditioningParams(ws.paths);
+    mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = first;
+    if (with_second) mp.extras[std::string(vllm::multimodal::kLtx2LoraPathExtra) + "_2"] = second;
+    return RenderBytes(mp, std::string(ws.root) + "/" + out);
+  };
+
+  const std::string one = render(false, "one");
+  const std::string two = render(true, "two");
+  REQUIRE(one.size() == two.size());
+  REQUIRE(one.size() > 0);
+
+  size_t differing = 0;
+  for (size_t i = 0; i < one.size(); ++i) {
+    if (one[i] != two[i]) ++differing;
+  }
+  MESSAGE("the second IC-LoRA moves " << differing << " of " << one.size()
+                                      << " artifact bytes");
+  // Every byte of the REQUEST is identical and so is the first adapter; the only
+  // difference is the `lora_path_2` LOAD EXTRA. Strictly greater than zero with
+  // no count floor above it, because a count-based tolerance bounds nothing —
+  // and the count IS small here (single digits of 91169) because the witness is
+  // a COMPRESSED artifact, not the latent. It does not grow with the adapter's
+  // scale: 2.0 moves fewer bytes than 0.5 does. What carries the weight of this
+  // case is therefore the equality below, over all 91169 bytes.
+  CHECK(differing > 0);
+
+  // AND THE SECOND ADAPTER'S OWN STRENGTH IS READ. `lora_strength_2` at 0 fuses
+  // a zero delta for the second adapter alone, which must land exactly on the
+  // one-adapter render. Without this, an implementation that opened the second
+  // file and dropped its strength would still pass the check above.
+  vllm::multimodal::VideoModelParams zeroed = ConditioningParams(ws.paths);
+  zeroed.extras[vllm::multimodal::kLtx2LoraPathExtra] = first;
+  zeroed.extras[std::string(vllm::multimodal::kLtx2LoraPathExtra) + "_2"] = second;
+  zeroed.extras[std::string(vllm::multimodal::kLtx2LoraStrengthExtra) + "_2"] = "0.0";
+  CHECK(RenderBytes(zeroed, ws.root + "/zeroed") == one);
+}
+
+TEST_CASE("ltx2 video: the INDEXED IC-LoRA load extras refuse by name on misuse") {
+  // Row LTX25-LORA-FUSION. Every one of these is a caller who believes an
+  // adapter is being fused; the failure mode each refusal prevents is a render
+  // that succeeds with fewer adapters than were asked for.
+  Workspace ws;
+  const std::string lora =
+      WriteFixtureLora(ws.root + "/ic.safetensors", kFixtureLoraTarget, 1.0F);
+
+  const auto refused = [&](const std::map<std::string, std::string>& extras) {
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    for (const auto& kv : extras) mp.extras[kv.first] = kv.second;
+    try {
+      (void)vllm::multimodal::LoadVideoEngine(mp);
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  SUBCASE("a GAP in the numbering refuses rather than renumbering") {
+    // `lora_path_3` with no `lora_path_2` would otherwise fuse two adapters and
+    // report success to a caller who asked for three.
+    const std::string msg = refused({{"lora_path", lora}, {"lora_path_3", lora}});
+    INFO(msg);
+    CHECK(msg.find("lora_path_3") != std::string::npos);
+    CHECK(msg.find("lora_path_2") != std::string::npos);
+    CHECK(msg.find("no gaps") != std::string::npos);
+  }
+
+  SUBCASE("an indexed adapter with no FIRST one refuses") {
+    // The same gap rule at the bottom: `lora_path_2` alone is a load with zero
+    // adapters, not a load with one.
+    const std::string msg = refused({{"lora_path_2", lora}});
+    INFO(msg);
+    CHECK(msg.find("lora_path_2") != std::string::npos);
+    CHECK(msg.find("no gaps") != std::string::npos);
+  }
+
+  SUBCASE("an indexed strength with no adapter at that index refuses") {
+    const std::string msg =
+        refused({{"lora_path", lora}, {"lora_strength_2", "0.5"}});
+    INFO(msg);
+    CHECK(msg.find("lora_strength_2") != std::string::npos);
+    CHECK(msg.find("lora_path_2") != std::string::npos);
+  }
+
+  SUBCASE("a non-numeric indexed strength names ITS OWN key, not the first one") {
+    // A message naming `lora_strength` for a defect in `lora_strength_2` sends
+    // the reader to a key that is fine.
+    const std::string msg = refused(
+        {{"lora_path", lora}, {"lora_path_2", lora}, {"lora_strength_2", "strong"}});
+    INFO(msg);
+    CHECK(msg.find("lora_strength_2") != std::string::npos);
+    CHECK(msg.find("not a finite number") != std::string::npos);
+  }
+
+  SUBCASE("`lora_path_1` refuses BY NAME rather than as an unknown key") {
+    // Two spellings for one adapter could disagree with no defensible winner, so
+    // the unindexed one is the only one — and a caller who got that wrong is
+    // told which spelling to use instead of being sent to hunt for a typo.
+    const std::string msg = refused({{"lora_path_1", lora}});
+    INFO(msg);
+    CHECK(msg.find("lora_path_1") != std::string::npos);
+    CHECK(msg.find("with no index") != std::string::npos);
+  }
+
+  SUBCASE("a nearby key is still an unknown extra, and the listing says so") {
+    const std::string msg = refused({{"lora_path_x", lora}});
+    INFO(msg);
+    CHECK(msg.find("unknown load extra") != std::string::npos);
+    CHECK(msg.find("lora_path_<n>") != std::string::npos);
+  }
+}
+
 TEST_CASE("ltx2 video: the IC-LoRA load extras refuse by name on misuse") {
   Workspace ws;
 
@@ -11184,6 +11326,54 @@ TEST_CASE("ltx2 a2vid: the rebind leaves the DiT where the NEXT generation expec
   // DiT unfused after the first render would make the second render's stage 2
   // run on base weights, and these would differ.
   CHECK(a == b);
+}
+
+TEST_CASE("ltx2 a2vid: a SECOND adapter refuses, because stage 1 cannot hold a SUBSET") {
+  // ROW LTX25-LORA-FUSION. THE ARM THAT LIFTING THE ARITY CAP MADE EXPRESSIBLE
+  // AND THIS ENGINE CANNOT RUN, refused by name rather than rendered.
+  //
+  // While the load held ONE adapter, `kNoAdapters` on stage 1 mirrored upstream
+  // EXACTLY: that adapter is the `distilled_lora` the recipe demands, and
+  // upstream's stage 1 argument is `loras=tuple(loras)` — the USER adapters,
+  // necessarily empty. `a2vid_two_stage.py:107` against `:114`. With TWO,
+  // upstream's stage 1 carries the user adapter and not the distilled one, which
+  // is a PROPER SUBSET; this engine holds one resident DiT that `Ltx2RebindDitLoras`
+  // fuses with all or none, and no load extra says which of the two is distilled.
+  //
+  // ENTRY POINT: `LoadVideoEngine` on the documented load extras. Deleting the
+  // `dit_options.loras.size() > 1` guard in `ltx2_video.cpp` REDs this case and
+  // leaves every other LoRA case in this file and the whole of `test_ltx2_lora`
+  // green, which is the difference that makes it a capability claim.
+  Workspace ws;
+  const std::string first =
+      WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
+  const std::string second =
+      WriteFixtureLora(ws.root + "/user.safetensors", kFixtureLoraTarget, 0.5F);
+
+  vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, first);
+  mp.extras[std::string(vllm::multimodal::kLtx2LoraPathExtra) + "_2"] = second;
+  std::string message;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+  INFO(message);
+  REQUIRE_FALSE(message.empty());
+  CHECK(message.find("stage_1") != std::string::npos);
+  CHECK(message.find("2 adapters were supplied") != std::string::npos);
+  CHECK(message.find("a2vid_two_stage.py:107") != std::string::npos);
+  CHECK(message.find("dfr_pipeline.py:212") != std::string::npos);
+
+  // NOT A BLANKET REFUSAL OF THE SECOND ADAPTER. The same two adapters on a
+  // pipeline whose phases all run fused are ACCEPTED — that is the composition
+  // `dfr_pipeline.py:212` builds and the one this row was lifted for. Without
+  // this, a guard that simply refused `loras.size() > 1` everywhere would pass
+  // the checks above while deleting the row's whole capability.
+  vllm::multimodal::VideoModelParams one_stage = ConditioningParams(ws.paths);
+  one_stage.extras[vllm::multimodal::kLtx2LoraPathExtra] = first;
+  one_stage.extras[std::string(vllm::multimodal::kLtx2LoraPathExtra) + "_2"] = second;
+  CHECK_NOTHROW((void)vllm::multimodal::LoadVideoEngine(one_stage));
 }
 
 // ─── LTX25-TI2VID-RECIPE (#1093) ─────────────────────────────────────────────

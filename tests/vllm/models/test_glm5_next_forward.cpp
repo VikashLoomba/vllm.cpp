@@ -1796,3 +1796,161 @@ TEST_CASE("glm5_next W9c-3b: a CPU queue writes the pages IN PLACE, and the "
     }
   }
 }
+
+// ═══ (5) THE ASYNCHRONOUS DEVICE-IDENTIFIER GATE ════════════════════════════
+//
+// Row `ENG-ASYNC-DEVICE-IDS-2544`, spec
+// `.agents/specs/eng-async-device-ids-2544.md`, issue
+// [#2544](https://github.com/mudler/vllm.cpp/issues/2544); the contract is
+// [#1305](https://github.com/mudler/vllm.cpp/issues/1305)'s.
+//
+// WHAT IT MEASURES. On the asynchronous serving path the runner's combine
+// splices each decode row's sampled token into the DEVICE identifiers on the
+// main queue and leaves the host `token_ids` deliberately stale for decode rows
+// (`src/vllm/v1/worker/gpu/runner.cpp`, the mirror arm, which is the DEFAULT on
+// CUDA -- integrated parts included). A forward that embeds the host vector
+// therefore generates every step after the first from the previous step's
+// identifiers, and because `token_ids_cpu` is zero-initialised that means from
+// TOKEN ID 0.
+//
+// This was MEASURED for this model, not inferred. On `dgx:gpu0` over the real
+// 101.25 GiB UD-Q2_K_XL artifact, one binary, one variable flipped:
+//
+//     default                     ->  ' Paris Paris'
+//     VT_ASYNC_DEVICE_MIRROR=0    ->  ' Paris.'
+//     --max-tokens 1 (prefill)    ->  ' Paris'
+//
+// The prefill agrees, so the first token looked right and everything after it
+// came from id 0 -- silently, at rc=0.
+//
+// THE DEFECT IS SILENTLY WRONG TOKENS AND NOT A FAULT, so this asserts the
+// identifiers themselves rather than that the call returns. Three runs, because
+// two of them cannot separate the cases:
+//
+//     A  right host ids, no mirror              -> the reference
+//     B  ZERO host ids, no mirror               -> must DIFFER from A
+//     C  ZERO host ids, mirror carries A's      -> must EQUAL A, bit for bit
+//
+// B is the control. Without it a forward that ignored its identifiers entirely
+// would satisfy C, and so would a gate whose two runs happened to share a
+// buffer. ZERO is the wrong-host value on purpose: it is the value the real
+// defect feeds.
+//
+// EVERY IDENTIFIER IN A IS NON-ZERO, so C cannot agree with A for the wrong
+// reason.
+//
+// WHAT A CPU HARNESS CANNOT SHOW, stated the right way round: `vt::Backend::Alloc`
+// returns host-addressable memory on this backend, so the mirror's buffer and the
+// host vector are the same kind of pointer. That the copy reads DEVICE memory and
+// that it is ordered on the main queue after the combine are the two halves this
+// cannot see; the spec's `## Gates` carries the hardware legs that can.
+namespace {
+
+// The mirror's buffer is a REAL backend allocation, never the host vector's
+// address. On CPU the two are the same kind of pointer, so this buys nothing
+// today; it is what makes the case correct by construction on a device, where
+// `device_token_ids` is a pointer the runner's combine wrote.
+struct MirrorIds {
+  vt::Backend* b = nullptr;
+  int32_t* p = nullptr;
+  MirrorIds(vt::Queue& q, const std::vector<int32_t>& ids) {
+    b = &vt::GetBackend(q.device.type);
+    const size_t bytes = ids.size() * sizeof(int32_t);
+    p = static_cast<int32_t*>(b->Alloc(bytes));
+    b->Copy(q, p, ids.data(), bytes);
+    b->Synchronize(q);
+  }
+  ~MirrorIds() { if (b != nullptr && p != nullptr) b->Free(p); }
+  MirrorIds(const MirrorIds&) = delete;
+  MirrorIds& operator=(const MirrorIds&) = delete;
+};
+
+size_t DifferingFloats(const std::vector<float>& a, const std::vector<float>& b) {
+  REQUIRE(a.size() == b.size());
+  size_t n = 0;
+  // memcmp rather than `!=`, because `NaN != NaN` is TRUE and would read as a
+  // difference on a forward that produced no numbers at all.
+  for (size_t i = 0; i < a.size(); ++i)
+    if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) ++n;
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("glm5_next: the forward embeds the async mirror's DEVICE ids, not the stale host vector") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  REQUIRE(model != nullptr);
+
+  // NON-ZERO throughout, and inside the fixture's vocabulary so run B is a
+  // wrong ANSWER rather than a refusal.
+  const std::vector<int32_t> truth{5, 11, 23, 17};
+  const std::vector<int32_t> stale(truth.size(), 0);
+
+  // ── RUN A — the reference ───────────────────────────────────────────────
+  Step a(truth);
+  const vllm::ForwardLogits ref = vllm::ModelRegistry::Forward(*model, a.Get());
+  REQUIRE(ref.host.size() == static_cast<size_t>(truth.size() * kVocab));
+  // FINITENESS BEFORE ANY COMPARISON. Against a NaN both `==` and `!=` are
+  // false, so an equality gate and a difference gate BOTH report success on a
+  // forward that produced no numbers -- which is exactly how this row's sibling
+  // read an all-NaN forward as a perfect match.
+  {
+    int nonfinite = 0;
+    for (float v : ref.host) if (!std::isfinite(v)) ++nonfinite;
+    REQUIRE(nonfinite == 0);
+  }
+
+  // ── RUN B — THE CONTROL. Stale host ids, no mirror: the logits must MOVE. ─
+  Step b(stale);
+  const vllm::ForwardLogits zeroed = vllm::ModelRegistry::Forward(*model, b.Get());
+  REQUIRE(zeroed.host.size() == ref.host.size());
+  {
+    int nonfinite = 0;
+    for (float v : zeroed.host) if (!std::isfinite(v)) ++nonfinite;
+    REQUIRE(nonfinite == 0);
+  }
+  const size_t moved = DifferingFloats(ref.host, zeroed.host);
+  CHECK_MESSAGE(moved > 0,
+                "zeroing the host ids changed nothing, so this fixture cannot "
+                "see an identifier at all and run C would prove nothing");
+
+  // ── RUN C — THE GATE. The same stale host vector, the true identifiers
+  //    reaching the model ONLY through `device_token_ids`. ─────────────────
+  Step c(stale);
+  vllm::ModelForwardInput in = c.Get();
+  MirrorIds mirror(in.queue, truth);
+  // Set after aggregate construction, exactly as `runner.cpp` sets it.
+  in.device_token_ids = mirror.p;
+  const vllm::ForwardLogits via_device = vllm::ModelRegistry::Forward(*model, in);
+  REQUIRE(via_device.host.size() == ref.host.size());
+  const size_t differing = DifferingFloats(ref.host, via_device.host);
+  CHECK_MESSAGE(differing == 0,
+                "registry forward, mirror vs host reference: " << differing
+                    << " of " << ref.host.size() << " logits differ, so this "
+                    "forward embedded the STALE host ids and the model generates "
+                    "from token id 0 on every decode step after the first "
+                    "(#2544, #1305)");
+  MESSAGE("glm5_next device-ids: control moved " << moved << " floats; mirror "
+          "vs reference differ in " << differing << " of " << ref.host.size());
+}
+
+TEST_CASE("glm5_next: a published device buffer over an EMPTY step is refused by name") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+
+  // A runner that published identifiers for a step whose host vector is empty
+  // and a model that shortened the step both reach here, and the two disagree
+  // about the step's shape. Refused rather than silently reduced to a no-op,
+  // because a no-op here IS the defect.
+  Step e(std::vector<int32_t>{});
+  vllm::ModelForwardInput in = e.Get();
+  const std::vector<int32_t> one{5};
+  MirrorIds mirror(in.queue, one);
+  in.device_token_ids = mirror.p;
+  CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, in),
+                       doctest::Contains("disagree about the step's shape"),
+                       std::runtime_error);
+}

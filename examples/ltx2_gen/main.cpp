@@ -304,7 +304,10 @@ int main(int argc, char** argv) {
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
   // takes, built once after parsing.
   std::vector<std::string> extra_keys, extra_values;
-  auto SetExtra = [&](const char* key, std::string value) {
+  // How many `--lora` flags have been seen, which is how the engine's indexed
+  // load extras are numbered. See the flag below.
+  int lora_count = 0;
+  auto SetExtra = [&](const std::string& key, std::string value) {
     for (size_t i = 0; i < extra_keys.size(); ++i) {
       if (extra_keys[i] == key) {
         extra_values[i] = std::move(value);
@@ -371,12 +374,21 @@ int main(int argc, char** argv) {
     // strength is optional and defaults to upstream's DEFAULT_LORA_STRENGTH.
     // LOAD extras, because upstream fuses the adapter into the weights at
     // construction (ic_lora.py:104-114) and it cannot vary per request.
+    //
+    // REPEATABLE since row LTX25-LORA-FUSION (#932), which is what upstream's
+    // own help text has always said: "Can be specified multiple times. Example:
+    // --lora path/to/lora1.safetensors 0.8 --lora path/to/lora2.safetensors"
+    // (`utils/args.py:608-609`). The engine numbers adapters from 1 with the
+    // first unindexed, so this appends `_2`, `_3`, ... in the order given —
+    // which is the order they fuse in, and that order is observable.
     else if (f == "--lora") {
-      SetExtra("lora_path", Need(argc, argv, ++i, f.c_str()));
+      ++lora_count;
+      const std::string suffix = lora_count == 1 ? "" : "_" + std::to_string(lora_count);
+      SetExtra("lora_path" + suffix, Need(argc, argv, ++i, f.c_str()));
       // The optional second word. Consumed only when it does not look like the
       // next flag, which is how upstream's `nargs="+"` LoraAction disambiguates.
       if (i + 1 < argc && argv[i + 1][0] != '-') {
-        SetExtra("lora_strength", argv[++i]);
+        SetExtra("lora_strength" + suffix, argv[++i]);
       }
     }
     // Image conditioning (row LTX25-IMAGE-COND, issue #644). `--first-frame` is

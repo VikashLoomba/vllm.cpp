@@ -2434,6 +2434,20 @@ vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 # with the vllm-bench CLI).
 vllm_cpp_add_test(test_bench examples/test_bench.cpp)
 target_include_directories(test_bench PRIVATE ${CMAKE_SOURCE_DIR}/examples/bench)
+# KV-FP8 W7 (#2619): `--kv-cache-dtype` on `vllm-bench`. It runs the BINARY,
+# because that is the only thing that proves the FLAG arrives: `test_bench`
+# above already drives `RunBench` from a hand-built `BenchConfig`, so a test
+# that set the field here would re-prove the field. Same `$<TARGET_FILE:...>` +
+# `SKIP_RETURN_CODE 77` shape as `test_cli_kv_cache_dtype`, and registered
+# UNCONDITIONALLY for the same reason: with examples off the suite exits 77 and
+# CTest reports it Skipped, which REPORTS the gate's absence instead of hiding
+# it behind an option.
+vllm_cpp_add_test(test_bench_kv_cache_dtype
+  examples/test_bench_kv_cache_dtype.cpp)
+if(TARGET vllm-bench OR VLLM_CPP_BUILD_EXAMPLES)
+  target_compile_definitions(test_bench_kv_cache_dtype
+    PRIVATE VLLM_BENCH_BINARY="$<TARGET_FILE:vllm-bench>")
+endif()
 
 # C ABI (M3.5 Task 1): the C++ test drives the public C API over a synthetic
 # engine via the internal MakeEngineHandle hook (reached under src/).

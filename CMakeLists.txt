@@ -830,6 +830,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/glm5_next_kv.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
   src/vllm/model_executor/models/glm5_next_device.cpp
+  src/vllm/model_executor/models/host_token_ids.cpp
   src/vllm/model_executor/models/glm_moe_dsa.cpp
   src/vllm/model_executor/models/glm_moe_dsa_forward.cpp
   src/vllm/model_executor/models/glm_moe_dsa_loader.cpp
@@ -2980,6 +2981,12 @@ endif()
 # thing that has to know about the ordering.
 if(TARGET test_cli_offload_config AND TARGET vllm-cli)
   add_dependencies(test_cli_offload_config vllm-cli)
+endif()
+# KV-FP8 W7 (#2619): the same ordering, for the same reason, for the benchmark
+# harness's own flag gate. Without this the gate can run against a stale or
+# absent `vllm-bench` and report a verdict about a binary it did not build.
+if(TARGET test_bench_kv_cache_dtype AND TARGET vllm-bench)
+  add_dependencies(test_bench_kv_cache_dtype vllm-bench)
 endif()
 
 # Render the compiled-arch manifest (issue #1357). Last, so it observes whatever

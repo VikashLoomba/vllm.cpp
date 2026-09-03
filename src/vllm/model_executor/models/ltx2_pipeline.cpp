@@ -1353,9 +1353,11 @@ Ltx2PipelineRecipe DfrRecipe(const std::string& version) {
   // THE DETAILING IC-LoRA IS NOT A SECOND REQUIREMENT, which #1445 asks for a
   // decision on. `detailing_lora` defaults to `None` (`:176`), `--detailing-lora`
   // carries `default=[]` and no `required` (`:569-577`), and `CLAUDE.md:51` says
-  // stage 2 "may add" it. So ONE adapter is the complete requirement here, and
-  // the arity cap in `Ltx2ResolveLoraReferenceFactors` that refuses a second one
-  // is a missing capability rather than an unmet requirement of this flag.
+  // stage 2 "may add" it. So ONE adapter is the complete requirement here. A
+  // SECOND one is now expressible — row LTX25-LORA-FUSION lifted the arity cap
+  // in `Ltx2ResolveLoraReferenceFactors`, and `dfr_pipeline.py:212`'s
+  // `(*user_loras, *distilled_lora)` is exactly this composition — but it is
+  // still not a requirement of this flag.
   recipe.requires_distilled_lora = true;
   // THE CHECKPOINT IS NOT THE DISTILLED ONE, although the schedule is. The
   // `Model` column reads `Keyframe-slot SFT + distilled LoRA (+ detailing

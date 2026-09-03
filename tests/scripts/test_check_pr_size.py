@@ -631,6 +631,14 @@ class BudgetEnforcement(unittest.TestCase):
             # all 31 cases red on AttributeError. Measured, not asserted: the
             # suite has no case that passes without touching the checker.
             "scripts/check-attention-rung-consistency.py",
+            # 2026-09-02: the ROCm hardware-dp4a intrinsic gate (ROCM-HW-DP4A).
+            # Created in the same range, so it has no BASE version to mutate.
+            # Its suite imports the checker as a module and every case calls
+            # `check(root=...)`, which the disabled stub does not define, so all
+            # 6 cases go red on AttributeError. Measured with the stub in place,
+            # not asserted: "Ran 6 tests" then "FAILED (errors=6)", with no case
+            # passing on a reduced contract.
+            "scripts/check-rocm-dp4a-intrinsic.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

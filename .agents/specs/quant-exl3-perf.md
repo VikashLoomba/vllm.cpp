@@ -71,14 +71,115 @@ M4  :170  Exl3GemvSelectConfig(bw, 1, 17408, 5120, 3, 2, 1, 159) == -1  -> got 0
 M3 also reds the `(4, 2)` threshold rows, which is the point of recording them
 before that arm exists: they are what the port will be measured against.
 
-### Device arm — PENDING
+### Device arm — `thor:gpu0`, executed 2026-09-03
 
-Queued on `dgx:gpu0` behind other work. NOTHING device-shaped is claimed until
-it runs: not the tier-3c bound at either codebook, not the discrimination check,
-not `narrow_coresident`, and not one throughput number. The mutations that must
-run there are M1 (take `(3,2)` back out of the predicate, which reproduces the
-pre-change binary and is the control the one-binary A/B rests on) and M2 (thread
-`GemvKernelForArm<3, 1>` for `cb == 2`, the confusable pair).
+NVIDIA Thor, compute capability **11.0**, driver **595.78**, nvcc 13.0, built
+`sm_110` from the pinned bundle. `BUILD_RC=0`, so `GemvKernelForArm<3, 2>`
+COMPILES; this was its first build anywhere.
+
+```
+GATE_RC=0
+[doctest] test cases:  7 |  7 passed | 0 failed | 0 skipped
+[doctest] assertions: 76 | 76 passed | 0 failed
+device case SKIPPED count: 0        <- the device arm RAN; it did not skip
+cb 1  tier 3c: relative RMS 5.16027e-04, worst elementwise 0.125
+cb 2  tier 3c: relative RMS 5.27980e-04, worst elementwise 0.125
+(3,1) vs (3,2) differ in 4095 of 4096 outputs
+```
+
+Against the tier-3c bound of `6.0e-3`, the new `(3, 2)` arm measures
+`5.2798e-4` — an order of magnitude inside it, and within 2.3% of the
+established `(3, 1)` arm's `5.16e-4` on the same fixture. The bound was not
+touched.
+
+The discrimination check is what makes those two numbers mean anything: the two
+codebooks disagree on **4095 of 4096** outputs. A `cb` threaded wrongly between
+them would have produced identical output and two green tolerances.
+
+### Mutation table — device arm, `thor:gpu0`
+
+| Mutation | sha256 | built | mtime moved | `TEST_RC` | verdict | restored |
+|---|---|---|---|---|---|---|
+| baseline | — | OK | — | 0 | 76/76 pass, 0 skipped | — |
+| M1 `(3,2)` out of the predicate | `6c2dc9f5d5…` | OK | YES | 1 | **RED** | YES |
+| M2 `cb == 2` → `GemvKernelForArm<3, 1>` | `283d10a5a8…` | OK | YES | 1 | **RED**, 3 failed | YES |
+
+**M1 IS THE REPO'S OWN doctest TRAP, CAUGHT.** Its summary line reads
+`assertions: 71 | 71 passed | 0 failed` — a clean sweep — while `TEST_RC=1`,
+because the case did not fail an assertion, it **THREW**:
+
+```
+test_exl3_gemv.cpp:227: ERROR: test case THREW exception:
+vt cuda exl3: exl3_gemm was asked to force the m<=8 GEMV arm (force_gemv=1)
+but the call is not hard-eligible for it: m=1 k=2048 n=4096 bits=3.
+```
+
+Anything reading that assertions line as the verdict would have recorded M1 as
+GREEN and concluded the gate could not see the arm's removal. Only the exit code
+caught it. That is why every row of this table carries `TEST_RC` and not a
+summary line.
+
+M1 is also the CONTROL the one-binary A/B rests on: with `(3, 2)` out of the
+predicate the tree is the pre-change product exactly, and it refuses by name.
+
+**M2 fails THREE independent assertions**, which is the confusable pair caught
+from three directions at once:
+
+```
+:325  CHECK( rel <= 6.0e-3 )                     NOT correct   <- tier 3c
+:326  CHECK( worst <= 64.0 * UlpF16(rms_ref) )   NOT correct   <- worst element
+:352  CHECK( differing > size/2 )                NOT correct   <- discrimination
+```
+
+Worth stating precisely rather than flattering the design: on THIS fixture the
+tolerance caught the wrong codebook by itself, so the discrimination check was
+not the only line of defence here. It is still the one that GENERALISES. A
+tolerance can only see a mis-threaded codebook when the two decodes happen to
+diverge by more than the bound on the data at hand; the discrimination check
+fails whenever they agree, which is the actual invariant — `(3, 1)` and `(3, 2)`
+are different decodes of the same bits and must never produce the same numbers.
+On the real fixture they differ in 4095 of 4096 outputs.
+
+### THE OCCUPANCY TERM HAS A CEILING, AND IT IS BELOW WHAT THIS CHECKPOINT NEEDS
+
+`DEVICE PROPS SM_COUNT=20 MAX_THREADS_PER_SM=1536 REGS_PER_SM=65536`.
+
+The narrow config launches **512-thread** blocks, so
+`blocks_per_sm <= floor(max_threads_per_sm / 512)` REGARDLESS of registers or
+shared memory — a thread-budget ceiling no kernel tuning can lift. Therefore
+
+```
+narrow_coresident = blocks_per_sm * sm_count
+                 <= floor(max_threads_per_sm / 512) * sm_count
+```
+
+| device | max_threads/SM | SMs | ceiling | n=17408 needs 544 | n=5120 needs 160 |
+|---|---:|---:|---:|---|---|
+| Thor sm_110 (MEASURED) | 1536 | 20 | **60** | CANNOT | CANNOT |
+| GB10, if 1536 / 48 | 1536 | 48 | 144 | CANNOT | CANNOT |
+| GB10, if 2048 / 48 | 2048 | 48 | 192 | **CANNOT** | can |
+
+**This is a PREDICTION, recorded before the `dgx:gpu0` job runs**, so it can be
+falsified rather than fitted afterwards. The `n = 17408` shape — 92 of the 137
+bits-3 modules, every `mlp.gate_proj` and `mlp.up_proj` — needs 544, which needs
+roughly 136 SMs at 4 blocks each. No part in this fleet is close. So at mode 1
+those 92 modules DECLINE on GB10 as certainly as they decline here, and the most
+that can be admitted is the 45 `mlp.down_proj` modules at `n = 5120`, and only
+if GB10 reaches 4 blocks/SM across at least 40 SMs. The dgx job prints
+`SM_COUNT` and `MAX_THREADS_PER_SM`, which settles it.
+
+If the A/B then reads `G1 == G0`, that is not a mystery and not a ceiling: it is
+this table. **The next traceable hypothesis is the WIDE config (CFG 1), not the
+kernel.** The narrow grid is one block per 32 output columns, which is what
+makes a large-`n` shape need a co-resident wave these parts cannot supply;
+upstream's envelope admits the wide config at large-`n`/small-`k` only for
+`K == 4` (`exl3_gemv.cu:69`). That is the `(4, 2)` port, which is already this
+row's largest `## Owed` item — so the measurement and the owed work point at the
+same place, from two directions.
+
+### Device throughput — PENDING
+
+Queued on `dgx:gpu0`. No throughput number is claimed anywhere until it runs.
 
 ## Owed`, itemised, with the reason it is not closed here.
 

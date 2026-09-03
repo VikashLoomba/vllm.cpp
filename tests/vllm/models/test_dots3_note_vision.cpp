@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -41,6 +42,7 @@
 #include <random>
 #include <set>
 #include <system_error>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -51,6 +53,7 @@
 #include "vllm/model_executor/models/dots3_note.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/multimodal/dots3_note_processor.h"
+#include "vllm/multimodal/pil_resize.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -1541,6 +1544,331 @@ TEST_CASE("dots3-note W6a: the image processor mirrors upstream's own resize and
   // wrong grid: the bicubic resize is a named residual, not a silent path.
   std::vector<uint8_t> odd(static_cast<size_t>(9 * 9 * 3), 128);
   CHECK_THROWS_AS((void)proc.ProcessImage(odd.data(), 9, 9), std::runtime_error);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// THE INDEPENDENT RESAMPLER REFERENCE (W6c, #2537). Written from Pillow's
+// `src/libImaging/Resample.c` at tag `12.1.1`; it calls nothing the
+// implementation calls, and every qualified name below is `std::`.
+//
+// It is deliberately a DIFFERENT SHAPE from the implementation. The
+// implementation carries upstream's `bounds` + `ksize` packing, one row of
+// coefficients per output pixel with the window stored as (first, count). This
+// reference builds a DENSE `out x in` weight matrix per axis and multiplies by
+// it, so a transcription of the implementation's indexing cannot be mistaken
+// for a second reading of the algorithm.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace ref_resample {
+
+// `bicubic_filter`, `a = -0.5`, support 2 (Resample.c). Written as the Keys
+// piecewise polynomial rather than in upstream's factored form, so an
+// arithmetic slip in one is not reproduced by the other.
+double Cubic(double t) {
+  const double a = -0.5;
+  const double x = t < 0.0 ? -t : t;
+  if (x < 1.0) return (a + 2.0) * x * x * x - (a + 3.0) * x * x + 1.0;
+  if (x < 2.0) return a * x * x * x - 5.0 * a * x * x + 8.0 * a * x - 4.0 * a;
+  return 0.0;
+}
+
+// One axis' DENSE weight matrix, `out` rows of `in` doubles, normalized per row.
+// `precompute_coeffs`: `scale = in/out`, `filterscale = max(1, scale)`,
+// `support = 2*filterscale`, `center = (o + 0.5)*scale`, weight of input index
+// `i` is `cubic((i - center + 0.5)/filterscale)` over the truncated-and-clamped
+// window, divided by the row sum.
+std::vector<double> Weights(long in_size, long out_size) {
+  std::vector<double> w(static_cast<std::size_t>(out_size * in_size), 0.0);
+  const double scale = static_cast<double>(in_size) / static_cast<double>(out_size);
+  const double fs = scale > 1.0 ? scale : 1.0;
+  const double support = 2.0 * fs;
+  for (long o = 0; o < out_size; ++o) {
+    const double center = (static_cast<double>(o) + 0.5) * scale;
+    long lo = static_cast<long>(center - support + 0.5);
+    if (lo < 0) lo = 0;
+    long hi = static_cast<long>(center + support + 0.5);
+    if (hi > in_size) hi = in_size;
+    double total = 0.0;
+    for (long i = lo; i < hi; ++i) {
+      const double v = Cubic((static_cast<double>(i) - center + 0.5) / fs);
+      w[static_cast<std::size_t>(o * in_size + i)] = v;
+      total += v;
+    }
+    if (total != 0.0) {
+      for (long i = lo; i < hi; ++i) w[static_cast<std::size_t>(o * in_size + i)] /= total;
+    }
+  }
+  return w;
+}
+
+// `normalize_coeffs_8bpc` + the accumulator seed + `clip8`, applied to one
+// weighted sum of 8-bit samples. 22 fraction bits, weights rounded half away
+// from zero, accumulator seeded with half an output level, floor shift, clamp.
+long FixedPointSample(const std::vector<double>& w, std::size_t row_base,
+                      long in_size, const std::vector<unsigned char>& src,
+                      std::size_t src_base, std::size_t src_stride) {
+  const double kUnit = 4194304.0;  // 2^22
+  long acc = 2097152;              // 2^21
+  for (long i = 0; i < in_size; ++i) {
+    const double v = w[row_base + static_cast<std::size_t>(i)] * kUnit;
+    const long q = static_cast<long>(v < 0.0 ? v - 0.5 : v + 0.5);
+    acc += q * static_cast<long>(src[src_base + static_cast<std::size_t>(i) * src_stride]);
+  }
+  long out = acc >> 22;
+  if (out < 0) out = 0;
+  if (out > 255) out = 255;
+  return out;
+}
+
+// The whole `ImagingResampleInner` 8bpc path: horizontal into a uint8
+// intermediate, then vertical over it, each pass skipped when its axis is
+// unchanged.
+std::vector<unsigned char> ResizeExact(const std::vector<unsigned char>& src,
+                                       long ih, long iw, long oh, long ow) {
+  if (ih == oh && iw == ow) return src;
+  std::vector<unsigned char> mid;
+  const std::vector<unsigned char>* stage = &src;
+  long sw = iw;
+  if (ow != iw) {
+    const std::vector<double> w = Weights(iw, ow);
+    mid.assign(static_cast<std::size_t>(ih * ow * 3), 0);
+    for (long y = 0; y < ih; ++y) {
+      for (long x = 0; x < ow; ++x) {
+        for (long c = 0; c < 3; ++c) {
+          mid[static_cast<std::size_t>((y * ow + x) * 3 + c)] =
+              static_cast<unsigned char>(FixedPointSample(
+                  w, static_cast<std::size_t>(x * iw), iw, src,
+                  static_cast<std::size_t>((y * iw) * 3 + c), 3));
+        }
+      }
+    }
+    stage = &mid;
+    sw = ow;
+  }
+  if (oh == ih) return *stage;
+  const std::vector<double> w = Weights(ih, oh);
+  std::vector<unsigned char> out(static_cast<std::size_t>(oh * ow * 3), 0);
+  for (long y = 0; y < oh; ++y) {
+    for (long x = 0; x < ow; ++x) {
+      for (long c = 0; c < 3; ++c) {
+        out[static_cast<std::size_t>((y * ow + x) * 3 + c)] =
+            static_cast<unsigned char>(FixedPointSample(
+                w, static_cast<std::size_t>(y * ih), ih, *stage,
+                static_cast<std::size_t>(x * 3 + c),
+                static_cast<std::size_t>(sw * 3)));
+      }
+    }
+  }
+  return out;
+}
+
+// The same algorithm with the fixed-point ROUNDING removed but the
+// intermediate's SATURATION kept: the uint8 intermediate really does clamp
+// between the two passes, and dropping that is a different algorithm rather
+// than an unrounded one — on a hard 0/255 edge the horizontal overshoot is
+// clipped before the vertical pass ever sees it, which moved this arm by 21.7
+// levels when it was first written without the clamp. What is left out is only
+// step 6, so the residual against the implementation is the rounding alone.
+//
+// This arm exists because the exact reference above and the implementation
+// could in principle share a MISREADING of the quantization and still agree; a
+// defect in the geometry — a half-pixel centre, a dropped support scaling, an
+// unnormalized row — moves this arm too, and by far more than rounding can.
+std::vector<double> ResizeContinuous(const std::vector<unsigned char>& src,
+                                     long ih, long iw, long oh, long ow) {
+  std::vector<double> cur(static_cast<std::size_t>(ih * iw * 3));
+  for (std::size_t i = 0; i < cur.size(); ++i) cur[i] = static_cast<double>(src[i]);
+  long cw = iw;
+  if (ow != iw) {
+    const std::vector<double> w = Weights(iw, ow);
+    std::vector<double> nxt(static_cast<std::size_t>(ih * ow * 3), 0.0);
+    for (long y = 0; y < ih; ++y)
+      for (long x = 0; x < ow; ++x)
+        for (long c = 0; c < 3; ++c) {
+          double a = 0.0;
+          for (long i = 0; i < iw; ++i)
+            a += w[static_cast<std::size_t>(x * iw + i)] *
+                 cur[static_cast<std::size_t>((y * iw + i) * 3 + c)];
+          nxt[static_cast<std::size_t>((y * ow + x) * 3 + c)] = a;
+        }
+    for (double& v : nxt) {
+      if (v < 0.0) v = 0.0;
+      if (v > 255.0) v = 255.0;
+    }
+    cur.swap(nxt);
+    cw = ow;
+  }
+  if (oh != ih) {
+    const std::vector<double> w = Weights(ih, oh);
+    std::vector<double> nxt(static_cast<std::size_t>(oh * cw * 3), 0.0);
+    for (long y = 0; y < oh; ++y)
+      for (long x = 0; x < cw; ++x)
+        for (long c = 0; c < 3; ++c) {
+          double a = 0.0;
+          for (long i = 0; i < ih; ++i)
+            a += w[static_cast<std::size_t>(y * ih + i)] *
+                 cur[static_cast<std::size_t>((i * cw + x) * 3 + c)];
+          nxt[static_cast<std::size_t>((y * cw + x) * 3 + c)] = a;
+        }
+    cur.swap(nxt);
+  }
+  for (double& v : cur) {
+    if (v < 0.0) v = 0.0;
+    if (v > 255.0) v = 255.0;
+  }
+  return cur;
+}
+
+}  // namespace ref_resample
+
+// ---------------------------------------------------------------------------
+// 6b. THE RESAMPLER (W6c, #2537). `Image.Resampling.BICUBIC` is not a four-tap
+//     cubic, and the difference is not a rounding difference on a downscale.
+//
+//     A MEAN error bound is the wrong instrument here, so this case asserts the
+//     PER-PIXEL MAXIMUM against two independent references — one that
+//     reproduces upstream's 22-bit fixed point, where the bound is EXACT
+//     equality (0 levels of 255), and one that stops before the fixed point,
+//     where the bound is 2 levels because that is all the intermediate
+//     rounding can move a pixel. Four defect shapes a tolerance alone cannot
+//     see get their own arms: a half-pixel centre, an axis swap (every case is
+//     non-square in and out), an unnormalized weight row (a near-uniform scale
+//     a relative bound absorbs), and the 0/255 saturation ends.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6c: the bicubic resampler is PIL's, per-pixel and at both extremes") {
+  using vllm::multimodal::PilResizeBicubicRgb;
+
+  // A deterministic image whose value depends on x, y AND channel, so an axis
+  // swap, a dropped channel and a half-pixel shift each change the bytes.
+  const auto make = [](long h, long w, int variant) {
+    std::vector<unsigned char> v(static_cast<std::size_t>(h * w * 3));
+    for (long y = 0; y < h; ++y)
+      for (long x = 0; x < w; ++x)
+        for (long c = 0; c < 3; ++c) {
+          const std::size_t i = static_cast<std::size_t>((y * w + x) * 3 + c);
+          switch (variant) {
+            case 0:  // a hard 0/255 checker: bicubic OVERSHOOTS past both ends
+              v[i] = ((x / 3 + y / 2 + c) % 2) ? 255 : 0;
+              break;
+            case 1:  // a linear ramp: the half-pixel probe
+              v[i] = static_cast<unsigned char>((x * 7 + y * 13 + c * 61) & 0xFF);
+              break;
+            default: {  // high-frequency noise: the aliasing probe
+              unsigned long s = static_cast<unsigned long>(
+                  (y * 1103515245UL + x * 12345UL + c * 7919UL) ^ 0x5DEECE66DUL);
+              s = (s * 6364136223846793005UL + 1442695040888963407UL);
+              v[i] = static_cast<unsigned char>((s >> 33) & 0xFF);
+              break;
+            }
+          }
+        }
+    return v;
+  };
+
+  struct Case {
+    long ih, iw, oh, ow;
+    const char* what;
+  };
+  // Every case is NON-SQUARE in at least one of source and target, and the four
+  // regimes are covered separately because the support scaling exists only on
+  // the downscale side.
+  const std::vector<Case> cases{
+      {29, 45, 28, 44, "mild downscale, both axes, non-square"},
+      {20, 28, 4, 8, "5x by 3.5x downscale — the support scaling dominates"},
+      {6, 14, 8, 16, "the served fixture's own upscale, non-square"},
+      {33, 17, 11, 34, "downscale one axis while UPSCALING the other"},
+      {5, 7, 28, 28, "heavy upscale to a square target from a non-square source"},
+      {24, 24, 24, 8, "one axis unchanged, so only ONE pass runs"},
+  };
+
+  long worst_exact = 0;
+  double worst_cont = 0.0;
+  bool saw_zero = false, saw_255 = false;
+  for (const Case& k : cases) {
+    for (int variant = 0; variant < 3; ++variant) {
+      CAPTURE(std::string(k.what));
+      CAPTURE(variant);
+      const std::vector<unsigned char> src = make(k.ih, k.iw, variant);
+      const std::vector<uint8_t> got =
+          PilResizeBicubicRgb(src.data(), k.ih, k.iw, k.oh, k.ow);
+      REQUIRE(got.size() == static_cast<std::size_t>(k.oh * k.ow * 3));
+
+      const std::vector<unsigned char> want =
+          ref_resample::ResizeExact(src, k.ih, k.iw, k.oh, k.ow);
+      const std::vector<double> cont =
+          ref_resample::ResizeContinuous(src, k.ih, k.iw, k.oh, k.ow);
+      REQUIRE(want.size() == got.size());
+      REQUIRE(cont.size() == got.size());
+
+      long maxe = 0;
+      double maxc = 0.0;
+      for (std::size_t i = 0; i < got.size(); ++i) {
+        const long d = std::abs(static_cast<long>(got[i]) -
+                                static_cast<long>(want[i]));
+        if (d > maxe) maxe = d;
+        const double dc = std::fabs(static_cast<double>(got[i]) - cont[i]);
+        if (dc > maxc) maxc = dc;
+        if (got[i] == 0) saw_zero = true;
+        if (got[i] == 255) saw_255 = true;
+      }
+      // EXACT. Both sides compute the same 22-bit fixed point, so any
+      // disagreement at all is a defect and not a tolerance question.
+      CHECK(maxe == 0);
+      // ...and the geometry alone, with no fixed point anywhere, agrees to
+      // within what the intermediate rounding can move a pixel.
+      CHECK(maxc <= 2.0);
+      if (maxe > worst_exact) worst_exact = maxe;
+      if (maxc > worst_cont) worst_cont = maxc;
+    }
+  }
+  MESSAGE("W6c resampler: per-pixel max |impl - fixed-point ref| = ", worst_exact,
+          " of 255 levels over ", cases.size() * 3, " cases");
+  MESSAGE("W6c resampler: per-pixel max |impl - continuous ref| = ", worst_cont,
+          " of 255 levels (bound 2.0)");
+  // The saturating clamp was REACHED at both ends rather than assumed: the
+  // 0/255 checker downscaled overshoots past both, and a clamp that only
+  // guarded one end would have been invisible without this.
+  CHECK(saw_zero);
+  CHECK(saw_255);
+
+  SUBCASE("an unchanged size is the identity, byte for byte") {
+    const std::vector<unsigned char> src = make(9, 13, 2);
+    const std::vector<uint8_t> got = PilResizeBicubicRgb(src.data(), 9, 13, 9, 13);
+    REQUIRE(got.size() == src.size());
+    CHECK(std::equal(src.begin(), src.end(), got.begin()));
+  }
+
+  SUBCASE("a non-positive extent refuses by name") {
+    const std::vector<unsigned char> src = make(4, 4, 1);
+    CHECK_THROWS_AS((void)PilResizeBicubicRgb(src.data(), 4, 4, 0, 4),
+                    std::runtime_error);
+    CHECK_THROWS_AS((void)PilResizeBicubicRgb(src.data(), 4, 4, 4, -1),
+                    std::runtime_error);
+  }
+
+  // A CONSTANT image must survive any resize unchanged. This is the arm the
+  // weight normalization owns on its own: unnormalized rows scale a flat field
+  // away from its own value, at the borders first and everywhere on a
+  // downscale, and a relative tolerance on a textured image can absorb that.
+  SUBCASE("a constant field is preserved, which is what per-row normalization buys") {
+    for (const Case& k : cases) {
+      CAPTURE(std::string(k.what));
+      for (int level : {0, 1, 137, 254, 255}) {
+        const std::vector<unsigned char> src(
+            static_cast<std::size_t>(k.ih * k.iw * 3),
+            static_cast<unsigned char>(level));
+        const std::vector<uint8_t> got =
+            PilResizeBicubicRgb(src.data(), k.ih, k.iw, k.oh, k.ow);
+        long maxe = 0;
+        for (uint8_t v : got) {
+          const long d = std::abs(static_cast<long>(v) - static_cast<long>(level));
+          if (d > maxe) maxe = d;
+        }
+        CAPTURE(level);
+        CHECK(maxe == 0);
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

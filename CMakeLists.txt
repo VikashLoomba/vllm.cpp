@@ -1087,6 +1087,9 @@ add_library(vllm STATIC
   # (ENG-MM-INPUT-PIPELINE L1, #607).
   src/vllm/multimodal/processing/context.cpp
   src/vllm/multimodal/dots3_note_processor.cpp
+  # Pillow's BICUBIC resampler, which is NOT torchvision's and NOT a four-tap
+  # cubic (dots3-note W6c, #2537).
+  src/vllm/multimodal/pil_resize.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end

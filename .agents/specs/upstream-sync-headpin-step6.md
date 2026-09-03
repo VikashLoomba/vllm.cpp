@@ -202,8 +202,9 @@ which no host in this fleet is: GB10 is `sm_121` and the local workspace box
    `5559679229`; the docstring at `:97-100` says "opt-in only"). On a family-120
    host neither branch fires and the function returns `triton`, the FLA path.
 3. **FA4.** The `import cutlass` calls in
-   `vllm/v1/attention/backends/flash_attn.py:1401-1403` and `:1489-1490` are
-   function-local, inside `vllm_flash_attn.cute` helpers on the FA4 path. The
+   `vllm/v1/attention/backends/flash_attn.py:1401-1403` and `:1489-1490` @
+   `5559679229` are function-local, inside `vllm_flash_attn.cute` helpers on
+   the FA4 path. The
    recorded runs selected FA2 (`docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md:35-36`,
    `FLASH_ATTN` out of four candidates) and `.agents/sync/2026-09-03-e126687-runhalf.md`
    §2 records the same selection at the target.

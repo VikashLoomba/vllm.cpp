@@ -233,6 +233,7 @@ const ModelFactory kQwen3_5MoeFactory{
     // the lane is on. Both arms registered below share this factory and therefore
     // this answer; the DENSE Qwen3.5 arms have no expert tower and keep the
     // default.
+    .consumes_device_token_ids = true,
     .streams_routed_experts = true,
 };
 

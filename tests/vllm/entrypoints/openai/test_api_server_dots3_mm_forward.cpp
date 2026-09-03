@@ -578,8 +578,23 @@ TEST_CASE("dots3-note W6b: two DIFFERENT images through a PYRAMID tower give two
 //     So the router needs its own served assertion, and this is its shape: two
 //     checkpoints that differ in `mlp.router_bias` AND IN NOTHING ELSE — every
 //     other tensor is drawn from the same seed stream — must produce different
-//     logprobs. A router that ignores its bias, ignores its input, or feeds a
-//     constant FFN gives the two identical answers and this case reds.
+//     logprobs.
+//
+//     WHAT IT DETECTS, EXACTLY, AND WHAT NO CASE IN THIS FILE DETECTS. It reds
+//     when the router ignores its bias, ignores its input, or feeds a constant
+//     FFN — three defects that all change WHICH expert runs, and therefore
+//     change the answer once the two checkpoints stop disagreeing about the
+//     selection. It is NOT a gate on routed ARITHMETIC. Spec §4.12.9's M6
+//     measures that limit: swapping which selected slot each expert's output is
+//     written into multiplies every expert output by the OTHER selected
+//     expert's routing weight — a genuine routed-path arithmetic defect that
+//     leaves the selection SET intact — and it left this ENTIRE suite green,
+//     12/12, while reding the tower gate on tolerance alone.
+//
+//     So this file gates REACHABILITY and BIAS-DEPENDENCE of the routed block,
+//     and nothing about the arithmetic inside it. The tower gate
+//     (`test_dots3_note_vision`) is where routed arithmetic is caught, and spec
+//     §4.12.6 records why a served case cannot cheaply be made to catch it.
 // ---------------------------------------------------------------------------
 TEST_CASE("dots3-note W6b: the router BIAS changes what the server answers") {
   TinySpec biased;

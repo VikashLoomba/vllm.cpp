@@ -4022,23 +4022,23 @@ Every number below was read from the COMMITTED fixture
 | `pre_pixel_shuffle` | true | the PREPROCESSOR emits 2x2-grouped patch rows and RoPE regroups to match |
 | `adapter_type` | `"patch_merger"` | `PatchMergerAdapter`, NOT `PixelShuffleAdapter` |
 | `adapter_in_dim` / `adapter_out_dim` | 1536 / 5120 | 4x1536 = 6144 folded to the text tower's 5120 |
-| `pyramid_num_routed` | `[-1 x 25, 4, 8, ..., 60, 64, 64]` | `is_moe` is `pyramid_num_routed[i] > 0` (vision.py:346-350), so -1 is DENSE |
+| `pyramid_num_routed` | `[-1 x 25, 4, 8, ..., 60, 64, 64]` | `is_moe` is `pyramid_num_routed[i] > 0` (vision.py:363-366), so -1 is DENSE |
 
 **One word in #2512 needs correcting, and the fixture is what corrects it.** The
 issue's scope prose says the dense arm is "`post_trunk_norm` -> pixel shuffle ->
 `adapter`". The released `vision_config` sets `adapter_type: "patch_merger"`,
 and `PatchMergerAdapter` is upstream's own name for the arm that **skips the
 pixel-shuffle permutation** and instead views every 4 consecutive 2x2-grouped
-tokens as one row (`vision.py:441-449`, its docstring). The 2x2 regrouping has
+tokens as one row (`vision.py:465-471`, its docstring). The 2x2 regrouping has
 not disappeared; `pre_pixel_shuffle: true` moved it into the PREPROCESSOR
 (`processor.py:185-197`, the nine-way reshape and the `(0,3,6,4,7,2,1,5,8)`
 transpose) and into the RoPE position builder
-(`get_pos_ids_by_grid:566-575`, `rope_merge_size = spatial_merge_size`).
+(`get_pos_ids_by_grid:565-574`, `rope_merge_size = spatial_merge_size`).
 
 This is not a disagreement about geometry, and it did not need escalating.
 #2512's own tensor inventory says `adapter.{ln_q, mlp.0, mlp.2}`, which is
 `PatchMergerAdapter`'s state dict and nothing else — `PixelShuffleAdapter`
-spells its parameters `proj.0` / `proj.1` / `proj.3` (`vision.py:397-406`). The
+spells its parameters `proj.0` / `proj.1` / `proj.3` (`vision.py:423`, `:432-437`). The
 inventory is right and the prose word is loose. W6a implements
 `patch_merger`, and `pixel_shuffle_mlp` is REFUSED BY NAME rather than
 silently mapped onto it, because the two produce different token orders from
@@ -4139,7 +4139,7 @@ own softmax, its own rope and its own norms; the implementation is
 over bf16 device buffers through the shared seams.
 
 **One formula difference is deliberate and is recorded rather than hidden.**
-Upstream's vision `RMSNorm.forward` (`vision.py:112-114`) casts the normalized
+Upstream's vision `RMSNorm.forward` (`vision.py:114-116`) casts the normalized
 value back to the activation dtype BEFORE multiplying by the weight; `vt::RmsNorm`
 keeps f32 through the weight multiply and rounds once on the store (its own
 header says so). Using the shared op is the seam rule. The reference does NOT
@@ -4358,17 +4358,17 @@ carrying `4, 8, 12 ... 60, 64, 64` = **608** routed experts, `17 * 8 + 608 * 3 =
 Upstream's router, line by line at `9035151d6`:
 
 ```
-:181  gate_logits = F.linear(x_flat.float(), self.gate_weight.float())
+:180  gate_logits = F.linear(x_flat.float(), self.gate_weight.float())
 :183  gating_prob = torch.sigmoid(gate_logits)                   # ELEMENTWISE
-:193  gating_with_bias = gating_prob + router_bias.to(f32)
-:194  _, topk_indices = torch.topk(gating_with_bias, k=topk, sorted=False)
-:196  routed_weights = gating_prob.gather(1, topk_indices)       # UNBIASED
-:197  if sigmoid and topk > 1: routed_weights /= (sum + 1e-9)
-:201  routed_weights = routed_weights * self.router_scale
+:192  gating_with_bias = gating_prob + router_bias.to(f32)
+:193  _, topk_indices = torch.topk(gating_with_bias, k=topk, sorted=False)
+:195  routed_weights = gating_prob.gather(1, topk_indices)       # UNBIASED
+:196  if sigmoid and topk > 1: routed_weights /= (sum + 1e-9)
+:200  routed_weights = routed_weights * self.router_scale
 ```
 
 `vt::MoeRouterTopK` with `num_expert_group = 1` is that function and not an
-approximation of it. Its grouped arm (`cpu_ops.cpp:2825-2942`, ported from
+approximation of it. Its grouped arm (`cpu_ops.cpp:2821-2948`, ported from
 `grouped_topk_router.py:110-160`) computes sigmoid scores elementwise, adds the
 bias to the SELECTION score only, reads the weight from the UNBIASED score,
 renormalizes by the selected sum and then applies `routed_scaling_factor`. At one
@@ -4398,20 +4398,34 @@ a WIDENING relative to upstream and `porting.md`'s memory-format rule asks for
 the reason in writing: the buffer is `[L, top_k]` f32, four bytes per selected
 slot, and its dtype is the shared ops' CONTRACT rather than a choice made here —
 narrowing it would mean a bf16 round trip that no op in `include/vt/ops.h`
-offers, written by hand beside the seam. It is also self-cancelling to first
-order, because both upstream and this port divide by the sum of the very
-coefficients they mixed with, so what survives is the ~4e-3 relative
-requantization of a 2-way mixture rather than a scale error. The reference keeps
-double throughout and models NEITHER rounding, which is why this sits inside the
-measured 7.81e-3 rather than beside it. Recorded here because a reader comparing
+offers, written by hand beside the seam.
+
+It is also self-cancelling to first order — but NOT by the symmetry an earlier
+draft of this paragraph claimed, and the correction matters because that false
+symmetry is what would have made the argument sound like a licence to narrow.
+UPSTREAM does divide by the sum of the very coefficients it mixed with:
+`aggregated_gate` is accumulated from the same rounded `routed_weights` values
+that scaled the expert outputs (`vision.py:213`, `:215-217`), so its rounding
+cancels term by term. **This port does not divide by that sum at all.**
+`VisionMoeFfn` hands `vt::MoeCombine` the CONSTANT
+`1.0f / (router_scale + 1e-9f)` (`dots3_note_vision.cpp`, the combine call),
+never the realised sum of `tw`. The two denominators agree only because
+§4.12.3's identity holds — after the renormalize at `:196-:199` the f32 weights
+sum to `router_scale`, at f32 to about 1e-7 — and that identity is a property
+`Dots3NoteVisionRefusal` defends, not an algebraic equality of the two
+expressions. So what survives is upstream's ~4e-3 relative requantization of a
+2-way mixture, mostly cancelled on upstream's own side, rather than a scale
+error on either. The reference keeps double throughout and models NEITHER
+rounding, which is why this sits inside the measured 7.81e-3 rather than beside
+it. Recorded here because a reader comparing
 `vision.py:200` with `VisionMoeFfn` will see the difference and is owed the
 reason; it is not owed a brick.
 
 #### 4.12.3 The combine's denominator is a CONSTANT, and that is why two arms refuse
 
-Upstream's combine (`vision.py:203-218`) accumulates a per-token
+Upstream's combine (`vision.py:202-217`) accumulates a per-token
 `aggregated_gate` and returns `aggregated_output / (aggregated_gate + 1e-9)`.
-After `:197-:201` the routed weights sum to `router_scale` for every token, so
+After `:196-:200` the routed weights sum to `router_scale` for every token, so
 that denominator is a per-tower CONSTANT and `vt::MoeCombine`'s single-float
 `routed_scale` expresses it exactly as `1 / (router_scale + 1e-9)`.
 
@@ -4448,7 +4462,7 @@ claim.
 
 #### 4.12.5 The F32 is on the OUTPUT, not on the operands
 
-Upstream writes `.float()` on both sides of the router GEMM (`:181`). Both sides
+Upstream writes `.float()` on both sides of the router GEMM (`:180`). Both sides
 are bf16-VALUED — `x` is the bf16 `norm_2` output and `gate_weight` is BF16 on
 disk in the released index — and a bf16 x bf16 product is exact in f32. A
 bf16-operand GEMM with an f32 accumulator therefore IS
@@ -4459,7 +4473,7 @@ memory-format rule applied in the direction it is usually not.
 
 `router_bias` is the exception that really is f32, and it is UPSTREAM'S choice:
 `register_buffer("router_bias", torch.zeros(num_routed, dtype=torch.float32))`
-(`vision.py:152-155`). Those 17 buffers are exactly the 17 F32 tensors the
+(`vision.py:152-154`). Those 17 buffers are exactly the 17 F32 tensors the
 released vision tower carries against 2178 BF16 ones, and the census that says so
 is §4.4's. The loader asserts the dtype in BOTH directions — `RequireVisionShape`
 refuses a widened weight, `RequireF32VisionShape` refuses a narrowed bias — and
@@ -4506,7 +4520,7 @@ performance number is claimable on any axis** while B holds.
 | Arm | W6b | Why |
 |---|---|---|
 | `adapter_type = pixel_shuffle_mlp` | **LIFTED** | `PixelShuffleAdapter` (`vision.py:419-461`) is a real published adapter with its own state dict (`proj.0`/`proj.1`/`proj.3`) and its own token order. Implemented, and gated against a reference that spells the reshape/permute chain rather than the closed form the implementation gathers by |
-| `post_norm = false` | **LIFTED** | W6a's forward and enumerator already had the branch; only the refusal stood in front of it. `nn.Identity()` upstream (`vision.py:513-514`), one tensor fewer |
+| `post_norm = false` | **LIFTED** | W6a's forward and enumerator already had the branch; only the refusal stood in front of it. Upstream creates the `post_trunk_norm` attribute only under `if config.post_norm:` (`vision.py:525-526`) and guards the call with the same flag in `forward` (`:673-674`) — there is no `nn.Identity` in the file, so the step is ABSENT rather than an identity; one tensor fewer |
 | `use_qk_norm = false` | **LIFTED** | upstream builds no `q_norm`/`k_norm` module (`vision_attention.py:145-147`) and the checkpoint ships neither; two tensors fewer per block |
 | `is_causal = true` | **LIFTED** | `causal=self.is_causal` on the FLASH family (`vision_attention.py:265`, `:291`, `:302`), which is what the released `attn_implementation = flash_attention_3` selects |
 | `use_bias = true` | **STILL REFUSED**, [#2616](https://github.com/mudler/vllm.cpp/issues/2616) | see below |
@@ -5201,7 +5215,7 @@ dispatchable in order, under the constraints that answer imposes.
   The evidence that moved it is the row's own W2 census: the released bf16
   `dots-studio/dots3-note-prev` carries 37944 BF16 + 62 F32 tensors and NO scale
   tensors at all (§4.4), so there is no FP8 formula anywhere in the arm W6
-  loads; `MoESwiGLUFFNFP8.process_weights_after_loading` (`vision.py:226-268` @
+  loads; `MoESwiGLUFFNFP8.process_weights_after_loading` (`vision.py:245-283` @
   `9035151d6`) CASTS bf16 experts to block-FP8 at load, which is a quantized
   path this port does not take, and the `-fp8` sibling that ships those scales
   is already refused BY NAME as W9. **R5 moved with it** (§8).
@@ -5259,8 +5273,8 @@ Carried openly under option B (§6.4), not waived:
   `Dots3NoteVisionRefusal` turns away a `vision_config` whose
   `router_scoring_func` is not `"sigmoid"`, and one whose
   `min(int(capacity_factor), num_routed)` is below 2 on any routed block. Both
-  are arms upstream implements (`vision.py:185-186`, and the `topk > 1` guard at
-  `:197` @ `9035151d6`). The reason is §4.12.3's: on those arms upstream skips
+  are arms upstream implements (`vision.py:184-185`, and the `topk > 1` guard at
+  `:196` @ `9035151d6`). The reason is §4.12.3's: on those arms upstream skips
   the weight renormalization, which leaves the self-normalizing combine's
   `aggregated_gate` denominator PER TOKEN, and no op in `include/vt/ops.h`
   expresses a per-token scale on the combine — `vt::MoeCombine`'s `routed_scale`
@@ -5276,7 +5290,7 @@ Carried openly under option B (§6.4), not waived:
 - **`use_bias = true` is refused for the whole vision tower.** Upstream threads
   `DotsMoEVitConfig.use_bias` (`vision.py:43` @ `9035151d6`) into the attention
   `qkv`/`proj` (`vision_attention.py:143-144`), every dense block's `fc1`/`fc2`/
-  `fc3` (`vision.py:129-134`) and every routed EXPERT's (`vision.py:158-163`) —
+  `fc3` (`vision.py:129-133`) and every routed EXPERT's (`vision.py:159`) —
   1949 extra tensors on the released geometry. It is refused rather than
   implemented for three reasons, none of them effort: nothing published sets the
   key (upstream's default is `False` and the released config agrees); the shared

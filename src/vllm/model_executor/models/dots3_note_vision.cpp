@@ -108,7 +108,7 @@ void RequireVisionShape(const OwnedTensor& t, const std::string& name,
 
 // The SAME assertion pointed the other way, for the ONE family of vision
 // tensors upstream itself declares f32: `register_buffer("router_bias",
-// torch.zeros(num_routed, dtype=torch.float32))` (vision.py:152-155 @
+// torch.zeros(num_routed, dtype=torch.float32))` (vision.py:152-154 @
 // 9035151d6). 17 of them against 2178 BF16 tensors in the released tower. A
 // NARROWED router bias is as invisible to a token gate as a widened weight, so
 // the load names the dtype in both directions instead of accepting the file's.
@@ -121,7 +121,7 @@ void RequireF32VisionShape(const OwnedTensor& t, const std::string& name,
   VT_CHECK(t.dtype == DType::kF32,
            "dots3-note vision tower: '" + name +
                "' is not F32 after load. Upstream registers this buffer "
-               "`dtype=torch.float32` (vision.py:152-155 @ 9035151d6) and the "
+               "`dtype=torch.float32` (vision.py:152-154 @ 9035151d6) and the "
                "released checkpoint ships it F32; a narrower store changes "
                "which experts the top-k selects and no token gate can see it "
                "(porting.md).");
@@ -141,7 +141,7 @@ OwnedTensor LoadVisionF32Vector(const TensorResolver& get,
            "dots3-note vision tower: expected F32 for " + name +
                " but the checkpoint ships " + t.dtype +
                " — `router_bias` is registered `dtype=torch.float32` upstream "
-               "(vision.py:152-155 @ 9035151d6) and is one of the 17 F32 "
+               "(vision.py:152-154 @ 9035151d6) and is one of the 17 F32 "
                "tensors in an otherwise all-BF16 tower");
   VT_CHECK(t.shape.size() == 1,
            "dots3-note vision tower: expected a 1-D tensor for " + name);
@@ -195,7 +195,7 @@ Dots3NoteVisionParams ParseDots3NoteVisionParams(const HfConfig& config) {
   if (pyr != j.end() && !pyr->is_null()) {
     VT_CHECK(pyr->is_array(),
              "dots3-note vision_config: `pyramid_num_routed` must be a list "
-             "(vision.py:90 @ 9035151d6), got " + pyr->dump());
+             "(vision.py:91 @ 9035151d6), got " + pyr->dump());
     for (const nlohmann::json& e : *pyr) {
       VT_CHECK(e.is_number_integer(),
                "dots3-note vision_config: `pyramid_num_routed` entries must be "
@@ -226,7 +226,7 @@ Dots3NoteVisionParams ParseDots3NoteVisionParams(const HfConfig& config) {
            "dots3-note vision_config: head_dim " +
                std::to_string(v.head_dim()) +
                " is odd; the 2-D vision RoPE splits it into a height half and a "
-               "width half (vision.py:503-504 @ 9035151d6)");
+               "width half (vision.py:518-519 @ 9035151d6)");
   VT_CHECK(v.spatial_merge_size > 0 && v.adapter_merge_size > 0,
            "dots3-note vision_config: spatial_merge_size and adapter_merge_size "
            "must be positive");
@@ -237,7 +237,7 @@ Dots3NoteVisionParams ParseDots3NoteVisionParams(const HfConfig& config) {
                std::to_string(v.pyramid_num_routed.size()) + " entries for " +
                std::to_string(v.num_hidden_layers) +
                " blocks. Upstream indexes it by layer number "
-               "(vision.py:346-350 @ 9035151d6), so a short list would make the "
+               "(vision.py:363-366 @ 9035151d6), so a short list would make the "
                "tail silently dense.");
   return v;
 }
@@ -255,21 +255,21 @@ std::string Dots3NoteVisionRefusal(
   if (!weight_block_size.empty() || quant_method == "fp8") {
     return "the checkpoint is BLOCKWISE-QUANTIZED (`quantization_config"
            ".weight_block_size`), and the vision tower's FP32-scale FP8 arm "
-           "(`MoESwiGLUFFNFP8`, vision.py:222-297 @ 9035151d6, and "
+           "(`MoESwiGLUFFNFP8`, vision.py:242-315 @ 9035151d6, and "
            "nvidia/vision_moe.py's `note_vision_fused_moe_fp8`) is W9";
   }
   if (v.temporal_patch_size != 1) {
     return "`temporal_patch_size` is " + std::to_string(v.temporal_patch_size) +
            ", which is the VIDEO arm: `DotsPatchEmbed.forward` takes "
-           "`[:, :, 0]` of the temporal axis (vision.py:317-325 @ 9035151d6) "
+           "`[:, :, 0]` of the temporal axis (vision.py:337-343 @ 9035151d6) "
            "and the multi-frame `cu_seqlens` builder is a different one "
-           "(vision.py:613-624). Video is W7";
+           "(vision.py:609-629). Video is W7";
   }
   if (v.use_bias) {
     return "`use_bias` is true, so `attn.qkv`, `attn.proj` and every "
            "`mlp.fc*` — of the dense blocks AND of every routed expert — would "
            "carry a bias the released checkpoint does not ship "
-           "(vision_attention.py:143-144 and vision.py:129-134, :158-163 @ "
+           "(vision_attention.py:143-144 and vision.py:129-133, :159 @ "
            "9035151d6). The shared `layers::MlpGateUpMethodBase` seam has no "
            "bias operand, so lifting this means extending that seam rather "
            "than adding an arm here. Owed under "
@@ -278,9 +278,9 @@ std::string Dots3NoteVisionRefusal(
   // ── THE PYRAMID ROUTER ARMS W6b DOES NOT SERVE ────────────────────────────
   //
   // These two exist because upstream's combine is SELF-NORMALIZING: it divides
-  // the routed sum by a per-token `aggregated_gate + 1e-9` (vision.py:207-218).
+  // the routed sum by a per-token `aggregated_gate + 1e-9` (vision.py:212-217).
   // On the sigmoid arm with `topk > 1` the weights were already renormalized to
-  // sum to `router_scale` (vision.py:182-184), so that denominator is a
+  // sum to `router_scale` (vision.py:196-200), so that denominator is a
   // CONSTANT and folds exactly into `vt::MoeCombine`'s `routed_scale`. On the
   // other arms it is per-token, and no shared op expresses a per-token scale on
   // the combine. Refusing beats a host round-trip per routed block, and beats
@@ -291,8 +291,8 @@ std::string Dots3NoteVisionRefusal(
            "'. W6b serves the SIGMOID arm (vision.py:182-183 @ 9035151d6), "
            "which is what the released `dots-studio/dots3-note-prev` and "
            "`DotsMoEVitConfig`'s own default both select. The softmax branch "
-           "(vision.py:185-186) leaves the combine's `aggregated_gate` "
-           "denominator per-token (vision.py:207-218), which `vt::MoeCombine`'s "
+           "(vision.py:184-185) leaves the combine's `aggregated_gate` "
+           "denominator per-token (vision.py:212-217), which `vt::MoeCombine`'s "
            "single-float `routed_scale` cannot express. Owed under "
            "`.agents/specs/dots3-note.md` `## Owed`, issue #2615";
   }
@@ -302,10 +302,10 @@ std::string Dots3NoteVisionRefusal(
     return "vision block " + std::to_string(i) + " routes to top-" +
            std::to_string(v.routed_top_k(i)) + " of " +
            std::to_string(v.pyramid_num_routed[static_cast<size_t>(i)]) +
-           " experts (`min(int(capacity_factor), num_routed)`, vision.py:180 @ "
+           " experts (`min(int(capacity_factor), num_routed)`, vision.py:190 @ "
            "9035151d6). Below 2 upstream SKIPS the weight renormalization "
-           "(vision.py:182), which leaves the combine's `aggregated_gate` "
-           "denominator per-token (vision.py:207-218) and `vt::MoeCombine`'s "
+           "(vision.py:196), which leaves the combine's `aggregated_gate` "
+           "denominator per-token (vision.py:212-217) and `vt::MoeCombine`'s "
            "single-float `routed_scale` cannot express it. The released "
            "checkpoint's `capacity_factor` is 2 and its smallest block routes "
            "to 4 experts. Owed under `.agents/specs/dots3-note.md` `## Owed`, "
@@ -350,7 +350,7 @@ std::string Dots3NoteVisionRefusal(
            " is not the TEXT tower's `hidden_size` " +
            std::to_string(v.text_hidden_size) +
            ", so `adapter.mlp.2` emits rows that cannot be scattered into the "
-           "prompt at all (vision.py:461 @ 9035151d6 against "
+           "prompt at all (vision.py:476, :485 @ 9035151d6 against "
            "`config.hidden_size`). This is the comparison "
            "`EncodeMmDots3NoteForCausalLM` makes on a served request";
   }
@@ -363,7 +363,7 @@ std::string Dots3NoteVisionRefusal(
            "(multimodal.py:151-155 @ 9035151d6, and this port's "
            "`Dots3NoteProcessorConfig::merge_size`, which is read from that "
            "key) while the ADAPTER folds `adapter_merge_size**2` trunk tokens "
-           "into each emitted row (vision.py:441-449). Upstream keeps the two "
+           "into each emitted row (vision.py:478, :495). Upstream keeps the two "
            "as independent keys with independent defaults, so a checkpoint can "
            "carry them disagreeing; serving it would either leave the trunk "
            "length not grouping into whole merger rows, or emit a row count "
@@ -477,7 +477,7 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
   Dots3NoteVisionWeights w;
 
   // `DotsPatchEmbed.proj` is an `nn.Conv2d(C, E, kernel=stride=patch)`
-  // (vision.py:308-314), so its weight ships [E, C, p, p]. The forward takes
+  // (vision.py:328-333), so its weight ships [E, C, p, p]. The forward takes
   // `[:, :, 0]` of a temporal axis of size 1 and then applies a kernel that
   // covers exactly one patch with no overlap, which is a Linear over the
   // flattened patch row — so it is read as [E, C*tp*p*p] here. The shape
@@ -552,7 +552,7 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
       }
     } else {
       // fc1 = the SwiGLU gate, fc3 = the up projection
-      // (`fc2(F.silu(fc1(x)) * fc3(x))`, vision.py:132-133). The merge is what
+      // (`fc2(F.silu(fc1(x)) * fc3(x))`, vision.py:136). The merge is what
       // routes this pair through `layers::MlpGateUpMethodBase` instead of a
       // hand-written parallel path.
       bw.gate_up = LoadMergedBf16RawNK(
@@ -619,7 +619,7 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
 
 std::vector<std::array<int64_t, 2>> Dots3NoteVisionPosIds(
     const std::array<int64_t, 3>& grid_thw, const Dots3NoteVisionParams& v) {
-  // `get_pos_ids_by_grid` (vision.py:566-603 @ 9035151d6). When
+  // `get_pos_ids_by_grid` (vision.py:565-599 @ 9035151d6). When
   // `pre_pixel_shuffle` is set the positions follow the qwen `merge_size`
   // GROUPED layout, because the preprocessor already emitted the patch rows in
   // that order; otherwise they are flat row-major regardless of
@@ -633,7 +633,7 @@ std::vector<std::array<int64_t, 2>> Dots3NoteVisionPosIds(
                std::to_string(wgrid) +
                " is not divisible by the RoPE merge size " +
                std::to_string(rope_merge) +
-               ", so the grouped position reshape (vision.py:576-590 @ "
+               ", so the grouped position reshape (vision.py:580-597 @ "
                "9035151d6) has no answer");
   std::vector<std::array<int64_t, 2>> one;
   one.reserve(static_cast<size_t>(h * wgrid));
@@ -657,11 +657,11 @@ std::vector<std::array<int64_t, 2>> Dots3NoteVisionPosIds(
 
 std::vector<float> Dots3NoteVisionRopeCache(
     const std::array<int64_t, 3>& grid_thw, const Dots3NoteVisionParams& v) {
-  // `VisionRotaryEmbedding(head_dim // 2)` (vision.py:503-504) builds
+  // `VisionRotaryEmbedding(head_dim // 2)` (vision.py:518-519) builds
   // `inv_freq = 1 / theta ** (arange(0, dim, 2) / dim)` with `dim = head_dim/2`
   // (vision_attention.py:67), i.e. head_dim/4 frequencies per spatial axis.
   // `rot_pos_emb` gathers [L, 2, nf] and flattens to [L, 2*nf] = [L, head_dim/2]
-  // (vision.py:604-611). `apply_rotary_pos_emb_vision` then repeats that to
+  // (vision.py:601-607). `apply_rotary_pos_emb_vision` then repeats that to
   // head_dim as [f | f] and applies NeoX rotate_half
   // (vision_attention.py:39-49) — which is exactly the [cos(hd/2) | sin(hd/2)]
   // cache `vt::RopeFromCache` consumes at `rotary_dim == head_dim`.
@@ -719,23 +719,23 @@ std::vector<float> DownloadF32(Dev d, DBuf& buf, int64_t n) {
 
 // ── the PYRAMID MoE FFN (W6b) ───────────────────────────────────────────────
 //
-// `MoESwiGLUFFN.forward` (vision.py:170-219 @ 9035151d6), one routed block.
+// `MoESwiGLUFFN.forward` (vision.py:170-218 @ 9035151d6), one routed block.
 //
 // WHY THE SHARED ROUTER OP IS THE WHOLE ROUTER, and not a starting point.
 // Upstream's five router steps are, line by line:
 //
-//   :181  gate_logits  = F.linear(x.float(), gate_weight.float())
+//   :180  gate_logits  = F.linear(x.float(), gate_weight.float())
 //   :183  gating_prob  = sigmoid(gate_logits)                    [ELEMENTWISE]
-//   :193  biased       = gating_prob + router_bias.float()
-//   :194  topk over `biased`, `sorted=False`
-//   :196  routed_w     = gating_prob.gather(topk_indices)        [UNBIASED]
-//   :197-:200 sigmoid and topk>1  ->  routed_w /= (sum + 1e-9)
-//   :201  routed_w    *= router_scale
+//   :192  biased       = gating_prob + router_bias.float()
+//   :193  topk over `biased`, `sorted=False`
+//   :195  routed_w     = gating_prob.gather(topk_indices)        [UNBIASED]
+//   :196-:199 sigmoid and topk>1  ->  routed_w /= (sum + 1e-9)
+//   :200  routed_w    *= router_scale
 //
 // `vt::MoeRouterTopK` with `num_expert_group == 1` IS that function: the group
 // stage is definitionally inert at one group (the mask is all-ones), the
 // scoring func is sigmoid, the bias shifts the SELECTION score only and the
-// weight is read from the UNBIASED score (`cpu_ops.cpp:2856-2930`, ported from
+// weight is read from the UNBIASED score (`cpu_ops.cpp:2821-2948`, ported from
 // `grouped_topk_router.py:110-160`), the renormalize divides by the selected
 // sum, and `routed_scaling_factor` multiplies afterwards. The two differ ONLY
 // in the `1e-9` upstream adds to the renormalize denominator, which is 1e-9
@@ -749,9 +749,9 @@ std::vector<float> DownloadF32(Dev d, DBuf& buf, int64_t n) {
 // `dots3_note_device.cpp`'s language MoE records for `n_group == 1`.
 //
 // AND WHY `routed_scale` CARRIES THE COMBINE'S DIVISION. Upstream's combine is
-// self-normalizing (:207-:218): it accumulates `aggregated_gate[t]` = the sum of
+// self-normalizing (:212-:217): it accumulates `aggregated_gate[t]` = the sum of
 // that token's routed weights and divides the routed sum by
-// `aggregated_gate + 1e-9`. After the renormalize at :197-:201 that sum is
+// `aggregated_gate + 1e-9`. After the renormalize at :196-:200 that sum is
 // `router_scale` for EVERY token, so the denominator is a per-tower CONSTANT and
 // `vt::MoeCombine`'s single `routed_scale` expresses it exactly. That identity
 // is why `Dots3NoteVisionRefusal` turns away the two arms where upstream does
@@ -770,7 +770,7 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
 
   // --- the router -----------------------------------------------------------
   // THE F32 IS THE OUTPUT, NOT THE OPERANDS. Upstream writes `.float()` on both
-  // sides (:181), but both sides are bf16-VALUED — `x` is the bf16 `norm_2`
+  // sides (:180), but both sides are bf16-VALUED — `x` is the bf16 `norm_2`
   // output and `gate_weight` is bf16 on disk — and a bf16 x bf16 product is
   // exact in f32. A bf16-operand GEMM with an f32 accumulator is therefore
   // bit-for-bit `F.linear(x.float(), w.float())`, while widening the stored
@@ -784,7 +784,7 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
 
   vt::MoeRouterTopKArgs args{};
   args.top_k = static_cast<int>(k);
-  // `sigmoid and topk > 1` (:197). Both halves are guaranteed by the refusal,
+  // `sigmoid and topk > 1` (:196). Both halves are guaranteed by the refusal,
   // and the expression is written out rather than hard-coded `true` so the
   // predicate here and the predicate in the refusal are the same sentence.
   args.renormalize = v.router_scoring_func == "sigmoid" && k > 1;
@@ -792,6 +792,15 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
   args.num_expert_group = 1;
   args.topk_group = 1;
   args.routed_scaling_factor = static_cast<float>(v.router_scale);
+  // F32, and this one is a WIDENING against upstream rather than a mirror of
+  // it: upstream casts the routed weights to the activation dtype before the
+  // combine (`(routed_weights * router_scale).to(x_flat.dtype)`, :200), so a
+  // bf16 tower mixes its experts with BF16 coefficients. `vt::MoeRouterTopK`
+  // emits f32 and `vt::MoeCombine` consumes f32; that is the shared ops'
+  // CONTRACT, and narrowing it would mean a bf16 round trip no op in
+  // `include/vt/ops.h` offers, written by hand beside the seam. The buffer is
+  // `[L, top_k]` — four bytes per selected slot, not per token-channel — and
+  // spec §4.12.2 carries the full argument and its ONE inexact step.
   DBuf tw(d, DType::kF32, {L, k});
   DBuf tid(d, DType::kI32, {L, k});
   Tensor rbias = ResidentWeight(d, m.router_bias, {ne});
@@ -823,7 +832,7 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
   const size_t row_bytes = static_cast<size_t>(E) * vt::SizeOf(DType::kBF16);
   for (int64_t e = 0; e < ne; ++e) {
     const auto& list = lists[static_cast<size_t>(e)];
-    // `if selected_mask.sum() == 0: continue` (:191-192). An expert no token
+    // `if selected_mask.sum() == 0: continue` (:204-205). An expert no token
     // chose contributes nothing and is not run.
     if (list.empty()) continue;
     const int64_t n = static_cast<int64_t>(list.size());
@@ -855,7 +864,13 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
     }
   }
 
-  // --- the self-normalizing combine (:207-:218) -----------------------------
+  // --- the self-normalizing combine (:212-:217) -----------------------------
+  // The divisor is the CONSTANT `router_scale`, NOT the realised sum of `tw`.
+  // Upstream divides by the sum it actually accumulated; this call divides by
+  // the value that sum is guaranteed to take after the renormalize at
+  // :196-:199. The two agree to ~1e-7 at f32 and the guarantee is exactly what
+  // `Dots3NoteVisionRefusal` protects, but they are not the same expression —
+  // spec §4.12.2 and §4.12.3.
   const float eps = 1e-9f;
   DBuf out(d, DType::kBF16, {L, E});
   vt::MoeCombine(d.q, out.t(), expert_out.t(), tw.t(), /*shared=*/nullptr,
@@ -889,7 +904,7 @@ std::vector<float> Dots3NoteVisionForward(
   VT_CHECK(grid_thw[0] == 1,
            "dots3-note vision tower: grid_t is " + std::to_string(grid_thw[0]) +
                ". W6a serves single-frame IMAGE items; the multi-frame "
-               "`cu_seqlens` builder (vision.py:613-624 @ 9035151d6) is the "
+               "`cu_seqlens` builder (vision.py:609-629 @ 9035151d6) is the "
                "VIDEO arm and belongs to W7.");
   const int64_t E = v.embed_dim, I = v.intermediate_size;
   const int64_t nh = v.num_attention_heads, hd = v.head_dim();
@@ -906,7 +921,7 @@ std::vector<float> Dots3NoteVisionForward(
   Dev d{backend, q};
   const vt::RmsNormArgs rms{static_cast<float>(v.rms_norm_eps), /*gemma=*/false};
 
-  // ── patch_embed (vision.py:302-332) ────────────────────────────────────────
+  // ── patch_embed (vision.py:321-346) ────────────────────────────────────────
   DBuf hidden(d, DType::kBF16, {L, E});
   {
     DBuf px(d, DType::kBF16, {L, P}, pixel_values_bf16.data());
@@ -919,7 +934,7 @@ std::vector<float> Dots3NoteVisionForward(
   }
   if (cap != nullptr) cap->patch_embed_out = DownloadF32(d, hidden, L * E);
 
-  // ── the 2-D vision rope cache, host f32 -> bf16 device (vision.py:604-611) ──
+  // ── the 2-D vision rope cache, host f32 -> bf16 device (vision.py:601-607) ──
   const std::vector<float> cache_f = Dots3NoteVisionRopeCache(grid_thw, v);
   if (cap != nullptr) cap->rope_cache = cache_f;
   std::vector<uint16_t> cache_bits(cache_f.size());
@@ -1017,7 +1032,7 @@ std::vector<float> Dots3NoteVisionForward(
     }
     vt::Add(d.q, hidden.t(), hidden.t(), attn.t());
 
-    // `hidden + mlp(norm_2(hidden))` (vision.py:369).
+    // `hidden + mlp(norm_2(hidden))` (vision.py:394).
     vt::RmsNorm(d.q, n2.t(), hidden.t(), ResidentWeight(d, bw.norm_2, {E}), rms);
     if (bw.is_moe) {
       // `MoEVisionBlock.__init__` picks the routed mlp on
@@ -1038,7 +1053,7 @@ std::vector<float> Dots3NoteVisionForward(
     if (cap != nullptr && b == 0) cap->block0_out = DownloadF32(d, hidden, L * E);
   }
 
-  // ── post_trunk_norm (vision.py:513-514, 676-677) ───────────────────────────
+  // ── post_trunk_norm (vision.py:525-526, 673-674) ───────────────────────────
   DBuf trunk(d, DType::kBF16, {L, E});
   if (v.post_norm) {
     vt::RmsNorm(d.q, trunk.t(), hidden.t(),
@@ -1048,7 +1063,7 @@ std::vector<float> Dots3NoteVisionForward(
   }
   if (cap != nullptr) cap->trunk_out = DownloadF32(d, trunk, L * E);
 
-  // ── the adapter (vision.py:398-496 @ 9035151d6) ────────────────────────────
+  // ── the adapter (vision.py:398-501 @ 9035151d6) ────────────────────────────
   const int64_t merge_unit = v.adapter_merge_size * v.adapter_merge_size;
   VT_CHECK(L % merge_unit == 0,
            "dots3-note vision tower: " + std::to_string(L) +
@@ -1079,6 +1094,20 @@ std::vector<float> Dots3NoteVisionForward(
     // grid and no such request can be served by either. Refusing here says so
     // where the numbers are in hand, rather than letting the encoder's
     // `rows == item.length` assert fire with nothing to say.
+    //
+    // AND WHY THIS ONE IS A `VT_CHECK` INSIDE THE ENCODER rather than an
+    // install-time refusal, which the file's own "a refusal and its route
+    // predicate must be the same predicate" rule invites a reader to ask. The
+    // grid is not a config key: it is produced per request by the processor,
+    // which rounds both sides to a multiple of `patch_size * merge_size` = 28
+    // (`common/processor.py:81-83` for the factor and `:131-144` for the
+    // rounding @ 9035151d6, and this port's `Dots3NoteResizedSize`). A grid
+    // side is `resized/patch_size`, hence always a multiple of `merge_size` =
+    // 2, so a SERVED grid side is always EVEN and this assert is
+    // DEFENSIVE and not a live throw path — nothing a request
+    // can carry reaches it, and `Dots3NoteVisionRefusal` has no config key to
+    // test. It exists so a future caller that builds a grid by hand fails
+    // here, by name, instead of downstream in the placeholder arithmetic.
     VT_CHECK(gh % 2 == 0 && gw % 2 == 0,
              "dots3-note vision tower: the `pixel_shuffle_mlp` adapter was "
              "given a " + std::to_string(gh) + "x" + std::to_string(gw) +

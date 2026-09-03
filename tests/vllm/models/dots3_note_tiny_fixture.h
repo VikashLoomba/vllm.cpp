@@ -45,7 +45,7 @@ namespace dots3_tiny {
 // for:
 //   * vision `head_dim` 8, so the 2-D rope has TWO frequencies per spatial axis
 //     (`head_dim/2 = 4` split into a height half and a width half,
-//     vision.py:503-504 @ 9035151d6). At `head_dim` 4 there would be one
+//     vision.py:518-519 @ 9035151d6). At `head_dim` 4 there would be one
 //     frequency per axis and a swapped height/width axis could not show.
 //   * TWO dense vision blocks, so a block that read the previous block's
 //     weights would move the answer.
@@ -94,7 +94,7 @@ struct TinySpec {
   // pass every shape check.
   int64_t v_moe_inter = 4;
   // `capacity_factor`. `topk = min(int(capacity_factor), num_routed)`
-  // (vision.py:180 @ 9035151d6), so 2 selects TWO experts — the released value.
+  // (vision.py:190 @ 9035151d6), so 2 selects TWO experts — the released value.
   double v_capacity_factor = 2.0;
   std::string v_router_scoring_func = "sigmoid";
   double v_router_scale = 1.0;
@@ -104,6 +104,22 @@ struct TinySpec {
   // drawn from the same seed stream, so a difference in what the server answers
   // can only have come through the routing decision.
   double v_router_bias_amp = 0.4;
+  // The ROUTER'S OWN SEED OFFSET, and the only reason it is settable. It is
+  // added to the two seeds that draw `mlp.gate_weight` and `mlp.router_bias`
+  // and to nothing else, and the shared `next()` stream still advances once per
+  // tensor, so changing it moves the ROUTING DECISION and leaves every other
+  // tensor in the checkpoint byte-for-byte where it was.
+  //
+  // WHY IT IS NOT 0. At 0 this fixture's 16 tokens routed 13 to {1,2} and 3 to
+  // {2,3}: expert 0 was NEVER selected, expert 2 was in every set, and the
+  // set assertion's discriminating population was three tokens. Expert 0 is the
+  // index an off-by-one lands on, so a fixture that never selects it is the
+  // weakest possible arrangement of the strongest assertion in the gate. The
+  // value below was SEARCHED over the tower this fixture actually builds — the
+  // search and the result are spec section 4.12.9 — for the first offset whose
+  // 16 tokens select every expert, produce more than two of the six possible
+  // pairs, and keep the minimum decision margin above the gate's 1e-3 bound.
+  uint64_t v_router_seed_nudge = 42;
   std::string v_adapter_type = "patch_merger";
   bool v_pre_pixel_shuffle = true;
   bool v_post_norm = true;
@@ -408,19 +424,22 @@ inline std::vector<StOut> TinyEntries(const TinySpec& s, uint64_t seed = 7) {
     if (moe) {
       // The PYRAMID block's own state dict: `mlp.gate_weight` BF16 [ne, E] and
       // `mlp.router_bias` **F32** [ne], which is the dtype upstream registers
-      // (vision.py:152-155 @ 9035151d6) and the one dtype in this fixture that
+      // (vision.py:152-154 @ 9035151d6) and the one dtype in this fixture that
       // is not BF16. Writing it BF16 here is what a re-typed-router mutation
       // does, and the loader refuses it by name.
       const int64_t ne = s.v_pyramid[static_cast<size_t>(b)];
       const int64_t mi = s.v_moe_inter;
-      e.push_back({pre + "mlp.gate_weight", {ne, E}, proj(ne * E)});
+      e.push_back({pre + "mlp.gate_weight", {ne, E},
+                   Values(ne * E, next() + s.v_router_seed_nudge, 0.5)});
       // AMPLITUDE 0.4, not 0.1. The router bias shifts the SELECTION score
       // against sigmoid probabilities that all sit in (0, 1) and mostly near
       // 0.5, so a bias too small to reorder them would leave the fixture's
       // selection identical to the unbiased one — and a gate on a tower whose
       // bias does nothing cannot see a dropped bias.
       e.push_back({pre + "mlp.router_bias", {ne},
-                   Values(ne, next(), s.v_router_bias_amp), "F32"});
+                   Values(ne, next() + s.v_router_seed_nudge,
+                          s.v_router_bias_amp),
+                   "F32"});
       for (int64_t x = 0; x < ne; ++x) {
         const std::string ep = pre + "mlp.experts." + std::to_string(x) + ".";
         e.push_back({ep + "fc1.weight", {mi, E}, proj(mi * E)});

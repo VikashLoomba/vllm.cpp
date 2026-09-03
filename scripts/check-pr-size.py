@@ -227,10 +227,10 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 # #668 and #989, and repaired the same way: name the surface, do not widen a
 # rule.
 #
-# The extension list is EXACTLY the set this directory carries, and it
-# deliberately omits `.md` and `.json`. Those two already classify as
-# public_document through DOC below, and the evidence arm is tested FIRST, so
-# admitting them here would silently RECLASSIFY
+# The extension list is EXACTLY the union of what the tracked per-run
+# directories carry, and it deliberately omits `.md` and `.json`. Those two
+# already classify as public_document through DOC below, and the evidence arm is
+# tested FIRST, so admitting them here would silently RECLASSIFY
 # docs/bench-evidence/mxfp4-qwen/*.md and its golden .json. Preserving the class
 # of a path that already had one matters more than making the directory
 # uniform.
@@ -238,8 +238,34 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 # `.sh` and `.cu` are evidence, not product: they are the recipe that produced
 # the number. Nothing builds them, nothing installs them, and no entry point
 # reaches them.
+#
+# `.py`, `.jsonl` and `.rc` joined 2026-09-03. Fifth instance of the same class,
+# repaired the same way: NAME the artifact kind, do not relax the shape. Each is
+# one kind a `rc` measurement job actually emits, and the list stays a closed
+# enumeration so nothing arbitrary is admitted by growing it:
+#
+#   `.py`    the fold and the sampler that produced the numbers -- the recipe,
+#            exactly as `.sh` and `.cu` are. Verified, not assumed: the only
+#            referents of `fold.py` and `amd_clock_sample.py` in the tree are
+#            the evidence document, `job-as-run.sh` beside them and the row's
+#            staged recipe under `.agents/scripts/`. Nothing under
+#            CMakeLists.txt, .github/, scripts/, src/ or include/ reaches them.
+#   `.jsonl` the raw instrument stream, one JSON object per sample. It is the
+#            population a folded clock figure is derived FROM, so it is the same
+#            kind of artifact as a `.log` and not a document. `.json` above is
+#            deliberately still absent, and `.jsonl` does not match DOC.
+#   `.rc`    one process's recorded exit status. A leg's `rc` is what decides
+#            whether its figure may be used at all, so it is evidence in the
+#            strictest sense: two bytes nothing can regenerate.
+#
+# All fourteen paths of `rocm-strix-llamacpp-denominator-20260902` (#2497) were
+# unclassified without these, which left
+# `test_every_tracked_and_current_change_path_is_classified` RED and would have
+# reddened `main` itself, because this checker is CI-only and
+# `agent-preflight.sh` never runs it -- the same blind spot #2609 names.
 BENCH_EVIDENCE_RUN = re.compile(
-    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu)\Z"
+    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    r"\.(?:txt|log|gz|sh|cu|py|jsonl|rc)\Z"
 )
 # #2609. The lease RECIPES: the exact script a `rc` job ran to produce a number
 # a spec then cites. Same class and same reasoning as BENCH_EVIDENCE_RUN's `.sh`

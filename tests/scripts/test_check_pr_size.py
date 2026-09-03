@@ -278,6 +278,45 @@ class PathClassification(unittest.TestCase):
         with self.assertRaises(ValueError):
             checker.classify_path(".agents/not-a-real-guide-xyz.md")
 
+    def test_a_measurement_runs_own_artifact_kinds_classify_as_evidence(self) -> None:
+        """A `rc` job's own emissions are evidence, not unclassified paths.
+
+        `docs/bench-evidence/<run-id>/` carries what the job produced. Three
+        kinds had no class and `classify_path` fails closed, so all fourteen
+        such paths of `rocm-strix-llamacpp-denominator-20260902` (#2497) left
+        `test_every_tracked_and_current_change_path_is_classified` RED --
+        against the whole tree, so landing it would have reddened `main` and
+        refused every later change touching this checker through its own
+        evidence contract. It went unseen because this checker is CI-only and
+        `agent-preflight.sh` never runs it.
+
+        This is the RED-BEFORE for that repair: every `evidence` assertion below
+        raises `ValueError` against the base checker.
+        """
+        run = "docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902"
+        for path in (
+            f"{run}/fold.py",              # the recipe, as `.sh` and `.cu` are
+            f"{run}/amd_clock_sample.py",
+            f"{run}/clock-leg1.jsonl",     # the raw instrument stream
+            f"{run}/leg1.rc",              # one process's recorded exit status
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "evidence")
+
+        # The additions are a closed enumeration over ONE directory shape, not a
+        # relaxation. A sibling extension nobody has argued for still fails
+        # closed, and the same names outside a per-run evidence directory keep
+        # whatever class they already had.
+        with self.assertRaises(ValueError):
+            checker.classify_path(f"{run}/leg1.pickle")
+        self.assertEqual(
+            checker.classify_path("scripts/check-pr-size.py"), "governance_checker"
+        )
+        # `.json` stays OUT of the evidence arm: DOC already claims it, and the
+        # evidence arm is tested first, so admitting it would reclassify
+        # docs/bench-evidence/mxfp4-qwen's golden.
+        self.assertEqual(checker.classify_path(f"{run}/leg1.json"), "public_document")
+
     def test_every_tracked_and_current_change_path_is_classified(self) -> None:
         paths = set(
             subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).splitlines()

@@ -597,6 +597,22 @@ jobs:
         run: |
           python3 scripts/check-conflict-markers.py
           python3 tests/scripts/test_check_conflict_markers.py
+      - name: The staged gfx1151 paired measurement still refuses to run (#2497)
+        # Registered in TWO places, like the suites above, and it was in ONE.
+        # `scripts/agent-preflight.sh` held it from the start and this file never
+        # did, so the ONE behaviour of `BACKEND-GATE-ROCM-LLAMACPP` that a test
+        # can falsify -- `.agents/scripts/rocm-strix-ourarm-staged.sh` refusing
+        # unless `STRIX_ARM_SPEED_RATIFIED_BY` names a ratifying decision --
+        # gated on a developer box and was green on the forge. #2497 has already
+        # had one measurement retracted for being taken ahead of that arm's token
+        # gate, which reads `TOKEN_GATE=FAIL` at 3 of 6, so a staged script whose
+        # refusal nothing on a lane enforces is that defect parked in a file.
+        #
+        # Nothing here can skip: `bash` and the standard library over one
+        # committed script, in a scratch working directory. No GPU, no lease, no
+        # toolchain, no checkpoint, no network, under a second.
+        run: |
+          python3 tests/scripts/test_rocm_strix_ourarm_staged.py
       - name: The pre-push hook refuses a checker it names but cannot find
         # #1779. The hook named six checkers, three of which had been deleted,
         # and skipped each missing one in silence while still exiting 0. The

@@ -102,6 +102,16 @@ class StagedScriptRefuses(unittest.TestCase):
           - SHORT and carrying a reference -- refused only by the length floor.
             `#2497` is an issue number with no decision, no date and nobody
             attached to it, which is a citation and not a ratification.
+
+        A THIRD split matters and was missing, which left a live mutant. The
+        issue-reference term is `#[0-9]+`, and every long refused value above
+        carried no digit at all -- so weakening it to `#?[0-9]+` left this whole
+        suite green at 13 passed, while
+        `STRIX_ARM_SPEED_RATIFIED_BY='ratified 2026-09-02 by the operator'` went
+        from rc 3 to rc 0. The contract "naming means an issue reference" had
+        silently degraded to "contains any digit", and no assertion could see
+        it, because a date is the digit a real ratification always carries. The
+        values marked below close that: LONG, carrying digits, carrying no `#`.
         """
         for value in (
             "1",
@@ -116,6 +126,12 @@ class StagedScriptRefuses(unittest.TestCase):
             "#2497",
             "see #2497",
             "ok #2497",
+            # LONG, with digits, no `#`. These are what kill `#?[0-9]+`.
+            "ratified 2026-09-02 by the operator",
+            "ratified on 2026-09-02, token gate PASS",
+            "approved 2026-09-02 by the operator, issue 2497",
+            "token gate passed 6 of 6 on 2026-09-02",
+            "1111111111111111",
         ):
             with self.subTest(value=value):
                 proc = run(value)

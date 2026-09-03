@@ -259,19 +259,21 @@ field is `std::string`, and the probe above is why rather than a precaution.
 
 Submitted 2026-09-03 under an `rc` lease, queued behind two other jobs on that
 device. Pinned to `git bundle` sha256
-`8a32656973d3b0367179905f5f6e7ade20cdc81a81729bfcb4b404a2104e2fee`, commit
-`a74565873`, and the job aborts unless `git rev-parse HEAD` inside the clone
+`c67a28a8eea92e8c54d4cff06f2be7a05462a21222de7ee3f76bba0f19289936`, commit
+`bb1ecefef`, and the job aborts unless `git rev-parse HEAD` inside the clone
 matches. Nothing is pushed to reach the box. The harness is
 `/workspace/exl342-thor/run.sh`.
 
 **Which tree slice B's evidence is measured on, said before it drifts.** Slice A
 recorded a claim of this shape and a later `origin/main` merge falsified it, so
-this one is written narrowly on purpose: `a74565873` is the LAST commit of this
+this one is written narrowly on purpose: `bb1ecefef` is the LAST commit of this
 branch that touches `src/`, `include/` or `tests/`. Anything after it edits this
-spec and nothing else. Re-derive that with
-`git diff --stat a74565873..HEAD -- src include tests CMakeLists.txt` before
+spec, this row's claim and the public documents, and nothing else. Re-derive
+that with
+`git diff --stat bb1ecefef..HEAD -- src include tests CMakeLists.txt` before
 quoting any number below; a non-empty output means the evidence names a
-different tree than the head does.
+different tree than the head does, and the lease must be re-pinned and re-run
+rather than the sentence re-worded.
 
 **No claim about the ported kernel is made until it runs.** What it will
 produce, cheapest first: the tree facts, the sm_110 build, the four-leg tier-3c
@@ -293,8 +295,8 @@ because `Exl3GemvSmemMode()` caches its `getenv` in a function-local static,
 Submitted 2026-09-03 at queue position 11 behind a job that had already run for
 ten hours. **It will not have run when this row is reported, and no throughput
 number is claimed for `(4, 2)` anywhere.** Pinned to tarball sha256
-`240a328843cd64dbffc190e35feac379cc1dfcde83e715265d5b9c8ec657c3fd`, commit
-`a74565873`; harness `/workspace/exl342-dgx/job.sh`, adapted from slice A's with
+`88a9df5d4c5930299c316c3810112845eca95b0d9912dcc038bacb31f0bc881c`, commit
+`bb1ecefef`; harness `/workspace/exl342-dgx/job.sh`, adapted from slice A's with
 the tree facts and the two `(4, 2)` mutations replaced.
 
 Read `SM_COUNT` and `MAX_THREADS_PER_SM` from section F BEFORE any tok/s number.

@@ -76,13 +76,20 @@ report says which one it reached rather than blurring them:
    architectures `is_available_online=False` at this very revision. Nothing this
    wave can do changes that.
 2. **Any model** generating tokens through vLLM's normal path at this revision.
-   This is what AGENTS.md's sentence means, and it is this wave's target.
+   **This wave reads AGENTS.md's "builds and runs the model" permissively, as
+   any model, and targets that. It does not claim the reading is settled.** A
+   strict reading — that the model an oracle must run is the model the candidate
+   is wanted for — is defensible and would not be satisfied by level 2. Under
+   either reading the pin does not move, and §6 of the report records that
+   `qwen4_exp` itself does not run on this device.
 3. A forward pass producing logits without generation. Weaker, and recorded as
    such if it is all that is reached.
 
 A fourth reading sits between 1 and 2 and this wave attempts it as a stretch:
 the `qwen4_exp` graph executing on **random** weights, from the model's own
-published `config.json` shrunk in depth and width, under `load_format="dummy"`.
+published `config.json` shrunk in **depth and count only** — width is left
+alone, because halving `head_dim` breaks
+`sum(mrope_section) == rotary_dim // 2` — under `load_format="dummy"`.
 That is not a parity statement and not a token gate — the tokens carry no
 information — but it is the strongest statement about this architecture the
 fleet can currently support, and it is reported with that qualifier attached.
@@ -114,12 +121,17 @@ The worker's `github.com` egress is not guaranteed and its absence reads as an
 authentication failure rather than a network one
 ([`../environment.md`](../environment.md)); a `thor:gpu0` job failed `git fetch`
 that way on 2026-09-02, the same day #2594's jobs cloned successfully. The
-target tree, the four `FetchContent` dependencies CMake would clone
-(`cutlass v4.4.2`, `vllm-project/flash-attention 06bdd47c`,
-`vllm-project/FlashMLA 0397728d`, `vllm-project/FlashKDA ee0be888`) and the
+target tree, the `FetchContent` dependencies CMake would clone and the
 checkpoint are therefore staged on `/workspace` from the developer box, and the
-build is pointed at them with `VLLM_CUTLASS_SRC_DIR`,
-`VLLM_FLASH_ATTN_SRC_DIR`, `FLASH_MLA_SRC_DIR` and `FLASH_KDA_SRC_DIR`.
+build is pointed at them with the `*_SRC_DIR` overrides upstream provides.
+
+**This spec planned for FOUR such dependencies and the measurement found NINE.**
+A CUDA build clones all nine at configure time, before any architecture gate can
+skip one, and the fifth of them — `deepseek-ai/DeepGEMM` — is what job A died
+on. The report's §3 carries the full table with revisions and override names.
+Because the count was wrong once, the job also prints every `GIT_REPOSITORY`
+the tree still declares beside every override it set, so a tenth names itself in
+the log rather than costing another lease.
 
 The tree is staged as a **git bundle**, not a tarball, for two reasons. A
 release tarball cannot build vLLM, because `setuptools_scm` needs git. And the
@@ -210,10 +222,12 @@ discharged here:
 - The PORT-NOW queue for `5559679229..e126687a9a`, 290 entries
   ([#2611](https://github.com/mudler/vllm.cpp/issues/2611)).
 - Whether upstream `main` installs under the same repair (#2611).
-- `scripts/check-pr-size.py` cannot classify `.agents/scripts/**`
-  ([#2607](https://github.com/mudler/vllm.cpp/issues/2607)), so this wave's job
-  script is reproduced verbatim in its report rather than committed beside the
-  two already tracked there.
+- Nothing about the job scripts. They are committed at
+  `.agents/scripts/runhalf-e126687-*`. An earlier draft owed their absence to
+  `scripts/check-pr-size.py` not classifying `.agents/scripts/**`
+  ([#2607](https://github.com/mudler/vllm.cpp/issues/2607)); that was false when
+  written — the classifier has accepted those paths since before this wave's
+  merge-base, and #2607 closed before the wave ran. See the report's §7 C7.
 
 ## Outcome
 

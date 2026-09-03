@@ -4069,6 +4069,35 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+### Upstream's own QSA cannot launch on `thor:gpu0` (#2626)
+
+Found by wave RUNHALF while measuring the run half of the `e126687a9a`
+candidate ([#2611](https://github.com/mudler/vllm.cpp/issues/2611),
+[`../sync/2026-09-03-e126687-runhalf.md`](../sync/2026-09-03-e126687-runhalf.md)
+§6). **Upstream vLLM at that revision, built from source for sm_110, cannot run
+`Qwen4ExpForConditionalGeneration` on `thor:gpu0`**: its QSA indexer's
+`cooperative_topk` refuses to launch with
+`a kernel launch error has occurred due to cluster misconfiguration` at
+`csrc/libtorch_stable/cooperative_topk.cu:46`. The cluster size there is a
+compile-time template parameter, and the arm is chosen by
+`get_device_prop()->major >= 10`, a compute-capability major used as a proxy for
+a cluster-size capability, which admits Thor's 11.0.
+
+**The obvious hypothesis was tested and NOT confirmed.** A second leg with a
+larger request batch, meant to select the 8-CTA arm, failed identically;
+`num_rows` at that call site is the number of scoring rows rather than the
+request batch, so the knob did not move the variable. Which cluster size was
+attempted is unknown, and Thor's actual maximum cluster size was never queried.
+
+**Why this row owns it rather than the sync row.** It is a property of this
+model on this hardware and it outlives any pin: `UPSTREAM-SYNC-HEADPIN` closes
+when its wave closes, and this would then have no live owner.
+[#2626](https://github.com/mudler/vllm.cpp/issues/2626) owns it, and its item 3
+is the one that matters here — if upstream cannot run `qwen4_exp` on the only
+fleet device whose container exposes a GPU, this row has no vLLM oracle for its
+own model on this fleet regardless of the pin, and the `llama-cpp-qwen4exp`
+secondary oracle carries more weight than the records currently say.
+
 ### PREFILLDIV: the MoE second source, and the instrument it needs (#2552)
 
 Wave PREFILLDIV isolated TWO sources of CPU/CUDA prefill divergence at decoder

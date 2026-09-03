@@ -44,11 +44,19 @@ RUN_RC=0        facebook/opt-125m, greedy, FLASH_ATTN/FA2, eager AND compiled
 Evidence: [`../sync/2026-09-03-e126687-runhalf.md`](../sync/2026-09-03-e126687-runhalf.md),
 issue [#2611](https://github.com/mudler/vllm.cpp/issues/2611).
 
-**What that is worth.** AGENTS.md's condition for `gateable` is that an oracle
-demonstrably builds and runs the model, and the build-and-run half of that
-sentence is now satisfied for this candidate on one device. It is **not** a
-pin advance and it is **not** a `gateable = yes` for this revision, because a
-pin advance additionally owes:
+**What that is worth, and the limit is first because it is the larger fact.**
+`qwen4_exp` — the model this candidate is wanted for — **does not run on
+`thor:gpu0`** at this revision: its QSA indexer's `cooperative_topk` refuses to
+launch with a cluster misconfiguration
+([#2626](https://github.com/mudler/vllm.cpp/issues/2626)), and its published
+safetensors arms exceed the largest fleet box. So a pin here would carry a
+registered, importable, executable vLLM that still cannot serve
+`MODEL-MM-QWEN4-EXP`'s own model on this fleet. What was demonstrated is that
+**some** model builds and runs, on one device; whether AGENTS.md's "builds and
+runs the model" is satisfied by that, or requires the model in question, is a
+reading this record does not settle. It is **not** a pin advance and **not** a
+`gateable = yes` for this revision. Beyond the question above, a pin advance
+additionally owes these four:
 
 1. The **290-entry PORT-NOW queue** for `5559679229..e126687a9a`, unworked
    ([#2611](https://github.com/mudler/vllm.cpp/issues/2611)).
@@ -61,10 +69,10 @@ pin advance additionally owes:
    candidate.
 4. A reading on **`dgx:gpu0`**. Only `thor:gpu0` was measured.
 
-**And one thing the candidate cannot yet be an oracle for.** `qwen4_exp`, the
-model that motivates this candidate, **does not run on `thor:gpu0`** at this
-revision: its QSA indexer's `cooperative_topk` refuses to launch with a cluster
-misconfiguration ([#2626](https://github.com/mudler/vllm.cpp/issues/2626)). Its
-published safetensors arms also exceed the largest fleet box. A pin at this
-revision would carry a registered, importable, executable vLLM that still cannot
-serve `MODEL-MM-QWEN4-EXP`'s own model here.
+**Evidence for the paragraph above.**
+[#2626](https://github.com/mudler/vllm.cpp/issues/2626) is owned by
+`MODEL-MM-QWEN4-EXP` and listed under `## Owed` in
+[`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md); the
+measurement and its explicit non-claims are in
+[`../sync/2026-09-03-e126687-runhalf.md`](../sync/2026-09-03-e126687-runhalf.md)
+§6.

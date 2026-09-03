@@ -205,6 +205,18 @@ The job is pinned to tarball
 (commit `665167c4a`) and aborts rather than build anything else. Every compiled
 and tested path in it is byte-identical to this row's head.
 
+The harness itself is `/workspace/exl3perf-2570/job.sh`,
+`sha256 81e2de48268fd9e69cdc7144fcd0162149c1ca05bf6dff3d081d3afa195268ef` —
+named because a measurement is only reproducible if the script that took it is
+identifiable, and this one runs unattended. It carries one class of repair worth
+knowing about when reading or reusing it. The script sets only `set -u`, but its
+first `set +e` / `set -e` pair leaves **errexit ON** for everything after it, and
+`hb` is a shell FUNCTION: `hb ...; RC=$?` therefore kills the job on a non-zero
+return before `$?` can be read. A failed build, a failed model stage or a
+mutation that does not compile would have ended the run silently instead of
+reporting the abort it was written to report. Every rc is now taken with
+`|| RC=$?` or inside an explicit `set +e` block.
+
 What it produces, in order, cheapest evidence first so a crash on this box costs
 the least: the tree facts, the build, the device numeric gate, `SM_COUNT` and
 `MAX_THREADS_PER_SM` (which settle the prediction above), the interleaved A/B,

@@ -14,8 +14,10 @@ that made the primary oracle reachable on this device).
 
 ## Now
 
-`ACTIVE`. This spec pre-registers the rule. The score lands beside it in
-`docs/bench-evidence/q4km-neartie-vllm-oracle-20260903.md`.
+`DONE`. The rule below was committed before the job finished; the score is in
+[`../../docs/bench-evidence/q4km-neartie-vllm-oracle-20260903.md`](../../docs/bench-evidence/q4km-neartie-vllm-oracle-20260903.md).
+Four of the six pre-registered outcomes fired: P1 under compiled, P2 under
+eager, P4, and P5 in both configurations. See `## Outcome`.
 
 ## 1. The question
 
@@ -192,3 +194,79 @@ per-step JSON for both configurations.
   to it and takes it no further.
 - The bigger-model strict limb of the near-tie doctrine, still without a vehicle;
   §7 of the adjudication spec records the search and its three disqualifications.
+
+## Outcome
+
+`rc` job `e1afb349-98c4-4e8b-a684-26fdeaa4ba24`, `strix:gpu0`, 2026-09-03.
+
+### What was measured
+
+| oracle configuration | our arm | the oracle's own decode | llama.cpp `b10451` |
+|---|---|---|---|
+| compiled | **0 of 288, worst 0.000000, FOUR CONJUNCTS PASS** | 3 of 288 | 1 of 288 |
+| eager | 4 of 288, worst 0.250000, FOUR CONJUNCTS FAIL | 6 of 288 | 3 of 288 |
+
+No divergence anywhere is an exact tie. The negative control failed at 21.24
+nats in both configurations, so the instrument discriminates.
+
+### What was rejected, and why
+
+**A headline of "token-exact against the primary oracle" was rejected as false.**
+The band is teacher-forced: the oracle is fed our own prefix at every step, so
+the sequences cannot drift. The declared token gate compares free-running
+streams. Under a free-running comparison our arm diverges from vLLM compiled on
+**5 of 6** prompts, worse than the 3 of 6 it reads against llama.cpp
+(`score-compiled.md`, `VLLMCPP_vs_VLLM_DIVERGENCES=5/6`, re-derived
+independently). Substituting the primary oracle into the declared gate makes
+this arm's reading worse. The evidence document states this before it can be
+inferred.
+
+**Reading compiled as "the configuration the protocol mandates" was rejected.**
+`AGENTS.md` §Gates forbids `--enforce-eager` as the denominator for a
+**performance** comparison, where eager disables the path a production
+deployment uses. It does not nominate a correctness denominator, and no
+ratification has. Treating it as one would have converted a maintainer's open
+decision (#2534) into an inference, and it would have picked the configuration
+under which the number is favourable. Both are reported; neither is averaged.
+
+**A verdict without the self-consistency floor was rejected.** P5 fired. The
+floor is 3 of 288 under compiled and 6 of 288 under eager, so our arm's 0 sits
+*below* the floor of the instrument scoring it. Our stream agrees with the
+compiled prefill argmax at three near-tie positions where the oracle's own
+decode does not. A threshold below its instrument's floor can be met by luck,
+and that is the strongest limit on the PASS.
+
+### Why each default has its value
+
+- **`K = 20`** because the harness asserts our token is present in the returned
+  dict at every step, so `top_lp` is the true argmax and never a top-K artefact.
+  The assertion, not the value, is what carries this.
+- **`gap > 1e-9` for divergence**, taken from
+  `scripts/mm/a3_voxtral_neartie_gate.py` rather than restated, because an exact
+  tie must not count and that is why the Voxtral precedent passed at
+  `worst_gap 0.0000`.
+- **The oracle's own `PROMPT_IDS`, not a re-tokenization**, so a tokenizer
+  difference cannot contaminate the score.
+- **The recorded `ours_gen_ids_1.json`, never re-generated**, so nothing about
+  our engine could move under the measurement.
+- **Both configurations, scored separately**, because #2788 measured that they
+  disagree on 2 of 6 prompts and each is byte-identical to its own repeat.
+
+### Records this falsified
+
+`.agents/backend-matrix.md`'s `BACKEND-GATE-ROCM-LLAMACPP` row read "vLLM has no
+entry on that architecture" and called llama.cpp "the ONLY comparator that runs
+on `gfx1151` at all". #2788 falsified that and did not correct the row; this
+change does. The row's disposition is unchanged: it still has one side of one
+comparison, still has no ratio, and stays `INVENTORIED`.
+
+### What is still owed
+
+- The ratification decision under
+  [#2534](https://github.com/mudler/vllm.cpp/issues/2534). This row adds an
+  input and takes it no further.
+- The bigger-model strict limb of the near-tie doctrine, still without a
+  vehicle.
+- A free-running token gate against the primary oracle on this device, if anyone
+  wants one. The figure exists (5 of 6) but no spec declares that gate, and
+  changing this arm's declared oracle is out of scope here.

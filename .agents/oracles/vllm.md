@@ -122,6 +122,7 @@ unsupported. One row per measurement, appended by the change that made it.
 | device | arch | measured | builds | runs a gate model | evidence |
 |---|---|---|---|---|---|
 | `strix:gpu0` | `gfx1151` (RDNA 3.5, Radeon 8060S, ROCm 7.2.4) | 2026-09-03 | yes | yes — Qwen3.8-27B Q4_K_M GGUF, 6 prompts x 48 greedy tokens, reproducible | [`oracle-vllm-gfx1151-20260903.md`](../../docs/bench-evidence/oracle-vllm-gfx1151-20260903.md) |
+| `strix:gpu0` | `gfx1151` (RDNA 3.5, Radeon 8060S, ROCm 7.2.4) | 2026-09-03 | yes | yes — and SCORED a gate: `prompt_logprobs` teacher-forcing over 6 x 48 steps, both configurations, negative control discriminating at 21.24 nats | [`q4km-neartie-vllm-oracle-20260903.md`](../../docs/bench-evidence/q4km-neartie-vllm-oracle-20260903.md) |
 
 **gfx1151 needs five packages a bare ROCm image does not carry**, and each of
 their absences presents as a device failure rather than as a provisioning gap:
@@ -130,6 +131,20 @@ their absences presents as a device failure rather than as a provisioning gap:
 decides whether the platform is ROCm by importing it, so without it vLLM falls
 back to `UnspecifiedPlatform` on a fully working ROCm box. The evidence file
 carries the exact message each one produces.
+
+**The oracle is not self-consistent on this device, and the gate a reader picks
+decides the answer.** Its two supported configurations are each byte-identical
+to their own repeat and still disagree with each other: 2 of 6 prompts
+free-running, and teacher-forced each one diverges from its *own* recorded
+decode, 3 of 288 under compiled and 6 of 288 under eager. That floor is a
+property of the oracle on this board, not of anything measured against it, so a
+score of 0 divergences here is below the instrument's own floor and must be read
+with it. `AGENTS.md` §Gates admits an explicitly ratified distributional gate
+when an oracle's greedy decode is non-deterministic; that precondition is now
+MEASURED for the primary oracle, and the ratification for the Q4_K_M ROCm arm is
+still open under [#2534](https://github.com/mudler/vllm.cpp/issues/2534).
+Measured by [#2809](https://github.com/mudler/vllm.cpp/issues/2809):
+[`q4km-neartie-vllm-oracle-20260903.md`](../../docs/bench-evidence/q4km-neartie-vllm-oracle-20260903.md).
 
 **No `HSA_OVERRIDE_GFX_VERSION` was set for that measurement**, and none may be
 set for another. That knob makes the runtime report a different device, and a

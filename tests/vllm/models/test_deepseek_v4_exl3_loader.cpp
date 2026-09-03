@@ -45,6 +45,7 @@
 #include "vllm/v1/attention/backend.h"             // CommonAttentionMetadata
 #include "vllm/v1/attention/backends/gdn_attn.h"   // GDNAttentionMetadata
 #include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 // The fixture is SHARED with tests/vllm/models/test_deepseek_v4_exl3_forward.cpp,
@@ -1434,4 +1435,149 @@ TEST_CASE("PAGED-ENTRY: ModelRegistry::Forward REACHES the EXL3 paged arm (#2447
   // no request dimension -- two requests at EQUAL length would sail past
   // `seen == kv_base` into a plausible answer over a mixed history.
   CHECK_THROWS(step(/*token=*/3, /*position=*/2, /*computed=*/2, /*nreqs=*/2));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ENG-ASYNC-DEVICE-IDS-2544 — THE ASYNCHRONOUS DEVICE-IDENTIFIER GATE.
+//
+// Spec `.agents/specs/eng-async-device-ids-2544.md`, issue
+// [#2544](https://github.com/mudler/vllm.cpp/issues/2544); the contract is
+// [#1305](https://github.com/mudler/vllm.cpp/issues/1305)'s.
+//
+// WHAT IT MEASURES. On the asynchronous serving path the runner's combine
+// splices each decode row's sampled token into the DEVICE identifiers on the
+// main queue and leaves the host `token_ids` deliberately stale for decode rows
+// (`src/vllm/v1/worker/gpu/runner.cpp`, the mirror arm, which is the DEFAULT on
+// CUDA). A forward that embeds the host vector generates every step after the
+// first from the previous step's identifiers — and because `token_ids_cpu` is
+// zero-initialised, from TOKEN ID 0. Silently, at rc=0, with plausible output.
+//
+// WIRED BUT NOT CONVICTED, and the case says so rather than implying otherwise.
+// #2544 named this registration on a `grep` and called it "a candidate, not a
+// conviction"; this row has no staged DeepSeek-V4 checkpoint and no GPU time for
+// one. What is proved here is that the identifiers reach the embed through
+// `ModelRegistry::Forward` — not that service ever hands this model a live
+// `device_token_ids`. Spec `## Owed` O4.
+//
+// THREE RUNS, because two of them cannot separate the cases:
+//
+//     A  right host id, no mirror            -> the reference
+//     B  ZERO host id, no mirror             -> must DIFFER from A
+//     C  ZERO host id, mirror carries A's    -> must EQUAL A, bit for bit
+//
+// B is the control. Without it a forward that ignored its identifiers entirely
+// would satisfy C. ZERO is the wrong value on purpose: it is what the real
+// defect feeds. A's identifier is NON-ZERO, so C cannot agree for the wrong
+// reason.
+//
+// ONE MODEL PER RUN. This arm carries a per-model compressor state that refuses
+// unless it has seen exactly `kv_base` tokens, so three runs sharing one
+// `LoadedModel` would be three different histories rather than three readings of
+// one step.
+TEST_CASE("dsv4 #2544: the paged arm embeds the async mirror's DEVICE id, not the stale host one") {
+  dsv4_exl3_fixture::FixtureOptions opt;
+  opt.layers = 2;
+  opt.compress_ratios = {0, 128};
+  opt.real_dsa_geometry = false;
+  auto f = dsv4_exl3_fixture::BuildFixture(opt);
+  const vllm::DeepseekV4Params params = vllm::ParseDeepseekV4Params(f->config);
+  const int64_t nlayers = params.num_hidden_layers;
+  const int64_t hd = params.head_dim;
+
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Backend& be = vt::GetBackend(queue.device.type);
+
+  // The identifier the runner's combine would have written. NON-ZERO, and inside
+  // the fixture's vocabulary so run B is a wrong ANSWER and not a refusal.
+  constexpr int32_t kTrue = 3;
+  REQUIRE(kTrue < params.vocab_size);
+
+  // One step through `ModelRegistry::Forward` on a FRESH model, with the host
+  // identifier and the mirror chosen by the caller.
+  const auto run = [&](int32_t host_id, bool mirror) {
+    const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(f->shards);
+    std::unique_ptr<vllm::LoadedModel> model =
+        vllm::ModelRegistry::Load(f->config, source);
+    REQUIRE(model != nullptr);
+
+    const int64_t nb = 4, bs = 8;
+    std::vector<std::vector<float>> storage(static_cast<size_t>(nlayers));
+    std::vector<vllm::PagedKvCache> attn_kv(static_cast<size_t>(nlayers));
+    std::vector<std::string> names;
+    for (int64_t l = 0; l < nlayers; ++l) {
+      const size_t i = static_cast<size_t>(l);
+      storage[i].assign(static_cast<size_t>(nb * bs * hd), 0.0f);
+      attn_kv[i].data = storage[i].data();
+      attn_kv[i].dtype = vt::DType::kF32;
+      attn_kv[i].num_blocks = nb;
+      attn_kv[i].block_size = bs;
+      attn_kv[i].num_kv_heads = 1;
+      attn_kv[i].head_size = hd;
+      names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+    }
+    vllm::MultiKvCacheIndex mk;
+    mk.layer_names = &names;
+
+    const std::vector<int32_t> tok{host_id};
+    const std::vector<int32_t> pos{0};
+    const std::vector<int32_t> li{0};
+    std::vector<vllm::GdnStateCache> gdn_state;
+    const vllm::v1::GDNAttentionMetadata gdn_meta{};
+    vllm::v1::CommonAttentionMetadata attn_meta{};
+    attn_meta.num_reqs = 1;
+    attn_meta.num_computed_tokens_cpu = {0};
+    vllm::ModelForwardInput in{.token_ids = tok,
+                               .positions = pos,
+                               .attn_meta = attn_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = f->config,
+                               .queue = queue,
+                               .logits_indices = li,
+                               .num_reqs = 1};
+    in.multi_kv = &mk;
+    // A REAL backend allocation, never the host vector's address. On CPU the two
+    // are the same kind of pointer, so this buys nothing today; it is what makes
+    // the case correct by construction on a device.
+    int32_t* dev = nullptr;
+    if (mirror) {
+      dev = static_cast<int32_t*>(be.Alloc(sizeof(int32_t)));
+      const int32_t truth = kTrue;
+      be.Copy(queue, dev, &truth, sizeof(int32_t));
+      be.Synchronize(queue);
+      // Set AFTER aggregate construction, exactly as `runner.cpp` sets it.
+      in.device_token_ids = dev;
+    }
+    const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, in);
+    if (dev != nullptr) be.Free(dev);
+    REQUIRE(out.host.size() == static_cast<size_t>(params.vocab_size));
+    return out.host;
+  };
+
+  const std::vector<float> ref = run(kTrue, /*mirror=*/false);
+  // FINITENESS BEFORE ANY COMPARISON. Against a NaN both `==` and `!=` are
+  // false, so an equality gate and a difference gate BOTH report success on a
+  // forward that produced no numbers at all.
+  REQUIRE(NonFinite(ref) == 0);
+
+  const std::vector<float> stale = run(/*host_id=*/0, /*mirror=*/false);
+  REQUIRE(NonFinite(stale) == 0);
+  size_t moved = 0;
+  for (size_t i = 0; i < ref.size(); ++i)
+    if (std::memcmp(&ref[i], &stale[i], sizeof(float)) != 0) ++moved;
+  CHECK_MESSAGE(moved > 0,
+                "zeroing the host id changed nothing, so this fixture cannot "
+                "see an identifier at all and the gate below proves nothing");
+
+  const std::vector<float> via_device = run(/*host_id=*/0, /*mirror=*/true);
+  size_t differing = 0;
+  for (size_t i = 0; i < ref.size(); ++i)
+    if (std::memcmp(&ref[i], &via_device[i], sizeof(float)) != 0) ++differing;
+  CHECK_MESSAGE(differing == 0,
+                "registry forward, mirror vs host reference: " << differing
+                    << " of " << ref.size() << " logits differ, so this forward "
+                    "embedded the STALE host id (#2544, #1305)");
+  MESSAGE("dsv4 device-ids: control moved " << moved << " floats; mirror vs "
+          "reference differ in " << differing << " of " << ref.size());
 }

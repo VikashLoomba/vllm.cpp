@@ -298,6 +298,17 @@ is seen.
 on `strix:gpu0`. Until it reports, this wave has four killed mutations and one
 repaired-but-unre-measured case, and nothing here says otherwise.
 
+### What the W1 gate does NOT cover, stated rather than implied
+
+`GatherMlaCacheKernelHip` carries upstream's `token_id >= batch_end` early
+return (`cache_kernels.cu:1019`), and **no case in this wave makes it fire**.
+The grid is `num_tokens` and the last request's `cu_seq_lens` entry equals
+`num_tokens`, so `token_id < batch_end` always holds and the branch is dead in
+the gate. It is ported because it is upstream's, not because it is checked;
+exercising it needs a `token_to_seq` that names a request the token is past,
+which is the ragged-batch shape this harness does not build. Recorded here so
+nobody reads "four killed mutations" as coverage of every line.
+
 ### Also pending on `e88fd335`: what an unregistered ROCm op actually does here
 
 #2715 says the missing ops are a slow path on gfx1151 and a refusal elsewhere.

@@ -224,9 +224,24 @@ commit `665167c4a` of `row/QUANT-EXL3-PERF`. Every compiled and tested path --
 `src/`, `include/`, `tests/vt/`, `cmake/`, `CMakeLists.txt` -- is byte-identical
 between that commit and this row's head; only `docs/USAGE.md` moved afterwards.
 
+The DEVICE NUMERIC GATE runs on `thor:gpu0` from a `git bundle` pinned to
+`sha256 8156c0dbe30092ac267ab1749d2386c37ea832d7a2ceed5f3db6d29504d9ebf7`,
+which is commit `57e359907`, and the job aborts unless `git rev-parse HEAD`
+inside the clone matches. Nothing is pushed to reach that box.
+
 Named here because an evidence table must say which tree produced it, and
-because the tarball sha is the only identifier the job can verify on the box:
-it aborts rather than build a tree it was not pinned to.
+because the bundle and tarball hashes are the only identifiers the job can
+verify on the box: each aborts rather than build a tree it was not pinned to. A
+`git rev-parse` plus an empty porcelain proves nothing on the far side of a
+copy.
+
+**Why two boxes.** `Exl3CcFromSm` maps every `sm_major >= 10` to
+`Exl3Cc::kBlackwell`, so Thor (11.0) and GB10 (12.1) are the SAME envelope
+class and only `narrow_coresident` differs by SM count. That makes Thor a valid
+CORRECTNESS box for the tier-3c bound and the codebook discrimination, and it is
+NOT a valid throughput box: the 16.7 tok/s baseline is GB10's, and a decode
+number from a different part is not comparable to it. The throughput half stays
+on `dgx:gpu0` and nothing from Thor is quoted on that axis.
 
 ## Scope
 

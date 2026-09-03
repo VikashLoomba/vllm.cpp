@@ -1,155 +1,95 @@
-# ROCm skinny GEMM sacred-gate adjudication
+# Repair the ROCm skinny sacred-gate provenance
 
 ## Now
 
-Issue [#2772](https://github.com/mudler/vllm.cpp/issues/2772), owned by Row
-`BACKEND-ROCM`, is **FAILING** at source
-`4d10c8acc527c34a6a58a309d52ea5f8fbd1d47b` (tree
-`68cb23e690cf0b76f43aa01235e328de38fca145`). The default Qwen3.5-0.8B
-checkpoint gate first disagrees with its committed local anchor at prompt 10,
-generated token 10: the engine emits token 369 and the anchor records token
-488. The implementation may begin only after this spec commit. It may not
-replace the committed anchor or near-tie gaps until the pinned oracle has
-adjudicated the first shared-prefix disagreement.
+Issue [#2772](https://github.com/mudler/vllm.cpp/issues/2772) belongs to Row
+`BACKEND-ROCM`. The issue is open, and its default checkpoint gate is
+**FAILING** at the reviewed base `3ab4b1209be19faaf734697532d4d1eb1722066c`.
 
-The source checkout for the pinned vLLM revision is present. A runnable oracle
-is not: `VLLM_ORACLE` is empty and the former local image
-`vllm-rocm-oracle:555967922-gfx1100` is absent. Oracle reconstruction and every
-conclusion that depends on it are therefore **PENDING**, not waived. This spec
-and the later implementation share one pull request, the repository default.
+The first failure is prompt 10, generated token 10. Default local wvSplitK
+emits token 369, but the committed local anchor records token 488. Setting
+`VT_ROCM_SKINNY=0` restores the old anchor and 137/137 assertions. A locked
+bisect identifies `f38c1edc4ea679348f856c0c0b20fb0702f77daf` as the first bad
+commit. That commit made the existing wvSplitK arm the eligible default.
+
+The pinned production oracle now runs. It chooses token 369 at the disputed
+prefix and supports every token in the current local 16 by 16 sequence with a
+zero teacher-forced gap. The selected repair is therefore minimal
+rederivation. Preserve the default wvSplitK path, make both capture scripts use
+production vLLM by default, and refresh the four ROCm arrays and their
+provenance.
+
+This specification and its implementation use one pull request. This row is
+not `DONE`, so this specification has no `## Outcome` section.
 
 ## Goal
 
-Determine whether the default local wvSplitK path is a faulty vLLM mirror or a
-correct mirror that exposes a stale local golden. Then make the smallest change
-that restores a causal, checkpoint-backed default gate without choosing that
-answer in advance.
+Make the Qwen3.5-0.8B ROCm sacred gate reproduce the pinned vLLM production
+mode that governs acceptance. Keep the existing checkpoint path and acceptance
+policy causal to default local wvSplitK.
 
-The change must:
+The completed implementation must have these properties:
 
-1. establish the exact production `MatmulBT` shapes and selected arms on the
-   shared-prefix disputed step;
-2. compare the local skinny and BLAS arms from identical operands, and compare
-   both with the executing pinned upstream path;
-3. reconstruct the pinned vLLM oracle and ask the one-token, teacher-forced
-   same-prefix question before using any new golden;
-4. repair the mirror, rederive the local golden, or narrow the default only as
-   the pre-registered evidence below permits;
-5. port the applicable upstream kernel and routing tests; and
-6. keep one default checkpoint test entering through
-   `LoadedEngine::FromModelDir` and prove that the wvSplitK production call is
-   indispensable to that gate.
+1. Both oracle scripts default to production mode and expose eager mode only
+   through explicit `--enforce-eager`.
+2. A CPU test distinguishes default production mode from explicit eager mode
+   for both scripts.
+3. Exactly four ROCm arrays derive from the retained production evidence.
+4. The existing real `LoadedEngine::FromModelDir` case passes 137/137 and
+   reports 15/16 strict prompts, one oracle-tied prompt, maximum gap 0.0, and
+   zero forward divergence.
+5. Routing `WvSplitKBT` to the existing BLAS fallback makes that real case fail
+   at prompt 10, token 10.
+6. The existing prerequisite exit contract and wvSplitK focused test remain
+   unchanged.
 
-Correctness precedes performance. Matching the current BLAS arm or the old
-local token 488 does not establish correctness by itself.
+## Selected decision
 
-## Acceptance ledger
+The evidence selects rederivation. It does not select a kernel repair, an
+eligibility change, a default change, or a performance campaign.
 
-Each applicable obligation has one current result:
+At the first shared-prefix disagreement, pinned vLLM reports equal log
+probabilities for tokens 369 and 488:
 
-| Obligation | Result now | Closure evidence |
-|---|---|---|
-| Default sacred checkpoint gate | **FAILING** | Prompt 10/token 10 is 369 versus anchor 488. |
-| Regression isolation | **SATISFIED** | Skinny-off 137/137, unrelated Q8K/attention arms still red, HIP-7.15 known-good green, and first bad `f38c1edc4`. |
-| Source and artifact pins | **SATISFIED** | Exact local source/tree, upstream revision, model revision, file names, sizes, and SHA-256 values are recorded below. |
-| Complete pinned source chain | **SATISFIED for source inspection** | Environment default, Python dispatch, custom-op binding, host configuration, and RDNA3 body are cited below. |
-| Production shape/configuration census | **PENDING** | Requires the internal selection record and a locked checkpoint run. |
-| Same-input local skinny/BLAS outputs and logits | **PENDING** | Requires scratch capture on gfx1100. |
-| Runnable pinned vLLM and exact-prefix answer | **PENDING** | `VLLM_ORACLE` is empty and the old image is absent. Source alone is insufficient. |
-| Decision branch | **PENDING** | No branch is selected before paired local and runnable-oracle evidence. |
-| Applicable upstream test port and causal checkpoint gate | **PENDING** | Belongs to the later implementation, not this prerequisite commit. |
-| Performance acceptance | **PENDING only if branch C applies** | Correctness must select branch C before same-workload timing is admissible. |
+```text
+369  -1.2000471353530884
+488  -1.2000471353530884
+```
 
-There is no waiver in this spec.
+Production greedy and teacher-forced argmax both choose 369. The current local
+prompt-10 sequence matches the production oracle:
 
-## Scope
+```text
+279 2691 13 271 248068 271 248069 271 760 4952 369 2972 1802 159034 271 760
+```
 
-In scope:
+The eager diagnostic reproduces the historical committed oracle output. Thus
+the stale evidence came from capture mode, not restored dependency drift.
 
-- the BF16, no-bias, packed-row gfx1100 wvSplitK arm selected by the Qwen3.5
-  production decode;
-- the local `MatmulBT` internal selection seam, its minimal diagnostic record,
-  and the tests that consume that record;
-- the executing pinned vLLM gfx1x dispatch, host configuration, and RDNA3
-  kernel body;
-- exact-prefix local skinny, local BLAS, and pinned-vLLM output/logit evidence;
-- the Qwen3.5-0.8B sacred gate and only the golden files justified by the
-  selected evidence branch; and
-- same-workload performance evidence only if the evidence selects the
-  narrowing/default-disable branch.
+## Verified evidence
 
-Out of scope:
+### Oracle identity
 
-- cache-mode, model-wide state-space, convolution, attention, and layerwise
-  numerical characterization owned by issue
-  [#2773](https://github.com/mudler/vllm.cpp/issues/2773);
-- FP16, bias, padded-weight, gfx9 wave64, gfx950, gfx1151, medium-LDS, and
-  big-LDS implementations that the production Qwen3.5 BF16 arm does not use;
-- Q8K and paged-attention repairs already excluded by controlled rollback;
-- a public debug API or a new user-facing environment switch;
-- changing vLLM's model, sampling, or cache defaults; and
-- treating the provisional Qwen3.5-4B trace as issue #2772 acceptance evidence.
+`VLLM_ORACLE` resolves to
+`/home/vikash/oracle/vllm-rocm-oracle-python`. The wrapper uses network-disabled
+image ID
+`sha256:80aab4c182a1f3eeebe286173977e57fcaf10a049b41f475655b35d285de31dc`.
 
-If execution evidence reaches an out-of-scope arm, stop and request a scope
-decision. Do not silently expand the port.
+The oracle identity is:
 
-## Grounded red evidence
+| Field | Value |
+|---|---|
+| vLLM runtime | `0.23.1rc1.dev1511+g555967922` |
+| vLLM source | `5559679229bc961848b121ccdeaa8fa5d79bec98` |
+| Wheel SHA-256 | `c4892c729daaff1ac3e8ad72d4e4753118b84e7d7c265634a1326b261a44ee43` |
+| Base image digest | `sha256:ba82bf93fc2d3787550b77fb2a79fe230130f05bec737c671093251c55459309` |
+| HIP userland | `7.2.53211` |
+| Device | `gfx1100` |
+| GPU exclusion | `/home/vikash/gpu.lock` |
 
-The following results are binding evidence from issue #2772. They are not
-rerun by this spec-only change because every run requires the shared GPU.
-
-- The exact current default dedicated test runs one real doctest case and
-  fails at `prompt[10]`, generated token 10: engine 369, committed local anchor
-  488. The gate reports native ROCm providers; it does not take a reference
-  provider.
-- The same binary with `VT_ROCM_SKINNY=0` passes 1/1 case and 137/137
-  assertions. `VT_ROCM_Q8K_BLOCK=0` and `VT_ATTN_DECODE_D128=0` still fail at
-  the same cell.
-- Commit `7b89cf30775df79155d4bcc4f3cabf57637f74fc`, rebuilt under the current
-  HIP 7.15 toolchain, passes 137/137. A GPU-locked bisect that rebuilt and ran
-  the real test at every candidate identifies
-  `f38c1edc4ea679348f856c0c0b20fb0702f77daf` as first bad. That commit enabled
-  local wvSplitK by default.
-- `VT_DUMP_IDS=1` reports six changed cells, all prompt 10, tokens 10 through
-  15. Only token 10 has the committed input prefix. The five suffix cells have
-  already consumed a different token and the old gap table cannot adjudicate
-  them. The old prompt-10/token-10 gap is 125 milli-nats for committed token
-  488 on that shared prefix; it does not report the gap or rank of skinny token
-  369.
-- `/tmp/gfx1100-current-profile-4d10` is provisional only. Its different
-  quantized 4B model records 72 wvSplitK calls per token and 2.4651 ms per
-  token. It cannot decide #2772 correctness or satisfy a performance gate.
-
-The existing sacred path is
-`tests/parity/test_qwen35_paged_engine.cpp::RunGate`. Its only actual doctest
-case reaches `LoadedEngine::FromModelDir`, generates all 16 prompts, checks the
-committed local anchor before the near-tie loop, and records native-provider
-selection. Provider selection proves that ROCm owns `kMatmulBT`; it does not
-distinguish the wvSplitK and BLAS branches inside that provider.
-
-## History
-
-Issue [#487](https://github.com/mudler/vllm.cpp/issues/487) identified the
-decode-skinny rocBLAS tile mismatch and led to PR
-[#506](https://github.com/mudler/vllm.cpp/pull/506). The landed commit
-`f38c1edc4ea679348f856c0c0b20fb0702f77daf` introduced the local gfx1x BF16
-kernel and made it the default for eligible shapes. Its commit and pull request
-reported that the Qwen3.5 gate remained unchanged. The current exact-test
-bisect falsifies that claim on the present HIP 7.15 build; it does not by itself
-say whether the kernel or the old local golden is correct.
-
-The reviewed follow-up recorded the safe local preconditions in
-`.agents/specs/rocm-skinny-gemm.md`: even output features greater than eight,
-packed BF16 rows, one through four input rows, `K % 8 == 0`, small-LDS fit, and
-wave32 architecture. This issue preserves those guards unless executing-chain
-evidence selects branch A or C below.
-
-## Artifact and environment pins
-
-The exact model is
-`Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17`, present at
-`/home/vikash/models/Qwen3.5-0.8B`. The files that must be mounted unchanged on
-both sides are:
+The model is
+`Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17`.
+Both engines use these exact local files:
 
 | File | Bytes | SHA-256 |
 |---|---:|---|
@@ -157,477 +97,390 @@ both sides are:
 | `model.safetensors.index.json` | 50,900 | `d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e` |
 | `config.json` | 2,907 | `b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204e` |
 
-The index declares one shard, 488 weights, and total tensor bytes
-1,746,882,752. The model resolves BF16 weights and BF16 model activations; its
-documented state-space exception remains f32. This issue does not change that
-polarity.
+### Production results
 
-All later GPU work runs on the local RX 7900 XTX (`gfx1100`) under HIP 7.15.
-Every GPU command must hold `flock /home/vikash/gpu.lock` and use exactly the
-sanitized ROCm runtime path
-`LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib`. Evidence records the
-binary SHA, compiler and runtime versions, board identity, clocks, contention
-state, command, environment, exit code, and output path.
+The production oracle ran with `enforce_eager=False`. Its compilation mode was
+`VLLM_COMPILE`, and its graph mode was `FULL_AND_PIECEWISE`.
+`VLLM_ROCM_USE_SKINNY_GEMM` was unset and resolved true.
 
-## Pinned vLLM executing chain
+The complete teacher-forced run compared all 256 current local prefixes. It
+found zero prompt mismatches, zero local tokens outside the oracle top 20, 256
+strict argmax matches, zero nonzero gaps, and maximum gap 0.0. Evidence is
+`/tmp/qwen35-skinny-oracle-full-gap-2772-production/result.json`, SHA-256
+`495ff7624c7a46fd135edc18fddc364ef449a10db78a5eb3e5b7d2fc1a99589b`.
 
-The primary oracle is the checkout at `/home/vikash/oracle/vllm-src`, commit
-`5559679229bc961848b121ccdeaa8fa5d79bec98`, the parity pin recorded in
-`.agents/upstream-sync.md`. Source inspection establishes this complete chain:
+The production K=10 greedy run was deterministic in all 256 cells. It differs
+from current local output only at prompt 7, positions 8 through 15, after an
+exact tie at the first split. Evidence is
+`/tmp/qwen35-skinny-oracle-greedy-k10-2772-production/result.json`, SHA-256
+`92460eb055228491c7e30c8bef83d7ce4a909db1c6c925ef31d0fba4fdf4c5d4`.
 
-1. `vllm/envs.py::VLLM_ROCM_USE_SKINNY_GEMM` resolves unset to true.
-2. The `apply` method on
-   `vllm/model_executor/layers/linear.py::UnquantizedLinearMethod` enters
-   `vllm/model_executor/layers/utils.py::dispatch_unquantized_gemm`.
-3. `vllm/model_executor/layers/utils.py::rocm_unquantized_gemm_impl` selects
-   the ROCm skinny path for gfx9/gfx1x FP16 or BF16, `K % 8 == 0`, output
-   features greater than 8, and one through five input rows. On gfx1x this arm
-   calls wvSplitK; more than five rows fall back to ordinary linear execution.
-4. `vllm/_custom_ops.py::wvSplitK` invokes the `_rocm_C` custom operation
-   registered by `csrc/rocm/torch_bindings.cpp::wvSplitK`.
-5. `csrc/rocm/skinny_gemms.cu::wvSplitK` reads strides, output and bias shape,
-   compute-unit count, and LDS size. For gfx1x it launches wave32 with 16 waves
-   per group. It derives `sYT = ceil(M_in / (CuCount * 4))`, then selects
-   YTILE/UNRL as 1/4 for `sYT <= 1`, 2/2 for a one-row activation, an LDS miss,
-   or `sYT <= 8`, 3/2 for `sYT <= 12`, 4/1 for four input rows, and 4/2
-   otherwise. It selects the small body only when `Kbp * N_in` fits the BF16
-   element capacity (`LDS bytes / 2`) and `M_in` is divisible by YTILE, the
-   medium body up to 1.2 times that capacity, and the big body otherwise. It
-   has template arms for one through five input rows.
-6. On the applicable RDNA3 small-body arm,
-   `csrc/rocm/skinny_gemms.cu::wvSplitK_hf_sml_` stages the activation in LDS,
-   loads weights nontemporally, expands BF16 pairs to f32, accumulates in f32,
-   reduces wave32 with DPP row shifts plus shuffle-xor 16, adds any bias, and
-   stores BF16 output. This is the executing body, not an adjacent candidate.
+The four retained candidates are:
 
-The corresponding local production route is
-`src/vllm/entrypoints/model_loader.cpp::LoadedEngine::FromModelDir` through
-`src/vllm/model_executor/models/model_registry.cpp::ModelRegistry::Forward`
-and the Qwen3.5 projections including
-`src/vllm/model_executor/models/qwen3_5.cpp::MatmulBTRawD`, then
-`src/vt/ops.cpp::MatmulBT` to the registration in
-`src/vt/rocm/rocm_ops.hip::Registrar`, then
-`src/vt/rocm/rocm_matmul_hipblaslt.hip::MatmulBTKernelRocm` and
-`src/vt/rocm/rocm_matmul_hipblaslt.hip::SkinnyGemmEnabled`, followed by
-the architecture predicate
-`include/vt/rocm/rocm_skinny_gemm_arch.h::SkinnyGemmArchOk`,
-`src/vt/rocm/rocm_skinny_gemm.hip::WvSplitKBT` and
-`src/vt/rocm/rocm_skinny_gemm.hip::wvSplitKSml`.
+| Destination array | Retained source | SHA-256 |
+|---|---|---|
+| `our_ids.npy` | `qwen35-skinny-oracle-full-gap-2772-production/our_ids.production.npy` | `395ecea93be0c2cf036a0d8d515493a5178a5dcaea172df8ff71cfd80ab24112` |
+| `neartie_gap_mnats.npy` | `qwen35-skinny-oracle-full-gap-2772-production/neartie_gap_mnats.production.npy` | `c707d168d23aea394987c4a40c4e92d8347c0400e9790df0851c94d37c113a82` |
+| `greedy_ids.npy` | `qwen35-skinny-oracle-greedy-k10-2772-production/greedy_ids.production.npy` | `c120eec482e2029037269f55721f9100c0f4717c956017aeaf51346abfd4b9c8` |
+| `greedy_dist.npy` | `qwen35-skinny-oracle-greedy-k10-2772-production/greedy_dist.production.npy` | `1924f7a8915d367ea462975d0b5f91da78ba0f36d922c0d563abff9457ec16c8` |
 
-The local body appears to match the applicable RDNA gfx1x BF16 arithmetic and
-wave32 reduction, but that is not yet a parity result. Its host policy is a
-narrow port: one through four rows, packed BF16 input/output, no bias, fixed
-YTILE=2 and UNRL=2, small-LDS only, even output features, and gfx11/gfx12. The
-pinned host dynamically chooses YTILE/UNRL, supports row count five, and can
-reach bias, strided, FP16, medium, and big arms. The shape census must prove the
-configuration used by Qwen3.5 before any claim that the local body mirrors the
-executing upstream body.
+The expected differences from the committed arrays are exact:
 
-## Minimal production-path instrumentation
+- `our_ids.npy` changes six cells at prompt 10, positions 10 through 15.
+- `neartie_gap_mnats.npy` changes `(7,8)` and `(10,10)` from 125 to 0.
+- `greedy_ids.npy` changes 16 cells at prompts 7 and 10, positions 8 through
+  15.
+- `greedy_dist.npy` changes 160 cells.
 
-The implementation first adds an internal, test-owned selection record at
-`MatmulBTKernelRocm`. It is not exposed through `include/vllm.h`, is inert when
-no test observer is installed, allocates nothing on the normal path, and does
-not add an environment variable. The record contains:
+These hashes belong to this evidence section and issue comments. Do not add an
+array-hash inventory or copy these hashes into another tracked file.
 
-- monotonically increasing `MatmulBT` call ordinal;
-- device and architecture;
-- exact logical `{M_tokens, N_features, K}`;
-- input, weight, and output dtypes and row strides;
-- each eligibility predicate and the selected arm (`wvSplitK`, hipBLASLt,
-  hipBLAS GEMM, or another existing arm); and
-- for wvSplitK, compute-unit count, LDS-fit result, THRDS, waves per group,
-  YTILE, UNRL, and instantiated input-row template.
+### Eager diagnostic
 
-The existing operation-provider statistics remain the proof that the public
-production dispatch selected native ROCm. The new record answers only the
-missing internal-arm question. A focused CPU-side routing test installs the
-observer and proves that every guard is narrated correctly; it does not claim
-kernel correctness.
+The committed `scripts/qwen3-oracle-capture.py` hard-codes
+`enforce_eager=True`. Running it unchanged in the restored image reproduced the
+historical `greedy_ids.npy` byte for byte, with SHA-256
+`865293612ec0e5da77a188c8513cca80f0efcb4235fae37b380530a0ca2413b3`.
+The runtime reported disabled compilation and graph mode `NONE`.
 
-The one checkpoint gate consumes aggregate counts and the exact reached shapes
-from this same record. It must assert at least one production wvSplitK call and
-the frozen disputed-step shape inventory. That prevents a future default
-change from making the token gate green by bypassing the kernel.
+This result isolates execution mode as the provenance defect. Eager remains a
+useful diagnostic, but it is not the production denominator.
 
-### Paired operand and output capture
+### Actual engine configurations
 
-Detailed capture is correctness diagnosis, not shipped tracing. Use a scratch
-instrumentation patch around the same production dispatcher and remove it
-byte-for-byte before review. Run two fresh processes from the exact numeric
-teacher prefix below: ambient/default skinny, then `VT_ROCM_SKINNY=0` as a
-diagnostic BLAS control. Do not execute an extra shadow GEMM in the same model
-run.
+The engines did not use an identical capacity configuration. Record their
+actual defaults separately.
 
-For every eligible call until the one-token logits are produced, write a
-manifest containing the call ordinal, shape/configuration record, activation
-and weight SHA-256, raw BF16 output SHA-256, and output bytes. Synchronize only
-after the real operation has completed, copy the completed result without
-altering it, and resume the unchanged model output. Pair calls only when
-ordinal, shape, activation bytes, and weight bytes match. Report the first
-output element that differs, maximum absolute and relative difference, and
-whether the difference survives BF16 storage. If the inputs do not match, the
-pair is invalid. The first call with matching inputs and different output is
-the causal local skinny/BLAS boundary. Calls after that boundary consume
-different model state and may be recorded as consequences, but they must not
-be described as paired evidence.
+| Setting | Local sacred case | Production vLLM oracle |
+|---|---|---|
+| Construction | `EngineParams{}` | production `LLM` |
+| Model dtype | BF16 | BF16 |
+| Block size | 32 | runtime default, not an identity condition |
+| KV blocks or tokens | auto, fallback 256 blocks | profiled 1,085,870 GPU KV tokens |
+| Maximum sequences | 32 | 256 |
+| Maximum batched tokens | 2,048 for the dense registration | 8,192 |
+| Maximum model length | auto-fitted to the local pool, at most 8,192 | 262,144 |
+| Prefix caching | hybrid-model default off | off |
+| KV-cache dtype | not characterized in this issue | reported as `auto` |
+| Oracle execution mode | n/a | `enforce_eager=False`, `FULL_AND_PIECEWISE` |
+| Skinny mode | `VT_ROCM_SKINNY` unset, default on | `VLLM_ROCM_USE_SKINNY_GEMM` unset, resolves true |
 
-Use the existing `src/vllm/v1/worker/gpu/runner.cpp::GPUModelRunner::dump_step_logits`
-seam (`VT_DUMP_LOGITS`) to capture the final f32 logits before sampling and its
-argmax sidecar. Its current tests already establish alignment and default
-inertness. The new work must repeat a capture-off/capture-on token comparison
-to show that scratch operand capture also does not perturb output. These dumps
-may diagnose correctness; their synchronizations make them invalid for timing.
+The comparison requires identity only for the model bytes, exact numeric
+prefix, one request, one next token, greedy sampling, and default skinny mode.
+Do not require shared scheduler capacity values. Do not claim a physical cache
+dtype from `auto`. Issue #2773 owns cache and state characterization.
 
-If a reproducible capture cannot be made through the production dispatcher
-without changing its output, stop with `NEEDS_DECISION`. Do not land a public
-debug switch to make progress.
+### Executing chains
 
-## Exact same-prefix oracle question
-
-Prompt 10 is `The mitochondria is the powerhouse of`. Its tokenizer prefix is:
+The pinned upstream source chain remains:
 
 ```text
-760 52132 4065 369 279 71594 314
+vllm/envs.py::VLLM_ROCM_USE_SKINNY_GEMM
+  -> vllm/model_executor/layers/utils.py::rocm_unquantized_gemm_impl
+  -> vllm/_custom_ops.py::wvSplitK
+  -> csrc/rocm/torch_bindings.cpp::wvSplitK
+  -> csrc/rocm/skinny_gemms.cu::wvSplitK
+  -> csrc/rocm/skinny_gemms.cu::wvSplitK_hf_sml_
 ```
 
-The committed local output is shared through generated token 9:
+The local production chain remains:
 
 ```text
-279 2691 13 271 248068 271 248069 271 760 4952
+src/vllm/entrypoints/model_loader.cpp::LoadedEngine::FromModelDir
+  -> src/vllm/model_executor/models/model_registry.cpp::ModelRegistry::Forward
+  -> src/vllm/model_executor/models/qwen3_5.cpp::MatmulBTRawD
+  -> src/vt/ops.cpp::MatmulBT
+  -> src/vt/rocm/rocm_matmul_hipblaslt.hip::MatmulBTKernelRocm
+  -> src/vt/rocm/rocm_matmul_hipblaslt.hip::WvSplitKBT
+  -> src/vt/rocm/rocm_skinny_gemm.hip::wvSplitKSml
 ```
 
-Therefore the only admissible teacher-forced input for the disputed next token
-is this 17-token numeric sequence:
+The source audit and retained production run establish the selected default.
+No direct custom-operation replay or raw-BF16 byte-identity condition remains.
+
+## Scope
+
+### In scope
+
+- Change `scripts/qwen3-oracle-capture.py` and
+  `scripts/qwen3-neartie-gap.py` to default to production mode.
+- Add explicit eager diagnostics to both scripts.
+- Add one CPU test for both scripts' mode selection and narration.
+- Refresh exactly four arrays under
+  `tests/parity/goldens/qwen35_greedy_0_8b/`.
+- Update that directory's `manifest.json` and the provenance comments in
+  `tests/parity/test_qwen35_paged_engine.cpp`.
+- Preserve the real checkpoint case, its acceptance logic, and its prerequisite
+  behavior.
+- Run the existing relevant wvSplitK test without changing it.
+
+### Out of scope
+
+- Any kernel, default, eligibility, arithmetic, or performance change.
+- A shipped observer, execution-shape freeze, operand dump, logit dump, or
+  direct custom-operation replay.
+- An eighth upstream shape or a broader upstream test port.
+- Cache dtype, capacity, state-space, convolution, attention, or layer-numeric
+  characterization.
+- Product code, a framework seam, a public API, or public documentation.
+- Tenstorrent arrays, prompt-ID files, unrelated goldens, and threshold changes.
+
+If a focused result contradicts the zero-gap production evidence, stop with
+`NEEDS_DECISION`. Do not reactivate the removed diagnostic campaign silently.
+
+## Implementation contract
+
+### Make production mode reproducible
+
+Both scripts must omit `enforce_eager` or pass `False` by default. Both scripts
+must accept an explicit `--enforce-eager` flag that passes `True` to `LLM`.
+Each script must print the selected mode in words before engine construction.
+The narration must distinguish production from eager and state the resolved
+`enforce_eager` value.
+
+A small pure argument or keyword-construction helper is allowed. It remains
+private to the scripts and does not create a framework or public API.
+
+### Add the smallest CPU mode test
+
+The future implementation adds
+`tests/scripts/test_qwen3_oracle_modes.py`. This is an implementer-added test;
+it does not exist in this specification commit.
+
+The test imports each script without constructing vLLM. For each script, it
+must prove:
+
+- no flag selects production and yields absent or false `enforce_eager`;
+- `--enforce-eager` yields true `enforce_eager`; and
+- the selected narration names production or eager correctly.
+
+Run this test against the current hard-coded eager scripts before changing
+them. It must fail for the intended default-mode reason. It must pass after
+both scripts change.
+
+### Refresh only the selected evidence
+
+Replace exactly these files in
+`tests/parity/goldens/qwen35_greedy_0_8b/`:
 
 ```text
-760 52132 4065 369 279 71594 314 279 2691 13 271 248068 271 248069 271 760 4952
+greedy_ids.npy
+greedy_dist.npy
+our_ids.npy
+neartie_gap_mnats.npy
 ```
 
-Construct the request from these token IDs, not decoded/re-tokenized text, and
-run exactly one next-token step in a newly loaded engine with an empty cache,
-batch size one, greedy sampling, temperature zero, no chat template, and no
-other concurrent request. Record the resolved model dtype, physical KV-cache
-dtype, prefix-caching state, compilation mode, sampling seed/defaults, and
-custom-operation selection on each side. Local must enter through
-`LoadedEngine::FromModelDir`; pinned vLLM must use the identical artifact and
-configuration. `auto` cache resolution must be recorded as the physical dtype,
-not left as the word `auto`.
+Use the retained sources and expected hashes in `## Verified evidence`. Verify
+the exact old-to-new cell counts before staging.
 
-For this artifact, reproduce the sacred test's `EngineParams{}` resolution
-explicitly on both sides: block size 32, 256 KV blocks, maximum sequences 32,
-maximum batched tokens 8,192, prefix caching disabled for the hybrid model,
-model maximum length 262,144, BF16 model dtype, and `auto` resolved to physical
-BF16 KV storage. The local request uses the existing `Greedy(1)` sampling
-construction; the upstream request sets the equivalent one-token greedy
-parameters and seed 0. Record rather than infer every resolved value from each
-runtime. A mismatch makes the comparison invalid.
+Update `tests/parity/goldens/qwen35_greedy_0_8b/manifest.json` with the restored
+image, source, wheel, base image, HIP, date, production mode, graph mode,
+default skinny mode, commands, and expected gate summary. Do not add array
+hashes to the manifest.
 
-The oracle environment is acceptable only after it:
+Update the provenance comments in
+`tests/parity/test_qwen35_paged_engine.cpp`. The comments must identify
+production capture as the denominator and eager as diagnostic history. Do not
+change executable logic, thresholds, cases, or prerequisites.
 
-1. reports the exact source pin and successfully imports the extension built
-   from that pin;
-2. loads the three hashed artifact files above;
-3. proves the production chain selects `_rocm_C.wvSplitK` with the resolved
-   gfx1x host configuration; and
-4. produces repeatable logits for the exact one-token question.
+### Preserve the causal sacred case
 
-The full-model oracle run adjudicates the token. It may not present
-byte-identical intermediate activations because the two engines have other
-implementation differences. For the kernel-body question, replay the first
-local captured BF16 activation and weight pair directly through the pinned
-`_rocm_C.wvSplitK` operation after the full-model trace has proven that the same
-shape and host configuration are production-reachable. Use the recorded CU
-count, preserve strides and orientation, and compare raw BF16 output bytes with
-the local skinny capture. Label this replay as kernel evidence, never as a
-substitute for the full production oracle.
+Keep the single existing doctest case in
+`tests/parity/test_qwen35_paged_engine.cpp::RunGate`. It must continue to enter
+through `LoadedEngine::FromModelDir`, run the 16 prompts, check the local anchor
+before the near-tie policy, and prove native provider selection.
 
-Run pinned vLLM with its production configuration and the skinny default
-resolved true. A skinny-disabled upstream arm may be collected as a diagnostic
-control, but it does not replace the production oracle. `--enforce-eager` may
-be used only as a labelled correctness cross-check needed to compare the old
-capture; it is forbidden as the performance denominator.
+Do not add an observer or freeze internal GEMM shapes. The refreshed anchor is
+causal without either mechanism. In a scratch copy, route the eligible
+`WvSplitKBT` call in
+`src/vt/rocm/rocm_matmul_hipblaslt.hip::MatmulBTKernelRocm` to its existing
+BLAS fallback. The real gate must fail at prompt 10, token 10, because fallback
+emits 488 instead of refreshed anchor token 369. Restore the file byte for
+byte, then require the gate to pass again.
 
-For tokens 369 and 488, record logits, ranks, argmax, and log-probability gaps
-from the same output tensor. Apply only the sacred gate's already-ratified
-500-milli-nat acceptance band. The old table's token-10 entry describes this
-shared prefix and may be reported as historical context. Entries for tokens 11
-through 15 follow a divergent token and must not be used. If a new local
-sequence is justified, teacher-force every later position from that new exact
-prefix and derive every suffix gap anew.
+### Preserve prerequisite behavior
 
-Source inspection alone is not an oracle result. Until the runnable steps pass,
-the same-prefix answer is **PENDING**.
+Do not edit
+`tests/parity/test_qwen35_paged_engine_prerequisites.cmake` or its CTest
+registration. The prerequisite probe contract remains:
 
-## Pre-registered decisions
+| Probe | Required exit |
+|---|---:|
+| missing `greedy_ids.npy` | 77 |
+| missing `our_ids.npy` | 77 |
+| missing `neartie_gap_mnats.npy` | 77 |
+| all three present | 86 |
 
-Choose exactly one branch after recording all required evidence. Do not choose
-a branch from the current BLAS/local-anchor agreement.
+Exit 86 is the complete-set sentinel. It is not a successful model run. A
+zero-case `RC 0` is invalid for the dedicated real gate.
 
-### A. Local port differs from executing pinned upstream
+### Preserve the existing kernel test
 
-If paired identical operands show any raw-BF16 output difference between local
-wvSplitK and the applicable executing pinned body, or the shape/configuration
-census shows a host-policy mismatch on the production arm, repair the local
-mirror. The upstream tolerance remains the general numerical-test contract; it
-does not excuse drift on this same-board, same-input kernel-body comparison.
-Port the minimum missing arithmetic, host selection, stride, or device behavior
-that the measured arm needs. Keep the committed goldens unchanged. The repaired
-default must pass the per-operation ported suite, exact-prefix oracle
-comparison, full sacred gate, full repository gate, and fresh mutation review.
+Run the unchanged case
+`tests/vt/test_backend_cross_device.cpp::decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle`.
+Do not add `(2,10240,1024)` or another eighth upstream shape. Issue #487 owns
+broader routing, kernel coverage, and performance work.
 
-### B. Local matches upstream and the pinned oracle supports the skinny token
+## Acceptance ledger
 
-If identical operands produce byte-identical raw-BF16 local/pinned skinny
-outputs under the same configuration, and pinned vLLM's exact-prefix logits
-support token 369 under the ratified band, the old local anchor is stale. Only
-then capture the new default 16-by-16 local sequence, verify repeatability,
-replace the local anchor, and teacher-force pinned vLLM on every exact new
-prefix to rederive the complete near-tie table. Retain the old files and
-failure as historical evidence in the spec or review record rather than using
-any old suffix gap. The new checkpoint gate must still causally assert
-wvSplitK selection.
+| Obligation | Current result | Completion result |
+|---|---|---|
+| Default sacred gate | **FAILING** at prompt 10, token 10 | 137/137 with the exact summary in `## Goal` |
+| Production oracle identity | **SATISFIED** | Preserve the recorded pins and mode |
+| Selected decision | **SATISFIED** | Minimal rederivation only |
+| Script reproduction mode | **FAILING** because both scripts hard-code eager | Default production plus explicit eager for both scripts |
+| Four ROCm arrays | **FAILING** because they are eager-era evidence | Exact retained production candidates |
+| Prerequisite contract | **SATISFIED** | Preserve 77/77/77/86 |
+| Existing wvSplitK test | **SATISFIED** at the reviewed source | Pass unchanged; no eighth shape |
+| Causal production route | **PENDING** reviewer mutation | BLAS routing makes the sacred case red |
+| Repository preflight | **FAILING** on inherited suites | `RC 0`, or report a set-identical inherited failure without calling it green |
+| Upstream symbol anchors | **FAILING** on inherited anchors | `RC 0`, or report a set-identical inherited failure without calling it green |
 
-### C. The upstream skinny arm or a faithful local production path is invalid
+The controlled pre-edit preflight at `3ab4b1209` returned `RC 1`. It reported
+five failures: `test_agent_onboard`, `test_check_windows_portability`, trailer
+suites, commit style suites, and tools suites. It also reported five
+argument-dependent skips. These results are not green and are outside this
+issue's authority.
 
-This branch is available only if the pinned upstream skinny arm fails its
-applicable upstream tests, or the local production seam cannot reproduce the
-executing upstream path without an unsafe or out-of-scope change. Narrow or
-disable the default only after the existing goldens pass, the reason is tied to
-specific shapes/configurations, and a same-binary same-workload measurement
-quantifies throughput, latency, and memory cost. Record why each new threshold
-or default has its value and which issue owns restoration. A broad disable is
-not justified when a measured shape guard is sufficient.
+The reviewed upstream symbol-anchor command returned `RC 1` with 15 stale or
+unresolvable citations outside this specification. The specification's own
+cited paths and symbols resolved. Re-run both gates and classify any remaining
+failure. Do not absorb either inherited repair into #2772.
 
-If the evidence supports none or more than one branch, return
-`NEEDS_DECISION`; do not average the conclusions.
+## Red and green evidence
 
-## Upstream tests to port
+### Red
 
-The source is pinned
-`tests/kernels/quantization/test_rocm_skinny_gemms.py::test_rocm_wvsplitk_kernel`
-and the routing companion is
-`tests/model_executor/layers/test_rocm_unquantized_gemm.py::test_rocm_unquantized_gemm_gfx1x_wvsplitk_path`.
-Preserve upstream seed 0, both xavier-normalization modes, elementwise
-`atol = finfo(dtype).eps * sqrt(K)`, `rtol = 1e-2`, and direct comparison with
-linear reference output. Do not substitute aggregate NMSE.
+- Run the implementer-added CPU mode test before editing either script. The
+  current eager hard-coding must make the production-default assertion fail.
+- Retain the existing default checkpoint failure at prompt 10, token 10, as the
+  checkpoint red. Do not rerun it without the required GPU exclusion.
 
-The upstream `(input rows, K, output features)` factors are preserved in the
-spec, not summarized away:
-
-```text
-(1,32,16)       (1,64,64)       (2,256,256)      (3,1024,1024)
-(4,4096,4096)   (4,4096,4097)   (4,4112,4096)    (4,4112,4097)
-(1,9216,512)    (2,10240,1024)  (4,16384,8192)   (4,32768,8192)
-(4,32768,8193)  (4,32784,8192)  (4,32784,8193)   (1,64,8)
-(2,128,8)       (4,256,8)
-```
-
-For each upstream factor, its cross product is seed 0, xnorm false/true, BF16
-and FP16, bias modes none/vector/matrix, and padded activation and weight
-false/true. The table below classifies every dimension of that cross product.
-The direct local BF16/no-bias/packed wvSplitK subset is exactly
-`(1,32,16)`, `(1,64,64)`, `(2,256,256)`, `(3,1024,1024)`, `(4,4096,4096)`,
-`(4,4112,4096)`, `(1,9216,512)`, and `(2,10240,1024)`. The implementation
-ports all eight rather than retaining the current seven-shape subset.
-
-The applicability inventory is explicit:
-
-| Upstream surface | Disposition in #2772 |
-|---|---|
-| BF16, no bias, packed activation and weight, rows 1-4, gfx1x small-LDS shapes | Port every applicable N/K/M parameter and both xnorm modes; require selected wvSplitK plus numerical output and output-sentinel checks. |
-| More than five input rows and non-skinny output width | Port routing fallback cases; wvSplitK must not be called. |
-| Row count 5 | Port as an explicit local refusal/fallback case unless branch A proves the production arm needs the upstream template. |
-| `K % 8 != 0`, output features at or below 8, odd output features, non-packed activation, and LDS overflow | Preserve the local adaptation as safe BLAS fallback; assert no wvSplitK call and correct output. |
-| FP16 or mismatched input dtypes | Not applicable to the measured BF16 Qwen3.5 arm; preserve the public local rejection and do not claim FP16 is ported. |
-| bias modes 1/2 | Not applicable because `vt::MatmulBT` has no bias operand; do not silently drop the parameter. |
-| padded weight/activation modes | Padded activation is a fallback case; padded weight is rejected by the shared `MatmulBT` contract. Preserve those local semantics explicitly. |
-| gfx9, gfx950, gfx1151, medium-LDS, and big-LDS bodies | Not executed by the scoped gfx1100 checkpoint path; keep them refused or on BLAS and name them as non-ported. |
-
-The current local test case in `tests/vt/test_backend_cross_device.cpp` is the
-starting seam, not sufficient evidence by itself. Its direct construction
-proves kernel behavior. The checkpoint test supplies production reachability.
-
-## Checkpoint-backed causal gate
-
-Keep `tests/parity/test_qwen35_paged_engine.cpp::RunGate` as one actual doctest
-case under its ordinary default environment. The CTest registration must not
-set `VT_ROCM_SKINNY=0`, and no rollback-arm checkpoint test substitutes for the
-default case. The case must:
-
-- load the pinned directory through `LoadedEngine::FromModelDir`;
-- run the existing 16 prompts and native-provider checks;
-- assert the internal-arm trace saw wvSplitK on the measured production shapes;
-- apply the unchanged anchor/gap policy, with golden changes allowed only by
-  branch B; and
-- fail, not skip, for token drift when prerequisites are present.
-
-The production chain under review is:
-
-```text
-LoadedEngine::FromModelDir
-  -> ModelRegistry::Forward
-  -> Qwen3.5 model projection
-  -> vt::MatmulBT
-  -> registered ROCm MatmulBTKernelRocm
-  -> WvSplitKBT
-  -> wvSplitKSml
-```
-
-The fresh reviewer deletes or bypasses the `WvSplitKBT` call in a scratch copy
-and reruns the focused checkpoint gate. It must fail because the wvSplitK
-selection assertion disappears even if BLAS happens to reproduce the committed
-tokens. A gate that stays green is not causal and blocks landing.
-
-## Gates and evidence
-
-### Red-first implementation evidence
-
-Before changing product behavior, the implementer records:
-
-1. the current default one-case failure at prompt 10/token 10;
-2. the new causal assertion failing when the production wvSplitK call is
-   bypassed;
-3. the applicable upstream test port failing for the intended numerical or
-   dispatch reason selected by the evidence; and
-4. the exact-prefix skinny/BLAS manifests and logits, labelled diagnostic.
-
-If branch B needs no product arithmetic repair, the existing default sacred
-failure is the red test; do not manufacture a kernel failure.
+No manufactured kernel red is required because no kernel behavior changes.
 
 ### Focused green
 
-Every GPU command uses the same lock and sanitized library path. The focused
-commands are:
+Run these commands from the task worktree. The first test name is
+implementer-added:
 
 ```sh
-env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib \
-  flock /home/vikash/gpu.lock \
-  cmake --build build-hip --target test_backend_cross_device \
-  test_qwen35_paged_engine -j 4
-env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib \
+python3 tests/scripts/test_qwen3_oracle_modes.py
+
+cmake --build build-hip --target test_qwen35_paged_engine \
+  test_backend_cross_device -j 4
+
+ctest --test-dir build-hip --output-on-failure \
+  -R '^test_qwen35_paged_engine_prerequisites$'
+
+env -u VT_ROCM_SKINNY \
+  LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib \
   flock /home/vikash/gpu.lock \
   build-hip/tests/test_backend_cross_device \
   '--test-case=decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle'
-env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib \
+
+env -u VT_ROCM_SKINNY \
+  LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib \
   flock /home/vikash/gpu.lock \
-  build-hip/tests/test_backend_cross_device \
-  '--test-case=ROCm MatmulBT observer reports skinny selection guards'
-env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib \
-  flock /home/vikash/gpu.lock build-hip/tests/test_qwen35_paged_engine
+  build-hip/tests/test_qwen35_paged_engine
 ```
 
-Build only with bounded parallelism. The focused gate includes the wvSplitK
-cross-device suite, the internal routing observer test, and the one-case sacred
-executable. Record commands and exact assertion counts. A missing model or
-oracle is `PENDING`, never green.
+The prerequisite CTest must report all four expected child exits. The
+unfiltered dedicated binary must run one real case, return `RC 0`, pass 137/137
+assertions, and print this semantic summary:
 
-### Full gate
+```text
+16/16 prompts PASS
+STRICT token-exact vs oracle per-prompt greedy: 15/16
+near-tie-band only: 1/16
+max gap 0.0 nats
+0 forward-divergent
+```
 
-After focused green, run the row's declared full gate under the same sanitized
-runtime and lock. Run `scripts/agent-preflight.sh` separately for record and
-prose checks, followed by:
+The exact punctuation can remain the existing output. Zero cases with `RC 0`
+does not satisfy this gate.
+
+### Full verification
+
+Run the controlled record and citation gates after focused green:
 
 ```sh
+scripts/agent-preflight.sh
 python3 scripts/check-symbol-anchors.py \
   --upstream-root /home/vikash/oracle/vllm-src
 ```
 
-The operator, not the implementer, reruns the row gate for acceptance.
+Record each return code and output path. `RC 0` is green. A nonzero result that
+is set-identical to the controlled base is an inherited failure, not green and
+not an implementation regression. Any new failure blocks completion.
 
-### Performance if branch C is selected
+The operator reruns the row gate. An implementer report does not replace that
+run.
 
-Correctness must already be established. Measure skinny and proposed
-narrow/disabled arms with one binary, the exact hashed 0.8B artifact, identical
-fixed prefixes, one-token teacher-forced decode, batch/concurrency one, and
-identical cache/sampling configuration. Because `SkinnyGemmEnabled` caches its
-environment, use fresh processes and interleave A/B/B/A repetitions on an idle
-board. Record tokens/s, ms/token, first-token latency if applicable, peak
-device memory, per-shape invocation counts, and identical-tool ROCm traces.
-Never compare autoregressive suffixes after the first divergence. Never use
-`--enforce-eager` as the pinned vLLM denominator, and never substitute the 4B
-provisional trace.
+## Fresh review mutations
 
-### Fresh review mutations
+A fresh reviewer uses a scratch copy of the immutable implementation head. The
+reviewer applies one mutation at a time:
 
-A fresh reviewer reviews an immutable head, mutates one guarantee at a time,
-and restores byte-for-byte after each run:
+1. Flip either script's default from production to eager. The CPU mode test
+   must fail.
+2. Route `WvSplitKBT` to the existing BLAS fallback. The real sacred case must
+   fail at prompt 10, token 10.
+3. Change one oracle-tied gap from 0 to 501 milli-nats. The real sacred case
+   must report forward divergence and fail.
+4. Exercise each missing prerequisite. Each child must exit 77.
+5. Exercise the complete prerequisite set. The child must exit 86.
 
-- bypass the production `WvSplitKBT` call;
-- make one measured eligible shape select BLAS while leaving provider
-  statistics unchanged;
-- remove one shape/configuration guard;
-- corrupt one BF16 multiply or one wave32 reduction step;
-- relax the upstream elementwise tolerance or delete one applicable parameter;
-- if branch B changes goldens, restore the old token-10 anchor or substitute an
-  old suffix gap; and
-- if branch C narrows the default, widen the guard back over the proven-bad
-  shape.
-
-Each mutation must fail the focused gate for the intended reason. Restore and
-verify SHA-256 values of every mutated file before the next mutation. Review
-returns `PASS` only after focused and full green on the restored immutable head.
+Do not mutate arithmetic, eligibility guards, thresholds, or unrelated routing.
+After each mutation, restore every touched file byte for byte and verify its
+SHA-256 before the next mutation. Re-run focused green on the restored head.
 
 ## Risks and controls
 
-- **BLAS is not the oracle.** The rollback's 137/137 result isolates the
-  regression but cannot canonize token 488. The pinned execution decides.
-- **Suffix evidence is poisoned after divergence.** Only the first disputed
-  step shares an input prefix. All later gaps are rederived when needed.
-- **Static environment caching can mix arms.** Skinny and BLAS diagnostics use
-  fresh processes, with the resolved arm recorded in each manifest.
-- **Instrumentation can change timing or execution.** Detailed dumps are
-  correctness-only, run the actual operation once, and are removed before
-  review. Capture-off/on tokens prove non-perturbation.
-- **A direct kernel test can land dead code.** The checkpoint case asserts the
-  branch reached through the full production loader and registry path.
-- **The apparent local/upstream body match can hide host drift.** Exact shapes,
-  strides, CU count, LDS branch, YTILE, UNRL, and template row count are
-  compared before arithmetic.
-- **An unavailable source-built extension can masquerade as an oracle.** Import,
-  revision, artifact hashes, selected custom op, and repeated output are all
-  required.
-- **A broad rollback can erase measured performance.** Branch C requires a
-  shape-minimal guard and same-workload performance evidence.
+- An ordinary rerun can restore stale eager artifacts. The default-mode CPU
+  test and script narration prevent silent mode reversal.
+- A copied array can hide a wrong source. Exact retained hashes, cell counts,
+  manifest provenance, and the real gate bind the refresh to production mode.
+- A prerequisite regression can create a false pass. The registered CTest pins
+  77/77/77/86 before the unfiltered real binary runs.
+- A token gate can pass after bypassing a kernel. The BLAS call-site mutation
+  proves the refreshed anchor needs default wvSplitK.
+- Capacity differences can reject a valid oracle run. The comparison binds
+  semantic workload inputs and records each engine's capacity separately.
+- Inherited repository failures can look green when summarized loosely. Record
+  their nonzero return codes and compare their exact failure sets.
 
 ## Stop conditions
 
-Stop and return the named state when:
+Return `NEEDS_CONTEXT` if an artifact, model, oracle, source, or retained hash
+does not match this specification.
 
-- the runnable pinned oracle cannot be reconstructed: leave oracle-dependent
-  gates `PENDING`, record the exact build/runtime blocker, and do not edit
-  goldens;
-- artifact name, byte size, hash, source pin, or extension identity differs:
-  `NEEDS_CONTEXT`;
-- skinny and BLAS captures do not share identical operands at the disputed
-  step: `NEEDS_CONTEXT`;
-- evidence does not select exactly one pre-registered branch:
-  `NEEDS_DECISION`;
-- a repair would require an out-of-scope upstream arm or change issue #2773's
-  state/cache contract: `NEEDS_DECISION`;
-- an applicable upstream parameter or failure case cannot be represented at
-  the local seam without changing its public contract: `NEEDS_DECISION`;
-- the default sacred gate, the causal reachability mutation, or the row's full
-  gate remains red after the selected branch: implementation remains
-  incomplete; or
-- GPU work lacks the required lock, sanitized runtime, or idle-board evidence:
-  discard that run rather than reporting it.
+Return `NEEDS_DECISION` if focused evidence contradicts the zero-gap production
+result or requires any out-of-scope kernel, default, cache, or performance
+change.
+
+Return incomplete if the mode test, prerequisite CTest, unchanged wvSplitK
+test, real sacred case, or required review mutation does not produce its exact
+result. Do not weaken the anchor or near-tie acceptance logic.
+
+Classify inherited preflight and symbol-anchor failures. They are not green,
+and their repair is not authorized in this issue.
 
 ## Owed
 
 - Issue [#2773](https://github.com/mudler/vllm.cpp/issues/2773), Row
-  `BACKEND-ROCM`, owns later CPU/ROCm cache, state-space, convolution,
-  attention, and layer-numeric characterization. It remains blocked on #2772
-  and is not absorbed here.
+  `BACKEND-ROCM`, owns cache, state-space, convolution, attention, and
+  layer-numeric characterization. It remains blocked only until #2772 lands.
 - Issue [#487](https://github.com/mudler/vllm.cpp/issues/487), Row
-  `BACKEND-ROCM`, retains the broader ROCm skinny-GEMM performance surface and
-  non-applicable architecture/mode work. This issue changes only what measured
-  Qwen3.5 correctness requires.
+  `BACKEND-ROCM`, owns broader skinny-GEMM kernel coverage, routing, and
+  performance work.
+
+Neither issue is absorbed into #2772.
 
 ## Git integration
 
-Use one pull request for this committed spec and its later implementation. The
-pull request body links issue #2772, carries `Row: BACKEND-ROCM`, and closes the
-issue only when the selected branch, focused/full gates, fresh review, and
-operator verification all pass. This spec commit precedes every product or test
-implementation commit.
+Use one pull request for this specification and its implementation. The pull
+request body links issue #2772, carries `Row: BACKEND-ROCM`, and closes #2772
+only after focused green, fresh review, and operator verification.
+
+Do not edit public documentation or an application programming interface. Add
+`## Outcome` only when the row reaches `DONE`.

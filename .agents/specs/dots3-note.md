@@ -5957,8 +5957,10 @@ every later request, text ones included, into a 500 (§4.14.5).
 | `include/vllm/multimodal/inputs.h` | `AudioKwargs` gains `num_chunks` (default 1) and the two per-chunk length vectors. `input_features` becomes `[num_chunks, n_mels, n_frames]`; at `num_chunks == 1` the layout is byte-identical to W7a's and every pre-W7b producer and consumer is unchanged |
 | `include/vllm/multimodal/dots3_note_processor.h` | `Dots3NoteAudioProcessor::AudioChunk` and `SegmentWaveform`, the production seam a gate can drive without a front end; `ProcessWaveform`'s contract |
 | `src/vllm/multimodal/dots3_note_processor.cpp` | `SegmentWaveform` (`audio.py:196-212`); `ProcessWaveform` loops (`:208-218`); the `chunk_seconds` refusal is REPLACED by the §4.15.3 one |
-| `src/vllm/model_executor/models/dots3_note_audio.{h,cpp}` | `Dots3NoteAudioForwardChunks` (`audio.py:220-234`), which is the production entry point from W7b on. `Dots3NoteAudioForward` is UNCHANGED |
+| `src/vllm/model_executor/models/dots3_note_audio.{h,cpp}` | `Dots3NoteAudioForwardChunks` (`audio.py:220-234`), which is the production entry point from W7b on. `Dots3NoteAudioForward` keeps its arithmetic and gains ONE check: upstream's `assert mel.shape[1] == self.chunk_mel_frames` (`audio.py:215`), made executable there, with `chunk_seconds` carried on `Dots3NoteAudioParams` as `DotsEncoderWithMask` carries it (`audio.py:169-171`). §4.15.6 records why: without it M5 is GREEN |
 | `src/vllm/model_executor/models/dots3_note_registry.cpp` | `EncodeAudioDots3Note` calls the chunked function |
+| `src/vllm/entrypoints/openai/mm_chat_dots3note.cpp` | the comment over `ProcessWaveform` names the refusal that is left, and records that this call is the FRONT END and not the engine loop |
+| `docs/FEATURES.md`, `docs/USAGE.md` | both stated the `chunk_seconds` ceiling as owed to W7b; both now state what is served and what the divisibility invariant refuses |
 | `tests/vllm/models/dots3_note_tiny_fixture.h` | a length-parameterised long clip, and the `a_chunk_seconds` knob it drives |
 | `tests/vllm/models/test_dots3_note_audio.cpp` | `ref_chunks`, the third reference namespace, and the seam cases |
 | `tests/vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp` | the served multi-chunk request and its two-waveform LOGPROB case |
@@ -6025,6 +6027,22 @@ the binary's sha256 AND the case counts:
 | M4 | compute the temporal mask from the PADDED length | `ProcessWaveform`'s per-chunk `num_samples` |
 | M5 | delete the production call that lifts the refusal | `EncodeAudioDots3Note` |
 
+**M5 MEASURED A REACHABILITY HOLE AND CLOSED IT, and that is the finding of this
+brick.** Written as a pure deletion M5 is trivial. Written as the substitution it
+has to be — put W7a's `Dots3NoteAudioForward(mel.input_features, mel.num_samples,
+mel.num_tokens, ...)` back, so nothing in production reaches
+`Dots3NoteAudioForwardChunks` — the served suite stayed GREEN and the tower suite
+stayed green with it. The reason is that the flattened call produces a
+correctly-SHAPED answer with the RIGHT ROW COUNT: it reads the stacked mel as one
+600-frame mel, takes 75 stem rows and returns the first 63, which is exactly the
+placeholder span. Two different waveforms still give two different logprobs, so
+even the load-bearing case cannot see it. A gate that stays green without the
+call site measures a class, not a capability, so the hole was closed rather than
+recorded: `Dots3NoteAudioForward` now carries upstream's own
+`assert mel.shape[1] == self.chunk_mel_frames` (`audio.py:215`), which is the one
+number that separates one chunk from a stack of them, and M5 is RED at the
+entrypoint. A case drives that check directly so it is not a mute switch.
+
 #### 4.15.7 Risks
 
 1. **The divisibility invariant is silent when it fails.** Mitigated by
@@ -6043,10 +6061,70 @@ Stop and report `NEEDS_DECISION` if the varlen pack/unpack cannot be mirrored
 without changing W7a's single-chunk path (it can — §4.15.2), or if the geometry
 in the issue, this spec and the fixture disagree.
 
-#### 4.15.9 Evidence, measured on the merge commit
+#### 4.15.9 Evidence, measured 2026-09-03
 
-Filled in at `## Outcome` when the brick lands; the numbers live in the pull
-request body and in this section rather than in a state log.
+Host: the developer's x86-64 Linux box, CPU queue, `-DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`. No GPU
+lease was taken and no number here is a performance number. The build is SCOPED
+to the two targets this brick moves, because the box was at 97% on `/` and a
+full-tree link on this row has already produced ENOSPC failures that read like
+real defects; the build tree lives in `/dev/shm`.
+
+Oracle identity asserted before any citation: `git rev-parse HEAD` in
+`~/_git/vllm` is `5559679229bc961848b121ccdeaa8fa5d79bec98`, this project's
+parity pin, which carries no `dots3_note`; every anchor below therefore names
+`9035151d6c` (`[Model] Add native Dots3 NOTE multimodal support (#51255)`), read
+out of that same checkout with `git show`.
+
+| Suite (REAL target name) | Result |
+|---|---|
+| `test_dots3_note_audio` | **20 cases, 3869 assertions, 0 failed** (19 / 3858 before the reachability repair) |
+| `test_openai_api_server_dots3_mm_forward` | **26 cases, 311 assertions, 0 failed** |
+
+Baseline binaries: `test_dots3_note_audio`
+`bad4cfd1c4ac035c3e73a8db217364dc5b06b8f5f3080b651d789c9070bcd280`,
+`test_openai_api_server_dots3_mm_forward`
+`0e5ac1a9201da4f2a7314ac195290423e52f940104fced6e4db46398386e0c0f`. Both were
+recomputed after the last mutation was restored and match byte for byte.
+
+**RED at W7a's production head.** The seven production files were checked out at
+`e64f00560` — the merge base — with the tests, the fixture and the docs kept, and
+`test_openai_api_server_dots3_mm_forward` was rebuilt
+(`54ab3d22f4aba33312fb14fe7466b67f062422d164d24a0812b504f9be0e8b80`). It failed
+**3 cases / 7 assertions**, the two reach cases on `REQUIRE(r.status == 200)` and
+the refusal case on the message, with the body carrying "SEGMENTATION IS NOT
+PORTED and is owed to W7b". The tower suite cannot be built at that head, because
+`SegmentWaveform`, `AudioChunk` and `Dots3NoteAudioForwardChunks` do not exist
+there and a build failure is not a red.
+
+**The independence instrument, extended rather than duplicated**, reading this
+file's own bytes at run time: `ref_front` 11 distinct / 71 occurrences,
+`ref_tower` 6 / 53, `ref_chunks` 2 / 25, every scope `std` and nothing else.
+
+**The mutations**, each applied by a harness that asserts the mutation APPLIED
+and the build SUCCEEDED before it reads a result, each restored byte-for-byte:
+
+| # | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` | audio binary sha256 |
+|---|---|---|---|
+| M1 reverse the chunk order | **1 case / 9 assertions FAILED** | 26 / 311 pass | `f149ecef2a1915ff663000d206ad0181fa6d3603b4b2a116d308e0dbb9361d06` |
+| M2 no truncation of the short chunk | **2 cases / 2 assertions FAILED** | **2 cases / 2 FAILED** (500: "75 embedding rows for a placeholder span of 63") | `8d84f47495ac4d0df41eaf03112d498ea3daf2bd78862911a78d89fa284d6715` |
+| M3 off-by-one the per-chunk slice | **2 cases / 12 assertions FAILED** | 26 / 311 pass | `44f2cd8c49aa278e8c249efb57f40b5c24615ff4a889fa206bdd35b9cc9940f5` |
+| M4 mask from the PADDED length | **3 cases / 14 assertions FAILED** | 26 / 311 pass | `7bdc11e55ed400b13babd04b8a57f1c776b252b25a04ccbb2c8f589960286ae3` |
+| M5 delete the production call site | 20 / 3869 pass | **2 cases / 2 FAILED** (500: "the mel holds 9600 values, which is not ONE chunk of 16 x 200") | `87d9ae650bb38818a9906ae8dd205e310962f612d102bd48035c7d199ed77ff5` |
+
+Every sha differs from the baseline and from every other row, so no result is a
+stale binary reporting green. The M1/M3/M4 column of served greens is not a gap:
+it is §4.14.12's measurement reproduced — the served suite gates REACHABILITY and
+not tower arithmetic — and it is why the seams are gated where they are.
+
+**The geometry gated**: `chunk_seconds` 2 = 32000 samples = 200 mel frames = 25
+token strides; a clip of 80000 samples = 5 s = 2.5 chunks -> **32000, 32000,
+16000** samples contributing **25, 25, 13** rows = 63 = `ceil(80000/1280)`. The
+boundary walk drives 1, 1280, 31999, 32000, 32001, 80000 and 96000 samples and
+asserts, at each, that the segments TILE the waveform and that the per-segment
+sum equals `NumAudioTokens`. The refusal case drives the fixture's OWN
+non-divisible `chunk_seconds` 1 at 40000 samples, where the sum is 33 against a
+span of 32, and asserts that a clip inside one chunk is still served there.
 
 
 ## 5. Gates

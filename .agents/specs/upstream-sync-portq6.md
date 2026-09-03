@@ -17,16 +17,29 @@ entries 241-290 concurrently. Together the two finish the classification.
 
 ## Now
 
-**Done.** 40 of 40 re-derived: **4 ALREADY_SATISFIED, 5 REAL_GAP,
-31 NOT_APPLICABLE** (29 `surface-absent`, 2 `inert`). **35 of the 40 disagree
-with the recorded PORT-NOW disposition.**
+**Done, and repaired after a fresh review returned NOT PASS.** 40 of 40
+re-derived: **3 ALREADY_SATISFIED, 6 REAL_GAP, 31 NOT_APPLICABLE**
+(29 `surface-absent`, 2 `inert`). **34 of the 40 disagree with the recorded
+PORT-NOW disposition.**
 
-Five issues carry the five gaps, all new:
+The review re-derived 22 of the 23 NOT_APPLICABLE and ALREADY_SATISFIED calls and
+found **no false absence anywhere**, so the classification stands. What failed was
+a layer of quantitative and causal claims on top of it, and they failed in one
+direction: toward drama. Six material corrections are recorded in place, each
+beside the claim it replaces -- §10 (the gate lesson, which was itself an
+after-a-pipe error), §6.5 (`[214]`'s pre-pin excuse, refuted), §5.1 (11 markers
+overstated; 7), §4.1 and §3 (`[214]`'s site counts), §1 (21 wholly pre-pin
+inflated; 18), and §6.1 (the citation mechanism's causal story). **`[221]` moved
+from ALREADY_SATISFIED to REAL_GAP**, because the report called its residual "not
+portable work" and sized it at ~5 lines one sentence later.
+
+Six issues carry the six gaps, all new:
 [#2719](https://github.com/mudler/vllm.cpp/issues/2719) (`KV-SIZING`),
 [#2721](https://github.com/mudler/vllm.cpp/issues/2721) (`LORA-RUNTIME`),
 [#2722](https://github.com/mudler/vllm.cpp/issues/2722) (`LOAD-SAFETENSORS`),
 [#2723](https://github.com/mudler/vllm.cpp/issues/2723) (no row exists),
-[#2726](https://github.com/mudler/vllm.cpp/issues/2726) (`SERVE-REQUEST-LENGTH-GUARD`).
+[#2726](https://github.com/mudler/vllm.cpp/issues/2726) (`SERVE-REQUEST-LENGTH-GUARD`),
+[#2747](https://github.com/mudler/vllm.cpp/issues/2747) (`SPEC-DFLASH2`).
 
 **One landed record is falsified and corrected in place.**
 `.agents/sync/2026-09-03-portq5.md` §5.3 says stage 6 of the KV-cache layout
@@ -120,10 +133,14 @@ invalidate the landed tranches as well as this one. None fired.
 - [#2726](https://github.com/mudler/vllm.cpp/issues/2726) —
   `SERVE-REQUEST-LENGTH-GUARD`: four media entry points decode or accept
   unbounded bytes.
+- [#2747](https://github.com/mudler/vllm.cpp/issues/2747) — `SPEC-DFLASH2`:
+  `output_multiplier` accepts any number where upstream refuses a non-positive
+  scale.
 
-Two residuals carry no issue because neither is portable work, and both are
-recorded in the report §6.2: `[221]`'s missing `output_multiplier` guard, and
-`[222]`'s stale prose at `modelopt_mixed_precision.h:56-62`. Two more are owned
+One residual carries no issue because it is not portable work, and it is recorded
+in the report §6.2: `[222]`'s stale prose at `modelopt_mixed_precision.h:56-62`.
+The other, `[221]`'s missing `output_multiplier` guard, **was** portable work; the
+first version of this spec said otherwise and #2747 now carries it. Two more are owned
 elsewhere and are recorded rather than filed: `[203]`'s mirror-source move
 (`.agents/model-matrix.md:246` already carries it) and `[211]`'s denominator
 consequence (`.agents/oracles/vllm.md:63-68` already carries it).
@@ -131,11 +148,20 @@ consequence (`.agents/oracles/vllm.md:63-68` already carries it).
 ## Outcome
 
 Recorded on completion in [`../sync/2026-09-03-portq6.md`](../sync/2026-09-03-portq6.md)
-§1 and §5. The measured result: **five gaps in forty, 35 of 40 disagreeing with
+§1 and §5. The measured result: **six gaps in forty, 34 of 40 disagreeing with
 the record, and five entries that are non-work or partly non-work against the
 target for reasons only a whole-queue scan could reach.** Extrapolating the
-running rate across the six landed tranches — 50 gaps in 240 entries — gives
-**roughly 60 gaps in the 290**, which is **an estimate**, not a measurement: the
+running rate across the six landed tranches — 51 gaps in 240 entries — gives
+**roughly 62 gaps in the 290**, which is **an estimate**, not a measurement: the
 tranches are contiguous slices of a SHA-ordered queue, not a random sample, and
-this tranche's rate (5 of 40) is the lowest of the six while PORTQ-5's was 11 of
-40. The remaining fifty entries are PORTQ-7's and will settle it.
+this tranche's rate (6 of 40) is at the low end while PORTQ-5's was 11 of 40. The
+remaining fifty entries are PORTQ-7's and will settle it.
+
+**The durable lesson of this wave is not in the classification.** The
+classification survived review intact. What did not survive was a layer of
+derived numbers and causal stories laid on top of it, every one of which erred
+toward the more dramatic reading: a gate that "failed while exiting 0" (it exited
+1; the 0 was `$?` after a pipe), 11 markers "removed as incorrect" (7 were), a
+reader who "could have looked and didn't" (the annotation was not in their tree).
+Each was cheap to check and none was checked, because each confirmed a point the
+report was already making.

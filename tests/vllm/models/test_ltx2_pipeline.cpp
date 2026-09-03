@@ -2629,33 +2629,38 @@ TEST_CASE("ltx2 the Embeddings1DConnector at BFLOAT16 reproduces upstream on eve
     const vllm::Ltx2ConnectorOutput got =
         vllm::Ltx2ConnectorForward(config, bag.weights, hidden.data(), mask.data(), batch, seq);
 
-    // THE BOUND IS DERIVED FROM THE FORMAT, not fitted to the result. Both sides
-    // are bf16-valued, so a correct port can differ from the oracle only by the
-    // reduction ORDER inside the GEMMs and the norms; that difference is bounded
-    // by bf16's own unit roundoff, 2^-8 relative, against the golden's magnitude.
-    // The margin is REPORTED so a drift shows up as a number rather than as a
-    // pass, exactly as the f32 arm above does.
+    // BIT-EXACT, and no tolerance sits under this port's arithmetic. A
+    // format-derived bound was tried first -- two bf16 ulps, 2^-8 relative to the
+    // golden's own magnitude -- and it is 0.0177 to 0.0229 on these five arms
+    // while the port sits at 0.0. A bound with that much slack is a mute switch:
+    // it let a deliberate mis-rounding of SPLIT rope through on four of the five
+    // arms. It is still COMPUTED and REPORTED, so a reader can see how much room
+    // the format would have allowed, and it is not what the gate rests on.
     double scale = 0.0;
     for (size_t i = 0; i < golden_count; ++i) scale = std::max(scale, static_cast<double>(std::fabs(golden[i])));
     const double bound = 2.0 * std::pow(2.0, -8.0) * scale;
     const double worst = MaxAbsDiff(got.hidden_states, golden, golden_count);
-    INFO("bf16 Embeddings1DConnector arm = ", tag, " max|diff| = ", worst, " bound = ", bound,
-         " max|golden| = ", scale);
-    CHECK(worst <= bound);
+    INFO("bf16 Embeddings1DConnector arm = ", tag, " max|diff| = ", worst,
+         " (the format would have allowed ", bound, " at max|golden| ", scale, ")");
+    CHECK(worst == 0.0);
 
-    // AND THE DISTANCE TO THE KERNEL TORCH ACTUALLY PICKED, reported rather than
-    // gated. The oracle above is `SDPBackend.MATH`, which is bit-equal to an
-    // f32-accumulated attention; the FLASH kernel `AttentionFunction.AUTOMATIC`
+    // AND THE DISTANCE TO THE KERNEL TORCH ACTUALLY PICKED IS EXACTLY THE TWO
+    // KERNELS' OWN. The oracle above is `SDPBackend.MATH`, which is bit-equal to
+    // an f32-accumulated attention; the FLASH kernel `AttentionFunction.AUTOMATIC`
     // resolves to is reproducible by no formula, so holding a port to it would be
-    // fitting this machine's SIMD width instead of upstream's arithmetic. What is
-    // ASSERTED is that the generator's own measurement of that distance is the
-    // scale of the two-ulp bound above and not larger, so "we are close to MATH"
-    // cannot be quietly satisfied by being far from both.
+    // fitting this machine's SIMD width instead of upstream's arithmetic. Because
+    // the port is bit-equal to MATH, its distance to the unpatched module must
+    // equal the distance the GENERATOR measured between the two kernels -- a
+    // statement that follows from the line above and would break if either the
+    // port or the goldens moved. It is a sharper claim than any inequality.
     const double to_unpatched = MaxAbsDiff(got.hidden_states, unpatched, golden_count);
     INFO("bf16 arm = ", tag, " distance to the UNPATCHED module = ", to_unpatched,
-         ", the two kernels' own distance = ", kernel_gap);
+         ", the two kernels' own distance measured by the generator = ", kernel_gap);
+    CHECK(to_unpatched == doctest::Approx(kernel_gap));
+    // Not vacuous: the two kernels really do disagree on this fixture, so
+    // "bit-exact to MATH" is a choice of oracle and not a coincidence.
+    CHECK(kernel_gap > 0.0);
     CHECK(kernel_gap <= bound);
-    CHECK(to_unpatched <= 2.0 * bound);
 
     // ── THE DTYPE GATE, IN BOTH DIRECTIONS, ON ONE FIXTURE ────────────────
     //

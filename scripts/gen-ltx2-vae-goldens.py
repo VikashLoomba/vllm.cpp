@@ -1422,6 +1422,169 @@ def section_video_vae_bf16_kernels(out) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Section 5h — THE SHALLOW BF16 ARM, which is where the rules section 5e cannot
+# gate become gateable.
+#
+# Section 5e's whole-decode arm carries no value bound, because torch's blocked
+# convolution reduction gives it an irreducible term and this chain amplifies one
+# last bit into 0.0117 at the output. That is a property of DEPTH: the shipped
+# fixture runs thirteen convolutions and the residues compound.
+#
+# This arm runs TWO -- `conv_in` and `conv_out` -- with an `attn` block between
+# them and timestep conditioning on. It therefore reaches, and can hold
+# BIT-EXACTLY, three rules the kernel table does not own and section 5e cannot
+# see: `_RMSNorm2D`'s multiply order, `per_channel_statistics.un_normalize`'s
+# narrowing of its two registered buffers, and the PixArt timestep embedding
+# computed AT the activation dtype. Each is emitted with the answer it rejects.
+#
+# `sqrt(8)` IS NOT A POWER OF TWO, and that is why this width was chosen.
+# `_RMSNorm2D` is `F.normalize(x, dim=1) * (self.scale * self.gamma)`
+# (attention.py:23) and at C=64 every ordering of that product agrees on 4800 of
+# 4800 values, so a probe built on a power-of-two channel count would gate
+# nothing. The `attn` block here sits at `base_channels * 1 = 8`.
+VIDEO_SHALLOW_BLOCKS = [("attn", {"num_layers": 1})]
+
+
+def section_conv_video_decoder_bf16_shallow(out) -> None:
+    import torch
+
+    from ltx_core.model.video_vae import attention as vae_attn
+    from ltx_core.model.video_vae import ops as vae_ops
+    from ltx_core.model.video_vae.conv_video_decoder import ConvVideoDecoder
+    from ltx_core.model.video_vae.enums import NormLayerType, PaddingModeType
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    real_randn = torch.randn
+
+    def build():
+        d = ConvVideoDecoder(
+            decoder_blocks=VIDEO_SHALLOW_BLOCKS,
+            norm_layer=NormLayerType.PIXEL_NORM,
+            decoder_spatial_padding_mode=PaddingModeType.REFLECT,
+            **VIDEO_DEC,
+        ).eval()
+        m = fill_from_stream(d, prefix="ltx2.videodecshallow.")
+        return d, m
+
+    latent = make_input("ltx2.videodecshallow.input", VIDEO_LATENT, 1.0).to(torch.bfloat16)
+
+    def run(dec):
+        local: list[int] = []
+
+        def patched(*args, **kwargs):
+            shape = (tuple(args[0]) if len(args) == 1 and not isinstance(args[0], int)
+                     else tuple(args))
+            count = int(np.prod(shape)) if shape else 1
+            values = ltx_rand(f"ltx2.videodecshallow.noise.{len(local)}", count)
+            local.append(count)
+            drawn = torch.from_numpy(values.astype(np.float32)).reshape(shape)
+            dtype = kwargs.get("dtype")
+            return drawn.to(dtype) if dtype is not None else drawn
+
+        torch.randn = patched
+        try:
+            with sdpa_kernel(SDPBackend.MATH):
+                return dec(latent), local
+        finally:
+            torch.randn = real_randn
+
+    dec, manifest = build()
+    y, draws = run(dec.to(torch.bfloat16))
+    assert y.dtype == torch.bfloat16
+    base = y.float()
+
+    # REJECTED 1: `_RMSNorm2D` multiplies by sqrt(C) and by gamma separately.
+    orig_rms = vae_attn._RMSNorm2D.forward
+
+    def bad_rms(self, x):
+        return (torch.nn.functional.normalize(x, dim=1) * self.scale) * self.gamma
+
+    vae_attn._RMSNorm2D.forward = bad_rms
+    try:
+        d2, _ = build()
+        y_rms, _ = run(d2.to(torch.bfloat16))
+    finally:
+        vae_attn._RMSNorm2D.forward = orig_rms
+
+    # REJECTED 2: `un_normalize` fuses its multiply and its add in f32.
+    orig_un = vae_ops.PerChannelStatistics.un_normalize
+
+    def bad_un(self, x):
+        s = self.get_buffer("std-of-means").view(1, -1, 1, 1, 1).to(x)
+        m = self.get_buffer("mean-of-means").view(1, -1, 1, 1, 1).to(x)
+        return (x.float() * s.float() + m.float()).to(x.dtype)
+
+    vae_ops.PerChannelStatistics.un_normalize = bad_un
+    try:
+        d3, _ = build()
+        y_un, _ = run(d3.to(torch.bfloat16))
+    finally:
+        vae_ops.PerChannelStatistics.un_normalize = orig_un
+
+    # REJECTED 3: the timestep embedding computed in f32 and rounded once.
+    from ltx_core.model.transformer import timestep_embedding as te
+
+    orig_te = te.TimestepEmbedding.forward
+
+    def bad_te(self, sample, condition=None):  # noqa: ARG001
+        was = sample.dtype
+        h = self.linear_1(sample.float().to(self.linear_1.weight.dtype).float())
+        return h.to(was)
+
+    # A faithful f32 re-run of the module rather than a re-derivation: run the
+    # WHOLE embedder in f32 and narrow once.
+    def f32_te(self, sample, condition=None):  # noqa: ARG001
+        was = sample.dtype
+        w1 = self.linear_1.weight.float()
+        b1 = self.linear_1.bias.float()
+        w2 = self.linear_2.weight.float()
+        b2 = self.linear_2.bias.float()
+        h = torch.nn.functional.linear(sample.float(), w1, b1)
+        h = torch.nn.functional.silu(h)
+        return torch.nn.functional.linear(h, w2, b2).to(was)
+
+    te.TimestepEmbedding.forward = f32_te
+    try:
+        d4, _ = build()
+        y_te, _ = run(d4.to(torch.bfloat16))
+    finally:
+        te.TimestepEmbedding.forward = orig_te
+
+    sep_rms = float((base - y_rms.float()).abs().max())
+    sep_un = float((base - y_un.float()).abs().max())
+    sep_te = float((base - y_te.float()).abs().max())
+    print(f"[bf16 shallow] rejected distances: _RMSNorm2D order {sep_rms:g}, "
+          f"un_normalize fused {sep_un:g}, f32 timestep embedding {sep_te:g}",
+          file=sys.stderr)
+    assert sep_rms > 0 and sep_un > 0 and sep_te > 0, (
+        "a shallow-arm rejected hypothesis separates NOTHING, so this section "
+        "would gate the rule it names at zero -- rebuild it rather than emitting it"
+    )
+
+    out.write("// --- section 5h: the SHALLOW bf16 arm (two convolutions, attn, timestep) ---\n")
+    emit_scalar(out, "kLtx2VideoDecShallowOutC", y.shape[1])
+    emit_scalar(out, "kLtx2VideoDecShallowOutT", y.shape[2])
+    emit_scalar(out, "kLtx2VideoDecShallowOutH", y.shape[3])
+    emit_scalar(out, "kLtx2VideoDecShallowOutW", y.shape[4])
+    emit_scalar(out, "kLtx2VideoDecShallowNoiseDraws", len(draws))
+    out.write("inline constexpr double kLtx2VideoDecShallowRejectRmsOrder = "
+              + _cxx_float(sep_rms, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecShallowRejectUnNormalize = "
+              + _cxx_float(sep_un, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecShallowRejectTimestepF32 = "
+              + _cxx_float(sep_te, 9) + ";\n\n")
+    emit_manifest(out, "kLtx2VideoDecShallowParam", manifest)
+    emit_f32(out, "kLtx2VideoDecShallowGolden", base.numpy())
+    # The rejected ANSWERS themselves, not only their distances. A golden that
+    # carries upstream's answer alone proves agreement; carrying the alternatives
+    # lets the C++ side say WHICH hypothesis a failing port landed on, which is
+    # the difference between "something is wrong" and a diagnosis.
+    emit_f32(out, "kLtx2VideoDecShallowRejectedRmsOrderGolden", y_rms.float().numpy())
+    emit_f32(out, "kLtx2VideoDecShallowRejectedUnNormalizeGolden", y_un.float().numpy())
+    emit_f32(out, "kLtx2VideoDecShallowRejectedTimestepF32Golden", y_te.float().numpy())
+
+
+# ---------------------------------------------------------------------------
 # Sections 6-8 — the ENCODER halves (phase L11), which L4 recorded as owed.
 # ---------------------------------------------------------------------------
 
@@ -2260,6 +2423,7 @@ def main() -> int:
         section_conv_video_decoder(out)
         section_conv_video_decoder_bf16(out)
         section_video_vae_bf16_kernels(out)
+        section_conv_video_decoder_bf16_shallow(out)
         section_video_encoder(out)
         section_audio_encoder(out)
         section_audio_mel(out)

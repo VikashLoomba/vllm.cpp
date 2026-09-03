@@ -1241,72 +1241,65 @@ TEST_CASE("ltx2 vae: the Conv video decoder's BF16 arm matches upstream ltx_core
   REQUIRE(!frames.data.empty());
   CHECK(wider == 0);
 
-  // ── NO VALUE BOUND IS APPLIED HERE, AND THE NUMBERS ARE WHY ───────────────
+  // ── THE BOUND IS THE CHAIN'S OWN ONE-ULP RESPONSE, MEASURED ───────────────
   //
-  // This case gates the SHAPE, the noise ORDER, the WIDTH and the BYTES. It does
-  // not gate the values, and saying so with the measurement is worth more than a
-  // tolerance that would look like one.
+  // This arm is NOT bit-exact and the reason is upstream's convolution rather
+  // than a rule this port gets wrong. `cpu_conv3d`'s contract is torch's -- an
+  // f32 accumulator seeded with the bias, one rounding on store -- but torch
+  // BLOCKS its reduction, and at this fixture's own convolution shapes the two
+  // association orders disagree on 3 to 5 outputs of 8192 to 24576. Thirteen
+  // convolutions deep, those residues compound.
   //
-  // The port cannot be bit-identical to this golden, and the reason is upstream's
-  // own convolution rather than a rule this port gets wrong. `cpu_conv3d`'s
-  // contract is torch's -- an f32 accumulator seeded with the bias, one rounding
-  // on store -- but torch BLOCKS its reduction, and at this fixture's own
-  // convolution shapes the two association orders disagree on 3 to 5 outputs of
-  // 8192 to 24576 with max|diff| up to 0.015625. The chain then amplifies one
-  // last bit: perturbing a single `conv_in` weight by ONE bf16 ulp moves the
-  // whole output by `kLtx2VideoDecBf16UlpSensitivity`.
+  // SO THE BOUND IS A PROPERTY OF THE CHAIN AND NOT OF THE RESULT.
+  // `kLtx2VideoDecBf16UlpSensitivity` is what the generator measured by
+  // perturbing ONE `conv_in` weight by ONE bf16 ulp and re-running upstream: it
+  // is how far this decode moves when a single last bit of the SHIPPING FORMAT
+  // changes, which is exactly the size of the difference the port cannot avoid.
+  // Nothing about the port's own distance went into choosing it.
   //
-  // A tolerance would have to be wider than that irreducible term, and the
-  // generator measured what such a tolerance would then admit by replacing each
-  // rounding rule with the hypothesis this row rejected and re-running upstream
-  // end to end:
+  // AND IT IS PROVEN TO SEPARATE, which is the half wave 2 had to delete its own
+  // bound for. The generator replaced each rejected rule in upstream and re-ran
+  // end to end, and the two that reach this fixture's output both exceed the
+  // bound. The third does not reach it at all -- at ANY bound -- which is why the
+  // per-kernel cases exist rather than being a convenience.
   //
-  //   f32 per-channel statistics   kLtx2VideoDecBf16DefectStats
-  //   `_RMSNorm2D` multiply order  kLtx2VideoDecBf16DefectRmsOrder
-  //   f32 GroupNorm affine         kLtx2VideoDecBf16DefectGroupNormAffine
-  //
-  // The assertions below are about the RELATION between those and the
-  // irreducible term, not about any of the numbers, so they say plainly that a
-  // bound here would be a mute switch. This is wave 2's finding in a second
-  // place: it planned exactly such a bound and removed it after measuring that
-  // three of five defect mutations moved less than it.
-  //
-  // THE ARITHMETIC IS GATED, just not here. Every rounding rule the kLtx2Vae
-  // table owns is held BIT-EXACT one rule at a time, against upstream and against
-  // the answer it rejects, in "each kLtx2Vae kernel's BF16 rule is the one
-  // upstream applies" and in the PixelNorm epsilon case. What is left ungated by
-  // a numeric comparison -- `_RMSNorm2D`'s ordering, `un_normalize`'s narrowing,
-  // the timestep embedding's bf16 evaluation and the convolution's own bf16 rule
-  // -- is named under `## Owed` in .agents/specs/ltx25-a24-video-vae-bf16.md.
+  // The SHALLOW bf16 arm two cases below runs the same rules through TWO
+  // convolutions instead of thirteen and is held BIT-EXACT, so the rules this
+  // bound cannot resolve are resolved there.
   const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecBf16Golden,
                                 std::size(vllm_test::kLtx2VideoDecBf16Golden));
-  MESSAGE("BF16 conv video decoder max|diff| against upstream = "
-          << err << "; one-ulp sensitivity " << vllm_test::kLtx2VideoDecBf16UlpSensitivity
-          << "; the two upstream arms are " << vllm_test::kLtx2VideoDecBf16ArmGap << " apart");
-  MESSAGE("defect distances: f32 statistics " << vllm_test::kLtx2VideoDecBf16DefectStats
-          << ", _RMSNorm2D order " << vllm_test::kLtx2VideoDecBf16DefectRmsOrder
-          << ", f32 GroupNorm affine " << vllm_test::kLtx2VideoDecBf16DefectGroupNormAffine);
+  INFO("BF16 conv video decoder max|diff| = "
+       << err << " against a one-ulp sensitivity of "
+       << vllm_test::kLtx2VideoDecBf16UlpSensitivity << "; the two upstream arms are "
+       << vllm_test::kLtx2VideoDecBf16ArmGap << " apart; defect distances: f32 statistics "
+       << vllm_test::kLtx2VideoDecBf16DefectStats << ", _RMSNorm2D order "
+       << vllm_test::kLtx2VideoDecBf16DefectRmsOrder << ", f32 GroupNorm affine "
+       << vllm_test::kLtx2VideoDecBf16DefectGroupNormAffine);
+  CHECK(err <= vllm_test::kLtx2VideoDecBf16UlpSensitivity);
 
-  // 1. The chain really does have an irreducible term. Without this the paragraph
-  //    above is an excuse rather than a measurement.
+  // 1. The chain really does have an irreducible term, so the bound is a
+  //    measurement and not a shrug.
   CHECK(vllm_test::kLtx2VideoDecBf16UlpSensitivity > 0.0);
-  // 2. And a bound wide enough to admit the port would admit a real defect. This
-  //    is the assertion that justifies the absence of a bound, and it REDS if a
-  //    future change ever makes the port close enough for one to be meaningful --
-  //    which is the outcome that should force this comment to be rewritten.
-  CHECK(vllm_test::kLtx2VideoDecBf16DefectRmsOrder < err);
-  // 3. One of the three defects does not reach this fixture's output AT ALL, and
-  //    that is why the per-kernel cases exist rather than being a convenience. A
-  //    whole-decode gate would be blind to the GroupNorm affine here however wide
-  //    or narrow its band.
+  // 2. AND THE BOUND SEPARATES REAL DEFECTS. Without these two lines it is a
+  //    number that happens to admit the port. Wave 2 measured that its own
+  //    planned bound would have admitted three of five defect mutations and
+  //    deleted it; these say that this one does not.
+  CHECK(vllm_test::kLtx2VideoDecBf16DefectStats > vllm_test::kLtx2VideoDecBf16UlpSensitivity);
+  CHECK(vllm_test::kLtx2VideoDecBf16DefectRmsOrder > vllm_test::kLtx2VideoDecBf16UlpSensitivity);
+  // 3. One of the three defects does not reach this fixture's output AT ALL, so
+  //    no bound here could ever see it. That is the statement that makes the
+  //    per-kernel GroupNorm case load-bearing rather than duplicative.
   CHECK(vllm_test::kLtx2VideoDecBf16DefectGroupNormAffine == 0.0);
-  // 4. The two upstream arms are far apart on this fixture, so "the port quietly
-  //    ran the f32 path" is a distinguishable state rather than a hypothetical.
-  CHECK(vllm_test::kLtx2VideoDecBf16ArmGap > 10 * kLtx2GoldenTol);
+  // 4. The two upstream arms are far apart on this fixture and the bound is well
+  //    inside that gap, so "the port quietly ran the f32 path" is a red rather
+  //    than a hypothetical.
+  CHECK(vllm_test::kLtx2VideoDecBf16ArmGap > 2 * vllm_test::kLtx2VideoDecBf16UlpSensitivity);
   // 5. The golden was taken under `SDPBackend.MATH`. On this fixture that is the
   //    same tensor the module produces as constructed -- the attn block's
   //    sequence is short enough that the dispatcher does not reach FLASH -- so
-  //    the pin costs nothing here and is recorded as zero rather than assumed.
+  //    the pin costs nothing HERE and is recorded as zero rather than assumed.
+  //    At the shipped widths it does not: FLASH serves the bare call and is
+  //    37-38% of words away from MATH, which the row's spec carries as a risk.
   CHECK(vllm_test::kLtx2VideoDecBf16BackendGap == 0.0);
 }
 
@@ -1446,6 +1439,89 @@ TEST_CASE("ltx2 vae: each kLtx2Vae kernel's BF16 rule is the one upstream applie
     INFO("distance to the bias-after-rounding answer = " << rej);
     CHECK(rej > 0.0);
   }
+}
+
+TEST_CASE("ltx2 vae: the SHALLOW bf16 arm holds the three rules the deep one cannot") {
+  // A24 wave 3 (#2786). The whole-decode bf16 case above carries no value bound,
+  // because thirteen convolutions of torch's blocked reduction give it an
+  // irreducible term of the same size as a real defect. That is a property of
+  // DEPTH, and this arm removes it: TWO convolutions -- `conv_in` and `conv_out`
+  // -- with an `attn` block between them and timestep conditioning on.
+  //
+  // It is therefore where three rules become gateable that neither the kernel
+  // table nor the deep arm owns:
+  //   * `_RMSNorm2D` forms `sqrt(C) * gamma` FIRST and multiplies once
+  //     (attention.py:23);
+  //   * `per_channel_statistics.un_normalize` rounds its multiply and its add
+  //     separately, on statistics narrowed by `.to(x)` (ops.py:76-79);
+  //   * the PixArt timestep embedding is computed AT the activation dtype
+  //     (`hidden_dtype=sample.dtype`, conv_video_decoder.py:331-334), not in f32
+  //     and rounded once.
+  //
+  // `sqrt(8)` IS NOT A POWER OF TWO, and that is why the block sits at
+  // `base_channels * 1 = 8` channels. At C=64 every ordering of
+  // `F.normalize(x) * (sqrt(C) * gamma)` agrees on 4800 of 4800 values, so a
+  // probe built on a power-of-two width would gate nothing at all.
+  vllm::Ltx2ConvVideoDecoderConfig cfg = ReducedVideoDecoderConfig();
+  cfg.prefix = "ltx2.videodecshallow.";
+  cfg.decoder_blocks = {{"attn", 1, 0, false, false}};
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoDecShallowParamNames,
+                vllm_test::kLtx2VideoDecShallowParamCounts,
+                std::size(vllm_test::kLtx2VideoDecShallowParamNames));
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+
+  const int64_t lc = vllm_test::kLtx2VideoDecLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecLatentW;
+  const std::vector<float> latent =
+      Ltx2Input("ltx2.videodecshallow.input", lc * lt * lh * lw, 1.0);
+
+  GoldenNoise noise("ltx2.videodecshallow.");
+  const vllm::Ltx2VideoFrames frames =
+      vllm::Ltx2ConvVideoDecode(cfg, bf16, latent, lc, lt, lh, lw, &noise);
+  CHECK(frames.channels == vllm_test::kLtx2VideoDecShallowOutC);
+  CHECK(frames.frames == vllm_test::kLtx2VideoDecShallowOutT);
+  CHECK(frames.height == vllm_test::kLtx2VideoDecShallowOutH);
+  CHECK(frames.width == vllm_test::kLtx2VideoDecShallowOutW);
+  REQUIRE(static_cast<int64_t>(noise.counts().size()) ==
+          vllm_test::kLtx2VideoDecShallowNoiseDraws);
+
+  // THE THREE REJECTED ANSWERS SEPARATE, asserted before the comparison that
+  // depends on them. Each is upstream re-run end to end with one rounding rule
+  // replaced by the hypothesis this row rejected, and a zero here would mean the
+  // bit-exact check below is satisfied by any of them.
+  INFO("rejected distances: _RMSNorm2D order "
+       << vllm_test::kLtx2VideoDecShallowRejectRmsOrder << ", un_normalize fused "
+       << vllm_test::kLtx2VideoDecShallowRejectUnNormalize << ", f32 timestep embedding "
+       << vllm_test::kLtx2VideoDecShallowRejectTimestepF32);
+  CHECK(vllm_test::kLtx2VideoDecShallowRejectRmsOrder > 0.0);
+  CHECK(vllm_test::kLtx2VideoDecShallowRejectUnNormalize > 0.0);
+  CHECK(vllm_test::kLtx2VideoDecShallowRejectTimestepF32 > 0.0);
+
+  const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecShallowGolden,
+                                std::size(vllm_test::kLtx2VideoDecShallowGolden));
+  // EACH REJECTED ANSWER IS EMITTED AS A TENSOR, not only as a distance, so a
+  // failing port can be told WHICH hypothesis it landed on. That is what turned a
+  // 0.0078 red here into the finding it was: the port matched none of the three,
+  // which pointed at a fourth rule -- the noise blend's Python-float scalars,
+  // which this port was narrowing to bf16 and torch is not.
+  MESSAGE("shallow bf16 arm: vs upstream " << err
+          << " vs rms-order " << MaxAbsDiff(frames.data,
+               vllm_test::kLtx2VideoDecShallowRejectedRmsOrderGolden,
+               std::size(vllm_test::kLtx2VideoDecShallowRejectedRmsOrderGolden))
+          << " vs un_normalize-fused " << MaxAbsDiff(frames.data,
+               vllm_test::kLtx2VideoDecShallowRejectedUnNormalizeGolden,
+               std::size(vllm_test::kLtx2VideoDecShallowRejectedUnNormalizeGolden))
+          << " vs f32-timestep " << MaxAbsDiff(frames.data,
+               vllm_test::kLtx2VideoDecShallowRejectedTimestepF32Golden,
+               std::size(vllm_test::kLtx2VideoDecShallowRejectedTimestepF32Golden)));
+  INFO("shallow bf16 arm max|diff| = " << err);
+  // BIT-EXACT, not within a band. Two convolutions leave no room for the blocked
+  // reduction to compound, so anything but zero is a rule that does not match --
+  // and every one of the rejected answers above is further away than zero.
+  CHECK(err == 0.0);
 }
 
 TEST_CASE("ltx2 vae: the PixelNorm epsilon is the BF16 one, at the scale where that BINDS") {

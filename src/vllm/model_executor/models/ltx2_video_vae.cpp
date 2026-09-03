@@ -1504,8 +1504,25 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
     // #2780 and it is the developer's. This arm keeps `Ltx2NoiseStream`'s f32
     // sequence and narrows each drawn value, which is a recorded divergence and
     // not an oversight; the same divergence applies at `FeedSpatialNoise`.
-    const float noise_scale = Round(static_cast<float>(config.decode_noise_scale));
-    const float keep_scale = Round(static_cast<float>(1.0 - config.decode_noise_scale));
+    // THE TWO SCALARS ARE NOT NARROWED, AND THAT IS THE OPPOSITE OF THE RULE ONE
+    // BLOCK BELOW. `self.decode_noise_scale` is a PYTHON FLOAT, so
+    // `noise * self.decode_noise_scale` and `(1.0 - self.decode_noise_scale) *
+    // sample` go through torch's scalar path, whose compute type for a bf16
+    // tensor is f32: the scalar reaches the multiply at f32 and only the RESULT
+    // rounds. Narrowing it first is wrong on 576 of 2000 values -- `bf16(0.975)`
+    // is 0.9765625, a whole 2^-9 away from 0.975 -- and it was wrong here, which
+    // is what the shallow bf16 arm caught.
+    //
+    // A REGISTERED BUFFER GOES THE OTHER WAY IN THIS SAME FUNCTION: the
+    // per-channel statistics below are tensors and `.to(x)` narrows them
+    // (ops.py:76-79), which is 1294 of 4096 values if it is skipped. And
+    // `PixelNorm`'s epsilon, ALSO a Python float, IS narrowed for its add -- the
+    // port is bit-exact against upstream with `bf16(1e-8)` and 7 of 144 words
+    // away with `1e-8` at a row scale of 2^-14. Three scalars, three answers, in
+    // two files, and this is A24 wave 1's finding in a third component: none of
+    // them may be read off the source.
+    const float noise_scale = static_cast<float>(config.decode_noise_scale);
+    const float keep_scale = static_cast<float>(1.0 - config.decode_noise_scale);
     for (size_t i = 0; i < staged.size(); ++i) {
       staged[i] = Round(Round(Round(drawn[i]) * noise_scale) + Round(keep_scale * staged[i]));
     }

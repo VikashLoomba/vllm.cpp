@@ -390,6 +390,45 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
     cb_be.Copy(dq, got.data(), d_c, got.size() * 2);
     cb_be.Synchronize(dq);
 
+    // NOTHING LANDS DEAD. Everything above is FORCED, and a forced arm proves
+    // the kernel works, never that anything reaches it. This second call leaves
+    // `force_gemv` at its `Exl3GemmArgs` DEFAULT of -1 — exactly what a model's
+    // linear method passes through `ModelRegistry::Forward` — so the envelope
+    // decides at mode 1, on this device, with no test-only lever anywhere.
+    //
+    // At `k == 2048, n == 4096` the branch `size_k <= 2048 && size_n <= 8192`
+    // (`exl3_gemv.cu:67`) fires on EVERY compute-capability bucket and takes NO
+    // occupancy input, so this is the one shape whose default-mode verdict is a
+    // constant rather than a device query. `arm.n == kW2N` selects it and the
+    // wide leg, at n = 8320, is excluded because its verdict is not.
+    //
+    // The assertion is BYTE equality with the forced result, and that is what
+    // makes it a reachability check rather than a second tolerance: the regular
+    // shape-table kernel accumulates in f32 where this one accumulates in fp16,
+    // so a fall-through would agree to tier 3c and disagree here. Deleting the
+    // `Exl3GemvTryLaunch` call site turns this from equal to unequal.
+    if (arm.n == kW2N) {
+      std::vector<uint16_t> unforced(static_cast<size_t>(m * n), 0);
+      void* d_c2 = cb_be.Alloc(unforced.size() * 2);
+      vt::Tensor dc2 = vt::Tensor::Contiguous(d_c2, vt::DType::kF16, dq.device, {m, n});
+      vt::Exl3GemmArgs prod = ha;  // force_gemv stays -1, force_shape_idx stays 0
+      CHECK(prod.force_gemv == -1);
+      CHECK(vt::Exl3GemvSelectConfig(vt::Exl3Cc::kBlackwell, static_cast<int>(m),
+                                     static_cast<int>(k), static_cast<int>(n), arm.bits, arm.cb,
+                                     /*mode=*/1, /*narrow_coresident=*/0) == 0);
+      vt::Exl3Gemm(dq, dc2, da, db, dsuh, dsvh, dah, prod);
+      cb_be.Synchronize(dq);
+      cb_be.Copy(dq, unforced.data(), d_c2, unforced.size() * 2);
+      cb_be.Synchronize(dq);
+      size_t same = 0;
+      for (size_t i = 0; i < got.size(); ++i)
+        if (unforced[i] == got[i]) ++same;
+      MESSAGE(arm.what, " reached UNFORCED at mode 1: ", same, " of ", got.size(),
+              " outputs byte-equal to the forced launch");
+      CHECK(same == got.size());
+      cb_be.Free(d_c2);
+    }
+
     double sq = 0.0, rq = 0.0, worst = 0.0, sq_sib = 0.0;
     for (size_t i = 0; i < got.size(); ++i) {
       const double r = vt::F16ToF32(ref[i]);

@@ -307,8 +307,15 @@ class Dots3NoteAudioProcessor {
   // segment at a time. One pass over the whole waveform would use one max for
   // every chunk and shift the quietest bands of the quietest chunk.
   //
+  // RESAMPLES a `sample_rate` that is not `cfg.sampling_rate` (W7c-2, #2828)
+  // through `vllm::multimodal::ResampleAudioScipy`, which is upstream's own
+  // `"scipy"` `AudioResampler` arm and NOT its `"pyav"` default; that choice is
+  // a recorded divergence and the seam header carries the reason. At the target
+  // rate the call returns its input unchanged, so nothing at 16 kHz moves.
+  //
   // REFUSES BY NAME, before any arithmetic:
-  //   * `sample_rate != cfg.sampling_rate` -> W7c (no resampler is ported)
+  //   * a non-positive rate, or a reduced polyphase ratio past
+  //     `kMaxPolyphaseRate` (from inside the resample seam)
   //   * more than one chunk on a config whose `chunk_samples` is not a whole
   //     number of `token_stride`s. That is the ONE thing segmentation cannot
   //     make safe: the tower produces `sum_i ceil(seg_i / stride)` rows
@@ -339,6 +346,20 @@ class Dots3NoteAudioProcessor {
   int64_t NumAudioTokens(int64_t num_samples) const;
 
   std::string HashAudio(const float* samples, int64_t num_samples) const;
+
+  // The encoder-cache key for a request that names its OWN sample rate
+  // (W7c-2, #2828). It hashes the RESAMPLED waveform, which is what the tower
+  // consumes.
+  //
+  // THE TWO-ARGUMENT FORM IS NOT SAFE FOR A MULTI-RATE CALLER, and W7c-2
+  // created that hazard by serving more than one rate. A file carrying N PCM16
+  // samples at 16000 Hz and a file carrying the identical N samples at
+  // 44100 Hz decode to identical float buffers and hash identically under it,
+  // while their features differ. Every caller that has a request rate in hand
+  // must use this overload; the two-argument one stays for the callers that
+  // are single-rate by construction.
+  std::string HashAudio(const float* samples, int64_t num_samples,
+                        int sample_rate) const;
 
  private:
   Dots3NoteAudioProcessorConfig cfg_;

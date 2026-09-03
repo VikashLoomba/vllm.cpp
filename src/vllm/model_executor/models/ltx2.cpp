@@ -92,6 +92,8 @@ void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
   NarrowTo(compute_dtype, out, static_cast<size_t>(rows * out_features));
 }
 
+}  // namespace
+
 // torch.nn.functional.rms_norm over the last dim (ltx_core/utils.py:7-12), with
 // an optional elementwise weight (torch.nn.RMSNorm, attention.py:505-506).
 // `out_dtype` is the dtype the RESULT is materialized in, and at bf16 that is the
@@ -108,8 +110,8 @@ void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
 // 15 360 000 values and this f64 one mismatches 24. Accumulating exactly and
 // rounding once is the closest single-rounding approximation to any order, which
 // is the same argument the f32 arm's own header makes.
-void RmsNormRows(const float* in, const float* weight, float* out, int64_t rows, int64_t width,
-                 double eps, DType out_dtype = DType::kF32) {
+void Ltx2RmsNormRows(const float* in, const float* weight, float* out, int64_t rows,
+                     int64_t width, double eps, DType out_dtype) {
   for (int64_t r = 0; r < rows; ++r) {
     const float* src = in + r * width;
     double sum = 0.0;
@@ -124,6 +126,8 @@ void RmsNormRows(const float* in, const float* weight, float* out, int64_t rows,
     NarrowTo(out_dtype, dst, static_cast<size_t>(width));
   }
 }
+
+namespace {
 
 float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 
@@ -809,7 +813,7 @@ void Ltx2ApplyRotaryEmb(float* x, int64_t batch, int64_t tokens, int64_t dim, in
           const float cos = pe.cos[base + static_cast<size_t>(r)];
           const float sin = pe.sin[base + static_cast<size_t>(r)];
           const float lo = v[r], hi = v[per_head + r];
-          // `output = split_input * cos` materializes a bf16 tensor (rope.py:73)
+          // `output = split_input * cos` materializes a bf16 tensor (rope.py:71)
           // and `addcmul_` then FUSES the second multiply into the add with a
           // single rounding (:75-76). So TWO roundings per output, not three and
           // not one — and the second operand is the ORIGINAL half, not the
@@ -1012,14 +1016,14 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
   // The q/k norms are `torch.nn.RMSNorm(inner_dim)` (attention.py:505-506) and
   // the bag may hold their gains at either width; the widening is exact.
   std::vector<float> qnorm_scratch, knorm_scratch;
-  RmsNormRows(qb.data(), AsF32(w.q_norm, qnorm_scratch), qn.data(), batch * tq, inner,
-              args.norm_eps, args.compute_dtype);
+  Ltx2RmsNormRows(qb.data(), AsF32(w.q_norm, qnorm_scratch), qn.data(), batch * tq, inner,
+                  args.norm_eps, args.compute_dtype);
   if (!reuse_kv) {
     std::vector<float> kb(static_cast<size_t>(batch * s * inner));
     Linear(q, ctx, batch * s, ctx_dim, w.to_k, kb.data(), args.compute_dtype);
     kn.resize(kb.size());
-    RmsNormRows(kb.data(), AsF32(w.k_norm, knorm_scratch), kn.data(), batch * s, inner,
-                args.norm_eps, args.compute_dtype);
+    Ltx2RmsNormRows(kb.data(), AsF32(w.k_norm, knorm_scratch), kn.data(), batch * s, inner,
+                    args.norm_eps, args.compute_dtype);
   }
   if (args.pe != nullptr) {
     Ltx2ApplyRotaryEmb(qn.data(), batch, tq, inner, heads, *args.pe, args.rope_type,

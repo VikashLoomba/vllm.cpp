@@ -2741,6 +2741,20 @@ TEST_CASE("ltx2 the connector's bf16 register table is the STORED word, not a re
   const vllm::Ltx2ConnectorOutput wide = vllm::Ltx2ConnectorReplaceRegisters(
       config, wide_bag.weights, hidden.data(), mask.data(), batch, seq);
 
+  // THE STORED TABLE ITSELF, before anything selects from it. At bf16 upstream's
+  // `.to(hidden_states.dtype)` (:146) is an identity, so the parameter as stored
+  // IS the value the substitution places, and widening our stored word must
+  // reproduce it exactly. Only the `Split` arm emits this trio, because the other
+  // three register arms are already gated end to end by their forward goldens,
+  // which the substitution feeds.
+  const std::vector<uint16_t>& stored_bits =
+      narrow_bag.weights.GetBf16(config.prefix + "learnable_registers");
+  REQUIRE(stored_bits.size() == std::size(vllm_test::kLtx2ConnBf16SplitRegistersGolden));
+  std::vector<float> stored_table(stored_bits.size());
+  for (size_t i = 0; i < stored_bits.size(); ++i) stored_table[i] = vt::BF16ToF32(stored_bits[i]);
+  CHECK(MaxAbsDiff(stored_table, vllm_test::kLtx2ConnBf16SplitRegistersGolden,
+                   std::size(vllm_test::kLtx2ConnBf16SplitRegistersGolden)) == 0.0);
+
   // Against UPSTREAM first, so this is a port check and not a self-consistency
   // one. The substitution is a select between two bf16-valued streams, so it is
   // exact on both arms and no tolerance belongs under it.
@@ -2808,6 +2822,57 @@ TEST_CASE("ltx2 the connector's bf16 rms_norm takes the f32 epsilon, not the nar
        CountWiderThanBf16(as_f32), " of ", got.size());
   CHECK(CountWiderThanBf16(got) == 0);
   CHECK(CountWiderThanBf16(as_f32) > static_cast<int64_t>(as_f32.size()) / 2);
+
+  // ── AND THE SAME PROBE ON THE WEIGHTED NORM, WHICH IS A DIFFERENT FUNCTION ──
+  //
+  // Everything above holds `Ltx2ConnectorRmsNormRows`, the connector's WEIGHTLESS
+  // residual norm. The q/k norms inside the attention are
+  // `torch.nn.RMSNorm(inner_dim, eps=norm_eps)` (attention.py:505-506); they run
+  // in the SAME forward on the SAME constant -- `Ltx2ConnectorForward` assigns
+  // `Ltx2AttentionArgs::norm_eps = kLtx2ConnectorRmsNormEps` -- and they reach it
+  // through `Ltx2RmsNormRows`, which had no probe of its own. Measured on this
+  // tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 left all 722 ltx2
+  // assertions green, while setting it to 1.0 reds ten of them on all five arms.
+  // So the site is live and reached, and the arm goldens cannot resolve it --
+  // exactly the hole this case exists to close for the weightless form.
+  std::vector<float> gain(std::begin(vllm_test::kLtx2ConnBf16EpsGain),
+                          std::end(vllm_test::kLtx2ConnBf16EpsGain));
+  REQUIRE(gain.size() == static_cast<size_t>(width));
+  std::vector<float> weighted_in(std::begin(vllm_test::kLtx2ConnBf16EpsInput),
+                                 std::end(vllm_test::kLtx2ConnBf16EpsInput));
+  std::vector<float> weighted(weighted_in.size());
+  vllm::Ltx2RmsNormRows(weighted_in.data(), gain.data(), weighted.data(), rows, width,
+                        vllm::kLtx2ConnectorRmsNormEps, vt::DType::kBF16);
+  const double weighted_worst = MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedGolden,
+                                           std::size(vllm_test::kLtx2ConnBf16EpsWeightedGolden));
+  INFO("bf16 WEIGHTED rms_norm epsilon probe: max|diff| = ", weighted_worst);
+  CHECK(weighted_worst == 0.0);
+
+  // TWO rejected hypotheses, both emitted beside upstream's answer and both
+  // measured to separate on these rows. (a) the bf16-narrowed epsilon, the same
+  // alternative the weightless probe rejects. (b) rounding the normalized value
+  // into bf16 and THEN multiplying by the gain, instead of the single rounding
+  // `F.rms_norm` does. Spec section 4.1 recorded (b) as "not separable"; executed,
+  // it parts from upstream on 3166 of 12288 values here and on 12647 of 49152 at
+  // ordinary magnitude, so it gets a golden rather than a sentence.
+  INFO("weighted probe separations measured by the generator: eps ",
+       vllm_test::kLtx2ConnBf16EpsWeightedSeparating, ", round-then-multiply ",
+       vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMulSeparating, " of ", rows * width);
+  REQUIRE(vllm_test::kLtx2ConnBf16EpsWeightedSeparating > 0);
+  REQUIRE(vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMulSeparating > 0);
+  CHECK(MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedRejected,
+                   std::size(vllm_test::kLtx2ConnBf16EpsWeightedRejected)) > 0.0);
+  CHECK(MaxAbsDiff(weighted, vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMul,
+                   std::size(vllm_test::kLtx2ConnBf16EpsWeightedRoundThenMul)) > 0.0);
+
+  // The same both-directions dtype pair the weightless half uses.
+  std::vector<float> weighted_f32(weighted_in.size());
+  vllm::Ltx2RmsNormRows(weighted_in.data(), gain.data(), weighted_f32.data(), rows, width,
+                        vllm::kLtx2ConnectorRmsNormEps, vt::DType::kF32);
+  INFO("weighted, wider than bf16: bf16 arm ", CountWiderThanBf16(weighted), ", f32 arm ",
+       CountWiderThanBf16(weighted_f32), " of ", weighted.size());
+  CHECK(CountWiderThanBf16(weighted) == 0);
+  CHECK(CountWiderThanBf16(weighted_f32) > static_cast<int64_t>(weighted_f32.size()) / 2);
 }
 
 TEST_CASE("ltx2 the bf16 connector narrows the CALLER's stream on BOTH branches") {

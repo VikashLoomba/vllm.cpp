@@ -511,6 +511,24 @@ struct Ltx2AttentionArgs {
 std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& w, const float* x,
                                  const float* context, const Ltx2AttentionArgs& args);
 
+// `torch.nn.functional.rms_norm` over the last dimension with an OPTIONAL
+// elementwise gain (utils.py:7-12; `torch.nn.RMSNorm`, attention.py:505-506).
+// `weight == nullptr` is the weightless form; `out_dtype` selects where the one
+// narrowing lands and not the arithmetic, which is f64-accumulated on both arms.
+//
+// This is `Ltx2Attention`'s OWN q/k norm -- `Ltx2Attention` calls it twice per
+// block and nothing else defines it -- and it is declared here for the same
+// reason `Ltx2ConnectorRmsNormRows` is declared in ltx2_connector.h: `eps` lives
+// in it, and at bf16 the difference between `1e-6` and `bf16(1e-6)` is INVISIBLE
+// in any tensor built from rows of ordinary magnitude. Measured: narrowing this
+// epsilon leaves every one of this suite's 722 ltx2 assertions green, while
+// setting it to 1.0 reds ten of them -- so the site is live and reached, and an
+// arm golden simply cannot resolve it. The probe that can needs rows near
+// 2^-13, which no forward fixture produces, so it calls this directly. A
+// production path, not a test hook.
+void Ltx2RmsNormRows(const float* in, const float* weight, float* out, int64_t rows,
+                     int64_t width, double eps, vt::DType out_dtype = vt::DType::kF32);
+
 // ---------------------------------------------------------------------------
 // Forward
 // ---------------------------------------------------------------------------

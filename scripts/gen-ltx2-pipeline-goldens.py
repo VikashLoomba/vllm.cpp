@@ -1619,7 +1619,13 @@ def section_connector_bf16(out) -> None:
         emit_f32(out, f"kLtx2ConnBf16{tag}UnpatchedGolden", unpatched.float().numpy())
         emit_double(out, f"kLtx2ConnBf16{tag}KernelGap", gap)
 
-        if registers:
+        # THE SUBSTITUTION ON ITS OWN, for the ONE arm that isolates it. Four of
+        # the five arms carry registers and every one of them is already gated
+        # END TO END by the forward golden above, which the substitution feeds;
+        # a trio per arm emitted nine arrays no case ever read. `Split` is the
+        # arm the isolation case runs, and all three of its goldens are
+        # referenced by it.
+        if registers and tag == "Split":
             replaced, zeroed = module._replace_padded_with_learnable_registers(  # noqa: SLF001
                 hidden.clone(), mask.clone()
             )
@@ -1673,6 +1679,60 @@ def section_connector_bf16(out) -> None:
     # suite asserts the difference rather than trusting the constant.
     emit_f32(out, "kLtx2ConnBf16EpsRejected", rejected.float().numpy())
     emit_scalar(out, "kLtx2ConnBf16EpsSeparating", separating)
+
+    # ── THE SAME PROBE ON THE WEIGHTED NORM, WHICH IS A DIFFERENT FUNCTION ──
+    #
+    # Everything above holds `Ltx2ConnectorRmsNormRows`, the connector's
+    # WEIGHTLESS residual norm. The q/k norms inside the attention are
+    # `torch.nn.RMSNorm(inner_dim, eps=norm_eps)` (attention.py:505-506), they run
+    # in the same forward on the same constant -- `Ltx2ConnectorForward` hands
+    # `Ltx2AttentionArgs::norm_eps` the same `kLtx2ConnectorRmsNormEps` -- and
+    # they went through a DIFFERENT function with no probe of its own. Measured on
+    # the tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 leaves all 722
+    # ltx2 assertions green, while setting it to 1.0 reds ten of them across all
+    # five arms. The site is live and reached; the arm goldens simply cannot
+    # resolve a difference eight orders below bf16's resolution.
+    #
+    # Same rows, same scale, same refuse-if-not-separating guard. The gain follows
+    # this suite's own rule for a 1-D `.weight` -- an affine norm gain centred on
+    # 1.0 -- so it is the same fixture shape the arm goldens use.
+    gain = torch.from_numpy(make("ltx2.conn.bf16.eps.gain", width, 0.1, 1.0)).to(bf)
+    g32 = gain.float()
+    weighted = rms_norm(small, gain)
+    weighted_rejected = (
+        x32 * torch.rsqrt(ms + float(torch.tensor(1e-6, dtype=bf))) * g32
+    ).to(bf)
+    weighted_separating = int(
+        (weighted.view(torch.int16) != weighted_rejected.view(torch.int16)).sum()
+    )
+    # THE SECOND REJECTED HYPOTHESIS. Section 4.1 of the spec recorded that
+    # rounding the normalized value into bf16 and THEN multiplying by the gain is
+    # "not separable" from the single rounding `F.rms_norm` does. Executed, it
+    # separates cleanly, so the alternative gets a golden of its own rather than a
+    # sentence saying it could not have one.
+    weighted_rtm = ((x32 * torch.rsqrt(ms + 1e-6)).to(bf).float() * g32).to(bf)
+    weighted_rtm_separating = int(
+        (weighted.view(torch.int16) != weighted_rtm.view(torch.int16)).sum()
+    )
+    if weighted_separating == 0 or weighted_rtm_separating == 0:
+        raise SystemExit(
+            "the WEIGHTED bf16 rms_norm probe no longer separates upstream from one of its "
+            f"two rejected hypotheses (eps {weighted_separating}, round-then-multiply "
+            f"{weighted_rtm_separating}). A probe that cannot fail gates nothing; rebuild it "
+            "(raise `rows`, or lower the scale) rather than emitting it."
+        )
+    print(
+        f"  bf16 WEIGHTED rms_norm probe: eps separates on {weighted_separating}"
+        f"/{weighted.numel()}, round-then-multiply on {weighted_rtm_separating}"
+        f"/{weighted.numel()}",
+        file=sys.stderr,
+    )
+    emit_f32(out, "kLtx2ConnBf16EpsGain", g32.numpy())
+    emit_f32(out, "kLtx2ConnBf16EpsWeightedGolden", weighted.float().numpy())
+    emit_f32(out, "kLtx2ConnBf16EpsWeightedRejected", weighted_rejected.float().numpy())
+    emit_scalar(out, "kLtx2ConnBf16EpsWeightedSeparating", weighted_separating)
+    emit_f32(out, "kLtx2ConnBf16EpsWeightedRoundThenMul", weighted_rtm.float().numpy())
+    emit_scalar(out, "kLtx2ConnBf16EpsWeightedRoundThenMulSeparating", weighted_rtm_separating)
 
 
 # ---------------------------------------------------------------------------

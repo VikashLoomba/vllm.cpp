@@ -377,7 +377,7 @@ double ExtraDouble(const std::map<std::string, std::string>& extras, const std::
 // Not `ExtraDouble` above, and deliberately: that one reports "not a finite
 // number of SECONDS", which is the wrong noun for a strength, and it defaults a
 // missing key while this one is only ever called on a key that is present.
-double ParseLoraStrength(const std::string& raw) {
+double ParseLoraStrength(const std::string& key, const std::string& raw) {
   try {
     size_t consumed = 0;
     const double value = std::stod(raw, &consumed);
@@ -385,9 +385,69 @@ double ParseLoraStrength(const std::string& raw) {
     if (!std::isfinite(value)) throw std::invalid_argument("non-finite");
     return value;
   } catch (const std::exception&) {
-    Fail("the extra '" + std::string(kLtx2LoraStrengthExtra) + "' is '" + raw +
-         "', which is not a finite number");
+    Fail("the extra '" + key + "' is '" + raw + "', which is not a finite number");
   }
+}
+
+// The suffix that names adapter `index` in the load extras: adapter 1 is the
+// unindexed `lora_path` / `lora_strength` every existing caller already writes.
+std::string LoraIndexSuffix(int64_t index) {
+  return index == 1 ? std::string() : "_" + std::to_string(index);
+}
+
+// `lora_path_<n>` or `lora_strength_<n>` with n >= 2 — the indexed spelling of
+// upstream's REPEATABLE `--lora`. False for everything else, `..._1` included:
+// the first adapter is spelled without an index, and admitting a second
+// spelling for it would let `lora_path` and `lora_path_1` disagree with no
+// defensible winner. `CheckKnownExtras` refuses `..._1` by name for that reason
+// rather than as an unknown key.
+bool LoraExtraIndex(const std::string& key, int64_t* out_index) {
+  for (const char* base : {kLtx2LoraPathExtra, kLtx2LoraStrengthExtra}) {
+    const std::string prefix = std::string(base) + "_";
+    if (key.size() <= prefix.size()) continue;
+    if (key.compare(0, prefix.size(), prefix) != 0) continue;
+    const std::string digits = key.substr(prefix.size());
+    // A leading zero, a non-digit or a length no `int64_t` needs is not an
+    // index. Bounded before `stoll` so this cannot throw on a hostile key.
+    if (digits[0] == '0' || digits.size() > 6) return false;
+    for (const char c : digits) {
+      if (c < '0' || c > '9') return false;
+    }
+    const int64_t index = std::stoll(digits);
+    if (index < 2) return false;
+    if (out_index != nullptr) *out_index = index;
+    return true;
+  }
+  return false;
+}
+
+// `lora_path_1` / `lora_strength_1` refuse BY NAME rather than as unknown keys.
+// The caller has understood the indexed family and mis-spelled its first member,
+// and the generic message would send them hunting for a typo in a key they got
+// almost right. A no-op for every other key.
+//
+// HERE, ABOVE `kKnownLoadExtras[]`, and not inside `CheckKnownExtras` where it
+// is called: `test_ltx2_video` derives each served key's READER as the first
+// line after that array which names its token, so a token mentioned between the
+// array and the real readers moves the anchor onto a refusal.
+void RefuseLoraIndexOne(const std::string& key) {
+  for (const char* base : {kLtx2LoraPathExtra, kLtx2LoraStrengthExtra}) {
+    if (key != std::string(base) + "_1") continue;
+    Fail("the load extra '" + key + "' does not exist: the FIRST adapter is '" +
+         std::string(base) + "' with no index, and the second onwards are '" +
+         std::string(base) + "_2', '" + std::string(base) +
+         "_3' and so on. Two spellings for one adapter could disagree, so the "
+         "unindexed one is the only one.");
+  }
+}
+
+// The indexed family's entry in the unknown-key listing. A PATTERN and not a
+// listable set, because upstream's `--lora` has no arity bound
+// (`utils/args.py:600-611`), so `kKnownLoadExtras[]` cannot hold it. Above the
+// array for the same reason `RefuseLoraIndexOne` is.
+std::string LoraIndexedListing() {
+  return std::string(kLtx2LoraPathExtra) + "_<n>, " + std::string(kLtx2LoraStrengthExtra) +
+         "_<n> (n >= 2)";
 }
 
 // The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
@@ -414,7 +474,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 1079 1089 1090 1176 1272 1288 1377 1381 1484 1562 1670 1712 1754 1756
+// 572 574 1199 1295 1391 1407 1542 1546 1649 1727 1835 1877 1919 1921
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -455,9 +515,15 @@ void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
     for (const char* name : kKnownLoadExtras) {
       if (kv.first == name) known = true;
     }
+    // The indexed IC-LoRA family (row LTX25-LORA-FUSION). It is a PATTERN and
+    // not a listable set because upstream's `--lora` has no arity bound
+    // (`utils/args.py:600-611`), so the enumerated array above cannot hold it.
+    if (!known && LoraExtraIndex(kv.first, nullptr)) known = true;
     if (!known) {
+      RefuseLoraIndexOne(kv.first);
       std::string listing;
       for (const char* name : kKnownLoadExtras) listing += std::string(listing.empty() ? "" : ", ") + name;
+      listing += ", " + LoraIndexedListing();
       Fail("unknown load extra '" + kv.first + "'. This family defines: " + listing);
     }
   }
@@ -482,6 +548,60 @@ void CheckUnservedExtras(const std::map<std::string, std::string>& extras) {
          "arithmetic against the recipe frame rate), instead. Refused rather than ignored; "
          "recorded as owed in .agents/specs/ltx25-retire-dead-arms.md (#611).");
   }
+}
+
+// Every IC-LoRA adapter the load names, in `--lora` order (row
+// LTX25-LORA-FUSION, #932).
+//
+// THE TRANSPORT IS INDEXED KEYS, and the reason is that these values are PATHS.
+// The tree's own precedent for a repeatable upstream flag is one delimited value
+// (`ApplyStgBlocksExtra`, for `--*-stg-blocks`), and it does not transfer: a
+// comma is legal in a POSIX filename, the only bytes that are not are `/` and
+// NUL, and NUL cannot sit inside a C string. A delimited encoding would
+// therefore cut some real path in half and report two files that do not exist.
+// A repeated key is not available either — `VideoExtrasFromArrays` folds the C
+// ABI's parallel arrays into a `std::map`, where the last `lora_path` wins in
+// silence.
+//
+// A GAP REFUSES rather than renumbering. A caller who wrote `lora_path_3` and
+// no `lora_path_2` believes three adapters are being fused; sliding the third
+// into the second slot would fuse two and report success.
+std::vector<Ltx2LoraSpec> ResolveLoraSpecs(const std::map<std::string, std::string>& extras) {
+  std::vector<Ltx2LoraSpec> out;
+  for (int64_t index = 1;; ++index) {
+    const std::string path_key = std::string(kLtx2LoraPathExtra) + LoraIndexSuffix(index);
+    const std::string strength_key =
+        std::string(kLtx2LoraStrengthExtra) + LoraIndexSuffix(index);
+    const std::string path = VideoExtra(extras, path_key);
+    const std::string strength = VideoExtra(extras, strength_key);
+    if (path.empty()) {
+      // The same refusal the one-adapter arm has always carried, now per index.
+      if (!strength.empty()) {
+        Fail("'" + strength_key + "' was given without '" + path_key +
+             "'. A strength with no adapter fuses nothing, and silently doing nothing is "
+             "what this refusal exists to prevent.");
+      }
+      break;
+    }
+    Ltx2LoraSpec spec;
+    spec.path = path;
+    // Absent is DEFAULT_LORA_STRENGTH, per adapter, exactly as upstream's
+    // `--lora PATH` with no second word is (`utils/args.py:607-608`).
+    if (!strength.empty()) spec.strength = ParseLoraStrength(strength_key, strength);
+    out.push_back(std::move(spec));
+  }
+  const int64_t next = static_cast<int64_t>(out.size()) + 1;
+  for (const auto& kv : extras) {
+    int64_t index = 0;
+    if (!LoraExtraIndex(kv.first, &index) || index <= next) continue;
+    Fail("the load carries '" + kv.first + "' but no '" + std::string(kLtx2LoraPathExtra) +
+         LoraIndexSuffix(next) + "', so the adapters are not numbered 1..N with no gaps. " +
+         std::to_string(out.size()) +
+         " adapter(s) would be fused and the rest silently dropped. Number them from 1 — the "
+         "first is '" +
+         std::string(kLtx2LoraPathExtra) + "' with no index — or drop '" + kv.first + "'.");
+  }
+  return out;
 }
 
 // `detect_model_version` normalizes the separator before parsing
@@ -1082,22 +1202,21 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   // `Ltx2StreamDitToDevice` dequantizes and uploads ONE TENSOR AT A TIME, so peak
   // residency is the device copy plus one tensor rather than two whole models.
   dit_options.widen_to_f32 = !im.on_device;
-  // The IC-LoRA adapter, fused into the weights as they are materialized. This
+  // The IC-LoRA adapters, fused into the weights as they are materialized. This
   // is the production call site for the whole `ltx2_lora.h` family: deleting it
-  // makes the adapter unreachable, which is what the reachability mutation in
-  // the row's spec §5.3 checks.
-  const std::string lora_path = VideoExtra(params.extras, kLtx2LoraPathExtra);
-  const std::string lora_strength = VideoExtra(params.extras, kLtx2LoraStrengthExtra);
-  if (lora_path.empty() && !lora_strength.empty()) {
-    Fail("'" + std::string(kLtx2LoraStrengthExtra) + "' was given without '" +
-         std::string(kLtx2LoraPathExtra) +
-         "'. A strength with no adapter fuses nothing, and silently doing nothing is what "
-         "this refusal exists to prevent.");
-  }
-  if (!lora_path.empty()) {
-    Ltx2LoraSpec spec;
-    spec.path = lora_path;
-    if (!lora_strength.empty()) spec.strength = ParseLoraStrength(lora_strength);
+  // makes the adapters unreachable, which is what the reachability mutation in
+  // the row's spec §5.3 checks. Deleting only the `index > 1` arm of
+  // `ResolveLoraSpecs` leaves the one-adapter arm and its whole suite green and
+  // REDs the N-adapter case in `test_ltx2_video`, which is what
+  // .agents/specs/ltx25-lora-fusion.md §8 records.
+  //
+  // N OF THEM, IN ORDER (row LTX25-LORA-FUSION, #932). Upstream's `--lora` is
+  // repeatable — `action=LoraAction`, `nargs="+"`, `default=[]`, and the help
+  // text says "Can be specified multiple times" (`utils/args.py:600-611`) — and
+  // `dfr_pipeline.py:212` composes `(*user_loras, *distilled_lora)` onto ONE
+  // resident DiT. The order is load order, and it is not an implementation
+  // detail: only the FIRST adapter takes upstream's first product form.
+  for (Ltx2LoraSpec& spec : ResolveLoraSpecs(params.extras)) {
     dit_options.loras.push_back(std::move(spec));
   }
   // The prologue ends where the DiT load begins: `load.open` must not absorb any
@@ -1356,6 +1475,52 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
          "The adapter runs on the phases the recipe's `loras` scope names, which for '" +
          im.pipeline_kind + "' is " + scope + ".");
   }
+  // ── N ADAPTERS AGAINST A PHASE-SCOPED RECIPE (row LTX25-LORA-FUSION) ──────
+  //
+  // THE ARITY CAP WAS LOAD-BEARING FOR `Ltx2PhaseLoraScope`, and lifting it is
+  // what obliges this refusal. `kNoAdapters` mirrors upstream's stage 1 EXACTLY
+  // while the load holds ONE adapter: that adapter is the `distilled_lora` the
+  // recipe demands, and upstream's stage 1 argument is `loras=tuple(loras)` —
+  // the USER adapters, which are then necessarily none.
+  // `a2vid_two_stage.py:107` against `:114` and `ti2vid_two_stages.py:140`
+  // against `:151` are both `stage 1 = loras`, `stage 2 = loras + distilled`.
+  //
+  // WITH TWO IT IS A PROPER SUBSET, and this engine cannot express one. It holds
+  // ONE resident DiT and `Ltx2RebindDitLoras` takes a BOOLEAN, so a phase is
+  // fused with every adapter or with none; and no load extra says WHICH of the N
+  // is the distilled one, so it could not pick the subset even if it could hold
+  // it. Rendering anyway would run the user's adapter on stage 2 alone where
+  // upstream runs it on both, and return a clip of the right size, frame count
+  // and sample rate — which is why this refuses instead.
+  //
+  // KEYED ON THE PHASE SCOPE, not on `requires_distilled_lora`. The scope is the
+  // thing that cannot be represented, so the refusal and the defect are the same
+  // predicate; a recipe that gains a `kNoAdapters` phase inherits this without
+  // anyone remembering to pair the two fields.
+  if (dit_options.loras.size() > 1) {
+    std::string bare_phases;
+    for (const Ltx2PhaseRecipe& phase : im.recipe.phases) {
+      if (phase.loras != Ltx2PhaseLoraScope::kNoAdapters) continue;
+      if (!bare_phases.empty()) bare_phases += ", ";
+      bare_phases += "'" + phase.name + "'";
+    }
+    if (!bare_phases.empty()) {
+      Fail("the '" + im.pipeline_kind + "' pipeline runs " + bare_phases +
+           " on the BASE weights, and " + std::to_string(dit_options.loras.size()) +
+           " adapters were supplied. Upstream gives that phase `loras=tuple(loras)` — "
+           "the user adapters WITHOUT the distilled one (ltx-pipelines "
+           "a2vid_two_stage.py:107 against :114, ti2vid_two_stages.py:140 against :151) — "
+           "and this engine holds one resident DiT that is fused with every adapter or "
+           "with none, with nothing in the load extras naming which of the " +
+           std::to_string(dit_options.loras.size()) +
+           " is the distilled one. Supply ONE adapter to this pipeline, or use a pipeline "
+           "whose phases all run fused ('dfr' composes `(*user_loras, *distilled_lora)` on "
+           "the one stage both its phases share, dfr_pipeline.py:212). Refused rather than "
+           "rendered, because dropping an adapter from a phase returns a clip of the right "
+           "size, frame count and sample rate. Owed by row LTX25-LORA-FUSION.");
+    }
+  }
+
   // ── the CHECKPOINT CLASS the pipeline can run (#1137) ─────────────────────
   //
   // THE PRODUCTION CALL SITE for row LTX25-CHECKPOINT-CLASS. Deleting this one

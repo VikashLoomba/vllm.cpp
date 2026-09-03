@@ -135,17 +135,19 @@ and not merely a smoke test.
 
 ## Reproduce this run
 
-You need one NVIDIA GB10 board, CUDA 13.0, and 20 GB of free local disk. The
-whole run takes about 90 minutes. The build and the two measurement legs take
-most of that time.
+Everything here runs on one GB10 board with CUDA 13.0 and about 20 GB of disk
+free. Set aside ninety minutes or so; the CUDA build eats most of it, and each
+measurement leg is another twenty.
 
-Read the [limitations](#limitations) before you quote any number from this
-procedure.
+If you are going to quote a number from this, read the
+[limitations](#limitations) as well. Three axes of the upstream comparison are
+not matched here, and one of them is a bug we have open.
 
 ### 1. Get the weights
 
-Download both checkpoints at the revisions this page pins. A repository name
-alone is not a pin, because a publisher can requantize a checkpoint in place.
+Both checkpoints are pinned by revision below, and it is worth pinning yours
+too. Publishers do requantize in place under an unchanged repository name, so a
+bare repo id can quietly get you different weights than the ones measured here.
 
 ```sh
 hf download Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw \
@@ -157,14 +159,15 @@ hf download Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw \
     --local-dir ./draft-dflash2-5.0bpw
 ```
 
-Compare the hashes against the values in [subject](#subject).
+Then check what you got against the hashes in [subject](#subject).
 
 ```sh
 sha256sum ./target-3.5bpw/*.safetensors ./draft-dflash2-5.0bpw/*.safetensors
 ```
 
-Copy both directories to local disk if you keep them on network storage. A
-model that you read over a network measures the network.
+If those directories live on a NAS or any other network mount, copy them to
+local disk before you run anything. Otherwise the run spends a good part of its
+time waiting on the filesystem instead of the GPU.
 
 ### 2. Build
 
@@ -176,14 +179,17 @@ cmake -S . -B build -G Ninja \
 cmake --build build -j 4 --target vllm-cli vllm-bench
 ```
 
-Set `-DVLLM_CPP_CUDA_ARCHITECTURES` to your own board. `121a` is GB10.
+`121a` is GB10. Change `-DVLLM_CPP_CUDA_ARCHITECTURES` if you are on something else.
 
-### 3. Make sure the model generates
+### 3. Check that it generates
 
-Run this step before you measure anything. A wrong trellis codebook produces a
-weight with the right distribution and no relation to the true one. Every shape
-check still passes, and the model writes fluent nonsense. Coherent output is
-therefore evidence, not a formality.
+Do this before you time anything.
+
+EXL3 stores weights as a trellis, and if the codebook resolves wrong you get
+weights with the right distribution and no relationship to the real ones. Every
+shape check still passes. The model still writes fluent English. It writes the
+wrong fluent English, and any throughput number you take in that state is
+worthless.
 
 ```sh
 build/examples/vllm-cli --model ./target-3.5bpw --device cuda \
@@ -191,14 +197,16 @@ build/examples/vllm-cli --model ./target-3.5bpw --device cuda \
     --max-tokens 16 --temperature 0 --seed 0
 ```
 
-The model writes ` Paris. The capital of Germany is Berlin. The capital of Italy
-is` and exits 0. The command reports `finish_reason=length`. The prompt is a
-plain completion, so the model does not emit an end-of-sequence token inside 16
-tokens.
+You should get ` Paris. The capital of Germany is Berlin. The capital of Italy
+is`, and an exit code of 0. It stops there because it hit the 16-token cap, which
+the `finish_reason=length` line tells you. This is a plain completion prompt with
+no chat template, so the model has no reason to emit an end-of-sequence token —
+it just keeps listing capitals.
 
 ### 4. Build the prompt set
 
-The benchmark reads the 164 HumanEval problems in the ShareGPT shape.
+The harness wants the 164 HumanEval problems in the ShareGPT shape, so convert
+them once.
 
 ```sh
 curl -L -O https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz
@@ -212,16 +220,18 @@ json.dump([{"conversations": [{"from": "human", "value": r["prompt"]},
           open("humaneval-sharegpt.json", "w"))'
 ```
 
-The `HumanEval.jsonl` file has sha256
+For reference, `HumanEval.jsonl` should hash to
 `1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2`.
 
 ### 5. Measure both arms
 
-`VT_DFLASH_PAGED=0` is required today. The paged draft route fails on the
-second run inside one process, which
-[#2274](https://github.com/mudler/vllm.cpp/issues/2274) tracks.
+`VT_DFLASH_PAGED=0` is not optional right now. With the paged draft route
+enabled, the first run finishes and the second one dies inside the same process
+with an illegal memory access. That is
+[#2274](https://github.com/mudler/vllm.cpp/issues/2274); it predates this
+checkpoint and it is still open.
 
-Run the target alone first.
+Target alone first.
 
 ```sh
 VT_DFLASH_PAGED=0 build/examples/vllm-bench --model ./target-3.5bpw \
@@ -229,7 +239,7 @@ VT_DFLASH_PAGED=0 build/examples/vllm-bench --model ./target-3.5bpw \
     --output-len 128 --temperature 0.6 --seed 0 --concurrency 1
 ```
 
-Then run the same binary with the draft.
+Then the same binary again, with the draft:
 
 ```sh
 VT_DFLASH_PAGED=0 build/examples/vllm-bench --model ./target-3.5bpw \
@@ -240,12 +250,14 @@ VT_DFLASH_PAGED=0 build/examples/vllm-bench --model ./target-3.5bpw \
                            "num_speculative_tokens": 7}'
 ```
 
-Run the two legs again in the same order. One board can drift between legs, and
-an interleaved pair separates a drift from an effect.
+Now run both legs again, in the same order. A board drifts over minutes, and
+running target-draft-target-draft lets you see whether a difference belongs to
+the arm or to the hour.
 
 ### 6. Read the result
 
-The report prints both counting conventions. This page quotes the first line.
+The report gives you two throughput lines, and they answer different questions.
+This page quotes the first one.
 
 ```text
 Mean per-stream decode rate (tok/s):       59.59
@@ -255,13 +267,14 @@ Draft tokens accepted:                     17841
 Acceptance rate (accepted/proposed):       0.58
 ```
 
-`Mean per-stream decode rate` is `1 / mean_tpot`, where `tpot` is
-`(latency - ttft) / (output_len - 1)`. It excludes the prefill.
-`Output (decode) token throughput` divides the same tokens by the whole run,
-so it includes the prefill.
+`Mean per-stream decode rate` is `1 / mean_tpot`, with `tpot` being
+`(latency - ttft) / (output_len - 1)`, so the prefill is out of it.
+`Output (decode) token throughput` divides the same tokens by the whole wall
+time, prefill included. Which one you want depends on what you are comparing
+against, and plenty of published figures do not say which they used.
 
-The acceptance counters come from the engine. Do not derive them from the
-throughput.
+The acceptance counters are read straight out of the engine. Do not try to back
+them out of the throughput.
 
 ### What to expect
 
@@ -270,19 +283,22 @@ throughput.
 | Target only | 16.6 to 16.8 tok/s |
 | Target and draft, `num_speculative_tokens: 7` | 59.4 to 59.6 tok/s |
 
-A difference under 1% between your two target legs is drift, not a result.
+Your two target legs should land within about 1% of each other. If they differ
+by less than that, you are looking at drift rather than at anything you changed.
 
 ### Change the draft budget
 
-`num_speculative_tokens` is the strongest single lever in this recipe. The
-drafter declares `block_size: 8`, and that value does not cap the budget. The
-loader takes the budget from the flag and prints the block size it resolved.
+`num_speculative_tokens` moves this number more than anything else you can set
+from the command line. The drafter's config declares `block_size: 8`, but that
+does not cap the verify budget — the loader takes the budget from your flag and
+prints what it resolved.
 
-Raise the value to 12 and read the `block=` line in the startup output. It
-reports 13, which is the budget plus one.
+Try 12. Look for `block=13` in the startup output, which is the budget plus one
+and tells you the flag actually took.
 
 The [draft budget section](#the-draft-budget-is-a-real-lever-and-our-knee-is-not-theirs)
-above records what each budget produced here.
+above has what each value produced on this box, including where it stops
+helping.
 
 ## Limitations
 

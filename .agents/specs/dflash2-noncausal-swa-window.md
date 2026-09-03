@@ -68,11 +68,16 @@ kernel: `DflashBlockPagedMaskOf`
 **The defect is invisible below the window and grows above it**, which is the
 measured shape and is why no short-context gate could see it:
 
-| context | keys upstream admits per query row | keys we admit | extra |
+Counted for the LAST query row of a 1+16 draft block, `ii = C + 16`, against a
+key axis of `C + 17`. The symmetric window is `[ii-2047, ii+2047]`, and its
+right half falls off the end of that axis, so what actually binds is the left
+bound alone:
+
+| context C | keys upstream admits | keys we admitted | extra |
 |---:|---:|---:|---:|
-| 324 | all of them | all of them | **none — identical** |
-| 2,307 | 4,095 | 2,323 | none binding yet, a few hundred rows clipped |
-| 8,159 | 4,095 | 8,175 | **~4,080 keys upstream masks** |
+| 324 | 341 (the whole axis) | 341 | **none — identical** |
+| 2,307 | 2,064 | 2,324 | 260, about 11% |
+| 8,159 | 2,064 | 8,176 | **6,112 keys upstream masks, 75% of the attended mass** |
 
 At 324 the whole sequence lies inside +/-2047 of every query row, so the window
 is a no-op and the arm is correct by accident. At 2,307 it barely binds and

@@ -9,10 +9,12 @@
 #include <fstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "vllm/multimodal/hasher.h"
+#include "vllm/multimodal/pil_resize.h"
 #include "vt/dtype.h"
 
 namespace vllm::multimodal {
@@ -216,27 +218,25 @@ ImageKwargs Dots3NoteImageProcessor::ProcessImage(const uint8_t* rgb,
   const std::array<int64_t, 2> rs =
       Dots3NoteResizedSize(height, width, f, cfg_.min_pixels, cfg_.max_pixels);
   const int64_t rh = rs[0], rw = rs[1];
+
+  // THE RESIZE (`image.resize((resized_w, resized_h),
+  // Image.Resampling.BICUBIC)`, `processor.py:174` @ `9035151d6`). Upstream
+  // ALWAYS resizes, and `factor = patch_size * merge_size` is 28 on the
+  // released checkpoint, so an image that clears the identity below is the rare
+  // case rather than the ordinary one: this call is the served path, not a
+  // fallback. W6c, issue #2537.
+  //
+  // `PilResizeBicubicRgb` is PIL's resampler and NOT a four-tap cubic — see
+  // `pil_resize.h` for why the difference is structural on a downscale. Getting
+  // it wrong here would move every patch, and §6.4 records that this row has no
+  // token-exact denominator that could catch it.
+  //
+  // NOT resizing when the size already matches is upstream's own short circuit
+  // and keeps the conformant path byte-identical to what W6a served.
+  std::vector<uint8_t> resized;
   if (rh != height || rw != width) {
-    // A genuine bicubic resize (`Image.Resampling.BICUBIC`,
-    // `processor.py:174`). NAMED, exactly as the Qwen3-VL processor beside this
-    // one names it: patchifying at the wrong grid would change the placeholder
-    // count and serve a well-shaped wrong prompt.
-    //
-    // THIS IS A CAPABILITY GAP, NOT A CORNER. `factor` is
-    // `patch_size * merge_size`, which on the released checkpoint is 28, and
-    // upstream ALWAYS resizes — so once W6b lifts the MoE ViT refusal, almost
-    // no real image clears this. It is owed by W8 (the MM front end brick that
-    // owns the processor), recorded under `## Owed` in
-    // `.agents/specs/dots3-note.md`, and tracked by issue #2537. Both this
-    // comment and the message below claimed that record before it existed; the
-    // fresh review of #2523 found the claim false and this is the repair.
-    throw std::runtime_error(
-        "Dots3NoteImageProcessor: image requires resize (" +
-        std::to_string(width) + "x" + std::to_string(height) + " -> " +
-        std::to_string(rw) + "x" + std::to_string(rh) +
-        "); the bicubic resize path is not ported (W6a uses conformant "
-        "images). Owed by W8 and tracked by issue #2537; see "
-        ".agents/specs/dots3-note.md `## Owed`.");
+    resized = PilResizeBicubicRgb(rgb, height, width, rh, rw);
+    rgb = resized.data();
   }
 
   const int64_t grid_h = rh / patch;
@@ -270,7 +270,10 @@ ImageKwargs Dots3NoteImageProcessor::ProcessImage(const uint8_t* rgb,
   out.pixel_values_f32.resize(static_cast<size_t>(num_patches * feat));
   out.pixel_values_bf16.resize(static_cast<size_t>(num_patches * feat));
 
-  const int64_t rowstride = width * 3;  // HWC uint8 source stride
+  // The RESIZED width, not the requested one: `rgb` points at the resampled
+  // buffer whenever the two differ, and reading it at the source stride would
+  // shear the image while leaving every shape and every count valid.
+  const int64_t rowstride = rw * 3;  // HWC uint8 stride of the patchified image
   // The column index is the same under both row orders:
   //   k = ((c * tp + t) * patch + ph) * patch + pw
   // because both transposes end `..., C, tp, ph, pw` (`processor.py:196`,

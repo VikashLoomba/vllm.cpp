@@ -5680,6 +5680,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // least half of this render's `decode.video.chunk` seconds.
   size_t chunk_handle =
       phase::PhaseLog::Instance().Open("decode.video.chunk", /*span=*/false);
+  // A24 wave 3 (#2786). The decoder's INPUT width, taken here rather than in the
+  // sink because this is the last point the latent exists as itself. It is the
+  // live control that makes the sink's counter mean something: the two are the
+  // same fixture, in the same render, one statement apart.
+  im.trace.vae_latent_not_bf16 = CountWiderThanBf16(video_latent_volume);
+  im.trace.vae_latent_values = static_cast<int64_t>(video_latent_volume.size());
   Ltx2VideoDecodeStreaming(
       im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc, video_lf,
       video_lh, video_lw, &decode_noise,
@@ -5687,6 +5693,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       [&](const Ltx2VideoChunk& chunk) {
         phase::PhaseLog::Instance().Close(chunk_handle);
         phase::PhaseLog::Instance().Close(decode_handle);
+        // A24 wave 3 (#2786): the decode's OUTPUT width, on the one production
+        // route into the decoder. Summed over chunks, because the tiled decode
+        // emits one per temporal group and the last one is not the render.
+        im.trace.vae_decode_not_bf16 += CountWiderThanBf16(chunk.frames.data);
+        im.trace.vae_decode_values += static_cast<int64_t>(chunk.frames.data.size());
         phase::Scope write_phase("artifacts.frames");
         MiniMaxH3VideoFrameShape shape;
         shape.channels = chunk.frames.channels;

@@ -7013,6 +7013,52 @@ TEST_CASE("ltx2 video: a typed PROMPT conditions the render") {
   CHECK(fox.trace.connector_audio_not_bf16 == 0);
 }
 
+TEST_CASE("ltx2 video: the VAE DECODE runs at upstream's dtype") {
+  // A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, issue #2786.
+  //
+  // Upstream constructs `VideoDecoder` with the ONE pipeline dtype
+  // (`distilled.py:146-149`, `self.dtype` at `:148`) and its forward casts the
+  // latent to the weights' dtype on entry and back on exit
+  // (`conv_video_decoder.py:283-284, 357`). It carries no float32 pin of the kind
+  // the audio vocoder has (`vocoder.py:575-580`), which is the one place in this
+  // pipeline where f32 is argued rather than owed.
+  //
+  // THE COUNTER IS SAMPLED IN THE `Ltx2VideoDecodeStreaming` SINK, which is the
+  // one production route into the decoder. A unit test that builds
+  // `Ltx2ConvVideoDecode` itself would prove the class works and never that
+  // anything reaches it (AGENTS.md `## Nothing lands dead`).
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  const Rendered fox = RenderPrompt(mp, ws.root + "/p_vaedtype", "a b c");
+
+  // 1. THE FIXTURE CARRIES SUB-BF16 DETAIL INTO THE DECODE, measured rather than
+  //    assumed. Without this the next check goes quietly green on any fixture
+  //    whose numbers happen to land on bf16 grid points -- which is exactly the
+  //    hole A24 sat in for the whole tree. The latent is the decoder's own input
+  //    in this same render, produced by the f32 CPU reference DiT arm, so it is a
+  //    LIVE wide stream rather than an argument about one.
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count: a floor
+  //    below the real number is a mute switch. The measured value is printed
+  //    beside it so a reader can see the headroom.
+  INFO("latent into the decode, wider than bf16: "
+       << fox.trace.vae_latent_not_bf16 << " of " << fox.trace.vae_latent_values);
+  REQUIRE(fox.trace.vae_latent_values > 0);
+  CHECK(fox.trace.vae_latent_not_bf16 > fox.trace.vae_latent_values / 2);
+
+  // 2. AND THE DECODE ITSELF PRODUCES ONLY bf16-REPRESENTABLE PIXELS.
+  //
+  //    NOTHING ELSE ON THIS PATH CAN SEE THAT. The frame digests detect CHANGE
+  //    and the absmax detects COLLAPSE; both are computed over the same f32
+  //    container on either arm and are identical in shape whichever width filled
+  //    it. AGENTS.md names the blind spot exactly -- "a token gate cannot detect a
+  //    dtype that is too wide."
+  INFO("VAE decode output, wider than bf16: "
+       << fox.trace.vae_decode_not_bf16 << " of " << fox.trace.vae_decode_values);
+  REQUIRE(fox.trace.vae_decode_values > 0);
+  CHECK(fox.trace.vae_decode_not_bf16 == 0);
+}
+
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {
   // The prompt path is a DIFFERENT caller of `RunConnector` from the
   // prompt-embeds path, so "the connector is wired" proved for one proves

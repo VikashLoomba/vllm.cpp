@@ -847,7 +847,25 @@ class AgentRecordMutationTests(unittest.TestCase):
         # artifact, its own bit widths and its own owed GEMV arm, none of which
         # `QUANT-EXL3`'s cells can hold without saying two things at once.
         #
-        # Listing both by name keeps the force of the original: a THIRD
+        # `QUANT-EXL3-PERF` (#2570) is the THIRD, and it is admitted on a
+        # different ground from the second. It is not a codebook, a width or a
+        # layout: it is the only row on a different AXIS. `QUANT-EXL3` and
+        # `QUANT-EXL3-MUL1` are correctness rows and their cells say so -- they
+        # answer "does this width RUN" -- while this one answers "what does it
+        # COST", which is the question #2570 asked and no row owned. Its `P`
+        # cell is the one cell neither sibling can carry: `QUANT-EXL3-MUL1`
+        # reads `E` `-` and `P` `-` precisely BECAUSE it ports the format and not
+        # the benchmark, and overwriting those to hold a throughput verdict would
+        # make one row say two things about two different measurements.
+        #
+        # The concrete surface is also disjoint. This row owns
+        # `Exl3GemvArmInstantiated` and `GemvKernel` -- the `m <= 8` GEMV arm set
+        # and its envelope -- which `QUANT-EXL3-MUL1`'s own claim file EXCLUDES
+        # by name ("EXCLUDES the GEMV kernel itself"). A row whose scope another
+        # row explicitly excluded is not a sibling scheme row; it is the owner
+        # that exclusion implies.
+        #
+        # Listing all three by name keeps the force of the original: a FOURTH
         # `QUANT-*EXL3*` row still fails here and has to argue for itself in this
         # comment, which is exactly what a rank-sliced-layout row could not do.
         # Scoped to `QUANT-` deliberately -- `MODEL-DSV4-EXL3` also carries EXL3
@@ -856,7 +874,7 @@ class AgentRecordMutationTests(unittest.TestCase):
         siblings = [row for row in rows
                     if row.item_id.startswith("QUANT-") and "EXL3" in row.item_id]
         self.assertEqual(sorted(row.item_id for row in siblings),
-                         ["QUANT-EXL3", "QUANT-EXL3-MUL1"])
+                         ["QUANT-EXL3", "QUANT-EXL3-MUL1", "QUANT-EXL3-PERF"])
 
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.

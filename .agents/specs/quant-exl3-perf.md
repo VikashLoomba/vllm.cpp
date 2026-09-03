@@ -264,6 +264,20 @@ of the direct entry point.
   Upstream answers this with a per-`K` compilation-unit split
   (`comp_units/exl3_comp_unit_K_cbX.cu`); this tree has one unit and the split
   stays owed by `QUANT-EXL3-MUL1`, which argued it first.
+- **D4. The `QUANT-*EXL3*` sibling ratchet is widened by NAME, not by
+  predicate.** `tests/scripts/test_agent_record.py` pins the exact set of
+  `QUANT-` rows carrying `EXL3`, and it went RED on this row before its argument
+  was written, which is the gate working. The argument is that this row sits on
+  a different AXIS rather than being a third scheme: the two siblings answer
+  "does this width RUN" and this one answers "what does it COST", and
+  `QUANT-EXL3-MUL1`'s own claim file EXCLUDES the GEMV by name, so this row is
+  the owner that exclusion implies. A FOURTH row still fails there and must
+  argue for itself.
+- **D5. `docs/FEATURES.md` is edited, `docs/BENCHMARKS.md` is not.** The GEMV
+  arm set is a quantization surface and its row said the mul1 GEMV was owed, so
+  that sentence is now false and is repaired. No benchmark ID is added, because
+  no number exists yet; the cell says the measurement is PENDING rather than
+  omitting it.
 - **R3. Measuring on a box that crashes.** `dgx:gpu0` has crashed roughly hourly
   under long ladders. The job prints results incrementally and orders the A/B
   ahead of the mutations, so a crash costs the cheapest evidence rather than the

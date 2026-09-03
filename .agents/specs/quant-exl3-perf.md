@@ -234,6 +234,27 @@ also performs, so it gates a typo in the module table and not the envelope. The
 gate on the envelope is the two-sided threshold assertion beside it, and H1 is
 the evidence that it bites.
 
+### The arm labels had to be TYPED, and the trap is executable in this tree
+
+The four-leg device case is parameterised, so each `MESSAGE` carries the arm's
+label — and that label is what the lease's evidence gets read by. The first cut
+declared it `const char*`. Under doctest 2.5.2 that decays to BOOL:
+
+```
+$ g++ -std=c++20 -Ithird_party dtprobe.cpp -o dtprobe && ./dtprobe -s
+dtprobe.cpp:7: MESSAGE: RAW   -> 1
+dtprobe.cpp:8: MESSAGE: TYPED -> (4,2) wide
+  logged: raw := 1
+          typed := (4,2) wide
+```
+
+`raw` and `typed` hold the same characters. A string LITERAL streams correctly,
+which is why slice A's `MESSAGE("cb ", codebook, …)` was fine and hid the
+problem; a decayed pointer does not. Four tier-3c numbers labelled `1`, `1`, `1`
+and `1` would have been attributed by assumed loop order, which is how three
+measured values were once rotated across three axes in this repository. The
+field is `std::string`, and the probe above is why rather than a precaution.
+
 ### SLICE B, device arm — PENDING on `thor:gpu0`
 
 Submitted 2026-09-03 under an `rc` lease, queued behind two other jobs on that

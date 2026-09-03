@@ -306,7 +306,14 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
   struct Arm {
     int bits, cb;
     int64_t k, n;
-    const char* what;
+    // `std::string`, NOT `const char*`. Under doctest 2.5.2 a `const char*`
+    // streamed into `MESSAGE` or `CAPTURE` decays to BOOL and prints `1`, so a
+    // parameterised suite's per-arm diagnostic silently stops naming the arm --
+    // and every number read off it is then attributed by assumed loop order.
+    // That has already rotated three measured values across three axes in this
+    // tree. The label is what the lease's evidence is read by, so it is typed
+    // to print.
+    std::string what;
   };
   const Arm kArms[] = {
       {3, 1, kW2K, kW2N, "(3,1) narrow"},

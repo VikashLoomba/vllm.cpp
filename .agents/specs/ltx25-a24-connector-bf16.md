@@ -613,9 +613,11 @@ table above holds `Ltx2ConnectorRmsNormRows`, the connector's WEIGHTLESS residua
 norm. The q/k norms are `torch.nn.RMSNorm(inner_dim, eps=norm_eps)`
 (attention.py:505-506), they take the same constant in the same forward, and they
 reach it through a DIFFERENT function — `Ltx2RmsNormRows` in `ltx2.cpp`. Narrowing
-that epsilon to `bf16(1e-6)` at `kBF16` left every assertion green; setting it to
-`1.0` red ten across all five arms, so the site was live and reached and the arm
-goldens simply could not resolve it.
+that epsilon to `bf16(1e-6)` at `kBF16` left `test_ltx2_pipeline` at
+`4018 | 4018 passed` and `test_ltx2_video` at `4951 | 4951 passed`. The control,
+setting it to `1.0`, reds 11 — ten across all five connector arms plus the new
+probe — so the site was live and reached, and the arm goldens simply could not
+resolve it.
 
 The arithmetic did NOT change; the probe did. `section_connector_bf16`'s small-row
 probe grew a weighted arm on the same 2^-13 rows with a bf16 gain and the same

@@ -2831,10 +2831,11 @@ TEST_CASE("ltx2 the connector's bf16 rms_norm takes the f32 epsilon, not the nar
   // in the SAME forward on the SAME constant -- `Ltx2ConnectorForward` assigns
   // `Ltx2AttentionArgs::norm_eps = kLtx2ConnectorRmsNormEps` -- and they reach it
   // through `Ltx2RmsNormRows`, which had no probe of its own. Measured on this
-  // tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 left all 722 ltx2
-  // assertions green, while setting it to 1.0 reds ten of them on all five arms.
-  // So the site is live and reached, and the arm goldens cannot resolve it --
-  // exactly the hole this case exists to close for the weightless form.
+  // tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 left this binary at
+  // `4018 | 4018 passed` and `test_ltx2_video` at `4951 | 4951 passed`, while
+  // setting it to 1.0 reds 11 -- ten across all five connector arms plus this
+  // probe. So the site is live and reached, and the arm goldens cannot resolve
+  // it -- exactly the hole this case exists to close for the weightless form.
   std::vector<float> gain(std::begin(vllm_test::kLtx2ConnBf16EpsGain),
                           std::end(vllm_test::kLtx2ConnBf16EpsGain));
   REQUIRE(gain.size() == static_cast<size_t>(width));

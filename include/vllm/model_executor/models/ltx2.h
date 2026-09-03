@@ -520,12 +520,13 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
 // block and nothing else defines it -- and it is declared here for the same
 // reason `Ltx2ConnectorRmsNormRows` is declared in ltx2_connector.h: `eps` lives
 // in it, and at bf16 the difference between `1e-6` and `bf16(1e-6)` is INVISIBLE
-// in any tensor built from rows of ordinary magnitude. Measured: narrowing this
-// epsilon leaves every one of this suite's 722 ltx2 assertions green, while
-// setting it to 1.0 reds ten of them -- so the site is live and reached, and an
-// arm golden simply cannot resolve it. The probe that can needs rows near
-// 2^-13, which no forward fixture produces, so it calls this directly. A
-// production path, not a test hook.
+// in any tensor built from rows of ordinary magnitude. MEASURED on this tree:
+// narrowing this epsilon at kBF16 left `test_ltx2_pipeline` at
+// `4018 | 4018 passed` and `test_ltx2_video` at `4951 | 4951 passed`, while
+// setting it to 1.0 reds 11 -- ten across all five connector arms plus the probe
+// below. So the site is live and reached, and an arm golden simply cannot
+// resolve it. The probe that can needs rows near 2^-13, which no forward fixture
+// produces, so it calls this directly. A production path, not a test hook.
 void Ltx2RmsNormRows(const float* in, const float* weight, float* out, int64_t rows,
                      int64_t width, double eps, vt::DType out_dtype = vt::DType::kF32);
 

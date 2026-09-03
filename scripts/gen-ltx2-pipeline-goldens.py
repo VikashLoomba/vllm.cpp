@@ -1688,10 +1688,12 @@ def section_connector_bf16(out) -> None:
     # in the same forward on the same constant -- `Ltx2ConnectorForward` hands
     # `Ltx2AttentionArgs::norm_eps` the same `kLtx2ConnectorRmsNormEps` -- and
     # they went through a DIFFERENT function with no probe of its own. Measured on
-    # the tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 leaves all 722
-    # ltx2 assertions green, while setting it to 1.0 reds ten of them across all
-    # five arms. The site is live and reached; the arm goldens simply cannot
-    # resolve a difference eight orders below bf16's resolution.
+    # the tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 left
+    # `test_ltx2_pipeline` at 4018 | 4018 passed and `test_ltx2_video` at
+    # 4951 | 4951 passed, while setting it to 1.0 reds 11 -- ten across all five
+    # connector arms plus this probe. The site is live and reached; the arm
+    # goldens simply cannot resolve a difference eight orders below bf16's
+    # resolution.
     #
     # Same rows, same scale, same refuse-if-not-separating guard. The gain follows
     # this suite's own rule for a 1-D `.weight` -- an affine norm gain centred on

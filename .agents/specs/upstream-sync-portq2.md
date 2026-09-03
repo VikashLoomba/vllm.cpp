@@ -14,7 +14,17 @@ Parent: [#2611](https://github.com/mudler/vllm.cpp/issues/2611), which owns the
 
 ## Now
 
-PENDING — filled in when the tranche is read.
+**Done.** 40 of 40 re-derived: **4 ALREADY_SATISFIED, 9 REAL_GAP,
+27 NOT_APPLICABLE** (23 `surface-absent`, 4 `inert`). **31 of the 40 disagree
+with the recorded PORT-NOW disposition.** Thirteen issues carry the work: nine
+for the gaps, four for the deferred entries. **Nothing was executed** — no build,
+no test run, no GPU — so every label is a static reading of source and
+`ALREADY_SATISFIED` means the code implements the behaviour, not that a gate
+observed it.
+Report: [`../sync/2026-09-03-portq2.md`](../sync/2026-09-03-portq2.md).
+
+The pin did **not** advance and nothing read here is a reason to move it. The
+active parity pin remains `5559679229bc961848b121ccdeaa8fa5d79bec98`.
 
 ## 1. Scope
 
@@ -138,3 +148,66 @@ printed again by this wave's operator before they are written down.
 - [#2524](https://github.com/mudler/vllm.cpp/issues/2524), whose §13 worked list
   this wave re-verifies for the four items inside this tranche and does not
   discharge.
+- The nine real gaps, each on its own issue with an owning row that resolves in
+  `roadmap_v1.md` or a `*-matrix.md`:
+  [#2656](https://github.com/mudler/vllm.cpp/issues/2656) `ENG-RUNNER-MODELSHAPE`,
+  [#2657](https://github.com/mudler/vllm.cpp/issues/2657) `SPEC-DSPARK-BLOCK-SIZE-GUARD`,
+  [#2658](https://github.com/mudler/vllm.cpp/issues/2658) `SERVE-COMPLETION-LONGTAIL`,
+  [#2659](https://github.com/mudler/vllm.cpp/issues/2659) `QUANT-FP8-GENERIC`,
+  [#2660](https://github.com/mudler/vllm.cpp/issues/2660) `KV-MAMBA-ALIGN`,
+  [#2661](https://github.com/mudler/vllm.cpp/issues/2661) `QUANT-GGUF-CPU-THREADPOOL`,
+  [#2662](https://github.com/mudler/vllm.cpp/issues/2662) `KV-OFFLOAD`,
+  [#2663](https://github.com/mudler/vllm.cpp/issues/2663) `KV-PREFIX-MATCH-UNIT`,
+  [#2664](https://github.com/mudler/vllm.cpp/issues/2664) `LOAD-CONFIG-SURFACE`.
+- The four deferred (`inert`) entries, each with its gate named and an owner:
+  [#2665](https://github.com/mudler/vllm.cpp/issues/2665) `ENG-MM-INPUT-PIPELINE`,
+  [#2666](https://github.com/mudler/vllm.cpp/issues/2666) `KERNEL-ATTN-MLA-SPARSE`,
+  [#2667](https://github.com/mudler/vllm.cpp/issues/2667) `MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm`,
+  [#2668](https://github.com/mudler/vllm.cpp/issues/2668) `SPEC-ACCEPT-VARIANTS`.
+- **Three committed records that the PIN ADVANCE will falsify**, correct today and
+  therefore not edited here: `.agents/porting.md:78` (ModelOpt fp8 `out_dtype`),
+  the two `config/cache.py:111` citations for `calculate_kv_scales`, and
+  `.agents/specs/dflash2-spec-decode.md`'s recorded draft-logits cache layout.
+  Report §9 carries them; the third also rides on
+  [#2668](https://github.com/mudler/vllm.cpp/issues/2668).
+
+## Outcome
+
+**What was measured.** The tranche derivation reproduced both published counts
+(`1465` range commits, `290` PORT-NOW) before any entry was read, and offsets 1
+and 40 of the same ordering reproduced PORTQ-1's published endpoints
+`3f1d40960f` and `b49eaf205a` — a third check that this tranche continues that
+one rather than a differently-ordered list. This wave's operator independently
+derived sixteen of the forty before the readers returned, and re-read every
+`file:line` behind all nine real gaps and both prior-triage re-verifications. No
+citation named a symbol that does not exist; one anchor was off by one line and
+is corrected in the report.
+
+**What the method caught in itself.** An operator probe used
+`grep -rniE "a\|b"`, where ERE reads `\|` as a LITERAL pipe, and it returned `0`
+for a symbol this tree plainly carries. It was caught only because the zero
+contradicted a citation PORTQ-1 had published. A zero from a malformed pattern is
+indistinguishable from a zero from an absent symbol, which is PORTQ-1's
+retraction in a new costume: the instrument, not the tree, produced the absence.
+
+**What was rejected, and why.** Treating 9/40 as *the* rate for the remaining
+210. It is higher than PORTQ-1's 6/40 and #2524's 11/63, and all three are
+contiguous or overlapping populations rather than independent draws — four of
+this tranche's nine gaps ARE #2524's own §13 items. The report states 45-60 as an
+estimate from three samples and gives all four reasons not to trust the point
+value, including that three of the nine are `yes (part)`.
+
+**One label was adjudicated against its reader.** `[41]` came back `REAL_GAP` at
+~150-250 lines "dominated by vendoring SHA-2". A port whose bulk is work the
+commit does not contain, guarded by an algorithm this tree does not implement, is
+`inert` under §2.2's own definition. The disagreement is recorded in the report
+rather than absorbed, because the reader's facts were right and only the
+label boundary was at issue.
+
+**The finding worth carrying to the next tranche.** Reading the commit is not
+enough; read the TARGET HEAD. `[55]`'s commit deletes a DSpark refusal, and
+carry-over C9 says a later commit re-lands the removal — but at `e126687a9a` a
+NARROWER, Qwen3-Omni-scoped equality check stands in its place, reading
+`block_size` before `dspark_block_size`, which is this tree's own widened
+fallback order arrived at independently. Sizing that deletion from the commit
+alone would have produced the wrong unit of work.

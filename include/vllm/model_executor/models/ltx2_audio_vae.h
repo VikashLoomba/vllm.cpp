@@ -89,7 +89,15 @@ struct Ltx2VaeWeights {
   // f32 arm, rather than returning an empty vector a caller would read as a
   // zero-length tensor.
   const std::vector<uint16_t>& GetBf16(const std::string& name) const;
-  bool Has(const std::string& name) const { return tensors.count(name) != 0; }
+  // ARM-AWARE, like `Get` and `Count` and unlike its first form. `Has` answers
+  // "does this bag carry that tensor", and a bag whose whole content is in
+  // `bf16` answered NO to every name it holds. No caller on the LTX-2.5 path
+  // reaches it today, which is exactly why it had to be fixed before one does:
+  // a presence test that is false for a present tensor is a silently-skipped
+  // load, not a refusal. `HasBf16` stays the arm-SPECIFIC question.
+  bool Has(const std::string& name) const {
+    return dtype == vt::DType::kBF16 ? bf16.count(name) != 0 : tensors.count(name) != 0;
+  }
   bool HasBf16(const std::string& name) const { return bf16.count(name) != 0; }
   // Elements of one tensor, whichever arm holds it.
   size_t Count(const std::string& name) const;

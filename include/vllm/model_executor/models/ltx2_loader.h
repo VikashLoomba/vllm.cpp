@@ -780,9 +780,17 @@ Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
 // tensor of the family may be left over. A config that says 2 layers against a
 // file carrying 8 is refused by name here rather than binding the first two and
 // rendering.
+//
+// `compute_dtype` has NO DEFAULT, and that is deliberate. It selects between the
+// arm upstream runs (bf16, distilled.py:109) and the WIDER f32 parity arm the
+// five connector goldens are measured against. A default of either one makes the
+// other arrive by silence: with `kF32` a new call site would get twice the bytes
+// and a precision upstream does not have, and the only instrument that would
+// notice is the prompted-render path's `connector_video_not_bf16` counter. The
+// caller knows which arm it wants; it says so.
 Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
                                         const Ltx2ConnectorConfig& config,
-                                        vt::DType compute_dtype = vt::DType::kF32);
+                                        vt::DType compute_dtype);
 
 // `__metadata__["model_version"]` ("2.5.0"), which is what
 // `detect_model_version` reads to pick a recipe (ltx-pipelines

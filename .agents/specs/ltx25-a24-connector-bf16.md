@@ -130,11 +130,22 @@ shape, which wave 1's bf16 `rsqrt` was not: isolating each of 512 rows and
 re-normalizing it alone reproduces the batched answer on **512 of 512**.
 
 `torch.nn.RMSNorm` WITH a weight (the q/k norms) is bit-equal to the same
-expression times the f32-widened weight, 0 of 491 520. The alternative — round the
-normalized value to bf16 and then multiply — is NOT separable from it on that
-sweep (0 mismatches either way), so this row implements the fused f32 form,
-which is `F.rms_norm`'s own structure, and records that the probe could not part
-the two rather than claiming it did.
+expression times the f32-widened weight, 0 of 491 520.
+
+> **RETRACTED, 2026-09-03.** This paragraph originally said the alternative —
+> round the normalized value to bf16 and THEN multiply by the gain — was "NOT
+> separable from it on that sweep (0 mismatches either way)", and that reasoning
+> is what justified not gating the alternative. Executed, it separates cleanly.
+> Measured on this branch with the suite's own 1-D `.weight` fixture at width 24:
+> upstream against the fused form **0**, against round-then-multiply **12 647 of
+> 49 152** at ordinary magnitude and **3 166 of 12 288** at the probe's 2^-13
+> rows. The sweep that reported 0 either way did not measure what this sentence
+> claimed. What actually holds is the first sentence alone: upstream is the FUSED
+> f32 form, which is `F.rms_norm`'s own structure, and the round-then-multiply
+> alternative is a distinguishable and wrong one. It is now emitted as a second
+> rejected hypothesis beside upstream's answer in the weighted epsilon probe
+> (`kLtx2ConnBf16EpsWeightedRoundThenMul`), so the suite asserts the difference
+> rather than recording that it could not see one.
 
 ### 4.2 The epsilon is the f32 `1e-6`, and it only shows on SMALL rows
 
@@ -282,9 +293,14 @@ no rounding, so neither can silently become the other.
 * the register table is used as stored, and the output of the substitution is
   bf16-valued (§4.7);
 * the RoPE tables are computed as today and narrowed (§4.4);
-* every `rms_norm` widens to f32, accumulates the mean square in f32, adds the
-  f32 `1e-6`, and rounds once (§4.1, §4.2) — replacing the f32 arm's f64
-  accumulator, which is a deliberate difference and is what §4.1 measured;
+* every `rms_norm` widens to f32, adds the f32 `1e-6` — not `bf16(1e-6)` — and
+  rounds the result once (§4.1, §4.2). **The mean-square accumulator STAYS f64 on
+  both arms**, which is the opposite of what this line predicted before the work
+  ran: the branch measured `torch.mean` to be a BLOCKED f32 reduction that an
+  exact f64 sum approximates far better than a same-width sequential one (11 000
+  mismatches against 24 at the shipped width 3840). See `## Outcome`, "What §4 got
+  right, and the one thing §7 got wrong", for the table and
+  `ltx2_connector.h:157-161` for the shipped rule;
 * attention and the feed-forward narrow at the points §4.3, §4.5, §4.6 and §4.8
   name;
 * both residual adds round (§4.8);
@@ -384,10 +400,13 @@ any case that needs it records its measured margin beside it.
 * **bf16 is lossy and this row makes the render less precise than it was.** That
   is the point: upstream's answer is the bf16 one. The f32 arm stays reachable and
   gated.
-* **The reduction escape changes.** The f32 arm accumulates the norm's sum in f64
-  (`ltx2_connector.cpp`, the L3 precedent). §4.1 measured that upstream's bf16
-  path is an f32 accumulation, so the bf16 arm uses f32 — a deliberate difference
-  between the arms, recorded because it looks like an inconsistency.
+* **The reduction escape was expected to change, and it did NOT.** This risk was
+  written predicting that the bf16 arm would accumulate the norm's sum in f32
+  because upstream's `torch.mean` does. Measured, it is wrong: `torch.mean` is a
+  blocked f32 reduction, and the f32 arm's existing f64 accumulator
+  (`ltx2_connector.cpp`, the L3 precedent) reproduces it far better than a
+  same-width sequential loop. **Both arms keep the f64 sum.** See `## Outcome`,
+  "What §4 got right, and the one thing §7 got wrong".
 * **No real-weights render.** This row gates the arithmetic against upstream
   executed on CPU at reduced dimensions. A full-render token gate on the shipped
   checkpoint needs a GPU lease and is owed.
@@ -556,6 +575,88 @@ the lines under it, and `test_ltx2_video`'s own anchor gate caught it and printe
 the replacement. Recorded because it is the third time this file's line anchors
 have drifted inside one pull request, and because it is why §3 above cites a
 `grep -c` on a call string instead of a line number.
+
+### What the fresh review found, and what the repairs measured
+
+Three findings were required and four more were applied. All of them are in the
+branch; none of them was re-litigated.
+
+**F1 was a correctness defect on the shipped branch, not a gate gap.**
+`Ltx2ConnectorForward` narrowed the caller's stream inside its `else` only, so
+the `num_learnable_registers > 0` branch — the SHIPPED one, because the
+checkpoint declares 128 — handed the first transformer block whatever width the
+caller carried. The substitution replaces only the padded rows and copies the
+kept ones verbatim, so the comment claiming both sides of the select were already
+bf16 was true of the registers and false of everything else. It is reachable:
+`Ltx2VideoEngine::Load` and `GenerateAudioOnly` pass `RunConnectorFromFile` the
+output of `ReadF32File`, an arbitrary user file. The tower path escaped only
+because wave 1 makes the tower output bf16-valued, which is an invariant enforced
+in a different component.
+
+No case here could see it, because every bf16 golden is emitted from
+`hidden.to(bf16)` and a missing narrowing over a bf16-valued input is an
+identity. The new case perturbs that fixture by a QUARTER of a bf16 ulp —
+`x * (1 + 2^-10)` against the format's own `2^-8` — and asserts the forward
+answers exactly as it does on the pre-narrowed stream:
+
+| arm | before the repair | after |
+|---|---|---|
+| Split (4 registers) | `CHECK( 0.015625 == 0 )` | `0` |
+| NoRegisters | `0` | `0` |
+
+The `NoRegisters` arm is in the case so the pair says WHICH branch moved. The
+narrowing is an identity over the substituted register values, so the four
+register arms stay bit-exact against upstream after it.
+
+**F2: the q/k RMSNorm's epsilon was reached and ungated.** Mutation C in the
+table above holds `Ltx2ConnectorRmsNormRows`, the connector's WEIGHTLESS residual
+norm. The q/k norms are `torch.nn.RMSNorm(inner_dim, eps=norm_eps)`
+(attention.py:505-506), they take the same constant in the same forward, and they
+reach it through a DIFFERENT function — `Ltx2RmsNormRows` in `ltx2.cpp`. Narrowing
+that epsilon to `bf16(1e-6)` at `kBF16` left every assertion green; setting it to
+`1.0` red ten across all five arms, so the site was live and reached and the arm
+goldens simply could not resolve it.
+
+The arithmetic did NOT change; the probe did. `section_connector_bf16`'s small-row
+probe grew a weighted arm on the same 2^-13 rows with a bf16 gain and the same
+refuse-if-not-separating guard. Measured by the generator at width 24:
+
+| row scale | upstream vs f32-eps | upstream vs bf16-eps | of |
+|---|---|---|---|
+| 2^-13 | **0** | 1831 | 12 288 |
+| 2^-8 | **0** | 62 | 12 288 |
+| 2^-2 | **0** | 0 | 12 288 |
+
+Re-running the narrowing mutation with the probe in place: `test_ltx2_pipeline`
+goes from `4018 | 4018 passed | 0 failed` to
+`4018 | 4016 passed | 2 failed`, and the two are the new probe's own —
+`CHECK( 0.00195312 == 0 )` and `CHECK( 0 > 0 )` — with every other assertion,
+`test_ltx2_video` included, still green. That is the literal before and after:
+without these two assertions the mutation was invisible.
+
+`Ltx2RmsNormRows` is declared in `ltx2.h` for this, on the same argument
+`ltx2_connector.h` already makes for `Ltx2ConnectorRmsNormRows`: it is
+`Ltx2Attention`'s own norm, called twice per block, and no forward fixture
+produces rows near 2^-13.
+
+**F3 and F4 were spec repairs.** §5.3 and §7 still stated the f32 accumulator this
+branch measured and rejected; both now say f64 and point at this Outcome. §4.1
+recorded round-then-multiply as "NOT separable" from the fused form, and executing
+it parts upstream from it on 12 647 of 49 152 values at ordinary magnitude and
+3 166 of 12 288 at the probe's rows. It is retracted in place, and the alternative
+is now a SECOND rejected hypothesis in the weighted probe rather than a sentence
+saying it could not have one.
+
+**F5, F6, F8 and F9.** Nine of the twelve emitted
+`kLtx2ConnBf16*{Registers,Replaced,ZeroedMask}Golden` arrays were read by nothing;
+the generator now emits the trio for `Split` alone, the arm whose isolation case
+reads all three, and the other three register arms keep the end-to-end forward
+golden that already subsumes the substitution. `Ltx2VaeWeights::Has()` inspected
+only the f32 map while `Get` and `Count` were arm-aware, so it answered NO to
+every tensor a bf16 bag holds; it is arm-aware now, before the VAE decoder wave
+reaches it. `Ltx2LoadConnectorWeights`' `compute_dtype` lost its `kF32` default,
+so no future call site gets the WIDER arm by silence. And `ltx2.cpp` cited
+`rope.py:73` for `output = split_input * cos`, which is at `:71`.
 
 ## Owed
 

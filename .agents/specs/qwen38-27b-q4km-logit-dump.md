@@ -129,11 +129,11 @@ verdict does not rest on this row's own code.
 
 **Why it was the wrong function, and the reading error that hid it.**
 `async_input_combine_` is assigned DIRECTLY in the runner constructor
-(`runner.cpp:472` and `:537`) from `AsyncRunnerEnvDefault()`, and
+(`runner.cpp:480` and `:553`) from `AsyncRunnerEnvDefault()`, and
 `AsyncRunnerFlagIsOn` answers TRUE when `VT_ASYNC_RUNNER` is unset
 (`async_runner_flag.h`). So the production default samples in the
 DEVICE-RESIDENT branch of `sample_tokens_async`, which has its own
-`assemble_sample_logits` at `runner.cpp:4733`. `sample_tokens` is the fallback,
+`assemble_sample_logits` at `runner.cpp:4791`. `sample_tokens` is the fallback,
 not the default.
 
 I had ruled this branch out and was wrong. I grepped the SETTER

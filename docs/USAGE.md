@@ -591,6 +591,50 @@ if (vllm_complete(engine, "The capital of France is", &sampling, &output) == VLL
 vllm_engine_free(engine);
 ```
 
+`vllm_engine_spec_acceptance` (ABI v25) reads back the speculative-decoding
+counters the engine already keeps, so a client can say why a throughput number
+is what it is. The three counts are CUMULATIVE over the handle's life; subtract
+two reads to get a per-request or per-leg figure, which is what `vllm-cli` does
+per `--repeat` leg:
+
+```c
+vllm_spec_acceptance before, after;
+vllm_engine_spec_acceptance(engine, &before);
+vllm_complete(engine, "The capital of France is", &sampling, &output);
+vllm_engine_spec_acceptance(engine, &after);
+
+int64_t proposed = after.drafts_proposed - before.drafts_proposed;
+int64_t accepted = after.drafts_accepted - before.drafts_accepted;
+int64_t steps    = after.drafted_request_steps - before.drafted_request_steps;
+```
+
+`drafts_accepted` EXCLUDES the bonus/replacement token a verify step always
+emits, which is vLLM's own convention for
+`vllm:spec_decode_num_accepted_tokens`, so `accepted / proposed` is the
+acceptance rate with the bonus token out of it.
+
+`drafted_request_steps` counts (request, step) PAIRS that carried at least one
+draft, NOT forward passes: one verify forward over a batch of 8 drafted requests
+adds 8, and the two numbers are equal only at `max_num_seqs=1`. That is also how
+vLLM's `vllm:spec_decode_num_drafts` and SGLang's `spec_verify_ct` count, so the
+figures compare directly at any concurrency.
+
+`1 + accepted / steps` is vLLM's `mean_acceptance_length` EXACTLY, with the bonus
+token in it. It is NOT SGLang's `accept_length`, which divides
+`completion_tokens` by `spec_verify_ct`: that numerator also carries the
+request's prefill token, which came from no verify step, so SGLang's figure runs
+about one token per request higher. Quoting one number under both names is an
+error of roughly +0.07 on a 64-token request.
+
+All three read 0 on an engine that never speculated.
+
+`vllm-cli` prints the per-leg deltas on stderr, on their own line, beside the
+timing and leg-boundary lines it already prints:
+
+```text
+vllm-cli: run=2/5 spec_drafts_proposed=196 spec_drafts_accepted=90 spec_drafted_request_steps=28
+```
+
 `vllm_chat` takes a whole OpenAI chat request as JSON, so it accepts
 `chat_template_kwargs` exactly as the server does, and it applies the same
 default: a key nobody sends is not a template variable at all, so a Qwen3.8

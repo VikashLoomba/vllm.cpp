@@ -7013,6 +7013,52 @@ TEST_CASE("ltx2 video: a typed PROMPT conditions the render") {
   CHECK(fox.trace.connector_audio_not_bf16 == 0);
 }
 
+TEST_CASE("ltx2 video: the VAE DECODE runs at upstream's dtype") {
+  // A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, issue #2786.
+  //
+  // Upstream constructs `VideoDecoder` with the ONE pipeline dtype
+  // (`distilled.py:146-149`, `self.dtype` at `:148`) and its forward casts the
+  // latent to the weights' dtype on entry and back on exit
+  // (`conv_video_decoder.py:283-284, 357`). It carries no float32 pin of the kind
+  // the audio vocoder has (`vocoder.py:575-580`), which is the one place in this
+  // pipeline where f32 is argued rather than owed.
+  //
+  // THE COUNTER IS SAMPLED IN THE `Ltx2VideoDecodeStreaming` SINK, which is the
+  // one production route into the decoder. A unit test that builds
+  // `Ltx2ConvVideoDecode` itself would prove the class works and never that
+  // anything reaches it (AGENTS.md `## Nothing lands dead`).
+  Workspace ws;
+  const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
+  const Rendered fox = RenderPrompt(mp, ws.root + "/p_vaedtype", "a b c");
+
+  // 1. THE FIXTURE CARRIES SUB-BF16 DETAIL INTO THE DECODE, measured rather than
+  //    assumed. Without this the next check goes quietly green on any fixture
+  //    whose numbers happen to land on bf16 grid points -- which is exactly the
+  //    hole A24 sat in for the whole tree. The latent is the decoder's own input
+  //    in this same render, produced by the f32 CPU reference DiT arm, so it is a
+  //    LIVE wide stream rather than an argument about one.
+  //
+  //    THE FLOOR IS "MOST OF THE STREAM", not a small absolute count: a floor
+  //    below the real number is a mute switch. The measured value is printed
+  //    beside it so a reader can see the headroom.
+  INFO("latent into the decode, wider than bf16: "
+       << fox.trace.vae_latent_not_bf16 << " of " << fox.trace.vae_latent_values);
+  REQUIRE(fox.trace.vae_latent_values > 0);
+  CHECK(fox.trace.vae_latent_not_bf16 > fox.trace.vae_latent_values / 2);
+
+  // 2. AND THE DECODE ITSELF PRODUCES ONLY bf16-REPRESENTABLE PIXELS.
+  //
+  //    NOTHING ELSE ON THIS PATH CAN SEE THAT. The frame digests detect CHANGE
+  //    and the absmax detects COLLAPSE; both are computed over the same f32
+  //    container on either arm and are identical in shape whichever width filled
+  //    it. AGENTS.md names the blind spot exactly -- "a token gate cannot detect a
+  //    dtype that is too wide."
+  INFO("VAE decode output, wider than bf16: "
+       << fox.trace.vae_decode_not_bf16 << " of " << fox.trace.vae_decode_values);
+  REQUIRE(fox.trace.vae_decode_values > 0);
+  CHECK(fox.trace.vae_decode_not_bf16 == 0);
+}
+
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {
   // The prompt path is a DIFFERENT caller of `RunConnector` from the
   // prompt-embeds path, so "the connector is wired" proved for one proves
@@ -11388,8 +11434,11 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   const std::string lora =
       WriteFixtureLora(ws.root + "/distilled.safetensors", kFixtureLoraTarget, 1.0F);
 
-  // `max_phase` is a LOAD extra, so each arm is its own engine.
-  const auto render = [&](const char* strength, const char* max_phase, const char* out) {
+  // `max_phase` is a LOAD extra, so each arm is its own engine. `trace` is an
+  // out-parameter rather than a second render, because two renders of the same
+  // arm would be two chances for the comparison to be about noise.
+  const auto render = [&](const char* strength, const char* max_phase, const char* out,
+                          vllm::multimodal::Ltx2ConditioningTrace* trace = nullptr) {
     vllm::multimodal::VideoModelParams mp = A2VidParams(ws.paths, lora);
     mp.extras[vllm::multimodal::kLtx2LoraStrengthExtra] = strength;
     if (max_phase != nullptr) mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = max_phase;
@@ -11398,6 +11447,11 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
     REQUIRE(engine != nullptr);
     const std::string dir = std::string(ws.root) + "/" + out;
     const vllm::multimodal::VideoResult result = engine->Generate(A2VidGen(dir, wav));
+    if (trace != nullptr) {
+      const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+      REQUIRE(ltx != nullptr);
+      *trace = ltx->last_conditioning();
+    }
     return A2VidArtifacts(dir, result);
   };
 
@@ -11420,8 +11474,9 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   CHECK(s1_differing == 0);
 
   // ── both stages, the same two strengths ───────────────────────────────────
-  const std::string both_full = render("1.0", nullptr, "both_full");
-  const std::string both_zero = render("0.0", nullptr, "both_zero");
+  vllm::multimodal::Ltx2ConditioningTrace both_full_trace, both_zero_trace;
+  const std::string both_full = render("1.0", nullptr, "both_full", &both_full_trace);
+  const std::string both_zero = render("0.0", nullptr, "both_zero", &both_zero_trace);
   REQUIRE(both_full.size() == both_zero.size());
 
   size_t both_differing = 0;
@@ -11431,14 +11486,34 @@ TEST_CASE("ltx2 a2vid: the distilled adapter rides stage 2 ALONE") {
   MESSAGE("both stages: the adapter moves " << both_differing << " of " << both_full.size()
                                             << " artifact bytes");
   // THE HALF THAT REDS ON "STOPPED FUSING ALTOGETHER". `stage_2_loras` at `:114`
-  // DOES carry the distilled adapter, so it must reach the pixels through stage
+  // DOES carry the distilled adapter, so it must reach the render through stage
   // 2. Without this line the case above is satisfied by an engine that ignores
   // `lora_path` entirely, which is the same shape of green-but-proves-nothing
   // the row's spec rejects.
   //
-  // Strictly greater than zero and no count floor above it: a count-based
-  // tolerance would bound nothing.
-  CHECK(both_differing > 0);
+  // THE ARTIFACT-BYTE COMPARISON THAT USED TO CARRY THIS CANNOT ANY MORE, AND THE
+  // NUMBERS ARE WHY (A24 wave 3, #2786). On an f32 decode the adapter moved 19 of
+  // 146753 PPM bytes -- 0.013% of the clip, a handful of pixels that happened to
+  // straddle an 8-bit quantization boundary. The decode now runs at upstream's
+  // own bfloat16 (`distilled.py:109`, handed to `VideoDecoder` at `:148`), whose
+  // mantissa is also 8 bits, and a difference that small rounds away: measured 0
+  // of 146753. Raising the fixture's delta does NOT recover it -- at scale 8 the
+  // count is 0 as well, because a larger delta pushes the render further into the
+  // writer's clamp and both arms saturate to the same bytes. The instrument had a
+  // narrow window and the shipping dtype closed it.
+  //
+  // So the claim is made ONE STEP UPSTREAM, on the latent the decoder is handed,
+  // which is where the adapter's effect lives and which no pixel quantization
+  // touches. This is strictly a different statement from "reaches the pixels" and
+  // is written as such: it proves the adapter reaches the DECODER'S INPUT. That
+  // the decode depends on its input is gated separately and numerically by
+  // tests/vllm/models/test_ltx2_vae.cpp's decoder goldens, so the two together
+  // still close the path the byte comparison used to close alone.
+  MESSAGE("both stages: latent digest full=" << both_full_trace.vae_latent_digest
+                                             << " zero=" << both_zero_trace.vae_latent_digest);
+  REQUIRE(both_full_trace.vae_latent_values > 0);
+  REQUIRE(both_full_trace.vae_latent_absmax > 1e-6);
+  CHECK(both_full_trace.vae_latent_digest != both_zero_trace.vae_latent_digest);
 
   // ── and the two arms are not the same render ──────────────────────────────
   // Stage 2 upsamples, so a stage-1-only artifact cannot equal a two-stage one.

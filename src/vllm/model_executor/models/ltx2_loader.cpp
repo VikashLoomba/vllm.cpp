@@ -1144,9 +1144,28 @@ Ltx2TextEncoderCheckpoint Ltx2LoadTextEncoderFromSafetensors(
   return out;
 }
 
+Ltx2TextEncoderWeights Ltx2TextProjectionsAsBf16(
+    const Ltx2TextEncoderCheckpoint& checkpoint) {
+  auto keep = [](const Ltx2TextProjection& src, Ltx2TextAggregateEmbed& dst) {
+    dst.dtype = vt::DType::kBF16;
+    dst.out_features = src.out_features;
+    dst.in_features = src.in_features;
+    // A copy, not a widening. There is no per-element conversion here at all,
+    // which is the point: the checkpoint stores exactly these 16-bit values and
+    // the tower now computes on exactly these 16-bit values.
+    dst.weight_bf16 = src.weight_bf16;
+    dst.bias_bf16 = src.bias_bf16;
+  };
+  Ltx2TextEncoderWeights out;
+  keep(checkpoint.video, out.video);
+  keep(checkpoint.audio, out.audio);
+  return out;
+}
+
 Ltx2TextEncoderWeights Ltx2WidenTextProjectionsToF32(
     const Ltx2TextEncoderCheckpoint& checkpoint) {
   auto widen = [](const Ltx2TextProjection& src, Ltx2TextAggregateEmbed& dst) {
+    dst.dtype = vt::DType::kF32;
     dst.out_features = src.out_features;
     dst.in_features = src.in_features;
     dst.weight.resize(src.weight_bf16.size());
@@ -1513,11 +1532,19 @@ Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
 }
 
 Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
-                                        const Ltx2ConnectorConfig& config) {
+                                        const Ltx2ConnectorConfig& config,
+                                        vt::DType compute_dtype) {
   const DitPlan plan = PlanDit(file);
   const std::vector<Ltx2ConnectorTensorSpec> specs = EnumerateLtx2ConnectorTensors(config);
 
+  if (compute_dtype != vt::DType::kF32 && compute_dtype != vt::DType::kBF16) {
+    Fail(
+        "the connector weights can be materialized as f32 (the parity arm) or bf16 (upstream's "
+        "own model dtype, distilled.py:109). The FP8 and NVFP4 arms are A22 -- upstream's "
+        "quantization policies, quantization_factory.py:22-26 -- and are not implemented");
+  }
   Ltx2VaeWeights out;
+  out.dtype = compute_dtype;
   for (const Ltx2ConnectorTensorSpec& spec : specs) {
     const auto shape_it = plan.logical.find(spec.name);
     if (shape_it == plan.logical.end()) {
@@ -1537,14 +1564,32 @@ Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
     const vt::DType dtype = MaterializeDitTensor(file, plan, {spec.name, spec.shape}, bytes);
     int64_t numel = 1;
     for (const int64_t d : spec.shape) numel *= d;
+    if (dtype != vt::DType::kBF16 && dtype != vt::DType::kF32) {
+      Fail("'" + spec.name + "' materialized as a dtype the connector bag cannot hold");
+    }
+    if (compute_dtype == vt::DType::kBF16) {
+      // THE WIDENING IS THE DEBT, so on this arm there is none: a BF16 tensor is
+      // moved word for word. At the shipped widths that is the difference between
+      // ~8 GB and ~4 GB of resident parameters, per render, on a module that runs
+      // once per request.
+      std::vector<uint16_t> narrow(static_cast<size_t>(numel));
+      if (dtype == vt::DType::kBF16) {
+        std::memcpy(narrow.data(), bytes.data(), static_cast<size_t>(numel) * sizeof(uint16_t));
+      } else {
+        const auto* src = reinterpret_cast<const float*>(bytes.data());
+        for (int64_t i = 0; i < numel; ++i) {
+          narrow[static_cast<size_t>(i)] = vt::F32ToBF16(src[static_cast<size_t>(i)]);
+        }
+      }
+      out.bf16[spec.name] = std::move(narrow);
+      continue;
+    }
     std::vector<float> widened(static_cast<size_t>(numel));
     if (dtype == vt::DType::kBF16) {
       const auto* src = reinterpret_cast<const uint16_t*>(bytes.data());
       for (int64_t i = 0; i < numel; ++i) widened[static_cast<size_t>(i)] = Bf16ToF32(src[static_cast<size_t>(i)]);
-    } else if (dtype == vt::DType::kF32) {
-      std::memcpy(widened.data(), bytes.data(), static_cast<size_t>(numel) * sizeof(float));
     } else {
-      Fail("'" + spec.name + "' materialized as a dtype the connector bag cannot hold");
+      std::memcpy(widened.data(), bytes.data(), static_cast<size_t>(numel) * sizeof(float));
     }
     out.tensors[spec.name] = std::move(widened);
   }
@@ -1557,7 +1602,7 @@ Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
   std::string first_extra;
   for (const auto& kv : plan.logical) {
     if (!StartsWith(kv.first, config.prefix)) continue;
-    if (out.tensors.count(kv.first) != 0) continue;
+    if (out.tensors.count(kv.first) != 0 || out.bf16.count(kv.first) != 0) continue;
     if (extra == 0) first_extra = kv.first;
     ++extra;
   }

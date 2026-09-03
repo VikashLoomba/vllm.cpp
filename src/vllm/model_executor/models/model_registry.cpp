@@ -489,6 +489,22 @@ bool MultiKvRefusalApplies(const MultiKvCacheIndex* mk, bool consumes_multi_kv) 
   return mk != nullptr && !consumes_multi_kv;
 }
 
+// ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710). Trivial by construction for the same
+// reason its sibling above is: the rule ("a step whose host identifiers are stale
+// may not reach a forward that reads only host identifiers") is the one a future
+// edit is most likely to invert or widen, and as a free function it is pinned by
+// a test that needs no model.
+//
+// ALL THREE TERMS ARE LOAD-BEARING and the header says why each is. In
+// particular, dropping `host_token_ids_stale` reduces this to nullness and makes
+// the guard refuse a pooling forward that is correct today.
+bool DeviceTokenIdsRefusalApplies(const int32_t* device_token_ids,
+                                  bool host_token_ids_stale,
+                                  bool consumes_device_token_ids) {
+  return device_token_ids != nullptr && host_token_ids_stale &&
+         !consumes_device_token_ids;
+}
+
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,
                                      const ModelForwardInput& input) {
   // KV-DSV4-MULTICACHE W3 (#2068): a MULTI-CACHE topology reached the shared
@@ -642,6 +658,78 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
                  arch +
                  "' and not by the engine row that owns this guard. "
                  "#1925, #2068, #2353");
+  }
+  // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): THE SECOND ADVISORY CHANNEL, made
+  // refusable.
+  //
+  // `ModelForwardInput::device_token_ids` states that when it is non-null the
+  // step's input identifiers live in that device buffer and `token_ids` is stale
+  // for decode rows. Until this guard, that was ADVICE: a forward that ignored it
+  // was handed the stale host vector anyway, and since `token_ids_cpu` is
+  // zero-initialised it decoded from TOKEN ID 0 at every step after the first —
+  // at rc=0, with fluent, plausible, wrong output that no token gate catches
+  // because there is nothing to compare it against.
+  //
+  // FIVE ARCHITECTURES WERE CAUGHT THIS WAY, one at a time, by hardware runs
+  // rather than by any gate: #1305 took three, #2496 and #2544 took the rest. The
+  // sixth is what this guard is for. The mechanism is the same one the multi-KV
+  // channel above uses — a capability the MODEL declares, defaulting false, and a
+  // refusal when the step needs a capability the model has not claimed.
+  //
+  // IT TURNS ON THE DISAGREEMENT, NOT ON THE ARRIVAL, and that distinction is the
+  // whole reason `host_token_ids_stale` exists beside the pointer. The runner
+  // sets the pointer on every step once the mirror is engaged, including steps
+  // whose rows are all prefill, where nothing is spliced and the host vector is
+  // perfectly good. Refusing those would take away `ForwardLlamaModelEmbedding` —
+  // a pooling forward that reads host identifiers and is CORRECT, because every
+  // request it serves is prefill-only. A guard that breaks a working path is
+  // worse than the defect it prevents.
+  //
+  // THE STALENESS FACT IS PER-STEP AND MUST STAY SO. It is
+  // `v1::AnyRowSplicedByCombine`, an OR over every row of the batch, sharing
+  // `v1::CombineSplicesRow` with the combine that does the splicing rather than
+  // re-deriving it. A per-REQUEST reading would let a step that mixes prefill
+  // rows with one decode row proceed on account of its prefill rows while the
+  // decode row read identifiers the runner never wrote. That is a refusal whose
+  // predicate disagrees with its route predicate, and this tree has shipped that
+  // exact shape once already.
+  //
+  // LIKE ITS SIBLING, THIS GUARD IS THE ENGINE'S. It fires before dispatch to the
+  // architecture's own forward hook, so the consuming forward is owed by the row
+  // that ports the architecture and not by the engine row that owns the guard.
+  if (DeviceTokenIdsRefusalApplies(
+          input.device_token_ids, input.host_token_ids_stale,
+          model.registration().factory->consumes_device_token_ids)) {
+    const std::string arch(model.registration().architecture);
+    VT_CHECK(
+        false,
+        std::string("model forward: architecture '") + arch +
+            "' reached this forward on a step of " +
+            std::to_string(input.num_reqs) +
+            " request(s) whose HOST token identifiers are stale — the "
+            "asynchronous runner's combine spliced at least one row's sampled "
+            "token into the DEVICE buffer on the main queue and deliberately "
+            "never wrote it back — and the forward registered for '" +
+            arch +
+            "' does not read `ModelForwardInput::device_token_ids`: its "
+            "ModelFactory leaves `consumes_device_token_ids` false. Refusing "
+            "rather than embedding a host array the runner never wrote, which "
+            "decodes from token id 0 (token_ids_cpu is zero-initialised) at "
+            "rc=0 with plausible-looking output. `async_device_mirror()` is the "
+            "DEFAULT on CUDA, integrated parts included, so this is the default "
+            "arm and not an opt-in. TO FIX: make this architecture's forward "
+            "consume the device identifiers — the device arm is "
+            "`detail::DeviceTokenIdsScope`, the host arm is "
+            "`ResolveHostTokenIds` "
+            "(include/vllm/model_executor/models/host_token_ids.h) — and set "
+            "`consumes_device_token_ids = true` beside its forward. TO ROLL "
+            "BACK instead, run with VT_ASYNC_DEVICE_MIRROR=0, which returns the "
+            "host combine and makes the host identifiers authoritative again. "
+            "THIS GUARD IS THE ENGINE'S (ENG-ASYNC-DEVICE-IDS-REFUSAL, #2710) "
+            "and it fires BEFORE dispatch to that architecture's own forward "
+            "hook, so the consuming forward is owed by the row that ports '" +
+            arch +
+            "'. #1305, #2496, #2544, #2710");
   }
   return model.registration().factory->forward(model, input);
 }

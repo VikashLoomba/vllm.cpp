@@ -269,6 +269,53 @@ std::vector<int32_t> combine_sampled_and_draft_tokens(
     const std::vector<int32_t>& draft_tokens, int draft_tokens_stride,
     const std::vector<int32_t>& cu_num_logits, int num_new_sampled_tokens = 1);
 
+// ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): THE COMBINE'S ROW PREDICATE, extracted so
+// that one rule has one expression.
+//
+// TRUE when batch row `i`'s host input identifier is about to be REPLACED by the
+// previous step's sampled token — which is the same thing as saying the host
+// vector is stale for that row. A row still consuming known prefill tokens,
+// INCLUDING the chunk that exactly completes prefill, keeps its prompt token and
+// is left untouched, so the boundary is a strict `>` and not a `>=`.
+//
+// WHY IT IS A NAMED FUNCTION NOW. `combine_sampled_and_draft_tokens` above wrote
+// this condition inline and the CUDA kernel it mirrors
+// (`src/vt/cuda/cuda_combine_tokens.cu`) writes it again, which was tolerable
+// while the only readers WERE the two combines. A third reader now needs the same
+// answer: the guard in `ModelRegistry::Forward` that refuses a forward which
+// ignores `ModelForwardInput::device_token_ids`. A refusal whose predicate is a
+// re-derivation of the route's predicate is precisely the failure this repository
+// has already shipped once, so the guard SHARES this expression instead of
+// agreeing with it by inspection.
+//
+// The device kernel keeps its own copy because device code cannot call a host
+// inline. That copy is pre-existing; the spec records as owed the fact that
+// nothing pins the two against each other on a device.
+inline bool CombineSplicesRow(int32_t seq_len, int32_t prefill_len) {
+  return seq_len > prefill_len;
+}
+
+// TRUE when ANY row of this step is one `CombineSplicesRow` splices — which is
+// exactly "the host token identifiers are stale for this step".
+//
+// PER-STEP, AND THE GRANULARITY IS THE POINT. Staleness is a per-ROW fact, but
+// the decision it feeds is a per-STEP one: a forward either reads
+// `device_token_ids` or it does not, and it is handed the whole step at once. A
+// per-REQUEST reading of the same rule — "this request is a prefill row, so it is
+// fine" — lets a MIXED step through for its prefill rows while its decode row is
+// served from identifiers the runner never wrote. That is a refusal whose
+// predicate disagrees with its route predicate, which this tree has shipped
+// before: a per-request refusal paired with a per-step route veto, where every
+// test used `num_reqs == 1` so the two agreed on every test input.
+//
+// So this reduces with OR over the whole batch and never reports a per-row
+// answer. `idx_mapping` maps batch row -> req_state slot for `prefill_len`,
+// exactly as the combine does; pass nullptr for the identity mapping that the
+// condensed-dense persistent batch uses.
+bool AnyRowSplicedByCombine(const std::vector<int32_t>& seq_lens,
+                            const std::vector<int32_t>& prefill_len,
+                            const int32_t* idx_mapping, int num_reqs);
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_WORKER_GPU_PREPARE_INPUTS_H_

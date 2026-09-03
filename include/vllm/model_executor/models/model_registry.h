@@ -564,6 +564,49 @@ struct MultiKvCacheIndex {
 // arrival, and the refusal's message reads the payload so it can say so.
 bool MultiKvRefusalApplies(const MultiKvCacheIndex* mk, bool consumes_multi_kv);
 
+// ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): must a step whose HOST token identifiers
+// are stale be refused, because the forward it is bound for does not read the
+// device ones?
+//
+// A PURE PREDICATE for the same reason its `MultiKvRefusalApplies` sibling above
+// is one: the decision is gateable without a model, a runner or a registry, so
+// both polarities can be pinned directly rather than only through a full engine.
+// An inline copy inside `ModelRegistry::Forward` would be a second derivation,
+// and a second derivation is the thing that can disagree with the one a test
+// pins.
+//
+// TRUE when all three hold:
+//
+//   `device_token_ids != nullptr`   the mirror is live and the device buffer is
+//                                   authoritative for this step.
+//   `host_token_ids_stale`          and at least one row of this step actually
+//                                   HAS a spliced identifier, so the host vector
+//                                   and the device buffer disagree.
+//   `!consumes_device_token_ids`    and the registered forward never reads the
+//                                   device buffer.
+//
+// WHY THE MIDDLE TERM IS NOT REDUNDANT. Without it this reduces to nullness, and
+// nullness refuses `ForwardLlamaModelEmbedding` — a pooling forward that reads
+// host identifiers, never reads the pointer, and is CORRECT because every request
+// it serves is prefill-only. A refusal that fires on a model which actually works
+// is worse than the defect it prevents, so the guard turns on the DISAGREEMENT
+// and not on the arrival.
+//
+// THE MIDDLE TERM IS A PER-STEP FACT AND MUST STAY ONE. `v1::AnyRowSplicedByCombine`
+// computes it as an OR over every row, so a step that mixes prefill rows with one
+// decode row refuses as a whole. Evaluating the same rule per REQUEST would let
+// such a step through for its prefill rows while its decode row read identifiers
+// the runner never wrote — a refusal disagreeing with its own route predicate,
+// which is a failure this tree has shipped before.
+//
+// NOTE THE ASYMMETRY WITH THE SIBLING, which is why that one needs no such term:
+// a multi-cache topology is a property of the whole model and the whole step, so
+// its arrival IS its disagreement. Staleness here is a property of a ROW, so
+// arrival and disagreement come apart and both have to be asked.
+bool DeviceTokenIdsRefusalApplies(const int32_t* device_token_ids,
+                                  bool host_token_ids_stale,
+                                  bool consumes_device_token_ids);
+
 // One MRV2 forward invocation. References stay valid for the duration of the
 // registered forward hook; model-specific decode-graph state lives in the
 // concrete LoadedModel rather than leaking concrete weight types into runner.
@@ -638,10 +681,46 @@ struct ModelForwardInput {
   // since materializing it on the host is the synchronize W4 removes.
   //
   // A model that honors this embeds from the device pointer instead of uploading
-  // `token_ids`; a model that ignores it is simply never given one (the runner
-  // only sets it on the discrete-CUDA async path, which the Qwen3.5 gate vehicle
-  // owns). Null on every other path, so every other forward is byte-identical.
+  // `token_ids`.
+  //
+  // WHAT THIS COMMENT USED TO SAY, AND WHY IT IS GONE (#2710). It said "a model
+  // that ignores it is simply never given one (the runner only sets it on the
+  // discrete-CUDA async path, which the Qwen3.5 gate vehicle owns)". THAT
+  // SENTENCE WAS FALSE, and it is the sentence the defect hid behind for five
+  // architectures. `GPUModelRunner::execute_model` assigns this field
+  // UNCONDITIONALLY, for every registered forward, whenever the mirror is
+  // engaged — and `async_device_mirror()` is the DEFAULT on CUDA, integrated
+  // parts included, not a discrete-only opt-in. A model that ignored it was not
+  // spared; it was handed identifiers it then failed to read.
+  //
+  // IT IS NO LONGER ADVISORY. A forward may only be handed a step whose host
+  // identifiers are stale when its `ModelFactory::consumes_device_token_ids` is
+  // true; `ModelRegistry::Forward` refuses the step otherwise, exactly as the
+  // `multi_kv` channel below is refused. See `DeviceTokenIdsRefusalApplies`.
+  //
+  // Null on every non-mirror path, so every such forward is byte-identical.
   const int32_t* device_token_ids = nullptr;
+  // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): does `token_ids` actually DISAGREE with
+  // `device_token_ids` for this step?
+  //
+  // The pointer above says "the device buffer is authoritative". This says "and
+  // it differs", which is a different fact and is the one a refusal must turn on.
+  // The runner's combine splices a row only when
+  // `v1::CombineSplicesRow(seq_len, prefill_len)` holds, so on a step whose rows
+  // are ALL prefill — every step of a pooling model, and the first step of every
+  // ordinary one — nothing is spliced and the host vector is perfectly good.
+  //
+  // WITHOUT THIS FIELD THE GUARD WOULD BE WORSE THAN THE DEFECT. It would refuse
+  // `ForwardLlamaModelEmbedding`, which reads host `token_ids`, never reads the
+  // pointer, and is CORRECT because every request it serves is prefill-only.
+  // Taking a working path away is a worse outcome than the silent staleness the
+  // guard exists to stop.
+  //
+  // PER-STEP, computed by `v1::AnyRowSplicedByCombine` as an OR over the whole
+  // batch. It is never a per-request answer; the header of that function says
+  // what a per-request reading would let through. FALSE by default, so every
+  // caller that is not the async runner is byte-identical.
+  bool host_token_ids_stale = false;
   // KV-DSV4-MULTICACHE W3 (#2068): the THIRD cache channel. Non-null only when
   // the runner allocated a MULTI-CACHE topology — one whose published groups the
   // positional `attn_kv` convention cannot address. THREE architectures publish
@@ -829,6 +908,30 @@ struct ModelFactory {
   // while doing asymptotically more work, so no token gate can see it. A
   // capability whose absence is invisible must be opt-in.
   bool consumes_multi_kv = false;
+  // ENG-ASYNC-DEVICE-IDS-REFUSAL ([#2710](https://github.com/mudler/vllm.cpp/issues/2710)):
+  // whether THIS model's registered forward READS
+  // `ModelForwardInput::device_token_ids` rather than embedding from the host
+  // `token_ids` vector the async runner deliberately leaves stale.
+  //
+  // THE DEFAULT IS FALSE AND THAT IS THE MECHANISM, the polarity
+  // `consumes_multi_kv` above and `stage_on_load` already use. A model added
+  // tomorrow that does not read the field is REFUSED on a step whose host
+  // identifiers are stale, instead of being handed them and decoding from
+  // whatever `token_ids_cpu` was zero-initialised to. Five architectures were
+  // caught doing exactly that before this bit existed (#1305, #2496, #2544); the
+  // sixth is the one this default is for.
+  //
+  // WHY A BIT AND NOT A LIST IN THE GUARD. The fact is a property of the forward
+  // and it lives beside the forward: the translation unit that reads the field is
+  // the one that sets this. A list inside `ModelRegistry::Forward` would have to
+  // be edited by every model row, which is the shared-file lock AGENTS.md
+  // `## Records` forbids.
+  //
+  // WHAT IT DOES NOT CLAIM. It says "this forward reads the field", not "on every
+  // path it can take". A forward with one arm that reads the device identifiers
+  // and another that does not is a defect in that forward, and this bit cannot
+  // see it. Setting it is a statement about the code, not a warrant for it.
+  bool consumes_device_token_ids = false;
   // MODEL-MM-QWEN4-EXP W5L ([#2031](https://github.com/mudler/vllm.cpp/issues/2031)):
   // whether THIS model's forward serves exactly ONE sequence per step, so the
   // engine must not schedule a batch it will refuse.

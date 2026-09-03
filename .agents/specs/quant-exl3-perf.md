@@ -418,9 +418,14 @@ device numeric case to gate both codebooks at tier 3c; measure the end-to-end
 decode effect on the real checkpoint on `dgx:gpu0`; record the envelope's actual
 verdict per shape.
 
-**Out of scope and owed, not silently dropped:** the `(4, 2)` kernel port, the
-fused MoE arm, `kExl3HadR` on ROCm, the four-shape coverage of the regular
-kernel's shape table. Each is under `## Owed` with its reason.
+**Out of scope and owed, not silently dropped:** the `(4, 2)` kernel port and
+the fused MoE arm. Each is under `## Owed` with its reason. Two more items sat
+in that list and neither is owed here any longer: the four-shape coverage of the
+regular kernel's shape table CLOSED under `QUANT-EXL3` W5
+([#2749](https://github.com/mudler/vllm.cpp/issues/2749)), and `kExl3HadR` on
+ROCm was WITHDRAWN as a false record
+([#2757](https://github.com/mudler/vllm.cpp/issues/2757)). `## Owed` carries
+both, struck through with the reason.
 
 ## Upstream chain
 
@@ -662,18 +667,28 @@ A CPU-only green is not a device result and is never reported as one. A doctest
   `cuda_exl3.cu`), and it is CUDA-only. The #2495 checkpoint is dense so nothing
   here reaches it, and it is named so the next MoE EXL3 artifact does not
   rediscover it.
-- **`kExl3HadR` on ROCm runs the portable CPU reference tier, not a native
-  kernel.** It is correct and it is not fast, and no row owned that either.
-- **The regular kernel's shape table is gated at ONE of its four shapes.**
-  Read at `src/vt/exl3_policy.cpp:98-110`, the Blackwell arm returns shape 2 at
-  the dimensions the suite tests (`k 2048, n 4096, bits 3`: `mod_256 &&
-  size_n <= 4096` with `size_k > 8192` false). Shape 4 needs
-  `mod_512 && size_n > 16384` and shape 1 needs `(K == 4 || K == 2) && !multi &&
-  size_k <= 2048`, so neither is reachable at those dimensions at all.
-  `force_shape_idx` already exists, so covering the other three is a test loop
-  rather than a port. Owed by `QUANT-EXL3-MUL1`, which owns that table; repeated
-  here because the GEMV falls THROUGH to it on every shape the envelope
-  declines, which on this checkpoint may be all of them.
+- ~~**`kExl3HadR` on ROCm runs the portable CPU reference tier, not a native
+  kernel.**~~ **WITHDRAWN, and it was wrong in both halves.** The transform runs
+  NATIVELY on ROCm: `HadK` in `src/vt/rocm/rocm_exl3.hip` serves steps 1 and 3
+  of `Exl3GemmKernelRocm`, so nothing on an EXL3 forward reaches the reference
+  tier there. What is absent is the standalone `kExl3HadR128` REGISTRATION, and
+  a row did own that: `.agents/specs/backend-rocm-exl3.md` scopes it out by name
+  and carries it in its own `## Owed`, because `vt::Exl3HadR128` has no
+  production caller on ANY backend -- `git grep 'Exl3HadR128('` finds the
+  declaration, the definition and tests -- and Vulkan declines to register it
+  for the same stated reason. Registering it would land a surface nothing
+  reaches. Left here as a correction rather than deleted, because this bullet
+  has already been read as a live gap.
+- ~~**The regular kernel's shape table is gated at ONE of its four shapes.**~~
+  **CLOSED by `QUANT-EXL3` W5** ([#2749](https://github.com/mudler/vllm.cpp/issues/2749)),
+  which forces all four through `force_shape_idx`. This bullet and the one in
+  `quant-exl3-mul1.md` each named the other row as the owner; the table lives in
+  `src/vt/exl3_policy.cpp`, which `quant-exl3-shared.md` `## Port map` claims, so
+  it went there. It PASSED on `thor:gpu0` on 2026-09-03 -- all four forced, all
+  six output pairs differing, and two mutations detected -- and the evidence is
+  in `quant-exl3-shared.md` `### Evidence (W5)`. It mattered to this row because
+  the GEMV falls THROUGH to that table on every shape the envelope declines,
+  which on this checkpoint may be all of them.
 - **`bits` 5 and 6 have no GEMV upstream either** (`exl3_gemv.cu:110-111`
   refuses `K < 2 || K > 4`), so the one 5-bit tensor and the 6-bit `lm_head`
   falling to the regular kernel is upstream's behaviour and not a gap. Recorded

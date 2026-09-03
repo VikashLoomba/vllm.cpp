@@ -1506,6 +1506,238 @@ def section_connector(out) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Section 10b — the connector's BFLOAT16 arm (A24 wave 2, row
+# LTX25-A24-CONNECTOR-BF16, issue #2720)
+#
+# Upstream resolves ONE pipeline dtype and it is bfloat16 (`distilled.py:109`),
+# handed to `PromptEncoder` at `:113`; `Embeddings1DConnector` is constructed
+# inside `PromptEncoder` and inherits it. Section 10 above is the f32 PARITY arm
+# and stays exactly as it was — same five arms, same fixtures, same tolerances.
+# This section runs the SAME five modules with one dtype changed.
+#
+# THE KERNEL IS NOT A FUNCTION OF ITS INPUT, so every golden is emitted TWICE.
+# `AttentionFunction.AUTOMATIC` resolves here to
+# SDPA[FLASH_ATTENTION>...] and no formula reproduces it: eight hypotheses over
+# {round scores, round probabilities, scale before/after} were measured against
+# it and the closest still differs on 128 of 384 bf16 words. `SDPBackend.MATH` IS
+# well defined — bit-equal to an f32-accumulated attention with no intermediate
+# rounding, 0 of 384 against both an f32 and an f64 reference. So the port is held
+# to the MATH oracle and its distance to the unpatched module is REPORTED. This is
+# the same remedy A24 wave 1 applied to `torch.rsqrt`, one level up.
+# ---------------------------------------------------------------------------
+
+
+def _math_attention():
+    """`SDPBackend.MATH` pinned through upstream's own callable, not a reimplementation."""
+    from torch.nn.attention import SDPBackend  # noqa: PLC0415
+
+    from ltx_core.model.transformer.attention import PytorchAttention  # noqa: PLC0415
+
+    return PytorchAttention(priority=[SDPBackend.MATH])
+
+
+def section_connector_bf16(out) -> None:
+    import torch  # noqa: PLC0415
+    from ltx_core.model.transformer.rope import LTXRopeType  # noqa: PLC0415
+    from ltx_core.text_encoders.gemma.embeddings_connector import (  # noqa: PLC0415
+        Embeddings1DConnector,
+    )
+    from ltx_core.utils import rms_norm  # noqa: PLC0415
+
+    section(out, "Section 10b - Embeddings1DConnector at BFLOAT16 (A24 wave 2)")
+
+    bf = torch.bfloat16
+    inner = _CONN_HEADS * _CONN_HEAD_DIM
+    count = _CONN_BATCH * _CONN_SEQ * inner
+
+    # The SAME input stream as the f32 arm, rounded into the dtype upstream runs.
+    # `.to(bf16)` and not a second stream, so the two arms differ in dtype and in
+    # nothing else.
+    hidden = torch.from_numpy(make("ltx2.conn.hidden", count, 1.0)).reshape(
+        _CONN_BATCH, _CONN_SEQ, inner
+    ).to(bf)
+    emit_f32(out, "kLtx2ConnBf16Hidden", hidden.float().numpy())
+
+    # The mask does NOT narrow. `_replace_padded_with_learnable_registers` returns
+    # `torch.zeros_like(additive_attention_mask)` (embeddings_connector.py:152) and
+    # the caller's mask is f32, so the mask never sees the model dtype. MEASURED,
+    # not assumed: the probe reads `zeroed dtype: torch.float32` on a bf16 module.
+    mask = torch.zeros(_CONN_BATCH, 1, 1, _CONN_SEQ, dtype=torch.float32)
+    mask[0, 0, 0, 5:] = -torch.finfo(torch.float32).max
+
+    math_fn = _math_attention()
+
+    for tag, rope_type, double_precision, registers, gated, ff_bias in (
+        ("Split", LTXRopeType.SPLIT, False, _CONN_REGISTERS, False, True),
+        ("Interleaved", LTXRopeType.INTERLEAVED, False, _CONN_REGISTERS, False, True),
+        ("Float64", LTXRopeType.SPLIT, True, _CONN_REGISTERS, False, True),
+        ("NoRegisters", LTXRopeType.SPLIT, False, None, False, True),
+        ("GatedNoBias", LTXRopeType.SPLIT, False, _CONN_REGISTERS, True, False),
+    ):
+        def build(pin_math: bool):
+            module = Embeddings1DConnector(
+                attention_head_dim=_CONN_HEAD_DIM,
+                num_attention_heads=_CONN_HEADS,
+                num_layers=_CONN_LAYERS,
+                positional_embedding_theta=10000.0,
+                positional_embedding_max_pos=[1],
+                num_learnable_registers=registers,
+                rope_type=rope_type,
+                double_precision_rope=double_precision,
+                apply_gated_attention=gated,
+                ff_bias=ff_bias,
+            ).to(bf)
+            module.eval()
+            # Filled AFTER `.to(bf16)`, so `copy_` rounds each value into the
+            # parameter's own dtype exactly once. The C++ side rounds the same
+            # stream the same way; a port that kept f32 weights would be WIDER
+            # than upstream, which is the polarity a value gate cannot catch.
+            man = fill_module(module, f"ltx2.conn.{tag}.")
+            if pin_math:
+                for block in module.transformer_1d_blocks:
+                    block.attn1.attention_function = math_fn
+                    block.attn1.masked_attention_function = math_fn
+            return module, man
+
+        module, manifest = build(pin_math=True)
+        golden, _ = module(hidden.clone(), mask.clone())
+        unpatched, _ = build(pin_math=False)[0](hidden.clone(), mask.clone())
+
+        # The distance between the two kernels, reported rather than hidden. It is
+        # the reason this port is held to MATH and not to whatever torch picked.
+        gap = float((golden.float() - unpatched.float()).abs().max())
+        scale = float(golden.float().abs().max())
+        differing = int((golden.view(torch.int16) != unpatched.view(torch.int16)).sum())
+        print(
+            f"  bf16 connector {tag}: MATH vs AUTOMATIC differs on"
+            f" {differing}/{golden.numel()} words, max|diff| {gap:g}"
+            f" against max|golden| {scale:g}",
+            file=sys.stderr,
+        )
+        emit_manifest(out, f"kLtx2ConnBf16{tag}Param", manifest)
+        emit_f32(out, f"kLtx2ConnBf16{tag}Golden", golden.float().numpy())
+        emit_f32(out, f"kLtx2ConnBf16{tag}UnpatchedGolden", unpatched.float().numpy())
+        emit_double(out, f"kLtx2ConnBf16{tag}KernelGap", gap)
+
+        # THE SUBSTITUTION ON ITS OWN, for the ONE arm that isolates it. Four of
+        # the five arms carry registers and every one of them is already gated
+        # END TO END by the forward golden above, which the substitution feeds;
+        # a trio per arm emitted nine arrays no case ever read. `Split` is the
+        # arm the isolation case runs, and all three of its goldens are
+        # referenced by it.
+        if registers and tag == "Split":
+            replaced, zeroed = module._replace_padded_with_learnable_registers(  # noqa: SLF001
+                hidden.clone(), mask.clone()
+            )
+            # The register table AS STORED. At bf16 upstream's `.to(hidden.dtype)`
+            # is an identity, where the f32 arm rounds; the same number by two
+            # routes, and the one place the two arms provably agree.
+            emit_f32(out, f"kLtx2ConnBf16{tag}RegistersGolden",
+                     module.learnable_registers.float().numpy())
+            emit_f32(out, f"kLtx2ConnBf16{tag}ReplacedGolden", replaced.float().numpy())
+            emit_f32(out, f"kLtx2ConnBf16{tag}ZeroedMaskGolden", zeroed.numpy())
+
+    # ── THE EPSILON PROBE, which the arm goldens above CANNOT be ────────────
+    #
+    # `rms_norm`'s eps reaches the bf16 arm as the f32 `1e-6`, not as
+    # `bf16(1e-6) = 9.98377799987793e-07`, because it is added inside an f32
+    # accumulator (measured: 0 mismatches against the f32 scalar over 1 973 760
+    # values at every row scale tried, and every mismatch against the bf16 scalar).
+    # A24 wave 1's epsilon probe turned out to be a transcription check on a
+    # constant that never reached the arithmetic, so this one is built to SEPARATE
+    # and refuses to be emitted if it stops.
+    #
+    # The two narrowings part only on SMALL rows, and the row scale was CHOSEN by
+    # sweeping rather than guessed. Measured over 49152 values at width 24:
+    # 0 separating at 2^-2 and above, 4 at 2^-4, 94 at 2^-6, 1292 at 2^-8, a
+    # maximum of 8716 (17.7%) at 2^-13, and upstream agreeing with the f32 scalar
+    # on ALL of them at every scale. The arm fixture above is ordinary-magnitude,
+    # so it gates NOTHING about the epsilon; these rows are laid at 2^-13 for that
+    # reason and for no other.
+    rows, width = 512, inner
+    small = torch.from_numpy(make("ltx2.conn.bf16.eps", rows * width, 2.0, -1.0)).reshape(
+        rows, width
+    ).to(bf) * (2.0 ** -13)
+    upstream_eps = rms_norm(small)
+    x32 = small.float()
+    ms = (x32 * x32).mean(-1, keepdim=True)
+    rejected = (x32 * torch.rsqrt(ms + float(torch.tensor(1e-6, dtype=bf)))).to(bf)
+    separating = int((upstream_eps.view(torch.int16) != rejected.view(torch.int16)).sum())
+    if separating == 0:
+        raise SystemExit(
+            "the bf16 rms_norm epsilon probe no longer separates the f32 scalar from the "
+            "bf16-narrowed one on these rows. A probe that cannot fail gates nothing; "
+            "rebuild it (raise `rows`, or lower the scale) rather than emitting it."
+        )
+    print(f"  bf16 rms_norm eps probe: separating on {separating}/{upstream_eps.numel()} values",
+          file=sys.stderr)
+    emit_scalar(out, "kLtx2ConnBf16EpsRows", rows)
+    emit_scalar(out, "kLtx2ConnBf16EpsWidth", width)
+    emit_f32(out, "kLtx2ConnBf16EpsInput", small.float().numpy())
+    emit_f32(out, "kLtx2ConnBf16EpsGolden", upstream_eps.float().numpy())
+    # The answer this port must NOT produce, emitted beside upstream's so the
+    # suite asserts the difference rather than trusting the constant.
+    emit_f32(out, "kLtx2ConnBf16EpsRejected", rejected.float().numpy())
+    emit_scalar(out, "kLtx2ConnBf16EpsSeparating", separating)
+
+    # ── THE SAME PROBE ON THE WEIGHTED NORM, WHICH IS A DIFFERENT FUNCTION ──
+    #
+    # Everything above holds `Ltx2ConnectorRmsNormRows`, the connector's
+    # WEIGHTLESS residual norm. The q/k norms inside the attention are
+    # `torch.nn.RMSNorm(inner_dim, eps=norm_eps)` (attention.py:505-506), they run
+    # in the same forward on the same constant -- `Ltx2ConnectorForward` hands
+    # `Ltx2AttentionArgs::norm_eps` the same `kLtx2ConnectorRmsNormEps` -- and
+    # they went through a DIFFERENT function with no probe of its own. Measured on
+    # the tree: narrowing that epsilon to `bf16(1e-6)` at kBF16 left
+    # `test_ltx2_pipeline` at 4018 | 4018 passed and `test_ltx2_video` at
+    # 4951 | 4951 passed, while setting it to 1.0 reds 11 -- ten across all five
+    # connector arms plus this probe. The site is live and reached; the arm
+    # goldens simply cannot resolve a difference eight orders below bf16's
+    # resolution.
+    #
+    # Same rows, same scale, same refuse-if-not-separating guard. The gain follows
+    # this suite's own rule for a 1-D `.weight` -- an affine norm gain centred on
+    # 1.0 -- so it is the same fixture shape the arm goldens use.
+    gain = torch.from_numpy(make("ltx2.conn.bf16.eps.gain", width, 0.1, 1.0)).to(bf)
+    g32 = gain.float()
+    weighted = rms_norm(small, gain)
+    weighted_rejected = (
+        x32 * torch.rsqrt(ms + float(torch.tensor(1e-6, dtype=bf))) * g32
+    ).to(bf)
+    weighted_separating = int(
+        (weighted.view(torch.int16) != weighted_rejected.view(torch.int16)).sum()
+    )
+    # THE SECOND REJECTED HYPOTHESIS. Section 4.1 of the spec recorded that
+    # rounding the normalized value into bf16 and THEN multiplying by the gain is
+    # "not separable" from the single rounding `F.rms_norm` does. Executed, it
+    # separates cleanly, so the alternative gets a golden of its own rather than a
+    # sentence saying it could not have one.
+    weighted_rtm = ((x32 * torch.rsqrt(ms + 1e-6)).to(bf).float() * g32).to(bf)
+    weighted_rtm_separating = int(
+        (weighted.view(torch.int16) != weighted_rtm.view(torch.int16)).sum()
+    )
+    if weighted_separating == 0 or weighted_rtm_separating == 0:
+        raise SystemExit(
+            "the WEIGHTED bf16 rms_norm probe no longer separates upstream from one of its "
+            f"two rejected hypotheses (eps {weighted_separating}, round-then-multiply "
+            f"{weighted_rtm_separating}). A probe that cannot fail gates nothing; rebuild it "
+            "(raise `rows`, or lower the scale) rather than emitting it."
+        )
+    print(
+        f"  bf16 WEIGHTED rms_norm probe: eps separates on {weighted_separating}"
+        f"/{weighted.numel()}, round-then-multiply on {weighted_rtm_separating}"
+        f"/{weighted.numel()}",
+        file=sys.stderr,
+    )
+    emit_f32(out, "kLtx2ConnBf16EpsGain", g32.numpy())
+    emit_f32(out, "kLtx2ConnBf16EpsWeightedGolden", weighted.float().numpy())
+    emit_f32(out, "kLtx2ConnBf16EpsWeightedRejected", weighted_rejected.float().numpy())
+    emit_scalar(out, "kLtx2ConnBf16EpsWeightedSeparating", weighted_separating)
+    emit_f32(out, "kLtx2ConnBf16EpsWeightedRoundThenMul", weighted_rtm.float().numpy())
+    emit_scalar(out, "kLtx2ConnBf16EpsWeightedRoundThenMulSeparating", weighted_rtm_separating)
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -1614,6 +1846,7 @@ def main() -> int:
         section_upsampler(out)
         section_duration_head(out)
         section_connector(out)
+        section_connector_bf16(out)
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

@@ -626,9 +626,25 @@ struct Ltx2TextEncoderCheckpoint {
 Ltx2TextEncoderCheckpoint Ltx2LoadTextEncoderFromSafetensors(
     const SafetensorsFile& file, const Ltx2TextEncoderLoadOptions& options = {});
 
-// Widen the bf16 projections into `Ltx2TextEncoderWeights`, whose f32 is phase
-// L3's declared PARITY dtype (ltx2_text_encoder.h:73-83). Opt-in, and ~4.6 GB
-// at the shipped widths — which is exactly why it is not what loading does.
+// Move the checkpoint's OWN bf16 projections into `Ltx2TextEncoderWeights`,
+// unwidened. This is the arm the render path takes, because bf16 is the single
+// dtype upstream resolves for the whole pipeline and hands to `PromptEncoder`
+// (distilled.py:109, :111-113) — see the DTYPE note in ltx2_text_encoder.h.
+//
+// ~2.3 GB at the shipped [4096, 188160] and [2048, 188160], against the 4.6 GB
+// the widening below costs for the same two tensors. That is the whole of A24
+// wave 1 on the weight side: the checkpoint was always bf16 and the tower was
+// always computing on a copy at twice the width.
+Ltx2TextEncoderWeights Ltx2TextProjectionsAsBf16(
+    const Ltx2TextEncoderCheckpoint& checkpoint);
+
+// Widen the bf16 projections into `Ltx2TextEncoderWeights`'s f32 storage. This is
+// the PARITY arm: f32 is the dtype the goldens beside `ltx2_text_encoder.cpp`
+// were produced in, by executing upstream's own modules in `torch.float32`.
+//
+// Opt-in, and ~4.6 GB at the shipped widths. It stopped being what the render
+// path calls when the bf16 arm landed (LTX25-A24-TEXT-TOWER-BF16); it is kept
+// because deleting it would delete the arm the parity gate measures against.
 Ltx2TextEncoderWeights Ltx2WidenTextProjectionsToF32(
     const Ltx2TextEncoderCheckpoint& checkpoint);
 
@@ -737,8 +753,16 @@ bool Ltx2CheckpointHasConnector(const SafetensorsFile& file, Ltx2ConnectorStream
 Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
                                              Ltx2ConnectorStream stream);
 
-// Materialize one connector family out of the DiT checkpoint, widened to f32 —
-// which is `Ltx2ConnectorForward`'s declared parity dtype.
+// Materialize one connector family out of the DiT checkpoint at `compute_dtype`.
+//
+// `kBF16` is what the render path asks for and it is upstream's own answer
+// (`distilled.py:109` resolves ONE pipeline dtype and hands it to `PromptEncoder`
+// at `:113`, which constructs this module). It keeps the checkpoint's own 16-bit
+// words instead of expanding them, which HALVES the figure below. `kF32` is the
+// parity arm the five upstream goldens cover and is kept as the reference the
+// bf16 arm is measured against. A checkpoint that stores F32 under a bf16 request
+// is narrowed once here, which is what `.to(dtype)` does to a module built from an
+// f32 state dict. Row LTX25-A24-CONNECTOR-BF16, issue #2720.
 //
 // IT IS NOT CHEAP AND THE CALLER MUST TREAT IT AS EXPENSIVE. 129 tensors is 8
 // blocks of four dim x dim projections plus a 4x-wide feed-forward, so at the
@@ -756,8 +780,17 @@ Ltx2ConnectorConfig Ltx2ParseConnectorConfig(const nlohmann::json& config,
 // tensor of the family may be left over. A config that says 2 layers against a
 // file carrying 8 is refused by name here rather than binding the first two and
 // rendering.
+//
+// `compute_dtype` has NO DEFAULT, and that is deliberate. It selects between the
+// arm upstream runs (bf16, distilled.py:109) and the WIDER f32 parity arm the
+// five connector goldens are measured against. A default of either one makes the
+// other arrive by silence: with `kF32` a new call site would get twice the bytes
+// and a precision upstream does not have, and the only instrument that would
+// notice is the prompted-render path's `connector_video_not_bf16` counter. The
+// caller knows which arm it wants; it says so.
 Ltx2VaeWeights Ltx2LoadConnectorWeights(const SafetensorsFile& file,
-                                        const Ltx2ConnectorConfig& config);
+                                        const Ltx2ConnectorConfig& config,
+                                        vt::DType compute_dtype);
 
 // `__metadata__["model_version"]` ("2.5.0"), which is what
 // `detect_model_version` reads to pick a recipe (ltx-pipelines

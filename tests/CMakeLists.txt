@@ -1779,6 +1779,8 @@ vllm_cpp_add_test(test_deepseek_v4_paged_equiv
   vllm/models/test_deepseek_v4_paged_equiv.cpp)
 vllm_cpp_add_test(test_multi_kv_refusal
   vllm/model_executor/test_multi_kv_refusal.cpp)
+vllm_cpp_add_test(test_device_token_ids_refusal
+  vllm/model_executor/test_device_token_ids_refusal.cpp)
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 
@@ -1878,6 +1880,14 @@ target_include_directories(test_expert_stream_device_slot PRIVATE ${CMAKE_SOURCE
 # UnifiedMemory(), which is a process-global registration and not a per-case flag.
 vllm_cpp_add_test(test_resident_weight_host_addressable vllm/model_executor/test_resident_weight_host_addressable.cpp)
 target_include_directories(test_resident_weight_host_addressable PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ENG-EXPERT-STREAM-DEVICE (#2711): does `ResidentWeightF32` still hold its copy
+# source when the copy runs? Its own binary for the same reason as the sibling
+# above -- it registers a fake backend and a fake platform in the process-global
+# kXPU slot -- and separately because its backend DEFERS every `Copy` until a
+# `Synchronize`, which is the opposite of the sibling's eager `memcpy` and would
+# change what every case in that file measures.
+vllm_cpp_add_test(test_resident_weight_f32_copy_retires vllm/model_executor/test_resident_weight_f32_copy_retires.cpp)
+target_include_directories(test_resident_weight_f32_copy_retires PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ENG-EXPERT-STREAM (#1091): the step clock at the MoE entry points ForwardLayers
 # does NOT cover, and the final statistics line. Its own binary because it is the
 # only one that can observe `steps == 0` -- the store is a process-lifetime
@@ -1918,6 +1928,7 @@ vllm_cpp_add_test(test_logits_processor_host_addressable
   vllm/v1/sample/test_logits_processor_host_addressable.cpp)
 vllm_cpp_add_test(test_prepare_inputs vllm/v1/worker/test_prepare_inputs.cpp)
 vllm_cpp_add_test(test_combine_tokens vllm/v1/worker/test_combine_tokens.cpp)
+vllm_cpp_add_test(test_combine_row_predicate vllm/v1/worker/test_combine_row_predicate.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 # ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state

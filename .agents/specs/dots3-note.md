@@ -4387,6 +4387,26 @@ and is written with its reason beside it.
 UPSTREAM'S version, so the difference is carried by the gate's tolerance and
 measured, not defined away.
 
+**A SECOND difference, found by the fresh implementer who finished this brick
+rather than by the one who wrote it.** Upstream casts the routed weights to the
+activation dtype before the combine — `routed_weights = (routed_weights *
+self.router_scale).to(x_flat.dtype)` (`vision.py:200`) — so on a bf16 tower it
+mixes the experts with BF16 coefficients and accumulates `aggregated_gate` from
+those same rounded values. `vt::MoeRouterTopK` emits F32 weights and
+`vt::MoeCombine` consumes F32, so this port mixes with f32 coefficients. This is
+a WIDENING relative to upstream and `porting.md`'s memory-format rule asks for
+the reason in writing: the buffer is `[L, top_k]` f32, four bytes per selected
+slot, and its dtype is the shared ops' CONTRACT rather than a choice made here —
+narrowing it would mean a bf16 round trip that no op in `include/vt/ops.h`
+offers, written by hand beside the seam. It is also self-cancelling to first
+order, because both upstream and this port divide by the sum of the very
+coefficients they mixed with, so what survives is the ~4e-3 relative
+requantization of a 2-way mixture rather than a scale error. The reference keeps
+double throughout and models NEITHER rounding, which is why this sits inside the
+measured 7.81e-3 rather than beside it. Recorded here because a reader comparing
+`vision.py:200` with `VisionMoeFfn` will see the difference and is owed the
+reason; it is not owed a brick.
+
 #### 4.12.3 The combine's denominator is a CONSTANT, and that is why two arms refuse
 
 Upstream's combine (`vision.py:203-218`) accumulates a per-token
@@ -4564,6 +4584,7 @@ multimodal support (#51255)" — read out of the same clone's object store with
 | `test_openai_api_server_dots3_mm_forward` | 12 cases, **177 assertions**, 0 failed |
 | `test_dots3_note_scaffold` | 26 cases, **110835 assertions**, 0 failed |
 | `test_dots3_note_attn` | 51 cases, **6888 assertions**, 0 failed |
+| **the FULL gate** on the merged head — `cmake --build build -j 2` then `ctest -j 2` | **709/709 targets, `NINJA_RC=0`**; **720/720 tests passed, 0 failed**, 7 skipped for absent checkpoints or an absent CUDA device, `CTEST_RC=0`, 144.95 s |
 | `scripts/agent-preflight.sh` | rc 0, 25 record gates ok |
 | `check-commit-style.py` / `check-commit-trailers.py`, `--range $(git merge-base origin/main HEAD)..HEAD` | rc 0 / rc 0 |
 

@@ -1261,7 +1261,11 @@ target_compile_definitions(test_dots3_note_vision PRIVATE
 vllm_cpp_add_test(test_dots3_note_audio vllm/models/test_dots3_note_audio.cpp)
 target_compile_definitions(test_dots3_note_audio PRIVATE
   DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev"
-  VOXTRAL_AUDIO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal/fixtures/voxtral_audio")
+  VOXTRAL_AUDIO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal/fixtures/voxtral_audio"
+  # The reference-independence case re-reads THIS file and counts the qualified
+  # names in each reference namespace, so the enumeration is a measurement
+  # rather than a transcription asserted against itself.
+  DOTS3_AUDIO_TEST_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/test_dots3_note_audio.cpp")
 # dots3_note.h and dots3_note_audio.h are MODEL-PRIVATE headers under src/, not
 # include/vllm/ — same arrangement test_dots3_note_vision uses.
 target_include_directories(test_dots3_note_audio PRIVATE

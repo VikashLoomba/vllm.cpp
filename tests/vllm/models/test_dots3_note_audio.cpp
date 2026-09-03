@@ -41,6 +41,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -86,22 +88,31 @@ std::vector<float> ReadF32File(const std::string& path) {
 // Written from `nvidia/audio.py:96-126` @ `9035151d6` and from transformers
 // `audio_utils.mel_filter_bank:453` / `hertz_to_mel:285` / `mel_to_hertz:321`,
 // in double precision, sharing NO helper with `src/`. Every qualified name
-// below is `std::`; the count is asserted by `ref_front::kQualifiedNames`.
+// below is `std::`, and the enumeration case MEASURES that from this file's
+// own bytes rather than trusting the list.
 // ═══════════════════════════════════════════════════════════════════════════
 namespace ref_front {
 
-// Every qualified name used in this namespace, enumerated so the independence
-// claim is CHECKABLE rather than asserted. All 22 are `std::`: this reference
-// calls nothing from `vllm::`, nothing from `vt::` and nothing from the file
-// under test.
+// Every qualified name used in this namespace, MEASURED by the enumeration case
+// below — not transcribed. All 11 are `std::`: this reference calls nothing
+// from `vllm::`, nothing from `vt::` and nothing from the file under test.
 //
-//  1 std::vector       2 std::size_t      3 std::cos          4 std::sin
-//  5 std::log10        6 std::log         7 std::exp          8 std::max
-//  9 std::min         10 std::pow        11 std::string      12 std::sqrt
-// 13 std::abs         14 std::int16_t    15 std::int64_t     16 std::to_string
-// 17 std::fabs        18 std::floor      19 std::ceil        20 std::round
-// 21 std::llround     22 std::numeric_limits
-inline constexpr int kQualifiedNames = 22;
+//  1 std::size_t (36)         2 std::vector (19)    3 std::int64_t (4)
+//  4 std::log (3)             5 std::cos (2)        6 std::min (2)
+//  7 std::exp (1)             8 std::log10 (1)      9 std::max (1)
+// 10 std::numeric_limits (1) 11 std::sin (1)
+//
+// 71 occurrences of 11 distinct names. THIS LIST WAS WRONG WHEN THE FILE WAS
+// FIRST WRITTEN, and nothing could see it: it read 22 names asserted against a
+// hand-written `kQualifiedNames = 22`, and eleven of them — `std::pow`,
+// `std::string`, `std::sqrt`, `std::abs`, `std::int16_t`, `std::to_string`,
+// `std::fabs`, `std::floor`, `std::ceil`, `std::round`, `std::llround` — are
+// used NOWHERE in this namespace. Two (`std::llround`, `std::int16_t`) appear
+// nowhere in this FILE except inside that list. A constant compared with a
+// literal is a transcription, and a transcription cannot gate what it
+// transcribes; adding a `vllm::` call would not have moved it either.
+inline constexpr int kDistinctQualifiedNames = 11;
+inline constexpr int kQualifiedNameOccurrences = 71;
 
 constexpr double kPi = 3.14159265358979323846;
 
@@ -242,18 +253,22 @@ std::vector<std::vector<double>> LogMel(const std::vector<float>& wav,
 //
 // Written from `nvidia/audio_encoder.py` and `nvidia/audio.py` @ `9035151d6`,
 // in double precision, sharing NO helper with `src/` or with `ref_front`. Every
-// qualified name is `std::`; the count is `ref_tower::kQualifiedNames`.
+// qualified name is `std::`, measured the same way.
 // ═══════════════════════════════════════════════════════════════════════════
 namespace ref_tower {
 
-// Enumerated, as above. All 19 are `std::`.
+// MEASURED, as above. All 6 are `std::`.
 //
-//  1 std::vector      2 std::size_t     3 std::int64_t    4 std::exp
-//  5 std::sqrt        6 std::pow        7 std::cos        8 std::sin
-//  9 std::erf        10 std::max       11 std::min       12 std::string
-// 13 std::to_string  14 std::fabs      15 std::numeric_limits
-// 16 std::log        17 std::abs       18 std::sort      19 std::swap
-inline constexpr int kQualifiedNames = 19;
+//  1 std::size_t (24)   2 std::vector (14)   3 std::int64_t (10)
+//  4 std::sqrt (3)      5 std::erf (1)       6 std::exp (1)
+//
+// 53 occurrences of 6 distinct names. This list read 19 names before it was
+// measured; thirteen of them are not used here. That this reference reaches
+// only SIX names is itself the point — a 32-layer tower in double precision
+// needs `exp`, `erf` and `sqrt` and nothing else, so anything else appearing
+// in the measurement is a helper that leaked in from `src/`.
+inline constexpr int kDistinctQualifiedNames = 6;
+inline constexpr int kQualifiedNameOccurrences = 53;
 
 using Mat = std::vector<std::vector<double>>;
 
@@ -376,6 +391,103 @@ void MaskTime(std::vector<Mat>* x, std::int64_t valid) {
 }  // namespace ref_tower
 
 // ═══════════════════════════════════════════════════════════════════════════
+// THE ENUMERATION INSTRUMENT.
+//
+// Reads THIS source file at `DOTS3_AUDIO_TEST_SOURCE` (the same arrangement
+// `MODELOPT_MIXED_FIXTURE_DIR` uses to hand a test a path), strips comments and
+// string/char literals, takes the span of one reference namespace, and counts
+// every `scope::name`. Comments must be stripped or the enumeration LIST above
+// would count itself and the instrument would agree with any list it was given
+// — which is the exact failure this replaces.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+struct RefNames {
+  int distinct = 0;
+  int occurrences = 0;
+  std::set<std::string> scopes;
+  std::set<std::string> names;
+};
+
+std::string Join(const std::set<std::string>& s) {
+  std::string out;
+  for (const std::string& v : s) {
+    if (!out.empty()) out += ",";
+    out += v;
+  }
+  return out;
+}
+
+// Comments and literals out, everything else through unchanged.
+std::string StripCommentsAndLiterals(const std::string& code) {
+  std::string out;
+  const size_t n = code.size();
+  for (size_t i = 0; i < n;) {
+    const char c = code[i];
+    if (c == '/' && i + 1 < n && code[i + 1] == '/') {
+      const size_t j = code.find('\n', i);
+      i = (j == std::string::npos) ? n : j;
+    } else if (c == '/' && i + 1 < n && code[i + 1] == '*') {
+      const size_t j = code.find("*/", i + 2);
+      i = (j == std::string::npos) ? n : j + 2;
+    } else if (c == '"' || c == '\'') {
+      size_t j = i + 1;
+      while (j < n && code[j] != c) j += (code[j] == '\\') ? 2 : 1;
+      i = j + 1;
+    } else {
+      out += c;
+      ++i;
+    }
+  }
+  return out;
+}
+
+bool IsIdentChar(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
+RefNames QualifiedNamesIn(const std::string& ns) {
+  std::ifstream in(DOTS3_AUDIO_TEST_SOURCE, std::ios::binary);
+  REQUIRE_MESSAGE(in.good(),
+                  "the enumeration instrument could not open its own source at "
+                      << DOTS3_AUDIO_TEST_SOURCE);
+  const std::string src((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+  const std::string open = "namespace " + ns + " {";
+  const std::string close = "}  // namespace " + ns;
+  const size_t a = src.find(open);
+  const size_t b = src.find(close);
+  REQUIRE(a != std::string::npos);
+  REQUIRE(b != std::string::npos);
+  REQUIRE(b > a);
+  const std::string body = StripCommentsAndLiterals(src.substr(a, b - a));
+
+  RefNames r;
+  for (size_t i = 0; i + 1 < body.size(); ++i) {
+    if (body[i] != ':' || body[i + 1] != ':') continue;
+    // the scope to the left
+    size_t s = i;
+    while (s > 0 && IsIdentChar(body[s - 1])) --s;
+    if (s == i) continue;
+    // the name to the right
+    size_t e = i + 2;
+    size_t t = e;
+    while (t < body.size() && IsIdentChar(body[t])) ++t;
+    if (t == e) continue;
+    const std::string scope = body.substr(s, i - s);
+    const std::string name = body.substr(e, t - e);
+    r.scopes.insert(scope);
+    r.names.insert(scope + "::" + name);
+    ++r.occurrences;
+  }
+  r.distinct = static_cast<int>(r.names.size());
+  return r;
+}
+
+}  // namespace
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 1. THE ONE REAL ORACLE ON THIS ROW.
 // ═══════════════════════════════════════════════════════════════════════════
 TEST_CASE("dots3-note W7a: the SHARED slaney bank reproduces the committed voxtral oracle BIT for BIT") {
@@ -435,16 +547,37 @@ TEST_CASE("dots3-note W7a: the SHARED slaney bank reproduces the committed voxtr
 }
 
 TEST_CASE("dots3-note W7a: the two references share no helper with src/, by enumeration") {
-  // The row's convention (W6a 70, W6b 105, W6c 45). Both counts are reported so
-  // a reviewer can check the lists in the file against them, and the assertion
-  // is that the numbers are the ones the comments enumerate — a reference that
-  // grew a `vllm::` call would have to change one of these lines to pass.
-  MESSAGE("ref_front qualified names: " << ref_front::kQualifiedNames
-                                        << " (all std::)");
-  MESSAGE("ref_tower qualified names: " << ref_tower::kQualifiedNames
-                                        << " (all std::)");
-  CHECK(ref_front::kQualifiedNames == 22);
-  CHECK(ref_tower::kQualifiedNames == 19);
+  // The row's convention (W6a 70, W6b 105, W6c 45 qualified names, all `std::`).
+  //
+  // THIS CASE RE-READS THIS FILE AND COUNTS. It used to compare two
+  // hand-written constants with two literals, which measured nothing: the lists
+  // beside those constants named 22 and 19 names when the references actually
+  // use 11 and 6, and a reference that GREW a `vllm::` call would not have
+  // moved either number. The load-bearing assertion below is the SCOPE SET —
+  // every qualified name in each reference span resolves through `std::` — and
+  // it is computed from the bytes, so one `vllm::` or `vt::` call reddens it.
+  const RefNames front = QualifiedNamesIn("ref_front");
+  const RefNames tower = QualifiedNamesIn("ref_tower");
+
+  // The instrument must be shown to have READ something. A parse that found an
+  // empty span would otherwise report "zero non-std:: names" and pass.
+  REQUIRE(front.occurrences > 0);
+  REQUIRE(tower.occurrences > 0);
+
+  MESSAGE("ref_front: " << front.distinct << " distinct, " << front.occurrences
+                        << " occurrences, scopes=" << Join(front.scopes));
+  MESSAGE("ref_tower: " << tower.distinct << " distinct, " << tower.occurrences
+                        << " occurrences, scopes=" << Join(tower.scopes));
+
+  // The independence property itself.
+  CHECK(Join(front.scopes) == "std");
+  CHECK(Join(tower.scopes) == "std");
+
+  // And the enumerated lists, now that they are the measurement's own output.
+  CHECK(front.distinct == ref_front::kDistinctQualifiedNames);
+  CHECK(front.occurrences == ref_front::kQualifiedNameOccurrences);
+  CHECK(tower.distinct == ref_tower::kDistinctQualifiedNames);
+  CHECK(tower.occurrences == ref_tower::kQualifiedNameOccurrences);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

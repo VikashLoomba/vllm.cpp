@@ -2588,6 +2588,29 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     positions.push_back(static_cast<int32_t>(position));
   }
 
+  // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710) / ENG-MM-EMBED-DEVICE-IDS (#2730):
+  // WHETHER the host vector actually disagrees with the device buffer for this
+  // step. The pointer alone says the device buffer is authoritative; it does not
+  // say the two differ, and on an all-prefill step they do not.
+  //
+  // COMPUTED ONCE, HERE, and read by BOTH channels below -- `MmEmbedInputs` and
+  // `ModelForwardInput`. It used to sit beside the `ModelForwardInput`
+  // assignment, which is AFTER the multimodal embed, so the embed could not have
+  // been told. Two calls would be two derivations that can disagree about one
+  // step, and the embed's guard and the forward's guard must not.
+  //
+  // It shares `v1::CombineSplicesRow` with the combine that does the splicing,
+  // so the guards' predicate is the route's predicate. `idx_mapping` is null for
+  // the same reason the combine launch above passes null: the persistent batch is
+  // condensed dense, so batch row == req_state slot. Only meaningful when the
+  // pointer is live, so it is computed only there -- false on every non-mirror
+  // path, where both guards are inert anyway.
+  const bool host_token_ids_stale =
+      device_input_ids != nullptr
+          ? v1::AnyRowSplicedByCombine(step.seq_lens, input_batch_.prefill_len,
+                                       /*idx_mapping=*/nullptr, num_reqs)
+          : false;
+
   // ─── ENG-MM-INPUT-PIPELINE P2 (#2379): what FILLS ModelForwardInput::mm ────
   //
   // The gather takes the encoder-output rows this step's window reaches; the
@@ -2619,6 +2642,16 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // EMPTY, not null, when the model declares no M-RoPE hook — upstream's
     // `uses_mrope == False`, where the model reads the 1-D positions instead.
     embed_inputs.mrope_positions = &mrope_positions;
+    // ENG-MM-EMBED-DEVICE-IDS (#2730): THE assignment this row exists for.
+    // `token_ids` above is the host step vector, which this runner deliberately
+    // leaves STALE for decode rows -- the combine spliced each decode row's
+    // sampled token into `device_input_ids` on the main queue and never wrote it
+    // back. `batch_carries_mm()` is true on those decode steps BY DESIGN (see its
+    // own comment), so without these two lines `EmbedMm` merged `inputs_embeds`
+    // out of token id 0 on every one of them. Null / false on every non-mirror
+    // step, where the hooks are byte-identical to their pre-#2730 selves.
+    embed_inputs.device_token_ids = device_input_ids;
+    embed_inputs.host_token_ids_stale = host_token_ids_stale;
     mm_buffers = ModelRegistry::EmbedMm(*model_, config_, queue_, embed_inputs);
   }
 
@@ -2791,23 +2824,10 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   forward_input.device_token_ids = device_input_ids;
   // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): and WHETHER the host vector actually
   // disagrees with that buffer, which is what `ModelRegistry::Forward` refuses
-  // on. The pointer alone says the device buffer is authoritative; it does not
-  // say the two differ, and on an all-prefill step they do not.
-  //
-  // Computed HERE, beside the assignment, because this is the one place that
-  // holds both arrays. It shares `v1::CombineSplicesRow` with the combine that
-  // does the splicing, so the guard's predicate is the route's predicate and not
-  // a second derivation of it. `idx_mapping` is null for the same reason the
-  // combine launch above passes null: the persistent batch is condensed dense, so
-  // batch row == req_state slot.
-  //
-  // Only meaningful when the pointer is live, so it is computed only there —
-  // leaving it false on every non-mirror path, where the guard is inert anyway.
-  if (device_input_ids != nullptr) {
-    forward_input.host_token_ids_stale = v1::AnyRowSplicedByCombine(
-        step.seq_lens, input_batch_.prefill_len, /*idx_mapping=*/nullptr,
-        num_reqs);
-  }
+  // on. The one derivation, taken above the multimodal embed so that
+  // `MmEmbedInputs` could be told the same fact (#2730), and READ here rather
+  // than recomputed.
+  forward_input.host_token_ids_stale = host_token_ids_stale;
   // ENG-MM-INPUT-PIPELINE P2 (#2379): THE assignment this row exists for. Set
   // after aggregate construction for the same reason `device_token_ids` is —
   // the field sits past the positional initializers other callers use. nullopt

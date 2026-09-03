@@ -6333,6 +6333,98 @@ The container refusal is NARROWED and not merely reworded: it used to name
 "multi-channel or non-16-bit WAV" as owed to W7c, and multi-channel is now
 served. Nothing about the container arm is implemented here.
 
+#### 4.16.7 The gate, measured
+
+Built in `/dev/shm` at `-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, GCC, `-j 2`. Two suites, by
+their real target names:
+
+| Suite | Cases | Assertions |
+|---|---|---|
+| `test_dots3_note_audio` | **21 / 21 passed** | **3904 / 3904** |
+| `test_openai_api_server_dots3_mm_forward` | **27 / 27 passed** | **16344 / 16344** |
+
+`test_dots3_note_audio` sha256
+`1814f30286bfd39b49c6ca14c233b4293964a3b2d1fc5a8b682d711965d2678c`;
+`test_openai_api_server_dots3_mm_forward` sha256
+`042b208fcd41f238548d24760e3f66e170d95a8d17bc56f897c930032cd24420`.
+
+**The RED before, verbatim.** With the tests inverted and `src/` untouched, the
+served suite read **27 cases / 25 passed / 2 failed, 16321 assertions / 8
+failed**, and the stereo case died at the line that matters:
+
+```text
+test_api_server_dots3_mm_forward.cpp:1500: FATAL ERROR: REQUIRE( r.status == 200 ) is NOT correct!
+  values: REQUIRE( 400 == 200 )
+  logged: stereo body: {"error":{"code":400,"message":"dots3-note audio chat seam:
+  this request's audio is not a PCM16 MONO RIFF/WAVE buffer (DecodeWavPcm16Mono:
+  not mono). ..."}}
+```
+
+The other seven were the three repaired oracle statements, each asserted as a
+CLAIM rather than as a word: `#2814` absent, `PCM16 MONO` present,
+`multi-channel` present, `librosa` present in the container message; and
+`W7c-2` absent, `librosa` present, `libswresample` absent in the rate one.
+
+**The exactness claim of §4.16.2 is MEASURED, not asserted.** Against a
+`long double` reference over 517 frames:
+
+| Channels | Worst \|got - ref\| | Exactly equal |
+|---|---|---|
+| 1 | **0** | 517 / 517 |
+| 2 | **0** | 517 / 517 |
+| 3 | 1.98682e-08 | 161 / 517 |
+| 4 | **0** | 517 / 517 |
+| 8 | **0** | 517 / 517 |
+
+Every power of two is exact and 3 is not, which is exactly the shape §4.16.2
+predicts. 1.99e-08 is under a third of a float ulp near 1.0.
+
+**The served case's own numbers.** The stereo fixture's two channels differ
+from their mean in **7996 and 7996 of 8000** samples, so a port that picked one
+would be visibly wrong. The stereo request's first-token logprobs match the mono
+mean request's with a worst gap of **0**, and differ from channel 0's by
+**0.2155** and from channel 1's by **0.2828**.
+
+#### The mutation table
+
+Each mutation applied to the tracked source, rebuilt, run, and restored. The
+harness asserts that the mutation APPLIED and that the build SUCCEEDED before it
+reads any result — **M1 and M2 first came back as build failures**
+(`-Werror=unused-variable` on the `denom` the mutation orphaned) and were
+reported as `BUILD FAILED -- NOT a test result` rather than as a green, which is
+the exact failure mode this row has hit twice.
+
+| # | Mutation | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` | audio sha256 / served sha256 |
+|---|---|---|---|---|
+| — | baseline | 21 / 3904 pass | 27 / 16344 pass | `1814f302…` / `042b208f…` |
+| M1 | take channel 0 instead of the mean | **1 case / 8 assertions FAILED** | **1 case / 2 FAILED** (`gap_mean == 0.0` and `gap_left > 1e-4`) | `7fb0371d3467a6b456026f5906a4cc89adb089a86de3b8c85a535f0db023dc5c` / `ea0e227123ed1da141c5f7f079b06df875bda1613ba2f66e6d1cca55aa46f08d` |
+| M2 | sum the channels without dividing | **1 case / 9 assertions FAILED** | **1 case / 1 FAILED** (`gap_mean == 0.0`) | `d973c90715908c4f4d536eedc1cb591d7b3b628f7078acd29518d9d761291aed` / `fc0e5545b1be80a88588413af8aa8280413064f490549d8aa32a78aecb7a20be` |
+| M3 | mean over the FRAME axis, not the channel axis | **1 case / 9 assertions FAILED** | **1 case / 1 FAILED** (`gap_mean == 0.0`) | `f0aeb23884caae649f244139a1481e97bfe9327fda7aa59d7fb1be4c86c49520` / `95bf9489d3b2bf7c02d1af7b2324734f267ac87955b125b91b58f5c241296c67` |
+| M4 | delete the production call site (back to `DecodeWavPcm16Mono`) | 21 / 3904 pass | **1 case / 1 FAILED**, `REQUIRE( 400 == 200 )`, and the suite's assertion total drops to 16322 because the FATAL aborts the case | `13b732986cf71a484044c15155e6a6cec3c5aea56cfeef8bd92c77db7eefce4b` / `f24fbb23cd1857f7f76263b3cf59bb299f7b9232588479380980a4cfb12c1a9a` |
+
+Ten distinct shas, none equal to the baseline's or to another row's, so no
+result here is a stale binary reporting green.
+
+**M1 and M2 are separated, which is the point of the fixture's construction.**
+Both move the answer, and only M1 also fails `gap_left > 1e-4` — because with
+channel 0 picked, the served stereo answer IS channel 0's. M2 leaves them
+different and fails only the equality. A fixture whose channels were equal, or
+whose mean was compared by tolerance alone, could not tell the two defects
+apart.
+
+**M4 is the reachability line, and its column shape is the measurement.**
+`test_dots3_note_audio` stays fully green under it: the decoder still computes
+the right mean, it is simply no longer called. Only the suite that enters
+through `ApiServer::handle_chat_completions` moves. That is the difference
+AGENTS.md's "Nothing lands dead" asks for, shown rather than argued.
+
+**Restored byte-for-byte, and verified at the BINARY.** After the last mutation
+the tree was rebuilt and both binaries hashed again: `1814f302…` and
+`042b208f…`, identical to the baseline row above, with both suites green at
+21 / 3904 and 27 / 16344. A restored source that produced a different binary
+would mean the restore was not byte-for-byte.
+
 
 ## 5. Gates
 

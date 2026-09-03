@@ -173,24 +173,26 @@ so every number below can be checked without the share.
 `AGENTS.md` requires the oracle to build **and run** the model. A 16.3 GiB
 load is not a generation.
 
-- **The forward is blocked on `thor:gpu0`, and WHY is open.** Memory
-  profiling dies with `CUDA error: no kernel image is available for execution
-  on the device`. The throw happens **inside the plugin's own quantized GEMM**:
+- **The forward is blocked on `thor:gpu0`. Where it THROWS is not where it
+  FAILED.** Memory profiling dies with `CUDA error: no kernel image is
+  available for execution on the device`. The throw happens **inside the
+  plugin's own quantized GEMM**:
   `linear.py:1763` -> `vllm_gguf_plugin/quantization/linear.py:261` ->
   `:49 _fused_mul_mat_gguf` -> `vllm_gguf_plugin/ops.py:207 ggml_mul_mat_a8` ->
   `torch.ops._C_gguf.ggml_mul_mat_a8`, with C++ frames #15-#17 inside
   `vllm_gguf_plugin/_C_gguf.abi3.so` calling
   `torch_call_dispatcher("aten::new_zeros")` (`torch/csrc/stable/ops.h:975`).
   Only below that does `at::native::FillFunctor<c10::BFloat16>` appear, at
-  frame #2. That fill is `ggml_mul_mat_a8`'s **first** statement
-  (`csrc/gguf/gguf_kernel.cu:228`), and what raised is the launch check torch
-  runs after it.
+  frame #2. That fill is the **first device-touching statement** of
+  `ggml_mul_mat_a8` (`csrc/gguf/gguf_kernel.cu:228`; the five lines above it
+  read shapes and take a `DeviceGuard`, and none of them launches anything),
+  and what raised is the launch check torch runs after it.
 - **A launch check reports whichever launch last failed, not necessarily its
   own.** `cudaErrorNoKernelImageForDevice` is returned to the launching thread
   and sits in the last-error slot until some `cudaGetLastError` collects it.
   The plugin's `csrc/` contains **zero** launch checks across all eleven files,
   and vLLM's own `LAUNCH_ACTIVATION_GATE_KERNEL`
-  (`csrc/libtorch_stable/activation_kernels.cu:250-288`) checks none either. So
+  (`csrc/libtorch_stable/activation_kernels.cu:235-288`) checks none either. So
   the frame that raised need not be the frame that failed, and reading the
   bottom of this stack as "PyTorch's bf16 fill has no image" is not a
   conclusion the stack supports.
@@ -200,9 +202,11 @@ load is not a generation.
   `cp312-cp312-manylinux_2_28_aarch64`, `git_version
   cf30153c4c131c8164ee7798e5022d810682e2cb`. Its `torch/lib/libtorch_cuda.so`
   carries SASS for `sm_80, 90, 100, 103, 110, 120, 121` — **508 `sm_110` cubin
-  entries over 449 fatbin blocks**. The same box has run that same
-  `torch 2.13.0+cu130` at `capability (11, 0)` before: `CUBLAS_OK (bf16
-  1024x1024 matmul executed)`, `.agents/specs/lease-runtime-staging.md`.
+  entries over 449 fatbin blocks**. The same box has run `torch 2.13.0+cu130`
+  at `capability (11, 0)` before: `CUBLAS_OK (bf16 1024x1024 matmul executed)`,
+  `.agents/specs/lease-runtime-staging.md:70-78`. That leg staged its own
+  relocated tree rather than pip-installing the wheel, so it corroborates the
+  fatbin measurement and does not replace it.
 - **Of the three objects measured, the one with no image for this device is
   vLLM's own wheel.** `vllm/_C_stable_libtorch.abi3.so`, built on GB10 and
   installed from `/workspace/oracle-vllm/`, carries `sm_80, 89, 90, 120` SASS
@@ -217,19 +221,41 @@ load is not a generation.
   what makes the parse trustworthy for the other two objects. Instrument,
   inputs and output:
   `docs/bench-evidence/vllm-gguf-plugin-thor-20260903/fatbin-arch-20260903.txt`.
-- **What is NOT established: which launch set the flag.** Two candidates
-  survive and each has an argument against it. The plugin's own
-  `quantize_row_q8_1_cuda` / `ggml_mul_mat_q4_K_q8_1_cuda` from the preceding
-  `gate_up_proj` are unchecked and in the window — but that object does carry
-  `sm_110`. vLLM's `silu_and_mul` is unchecked and in the window and its object
-  does not carry `sm_110` — but `rms_norm_kernel` is in the same arch class and
-  the forward plainly got past `post_attention_layernorm`
-  (`qwen3_next.py:546`) to reach the MLP at `:554`, which a universally
-  imageless `_C` does not explain. Naming the culprit needs one cheap run that
-  this record does not have: `CUDA_LAUNCH_BLOCKING=1`, or a
-  `cudaGetLastError` immediately after each launch. Until then the honest
-  statement is that the forward is blocked, the throw is inside the plugin's
-  op, and the attribution is open.
+- **The failing launch is `torch.ops._C.silu_and_mul`, by elimination over a
+  closed window.** `gate_up_proj` (`qwen2_moe.py:113`) took the identical route
+  two lines earlier and its own `new_zeros` did NOT raise, so the last-error
+  slot was clean there and the failing launch is between the two `new_zeros`
+  calls. That window holds exactly three launches: `gate_up`'s
+  `quantize_row_q8_1_cuda` and `ggml_mul_mat_*_q8_1_cuda`, both unchecked, and
+  `act_fn` at `:114`, which is `torch.ops._C.silu_and_mul`, also unchecked.
+  Nothing else in it launches a checked kernel. The first two are in an object
+  that carries an `sm_110` image, measured twice and independently, and
+  `cudaErrorNoKernelImageForDevice` is returned exactly when no compatible
+  image exists — so they cannot produce it. The third is
+  `vllm::act_and_mul_kernel`, `sm_120` ELF with no PTX. It is also the FIRST
+  vLLM `_C` kernel the whole forward reaches, which is why the load and every
+  preceding norm and GDN attention layer ran first.
+- **The counter-argument that kept this open is refuted, by execution.** It was
+  that `rms_norm_kernel` is in the same arch class, so a uniformly imageless
+  `_C` should have killed layer 0 long before the MLP. Those norms never enter
+  `_C`. Qwen3.5's norm is `GemmaRMSNorm` under an alias
+  (`qwen3_next.py:28`), which widens its weight to `f32` before calling the IR
+  op (`layernorm.py:157`), while `vllm/kernels/vllm_c.py` admits its `rms_norm`
+  and `fused_add_rms_norm` impls only for `weight.dtype == x.dtype`;
+  `vllm/ir/op.py:344-351` then skips the impl and takes `native`, the next
+  entry of the `['vllm_c', 'native']` priority the run's own logged
+  `kernel_config` sets. `ir_dispatch_probe.py` executes those exact source
+  constructs out of the pinned checkout and reports `False`, `False` and a
+  `True` positive control on a dtype-matched weight.
+- **What is still owed is the direct observation.** This is a deduction from a
+  closed enumeration plus two offline measurements, not something anyone
+  watched happen. `CUDA_LAUNCH_BLOCKING=1`, or a `cudaGetLastError` after each
+  launch, sees it directly. The deduction predicts that `dgx:gpu0` does not hit
+  this wall, since it is `sm_121a` and the wheel's `sm_120` SASS covers it, and
+  the queued job there reads that prediction out. Working or not, the wall is
+  the pinned vLLM wheel's own arch list — a build input, not GGUF, not the
+  plugin, and not this checkpoint. Deduction, instruments and transcripts:
+  `docs/bench-evidence/vllm-gguf-plugin-thor-20260903/no-kernel-image-attribution-20260903.txt`.
 - **`dgx:gpu0` is untried.** It is `sm_121a`, the capability the vLLM wheel
   was built for and the one its `sm_120` code actually covers; `rc` job
   `7a45427e-ad86-4042-aeea-cdf8db535a54` is queued there with the identical

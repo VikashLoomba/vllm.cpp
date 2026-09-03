@@ -6847,6 +6847,188 @@ none. It is gated in both directions: a rate just past it refuses, and 44.1 kHz
 serves.
 
 
+#### 4.17.11 The gate, measured
+
+Built in `/dev/shm` at `-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`, GCC, `-j 2`. Two suites, by
+their real target names:
+
+| Suite | Cases | Assertions |
+|---|---|---|
+| `test_dots3_note_audio` | **24 / 24 passed** | **3997 / 3997** |
+| `test_openai_api_server_dots3_mm_forward` | **28 / 28 passed** | **16374 / 16374** |
+
+`test_dots3_note_audio` sha256
+`2dffef516125164e47bc761d33e9ea225b95bec7d6a0a6b9be80bc0d055c4cee`;
+`test_openai_api_server_dots3_mm_forward` sha256
+`2c36cc9776e3839c8efbd117eb789d7e49292f194f5e23dadcd7f56ac099f0f6`. The served
+suite's sha moved once during the slice, when §4.17.13's two outside controls
+were added; the mutation table is measured against this final one and the whole
+sweep was re-run rather than patched.
+
+**The port reproduces scipy BIT FOR BIT on four of the five golden cases.**
+
+| Case | Conversion | `n_in` -> `n_out` | peak | worst \|ours - scipy\| |
+|---|---|---|---|---|
+| `Wav44100` | 44100 -> 16000 | 441 -> 160 | 0.98991 | **0** |
+| `Wav48000` | 48000 -> 16000 | 480 -> 160 | 0.98984 | **0** |
+| `Wav22050` | 22050 -> 16000 | 220 -> 160 | 0.98989 | **0** |
+| `Wav8000` | 8000 -> 16000 | 80 -> 160 | 0.99038 | **0** |
+| `Alias44100` | 44100 -> 16000 | 441 -> 160 | 0.50021 | **8.31e-18** |
+
+Worst against `ref_resample`, the independent second transcription, is
+**2.95e-08** — half a `float` ulp, so the two disagree only in the narrowing
+store.
+
+**THE TOLERANCE IS NOT TWO TIMES THAT FLOOR, AND SAYING WHY IS THE POINT.**
+"~2x the measured float floor" would be 1.7e-17, and gating there would be
+gating on a coincidence of rounding rather than on a bound: the port and scipy
+agree to ~1e-15 in DOUBLE, and everything after that is one narrowing store
+whose granularity is a `float` ulp. A legitimate platform difference — another
+libm's `sin` by one ulp in the filter taps, or a contracted multiply-add in the
+convolution — moves the double answer by ~1e-16 relative, which usually narrows
+to the same `float` and can narrow to the adjacent one. **The gate is therefore
+TWO FLOAT ULPS at the fixtures' peak of ~0.99, which is 1.2e-7**, and every
+defect it exists to catch is orders above it.
+
+**The difference assertion, which is what makes that tolerance mean anything.**
+A nearest-sample decimation computed in the test sits this far from the golden:
+
+| Case | nearest-sample vs golden | against a tolerance of |
+|---|---|---|
+| `Wav44100` | 0.0538 | 1.2e-7 |
+| `Wav48000` | 0.0530 | 1.2e-7 |
+| `Wav22050` | 0.1480 | 1.2e-7 |
+| `Wav8000` | 0.3495 | 1.2e-7 |
+| `Alias44100` | 0.4568 | 1.2e-7 |
+
+**The generator's own agreement, which is what makes the C++ a port.** The six
+steps written a second time in plain Python, with `i0` as its own power series,
+against `scipy.signal.resample_poly` itself: worst 6.11e-15 in `double` over the
+five cases, and **0.0** after narrowing both sides to `float32` on four of them
+(2.75e-18 on `Alias44100`). scipy 1.17.1, numpy 2.3.5.
+
+**The independence instrument's counts, from its own reading of the file.**
+
+| Namespace | Distinct | Occurrences | Scopes |
+|---|---|---|---|
+| `ref_front` | 11 | 71 | `std` |
+| `ref_tower` | 6 | 53 | `std` |
+| `ref_chunks` | 2 | 25 | `std` |
+| `ref_resample` | **5** | **63** | **`std`** |
+
+`ref_resample` reaches exactly two transcendentals, `std::sin` and `std::sqrt`,
+beside `std::int64_t` (39), `std::size_t` (14) and `std::vector` (8). The
+instrument's own standing pp-number gate is unchanged and still green.
+
+**The front end's own numbers.** At 22050 -> 16000 the front end's mel is
+BIT-IDENTICAL to the mel of the same waveform pre-resampled and handed in at
+16000: **0 of 1600 values differ**. The resample itself is 2.98e-08 from
+`ref_resample` there.
+
+**The served case's numbers.**
+
+| Comparison | Worst first-token logprob gap |
+|---|---|
+| 44.1 kHz vs its OWN offline resample, through a PCM16 container | 0.00957 |
+| 44.1 kHz vs the NATIVE 16 kHz recording of the same signal | **0.00705** |
+| 44.1 kHz vs SILENCE | 0.2488 |
+| 44.1 kHz vs a DIFFERENT clip | 0.2605 |
+
+The second row is the one worth reading twice: the resampled 44.1 kHz clip lands
+CLOSER to a native 16 kHz recording of the same continuous signal than to its own
+offline resample, because the offline arm pays a PCM16 quantization the served
+arm does not.
+
+#### 4.17.12 The RED before, verbatim, and one defect it found
+
+With `src/` changed and the tests still asserting the refusals, the front-end
+suite read **21 cases / 20 passed / 1 failed, 3914 assertions / 4 failed**:
+
+```text
+test_dots3_note_audio.cpp:827: ERROR: CHECK( msg.find("22050") != std::string::npos ) is NOT correct!
+  values: CHECK( 18446744073709551615 != 18446744073709551615 )
+```
+
+with `W7c-2`, `RESAMPLING IS NOT PORTED` and `libswresample` failing the same
+way: the throw those four asserted on no longer happens.
+
+The served suite read **27 cases / 26 passed / 1 failed, 16344 assertions /
+5 failed**, and it did NOT read what a correct implementation would have made it
+read:
+
+```text
+test_api_server_dots3_mm_forward.cpp:1403: ERROR: CHECK( r.status == 400 ) is NOT correct!
+  values: CHECK( 500 == 400 )
+  logged: body: {"error":{"code":500,"message":"WhisperAudioProcessor: resample
+  deferred; provide audio at cfg.sampling_rate (16 kHz)","param":null,
+  "type":"InternalServerError"}}
+```
+
+**That 500 is a real defect the served inversion found, and a unit test on the
+resampler could not have.** `ProcessWaveform` rebound the sample pointer and the
+length after resampling and left `sample_rate` at the REQUEST's value, so the
+resampled buffer was still described as 22050 Hz when it reached
+`WhisperAudioProcessor::ProcessWaveform` — which this drives once per chunk, and
+which carries its OWN rate refusal for the Whisper/Voxtral row
+(`audio_processor.cpp:214-221`). That refusal is a bare `runtime_error`, so the
+server answered HTTP 500 rather than 400. Before W7c-2 the missing assignment was
+unreachable, because the refusal above it guaranteed the two rates were equal.
+The three variables that describe a waveform now move together.
+
+#### 4.17.13 The mutation table, measured
+
+Each mutation applied to the tracked source, rebuilt, run, and restored. The
+harness asserts that the mutation APPLIED and that the build SUCCEEDED before it
+reads any result, and records the binary sha256 for every arm, because on this
+row a failed build has twice read as a pass.
+
+| # | Mutation | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` |
+|---|---|---|---|
+| — | baseline | 24 / 3997 pass | 28 / 16374 pass |
+| M1 | return the input unresampled | **2 cases / 5 FAILED**, `kw.num_samples == kAudioSamples` | **2 cases / 3 FAILED**, `t22 == t16 - 2` |
+| M2 | return zeros of the right length | **2 cases / 16 FAILED**, `worst <= kResampleTol` | **1 case / 2 FAILED**, `gap_native < 5e-2` |
+| M3 | drop the anti-alias filter, decimate by picking samples | **2 cases / 11 FAILED**, `worst <= kResampleTol` | **1 case / 1 FAILED**, `gap_native < 5e-2` |
+| M4 | off-by-one the `n_pre_remove` centring | **2 cases / 11 FAILED**, `worst <= kResampleTol` | 28 / 16374 pass |
+| M5 | delete the production call site | **1 case FAILED**, the subcase THREW | **2 cases / 2 FAILED**, `r.status == 200` |
+| M6 | hash the RAW waveform in the 3-argument `HashAudio` | **1 case / 1 FAILED**, `at_target != at_44100` | **1 case / 1 FAILED**, `at16.status == 200` |
+| M7 | the ROUTE reverts to the 2-argument `HashAudio` | 24 / 3997 pass | **1 case / 1 FAILED**, `at16.status == 200` |
+
+Binary sha256 prefixes, none equal to the baseline's on the suite the mutation
+can reach: M1 `b16e7937…` / `eb10ff9d…`; M2 `94f5f395…` / `4bbe45f6…`; M3
+`11d1573d…` / `9974205a…`; M4 `1f065c69…` / `4098729e…`; M5 `3923ee19…` /
+`8d481591…`; M6 `5db8b8d7…` / `4147ee10…`; M7 `c6e15207…` / `b585f8a0…`.
+
+**M4 is the one the served suite cannot see, and that is stated rather than
+hidden.** A one-sample phase shift moves the front-end comparison by far more
+than 1.2e-7 and moves the served answer by less than the 5e-2 the native-clip
+control allows. The value gate is the front-end suite's; the served suite gates
+that the capability is REACHED and that it is not dead or aliased.
+
+**M2 and M3 first read GREEN on the served suite, and that finding changed the
+test rather than the report.** Its value assertion compared the request against
+an offline reference computed with the SAME production code, so both sides moved
+together — a shared-helper consistency check wearing a correctness gate. Two
+controls now come from outside the resample path: a WAV of literal silence,
+which is never resampled at all, and the natively-16 kHz fixture, which is the
+same continuous signal from the same closed form. §4.17.11 carries their
+numbers.
+
+**M7 is the reachability line for §4.17.6, and it works for a reason worth
+recording.** Reverting the ROUTE to the two-argument hash leaves the front-end
+suite fully green — the overload still computes the right key, it is simply not
+asked for — and reds only the suite that enters through
+`ApiServer::handle_chat_completions`. It reds there because the inverted subcase
+serves the SAME 8000-frame buffer at 22050 Hz and then at 16000 Hz on ONE
+harness, so the collision §4.17.6 describes is a live cross-request cache hit and
+not a hypothetical.
+
+**Restored byte-for-byte, and verified at the BINARY.** After the last mutation
+the tree was rebuilt and both binaries hashed again: `2dffef51…` and
+`2c36cc97…`, identical to the baseline row, with both suites green at 24 / 3997
+and 28 / 16374.
+
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**

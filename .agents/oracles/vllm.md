@@ -111,3 +111,26 @@ additionally owes these four:
 measurement and its explicit non-claims are in
 [`../sync/2026-09-03-e126687-runhalf.md`](../sync/2026-09-03-e126687-runhalf.md)
 §6.
+
+## Device-scoped gateability
+
+`gateable = yes` above is a property of the oracle, not a promise about every
+board. Where a device has been MEASURED to build and run a gate model, it is
+recorded here with the evidence; absence from this table means unmeasured, never
+unsupported. One row per measurement, appended by the change that made it.
+
+| device | arch | measured | builds | runs a gate model | evidence |
+|---|---|---|---|---|---|
+| `strix:gpu0` | `gfx1151` (RDNA 3.5, Radeon 8060S, ROCm 7.2.4) | 2026-09-03 | yes | yes — Qwen3.8-27B Q4_K_M GGUF, 6 prompts x 48 greedy tokens, reproducible | [`oracle-vllm-gfx1151-20260903.md`](../../docs/bench-evidence/oracle-vllm-gfx1151-20260903.md) |
+
+**gfx1151 needs five packages a bare ROCm image does not carry**, and each of
+their absences presents as a device failure rather than as a provisioning gap:
+`python3-dev`, `rocm-libs`, `libdrm-dev`, the ROCm `torchvision`, and `amdsmi`.
+`amdsmi` is the one that matters most: `vllm/platforms/__init__.py:110-128`
+decides whether the platform is ROCm by importing it, so without it vLLM falls
+back to `UnspecifiedPlatform` on a fully working ROCm box. The evidence file
+carries the exact message each one produces.
+
+**No `HSA_OVERRIDE_GFX_VERSION` was set for that measurement**, and none may be
+set for another. That knob makes the runtime report a different device, and a
+pin taken under it is a pin on a fiction.

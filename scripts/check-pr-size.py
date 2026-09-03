@@ -228,9 +228,9 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 # rule.
 #
 # The extension list is EXACTLY the union of what the tracked per-run
-# directories carry, and it deliberately omits `.md` and `.json`. Those two
-# already classify as public_document through DOC below, and the evidence arm is
-# tested FIRST, so admitting them here would silently RECLASSIFY
+# directories carry, and it deliberately omits `.md` and `.json`. Those two already classify as
+# public_document through DOC below, and the evidence arm is tested FIRST, so
+# admitting them here would silently RECLASSIFY
 # docs/bench-evidence/mxfp4-qwen/*.md and its golden .json. Preserving the class
 # of a path that already had one matters more than making the directory
 # uniform.
@@ -239,30 +239,60 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 # the number. Nothing builds them, nothing installs them, and no entry point
 # reaches them.
 #
-# `.py`, `.jsonl` and `.rc` joined 2026-09-03. Fifth instance of the same class,
-# repaired the same way: NAME the artifact kind, do not relax the shape. Each is
-# one kind a `rc` measurement job actually emits, and the list stays a closed
-# enumeration so nothing arbitrary is admitted by growing it:
+# `.py` joined them 2026-09-03 (#2629). A numeric study whose instrument is a
+# numpy replica arrives as `.py` for exactly the reason a profiler run arrives
+# as `.sh`: it IS the recipe. `docs/bench-evidence/gdn-chunked-decomposition-
+# 20260902/` landed SIX of them, and `classify_path` FAILS CLOSED, so the
+# whole-tree sweep in tests/scripts/test_check_pr_size.py went red on the branch
+# carrying them and would have gone red on `main` the moment they landed. At
+# least the SEVENTH instance of the class -- #856, #668, #989, #1448, then
+# `8496d93dd` (csv, #2316) and `6d1335568` (AGENT_RUN_SCRIPT, #2609), the last
+# of those one day earlier -- and repaired the same way: name the surface, do
+# not widen a rule.
 #
-#   `.py`    the fold and the sampler that produced the numbers -- the recipe,
-#            exactly as `.sh` and `.cu` are. Verified, not assumed: the only
-#            referents of `fold.py` and `amd_clock_sample.py` in the tree are
-#            the evidence document, `job-as-run.sh` beside them and the row's
-#            staged recipe under `.agents/scripts/`. Nothing under
-#            CMakeLists.txt, .github/, scripts/, src/ or include/ reaches them.
+# THE `.sh`/`.cu` PREMISE ABOVE IS TOO STRONG AND THE TREE FALSIFIES IT. Two
+# tracked files DO read a path under docs/bench-evidence/ by name:
+# scripts/dgx-online-serving.sh:1203 passes
+# docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json to
+# tools/bench/mxfp4_smoke_gate.py as a gate input, and
+# tests/scripts/test_cpu_x86_llamacpp_floor.py:26 reads
+# docs/bench-evidence/cpu-x86-llamacpp-20260811.md. So "nothing outside docs/
+# references this directory" is false as a universal claim and must not be
+# repeated.
+#
+# What was checked for THIS arm, and what holds: NO `.py` under
+# docs/bench-evidence/ is read, imported, built, installed or executed by
+# anything outside docs/. The only outside mentions of one are the literal path
+# strings in this checker's own test, which classify them rather than run them.
+# That is the narrow claim the `py` arm rests on. A `.py` OUTSIDE a per-run
+# evidence directory still fails closed, which is what keeps this from becoming
+# a suffix licence.
+#
+# `.jsonl` and `.rc` joined the same day (#2497), from a different directory and
+# for a different reason than `.py`. They are not recipes; they are the job's
+# own OUTPUT, which the `.py` arm above does not cover:
+#
 #   `.jsonl` the raw instrument stream, one JSON object per sample. It is the
-#            population a folded clock figure is derived FROM, so it is the same
-#            kind of artifact as a `.log` and not a document. `.json` above is
-#            deliberately still absent, and `.jsonl` does not match DOC.
+#            population a folded clock figure is derived FROM, which is what a
+#            `.log` already is here, so it takes the same class. `.json` stays
+#            deliberately absent for the reason given above, and `.jsonl` does
+#            not match DOC.
 #   `.rc`    one process's recorded exit status. A leg's `rc` is what decides
 #            whether its figure may be used at all, so it is evidence in the
 #            strictest sense: two bytes nothing can regenerate.
 #
-# All fourteen paths of `rocm-strix-llamacpp-denominator-20260902` (#2497) were
-# unclassified without these, which left
-# `test_every_tracked_and_current_change_path_is_classified` RED and would have
-# reddened `main` itself, because this checker is CI-only and
-# `agent-preflight.sh` never runs it -- the same blind spot #2609 names.
+# Twelve paths of `rocm-strix-llamacpp-denominator-20260902` were unclassified
+# without them -- six `clock-leg*.jsonl` and six `leg*.rc` -- and two more,
+# `fold.py` and `amd_clock_sample.py`, were unclassified until #2629 landed the
+# `py` arm above hours earlier. Same failure, same day, two directories, found
+# independently.
+#
+# The narrow claim above is re-checked for these two and holds the same way:
+# nothing outside docs/ reads, imports, builds, installs or executes a `.jsonl`
+# or `.rc` under docs/bench-evidence/. It is NOT re-stated as the universal
+# claim the paragraph above corrects. Outside a per-run evidence directory both
+# still fail closed, which is what keeps this a named surface rather than a
+# suffix licence.
 BENCH_EVIDENCE_RUN = re.compile(
     r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
     r"\.(?:txt|log|gz|sh|cu|py|jsonl|rc)\Z"

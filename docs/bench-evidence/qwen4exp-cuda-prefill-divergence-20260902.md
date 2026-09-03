@@ -112,9 +112,14 @@ chunked WY decomposition. The CPU arm runs an exact sequential recurrence.
 — which is why that lever removes the difference.
 
 **vLLM implements the chunked one.** Read at vLLM
-`5559679229bc961848b121ccdeaa8fa5d79bec98` (a FORWARD REFERENCE beyond this
-row's pin), in the vendored Flash-Linear-Attention tree
-`vllm/third_party/flash_linear_attention/ops/`:
+`5559679229bc961848b121ccdeaa8fa5d79bec98` — **the parity pin itself**
+(`.agents/upstream-sync.md`'s ` ```parity-pin ` block and
+`.agents/oracles/vllm.md` both carry that revision) — in the vendored
+Flash-Linear-Attention tree `vllm/third_party/flash_linear_attention/ops/`.
+This sentence read "a FORWARD REFERENCE beyond this row's pin" when it was
+written; that was wrong, and it understated the citation. Nothing else in this
+file changes: every anchor below was already read at that revision, so calling
+it the pin strengthens the measurement rather than restating it:
 
 | tensor | FLA dtype | anchor | ours |
 |---|---|---|---|
@@ -127,6 +132,21 @@ row's pin), in the vendored Flash-Linear-Attention tree
 There is no `state_dtype` parameter and no switch that widens `h`; the caller
 (`vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1438-1450`)
 passes none.
+
+**This table is INCOMPLETE, and wave GDNDECOMP found the two it omits.** Both
+are rounding sites FLA performs and neither appears above:
+
+| tensor | FLA dtype | anchor | note |
+|---|---|---|---|
+| `A^-1`, the triangular inverse | **bf16** | `chunk.py:50` passes `output_dtype=k.dtype` to `solve_tril`; stored `fp_downcast_rounding="rtne"` at `solve_tril.py:96,203,425-460` | `A` is f32, its INVERSE is not |
+| `h` as the operand of `w @ h^T` | **bf16** | `chunk_delta_h.py:178` `tl.trans(b_h1).to(b_w.dtype)` | the running state is f32 in registers and is cast DOWN to feed the product that reads it |
+
+Their sizes, and the split of this row's `3.525e-04` into a reassociation term
+and a dtype term, are measured in
+[`gdn-chunked-decomposition-20260902.md`](gdn-chunked-decomposition-20260902.md)
+([#2612](https://github.com/mudler/vllm.cpp/issues/2612)). The one-line result
+of that wave: the chunked reassociation is exact (`2.4e-17`) and the whole gap
+is the bf16 placement above.
 
 **So the CUDA arm mirrors the oracle and the CPU arm is the outlier.** Our CPU
 sequential recurrence is MORE accurate than vLLM's chunked kernel, not more

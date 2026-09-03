@@ -205,7 +205,14 @@ MATRICES = {
     # (`Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`), its own widths, and its own owed
     # GEMV arm, none of which `QUANT-EXL3`'s cells can carry without saying two
     # things at once (#2495).
-    "QUANT": (AGENTS / "quantization-matrix.md", 86),
+    # 87 since 2026-09-02: +`QUANT-EXL3-PERF`, the EXL3 `m<=8` GEMV arm set and
+    # its selection envelope. A separate row from `QUANT-EXL3` and
+    # `QUANT-EXL3-MUL1` because both of those are CORRECTNESS rows and say so --
+    # they make a width RUN -- while this one owns what the format COSTS, which
+    # is a different verdict on a different axis. #2570 named a verified
+    # instantiation gap with no owner, and an unowned gap is one nobody reruns
+    # (#2570).
+    "QUANT": (AGENTS / "quantization-matrix.md", 87),
     # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
     # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
     # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block

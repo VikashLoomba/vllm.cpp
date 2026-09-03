@@ -51,6 +51,75 @@ VT_DFLASH_PAGED=0 vllm-cli --model <target> --device cuda \
 **2.91x from speculation.** The two target legs are separated by a draft leg and
 agree to 0.75%, so drift does not account for the difference.
 
+## The MATCHED workload: real HumanEval at T = 0.6
+
+The section above is a favourable prompt and says so. This section removes two of the
+three differences from the upstream README's 47.5 tok/s: the real 164-problem
+HumanEval set (`openai/human-eval` `data/HumanEval.jsonl.gz`, sha256
+`1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2`, ShareGPT-shaped
+for the harness) and **T = 0.6**, their temperature. 128 output tokens, concurrency
+1, seed 0, two interleaved legs on one binary (md5 `6ae2949042e256b707c2e75d0a547d9b`).
+
+Counted **decode only**: `Mean per-stream decode rate` is `1 / mean_tpot` where
+`tpot = (latency - ttft) / (output_len - 1)`, so prefill is excluded.
+
+| arm | leg A | leg B |
+|---|---|---|
+| target only | 16.74 | 16.64 |
+| + DFlash2 draft, k = 7 | **59.59** | **59.48** |
+
+**Acceptance, measured rather than inferred**: 30,863 draft tokens proposed, 17,841
+accepted, rate 0.58 -> **4.06 accepted per step** (5.06 emitted). The upstream README
+states 4.43. So this is not a case of an easier drafting task: our acceptance is at or
+below theirs and the throughput is higher anyway.
+
+Every request produced exactly 128 tokens (`duration_s` 1355.86 x `output_throughput`
+15.48 = 20,992 = 164 x 128), so no leg was skewed by early EOS.
+
+**The counting convention is the open question, and it is theirs, not ours.** Their
+README says "decode tok/s" and defines it nowhere. The same run of ours reads **59.5**
+counted decode-only and **45.1** counted over whole-run wall time. Against the first
+convention we are 1.25x; against the second, 0.95x. Their page pins no engine revision
+either, so this cannot be settled from published material. Both numbers are given here
+for that reason.
+
+## The draft budget is a real lever, and our knee is not theirs
+
+`pangoleen/qwen3.8-27b-dgx-spark-dflash2` serves the SAME DFlash2 drafter architecture
+-- its `dflash_config` is byte-identical to ours, `block_size` 8, taps
+`[5,19,33,47,61]`, `selector_rank` 256 -- at a verify budget of 16, and states: "the
+drafter's block_size of 8 is not a cap on the verify budget: 8 -> 16 is +69.3%
+edit-heavy and +10.5% fresh. 24 is past the knee."
+
+Swept on our engine, real HumanEval at T = 0.6, **32 prompts** (a hotter subset than
+the 164 above: acceptance 0.69 against 0.58 at the same k = 7), one sample per rung:
+
+| k | decode tok/s | acceptance rate | accepted per pass | proposed |
+|---|---|---|---|---|
+| 0 (no draft) | 16.65 | - | - | - |
+| 7 | 68.67 | 0.69 | 4.83 | 5,243 |
+| **12** | **76.28** | 0.52 | 6.24 | 7,536 |
+| 16 | 45.21 | 0.39 | 6.24 | 10,048 |
+| 24 | 40.70 | 0.25 | 6.00 | 15,504 |
+
+Each rung's engine-reported `block` equalled `k + 1`, so every budget genuinely took
+rather than being clamped back to 8.
+
+**Accepted tokens per pass saturates at ~6.0-6.24 from k = 12 onward**, so past 12 the
+arm buys strictly more draft work for no more accepted tokens and throughput falls
+monotonically. **Our knee is between 12 and 16; theirs is between 16 and 24.** The
+reason is visible in the acceptance: at budget 16 they report 6.8-8.1 accepted per
+pass where we saturate at 6.24. Their drafter extracts more from the same budget --
+theirs is NVFP4 served by SGLang, ours the EXL3 quant, and our drafter's `block_size`
+of 8 is being run at a block of 17.
+
+**These rungs are one sample each and are indicative, not gated.** This repository has
+a recorded case of one unchanged binary reading 36.82 and 78.86 tok/s in the same
+session. The 41% fall at k = 16 is far too large to be noise, so the knee is real; the
++11.1% from k = 7 to k = 12 is exactly the size where a single sample is weak evidence.
+A repeated k = 7 vs k = 12 comparison on the full 164-problem set is owed and is what
+should be quoted.
+
 ## Correctness, which is the result that gates the other one
 
 **The two arms emit token-identical output.** Both continue `The capital of
@@ -92,9 +161,18 @@ two legs per arm. No multi-request batching, no long context, no second box.
 
 ## Owed
 
-- A HumanEval-style prompt set at T = 0.6 with the acceptance rate reported
-  beside the throughput, which is the only thing that makes the published figure
-  a denominator rather than a coincidence.
+- ~~A HumanEval-style prompt set at T = 0.6 with the acceptance rate reported~~ —
+  **done**, see the matched-workload section above: 59.5 tok/s at acceptance 4.06
+  per step against their 47.5 at 4.43.
+- A repeated `k = 7` vs `k = 12` comparison on the **full 164-problem set**. The
+  budget sweep above ran on a 32-prompt subset that drafts hotter than the full
+  set, so its 76.28 is not transferable and must not be scaled onto the 59.5.
+- The remaining unmatched axes against the upstream recipe: context (8192 here
+  against their `-cs 262144`) and KV dtype (bf16 here against their `-cq nvfp4`,
+  which this engine refuses by name — [#2620](https://github.com/mudler/vllm.cpp/issues/2620),
+  whose named owner row did not exist). `vllm-bench` also cannot select a KV
+  dtype at all ([#2619](https://github.com/mudler/vllm.cpp/issues/2619)), so no
+  number on this page states the KV dtype it was measured on.
 - [#2274](https://github.com/mudler/vllm.cpp/issues/2274), so the shipped paged
   route can be measured rather than routed around.
 - [#2570](https://github.com/mudler/vllm.cpp/issues/2570): our `m <= 8` EXL3

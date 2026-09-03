@@ -128,6 +128,39 @@ class PathClassification(unittest.TestCase):
             "evidence",
         )
 
+    def test_a_python_probe_in_a_per_run_evidence_dir_is_evidence(self) -> None:
+        """#2612: wave GDNDECOMP's instrument is a numpy replica of FLA, so its
+        five scripts land as `.py` inside
+        `docs/bench-evidence/gdn-chunked-decomposition-20260902/`. The extension
+        list carried `txt|log|gz|sh|cu` and not `py`, `classify_path` fails
+        closed, and the whole-tree sweep below went RED on the branch carrying
+        them -- and would have gone red on `main` on the day they landed, the
+        same shape as #1448 and #2316.
+
+        A `.py` is the recipe exactly as a `.sh` is. RED before the `py` arm of
+        BENCH_EVIDENCE_RUN.
+        """
+        for path in (
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/gdn_decomp.py",
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/run_golden.py",
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/check_bf16_helper.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "evidence")
+
+    def test_a_python_file_outside_a_per_run_evidence_dir_fails_closed(self) -> None:
+        """The suffix is not a licence, and this is the arm that keeps a product
+        or checker script from taking the evidence class by being spelled `.py`.
+        A flat `docs/bench-evidence/*.py` is NOT a per-run directory and does not
+        classify either."""
+        for path in (
+            "docs/some-other-place/whatever.py",
+            "docs/bench-evidence/flat-not-a-run-dir.py",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
     def test_a_csv_outside_bench_evidence_still_fails_closed(self) -> None:
         """The extension is not a licence. Widening by suffix alone would let a
         csv anywhere in docs/ take the evidence class without review."""
@@ -279,36 +312,46 @@ class PathClassification(unittest.TestCase):
             checker.classify_path(".agents/not-a-real-guide-xyz.md")
 
     def test_a_measurement_runs_own_artifact_kinds_classify_as_evidence(self) -> None:
-        """A `rc` job's own emissions are evidence, not unclassified paths.
+        """#2497: a `rc` job's own OUTPUT is evidence, not unclassified paths.
 
-        `docs/bench-evidence/<run-id>/` carries what the job produced. Three
-        kinds had no class and `classify_path` fails closed, so all fourteen
-        such paths of `rocm-strix-llamacpp-denominator-20260902` (#2497) left
-        `test_every_tracked_and_current_change_path_is_classified` RED --
-        against the whole tree, so landing it would have reddened `main` and
-        refused every later change touching this checker through its own
-        evidence contract. It went unseen because this checker is CI-only and
-        `agent-preflight.sh` never runs it.
+        Distinct from the `py` arm #2629 landed hours earlier, and found
+        independently in another directory. That arm covers the RECIPE. These
+        two are what the job emitted: `docs/bench-evidence/rocm-strix-llamacpp-
+        denominator-20260902/` carries six `clock-leg*.jsonl` and six `leg*.rc`
+        with no class, and `classify_path` fails closed, so
+        `test_every_tracked_and_current_change_path_is_classified` was RED
+        against the WHOLE TREE. Landing that would have reddened `main` itself
+        and then refused every later change touching this checker through its
+        own evidence contract. It went unseen because this checker is CI-only
+        and `agent-preflight.sh` never runs it.
 
-        This is the RED-BEFORE for that repair: every `evidence` assertion below
-        raises `ValueError` against the base checker.
+        RED-BEFORE for the `jsonl|rc` arms: both raise `ValueError` against the
+        base checker. The `.py` line is a REGRESSION GUARD and is green at base
+        as well as at head -- #2629 made it so, and it is kept because these two
+        files are the row's own and a later narrowing of that arm would silently
+        take them with it.
         """
         run = "docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902"
         for path in (
-            f"{run}/fold.py",              # the recipe, as `.sh` and `.cu` are
-            f"{run}/amd_clock_sample.py",
-            f"{run}/clock-leg1.jsonl",     # the raw instrument stream
-            f"{run}/leg1.rc",              # one process's recorded exit status
+            f"{run}/clock-leg1.jsonl",     # RED at base: the instrument stream
+            f"{run}/leg1.rc",              # RED at base: one leg's exit status
+            f"{run}/fold.py",              # green at base since #2629
         ):
             with self.subTest(path=path):
                 self.assertEqual(checker.classify_path(path), "evidence")
 
         # The additions are a closed enumeration over ONE directory shape, not a
         # relaxation. A sibling extension nobody has argued for still fails
-        # closed, and the same names outside a per-run evidence directory keep
-        # whatever class they already had.
-        with self.assertRaises(ValueError):
-            checker.classify_path(f"{run}/leg1.pickle")
+        # closed, both new suffixes fail closed outside a per-run evidence
+        # directory, and names that already had a class keep it.
+        for path in (
+            f"{run}/leg1.pickle",
+            "docs/bench-evidence/flat-not-a-run-dir.jsonl",
+            "docs/some-other-place/whatever.rc",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
         self.assertEqual(
             checker.classify_path("scripts/check-pr-size.py"), "governance_checker"
         )

@@ -316,6 +316,27 @@ the checker is CI-only and `agent-preflight.sh` skips it. Repaired the way the
 checker's own comments prescribe: NAME the artifact kinds, keep the extension
 list a closed enumeration, do not relax the directory shape.
 
+**Two of the fourteen were repaired by somebody else while this branch was in
+review.** #2629 landed a `py` arm on 2026-09-03 for
+`docs/bench-evidence/gdn-chunked-decomposition-20260902/`, hours before this
+merge, which classifies `fold.py` and `amd_clock_sample.py` too. Same failure,
+same day, two directories, found independently — which is the argument for the
+rule the checker's comments state, not against it. **After merging `origin/main`
+this row's own remaining contribution is twelve paths, not fourteen: the six
+`.jsonl` and the six `.rc`**, and every number below is restated at that base
+rather than left standing from before the merge. The `.py` assertion is kept as
+a regression guard and is labelled as green-at-base, because these two files are
+this row's own and a later narrowing of that arm would take them silently.
+
+The two arms are also different in kind, and the comment says so rather than
+folding them together: `.py` is the RECIPE, and `.jsonl` and `.rc` are the job's
+OUTPUT. The merge also brought a correction this row must not undo — #2629
+found the `.sh`/`.cu` premise "nothing outside `docs/` references this
+directory" to be false as a universal claim, so the narrow form is re-checked
+for these two arms and the universal form is not repeated. Verified: no tracked
+file outside `docs/` names a `docs/bench-evidence/…*.jsonl` or `…*.rc` path at
+all.
+
 ## Gates
 
 ```sh
@@ -339,8 +360,12 @@ number this row produces about the oracle cannot be re-derived by CI.
 **The checker change's red-before and green-after.** `check-pr-size.py` is a
 semantic checker change, so it carries both.
 
+Taken FIRST against the pre-merge base, and RE-TAKEN against `origin/main`
+after the merge, because a merge can falsify a sentence inside the same branch
+and this one did.
+
 ```
-RED   (base checker, HEAD tree)
+RED, pre-merge base (before #2629 landed its `py` arm)
   $ python3 scripts/check-pr-size.py --base origin/main --head HEAD
   ERROR: PR size check could not classify the change: unclassified repository
   path 'docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902/amd_clock_sample.py'
@@ -348,22 +373,28 @@ RED   (base checker, HEAD tree)
   $ python3 -m pytest tests/scripts/test_check_pr_size.py -q
   AssertionError: Lists differ: [...] != []   (14 additional elements)
   1 failed, 6 passed, 39 subtests
-  origin/main: 5,631 tracked paths, 0 unclassified. This head: 5,660, 14 unclassified.
+  base 5,631 tracked / 0 unclassified; head 5,660 / 14
 
-GREEN (head checker, HEAD tree)
+RED, post-merge base (origin/main's checker over the merged tree)
+  5,682 tracked / 12 unclassified — six clock-leg*.jsonl, six leg*.rc.
+  `fold.py` and `amd_clock_sample.py` now classify at base; #2629 did that.
+
+GREEN (head checker, merged tree)
   $ python3 scripts/check-pr-size.py --base origin/main --head HEAD
   OK: every explicit path class is within its review budget.   rc=0
   $ python3 -m pytest tests/scripts/test_check_pr_size.py -q
-  54 passed, 162 subtests
+  56 passed, 169 subtests
 ```
 
 `test_a_measurement_runs_own_artifact_kinds_classify_as_evidence` is the paired
-evidence: every `evidence` assertion in it raises `ValueError` against the base
-checker, verified by loading `origin/main`'s `check-pr-size.py` directly. It
-also pins the two directions that must NOT move — an unargued sibling extension
-still fails closed, and `leg1.json` stays `public_document`, because the
-evidence arm is tested before `DOC` and admitting `.json` there would silently
-reclassify `docs/bench-evidence/mxfp4-qwen`'s golden.
+evidence. Its `.jsonl` and `.rc` assertions raise `ValueError` against the base
+checker, verified by loading `origin/main`'s `check-pr-size.py` directly rather
+than by reading it; its `.py` assertion is labelled a regression guard and is
+green at base as well as at head. It also pins the directions that must NOT
+move — `leg1.pickle`, a flat `docs/bench-evidence/*.jsonl` and a `.rc` outside
+the directory all still fail closed, and `leg1.json` stays `public_document`,
+because the evidence arm is tested before `DOC` and admitting `.json` there
+would silently reclassify `docs/bench-evidence/mxfp4-qwen`'s golden.
 
 **The guard mutation the original set missed.** Weakening `#[0-9]+` to
 `#?[0-9]+` in the staged script left the suite green at `13 passed` while

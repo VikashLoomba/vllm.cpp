@@ -238,8 +238,37 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 # `.sh` and `.cu` are evidence, not product: they are the recipe that produced
 # the number. Nothing builds them, nothing installs them, and no entry point
 # reaches them.
+#
+# `.py` joined them 2026-09-03 (#2629). A numeric study whose instrument is a
+# numpy replica arrives as `.py` for exactly the reason a profiler run arrives
+# as `.sh`: it IS the recipe. `docs/bench-evidence/gdn-chunked-decomposition-
+# 20260902/` landed SIX of them, and `classify_path` FAILS CLOSED, so the
+# whole-tree sweep in tests/scripts/test_check_pr_size.py went red on the branch
+# carrying them and would have gone red on `main` the moment they landed. At
+# least the SEVENTH instance of the class -- #856, #668, #989, #1448, then
+# `8496d93dd` (csv, #2316) and `6d1335568` (AGENT_RUN_SCRIPT, #2609), the last
+# of those one day earlier -- and repaired the same way: name the surface, do
+# not widen a rule.
+#
+# THE `.sh`/`.cu` PREMISE ABOVE IS TOO STRONG AND THE TREE FALSIFIES IT. Two
+# tracked files DO read a path under docs/bench-evidence/ by name:
+# scripts/dgx-online-serving.sh:1203 passes
+# docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json to
+# tools/bench/mxfp4_smoke_gate.py as a gate input, and
+# tests/scripts/test_cpu_x86_llamacpp_floor.py:26 reads
+# docs/bench-evidence/cpu-x86-llamacpp-20260811.md. So "nothing outside docs/
+# references this directory" is false as a universal claim and must not be
+# repeated.
+#
+# What was checked for THIS arm, and what holds: NO `.py` under
+# docs/bench-evidence/ is read, imported, built, installed or executed by
+# anything outside docs/. The only outside mentions of one are the literal path
+# strings in this checker's own test, which classify them rather than run them.
+# That is the narrow claim the `py` arm rests on. A `.py` OUTSIDE a per-run
+# evidence directory still fails closed, which is what keeps this from becoming
+# a suffix licence.
 BENCH_EVIDENCE_RUN = re.compile(
-    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu)\Z"
+    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu|py)\Z"
 )
 # #2609. The lease RECIPES: the exact script a `rc` job ran to produce a number
 # a spec then cites. Same class and same reasoning as BENCH_EVIDENCE_RUN's `.sh`

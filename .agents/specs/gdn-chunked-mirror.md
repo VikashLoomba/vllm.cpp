@@ -702,6 +702,7 @@ Each rides in the pull request whose change makes it stale, per AGENTS.md.
 | `.agents/porting-inventory.md` §9 | no entry | The tracked exception of D4, as a numbered list item in the section's prose format (it is NOT a table; and its numbering is already non-monotonic and must not be "fixed"). Lands with the implementation. |
 | `.agents/specs/gdn-semantics.md` §7 | calls the chunked path the "chunked oracle" and the sequential kernel "what the M0.7 C++ implements directly" | The second half is what changes. Restate which arm runs which algorithm, and add D1's dtype placement — §7 carries none today. Lands with the implementation. |
 | `docs/ENVIRONMENT.md` `## Rollback and bisect switches` | `VT_GDN_CHUNKED` absent; allowlisted as kernel-internal at `scripts/env-doc-allowlist.txt:71` | It becomes a cross-backend documented lever. Add the row; its sibling `VT_GDN_OUT_BF16` is already there (`:228`) for the same reason. Lands with the implementation. |
+| `scripts/check-pr-size.py` `BENCH_EVIDENCE_RUN` | the extension list was `txt\|log\|gz\|sh\|cu`, so this wave's SIX `.py` probes under `docs/bench-evidence/gdn-chunked-decomposition-20260902/` were unclassified; `classify_path` fails closed, and the whole-tree sweep in `tests/scripts/test_check_pr_size.py` went red on the branch carrying them | **Corrected in this flow** ([#2629](https://github.com/mudler/vllm.cpp/issues/2629)), with a red-before mutation and two new cases. At least the seventh instance of the class — #856, #668, #989, #1448, then `8496d93dd` (#2316) and `6d1335568` (#2609) — and the second in two days; repaired by naming the surface, not by widening a rule |
 | `.agents/kernel-matrix.md` + `scripts/check-agent-record.py:402` | no `KERNEL-GDN-CHUNKED-MIRROR` row; `KERNEL` count `58` | The row and the `58 -> 59` bump, owed by the change that moves this spec to `READY`. |
 | `.agents/specs/tenstorrent-gdn.md:263-264` | tolerance table measured against a sequential CPU reference | Re-based by G7. |
 | `.agents/specs/qwen4-exp-qsa-q-bf16.md:123` | "must not move" on the control sequence | Reconcile with the implementation. |
@@ -721,6 +722,15 @@ Each rides in the pull request whose change makes it stale, per AGENTS.md.
 - **The `qwen4_exp` MoE prefill residue**, `7.269e-05` per layer with the GDN
   source removed (PREFILLDIV §3). A second, independent divergence source, named
   and undiagnosed. Not this row.
+- [#2629](https://github.com/mudler/vllm.cpp/issues/2629) — `check-pr-size.py`
+  had no class for a `.py` probe in a per-run evidence directory, so this
+  branch's own six scripts were unclassified and the checker's whole-tree sweep
+  was red. **Fixed in this flow and closed by this pull request**; it is listed
+  here because AGENTS.md asks an issue a change cites to name its owner, and
+  this spec is the thing that owns it. What the issue records beyond the fix is
+  the RATE: at least seven repairs of one shape in that file, two of them one
+  day apart, and the argument for why no durable fix was taken.
+
 - **A MULTI-CHUNK oracle dump.** Every number in this spec, G1's bar included,
   is derived from a golden of 20 and 12 tokens at `BT = 64` — one chunk per
   sequence. The cross-chunk state carry is exercised only against the replica's

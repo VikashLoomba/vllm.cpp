@@ -626,10 +626,22 @@ over six values of `n` rather than two:
 | 17408 | 544 | 38 | 270 |
 
 Against the bits-3 side, where `n = 5120` (45 modules) needs 160 and
-`n = 17408` (92 modules) needs 544. So at a `narrow_coresident` of 160 — which
-`SM_COUNT=20, MAX_THREADS_PER_SM=1536` on Thor cannot reach and a 48-SM GB10 at
-3 or 4 blocks/SM can — the arm set reaches 119 bits-4 modules plus 45 bits-3
-ones, 164 of 409, where slice A alone reached 45. At 32 it reaches 34 and 0.
+`n = 17408` (92 modules) needs 544. So at a `narrow_coresident` of 160 the arm
+set reaches 119 bits-4 modules plus 45 bits-3 ones, 164 of 409, where slice A
+alone reached 45. At 32 it reaches 34 and 0, and below 32 it reaches nothing at
+either width.
+
+**Whether GB10 reaches 160 is NOT settled here, and the arithmetic that would
+settle it is only half known.** Thor MEASURED `SM_COUNT=20,
+MAX_THREADS_PER_SM=1536` in slice A, which ceilings it at 60. GB10's SM count is
+recorded in this tree as 48 (`.agents/specs/dspark-spec-decode.md` §"GB10 | 48
+SMs, 102400 B shared per SM", and `.agents/specs/moe-shared-aux-stream.md`), but
+its `maxThreadsPerMultiProcessor` is recorded NOWHERE and neither is the
+`(4, 2)` narrow kernel's actual `blocks_per_sm`, which can be below the thread
+ceiling if the kernel is register- or shared-memory-bound. 48 SMs needs
+`blocks_per_sm >= 4` to clear 160 — reachable at 2048 threads/SM and not at
+1536. The dgx job prints both numbers in section F, which is why that section
+runs before the A/B and why its output must be read first.
 
 **This is recorded as a correction, not as a design.** The prediction it
 replaces was written into this spec before the measurement and is left standing

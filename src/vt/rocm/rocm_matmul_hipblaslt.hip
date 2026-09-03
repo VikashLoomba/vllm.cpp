@@ -760,4 +760,78 @@ void MatmulBTPointerBatchABKernelRocm(Queue& q, void** out_ptrs, void** a_ptrs,
             "hipblasGemmBatchedEx BT AB");
 }
 
+// ---------------------------------------------------------------------------
+// vt::BatchedMatmul (kBatchedMatmul) — the ROCm arm, MLA/DSA campaign W1
+// (`BACKEND-ROCM`, issue #2715, spec .agents/specs/rocm-mla-dsa-ops.md).
+//
+// out[g] = a[g] @ b[g], all three row-major rank-3 with per-operand batch and
+// row strides. This is the op the MLA projections reach for
+// (`vllm/model_executor/layers/mla.py`'s `torch.bmm` over W_UK / W_UV); vLLM has
+// no kernel of its own here, so the reference is the BLAS contract and the
+// structural donor is `src/vt/cuda/cuda_matmul.cu:605-690`, which builds the
+// same NN strided-batch call through cuBLASLt.
+//
+// THE OPERAND SWAP is this file's existing row-major convention, unchanged from
+// `MatmulKernelRocm` above and from `MatmulBTStridedBatchFullKernelRocm`: a
+// row-major X[p,q] with row stride ldx IS a column-major X^T[q,p] with leading
+// dimension ldx, so row-major `C = A @ B` is the column-major `C^T = B^T · A^T`,
+// i.e. `gemm(OP_N, OP_N, m=N, n=M, k=K)` with B passed FIRST. Leading dimensions
+// are each operand's ROW stride (`stride[1]`) and batch strides its outer stride
+// (`stride[0]`), which is what lets a strided view through unchanged — the donor
+// keys its cuBLASLt plan on exactly those six values (`cuda_matmul.cu:658-669`).
+//
+// The dtype domain is the donor's: (bf16,bf16) and (f32,f32) in, f32 or bf16
+// out. `hipblasGemmStridedBatchedEx` takes a separate type per operand, so the
+// mixed-out case needs no cast pass.
+void BatchedMatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  const bool bf16_in = a.dtype == DType::kBF16 && b.dtype == DType::kBF16 &&
+                       (out.dtype == DType::kF32 || out.dtype == DType::kBF16);
+  const bool f32_in = a.dtype == DType::kF32 && b.dtype == DType::kF32 &&
+                      (out.dtype == DType::kF32 || out.dtype == DType::kBF16);
+  if (!bf16_in && !f32_in) {
+    throw std::runtime_error("vt rocm: batched_matmul: unsupported dtype combo " +
+                             ComboName(a, b, out) +
+                             "; supported: (bf16,bf16)->f32|bf16, (f32,f32)->f32|bf16");
+  }
+  const int64_t g = out.shape[0], M = out.shape[1], N = out.shape[2], K = a.shape[2];
+  if (g == 0 || M == 0 || N == 0) return;
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  if (K == 0) {
+    // Empty contraction: out = 0. A wholesale memset is only sound when `out`
+    // owns a dense span; a strided view is zeroed row by row (donor `:620-632`).
+    if (out.IsContiguous()) {
+      CheckHip(hipMemsetAsync(out.data, 0, out.Bytes(), s), "batched k=0 memset");
+    } else {
+      const size_t esz = SizeOf(out.dtype);
+      for (int64_t bi = 0; bi < g; ++bi) {
+        for (int64_t i = 0; i < M; ++i) {
+          char* row = static_cast<char*>(out.data) +
+                      static_cast<size_t>(bi * out.stride[0] + i * out.stride[1]) * esz;
+          CheckHip(hipMemsetAsync(row, 0, static_cast<size_t>(N) * esz, s),
+                   "batched k=0 row memset");
+        }
+      }
+    }
+    return;
+  }
+
+  auto ctx = GetBlas(q.device.index, s);
+  const float alpha = 1.f, beta = 0.f;
+  const hipDataType ab_t = ToBlasType(a.dtype);
+  const hipDataType c_t = ToBlasType(out.dtype);
+  CheckBlas(hipblasGemmStridedBatchedEx(
+                ctx.handle, HIPBLAS_OP_N, HIPBLAS_OP_N,
+                /*m=*/static_cast<int>(N), /*n=*/static_cast<int>(M),
+                /*k=*/static_cast<int>(K), &alpha,
+                /*A=*/b.data, ab_t, /*lda=*/static_cast<int>(b.stride[1]),
+                /*strideA=*/static_cast<long long>(b.stride[0]),
+                /*B=*/a.data, ab_t, /*ldb=*/static_cast<int>(a.stride[1]),
+                /*strideB=*/static_cast<long long>(a.stride[0]), &beta,
+                /*C=*/out.data, c_t, /*ldc=*/static_cast<int>(out.stride[1]),
+                /*strideC=*/static_cast<long long>(out.stride[0]),
+                /*batchCount=*/static_cast<int>(g), GemmCompute(a.dtype),
+                HIPBLAS_GEMM_DEFAULT),
+            "hipblasGemmStridedBatchedEx NN (batched_matmul)");
+}
+
 }  // namespace vt::rocm

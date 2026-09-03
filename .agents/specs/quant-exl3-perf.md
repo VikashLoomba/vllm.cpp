@@ -201,6 +201,23 @@ python3 scripts/check-pr-size.py --base origin/main --head HEAD  ->  rc 0
 
 158 against slice A's 69, and 89 of the difference is the bits-4 envelope table.
 
+`scripts/agent-preflight.sh` exits 0 while printing `NOT a green preflight`, so
+the output is read and not the exit code. **Zero gates FAILED.** Five SKIPPED,
+every one for `needs arguments preflight does not supply`, and each is chased by
+hand rather than left as an unknown:
+
+| Skipped gate | run by hand | result |
+|---|---|---|
+| `check-pr-size.py` | `--base origin/main --head HEAD` | OK, every path class within budget |
+| `check-cpu-isa-build.py` | `--compile-commands` from the local CPU build | OK |
+| `check-arm-isa-build.py` | same | FAILS on its own PRECONDITION, not on this change: it is fed an x86 build, where `cpu_quant_dot_sdot.cpp`, `cpu_quant_dot_arm.cpp` and `cpu_quant_repack_arm.cpp` carry no `-march=armv8.2-a` flags because they are not built. None of the three is in this change. It needs an Arm build |
+| `check-cuda-fat-gencode.py` | not runnable here | needs `--library` or `--cuobjdump-list` as well, which needs a CUDA build this host cannot produce |
+| `check-triton-aot-multiarch.py` | not runnable here | needs `--vendored-root` |
+
+`check-tree-compiles` reports `1 of 1 translation unit(s) in scope compiled`,
+which is the second half of the point above: the one TU is the test file. The
+CUDA TU is not in scope on a host with no CUDA toolchain.
+
 **NOTHING ON THIS HOST COMPILES `cuda_exl3.cu` AT ALL.** There is no CUDA
 toolchain here, so the file is not in the CPU build at any warning level. Every
 claim about the ported kernel — that it compiles, that it meets tier 3c, that

@@ -403,7 +403,10 @@ struct Ltx2DitLoadOptions {
   // before the device copy, so the "one host buffer live at a time" invariant is
   // unchanged. See `ltx2_lora.h` for the arithmetic and the dtype argument.
   //
-  // Exactly one adapter is accepted; a second refuses by name.
+  // N adapters, fused in this order: the first materializes the aggregator and
+  // every one after it folds in through upstream's second product form
+  // (`fuse_loras.py:110-116`). Reordering the vector is a DIFFERENT computation,
+  // not a re-association.
   std::vector<Ltx2LoraSpec> loras;
 };
 

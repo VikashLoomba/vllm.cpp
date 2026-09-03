@@ -982,6 +982,21 @@ slice to land unreached only when this list, the commit body and the pull
 request body all name it, so this section is the record that permission depends
 on and not a summary.
 
+**The OpenAI server exports no speculative-decoding acceptance metric**
+([#2770](https://github.com/mudler/vllm.cpp/issues/2770)). vLLM at the parity pin
+`5559679229` exports `vllm:spec_decode_num_accepted_tokens_total` and three
+siblings; we export none. `spec_drafts_proposed()` and `spec_drafts_accepted()`
+are `GpuRunner` accessors whose only non-test readers are in
+`examples/bench/bench_core.h`, so acceptance is obtainable from the bench binary
+and nowhere else. Two consequences make it worth a wave rather than a footnote.
+Anyone serving this model gets no acceptance figure at all, and a head-to-head
+against another engine over HTTP is asymmetric for a reason that is plumbing.
+Compounding it, `bench_core.h:558` hardcodes `ignore_eos = true`
+([#2759](https://github.com/mudler/vllm.cpp/issues/2759)), so **no configuration
+of this tree reports acceptance for an EOS-terminated generation** — which is
+what every published comparison measures. Not fixed where it was found because
+it is a server-surface wave, not a change to the speculator.
+
 **W2 DISCHARGED O1, O2, O3 and O4.** They are kept below, struck through in
 prose rather than deleted, because the reason each existed is what a later reader
 needs and `.agents/completed/` is for superseded documents rather than for four

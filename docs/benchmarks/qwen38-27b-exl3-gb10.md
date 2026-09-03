@@ -347,15 +347,17 @@ helping.
 
 ## Limitations
 
-**Three differences from the upstream README's 47.5 tok/s, and all three favour
-this measurement.** Do not quote the two numbers side by side without them.
+Two of these apply to every number on this page. The first applies only to the
+greedy measurement, and the matched HumanEval run above exists to remove it.
 
-1. **Workload.** The published figure is HumanEval-style at **T = 0.6 with
-   acceptance 4.43**. This is **greedy, T = 0**, on `The capital of France is`,
+1. **Workload — closed for the matched run, open for the first one.** The
+   published figure is HumanEval-style at **T = 0.6 with acceptance 4.43**. The
+   *first* measurement here is **greedy, T = 0**, on `The capital of France is`,
    which continues into a list of capitals — close to the easiest possible text
-   for a drafter to predict, so acceptance sits near its ceiling. The engine did
-   not report an acceptance rate for this run, so the gap cannot even be
-   quantified from here.
+   for a drafter to predict — and the engine reported no acceptance rate for it,
+   so its gap cannot be quantified at all. The **matched HumanEval run** uses
+   their task and their temperature and reports acceptance from the engine's own
+   counters, so this difference does not apply to it.
 2. **Context and KV cache.** The published recipe is `-cs 262144` with an NVFP4
    KV cache. Here auto-fit reduced `max_model_len` from 262144 to 8192 and
    `max_num_seqs` from 32 to 1 on the KV budget, and no NVFP4 KV cache was used.

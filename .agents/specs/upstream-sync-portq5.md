@@ -15,8 +15,21 @@ whose method this wave continues.
 
 ## Now
 
-**Open.** 40 of 40 to be re-derived: entries **161 to 200** of the PORT-NOW
-queue for `5559679229..e126687a9a`, in upstream commit order.
+**Done.** 40 of 40 re-derived: **3 ALREADY_SATISFIED, 10 REAL_GAP,
+27 NOT_APPLICABLE** (26 `surface-absent`, 1 `inert`). **30 of the 40 disagree
+with the recorded PORT-NOW disposition.** Ten issues carry the ten gaps: nine new
+([#2686](https://github.com/mudler/vllm.cpp/issues/2686),
+[#2687](https://github.com/mudler/vllm.cpp/issues/2687),
+[#2690](https://github.com/mudler/vllm.cpp/issues/2690),
+[#2691](https://github.com/mudler/vllm.cpp/issues/2691),
+[#2692](https://github.com/mudler/vllm.cpp/issues/2692),
+[#2695](https://github.com/mudler/vllm.cpp/issues/2695),
+[#2698](https://github.com/mudler/vllm.cpp/issues/2698),
+[#2699](https://github.com/mudler/vllm.cpp/issues/2699),
+[#2701](https://github.com/mudler/vllm.cpp/issues/2701)) and the pre-existing
+[#2657](https://github.com/mudler/vllm.cpp/issues/2657) for `[162]`. The one
+`inert` entry is deferred under `.agents/feature-matrix.md:140`, which already
+owns its gate.
 Report: [`../sync/2026-09-03-portq5.md`](../sync/2026-09-03-portq5.md).
 
 **Nothing in this wave is executed.** No build, no test run, no GPU, no lease.

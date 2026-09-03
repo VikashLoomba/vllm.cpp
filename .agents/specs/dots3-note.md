@@ -6855,16 +6855,19 @@ their real target names:
 
 | Suite | Cases | Assertions |
 |---|---|---|
-| `test_dots3_note_audio` | **24 / 24 passed** | **3997 / 3997** |
+| `test_dots3_note_audio` | **24 / 24 passed** | **3992 / 3992** |
 | `test_openai_api_server_dots3_mm_forward` | **28 / 28 passed** | **16374 / 16374** |
 
 `test_dots3_note_audio` sha256
-`2dffef516125164e47bc761d33e9ea225b95bec7d6a0a6b9be80bc0d055c4cee`;
+`db03ea5e790307297836827d6b0ce41fd0b095e70f8981100f87ab9ae9d58c8e`;
 `test_openai_api_server_dots3_mm_forward` sha256
-`2c36cc9776e3839c8efbd117eb789d7e49292f194f5e23dadcd7f56ac099f0f6`. The served
-suite's sha moved once during the slice, when §4.17.13's two outside controls
-were added; the mutation table is measured against this final one and the whole
-sweep was re-run rather than patched.
+`e0158068e12a18708b6cd4978eb2d6c25ed86cddaea26c6624f1ffcf45b4a157`.
+
+**Both shas moved twice during the slice, and the whole sweep was re-run each
+time rather than patched.** Once when §4.17.13's two outside controls were added
+to the served case, and once when `ResampleAudioScipyOutputLength` was deleted
+for being reachable only from a test. A mutation table whose arms were measured
+against a different binary from its baseline is not a mutation table.
 
 **The port reproduces scipy BIT FOR BIT on four of the five golden cases.**
 
@@ -6985,19 +6988,21 @@ row a failed build has twice read as a pass.
 
 | # | Mutation | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` |
 |---|---|---|---|
-| — | baseline | 24 / 3997 pass | 28 / 16374 pass |
+| — | baseline | 24 / 3992 pass | 28 / 16374 pass |
 | M1 | return the input unresampled | **2 cases / 5 FAILED**, `kw.num_samples == kAudioSamples` | **2 cases / 3 FAILED**, `t22 == t16 - 2` |
 | M2 | return zeros of the right length | **2 cases / 16 FAILED**, `worst <= kResampleTol` | **1 case / 2 FAILED**, `gap_native < 5e-2` |
 | M3 | drop the anti-alias filter, decimate by picking samples | **2 cases / 11 FAILED**, `worst <= kResampleTol` | **1 case / 1 FAILED**, `gap_native < 5e-2` |
 | M4 | off-by-one the `n_pre_remove` centring | **2 cases / 11 FAILED**, `worst <= kResampleTol` | 28 / 16374 pass |
 | M5 | delete the production call site | **1 case FAILED**, the subcase THREW | **2 cases / 2 FAILED**, `r.status == 200` |
 | M6 | hash the RAW waveform in the 3-argument `HashAudio` | **1 case / 1 FAILED**, `at_target != at_44100` | **1 case / 1 FAILED**, `at16.status == 200` |
-| M7 | the ROUTE reverts to the 2-argument `HashAudio` | 24 / 3997 pass | **1 case / 1 FAILED**, `at16.status == 200` |
+| M7 | the ROUTE reverts to the 2-argument `HashAudio` | 24 / 3992 pass | **1 case / 1 FAILED**, `at16.status == 200` |
 
 Binary sha256 prefixes, none equal to the baseline's on the suite the mutation
-can reach: M1 `b16e7937…` / `eb10ff9d…`; M2 `94f5f395…` / `4bbe45f6…`; M3
-`11d1573d…` / `9974205a…`; M4 `1f065c69…` / `4098729e…`; M5 `3923ee19…` /
-`8d481591…`; M6 `5db8b8d7…` / `4147ee10…`; M7 `c6e15207…` / `b585f8a0…`.
+can reach: M1 `4bf541b1…` / `ce779bdf…`; M2 `e0dffd57…` / `86f2713b…`; M3
+`6f709b05…` / `62557952…`; M4 `28ac7a83…` / `64ed66d4…`; M5 `a8e5ca14…` /
+`95fa8d03…`; M6 `0af5171a…` / `49c69922…`; M7 `dab4a93c…` / `995f33b5…`.
+Fourteen distinct values, none equal to the baseline's `db03ea5e…` /
+`e0158068…`.
 
 **M4 is the one the served suite cannot see, and that is stated rather than
 hidden.** A one-sample phase shift moves the front-end comparison by far more
@@ -7024,8 +7029,8 @@ harness, so the collision §4.17.6 describes is a live cross-request cache hit a
 not a hypothetical.
 
 **Restored byte-for-byte, and verified at the BINARY.** After the last mutation
-the tree was rebuilt and both binaries hashed again: `2dffef51…` and
-`2c36cc97…`, identical to the baseline row, with both suites green at 24 / 3997
+the tree was rebuilt and both binaries hashed again: `db03ea5e…` and
+`e0158068…`, identical to the baseline row, with both suites green at 24 / 3992
 and 28 / 16374.
 
 

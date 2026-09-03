@@ -275,9 +275,23 @@ reference tier.
 **What still holds, and what does not.** The `kFusedNormRope` port is unaffected —
 it is a real native ROCm kernel and remains registered. Four more ops landed at
 `928d89a9b` (#2715). What is falsified is the claim that the REMAINING ops are a
-performance concern: `kDsaIndexerLogits`, `kDsaTopkSelect` and
-`kMlaDecodeAttention` have **zero** registrations under `src/vt/rocm/` at `main`,
-and with the tier withdrawn each is now a hard refusal on this board.
+performance concern.
+
+**CORRECTED, and the first version of this entry got it wrong twice.** It is
+**FOUR** ops, not three — `kMlaPrefillAttention`, `kMlaDecodeAttention`,
+`kDsaIndexerLogits` and `kDsaTopkSelect` each have **zero** registrations under
+`src/vt/rocm/` at `main`, verified by count. The narrower set of **three**
+that `rocm_ops.hip:283` calls "gating" is the *consulted-before-the-call* set, and
+that distinction only means anything on a board where the tier exists — which this
+one is not. And `ReferenceTierEligible` gates on `DeviceMemoryIsHostAddressable()`,
+not on `UnifiedMemory()` (`op_provider.cpp:203-205`); the probe prints both, which
+is what made the mis-attribution easy.
+
+**One more precision, because the retraction overstated what it was retracting.**
+The prior record did not say these ops make GLM-5.3 *slow*. It said they disqualify
+a speed *number*, which was correct for a board whose tier was eligible. What
+changed is that the premise is gone — a stronger correction than the one first
+written here, and stated so rather than left flattering.
 
 **The lesson worth encoding, because this is the second instance in one day.** A
 commit that lands AFTER a measurement can invalidate that measurement's premise,

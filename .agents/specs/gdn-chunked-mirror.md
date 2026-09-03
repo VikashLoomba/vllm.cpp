@@ -339,16 +339,19 @@ It read: **"`--device cpu` is the arm to use when the exact ids matter."**
 On the mirror criterion that is backwards, and it was the single canonical
 statement of the claim (no other doc makes it). This spec's own commit replaces
 it with a presently-true form — the CPU arm is the more *accurate* one and the
-less *faithful* one. Verbatim, as landed in the same commit as this spec:
+less *faithful* one. Verbatim, as landed in the same commit as this spec, in a
+fenced block because its two links are relative to `docs/`, not to this file:
 
-> **`--device cuda` is the arm that MIRRORS vLLM; `--device cpu` is the arm that
-> is more accurate.** Those are different things and the CPU arm is not the
-> authority: it runs an exact sequential recurrence and lands `1.15e-08` from the
-> exact answer, where vLLM's own chunked kernel lands `2.29e-04`
-> ([decomposition](bench-evidence/gdn-chunked-decomposition-20260902.md),
-> [#2612](https://github.com/mudler/vllm.cpp/issues/2612)), so the CPU ids are
-> the ids of an answer vLLM does not compute. Reach for `--device cpu` when you
-> want the ids this table records, not when you want the ids vLLM would emit.
+```text
+**`--device cuda` is the arm that MIRRORS vLLM; `--device cpu` is the arm that
+is more accurate.** Those are different things and the CPU arm is not the
+authority: it runs an exact sequential recurrence and lands `1.15e-08` from the
+exact answer, where vLLM's own chunked kernel lands `2.29e-04`
+([decomposition](bench-evidence/gdn-chunked-decomposition-20260902.md),
+[#2612](https://github.com/mudler/vllm.cpp/issues/2612)), so the CPU ids are the
+ids of an answer vLLM does not compute. Reach for `--device cpu` when you want
+the ids this table records, not when you want the ids vLLM would emit.
+```
 
 **Sequencing.** That correction is true of the tree as it stands and does not
 depend on the default flip, which is why it lands here rather than waiting. The

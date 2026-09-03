@@ -70,7 +70,7 @@ discharge withdrawal punished, so it was checked rather than assumed.
 
 The check is a **full read** of both harness files, not a grep, because a grep's
 zero has eight recorded ways of being wrong in this tree. `opt-oracle-capture.py`
-is 156 lines and `opt-dgx-gate.sh` is 55; both were read end to end. Neither
+is 142 lines and `opt-dgx-gate.sh` is 57; both were read end to end. Neither
 imports anything from `tools/bench/`, neither opens `.agents/upstream-sync.md`,
 and neither takes a revision as input at all: the capture script's only
 oracle-side input is whichever `vllm` is importable in the venv on `PATH`.
@@ -174,6 +174,24 @@ header — "Where vLLM is self-consistent the honest bar is exact agreement — 
 no near-tie band is used here at all" — and the body carries no `kNearTieMnats`.
 The row's premise is false for this member, so the discharge does not cover it.
 
+**How wide the mis-bucketing is, measured rather than guessed.** Of the 26
+`tests/**/test_*paged_engine*.cpp` gates in the tree, exactly five carry no
+`kNearTieMnats` at all: `test_qwen27_paged_engine.cpp`,
+`test_qwen27n_fp8_tower_paged_engine.cpp`, `test_qwen36_paged_engine.cpp`,
+`test_gemma4_paged_engine.cpp` and `test_opt_paged_engine.cpp`. Every other one
+has 4 or more, `test_qwen3_5_vl_video_e2e.cpp` has 5 through the same probe, and
+that is the positive control which makes the zeros legible. Cross that against
+the ten models the W3b row names — llama, opt, phi, mistral, internlm, minicpm,
+yi, olmo2, deepseek-v2, glm4-moe-lite — and **OPT is the only one of the ten
+whose gate has no near-tie band.** The row is right about its other nine named
+members and wrong about this one, which is why the error survived.
+
+The two remaining no-band gates, `qwen27n_fp8_tower` and `gemma4`, are not in the
+W3b table and are **not examined here**. Gemma-4 was unblocked by this very
+advance, so it was plausibly born at the new pin; `qwen27n_fp8_tower` is
+unchecked either way. Neither is claimed as drift and neither is claimed as
+clean.
+
 The consequence is bounded and should not be overstated. The active pin does have
 declared token-exact gates: 27B W4A4, 32B-NVFP4A16, 35B and Coder were each
 re-captured or re-measured at `5559679229` and recorded bit-identical or
@@ -208,6 +226,41 @@ avoid; the refusal is the gate's device assertion, expressed where it cannot be
 skipped. It is resumable in two stages (`STAGE=build`, `STAGE=capture`) and
 persists the wheel to `/workspace` the moment it exists, because `dgx:gpu0` has
 crashed under sequences shorter than the ~1.3 h source build this needs.
+
+### 2.6 Nothing records which oracle revision a golden was captured at
+
+The reason OPT's golden crossed a pin advance unexamined is structural, and the
+tree already contains the fix it did not apply.
+
+`test_opt_paged_engine.cpp` names no revision at all — a scan of all 298 lines
+for `serve_low_common`, `parity-pin`, `upstream-sync`, `assert_oracle_commit`,
+`FLASHINFER`, `5559679`, `e126687` and `e24d1b24` returns zero for every one,
+against `PARITY_GOLDENS_DIR` at 1 and `greedy_ids` at 3 as controls. That is
+correct design: the gate compares bytes, and the revision those bytes came from
+is a property of the file, not of the test. But the file does not carry it
+either. `tests/parity/goldens/opt_greedy/` holds eight binaries and nothing else,
+so the only record that its oracle was vLLM 0.25.0 is the subject line of
+`b8358a5b9`. A pin advance sweeping ~30 golden directories has nothing to read.
+
+**One greedy golden already does this right.**
+`tests/parity/goldens/qwen35_greedy_0_8b/manifest.json` carries an `oracle` block
+with `vllm_commit`, `vllm_runtime_version`, the wheel filename, the container
+image, the hardware, the exact invocation and the capture date, plus a `model`
+block with the HuggingFace `revision`. That is precisely the record that would
+have made this wave's §2.4 finding a one-line check instead of a `git log
+--follow`. It is one file per golden, read by glob, so it is the record shape
+AGENTS.md prescribes rather than another surface every change must write.
+
+Of the 21 `tests/parity/goldens/*_greedy*` directories, exactly **one** has a
+manifest. This wave does not add the other twenty, and deliberately does not add
+`opt_greedy`'s: the honest value of its `oracle.vllm_commit` field is not
+`e24d1b24`. The pin at the capture date was `e24d1b24` and the commit subject
+says "vLLM 0.25.0", but `.agents/environment.md` records the 0.25.0 oracle as a
+**pip** stack, and `702f4814fe54` is the revision this repository audited as
+v0.25.0 — so the release the wheel carried and the commit the pin named are not
+known to be the same object, and writing either into a provenance field would
+manufacture a fact. The capture this wave queues resolves it by measurement: a
+manifest written from that job records a commit it actually ran.
 
 ## 3. Risks
 
@@ -261,6 +314,11 @@ Every rc above was read directly, never after a pipe.
 - **A re-capture of the OPT golden at the ACTIVE pin `5559679229`**, which §2.4
   shows was skipped. A candidate capture that reproduces the committed bytes
   answers this too; one that does not leaves it open (#2794).
+- **A provenance manifest for `opt_greedy`, and for the other nineteen greedy
+  goldens that lack one**, on the shape
+  `tests/parity/goldens/qwen35_greedy_0_8b/manifest.json` already uses. §2.6. The
+  OPT one should be written from the capture job's own output rather than
+  reconstructed, which is why it is owed rather than done here (#2794).
 - **The other strict goldens at the target** — 27B W4A4, 32B-NVFP4A16, 35B,
   Coder. The pin advance re-captured all four at `5559679229`; none has been
   re-captured at `e126687a9a`, and this wave does not attempt it (#2794).

@@ -236,17 +236,24 @@ Ltx2ConnectorOutput Ltx2ConnectorForward(const Ltx2ConnectorConfig& config,
                                           additive_attention_mask, batch, seq);
   } else {
     state.hidden_states.assign(hidden_states, hidden_states + batch * seq * dim);
-    // Upstream is handed a bf16 tensor, so the arm's input is bf16 whatever the
-    // caller's container width. On the register arm above the substitution already
-    // yields bf16 values on both sides of the select; here nothing has narrowed
-    // the caller's stream yet.
-    NarrowBuffer(dt, state.hidden_states.data(), state.hidden_states.size());
     if (additive_attention_mask != nullptr) {
       state.mask.assign(additive_attention_mask, additive_attention_mask + batch * seq);
     } else {
       state.mask.assign(static_cast<size_t>(batch * seq), 0.0f);
     }
   }
+  // ONE NARROWING, AFTER THE BRANCH, BECAUSE BOTH BRANCHES NEED IT. Upstream is
+  // handed a bf16 TENSOR, so the arm's input is bf16 whatever width the caller's
+  // container carries -- and the caller really does hand f32 in:
+  // `Ltx2VideoEngine::Load` and `GenerateAudioOnly` pass `RunConnectorFromFile`
+  // the output of `ReadF32File`, an arbitrary user file. The register
+  // substitution above replaces only the PADDED rows and copies the kept ones
+  // from the caller verbatim, so this narrowing sat inside the `else` while the
+  // SHIPPED branch is the register one (the checkpoint declares 128 registers)
+  // -- the first transformer block was reading sub-bf16 detail upstream cannot
+  // have. On the register side the substituted values are already bf16, so this
+  // pass is an identity over them and the fix costs that branch nothing.
+  NarrowBuffer(dt, state.hidden_states.data(), state.hidden_states.size());
 
   // :172-184 — a 1-D position grid over the token index. `use_middle_indices_grid`
   // is FALSE here: `indices_grid` carries one value per token, not a [start, end)

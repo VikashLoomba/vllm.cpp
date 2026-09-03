@@ -2810,6 +2810,83 @@ TEST_CASE("ltx2 the connector's bf16 rms_norm takes the f32 epsilon, not the nar
   CHECK(CountWiderThanBf16(as_f32) > static_cast<int64_t>(as_f32.size()) / 2);
 }
 
+TEST_CASE("ltx2 the bf16 connector narrows the CALLER's stream on BOTH branches") {
+  // WHAT THIS CATCHES, and why no other case here can. Upstream's connector is a
+  // bf16 module and is handed a bf16 TENSOR: `Embeddings1DConnector` is built
+  // inside `PromptEncoder` at the one pipeline dtype (distilled.py:109, :113) and
+  // the encoder hands it its own bf16 output. This port takes `const float*`, so
+  // the narrowing of the caller's stream is the port's own job, and it has to
+  // happen on every branch of the entry point.
+  //
+  // The register branch is the SHIPPED one -- the checkpoint declares 128
+  // registers (ltx2_loader.cpp) -- and the caller really does hand f32 in:
+  // `Ltx2VideoEngine::Load` and `GenerateAudioOnly` feed `RunConnectorFromFile`
+  // the output of `ReadF32File`, an arbitrary user file. The substitution
+  // replaces only the PADDED rows; the kept rows are copied verbatim, so a
+  // narrowing placed inside the no-register branch alone leaves the shipped path
+  // reading sub-bf16 detail upstream cannot have.
+  //
+  // EVERY OTHER bf16 CASE IN THIS FILE IS BLIND TO IT: their fixture is
+  // `hidden.to(bf16)` on both sides, so the input is already bf16-valued and a
+  // missing narrowing is an identity. This case perturbs the fixture by a QUARTER
+  // of a bf16 ulp -- x * (1 + 2^-10), against bf16's own 2^-8 -- and asserts the
+  // forward answers exactly as it does on the pre-narrowed stream. Measured
+  // before the repair: 0.015625 on the register arm, 0 on the no-register one.
+  const int64_t batch = vllm_test::kLtx2ConnBatch;
+  const int64_t seq = vllm_test::kLtx2ConnSeq;
+  const int64_t inner = vllm_test::kLtx2ConnInnerDim;
+
+  std::vector<float> perturbed(std::begin(vllm_test::kLtx2ConnBf16Hidden),
+                               std::end(vllm_test::kLtx2ConnBf16Hidden));
+  REQUIRE(perturbed.size() == static_cast<size_t>(batch * seq * inner));
+  for (float& v : perturbed) v *= 1.0f + std::ldexp(1.0f, -10);
+  std::vector<float> prenarrowed(perturbed.size());
+  for (size_t i = 0; i < perturbed.size(); ++i) {
+    prenarrowed[i] = vt::BF16ToF32(vt::F32ToBF16(perturbed[i]));
+  }
+  // NOT VACUOUS: the perturbed stream really does carry detail bf16 cannot hold,
+  // and the two inputs really are different numbers. Without this the equality
+  // below would hold for a forward that narrows nothing.
+  INFO("perturbed values wider than bf16: ", CountWiderThanBf16(perturbed), " of ",
+       perturbed.size());
+  REQUIRE(CountWiderThanBf16(perturbed) > static_cast<int64_t>(perturbed.size()) / 2);
+  REQUIRE(MaxAbsDiff(perturbed, prenarrowed.data(), prenarrowed.size()) > 0.0);
+
+  std::vector<float> mask(static_cast<size_t>(batch * seq), 0.0f);
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t s = 0; s < seq; ++s) {
+      if (vllm_test::kLtx2ConnKeep[b * seq + s] == 0) {
+        mask[static_cast<size_t>(b * seq + s)] = -std::numeric_limits<float>::max();
+      }
+    }
+  }
+
+  auto both_ways = [&](const std::string& tag, int64_t registers) {
+    const vllm::Ltx2ConnectorConfig config = ReducedConnectorConfig(
+        std::string("ltx2.conn.") + tag + ".", /*interleaved=*/false,
+        /*double_precision=*/false, registers, /*gated=*/false, /*ff_bias=*/true);
+    ParamBag bag;
+    for (const vllm::Ltx2ConnectorTensorSpec& spec :
+         vllm::EnumerateLtx2ConnectorTensors(config)) {
+      bag.PutBf16(spec.name, spec.shape);
+    }
+    REQUIRE(bag.weights.dtype == vt::DType::kBF16);
+    const vllm::Ltx2ConnectorOutput raw = vllm::Ltx2ConnectorForward(
+        config, bag.weights, perturbed.data(), mask.data(), batch, seq);
+    const vllm::Ltx2ConnectorOutput narrowed = vllm::Ltx2ConnectorForward(
+        config, bag.weights, prenarrowed.data(), mask.data(), batch, seq);
+    const double worst =
+        MaxAbsDiff(raw.hidden_states, narrowed.hidden_states.data(), narrowed.hidden_states.size());
+    INFO("bf16 connector arm = ", tag, " (registers = ", registers,
+         "): max|diff| between the raw f32 caller stream and the pre-narrowed one = ", worst);
+    CHECK(worst == 0.0);
+  };
+  // The shipped shape first. `NoRegisters` is the branch that already narrowed,
+  // and it is here so the pair says WHICH branch moved when this reds.
+  both_ways("Split", vllm_test::kLtx2ConnSplitRegisters);
+  both_ways("NoRegisters", vllm_test::kLtx2ConnNoRegistersRegisters);
+}
+
 TEST_CASE("ltx2 the connector's learnable registers are stored BFLOAT16, and rounded") {
   // embeddings_connector.py:135-137 constructs the table with
   // `dtype=torch.bfloat16`. Carrying those values at f32 is WIDER than upstream —

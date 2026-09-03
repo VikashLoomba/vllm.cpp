@@ -21,8 +21,11 @@ whose method this wave continues.
 
 **The queue ends exactly at 290**, at `e126687a9a` — the sync target itself —
 with position 291 empty, re-derived at the merge commit and byte-identical to
-the pre-annotation derivation. With this tranche the queue is complete: 55 real
-gaps in 290 entries.
+the pre-annotation derivation. This tranche is the queue's last slice, but the
+queue is **not** fully counted here: PORTQ-6 ran 201-240 concurrently and its
+counts are not in this record, so what is known is **55 real gaps in 250
+entries** (the landed tranches' 45 across 1-200 plus this wave's 10), not a
+290-entry total.
 
 Ten issues carry the ten gaps, all new:
 [#2724](https://github.com/mudler/vllm.cpp/issues/2724),

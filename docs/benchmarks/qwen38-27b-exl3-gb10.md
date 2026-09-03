@@ -355,7 +355,16 @@ two legs per arm. No multi-request batching, no long context, no second box.
   number on this page states the KV dtype it was measured on.
 - [#2274](https://github.com/mudler/vllm.cpp/issues/2274), so the shipped paged
   route can be measured rather than routed around.
-- [#2570](https://github.com/mudler/vllm.cpp/issues/2570): our `m <= 8` EXL3
-  GEMV instantiates `(3,1)` only, and this checkpoint contains **zero** `(3,1)`
-  tensors while upstream's GEMV takes 407 of its 409. That is the named,
-  still-unmeasured hypothesis for any gap that a matched workload reveals.
+- [#2570](https://github.com/mudler/vllm.cpp/issues/2570): the `m <= 8` EXL3
+  GEMV. When this page was first written it instantiated `(3,1)` only, and this
+  checkpoint has no `(3,1)` tensor at all, so the arm was dead on it. `(3,2)`
+  has since landed, which covers the 137 bits-3 modules; `(4,2)` and its 270 is
+  in flight. Upstream's GEMV takes 407 of the 409.
+
+  Instantiating an arm is not the same as reaching it. Admission runs through an
+  occupancy test, `size_n / 32 <= narrow_coresident`, and this checkpoint's
+  bits-3 shapes need that to clear 544 and 160. Measured on Thor it is 60. So
+  whether any of those 137 modules take the fast path on GB10 is **unmeasured**,
+  and the queued job reads `SM_COUNT` and `MAX_THREADS_PER_SM` before its A/B so
+  that a decline stays distinguishable from a null result. No throughput effect
+  is claimed here in either direction.

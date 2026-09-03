@@ -626,9 +626,25 @@ struct Ltx2TextEncoderCheckpoint {
 Ltx2TextEncoderCheckpoint Ltx2LoadTextEncoderFromSafetensors(
     const SafetensorsFile& file, const Ltx2TextEncoderLoadOptions& options = {});
 
-// Widen the bf16 projections into `Ltx2TextEncoderWeights`, whose f32 is phase
-// L3's declared PARITY dtype (ltx2_text_encoder.h:73-83). Opt-in, and ~4.6 GB
-// at the shipped widths — which is exactly why it is not what loading does.
+// Move the checkpoint's OWN bf16 projections into `Ltx2TextEncoderWeights`,
+// unwidened. This is the arm the render path takes, because bf16 is the single
+// dtype upstream resolves for the whole pipeline and hands to `PromptEncoder`
+// (distilled.py:109, :111-113) — see the DTYPE note in ltx2_text_encoder.h.
+//
+// ~2.3 GB at the shipped [4096, 188160] and [2048, 188160], against the 4.6 GB
+// the widening below costs for the same two tensors. That is the whole of A24
+// wave 1 on the weight side: the checkpoint was always bf16 and the tower was
+// always computing on a copy at twice the width.
+Ltx2TextEncoderWeights Ltx2TextProjectionsAsBf16(
+    const Ltx2TextEncoderCheckpoint& checkpoint);
+
+// Widen the bf16 projections into `Ltx2TextEncoderWeights`'s f32 storage. This is
+// the PARITY arm: f32 is the dtype the goldens beside `ltx2_text_encoder.cpp`
+// were produced in, by executing upstream's own modules in `torch.float32`.
+//
+// Opt-in, and ~4.6 GB at the shipped widths. It stopped being what the render
+// path calls when the bf16 arm landed (LTX25-A24-TEXT-TOWER-BF16); it is kept
+// because deleting it would delete the arm the parity gate measures against.
 Ltx2TextEncoderWeights Ltx2WidenTextProjectionsToF32(
     const Ltx2TextEncoderCheckpoint& checkpoint);
 

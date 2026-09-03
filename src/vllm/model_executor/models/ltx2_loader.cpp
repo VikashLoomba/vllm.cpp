@@ -1144,9 +1144,28 @@ Ltx2TextEncoderCheckpoint Ltx2LoadTextEncoderFromSafetensors(
   return out;
 }
 
+Ltx2TextEncoderWeights Ltx2TextProjectionsAsBf16(
+    const Ltx2TextEncoderCheckpoint& checkpoint) {
+  auto keep = [](const Ltx2TextProjection& src, Ltx2TextAggregateEmbed& dst) {
+    dst.dtype = vt::DType::kBF16;
+    dst.out_features = src.out_features;
+    dst.in_features = src.in_features;
+    // A copy, not a widening. There is no per-element conversion here at all,
+    // which is the point: the checkpoint stores exactly these 16-bit values and
+    // the tower now computes on exactly these 16-bit values.
+    dst.weight_bf16 = src.weight_bf16;
+    dst.bias_bf16 = src.bias_bf16;
+  };
+  Ltx2TextEncoderWeights out;
+  keep(checkpoint.video, out.video);
+  keep(checkpoint.audio, out.audio);
+  return out;
+}
+
 Ltx2TextEncoderWeights Ltx2WidenTextProjectionsToF32(
     const Ltx2TextEncoderCheckpoint& checkpoint) {
   auto widen = [](const Ltx2TextProjection& src, Ltx2TextAggregateEmbed& dst) {
+    dst.dtype = vt::DType::kF32;
     dst.out_features = src.out_features;
     dst.in_features = src.in_features;
     dst.weight.resize(src.weight_bf16.size());

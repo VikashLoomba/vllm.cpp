@@ -165,7 +165,8 @@ class Dots3NoteImageProcessor {
 // WHAT THIS CLASS ADDS ON TOP: the `chunk_seconds` SEGMENT LOOP (W7b, #2797,
 // `audio.py:193-218`), `pad_or_trim` to `chunk_samples` per segment, the
 // `ceil(num_samples / token_stride)` token count, the VALID mel-frame count the
-// tower's temporal mask needs, and the refusals W7c and §4.15.3 own.
+// tower's temporal mask needs, the SAMPLE-RATE conversion (W7c-2, #2828, through
+// the shared `ResampleAudioScipy` seam), and the refusal §4.15.3 owns.
 struct Dots3NoteAudioProcessorConfig {
   // False when `config.json` carries no `audio_config`. Upstream builds no
   // `Dots3NoteAudioModel` in that case (`multimodal.py:119-126` @ `9035151d6`).

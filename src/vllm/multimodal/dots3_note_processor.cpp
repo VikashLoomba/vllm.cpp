@@ -489,8 +489,10 @@ Dots3NoteAudioProcessor::SegmentWaveform(int64_t num_samples) const {
   //
   // Upstream steps in SECONDS and multiplies by the module constant
   // SAMPLE_RATE (`audio.py:15`), not by `self.sampling_rate`; the two are the
-  // same 16000 wherever this port runs, because a rate that is not
-  // `audio_config.sampling_rate` is refused to W7c before this is reached. The
+  // same 16000 wherever this port runs. Before W7c-2 (#2828) that held because a
+  // rate that was not `audio_config.sampling_rate` was REFUSED before this was
+  // reached; it now holds because such a rate is RESAMPLED to it, which is the
+  // stronger of the two reasons and reaches this function the same way. The
   // stride is written in SAMPLES here so the loop cannot overflow a second
   // count on a long recording.
   std::vector<AudioChunk> out;
@@ -530,10 +532,10 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
   // `.agents/specs/dots3-note.md` §4.17.
   //
   // THIS IS THE PRODUCTION CALL SITE the reachability mutation deletes. The
-  // resample is unconditional in form and a no-op in fact at the target rate:
-  // `ResampleAudioScipy` returns its input unchanged when the rates are equal,
-  // exactly as upstream's `resample_audio_scipy` does (`audio.py:241-242`), so
-  // no 16 kHz waveform in this tree can move by a bit.
+  // guard below is upstream's own `if orig_sr_int == target_sr_int: return
+  // audio` (`audio.py:241-242`) hoisted to the caller, and `ResampleAudioScipy`
+  // repeats it internally rather than trusting it, so a 16 kHz waveform cannot
+  // move by a bit whichever way it arrives.
   //
   // THE THREE VARIABLES DESCRIBING THE WAVEFORM MOVE TOGETHER, and `sample_rate`
   // is one of them. Rebinding the pointer and the length while leaving the rate

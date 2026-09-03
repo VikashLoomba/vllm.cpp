@@ -208,8 +208,10 @@ multimodal::MultiModalInputs RouteDots3NoteImageRgb(
 // name; what this adds is WHO OWES IT, so an operator learns that rather than
 // only what failed.
 //
-// W7c-1 (#2813) NARROWED it. It used to say a multi-channel WAV was owed to
-// W7c; any channel count is now served, mean-reduced as upstream reduces. And
+// W7c-1 (#2813) and W7c-2 (#2828) NARROWED it, twice. It used to say a
+// multi-channel WAV was owed to W7c and then that a non-16 kHz one was; any
+// channel count is now served, mean-reduced as upstream reduces, and any
+// sampling rate is served, resampled as upstream's own scipy arm resamples. And
 // the container arm left this row entirely: it needs a demuxer this tree does
 // not vendor, five surfaces refuse compressed media for that same missing
 // brick, and #2814 owns it. The refusal stays at the SEAM and stays the SAME

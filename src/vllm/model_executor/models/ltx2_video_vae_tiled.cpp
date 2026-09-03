@@ -167,20 +167,35 @@ std::vector<float> AccumulateTemporalGroup(const Ltx2ConvVideoDecoderConfig& con
 
     // `buffer[chunk_coords] += scale_by_masks_1d(decoded_slice, masks)`
     // (conv_video_decoder.py:552) — SEPARABLE 1-D masks, never a dense N-D one.
+    //
+    // AND THE MASKS ARE APPLIED ONE AXIS AT A TIME, NOT FUSED (#2815).
+    // `scale_by_masks_1d` walks the axes and multiplies the running value by each
+    // mask in turn (tiling.py:430-434), so the arithmetic is `((x * mt) * mh) * mw`
+    // and NOT `x * ((mt * mh) * mw)`. The two round differently, and this port
+    // fused them until the bf16 arm below could see it: at f32 the difference is a
+    // relative ~1e-7 and sits far under the 5e-6 golden band every tiling case
+    // uses, so all of them stayed green. At upstream's own bfloat16 it is a whole
+    // word — upstream re-run with the fused product lands 0.001953125 from its own
+    // answer, which is exactly where this port sat.
     for (int64_t c = 0; c < buffer->channels; ++c) {
       for (int64_t ti = 0; ti < actual; ++ti) {
         const float mt = MaskAt(tile.out_t, ti);
         for (int64_t hi = 0; hi < tile_h; ++hi) {
-          const float mth = mt * MaskAt(tile.out_h, hi);
+          const float mh = MaskAt(tile.out_h, hi);
+          // The WEIGHTS denominator may keep the fused product: it accumulates the
+          // same masks over a tensor of ones (conv_video_decoder.py:553-555), and
+          // `((1 * mt) * mh) * mw` is bit-identical to `(mt * mh) * mw`.
+          const float mth = mt * mh;
           const size_t dst_row =
               buffer->At(c, temporal_offset + ti, tile.out_h.start + hi, tile.out_w.start);
           const size_t src_row = static_cast<size_t>(
               ((c * decoded.frames + ti) * decoded.height + hi) * decoded.width);
           for (int64_t wi = 0; wi < tile_w; ++wi) {
-            const float m = mth * MaskAt(tile.out_w, wi);
+            const float mw = MaskAt(tile.out_w, wi);
+            const float m = mth * mw;
             buffer->data[dst_row + static_cast<size_t>(wi)] =
                 RoundTo(buffer->data[dst_row + static_cast<size_t>(wi)] +
-                            decoded.data[src_row + static_cast<size_t>(wi)] * m,
+                            ((decoded.data[src_row + static_cast<size_t>(wi)] * mt) * mh) * mw,
                         buffer->dtype);
             if (!complementary) {
               // conv_video_decoder.py:553-555: the weights accumulate the SAME

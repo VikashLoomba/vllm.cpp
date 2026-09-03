@@ -83,6 +83,37 @@ convention we are 1.25x; against the second, 0.95x. Their page pins no engine re
 either, so this cannot be settled from published material. Both numbers are given here
 for that reason.
 
+## 16.7 is a QUANTIZATION result, not an engine result
+
+This page's 16.74 tok/s invites one comparison in particular, and that comparison
+does not hold. `pangoleen/qwen3.8-27b-dgx-spark-dflash2` publishes a **12.71
+tok/s** no-drafter median for the same model on the same class of box, under
+SGLang, on `RadixArk/Qwen3.8-27B-NVFP4`. Read side by side that is 1.32x in our
+favour. It is not.
+
+Read from both checkpoints' own safetensors headers, the weights a text decode
+step sweeps once per token — everything but the vision tower, `embed_tokens`,
+which is gathered by row, and the MTP head nothing executes — are **11.661 GB**
+here and **17.608 GB** there. Their checkpoint is 1.51x the bytes, which is more
+than the whole throughput difference:
+
+| | tok/s | x decode-resident GB | achieved GB/s |
+|---|---:|---:|---:|
+| this page, EXL3 3.5bpw | 16.74 | 11.661 | **195** |
+| pangoleen, SGLang, NVFP4 | 12.71 | 17.608 | **224** |
+
+Their box measures about 231 GB/s effective, so their target forward is at 97% of
+its bandwidth limit and this one is at 85%. **Byte-normalized the comparison
+reverses sign**, 0.872x. Treat that as an indication and not a verdict: EXL3's
+trellis decode does real work per byte, so 86% may be compute-bound rather than a
+scheduling loss, and the two numbers are on different formats and different
+engines. The measurement that settles it is our engine on their checkpoint, which
+is [`bench-qwen38-27b-nvfp4-matched`](../../.agents/specs/bench-qwen38-27b-nvfp4-matched.md).
+
+The reading that survives is the one this page already gives: the target forward
+is near the bus on both engines, and what is actually contested is the
+speculation multiplier.
+
 ## The draft budget is a real lever, and our knee is not theirs
 
 `pangoleen/qwen3.8-27b-dgx-spark-dflash2` serves the SAME DFlash2 drafter architecture

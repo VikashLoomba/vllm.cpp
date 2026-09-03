@@ -141,9 +141,15 @@ as a pass.
 
 ## Owed
 
-- The run half of gateability: a model served from the built target inside a
+- ~~The run half of gateability: a model served from the built target inside a
   lease, on a device whose container exposes the GPU (#2593, carried from
-  #2589 C7).
+  #2589 C7).~~ **Discharged 2026-09-03** by wave RUNHALF
+  ([#2611](https://github.com/mudler/vllm.cpp/issues/2611),
+  [`upstream-sync-headpin-runhalf.md`](upstream-sync-headpin-runhalf.md),
+  [`../sync/2026-09-03-e126687-runhalf.md`](../sync/2026-09-03-e126687-runhalf.md)):
+  `SRCBUILD_RC=0`, `EXT_PRESENT=True`, `RUN_RC=0`, `COMPILED_RC=0` on
+  `thor:gpu0`. The pin still does not move, and `qwen4_exp` itself does not run
+  there ([#2626](https://github.com/mudler/vllm.cpp/issues/2626)).
 - The PORT-NOW queue for `5559679229..e126687a9a`, which is #2589's 206 entries
   plus everything between `db92053e97` and this target (#2593).
 - Whether upstream `main` installs under the same repair (#2593). Deliberately

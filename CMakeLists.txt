@@ -830,6 +830,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/glm5_next_kv.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
   src/vllm/model_executor/models/glm5_next_device.cpp
+  src/vllm/model_executor/models/host_token_ids.cpp
   src/vllm/model_executor/models/glm_moe_dsa.cpp
   src/vllm/model_executor/models/glm_moe_dsa_forward.cpp
   src/vllm/model_executor/models/glm_moe_dsa_loader.cpp

@@ -371,6 +371,13 @@ CREATION_MUTATIONS = {
     # clean-tree case, which asserts a checked count at or above the recorded
     # floor and so cannot be satisfied by silence.
     "scripts/check-symbol-anchors.py": DISABLED_CREATION_CHECKER,
+    # ROCM-HW-DP4A. Created in the same pull request, so there is no BASE
+    # version to mutate. Its suite imports the checker as a module and calls
+    # `check(root=...)`, which the disabled stub does not define, so all 6 cases
+    # in tests/scripts/test_check_rocm_dp4a_intrinsic.py error rather than a
+    # reduced subset passing. Verified against the stub: "Ran 6 tests" then
+    # "FAILED (errors=6)".
+    "scripts/check-rocm-dp4a-intrinsic.py": DISABLED_CREATION_CHECKER,
     # 2026-08-16: the CUDA arch-gate registration guard (#960). Created in the
     # same PR, so there is no BASE version to mutate; its own suite loads the
     # checker as a module and calls into it, so the disabled stub fails at import

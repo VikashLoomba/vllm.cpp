@@ -125,6 +125,7 @@ CHECKERS=(
   check-attention-rung-consistency
   check-fp4-resident-consistency
   check-cuda-op-arch-gate
+  check-rocm-dp4a-intrinsic
   check-runner-routing-consistency
   check-surface-coverage
   check-test-registration
@@ -175,6 +176,7 @@ SUITES=(
   test_check_attention_rung_consistency
   test_check_fp4_resident_consistency
   test_check_cuda_op_arch_gate
+  test_check_rocm_dp4a_intrinsic
   test_check_runner_routing_consistency
   test_check_surface_coverage
   test_check_test_registration

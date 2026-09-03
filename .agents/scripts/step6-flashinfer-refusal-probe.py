@@ -8,7 +8,18 @@ Prints an explicit rc per leg so a leg that did not run cannot read as a pass.
 import pathlib, sys, tempfile, types
 from unittest import mock
 
-ROOT = pathlib.Path("/home/mudler/_git/vllm.cpp/.wt/step6-denom")
+# Repo root: argv[1] if given, else derived from this file's own location
+# (.agents/scripts/<this>), so the probe runs from any checkout. It must NOT be
+# an absolute path to a worktree: AGENTS.md requires a worktree be removed when
+# its work merges, and a later wave reusing the directory name would make this
+# read a different tree and still print a verdict.
+ROOT = pathlib.Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parents[2]
+if not (ROOT / "tools" / "bench" / "online_gate.py").is_file():
+    raise SystemExit(
+        f"PROBE ABORT: {ROOT} is not a vllm.cpp checkout "
+        "(tools/bench/online_gate.py absent). Pass the repo root as argv[1]."
+    )
+print(f"REPO_ROOT={ROOT}")
 sys.path.insert(0, str(ROOT))
 
 from tools.bench.online_gate import (  # noqa: E402

@@ -12,14 +12,13 @@ Row spec: [`upstream-sync-headpin.md`](upstream-sync-headpin.md).
 
 ## Now
 
-**The affected set is determined, and it is two gates, both FlashInfer's.** Of
-the four denominators `.agents/oracles/vllm.md:66-69` names, only FlashInfer
-reaches anything committed:
+**The affected set is determined.** Of the four denominators
+`.agents/oracles/vllm.md:66-69` names:
 
 | Denominator | Reaches a committed gate? |
 |---|---|
-| FlashInfer `0.6.15.post1` to `0.6.18` | **YES**, `vllm-online-serving` and `speculative-decoding` |
-| CUTLASS DSL `4.6.0` to `4.6.2` | **NO**, discharged, §2.3 |
+| FlashInfer `0.6.15.post1` to `0.6.18` | **YES**, `vllm-online-serving` (three rows) and `speculative-decoding` (two) |
+| CUTLASS DSL `4.6.0` to `4.6.2` | **PARTLY.** Discharge WITHDRAWN after review; §2.3 carries the correction |
 | `transformers` floor `>= 5.5.3` to `>= 5.10.4` | **NO**, discharged, §2.4 |
 | `VLLM_ALLREDUCE_USE_FLASHINFER` default `0` to `1` | **NO**, discharged, §2.5 |
 
@@ -65,20 +64,30 @@ this spec says so rather than dressing it as a measurement.
 
 ### 2.1 What counts as a committed gate here
 
-`docs/BENCHMARKS.md:7-19` is the public index; nine benchmark IDs, each owning
-one detail file. **Two** of them carry a number the record calls binding against
-a vLLM denominator at the current pin.
+`docs/BENCHMARKS.md:9-19` is the public index; **eleven** benchmark IDs, each
+owning one detail file. **Two** of them carry a number baselined against a vLLM
+denominator at the current pin. Within those two, **five rows** are affected,
+not three: the criterion is step 6's "baselined against", not the narrower "the
+record calls it binding" that an earlier draft used and that silently dropped
+two rows. The report's §2.1a is the per-row in/out table, with an argument for
+every exclusion.
 
 - `vllm-online-serving`, rows `docs/benchmarks/vllm-online-serving.md:66-67`
   (Qwen3.6-27B NVFP4 `nvidia` @`0893e160`) and `:106-107` (Qwen3.6-35B-A3B
   NVFP4), both marked "**BINDING at the pin, graphed, `--language-model-only`,
   clocks 2184 MHz**", and carried internally by the clock-controlled grid at
   `.agents/benchmark-record.md:22318-22343`.
+- `vllm-online-serving`, row `:21` (Qwen3.8-27B bf16 @`1d4bf0f2`, "at the pin,
+  graphed", c4 tput 0.963x), whose denominator is recorded as FlashInfer
+  `0.6.15.post1` at `.agents/benchmark-record.md:23256-23257`. **Added after
+  review; an earlier draft cited `:23257` and never evaluated the row.**
 - `speculative-decoding`, row `docs/benchmarks/speculative-decoding.md:6`
   (DFlash, 1.003x, `DONE`), carried internally at
   `.agents/benchmark-record.md:5161-5165` with `benchmark_binding=true`, over
   four earlier binding rungs at `:5360-5361`, `:5437-5438`, `:5469-5470` and
   `:5503-5504`.
+- `speculative-decoding`, row `:5` (MTP, Qwen3.6-27B NVFP4, "~4% faster at c1",
+  `DONE`). **Added after review**, same omission shape as `:21`.
 
 Everything else on those pages is SUPERSEDED, VOID, PENDING or owes no number,
 and `docs/benchmarks/open-gaps.md` carries the reasons. The one binding row
@@ -170,58 +179,34 @@ candidates. The GB10 side has only the prose claim at
 binding GB10 numbers is asserted by the harness and by the pin record, and is
 nowhere written into the evidence beside the numbers themselves.
 
-### 2.3 CUTLASS DSL is discharged
+### 2.3 CUTLASS DSL: the discharge was WITHDRAWN
 
-**It is recorded as installed, and it is not on any executed path this fleet
-can take.** `docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md:33` is the
-one committed measurement that names it, `nvidia-cutlass-dsl 4.6.0`, in the
-oracle stack of the binding Qwen3.5-4B row. That is an inventory of what `pip`
-resolved, not evidence that a kernel from it ran.
+**A fresh review of [#2783](https://github.com/mudler/vllm.cpp/pull/2783)
+falsified this section.** Its original claim — that `nvidia-cutlass-dsl` is "not
+on any executed path this fleet can take" — is **wrong**. The report's §3
+carries the full correction; the load-bearing facts are:
 
-`nvidia-cutlass-dsl` is the Python package vLLM imports as `cutlass`. Nineteen
-modules import it at the pin. Three of them can be reached by the models this
-project gates, and **every one is gated behind device capability family 100**,
-which no host in this fleet is: GB10 is `sm_121` and the local workspace box
-`sm_120`, both family 120; Thor is `sm_110`, family 110.
+- `vllm/model_executor/warmup/kernel_warmup.py:125-126` @ `5559679229` gates
+  `_warmup_ll_bf16_router_gemm()` on `has_device_capability(90)`, which is
+  **`>=`** (`platforms/interface.py:447-454`), so `sm_121` passes. The three
+  paths this section originally enumerated all use
+  `is_device_capability_family` (`interface.py:481-493`), which is `//10`
+  equality. Reading one predicate and generalising to the other is how the
+  false sentence was written.
+- The callee gates only on a bare `import cutlass` (`ll_bf16.py:19-31`) and then
+  compiles **unguarded** (`:188-206`); `kernel_warmup(worker)` is called
+  unconditionally from `gpu_worker.py:704`.
 
-1. **The NVFP4 linear kernel.** `FlashInferCuteDslNvFp4LinearKernel.is_supported`
-   returns `False, "FlashInfer cutedsl requires sm_10x"` unless
-   `is_device_capability_family(100)`
-   (`vllm/model_executor/kernels/linear/nvfp4/flashinfer.py:35-42` @
-   `5559679229`). It is first in `_POSSIBLE_NVFP4_KERNELS`
-   (`kernels/linear/__init__.py:448`), so it is skipped on every gate host and
-   selection falls to `FlashInferCutlassNvFp4LinearKernel`, which §2.2 records
-   as observed.
-2. **The GDN prefill kernel**, which matters because every Qwen3.5/3.6/3.8 arm
-   on this gate is a hybrid GDN model.
-   `_resolve_gdn_prefill_backend` sets `supports_cutedsl` only inside the
-   `is_device_capability_family(100) and head_k_dim == 128 and
-   cuda_runtime_major >= 13` branch, and the `cutedsl` return additionally
-   requires the backend to be **explicitly requested**, never `auto`
-   (`vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:112-133` @
-   `5559679229`; the docstring at `:97-100` says "opt-in only"). On a family-120
-   host neither branch fires and the function returns `triton`, the FLA path.
-3. **FA4.** The `import cutlass` calls in
-   `vllm/v1/attention/backends/flash_attn.py:1401-1403` and `:1489-1490` @
-   `5559679229` are function-local, inside `vllm_flash_attn.cute` helpers on
-   the FA4 path. The
-   recorded runs selected FA2 (`docs/bench-evidence/qwen35-4b-pinned-oracle-20260728.md:35-36`,
-   `FLASH_ATTN` out of four candidates) and `.agents/sync/2026-09-03-e126687-runhalf.md`
-   §2 records the same selection at the target.
+**What survives** is that the steady-state dispatch is family-100 gated
+(`layers/fused_moe/router/gate_linear.py:59-62`) and never fires on `sm_121`, so
+the package cannot move either gate's throughput or latency math. **What does
+not survive** is the claim that nothing executes: a `4.6.2` break in the warmup
+aborts engine start, and the compile sits inside the startup window
+`docs/benchmarks/vllm-online-serving.md:73` publishes as a 5.46x ratio.
 
-`scripts/dgx-online-serving.sh:506-508` records the parallel MXFP4 case, where
-the cute-dsl backend does not merely lose the selection on `sm_121` but aborts
-engine start, and `docs/bench-evidence/mxfp4-qwen/W0-W1-oracle-run.md:26`
-carries the exception verbatim.
-
-No committed harness asserts a `nvidia-cutlass-dsl` version. The only
-occurrence outside records is `scripts/rc-sglang-oracle-lease.sh:227`, which
-greps a `pip freeze` for an SGLang lease and gates nothing.
-
-**Scope of the discharge.** It covers the gate hosts this project has. It is a
-source argument, not a measurement, and it does not hold on an `sm_100` device,
-where the cute-dsl NVFP4 kernel is first in priority and the GDN cutedsl branch
-becomes reachable.
+Two adjacent entry points, `cutedsl_warmup()` and `fa4_cutedsl_warmup()`
+(`kernel_warmup.py:160-167`), are enabled in the one recorded live engine config
+and were **not examined**; the report asserts only that, not that they fire.
 
 ### 2.4 The `transformers` floor is discharged
 
@@ -307,15 +292,21 @@ rules select.
 
 **G1, the affected set.** Each of the four is either named with the committed
 gate it reaches, with `file:line`, or discharged with evidence and an explicit
-scope limit. Met by §2.2 to §2.5.
+scope limit. **Met only after repair.** The first pass failed G1 twice, and a
+fresh review of #2783 caught both: §2.3's discharge was false (a fourth,
+non-family-100 path), and the row list inside the two affected gates omitted two
+rows. Both are corrected; §2.3 is now a withdrawal plus a narrower claim, and
+§2.1a of the report is the per-row table with an argument for every exclusion.
 
 **G2, the re-measurement.** For each affected gate, a baseline at the target on
 a fleet device under the production graphed configuration, recorded with the
 exact build and run recipe, revisions, model hashes, environment and contention
-state. **NOT MET.** No CUDA fleet device was free, and §2.6's ordering
-constraint stands regardless. The report's §7 C1a and C1b carry the two exact
-jobs, both on `dgx:gpu0`, sharing one source build of vLLM at the target and one
-rebuild of our arm against that wheel's `data/cutlass`.
+state. **NOT MET.** No CUDA fleet device was free, `dgx:gpu0` ended the wave
+`unhealthy`, `thor:gpu0` is `sm_110` and cannot carry a GB10 baseline, and
+§2.6's ordering constraint stands regardless. The report's §7 C1a, C1b and C1c
+carry the jobs — five rows plus the startup row plus the CuteDSL warmup
+question — all on `dgx:gpu0`, sharing one source build of vLLM at the target and
+one rebuild of our arm against that wheel's `data/cutlass`.
 
 **G3, the ordering constraint.** §2.6 is recorded as a property of the harness,
 with the two admissible resolutions named, and no assertion is loosened to make
@@ -343,5 +334,11 @@ a red gate green. Met.
   discharged here, and now blocked on the environment: the box read
   `unhealthy (no contact 2h9m47s)` at this wave's last `rc devices`. Nobody can
   discharge blocker 4, or run this wave's own G2, while that holds.
-- **The `sm_100` scope limit on §2.3.** The CUTLASS DSL discharge does not hold
-  on a device of capability family 100, and this fleet has none to test it on.
+- **`nvidia-cutlass-dsl`, §2.3.** The discharge is withdrawn. What is owed is a
+  measurement: whether the `4.6.2` warmup compile succeeds on GB10, and what
+  fraction of the oracle's startup the CuteDSL warmup is. The report's C1c
+  carries it, with §3.4's two un-examined entry points.
+- **The two rows the first pass omitted**, added in the report's §2.1a:
+  `vllm-online-serving.md:21` (Qwen3.8-27B bf16) and
+  `speculative-decoding.md:5` (MTP). Both have a pin-era vLLM denominator and
+  both are now in C1a and C1b.

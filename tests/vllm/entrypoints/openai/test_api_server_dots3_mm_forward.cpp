@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -60,6 +61,7 @@
 #include "dots3_note_tiny_fixture.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/multimodal/dots3_note_processor.h"
+#include "vllm/multimodal/pil_resize.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/mm_chat_registry.h"
@@ -247,15 +249,20 @@ std::string ImageDataUri(int variant) {
          EncodeBase64(dots3_tiny::FixtureImage(variant));
 }
 
-// The NON-CONFORMANT image, dimensions carried in the payload (W6c, #2537).
-std::string OddImageDataUri(int64_t h, int64_t w, int variant) {
+// Any HWC uint8 RGB buffer as a dimension-carrying data URI.
+std::string RawImageDataUri(int64_t h, int64_t w,
+                            const std::vector<uint8_t>& px) {
   std::vector<uint8_t> raw{static_cast<uint8_t>((h >> 8) & 0xFF),
                            static_cast<uint8_t>(h & 0xFF),
                            static_cast<uint8_t>((w >> 8) & 0xFF),
                            static_cast<uint8_t>(w & 0xFF)};
-  const std::vector<uint8_t> px = dots3_tiny::FixtureImageHW(h, w, variant);
   raw.insert(raw.end(), px.begin(), px.end());
   return "data:image/x-raw-rgb-hw;base64," + EncodeBase64(raw);
+}
+
+// The NON-CONFORMANT image, dimensions carried in the payload (W6c, #2537).
+std::string OddImageDataUri(int64_t h, int64_t w, int variant) {
+  return RawImageDataUri(h, w, dots3_tiny::FixtureImageHW(h, w, variant));
 }
 
 json ChatBodyWithImage(int max_tokens, const std::string& data_uri,
@@ -564,6 +571,82 @@ TEST_CASE("dots3-note W6c: two different NON-CONFORMANT images give two differen
         3 + dots3_tiny::kOddExpectedImageTokens);
   CHECK(jb.at("usage").at("prompt_tokens") ==
         3 + dots3_tiny::kOddExpectedImageTokens);
+}
+
+// ---------------------------------------------------------------------------
+// 2d. THE SERVED PATH REALLY RESAMPLES, and this is the case that says so.
+//
+//     Cases 2b and 2c both survive a tree with the resize call DELETED. 2b
+//     asserts geometry, which `Dots3NoteResizedSize` owned before W6c; 2c
+//     asserts that two different images differ, which they do whether or not
+//     either was resampled. Measured: with the call site disabled,
+//     `test_openai_api_server_dots3_mm_forward` still read 14/14 and 199/199.
+//     A gate that stays green without the call site measures a class, not a
+//     capability (`.agents/reachability.md`).
+//
+//     This case closes that. It serves the 6x14 image and then serves the 8x16
+//     image `PilResizeBicubicRgb` produces from it, and requires the two
+//     logprob vectors to be IDENTICAL. The second request takes the processor's
+//     identity path — 8x16 is already conformant — so the two agree only if the
+//     served 6x14 request resampled to exactly those bytes. The numeric
+//     correctness of those bytes is `test_dots3_note_vision`'s to prove against
+//     the independent reference; what this asserts is that the production path
+//     produced them.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6c: a served NON-CONFORMANT image equals its pre-resized twin") {
+  Served s;
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  const std::vector<uint8_t> odd = dots3_tiny::FixtureImageHW(
+      dots3_tiny::kOddImageH, dots3_tiny::kOddImageW, /*variant=*/0);
+  const std::vector<uint8_t> pre = vllm::multimodal::PilResizeBicubicRgb(
+      odd.data(), dots3_tiny::kOddImageH, dots3_tiny::kOddImageW,
+      dots3_tiny::kOddResizedH, dots3_tiny::kOddResizedW);
+  REQUIRE(pre.size() == static_cast<std::size_t>(dots3_tiny::kOddResizedH *
+                                                 dots3_tiny::kOddResizedW * 3));
+  // The premise: the pre-resized twin is CONFORMANT, so its own request takes
+  // the identity path and cannot be resampled a second time.
+  REQUIRE(dots3_tiny::kOddResizedH %
+              (dots3_tiny::TinySpec{}.v_patch * dots3_tiny::TinySpec{}.v_merge) == 0);
+  REQUIRE(dots3_tiny::kOddResizedW %
+              (dots3_tiny::TinySpec{}.v_patch * dots3_tiny::TinySpec{}.v_merge) == 0);
+
+  const ApiServer::DispatchResult a = h.server.handle_chat_completions(
+      ChatBodyWithImage(4,
+                        OddImageDataUri(dots3_tiny::kOddImageH,
+                                        dots3_tiny::kOddImageW, 0),
+                        true)
+          .dump());
+  const ApiServer::DispatchResult b = h.server.handle_chat_completions(
+      ChatBodyWithImage(4, RawImageDataUri(dots3_tiny::kOddResizedH,
+                                           dots3_tiny::kOddResizedW, pre),
+                        true)
+          .dump());
+  INFO("6x14: ", a.body);
+  INFO("8x16: ", b.body);
+  REQUIRE(a.status == 200);
+  REQUIRE(b.status == 200);
+  const json ja = json::parse(a.body);
+  const json jb = json::parse(b.body);
+  REQUIRE(ja.at("usage").at("prompt_tokens") ==
+          jb.at("usage").at("prompt_tokens"));
+  const json& ca = ja.at("choices").at(0).at("logprobs").at("content");
+  const json& cb = jb.at("choices").at(0).at("logprobs").at("content");
+  REQUIRE(ca.size() == cb.size());
+  REQUIRE(ca.size() > 0);
+  for (std::size_t i = 0; i < ca.size(); ++i) {
+    CAPTURE(i);
+    // Bit-for-bit: the two requests run the same pixel bytes through the same
+    // tower on the same queue, so anything but equality means the served 6x14
+    // leg patchified something other than the resample.
+    CHECK(ca.at(i).at("logprob").get<double>() ==
+          cb.at(i).at("logprob").get<double>());
+  }
+  MESSAGE("6x14 logprob0 ", ca.at(0).dump());
+  MESSAGE("8x16 logprob0 ", cb.at(0).dump());
 }
 
 // ---------------------------------------------------------------------------

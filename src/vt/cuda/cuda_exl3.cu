@@ -2231,8 +2231,11 @@ const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
 // made bits-3-only (`:199-216`), and `dq8_regs_4bits` (`:86-100`), which is a
 // different extractor and not a parameter of the 3-bit one.
 //
-// (4, 0) and (4, 1) are NOT instantiated even though the kernel now compiles
-// for them and `Exl3GemvHardEligible` admits `(4, 0)`. They are 16 kernels each
+// (4, 0) and (4, 1) are NOT instantiated even though `Exl3GemvHardEligible`
+// admits `(4, 0)` -- upstream's `K != 4 && cb == 0` refusal exempts this width
+// alone -- and even though nothing in the kernel above depends on `cb`, so it
+// SHOULD compile for both. Nothing builds either, so that last clause is an
+// inference and is written as one. They are 16 kernels each
 // in a translation unit the fat build compiles for ten architectures, and no
 // artifact in this tree carries a 4-bit tensor at either codebook: the #2495
 // checkpoint's 270 are all `mul1`. Adding them would repeat the `(3, 0)`

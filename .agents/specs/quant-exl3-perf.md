@@ -606,8 +606,13 @@ What is NOT ported, and why it is named rather than dropped:
   `:302-310`). No 2-bit EXL3 artifact has reached this tree, so there is nothing
   to gate it against, and an ungated third geometry in a translation unit the
   fat build compiles for ten architectures is cost without a reader.
-- **`(4, 0)` and `(4, 1)`.** The kernel now COMPILES for them and
-  `Exl3GemvHardEligible` admits `(4, 0)` — upstream's `K != 4 && cb == 0`
+- **`(4, 0)` and `(4, 1)`.** The kernel should compile for them -- `cb` is a
+  free template argument reaching one call, and `decode_3inst_2<cb>` carries all
+  three codebooks -- and `Exl3GemvHardEligible` admits `(4, 0)`. **That is an
+  inference for `(4, 0)` and a MEASUREMENT for `(4, 1)`**: no translation unit
+  instantiates either, so nothing here proves it, and only the thor job's M2
+  mutation compiles `GemvKernelForArm<4, 1>` at all. Do not upgrade the wording
+  until M2 reports a build — upstream's `K != 4 && cb == 0`
   refusal exempts exactly this width. They are still not instantiated, because
   16 kernels each that no artifact in this tree can reach is precisely the
   `(3, 0)` mistake recorded at `cuda_exl3.cu`'s GEMV arm-set comment, which
@@ -734,7 +739,7 @@ its 409 trellis modules is codebook 2, and the arm predicate admitted only
 | `dq8_regs_4bits<cb>` | `exl3_gemv_kernel.cuh:86-100` | `dq8_regs_4bits` in `cuda_exl3.cu` | **this row, slice B** |
 | `FSHF_IMM`, `BFE16_IMM` | `ptx.cuh:314-315` | `VT_EXL3_FSHF_IMM`, `VT_EXL3_BFE16_IMM`, scoped and `#undef`d | **this row, slice B** |
 | per-width `LSTRIDE` and lane guards | `:153`, `:226-232`, `:265-273` | `exl3_gemv_kernel` | **this row, slice B** |
-| `(4, 0)`, `(4, 1)` | `SEL_GRID(4, 0/1, false)` | the kernel COMPILES for them; not instantiated | OWED, and it is now one line each |
+| `(4, 0)`, `(4, 1)` | `SEL_GRID(4, 0/1, false)` | not instantiated; the kernel is expected to compile for them and nothing here builds either | OWED, and it is now one line each |
 | `(2, 1)`, `(2, 2)` | `SEL_GRID(2, *, *)` | — | OWED; a third geometry, and no 2-bit artifact has reached this tree |
 | `(3, 1)`, `(3, 2)` smem-staged | `SEL_GRID(3, *, true)` | `SMEM_STAGE` template arm, both instantiated | landed |
 | the envelope | `exl3_gemv_cfg` | `Exl3GemvSelectConfig` | landed, verbatim, per-K so `(3, 2)` inherits `(3, 1)`'s |
@@ -958,8 +963,9 @@ A CPU-only green is not a device result and is never reported as one. A doctest
   carries TWO tiles (`exl3_gemv_kernel.cuh:152`, `:302-310`), so it is a third
   geometry rather than another width of slice B's. No 2-bit EXL3 artifact has
   reached this tree, so nothing would gate it. Named, not attempted.
-- **`(4, 0)` and `(4, 1)`.** After slice B the kernel compiles for them and the
-  hard tests admit `(4, 0)` — upstream's `K != 4 && cb == 0` refusal exempts
+- **`(4, 0)` and `(4, 1)`.** After slice B the kernel is expected to compile for
+  them -- unmeasured, see the note under `## Slice B design` -- and the hard
+  tests admit `(4, 0)` — upstream's `K != 4 && cb == 0` refusal exempts
   this width alone — so each is ONE line in `GemvKernel` and one term in the
   predicate. They stay out because no artifact here carries a 4-bit tensor at
   either codebook, and 16 unreachable kernels each in a translation unit the fat

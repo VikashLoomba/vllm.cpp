@@ -1128,7 +1128,7 @@ TEST_CASE("dots3-note W2: all 38006 tensors of the WHOLE released index are clai
   CHECK(acc.duplicated.empty());
 }
 
-TEST_CASE("dots3-note W2: the two tower files are NAMED W6/W7 deferrals, all 2625") {
+TEST_CASE("dots3-note W2: the two tower files are NAMED W9/W7 deferrals, all 2625") {
   // A deferral is a record that names the brick, the file and what the tower
   // is. A bare counter is not one: it cannot tell a reader whether 2625 weights
   // are deferred on purpose or lost.
@@ -1136,11 +1136,12 @@ TEST_CASE("dots3-note W2: the two tower files are NAMED W6/W7 deferrals, all 262
   REQUIRE(towers.size() == 2);
   CHECK(std::string(towers[0].prefix) == "vision_encoder.");
   CHECK(std::string(towers[0].file) == "model-vision.safetensors");
-  // W6a (#2512) landed the DENSE half of this tower, so the deferral that
-  // remains is the PYRAMID half and the brick moved with it. The COUNT did not
-  // move and neither did the prefix: a tower whose refusal fires is not partly
-  // loaded, so all 2195 `vision_encoder.*` names still land in this bucket.
-  CHECK(std::string(towers[0].brick) == "W6b");
+  // W6a (#2512) landed the DENSE half of this tower and W6b (#2613) the
+  // PYRAMID half, so a bf16 checkpoint's tower LOADS and the brick moved again:
+  // what remains owed is the blockwise-FP8 arm, which is W9. The COUNT did not
+  // move and neither did the prefix — the accounting buckets by prefix, so all
+  // 2195 `vision_encoder.*` names land here whether the tower loaded or not.
+  CHECK(std::string(towers[0].brick) == "W9");
   CHECK(std::string(towers[1].prefix) == "audio_encoder.");
   CHECK(std::string(towers[1].file) == "model-audio.safetensors");
   CHECK(std::string(towers[1].brick) == "W7");
@@ -1674,7 +1675,7 @@ TEST_CASE("dots3-note: the unported arms REFUSE BY NAME") {
     // W2: the message distinguishes UNKNOWN from DEFERRED by printing the
     // deferral table, so a reader is not left guessing which of the two the
     // loader thinks it hit.
-    CHECK_MESSAGE(refusal.find("vision_encoder.* (W6b)") != std::string::npos,
+    CHECK_MESSAGE(refusal.find("vision_encoder.* (W9)") != std::string::npos,
                   "the refusal does not name the vision deferral: " << refusal);
     CHECK_MESSAGE(refusal.find("audio_encoder.* (W7)") != std::string::npos,
                   "the refusal does not name the audio deferral: " << refusal);

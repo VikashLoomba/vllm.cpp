@@ -49,6 +49,7 @@
 #include "vllm/model_executor/models/glm5_next_forward.h"
 #include "vllm/model_executor/models/glm5_next_kv.h"
 #include "vllm/model_executor/models/glm5_next_loader.h"
+#include "vllm/model_executor/models/host_token_ids.h"  // ResolveHostTokenIds
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"  // v1::ResolveKvCacheDType
@@ -206,12 +207,29 @@ ForwardLogits ForwardGlm5NextForConditionalGeneration(
            "two caches an entry is. Running anyway would attend an empty "
            "prefix on every step after the first. See "
            ".agents/specs/glm5-next-flash.md and issue #2348.");
+  // #2544/#1305 -- TAKE the asynchronous runner's DEVICE identifiers. On the
+  // async serving path the runner's combine splices each decode row's sampled
+  // token into the DEVICE buffer on the main queue and leaves `token_ids`
+  // deliberately stale for decode rows (`v1/worker/gpu/runner.cpp`, the mirror
+  // arm, which is the DEFAULT on CUDA -- integrated parts as well as discrete).
+  // Without this line this model embedded that stale host vector, so on
+  // `dgx:gpu0` over the real UD-Q2_K_XL artifact the default arm emitted
+  // ` Paris Paris` where `VT_ASYNC_DEVICE_MIRROR=0` emitted ` Paris.`: every
+  // step after the first generated from token id 0, at rc=0.
+  //
+  // This forward is a HOST gather, so it takes the host arm of the seam rather
+  // than `detail::ApplyDeviceTokenIds` -- there is no device embed buffer here
+  // to splice over. `host_token_ids.h` carries the whole argument.
+  std::vector<int32_t> device_ids;
+  const std::vector<int32_t>& ids = ResolveHostTokenIds(
+      input, &device_ids, "Glm5NextForConditionalGeneration");
+
   const glm5_next::KvBinding binding =
       glm5_next::ResolveKvBinding(w.params, input);
   std::vector<glm5_next::LayerCache> caches;
   glm5_next::LoadCaches(w.params, binding, input, &caches);
   std::vector<float> logits = glm5_next::Glm5NextHostForward(
-      w, input.token_ids, input.logits_indices, input.queue, &caches);
+      w, ids, input.logits_indices, input.queue, &caches);
   // The new rows go back into the ENGINE's pages, so the next step reads them
   // through the same block table the block manager owns -- rather than onto
   // this `LoadedModel`, which would be per-model state the engine cannot

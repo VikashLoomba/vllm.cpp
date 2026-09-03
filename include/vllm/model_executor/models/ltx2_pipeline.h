@@ -619,13 +619,31 @@ enum class Ltx2PhaseDenoiser { kGuided, kSimple };
 // `:50-51` says the same of DFR. Stage 1 `kNoAdapters` with stage 2 defaulted is
 // the first; both phases defaulted is the second.
 //
-// TWO ENUMERATORS, and two is the COMPLETE space rather than a boolean wearing
-// an enum's clothes: `Ltx2ResolveLoraReferenceFactors` refuses more than one
-// adapter by name (`ltx2_lora.h:167-172`, mirroring `dubit.py:364-365` and
-// `hdr_ic_lora.py:271-272`), so the powerset of the load's adapters has exactly
-// two members. "Some of them" has no spelling here because it has no spelling
-// anywhere in this engine yet; the day that arity cap lifts, the third value
-// goes here.
+// TWO ENUMERATORS, and the argument that made two COMPLETE has been retired.
+// It used to read: `Ltx2ResolveLoraReferenceFactors` refuses more than one
+// adapter, so the powerset of the load's adapters has exactly two members. Row
+// LTX25-LORA-FUSION lifted that cap, and the argument does not survive it.
+//
+// UPSTREAM DOES SCOPE A PROPER SUBSET, and it takes two adapters to see it.
+// `a2vid_two_stage.py:107` gives stage 1 `loras=tuple(loras)` — the USER
+// adapters — against stage 2's `(*tuple(loras), *tuple(distilled_lora))`
+// (`:114`, taken at `:116`); `ti2vid_two_stages.py:140` against `:151` is the
+// same shape. While the load holds ONE adapter that argument's conclusion still
+// held by accident: that adapter is the `distilled_lora` the recipe demands, so
+// upstream's `tuple(loras)` is EMPTY and `kNoAdapters` is exact. A second
+// adapter makes stage 1's set a proper subset, and this engine cannot say it —
+// it holds one resident DiT, `Ltx2RebindDitLoras` takes a BOOLEAN, and no load
+// extra says which of the N is the distilled one.
+//
+// SO THE LOAD REFUSES THAT COMBINATION rather than this enum growing a third
+// value that nothing could execute. `ltx2_video.cpp` refuses N > 1 adapters on
+// any recipe carrying a `kNoAdapters` phase, by name, and the row's spec lists
+// the arm under `## Owed`. `dfr_pipeline.py:212`'s `(*user_loras,
+// *distilled_lora)` on the one stage both phases share is unaffected, and it is
+// the composition N-adapter fusion was lifted for.
+//
+// What `ti2vid_two_stages_hq.py:154` against `:165` varies per stage is the
+// STRENGTH and not the membership, and that is #1144 below.
 //
 // AND UPSTREAM HOLDS ONE TRANSFORMER, not two. Both `from_checkpoint` calls name
 // the same `model_paths.transformer()` (`a2vid_two_stage.py:104` and `:116`,

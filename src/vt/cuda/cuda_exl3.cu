@@ -1228,14 +1228,20 @@ __global__ __launch_bounds__(kBaseThreads* TILESIZE_K / 16) void exl3_gemm_kerne
 // relative RMS) rather than reusing tier 3's 1.0e-3, which a correct kernel
 // here could not meet.
 //
-// NARROWED to bits == 3 and cb == 1 (mcg) only, which is NO LONGER the regular
-// kernel's set: that one carries (3,0), (3,1) and (6,0). Upstream's own GEMV
-// list is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)`, so cb 0 at 3 bpw is
-// excluded there too and its envelope refuses it before any kernel is chosen.
-// Upstream instantiates 2/3/4 bpw over three codebooks; every other width
-// DECLINES this arm and falls through to the shape table, which is upstream's
-// own failure mode (`exl3_gemv_select_kernel` returns nullptr and
-// `exl3_gemv_try_launch` returns false) and not an unimplemented refusal.
+// NARROWED to bits == 3, over codebooks 1 (mcg) and 2 (mul1), which is NOT the
+// regular kernel's set: that one is seven pairs wide. Upstream's own GEMV list
+// is `(4,0) (4,1) (4,2) (2,1) (2,2) (3,1) (3,2)`, so cb 0 at 3 bpw is excluded
+// there too and its envelope refuses it before any kernel is chosen. Upstream
+// instantiates 2/3/4 bpw over three codebooks; every other width DECLINES this
+// arm and falls through to the shape table, which is upstream's own failure
+// mode (`exl3_gemv_select_kernel` returns nullptr and `exl3_gemv_try_launch`
+// returns false) and not an unimplemented refusal.
+//
+// THE WIDTH IS SPECIALIZED, THE CODEBOOK IS NOT. `bits` is fixed at 3 by the
+// static_assert below and widening it is a kernel port; `cb` is a free template
+// argument that reaches exactly one call, `dq8_regs_3bits<cb>`. That asymmetry
+// is why `(3, 2)` cost one template argument (QUANT-EXL3-PERF, #2570) and
+// `(4, 2)` is still owed.
 
 // mma.m16n8k16 with the A operand as two FragB halves, FP16 accumulate
 // (exl3_gemv_kernel.cuh:37-52).
@@ -2072,7 +2078,7 @@ const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
 }
 
 
-// THE GEMV ARM SET IS `(3, 1)` ONLY, AND CODEBOOK 0 IS EXCLUDED ON PURPOSE
+// THE GEMV ARM SET IS `(3, 1)` AND `(3, 2)`, AND CODEBOOK 0 IS EXCLUDED ON PURPOSE
 // rather than as an oversight. Upstream's own envelope refuses it:
 // `exl3_gemv.cu`'s try-launch carries `if (K != 4 && cb == 0) return false;`,
 // which `Exl3GemvHardEligible` transcribes at `exl3_policy.cpp:148`, and
@@ -2106,17 +2112,44 @@ const void* GemvKernelForArm(bool c_fp32, int mmode, int cfg, bool smem) {
 //     `(lane + 31) & 31` shuffle into a `dq8_regs_4bits` this tree does not
 //     have (`:296-300`, `:87`), and the `exl3_gemv_cfg` envelope was measured
 //     for K in {2,3,4} so it needs no new arm. It is owed, not refused as
-//     impossible.
+//     impossible. It is 270 of the 409 trellis modules of the #2495 artifact
+//     and it is the LARGEST remaining population (QUANT-EXL3-PERF, #2570).
 //
-// The cost of declining is NOT measured here and is not asserted: it is the
-// `m <= 8` fast path only, and quantifying it needs the checkpoint on a device.
+// BUT bits 3, cb 2 IS AN INSTANTIATION, and it is now here (QUANT-EXL3-PERF,
+// #2570). It is 137 of those 409 modules -- every MLP projection quantized at
+// the low end of that artifact's 3.5 bpw average -- and until this line the
+// GEMV's ONLY arm was `(3, 1)`, of which that checkpoint contains ZERO tensors.
+// The fast path was unreachable on the whole model the benchmark is about, one
+// module at a time and silently, because a declined GEMV falls through instead
+// of refusing. Nothing about the kernel's geometry depends on `cb`: `LSTRIDE`,
+// `TWORDS`, `FOLD`, `PF` and `LOADS` are functions of `bits`, `CFG` and `MMODE`
+// alone, and the single decode site is `dq8_regs_3bits<cb>`, which has carried
+// all three codebooks since QUANT-EXL3-MUL1 slice A.
+//
+// AN INSTANTIATION IS NECESSARY AND IT IS NOT SUFFICIENT, which is the part
+// that is easy to bank and wrong. `Exl3GemvSelectConfig` returns -1 to DECLINE,
+// and on Blackwell the only branch that can admit a bits-3 shape is
+// `size_n / 32 <= narrow_coresident` -- an OCCUPANCY QUERY -- before
+// `if (K == 3) return -1;` closes the door. At this artifact's two bits-3
+// shapes that needs `narrow_coresident >= 544` (k 5120, n 17408) and `>= 160`
+// (k 17408, n 5120). `tests/vt/test_exl3_gemv.cpp` pins both thresholds, so
+// whether the arm actually RUNS on a given device is a lookup and not a guess,
+// and a zero end-to-end effect with the arm declined stays distinguishable from
+// a zero with the arm taken.
+//
+// The cost of declining is NOT asserted here: it is the `m <= 8` fast path
+// only, and quantifying it needs the checkpoint on a device. `## Owed` of
+// `.agents/specs/quant-exl3-perf.md` carries what is measured and what is not.
 //
 // A null here is a DECLINE, and `TryGemv` turns it into a fall-through rather
 // than a failure.
-constexpr bool Exl3GemvArmInstantiated(int bits, int cb) { return bits == 3 && cb == 1; }
+constexpr bool Exl3GemvArmInstantiated(int bits, int cb) {
+  return bits == 3 && (cb == 1 || cb == 2);
+}
 
 const void* GemvKernel(int bits, int cb, bool c_fp32, int mmode, int cfg, bool smem) {
   if (bits == 3 && cb == 1) return GemvKernelForArm<3, 1>(c_fp32, mmode, cfg, smem);
+  if (bits == 3 && cb == 2) return GemvKernelForArm<3, 2>(c_fp32, mmode, cfg, smem);
   return nullptr;
 }
 

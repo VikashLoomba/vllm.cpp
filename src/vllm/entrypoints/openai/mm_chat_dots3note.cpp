@@ -222,9 +222,12 @@ MultiModalChatSeam MakeDots3NoteChatSeam(const MultiModalChatContext& ctx) {
         "per-channel normalization and its pixel bounds are read from it");
   }
 
-  // THE TOWER'S OWN REFUSAL, ASKED HERE AND NOT IN THE ENGINE. The DENSE arm is
-  // W6a's; a checkpoint whose vision blocks are routed belongs to W6b, and the
-  // RELEASED `dots-studio/dots3-note-prev` is one — 17 of its 42 blocks are.
+  // THE TOWER'S OWN REFUSAL, ASKED HERE AND NOT IN THE ENGINE. W6a shipped the
+  // dense blocks and W6b (#2613) the pyramid MoE ones, so the RELEASED
+  // `dots-studio/dots3-note-prev` — 17 of whose 42 blocks are routed — is
+  // ACCEPTED here now. What still refuses is `use_bias` (#2616), the softmax
+  // and top-k-below-2 router arms (#2615), the blockwise-FP8 tower (W9) and
+  // video (W7).
   //
   // Asking at INSTALL is not a preference. `EncodeMmDots3NoteForCausalLM`
   // refuses too, but it runs inside the engine's busy loop: throwing there stops
@@ -242,7 +245,8 @@ MultiModalChatSeam MakeDots3NoteChatSeam(const MultiModalChatContext& ctx) {
       throw std::runtime_error(
           "dots3-note multimodal chat seam: this checkpoint's vision tower is "
           "not ported — " + why +
-          ". See .agents/specs/dots3-note.md §4.11 and issue #2512.");
+          ". See .agents/specs/dots3-note.md §4.11 and §4.12, issues #2512 and "
+          "#2613.");
     }
   }
 
@@ -259,7 +263,7 @@ MultiModalChatSeam MakeDots3NoteChatSeam(const MultiModalChatContext& ctx) {
   MultiModalChatSeam seam;
   seam.allowed_limits = info->AllowedMmLimits();
   seam.detail = "dots3-note processor from " + preprocessor_config_path +
-                " (DENSE vision arm; the pyramid MoE ViT is W6b)";
+                " (dense + pyramid MoE vision arm)";
   seam.chat_fn = MakeDots3NoteImageChatFn(proc, *ctx.tokenizer, ctx.prompt_fn,
                                           ctx.codec, info);
   return seam;

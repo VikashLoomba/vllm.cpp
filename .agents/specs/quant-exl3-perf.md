@@ -1,0 +1,696 @@
+# QUANT-EXL3-PERF — the EXL3 decode-throughput arm set, and the envelope that decides it
+
+Row: `QUANT-EXL3-PERF`
+Issues: [#2570](https://github.com/mudler/vllm.cpp/issues/2570) (primary)
+Base SHA: `3d045ba1b`
+Parent row: [`QUANT-EXL3`](quant-exl3-shared.md)
+Sibling row: [`QUANT-EXL3-MUL1`](quant-exl3-mul1.md) — that row ports the FORMAT,
+this one owns what it COSTS.
+Matrix: [`.agents/quantization-matrix.md`](../quantization-matrix.md)
+
+Upstream pin: vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98` — **vLLM implements
+no EXL3** at the pin, so the kernels are mirrored from the registered secondary
+oracle [`exllamav3`](../oracles/exllamav3.md) @
+`2398c05635fbbad01a0a51dce63c85c6c8a8450e` (v1.4.3, MIT). The seam is vLLM's;
+exllamav3 supplies the trellis kernels only.
+
+## Now
+
+`ACTIVE`. This row exists because no row owned EXL3 PERFORMANCE. `QUANT-EXL3`
+owns the format and `QUANT-EXL3-MUL1` owns the `mul1` widths; both are
+correctness rows and both say so. #2570 named a throughput gap with no owner,
+and an unowned gap is one nobody reruns.
+
+Slice A (the `(3, 2)` GEMV instantiation) is described below. Everything else is
+under `## Evidence
+
+### Host arm, executed 2026-09-03 on `mudler-ubuntu-box`
+
+CPU-only build (`RelWithDebInfo`, no CUDA toolchain on this host), built in
+`/dev/shm` because `/` had 8.2 GB free. `BUILD_RC=0` in 432 s;
+`ctest -R '^test_exl3_gemv$'` passed.
+
+```
+[doctest] test cases:  7 |  7 passed | 0 failed | 0 skipped
+[doctest] assertions: 69 | 69 passed | 0 failed |
+```
+
+The device tier-3c case SKIPPED, once, and is counted above because it still
+asserts on the way out (`CHECK_FALSE(OpRegistered(kExl3Gemm, kCUDA))`). A skip
+that asserts nothing reports `assertions: 0`, which reads as a pass; this one
+cannot. **So the tier-3c bound and the `(3,1)`-vs-`(3,2)` discrimination check
+are UNMEASURED here and are not claimed.** They need the lease.
+
+### Mutation table — host arm
+
+Each row asserts four things, because three of them have faked a pass in this
+tree before: the mutated file's `sha256` CHANGED, it COMPILED, the test binary's
+`mtime` MOVED, and the tree RESTORED byte-for-byte.
+
+| Mutation | file | sha256 | built | mtime moved | `TEST_RC` | verdict | restored |
+|---|---|---|---|---|---|---|---|
+| baseline | — | `db293772…` | — | — | 0 | 69/69 pass | — |
+| M3 narrow admission boundary `<=` → `<` | `src/vt/exl3_policy.cpp` | `bd89702425…` | OK | YES | 1 | **RED**, 6 failed | YES |
+| M4 `if (K == 3) return -1;` → `return 0;` | `src/vt/exl3_policy.cpp` | `f82c3ece4a…` | OK | YES | 1 | **RED**, 4 failed | YES |
+
+After restore: build `rc=0`, file `sha256` matches the baseline, gate `rc=0`, and
+the assertion counts are identical to the baseline line for line.
+
+The two mutations bracket the boundary FROM BOTH SIDES, which is what a discrete
+selection gate needs — its error is bimodal, not a tolerance. M3 reds the
+ADMITTED side and M4 reds the DECLINED side, and the specific cases that fire
+are this row's new ones:
+
+```
+M3  :169  Exl3GemvSelectConfig(bw, 1, 5120, 17408, 3, 2, 1, 544) == 0   -> got -1
+M3  :171  Exl3GemvSelectConfig(bw, 1, 17408, 5120, 3, 2, 1, 160) == 0   -> got -1
+M4  :168  Exl3GemvSelectConfig(bw, 1, 5120, 17408, 3, 2, 1, 543) == -1  -> got 0
+M4  :170  Exl3GemvSelectConfig(bw, 1, 17408, 5120, 3, 2, 1, 159) == -1  -> got 0
+```
+
+M3 also reds the `(4, 2)` threshold rows, which is the point of recording them
+before that arm exists: they are what the port will be measured against.
+
+### Device arm — `thor:gpu0`, executed 2026-09-03
+
+NVIDIA Thor, compute capability **11.0**, driver **595.78**, nvcc 13.0, built
+`sm_110` from the pinned bundle. `BUILD_RC=0`, so `GemvKernelForArm<3, 2>`
+COMPILES; this was its first build anywhere.
+
+```
+GATE_RC=0
+[doctest] test cases:  7 |  7 passed | 0 failed | 0 skipped
+[doctest] assertions: 76 | 76 passed | 0 failed
+device case SKIPPED count: 0        <- the device arm RAN; it did not skip
+cb 1  tier 3c: relative RMS 5.16027e-04, worst elementwise 0.125
+cb 2  tier 3c: relative RMS 5.27980e-04, worst elementwise 0.125
+(3,1) vs (3,2) differ in 4095 of 4096 outputs
+```
+
+Against the tier-3c bound of `6.0e-3`, the new `(3, 2)` arm measures
+`5.2798e-4` — an order of magnitude inside it, and within 2.3% of the
+established `(3, 1)` arm's `5.16e-4` on the same fixture. The bound was not
+touched.
+
+The discrimination check is what makes those two numbers mean anything: the two
+codebooks disagree on **4095 of 4096** outputs. A `cb` threaded wrongly between
+them would have produced identical output and two green tolerances.
+
+### Mutation table — device arm, `thor:gpu0`
+
+| Mutation | sha256 | built | mtime moved | `TEST_RC` | verdict | restored |
+|---|---|---|---|---|---|---|
+| baseline | — | OK | — | 0 | 76/76 pass, 0 skipped | — |
+| M1 `(3,2)` out of the predicate | `6c2dc9f5d5…` | OK | YES | 1 | **RED** | YES |
+| M2 `cb == 2` → `GemvKernelForArm<3, 1>` | `283d10a5a8…` | OK | YES | 1 | **RED**, 3 failed | YES |
+| after restore | matches baseline | OK | — | 0 | 76/76 pass, 0 failed | — |
+
+**M1 IS THE REPO'S OWN doctest TRAP, CAUGHT.** Its summary line reads
+`assertions: 71 | 71 passed | 0 failed` — a clean sweep — while `TEST_RC=1`,
+because the case did not fail an assertion, it **THREW**:
+
+```
+test_exl3_gemv.cpp:227: ERROR: test case THREW exception:
+vt cuda exl3: exl3_gemm was asked to force the m<=8 GEMV arm (force_gemv=1)
+but the call is not hard-eligible for it: m=1 k=2048 n=4096 bits=3.
+```
+
+Anything reading that assertions line as the verdict would have recorded M1 as
+GREEN and concluded the gate could not see the arm's removal. Only the exit code
+caught it. That is why every row of this table carries `TEST_RC` and not a
+summary line.
+
+M1 is also the CONTROL the one-binary A/B rests on: with `(3, 2)` out of the
+predicate the tree is the pre-change product exactly, and it refuses by name.
+
+**M2 fails THREE independent assertions**, which is the confusable pair caught
+from three directions at once:
+
+```
+:325  CHECK( rel <= 6.0e-3 )                     NOT correct   <- tier 3c
+:326  CHECK( worst <= 64.0 * UlpF16(rms_ref) )   NOT correct   <- worst element
+:352  CHECK( differing > size/2 )                NOT correct   <- discrimination
+```
+
+Worth stating precisely rather than flattering the design: on THIS fixture the
+tolerance caught the wrong codebook by itself, so the discrimination check was
+not the only line of defence here. It is still the one that GENERALISES. A
+tolerance can only see a mis-threaded codebook when the two decodes happen to
+diverge by more than the bound on the data at hand; the discrimination check
+fails whenever they agree, which is the actual invariant — `(3, 1)` and `(3, 2)`
+are different decodes of the same bits and must never produce the same numbers.
+On the real fixture they differ in 4095 of 4096 outputs.
+
+The job ends with `RESTORE build rc=0`, `cuda_exl3.cu matches baseline: YES`,
+and `GATE AFTER RESTORE rc=0` at `assertions: 76 | 76 passed | 0 failed` — the
+same counts as the pre-mutation baseline, line for line. So the two mutations
+left no damage, and the green that opens this section is the same green that
+closes it.
+
+### THE OCCUPANCY TERM HAS A CEILING, AND IT IS BELOW WHAT THIS CHECKPOINT NEEDS
+
+`DEVICE PROPS SM_COUNT=20 MAX_THREADS_PER_SM=1536 REGS_PER_SM=65536`.
+
+The narrow config launches **512-thread** blocks, so
+`blocks_per_sm <= floor(max_threads_per_sm / 512)` REGARDLESS of registers or
+shared memory — a thread-budget ceiling no kernel tuning can lift. Therefore
+
+```
+narrow_coresident = blocks_per_sm * sm_count
+                 <= floor(max_threads_per_sm / 512) * sm_count
+```
+
+| device | max_threads/SM | SMs | ceiling | n=17408 needs 544 | n=5120 needs 160 |
+|---|---:|---:|---:|---|---|
+| Thor sm_110 (MEASURED) | 1536 | 20 | **60** | CANNOT | CANNOT |
+| GB10, if 1536 / 48 | 1536 | 48 | 144 | CANNOT | CANNOT |
+| GB10, if 2048 / 48 | 2048 | 48 | 192 | **CANNOT** | can |
+
+**This is a PREDICTION, recorded before the `dgx:gpu0` job runs**, so it can be
+falsified rather than fitted afterwards. The `n = 17408` shape — 92 of the 137
+bits-3 modules, every `mlp.gate_proj` and `mlp.up_proj` — needs 544, which needs
+roughly 136 SMs at 4 blocks each. No part in this fleet is close. So at mode 1
+those 92 modules DECLINE on GB10 as certainly as they decline here, and the most
+that can be admitted is the 45 `mlp.down_proj` modules at `n = 5120`, and only
+if GB10 reaches 4 blocks/SM across at least 40 SMs. The dgx job prints
+`SM_COUNT` and `MAX_THREADS_PER_SM`, which settles it.
+
+If the A/B then reads `G1 == G0`, that is not a mystery and not a ceiling: it is
+this table. **The next traceable hypothesis is the WIDE config (CFG 1), not the
+kernel.** The narrow grid is one block per 32 output columns, which is what
+makes a large-`n` shape need a co-resident wave these parts cannot supply;
+upstream's envelope admits the wide config at large-`n`/small-`k` only for
+`K == 4` (`exl3_gemv.cu:69`). That is the `(4, 2)` port, which is already this
+row's largest `## Owed` item — so the measurement and the owed work point at the
+same place, from two directions.
+
+### Device throughput — PENDING, and how to collect it
+
+Queued on `dgx:gpu0`. **No throughput number is claimed anywhere until it runs**,
+and none appears in `docs/FEATURES.md` or `docs/USAGE.md` either.
+
+```sh
+rc ps                                     # find the exl3perf-2570 job id
+rc logs <job-id> | grep '^RESULT'         # the whole evidence stream
+```
+
+Results also land under `/workspace/exl3perf-2570/out/` (`/mnt/nas_share/rc/…`
+from the devbox), but that mount LAGS — `rc logs` is the authoritative read and
+the CIFS copy has been minutes behind it in this campaign. A flat `rc logs` tail
+is not evidence of a stalled job either: compare byte counts across two samples
+before concluding anything, because the endpoint serves cached content.
+
+The job is pinned to tarball
+`sha256 c133a4cbba670dbef6c6daebf4c0e130824519f317af221eaff7ebb1e9e9c5dd`
+(commit `665167c4a`) and aborts rather than build anything else. The five files
+this row's measurements depend on are byte-identical between that commit and the
+merged head; other paths have moved under it since (see "Which tree the device
+evidence is measured on").
+
+The harness itself is `/workspace/exl3perf-2570/job.sh`,
+`sha256 81e2de48268fd9e69cdc7144fcd0162149c1ca05bf6dff3d081d3afa195268ef` —
+named because a measurement is only reproducible if the script that took it is
+identifiable, and this one runs unattended. It carries one class of repair worth
+knowing about when reading or reusing it. The script sets only `set -u`, but its
+first `set +e` / `set -e` pair leaves **errexit ON** for everything after it, and
+`hb` is a shell FUNCTION: `hb ...; RC=$?` therefore kills the job on a non-zero
+return before `$?` can be read. A failed build, a failed model stage or a
+mutation that does not compile would have ended the run silently instead of
+reporting the abort it was written to report. Every rc is now taken with
+`|| RC=$?` or inside an explicit `set +e` block.
+
+What it produces, in order, cheapest evidence first so a crash on this box costs
+the least: the tree facts, the build, the device numeric gate, `SM_COUNT` and
+`MAX_THREADS_PER_SM` (which settle the prediction above), the interleaved A/B,
+an `nsys --cuda-graph-trace=node` check of whether `exl3_gemv_kernel` actually
+appears, and finally the M1/M2/M3 mutations behind a 180-minute deadline.
+
+**Read the envelope verdict BEFORE any tok/s number.** If `SM_COUNT` and
+`MAX_THREADS_PER_SM` put `narrow_coresident` below 544 and 160, then `G1 == G0`
+is the predicted result and the A/B has measured an envelope decline rather than
+a kernel. Quoting a speed ratio from those legs would be measuring the same path
+twice, which is the mistake this row was written to avoid.
+
+## Owed`, itemised, with the reason it is not closed here.
+
+**No throughput number is claimed by this row yet.** The arm is instantiated and
+its numeric gate and A/B are QUEUED on `dgx:gpu0` behind other work. Until that
+lease runs, every device claim here is PENDING and is reported as PENDING; a
+queued job nobody could gate is a partial result and never a pass.
+
+## The gap, as #2570 states it
+
+Our `m <= 8` EXL3 GEMV instantiated exactly one arm, `(bits = 3, cb = 1)`.
+`Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` — the #2495 benchmark checkpoint — contains
+**zero** tensors of that arm, so the small-m fast path was unreachable on the
+model the benchmark is about, one arm at a time and silently, because a declined
+GEMV falls through to the regular block-pipelined kernel rather than refusing.
+
+Upstream instantiates seven pairs at the pin
+(`exllamav3/exllamav3_ext/quant/exl3_gemv.cu:83-86`):
+
+```c
+SEL_GRID(4, 0, false) SEL_GRID(4, 1, false) SEL_GRID(4, 2, false)
+SEL_GRID(2, 1, false) SEL_GRID(2, 2, false) SEL_GRID(2, 1, true) SEL_GRID(2, 2, true)
+SEL_GRID(3, 1, false) SEL_GRID(3, 2, false) SEL_GRID(3, 1, true) SEL_GRID(3, 2, true)
+```
+
+## The census, recomputed for this row rather than inherited
+
+Read from the LOCAL safetensors headers of
+`/mnt/nas_share/rc/qwen38-exl3-bench/ckpt/target-3.5bpw`, both shards, on
+2026-09-02. 2426 tensors, of which **409 are `.trellis`**, **409 carry a `mul1`
+marker and zero carry `mcg`** — so every quantized linear in the artifact is
+codebook 2, and `LinearEXL3`'s presence rule (`exl3.py:74-77`) has no other
+answer for it.
+
+Bit widths are read from the trellis shape's third axis (`16 * bits`), and every
+shape is 128-aligned on both `k` and `n`, so none is excluded by the GEMV's
+`size_k % 128 || size_n % 128` hard test:
+
+| bits | k | n | modules | which |
+|---:|---:|---:|---:|---|
+| 3 | 5120 | 17408 | 92 | `mlp.gate_proj`, `mlp.up_proj` |
+| 3 | 17408 | 5120 | 45 | `mlp.down_proj` |
+| 4 | 5120 | 1024 | 34 | narrow attention/GDN projections |
+| 4 | 5120 | 6144 | 48 | |
+| 4 | 5120 | 10240 | 48 | |
+| 4 | 5120 | 12288 | 17 | |
+| 4 | 5120 | 17408 | 38 | |
+| 4 | 6144 | 5120 | 64 | |
+| 4 | 10240 | 5120 | 1 | |
+| 4 | 17408 | 5120 | 20 | |
+| 5 | 6144 | 5120 | 1 | |
+| 6 | 5120 | 248320 | 1 | `lm_head` |
+
+Totals `{3: 137, 4: 270, 5: 1, 6: 1}` = 409. This reproduces the count
+`QUANT-EXL3-MUL1` slice F recorded, from the artifact and not from a summary of
+it, which is the discipline that row's own lesson demands.
+
+## THE INSTANTIATION IS NOT THE ONLY GATE, AND ON GB10 IT IS NOT THE BINDING ONE
+
+This is the finding that shapes the whole row, and #2570 does not contain it.
+
+`Exl3GemvSelectConfig` (`src/vt/exl3_policy.cpp:154-179`) is upstream's
+`exl3_gemv_cfg` (`exl3_gemv.cu:46-72`) verbatim, and it returns `-1` to DECLINE.
+Read it at the shapes above, on Blackwell (GB10 is `Exl3Cc::kBlackwell`), at the
+default `mode == 1`:
+
+```
+if (K == 2)                      -> config chosen        (no bits-2 tensor here)
+if (K == 3 && cc == kAda)        -> config chosen        (GB10 is NOT Ada)
+if (size_n / 32 <= narrow_coresident) -> 0
+if (size_k <= 2048 && size_n <= 8192) -> 0               (min k here is 5120)
+if (K == 3)                      -> -1                   <-- every bits-3 shape
+if (size_n >= 8192 && size_k <= 4096) -> 1               (min k here is 5120)
+if (... && cc == kAmpere)        -> 1                     (GB10 is NOT Ampere)
+                                 -> -1
+```
+
+`narrow_coresident` is `GemvOccupancy(narrow kernel, 512 threads) * num_sms`,
+the only term a device supplies. Every other term is fixed by the shape. So on
+GB10 the arm is admitted at the default mode **only** where
+`n / 32 <= blocks_per_sm * num_sms`:
+
+| bits | k | n | n/32 | admitted at mode 1? |
+|---:|---:|---:|---:|---|
+| 3 | 5120 | 17408 | 544 | only if `narrow_coresident >= 544` |
+| 3 | 17408 | 5120 | 160 | only if `narrow_coresident >= 160` |
+| 4 | 5120 | 1024 | 32 | almost certainly YES |
+| 4 | 6144 | 5120 | 160 | only if `narrow_coresident >= 160` |
+| 4 | 5120 | 6144 | 192 | only if `narrow_coresident >= 192` |
+| 4 | 5120 | 10240 | 320 | only if `narrow_coresident >= 320` |
+| 4 | 5120 | 12288 | 384 | only if `narrow_coresident >= 384` |
+| 4 | 5120 | 17408 | 544 | only if `narrow_coresident >= 544` |
+
+An occupancy of one or two 512-thread blocks per SM on a device with a few dozen
+SMs puts `narrow_coresident` in the low hundreds. **The instantiation is
+therefore necessary and possibly not sufficient**, and a measurement that only
+compares "arm present" against "arm absent" at the default mode cannot tell the
+two apart: a zero would be indistinguishable from an envelope that never
+admitted the arm.
+
+That confusion has already cost this tree one published number. The comment at
+`cuda_exl3.cu:2086` records a `VT_EXL3_GEMV=1` vs `=0` A/B reported as an 8%
+GEMV effect **when neither arm could take the GEMV at all** — it ran the same
+path twice. This row does not repeat it.
+
+So the measurement carries THREE legs, not two:
+
+- `VT_EXL3_GEMV=0` — the arm is off. On this checkpoint this is byte-identical
+  in behaviour to the pre-change binary, because the pre-change predicate
+  admitted only `(3, 1)` and the artifact has zero `(3, 1)` tensors. That
+  equivalence is asserted by a fourth leg on the PRE-CHANGE binary, not assumed.
+- `VT_EXL3_GEMV=1` — the default. Upstream's measured envelope decides, and this
+  is the only leg that is a production claim.
+- `VT_EXL3_GEMV=2` — upstream's own "use wherever the hard constraints allow"
+  testing mode (`exl3_gemv.cu:22`). This leg separates "the envelope declined"
+  from "the arm ran and did not help". It is a DIAGNOSTIC and is never reported
+  as a production number.
+
+`narrow_coresident` itself is printed from the device, so the table above stops
+being a prediction.
+
+**WHAT SEPARATES G0 FROM G1 WHEN THE ENVELOPE DECLINES, exactly.** Read
+`Exl3GemvTryLaunch` in order: `force_gemv == 0`, then the arm predicate, then
+`Exl3GemvHardEligible`, then the mode, then `GemvKernel`, then `GemvOccupancy`,
+then `Exl3GemvSelectConfig`. `VT_EXL3_GEMV=0` returns at the MODE test, which is
+before the occupancy query. So if the envelope declines at mode 1, the whole
+measured difference between G0 and G1 is one
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` per (device, kernel) pair,
+memoised in a static map. That is why `G1 == G0` would be the EXPECTED reading
+under a declining envelope rather than a surprise, and why G2 is needed to say
+anything about the kernel itself.
+
+The same order is what makes the pre-change binary and `VT_EXL3_GEMV=0`
+equivalent on this checkpoint: the old predicate returned false one test EARLIER
+than the mode test does, and neither reaches a device call. Both fall through to
+`exl3_gemm_kernel` with identical arguments.
+
+## Which tree the device evidence is measured on
+
+The lease job is pinned to the source tarball `sha256
+c133a4cbba670dbef6c6daebf4c0e130824519f317af221eaff7ebb1e9e9c5dd`, which is
+commit `665167c4a` of `row/QUANT-EXL3-PERF`.
+
+**THIS SENTENCE USED TO CLAIM MORE, AND A MERGE FALSIFIED IT.** It read "every
+compiled and tested path is byte-identical between that commit and this row's
+head; only `docs/USAGE.md` moved afterwards". That was true when written and
+became false when `origin/main` was merged into this branch before landing: 25
+paths under `src/`, `include/`, `tests/` and `CMakeLists.txt` differ between
+`665167c4a` and the merged head, none of them this row's. The gates stayed green
+throughout, which is exactly why the claim had to be re-checked rather than
+assumed -- a merge can leave the code correct and the PROSE wrong, and only the
+prose is load-bearing for an evidence table.
+
+What is true, and what the evidence actually rests on: **the five files this
+row's measurements depend on are byte-identical** between both pins and the
+merged head --- `src/vt/cuda/cuda_exl3.cu`, `src/vt/exl3_policy.cpp`,
+`include/vt/ops.h`, `tests/vt/test_exl3_gemv.cpp` and
+`tests/vt/exl3_fixture.h`. So the device numbers below still name this tree's
+kernel, its envelope and its fixture. Anything measured on the pinned trees is a
+statement about THOSE trees; re-derive it after any change to those five
+files.
+
+The DEVICE NUMERIC GATE runs on `thor:gpu0` from a `git bundle` pinned to
+`sha256 8156c0dbe30092ac267ab1749d2386c37ea832d7a2ceed5f3db6d29504d9ebf7`,
+which is commit `57e359907`, and the job aborts unless `git rev-parse HEAD`
+inside the clone matches. Nothing is pushed to reach that box.
+
+Named here because an evidence table must say which tree produced it, and
+because the bundle and tarball hashes are the only identifiers the job can
+verify on the box: each aborts rather than build a tree it was not pinned to. A
+`git rev-parse` plus an empty porcelain proves nothing on the far side of a
+copy.
+
+**Why two boxes.** `Exl3CcFromSm` maps every `sm_major >= 10` to
+`Exl3Cc::kBlackwell`, so Thor (11.0) and GB10 (12.1) are the SAME envelope
+class and only `narrow_coresident` differs by SM count. That makes Thor a valid
+CORRECTNESS box for the tier-3c bound and the codebook discrimination, and it is
+NOT a valid throughput box: the 16.7 tok/s baseline is GB10's, and a decode
+number from a different part is not comparable to it. The throughput half stays
+on `dgx:gpu0` and nothing from Thor is quoted on that axis.
+
+## Scope
+
+**In scope, slice A:** instantiate the GEMV at `(bits = 3, cb = 2)`; extend the
+device numeric case to gate both codebooks at tier 3c; measure the end-to-end
+decode effect on the real checkpoint on `dgx:gpu0`; record the envelope's actual
+verdict per shape.
+
+**Out of scope and owed, not silently dropped:** the `(4, 2)` kernel port, the
+fused MoE arm, `kExl3HadR` on ROCm, the four-shape coverage of the regular
+kernel's shape table. Each is under `## Owed` with its reason.
+
+## Upstream chain
+
+vLLM implements no EXL3 at the parity pin, so the chain below is the secondary
+oracle's, read at `2398c05635fbbad01a0a51dce63c85c6c8a8450e` and cited by
+`file:line` as `.agents/porting.md` requires.
+
+| Upstream path | What it defines | Where it lands here |
+|---|---|---|
+| `exllamav3_ext/quant/exl3_gemv.cu:29-42` | the `EXL3_GEMV` and `EXL3_GEMV_SMEM` knobs | `Exl3GemvParseMode` / `Exl3GemvParseSmemMode`, `src/vt/exl3_policy.cpp` |
+| `exllamav3_ext/quant/exl3_gemv.cu:46-72` | `exl3_gemv_cfg`, the narrow/wide/decline envelope | `Exl3GemvSelectConfig`, `src/vt/exl3_policy.cpp:154-179`, verbatim |
+| `exllamav3_ext/quant/exl3_gemv.cu:83-86` | `SEL_GRID`, the instantiated `(bits, cb)` arms | `Exl3GemvArmInstantiated` / `GemvKernel`, `src/vt/cuda/cuda_exl3.cu` |
+| `exllamav3_ext/quant/exl3_gemv.cu:108-114` | the hard eligibility tests, in upstream's order | `Exl3GemvHardEligible`, `src/vt/exl3_policy.cpp:141-152` |
+| `exllamav3_ext/quant/exl3_gemv.cu:171-241` | the direct entry point that ERRORS on an ineligible call | `Exl3GemmArgs::force_gemv`, used by the device gate |
+| `exllamav3_ext/quant/exl3_gemv_kernel.cuh:31` | `EXL3_GEMV_MAX_M` | `vt::kExl3GemvMaxM` / `kExl3GemvMaxMDev`, asserted equal |
+| `exllamav3_ext/quant/exl3_gemv_kernel.cuh:37-52` | the fp16-accumulate `mma.m16n8k16` fragment | `ptx_mma_ab_h`, `src/vt/cuda/cuda_exl3.cu` |
+| `exllamav3_ext/quant/exl3_gemv_kernel.cuh:120-134` | the register-form `dq8` with per-lane funnel alignment | `dq8_regs_3bits<cb>` |
+| `exllamav3_ext/quant/exl3_gemv_kernel.cuh:138-402` | the kernel, both configs, both m-modes | `exl3_gemv_kernel`, narrowed to `bits == 3` |
+| `exllamav3_ext/quant/codebook.cuh:56-90` | `decode_3inst<cb>` for all three codebooks | `decode_3inst_2<cb>`, landed by `QUANT-EXL3-MUL1` slice A |
+| `exllamav3_ext/quant/exl3_gemm.cu:220-236` | a DECLINED GEMV falls through to the shape table | `Exl3GemmKernelCuda`'s `TryGemv` call site |
+
+The chain that EXECUTES on a decode step is: the model's linear method reaches
+`vt::Exl3Gemm` through `ModelRegistry::Forward`; the CUDA arm calls
+`Exl3GemvTryLaunch`; that reads the arm predicate, then `Exl3GemvHardEligible`,
+then the env mode, then an occupancy query, then `Exl3GemvSelectConfig`; a
+non-negative config launches `exl3_gemv_kernel` cooperatively and a `-1` falls
+through to `exl3_gemm_kernel`. Every one of those is a place the arm can be lost,
+which is why the measurement observes the kernel rather than inferring it.
+
+## Our baseline
+
+Measured on `dgx:gpu0` (GB10, `sm_121a`, driver 580.173.02) under an `rc` lease,
+prompt `The capital of France is`, 64 tokens, greedy, `--repeat 5` with run 1
+discarded as cold, `VT_DFLASH_PAGED=0` (#2274):
+
+| arm | decode tok/s | spread |
+|---|---|---|
+| target only | 16.670 – 16.796 | 0.75%, two interleaved legs |
+| target + DFlash2 draft, k = 7 | 48.446 – 49.079 | two interleaved legs |
+
+Reproduced by this row's own job before anything is compared, on the same
+binary, because a sequential A/B on this box measures drift as much as it
+measures a change: one unchanged binary has read 36.82 and 78.86 tok/s in a
+single session here.
+
+The GEMV's own baseline is that it NEVER RUNS on this checkpoint. Every one of
+its 409 trellis modules is codebook 2, and the arm predicate admitted only
+`(3, 1)`.
+
+## Port map
+
+| Item | Upstream | Here | Status |
+|---|---|---|---|
+| `(3, 1)` GEMV arm | `SEL_GRID(3, 1, *)` | `GemvKernelForArm<3, 1>` | landed, `MODEL-DSV4-EXL3` W2c |
+| `(3, 2)` GEMV arm | `SEL_GRID(3, 2, false)` | `GemvKernelForArm<3, 2>` | **this row, slice A** |
+| `(4, 2)` GEMV arm | `SEL_GRID(4, 2, false)` | — | OWED, kernel port |
+| `(4, 0)`, `(4, 1)` | `SEL_GRID(4, 0/1, false)` | — | OWED with `(4, 2)`; same kernel work |
+| `(2, 1)`, `(2, 2)` | `SEL_GRID(2, *, *)` | — | no 2-bit artifact has reached this tree |
+| `(3, 1)`, `(3, 2)` smem-staged | `SEL_GRID(3, *, true)` | `SMEM_STAGE` template arm, both instantiated | landed |
+| the envelope | `exl3_gemv_cfg` | `Exl3GemvSelectConfig` | landed, verbatim, per-K so `(3, 2)` inherits `(3, 1)`'s |
+| the hard tests | `exl3_gemv.cu:110-114` | `Exl3GemvHardEligible` | landed, upstream's order |
+
+## Tests to port
+
+Upstream ships no C++ unit test for `exl3_gemv`; it exercises the path from
+Python through `exl3_gemv` and `exl3_gemm` with `EXL3_GEMV` set, and its
+correctness reference is the same linear evaluated by the regular kernel. The
+adaptation is recorded rather than hidden: the envelope is extracted as a pure
+function and gated directly, which upstream cannot do because its copy is
+`static` inside the `.cu`, and the kernel is gated against this tree's CPU arm,
+which `test_exl3_gemm` already gates against an f64 chain built from
+DEFINITIONS. That keeps ONE reference for both device arms instead of two that
+must agree.
+
+What is preserved from upstream: `EXL3_GEMV_MAX_M`, the mode values and their
+`atoi` parsing including the unset defaults, every branch of the envelope, the
+`K != 4 && cb == 0` refusal, the 128-alignment tests, and the `force` semantics
+of the direct entry point.
+
+## Dependencies
+
+- `QUANT-EXL3` (#2181) — the format, the CPU reference, `had_r_128`, and the
+  tier-3c bound this row inherits rather than restates.
+- `QUANT-EXL3-MUL1` (#2495) — `decode_3inst_2<2>` and `decode_mul1_product_2`.
+  Without codebook 2 in the shared decoder there is no `(3, 2)` arm to
+  instantiate; this row adds no decode of its own.
+- `.agents/oracles/exllamav3.md` — the pin. Advancing it re-opens every
+  `file:line` above.
+- An `rc` lease on `dgx:gpu0` for anything device-shaped. There is no local CUDA
+  toolchain, so every device claim in this row is PENDING until the lease runs.
+- #2274 (`VT_DFLASH_PAGED`) — the workaround the baseline carries, applied to
+  every leg alike so it cancels in the ratio.
+
+## Risks/decisions
+
+- **D1. The A/B is env-driven on ONE binary, not two binaries.** Decided,
+  because on this checkpoint `VT_EXL3_GEMV=0` and the pre-change binary take the
+  same code path: the old predicate admitted only `(3, 1)` and the artifact has
+  zero `(3, 1)` tensors. That removes binary drift from the comparison. The
+  equivalence is not assumed — a mutation that takes `(3, 2)` back out of the
+  predicate rebuilds the pre-change product behaviour and is measured.
+- **D2. Three legs, not two.** `VT_EXL3_GEMV=2` is upstream's testing mode and
+  is carried as a DIAGNOSTIC so an envelope decline stays distinguishable from a
+  null effect. It is never reported as a production number. R: quoting it as one
+  would be the 8%-from-nothing failure again.
+- **D3. The tier is 3c and it is inherited.** R: a `(3, 2)` arm that misses
+  `6.0e-3` is wrong; widening the bound to admit it would delete the only check
+  that can see a mis-threaded codebook.
+- **R1. The envelope may decline every bits-3 shape on GB10.** Then the arm is
+  correct, upstream-faithful and worth nothing on this device, and the next
+  hypothesis is the narrow config's occupancy. Recorded in `## Owed` as the
+  outcome it would be, not as a failure of the row.
+- **R2. The fat build compiles one more kernel set.** `(3, 2)` is 16 more
+  kernels in a translation unit the fat build compiles for ten architectures.
+  Upstream answers this with a per-`K` compilation-unit split
+  (`comp_units/exl3_comp_unit_K_cbX.cu`); this tree has one unit and the split
+  stays owed by `QUANT-EXL3-MUL1`, which argued it first.
+- **D4. The `QUANT-*EXL3*` sibling ratchet is widened by NAME, not by
+  predicate.** `tests/scripts/test_agent_record.py` pins the exact set of
+  `QUANT-` rows carrying `EXL3`, and it went RED on this row before its argument
+  was written, which is the gate working. The argument is that this row sits on
+  a different AXIS rather than being a third scheme: the two siblings answer
+  "does this width RUN" and this one answers "what does it COST", and
+  `QUANT-EXL3-MUL1`'s own claim file EXCLUDES the GEMV by name, so this row is
+  the owner that exclusion implies. A FOURTH row still fails there and must
+  argue for itself.
+- **D5. `docs/FEATURES.md` is edited, `docs/BENCHMARKS.md` is not.** The GEMV
+  arm set is a quantization surface and its row said the mul1 GEMV was owed, so
+  that sentence is now false and is repaired. No benchmark ID is added, because
+  no number exists yet; the cell says the measurement is PENDING rather than
+  omitting it.
+- **R3. Measuring on a box that crashes.** `dgx:gpu0` has crashed roughly hourly
+  under long ladders. The job prints results incrementally and orders the A/B
+  ahead of the mutations, so a crash costs the cheapest evidence rather than the
+  most expensive.
+
+## Why `(3, 2)` is an instantiation and `(4, 2)` is a port
+
+`exl3_gemv_kernel` in `src/vt/cuda/cuda_exl3.cu` is already
+`template <int bits, bool c_fp32, int cb, int MMODE, int CFG, bool SMEM_STAGE>`
+and threads `cb` all the way down: the only decode site in it is
+`dq8_regs_3bits<cb>`, which calls `decode_3inst_2<cb>`, and that function has
+carried all three codebooks since `QUANT-EXL3-MUL1` slice A. `GemvKernelForArm`
+is already `template <int BITS, int CB>`. Nothing about the kernel's geometry
+depends on `cb`: `LSTRIDE`, `TWORDS`, `FOLD`, `PF` and `LOADS` are all functions
+of `bits`, `CFG` and `MMODE`.
+
+So `(3, 2)` changes ONE template argument and ONE predicate. It covers 137 of
+the 409 modules.
+
+`(4, 2)` does not. `LSTRIDE` is the literal `24` with the comment
+`// uint32 per load, bits == 3`, and `TWORDS` is `8 * bits`, so at bits 3 the
+two are equal and one warp load covers one whole 16x16 tile. At bits 4
+`TWORDS == 32` and they are not equal; the prefetch ring depth `PF`, the fold
+cadence `FOLD` and the load count `LOADS` are all tuned around that equality,
+and no `dq8_regs_4bits` register extractor exists in this tree. That is a kernel
+port from `exl3_gemv_kernel.cuh`, and it is not attempted here.
+
+## The envelope is ALREADY ported, and that matters
+
+#2570 asks that any port bring `exl3_gemv.cu:55-71` with it. It is already here,
+verbatim, including the `K == 4` wide-config admission and the commented-out
+`cc != CC_AMPERE` guard that upstream disabled
+(`src/vt/exl3_policy.cpp:154-179`), and `tests/vt/test_exl3_gemv.cpp:101-122`
+gates its branches on any machine. Slice A adds no envelope change, because
+there is none to add: upstream's envelope is per-`K`, not per-`cb`, so `(3, 2)`
+inherits `(3, 1)`'s exactly.
+
+## The numeric tier is 3c, and it is NOT widened
+
+The GEMV accumulates in `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16` and
+folds to an f32 pair only every `FOLD` iterations, so an fp16 accumulator
+absorbs up to `FOLD * 16` k-elements. `QUANT-EXL3`'s `## W2cd design` W2c-3 sets
+its bound at tier 3c, relative RMS `6.0e-3`, rather than tier 3's `1.0e-3`. A
+new arm INHERITS that bound. If `(3, 2)` cannot meet `6.0e-3` the arm is wrong;
+the bound does not move.
+
+`(3, 1)` and `(3, 2)` are the confusable pair and the reason the device case
+gates both. Both are three bits wide, both take the same `dq8` route, both use
+the same tile shapes. A `cb` threaded wrongly between them does not fail to
+compile and does not change a shape: it decodes with the other codebook's tail
+and yields a weight with the right DISTRIBUTION and no correlation to the true
+one. The mutation table below makes that failure red.
+
+## Work breakdown
+
+- **A1.** Extend `tests/vt/test_exl3_gemv.cpp`'s device case over `cb` in
+  `{1, 2}`, referenced against the CPU arm at the same `cb`. RED first: `(3, 2)`
+  declines the arm before A2, so the forced call throws.
+- **A2.** Add `(3, 2)` to `Exl3GemvArmInstantiated` and `GemvKernel`, and
+  correct the comment block above them, which asserts the arm set is `(3, 1)`
+  only.
+- **A3.** Add a machine-independent case that reads the ENVELOPE at this
+  checkpoint's real shapes, so the table in this spec is executable rather than
+  prose.
+- **A4.** Measure on `dgx:gpu0` under an `rc` lease: the four legs above,
+  interleaved, one binary per arm, `narrow_coresident` printed.
+
+## Tests
+
+- `tests/vt/test_exl3_gemv.cpp` — the envelope cases (any machine) and the
+  device tier-3c case (CUDA only, skips loudly and still asserts).
+- The device case is FORCED through `Exl3GemmArgs::force_gemv`, mirroring
+  upstream's direct entry point (`exl3_gemv.cu:171-241`). Forcing is what makes
+  it a gate rather than a coin flip on an occupancy query: without it a device
+  whose envelope declines the shape measures the REGULAR kernel and reports
+  tier 3c green.
+
+## Gates
+
+```sh
+ctest --test-dir build -R '^test_exl3_gemv$' --output-on-failure
+ctest --test-dir build -R '^test_exl3_gemm$' --output-on-failure
+scripts/agent-preflight.sh --staged
+```
+
+The device arm additionally needs an `rc` lease and a CUDA build:
+
+```sh
+rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R '^test_exl3_gemv$' -V
+```
+
+A CPU-only green is not a device result and is never reported as one. A doctest
+`assertions: 0` line is a skip wearing a pass; read the ctest exit code.
+
+## Owed
+
+- **`(4, 2)`, the 270-module arm.** The largest single population in the
+  checkpoint, and the one #2570 leads with. It is a kernel port for the reason
+  under "Why `(3, 2)` is an instantiation" above, and it is not attempted in
+  this flow. Tracked by [#2570](https://github.com/mudler/vllm.cpp/issues/2570),
+  which stays OPEN for it.
+- **The envelope may decline `(3, 2)` at every shape this checkpoint has, on
+  GB10.** If it does, the instantiation is correct, upstream-faithful, and worth
+  zero end to end on this device — and the next traceable hypothesis is the
+  occupancy of the narrow config, which is the only device-supplied term in the
+  admission test. That is a measurement, not a ceiling.
+- **The fused MoE arm is `(3, 1)` only** (`kMoeBits`/`kMoeCb` in
+  `cuda_exl3.cu`), and it is CUDA-only. The #2495 checkpoint is dense so nothing
+  here reaches it, and it is named so the next MoE EXL3 artifact does not
+  rediscover it.
+- **`kExl3HadR` on ROCm runs the portable CPU reference tier, not a native
+  kernel.** It is correct and it is not fast, and no row owned that either.
+- **The regular kernel's shape table is gated at ONE of its four shapes.**
+  Read at `src/vt/exl3_policy.cpp:98-110`, the Blackwell arm returns shape 2 at
+  the dimensions the suite tests (`k 2048, n 4096, bits 3`: `mod_256 &&
+  size_n <= 4096` with `size_k > 8192` false). Shape 4 needs
+  `mod_512 && size_n > 16384` and shape 1 needs `(K == 4 || K == 2) && !multi &&
+  size_k <= 2048`, so neither is reachable at those dimensions at all.
+  `force_shape_idx` already exists, so covering the other three is a test loop
+  rather than a port. Owed by `QUANT-EXL3-MUL1`, which owns that table; repeated
+  here because the GEMV falls THROUGH to it on every shape the envelope
+  declines, which on this checkpoint may be all of them.
+- **`bits` 5 and 6 have no GEMV upstream either** (`exl3_gemv.cu:110-111`
+  refuses `K < 2 || K > 4`), so the one 5-bit tensor and the 6-bit `lm_head`
+  falling to the regular kernel is upstream's behaviour and not a gap. Recorded
+  so it is not re-filed.
+- **`docs/USAGE.md` owes this checkpoint's file names, sizes, repo and
+  REVISION.** Owed by `QUANT-EXL3-MUL1`, which loads it; repeated here because
+  this row measures it.
+
+## Stop conditions
+
+- `(3, 2)` and `(3, 1)` agree elementwise on the device case → the case is not
+  discriminating; the two codebooks must produce different numbers at the same
+  width. Stop and fix the fixture before reading any tolerance.
+- The tier-3c bound fails → the arm is wrong. Never widen the bound.
+- The `(4, 2)` port needs a kernel structure that is not upstream's → return
+  `NEEDS_DECISION` rather than inventing one.
+- The lease never arrives → report `(3, 2)` as instantiated-and-ungated, and say
+  so. A queued job nobody could gate is a partial result, never a pass.
+- An A/B leg shows the GEMV arm never ran → the measurement is void, not a zero.
+  Print the envelope's verdict before reading any tok/s.

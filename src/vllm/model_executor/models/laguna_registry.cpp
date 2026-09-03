@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/laguna.h"
+#include "vllm/model_executor/models/host_token_ids.h"  // ResolveHostTokenIds
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
@@ -90,14 +91,32 @@ ForwardLogits ForwardLagunaForCausalLM(LoadedModel& model,
                                        const ModelForwardInput& input) {
   auto& laguna = ModelAs<LagunaLoadedModel>(model, "LagunaForCausalLM");
   const LagunaWeights& weights = laguna.weights();
+  // #2544/#1305 -- TAKE the asynchronous runner's DEVICE identifiers, BEFORE
+  // either arm reads them. On the async serving path the runner's combine
+  // splices each decode row's sampled token into the DEVICE buffer on the main
+  // queue and leaves `token_ids` deliberately stale for decode rows
+  // (`v1/worker/gpu/runner.cpp`, the mirror arm, which is the DEFAULT on CUDA).
+  // A forward that embeds the host vector generates every step after the first
+  // from token id 0 -- silently, at rc=0, with plausible-looking output.
+  //
+  // Both arms here are HOST gathers -- `ForwardDevice` calls `Forward` -- so this
+  // is the host arm of the seam and not `detail::ApplyDeviceTokenIds`, which
+  // splices over a device embed buffer this model does not have.
+  // `host_token_ids.h` carries the whole argument.
+  //
+  // WIRED BUT NOT CONVICTED, and the spec says so under O4: #2544 named this
+  // registration on a grep and this row has no staged checkpoint for it.
+  std::vector<int32_t> device_ids;
+  const std::vector<int32_t>& ids =
+      ResolveHostTokenIds(input, &device_ids, "LagunaForCausalLM");
   if (input.gather_logits) {
-    return LagunaModel::ForwardDevice(input.token_ids, input.positions,
+    return LagunaModel::ForwardDevice(ids, input.positions,
                                       input.attn_meta, input.attn_kv, weights,
                                       input.config, input.queue,
                                       input.logits_indices);
   }
   return HostLogits(
-      LagunaModel::Forward(input.token_ids, input.positions, input.attn_meta,
+      LagunaModel::Forward(ids, input.positions, input.attn_meta,
                            input.attn_kv, weights, input.config, input.queue,
                            input.logits_indices),
       weights.params.vocab_size);

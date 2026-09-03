@@ -128,6 +128,39 @@ class PathClassification(unittest.TestCase):
             "evidence",
         )
 
+    def test_a_python_probe_in_a_per_run_evidence_dir_is_evidence(self) -> None:
+        """#2612: wave GDNDECOMP's instrument is a numpy replica of FLA, so its
+        five scripts land as `.py` inside
+        `docs/bench-evidence/gdn-chunked-decomposition-20260902/`. The extension
+        list carried `txt|log|gz|sh|cu` and not `py`, `classify_path` fails
+        closed, and the whole-tree sweep below went RED on the branch carrying
+        them -- and would have gone red on `main` on the day they landed, the
+        same shape as #1448 and #2316.
+
+        A `.py` is the recipe exactly as a `.sh` is. RED before the `py` arm of
+        BENCH_EVIDENCE_RUN.
+        """
+        for path in (
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/gdn_decomp.py",
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/run_golden.py",
+            "docs/bench-evidence/gdn-chunked-decomposition-20260902/check_bf16_helper.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "evidence")
+
+    def test_a_python_file_outside_a_per_run_evidence_dir_fails_closed(self) -> None:
+        """The suffix is not a licence, and this is the arm that keeps a product
+        or checker script from taking the evidence class by being spelled `.py`.
+        A flat `docs/bench-evidence/*.py` is NOT a per-run directory and does not
+        classify either."""
+        for path in (
+            "docs/some-other-place/whatever.py",
+            "docs/bench-evidence/flat-not-a-run-dir.py",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
     def test_a_csv_outside_bench_evidence_still_fails_closed(self) -> None:
         """The extension is not a licence. Widening by suffix alone would let a
         csv anywhere in docs/ take the evidence class without review."""

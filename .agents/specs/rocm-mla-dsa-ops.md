@@ -41,7 +41,24 @@ Verified with `git show 11fed3ba:src/vt/cuda/cuda_mla_attn.cu | grep -n
 but for the reason in §Split, not for a missing donor. Every one of the eight has
 a structural donor in this tree.
 
-### Correction 2 — `kFusedChain` cannot disqualify a default-configuration run
+### Correction 2 — the list of eight is not complete
+
+Two more ops are ROCm-unregistered, have both a CUDA and a CPU sibling, and are
+on an MLA path: `kMlaPrefillAttention` and `kMergeAttnStates`. The first is not
+a guess. The `kFusedNormRope` landing commit `9f3e6e223` names the ops its
+GLM-5.3 run on `strix:gpu0` observed on the reference tier, and its list is
+**five**: `ConcatAndCacheMla`, `ConcatMlaNopeRope`, **`MlaPrefillAttention`**,
+`BatchedMatmul`, `MlaDecodeAttention`. So `kMlaPrefillAttention` was measured on
+this model, on this board, and #2715 does not list it.
+
+It is not scoped here and it is not a W2 or W3 item either. Its CUDA arm is
+inside `#ifdef VLLM_CPP_FLASH_ATTN` (`cuda_mla_prefill.cu`) and is the vendored
+FA-2 launcher, so there is nothing to mirror: a ROCm arm is a new kernel against
+the CPU reference, not a port. `kMergeAttnStates` is a scalar elementwise kernel
+(`cuda_mla_prefill.cu:365-450`) and is cheap, but no ROCm run has yet observed
+it. Both are recorded under `## Owed`.
+
+### Correction 3 — `kFusedChain` cannot disqualify a default-configuration run
 
 `kFusedChain` is the **Tier-1 interpreter**, and `src/vt/ops.cpp:1287-1298`
 reaches it only when `RecipeIsTier1Able(recipe) && FusedTier() == 1`.
@@ -123,7 +140,7 @@ axis.
 | **W2** | `kDsaIndexerLogits`, `kDsaTopkSelect` | ~270 | The pair is one unit: the top-k consumes the logits the first op writes, and the tie/emission rule is only checkable end to end. |
 | **W3** | `kMlaDecodeAttention` | ~600 | The four risks above. Landing it closes the disqualification, so the speed axis is measurable for the first time at W3 and not before. |
 
-`kFusedChain` is not in any wave — see Correction 2.
+`kFusedChain` is not in any wave — see Correction 3.
 
 ## W1 — what this pull request lands
 
@@ -222,6 +239,13 @@ W1 in flight. W2 and W3 unclaimed.
 - `kMlaDecodeAttention` on ROCm — W3. Owner `BACKEND-ROCM`, issue #2715.
 - `kDsaIndexerLogits` + `kDsaTopkSelect` on ROCm — W2. Owner `BACKEND-ROCM`,
   issue #2715.
+- `kMlaPrefillAttention` on ROCm — NOT a port. Owner `BACKEND-ROCM`, issue
+  #2715. Its CUDA arm is the vendored FA-2 launcher behind `VLLM_CPP_FLASH_ATTN`,
+  so a ROCm arm is a new kernel written against the CPU reference. Measured on
+  the reference tier by `9f3e6e223`'s own GLM-5.3 run and absent from #2715's
+  list.
+- `kMergeAttnStates` on ROCm — a scalar elementwise kernel, cheap, but no ROCm
+  run has observed it. Owner `BACKEND-ROCM`, issue #2715.
 - `kFusedChain` on ROCm — **non-gating**. Owner `BACKEND-ROCM`, issue #2715.
   Reached only under `VT_FUSED_TIER=1`, which is a rejected performance arm on
   every backend that measured it, so it cannot disqualify a default run.

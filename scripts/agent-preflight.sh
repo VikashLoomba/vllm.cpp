@@ -190,6 +190,7 @@ SUITES=(
   test_agent_issue_index
   test_check_symbol_anchors
   test_check_oracle_denominator_flags
+  test_rocm_strix_ourarm_staged
   test_check_conflict_markers
   test_check_tree_compiles
   test_prepush_checker_names

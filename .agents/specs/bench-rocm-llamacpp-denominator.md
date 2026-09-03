@@ -19,6 +19,40 @@ whose speed axis is marked INADMISSIBLE and quotable as nothing.
 The oracle side is measured and recorded. Our arm's side is staged and
 deliberately unrun.
 
+**The denominator is `12.233 tok/s`**, the median of 6 legs, spread `0.303%` of
+the median, 6 of 6 legs `rc=0`, taken on 2026-09-02 in `rc` job
+`ff18a029-cd10-42d1-a5f7-9129c1c8af09`. It reproduces the 2026-09-01 lease's
+three legs on a different lease. The executed path is pinned by the source
+content manifest and by the sha256 of every binary and shared object the run
+linked, because this oracle's greedy decode is not deterministic across its own
+kernel paths and the revision alone under-specifies it. The job checked that
+manifest only against a constant in its own script, which fixes the tree but not
+its provenance; the link to upstream was closed separately by reproducing the
+manifest from `git archive` of `10bf611e…aebd8` out of `ggml-org/llama.cpp`,
+where the tag `b10451` resolves to that commit and the file count matches at
+3,425. `build_commit` reading `unknown` is a consequence of staging from a
+tarball with no `.git`, not an unpinned build.
+
+The staged arm refuses on `STRIX_ARM_SPEED_RATIFIED_BY`, and the refusal is
+proven rather than asserted: **14 of 14 mutations of the guard are detected** by
+`tests/scripts/test_rocm_strix_ourarm_staged.py`. Three of those mutations read
+NOT DETECTED on the first pass and were repaired rather than recorded as passes
+— the length floor and the issue-reference term were being tested as one
+condition, and the reference-tier assertion was a substring test that
+`VT_OP_PROVIDER_STATS_DISABLED=1` walked straight through. A fourth clause, a
+bare `-z` test, was **deleted**: no mutation could break it, because the length
+floor already decided the empty and the unset case, and an assertion nothing can
+falsify is not a guarantee.
+
+The staged arm's reference-tier assertion was itself defective when it was
+written, and `tests/scripts/test_ltx25_ab_memwatch.py` caught it before it
+landed. It read the count as `grep -c … || echo 0`, and `grep -c` prints its own
+`0` and exits 1 on no match, so the fallback ran on top of the count and produced
+the two-line value `0\n0`; an absent stderr capture also read as `0`, which is
+exactly the clean reference-tier result the assertion exists to refuse. It now
+tests the file is readable first and reports `UNREAD` when it is not, so a
+missing capture can no longer pass for a clean one.
+
 The `BACKEND-GATE-ROCM-LLAMACPP` matrix row stays `INVENTORIED`. Nothing here
 makes the ROCm floor gateable: a floor is a comparison, and this row has only
 one side of one. What the row's record gains is a measured denominator and the

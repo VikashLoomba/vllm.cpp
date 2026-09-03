@@ -311,6 +311,55 @@ class PathClassification(unittest.TestCase):
         with self.assertRaises(ValueError):
             checker.classify_path(".agents/not-a-real-guide-xyz.md")
 
+    def test_a_measurement_runs_own_artifact_kinds_classify_as_evidence(self) -> None:
+        """#2497: a `rc` job's own OUTPUT is evidence, not unclassified paths.
+
+        Distinct from the `py` arm #2629 landed hours earlier, and found
+        independently in another directory. That arm covers the RECIPE. These
+        two are what the job emitted: `docs/bench-evidence/rocm-strix-llamacpp-
+        denominator-20260902/` carries six `clock-leg*.jsonl` and six `leg*.rc`
+        with no class, and `classify_path` fails closed, so
+        `test_every_tracked_and_current_change_path_is_classified` was RED
+        against the WHOLE TREE. Landing that would have reddened `main` itself
+        and then refused every later change touching this checker through its
+        own evidence contract. It went unseen because this checker is CI-only
+        and `agent-preflight.sh` never runs it.
+
+        RED-BEFORE for the `jsonl|rc` arms: both raise `ValueError` against the
+        base checker. The `.py` line is a REGRESSION GUARD and is green at base
+        as well as at head -- #2629 made it so, and it is kept because these two
+        files are the row's own and a later narrowing of that arm would silently
+        take them with it.
+        """
+        run = "docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902"
+        for path in (
+            f"{run}/clock-leg1.jsonl",     # RED at base: the instrument stream
+            f"{run}/leg1.rc",              # RED at base: one leg's exit status
+            f"{run}/fold.py",              # green at base since #2629
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "evidence")
+
+        # The additions are a closed enumeration over ONE directory shape, not a
+        # relaxation. A sibling extension nobody has argued for still fails
+        # closed, both new suffixes fail closed outside a per-run evidence
+        # directory, and names that already had a class keep it.
+        for path in (
+            f"{run}/leg1.pickle",
+            "docs/bench-evidence/flat-not-a-run-dir.jsonl",
+            "docs/some-other-place/whatever.rc",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+        self.assertEqual(
+            checker.classify_path("scripts/check-pr-size.py"), "governance_checker"
+        )
+        # `.json` stays OUT of the evidence arm: DOC already claims it, and the
+        # evidence arm is tested first, so admitting it would reclassify
+        # docs/bench-evidence/mxfp4-qwen's golden.
+        self.assertEqual(checker.classify_path(f"{run}/leg1.json"), "public_document")
+
     def test_every_tracked_and_current_change_path_is_classified(self) -> None:
         paths = set(
             subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).splitlines()

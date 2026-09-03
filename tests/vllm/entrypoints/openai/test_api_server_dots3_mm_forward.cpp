@@ -41,6 +41,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -58,6 +59,7 @@
 
 #include "dots3_note_tiny_fixture.h"
 #include "vllm/config/multimodal.h"
+#include "vllm/multimodal/dots3_note_processor.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/mm_chat_registry.h"
@@ -180,14 +182,31 @@ std::string ConcatChatPrompt(
 }
 
 // The raw-RGB passthrough codec, the same shape `server_main.cpp` installs.
+//
+// TWO media types, because W6c (#2537) needs a NON-SQUARE image and the square
+// one cannot carry its own dimensions. `image/x-raw-rgb` keeps W6a's shape — a
+// perfect square inferred from the byte count — and `image/x-raw-rgb-hw`
+// prefixes the pixels with height and width as two big-endian `uint16`s. The
+// codec is the only place that changes: what it hands the seam is the same
+// `DecodedImageRgb` either way, so the served path past it is byte-identical
+// between the two cases.
 oai::ImageCodecFn RawRgbCodec() {
   return [](const oai::DecodedMedia& media) -> oai::DecodedImageRgb {
+    oai::DecodedImageRgb out;
+    if (media.media_type == "image/x-raw-rgb-hw") {
+      REQUIRE(media.bytes.size() >= 4);
+      out.height = (static_cast<int64_t>(media.bytes[0]) << 8) | media.bytes[1];
+      out.width = (static_cast<int64_t>(media.bytes[2]) << 8) | media.bytes[3];
+      REQUIRE(static_cast<std::size_t>(out.height * out.width * 3) ==
+              media.bytes.size() - 4);
+      out.rgb.assign(media.bytes.begin() + 4, media.bytes.end());
+      return out;
+    }
     REQUIRE(media.media_type == "image/x-raw-rgb");
     const std::size_t px = media.bytes.size() / 3;
     const auto side = static_cast<int64_t>(
         std::llround(std::sqrt(static_cast<double>(px))));
     REQUIRE(static_cast<std::size_t>(side * side * 3) == media.bytes.size());
-    oai::DecodedImageRgb out;
     out.rgb = media.bytes;
     out.height = side;
     out.width = side;
@@ -228,14 +247,33 @@ std::string ImageDataUri(int variant) {
          EncodeBase64(dots3_tiny::FixtureImage(variant));
 }
 
+// The NON-CONFORMANT image, dimensions carried in the payload (W6c, #2537).
+std::string OddImageDataUri(int64_t h, int64_t w, int variant) {
+  std::vector<uint8_t> raw{static_cast<uint8_t>((h >> 8) & 0xFF),
+                           static_cast<uint8_t>(h & 0xFF),
+                           static_cast<uint8_t>((w >> 8) & 0xFF),
+                           static_cast<uint8_t>(w & 0xFF)};
+  const std::vector<uint8_t> px = dots3_tiny::FixtureImageHW(h, w, variant);
+  raw.insert(raw.end(), px.begin(), px.end());
+  return "data:image/x-raw-rgb-hw;base64," + EncodeBase64(raw);
+}
+
+json ChatBodyWithImage(int max_tokens, const std::string& data_uri,
+                       bool logprobs);
+
 json ChatBody(int max_tokens, int variant, bool logprobs) {
+  return ChatBodyWithImage(max_tokens, ImageDataUri(variant), logprobs);
+}
+
+json ChatBodyWithImage(int max_tokens, const std::string& data_uri,
+                       bool logprobs) {
   json body = {
       {"model", "test-model"},
       {"messages",
        json::array({{{"role", "user"},
                      {"content",
                       json::array({{{"type", "image_url"},
-                                    {"image_url", {{"url", ImageDataUri(variant)}}}},
+                                    {"image_url", {{"url", data_uri}}}},
                                    {{"type", "text"}, {"text", "hello"}}})}}})},
       {"max_completion_tokens", max_tokens},
       {"temperature", 0.0}};
@@ -421,6 +459,111 @@ TEST_CASE("dots3-note W6a: a served image chat request reaches the model forward
   // image tokens + `<|endofimg|>` + "hello". A seam that dropped the expansion
   // would report 3 prompt tokens and still answer 200.
   CHECK(j.at("usage").at("prompt_tokens") == 3 + dots3_tiny::kExpectedImageTokens);
+}
+
+// ---------------------------------------------------------------------------
+// 2b. THE NON-CONFORMANT IMAGE IS SERVED, NOT REFUSED (W6c, #2537).
+//
+//     THIS IS THE RED-BEFORE FOR THE WHOLE BRICK. `factor` is
+//     `patch_size * merge_size`, 4 on this fixture and 28 on the released
+//     checkpoint, and before W6c `Dots3NoteImageProcessor::ProcessImage` threw
+//     for any image whose sides were not already multiples of it. The throw
+//     surfaced here as HTTP 400 with both sizes in the message — a refusal by
+//     name, never a silent skip — so this case read 400 on the tree this brick
+//     started from and reads 200 on the tree it leaves.
+//
+//     The image is 6x14. It is NON-SQUARE on purpose: 8x16 out of 6x14 keeps
+//     the two axes distinguishable on both sides of the resample, so a
+//     transposed loop or a swapped bound cannot pass here. And the token count
+//     is the grid the RESIZED size implies (32 patches / 2² = 8) rather than
+//     the four the square fixture produces, so a resize that silently kept the
+//     original geometry would answer 200 with the wrong prompt length.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6c: a NON-CONFORMANT image is resized and served, not refused") {
+  Served s;
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, /*is_multimodal_model=*/true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  // The premise, asserted rather than assumed: neither side of 6x14 is a
+  // multiple of this fixture's `factor`, and the resolved target is 8x16.
+  const int64_t factor = dots3_tiny::TinySpec{}.v_patch * dots3_tiny::TinySpec{}.v_merge;
+  REQUIRE(dots3_tiny::kOddImageH % factor != 0);
+  REQUIRE(dots3_tiny::kOddImageW % factor != 0);
+  REQUIRE(dots3_tiny::kOddImageH != dots3_tiny::kOddImageW);
+  const std::array<int64_t, 2> rs = vllm::multimodal::Dots3NoteResizedSize(
+      dots3_tiny::kOddImageH, dots3_tiny::kOddImageW, factor,
+      dots3_tiny::TinySpec{}.p_min_pixels, dots3_tiny::TinySpec{}.p_max_pixels);
+  REQUIRE(rs[0] == dots3_tiny::kOddResizedH);
+  REQUIRE(rs[1] == dots3_tiny::kOddResizedW);
+
+  const ApiServer::DispatchResult r = h.server.handle_chat_completions(
+      ChatBodyWithImage(/*max_tokens=*/3,
+                        OddImageDataUri(dots3_tiny::kOddImageH,
+                                        dots3_tiny::kOddImageW, /*variant=*/0),
+                        /*logprobs=*/false)
+          .dump());
+  INFO("body: ", r.body);
+  // A 500 here IS the pre-W6c behaviour: the processor's throw reaches the
+  // dispatcher, which reports it with the message that names the missing path.
+  REQUIRE(r.status == 200);
+  const json j = json::parse(r.body);
+  CHECK(j.at("object") == "chat.completion");
+  CHECK(j.at("usage").at("completion_tokens") == 3);
+  // `<|img|>` + EIGHT image tokens + `<|endofimg|>` + "hello". Eight, not four:
+  // the placeholder run follows the RESIZED grid.
+  CHECK(j.at("usage").at("prompt_tokens") ==
+        3 + dots3_tiny::kOddExpectedImageTokens);
+}
+
+// ---------------------------------------------------------------------------
+// 2c. THE RESIZED PIXELS REACH THE MODEL, and two non-conformant images that
+//     resize to the SAME grid still give different forwards.
+//
+//     Case 2b would pass on a tree whose resampler returned a constant of the
+//     right shape: the status, the grid and the token count are all properties
+//     of the GEOMETRY, which `Dots3NoteResizedSize` already owned before W6c.
+//     This case compares the served logprobs of two different 6x14 images. It
+//     is the served counterpart of the resampler's numeric gate, and it is what
+//     the "delete the resize call" mutation has to break.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6c: two different NON-CONFORMANT images give two different forwards") {
+  Served s;
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  const ApiServer::DispatchResult a = h.server.handle_chat_completions(
+      ChatBodyWithImage(4,
+                        OddImageDataUri(dots3_tiny::kOddImageH,
+                                        dots3_tiny::kOddImageW, 0),
+                        true)
+          .dump());
+  const ApiServer::DispatchResult b = h.server.handle_chat_completions(
+      ChatBodyWithImage(4,
+                        OddImageDataUri(dots3_tiny::kOddImageH,
+                                        dots3_tiny::kOddImageW, 1),
+                        true)
+          .dump());
+  INFO("a: ", a.body);
+  INFO("b: ", b.body);
+  REQUIRE(a.status == 200);
+  REQUIRE(b.status == 200);
+
+  const json ja = json::parse(a.body);
+  const json jb = json::parse(b.body);
+  const json& la = ja.at("choices").at(0).at("logprobs").at("content").at(0);
+  const json& lb = jb.at("choices").at(0).at("logprobs").at("content").at(0);
+  MESSAGE("odd image A logprob0 ", la.dump());
+  MESSAGE("odd image B logprob0 ", lb.dump());
+  CHECK(la.at("logprob").get<double>() != lb.at("logprob").get<double>());
+  // Both legs still ran the RESIZED grid.
+  CHECK(ja.at("usage").at("prompt_tokens") ==
+        3 + dots3_tiny::kOddExpectedImageTokens);
+  CHECK(jb.at("usage").at("prompt_tokens") ==
+        3 + dots3_tiny::kOddExpectedImageTokens);
 }
 
 // ---------------------------------------------------------------------------

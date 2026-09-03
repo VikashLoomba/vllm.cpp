@@ -96,6 +96,14 @@ struct TinySpec {
   // `capacity_factor`. `topk = min(int(capacity_factor), num_routed)`
   // (vision.py:190 @ 9035151d6), so 2 selects TWO experts — the released value.
   double v_capacity_factor = 2.0;
+  // The processor's PIXEL BUDGET, written into `preprocessor_config.json`.
+  // The defaults leave `Dots3NoteResizedSize` free to round each side to a
+  // multiple of `factor` with no clamp, which is what the conformant fixture
+  // image wants. W6c's downscale case lowers `p_max_pixels` instead of shipping
+  // a large image, because the clamp is the only way to force a resize RATIO
+  // big enough for PIL's support scaling to dominate.
+  int64_t p_min_pixels = 16;
+  int64_t p_max_pixels = 1 << 20;
   std::string v_router_scoring_func = "sigmoid";
   double v_router_scale = 1.0;
   // The AMPLITUDE of the generated `mlp.router_bias` values, and the ONLY
@@ -325,9 +333,11 @@ inline nlohmann::json TinyConfigDoc(const std::string& fixture_dir,
 }
 
 // The `preprocessor_config.json` the chat seam's factory reads. Its geometry
-// reproduces the `vision_config`'s, and `min_pixels`/`max_pixels` are chosen so
-// `Dots3NoteResizedSize` is the IDENTITY on the fixture image — the bicubic
-// resize path is a named residual, so a fixture that needed it would refuse.
+// reproduces the `vision_config`'s, and the DEFAULT `min_pixels`/`max_pixels`
+// leave `Dots3NoteResizedSize` the IDENTITY on the square fixture image. Since
+// W6c a non-conformant image is RESIZED rather than refused, so a case is free
+// to move either bound or to hand `ProcessImage` a size that is not a multiple
+// of `factor`.
 inline nlohmann::json TinyPreprocessorDoc(const TinySpec& s) {
   return nlohmann::json{
       {"patch_size", s.v_patch},
@@ -336,8 +346,8 @@ inline nlohmann::json TinyPreprocessorDoc(const TinySpec& s) {
       {"pre_pixel_shuffle", s.v_pre_pixel_shuffle},
       {"image_mean", {0.5, 0.45, 0.4}},
       {"image_std", {0.25, 0.3, 0.35}},
-      {"min_pixels", 16},
-      {"max_pixels", 1 << 20}};
+      {"min_pixels", s.p_min_pixels},
+      {"max_pixels", s.p_max_pixels}};
 }
 
 inline nlohmann::json TinyAddedTokensDoc() {
@@ -546,6 +556,40 @@ inline std::vector<uint8_t> FixtureImage(int variant) {
     rgb[i] = variant == 0
                  ? static_cast<uint8_t>((i * 37 + 11) & 0xFF)
                  : static_cast<uint8_t>(((i / (kImageSide * 3)) * 29) & 0xFF);
+  }
+  return rgb;
+}
+
+// The NON-CONFORMANT fixture image (W6c, #2537): 6 rows by 14 columns, so
+// NEITHER side is a multiple of `factor` = 4 and the two sides differ. A square
+// probe cannot see an axis swap or a transposed loop, which is the defect a
+// resampler is most likely to carry and the one a shape check never reports.
+//
+// `Dots3NoteResizedSize(6, 14, 4, 16, 1<<20)` rounds each side independently:
+// `round(6/4) = 2` -> 8 rows and `round(14/4) = 4` -> 16 columns, so the target
+// is 8x16 and the axes stay distinguishable on BOTH sides of the resize. The
+// grid is then (1, 4, 8) = 32 patches and 32 / (2*2) = EIGHT placeholder tokens.
+inline constexpr int64_t kOddImageH = 6;
+inline constexpr int64_t kOddImageW = 14;
+inline constexpr int64_t kOddResizedH = 8;
+inline constexpr int64_t kOddResizedW = 16;
+inline constexpr int64_t kOddExpectedImageTokens = 8;
+
+// An HWC uint8 RGB image whose value depends on BOTH coordinates and on the
+// channel, so a swapped axis, a dropped channel and a half-pixel shift each
+// change the bytes. `variant` picks a genuinely different image, exactly as
+// `FixtureImage` does.
+inline std::vector<uint8_t> FixtureImageHW(int64_t h, int64_t w, int variant) {
+  std::vector<uint8_t> rgb(static_cast<size_t>(h * w * 3));
+  for (int64_t y = 0; y < h; ++y) {
+    for (int64_t x = 0; x < w; ++x) {
+      for (int64_t c = 0; c < 3; ++c) {
+        const size_t i = static_cast<size_t>((y * w + x) * 3 + c);
+        rgb[i] = variant == 0
+                     ? static_cast<uint8_t>((y * 37 + x * 11 + c * 61) & 0xFF)
+                     : static_cast<uint8_t>((y * 5 + x * 23 + c * 97) & 0xFF);
+      }
+    }
   }
   return rgb;
 }

@@ -1540,10 +1540,33 @@ TEST_CASE("dots3-note W6a: the image processor mirrors upstream's own resize and
     }
   }
 
-  // A non-conformant image is REFUSED by name rather than patchified at the
-  // wrong grid: the bicubic resize is a named residual, not a silent path.
+  // A non-conformant image is RESIZED and patchified at the RESIZED grid.
+  // W6a's version of this assertion was the refusal; W6c (#2537) inverted it,
+  // and the two halves of the inversion are asserted together so a resize that
+  // ran but kept the old geometry cannot pass: 9x9 resolves to 8x8, which is
+  // FOUR 2x2 patches by four, and the placeholder run follows that grid and not
+  // the 9x9 one.
   std::vector<uint8_t> odd(static_cast<size_t>(9 * 9 * 3), 128);
-  CHECK_THROWS_AS((void)proc.ProcessImage(odd.data(), 9, 9), std::runtime_error);
+  const vllm::multimodal::ImageKwargs okw = proc.ProcessImage(odd.data(), 9, 9);
+  const auto ors = Dots3NoteResizedSize(9, 9, proc.factor(), cfg.min_pixels,
+                                        cfg.max_pixels);
+  CHECK(ors[0] == 8);
+  CHECK(ors[1] == 8);
+  CHECK(okw.image_grid_thw[1] == ors[0] / s.v_patch);
+  CHECK(okw.image_grid_thw[2] == ors[1] / s.v_patch);
+  CHECK(okw.num_patches == okw.image_grid_thw[1] * okw.image_grid_thw[2]);
+  // A CONSTANT image survives the resample, so every patch element is that
+  // constant put through the per-channel normalization. This is the cheapest
+  // assertion that the resized buffer — and not the original one read at the
+  // wrong stride — is what got patchified.
+  for (int64_t c = 0; c < 3; ++c) {
+    const double want =
+        (128.0 - cfg.image_mean[static_cast<size_t>(c)] / cfg.rescale_factor) /
+        (cfg.image_std[static_cast<size_t>(c)] / cfg.rescale_factor);
+    const int64_t k = (c * s.v_patch + 0) * s.v_patch + 0;
+    CHECK(okw.pixel_values_f32[static_cast<size_t>(k)] ==
+          doctest::Approx(want).epsilon(1e-6));
+  }
 }
 
 
@@ -1830,6 +1853,80 @@ TEST_CASE("dots3-note W6c: the bicubic resampler is PIL's, per-pixel and at both
   // guarded one end would have been invisible without this.
   CHECK(saw_zero);
   CHECK(saw_255);
+
+  // THE PROCESSOR ACTUALLY USES IT, at the RESIZED stride. Everything above
+  // measures `PilResizeBicubicRgb` in isolation; this arm measures what
+  // `ProcessImage` patchified. It is the arm that catches a resize that ran and
+  // was then read back at the SOURCE row stride — a shear that leaves the grid,
+  // the patch count, the placeholder run and the served status all valid.
+  //
+  // The check is a full RECONSTRUCTION: undo the per-channel normalization and
+  // undo `pre_pixel_shuffle`'s transpose (`processor.py:185-197`), which puts
+  // every element back at the resized-image coordinate it came from, then
+  // compare the whole image to the reference resample byte for byte.
+  SUBCASE("ProcessImage patchifies the RESIZED image, at the resized stride") {
+    const TinySpec ps;
+    const TinyCheckpoint ck(FixtureDir(), ps);
+    const vllm::multimodal::Dots3NoteProcessorConfig pcfg =
+        vllm::multimodal::LoadDots3NoteProcessorConfig(
+            ck.dir() + "/preprocessor_config.json", ck.config_path(), "tiny");
+    const vllm::multimodal::Dots3NoteImageProcessor proc(pcfg);
+    REQUIRE(pcfg.pre_pixel_shuffle);
+
+    // 6x14 is the served fixture's own non-conformant shape: NEITHER side is a
+    // multiple of `factor` = 4, and the two sides differ, so an axis swap
+    // cannot survive either.
+    const long ih = 6, iw = 14;
+    const std::vector<unsigned char> src = make(ih, iw, 2);
+    const auto rs = vllm::multimodal::Dots3NoteResizedSize(
+        ih, iw, proc.factor(), pcfg.min_pixels, pcfg.max_pixels);
+    const long rh = static_cast<long>(rs[0]), rw = static_cast<long>(rs[1]);
+    REQUIRE(rh == 8);
+    REQUIRE(rw == 16);
+    const std::vector<unsigned char> want =
+        ref_resample::ResizeExact(src, ih, iw, rh, rw);
+
+    const vllm::multimodal::ImageKwargs kw =
+        proc.ProcessImage(src.data(), ih, iw);
+    const int64_t patch = pcfg.patch_size, m = pcfg.merge_size;
+    const int64_t gh = rh / patch, gw = rw / patch;
+    const int64_t Gw = gw / m;
+    REQUIRE(kw.image_grid_thw[1] == gh);
+    REQUIRE(kw.image_grid_thw[2] == gw);
+    REQUIRE(kw.num_patches == gh * gw);
+
+    long worst = 0;
+    for (int64_t bh = 0; bh < gh / m; ++bh)
+      for (int64_t bw = 0; bw < Gw; ++bw)
+        for (int64_t mh = 0; mh < m; ++mh)
+          for (int64_t mw = 0; mw < m; ++mw) {
+            const int64_t r = ((bh * Gw + bw) * m + mh) * m + mw;
+            for (int64_t c = 0; c < 3; ++c) {
+              const double shift =
+                  pcfg.image_mean[static_cast<std::size_t>(c)] / pcfg.rescale_factor;
+              const double sc =
+                  pcfg.image_std[static_cast<std::size_t>(c)] / pcfg.rescale_factor;
+              for (int64_t ph = 0; ph < patch; ++ph)
+                for (int64_t pw = 0; pw < patch; ++pw) {
+                  const int64_t k = (c * patch + ph) * patch + pw;
+                  const double got =
+                      static_cast<double>(
+                          kw.pixel_values_f32[static_cast<std::size_t>(
+                              r * kw.patch_feature_dim + k)]) *
+                          sc +
+                      shift;
+                  const long y = (bh * m + mh) * patch + ph;
+                  const long x = (bw * m + mw) * patch + pw;
+                  const long ref = static_cast<long>(
+                      want[static_cast<std::size_t>((y * rw + x) * 3 + c)]);
+                  const long d = std::abs(static_cast<long>(std::lround(got)) - ref);
+                  if (d > worst) worst = d;
+                }
+            }
+          }
+    MESSAGE("W6c ProcessImage vs reference resample: max |level| = ", worst);
+    CHECK(worst == 0);
+  }
 
   SUBCASE("an unchanged size is the identity, byte for byte") {
     const std::vector<unsigned char> src = make(9, 13, 2);

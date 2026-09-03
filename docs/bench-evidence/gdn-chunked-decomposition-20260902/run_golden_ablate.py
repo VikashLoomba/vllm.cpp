@@ -12,11 +12,11 @@ LAB={'Ai':"solve_tril out -> bf16       chunk.py:50",
  'wu_op':"(beta*v),(beta*eG*k) -> bf16 wy_fast.py:92,114",
  'wu_st':"u,w stores -> bf16           wy_fast.py:94,116",
  'h_snap':"h chunk-start snap -> bf16   chunk_delta_h.py:352",
- 'h_dot':"h operand of w@h^T -> bf16   chunk_delta_h.py:176",
+ 'h_dot':"h operand of w@h^T -> bf16   chunk_delta_h.py:178",
  'vnew_st':"v_new store -> bf16          chunk_delta_h.py:206",
- 'vdec':"decayed v_new -> bf16        chunk_delta_h.py:273",
- 'Ao':"intra-chunk A -> bf16        chunk_o.py:132",
- 'o_st':"o store -> bf16              chunk_o.py:133"}
+ 'vdec':"decayed v_new -> bf16        chunk_delta_h.py:274",
+ 'Ao':"intra-chunk A -> bf16        chunk_o.py:137",
+ 'o_st':"o store -> bf16              chunk_o.py:138"}
 def run(R, D=np.float32):
     o=np.zeros(oo.shape,np.float64); S=np.zeros(si.shape,np.float64)
     for s in range(len(qsl)-1):

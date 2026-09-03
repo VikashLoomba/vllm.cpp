@@ -5,7 +5,7 @@ its REASSOCIATION term and its BF16-INTERMEDIATE term.
 Reference algorithm read at vLLM pin 5559679229bc961848b121ccdeaa8fa5d79bec98,
 vendored FLA tree vllm/third_party/flash_linear_attention/ops/:
   chunk.py:37-82  cumsum.py  chunk_scaled_dot_kkt.py:86-116  solve_tril.py
-  wy_fast.py:70-116  chunk_delta_h.py:132-300  chunk_o.py:88-133
+  wy_fast.py:70-116  chunk_delta_h.py:132-302,352-357  chunk_o.py:88-138
 
 Every arm below consumes the SAME inputs, so input rounding is common mode and
 cancels; what is measured is the algorithm and the placement of its rounding.
@@ -69,11 +69,11 @@ def chunked(q, k, v, g, beta, h0, scale, D, BT=64, R=None):
       'wu_op'   wy_fast.py:92,114 (v*beta) and (k*beta*exp G) cast to k.dtype
       'wu_st'   wy_fast.py:94,116 u,w stores -> bf16
       'h_snap'  chunk_delta_h.py:352 h = k.new_empty(...) -> bf16 (read by chunk_o)
-      'h_dot'   chunk_delta_h.py:176 tl.trans(b_h1).to(b_w.dtype) -> bf16
+      'h_dot'   chunk_delta_h.py:178 tl.trans(b_h1).to(b_w.dtype) -> bf16
       'vnew_st' chunk_delta_h.py:206 v_new store -> bf16
-      'vdec'    chunk_delta_h.py:273 b_v.to(k.dtype) after the decay
-      'Ao'      chunk_o.py:132 b_A.to(b_v.dtype) -> bf16
-      'o_st'    chunk_o.py:133 o store -> bf16
+      'vdec'    chunk_delta_h.py:274 b_v.to(k.dtype) after the decay
+      'Ao'      chunk_o.py:137 b_A.to(b_v.dtype) -> bf16
+      'o_st'    chunk_o.py:138 o store -> bf16
     """
     if R is None:
         R = {}

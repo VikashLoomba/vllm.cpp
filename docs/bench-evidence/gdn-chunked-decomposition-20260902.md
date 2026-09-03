@@ -35,16 +35,32 @@ inputs. `q`, `k`, `v` are stored as raw bf16 bit patterns and are bf16-exact
 same values, so input rounding is common mode and cancels. What is measured is
 the algorithm and the placement of its rounding, nothing else.
 
-**The golden was dumped at the PREVIOUS pin, and that is named rather than
-hidden.** Its manifest records `oracle.source = "pinned:e24d1b24"`; the current
-parity pin is `5559679229`, and the FLA sources this study's replica models were
-read at `5559679229`. The two are therefore not asserted to be the same
-revision. They are measured to be the same algorithm: a replica built from the
-CURRENT pin's dtype placement lands `6.1035e-05` from a kernel dumped at the
-OLD one, where every arm that differs in dtype placement lands `2.29e-04` — a
-3.7x separation that a changed algorithm would not survive. If a future pin
-advance changes FLA's rounding placement, this file's §3 is the table that has
-to be re-derived, and the separation above is the check that would catch it.
+**The golden was dumped at the PREVIOUS pin, and the two revisions were
+DIFFED rather than argued about.** Its manifest records
+`oracle.source = "pinned:e24d1b24"`; the current parity pin is `5559679229`,
+and the FLA sources this study's replica models were read at `5559679229`.
+Between those two revisions the vendored tree also MOVED, from
+`vllm/model_executor/layers/fla/ops/` to
+`vllm/third_party/flash_linear_attention/ops/`, so a path-wise `git diff` reads
+as a wholesale addition and says nothing. Diffed across the move, in a checkout
+of the vLLM oracle:
+
+| FLA op | `e24d1b24` -> `5559679229` |
+|---|---|
+| `chunk.py`, `chunk_o.py`, `wy_fast.py`, `solve_tril.py`, `cumsum.py` | **byte-identical** |
+| `chunk_delta_h.py` | 4 lines: a `torch.version.hip` guard that drops `num_stages=4` from the autotune list on AMD |
+| `chunk_scaled_dot_kkt.py` | 20 lines: a `current_platform.is_rocm()` / `on_gfx1x()` branch, whose non-RDNA arm is the old `b_A += tl.dot(b_kb, tl.trans(b_k).to(b_kb.dtype))` verbatim |
+
+**The golden was dumped on an NVIDIA GB10.** On that device
+`current_platform.is_rocm()` is false and `torch.version.hip` is `None`, so both
+deltas take the arm that is the old code, character for character. The kernel
+that produced `out.npy` is numerically identical at the two revisions, and this
+is a diff rather than an inference. Every line number this file cites is read at
+`5559679229`; `chunk_o.py` is byte-identical, so its anchors hold at both.
+
+A pin advance that DOES change FLA's rounding placement would invalidate §3, and
+the check that catches it is this same diff, not a separation of measured
+values.
 
 **The metric is `max|diff|`**, the metric the golden's own manifest uses for its
 recorded `chunk_vs_sequential_max_abs_out = 2.441406e-04` and
@@ -69,13 +85,18 @@ why `tests/parity/test_op_parity.cpp:595` already forces `VT_GDN_CHUNKED=0` for
 f32 on CUDA. The replica is the only way to hold the algorithm fixed and move
 the dtypes.
 
-**The replica is validated three ways, not asserted.** (a) Its bf16 helper is
-bit-identical to `torch.bfloat16` over 20000 values spanning 12 decades. (b) At
-`float64` with every rounding site disabled it reproduces the sequential
-recurrence to `2.43e-17`, so it is the same function and not an approximation of
-one. (c) Run with upstream's dtype placement it reproduces the published
-`1.15e-08` and `2.29e-04` / `2.25e-03` figures that #2612 reports, from an
-independent implementation.
+**The replica is validated three ways, not asserted, and each check is a
+committed script.** (a) Its bf16 helper is bit-identical to `torch.bfloat16`
+over **15531 of 15531** values — a 12-decade magnitude sweep, 5000 EXACT ties
+(low half `0x8000`, the only inputs where round-half-to-even differs from
+round-half-away), and the structural corners including subnormals, the bf16
+max normal, infinities and NaN. `check_bf16_helper.py` in this directory
+performs it, and it is the one script here that imports `torch`. (b) At
+`float64` with every rounding site disabled the replica reproduces the
+sequential recurrence to `2.43e-17`, so it is the same function and not an
+approximation of one. (c) Run with upstream's dtype placement it reproduces the
+published `1.15e-08` and `2.29e-04` / `2.25e-03` figures that #2612 reports,
+from an independent implementation.
 
 ## 2. The decomposition
 
@@ -184,12 +205,23 @@ could still miss for reasons that are not dtype placement.
 CPU only, no GPU, ~50 s. From the repository root:
 
 ```sh
+python3 docs/bench-evidence/gdn-chunked-decomposition-20260902/check_bf16_helper.py
 python3 docs/bench-evidence/gdn-chunked-decomposition-20260902/run_golden.py
 python3 docs/bench-evidence/gdn-chunked-decomposition-20260902/run_golden_ablate.py
 python3 docs/bench-evidence/gdn-chunked-decomposition-20260902/run_prodview.py
 python3 docs/bench-evidence/gdn-chunked-decomposition-20260902/run_final.py
 ```
 
-`run_golden.py` needs `torch` only for the bf16-helper self-check. The captured
-output of all four is `OUTPUT.txt` in that directory; `gdn_decomp.py` carries the
-algorithm, with each rounding site keyed by the upstream line it models.
+**`check_bf16_helper.py` is the only one that needs `torch`**; the other four
+are numpy-only, which is why the torch-dependent check is a separate file rather
+than a self-check inside `run_golden.py`. An earlier draft of this section said
+`run_golden.py` needed `torch` for that check. It does not, it never imported
+`torch`, and the bit-identity claim was consequently not reproducible from the
+committed artifact. It now is.
+
+The captured stdout of all five is `OUTPUT.txt` in that directory, measured on
+`torch 2.11.0+cu130` / `numpy 2.3.5`. `run_final.py` also writes two benign
+`RuntimeWarning: overflow encountered in exp` lines to stderr at `T = 1024`, from
+`exp(G_i - G_j)` evaluated on the full matrix before `np.tril` discards the
+upper triangle; stderr is not captured. `gdn_decomp.py` carries the algorithm,
+with each rounding site keyed by the upstream line it models.

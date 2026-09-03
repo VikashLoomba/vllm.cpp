@@ -25,8 +25,12 @@ vLLM runs the chunked WY decomposition for **all** GDN prefill, on every path.
 (`qwen_gdn_linear_attn.py:1424-1450`), and `forward_native` (`:266-294`) is the
 same Triton chunk kernel rather than a torch fallback. The sequential kernel our
 CPU arm ports, `fused_recurrent_gated_delta_rule`, is not referenced by that
-layer at all; its only callers are `olmo_gdn_linear_attn.py:430,473`, both
-decode.
+layer at all; **among the model layers** its only callers are
+`olmo_gdn_linear_attn.py:430,473`, both decode. Repo-wide it has two more
+references, `tests/kernels/test_fused_sigmoid_gating_delta_rule.py:71,166`, which
+use it as the reference an upstream test compares the fused decode kernel
+against. That does not weaken the layer claim; it does mean "referenced only by
+`olmo`" is false as a repo-wide statement and is not written that way here.
 
 `vt::GdnPrefill` runs the chunked algorithm on CUDA
 (`src/vt/cuda/cuda_gdn.cu:6117 GdnPrefillChunkedCuda`, default on) and on
@@ -123,6 +127,21 @@ Routing f32 to the sequential recurrence keeps that coverage alive and computes
 the same recurrence upstream's own f32 kernel computes. Tenstorrent, which has
 no sequential arm at all, is the one backend that must refuse rather than route
 (D3).
+
+**D0 CHANGES CUDA's DEFAULT TOO, and that is a second backend whose production
+path moves.** `ChunkedPrefillEnabled()` (`cuda_gdn.cu:3265-3271`) carries no
+dtype term, and neither does the six-term conjunction at `:6218` — `wmma_ok`
+constrains bf16 dims only. **CUDA therefore takes the chunked arm for f32
+inputs today.** That is why `tests/parity/test_op_parity.cpp:595` has to set
+`ScopedEnv("VT_GDN_CHUNKED","0")` at all: without it the f32 goldens would
+replay through a chunked kernel upstream refuses to run. Under D0 that
+`ScopedEnv` becomes redundant, because the dtype predicate does what the comment
+above it describes. Leave it in place, restate the comment, and say in the
+commit that CUDA's f32 default moved — an f32 CUDA request that runs chunked
+today runs sequentially after this row, which is a behaviour change on a shipped
+backend and not only a new arm on three others. Whether to then DELETE the
+`ScopedEnv` is the implementer's call; deleting it removes a belt while the
+braces are new, so keeping it is the recommendation.
 
 A consequence worth stating: the f32 chunked arm is then **not covered by any
 upstream test**, because upstream has no f32 chunked case to port. Whatever f32
@@ -320,14 +339,16 @@ It read: **"`--device cpu` is the arm to use when the exact ids matter."**
 On the mirror criterion that is backwards, and it was the single canonical
 statement of the claim (no other doc makes it). This spec's own commit replaces
 it with a presently-true form — the CPU arm is the more *accurate* one and the
-less *faithful* one:
+less *faithful* one. Verbatim, as landed in the same commit as this spec:
 
-> The two arms differ because the CPU arm runs an exact sequential recurrence and
-> the CUDA arm runs vLLM's chunked prefill decomposition. The CPU arm is the
-> *more accurate* of the two and the *less faithful*: it is `1.15e-08` from the
-> exact recurrence where vLLM's own kernel is `2.29e-04`, so the ids it emits are
-> the ids of an answer vLLM does not compute. `--device cuda` is the arm that
-> mirrors vLLM.
+> **`--device cuda` is the arm that MIRRORS vLLM; `--device cpu` is the arm that
+> is more accurate.** Those are different things and the CPU arm is not the
+> authority: it runs an exact sequential recurrence and lands `1.15e-08` from the
+> exact answer, where vLLM's own chunked kernel lands `2.29e-04`
+> ([decomposition](bench-evidence/gdn-chunked-decomposition-20260902.md),
+> [#2612](https://github.com/mudler/vllm.cpp/issues/2612)), so the CPU ids are
+> the ids of an answer vLLM does not compute. Reach for `--device cpu` when you
+> want the ids this table records, not when you want the ids vLLM would emit.
 
 **Sequencing.** That correction is true of the tree as it stands and does not
 depend on the default flip, which is why it lands here rather than waiting. The
@@ -335,40 +356,107 @@ depend on the default flip, which is why it lands here rather than waiting. The
 and re-deriving the ids the cell records — lands with the implementation, and the
 row is not `DONE` until the cell stops promising an arm that no longer exists.
 
-### What goes red, enumerated
+### What goes red — and the answer is ALMOST NOTHING, which is the cost
 
-Every item below was located by reading the tree, not predicted. An implementer
-who is surprised by one of these has found something this list missed; say so.
+An earlier draft of this spec listed five gates as "red by construction". **That
+list does not reproduce, and the real cost is the opposite one.** Every test in
+it is f32-only, and D0's predicate is
+`chunked = (q.dtype != f32) && VT_GDN_CHUNKED != 0`, so under this spec's own
+design none of them ever takes the chunked arm:
 
-**Fails outright, on a chunked CPU arm.**
+| predicted red | why it stays GREEN |
+|---|---|
+| `tests/vt/test_ops_gdn.cpp:111` | the hand-computed 3-token table builds every tensor through `T2`/`T3`/`T4` (`:53-60`), which hardwire `DType::kF32` |
+| `tests/vt/test_ops_kda_recurrence.cpp:144` | every tensor in the case is `kF32` (`:169-191`) |
+| `tests/vt/test_cpu_threadpool.cpp:459` | every `GdnPrefill` tensor in the corpus is `kF32` (`:325-378`) |
+| `tests/parity/test_op_parity.cpp:590-600` | D0 IS the fix — these three goldens are f32 dumps of upstream's sequential kernel and must stay green, which is G2 |
+| `tests/vt/test_ops_gdn.cpp:3466` | it runs `kCudaCombos[0]` only (`:795-799`), which is f32 in / f32 out |
+
+**So the cost this spec has to state is a coverage gap, not a red list.**
+Essentially the whole CPU unit-test corpus for `vt::GdnPrefill` is f32. Under D0
+the new chunked arm therefore lands reached by almost nothing that exists today:
+the single bf16 golden `gdn_prefill_bf16_realdims` and whatever T1 and T5 below
+add. A change that lands green because its tests cannot see it is the failure
+this repository names in `.agents/reachability.md`, and a suite that stays green
+across the flip is evidence of nothing.
+
+**Closing the gap is part of the implementer's job, not a follow-up.** Each site
+in the table above gets a bf16 arm beside its f32 one, computing the same case at
+the model dtype so that the chunked kernel is the thing under test:
+
+| site | owed |
+|---|---|
+| `tests/vt/test_ops_gdn.cpp:111` | a bf16 companion case. The hand-computed f64 table is NOT the expectation for it — the chunked arm is a different answer by design — so the bf16 case asserts against the golden-derived bar of T1's family, or against the sequential arm at the recorded chunk-vs-sequential distance, and says which in a comment |
+| `tests/vt/test_ops_kda_recurrence.cpp:144` | a bf16 arm, under whichever resolution T7 takes |
+| `tests/vt/test_cpu_threadpool.cpp:459` | a bf16 `GdnPrefill` entry in the corpus at `:348`/`:375`, because thread byte-identity is only proved on the arm that actually runs |
+| `tests/vt/test_backend_cross_device.cpp:1676` | see the trap below: this gate is all-f32 and is NOT where a chunked-arm comparison belongs |
+
+**`tests/vt/test_ops_gdn.cpp:3452` fails for a DIFFERENT reason, in the opposite
+direction, and it names a live hazard.** `RunGdnCudaCase` executes a bare
+`setenv("VT_GDN_CHUNKED", "0", 1)` at `:1798`. It is process-wide, it is never
+unset, and there is no scoped-restore wrapper on it. Two consequences:
+
+1. Under D3's shared flag it pins **both** legs sequential, not just the CUDA
+   one, so the CPU-vs-CUDA pair does not de-pin — it agrees for a reason that
+   has nothing to do with either arm being right. This is the inverse of what
+   an earlier draft claimed.
+2. **The setting leaks forward through the whole binary.** Once `:1798` (or the
+   toggle loop at `:2212`, or any of the nine `setenv(..., "1")` calls at
+   `:3800-4077`) has fired, every later CPU `GdnPrefill` in the same doctest
+   process inherits it. Today that is invisible because CPU ignores the flag.
+   The moment D3 makes CPU read it, test-case ordering silently selects the CPU
+   algorithm.
+
+**Decision: the port replaces every bare `setenv("VT_GDN_CHUNKED", ...)` in
+`tests/vt/test_ops_gdn.cpp` with the scoped setter the tree already has**,
+`ScopedEnv` (used at `tests/parity/test_op_parity.cpp:594-595`), so the value is
+restored at scope exit. This is not a cleanup: without it a chunked-CPU test and
+a flag-pinning CUDA test in one binary interact through the environment, and
+which one wins depends on doctest's case order. Do it in the same change that
+makes CPU read the flag.
+
+**The cross-device trap is real, and it does NOT belong on
+`test_backend_cross_device.cpp:1676`.** That case is all-f32 — its own comment
+at `:1677` says "§7/§8. All f32." — so under D0 no device takes the chunked arm
+there and it compares two sequential arms before and after this row. Its
+mechanics are otherwise exactly as this spec described them (CPU reference at
+`:1699-1711`, `RegisteredDevices()` loop at `:1714`, `kNmseTol = 5e-4` at `:58`),
+and it stays a gate; it is simply not the gate the trap applies to.
+
+**The trap attaches to `tests/vt/test_vulkan_backend.cpp:2723-2747` instead.**
+That is the bf16 arm of the Vulkan GDN prefill case, the one cross-device GDN
+prefill comparison in the tree that runs at the model dtype: it builds
+`kBF16` q/k/v/out on both devices (`:2723-2730`), runs the CPU reference at
+`:2732` and Vulkan at `:2733`, and checks `nmse16 <= kGdnNmseTol` at `:2747`
+with `kGdnNmseTol = 5e-4` (`:1961`). **Once BOTH arms are chunked they will
+agree with each other far more tightly than either agrees with today's
+baseline, and a green there is not evidence that either is right.** During the
+transition — CPU chunked, Vulkan still sequential — the same gate compares two
+different algorithms across a recorded `2.44e-04` max-abs gap. Both states are
+green-for-the-wrong-reason in opposite directions.
+
+**Fails outright, for a reason other than the chunked arm.**
 
 | site | assertion | why it breaks |
 |---|---|---|
-| `tests/parity/test_op_parity.cpp:590-600` x `gdn_prefill_f32_small`, `_noinit`, `_realdims` | `atol = rtol = 1e-05` against a SEQUENTIAL upstream dump | the `ScopedEnv("VT_GDN_CHUNKED","0")` at `:595` is read only by CUDA (`cuda_gdn.cu:3269`), so it becomes a no-op on CPU. **D0 is the fix. Do not loosen these.** |
-| `tests/vt/test_ops_gdn.cpp:111` | hand-computed 3-token table at `doctest::Approx(...).epsilon(1e-6)` | the values were derived from the sequential pseudocode in f64 |
-| `tests/vt/test_ops_gdn.cpp:3452,3466` | CUDA-vs-CPU at `1e-5f/1e-5f` (`kCudaCombos[0]`, `:796`) | `RunGdnCudaCase` pins only the CUDA leg sequential (`:1795-1798`); the pair de-pins |
-| `tests/vt/test_ops_kda_recurrence.cpp:144` | `CHECK(out_diff == 0); CHECK(st_diff == 0);` — KDA reduces to `vt::GdnPrefill` **bit for bit** on CPU | KDA is not chunked. Either KDA moves in lockstep or this reduction is stated as holding only on the sequential arm. **Decide it in the spec, not in the test.** |
-| `tests/vt/test_cpu_threadpool.cpp:459` (corpus at `:348`, `:375`) | byte-identical output at `n_threads` 1 / 3 / 20, `GdnPrefill` in the corpus | today's kernel is byte-identical by construction (disjoint `(sequence, head)` work, no shared reduction, `cpu_ops.cpp:1878-1880`). A chunked arm must keep that property, which constrains how chunks are parallelised. |
+| `tests/vt/test_ops_gdn.cpp:3452` | CUDA-vs-CPU over all three `kCudaCombos`, including bf16 | not the algorithm: the `setenv` at `:1798` pins both legs once CPU reads the flag. Fixed by the `ScopedEnv` decision above, not by touching tolerances |
 
 **At risk, and each needs a measurement rather than a guess.**
 
 | gate | bar | note |
 |---|---|---|
-| `tests/vt/test_backend_cross_device.cpp:1676` | `Nmse <= kNmseTol` with `kNmseTol = 5e-4` (`:58`) | **This one case is the ROCm, Vulkan, Tenstorrent and CUDA gate at once**: it loops `RegisteredDevices()` at `:1714` against the CPU reference at `:1699-1711`. ROCm's kernel header names it as its contract (`src/vt/rocm/rocm_gdn_scan.hip:14-16`). While CPU is chunked and ROCm/Vulkan are not, this compares two different algorithms whose recorded gap is `2.44e-04` max-abs. |
-| `tests/vt/test_vulkan_backend.cpp:2601` (`:2692`, `:2696`, `:2747`) | `kGdnNmseTol = 5e-4` (`:1961`) | same shape; plus `:2703-2704` `memcmp`-asserts that an EMPTY sequence's state block is untouched, which a chunked arm must also honour |
-| `tests/vt/test_vulkan_backend.cpp:2890` | `memcmp == 0` on the wide-`Dk` decline path (`:2967`) | Vulkan declines to the CPU provider, so this compares the new CPU kernel to itself. It stays green — and it therefore proves nothing about the change, which is the trap. |
-| `tests/vt/test_tenstorrent_backend.cpp:1965` | `tol_o` 0.05/0.08, `tol_s` 0.05 (`:2068-2076`) | Tenstorrent is ALREADY chunked, so this should get *better*. Its recorded state margin is `1.44e-2` against 0.05 — 3.10x headroom (`.agents/specs/tenstorrent-gdn.md:263-264`) — and that table is re-based by any move of the CPU reference. |
+| `tests/vt/test_vulkan_backend.cpp:2723-2747` (bf16 arm) | `nmse16 <= kGdnNmseTol`, `kGdnNmseTol = 5e-4` (`:1961`) | **the trap gate**, above. The f32 arm of the same case (`:2601-2702`) is unaffected by D0; its `:2701-2702` `memcmp` that an EMPTY sequence's state block is untouched must still hold on the chunked arm |
+| `tests/vt/test_backend_cross_device.cpp:1676` | `Nmse <= kNmseTol`, `kNmseTol = 5e-4` (`:58`) | all-f32, so unmoved by D0. It remains the ROCm/Vulkan/Tenstorrent/CUDA gate at once (`RegisteredDevices()` at `:1714` against the CPU reference at `:1699-1711`), and ROCm's kernel header names it as its contract (`src/vt/rocm/rocm_gdn_scan.hip:14-16`). It gates the SEQUENTIAL arm after this row, which is a thing worth gating and is not a mirror check |
+| `tests/vt/test_vulkan_backend.cpp:2890` | `memcmp == 0` on the wide-`Dk` decline path (`:2967`) | Vulkan declines to the CPU provider, so this compares the new CPU kernel to itself. It stays green — and it therefore proves nothing about the change, which is the trap in its purest form |
+| `tests/vt/test_tenstorrent_backend.cpp:1965` | `tol_o` 0.05/0.08, `tol_s` 0.05 (`:2068-2076`) | its title says "matches the CPU f32 oracle" and the case is f32, so D0 leaves it comparing an already-chunked Tenstorrent arm against a still-sequential CPU f32 reference. Its recorded state margin is `1.44e-2` against 0.05 — 3.10x headroom (`.agents/specs/tenstorrent-gdn.md:263-264`). Unmoved by this row; re-based only if a later row gives it a bf16 arm |
 
-**The trap in every row of the second table.** Once two arms both run the chunked
-algorithm they will agree with each other far more tightly than either agrees
-with today's baseline. **A green cross-device gate after the flip is not evidence
-that either arm is right.** The re-baseline is against the **oracle**, not against
-the CPU arm: `tests/parity/goldens/gdn_prefill_bf16_realdims/` is a dump of the
-real Triton chunk kernel and is the only artifact in this tree that can say
-whether a chunked port is correct. It is currently satisfied by the sequential
-C++ at a tolerance loosened to `5e-3` in M0.7 *because of* the `2.29e-04` gap its
-own manifest note records. **A chunked CPU arm must pass it far tighter, and
-that tightening is this row's primary gate.**
+**Where the re-baseline actually comes from.** Not from any of the tables above.
+`tests/parity/goldens/gdn_prefill_bf16_realdims/` is a dump of the real Triton
+chunk kernel and is the only artifact in this tree that can say whether a
+chunked port is correct. It is currently satisfied by the sequential C++ at a
+tolerance loosened to `5e-3` in M0.7 *because of* the `2.29e-04` gap its own
+manifest note records. **A chunked CPU arm must pass it far tighter, and that
+tightening is this row's primary gate.**
 
 ### Harnesses and evidence whose premise moves
 
@@ -400,10 +488,17 @@ gathered into an f32 working buffer before the call (`qwen3_5.cpp:5451-5455`).
 The chunked CPU arm must therefore accept a bf16 `out` store and an f32 state,
 and any CPU-vs-CPU A/B must fix `VT_GDN_OUT_BF16` rather than inherit it.
 
-## Tests — red first
+## Tests — red first, and the honest note about how little goes red
 
-Each test below fails on `origin/main` for the reason it names, and the
-implementer captures that red before writing the kernel.
+**Read `## What goes red` first.** Only T1 has a genuine red-before on
+`origin/main` today, because the existing CPU corpus is f32 and D0 routes f32 to
+the sequential arm. T2, T3 and T4 are red in the trivial sense that the thing
+they assert does not exist yet. The rest are coverage the chunked arm does not
+have and must be given, and their red-before is captured by writing the bf16
+case FIRST and watching it fail against the tight bar on the sequential arm.
+
+An implementer who reports "everything was already green" has confirmed the
+coverage gap, not passed the gate.
 
 1. **T1, the tolerance the sequential arm cannot meet.** `test_op_parity.cpp`
    runs `gdn_prefill_bf16_realdims` at `atol = rtol = 5e-3`, loosened in M0.7
@@ -415,6 +510,28 @@ implementer captures that red before writing the kernel.
    f32-intermediate arm (`2.4414e-04` / `2.2486e-03`) and today's sequential arm
    (`2.2865e-04` / `2.2487e-03`) both fail and a bf16-faithful port passes with
    margin. RED-BEFORE: fails on `main` at `2.2865e-04`.
+
+   **THE BAR IS SINGLE-CHUNK-DERIVED, and G1 says so.** The golden is two
+   sequences of 20 and 12 tokens at `BT = 64`, so `run_golden.py` processes
+   `2 seqs x 2 heads x 1 chunk = 4` chunks and asserts that count. **No
+   cross-chunk state carry is measured against a real kernel dump anywhere in
+   this tree.** The multi-chunk regime exists only against the replica's own f64
+   reference (`run_final.py`, `T` up to 1024), where the oracle is the author's
+   implementation rather than a dumped kernel. Evidence §3 shows that the two
+   sites which compound across chunks — `vdec` (`chunk_delta_h.py:274`) and the
+   `wy_fast` stores — are precisely the state-path ones, and `vdec` does not
+   reach `out` at all in a single-chunk run. So `1.5e-04` / `1.5e-03` is a bar
+   with 2.46x / 2.96x headroom over a residual that a multi-chunk workload has
+   never been asked to produce, and it may be optimistic there. It is the bar
+   this row gates on, because it is the only bar an oracle dump supports.
+
+   **What would establish a multi-chunk bar**, and it is owed rather than
+   assumed: a second golden dumped from `fla/ops/chunk.py::chunk_gated_delta_rule`
+   at `T >= 129` on the same real dims, giving at least three chunks including a
+   partial tail, with a sequence carrying an initial state. Until that dump
+   exists, a T1 failure at `T > 64` on a port that passes G3 is the
+   `## Owed` `6.1e-05` hypothesis, not automatically an implementation defect —
+   and it is the trigger to dump the golden rather than to loosen the bar.
 
 2. **T2, the dtype gate a token gate cannot see.** Assert the *memory format* of
    the chunked CPU scratch: `u`, `w`, `v_new`, the per-chunk `h` snapshot and
@@ -442,31 +559,51 @@ implementer captures that red before writing the kernel.
    shows the state-path rounding sites do not reach `out` at all in a
    single-chunk run, so a suite that only exercises `T <= 64` cannot see half the
    kernel. The empty-sequence case is not optional:
-   `tests/vt/test_vulkan_backend.cpp:2703-2704` already `memcmp`-asserts that
+   `tests/vt/test_vulkan_backend.cpp:2701-2702` already `memcmp`-asserts that
    block untouched.
 
-6. **T6, byte-identity across threads survives.** Extend
-   `tests/vt/test_cpu_threadpool.cpp:459`'s corpus to the chunked arm at
-   `n_threads` 1 / 3 / 20. Today's kernel is byte-identical by construction
+6. **T6, byte-identity across threads survives.** The corpus at
+   `tests/vt/test_cpu_threadpool.cpp:348`/`:375` is entirely `kF32`
+   (`:325-378`), so it will never reach the chunked arm on its own. **Add a
+   bf16 `GdnPrefill` entry** and check byte-identity at `n_threads` 1 / 3 / 20
+   on it. Today's kernel is byte-identical by construction
    (`cpu_ops.cpp:1878-1880`); a chunked arm must be too, which constrains how
-   chunks may be parallelised. RED-BEFORE: run the new arm under the existing
-   harness before the parallelisation is settled.
+   chunks may be parallelised. RED-BEFORE: run the new bf16 entry under the
+   existing harness before the parallelisation is settled. Reporting the
+   existing f32 corpus green is not this test.
 
 7. **T7, the KDA reduction.** `tests/vt/test_ops_kda_recurrence.cpp:144` asserts
    `vt::KdaGatedDeltaRule` reduces to `vt::GdnPrefill` **bit for bit** on CPU
-   (`out_diff == 0`, `st_diff == 0`). KDA is not chunked. **Decide this in the
-   spec, not in the test**: either KDA moves in lockstep, or the reduction is
-   restated as holding on the sequential arm and the test pins
-   `VT_GDN_CHUNKED=0`. Restating it is the smaller change and is what this spec
+   (`out_diff == 0`, `st_diff == 0`). Its tensors are all `kF32` (`:169-191`),
+   so **D0 leaves it green** — the claim silently narrows from "the two agree"
+   to "the two agree at f32", and nothing in the tree records that narrowing.
+   That is worse than a red, because it is a true assertion standing in for one
+   that stopped being true. **Decide it in the spec, not in the test**: either
+   KDA moves in lockstep, or the reduction is restated as holding on the
+   sequential arm. Restating it is the smaller change and is what this spec
    recommends, because the KDA row's claim is about the *recurrence*, not about
-   which evaluation order our GDN default happens to take. Whichever is chosen,
-   the test says which, in a comment, with this row's ID.
+   which evaluation order our GDN default happens to take. Under that
+   resolution the test states the narrowing in a comment carrying this row's ID,
+   and **adds a bf16 arm that asserts the two DIFFER** — a reduction claim that
+   is silent about the dtype where it fails is the shape of gate this spec keeps
+   refusing. If instead KDA moves in lockstep, the bf16 arm asserts `== 0` there
+   too. Do not weaken `== 0` to a tolerance (`## Stop conditions` item 6).
 
 8. **T8, upstream's own tests.** Port the FLA chunked-path cases with their
    parameters, tolerances and the pin anchor, per AGENTS.md. Constraint, and it
    must be recorded rather than papered over: `chunk.py:213-215` means upstream
    has **no f32 chunked case to port**, so whatever f32 chunked coverage exists
    is ours. Record it as an adaptation, never as a port.
+
+9. **T9, the f32-only corpus gets bf16 arms, and the flag setters get scoped.**
+   The four sites tabulated under `## What goes red` each gain a bf16 companion,
+   and every bare `setenv("VT_GDN_CHUNKED", ...)` in `tests/vt/test_ops_gdn.cpp`
+   (`:1798`, `:2212`, and `:3800`-`:4077`) becomes a scoped `ScopedEnv` so the
+   value does not leak into a later case in the same process. RED-BEFORE for the
+   scoping half is mechanical and worth capturing anyway: set the flag in one
+   case, assert in a LATER case that `getenv("VT_GDN_CHUNKED")` is unset, and
+   watch it fail on `main`. This item is not optional polish. Without it the CPU
+   algorithm a test runs depends on doctest's case order.
 
 **Two doctest traps this suite must avoid.** `assertions: 0 ... SUCCESS!` at
 rc 0 is a skip wearing a pass — assert a counted property in every case. And
@@ -480,20 +617,22 @@ an input, never a result.
 
 | gate | what | bar |
 |---|---|---|
-| G1 tight golden | T1, `gdn_prefill_bf16_realdims`, CPU arm | `max\|d\| <= 1.5e-04` out, `<= 1.5e-03` state |
+| G1 tight golden | T1, `gdn_prefill_bf16_realdims`, CPU arm | `max\|d\| <= 1.5e-04` out, `<= 1.5e-03` state. **SINGLE-CHUNK-DERIVED**: the golden is 20 and 12 tokens at `BT = 64`, so the residual this bar has 2.46x/2.96x headroom over was measured at one chunk per sequence, and no cross-chunk state carry is gated against a real kernel dump anywhere. See T1 for what would establish a multi-chunk bar |
 | G2 f32 goldens UNMOVED | `gdn_prefill_f32_small`, `_noinit`, `_realdims` | still green at their committed `atol = rtol = 1e-05`, with the tolerances **byte-unchanged**. This is the gate that catches a mis-read of D0. |
 | G3 dtype format | T2 | every buffer has the dtype D1 names |
 | G4 routing | T3, T4 | dtype predicate and flag both reach both arms; `=0` bit-identical to today |
-| G5 breadth | T5, T6, T8 | green on every listed `T`, on varlen with an empty sequence, and at 1/3/20 threads |
+| G5 breadth | T5, T6, T8 | green on every listed `T`, on varlen with an empty sequence, and at 1/3/20 threads — **on bf16 entries**, since the f32 corpus does not reach the arm |
+| G5b coverage | T9 | every site tabulated under `## What goes red` has a bf16 arm, and no `setenv("VT_GDN_CHUNKED", ...)` in `tests/vt/` escapes its scope. Mutate for it: delete one bf16 arm and confirm the suite still passes — if it does not go quieter, the arm was not the thing under test |
 | G6 KDA | T7 | the reduction claim is true as written, and the test states which arm it holds on |
-| G7 cross-device re-baseline | `tests/vt/test_backend_cross_device.cpp:1676`, `tests/vt/test_vulkan_backend.cpp:2601`, `tests/vt/test_tenstorrent_backend.cpp:1965` | each bar re-derived **against the golden**, never against the CPU arm, and each restated with the arm and tree it was measured on |
+| G7 cross-device re-baseline | `tests/vt/test_vulkan_backend.cpp:2723-2747` (the bf16 arm — the ONLY cross-device GDN prefill gate D0 moves); `tests/vt/test_backend_cross_device.cpp:1676` and `tests/vt/test_tenstorrent_backend.cpp:1965` are all-f32 and are confirmed UNMOVED rather than re-derived | the bf16 bar re-derived **against the golden**, never against the CPU arm, and restated with the arm and tree it was measured on. For the two f32 gates the required evidence is the opposite: show they did not move, and say it is because D0 routes f32 sequential on every arm |
 | G8 reachability | delete `qwen3_5.cpp:5484`/`:5493` in a scratch copy, rerun G1-G6 | at least one gate goes red; restore the tree byte-for-byte |
 | G9 full | `scripts/agent-preflight.sh` | grep for `gate(s) failed` and `NOT a green`; never trust the exit code |
 
 **G7 is the gate most likely to be reported green while meaning nothing**, for
-the reason stated under `## Blast radius`. State for each backend which arm
-produced the baseline and on what tree. An evidence table that does not name its
-tree is not evidence.
+the reason stated under `## What goes red`. State for each backend which arm
+produced the baseline, at which dtype, and on what tree. An evidence table that
+does not name its tree is not evidence, and one that does not name its dtype
+cannot say whether the chunked arm ran at all.
 
 ## Risks
 
@@ -532,6 +671,18 @@ three evidence documents rest on "the CPU arm runs an exact sequential
 recurrence". Every one is listed above or under `## Records owed`; none is
 discovered later.
 
+**R9. The chunked arm lands with almost no coverage and every gate is green.**
+The likeliest OUTCOME, as distinct from the likeliest defect. The CPU corpus is
+f32; D0 routes f32 sequential; so the new arm is reached by one golden and the
+cases T1/T5/T9 add. A suite that passes across the flip without those cases has
+measured the arm that did not change. T9 and G5b exist for it, and the mutation
+G5b names is the only thing that distinguishes coverage from its appearance.
+
+**R10. `VT_GDN_CHUNKED` leaks between test cases and picks the algorithm.**
+`tests/vt/test_ops_gdn.cpp` sets it with a bare, never-unset `setenv` in eleven
+places. Harmless today, because only CUDA reads it; a silent, order-dependent
+algorithm selector the moment D3 lands. T9 converts every one to `ScopedEnv`.
+
 **R8. Someone reads a token count as the result.** Named in `## Scope` and
 restated here, because PREFILLDIV already measured that the more accurate arm
 agrees on *fewer* ids.
@@ -567,6 +718,16 @@ Each rides in the pull request whose change makes it stale, per AGENTS.md.
 - **The `qwen4_exp` MoE prefill residue**, `7.269e-05` per layer with the GDN
   source removed (PREFILLDIV §3). A second, independent divergence source, named
   and undiagnosed. Not this row.
+- **A MULTI-CHUNK oracle dump.** Every number in this spec, G1's bar included,
+  is derived from a golden of 20 and 12 tokens at `BT = 64` — one chunk per
+  sequence. The cross-chunk state carry is exercised only against the replica's
+  own f64 reference. A second dump from
+  `fla/ops/chunk.py::chunk_gated_delta_rule` at `T >= 129` on the same real
+  dims, with a partial tail chunk and a sequence carrying an initial state,
+  would turn T1's bar from single-chunk-derived into a bar. No issue yet; file
+  one before this row reaches `DONE`. It needs a GPU lease and is why it is not
+  in this change.
+
 - **The `6.1e-05` the replica does not model.** The bound on how much of vLLM's
   output a bf16-faithful C++ port could still miss for reasons that are not dtype
   placement: Triton tile reduction order, the blocked `solve_tril` merge,

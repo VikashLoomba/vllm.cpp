@@ -1,3 +1,11 @@
+########## check_bf16_helper.py
+torch 2.11.0+cu130, numpy 2.3.5
+  magnitude sweep, 12 decades        n= 10000  identical= 10000/10000  OK
+  exact ties (low half == 0x8000)    n=  5000  identical=  5000/5000  OK
+  structural corners                 n=   531  identical=   531/531  OK
+
+TOTAL: 15531/15531 bit-identical to torch.bfloat16
+PASS: gdn_decomp.bf16 IS torch.bfloat16, bit for bit
 ########## run_golden.py
 shapes/dtypes: {'q': ((32, 1, 128), '<f4'), 'k': ((32, 1, 128), '<f4'), 'v': ((32, 2, 128), '<f4'), 'g': ((32, 2), '<f4'), 'beta': ((32, 2), '<f4'), 'state_in': ((2, 2, 128, 128), '<f4'), 'out': ((32, 2, 128), '<f4'), 'state_out': ((2, 2, 128, 128), '<f4'), 'qsl': ((3,), '<i4')}
 qsl: [ 0 20 32]  scale: 0.08838834764831845  Hk,Hv,Dk,Dv: 1 2 128 128
@@ -40,11 +48,11 @@ solve_tril out -> bf16       chunk.py:50  2.2864e-04  2.1751e-03  2.6174e-06   4
 (beta*v),(beta*eG*k) -> bf16 wy_fast.py:92,114  2.0735e-04  1.6246e-03  7.4423e-05   1.6092e-03      yes
 u,w stores -> bf16           wy_fast.py:94,116  2.2864e-04  2.1412e-03  7.8918e-05   1.6046e-03      yes
 h chunk-start snap -> bf16   chunk_delta_h.py:352  2.2864e-04  2.1751e-03  1.3397e-04   1.1449e-07      yes
-h operand of w@h^T -> bf16   chunk_delta_h.py:176  2.2864e-04  2.1751e-03  1.3131e-05   1.7410e-07      yes
+h operand of w@h^T -> bf16   chunk_delta_h.py:178  2.2864e-04  2.1751e-03  1.3131e-05   1.7410e-07      yes
 v_new store -> bf16          chunk_delta_h.py:206  2.2864e-04  2.2486e-03  7.8918e-05   1.6046e-03      yes
-decayed v_new -> bf16        chunk_delta_h.py:273  2.2864e-04  2.2493e-03  3.8555e-08   1.6043e-03       NO
-intra-chunk A -> bf16        chunk_o.py:132  3.2218e-04  2.1751e-03  8.8539e-05   1.1449e-07      yes
-o store -> bf16              chunk_o.py:133  2.2783e-04  2.1751e-03  2.0735e-04   1.1449e-07      yes
+decayed v_new -> bf16        chunk_delta_h.py:274  2.2864e-04  2.2493e-03  3.8555e-08   1.6043e-03       NO
+intra-chunk A -> bf16        chunk_o.py:137  3.2218e-04  2.1751e-03  8.8539e-05   1.1449e-07      yes
+o store -> bf16              chunk_o.py:138  2.2783e-04  2.1751e-03  2.0735e-04   1.1449e-07      yes
 ########## run_prodview.py
 === at the PRODUCTION output dtype (bf16) ===  elements: 8192
   arm                                 max|d| vs vLLM golden   bf16 elems differing

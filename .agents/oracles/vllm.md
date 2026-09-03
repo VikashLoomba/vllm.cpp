@@ -62,7 +62,23 @@ additionally owes these four:
    ([#2611](https://github.com/mudler/vllm.cpp/issues/2611)).
 2. A **declared token-exact gate**. The run above is six prompts at 16 tokens
    and gates nothing; it agreed with `tests/parity/goldens/opt_greedy` exactly,
-   which is informative and not a result.
+   which is informative and not a result. Specified 2026-09-03 by
+   [`../specs/upstream-sync-headpin-tokengate.md`](../specs/upstream-sync-headpin-tokengate.md)
+   ([#2794](https://github.com/mudler/vllm.cpp/issues/2794)), which establishes
+   three things and closes none of them. **The token path is NOT subject to the
+   §3 harness refusal** — `scripts/opt-oracle-capture.py`,
+   `scripts/opt-dgx-gate.sh` and `tests/vllm/models/test_opt_paged_engine.cpp`
+   read no pin constant, so the gate can be captured at any revision that
+   imports. **The gate must be captured on `dgx:gpu0` (GB10, `sm_121a`)**, the
+   device the committed golden came from, against the bf16-materialized
+   checkpoint and with `--runs 5`, because K selects the STRICT bar; a Thor
+   capture moves the silicon and the rounding path alongside the revision, which
+   is what makes the run above informative rather than a gate. **And the OPT
+   golden was never re-validated at the ACTIVE pin either** — it was captured
+   once at `b8358a5b9` against vLLM 0.25.0, and the `5559679229` advance's W3b
+   table discharged it in a row for already-ratified near-tie-robust gates, a
+   class OPT's strict no-band gate is not in. The capture that answers this
+   obligation answers that one too.
 3. **Step 6 re-measurement.** Narrowed 2026-09-03 by
    [`../sync/2026-09-03-e126687-step6.md`](../sync/2026-09-03-e126687-step6.md)
    ([#2771](https://github.com/mudler/vllm.cpp/issues/2771)) from "four

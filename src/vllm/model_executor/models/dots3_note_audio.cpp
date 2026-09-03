@@ -108,6 +108,7 @@ Dots3NoteAudioParams ParseDots3NoteAudioParams(const HfConfig& config) {
   a.use_causal = ReadBoolOr(j, "use_causal", false);
   a.downsample_hidden_size = ReadIntOr(j, "downsample_hidden_size", 480);
   a.merge_factor = ReadIntOr(j, "merge_factor", 1);
+  a.chunk_seconds = ReadIntOr(j, "chunk_seconds", 60);
   // `whisper_adapter_in_dim` falls back to `adapter_in_dim` upstream
   // (`audio.py:30-35`), so both spellings are read here.
   a.adapter_in_dim = ReadIntOr(j, "whisper_adapter_in_dim",
@@ -591,6 +592,23 @@ std::vector<float> Dots3NoteAudioForward(const std::vector<float>& mel,
   VT_CHECK(w.present,
            "dots3-note audio tower: the weights were never materialized. The "
            "loader only materializes a tower Dots3NoteAudioRefusal accepted.");
+  // `assert mel.shape[1] == self.chunk_mel_frames` (`nvidia/audio.py:215` @
+  // `9035151d6`), made executable HERE by W7b (#2797) rather than only in the
+  // processor. Upstream can only ever hand `_forward_speech_encoder` a STACK of
+  // `chunk_mel_frames`-wide segments (`torch.stack`, `:220`), and this function
+  // is one element of that stack. A caller that hands it the WHOLE stack — the
+  // shape the code had before `Dots3NoteAudioForwardChunks` existed — gets a
+  // correctly-shaped answer of the right row count off a mel of the wrong
+  // width, and this width is the only number that can tell the two apart.
+  VT_CHECK(a.num_mel_bins > 0 &&
+               static_cast<int64_t>(mel.size()) ==
+                   a.num_mel_bins * a.chunk_mel_frames(),
+           "dots3-note audio tower: the mel holds " +
+               std::to_string(mel.size()) + " values, which is not ONE chunk of "
+               + std::to_string(a.num_mel_bins) + " x " +
+               std::to_string(a.chunk_mel_frames()) +
+               " (nvidia/audio.py:215 @ 9035151d6). Pass one chunk; "
+               "`Dots3NoteAudioForwardChunks` is what takes the stack.");
   const int64_t D = a.d_model, F = a.ffn_dim;
   const int64_t nh = a.num_heads, hd = a.head_dim();
   const int64_t Fmel = a.num_mel_bins;

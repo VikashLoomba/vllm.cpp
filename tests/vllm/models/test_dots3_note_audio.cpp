@@ -1887,6 +1887,52 @@ TEST_CASE("dots3-note W7b: ONE chunk takes W7a's path, byte for byte") {
   CHECK(differing == 0u);
 }
 
+TEST_CASE("dots3-note W7b: the single-chunk tower REFUSES a whole STACK, which is what makes the chunk loop reachable") {
+  // The invariant that makes the reachability mutation visible, gated so it is
+  // not a mute switch. Handing `Dots3NoteAudioForward` the stacked mel of a
+  // multi-chunk clip — which is exactly what the production call site looked
+  // like before `Dots3NoteAudioForwardChunks` existed — produces a
+  // CORRECTLY-SHAPED answer with the right row count off a mel of the wrong
+  // width, so nothing downstream can tell. Upstream's own
+  // `assert mel.shape[1] == self.chunk_mel_frames` (`audio.py:215` @
+  // `9035151d6`) is the check that can, and this drives it.
+  const TinySpec spec = LongAudioSpec();
+  const LoadedTower t(spec, /*variant=*/0, dots3_tiny::kAudioLongSamples);
+  REQUIRE(t.mel.num_chunks == dots3_tiny::kAudioLongChunks);
+  REQUIRE(t.params.chunk_mel_frames() == spec.a_chunk_mel_frames());
+  REQUIRE(static_cast<std::int64_t>(t.mel.input_features.size()) ==
+          dots3_tiny::kAudioLongChunks * t.params.num_mel_bins *
+              t.params.chunk_mel_frames());
+
+  std::string msg;
+  try {
+    (void)vllm::Dots3NoteAudioForward(
+        t.mel.input_features, t.mel.num_samples, t.mel.num_tokens,
+        /*hop_length=*/160, t.weights, t.params,
+        vt::GetBackend(vt::DeviceType::kCPU));
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  INFO("message: ", msg);
+  MESSAGE("the stacked mel is refused with: " << msg);
+  CHECK(msg.find("not ONE chunk") != std::string::npos);
+  CHECK(msg.find("audio.py:215") != std::string::npos);
+  CHECK(msg.find("Dots3NoteAudioForwardChunks") != std::string::npos);
+  // ...and ONE chunk of that same stack is accepted, so the check is a width
+  // check and not a refusal of the whole path.
+  const std::size_t per = static_cast<std::size_t>(t.params.num_mel_bins *
+                                                   t.params.chunk_mel_frames());
+  const std::vector<float> one(t.mel.input_features.begin(),
+                               t.mel.input_features.begin() +
+                                   static_cast<std::ptrdiff_t>(per));
+  const std::vector<float> rows = vllm::Dots3NoteAudioForward(
+      one, t.mel.chunk_num_samples[0], t.mel.chunk_num_tokens[0],
+      /*hop_length=*/160, t.weights, t.params,
+      vt::GetBackend(vt::DeviceType::kCPU));
+  CHECK(rows.size() == static_cast<std::size_t>(t.mel.chunk_num_tokens[0] *
+                                                t.spec.a_adapter_out()));
+}
+
 TEST_CASE("dots3-note W7b: a geometry whose chunk is not a whole number of strides refuses a LONG clip, and serves a short one") {
   // §4.15.3. The tiny fixture's DEFAULT `chunk_seconds` = 1 is exactly such a
   // geometry — 16000 is 12.5 token strides — so this is not a hypothetical

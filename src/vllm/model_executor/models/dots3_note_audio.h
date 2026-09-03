@@ -112,6 +112,14 @@ struct Dots3NoteAudioParams {
   bool use_latent_input = false;
   int64_t downsample_hidden_size = 480;  // audio.py:46
   int64_t merge_factor = 1;              // audio.py:40
+  // `chunk_seconds` (`audio.py:41`), carried on the TOWER and not only on the
+  // processor because `DotsEncoderWithMask` keeps it too (`audio.py:169-171`)
+  // and it is what upstream's `mel.shape[1] == self.chunk_mel_frames` assert
+  // (`:215`) compares against. W7b (#2797) made that assert executable here:
+  // once the mel is a STACK of chunks, a caller that hands the tower the whole
+  // stack instead of one chunk produces correctly-shaped output, and only this
+  // number can tell the two apart.
+  int64_t chunk_seconds = 60;
   int64_t adapter_in_dim = 1280;         // whisper_adapter_in_dim, audio.py:30
   int64_t adapter_out_dim = 5120;        // whisper_adapter_out_dim, audio.py:33
 
@@ -144,6 +152,10 @@ struct Dots3NoteAudioParams {
   // `norm_cls(self.embed_dim)` call takes (`audio_encoder.py:322-323`, `:336`,
   // `:515-516`).
   double rms_norm_eps = 1e-6;
+
+  // `chunk_mel_frames` (`audio.py:79-81`): `chunk_seconds * 100`, which is also
+  // `chunk_samples / hop_length` at 16 kHz and 160.
+  int64_t chunk_mel_frames() const { return chunk_seconds * 100; }
 
   int64_t head_dim() const { return d_model / num_heads; }
   // `rotary_dim = int(head_dim * partial_rotary_factor)`, then rounded DOWN to

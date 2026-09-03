@@ -6,6 +6,7 @@
 // kernel keeps its exact per-element math and per-output sequential reduction
 // order; parallelism partitions OUTPUT elements only, so results are
 // bit-identical to single-thread by construction (spec § Dispatch behavior).
+#include "vt/dflash_attn_mask.h"  // #2784: the ONE mask bound, shared with the CUDA kernels
 #include "vt/ops.h"
 
 #include <algorithm>
@@ -3220,10 +3221,12 @@ void DFlashBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query, const 
       for (int64_t iq = 0; iq < qlen; ++iq) {
         const int64_t i = qqs + iq;      // global QUERY row
         const int64_t ii = qoffset + iq;  // this query's COMBINED intra-block offset
-        // Visible key range within the block (intra-block offsets [jlo,jhi]).
-        const int64_t jhi = causal ? ii : blen - 1;
-        int64_t jlo = 0;
-        if (causal && window > 0) jlo = ii - (window - 1) > 0 ? ii - (window - 1) : 0;
+        // Visible key range within the block (intra-block offsets [jlo,jhi]),
+        // from the ONE shared bound (#2784): a NON-CAUSAL layer carrying a
+        // window attends SYMMETRICALLY within it rather than over everything.
+        const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii, blen, causal, window);
+        const int64_t jhi = span.hi;
+        const int64_t jlo = span.lo;
         const int64_t qoff = (i * hq + h) * d;
         // Pass 1: scores + running max.
         float m = -std::numeric_limits<float>::infinity();
@@ -3299,9 +3302,9 @@ void DFlashPagedBlockAttentionKernel(Queue&, Tensor& out, const Tensor& query,
       for (int64_t ii = 0; ii < blen; ++ii) {
         const int64_t i = qs + ii;          // global block-query row
         const int64_t ii_comb = C + ii;     // query offset in the combined sequence
-        const int64_t jhi = causal ? ii_comb : N - 1;
-        int64_t jlo = 0;
-        if (causal && window > 0) jlo = ii_comb - (window - 1) > 0 ? ii_comb - (window - 1) : 0;
+        const vt::DFlashMaskSpan span = vt::DFlashMaskSpanOf(ii_comb, N, causal, window);
+        const int64_t jhi = span.hi;
+        const int64_t jlo = span.lo;
         const int64_t qoff = (i * hq + h) * d;
         // Pass 1: scores + running max over combined keys [jlo, jhi].
         float m = -std::numeric_limits<float>::infinity();

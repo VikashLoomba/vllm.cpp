@@ -35,6 +35,13 @@ writing that job is `efc30c74-005e-4e80-bc28-bd34f5b76b77`, position 12 in the
 The pin does **not** advance and nothing here is a reason to move it. The active
 parity pin remains `5559679229bc961848b121ccdeaa8fa5d79bec98`.
 
+**SUPERSEDED 2026-09-03: the pin HAS advanced**, to
+`e126687a9a828d513c01a07cd69f025f27d63280`, by the developer ruling recorded in
+[`upstream-pin-advance-e126687.md`](upstream-pin-advance-e126687.md) §1
+([#2817](https://github.com/mudler/vllm.cpp/issues/2817)). The sentence above was
+true of THIS wave and is kept because it was that wave's own stop condition. It
+is no longer true of the tree.
+
 ## 1. Scope
 
 **The question.** `.agents/oracles/vllm.md` lists four obligations a pin advance

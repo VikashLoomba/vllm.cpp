@@ -750,6 +750,11 @@ vllm_cpp_add_test(test_gemma4_honesty vllm/models/test_gemma4_honesty.cpp)
 # case that wants a different one.
 vllm_cpp_add_test(test_gemma4_moe_device_arm_guard
                   vllm/models/test_gemma4_moe_device_arm_guard.cpp)
+# Its own binary, not a case in the file above: `RunGemma4Moe` freezes
+# `VT_GEMMA4_FP8_NATIVE` in a function-local `static const` on the first call in
+# the process, and these two files must disagree about it (#2623).
+vllm_cpp_add_test(test_gemma4_moe_fp8_native_arm_guard
+                  vllm/models/test_gemma4_moe_fp8_native_arm_guard.cpp)
 vllm_cpp_add_test(test_gemma4_indexed_max_t vllm/models/test_gemma4_indexed_max_t.cpp)
 target_compile_definitions(test_gemma4_indexed_max_t PRIVATE
   VLLM_CPP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -3160,6 +3165,7 @@ vllm_cpp_add_test(test_ops_rmsnorm_elem_dispatch vt/test_ops_rmsnorm_elem_dispat
 target_include_directories(test_ops_rmsnorm_elem_dispatch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_dflash_attn_grid vt/test_dflash_attn_grid.cpp)
+vllm_cpp_add_test(test_dflash_attn_mask vt/test_dflash_attn_mask.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 # SPEC-DFLASH2 W2 (#1314): the DFlash2 grouped dynamic depthwise convolution,
 # gated against upstream's own sequential reference at block 5 (modulo arm), 8

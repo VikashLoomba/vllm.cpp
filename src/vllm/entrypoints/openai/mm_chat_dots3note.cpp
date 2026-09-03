@@ -203,10 +203,19 @@ multimodal::MultiModalInputs RouteDots3NoteImageRgb(
 // editing `RouteImageRgb`.
 //
 // THE CONTAINER REFUSAL IS HERE AND NOT IN THE PROCESSOR, because the container
-// is a REQUEST property while the rate is a CONFIG one. `DecodeWavPcm16Mono`
-// already refuses a non-PCM16, non-mono or malformed buffer by name; what this
-// adds is the brick, W7c, so an operator learns what is owed rather than only
-// what failed.
+// is a REQUEST property while the rate is a CONFIG one.
+// `DecodeWavPcm16MeanToMono` already refuses a non-PCM16 or malformed buffer by
+// name; what this adds is WHO OWES IT, so an operator learns that rather than
+// only what failed.
+//
+// W7c-1 (#2813) NARROWED it. It used to say a multi-channel WAV was owed to
+// W7c; any channel count is now served, mean-reduced as upstream reduces. And
+// the container arm left this row entirely: it needs a demuxer this tree does
+// not vendor, five surfaces refuse compressed media for that same missing
+// brick, and #2814 owns it. The refusal stays at the SEAM and stays the SAME
+// predicate as the route, because this throw is HTTP 400 for one request while
+// the same throw from inside `encode_mm` would set `AsyncLLM`'s errored latch
+// and 500 every later request, TEXT ones included.
 multimodal::MultiModalInputs RouteDots3NoteAudioWav(
     const multimodal::Dots3NoteAudioProcessor& proc, const DecodedMedia& audio,
     const std::vector<int32_t>& prompt_ids) {
@@ -214,8 +223,11 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
 
   multimodal::DecodedAudio decoded;
   try {
-    decoded = multimodal::DecodeWavPcm16Mono(audio.bytes.data(),
-                                             audio.bytes.size());
+    // W7c-1 (#2813): the MEAN-reducing sibling, so a multi-channel PCM16 WAV
+    // at the target rate is SERVED instead of refused. This is the production
+    // call site the reachability mutation deletes.
+    decoded = multimodal::DecodeWavPcm16MeanToMono(audio.bytes.data(),
+                                                   audio.bytes.size());
   } catch (const std::exception& e) {
     // `InputValidationError`, NOT `std::runtime_error`. The container is a
     // property of the REQUEST, so this is a client error and
@@ -227,15 +239,21 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
     // SERVER fault is what the 500 arm is for, and it is not this.
     throw vllm::v1::InputValidationError(
         std::string("dots3-note audio chat seam: this request's audio is not a "
-                    "PCM16 MONO RIFF/WAVE buffer (") + e.what() +
-        "). Only that container is ported; every other one — including the "
-        "`mp3`/`flac`/`ogg` an `input_audio.format` may name, and multi-channel "
-        "or non-16-bit WAV — is owed to W7c. Upstream decodes with librosa "
-        "through its data parser (common/processor.py:523-525 @ 9035151d6). "
-        "See .agents/specs/dots3-note.md §4.14.5 and issue #2703.");
+                    "PCM16 RIFF/WAVE buffer (") + e.what() +
+        "). Only that container is ported. The `mp3`/`flac`/`ogg` an "
+        "`input_audio.format` may name needs a demuxer this tree does not "
+        "vendor; five surfaces refuse compressed media for that same missing "
+        "brick, and it is tracked by issue #2814 — a SHARED brick, not a "
+        "dots3-note one. Any CHANNEL count is served since W7c-1 (#2813): the "
+        "channels are mean-reduced to mono, as upstream's "
+        "`load_audio(..., mono=True)` does "
+        "(vllm/multimodal/media/audio.py:207-208, :220 @ 9035151d6). A "
+        "sampling rate other than `audio_config.sampling_rate` is refused "
+        "separately, by the front end, and is owed to W7c-2. See "
+        ".agents/specs/dots3-note.md §4.16 and issue #2813.");
   }
 
-  // The front end refuses a wrong rate (W7c) BY NAME, and — since W7b (#2797)
+  // The front end refuses a wrong rate (W7c-2) BY NAME, and — since W7b (#2797)
   // lifted the `chunk_seconds` ceiling — a waveform past ONE chunk on a
   // checkpoint whose `chunk_samples` is not a whole number of `token_stride`s,
   // where upstream's own per-segment row sum and its prompt-side

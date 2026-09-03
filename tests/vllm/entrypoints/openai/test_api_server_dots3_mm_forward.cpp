@@ -1369,32 +1369,46 @@ TEST_CASE("dots3-note W7a: a checkpoint with NO audio_config refuses the audio p
   CHECK(t.status == 200);
 }
 
-TEST_CASE("dots3-note W7a: a non-PCM16-mono container and a wrong rate refuse BY NAME, to W7c") {
+TEST_CASE("dots3-note W7a+W7c-1: a non-PCM16 container and a wrong rate refuse BY NAME, and the container refusal is NOT this row's") {
   Served s(AudioSpec());
   MmServerHarness h(s.config, *s.model, Fixture());
   std::ostringstream log;
   REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
           oai::MultiModalChatInstall::kInstalled);
 
-  SUBCASE("a STEREO WAV names the container refusal and W7c") {
+  SUBCASE("a compressed container is refused, and it names #2814 rather than this row") {
+    // W7c-1 NARROWED this message. It used to say a `.mp3` was owed to W7c, a
+    // dots3-note brick. It needs a demuxer this tree does not vendor, five
+    // surfaces refuse compressed media for the same reason, and #2814 owns it.
+    const std::vector<uint8_t> junk(2048, 0x42);
     const ApiServer::DispatchResult r = h.server.handle_chat_completions(
-        ChatBodyWithAudio(1, dots3_tiny::FixtureAudioWav(0, 16000, /*channels=*/2),
-                          false)
-            .dump());
+        ChatBodyWithAudio(1, junk, false, "flac").dump());
     INFO("body: ", r.body);
     CHECK(r.status == 400);
-    CHECK(r.body.find("W7c") != std::string::npos);
-    CHECK(r.body.find("PCM16 MONO") != std::string::npos);
+    CHECK(r.body.find("#2814") != std::string::npos);
+    // ...and it no longer claims multi-channel WAV is owed to anyone.
+    CHECK(r.body.find("PCM16 MONO") == std::string::npos);
+    CHECK(r.body.find("multi-channel") == std::string::npos);
+    // ...nor names librosa at all: the decode chain is soundfile/libsndfile
+    // with a PyAV fallback, and nothing under `vllm/` imports librosa
+    // (spec 4.16.4).
+    CHECK(r.body.find("librosa") == std::string::npos);
   }
-  SUBCASE("a 22050 Hz WAV names the resampler refusal and W7c") {
+  SUBCASE("a 22050 Hz WAV names the resampler refusal and W7c-2") {
     const ApiServer::DispatchResult r = h.server.handle_chat_completions(
         ChatBodyWithAudio(1, dots3_tiny::FixtureAudioWav(0, /*sample_rate=*/22050),
                           false)
             .dump());
     INFO("body: ", r.body);
     CHECK(r.status == 400);
-    CHECK(r.body.find("W7c") != std::string::npos);
+    CHECK(r.body.find("W7c-2") != std::string::npos);
     CHECK(r.body.find("RESAMPLING IS NOT PORTED") != std::string::npos);
+    // The rate message CLAIMED librosa does the resample. libswresample does,
+    // and no vLLM path imports librosa at all (spec 4.16.4). The message now
+    // says so explicitly, so the assertion is on the CLAIM and not on the word.
+    CHECK(r.body.find("with librosa") == std::string::npos);
+    CHECK(r.body.find("NOT librosa") != std::string::npos);
+    CHECK(r.body.find("libswresample") != std::string::npos);
   }
   SUBCASE("a payload that is not a RIFF/WAVE buffer at all is refused, not decoded") {
     const std::vector<uint8_t> junk(2048, 0x41);
@@ -1402,7 +1416,7 @@ TEST_CASE("dots3-note W7a: a non-PCM16-mono container and a wrong rate refuse BY
         ChatBodyWithAudio(1, junk, false, "mp3").dump());
     INFO("body: ", r.body);
     CHECK(r.status == 400);
-    CHECK(r.body.find("W7c") != std::string::npos);
+    CHECK(r.body.find("RIFF/WAVE") != std::string::npos);
   }
   // ...and the server still answers TEXT after all three, which is what "the
   // refusal is at the entrypoint" buys.
@@ -1413,6 +1427,120 @@ TEST_CASE("dots3-note W7a: a non-PCM16-mono container and a wrong rate refuse BY
            {"temperature", 0.0}}
           .dump());
   CHECK(t.status == 200);
+}
+
+// ── W7c-1 (#2813): the STEREO inversion ─────────────────────────────────────
+//
+// THIS IS THE OWNERSHIP PROOF FOR THIS SLICE, and it is an INVERSION rather
+// than an addition. The subcase above it used to be
+// *"a STEREO WAV names the container refusal and W7c"* and asserted HTTP 400
+// on this very request. Nothing about the model, the front end or the tower was
+// missing: the file was refused because `DecodeWavPcm16Mono` threw "not mono".
+//
+// The fixture makes the mean CHECKABLE rather than approximable. Left is
+// `m + d` and right is `m - d` over the fixture's own two variants, so the
+// per-sample mean is EXACTLY `m` — `FixtureAudioPcm16(0)`, the clip every other
+// audio case serves. The test recomputes that mean itself, in int, before it
+// trusts anything the server did.
+TEST_CASE("dots3-note W7c-1: a STEREO WAV at 16 kHz is SERVED, and its answer is the MEAN's") {
+  // (a) The independent mean, computed here and not read out of `src/`.
+  std::vector<int16_t> left, right;
+  dots3_tiny::FixtureAudioPcm16StereoChannels(&left, &right);
+  const std::vector<int16_t> mono = dots3_tiny::FixtureAudioPcm16(0);
+  REQUIRE(left.size() == mono.size());
+  REQUIRE(right.size() == mono.size());
+  std::size_t differ_l = 0, differ_r = 0;
+  for (std::size_t i = 0; i < mono.size(); ++i) {
+    // Integer, exact: L + R is 2m, so the halving cannot round.
+    const int sum = static_cast<int>(left[i]) + static_cast<int>(right[i]);
+    REQUIRE(sum % 2 == 0);
+    REQUIRE(sum / 2 == static_cast<int>(mono[i]));
+    if (left[i] != mono[i]) ++differ_l;
+    if (right[i] != mono[i]) ++differ_r;
+  }
+  // ...and the two channels are GENUINELY different from the mean and from each
+  // other, so (d) below has something to measure. A fixture whose channels were
+  // equal would make every arm of this case pass on a port that picked one.
+  MESSAGE("stereo channels differ from their mean in " << differ_l << " and "
+          << differ_r << " of " << mono.size() << " samples");
+  CHECK(differ_l > mono.size() / 2);
+  CHECK(differ_r > mono.size() / 2);
+
+  const auto serve = [](const std::vector<uint8_t>& wav, bool logprobs) {
+    Served s(AudioSpec());
+    MmServerHarness h(s.config, *s.model, Fixture());
+    std::ostringstream log;
+    REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+            oai::MultiModalChatInstall::kInstalled);
+    return h.server.handle_chat_completions(
+        ChatBodyWithAudio(1, wav, logprobs).dump());
+  };
+  const auto logprobs_of = [&serve](const std::vector<uint8_t>& wav) {
+    const ApiServer::DispatchResult r = serve(wav, /*logprobs=*/true);
+    INFO("body: ", r.body);
+    REQUIRE(r.status == 200);
+    const json j = json::parse(r.body);
+    std::vector<double> out;
+    for (const json& t :
+         j.at("choices")[0].at("logprobs").at("content")[0].at("top_logprobs")) {
+      out.push_back(t.at("logprob").get<double>());
+    }
+    return out;
+  };
+  const auto worst_gap = [](const std::vector<double>& a,
+                            const std::vector<double>& b) {
+    REQUIRE(a.size() == b.size());
+    REQUIRE(!a.empty());
+    double w = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      w = std::max(w, std::fabs(a[i] - b[i]));
+    return w;
+  };
+
+  // (b) It SERVES. This is the true-before / false-after line: the same request
+  // answered 400 before this slice.
+  const ApiServer::DispatchResult r =
+      serve(dots3_tiny::FixtureAudioWavStereo(), /*logprobs=*/false);
+  INFO("stereo body: ", r.body);
+  REQUIRE(r.status == 200);
+  const json j = json::parse(r.body);
+  CHECK(j.at("object") == "chat.completion");
+  CHECK(j.at("usage").at("completion_tokens") == 1);
+  // The placeholder span did not move: a 2-channel file of N FRAMES carries the
+  // same N samples of waveform as the mono clip, not 2N and not N/2.
+  const ApiServer::DispatchResult m =
+      serve(dots3_tiny::FixtureAudioWav(0), /*logprobs=*/false);
+  REQUIRE(m.status == 200);
+  CHECK(j.at("usage").at("prompt_tokens") ==
+        json::parse(m.body).at("usage").at("prompt_tokens"));
+
+  // (c) The ANSWER is the mean's. Not a tolerance on features — the logprobs of
+  // the served first token, which is the whole chain.
+  const std::vector<double> stereo =
+      logprobs_of(dots3_tiny::FixtureAudioWavStereo());
+  const std::vector<double> mean =
+      logprobs_of(dots3_tiny::FixtureAudioWav(0));
+  const double gap_mean = worst_gap(stereo, mean);
+  MESSAGE("stereo vs its own per-sample mean: worst logprob gap " << gap_mean);
+  CHECK(gap_mean == 0.0);
+
+  // (d) ...and NOT either channel's, which is what makes (c) load-bearing. A
+  // port that took channel 0 would serve `left`; one that summed without
+  // dividing would serve `2m`, whose amplitude the log-mel sees. Both are
+  // separated here, and both are driven as mutations in spec 4.16.7.
+  const double gap_left =
+      worst_gap(stereo, logprobs_of(dots3_tiny::FixtureWavFromPcm16(left)));
+  const double gap_right =
+      worst_gap(stereo, logprobs_of(dots3_tiny::FixtureWavFromPcm16(right)));
+  MESSAGE("stereo vs channel 0: " << gap_left << ", vs channel 1: "
+          << gap_right);
+  CHECK(gap_left > 1e-4);
+  CHECK(gap_right > 1e-4);
+
+  // A SUM WITHOUT THE DIVIDE IS NOT DRIVEN FROM A FIXTURE HERE, deliberately:
+  // 2 * m leaves int16 (|m| reaches 19660) and could only be fed back through a
+  // WAV saturated, which would measure clipping rather than the missing divide.
+  // M2 in spec 4.16.7 mutates the production divide instead.
 }
 
 TEST_CASE("dots3-note W7a: an image and an audio part in ONE request refuse BY NAME, to W8") {

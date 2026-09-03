@@ -988,6 +988,57 @@ inline std::vector<uint8_t> FixtureAudioWavLong(int variant, int64_t n) {
   return FixtureWavFromPcm16(FixtureAudioPcm16Long(variant, n));
 }
 
+// ── the STEREO clip (W7c-1, #2813) ──────────────────────────────────────────
+//
+// TWO GENUINELY DIFFERENT CHANNELS WHOSE MEAN IS EXACTLY VARIANT 0. Left is
+// `m + d` and right is `m - d`, where `m` is `FixtureAudioPcm16(0)` — the chirp
+// every W7a case already serves — and `d` is a QUARTER of the two-tone beat of
+// variant 1. So `(L[i] + R[i]) / 2 == m[i]` for every i, with no rounding at
+// all: the sum is `2 * m[i]`, an even integer.
+//
+// WHY THAT CONSTRUCTION AND NOT TWO ARBITRARY SIGNALS. The mean of two
+// arbitrary int16 channels is not an int16, so it could not be fed back through
+// a WAV to compare against. This one makes the EXPECTED mono waveform a clip
+// the suite already knows how to send, which turns "the mean is right" into an
+// equality between two SERVED requests rather than into a tolerance.
+//
+// NO CLIPPING IS POSSIBLE, which matters because a clip would break the
+// equality silently: |m| <= 0.6 * 32767 = 19660 and |d| <= 0.7 * 32767 / 4 =
+// 5734, so |m +- d| <= 25394, well inside int16.
+inline void FixtureAudioPcm16StereoChannels(std::vector<int16_t>* left,
+                                            std::vector<int16_t>* right) {
+  const std::vector<int16_t> m = FixtureAudioPcm16(0);
+  const std::vector<int16_t> beat = FixtureAudioPcm16(1);
+  left->resize(m.size());
+  right->resize(m.size());
+  for (size_t i = 0; i < m.size(); ++i) {
+    const int d = static_cast<int>(beat[i]) / 4;
+    (*left)[i] = static_cast<int16_t>(static_cast<int>(m[i]) + d);
+    (*right)[i] = static_cast<int16_t>(static_cast<int>(m[i]) - d);
+  }
+}
+
+// Those two channels INTERLEAVED, which is the frame order a `data` chunk
+// carries: L0 R0 L1 R1 ... The buffer is 2N int16 for N frames, so the file has
+// the SAME frame count as the mono clip and expands to the same placeholders.
+inline std::vector<int16_t> FixtureAudioPcm16StereoInterleaved() {
+  std::vector<int16_t> l, r;
+  FixtureAudioPcm16StereoChannels(&l, &r);
+  std::vector<int16_t> out(l.size() * 2);
+  for (size_t i = 0; i < l.size(); ++i) {
+    out[2 * i] = l[i];
+    out[2 * i + 1] = r[i];
+  }
+  return out;
+}
+
+// The stereo clip as a 2-channel PCM16 RIFF/WAVE file, through the SAME writer
+// every other audio case uses.
+inline std::vector<uint8_t> FixtureAudioWavStereo() {
+  return FixtureWavFromPcm16(FixtureAudioPcm16StereoInterleaved(), 16000,
+                             /*channels=*/2);
+}
+
 // The clip as the DECODER would produce it: `int16 / 32768.0`. Used by the
 // tower gate so its reference is driven from the same quantized samples the
 // served path sees, rather than from the float signal before rounding.

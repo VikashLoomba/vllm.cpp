@@ -218,6 +218,11 @@ bf16 chain, only the width of the epsilon ADD varying — on `[2,32,2,8,8]`:
 | 2^-12 | **0** | 0 | 8192 |
 | 2^-14 | **0** | **842** | 8192 |
 
+The generator ships the same probe at the decoder's own channel count on a
+[1,8,2,3,3] volume, where the separating counts are 0, 0 and **7 of 144** for the
+width and 0, **144** and **144** for the read. The numbers move with the shape;
+the polarity does not, and it is the polarity the case asserts.
+
 `bf16(1e-8) = 1.0011717677116394e-08`.
 
 **This is wave 1's failure written out in advance.** At ordinary magnitude nothing
@@ -413,6 +418,24 @@ reachable only where more than one tile or temporal group contributes.
 NOT within 81..120, and `:84-86` records that the 448x256/25f geometry is one
 tile. **Whether the shipped bench geometries reach the multi-tile blend is
 UNMEASURED and is in `## Owed`, not assumed.**
+
+### 4.16 THREE SCALARS, THREE ANSWERS — found during implementation, not before it
+
+A Python float multiplied into a bf16 tensor does NOT narrow. torch's scalar path
+uses `opmath_t<BFloat16> = float`, so the scalar reaches the multiply at f32 and
+only the result rounds. On `noise * 0.025 + (1 - 0.025) * sample` over 2000
+values, narrowing the two scalars first is wrong on **576 of 2000** — `bf16(0.975)`
+is 0.9765625, a whole 2^-9 away.
+
+The same function narrows a REGISTERED BUFFER, because `.to(x)` on a tensor does
+(§4.7, 1294 of 4096 if skipped). And `PixelNorm`'s epsilon — also a Python float —
+IS narrowed for its ADD (§4.3, 7 of 144 at 2^-14). Three scalars, three answers,
+in two files.
+
+**This was not in §4 before implementation and it was the row's one real defect.**
+It is A24 wave 1's `t + 1e-6` versus `t * sqrt(8/6)` finding in a third component,
+and it is why §10's stop condition on guessing an arithmetic rule is not
+decorative.
 
 ### 4.15 Simulating the intended C++ loops against upstream
 
@@ -776,6 +799,18 @@ are both about records a number agreed with and a tree did not.
   the **duration head** (`ltx2_duration_head.h:55-58`, `distilled.py:163-165`).
 * **The CUDA arm of `kLtx2Vae` at bf16** (§5.6). It needs `cuda_conv3d`'s bf16
   storage (#1007) to be reachable at all, and a lease to be measured.
+* **The attention arm upstream ACTUALLY runs at the shipped widths.** The bf16
+  goldens are taken under `SDPBackend.MATH`; on the gated fixture that is
+  byte-identical to the module as constructed (0.0), but at the shipped widths
+  FLASH serves the bare call and is 37-38% of words away from MATH (§4.9). Needs
+  a lease and real weights.
+* **The convolution's own bf16 rule.** `cpu_conv3d` keeps torch's contract but
+  not torch's blocked association order, which is the deep arm's whole residue
+  (3 to 5 of 8192 to 24576 at the fixture's shapes). Reproducing the order is its
+  own row.
+* **The video ENCODER's bf16 arm shares this file's `VaeStore`**, so it is a
+  dtype argument away rather than a port -- but it has its own weights bag, its
+  own route and no bf16 goldens, and it is not this row's.
 * **`cuda_ltx2_vae.cu`'s header claim that it is "NEVER COMPILED, NEVER EXECUTED,
   ANYWHERE IN THIS PROJECT'S REACH"** is falsified by the `cuda-fat-build` CI job
   (`.github/workflows/ci.yml:1119-1156`), which builds the `vllm` target in
@@ -798,4 +833,145 @@ are both about records a number agreed with and a tree did not.
 
 ## Now
 
-`ACTIVE`. Spec committed before implementation; the commit order is the proof.
+`DONE`. Spec commit `f8e7024d3` precedes implementation commit `d1b87687d`.
+
+---
+
+## Outcome
+
+**`DONE`.** Issue [#2786](https://github.com/mudler/vllm.cpp/issues/2786).
+Spec commit `f8e7024d3` precedes the implementation commit `d1b87687d`, which is
+the commit order that proves it came first.
+
+### What was measured, including where the plan was wrong
+
+* **§0's "one wave" conclusion holds** and was re-verified at this base, not
+  inherited: `grep -c 'RequireF32(' src/vt/cpu/cpu_ltx2_vae.cpp` = 11,
+  `src/vt/cuda/cuda_ltx2_vae.cu` = 11, `VaeKernels(` = 14, `DType::kF32` in the
+  decoder = 22, `Ltx2VideoDecodeStreaming(` = 1.
+* **The CUDA arm is NOT written, and §5.6's reason survived contact.** CI DOES
+  compile that translation unit (`cuda-fat-build`, which falsifies the file's own
+  "NEVER COMPILED" claim and is repaired here), so the reason for not writing it
+  is reachability alone: `cuda_conv3d.cu` refuses bf16 storage (#1007) and every
+  convolution goes through `vt::Conv3d`, so eleven bf16 branches there would be
+  unreachable code.
+* **Two probes in the inherited draft were WRONG.** Both read a module's
+  parameters AFTER `.to(bfloat16)` had narrowed them in place, so their two
+  hypotheses were the same tensor: one reported `nn.GroupNorm` as non-separating
+  (it separates on 6664 of 24576) and the other reported `un_normalize`'s stat
+  width from a comparison that did not isolate it.
+* **The draft's open `F.normalize` stop condition is retired by measurement**
+  (§4.8): the denominator is rounded to bf16 before the divide, 0 of 4800 at two
+  scales against three separating alternatives.
+* **§4.16 is a rule this row did not know it needed**, and it was the one real
+  defect: the noise blend's Python-float scalars were being narrowed. The SHALLOW
+  arm (§ below) is what caught it, and only because the generator emits the
+  rejected answers as TENSORS — the port was equidistant from upstream and from
+  two of the three alternatives, which is what pointed at a fourth rule.
+
+### The red and the green, literally
+
+Red, on the f32 tree, through the production entry point:
+
+```text
+tests/vllm/multimodal/test_ltx2_video.cpp:7059: ERROR: CHECK( fox.trace.vae_decode_not_bf16 == 0 ) is NOT correct!
+  values: CHECK( 27645 == 0 )
+  logged: VAE decode output, wider than bf16: 27645 of 27648
+[doctest] assertions: 17 | 16 passed | 1 failed |
+```
+
+Green, after:
+
+```text
+tests/vllm/multimodal/test_ltx2_video.cpp:7059: SUCCESS: CHECK( fox.trace.vae_decode_not_bf16 == 0 ) is correct!
+  values: CHECK( 0 == 0 )
+  logged: latent into the decode, wider than bf16: 8 of 8
+          VAE decode output, wider than bf16: 0 of 27648
+```
+
+### How the values are gated, and what is NOT
+
+Three tiers, because one was not enough and saying which is which is the point.
+
+1. **Five per-kernel rules, BIT-EXACT**, each against upstream and against the
+   answer it rejects, through the `kLtx2Vae` CPU table: GroupNorm's narrowed
+   affine (rejects f32 affine, separating 33/144), `ada_ln`'s three roundings
+   (rejects one, 19/64), `spatial_noise`'s product-then-add (rejects fused,
+   7/144), `linear_cn`'s bias-seeded accumulator (rejects bias-after, 9/32) and
+   `PixelNorm` including its epsilon's WIDTH at three row scales.
+2. **A SHALLOW two-convolution arm, BIT-EXACT** (max|diff| == 0), which holds the
+   three rules the kernel table does not own: `_RMSNorm2D`'s multiply order
+   (rejected answer 0.00390625 away), `un_normalize`'s narrowing (0.0078125) and
+   the bf16 timestep embedding (0.00390625). It sits at 8 channels because
+   `sqrt(8)` is not representable in bf16 and at C=64 every ordering agrees on
+   4800 of 4800.
+3. **The deep thirteen-convolution arm, BOUNDED**, at the chain's own measured
+   one-ulp response (0.0117188 — how far the decode moves when ONE `conv_in`
+   weight changes by ONE bf16 ulp). The port sits at 0.00585938. The bound is
+   proven to separate rather than assumed to: the two rejected rules that reach
+   this fixture's output are 0.0351562 and 0.015625.
+
+**NOT bit-exact, and why.** torch BLOCKS its convolution reduction and this port
+does not; at the fixture's own shapes the two orders disagree on 3 to 5 outputs
+of 8192 to 24576. That is the whole of the deep arm's residue.
+
+**A defect that reaches NOTHING at whole-decode level.** The f32 GroupNorm affine
+moves the deep arm by exactly 0.0 — no bound of any width could see it — which is
+what makes tier 1 load-bearing rather than duplicative.
+
+### Mutations, with their literal results
+
+| mutation | result |
+|---|---|
+| delete the production `kBF16` argument (`ltx2_video.cpp`) | `vae_decode_not_bf16` 0 -> **27645 of 27648**; 1 of 4972 engine assertions red, every digest, absmax, frame byte and determinism check GREEN; `test_ltx2_vae` fully green, which is the unit suite measuring the class rather than the capability |
+| GroupNorm: round the normed value before the affine | reds "each kLtx2Vae kernel's BF16 rule" |
+| `ada_ln`: one rounding instead of three | reds "each kLtx2Vae kernel's BF16 rule" |
+| `spatial_noise`: fuse the product and the add | reds "each kLtx2Vae kernel's BF16 rule" |
+| `linear_cn`: add the bias after the store rounding | reds "each kLtx2Vae kernel's BF16 rule" |
+| `PixelNorm`: f32 epsilon instead of `bf16(1e-8)` | reds the **2^-14 arm ONLY**, at 0.00390625; 2^-0 and 2^-10 stay GREEN |
+| `PixelNorm`: epsilon set to 0 | reds the **2^-10 arm** at 0.0625 and 2^-14 at 1.88281; 2^-0 stays GREEN |
+| `_RMSNorm2D`: restore the old multiply order | reds the deep AND shallow bf16 arms |
+| `un_normalize`: fuse the multiply and the add | reds the deep AND shallow bf16 arms |
+| timestep embedding: drop the intermediate rounding | reds the deep AND shallow bf16 arms |
+| noise blend: narrow the Python-float scalars | reds the **shallow** arm; the deep arm's bound absorbs it |
+
+The last four red NOTHING before the shallow arm existed. That is recorded because
+it is the reason the shallow arm was built rather than a nicety.
+
+### One instrument lost its window and is repaired rather than deleted
+
+`ltx2 a2vid: the distilled adapter rides stage 2 ALONE` measured the adapter's
+reach in PPM bytes. On an f32 decode the adapter moved **19 of 146753** — 0.013%,
+a few pixels straddling an 8-bit boundary. bfloat16's mantissa is 8 bits too, so
+it now moves **0**, and raising the fixture's delta does NOT recover it: at scale
+8 the count is 0 as well, because a larger delta pushes both arms into the
+writer's clamp. The claim is made one step upstream instead, on a new
+`vae_latent_digest`, and the comment says plainly that this is a weaker statement
+than "reaches the pixels".
+
+### Records this row's own work falsified, repaired in the same change
+
+* `ltx2_video_vae_encoder.h:57` said the encoder's arm "is owed with the
+  decoder's". The decoder's landed and the encoder's did not.
+* `ltx2_tiling.h` recorded the buffer and the masks and NOT `zeros_like` — the
+  sentence that decides the blend quotient's width.
+* `cuda_ltx2_vae.cu` said it was "NEVER COMPILED, NEVER EXECUTED, ANYWHERE IN THIS
+  PROJECT'S REACH". The `cuda-fat-build` CI job compiles it on every pull request;
+  never EXECUTED still holds.
+* `docs/FEATURES.md`'s Conv VAE arithmetic-width row said "STORAGE stays f32;
+  bf16 owed".
+
+### Defaults, and why they have their values
+
+* **`Ltx2LoadVaeWeights`'s `compute_dtype` defaults to `kF32`**, unlike wave 2's
+  connector loader, which has no default at all. The connector has ONE caller;
+  this has seven, six of which are still f32 ports, and a `kBF16` default would
+  hand each of them a bag whose `Get` refuses.
+* **`Ltx2VideoFrames::data` stays `std::vector<float>`.** It is the public pixel
+  return, three channels wide; the intermediates this row narrowed are the base
+  channel width at full resolution. The counter gates that its values are
+  bf16-representable, which is the property that matters.
+* **`ChunkBuffer` keeps f32 storage and rounds at each accumulation.** Same
+  proportion argument: a pixel volume against base-channel-width intermediates.
+* **bf16 is refused on a non-CPU queue in ONE place**, asking the same question
+  the kernels refuse on, so the refusal and the route predicate cannot drift.

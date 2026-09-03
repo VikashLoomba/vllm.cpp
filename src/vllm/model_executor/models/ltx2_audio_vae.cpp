@@ -43,6 +43,30 @@ const std::vector<float>& Ltx2VaeWeights::Get(const std::string& name) const {
   return it->second;
 }
 
+const std::vector<uint16_t>& Ltx2VaeWeights::GetBf16(const std::string& name) const {
+  const auto it = bf16.find(name);
+  // Named rather than empty: a bag carries exactly one arm, and an empty vector
+  // reads downstream as a zero-length tensor rather than as the wrong arm.
+  VT_CHECK(it != bf16.end(),
+           "ltx2 vae: '" + name +
+               "' is not in the bf16 arm of this bag. Exactly one arm is populated; ask for "
+               "the arm the bag's `dtype` names.");
+  return it->second;
+}
+
+size_t Ltx2VaeWeights::Count(const std::string& name) const {
+  const auto f32 = tensors.find(name);
+  if (f32 != tensors.end()) return f32->second.size();
+  return GetBf16(name).size();
+}
+
+size_t Ltx2VaeWeights::Bytes() const {
+  size_t total = 0;
+  for (const auto& kv : tensors) total += kv.second.size() * sizeof(float);
+  for (const auto& kv : bf16) total += kv.second.size() * sizeof(uint16_t);
+  return total;
+}
+
 namespace {
 
 // ---------------------------------------------------------------------------

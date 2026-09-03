@@ -7009,8 +7009,8 @@ TEST_CASE("ltx2 video: a typed PROMPT conditions the render") {
        << fox.trace.connector_audio_values);
   REQUIRE(fox.trace.connector_video_values > 0);
   REQUIRE(fox.trace.connector_audio_values > 0);
-  CHECK(fox.trace.connector_video_not_bf16 > fox.trace.connector_video_values / 2);
-  CHECK(fox.trace.connector_audio_not_bf16 > fox.trace.connector_audio_values / 2);
+  CHECK(fox.trace.connector_video_not_bf16 == 0);
+  CHECK(fox.trace.connector_audio_not_bf16 == 0);
 }
 
 TEST_CASE("ltx2 video: the prompt's conditioning goes through the CONNECTOR") {

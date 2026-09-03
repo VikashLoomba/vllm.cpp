@@ -475,7 +475,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 583 585 1210 1306 1402 1418 1553 1557 1660 1738 1856 1898 1940 1942
+// 583 585 1217 1313 1409 1425 1560 1564 1667 1745 1863 1905 1947 1949
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -647,11 +647,18 @@ std::string RecipeVersionKey(const std::string& declared) {
 // on a module that runs once per request over 1024 rows. A diffusion request is
 // minutes; re-reading the DiT file is not the cost that matters here.
 //
-// THE f32 IS AN ANNOTATED ESCAPE, not an inherited default. Upstream runs this
-// module at the model dtype, so f32 here is WIDER — the polarity AGENTS.md says
-// a value gate cannot catch. It is taken because `Ltx2ConnectorForward` is L5's
-// declared PARITY dtype and this is the arm its goldens cover, and its output is
-// narrowed to the stream dtype on the first upload like every other activation.
+// AND IT RUNS AT UPSTREAM'S OWN DTYPE, which is bfloat16. `distilled.py:109`
+// resolves ONE pipeline dtype and hands it to `PromptEncoder` at `:113`, which
+// constructs this module, so both the materialization above and the arithmetic
+// below are bf16 on the render path. A24 wave 2, row LTX25-A24-CONNECTOR-BF16,
+// issue #2720. The paragraph above still prices the f32 arm because that arm is
+// what the parity goldens cover and what a caller gets by default; at bf16 the
+// figure halves, to ~2.016 B parameters in about 4 GB.
+//
+// This USED to read "the f32 is an annotated escape", which is the polarity
+// AGENTS.md says a value gate cannot catch, and it was right that nothing could
+// catch it: on this render the connector's output was 16384 of 16384 values wider
+// than bf16 while every digest, absmax, frame byte and determinism check passed.
 // A phase leaf that a caller can DECLINE, which is what an empty prefix means.
 // `phase::Scope` has no disabled state and is not movable, so the choice is
 // expressed by whether the optional holds one. Named rather than written inline
@@ -716,8 +723,8 @@ class ConnectorWeightSet {
     if (loaded_) return;
     const SubPhase weights_phase(phase_prefix, ".weights");
     const SafetensorsFile file = SafetensorsFile::Open(dit_path_);
-    video_ = Ltx2LoadConnectorWeights(file, video_cfg_);
-    audio_ = Ltx2LoadConnectorWeights(file, audio_cfg_);
+    video_ = Ltx2LoadConnectorWeights(file, video_cfg_, vt::DType::kBF16);
+    audio_ = Ltx2LoadConnectorWeights(file, audio_cfg_, vt::DType::kBF16);
     loaded_ = true;
   }
 
@@ -837,8 +844,8 @@ Ltx2ConnectorEmbeddings RunConnectorFromFile(const SafetensorsFile& dit_file,
   Ltx2VaeWeights audio_weights;
   {
     const SubPhase weights_phase(phase_prefix, ".weights");
-    video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg);
-    audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg);
+    video_weights = Ltx2LoadConnectorWeights(dit_file, video_cfg, vt::DType::kBF16);
+    audio_weights = Ltx2LoadConnectorWeights(dit_file, audio_cfg, vt::DType::kBF16);
   }
   return RunConnector(video_weights, audio_weights, video_cfg, audio_cfg, video_in, audio_in,
                       additive, rows, phase_prefix);

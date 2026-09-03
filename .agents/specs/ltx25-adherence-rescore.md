@@ -5,7 +5,11 @@ Row `LTX25-ADHERENCE-RESCORE`. Issue
 [`ltx-2-5.md`](ltx-2-5.md), under roadmap row `ROAD-V1-LTX25`.
 
 Base: `origin/main` at `6974557b02f822d9a1d603e8639091f735b7ecbe`, pinned when
-the worktree was created.
+the worktree was created. The four cross-document anchors the review repairs
+added — `ltx25-adherence-detail-loss.md:454-461`, `ltx25-oracle-absolute.md:54`,
+`ltx25-prompt-adherence.md:698-706` and `ltx25-render-compare.py:369` — were
+re-read at `origin/main` **`e24ec8bfd`** as well as in this worktree, and hold
+in both.
 
 Oracle: Lightricks `LTX-2` at `fd4ded7f2d88d3da713abcdd4ad41ecc4a9314ca`,
 `gateable = yes`; its reference render, manifest and `SHA256SUMS` are committed
@@ -120,9 +124,23 @@ collected.
   inherited: `git rev-list --count 7905607af..c3b4da804` is **454**, **129**
   files under `src/` and `include/` changed, and **5 of them match
   `ltx|video|vae|diffus`** — `ltx2_conditioning.h`, `ltx2_pipeline.h`,
-  `ltx2_video.h`, `ltx2_pipeline.cpp` and `ltx2_video.cpp`. Every number in
-  `## Outcome` names the SHA it came from, and the difference is not attributed
-  to the sigma flip on the strength of this scan.
+  `ltx2_video.h`, `ltx2_pipeline.cpp` and `ltx2_video.cpp`.
+
+  **`7905607af` here and the `source_sha 790c582bb` in `## Outcome`'s arm table
+  are the same engine**, so a reader who checks does not have to leave the
+  document. `790c582bb` is the dangling pre-squash tip of
+  `row/LTX25-RENDER-CONFIRM`, reachable from no ref, and its entire delta over
+  `7905607af` is `.agents/specs/ltx25-render-confirm.md` plus
+  `scripts/ltx25-render-confirm.sh` — no engine code
+  (`ltx25-prompt-adherence.md:698-706` establishes this; re-verified for this
+  bullet: `git merge-base --is-ancestor 7905607af 790c582bb` is YES,
+  `git rev-list --count 7905607af..790c582bb` is **2**, and
+  `git diff --name-only` over that range lists exactly those two files). The
+  engine sha is therefore the right endpoint to scan from, which is why this
+  bullet uses it.
+
+  Every number in `## Outcome` names the SHA it came from, and the difference is
+  not attributed to the sigma flip on the strength of this scan.
 
   **An earlier draft of this bullet read "112+ commits apart", and it was wrong
   in two ways.** 112 is `ltx25-prompt-adherence.md`'s own figure and it is
@@ -255,7 +273,8 @@ eight file digests verified on every run. Both reference forms, as
 | sharpness | 10.637435899739584 | 10.123432387695312 |
 | `blockiness_grid8` | 1.0301103174717752 `[PASS]` | 1.0282447301026165 `[PASS]` |
 | `blockiness_grid32` | 1.0248094630021185 `[PASS]` | 0.9757147618162578 `[PASS]` |
-| mean luminance | 126.544 | 103.150 |
+| `pixel_mean` — reference **121.704516** | 126.544109 | 103.150315 |
+| HSV mean saturation — reference **0.243190** | 0.117272 | 0.154290 |
 | `audio_rms` | 121.79029972068476 | 160.8030039983292 |
 | reading / verdict | `WORSE_THAN_ORACLE` / `FAIL` (exit 1) | `WORSE_THAN_ORACLE` / `FAIL` (exit 1) |
 
@@ -271,6 +290,32 @@ mean by 38.1278 − 38.0024 = **+0.1254**, which is exactly the codec
 contribution `ltx25-prompt-adherence.md` records, reproduced here
 independently; and S2 is invariant to the form entirely, margins and per-frame
 wins alike, because it ranks decoys on OUR frames and never on the reference's.
+
+**Exposure moved four times further from the reference than colour moved toward
+it, and the standing table reported neither against the value that makes them
+readable.** The reference's own `pixel_mean` is **121.704516**. So the ablation
+arm sat **+4.839593** from the reference's exposure and the new arm sits
+**−18.554201** — mirroring upstream's sigma anchor moved global exposure
+**3.83x further** from the reference than it already was: 15.25% below the
+reference, 18.49% below the arm it replaced. The colour axis moves the OTHER
+way. Mean HSV saturation goes **0.117272 → 0.154290** against the reference's
+**0.243190**, which closes 29.4% of the ablation arm's shortfall. The obvious
+joint mechanism therefore does **NOT** hold: the new arm is not washed out
+toward grey, it is darker AND more saturated, and the next reader should not
+spend a lease chasing desaturation. This is a real result of the flip, not a
+side note, and §"What to chase next" ranks it accordingly.
+
+**How those four numbers were computed**, so a reader can repeat them with no
+GPU and no lease. `pixel_mean` is the tool's own
+(`scripts/ltx25-render-compare.py:369`): the mean over the 25 frames of each
+frame's mean over all three 8-bit channels. Saturation is the HSV S channel,
+`(max(R,G,B) − min(R,G,B)) / max(R,G,B)` with `S = 0` where `max = 0`, averaged
+over every pixel of every frame — `ltx25-render-compare.py` emits no saturation
+metric, so this one is DEFINED here rather than quoted from an instrument. Both
+were read from the retained PPMs at
+`ltx25-adherence-rescore/run/20260902T145000Z/{abl,r1}` and
+`/mnt/nas_share/rc/ltx2-oracle/out/upstream_frames`, which is the same lossless
+reference set this section verifies against `SHA256SUMS` above.
 
 ### The control, which is the most valuable line in this row
 
@@ -349,8 +394,21 @@ the first.** Our render diverges from upstream's for some reason this row does
 not name, and the wrong schedule was compensating for it — buying back enough
 of the prompt's semantics to keep S2 above water while S1 stayed below the
 bound. Remove the compensation and the underlying divergence is visible at full
-size. That is a hypothesis, it is the only one the data suggests, and it is not
-evidence for itself.
+size. That is a hypothesis, it is one reading consistent with the data, and it
+is not evidence for itself. It is not the only one: the exposure axis in
+`## Outcome` supplies a competitor from this row's own table.
+
+**One obvious counter to the masking reading is closed, not open.** It would be
+that our `one_stage` arm is mapped to the wrong upstream recipe, so #2521's flip
+never should have reached this render and the score change is a mismatch rather
+than a mechanism. It is not: the #1864 reference render this row scores against
+was itself taken through `python -m ltx_pipelines.ti2vid_one_stage`
+(`ltx25-oracle-absolute.md:54`, the `Entry point` row of its anchor table). The
+oracle render ran at the 4096 anchor, which is exactly what
+`schedulers.py:32`'s `default_number_of_tokens` branch gives
+`ti2vid_one_stage.py:207`. Our arm and the reference are the same recipe, and
+the flip moved us ONTO the reference's schedule. That is what makes the score
+getting worse informative rather than a mapping error.
 
 ### What to chase next, and why it is a better handle than the number that fell
 
@@ -372,11 +430,35 @@ committed before any of these scores were seen. It is worth far more than a
 scalar mean that fell by a tenth of a standard deviation. It is also the axis
 this campaign already treated as the tight one: `ltx25-adherence-detail-loss.md`
 names "the fox-against-wolf margin" three times as the thing its own hypothesis
-was built to explain. The next hypothesis for #1854 / #2514 should be aimed at what
-carries species identity through this pipeline — the conditioning path and the
-high-noise steps where CFG sets subject semantics — and it should be gated on
-S2's per-frame win count, which discriminates, rather than on S1's mean, which
-on this evidence barely does.
+was built to explain.
+
+**Two candidates come out of this row with equal standing, and it does not
+choose between them.**
+
+1. **What carries species identity through this pipeline** — the conditioning
+   path and the high-noise steps where CFG sets subject semantics. This is what
+   the `near:1` flip names directly.
+2. **Global exposure** — the axis in `## Outcome`, where the new arm sits
+   **−18.554201** from the reference's `pixel_mean` against the ablation's
+   **+4.839593**.
+
+The second is not a separate defect to file behind the first. It is a
+**competing explanation for it**: the true prompt says *at sunrise*, and an
+18.49% drop in mean pixel value on a sunrise prompt can move a CLIP argmax on
+its own, with the render's animal unchanged. It also has the better provenance
+of the two. The exposure figure is measured against the ORACLE's own frames,
+while the `near:1` flip is an instrument reading with no reference value behind
+it — S2 ranks decoys on our frames only, as three paragraphs above establish.
+And the campaign already treats this axis as live:
+`ltx25-adherence-detail-loss.md:454-461` fits a gain-and-gamma map from our
+luminance quantiles onto the reference's and reports gain **0.99144**, gamma
+**1.04654** with an rms residual of **14.9379** levels. That fit was taken on
+the frames whose digest is `1166b28694001c52a`, which this row proves are the
+ablation arm's, byte for byte — the arm that sat **+4.839593**. Nobody has
+retaken it on the arm that sits **−18.554201**, and doing so is cheap.
+
+Both candidates should be gated on S2's per-frame win count, which
+discriminates, rather than on S1's mean, which on this evidence barely does.
 
 ### Why each default has the value it has
 

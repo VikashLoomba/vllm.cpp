@@ -12,11 +12,12 @@
 // numeric contract across the two stages.
 //
 // ─── SCOPE, so nothing is discovered later ───────────────────────────────────
-// This is the DECODE direction only: AudioDecoder + Vocoder (+ the BWE chain).
-// The ANALYSIS half (`AudioEncoder`, audio_vae.py:60-246, and the mel front-end
-// `AudioProcessor`, ops.py:8-55) is what a REFERENCE AUDIO would need, and it is
-// NOT ported here — it is owed, and the same is true of the video VAE's encoder
-// (see ltx2_video_vae.cpp).
+// Both directions now live here. The DECODE half is AudioDecoder + Vocoder
+// (+ the BWE chain); the ANALYSIS half is `AudioEncoder` (audio_vae.py:60-246)
+// and the whole `AudioProcessor` front-end (ops.py:8-55) — its slaney
+// filterbank, its mel transform, and, since row LTX25-AUDIO-RESAMPLE (#2583),
+// its resampler. The video VAE's encoder is a different file
+// (ltx2_video_vae.cpp).
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 
 #include "vllm/model_executor/models/ltx2_audio_vae_encoder.h"
@@ -25,6 +26,7 @@
 #include <cmath>
 #include <cstddef>
 #include <numbers>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -1044,20 +1046,210 @@ std::vector<float> Ltx2SlaneyMelFilterbank(int64_t n_freqs, double f_min, double
   return fb;
 }
 
-std::vector<float> Ltx2WaveformToLogMel(const Ltx2AudioProcessorConfig& config,
-                                        const std::vector<float>& waveform, int64_t channels,
-                                        int64_t samples, int64_t sampling_rate,
-                                        int64_t* out_frames) {
+namespace {
+
+// `_get_sinc_resample_kernel` (torchaudio 2.11 functional/functional.py:1305-1402)
+// at the arguments `ops.py:40` passes, which is to say at every default. Returns
+// `new_freq` phase rows of `2 * width + orig_freq` taps, row-major. `orig_freq`
+// and `new_freq` are already REDUCED by their gcd, as upstream reduces them at
+// `:1340-1341`.
+//
+// THE WINDOW IS HANN, and nine comments in this tree used to say kaiser.
+// `resample` defaults `resampling_method="sinc_interp_hann"` (`:1441`) and only
+// the kaiser branch (`:1386-1391`) builds `i0`-weighted taps; `ops.py:40` passes
+// neither that argument nor `beta`. The same window this file already builds for
+// the vocoder's BWE stage (`Ltx2HannSincResampleFilter1d`) is this kernel at
+// `orig_freq == 1`; what was missing was the arbitrary rational ratio.
+//
+// EVERY VALUE IS COMPUTED IN `float`, AND THAT IS THE MIRROR RATHER THAN A
+// SHORTCUT. Upstream's waveform is float32 from the decoder on
+// (`decode.py:173-176`), `encode_audio` moves it without casting
+// (`audio_vae.py:271`), and the kernel is built with `dtype=waveform.dtype`
+// (`:1487`), so `idx`, `t`, the clamp, the window and `sin(t)/t` are all f32
+// (`:1376-1397`). Measured against the pinned oracle, a `double`-built kernel
+// narrowed to `float` lands 3.39746e-06 away where this f32-built one lands
+// 1.19209e-07: widening here does not improve the port, it loosens the gate by a
+// factor of 28 and hides exactly what AGENTS.md's "a token gate cannot detect a
+// dtype that is too wide" is about.
+std::vector<float> Ltx2SincResampleKernel(int64_t orig_freq, int64_t new_freq,
+                                          int64_t* out_width) {
+  constexpr int64_t kLowpassFilterWidth = 6;  // functional.py:1439
+  constexpr double kRolloff = 0.99;           // functional.py:1440
+
+  // `base_freq` and `width` are Python floats, i.e. f64, and stay f64: only the
+  // TENSOR arithmetic below narrows (`:1350`, `:1369`; the first tensor is `:1376`).
+  const double base_freq64 = static_cast<double>(std::min(orig_freq, new_freq)) * kRolloff;
+  const int64_t width = static_cast<int64_t>(
+      std::ceil(static_cast<double>(kLowpassFilterWidth) * static_cast<double>(orig_freq) /
+                base_freq64));
+  const int64_t taps = 2 * width + orig_freq;
+  if (out_width != nullptr) *out_width = width;
+
+  // `t *= base_freq` narrows its operand to the tensor dtype (`:1379`), and so
+  // does `window * scale` — but `scale = base_freq / orig_freq` is a Python
+  // DIVISION in f64 that is narrowed only afterwards (`:1395`).
+  const float base_freq = static_cast<float>(base_freq64);
+  const float scale = static_cast<float>(base_freq64 / static_cast<double>(orig_freq));
+  const float lpw = static_cast<float>(kLowpassFilterWidth);
+  constexpr float kPi = std::numbers::pi_v<float>;  // `math.pi` narrowed, as torch narrows it
+
+  std::vector<float> kernel(static_cast<size_t>(new_freq * taps));
+  for (int64_t j = 0; j < new_freq; ++j) {
+    // `torch.arange(0, -new_freq, -1) / new_freq` (`:1378`): row j is the output
+    // phase -j/new_freq.
+    const float phase = static_cast<float>(-j) / static_cast<float>(new_freq);
+    for (int64_t k = 0; k < taps; ++k) {
+      // `idx = torch.arange(-width, width + orig_freq) / orig_freq` (`:1376`).
+      const float idx = static_cast<float>(k - width) / static_cast<float>(orig_freq);
+      float t = (phase + idx) * base_freq;
+      // `:1380`. The SINC reads the clamped t too, because `t *= math.pi` comes
+      // after (`:1393`). Outside +/-6 the window is cos(pi/2)^2 = 0 exactly, so
+      // those taps vanish whatever the sinc does — which is why the BWE
+      // filter's unclamped sinc has never mattered.
+      t = std::max(-lpw, std::min(lpw, t));
+      const float shaped = std::cos(((t * kPi) / lpw) / 2.0f);
+      const float window = shaped * shaped;  // `** 2` at `:1385`
+      t *= kPi;                              // `:1393`
+      // `torch.where(t == 0, 1.0, t.sin() / t)` (`:1396`). The equality is
+      // upstream's own and fires on exactly one tap per kernel — j = 0,
+      // k = width — because orig_freq and new_freq are coprime after the gcd.
+      const float sinc = t == 0.0f ? 1.0f : std::sin(t) / t;
+      // `kernels *= window * scale` (`:1397`) — that association, not
+      // `(sinc * window) * scale`, which rounds differently in f32.
+      kernel[static_cast<size_t>(j * taps + k)] = sinc * (window * scale);
+    }
+  }
+  return kernel;
+}
+
+}  // namespace
+
+std::vector<float> Ltx2ResampleWaveform(const std::vector<float>& waveform, int64_t channels,
+                                        int64_t samples, int64_t orig_freq, int64_t new_freq,
+                                        int64_t* out_samples) {
+  VT_CHECK(channels > 0 && samples > 0, "ltx2 resample: channels and samples must be positive");
   VT_CHECK(static_cast<int64_t>(waveform.size()) == channels * samples,
+           "ltx2 resample: waveform size does not match [channels, samples]");
+  // `resample` (functional.py:1470-1471), the same refusal and the same reason.
+  VT_CHECK(orig_freq > 0 && new_freq > 0,
+           "ltx2 resample: original frequency and desired frequency should be positive "
+           "(functional.py:1470-1471)");
+
+  if (out_samples != nullptr) *out_samples = samples;
+  // `:1473-1474`, and `resample_audio` returns even earlier (`ops.py:38-39`).
+  // The input UNFILTERED, not the input pushed through a unit-ratio filter: the
+  // filter has passband ripple and would change every sample by a little.
+  if (orig_freq == new_freq) return waveform;
+
+  const int64_t gcd = std::gcd(orig_freq, new_freq);
+  const int64_t orig = orig_freq / gcd;  // `:1340`, `:1416`
+  const int64_t next = new_freq / gcd;   // `:1341`, `:1417`
+  int64_t width = 0;
+  const std::vector<float> kernel = Ltx2SincResampleKernel(orig, next, &width);
+  const int64_t taps = 2 * width + orig;
+
+  // `_apply_sinc_resample_kernel` (`:1405-1432`): zero-pad by (width, width +
+  // orig), convolve with stride `orig`, transpose the phase axis in front of the
+  // block axis, and truncate to `ceil(new * length / orig)`.
+  //
+  // `blocks * next` is exactly how many columns the convolution leaves for that
+  // truncation to slice (`:1424-1426`).
+  const int64_t blocks = samples / orig + 1;
+  const int64_t columns = blocks * next;
+  // `target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()`
+  // (`:1427`), and this is NOT an exact integer ceil. `torch.as_tensor` of a
+  // PYTHON FLOAT takes `torch.get_default_dtype()`, which is float32, so the f64
+  // quotient is rounded to f32 BEFORE the ceil, and the narrowing moves BOTH
+  // ways. Where the exact quotient sits above an integer by less than half an f32
+  // ulp, the narrowing lands ON that integer and upstream keeps one sample FEWER
+  // than `(next * samples + orig - 1) / orig` gives — first at 180697 samples for
+  // 44100 -> 16000 (4.097 s), then for 48102 of the first 60 s worth of lengths.
+  // Where it rounds the other way, upstream asks for one sample MORE — at 33554438
+  // samples for 44100 -> 22050 (12.7 min), for instance. Either way the count
+  // moves the last STFT windows and, where `samples % hop == 0`, the mel FRAME
+  // COUNT.
+  //
+  // `next * samples` is exact in `int64_t` and exact again as a `double` for any
+  // length under 2^53 / next, so the division below is Python's own
+  // correctly-rounded f64 `int / int`; the narrowing and the ceil then mirror
+  // `as_tensor` and `torch.ceil`, and the cast to `int64_t` mirrors `.long()`.
+  // The whole rule below — the cast chain AND the clamp — is checked against what
+  // `torchaudio.functional.resample` RETURNS, `.shape[-1]`, and not against the
+  // formula at `:1427`. That distinction is the reason this clamp is here: the
+  // first pass compared expression to expression over 276060 pairs, found zero
+  // divergences, and could not see `:1428` at all, because the clamp is not in the
+  // expression. 496194 (ratio, length) pairs across nineteen ratios — 495900
+  // lengths under 2 million, plus 294 in six bands around 2^25 where the clamp
+  // bites: zero divergences.
+  const double quotient = static_cast<double>(next * samples) / static_cast<double>(orig);
+  const int64_t target = static_cast<int64_t>(std::ceil(static_cast<float>(quotient)));
+  // `resampled = resampled[..., :target_length]` (`:1428`). The truncation is a
+  // PYTHON SLICE, so it clamps, and mirroring `:1427` without `:1428` is not a
+  // port of the two lines. The slack between the columns and the exact integer
+  // ceil is `next - ceil(next * (samples % orig) / orig)`, whose minimum over the
+  // residues is `next / orig` in INTEGER division — ZERO for every DOWNsampling
+  // ratio. So on any ratio
+  // with `next < orig` there are lengths whose columns are exactly the exact ceil,
+  // and an upward narrowing there asks for a column the convolution never
+  // produced: at 48000 -> 16000 and 100663303 samples (2097.2 s), `target` is
+  // 33554436 and `columns` is 33554435. Without this `std::min` the loops below
+  // would stop at `columns` and leave the last element of `out` at its
+  // value-initialised zero — a trailing sample upstream never emitted, reported as
+  // real through `out_samples`.
+  //
+  // The ordinary path is the other one, `target < columns`, and it still
+  // truncates exactly as before: `std::min` changes nothing there.
+  const int64_t clamped = std::min(target, columns);
+  if (out_samples != nullptr) *out_samples = clamped;
+
+  // ONE kernel for every channel. torchaudio packs the batch and resamples the
+  // last axis (`:1419-1421`), so the channels are independent; this walks them
+  // rather than approximating that.
+  std::vector<float> out(static_cast<size_t>(channels) * static_cast<size_t>(clamped));
+  for (int64_t c = 0; c < channels; ++c) {
+    const float* in = waveform.data() + c * samples;
+    float* dst = out.data() + c * clamped;
+    for (int64_t b = 0; b < blocks; ++b) {
+      if (b * next >= clamped) break;
+      // Where tap 0 of this block lands in the UNPADDED signal. The zero pad is
+      // skipped rather than materialised, which is the same sum.
+      const int64_t base = b * orig - width;
+      const int64_t first = std::max<int64_t>(0, -base);
+      const int64_t last = std::min<int64_t>(taps, samples - base);
+      for (int64_t j = 0; j < next; ++j) {
+        const int64_t index = b * next + j;
+        if (index >= clamped) break;
+        const float* row = kernel.data() + j * taps;
+        // The one `double` in this function, and it is an ACCUMULATOR rather
+        // than a stored dtype: torch's vectorised conv1d reduction order is not
+        // reproducible from a C++ loop, so the choice is between two roundings
+        // and the exact sum is the defensible one. Every stored value is f32.
+        double acc = 0.0;
+        for (int64_t k = first; k < last; ++k) {
+          acc += static_cast<double>(row[k]) * static_cast<double>(in[base + k]);
+        }
+        dst[index] = static_cast<float>(acc);
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<float> Ltx2WaveformToLogMel(const Ltx2AudioProcessorConfig& config,
+                                        const std::vector<float>& source, int64_t channels,
+                                        int64_t source_samples, int64_t sampling_rate,
+                                        int64_t* out_frames) {
+  VT_CHECK(static_cast<int64_t>(source.size()) == channels * source_samples,
            "ltx2 mel: waveform size does not match [channels, samples]");
-  VT_CHECK(sampling_rate == config.target_sample_rate,
-           "ltx2 mel: the waveform is at " + std::to_string(sampling_rate) + " Hz but the audio "
-           "VAE wants " + std::to_string(config.target_sample_rate) +
-           " Hz. Upstream resamples with torchaudio.functional.resample (audio_vae/ops.py:36-42), "
-           "a polyphase kaiser resampler for an arbitrary rational ratio, which is NOT ported — "
-           "this project carries only the integer-ratio hann-sinc variant the BWE stage needs. "
-           "Refused rather than reinterpreted: treating the samples as if they were already at "
-           "the target rate conditions on audio that is pitched and time-scaled wrong");
+  // `waveform = self.resample_audio(audio).waveform` (ops.py:49), called
+  // UNCONDITIONALLY: the rate test lives inside `resample_audio` (ops.py:38-39),
+  // so the equal-rate arm is on the production path rather than reachable only
+  // from a test. Everything below — the reflect-pad floor, the frame count, the
+  // mel — is therefore over the RESAMPLED signal, which is upstream's order.
+  int64_t samples = 0;
+  const std::vector<float> waveform = Ltx2ResampleWaveform(
+      source, channels, source_samples, sampling_rate, config.target_sample_rate, &samples);
+
   const int64_t n_fft = config.n_fft;
   const int64_t hop = config.mel_hop_length;
   VT_CHECK(n_fft > 0 && hop > 0, "ltx2 mel: n_fft and hop_length must be positive");

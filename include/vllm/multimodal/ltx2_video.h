@@ -310,13 +310,16 @@ inline constexpr char kLtx2ImageCrfExtra[] = "image_crf";
 // the ordinary text-to-video render.
 //
 // A 16-bit PCM RIFF/WAVE file whose channel count matches the checkpoint's audio
-// VAE encoder `in_channels` and whose sample rate matches its mel front-end.
-// Neither is converted: upstream resamples with an arbitrary-ratio polyphase
-// kaiser resampler (`ops.py:40`) this project has not ported, and it feeds the
-// file's own channel count straight into a conv that declares 2
-// (`model_configurator.py:172`). Both mismatches are refused with both numbers
-// in the message, because a resampled-wrong or upmixed-wrong take conditions the
-// render on a waveform the caller never supplied and still finishes.
+// VAE encoder `in_channels`. ANY SAMPLE RATE is accepted: the mel front-end
+// resamples it to the checkpoint's own, exactly as upstream does
+// (`ops.py:36-49`, ported by row LTX25-AUDIO-RESAMPLE, #2583). The rendered
+// soundtrack still comes back at the FILE's rate, because upstream returns the
+// caller's original take rather than a VAE round trip (`:301-303`).
+//
+// The CHANNEL count is still refused, with both numbers in the message:
+// upstream feeds the file's own count straight into a conv that declares 2
+// (`model_configurator.py:172`), so an upmixed-wrong take would condition the
+// render on a waveform the caller never supplied and still finish.
 //
 // The audio is held FROZEN through every denoise phase — upstream's
 // `ModalitySpec(frozen=True, noise_scale=0.0)` at `a2vid_two_stage.py:251-256`

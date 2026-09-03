@@ -7706,6 +7706,106 @@ TEST_CASE("ltx2 video: a supplied audio file CONDITIONS the render, and stays FR
   }
 }
 
+TEST_CASE("ltx2 video: a take at ANOTHER rate is RESAMPLED, not refused") {
+  // Row LTX25-AUDIO-RESAMPLE, issue #2583, gap A19 of the completion plan.
+  //
+  // Enters through the PRODUCTION path — `LoadVideoEngine` + `Generate`, what
+  // `vllm_video_generate` calls straight through (`vllm_c.cpp:1646`) — for the
+  // reason in this section's header: a unit test over `Ltx2ResampleWaveform`
+  // proves the filter works and never that a request can arrive at it. Until
+  // this row, a request at any rate but the checkpoint's was refused three hops
+  // earlier and NOTHING downstream of that refusal ran.
+  //
+  // Upstream refuses nothing here: `waveform_to_mel` calls `resample_audio`
+  // before the mel transform (ops.py:44-49) and `resample_audio` filters
+  // whenever the rates differ (ops.py:36-42).
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  // THREE takes of the same 220 Hz tone, and the third is the control:
+  //   native — 2.0 s at the fixture's own 24000, the arm that always worked.
+  //   high   — 2.0 s at 44100. Same sound, more samples; must resample.
+  //   misread— `high`'s PCM bytes with 24000 written in the header. This is
+  //            what reading the samples "as if they were already at the target
+  //            rate" produces: 3.675 s of a 119.7 Hz tone. It is a legal WAV, so
+  //            it renders, and it is the wrong answer the refusal prevented.
+  const std::string native = WriteWav(ws.root + "/native.wav", 2, kFixtureAudioRate, 2.0);
+  const std::string high = WriteWav(ws.root + "/high.wav", 2, 44100, 2.0);
+  const std::string misread = ws.root + "/misread.wav";
+  {
+    std::string bytes = MakeWavPcm16(2, 44100, 2.0);
+    // The `fmt ` chunk's sample-rate field: "RIFF" + size + "WAVE" + "fmt " +
+    // size = 20 bytes, then wFormatTag(2) + nChannels(2) = 4 more.
+    const auto rate = static_cast<uint32_t>(kFixtureAudioRate);
+    for (int i = 0; i < 4; ++i) {
+      bytes[24 + static_cast<size_t>(i)] = static_cast<char>((rate >> (8 * i)) & 0xFF);
+    }
+    std::ofstream out(misread, std::ios::binary);
+    REQUIRE(out.good());
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    out.close();
+  }
+
+  auto render = [&](const std::string& dir, const std::string& wav) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
+    gen.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    return std::make_pair(result, ltx2->last_conditioning());
+  };
+
+  const auto [native_result, native_trace] = render("rs_native", native);
+  const auto [high_result, high_trace] = render("rs_high", high);
+  const auto [misread_result, misread_trace] = render("rs_misread", misread);
+
+  // (1) Accepted, conditioned, and not zeroed. Before this row the second call
+  //     threw, which is the red this case was written on.
+  CHECK(high_trace.completed);
+  CHECK(high_trace.audio_conditioned);
+  CHECK(high_trace.audio_tokens > 0);
+  CHECK(high_trace.audio_latent_absmax > 0.0);
+  CHECK(high_trace.audio_latent_digest != 0);
+
+  // (2) The RETURNED soundtrack stays at the FILE's rate. Upstream hands back
+  //     the original `Audio` untouched (a2vid_two_stage.py:301-303), so the
+  //     resample reaches the encoder and nothing else. A build that resampled
+  //     the take in place instead of inside the mel front-end passes every
+  //     assertion above and fails this one.
+  CHECK(high_result.sample_rate == 44100);
+  CHECK(native_result.sample_rate == kFixtureAudioRate);
+
+  // (3) The rate was READ, not ignored. `high` and `misread` carry BYTE
+  //     IDENTICAL PCM and differ only in the header's rate field, so a build
+  //     that never resampled gives them the same latent.
+  CHECK(high_trace.audio_latent_digest != misread_trace.audio_latent_digest);
+
+  // (4) THE VALUES ARE NOT GATED HERE, and that is a measurement rather than a
+  //     gap left open. The obvious video-level claim is "`high` is the same two
+  //     seconds of the same tone as `native`, so its latent must land NEARER
+  //     `native` than the mis-read take does" — and `audio_latent_absmax` cannot
+  //     carry it. Measured on this fixture, the three takes read 1.07194
+  //     (native), 1.07293 (high) and 1.07208 (misread): a 0.1% spread across
+  //     three genuinely different waveforms, because the trace's absmax is
+  //     dominated by the encoder's per-channel statistics and not by the take.
+  //     A one-scalar ordering over that population would have passed or failed
+  //     on noise either way.
+  //
+  //     So the numbers live where they can be gated: `test_ltx2_vae`'s sections
+  //     8d and 8e hold the resampler and the resampled mel against goldens the
+  //     generator produced by EXECUTING upstream, at 2.5e-07. This case proves
+  //     the request arrives, the rate is read, and the soundtrack comes back
+  //     untouched — the three things a unit test over the filter cannot.
+  INFO("audio_latent_absmax native=" << native_trace.audio_latent_absmax
+       << " high=" << high_trace.audio_latent_absmax
+       << " misread=" << misread_trace.audio_latent_absmax);
+
+  // The render still produced its artifacts; resampling is not a bypass.
+  CHECK(high_result.frame_count > 0);
+  CHECK(misread_result.frame_count > 0);
+}
+
 TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") {
   // Each of these renders a finished clip if it is accepted, which is why every
   // one is a refusal rather than a conversion. The assertions hold each message
@@ -7730,24 +7830,6 @@ TEST_CASE("ltx2 video: every audio-input mismatch is refused BY WHAT IS WRONG") 
   auto just_path = [](vllm::multimodal::VideoGenParams& g, const std::string& w) {
     g.extras[vllm::multimodal::kLtx2AudioPathExtra] = w;
   };
-
-  SUBCASE("a sample rate the mel front-end does not target") {
-    // Upstream RESAMPLES here (ops.py:40) with an arbitrary-ratio polyphase
-    // kaiser resampler this project has not ported. Reading 44.1 kHz samples at
-    // the checkpoint's rate pitches and time-shifts the conditioning while every
-    // shape checks out, so both rates go in the message.
-    //
-    // The TARGET rate asserted here is the fixture's 24000, which is neither the
-    // shipped 16000 nor `Ltx2ParseAudioEncoderConfig`'s own default. That is the
-    // point: with the fixture at 16000 this assertion passed against a parser
-    // that never read `params.sampling_rate` at all.
-    const std::string wav = WriteWav(ws.root + "/44k.wav", 2, 44100, 2.0);
-    const std::string message = refusal("rate", just_path, wav);
-    INFO("refusal: " << message);
-    CHECK(message.find("44100") != std::string::npos);
-    CHECK(message.find(std::to_string(kFixtureAudioRate)) != std::string::npos);
-    CHECK(message.find("ops.py:40") != std::string::npos);
-  }
 
   SUBCASE("a channel count the encoder does not declare") {
     // `MiniMaxH3ReadWav` would REPEAT a mono take across both channels

@@ -2817,6 +2817,212 @@ TEST_CASE("ltx2 vae: the slaney mel filterbank matches torchaudio") {
   }
 }
 
+TEST_CASE("ltx2 vae: resample_audio matches upstream at every ratio it can take") {
+  // Row LTX25-AUDIO-RESAMPLE (#2583). Generator section 8d runs upstream's OWN
+  // `AudioProcessor.resample_audio` (ops.py:36-42) at four ratios; this
+  // reproduces each from the same PRNG input.
+  //
+  // TOLERANCE. 2.5e-07 is not a hedge, it is twice the MEASURED floor. Setting
+  // it to 0.0 on this tree reds three of the four 8d arms at 5.96e-08 (Up),
+  // 5.96e-08 (Down) and 1.19209e-07 (Wide) and all four 8f tails at 1.49e-08,
+  // 4.47e-08, 2.98e-08 and 7.45e-09; Same passes at zero because it is a copy. The
+  // port mirrors torchaudio's float32 kernel arithmetic operation for operation,
+  // so the only residual is the difference between two libm `sin`/`cos` at the
+  // same f32 argument plus the convolution's reduction order. Building the filter
+  // in `double` instead would land 3.39746e-06 out — 13.6 times this bound —
+  // which is why a wider dtype FAILS this gate rather than passing it more
+  // comfortably.
+  struct Arm {
+    const char* tag;
+    const char* input;
+    int64_t orig_rate;
+    int64_t new_rate;
+    int64_t in_samples;
+    int64_t out_samples;
+    const float* golden;
+    size_t golden_size;
+  };
+  constexpr double kResampleTol = 2.5e-7;
+  const int64_t channels = vllm_test::kLtx2ResampleChannels;
+  const Arm arms[] = {
+      {"Up (o = 1, the BWE ratio)", "ltx2.resample.Up", vllm_test::kLtx2ResampleUpOrigRate,
+       vllm_test::kLtx2ResampleUpNewRate, vllm_test::kLtx2ResampleUpInSamples,
+       vllm_test::kLtx2ResampleUpOutSamples, vllm_test::kLtx2ResampleUpGolden,
+       std::size(vllm_test::kLtx2ResampleUpGolden)},
+      {"Down (n = 1)", "ltx2.resample.Down", vllm_test::kLtx2ResampleDownOrigRate,
+       vllm_test::kLtx2ResampleDownNewRate, vllm_test::kLtx2ResampleDownInSamples,
+       vllm_test::kLtx2ResampleDownOutSamples, vllm_test::kLtx2ResampleDownGolden,
+       std::size(vllm_test::kLtx2ResampleDownGolden)},
+      {"Wide (o = 441, width 17)", "ltx2.resample.Wide", vllm_test::kLtx2ResampleWideOrigRate,
+       vllm_test::kLtx2ResampleWideNewRate, vllm_test::kLtx2ResampleWideInSamples,
+       vllm_test::kLtx2ResampleWideOutSamples, vllm_test::kLtx2ResampleWideGolden,
+       std::size(vllm_test::kLtx2ResampleWideGolden)},
+      {"Same (the early return)", "ltx2.resample.Same", vllm_test::kLtx2ResampleSameOrigRate,
+       vllm_test::kLtx2ResampleSameNewRate, vllm_test::kLtx2ResampleSameInSamples,
+       vllm_test::kLtx2ResampleSameOutSamples, vllm_test::kLtx2ResampleSameGolden,
+       std::size(vllm_test::kLtx2ResampleSameGolden)},
+  };
+
+  for (const Arm& arm : arms) {
+    // `std::string`, not the bare pointer: doctest stringifies a `const char*`
+    // as a BOOL, so both `CAPTURE(arm.tag)` and `INFO("arm: " << arm.tag)` print
+    // `arm: 1` and the diagnostic cannot name which ratio broke.
+    INFO("arm: " << std::string(arm.tag));
+    const std::vector<float> in = Ltx2Input(arm.input, channels * arm.in_samples, 0.5);
+    int64_t produced = 0;
+    const std::vector<float> got = vllm::Ltx2ResampleWaveform(
+        in, channels, arm.in_samples, arm.orig_rate, arm.new_rate, &produced);
+    // `ceil` of the f32-narrowed `new * length / orig` (functional.py:1427; the
+    // narrowing is what section 8f below gates). Asserted before the
+    // values because a resampler that produced the right SAMPLES at the wrong
+    // LENGTH would be compared against a shifted golden.
+    CHECK(produced == arm.out_samples);
+    REQUIRE(got.size() == arm.golden_size);
+    const double err = MaxAbsDiff(got, arm.golden, arm.golden_size);
+    INFO("resample max|diff| = " << err);
+    CHECK(err <= kResampleTol);
+    // A LOWER bound as well. An all-zero output, or one that dropped every
+    // channel but the first, matches nothing here but would satisfy a
+    // tolerance against a golden regenerated from the same defect.
+    double absmax = 0.0;
+    for (float v : got) absmax = std::max(absmax, std::abs(static_cast<double>(v)));
+    CHECK(absmax > 0.0);
+    double second_channel_absmax = 0.0;
+    for (int64_t i = produced; i < 2 * produced; ++i) {
+      second_channel_absmax =
+          std::max(second_channel_absmax, std::abs(static_cast<double>(got[static_cast<size_t>(i)])));
+    }
+    CHECK(second_channel_absmax > 0.0);
+  }
+
+  // Section 8f — THE TRUNCATION BOUNDARY, which no arm above can reach.
+  //
+  // `_apply_sinc_resample_kernel` ends on TWO lines (functional.py:1427-1428):
+  //
+  //     target_length = torch.ceil(torch.as_tensor(new_freq * length / orig_freq)).long()
+  //     resampled = resampled[..., :target_length]
+  //
+  // and BOTH of them decide the output length.
+  //
+  // `torch.as_tensor` of a PYTHON FLOAT takes `torch.get_default_dtype()` —
+  // float32 — so the f64 quotient is rounded to f32 BEFORE the ceil, and the
+  // narrowing moves in both directions: DOWN onto an integer the exact quotient
+  // sits just above, giving one sample fewer than the exact integer ceil
+  // `(next * samples + orig - 1) / orig` this port first computed; and UP past
+  // that integer, giving one MORE.
+  //
+  // The second line is a Python slice, so it CLAMPS. `resampled` carries exactly
+  // `(samples / orig + 1) * next` columns, and the slack between that and the
+  // exact ceil is `next - ceil(next * (samples % orig) / orig)`, whose minimum
+  // over the residues is `next / orig` in INTEGER division — ZERO for every
+  // downsampling ratio. So on
+  // any ratio with `next < orig` there are lengths where an upward narrowing asks
+  // for one column more than the convolution produced, and upstream returns what
+  // it has. A port that trusts `target_length` alone emits a trailing sample
+  // upstream never computed.
+  //
+  // The four arms above top out at 218 output samples and cannot see any of it.
+  // At 44100 -> 16000 the first downward-divergent length is 180697 (4.097 s) and
+  // 48102 of the first 60 s worth of lengths diverge; at 22050 -> 16000 it starts
+  // at 90569. One output sample either way moves the last STFT windows and, where
+  // `samples % hop == 0`, the mel FRAME COUNT — the conditioning shape.
+  //
+  // `CeilBelow` and `CeilAbove` bracket 180697 and are lengths where the exact
+  // ceil is RIGHT, so an arm that always subtracted one would fail them.
+  // `CeilOver` and `CeilClamp` are lengths where the exact ceil is one too SMALL,
+  // so an arm that clamped to it instead would fail them. `CeilClamp` is 8d's own
+  // 48000 -> 16000 ratio at a length 8d cannot reach: `target_length` is 33554436
+  // there and the convolution produced 33554435, so it is the only arm where the
+  // two upstream lines disagree and the SLICE decides.
+  struct CeilArm {
+    const char* tag;
+    const char* input;
+    int64_t orig_rate;
+    int64_t new_rate;
+    int64_t in_samples;
+    int64_t out_samples;
+    const float* tail;
+    size_t tail_size;
+  };
+  const CeilArm ceil_arms[] = {
+      {"CeilBelow (exact ceil agrees)", "ltx2.resample.CeilBelow",
+       vllm_test::kLtx2ResampleCeilBelowOrigRate, vllm_test::kLtx2ResampleCeilBelowNewRate,
+       vllm_test::kLtx2ResampleCeilBelowInSamples, vllm_test::kLtx2ResampleCeilBelowOutSamples,
+       vllm_test::kLtx2ResampleCeilBelowTailGolden,
+       std::size(vllm_test::kLtx2ResampleCeilBelowTailGolden)},
+      {"CeilAt (the f32 narrowing bites)", "ltx2.resample.CeilAt",
+       vllm_test::kLtx2ResampleCeilAtOrigRate, vllm_test::kLtx2ResampleCeilAtNewRate,
+       vllm_test::kLtx2ResampleCeilAtInSamples, vllm_test::kLtx2ResampleCeilAtOutSamples,
+       vllm_test::kLtx2ResampleCeilAtTailGolden,
+       std::size(vllm_test::kLtx2ResampleCeilAtTailGolden)},
+      {"CeilAbove (exact ceil agrees)", "ltx2.resample.CeilAbove",
+       vllm_test::kLtx2ResampleCeilAboveOrigRate, vllm_test::kLtx2ResampleCeilAboveNewRate,
+       vllm_test::kLtx2ResampleCeilAboveInSamples, vllm_test::kLtx2ResampleCeilAboveOutSamples,
+       vllm_test::kLtx2ResampleCeilAboveTailGolden,
+       std::size(vllm_test::kLtx2ResampleCeilAboveTailGolden)},
+      {"CeilAlt (22050 -> 16000, the same effect at another ratio)",
+       "ltx2.resample.CeilAlt", vllm_test::kLtx2ResampleCeilAltOrigRate,
+       vllm_test::kLtx2ResampleCeilAltNewRate, vllm_test::kLtx2ResampleCeilAltInSamples,
+       vllm_test::kLtx2ResampleCeilAltOutSamples, vllm_test::kLtx2ResampleCeilAltTailGolden,
+       std::size(vllm_test::kLtx2ResampleCeilAltTailGolden)},
+      {"CeilOver (the narrowing rounds UP, and the columns hold it)",
+       "ltx2.resample.CeilOver", vllm_test::kLtx2ResampleCeilOverOrigRate,
+       vllm_test::kLtx2ResampleCeilOverNewRate, vllm_test::kLtx2ResampleCeilOverInSamples,
+       vllm_test::kLtx2ResampleCeilOverOutSamples, vllm_test::kLtx2ResampleCeilOverTailGolden,
+       std::size(vllm_test::kLtx2ResampleCeilOverTailGolden)},
+      {"CeilClamp (the narrowing rounds UP past the last column, so :1428 clamps)",
+       "ltx2.resample.CeilClamp", vllm_test::kLtx2ResampleCeilClampOrigRate,
+       vllm_test::kLtx2ResampleCeilClampNewRate, vllm_test::kLtx2ResampleCeilClampInSamples,
+       vllm_test::kLtx2ResampleCeilClampOutSamples, vllm_test::kLtx2ResampleCeilClampTailGolden,
+       std::size(vllm_test::kLtx2ResampleCeilClampTailGolden)},
+  };
+
+  for (const CeilArm& arm : ceil_arms) {
+    INFO("ceil arm: " << std::string(arm.tag));
+    REQUIRE(arm.tail_size == static_cast<size_t>(vllm_test::kLtx2ResampleCeilTail));
+    const std::vector<float> in = Ltx2Input(arm.input, arm.in_samples, 0.5);
+    int64_t produced = 0;
+    const std::vector<float> got = vllm::Ltx2ResampleWaveform(in, 1, arm.in_samples, arm.orig_rate,
+                                                              arm.new_rate, &produced);
+    INFO("produced = " << produced << ", upstream = " << arm.out_samples);
+    CHECK(produced == arm.out_samples);
+    REQUIRE(got.size() == static_cast<size_t>(produced));
+    REQUIRE(produced >= static_cast<int64_t>(arm.tail_size));
+    // The tail as well as the count. A port that produced upstream's LENGTH from
+    // a signal shifted by a sample would satisfy the count on its own; these are
+    // the last `kLtx2ResampleCeilTail` samples upstream actually emitted.
+    const std::vector<float> tail(got.end() - static_cast<std::ptrdiff_t>(arm.tail_size),
+                                  got.end());
+    const double tail_err = MaxAbsDiff(tail, arm.tail, arm.tail_size);
+    INFO("tail max|diff| = " << tail_err);
+    CHECK(tail_err <= kResampleTol);
+    double tail_absmax = 0.0;
+    for (float v : tail) tail_absmax = std::max(tail_absmax, std::abs(static_cast<double>(v)));
+    CHECK(tail_absmax > 0.0);
+  }
+
+  // The equal-rate arm returns the INPUT, byte for byte. Upstream returns the
+  // same `Audio` object (ops.py:38-39) and never enters the filter; a port that
+  // ran a unit-ratio filter anyway would be wrong by its passband ripple, which
+  // is under the tolerance above and would pass every check in the loop.
+  const std::vector<float> same_in =
+      Ltx2Input("ltx2.resample.Same", channels * vllm_test::kLtx2ResampleSameInSamples, 0.5);
+  const std::vector<float> same_out = vllm::Ltx2ResampleWaveform(
+      same_in, channels, vllm_test::kLtx2ResampleSameInSamples,
+      vllm_test::kLtx2ResampleSameOrigRate, vllm_test::kLtx2ResampleSameNewRate, nullptr);
+  CHECK(same_out == same_in);
+
+  // Upstream's own refusal, at the same boundary (functional.py:1470-1471).
+  bool threw = false;
+  try {
+    vllm::Ltx2ResampleWaveform(same_in, channels, vllm_test::kLtx2ResampleSameInSamples, 16000, 0,
+                               nullptr);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  CHECK(threw);
+}
+
 TEST_CASE("ltx2 vae: waveform_to_mel matches upstream AudioProcessor") {
   vllm::Ltx2AudioProcessorConfig cfg;
   cfg.target_sample_rate = vllm_test::kLtx2MelRate;
@@ -2838,21 +3044,37 @@ TEST_CASE("ltx2 vae: waveform_to_mel matches upstream AudioProcessor") {
   INFO("waveform_to_mel max|diff| = " << err);
   CHECK(err <= kLtx2GoldenTol);
 
-  // A rate that does not match is REFUSED, because upstream would RESAMPLE and
-  // this project does not carry that resampler. Treating the samples as if they
-  // were already at the target rate conditions on audio that is pitched wrong.
-  bool threw = false;
-  std::string message;
-  try {
-    vllm::Ltx2WaveformToLogMel(cfg, wave, channels, samples, 44100, nullptr);
-  } catch (const std::exception& error) {
-    threw = true;
-    message = error.what();
-  }
-  REQUIRE(threw);
-  INFO("refusal message: " << message);
-  CHECK(message.find("resample") != std::string::npos);
-  CHECK(message.find("44100") != std::string::npos);
+  // A rate that does NOT match is RESAMPLED, which is what upstream does
+  // (`waveform_to_mel` calls `resample_audio` first, ops.py:49) and what this
+  // project refused to do until row LTX25-AUDIO-RESAMPLE (#2583).
+  //
+  // Section 8e's golden is the whole claim: the source is 600 samples at 44100,
+  // the processor targets 16000, and the mel that comes back is over the
+  // RESAMPLED 218 samples. A build that resampled after the transform, or that
+  // never resampled at all, produces a different frame count before it produces
+  // a different value, so the count is asserted first.
+  int64_t resampled_frames = 0;
+  const int64_t source_samples = vllm_test::kLtx2MelSourceSamples;
+  const std::vector<float> source =
+      Ltx2Input("ltx2.mel.resampled.input", channels * source_samples, 0.5);
+  const std::vector<float> resampled_mel = vllm::Ltx2WaveformToLogMel(
+      cfg, source, channels, source_samples, vllm_test::kLtx2MelSourceRate, &resampled_frames);
+  CHECK(resampled_frames == vllm_test::kLtx2MelResampledFrames);
+  REQUIRE(static_cast<int64_t>(resampled_mel.size()) ==
+          static_cast<int64_t>(std::size(vllm_test::kLtx2MelResampledGolden)));
+  const double resampled_err = MaxAbsDiff(resampled_mel, vllm_test::kLtx2MelResampledGolden,
+                                          std::size(vllm_test::kLtx2MelResampledGolden));
+  INFO("resampled waveform_to_mel max|diff| = " << resampled_err);
+  CHECK(resampled_err <= kLtx2GoldenTol);
+
+  // And it is NOT the mel of the same samples read as if they were already at
+  // the target rate — the exact wrong answer the old refusal existed to
+  // prevent, and the one a tolerance against the golden alone cannot see if the
+  // golden were ever regenerated from the wrong side.
+  const std::vector<float> misread =
+      vllm::Ltx2WaveformToLogMel(cfg, source, channels, source_samples,
+                                 cfg.target_sample_rate, nullptr);
+  CHECK(misread.size() != resampled_mel.size());
 }
 
 TEST_CASE("ltx2 vae: SILENCE saturates the mel log clamp, and the clamp is pinned") {

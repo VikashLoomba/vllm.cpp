@@ -79,12 +79,25 @@ because wave 1 recorded three drifts of the same three numbers in
 `ltx2_video.cpp` inside one pull request:
 
 ```sh
-grep -c 'RunConnector(' src/vllm/multimodal/ltx2_video.cpp        # 5: 2 definitions + 3 calls
-grep -c 'RunConnectorFromFile(' src/vllm/multimodal/ltx2_video.cpp # 4: 1 definition + 3 calls
+grep -c 'RunConnector(' src/vllm/multimodal/ltx2_video.cpp         # 6
+grep -c 'RunConnectorFromFile(' src/vllm/multimodal/ltx2_video.cpp  # 4
 ```
 
-Both are render-path functions in `Ltx2VideoEngine`; the prompted render reaches
-`RunConnector` and the prompt-embeds render reaches `RunConnectorFromFile`.
+**Those two numbers were WRITTEN before they were run, and the first one was
+wrong.** This section first said "5: 2 definitions + 3 calls" for `RunConnector`
+on no measurement at all, which is the same error as citing a line number nobody
+re-read. Run at this head, the decomposition is: `RunConnector` has **two
+overloads**, one taking materialized weights and one taking a `ConnectorWeightSet`;
+the second forwards to the first, and `RunConnectorFromFile` forwards to it too.
+So of the six, two are definitions, two are those internal forwards, and **two are
+render-path calls**. `RunConnectorFromFile` is 1 definition and 3 calls, which is
+what it said.
+
+Both are `Ltx2VideoEngine` functions on the render path: the prompted render
+reaches `RunConnector` through the `ConnectorWeightSet` overload, and the
+prompt-embeds render reaches `RunConnectorFromFile`. Every one of the four
+materialization sites now asks for `kBF16`, which
+`grep -c 'Ltx2LoadConnectorWeights(.*kBF16'` reports as 4.
 
 **Wave 1 already built this row's instrument and measured its red.**
 `Ltx2ConditioningTrace` (`multimodal/ltx2_video.h`) carries

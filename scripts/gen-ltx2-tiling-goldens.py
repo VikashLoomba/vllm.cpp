@@ -747,7 +747,10 @@ TILING_BF16_LATENT = (1, 6, 6, 3, 3)
 # THE RAMP LENGTHS ARE PART OF THE FIXTURE, and they are chosen rather than
 # inherited. `Ltx2TrapezoidalMask1d` builds its ramps with a double linspace and
 # narrows once; `torch.linspace` on a float32 tensor is NOT correctly rounded and
-# disagrees with that for lengths 4, 7 and 13 (tiling.py:39-47, #2816). At f32
+# disagrees with that for 21 of the 31 lengths in n = 2..32, including 4, 7, 8 and 13
+# (tiling.py:39-47, #2816, which carries the swept set — do NOT pick a geometry
+# from a short list of three, which is what an earlier form of this comment
+# offered). At f32
 # the difference is a relative 6e-8 and every case in the suite passes; at bf16 it
 # is a whole word, and a 6-frame / 2-overlap temporal tile produces exactly an
 # n = 4 ramp and put 2 of 3888 blended outputs one bf16 ulp from upstream. An

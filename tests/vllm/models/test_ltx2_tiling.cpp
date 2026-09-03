@@ -277,8 +277,10 @@ vllm::Ltx2TileSizeConfig ControlTiling() {
 //
 // THE RAMP LENGTHS ARE CHOSEN, NOT INHERITED. `Ltx2TrapezoidalMask1d` builds its
 // ramps with a double linspace and narrows once; `torch.linspace` on a float32
-// tensor is not correctly rounded and disagrees with that for lengths 4, 7 and 13
-// (tiling.py:39-47, #2816). At f32 the difference is a relative 6e-8 and the
+// tensor is not correctly rounded and disagrees with that for 21 of the 31 lengths in n = 2..32, including 4, 7, 8 and 13
+// (tiling.py:39-47, #2816, which carries the swept set — do NOT pick a geometry
+// from a short list of three, which is what an earlier form of this comment
+// offered). At f32 the difference is a relative 6e-8 and the
 // suite's 5e-6 band hides it; at bf16 it is a whole word, and a 6-frame /
 // 2-overlap temporal tile — which produces exactly an n = 4 ramp — put 2 of 3888
 // blended outputs one bf16 ulp from upstream. 8/4 does not reach a disagreeing

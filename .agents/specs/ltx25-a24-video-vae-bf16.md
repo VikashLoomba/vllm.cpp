@@ -824,10 +824,12 @@ are both about records a number agreed with and a tree did not.
   blend ramps with a double linspace and narrows once; torch's float32 CPU kernel
   computes the head as `start + step*i` and the tail as `end - step*(n-1-i)`, with
   the boundary set by the vectorization width, and the two disagree in the last
-  f32 bit for lengths 4, 7 and 13. At f32 the relative error is 6e-8 against a
-  5e-6 band and nothing sees it; at bf16 it is a whole word, and a 6-frame /
-  2-overlap temporal tile put 2 of 3888 blended outputs one bf16 ulp from
-  upstream. §8's fixture uses an 8/4 temporal tile, which does not reach a
+  f32 bit for 21 of the 31 lengths in n = 2..32, including 4, 7, 8 and 13. #2816
+  carries the swept set; an earlier form of this bullet named only 4, 7 and 13,
+  which was a spot check read as a measurement. At f32 the relative error is 6e-8
+  against a 5e-6 band and nothing sees it; at bf16 it is a whole word, and a
+  6-frame / 2-overlap temporal tile put 2 of 3888 blended outputs one bf16 ulp
+  from upstream. §8's fixture uses an 8/4 temporal tile, which does not reach a
   disagreeing length, so the buffer gate measures the buffer. Deciding between
   mirroring torch's vectorization boundary and accepting the divergence with the
   mask case tightened from a band to bit-exactness needs its own row.
@@ -1019,6 +1021,16 @@ than "reaches the pixels".
   registration removed and nothing else changed it throws "for which no platform
   is registered" (`:177`). All three of this row's dtype refusals are now gated in
   "ltx2 vae: the dtype refusals this arm adds are REACHED, not merely written".
+* **#2816's disagreement set was a spot check presented as a measurement.** It
+  named n = 4, 7 and 13. Swept over n = 2..32 against the port's own `Linspace`
+  (`ltx2_tiling.cpp:26-40`), `torch.linspace` disagrees at n = 4, 7, 8, 12, 13,
+  14, 15, 16 and 20 through 32 -- 21 of 31 -- and agrees at 2, 3, 5, 6, 9, 10, 11,
+  17, 18 and 19; `linspace(1, 0, n)` disagrees on the same set. The polarity is
+  unchanged and was re-derived: the port's double-narrowed value is the
+  correctly-rounded f32 at every n in the sweep, and the n = 4 pair #2816 quotes
+  reproduces exactly. The short list was dangerous in one specific way -- an
+  author avoiding "4, 7 and 13" would pick a ramp of 6, whose linspace has 8
+  steps, and hit it. The issue now carries the swept set.
 
 ### Defaults, and why they have their values
 

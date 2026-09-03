@@ -1786,7 +1786,17 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.feature_cfg = Ltx2SelectTextFeatureVariant(
         dit_config.contains("transformer") ? dit_config.at("transformer") : dit_config,
         te.gemma_hidden_size, te.gemma_num_hidden_layers);
-    im.caption_projections = Ltx2WidenTextProjectionsToF32(te);
+    // UPSTREAM'S OWN DTYPE, and the arm the whole tower runs in. `distilled.py:109`
+    // resolves one pipeline dtype, `torch.bfloat16`, and hands it to
+    // `PromptEncoder` at `:111-113`; every parameter under it inherits it. This
+    // call keeps the checkpoint's 16-bit values instead of doubling them, which is
+    // ~2.3 GB rather than ~4.6 GB for the two projections and halves every
+    // full-width activation buffer the extractor materializes. It is also what
+    // SELECTS the arm — `Ltx2EncodePromptToConditioning` reads the dtype off the
+    // weights rather than taking a parameter, exactly as upstream reads it off the
+    // module. Swapping this line back to `Ltx2WidenTextProjectionsToF32` puts the
+    // render on the f32 parity arm, which is the mutation the row's spec names.
+    im.caption_projections = Ltx2TextProjectionsAsBf16(te);
 
     // 5. THE TWO WIDTHS MUST BE THE DiT's. `Ltx2SelectTextFeatureVariant` reads
     //    them from the SAME transformer config the DiT's cross-attention

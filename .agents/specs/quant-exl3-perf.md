@@ -202,8 +202,10 @@ before concluding anything, because the endpoint serves cached content.
 
 The job is pinned to tarball
 `sha256 c133a4cbba670dbef6c6daebf4c0e130824519f317af221eaff7ebb1e9e9c5dd`
-(commit `665167c4a`) and aborts rather than build anything else. Every compiled
-and tested path in it is byte-identical to this row's head.
+(commit `665167c4a`) and aborts rather than build anything else. The five files
+this row's measurements depend on are byte-identical between that commit and the
+merged head; other paths have moved under it since (see "Which tree the device
+evidence is measured on").
 
 The harness itself is `/workspace/exl3perf-2570/job.sh`,
 `sha256 81e2de48268fd9e69cdc7144fcd0162149c1ca05bf6dff3d081d3afa195268ef` —
@@ -369,9 +371,26 @@ than the mode test does, and neither reaches a device call. Both fall through to
 
 The lease job is pinned to the source tarball `sha256
 c133a4cbba670dbef6c6daebf4c0e130824519f317af221eaff7ebb1e9e9c5dd`, which is
-commit `665167c4a` of `row/QUANT-EXL3-PERF`. Every compiled and tested path --
-`src/`, `include/`, `tests/vt/`, `cmake/`, `CMakeLists.txt` -- is byte-identical
-between that commit and this row's head; only `docs/USAGE.md` moved afterwards.
+commit `665167c4a` of `row/QUANT-EXL3-PERF`.
+
+**THIS SENTENCE USED TO CLAIM MORE, AND A MERGE FALSIFIED IT.** It read "every
+compiled and tested path is byte-identical between that commit and this row's
+head; only `docs/USAGE.md` moved afterwards". That was true when written and
+became false when `origin/main` was merged into this branch before landing: 25
+paths under `src/`, `include/`, `tests/` and `CMakeLists.txt` differ between
+`665167c4a` and the merged head, none of them this row's. The gates stayed green
+throughout, which is exactly why the claim had to be re-checked rather than
+assumed -- a merge can leave the code correct and the PROSE wrong, and only the
+prose is load-bearing for an evidence table.
+
+What is true, and what the evidence actually rests on: **the five files this
+row's measurements depend on are byte-identical** between both pins and the
+merged head --- `src/vt/cuda/cuda_exl3.cu`, `src/vt/exl3_policy.cpp`,
+`include/vt/ops.h`, `tests/vt/test_exl3_gemv.cpp` and
+`tests/vt/exl3_fixture.h`. So the device numbers below still name this tree's
+kernel, its envelope and its fixture. Anything measured on the pinned trees is a
+statement about THOSE trees; re-derive it after any change to those five
+files.
 
 The DEVICE NUMERIC GATE runs on `thor:gpu0` from a `git bundle` pinned to
 `sha256 8156c0dbe30092ac267ab1749d2386c37ea832d7a2ceed5f3db6d29504d9ebf7`,

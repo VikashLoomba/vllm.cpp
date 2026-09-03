@@ -9,6 +9,11 @@ gap **A18**, itself issue
 Base read: `origin/main` at **`2850314e3`**. The dispatch named `be12dc71a`;
 `main` had moved before the first anchor below was taken, and every anchor in
 this document was re-derived at `2850314e3` with `git show origin/main:<path>`.
+The review repairs applied afterwards touch four anchors —
+`ltx25-a2v-audio-input.md:24` and `:86` (§3.1),
+`ltx25-completion-scope.md:545` (§0) and
+`ltx2_conditioning.h:61-63` (§2.1) — and each of those four was re-read at
+`origin/main` **`e24805924`**, which is where they hold.
 
 Upstream pins:
 
@@ -39,8 +44,14 @@ contradict that sizing.
 **1. Upstream has no delivery from a standalone reference-audio file, and the
 refusal's own second anchor points at a different mechanism.** At `fd4ded7f`,
 `git grep -n "AudioConditionByReferenceLatent"` returns nine lines in five
-files. Eight are the class definition, two `__init__` re-exports and one
-documentation line. **Exactly one site constructs it**, and it is
+files, and the nine enumerate as **4 + 1 + 1 + 3**: four `__init__` re-export
+lines across two files (`ltx-core .../conditioning/__init__.py:6` and `:16`,
+`.../conditioning/types/__init__.py:8` and `:12`); one class definition
+(`.../conditioning/types/reference_audio_cond.py:12`); one documentation line
+(`packages/ltx-pipelines/CLAUDE.md:85`); and three inside `dubit.py` alone — its
+own import (`:13`), the return annotation of `build_audio_ref_conditioning`
+(`:266`) and the constructor call (`:272`).
+**Exactly one site constructs it**, and it is
 `packages/ltx-pipelines/src/ltx_pipelines/dubit.py:272`, inside
 `DubItPipeline` — gap **A3**, which this tree does not ship
 (`include/vllm/model_executor/models/ltx2_pipeline.h:876`: "`DubItPipeline`,
@@ -98,8 +109,15 @@ splitting it:
 * Implement it against `gen.ref_audio_path` on the distilled phase loop, and the
   engine grows a conditioning mode upstream does not define. AGENTS.md's rule is
   "mirror vLLM"; the completion scope's own class-A test is "does upstream
-  construct this?". This construction fails that test, which makes it class **B**
-  (a correct mirror of an absent upstream feature) or an invention, not class A.
+  construct this?". This construction fails that test, and the scope document
+  already carries the class that failure names:
+  `.agents/specs/ltx25-completion-scope.md:545`, "**Class E — the one gap that
+  fails class A's own test**", opened for A12 on precisely this ground. Under
+  (b) or (c) the reclassification target is therefore **E**, not class **B** —
+  B is for a correct mirror of an absent upstream feature, and a delivery
+  upstream never performs is not a mirror of anything. Under (a) the question is
+  moot: the obligation moves into A3, which carries its own class, and A18 stops
+  being a classified gap.
 
 **This is the A8 failure again.** A8 was sized `S` because a second consumer was
 never counted ([#2584](https://github.com/mudler/vllm.cpp/issues/2584)). A18 is
@@ -168,7 +186,7 @@ All at `Lightricks/LTX-2 @ fd4ded7f`. Paths are relative to the repository root.
 | `:12-22` | `class AudioConditionByReferenceLatent`. Docstring: patchified reference latent `[B, T_ref, C]`, positions `[B, 1, T_ref, 2]`, "1.0 keeps reference clean". |
 | `:24-32` | Constructor. `strength: float = 1.0` is the **default**; `positions` is cast to `torch.float32` on the way in. |
 | `:36-41` | `denoise_mask` for the appended block is `1.0 - strength`, filled, shape `(*tokens.shape[:2], 1)`. |
-| `:43-51` | `update_attention_mask(attention_mask=None, num_noisy_tokens=patchifier.get_token_count(target_shape), ...)`. With no incoming mask this resolves to `None`. |
+| `:43-51` | `update_attention_mask(attention_mask=None, num_noisy_tokens=patchifier.get_token_count(target_shape), ...)`. With no incoming mask **and no mask already on the state** this resolves to `None` (`mask_utils.py:141-143`); with an existing mask on the state it instead pads the new tokens with ones and rebuilds the 2-D mask (`mask_utils.py:144-156`). This tree carries the same two-part condition at `include/vllm/model_executor/models/ltx2_conditioning.h:61-63`. |
 | `:54-57` | Concatenation order: `latent` gets `zeros_like(tokens)`, `clean_latent` gets `tokens`, `positions` concatenate on `dim=2`. The reference tokens go at the **end**. |
 | `:59-61` | `keyframes_mask=extend_keyframes_mask(latent_state, tokens.shape[1], marked=False)` — called unconditionally, "to keep the invariant that every appending conditioning item extends the per-token fields". |
 | `:62-64` | `generated_keyframe_layout`, `generated_keyframes` and `frozen` pass through unchanged. |
@@ -229,10 +247,13 @@ body runs `:2935-2946` and the block closes at `:2947`. Both the guard string
 and the unpatchify line cited in §3.4 occur **exactly once** in the file
 (`grep -c` returns 1 for each), so the anchors are unique, not merely present.
 
-The completion scope cites `ltx2_video.cpp:2754-2766` and
-`.agents/specs/ltx25-a2v-audio-input.md:22-23` cites `ltx2_video.cpp:1404`.
-Both are stale by 180 and 1530 lines. The scope document also cites
-`ltx2_pipeline.h:837` for the DubIt comment; it is at `:876`. Anchors in this
+The completion scope cites `ltx2_video.cpp:2754-2766`, and
+`.agents/specs/ltx25-a2v-audio-input.md` cites `ltx2_video.cpp:1404` at its
+`:24` and again at its `:86`. That anchor is **not unique in that file**
+(`grep -c` returns 2 at `origin/main`), so both of its lines are named here
+rather than one. Both citations are stale, by 180 and 1530 lines. The scope
+document also cites `ltx2_pipeline.h:837` for the DubIt comment; it is at
+`:876`. Anchors in this
 tree drift within weeks, which is why §7 gates on a symbol grep rather than a
 line number.
 
@@ -380,7 +401,12 @@ incomplete in another, and both survive whichever of (a), (b) or (c) is chosen.
 
 * It names `ltx-pipelines/utils/helpers.py:264-269` as "what it needs". That
   function is `audio_latent_from_file`, whose only caller is retake's initial
-  latent (§2.4). The message sends a reader who checks to the wrong mechanism.
+  latent (§2.4). The anchor is not wrong so much as **one wrapper away from the
+  function it names**: `helpers.py:267` does call `encode_audio`, but what
+  `audio_latent_from_file` returns is retake's *initial* audio latent, not a
+  conditioning item. Point the refusal at `encode_audio` itself,
+  `ltx-core .../model/audio_vae/audio_vae.py:249-274` (§2.4), so a reader who
+  follows the anchor lands on the encode the message is actually about.
 * It says "nothing in this phase loop constructs one from a request" and stops
   there, which reads as a wiring gap. What it must say is that **upstream
   constructs this item at exactly one site, `dubit.py:272`, inside a pipeline
@@ -539,7 +565,7 @@ specified, not executed — see §10.
 | The trainer uses non-negative positions | `validation_runner.py:759-784` | yes |
 | The audio stream has no trim | `ltx2_video.cpp:3753`, `:5045`, `:5071-5072`, `:5090` | yes |
 | `StreamState` != `Ltx2LatentState` | `ltx2_video.cpp:181-192` against `ltx2_conditioning.h:94+` | yes |
-| No open issue tracks A18 | `gh issue list --state open --search "reference audio"` (2 hits, neither LTX) ; `--search "A18 in:body"` (1 hit, #2583, closed) | yes |
+| No open issue tracks A18 | `gh issue list --state open --search "reference audio"` (2 hits, neither LTX) ; `gh issue list --state all --search "A18 in:body"` (1 hit, #2583, closed — `--state all` because `--state open` excludes it) | yes |
 | The a2v spec already records the op as test-only | `.agents/specs/ltx25-a2v-audio-input.md` `## Owed` | yes |
 | The scope doc's `ltx2_video.cpp:2754-2766` is stale | it is `:2934-2947` | yes |
 | The scope doc's `ltx2_pipeline.h:837` is stale | the DubIt comment is at `:876` | yes |
@@ -579,9 +605,13 @@ specified, not executed — see §10.
   opened with this spec and carrying the same derivation. It stays OPEN, because
   what it asks for is a decision and not a fix. Before it existed, searched
   read-only:
-  `gh issue list --state open --search "reference audio"` returns #2613 and #387,
-  neither LTX; `--search "A18 in:body"` returns only #2583 (A19, closed);
-  `--search "dubit OR DubIt"` returns #2526 and #2583, both closed. An issue is
+  `gh issue list --state open --search "reference audio"` returned #2613 and
+  #387, neither LTX. The other two searches report CLOSED issues, so they were
+  run with `--state all`, which is the flag recorded here because `--state open`
+  excludes exactly what they found: `--state all --search "A18 in:body"`
+  returned only #2583 (A19, closed), and `--state all --search
+  "dubit OR DubIt"` returned #2526 and #2583, both closed. Each of the three now
+  also returns #2634 itself, which did not exist when they were run. An issue is
   required before work starts (AGENTS.md, "Every change starts from an issue");
   the spec-drafting dispatch was forbidden writes, so the operator opened it
   alongside this landing.

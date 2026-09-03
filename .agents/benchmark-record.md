@@ -29397,3 +29397,116 @@ attribution narrows but does not close.
 # model snapshots under $HOME/.cache/huggingface/hub (Qwen3-0.6B,
 # Qwen3-4B, Mistral-7B-v0.3); raw leg logs hf-{mist,}t{1,2}{A,B,C}.{out,err}
 ```
+
+## SPEC-DFLASH2 — the ratio moves to **0.9280x** on the graph-pin tree, and TWO runs on two trees agree the 0.8017x record was stale (2026-09-02, `dgx:gpu0`, gate tree `42b30950837503d352ad0f8c50588b15335a715c`, [#2630](https://github.com/mudler/vllm.cpp/issues/2630))
+
+**The O26 entry above is not wrong; it is old.** It measured `d25730fbb` on
+2026-08-22. The gate has run twice since, on two later trees, and neither result
+was folded in. This entry folds them. Every figure is re-derivable from
+`/mnt/nas_share/rc/dflash2-staged/out-d1/`, which is READ-ONLY evidence. Every
+path below is relative to that directory, and the command that produces each
+figure is beside it.
+
+| axis | ours | vLLM | ratio | verdict |
+|---|---:|---:|---:|---|
+| `output_throughput_tok_s` | **14.951** | **16.11145768349725** | **0.9279731414565989** | `RECORDED, no floor declared` |
+| `peak_device_bytes` | null | null | null | `NOT MEASURED` |
+| `tpot_ms` | null | null | null | `NOT MEASURED` |
+| `ttft_ms` | null | null | null | `NOT MEASURED` |
+
+```sh
+python3 -c "import json;d=json.load(open('evidence/evidence-d1/dflash2-speed.json'));[print(a['axis'],a['ours'],a['vllm'],a['ratio'],a['verdict']) for a in d['axes']]"
+```
+
+**`RECORDED, no floor declared` IS STILL NOT A PASS**, for the same reason O26
+gives: no bar was ever declared for this axis on this row, so the gate had
+nothing to compare 0.9280 against and said so in the verdict field rather than
+inventing one. `floor` is `null` in the artifact. Three of the four axes remain
+`NOT MEASURED` for O26's unchanged reasons. **A ratio below 1.0 is a gap, and
+0.9280 is a gap**; the movement from 0.8017 is progress on that gap, not its
+closure.
+
+**Two runs, two trees, and they bracket each other.** The same `out-d1`
+directory holds an earlier gate on tree `85f65b0e8b6c`
+(`evidence/dflash2-speed.json`, 2026-08-30) reading **15.029 / 16.36343357698801
+= 0.9185**, and the run recorded here on `42b309508375`
+(`evidence/evidence-d1/dflash2-speed.json`, 2026-09-02) reading **0.9280**. Two
+independently built trees measured eight days apart land 0.0095 apart, which is
+what makes the 0.12 step away from 0.8017 a property of the trees rather than of
+one lucky lease. **Read the nested path carefully**: the two artifacts have the
+same basename, the outer one is the older tree, and taking the outer file for
+the newer run is the error this paragraph exists to prevent.
+
+```sh
+for f in evidence/dflash2-speed.json evidence/evidence-d1/dflash2-speed.json; do
+  python3 -c "
+import json,sys;d=json.load(open('$f'));a=[x for x in d['axes'] if x['axis']=='output_throughput_tok_s'][0]
+print('$f',d['preconditions']['build']['ours']['revision'][:12],a['ours'],a['vllm'],a['ratio'])"
+done
+```
+
+**Both medians are over the SAME sixteen warm legs of twenty**, folded by
+`dflash2_speed_harness.fold_legs`, which discards run 1 of each repetition group
+on both arms for its named cause. Ours folds 16 spanning **8.169 to 19.095
+tok/s** (median 14.951); the oracle folds 16 spanning **8.882 to 22.012 tok/s**
+(median 16.11145768349725). Every leg on both arms returned **64 completion
+tokens** with `finish_reason: length`, so no leg was short and the #1667 discard
+path was never entered.
+
+```sh
+python3 -c "
+import json,statistics
+for f in ('evidence/evidence-d1/our-arm.json','evidence/evidence-d1/vllm-arm.json'):
+    d=json.load(open(f)); w=[l['tok_s'] for l in d['legs'] if l['run']!=1]
+    print(f,len(d['legs']),'legs',d['warm_legs'],'warm',d['cold_legs_discarded'],'cold',
+          'span %.3f..%.3f'%(min(w),max(w)),'median',statistics.median(w),'==',d['metrics']['output_throughput_tok_s'],
+          sorted({l['finish_reason'] for l in d['legs']}),sorted({l['completion_tokens'] for l in d['legs']}))"
+```
+
+**The workload fingerprint is IDENTICAL on both arms**, which is what makes the
+division legal: `prompts_sha256 173f9e98c1e14ebf7121ecc5296d76961fa9b8fc468a5caa1e59b69940088e26`,
+4 prompts x `repeat 5`, `max_tokens 64`, `max_num_seqs 1`, `concurrency 1`,
+`temperature 0.0`, `seed null`, `num_speculative_tokens 7`, and
+**`enforce_eager: false`** on the denominator. The oracle is
+`0.1.dev1+g66e5414c6`, matching `oracle_expected_commit`, and both arms loaded
+byte-identical artifacts: target `ba0ce20aae489ad1`, draft `67fc76d68dc5a941`.
+
+**Both arms ran in ONE lease on ONE boot**, which is the condition the harness
+refuses to measure across. `lease_id c2b30732-1444-4819-817a-21fd40a3402e`,
+`boot_id 49b5d969-3870-4a2b-b5b8-71355083d5e6` on both sides, `same_boot: true`,
+`compute_processes: []` on both, `TEARDOWN_VERDICT=CLEAN`. Clock pairing: ours
+2529.31 MHz mean over 72 busy samples with 0.789% spread, the oracle 2519.44 MHz
+over 84 with 0.795%, a 0.392% mean offset, no throttle reason set on either
+(`0x0000000000000000`). The harness's own estimate of the clock's contribution
+is **0.600%**, reported and never gated on.
+
+```sh
+python3 -c "import json;p=json.load(open('evidence/evidence-d1/dflash2-speed.json'))['preconditions'];print(json.dumps(p['clock']['pairing'],indent=1,sort_keys=True));print(json.dumps(p['contention'],sort_keys=True))"
+```
+
+**`attention_backend: "TRITON_ATTN"` is a lossy scalar over a mixed stack, not a
+weakened denominator.** The same artifact carries
+`attention_backend_groups`, read back from the live engine rather than from the
+flag, and it resolves **`GDNAttentionBackend` on 48 linear-attention layers,
+`TritonAttentionBackend` on 16 self-attention layers, and
+`FlashAttentionBackend` on the 5 draft layers `model.layers.64..68`**. A single
+string cannot describe that, and the scalar reports the majority
+self-attention backend. Anyone comparing this row against a record that quotes
+only the scalar should compare the groups instead.
+
+```sh
+python3 -c "import json;g=json.load(open('evidence/evidence-d1/dflash2-speed.json'))['preconditions']['attention_backend_groups'];print(g['probe']);print(json.dumps(g['backends'],sort_keys=True))"
+```
+
+**The SGLang axis is still unmeasured, and its recorded reason is now out of
+date.** The artifact's `sglang` block says the pinned SGLang `f63458b5`
+(v0.5.15) registers only `DFlashDraftModel` and therefore cannot load this
+gate's `DFlash2DraftModel` draft, so no undrafted substitute may stand in — an
+undrafted arm would make the ratio measure the FEATURE rather than the engine.
+That refusal remains correct at the pin. What has changed is that a tree which
+CAN load the draft now exists: DFlash2 landed upstream in `c14312a664`
+(`CandidateSelector`, `DFlashGroupedConv`, `DFlash2DraftModel` in `EntryClass`),
+and `1cf2b8c54d` adds the quantized-lm_head path that also serves an NVFP4
+target. Neither is on any SGLang release; v0.5.18 branched before them. Until
+that arm is built and measured, this row has **no SGLang denominator**, and no
+number in this entry may be read as one.

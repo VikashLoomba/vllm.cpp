@@ -177,25 +177,48 @@ StepInputs prepare_inputs(InputBatch& input_batch,
                           const SchedulerOutput& scheduler_output);
 
 // combine_sampled_and_draft_tokens: the async-scheduling device-input path
-// (ENG-ASYNC-SCHED W3 runner leaf). Ported from
-// vllm/v1/worker/gpu/input_batch.py::combine_sampled_and_draft_tokens (+ the
-// _combine_sampled_and_draft_tokens_kernel) @ e24d1b24, T0 non-spec subset.
+// (ENG-ASYNC-SCHED W3 runner leaf, made draft-aware by SPEC-DFLASH2 A2-1).
+// Ported from vllm/v1/worker/gpu/input_batch.py::combine_sampled_and_draft_tokens
+// (:364-406) + _combine_sampled_and_draft_tokens_kernel (:303-361) @ the parity
+// pin 5559679229bc961848b121ccdeaa8fa5d79bec98.
 //
 // Under async/overlap scheduling step N+1 is prepared BEFORE step N's sampled
 // token has crossed to the host (the blocking D2H the whole lever removes), so
 // prepare_inputs' host read of token_ids_cpu at the decode position is stale.
-// This rebuilds the decode rows' input token ids from `last_sampled_tokens` —
-// the sampler's output, which already lives GPU-side (per req_state) — instead:
-// for each batch row whose seq_len > prefill_len (past the known prefill tokens),
-// input_token_ids[query_end - num_logits] is overwritten with
-// last_sampled_tokens[idx_mapping[batch_idx]]. Prefill / chunked-prefill rows
-// (seq_len <= prefill_len, incl. the exact chunk that completes prefill) are
-// LEFT UNTOUCHED — their input still comes from the prompt in token_ids_cpu.
-// Returns logits_indices (per-req query_start_loc[b+1] - num_logits); at T0
-// num_new_sampled_tokens == 1 and there are no draft tokens, so num_logits == 1
-// and this equals prepare_inputs' logits_indices (query_start_loc[1:] - 1).
+// This rebuilds the generated-token rows' input ids from the two buffers that
+// already live on the sampler's side of the boundary:
 //
-//   input_token_ids  [total]        mutated in place (decode rows overwritten)
+//   * the COMMITTED token, from last_sampled_tokens[req_state] — written at
+//     logits_start == query_end - num_logits (:344-348);
+//   * the DRAFT tokens, from draft_tokens[req_state] — scattered over
+//     [query_end - num_draft_tokens, query_end) (:350-361), where
+//     num_draft_tokens == num_logits - num_new_sampled_tokens (:325).
+//
+// num_logits is per request and comes from cu_num_logits, NOT from
+// num_new_sampled_tokens. That distinction is the whole of A2-1. On a verify
+// step a request with k drafts has num_logits == 1 + k, so logits_start is
+// query_end - (1 + k); reading num_logits as 1 there writes the committed token
+// over the LAST DRAFT SLOT and silently destroys draft k-1. That corruption
+// costs acceptance and nothing else — speculative decoding is lossless, so the
+// emitted tokens never move and no token gate, golden or acceptance ratio on
+// this tree can see it (`.agents/specs/dflash2-async-spec-sampler.md`, reason A;
+// it already shipped once as #1366). The gate that CAN see it is G2, and it
+// asserts on the draft token ids in tests/vllm/v1/worker/test_combine_tokens.cpp.
+//
+// Prefill / chunked-prefill rows (seq_len <= prefill_len, incl. the exact chunk
+// that completes prefill) are LEFT UNTOUCHED — their input still comes from the
+// prompt in token_ids_cpu. Past that, the committed-token store carries a SECOND
+// guard, `first_logit_seq_pos >= prefill_len` (:344-345): when the logits window
+// reaches back over the prompt tail (possible once num_logits > 1), logits_start
+// addresses a PROMPT slot, and upstream leaves it alone. The draft scatter is
+// NOT under that guard, exactly as upstream.
+//
+// Returns logits_indices, stored at cu_num_logits[b] + j exactly as the kernel
+// stores it (:331-335), so on the non-speculative path (cu_num_logits ==
+// arange(num_reqs + 1), num_new_sampled_tokens == 1) it is byte-identical to
+// prepare_inputs' logits_indices (query_start_loc[1:] - 1).
+//
+//   input_token_ids  [total]        mutated in place (generated rows overwritten)
 //   idx_mapping      [num_reqs]     batch_idx -> req_state slot (identity for our
 //                                   already-condensed persistent batch; the
 //                                   indirection matters after an abort/finish
@@ -204,23 +227,47 @@ StepInputs prepare_inputs(InputBatch& input_batch,
 //   query_start_loc  [num_reqs + 1] cumulative token offsets (== StepInputs)
 //   seq_lens         [num_reqs]     num_computed + num_scheduled (== StepInputs)
 //   prefill_len      [>= max req_state]  per req_state, tokens known at admission
+//   draft_tokens     [>= (max req_state + 1) * draft_tokens_stride]  ROW-MAJOR
+//                                   per req_state, upstream's 2-D
+//                                   [num_req_states, num_speculative_steps]
+//                                   tensor flattened; may be empty when no
+//                                   request has drafts this step
+//   draft_tokens_stride             upstream's draft_tokens.stride(0) (:381,396)
+//   cu_num_logits    [num_reqs + 1] StepInputs::cu_num_logits — [0] ++ cumsum
+//                                   (num_new_sampled_tokens + k_i). REQUIRED, as
+//                                   upstream requires it: it is the only source
+//                                   of the per-request num_logits
 //   num_new_sampled_tokens          0 or 1 (bonus token; excl. accepted drafts)
 //
-// DEVICE-NEUTRAL (recorded): on CPU these are host std::vectors; the DGX leaf
-// ports this loop to the cited Triton kernel over GPU-resident input_ids /
-// last_sampled_tokens so no sampled-id round-trips the host. It runs on the HOST
-// side of input prep, BEFORE the forward and OUTSIDE any CUDA-graph capture
-// (exactly as upstream keeps input prep ahead of the decode graph replay), so it
-// is capture-safe by construction. Spec-decode draft tokens (draft_tokens /
-// num_new_sampled_tokens==0 / cu_num_logits>1) are deferred with SPEC-MTP;
-// num_new_sampled_tokens is fixed at 1 here.
+// HARNESS ADAPTATION, the only one: upstream also takes `num_logits` (the total)
+// to size its output tensor (:373,383-387). We derive it from cu_num_logits.back(),
+// which upstream requires to be the same value, so the two cannot disagree here.
+//
+// DEVICE-NEUTRAL (recorded): on CPU these are host std::vectors; the CUDA
+// counterpart is vt::cuda::LaunchCombineSampledAndDraftTokens
+// (src/vt/cuda/cuda_combine_tokens.cu), which mirrors this body over GPU-resident
+// buffers so no sampled id round-trips the host. It runs on the HOST side of
+// input prep, BEFORE the forward and OUTSIDE any CUDA-graph capture (exactly as
+// upstream keeps input prep ahead of the decode graph replay), so it is
+// capture-safe by construction.
+//
+// REACHABILITY, stated once: the draft lane below is UNREACHED on `main`. The
+// only production caller is GPUModelRunner::execute_model behind
+// `async_input_combine_`, and that flag is vetoed for every speculative engine at
+// BOTH GPUModelRunner constructors — src/vllm/v1/worker/gpu/runner.cpp:480 and
+// :553, which are the two `async_input_combine_ = ...` assignments and not the
+// comment blocks that precede them — so no production step reaches this function
+// with num_logits > 1. Row `SPEC-DFLASH2` owns the wiring (waves A2-2 and A2-3),
+// issue #2644 tracks it, and the row's spec lists it under `## Owed`.
 std::vector<int32_t> combine_sampled_and_draft_tokens(
     std::vector<int32_t>& input_token_ids,
     const std::vector<int32_t>& idx_mapping,
     const std::vector<int32_t>& last_sampled_tokens,
     const std::vector<int32_t>& query_start_loc,
     const std::vector<int32_t>& seq_lens,
-    const std::vector<int32_t>& prefill_len, int num_new_sampled_tokens = 1);
+    const std::vector<int32_t>& prefill_len,
+    const std::vector<int32_t>& draft_tokens, int draft_tokens_stride,
+    const std::vector<int32_t>& cu_num_logits, int num_new_sampled_tokens = 1);
 
 // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): THE COMBINE'S ROW PREDICATE, extracted so
 // that one rule has one expression.

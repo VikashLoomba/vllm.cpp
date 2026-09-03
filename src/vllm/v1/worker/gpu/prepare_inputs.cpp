@@ -311,42 +311,59 @@ StepInputs prepare_inputs(InputBatch& input_batch,
 
 // ─── combine_sampled_and_draft_tokens ───────────────────────────────────────
 // Ported from vllm/v1/worker/gpu/input_batch.py::combine_sampled_and_draft_tokens
-// + _combine_sampled_and_draft_tokens_kernel @ e24d1b24 (T0 non-spec subset).
+// (:364-406) + _combine_sampled_and_draft_tokens_kernel (:303-361) @ the parity
+// pin 5559679229bc961848b121ccdeaa8fa5d79bec98. The Triton kernel is one program
+// per request; this is the same body as a host loop over batch rows.
 // See prepare_inputs.h for the async-scheduling contract, the device-neutral /
-// capture-safety note, and the deferred spec-decode draft lane.
+// capture-safety note, the one harness adaptation, and the reachability record.
 std::vector<int32_t> combine_sampled_and_draft_tokens(
     std::vector<int32_t>& input_token_ids,
     const std::vector<int32_t>& idx_mapping,
     const std::vector<int32_t>& last_sampled_tokens,
     const std::vector<int32_t>& query_start_loc,
     const std::vector<int32_t>& seq_lens,
-    const std::vector<int32_t>& prefill_len, int num_new_sampled_tokens) {
+    const std::vector<int32_t>& prefill_len,
+    const std::vector<int32_t>& draft_tokens, int draft_tokens_stride,
+    const std::vector<int32_t>& cu_num_logits, int num_new_sampled_tokens) {
   // Upstream asserts num_new_sampled_tokens in (0, 1): the bonus token, excl.
-  // accepted draft tokens.
+  // accepted draft tokens (:376-378).
   assert(num_new_sampled_tokens == 0 || num_new_sampled_tokens == 1);
   const int num_reqs = static_cast<int>(idx_mapping.size());
+  // cu_num_logits is the ONLY source of the per-request num_logits (:322-324),
+  // so a caller that cannot supply it cannot call this function.
+  VT_CHECK(static_cast<int>(cu_num_logits.size()) == num_reqs + 1,
+           "combine_sampled_and_draft_tokens: cu_num_logits must hold num_reqs "
+           "+ 1 entries");
 
-  // cu_num_logits is one logit per request at T0 (no draft tokens), so
-  // num_logits == num_new_sampled_tokens per row and the total == num_reqs *
-  // num_new_sampled_tokens. logits_indices[b] = query_end - num_logits (+block).
-  std::vector<int32_t> logits_indices;
-  logits_indices.reserve(
-      static_cast<size_t>(num_reqs) * static_cast<size_t>(num_new_sampled_tokens));
+  // Upstream allocates logits_indices at the total num_logits (:383-387) and the
+  // kernel stores each row's block at cu_num_logits[b] (:331-335). Same here:
+  // sized from cu_num_logits.back(), written at the same offsets, so the array
+  // is index-for-index the upstream one.
+  const int total_num_logits = cu_num_logits[static_cast<size_t>(num_reqs)];
+  std::vector<int32_t> logits_indices(static_cast<size_t>(total_num_logits));
 
   for (int batch_idx = 0; batch_idx < num_reqs; ++batch_idx) {
     const int req_state_idx = idx_mapping[static_cast<size_t>(batch_idx)];
-    // num_logits == num_new_sampled_tokens (num_draft_tokens == 0 at T0).
-    const int num_logits = num_new_sampled_tokens;
+
+    // Get the number of logits and draft tokens (:321-325). num_logits is
+    // 1 + k_i on a verify step and num_new_sampled_tokens on a decode step; the
+    // difference is exactly the draft count.
+    const int cu_start = cu_num_logits[static_cast<size_t>(batch_idx)];
+    const int cu_end = cu_num_logits[static_cast<size_t>(batch_idx) + 1];
+    const int num_logits = cu_end - cu_start;
+    const int num_draft_tokens = num_logits - num_new_sampled_tokens;
+
+    // Compute the logits indices (:327-335).
     const int32_t query_end =
         query_start_loc[static_cast<size_t>(batch_idx) + 1];
     const int32_t logits_start = query_end - num_logits;
     for (int j = 0; j < num_logits; ++j) {
-      logits_indices.push_back(logits_start + j);
+      logits_indices[static_cast<size_t>(cu_start + j)] = logits_start + j;
     }
 
     // seq_len <= prefill_len: still consuming the known prefill tokens (incl.
     // the chunk that exactly completes prefill) — no sampled or draft token to
-    // splice; the prompt token in input_token_ids stays.
+    // splice; the prompt token in input_token_ids stays (:337-341).
     const int32_t seq_len = seq_lens[static_cast<size_t>(batch_idx)];
     const int32_t pf = prefill_len[static_cast<size_t>(req_state_idx)];
     // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): the condition that was written here
@@ -357,13 +374,36 @@ std::vector<int32_t> combine_sampled_and_draft_tokens(
     if (!CombineSplicesRow(seq_len, pf)) {
       continue;
     }
-    // Write the last sampled token id at the decode position (query_end -
-    // num_logits). num_new_sampled_tokens == 0 (draft-only step) writes nothing.
-    if (num_new_sampled_tokens > 0) {
-      input_token_ids[static_cast<size_t>(query_end - num_logits)] =
+
+    // Keep prompt-tail slots intact; only rewrite generated-token slots
+    // (:343-348). Once num_logits > 1 the window can reach back over the prompt,
+    // and then logits_start addresses a PROMPT id that upstream leaves alone.
+    // With num_logits == 1 this is implied by the check above, so the
+    // non-speculative path is unchanged.
+    const int32_t first_logit_seq_pos = seq_len - num_logits;
+    if (num_new_sampled_tokens > 0 && first_logit_seq_pos >= pf) {
+      input_token_ids[static_cast<size_t>(logits_start)] =
           last_sampled_tokens[static_cast<size_t>(req_state_idx)];
     }
-    // Draft tokens (num_draft_tokens > 0) are deferred with SPEC-MTP.
+
+    // Write the draft tokens (if any) to input_ids (:350-361). The count comes
+    // from num_draft_tokens and NOT from draft_tokens_stride, which is the
+    // speculator's max draft length and pads every shorter row.
+    if (num_draft_tokens > 0) {
+      VT_CHECK(draft_tokens_stride >= num_draft_tokens,
+               "combine_sampled_and_draft_tokens: draft_tokens_stride is "
+               "smaller than a request's draft count");
+      const size_t row = static_cast<size_t>(req_state_idx) *
+                         static_cast<size_t>(draft_tokens_stride);
+      VT_CHECK(row + static_cast<size_t>(num_draft_tokens) <=
+                   draft_tokens.size(),
+               "combine_sampled_and_draft_tokens: draft_tokens does not hold a "
+               "row for this request's req_state");
+      for (int b = 0; b < num_draft_tokens; ++b) {
+        input_token_ids[static_cast<size_t>(query_end - num_draft_tokens + b)] =
+            draft_tokens[row + static_cast<size_t>(b)];
+      }
+    }
   }
   return logits_indices;
 }

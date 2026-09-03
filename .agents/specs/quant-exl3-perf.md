@@ -959,6 +959,35 @@ A CPU-only green is not a device result and is never reported as one. A doctest
 
 ## Owed
 
+- **ONE RECORD EDIT THIS BRANCH COULD NOT MAKE, with its exact replacement
+  text.** `docs/benchmarks/qwen38-27b-exl3-gb10.md` exists on `origin/main` and
+  not on this branch's base, and its unmatched-axes list ends with a bullet that
+  slice B falsifies:
+
+  > [#2570]: our `m <= 8` EXL3 GEMV instantiates `(3,1)` only, and this
+  > checkpoint contains **zero** `(3,1)` tensors while upstream's GEMV takes 407
+  > of its 409. That is the named, still-unmeasured hypothesis for any gap that
+  > a matched workload reveals.
+
+  It was already half stale before slice B -- slice A added `(3,2)` -- and slice
+  B makes the whole sentence wrong: this tree now takes the same 407 of 409.
+  What it should say instead:
+
+  > [#2570]: our `m <= 8` EXL3 GEMV now instantiates `(3,1)`, `(3,2)` and
+  > `(4,2)`, which is 407 of this checkpoint's 409 trellis modules -- the same
+  > 407 upstream's GEMV takes. WHETHER IT IS TAKEN is the open question, not
+  > whether it exists: `Exl3GemvSelectConfig` admits every shape here only where
+  > `size_n / 32 <= narrow_coresident`, an occupancy query, and that has not
+  > been measured on GB10. Still the named hypothesis for any gap a matched
+  > workload reveals, and now with a specific thing to measure.
+
+  It is NOT edited here, and the reason is mechanical rather than a judgement:
+  this branch is 30 commits behind `origin/main`, both device leases are queued
+  against a pinned tree, and a merge would move the pin and force both jobs to
+  be re-staged and re-queued from the back. The edit rides the merge. It is
+  written out in full so that it cannot be lost between the two, and so that
+  whoever merges does not have to re-derive it.
+
 - **The 2 bpw GEMV arm.** `LOADS` halves to `WNT / 2` and one loaded word
   carries TWO tiles (`exl3_gemv_kernel.cuh:152`, `:302-310`), so it is a third
   geometry rather than another width of slice B's. No 2-bit EXL3 artifact has

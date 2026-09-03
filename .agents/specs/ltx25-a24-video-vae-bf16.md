@@ -847,15 +847,6 @@ are both about records a number agreed with and a tree did not.
   `std::memcpy` cannot replace it without a write-back, because the encoder's
   gathers mutate the volume in place. The repair is a refactor of the encoder's
   host path, not a line, and it is not this row's.
-* **The bf16-on-a-non-CPU-queue refusal is UNGATED, and cannot be gated on this
-  build.** `ltx2_video_vae.cpp:1462-1472` refuses a bf16 bag on a device queue,
-  but an earlier check at `:177` refuses any queue whose device type has no
-  registered platform, and on a CPU-only build `cuda` has none -- measured, the
-  attempt throws "for which no platform is registered" and never reaches the
-  dtype refusal. Gating it needs a build with a non-CPU platform registered,
-  which is a CUDA build and a lease. The other two refusals this row adds
-  (`RequireVaeDType` and the encoder's) ARE gated, in "the three dtype refusals
-  this arm adds are REACHED".
 * **The shipped `timestep_scale_multiplier` value** (§4.12), which decides whether
   the bf16 timestep product differs on the real checkpoint. Needs the checkpoint;
   `CHECKPOINT_ROOT` is not mounted on this box.
@@ -983,6 +974,14 @@ Three more, added by the fresh review's repairs and measured the same way:
 | tiled decode: force `buffer.Allocate` to `kF32` | before the repair, GREEN -- 10 cases and 915 assertions of `test_ltx2_tiling`, and 114 cases and 4972 assertions of `test_ltx2_video`. After it, `test_ltx2_tiling` is 10/11 with 5 of 971 assertions red: `max\|diff\|` 0 -> **0.00507808**, landing exactly on upstream's own f32-buffer tensor. `test_ltx2_video` stays green, which is the engine suite measuring the render rather than the blend |
 | tiled decode: fuse the three separable blend masks (the defect as found) | reds the section 8 arm at **0.001953125**, one bf16 ulp; every f32 tiling case stays green, which is why it survived to the bf16 arm (#2815) |
 
+One more, added by the scoped fresh RE-review, for the refusal this spec had
+recorded as ungateable:
+
+| mutation | result |
+|---|---|
+| delete the bf16-on-a-non-CPU-queue refusal (`ltx2_video_vae.cpp:1473-1481`) | the mutation COMPILES (`BUILD_rc=0`, `libvllm.a` relinked) and reds the new subcase: `test_ltx2_vae -tc='*dtype refusals*'` goes 1/1 cases and 3/3 assertions GREEN to **1 of 1 case failed, 1 of 3 assertions red**, `CHECK_THROWS_WITH_AS ... threw a DIFFERENT exception!` -- the decode runs on past the deleted guard and dies downstream on a missing bf16 parameter. Restored byte-for-byte |
+| the SAME subcase with the fake-accelerator registration removed (control) | throws `":177"` "for which no platform is registered", not `":1473"` "only the CPU arm serves it" -- which is the whole content of the retired "cannot be gated on this build" claim, and it holds only in that control |
+
 ### One instrument lost its window and is repaired rather than deleted
 
 `ltx2 a2vid: the distilled adapter rides stage 2 ALONE` measured the adapter's
@@ -1005,6 +1004,21 @@ than "reaches the pixels".
   never EXECUTED still holds.
 * `docs/FEATURES.md`'s Conv VAE arithmetic-width row said "STORAGE stays f32;
   bf16 owed".
+* **This spec's own `## Owed` said the bf16-on-a-non-CPU-queue refusal "cannot be
+  gated on this build", and that was FALSE.** The shadowing by
+  `RequirePooledDevice` (`ltx2_video_vae.cpp:1441`, throwing at `:177`) is real
+  ONLY in the control condition, when no platform is registered for the device
+  type. `vllm::platforms::RegisterPlatform` and `vt::RegisterBackend` are public
+  APIs, and `grep -rln 'platforms::RegisterPlatform' tests/` names THIRTEEN other
+  test files that already call them on this CPU-only build
+  (`tests/vllm/multimodal/test_ltx2_video_device_forward.cpp:190-192` is the one
+  the new subcase is shaped after). Doing so here reaches the refusal with no GPU
+  and no lease.
+  Both arms measured on the same binary: with the fake `kXPU` backend and platform
+  registered the decode throws "only the CPU arm serves it" (`:1473`); with the
+  registration removed and nothing else changed it throws "for which no platform
+  is registered" (`:177`). All three of this row's dtype refusals are now gated in
+  "ltx2 vae: the dtype refusals this arm adds are REACHED, not merely written".
 
 ### Defaults, and why they have their values
 

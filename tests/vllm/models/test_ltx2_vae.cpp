@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
@@ -31,6 +32,11 @@
 // VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads the geometry it claims
 // rather than assuming it (src/vt/cpu/cpu_conv1d_block.h), same reach as above.
 #include "vt/cpu/cpu_conv1d_block.h"
+// A24 wave 3 fresh re-review (#2786): the non-CPU dtype refusal is reached by
+// registering a fake accelerator, which needs the backend and platform registries.
+#include "vt/backend.h"
+#include "vt/device.h"
+#include "vllm/platforms/interface.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
@@ -1318,6 +1324,65 @@ std::vector<float> WidenWords(const std::vector<uint16_t>& w) {
   return out;
 }
 
+// ─── A FAKE ACCELERATOR, SO A NON-CPU REFUSAL IS REACHABLE WITHOUT A GPU ─────
+//
+// `Ltx2ConvVideoDecode` refuses a bf16 bag on a non-CPU queue, but reaching that
+// refusal needs a device type with a REGISTERED PLATFORM (ltx2_video_vae.cpp:177)
+// and a REGISTERED BACKEND (`VaeWeightCache`'s constructor, `:489-495`). Neither
+// needs hardware: both registries are plain public tables, and thirteen other
+// test files in this CPU-only build already call them
+// (`grep -rln 'platforms::RegisterPlatform' tests/`) —
+// `tests/vllm/multimodal/test_ltx2_video_device_forward.cpp:190-192` is the one
+// this is shaped after.
+//
+// `kXPU` ONLY, deliberately: `CurrentPlatform()` walks {kCUDA, kROCM, kXPU, ...}
+// and returns the first REGISTERED entry (src/vllm/platforms/platform.cpp:91-98),
+// so registering into the CUDA slot as well — which the device-forward file does,
+// because it needs `CurrentPlatform()` to resolve to the fake — would change what
+// every other case in this binary resolves. Nothing here asks `CurrentPlatform()`;
+// the refusal under test asks `HasPlatform(kXPU)`. Measured: the suite reads the
+// same case and assertion count with this registration as without it.
+//
+// Its memory is host memory and it is honest about that. Nothing below allocates
+// on it — the refusal fires before the first allocation — so `Alloc` exists only
+// to satisfy the interface.
+class FakeXpuBackend final : public vt::Backend {
+ public:
+  void* Alloc(size_t bytes) override { return std::malloc(bytes == 0 ? 1 : bytes); }
+  void Free(void* ptr) override { std::free(ptr); }
+  void Memset(vt::Queue&, void* ptr, int value, size_t bytes) override {
+    std::memset(ptr, value, bytes);
+  }
+  void Copy(vt::Queue&, void* dst, const void* src, size_t bytes) override {
+    std::memcpy(dst, src, bytes);
+  }
+  vt::Queue CreateQueue() override { return vt::Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr}; }
+  bool UnifiedMemory() const override { return true; }
+  bool DeviceMemoryIsHostAddressable() const override { return true; }
+};
+
+class FakeXpuPlatform final : public vllm::platforms::Platform {
+ public:
+  explicit FakeXpuPlatform(FakeXpuBackend& backend) : backend_(backend) {}
+  vt::DeviceType device_type() const override { return vt::DeviceType::kXPU; }
+  vt::Backend& backend() const override { return backend_; }
+  vllm::platforms::DeviceCapability get_device_capability() const override { return {}; }
+  std::vector<vt::DType> supported_dtypes() const override { return {vt::DType::kBF16}; }
+  vllm::platforms::ResidencyPolicy residency_policy() const override { return {}; }
+  bool supports_model_architecture(std::string_view) const override { return true; }
+
+ private:
+  FakeXpuBackend& backend_;
+};
+
+// Idempotent, so a case can call it without ordering itself against the others.
+void RegisterFakeXpuAccelerator() {
+  static FakeXpuBackend backend;
+  static FakeXpuPlatform platform(backend);
+  vt::RegisterBackend(vt::DeviceType::kXPU, &backend);
+  vllm::platforms::RegisterPlatform(vt::DeviceType::kXPU, &platform);
+}
+
 }  // namespace
 
 TEST_CASE("ltx2 vae: each kLtx2Vae kernel's BF16 rule is the one upstream applies") {
@@ -1620,6 +1685,22 @@ TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely wr
     // `RequireVaeDType`. FP8 and NVFP4 are A22; the point is that a bag carrying
     // one arrives at a message naming this decode and the dtype, not at a
     // kernel-level surprise three headers away.
+    //
+    // THIS GATES THE PREDICATE, NOT THE ENTRY-POINT CALL SITE, and the difference
+    // is measured rather than assumed. `RequireVaeDType` is called from three
+    // places with ONE message -- the decode entry (ltx2_video_vae.cpp:1465),
+    // `VaeStore::Alloc` (`:250`) and `VaeScratch` (`:546`) -- so deleting the
+    // entry-point call alone leaves this subcase GREEN: the store refuses the
+    // same bag with the same words a few lines later. That is the shape
+    // `RequirePooledDevice`'s own comment at `:167-175` names, "a guard with a
+    // spare copy is a guard whose deletion no test can see", and here the spare
+    // copies are deliberate: the entry call is a fail-fast that refuses BEFORE
+    // the first allocation, and the two deep ones are the refusal proper.
+    // Forking the text so this case could gate `:1465` specifically would give
+    // one refusal three messages, which is exactly what `:212-213` says the
+    // single function exists to prevent. What is asserted here is that a third
+    // storage width cannot reach the decode; WHICH of the three sites answers is
+    // not.
     vllm::Ltx2VaeWeights wrong = bag.weights;
     wrong.dtype = vt::DType::kF16;
     GoldenNoise noise("ltx2.videodecshallow.");
@@ -1628,15 +1709,35 @@ TEST_CASE("ltx2 vae: the dtype refusals this arm adds are REACHED, not merely wr
         doctest::Contains("the decode serves f32"), std::runtime_error);
   }
 
-  // THE THIRD REFUSAL IS NOT GATED HERE, AND MEASURING WHY IS THE POINT.
-  // `Ltx2ConvVideoDecode` refuses a bf16 bag on a non-CPU queue
-  // (ltx2_video_vae.cpp:1462-1472), but on a CPU-only build it is UNREACHABLE: an
-  // earlier check at `:177` refuses any queue whose device type has no registered
-  // platform, and on this build `cuda` has none. Measured -- the attempt threw
-  // "for which no platform is registered", not "only the CPU arm serves it".
-  // Gating it needs a build where a non-CPU platform is registered, which is a
-  // CUDA build and a lease. Recorded in the row's `## Owed` rather than replaced
-  // by a case that asserts the wrong refusal.
+  SUBCASE("a bf16 bag on a NON-CPU queue is refused by name, on this CPU-only build") {
+    // THE SHADOWING IS REAL ONLY IN THE CONTROL CONDITION, and that is the whole
+    // finding. `Ltx2ConvVideoDecode` refuses a bf16 bag on a non-CPU queue
+    // (ltx2_video_vae.cpp:1473-1481), and an EARLIER check at `:1441` refuses any
+    // queue whose device type has no registered platform (`:177`). With no
+    // platform registered the second message is the one that arrives, which is
+    // what an earlier revision of this file recorded as "cannot be gated on this
+    // build, it needs a CUDA build and a lease". That was FALSE.
+    // `vllm::platforms::RegisterPlatform` and `vt::RegisterBackend` are public
+    // APIs, thirteen other test files in this tree already call them on CPU-only
+    // builds, and registering one here reaches the dtype refusal with no GPU
+    // anywhere in the loop.
+    //
+    // Both arms measured, same binary:
+    //   registered   -> "only the CPU arm serves it"        (`:1473`)
+    //   not registered -> "for which no platform is registered" (`:177`)
+    //
+    // The bag can be the fixture's own: the refusal fires before the first
+    // `wcache.Get` and before the first allocation, so no weight is read and
+    // nothing is staged onto the fake device.
+    RegisterFakeXpuAccelerator();
+    vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+    vllm::Ltx2VaeWeights bf16 = bag.weights;
+    bf16.dtype = vt::DType::kBF16;
+    GoldenNoise noise("ltx2.videodecshallow.");
+    CHECK_THROWS_WITH_AS(
+        vllm::Ltx2ConvVideoDecode(cfg, bf16, latent, lc, lt, lh, lw, &noise, nullptr, &q),
+        doctest::Contains("only the CPU arm serves it"), std::runtime_error);
+  }
 
   SUBCASE("the ENCODER refuses a bf16 bag by name, and at its own entry") {
     // Added by the review: the encoder allocates every volume `kF32` while

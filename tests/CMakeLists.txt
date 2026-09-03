@@ -1781,6 +1781,12 @@ vllm_cpp_add_test(test_multi_kv_refusal
   vllm/model_executor/test_multi_kv_refusal.cpp)
 vllm_cpp_add_test(test_device_token_ids_refusal
   vllm/model_executor/test_device_token_ids_refusal.cpp)
+# ENG-MM-EMBED-DEVICE-IDS (#2730): the MULTIMODAL half of the same channel --
+# `MmEmbedInputs` carries the device identifiers, both registered `embed_mm`
+# hooks splice them over the buffer they gather from, and a hook that does not
+# declare the capability is refused instead of embedding token id 0.
+vllm_cpp_add_test(test_mm_embed_device_token_ids
+  vllm/models/test_mm_embed_device_token_ids.cpp)
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 

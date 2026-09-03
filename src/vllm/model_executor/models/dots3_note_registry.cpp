@@ -37,6 +37,7 @@
 
 #include "vllm/model_executor/models/dense_attn_block.h"  // MakeTensor
 #include "vllm/model_executor/models/dots3_note.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::ApplyDeviceTokenIds
 #include "vllm/model_executor/models/dots3_note_vision.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/multimodal/inputs.h"  // MultiModalFeatureSpec
@@ -282,6 +283,19 @@ MmForwardBuffers EmbedMmDots3NoteForCausalLM(LoadedModel& model,
   std::vector<uint16_t> merged(static_cast<size_t>(T * H));
   {
     dense_attn::DBuf ids(d, vt::DType::kI32, {T}, token_ids.data());
+    // ENG-MM-EMBED-DEVICE-IDS (#2730): SPLICE the runner's device identifiers
+    // over the host upload just made, before the gather reads it. The host
+    // vector is deliberately stale for decode rows -- the combine wrote each
+    // sampled token into `MmEmbedInputs::device_token_ids` on the main queue and
+    // never wrote it back -- so without this the decode rows of an image request
+    // embed token id 0. The `Copy` is enqueued on this same queue, which is why
+    // it is ordered AFTER that combine rather than racing it, and it is the
+    // SHARED splice the text device arm uses rather than a second copy of it.
+    // Null on every non-mirror step, where it writes nothing and this hook is
+    // byte-identical to its pre-#2730 self.
+    detail::ApplyDeviceTokenIds(
+        d.b, d.q, ids.ptr(), T,
+        detail::DeviceTokenIds{inputs.device_token_ids, T}, "dots3-note mm embed");
     dense_attn::DBuf emb(d, vt::DType::kBF16, {T, H});
     vt::Tensor table = dense_attn::ResidentWeight(
         d, w.device.embed_tokens, {config.vocab_size, H});
@@ -367,6 +381,20 @@ const ModelFactory kDots3NoteFactory{
     .encode_mm = &EncodeMmDots3NoteForCausalLM,
     .embed_mm = &EmbedMmDots3NoteForCausalLM,
     .is_dense_model = false,
+    // ENG-MM-EMBED-DEVICE-IDS (#2730): the HOOK bit, and DELIBERATELY NOT the
+    // forward's beside it. `EmbedMmDots3NoteForCausalLM` splices
+    // `MmEmbedInputs::device_token_ids` over the buffer it gathers from, so the
+    // merged embeds are built from the identifiers the combine actually wrote.
+    // `ForwardDots3NoteForCausalLM` does not: it reaches
+    // `Dots3NoteModel::ForwardDevice(input.token_ids, ...)`, and the runner takes
+    // the multimodal branch when ANY request in the batch carries multimodal
+    // items -- so a batch of TEXT-ONLY requests to this architecture takes the
+    // text arm and embeds the stale host vector. It is class (b) of
+    // `.agents/specs/eng-async-device-ids-refusal.md` and stays refused by
+    // `ModelRegistry::Forward` until the row that ports that arm lands
+    // ([#2732](https://github.com/mudler/vllm.cpp/issues/2732)). One bit could
+    // not express this pair, which is why there are two.
+    .embed_mm_consumes_device_token_ids = true,
 };
 
 }  // namespace

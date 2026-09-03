@@ -51,12 +51,21 @@ class GrowOnlyStreamScratch {
   // called with the pool's lock HELD, which is what makes the capacity check and
   // the publish one operation. It may throw; the entry is then unchanged.
   //
-  // Returns nullptr only when `need` is 0 and nothing was ever allocated.
+  // Returns nullptr when `need` is 0 and nothing was ever allocated, and when
+  // `alloc` could not allocate.
   template <typename Alloc>
   void* Ensure(StreamT stream, std::size_t need, Alloc&& alloc) {
-    Entry& entry = EntryFor(stream);
+    std::lock_guard<std::mutex> lock(mutex_);
+    Entry& entry = pools_[stream];
     if (need > entry.bytes) {
-      entry.buf = alloc(need);
+      void* block = alloc(need);
+      // A callable that cannot allocate must throw or return nullptr, and
+      // neither publishes. Publishing a nullptr with `need` bytes would poison
+      // the entry: every later caller would pass the capacity check and get
+      // nothing back.
+      if (block == nullptr) return nullptr;
+      if (entry.buf != nullptr) retired_.push_back(entry.buf);
+      entry.buf = block;
       entry.bytes = need;
     }
     return entry.buf;
@@ -88,11 +97,6 @@ class GrowOnlyStreamScratch {
     void* buf = nullptr;
     std::size_t bytes = 0;
   };
-
-  Entry& EntryFor(StreamT stream) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return pools_[stream];
-  }
 
   mutable std::mutex mutex_;
   std::unordered_map<StreamT, Entry> pools_;

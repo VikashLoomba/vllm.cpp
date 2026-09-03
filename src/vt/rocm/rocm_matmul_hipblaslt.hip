@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_getblas_dualslot.h"
@@ -295,18 +296,41 @@ std::unordered_map<LtKey, LtAlgoCache, LtKeyHash>& LtCache() {
   return m;
 }
 
-void* LtWorkspace(size_t need) {
-  static thread_local void* ws = nullptr;
-  static thread_local size_t cap = 0;
+// Grow-only hipBLASLt workspace, one entry per STREAM, sharing the bookkeeping
+// with the activation-quant scratch (src/vt/grow_only_stream_scratch.h).
+//
+// It was `thread_local` with a hipFree on growth, and that is two defects
+// (#2712). The workspace is handed to a STREAM-ORDERED hipblasLtMatmul below, so
+// the hipFree could return a block a queued matmul still reads, and a per-call
+// free is illegal under hipGraph stream capture besides. The block is now
+// RETIRED instead: kept resident for the process, exactly as the sibling pool
+// does and for the same reason.
+//
+// Keyed by stream, not by thread, because one host thread submits to two streams
+// here: the Gemma4 prefill peer path issues on the expert device's queue
+// (src/vt/rocm/rocm_gemma4_experts.hip:1147,1149) while the compute queue is
+// live. A per-thread buffer is therefore also one buffer across a two-device
+// hop, which is the hazard GetBlas above was given an explicit dual slot for.
+//
+// hipMalloc, not hipMallocAsync. The sibling can be stream-ordered because its
+// consumers are this project's own kernels on that stream; hipBLASLt's workspace
+// under graph capture is behaviour this row could not exercise, since the whole
+// Lt arm is default OFF (LtEnabled above). Removing the free is the part that is
+// verifiable, so it is the part that changed.
+vt::GrowOnlyStreamScratch<hipStream_t>& LtWorkspacePool() {
+  static vt::GrowOnlyStreamScratch<hipStream_t> pool;
+  return pool;
+}
+
+void* LtWorkspace(size_t need, hipStream_t stream) {
   if (need == 0) return nullptr;
-  if (need > cap) {
-    if (ws) (void)hipFree(ws);
-    ws = nullptr;
-    cap = 0;
-    if (hipMalloc(&ws, need) != hipSuccess) return nullptr;
-    cap = need;
-  }
-  return ws;
+  return LtWorkspacePool().Ensure(stream, need, [](size_t bytes) -> void* {
+    void* block = nullptr;
+    // nullptr is the pool's "could not allocate": it publishes nothing, so the
+    // caller's existing `if (!ws) return false` contract is unchanged.
+    if (hipMalloc(&block, bytes) != hipSuccess) return nullptr;
+    return block;
+  });
 }
 
 // C[M,N] row-major = alpha * A[M,K] @ B[N,K]^T + beta * C
@@ -391,7 +415,7 @@ bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M
     std::fprintf(stderr, "hipBLASLt COL ok M=%d N=%d K=%d ws=%zu\n", M, N, K, cache.workspace);
   }
 
-  void* ws = LtWorkspace(cache.workspace);
+  void* ws = LtWorkspace(cache.workspace, stream);
   if (cache.workspace > 0 && !ws) {
     cleanup();
     return false;

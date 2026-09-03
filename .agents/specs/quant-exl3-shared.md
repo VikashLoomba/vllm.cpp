@@ -312,6 +312,82 @@ Stated here before code, per risk 1:
   aarch64 it becomes the token oracle and this section is replaced, not
   supplemented.
 
+## W5: the shape table's other three kernels ([#2749](https://github.com/mudler/vllm.cpp/issues/2749))
+
+`Exl3SelectGemmShape` (`src/vt/exl3_policy.cpp:66-110`) chooses one of four
+kernel shapes, and `GemmKernelForArm` (`src/vt/cuda/cuda_exl3.cu:2022-2039`)
+instantiates all four for each of the seven `(bits, codebook)` arms. **One of
+the four has ever executed.** The committed device cases run `k 512 n 256` and
+`k 256 n 256` at `bits 3`, which on a Blackwell-class `cc` take
+`mod_256 && size_n <= 4096` with `size_k > 8192` false and return shape 2.
+Shape 4 is not merely unselected at `n = 256`, it is refused: it tiles `n` by
+512 and `Exl3GemmShapeCompat` rejects that `n`. Twenty-one instantiations
+therefore compile into the fat build for every architecture and ship untested.
+
+The table is this row's surface -- `## Port map` lists `src/vt/exl3_policy.cpp`
+here -- so W5 owns the coverage. `quant-exl3-mul1.md` and `quant-exl3-perf.md`
+each carried a repeated bullet for it, and each pointed at the other; both go
+with this slice.
+
+### Why this is a test loop and not a port
+
+`Exl3GemmArgs::force_shape_idx` already exists and the launcher already honours
+it (`cuda_exl3.cu:2270`), mirroring upstream's own `force_shape` parameter. No
+product code changes. What changes is that the gate stops measuring one kernel
+four times.
+
+### The discrimination problem, and what actually settles it
+
+A forced shape and the selector's shape compute the same product, so **no
+comparison against a reference can tell a honoured force from a dropped one.**
+The obvious structural discriminator is unavailable too, and it is worth writing
+down why so nobody re-derives it: `vt::Exl3Gemm` runs `had_r_128` over `A[m, k]`
+and over `C[m, n]`, and that transform refuses a row length that is not a
+multiple of 128. So `k % 128 == 0` and `n % 128 == 0` hold on every legal call,
+which makes shape 1 (`k % 16`, `n % 128`) and shape 2 (`k % 32`, `n % 128`)
+compatible with every legal call, and makes the selector's own answer compatible
+in every branch it has. There is no legal `(k, n)` at which a forced shape
+succeeds and the selected shape would have refused.
+
+Two things settle it instead, and the gate carries both.
+
+1. **The refusal proves the field is READ.** Forcing shape 4 at `n = 768`
+   (`768 % 512 == 256`) must throw `no compatible exl3_gemm kernel shape`,
+   because `Exl3GemmShapeCompat(4, k, 768)` is false. A launcher that ignored
+   `force_shape_idx` would select shape 3 there -- `768 % 256 == 0` -- and
+   return numbers. This case is deterministic and needs no tolerance.
+
+2. **Byte inequality across shapes proves each kernel is a DIFFERENT one.** The
+   four shapes decompose the same problem into different `(k, n)` tile grids,
+   so `Exl3GemmNumSms` gives them different block counts and the split-K
+   reduction over `k` runs a different tree. At `k 256 n 512` the slice counts
+   are 64, 32, 16 and 16, and shapes 3 and 4 reach their equal count by
+   different routes -- 2 n-tiles of 8 k-tiles against 1 n-tile of 16 -- so the
+   per-output reduction chains differ in length. The output is taken in **f32**
+   precisely so an fp16 store cannot absorb that difference. If two forced
+   shapes returned byte-identical outputs the case would be measuring one
+   kernel twice, which is the same failure the `(3,1)`/`(3,2)` discrimination
+   check in `test_exl3_gemv.cpp` exists to catch.
+
+### Gates (W5)
+
+| Gate | Owner |
+|---|---|
+| each of shapes 1, 2, 3, 4 FORCED and agreeing with the CPU arm at `rel_rms <= 1.0e-3` | implementer |
+| forcing shape 4 at `n = 768` REFUSES by name | implementer |
+| no two forced shapes return byte-identical output | implementer |
+| a forced index changed to a wrong one goes RED | implementer/reviewer |
+
+Device, not host: `cuda_exl3.cu` does not compile in a CPU build, so a green CPU
+preflight says nothing here and is never reported as a device result.
+
+### Stop conditions (W5)
+
+- Two forced shapes agree byte for byte. The case is not discriminating. Find
+  out which kernel ran before touching the assertion; never delete it.
+- A forced shape misses the bound. The instantiation is wrong. Never widen the
+  bound to admit it.
+
 ## Owed
 
 - ~~**W1b: nothing constructs `Exl3LinearMethod` yet.**~~ **RETIRED**: the

@@ -4013,3 +4013,61 @@ TEST_CASE("BatchedMatmul matches the CPU oracle within NMSE <= 5e-4, dense and s
     }
   }
 }
+
+TEST_CASE("what an unregistered ROCm op actually does on this board: tier, or refusal") {
+  // #2715 says the eight MLA/DSA ops "do not refuse; they install CPU host
+  // kernels and run" on gfx1151, so the damage is speed. That was TRUE of the
+  // tree it was written against and this case exists because it may no longer
+  // be. `6b97a6800` (#2511, "stop giving migratable memory to a part that
+  // cannot fault and recover") narrowed the managed-allocation branch to
+  // `PageableMemoryAccess == 1`, and made the unified claim FOLLOW the
+  // allocator (include/vt/rocm/rocm_arch.h:180-195). gfx1151 reports
+  // `PageableMemoryAccess = 0`. On a tree carrying that commit the tier is
+  // therefore WITHDRAWN on this board, and a missing op is a REFUSAL, not a
+  // slow path — which would make W2 and W3 blocking for GENERATION, not only
+  // for measurement.
+  //
+  // This case does not decide that by reading the source. It asks the seam, on
+  // whatever board it runs on, and asserts the consequence EITHER WAY, so it is
+  // a measurement and not a restatement. `ReferenceTierEligible` is the public
+  // safety gate (include/vt/op_provider.h:248-252) and it is side-effect free.
+  bool rocm_built = false;
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt == DeviceType::kROCM) rocm_built = true;
+  }
+  if (!rocm_built) return;
+
+  vt::Backend& dev = vt::GetBackend(DeviceType::kROCM);
+  const bool eligible = vt::ReferenceTierEligible(DeviceType::kROCM);
+  // Built as one std::string first: MESSAGE expands to `mb * __VA_ARGS__`, so a
+  // multi-term `+` chain binds against the builder rather than the string.
+  const std::string tier =
+      std::string("ROCm reference tier: UnifiedMemory=") +
+      (dev.UnifiedMemory() ? "1" : "0") + " DeviceMemoryIsHostAddressable=" +
+      (dev.DeviceMemoryIsHostAddressable() ? "1" : "0") + " ReferenceTierEligible=" +
+      (eligible ? "1" : "0");
+  MESSAGE(tier);
+
+  // The probe op must be one ROCm does not register. `kMlaDecodeAttention` is
+  // that today and W3 is what changes it; when it does, there is nothing left
+  // to probe here and this case has no business failing for that reason.
+  if (vt::OpRegistered(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM)) {
+    MESSAGE("kMlaDecodeAttention is now registered on ROCm (W3 landed) — probe skipped");
+    return;
+  }
+
+  const unsigned long long before = vt::GetReferenceTierHits();
+  if (eligible) {
+    // The tier is live: the miss installs a host kernel and counts itself.
+    CHECK_NOTHROW((void)vt::GetOp(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+    CHECK(vt::GetReferenceTierHits() > before);
+    MESSAGE("VERDICT: the tier is LIVE here — the missing MLA ops are a SPEED cost");
+  } else {
+    // No tier: `GetOp` refuses by name rather than handing a host kernel a
+    // pointer the host may not dereference.
+    CHECK_THROWS((void)vt::GetOp(vt::OpId::kMlaDecodeAttention, DeviceType::kROCM));
+    CHECK(vt::GetReferenceTierHits() == before);
+    MESSAGE("VERDICT: the tier is WITHDRAWN here — the missing MLA ops are a REFUSAL, "
+            "so W2/W3 block GENERATION and not only measurement");
+  }
+}

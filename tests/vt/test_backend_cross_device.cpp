@@ -3750,7 +3750,12 @@ TEST_CASE("ConcatAndCacheMla writes the concatenated MLA entry BIT-EXACTLY") {
   // is also what a PADDED slot must still be holding at the end.
   const std::vector<float> seed(kCacheN, -13.25f);
   std::vector<float> seed_padded(static_cast<size_t>(kCacheN + 2 * kGuard), 88.125f);
-  std::copy(seed.begin(), seed.end(), seed_padded.begin() + kGuard);
+  // A plain loop rather than std::copy: this file does not include <algorithm>
+  // and picking one up transitively from a libstdc++ header is not portable to
+  // the ROCm toolchain's libc++.
+  for (int64_t i = 0; i < kCacheN; ++i) {
+    seed_padded[static_cast<size_t>(kGuard + i)] = seed[static_cast<size_t>(i)];
+  }
 
   // Slots are shuffled across blocks, not ascending: a kernel that walked the
   // cache linearly instead of through the slot map passes on an identity map.

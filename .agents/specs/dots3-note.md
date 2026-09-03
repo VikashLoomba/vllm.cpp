@@ -6551,15 +6551,22 @@ pin, which carries no `dots3_note` at all):
 | the resampler's DEFAULT method | `method: Literal["pyav", "scipy", "soxr"] = "pyav"` | `vllm/multimodal/audio.py:283`, dispatch at `:305-316` |
 | what `pyav` is | `av.AudioResampler` — **libswresample** through PyAV/FFmpeg | `vllm/multimodal/audio.py:174-229` |
 
-**libswresample is not bit-identical to itself.** Measured locally with
-ffmpeg 6.1.1, the same binary and the same input, differing only in CPU
-dispatch:
+**libswresample is not bit-identical to itself.** #2828 measured this, and this
+slice REPRODUCED it rather than relaying it — ffmpeg 6.1.1-3ubuntu5, one binary,
+one input, differing only in CPU dispatch:
 
 ```text
 ffmpeg -i in.wav -af aresample=16000 -c:a pcm_f32le a.wav
 ffmpeg -cpuflags 0 -i in.wav -af aresample=16000 -c:a pcm_f32le b.wav
--> identical: False   ndiff 24691/32000   maxabs 9.686e-08
 ```
+
+| Run | `identical` | differing samples | worst \|delta\| |
+|---|---|---|---|
+| #2828's | False | 24691 / 32000 | 9.686e-08 |
+| this slice's, on its own 2 s three-tone probe | **False** | **19846 / 32000** | **2.980e-07** |
+
+The counts differ because the probe signals do; the fact does not, and it is the
+fact the decision rests on.
 
 A bit-exact gate against upstream's default is therefore impossible **in
 principle** and not merely inconvenient. Two further facts point the same way:
@@ -6585,20 +6592,45 @@ switch**, and vLLM already ships that arm in production for another model:
 permanently, for the reason above, and the refusal names it.
 
 **The distance from the real default is measured and recorded here so nobody
-re-derives it.** 44100 -> 16000, interior only, on band-limited content: scipy
-is **51.36 dB** down from libswresample's answer, soxr 46.59, torchaudio 26.72.
-Of the three arms this tree could reach, the one upstream also ships is also the
-closest.
+re-derives it — AND SO THAT NOBODY QUOTES IT WITHOUT ITS PROBE.** #2828 records
+scipy at 51.36 dB from libswresample, soxr at 46.59 and torchaudio at 26.72, on
+"band-limited content". This slice re-measured all three against ffmpeg 6.1.1 at
+44100 -> 16000, interior only (2000 samples trimmed from each end), and the
+ordering holds — but **only on content that reaches the OUTPUT Nyquist**, and
+that qualifier is load-bearing:
+
+| Probe (2 s at 44100) | scipy | soxr | torchaudio |
+|---|---|---|---|
+| 0 -> 7500 Hz sweep | **51.78 dB** | 44.63 | 29.02 |
+| noise band-limited to 7500 Hz | **37.47 dB** | 28.19 | 27.08 |
+| noise band-limited to 4000 Hz | 61.22 | **96.45** | 62.84 |
+| three tones at 440 / 1234 / 3000 Hz | 62.72 | **93.84** | 70.12 |
+
+The first row reproduces #2828's three numbers to within about 2 dB, so
+"band-limited content" there means content that FILLS the band up to the new
+Nyquist, not content sitting well below it. **On content well below the
+transition band the ordering INVERTS and soxr wins by 30 dB**, because a
+resampler's transition band cannot matter where there is no energy in it. A
+speech encoder sees the first kind. Quoting 51.36 without the probe would make a
+signal-dependent measurement read as a property of the algorithms.
 
 **Do NOT reuse `Ltx2ResampleWaveform`**
 (`src/vllm/model_executor/models/ltx2_audio_vae.cpp:1151`, landed by
 [#2583](https://github.com/mudler/vllm.cpp/issues/2583)). It is a genuine
 polyphase resampler and it is the tempting reuse. It is ~25 dB FURTHER from this
-oracle on exactly the band-limited content a speech encoder sees, because
-torchaudio's defaults are a short kernel (`lowpass_filter_width=6`, a Hann
-window) against swr's 32-tap kaiser-9. Reaching for it would trade a 51.36 dB
-answer for a 26.72 dB one and would look like a simplification. It is not one,
-and this paragraph exists so the next reader does not make it.
+oracle on exactly the content a speech encoder sees, because torchaudio's
+defaults are a short kernel (`lowpass_filter_width=6`, a Hann window) against
+swr's 32-tap kaiser-9. **This slice measured that gap rather than repeating it:
+22.8 dB on the 0 -> 7500 Hz sweep (51.78 against 29.02) and 10.4 dB on
+band-limited noise**, which is #2828's ~25 dB confirmed. Reaching for it would
+trade a 51.78 dB answer for a 29.02 dB one and would look like a simplification.
+It is not one, and this paragraph exists so the next reader does not make it.
+
+**And the same caveat applies in the other direction.** On the three-tone probe
+torchaudio scores 70.12 dB and BEATS scipy, because the short kernel's poor
+transition band never gets exercised. A reviewer who reaches for
+`Ltx2ResampleWaveform` and validates it on a low-frequency tone will find it
+excellent. The table above is why that would be the wrong probe.
 
 #### 4.17.3 The algorithm, stated exactly, and VERIFIED against scipy's source
 
@@ -6674,7 +6706,7 @@ So the claim this slice makes is bounded, and it is this: **the port equals
 `scipy.signal.resample_poly` on a `float64` input, narrowed to `float32`, within
 a measured tolerance.** It does NOT claim bit-identity with scipy's own
 `float32` arm, and it does not claim anything at all about libswresample beyond
-the 51.36 dB distance recorded in §4.17.2.
+the probe-qualified distances recorded in §4.17.2.
 
 #### 4.17.5 The seam, and why it is opted into PER MODEL
 
@@ -7644,8 +7676,13 @@ Carried openly under option B (§6.4), not waived:
   defaults come from an unpinned linked binary, and whose auto-resolved `cutoff`
   is unreadable from outside the source. That refusal does not expire when
   somebody works harder; §4.17.1 is the reason. The recorded distance between
-  the two, so nobody re-derives it: scipy is 51.36 dB from swresample's answer
-  on band-limited content at 44100 -> 16000, soxr 46.59, torchaudio 26.72.
+  the two, re-measured by this slice rather than relayed and reported WITH ITS
+  PROBE, because the ordering is signal-dependent: on a 0 -> 7500 Hz sweep at
+  44100 -> 16000 scipy is 51.78 dB from swresample's answer, soxr 44.63 and
+  torchaudio 29.02, which reproduces #2828's 51.36 / 46.59 / 26.72 to about
+  2 dB. On content well below the new Nyquist all three are good and soxr wins
+  by 30 dB, so the number means nothing without the signal it was measured on
+  (§4.17.2).
   `Ltx2ResampleWaveform` ([#2583](https://github.com/mudler/vllm.cpp/issues/2583),
   `src/vllm/model_executor/models/ltx2_audio_vae.cpp:1151`) is deliberately NOT
   reused: it is a real polyphase resampler, and it is ~25 dB FURTHER from this

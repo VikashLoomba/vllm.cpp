@@ -22,8 +22,12 @@ namespace vllm::multimodal {
 // source. `"scipy"` is ANOTHER ARM OF THE SAME SWITCH (`audio.py:305-316`), and
 // vLLM already ships it in production for another model
 // (`vllm/model_executor/models/phi4mm.py:580`). Measured distance from the real
-// default at 44100 -> 16000 on band-limited content: scipy 51.36 dB, soxr
-// 46.59, torchaudio 26.72.
+// default at 44100 -> 16000, interior only, ON A 0 -> 7500 Hz SWEEP — content
+// that reaches the OUTPUT Nyquist, which is what a speech encoder sees: scipy
+// 51.78 dB, soxr 44.63, torchaudio 29.02. THE PROBE IS PART OF THE NUMBER. On
+// content well below the new Nyquist the ordering inverts and soxr wins by
+// 30 dB, because a resampler's transition band cannot matter where there is no
+// energy in it. Spec §4.17.2 carries the four-probe table.
 //
 // See `.agents/specs/dots3-note.md` §4.17 for the decision, the algorithm
 // written out step by step, and what its gate does and does not establish.

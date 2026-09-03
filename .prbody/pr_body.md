@@ -17,15 +17,28 @@ WHAT IS IMPLEMENTED INSTEAD IS STILL UPSTREAM. `resample_audio_scipy`
 (vllm/multimodal/audio.py:232-250 @ 9035151d6) is another arm of upstream's own
 switch, and vLLM already ships it in production for another model
 (vllm/model_executor/models/phi4mm.py:580). The `pyav` arm is refused permanently
-and the refusal says why. Recorded distance from the real default at 44100 -> 16000
-on band-limited content, so nobody re-derives it: scipy 51.36 dB, soxr 46.59,
-torchaudio 26.72.
+and the refusal says why. Distance from the real default, re-measured here rather than relayed
+and reported WITH ITS PROBE, because the ordering is signal-dependent: on a
+0 -> 7500 Hz sweep at 44100 -> 16000, scipy is 51.78 dB from swresample, soxr 44.63
+and torchaudio 29.02. That reproduces the numbers in #2828 to about 2 dB, and it
+also shows what "band-limited content" has to mean there: content that FILLS the
+band up to the new Nyquist. On content well below it all three are good and soxr
+wins by 30 dB, because a resampler's transition band cannot matter where there is
+no energy in it. Spec section 4.17.2 carries the four-probe table, so nobody quotes
+one number as a property of the algorithms.
+
+The non-determinism was reproduced too, not relayed: 19846 of 32000 samples differ
+at a worst 2.980e-07 on this slice's own probe, against #2828's 24691 and 9.686e-08
+on its.
 
 `Ltx2ResampleWaveform` (#2583) is deliberately NOT reused. It is a genuine polyphase
-resampler and it is the tempting reuse. It is about 25 dB FURTHER from this oracle on
-exactly the band-limited content a speech encoder sees, because torchaudio's defaults
-are a short Hann kernel against swr's 32-tap kaiser-9. The spec says so, so that the
-next reader does not simplify it back.
+resampler and it is the tempting reuse. It is 22.8 dB FURTHER from this oracle on the
+0 -> 7500 Hz sweep, because torchaudio's defaults are a short Hann kernel against
+swr's 32-tap kaiser-9 — #2828's "about 25 dB", measured here. The caveat runs the
+other way too: on a low-frequency tone it scores 70.12 dB and BEATS scipy, because
+the short kernel's poor transition band never gets exercised. A reviewer who
+validates it on the wrong probe will find it excellent. The spec says so, so that
+the next reader does not simplify it back.
 
 THE ALGORITHM WAS VERIFIED, NOT TRANSCRIBED. Spec section 4.17.3 writes out
 `resample_poly`'s six steps as scipy 1.17.1's own source states them, and the

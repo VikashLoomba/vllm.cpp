@@ -129,7 +129,7 @@ described.
 - Focused: `ctest -R test_grow_only_stream_scratch`, red before, green after.
 - Build: the two `.hip` translation units compile on `strix:gpu0` (gfx1151).
 - Reachability: the production call sites at
-  `rocm_grouped_gemm.hip:842,862,915,940` reach `Ensure`; deleting the routing
+  `rocm_grouped_gemm.hip:841,861,914,939` reach `Ensure`; deleting the routing
   in a scratch copy must red the focused gate.
 
 ## Stop conditions

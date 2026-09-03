@@ -22,7 +22,26 @@
 //    the debt it pays, so leaving the two disagreeing was the record contradicting
 //    the tree.
 //
-// ─── DTYPE: THIS IS THE CPU REFERENCE ARM, AND f32 IS NOT WHAT SHIPS ─────────
+// ─── DTYPE: BOTH ARMS ARE LIVE, AND bf16 IS THE ONE THAT SHIPS ──────────────
+//
+// A24 wave 3 (row LTX25-A24-VIDEO-VAE-BF16, issue #2786) landed the bf16 arm the
+// paragraphs below were written owing. The decode now runs at
+// `Ltx2VaeWeights::dtype` and the render loads that bag at `kBF16`, so f32 is the
+// parity REFERENCE and not the shipping path. Read what follows as the reason the
+// reference exists and as the record of what an f32-only oracle cannot see; the
+// six rounding rules the bf16 arm applies are stated at their own sites and
+// measured in the row's spec section 4.
+//
+// WHAT THE bf16 ARM IS NOT BIT-EXACT AGAINST, said here rather than discovered:
+// torch BLOCKS its convolution reduction and this port does not, so at the gated
+// fixture's shapes the two disagree on 3 to 5 outputs of 8192 to 24576, and this
+// chain amplifies one such last bit into 0.0117 at the output. The whole-decode
+// bf16 golden therefore carries NO value bound -- a bound wide enough to admit
+// the port would admit a real defect, and tests/vllm/models/test_ltx2_vae.cpp
+// asserts that relation rather than asserting a number. The arithmetic is gated
+// bit-exactly one rule per kernel instead.
+//
+// ─── DTYPE: THE f32 REFERENCE ARM, AND WHY IT IS NOT WHAT SHIPS ─────────────
 // Every buffer below is f32, and unlike the audio VAE next door that is NOT an
 // upstream-grounded choice — it is the choice a reference arm makes, and it is
 // annotated here because AGENTS.md requires an f32 on a model path to carry a
@@ -1457,7 +1476,14 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
   const auto Round = [dt](float v) {
     return dt == vt::DType::kBF16 ? vt::BF16ToF32(vt::F32ToBF16(v)) : v;
   };
-  std::vector<float> staged = latent;
+  // `sample = sample.to(weights_dtype)` (conv_video_decoder.py:284) happens BEFORE
+  // the noise blend and before `un_normalize`, so the latent is already on the
+  // weights' grid when the prologue's arithmetic starts. Narrowing it only at the
+  // upload -- which is where this function puts the volume on the device -- would
+  // run two rounding-sensitive expressions on an f32 stream and round once at the
+  // end, and that is a different number.
+  std::vector<float> staged(latent.size());
+  for (size_t i = 0; i < latent.size(); ++i) staged[i] = Round(latent[i]);
 
   // --- noise + denormalize (conv_video_decoder.py:286-301) ---
   if (config.timestep_conditioning) {

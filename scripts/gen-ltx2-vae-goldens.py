@@ -920,6 +920,508 @@ def section_conv_video_decoder(out) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Sections 5e/5f — THE BFLOAT16 ARM (A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16,
+# issue #2786).
+#
+# Upstream resolves ONE pipeline dtype and it is bfloat16
+# (ltx-pipelines/.../distilled.py:109), handed to `VideoDecoder` at `:148`. Every
+# section above runs the module in f32, which is the PARITY arm and stays; this
+# one runs the SAME arm with the module and the latent at bfloat16, so the port's
+# bf16 branch has an oracle at all. Without it the six rounding rules the port
+# implements are ungated, and `ltx2_video_vae.cpp` already records why an f32
+# oracle cannot supply one: "a dtype comparison against it is vacuous by
+# construction".
+#
+# TWO HARNESS ADAPTATIONS, both recorded because both change something.
+#
+#   1. `fill_from_stream` still builds f32 parameters and the module is then
+#      `.to(torch.bfloat16)`. That is not the cast the file warns about -- it is
+#      exactly `module.to(dtype)` on an f32 state dict, which is what
+#      `Ltx2LoadVaeWeights(..., kBF16)` does to a checkpoint. Both sides therefore
+#      narrow the SAME f32 values once, and the manifest is unchanged.
+#
+#   2. The patched `torch.randn` HONOURS the `dtype=` keyword upstream passes
+#      (conv_video_decoder.py:288-294, resnet.py:115) by narrowing the shared f32
+#      stream, rather than drawing at bf16. `torch.randn(dtype=bfloat16)` at a
+#      fixed seed is a DIFFERENT SEQUENCE from `torch.randn(dtype=float32)` -- not
+#      the f32 stream rounded -- so mirroring it would change every render digest
+#      this repository has captured. That decision is #2780 and is the
+#      developer's; this generator mirrors the port's recorded divergence so the
+#      two sides compare the same thing.
+#
+# WHY THE SHIPPED FIXTURE SEPARATES THE _RMSNorm2D ORDERING, which is the one
+# rule a badly chosen width would hide. `_RMSNorm2D` is
+# `F.normalize(x, dim=1) * (self.scale * self.gamma)` (attention.py:23), and at a
+# channel count whose square root is a power of two every ordering of that
+# product agrees -- measured 0 of 4800 for all three at C=64. This decoder's
+# `attn` block sits at 32 channels, and `sqrt(32)` is not representable in
+# bfloat16, so the ordering is a first-order term here. It is stated rather than
+# assumed because a later fixture change that moved the attn block to 64 channels
+# would silently mute it.
+def section_conv_video_decoder_bf16(out) -> None:
+    import torch
+    import torch.nn as nn
+
+    from ltx_core.model.common.normalization import PixelNorm
+    from ltx_core.model.video_vae.conv_video_decoder import ConvVideoDecoder
+    from ltx_core.model.video_vae.enums import NormLayerType, PaddingModeType
+
+    decoder = ConvVideoDecoder(
+        decoder_blocks=VIDEO_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        decoder_spatial_padding_mode=PaddingModeType.REFLECT,
+        **VIDEO_DEC,
+    ).eval()
+    manifest = fill_from_stream(decoder, prefix="ltx2.videodec.")
+    decoder = decoder.to(torch.bfloat16)
+    latent = make_input("ltx2.videodec.input", VIDEO_LATENT, 1.0).to(torch.bfloat16)
+
+    draws: list[int] = []
+    real_randn = torch.randn
+
+    def patched_randn(*args, **kwargs):
+        shape = tuple(args[0]) if len(args) == 1 and not isinstance(args[0], int) else tuple(args)
+        count = int(np.prod(shape)) if shape else 1
+        values = ltx_rand(f"ltx2.videodec.noise.{len(draws)}", count)
+        draws.append(count)
+        drawn = torch.from_numpy(values.astype(np.float32)).reshape(shape)
+        # ADAPTATION 2. The f32 stream, NARROWED -- see this section's header.
+        dtype = kwargs.get("dtype")
+        return drawn.to(dtype) if dtype is not None else drawn
+
+    # THE ATTENTION BACKEND IS PINNED, AND AT bf16 THAT IS NOT A FORMALITY.
+    # `AttnBlock3D` resolves `AttentionFunction.PYTORCH` once in `__init__`
+    # (video_vae/attention.py:50, :53) and calls SDPA. Its docstring argues that
+    # the single-head `head_dim == in_channels` exceeds FlashAttention's limit so
+    # the dispatcher falls back to an efficient or math kernel -- and that is NOT
+    # what happens. Measured on this CPU with `sdpa_kernel`, at head_dim 64, 128
+    # and 256, the bare call is BIT-IDENTICAL to FLASH (0 of 8192, 0 of 16384, 0
+    # of 32768) and 37-38% of words away from MATH.
+    #
+    # At f32 the question does not arise: FlashAttention serves only fp16 and
+    # bf16, so every f32 section above is already getting MATH, which is why the
+    # port's own f32 softmax matches them. At bf16 the default arm is a kernel
+    # this port does not reproduce, so the golden is taken under MATH and the
+    # DISTANCE to the unpinned arm is emitted beside it rather than hidden. The
+    # arm upstream actually runs is therefore NOT gated here, and the row's spec
+    # says so under `## Risks`.
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    torch.randn = patched_randn
+    try:
+        with sdpa_kernel(SDPBackend.MATH):
+            y = decoder(latent)
+    finally:
+        torch.randn = real_randn
+
+    draws_bare: list[int] = []
+
+    def patched_randn_bare(*args, **kwargs):
+        shape = tuple(args[0]) if len(args) == 1 and not isinstance(args[0], int) else tuple(args)
+        count = int(np.prod(shape)) if shape else 1
+        values = ltx_rand(f"ltx2.videodec.noise.{len(draws_bare)}", count)
+        draws_bare.append(count)
+        drawn = torch.from_numpy(values.astype(np.float32)).reshape(shape)
+        dtype = kwargs.get("dtype")
+        return drawn.to(dtype) if dtype is not None else drawn
+
+    torch.randn = patched_randn_bare
+    try:
+        y_bare = decoder(latent)
+    finally:
+        torch.randn = real_randn
+    backend_gap = float((y.float() - y_bare.float()).abs().max())
+    print(f"[bf16 arm] MATH vs the module as constructed: max|diff| = {backend_gap:g}",
+          file=sys.stderr)
+
+    assert y.dtype == torch.bfloat16, f"the bf16 arm returned {y.dtype}"
+
+    # THE ARM IS NOT THE f32 ARM, measured rather than asserted. If the two agreed
+    # everywhere this whole section would be a second copy of section 5 and would
+    # gate nothing new.
+    f32_decoder = ConvVideoDecoder(
+        decoder_blocks=VIDEO_BLOCKS,
+        norm_layer=NormLayerType.PIXEL_NORM,
+        decoder_spatial_padding_mode=PaddingModeType.REFLECT,
+        **VIDEO_DEC,
+    ).eval()
+    fill_from_stream(f32_decoder, prefix="ltx2.videodec.")
+    draws32: list[int] = []
+
+    def patched_randn32(*args, **kwargs):
+        shape = tuple(args[0]) if len(args) == 1 and not isinstance(args[0], int) else tuple(args)
+        count = int(np.prod(shape)) if shape else 1
+        values = ltx_rand(f"ltx2.videodec.noise.{len(draws32)}", count)
+        draws32.append(count)
+        return torch.from_numpy(values.astype(np.float32)).reshape(shape)
+
+    torch.randn = patched_randn32
+    try:
+        y32 = f32_decoder(make_input("ltx2.videodec.input", VIDEO_LATENT, 1.0))
+    finally:
+        torch.randn = real_randn
+    arm_gap = float((y.float() - y32).abs().max())
+    assert arm_gap > 10 * GOLDEN_TOL, (
+        f"the bf16 arm must be measurably different from the f32 arm or it gates "
+        f"nothing new; max|diff| is only {arm_gap:g}"
+    )
+    print(f"[bf16 arm] conv video decoder: bf16 vs f32 max|diff| = {arm_gap:g}", file=sys.stderr)
+
+    # ── WHY THIS SECTION EMITS NO VALUE BOUND, MEASURED RATHER THAN ARGUED ──
+    #
+    # The port cannot be bit-identical to this golden and the reason is upstream's
+    # own convolution, not a rule the port gets wrong. `cpu_conv3d`'s contract is
+    # an f32 accumulator seeded with the bias and one rounding on store, which is
+    # what torch does -- but torch BLOCKS its reduction, and at this fixture's own
+    # convolution shapes the two association orders disagree on 3 to 5 outputs of
+    # 8192 to 24576, with max|diff| up to 0.015625. This chain then amplifies a
+    # single last-bit difference: perturbing ONE `conv_in` weight by ONE bf16 ulp
+    # moves the whole output by `kLtx2VideoDecBf16UlpSensitivity`.
+    #
+    # So a tolerance would have to be wider than that irreducible term -- and the
+    # three defect distances below say what such a tolerance would then admit.
+    # Each is a REAL rounding rule replaced by the hypothesis the row rejected,
+    # measured end to end on this fixture. This is wave 2's finding in a second
+    # place: a bound that admits the port admits real defects, so the C++ side
+    # applies NO value bound here and the arithmetic is gated bit-exactly, one
+    # rule per kernel, in section 5g.
+    from ltx_core.model.video_vae import attention as _vae_attn
+    from ltx_core.model.video_vae import ops as _vae_ops
+
+    def _rerun(dec):
+        local: list[int] = []
+
+        def _patched(*args, **kwargs):
+            shape = (tuple(args[0]) if len(args) == 1 and not isinstance(args[0], int)
+                     else tuple(args))
+            count = int(np.prod(shape)) if shape else 1
+            values = ltx_rand(f"ltx2.videodec.noise.{len(local)}", count)
+            local.append(count)
+            drawn = torch.from_numpy(values.astype(np.float32)).reshape(shape)
+            dtype = kwargs.get("dtype")
+            return drawn.to(dtype) if dtype is not None else drawn
+
+        torch.randn = _patched
+        try:
+            with sdpa_kernel(SDPBackend.MATH):
+                return dec(latent).float()
+        finally:
+            torch.randn = real_randn
+
+    def _fresh():
+        d = ConvVideoDecoder(
+            decoder_blocks=VIDEO_BLOCKS,
+            norm_layer=NormLayerType.PIXEL_NORM,
+            decoder_spatial_padding_mode=PaddingModeType.REFLECT,
+            **VIDEO_DEC,
+        ).eval()
+        fill_from_stream(d, prefix="ltx2.videodec.")
+        return d
+
+    base = y.float()
+    # DEFECT A: `un_normalize` keeps its statistics in f32 (ops.py:76-79 applies
+    # `.to(x)` to both registered buffers).
+    _d = _fresh()
+    _s32 = _d.per_channel_statistics.get_buffer("std-of-means").clone()
+    _m32 = _d.per_channel_statistics.get_buffer("mean-of-means").clone()
+    _orig_un = _vae_ops.PerChannelStatistics.un_normalize
+
+    def _bad_un(self, x):
+        return (
+            (x.float() * _s32.view(1, -1, 1, 1, 1)).to(x.dtype).float()
+            + _m32.view(1, -1, 1, 1, 1)
+        ).to(x.dtype)
+
+    _vae_ops.PerChannelStatistics.un_normalize = _bad_un
+    try:
+        defect_stats = float((base - _rerun(_d.to(torch.bfloat16))).abs().max())
+    finally:
+        _vae_ops.PerChannelStatistics.un_normalize = _orig_un
+
+    # DEFECT B: `_RMSNorm2D` multiplies by sqrt(C) and by gamma SEPARATELY instead
+    # of forming the gain first (attention.py:23).
+    _orig_rms = _vae_attn._RMSNorm2D.forward
+
+    def _bad_rms(self, x):
+        return (torch.nn.functional.normalize(x, dim=1) * self.scale) * self.gamma
+
+    _vae_attn._RMSNorm2D.forward = _bad_rms
+    try:
+        defect_rms = float((base - _rerun(_fresh().to(torch.bfloat16))).abs().max())
+    finally:
+        _vae_attn._RMSNorm2D.forward = _orig_rms
+
+    # DEFECT C: `nn.GroupNorm`'s affine kept in f32. On this fixture it is reached
+    # ONLY through `res_x_y`'s norm3, and it turns out not to reach the output at
+    # all -- which is exactly why section 5g gates it on the kernel directly.
+    _orig_gn = nn.GroupNorm.forward
+
+    def _bad_gn(self, x):
+        return torch.nn.functional.group_norm(
+            x.float(), self.num_groups, self.weight.float(), self.bias.float(), self.eps
+        ).to(x.dtype)
+
+    nn.GroupNorm.forward = _bad_gn
+    try:
+        defect_gn = float((base - _rerun(_fresh().to(torch.bfloat16))).abs().max())
+    finally:
+        nn.GroupNorm.forward = _orig_gn
+
+    # The chain's response to ONE last bit, which is the irreducible term.
+    _d = _fresh().to(torch.bfloat16)
+    with torch.no_grad():
+        _flat = dict(_d.named_parameters())["conv_in.conv.weight"].reshape(-1)
+        _w = _flat[0].view(torch.int16).item()
+        _flat[0] = torch.tensor([_w + 1], dtype=torch.int16).view(torch.bfloat16)[0]
+    ulp_sensitivity = float((base - _rerun(_d)).abs().max())
+
+    print(f"[bf16 arm] defects: f32 statistics {defect_stats:g}, _RMSNorm2D order "
+          f"{defect_rms:g}, f32 GroupNorm affine {defect_gn:g}; one-ulp sensitivity "
+          f"{ulp_sensitivity:g}", file=sys.stderr)
+    assert ulp_sensitivity > 0, (
+        "the one-ulp sensitivity probe moved nothing, so it cannot support the "
+        "claim that this arm has an irreducible term"
+    )
+
+    out.write("// --- section 5e: the BF16 arm of ConvVideoDecoder (A24 wave 3, #2786) ---\n")
+    emit_scalar(out, "kLtx2VideoDecBf16OutC", y.shape[1])
+    emit_scalar(out, "kLtx2VideoDecBf16OutT", y.shape[2])
+    emit_scalar(out, "kLtx2VideoDecBf16OutH", y.shape[3])
+    emit_scalar(out, "kLtx2VideoDecBf16OutW", y.shape[4])
+    emit_scalar(out, "kLtx2VideoDecBf16NoiseDraws", len(draws))
+    # How far the bf16 arm sits from the f32 one on the SAME fixture. The C++ side
+    # requires the port's bf16 output to be closer to this golden than this
+    # distance, so "the port just ran the f32 arm" is a red rather than a pass.
+    out.write("inline constexpr double kLtx2VideoDecBf16ArmGap = "
+              + _cxx_float(arm_gap, 9) + ";\n")
+    # The distance from the golden to the arm upstream actually runs, printed so
+    # that "held to MATH" is a stated limit with a number rather than a footnote.
+    out.write("inline constexpr double kLtx2VideoDecBf16BackendGap = "
+              + _cxx_float(backend_gap, 9) + ";\n")
+    # The irreducible term and what a bound wide enough to admit it would let
+    # through. The C++ side asserts the RELATION rather than any of the numbers,
+    # so this is a measurement that justifies the absence of a bound and not a
+    # bound in disguise.
+    out.write("inline constexpr double kLtx2VideoDecBf16UlpSensitivity = "
+              + _cxx_float(ulp_sensitivity, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecBf16DefectStats = "
+              + _cxx_float(defect_stats, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecBf16DefectRmsOrder = "
+              + _cxx_float(defect_rms, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecBf16DefectGroupNormAffine = "
+              + _cxx_float(defect_gn, 9) + ";\n\n")
+    emit_manifest(out, "kLtx2VideoDecBf16Param", manifest)
+    emit_f32(out, "kLtx2VideoDecBf16Golden", y.float().numpy())
+
+    # --- section 5f: the PixelNorm epsilon, at the scales where it separates ---
+    #
+    # The decoder golden above cannot gate this constant's WIDTH and saying so is
+    # the point. `PixelNorm.forward` adds `self.eps` to a bf16 `mean_sq`
+    # (normalization.py:37-40), so what reaches the arithmetic is
+    # `bf16(1e-8) = 1.0011717677116394e-08` and not `1e-8` -- and holding the rest
+    # of the chain fixed while varying ONLY that width separates on 0 of 8192
+    # values at ordinary magnitude and on 842 of 8192 at a row scale of 2^-14.
+    # Removing the epsilon entirely is a DIFFERENT question and separates from
+    # 2^-10. A probe at the shipped fixture's scale is a mute switch for both, so
+    # this emits three scales and the count each one separates on, and REFUSES to
+    # emit an arm that separates nothing.
+    # BATCH 1, DELIBERATELY. `PixelNorm` reduces over dim 1, and the port's kernel
+    # takes a channel-major [C, spatial] volume at batch 1 -- torch's memory order
+    # puts a batch axis OUTSIDE the channel axis, so a batch-2 tensor flattens to
+    # something the kernel would read as a different volume entirely. The first
+    # form of this probe had batch 2 and reported the port 0.44 away from
+    # upstream, which was the layout and not the arithmetic.
+    shape = (1, 8, 2, 3, 3)
+    scales = [0, 10, 14]
+    out.write("// --- section 5f: the PixelNorm epsilon, where its WIDTH binds ---\n")
+    out.write("inline constexpr int64_t kLtx2PixelNormEpsScales[] = {\n    "
+              + ", ".join(str(-e) for e in scales) + ",\n};\n")
+    golden = []
+    rejected_f32_eps = []
+    rejected_no_eps = []
+    sep_width = []
+    sep_read = []
+    for e in scales:
+        x = torch.from_numpy(
+            ltx_rand(f"ltx2.pixelnorm.bf16.{e}", int(np.prod(shape)))
+            .astype(np.float32)
+        ).reshape(shape) * (2.0 ** -e)
+        xb = x.to(torch.bfloat16)
+        up = PixelNorm(dim=1, eps=1e-8)(xb)
+        ms = torch.mean(xb ** 2, dim=1, keepdim=True)
+        # REJECTED 1: the epsilon added in f32 and the result rounded back. Same
+        # chain, one width changed.
+        wide = (ms.float() + 1e-8).to(torch.bfloat16)
+        r_f32 = xb / torch.sqrt(wide)
+        # REJECTED 2: no epsilon at all -- "is it read", not "at what width".
+        r_none = xb / torch.sqrt(ms)
+        n = up.numel()
+        sw = int((r_f32.reshape(-1) != up.reshape(-1)).sum())
+        sr = int((r_none.reshape(-1) != up.reshape(-1)).sum())
+        sep_width.append(sw)
+        sep_read.append(sr)
+        golden.append(up.float().reshape(-1).numpy())
+        rejected_f32_eps.append(r_f32.float().reshape(-1).numpy())
+        rejected_no_eps.append(r_none.float().reshape(-1).numpy())
+        print(f"[bf16 eps] scale 2^-{e}: f32-eps separates {sw}/{n}, "
+              f"no-eps separates {sr}/{n}", file=sys.stderr)
+    assert max(sep_width) > 0, (
+        "the epsilon WIDTH probe separates nothing at any emitted scale, so it "
+        "would gate the constant at zero -- rebuild it rather than emitting it"
+    )
+    assert max(sep_read) > 0, (
+        "the epsilon READ probe separates nothing at any emitted scale"
+    )
+    emit_scalar(out, "kLtx2PixelNormEpsChannels", shape[1])
+    emit_scalar(out, "kLtx2PixelNormEpsSpatial", shape[0] * shape[2] * shape[3] * shape[4])
+    out.write("inline constexpr int64_t kLtx2PixelNormEpsWidthSeparating[] = {\n    "
+              + ", ".join(str(v) for v in sep_width) + ",\n};\n")
+    out.write("inline constexpr int64_t kLtx2PixelNormEpsReadSeparating[] = {\n    "
+              + ", ".join(str(v) for v in sep_read) + ",\n};\n\n")
+    emit_f32(out, "kLtx2PixelNormEpsInput",
+             np.concatenate([
+                 ltx_rand(f"ltx2.pixelnorm.bf16.{e}", int(np.prod(shape))).astype(np.float32)
+                 * (2.0 ** -e)
+                 for e in scales
+             ]))
+    emit_f32(out, "kLtx2PixelNormEpsGolden", np.concatenate(golden))
+    emit_f32(out, "kLtx2PixelNormEpsRejectedF32Eps", np.concatenate(rejected_f32_eps))
+    emit_f32(out, "kLtx2PixelNormEpsRejectedNoEps", np.concatenate(rejected_no_eps))
+
+
+# ---------------------------------------------------------------------------
+# Section 5g — THE PER-KERNEL BF16 RULES, each with the answer it rejects.
+#
+# Section 5e holds the whole chain and is the gate that matters; these hold ONE
+# rounding rule each, so a red says WHICH rule moved instead of only that the
+# clip did. Every arm is BATCH 1 and channel-major, because the port's kernels
+# take a [C, spatial] volume and torch puts a batch axis outside the channel axis
+# -- the first form of the PixelNorm probe had batch 2 and read 0.44 away from
+# upstream, which was the layout and not the arithmetic.
+#
+# Each arm emits upstream's answer AND the hypothesis it rejects, with the count
+# the two differ on, and REFUSES to emit an arm whose alternatives all agree.
+def section_video_vae_bf16_kernels(out) -> None:
+    import torch
+    import torch.nn as nn
+
+    BF = torch.bfloat16
+
+    def stream(name, count, scale=1.0):
+        return torch.from_numpy(
+            (ltx_rand(name, count) * scale).astype(np.float32)
+        )
+
+    def sep(a, b):
+        return int((a.reshape(-1) != b.reshape(-1)).sum())
+
+    out.write("// --- section 5g: the per-kernel bf16 rules, with what they reject ---\n")
+
+    # --- GroupNorm: the AFFINE narrows, the statistics do not ------------------
+    C, G, T, H, W = 8, 2, 2, 3, 3
+    n = C * T * H * W
+    gn = nn.GroupNorm(G, C, eps=1e-6)
+    with torch.no_grad():
+        gn.weight.copy_(stream("ltx2.gnbf16.weight", C) * 0.1 + 1.0)
+        gn.bias.copy_(stream("ltx2.gnbf16.bias", C) * 0.1)
+    w32 = gn.weight.detach().clone()
+    b32 = gn.bias.detach().clone()
+    x = stream("ltx2.gnbf16.input", n).reshape(1, C, T, H, W).to(BF)
+    up = gn.to(BF)(x)
+    gn32 = nn.GroupNorm(G, C, eps=1e-6)
+    with torch.no_grad():
+        gn32.weight.copy_(w32)
+        gn32.bias.copy_(b32)
+    rejected = gn32(x.float()).to(BF)          # f32 affine, one store rounding
+    gn_sep = sep(rejected, up)
+    assert gn_sep > 0, "the GroupNorm affine-width probe separates nothing"
+    print(f"[bf16 kernels] group_norm: f32 affine separates {gn_sep}/{up.numel()}",
+          file=sys.stderr)
+    emit_scalar(out, "kLtx2Bf16GnChannels", C)
+    emit_scalar(out, "kLtx2Bf16GnGroups", G)
+    emit_scalar(out, "kLtx2Bf16GnSpatial", T * H * W)
+    emit_scalar(out, "kLtx2Bf16GnSeparating", gn_sep)
+    emit_f32(out, "kLtx2Bf16GnInput", x.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16GnWeight", w32.numpy())
+    emit_f32(out, "kLtx2Bf16GnBias", b32.numpy())
+    emit_f32(out, "kLtx2Bf16GnGolden", up.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16GnRejectedF32Affine", rejected.float().reshape(-1).numpy())
+
+    # --- AdaLN: THREE roundings ----------------------------------------------
+    C, T, H, W = 8, 2, 2, 2
+    n = C * T * H * W
+    xa = stream("ltx2.adabf16.input", n).reshape(1, C, T, H, W).to(BF)
+    table = stream("ltx2.adabf16.table", 4 * C).reshape(4, C).to(BF)
+    embed = stream("ltx2.adabf16.embed", 4 * C).reshape(4, C).to(BF)
+    shift = (table[0] + embed[0]).reshape(1, C, 1, 1, 1)
+    scale = (table[1] + embed[1]).reshape(1, C, 1, 1, 1)
+    up_ada = xa * (1 + scale) + shift
+    # REJECTED: one fused f32 expression instead of three roundings.
+    rej_ada = (xa.float() * (1.0 + scale.float()) + shift.float()).to(BF)
+    ada_sep = sep(rej_ada, up_ada)
+    assert ada_sep > 0, "the AdaLN rounding probe separates nothing"
+    print(f"[bf16 kernels] ada_ln: one-rounding separates {ada_sep}/{up_ada.numel()}",
+          file=sys.stderr)
+    emit_scalar(out, "kLtx2Bf16AdaChannels", C)
+    emit_scalar(out, "kLtx2Bf16AdaSpatial", T * H * W)
+    emit_scalar(out, "kLtx2Bf16AdaSeparating", ada_sep)
+    emit_f32(out, "kLtx2Bf16AdaInput", xa.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16AdaTable", table.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16AdaEmbed", embed.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16AdaGolden", up_ada.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16AdaRejectedOneRounding", rej_ada.float().reshape(-1).numpy())
+
+    # --- spatial noise: the PRODUCT rounds, then the ADD rounds ---------------
+    C, T, H, W = 8, 2, 3, 3
+    n = C * T * H * W
+    xs = stream("ltx2.noisebf16.input", n).reshape(1, C, T, H, W).to(BF)
+    plane = stream("ltx2.noisebf16.plane", H * W).reshape(H, W).to(BF)
+    pcs = (stream("ltx2.noisebf16.scale", C) * 0.1).reshape(C, 1, 1).to(BF)
+    up_sn = xs + (plane[None] * pcs)[None, :, None, ...]
+    rej_sn = (xs.float() + (plane[None].float() * pcs.float())[None, :, None, ...]).to(BF)
+    sn_sep = sep(rej_sn, up_sn)
+    assert sn_sep > 0, "the spatial-noise rounding probe separates nothing"
+    print(f"[bf16 kernels] spatial_noise: fused separates {sn_sep}/{up_sn.numel()}",
+          file=sys.stderr)
+    emit_scalar(out, "kLtx2Bf16NoiseChannels", C)
+    emit_scalar(out, "kLtx2Bf16NoiseT", T)
+    emit_scalar(out, "kLtx2Bf16NoiseH", H)
+    emit_scalar(out, "kLtx2Bf16NoiseW", W)
+    emit_scalar(out, "kLtx2Bf16NoiseSeparating", sn_sep)
+    emit_f32(out, "kLtx2Bf16NoiseInput", xs.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16NoisePlane", plane.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16NoiseScale", pcs.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16NoiseGolden", up_sn.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16NoiseRejectedFused", rej_sn.float().reshape(-1).numpy())
+
+    # --- linear_cn: a 1x1x1 nn.Conv3d, bias INSIDE the accumulator ------------
+    CIN, COUT, T, H, W = 6, 4, 2, 2, 2
+    N = T * H * W
+    xl = stream("ltx2.linbf16.input", CIN * N).reshape(1, CIN, T, H, W).to(BF)
+    wl = (stream("ltx2.linbf16.weight", COUT * CIN) * 0.3).reshape(COUT, CIN, 1, 1, 1).to(BF)
+    bl = (stream("ltx2.linbf16.bias", COUT) * 0.1).to(BF)
+    up_lin = torch.nn.functional.conv3d(xl, wl, bl)
+    # REJECTED: the bias added AFTER the store rounding.
+    rej_lin = (
+        torch.nn.functional.conv3d(xl, wl, None).to(BF).float()
+        + bl.float().reshape(1, -1, 1, 1, 1)
+    ).to(BF)
+    lin_sep = sep(rej_lin, up_lin)
+    assert lin_sep > 0, "the linear_cn bias-placement probe separates nothing"
+    print(f"[bf16 kernels] linear_cn: bias-after separates {lin_sep}/{up_lin.numel()}",
+          file=sys.stderr)
+    emit_scalar(out, "kLtx2Bf16LinIn", CIN)
+    emit_scalar(out, "kLtx2Bf16LinOut", COUT)
+    emit_scalar(out, "kLtx2Bf16LinN", N)
+    emit_scalar(out, "kLtx2Bf16LinSeparating", lin_sep)
+    emit_f32(out, "kLtx2Bf16LinInput", xl.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16LinWeight", wl.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16LinBias", bl.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16LinGolden", up_lin.float().reshape(-1).numpy())
+    emit_f32(out, "kLtx2Bf16LinRejectedBiasAfter", rej_lin.float().reshape(-1).numpy())
+
+
+# ---------------------------------------------------------------------------
 # Sections 6-8 — the ENCODER halves (phase L11), which L4 recorded as owed.
 # ---------------------------------------------------------------------------
 
@@ -1756,6 +2258,8 @@ def main() -> int:
         section_vocoder_legacy(out)
         section_bwe(out)
         section_conv_video_decoder(out)
+        section_conv_video_decoder_bf16(out)
+        section_video_vae_bf16_kernels(out)
         section_video_encoder(out)
         section_audio_encoder(out)
         section_audio_mel(out)

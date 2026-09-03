@@ -40,6 +40,11 @@
 // entry point rather than through Ltx2ConvVideoDecode (issue #1008).
 #include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+// A24 wave 3 (#2786): the PixelNorm epsilon case reaches the kLtx2Vae CPU arm
+// directly, because the constant's WIDTH is only separable at a row scale the
+// decoder fixture does not produce.
+#include "vllm/model_executor/models/ltx2_video_vae_kernels.h"
+#include "vt/dtype.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 // vocoder1d::kSnakeEps: the Snake/SnakeBeta stabilizer is SHARED with MiniMax-H3's
 // BigVGAN, so the constant this suite pins lives in that header.
@@ -160,6 +165,22 @@ struct ParamBag {
     weights.tensors[name] = std::move(values);
   }
 };
+
+// The SAME bag, narrowed once -- which is exactly what `Ltx2LoadVaeWeights` at
+// `kBF16` does to a checkpoint and what `module.to(torch.bfloat16)` does to an
+// f32 state dict in the generator. Both sides therefore round the same f32 values
+// at the same single point, so a mismatch is the ARITHMETIC and never the
+// fixture (A24 wave 3, #2786).
+vllm::Ltx2VaeWeights NarrowToBf16(const vllm::Ltx2VaeWeights& f32) {
+  vllm::Ltx2VaeWeights out;
+  out.dtype = vt::DType::kBF16;
+  for (const auto& kv : f32.tensors) {
+    std::vector<uint16_t> narrow(kv.second.size());
+    for (size_t i = 0; i < kv.second.size(); ++i) narrow[i] = vt::F32ToBF16(kv.second[i]);
+    out.bf16[kv.first] = std::move(narrow);
+  }
+  return out;
+}
 
 void CheckManifest(const ParamBag& bag, const char* const* want_names, const int64_t* want_counts,
                    size_t want_size) {
@@ -1146,6 +1167,367 @@ TEST_CASE("ltx2 vae: the Conv video decoder matches upstream ltx_core") {
                                 std::size(vllm_test::kLtx2VideoDecGolden));
   INFO("Conv video decoder max|diff| = " << err);
   CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 vae: the Conv video decoder's BF16 arm matches upstream ltx_core") {
+  // A24 wave 3, row LTX25-A24-VIDEO-VAE-BF16, issue #2786.
+  //
+  // THE ARM UPSTREAM ACTUALLY RUNS. `distilled.py:109` resolves ONE pipeline
+  // dtype and `:148` hands it to `VideoDecoder`, so the f32 case above is the
+  // parity REFERENCE and this is the shipping arithmetic. It exists because
+  // nothing else can gate it: `ltx2_video_vae.cpp` records that the f32 oracle
+  // makes a dtype comparison "vacuous by construction", and the engine-level
+  // `vae_decode_not_bf16` counter proves the WIDTH and says nothing about the
+  // VALUES.
+  //
+  // SIX ROUNDING RULES RIDE ON THIS ONE GOLDEN, and each of them was measured
+  // against the pinned modules before it was written:
+  //   * `PixelNorm` is a fully bf16 chain -- the square, the mean, the epsilon
+  //     add, the sqrt and the divide each round (0 of 4800 against upstream at
+  //     two scales, where four alternatives are 1244-1434).
+  //   * `nn.GroupNorm`'s AFFINE narrows and its statistics do not (0 of 24576 at
+  //     C=128 with the affine narrowed, 6664 with it left in f32).
+  //   * `per_channel_statistics.un_normalize` narrows both registered buffers
+  //     before the multiply (0 of 4096, against 1294 with f32 statistics).
+  //   * `_RMSNorm2D` forms `sqrt(C) * gamma` FIRST and multiplies once.
+  //   * both ada-LN sites round three times (0 of 512, against 198 and 162).
+  //   * `_feed_spatial_noise` rounds its product before its add (0 of 144,
+  //     against 8).
+  //
+  // THE _RMSNorm2D ORDERING IS SEPARABLE ON THIS FIXTURE, AND ONLY BECAUSE OF ITS
+  // WIDTH. At a channel count whose square root is a power of two every ordering
+  // of that product agrees -- 0 of 4800 for all three at C=64. This decoder's
+  // `attn` block sits at 32 channels and `sqrt(32)` is not representable in
+  // bfloat16, so the rule is first-order here. A later fixture change that moved
+  // the attn block to 64 channels would silently mute it.
+  const vllm::Ltx2ConvVideoDecoderConfig cfg = ReducedVideoDecoderConfig();
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+  CheckManifest(bag, vllm_test::kLtx2VideoDecBf16ParamNames,
+                vllm_test::kLtx2VideoDecBf16ParamCounts,
+                std::size(vllm_test::kLtx2VideoDecBf16ParamNames));
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+  // THE BAG IS HALF THE BYTES, measured on the same input rather than quoted.
+  // This is the storage half of the row: an arm that computed in bf16 and kept
+  // f32 parameters would pass every value check below and move twice the bytes.
+  CHECK(bf16.Bytes() * 2 == bag.weights.Bytes());
+  CHECK(bf16.tensors.empty());
+
+  const int64_t lc = vllm_test::kLtx2VideoDecLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecLatentW;
+  const std::vector<float> latent = Ltx2Input("ltx2.videodec.input", lc * lt * lh * lw, 1.0);
+
+  GoldenNoise noise;
+  const vllm::Ltx2VideoFrames frames =
+      vllm::Ltx2ConvVideoDecode(cfg, bf16, latent, lc, lt, lh, lw, &noise);
+  CHECK(frames.channels == vllm_test::kLtx2VideoDecBf16OutC);
+  CHECK(frames.frames == vllm_test::kLtx2VideoDecBf16OutT);
+  CHECK(frames.height == vllm_test::kLtx2VideoDecBf16OutH);
+  CHECK(frames.width == vllm_test::kLtx2VideoDecBf16OutW);
+  REQUIRE(static_cast<int64_t>(noise.counts().size()) ==
+          vllm_test::kLtx2VideoDecBf16NoiseDraws);
+
+  // EVERY RETURNED VALUE SURVIVES A bf16 ROUND TRIP, which is the property the
+  // values alone cannot carry: a decode that computed in f32 and rounded once at
+  // the exit would clear the band below while moving twice the bytes the whole
+  // way. The f32 arm on this same fixture fails this on most of the stream, and
+  // the case above is what shows that.
+  int64_t wider = 0;
+  for (const float v : frames.data) {
+    if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++wider;
+  }
+  INFO("bf16 decode values wider than bf16: " << wider << " of " << frames.data.size());
+  REQUIRE(!frames.data.empty());
+  CHECK(wider == 0);
+
+  // ── NO VALUE BOUND IS APPLIED HERE, AND THE NUMBERS ARE WHY ───────────────
+  //
+  // This case gates the SHAPE, the noise ORDER, the WIDTH and the BYTES. It does
+  // not gate the values, and saying so with the measurement is worth more than a
+  // tolerance that would look like one.
+  //
+  // The port cannot be bit-identical to this golden, and the reason is upstream's
+  // own convolution rather than a rule this port gets wrong. `cpu_conv3d`'s
+  // contract is torch's -- an f32 accumulator seeded with the bias, one rounding
+  // on store -- but torch BLOCKS its reduction, and at this fixture's own
+  // convolution shapes the two association orders disagree on 3 to 5 outputs of
+  // 8192 to 24576 with max|diff| up to 0.015625. The chain then amplifies one
+  // last bit: perturbing a single `conv_in` weight by ONE bf16 ulp moves the
+  // whole output by `kLtx2VideoDecBf16UlpSensitivity`.
+  //
+  // A tolerance would have to be wider than that irreducible term, and the
+  // generator measured what such a tolerance would then admit by replacing each
+  // rounding rule with the hypothesis this row rejected and re-running upstream
+  // end to end:
+  //
+  //   f32 per-channel statistics   kLtx2VideoDecBf16DefectStats
+  //   `_RMSNorm2D` multiply order  kLtx2VideoDecBf16DefectRmsOrder
+  //   f32 GroupNorm affine         kLtx2VideoDecBf16DefectGroupNormAffine
+  //
+  // The assertions below are about the RELATION between those and the
+  // irreducible term, not about any of the numbers, so they say plainly that a
+  // bound here would be a mute switch. This is wave 2's finding in a second
+  // place: it planned exactly such a bound and removed it after measuring that
+  // three of five defect mutations moved less than it.
+  //
+  // THE ARITHMETIC IS GATED, just not here. Every rounding rule the kLtx2Vae
+  // table owns is held BIT-EXACT one rule at a time, against upstream and against
+  // the answer it rejects, in "each kLtx2Vae kernel's BF16 rule is the one
+  // upstream applies" and in the PixelNorm epsilon case. What is left ungated by
+  // a numeric comparison -- `_RMSNorm2D`'s ordering, `un_normalize`'s narrowing,
+  // the timestep embedding's bf16 evaluation and the convolution's own bf16 rule
+  // -- is named under `## Owed` in .agents/specs/ltx25-a24-video-vae-bf16.md.
+  const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecBf16Golden,
+                                std::size(vllm_test::kLtx2VideoDecBf16Golden));
+  MESSAGE("BF16 conv video decoder max|diff| against upstream = "
+          << err << "; one-ulp sensitivity " << vllm_test::kLtx2VideoDecBf16UlpSensitivity
+          << "; the two upstream arms are " << vllm_test::kLtx2VideoDecBf16ArmGap << " apart");
+  MESSAGE("defect distances: f32 statistics " << vllm_test::kLtx2VideoDecBf16DefectStats
+          << ", _RMSNorm2D order " << vllm_test::kLtx2VideoDecBf16DefectRmsOrder
+          << ", f32 GroupNorm affine " << vllm_test::kLtx2VideoDecBf16DefectGroupNormAffine);
+
+  // 1. The chain really does have an irreducible term. Without this the paragraph
+  //    above is an excuse rather than a measurement.
+  CHECK(vllm_test::kLtx2VideoDecBf16UlpSensitivity > 0.0);
+  // 2. And a bound wide enough to admit the port would admit a real defect. This
+  //    is the assertion that justifies the absence of a bound, and it REDS if a
+  //    future change ever makes the port close enough for one to be meaningful --
+  //    which is the outcome that should force this comment to be rewritten.
+  CHECK(vllm_test::kLtx2VideoDecBf16DefectRmsOrder < err);
+  // 3. One of the three defects does not reach this fixture's output AT ALL, and
+  //    that is why the per-kernel cases exist rather than being a convenience. A
+  //    whole-decode gate would be blind to the GroupNorm affine here however wide
+  //    or narrow its band.
+  CHECK(vllm_test::kLtx2VideoDecBf16DefectGroupNormAffine == 0.0);
+  // 4. The two upstream arms are far apart on this fixture, so "the port quietly
+  //    ran the f32 path" is a distinguishable state rather than a hypothetical.
+  CHECK(vllm_test::kLtx2VideoDecBf16ArmGap > 10 * kLtx2GoldenTol);
+  // 5. The golden was taken under `SDPBackend.MATH`. On this fixture that is the
+  //    same tensor the module produces as constructed -- the attn block's
+  //    sequence is short enough that the dispatcher does not reach FLASH -- so
+  //    the pin costs nothing here and is recorded as zero rather than assumed.
+  CHECK(vllm_test::kLtx2VideoDecBf16BackendGap == 0.0);
+}
+
+namespace {
+
+// Narrow an f32 golden input to the bf16 words the kernel is fed, so both sides
+// start from the SAME rounded values and a mismatch is the arithmetic.
+std::vector<uint16_t> Bf16Words(const float* src, size_t n) {
+  std::vector<uint16_t> out(n);
+  for (size_t i = 0; i < n; ++i) out[i] = vt::F32ToBF16(src[i]);
+  return out;
+}
+std::vector<float> WidenWords(const std::vector<uint16_t>& w) {
+  std::vector<float> out(w.size());
+  for (size_t i = 0; i < w.size(); ++i) out[i] = vt::BF16ToF32(w[i]);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 vae: each kLtx2Vae kernel's BF16 rule is the one upstream applies") {
+  // A24 wave 3 (#2786). Section 5e holds the whole decode against upstream's own
+  // bf16 output and is the gate that matters; this case holds ONE rounding rule
+  // per kernel, so a red says WHICH rule moved rather than only that the clip
+  // did. Each arm asserts bit-exactness against upstream AND a non-zero distance
+  // to the hypothesis the generator rejected, because a golden carrying only
+  // upstream's answer shows agreement and never that the two are separable.
+  //
+  // EVERY ARM IS BATCH 1 AND CHANNEL-MAJOR. These kernels take a [C, spatial]
+  // volume and torch puts a batch axis OUTSIDE the channel axis, so a batch-2
+  // fixture flattens to a volume the kernel reads as something else entirely.
+  // The first form of the PixelNorm probe below had batch 2 and reported the port
+  // 0.44 away from upstream, which was the layout and not the arithmetic.
+  const vllm::ltx2_vae::Ltx2VaeDeviceKernels* k =
+      vllm::ltx2_vae::Ltx2VaeDevice(vt::DeviceType::kCPU);
+  REQUIRE(k != nullptr);
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  SUBCASE("group_norm narrows the AFFINE and keeps its statistics wide") {
+    // `nn.GroupNorm` at bf16 differs from the f32 module rounded once, and the
+    // whole difference is that `weight` and `bias` are bf16. The statistics' own
+    // width does not separate at all -- f32 and f64 agree everywhere -- so this
+    // kernel keeps the f64 accumulators every committed golden was taken through
+    // and gets its narrowing from the weights BAG.
+    const int64_t c = vllm_test::kLtx2Bf16GnChannels;
+    const int64_t sp = vllm_test::kLtx2Bf16GnSpatial;
+    const size_t n = static_cast<size_t>(c * sp);
+    REQUIRE(vllm_test::kLtx2Bf16GnSeparating > 0);
+    std::vector<uint16_t> x = Bf16Words(vllm_test::kLtx2Bf16GnInput, n);
+    const std::vector<uint16_t> w =
+        Bf16Words(vllm_test::kLtx2Bf16GnWeight, static_cast<size_t>(c));
+    const std::vector<uint16_t> b =
+        Bf16Words(vllm_test::kLtx2Bf16GnBias, static_cast<size_t>(c));
+    vllm::Ltx2ConvVideoDecoderConfig cfg;
+    k->group_norm(q, x.data(), c, sp, vllm_test::kLtx2Bf16GnGroups, w.data(), b.data(),
+                  cfg.norm_eps, vt::DType::kBF16);
+    const std::vector<float> got = WidenWords(x);
+    const double err = MaxAbsDiff(got, vllm_test::kLtx2Bf16GnGolden, n);
+    INFO("group_norm bf16 max|diff| = " << err);
+    CHECK(err == 0.0);
+    const double rej = MaxAbsDiff(got, vllm_test::kLtx2Bf16GnRejectedF32Affine, n);
+    INFO("distance to the f32-affine answer = " << rej);
+    CHECK(rej > 0.0);
+  }
+
+  SUBCASE("ada_ln rounds THREE times") {
+    // `hidden * (1 + scale) + shift` is three eager ops on bf16 tensors, so
+    // `1 + scale` materializes, the multiply materializes and the add
+    // materializes. The rejected arm is the same expression fused in f32.
+    const int64_t c = vllm_test::kLtx2Bf16AdaChannels;
+    const int64_t sp = vllm_test::kLtx2Bf16AdaSpatial;
+    const size_t n = static_cast<size_t>(c * sp);
+    REQUIRE(vllm_test::kLtx2Bf16AdaSeparating > 0);
+    std::vector<uint16_t> x = Bf16Words(vllm_test::kLtx2Bf16AdaInput, n);
+    const std::vector<uint16_t> table =
+        Bf16Words(vllm_test::kLtx2Bf16AdaTable, static_cast<size_t>(4 * c));
+    const std::vector<uint16_t> embed =
+        Bf16Words(vllm_test::kLtx2Bf16AdaEmbed, static_cast<size_t>(4 * c));
+    k->ada_ln(q, x.data(), table.data(), embed.data(), c, sp, 4, 0, 1, vt::DType::kBF16);
+    const std::vector<float> got = WidenWords(x);
+    const double err = MaxAbsDiff(got, vllm_test::kLtx2Bf16AdaGolden, n);
+    INFO("ada_ln bf16 max|diff| = " << err);
+    CHECK(err == 0.0);
+    const double rej = MaxAbsDiff(got, vllm_test::kLtx2Bf16AdaRejectedOneRounding, n);
+    INFO("distance to the one-rounding answer = " << rej);
+    CHECK(rej > 0.0);
+  }
+
+  SUBCASE("spatial_noise rounds the PRODUCT, then the ADD") {
+    // `_feed_spatial_noise` forms `spatial_noise * per_channel_scale` as its own
+    // tensor and adds it (resnet.py:114-117): two eager ops, not one fused
+    // expression.
+    const int64_t c = vllm_test::kLtx2Bf16NoiseChannels;
+    const int64_t t = vllm_test::kLtx2Bf16NoiseT;
+    const int64_t h = vllm_test::kLtx2Bf16NoiseH;
+    const int64_t w = vllm_test::kLtx2Bf16NoiseW;
+    const size_t n = static_cast<size_t>(c * t * h * w);
+    REQUIRE(vllm_test::kLtx2Bf16NoiseSeparating > 0);
+    std::vector<uint16_t> x = Bf16Words(vllm_test::kLtx2Bf16NoiseInput, n);
+    const std::vector<uint16_t> plane =
+        Bf16Words(vllm_test::kLtx2Bf16NoisePlane, static_cast<size_t>(h * w));
+    const std::vector<uint16_t> scale =
+        Bf16Words(vllm_test::kLtx2Bf16NoiseScale, static_cast<size_t>(c));
+    k->spatial_noise(q, x.data(), plane.data(), scale.data(), c, t, h, w, vt::DType::kBF16);
+    const std::vector<float> got = WidenWords(x);
+    const double err = MaxAbsDiff(got, vllm_test::kLtx2Bf16NoiseGolden, n);
+    INFO("spatial_noise bf16 max|diff| = " << err);
+    CHECK(err == 0.0);
+    const double rej = MaxAbsDiff(got, vllm_test::kLtx2Bf16NoiseRejectedFused, n);
+    INFO("distance to the fused answer = " << rej);
+    CHECK(rej > 0.0);
+  }
+
+  SUBCASE("linear_cn seeds its accumulator with the BIAS") {
+    // A 1x1x1 `nn.Conv3d` (make_linear_nd, convolution.py:84-85). The reduction
+    // is wider than the storage and there is one rounding on store, and the bias
+    // is INSIDE that accumulator: adding it after the store rounding is the
+    // rejected arm.
+    const int64_t cin = vllm_test::kLtx2Bf16LinIn;
+    const int64_t cout = vllm_test::kLtx2Bf16LinOut;
+    const int64_t n = vllm_test::kLtx2Bf16LinN;
+    const size_t outn = static_cast<size_t>(cout * n);
+    REQUIRE(vllm_test::kLtx2Bf16LinSeparating > 0);
+    const std::vector<uint16_t> x =
+        Bf16Words(vllm_test::kLtx2Bf16LinInput, static_cast<size_t>(cin * n));
+    const std::vector<uint16_t> w =
+        Bf16Words(vllm_test::kLtx2Bf16LinWeight, static_cast<size_t>(cout * cin));
+    const std::vector<uint16_t> b =
+        Bf16Words(vllm_test::kLtx2Bf16LinBias, static_cast<size_t>(cout));
+    std::vector<uint16_t> outw(outn, 0);
+    k->linear_cn(q, outw.data(), x.data(), w.data(), b.data(), cout, cin, n, vt::DType::kBF16);
+    const std::vector<float> got = WidenWords(outw);
+    const double err = MaxAbsDiff(got, vllm_test::kLtx2Bf16LinGolden, outn);
+    INFO("linear_cn bf16 max|diff| = " << err);
+    CHECK(err == 0.0);
+    const double rej = MaxAbsDiff(got, vllm_test::kLtx2Bf16LinRejectedBiasAfter, outn);
+    INFO("distance to the bias-after-rounding answer = " << rej);
+    CHECK(rej > 0.0);
+  }
+}
+
+TEST_CASE("ltx2 vae: the PixelNorm epsilon is the BF16 one, at the scale where that BINDS") {
+  // A24 wave 3 (#2786), and the reason it is a separate case from the decoder
+  // golden above is the whole lesson of A24 wave 1.
+  //
+  // `PixelNorm.forward` adds `self.eps` to a bf16 `mean_sq`
+  // (model/common/normalization.py:37-40), so torch promotes the Python float to
+  // the TENSOR's dtype and what reaches the add is
+  // `bf16(1e-8) = 1.0011717677116394e-08`, not `1e-8`. Holding the rest of the
+  // chain fixed and varying ONLY that width separates on 0 of 144 values at
+  // ordinary magnitude and on 25 of 144 at a row scale of 2^-14. A probe taken at
+  // the shipped fixture's scale would gate the width at ZERO -- the mute switch
+  // wave 1 shipped, whose claimed mutation stayed green at 4313 of 4313.
+  //
+  // "IS IT READ" AND "AT WHAT WIDTH" ARE DIFFERENT QUESTIONS and this case asks
+  // both. Removing the epsilon entirely separates from 2^-10 (144 of 144), where
+  // the width still does not. The generator emits the separating count for each
+  // scale and REFUSES to emit an arm that separates nothing, so the numbers
+  // asserted below are the oracle's own and not this file's.
+  const vllm::ltx2_vae::Ltx2VaeDeviceKernels* k =
+      vllm::ltx2_vae::Ltx2VaeDevice(vt::DeviceType::kCPU);
+  REQUIRE(k != nullptr);
+  const int64_t c = vllm_test::kLtx2PixelNormEpsChannels;
+  const int64_t sp = vllm_test::kLtx2PixelNormEpsSpatial;
+  const size_t n = static_cast<size_t>(c * sp);
+  const size_t arms = std::size(vllm_test::kLtx2PixelNormEpsScales);
+  REQUIRE(std::size(vllm_test::kLtx2PixelNormEpsGolden) == n * arms);
+
+  // THE PROBE SEPARATES SOMEWHERE, asserted rather than hoped. Without this the
+  // three comparisons below are satisfied by any epsilon at all.
+  int64_t width_sep = 0, read_sep = 0;
+  for (size_t a = 0; a < arms; ++a) {
+    width_sep += vllm_test::kLtx2PixelNormEpsWidthSeparating[a];
+    read_sep += vllm_test::kLtx2PixelNormEpsReadSeparating[a];
+  }
+  INFO("separating: width " << width_sep << ", read " << read_sep);
+  CHECK(width_sep > 0);
+  CHECK(read_sep > 0);
+  // ...and the ORDINARY-magnitude arm separates NOTHING on the width question,
+  // which is the statement that makes the low-magnitude arms necessary rather
+  // than decorative. It is asserted so that a fixture change which accidentally
+  // made it separate is reported instead of quietly widening the case.
+  CHECK(vllm_test::kLtx2PixelNormEpsWidthSeparating[0] == 0);
+
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  for (size_t a = 0; a < arms; ++a) {
+    // The kernel is fed the bf16 words the generator's tensor holds, so both
+    // sides start from the same narrowed input.
+    std::vector<uint16_t> x(n);
+    for (size_t i = 0; i < n; ++i) {
+      x[i] = vt::F32ToBF16(vllm_test::kLtx2PixelNormEpsInput[a * n + i]);
+    }
+    vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    k->pixel_norm(q, x.data(), c, sp, static_cast<float>(cfg.pixel_norm_eps), vt::DType::kBF16);
+    std::vector<float> got(n);
+    for (size_t i = 0; i < n; ++i) got[i] = vt::BF16ToF32(x[i]);
+
+    const double err = MaxAbsDiff(got, &vllm_test::kLtx2PixelNormEpsGolden[a * n], n);
+    INFO("PixelNorm bf16 arm 2^" << vllm_test::kLtx2PixelNormEpsScales[a]
+                                 << " max|diff| = " << err);
+    // BIT-EXACT, not within a band. Every rounding point of this chain is
+    // reproduced explicitly, so anything but zero is a rule that does not match.
+    CHECK(err == 0.0);
+
+    // AND THE REJECTED ANSWERS ARE EMITTED BESIDE IT. A golden that only carries
+    // upstream's answer proves the port agrees with upstream; it does not show
+    // that the two hypotheses are distinguishable at all. Where the generator
+    // measured a separation, the port must NOT match the rejected arm.
+    if (vllm_test::kLtx2PixelNormEpsWidthSeparating[a] > 0) {
+      const double f32_eps_err =
+          MaxAbsDiff(got, &vllm_test::kLtx2PixelNormEpsRejectedF32Eps[a * n], n);
+      INFO("distance to the f32-epsilon answer = " << f32_eps_err);
+      CHECK(f32_eps_err > 0.0);
+    }
+    if (vllm_test::kLtx2PixelNormEpsReadSeparating[a] > 0) {
+      const double no_eps_err =
+          MaxAbsDiff(got, &vllm_test::kLtx2PixelNormEpsRejectedNoEps[a * n], n);
+      INFO("distance to the epsilon-removed answer = " << no_eps_err);
+      CHECK(no_eps_err > 0.0);
+    }
+  }
 }
 
 TEST_CASE("ltx2 vae: the NON-causal Conv video decoder matches upstream ltx_core") {

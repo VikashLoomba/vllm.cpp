@@ -276,18 +276,18 @@ field is `std::string`, and the probe above is why rather than a precaution.
 
 Submitted 2026-09-03 under an `rc` lease, queued behind two other jobs on that
 device. Pinned to `git bundle` sha256
-`c67a28a8eea92e8c54d4cff06f2be7a05462a21222de7ee3f76bba0f19289936`, commit
-`bb1ecefef`, and the job aborts unless `git rev-parse HEAD` inside the clone
+`b1cf294a2c563376a117ee28cecf1922291dc91c3b89be0e1121f5a454243bcb`, commit
+`b1bad1a5a`, and the job aborts unless `git rev-parse HEAD` inside the clone
 matches. Nothing is pushed to reach the box. The harness is
 `/workspace/exl342-thor/run.sh`.
 
 **Which tree slice B's evidence is measured on, said before it drifts.** Slice A
 recorded a claim of this shape and a later `origin/main` merge falsified it, so
-this one is written narrowly on purpose: `bb1ecefef` is the LAST commit of this
+this one is written narrowly on purpose: `b1bad1a5a` is the LAST commit of this
 branch that touches `src/`, `include/` or `tests/`. Anything after it edits this
 spec, this row's claim and the public documents, and nothing else. Re-derive
 that with
-`git diff --stat bb1ecefef..HEAD -- src include tests CMakeLists.txt` before
+`git diff --stat b1bad1a5a..HEAD -- src include tests CMakeLists.txt` before
 quoting any number below; a non-empty output means the evidence names a
 different tree than the head does, and the lease must be re-pinned and re-run
 rather than the sentence re-worded.
@@ -312,8 +312,8 @@ because `Exl3GemvSmemMode()` caches its `getenv` in a function-local static,
 Submitted 2026-09-03 at queue position 11 behind a job that had already run for
 ten hours. **It will not have run when this row is reported, and no throughput
 number is claimed for `(4, 2)` anywhere.** Pinned to tarball sha256
-`88a9df5d4c5930299c316c3810112845eca95b0d9912dcc038bacb31f0bc881c`, commit
-`bb1ecefef`; harness `/workspace/exl342-dgx/job.sh`, adapted from slice A's with
+`ca6c50419bec8c2af8e391d3010bde8c29f5062a37b90a0fc6ccc378eececd44`, commit
+`b1bad1a5a`; harness `/workspace/exl342-dgx/job.sh`, adapted from slice A's with
 the tree facts and the two `(4, 2)` mutations replaced.
 
 Read `SM_COUNT` and `MAX_THREADS_PER_SM` from section F BEFORE any tok/s number.

@@ -2575,6 +2575,12 @@ set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+# The grow-only per-stream device scratch pool (#2712). UNCONDITIONAL for the
+# same reason test_rocm_arch is: src/vt/grow_only_stream_scratch.h is free of
+# HIP and CUDA headers, so the piece of the ROCm scratch allocators that holds
+# the SYNCHRONISATION is gated on a CPU-only runner with no accelerator.
+vllm_cpp_add_test(test_grow_only_stream_scratch vt/test_grow_only_stream_scratch.cpp)
+target_include_directories(test_grow_only_stream_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
 vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
   vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)

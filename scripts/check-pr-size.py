@@ -227,8 +227,8 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 # #668 and #989, and repaired the same way: name the surface, do not widen a
 # rule.
 #
-# The extension list is EXACTLY the set this directory carries, and it
-# deliberately omits `.md` and `.json`. Those two already classify as
+# The extension list is EXACTLY the union of what the tracked per-run
+# directories carry, and it deliberately omits `.md` and `.json`. Those two already classify as
 # public_document through DOC below, and the evidence arm is tested FIRST, so
 # admitting them here would silently RECLASSIFY
 # docs/bench-evidence/mxfp4-qwen/*.md and its golden .json. Preserving the class
@@ -267,8 +267,35 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 # That is the narrow claim the `py` arm rests on. A `.py` OUTSIDE a per-run
 # evidence directory still fails closed, which is what keeps this from becoming
 # a suffix licence.
+#
+# `.jsonl` and `.rc` joined the same day (#2497), from a different directory and
+# for a different reason than `.py`. They are not recipes; they are the job's
+# own OUTPUT, which the `.py` arm above does not cover:
+#
+#   `.jsonl` the raw instrument stream, one JSON object per sample. It is the
+#            population a folded clock figure is derived FROM, which is what a
+#            `.log` already is here, so it takes the same class. `.json` stays
+#            deliberately absent for the reason given above, and `.jsonl` does
+#            not match DOC.
+#   `.rc`    one process's recorded exit status. A leg's `rc` is what decides
+#            whether its figure may be used at all, so it is evidence in the
+#            strictest sense: two bytes nothing can regenerate.
+#
+# Twelve paths of `rocm-strix-llamacpp-denominator-20260902` were unclassified
+# without them -- six `clock-leg*.jsonl` and six `leg*.rc` -- and two more,
+# `fold.py` and `amd_clock_sample.py`, were unclassified until #2629 landed the
+# `py` arm above hours earlier. Same failure, same day, two directories, found
+# independently.
+#
+# The narrow claim above is re-checked for these two and holds the same way:
+# nothing outside docs/ reads, imports, builds, installs or executes a `.jsonl`
+# or `.rc` under docs/bench-evidence/. It is NOT re-stated as the universal
+# claim the paragraph above corrects. Outside a per-run evidence directory both
+# still fail closed, which is what keeps this a named surface rather than a
+# suffix licence.
 BENCH_EVIDENCE_RUN = re.compile(
-    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.(?:txt|log|gz|sh|cu|py)\Z"
+    r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    r"\.(?:txt|log|gz|sh|cu|py|jsonl|rc)\Z"
 )
 # #2609. The lease RECIPES: the exact script a `rc` job ran to produce a number
 # a spec then cites. Same class and same reasoning as BENCH_EVIDENCE_RUN's `.sh`

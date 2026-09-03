@@ -639,7 +639,20 @@ detail::DeviceTokenIds detail::TakeDeviceTokenIds() {
 
 bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
                                  void* dst, int64_t dst_count, const char* what) {
-  const DeviceTokenIds ov = TakeDeviceTokenIds();
+  return ApplyDeviceTokenIds(backend, queue, dst, dst_count,
+                             TakeDeviceTokenIds(), what);
+}
+
+// #2730 — the body, once, for both publishers. The override arm above takes and
+// clears the thread-local; the multimodal arm is handed
+// `MmEmbedInputs::device_token_ids` directly, because `ModelRegistry::EmbedMm`
+// runs before any forward has established a scope. Everything after the source
+// differs by nothing at all, and that is the point: the bounds check that refuses
+// a shape disagreement, and the `Copy` that goes ON `queue` so it is ordered
+// AFTER the runner's combine rather than racing it, are one expression.
+bool detail::ApplyDeviceTokenIds(vt::Backend& backend, vt::Queue& queue,
+                                 void* dst, int64_t dst_count,
+                                 DeviceTokenIds ov, const char* what) {
   if (ov.ids == nullptr) return false;
   VT_CHECK(ov.count <= dst_count,
            std::string(what) + ": device input ids longer than the embed input");

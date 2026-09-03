@@ -786,6 +786,40 @@ struct MmEmbedInputs {
   // `uses_mrope == False`, which is Gemma-4's multimodal arm: it reads the 1-D
   // `ModelForwardInput::positions` instead).
   const std::vector<int32_t>* mrope_positions = nullptr;
+  // ENG-MM-EMBED-DEVICE-IDS ([#2730](https://github.com/mudler/vllm.cpp/issues/2730)):
+  // the DEVICE twin of `token_ids`, and the reason this struct exists in the
+  // shape it does.
+  //
+  // `token_ids` above is the host step vector, and the asynchronous runner
+  // deliberately leaves it STALE for decode rows: its combine splices each decode
+  // row's sampled token into the DEVICE buffer on the main queue and never writes
+  // it back, because materialising it on the host is the synchronise that path
+  // exists to remove. `token_ids_cpu` is zero-initialised, so a hook that embeds
+  // the host vector alone builds `inputs_embeds` from TOKEN ID 0 on every decode
+  // row -- at rc=0, with plausible-looking output. `batch_carries_mm()` returns
+  // true on the decode steps of an image request BY DESIGN (see its own comment
+  // in `runner.cpp`), so this is reached rather than theoretical, and
+  // `async_device_mirror()` is the DEFAULT on CUDA, integrated parts included.
+  //
+  // The two fields carry exactly what `ModelForwardInput::device_token_ids` and
+  // `ModelForwardInput::host_token_ids_stale` carry, set by the runner from the
+  // SAME two values in the same step, so the embed's guard and the forward's
+  // guard cannot disagree about one step.
+  //
+  // NOT ADVISORY. A hook may only be handed a step whose host identifiers are
+  // stale when its `ModelFactory::embed_mm_consumes_device_token_ids` is true;
+  // `ModelRegistry::EmbedMm` refuses the step otherwise, on the same
+  // `DeviceTokenIdsRefusalApplies` predicate `ModelRegistry::Forward` uses.
+  //
+  // Null on every non-mirror path, so every such step is byte-identical.
+  const int32_t* device_token_ids = nullptr;
+  // Whether `token_ids` actually DISAGREES with `device_token_ids` for this step.
+  // The pointer says the device buffer is authoritative; this says the two
+  // differ, which is a different fact and the one a refusal must turn on. FALSE
+  // on an image request's PREFILL step, where the combine splices no row -- and
+  // every image request reaches its first token through such a step, so a guard
+  // that ignored this term would take multimodal serving away entirely.
+  bool host_token_ids_stale = false;
 };
 
 // The per-step device buffers the model staged, plus the seam view over them.
@@ -931,7 +965,40 @@ struct ModelFactory {
   // path it can take". A forward with one arm that reads the device identifiers
   // and another that does not is a defect in that forward, and this bit cannot
   // see it. Setting it is a statement about the code, not a warrant for it.
+  //
+  // AND IT IS A STATEMENT ABOUT THE REGISTRATION, NOT ONLY ABOUT THE FUNCTION
+  // NAMED `forward` (ENG-MM-EMBED-DEVICE-IDS,
+  // [#2730](https://github.com/mudler/vllm.cpp/issues/2730)). A multimodal
+  // registration can resolve the step's identifiers in its `embed_mm` hook and
+  // hand the forward merged embeds instead, in which case the forward reads no
+  // identifier at all and the registration is still correct. `qwen3_vl` is that
+  // case and is the only one today: its forward REFUSES a step without
+  // `input.mm` by name, and the runner only ever supplies `mm` from the same
+  // branch that just called `ModelRegistry::EmbedMm` with the same device
+  // pointer, so every step it can reach came through the hook. Leaving this
+  // comment saying "forward" while a registration sets it on the strength of its
+  // embed is how a capability bit becomes a lie, so it says both. The HOOK's own
+  // fact is `embed_mm_consumes_device_token_ids` below and the two are separate,
+  // because `dots3_note` has one and not the other.
   bool consumes_device_token_ids = false;
+  // ENG-MM-EMBED-DEVICE-IDS ([#2730](https://github.com/mudler/vllm.cpp/issues/2730)):
+  // the same question asked of the MULTIMODAL hook -- whether THIS model's
+  // `embed_mm` reads `MmEmbedInputs::device_token_ids` rather than gathering from
+  // the host vector the async runner leaves stale for decode rows.
+  //
+  // WHY A SECOND BIT AND NOT THE ONE ABOVE. `dots3_note` is the counterexample
+  // that makes one bit impossible: its `embed_mm` consumes the channel and its
+  // `forward` does not -- it reaches
+  // `Dots3NoteModel::ForwardDevice(input.token_ids, ...)` on a text-only batch,
+  // which is class (b) of `.agents/specs/eng-async-device-ids-refusal.md` and
+  // owed by [#2732](https://github.com/mudler/vllm.cpp/issues/2732). Collapsing
+  // the two facts would either un-refuse its stale text step or refuse its
+  // correct image step.
+  //
+  // THE DEFAULT IS FALSE AND THAT IS THE MECHANISM, the polarity every capability
+  // bit beside it uses. A hook added tomorrow that ignores the channel is REFUSED
+  // rather than served identifiers it never reads.
+  bool embed_mm_consumes_device_token_ids = false;
   // MODEL-MM-QWEN4-EXP W5L ([#2031](https://github.com/mudler/vllm.cpp/issues/2031)):
   // whether THIS model's forward serves exactly ONE sequence per step, so the
   // engine must not schedule a batch it will refuse.

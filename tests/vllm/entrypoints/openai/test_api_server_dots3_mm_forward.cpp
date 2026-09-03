@@ -121,8 +121,16 @@ constexpr const char* kUnregisteredMmArch = "Dots3NoteNotRegisteredForCausalLM";
 
 vt::Queue Q() { return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}; }
 
-// A BPE fixture whose ADDED tokens are dots3-note's three image markers, so the
-// string the chat seam injects tokenizes to exactly [14, 15, 16].
+// A BPE fixture whose ADDED tokens are dots3-note's three image markers and,
+// since W7a (#2703), its three AUDIO markers — so the string the chat seam
+// injects tokenizes to exactly [14, 15, 16] or [17, 19, 18].
+//
+// NOTE THE AUDIO ORDER: start 17, END 18, pad 19. That is the RELEASED
+// checkpoint's own (`<|audio_comp_start|>` 151718, `<|audio_comp_end|>` 151719,
+// `<|audio_comp_pad|>` 151720), and the fixture reproduces it so a port that
+// guessed "start, start+1, start+2" for the pad id is wrong HERE too. The seam
+// resolves all three from this tokenizer BY STRING, which is what makes the
+// injected marker and the expanded id the same thing by construction.
 Tokenizer BuildFixture() {
   static int counter = 0;
   const std::string path =
@@ -133,7 +141,16 @@ Tokenizer BuildFixture() {
   doc["added_tokens"] = json::array(
       {{{"id", dots3_tiny::kImgStartId}, {"content", "<|img|>"}, {"special", true}},
        {{"id", dots3_tiny::kImgPadId}, {"content", "<|imgpad|>"}, {"special", true}},
-       {{"id", dots3_tiny::kImgEndId}, {"content", "<|endofimg|>"}, {"special", true}}});
+       {{"id", dots3_tiny::kImgEndId}, {"content", "<|endofimg|>"}, {"special", true}},
+       {{"id", dots3_tiny::kAudStartId},
+        {"content", "<|audio_comp_start|>"},
+        {"special", true}},
+       {{"id", dots3_tiny::kAudEndId},
+        {"content", "<|audio_comp_end|>"},
+        {"special", true}},
+       {{"id", dots3_tiny::kAudPadId},
+        {"content", "<|audio_comp_pad|>"},
+        {"special", true}}});
   doc["normalizer"] = nullptr;
   doc["pre_tokenizer"] = {
       {"type", "Sequence"},
@@ -289,6 +306,49 @@ json ChatBodyWithImage(int max_tokens, const std::string& data_uri,
     body["top_logprobs"] = 3;
   }
   return body;
+}
+
+// ── W7a (#2703): the AUDIO request ──────────────────────────────────────────
+
+// The audio-capable fixture spec. `vocab` is raised to 20 because the three
+// AUDIO marker ids are 17, 18 and 19, and the embedding table is `[vocab,
+// hidden]` — an id past it is an out-of-bounds gather, not a wrong answer. The
+// image-only specs keep 17 so nothing about the existing cases moves.
+dots3_tiny::TinySpec AudioSpec() {
+  dots3_tiny::TinySpec s;
+  s.with_audio = true;
+  s.vocab = 20;
+  return s;
+}
+
+// `data:` is NOT used: an `input_audio` part carries a BARE base64 payload and
+// a `format`, which is what `DecodeInputAudioPart` (`chat_mm.cpp:122-129`)
+// expects. `audio_url` would carry a data URI instead, and the seam handles
+// both; this is the shape the OpenAI API documents.
+json ChatBodyWithAudio(int max_tokens, const std::vector<uint8_t>& wav,
+                       bool logprobs, const char* format = "wav") {
+  json body = {
+      {"model", "test-model"},
+      {"messages",
+       json::array({{{"role", "user"},
+                     {"content",
+                      json::array({{{"type", "input_audio"},
+                                    {"input_audio",
+                                     {{"data", EncodeBase64(wav)},
+                                      {"format", format}}}},
+                                   {{"type", "text"}, {"text", "hello"}}})}}})},
+      {"max_completion_tokens", max_tokens},
+      {"temperature", 0.0}};
+  if (logprobs) {
+    body["logprobs"] = true;
+    body["top_logprobs"] = 3;
+  }
+  return body;
+}
+
+json ChatBodyAudio(int max_tokens, int variant, bool logprobs) {
+  return ChatBodyWithAudio(max_tokens, dots3_tiny::FixtureAudioWav(variant),
+                           logprobs);
 }
 
 // The whole production serving stack over the tiny dots3-note, on a CPU queue.
@@ -1183,4 +1243,228 @@ TEST_CASE("dots3-note W6a: an adapter merge that is not the PROMPT's merge refus
   INFO("text body: ", t.body);
   CHECK(t.status == 200);
   CHECK(t.body.find("stopped") == std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. W7a (#2703) — THE SERVED AUDIO REQUEST.
+//
+//    THE RED-BEFORE FOR THIS WHOLE BRICK. Before W7a
+//    `Dots3NoteChatSupportedMmLimits()` returned `{{"image", 1}}` and nothing
+//    else, so `ValidateChatMmLimits` refused an `input_audio` part at the
+//    entrypoint with upstream's own message: HTTP 400, "At most 0 audio(s) may
+//    be provided in one prompt." Every case in this section reads that on the
+//    tree this brick started from.
+// ═══════════════════════════════════════════════════════════════════════════
+TEST_CASE("dots3-note W7a: a served input_audio chat request reaches the model forward") {
+  Served s(AudioSpec());
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, /*is_multimodal_model=*/true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+  INFO("install log: ", log.str());
+  // The install announced that it built an AUDIO tower as well as a vision one.
+  CHECK(log.str().find("audio tower") != std::string::npos);
+
+  const ApiServer::DispatchResult r = h.server.handle_chat_completions(
+      ChatBodyAudio(/*max_tokens=*/3, 0, false).dump());
+  INFO("body: ", r.body);
+  REQUIRE(r.status == 200);
+  const json j = json::parse(r.body);
+  CHECK(j.at("object") == "chat.completion");
+  CHECK(j.at("usage").at("completion_tokens") == 3);
+  // The prompt the engine actually ran is the EXPANDED one:
+  // `<|audio_comp_start|>` + SEVEN pad tokens + `<|audio_comp_end|>` + "hello".
+  // A seam that dropped the expansion would report 3 and still answer 200.
+  CHECK(j.at("usage").at("prompt_tokens") == 3 + dots3_tiny::kAudioTokens);
+}
+
+TEST_CASE("dots3-note W7a: two DIFFERENT waveforms give two different forwards") {
+  // THE LOAD-BEARING CASE. Status, `prompt_tokens` and `completion_tokens` all
+  // pass on a tree where the audio tower is replaced by a correctly SHAPED
+  // constant — the two waveforms have the same length, so they expand to the
+  // same seven placeholders and produce the same counts. The LOGPROBS of the
+  // first generated token do not.
+  const auto logprobs_of = [](int variant) {
+    Served s(AudioSpec());
+    MmServerHarness h(s.config, *s.model, Fixture());
+    std::ostringstream log;
+    REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+            oai::MultiModalChatInstall::kInstalled);
+    const ApiServer::DispatchResult r = h.server.handle_chat_completions(
+        ChatBodyAudio(/*max_tokens=*/1, variant, /*logprobs=*/true).dump());
+    INFO("body: ", r.body);
+    REQUIRE(r.status == 200);
+    const json j = json::parse(r.body);
+    std::vector<double> out;
+    for (const json& t :
+         j.at("choices")[0].at("logprobs").at("content")[0].at("top_logprobs")) {
+      out.push_back(t.at("logprob").get<double>());
+    }
+    return out;
+  };
+  const std::vector<double> a = logprobs_of(0);
+  const std::vector<double> b = logprobs_of(1);
+  REQUIRE(a.size() == b.size());
+  REQUIRE(!a.empty());
+  double worst = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    worst = std::max(worst, std::fabs(a[i] - b[i]));
+  MESSAGE("two waveforms move the first token's logprobs by up to " << worst);
+  CHECK(worst > 1e-4);
+}
+
+TEST_CASE("dots3-note W7a: the chat seam declares ONE audio, and refuses a second") {
+  Served s(AudioSpec());
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  json body = ChatBodyAudio(/*max_tokens=*/1, 0, false);
+  // A SECOND audio part in the same message.
+  body["messages"][0]["content"].push_back(
+      {{"type", "input_audio"},
+       {"input_audio",
+        {{"data", EncodeBase64(dots3_tiny::FixtureAudioWav(1))},
+         {"format", "wav"}}}});
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(body.dump());
+  INFO("body: ", r.body);
+  CHECK(r.status == 400);
+  // Upstream's own message shape (`context.py:414-415`), with the seam's own
+  // ceiling of 1 — a user `--limit-mm-per-prompt` can only LOWER it.
+  CHECK(r.body.find("At most 1 audio(s)") != std::string::npos);
+}
+
+TEST_CASE("dots3-note W7a: a checkpoint with NO audio_config refuses the audio part by name") {
+  // The state every dots3-note checkpoint was in before this brick, and the
+  // state an image-only one is still in: the seam's ceiling does not declare
+  // "audio" at all, which `context.py:414-415` reads as limit 0.
+  //
+  // THIS IS THE EXACT RED THIS BRICK STARTED FROM. Running this body against a
+  // WITH-audio checkpoint on the pre-W7a tree produced the same 400.
+  Served s;  // the default spec: `with_audio` is false
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+  // The install did NOT announce an audio tower.
+  CHECK(log.str().find("audio tower") == std::string::npos);
+
+  const ApiServer::DispatchResult r = h.server.handle_chat_completions(
+      ChatBodyAudio(/*max_tokens=*/1, 0, false).dump());
+  INFO("body: ", r.body);
+  CHECK(r.status == 400);
+  CHECK(r.body.find("At most 0 audio(s) may be provided in one prompt.") !=
+        std::string::npos);
+  // ...and the TEXT path on the same server is untouched, which is the whole
+  // reason the refusal is at the entrypoint and not inside the engine loop.
+  const ApiServer::DispatchResult t = h.server.handle_chat_completions(
+      json{{"model", "test-model"},
+           {"messages", json::array({{{"role", "user"}, {"content", "hello"}}})},
+           {"max_completion_tokens", 1},
+           {"temperature", 0.0}}
+          .dump());
+  INFO("text body: ", t.body);
+  CHECK(t.status == 200);
+}
+
+TEST_CASE("dots3-note W7a: a non-PCM16-mono container and a wrong rate refuse BY NAME, to W7c") {
+  Served s(AudioSpec());
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  SUBCASE("a STEREO WAV names the container refusal and W7c") {
+    const ApiServer::DispatchResult r = h.server.handle_chat_completions(
+        ChatBodyWithAudio(1, dots3_tiny::FixtureAudioWav(0, 16000, /*channels=*/2),
+                          false)
+            .dump());
+    INFO("body: ", r.body);
+    CHECK(r.status == 400);
+    CHECK(r.body.find("W7c") != std::string::npos);
+    CHECK(r.body.find("PCM16 MONO") != std::string::npos);
+  }
+  SUBCASE("a 22050 Hz WAV names the resampler refusal and W7c") {
+    const ApiServer::DispatchResult r = h.server.handle_chat_completions(
+        ChatBodyWithAudio(1, dots3_tiny::FixtureAudioWav(0, /*sample_rate=*/22050),
+                          false)
+            .dump());
+    INFO("body: ", r.body);
+    CHECK(r.status == 400);
+    CHECK(r.body.find("W7c") != std::string::npos);
+    CHECK(r.body.find("RESAMPLING IS NOT PORTED") != std::string::npos);
+  }
+  SUBCASE("a payload that is not a RIFF/WAVE buffer at all is refused, not decoded") {
+    const std::vector<uint8_t> junk(2048, 0x41);
+    const ApiServer::DispatchResult r = h.server.handle_chat_completions(
+        ChatBodyWithAudio(1, junk, false, "mp3").dump());
+    INFO("body: ", r.body);
+    CHECK(r.status == 400);
+    CHECK(r.body.find("W7c") != std::string::npos);
+  }
+  // ...and the server still answers TEXT after all three, which is what "the
+  // refusal is at the entrypoint" buys.
+  const ApiServer::DispatchResult t = h.server.handle_chat_completions(
+      json{{"model", "test-model"},
+           {"messages", json::array({{{"role", "user"}, {"content", "hello"}}})},
+           {"max_completion_tokens", 1},
+           {"temperature", 0.0}}
+          .dump());
+  CHECK(t.status == 200);
+}
+
+TEST_CASE("dots3-note W7a: an image and an audio part in ONE request refuse BY NAME, to W8") {
+  Served s(AudioSpec());
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  json body = ChatBodyAudio(/*max_tokens=*/1, 0, false);
+  body["messages"][0]["content"].push_back(
+      {{"type", "image_url"}, {"image_url", {{"url", ImageDataUri(0)}}}});
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(body.dump());
+  INFO("body: ", r.body);
+  CHECK(r.status == 400);
+  CHECK(r.body.find("BOTH an image") != std::string::npos);
+  CHECK(r.body.find("W8") != std::string::npos);
+  // Each on its OWN is still served — the refusal is about the COMBINATION.
+  CHECK(h.server.handle_chat_completions(ChatBodyAudio(1, 0, false).dump())
+            .status == 200);
+  CHECK(h.server.handle_chat_completions(ChatBody(1, 0, false).dump()).status ==
+        200);
+}
+
+TEST_CASE("dots3-note W7a: an audio checkpoint whose arms are OWED refuses at INSTALL") {
+  // Not inside the engine loop. `mm_chat_dots3note.cpp:232-240` records why:
+  // throwing from `encode_mm` stops `AsyncLLM` and turns every LATER request,
+  // TEXT ones included, into a 500. A refusing SEAM answers 400 and leaves the
+  // text path alone, and this case asserts both halves.
+  dots3_tiny::TinySpec spec = AudioSpec();
+  spec.a_use_causal = true;  // an arm W7a refuses by name
+  Served s(spec);
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  const oai::MultiModalChatInstall got =
+      h.install(kDots3Arch, true, s.ckpt, log);
+  INFO("install log: ", log.str());
+  CHECK(got == oai::MultiModalChatInstall::kRefusing);
+  CHECK(log.str().find("use_causal") != std::string::npos);
+
+  const ApiServer::DispatchResult r = h.server.handle_chat_completions(
+      ChatBodyAudio(/*max_tokens=*/1, 0, false).dump());
+  INFO("body: ", r.body);
+  CHECK(r.status == 400);
+
+  const ApiServer::DispatchResult t = h.server.handle_chat_completions(
+      json{{"model", "test-model"},
+           {"messages", json::array({{{"role", "user"}, {"content", "hello"}}})},
+           {"max_completion_tokens", 1},
+           {"temperature", 0.0}}
+          .dump());
+  INFO("text body: ", t.body);
+  CHECK(t.status == 200);
 }

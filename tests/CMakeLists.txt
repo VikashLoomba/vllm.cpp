@@ -1251,6 +1251,25 @@ target_include_directories(test_dots3_note_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_dots3_note_vision vllm/models/test_dots3_note_vision.cpp)
 target_compile_definitions(test_dots3_note_vision PRIVATE
   DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+
+# dots3-note W7a (#2703): the AUDIO tower and its front end. Two fixture
+# directories, because the two halves are gated against different things — the
+# tower against the committed dots3-note config, and the SHARED slaney
+# filterbank against `voxtral_mel_filters_f32.bin`, which is a third party's
+# implementation of the same `mel_filter_bank` call and the only real oracle
+# this row gets.
+vllm_cpp_add_test(test_dots3_note_audio vllm/models/test_dots3_note_audio.cpp)
+target_compile_definitions(test_dots3_note_audio PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev"
+  VOXTRAL_AUDIO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal/fixtures/voxtral_audio"
+  # The reference-independence case re-reads THIS file and counts the qualified
+  # names in each reference namespace, so the enumeration is a measurement
+  # rather than a transcription asserted against itself.
+  DOTS3_AUDIO_TEST_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/test_dots3_note_audio.cpp")
+# dots3_note.h and dots3_note_audio.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/ — same arrangement test_dots3_note_vision uses.
+target_include_directories(test_dots3_note_audio PRIVATE
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # Same model-private-header arrangement as the two gates above: dots3_note.h and
 # dots3_note_vision.h live under src/, because W1 ships nothing on the public ABI
 # and include/vllm/ is a USER_USAGE_PREFIXES surface (#515).
@@ -1781,6 +1800,17 @@ vllm_cpp_add_test(test_multi_kv_refusal
   vllm/model_executor/test_multi_kv_refusal.cpp)
 vllm_cpp_add_test(test_device_token_ids_refusal
   vllm/model_executor/test_device_token_ids_refusal.cpp)
+# ENG-MM-EMBED-DEVICE-IDS (#2730): the MULTIMODAL half of the same channel --
+# `MmEmbedInputs` carries the device identifiers, both registered `embed_mm`
+# hooks splice them over the buffer they gather from, and a hook that does not
+# declare the capability is refused instead of embedding token id 0.
+vllm_cpp_add_test(test_mm_embed_device_token_ids
+  vllm/models/test_mm_embed_device_token_ids.cpp)
+# The dots3-note case loads the tiny on-disk checkpoint through the REAL loader,
+# for the same reason its own gates do: `Dots3NoteLoadedModel` lives in the
+# anonymous namespace of its registry translation unit and cannot be borrowed.
+target_compile_definitions(test_mm_embed_device_token_ids PRIVATE
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
 vllm_cpp_add_test(test_device_placement
   vllm/model_executor/test_device_placement.cpp)
 

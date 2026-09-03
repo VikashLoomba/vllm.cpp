@@ -230,6 +230,70 @@ already makes on every MLA step. The mutation that proves it is deleting the
   are still unregistered after it lands, so `GetReferenceTierHits()` on a
   GLM-5.3 run stays non-zero and the axis stays **VOID**.
 
+## Evidence (`strix:gpu0`, rc job `be04b292`, 2026-09-03)
+
+gfx1151, ROCm/HIP 7.2.53211-97f5574fe2, `-DVLLM_CPP_HIP=ON
+-DVLLM_CPP_HIP_ARCHITECTURES=gfx1151`, `ninja -j 4`, `cmake rc=0` with
+`ROCm backend: ENABLED for arch(es) [gfx1151]` read off the configure log rather
+than assumed. **No `ccache`**, deliberately: `.agents/specs/rocm-glm53-dsa.md`
+§W5 records three runs on this board where a ccache-enabled HIP build failed to
+link `vllm-cli` and a ccache-free build of the identical source linked rc=0
+(#2506). The host usage sheet asks for ccache; that measurement outranks it here.
+
+RED is not "the tests with the kernels commented out". It is the tree at the
+spec commit `a1be8c1dc` — no `rocm_mla_ops.hip` on disk, zero `kConcatAndCacheMla`
+matches under `src/vt/rocm/`, both printed by the job from the tree — carrying
+only the new test file.
+
+| Arm | `ninja` | test cases | assertions |
+|---|---|---|---|
+| **RED** (before the kernels) | rc=0, 271 s | 5 / 4 passed / **1 failed** / 32 skipped | 11 / 7 passed / **4 failed** |
+| **GREEN** | rc=0, 260 s | 5 / **5 passed** / 0 failed / 32 skipped | 46 / **46 passed** / 0 failed |
+| GREEN, whole suite | — | 37 / 36 passed / 1 failed | 83,849 / 83,848 passed / 1 failed |
+| restored after every mutation | rc=0, 3 s | 5 / 5 passed / 0 failed | 46 / 46 passed / 0 failed |
+
+**Read the two counts together.** RED's four failures are the four
+`OpRegistered` CHECKs, by name in the log, against a NON-ZERO assertion count —
+so the cases asserted and failed rather than throwing. And RED's other four
+cases **passed**, on 7 assertions that are all `REQUIRE(ref != seed)`: the
+device loop bodies never ran, because `OpAvailable` was false. That is the
+spec's §Tests claim measured rather than argued — the oracle-equality
+assertions are green with no kernel at all. GREEN's assertion count rises 11 ->
+46, which is those loop bodies executing.
+
+The one full-suite failure is `test_backend_cross_device.cpp:2278`,
+`CHECK(got == ref_b)` inside "MoeSiluMul matches the CPU oracle" — the bf16 ±1
+ULP red #1954/#1513 track, already reproduced on this board by
+`.agents/specs/rocm-glm53-dsa.md` §W3. This wave touches no arithmetic on that
+path. It is reported, not widened into green.
+
+### Mutations
+
+Each patches one guarantee, **rebuilds** (`ninja rc=0` printed for every arm, so
+no mutation is a build failure wearing a test result), runs, restores, and
+proves the restore by sha256 against a manifest taken from the pristine tree
+before any mutation. `ALL FILES RESTORED BYTE-FOR-BYTE` at the end.
+
+| # | Mutation | Result | assertions |
+|---|---|---|---|
+| M1 | delete `RegisterOp(kConcatAndCacheMla, kROCM)` | **KILLED** | 41 / 40 passed / 1 failed |
+| M2 | `if (slot < 0) return;` -> `slot < -1000000` (drop the padded-token skip) | **SURVIVED** | 46 / 46 passed / 0 failed |
+| M3 | `broadcast = rope.shape[1] == 1 && heads > 1` -> `false` | **KILLED** | 46 / 45 passed / 1 failed |
+| M4 | drop the `seq_starts` offset in the gather | **KILLED** | 46 / 45 passed / 1 failed |
+| M5 | `lda = a.stride[1]` -> `a.shape[2]` in the batched GEMM | **KILLED** | 46 / 45 passed / 1 failed |
+
+M1 is also the reachability proof this wave owes. Deleting the registration
+reds assertion 2 while the numeric case goes back to passing vacuously (41
+assertions, not 46) — the two measure different things, and only one of them
+can see a missing kernel.
+
+**M2 SURVIVED, and the defect was the test.** `slot == -1` gives `block = -1/4 =
+0` and `offset = -1 % 4 = -1` under C++ truncation, so the entry address is
+NEGATIVE: a kernel with the skip removed writes BEFORE the cache, never inside
+it, and every word the case compared was still correct. The case now brackets
+the cache with guard bands and asserts both untouched, so an out-of-range write
+is seen. Re-measured under rc job `e88fd335`.
+
 ## Now
 
 W1 in flight. W2 and W3 unclaimed.

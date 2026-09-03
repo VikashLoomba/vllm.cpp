@@ -5758,7 +5758,8 @@ assertions below, `8081852cbd8aecd4…`, produced the same four rows.
 proves the hole once; it does not stop the next rewrite of the stripper from
 reopening it, and nothing on a clean tree can, because the whole point of the
 repair is that the counts do NOT move. So the enumeration case now calls
-`StripCommentsAndLiterals` directly on four strings: the bracketed reach
+`StripCommentsAndLiterals` directly on three strings, in four assertions: the
+bracketed reach
 `16'000.0 * vt::Scale(vllm::kOne) / 1'280.0`, whose two qualified names must
 SURVIVE; a prefixed `u8'v'`, whose body must NOT; and a `//` comment carrying
 both a `vt::` token and a separator, which must go whole. RED FIRST, with the

@@ -14,11 +14,24 @@ whose method this wave continues unchanged.
 
 ## Now
 
-**PENDING** until the report lands. 40 entries, 81 to 120 of the 290-entry
-PORT-NOW queue in upstream commit order. Report:
-[`../sync/2026-09-03-portq3.md`](../sync/2026-09-03-portq3.md).
+**Done.** 40 of 40 re-derived: **5 ALREADY_SATISFIED, 8 REAL_GAP,
+27 NOT_APPLICABLE** (20 `surface-absent`, 7 `inert`). **32 of the 40 disagree
+with the recorded PORT-NOW disposition.** Seven issues carry the eight gaps
+([#2648](https://github.com/mudler/vllm.cpp/issues/2648),
+[#2649](https://github.com/mudler/vllm.cpp/issues/2649),
+[#2650](https://github.com/mudler/vllm.cpp/issues/2650),
+[#2651](https://github.com/mudler/vllm.cpp/issues/2651),
+[#2652](https://github.com/mudler/vllm.cpp/issues/2652) which covers two entries,
+[#2653](https://github.com/mudler/vllm.cpp/issues/2653), and the pre-existing
+[#2527](https://github.com/mudler/vllm.cpp/issues/2527)); the seven deferred
+entries are carried on [#2655](https://github.com/mudler/vllm.cpp/issues/2655),
+and a citation defect found on the way is
+[#2654](https://github.com/mudler/vllm.cpp/issues/2654).
+Report: [`../sync/2026-09-03-portq3.md`](../sync/2026-09-03-portq3.md).
 
-The pin does **not** advance and nothing read here is a reason to move it. The
+**Nothing was executed.** No build, no test run, no GPU, no lease.
+
+The pin did **not** advance and nothing read here is a reason to move it. The
 active parity pin remains `5559679229bc961848b121ccdeaa8fa5d79bec98`.
 
 ## 1. Scope
@@ -175,4 +188,41 @@ resolves each against the tree before it is written down.
 
 ## Outcome
 
-Recorded when the wave lands.
+**What the delegated readers got wrong, and it was one citation in twenty.** The
+operator re-read all eight real gaps and eleven further citations. One named a
+file that does not exist — `include/vllm/v1/worker/gpu/cudagraph_dispatch.h:163`,
+where the symbol is at `src/vllm/v1/worker/gpu/cudagraph_dispatch.h:162`. Wrong
+directory, one line off, substance correct; the same shape as the three PORTQ-1
+corrected. No citation named a symbol that does not exist. §2.4 of the report
+carries the correction rather than quietly repairing it.
+
+**Why 20% is written down as an estimate and not a rate.** This tranche's 8 of 40
+sits between tranche 1's 6 of 40 and #2524's 11 of 63, and the three agree to
+within five percentage points. That agreement is the only reason the extrapolation
+to 50-60 gaps over the 290 is worth stating at all, and §10 of the report gives
+four reasons not to treat it as a measurement — the slice is contiguous rather
+than random, four of the eight gaps sit in two subsystems, this tranche shares two
+worked gaps with #2524's population, and two entries landing either way moves the
+figure from 15% to 25%.
+
+**Why `[107]` and `[114]` share one issue.** They are two upstream commits over
+eight adjacent keys of one transition table, and both are the same missing
+`REASONING_END`. AGENTS.md warns that intake without an exit is how 701 open
+issues accumulated; two issues over ~8 lines of the same map is that shape. The
+issue names both SHAs and all eight keys, so nothing is lost by the merge.
+
+**Why the deferred entries were collected rather than filed one by one.** Six of
+the seven `inert` entries have no open issue owning their gate — searched for
+`EPLB`, `DBO`, `ubatch`, `tokwise`, `pooling runner` and `OffloadingConnector
+worker`, all empty. Six new issues that each say "do not port this yet" would be
+six issues nobody can close. One issue with six rows, each naming its gate and
+the `path:line` that establishes it, is findable and closes when the gates land.
+
+**The shape this wave met that tranche 1 did not, and it is a property of the
+queue rather than of the tree.** `[89]` and `[120]` carry PORT-NOW labels for
+commits that edit `_mamba_block_aligned_split` and `shift_computed_tokens` —
+both of which upstream **already had at the pin**. The tree's distance from those
+commits is not the commit; it is a hole that predates the pin. A queue derived
+from a commit range structurally cannot see this, so the cheapest check for it,
+`git show 5559679229:<upstream path>`, is recorded in the report's §11 for the
+remaining tranches.

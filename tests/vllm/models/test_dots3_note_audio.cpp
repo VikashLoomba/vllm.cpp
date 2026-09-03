@@ -2753,7 +2753,7 @@ TEST_CASE("dots3-note W7a: every unported audio arm refuses BY NAME, with its br
 // upstream's default. Spec §4.17.7 says what that does and does not establish.
 //
 // A TOLERANCE ALONE WOULD GATE NOTHING, because a resampler that returns its
-// input, or returns zeros, passes one. Four assertions per case, each naming
+// input, or returns zeros, passes one. FIVE assertions per case, each naming
 // the defect it excludes, and the fifth golden case carries a tone ABOVE the
 // output Nyquist because that is the only content that separates a real
 // anti-alias filter from picking samples.
@@ -2779,10 +2779,6 @@ TEST_CASE("dots3-note W7c-2: the resampler reproduces scipy's `resample_poly`") 
         k.orig_sr;
     CHECK(static_cast<std::int64_t>(got.size()) == expect_len);
     CHECK(static_cast<std::int64_t>(k.n_out) == expect_len);
-    // ...and the seam's own length function agrees, since the chat seam may ask
-    // for the count without running the filter.
-    CHECK(vllm::multimodal::ResampleAudioScipyOutputLength(
-              k.n_in, k.orig_sr, k.target_sr) == expect_len);
     REQUIRE(static_cast<int>(got.size()) == k.n_out);
 
     // (2) A LOWER BOUND. A resampler that returned zeros, or one whose filter

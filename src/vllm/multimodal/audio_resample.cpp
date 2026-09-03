@@ -145,20 +145,6 @@ void ValidateRates(int orig_sr, int target_sr) {
 
 }  // namespace
 
-int64_t ResampleAudioScipyOutputLength(int64_t num_samples, int orig_sr,
-                                       int target_sr) {
-  ValidateRates(orig_sr, target_sr);
-  if (num_samples <= 0) return 0;
-  if (orig_sr == target_sr) return num_samples;
-  int64_t up = 0;
-  int64_t down = 0;
-  ReducedRatio(orig_sr, target_sr, &up, &down);
-  // `n_out = n_in * up; n_out = n_out // down + bool(n_out % down)`, which is
-  // `ceil(n_in * up / down)` written so it cannot double-round.
-  const int64_t n = num_samples * up;
-  return n / down + ((n % down) != 0 ? 1 : 0);
-}
-
 std::vector<float> ResampleAudioScipy(const float* samples, int64_t num_samples,
                                       int orig_sr, int target_sr) {
   ValidateRates(orig_sr, target_sr);

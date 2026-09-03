@@ -34,14 +34,6 @@ namespace vllm::multimodal {
 // than resampling, while dots3-note's upstream resamples. dots3-note opts in
 // by calling this; nobody else is changed by its existence.
 
-// The output length `resample_poly` produces for `num_samples` input frames,
-// which is `ceil(num_samples * target_sr / orig_sr)`. Upstream writes it as
-// `n_out = n_in * up; n_out = n_out // down + bool(n_out % down)`
-// (`scipy/signal/_signaltools.py::resample_poly`). Exposed so a caller can size
-// a placeholder span without running the filter.
-int64_t ResampleAudioScipyOutputLength(int64_t num_samples, int orig_sr,
-                                       int target_sr);
-
 // The filter is `20 * max(up, down) + 1` taps and `max(up, down)` is chosen by
 // the REQUEST, because a WAV's `fmt ` chunk names its own sample rate. A
 // request declaring 999983 Hz reduces to `max(up, down) = 999983` and asks this

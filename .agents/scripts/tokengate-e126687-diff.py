@@ -27,6 +27,16 @@ Three things are checked, and they are NOT the same check:
 Exit 0 only when all three hold. Exit 1 is a real difference (a finding, not a
 crash); exit 2 is a missing or malformed input, which is this script failing
 rather than the comparison failing.
+
+WHICH SIDE'S ABSENCE IS FATAL, because the two are not symmetric. The
+CANDIDATE's `greedy_ids.npy` and `greedy_dist.npy` are both required and their
+absence exits 2. On the COMMITTED side only `greedy_ids.npy` is required:
+`greedy_dist.npy` there is the OLD oracle's measurement of itself, it is not the
+licence for the bar at the candidate, and nothing here reads it except to print
+its hash beside the candidate's. So deleting the committed dist file exits 0,
+deliberately, and the run says `DIST committed ABSENT` rather than passing in
+silence. The staged committed set is sha256-asserted by the lease job before
+this script runs, so a missing committed file is caught there, not here.
 """
 import argparse
 import hashlib
@@ -120,9 +130,16 @@ def main():
               "test_opt_paged_engine.cpp must be RE-DERIVED, not kept")
         bad = 1
     cd = os.path.join(args.committed, "greedy_dist.npy")
+    print(f"DIST candidate sha256 {sha256(n_dist)}")
     if os.path.exists(cd):
         print(f"DIST committed sha256 {sha256(cd)}")
-        print(f"DIST candidate sha256 {sha256(n_dist)}")
+    else:
+        # NOT an error, and said out loud so it is not mistaken for one. The
+        # committed dist is the previous oracle's self-measurement; the licence
+        # for the strict bar at the candidate is the candidate's own K runs,
+        # recomputed above.
+        print("DIST committed ABSENT (not required: the selector is the "
+              "CANDIDATE's own K runs, recomputed above)")
 
     print(f"TOKENGATE_VERDICT {'PASS' if bad == 0 else 'DRIFT'}")
     sys.exit(bad)

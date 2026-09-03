@@ -113,9 +113,20 @@ is not that step, for three reasons, and the third was not named there.
 | Checkpoint | raw `facebook/opt-125m` fp16, rounded by vLLM at load | the bf16-materialized artifact `scripts/opt-materialize-checkpoint.py` writes, decisions D1/D2 of [`sweep-opt-125m.md`](sweep-opt-125m.md) |
 | K | one run per leg | `--runs 5`, because K **selects the gate** |
 
-The first two are confounds: revision moved together with silicon, and with the
-rounding path. An agreement across two moved variables is not attributable, and
-neither would a disagreement have been.
+**The device is the load-bearing confound; the checkpoint is a weaker point and
+is stated as one.** Revision moved together with silicon, and an agreement
+across two moved variables is not attributable — neither would a disagreement
+have been. The checkpoint difference is real but the repository's own record
+says it should be inert: decision D1, written into
+`scripts/opt-oracle-capture.py`'s header, is that the materializer applies the
+**same** single fp16-to-bf16 rounding vLLM applies at load, and
+`.agents/scripts/runhalf-e126687-gen.py` passes `dtype="bfloat16"` on the raw
+snapshot. So the two artifacts should agree, and an earlier draft of this spec
+calling the checkpoint "a second uncontrolled variable" overstated it. What is
+true and sufficient is narrower: the capture at the target must use the same
+artifact the golden was captured against, because an undeclared difference in a
+gate's inputs is not something a gate gets to assume away — not because that
+difference has been shown to matter.
 
 The third is not a confound but a missing measurement, and it is the one that
 makes this a gate rather than a diff. `test_opt_paged_engine.cpp` uses a STRICT
@@ -129,6 +140,16 @@ cannot stand in for it: it is the previous oracle's measurement of itself. If
 the candidate has become non-deterministic on this battery, the strict bar must
 be re-derived per [[near-tie-distributional-gate]] and not silently kept — and
 no diff of `greedy_ids.npy` alone can see that.
+
+**Every capture argument is the capture script's own default**, passed
+explicitly so the log records it rather than implying it: `--runs 5`,
+`--max-tokens 16`, `--gpu-mem-util 0.20`, `--max-model-len 2048`. `--runs` is
+the only argument the committed invocation in that script's docstring supplies.
+An earlier draft of the job passed `--gpu-mem-util 0.10`, which is RUNHALF's
+**thor** value chosen for a unified-memory box, and that would have been an
+undeclared config delta of exactly the kind this wave's central argument is
+about. `0.20` is what the committed golden was captured under. It is corrected
+in the job, and recorded here rather than left to a reader to notice.
 
 **So the construction is:** on GB10, against the same bf16-materialized
 checkpoint, with `scripts/opt-oracle-capture.py --runs 5` verbatim, capture
@@ -219,6 +240,26 @@ than the comparison failing. That separation is deliberate: an instrument whose
 failure looks like a result is this row's recurring trap, and three of RUNHALF's
 four reds were its own instruments.
 
+**Two properties of the job carry the verdict, and a fresh review of #2801
+found both missing from the first draft.**
+
+**The staged inputs are sha256-asserted, not only the checkpoint.** `/workspace`
+is a shared CIFS surface other sessions write. The first draft asserted the
+checkpoint and nothing else, while reading the capture script, the differ and
+`goldens-committed` — **which is the bar** — off that same surface unchecked. A
+stale staged golden would have produced a confident verdict against the wrong
+reference, and the `VERBATIM` comment beside the capture invocation was a claim
+no reader of the job's output could check. The job now asserts all ten files
+against the sha256 they have in the tree, prints each one, reports every
+mismatch rather than stopping at the first, and exits 9. This is the property
+#2628 named as its own strength.
+
+**A drift has its own exit code.** The first draft put `DIFF_RC` into a log line
+and fell through to exit 0, which made a real golden drift — the one outcome the
+wave exists to detect — indistinguishable from success in `rc`'s eyes. The map
+is now: 0 reproduces, **7 drift**, 8 the differ could not compare, 2-6 and 9 the
+environment or the instrument. Only 0 and 7 are statements about the target.
+
 `.agents/scripts/tokengate-e126687-job.sh` is the lease job. It **refuses to run
 on anything but compute capability 12.1** rather than adapting to the device it
 finds, because a capture on the wrong silicon is the failure this wave exists to
@@ -289,8 +330,16 @@ manifest written from that job records a commit it actually ran.
 | The differ detects a drifted token id | mutate `greedy_ids[2,7]`, rerun | **rc 1**, `IDS_DIFF prompt[2] pos 7: committed 4 candidate 5` |
 | The differ detects a moved input | mutate `p3_prompt.i32[1]`, rerun | **rc 1**, `PROMPT[3] … EQUAL False` |
 | The differ detects a lost selector | mutate `greedy_dist[0,3,4]`, rerun | **rc 1**, `SELECTOR K=5 multi_valued_cells 1` |
-| A missing input is NOT a finding | delete `greedy_dist.npy`, rerun | **rc 2**, `FATAL missing input` |
+| A missing CANDIDATE input is NOT a finding | delete the **candidate's** `greedy_dist.npy` | **rc 2**, `FATAL missing input` |
+| A missing CANDIDATE bar is NOT a finding | delete the **committed** `greedy_ids.npy` | **rc 2**, `FATAL missing input` |
+| A missing COMMITTED dist is NOT an error, and says so | delete the **committed** `greedy_dist.npy` | **rc 0**, `DIST committed ABSENT (not required: the selector is the CANDIDATE's own K runs)` |
 | Identical inputs pass | committed vs a copy of itself | **rc 0**, `TOKENGATE_VERDICT PASS` |
+| `assert_sha` accepts a matching file | the real staged `greedy_ids.npy` | **rc 0**, `STAGED OK 078d1593…` |
+| `assert_sha` rejects a wrong hash | same file, zeroed expectation | **rc 1**, `STAGED MISMATCH` + want/got |
+| `assert_sha` rejects an absent file | a path that does not exist | **rc 1**, `STAGED MISSING` |
+| The integrity block passes on the REAL staged tree | run the block extracted from the staged job against `/workspace` | **rc 0**, ten `STAGED OK` lines |
+| The integrity block catches a corrupted BAR | flip one byte of the staged `greedy_ids.npy`, rerun | **rc 9**, mismatch named, other nine still checked |
+| A drift leaves the job with its own status | `DIFF_RC` 0 / 1 / 2 / unset through the job's exit map | **0 / 7 / 8 / 0** |
 | The token harness reads no pin constant | full read + the §2.1 probe with controls | zero hits, controls 1/5/4 |
 | The capture at the target on GB10 | `efc30c74-005e-4e80-bc28-bd34f5b76b77` | **PENDING**, queued |
 
@@ -314,11 +363,52 @@ Every rc above was read directly, never after a pipe.
 - **A re-capture of the OPT golden at the ACTIVE pin `5559679229`**, which §2.4
   shows was skipped. A candidate capture that reproduces the committed bytes
   answers this too; one that does not leaves it open (#2794).
+- **[#2805](https://github.com/mudler/vllm.cpp/issues/2805): the STRICT bar's
+  licence is inside an existence guard.**
+  `tests/vllm/models/test_opt_paged_engine.cpp:155` wraps the self-determinism
+  re-assertion in `if (fs::exists(gdir / "greedy_dist.npy"))`, so deleting that
+  file leaves `multi_cells` at `-1`, fires no `CHECK`, and runs the strict bar
+  unlicensed. It is owned by `MODEL-TEXT-opt-optfor-causal-lm`, not by this
+  wave, because it changes what a SACRED gate asserts.
+
+  **The reachable form is a degenerate K, and the first draft of that issue got
+  the mechanism wrong.** It claimed a re-capture could write `greedy_ids.npy`
+  without `greedy_dist.npy`; `scripts/opt-oracle-capture.py:113-114` saves both
+  unconditionally on every path and `:86` is `K = max(1, args.runs)`, so the
+  script cannot do that. The claim came from a review of #2801 and was relayed
+  without being run down; it is corrected on the issue. What is true and worse:
+  **there is no floor on `DK` anywhere in the gate.** `grep -n DK` over
+  `test_opt_paged_engine.cpp` returns exactly three lines — the read at `:158`,
+  the print at `:172`, the loop at `:164` — against 14 `REQUIRE`/`CHECK`
+  occurrences as a control. A capture at `--runs 1` therefore writes a
+  well-formed `[N,T,1]` dist whose every cell has one member by construction,
+  `multi_cells` computes to 0, the `CHECK` passes, and the strict bar is
+  licensed by a measurement that cannot detect non-determinism at all. The
+  capture script's help says `K>=5`; nothing enforces it and the gate never
+  looks. That bears directly on this wave, whose whole argument is that K
+  selects the gate.
+- **[#2798](https://github.com/mudler/vllm.cpp/issues/2798): `opt-dgx-gate.sh`
+  claims a `flock` it never takes.** Deliberately not repaired: a bare `flock`
+  would recreate the two-mutexes-that-do-not-exclude-each-other failure that
+  file's own history caused, so the repair needs the lease relationship decided
+  first.
 - **A provenance manifest for `opt_greedy`, and for the other nineteen greedy
   goldens that lack one**, on the shape
   `tests/parity/goldens/qwen35_greedy_0_8b/manifest.json` already uses. §2.6. The
   OPT one should be written from the capture job's own output rather than
   reconstructed, which is why it is owed rather than done here (#2794).
+  A reviewer of #2801 noted that writing nothing is not the only honest option:
+  a manifest recording date, device, invocation and checkpoint with
+  `vllm_commit` explicitly **null** would manufacture no fact and would still
+  make the debt legible. That option is recorded here rather than taken, because
+  the queued capture produces the authoritative value and a second manifest
+  would then have to be reconciled with it. The survey behind this is stronger
+  than an earlier draft claimed: `find tests/parity/goldens -name manifest.json`
+  returns **67**, and `grep -rl vllm_commit` over that tree returns exactly
+  **one**, `qwen35_greedy_0_8b/manifest.json`. The review of #2801 reported 68
+  for the first of those; re-counted here it is 67, and the count that belongs
+  in the record is the one this wave measured rather than the one it was
+  handed.
 - **The other strict goldens at the target** — 27B W4A4, 32B-NVFP4A16, 35B,
   Coder. The pin advance re-captured all four at `5559679229`; none has been
   re-captured at `e126687a9a`, and this wave does not attempt it (#2794).

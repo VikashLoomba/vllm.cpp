@@ -20,6 +20,25 @@
 #
 # Every value that decides what was measured is printed. A step that cannot run
 # exits non-zero; it never prints a partial success.
+#
+# THE EXIT CODE CARRIES THE VERDICT, and DRIFT has its own value. An earlier
+# draft put DIFF_RC into a SUM line and fell through to exit 0, which made a
+# real golden drift -- the one outcome this job exists to detect -- the only
+# result `rc` could not tell apart from success. The map:
+#
+#   0  the capture ran and the candidate REPRODUCES the committed golden
+#   2  wrong device: compute capability is not 12.1, nothing was measured
+#   3  staging or build prerequisites missing
+#   4  the vLLM source build failed
+#   5  capture-stage setup failed (wheel, venv, checkpoint, oracle identity)
+#   6  the capture itself failed to run
+#   7  DRIFT: the capture ran and the candidate DISAGREES with the committed
+#      golden, or is no longer self-deterministic. A FINDING, not a failure.
+#   8  the differ could not compare (missing or malformed input) -- instrument
+#   9  a staged input's sha256 does not match the tree it was staged from
+#
+# 2-6, 8 and 9 are the instrument or the environment failing. Only 0 and 7 are
+# statements about the target.
 set -uo pipefail
 
 STAGE="${STAGE:-all}"
@@ -153,6 +172,44 @@ fi
 if [ "$STAGE" = "capture" ] || [ "$STAGE" = "all" ]; then
   if ! have_wheel; then sum "CAPTURE_RC=1  no wheel at $WS/wheel"; exit 5; fi
   W="$(compgen -G "$WHEEL_GLOB" | head -1)"
+
+  # ---- STAGED-INPUT INTEGRITY --------------------------------------------
+  # /workspace is a SHARED CIFS surface that other sessions write. The
+  # checkpoint was already asserted below; these three were not, and
+  # `goldens-committed` IS THE BAR -- a stale or wrong staged golden yields a
+  # confident verdict against the wrong reference. The expected values are the
+  # sha256 of the files in the tree at the commit that staged them, so this
+  # also makes the "VERBATIM" claim about opt-oracle-capture.py checkable from
+  # the job's own output instead of from a comment.
+  assert_sha() {
+    local path="$1" want="$2" got
+    if [ ! -f "$path" ]; then echo "STAGED MISSING $path"; return 1; fi
+    got="$(sha256sum "$path" | cut -d' ' -f1)"
+    if [ "$got" != "$want" ]; then
+      echo "STAGED MISMATCH $path"
+      echo "STAGED   want $want"
+      echo "STAGED   got  $got"
+      return 1
+    fi
+    echo "STAGED OK $got  $path"
+    return 0
+  }
+  stage_bad=0
+  assert_sha "$WS/opt-oracle-capture.py"     c4b4b770671d3728faa3480d957bca392a68ec8d85b682fb24c918469d5342d3 || stage_bad=1
+  assert_sha "$WS/tokengate-e126687-diff.py"     7334dab81079531051e7ab60dedab128ec1fb286d1c2cd2b44542dd9d1195d19 || stage_bad=1
+  assert_sha "$WS/goldens-committed/greedy_ids.npy"     078d15930de5e498788922cad66aa83dcba3c24ad2a072b7a9447a0d32e90698 || stage_bad=1
+  assert_sha "$WS/goldens-committed/greedy_dist.npy"     16e0ef356564bb36e2030004f68ee8e60b9109e609188f75c86835cf76918f45 || stage_bad=1
+  assert_sha "$WS/goldens-committed/p0_prompt.i32"     7b14d31df1a3db82e271b9d4dae1844ca5f7270a9a32e63d294db98925df9d45 || stage_bad=1
+  assert_sha "$WS/goldens-committed/p1_prompt.i32"     7c8d0ee78370f31d0d815ce6c594dac17f007da86d2332c2c670e595a7c81544 || stage_bad=1
+  assert_sha "$WS/goldens-committed/p2_prompt.i32"     fab727c9ffd510284de8e2ae2b884f43ddd6ed25563bf38af43d97e24fadadc2 || stage_bad=1
+  assert_sha "$WS/goldens-committed/p3_prompt.i32"     b791f64b0a95c4363655811636c2d5d3f688e8df54b05e0eac26ec4634ee4137 || stage_bad=1
+  assert_sha "$WS/goldens-committed/p4_prompt.i32"     7e3be091ff6ab0c636e1b509502821e3e6565fba1699e87b7f80c6c46714d620 || stage_bad=1
+  assert_sha "$WS/goldens-committed/p5_prompt.i32"     b8c6bec84f1ccaa7dc9d200be93da22fd533908df5cfc6c23d020f2b384090c0 || stage_bad=1
+  if [ "$stage_bad" -ne 0 ]; then
+    sum "STAGED_RC=1  a staged input does not match the tree it came from"
+    exit 9
+  fi
+  sum "STAGED_RC=0  capture script, differ and all 8 committed goldens verified"
   say "--- install $W ---"
   if [ ! -x "$WORK/venv/bin/python" ]; then
     python3 -m venv "$WORK/venv" || { sum "VENV_RC=1"; exit 5; }
@@ -190,11 +247,19 @@ PY
     *) sum "ORACLE_ID_RC=1  $VER does not carry +ge126687a9"; exit 5 ;;
   esac
 
+  # Every value here is scripts/opt-oracle-capture.py's OWN default, passed
+  # explicitly so the log records it: --runs is the only argument the committed
+  # invocation in that script's docstring supplies. An earlier draft passed
+  # --gpu-mem-util 0.10, which is RUNHALF's thor value picked for a
+  # unified-memory box; 0.20 is what the committed golden was captured under,
+  # and in a wave whose whole argument is that config deltas turn a gate into an
+  # anecdote, an undeclared delta of my own is not defensible. 0.20 of this
+  # box's 128 GB is far more than a 125M model and its KV pool need.
   say "--- CAPTURE: scripts/opt-oracle-capture.py VERBATIM, --runs 5 ---"
   mkdir -p "$OUT/goldens-candidate"
   ( cd "$WS" && "$WORK/venv/bin/python" "$WS/opt-oracle-capture.py" \
       --model "$WORK/ckpt/opt-125m-bf16-st" \
-      --runs 5 --max-tokens 16 --gpu-mem-util 0.10 --max-model-len 2048 \
+      --runs 5 --max-tokens 16 --gpu-mem-util 0.20 --max-model-len 2048 \
       --out-dir "$OUT/goldens-candidate" ) > "$OUT/capture.log" 2>&1
   CAPTURE_RC=$?
   cat "$OUT/capture.log"
@@ -207,8 +272,20 @@ PY
     | tee "$OUT/diff.log"
   DIFF_RC=${PIPESTATUS[0]}
   sum "DIFF_RC=$DIFF_RC"
+  case "$DIFF_RC" in
+    0) sum "TOKENGATE=PASS   the candidate reproduces the committed golden" ;;
+    1) sum "TOKENGATE=DRIFT  a FINDING: record it and re-gate, do not repair here" ;;
+    *) sum "TOKENGATE=INSTRUMENT the differ could not compare; nothing is said about the target" ;;
+  esac
 fi
 
 say "--- artifacts ---"
 ls -laR "$OUT" | head -60
 say "DONE_MARKER_TOKENGATE $STAMP"
+
+# The verdict leaves this script in its EXIT STATUS, not only in a log line.
+case "${DIFF_RC:-0}" in
+  0) exit 0 ;;
+  1) exit 7 ;;
+  *) exit 8 ;;
+esac

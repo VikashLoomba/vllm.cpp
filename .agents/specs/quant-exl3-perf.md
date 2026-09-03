@@ -25,7 +25,7 @@ Slice A (the `(3, 2)` GEMV instantiation) and slice B (the `(4, 2)` GEMV KERNEL
 PORT) are described below. Everything else is
 under `## Evidence
 
-### Host arm, executed 2026-09-03 on `mudler-ubuntu-box`
+### SLICE A, host arm, executed 2026-09-03 on `mudler-ubuntu-box`
 
 CPU-only build (`RelWithDebInfo`, no CUDA toolchain on this host), built in
 `/dev/shm` because `/` had 8.2 GB free. `BUILD_RC=0` in 432 s;
@@ -42,7 +42,7 @@ that asserts nothing reports `assertions: 0`, which reads as a pass; this one
 cannot. **So the tier-3c bound and the `(3,1)`-vs-`(3,2)` discrimination check
 are UNMEASURED here and are not claimed.** They need the lease.
 
-### Mutation table — host arm
+### Mutation table — slice A, host arm
 
 Each row asserts four things, because three of them have faked a pass in this
 tree before: the mutated file's `sha256` CHANGED, it COMPILED, the test binary's
@@ -72,7 +72,7 @@ M4  :170  Exl3GemvSelectConfig(bw, 1, 17408, 5120, 3, 2, 1, 159) == -1  -> got 0
 M3 also reds the `(4, 2)` threshold rows, which is the point of recording them
 before that arm exists: they are what the port will be measured against.
 
-### Device arm — `thor:gpu0`, executed 2026-09-03
+### SLICE A, device arm — `thor:gpu0`, executed 2026-09-03
 
 NVIDIA Thor, compute capability **11.0**, driver **595.78**, nvcc 13.0, built
 `sm_110` from the pinned bundle. `BUILD_RC=0`, so `GemvKernelForArm<3, 2>`
@@ -97,7 +97,7 @@ The discrimination check is what makes those two numbers mean anything: the two
 codebooks disagree on **4095 of 4096** outputs. A `cb` threaded wrongly between
 them would have produced identical output and two green tolerances.
 
-### Mutation table — device arm, `thor:gpu0`
+### Mutation table — slice A, device arm, `thor:gpu0`
 
 | Mutation | sha256 | built | mtime moved | `TEST_RC` | verdict | restored |
 |---|---|---|---|---|---|---|
@@ -185,7 +185,105 @@ upstream's envelope admits the wide config at large-`n`/small-`k` only for
 row's largest `## Owed` item — so the measurement and the owed work point at the
 same place, from two directions.
 
-### Device throughput — PENDING, and how to collect it
+### SLICE B, host arm, executed 2026-09-03 on `mudler-ubuntu-box`
+
+CPU-only build (`RelWithDebInfo`, no CUDA toolchain on this host), built in
+`/dev/shm` because `/` had 8.2 GB free. `BUILD_RC=0`; `test_exl3_gemv` and
+`test_exl3_gemm` both `rc=0`.
+
+```
+test_exl3_gemv  [doctest] test cases:   7 |   7 passed | 0 failed | 0 skipped
+                [doctest] assertions: 158 | 158 passed | 0 failed
+test_exl3_gemm  [doctest] test cases:  15 |  15 passed | 0 failed | 0 skipped
+                [doctest] assertions: 210 | 210 passed | 0 failed
+python3 scripts/check-pr-size.py --base origin/main --head HEAD  ->  rc 0
+```
+
+158 against slice A's 69, and 89 of the difference is the bits-4 envelope table.
+
+**NOTHING ON THIS HOST COMPILES `cuda_exl3.cu` AT ALL.** There is no CUDA
+toolchain here, so the file is not in the CPU build at any warning level. Every
+claim about the ported kernel — that it compiles, that it meets tier 3c, that
+the wide config works, that the arm is reached unforced — is a DEVICE claim and
+is PENDING until the lease runs. The host arm gates the envelope and nothing
+else, and the count above must not be read as covering the port.
+
+### Mutation table — slice B, host arm
+
+| Mutation | file | sha256 | built | mtime moved | `TEST_RC` | verdict | restored |
+|---|---|---|---|---|---|---|---|
+| baseline | — | `db293772…` | — | — | 0 | 158/158 pass | — |
+| H1 narrow admission `<=` → `<` | `src/vt/exl3_policy.cpp` | `bd89702425…` | OK | YES | 1 | **RED**, 11 failed | YES |
+| H2 `if (K == 3)` → `if (K == 3 \|\| K == 4)` | `src/vt/exl3_policy.cpp` | `d57f810bccbb…` | OK | YES | 1 | **RED**, 3 failed | YES |
+
+Each row asserts four things, because three of them have faked a pass in this
+tree before: the mutated file's `sha256` CHANGED, it COMPILED, the test binary's
+`mtime` MOVED, and the tree RESTORED byte-for-byte.
+
+H1 reds the ADMITTED side of every threshold including the eight new bits-4
+rows (`:204`). H2 is the bits-4-specific one: it makes `K == 4` decline where
+`K == 3` does, and the three cases that fire are exactly the three that read the
+WIDE band — `:112`, `:114` and `:222`. That is the point worth having in an
+evidence table rather than in prose: the wide band is genuinely gated, and it is
+also genuinely unreachable at this checkpoint's shapes, and those are different
+statements.
+
+**What the host mutations do NOT cover, stated rather than implied.** The
+`s.n / 32 == s.threshold` line inside the bits-4 loop is arithmetic the envelope
+also performs, so it gates a typo in the module table and not the envelope. The
+gate on the envelope is the two-sided threshold assertion beside it, and H1 is
+the evidence that it bites.
+
+### SLICE B, device arm — PENDING on `thor:gpu0`
+
+Submitted 2026-09-03 under an `rc` lease, queued behind two other jobs on that
+device. Pinned to `git bundle` sha256
+`8a32656973d3b0367179905f5f6e7ade20cdc81a81729bfcb4b404a2104e2fee`, commit
+`a74565873`, and the job aborts unless `git rev-parse HEAD` inside the clone
+matches. Nothing is pushed to reach the box. The harness is
+`/workspace/exl342-thor/run.sh`.
+
+**Which tree slice B's evidence is measured on, said before it drifts.** Slice A
+recorded a claim of this shape and a later `origin/main` merge falsified it, so
+this one is written narrowly on purpose: `a74565873` is the LAST commit of this
+branch that touches `src/`, `include/` or `tests/`. Anything after it edits this
+spec and nothing else. Re-derive that with
+`git diff --stat a74565873..HEAD -- src include tests CMakeLists.txt` before
+quoting any number below; a non-empty output means the evidence names a
+different tree than the head does.
+
+**No claim about the ported kernel is made until it runs.** What it will
+produce, cheapest first: the tree facts, the sm_110 build, the four-leg tier-3c
+gate with its skip count, the same binary re-run with `VT_EXL3_GEMV_SMEM=1`
+because `Exl3GemvSmemMode()` caches its `getenv` in a function-local static,
+`SM_COUNT` and `MAX_THREADS_PER_SM`, then six mutations behind a clock:
+
+| Mutation | what it removes | expected |
+|---|---|---|
+| M1 `(4,2)` out of the predicate | the arm itself; the pre-slice-B product exactly | RED, and a THROW rather than a failed assertion, so only the rc sees it |
+| M2 `GemvKernelForArm<4, 2>` → `<4, 1>` | the confusable codebook, at the new width | RED on tier 3c and on the sibling-reference check |
+| M3 the 24-lane guard applied at bits 4 | a quarter of every bits-4 tile | RED on the bits-4 legs only |
+| M4 the bits-4 window pair reversed | the funnel order across the word boundary | RED on the bits-4 legs only |
+| M5 `LSTRIDE` back to the literal 24 | the stride the whole port turns on | a COMPILE error naming `LSTRIDE == TWORDS`; read the first error line, because a build failure is otherwise a VOID mutation and not a result |
+| M6 the `Exl3GemvTryLaunch` call site | the DEFAULT-mode route to the arm | the forced legs stay GREEN and the unforced one REDS; a green here would mean the suite measures a class and not a capability |
+
+### Device throughput — SLICE B, PENDING on `dgx:gpu0`
+
+Submitted 2026-09-03 at queue position 11 behind a job that had already run for
+ten hours. **It will not have run when this row is reported, and no throughput
+number is claimed for `(4, 2)` anywhere.** Pinned to tarball sha256
+`240a328843cd64dbffc190e35feac379cc1dfcde83e715265d5b9c8ec657c3fd`, commit
+`a74565873`; harness `/workspace/exl342-dgx/job.sh`, adapted from slice A's with
+the tree facts and the two `(4, 2)` mutations replaced.
+
+Read `SM_COUNT` and `MAX_THREADS_PER_SM` from section F BEFORE any tok/s number.
+If they put `narrow_coresident` below 32, no module of the checkpoint is
+admitted at either width and `G1 == G0` is the predicted reading rather than a
+result about the kernel. Between 32 and 160 it is 34 modules of 409. The
+nsys leg is what separates "the arm ran and did not help" from "the arm never
+ran", and a speed ratio taken without it is the 8%-from-nothing failure again.
+
+### Device throughput — SLICE A, PENDING, and how to collect it
 
 Queued on `dgx:gpu0`. **No throughput number is claimed anywhere until it runs**,
 and none appears in `docs/FEATURES.md` or `docs/USAGE.md` either.

@@ -592,6 +592,15 @@ TEST_CASE("dots3-note W6c: two different NON-CONFORMANT images give two differen
 //     correctness of those bytes is `test_dots3_note_vision`'s to prove against
 //     the independent reference; what this asserts is that the production path
 //     produced them.
+//
+//     SAY THE LIMIT OUT LOUD, because it is the same shape as the defect this
+//     case repairs. Both legs run the SAME resampler, so a defect INSIDE it
+//     cancels: with a half-pixel centre, with the support scaling dropped and
+//     with the weight normalization skipped, this suite reads 15/15 and 216/216
+//     while `test_dots3_note_vision` reads 145, 96 and 177 failed assertions.
+//     That division is deliberate -- the served suite answers "was it called",
+//     the reference gate answers "was it right" -- and it is written here so a
+//     reader does not mistake a green served suite for a numeric verdict.
 // ---------------------------------------------------------------------------
 TEST_CASE("dots3-note W6c: a served NON-CONFORMANT image equals its pre-resized twin") {
   Served s;

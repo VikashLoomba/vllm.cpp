@@ -108,11 +108,11 @@ config proves nothing.
 
 | Gate | Command | State |
 |---|---|---|
-| the registry stays consistent both ways | `python3 scripts/check-oracle-pins.py` | **PASS**, 14 oracles. Red-before/green-after was taken on this change: with `pinned_on` omitted it printed `vllm-gguf-plugin.md: oracle-pin is missing required key 'pinned_on'` and `oracle-pins FAILED (1 error(s))`, and adding the key turned it green. Read the printed verdict, never the exit code — the checker exits 0 while printing FAILED |
-| the plugin builds on aarch64 + CUDA | `pip wheel . --no-build-isolation` in an `rc` lease | **PASS**, measured on `thor:gpu0` 2026-09-03. `PLUGIN_BUILD_RC=0` in 29.1 s under nvcc 13.0.88 |
+| the registry stays consistent both ways | `python3 scripts/check-oracle-pins.py` | **PASS**, 14 oracles. Red-before/green-after was taken on this change: with `pinned_on` omitted it printed `vllm-gguf-plugin.md: oracle-pin is missing required key 'pinned_on'` and `oracle-pins FAILED (1 error(s))`, and adding the key turned it green. The checker **exits 1** on that failure and 0 on the pass: `raise SystemExit(main())` at `scripts/check-oracle-pins.py:311-317`, re-measured by the same mutation on 2026-09-03. An earlier draft of this line, and the commit message of `43b1678e`, said it "exits 0 either way"; that was false and neither can be rewritten, so it is corrected here |
+| the plugin builds on aarch64 + CUDA | `pip wheel . --no-build-isolation` in an `rc` lease | **PASS**, measured on `thor:gpu0` 2026-09-03. `PLUGIN_BUILD_RC=0` in all five jobs under nvcc 13.0.88. The cold build is job 1's 29.128 s; the cited run (job 5) rebuilds over a warm tree in 3.113 s |
 | the plugin registers, and its CUDA extension imports | `import vllm_gguf_plugin._C_gguf`, entry-point listing | **PASS**, same lease. `REGISTRATION_RC=0` |
-| the GGUF loads into the pinned vLLM | the engine's own weight loader | **PASS**, same lease. 16.3 GiB in 745.17 s, no unmapped tensor reported |
-| the model emits tokens | `/workspace/ggufplugin/gen.py`, six prompts x 48 greedy tokens | **NOT REACHED on `thor:gpu0`**, blocked by a device/toolchain wall that is not the plugin's (below). `PENDING` on `dgx:gpu0`, `rc` job `7a45427e-ad86-4042-aeea-cdf8db535a54` |
+| the GGUF loads into the pinned vLLM | the engine's own weight loader | **PASS**, same lease. 16.3 GiB in 530.73 s in the cited run (745.17 s in job 3, cold cache), no unmapped tensor reported |
+| the model emits tokens | `/workspace/ggufplugin/gen.py`, six prompts x 48 greedy tokens | **NOT REACHED on `thor:gpu0`**; the forward throws inside the plugin's own op and the attribution is OPEN (below). `PENDING` on `dgx:gpu0`, `rc` job `7a45427e-ad86-4042-aeea-cdf8db535a54` |
 | the six-prompt token gate against this oracle | not attempted | **NOT REACHED** |
 
 ## Evidence
@@ -200,8 +200,10 @@ config proves nothing.
    (`unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M` against `Qwen/Qwen3.5-0.8B`) and
    `QWEN35_MOE_CONFIG` (`...35B-A3B...`), both multimodal Q4_K_M, and
    `README.md`'s coverage table lists "Qwen 3.5 — Q4_K_M backbone with BF16
-   projector". Both cases are `pytest.mark.slow` (`:118-123`) and neither was
-   run here: this is upstream's declaration, not a green from this session.
+   projector". `QWEN35_MODELS_TO_TEST` (`:121-124`) marks only the MoE case
+   `pytest.mark.slow`; the dense 0.8B case is unmarked, and the params at
+   `:118-119` are Gemma3's. Neither was run here: this is upstream's
+   declaration, not a green from this session.
 8. **The two oracles are not offered the same model.**
    `.agents/oracles/llama-cpp.md` records `b10451` loading 851 of 866 tensors
    and ignoring all 15 of `blk.64`, 289,527,808 bytes. The plugin maps all 15,
@@ -214,7 +216,13 @@ config proves nothing.
 Five `rc` jobs ran the same staged `/workspace/ggufplugin/job.sh` on
 `thor:gpu0` (aarch64, NVIDIA Thor, compute capability 11.0, driver 595.78,
 125,748 MB of unified memory). The last is `40a1d8dd-529b-456b-8e46-2789354cce5a`,
-run directory `/workspace/ggufplugin/20260903T012806Z`. Every job took the
+run directory `/workspace/ggufplugin/20260903T012806Z`. **The cited run's
+engine log, its `rc` job log, `job.sh`, `gen.py` and the offline arch
+measurement are committed under
+`docs/bench-evidence/vllm-gguf-plugin-thor-20260903/`.** They were on the NAS
+and in a scratchpad when this record was first written, which is why two
+numbers came from the wrong run and the stack was read one frame short: no gate
+could see either. Every job took the
 device through `rc`; no `ssh` was used.
 
 **PASS — the plugin builds from source on aarch64 + CUDA.** `PLUGIN_BUILD_RC=0`,
@@ -261,22 +269,88 @@ removes tokenizer divergence as a confound for any future comparison, and it is
 a stronger statement than the length match alone because the two sides read
 different vocab sources (GGUF vocab there, HF tokenizer here).
 
-**NOT REACHED on this device, and the wall is NOT the plugin's.** The memory
+**NOT REACHED on this device, and the attribution is OPEN.** The memory
 profiling forward dies with
-`CUDA error: no kernel image is available for execution on the device`. The C++
-frame names the culprit: `Exception raised from launch_vectorized_kernel at
-aten/src/ATen/native/cuda/CUDALoops.cuh:349`, frame #2
-`at::native::gpu_kernel_impl_nocast<at::native::FillFunctor<c10::BFloat16>>` in
-`torch/lib/libtorch_cuda.so`. That is **PyTorch's own bf16 fill**, in the stock
-PyPI `torch==2.13.0` aarch64 wheel, which carries no `sm_110` SASS. The
-plugin's extension is not the missing image: the job asserts
-`cuobjdump --list-elf` on the INSTALLED object and it reports
-`_C_gguf.abi3.1.sm_110.cubin`, `INSTALLED_CUBIN_ARCH_OK`. So `thor:gpu0` cannot
-run this stack for a reason that is about the torch wheel and the device
-capability, and has nothing to do with GGUF, the plugin, or this checkpoint.
-`dgx:gpu0` is `sm_121a`, which that same wheel does support and which is where
-the vLLM wheel was built and previously generated text; the queued job there is
-what answers the token question.
+`CUDA error: no kernel image is available for execution on the device`.
+
+**Where it throws.** Inside the plugin's own quantized GEMM, not inside
+PyTorch. The Python frames, from
+`docs/bench-evidence/vllm-gguf-plugin-thor-20260903/gen-20260903T012806Z.log`:
+
+```text
+vllm/model_executor/models/qwen2_moe.py:115   out, _ = self.down_proj(out)
+vllm/model_executor/layers/linear.py:1763     self.quant_method.apply(...)
+vllm_gguf_plugin/quantization/linear.py:261   fused_mul_mat_gguf_op(...)
+vllm_gguf_plugin/quantization/linear.py:49    ops.ggml_mul_mat_a8(...)
+vllm_gguf_plugin/ops.py:207                   torch.ops._C_gguf.ggml_mul_mat_a8
+```
+
+and the C++ frames continue **into** the plugin before they reach torch:
+frames #15-#17 are in `vllm_gguf_plugin/_C_gguf.abi3.so`, which calls
+`torch_call_dispatcher("aten::new_zeros")` at
+`torch/include/torch/csrc/stable/ops.h:975`; `new_zeros` -> `zero_` ->
+`fill__Scalar` -> `fill_kernel_cuda` -> frame #2
+`at::native::gpu_kernel_impl_nocast<at::native::FillFunctor<c10::BFloat16>>`.
+That `new_zeros` is the **first** statement of `ggml_mul_mat_a8`
+(`csrc/gguf/gguf_kernel.cu:228`), before the plugin launches anything of its
+own. The previous record stopped one frame short of the caller and read the
+bottom of the stack as the cause.
+
+**Why the bottom frame is not the cause.** `cudaErrorNoKernelImageForDevice`
+is handed to the launching thread and stays in the last-error slot until some
+`cudaGetLastError` collects it; torch runs one after every kernel it launches,
+and almost nothing else does. The plugin's `csrc/` has **zero** launch checks
+across all eleven files, and vLLM's `LAUNCH_ACTIVATION_GATE_KERNEL`
+(`csrc/libtorch_stable/activation_kernels.cu:250-288`) has none either. So the
+frame that raises is only the next frame that looked.
+
+**Measured offline, on the exact artifacts, with a positive control.**
+`docs/bench-evidence/vllm-gguf-plugin-thor-20260903/fatbin_arch.py` reads the
+`.nv_fatbin` section of an ELF and lists the SM version of every fatbin entry.
+Its control is the plugin's own object, whose arch coverage the lease
+established independently with `cuobjdump --list-elf`
+(`_C_gguf.abi3.1.sm_110.cubin`): the parser reports exactly `ELF sm_110` over
+100% of the section, so it agrees with `cuobjdump` where both ran.
+
+| object | source | SASS archs |
+|---|---|---|
+| `vllm_gguf_plugin/_C_gguf.abi3.so` | built in the lease, `TORCH_CUDA_ARCH_LIST=11.0` | `110` (control: matches `cuobjdump`) |
+| `torch/lib/libtorch_cuda.so` | `torch 2.13.0+cu130`, `cp312-manylinux_2_28_aarch64`, `git_version cf30153c4c` | `80, 90, 100, 103, 110, 120, 121` — **508 `sm_110` entries** |
+| `vllm/_C_stable_libtorch.abi3.so` | the GB10-built pinned wheel | `80, 89, 90, 120` — **no `sm_110`**; 64 of 70 blocks are `sm_120`-only with no PTX |
+| `vllm/_moe_C_stable_libtorch.abi3.so` | same wheel | `80, 120` — **no `sm_110`** |
+
+So the claim that the stock aarch64 torch wheel "carries no `sm_110`" is false.
+`.agents/specs/lease-runtime-staging.md` had already recorded that same
+`torch 2.13.0+cu130` running `CUBLAS_OK (bf16 1024x1024 matmul executed)` on
+this very box at `capability (11, 0)`. The object in the process that has no
+image for `sm_110` is **vLLM's own extension**: the fatbin block holding
+`vllm::act_and_mul_kernel` (the `silu_and_mul` that `Qwen2MoeMLP.forward` runs
+at `qwen2_moe.py:114`, between the two GGUF projections) and the block holding
+`vllm::rms_norm_kernel` are both `sm_120` ELF only.
+
+**What is still NOT established: which launch set the flag.** Two candidates
+survive the evidence and each has a counter-argument.
+
+- *The plugin's own kernels.* `quantize_row_q8_1_cuda` and
+  `ggml_mul_mat_q4_K_q8_1_cuda` from the immediately preceding `gate_up_proj`
+  are unchecked and inside the window. Against: that object does carry
+  `sm_110`.
+- *vLLM's `silu_and_mul`.* Unchecked, inside the window, and in an object with
+  no `sm_110`. Against: `rms_norm_kernel` sits in the same arch class and the
+  forward plainly got past `post_attention_layernorm` (`qwen3_next.py:546`) to
+  reach the MLP at `:554`, which a uniformly imageless `_C` does not explain.
+
+The window is bounded, and that is itself a result: `gate_up_proj`
+(`qwen2_moe.py:113`) took the identical `_fused_mul_mat_gguf` route two lines
+earlier and its `new_zeros` bf16 fill did **not** raise, so the last-error slot
+was clean at that point and the failing launch happened between the two.
+Deciding between the candidates needs one cheap run this record does not have:
+`CUDA_LAUNCH_BLOCKING=1`, or a `cudaGetLastError` after each launch. Naming a
+cause before that run is what the previous version of this section did.
+
+`dgx:gpu0` is `sm_121a`, the capability the vLLM wheel was built for and the
+one its `sm_120` code covers; the queued job there is what answers the token
+question.
 
 ### Three instrument failures, recorded because each read like a verdict
 
@@ -295,19 +369,22 @@ GGUF" by anyone reading only the last line.
    `Engine core initialization failed` under a `freeze_support()` bootstrap
    message. Fixed by moving `gen.py`'s body into `main()`.
 3. **`TORCH_CUDA_ARCH_LIST` unset, then a same-version reinstall that did
-   nothing.** The first draft of the job left the arch list unset on the theory
-   that torch's `cpp_extension` derives it from the present device. It does not,
-   or not at this capability: the extension built and installed and the model
-   loaded, and the first quantized GEMM then failed with the same
-   `no kernel image` message from inside `torch.ops._C_gguf.ggml_mul_mat_a8` --
-   the plugin's own kernel. Setting `TORCH_CUDA_ARCH_LIST` from
-   `nvidia-smi --query-gpu=compute_cap` produced a wheel carrying
-   `sm_110`, and the run STILL failed identically, because the plugin's version
-   is always `0.0.5` and `pip install` into the reused venv printed
-   "already satisfied" and kept the arch-less object. Fixed with
-   `--force-reinstall`, plus a `cuobjdump --list-elf` postcondition on the
-   INSTALLED object rather than on the wheel. **A flag is not a postcondition,
-   and a wheel is not what gets called.**
+   nothing. This one is an instrument repair that did NOT change the result,
+   and it must not be read as a second, fixed failure.** The first draft of the
+   job left the arch list unset on the theory that torch's `cpp_extension`
+   derives it from the present device. Setting it from
+   `nvidia-smi --query-gpu=compute_cap` produced a wheel carrying `sm_110`, and
+   `pip install` into the reused venv then printed "already satisfied" and kept
+   the arch-less object, because the plugin's version is always `0.0.5`. Adding
+   `--force-reinstall` plus a `cuobjdump --list-elf` postcondition on the
+   INSTALLED object made the installed object provably `sm_110`. **A flag is
+   not a postcondition, and a wheel is not what gets called** — that lesson
+   stands. What it did not do is change the failure: jobs 3, 4 and 5
+   (`20260903T010058Z` arch-less, `011701Z` arch-listed, `012806Z`
+   force-reinstalled) throw at the identical site with a byte-identical call
+   chain, differing only in timestamps and pids. So the section above describes
+   **one** unchanged failure, not two, and the arch of the plugin's installed
+   object is now known not to be its cause.
 
 **NOT ESTABLISHED, and this is what keeps `gateable = no`.** The bar
 `AGENTS.md` sets is that the oracle demonstrably **builds AND runs** the model.
@@ -325,9 +402,14 @@ still queued.
 **A new id, `vllm-gguf-plugin`, with `role = secondary`.** The alternative was
 to fold it into `vllm.md`, and that fails on two counts. Mechanically,
 `scripts/check-oracle-pins.py` requires **exactly one** `oracle-pin` block per
-file, so a second pin cannot live in `vllm.md`; and `vllm.md` deliberately does
-not even hold the vLLM pin, pointing at `.agents/upstream-sync.md` instead so
-one value is not transcribed twice. Substantively, the plugin is a separate
+file, and `vllm.md:14-24` already spends that one block on the vLLM pin
+itself, so a second pin cannot live there. (An earlier draft said `vllm.md`
+"holds no pin of its own", following `.agents/oracles/README.md:18-20`, which
+says `vllm.md` "points at it rather than restating it". Both are inaccurate:
+`vllm.md:19` does hold `pin = 5559679229...`, restated as identity while
+`.agents/upstream-sync.md` stays the block the sync cycle advances. The
+one-block-per-file conclusion does not depend on that, and the mutation below
+proves the mechanic directly.) Substantively, the plugin is a separate
 repository with its own release cadence and its own revision, which is the
 definition of a thing that needs its own pin.
 
@@ -356,18 +438,24 @@ not admissible for it.**
 - **THE TOKEN. Everything else is done; this is not.**
   [#2624](https://github.com/mudler/vllm.cpp/issues/2624). Build, install,
   registration, config resolution and a complete 16.3 GiB weight load are all
-  measured green on `thor:gpu0`; the forward is blocked there by the stock
-  torch wheel carrying no `sm_110`. `rc` job
+  measured green on `thor:gpu0`; the forward is blocked there at the first
+  quantized GEMM's launch check, for a reason not yet attributed. `rc` job
   `7a45427e-ad86-4042-aeea-cdf8db535a54` is queued on `dgx:gpu0`, which is
   `sm_121a` and is where that wheel was built, running the identical
   `bash /workspace/ggufplugin/job.sh`. Until it emits tokens, `gateable = no`
   stands and nobody may say vLLM serves this checkpoint.
-- **Whether `thor:gpu0` can be made to run this stack at all**, by staging a
-  torch built for `sm_110` rather than the PyPI wheel. Out of scope here and
-  unowned; it is a fleet-capability question, not a GGUF one, and
-  `.agents/environment.md` already records a separately staged
-  `torch 2.13.0+cu130` working on that box for a Triton kernel, which JITs and
-  so does not contradict this result.
+- **Whether `thor:gpu0` can be made to run this stack at all**, and if so
+  with which vLLM build. Out of scope here and unowned; it is a
+  fleet-capability question, not a GGUF one. Note that the in-tree record does
+  **not** support the earlier reading of it: `.agents/environment.md:409-424`
+  and `.agents/specs/lease-runtime-staging.md:11-12,70-78` record a staged
+  `torch 2.13.0+cu130` on that same box that "imports torch, initializes CUDA,
+  **runs a bf16 matmul**, and compiles and executes a Triton kernel", logging
+  `CUBLAS_OK (bf16 1024x1024 matmul executed)` at `capability (11, 0)`. The
+  bf16 matmul is not a JIT, so that record is evidence *for* torch working at
+  `sm_110`, not a Triton-only exception to it. The concrete next question is
+  the `sm_110`-less pinned vLLM wheel, which is a build input rather than a
+  property of the box.
 - **Whether the llama.cpp gate should move.** Not owned here and not decided
   here. It depends entirely on the item above, and #2534 stays exactly as
   recorded until then.

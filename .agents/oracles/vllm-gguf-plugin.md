@@ -5,9 +5,12 @@ GGUF support was deprecated in vLLM (`vllm-project/vllm#39583`) and migrated to
 `vllm-project/vllm-gguf-plugin`, in the same organisation. At our parity pin
 `5559679229`, `docs/features/quantization/gguf.md:7` names that repository as
 where GGUF support went, `:12` gives the install line and `:19` the serve
-recipe. So a GGUF path that this plugin serves is a path the PRIMARY oracle
-serves, and `AGENTS.md` §"When vLLM has no implementation" does not admit a
-secondary oracle for it.
+recipe. So a GGUF path that this plugin **serves** is a path the PRIMARY oracle
+serves, and `AGENTS.md` §"When vLLM has no implementation" would not admit a
+secondary oracle for it. That consequence is conditional on the serving, and
+this record does not yet establish it: `gateable = no` below, no token, and
+`llama-cpp` remains the admissible denominator for the Q4_K_M arm until it
+does. See "What this record does NOT license".
 
 ```oracle-pin
 id = vllm-gguf-plugin
@@ -66,9 +69,10 @@ the file that knows `ssm_alpha`, `ssm_beta`, `ssm_conv1d`, `ssm_out` and
   guards and **every one is a lower bound that `sm_121` clears** — 23 in
   `csrc/gguf/vecdotq.cuh` at `>= 610` around `__dp4a`, 2 in
   `csrc/gguf/ggml-common.h:1086,1090` at `>= 800` around `__float2bfloat16`.
-  The only other architecture branch is CUDA versus ROCm
-  (`csrc/cuda_compat.h`, `csrc/gguf/mmq.cuh`). Nothing excludes `sm_121a` by
-  construction.
+  The only other architecture branch is CUDA versus ROCm: `USE_ROCM`
+  appears in five files, `csrc/cuda_compat.h`, `csrc/gguf/vecdotq.cuh`,
+  `csrc/gguf/mmq.cuh`, `csrc/gguf/moe.cuh` and `csrc/gguf/ggml-common.h`.
+  Nothing excludes `sm_121a` by construction.
 - **It imports against OUR pin, not only against its own contemporary.** All
   44 `from vllm...` symbol imports in `vllm_gguf_plugin/` resolve in the
   pinned checkout at `5559679229`: 42 by an automated walk of each module's
@@ -109,9 +113,11 @@ the file that knows `ssm_alpha`, `ssm_beta`, `ssm_conv1d`, `ssm_out` and
   (`unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M` against `Qwen/Qwen3.5-0.8B`) and
   `QWEN35_MOE_CONFIG` (`...35B-A3B...`), both multimodal, both Q4_K_M, and the
   README's coverage table lists "Qwen 3.5 — Q4_K_M backbone with BF16
-  projector" — the exact shape of our checkpoint. They carry
-  `pytest.mark.slow` (`:118-123`) and were NOT run here, so this is upstream's
-  declaration of coverage and not a green from this session.
+  projector" — the exact shape of our checkpoint. `QWEN35_MODELS_TO_TEST`
+  (`:121-124`) marks only the MoE case `pytest.mark.slow`; the dense 0.8B case
+  carries no mark, and the `:118-119` params are Gemma3's. Neither was run
+  here, so this is upstream's declaration of coverage and not a green from this
+  session.
 - **That 15-tensor block is exactly what the llama.cpp oracle drops.**
   [`llama-cpp.md`](llama-cpp.md) records `b10451` loading 851 of 866 tensors
   and ignoring all 15 of `blk.64`. The plugin maps all 15. The two oracles are
@@ -121,11 +127,25 @@ the file that knows `ssm_alpha`, `ssm_beta`, `ssm_conv1d`, `ssm_out` and
 **MEASURED IN A LEASE, on `thor:gpu0`, 2026-09-03.** Five `rc` jobs ran the
 same staged script on `thor:gpu0` (aarch64, NVIDIA Thor, capability 11.0,
 driver 595.78); the last is `40a1d8dd-529b-456b-8e46-2789354cce5a`, run dir
-`/workspace/ggufplugin/20260903T012806Z`. No `ssh` was used.
+`/workspace/ggufplugin/20260903T012806Z`. No `ssh` was used. That run's engine
+log, its `rc` job log, the driver, the recipe and the offline arch measurement
+are committed under
+[`docs/bench-evidence/vllm-gguf-plugin-thor-20260903/`](../../docs/bench-evidence/vllm-gguf-plugin-thor-20260903/),
+so every number below can be checked without the share.
 
-- **It BUILDS.** `PLUGIN_BUILD_RC=0` in 29.1 s under nvcc 13.0.88, producing
-  `vllm_gguf_plugin-0.0.5-cp310-abi3-linux_aarch64.whl`. The source-feasibility
-  question is answered empirically, not by inference.
+- **It BUILDS.** `PLUGIN_BUILD_RC=0` under nvcc 13.0.88 in every one of the
+  five jobs, producing `vllm_gguf_plugin-0.0.5-cp310-abi3-linux_aarch64.whl`.
+  The **cold** from-source build is job 1's, 29.128 s; jobs 2-5 reuse that
+  worker's build tree and take 3.142, 3.085, 3.125 and 3.113 s, the last being
+  the cited run. Job 1 is the one that answers the source-feasibility question,
+  and it is also the job that then died on `ModuleNotFoundError: No module
+  named 'gguf'` at registration (`REGISTRATION_RC=1`), so its build number and
+  its registration verdict come from the same run and must be quoted together.
+  Each job does rebuild rather than serve a cached wheel — all five wheel
+  sha256 values differ (`c5a77c04`, `8c8c1463`, `ec8ad598`, `9464269f`,
+  `a79bcc2d`) — but the build is not byte-reproducible, so the sha256 does not
+  by itself identify which arch list produced which wheel; the
+  `cuobjdump --list-elf` postcondition on the INSTALLED object does.
 - **It REGISTERS.** `REGISTRATION_RC=0`; entry point
   `('gguf', 'vllm_gguf_plugin:register')`; `_C_gguf.abi3.so` imports; and
   `torch.ops._C_gguf` exposes `ggml_dequantize` and `ggml_moe_a8_vec`. In the
@@ -135,12 +155,17 @@ driver 595.78); the last is `40a1d8dd-529b-456b-8e46-2789354cce5a`, run dir
   it imports on Thor as `0.1.dev1+g555967922` and reports
   `cuda True NVIDIA Thor`.
 - **THE 17 GB Q4_K_M GGUF LOADS.** `Resolved architecture:
-  Qwen3_5ForConditionalGeneration`, then `Model loading took 16.3 GiB memory
-  and 745.171284 seconds`, with **no** `No HF name for N Qwen3.5 GGUF
-  tensor(s), skipping` warning — the line the adapter emits for anything it
-  cannot map. The offline mapping result is confirmed on the real loader. The
-  engine chose `Triton/FLA GDN prefill kernel (head_k_dim=128)` and the
-  `FLASHINFER` backend, so the Gated Delta Net path is the one that ran.
+  Qwen3_5ForConditionalGeneration`, then, in the cited run,
+  `Model loading took 16.3 GiB memory and 530.729566 seconds`
+  (`gen-20260903T012806Z.log:41`). The three jobs that got this far read
+  745.171284 s, 533.210486 s and 530.729566 s in that order; the first is a
+  cold page cache and none of the three is a benchmark. Neither
+  `No HF name for N Qwen3.5 GGUF tensor(s), skipping` (`qwen3_5.py:257`) nor
+  the separate MTP line `No HF name for N Qwen3.5 MTP tensor(s), skipping`
+  (`:424`) appears in any of the five `gen.out` files, so no backbone, vision
+  or MTP tensor went unmapped on the real loader. The engine chose
+  `Triton/FLA GDN prefill kernel (head_k_dim=128)` and the `FLASHINFER`
+  backend, so the Gated Delta Net path is the one that ran.
 - **The tokenizations agree with the llama.cpp gate's**, `[6, 5, 6, 7, 11, 7]`
   over the six recorded prompts, from two different vocab sources.
 
@@ -148,19 +173,65 @@ driver 595.78); the last is `40a1d8dd-529b-456b-8e46-2789354cce5a`, run dir
 `AGENTS.md` requires the oracle to build **and run** the model. A 16.3 GiB
 load is not a generation.
 
-- **The forward is blocked on `thor:gpu0`, and NOT by the plugin.** Memory
+- **The forward is blocked on `thor:gpu0`, and WHY is open.** Memory
   profiling dies with `CUDA error: no kernel image is available for execution
-  on the device`, raised from `launch_vectorized_kernel` at
-  `ATen/native/cuda/CUDALoops.cuh:349`, frame #2
-  `at::native::gpu_kernel_impl_nocast<at::native::FillFunctor<c10::BFloat16>>`
-  in `torch/lib/libtorch_cuda.so`. That is PyTorch's own bf16 fill in the stock
-  PyPI `torch==2.13.0` aarch64 wheel, which carries no `sm_110`. The plugin's
-  installed object DOES carry it: `cuobjdump --list-elf` on the installed
-  `_C_gguf.abi3.so` reports `_C_gguf.abi3.1.sm_110.cubin`. So this is a
-  device-and-toolchain wall on that box, not a statement about GGUF or this
-  checkpoint.
-- **`dgx:gpu0` is untried.** It is `sm_121a`, which that torch wheel does
-  support and where the vLLM wheel was built; `rc` job
+  on the device`. The throw happens **inside the plugin's own quantized GEMM**:
+  `linear.py:1763` -> `vllm_gguf_plugin/quantization/linear.py:261` ->
+  `:49 _fused_mul_mat_gguf` -> `vllm_gguf_plugin/ops.py:207 ggml_mul_mat_a8` ->
+  `torch.ops._C_gguf.ggml_mul_mat_a8`, with C++ frames #15-#17 inside
+  `vllm_gguf_plugin/_C_gguf.abi3.so` calling
+  `torch_call_dispatcher("aten::new_zeros")` (`torch/csrc/stable/ops.h:975`).
+  Only below that does `at::native::FillFunctor<c10::BFloat16>` appear, at
+  frame #2. That fill is `ggml_mul_mat_a8`'s **first** statement
+  (`csrc/gguf/gguf_kernel.cu:228`), and what raised is the launch check torch
+  runs after it.
+- **A launch check reports whichever launch last failed, not necessarily its
+  own.** `cudaErrorNoKernelImageForDevice` is returned to the launching thread
+  and sits in the last-error slot until some `cudaGetLastError` collects it.
+  The plugin's `csrc/` contains **zero** launch checks across all eleven files,
+  and vLLM's own `LAUNCH_ACTIVATION_GATE_KERNEL`
+  (`csrc/libtorch_stable/activation_kernels.cu:250-288`) checks none either. So
+  the frame that raised need not be the frame that failed, and reading the
+  bottom of this stack as "PyTorch's bf16 fill has no image" is not a
+  conclusion the stack supports.
+- **PyTorch is not the missing image, and that is now measured rather than
+  asserted.** The wheel the job installs (`job.sh:99`, `pip install -q
+  torch==2.13.0`, no index URL) is `torch 2.13.0+cu130`,
+  `cp312-cp312-manylinux_2_28_aarch64`, `git_version
+  cf30153c4c131c8164ee7798e5022d810682e2cb`. Its `torch/lib/libtorch_cuda.so`
+  carries SASS for `sm_80, 90, 100, 103, 110, 120, 121` — **508 `sm_110` cubin
+  entries over 449 fatbin blocks**. The same box has run that same
+  `torch 2.13.0+cu130` at `capability (11, 0)` before: `CUBLAS_OK (bf16
+  1024x1024 matmul executed)`, `.agents/specs/lease-runtime-staging.md`.
+- **Of the three objects measured, the one with no image for this device is
+  vLLM's own wheel.** `vllm/_C_stable_libtorch.abi3.so`, built on GB10 and
+  installed from `/workspace/oracle-vllm/`, carries `sm_80, 89, 90, 120` SASS
+  and **no `sm_110`**; 64 of its 70 fatbin blocks are `sm_120`-only with no PTX at all.
+  The block holding `vllm::act_and_mul_kernel` (`silu_and_mul`, the op
+  `Qwen2MoeMLP.forward` calls between the two GGUF projections) and the block
+  holding `vllm::rms_norm_kernel` are both `sm_120` ELF only.
+  `_moe_C_stable_libtorch.abi3.so` is `sm_80` + `sm_120` only. The plugin's own
+  object, by contrast, carries `sm_110` and nothing else — `cuobjdump
+  --list-elf` said so in the lease (`_C_gguf.abi3.1.sm_110.cubin`,
+  `INSTALLED_CUBIN_ARCH_OK`) and the offline parse agrees exactly, which is
+  what makes the parse trustworthy for the other two objects. Instrument,
+  inputs and output:
+  `docs/bench-evidence/vllm-gguf-plugin-thor-20260903/fatbin-arch-20260903.txt`.
+- **What is NOT established: which launch set the flag.** Two candidates
+  survive and each has an argument against it. The plugin's own
+  `quantize_row_q8_1_cuda` / `ggml_mul_mat_q4_K_q8_1_cuda` from the preceding
+  `gate_up_proj` are unchecked and in the window — but that object does carry
+  `sm_110`. vLLM's `silu_and_mul` is unchecked and in the window and its object
+  does not carry `sm_110` — but `rms_norm_kernel` is in the same arch class and
+  the forward plainly got past `post_attention_layernorm`
+  (`qwen3_next.py:546`) to reach the MLP at `:554`, which a universally
+  imageless `_C` does not explain. Naming the culprit needs one cheap run that
+  this record does not have: `CUDA_LAUNCH_BLOCKING=1`, or a
+  `cudaGetLastError` immediately after each launch. Until then the honest
+  statement is that the forward is blocked, the throw is inside the plugin's
+  op, and the attribution is open.
+- **`dgx:gpu0` is untried.** It is `sm_121a`, the capability the vLLM wheel
+  was built for and the one its `sm_120` code actually covers; `rc` job
   `7a45427e-ad86-4042-aeea-cdf8db535a54` is queued there with the identical
   script and is what owes the token.
 - **The `dgx` history is a caution, not a promise.**

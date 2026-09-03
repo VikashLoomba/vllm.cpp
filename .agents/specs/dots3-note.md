@@ -6127,6 +6127,213 @@ non-divisible `chunk_seconds` 1 at 40000 samples, where the sum is 33 against a
 span of 32, and asserts that a clip inside one chunk is still served there.
 
 
+### 4.16 W7c-1 accepts a MULTI-CHANNEL WAV at 16 kHz, by upstream's own mean
+
+**Issue: [#2813](https://github.com/mudler/vllm.cpp/issues/2813). Brick: W7c-1,
+the CHANNELS half of W7c.** W7c was one brick over two unrelated questions. The
+channel arm is an exact mirror of a two-line upstream reduction with no oracle
+risk; the rate arm needs a resampler and a recorded divergence. Keeping them
+apart stops one claim borrowing the other's credibility, so W7c-1 lifts the
+channel refusal ALONE and W7c-2 keeps the rate one.
+
+Before this slice, a PCM16 WAV **already at `audio_config.sampling_rate`** was
+refused with HTTP 400 for one reason: its `fmt ` chunk said two channels and
+`DecodeWavPcm16Mono` threw "not mono". Nothing about the model, the front end or
+the tower was missing. After it, the same file is served, and the waveform the
+tower sees is the per-sample mean over its channels.
+
+#### 4.16.1 Upstream, and the exact `file:line@SHA` ported
+
+`dots3_note` does not exist at the parity pin `5559679229`, so every anchor
+below names `9035151d6`, read in the local clone `~/_git/vllm`
+(`git rev-parse 9035151d6` = `9035151d6c9fb726181469f9e6aa9ccbf9a5dacb`;
+`git rev-parse HEAD` = `5559679229bc961848b121ccdeaa8fa5d79bec98`).
+
+| Upstream | What it is | Ported to |
+|---|---|---|
+| `vllm/multimodal/media/audio.py:207-208` | `if mono and y.ndim > 1: y = np.mean(y, axis=tuple(range(y.ndim - 1)))` — the DECODE-side reduction, over the CHANNEL axes of a `(channels, samples)` array | `DecodeWavPcm16MeanToMono`'s inner reduction |
+| `vllm/multimodal/media/audio.py:220` | `load_audio(..., mono: bool = True)` — the default that makes `:207-208` reached, not optional | why the reduction is unconditional here |
+| `vllm/multimodal/media/audio.py:168-169` | the SAME `np.mean(audio, axis=0)` on the PyAV fallback arm, so both decoders agree | evidence the mean is the format-independent rule |
+| `vllm/multimodal/audio.py:46-52` | `ChannelReduction`, whose `MEAN` member carries the comment "(default, preserves energy balance)" | the choice of mean over `FIRST`/`MAX`/`SUM` |
+| `vllm/multimodal/audio.py:69-70` | `AudioSpec.target_channels: int | None = 1`, `channel_reduction: ChannelReduction = ChannelReduction.MEAN` | the defaults |
+| `vllm/multimodal/audio.py:150-152` | `normalize_audio`: `if spec.target_channels == 1: if spec.channel_reduction == ChannelReduction.MEAN: ...` | the PARSER-side reduction, which selects the same operation |
+| `vllm/multimodal/parse.py:697-700` | `MultiModalDataParser` applying `normalize_audio(new_audio, AudioSpec(target_channels=self.target_channels))` | the call site `:150-152` is reached from |
+| `vllm/models/dots3_note/common/processor.py:523-525` | `get_data_parser` returning `MultiModalDataParser(target_sr=..., target_channels=1)` | **dots3-note's own selection of that spec** |
+
+**One anchor in #2813 was wrong and is corrected here rather than silently.**
+The issue writes the last row as `common/processor.py:523-525`, which reads as
+`vllm/multimodal/common/processor.py`. No such file exists at `9035151d6`
+(`git ls-tree -r --name-only 9035151d6 -- vllm/multimodal/` lists 26 paths and
+none is `common/`). The file is
+`vllm/models/dots3_note/common/processor.py`, and its `:523-525` is exact. The
+same short form is what two production strings in this tree carried, so a reader
+chasing the anchor landed nowhere; §4.16.4 repairs those.
+
+#### 4.16.2 The arithmetic, and the type it is done in
+
+Upstream reduces a `float32` array: `soundfile.read(dtype="float32")` makes
+each `int16` sample exactly `s / 32768`, and `np.mean` over a `float32` input
+accumulates in `float32`. This port does not have a float32 array to reduce —
+it has the interleaved `int16` frames of the `data` chunk — so the intermediate
+type is a decision that has to be stated.
+
+**It accumulates the raw `int16` channel samples in `int32`, divides once in
+`double`, and narrows once to `float`.**
+
+- The `int32` accumulator **cannot overflow**. `|s| <= 32768` and `channels` is
+  a `uint16` field of the `fmt ` chunk, so `|sum| <= 32768 * 65535 = 2147450880
+  < 2^31`. The sum is therefore EXACT for every WAV this parser can be handed,
+  which no `float32` accumulator can promise past 256 channels.
+- There is **exactly one rounding**, at the narrowing store. `acc / (32768 * C)`
+  is computed in `double` and assigned to `float` once; nothing is rounded to
+  `float` and then combined again, which is the double-rounding the issue warns
+  about.
+- **For every power-of-two channel count that rounding is not a rounding at
+  all, and the result is BIT-IDENTICAL to what upstream's `float32` mean
+  produces.** With `C = 2^k`, `acc` is an integer of magnitude at most
+  `2^(15+k)` and the divisor `32768 * C` is `2^(15+k)`, so the quotient is
+  `acc * 2^-(15+k)`: a value whose significand is `acc`, needing at most
+  `16 + k` bits against `float`'s 24. It is exact in `double` and exact in
+  `float`. Upstream's arm is exact for the same reason — each `s / 32768` is
+  exact in `float32`, every partial sum needs at most `16 + k` bits, and the
+  final divide by `2^k` only moves the exponent — so the two agree bit for bit.
+  This covers **C = 1**, which is why no mono waveform in this tree can move,
+  and **C = 2**, which is the case this slice exists to serve.
+- For a channel count that is NOT a power of two the two arms may differ by at
+  most one `float` ulp, and this port is the MORE accurate of the two, because
+  its sum is exact where `np.mean`'s is not. That is stated, not hidden. No
+  published dots3-note request shape reaches it: `C = 1` and `C = 2` are what a
+  WAV upload carries.
+
+**The mono entry point is not touched.** `DecodeWavPcm16Mono` keeps its own
+`static_cast<float>(s) / 32768.0f` loop verbatim, so `parakeet_transcription.cpp`,
+`chat_mm.cpp` and `test_voxtral_e2e.cpp` cannot move by a bit — this slice adds
+`DecodeWavPcm16MeanToMono` beside it and only the dots3-note route calls it.
+Both share ONE chunk walk (`ParseWavPcm16`), so the multi-channel arm is not a
+second hand-written parser. The gate MEASURES the equality rather than asserting
+it in prose: a 2-channel buffer whose two channels are equal decodes bit for bit
+to the mono decode of one of them.
+
+#### 4.16.3 The reachability proof is an INVERSION, not a new test
+
+The production entry point is unchanged: `ApiServer::handle_chat_completions`
+-> `InstallMultiModalChatSeam` (`server_main.cpp:1565`) -> `MakeDots3NoteChatSeam`
+-> `RouteDots3NoteAudioWav` (`mm_chat_dots3note.cpp:210`). The smallest failing
+test already existed and asserted the OPPOSITE of what this slice makes true:
+the subcase *"a STEREO WAV names the container refusal and W7c"* checked
+`status == 400` and that the body named W7c. It is replaced by a case that
+checks the same request SERVES, which is a true-before / false-after inversion
+and is what makes this slice owned rather than merely present.
+
+The replacement does not stop at HTTP 200. The stereo fixture is built as
+`L = m + d`, `R = m - d` from two DIFFERENT signals, so its per-sample mean is
+EXACTLY `m` — the fixture's own variant 0, the clip every other audio case in
+the suite already serves. The case therefore asserts:
+
+1. the stereo request answers 200, with the same prompt-token accounting as the
+   mono one, so the placeholder span did not move;
+2. the test recomputes `(L[i] + R[i]) / 2` itself, in `int`, and checks it
+   equals `m` bit for bit — the independent mean, computed in the test and not
+   read out of the production path;
+3. the stereo request's first-token logprobs equal the MONO `m` request's;
+4. and they DIFFER from the mono `L` request's and from the mono `R` request's.
+
+(4) is what makes (3) load-bearing. A port that took channel 0 would serve `L`
+and pass (1) and (3)-shaped equality against nothing; a port that summed without
+dividing would serve `2m`. Both are separated by (4), and both are driven as
+mutations in §4.16.5.
+
+#### 4.16.4 Three false statements about the oracle, repaired in flow
+
+**`librosa` is not on vLLM's decode or resample path, and this tree said three
+times that it was.** Measured at `9035151d6`:
+`git grep -n 'librosa' 9035151d6 -- vllm/` returns **three** hits and all three
+are comments — `vllm/multimodal/audio.py:31` ("Aligned with
+`librosa.get_duration` function"), `vllm/transformers_utils/processors/fireredlid.py:182`
+and `vllm/transformers_utils/processors/inkling.py:300` (both naming a
+convention). `git grep -n '^\s*import librosa\|^\s*from librosa' 9035151d6`
+returns nothing: **the package is never imported**. It appears in
+`requirements/test/*` only, as a test dependency.
+
+The real chain, read at the same SHA:
+
+| Stage | What actually runs | `file:line@9035151d6` |
+|---|---|---|
+| decode, primary | `soundfile` / libsndfile, `f.read(dtype="float32")` | `vllm/multimodal/media/audio.py:29-32`, `:205` |
+| decode, fallback | PyAV / FFmpeg, `load_audio_pyav` | `vllm/multimodal/media/audio.py:24-27`, `:47` |
+| channel reduction | `np.mean` | `:207-208`, and `:168-169` on the PyAV arm |
+| resample | `av.AudioResampler` — **libswresample** through PyAV, and the docstring says so | `vllm/multimodal/audio.py:174-229`, esp. `:180` and `:221` |
+
+Two of the three statements were **production error strings a user reads**, and
+both also carried the unresolvable `common/processor.py` anchor §4.16.1
+corrects:
+
+- `src/vllm/entrypoints/openai/mm_chat_dots3note.cpp:233-234` — "Upstream
+  decodes with librosa through its data parser". Rewritten to name libsndfile
+  and PyAV, and NARROWED (§4.16.6).
+- `src/vllm/multimodal/dots3_note_processor.cpp:526-528` — "upstream resamples
+  in its data parser ... with librosa". Rewritten to name `resample_audio_pyav`
+  / libswresample, and re-pointed at W7c-2.
+- this spec's `## Owed` — "accepts whatever `librosa` can open". Rewritten to
+  say what libsndfile and FFmpeg actually open.
+
+**And one stale BLOCKER in the same `## Owed` entry.** It read "a windowed-sinc
+resampler is a numerically delicate port of its own, not a line of glue", which
+was written when this tree had no resampler. It has one:
+[#2583](https://github.com/mudler/vllm.cpp/issues/2583) landed
+`Ltx2ResampleWaveform` (`src/vllm/model_executor/models/ltx2_audio_vae.cpp:1151`,
+declared at `include/vllm/model_executor/models/ltx2_audio_vae_encoder.h:190`).
+The difficulty claim is still true and the BLOCKER claim is not, so the entry now
+says the work is a rate-conversion decision against a seam that exists, owed to
+W7c-2, rather than a port that has to be written from nothing.
+
+**One `librosa` mention in this file is left alone, deliberately.**
+`src/vllm/multimodal/audio_processor.cpp:95` says a genuine resample would be
+"windowed sinc, à la librosa". That describes an ALGORITHM's style, not vLLM's
+executing chain, it belongs to the A1 Whisper/Voxtral row rather than this one,
+and it is not false. Editing another row's message to satisfy a sweep is how a
+correction becomes a drift.
+
+#### 4.16.5 The mutations
+
+Every mutation applied to the tracked source, rebuilt, run, and restored
+byte-for-byte, with the binary sha256 and the case counts recorded so a failed
+build cannot read as a pass:
+
+| # | Mutation | What a green here would mean |
+|---|---|---|
+| M1 | take channel 0 instead of the mean | the gate cannot tell a mean from a channel pick |
+| M2 | sum the channels without dividing | the gate cannot see a 2x amplitude error |
+| M3 | mean over the FRAME axis instead of the channel axis | the gate cannot see the wrong axis, only the wrong shape |
+| M4 | delete the production call site — `DecodeWavPcm16MeanToMono` back to `DecodeWavPcm16Mono` in `RouteDots3NoteAudioWav` | the served suite measures a function, not a capability |
+
+Each is applied to the tracked source, rebuilt, run and restored byte for byte,
+and each records the binary sha256 AND the case counts, because on this row a
+failed build has twice read as a pass and once did so with a binary byte-identical
+to a previous mutation's. **The measured table is §4.16.7, written by the
+implementation commit.** It is not in this spec commit, because a result written
+before it is measured is the defect this protocol exists to prevent.
+
+#### 4.16.6 What is still refused, and to whom it is owed
+
+The refusal stays at the SEAM and stays the SAME predicate as the route, for
+the reason W7a recorded and W7b repeated: an `InstallMultiModalChatSeam` throw
+is HTTP 400 for one request, while the same throw from inside `encode_mm` sets
+`AsyncLLM`'s errored latch and turns every later request, TEXT ones included,
+into a 500.
+
+| Refused | Owed to | Where the message is |
+|---|---|---|
+| any container but RIFF/WAVE PCM16 — `mp3`, `flac`, `ogg`, anything an `input_audio.format` may name | **NOT this row.** The shared codec brick, [#2814](https://github.com/mudler/vllm.cpp/issues/2814): five surfaces want the same demuxer, libsndfile alone reports 26 formats, and no row owns it | `mm_chat_dots3note.cpp`, the decode `catch` |
+| a rate that is not `audio_config.sampling_rate` | this row, **W7c-2** | `dots3_note_processor.cpp`, `ProcessWaveform` |
+| non-16-bit PCM, a non-PCM `fmt`, a zero channel count, a malformed chunk walk | this row, W7c-2, alongside the rate arm | `audio_processor.cpp`, `ParseWavPcm16` |
+| `use_causal`, `use_conv1d_stem` (`use_conv2d_stem = false`), `use_latent_input`, `merge_factor != 1`, a non-`dots` `encoder_type` | this row, unchanged by this slice | `Dots3NoteAudioRefusal` |
+
+The container refusal is NARROWED and not merely reworded: it used to name
+"multi-channel or non-16-bit WAV" as owed to W7c, and multi-channel is now
+served. Nothing about the container arm is implemented here.
+
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -6723,18 +6930,36 @@ Carried openly under option B (§6.4), not waived:
   needs a decision about WHICH of upstream's two numbers is the placeholder
   count. Owner: this row. Tracked in this section rather than as an issue, per
   AGENTS.md's "an issue you do not fix in the same flow has to say who owns it".
-- **W7c — every audio container and sampling rate but PCM16 mono WAV at 16
-  kHz.** Upstream resamples in the data parser
-  (`MultiModalDataParser(target_sr=..., target_channels=1)`,
-  `processor.py:523-525`) and accepts whatever `librosa` can open. This port
-  decodes exactly one container — `DecodeWavPcm16Mono`
-  (`audio_processor.cpp:35-79`) — and REFUSES a rate that is not
-  `audio_config.sampling_rate`, because `WhisperAudioProcessor::ProcessWaveform`
-  has carried a "resample deferred" throw since the audio-track A1 row
-  (`audio_processor.cpp:94-101`) and a windowed-sinc resampler is a numerically
-  delicate port of its own, not a line of glue. The refusal is at the ROUTE and
-  names W7c, so an operator learns which brick owes it rather than reading A1's
-  message about a different model. Owner: this row, W7c.
+- **W7c-2 — every audio SAMPLING RATE but `audio_config.sampling_rate`.**
+  W7c-1 ([#2813](https://github.com/mudler/vllm.cpp/issues/2813), §4.16) took
+  the CHANNELS half: a multi-channel PCM16 WAV already at the target rate is now
+  served, mean-reduced exactly as upstream's `load_audio(..., mono=True)` does
+  (`vllm/multimodal/media/audio.py:207-208`, `:220` @ `9035151d6`). What is
+  still owed is the RATE. Upstream resamples in the data parser —
+  `MultiModalDataParser(target_sr=..., target_channels=1)`,
+  `vllm/models/dots3_note/common/processor.py:523-525` @ `9035151d6` — which
+  reaches `resample_audio_pyav`, **libswresample through PyAV/FFmpeg**
+  (`vllm/multimodal/audio.py:174-229`). Its decode side is soundfile/libsndfile
+  with a PyAV fallback (`media/audio.py:29-32`, `:24-27`), so what it accepts is
+  what libsndfile and FFmpeg open, and **not** "whatever `librosa` can open":
+  `librosa` is never imported anywhere under `vllm/` at that SHA, and its three
+  mentions are comments (§4.16.4). This port REFUSES a rate that is not
+  `audio_config.sampling_rate`, at the ROUTE, naming W7c-2 so an operator learns
+  which brick owes it rather than reading the audio-track A1 row's "resample
+  deferred" message about a different model (`audio_processor.cpp:94-101`).
+  Rate conversion is still numerically delicate, but it is no longer a port from
+  nothing: [#2583](https://github.com/mudler/vllm.cpp/issues/2583) landed
+  `Ltx2ResampleWaveform`
+  (`src/vllm/model_executor/models/ltx2_audio_vae.cpp:1151`), so what W7c-2 owes
+  is a decision about which resampler upstream's PyAV arm is being mirrored by,
+  and its tolerance, against a seam that exists. Owner: this row, W7c-2.
+- **Every audio CONTAINER but RIFF/WAVE PCM16 — and this one is NOT owed to
+  this row.** `mp3`, `flac`, `ogg` and anything else an `input_audio.format` may
+  name need a demuxer this tree does not vendor. Five surfaces already refuse
+  compressed media for the same missing brick, and
+  [#2814](https://github.com/mudler/vllm.cpp/issues/2814) tracks it as shared
+  work. W7c-1 narrowed this row's container message to say so, so a reader is
+  no longer told that a `.mp3` is waiting on a dots3-note brick. Owner: #2814.
 - **`vt::Conv2d` has no CUDA provider, and W7a's stem composition is the
   exception that records it.** `src/vt/cpu/cpu_conv2d.cpp:111` is the only
   `RegisterOp(OpId::kConv2d, ...)` in the tree, so the shared 2-D convolution

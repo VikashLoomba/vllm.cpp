@@ -1579,11 +1579,19 @@ Ltx2VideoFrames Ltx2ConvVideoDecode(const Ltx2ConvVideoDecoderConfig& config,
   // conv_video_decoder.py:304-305) and multiplies it by
   // `self.timestep_scale_multiplier.to(sample)` (`:313`), which narrows the
   // registered buffer too. At `decode_timestep = 0.05` a multiplier of 1000 gives
-  // the same answer either way and one of 7.3 does not -- 0.365 in f64 against
+  // the same SCALAR either way and one of 7.3 does not -- 0.365625 wide against
   // 0.365234375 through the bf16 chain -- so a multiplier that happens to be
-  // exactly representable would hide this. The shipped checkpoint's value is not
-  // known to this row (`## Owed`), which is why the narrowing is applied rather
-  // than argued away.
+  // exactly representable would hide the rule entirely.
+  //
+  // A SEPARATING SCALAR IS NOT A SEPARATING OUTPUT, and 7.3 is the counterexample
+  // rather than the demonstration. The generator swept the multiplier
+  // (gen-ltx2-vae-goldens.py, section 5i) and 7.3 separates the two scalars above
+  // and ZERO of the arm's 144 outputs, because a 0.1% move in a 0.365-radian
+  // angle is under half a bf16 ulp everywhere the sinusoid lands. 3.7, 23.7, 41.3,
+  // 499.7 and the shipped 1000 also separate zero of them. The gated arm uses
+  // 113.7, which separates 119 of 144. The shipped checkpoint's value is not known
+  // to this row (`## Owed`), which is why the narrowing is applied rather than
+  // argued away.
   const double scaled_timestep =
       config.timestep_conditioning
           ? static_cast<double>(

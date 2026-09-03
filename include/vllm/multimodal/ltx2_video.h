@@ -634,6 +634,33 @@ struct Ltx2ConditioningTrace {
   // two prompts the SAME digest and RED any dependence check, but it would do so
   // for the wrong reason; this says which happened.
   double video_absmax = 0.0, audio_absmax = 0.0;
+  // ── the TOWER's output WIDTH, which no digest can report (A24 wave 1) ────
+  //
+  // How many values the TEXT TOWER produced that do NOT survive a bf16 round
+  // trip, out of how many it produced. Upstream resolves ONE pipeline dtype and
+  // it is bfloat16 (`distilled.py:109`, handed to `PromptEncoder` at `:111-113`),
+  // so on a bf16 tower these counts are ZERO and on the f32 parity arm they are
+  // essentially the whole stream.
+  //
+  // IT EXISTS BECAUSE NOTHING ELSE HERE CAN SEE THE DTYPE. The digests detect
+  // CHANGE and the absmax detects COLLAPSE; both are computed over the same f32
+  // container on either arm and are identical in shape whichever width filled it.
+  // AGENTS.md names this exact blind spot — "a token gate cannot detect a dtype
+  // that is too wide" — and it is why A24 sat invisible in this tree while every
+  // gate on this path passed. This counter is what makes the engine's arm choice
+  // (`Ltx2TextProjectionsAsBf16`) gateable from OUTSIDE the text encoder: swap
+  // that call back to `Ltx2WidenTextProjectionsToF32` and these go from 0 to the
+  // full stream with every digest, every frame byte and every other assertion on
+  // this path unmoved.
+  //
+  // SAMPLED BEFORE THE CONNECTOR, and that is a scope statement rather than a
+  // convenience. `Ltx2ConnectorForward` is A24's SECOND wave and still computes
+  // in f32, so the conditioning the DiT finally cross-attends over is f32-wide
+  // even on a bf16 tower. Measuring after it would report the connector's width
+  // and call this row's work absent. The connector's own arm is OWED — see
+  // `.agents/specs/ltx25-a24-text-tower-bf16.md` under `## Owed`.
+  int64_t tower_video_not_bf16 = 0, tower_audio_not_bf16 = 0;
+  int64_t tower_video_values = 0, tower_audio_values = 0;
   // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
   //
   // Zero everywhere when the request carried no image. `image_tokens` is how

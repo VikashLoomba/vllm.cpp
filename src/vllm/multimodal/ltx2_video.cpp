@@ -55,6 +55,7 @@
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — which accelerator, if any
 #include "vllm/tokenizer/tokenizer.h"
+#include "vt/dtype.h"
 
 namespace vllm::multimodal {
 namespace {
@@ -501,6 +502,16 @@ uint64_t DigestF32(const std::vector<float>& values) {
     h *= 1099511628211ULL;
   }
   return h;
+}
+
+// How many values could NOT have come out of a bf16 store. The dtype instrument
+// the digest and the absmax cannot be: both are computed over the same f32
+// container on either arm and are blind to the width that filled it.
+int64_t CountWiderThanBf16(const std::vector<float>& values) {
+  int64_t n = 0;
+  for (float v : values)
+    if (vt::BF16ToF32(vt::F32ToBF16(v)) != v) ++n;
+  return n;
 }
 
 double AbsMax(const std::vector<float>& values) {
@@ -2696,6 +2707,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     prompt_video = encoded.conditioning.video;
     prompt_audio = encoded.conditioning.audio;
     context_tokens = encoded.seq;
+    // A24 wave 1: the TOWER's own output width, sampled HERE — before the
+    // connector, because the connector is wave 2 and still computes in f32. See
+    // `Ltx2ConditioningTrace::tower_video_not_bf16`.
+    im.trace.tower_video_not_bf16 = CountWiderThanBf16(prompt_video);
+    im.trace.tower_audio_not_bf16 = CountWiderThanBf16(prompt_audio);
+    im.trace.tower_video_values = static_cast<int64_t>(prompt_video.size());
+    im.trace.tower_audio_values = static_cast<int64_t>(prompt_audio.size());
 
     if (im.has_connector) {
       const std::vector<float>& mask = encoded.conditioning.additive_mask;

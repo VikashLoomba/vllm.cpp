@@ -228,7 +228,109 @@ reference arm the goldens are measured against.
 the struct bf16 here would change a component this row excludes. So the tower
 computes in bf16 and materializes bf16 VALUES in an f32 container at the seam —
 which §6.4's assertion turns into the row's strongest gate rather than a soft
-spot — and the container is listed under `## Owed` against the connector wave.
+spot — and the container is listed under `## Outcome
+
+Everything below was measured on this branch, not predicted by §4.
+
+### What §4 got right, and the one thing it got wrong
+
+Facts 1, 2, 4 and 5 held exactly as written. Fact 3 — "a Python float paired with
+a bf16 tensor is narrowed first" — is **true of `add` and false of `mul`**, and
+the first implementation of this row got the rescale wrong because of it.
+
+Measured exhaustively over the bf16 domain at the pin:
+
+| op | bf16-narrowed scalar | f32 scalar |
+|---|---|---|
+| `t + 1e-6` | matches at **all 32640** | matches at all but 387 |
+| `t * sqrt(8/6)` | matches at all but 7881 | matches at **all 32639** |
+
+So the epsilon really is `bf16(1e-6)` and the rescale factor really is not
+narrowed. Two scalar ops one line of upstream apart, two answers, and no single
+rule covers both.
+
+**The probe that let the defect through multiplied by ONE.** `_rescale_norm(ones,
+...)` narrows to `bf16(f)` under both hypotheses, so its golden agreed with a
+port that was wrong on nearly a quarter of every other value. The probe is now a
+vector chosen to separate them — two values found by sweeping the exponent range
+against each factor — and the generator REFUSES to emit it if it ever stops
+separating them. Fixing this cut the V2 projection's divergence from 36/80 values
+to 10/80.
+
+### A fifth fact, which changed the gate's shape
+
+**`torch.rsqrt` on bf16 is not a function of its input.** The same value gives
+`0x4065` in a length-1 tensor and `0x4066` in a length-1000 one, because the
+vectorized body and the scalar tail round differently. `0x4066` is the correctly
+rounded answer and is what this port computes.
+
+No implementation can be bit-equal to a kernel that is not bit-equal to itself,
+and chasing one would fit this machine's SIMD width rather than upstream's
+arithmetic. So each bf16 golden is emitted TWICE: once from the module, and once
+from the module with `torch.rsqrt` replaced by the value its own vectorized path
+computes. The port is held **bit-exact** to the second — no tolerance sits under
+this port's arithmetic — and its distance to the first is reported.
+
+§6.3 planned "bit-exact where it holds, bf16 unit roundoff otherwise". What
+landed is better: bit-exact everywhere against a stable oracle, plus a reported
+distance to the unstable one.
+
+### The two bounds that are not bit-exact, and where each number comes from
+
+* **V2 norm vs the unpatched module: 2 ulp on at most `self-disagree x D`
+  values.** The norm ends in `x * inv`, and `|x*inv1 - x*inv2| = |x| * ulp(inv)`
+  is 2^-8 relative to the product — which is TWO ulp of a product at the top of
+  its binade. The count budget is the generator's own measurement of how many
+  variance entries torch disagrees with itself on (2 of 40), times the D values
+  one rsqrt feeds. Measured: 11 and 5 of 240, worst 2 ulp.
+* **Projection outputs vs the unpatched module: absolute, `2 x 2^-8 x
+  max|golden|`.** Not per-element relative, and the reason is arithmetic: each
+  output is a dot of 24 terms, so one that lands near zero through cancellation
+  moves arbitrarily far in relative terms on a last-bit input change. Measured
+  worst 0.00195 against a 0.00327 bound.
+* **The two arms against each other at the tower level: `sqrt(flat) x 2^-9 x
+  max|f32|`,** the random-walk accumulation of one bf16 unit roundoff over a
+  `flat`-term reduction. Measured 0.00844 against 0.0615 — a 7.3x margin, so the
+  bound is not doing the work the assertion claims for it.
+
+### The dtype gate, which is the row
+
+`ltx2 text bf16: the production entry point computes in bf16` reports:
+
+```
+bf16 arm: 0 of 480 video values are wider than bf16; f32 arm: 480
+caption projections: bf16 576 B, f32 1152 B
+```
+
+Perfect discrimination, both directions, in the same case.
+
+At the ENGINE level, `Ltx2ConditioningTrace` gained `tower_video_not_bf16` /
+`tower_audio_not_bf16`, sampled after the tower and BEFORE the connector, and
+`test_ltx2_video`'s prompted-render case asserts they are zero.
+
+**The mutation §6.5 names was run.** Reverting the engine's
+`Ltx2TextProjectionsAsBf16` call to `Ltx2WidenTextProjectionsToF32`:
+
+```
+ERROR: CHECK( fox.trace.tower_video_not_bf16 == 0 ) is NOT correct!
+  logged: tower output wider than bf16: video 64 of 16384, audio 32 of 8192
+[doctest] assertions: 63 | 59 passed | 4 failed |
+```
+
+Exactly the four new assertions red. The other 59 — the digests, the absmax, the
+prompt dependence, the frame bytes and the determinism check — stay green to the
+last one. That is simultaneously the reachability proof and the demonstration of
+why A24 was invisible: every gate that existed on this path passes under the
+defect. The tree was restored byte-for-byte and re-verified green afterwards.
+
+### Why the counters are sampled before the connector
+
+Measuring after it reports **16384 of 16384** wider than bf16 even on a bf16
+tower, because `Ltx2ConnectorForward` is A24 wave 2 and still computes in f32.
+That was measured, not assumed, and it is the sharpest available statement of
+what this row does and does not deliver.
+
+## Owed` against the connector wave.
 
 ## 6. Tests
 
@@ -368,5 +470,5 @@ stale" failure, and it is why §2 and §3 above were re-read at this head.
 
 ## Now
 
-`ACTIVE`. The spec is committed ahead of the implementation, which is the commit
+`DONE`. The spec commit precedes the implementation commit, which is the commit
 order that proves it came first.

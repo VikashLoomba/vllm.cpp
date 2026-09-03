@@ -310,6 +310,45 @@ std::vector<float> Dots3NoteAudioForward(const std::vector<float>& mel,
                                          vt::Backend& backend,
                                          Dots3NoteAudioCapture* capture = nullptr);
 
+// THE MULTI-CHUNK TOWER (W7b, #2797) — `DotsEncoderWithMask.encode_waveform`'s
+// encoder half, `nvidia/audio.py:220-234` @ `9035151d6`. THIS IS THE PRODUCTION
+// ENTRY POINT from W7b on; `Dots3NoteAudioForward` above is one chunk of it.
+//
+// `mels` is the STACKED `[num_chunks, n_mels, chunk_mel_frames]` host f32
+// `Dots3NoteAudioProcessor::ProcessWaveform` returns (`torch.stack`, `:220`),
+// `chunk_num_samples` is upstream's `audio_sample_lens` and `chunk_num_tokens`
+// its `token_lens` (`:217-218`). Returns
+// `[sum(chunk_num_tokens), adapter_out_dim]` host f32: each chunk's first
+// `token_len * merge_factor` rows, concatenated IN ORDER (`:229-234`).
+//
+// A LOOP IS UPSTREAM'S BATCHED CALL, and this is the one claim worth reading
+// before changing it. Upstream stacks the mels and makes ONE
+// `speech_encoder(...)` call with `input_seq_lens` (`:225-227`), and inside it:
+//   * the stem masks each batch element from ITS OWN `valid_mel_lens`
+//     (`audio_encoder.py:570-577`) and Conv2d is batch-independent;
+//   * the varlen PACK builds `cu_seqlens` from `input_seq_lens.cumsum`
+//     (`:674-677`), so each chunk is its own bidirectional attention window;
+//   * the packed rope positions are `arange(S)` gathered by the valid mask
+//     (`:679-685`), so every chunk RESTARTS at position 0;
+//   * the UNPACK (`:711-719`), the final `layer_norm` (`:721`) and the whole
+//     adapter (`audio.py:240-248`) are row-wise, and the zero rows the unpack
+//     writes are sliced away before anything reads them.
+// So the chunks never interact, and `k` calls to the single-chunk tower compute
+// the same numbers as one call over a batch of `k`. What the batch buys
+// upstream is one kernel launch instead of `k`; this row claims no performance
+// axis. At `num_chunks == 1` this is W7a's path with W7a's arguments, byte for
+// byte.
+//
+// `captures`, when non-null, is resized to one capture PER CHUNK, so a gate can
+// read each chunk's four mask stages rather than only the first one's.
+std::vector<float> Dots3NoteAudioForwardChunks(
+    const std::vector<float>& mels,
+    const std::vector<int64_t>& chunk_num_samples,
+    const std::vector<int64_t>& chunk_num_tokens, int64_t hop_length,
+    const Dots3NoteAudioWeights& w, const Dots3NoteAudioParams& a,
+    vt::Backend& backend,
+    std::vector<Dots3NoteAudioCapture>* captures = nullptr);
+
 }  // namespace vllm
 
 #endif  // VLLM_MODEL_EXECUTOR_MODELS_DOTS3_NOTE_AUDIO_H_

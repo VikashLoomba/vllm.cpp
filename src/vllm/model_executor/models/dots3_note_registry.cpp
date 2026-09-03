@@ -210,14 +210,21 @@ MmEncoderOutput EncodeAudioDots3Note(Dots3NoteLoadedModel& d3,
                " wide (`whisper_adapter_out_dim`, nvidia/audio.py:33-35 @ "
                "9035151d6)");
 
-  // The PADDED mel, the waveform's OWN length and the placeholder span, exactly
-  // as the processor produced them. `num_samples` and `num_tokens` are two
-  // different numbers and neither is derivable from the other — see
-  // `Dots3NoteAudioForward`'s own note.
+  // The STACKED padded mels and the PER-CHUNK lengths, exactly as the processor
+  // produced them (W7b, #2797). `chunk_num_samples[i]` and
+  // `chunk_num_tokens[i]` are two different numbers and neither is derivable
+  // from the other — see `Dots3NoteAudioForward`'s own note — and they are
+  // per-chunk because upstream's `encode_waveform` carries them that way
+  // (`audio_sample_lens` / `token_lens`, nvidia/audio.py:217-218 @ 9035151d6).
+  // A one-chunk item takes exactly W7a's path through the same call.
   const multimodal::AudioKwargs& mel = *item.audio_data;
-  const std::vector<float> tower = Dots3NoteAudioForward(
-      mel.input_features, mel.num_samples, mel.num_tokens, /*hop_length=*/160,
-      w.audio, a, vt::GetBackend(queue.device.type));
+  VT_CHECK(!mel.chunk_num_tokens.empty(),
+           "Dots3NoteForCausalLM encoder: the multimodal item carries mel "
+           "features with no per-chunk lengths. `Dots3NoteAudioProcessor::"
+           "ProcessWaveform` fills both vectors for every waveform it accepts.");
+  const std::vector<float> tower = Dots3NoteAudioForwardChunks(
+      mel.input_features, mel.chunk_num_samples, mel.chunk_num_tokens,
+      /*hop_length=*/160, w.audio, a, vt::GetBackend(queue.device.type));
 
   const int64_t rows =
       width > 0 ? static_cast<int64_t>(tower.size()) / width : 0;

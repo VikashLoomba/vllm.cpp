@@ -808,20 +808,43 @@ VLLM_API void vllm_engine_free(vllm_engine* engine);
  * THE UNITS ARE STATED HERE BECAUSE THE TWO REFERENCE ENGINES DISAGREE ON ONE
  * OF THEM, and conflating the two is a one-token-per-step error:
  *
- *   drafts_proposed  draft tokens the target VERIFIED. Mirrors vLLM's
- *                    `vllm:spec_decode_num_draft_tokens`.
- *   drafts_accepted  draft tokens the rejection sampler ACCEPTED. EXCLUDES the
- *                    bonus/replacement token a verify step always emits, which
- *                    is what vLLM's `vllm:spec_decode_num_accepted_tokens`
- *                    counts.
- *   verify_steps     verify steps that carried at least one draft. Mirrors
- *                    vLLM's `vllm:spec_decode_num_drafts` and SGLang's
- *                    `spec_verify_ct`.
+ *   drafts_proposed        draft tokens the target VERIFIED. Mirrors vLLM's
+ *                          `vllm:spec_decode_num_draft_tokens`.
+ *   drafts_accepted        draft tokens the rejection sampler ACCEPTED.
+ *                          EXCLUDES the bonus/replacement token a verify step
+ *                          always emits, which is what vLLM's
+ *                          `vllm:spec_decode_num_accepted_tokens` counts.
+ *   drafted_request_steps  (REQUEST, STEP) PAIRS that carried at least one
+ *                          draft — NOT forward passes. The engine increments it
+ *                          once per request per step, so a single verify step
+ *                          over a batch of 8 drafted requests adds 8. It equals
+ *                          the number of verify forwards ONLY at
+ *                          `max_num_seqs=1`.
  *
- * So `drafts_accepted / drafts_proposed` is the acceptance RATE, with the bonus
- * token OUT of it, and `(drafts_accepted + verify_steps) / verify_steps` is the
- * tokens emitted per verify step, with the bonus token IN it — which is what
- * SGLang reports as `accept_length`.
+ * THE FIELD IS NAMED FOR WHAT IT COUNTS, because a reader who divides by a
+ * "verify step" count that is really a request-step count is wrong by the batch
+ * size — and the concurrent rungs are exactly where this instrument gets
+ * pointed. The unit is nevertheless the SAME one both reference engines
+ * publish, so the comparison is exact and needs no correction: vLLM's
+ * `vllm:spec_decode_num_drafts` is incremented per request per step
+ * (`vllm/v1/spec_decode/metrics.py:41-42`, called from
+ * `vllm/v1/core/sched/scheduler.py:1691` under the same `num_draft_tokens > 0`
+ * predicate at `:2445`), and SGLang's `spec_verify_ct` likewise
+ * (`python/sglang/srt/managers/schedule_batch.py:961`).
+ *
+ * So `drafts_accepted / drafts_proposed` is the acceptance RATE with the bonus
+ * token OUT of it, and
+ * `1 + drafts_accepted / drafted_request_steps` is vLLM's
+ * `mean_acceptance_length` EXACTLY (`vllm/v1/spec_decode/metrics.py:114`), with
+ * the bonus token IN it.
+ *
+ * IT IS NOT SGLang's `accept_length`, and the two must not be quoted as one
+ * number. SGLang divides `completion_tokens` by `spec_verify_ct`
+ * (`python/sglang/srt/managers/tokenizer_manager.py:2363`) and that numerator
+ * includes the request's PREFILL token, which came from no verify step at all.
+ * The difference is about one token per request — roughly +0.07 on a 64-token
+ * request over ~15 steps, which is a seventh of the 4.67-versus-4.23 spread
+ * this instrument exists to explain.
  *
  * All three read 0 on an engine that never speculated, which is a true answer
  * and not an error. Returns VLLM_ERR_INVALID_ARGUMENT for a NULL argument or a
@@ -829,7 +852,7 @@ VLLM_API void vllm_engine_free(vllm_engine* engine);
 typedef struct vllm_spec_acceptance {
   int64_t drafts_proposed;
   int64_t drafts_accepted;
-  int64_t verify_steps;
+  int64_t drafted_request_steps;
 } vllm_spec_acceptance;
 
 VLLM_API vllm_status vllm_engine_spec_acceptance(const vllm_engine* engine,

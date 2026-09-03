@@ -605,23 +605,34 @@ vllm_engine_spec_acceptance(engine, &after);
 
 int64_t proposed = after.drafts_proposed - before.drafts_proposed;
 int64_t accepted = after.drafts_accepted - before.drafts_accepted;
-int64_t steps    = after.verify_steps    - before.verify_steps;
+int64_t steps    = after.drafted_request_steps - before.drafted_request_steps;
 ```
 
 `drafts_accepted` EXCLUDES the bonus/replacement token a verify step always
 emits, which is vLLM's own convention for
-`vllm:spec_decode_num_accepted_tokens`. So `accepted / proposed` is the
-acceptance rate with the bonus token out of it, and
-`(accepted + steps) / steps` is the tokens emitted per verify step with the
-bonus token in it, which is what SGLang publishes as `accept_length`. Reporting
-one number under both names is a one-token-per-step error. All three read 0 on an
-engine that never speculated.
+`vllm:spec_decode_num_accepted_tokens`, so `accepted / proposed` is the
+acceptance rate with the bonus token out of it.
+
+`drafted_request_steps` counts (request, step) PAIRS that carried at least one
+draft, NOT forward passes: one verify forward over a batch of 8 drafted requests
+adds 8, and the two numbers are equal only at `max_num_seqs=1`. That is also how
+vLLM's `vllm:spec_decode_num_drafts` and SGLang's `spec_verify_ct` count, so the
+figures compare directly at any concurrency.
+
+`1 + accepted / steps` is vLLM's `mean_acceptance_length` EXACTLY, with the bonus
+token in it. It is NOT SGLang's `accept_length`, which divides
+`completion_tokens` by `spec_verify_ct`: that numerator also carries the
+request's prefill token, which came from no verify step, so SGLang's figure runs
+about one token per request higher. Quoting one number under both names is an
+error of roughly +0.07 on a 64-token request.
+
+All three read 0 on an engine that never speculated.
 
 `vllm-cli` prints the per-leg deltas on stderr, on their own line, beside the
 timing and leg-boundary lines it already prints:
 
 ```text
-vllm-cli: run=2/5 spec_drafts_proposed=196 spec_drafts_accepted=90 spec_verify_steps=28
+vllm-cli: run=2/5 spec_drafts_proposed=196 spec_drafts_accepted=90 spec_drafted_request_steps=28
 ```
 
 `vllm_chat` takes a whole OpenAI chat request as JSON, so it accepts

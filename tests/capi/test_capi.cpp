@@ -1681,6 +1681,14 @@ TEST_CASE("capi: v24 kv_cache_dtype reaches the engine load") {
 // cases hold the accessor's CONTRACT; the harness suite
 // (`tests/tools/test_dflash2_speed_harness.py`) links the production CLI against
 // a stub libvllm and holds what it PRINTS.
+//
+// WHAT THESE CASES DO NOT HOLD, said plainly because a fresh review found the
+// gap by mutation: both of them return at the NULL guard, so neither ever
+// reaches the counter mapping, and swapping `drafts_proposed` with
+// `drafts_accepted` leaves this file green. That mapping lives in
+// `src/capi/spec_acceptance.h` for exactly that reason and is pinned by
+// `SpecAcceptanceMappingTest` in the harness suite, which compiles and runs it
+// with no library. Do not read a green here as a check on the values.
 TEST_CASE("capi: v25 vllm_engine_spec_acceptance refuses NULL and zeroes *out") {
   vllm_spec_acceptance got{};
   // A NULL out has nowhere to write, so it is the one argument that cannot be
@@ -1693,11 +1701,11 @@ TEST_CASE("capi: v25 vllm_engine_spec_acceptance refuses NULL and zeroes *out") 
   // acceptance count is a plausible-looking measurement.
   got.drafts_proposed = 111;
   got.drafts_accepted = 222;
-  got.verify_steps = 333;
+  got.drafted_request_steps = 333;
   CHECK(vllm_engine_spec_acceptance(nullptr, &got) == VLLM_ERR_INVALID_ARGUMENT);
   CHECK(got.drafts_proposed == 0);
   CHECK(got.drafts_accepted == 0);
-  CHECK(got.verify_steps == 0);
+  CHECK(got.drafted_request_steps == 0);
 }
 
 // ─── ABI v11: audio transcription (ARCH-ONE-SURFACE ROW 1) ───────────────────

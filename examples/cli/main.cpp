@@ -355,9 +355,15 @@ int main(int argc, char** argv) {
       // spec_drafts_accepted EXCLUDES the bonus token a verify step always
       // emits, exactly as vLLM's `spec_decode_num_accepted_tokens` does, so
       // accepted/proposed is the acceptance RATE and
-      // (accepted + verify_steps)/verify_steps is the tokens emitted per verify
-      // step, which is what SGLang publishes as `accept_length` and which DOES
-      // include that token.
+      // 1 + accepted/drafted_request_steps is vLLM's `mean_acceptance_length`,
+      // which DOES include that token. It is NOT SGLang's `accept_length`,
+      // whose numerator also carries the prefill token; see `vllm.h`.
+      //
+      // AND THE THIRD COUNT IS PER (REQUEST, STEP), NOT PER FORWARD PASS, which
+      // is why it is not called a verify-step count: at concurrency 8 one verify
+      // forward over 8 drafted requests adds 8. Both oracles count it the same
+      // way, so the comparison is exact; a reader who takes it for a forward
+      // count is wrong by the batch size.
       //
       // NOT PRINTED AT ALL when either read failed. A silent line is a refusal
       // in the harness that reads it; a line of zeroes would be a measurement
@@ -365,14 +371,15 @@ int main(int argc, char** argv) {
       if (spec_ok) {
         std::fprintf(stderr,
                      "vllm-cli: run=%d/%d spec_drafts_proposed=%lld "
-                     "spec_drafts_accepted=%lld spec_verify_steps=%lld\n",
+                     "spec_drafts_accepted=%lld "
+                     "spec_drafted_request_steps=%lld\n",
                      r + 1, args.repeat,
                      static_cast<long long>(spec_after.drafts_proposed -
                                             spec_before.drafts_proposed),
                      static_cast<long long>(spec_after.drafts_accepted -
                                             spec_before.drafts_accepted),
-                     static_cast<long long>(spec_after.verify_steps -
-                                            spec_before.verify_steps));
+                     static_cast<long long>(spec_after.drafted_request_steps -
+                                            spec_before.drafted_request_steps));
       }
       std::fflush(stderr);
       vllm_completion_free(&out);

@@ -14,7 +14,7 @@ on stderr:
 
 Since #2832 it also reports what an ATTRIBUTION needs, on its own line:
 
-    vllm-cli: run=2/5 spec_drafts_proposed=196 spec_drafts_accepted=90 spec_verify_steps=28
+    vllm-cli: run=2/5 spec_drafts_proposed=196 spec_drafts_accepted=90 spec_drafted_request_steps=28
 
 `--repeat` loads the model ONCE and completes N times, so the legs after the
 first are warm. This harness discards leg 1 for that NAMED CAUSE and no other:
@@ -186,11 +186,15 @@ def parse_leg_spans(stderr_text: str) -> dict[int, tuple[float, float]]:
 #:
 #: UNITS: `spec_drafts_accepted` EXCLUDES the bonus/replacement token a verify
 #: step always emits, exactly as vLLM's `spec_decode_num_accepted_tokens` does.
+#: `spec_drafted_request_steps` counts (REQUEST, STEP) PAIRS that carried a
+#: draft and NOT forward passes -- one verify forward over 8 drafted requests
+#: adds 8 -- which is also how vLLM's `spec_decode_num_drafts` and SGLang's
+#: `spec_verify_ct` count, so the comparison is exact at every concurrency.
 #: `fold_acceptance` owns the two derived figures and states the convention on
 #: each of them.
 LEG_SPEC_RE = re.compile(
     r"run=(?P<run>\d+)/(?P<of>\d+)\s+spec_drafts_proposed=(?P<proposed>\d+)\s+"
-    r"spec_drafts_accepted=(?P<accepted>\d+)\s+spec_verify_steps=(?P<steps>\d+)"
+    r"spec_drafts_accepted=(?P<accepted>\d+)\s+spec_drafted_request_steps=(?P<steps>\d+)"
 )
 
 
@@ -248,14 +252,14 @@ def legs_with_spans(stderr_text: str) -> list[dict[str, Any]]:
                 "marker, so this run cannot say whether it is slower because it "
                 "EXECUTES slower or because it ACCEPTS less. The marker is "
                 "`spec_drafts_proposed=`/`spec_drafts_accepted=`/"
-                "`spec_verify_steps=`, printed by `examples/cli/main.cpp` from "
+                "`spec_drafted_request_steps=`, printed by `examples/cli/main.cpp` from "
                 "`vllm_engine_spec_acceptance` (ABI v25); a binary built before "
                 "it cannot drive this arm"
             )
         (
             leg["spec_drafts_proposed"],
             leg["spec_drafts_accepted"],
-            leg["spec_verify_steps"],
+            leg["spec_drafted_request_steps"],
         ) = count
     return legs
 

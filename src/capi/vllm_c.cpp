@@ -29,6 +29,7 @@
 
 #include "capi/chat_prompt.h"
 #include "capi/engine_handle.h"
+#include "capi/spec_acceptance.h"  // FillSpecAcceptance (ABI v25)
 #include "vllm/config/offload.h"
 #include "vllm/config/kv_transfer.h"   // ParseKVTransferConfigJson (ABI v9)
 #include "vllm/config/multimodal.h"    // ParseLimitMmPerPromptJson (ABI v19)
@@ -829,12 +830,12 @@ VLLM_API void vllm_engine_free(vllm_engine* engine) { delete engine; }
 // `LoadedEngine::runner()` seam; the DFlash2 speed gate drives `examples/cli`,
 // which is a pure client of `vllm.h`, so that seam is closed to it.
 //
-// `verify_steps` comes from `spec_drafts_proposed_by_depth()[0]` rather than
-// from a counter of its own, and that is the SAME already-computed value: the
-// runner increments index 0 exactly once for each request-step whose draft list
-// was non-empty, which is the definition of a verify step that carried drafts.
-// The vector is EMPTY on an engine that never speculated, and 0 is then the
-// true answer.
+// THE MAPPING ITSELF LIVES IN `capi/spec_acceptance.h` AND MUST STAY THERE.
+// Which counter becomes which field, and which element of the per-depth vector
+// is read, is silently wrong under a swap and cannot be reached from here by
+// anything smaller than a test that links the whole library. That header states
+// the reason and is pinned by a probe the focused gate compiles and runs. Do
+// not re-inline these three assignments.
 VLLM_API vllm_status vllm_engine_spec_acceptance(const vllm_engine* engine,
                                                  vllm_spec_acceptance* out) {
   if (out == nullptr) {
@@ -843,7 +844,7 @@ VLLM_API vllm_status vllm_engine_spec_acceptance(const vllm_engine* engine,
   }
   out->drafts_proposed = 0;
   out->drafts_accepted = 0;
-  out->verify_steps = 0;
+  out->drafted_request_steps = 0;
   if (engine == nullptr) {
     SetError("vllm_engine_spec_acceptance: engine is null");
     return VLLM_ERR_INVALID_ARGUMENT;
@@ -852,11 +853,11 @@ VLLM_API vllm_status vllm_engine_spec_acceptance(const vllm_engine* engine,
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   try {
-    const vllm::v1::GPUModelRunner& runner = engine->loaded->runner();
-    out->drafts_proposed = runner.spec_drafts_proposed();
-    out->drafts_accepted = runner.spec_drafts_accepted();
-    const std::vector<int64_t>& by_depth = runner.spec_drafts_proposed_by_depth();
-    out->verify_steps = by_depth.empty() ? 0 : by_depth.front();
+    vllm::capi::FillSpecAcceptance(engine->loaded->runner(), out);
+    // Like every other entry point that returns VLLM_OK: a success clears the
+    // thread-local message, so a caller that reads `vllm_last_error()` after a
+    // successful call does not read the previous failure's string.
+    ClearError();
     return VLLM_OK;
   } catch (const std::exception& error) {
     SetError(std::string("vllm_engine_spec_acceptance: ") + error.what());

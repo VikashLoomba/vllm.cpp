@@ -855,15 +855,31 @@ def is_warm_leg(leg: Mapping[str, Any]) -> bool:
 #: The three counters `vllm-cli` prints per leg (#2832), in the order the
 #: refusals name them. A leg carries all three or none: a partial set is a
 #: defect and never a smaller sample.
-ACCEPTANCE_KEYS = ("spec_drafts_proposed", "spec_drafts_accepted", "spec_verify_steps")
+ACCEPTANCE_KEYS = ("spec_drafts_proposed", "spec_drafts_accepted", "spec_drafted_request_steps")
 
 #: Written into every acceptance block, because the two reference engines
 #: disagree here and one sentence of prose is cheaper than the error.
+#:
+#: IT NAMES vLLM AND NOT SGLang FOR THE SECOND FIGURE. `mean_acceptance_length`
+#: is `1 + accepted/steps`, which is vLLM's `mean_acceptance_length` EXACTLY
+#: (`vllm/v1/spec_decode/metrics.py:114`). SGLang's `accept_length` is
+#: `completion_tokens / spec_verify_ct`
+#: (`python/sglang/srt/managers/tokenizer_manager.py:2363`) and that numerator
+#: also carries the PREFILL token, which came from no verify step; the two
+#: differ by about one token per request, roughly +0.07 on a 64-token request
+#: over ~15 steps.
 BONUS_TOKEN_CONVENTION = (
     "the bonus/replacement token a verify step always emits is EXCLUDED from "
     "drafts_accepted and from accept_rate, which is vLLM's own convention for "
     "vllm:spec_decode_num_accepted_tokens, and INCLUDED in "
-    "tokens_per_verify_step, which is SGLang's convention for accept_length"
+    "mean_acceptance_length, which is vLLM's own mean_acceptance_length "
+    "(1 + accepted/steps) EXACTLY. It is NOT SGLang's accept_length: that "
+    "divides completion_tokens by spec_verify_ct, so its numerator also carries "
+    "the prefill token and it runs about one token per request higher. "
+    "drafted_request_steps counts (request, step) pairs that carried a draft "
+    "and NOT forward passes, which is how vllm:spec_decode_num_drafts and "
+    "spec_verify_ct both count; it equals the number of verify forwards only at "
+    "max_num_seqs=1"
 )
 
 
@@ -888,7 +904,7 @@ def _acceptance_of(leg: Mapping[str, Any]) -> tuple[int, int, int] | None:
     return (
         int(leg["spec_drafts_proposed"]),
         int(leg["spec_drafts_accepted"]),
-        int(leg["spec_verify_steps"]),
+        int(leg["spec_drafted_request_steps"]),
     )
 
 
@@ -943,17 +959,17 @@ def fold_acceptance(legs: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
         "warm_legs": len(reported),
         "drafts_proposed": proposed,
         "drafts_accepted": accepted,
-        "verify_steps": steps,
+        "drafted_request_steps": steps,
         "accept_rate": (accepted / proposed) if proposed > 0 else None,
-        "tokens_per_verify_step": ((accepted + steps) / steps) if steps > 0 else None,
+        "mean_acceptance_length": ((accepted + steps) / steps) if steps > 0 else None,
         "per_leg": [
             {
                 "run": int(leg["run"]),
                 "drafts_proposed": value[0],
                 "drafts_accepted": value[1],
-                "verify_steps": value[2],
+                "drafted_request_steps": value[2],
                 "accept_rate": (value[1] / value[0]) if value[0] > 0 else None,
-                "tokens_per_verify_step": (
+                "mean_acceptance_length": (
                     (value[1] + value[2]) / value[2] if value[2] > 0 else None
                 ),
             }
@@ -985,9 +1001,9 @@ def acceptance_reasons(legs: Sequence[Mapping[str, Any]], *, label: str) -> list
             f"acceptance: the {label} arm's legs carry no speculative counters, so "
             "the run cannot say whether it is slower because it EXECUTES slower or "
             "because it ACCEPTS less. The counters are `spec_drafts_proposed=` / "
-            "`spec_drafts_accepted=` / `spec_verify_steps=`, printed per leg by "
-            "`examples/cli/main.cpp`; a binary built before them cannot drive this "
-            "arm"
+            "`spec_drafts_accepted=` / `spec_drafted_request_steps=`, printed per "
+            "leg by `examples/cli/main.cpp`; a binary built before them cannot "
+            "drive this arm"
         ]
     total_proposed = 0
     for leg, value in counted:
@@ -1010,7 +1026,7 @@ def acceptance_reasons(legs: Sequence[Mapping[str, Any]], *, label: str) -> list
         if proposed > 0 and steps <= 0:
             reasons.append(
                 f"acceptance: run {leg.get('run')} verified {proposed} draft tokens "
-                "over 0 verify steps, so the tokens-per-verify-step figure has no "
+                "over 0 drafted request-steps, so mean_acceptance_length has no "
                 "denominator"
             )
     if total_proposed <= 0:
@@ -1257,8 +1273,15 @@ def acceptance_comparison(
     run folds to 16.034. Two independent oracles agree within 0.5% of each other,
     so the deficit is an engine property -- and throughput alone cannot say which
     one, because those two oracles reach the same number by DIFFERENT balances:
-    SGLang accepts more per verify step than vLLM and lands beside it. This block
-    is the axis that separates them, on the record a reader actually cites.
+    SGLang accepts more per drafted request-step than vLLM and lands beside it.
+    This block is the axis that separates them, on the record a reader actually
+    cites.
+
+    ONLY THE vLLM SIDE IS RENDERED HERE, and that is deliberate. `ours` and
+    `vllm` are the same quantity in the same units, so they subtract. SGLang's
+    published `accept_length` is NOT that quantity -- see
+    `BONUS_TOKEN_CONVENTION` -- and putting it in this block under the same key
+    would invite exactly the one-token error the block exists to prevent.
 
     THE TWO SIDES DO NOT FOLD THE SAME LEG POPULATION, and that is recorded
     rather than hidden. Ours is pooled over the WARM legs, which is the
@@ -1285,7 +1308,8 @@ def acceptance_comparison(
     def _per_step(accepted: Any, steps: Any) -> float | None:
         if accepted is None or steps is None or float(steps) <= 0:
             return None
-        # The bonus token is one per verify step and is IN this figure.
+        # The bonus token is one per drafted request-step and is IN this
+        # figure, which makes it vLLM's own mean_acceptance_length.
         return (float(accepted) + float(steps)) / float(steps)
 
     return {
@@ -1293,9 +1317,9 @@ def acceptance_comparison(
         "ours": {
             "drafts_proposed": block.get("drafts_proposed"),
             "drafts_accepted": block.get("drafts_accepted"),
-            "verify_steps": block.get("verify_steps"),
+            "drafted_request_steps": block.get("drafted_request_steps"),
             "accept_rate": block.get("accept_rate"),
-            "tokens_per_verify_step": block.get("tokens_per_verify_step"),
+            "mean_acceptance_length": block.get("mean_acceptance_length"),
             "per_leg": block.get("per_leg"),
             "leg_population": (
                 "the warm legs only, the same population the throughput median "
@@ -1303,16 +1327,16 @@ def acceptance_comparison(
             ),
             "source": (
                 "`spec_drafts_proposed=` / `spec_drafts_accepted=` / "
-                "`spec_verify_steps=` printed per leg by `examples/cli/main.cpp` "
+                "`spec_drafted_request_steps=` printed per leg by `examples/cli/main.cpp` "
                 "through `vllm_engine_spec_acceptance` (ABI v25)"
             ),
         },
         "vllm": {
             "drafts_proposed": their_proposed,
             "drafts_accepted": their_accepted,
-            "verify_steps": their_steps,
+            "drafted_request_steps": their_steps,
             "accept_rate": _rate(their_accepted, their_proposed),
-            "tokens_per_verify_step": _per_step(their_accepted, their_steps),
+            "mean_acceptance_length": _per_step(their_accepted, their_steps),
             "per_leg": None,
             "leg_population": (
                 "the whole run, COLD legs included: the oracle arm reads "

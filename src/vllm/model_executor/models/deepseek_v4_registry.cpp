@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/host_token_ids.h"  // ResolveHostTokenIds
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
@@ -135,6 +136,27 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
                                            const ModelForwardInput& input) {
   auto& ds = ModelAs<DeepseekV4LoadedModel>(model, "DeepseekV4ForCausalLM");
   const DeepseekV4Weights& weights = ds.weights();
+  // #2544/#1305 -- TAKE the asynchronous runner's DEVICE identifiers, BEFORE any
+  // arm below reads them. On the async serving path the runner's combine splices
+  // each decode row's sampled token into the DEVICE buffer on the main queue and
+  // leaves `token_ids` deliberately stale for decode rows
+  // (`v1/worker/gpu/runner.cpp`, the mirror arm, which is the DEFAULT on CUDA).
+  // A forward that embeds the host vector generates every step after the first
+  // from token id 0 -- silently, at rc=0, with plausible-looking output.
+  //
+  // ALL FOUR ARMS take the resolved vector, because the mirror is a property of
+  // the STEP and not of the arm the step routes to. Every one of them is a HOST
+  // gather, which is why this is the host arm of the seam and not
+  // `detail::ApplyDeviceTokenIds`; `host_token_ids.h` carries the argument.
+  //
+  // WIRED BUT NOT CONVICTED, and the spec says so under O4: #2544 named this
+  // registration on a grep and this row has no staged checkpoint for it, so what
+  // is proved here is that the identifiers reach the embed through
+  // `ModelRegistry::Forward`, not that service ever hands this model a live
+  // `device_token_ids`.
+  std::vector<int32_t> device_ids;
+  const std::vector<int32_t>& ids =
+      ResolveHostTokenIds(input, &device_ids, "DeepseekV4ForCausalLM");
   // MODEL-DSV4-PAGED-ENTRY (#2447): THE EXL3 PAGED ARM, and it is FIRST for the
   // reason the row exists. `ModelForwardInput::gather_logits` defaults to true
   // and the runner leaves it true on every default step, so a branch placed
@@ -155,19 +177,19 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
         weights.params, *input.multi_kv, input.attn_kv, input.attn_meta.num_reqs,
         input.queue.device, &pages, /*dsa_dense=*/false,
         /*have_compressor_state=*/true,
-        /*num_tokens=*/static_cast<int64_t>(input.token_ids.size()));
+        /*num_tokens=*/static_cast<int64_t>(ids.size()));
     VT_CHECK(refusal.empty(), refusal);
     const int64_t kv_base =
         input.attn_meta.num_computed_tokens_cpu.empty()
             ? 0
             : static_cast<int64_t>(input.attn_meta.num_computed_tokens_cpu[0]);
     return DeepseekV4ForwardExl3PagedLogits(
-        weights, input.queue, pages, kv_base, input.token_ids, input.positions,
+        weights, input.queue, pages, kv_base, ids, input.positions,
         input.logits_indices,
         &ds.compressor_state(weights.params.num_hidden_layers));
   }
   if (input.gather_logits) {
-    return DeepseekV4Model::ForwardDevice(input.token_ids, input.positions,
+    return DeepseekV4Model::ForwardDevice(ids, input.positions,
                                           input.attn_meta, input.attn_kv, weights,
                                           input.queue, input.logits_indices);
   }
@@ -183,19 +205,19 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
         weights.params, *input.multi_kv, input.attn_kv, input.attn_meta.num_reqs,
         input.queue.device, &pages, /*dsa_dense=*/true,
         /*have_compressor_state=*/false,
-        /*num_tokens=*/static_cast<int64_t>(input.token_ids.size()));
+        /*num_tokens=*/static_cast<int64_t>(ids.size()));
     VT_CHECK(refusal.empty(), refusal);
     const int64_t kv_base =
         input.attn_meta.num_computed_tokens_cpu.empty()
             ? 0
             : static_cast<int64_t>(input.attn_meta.num_computed_tokens_cpu[0]);
     return HostLogits(
-        DeepseekV4ForwardGgufPaged(weights, input.queue, pages, kv_base, input.token_ids,
+        DeepseekV4ForwardGgufPaged(weights, input.queue, pages, kv_base, ids,
                                    input.positions, input.logits_indices),
         weights.params.vocab_size);
   }
   return HostLogits(
-      DeepseekV4Model::Forward(input.token_ids, input.positions, input.attn_meta,
+      DeepseekV4Model::Forward(ids, input.positions, input.attn_meta,
                                input.attn_kv, weights, input.queue,
                                input.logits_indices),
       weights.params.vocab_size);

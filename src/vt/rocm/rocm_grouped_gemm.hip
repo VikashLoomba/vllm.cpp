@@ -74,13 +74,16 @@ __device__ __forceinline__ int GetIntB2(const int8_t* qs, int i32) {
   return static_cast<int>(x16[2 * i32 + 0]) | (static_cast<int>(x16[2 * i32 + 1]) << 16);
 }
 
-// Signed 8-bit x4 dot-product-accumulate, bit-identical to __dp4a (integer
-// math is exact either way). The HW dot instruction (v_dot4_i32_i8 /
-// __ockl_sdot4) is a perf lever, not a correctness requirement.
+// Signed 8-bit x4 dot-product-accumulate. Uses the HW v_dot4_i32_i8
+// instruction (__ockl_sdot4) on gfx1100 — one instruction instead of 4
+// int8 multiplies + 4 adds. Bit-identical: signed int8×int8→int32 dot
+// product is exact either way (the HW instruction and the scalar expansion
+// compute the same integer result).
 __device__ __forceinline__ int Dp4a(int a, int b, int acc) {
-  const int8_t* a8 = reinterpret_cast<const int8_t*>(&a);
-  const int8_t* b8 = reinterpret_cast<const int8_t*>(&b);
-  return acc + a8[0] * b8[0] + a8[1] * b8[1] + a8[2] * b8[2] + a8[3] * b8[3];
+  using char4_native = char __attribute__((ext_vector_type(4)));
+  char4_native va = *reinterpret_cast<const char4_native*>(&a);
+  char4_native vb = *reinterpret_cast<const char4_native*>(&b);
+  return __ockl_sdot4(va, vb, acc, false);
 }
 
 // ---- activation quantizers ----

@@ -1524,6 +1524,81 @@ TEST_CASE("ltx2 vae: the SHALLOW bf16 arm holds the three rules the deep one can
   CHECK(err == 0.0);
 }
 
+TEST_CASE("ltx2 vae: the scaled timestep NARROWS BOTH OPERANDS and rounds the product") {
+  // A24 wave 3 fresh review (#2786). `Ltx2ConvVideoDecode` forms
+  //   Round(Round(timestep) * Round(timestep_scale_multiplier))
+  // to mirror `timestep * self.timestep_scale_multiplier.to(sample)`
+  // (conv_video_decoder.py:313), where `timestep` is built at `sample.dtype`
+  // (`:304-305`) and `.to(sample)` narrows the parameter. The case above CANNOT
+  // gate that: reverting the port to its pre-row f64 product left all 52 cases
+  // and 3480 assertions of this file green, because the shared stream draws this
+  // fixture's multiplier as 0.0675802556968955 and the entire difference between
+  // the two rules is then a relative 1.5e-7 in a 3.4e-3 angle -- under a quarter
+  // of a bf16 ulp at every one of the 256 projection entries.
+  //
+  // So this case is the SAME arm with ONE parameter changed, on both sides. The
+  // multiplier was SWEPT rather than chosen: 3.7, 7.3, 23.7, 41.3, 499.7 and the
+  // SHIPPED 1000 all separate nothing, and the generator's section 5i records
+  // the whole table. 113.7 separates 119 of the 144 outputs and is still small
+  // enough that this arm measures the product's rounding rather than the f64
+  // frequency table `TimestepEmbedding` documents as its one wide exception.
+  vllm::Ltx2ConvVideoDecoderConfig cfg = ReducedVideoDecoderConfig();
+  cfg.prefix = "ltx2.videodecshallow.";
+  cfg.decoder_blocks = {{"attn", 1, 0, false, false}};
+  ParamBag bag = BuildVideoDecoderParams(cfg);
+  // The manifest is section 5h's, unchanged -- the arms differ by a VALUE and
+  // not by a parameter, which is what makes the comparison below about the rule.
+  CheckManifest(bag, vllm_test::kLtx2VideoDecShallowParamNames,
+                vllm_test::kLtx2VideoDecShallowParamCounts,
+                std::size(vllm_test::kLtx2VideoDecShallowParamNames));
+  bag.weights.tensors[cfg.prefix + "timestep_scale_multiplier"] = {
+      static_cast<float>(vllm_test::kLtx2VideoDecTsScaleMultiplier)};
+  const vllm::Ltx2VaeWeights bf16 = NarrowToBf16(bag.weights);
+
+  // THE TWO SCALARS, asserted before the tensors, so a failure says whether the
+  // arm stopped separating or the port stopped mirroring. `kLtx2VideoDecTsScale*`
+  // are upstream's own values at this multiplier.
+  const float t_bf = vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(
+      vllm_test::kLtx2VideoDecTsScaleTimestep)));
+  const float m_bf = vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(
+      vllm_test::kLtx2VideoDecTsScaleMultiplier)));
+  const double rule = static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(t_bf * m_bf)));
+  const double wide = vllm_test::kLtx2VideoDecTsScaleTimestep * static_cast<double>(m_bf);
+  INFO("scaled timestep: rule " << rule << " vs wide product " << wide);
+  CHECK(rule == vllm_test::kLtx2VideoDecTsScaleRuleValue);
+  CHECK(wide == vllm_test::kLtx2VideoDecTsScaleWideValue);
+  CHECK(rule != wide);
+
+  const int64_t lc = vllm_test::kLtx2VideoDecLatentC;
+  const int64_t lt = vllm_test::kLtx2VideoDecLatentT;
+  const int64_t lh = vllm_test::kLtx2VideoDecLatentH;
+  const int64_t lw = vllm_test::kLtx2VideoDecLatentW;
+  const std::vector<float> latent =
+      Ltx2Input("ltx2.videodecshallow.input", lc * lt * lh * lw, 1.0);
+
+  GoldenNoise noise("ltx2.videodecshallow.");
+  const vllm::Ltx2VideoFrames frames =
+      vllm::Ltx2ConvVideoDecode(cfg, bf16, latent, lc, lt, lh, lw, &noise);
+
+  // THE REJECTED ANSWER SEPARATES, asserted before the comparison that depends
+  // on it. It is upstream re-run with a WIDE `timestep` tensor, which is exactly
+  // the pre-row hypothesis and nothing else -- 0.01171875 apart, three bf16 ulps
+  // at this output's scale.
+  INFO("wide-product rejected distance: " << vllm_test::kLtx2VideoDecTsScaleRejectWideProduct);
+  CHECK(vllm_test::kLtx2VideoDecTsScaleRejectWideProduct > 0.0);
+
+  const double err = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecTsScaleGolden,
+                                std::size(vllm_test::kLtx2VideoDecTsScaleGolden));
+  const double rej = MaxAbsDiff(frames.data, vllm_test::kLtx2VideoDecTsScaleRejectedWideProductGolden,
+                                std::size(vllm_test::kLtx2VideoDecTsScaleRejectedWideProductGolden));
+  MESSAGE("scaled-timestep arm: vs upstream " << err << " vs wide-product " << rej);
+  INFO("scaled-timestep arm max|diff| = " << err);
+  // Bit-exact against upstream, and NOT on the rejected answer. A port that kept
+  // the f64 product would land on the second number, not the first.
+  CHECK(err == 0.0);
+  CHECK(rej == vllm_test::kLtx2VideoDecTsScaleRejectWideProduct);
+}
+
 TEST_CASE("ltx2 vae: the PixelNorm epsilon is the BF16 one, at the scale where that BINDS") {
   // A24 wave 3 (#2786), and the reason it is a separate case from the decoder
   // golden above is the whole lesson of A24 wave 1.

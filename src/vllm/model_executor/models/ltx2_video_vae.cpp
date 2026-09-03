@@ -1938,6 +1938,21 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
                                      const std::vector<float>& frames, int64_t channels,
                                      int64_t frame_count, int64_t height, int64_t width,
                                      int64_t* out_cropped_frames) {
+  // THE ENCODER IS STILL THE f32 PORT, and it says so HERE rather than by
+  // accident several hundred lines downstream. Every volume below is allocated
+  // `vt::DType::kF32` while `Param(weights, ...)` hands back whatever the bag
+  // stores, and `ApplyNorm`/`Linear3d`/`ApplyAdaLn`/`FeedSpatialNoise` take ONE
+  // dtype for the activation and the weight together -- so a bf16 bag would be
+  // read as f32 words. It does terminate today, because a `weights.Get(...)` on
+  // the per-channel statistics throws "missing parameter" on a bf16 bag, but a
+  // refusal that fires by accident, in a message naming neither this encoder nor
+  // the dtype it was handed, is not a refusal. A24 wave 3 (#2786) ports the
+  // DECODE; the encoder's bf16 arm is owed -- see `## Owed` in
+  // .agents/specs/ltx25-a24-video-vae-bf16.md.
+  VT_CHECK(weights.dtype == vt::DType::kF32,
+           std::string("ltx2 video encoder: the encoder is still the f32 port; its bf16 arm is "
+                       "owed (#2786 `## Owed`). It was handed ") +
+               vt::Name(weights.dtype));
   VT_CHECK(channels == config.in_channels,
            "ltx2 video encoder: input channel count does not match in_channels");
   VT_CHECK(static_cast<int64_t>(frames.size()) == channels * frame_count * height * width,

@@ -1444,6 +1444,13 @@ def section_video_vae_bf16_kernels(out) -> None:
 # nothing. The `attn` block here sits at `base_channels * 1 = 8`.
 VIDEO_SHALLOW_BLOCKS = [("attn", {"num_layers": 1})]
 
+# `ConvVideoDecoder.__init__` declares `decode_timestep: float = 0.05`
+# (conv_video_decoder.py:236) and `forward` builds the default timestep tensor
+# from it (`:304-305`); the port's `Ltx2ConvVideoDecoderConfig::decode_timestep`
+# carries the same default. Named once here so section 5i's wide-product arm and
+# the C++ probe cannot drift from it.
+VIDEO_DEC_DECODE_TIMESTEP = 0.05
+
 
 def section_conv_video_decoder_bf16_shallow(out) -> None:
     import torch
@@ -1468,7 +1475,7 @@ def section_conv_video_decoder_bf16_shallow(out) -> None:
 
     latent = make_input("ltx2.videodecshallow.input", VIDEO_LATENT, 1.0).to(torch.bfloat16)
 
-    def run(dec):
+    def run(dec, timestep=None):
         local: list[int] = []
 
         def patched(*args, **kwargs):
@@ -1484,7 +1491,7 @@ def section_conv_video_decoder_bf16_shallow(out) -> None:
         torch.randn = patched
         try:
             with sdpa_kernel(SDPBackend.MATH):
-                return dec(latent), local
+                return dec(latent, timestep=timestep), local
         finally:
             torch.randn = real_randn
 
@@ -1582,6 +1589,102 @@ def section_conv_video_decoder_bf16_shallow(out) -> None:
     emit_f32(out, "kLtx2VideoDecShallowRejectedRmsOrderGolden", y_rms.float().numpy())
     emit_f32(out, "kLtx2VideoDecShallowRejectedUnNormalizeGolden", y_un.float().numpy())
     emit_f32(out, "kLtx2VideoDecShallowRejectedTimestepF32Golden", y_te.float().numpy())
+
+    # --- section 5i: the SCALED TIMESTEP's own rule, at a multiplier that can
+    # SEPARATE it (A24 wave 3 fresh review, #2786) ---
+    #
+    # `scaled_timestep = timestep * self.timestep_scale_multiplier.to(sample)`
+    # (conv_video_decoder.py:313) narrows BOTH operands and rounds the product,
+    # because `timestep` is built at `sample.dtype` (`:304-305`) and `.to(sample)`
+    # narrows the parameter. The port mirrors that. Section 5h above CANNOT gate
+    # it, and the reason is arithmetic rather than an oversight:
+    #
+    #   * the fixture's multiplier is drawn from the shared stream and is
+    #     0.0675802556968955, so `scaled_timestep` is ~3.4e-3;
+    #   * the whole difference between the rule and the WIDE product is the
+    #     narrowing of `0.05` itself, a RELATIVE 1.5e-7;
+    #   * `get_timestep_embedding` widens the value back to f32 and takes
+    #     sin/cos of `t * exp(...)`, whose largest argument is that same 3.4e-3,
+    #     and only THEN narrows to bf16 (`timesteps_proj.to(hidden_dtype)`,
+    #     timestep_embedding.py:142). A 3e-6 move in a 3.4e-3 angle moves every
+    #     sin/cos by less than a quarter of a bf16 ulp, so all 256 projection
+    #     entries round to the same bf16 word and the arm is bit-identical.
+    #
+    # Measured, not asserted: reverting the port to its pre-row f64 product left
+    # section 5h fully green.
+    #
+    # THE MULTIPLIER WAS SWEPT, and the obvious candidates DO NOT WORK. The value
+    # this row's spec §4.12 names as separating -- 7.3 -- separates the two
+    # SCALARS (0.365234375 against 0.365625) and then separates NOTHING of the
+    # arm's 144 outputs, because a 0.1% move in a 0.365-radian angle is still
+    # under half a bf16 ulp everywhere the sinusoid lands. Upstream re-run at
+    # each candidate, max|rule - wide product| over the whole output:
+    #
+    #     3.7 -> 0        7.3 -> 0         23.7 -> 0        41.3 -> 0
+    #     499.7 -> 0      1000 -> 0        (the SHIPPED value separates nothing)
+    #     251.3 -> 0.00195312 (16/144)     17.3 -> 0.00390625 (64/144)
+    #     57.9 -> 0.00390625 (53/144)      733.1 -> 0.00390625 (100/144)
+    #     911.3 -> 0.0078125 (98/144)      113.7 -> 0.0117188 (119/144)
+    #
+    # 113.7 is taken because it separates the most of them and because it is
+    # still small enough to be SAFE: the port builds its frequency table in f64
+    # where upstream builds it in f32 (an annotated exception, see
+    # `TimestepEmbedding`), and at 500 that difference alone already flips one of
+    # the 256 projection entries after narrowing. At 113.7 it flips none, so this
+    # arm measures the product's rounding and not the table's width.
+    #
+    # NOTHING ELSE ABOUT THE ARM CHANGES. Same module, same stream, same weights,
+    # same manifest as 5h; only the `timestep_scale_multiplier` PARAMETER is
+    # overwritten, on both sides.
+    TSSCALE_MULTIPLIER = 113.7
+    d5, _ = build()
+    with torch.no_grad():
+        d5.timestep_scale_multiplier.fill_(TSSCALE_MULTIPLIER)
+    y_ts, _ = run(d5.to(torch.bfloat16))
+    assert y_ts.dtype == torch.bfloat16
+
+    # THE REJECTED ANSWER IS UPSTREAM RE-RUN, not a re-derivation. Handing
+    # `forward` a WIDE `timestep` tensor is exactly the pre-row hypothesis and
+    # nothing else: `timestep * multiplier.to(sample)` then promotes to f64 and
+    # the product is never rounded, while every other tensor in the module stays
+    # bf16. `get_timestep_embedding` widens whatever it is given to f32 anyway
+    # (timestep_embedding.py:91), so this arm changes the VALUE of the scaled
+    # timestep and no dtype downstream of it.
+    d6, _ = build()
+    with torch.no_grad():
+        d6.timestep_scale_multiplier.fill_(TSSCALE_MULTIPLIER)
+    wide = torch.full((VIDEO_LATENT[0],), VIDEO_DEC_DECODE_TIMESTEP, dtype=torch.float64)
+    y_ts_rej, _ = run(d6.to(torch.bfloat16), timestep=wide)
+
+    sep_ts = float((y_ts.float() - y_ts_rej.float()).abs().max())
+    # The two scalars themselves, so a reader can see WHY it separates here and
+    # not at the stream's own multiplier.
+    _mb = float(torch.tensor([TSSCALE_MULTIPLIER]).to(torch.bfloat16)[0])
+    _tb = float(torch.tensor([VIDEO_DEC_DECODE_TIMESTEP]).to(torch.bfloat16)[0])
+    ts_rule = float(torch.tensor([_tb * _mb]).to(torch.bfloat16)[0])
+    ts_wide = VIDEO_DEC_DECODE_TIMESTEP * _mb
+    print(f"[bf16 shallow] scaled timestep: rule {ts_rule!r} vs wide product "
+          f"{ts_wide!r}; whole-arm separation {sep_ts:g}", file=sys.stderr)
+    assert sep_ts > 0, (
+        "the wide-product hypothesis separates NOTHING even at multiplier "
+        f"{TSSCALE_MULTIPLIER}, so this section would gate the narrowing rule at "
+        "zero exactly as the stream's own multiplier does -- find a separating "
+        "value or record the rule as ungated, do not emit this"
+    )
+
+    out.write("// --- section 5i: the scaled-timestep rule at a SEPARATING multiplier ---\n")
+    out.write("inline constexpr double kLtx2VideoDecTsScaleMultiplier = "
+              + _cxx_float(TSSCALE_MULTIPLIER, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecTsScaleTimestep = "
+              + _cxx_float(VIDEO_DEC_DECODE_TIMESTEP, 9) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecTsScaleRuleValue = "
+              + _cxx_float(ts_rule, 17) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecTsScaleWideValue = "
+              + _cxx_float(ts_wide, 17) + ";\n")
+    out.write("inline constexpr double kLtx2VideoDecTsScaleRejectWideProduct = "
+              + _cxx_float(sep_ts, 9) + ";\n\n")
+    emit_f32(out, "kLtx2VideoDecTsScaleGolden", y_ts.float().numpy())
+    emit_f32(out, "kLtx2VideoDecTsScaleRejectedWideProductGolden", y_ts_rej.float().numpy())
 
 
 # ---------------------------------------------------------------------------

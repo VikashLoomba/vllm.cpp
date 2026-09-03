@@ -418,9 +418,14 @@ device numeric case to gate both codebooks at tier 3c; measure the end-to-end
 decode effect on the real checkpoint on `dgx:gpu0`; record the envelope's actual
 verdict per shape.
 
-**Out of scope and owed, not silently dropped:** the `(4, 2)` kernel port, the
-fused MoE arm, `kExl3HadR` on ROCm, the four-shape coverage of the regular
-kernel's shape table. Each is under `## Owed` with its reason.
+**Out of scope and owed, not silently dropped:** the `(4, 2)` kernel port and
+the fused MoE arm. Each is under `## Owed` with its reason. Two more items sat
+in that list and neither is owed here any longer: the four-shape coverage of the
+regular kernel's shape table CLOSED under `QUANT-EXL3` W5
+([#2749](https://github.com/mudler/vllm.cpp/issues/2749)), and `kExl3HadR` on
+ROCm was WITHDRAWN as a false record
+([#2757](https://github.com/mudler/vllm.cpp/issues/2757)). `## Owed` carries
+both, struck through with the reason.
 
 ## Upstream chain
 

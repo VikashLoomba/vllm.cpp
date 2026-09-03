@@ -292,7 +292,29 @@ can see a missing kernel.
 NEGATIVE: a kernel with the skip removed writes BEFORE the cache, never inside
 it, and every word the case compared was still correct. The case now brackets
 the cache with guard bands and asserts both untouched, so an out-of-range write
-is seen. Re-measured under rc job `e88fd335`.
+is seen.
+
+**The re-measurement is PENDING, not a pass.** It is rc job `e88fd335`, queued
+on `strix:gpu0`. Until it reports, this wave has four killed mutations and one
+repaired-but-unre-measured case, and nothing here says otherwise.
+
+### Also pending on `e88fd335`: what an unregistered ROCm op actually does here
+
+#2715 says the missing ops are a slow path on gfx1151 and a refusal elsewhere.
+That may be stale by one same-day commit. `6b97a6800` (#2511) narrowed the
+managed-allocation branch to `PageableMemoryAccess == 1` and made the unified
+claim FOLLOW the allocator (`include/vt/rocm/rocm_arch.h:180-195`); gfx1151
+reports that attribute 0; and `docs/ROCM.md:83-85` states outright that gfx1151
+and gfx1103 therefore get "plain `hipMalloc` and no reference tier". The
+`9f3e6e223` GLM-5.3 run that observed five ops ON the tier is NOT an ancestor of
+that commit — `git merge-base --is-ancestor 6b97a6800 9f3e6e223` answers no — so
+it measured the older allocator.
+
+If the board confirms it, the missing MLA ops are a **REFUSAL** on this part and
+W2/W3 block GENERATION, not only measurement. **This spec does not assert that.**
+The branch adds a case that asks `vt::ReferenceTierEligible(kROCM)` — the public,
+side-effect-free safety gate — and asserts the consequence in both directions, so
+whichever answer the board gives is measured rather than derived.
 
 ## Now
 

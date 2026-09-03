@@ -13,7 +13,7 @@ these two helpers.
 
 ## The defect, grounded
 
-| Where | What |
+| Where (line anchors read at this row's base, `8e582a5f9`) | What |
 |---|---|
 | `include/vllm/model_executor/models/dense_attn_block.h:342-360` | The wide copy. 49 translation units under `src/vllm/model_executor/models/` include this header. |
 | `src/vllm/model_executor/models/qwen3_5.cpp:1359-1379` | A private twin with the same body. The header flags its existence at `:222-223`; `qwen3_5.cpp` explains why it stays private at `:790`. |
@@ -56,8 +56,7 @@ Two repairs are available.
   `OwnedTensor::d_dev_f32`, so the synchronise runs **once per distinct weight
   per process**, not per token and not per forward. The f32 upcast serves the
   per-head q/k norms, the GDN `conv1d_weight` and the GDN `norm_weight`:
-  `PrepareBf16Resident` (`qwen3_5.cpp:8706-8760`) passes exactly two of them per
-  layer, so the added drains are `2 * n_layers` for the whole process.
+  `PrepareBf16Resident` passes exactly two of them per layer, so the added drains are `2 * n_layers` for the whole process.
 
 **What is NOT claimed: the wall-clock cost was not measured.** No device
 measurement was taken for this change. This box is CPU-only, where `Copy` is a
@@ -104,14 +103,14 @@ holds the poison when the function returns.
 Cases:
 
 1. **Through a production entry point.** `Qwen3_5DenseModel::PrepareBf16Resident`
-   is a real load-time hook (`qwen3_5_dense_weights.cpp:183` calls it) and it
+   is a real load-time hook (`StageAndReleaseLoadedDense` calls it) and it
    passes `attn.q_norm` and `attn.k_norm` to the qwen3_5.cpp helper. After it
    returns, `d_dev_f32` must hold the f32 upcast of the weight and must not be in
    the backend's pending queue.
 2. **The header copy**, `dense_attn::ResidentWeightF32`, driven directly. Its own
-   production callers are `DenseAttnBlock` (`dense_attn_block.h:602-604`,
-   `:646-648`) on every attention layer of the 49 models that include the header,
-   and driving one of those needs full attention metadata and a KV cache. This
+   production callers are `DenseAttnBlock`'s four `attn_f32 ? ResidentWeightF32`
+   sites, on every attention layer of the 49 models that include the header, and
+   driving one of those needs full attention metadata and a KV cache. This
    case therefore calls the inline helper directly and is labelled as doing so.
    It shares one body with case 1 after this change, which is what makes case 1's
    production evidence carry.
@@ -194,6 +193,59 @@ This becomes real the day a backend that answers `DeviceMemoryIsHostAddressable(
 true gains an asynchronous `Copy`. It has no issue because there is no defect to
 track, and filing one would put an unowned false positive into an intake that
 already carries six issues the tree had answered.
+
+## Outcome
+
+Landed as one shared body plus one `Synchronize`. What was measured, and what was
+rejected:
+
+**The gate.** RED on the pre-fix tree at both counts -- 3 cases with 2 failed,
+17 assertions with 6 failed. GREEN after: 3 of 3 and 17 of 17. The 30 test
+targets whose sources reach `dense_attn_block.h`, `dense_device_glue.h`,
+`qwen3_5_internal.h`, `ResidentWeightF32`, `StageWeightForTest` or
+`PrepareBf16Resident` were built and run: 0 failing binaries.
+
+**The mutations**, each rebuilt before it was run and each restored with the
+restoration verified by `sha256sum -c` against a baseline taken at the fix
+commit:
+
+| # | Mutation | Build | Result |
+|---|---|---|---|
+| M1 | delete `d.b.Synchronize(d.q)` from `InstallResidentF32` | rc 0 | 2 of 3 cases, 6 of 17 assertions FAIL |
+| M2 | move the `Synchronize` after the `shared_ptr` install | rc 0 | GREEN 3/3, 17/17 |
+| M3 | delete `f32(attn.q_norm)` / `f32(attn.k_norm)` from `PrepareBf16Resident` | rc 0 | case 1 FAILS, 1 of 12 assertions (a `REQUIRE` ends the case) |
+| M4 | revert the fix AND make the fixture's `Copy` eager | rc 0 | GREEN 3/3, 17/17 |
+
+**M4 is the finding worth keeping.** With an eager `Copy` -- which is exactly
+what the CPU backend does -- the UNFIXED tree is fully green. A CPU-only host
+cannot see this defect at all, and that is a property of the box rather than a
+weakness of the case. It is why the fixture had to simulate deferral to gate
+anything, and why the gate is stated as structural and ordering rather than as
+an observation of the race.
+
+**M2 is the second one.** Moving the drain one statement later leaves the gate
+green, and it should: the source is still alive there. A gate that reddened on
+M2 would be pinning a line rather than the guarantee.
+
+**Rejected: the batched drain.** `StageAndReleaseLoadedDense` already
+synchronises once after `PrepareBf16Resident` returns, and it was tempting to
+call that sufficient. It is not, and the reason is the whole issue: by the time
+it runs, every `std::vector<float>` the loop created has been destroyed. A
+deferred drain is the shape `glm5_next_kv.cpp` rejects, and this one is that
+shape spread over an entire model.
+
+**Rejected: owning the staging buffer.** See `## The design call` above. The
+short form is that `vt::Backend` gives no way to know when a copy retired, so
+ownership has no release point short of the model's lifetime.
+
+**Not measured: the wall-clock cost of the drain.** Stated as unmeasured rather
+than estimated, because a number produced on a host where `Synchronize` is a
+no-op would be a fabrication wearing a measurement's clothes.
+
+**Not run: the full `ctest`.** Each test binary is 26.6 MB and the box had 14 GB
+free at 97% full; 661 of them need about 17.6 GB, and an ENOSPC makes checkers
+emit false policy refusals rather than verdicts. The 30 reachable suites were run
+instead. This is a narrower gate than a full `ctest` and is recorded as such.
 
 ## Stop conditions
 

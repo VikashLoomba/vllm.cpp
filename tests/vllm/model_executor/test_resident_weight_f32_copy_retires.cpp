@@ -208,8 +208,9 @@ int Mismatches(const OwnedTensor& w, const std::vector<float>& expect) {
 // `Qwen3_5DenseModel::PrepareBf16Resident` is a real load-time hook, not a test
 // seam: `StageAndReleaseLoadedDense` calls it (`qwen3_5_dense_weights.cpp:183`)
 // and it hands `attn.q_norm` and `attn.k_norm` to the qwen3_5.cpp copy of
-// `ResidentWeightF32` (`qwen3_5.cpp:8752-8753`). Nothing here constructs the
-// helper's inputs by hand and calls it directly.
+// `ResidentWeightF32` -- grep `f32(attn.q_norm)` in `PrepareBf16Resident` rather
+// than trusting a line number, which goes stale inside its own pull request.
+// Nothing here constructs the helper's inputs by hand and calls it directly.
 //
 // It also shows why the drain that ALREADY exists is not the repair.
 // `StageAndReleaseLoadedDense` synchronises once, AFTER this function returns --
@@ -250,10 +251,11 @@ TEST_CASE("PrepareBf16Resident: each f32 upcast copy RETIRES before its source d
 // CASE 2 -- THE HEADER COPY, and this one is a DIRECT CALL.
 //
 // `dense_attn::ResidentWeightF32` is reached in production from `DenseAttnBlock`
-// (`dense_attn_block.h:602-604` and `:646-648`) on every attention layer of the
-// 49 translation units that include the header, and driving one of those needs
-// full attention metadata and a paged KV cache. So this case calls the inline
-// helper directly and says so rather than dressing it up.
+// -- four call sites, `grep -n 'attn_f32 ? ResidentWeightF32' dense_attn_block.h`
+// -- on every attention layer of the 49 translation units that include the
+// header, and driving one of those needs full attention metadata and a paged KV
+// cache. So this case calls the inline helper directly and says so rather than
+// dressing it up.
 //
 // What makes case 1's production evidence carry to here is that after #2711 both
 // helpers install through ONE body, `dense_attn::InstallResidentF32`. This case

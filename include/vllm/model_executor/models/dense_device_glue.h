@@ -329,8 +329,9 @@ class DBuf {
 // the other one.
 inline void InstallResidentF32(Dev d, const OwnedTensor& w,
                                std::vector<float> f) {
-  // Aliasing is a CPU property and not a not-CUDA one (#1946): kMETAL, kVULKAN
-  // and kXPU all reach the upload arm below.
+  // Aliasing is a CPU property and not a not-CUDA one (#125, #1946): the
+  // predicate this replaced was `!is_cuda()`, which handed a plain heap pointer
+  // to kMETAL, kVULKAN and kXPU. All three reach the upload arm below.
   if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
     auto* buf = new std::vector<float>(std::move(f));
     w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });

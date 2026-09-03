@@ -162,9 +162,19 @@ std::vector<uint8_t> PilResizeBicubicRgb(const uint8_t* src, int64_t in_h,
         const int64_t* k =
             &c.kk[static_cast<size_t>(xx) * static_cast<size_t>(c.ksize)];
         // Seeded with the rounding half, exactly as upstream does. The
-        // accumulator is int64 where upstream uses int: with 8-bit inputs and
-        // weights normalized to sum 1, `sum |k| <= 1.25` for this kernel, so
-        // |acc| stays under 1.34e9 and inside int32 anyway. The wider type
+        // accumulator is int64 where upstream uses int, and the widening is
+        // safe because `sum |k|` is bounded even though the weights are only
+        // normalized to sum ONE. 1.25 is the four-tap phase-0.5 value
+        // (`2*0.5625 + 2*0.0625`) and it is NOT the bound: once
+        // `filterscale > 1` the raw weights no longer sum to 1, and dividing a
+        // truncated window by a small row sum amplifies its magnitudes past
+        // that. Swept over every `(in, out)` in `1..800 x 1..800` (640,000
+        // pairs): the supremum is 1.268771, at `in = 208`, `out = 193`, output
+        // index 96 — an INTERIOR window — with normalized taps
+        // (-0.067193, +0.567193, +0.567193, -0.067193). At `sum |k| <= 1.27`,
+        // `|acc| <= 255 * 1.27 * 2^22 + 2^21`, about 1.36e9: inside int32's
+        // 2.15e9, and inside PIL's own `clip8` table, which covers `acc >> 22`
+        // over `[-640, 639]` against a worst index of 324. The wider type
         // removes an overflow that cannot occur; it does not change an answer.
         int64_t s0 = kHalf, s1 = kHalf, s2 = kHalf;
         for (int64_t x = 0; x < xmax; ++x) {

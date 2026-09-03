@@ -1693,10 +1693,19 @@ std::vector<unsigned char> ResizeExact(const std::vector<unsigned char>& src,
 // levels when it was first written without the clamp. What is left out is only
 // step 6, so the residual against the implementation is the rounding alone.
 //
-// This arm exists because the exact reference above and the implementation
-// could in principle share a MISREADING of the quantization and still agree; a
-// defect in the geometry — a half-pixel centre, a dropped support scaling, an
-// unnormalized row — moves this arm too, and by far more than rounding can.
+// WHAT THIS ARM CROSS-CHECKS, AND WHAT IT DOES NOT. It exists because the exact
+// reference above and the implementation could in principle share a MISREADING
+// of the QUANTIZATION — steps 6 and 7 — and still agree. This arm computes
+// neither, so such a misreading moves it.
+//
+// It supplies NO independence on the GEOMETRY, and it must not be read as if it
+// did: `ResizeContinuous` calls `ref_resample::Weights`, which is the same
+// function `ResizeExact` calls. The two arms differ by step 6 alone. Had the
+// centre been read as `xx * scale` with no `+ 0.5` and written into BOTH
+// `PrecomputeCoeffs` and `Weights`, every case here would report `maxe == 0`
+// and `maxc == 0.0`, both CHECKs green, with every served image shifted half an
+// output pixel. Steps 1-5 rest on ONE reading of `Resample.c` plus the Pillow
+// cross-check recorded as evidence in spec §4.13.4, which is not a gate.
 std::vector<double> ResizeContinuous(const std::vector<unsigned char>& src,
                                      long ih, long iw, long oh, long ow) {
   std::vector<double> cur(static_cast<std::size_t>(ih * iw * 3));
@@ -1749,11 +1758,15 @@ std::vector<double> ResizeContinuous(const std::vector<unsigned char>& src,
 //     cubic, and the difference is not a rounding difference on a downscale.
 //
 //     A MEAN error bound is the wrong instrument here, so this case asserts the
-//     PER-PIXEL MAXIMUM against two independent references — one that
-//     reproduces upstream's 22-bit fixed point, where the bound is EXACT
-//     equality (0 levels of 255), and one that stops before the fixed point,
-//     where the bound is 2 levels because that is all the intermediate
-//     rounding can move a pixel. Four defect shapes a tolerance alone cannot
+//     PER-PIXEL MAXIMUM against two reference ARMS — one that reproduces
+//     upstream's 22-bit fixed point, where the bound is EXACT equality (0
+//     levels of 255), and one that stops before the fixed point, where the
+//     bound is 2 levels because that is all the intermediate rounding can move
+//     a pixel. Both are independent of the IMPLEMENTATION; they are not
+//     independent of EACH OTHER, because both build their weights with
+//     `ref_resample::Weights`, so what the pair cross-checks is the
+//     quantization and not the geometry (see the note above
+//     `ResizeContinuous`). Four defect shapes a tolerance alone cannot
 //     see get their own arms: a half-pixel centre, an axis swap (every case is
 //     non-square in and out), an unnormalized weight row (a near-uniform scale
 //     a relative bound absorbs), and the 0/255 saturation ends.
@@ -1855,76 +1868,125 @@ TEST_CASE("dots3-note W6c: the bicubic resampler is PIL's, per-pixel and at both
   CHECK(saw_255);
 
   // THE PROCESSOR ACTUALLY USES IT, at the RESIZED stride. Everything above
-  // measures `PilResizeBicubicRgb` in isolation; this arm measures what
-  // `ProcessImage` patchified. It is the arm that catches a resize that ran and
-  // was then read back at the SOURCE row stride — a shear that leaves the grid,
-  // the patch count, the placeholder run and the served status all valid.
+  // measures `PilResizeBicubicRgb` in isolation; the two arms below measure
+  // what `ProcessImage` patchified. They are the arms that catch a resize that
+  // ran and was then read back at the SOURCE row stride — a shear that leaves
+  // the grid, the patch count, the placeholder run and the served status all
+  // valid.
   //
   // The check is a full RECONSTRUCTION: undo the per-channel normalization and
   // undo `pre_pixel_shuffle`'s transpose (`processor.py:185-197`), which puts
   // every element back at the resized-image coordinate it came from, then
   // compare the whole image to the reference resample byte for byte.
-  SUBCASE("ProcessImage patchifies the RESIZED image, at the resized stride") {
-    const TinySpec ps;
-    const TinyCheckpoint ck(FixtureDir(), ps);
-    const vllm::multimodal::Dots3NoteProcessorConfig pcfg =
-        vllm::multimodal::LoadDots3NoteProcessorConfig(
-            ck.dir() + "/preprocessor_config.json", ck.config_path(), "tiny");
-    const vllm::multimodal::Dots3NoteImageProcessor proc(pcfg);
-    REQUIRE(pcfg.pre_pixel_shuffle);
+  //
+  // It is one helper called twice because the two arms differ ONLY in the
+  // geometry the processor resolves, and that difference is the whole point:
+  // see the downscale arm below.
+  const auto process_image_matches_reference =
+      [&make](const TinySpec& ps, long ih, long iw, long want_rh,
+              long want_rw) {
+        const TinyCheckpoint ck(FixtureDir(), ps);
+        const vllm::multimodal::Dots3NoteProcessorConfig pcfg =
+            vllm::multimodal::LoadDots3NoteProcessorConfig(
+                ck.dir() + "/preprocessor_config.json", ck.config_path(),
+                "tiny");
+        const vllm::multimodal::Dots3NoteImageProcessor proc(pcfg);
+        REQUIRE(pcfg.pre_pixel_shuffle);
 
+        const std::vector<unsigned char> src = make(ih, iw, 2);
+        const auto rs = vllm::multimodal::Dots3NoteResizedSize(
+            ih, iw, proc.factor(), pcfg.min_pixels, pcfg.max_pixels);
+        const long rh = static_cast<long>(rs[0]), rw = static_cast<long>(rs[1]);
+        REQUIRE(rh == want_rh);
+        REQUIRE(rw == want_rw);
+        const std::vector<unsigned char> want =
+            ref_resample::ResizeExact(src, ih, iw, rh, rw);
+
+        const vllm::multimodal::ImageKwargs kw =
+            proc.ProcessImage(src.data(), ih, iw);
+        const int64_t patch = pcfg.patch_size, m = pcfg.merge_size;
+        const int64_t gh = rh / patch, gw = rw / patch;
+        const int64_t Gw = gw / m;
+        REQUIRE(kw.image_grid_thw[1] == gh);
+        REQUIRE(kw.image_grid_thw[2] == gw);
+        REQUIRE(kw.num_patches == gh * gw);
+
+        long worst = 0;
+        for (int64_t bh = 0; bh < gh / m; ++bh)
+          for (int64_t bw = 0; bw < Gw; ++bw)
+            for (int64_t mh = 0; mh < m; ++mh)
+              for (int64_t mw = 0; mw < m; ++mw) {
+                const int64_t r = ((bh * Gw + bw) * m + mh) * m + mw;
+                for (int64_t c = 0; c < 3; ++c) {
+                  const double shift =
+                      pcfg.image_mean[static_cast<std::size_t>(c)] /
+                      pcfg.rescale_factor;
+                  const double sc =
+                      pcfg.image_std[static_cast<std::size_t>(c)] /
+                      pcfg.rescale_factor;
+                  for (int64_t ph = 0; ph < patch; ++ph)
+                    for (int64_t pw = 0; pw < patch; ++pw) {
+                      const int64_t k = (c * patch + ph) * patch + pw;
+                      const double got =
+                          static_cast<double>(
+                              kw.pixel_values_f32[static_cast<std::size_t>(
+                                  r * kw.patch_feature_dim + k)]) *
+                              sc +
+                          shift;
+                      const long y = (bh * m + mh) * patch + ph;
+                      const long x = (bw * m + mw) * patch + pw;
+                      const long ref = static_cast<long>(
+                          want[static_cast<std::size_t>((y * rw + x) * 3 + c)]);
+                      const long d =
+                          std::abs(static_cast<long>(std::lround(got)) - ref);
+                      if (d > worst) worst = d;
+                    }
+                }
+              }
+        return worst;
+      };
+
+  SUBCASE("ProcessImage patchifies the RESIZED image, at the resized stride") {
     // 6x14 is the served fixture's own non-conformant shape: NEITHER side is a
     // multiple of `factor` = 4, and the two sides differ, so an axis swap
     // cannot survive either.
-    const long ih = 6, iw = 14;
-    const std::vector<unsigned char> src = make(ih, iw, 2);
-    const auto rs = vllm::multimodal::Dots3NoteResizedSize(
-        ih, iw, proc.factor(), pcfg.min_pixels, pcfg.max_pixels);
-    const long rh = static_cast<long>(rs[0]), rw = static_cast<long>(rs[1]);
-    REQUIRE(rh == 8);
-    REQUIRE(rw == 16);
-    const std::vector<unsigned char> want =
-        ref_resample::ResizeExact(src, ih, iw, rh, rw);
-
-    const vllm::multimodal::ImageKwargs kw =
-        proc.ProcessImage(src.data(), ih, iw);
-    const int64_t patch = pcfg.patch_size, m = pcfg.merge_size;
-    const int64_t gh = rh / patch, gw = rw / patch;
-    const int64_t Gw = gw / m;
-    REQUIRE(kw.image_grid_thw[1] == gh);
-    REQUIRE(kw.image_grid_thw[2] == gw);
-    REQUIRE(kw.num_patches == gh * gw);
-
-    long worst = 0;
-    for (int64_t bh = 0; bh < gh / m; ++bh)
-      for (int64_t bw = 0; bw < Gw; ++bw)
-        for (int64_t mh = 0; mh < m; ++mh)
-          for (int64_t mw = 0; mw < m; ++mw) {
-            const int64_t r = ((bh * Gw + bw) * m + mh) * m + mw;
-            for (int64_t c = 0; c < 3; ++c) {
-              const double shift =
-                  pcfg.image_mean[static_cast<std::size_t>(c)] / pcfg.rescale_factor;
-              const double sc =
-                  pcfg.image_std[static_cast<std::size_t>(c)] / pcfg.rescale_factor;
-              for (int64_t ph = 0; ph < patch; ++ph)
-                for (int64_t pw = 0; pw < patch; ++pw) {
-                  const int64_t k = (c * patch + ph) * patch + pw;
-                  const double got =
-                      static_cast<double>(
-                          kw.pixel_values_f32[static_cast<std::size_t>(
-                              r * kw.patch_feature_dim + k)]) *
-                          sc +
-                      shift;
-                  const long y = (bh * m + mh) * patch + ph;
-                  const long x = (bw * m + mw) * patch + pw;
-                  const long ref = static_cast<long>(
-                      want[static_cast<std::size_t>((y * rw + x) * 3 + c)]);
-                  const long d = std::abs(static_cast<long>(std::lround(got)) - ref);
-                  if (d > worst) worst = d;
-                }
-            }
-          }
+    const long worst = process_image_matches_reference(
+        TinySpec{}, dots3_tiny::kOddImageH, dots3_tiny::kOddImageW,
+        dots3_tiny::kOddResizedH, dots3_tiny::kOddResizedW);
     MESSAGE("W6c ProcessImage vs reference resample: max |level| = ", worst);
+    CHECK(worst == 0);
+  }
+
+  // THE DOWNSCALE ARM AT THE PROCESSOR, and the reason it is a separate case.
+  //
+  // Every other resize that reaches `ProcessImage` is an UPSCALE on both axes,
+  // because `Dots3NoteResizedSize` only rounds each side to a multiple of
+  // `factor`. On an upscale `filterscale = max(1, in/out)` is 1, the support
+  // stays 2.0, and this resampler is bit-for-bit the textbook four-tap cubic:
+  // 6x14 -> 8x16 is BYTE-IDENTICAL with the support scaling deleted, so the
+  // case above cannot see that deletion at all. The single downscale that used
+  // to reach here, 9x9 -> 8x8, carries a CONSTANT image, which every normalized
+  // weight set preserves by construction.
+  //
+  // `factor` is 28 on the released checkpoint, so essentially every real
+  // request DOWNSCALES. This arm puts that regime on the production path:
+  // `kBudgetMaxPixels` makes `Dots3NoteResizedSize` resolve 24x96 to 4x16, a 6x
+  // downscale on both axes with a 25-tap support-scaled window per output
+  // pixel, over a TEXTURED image, and compares the patchified result to the
+  // independent reference byte for byte.
+  SUBCASE("ProcessImage DOWNSCALES through the support-scaled window") {
+    TinySpec ps;
+    ps.p_max_pixels = dots3_tiny::kBudgetMaxPixels;
+    // The premise, asserted rather than assumed: this really is the regime the
+    // upscale arm cannot reach. `filterscale` is `in/out` on both axes and it
+    // is 6, so `support = 12` and `ksize = 25` where the arm above has 2 and 5.
+    REQUIRE(dots3_tiny::kBigImageH / dots3_tiny::kBigResizedH == 6);
+    REQUIRE(dots3_tiny::kBigImageW / dots3_tiny::kBigResizedW == 6);
+    const long worst = process_image_matches_reference(
+        ps, dots3_tiny::kBigImageH, dots3_tiny::kBigImageW,
+        dots3_tiny::kBigResizedH, dots3_tiny::kBigResizedW);
+    MESSAGE("W6c ProcessImage 6x DOWNSCALE vs reference resample: max |level| = ",
+            worst);
     CHECK(worst == 0);
   }
 

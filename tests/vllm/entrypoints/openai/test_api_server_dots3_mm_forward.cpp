@@ -596,11 +596,15 @@ TEST_CASE("dots3-note W6c: two different NON-CONFORMANT images give two differen
 //     SAY THE LIMIT OUT LOUD, because it is the same shape as the defect this
 //     case repairs. Both legs run the SAME resampler, so a defect INSIDE it
 //     cancels: with a half-pixel centre, with the support scaling dropped and
-//     with the weight normalization skipped, this suite reads 15/15 and 216/216
-//     while `test_dots3_note_vision` reads 145, 96 and 177 failed assertions.
+//     with the weight normalization skipped, this suite reads 16/16 and 240/240
+//     while `test_dots3_note_vision` reads 182, 121 and 214 failed assertions.
 //     That division is deliberate -- the served suite answers "was it called",
 //     the reference gate answers "was it right" -- and it is written here so a
 //     reader does not mistake a green served suite for a numeric verdict.
+//
+//     AND THE GEOMETRY HERE IS AN UPSCALE, which case 2e is about: 6x14 ->
+//     8x16 puts `filterscale = max(1, in/out)` at 1, so this case is
+//     BYTE-IDENTICAL with the support scaling deleted.
 // ---------------------------------------------------------------------------
 TEST_CASE("dots3-note W6c: a served NON-CONFORMANT image equals its pre-resized twin") {
   Served s;
@@ -656,6 +660,110 @@ TEST_CASE("dots3-note W6c: a served NON-CONFORMANT image equals its pre-resized 
   }
   MESSAGE("6x14 logprob0 ", ca.at(0).dump());
   MESSAGE("8x16 logprob0 ", cb.at(0).dump());
+}
+
+// ---------------------------------------------------------------------------
+// 2e. THE SERVED REQUEST THAT ACTUALLY DOWNSCALES (W6c, #2537).
+//
+//     Cases 2b, 2c and 2d all resize 6x14 to 8x16, which is an UPSCALE on both
+//     axes. `filterscale = max(1, in/out)` is 1 there, the support stays 2.0,
+//     and PIL's resampler is bit-for-bit the textbook four-tap cubic: 6x14 ->
+//     8x16 is BYTE-IDENTICAL with the support scaling deleted. So the served
+//     suite exercised none of what `pil_resize.cpp` exists for, while
+//     `factor = 28` on the released checkpoint means essentially every real
+//     request downscales.
+//
+//     `kBudgetMaxPixels` is what forces the other regime, and it forces it the
+//     way production does: `max_pixels` comes off `preprocessor_config.json`,
+//     so the served chain resolves it itself. 24x96 under a 64-pixel budget is
+//     4x16 -- a 6x downscale on both axes, a 25-tap support-scaled window per
+//     output pixel, and FOUR placeholder tokens rather than the eight the 6x14
+//     cases produce.
+//
+//     THE SAME LIMIT AS 2d, and for the same reason: both legs run the same
+//     resampler, so a defect INSIDE it cancels here. What this case adds is the
+//     REGIME -- the served path now reaches the support-scaled window at all --
+//     and the reachability arm inside it. The numeric verdict on the downscale
+//     is `test_dots3_note_vision`'s "ProcessImage DOWNSCALES through the
+//     support-scaled window", which compares it to the independent reference.
+// ---------------------------------------------------------------------------
+TEST_CASE("dots3-note W6c: a served image the PIXEL BUDGET downscales 6x is resized and served") {
+  TinySpec spec;
+  spec.p_max_pixels = dots3_tiny::kBudgetMaxPixels;
+  Served s(spec);
+  MmServerHarness h(s.config, *s.model, Fixture());
+  std::ostringstream log;
+  REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+          oai::MultiModalChatInstall::kInstalled);
+
+  // The premise, asserted rather than assumed. This is a DOWNSCALE by 6 on both
+  // axes, which is the only thing that puts `filterscale` above 1, and the two
+  // sides stay unequal on both ends so an axis swap cannot survive it.
+  const int64_t factor = TinySpec{}.v_patch * TinySpec{}.v_merge;
+  const std::array<int64_t, 2> rs = vllm::multimodal::Dots3NoteResizedSize(
+      dots3_tiny::kBigImageH, dots3_tiny::kBigImageW, factor, spec.p_min_pixels,
+      spec.p_max_pixels);
+  REQUIRE(rs[0] == dots3_tiny::kBigResizedH);
+  REQUIRE(rs[1] == dots3_tiny::kBigResizedW);
+  REQUIRE(dots3_tiny::kBigImageH / rs[0] == 6);
+  REQUIRE(dots3_tiny::kBigImageW / rs[1] == 6);
+  REQUIRE(rs[0] != rs[1]);
+
+  const std::vector<uint8_t> big = dots3_tiny::FixtureImageHW(
+      dots3_tiny::kBigImageH, dots3_tiny::kBigImageW, /*variant=*/0);
+  const std::vector<uint8_t> pre = vllm::multimodal::PilResizeBicubicRgb(
+      big.data(), dots3_tiny::kBigImageH, dots3_tiny::kBigImageW,
+      dots3_tiny::kBigResizedH, dots3_tiny::kBigResizedW);
+  REQUIRE(pre.size() == static_cast<std::size_t>(dots3_tiny::kBigResizedH *
+                                                 dots3_tiny::kBigResizedW * 3));
+  // The pre-resized twin is CONFORMANT and inside the same budget, so its own
+  // request takes the processor's identity path and is not resampled again.
+  REQUIRE(dots3_tiny::kBigResizedH % factor == 0);
+  REQUIRE(dots3_tiny::kBigResizedW % factor == 0);
+  REQUIRE(dots3_tiny::kBigResizedH * dots3_tiny::kBigResizedW <=
+          spec.p_max_pixels);
+
+  const ApiServer::DispatchResult a = h.server.handle_chat_completions(
+      ChatBodyWithImage(4,
+                        RawImageDataUri(dots3_tiny::kBigImageH,
+                                        dots3_tiny::kBigImageW, big),
+                        true)
+          .dump());
+  const ApiServer::DispatchResult b = h.server.handle_chat_completions(
+      ChatBodyWithImage(4,
+                        RawImageDataUri(dots3_tiny::kBigResizedH,
+                                        dots3_tiny::kBigResizedW, pre),
+                        true)
+          .dump());
+  INFO("24x96: ", a.body);
+  INFO("4x16: ", b.body);
+  REQUIRE(a.status == 200);
+  REQUIRE(b.status == 200);
+
+  const json ja = json::parse(a.body);
+  const json jb = json::parse(b.body);
+  // `<|img|>` + FOUR image tokens + `<|endofimg|>` + "hello": the placeholder
+  // run follows the DOWNSCALED grid (1, 2, 8), not the 24x96 one, which would
+  // be a (1, 12, 48) grid, 144 tokens, and would not fit `kMaxModelLen` at
+  // all.
+  CHECK(ja.at("usage").at("prompt_tokens") ==
+        3 + dots3_tiny::kBigExpectedImageTokens);
+  REQUIRE(ja.at("usage").at("prompt_tokens") ==
+          jb.at("usage").at("prompt_tokens"));
+
+  const json& ca = ja.at("choices").at(0).at("logprobs").at("content");
+  const json& cb = jb.at("choices").at(0).at("logprobs").at("content");
+  REQUIRE(ca.size() == cb.size());
+  REQUIRE(ca.size() > 0);
+  for (std::size_t i = 0; i < ca.size(); ++i) {
+    CAPTURE(i);
+    // Bit-for-bit, exactly as in 2d: anything but equality means the served
+    // 24x96 leg patchified something other than the resample.
+    CHECK(ca.at(i).at("logprob").get<double>() ==
+          cb.at(i).at("logprob").get<double>());
+  }
+  MESSAGE("24x96 logprob0 ", ca.at(0).dump());
+  MESSAGE("4x16 logprob0 ", cb.at(0).dump());
 }
 
 // ---------------------------------------------------------------------------

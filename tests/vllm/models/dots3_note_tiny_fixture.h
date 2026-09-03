@@ -99,9 +99,18 @@ struct TinySpec {
   // The processor's PIXEL BUDGET, written into `preprocessor_config.json`.
   // The defaults leave `Dots3NoteResizedSize` free to round each side to a
   // multiple of `factor` with no clamp, which is what the conformant fixture
-  // image wants. W6c's downscale case lowers `p_max_pixels` instead of shipping
-  // a large image, because the clamp is the only way to force a resize RATIO
-  // big enough for PIL's support scaling to dominate.
+  // image wants.
+  //
+  // W6c's DOWNSCALE cases lower `p_max_pixels` to `kBudgetMaxPixels` instead of
+  // shipping a large image, because the clamp is the only way to force a resize
+  // RATIO big enough for PIL's support scaling to dominate. Rounding alone
+  // never can: `out = round(in / factor) * factor` moves a side by less than
+  // `factor`, so the largest downscale it can produce at all is
+  // `1.5 - 1/factor`, and on this fixture's `factor` of 4 the sizes it actually
+  // produces are UPSCALES, where `filterscale = max(1, in/out)` is exactly 1
+  // and the resampler is the four-tap kernel it is NOT there for.
+  // `kBigImageH` x `kBigImageW` under that budget is a 6x downscale on both
+  // axes -- see the constants below.
   int64_t p_min_pixels = 16;
   int64_t p_max_pixels = 1 << 20;
   std::string v_router_scoring_func = "sigmoid";
@@ -574,6 +583,36 @@ inline constexpr int64_t kOddImageW = 14;
 inline constexpr int64_t kOddResizedH = 8;
 inline constexpr int64_t kOddResizedW = 16;
 inline constexpr int64_t kOddExpectedImageTokens = 8;
+
+// THE BUDGET-DOWNSCALED GEOMETRY (W6c, #2537), and the reason it exists.
+//
+// Every resize the fixture constants above produce is an UPSCALE on both axes,
+// because `Dots3NoteResizedSize` rounds each side to a multiple of `factor` and
+// nothing else. On an upscale `filterscale = max(1, in/out)` is 1, the support stays
+// 2.0, and PIL's resampler degenerates to exactly the textbook four-tap cubic
+// that `pil_resize.h` spends thirty lines arguing it is not: measured, 6x14 ->
+// 8x16 is BYTE-IDENTICAL with the support scaling deleted. So the regime the
+// file exists for -- and the regime essentially every real request lands in,
+// since `factor` is 28 on the released checkpoint -- had no case reaching
+// `ProcessImage` at all.
+//
+// `kBudgetMaxPixels` is what forces it. `Dots3NoteResizedSize(24, 96, 4, 16,
+// 64)`: both sides already multiples of 4, so `rh * rw = 2304 > 64` takes the
+// `max_pixels` arm, `beta = sqrt(2304 / 64) = 6`, and each side floors to
+// `24/6 = 4` and `96/6 = 16`. That is a 6x downscale on BOTH axes, a
+// `filterscale` of 6, and a 25-tap window per output pixel. The grid is
+// (1, 2, 8) = 16 patches and 16 / (2*2) = FOUR placeholder tokens, and the
+// 4x16 result is itself conformant, so it can be served back as its own
+// pre-resized twin.
+//
+// The sides stay UNEQUAL through the whole chain (24 != 96, 4 != 16), so an
+// axis swap cannot survive this geometry either.
+inline constexpr int64_t kBudgetMaxPixels = 64;
+inline constexpr int64_t kBigImageH = 24;
+inline constexpr int64_t kBigImageW = 96;
+inline constexpr int64_t kBigResizedH = 4;
+inline constexpr int64_t kBigResizedW = 16;
+inline constexpr int64_t kBigExpectedImageTokens = 4;
 
 // An HWC uint8 RGB image whose value depends on BOTH coordinates and on the
 // channel, so a swapped axis, a dropped channel and a half-pixel shift each

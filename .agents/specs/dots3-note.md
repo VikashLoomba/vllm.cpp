@@ -4906,12 +4906,20 @@ here because "we skipped an optimization" and "we changed the maths" look the
 same in a diff.
 
 **The one widening, and its bound.** PIL accumulates in `int`. This port
-accumulates in `int64_t`. With 8-bit inputs and coefficients normalized to sum
-1, `sum |k| <= 1.25` for this kernel, so `|acc| <= 255 * 1.25 * 2²² + 2²¹`,
-about `1.34e9`, inside `int32`'s range; PIL itself relies on a tighter bound
-still, because its `clip8` lookup table only covers `acc >> 22` in `[-640, 639]`.
-The wider accumulator therefore removes an overflow that cannot occur rather
-than changing an answer.
+accumulates in `int64_t`. The weights are normalized to sum 1, which does NOT
+bound their magnitudes at 1: `1.25` is the four-tap phase-0.5 value
+(`2*0.5625 + 2*0.0625`), and once `filterscale > 1` the raw weights no longer
+sum to 1, so dividing a truncated window by a small row sum amplifies them past
+it. Swept over every `(in, out)` in `1..800 × 1..800` (640,000 pairs), the
+supremum of `sum |k|` is **1.268771**, at `in = 208`, `out = 193`, output index
+96 — an INTERIOR window — with normalized taps
+`(-0.067193, +0.567193, +0.567193, -0.067193)`. Taking `sum |k| <= 1.27`,
+`|acc| <= 255 * 1.27 * 2²² + 2²¹`, about `1.36e9`, inside `int32`'s `2.15e9`;
+PIL itself relies on a tighter bound still, because its `clip8` lookup table
+only covers `acc >> 22` in `[-640, 639]`, and the worst index the sweep produces
+is 324. The wider accumulator therefore removes an overflow that cannot occur
+rather than changing an answer. The conclusion is unchanged from the `1.25` this
+paragraph first carried; the constant was wrong and the margin absorbed it.
 
 **This is PIL's resampler and NOT torchvision's, and the two must not be
 confused.** `qwen3vl_processor.cpp` refuses its own resize (`:110-116`,
@@ -4948,9 +4956,20 @@ asserts these separately:
   fixed-point reference reproduces steps 1-7 above and the bound is EXACT
   equality — max error 0 levels — because both compute the same integer
   quantization. A second, purely double-precision reference that stops before
-  step 6 bounds the impl at 1 level, which is the most the fixed-point rounding
-  can move a pixel; that arm is what catches a defect the fixed-point reference
-  could only miss by sharing a misreading.
+  step 6 is asserted at **2 levels**, the bound the test carries; the DERIVED
+  ceiling is 1.13439 (§4.13.4) and the measured value 1.07588.
+- **What the two arms do and do not cross-check.** They are independent of the
+  IMPLEMENTATION. They are NOT independent of each other: `ResizeContinuous`
+  calls `ref_resample::Weights`, the same function `ResizeExact` calls, and the
+  two arms differ by step 6 alone. So the pair cross-checks the QUANTIZATION —
+  a shared misreading of steps 6-7 moves the continuous arm — and supplies no
+  independence on the GEOMETRY. Concretely: had the centre been read as
+  `xx * scale` with no `+ 0.5` and written into both `PrecomputeCoeffs` and
+  `Weights`, every case would report `maxe == 0` and `maxc == 0.0`, both CHECKs
+  green and the served suite green, with every image shifted half an output
+  pixel. Steps 1-5 therefore rest on ONE reading of `Resample.c` plus the Pillow
+  cross-check below, which is evidence and not a gate. That is the honest
+  position, and it is why the Pillow number is recorded at all.
 - **A NON-SQUARE image with a non-square target.** A transposed loop or an
   axis swap is invisible on a square test image and this row's existing
   fixture image is 8x8.
@@ -4968,6 +4987,31 @@ image is NOT a multiple of the fixture's `factor` returns 400 before W6c and 200
 with the placeholder count the resized grid implies after it, through
 `ApiServer::handle_chat_completions` on the server's default configuration.
 
+**And the served regime has to be the DOWNSCALE one, which it was not at first.**
+`Dots3NoteResizedSize` only rounds each side to a multiple of `factor`, so every
+resize the 6x14 fixture produces is an UPSCALE on both axes: `filterscale` is 1,
+the support stays 2.0, and the resampler degenerates to exactly the textbook
+four-tap cubic §4.13.1 spends its length arguing it is not. Measured: 6x14 ->
+8x16 is BYTE-IDENTICAL with the support scaling deleted. The one downscale that
+reached `ProcessImage`, 9x9 -> 8x8, carries a CONSTANT image, which every
+normalized weight set preserves by construction. So M3 — dropping the single
+property this unit exists for — left every `ProcessImage` and every served
+assertion passing, and only the isolated unit cases caught it. Since `factor` is
+28 on the released checkpoint, essentially every real request downscales, and
+the regime proven through the production entry point was the one users never
+hit.
+
+The repair is the fixture's `p_max_pixels`, lowered to `kBudgetMaxPixels = 64`,
+which is how production reaches this regime too: the budget comes off
+`preprocessor_config.json`. 24x96 under it resolves to 4x16 — a 6x downscale on
+both axes and a 25-tap support-scaled window — over a TEXTURED image, in two
+places. `test_dots3_note_vision`'s "ProcessImage DOWNSCALES through the
+support-scaled window" is the numeric arm against the independent reference, and
+it is what M3 has to RED. `test_openai_api_server_dots3_mm_forward`'s case 2e
+serves it over HTTP and carries the same twin-equality reachability arm as 2d,
+with the same limit: both legs run the same resampler, so a defect inside it
+still cancels there.
+
 **A local Pillow cross-check is recorded as evidence and is NOT the gate.**
 Pillow is not in the oracle table and carries no pin here, so a comparison
 against the copy installed on this host cannot gate anything. It is still the
@@ -4979,14 +5023,21 @@ recorded with its exact version and treated as evidence, not as a result.
 
 Measured 2026-09-03 on the developer host, CPU build,
 `-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF
--DCMAKE_BUILD_TYPE=Release`, base `origin/main` `e24805924`.
+-DCMAKE_BUILD_TYPE=Release`.
+
+**Every number in this section was RE-MEASURED on the repaired tree**, the one
+that carries the budget-downscale arms, at branch head `3fb874179` plus this
+change. The earlier table (base `origin/main` `e24805924`, vision
+`2f2b3798a663dcf9…` 13/13 21242, server `52ad05417f0d4a28…` 15/15 216) described
+the tree before those arms existed and is superseded rather than merged, because
+a table that mixes two trees cannot be read.
 
 **The clean tree.**
 
 | target | binary sha256 | cases | assertions |
 |---|---|---|---|
-| `test_dots3_note_vision` | `2f2b3798a663dcf9…` | 13 / 13 | 21242 / 21242 |
-| `test_openai_api_server_dots3_mm_forward` | `52ad05417f0d4a28…` | 15 / 15 | 216 / 216 |
+| `test_dots3_note_vision` | `f99fefb17e85f3b8…` | 13 / 13 | 21343 / 21343 |
+| `test_openai_api_server_dots3_mm_forward` | `17797ed0144e8134…` | 16 / 16 | 240 / 240 |
 
 **The two reference arms.** Per-pixel MAXIMUM, in levels of 0-255, over 18 cases
 (six geometries by three images: a hard 0/255 checker, a wrapping ramp, and
@@ -4999,17 +5050,23 @@ high-frequency noise):
 
 The continuous bound of 2 is derived rather than fitted: the horizontal pass
 rounds by at most half a level, the vertical pass carries that through weights
-whose absolute sum is at most 1.25, and then rounds again, so 1.125 is the
-ceiling and 1.07588 sits just under it.
+whose absolute sum is at most **1.268771** (the swept supremum, §4.13.1), and
+then rounds again, so the ceiling is `0.5 * 1.268771 + 0.5 = 1.13439` and
+1.07588 sits under it. The asserted gate bound stays 2.0, which remains safe.
+This derivation first read 1.125 from the wrong `sum |k|` of 1.25; the corrected
+ceiling is larger and both the measured value and the asserted bound survive it.
 
 `ProcessImage` against the same reference, reconstructed back through the
-per-channel normalization and `pre_pixel_shuffle`'s transpose on a served 6x14
-image: **0** levels.
+per-channel normalization and `pre_pixel_shuffle`'s transpose: **0** levels on
+the served 6x14 image (an upscale to 8x16) and **0** levels on the 24x96 image
+the `kBudgetMaxPixels` budget downscales 6x to 4x16.
 
-**Reference independence.** Every qualified name inside `namespace
-ref_resample` (160 lines) enumerated: **2 distinct, 45 occurrences, both
+**Reference independence.** Every qualified name in the CODE inside `namespace
+ref_resample` (170 lines) enumerated: **2 distinct, 45 occurrences, both
 `std::`** — `std::size_t` (27) and `std::vector` (18). Zero non-`std::` names,
-which is the same test W6a's and W6b's references passed.
+which is the same test W6a's and W6b's references passed. One further
+`ref_resample::` occurs in a COMMENT, the one that says `ResizeContinuous` and
+`ResizeExact` share `Weights`; it is prose about the arms, not a call.
 
 **RED-before at the production entry point.** On the commit that landed the
 resampler without calling it, `test_openai_api_server_dots3_mm_forward` read
@@ -5028,11 +5085,31 @@ counts because a changed sha alone does not prove the mutation reached the code.
 
 | # | mutation | vision sha256 | vision | server sha256 | server |
 |---|---|---|---|---|---|
-| — | *(clean)* | `2f2b3798a663dcf9…` | 13/13, 21242/21242 | `52ad05417f0d4a28…` | 15/15, 216/216 |
-| M1 | delete the `PilResizeBicubicRgb` call site | `24b9a394079b9193…` | **12/13, 1 failed** | `2a8abda482b261b4…` | **14/15, 4 failed** |
-| M2 | half-pixel centre (`(xx + 0.5) * scale` -> `xx * scale`) | `f76d0a1402f37141…` | **12/13, 145 failed** | `7e3f292234c90805…` | 15/15, 216/216 |
-| M3 | drop the support scaling (`filterscale = 1.0`) | `cf3cb76e3b1689ac…` | **12/13, 96 failed** | `137c160ea8bcb5df…` | 15/15, 216/216 |
-| M4 | skip the per-output weight normalization | `44e0d65bf2ae2a14…` | **11/13, 177 failed** | `0ed9b83f7c8742ee…` | 15/15, 216/216 |
+| — | *(clean)* | `f99fefb17e85f3b8…` | 13/13, 21343/21343 | `17797ed0144e8134…` | 16/16, 240/240 |
+| M1 | delete the `PilResizeBicubicRgb` call site | `a667d66950aa5737…` | **12/13, 2 failed** | `64d218c55e4f47d2…` | **14/16, 8 failed** (cases 2d and 2e) |
+| M2 | half-pixel centre (`(xx + 0.5) * scale` -> `xx * scale`) | `a02a243c3d18944e…` | **12/13, 182 failed** | `c951890b3289f116…` | 16/16, 240/240 |
+| M3 | drop the support scaling (`filterscale = 1.0`) | `8b69d5db92b71d70…` | **12/13, 121 failed** | `acdc3b15a4cdbfe3…` | 16/16, 240/240 |
+| M4 | skip the per-output weight normalization | `e1cecc05459e1927…` | **11/13, 214 failed** | `d6e4f531a41ba72e…` | 16/16, 240/240 |
+
+**Per-arm, which is where M3's story actually is.** The `ProcessImage`
+reconstruction reports its worst level for each geometry, so the two arms can be
+read separately:
+
+| mutation | 6x14 -> 8x16 (upscale) | 24x96 -> 4x16 (6x downscale) |
+|---|---|---|
+| *(clean)* | 0 | 0 |
+| M1 | **255** | **143** |
+| M2 | **148** | **31** |
+| M3 | **0 — BLIND** | **119** |
+| M4 | **30** | **154** |
+
+M3 is the reason the downscale arm was added. Before it, the upscale arm was the
+ONLY `ProcessImage` case, and it reads 0 under M3: on an upscale
+`filterscale = max(1, in/out)` is 1, so deleting the support scaling deletes
+nothing, and 6x14 -> 8x16 comes out byte-identical. The served suite reads 0
+failures under M3 as well. Dropping the single property this unit exists for was
+therefore invisible everywhere except the isolated `PilResizeBicubicRgb` unit
+cases, on a model whose `factor` is 28 and whose every real request downscales.
 
 **M1 found a real hole and the repair is part of this brick.** On the first
 pass the served suite stayed at `14 | 14 passed`, `199 | 199 passed` with the
@@ -5042,13 +5119,35 @@ by construction, one asserting geometry that `Dots3NoteResizedSize` already
 owned and one asserting only that two different images differ. Case 2d serves
 the 6x14 image and then serves the 8x16 buffer the resampler produces from it —
 conformant, so it takes the identity path — and requires the two logprob vectors
-to be equal element for element. With it, M1 fails the served suite.
+to be equal element for element. With it, M1 fails the served suite. Case 2e is
+the same arm on the budget-downscaled geometry, and M1 fails both.
+
+**How M1 fails in case 2d, precisely, because it is not a value difference.**
+With the resize call deleted the 2d leg patchifies an 8x16 grid out of the
+252-byte 6x14 buffer at `rowstride = rw * 3 = 48`, so it reads up to byte 383 of
+a 252-byte allocation — 132 bytes past the end. Case 2d therefore detects M1
+through a HEAP OVER-READ whose bytes happen to differ, not through a defined
+value difference, and under a sanitizer the mutant would abort rather than fail
+an assertion. Production cannot reach that state: the only caller that can skip
+the resize is the size-equality short circuit, where the two strides agree. It
+is recorded because "the mutation reddened the gate" and "the mutation reddened
+the gate for the reason the gate claims" are different statements.
+
+**Case 2e does not have that shape, which is a second reason it is worth its
+cost.** Its M1 leg patchifies a 4x16 grid out of the 6912-byte 24x96 buffer, so
+the largest byte it reads is 191 — entirely in bounds. The 4x16 window it reads
+is the top-left corner of the source instead of the resample of the whole image,
+so 2e detects M1 through a DEFINED value difference. Under a sanitizer 2e still
+fails as an assertion where 2d aborts.
 
 **M2, M3 and M4 stay GREEN on the served suite, and that is correct rather than
-a gap.** Both legs of case 2d run the same resampler, so a defect inside it
-cancels. The served suite answers "was it called"; the reference gate answers
+a gap.** Both legs of cases 2d and 2e run the same resampler, so a defect inside
+it cancels. The served suite answers "was it called"; the reference gate answers
 "was it right". The test file says so in the same words, because a green served
 suite under three of the four mutations reads like coverage it does not have.
+What case 2e adds over 2d is not a numeric verdict but the REGIME: without it no
+served request, and no `ProcessImage` call on a textured image, ever reached the
+support-scaled window at all.
 
 **The local Pillow cross-check — EVIDENCE, not a gate.** Pillow is not in the
 oracle table and carries no pin here, so nothing measured against it can gate.
@@ -5061,6 +5160,16 @@ geometries by four image kinds, plus a 400-case fuzz over random extents in
 worst absolute difference 0 of 255.** Read that as "this port reads Resample.c
 correctly on this Pillow", never as a parity result: a different Pillow could in
 principle move, and the committed gate is the in-tree reference above.
+
+**THE HARNESS IS NOT RETAINED, so do not go looking for it in the tree.**
+Committing it would add a Pillow build dependency to a repository that has none,
+for a comparison that is not allowed to gate, so it was run and discarded. The
+consequence is stated rather than hidden: this number is not reproducible from a
+checkout, and anyone who wants it again rebuilds the harness from §4.13.1's step
+list. A fresh review of this row re-ran the same comparison independently over
+490 cases — the 18 committed geometries, 18 edge geometries including 1-pixel
+sides and 64x64 -> 1x1, and 400 random extents — and read 490 of 490 byte-exact,
+worst absolute difference 0.
 
 **What was NOT measured.** No GPU, and none is relevant — the resample is host
 CPU work upstream of the tower. No throughput number on any axis. And no

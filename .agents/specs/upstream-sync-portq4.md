@@ -30,7 +30,7 @@ citations. Nine issues carry the eleven gaps
 [#2696](https://github.com/mudler/vllm.cpp/issues/2696),
 [#2706](https://github.com/mudler/vllm.cpp/issues/2706), and the pre-existing
 [#2650](https://github.com/mudler/vllm.cpp/issues/2650) which already owns
-`608c12473f`); the five deferred entries and one un-owned pre-pin gap are carried
+`608c12473f`); four deferred entries, one deferred half, and one un-owned pre-pin gap are carried
 on [#2700](https://github.com/mudler/vllm.cpp/issues/2700), and a pre-pin
 correctness hole found on the way is
 [#2697](https://github.com/mudler/vllm.cpp/issues/2697).

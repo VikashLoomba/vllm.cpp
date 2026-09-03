@@ -49,6 +49,23 @@ struct DecodedAudio {
 // samples with zero decode ambiguity.
 DecodedAudio DecodeWavPcm16Mono(const uint8_t* wav_bytes, size_t num_bytes);
 
+// The same buffer, but with ANY channel count, reduced to mono by the per-sample
+// MEAN over channels -- upstream's own reduction
+// (`vllm/multimodal/media/audio.py:207-208` @ `9035151d6`, reached by
+// `load_audio`'s `mono=True` default at `:220`; and `ChannelReduction.MEAN` /
+// `AudioSpec.target_channels = 1` at `vllm/multimodal/audio.py:69-70`, which
+// dots3-note selects at
+// `vllm/models/dots3_note/common/processor.py:523-525`).
+//
+// A SIBLING RATHER THAN A WIDENING, so that `DecodeWavPcm16Mono`'s three
+// callers -- parakeet transcription, the ROAD-V1-MM parse path and the voxtral
+// e2e gate -- cannot move by a bit. Both share ONE chunk walk. The mean is
+// accumulated in int32 (exact; no overflow is representable) and rounded once,
+// which is BIT-IDENTICAL to upstream's float32 mean for every power-of-two
+// channel count, C = 1 and C = 2 included. See
+// `.agents/specs/dots3-note.md` 4.16.2. W7c-1, issue #2813.
+DecodedAudio DecodeWavPcm16MeanToMono(const uint8_t* wav_bytes, size_t num_bytes);
+
 // The subset of the whisper-small feature-extractor + config the audio path needs.
 struct AudioProcessorConfig {
   int n_fft = 400;

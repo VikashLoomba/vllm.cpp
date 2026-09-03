@@ -30,7 +30,7 @@ PROMPTS = [
     "A prime number is a natural number",
 ]
 # The llama.cpp b10451 oracle's own PROMPT_IDS, recorded in
-# /workspace/rocm-tokgate-strix-v2/.../oracle_hip.stdout. These are FED to the
+# /workspace/rocm-tokgate-strix-v2/.../oracle_hip.txt. These are FED to the
 # engine rather than re-tokenized, so the comparison is about generation and
 # cannot be contaminated by a tokenizer difference. They are ALSO re-derived
 # from the tokenizer and the two are asserted equal.

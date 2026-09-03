@@ -4,7 +4,7 @@ streams already recorded for this arm.
 
 Inputs, all recorded BEFORE this run and none of them re-derived here:
   A  vLLM at 5559679229 on gfx1151        -- tokens-*.json from phase 3
-  B  llama.cpp b10451 HIP on gfx1151      -- GEN_IDS lines of oracle_hip.stdout
+  B  llama.cpp b10451 HIP on gfx1151      -- GEN_IDS lines of oracle_hip.txt
   C  vllm.cpp ROCm arm on gfx1151         -- ours_gen_ids_1.json
 
 No timing is read out of anything here. AGENTS.md Gates admits no performance

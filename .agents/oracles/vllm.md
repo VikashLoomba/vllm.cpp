@@ -63,10 +63,29 @@ additionally owes these four:
 2. A **declared token-exact gate**. The run above is six prompts at 16 tokens
    and gates nothing; it agreed with `tests/parity/goldens/opt_greedy` exactly,
    which is informative and not a result.
-3. **Step 6 re-measurement** of every benchmark baselined against FlashInfer
-   0.6.15.post1, CUTLASS DSL 4.6.0, the `transformers` floor and the
-   `VLLM_ALLREDUCE_USE_FLASHINFER` default, all of which move under this
-   candidate.
+3. **Step 6 re-measurement.** Narrowed 2026-09-03 by
+   [`../sync/2026-09-03-e126687-step6.md`](../sync/2026-09-03-e126687-step6.md)
+   ([#2771](https://github.com/mudler/vllm.cpp/issues/2771)) from "four
+   denominators" to **FlashInfer 0.6.15.post1 to 0.6.18, on two gates**:
+   `vllm-online-serving` (three rows), where it is the NVFP4 GEMM under the
+   denominator and the CUTLASS source tree our own arm is compiled from, and
+   `speculative-decoding` (two rows), where it is the oracle's attention
+   backend. The `transformers` floor and the `VLLM_ALLREDUCE_USE_FLASHINFER`
+   default are **discharged** as reaching no committed gate, each with its scope
+   limit recorded there. **`nvidia-cutlass-dsl` is NOT discharged**: a fresh
+   review of [#2783](https://github.com/mudler/vllm.cpp/pull/2783) falsified the
+   first pass's claim by finding a warmup path gated on
+   `has_device_capability(90)` rather than on capability family 100, which
+   compiles CuteDSL at engine start on GB10. It cannot move the steady-state
+   math, but it can abort engine start and it sits inside the startup ratio
+   `docs/benchmarks/vllm-online-serving.md:73` publishes. **The re-measurement itself is still owed**; that report
+   ran no job, and §6 records that the committed harness **structurally refuses
+   to measure at any revision but the pinned one** — `online_gate.py:3529-3540`
+   checks the distribution and runtime versions and `:3542` the commit, all
+   before the FlashInfer gate at `:3552-3560`, and all read from the same
+   `parity-pin` block. So the block must move before ANY pin advance can be
+   measured through this harness, which puts this obligation and that edit in an
+   order nothing states.
 4. A reading on **`dgx:gpu0`**. Only `thor:gpu0` was measured.
 
 **Evidence for the paragraph above.**

@@ -518,3 +518,184 @@ and 11,947 bytes.
 Each implementation/gate result updates README, BENCHMARKS, the roadmap and
 owning matrices in the same checkpoint. A failed component stops before the
 exact grid and cannot authorize 35B performance.
+
+## W3-F draw-quality survey (#2751) and the pinned GB10 artifact (#2752)
+
+Status: **SPEC ONLY. The harness is committed and has NEVER RUN on a device.**
+Every number below is a threshold written before the measurement, not a result.
+W3-C3 above stands unchanged and is the baseline this section is measured
+against.
+
+Issues: [#2751](https://github.com/mudler/vllm.cpp/issues/2751),
+[#2752](https://github.com/mudler/vllm.cpp/issues/2752).
+
+The harness is shared with `KERNEL-GEMM-BF16`'s #2750 measurement and is
+described once, in
+[`cublaslt-cross-process-algo-stability.md`](cublaslt-cross-process-algo-stability.md)
+§"Port and harness map". One job produces the evidence for all three issues,
+because the three questions are answered by the same N fresh processes: the
+`[VT_GEMM_ALGO]` lines are #2750's data and the `[VT_FP4_CACHE]` lines are
+#2751's, and running them twice would spend two leases to learn what one can.
+
+### Why W3-C3 does not already answer #2751
+
+W3-C3 proved that a FROZEN plan map removes tactic selection as a confounder:
+64/64 equal IDs, zero tuning misses, and a steady-state component of c2
+**1.0045x** / c16 **1.0050x** that STRICT-FAILED at 39/40 timing + 1/8 memory.
+Persistence is credited as a control, not a speedup, and that is still true.
+
+What it did not ask is whether the draws it froze were **good** draws. The tuner
+mirrors installed FlashInfer 0.6.13 exactly -- three warmups, synchronize, a
+5,000-us eager stream delay, ten event-timed repeats, minimum wins
+(`src/vt/cuda/nvfp4_persistent_cache.h:25-27`) -- and that mirror carries one
+draw per process, kept whole. Timing noise at selection time is not averaged
+away across candidates; it is *selected on*. The identity spread is known to be
+wide (18--33 of 64 shared IDs across paired runs). The **speed** spread has
+never been measured, and until it is, "which draw" is a question with no answer
+and #2752 has nothing defensible to pin.
+
+### The draw is disjoint from the score by construction, not by discipline
+
+#2751 and [`.agents/benchmarking.md`](../benchmarking.md) both refuse a selector
+that picks a plan on the workload the plan will later be scored on. On this lane
+that separation is structural and can be pointed at:
+
+- The tuning pass is the pre-serve NVFP4 warmup at
+  `src/vllm/entrypoints/model_loader.cpp:2388-2410`. It submits ONE synthetic
+  request of `max_num_batched_tokens` repeated dummy tokens under
+  `Nvfp4AutotuneWarmupScope` and completes the tuner before serving begins.
+- No prompt of the scoring workload exists when the draw is taken.
+
+What is **not** structural, and is enforced by the harness, is that
+`--max-num-batched-tokens` be held constant across draws. It decides which plan
+keys get tuned, so a draw taken at another value tuned a different key set; the
+judge refuses that outright (exit `74`) rather than comparing tactic maps that
+describe different shapes.
+
+### The identity gate
+
+From the `issue_2751_identity` block of `REPORT.json`, over N >= 8 draws whose
+plan-key sets and metadata fingerprints are identical:
+
+| Reported | Meaning |
+|---|---|
+| `pairwise_shared_min/median/max` | the "shared X of 64 tactic IDs" statistic W3-C3 already uses, now over every pair |
+| `keys_unanimous` | keys on which all N draws agree; W3-C3's per-arm figure was 9--17 of 64 at c16 and 12--15 at c2 across three repetitions |
+| `max_distinct_tactics_on_one_key` | whether the spread is concentrated on a few keys or spread across all of them |
+
+This half needs no clock and no timing admissibility. It stands even on a run
+whose speed half is refused.
+
+### The speed gate, and the bar it has to clear
+
+Scoring replays each draw **frozen** -- `VT_FP4_AUTOTUNE_CACHE_PATH` at that
+draw's document plus `VT_FP4_AUTOTUNE_CACHE_READONLY=1`, so a frozen miss is
+rejected before any tuning. The leg is refused (exit `78`) unless its
+`[VT_FP4_CACHE] complete` line reads `tuned=0` and `loaded` equal to the draw's
+own plan count. Without that control the scoring phase is N MORE DRAWS wearing
+the label of a replay, and each number would be attributed to a plan map nobody
+recorded.
+
+Legs are interleaved with the opening arm repeated last, through
+`tools/bench/c8_leg_runner.py` and `tools/bench/resumable_legs.py`: a block of
+one arm followed by a block of the next measures the hour as much as the draw,
+the terminal control is what makes a drifting box declare itself, and folding
+refuses across a boot change.
+
+| Verdict | Condition | Consequence |
+|---|---|---|
+| `EQUIVALENT` | best/worst draw ratio does not exceed the worst WITHIN-draw repeat spread | **#2751 closes as "no divergence warranted"**, which is the outcome the issue names first; the persistent cache alone is the right answer and #2752 unblocks |
+| `SEPARATED_BELOW_BAR` | ratio exceeds the within-draw spread but is under **1.02x** | the draws differ and the difference is not worth a divergence from the mirror; #2751 records the number and closes without a selector; #2752 stays blocked, because "which draw" is no longer arbitrary |
+| `ABOVE_BAR` | ratio >= **1.02x** | #2751 escalates for **developer ratification**. A divergence from the pinned oracle's selection method is a product decision, not an inferred one, and no selector is written before that answer |
+| `INCOMPARABLE` | fewer than two legs on some draw, or a non-positive mean | no number; the sequence is repeated |
+
+**Why 1.02x.** The control this lane already has is worth 1.0045x/1.0050x and
+still strict-failed. A selector is a deliberate divergence from a mirrored
+upstream method, so it has to be worth meaningfully more than the control it
+would sit beside. 1.02x is four times that magnitude and sits above both the 1%
+cross-arm clock-mean rule and the noise a lease can produce with no lever to pin
+the SM clock (`LGC_RC=4`, [#1354](https://github.com/mudler/vllm.cpp/issues/1354)).
+It is a threshold, not a measurement, and it is written here before the run so
+that it cannot be chosen after seeing the numbers.
+
+**Concurrency: c2 and c16, and NOT c8.** Those two rungs held still enough in
+W3-C3 to resolve sub-percent effects across 12 legs (20/20 and 19/20 timing
+axes). c8 on this host has produced a severity metric ranging 0.0 to 79.6 across
+runs of ONE unchanged binary
+([`c8-measurement-admissibility.md`](c8-measurement-admissibility.md),
+[#2154](https://github.com/mudler/vllm.cpp/issues/2154)); a rung that cannot
+gate its own effects cannot gate this one. The harness takes one
+`--concurrency` per evidence root, so c2 and c16 are two roots and two folds,
+never one pooled population.
+
+### #2752: the shipping rule, and why it is "the first one"
+
+`select_shipping_draw` returns a draw **only** on `EQUIVALENT`, and then it
+returns the FIRST draw in draw order.
+
+That is the whole rule, deliberately. Ranking N draws on a workload and shipping
+the winner selects a kernel plan by a measurement of its own speed, which is the
+shape #2751 refuses by name and which this repository's benchmark protocol
+refuses generally. When the draws are equivalent the choice is arbitrary *by the
+measurement's own finding*, so an a-priori rule -- draw order, fixed before the
+first number existed -- is the one choice no measurement can bias. When they are
+not equivalent, the function ships nothing and names #2751 as the blocker, which
+is exactly what #2752's own "blocked-by consideration" paragraph asks for.
+
+If and only if #2751 returns `EQUIVALENT`, the artifact lands with:
+
+- the native document `SerializeNativeCache` emitted for that draw, verbatim;
+- its **sha256**, and the `PersistentCacheMetadataFingerprint`
+  (`src/vt/cuda/nvfp4_persistent_cache.cpp:528`) recorded beside it, so identity
+  is checkable without running anything;
+- the install step in [`docs/USAGE.md`](../../docs/USAGE.md), which is the
+  projection that owns an install step and a config key;
+- a plain note that the draw is a starting point for that exact configuration
+  and not a guarantee. `ParseNativeCache` already validates metadata against the
+  running configuration, so a draw installed onto a host it does not describe is
+  **rejected, not silently used** -- the mismatch mode this artifact could
+  otherwise introduce is already closed.
+
+**This is a reproducibility and warmup artifact, not a speed artifact.** What it
+buys is that two people benchmarking this tree on the same silicon start from
+the same kernel plan and that the first serve does not pay a tuning pass. Any
+claim beyond that needs its own measurement.
+
+Nothing in this change writes `docs/USAGE.md`, because no artifact exists yet.
+
+### Gates for W3-F
+
+```sh
+# c2 root
+bash scripts/dgx-gemm-tactic-draw-survey.sh \
+     --evidence /workspace/gemm-draw-survey/<stamp>-c2 \
+     --src /workspace/gemm-draw-survey/src.tar.gz \
+     --model /workspace/ckpt/<nvfp4-checkpoint> \
+     --draws 8 --score-reps 2 --concurrency 2
+
+# c16 root, same binary, same draws re-taken for that rung
+bash scripts/dgx-gemm-tactic-draw-survey.sh \
+     --evidence /workspace/gemm-draw-survey/<stamp>-c16 \
+     --src /workspace/gemm-draw-survey/src.tar.gz \
+     --model /workspace/ckpt/<nvfp4-checkpoint> \
+     --draws 8 --score-reps 2 --concurrency 16
+
+# the judgement, offline, per root
+python3 tools/bench/gemm_tactic_draw_survey.py reduce \
+     --evidence /workspace/gemm-draw-survey/<stamp>-c2
+```
+
+The judge refuses before it prints a verdict when a precondition failed: `72`
+when the persistent runtime never started, `73` when a "draw" LOADED a map
+instead of tuning one (a copy, not a sample), `74` on divergent plan-key sets,
+`75` on divergent metadata fingerprints, `77` when a draw published no document,
+`78` on a scoring leg that re-tuned, `79` when the legs were not one binary.
+
+## Owed
+
+- [#2751](https://github.com/mudler/vllm.cpp/issues/2751) -- the draw-quality
+  measurement itself. The harness and these thresholds land here; the run is
+  owed to an operator with a lease.
+- [#2752](https://github.com/mudler/vllm.cpp/issues/2752) -- the pinned GB10
+  draw. Blocked on #2751 by its own blocked-by consideration and by the shipping
+  rule above; nothing is committed until #2751 returns `EQUIVALENT`.

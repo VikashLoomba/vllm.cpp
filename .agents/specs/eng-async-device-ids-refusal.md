@@ -183,10 +183,37 @@ Each registered forward is one of:
 * **(c) INERT / UNREACHABLE** — cannot decode at all. Leaves the bit false;
   neither arm applies.
 
-The classification is read from each forward and the chain it reaches, not from a
-grep. #2544 established that a grep-derived list is wrong in BOTH directions:
-`kimi_k3` was never affected (a `VT_CHECK(false, ...)` skeleton that `(void)`s its
-ids), and `laguna` cannot be gated at all (#2618).
+### How to classify, and why a grep cannot do it
+
+Recorded because it will bite the next reader, and because it has already made
+one list wrong. #2544 built its candidate list from a grep and was wrong in BOTH
+directions: `kimi_k3` was never affected, and `laguna` cannot be gated at all
+(#2618).
+
+**CONSUMPTION IS SPREAD ACROSS THREE DISTINCT SEAMS.** A grep for any one of them
+sees roughly a third of the truth:
+
+1. `detail::DeviceTokenIdsScope` — the DEVICE arm, for a forward that already
+   uploads its ids to a device buffer and can have the pointer spliced over it.
+2. `ResolveHostTokenIds` (`include/vllm/model_executor/models/host_token_ids.h`)
+   — the HOST arm, added by #2544 for forwards that gather embedding rows on the
+   host and so have no `dst` to splice.
+3. A direct `input.device_token_ids != nullptr` read, sometimes in the
+   registration's own translation unit (`qwen4_exp_registry`) and sometimes in a
+   device file the registration only reaches through a call chain
+   (`nemotron_h_device.cpp`, `kimi_linear_device.cpp`) — so the registry file
+   itself contains no match at all.
+
+**AND THE MATCHES LIE IN BOTH DIRECTIONS.** `kimi_k3_registry.cpp` matches a grep
+for `ResolveHostTokenIds` — inside a COMMENT whose text says there is no such call
+in that file. A false positive of exactly the shape that made #2544's list wrong.
+Meanwhile `nemotron_h_registry.cpp` and `kimi_linear_registry.cpp` are true
+consumers whose registry files match nothing.
+
+So each registration is classified by reading its forward and following the chain
+it reaches. The count below was derived that way, in a worktree at the head being
+changed — NOT in the shared checkout, which is routinely behind and which lacked
+#2544 entirely while this row was being written.
 
 36 registrations. **16 (a)**, **16 (b)**, **4 (c)**.
 
@@ -294,8 +321,56 @@ RED-first, both counts captured (cases AND assertions), because
 
 ## Evidence
 
-Filled on completion: RED and GREEN with both counts, every mutation with its
-rebuild result and restore proof, and the per-forward classification table.
+Measured in `/home/mudler/_git/vllm.cpp-devidrefusal` on `bb2da6f97` + this
+branch, CPU, Release, `-j 3`. Both counts are recorded everywhere, because
+`N failed / 0 assertions failed` means the cases THREW and is a different result.
+
+### GREEN
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_device_token_ids_refusal` | 3 / 3 passed | 16 / 16 passed |
+| `test_combine_row_predicate` | 6 / 6 passed | 13 / 13 passed |
+| `test_combine_tokens` (the D3 control) | 7 / 7 passed | 14 / 14 passed |
+| `test_multi_kv_refusal` (the sibling) | 2 / 2 passed | 7 / 7 passed |
+
+### RED, and the mutations
+
+Eight mutations, each APPLIED (sha256 verified changed), REBUILT (a mutation that
+does not rebuild reads as a passing test), run, then restored and verified
+byte-for-byte by sha256. All eight were detected; none survived.
+
+| # | mutation | rebuild rc | detected by | cases / assertions failed |
+|---|---|---|---|---|
+| M1 | DELETE the refusal from `ModelRegistry::Forward` (`if (false && ...)`) | 0 | `test_device_token_ids_refusal` | 1 case / 1 assertion |
+| M2b | drop the `host_token_ids_stale` term (nullness-only, the sibling's shape) | 0 | `test_device_token_ids_refusal` | 2 cases / 1 assertion |
+| M3b | drop the `device_token_ids != nullptr` term | 0 | `test_device_token_ids_refusal` | 1 case / 1 assertion |
+| M4 | invert the claim term (`!consumes` -> `consumes`) | 0 | `test_device_token_ids_refusal` | 3 cases / 3 assertions |
+| M5 | `CombineSplicesRow` boundary `>` -> `>=` | 0 | `test_combine_row_predicate` AND `test_combine_tokens` | 2+1 cases / 2+1 assertions |
+| M6 | `AnyRowSplicedByCombine` returns the FIRST row instead of the OR | 0 | `test_combine_row_predicate` | 3 cases / 3 assertions |
+
+M1 is the reachability mutation AGENTS.md `## Nothing lands dead` asks for: it
+deletes the production call site and a gate goes red, so the suite measures the
+guard and not merely the free function.
+
+M5 firing in `test_combine_tokens` as well as in the new suite is the evidence
+that the extraction is REAL: the host combine and the guard are running the same
+expression, so breaking it breaks both. Had `test_combine_tokens` stayed green,
+the "one rule, one expression" claim would have been false.
+
+M2 and M3 were first run WITHOUT a `(void)` cast and were caught by
+`-Werror=unused-parameter` at `model_registry.cpp:502` rather than by any test.
+That is a compiler detection, not a gate detection, and it is a WEAKER result, so
+both were re-run as M2b/M3b with the parameter voided. The recorded verdicts are
+the re-runs. The first pair is kept in this record rather than dropped, because
+"the build failed" reads like a detection and is not one.
+
+### What the gate does NOT reach
+
+The runner's own assignment (`forward_input.host_token_ids_stale = ...`,
+`runner.cpp`) has NO CPU coverage: the mirror requires CUDA, so no test in this
+tree executes that line. Deleting it would not turn any gate red. That is `## Owed`
+O2 and it is stated rather than implied.
 
 ## Stop conditions
 

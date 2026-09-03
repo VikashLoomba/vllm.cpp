@@ -2741,11 +2741,32 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     exec_state_.spec_aux.layer_ids = dflash_tap_layer_ids_;
     forward_input.aux_tap = &exec_state_.spec_aux;
   }
-  // W4: non-null only on the discrete-CUDA async path, where the combine above
-  // patched the DEVICE ids and `token_ids` is deliberately stale for decode rows.
-  // Set after construction because the field sits at the END of the struct, where
-  // it cannot shift the positional aggregate initializers other callers use.
+  // W4: non-null whenever the mirror is engaged (integrated OR discrete — see
+  // `async_device_mirror()`; the comment here used to say "discrete-CUDA" and
+  // that was wrong, #2710), where the combine above patched the DEVICE ids and
+  // `token_ids` is deliberately stale for decode rows. Set after construction
+  // because the field sits at the END of the struct, where it cannot shift the
+  // positional aggregate initializers other callers use.
   forward_input.device_token_ids = device_input_ids;
+  // ENG-ASYNC-DEVICE-IDS-REFUSAL (#2710): and WHETHER the host vector actually
+  // disagrees with that buffer, which is what `ModelRegistry::Forward` refuses
+  // on. The pointer alone says the device buffer is authoritative; it does not
+  // say the two differ, and on an all-prefill step they do not.
+  //
+  // Computed HERE, beside the assignment, because this is the one place that
+  // holds both arrays. It shares `v1::CombineSplicesRow` with the combine that
+  // does the splicing, so the guard's predicate is the route's predicate and not
+  // a second derivation of it. `idx_mapping` is null for the same reason the
+  // combine launch above passes null: the persistent batch is condensed dense, so
+  // batch row == req_state slot.
+  //
+  // Only meaningful when the pointer is live, so it is computed only there —
+  // leaving it false on every non-mirror path, where the guard is inert anyway.
+  if (device_input_ids != nullptr) {
+    forward_input.host_token_ids_stale = v1::AnyRowSplicedByCombine(
+        step.seq_lens, input_batch_.prefill_len, /*idx_mapping=*/nullptr,
+        num_reqs);
+  }
   // ENG-MM-INPUT-PIPELINE P2 (#2379): THE assignment this row exists for. Set
   // after aggregate construction for the same reason `device_token_ids` is —
   // the field sits past the positional initializers other callers use. nullopt

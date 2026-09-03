@@ -117,6 +117,30 @@ ltx2-gen \
   --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
 ```
 
+`--lora` is repeatable, and each repetition takes an adapter path with an
+optional strength, exactly as upstream's own flag does: `--lora
+first.safetensors 0.8 --lora second.safetensors`. An omitted strength is
+upstream's `DEFAULT_LORA_STRENGTH`. The adapters fuse into the weights in the
+order given, and that order is observable in the render, because the aggregator
+rounds the first product differently from every later one.
+
+Through the C ABI and the server the same adapters are load extras rather than
+flags, because the fusion happens once when the engine loads and cannot vary per
+request. The first adapter is `lora_path` and `lora_strength` with no index; the
+second onward are `lora_path_2` and `lora_strength_2`, `lora_path_3`, and so on.
+A gap in the numbering is refused by name rather than closed up, so
+`lora_path_3` without `lora_path_2` is an error and not a two-adapter render. So
+is `lora_path_1`: one adapter has one spelling.
+
+A second adapter is refused on `a2vid_two_stage`, `ti2vid_two_stage` and
+`keyframe_interpolation`. Upstream runs the first stage of those three on the
+user adapters alone and the second on the user adapters plus the distilled one,
+which is a per-stage subset this engine cannot hold: it keeps one resident DiT
+that every phase runs fused or bare, and no load extra says which of the
+adapters is the distilled one. Supply one adapter to those pipelines, or use
+`dfr`, which composes the user adapters and the distilled one onto the single
+stage both its phases share.
+
 Pass `--steps N` to set the denoise step count (#2130). Omit it, or pass a value
 of 0 or less, and the resolved recipe decides: `one_stage` on model version 2.5
 runs 30. The flag reaches `vllm_video_params.steps`, which the C ABI has always

@@ -16,6 +16,27 @@ blindness #435/#644/#1854/#2295 record. `REMOTE_UNVERIFIED` is not absence, and
 #930 is cited by the predecessor spec as landed in `c7cb59fbb`, so the low range
 exists. The issue is referenced and not re-filed.
 
+**#932 OWNS TWO ARMS, THIS ROW LANDS ONE, AND SO NOTHING HERE CLOSES IT.** The
+same issue is the recorded owner of **A16**, `conditioning_attention_strength <
+1.0` and its attention mask, in three committed places a reader has: the
+`## Owed` entry beginning "the `conditioning_attention_mask` /
+`conditioning_attention_strength < 1.0` arm" in
+[`ltx25-ic-lora.md`](ltx25-ic-lora.md), the **A16** row of
+[`ltx25-completion-scope.md`](ltx25-completion-scope.md), and a SHIPPED
+user-facing refusal in `ltx2_video.cpp` whose text reads "The sub-1.0 arm is
+owed by #932, and it is not what blocks this one". A16 is out of scope here
+(§4), is still unimplemented, and its refusal is still live, so a closing
+keyword on this row would take A16's only owner away and leave a shipped error
+message pointing a user at a closed issue. `scripts/check-agent-record.py`
+cannot see that: it asks only that a referenced issue HAS an owning row or an
+`## Owed` entry, and #932 has two.
+
+**So this row's pull request carries no closing keyword** and names the half it
+lands instead. The alternative — giving A16 its own issue and retargeting the
+three references — needs `ltx25-completion-scope.md` edited, and that document
+is an operator-owned record a sibling row was told not to touch, so the split is
+left to the operator and #932 stays open on A16.
+
 ## 1. The refusal this row lifts, and whether its stated reason was true
 
 `Ltx2ResolveLoraReferenceFactors` refuses a second adapter
@@ -132,6 +153,19 @@ added.
   phase, refused at load by name. Lifting the cap is what makes that arm
   reachable, so refusing it is part of the same change and not a later sweep.
 - `docs/FEATURES.md`, one row.
+- `docs/models/ltx-2-5.md`, the page that documents `--lora`: the flag becomes
+  repeatable and the indexed load extras are new config keys, which the public
+  documents table owes a surface. **The surface is the model recipe and not
+  `docs/USAGE.md`**, and that was checked rather than assumed: `grep -ni lora
+  docs/USAGE.md` returns three lines, all in the checkpoint registry and its
+  prose, and `grep -rn lora_path docs/` returned NOTHING BEFORE this change (it
+  returns this row's own new lines after it) — so `--lora`, `lora_path` and
+  `lora_strength` have never been in `USAGE.md`, while `ltx-2-5.md` documented
+  `--lora` in four places already. `USAGE.md` routes a reader to
+  the recipe under `## Find a model recipe` for exactly this: "commands,
+  required weights, component-specific runtime settings, and known limits for
+  each model family". A positive control, because an absence read off a failed
+  grep is not a finding.
 
 **Out.**
 
@@ -219,6 +253,17 @@ STRENGTH (0.25 at `:92-96`, 0.5 at `:97-101`), not the membership, and that is
   transport and not on the fuser.
 - **The derived reader-anchor list** in `ltx2_video.cpp` moves when lines are
   inserted above it. Re-derived from the gate's own printed replacement.
+- **The refusal runs AFTER the fusion it discards, and that is recorded rather
+  than restructured.** `ResolveLoraSpecs` feeds `Ltx2LoadDitFromSafetensors`,
+  the recipe resolves after that, and the `kNoAdapters` guard runs after both,
+  so on real weights a two-adapter `a2vid_two_stage` load fuses a 21 B DiT twice
+  and only then refuses. **Not introduced here**: the `requires_distilled_lora`
+  refusal in the same function has had the same placement since it landed, and
+  the guard has to read `im.recipe.phases`, which does not exist until the
+  recipe resolves. Hoisting it would mean lifting recipe resolution above the
+  DiT load, which is a change to the load order of every arm and belongs to a
+  row that can gate it. The cost is wall time on a refused load, never a wrong
+  render.
 
 ## 7. Gates
 

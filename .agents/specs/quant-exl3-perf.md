@@ -184,9 +184,38 @@ upstream's envelope admits the wide config at large-`n`/small-`k` only for
 row's largest `## Owed` item — so the measurement and the owed work point at the
 same place, from two directions.
 
-### Device throughput — PENDING
+### Device throughput — PENDING, and how to collect it
 
-Queued on `dgx:gpu0`. No throughput number is claimed anywhere until it runs.
+Queued on `dgx:gpu0`. **No throughput number is claimed anywhere until it runs**,
+and none appears in `docs/FEATURES.md` or `docs/USAGE.md` either.
+
+```sh
+rc ps                                     # find the exl3perf-2570 job id
+rc logs <job-id> | grep '^RESULT'         # the whole evidence stream
+```
+
+Results also land under `/workspace/exl3perf-2570/out/` (`/mnt/nas_share/rc/…`
+from the devbox), but that mount LAGS — `rc logs` is the authoritative read and
+the CIFS copy has been minutes behind it in this campaign. A flat `rc logs` tail
+is not evidence of a stalled job either: compare byte counts across two samples
+before concluding anything, because the endpoint serves cached content.
+
+The job is pinned to tarball
+`sha256 c133a4cbba670dbef6c6daebf4c0e130824519f317af221eaff7ebb1e9e9c5dd`
+(commit `665167c4a`) and aborts rather than build anything else. Every compiled
+and tested path in it is byte-identical to this row's head.
+
+What it produces, in order, cheapest evidence first so a crash on this box costs
+the least: the tree facts, the build, the device numeric gate, `SM_COUNT` and
+`MAX_THREADS_PER_SM` (which settle the prediction above), the interleaved A/B,
+an `nsys --cuda-graph-trace=node` check of whether `exl3_gemv_kernel` actually
+appears, and finally the M1/M2/M3 mutations behind a 180-minute deadline.
+
+**Read the envelope verdict BEFORE any tok/s number.** If `SM_COUNT` and
+`MAX_THREADS_PER_SM` put `narrow_coresident` below 544 and 160, then `G1 == G0`
+is the predicted result and the A/B has measured an envelope decline rather than
+a kernel. Quoting a speed ratio from those legs would be measuring the same path
+twice, which is the mistake this row was written to avoid.
 
 ## Owed`, itemised, with the reason it is not closed here.
 

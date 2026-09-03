@@ -156,18 +156,50 @@ scripts/agent-preflight.sh
 A doctest run reporting `assertions: 0` is a SKIP wearing a pass; read both
 counts.
 
-## Mutations the reviewer must run, rebuilding each time
+## Mutations, as RUN (not as planned)
 
-1. Delete the three-term guard. Expect RED with a `ROCm-only in this build`
-   throw out of the decode step.
-2. Delete only the `HasMatmulBTFp8Channel` term. Expect RED — that is the op the
-   `:1461` consumer reaches first.
-3. Force each new predicate to `return true`. Expect RED.
-4. Delete the production call site in `gemma4_moe.cpp`. A gate that stays green
-   without it measures a class, not a capability.
+Every one rebuilt (`BUILD_RC=0` recorded for each, so no result is a compiler catch) and
+every one restored byte-for-byte, verified by sha256 against the pre-mutation baseline
+`gemma4_moe.cpp d9b98f24...ab8e3` / `fused_ops.cpp f5f85c0b...34ebc`.
 
-A compiler catching a mutation is not a test detecting it. Void the parameter and
-re-run.
+| # | mutation | result |
+|---|---|---|
+| RED | none — the guard absent, as filed | **RED** `1 failed`, `9 assertions / 1 failed`, threw `vt::MatmulBTFp8Channel: ROCm-only in this build` |
+| GREEN | the guard as landed | **GREEN** `1 passed`, `13 assertions / 0 failed` |
+| M1 | delete the whole three-term guard | **RED**, threw `vt::MatmulBTFp8Channel` |
+| M2 | delete ONLY the `HasMatmulBTFp8Channel` term | **GREEN** — see below |
+| M2b | keep ONLY `HasMatmulBTFp8Channel`, drop the other two | **GREEN** — see below |
+| M3 | force `HasMatmulBTFp8Channel` to `return true` | **RED**, but at assertion 1 — the PRECONDITION, not the behaviour |
+| M4 | disable the `!fp8_res_peer` call site | **GREEN** — not the sole route |
+| M5 | M1 + M4 together | **RED**, still `MatmulBTFp8Channel` |
+| M6 | M1 + disable the `use_dev_expert_lru` prefetch | **RED**, still `MatmulBTFp8Channel` |
+| M7 | M1 + disable BOTH of those call sites | **RED, and the op CHANGED to `vt::DequantFp8ChannelBf16`** |
+
+### What M7 established, and it is the row's best evidence
+
+Two DIFFERENT ops fire depending on which call site survives. The prefetch (`:1419`) and
+the `!fp8_res_peer` branch (`:1495`) route into `ExpertGeGLUFp8TopKFusedGelu` and throw
+`MatmulBTFp8Channel`; the per-expert branch (`:1620`) routes into `ExpertGeGLUFp8Native`
+and throws `DequantFp8ChannelBf16`. **Neither is the op `HasMatmulBTAlphaBeta` names.** So
+the one-line repair #2623 proposed would have guarded the op this path reaches LAST and
+missed both of the ops it actually reaches. That is the record's argument, now measured.
+
+### What the gate does NOT prove, stated rather than left green
+
+M2 and M2b are both GREEN, and that is an honest negative. All three predicates are the
+same expression today (`VLLM_CPP_HIP` and `kROCM`), so **any single term already refuses on
+every device this suite can run**, and no mutation available here separates the three. The
+three terms are justified by the ops the function commits to, not by a discriminating
+mutation. A future device that gains one of the three kernels would wake nothing, and
+nothing in this suite would notice. Listed under `## Owed`.
+
+M3's RED is likewise weaker than it looks: it fires on precondition 1, so it proves the
+instrument checks its own premise, not that the guard binds.
+
+M4 GREEN is not a reachability failure. This is a REFUSAL gate whose guarantee is "does
+not throw", so removing a path that could throw trivially satisfies it. Reachability is
+carried by M1/M5/M6/M7 instead: with the guard deleted the layer throws from inside
+`RunGemma4Moe`, and `MatmulBTFp8Channel` has no other route.
 
 ## Risks
 
@@ -191,6 +223,12 @@ is a real one.
 
 ## Owed
 
+- **The three guard terms are not independently gated.** M2 and M2b above are green
+  because the three predicates are one expression today. If a device ever implements one
+  of `MatmulBTFp8Channel`, `DequantFp8ChannelBf16` or `MatmulBTAlphaBeta` without the other
+  two, this guard still refuses correctly but no test here would fail if a term were
+  dropped. Owner `ENG-EXPERT-STREAM`. Separating them needs a seam that can pose one
+  predicate true and the others false, which does not exist and is not built here.
 - A CUDA arm for `MatmulBTFp8Channel`, `DequantFp8ChannelBf16` and
   `MatmulBTAlphaBeta`. Owner `ENG-EXPERT-STREAM`, tracked by #1205, unchanged by
   this row.

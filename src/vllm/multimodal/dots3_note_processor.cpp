@@ -523,13 +523,16 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
         std::to_string(sample_rate) + " Hz and this checkpoint's "
         "`audio_config.sampling_rate` is " +
         std::to_string(cfg_.sampling_rate) +
-        " Hz. RESAMPLING IS NOT PORTED and is owed to W7c: upstream resamples "
-        "in its data parser (MultiModalDataParser(target_sr=...), "
-        "common/processor.py:523-525 @ 9035151d6) with librosa, and a "
-        "windowed-sinc resampler is a numerically delicate port of its own. "
-        "Refused by name rather than fed to a front end that would produce "
-        "correctly-shaped wrong features. See .agents/specs/dots3-note.md "
-        "§4.14.5 and issue #2703.");
+        " Hz. RESAMPLING IS NOT PORTED and is owed to W7c-2: upstream "
+        "resamples in its data parser (MultiModalDataParser(target_sr=...), "
+        "vllm/models/dots3_note/common/processor.py:523-525 @ 9035151d6), "
+        "which reaches `resample_audio_pyav` — libswresample through "
+        "PyAV/FFmpeg (vllm/multimodal/audio.py:174-229 @ 9035151d6). NOT "
+        "librosa: no vLLM decode or resample path imports it. Rate conversion "
+        "is numerically delicate and this port has not chosen its tolerance "
+        "yet. Refused by name rather than fed to a front end that would "
+        "produce correctly-shaped wrong features. See "
+        ".agents/specs/dots3-note.md `## Owed` (W7c-2) and §4.16.");
   }
   if (num_samples <= 0) {
     throw v1::InputValidationError(
@@ -589,7 +592,7 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
     // `pad_or_trim(audio_segment.flatten(), length=self.chunk_samples)` then
     // `log_mel_spectrogram(pad_audio)` (`audio.py:213-214`), PER SEGMENT.
     // `WhisperAudioProcessor::ProcessWaveform` performs the pad itself
-    // (audio_processor.cpp:108-112, `padding="max_length"` with truncation), so
+    // (audio_processor.cpp:228-232, `padding="max_length"` with truncation), so
     // this call IS that pair. The `-8` floor inside it is a GLOBAL max over the
     // segment it is handed, which is why the front end is driven once per
     // segment and not once over the whole waveform.

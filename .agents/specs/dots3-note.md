@@ -4108,7 +4108,7 @@ having no oracle to catch it.
 |---|---|---|
 | any block with `pyramid_num_routed[i] > 0` | **W6b** | `Dots3NoteVisionRefusal` |
 | `quantization_config.weight_block_size` on the vision tower | **W9** | `Dots3NoteVisionRefusal` |
-| `audio` modality | **W7** — see the correction below | `EncodeMmDots3Note`, and the chat seam's `allowed_limits`. **LIFTED by W7a (§4.14)** for a 16 kHz mono PCM16 WAV at or under `chunk_seconds`; what remains refused is named in §4.14.5 |
+| `audio` modality | **W7** — see the correction below | `EncodeMmDots3Note`, and the chat seam's `allowed_limits`. **LIFTED by W7a (§4.14)** for a 16 kHz mono PCM16 WAV at or under `chunk_seconds`, and by W7b (§4.15) for one of ANY length; what remains refused is named in §4.14.5 as W7a left it, with the `chunk_seconds` row struck through |
 | `video` modality | **W8** — see the correction below | `EncodeMmDots3Note`, and the chat seam's `allowed_limits` |
 | `adapter_type == "pixel_shuffle_mlp"` | W6b | `ParseDots3NoteVisionParams` |
 | `post_norm == false` | W6b | `ParseDots3NoteVisionParams` |
@@ -5423,7 +5423,7 @@ a config it still refuses by name.
 
 | Refused | Named brick | Where |
 |---|---|---|
-| audio longer than `chunk_seconds` (60 s = 960000 samples) | **W7b** | `Dots3NoteAudioProcessor`, reached from the chat seam's route |
+| ~~audio longer than `chunk_seconds` (60 s = 960000 samples)~~ | **LIFTED by W7b (§4.15)** | was `Dots3NoteAudioProcessor`; the segment loop replaced it, and what stands in its place is the §4.15.3 geometry refusal |
 | any container but PCM16 mono RIFF/WAVE | **W7c** | the route, before decode |
 | any sampling rate but `audio_config.sampling_rate` (16000) | **W7c** | the route, before the front end |
 | `use_causal == true` | unshipped arm | `ParseDots3NoteAudioParams`, at INSTALL |
@@ -5467,6 +5467,13 @@ Past one chunk they diverge, the placeholder span stops matching the tower's row
 count, and a masked scatter that does not balance splices audio features onto
 text rows. W7b owns the segmentation; until it lands, the refusal is what keeps
 the two sides equal.
+
+**W7b HAS LANDED, and §4.15.3 records what replaced this refusal.** The segment
+loop makes the tower's row count `sum_i ceil(seg_i / 1280)`, and that sum equals
+the prompt side's one `ceil(total / 1280)` exactly when `chunk_samples` is a
+whole number of `token_stride`s — which the released config satisfies and the
+tiny fixture's own `chunk_seconds = 1` does not. A waveform spanning more than
+one chunk on a config that does not satisfy it is now what refuses by name.
 
 #### 4.14.6 The three marker ids come from the TOKENIZER, and the checkpoint was checked
 
@@ -5811,6 +5818,313 @@ no-bias — is CAUGHT: rel-L2 **0.0077 -> 0.0987** against the `5e-2` bound. It 
 a FOURTH tower-only defect the served suite cannot see, alongside C and D, and
 it is the mutation that proves the new seam arm's bias is applied rather than
 merely reachable.
+
+
+
+### 4.15 W7b lifts the `chunk_seconds` refusal, so a real recording is served
+
+**Issue: [#2797](https://github.com/mudler/vllm.cpp/issues/2797). Brick: W7b,
+on top of W7a ([#2703](https://github.com/mudler/vllm.cpp/issues/2703), merge
+`e5efa29f0`).** W7a decodes a WAV `input_audio` part, makes 128 mel bins, runs
+the 32-layer `dots` speech encoder and scatters the result into the prompt
+embeddings — for a clip at or under `chunk_seconds`, 60 s on the released
+config, and refuses anything longer BY NAME (§4.14.5). W7b writes the segment
+loop that refusal names. It is what makes the audio path usable on a recording
+rather than on a clip.
+
+#### 4.15.1 Upstream, and the exact `file:line@SHA` ported
+
+`dots3_note` does not exist at the parity pin `5559679229`, so every anchor
+below names `9035151d6`, read in the local clone `~/_git/vllm`
+(`git rev-parse 9035151d6` = `9035151d6c9fb726181469f9e6aa9ccbf9a5dacb`).
+
+| Upstream | What it is | Ported to |
+|---|---|---|
+| `nvidia/audio.py:193-234` | `DotsEncoderWithMask.encode_waveform` — the whole brick | `Dots3NoteAudioProcessor::SegmentWaveform` + `ProcessWaveform` + `Dots3NoteAudioForwardChunks` |
+| `nvidia/audio.py:196-203` | the `while time_step * SAMPLE_RATE < n` slicing loop | `SegmentWaveform` |
+| `nvidia/audio.py:209-212` | the per-segment `token_len` | `SegmentWaveform`, through the UNCHANGED `NumAudioTokens` |
+| `nvidia/audio.py:213-218` | `pad_or_trim` + `log_mel_spectrogram` + the `chunk_mel_frames` assert, per segment | `ProcessWaveform`'s loop body |
+| `nvidia/audio.py:220-227` | `torch.stack` of the mels, `input_seq_lens = token_lens * merge_factor`, ONE encoder call | `Dots3NoteAudioForwardChunks` |
+| `nvidia/audio.py:229-234` | keep `[idx, : token_len * merge_factor, :]` of each chunk, `torch.cat` | `Dots3NoteAudioForwardChunks`'s concatenation |
+| `nvidia/audio.py:129-147` | `compute_audio_token_length` — upstream's own chunked TOTAL | the identity §4.15.3 gates; DEAD upstream (`git grep` at `9035151d6` finds one hit, its own `def`) |
+| `nvidia/audio_encoder.py:664-685` | the varlen PACK: `cu_seqlens`, the valid-token mask, the gathered rope positions | §4.15.2 — why the loop IS this |
+| `nvidia/audio_encoder.py:711-719` | the varlen UNPACK back to `[B, max_seqlen, D]` | same |
+| `nvidia/audio_encoder.py:570-577` | `valid_mel_lens = audio_sample_lens // hop_length`, PER BATCH ELEMENT | the per-chunk `num_samples` W7a's tower already takes |
+| `common/processor.py:762-771` | the PROMPT side's one `ceil(total / stride)` | the UNCHANGED `NumAudioTokens`, and §4.15.3's invariant |
+
+#### 4.15.2 A loop over W7a's tower IS upstream's batched varlen call
+
+Upstream batches the chunk mels and makes ONE encoder call. This port calls
+W7a's single-chunk `Dots3NoteAudioForward` once per chunk and concatenates. That
+is the same function, not an approximation, and the reason is the varlen path
+itself:
+
+1. **The stem never mixes chunks.** `_forward_conv2d_stem` takes
+   `[B, 1, n_mels, T]` and masks each batch element from ITS OWN
+   `valid_mel_lens` (`audio_encoder.py:570-577`, `:545-561`). Conv2d is
+   batch-independent.
+2. **Attention never crosses a chunk.** The pack builds `cu_seqlens_q` from
+   `input_seq_lens.cumsum` (`:674-677`) and hands it to
+   `flash_attn_varlen_func` (`:276`), so each chunk is its own bidirectional
+   window. That is `AttentionDenseFlash` over one chunk, which is what W7a
+   already runs.
+3. **The rope positions RESTART at 0 per chunk.** `position_ids` is
+   `arange(S)` over the PADDED stem length (`:644-646`), and the pack then
+   gathers `token_positions.expand(B, S)[valid_token_mask]` (`:679-685`) — the
+   first `token_len` positions of EACH row. So chunk 7's first token carries
+   position 0, not `7 * 750`. W7a's cache is built at `arange(num_tokens)` and
+   is therefore already the right cache for every chunk.
+4. **Everything after the layers is ROW-WISE.** The unpack writes the kept rows
+   back into a zero-filled `[B, max_seqlen, D]` (`:711-719`); `layer_norm`
+   (`:721`), the adapter's LayerNorm, its two Linears and its GELU
+   (`audio.py:240-248`) all act on one row at a time, and the zero rows are
+   sliced away by `[idx, : token_len, :]` (`:229-234`) before anything reads
+   them.
+
+So the ONLY thing the batch buys upstream is one kernel launch instead of `k`.
+This port pays `k` launches and computes the same numbers. **W7a's single-chunk
+path is byte-identical under this change** — at `k == 1` the loop calls the same
+function with the same arguments — which is what makes W7b additive rather than
+a rewrite, and it is also the answer to the NEEDS_DECISION the dispatch named:
+the pack/unpack CAN be mirrored without touching that path, because for one
+chunk it degenerates to a prefix slice and for many it degenerates to `k`
+independent prefix slices.
+
+**The log-mel is computed PER SEGMENT and that is not an optimisation.**
+`log_mel_spectrogram` floors at `log_spec.max() - 8.0` (`audio.py:124`), a
+GLOBAL max over the tensor it is given. Upstream gives it one padded segment at
+a time (`:213-214`), so the floor is per-chunk. A port that ran the front end
+once over the whole waveform and sliced the mel afterwards would use ONE max for
+every chunk, and the difference is a per-chunk additive shift on the quietest
+bands of the quietest chunk. This port calls the same
+`WhisperAudioProcessor::ProcessWaveform` per segment, which is upstream's shape.
+
+#### 4.15.3 The one arithmetic invariant, and the new refusal that guards it
+
+`NumAudioTokens` IS NOT TOUCHED, and #2797 records why. Upstream's per-segment
+count is `(segment_length - 1) // (HOP_LENGTH * conv_temporal_stride *
+merge_factor) + 1` (`audio.py:210-212`) and W7a wrote `ceil(n / 1280)`. These
+are algebraically identical for every `n >= 1`. They differ at `n == 0`, and
+only in C++: Python's `//` floors, so `(0-1)//1280 + 1 == 0`, while C++ integer
+division truncates toward zero, so a literal transcription yields
+`(-1)/1280 + 1 == 1` — one phantom token for an empty segment. W7b ports the
+identity, not the characters. The reference in the gate carries upstream's
+LITERAL expression, and it is safe there for a reason worth writing down: the
+slicing loop's `while time_step * SAMPLE_RATE < n` condition (`:196`) means no
+segment is ever empty, so the `n == 0` case the two forms disagree on is
+unreachable from either side.
+
+The invariant W7b must hold is between TWO DIFFERENT upstream expressions:
+
+* the PROMPT side counts `math.ceil(total / stride)` in one go
+  (`processor.py:771`), which is what `NumAudioTokens(total)` computes and what
+  the placeholder span is built from;
+* the TOWER produces `sum_i ceil(seg_i / stride)` rows, which is upstream's own
+  `compute_audio_token_length` (`audio.py:129-147`).
+
+Write `C = chunk_samples`, `s = token_stride` and `n = total`. Every segment but
+the last is exactly `C` long, so the sum is `k * ceil(C/s) + ceil(rem/s)` and
+the prompt side is `ceil((kC + rem)/s)`. **The two are equal for every `n`
+exactly when `C % s == 0`**, and they differ otherwise: at `C = 16000`, `s =
+1280` (the tiny fixture's own geometry) a 2.5-chunk waveform gives 13+13+7 = 33
+rows against a span of `ceil(40000/1280) = 32`.
+
+The released config satisfies it — `chunk_samples` 960000 = 750 * 1280 — and so
+does every EVEN `chunk_seconds` at 16 kHz, because `16000 * cs % 1280 == 0` iff
+`cs` is even. A config that does not satisfy it is one upstream itself would
+splice on, since upstream runs both expressions and never compares them. This
+port compares them and REFUSES BY NAME, per request, when the waveform actually
+spans more than one chunk:
+
+> the waveform needs `k` chunks and this checkpoint's `audio_config` gives
+> `chunk_samples` that is not a whole number of `token_stride`s, so the
+> placeholder span and the tower's row count would differ.
+
+**It is a per-request refusal and not an install-time one, deliberately.** The
+predicate is a property of the REQUEST as much as of the config: at `chunk_samples
+% token_stride != 0` a single-chunk clip is still served correctly, because a
+one-segment sum is `ceil(n/s)` on both sides. Refusing the whole audio capability
+at install would refuse clips upstream serves. It is raised from
+`ProcessWaveform`, which runs in the CHAT SEAM before the engine — the same place
+W7a's rate refusal is raised, as an `InputValidationError` mapping to HTTP 400 —
+and NOT from `encode_mm`, where a throw runs in the engine's busy loop and turns
+every later request, text ones included, into a 500 (§4.14.5).
+
+#### 4.15.4 What changes, file by file
+
+| File | Change |
+|---|---|
+| `include/vllm/multimodal/inputs.h` | `AudioKwargs` gains `num_chunks` (default 1) and the two per-chunk length vectors. `input_features` becomes `[num_chunks, n_mels, n_frames]`; at `num_chunks == 1` the layout is byte-identical to W7a's and every pre-W7b producer and consumer is unchanged |
+| `include/vllm/multimodal/dots3_note_processor.h` | `Dots3NoteAudioProcessor::AudioChunk` and `SegmentWaveform`, the production seam a gate can drive without a front end; `ProcessWaveform`'s contract |
+| `src/vllm/multimodal/dots3_note_processor.cpp` | `SegmentWaveform` (`audio.py:196-212`); `ProcessWaveform` loops (`:208-218`); the `chunk_seconds` refusal is REPLACED by the §4.15.3 one |
+| `src/vllm/model_executor/models/dots3_note_audio.{h,cpp}` | `Dots3NoteAudioForwardChunks` (`audio.py:220-234`), which is the production entry point from W7b on. `Dots3NoteAudioForward` keeps its arithmetic and gains ONE check: upstream's `assert mel.shape[1] == self.chunk_mel_frames` (`audio.py:215`), made executable there, with `chunk_seconds` carried on `Dots3NoteAudioParams` as `DotsEncoderWithMask` carries it (`audio.py:169-171`). §4.15.6 records why: without it M5 is GREEN |
+| `src/vllm/model_executor/models/dots3_note_registry.cpp` | `EncodeAudioDots3Note` calls the chunked function |
+| `src/vllm/entrypoints/openai/mm_chat_dots3note.cpp` | the comment over `ProcessWaveform` names the refusal that is left, and records that this call is the FRONT END and not the engine loop |
+| `docs/FEATURES.md`, `docs/USAGE.md` | both stated the `chunk_seconds` ceiling as owed to W7b; both now state what is served and what the divisibility invariant refuses |
+| `tests/vllm/models/dots3_note_tiny_fixture.h` | a length-parameterised long clip, and the `a_chunk_seconds` knob it drives |
+| `tests/vllm/models/test_dots3_note_audio.cpp` | `ref_chunks`, the third reference namespace, and the seam cases |
+| `tests/vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp` | the served multi-chunk request and its two-waveform LOGPROB case |
+
+Every OTHER refusal is kept and stays owed: non-PCM16-mono-WAV and non-16 kHz
+(W7c), `use_causal`, `use_conv1d_stem`, `use_latent_input`, `merge_factor != 1`,
+`encoder_type != "dots"`, `use_rms_norm == false`, `use_rope == false`.
+
+#### 4.15.5 Gates — chunking needs shapes single-chunk did not
+
+No oracle (§6.4 option B), so correctness rests on the in-test double-precision
+references. W7a has two; W7b adds a THIRD, `ref_chunks`, for the segmentation
+GEOMETRY — the offsets, the per-segment lengths, the per-segment token counts
+and the row offset of each chunk in the concatenation. It is written from
+`audio.py:196-234` and uses nothing but `std::`. The heavy numerics are NOT
+re-written: the driver hands each segment to `ref_front::LogMel` and to the
+existing `RefTower`, both unchanged, at the geometry `ref_chunks` derived.
+**W7a's enumeration instrument is EXTENDED to cover it** — the same
+`QualifiedNamesIn` reading this file's own bytes at run time, with the scope-set
+assertion and the two counts, now over three namespaces — rather than a second
+instrument being written.
+
+**A tolerance on the concatenated output cannot see any of these, and each
+produces correctly-shaped output**, so each gets a SEAM assertion rather than an
+aggregate one:
+
+| Defect | What the aggregate sees | The seam assertion |
+|---|---|---|
+| off-by-one in the per-chunk `token_len` slice | a norm that is still small | per-chunk row COUNTS from `SegmentWaveform` against `ref_chunks`, and the concatenated row at each boundary against that chunk's reference row 0 |
+| chunks concatenated in the WRONG ORDER | nothing — every row is a correct row | each chunk's block of the output compared against ITS OWN reference block, and the deliberately reversed concatenation asserted to DIFFER |
+| the short final chunk padded but not truncated | a longer output, but every row well-formed | the last chunk's row count asserted `< ` the full chunks', and the total asserted equal to the placeholder span |
+| the temporal mask taken from the PADDED length | a small norm change | the last chunk driven at both lengths in the reference and asserted to DIFFER on its LAST KEPT row |
+
+**The geometry is chosen so none of the four can alias.** `a_chunk_seconds = 2`
+(32000 samples, 25 token strides — §4.15.3's condition holds), a waveform of
+80000 samples = 5 s = **2.5 chunks**: THREE chunks, of which the last is
+genuinely SHORT, with per-chunk token counts **25, 25, 13** summing to 63 =
+`ceil(80000/1280)`. Three chunks means a reversal is not a swap of two equal
+halves; a short last chunk means the truncation is exercised; and 80000 is not a
+multiple of `chunk_samples`, which is what makes the last chunk short.
+
+#### 4.15.6 Reachability
+
+Production entry point `ApiServer::handle_chat_completions` on the default
+configuration, with an `input_audio` part longer than `chunk_seconds`. That
+request is HTTP 400 at W7a's head — "SEGMENTATION IS NOT PORTED" — which is the
+RED. The two-different-waveforms LOGPROB case is mandatory and is the
+load-bearing one: status and token counts pass on a tree whose tower is a
+correctly-shaped constant.
+
+What the served suite CANNOT do here is recorded by W7a and is not re-learned:
+it gates REACHABILITY, not tower arithmetic — four separate tower-only defects
+leave it green (§4.14.12). Chunk-seam defects are gated at the
+processor/tower level against the references; the served case proves reach.
+
+The mutations, each RED-first, each restored byte-for-byte, each reported with
+the binary's sha256 AND the case counts:
+
+| # | Mutation | Where |
+|---|---|---|
+| M1 | reverse the chunk order in the concatenation | `Dots3NoteAudioForwardChunks` |
+| M2 | drop the final short chunk's truncation (keep all stem rows) | same |
+| M3 | off-by-one the per-chunk slice | same |
+| M4 | compute the temporal mask from the PADDED length | `ProcessWaveform`'s per-chunk `num_samples` |
+| M5 | delete the production call that lifts the refusal | `EncodeAudioDots3Note` |
+
+**M5 MEASURED A REACHABILITY HOLE AND CLOSED IT, and that is the finding of this
+brick.** Written as a pure deletion M5 is trivial. Written as the substitution it
+has to be — put W7a's `Dots3NoteAudioForward(mel.input_features, mel.num_samples,
+mel.num_tokens, ...)` back, so nothing in production reaches
+`Dots3NoteAudioForwardChunks` — the served suite stayed GREEN and the tower suite
+stayed green with it. The reason is that the flattened call produces a
+correctly-SHAPED answer with the RIGHT ROW COUNT: it reads the stacked mel as one
+600-frame mel, takes 75 stem rows and returns the first 63, which is exactly the
+placeholder span. Two different waveforms still give two different logprobs, so
+even the load-bearing case cannot see it. A gate that stays green without the
+call site measures a class, not a capability, so the hole was closed rather than
+recorded: `Dots3NoteAudioForward` now carries upstream's own
+`assert mel.shape[1] == self.chunk_mel_frames` (`audio.py:215`), which is the one
+number that separates one chunk from a stack of them, and M5 is RED at the
+entrypoint. A case drives that check directly so it is not a mute switch.
+
+#### 4.15.7 Risks
+
+1. **The divisibility invariant is silent when it fails.** Mitigated by
+   §4.15.3's refusal and by a case that drives the tiny fixture's OWN
+   non-divisible geometry and asserts the refusal names it.
+2. **`AudioKwargs` is shared with Whisper's `RouteAudioWav`.** Mitigated by
+   defaulting `num_chunks` to 1 and leaving the two vectors empty, so the
+   pre-W7b layout is the `num_chunks == 1` case and no other producer changes.
+3. **A per-chunk encoder call costs `k` launches where upstream pays one.** No
+   performance axis is claimed on this row (§0), and the alternative is a
+   batched tower this port has no other caller for.
+
+#### 4.15.8 Stop conditions
+
+Stop and report `NEEDS_DECISION` if the varlen pack/unpack cannot be mirrored
+without changing W7a's single-chunk path (it can — §4.15.2), or if the geometry
+in the issue, this spec and the fixture disagree.
+
+#### 4.15.9 Evidence, measured 2026-09-03
+
+Host: the developer's x86-64 Linux box, CPU queue, `-DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`. No GPU
+lease was taken and no number here is a performance number. The build is SCOPED
+to the two targets this brick moves, because the box was at 97% on `/` and a
+full-tree link on this row has already produced ENOSPC failures that read like
+real defects; the build tree lives in `/dev/shm`.
+
+Oracle identity asserted before any citation: `git rev-parse HEAD` in
+`~/_git/vllm` is `5559679229bc961848b121ccdeaa8fa5d79bec98`, this project's
+parity pin, which carries no `dots3_note`; every anchor below therefore names
+`9035151d6c` (`[Model] Add native Dots3 NOTE multimodal support (#51255)`), read
+out of that same checkout with `git show`.
+
+| Suite (REAL target name) | Result |
+|---|---|
+| `test_dots3_note_audio` | **20 cases, 3869 assertions, 0 failed** (19 / 3858 before the reachability repair) |
+| `test_openai_api_server_dots3_mm_forward` | **26 cases, 311 assertions, 0 failed** |
+
+Baseline binaries: `test_dots3_note_audio`
+`bad4cfd1c4ac035c3e73a8db217364dc5b06b8f5f3080b651d789c9070bcd280`,
+`test_openai_api_server_dots3_mm_forward`
+`0e5ac1a9201da4f2a7314ac195290423e52f940104fced6e4db46398386e0c0f`. Both were
+recomputed after the last mutation was restored and match byte for byte.
+
+**RED at W7a's production head.** The seven production files were checked out at
+`e64f00560` — the merge base — with the tests, the fixture and the docs kept, and
+`test_openai_api_server_dots3_mm_forward` was rebuilt
+(`54ab3d22f4aba33312fb14fe7466b67f062422d164d24a0812b504f9be0e8b80`). It failed
+**3 cases / 7 assertions**, the two reach cases on `REQUIRE(r.status == 200)` and
+the refusal case on the message, with the body carrying "SEGMENTATION IS NOT
+PORTED and is owed to W7b". The tower suite cannot be built at that head, because
+`SegmentWaveform`, `AudioChunk` and `Dots3NoteAudioForwardChunks` do not exist
+there and a build failure is not a red.
+
+**The independence instrument, extended rather than duplicated**, reading this
+file's own bytes at run time: `ref_front` 11 distinct / 71 occurrences,
+`ref_tower` 6 / 53, `ref_chunks` 2 / 25, every scope `std` and nothing else.
+
+**The mutations**, each applied by a harness that asserts the mutation APPLIED
+and the build SUCCEEDED before it reads a result, each restored byte-for-byte:
+
+| # | `test_dots3_note_audio` | `test_openai_api_server_dots3_mm_forward` | audio binary sha256 |
+|---|---|---|---|
+| M1 reverse the chunk order | **1 case / 9 assertions FAILED** | 26 / 311 pass | `f149ecef2a1915ff663000d206ad0181fa6d3603b4b2a116d308e0dbb9361d06` |
+| M2 no truncation of the short chunk | **2 cases / 2 assertions FAILED** | **2 cases / 2 FAILED** (500: "75 embedding rows for a placeholder span of 63") | `8d84f47495ac4d0df41eaf03112d498ea3daf2bd78862911a78d89fa284d6715` |
+| M3 off-by-one the per-chunk slice | **2 cases / 12 assertions FAILED** | 26 / 311 pass | `44f2cd8c49aa278e8c249efb57f40b5c24615ff4a889fa206bdd35b9cc9940f5` |
+| M4 mask from the PADDED length | **3 cases / 14 assertions FAILED** | 26 / 311 pass | `7bdc11e55ed400b13babd04b8a57f1c776b252b25a04ccbb2c8f589960286ae3` |
+| M5 delete the production call site | 20 / 3869 pass | **2 cases / 2 FAILED** (500: "the mel holds 9600 values, which is not ONE chunk of 16 x 200") | `87d9ae650bb38818a9906ae8dd205e310962f612d102bd48035c7d199ed77ff5` |
+
+Every sha differs from the baseline and from every other row, so no result is a
+stale binary reporting green. The M1/M3/M4 column of served greens is not a gap:
+it is §4.14.12's measurement reproduced — the served suite gates REACHABILITY and
+not tower arithmetic — and it is why the seams are gated where they are.
+
+**The geometry gated**: `chunk_seconds` 2 = 32000 samples = 200 mel frames = 25
+token strides; a clip of 80000 samples = 5 s = 2.5 chunks -> **32000, 32000,
+16000** samples contributing **25, 25, 13** rows = 63 = `ceil(80000/1280)`. The
+boundary walk drives 1, 1280, 31999, 32000, 32001, 80000 and 96000 samples and
+asserts, at each, that the segments TILE the waveform and that the per-segment
+sum equals `NumAudioTokens`. The refusal case drives the fixture's OWN
+non-divisible `chunk_seconds` 1 at 40000 samples, where the sum is 33 against a
+span of 32, and asserts that a clip inside one chunk is still served there.
 
 
 ## 5. Gates
@@ -6397,19 +6711,17 @@ change as the lifecycle move, not afterwards.
 
 Carried openly under option B (§6.4), not waived:
 
-- **W7b — audio longer than one `chunk_seconds`.** Upstream's tower splits a
-  waveform into `chunk_seconds`-long segments, mel-pads each to `chunk_samples`,
-  runs them as a BATCH through the varlen path and concatenates the per-segment
-  row slices (`audio.py:193-234` @ `9035151d6`); the prompt side counts
-  `ceil(total_samples / stride)` in one go (`processor.py:771`), while the tower
-  sums `ceil(chunk_len / stride)` per segment (`audio.py:141-146`). Those two
-  numbers AGREE for a waveform at or under one chunk and DIVERGE past it, and a
-  divergence there is a masked scatter that does not balance — audio rows
-  spliced onto text rows, which no shape check sees. W7a therefore refuses a
-  longer waveform BY NAME (§4.14.5) rather than serving the first 60 seconds or
-  computing the wrong span. Closing it is the segment loop plus a batched varlen
-  encoder pass, and it is invisible to every fixture shorter than a minute.
-  Owner: this row, W7b. Tracked in this section rather than as an issue, per
+- **A checkpoint whose `chunk_samples` is not a whole number of `token_stride`s
+  serves ONE chunk and refuses more.** W7b ([#2797](https://github.com/mudler/vllm.cpp/issues/2797),
+  §4.15) landed the segment loop, so audio longer than `chunk_seconds` is served
+  rather than refused. What is still owed is the arm §4.15.3 names: on such a
+  config upstream's prompt-side `ceil(total / stride)` (`processor.py:771`) and
+  its tower-side `sum_i ceil(seg_i / stride)` (`audio.py:129-147`) disagree, so
+  a multi-chunk waveform is refused BY NAME rather than spliced. No published
+  checkpoint has such a config — the released one is 960000 = 750 * 1280 — and
+  upstream does not compare the two expressions at all, so serving it correctly
+  needs a decision about WHICH of upstream's two numbers is the placeholder
+  count. Owner: this row. Tracked in this section rather than as an issue, per
   AGENTS.md's "an issue you do not fix in the same flow has to say who owns it".
 - **W7c — every audio container and sampling rate but PCM16 mono WAV at 16
   kHz.** Upstream resamples in the data parser
@@ -7266,5 +7578,26 @@ double-precision references, one for the front end and one for the tower,
 sharing no helper with the implementation. No performance number is claimed on
 any axis.
 
-**Next dispatchable: W7b/W7c for the rest of the audio front end, W8 for video
+**W7b — LANDED, and the clip may now be a recording.**
+([#2797](https://github.com/mudler/vllm.cpp/issues/2797), evidence §4.15.) The
+`chunk_seconds` refusal is gone: a waveform of any length is sliced into
+`chunk_seconds` segments, each padded to `chunk_samples` and mel'd on its own,
+each run through the tower at its OWN valid length, and the per-segment row
+slices concatenated in order (`audio.py:193-234` @ `9035151d6`). Upstream
+batches the segments into one encoder call and this port loops; §4.15.2 shows
+those are the same numbers, because the varlen pack gives each chunk its own
+`cu_seqlens` window and restarts its rope positions at 0, so the chunks never
+interact. `NumAudioTokens` is UNCHANGED — #2797 checked that upstream's
+`(n-1)//1280 + 1` and W7a's `ceil(n/1280)` are the same function for every
+`n >= 1` and differ only at `n == 0`, where a literal C++ transcription would
+invent a token.
+
+**A THIRD reference namespace came with it,** `ref_chunks`, for the
+segmentation geometry alone, under W7a's existing run-time enumeration
+instrument rather than a second one. The seams a tolerance cannot see — an
+off-by-one slice, a reversed concatenation, an untruncated short chunk, a mask
+taken from the padded length — are gated as row counts and boundary rows at a
+geometry chosen so none of them can alias: three chunks, the last one short.
+
+**Next dispatchable: W7c for the rest of the audio front end, W8 for video
 and the MM ABI, or W9 for the quantized arms.**

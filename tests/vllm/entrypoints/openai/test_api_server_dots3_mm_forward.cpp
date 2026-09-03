@@ -59,6 +59,7 @@
 #include <nlohmann/json.hpp>
 
 #include "dots3_note_tiny_fixture.h"
+#include "vllm/multimodal/audio_resample.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/multimodal/dots3_note_processor.h"
 #include "vllm/multimodal/pil_resize.h"
@@ -1369,7 +1370,7 @@ TEST_CASE("dots3-note W7a: a checkpoint with NO audio_config refuses the audio p
   CHECK(t.status == 200);
 }
 
-TEST_CASE("dots3-note W7a+W7c-1: a non-PCM16 container and a wrong rate refuse BY NAME, and the container refusal is NOT this row's") {
+TEST_CASE("dots3-note W7c-1+W7c-2: the container refusal is NOT this row's, and a wrong rate no longer refuses at all") {
   Served s(AudioSpec());
   MmServerHarness h(s.config, *s.model, Fixture());
   std::ostringstream log;
@@ -1394,21 +1395,33 @@ TEST_CASE("dots3-note W7a+W7c-1: a non-PCM16 container and a wrong rate refuse B
     // (spec 4.16.4).
     CHECK(r.body.find("librosa") == std::string::npos);
   }
-  SUBCASE("a 22050 Hz WAV names the resampler refusal and W7c-2") {
+  SUBCASE("a 22050 Hz WAV is SERVED, because W7c-2 RESAMPLES it") {
+    // TRUE-BEFORE / FALSE-AFTER, and the ownership test for W7c-2 (#2828).
+    // THE REQUEST IS BYTE-IDENTICAL to the one this subcase used to send. It
+    // asserted `status == 400`, that the body named "RESAMPLING IS NOT PORTED"
+    // and W7c-2, and that the message said libswresample. The RED-before is in
+    // spec §4.17.11 verbatim.
     const ApiServer::DispatchResult r = h.server.handle_chat_completions(
         ChatBodyWithAudio(1, dots3_tiny::FixtureAudioWav(0, /*sample_rate=*/22050),
                           false)
             .dump());
     INFO("body: ", r.body);
-    CHECK(r.status == 400);
-    CHECK(r.body.find("W7c-2") != std::string::npos);
-    CHECK(r.body.find("RESAMPLING IS NOT PORTED") != std::string::npos);
-    // The rate message CLAIMED librosa does the resample. libswresample does,
-    // and no vLLM path imports librosa at all (spec 4.16.4). The message now
-    // says so explicitly, so the assertion is on the CLAIM and not on the word.
-    CHECK(r.body.find("with librosa") == std::string::npos);
-    CHECK(r.body.find("NOT librosa") != std::string::npos);
-    CHECK(r.body.find("libswresample") != std::string::npos);
+    CHECK(r.status == 200);
+    CHECK(r.body.find("RESAMPLING IS NOT PORTED") == std::string::npos);
+    CHECK(r.body.find("W7c-2") == std::string::npos);
+    // 8000 frames read as 22050 Hz resample to `ceil(8000 * 320 / 441)` = 5805,
+    // a `ceil(5805 / 1280)` = 5 token span rather than the 7 the same frames
+    // carry at 16 kHz. The span MOVED, which a pass-through could not do.
+    const json j = json::parse(r.body);
+    const ApiServer::DispatchResult at16 = h.server.handle_chat_completions(
+        ChatBodyWithAudio(1, dots3_tiny::FixtureAudioWav(0), false).dump());
+    REQUIRE(at16.status == 200);
+    const int64_t t22 = j.at("usage").at("prompt_tokens").get<int64_t>();
+    const int64_t t16 =
+        json::parse(at16.body).at("usage").at("prompt_tokens").get<int64_t>();
+    MESSAGE("the same 8000 frames: " << t22 << " prompt tokens declared at "
+            << "22050 Hz, " << t16 << " at 16000 Hz");
+    CHECK(t22 == t16 - 2);
   }
   SUBCASE("a payload that is not a RIFF/WAVE buffer at all is refused, not decoded") {
     const std::vector<uint8_t> junk(2048, 0x41);
@@ -1762,4 +1775,110 @@ TEST_CASE("dots3-note W7b: a NON-DIVISIBLE chunk geometry refuses a LONG clip at
           .dump());
   INFO("text body: ", t.body);
   CHECK(t.status == 200);
+}
+
+// W7c-2 (#2828): A 44.1 kHz WAV IS SERVED, AND ITS ANSWER IS THE RESAMPLED
+// AUDIO'S.
+//
+// The entry point is unchanged — `ApiServer::handle_chat_completions` ->
+// `InstallMultiModalChatSeam` -> `MakeDots3NoteChatSeam` ->
+// `RouteDots3NoteAudioWav` -> `Dots3NoteAudioProcessor::ProcessWaveform`. What
+// changed is that the last hop resamples instead of throwing, and the subcase
+// above is the inversion of the refusal that used to sit there.
+//
+// The fixture is the SAME CONTINUOUS SIGNAL as the mono clip, sampled at 44100
+// for the same 0.5 s: 22050 frames, which resample to exactly 8000 and expand
+// the same 7-token span. That token count is the assertion a pass-through
+// cannot survive and it needs no value from the resampler at all.
+TEST_CASE("dots3-note W7c-2: a 44.1 kHz WAV is SERVED, at the RESAMPLED span") {
+  const auto serve = [](const std::vector<uint8_t>& wav, bool logprobs) {
+    Served s(AudioSpec());
+    MmServerHarness h(s.config, *s.model, Fixture());
+    std::ostringstream log;
+    REQUIRE(h.install(kDots3Arch, true, s.ckpt, log) ==
+            oai::MultiModalChatInstall::kInstalled);
+    return h.server.handle_chat_completions(
+        ChatBodyWithAudio(1, wav, logprobs).dump());
+  };
+  const auto logprobs_of = [&serve](const std::vector<uint8_t>& wav) {
+    const ApiServer::DispatchResult r = serve(wav, /*logprobs=*/true);
+    INFO("body: ", r.body);
+    REQUIRE(r.status == 200);
+    const json j = json::parse(r.body);
+    std::vector<double> out;
+    for (const json& t :
+         j.at("choices")[0].at("logprobs").at("content")[0].at("top_logprobs")) {
+      out.push_back(t.at("logprob").get<double>());
+    }
+    return out;
+  };
+  const auto worst_gap = [](const std::vector<double>& a,
+                            const std::vector<double>& b) {
+    REQUIRE(a.size() == b.size());
+    REQUIRE(!a.empty());
+    double w = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      w = std::max(w, std::fabs(a[i] - b[i]));
+    return w;
+  };
+
+  const std::vector<uint8_t> wav44 =
+      dots3_tiny::FixtureAudioWavAtRate(0, 44100);
+
+  // (a) IT SERVES. This is the true-before / false-after line: the same shape
+  // of request answered 400 before this slice, and the RED is in spec §4.17.11.
+  const ApiServer::DispatchResult r = serve(wav44, /*logprobs=*/false);
+  INFO("44.1 kHz body: ", r.body);
+  REQUIRE(r.status == 200);
+  const json j = json::parse(r.body);
+  CHECK(j.at("object") == "chat.completion");
+  CHECK(j.at("usage").at("completion_tokens") == 1);
+
+  // (b) THE SPAN IS THE RESAMPLED ONE. 22050 frames at 44100 become 8000 at
+  // 16000, which is a 7-token span; an unresampled 22050-sample waveform would
+  // expand `ceil(22050 / 1280)` = 18. The mono 16 kHz clip is served here as
+  // the reference count rather than a literal, so the two cannot drift.
+  const ApiServer::DispatchResult m =
+      serve(dots3_tiny::FixtureAudioWav(0), /*logprobs=*/false);
+  REQUIRE(m.status == 200);
+  const int64_t tokens_44 = j.at("usage").at("prompt_tokens").get<int64_t>();
+  const int64_t tokens_16 =
+      json::parse(m.body).at("usage").at("prompt_tokens").get<int64_t>();
+  MESSAGE("prompt tokens: 44.1 kHz " << tokens_44 << ", 16 kHz " << tokens_16);
+  CHECK(tokens_44 == tokens_16);
+
+  // (c) THE ANSWER IS THE RESAMPLED AUDIO'S. The same clip, resampled OFFLINE
+  // here and sent as a 16 kHz file, must give the same first-token logprobs.
+  //
+  // NOT BIT-FOR-BIT, and the reason is the container rather than the arithmetic:
+  // the offline arm has to quantize its float result back to PCM16 to put it in
+  // a WAV, which the served arm never does. So the gap is bounded by one
+  // quantization step and NOT by zero, and (d) is what makes the bound mean
+  // something.
+  const std::vector<float> f44 =
+      dots3_tiny::FixtureAudioF32AtRate(0, 44100);
+  const std::vector<float> off = vllm::multimodal::ResampleAudioScipy(
+      f44.data(), static_cast<int64_t>(f44.size()), 44100, 16000);
+  REQUIRE(off.size() == static_cast<std::size_t>(dots3_tiny::kAudioSamples));
+  std::vector<int16_t> off_pcm(off.size());
+  for (std::size_t i = 0; i < off.size(); ++i) {
+    const double v = static_cast<double>(off[i]) * 32768.0;
+    const double c = v < -32768.0 ? -32768.0 : (v > 32767.0 ? 32767.0 : v);
+    off_pcm[i] = static_cast<int16_t>(std::lround(c));
+  }
+  const std::vector<double> lp44 = logprobs_of(wav44);
+  const std::vector<double> lpoff =
+      logprobs_of(dots3_tiny::FixtureWavFromPcm16(off_pcm));
+  const double gap_offline = worst_gap(lp44, lpoff);
+
+  // (d) ...and NOT a DIFFERENT clip's, which is what makes (c) load-bearing.
+  // Variant 1 is the two-tone beat, a genuinely different signal and not a
+  // shifted copy, so a tower that ignored its input would fail here.
+  const double gap_other =
+      worst_gap(lp44, logprobs_of(dots3_tiny::FixtureAudioWav(1)));
+  MESSAGE("44.1 kHz vs its own offline resample: " << gap_offline
+          << "; vs a DIFFERENT clip: " << gap_other);
+  CHECK(gap_offline < 5e-2);
+  CHECK(gap_other > 1e-2);
+  CHECK(gap_other > 100.0 * gap_offline);
 }

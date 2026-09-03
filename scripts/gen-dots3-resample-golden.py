@@ -154,7 +154,13 @@ def scipy_resample(x, orig_sr, target_sr):
 
 
 def fmt(v):
-    return "%.9gf" % float(np.float32(v))
+    # `%.9g` alone emits "0" for a zero and "1" for a one, and `0f` is not a
+    # C++ literal — the suffix needs a decimal point or an exponent in front of
+    # it. Nine significant digits is what makes a float32 round-trip exactly.
+    text = "%.9g" % float(np.float32(v))
+    if "." not in text and "e" not in text and "E" not in text:
+        text += ".0"
+    return text + "f"
 
 
 def emit(values, per_line=6, indent="    "):

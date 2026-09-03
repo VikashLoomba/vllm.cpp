@@ -51,7 +51,9 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dots3_note.h"
 #include "vllm/multimodal/dots3_note_processor.h"
+#include "dots3_note_resample_golden.h"
 #include "vllm/multimodal/audio_processor.h"
+#include "vllm/multimodal/audio_resample.h"
 #include "vllm/multimodal/mel_filter_bank.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
@@ -61,6 +63,24 @@ using dots3_tiny::TinyCheckpoint;
 using dots3_tiny::TinySpec;
 
 namespace {
+
+// The value tolerance for the W7c-2 resampler (#2828), and its DERIVATION.
+//
+// Measured on this build the port reproduces scipy's own float32 output BIT FOR
+// BIT on four of the five golden cases and to 8.31e-18 on the fifth, so "twice
+// the measured floor" would be 1.7e-17. THAT IS NOT THE BOUND, and gating on it
+// would be gating on a coincidence of rounding: the port and scipy agree to
+// ~1e-15 in DOUBLE, and everything after that is one narrowing store, whose
+// granularity is a `float` ulp. A legitimate platform difference — another
+// libm's `sin` by one ulp in the filter taps, or a contracted multiply-add in
+// the convolution — moves the double answer by ~1e-16 relative, which usually
+// narrows to the same float and can narrow to the adjacent one.
+//
+// So the bound is TWO FLOAT ULPS at the fixtures' peak of ~0.99, which is
+// 1.2e-7. Every defect this gate exists to catch is orders above it: a
+// one-sample phase shift moves an output by up to 0.34 on these fixtures, and a
+// nearest-sample decimation by 0.053 to 0.457.
+inline constexpr double kResampleTol = 1.2e-7;
 
 std::string FixtureDir() { return DOTS3_NOTE_CKPT_FIXTURE_DIR; }
 std::string VoxtralFixtureDir() { return VOXTRAL_AUDIO_FIXTURE_DIR; }
@@ -492,6 +512,159 @@ std::vector<std::int64_t> MaskStages(std::int64_t length,
 }  // namespace ref_chunks
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 1c. THE RESAMPLE REFERENCE (W7c-2, #2828).
+//
+// A FOURTH reference namespace, under the SAME run-time enumeration instrument
+// W7a wrote and W7b extended, because reference code the instrument does not
+// read is reference code whose independence nothing measures.
+//
+// It transcribes `scipy.signal.resample_poly` at its defaults from scipy's own
+// source — `_signaltools.py::resample_poly`, `_fir_filter_design.py::firwin`,
+// `windows._windows.kaiser` — which is the arm upstream's `resample_audio_scipy`
+// calls (`vllm/multimodal/audio.py:232-250` @ `9035151d6`). Spec §4.17.3 writes
+// the six steps out.
+//
+// WHAT THIS REFERENCE DOES AND DOES NOT ADD. It is the SAME algorithm as
+// `src/`, written twice, so it catches a transcription slip in one of the two
+// and nothing else. The actual oracle on this slice is
+// `dots3_note_resample_golden.h`, which is scipy's own output; this namespace
+// is the row's convention and the second opinion, not the authority. Spec
+// §4.17.7 says so in its own words.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace ref_resample {
+
+// MEASURED by the enumeration case below, as the other three are.
+//
+//  1 std::int64_t (39)   2 std::size_t (14)   3 std::vector (8)
+//  4 std::sin (1)        5 std::sqrt (1)
+//
+// 63 occurrences of 5 distinct names. That a windowed-sinc filter design needs
+// exactly TWO transcendentals is the shape to check: anything from `vt::` or
+// `vllm::` appearing in the measurement is a helper that leaked in from `src/`,
+// and the enumeration reads this file's own bytes rather than this list.
+inline constexpr int kDistinctQualifiedNames = 5;
+inline constexpr int kQualifiedNameOccurrences = 63;
+
+// `scipy.special.i0` as its own power series, `sum_k (x^2/4)^k / (k!)^2`. At
+// the kaiser default's beta = 5 the argument never exceeds 5.
+double I0(double x) {
+  const double q = x * x / 4.0;
+  double term = 1.0;
+  double total = 1.0;
+  for (int k = 1; k < 200; ++k) {
+    term *= q / (static_cast<double>(k) * static_cast<double>(k));
+    total += term;
+    if (term < 1e-18 * total) break;
+  }
+  return total;
+}
+
+// `numpy.sinc`.
+double Sinc(double x) {
+  if (x == 0.0) return 1.0;
+  const double p = 3.14159265358979323846 * x;
+  return std::sin(p) / p;
+}
+
+std::int64_t Gcd(std::int64_t a, std::int64_t b) {
+  while (b != 0) {
+    const std::int64_t t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+
+// The whole of `resample_poly(x, up, down)` at defaults, in double.
+std::vector<double> ResamplePoly(const std::vector<double>& x,
+                                 std::int64_t orig_sr, std::int64_t target_sr) {
+  const std::int64_t g = Gcd(orig_sr, target_sr);
+  const std::int64_t up = target_sr / g;
+  const std::int64_t down = orig_sr / g;
+  if (up == 1 && down == 1) return x;
+
+  // firwin(2 * half_len + 1, 1 / max_rate, window=("kaiser", 5.0)), scaled so
+  // the taps sum to `up`.
+  const std::int64_t max_rate = up > down ? up : down;
+  const double f_c = 1.0 / static_cast<double>(max_rate);
+  const std::int64_t half_len = 10 * max_rate;
+  const std::int64_t numtaps = 2 * half_len + 1;
+  const double alpha = 0.5 * static_cast<double>(numtaps - 1);
+  const double i0_beta = I0(5.0);
+  std::vector<double> h(static_cast<std::size_t>(numtaps));
+  double sum = 0.0;
+  for (std::int64_t i = 0; i < numtaps; ++i) {
+    const double m = static_cast<double>(i) - alpha;
+    const double r = m / alpha;
+    const double under = 1.0 - r * r;
+    const double win = I0(5.0 * std::sqrt(under > 0.0 ? under : 0.0)) / i0_beta;
+    h[static_cast<std::size_t>(i)] = f_c * Sinc(f_c * m) * win;
+    sum += h[static_cast<std::size_t>(i)];
+  }
+  for (double& v : h) v = v * static_cast<double>(up) / sum;
+
+  const std::int64_t n_in = static_cast<std::int64_t>(x.size());
+  const std::int64_t prod = n_in * up;
+  const std::int64_t n_out = prod / down + ((prod % down) != 0 ? 1 : 0);
+
+  const std::int64_t n_pre_pad = down - (half_len % down);
+  const std::int64_t n_pre_remove = (half_len + n_pre_pad) / down;
+  std::int64_t n_post_pad = 0;
+  // `_output_len(len_h, n_in, up, down) = ((n_in - 1) * up + len_h - 1)
+  //  // down + 1`.
+  while (((n_in - 1) * up + (static_cast<std::int64_t>(h.size()) + n_pre_pad +
+                             n_post_pad) - 1) / down + 1 <
+         n_out + n_pre_remove) {
+    ++n_post_pad;
+  }
+  std::vector<double> hh(static_cast<std::size_t>(n_pre_pad) + h.size() +
+                             static_cast<std::size_t>(n_post_pad),
+                         0.0);
+  for (std::size_t i = 0; i < h.size(); ++i)
+    hh[static_cast<std::size_t>(n_pre_pad) + i] = h[i];
+  const std::int64_t len_h = static_cast<std::int64_t>(hh.size());
+
+  std::vector<double> y(static_cast<std::size_t>(n_out), 0.0);
+  for (std::int64_t oi = 0; oi < n_out; ++oi) {
+    const std::int64_t t = (oi + n_pre_remove) * down;
+    std::int64_t j_lo = (t - len_h + up) / up;
+    if (j_lo < 0) j_lo = 0;
+    std::int64_t j_hi = t / up;
+    if (j_hi > n_in - 1) j_hi = n_in - 1;
+    double acc = 0.0;
+    for (std::int64_t j = j_lo; j <= j_hi; ++j)
+      acc += hh[static_cast<std::size_t>(t - j * up)] *
+             x[static_cast<std::size_t>(j)];
+    y[static_cast<std::size_t>(oi)] = acc;
+  }
+  return y;
+}
+
+// THE DEFECT THE GOLDEN TOLERANCE MUST BE ABLE TO SEE: no anti-alias filter at
+// all, just the nearest input sample. It is a legitimate "resampler" on
+// band-limited content and a wrong one on anything else, which is why the
+// golden set carries a case with a tone above the output Nyquist.
+std::vector<double> NearestSample(const std::vector<double>& x,
+                                  std::int64_t orig_sr,
+                                  std::int64_t target_sr) {
+  const std::int64_t n_in = static_cast<std::int64_t>(x.size());
+  const std::int64_t g = Gcd(orig_sr, target_sr);
+  const std::int64_t up = target_sr / g;
+  const std::int64_t down = orig_sr / g;
+  const std::int64_t prod = n_in * up;
+  const std::int64_t n_out = prod / down + ((prod % down) != 0 ? 1 : 0);
+  std::vector<double> y(static_cast<std::size_t>(n_out), 0.0);
+  for (std::int64_t i = 0; i < n_out; ++i) {
+    std::int64_t j = (i * down + up / 2) / up;
+    if (j > n_in - 1) j = n_in - 1;
+    y[static_cast<std::size_t>(i)] = x[static_cast<std::size_t>(j)];
+  }
+  return y;
+}
+
+}  // namespace ref_resample
+
+// ═══════════════════════════════════════════════════════════════════════════
 // THE ENUMERATION INSTRUMENT.
 //
 // Reads THIS source file at `DOTS3_AUDIO_TEST_SOURCE` (the same arrangement
@@ -672,7 +845,7 @@ TEST_CASE("dots3-note W7a: the SHARED slaney bank reproduces the committed voxtr
   CHECK(t_bad == 0u);
 }
 
-TEST_CASE("dots3-note W7a+W7b: the THREE references share no helper with src/, by enumeration") {
+TEST_CASE("dots3-note W7a+W7b+W7c-2: the FOUR references share no helper with src/, by enumeration") {
   // The row's convention (W6a 70, W6b 105, W6c 45 qualified names, all `std::`),
   // now over THREE namespaces since W7b (#2797).
   //
@@ -690,12 +863,16 @@ TEST_CASE("dots3-note W7a+W7b: the THREE references share no helper with src/, b
   // code the instrument does not read is reference code whose independence
   // nothing measures.
   const RefNames chunks = QualifiedNamesIn("ref_chunks");
+  // W7c-2 (#2828) extends it AGAIN, to a fourth namespace, for the same reason
+  // W7b did rather than writing a second instrument.
+  const RefNames resample = QualifiedNamesIn("ref_resample");
 
   // The instrument must be shown to have READ something. A parse that found an
   // empty span would otherwise report "zero non-std:: names" and pass.
   REQUIRE(front.occurrences > 0);
   REQUIRE(tower.occurrences > 0);
   REQUIRE(chunks.occurrences > 0);
+  REQUIRE(resample.occurrences > 0);
 
   MESSAGE("ref_front: " << front.distinct << " distinct, " << front.occurrences
                         << " occurrences, scopes=" << Join(front.scopes));
@@ -704,11 +881,15 @@ TEST_CASE("dots3-note W7a+W7b: the THREE references share no helper with src/, b
   MESSAGE("ref_chunks: " << chunks.distinct << " distinct, "
                          << chunks.occurrences
                          << " occurrences, scopes=" << Join(chunks.scopes));
+  MESSAGE("ref_resample: " << resample.distinct << " distinct, "
+                           << resample.occurrences
+                           << " occurrences, scopes=" << Join(resample.scopes));
 
   // The independence property itself.
   CHECK(Join(front.scopes) == "std");
   CHECK(Join(tower.scopes) == "std");
   CHECK(Join(chunks.scopes) == "std");
+  CHECK(Join(resample.scopes) == "std");
 
   // And the enumerated lists, now that they are the measurement's own output.
   CHECK(front.distinct == ref_front::kDistinctQualifiedNames);
@@ -717,6 +898,8 @@ TEST_CASE("dots3-note W7a+W7b: the THREE references share no helper with src/, b
   CHECK(tower.occurrences == ref_tower::kQualifiedNameOccurrences);
   CHECK(chunks.distinct == ref_chunks::kDistinctQualifiedNames);
   CHECK(chunks.occurrences == ref_chunks::kQualifiedNameOccurrences);
+  CHECK(resample.distinct == ref_resample::kDistinctQualifiedNames);
+  CHECK(resample.occurrences == ref_resample::kQualifiedNameOccurrences);
 
   // AND THE STRIPPER ITSELF, because the property above is only as true as the
   // scan that measures it. `StripCommentsAndLiterals` used to treat every `'`
@@ -807,7 +990,7 @@ TEST_CASE("dots3-note W7a: the front end agrees with an INDEPENDENT double refer
   }
 }
 
-TEST_CASE("dots3-note W7a+W7b: the front end REFUSES a wrong rate, and W7b MOVED the length refusal") {
+TEST_CASE("dots3-note W7c-2: the front end RESAMPLES a wrong rate, and W7b MOVED the length refusal") {
   const TinySpec spec = AudioSpec();
   const TinyCheckpoint ckpt(FixtureDir(), spec);
   vllm::multimodal::Dots3NoteAudioProcessorConfig cfg =
@@ -817,22 +1000,91 @@ TEST_CASE("dots3-note W7a+W7b: the front end REFUSES a wrong rate, and W7b MOVED
   const vllm::multimodal::Dots3NoteAudioProcessor proc(cfg);
   const std::vector<float> wav = dots3_tiny::FixtureAudioF32(0);
 
-  SUBCASE("a rate that is not `audio_config.sampling_rate` names W7c") {
-    std::string msg;
-    try {
-      proc.ProcessWaveform(wav.data(), static_cast<int64_t>(wav.size()), 22050);
-    } catch (const std::exception& e) {
-      msg = e.what();
-    }
-    CHECK(msg.find("22050") != std::string::npos);
-    CHECK(msg.find("W7c-2") != std::string::npos);
-    CHECK(msg.find("RESAMPLING IS NOT PORTED") != std::string::npos);
-    // W7c-1 (#2813) repaired the ORACLE claim in this message: libswresample
-    // through PyAV is what resamples upstream, and librosa is never imported
-    // anywhere under `vllm/` at `9035151d6` (spec 4.16.4).
-    CHECK(msg.find("with librosa") == std::string::npos);
-    CHECK(msg.find("libswresample") != std::string::npos);
+  SUBCASE("a rate that is not `audio_config.sampling_rate` is RESAMPLED, not refused") {
+    // TRUE-BEFORE / FALSE-AFTER, and this subcase is the ownership test for
+    // W7c-2 (#2828). It used to assert that `ProcessWaveform` THREW, that the
+    // message named W7c-2 and "RESAMPLING IS NOT PORTED", and that the message
+    // named libswresample. None of that is true any more. The RED-before is in
+    // spec §4.17.11 verbatim.
+    const std::vector<float> at22 = dots3_tiny::FixtureAudioF32AtRate(0, 22050);
+    REQUIRE(at22.size() == 11025u);
+    const vllm::multimodal::AudioKwargs kw =
+        proc.ProcessWaveform(at22.data(), static_cast<int64_t>(at22.size()),
+                             22050);
+
+    // (a) The waveform the front end saw is the RESAMPLED one:
+    // `ceil(11025 * 320 / 441)` = 8000, which is `kAudioSamples`, so the span
+    // is the same 7 tokens the 16 kHz clip expands. An UNRESAMPLED 11025-sample
+    // waveform would carry `ceil(11025 / 1280)` = 9 tokens, so this assertion
+    // alone separates a pass-through, and it does so without reference to any
+    // value the resampler produced.
+    CHECK(kw.num_samples == dots3_tiny::kAudioSamples);
+    CHECK(kw.num_tokens == dots3_tiny::kAudioTokens);
+
+    // (b) THE RESAMPLE IS THE ONLY DIFFERENCE. Feeding the pre-resampled
+    // waveform at the target rate produces the same mel BIT FOR BIT, which is
+    // what "the same audio, resampled offline, gives the same answer" means at
+    // the front end. The values that resample carries are gated against scipy
+    // separately, by the golden case.
+    const std::vector<float> pre = vllm::multimodal::ResampleAudioScipy(
+        at22.data(), static_cast<int64_t>(at22.size()), 22050, 16000);
+    REQUIRE(pre.size() == static_cast<std::size_t>(dots3_tiny::kAudioSamples));
+    const vllm::multimodal::AudioKwargs off = proc.ProcessWaveform(
+        pre.data(), static_cast<int64_t>(pre.size()), 16000);
+    REQUIRE(off.input_features.size() == kw.input_features.size());
+    std::size_t moved = 0;
+    for (std::size_t i = 0; i < kw.input_features.size(); ++i)
+      if (kw.input_features[i] != off.input_features[i]) ++moved;
+    MESSAGE("resampled in the front end vs pre-resampled: " << moved << " of "
+            << kw.input_features.size() << " mel values differ");
+    CHECK(moved == 0u);
+
+    // (c) ...and those values are scipy's, checked against the INDEPENDENT
+    // second transcription rather than against the same code.
+    std::vector<double> xin(at22.size());
+    for (std::size_t i = 0; i < at22.size(); ++i)
+      xin[i] = static_cast<double>(at22[i]);
+    const std::vector<double> ref =
+        ref_resample::ResamplePoly(xin, 22050, 16000);
+    REQUIRE(ref.size() == pre.size());
+    double worst = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i)
+      worst = std::max(worst,
+                       std::fabs(ref[i] - static_cast<double>(pre[i])));
+    MESSAGE("22050 -> 16000 vs ref_resample: worst |delta| " << worst);
+    CHECK(worst <= kResampleTol);
   }
+
+  SUBCASE("...and the encoder-cache key SEPARATES two rates over one buffer") {
+    // W7c-2 CREATED this hazard and closes it in the same change. Before it,
+    // every served rate was 16000 and the raw waveform was an unambiguous key.
+    // Now a file carrying N samples at 16000 Hz and a file carrying THE
+    // IDENTICAL N SAMPLES at 44100 Hz decode to identical float buffers. They
+    // must not share an encoder-cache entry, because their features differ.
+    const std::vector<float>& x = wav;
+    const std::string at_target =
+        proc.HashAudio(x.data(), static_cast<int64_t>(x.size()), 16000);
+    const std::string at_44100 =
+        proc.HashAudio(x.data(), static_cast<int64_t>(x.size()), 44100);
+    MESSAGE("same buffer, 16000 vs 44100: " << at_target << " / " << at_44100);
+    CHECK(at_target != at_44100);
+
+    // ...and at the target rate the three-argument form is the two-argument
+    // one, so no existing key moved when this overload was added.
+    CHECK(at_target == proc.HashAudio(x.data(), static_cast<int64_t>(x.size())));
+
+    // The features really do differ, which is what makes the separation a
+    // correctness requirement rather than a nicety: 8000 samples read as
+    // 44100 Hz resample to `ceil(8000 * 160 / 441)` = 2903.
+    const vllm::multimodal::AudioKwargs a =
+        proc.ProcessWaveform(x.data(), static_cast<int64_t>(x.size()), 16000);
+    const vllm::multimodal::AudioKwargs b =
+        proc.ProcessWaveform(x.data(), static_cast<int64_t>(x.size()), 44100);
+    CHECK(a.num_samples == 8000);
+    CHECK(b.num_samples == 2903);
+    CHECK(a.num_tokens != b.num_tokens);
+  }
+
   SUBCASE("a clip over `chunk_seconds` no longer names W7b, because W7b LIFTED it") {
     // This subcase used to assert "SEGMENTATION IS NOT PORTED" and W7b. It is
     // kept rather than deleted because it is the RED-BEFORE of #2797 written
@@ -2481,5 +2733,172 @@ TEST_CASE("dots3-note W7a: every unported audio arm refuses BY NAME, with its br
     // And the enumeration claims NOTHING, so the 430 stay in the deferral
     // bucket rather than becoming missing tensors.
     CHECK(vllm::EnumerateDots3NoteAudioTensors(a).empty());
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. THE RESAMPLER (W7c-2, #2828).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// THE ORACLE HERE IS scipy, AND IT IS NOT UPSTREAM'S DEFAULT. Upstream's
+// `AudioResampler` defaults to `"pyav"`, which is libswresample, which is not
+// bit-identical to ITSELF across CPU dispatch on one binary and one input
+// (ffmpeg 6.1.1: 24691 of 32000 samples differ, worst 9.686e-08). A bit-exact
+// gate against it is impossible in principle. What is gated is
+// `resample_audio_scipy` — another arm of upstream's own switch
+// (`vllm/multimodal/audio.py:232-250`, dispatch at `:305-316` @ `9035151d6`),
+// which vLLM ships in production for phi4mm (`phi4mm.py:580`).
+//
+// So this is a CONSISTENCY gate against a stated algorithm and NOT parity with
+// upstream's default. Spec §4.17.7 says what that does and does not establish.
+//
+// A TOLERANCE ALONE WOULD GATE NOTHING, because a resampler that returns its
+// input, or returns zeros, passes one. Four assertions per case, each naming
+// the defect it excludes, and the fifth golden case carries a tone ABOVE the
+// output Nyquist because that is the only content that separates a real
+// anti-alias filter from picking samples.
+TEST_CASE("dots3-note W7c-2: the resampler reproduces scipy's `resample_poly`") {
+  REQUIRE(dots3_resample_golden::kNumCases == 5);
+  double worst_all = 0.0;
+  double worst_ref_all = 0.0;
+  for (int c = 0; c < dots3_resample_golden::kNumCases; ++c) {
+    const dots3_resample_golden::Case& k = dots3_resample_golden::kCases[c];
+    // NOT `CAPTURE(k.name)`: doctest stringifies a `const char*` through its
+    // bool conversion, so the case name would read as "true".
+    INFO("case: ", std::string(k.name));
+
+    const std::vector<float> got = vllm::multimodal::ResampleAudioScipy(
+        k.input, k.n_in, k.orig_sr, k.target_sr);
+
+    // (1) LENGTH: `ceil(n_in * target / orig)`, which is upstream's
+    // `n_out = n_in * up; n_out = n_out // down + bool(n_out % down)`. This is
+    // what a resampler that RETURNED ITS INPUT cannot pass: at 8000 -> 16000 it
+    // would be 80 long and this is 160.
+    const std::int64_t expect_len =
+        (static_cast<std::int64_t>(k.n_in) * k.target_sr + k.orig_sr - 1) /
+        k.orig_sr;
+    CHECK(static_cast<std::int64_t>(got.size()) == expect_len);
+    CHECK(static_cast<std::int64_t>(k.n_out) == expect_len);
+    // ...and the seam's own length function agrees, since the chat seam may ask
+    // for the count without running the filter.
+    CHECK(vllm::multimodal::ResampleAudioScipyOutputLength(
+              k.n_in, k.orig_sr, k.target_sr) == expect_len);
+    REQUIRE(static_cast<int>(got.size()) == k.n_out);
+
+    // (2) A LOWER BOUND. A resampler that returned zeros, or one whose filter
+    // normalization collapsed, passes any tolerance against a golden it is
+    // being compared to only in absolute terms. The fixture signals reach 0.5
+    // and 0.99, so 0.2 is far under the truth and far over zero.
+    double peak = 0.0;
+    for (float v : got) peak = std::max(peak, static_cast<double>(std::fabs(v)));
+    CHECK(peak > 0.2);
+
+    // (3) THE VALUES, against scipy's own output.
+    double worst = 0.0;
+    for (int i = 0; i < k.n_out; ++i)
+      worst = std::max(worst, static_cast<double>(std::fabs(
+                                  got[static_cast<std::size_t>(i)] - k.expected[i])));
+    worst_all = std::max(worst_all, worst);
+    MESSAGE(k.name << ": " << k.orig_sr << " -> " << k.target_sr << " Hz, "
+                   << k.n_in << " in, " << got.size()
+                   << " out, peak " << peak << ", worst |got - scipy| " << worst);
+    // The tolerance is ~2x the measured float floor and is derived in spec
+    // §4.17.11 from this suite's own numbers. It is NOT a "close enough" band:
+    // the port and scipy agree to ~1e-15 in double, and everything left is the
+    // single narrowing store to `float`.
+    CHECK(worst <= kResampleTol);
+
+    // (4) THE DIFFERENCE ASSERTION, which is what makes (3) mean anything. A
+    // nearest-sample decimation — mutation M3, a "resampler" with no
+    // anti-alias filter — is computed HERE and must be FAR from the golden.
+    // Without this, a tolerance of 6e-7 could be one that nothing can fail.
+    std::vector<double> xin(static_cast<std::size_t>(k.n_in));
+    for (int i = 0; i < k.n_in; ++i)
+      xin[static_cast<std::size_t>(i)] = static_cast<double>(k.input[i]);
+    const std::vector<double> naive =
+        ref_resample::NearestSample(xin, k.orig_sr, k.target_sr);
+    REQUIRE(naive.size() == got.size());
+    double sep = 0.0;
+    for (std::size_t i = 0; i < naive.size(); ++i)
+      sep = std::max(sep, std::fabs(naive[i] - static_cast<double>(
+                                                   k.expected[i])));
+    MESSAGE(k.name << ": nearest-sample decimation is " << sep
+                   << " from the golden, against the value tolerance");
+    CHECK(sep > 1e-2);
+
+    // (5) AND THE INDEPENDENT REFERENCE, written from scipy's source a second
+    // time and sharing no helper with `src/`.
+    const std::vector<double> ref =
+        ref_resample::ResamplePoly(xin, k.orig_sr, k.target_sr);
+    REQUIRE(ref.size() == got.size());
+    double worst_ref = 0.0;
+    for (std::size_t i = 0; i < ref.size(); ++i)
+      worst_ref = std::max(worst_ref,
+                           std::fabs(ref[i] - static_cast<double>(
+                                                  got[i])));
+    worst_ref_all = std::max(worst_ref_all, worst_ref);
+    CHECK(worst_ref <= kResampleTol);
+  }
+  MESSAGE("worst over all cases: |ours - scipy| " << worst_all
+          << ", |ours - ref_resample| " << worst_ref_all);
+}
+
+TEST_CASE("dots3-note W7c-2: the resample seam is a NO-OP at the target rate") {
+  // `if orig_sr_int == target_sr_int: return audio` (`audio.py:241-242`). This
+  // is what keeps every 16 kHz waveform in this tree byte-identical across
+  // W7c-2, and it is asserted rather than assumed.
+  const std::vector<float> x = dots3_tiny::FixtureAudioF32(0);
+  const std::vector<float> y =
+      vllm::multimodal::ResampleAudioScipy(x.data(),
+                                           static_cast<std::int64_t>(x.size()),
+                                           16000, 16000);
+  REQUIRE(y.size() == x.size());
+  std::size_t moved = 0;
+  for (std::size_t i = 0; i < x.size(); ++i)
+    if (x[i] != y[i]) ++moved;
+  MESSAGE("at 16000 -> 16000, " << moved << " of " << x.size()
+                                << " samples moved");
+  CHECK(moved == 0u);
+}
+
+TEST_CASE("dots3-note W7c-2: the seam REFUSES a rate it will not design a filter for") {
+  const std::vector<float> x = dots3_tiny::FixtureAudioF32(0);
+  const auto resample = [&x](int orig, int target) {
+    std::string msg;
+    try {
+      vllm::multimodal::ResampleAudioScipy(
+          x.data(), static_cast<std::int64_t>(x.size()), orig, target);
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    return msg;
+  };
+
+  SUBCASE("a non-positive rate") {
+    CHECK(resample(0, 16000).find("must be positive") != std::string::npos);
+    CHECK(resample(44100, -1).find("must be positive") != std::string::npos);
+  }
+
+  SUBCASE("a reduced ratio past `kMaxPolyphaseRate`, which is a DIVERGENCE") {
+    // The filter is `20 * max(up, down) + 1` taps and `max(up, down)` is chosen
+    // by the REQUEST, because a WAV's `fmt ` chunk names its own rate. Upstream
+    // has no such guard; upstream is also not reached from an HTTP body. The
+    // message has to say both, so an operator is not told a port is missing.
+    const std::string msg = resample(999983, 16000);
+    INFO("message: ", msg);
+    CHECK(msg.find("999983") != std::string::npos);
+    CHECK(msg.find("100000") != std::string::npos);
+    CHECK(msg.find("UPSTREAM HAS NO SUCH GUARD") != std::string::npos);
+    CHECK(msg.find("DIVERGENCE") != std::string::npos);
+    CHECK(msg.find("§4.17.10") != std::string::npos);
+  }
+
+  SUBCASE("...and every rate this row actually serves is FAR under the bound") {
+    // The other half of the sentence above, so the bound is gated in BOTH
+    // directions and cannot quietly become one that refuses real audio.
+    for (const int sr : {44100, 48000, 22050, 8000, 32000, 11025, 44101}) {
+      CAPTURE(sr);
+      CHECK(resample(sr, 16000).empty());
+    }
   }
 }

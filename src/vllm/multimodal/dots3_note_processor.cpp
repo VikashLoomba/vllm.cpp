@@ -534,12 +534,23 @@ AudioKwargs Dots3NoteAudioProcessor::ProcessWaveform(
   // `ResampleAudioScipy` returns its input unchanged when the rates are equal,
   // exactly as upstream's `resample_audio_scipy` does (`audio.py:241-242`), so
   // no 16 kHz waveform in this tree can move by a bit.
+  //
+  // THE THREE VARIABLES DESCRIBING THE WAVEFORM MOVE TOGETHER, and `sample_rate`
+  // is one of them. Rebinding the pointer and the length while leaving the rate
+  // at the request's value left the resampled buffer described as 22050 Hz, and
+  // `WhisperAudioProcessor::ProcessWaveform` — which this drives once per chunk
+  // and which carries its OWN rate refusal for the Whisper/Voxtral row
+  // (`audio_processor.cpp:214-221`) — threw a bare `runtime_error`. That is
+  // HTTP 500, not 400: the served suite read `500 == 400` before this line was
+  // written. Before W7c-2 the assignment was unreachable, because the refusal
+  // above it guaranteed the two rates were already equal.
   std::vector<float> resampled;
   if (sample_rate != cfg_.sampling_rate) {
     resampled = ResampleAudioScipy(samples, num_samples, sample_rate,
                                    cfg_.sampling_rate);
     samples = resampled.data();
     num_samples = static_cast<int64_t>(resampled.size());
+    sample_rate = cfg_.sampling_rate;
   }
 
   if (num_samples <= 0) {

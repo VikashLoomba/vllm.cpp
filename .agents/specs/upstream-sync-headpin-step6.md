@@ -23,9 +23,11 @@ reaches anything committed:
 | `transformers` floor `>= 5.5.3` to `>= 5.10.4` | **NO**, discharged, §2.4 |
 | `VLLM_ALLREDUCE_USE_FLASHINFER` default `0` to `1` | **NO**, discharged, §2.5 |
 
-**The re-measurement was NOT run.** No CUDA fleet device was free during this
-wave, and the committed harness structurally refuses to run at the target
-anyway (§2.6). §4 names the exact job the next wave runs.
+**The re-measurement was NOT run, on either gate.** No CUDA device was free at
+any of three `rc` readings, `dgx:gpu0` ended the wave
+`unhealthy (no contact 2h9m47s)`, `thor:gpu0` is `sm_110` and cannot carry a
+GB10 baseline, and the committed harness structurally refuses to run at the
+target anyway (§2.6). The report's §7 C1a and C1b name the two exact jobs.
 
 The pin did **not** advance and nothing here is a reason to move it. The active
 parity pin remains `5559679229bc961848b121ccdeaa8fa5d79bec98`.
@@ -337,6 +339,8 @@ a red gate green. Met.
   harness's own fail-closed pin assertion are in tension, and nothing in
   `.agents/upstream-sync.md` says which moves first.
 - **A reading on `dgx:gpu0`**, blocker 4 of `.agents/oracles/vllm.md:70`. Not
-  discharged here; this wave obtained no lease.
+  discharged here, and now blocked on the environment: the box read
+  `unhealthy (no contact 2h9m47s)` at this wave's last `rc devices`. Nobody can
+  discharge blocker 4, or run this wave's own G2, while that holds.
 - **The `sm_100` scope limit on §2.3.** The CUTLASS DSL discharge does not hold
   on a device of capability family 100, and this fleet has none to test it on.

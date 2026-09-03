@@ -679,9 +679,11 @@ A CPU-only green is not a device result and is never reported as one. A doctest
   which forces all four through `force_shape_idx`. This bullet and the one in
   `quant-exl3-mul1.md` each named the other row as the owner; the table lives in
   `src/vt/exl3_policy.cpp`, which `quant-exl3-shared.md` `## Port map` claims, so
-  it went there. It mattered to this row because the GEMV falls THROUGH to that
-  table on every shape the envelope declines, which on this checkpoint may be
-  all of them.
+  it went there. It PASSED on `thor:gpu0` on 2026-09-03 -- all four forced, all
+  six output pairs differing, and two mutations detected -- and the evidence is
+  in `quant-exl3-shared.md` `### Evidence (W5)`. It mattered to this row because
+  the GEMV falls THROUGH to that table on every shape the envelope declines,
+  which on this checkpoint may be all of them.
 - **`bits` 5 and 6 have no GEMV upstream either** (`exl3_gemv.cu:110-111`
   refuses `K < 2 || K > 4`), so the one 5-bit tensor and the 6-bit `lm_head`
   falling to the regular kernel is upstream's behaviour and not a gap. Recorded

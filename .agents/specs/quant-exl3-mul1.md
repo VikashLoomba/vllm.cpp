@@ -467,8 +467,12 @@ green is not a device result and is never reported as one.
   **CLOSED by `QUANT-EXL3` W5** ([#2749](https://github.com/mudler/vllm.cpp/issues/2749)).
   It was owed "by the table", and the table is `src/vt/exl3_policy.cpp`, which
   `quant-exl3-shared.md` `## Port map` claims. The gate now forces all four
-  shapes; "What the gate does NOT reach" above is the analysis it was built on
-  and is left standing as the record of why.
+  shapes and PASSED on `thor:gpu0` on 2026-09-03; the evidence is in
+  `quant-exl3-shared.md` `### Evidence (W5)`. "What the gate does NOT reach"
+  above is the analysis it was built on and is left standing as the record of
+  why. The coverage it describes is for the (3, 1) arm; the other six arms share
+  the same four instantiations and are not separately forced, which W5 records
+  as its own remaining debt.
 - **Slice F's arm is VERIFIED on `dgx:gpu0`** (see its evidence section), which
   also closes slice C's device debt for cb 2 at four widths. What is still
   unverified is any REAL tensor of the artifact: the gate is synthetic

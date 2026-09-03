@@ -391,6 +391,105 @@ void MaskTime(std::vector<Mat>* x, std::int64_t valid) {
 }  // namespace ref_tower
 
 // ═══════════════════════════════════════════════════════════════════════════
+// REFERENCE 3 — THE SEGMENTATION GEOMETRY (W7b, #2797).
+//
+// Written from `nvidia/audio.py:193-234` and `nvidia/audio_encoder.py:570-577`
+// @ `9035151d6`, sharing NO helper with `src/`, with `ref_front` or with
+// `ref_tower`. Every qualified name is `std::`, measured by the same
+// enumeration case — which W7b EXTENDS to a third namespace rather than
+// writing a second instrument.
+//
+// WHY A THIRD REFERENCE AND NOT A LONGER SECOND ONE. What chunking gets wrong
+// is GEOMETRY — which samples land in which chunk, how many rows each chunk
+// contributes, and where each chunk starts in the concatenation — and every one
+// of those defects produces correctly-shaped output that an aggregate norm
+// cannot see. This namespace computes that geometry and nothing else; the
+// heavy numerics stay in `ref_front::LogMel` and `RefTower`, which W7b does not
+// touch and drives per segment at the geometry derived here.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace ref_chunks {
+
+// MEASURED by the enumeration case below, as the other two are.
+//
+//  1 std::int64_t (20)   2 std::vector (5)
+//
+// 25 occurrences of 2 distinct names. That this reference reaches only TWO is
+// the point of it: a geometry that needs `sqrt`, `exp` or anything from `vt::`
+// is not a geometry any more, so anything else appearing in the measurement is
+// a helper that leaked in from `src/`.
+inline constexpr int kDistinctQualifiedNames = 2;
+inline constexpr int kQualifiedNameOccurrences = 25;
+
+// One `chunk_seconds` segment: where it starts, how long it is, how many rows
+// it contributes and where those rows land in the concatenation.
+struct Segment {
+  std::int64_t start = 0;
+  std::int64_t length = 0;
+  std::int64_t token_len = 0;
+  std::int64_t row_offset = 0;
+};
+
+// `encode_waveform`'s slicing loop (`audio.py:194-218`), stepping in SECONDS
+// exactly as upstream does, with Python's clamping slice stop.
+//
+// `token_len` is written as upstream's LITERAL `(length - 1) // stride + 1`
+// (`:210-212`) and not as the `ceil` the implementation uses, which is the
+// whole point of a reference. The two are the same function for every
+// `length >= 1` and differ only at `length == 0`, where C++ truncation toward
+// zero would give 1 where Python's floor gives 0 — and the `while` condition
+// below never emits a zero-length segment, so this transcription is safe HERE
+// and would not be in the implementation, where the count is also asked for a
+// waveform.
+std::vector<Segment> Segments(std::int64_t num_samples, std::int64_t chunk_seconds,
+                              std::int64_t sample_rate, std::int64_t hop_length,
+                              std::int64_t conv_temporal_stride,
+                              std::int64_t merge_factor) {
+  const std::int64_t stride = hop_length * conv_temporal_stride * merge_factor;
+  std::vector<Segment> out;
+  std::int64_t time_step = 0;
+  std::int64_t rows = 0;
+  while (time_step * sample_rate < num_samples) {
+    Segment s;
+    s.start = time_step * sample_rate;
+    const std::int64_t stop = (time_step + chunk_seconds) * sample_rate;
+    s.length = (stop < num_samples ? stop : num_samples) - s.start;
+    s.token_len = (s.length - 1) / stride + 1;
+    s.row_offset = rows;
+    rows += s.token_len;
+    out.push_back(s);
+    time_step += chunk_seconds;
+  }
+  return out;
+}
+
+// `compute_audio_token_length` (`audio.py:129-147`) — upstream's OWN statement
+// of the total, which it defines and never calls. The PROMPT side instead
+// counts one `math.ceil(total / stride)` (`common/processor.py:771`), and the
+// two are equal for every waveform exactly when `chunk_samples % stride == 0`.
+std::int64_t TotalTokens(const std::vector<Segment>& segments) {
+  std::int64_t n = 0;
+  for (const Segment& s : segments) n += s.token_len;
+  return n;
+}
+
+// The four temporal-mask lengths for one segment, from ITS OWN sample count:
+// `valid_mel_lens = audio_sample_lens // hop_length` per batch element
+// (`audio_encoder.py:570-577`), then `(n + 1) // 2` at each of the three
+// stride-2 layers (`:550`, `:555`, `:560`). Taking these from the PADDED length
+// instead is one of the four defects a norm cannot see.
+std::vector<std::int64_t> MaskStages(std::int64_t length,
+                                     std::int64_t hop_length) {
+  std::vector<std::int64_t> v(4);
+  v[0] = length / hop_length;
+  v[1] = (v[0] + 1) / 2;
+  v[2] = (v[1] + 1) / 2;
+  v[3] = (v[2] + 1) / 2;
+  return v;
+}
+
+}  // namespace ref_chunks
+
+// ═══════════════════════════════════════════════════════════════════════════
 // THE ENUMERATION INSTRUMENT.
 //
 // Reads THIS source file at `DOTS3_AUDIO_TEST_SOURCE` (the same arrangement
@@ -571,8 +670,9 @@ TEST_CASE("dots3-note W7a: the SHARED slaney bank reproduces the committed voxtr
   CHECK(t_bad == 0u);
 }
 
-TEST_CASE("dots3-note W7a: the two references share no helper with src/, by enumeration") {
-  // The row's convention (W6a 70, W6b 105, W6c 45 qualified names, all `std::`).
+TEST_CASE("dots3-note W7a+W7b: the THREE references share no helper with src/, by enumeration") {
+  // The row's convention (W6a 70, W6b 105, W6c 45 qualified names, all `std::`),
+  // now over THREE namespaces since W7b (#2797).
   //
   // THIS CASE RE-READS THIS FILE AND COUNTS. It used to compare two
   // hand-written constants with two literals, which measured nothing: the lists
@@ -583,26 +683,38 @@ TEST_CASE("dots3-note W7a: the two references share no helper with src/, by enum
   // it is computed from the bytes, so one `vllm::` or `vt::` call reddens it.
   const RefNames front = QualifiedNamesIn("ref_front");
   const RefNames tower = QualifiedNamesIn("ref_tower");
+  // W7b (#2797) EXTENDS this instrument to its third namespace rather than
+  // writing a second one: `ref_chunks` is new reference code, and reference
+  // code the instrument does not read is reference code whose independence
+  // nothing measures.
+  const RefNames chunks = QualifiedNamesIn("ref_chunks");
 
   // The instrument must be shown to have READ something. A parse that found an
   // empty span would otherwise report "zero non-std:: names" and pass.
   REQUIRE(front.occurrences > 0);
   REQUIRE(tower.occurrences > 0);
+  REQUIRE(chunks.occurrences > 0);
 
   MESSAGE("ref_front: " << front.distinct << " distinct, " << front.occurrences
                         << " occurrences, scopes=" << Join(front.scopes));
   MESSAGE("ref_tower: " << tower.distinct << " distinct, " << tower.occurrences
                         << " occurrences, scopes=" << Join(tower.scopes));
+  MESSAGE("ref_chunks: " << chunks.distinct << " distinct, "
+                         << chunks.occurrences
+                         << " occurrences, scopes=" << Join(chunks.scopes));
 
   // The independence property itself.
   CHECK(Join(front.scopes) == "std");
   CHECK(Join(tower.scopes) == "std");
+  CHECK(Join(chunks.scopes) == "std");
 
   // And the enumerated lists, now that they are the measurement's own output.
   CHECK(front.distinct == ref_front::kDistinctQualifiedNames);
   CHECK(front.occurrences == ref_front::kQualifiedNameOccurrences);
   CHECK(tower.distinct == ref_tower::kDistinctQualifiedNames);
   CHECK(tower.occurrences == ref_tower::kQualifiedNameOccurrences);
+  CHECK(chunks.distinct == ref_chunks::kDistinctQualifiedNames);
+  CHECK(chunks.occurrences == ref_chunks::kQualifiedNameOccurrences);
 
   // AND THE STRIPPER ITSELF, because the property above is only as true as the
   // scan that measures it. `StripCommentsAndLiterals` used to treat every `'`
@@ -693,7 +805,7 @@ TEST_CASE("dots3-note W7a: the front end agrees with an INDEPENDENT double refer
   }
 }
 
-TEST_CASE("dots3-note W7a: the front end REFUSES a wrong rate and an over-long clip, BY NAME") {
+TEST_CASE("dots3-note W7a+W7b: the front end REFUSES a wrong rate, and W7b MOVED the length refusal") {
   const TinySpec spec = AudioSpec();
   const TinyCheckpoint ckpt(FixtureDir(), spec);
   vllm::multimodal::Dots3NoteAudioProcessorConfig cfg =
@@ -714,7 +826,17 @@ TEST_CASE("dots3-note W7a: the front end REFUSES a wrong rate and an over-long c
     CHECK(msg.find("W7c") != std::string::npos);
     CHECK(msg.find("RESAMPLING IS NOT PORTED") != std::string::npos);
   }
-  SUBCASE("a clip over `chunk_seconds` names W7b, and says why it is not a convenience") {
+  SUBCASE("a clip over `chunk_seconds` no longer names W7b, because W7b LIFTED it") {
+    // This subcase used to assert "SEGMENTATION IS NOT PORTED" and W7b. It is
+    // kept rather than deleted because it is the RED-BEFORE of #2797 written
+    // down: the same call, on the same config, now refuses for a DIFFERENT and
+    // narrower reason, and a reader who greps for the old string should land
+    // here and find out where it went.
+    //
+    // The tiny fixture's `chunk_seconds` = 1 is 12.5 token strides, so this
+    // geometry is one of the non-divisible ones §4.15.3 still refuses PAST ONE
+    // CHUNK: 16001 samples is 16000 + 1, whose per-segment sum is 13 + 1 = 14
+    // against a placeholder span of ceil(16001/1280) = 13.
     std::vector<float> too_long(static_cast<std::size_t>(spec.a_chunk_samples() + 1),
                                 0.1f);
     std::string msg;
@@ -724,9 +846,34 @@ TEST_CASE("dots3-note W7a: the front end REFUSES a wrong rate and an over-long c
     } catch (const std::exception& e) {
       msg = e.what();
     }
-    CHECK(msg.find("W7b") != std::string::npos);
-    CHECK(msg.find("SEGMENTATION IS NOT PORTED") != std::string::npos);
+    CHECK(msg.find("SEGMENTATION IS NOT PORTED") == std::string::npos);
+    CHECK(msg.find("#2797") != std::string::npos);
+    CHECK(msg.find("not a whole number of 1280") != std::string::npos);
+    CHECK(msg.find("14 rows") != std::string::npos);
+    CHECK(msg.find("span of 13") != std::string::npos);
     CHECK(msg.find("splices audio features") != std::string::npos);
+  }
+  SUBCASE("...and on a DIVISIBLE geometry the very same length is SERVED") {
+    // The other half of the sentence above, and the reason the refusal is about
+    // the config's arithmetic rather than about length. `a_chunk_seconds = 2`
+    // is 25 whole token strides, and 32001 samples is 2 chunks there.
+    TinySpec long_spec = spec;
+    long_spec.a_chunk_seconds = dots3_tiny::kAudioLongChunkSeconds;
+    const TinyCheckpoint long_ckpt(FixtureDir(), long_spec);
+    vllm::multimodal::Dots3NoteAudioProcessorConfig long_cfg =
+        vllm::multimodal::LoadDots3NoteAudioProcessorConfig(
+            long_ckpt.config_path(), "tiny");
+    long_cfg.audio_token_id = dots3_tiny::kAudPadId;
+    const vllm::multimodal::Dots3NoteAudioProcessor long_proc(long_cfg);
+    std::vector<float> two_chunks(
+        static_cast<std::size_t>(long_spec.a_chunk_samples() + 1), 0.1f);
+    const vllm::multimodal::AudioKwargs kw = long_proc.ProcessWaveform(
+        two_chunks.data(), static_cast<int64_t>(two_chunks.size()), 16000);
+    CHECK(kw.num_chunks == 2);
+    CHECK(kw.chunk_num_tokens.size() == 2u);
+    CHECK(kw.chunk_num_tokens[0] == 25);
+    CHECK(kw.chunk_num_tokens[1] == 1);
+    CHECK(kw.num_tokens == 26);
   }
   SUBCASE("...and exactly `chunk_samples` is ACCEPTED, so the bound is not off by one") {
     std::vector<float> exact(static_cast<std::size_t>(spec.a_chunk_samples()), 0.1f);
@@ -1079,9 +1226,18 @@ struct LoadedTower {
   vllm::Dots3NoteAudioParams params;
   vllm::Dots3NoteAudioWeights weights;
   vllm::multimodal::AudioKwargs mel;
-  std::vector<std::vector<double>> mel_ref;
+  std::vector<std::vector<double>> mel_ref;   // chunk 0's, as W7a had it
+  // W7b (#2797): the clip the front end ran on, the segmentation the processor
+  // derived, and ONE unpacked mel per chunk.
+  std::vector<float> wav;
+  std::vector<vllm::multimodal::Dots3NoteAudioProcessor::AudioChunk> chunks;
+  std::vector<std::vector<std::vector<double>>> mel_refs;
 
-  explicit LoadedTower(TinySpec s = AudioSpec(), int variant = 0)
+  // `long_samples > 0` selects the MULTI-CHUNK clip (W7b, #2797) instead of the
+  // 0.5 s one, and the caller is expected to have set `spec.a_chunk_seconds` to
+  // a chunk that divides — see `kAudioLongChunkSeconds`.
+  explicit LoadedTower(TinySpec s = AudioSpec(), int variant = 0,
+                       int64_t long_samples = 0)
       : spec(s),
         ckpt(FixtureDir(), s),
         config(vllm::LoadHfConfig(ckpt.config_path())) {
@@ -1098,15 +1254,29 @@ struct LoadedTower {
                                                             "tiny");
     cfg.audio_token_id = dots3_tiny::kAudPadId;
     const vllm::multimodal::Dots3NoteAudioProcessor proc(cfg);
-    const std::vector<float> wav = dots3_tiny::FixtureAudioF32(variant);
+    wav = long_samples > 0
+              ? dots3_tiny::FixtureAudioLongF32(variant, long_samples)
+              : dots3_tiny::FixtureAudioF32(variant);
+    chunks = proc.SegmentWaveform(static_cast<int64_t>(wav.size()));
     mel = proc.ProcessWaveform(wav.data(), static_cast<int64_t>(wav.size()),
                                16000);
-    mel_ref.assign(static_cast<std::size_t>(mel.n_mels),
-                   std::vector<double>(static_cast<std::size_t>(mel.n_frames)));
-    for (int64_t m = 0; m < mel.n_mels; ++m)
-      for (int64_t f = 0; f < mel.n_frames; ++f)
-        mel_ref[static_cast<std::size_t>(m)][static_cast<std::size_t>(f)] =
-            mel.input_features[static_cast<std::size_t>(m * mel.n_frames + f)];
+    // The stacked mel, unpacked into one `[n_mels][n_frames]` per chunk. At one
+    // chunk this is exactly what W7a built, and `mel_ref` below still names it.
+    const std::size_t per =
+        static_cast<std::size_t>(mel.n_mels) * static_cast<std::size_t>(mel.n_frames);
+    for (int64_t c = 0; c < mel.num_chunks; ++c) {
+      std::vector<std::vector<double>> one(
+          static_cast<std::size_t>(mel.n_mels),
+          std::vector<double>(static_cast<std::size_t>(mel.n_frames)));
+      for (int64_t m = 0; m < mel.n_mels; ++m)
+        for (int64_t f = 0; f < mel.n_frames; ++f)
+          one[static_cast<std::size_t>(m)][static_cast<std::size_t>(f)] =
+              mel.input_features[static_cast<std::size_t>(c) * per +
+                                 static_cast<std::size_t>(m * mel.n_frames + f)];
+      mel_refs.push_back(std::move(one));
+    }
+    REQUIRE(!mel_refs.empty());
+    mel_ref = mel_refs[0];
   }
 
   std::vector<float> Run(vllm::Dots3NoteAudioCapture* cap = nullptr) const {
@@ -1114,6 +1284,16 @@ struct LoadedTower {
                                        mel.num_tokens, /*hop_length=*/160,
                                        weights, params,
                                        vt::GetBackend(vt::DeviceType::kCPU), cap);
+  }
+
+  // THE PRODUCTION ENTRY POINT since W7b (#2797) — what `EncodeAudioDots3Note`
+  // calls. At one chunk it is `Run` above with the same arguments.
+  std::vector<float> RunChunks(
+      std::vector<vllm::Dots3NoteAudioCapture>* caps = nullptr) const {
+    return vllm::Dots3NoteAudioForwardChunks(
+        mel.input_features, mel.chunk_num_samples, mel.chunk_num_tokens,
+        /*hop_length=*/160, weights, params,
+        vt::GetBackend(vt::DeviceType::kCPU), caps);
   }
 };
 
@@ -1299,6 +1479,535 @@ TEST_CASE("dots3-note W7a: two DIFFERENT waveforms give two different tower outp
   for (std::size_t i = 0; i < ga.size(); ++i)
     worst = std::max(worst, std::fabs(static_cast<double>(ga[i] - gb[i])));
   MESSAGE("two waveforms differ in the tower output by up to " << worst);
+  CHECK(worst > 1e-3);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3b. W7b (#2797) — THE CHUNK LOOP, and the four seams a norm cannot see.
+//
+// Spec §4.15. The geometry is `kAudioLongChunkSeconds` = 2 (32000 samples = 25
+// token strides, which is what makes the tower's per-chunk sum equal the prompt
+// side's single ceil) over an 80000-sample clip: THREE chunks of 32000, 32000
+// and 16000, contributing 25, 25 and 13 rows. Three so a reversal is not a swap
+// of two halves; a short last one so the truncation and the temporal mask on a
+// partly padded chunk are both exercised.
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+TinySpec LongAudioSpec() {
+  TinySpec s = AudioSpec();
+  s.a_chunk_seconds = dots3_tiny::kAudioLongChunkSeconds;
+  return s;
+}
+
+// The reference geometry for one config, from `ref_chunks` alone.
+std::vector<ref_chunks::Segment> RefSegments(
+    const vllm::multimodal::Dots3NoteAudioProcessorConfig& cfg,
+    std::int64_t num_samples) {
+  return ref_chunks::Segments(num_samples, cfg.chunk_seconds, cfg.sampling_rate,
+                              cfg.hop_length, cfg.conv_temporal_stride,
+                              cfg.merge_factor);
+}
+
+// One tower reference block per chunk, each at ITS OWN valid length and row
+// count. `num_samples_override` drives the mask from a different length, which
+// is how the "mask from the PADDED length" defect is measured rather than
+// argued.
+std::vector<ref_tower::Mat> RefChunkBlocks(
+    const TowerRefWeights& rw, const LoadedTower& t,
+    const std::vector<ref_chunks::Segment>& segs,
+    std::int64_t num_samples_override = 0, std::int64_t token_len_override = 0) {
+  std::vector<ref_tower::Mat> out;
+  for (std::size_t i = 0; i < segs.size(); ++i) {
+    const std::int64_t ns =
+        num_samples_override > 0 ? num_samples_override : segs[i].length;
+    const std::int64_t tl =
+        token_len_override > 0 ? token_len_override : segs[i].token_len;
+    out.push_back(RefTower(rw, t.spec, t.mel_refs[i], ns, tl));
+  }
+  return out;
+}
+
+// The worst |delta| between a block of the concatenated output and a reference
+// block, starting at `row_offset`.
+double WorstBlockDelta(const std::vector<float>& got, std::int64_t row_offset,
+                       const ref_tower::Mat& want, std::int64_t width) {
+  double worst = 0.0;
+  for (std::size_t r = 0; r < want.size(); ++r) {
+    for (std::size_t c = 0; c < want[r].size(); ++c) {
+      const std::size_t i =
+          static_cast<std::size_t>((row_offset + static_cast<std::int64_t>(r)) *
+                                   width) + c;
+      REQUIRE(i < got.size());
+      worst = std::max(worst, std::fabs(static_cast<double>(got[i]) - want[r][c]));
+    }
+  }
+  return worst;
+}
+
+// Relative L2 of ONE row of the output against one reference row.
+double RowRelL2(const std::vector<float>& got, std::int64_t row,
+                const std::vector<double>& want, std::int64_t width) {
+  double num = 0.0, den = 0.0;
+  for (std::size_t c = 0; c < want.size(); ++c) {
+    const double d =
+        static_cast<double>(got[static_cast<std::size_t>(row * width) + c]) -
+        want[c];
+    num += d * d;
+    den += want[c] * want[c];
+  }
+  return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+}
+
+}  // namespace
+
+TEST_CASE("dots3-note W7b: the SEGMENTATION is upstream's slicing loop, and the counts balance") {
+  // `SegmentWaveform` is the production seam (`audio.py:196-212` @ `9035151d6`)
+  // and this drives it against `ref_chunks`, which transcribes upstream's
+  // LITERAL `(length - 1) // stride + 1` rather than the implementation's
+  // `ceil`. #2797 records that those are the same function for every length the
+  // loop can emit, and this case is where that stops being an argument.
+  const TinySpec spec = LongAudioSpec();
+  const TinyCheckpoint ckpt(FixtureDir(), spec);
+  vllm::multimodal::Dots3NoteAudioProcessorConfig cfg =
+      vllm::multimodal::LoadDots3NoteAudioProcessorConfig(ckpt.config_path(),
+                                                          "tiny");
+  cfg.audio_token_id = dots3_tiny::kAudPadId;
+  REQUIRE(cfg.chunk_seconds == dots3_tiny::kAudioLongChunkSeconds);
+  REQUIRE(cfg.chunk_samples() == 32000);
+  REQUIRE(cfg.token_stride() == 1280);
+  // THE CONDITION THE WHOLE BRICK RESTS ON (§4.15.3): every segment but the
+  // last is exactly `chunk_samples` long, so the tower's per-segment sum equals
+  // the prompt side's one ceil for every waveform exactly when this is 0.
+  REQUIRE(cfg.chunk_samples() % cfg.token_stride() == 0);
+  const vllm::multimodal::Dots3NoteAudioProcessor proc(cfg);
+
+  // Lengths chosen to walk the boundary: one sample, one stride, one sample
+  // under and over a whole chunk, the gated clip, and an exact multiple.
+  const std::vector<std::int64_t> lengths = {
+      1, 1280, 31999, 32000, 32001, dots3_tiny::kAudioLongSamples, 96000};
+  for (std::int64_t n : lengths) {
+    const std::vector<ref_chunks::Segment> want = RefSegments(cfg, n);
+    const std::vector<vllm::multimodal::Dots3NoteAudioProcessor::AudioChunk>
+        got = proc.SegmentWaveform(n);
+    INFO("num_samples=", n);
+    REQUIRE(got.size() == want.size());
+    std::int64_t summed = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      INFO("chunk ", i);
+      CHECK(got[i].start == want[i].start);
+      CHECK(got[i].length == want[i].length);
+      CHECK(got[i].num_tokens == want[i].token_len);
+      summed += got[i].num_tokens;
+    }
+    // The segments TILE the waveform: no sample is dropped and none is fed
+    // twice. A slice whose stop or start was off by one chunk would still
+    // produce well-formed segments.
+    std::int64_t covered = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      CHECK(got[i].start == covered);
+      covered += got[i].length;
+    }
+    CHECK(covered == n);
+    // And the two upstream token counts agree: the per-segment sum
+    // (`audio.py:129-147`) against the prompt side's one ceil
+    // (`processor.py:771`), which is `NumAudioTokens` UNCHANGED.
+    CHECK(summed == proc.NumAudioTokens(n));
+  }
+
+  // The gated geometry, written out so a reader can check the spec against the
+  // fixture without running anything.
+  const std::vector<vllm::multimodal::Dots3NoteAudioProcessor::AudioChunk> c =
+      proc.SegmentWaveform(dots3_tiny::kAudioLongSamples);
+  REQUIRE(c.size() == static_cast<std::size_t>(dots3_tiny::kAudioLongChunks));
+  CHECK(c[0].length == 32000);
+  CHECK(c[1].length == 32000);
+  CHECK(c[2].length == 16000);  // SHORT, and 80000 is not a multiple of 32000
+  CHECK(c[0].num_tokens == dots3_tiny::kAudioLongFullChunkTokens);
+  CHECK(c[1].num_tokens == dots3_tiny::kAudioLongFullChunkTokens);
+  CHECK(c[2].num_tokens == dots3_tiny::kAudioLongLastChunkTokens);
+  CHECK(c[2].num_tokens < c[1].num_tokens);
+  MESSAGE("80000 samples -> " << c.size() << " chunks of " << c[0].length << ", "
+                              << c[1].length << ", " << c[2].length
+                              << " samples and " << c[0].num_tokens << ", "
+                              << c[1].num_tokens << ", " << c[2].num_tokens
+                              << " rows");
+  CHECK(proc.NumAudioTokens(dots3_tiny::kAudioLongSamples) ==
+        dots3_tiny::kAudioLongTokens);
+}
+
+TEST_CASE("dots3-note W7b: the front end stacks ONE padded mel per chunk, from that chunk's OWN samples") {
+  // The seam a wrong slice offset breaks. Every chunk's mel is asserted against
+  // `ref_front::LogMel` OF THAT SEGMENT — so a loop that fed chunk 1 the same
+  // samples as chunk 0, or that mel'd the whole waveform once and sliced the
+  // result, fails here rather than in a norm over the tower output.
+  const TinySpec spec = LongAudioSpec();
+  const TinyCheckpoint ckpt(FixtureDir(), spec);
+  vllm::multimodal::Dots3NoteAudioProcessorConfig cfg =
+      vllm::multimodal::LoadDots3NoteAudioProcessorConfig(ckpt.config_path(),
+                                                          "tiny");
+  cfg.audio_token_id = dots3_tiny::kAudPadId;
+  const vllm::multimodal::Dots3NoteAudioProcessor proc(cfg);
+
+  const std::vector<float> wav = dots3_tiny::FixtureAudioLongF32(
+      0, dots3_tiny::kAudioLongSamples);
+  REQUIRE(wav.size() == static_cast<std::size_t>(dots3_tiny::kAudioLongSamples));
+  const vllm::multimodal::AudioKwargs got = proc.ProcessWaveform(
+      wav.data(), static_cast<std::int64_t>(wav.size()), 16000);
+
+  CHECK(got.num_chunks == dots3_tiny::kAudioLongChunks);
+  CHECK(got.n_mels == spec.a_mels);
+  CHECK(got.n_frames == spec.a_chunk_mel_frames());
+  CHECK(got.num_samples == dots3_tiny::kAudioLongSamples);
+  CHECK(got.num_tokens == dots3_tiny::kAudioLongTokens);
+  // `torch.stack` (`audio.py:220`): one PADDED mel per chunk, all the same
+  // width, which is what makes the stack legal upstream.
+  REQUIRE(got.input_features.size() ==
+          static_cast<std::size_t>(got.num_chunks * got.n_mels * got.n_frames));
+  REQUIRE(got.chunk_num_samples.size() ==
+          static_cast<std::size_t>(dots3_tiny::kAudioLongChunks));
+  REQUIRE(got.chunk_num_tokens.size() ==
+          static_cast<std::size_t>(dots3_tiny::kAudioLongChunks));
+
+  const std::vector<ref_chunks::Segment> segs =
+      RefSegments(cfg, static_cast<std::int64_t>(wav.size()));
+  REQUIRE(segs.size() == static_cast<std::size_t>(got.num_chunks));
+  std::int64_t summed = 0;
+  for (std::size_t i = 0; i < segs.size(); ++i) {
+    CHECK(got.chunk_num_samples[i] == segs[i].length);
+    CHECK(got.chunk_num_tokens[i] == segs[i].token_len);
+    summed += got.chunk_num_tokens[i];
+  }
+  CHECK(summed == got.num_tokens);
+
+  const std::size_t per = static_cast<std::size_t>(got.n_mels * got.n_frames);
+  double worst_all = 0.0;
+  for (std::size_t i = 0; i < segs.size(); ++i) {
+    const std::vector<float> segment(
+        wav.begin() + static_cast<std::ptrdiff_t>(segs[i].start),
+        wav.begin() + static_cast<std::ptrdiff_t>(segs[i].start + segs[i].length));
+    const std::vector<std::vector<double>> want = ref_front::LogMel(
+        segment, static_cast<int>(spec.a_chunk_samples()), cfg.n_fft,
+        cfg.hop_length, static_cast<int>(spec.a_mels), 16000);
+    REQUIRE(want.size() == static_cast<std::size_t>(got.n_mels));
+    REQUIRE(want[0].size() == static_cast<std::size_t>(got.n_frames));
+    double worst = 0.0;
+    for (std::int64_t m = 0; m < got.n_mels; ++m) {
+      for (std::int64_t f = 0; f < got.n_frames; ++f) {
+        const double a = got.input_features[i * per +
+                                            static_cast<std::size_t>(m * got.n_frames + f)];
+        const double b =
+            want[static_cast<std::size_t>(m)][static_cast<std::size_t>(f)];
+        worst = std::max(worst, std::fabs(a - b));
+      }
+    }
+    INFO("chunk ", i);
+    MESSAGE("chunk " << i << " mel vs reference: worst |delta| " << worst);
+    CHECK(worst < 1e-5);
+    worst_all = std::max(worst_all, worst);
+  }
+  MESSAGE("worst over all " << segs.size() << " chunks: " << worst_all);
+
+  // AND THE CHUNKS ARE DIFFERENT MELS. If they were not, every ordering and
+  // slicing assertion below would be measuring an identity. The clip sweeps, so
+  // chunk 0 and chunk 1 disagree even though both are full.
+  double chunk_delta = 0.0;
+  for (std::size_t k = 0; k < per; ++k) {
+    chunk_delta = std::max(
+        chunk_delta, std::fabs(static_cast<double>(got.input_features[k]) -
+                               static_cast<double>(got.input_features[per + k])));
+  }
+  MESSAGE("chunk 0 and chunk 1 differ in the mel by up to " << chunk_delta);
+  CHECK(chunk_delta > 1e-2);
+}
+
+TEST_CASE("dots3-note W7b: the tower runs each chunk at ITS OWN mask length and concatenates IN ORDER") {
+  // THE SEAM CASE. Four defects produce correctly-shaped output and each gets
+  // its own assertion rather than a share of an aggregate norm (§4.15.5).
+  const TinySpec spec = LongAudioSpec();
+  const LoadedTower t(spec, /*variant=*/0, dots3_tiny::kAudioLongSamples);
+  REQUIRE(t.mel.num_chunks == dots3_tiny::kAudioLongChunks);
+  const std::int64_t width = t.spec.a_adapter_out();
+
+  std::vector<vllm::Dots3NoteAudioCapture> caps;
+  const std::vector<float> got = t.RunChunks(&caps);
+  REQUIRE(got.size() ==
+          static_cast<std::size_t>(dots3_tiny::kAudioLongTokens * width));
+
+  // 1. THE MASK IS PER CHUNK. The two full chunks mask nothing at the last
+  //    stage (25 valid of 25 stem rows); the SHORT one masks 13 of 25. A mask
+  //    taken from the padded length would read 25 everywhere.
+  REQUIRE(caps.size() == static_cast<std::size_t>(dots3_tiny::kAudioLongChunks));
+  const std::vector<ref_chunks::Segment> segs = ref_chunks::Segments(
+      dots3_tiny::kAudioLongSamples, dots3_tiny::kAudioLongChunkSeconds, 16000,
+      160, 8, 1);
+  REQUIRE(segs.size() == caps.size());
+  for (std::size_t i = 0; i < caps.size(); ++i) {
+    const std::vector<std::int64_t> want =
+        ref_chunks::MaskStages(segs[i].length, 160);
+    REQUIRE(caps[i].valid_lens.size() == 4u);
+    INFO("chunk ", i);
+    for (std::size_t k = 0; k < 4; ++k) CHECK(caps[i].valid_lens[k] == want[k]);
+    MESSAGE("chunk " << i << " mask stages: " << caps[i].valid_lens[0] << " -> "
+                     << caps[i].valid_lens[1] << " -> " << caps[i].valid_lens[2]
+                     << " -> " << caps[i].valid_lens[3]);
+  }
+  CHECK(caps[0].valid_lens[3] == dots3_tiny::kAudioLongFullChunkTokens);
+  CHECK(caps[2].valid_lens[3] == dots3_tiny::kAudioLongLastChunkTokens);
+  CHECK(caps[2].valid_lens[3] < caps[0].valid_lens[3]);
+
+  // 2. EACH CHUNK'S BLOCK IS THAT CHUNK'S ANSWER, at that chunk's row offset.
+  const TowerRefWeights rw = ReadTowerWeights(t.ckpt, t.spec);
+  const std::vector<ref_tower::Mat> want = RefChunkBlocks(rw, t, segs);
+  REQUIRE(want.size() == segs.size());
+  for (std::size_t i = 0; i < segs.size(); ++i) {
+    INFO("chunk ", i);
+    REQUIRE(want[i].size() == static_cast<std::size_t>(segs[i].token_len));
+    REQUIRE(want[i][0].size() == static_cast<std::size_t>(width));
+    const double worst =
+        WorstBlockDelta(got, segs[i].row_offset, want[i], width);
+    MESSAGE("chunk " << i << " (rows " << segs[i].row_offset << ".."
+                     << segs[i].row_offset + segs[i].token_len - 1
+                     << ") vs its own reference: worst |delta| " << worst);
+    CHECK(worst < 5e-2);
+  }
+
+  // 3. THE BOUNDARIES ARE WHERE THE ROW COUNTS PUT THEM. An off-by-one in the
+  //    per-chunk slice moves every later chunk by one row and leaves the shape
+  //    intact when the total is fixed up; this compares the FIRST row of each
+  //    chunk's block against that chunk's reference row 0 and against the
+  //    PREVIOUS chunk's last reference row, and asserts the first is the near
+  //    one.
+  for (std::size_t i = 1; i < segs.size(); ++i) {
+    const double at_seam =
+        RowRelL2(got, segs[i].row_offset, want[i][0], width);
+    const double if_shifted = RowRelL2(
+        got, segs[i].row_offset, want[i - 1][want[i - 1].size() - 1], width);
+    INFO("chunk ", i);
+    MESSAGE("seam at row " << segs[i].row_offset << ": rel-L2 " << at_seam
+                           << " against this chunk's row 0, " << if_shifted
+                           << " against the previous chunk's last row");
+    CHECK(at_seam < 5e-2);
+    CHECK(if_shifted > at_seam);
+  }
+
+  // 4. THE ORDER. Every row of a reversed concatenation is a correct row, so
+  //    only a comparison that knows WHICH chunk belongs WHERE can see it.
+  std::vector<float> reversed;
+  for (std::size_t i = segs.size(); i-- > 0;)
+    for (const std::vector<double>& row : want[i])
+      for (double v : row) reversed.push_back(static_cast<float>(v));
+  REQUIRE(reversed.size() == got.size());
+  std::vector<float> ordered;
+  for (std::size_t i = 0; i < segs.size(); ++i)
+    for (const std::vector<double>& row : want[i])
+      for (double v : row) ordered.push_back(static_cast<float>(v));
+  double ord = 0.0, rev = 0.0;
+  for (std::size_t k = 0; k < got.size(); ++k) {
+    ord = std::max(ord, std::fabs(static_cast<double>(got[k] - ordered[k])));
+    rev = std::max(rev, std::fabs(static_cast<double>(got[k] - reversed[k])));
+  }
+  MESSAGE("worst |delta| against the ordered concatenation " << ord
+          << ", against the reversed one " << rev);
+  CHECK(ord < 5e-2);
+  CHECK(rev > 10.0 * ord);
+
+  // 5. THE SHORT CHUNK IS TRUNCATED BACK, and truncating is not the same as
+  //    dropping rows off the end. The last chunk's 25 stem rows all enter
+  //    attention when the slice is not applied, so its KEPT 13 rows change too:
+  //    the reference is run at both token counts and the two are asserted to
+  //    disagree on the rows the answer keeps.
+  const std::vector<ref_tower::Mat> untruncated = RefChunkBlocks(
+      rw, t, segs, /*num_samples_override=*/0,
+      /*token_len_override=*/dots3_tiny::kAudioLongFullChunkTokens);
+  const std::size_t last = segs.size() - 1;
+  REQUIRE(untruncated[last].size() ==
+          static_cast<std::size_t>(dots3_tiny::kAudioLongFullChunkTokens));
+  double trunc_delta = 0.0;
+  for (std::size_t r = 0; r < want[last].size(); ++r)
+    for (std::size_t c = 0; c < want[last][r].size(); ++c)
+      trunc_delta = std::max(
+          trunc_delta, std::fabs(want[last][r][c] - untruncated[last][r][c]));
+  MESSAGE("not truncating the short chunk moves its KEPT rows by up to "
+          << trunc_delta << ", and would add "
+          << (dots3_tiny::kAudioLongFullChunkTokens -
+              dots3_tiny::kAudioLongLastChunkTokens)
+          << " padding-derived rows");
+  CHECK(trunc_delta > 1e-3);
+  CHECK(WorstBlockDelta(got, segs[last].row_offset, want[last], width) < 5e-2);
+
+  // 6. THE MASK COMES FROM THE VALID LENGTH, NOT THE PADDED ONE. Same shape,
+  //    same row count, different numbers — measured on the short chunk, whose
+  //    padded tail is half of it.
+  const std::vector<ref_tower::Mat> padded_mask = RefChunkBlocks(
+      rw, t, segs, /*num_samples_override=*/32000);
+  double mask_delta = 0.0;
+  for (std::size_t r = 0; r < want[last].size(); ++r)
+    for (std::size_t c = 0; c < want[last][r].size(); ++c)
+      mask_delta = std::max(
+          mask_delta, std::fabs(want[last][r][c] - padded_mask[last][r][c]));
+  MESSAGE("masking the short chunk from the PADDED length moves it by up to "
+          << mask_delta);
+  CHECK(mask_delta > 1e-3);
+  // ...and the implementation is the one masked from the VALID length.
+  CHECK(WorstBlockDelta(got, segs[last].row_offset, want[last], width) <
+        WorstBlockDelta(got, segs[last].row_offset, padded_mask[last], width));
+
+  // 7. AND THE ANSWER IS NOT A CONSTANT.
+  double lo = got[0], hi = got[0];
+  for (float v : got) {
+    lo = std::min(lo, static_cast<double>(v));
+    hi = std::max(hi, static_cast<double>(v));
+  }
+  MESSAGE("the concatenated output spans [" << lo << ", " << hi << "]");
+  CHECK(hi - lo > 1e-3);
+}
+
+TEST_CASE("dots3-note W7b: ONE chunk takes W7a's path, byte for byte") {
+  // The additivity claim, asserted rather than described: at `num_chunks == 1`
+  // the chunked entry point calls the single-chunk tower with the same
+  // arguments, so the two answers are IDENTICAL and not merely close. The
+  // default fixture geometry is used deliberately — it is the one every W7a
+  // case runs on.
+  const LoadedTower t;
+  REQUIRE(t.mel.num_chunks == 1);
+  REQUIRE(t.mel.chunk_num_samples.size() == 1u);
+  CHECK(t.mel.chunk_num_samples[0] == t.mel.num_samples);
+  CHECK(t.mel.chunk_num_tokens[0] == t.mel.num_tokens);
+  const std::vector<float> single = t.Run();
+  const std::vector<float> chunked = t.RunChunks();
+  REQUIRE(single.size() == chunked.size());
+  std::size_t differing = 0;
+  for (std::size_t i = 0; i < single.size(); ++i)
+    if (single[i] != chunked[i]) ++differing;
+  MESSAGE("one chunk through the chunked path: " << differing << " of "
+                                                 << single.size()
+                                                 << " values differ");
+  CHECK(differing == 0u);
+}
+
+TEST_CASE("dots3-note W7b: the single-chunk tower REFUSES a whole STACK, which is what makes the chunk loop reachable") {
+  // The invariant that makes the reachability mutation visible, gated so it is
+  // not a mute switch. Handing `Dots3NoteAudioForward` the stacked mel of a
+  // multi-chunk clip — which is exactly what the production call site looked
+  // like before `Dots3NoteAudioForwardChunks` existed — produces a
+  // CORRECTLY-SHAPED answer with the right row count off a mel of the wrong
+  // width, so nothing downstream can tell. Upstream's own
+  // `assert mel.shape[1] == self.chunk_mel_frames` (`audio.py:215` @
+  // `9035151d6`) is the check that can, and this drives it.
+  const TinySpec spec = LongAudioSpec();
+  const LoadedTower t(spec, /*variant=*/0, dots3_tiny::kAudioLongSamples);
+  REQUIRE(t.mel.num_chunks == dots3_tiny::kAudioLongChunks);
+  REQUIRE(t.params.chunk_mel_frames() == spec.a_chunk_mel_frames());
+  REQUIRE(static_cast<std::int64_t>(t.mel.input_features.size()) ==
+          dots3_tiny::kAudioLongChunks * t.params.num_mel_bins *
+              t.params.chunk_mel_frames());
+
+  std::string msg;
+  try {
+    (void)vllm::Dots3NoteAudioForward(
+        t.mel.input_features, t.mel.num_samples, t.mel.num_tokens,
+        /*hop_length=*/160, t.weights, t.params,
+        vt::GetBackend(vt::DeviceType::kCPU));
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  INFO("message: ", msg);
+  MESSAGE("the stacked mel is refused with: " << msg);
+  CHECK(msg.find("not ONE chunk") != std::string::npos);
+  CHECK(msg.find("audio.py:215") != std::string::npos);
+  CHECK(msg.find("Dots3NoteAudioForwardChunks") != std::string::npos);
+  // ...and ONE chunk of that same stack is accepted, so the check is a width
+  // check and not a refusal of the whole path.
+  const std::size_t per = static_cast<std::size_t>(t.params.num_mel_bins *
+                                                   t.params.chunk_mel_frames());
+  const std::vector<float> one(t.mel.input_features.begin(),
+                               t.mel.input_features.begin() +
+                                   static_cast<std::ptrdiff_t>(per));
+  const std::vector<float> rows = vllm::Dots3NoteAudioForward(
+      one, t.mel.chunk_num_samples[0], t.mel.chunk_num_tokens[0],
+      /*hop_length=*/160, t.weights, t.params,
+      vt::GetBackend(vt::DeviceType::kCPU));
+  CHECK(rows.size() == static_cast<std::size_t>(t.mel.chunk_num_tokens[0] *
+                                                t.spec.a_adapter_out()));
+}
+
+TEST_CASE("dots3-note W7b: a geometry whose chunk is not a whole number of strides refuses a LONG clip, and serves a short one") {
+  // §4.15.3. The tiny fixture's DEFAULT `chunk_seconds` = 1 is exactly such a
+  // geometry — 16000 is 12.5 token strides — so this is not a hypothetical
+  // config invented to be refused. Past one chunk upstream's own two token
+  // counts disagree there, and upstream never compares them.
+  const TinySpec spec = AudioSpec();
+  const TinyCheckpoint ckpt(FixtureDir(), spec);
+  vllm::multimodal::Dots3NoteAudioProcessorConfig cfg =
+      vllm::multimodal::LoadDots3NoteAudioProcessorConfig(ckpt.config_path(),
+                                                          "tiny");
+  cfg.audio_token_id = dots3_tiny::kAudPadId;
+  REQUIRE(cfg.chunk_samples() == 16000);
+  REQUIRE(cfg.chunk_samples() % cfg.token_stride() != 0);
+  const vllm::multimodal::Dots3NoteAudioProcessor proc(cfg);
+
+  // The premise, measured: the two upstream expressions really do disagree
+  // here, so the refusal is not decoration.
+  const std::int64_t n = 40000;  // 2.5 chunks
+  const std::vector<ref_chunks::Segment> segs = RefSegments(cfg, n);
+  REQUIRE(segs.size() == 3u);
+  MESSAGE("at chunk_seconds=1: the per-segment sum is "
+          << ref_chunks::TotalTokens(segs) << " and ceil(total/stride) is "
+          << proc.NumAudioTokens(n));
+  CHECK(ref_chunks::TotalTokens(segs) == 33);
+  CHECK(proc.NumAudioTokens(n) == 32);
+  CHECK(ref_chunks::TotalTokens(segs) != proc.NumAudioTokens(n));
+
+  SUBCASE("a waveform past one chunk refuses BY NAME, with the numbers") {
+    const std::vector<float> wav = dots3_tiny::FixtureAudioLongF32(0, n);
+    std::string msg;
+    try {
+      proc.ProcessWaveform(wav.data(), static_cast<std::int64_t>(wav.size()),
+                           16000);
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    INFO("message: ", msg);
+    CHECK(msg.find("3 chunks") != std::string::npos);
+    CHECK(msg.find("not a whole number of 1280") != std::string::npos);
+    CHECK(msg.find("33 rows") != std::string::npos);
+    CHECK(msg.find("span of 32") != std::string::npos);
+    CHECK(msg.find("#2797") != std::string::npos);
+  }
+  SUBCASE("...and a waveform INSIDE one chunk is still served, because the sums agree there") {
+    // The reason this is a per-request refusal and not an install-time one: a
+    // one-segment sum IS `ceil(n / stride)`, so W7a's whole gate still passes
+    // on this config.
+    const std::vector<float> wav = dots3_tiny::FixtureAudioF32(0);
+    const vllm::multimodal::AudioKwargs kw = proc.ProcessWaveform(
+        wav.data(), static_cast<std::int64_t>(wav.size()), 16000);
+    CHECK(kw.num_chunks == 1);
+    CHECK(kw.num_tokens == dots3_tiny::kAudioTokens);
+  }
+  SUBCASE("...and the EXACT chunk boundary is served: one chunk, not two") {
+    std::vector<float> exact(static_cast<std::size_t>(cfg.chunk_samples()), 0.1f);
+    const vllm::multimodal::AudioKwargs kw = proc.ProcessWaveform(
+        exact.data(), static_cast<std::int64_t>(exact.size()), 16000);
+    CHECK(kw.num_chunks == 1);
+    CHECK(kw.num_tokens == dots3_tiny::kAudioStemFrames);
+  }
+}
+
+TEST_CASE("dots3-note W7b: two DIFFERENT long waveforms give two different concatenations") {
+  const TinySpec spec = LongAudioSpec();
+  const LoadedTower a(spec, /*variant=*/0, dots3_tiny::kAudioLongSamples);
+  const LoadedTower b(spec, /*variant=*/1, dots3_tiny::kAudioLongSamples);
+  const std::vector<float> ga = a.RunChunks();
+  const std::vector<float> gb = b.RunChunks();
+  REQUIRE(ga.size() == gb.size());
+  REQUIRE(ga.size() == static_cast<std::size_t>(dots3_tiny::kAudioLongTokens *
+                                                a.spec.a_adapter_out()));
+  double worst = 0.0;
+  for (std::size_t i = 0; i < ga.size(); ++i)
+    worst = std::max(worst, std::fabs(static_cast<double>(ga[i] - gb[i])));
+  MESSAGE("two long waveforms differ in the concatenation by up to " << worst);
   CHECK(worst > 1e-3);
 }
 

@@ -235,8 +235,17 @@ multimodal::MultiModalInputs RouteDots3NoteAudioWav(
         "See .agents/specs/dots3-note.md §4.14.5 and issue #2703.");
   }
 
-  // The front end refuses a wrong rate (W7c) and a waveform over one chunk
-  // (W7b) BY NAME; both messages name the brick and the reason.
+  // The front end refuses a wrong rate (W7c) BY NAME, and — since W7b (#2797)
+  // lifted the `chunk_seconds` ceiling — a waveform past ONE chunk on a
+  // checkpoint whose `chunk_samples` is not a whole number of `token_stride`s,
+  // where upstream's own per-segment row sum and its prompt-side
+  // `ceil(total / stride)` disagree (spec §4.15.3). Both messages name the
+  // reason and the numbers.
+  //
+  // THIS IS THE FRONT END AND NOT THE ENGINE LOOP, and that is the point of
+  // refusing here: `InputValidationError` becomes HTTP 400 for THIS request,
+  // where the same throw from inside `encode_mm` would set `AsyncLLM`'s errored
+  // latch and 500 every later request, text ones included.
   multimodal::AudioKwargs kw = proc.ProcessWaveform(
       decoded.samples.data(), static_cast<int64_t>(decoded.samples.size()),
       decoded.sampling_rate);

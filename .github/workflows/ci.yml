@@ -486,9 +486,17 @@ jobs:
           python3 tests/scripts/test_agent_pr_body.py
           python3 tests/scripts/test_agent_issue_index.py
           python3 tests/scripts/test_ab_arms_differ.py
-          python3 tests/scripts/test_tier_hidden_delta.py
+          # The ROCM-TIER-DIVERGENCE (#2590) attribution suite stays HERE, and
+          # its two siblings do not (#2705). This one drives
+          # `scripts/tier-delta-attribution.py`, which imports `statistics` and
+          # nothing else, so it runs in a step with no numpy. The hidden-state
+          # and logit comparators both `import numpy as np`, and they landed on
+          # these lines by mistake: numpy is installed in the NEXT step, so all
+          # three were invoked before the dependency existed and the first of
+          # them reduced the whole step to a `ModuleNotFoundError` wearing an
+          # `AssertionError: 1 != 0`. The two that need numpy moved to the lane
+          # that installs it. Do not reunite them here.
           python3 tests/scripts/test_tier_delta_attribution.py
-          python3 tests/scripts/test_tier_logit_delta.py
       - name: The LTX-2.5 pixel comparison and its harness run on a lane (#1612)
         # Registered in TWO places, like the baseline and preflight suites above:
         # here and in `scripts/agent-preflight.sh`. Both suites ran on NO lane
@@ -537,6 +545,19 @@ jobs:
           # never be silent.
           python3 tests/scripts/test_convert_glm5_next_gguf.py
           python3 tests/scripts/test_ltx25_pixel_ab_harness.py
+          # Same numpy-only lane, same reason (#2705, repairing #2590): the two
+          # ROCM-TIER-DIVERGENCE comparators read raw activation and logit dumps
+          # with `np.fromfile`, and `tier-hidden-delta.py` decodes bf16 by
+          # widening `uint16` and viewing it as `float32`, so numpy is not a
+          # convenience there. Both suites shell out to their tool and assert on
+          # its return code, which is why a missing import presented as a content
+          # failure. Neither is in preflight's `SUITES`, so this lane is the ONLY
+          # place either one runs, and a skip-when-absent guard is therefore not
+          # the repair: the paragraph above records why a skip is honest on a
+          # developer box and would be silence on a lane, and for these two it
+          # would be silence everywhere.
+          python3 tests/scripts/test_tier_hidden_delta.py
+          python3 tests/scripts/test_tier_logit_delta.py
       - name: The LTX-2 latent-dump driver's own controls are executed (#2514)
         # `tools/oracle/ltx2_latent_dump.py` runs only inside an `rc` lease, and
         # nothing in this tree executed it: two defects rode a merged branch to a

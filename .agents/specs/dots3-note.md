@@ -5706,8 +5706,9 @@ each, which is the caller that makes D5's arm REACHED; `conv_out.bias` absent.
 The review returned PASS on the tower's arithmetic, on its refusals and on the
 oracle comparison, and it mutated each of them rather than reading them. What
 follows is what it came back with that the sections above did not already say.
-Four of the five items are not defects. They are written down anyway, because a
-number nobody records is a number the next reader has to derive again.
+Only the first item is a defect. The rest are not, and they are written down
+anyway, because a number nobody records is a number the next reader has to
+derive again.
 
 **THE ENUMERATION INSTRUMENT HAD A `'` HOLE, AND IT IS NOW CLOSED.**
 `StripCommentsAndLiterals` treated EVERY `'` as a char-literal delimiter, so a

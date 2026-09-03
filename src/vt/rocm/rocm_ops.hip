@@ -276,11 +276,13 @@ struct Registrar {
     RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelRocm)));
-    // MLA/DSA campaign W1 (#2715). Each of these four served from the portable
-    // CPU reference tier on gfx1151 before this line existed, which is what
-    // docs/ROCM.md:60-61 disqualifies a performance result on. The remaining
-    // three gating ops (kDsaIndexerLogits, kDsaTopkSelect, kMlaDecodeAttention)
-    // are still absent, so the GLM-5.3 speed axis stays VOID after this wave.
+    // MLA/DSA campaign W1 (#2715). Before these lines each of these four
+    // resolved to NO native ROCm kernel: the portable CPU reference tier where
+    // it is eligible (which docs/ROCM.md:60-61 disqualifies a performance result
+    // on) and a REFUSAL where #2511 withdrew it — see rocm_mla_ops.hip's header.
+    // The remaining three gating ops (kDsaIndexerLogits, kDsaTopkSelect,
+    // kMlaDecodeAttention) are still absent, so the GLM-5.3 speed axis stays
+    // VOID after this wave.
     RegisterOp(OpId::kBatchedMatmul, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<BatchedMatmulFn>(&BatchedMatmulKernelRocm)));

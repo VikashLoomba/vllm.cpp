@@ -9,16 +9,26 @@
 //   kGatherMlaCache     — gather a request's cache entries back into a dense
 //                         [total_tokens, head_dim] buffer for prefill.
 //
-// WHY THEY MATTER HERE, AND WHAT THEY DO NOT FIX. `gfx1151` reports
-// `integrated=1` and `managedMemory=1`, so `DeviceMemoryIsHostAddressable()` is
-// true and the portable CPU reference tier is eligible
-// (`src/vt/rocm/rocm_backend.hip:371`, `docs/ROCM.md:53-58`). An MLA op with no
-// native ROCm kernel therefore does not refuse on this board — it installs a
-// host kernel and runs. So these three were never a correctness failure here;
-// they were a SPEED failure that `docs/ROCM.md:60-61` turns into a MEASUREMENT
-// failure, because it disqualifies any performance result from a run whose
-// `GetReferenceTierHits()` is non-zero. On a DISCRETE AMD card the same absence
-// is a refusal, because the tier needs host-addressable device memory.
+// WHY THEY MATTER HERE, AND WHAT THEY DO NOT FIX. An op with no native ROCm
+// kernel meets one of two fates, and WHICH ONE on this board is a live question
+// this branch measures rather than assumes.
+//
+// Where the portable CPU reference tier is eligible it installs a host kernel
+// and the op RUNS, slowly: not a correctness failure, but a MEASUREMENT one,
+// because `docs/ROCM.md:60-61` disqualifies any performance result from a run
+// whose `GetReferenceTierHits()` is non-zero. That is the state #2715 describes
+// and the state `9f3e6e223`'s GLM-5.3 run observed, with five ops on the tier.
+//
+// Where it is not eligible, `GetOp` REFUSES by name rather than hand a host
+// kernel a pointer the host may not dereference. That is a discrete AMD card —
+// and, since `6b97a6800` (#2511) narrowed managed allocation to
+// `PageableMemoryAccess == 1` and made the unified claim follow the allocator,
+// possibly `gfx1151` too: it reports that attribute 0, and `docs/ROCM.md:83-85`
+// says outright that this part gets "plain `hipMalloc` and no reference tier".
+// `9f3e6e223` is NOT a descendant of that commit, so its observation predates
+// the narrowing. `tests/vt/test_backend_cross_device.cpp` asks the board through
+// `vt::ReferenceTierEligible` and asserts the consequence either way; this
+// header does not pick an answer.
 //
 // Registering these three does not make a GLM-5.3 speed number admissible. The
 // campaign's W2 (`kDsaIndexerLogits`, `kDsaTopkSelect`) and W3

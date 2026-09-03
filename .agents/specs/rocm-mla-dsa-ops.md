@@ -294,9 +294,14 @@ it, and every word the case compared was still correct. The case now brackets
 the cache with guard bands and asserts both untouched, so an out-of-range write
 is seen.
 
-**The re-measurement is PENDING, not a pass.** It is rc job `e88fd335`, queued
-on `strix:gpu0`. Until it reports, this wave has four killed mutations and one
-repaired-but-unre-measured case, and nothing here says otherwise.
+**The re-measurement is PENDING, not a pass.** It is rc job `e88fd335` on
+`strix:gpu0`, submitted 2026-09-03 and still queued behind another row's job
+when this was written. Until it reports, this wave has four killed mutations and
+one repaired-but-unre-measured case, and nothing here says otherwise. Its output
+lands at `/workspace/rocm-mla-2715/out2/` (`job2.log`, `probe.log`, `m2b.log`,
+`m2b_restored.log`) and is readable with `rc logs e88fd335`; the job builds the
+BRANCH HEAD bytes, not the tarball job1 used, and prints each file's sha256
+against `head.sha256` so the tree it measured is nameable.
 
 ### What the W1 gate does NOT cover, stated rather than implied
 

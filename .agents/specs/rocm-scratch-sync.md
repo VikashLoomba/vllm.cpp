@@ -47,7 +47,7 @@ legacy sync engine under `legacy_engine_mutex`
 `POST /v1/videos` spawns a job thread at
 `src/vllm/entrypoints/openai/api_server.cpp:670`, and `POST /v1/audio/speech`
 runs `synthesizer_` inline on the cpp-httplib worker thread
-(`api_server.cpp:611`). On a ROCm build those runners resolve to `kROCM`, so two
+(`ApiServer::handle_audio_speech`, `api_server.cpp:612`). On a ROCm build those runners resolve to `kROCM`, so two
 host threads can be inside `vt::MatmulBT` at once.
 
 **That is still not a race on this entry, because they do not share a stream.**
@@ -144,7 +144,17 @@ described.
 - `GetLt()` (`rocm_matmul_hipblaslt.hip:272`) keeps one `thread_local`
   `hipblasLtHandle_t` across both devices of the Gemma4 peer hop, while its
   neighbour `GetBlas` was given an explicit dual slot for that exact hazard.
+- [#2836](https://github.com/mudler/vllm.cpp/issues/2836): the speech route
+  shares one `vt::Queue` across cpp-httplib worker threads with no lock. This is
+  the "one shape would make it live" case in `## First deliverable` above, filed
+  because it is a hazard on its own terms and not only as #2712's trigger.
+- [#2837](https://github.com/mudler/vllm.cpp/issues/2837): a THIRD grow-only pool
+  in `rocm_matmul_hipblaslt.hip` (the batched pointer tables, `:678-680` and
+  `:738-740`) frees on growth. Its locking is correct, so it has no race; it
+  shares only the lifetime half, and the repair is the same retire-never-free.
+  Found by reading the file's remaining `hipFree` occurrences after this row
+  removed the one it owned.
 - The hipBLASLt arm is opt-in and default OFF (`LtEnabled()`,
-  `rocm_matmul_hipblaslt.hip:253-260`, requires `VT_ROCM_HIPBLASLT=1`), so the
+  `rocm_matmul_hipblaslt.hip:255`, requires `VT_ROCM_HIPBLASLT=1`), so the
   `LtWorkspace` half of this change is compiled but not exercised at runtime by
   any default-configuration gate this row ran.

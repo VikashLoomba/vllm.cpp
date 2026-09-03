@@ -4808,6 +4808,177 @@ the served side:
   Neither is a served case; both are the tower gate wearing a server. **The
   division stands as it is, and it is now written down rather than implied.**
 
+### 4.13 W6c ports PIL's resampler, and the served image no longer has to be a multiple of 28
+
+**The gap W6c closes.** W6a landed the image processor and W6b made the released
+tower compute, so after W6b every part of the served image chain worked except
+its first step. `Dots3NoteImageProcessor::ProcessImage` computed
+`Dots3NoteResizedSize` correctly and then REFUSED whenever that size differed
+from the size it was handed, because the pixel RESAMPLING behind
+`image.resize(..., Image.Resampling.BICUBIC)` (`common/processor.py:174` @
+`9035151d6`) was not ported. `factor = patch_size * merge_size` is 28 on
+`dots-studio/dots3-note-prev`, and upstream ALWAYS resizes, so the refusal
+turned away essentially every real photograph and screenshot. It landed as an
+HTTP 400 at `ApiServer::handle_chat_completions` with both sizes in the message,
+so it was never a silent skip — it was the last thing standing between the
+server and a real image. Issue
+[#2537](https://github.com/mudler/vllm.cpp/issues/2537).
+
+**What was already ported, and what W6c leaves alone.** The GEOMETRY is W6a's
+and W6c does not touch it: `RoundByFactor` (Python `round`, half-to-EVEN, via
+`std::nearbyint` and deliberately not `std::round`), `CeilByFactor`,
+`FloorByFactor` at `dots3_note_processor.cpp:30-45`, and `Dots3NoteResizedSize`
+mirroring `resized_size` (`common/processor.py:97-146` @ `9035151d6`) including
+the `min_pixels` floor, the `max_pixels` ceiling and the second rebalance when
+the floor pushes the size back past the ceiling. That clamp is already honoured
+from `preprocessor_config.json`, and §4.11's gate already measures it.
+
+**What `Dots3NoteResizedSize` still ignores, and why that is not W6c's.**
+Upstream's `resized_size` also reads a per-call `detail` string, a
+`self.image_details[detail]` override table, and explicit `target_height` /
+`target_width` arguments (`common/processor.py:97-119`). None of the three
+reaches this port, because the OpenAI chat seam this row owns never supplies
+them: `RouteDots3NoteImageRgb` calls `ProcessImage(rgb, height, width)` with the
+decoded image's own size and nothing else, and `image_details` is a
+`Dots3NoteProcessor` constructor argument no released `preprocessor_config.json`
+carries. Wiring `detail` through is a FRONT-END change to the chat seam's
+request parsing, which is W8's, and it stays owed under `## Owed` beside the
+other W8 items rather than being widened into here. This is stated so a reader
+does not read "the budget clamp is honoured" as "every argument of
+`resized_size` is honoured".
+
+#### 4.13.1 `Image.Resampling.BICUBIC` is not "a bicubic kernel"
+
+The one thing that could quietly make every served image wrong is treating
+PIL's `resize` as a four-tap cubic interpolation. It is not one, and on a
+DOWNSCALE — which is what a chat request almost always asks for — the difference
+is not a rounding difference. The algorithm is `ImagingResampleInner` and its
+`8bpc` horizontal/vertical passes in Pillow's `src/libImaging/Resample.c`, read
+at tag `12.1.1`, which is the version installed on this developer host and the
+version `import PIL` reports there. Its parts, in the order they run, are:
+
+1. **The filter.** `bicubic_filter` with `a = -0.5` and `support = 2.0`:
+   `((a+2)x - (a+3))x² + 1` for `x < 1`, `(((x-5)x + 8)x - 4)a` for `x < 2`, zero
+   beyond. This half is the textbook Keys kernel, and it is the only half a
+   textbook gives you.
+2. **Support SCALING on downscale.** `precompute_coeffs` sets
+   `scale = in/out` and `filterscale = max(1.0, scale)`, then
+   `support = 2.0 * filterscale` and `ksize = ceil(support)*2 + 1`. Every filter
+   argument is divided by `filterscale`. A 5x downscale therefore reads a
+   21-tap window and behaves as a weighted AREA AVERAGE, not as a 4-tap
+   interpolation. A plain 4-tap bicubic aliases instead, and the error is
+   structural rather than small.
+3. **The sample centre.** `center = in0 + (xx + 0.5) * scale` with the box
+   `in0 = 0`, `in1 = inSize`; the weight of input column `x + xmin` is
+   `filter((x + xmin - center + 0.5) / filterscale)`. The two halves of that
+   `+0.5` are the classic half-pixel trap: dropping either one shifts the whole
+   image by half an output pixel and leaves every shape valid.
+4. **The window.** `xmin = (int)(center - support + 0.5)` clamped at 0,
+   `xmax = (int)(center + support + 0.5)` clamped at `inSize`, then
+   `xmax -= xmin` so it is a COUNT. The cast truncates toward zero; below zero
+   the clamp makes truncation and floor agree, and the upper bound is never
+   negative, so `(int)` is faithful and not a simplification.
+5. **Per-output NORMALIZATION.** The weights are divided by their own sum,
+   which is what makes the clipped edge windows and the widened downscale
+   windows preserve brightness. Skipping it darkens the borders and, on a
+   downscale, scales the whole image — a uniform shift a relative tolerance can
+   absorb.
+6. **Fixed point.** `normalize_coeffs_8bpc` converts each weight to
+   `int32` as `(int)(±0.5 + w * 2²²)` (`PRECISION_BITS = 32 - 8 - 2 = 22`),
+   which is round-half-away-from-zero. Each output accumulates from
+   `1 << 21` — the rounding half — and `clip8` returns
+   `clamp(acc >> 22, 0, 255)` with an ARITHMETIC shift, so the rounding is
+   round-half-up and the clamp is saturating.
+7. **Two passes over a uint8 INTERMEDIATE.** Horizontal first, into a real
+   8-bit image; then vertical over that. The intermediate is quantized, so the
+   result is NOT the separable float computation rounded once. Each pass is
+   skipped entirely when that axis does not change size, which for
+   `box = (0,0,w,h)` is exactly `out == in` on that axis.
+
+**The one deviation, and why it is an identity.** PIL computes the horizontal
+pass only over source rows `[ybox_first, ybox_last)` — the rows the vertical
+pass will read — and shifts `bounds_vert` to match. `PilResizeBicubicRgb`
+computes all `in_h` rows and indexes the intermediate absolutely. The horizontal
+pass reads exactly one source row per output row and writes exactly one
+intermediate row, so the two agree byte for byte on every row either of them
+computes; the deviation only costs the rows outside the window. It is recorded
+here because "we skipped an optimization" and "we changed the maths" look the
+same in a diff.
+
+**The one widening, and its bound.** PIL accumulates in `int`. This port
+accumulates in `int64_t`. With 8-bit inputs and coefficients normalized to sum
+1, `sum |k| <= 1.25` for this kernel, so `|acc| <= 255 * 1.25 * 2²² + 2²¹`,
+about `1.34e9`, inside `int32`'s range; PIL itself relies on a tighter bound
+still, because its `clip8` lookup table only covers `acc >> 22` in `[-640, 639]`.
+The wider accumulator therefore removes an overflow that cannot occur rather
+than changing an answer.
+
+**This is PIL's resampler and NOT torchvision's, and the two must not be
+confused.** `qwen3vl_processor.cpp` refuses its own resize (`:110-116`,
+`:271-274`) and names torchvision bicubic, which is a different algorithm:
+`antialias=False` by default on tensors, no support scaling, and float output
+with no uint8 round trip. The new file is named for PIL for that reason, and its
+header says so, so that a later reader does not discharge the Qwen3-VL debt with
+it.
+
+#### 4.13.2 Where it lands
+
+`include/vllm/multimodal/pil_resize.h` + `src/vllm/multimodal/pil_resize.cpp`
+carry `PilResizeBicubicRgb(src, in_h, in_w, out_h, out_w)` over HWC uint8 RGB.
+`Dots3NoteImageProcessor::ProcessImage` deletes the throw and calls it whenever
+`Dots3NoteResizedSize` moves either side, then patchifies the resized buffer at
+the resized stride. The `min(h,w) < factor/4` and aspect-ratio refusals stay:
+they are upstream's own `ValueError`s and not a gap.
+
+The RGBA compositing arm at `common/processor.py:157-162` (white background,
+alpha as mask) and the non-RGB `convert("RGB")` arm are NOT reached here: the
+chat seam's `ImageCodecFn` hands `ProcessImage` three-channel RGB already, so
+the mode normalization happens in the codec, upstream of this function. That is
+a statement about who owns it, not a claim that it is done — it stays with the
+codec, which is W8's.
+
+#### 4.13.3 The gate, and the four shapes a tolerance cannot see
+
+§6.4 option B still holds: there is no oracle for this row, so the gate is an
+independent in-test reference sharing no helper with the implementation. For a
+RESAMPLER a mean-error tolerance is a particularly weak instrument, so the gate
+asserts these separately:
+
+- **Per-pixel MAXIMUM error, in units of one 0-255 level**, not a mean. The
+  fixed-point reference reproduces steps 1-7 above and the bound is EXACT
+  equality — max error 0 levels — because both compute the same integer
+  quantization. A second, purely double-precision reference that stops before
+  step 6 bounds the impl at 1 level, which is the most the fixed-point rounding
+  can move a pixel; that arm is what catches a defect the fixed-point reference
+  could only miss by sharing a misreading.
+- **A NON-SQUARE image with a non-square target.** A transposed loop or an
+  axis swap is invisible on a square test image and this row's existing
+  fixture image is 8x8.
+- **A half-pixel probe.** A ramp image resampled at a scale where the
+  centre offset is decisive, asserted against the reference exactly; the
+  mutation table below shows the offset mutation moves it.
+- **Both extremes.** A hard 0/255 edge downscaled, where bicubic overshoot
+  runs past both ends of the range, so the saturating clamp is exercised at 0
+  and at 255 rather than assumed.
+- **The DOWNSCALE arm specifically**, because the support scaling only exists
+  there, and because a chat request almost always downscales.
+
+**Reachability** is the served case, not the unit gate. A chat request whose
+image is NOT a multiple of the fixture's `factor` returns 400 before W6c and 200
+with the placeholder count the resized grid implies after it, through
+`ApiServer::handle_chat_completions` on the server's default configuration.
+
+**A local Pillow cross-check is recorded as evidence and is NOT the gate.**
+Pillow is not in the oracle table and carries no pin here, so a comparison
+against the copy installed on this host cannot gate anything. It is still the
+strongest single piece of evidence available that the port reads the algorithm
+correctly — it is the very library upstream calls — so the measurement is
+recorded with its exact version and treated as evidence, not as a result.
+
+#### 4.13.4 Evidence
+
+*(measured after implementation; see the commit that lands it)*
+
 ---
 
 ## 5. Gates
@@ -5318,6 +5489,18 @@ dispatchable in order, under the constraints that answer imposes.
   ([#2615](https://github.com/mudler/vllm.cpp/issues/2615)). The gate carries
   the SET-equality assertion on the top-k plus the printed minimum decision
   margin, because a tolerance alone cannot see a bimodal selection flip.
+- **W6c — PIL's bicubic resampler, so a real image is SERVED. LANDED**
+  (evidence §4.13, [#2537](https://github.com/mudler/vllm.cpp/issues/2537)).
+  `PilResizeBicubicRgb` ports `ImagingResampleInner`'s 8bpc path — the `a = -0.5`
+  cubic, the `max(1, in/out)` support scaling that makes a downscale an area
+  average, the `(xx + 0.5) * scale` centre, the per-output weight
+  normalization, the 22-bit fixed point with its `1 << 21` rounding half and
+  saturating `clip8`, and the two passes over a uint8 intermediate — and
+  `ProcessImage` calls it instead of throwing. An image whose sides are not
+  multiples of `patch_size * merge_size` is now answered 200 rather than 400.
+  It does NOT wire `resized_size`'s `detail` / `image_details` /
+  `target_height` / `target_width` arguments, which are the chat seam's request
+  parsing and stay owed to W8.
 - **W7 — audio tower.** The `dots` stem deltas over our Whisper encoder.
 - **W8 — MM front end + ABI.** Processor, video sampling, placeholder expansion,
   `<|audio_comp_*|>`, `include/vllm.h` surface, the example server as a thin
@@ -5416,35 +5599,22 @@ Carried openly under option B (§6.4), not waived:
   against such a checkpoint gets HTTP 400 with the text path still answering.
   Owner: this row. Issue
   [#2616](https://github.com/mudler/vllm.cpp/issues/2616).
-- **The image processor REFUSES instead of resizing, so no non-conformant image
-  is servable.** `Dots3NoteImageProcessor::ProcessImage`
-  (`src/vllm/multimodal/dots3_note_processor.cpp`) computes the resized size and
-  then throws when it differs from the input size, rather than performing the
-  `Image.Resampling.BICUBIC` resample upstream always performs
-  (`common/processor.py:174` @ `9035151d6`). `Dots3NoteResizedSize` itself is
-  ported and correct, including the `min_pixels`/`max_pixels` rebalance
-  (`processor.py:97`); it is the resample AFTER it that is missing. **This is a
-  capability gap and not only a bookkeeping one.** `factor` is
-  `patch_size * merge_size`, which on the released `dots-studio/dots3-note-prev`
-  is 28, so an image is servable only when BOTH dimensions are already multiples
-  of 28 and the pixel count already sits inside the bounds — which almost no
-  real photograph or screenshot does. W6a never reaches the throw because its
-  fixture image is conformant by construction, and once W6b lifts the MoE ViT
-  refusal this becomes what a user hits instead. Refusing remains the right
-  INTERIM behaviour: patchifying at the wrong grid changes the placeholder count
-  and serves a well-shaped wrong prompt, which §6.4 records as having no oracle
-  to catch it. Closing it needs the resample matched to PIL's kernel
-  (`a = -0.5`, its support radius, its per-axis two-pass order and its clamping),
-  a gate that measures the resampler against a reference on a NON-conformant
-  image rather than only checking that the placeholder count comes out right,
-  and the refusal deleted in the same change so message and behaviour cannot
-  drift. **The record it claimed did not exist.** The code comment and the
-  runtime message both said "Recorded under `## Owed` in
-  `.agents/specs/dots3-note.md`" while this section named it nowhere and no
-  issue tracked it; the fresh review of #2523 found that, and this entry and
-  the issue below are the repair. Owner: this row, W8 (the MM front end brick
-  that owns the processor, §7). Issue
-  [#2537](https://github.com/mudler/vllm.cpp/issues/2537).
+- **`resized_size`'s per-request DETAIL overrides are not wired.** Upstream's
+  `Dots3NoteImageProcessor.resized_size` accepts `detail`, an
+  `image_details[detail]` table of `min_pixels` / `max_pixels` /
+  `target_height` / `target_width`, and explicit `target_height` /
+  `target_width` arguments (`common/processor.py:97-119` @ `9035151d6`). This
+  port honours the `min_pixels` / `max_pixels` pair from
+  `preprocessor_config.json` and ignores the other three inputs, because
+  `RouteDots3NoteImageRgb` calls `ProcessImage(rgb, height, width)` with the
+  decoded size and nothing else and no released `preprocessor_config.json`
+  carries an `image_details` table. Closing it is a FRONT-END change — the
+  OpenAI `image_url` part's `detail` field has to reach the processor call —
+  and it therefore belongs to W8 with the rest of the request parsing, not to
+  the resampler W6c landed (§4.13). Nothing published selects it and the
+  default `detail` resolves to the config pair the port already reads, so the
+  gap is invisible to every checkpoint this row can feed. Owner: this row, W8.
+  Issue [#2645](https://github.com/mudler/vllm.cpp/issues/2645).
 - **PER-REQUEST sparse routing for a MIXED step, and the refusal that stands in
   for it.** The W4b-3c review found the route predicate and the refusal
   predicate to be different predicates with a reachable gap between them, and
@@ -6159,3 +6329,32 @@ the quantized arms. `## Owed` is unchanged except that `vt::QuantFp8Group`'s
 missing `use_ue8m0` rounding is now recorded against W9 with the reason, because
 upstream's blockwise-fp8 MoE routes through DeepGEMM with e8m0 scales, and that
 R5 and the vision FP8 formula moved from W6 to W9 (§7, §8).
+
+**W6c — LANDED, and the server will now take a photograph.** The last step of
+the served image chain that still refused was its FIRST one.
+`Dots3NoteImageProcessor::ProcessImage` computed the resized geometry and then
+threw whenever it differed from the size it was handed, so an image was servable
+only when both of its sides were already multiples of `patch_size * merge_size`
+— 28 on the released checkpoint. `PilResizeBicubicRgb`
+(`src/vllm/multimodal/pil_resize.cpp`) ports Pillow's `ImagingResampleInner`
+8bpc path and the throw is gone; a non-conformant image is answered 200 with the
+placeholder count the resized grid implies. Evidence is §4.13, issue
+[#2537](https://github.com/mudler/vllm.cpp/issues/2537).
+
+**Say what it is NOT, in the same breath.** It is PIL's resampler, not "a
+bicubic kernel": the `max(1, in/out)` support scaling that turns a downscale
+into an area average, the `(xx + 0.5) * scale` centre, the per-output weight
+normalization and the 22-bit fixed point over a uint8 intermediate are each
+load-bearing, and each has a RED-first mutation behind it in §4.13. It is also
+not torchvision's, so it does not discharge Qwen3-VL's own deferred resize. And
+it wires none of `resized_size`'s `detail` / `image_details` / `target_height` /
+`target_width` arguments, which are request parsing and stay owed to W8
+([#2645](https://github.com/mudler/vllm.cpp/issues/2645)).
+
+**Next dispatchable: W7 for the audio tower, or W9 for the quantized arms.**
+The vision half of this row is now complete for every arm any published
+checkpoint selects, and what it still refuses BY NAME — `use_bias = true`
+([#2616](https://github.com/mudler/vllm.cpp/issues/2616)), the softmax router
+and the top-k-below-2 arm
+([#2615](https://github.com/mudler/vllm.cpp/issues/2615)) — nothing published
+sets.

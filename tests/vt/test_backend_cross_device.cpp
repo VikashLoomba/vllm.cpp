@@ -3731,12 +3731,26 @@ TEST_CASE("ConcatAndCacheMla writes the concatenated MLA entry BIT-EXACTLY") {
   // so the strided copy's tail runs rather than dividing away.
   constexpr int64_t kTokens = 11, kRank = 37, kPe = 8, kBlocks = 5, kBlockSize = 4;
   constexpr int64_t kWidth = kRank + kPe;
+  constexpr int64_t kCacheN = kBlocks * kBlockSize * kWidth;
 
+  // GUARD BANDS, and they are not decoration. The padded-token skip
+  // (`slot < 0`, upstream cache_kernels.cu:419-422) is the one guarantee in this
+  // op whose removal writes OUTSIDE the cache rather than inside it: `slot == -1`
+  // gives `block = -1/4 = 0` and `offset = -1%4 = -1`, so the entry address is
+  // NEGATIVE and a kernel that dropped the skip scribbles BEFORE the buffer. A
+  // test that allocated exactly the cache would compare only in-range words,
+  // find them all correct, and report that mutation as killed when it was not —
+  // measured: the first version of this case passed 46/46 with the skip removed.
+  // The tensor therefore points at the MIDDLE of a wider allocation and both
+  // bands are asserted untouched.
+  constexpr int64_t kGuard = 64;
   const std::vector<float> kv_c = RandomVec(kTokens * kRank, 27101);
   const std::vector<float> k_pe = RandomVec(kTokens * kPe, 27102);
   // The pre-seed is what a kernel that writes nothing has to overwrite, and it
   // is also what a PADDED slot must still be holding at the end.
-  const std::vector<float> seed(kBlocks * kBlockSize * kWidth, -13.25f);
+  const std::vector<float> seed(kCacheN, -13.25f);
+  std::vector<float> seed_padded(static_cast<size_t>(kCacheN + 2 * kGuard), 88.125f);
+  std::copy(seed.begin(), seed.end(), seed_padded.begin() + kGuard);
 
   // Slots are shuffled across blocks, not ascending: a kernel that walked the
   // cache linearly instead of through the slot map passes on an identity map.
@@ -3771,24 +3785,32 @@ TEST_CASE("ConcatAndCacheMla writes the concatenated MLA entry BIT-EXACTLY") {
     const Device d{dt, 0};
 
     DevBuf dkv(dev, q, kTokens * kRank), dpe(dev, q, kTokens * kPe),
-        dc(dev, q, static_cast<size_t>(kBlocks * kBlockSize * kWidth));
+        dc(dev, q, static_cast<size_t>(kCacheN + 2 * kGuard));
     dkv.Upload(kv_c);
     dpe.Upload(k_pe);
-    dc.Upload(seed);
+    dc.Upload(seed_padded);
+    // The cache the op is handed starts kGuard floats into the allocation.
+    void* cache_ptr = static_cast<void*>(static_cast<float*>(dc.ptr()) + kGuard);
     void* ds = dev.Alloc(kTokens * sizeof(int64_t));
     dev.Copy(q, ds, slots.data(), kTokens * sizeof(int64_t));
     dev.Synchronize(q);
 
     Tensor tkv = T2(dkv.ptr(), d, kTokens, kRank);
     Tensor tpe = T2(dpe.ptr(), d, kTokens, kPe);
-    Tensor tc = Tensor::Contiguous(dc.ptr(), DType::kF32, d, {kBlocks, kBlockSize, kWidth});
+    Tensor tc = Tensor::Contiguous(cache_ptr, DType::kF32, d, {kBlocks, kBlockSize, kWidth});
     Tensor ts = Tensor::Contiguous(ds, DType::kI64, d, {kTokens});
 
     const unsigned long long hits_before = vt::GetReferenceTierHits();
     vt::ConcatAndCacheMla(q, tkv, tpe, tc, ts);
     dev.Synchronize(q);
+    const std::vector<float> got = dc.Download();
     // A pure copy has no reassociation, so the bar is EQUALITY, not NMSE.
-    CHECK(dc.Download() == ref);
+    CHECK(std::vector<float>(got.begin() + kGuard, got.begin() + kGuard + kCacheN) == ref);
+    // Both guard bands, which is what makes the padded-token skip checkable.
+    CHECK(std::vector<float>(got.begin(), got.begin() + kGuard) ==
+          std::vector<float>(static_cast<size_t>(kGuard), 88.125f));
+    CHECK(std::vector<float>(got.begin() + kGuard + kCacheN, got.end()) ==
+          std::vector<float>(static_cast<size_t>(kGuard), 88.125f));
     // If this moved, the call above ran on the host, not on the device — the
     // same quantity docs/ROCM.md:60-61 disqualifies a speed result on.
     CHECK(vt::GetReferenceTierHits() == hits_before);

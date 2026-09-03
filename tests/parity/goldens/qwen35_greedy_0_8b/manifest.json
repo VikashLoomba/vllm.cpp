@@ -22,8 +22,11 @@
    "gpu_memory_utilization": 0.8
   },
   "capture_commands": [
-   "env -u VLLM_ROCM_USE_SKINNY_GEMM HIP_VISIBLE_DEVICES=0 /home/vikash/oracle/vllm-rocm-oracle-python scripts/qwen3-oracle-capture.py --model /models/Qwen3.5-0.8B --runs 10 --max-tokens 16 --per-prompt --gpu-mem 0.80 --out-dir /tmp/qwen35-skinny-oracle-greedy-k10-2772-production",
-   "env -u VLLM_ROCM_USE_SKINNY_GEMM HIP_VISIBLE_DEVICES=0 /home/vikash/oracle/vllm-rocm-oracle-python scripts/qwen3-neartie-gap.py --model /models/Qwen3.5-0.8B --golden-dir /tmp/qwen35-skinny-oracle-full-gap-2772-production --max-tokens 16 --topk 20 --gpu-mem-util 0.80"
+   "mkdir /tmp/qwen35-skinny-sacred-2772-reproduction",
+   "env -u VT_ROCM_SKINNY HIP_VISIBLE_DEVICES=0,1,2,3 LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib CHECKPOINT_ROOT=/home/vikash/models VT_QWEN35_08B_SNAPSHOT=/home/vikash/models/Qwen3.5-0.8B VT_DUMP_IDS=1 flock /home/vikash/gpu.lock build-hip-repair/tests/test_qwen35_paged_engine",
+   "mv tests/parity/goldens/qwen35_greedy_0_8b/our_ids.i32 /tmp/qwen35-skinny-sacred-2772-reproduction/our_ids.i32",
+   "env -u VLLM_ROCM_USE_SKINNY_GEMM HIP_VISIBLE_DEVICES=0 /home/vikash/oracle/vllm-rocm-oracle-python scripts/qwen3-oracle-capture.py --model /home/vikash/models/Qwen3.5-0.8B --runs 10 --max-tokens 16 --per-prompt --gpu-mem 0.80 --out-dir /tmp/qwen35-skinny-sacred-2772-reproduction",
+   "env -u VLLM_ROCM_USE_SKINNY_GEMM HIP_VISIBLE_DEVICES=0 /home/vikash/oracle/vllm-rocm-oracle-python scripts/qwen3-neartie-gap.py --model /home/vikash/models/Qwen3.5-0.8B --golden-dir /tmp/qwen35-skinny-sacred-2772-reproduction --max-tokens 16 --topk 20 --gpu-mem-util 0.80"
   ],
   "capture_date": "2026-09-03",
   "diagnostic_history": "The historical eager capture selected a different branch of an exact tie. Eager mode is diagnostic only and is not the denominator."

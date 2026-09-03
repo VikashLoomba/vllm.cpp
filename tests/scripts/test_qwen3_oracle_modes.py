@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Check that both Qwen3 oracle scripts select and narrate their mode."""
+"""Check both Qwen3 oracle scripts' production LLM construction paths."""
 
 from __future__ import annotations
 
-import ast
 import builtins
+import io
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -13,6 +14,18 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class _FakeArray:
+    def reshape(self, *shape):
+        return self
+
+
+def fake_numpy() -> ModuleType:
+    module = ModuleType("numpy")
+    module.fromfile = lambda *args, **kwargs: _FakeArray()
+    module.load = lambda *args, **kwargs: _FakeArray()
+    return module
 
 
 def load_script(name: str, path: Path) -> ModuleType:
@@ -27,58 +40,75 @@ def load_script(name: str, path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise AssertionError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
-    with mock.patch("builtins.__import__", side_effect=reject_vllm):
+    with mock.patch.dict(sys.modules, {"numpy": fake_numpy()}), mock.patch(
+        "builtins.__import__", side_effect=reject_vllm
+    ):
         spec.loader.exec_module(module)
     return module
 
 
-def hard_codes_eager(path: Path) -> bool:
-    tree = ast.parse(path.read_text())
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        if not isinstance(node.func, ast.Name) or node.func.id != "LLM":
-            continue
-        for keyword in node.keywords:
-            if keyword.arg == "enforce_eager":
-                return isinstance(keyword.value, ast.Constant) and keyword.value.value is True
-    return False
+class _LlmConstructed(Exception):
+    """Stop a script after observing its production LLM constructor call."""
 
 
 class OracleModeTests(unittest.TestCase):
-    def assert_modes(self, filename: str, required_args: list[str]) -> None:
+    def run_to_llm(self, module: ModuleType, argv: list[str]):
+        constructor_calls = []
+        output = io.StringIO()
+        fake_vllm = ModuleType("vllm")
+
+        def observing_llm(**kwargs):
+            constructor_calls.append(kwargs)
+            raise _LlmConstructed
+
+        fake_vllm.LLM = observing_llm
+        fake_vllm.SamplingParams = object
+        with mock.patch.dict(sys.modules, {"vllm": fake_vllm}), mock.patch.object(
+            sys, "argv", [str(module.__file__), *argv]
+        ), mock.patch.object(module.os, "makedirs"), mock.patch(
+            "sys.stdout", output
+        ):
+            with self.assertRaises(_LlmConstructed):
+                module.main()
+
+        self.assertEqual(len(constructor_calls), 1)
+        return constructor_calls[0], output.getvalue()
+
+    def assert_modes(self, filename: str, required_args: list[str], gpu_arg: str) -> None:
         path = ROOT / "scripts" / filename
         module = load_script(filename.replace("-", "_"), path)
 
-        required_seams = ("_parse_args", "_llm_kwargs", "_mode_narration")
-        if not all(hasattr(module, name) for name in required_seams):
-            self.assertFalse(
-                hard_codes_eager(path),
-                f"{filename}: default LLM mode hard-codes enforce_eager=True",
+        for eager in (False, True):
+            argv = [*required_args, gpu_arg, "0.42"]
+            if eager:
+                argv.append("--enforce-eager")
+            kwargs, narration = self.run_to_llm(module, argv)
+            self.assertEqual(
+                kwargs,
+                {
+                    "model": "model",
+                    "dtype": "bfloat16",
+                    "enforce_eager": eager,
+                    "gpu_memory_utilization": 0.42,
+                },
             )
-            self.fail(f"{filename}: pure mode-selection seam is absent")
-
-        default_args = module._parse_args(required_args)
-        default_kwargs = module._llm_kwargs(default_args)
-        self.assertFalse(default_kwargs.get("enforce_eager", False))
-        default_line = module._mode_narration(default_args)
-        self.assertIn("production", default_line.lower())
-        self.assertIn("enforce_eager=False", default_line)
-
-        eager_args = module._parse_args([*required_args, "--enforce-eager"])
-        eager_kwargs = module._llm_kwargs(eager_args)
-        self.assertIs(eager_kwargs.get("enforce_eager"), True)
-        eager_line = module._mode_narration(eager_args)
-        self.assertIn("eager", eager_line.lower())
-        self.assertIn("enforce_eager=True", eager_line)
+            self.assertIs(kwargs["enforce_eager"], eager)
+            mode = "eager diagnostic" if eager else "production"
+            self.assertIn(mode, narration.lower())
+            self.assertIn(f"enforce_eager={eager}", narration)
 
     def test_oracle_capture_modes(self) -> None:
-        self.assert_modes("qwen3-oracle-capture.py", [])
+        self.assert_modes(
+            "qwen3-oracle-capture.py",
+            ["--model", "model", "--out-dir", "/unused"],
+            "--gpu-mem",
+        )
 
     def test_neartie_gap_modes(self) -> None:
         self.assert_modes(
             "qwen3-neartie-gap.py",
-            ["--model", "model", "--golden-dir", "goldens"],
+            ["--model", "model", "--golden-dir", "/unused"],
+            "--gpu-mem-util",
         )
 
 
